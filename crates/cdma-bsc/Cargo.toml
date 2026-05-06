@@ -9,9 +9,10 @@ homepage.workspace = true
 description = "BSC, mobility, paging, SMS, traffic, packet-data, and management services for 1xBTS."
 
 [features]
-default = ["uhd-backend", "lime-backend"]
+default = ["uhd-backend", "lime-backend", "bladerf-backend"]
 uhd-backend = ["cdma-bts/uhd-backend"]
 lime-backend = ["cdma-bts/lime-backend"]
+bladerf-backend = ["cdma-bts/bladerf-backend"]
 test-utils = []
 
 [dependencies]
@@ -20,7 +21,7 @@ cdma-a8 = { path = "../cdma-a8" }
 cdma-a10 = { path = "../cdma-a10" }
 cdma-a11 = { path = "../cdma-a11" }
 cdma-common = { path = "../cdma-common"}
-cdma-bts = { path = "../cdma-bts"}
+cdma-bts = { path = "../cdma-bts", default-features = false }
 cdma-ios = { path = "../cdma-ios" }
 log = "0.4"
 chrono = "0.4"

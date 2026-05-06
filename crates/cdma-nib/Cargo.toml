@@ -10,13 +10,13 @@ description = "Network-in-a-box launcher for running integrated 1xBTS services."
 
 [features]
 default = ["uhd-backend", "lime-backend", "bladerf-backend"]
-uhd-backend = ["cdma-bts/uhd-backend"]
-lime-backend = ["cdma-bts/lime-backend"]
-bladerf-backend = ["cdma-bts/bladerf-backend"]
+uhd-backend = ["cdma-bts/uhd-backend", "cdma-bsc/uhd-backend"]
+lime-backend = ["cdma-bts/lime-backend", "cdma-bsc/lime-backend"]
+bladerf-backend = ["cdma-bts/bladerf-backend", "cdma-bsc/bladerf-backend"]
 
 [dependencies]
-cdma-bts = { path = "../cdma-bts" }
-cdma-bsc = { path = "../cdma-bsc" }
+cdma-bts = { path = "../cdma-bts", default-features = false }
+cdma-bsc = { path = "../cdma-bsc", default-features = false }
 cdma-common = { path = "../cdma-common" }
 cdma-hlr = { path = "../cdma-hlr" }
 cdma-msc = { path = "../cdma-msc" }
