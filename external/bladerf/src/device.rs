@@ -64,7 +64,7 @@ impl Device {
 
     /// Get the device serial number.
     pub fn serial(&self) -> Result<String, Error> {
-        let mut buf = [0i8; 33];
+        let mut buf = [0 as std::os::raw::c_char; 33];
         check_bladerf(
             unsafe { bladerf_sys::bladerf_get_serial(self.ptr, buf.as_mut_ptr()) },
             "bladerf_get_serial",
