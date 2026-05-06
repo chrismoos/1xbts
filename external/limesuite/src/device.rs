@@ -17,7 +17,7 @@ impl Device {
         if count == 0 {
             return Ok(Vec::new());
         }
-        let mut list: Vec<limesuite_sys::lms_info_str_t> = vec![[0i8; 256]; count as usize];
+        let mut list: Vec<limesuite_sys::lms_info_str_t> = vec![[0; 256]; count as usize];
         let ret = unsafe { limesuite_sys::LMS_GetDeviceList(list.as_mut_ptr()) };
         if ret < 0 {
             return Err(Error::Lms("LMS_GetDeviceList failed".into()));
@@ -185,7 +185,7 @@ impl Device {
         if count <= 0 {
             return Ok(Vec::new());
         }
-        let mut names: Vec<limesuite_sys::lms_name_t> = vec![[0i8; 16]; count as usize];
+        let mut names: Vec<limesuite_sys::lms_name_t> = vec![[0; 16]; count as usize];
         let ret =
             unsafe { limesuite_sys::LMS_GetAntennaList(self.0, dir_tx, chan, names.as_mut_ptr()) };
         if ret <= 0 {
