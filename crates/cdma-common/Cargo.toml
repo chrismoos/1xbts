@@ -1,0 +1,19 @@
+[package]
+name = "cdma-common"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Shared utilities, error types, bitstreams, and timing helpers for 1xBTS."
+
+[dependencies]
+chrono = "0.4"
+hound = "3"
+num-complex = "0.4"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+
+[lints]
+workspace = true

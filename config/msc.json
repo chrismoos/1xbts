@@ -1,0 +1,29 @@
+{
+  "a1_listen_addr": "127.0.0.1:17013",
+  "mgmt_grpc_addr": "127.0.0.1:17017",
+  "a1_peers": [],
+  "voice": {
+    "gateway": {
+      "enabled": true,
+      "endpoint": "http://127.0.0.1:17015",
+      "fallback_to_wav": true
+    },
+    "wav_file": "config/sample-sound.wav",
+    "media_ringback_enabled": true,
+    "media_ringback_type": "nanp",
+    "answer_delay_ms": 3000,
+    "release_timeout_ms": 5000,
+    "supported_service_options": [3, 17, 68, 73]
+  },
+  "welcome_sms": {
+    "enabled": true,
+    "text": "Welcome to 1xBTS! You are now connected to a live CDMA2000 1X base station. Enjoy your stay on the network.",
+    "originating_number": "0000",
+    "inactive_days_threshold": 30
+  },
+  "sms_retry": {
+    "enabled": true,
+    "retry_after_secs": 10,
+    "sweep_interval_secs": 10
+  }
+}

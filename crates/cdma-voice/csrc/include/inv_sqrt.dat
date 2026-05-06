@@ -1,0 +1,29 @@
+/*======================================================================*/
+/*     Enhanced Variable Rate Codec - Bit-Exact C Specification         */
+/*     Copyright (C) 1997-1998 Telecommunications Industry Association. */
+/*     All rights reserved.                                             */
+/*----------------------------------------------------------------------*/
+/* Note:  Reproduction and use of this software for the design and      */
+/*     development of North American Wideband CDMA Digital              */
+/*     Cellular Telephony Standards is authorized by the TIA.           */
+/*     The TIA does not authorize the use of this software for any      */
+/*     other purpose.                                                   */
+/*                                                                      */
+/*     The availability of this software does not provide any license   */
+/*     by implication, estoppel, or otherwise under any patent rights   */
+/*     of TIA member companies or others covering any use of the        */
+/*     contents herein.                                                 */
+/*                                                                      */
+/*     Any copies of this software or derivative works must include     */
+/*     this and all other proprietary notices.                          */
+/*======================================================================*/
+/* Table for routine Inv_sqrt().             */
+
+
+static Shortword table[49] = {
+
+ 32767, 31790, 30894, 30070, 29309, 28602, 27945, 27330, 26755, 26214,
+ 25705, 25225, 24770, 24339, 23930, 23541, 23170, 22817, 22479, 22155,
+ 21845, 21548, 21263, 20988, 20724, 20470, 20225, 19988, 19760, 19539,
+ 19326, 19119, 18919, 18725, 18536, 18354, 18176, 18004, 17837, 17674,
+ 17515, 17361, 17211, 17064, 16921, 16782, 16646, 16514, 16384 };

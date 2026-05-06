@@ -1,0 +1,23 @@
+[package]
+name = "bladerf-sys"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Low-level FFI bindings to the libbladeRF library for bladeRF devices"
+links = "bladeRF"
+build = "build.rs"
+
+[lib]
+doctest = false
+
+[dependencies]
+
+[build-dependencies]
+pkg-config = "0.3"
+bindgen = "0.71"
+
+[lints]
+workspace = true

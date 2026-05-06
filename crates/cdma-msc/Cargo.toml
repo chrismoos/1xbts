@@ -1,0 +1,35 @@
+[package]
+name = "cdma-msc"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "MSC runtime, A1 control, call routing, and voice policy support for 1xBTS."
+
+[dependencies]
+async-trait = "0.1"
+chrono = "0.4"
+cdma-common = { path = "../cdma-common" }
+cdma-hlr = { path = "../cdma-hlr" }
+cdma-ios = { path = "../cdma-ios" }
+cdma-smsc = { path = "../cdma-smsc" }
+cdma-voice = { path = "../cdma-voice" }
+log = "0.4"
+prost = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "rt", "macros", "net"] }
+tokio-stream = "0.1"
+tonic = "0.13"
+uuid = { version = "1", features = ["v4"] }
+
+[build-dependencies]
+tonic-build = "0.13"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

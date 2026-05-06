@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /usr/local/share/chromium
+          sudo rm -rf /usr/local/lib/node_modules
+          df -h /
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            libclang-dev \
+            pkg-config \
+            protobuf-compiler \
+            libprotobuf-dev \
+            libboost-system-dev \
+            libssl-dev \
+            zstd \
+            libre-dev \
+            libsoapysdr-dev \
+            soapysdr-tools \
+            libuhd-dev \
+            uhd-host \
+            libbladerf-dev \
+            bladerf \
+            liblimesuite-dev \
+            limesuite
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Fetch capture fixtures
+        env:
+          CAPTURE_DOWNLOAD_TOKEN: ${{ secrets.CAPTURE_DOWNLOAD_TOKEN }}
+        run: test/capture/fetch-archive.sh
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --release -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-targets --release -- --skip capture_
+
+      - name: Capture tests
+        run: cargo test --workspace --all-targets --release capture_ -- --test-threads=1

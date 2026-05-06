@@ -1,0 +1,41 @@
+{
+  "generatorScript": "generate_reverse_rc3_extended_wav.m",
+  "generatorVersion": 1,
+  "direction": "reverse",
+  "radioConfig": 3,
+  "channelType": "sch",
+  "sampleRate": 4.9152E+6,
+  "chipRate": 1.2288E+6,
+  "esn": 2.15623228E+9,
+  "longCodeState": 2.199023255552E+12,
+  "filterType": "Off",
+  "numFrames": 4,
+  "frameLongCodeStates": [
+    2.199023255552E+12,
+    4.057813343663E+12,
+    3.028908723935E+12,
+    2.83416946373E+11
+  ],
+  "channels": {
+    "pilot": {
+      "enabled": true,
+      "powerDb": 0
+    },
+    "fch": {
+      "enabled": true,
+      "walshCode": 4,
+      "dataRate": 9600,
+      "powerDb": 0,
+      "longCodeMask": 3.403093918899E+12
+    },
+    "sch": {
+      "enabled": true,
+      "walshCode": 2,
+      "dataRate": 38400,
+      "powerDb": 0,
+      "longCodeMask": 3.540532872371E+12,
+      "infoBitsPerFrame": 744
+    }
+  },
+  "pilotOnlyCompanion": "rev_sch_rc3_38k4_pilot_only.wav"
+}

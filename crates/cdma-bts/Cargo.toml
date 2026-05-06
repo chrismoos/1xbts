@@ -1,0 +1,48 @@
+[package]
+name = "cdma-bts"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "BTS, LAC/MAC, PHY, receiver, and SDR backend implementation for 1xBTS."
+
+[lib]
+path = "src/lib/mod.rs"
+
+[features]
+default = ["uhd-backend", "lime-backend", "bladerf-backend"]
+uhd-backend = ["uhd"]
+lime-backend = ["limesuite"]
+bladerf-backend = ["bladerf"]
+
+[dependencies]
+num = "0.4"
+uhd = { path = "../../external/uhd", optional = true }
+limesuite = { path = "../../external/limesuite", optional = true }
+bladerf = { path = "../../external/bladerf", optional = true }
+hound = "3"
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+env_logger = "0.11"
+tracing = "0.1"
+tracing-subscriber = {version = "0.3", features = ["env-filter"]}
+biquad = "0.6"
+cdma-common = { path = "../cdma-common"}
+chrono = "0.4"
+soapysdr = "0.5"
+sdr = "0.7"
+num-complex = "0.4"
+libc = "0.2"
+rustfft = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+signal-hook = "0.3"
+clap = { version = "4", features = ["derive"] }
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+cdma-abis = { path = "../cdma-abis" }
+
+[lints]
+workspace = true

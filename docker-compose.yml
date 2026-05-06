@@ -1,0 +1,60 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: 1xbts-postgres
+    ports:
+      - "45432:5432"
+    environment:
+      POSTGRES_DB: 1xbts
+      POSTGRES_USER: 1xbts
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-1xbts}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U 1xbts -d 1xbts"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  1xbts-web:
+    image: node:25-bookworm
+    container_name: 1xbts-web
+    working_dir: /app
+    command: sh -c "npm install && npm run dev -- --hostname 0.0.0.0"
+    ports:
+      - "${ONEXBTS_WEB_PORT:-3000}:3000"
+    environment:
+      MANAGEMENT_GRPC_ADDRESS: ${MANAGEMENT_GRPC_ADDRESS:-host.docker.internal:17016}
+      MSC_GRPC_ADDRESS: ${MSC_GRPC_ADDRESS:-host.docker.internal:17017}
+      WATCHPACK_POLLING: "true"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./1xbts-web:/app
+      - 1xbts-web-node-modules:/app/node_modules
+    restart: unless-stopped
+
+  fou-nat:
+    build:
+      context: ./docker/fou-nat
+    container_name: 1xbts-fou-nat
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    ports:
+      - "17012:17012/tcp"
+    environment:
+      FOU_LISTEN_PORT: "17010"
+      FOU_REMOTE_PORT: "17011"
+      FOU_TCP_PORT: "17012"
+      MOBILE_CIDR: "10.55.0.0/24"
+      TUNNEL_ADDR: "10.55.0.1/24"
+      FOU_LOCAL_IP: "127.0.0.1"
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  1xbts-web-node-modules:

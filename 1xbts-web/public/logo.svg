@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 148">
+  <defs>
+    <linearGradient id="brand" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#6366f1"/>
+      <stop offset="100%" style="stop-color:#10b981"/>
+    </linearGradient>
+    <linearGradient id="tower" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#818cf8"/>
+      <stop offset="100%" style="stop-color:#34d399"/>
+    </linearGradient>
+    <linearGradient id="textGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#6366f1"/>
+      <stop offset="100%" style="stop-color:#10b981"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Icon mark -->
+  <g transform="translate(10, 4)">
+    <rect width="104" height="104" rx="24" fill="#0c0e14"/>
+    <circle cx="52" cy="44" r="32" fill="url(#brand)" opacity="0.06"/>
+
+    <path d="M 14 36 A 38 38 0 0 1 36 14" fill="none" stroke="url(#brand)" stroke-width="4" stroke-linecap="round" opacity="0.25"/>
+    <path d="M 68 14 A 38 38 0 0 1 90 36" fill="none" stroke="url(#brand)" stroke-width="4" stroke-linecap="round" opacity="0.25"/>
+    <path d="M 24 40 A 22 22 0 0 1 40 24" fill="none" stroke="url(#brand)" stroke-width="4" stroke-linecap="round" opacity="0.45"/>
+    <path d="M 64 24 A 22 22 0 0 1 80 40" fill="none" stroke="url(#brand)" stroke-width="4" stroke-linecap="round" opacity="0.45"/>
+    <path d="M 34 42 A 12 12 0 0 1 42 34" fill="none" stroke="url(#brand)" stroke-width="4" stroke-linecap="round" opacity="0.75"/>
+    <path d="M 62 34 A 12 12 0 0 1 70 42" fill="none" stroke="url(#brand)" stroke-width="4" stroke-linecap="round" opacity="0.75"/>
+
+    <circle cx="52" cy="32" r="4" fill="#818cf8"/>
+    <line x1="52" y1="36" x2="52" y2="58" stroke="url(#tower)" stroke-width="5" stroke-linecap="round"/>
+    <line x1="52" y1="58" x2="38" y2="88" stroke="url(#tower)" stroke-width="4" stroke-linecap="round"/>
+    <line x1="52" y1="58" x2="66" y2="88" stroke="url(#tower)" stroke-width="4" stroke-linecap="round"/>
+    <line x1="43" y1="68" x2="61" y2="68" stroke="#34d399" stroke-width="2.5" stroke-linecap="round" opacity="0.5"/>
+    <line x1="40" y1="78" x2="64" y2="78" stroke="#34d399" stroke-width="2.5" stroke-linecap="round" opacity="0.5"/>
+    <line x1="32" y1="88" x2="72" y2="88" stroke="#34d399" stroke-width="3" stroke-linecap="round" opacity="0.35"/>
+  </g>
+
+  <!-- Wordmark: vertically centered with icon (icon center y=56) -->
+  <text x="130" y="79" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="64" font-weight="800" letter-spacing="-2" fill="url(#textGrad)">1xBTS</text>
+
+  <!-- Tagline: below the full icon+wordmark row -->
+  <text x="10" y="138" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="26" font-weight="500" letter-spacing="4" fill="#64748b">CDMA2000 BASE STATION</text>
+</svg>

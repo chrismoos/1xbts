@@ -1,0 +1,63 @@
+{
+  "grpc": {
+    "listen_addr": "127.0.0.1:17015"
+  },
+  "sip": {
+    "listen_addr": "127.0.0.1:5060",
+    "transport": "udp",
+    "request_uri_template": "sip:{called}@127.0.0.1:5060",
+    "from_domain": "bts.local",
+    "caller_id_override": null,
+    "user_agent": "1XBTS-VoiceGW/0.1",
+    "keepalive_interval_secs": 0,
+    "auth": {
+      "username": "",
+      "password": null,
+      "password_env": null
+    },
+    "registration": {
+      "enabled": false,
+      "registrar_uri": "",
+      "to_uri": null,
+      "from_uri": null,
+      "from_name": null,
+      "contact_user": null,
+      "expires_secs": 300,
+      "allow_unauthenticated": false
+    }
+  },
+  "rtp": {
+    "listen_addr": "0.0.0.0",
+    "advertise_addr": "192.0.2.1",
+    "port_range": [17100, 17200],
+    "preferred_codecs": ["PCMU", "PCMA"]
+  },
+  "nat": {
+    "mode": "disabled",
+    "stun_server": null,
+    "stun_timeout_ms": 1000,
+    "rtp_latch_packets": 5,
+    "rtp_latch_interval_ms": 20
+  },
+  "calls": {
+    "max_concurrent_calls": 32,
+    "setup_timeout_ms": 30000,
+    "ringing_timeout_ms": 120000,
+    "media_idle_timeout_ms": 30000
+  },
+  "queues": {
+    "gateway_voice_frames": 512,
+    "media_stream_frames": 256
+  },
+  "logging": {
+    "summary": true,
+    "control_events": true,
+    "media_frames": false,
+    "media_summary": true,
+    "sip_events": true,
+    "sip_trace": false,
+    "sip_sdp": false
+  },
+  "jitter_buffer_ms": 60,
+  "dtmf_mode": "disabled"
+}

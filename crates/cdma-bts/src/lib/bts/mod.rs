@@ -1,0 +1,874 @@
+pub mod abis_agent;
+pub mod bearer_agent;
+pub mod bearer_transport_service;
+pub mod config;
+pub mod handle;
+pub mod launcher;
+pub mod metrics_service;
+pub mod paging_service;
+pub mod paging_supplier;
+pub mod power_control;
+pub mod power_control_service;
+pub mod resource_controller;
+pub mod rx;
+pub mod settings;
+pub mod synthesis_service;
+pub mod traffic_lac;
+pub mod traffic_setup_service;
+pub use bearer_transport_service::BearerTransportService;
+pub use config::{BtsAbisTimers, BtsNodeConfig, RadioConfig, load_radio_from_path};
+pub use handle::*;
+pub use launcher::*;
+pub use metrics_service::MetricsService;
+pub use paging_service::PagingService;
+pub use paging_supplier::PchTransmitEvent;
+pub use power_control::{BtsPowerControlRegistry, BtsPowerControlSnapshot, BtsPowerControlTick};
+pub use power_control_service::PowerControlService;
+pub use resource_controller::{TrafficResourceController, TrafficResourceService};
+pub use settings::*;
+pub use synthesis_service::SynthesisService;
+pub use traffic_setup_service::TrafficSetupService;
+
+mod downlink;
+mod synth;
+mod timing;
+
+use std::{sync::Arc, sync::atomic::AtomicBool, thread, time::Instant};
+
+use cdma_common::{consts::SR1_CHIPS_320MS, error::Error, time};
+use log::{debug, info, trace};
+use num::complex::Complex32;
+use tokio::sync::mpsc;
+
+use crate::{
+    channels::{
+        WalshChannelWrapper, fpch::ForwardPagingChannel, fsch::ForwardSyncChannel,
+        pilot::ForwardPilotChannel,
+    },
+    mac,
+    receiver::sync::SyncChannelMessage,
+    sdr::{Radio, RadioRx, RadioTx, pipe::RadioPipe},
+};
+
+pub use timing::TxRxAnchor;
+
+/// Attempt to set the calling thread to real-time priority.
+/// Logs a warning on failure but does not panic. The BTS can still
+/// run at normal priority, just with higher jitter risk.
+fn set_thread_priority(label: &str, hard_rt: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        if hard_rt {
+            #[repr(C)]
+            struct ThreadTimeConstraintPolicy {
+                period: u32,
+                computation: u32,
+                constraint: u32,
+                preemptible: i32,
+            }
+            #[repr(C)]
+            struct MachTimebaseInfo {
+                numer: u32,
+                denom: u32,
+            }
+            unsafe extern "C" {
+                fn mach_thread_self() -> u32;
+                fn thread_policy_set(
+                    thread: u32,
+                    flavor: u32,
+                    policy_info: *const ThreadTimeConstraintPolicy,
+                    count: u32,
+                ) -> i32;
+                fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+            }
+            const THREAD_TIME_CONSTRAINT_POLICY: u32 = 2;
+            const THREAD_TIME_CONSTRAINT_POLICY_COUNT: u32 = 4;
+
+            let mut timebase = MachTimebaseInfo { numer: 0, denom: 0 };
+            unsafe { mach_timebase_info(&mut timebase) };
+            let ns_to_abs = |ns: u64| -> u32 {
+                ((ns as u128 * timebase.denom as u128) / timebase.numer as u128) as u32
+            };
+
+            let policy = ThreadTimeConstraintPolicy {
+                period: ns_to_abs(1_250_000),
+                computation: ns_to_abs(800_000),
+                constraint: ns_to_abs(1_200_000),
+                preemptible: 1,
+            };
+            let ret = unsafe {
+                thread_policy_set(
+                    mach_thread_self(),
+                    THREAD_TIME_CONSTRAINT_POLICY,
+                    &policy,
+                    THREAD_TIME_CONSTRAINT_POLICY_COUNT,
+                )
+            };
+            if ret != 0 {
+                log::warn!(
+                    "{}: THREAD_TIME_CONSTRAINT_POLICY failed (ret={}), falling back to QoS",
+                    label,
+                    ret
+                );
+            } else {
+                log::info!(
+                    "{}: set to THREAD_TIME_CONSTRAINT_POLICY (period=1.25ms computation=0.8ms constraint=1.2ms)",
+                    label
+                );
+                return;
+            }
+        }
+
+        use std::os::raw::c_int;
+        unsafe extern "C" {
+            fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: c_int) -> c_int;
+        }
+        let ret = unsafe { pthread_set_qos_class_self_np(0x21, 0) };
+        if ret != 0 {
+            log::warn!("{}: failed to set QoS class (ret={})", label, ret);
+        } else {
+            log::info!("{}: set to QOS_CLASS_USER_INTERACTIVE", label);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::raw::c_int;
+        #[repr(C)]
+        struct SchedParam {
+            sched_priority: c_int,
+        }
+        unsafe extern "C" {
+            fn pthread_setschedparam(
+                thread: libc::pthread_t,
+                policy: c_int,
+                param: *const SchedParam,
+            ) -> c_int;
+            fn pthread_self() -> libc::pthread_t;
+        }
+        if hard_rt {
+            const SCHED_FIFO: c_int = 1;
+            let param = SchedParam { sched_priority: 50 };
+            let ret = unsafe { pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) };
+            if ret != 0 {
+                log::warn!(
+                    "{}: failed to set SCHED_FIFO priority (ret={}, try running as root)",
+                    label,
+                    ret
+                );
+            } else {
+                log::info!("{}: set to SCHED_FIFO priority 50", label);
+            }
+        } else {
+            log::info!("{}: using default scheduling (soft real-time)", label);
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        log::info!("{}: real-time priority not supported on this OS", label);
+    }
+}
+
+/// Static BTS wiring and protocol dependencies.
+pub struct Config {
+    /// Pilot PN offset index in units of 64 chips.
+    pub pilot_offset: usize,
+    /// MAC service used for paging fragments and overhead availability.
+    pub mac_layer: mac::Layer2MacRef,
+    /// When set, the BTS starts from this exact CDMA system time instead of
+    /// sampling wall clock time at runtime. Useful for deterministic tests.
+    pub start_system_time: Option<time::CdmaSystemTime>,
+    /// When set, the BTS generates sync channel messages directly instead of
+    /// going through the MAC/LAC availability-indication path. The template
+    /// is re-stamped with `lc_state` and `sys_time` at each superframe start.
+    pub sync_channel_template: Option<SyncChannelMessage>,
+    /// Optional reverse-link RX configuration.
+    pub rx: Option<RxSettings>,
+}
+
+/// Forward-link BTS runtime and associated control-plane endpoints.
+pub struct Bts {
+    config: Config,
+    radio: Option<Box<dyn Radio>>,
+    runtime: BtsRuntimeSettings,
+    injected_rx: Option<rx::InjectedRxReceiver>,
+    metrics: MetricsService,
+    commands_rx: Option<mpsc::Receiver<BtsCommand>>,
+    traffic_channels: TrafficChannelPool,
+    traffic_rx_pool: TrafficRxPool,
+    traffic_rx_removals: TrafficRxRemovals,
+    power_control: BtsPowerControlRegistry,
+    rx_measurements: settings::RxMeasurementStore,
+}
+
+type PilotWalshChannel = WalshChannelWrapper<ForwardPilotChannel>;
+type SyncWalshChannel = WalshChannelWrapper<ForwardSyncChannel<9, 2>>;
+type PagingWalshChannel = WalshChannelWrapper<ForwardPagingChannel<9, 2>>;
+
+pub(crate) struct TxLoopState {
+    chip_rate: u64,
+    block_size: u64,
+    tx_batch_chips: u64,
+    sync_frame_chips: u64,
+    sync_superframe_chips: u64,
+    paging_frame_chips: u64,
+    paging_fragments_per_frame: usize,
+    pilot_offset_chips: u64,
+    paging_start_enable_chip: u64,
+    sync_requested_fragments: usize,
+    sync_sent_fragments: usize,
+    paging_requested_fragments: usize,
+    paging_sent_fragments: usize,
+    current_sync_pdu: Option<crate::lac::EncapsulatedPdu>,
+    hardware_start_tick: u64,
+    hardware_start_chip: u64,
+    gen_time_sum_us: u64,
+    gen_time_max_us: u64,
+    sync_time_sum_us: u64,
+    paging_time_sum_us: u64,
+    synth_time_sum_us: u64,
+    synth_pilot_us: u64,
+    synth_fsch_us: u64,
+    synth_fpch_us: u64,
+    synth_ftch_us: u64,
+    synth_spread_us: u64,
+    tx_time_sum_us: u64,
+    tx_time_max_us: u64,
+    synth_blocks: usize,
+    tx_batches: usize,
+    interval_start: Instant,
+}
+
+impl Bts {
+    /// Create a BTS using default runtime settings.
+    pub fn new(radio: Box<dyn Radio>, config: Config) -> (Bts, BtsHandle) {
+        Bts::new_with_settings(radio, config, BtsRuntimeSettings::default())
+    }
+
+    /// Create a BTS with an injected RX path for tests and diagnostics.
+    pub fn new_with_injected_rx(
+        radio: Box<dyn Radio>,
+        config: Config,
+        runtime: BtsRuntimeSettings,
+    ) -> (Bts, BtsHandle, rx::InjectedRxSender) {
+        let (injected_tx, injected_rx) = rx::injected_rx_channel(32);
+        let (bts, handle) = Self::build(radio, config, runtime, Some(injected_rx));
+        (bts, handle, injected_tx)
+    }
+
+    /// Create a BTS with explicit runtime settings.
+    pub fn new_with_settings(
+        radio: Box<dyn Radio>,
+        config: Config,
+        runtime: BtsRuntimeSettings,
+    ) -> (Bts, BtsHandle) {
+        assert!(config.pilot_offset <= 511);
+        Self::build(radio, config, runtime, None)
+    }
+
+    fn build(
+        radio: Box<dyn Radio>,
+        config: Config,
+        runtime: BtsRuntimeSettings,
+        injected_rx: Option<rx::InjectedRxReceiver>,
+    ) -> (Bts, BtsHandle) {
+        let (senders, handle) = handle::create_handle(Arc::new(runtime.clone()));
+        let metrics = MetricsService::new(
+            senders.tx_metrics,
+            senders.rx_metrics,
+            senders.access_event_tx,
+        );
+        let bts = Bts {
+            config,
+            radio: Some(radio),
+            runtime,
+            injected_rx,
+            metrics,
+            commands_rx: Some(senders.commands_rx),
+            traffic_channels: senders.traffic_channels,
+            traffic_rx_pool: senders.traffic_rx_pool,
+            traffic_rx_removals: senders.traffic_rx_removals,
+            power_control: senders.power_control,
+            rx_measurements: senders.rx_measurements,
+        };
+        (bts, handle)
+    }
+
+    fn configure_radio(&mut self) -> Result<(), Error> {
+        let radio = self
+            .radio
+            .as_mut()
+            .expect("radio consumed before configure");
+        radio.set_tx_bandwidth(self.runtime.tx_bandwidth_hz)?;
+        radio.set_tx_sample_rate(self.runtime.tx_sample_rate_hz)?;
+        radio.set_tx_lo_offset_hz(self.runtime.tx_lo_offset_hz)?;
+        radio.set_tx_frequency(self.runtime.tx_center_frequency_hz)?;
+
+        info!(
+            "Set TX center frequency to {:.04}Mhz (LO offset {:+.03}kHz), sample rate {:.04}Mhz, spreading rate {:?}",
+            self.runtime.tx_center_frequency_hz as f64 / 1_000_000.0,
+            self.runtime.tx_lo_offset_hz as f64 / 1_000.0,
+            self.runtime.tx_sample_rate_hz as f64 / 1_000_000.0,
+            self.runtime.spreading_rate,
+        );
+        Ok(())
+    }
+
+    fn spawn_rx_thread(
+        rx_settings: RxSettings,
+        commands_rx: mpsc::Receiver<BtsCommand>,
+        mut radio_rx: Box<dyn RadioRx>,
+        shutdown: Arc<AtomicBool>,
+    ) -> thread::JoinHandle<Result<(), Error>> {
+        thread::Builder::new()
+            .name("bts-rx".into())
+            .spawn(move || {
+                let shutdown_flag = shutdown.clone();
+                let result = rx::run_rx_loop(rx_settings, commands_rx, &mut *radio_rx, shutdown);
+                match &result {
+                    Ok(()) => info!("rx: stopped normally"),
+                    Err(_) => shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed),
+                }
+                result
+            })
+            .expect("failed to spawn RX thread")
+    }
+
+    /// Threshold in microseconds: log a warning when a single TX batch exceeds this.
+    const TX_SLOW_THRESHOLD_US: u64 = 2_000;
+
+    fn flush_tx_batch(
+        radio_tx: &mut dyn RadioTx,
+        state: &mut TxLoopState,
+        tx_batch: &[Complex32],
+        batch_tx_tick: u64,
+    ) -> Result<(), Error> {
+        if tx_batch.is_empty() {
+            return Ok(());
+        }
+
+        let hw_before = if state.tx_batches < 10 {
+            radio_tx.get_hardware_time().ok()
+        } else {
+            None
+        };
+
+        let tx_start = Instant::now();
+        radio_tx.transmit_at(tx_batch, Some(batch_tx_tick))?;
+        let tx_us = tx_start.elapsed().as_micros() as u64;
+        state.tx_time_sum_us += tx_us;
+        state.tx_time_max_us = state.tx_time_max_us.max(tx_us);
+        state.tx_batches += 1;
+
+        if let Some(hw) = hw_before {
+            let margin = batch_tx_tick.saturating_sub(hw);
+            let late = if hw > batch_tx_tick {
+                hw - batch_tx_tick
+            } else {
+                0
+            };
+            trace!(
+                "tx_batch_debug: batch #{} tick={} hw={} margin={} late={} tx_us={} chips={}",
+                state.tx_batches,
+                batch_tx_tick,
+                hw,
+                margin,
+                late,
+                tx_us,
+                tx_batch.len(),
+            );
+        }
+
+        if tx_us > Self::TX_SLOW_THRESHOLD_US {
+            log::warn!(
+                "tx_slow_batch: transmit_at took {}us (batch #{}, {} chips)",
+                tx_us,
+                state.tx_batches,
+                tx_batch.len(),
+            );
+        }
+        Ok(())
+    }
+
+    fn run_loop(mut self, max_blocks: Option<usize>) -> Result<(), Error> {
+        self.runtime.validate()?;
+        self.configure_radio()?;
+
+        let radio = self.radio.take().expect("radio consumed before split");
+        let (mut radio_tx, mut radio_rx) = radio.split()?;
+
+        let (pch, fsch, fpch) = downlink::build_channels(&self.config, &self.runtime)?;
+        let pilot_offset_chips = timing::pilot_offset_chips(self.config.pilot_offset);
+
+        let mut state = TxLoopState {
+            chip_rate: self.runtime.chip_rate_hz as u64,
+            block_size: self.runtime.block_size_chips as u64,
+            tx_batch_chips: self.runtime.tx_batch_chips as u64,
+            sync_frame_chips: self.runtime.overhead.fragment_availability_interval_chips as u64,
+            sync_superframe_chips: self.runtime.overhead.sync_superframe_interval_chips as u64,
+            paging_frame_chips: (self.runtime.chip_rate_hz / 50) as u64,
+            paging_fragments_per_frame: 2,
+            pilot_offset_chips,
+            paging_start_enable_chip: pilot_offset_chips + SR1_CHIPS_320MS,
+            sync_requested_fragments: 0,
+            sync_sent_fragments: 0,
+            paging_requested_fragments: 0,
+            paging_sent_fragments: 0,
+            current_sync_pdu: None,
+            hardware_start_tick: 0,
+            hardware_start_chip: 0,
+            gen_time_sum_us: 0,
+            gen_time_max_us: 0,
+            sync_time_sum_us: 0,
+            paging_time_sum_us: 0,
+            synth_time_sum_us: 0,
+            synth_pilot_us: 0,
+            synth_fsch_us: 0,
+            synth_fpch_us: 0,
+            synth_ftch_us: 0,
+            synth_spread_us: 0,
+            tx_time_sum_us: 0,
+            tx_time_max_us: 0,
+            synth_blocks: 0,
+            tx_batches: 0,
+            interval_start: Instant::now(),
+        };
+
+        if let Some(rx) = radio_rx.as_mut() {
+            timing::prime_hardware_clock(&mut **rx, &mut *radio_tx)?;
+        }
+
+        let tick_rate = radio_tx.tick_rate();
+        let hardware_now = radio_tx.get_hardware_time()?;
+        let start_system_time = self
+            .config
+            .start_system_time
+            .unwrap_or_else(time::system_time_now);
+
+        let initial_anchor = timing::compute_initial_tx_anchor(
+            start_system_time,
+            state.chip_rate,
+            tick_rate,
+            hardware_now,
+            state.sync_superframe_chips,
+            pilot_offset_chips,
+        );
+        timing::apply_anchor(&mut state, &initial_anchor);
+        timing::log_anchor(
+            "bts: hardware-time anchor",
+            hardware_now,
+            &initial_anchor,
+            state.chip_rate,
+        );
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        {
+            let flag = shutdown.clone();
+            let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, flag.clone());
+            let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, flag);
+        }
+
+        let tx_rx_anchor = Arc::new(TxRxAnchor::new());
+
+        let rx_thread = match (
+            self.config.rx.clone(),
+            self.commands_rx.take(),
+            radio_rx.take(),
+            self.injected_rx.take(),
+        ) {
+            (Some(mut rx_settings), Some(commands_rx), Some(rx), _) => {
+                rx_settings.absolute_chip_start = 0;
+                rx_settings.hardware_start_time_ns = 0;
+                rx_settings.tick_rate = tick_rate;
+                rx_settings.rx_metrics_tx = Some(self.metrics.rx_metrics_sender());
+                rx_settings.access_event_tx = Some(self.metrics.access_event_sender());
+                rx_settings.traffic_rx_pool = Some(self.traffic_rx_pool.clone());
+                rx_settings.traffic_rx_removals = Some(self.traffic_rx_removals.clone());
+                rx_settings.traffic_channels = Some(self.traffic_channels.clone());
+                rx_settings.power_control = Some(self.power_control.clone());
+                rx_settings.tx_rx_anchor = Some(tx_rx_anchor.clone());
+                rx_settings.rx_measurements = Some(self.rx_measurements.clone());
+                Some(Self::spawn_rx_thread(
+                    rx_settings,
+                    commands_rx,
+                    rx,
+                    shutdown.clone(),
+                ))
+            }
+            (Some(mut rx_settings), Some(commands_rx), None, Some(injected_rx)) => {
+                rx_settings.absolute_chip_start = state.hardware_start_chip;
+                rx_settings.hardware_start_time_ns = state.hardware_start_tick;
+                rx_settings.tick_rate = tick_rate;
+                rx_settings.rx_metrics_tx = Some(self.metrics.rx_metrics_sender());
+                rx_settings.access_event_tx = Some(self.metrics.access_event_sender());
+                rx_settings.traffic_rx_pool = Some(self.traffic_rx_pool.clone());
+                rx_settings.traffic_rx_removals = Some(self.traffic_rx_removals.clone());
+                rx_settings.traffic_channels = Some(self.traffic_channels.clone());
+                rx_settings.power_control = Some(self.power_control.clone());
+                rx_settings.tx_rx_anchor = None;
+                rx_settings.rx_measurements = Some(self.rx_measurements.clone());
+                let injected_shutdown = shutdown.clone();
+                Some(
+                    thread::Builder::new()
+                        .name("bts-rx-injected".into())
+                        .spawn(move || {
+                            let shutdown_flag = injected_shutdown.clone();
+                            let result = rx::run_injected_rx_loop(
+                                rx_settings,
+                                commands_rx,
+                                injected_rx,
+                                injected_shutdown,
+                            );
+                            if result.is_err() {
+                                shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            result
+                        })
+                        .expect("failed to spawn injected RX thread"),
+                )
+            }
+            (_, Some(commands_rx), _, _) => {
+                drop(commands_rx);
+                None
+            }
+            _ => None,
+        };
+
+        let mut chip_cursor;
+        {
+            let hw_now = radio_tx.get_hardware_time()?;
+            let live_anchor = timing::reseed_tx_anchor_from_live_clock(
+                state.chip_rate,
+                tick_rate,
+                hw_now,
+                state.hardware_start_tick,
+                state.hardware_start_chip,
+                state.sync_superframe_chips,
+                pilot_offset_chips,
+                self.runtime.max_tx_lookahead_ms,
+            );
+            timing::apply_anchor(&mut state, &live_anchor);
+            chip_cursor = live_anchor.chip_cursor;
+            timing::log_anchor(
+                "bts: TX anchor seeded from live clock:",
+                hw_now,
+                &live_anchor,
+                state.chip_rate,
+            );
+
+            tx_rx_anchor.publish(state.hardware_start_tick, state.hardware_start_chip);
+            info!(
+                "bts: TX→RX anchor published: tick={} chip={}",
+                state.hardware_start_tick, state.hardware_start_chip
+            );
+        }
+
+        let mut spreader = synth::aligned_spreader(
+            self.config.pilot_offset,
+            self.runtime.short_code_length_chips,
+            chip_cursor,
+        );
+        fpch.channel.advance_lc_to_chip(chip_cursor);
+
+        radio_tx.enable_transmit_at(true, Some(state.hardware_start_tick))?;
+        info!(
+            "tx_timing: enable_transmit_at start_tick={} hw_now={}",
+            state.hardware_start_tick,
+            radio_tx.get_hardware_time()?,
+        );
+
+        let mut synth_block = vec![Complex32::default(); state.block_size as usize];
+        let mut tx_batch = vec![Complex32::default(); state.tx_batch_chips as usize];
+        let blocks_per_batch = (state.tx_batch_chips / state.block_size) as usize;
+        let heartbeat_interval = (state.chip_rate / state.block_size) as usize;
+        let mut sent_blocks = 0usize;
+
+        let mut wall_anchor_instant = Instant::now();
+        let mut wall_anchor_tick = radio_tx.get_hardware_time()?;
+
+        loop {
+            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                info!("shutdown signal received, stopping TX loop");
+                break;
+            }
+            if let Some(limit) = max_blocks {
+                if sent_blocks >= limit {
+                    break;
+                }
+            }
+
+            let batch_playout_tick = timing::batch_playout_tick(&state, chip_cursor, tick_rate);
+            if max_blocks.is_none() && self.runtime.max_tx_lookahead_ms > 0 {
+                let lookahead_ticks = self.runtime.max_tx_lookahead_ms as u64 * tick_rate / 1_000;
+                loop {
+                    let elapsed_ns = wall_anchor_instant.elapsed().as_nanos() as u64;
+                    let estimated_hw = wall_anchor_tick
+                        + (elapsed_ns as u128 * tick_rate as u128 / 1_000_000_000) as u64;
+                    if batch_playout_tick.saturating_sub(estimated_hw) <= lookahead_ticks
+                        || shutdown.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+
+            if max_blocks.is_none()
+                && sent_blocks % heartbeat_interval < blocks_per_batch
+                && sent_blocks > 0
+            {
+                let frame_system_time = time::system_time_from_chips(chip_cursor, state.chip_rate);
+                let tx_rel_chips = chip_cursor.saturating_sub(state.hardware_start_chip);
+                let tx_hardware_tick =
+                    timing::hardware_tick_at_chip(&state, chip_cursor, tick_rate);
+                let t20 = time::system_time_20ms_frames(frame_system_time);
+                let wall_ms = state.interval_start.elapsed().as_millis();
+                let synth_n = state.synth_blocks.max(1) as u64;
+                let tx_n = state.tx_batches.max(1) as u64;
+                let avg_gen_us = state.gen_time_sum_us / synth_n;
+                let avg_tx_us = state.tx_time_sum_us / tx_n;
+                let gen_total_ms = state.gen_time_sum_us / 1000;
+                let tx_total_ms = state.tx_time_sum_us / 1000;
+                let rt_ratio = if state.gen_time_sum_us > 0 {
+                    1_000_000.0 / state.gen_time_sum_us as f64
+                } else {
+                    f64::INFINITY
+                };
+                let sync_total_ms = state.sync_time_sum_us / 1000;
+                let paging_total_ms = state.paging_time_sum_us / 1000;
+                let synth_total_ms = state.synth_time_sum_us / 1000;
+                debug!(
+                    "transmit t20={} wall={}ms blocks={} tx_batches={} gen={}ms(avg={}us max={}us) sync={}ms paging={}ms synth={}ms[pilot={}ms fsch={}ms fpch={}ms spread={}ms] tx={}ms(avg={}us max={}us) rt={:.1}x",
+                    t20,
+                    wall_ms,
+                    state.synth_blocks,
+                    state.tx_batches,
+                    gen_total_ms,
+                    avg_gen_us,
+                    state.gen_time_max_us,
+                    sync_total_ms,
+                    paging_total_ms,
+                    synth_total_ms,
+                    state.synth_pilot_us / 1000,
+                    state.synth_fsch_us / 1000,
+                    state.synth_fpch_us / 1000,
+                    state.synth_spread_us / 1000,
+                    tx_total_ms,
+                    avg_tx_us,
+                    state.tx_time_max_us,
+                    rt_ratio
+                );
+                debug!(
+                    "tx_hardware_heartbeat: hw_tick={} chip={} rel_chip={} t20={}",
+                    tx_hardware_tick, chip_cursor, tx_rel_chips, t20
+                );
+                self.metrics.publish_tx_metrics(TxMetrics {
+                    timestamp_ns: tx_hardware_tick,
+                    chip_cursor,
+                    blocks_transmitted: sent_blocks as u64,
+                    rt_ratio,
+                    gen_avg_us: avg_gen_us,
+                    gen_max_us: state.gen_time_max_us,
+                    tx_avg_us: avg_tx_us,
+                    tx_max_us: state.tx_time_max_us,
+                    synth_pilot_us: state.synth_pilot_us,
+                    synth_sync_us: state.synth_fsch_us,
+                    synth_paging_us: state.synth_fpch_us,
+                    synth_spread_us: state.synth_spread_us,
+                    sync_fragments_sent: state.sync_sent_fragments as u64,
+                    paging_fragments_sent: state.paging_sent_fragments as u64,
+                });
+                state.gen_time_sum_us = 0;
+                state.gen_time_max_us = 0;
+                state.sync_time_sum_us = 0;
+                state.paging_time_sum_us = 0;
+                state.synth_time_sum_us = 0;
+                state.synth_pilot_us = 0;
+                state.synth_fsch_us = 0;
+                state.synth_fpch_us = 0;
+                state.synth_ftch_us = 0;
+                state.synth_spread_us = 0;
+                state.tx_time_sum_us = 0;
+                state.tx_time_max_us = 0;
+                state.synth_blocks = 0;
+                state.tx_batches = 0;
+                state.interval_start = Instant::now();
+
+                if let Ok(hw) = radio_tx.get_hardware_time() {
+                    wall_anchor_tick = hw;
+                    wall_anchor_instant = Instant::now();
+                }
+            }
+
+            let gen_start = Instant::now();
+            let bs = state.block_size as usize;
+            for block_idx in 0..blocks_per_batch {
+                let block_chip = chip_cursor + (block_idx as u64) * state.block_size;
+                let frame_system_time = time::system_time_from_chips(block_chip, state.chip_rate);
+                let boundaries = timing::frame_boundaries(&state, block_chip);
+
+                downlink::send_availability_indications(
+                    &self.config,
+                    &self.runtime,
+                    boundaries.sync_frame_boundary,
+                    frame_system_time,
+                    block_chip,
+                )?;
+
+                if boundaries.sync_frame_boundary {
+                    let t = Instant::now();
+                    downlink::handle_sync_frame(
+                        &self.config,
+                        &self.runtime,
+                        &mut state,
+                        &fsch,
+                        block_chip,
+                    )?;
+                    state.sync_time_sum_us += t.elapsed().as_micros() as u64;
+                }
+
+                if boundaries.paging_frame_boundary && boundaries.paging_enabled {
+                    let t = Instant::now();
+                    let hw_tick = timing::hardware_tick_at_chip(&state, block_chip, tick_rate);
+                    downlink::handle_paging_frame(
+                        &self.config,
+                        &self.runtime,
+                        &mut state,
+                        &fpch,
+                        block_chip,
+                        hw_tick,
+                    )?;
+                    let next_frame_chip = block_chip.saturating_add(state.paging_frame_chips);
+                    let next_frame_system_time =
+                        time::system_time_from_chips(next_frame_chip, state.chip_rate);
+                    downlink::send_paging_frame_availability(
+                        &self.config,
+                        &self.runtime,
+                        &state,
+                        next_frame_system_time,
+                        next_frame_chip,
+                    )?;
+                    state.paging_time_sum_us += t.elapsed().as_micros() as u64;
+                }
+
+                let prev_synth_ftch_us = state.synth_ftch_us;
+                let prev_synth_spread_us = state.synth_spread_us;
+                let block_gen_start = Instant::now();
+                synth::synthesize_block(
+                    &self.runtime,
+                    &self.traffic_channels,
+                    &mut state,
+                    gen_start,
+                    &pch,
+                    &fsch,
+                    &fpch,
+                    &mut spreader,
+                    &mut synth_block,
+                    bs,
+                    frame_system_time,
+                    block_chip,
+                )?;
+                let block_gen_us = block_gen_start.elapsed().as_micros() as u64;
+                if block_gen_us > 500 {
+                    log::warn!(
+                        "tx_slow_gen: {}us (block #{}, chip={}) ftch={}us spread={}us",
+                        block_gen_us,
+                        state.synth_blocks,
+                        block_chip,
+                        state.synth_ftch_us.saturating_sub(prev_synth_ftch_us),
+                        state.synth_spread_us.saturating_sub(prev_synth_spread_us),
+                    );
+                }
+
+                let offset = block_idx * bs;
+                tx_batch[offset..offset + bs].copy_from_slice(&synth_block[..bs]);
+            }
+
+            let batch_gen_us = gen_start.elapsed().as_micros() as u64;
+            if batch_gen_us > 2000 {
+                log::warn!(
+                    "tx_slow_batch_gen: {}us ({} blocks, chip={})",
+                    batch_gen_us,
+                    blocks_per_batch,
+                    chip_cursor
+                );
+            }
+
+            Self::flush_tx_batch(&mut *radio_tx, &mut state, &tx_batch, batch_playout_tick)?;
+
+            chip_cursor += state.tx_batch_chips;
+            sent_blocks += blocks_per_batch;
+        }
+
+        trace!(
+            "bts_sync_fragments: requested={} sent={}",
+            state.sync_requested_fragments, state.sync_sent_fragments
+        );
+        trace!(
+            "bts_paging_fragments: requested={} sent={}",
+            state.paging_requested_fragments, state.paging_sent_fragments
+        );
+
+        info!("disabling TX module");
+        if let Err(e) = radio_tx.enable_transmit(false) {
+            log::error!("failed to disable TX on shutdown: {}", e);
+        }
+
+        if let Some(handle) = rx_thread {
+            info!("waiting for RX thread to shut down...");
+            match handle.join() {
+                Ok(Ok(())) => info!("RX thread stopped"),
+                Ok(Err(err)) => {
+                    log::error!("rx: fatal error: {err}");
+                    std::process::exit(1);
+                }
+                Err(_) => {
+                    log::error!("rx: thread panicked");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Start the BTS TX loop until shutdown.
+    pub async fn start(self) -> Result<(), Error> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        thread::Builder::new()
+            .name("bts-tx".into())
+            .spawn(move || {
+                let result = self.run_loop(None);
+                let _ = tx.send(result);
+            })
+            .map_err(|e| Error::from(format!("failed to spawn TX thread: {}", e)))?;
+        rx.await
+            .map_err(|_| Error::from("BTS TX thread panicked"))?
+    }
+
+    /// Run the BTS TX loop for a bounded number of synthesis blocks.
+    pub async fn run_for_blocks(self, blocks: usize) -> Result<(), Error> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        thread::Builder::new()
+            .name("bts-tx".into())
+            .spawn(move || {
+                set_thread_priority("bts-tx", true);
+                let result = self.run_loop(Some(blocks));
+                let _ = tx.send(result);
+            })
+            .map_err(|e| Error::from(format!("failed to spawn TX thread: {}", e)))?;
+        rx.await
+            .map_err(|_| Error::from("BTS TX thread panicked"))?
+    }
+}
+
+impl Bts {
+    /// Construct a BTS backed by a `RadioPipe` for testing.
+    pub fn new_with_radio_pipe(
+        mut radio: RadioPipe,
+        config: Config,
+        runtime: BtsRuntimeSettings,
+    ) -> (Bts, BtsHandle) {
+        let injected_rx = radio.take_injected_rx();
+        Self::build(Box::new(radio), config, runtime, injected_rx)
+    }
+}

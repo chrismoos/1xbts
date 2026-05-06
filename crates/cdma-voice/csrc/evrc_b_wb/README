@@ -1,0 +1,123 @@
+/**********************************************************************
+Each of the companies; Qualcomm, and Lucent, and Motorola (hereinafter 
+referred to individually as "Source" or collectively as "Sources") do 
+hereby state:
+
+To the extent to which the Source(s) may legally and freely do so, the 
+Source(s), upon submission of a Contribution, grant(s) a free, 
+irrevocable, non-exclusive, license to the Third Generation Partnership 
+Project 2 (3GPP2) and its Organizational Partners: ARIB, CCSA, TIA, TTA, 
+and TTC, under the Source's copyright or copyright license rights in the 
+Contribution, to, in whole or in part, copy, make derivative works, 
+perform, display and distribute the Contribution and derivative works 
+thereof consistent with 3GPP2's and each Organizational Partner's 
+policies and procedures, with the right to (i) sublicense the foregoing 
+rights consistent with 3GPP2's and each Organizational Partner's  policies 
+and procedures and (ii) copyright and sell, if applicable) in 3GPP2's name 
+or each Organizational Partner's name any 3GPP2 or transposed Publication 
+even though this Publication may contain the Contribution or a derivative 
+work thereof.  The Contribution shall disclose any known limitations on 
+the Source's rights to license as herein provided.
+
+When a Contribution is submitted by the Source(s) to assist the 
+formulating groups of 3GPP2 or any of its Organizational Partners, it 
+is proposed to the Committee as a basis for discussion and is not to 
+be construed as a binding proposal on the Source(s).  The Source(s) 
+specifically reserve(s) the right to amend or modify the material 
+contained in the Contribution. Nothing contained in the Contribution 
+shall, except as herein expressly provided, be construed as conferring 
+by implication, estoppel or otherwise, any license or right under (i) 
+any existing or later issuing patent, whether or not the use of 
+information in the document necessarily employs an invention of any 
+existing or later issued patent, (ii) any copyright, (iii) any 
+trademark, or (iv) any other intellectual property right.
+
+With respect to the Software necessary for the practice of any or 
+all Normative portions of the EVRC-WB Variable Rate Speech Codec as 
+it exists on the date of submittal of this form, should the EVRC-WB be 
+approved as a Specification or Report by 3GPP2, or as a transposed 
+Standard by any of the 3GPP2's Organizational Partners, the Source(s) 
+state(s) that a worldwide license to reproduce, use and distribute the 
+Software, the license rights to which are held by the Source(s), will 
+be made available to applicants under terms and conditions that are 
+reasonable and non-discriminatory, which may include monetary compensation, 
+and only to the extent necessary for the practice of any or all of the 
+Normative portions of the EVRC-WB or the field of use of practice of the 
+EVRC-WB Specification, Report, or Standard.  The statement contained above 
+is irrevocable and shall be binding upon the Source(s).  In the event 
+the rights of the Source(s) in and to copyright or copyright license 
+rights subject to such commitment are assigned or transferred, the 
+Source(s) shall notify the assignee or transferee of the existence of 
+such commitments.
+*******************************************************************/
+
+Notes on EVRC-WB executable compilation
+---------------------------------------
+on Unix  - use Makefile
+on Cygwin - use Makefile.cyg
+
+Notes on EVRC-WB executable usage
+---------------------------------
+
+Encoder usage:
+	Evrc_wb -i input_speech_file -o encoded_packet_file -X OP=<0 or 1 or 2 or 3 or Music or Music_MDCT> -X Fsinp=<8000 or 16000> -e [-D]
+
+Decoder usage:
+	EvrcB -i encoded_packet_file -o decoded_output_speech_file -X Fsop=<8000 or 16000> -d [-D]
+
+
+Notes:
+
+The -X OP=0 {or 1 or 2 or 3 or Music or Music_MDCT} exercises the following sample operating points of the EVRC-WB encoder.
+When OP=0, EVRC-WB tries to match the active speech average channel rate of 9.3 kbps
+When OP=1, EVRC-WB tries to match the active speech average channel rate of 6.6 kbps
+When OP=2, EVRC-WB tries to match the active speech average channel rate of 5.8 kbps
+When OP=3, EVRC-WB encodes wideband input speech sampled at 16000 samples/sec using one of CELP/NELP/Silence coding modes on a frame-by-frame basis at the active speech maximum channel rate of 9.6 kbps.
+When OP=Music, EVRC-WB encodes wideband input signal sampled at 16000 samples/sec using one of MDCT/RCELP/NELP/Silence coding modes on a frame-by-frame basis at the active speech maximum channel rate of 9.6 kbps.
+When OP=Music_MDCT, EVRC-WB encodes wideband input signal sampled at 16000 samples/sec using one of MDCT/NELP/Silence coding modes on a frame by frame basis at the active speech maximum channel rate of 9.6 kbps.
+
+The -X Fsinp= 16000{ or 8000} is used to specify the sampling frequency of the input signal. The table below describes the allowed input signal sampling freqencies for each sample operating point
+
+==================================================================================================================
+Fsinp= |  OP=0         |  OP=1         |  OP=2         |  OP=3       |  OP=Music     |  OP=Music_MDCT
+==================================================================================================================
+8000   |  Allowed      |  Allowed      |  Allowed      |  NotAllowed |  Not Allowed  |  Not Allowed
+------------------------------------------------------------------------------------------------------------------
+16000  |  Not Allowed  |  Not Allowed  |  Not Allowed  |  Allowed    |  Allowed      |  Allowed      
+------------------------------------------------------------------------------------------------------------------
+
+The -X Fsop= 16000{ or 8000} is used to specify the sampling frequency of the decoded output signal. The table below describes the allowed output signal sampling freqencies when the input packet was encoded in different sample operating point
+
+==================================================================================================================
+Fsop=  |  OP=0          |  OP=1         |  OP=2         |  OP=3                 |  OP=Music     |  OP=Music_MDCT
+==================================================================================================================
+8000   |  Allowed       |  Allowed      |  Allowed      |  NotAllowed           |  Not Allowed  |  Not Allowed
+------------------------------------------------------------------------------------------------------------------
+16000  |  Not Allowed   |  Not Allowed  |  Not Allowed  |    Allowed            |  Allowed      |  Allowed      
+------------------------------------------------------------------------------------------------------------------
+
+Note: The above limitations in the modes that are "Not allowed" are only temporary, and during EVRC-WB software Ballot resolution and V&V, the above Not Allowed modes will be enabled.
+
+-D option is used to enable DTX at the encoder  and decoder
+
+
+
+Input/Output Data formats
+- input_speech_file, and decoded_output_speech_file 
+	- 8 or 16 KHz, 16-bit(native format (little or big endian)) per sample 
+- encoded_packet_file 
+	- 12 16-bit words per frame 
+	- 1st word is the rate word (4-full, 3-half, 2-quarter, 1-eighth, 0-blank,0xE-erasure)
+	- followed by 11 words of data (regardless of rate)
+
+
+Notes on compiling a VoIP client simulation to interface to NCIM
+----------------------------------------------------------------
+
+Evrc_wb.a 
+----------
+EVRC-WB VoIP client (DeJitter buffer and Decoder) library that interfaces to NCIM in
+3GPP2 C.P1009 (3GPP2 Multimedia Services Evaluation Methodology: Software Tools).
+
+API to this library in codec.h
+

@@ -1,0 +1,18 @@
+[package]
+name = "bladerf"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Safe Rust bindings to the libbladeRF library for bladeRF devices"
+
+[dependencies]
+bladerf-sys = { version = "0.1.0", path = "../bladerf-sys" }
+num-complex = "0.4"
+thiserror = "1"
+log = "0.4"
+
+[lints]
+workspace = true

@@ -1,0 +1,1010 @@
+syntax = "proto3";
+package bsc.v1;
+
+import "google/protobuf/empty.proto";
+
+// ─── System ─────────────────────────────────────────────────────
+
+// Current serving-cell status and identity.
+message SystemStatus {
+  bool running = 1;
+  uint32 sid = 2;
+  uint32 nid = 3;
+  uint32 base_id = 4;
+  uint32 pilot_pn = 5;
+  uint32 reg_zone = 6;
+}
+
+// ─── TX Metrics ─────────────────────────────────────────────────
+
+// Forward-link transmit loop metrics.
+message TxMetrics {
+  int64 timestamp_ns = 1;
+  uint64 chip_cursor = 2;
+  uint64 blocks_transmitted = 3;
+  double rt_ratio = 4;
+  uint64 gen_avg_us = 5;
+  uint64 gen_max_us = 6;
+  uint64 tx_avg_us = 7;
+  uint64 tx_max_us = 8;
+  uint64 synth_pilot_us = 9;
+  uint64 synth_sync_us = 10;
+  uint64 synth_paging_us = 11;
+  uint64 synth_spread_us = 12;
+  uint64 sync_fragments_sent = 13;
+  uint64 paging_fragments_sent = 14;
+}
+
+// ─── RX Metrics ─────────────────────────────────────────────────
+
+// Timing metrics for one receiver pipeline stage.
+message StageMetrics {
+  string name = 1;
+  uint64 total_us = 2;
+  uint64 calls = 3;
+  uint64 max_us = 4;
+  double pct_pipeline = 5;
+}
+
+// Reverse-link receiver pipeline metrics.
+message RxMetrics {
+  uint64 reads = 1;
+  uint64 samples = 2;
+  double rt_ratio = 3;
+  uint64 capture_us = 4;
+  uint64 pipeline_us = 5;
+  uint64 total_us = 6;
+  uint64 total_max_us = 7;
+  repeated StageMetrics stages = 8;
+  optional double deficit_ms = 9;
+}
+
+// Combined radio, receiver, transmitter, and bearer metrics.
+message RadioMetrics {
+  TxMetrics tx = 1;
+  RxMetrics rx = 2;
+  BearerMetrics bearer = 3;
+}
+
+// Forward/reverse bearer transport counters.
+message BearerMetrics {
+  uint64 tx_frames = 1;
+  uint64 rx_accepted = 2;
+  uint64 duplicate_drop = 3;
+  uint64 late_drop = 4;
+  uint64 encode_errors = 5;
+  uint64 route_errors = 6;
+  uint64 delivery_errors = 7;
+}
+
+// ─── Access Events (reverse-link) ──────────────────────────────
+
+// Decoded reverse access or reverse dedicated signaling event.
+message AccessEvent {
+  uint64 chip_start = 1;
+  int64 preamble_frames = 2;
+  uint32 pd = 3;
+  uint32 msg_type = 4;
+  string msg_type_name = 5;
+  optional string address = 6;
+  optional string resolved_address = 40;
+  optional string subscriber_id = 41;
+  optional string l3_summary = 7;
+  string pdu_summary = 8;
+  // Structured decoded fields
+  optional uint32 msg_seq = 9;
+  optional uint32 ack_seq = 42;
+  bool ack_req = 43;
+  bool valid_ack = 44;
+  optional uint32 msid_type = 10;
+  optional uint32 esn = 11;
+  optional uint32 imsi_m_s1 = 12;
+  optional uint32 imsi_m_s2 = 13;
+  optional uint32 mob_p_rev = 14;
+  // Microseconds since Unix epoch (RX wall-clock time)
+  uint64 timestamp_us = 15;
+  // Signal quality metrics
+  optional float snr_db = 16;
+  optional float signal_power_db = 17;
+  optional float demod_quality_pct = 18;
+  // Absolute Rx power in dBm (only present when rx_reference_dbm is configured)
+  optional float rx_power_dbm = 19;
+  string event_id = 20;
+  oneof body {
+    AccessRegistration registration = 30;
+    AccessOrigination origination = 31;
+    AccessPageResponse page_response = 32;
+    AccessOrder order = 33;
+    AccessDataBurst data_burst = 34;
+    AccessServiceConnectCompletion service_connect_completion = 37;
+    AccessServiceResponse service_response = 45;
+    AccessPowerMeasurementReport power_measurement_report = 46;
+  }
+  optional uint32 traffic_walsh_code = 35;
+  bool is_preamble_only = 36;
+  // Decoded r-dsch summary for traffic channel events
+  optional string rdsch_summary = 38;
+  optional string rdsch_msg_type_name = 39;
+}
+
+// Registration Message fields decoded from the reverse access channel.
+message AccessRegistration {
+  uint32 reg_type = 1;
+  bool mob_term = 2;
+  uint32 slot_cycle_index = 3;
+  uint32 mob_p_rev = 4;
+  uint32 scm = 5;
+  uint32 return_cause = 6;
+  uint32 remaining_bits = 7;
+}
+
+// Forward/reverse FCH capability record decoded from an access message.
+message AccessFchCapability {
+  bool frame_size_5ms_supported = 1;
+  repeated uint32 for_supported_rcs = 2;
+  repeated uint32 rev_supported_rcs = 3;
+}
+
+// Forward/reverse DCCH capability record decoded from an access message.
+message AccessDcchCapability {
+  uint32 frame_size_mode = 1;
+  repeated uint32 for_supported_rcs = 2;
+  repeated uint32 rev_supported_rcs = 3;
+}
+
+// Origination Message fields decoded from the reverse access channel.
+message AccessOrigination {
+  bool mob_term = 1;
+  uint32 slot_cycle_index = 2;
+  uint32 mob_p_rev = 3;
+  uint32 scm = 4;
+  uint32 request_mode = 5;
+  bool special_service = 6;
+  optional uint32 service_option = 7;
+  bool pm = 8;
+  bool digit_mode = 9;
+  optional uint32 number_type = 10;
+  optional uint32 number_plan = 11;
+  bool more_fields = 12;
+  uint32 num_fields = 13;
+  string digits = 14;
+  bool nar_an_cap = 15;
+  bool paca_reorig = 16;
+  uint32 return_cause = 17;
+  bool more_records = 18;
+  optional uint32 encryption_supported = 19;
+  bool paca_supported = 20;
+  repeated uint32 alt_service_options = 21;
+  optional bool drs = 22;
+  optional bool uzid_incl = 23;
+  optional uint32 uzid = 24;
+  optional uint32 ch_ind = 25;
+  optional uint32 sr_id = 26;
+  optional bool otd_supported = 27;
+  optional bool qpch_supported = 28;
+  optional bool enhanced_rc = 29;
+  optional uint32 for_rc_pref = 30;
+  optional uint32 rev_rc_pref = 31;
+  optional bool fch_supported = 32;
+  optional AccessFchCapability fch = 33;
+  optional bool dcch_supported = 34;
+  optional AccessDcchCapability dcch = 35;
+  optional bool geo_loc_incl = 36;
+  optional uint32 geo_loc_type = 37;
+  optional bool rev_fch_gating_req = 38;
+  optional bool orig_reason = 39;
+  optional uint32 orig_count = 40;
+  uint32 remaining_bits = 41;
+}
+
+// Page Response Message fields decoded from the reverse access channel.
+message AccessPageResponse {
+  bool mob_term = 1;
+  uint32 slot_cycle_index = 2;
+  uint32 mob_p_rev = 3;
+  uint32 scm = 4;
+  uint32 request_mode = 5;
+  uint32 service_option = 6;
+  bool pm = 7;
+  bool nar_an_cap = 8;
+  repeated uint32 alt_service_options = 9;
+  uint32 remaining_bits = 10;
+}
+
+// Mobile Station Reject Order details decoded from an access/order message.
+message AccessMobileReject {
+  uint32 ordq = 1;
+  string ordq_name = 2;
+  uint32 rejected_type = 3;
+  string rejected_type_name = 4;
+  optional uint32 rejected_order = 5;
+  optional string rejected_order_name = 6;
+  optional uint32 rejected_ordq = 7;
+  optional uint32 rejected_record = 8;
+  optional uint32 con_ref = 9;
+  optional uint32 tag = 10;
+  optional uint32 rejected_pdu_type = 11;
+  optional string rejected_pdu_type_name = 12;
+  string trailing_hex = 13;
+}
+
+// Order Message fields decoded from the reverse access or dedicated channel.
+message AccessOrder {
+  uint32 order = 1;
+  uint32 add_record_len = 2;
+  string order_name = 3;
+  string detail = 4;
+  string order_specific_hex = 5;
+  optional AccessMobileReject reject = 6;
+  uint32 remaining_bits = 7;
+}
+
+// Data Burst Message fields decoded from the reverse access or dedicated channel.
+message AccessDataBurst {
+  uint32 msg_number = 1;
+  uint32 burst_type = 2;
+  string burst_type_name = 3;
+  uint32 num_msgs = 4;
+  uint32 num_fields = 5;
+  uint32 payload_bytes = 6;
+  string payload_hex = 7;
+  uint32 remaining_bits = 8;
+  // Decoded SMS fields (populated when burst_type=3)
+  optional DecodedSms decoded_sms = 9;
+}
+
+// Decoded C.S0015-B SMS Transport Layer message.
+message DecodedSms {
+  uint32 teleservice_id = 1;
+  string destination_number = 2;
+  string originating_number = 3;
+  uint32 message_type = 4;
+  uint32 message_id = 5;
+  string text = 6;
+}
+
+// Service Connect Completion fields decoded from the reverse dedicated channel.
+message AccessServiceConnectCompletion {
+  uint32 serv_con_seq = 1;
+}
+
+// Service Response Message (C.S0005-E 2.7.2.3.2.13)
+// Sent by the mobile on r-dsch in response to a Service Request.
+message AccessServiceResponse {
+  uint32 serv_req_seq = 1;
+  // RESP_PURPOSE: 0b0000=accept, 0b0001=reject, 0b0010=counter-propose
+  uint32 resp_purpose = 2;
+  string resp_purpose_name = 3;
+  // Proposed service option from counter-propose config, if any
+  optional uint32 service_option = 4;
+}
+
+// Power Measurement Report Message (PMRM). C.S0005-E 2.7.2.3.2.6.
+// Sent by the mobile on the reverse dedicated channel to report frame
+// error statistics and active-set pilot strengths.
+message AccessPowerMeasurementReport {
+  // Number of bad frames on FCH (or DCCH if only DCCH assigned). 5 bits.
+  uint32 errors_detected = 1;
+  // Total frame count on FCH (or DCCH if only DCCH assigned). 10 bits.
+  uint32 pwr_meas_frames = 2;
+  // Last Handoff Direction Message sequence number. 2 bits (3 = none received).
+  uint32 last_hdm_seq = 3;
+  // Pilot strengths for each pilot in the Active Set (6 bits each, 0-63).
+  repeated uint32 pilot_strengths = 4;
+  // 1 if both FCH and DCCH are assigned.
+  bool dcch_pwr_meas_incl = 5;
+  // DCCH frame count (10 bits). Present if dcch_pwr_meas_incl.
+  optional uint32 dcch_pwr_meas_frames = 6;
+  // DCCH bad frame count (5 bits). Present if dcch_pwr_meas_incl.
+  optional uint32 dcch_errors_detected = 7;
+  // 1 if FOR_SCH_FER_REP=1 and reporting SCH.
+  bool sch_pwr_meas_incl = 8;
+  // Supplemental channel ID (1 bit). Present if sch_pwr_meas_incl.
+  optional uint32 sch_id = 9;
+  // SCH frame count (16 bits). Present if sch_pwr_meas_incl.
+  optional uint32 sch_pwr_meas_frames = 10;
+  // SCH bad frame count (10 bits). Present if sch_pwr_meas_incl.
+  optional uint32 sch_errors_detected = 11;
+}
+
+// ─── Paging Events (forward-link) ──────────────────────────────
+
+// LAC PDU header fields for every paging channel message
+message PagingPduHeader {
+  uint32 msg_tag = 1;
+  string msg_type_name = 2;
+  uint32 sdu_length_bits = 3;
+  // Addressing (None for broadcast, present for directed PDUs)
+  optional PagingAddress address = 4;
+  // ARQ fields
+  uint32 msg_seq = 5;
+  uint32 ack_seq = 6;
+  bool ack_req = 7;
+  bool valid_ack = 8;
+  string resolved_address = 9;
+}
+
+// Address carried by a forward paging-channel PDU.
+message PagingAddress {
+  oneof addr {
+    uint32 esn = 1;
+    ImsiS imsi_s = 2;
+    ImsiClass0 imsi_class0 = 3;
+  }
+}
+
+// Short-form IMSI_S address fields.
+message ImsiS {
+  uint32 imsi_m_s1 = 1;
+  uint32 imsi_m_s2 = 2;
+}
+
+// Class-0 IMSI address fields.
+message ImsiClass0 {
+  uint32 imsi_m_s1 = 1;
+  uint32 imsi_m_s2 = 2;
+}
+
+// Decoded forward paging-channel transmission event.
+message PagingEvent {
+  PagingPduHeader header = 1;
+  // Microseconds since Unix epoch (TX wall-clock time)
+  uint64 timestamp_us = 2;
+  string event_id = 3;
+  oneof body {
+    PagingSystemParameters system_parameters = 10;
+    PagingAccessParameters access_parameters = 11;
+    PagingNeighborList neighbor_list = 12;
+    PagingCdmaChannelList cdma_channel_list = 13;
+    PagingExtendedSystemParameters extended_system_parameters = 14;
+    PagingGeneralPage general_page = 15;
+    PagingOrder order = 16;
+    PagingDataBurst data_burst = 17;
+    PagingChannelAssignment channel_assignment = 18;
+  }
+}
+
+// ─── Traffic Events (forward-link) ─────────────────────────────
+
+// Decoded forward dedicated traffic-channel signaling event.
+message TrafficEvent {
+  PagingPduHeader header = 1;
+  // Microseconds since Unix epoch (TX wall-clock time)
+  uint64 timestamp_us = 2;
+  uint32 walsh_code = 3;
+  optional uint32 service_option = 4;
+  string channel_name = 5;
+  optional string rc_name = 6;
+  optional string address = 7;
+  optional string l3_summary = 8;
+  string pdu_summary = 9;
+  optional string sdu_hex = 10;
+  optional string pdu_hex = 11;
+  string event_id = 12;
+  oneof body {
+    PagingOrder order = 20;
+    PagingDataBurst data_burst = 21;
+    TrafficServiceConnect service_connect = 22;
+    TrafficAlertWithInfo alert_with_info = 23;
+    TrafficServiceRequest service_request = 25;
+  }
+  // Voice call sub-state (e.g. "WaitingServiceConnect", "Alerting", "Connected", "Releasing")
+  optional string voice_call_state = 24;
+}
+
+// One service-configuration connection record in a Service Connect message.
+message TrafficServiceConnectConnection {
+  uint32 con_ref = 1;
+  uint32 service_option = 2;
+  uint32 for_traffic = 3;
+  uint32 rev_traffic = 4;
+  uint32 ui_encrypt_mode = 5;
+  uint32 sr_id = 6;
+  bool rlp_info_incl = 7;
+}
+
+// Alert With Information Message (C.S0005-E 3.7.3.3.2.3)
+// Sent on f-dsch to tell the MS what call progress tone to play.
+message TrafficAlertWithInfo {
+  // Number of information records
+  uint32 num_info_records = 1;
+  // Signal Information Record (RECORD_TYPE=0x05)
+  optional TrafficSignalInfoRecord signal_info = 2;
+  // Calling Party Number Record (RECORD_TYPE=0x03)
+  optional TrafficCallingPartyRecord calling_party = 3;
+}
+
+message TrafficCallingPartyRecord {
+  // 3-bit NUMBER_TYPE per ANSI T1.607
+  uint32 number_type = 1;
+  // 4-bit NUMBER_PLAN
+  uint32 number_plan = 2;
+  // 2-bit presentation indicator: 0=allowed, 1=restricted, 2=not available
+  uint32 presentation_indicator = 3;
+  // 2-bit screening indicator
+  uint32 screening_indicator = 4;
+  // The calling party digits
+  string digits = 5;
+}
+
+message TrafficSignalInfoRecord {
+  // 0x01 = IS-54B Alerting, 0x02 = IS-54B ISDN Alerting, etc.
+  uint32 signal_type = 1;
+  // 0x00 = Medium, 0x01 = High, 0x02 = Low, 0x03 = Reserved
+  uint32 alert_pitch = 2;
+  // Tone pattern: 0x00 = Normal ringback, etc.
+  uint32 signal = 3;
+  // Human-readable descriptions
+  string signal_type_name = 4;
+  string alert_pitch_name = 5;
+  string signal_name = 6;
+}
+
+// Service Request Message (C.S0005-E 3.7.3.3.2.18)
+// Sent on f-dsch to propose a service configuration to the mobile.
+message TrafficServiceRequest {
+  uint32 serv_req_seq = 1;
+  // REQ_PURPOSE: 0b0001=reject, 0b0010=propose
+  uint32 req_purpose = 2;
+  // Proposed service option (from first connection record, if any)
+  optional uint32 service_option = 3;
+  optional uint32 for_mux_option = 4;
+  optional uint32 rev_mux_option = 5;
+  optional uint32 for_fch_rc = 6;
+  optional uint32 rev_fch_rc = 7;
+}
+
+// Traffic-channel Service Connect message summary.
+message TrafficServiceConnect {
+  uint32 serv_con_seq = 1;
+  uint32 for_mux_option = 2;
+  uint32 rev_mux_option = 3;
+  uint32 for_rates = 4;
+  uint32 rev_rates = 5;
+  repeated TrafficServiceConnectConnection connections = 6;
+  optional uint32 fch_frame_size = 7;
+  optional uint32 for_fch_rc = 8;
+  optional uint32 rev_fch_rc = 9;
+  optional string non_neg_hex = 10;
+}
+
+// System Parameters Message broadcast fields.
+message PagingSystemParameters {
+  uint32 pilot_pn = 1;
+  uint32 sid = 2;
+  uint32 nid = 3;
+  uint32 base_id = 4;
+  uint32 reg_zone = 5;
+  uint32 total_zones = 6;
+  uint32 page_chan = 7;
+  uint32 max_slot_cycle_index = 8;
+  bool power_up_reg = 9;
+  bool parameter_reg = 10;
+}
+
+// Access Parameters Message broadcast fields.
+message PagingAccessParameters {
+  uint32 pilot_pn = 1;
+  uint32 acc_chan = 2;
+  // NOM_PWR open-loop offset in dB. Wire is 4-bit signed (-8..+7).
+  int32 nom_pwr = 3;
+  // INIT_PWR open-loop offset in dB. Wire is 5-bit signed (-16..+15).
+  int32 init_pwr = 4;
+  uint32 pwr_step = 5;
+  uint32 num_step = 6;
+  uint32 max_cap_sz = 7;
+  uint32 auth = 8;
+}
+
+// Neighbor List Message broadcast fields.
+message PagingNeighborList {
+  uint32 pilot_pn = 1;
+  uint32 pilot_inc = 2;
+  repeated uint32 neighbors = 3;
+}
+
+// CDMA Channel List Message broadcast fields.
+message PagingCdmaChannelList {
+  uint32 pilot_pn = 1;
+  repeated uint32 channels = 2;
+}
+
+// Extended System Parameters Message broadcast fields.
+message PagingExtendedSystemParameters {
+  uint32 pilot_pn = 1;
+  uint32 p_rev = 2;
+  uint32 min_p_rev = 3;
+  uint32 mcc = 4;
+  uint32 imsi_11_12 = 5;
+  bool use_tmsi = 6;
+  uint32 pref_msid_type = 7;
+  uint32 max_num_alt_so = 8;
+}
+
+// General Page Message fields and page records.
+message PagingGeneralPage {
+  uint32 config_msg_seq = 1;
+  uint32 acc_msg_seq = 2;
+  bool class_0_done = 3;
+  bool class_1_done = 4;
+  bool tmsi_done = 5;
+  repeated PageRecord page_records = 6;
+}
+
+// One General Page Message page record.
+message PageRecord {
+  oneof record {
+    PageRecordClass0 class0 = 1;
+    PageRecordClass1 class1 = 2;
+    PageRecordTmsi tmsi = 3;
+    PageRecordBroadcast broadcast = 4;
+  }
+}
+
+// Class-0 IMSI page record.
+message PageRecordClass0 {
+  uint32 page_subclass = 1;
+  uint32 msg_seq = 2;
+  optional uint32 imsi_m_s1 = 3;
+  optional uint32 imsi_m_s2 = 4;
+  optional uint32 mcc = 5;
+  optional uint32 imsi_addr_num = 6;
+  bool special_service = 7;
+  optional uint32 service_option = 8;
+  optional uint64 imsi_s = 9;
+}
+
+// Class-1 ESN page record.
+message PageRecordClass1 {
+  uint32 msg_seq = 1;
+  uint32 esn = 2;
+  bool special_service = 3;
+  optional uint32 service_option = 4;
+}
+
+// TMSI page record.
+message PageRecordTmsi {
+  uint32 msg_seq = 1;
+  uint32 tmsi_code_addr = 2;
+  bool special_service = 3;
+  optional uint32 service_option = 4;
+}
+
+// Broadcast page record.
+message PageRecordBroadcast {
+  uint32 bc_addr = 1;
+}
+
+// Forward paging-channel Order Message summary.
+message PagingOrder {
+  uint32 order = 1;
+  uint32 ordq = 2;
+  string order_name = 3;
+}
+
+// Forward paging or traffic Data Burst Message summary.
+message PagingDataBurst {
+  uint32 burst_type = 1;
+  uint32 msg_number = 2;
+  uint32 num_msgs = 3;
+  uint32 payload_bytes = 4;
+  optional DecodedSms decoded_sms = 5;
+}
+
+// Pilot/channel assignment record in an Extended Channel Assignment Message.
+message PagingTrafficPilot {
+  uint32 pilot_pn = 1;
+  bool pwr_comb_ind = 2;
+  uint32 code_chan_fch = 3;
+  uint32 qof_mask_id_fch = 4;
+}
+
+// Channel Assignment or Extended Channel Assignment Message summary.
+message PagingChannelAssignment {
+  // ASSIGN_MODE: 000=IS-95, 100=Extended (IS-2000)
+  uint32 assign_mode = 1;
+  // Walsh code for forward traffic channel
+  uint32 code_chan = 2;
+  uint32 frame_offset = 3;
+  uint32 encrypt_mode = 4;
+  bool freq_incl = 5;
+  optional uint32 band_class = 6;
+  optional uint32 cdma_freq = 7;
+  // Extended (ASSIGN_MODE=100) fields
+  optional bool bypass_alert_answer = 8;
+  optional uint32 default_config = 9;
+  optional uint32 granted_mode = 10;
+  string assign_mode_name = 11;
+  string default_config_name = 12;
+  optional bool direct_ch_assign_ind = 13;
+  optional uint32 for_rc = 14;
+  optional uint32 rev_rc = 15;
+  optional uint32 fpc_subchan_gain = 16;
+  optional sint32 rlgain_adj = 17;
+  optional uint32 ch_ind = 18;
+  optional uint32 ch_record_len_octets = 19;
+  optional uint32 fpc_fch_init_setpt = 20;
+  optional uint32 fpc_fch_fer = 21;
+  optional uint32 fpc_fch_min_setpt = 22;
+  optional uint32 fpc_fch_max_setpt = 23;
+  optional bool rev_fch_gating_mode = 24;
+  optional uint32 plcm_type = 25;
+  optional bool early_rl_transmit_ind = 26;
+  optional uint32 tx_pwr_limit = 27;
+  repeated PagingTrafficPilot pilots = 28;
+  optional string sdu_hex = 29;
+}
+
+// ─── Config ─────────────────────────────────────────────────────
+
+// BTS radio and overhead configuration exposed through management APIs.
+message BtsConfig {
+  uint32 pilot_offset = 1;
+  string spreading_rate = 2;
+  uint32 chip_rate_hz = 3;
+  uint32 tx_sample_rate_hz = 4;
+  uint32 tx_bandwidth_hz = 5;
+  uint32 tx_center_frequency_hz = 6;
+  float tx_digital_backoff = 7;
+  uint32 block_size_chips = 8;
+
+  PilotConfig pilot = 10;
+  SyncConfig sync = 11;
+  PagingConfig paging = 12;
+
+  OverheadConfig overhead = 20;
+}
+
+// Pilot channel configuration.
+message PilotConfig {
+  uint32 walsh_code = 1;
+  float gain = 2;
+}
+
+// Sync channel configuration.
+message SyncConfig {
+  uint32 walsh_code = 1;
+  uint32 data_rate_bps = 2;
+  float gain = 3;
+}
+
+// Paging channel configuration.
+message PagingConfig {
+  uint32 walsh_code = 1;
+  uint32 paging_channel_number = 2;
+  uint32 data_rate_bps = 3;
+  float gain = 4;
+}
+
+// Broadcast overhead parameters used to build paging-channel overhead messages.
+message OverheadConfig {
+  uint32 sid = 1;
+  uint32 nid = 2;
+  uint32 base_id = 3;
+  uint32 reg_zone = 4;
+  uint32 total_zones = 5;
+  uint32 zone_timer = 6;
+  uint32 max_slot_cycle_index = 7;
+  uint32 page_chan = 8;
+  uint32 config_seq = 9;
+  uint32 acc_config_seq = 10;
+  bool power_up_reg = 11;
+  bool parameter_reg = 12;
+  uint32 auth_mode = 13;
+}
+
+// ─── Mobiles ────────────────────────────────────────────────────
+
+// Mobile/subscriber state currently known by the BSC.
+message MobileInfo {
+  reserved 5, 7, 8;
+
+  string address = 1;
+  string page_address = 2;
+  string state = 3;
+  uint32 mob_p_rev = 4;
+  // Structured identity
+  optional uint32 esn = 6;
+  optional string imsi = 25;
+  // Slotted mode paging
+  optional uint32 pgslot = 9;
+  uint32 slot_cycle_index = 10;
+  // Signal quality from last access probe
+  optional float snr_db = 11;
+  optional float signal_power_db = 12;
+  optional float demod_quality_pct = 13;
+  optional uint64 last_heard_ms = 14;
+  // Absolute Rx power in dBm (only present when rx_reference_dbm is configured)
+  optional float rx_power_dbm = 15;
+  // Rx level in dBFS (relative to ADC full-scale). Always populated when raw
+  // power has been measured; use this when rx_power_dbm is not set.
+  optional float rx_level_dbfs = 23;
+  // Closed-loop power control snapshot. Present iff the mobile has an
+  // active reverse traffic channel.
+  optional TrafficChannelPower traffic_power = 24;
+  optional MobileForwardAddress forward_address = 16;
+  optional MobilePageAddress page_address_detail = 17;
+  // Subscriber phone number from HLR (if resolved)
+  optional string phone_number = 18;
+  // HLR subscriber ID (UUID)
+  optional string subscriber_id = 19;
+  // Subscriber display name from HLR (if resolved)
+  optional string subscriber_display_name = 26;
+  // Traffic channel Walsh code (if assigned)
+  optional uint32 traffic_walsh_code = 20;
+  // Traffic channel service option (if assigned, e.g. 6=SMS)
+  optional uint32 traffic_service_option = 21;
+  // Voice call sub-state (e.g. "Alerting", "Connected", "Releasing"; absent for non-voice)
+  optional string voice_call_state = 22;
+}
+
+// List of mobiles currently tracked by the BSC.
+message MobileList {
+  repeated MobileInfo mobiles = 1;
+}
+
+// Forward-channel address used for directed signaling.
+message MobileForwardAddress {
+  oneof addr {
+    uint32 esn = 1;
+    ImsiS imsi_s = 2;
+    ImsiClass0 imsi_class0 = 3;
+  }
+}
+
+// Paging address used for mobile-terminated pages.
+message MobilePageAddress {
+  oneof addr {
+    uint32 esn = 1;
+    MobilePageImsiS imsi_s = 2;
+  }
+}
+
+// IMSI_S page address with optional MCC/IMSI_11_12 context.
+message MobilePageImsiS {
+  uint32 imsi_m_s1 = 1;
+  uint32 imsi_m_s2 = 2;
+  optional uint32 mcc = 3;
+  optional uint32 imsi_11_12 = 4;
+}
+
+// Requests a mobile-terminated voice call.
+message InitiateCallRequest {
+  string subscriber_id = 1;
+  optional string audio_file = 2;
+  // Caller ID digits to present to the called party.
+  optional string caller_number = 3;
+}
+
+// Result of accepting or rejecting a voice-call request.
+message InitiateCallResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+// Requests a mobile-terminated packet-data call.
+message InitiateDataCallRequest {
+  string subscriber_id = 1;
+  // Service option: 33 = high-rate packet (IS-707), 7 = async data.
+  uint32 service_option = 2;
+}
+
+// Result of accepting or rejecting a data-call request.
+message InitiateDataCallResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+// IQ capture state and output metadata.
+message IqCaptureStatus {
+  bool active = 1;
+  string directory = 2;
+  optional string wav_path = 3;
+  optional string metadata_path = 4;
+  optional uint64 first_absolute_chip_start = 5;
+  optional uint64 first_absolute_sample_start = 6;
+  optional string first_sample_system_time = 7;
+  optional int64 first_hardware_time_ns = 8;
+  uint64 captured_samples = 9;
+  double captured_seconds = 10;
+  uint32 sample_rate_hz = 11;
+  uint32 chip_rate_hz = 12;
+}
+
+// ─── Channels ──────────────────────────────────────────────────
+
+// Configured or active radio channel.
+message Channel {
+  // Walsh code (forward-link channels only; absent for access channels)
+  optional uint32 walsh_code = 1;
+  // "pilot", "sync", "paging", "access", "traffic"
+  string channel_type = 2;
+  // "forward" or "reverse"
+  string direction = 3;
+  // Forward-link gain (pilot, sync, paging only)
+  optional float gain = 4;
+  // Data rate in bps (sync, paging, access)
+  optional uint32 data_rate_bps = 5;
+  // Paging channel number (paging only)
+  optional uint32 paging_channel_number = 6;
+  // Access channel number (access only)
+  optional uint32 access_channel_number = 7;
+  // Assigned mobile (traffic channels only)
+  optional ChannelMobile mobile = 8;
+  // Service option (traffic channels only, e.g. 1=voice, 6=SMS)
+  optional uint32 service_option = 9;
+  // Closed-loop power control snapshot (traffic channels only).
+  optional TrafficChannelPower traffic_power = 10;
+}
+
+// Closed-loop power control snapshot for an active traffic channel —
+// both reverse loop (BTS measures, sends PCBs) and forward loop (mobile
+// reports forward FER via PMRM, BSC walks F-FCH gain).
+// See docs/power-control.md for the algorithms and design notes.
+message TrafficChannelPower {
+  // ---- Reverse loop ------------------------------------------------
+  // Outer-loop target Eb/Nt in dB. Calibrated against the FHT
+  // peak/noise ratio computed per PCG in the walsh demod, so it's
+  // gain-independent and matches textbook CDMA figures.
+  float target_eb_nt_db = 1;
+  // Effective inner-loop target currently in use. Equals
+  // `target_eb_nt_db` in auto mode, or the pinned manual target while
+  // an operator override is active.
+  float effective_target_eb_nt_db = 14;
+  // Operator-pinned reverse Eb/Nt target in dB. Absent when the
+  // channel is in normal automatic outer-loop mode.
+  optional float manual_target_override_db = 15;
+  // Most recent Eb/Nt estimate for each modulo-16 PCG slot. Updated
+  // live by per-PCG measurements and refreshed by the latest decoded
+  // 20 ms reverse traffic snapshot.
+  repeated float last_pcg_snr_db = 2;
+  // Exact or best-available transmitted-PCG mask for the same reverse
+  // frame. `true` means the MS transmitted in that PCG.
+  repeated bool last_active_pcg_mask = 13;
+  // Last PCB committed for each modulo-16 PCG slot on the absolute-PCG
+  // TX timeline. 0 = UP (mobile increases TX power), 1 = DOWN.
+  repeated uint32 last_pcbs = 3;
+  // Most recent reverse pilot Ec/Io estimate in dB from the validated
+  // reverse traffic finger. Present when the RC3 reverse receiver exports
+  // a pilot-quality estimate for the active channel.
+  optional float reverse_pilot_ec_io_db = 16;
+  // Sliding-window reverse FER as a percentage (0..100).
+  float fer_pct = 4;
+  // Total received reverse traffic frames since traffic channel allocation.
+  uint64 frames_total = 5;
+  // Total received reverse traffic frames whose CRC failed.
+  uint64 frames_crc_error = 6;
+  // ---- Forward loop ------------------------------------------------
+  // Current forward F-FCH gain offset in dB relative to the channel's
+  // initial composite allocation. Walked by the outer loop based on
+  // PMRM-reported forward FER.
+  float forward_gain_offset_db = 7;
+  // Most recent forward FER reported by the mobile via PMRM, percentage
+  // (0..100). 0 if no PMRM has been received yet (see forward_pmrm_count
+  // to disambiguate).
+  float forward_last_fer_pct = 8;
+  // Raw counts from the most recent PMRM (errors_detected,
+  // pwr_meas_frames). For UI display so an operator can see the loop
+  // input directly.
+  uint32 forward_last_pmrm_errors = 9;
+  uint32 forward_last_pmrm_frames = 10;
+  // Lifetime PMRM count for this channel since allocation.
+  uint64 forward_pmrm_count = 11;
+  // Active Set pilot Ec/Io values (in dB) from the most recent PMRM.
+  // One entry per pilot the mobile reported; typically just the
+  // serving pilot for a single-cell BS. Decoded from the raw 6-bit
+  // PILOT_STRENGTH field via `-raw/2.0` per C.S0005-E §2.7.2.3.2.6.
+  // Empty if no PMRM received yet or the mobile reported NUM_PILOTS=0.
+  repeated float forward_pilot_ec_io_db = 12;
+  // Per-PCG pilot Ec/Nt estimates (dB) used by the inner-loop power
+  // control. For RC3 this comes from R-PICH scatter (rate-independent,
+  // every PCG). For RC1 this equals the data Eb/Nt from FHT peak/noise
+  // (active PCGs only). Separate from `last_pcg_snr_db` which carries
+  // the per-frame data Eb/Nt snapshot.
+  repeated float last_pcg_pilot_ec_nt_db = 17;
+  // Reverse radio configuration (1 = RC1, 3 = RC3, etc.). Lets the UI
+  // choose appropriate labels and metric interpretation.
+  uint32 reverse_radio_config = 18;
+  // Time-series history of 500ms-windowed power control measurements.
+  // Each entry is the mean over a 500ms (400 PCG) window, providing
+  // ~2 Hz granularity for the UI chart. The BSC maintains a rolling
+  // 5-minute buffer (~600 entries).
+  repeated PowerControlSample power_history = 19;
+}
+
+// Single 500ms-windowed power control measurement for the time-series
+// chart. Accumulated server-side from per-PCG (800 Hz) measurements.
+message PowerControlSample {
+  // Wall-clock timestamp at window close, Unix milliseconds.
+  uint64 timestamp_ms = 1;
+  // Mean measured Eb/Nt (or pilot Ec/Nt for RC3) over the 500ms window.
+  float measured_eb_nt_db = 2;
+  // Effective inner-loop target at window close.
+  float target_eb_nt_db = 3;
+  // Forward gain offset at window close.
+  float forward_gain_db = 4;
+  // Sliding-window FER percentage at window close.
+  float fer_pct = 5;
+}
+
+message SetTrafficChannelPowerOverrideRequest {
+  // Active traffic channel Walsh code.
+  uint32 walsh_code = 1;
+
+  oneof action {
+    // Pin the reverse inner-loop target to this Eb/Nt value in dB.
+    float set_target_eb_nt_db = 2;
+    // Clear any active manual override and resume the automatic outer
+    // loop from the pinned value.
+    bool clear = 3;
+  }
+}
+
+message SetTrafficChannelPowerOverrideResponse {
+  bool accepted = 1;
+  string message = 2;
+  optional TrafficChannelPower traffic_power = 3;
+}
+
+// Mobile assignment summary for an active traffic channel.
+message ChannelMobile {
+  string address = 1;
+  string state = 2;
+  optional string phone_number = 3;
+  optional float snr_db = 4;
+  optional float rx_power_dbm = 5;
+  optional float signal_power_db = 6;
+  optional float demod_quality_pct = 7;
+  // Voice call sub-state (absent for non-voice traffic channels)
+  optional string voice_call_state = 8;
+  // Rx level in dBFS (relative to ADC full-scale). Always populated when raw
+  // power has been measured; use this when rx_power_dbm is not set.
+  optional float rx_level_dbfs = 9;
+}
+
+// List of configured and active channels.
+message ChannelList {
+  repeated Channel channels = 1;
+  uint32 total_walsh_codes = 2;
+}
+
+// ─── Service ────────────────────────────────────────────────────
+
+// BSC/BTS management service used by local tools and the web UI.
+service BscService {
+  // Returns current serving-cell status and identity.
+  rpc GetSystemStatus(google.protobuf.Empty) returns (SystemStatus);
+  // Returns active BTS radio and overhead configuration.
+  rpc GetConfig(google.protobuf.Empty) returns (BtsConfig);
+
+  // Returns the latest TX/RX/bearer metrics snapshot.
+  rpc GetRadioMetrics(google.protobuf.Empty) returns (RadioMetrics);
+  // Streams TX/RX/bearer metrics as they are updated.
+  rpc StreamRadioMetrics(google.protobuf.Empty) returns (stream RadioMetrics);
+  // Returns current IQ capture state and output paths.
+  rpc GetIqCaptureStatus(google.protobuf.Empty) returns (IqCaptureStatus);
+  // Starts IQ capture using the configured capture directory.
+  rpc StartIqCapture(google.protobuf.Empty) returns (IqCaptureStatus);
+  // Stops the active IQ capture, if any.
+  rpc StopIqCapture(google.protobuf.Empty) returns (IqCaptureStatus);
+
+  // Streams decoded reverse access-channel events.
+  rpc StreamAccessEvents(google.protobuf.Empty) returns (stream AccessEvent);
+
+  // Streams decoded forward paging-channel transmissions.
+  rpc StreamPagingEvents(google.protobuf.Empty) returns (stream PagingEvent);
+
+  // Streams decoded forward dedicated traffic-channel signaling.
+  rpc StreamTrafficEvents(google.protobuf.Empty) returns (stream TrafficEvent);
+
+  // Lists mobiles known to BSC mobility/subscriber state.
+  rpc ListMobiles(google.protobuf.Empty) returns (MobileList);
+
+  // Lists configured radio channels and active assignments.
+  rpc ListChannels(google.protobuf.Empty) returns (ChannelList);
+  // Applies or clears a manual reverse power-control target override.
+  rpc SetTrafficChannelPowerOverride(SetTrafficChannelPowerOverrideRequest) returns (SetTrafficChannelPowerOverrideResponse);
+
+  // Requests a mobile-terminated packet-data call.
+  rpc InitiateDataCall(InitiateDataCallRequest) returns (InitiateDataCallResponse);
+}

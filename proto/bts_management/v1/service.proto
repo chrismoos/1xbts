@@ -1,0 +1,45 @@
+syntax = "proto3";
+package bts_management.v1;
+
+import "bsc/v1/service.proto";
+import "google/protobuf/empty.proto";
+
+// BTS-local management API for radio state, capture control, and BTS-originated events.
+service BtsManagementService {
+  // Returns BTS runtime status and configured identity.
+  rpc GetBtsStatus(google.protobuf.Empty) returns (bsc.v1.SystemStatus);
+  // Returns the active BTS radio and overhead configuration.
+  rpc GetBtsConfig(google.protobuf.Empty) returns (bsc.v1.BtsConfig);
+  // Returns the latest TX/RX/bearer radio metrics snapshot.
+  rpc GetRadioMetrics(google.protobuf.Empty) returns (bsc.v1.RadioMetrics);
+  // Streams TX/RX/bearer radio metrics as they are updated.
+  rpc StreamRadioMetrics(google.protobuf.Empty) returns (stream bsc.v1.RadioMetrics);
+  // Returns current IQ capture state and output paths.
+  rpc GetIqCaptureStatus(google.protobuf.Empty) returns (bsc.v1.IqCaptureStatus);
+  // Starts a BTS-side IQ capture using the configured capture directory.
+  rpc StartIqCapture(google.protobuf.Empty) returns (bsc.v1.IqCaptureStatus);
+  // Stops the active BTS-side IQ capture, if any.
+  rpc StopIqCapture(google.protobuf.Empty) returns (bsc.v1.IqCaptureStatus);
+  // Lists local pilot, sync, paging, access, and traffic resources.
+  rpc ListLocalRadioResources(google.protobuf.Empty) returns (bsc.v1.ChannelList);
+  // Returns reverse closed-loop power control state for one traffic Walsh code.
+  rpc GetReversePowerControl(ReversePowerControlRequest) returns (bsc.v1.TrafficChannelPower);
+  // Lists reverse closed-loop power control state for active traffic channels.
+  rpc ListReversePowerControls(google.protobuf.Empty) returns (ReversePowerControlList);
+  // Applies or clears a manual reverse power-control target override.
+  rpc SetReversePowerControlOverride(bsc.v1.SetTrafficChannelPowerOverrideRequest) returns (bsc.v1.SetTrafficChannelPowerOverrideResponse);
+  // Streams BTS-emitted paging-channel transmissions.
+  rpc StreamPchTransmissions(google.protobuf.Empty) returns (stream bsc.v1.PagingEvent);
+}
+
+// Selects an active traffic channel by Walsh code.
+message ReversePowerControlRequest {
+  // Forward traffic-channel Walsh code assigned to the mobile.
+  uint32 walsh_code = 1;
+}
+
+// Collection of reverse power-control snapshots for active traffic channels.
+message ReversePowerControlList {
+  // One snapshot per active traffic channel.
+  repeated bsc.v1.TrafficChannelPower power_controls = 1;
+}

@@ -1,0 +1,4 @@
+[build]
+# Required for console-subscriber / tokio-console.
+# Also required for tokio's unstable task dump APIs.
+rustflags = ["--cfg", "tokio_unstable"]

@@ -1,0 +1,55 @@
+syntax = "proto3";
+package management.v1;
+
+import "bsc/v1/service.proto";
+import "google/protobuf/empty.proto";
+
+// Health summary for one node participating in the network-in-a-box stack.
+message NodeHealth {
+  // Stable node identifier used in logs and management UI.
+  string node_id = 1;
+  // Node role such as BTS, BSC, MSC, HLR, SMSC, PCF, or PDSN.
+  string node_type = 2;
+  // True when the node is reachable and serving its expected role.
+  bool healthy = 3;
+  // Human-readable status or failure reason.
+  string message = 4;
+}
+
+// Aggregated management snapshot across radio and core services.
+message SystemOverview {
+  // Current BSC/BTS radio-access status.
+  bsc.v1.SystemStatus bsc_status = 1;
+  // Health state for each managed node.
+  repeated NodeHealth nodes = 2;
+}
+
+// Unified event stream item for the management facade.
+message ManagementEvent {
+  // Node identifier that emitted the event.
+  string source_node_id = 1;
+  // Node role that emitted the event.
+  string source_node_type = 2;
+  // Event category used by clients for filtering and display.
+  string classification = 3;
+  oneof body {
+    // Radio TX/RX/bearer metrics update.
+    bsc.v1.RadioMetrics radio_metrics = 10;
+    // Forward paging-channel transmission event.
+    bsc.v1.PagingEvent paging_event = 11;
+    // Reverse access-channel receive event.
+    bsc.v1.AccessEvent access_event = 12;
+    // Forward dedicated traffic-channel transmission event.
+    bsc.v1.TrafficEvent traffic_event = 13;
+    // Node health transition or heartbeat.
+    NodeHealth node_health = 14;
+  }
+}
+
+// Facade service for clients that want a single management endpoint for the stack.
+service ManagementFacadeService {
+  // Returns a point-in-time status summary for all managed services.
+  rpc GetSystemOverview(google.protobuf.Empty) returns (SystemOverview);
+  // Streams cross-node radio, paging, access, traffic, and health events.
+  rpc StreamSystemEvents(google.protobuf.Empty) returns (stream ManagementEvent);
+}

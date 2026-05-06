@@ -1,0 +1,42 @@
+syntax = "proto3";
+package msc_management.v1;
+
+import "bsc/v1/service.proto";
+import "google/protobuf/empty.proto";
+
+// Active MSC call identifiers.
+message CallList {
+  // MSC call/session IDs currently tracked by call control.
+  repeated string call_ids = 1;
+}
+
+// Submits a mobile-terminated SMS. Exactly one of `destination_number` or
+// `destination_imsi` must be set:
+//   * `destination_number` resolves the target via HLR and addresses by phone
+//     number (subscriber-only path).
+//   * `destination_imsi` sends to the given IMSI directly without an HLR
+//     lookup; used for non-subscriber mobiles seen on the air.
+message SendSmsRequest {
+  string originating_number = 1;
+  string text = 2;
+  optional uint64 timeout_ms = 3;
+  oneof destination {
+    string destination_number = 4;
+    string destination_imsi = 5;
+  }
+}
+
+message SendSmsResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+// MSC management API for mobile-terminated voice, SMS, and call state.
+service MscManagementService {
+  // Initiates a mobile-terminated voice call through the BSC and voice gateway.
+  rpc InitiateCall(bsc.v1.InitiateCallRequest) returns (bsc.v1.InitiateCallResponse);
+  // Submits an SMS for mobile-terminated delivery.
+  rpc SendSms(SendSmsRequest) returns (SendSmsResponse);
+  // Lists active MSC call IDs.
+  rpc ListCalls(google.protobuf.Empty) returns (CallList);
+}

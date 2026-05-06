@@ -1,0 +1,35 @@
+syntax = "proto3";
+package pdsn_management.v1;
+
+import "google/protobuf/empty.proto";
+import "packet/v1/service.proto";
+
+// Packet sessions visible through the PDSN management service.
+message PdsnSessionList {
+  // Summary for each active or recently tracked packet session.
+  repeated packet.v1.PacketSessionInfo sessions = 1;
+}
+
+// Selects a PDSN packet session.
+message GetPdsnSessionRequest {
+  // Packet session identifier allocated by packet-call setup.
+  string session_id = 1;
+}
+
+// Enables or disables packet trace capture for one session.
+message SetPacketTraceCaptureRequest {
+  // Packet session identifier.
+  string session_id = 1;
+  // True to retain packet trace events, false to stop capture.
+  bool enabled = 2;
+}
+
+// PDSN management API for packet session status and trace capture control.
+service PdsnManagementService {
+  // Lists packet sessions known by the PDSN.
+  rpc ListPdsnSessions(google.protobuf.Empty) returns (PdsnSessionList);
+  // Returns detailed status for one packet session.
+  rpc GetPdsnSession(GetPdsnSessionRequest) returns (packet.v1.GetSessionStatusResponse);
+  // Enables or disables trace capture on one packet session.
+  rpc SetPacketTraceCapture(SetPacketTraceCaptureRequest) returns (packet.v1.SetSessionCaptureResponse);
+}

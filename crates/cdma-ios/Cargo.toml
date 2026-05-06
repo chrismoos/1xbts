@@ -1,0 +1,20 @@
+[package]
+name = "cdma-ios"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "IOS/A1 signaling support used by the 1xBTS BSC and MSC."
+
+[dependencies]
+log = "0.4"
+rand = "0.8"
+tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "macros", "time"] }
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

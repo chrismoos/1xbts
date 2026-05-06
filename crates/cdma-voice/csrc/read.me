@@ -1,0 +1,121 @@
+**************************************************************************
+TIA IS-127 Enhanced Variable Rate Codec, Speech Service Option 3 for
+Wideband Spread Spectrum Digital System                            
+**************************************************************************
+This disk contains the Bit-Exact EVRC fixed point C simulation.
+**************************************************************************
+Bit-Exact Fixed Point C Source Code Simulation Version 1.21 11 Apr 1997
+
++ Created separate bin directory for executable.
+
++ Moved math library specific ".h" files to "dspmath" directory. 
+**************************************************************************
+Bit-Exact Fixed Point C Source Code Simulation Version 1.2 12 Mar 1997
+
++ Removed command line options for complexity report (-c) and
+  rate-only mode (-r).
+
++ Added separate random number generator for rate 1/8 encode: e_ran_g().
+  Output from running encoder/decoder separately is now bit-exact to
+  that of running encoder/decoder together.
+
+**************************************************************************
+Bit-Exact Fixed Point C Source Code Simulation Version 1.1 12 Dec 1996
+
++ Modified durbin.c to correctly handly null inputs (for bit-exactness)
+
+**************************************************************************
+Bit-Exact Fixed Point C Source Code Simulation Version 1.0 09 Nov 1996
+
+Changes incorporated into Version 1.0 include (but may not be limited to):
+
++ Noise supression scaling & block normalization
++ FCB Gain quanziter modularized
++ Bug-fixes in ACELP routines (for l_subfr / L_SUBFR problems) 
++ Re-written main driver/pre_processor memory handling.   
++ Other misc. fixes for 'bit-exact' output.
+
+THE TEST SPEECH FILES INCLUDED WITH THIS RELEASE SHOULD NOT BE CONSIDERED
+OFFICAL TEST VECTORS!  TIA Approved test vectors will be provided at a later 
+date.
+
+**************************************************************************
+Bit-Exact Fixed Point C Source Code Simulation Version 0.99a 09 Aug 1996
+
+Version "a" used for MOS test 08/96. Contains Nokia reduced complexity ACELP
+search, updated noise supression scaling, 1/8th rate mods, etc. 
+
+
+**************************************************************************
+Bit-Exact Fixed Point C Source Code Simulation Version 0.95 11 July 1996
+
+There are known known "obvious" bugs in this release.
+The code is still being optimized and quality improved.
+
+Current complexity is around 15-16 MOPS for encode, 2-3 MOPS for decode.
+
+Changes/Bug Fixes/etc. to version 0.90 included in this release:
+
+C-File				Desciption of Change      
+------------------------------------------------------------------------------
+bqiir.c				Re-written by LT to use more percision to improve overall quality
+acelp_pf.c			ACELP Gain Problem fixed by Nokia
+decode.c			ACELP Gain problem fix also needed to update decode.c..
+c8_35pf.c			Fixed energy calc (ps1 & ps2) [Motorola]
+lsp2a.c				Added a round() for a variable
+auto.c				Optimized/Re-written by LT.
+convh.c				Optimized by LT
+durbin.c			Re-written & optimized by LT
+filter.c			Optimized by LT
+fndppf.c			Optimized/Fixed by LT (overflow problems in decimation filter)
+getres.c			Optimized by LT
+lspmaq.c			Optimized by LT
+synfltr.c			Optimized by LT
+w2res.c				Optimized by LT
+rda.c				Qualcomm fixed background noise est... Needs some further testing.
+impulser.c			Fixed Memory[0] inits == 0x800.
+
+**************************************************************************
+Bit-Exact Fixed Point C Source Code Simulation Version 0.90 7 June 1996
+
+Known problems in this release:
+1) RDA does not handle noise estimate properly. Force full rate operation with
+   the "-l 4 -h 4" command line options to disable the RDA.
+
+2) There is a slight gain problem that causes the encoder to generate approx.
+1 to 2 db louder output.  This is related to the ACELP codebook search and
+shall be corrected by release 1.00.
+
+**************************************************************************
+
+Included in the ./test directory are some test input files (.src files) with
+the post-filtered and un-post-filtered speech output files (.pf & .npf) 
+and the bit-stream output files (.bit).  Also included are complexity reports
+generated with the simualtion.  The encoder are the files with the ".erp"
+extension, and the decoder are the files with the ".drp" extensions.  These
+files in the ./test directory ARE NOT qualified test vectors, they are only
+supplied to insure correct operation on the users system.
+
+The test files were created using gcc 2.6.3 under Linux ("PC Format")
+
+Note that there are two compiler options when compiling the fixed point library
+routines in ./dspmath directory.  By default, the library will use double
+precision multiply functions which utilize ungsigned multiplies to determine
+the result.  As an option, the user may define the "USE_ALT_DP31" compile time
+option to use the ETSI double precision multiplies.  Final test vectors will
+be supplied which allow the use of either DPF multiplies in an implementation.
+See the makefile in ./dspmath for more information.
+
+Complexity estimates can be done with the simulator by using the "-c <filename"
+command line option.  If this option is specified, the simulator will create
+a report on the complexity of the major modules.  This complexity measure is
+an estimate based on the fixed point library weighted mops.
+
+Questions and comments regarding the code should be sent to:
+Tom Janiszewski
+Lucent Technologies Network Wireless Systems
+RM2A-203
+67 Whippany Rd,
+Whippany, NJ 08809
+tj@fuwutai.lucent.com
+

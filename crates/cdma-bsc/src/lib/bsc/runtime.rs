@@ -1,0 +1,134 @@
+use std::time::Duration;
+
+use cdma_common::error::Error;
+use log::{debug, info, warn};
+
+use super::{A1ClearState, Bsc, recv_or_pending, recv_unbounded_or_pending};
+
+impl Bsc {
+    pub async fn run(mut self) -> Result<(), Error> {
+        debug!("BSC starting.");
+        self.log_open_loop_power_init();
+
+        let mut access_rx = self.config.access_event_rx.take();
+        let mut sms_rx = self.config.sms_request_rx.take();
+        let mut data_rx = self.config.data_request_rx.take();
+        let mut power_override_rx = self.config.power_override_request_rx.take();
+        let msc_client = self.config.msc_client.clone();
+        let traffic_timeout = Duration::from_secs(self.config.traffic_assignment.idle_timeout_s);
+        let mut stale_channel_interval = tokio::time::interval(Duration::from_secs(1));
+        let mut bearer_poll_interval = tokio::time::interval(Duration::from_millis(20));
+
+        loop {
+            self.drain_pch_transfer_acks();
+
+            let retry_sleep = async {
+                match self.paging.next_retry_at() {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+
+            // Paging retries are now handled by the BTS (OTA retransmission
+            // with L2 ARQ). The BSC is notified of outcomes via
+            // PchMessageTransferAck (cause on failure, bts_l2_termination on
+            // success).
+
+            let voice_poll_deadline = self.next_voice_poll_deadline();
+            let voice_poll_sleep = async {
+                match voice_poll_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+
+            tokio::select! {
+                Some(event) = recv_unbounded_or_pending(access_rx.as_mut()) => {
+                    let event = self.enrich_uplink_event(event);
+                    if !event.is_traffic_phy_status {
+                        self.events.publish_access_event(event.clone());
+                    }
+                    self.handle_access_event(event).await;
+                }
+                Some(sms_req) = recv_or_pending(sms_rx.as_mut()) => {
+                    self.handle_sms_request(sms_req);
+                }
+                Some(data_req) = recv_or_pending(data_rx.as_mut()) => {
+                    self.initiate_bs_data_call(data_req);
+                }
+                Some(power_req) = recv_or_pending(power_override_rx.as_mut()) => {
+                    self.handle_traffic_power_override_request(power_req);
+                }
+                result = async {
+                    match self.config.msc_voice_bearer.as_ref() {
+                        Some(bearer) => bearer.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(frame) = result {
+                        self.handle_forward_bearer_frame(frame);
+                    }
+                }
+                Some(resolution) = self.hlr_result_rx.recv() => {
+                    self.apply_hlr_resolution(resolution);
+                }
+                Some(message) = async {
+                    msc_client.poll_a1().await.ok().flatten()
+                } => {
+                    self.handle_incoming_a1_message(message).await;
+                }
+                _ = retry_sleep => {
+                    self.handle_page_retry();
+                }
+                _ = voice_poll_sleep => {
+                    self.poll_voice_calls().await;
+                }
+                _ = stale_channel_interval.tick() => {
+                    self.drain_pch_transfer_acks();
+                    self.teardown_stale_traffic_channels(traffic_timeout).await;
+                    self.evict_stale_mobiles();
+                }
+                _ = bearer_poll_interval.tick() => {
+                    self.poll_reverse_bearer_preambles().await;
+                    self.apply_rx_measurements();
+                }
+            }
+        }
+    }
+
+    async fn teardown_stale_traffic_channels(&mut self, traffic_timeout: Duration) {
+        let bts_client_for_stale_check = self.config.bts_client.clone();
+        let stale_entries = self
+            .mobiles
+            .stale_traffic_channels(traffic_timeout, |walsh_code| {
+                bts_client_for_stale_check
+                    .as_ref()
+                    .and_then(|client| client.last_traffic_enqueue_at(walsh_code))
+            });
+
+        for stale in stale_entries.into_iter().rev() {
+            warn!(
+                "BSC: traffic channel walsh={} inactive for {}s (channel_state={:?}), tearing down",
+                stale.walsh_code, stale.inactive_secs, stale.channel_state_label
+            );
+            if let (Some(call_id), A1ClearState::Idle) = (stale.a1_call_id, stale.a1_clear_state) {
+                self.a1.send_clear_request(call_id, 0);
+            }
+            self.teardown_traffic_channel(stale.walsh_code).await;
+            self.on_voice_leg_released(stale.voice_session_id, stale.voice_leg_role);
+        }
+    }
+
+    fn evict_stale_mobiles(&mut self) {
+        let evicted = self.evict_idle_mobiles();
+        if evicted > 0 {
+            info!(
+                "BSC: evicted {} idle mobile(s) (timeout={}s, remaining={})",
+                evicted,
+                self.config.mobile_idle_timeout_s,
+                self.mobiles.tracked_count(),
+            );
+            self.publish_mobiles();
+        }
+    }
+}

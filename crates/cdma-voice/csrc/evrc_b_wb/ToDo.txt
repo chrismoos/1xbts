@@ -1,0 +1,25 @@
+To do list for 4GV-WB
+
+VERIFY
+See how NB signal is coded by 4GV-WB copare with OP0 of FOURGV_NB only.
+
+
+CODE CLEAN-UP
+
+- Clear up indentation
+- do dos2unix on all files
+- generate lpc analysis windows in real-time, rather than storing in tables
+    (use a simple recursion; might give fixed-point problems)
+- description of each function
+- description of each function's arguments (also indicating input/output)
+- use 'const' whereever applicable
+- resolve duplicate definition (e.g. LPC_ORD_WB vs LPC_UB_ORDER)
+- LSFs (and LSF codebooks) in the same range everywhere, e.g. from 0 to 0.5, 
+    to avoid conversions and confusions
+- definitions in *.cc files; declarations in *.h files
+- Do nonlinear function in 32 KHz sample rate. Evaluate it.
+- Get rid of unused code baesd on defines.h configuration
+
+- resolve warnings during compilation
+- make sure purify doesnt give warnings
+- remove unused files from CVS latest version

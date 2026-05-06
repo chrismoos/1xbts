@@ -1,0 +1,528 @@
+"use client";
+
+import { use, useCallback, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { esnManufacturer } from "@/lib/esn-manufacturer";
+import { formatEsn } from "@/lib/format";
+import { Card, Stat } from "@/components/card";
+import type {
+  RegistrationBinding,
+  Subscriber,
+  SubscriberIdentity,
+} from "@/lib/proto/hlr/v1/service";
+
+type SubscriberDetail = {
+  subscriber?: Subscriber;
+  identities: SubscriberIdentity[];
+  binding?: RegistrationBinding;
+  error?: string;
+};
+
+function formatTimestamp(
+  ts?: Date | string | { seconds: number; nanos: number } | undefined
+): string {
+  if (!ts) return "-";
+  if (ts instanceof Date || typeof ts === "string") {
+    const date = new Date(ts);
+    return Number.isNaN(date.getTime()) ? "-" : date.toLocaleString();
+  }
+  const millis = ts.seconds * 1000 + Math.floor(ts.nanos / 1_000_000);
+  const date = new Date(millis);
+  return Number.isNaN(date.getTime()) ? "-" : date.toLocaleString();
+}
+
+function formatBindingIdentity(binding?: RegistrationBinding): string {
+  if (!binding) return "-";
+  return [binding.esn != null ? `ESN ${formatEsn(binding.esn)}` : null, binding.imsi ? `IMSI ${binding.imsi}` : null]
+    .filter(Boolean)
+    .join(" / ") || "-";
+}
+
+export default function SubscriberDetailPage({
+  params,
+}: {
+  params: Promise<{ id: string }>;
+}) {
+  const { id } = use(params);
+  const router = useRouter();
+  const [detail, setDetail] = useState<SubscriberDetail | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [saveResult, setSaveResult] = useState<string | null>(null);
+  const [calling, setCalling] = useState(false);
+  const [callAudioFile, setCallAudioFile] = useState("");
+  const [callerNumber, setCallerNumber] = useState("");
+  const [callResult, setCallResult] = useState<string | null>(null);
+  const [startingData, setStartingData] = useState(false);
+  const [dataResult, setDataResult] = useState<string | null>(null);
+  const [dataSo, setDataSo] = useState(33);
+
+  const primaryIdentity = useMemo(
+    () =>
+      detail?.identities.find((identity) => identity.isPrimary) ??
+      detail?.identities?.[0],
+    [detail]
+  );
+
+  const [phoneNumber, setPhoneNumber] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [status, setStatus] = useState("active");
+  const [esnHex, setEsnHex] = useState("");
+  const [imsi, setImsi] = useState("");
+  const [formError, setFormError] = useState<string | null>(null);
+
+  const fetchDetail = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/subscribers/${encodeURIComponent(id)}`);
+      const data: SubscriberDetail = await res.json();
+      if (!res.ok || data.error) {
+        throw new Error(data.error || `HTTP ${res.status}`);
+      }
+      setDetail(data);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "unknown error");
+    } finally {
+      setLoading(false);
+    }
+  }, [id]);
+
+  useEffect(() => {
+    fetchDetail();
+  }, [fetchDetail]);
+
+  useEffect(() => {
+    const subscriber = detail?.subscriber;
+    if (!subscriber) return;
+    setPhoneNumber(subscriber.phoneNumber);
+    setDisplayName(subscriber.displayName || "");
+    setStatus(subscriber.status || "active");
+
+    setEsnHex(
+      primaryIdentity?.esn != null
+        ? (primaryIdentity.esn >>> 0).toString(16).toUpperCase().padStart(8, "0")
+        : ""
+    );
+    setImsi(primaryIdentity?.imsi ?? "");
+  }, [detail, primaryIdentity]);
+
+  const handleSave = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setFormError(null);
+    setSaveResult(null);
+    setSaving(true);
+
+    try {
+      const body: Record<string, unknown> = {
+        phoneNumber: phoneNumber.trim(),
+        displayName,
+        status,
+      };
+
+      const normalizedPhoneNumber = phoneNumber.trim();
+      const normalizedEsn = esnHex.trim();
+      const normalizedImsi = imsi.trim();
+
+      if (!/^\d+$/.test(normalizedPhoneNumber)) {
+        throw new Error("Phone number must contain at least one digit and only digits");
+      }
+
+      if (normalizedEsn) {
+        const esn = parseInt(normalizedEsn, 16);
+        if (isNaN(esn)) {
+          throw new Error("Invalid ESN hex value");
+        }
+        body.esn = esn;
+      }
+
+      if (normalizedImsi) {
+        if (!/^\d{10,15}$/.test(normalizedImsi)) {
+          throw new Error("IMSI must be 10 to 15 digits");
+        }
+        body.imsi = normalizedImsi;
+      }
+
+      const res = await fetch(`/api/subscribers/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        throw new Error(data.error || `HTTP ${res.status}`);
+      }
+      setSaveResult("Saved");
+      await fetchDetail();
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : "unknown error");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!detail?.subscriber) return;
+    setDeleting(true);
+    setError(null);
+    try {
+      const res = await fetch(
+        `/api/subscribers?id=${encodeURIComponent(detail.subscriber.subscriberId)}`,
+        { method: "DELETE" }
+      );
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        throw new Error(data.error || `HTTP ${res.status}`);
+      }
+      router.push("/subscribers");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "unknown error");
+      setDeleting(false);
+    }
+  };
+
+  const handleCall = async () => {
+    if (!detail?.subscriber) return;
+    setCalling(true);
+    setCallResult(null);
+    try {
+      const res = await fetch("/api/calls", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          subscriberId: detail.subscriber.subscriberId,
+          audioFile: callAudioFile.trim() || undefined,
+          callerNumber: callerNumber.trim() || undefined,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.accepted) {
+        throw new Error(data.message || `HTTP ${res.status}`);
+      }
+      setCallResult(data.message || "Call requested");
+    } catch (err) {
+      setCallResult(err instanceof Error ? err.message : "unknown error");
+    } finally {
+      setCalling(false);
+    }
+  };
+
+  const handleDataCall = async () => {
+    if (!detail?.subscriber) return;
+    setStartingData(true);
+    setDataResult(null);
+    try {
+      const res = await fetch("/api/data-call", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          subscriberId: detail.subscriber.subscriberId,
+          serviceOption: dataSo,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.accepted) {
+        throw new Error(data.message || `HTTP ${res.status}`);
+      }
+      setDataResult(data.message || "Data session requested");
+    } catch (err) {
+      setDataResult(err instanceof Error ? err.message : "unknown error");
+    } finally {
+      setStartingData(false);
+    }
+  };
+
+  if (loading) {
+    return <div className="max-w-7xl mx-auto text-sm text-muted">Loading...</div>;
+  }
+
+  if (error || !detail?.subscriber) {
+    return (
+      <div className="max-w-7xl mx-auto space-y-4">
+        <Link
+          href="/subscribers"
+          className="text-sm text-muted hover:text-primary"
+        >
+          &larr; Subscribers
+        </Link>
+        <div className="rounded-lg border border-accent-red/20 bg-accent-red-bg p-4 text-sm text-accent-red">
+          {error || "Subscriber not found"}
+        </div>
+      </div>
+    );
+  }
+
+  const subscriber = detail.subscriber;
+  const binding = detail.binding;
+
+  return (
+    <div className="max-w-7xl mx-auto space-y-6">
+      <div className="flex items-center justify-between gap-4">
+        <div className="min-w-0">
+          <Link
+            href="/subscribers"
+            className="text-sm text-muted hover:text-primary"
+          >
+            &larr; Subscribers
+          </Link>
+          <h1 className="text-lg font-bold font-mono mt-2">{subscriber.phoneNumber}</h1>
+          <div className="text-xs text-muted">
+            {subscriber.displayName || "Unnamed subscriber"}
+          </div>
+        </div>
+        <button
+          onClick={handleDelete}
+          disabled={deleting}
+          className="text-xs px-3 py-1.5 rounded bg-accent-red-bg text-accent-red border border-accent-red/20 hover:bg-accent-red/15 disabled:opacity-50 transition-colors"
+        >
+          {deleting ? "Deleting..." : "Delete Subscriber"}
+        </button>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <Card title="Subscriber">
+          <Stat label="Phone Number" value={subscriber.phoneNumber} mono />
+          <Stat label="Display Name" value={subscriber.displayName || "-"} />
+          <Stat label="Status" value={subscriber.status} />
+          <Stat label="Subscriber ID" value={subscriber.subscriberId} mono />
+          <Stat label="Created" value={formatTimestamp(subscriber.createdAt)} mono />
+          <Stat label="Updated" value={formatTimestamp(subscriber.updatedAt)} mono />
+        </Card>
+
+        <Card title="Registration Binding">
+          {binding ? (
+            <>
+              <Stat label="State" value={binding.state} />
+              <Stat label="Serving Node" value={binding.servingNodeId} mono />
+              <Stat label="Identity" value={formatBindingIdentity(binding)} mono />
+              <Stat label="PGSLOT" value={binding.pgslot != null ? String(binding.pgslot) : "-"} mono />
+              <Stat
+                label="Slot Cycle Index"
+                value={
+                  binding.slotCycleIndex != null
+                    ? String(binding.slotCycleIndex)
+                    : "-"
+                }
+                mono
+              />
+              <Stat
+                label="Last MSG_SEQ"
+                value={binding.lastMsgSeq != null ? String(binding.lastMsgSeq) : "-"}
+                mono
+              />
+              <Stat label="Last Registered" value={formatTimestamp(binding.lastRegisteredAt)} mono />
+              <Stat label="Last Seen" value={formatTimestamp(binding.lastSeenAt)} mono />
+            </>
+          ) : (
+            <p className="text-sm text-muted">No active registration binding.</p>
+          )}
+        </Card>
+
+        <Card title={`Identities (${detail.identities.length})`}>
+          {detail.identities.length === 0 ? (
+            <p className="text-sm text-muted">No identities provisioned.</p>
+          ) : (
+            <div className="space-y-3">
+              {detail.identities.map((identity) => (
+                <div
+                  key={identity.subscriberIdentityId}
+                  className="rounded border border-border p-3 text-xs space-y-1"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-mono text-muted">
+                      {identity.subscriberIdentityId.slice(0, 8)}...
+                    </span>
+                    {identity.isPrimary && (
+                      <span className="rounded bg-badge-green-bg px-2 py-0.5 text-badge-green-text">
+                        Primary
+                      </span>
+                    )}
+                  </div>
+                  {identity.esn != null && (
+                    <div className="font-mono text-secondary">
+                      ESN {formatEsn(identity.esn)}
+                      {esnManufacturer(identity.esn) && (
+                        <span className="ml-2 text-muted font-sans">{esnManufacturer(identity.esn)}</span>
+                      )}
+                    </div>
+                  )}
+                  <div className="font-mono text-secondary">
+                    IMSI {identity.imsi || "Not Available"}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </Card>
+      </div>
+
+      <Card title="Voice Call">
+        <div className="space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] gap-4 items-end">
+            <div>
+              <label className="block text-xs text-muted mb-1">
+                Caller ID Number
+              </label>
+              <input
+                type="text"
+                value={callerNumber}
+                onChange={(e) => setCallerNumber(e.target.value)}
+                placeholder="0000000000"
+                className="w-full glass-input font-mono"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-muted mb-1">
+                Optional WAV Override
+              </label>
+              <input
+                type="text"
+                value={callAudioFile}
+                onChange={(e) => setCallAudioFile(e.target.value)}
+                placeholder="Use server default when blank"
+                className="w-full glass-input font-mono"
+              />
+            </div>
+            <button
+              type="button"
+              onClick={handleCall}
+              disabled={calling || !binding}
+              className="text-xs px-4 py-2 rounded bg-accent-blue hover:bg-accent-blue/80 text-primary disabled:opacity-50 transition-colors"
+            >
+              {calling ? "Calling..." : "Start Call"}
+            </button>
+          </div>
+          <p className="text-xs text-muted">
+            Places a BS-originated voice call to this subscriber. The subscriber must
+            have an active registration binding.
+          </p>
+          {callResult && (
+            <p
+              className={`text-xs ${
+                callResult.toLowerCase().includes("accepted")
+                  ? "text-accent-green"
+                  : "text-accent-red"
+              }`}
+            >
+              {callResult}
+            </p>
+          )}
+        </div>
+      </Card>
+
+      <Card title="Data Session">
+        <div className="space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_auto] gap-4 items-end">
+            <div>
+              <label className="block text-xs text-muted mb-1">
+                Service Option
+              </label>
+              <select
+                value={dataSo}
+                onChange={(e) => setDataSo(Number(e.target.value))}
+                className="w-full glass-input font-mono"
+              >
+                <option value={33}>SO 33 — High-Rate Packet (IS-707)</option>
+                <option value={7}>SO 7 — Async Data</option>
+              </select>
+            </div>
+            <button
+              type="button"
+              onClick={handleDataCall}
+              disabled={startingData || !binding}
+              className="text-xs px-4 py-2 rounded bg-accent-green-bg text-accent-green border border-accent-green/20 hover:bg-accent-green/15 disabled:opacity-50 transition-colors"
+            >
+              {startingData ? "Starting..." : "Start Data Session"}
+            </button>
+          </div>
+          <p className="text-xs text-muted">
+            Pages the mobile and assigns a traffic channel with the selected packet data
+            service option. RLP/PPP negotiation starts automatically on Service Connect.
+          </p>
+          {dataResult && (
+            <p
+              className={`text-xs ${
+                dataResult.toLowerCase().includes("accepted")
+                  ? "text-accent-green"
+                  : "text-accent-red"
+              }`}
+            >
+              {dataResult}
+            </p>
+          )}
+        </div>
+      </Card>
+
+      <Card title="Edit Subscriber">
+        <form onSubmit={handleSave} className="space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div>
+              <label className="block text-xs text-muted mb-1">Phone Number</label>
+              <input
+                type="text"
+                value={phoneNumber}
+                onChange={(e) => setPhoneNumber(e.target.value)}
+                className="w-full glass-input font-mono"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-muted mb-1">Display Name</label>
+              <input
+                type="text"
+                value={displayName}
+                onChange={(e) => setDisplayName(e.target.value)}
+                className="w-full glass-input"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-muted mb-1">Status</label>
+              <select
+                value={status}
+                onChange={(e) => setStatus(e.target.value)}
+                className="w-full glass-input"
+              >
+                <option value="active">active</option>
+                <option value="suspended">suspended</option>
+                <option value="disabled">disabled</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs text-muted mb-1">ESN (hex)</label>
+              <input
+                type="text"
+                value={esnHex}
+                onChange={(e) => setEsnHex(e.target.value)}
+                className="w-full glass-input font-mono"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-muted mb-1">IMSI</label>
+              <input
+                type="text"
+                value={imsi}
+                onChange={(e) => setImsi(e.target.value)}
+                className="w-full glass-input font-mono"
+              />
+            </div>
+          </div>
+
+          {formError && <p className="text-xs text-accent-red">{formError}</p>}
+          {saveResult && <p className="text-xs text-accent-green">{saveResult}</p>}
+
+          <button
+            type="submit"
+            disabled={saving}
+            className="text-xs px-4 py-1.5 rounded bg-accent-green-bg text-accent-green border border-accent-green/20 hover:bg-accent-green/15 disabled:opacity-50 transition-colors"
+          >
+            {saving ? "Saving..." : "Save Changes"}
+          </button>
+        </form>
+      </Card>
+    </div>
+  );
+}

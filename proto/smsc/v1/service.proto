@@ -1,0 +1,167 @@
+syntax = "proto3";
+package smsc.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+// --- Messages ---
+
+// SMS submission accepted by the SMSC.
+message SmsSubmission {
+  string sms_id = 1;  // UUID
+  string originating_number = 2;
+  optional string destination_number = 3;   // set when targeting by phone
+  optional string originating_subscriber_id = 4;
+  optional string destination_subscriber_id = 5;
+  string text = 6;
+  string state = 7;  // "accepted", "paging", "page_response_received", "sent", "failed", "expired"
+  optional string failure_reason = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp updated_at = 10;
+  optional uint64 destination_esn = 11;     // set when targeting by ESN
+  optional string destination_imsi = 12;    // set when targeting by IMSI/IMSI_S digits
+}
+
+// One delivery attempt for an SMS submission.
+message SmsDeliveryAttempt {
+  string sms_delivery_attempt_id = 1;  // UUID
+  string sms_id = 2;                    // FK
+  uint32 attempt_number = 3;
+  string state = 4;  // "queued", "paging", "page_response_received", "forward_sent", "failed", "expired"
+  optional string target_subscriber_id = 5;  // absent for unprovisioned MS
+  optional string failure_reason = 6;
+  google.protobuf.Timestamp requested_at = 7;
+  optional google.protobuf.Timestamp completed_at = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp updated_at = 10;
+}
+
+// MO SMS deduplication fingerprint extracted from teleservice payloads.
+message MoSmsFingerprint {
+  uint32 teleservice_id = 1;
+  uint32 message_type = 2;
+  uint32 message_id = 3;
+}
+
+// --- Request/Response Messages ---
+
+// Creates an SMS submission for later routing and delivery.
+message CreateSmsSubmissionRequest {
+  string originating_number = 1;
+  optional string destination_number = 2;   // set one of the three destination fields
+  string text = 3;
+  optional string originating_subscriber_id = 4;
+  optional string destination_subscriber_id = 5;
+  optional uint64 destination_esn = 6;
+  optional string destination_imsi = 7;
+}
+
+// Created SMS submission.
+message CreateSmsSubmissionResponse {
+  SmsSubmission submission = 1;
+}
+
+// Creates an MO SMS submission or returns a recent matching duplicate.
+message CreateOrGetRecentMoSubmissionRequest {
+  string originating_number = 1;
+  string destination_number = 2;
+  string text = 3;
+  optional string originating_subscriber_id = 4;
+  optional string destination_subscriber_id = 5;
+  MoSmsFingerprint fingerprint = 6;
+}
+
+message CreateOrGetRecentMoSubmissionResponse {
+  SmsSubmission submission = 1;
+  bool created = 2;
+}
+
+// Updates the state of an SMS submission.
+message UpdateSmsSubmissionStateRequest {
+  string sms_id = 1;
+  string state = 2;
+  optional string failure_reason = 3;
+}
+
+// Updated SMS submission.
+message UpdateSmsSubmissionStateResponse {
+  SmsSubmission submission = 1;
+}
+
+// Looks up one SMS submission.
+message GetSmsSubmissionRequest {
+  string sms_id = 1;
+}
+
+// SMS submission plus its delivery attempts.
+message GetSmsSubmissionResponse {
+  SmsSubmission submission = 1;
+  repeated SmsDeliveryAttempt delivery_attempts = 2;
+}
+
+// Paged/filterable request for SMS submission list views.
+message ListSmsSubmissionsRequest {
+  optional uint32 limit = 1;
+  optional uint32 offset = 2;
+  optional string destination_number = 3;
+  optional string state = 4;
+  optional uint64 destination_esn = 5;
+  optional string destination_imsi = 6;
+}
+
+// SMS submission list page and total count.
+message ListSmsSubmissionsResponse {
+  repeated SmsSubmission submissions = 1;
+  uint32 total = 2;
+}
+
+// Creates a new delivery attempt for a submission.
+message CreateDeliveryAttemptRequest {
+  string sms_id = 1;
+  optional string target_subscriber_id = 2;  // omit for unprovisioned MS
+}
+
+// Created delivery attempt.
+message CreateDeliveryAttemptResponse {
+  SmsDeliveryAttempt attempt = 1;
+}
+
+// Updates the state of one delivery attempt.
+message UpdateDeliveryAttemptStateRequest {
+  string sms_delivery_attempt_id = 1;
+  string state = 2;
+  optional string failure_reason = 3;
+}
+
+// Updated delivery attempt.
+message UpdateDeliveryAttemptStateResponse {
+  SmsDeliveryAttempt attempt = 1;
+}
+
+// Assigns or updates the resolved destination subscriber for a submission.
+message UpdateDestinationSubscriberRequest {
+  string sms_id = 1;
+  string destination_subscriber_id = 2;
+}
+
+// --- Service ---
+
+// SMSC service for storing SMS submissions and tracking delivery attempts.
+service SmscService {
+  // Accepts a new SMS submission.
+  rpc CreateSmsSubmission(CreateSmsSubmissionRequest) returns (CreateSmsSubmissionResponse);
+  // Accepts an MO SMS submission with duplicate suppression.
+  rpc CreateOrGetRecentMoSubmission(CreateOrGetRecentMoSubmissionRequest) returns (CreateOrGetRecentMoSubmissionResponse);
+  // Updates high-level submission state.
+  rpc UpdateSmsSubmissionState(UpdateSmsSubmissionStateRequest) returns (UpdateSmsSubmissionStateResponse);
+  // Returns one submission and its delivery attempts.
+  rpc GetSmsSubmission(GetSmsSubmissionRequest) returns (GetSmsSubmissionResponse);
+  // Lists submissions with optional filters.
+  rpc ListSmsSubmissions(ListSmsSubmissionsRequest) returns (ListSmsSubmissionsResponse);
+  // Starts tracking a new delivery attempt for a submission.
+  rpc CreateDeliveryAttempt(CreateDeliveryAttemptRequest) returns (CreateDeliveryAttemptResponse);
+  // Updates delivery-attempt state.
+  rpc UpdateDeliveryAttemptState(UpdateDeliveryAttemptStateRequest) returns (UpdateDeliveryAttemptStateResponse);
+  // Assigns or updates the resolved destination subscriber.
+  rpc UpdateDestinationSubscriber(UpdateDestinationSubscriberRequest) returns (google.protobuf.Empty);
+}

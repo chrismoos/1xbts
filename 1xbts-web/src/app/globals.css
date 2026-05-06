@@ -1,0 +1,271 @@
+@import "tailwindcss";
+
+/* ================================================================
+   Design Tokens — Dark Glass (default) + Light mode overrides
+   ================================================================ */
+
+:root {
+  /* Backgrounds */
+  --bg-body: #0c0e14;
+  --bg-surface: rgba(255, 255, 255, 0.03);
+  --bg-surface-solid: #111827;
+  --bg-surface-raised: rgba(255, 255, 255, 0.05);
+  --bg-sidebar: rgba(12, 14, 20, 0.7);
+  --bg-input: rgba(255, 255, 255, 0.03);
+  --bg-hover: rgba(255, 255, 255, 0.02);
+  --bg-active: rgba(99, 102, 241, 0.15);
+
+  /* Borders */
+  --border-primary: rgba(255, 255, 255, 0.06);
+  --border-subtle: rgba(255, 255, 255, 0.04);
+  --border-input: rgba(255, 255, 255, 0.08);
+
+  /* Text */
+  --text-primary: #f1f5f9;
+  --text-secondary: #e2e8f0;
+  --text-muted: #64748b;
+  --text-dimmed: #475569;
+
+  /* Accents */
+  --accent-indigo: #6366f1;
+  --accent-indigo-text: #818cf8;
+  --accent-green: #34d399;
+  --accent-amber: #fbbf24;
+  --accent-purple: #c084fc;
+  --accent-red: #f87171;
+  --accent-blue: #60a5fa;
+  --accent-cyan: #22d3ee;
+
+  /* Accent backgrounds */
+  --accent-indigo-bg: rgba(99, 102, 241, 0.15);
+  --accent-green-bg: rgba(16, 185, 129, 0.1);
+  --accent-amber-bg: rgba(250, 204, 21, 0.08);
+  --accent-purple-bg: rgba(168, 85, 247, 0.08);
+  --accent-red-bg: rgba(248, 113, 113, 0.08);
+  --accent-blue-bg: rgba(59, 130, 246, 0.1);
+
+  /* Badge pairs */
+  --badge-green-bg: rgba(16, 185, 129, 0.1);
+  --badge-green-text: #34d399;
+  --badge-yellow-bg: rgba(250, 204, 21, 0.1);
+  --badge-yellow-text: #fbbf24;
+  --badge-purple-bg: rgba(168, 85, 247, 0.1);
+  --badge-purple-text: #c084fc;
+  --badge-blue-bg: rgba(59, 130, 246, 0.1);
+  --badge-blue-text: #60a5fa;
+  --badge-red-bg: rgba(248, 113, 113, 0.1);
+  --badge-red-text: #f87171;
+  --badge-orange-bg: rgba(251, 146, 60, 0.1);
+  --badge-orange-text: #fb923c;
+
+  /* Glass effects */
+  --glass-blur: blur(20px);
+  --glass-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 8px 32px rgba(0, 0, 0, 0.3);
+  --glass-radius: 16px;
+  --glass-card-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+
+  /* Gradient orbs */
+  --orb-indigo: rgba(99, 102, 241, 0.15);
+  --orb-green: rgba(16, 185, 129, 0.1);
+  --orb-display: block;
+
+  /* Live indicator */
+  --live-color: #10b981;
+
+  /* Brand */
+  --brand-from: #6366f1;
+  --brand-to: #10b981;
+}
+
+/* Light mode overrides */
+.light {
+  --bg-body: #fafafa;
+  --bg-surface: #fff;
+  --bg-surface-solid: #fff;
+  --bg-surface-raised: #f5f5f8;
+  --bg-sidebar: #fff;
+  --bg-input: #fafafa;
+  --bg-hover: #f5f5f8;
+  --bg-active: #f0f0f5;
+
+  --border-primary: #e8e8ee;
+  --border-subtle: #f2f2f5;
+  --border-input: #e8e8ee;
+
+  --text-primary: #1a1a2e;
+  --text-secondary: #475569;
+  --text-muted: #999;
+  --text-dimmed: #bbb;
+
+  --accent-green: #059669;
+  --accent-amber: #d97706;
+  --accent-purple: #7c3aed;
+  --accent-red: #dc2626;
+  --accent-blue: #6366f1;
+  --accent-indigo-text: #6366f1;
+
+  --accent-indigo-bg: #eef2ff;
+  --accent-green-bg: #ecfdf5;
+  --accent-amber-bg: #fffbeb;
+  --accent-purple-bg: #faf5ff;
+  --accent-red-bg: #fef2f2;
+  --accent-blue-bg: #eef2ff;
+
+  --badge-green-bg: #ecfdf5;
+  --badge-green-text: #059669;
+  --badge-yellow-bg: #fffbeb;
+  --badge-yellow-text: #d97706;
+  --badge-purple-bg: #faf5ff;
+  --badge-purple-text: #7c3aed;
+  --badge-blue-bg: #eef2ff;
+  --badge-blue-text: #6366f1;
+  --badge-red-bg: #fef2f2;
+  --badge-red-text: #dc2626;
+  --badge-orange-bg: #fff7ed;
+  --badge-orange-text: #ea580c;
+
+  --glass-blur: blur(0px);
+  --glass-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  --glass-card-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+
+  --orb-display: none;
+
+  --brand-from: #6366f1;
+  --brand-to: #10b981;
+}
+
+/* ================================================================
+   Tailwind Theme — register tokens as utilities
+   ================================================================ */
+
+@theme inline {
+  --font-sans: var(--font-inter);
+  --font-mono: var(--font-jetbrains);
+
+  --color-body: var(--bg-body);
+  --color-surface: var(--bg-surface);
+  --color-surface-solid: var(--bg-surface-solid);
+  --color-surface-raised: var(--bg-surface-raised);
+  --color-sidebar: var(--bg-sidebar);
+  --color-input: var(--bg-input);
+  --color-hover: var(--bg-hover);
+  --color-active: var(--bg-active);
+
+  --color-border: var(--border-primary);
+  --color-border-subtle: var(--border-subtle);
+  --color-border-input: var(--border-input);
+
+  --color-primary: var(--text-primary);
+  --color-secondary: var(--text-secondary);
+  --color-muted: var(--text-muted);
+  --color-dimmed: var(--text-dimmed);
+
+  --color-accent-indigo: var(--accent-indigo);
+  --color-accent-indigo-text: var(--accent-indigo-text);
+  --color-accent-green: var(--accent-green);
+  --color-accent-amber: var(--accent-amber);
+  --color-accent-purple: var(--accent-purple);
+  --color-accent-red: var(--accent-red);
+  --color-accent-blue: var(--accent-blue);
+  --color-accent-cyan: var(--accent-cyan);
+
+  --color-accent-indigo-bg: var(--accent-indigo-bg);
+  --color-accent-green-bg: var(--accent-green-bg);
+  --color-accent-amber-bg: var(--accent-amber-bg);
+  --color-accent-purple-bg: var(--accent-purple-bg);
+  --color-accent-red-bg: var(--accent-red-bg);
+  --color-accent-blue-bg: var(--accent-blue-bg);
+
+  --color-badge-green-bg: var(--badge-green-bg);
+  --color-badge-green-text: var(--badge-green-text);
+  --color-badge-yellow-bg: var(--badge-yellow-bg);
+  --color-badge-yellow-text: var(--badge-yellow-text);
+  --color-badge-purple-bg: var(--badge-purple-bg);
+  --color-badge-purple-text: var(--badge-purple-text);
+  --color-badge-blue-bg: var(--badge-blue-bg);
+  --color-badge-blue-text: var(--badge-blue-text);
+  --color-badge-red-bg: var(--badge-red-bg);
+  --color-badge-red-text: var(--badge-red-text);
+  --color-badge-orange-bg: var(--badge-orange-bg);
+  --color-badge-orange-text: var(--badge-orange-text);
+
+  --color-live: var(--live-color);
+}
+
+/* ================================================================
+   Global styles
+   ================================================================ */
+
+/* Gradient orbs — dark mode only */
+body::before, body::after {
+  content: '';
+  position: fixed;
+  border-radius: 50%;
+  filter: blur(120px);
+  z-index: 0;
+  pointer-events: none;
+  display: var(--orb-display);
+}
+
+body::before {
+  width: 600px;
+  height: 600px;
+  top: -200px;
+  right: -100px;
+  background: radial-gradient(circle, var(--orb-indigo), transparent 70%);
+}
+
+body::after {
+  width: 500px;
+  height: 500px;
+  bottom: -150px;
+  left: -100px;
+  background: radial-gradient(circle, var(--orb-green), transparent 70%);
+}
+
+/* ================================================================
+   Component layer — glass card, sidebar
+   ================================================================ */
+
+@layer components {
+  .glass-card {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--glass-radius);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+    box-shadow: var(--glass-shadow);
+    overflow: hidden;
+  }
+
+  .glass-card-title {
+    padding: 12px 16px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .glass-sidebar {
+    background: var(--bg-sidebar);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+    border-right: 1px solid var(--border-primary);
+  }
+
+  .glass-input {
+    background: var(--bg-input);
+    border: 1px solid var(--border-input);
+    color: var(--text-primary);
+    border-radius: 12px;
+    min-height: 2.25rem;
+    padding: 0.5rem 0.75rem;
+  }
+
+  .glass-input:focus {
+    outline: none;
+    border-color: var(--accent-indigo);
+  }
+}

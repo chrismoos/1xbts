@@ -1,0 +1,23 @@
+syntax = "proto3";
+package bsc_management.v1;
+
+import "bsc/v1/service.proto";
+import "google/protobuf/empty.proto";
+
+// BSC management API for radio-access state, events, and operator controls.
+service BscManagementService {
+  // Returns current BSC/BTS serving status.
+  rpc GetBscStatus(google.protobuf.Empty) returns (bsc.v1.SystemStatus);
+  // Lists mobiles known to the BSC mobility table.
+  rpc ListMobiles(google.protobuf.Empty) returns (bsc.v1.MobileList);
+  // Lists configured and allocated radio channels.
+  rpc ListChannels(google.protobuf.Empty) returns (bsc.v1.ChannelList);
+  // Streams decoded reverse access-channel events.
+  rpc StreamAccessEvents(google.protobuf.Empty) returns (stream bsc.v1.AccessEvent);
+  // Streams forward paging-channel transmissions.
+  rpc StreamPagingEvents(google.protobuf.Empty) returns (stream bsc.v1.PagingEvent);
+  // Streams forward dedicated traffic-channel transmissions.
+  rpc StreamTrafficEvents(google.protobuf.Empty) returns (stream bsc.v1.TrafficEvent);
+  // Applies or clears a manual reverse power-control target override.
+  rpc SetTrafficChannelPowerOverride(bsc.v1.SetTrafficChannelPowerOverrideRequest) returns (bsc.v1.SetTrafficChannelPowerOverrideResponse);
+}

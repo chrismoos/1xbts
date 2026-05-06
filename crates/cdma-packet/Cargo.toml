@@ -1,0 +1,28 @@
+[package]
+name = "cdma-packet"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Packet-data session, RLP, PPP, TUN, and management support for 1xBTS."
+
+[dependencies]
+log = "0.4"
+libc = "0.2"
+tonic = "0.13"
+prost = "0.13"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+uuid = { version = "1", features = ["v4"] }
+socket2 = "0.5"
+
+[build-dependencies]
+tonic-build = "0.13"
+
+[lib]
+path = "src/lib/mod.rs"
+
+[lints]
+workspace = true

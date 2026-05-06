@@ -1,0 +1,4 @@
+{
+  "grpc_listen_addr": "127.0.0.1:17019",
+  "postgres_dsn": "postgres://1xbts:1xbts@localhost:45432/1xbts"
+}

@@ -1,0 +1,110 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cdma-a8",
+    "crates/cdma-a9",
+    "crates/cdma-a10",
+    "crates/cdma-a11",
+    "crates/cdma-abis",
+    "crates/cdma-bsc",
+    "crates/cdma-bts",
+    "crates/cdma-common",
+    "crates/cdma-hlr",
+    "crates/cdma-ios",
+    "crates/cdma-msc",
+    "crates/cdma-nib",
+    "crates/cdma-packet",
+    "crates/cdma-pcf",
+    "crates/cdma-pdsn",
+    "crates/cdma-smsc",
+    "crates/cdma-voice",
+    "crates/cdma-voice-gw",
+    "external/bladerf",
+    "external/bladerf-sys",
+    "external/libre",
+    "external/libre-sys",
+    "external/limesuite",
+    "external/limesuite-sys",
+    "external/uhd",
+    "external/uhd-sys",
+]
+
+[workspace.package]
+license = "Apache-2.0"
+authors = ["Chris Moos"]
+repository = "https://github.com/chrismoos/1xbts"
+homepage = "https://1xbts.org"
+
+[workspace.lints.rust]
+warnings = "deny"
+
+# TODO before release: annotate non-obvious suppressions with why they're intentional,
+# especially await_holding_lock and mut_from_ref which are relevant to a protocol stack.
+[workspace.lints.clippy]
+bool_assert_comparison = "allow"
+assign_op_pattern = "allow"
+await_holding_lock = "allow"
+byte_char_slices = "allow"
+clone_on_copy = "allow"
+collapsible_match = "allow"
+collapsible_if = "allow"
+default_constructed_unit_structs = "allow"
+derivable_impls = "allow"
+doc_lazy_continuation = "allow"
+empty_line_after_doc_comments = "allow"
+explicit_counter_loop = "allow"
+field_reassign_with_default = "allow"
+for_kv_map = "allow"
+get_first = "allow"
+identity_op = "allow"
+if_same_then_else = "allow"
+implicit_saturating_sub = "allow"
+io_other_error = "allow"
+items_after_test_module = "allow"
+len_without_is_empty = "allow"
+len_zero = "allow"
+let_and_return = "allow"
+manual_contains = "allow"
+manual_checked_ops = "allow"
+manual_c_str_literals = "allow"
+manual_div_ceil = "allow"
+manual_ignore_case_cmp = "allow"
+manual_is_multiple_of = "allow"
+manual_map = "allow"
+manual_range_contains = "allow"
+manual_range_patterns = "allow"
+manual_repeat_n = "allow"
+map_flatten = "allow"
+match_like_matches_macro = "allow"
+mut_from_ref = "allow"
+needless_borrow = "allow"
+needless_late_init = "allow"
+needless_range_loop = "allow"
+never_loop = "allow"
+new_without_default = "allow"
+print_literal = "allow"
+ptr_arg = "allow"
+question_mark = "allow"
+redundant_closure = "allow"
+redundant_locals = "allow"
+redundant_pattern_matching = "allow"
+result_large_err = "allow"
+same_item_push = "allow"
+should_implement_trait = "allow"
+single_match = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+unnecessary_cast = "allow"
+unnecessary_get_then_check = "allow"
+unnecessary_lazy_evaluations = "allow"
+unnecessary_map_or = "allow"
+unusual_byte_groupings = "allow"
+useless_conversion = "allow"
+useless_vec = "allow"
+vec_init_then_push = "allow"
+while_let_loop = "allow"
+wildcard_in_or_patterns = "allow"
+wrong_self_convention = "allow"
+
+[profile.dev]
+debug = "line-tables-only"

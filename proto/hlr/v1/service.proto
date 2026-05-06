@@ -1,0 +1,257 @@
+syntax = "proto3";
+package hlr.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+// --- Messages ---
+
+// Subscriber account record managed by the HLR.
+message Subscriber {
+  string subscriber_id = 1;  // UUID
+  string phone_number = 2;   // one or more decimal digits
+  string display_name = 3;
+  string status = 4;         // "active", "suspended", "disabled"
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+// Radio identity attached to one subscriber.
+message SubscriberIdentity {
+  string subscriber_identity_id = 1;  // UUID
+  string subscriber_id = 2;           // FK
+  optional string imsi = 11;
+  optional uint32 esn = 3;
+  bool is_primary = 9;
+  google.protobuf.Timestamp created_at = 10;
+}
+
+// Current serving-node registration state for one subscriber.
+message RegistrationBinding {
+  string subscriber_id = 1;
+  string serving_node_id = 2;
+  string state = 3;  // "registered", "paged", "page_response_received", "stale"
+  optional string imsi = 50;
+  optional uint32 esn = 10;
+  // Radio state
+  optional uint32 mob_p_rev = 30;
+  optional uint32 pgslot = 31;
+  optional uint32 slot_cycle_index = 32;
+  optional uint32 last_msg_seq = 33;
+  google.protobuf.Timestamp last_registered_at = 40;
+  google.protobuf.Timestamp last_seen_at = 41;
+  google.protobuf.Timestamp updated_at = 42;
+}
+
+// Result of recording a mobile identity sighting.
+message MobileSeenUpsert {
+  bool is_new = 1;
+  optional google.protobuf.Timestamp previous_last_seen_at = 2;
+}
+
+// --- Request/Response Messages ---
+
+// Creates or updates a subscriber and optionally attaches one identity.
+message UpsertSubscriberRequest {
+  string phone_number = 1;  // one or more decimal digits
+  string display_name = 2;
+  string status = 3;
+  // Identity to attach
+  optional string imsi = 16;
+  optional uint32 esn = 10;
+}
+
+// Created or updated subscriber and identity.
+message UpsertSubscriberResponse {
+  Subscriber subscriber = 1;
+  SubscriberIdentity identity = 2;
+}
+
+// Creates or updates one radio identity for an existing subscriber.
+message UpsertIdentityRequest {
+  string subscriber_id = 1;
+  optional string imsi = 2;
+  optional uint32 esn = 3;
+}
+
+message UpsertIdentityResponse {
+  SubscriberIdentity identity = 1;
+}
+
+// Replaces the subscriber's primary identity.
+message ReplacePrimaryIdentityRequest {
+  string subscriber_id = 1;
+  optional string imsi = 2;
+  optional uint32 esn = 3;
+}
+
+message ReplacePrimaryIdentityResponse {
+  SubscriberIdentity identity = 1;
+}
+
+// Lists all identities attached to one subscriber.
+message GetIdentitiesForSubscriberRequest {
+  string subscriber_id = 1;
+}
+
+message GetIdentitiesForSubscriberResponse {
+  repeated SubscriberIdentity identities = 1;
+}
+
+// Records that a mobile identity was observed on the air interface.
+message UpsertMobileSeenRequest {
+  optional uint32 esn = 1;
+  optional string imsi = 2;
+  optional uint32 mob_p_rev = 3;
+}
+
+message UpsertMobileSeenResponse {
+  MobileSeenUpsert result = 1;
+}
+
+// Looks up a subscriber by normalized phone number.
+message GetSubscriberByPhoneNumberRequest {
+  string phone_number = 1;
+}
+
+// Subscriber lookup result including identities and active registration.
+message GetSubscriberByPhoneNumberResponse {
+  Subscriber subscriber = 1;
+  repeated SubscriberIdentity identities = 2;
+  optional RegistrationBinding binding = 3;
+}
+
+// Looks up a subscriber by UUID.
+message GetSubscriberRequest {
+  string subscriber_id = 1;
+}
+
+// Subscriber lookup result including identities and active registration.
+message GetSubscriberResponse {
+  Subscriber subscriber = 1;
+  repeated SubscriberIdentity identities = 2;
+  optional RegistrationBinding binding = 3;
+}
+
+// Resolves a mobile identity observed on the air interface to a subscriber.
+message ResolveSubscriberByIdentityRequest {
+  optional uint32 esn = 1;
+  optional string imsi = 2;
+  // Radio-derived IMSI_S pieces. The HLR derives these from stored IMSI
+  // strings when an access event cannot provide the full IMSI.
+  optional uint32 imsi_m_s1 = 3;
+  optional uint32 imsi_m_s2 = 4;
+}
+
+// Resolved subscriber and current registration binding, if any.
+message ResolveSubscriberByIdentityResponse {
+  optional Subscriber subscriber = 1;
+  optional RegistrationBinding binding = 2;
+}
+
+// Creates or updates the serving-node registration binding for a subscriber.
+message UpsertRegistrationBindingRequest {
+  string subscriber_id = 1;
+  string serving_node_id = 2;
+  string state = 3;
+  optional string imsi = 50;
+  optional uint32 esn = 10;
+  optional uint32 mob_p_rev = 30;
+  optional uint32 pgslot = 31;
+  optional uint32 slot_cycle_index = 32;
+  optional uint32 last_msg_seq = 33;
+}
+
+// Updated registration binding.
+message UpsertRegistrationBindingResponse {
+  RegistrationBinding binding = 1;
+}
+
+// Resolves an SMS destination number to a routable subscriber.
+message ResolveSmsTargetRequest {
+  string destination_number = 1;
+}
+
+// SMS target resolution result.
+message ResolveSmsTargetResponse {
+  Subscriber subscriber = 1;
+  optional RegistrationBinding binding = 2;
+}
+
+// Paged request for subscriber list views.
+message ListSubscribersRequest {
+  optional uint32 limit = 1;
+  optional uint32 offset = 2;
+}
+
+// Subscriber list page and total count.
+message ListSubscribersResponse {
+  repeated Subscriber subscribers = 1;
+  uint32 total = 2;
+}
+
+// Deletes one subscriber and associated identities/bindings.
+message DeleteSubscriberRequest {
+  string subscriber_id = 1;
+}
+
+// Updates subscriber profile fields and optionally replaces identity data.
+message UpdateSubscriberRequest {
+  string subscriber_id = 1;
+  string phone_number = 2;
+  string display_name = 3;
+  string status = 4;
+  optional string imsi = 16;
+  optional uint32 esn = 10;
+}
+
+// Updated subscriber, identity, and registration state.
+message UpdateSubscriberResponse {
+  Subscriber subscriber = 1;
+  optional SubscriberIdentity identity = 2;
+  optional RegistrationBinding binding = 3;
+}
+
+// Looks up the current registration binding for a subscriber.
+message GetRegistrationBindingRequest {
+  string subscriber_id = 1;
+}
+
+// Current registration binding, if present.
+message GetRegistrationBindingResponse {
+  optional RegistrationBinding binding = 1;
+}
+
+// --- Service ---
+
+// HLR service for subscriber profiles, radio identities, and registrations.
+service HlrService {
+  // Creates or updates a subscriber and optional primary identity.
+  rpc UpsertSubscriber(UpsertSubscriberRequest) returns (UpsertSubscriberResponse);
+  // Creates or updates one radio identity for a subscriber.
+  rpc UpsertIdentity(UpsertIdentityRequest) returns (UpsertIdentityResponse);
+  // Replaces the subscriber's primary identity.
+  rpc ReplacePrimaryIdentity(ReplacePrimaryIdentityRequest) returns (ReplacePrimaryIdentityResponse);
+  // Lists all radio identities for a subscriber.
+  rpc GetIdentitiesForSubscriber(GetIdentitiesForSubscriberRequest) returns (GetIdentitiesForSubscriberResponse);
+  // Records a mobile sighting.
+  rpc UpsertMobileSeen(UpsertMobileSeenRequest) returns (UpsertMobileSeenResponse);
+  // Looks up subscriber state by normalized phone number.
+  rpc GetSubscriberByPhoneNumber(GetSubscriberByPhoneNumberRequest) returns (GetSubscriberByPhoneNumberResponse);
+  // Looks up subscriber state by subscriber UUID.
+  rpc GetSubscriber(GetSubscriberRequest) returns (GetSubscriberResponse);
+  // Resolves ESN, IMSI, or IMSI_S fields to subscriber state.
+  rpc ResolveSubscriberByIdentity(ResolveSubscriberByIdentityRequest) returns (ResolveSubscriberByIdentityResponse);
+  // Updates the serving-node registration binding for a subscriber.
+  rpc UpsertRegistrationBinding(UpsertRegistrationBindingRequest) returns (UpsertRegistrationBindingResponse);
+  // Resolves a destination phone number for SMS routing.
+  rpc ResolveSmsTarget(ResolveSmsTargetRequest) returns (ResolveSmsTargetResponse);
+  // Lists subscriber records for management UI pages.
+  rpc ListSubscribers(ListSubscribersRequest) returns (ListSubscribersResponse);
+  // Updates subscriber profile and optional identity fields.
+  rpc UpdateSubscriber(UpdateSubscriberRequest) returns (UpdateSubscriberResponse);
+  // Deletes one subscriber.
+  rpc DeleteSubscriber(DeleteSubscriberRequest) returns (google.protobuf.Empty);
+  // Returns the current registration binding for a subscriber.
+  rpc GetRegistrationBinding(GetRegistrationBindingRequest) returns (GetRegistrationBindingResponse);
+}

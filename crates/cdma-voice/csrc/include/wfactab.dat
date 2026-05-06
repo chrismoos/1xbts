@@ -1,0 +1,89 @@
+/*======================================================================*/
+/*     Enhanced Variable Rate Codec - Bit-Exact C Specification         */
+/*     Copyright (C) 1997-1998 Telecommunications Industry Association. */
+/*     All rights reserved.                                             */
+/*----------------------------------------------------------------------*/
+/* Note:  Reproduction and use of this software for the design and      */
+/*     development of North American Wideband CDMA Digital              */
+/*     Cellular Telephony Standards is authorized by the TIA.           */
+/*     The TIA does not authorize the use of this software for any      */
+/*     other purpose.                                                   */
+/*                                                                      */
+/*     The availability of this software does not provide any license   */
+/*     by implication, estoppel, or otherwise under any patent rights   */
+/*     of TIA member companies or others covering any use of the        */
+/*     contents herein.                                                 */
+/*                                                                      */
+/*     Any copies of this software or derivative works must include     */
+/*     this and all other proprietary notices.                          */
+/*======================================================================*/
+short wfac_GAMMA1[10] = 	/* 0.900000 */
+{
+	29491,
+	26542,
+	23888,
+	21499,
+	19349,
+	17414,
+	15673,
+	14106,
+	12695,
+	11425
+};
+
+short wfac_GAMMA2[10] = 	/* 0.500000 */
+{
+	16384,
+	8192,
+	4096,
+	2048,
+	1024,
+	512,
+	256,
+	128,
+	64,
+	32
+};
+
+short wfac_Gamma_4[10] = 	/* 0.994000 */
+{
+	32571,
+	32376,
+	32182,
+	31989,
+	31797,
+	31606,
+	31416,
+	31228,
+	31040,
+	30854
+};
+
+short wfac_ALPHA[10] = 	/* 0.570000 */
+{
+	18678,
+	10646,
+	6068,
+	3459,
+	1972,
+	1124,
+	641,
+	365,
+	208,
+	119
+};
+
+short wfac_BETA[10] = 	/* 0.750000 */
+{
+	24576,
+	18432,
+	13824,
+	10368,
+	7776,
+	5832,
+	4374,
+	3281,
+	2460,
+	1845
+};
+

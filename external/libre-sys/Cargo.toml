@@ -1,0 +1,26 @@
+[package]
+name = "libre-sys"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Low-level bindings to Baresip libre/re"
+links = "re"
+build = "build.rs"
+
+[features]
+default = []
+required = []
+
+[lib]
+doctest = false
+
+[build-dependencies]
+bindgen = "0.71"
+cc = "1"
+pkg-config = "0.3"
+
+[lints]
+workspace = true

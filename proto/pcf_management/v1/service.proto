@@ -1,0 +1,28 @@
+syntax = "proto3";
+package pcf_management.v1;
+
+import "bsc/v1/service.proto";
+import "google/protobuf/empty.proto";
+import "packet/v1/service.proto";
+
+// Packet sessions visible through the PCF management service.
+message PcfSessionList {
+  // Summary for each active or recently tracked packet session.
+  repeated packet.v1.PacketSessionInfo sessions = 1;
+}
+
+// Selects a PCF packet session.
+message GetPcfSessionRequest {
+  // Packet session identifier allocated by packet-call setup.
+  string session_id = 1;
+}
+
+// PCF management API for packet-call initiation and packet session inspection.
+service PcfManagementService {
+  // Initiates a data call by paging the mobile and requesting packet service.
+  rpc InitiateDataCall(bsc.v1.InitiateDataCallRequest) returns (bsc.v1.InitiateDataCallResponse);
+  // Lists packet sessions known by the PCF.
+  rpc ListPcfSessions(google.protobuf.Empty) returns (PcfSessionList);
+  // Returns detailed status for one packet session.
+  rpc GetPcfSession(GetPcfSessionRequest) returns (packet.v1.GetSessionStatusResponse);
+}

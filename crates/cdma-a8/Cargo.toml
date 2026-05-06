@@ -1,0 +1,15 @@
+[package]
+name = "cdma-a8"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "A8 packet-data bearer support for the 1xBTS packet core."
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

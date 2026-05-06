@@ -1,0 +1,25 @@
+[package]
+name = "uhd-sys"
+version = "0.1.3"
+authors.workspace = true
+repository.workspace = true
+edition = "2021"
+homepage.workspace = true
+license = "MIT OR Apache-2.0"
+description = "Low-level UHD (USRP Hardware Driver) FFI bindings used by the 1xBTS SDR backend."
+keywords = ["sdr"]
+categories = ["external-ffi-bindings", "hardware-support"]
+links = "uhd"
+build = "build.rs"
+
+[lib]
+doctest = false
+
+[dependencies]
+
+[build-dependencies]
+pkg-config = "0.3"
+bindgen = "0.71"
+
+[lints]
+workspace = true

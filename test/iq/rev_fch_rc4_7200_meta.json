@@ -1,0 +1,13 @@
+{
+  "generatorScript": "generate_all_goldens.m (generate_reverse_rc4_fch)",
+  "direction": "reverse",
+  "radioConfig": 4,
+  "channelType": "fch",
+  "dataRate": 7200,
+  "sampleRate": 4.9152E+6,
+  "chipRate": 1.2288E+6,
+  "numFrames": 4,
+  "infoBitsPerFrame": 125,
+  "pilotEnabled": true,
+  "encodingRate": "1/4"
+}

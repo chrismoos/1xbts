@@ -1,0 +1,17 @@
+[package]
+name = "libre"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Safe Rust wrapper for Baresip libre/re"
+
+[dependencies]
+libre-sys = { version = "0.1.0", path = "../libre-sys" }
+libc = "0.2"
+thiserror = "1"
+
+[lints]
+workspace = true

@@ -1,0 +1,169 @@
+syntax = "proto3";
+package packet.v1;
+
+// Packet data service used by the PCF/PDSN edge to manage RLP/PPP/IP sessions.
+service PacketService {
+  // Opens or replaces packet session state for one mobile data call.
+  rpc OpenSession(OpenSessionRequest) returns (OpenSessionResponse);
+  // Closes one packet session and releases associated transport resources.
+  rpc CloseSession(CloseSessionRequest) returns (CloseSessionResponse);
+  // Exchanges reverse and forward RLP frame payloads for a packet session.
+  rpc StreamSession(stream SessionFrame) returns (stream SessionFrame);
+  // Returns detailed RLP/PPP/IP state for one packet session.
+  rpc GetSessionStatus(GetSessionStatusRequest) returns (GetSessionStatusResponse);
+  // Lists known packet sessions.
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  // Enables or disables per-session packet trace capture.
+  rpc SetSessionCapture(SetSessionCaptureRequest) returns (SetSessionCaptureResponse);
+}
+
+// One RLP traffic frame moving between the radio stack and packet engine.
+message SessionFrame {
+  // Packet session identifier.
+  string session_id = 1;
+  // Bit vector encoded as one byte per bit, value 0 or 1.
+  bytes bits = 2;
+  // Number of valid bits in `bits`.
+  uint32 num_bits = 3;
+  // CDMA frame rate represented as payload bits per second.
+  uint32 rate_bps = 4;
+}
+
+// Opens packet session state for one mobile packet-data call.
+message OpenSessionRequest {
+  // Packet session identifier allocated by call setup.
+  string session_id = 1;
+  // CDMA service option, for example SO33 for high-rate packet data.
+  uint32 service_option = 2;
+  // Mobile ESN when available.
+  uint32 esn = 3;
+  // Full mobile IMSI when available.
+  string imsi = 4;
+  // Display/debug mobile address.
+  string mobile_address = 5;
+  // HLR subscriber UUID when resolved.
+  string subscriber_id = 6;
+  // Subscriber phone number when resolved.
+  string phone_number = 7;
+  // Assigned forward traffic-channel Walsh code.
+  uint32 traffic_walsh_code = 8;
+}
+
+// Response returned after packet session state is opened.
+message OpenSessionResponse {
+  // Packet session identifier that was opened.
+  string session_id = 1;
+}
+
+// Closes packet session state and transport resources.
+message CloseSessionRequest {
+  // Packet session identifier to close.
+  string session_id = 1;
+}
+
+// Empty response for a successful session close.
+message CloseSessionResponse {}
+
+// Selects one packet session for status lookup.
+message GetSessionStatusRequest {
+  // Packet session identifier.
+  string session_id = 1;
+}
+
+// Detailed status lookup response for one packet session.
+message GetSessionStatusResponse {
+  // Session detail, omitted only if the implementation returns an error.
+  PacketSessionDetail session = 1;
+}
+
+// Request to list packet sessions.
+message ListSessionsRequest {}
+
+// List of packet session summaries.
+message ListSessionsResponse {
+  // Session summaries sorted by implementation-defined recency.
+  repeated PacketSessionInfo sessions = 1;
+}
+
+// Enables or disables trace capture for one packet session.
+message SetSessionCaptureRequest {
+  // Packet session identifier.
+  string session_id = 1;
+  // True to retain trace events, false to stop capture.
+  bool enabled = 2;
+}
+
+// Response after changing packet trace capture state.
+message SetSessionCaptureResponse {
+  // Updated session detail.
+  PacketSessionDetail session = 1;
+}
+
+// Summary state for a packet data session.
+message PacketSessionInfo {
+  // Packet session identifier.
+  string session_id = 1;
+  // Packet engine phase such as setup, active, or closing.
+  string phase = 2;
+  // CDMA service option used for the session.
+  uint32 service_option = 3;
+  // Mobile-side IP address.
+  string peer_ip = 4;
+  // Network-side IP address.
+  string our_ip = 5;
+  // TUN device name when the session uses TUN transport.
+  string tun_device = 6;
+  uint64 uplink_frames = 10;
+  uint64 downlink_frames = 11;
+  uint64 uplink_bytes = 12;
+  uint64 downlink_bytes = 13;
+  uint64 created_at_ms = 14;
+  uint64 last_phase_change_at_ms = 15;
+  uint64 last_uplink_at_ms = 16;
+  uint64 last_downlink_at_ms = 17;
+  uint64 last_activity_at_ms = 18;
+  uint32 last_uplink_rate_bps = 19;
+  uint32 last_downlink_rate_bps = 20;
+  string mobile_address = 21;
+  string subscriber_id = 22;
+  string phone_number = 23;
+  uint32 traffic_walsh_code = 24;
+  string rlp_state = 25;
+  string lcp_state = 26;
+  string ipcp_state = 27;
+  bool capture_enabled = 28;
+}
+
+// One trace event emitted by PPP, RLP, IP transport, or capture code.
+message PacketTraceEvent {
+  // Unix timestamp in milliseconds.
+  uint64 timestamp_ms = 1;
+  // Protocol layer that emitted the event.
+  string layer = 2;
+  // Direction such as uplink or downlink.
+  string direction = 3;
+  // Short event summary for list displays.
+  string summary = 4;
+  // Longer diagnostic text.
+  string detail = 5;
+  // Optional payload bytes rendered as hex.
+  string payload_hex = 6;
+}
+
+// Detailed packet session status and recent trace events.
+message PacketSessionDetail {
+  // Basic session state and counters.
+  PacketSessionInfo summary = 1;
+  // Most recent inbound control frame summary.
+  string last_rx_control = 2;
+  // Most recent outbound control frame summary.
+  string last_tx_control = 3;
+  // Repeat count for the most recent inbound control frame.
+  uint64 last_rx_control_repeats = 4;
+  // Repeat count for the most recent outbound control frame.
+  uint64 last_tx_control_repeats = 5;
+  // Recent PPP/RLP/IP events retained even when capture is disabled.
+  repeated PacketTraceEvent recent_ppp_events = 6;
+  // Captured trace events retained while capture is enabled.
+  repeated PacketTraceEvent capture_events = 7;
+}

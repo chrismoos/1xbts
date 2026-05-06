@@ -1,0 +1,36 @@
+[package]
+name = "cdma-nib"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Network-in-a-box launcher for running integrated 1xBTS services."
+
+[features]
+default = ["uhd-backend", "lime-backend", "bladerf-backend"]
+uhd-backend = ["cdma-bts/uhd-backend"]
+lime-backend = ["cdma-bts/lime-backend"]
+bladerf-backend = ["cdma-bts/bladerf-backend"]
+
+[dependencies]
+cdma-bts = { path = "../cdma-bts" }
+cdma-bsc = { path = "../cdma-bsc" }
+cdma-common = { path = "../cdma-common" }
+cdma-hlr = { path = "../cdma-hlr" }
+cdma-msc = { path = "../cdma-msc" }
+cdma-pcf = { path = "../cdma-pcf" }
+cdma-pdsn = { path = "../cdma-pdsn" }
+cdma-smsc = { path = "../cdma-smsc" }
+clap = { version = "4", features = ["derive"] }
+console-subscriber = "0.4"
+env_logger = "0.11"
+log = "0.4"
+signal-hook = "0.3"
+tokio = { version = "1", features = ["full", "tracing"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true

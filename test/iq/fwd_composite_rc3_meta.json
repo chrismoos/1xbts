@@ -1,0 +1,43 @@
+{
+  "generatorScript": "generate_forward_rc3_composite_wav.m",
+  "generatorVersion": 1,
+  "direction": "forward",
+  "radioConfig": 3,
+  "sampleRate": 4.9152E+6,
+  "numFrames": 4,
+  "pnOffset": 0,
+  "esn": 1.289493769E+9,
+  "longCodeState": 2.277210749082E+12,
+  "filterType": "Off",
+  "channels": {
+    "pilot": {
+      "enabled": true,
+      "powerDb": 0
+    },
+    "sync": {
+      "enabled": true,
+      "powerDb": -6.3
+    },
+    "pch": {
+      "enabled": true,
+      "walshCode": 1,
+      "powerDb": -0.3,
+      "dataRate": 9600
+    },
+    "fch": {
+      "enabled": true,
+      "walshCode": 4,
+      "powerDb": -0.53,
+      "dataRate": 9600,
+      "longCodeMask": 3.404393922982E+12
+    },
+    "sch": {
+      "enabled": false,
+      "walshCode": 12,
+      "powerDb": -3,
+      "dataRate": 19200,
+      "longCodeMask": 3.541832876454E+12
+    }
+  },
+  "pilotOnlyCompanion": "fwd_composite_rc3_pilot_only.wav"
+}

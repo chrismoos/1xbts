@@ -1,0 +1,104 @@
+
+#/*======================================================================*/
+#/*  4GV - Fourth Generation Vocoder Speech Service Option for             */
+#/*  Wideband Spread Spectrum Digital System                             */
+#/*  C Source Code Simulation                                            */
+#/*                                                                      */
+#/*  Copyright (C) 1999 Qualcomm Incorporated. All rights                */
+#/*  reserved.                                                           */
+#/*----------------------------------------------------------------------*/
+
+.PRECIOUS:	%
+
+CC	= g++
+CFLAGS	= -g3 -Wno-deprecated -D__SUNOS4__
+#CFLAGS	= -g3 -Wno-deprecated
+DEPEND	= -MM -Wno-deprecated
+EXEC	= fourgv
+EXEC_std= Evrc_wb
+VOIPLIB = Evrc_wb.a
+CREATE_NCIM_INPUT = create_ncim_input
+VOIP_TEST = Evrc_wb_ncim
+LDFLAGS	= -lm
+PURE	= /pkg/pure/purify-4.1-solaris2/purify
+
+MAINOBJS = main.o
+VOIPCLIENTOBJS = voip_client.o
+LIBOBJS = \
+dafpindex.o\
+io.o rom.o preproc.o preproc1.o encode.o decode.o filt.o lpcana.o lsp.o olpitch.o rcelp.o \
+acb_cmn.o celp.o acbevrc.o interp.o acelp.o \
+voiced.o ppp.o WI.o \
+nelp.o uvgq.o \
+silence.o WBSmartBlanking.o\
+lsp_cb2233_6697e.o cb_8R_quant.o\
+lspq.o packet.o fer.o \
+genutils.o \
+pf.o\
+bad_rate.o\
+nacfap.o rda.o mode.o new_mode.o \
+filterbank.o filterbank_coef.o \
+cod3_10jcelp.o dec3_10jcelp.o \
+wsnr.o \
+lsp_vq_28.o lsp_vq_22.o lsp_vq_16.o lsp_vq_10.o lsp_vq_8.o \
+cod7_35.o hpf80.o\
+gen_lsp_weights.o r_fft_float.o \
+UB_gain_cb.o UB_lsf_cb.o UB_analysis_windows.o \
+vectors.o wideband_encoder_v1.o gen_shaped_noisev2.o WB_analysis_windows_8thRate.o\
+Quantize_WB_params.o MSencode.o\
+NoiseSynthesis.o declick_frame_v3.o fwd_smooth.o bck_smooth.o\
+log_envelope_1KHz.o wideband_encoder_8thRate.o WB_Erasure_processing.o fgv_mem.o ER_BWext.o\
+UB_enc.o WB_encoder.o WB_decoder.o interppitchfilt.o hnwfilters.o pitchprefilter.o music_mode.o  celp_mdct_discriminator.o blind_bg.o\
+fplib_def.o bigint.o\
+mdct.o
+
+CREATE_NCIM_INPUT_OBJS = create_ncim_input.o
+VOIP_TEST_OBJS = voip_test.o
+DJBOBJS=jitter_buffer.o
+
+DATA = A_AmpCB0.64 A_AmpCB1.64 A_AmpCB2.256 A_PowerCB.256 AmpCB1.64 AmpCB2.64 PowerCB.64
+INCS = defines.h struct.h macro.h io.h filt.h preproc.h proto.h rom.h uvgq.h acelp.h upgrades.h rda.h typedef.h filterbank.h lspq.dat WBSmartBlanking.h
+
+all: ${EXEC} ${EXEC_std} ${VOIPLIB} ${CREATE_NCIM_INPUT} ${VOIP_TEST} 
+
+${EXEC}: ${MAINOBJS} ${LIBOBJS} ${DATA}
+	${CC} -static ${CFLAGS} -o ${EXEC} ${MAINOBJS} ${LIBOBJS} ${LDFLAGS}
+	\rm -f ${EXEC}_enc;ln -s ${EXEC} ${EXEC}_enc
+	\rm -f ${EXEC}_dec;ln -s ${EXEC} ${EXEC}_dec
+
+${EXEC_std}: ${MAINOBJS} ${LIBOBJS} ${DATA}
+	${CC} -static ${CFLAGS} -o ${EXEC_std} ${MAINOBJS} ${LIBOBJS} ${LDFLAGS}
+
+${EXEC}_enc: ${EXEC}
+	\rm -f ${EXEC}_enc;ln -s ${EXEC} ${EXEC}_enc
+
+${EXEC}_dec: ${EXEC}
+	\rm -f ${EXEC}_dec;ln -s ${EXEC} ${EXEC}_dec
+
+${VOIPLIB}: ${VOIPCLIENTOBJS} ${DJBOBJS} ${LIBOBJS} ${DATA}
+	ar rv ${VOIPLIB} ${VOIPCLIENTOBJS} ${DJBOBJS} ${LIBOBJS}
+	ranlib ${VOIPLIB}
+
+${CREATE_NCIM_INPUT}: ${CREATE_NCIM_INPUT_OBJS}
+	${CC} -o ${CREATE_NCIM_INPUT} ${CREATE_NCIM_INPUT_OBJS}
+
+${VOIP_TEST}: ${VOIP_TEST_OBJS} ${VOIPLIB}
+	${CC} ${CFLAGS} -o ${VOIP_TEST} ${VOIP_TEST_OBJS} ${VOIPLIB}
+
+pure: ${EXEC}_pure
+${EXEC}_pure: ${MAINOBJS} ${LIBOBJS} ${DATA}
+	${PURE} ${CC} -static ${CFLAGS} -o ${EXEC_std}_pure ${MAINOBJS} ${LIBOBJS} ${LDFLAGS}
+	\rm -f ${EXEC}_enc_pure;ln -s ${EXEC}_pure ${EXEC}_enc_pure
+	\rm -f ${EXEC}_dec_pure;ln -s ${EXEC}+pure ${EXEC}_dec_pure
+.cc.o:
+	${CC} ${CFLAGS} -c $*.cc
+
+clean:
+	\rm -f *.o depend ${EXEC} ${EXEC}.exe ${EXEC_std} ${EXEC_std}.exe ${EXEC}_enc ${EXEC}_dec ${VOIPLIB} ${VOIP_TEST} ${CREATE_NCIM_INPUT}
+
+
+depend: ${LIBOBJS:%.o=%.cc} ${MAINOBJS:%.o=%.cc} ${VOIPCLIENTOBJS:%.o=%.cc} ${CREATE_NCIM_INPUT_OBJS:%.o=%.cc} ${VOIP_TEST_OBJS: %.o=%.c} ${DATA} ${INCS} 
+	@echo Making dependency file         
+	@${CC} ${DEPEND} ${LIBOBJS:%.o=%.cc} ${MAINOBJS:%.o=%.cc} ${VOIPCLIENTOBJS:%.o=%.cc} ${CREATE_NCIM_INPUT_OBJS:%.o=%.cc} ${VOIP_TEST_OBJS:%.o=%.c} > $@
+include depend
+

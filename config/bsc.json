@@ -1,0 +1,25 @@
+{
+  "traffic_assignment": {
+    "supported_for_rcs": [1, 3],
+    "supported_rev_rcs": [1, 3],
+    "preferred_pairs": [
+      { "for_rc": 3, "rev_rc": 3 }
+    ],
+    "idle_timeout_s": 30
+  },
+  "traffic_retry": {
+    "ack_timeout_ms": 3000,
+    "max_retries": 5
+  },
+  "paging_retry": {
+    "ack_timeout_ms": 15000,
+    "max_retries": 0
+  },
+  "abis": {
+    "remote_addr": "127.0.0.1:5604"
+  },
+  "bearer": {
+    "bind_addr": "127.0.0.1:17022",
+    "remote_addr": "127.0.0.1:17014"
+  }
+}

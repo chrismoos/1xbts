@@ -1,0 +1,18 @@
+[package]
+name = "cdma-a10"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "A10 packet-data bearer support for the 1xBTS packet core."
+
+[dependencies]
+cdma-a8 = { path = "../cdma-a8" }
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

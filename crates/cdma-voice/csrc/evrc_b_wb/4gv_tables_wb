@@ -1,0 +1,31 @@
+see at the bottom for memory configs
+
+QPPP
+	LSP : 6*1024+4*64 : 6168/2 n= 3084
+	Amp : 2*64+10*64+9*64 n= 1344
+FPPP
+	Amp : 2*256+5*64+5*64+9*256 n= 3456
+ER_NB
+	LSP : 5*16+5*16 n= 160
+NELP_NB
+	LSP : 5*256+5*256 : 2560 : 2560/2 n= 1280
+ER_WB_LB
+	LSP : 5*32+5*32 w= 320
+HCELP
+	LSP : 3*128+3*128+4*256 : 1792/2 w=n= 896
+FCELP
+	LSP : 2*64+2*64+3*512+3*128 : 2176/2 w=n= 1088
+NELP_WB_LB
+	Gain: 5*64+5*64+2*32 w=n= 704
+HB_voiced :
+	LSP : 6*256 w= 1536
+	Gain: 32+5*32 w= 192
+HB_unvoiced
+	LSP : 6*8 w= 48
+	Gain: 4*5+4*5 w= 40
+
+
+
+4GV_NB only -> 12012
+4GV_NB+4GV_WB -> 14148
+4GV_WB only -> 4824 (basically 4GV_WB only = 4GV_NB only - 10220)

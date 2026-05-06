@@ -1,0 +1,39 @@
+[package]
+name = "cdma-voice-gw"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "SIP/media voice gateway for 1xBTS."
+
+[dependencies]
+async-trait = "0.1"
+cdma-voice = { path = "../cdma-voice" }
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+libre = { path = "../../external/libre" }
+log = "0.4"
+parking_lot = "0.12"
+prost = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tonic = "0.13"
+uuid = { version = "1", features = ["v4"] }
+
+[build-dependencies]
+tonic-build = "0.13"
+
+[lib]
+path = "src/lib/mod.rs"
+
+[[bin]]
+name = "cdma-voice-gw"
+path = "src/main.rs"
+
+[lints]
+workspace = true
