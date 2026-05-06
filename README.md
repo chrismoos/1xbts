@@ -98,7 +98,14 @@ Clone, bring up the support services, and run the network-in-a-box:
 ```sh
 git clone https://github.com/chrismoos/1xbts.git
 cd 1xbts
+
+# Linux:
+sudo modprobe fou ipip   # load kernel modules required by fou-nat
 docker compose up -d
+
+# macOS (uses bridge networking + host.docker.internal):
+docker compose -f docker-compose.yml -f docker-compose.macos.yml up -d
+
 # postgres :45432 · dashboard :3000 · fou-nat :17012
 cargo run --release -p cdma-nib --no-default-features --features bladerf-backend -- \
     --config-dir config \

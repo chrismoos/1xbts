@@ -21,16 +21,13 @@ services:
   1xbts-web:
     image: node:25-bookworm
     container_name: 1xbts-web
+    network_mode: host
     working_dir: /app
     command: sh -c "npm install && npm run dev -- --hostname 0.0.0.0"
-    ports:
-      - "${ONEXBTS_WEB_PORT:-3000}:3000"
     environment:
-      MANAGEMENT_GRPC_ADDRESS: ${MANAGEMENT_GRPC_ADDRESS:-host.docker.internal:17016}
-      MSC_GRPC_ADDRESS: ${MSC_GRPC_ADDRESS:-host.docker.internal:17017}
+      MANAGEMENT_GRPC_ADDRESS: ${MANAGEMENT_GRPC_ADDRESS:-127.0.0.1:17016}
+      MSC_GRPC_ADDRESS: ${MSC_GRPC_ADDRESS:-127.0.0.1:17017}
       WATCHPACK_POLLING: "true"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     volumes:
       - ./1xbts-web:/app
       - 1xbts-web-node-modules:/app/node_modules
