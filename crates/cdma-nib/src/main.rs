@@ -19,9 +19,7 @@ use tracing_subscriber::{EnvFilter, prelude::*, util::SubscriberInitExt};
 
 mod debug_dump;
 
-const DEFAULT_LOG_FILTER: &str = "debug";
-const DEPENDENCY_LOG_FILTERS: &str =
-    "h2=info,hyper=info,tower=info,tonic=info,sqlx=warn,sqlx_core=warn,sqlx_postgres=warn";
+const DEFAULT_LOG_FILTER: &str = "info";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -63,11 +61,10 @@ fn resolve_config_dir(cli: &Cli) -> PathBuf {
 }
 
 fn effective_log_filter() -> String {
-    let base = std::env::var("RUST_LOG")
+    std::env::var("RUST_LOG")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_LOG_FILTER.to_string());
-    format!("{base},{DEPENDENCY_LOG_FILTERS}")
+        .unwrap_or_else(|| DEFAULT_LOG_FILTER.to_string())
 }
 
 fn init_logging(enable_tokio_console: bool) {
