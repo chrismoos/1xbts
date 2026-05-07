@@ -1,6 +1,11 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 #![allow(non_upper_case_globals)]
+// Suppress lints on bindgen-generated code that hasn't caught up with Rust 1.95+.
+// See https://rust-lang.github.io/rust-bindgen/tutorial-4.html
+#![allow(unnecessary_transmutes)]
+#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::ptr_offset_with_cast)]
 
 //!
 //! Low-level bindings to Baresip's `libre`/`re` C library.
