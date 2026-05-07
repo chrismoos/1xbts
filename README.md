@@ -150,6 +150,12 @@ npm install
 npm run dev
 ```
 
+## Support
+
+- **GitHub Discussions** — [github.com/chrismoos/1xbts/discussions](https://github.com/chrismoos/1xbts/discussions) for questions, ideas, and show-and-tell.
+- **GitHub Issues** — [github.com/chrismoos/1xbts/issues](https://github.com/chrismoos/1xbts/issues) for bug reports and feature requests.
+- **IRC** — `#1xbts` on [Libera.Chat](https://libera.chat) for live chat.
+
 ## License
 
 The main 1xBTS workspace is licensed under Apache-2.0. The SDR wrapper crates
