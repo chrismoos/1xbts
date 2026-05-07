@@ -12,16 +12,18 @@ description = "BTS, LAC/MAC, PHY, receiver, and SDR backend implementation for 1
 path = "src/lib/mod.rs"
 
 [features]
-default = ["uhd-backend", "lime-backend", "bladerf-backend"]
+default = ["uhd-backend", "lime-backend", "bladerf-backend", "soapy-backend"]
 uhd-backend = ["uhd"]
 lime-backend = ["limesuite"]
 bladerf-backend = ["bladerf"]
+soapy-backend = ["soapysdr"]
 
 [dependencies]
 num = "0.4"
 uhd = { path = "../../external/uhd", optional = true }
 limesuite = { path = "../../external/limesuite", optional = true }
 bladerf = { path = "../../external/bladerf", optional = true }
+soapysdr = { version = "0.5", optional = true }
 hound = "3"
 tokio = { version = "1", features = ["full"] }
 log = "0.4"
@@ -31,7 +33,6 @@ tracing-subscriber = {version = "0.3", features = ["env-filter"]}
 biquad = "0.6"
 cdma-common = { path = "../cdma-common"}
 chrono = "0.4"
-soapysdr = "0.5"
 sdr = "0.7"
 num-complex = "0.4"
 libc = "0.2"

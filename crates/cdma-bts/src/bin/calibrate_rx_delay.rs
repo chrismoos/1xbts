@@ -77,6 +77,7 @@ use std::{fs, path::PathBuf, thread, time::Duration};
 use clap::Parser;
 use num_complex::Complex32;
 use serde::Deserialize;
+#[cfg(feature = "soapy-backend")]
 use soapysdr::{Direction, ErrorCode as SoapyErrorCode};
 
 #[derive(Parser, Debug)]
@@ -257,6 +258,7 @@ enum RadioConfigFile {
     Other,
 }
 
+#[allow(dead_code)]
 struct LoadedConfig {
     /// Backend name inferred from the config file's `kind` field.
     detected_backend: String,
@@ -432,9 +434,10 @@ trait CalibrationBackend {
 }
 
 // ---------------------------------------------------------------------------
-// SoapySDR backend (always available — soapysdr is a non-optional dep)
+// SoapySDR backend (feature-gated)
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "soapy-backend")]
 struct SoapyBackend {
     device: soapysdr::Device,
     _channel: usize,
@@ -442,6 +445,7 @@ struct SoapyBackend {
     rx_stream: soapysdr::RxStream<Complex32>,
 }
 
+#[cfg(feature = "soapy-backend")]
 impl SoapyBackend {
     fn new(
         device_str: &str,
@@ -484,6 +488,7 @@ impl SoapyBackend {
     }
 }
 
+#[cfg(feature = "soapy-backend")]
 impl CalibrationBackend for SoapyBackend {
     fn tick_rate(&self) -> u64 {
         1_000_000_000 // SoapySDR uses nanoseconds
@@ -1534,6 +1539,7 @@ fn run_round(
 }
 
 /// Create the backend based on the `--backend` flag and resolved configuration.
+#[allow(unused_variables)]
 fn create_backend(
     backend_name: &str,
     device_str: &str,
@@ -1544,6 +1550,7 @@ fn create_backend(
     loaded: &Option<LoadedConfig>,
 ) -> Result<Box<dyn CalibrationBackend>, Box<dyn std::error::Error>> {
     match backend_name {
+        #[cfg(feature = "soapy-backend")]
         "soapy" => {
             let b = SoapyBackend::new(
                 device_str,
@@ -1558,6 +1565,8 @@ fn create_backend(
             )?;
             Ok(Box::new(b))
         }
+        #[cfg(not(feature = "soapy-backend"))]
+        "soapy" => Err("SoapySDR backend not compiled in (enable 'soapy-backend' feature)".into()),
         #[cfg(feature = "uhd-backend")]
         "uhd" => {
             let mcr = loaded

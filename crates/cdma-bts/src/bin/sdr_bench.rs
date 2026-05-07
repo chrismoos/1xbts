@@ -42,12 +42,26 @@
 //!   --radio config/radio_bladerf_micro2.json --full-duplex
 //! ```
 
+#![cfg_attr(
+    not(any(
+        feature = "lime-backend",
+        feature = "uhd-backend",
+        feature = "bladerf-backend"
+    )),
+    allow(dead_code, unused_variables, unused_imports, unreachable_code)
+)]
+
+#[allow(unused_imports)]
 use std::fs;
+#[allow(unused_imports)]
 use std::path::PathBuf;
+#[allow(unused_imports)]
 use std::sync::Arc;
+#[allow(unused_imports)]
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+#[allow(unused_imports)]
 use log::{debug, info, warn};
 use num_complex::Complex32;
 use serde::Deserialize;
@@ -1952,6 +1966,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Build throughput sweep list.
+    #[allow(unused_variables)]
     let throughput_list: Vec<f32> = if cli.sweep_throughput {
         vec![0.0, 0.25, 0.5, 0.75, 1.0]
     } else {
@@ -1966,6 +1981,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Build FIFO size sweep list.
+    #[allow(unused_variables)]
     let fifo_list: Vec<u32> = if cli.sweep_fifo {
         vec![
             256 * 1024,
@@ -1984,7 +2000,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config: RadioConfigFile =
         serde_json::from_str(&raw).map_err(|e| format!("failed to parse radio config: {}", e))?;
 
-    let results = match config {
+    let results: Vec<BenchResult> = match config {
         #[cfg(feature = "lime-backend")]
         RadioConfigFile::Lime {
             device,

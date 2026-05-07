@@ -10,11 +10,13 @@ use cdma_common::error::Error;
 use log::{info, warn};
 use tokio::sync::{broadcast, mpsc};
 
+#[cfg(feature = "soapy-backend")]
+use crate::sdr::SoapySdrRadio;
 use crate::{
     lac,
     mac::{self, Layer2MacRef},
     receiver::sync::SyncChannelMessage,
-    sdr::{FileOutputRadio, NoopRadio, Radio, SoapySdrRadio},
+    sdr::{FileOutputRadio, NoopRadio, Radio},
 };
 
 use super::{
@@ -41,6 +43,7 @@ pub fn build_radio_from_config(
             Ok(Box::new(FileOutputRadio::new(fs::File::create(path)?)?))
         }
         RadioConfig::Noop => Ok(Box::new(NoopRadio::new())),
+        #[cfg(feature = "soapy-backend")]
         RadioConfig::Soapy {
             device,
             channel,
@@ -73,6 +76,10 @@ pub fn build_radio_from_config(
             );
 
             Ok(Box::new(radio))
+        }
+        #[cfg(not(feature = "soapy-backend"))]
+        RadioConfig::Soapy { .. } => {
+            Err("SoapySDR backend not compiled in (enable 'soapy-backend' feature)".into())
         }
         #[cfg(feature = "uhd-backend")]
         RadioConfig::Uhd {

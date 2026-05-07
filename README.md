@@ -68,11 +68,42 @@ At minimum:
 
 - Rust toolchain with Cargo.
 - PostgreSQL for HLR/SMSC state (`docker compose up -d postgres` starts a local `1xbts` database on port 45432).
-- `protoc` for protobuf code generation.
+- `protoc` for protobuf code generation (Ubuntu/Debian: `protobuf-compiler`).
 - `pkg-config` and a C compiler for native bindings.
+- `libclang` for bindgen (Ubuntu/Debian: `libclang-dev`).
 
 Optional radio and voice dependencies depend on enabled features and hardware:
 UHD/USRP, LimeSuite, SoapySDR, bladeRF, and Baresip libre/re.
+
+### Ubuntu / Debian
+
+Common packages (always required):
+
+```sh
+sudo apt-get install -y \
+    build-essential pkg-config protobuf-compiler libssl-dev \
+    libclang-dev libre-dev
+```
+
+Then add the packages for whichever SDR backend(s) you plan to enable:
+
+**bladeRF** (`--features bladerf-backend`):
+
+```sh
+sudo apt-get install -y libbladerf-dev
+```
+
+**UHD / USRP** (`--features uhd-backend`):
+
+```sh
+sudo apt-get install -y libuhd-dev
+```
+
+**LimeSDR** (`--features lime-backend`):
+
+```sh
+sudo apt-get install -y liblimesuite-dev
+```
 
 ### Tested SDR Hardware
 
@@ -112,10 +143,6 @@ cargo run --release -p cdma-nib --no-default-features --features bladerf-backend
     --radio-config config/radio_bladerf_micro2.json
 ```
 
-For headless development without RF hardware, swap the cargo invocation for
-`cargo run -p cdma-nib -- --config-dir config --null-radio` to run the full stack
-against a stubbed radio.
-
 Default service ports are listed in `docs/PORTS.md`. If port 3000 is already in
 use, set `ONEXBTS_WEB_PORT`, for example `ONEXBTS_WEB_PORT=3001 docker compose up 1xbts-web`.
 
@@ -123,12 +150,11 @@ use, set `ONEXBTS_WEB_PORT`, for example `ONEXBTS_WEB_PORT=3001 docker compose u
 
 Enable exactly one SDR backend at build time:
 
-| System library     | Hardware            | Cargo feature             |
-| ------------------ | ------------------- | ------------------------- |
-| `libbladeRF`       | bladeRF devices     | `--features bladerf-backend` |
+| Ubuntu package     | Hardware            | Cargo feature                |
+| ------------------ | ------------------- | ---------------------------- |
+| `libbladerf-dev`   | bladeRF devices     | `--features bladerf-backend` |
 | `libuhd-dev`       | USRP B200/B210      | `--features uhd-backend`     |
 | `liblimesuite-dev` | LimeSDR devices     | `--features lime-backend`    |
-| `libsoapysdr-dev`  | Generic SDR         | generic SoapySDR path        |
 
 ### Tests
 
