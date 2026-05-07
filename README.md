@@ -59,7 +59,7 @@ running as its own process and communicating over standard reference points:
 - **SMSC** (`cdma-smsc`) - short message service center.
 - **PCF** (`cdma-pcf`) - packet control function; A8/A9 to BSC, A10/A11 to PDSN.
 - **PDSN** (`cdma-pdsn`) - packet data serving node, FoU/TUN packet path.
-- **voice-gw** (`cdma-voice-gw`) - SIP gateway for voice calls.
+- **voice-gw** (`cdma-voice-gw`) - SIP gateway for outbound voice calls (PSTN origination). See [voice gateway setup](https://1xbts.org/docs/guides/voice-gateway/) for trunk + STUN configuration.
 - **NIB** (`cdma-nib`) - network-in-a-box launcher that runs the full stack in one process.
 
 ## Prerequisites
