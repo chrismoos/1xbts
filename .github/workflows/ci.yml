@@ -12,6 +12,8 @@ jobs:
   rust:
     name: Rust
     runs-on: ubuntu-24.04
+    env:
+      CAPTURE_DOWNLOAD_TOKEN: ${{ secrets.CAPTURE_DOWNLOAD_TOKEN }}
 
     steps:
       - name: Free disk space
@@ -63,9 +65,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Fetch capture fixtures
-        if: ${{ secrets.CAPTURE_DOWNLOAD_TOKEN != '' }}
-        env:
-          CAPTURE_DOWNLOAD_TOKEN: ${{ secrets.CAPTURE_DOWNLOAD_TOKEN }}
+        if: env.CAPTURE_DOWNLOAD_TOKEN != ''
         run: test/capture/fetch-archive.sh
 
       - name: Format
@@ -78,5 +78,5 @@ jobs:
         run: cargo test --workspace --all-targets --release -- --skip capture_
 
       - name: Capture tests
-        if: ${{ secrets.CAPTURE_DOWNLOAD_TOKEN != '' }}
+        if: env.CAPTURE_DOWNLOAD_TOKEN != ''
         run: cargo test --workspace --all-targets --release capture_ -- --test-threads=1
