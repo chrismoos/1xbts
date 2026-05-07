@@ -117,7 +117,7 @@
             "bcast_index": 0,
             "imsi_t_supported": false,
             "p_rev": 6,
-            "min_p_rev": 6,
+            "min_p_rev": 3,
             "soft_slope": 16,
             "add_intercept": 8,
             "drop_intercept": 6,

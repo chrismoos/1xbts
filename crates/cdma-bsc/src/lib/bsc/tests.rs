@@ -3351,6 +3351,96 @@ async fn duplicate_access_probe_gets_l2_ack_only() {
     assert_eq!(bsc.mobiles.tracked_count(), 1);
 }
 
+#[tokio::test]
+async fn sms_page_gpm_includes_so6_special_service() {
+    let bts_client = Arc::new(CapturingBtsClient::default());
+
+    let mut bsc = Bsc::new(Config {
+        pilot_offset: 0,
+        overhead: OverheadParameters::default(),
+        paging: PagingChannelSettings::default(),
+        traffic_assignment: TrafficAssignmentConfig::default(),
+        access_event_rx: None,
+        access_event_broadcast: None,
+        sms_request_rx: None,
+        sms_request_tx: None,
+        data_request_rx: None,
+        data_request_tx: None,
+        power_override_request_rx: None,
+        power_override_request_tx: None,
+        mobiles_tx: None,
+        paging_broadcast: None,
+        traffic_broadcast: None,
+        rx_reference_dbm: None,
+        hlr_repo: None,
+        msc_client: test_msc_client(),
+        bts_client: Some(bts_client.clone() as Arc<dyn BtsControlClient>),
+        traffic_retry: TrafficRetryConfig::default(),
+        paging_retry: PagingRetryConfig::default(),
+        voice_policy: test_voice_policy(),
+        pcf_client: None,
+        mobile_idle_timeout_s: 0,
+        bts_paging_state: None,
+        node_id: "bsc-test".to_string(),
+        msc_voice_bearer: None,
+    });
+
+    let esn = 0x1234_5678;
+    let mut registration = test_access_event();
+    registration.message_id = MessageId::Registration;
+    registration.msg_type_name = "Registration Message".to_string();
+    registration.msg_seq = Some(3);
+    registration.ack_req = true;
+    registration.esn = Some(esn);
+    registration.mob_p_rev = Some(3);
+    registration.slot_cycle_index = Some(1);
+    registration.scm = Some(0x6a);
+
+    bsc.inject_access_event(registration).await;
+    bts_client.pch_messages.lock().clear();
+
+    bsc.inject_sms_request(SmsRequest {
+        originating_number: "5551234".to_string(),
+        text: "pending sms".to_string(),
+        target_address: Some(format!("ESN:0x{:08X}", esn)),
+        target_subscriber_id: None,
+        timeout_ms: Some(60_000),
+        destination_number: None,
+        sms_id: None,
+        delivery_attempt_id: None,
+        a1_tag: None,
+        raw_payload: None,
+    });
+
+    let messages = bts_client.pch_messages.lock();
+    let aim = messages
+        .iter()
+        .filter_map(|message| message.air_interface_message.as_ref())
+        .find(|aim| {
+            MessageId::from_wire(
+                cdma_common::lac::message_types::WireChannel::ForwardCommon,
+                aim.message_type,
+            ) == Some(MessageId::GeneralPage)
+        })
+        .expect("SMS page should send a General Page Message via Abis");
+
+    let mut bits = Bitstream::new_bytes(&aim.message);
+    let gpm = lac::paging_messages::GeneralPageMessage::from_sdu(&mut bits)
+        .expect("captured GPM should decode");
+    assert_eq!(gpm.page_records.len(), 1);
+    match &gpm.page_records[0] {
+        lac::paging_messages::GeneralPageRecord::Class1 {
+            special_service,
+            service_option,
+            ..
+        } => {
+            assert!(*special_service, "SMS page must set SPECIAL_SERVICE");
+            assert_eq!(*service_option, Some(6), "SMS page must announce SO6");
+        }
+        record => panic!("expected ESN Class1 page record, got {record:?}"),
+    }
+}
+
 #[test]
 fn access_duplicate_detection_clears_after_inactivity_timeout() {
     let mut access = AccessService::new();

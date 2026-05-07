@@ -41,9 +41,9 @@ pub enum TrafficPowerOverrideAction {
 
 /// Unified traffic channel state machine.
 ///
-/// Every traffic channel progresses through a linear prefix
-/// (Assigned -> WaitingMsAck -> ServiceConnecting -> Active),
-/// then branches by service option into SO-specific terminal states.
+/// Every traffic channel progresses through a common acquisition prefix.
+/// Full service negotiation uses ServiceConnecting; legacy CAM
+/// ASSIGN_MODE=000 can advance directly after the MS Ack.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ChannelState {
     /// ECAM sent, waiting for MS preamble.
@@ -145,6 +145,25 @@ pub(crate) fn traffic_channel_power_snapshot(
     }
 }
 
+/// Service negotiation context established by the Channel Assignment form.
+///
+/// Legacy CAM ASSIGN_MODE=000 disables full service negotiation; ECAM and
+/// CAM ASSIGN_MODE=100 enable it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServiceNegotiationMode {
+    ServiceOptionNegotiation,
+    ServiceNegotiation,
+}
+
+impl ServiceNegotiationMode {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            ServiceNegotiationMode::ServiceOptionNegotiation => "serv_neg_disabled",
+            ServiceNegotiationMode::ServiceNegotiation => "serv_neg_enabled",
+        }
+    }
+}
+
 /// Per-mobile traffic channel state.
 pub(crate) struct TrafficChannelInfo {
     /// Spec-faithful Abis call connection reference (A.S0003-A section 6.2.2.29).
@@ -172,6 +191,7 @@ pub(crate) struct TrafficChannelInfo {
     pub(crate) for_rc: u8,
     pub(crate) rev_rc: u8,
     pub(crate) rc_label: &'static str,
+    pub(crate) service_negotiation_mode: ServiceNegotiationMode,
     pub(crate) power_control_delay_pcgs: u64,
     pub(crate) last_forward_enqueue_at: Option<Instant>,
     pub(crate) channel_state: ChannelState,
@@ -236,6 +256,7 @@ impl TrafficChannelInfo {
         service_option: u16,
         origination_service_option: Option<u16>,
         service_ref_id: u8,
+        service_negotiation_mode: ServiceNegotiationMode,
         voice_session_id: Option<Uuid>,
         voice_leg_role: Option<VoiceLegRole>,
         a1_call_id: Option<u64>,
@@ -254,6 +275,7 @@ impl TrafficChannelInfo {
             for_rc: handle.for_rc,
             rev_rc: handle.rev_rc,
             rc_label: handle.rc_label,
+            service_negotiation_mode,
             power_control_delay_pcgs: handle.power_control_delay_pcgs,
             last_forward_enqueue_at: None,
             channel_state: ChannelState::Assigned {
@@ -531,6 +553,7 @@ impl std::fmt::Debug for TrafficChannelInfo {
         f.debug_struct("TrafficChannelInfo")
             .field("walsh_code", &self.walsh_code)
             .field("service_option", &self.service_option)
+            .field("service_negotiation_mode", &self.service_negotiation_mode)
             .field("channel_state", &self.channel_state)
             .finish()
     }
