@@ -9,14 +9,20 @@ use std::time::Instant;
 use cdma_common::access::AccessMessage;
 use cdma_common::events::AccessChannelEvent;
 use cdma_common::formatting::reverse_order_name;
-use cdma_common::lac::{message_types::MessageId, paging_messages::OrderMessage};
+use cdma_common::lac::{
+    message_types::MessageId,
+    paging_messages::{MsAddress, OrderMessage},
+};
 use cdma_voice::VoiceCodec;
 use log::{debug, info, warn};
 
 use crate::addressing::{format_ms_address, is_packet_data_so};
 use crate::power_control::ForwardPowerControlState;
 
-use super::{A1ClearState, Bsc, MsState, VoiceAlertMode, VoiceLegRole, VoiceSessionKind};
+use super::{
+    A1ClearState, Bsc, MsState, ServiceNegotiationMode, VoiceAlertMode, VoiceLegRole,
+    VoiceSessionKind,
+};
 
 #[derive(Default)]
 pub(crate) struct TrafficSignalingService {
@@ -82,7 +88,7 @@ impl Bsc {
         }
     }
 
-    pub(crate) fn advance_waiting_ms_ack(
+    pub(crate) async fn advance_waiting_ms_ack(
         &mut self,
         walsh_code: u8,
         ack_seq: u8,
@@ -106,16 +112,42 @@ impl Bsc {
             format_ms_address(&addr)
         );
 
-        let needs_negotiation = self
-            .mobiles
-            .get_traffic_channel(walsh_code)
-            .map(|tc| {
-                tc.origination_service_option
-                    .map_or(false, |orig_so| orig_so != tc.service_option)
+        let Some((service_negotiation_mode, service_option, origination_service_option)) =
+            self.mobiles.get_traffic_channel(walsh_code).map(|tc| {
+                (
+                    tc.service_negotiation_mode,
+                    tc.service_option,
+                    tc.origination_service_option,
+                )
             })
-            .unwrap_or(false);
+        else {
+            return;
+        };
 
-        if needs_negotiation {
+        let needs_negotiation =
+            origination_service_option.is_some_and(|orig_so| orig_so != service_option);
+
+        if service_negotiation_mode == ServiceNegotiationMode::ServiceOptionNegotiation {
+            if needs_negotiation {
+                warn!(
+                    "BSC: SERV_NEG disabled on walsh={} but origination SO={:?} differs from assigned SO={}; legacy SO negotiation orders are not implemented, tearing down",
+                    walsh_code, origination_service_option, service_option
+                );
+                self.teardown_traffic_channel(walsh_code).await;
+            } else {
+                info!(
+                    "BSC: SERV_NEG disabled on walsh={}; accepting implicit SO{} on MS Ack without Service Connect",
+                    walsh_code, service_option
+                );
+                self.complete_service_negotiation(
+                    walsh_code,
+                    ack_seq,
+                    &addr,
+                    "MS Ack with SERV_NEG disabled",
+                )
+                .await;
+            }
+        } else if needs_negotiation {
             if let Err(e) = self.send_service_request(walsh_code, ack_seq) {
                 warn!(
                     "BSC: failed to send Service Request on walsh={}: {}",
@@ -135,6 +167,136 @@ impl Bsc {
             self.mobiles.update_tc(walsh_code, |_, tc| {
                 tc.mark_service_connecting();
             });
+        }
+    }
+
+    async fn complete_service_negotiation(
+        &mut self,
+        walsh_code: u8,
+        ack_seq: u8,
+        addr: &MsAddress,
+        trigger: &str,
+    ) {
+        let is_voice = self
+            .mobiles
+            .get_traffic_channel(walsh_code)
+            .and_then(super::traffic_forward::voice_service_option_for_channel)
+            .is_some();
+        if is_voice {
+            let replaced_packet_session = self.replace_packet_service_with_voice(walsh_code);
+            if let Some(packet_session_id) = replaced_packet_session {
+                self.close_packet_session_background(walsh_code, packet_session_id);
+            }
+            let (
+                session_id,
+                leg_role,
+                a1_call_id,
+                should_send_assignment_complete,
+                voice_service_option,
+            ) = self
+                .mobiles
+                .get_traffic_channel(walsh_code)
+                .map(|tc| {
+                    (
+                        tc.voice_session_id,
+                        tc.voice_leg_role,
+                        tc.a1_call_id,
+                        tc.is_service_connecting() || tc.is_waiting_ms_ack(),
+                        super::traffic_forward::voice_service_option_for_channel(tc)
+                            .unwrap_or(tc.service_option),
+                    )
+                })
+                .unwrap_or((None, None, None, false, 3));
+            let session = session_id.and_then(|id| self.voice.session(id));
+            let session_kind = session.map(|s| s.kind);
+            let caller_number: Option<String> = match leg_role {
+                Some(VoiceLegRole::Callee) => session.and_then(|s| s.caller_number.clone()),
+                _ => None,
+            };
+            let caller_ref = caller_number.as_deref();
+            let (send_result, mode, log_label) = match (session_kind, leg_role) {
+                (_, Some(VoiceLegRole::Callee)) => (
+                    self.send_standard_alert(walsh_code, ack_seq, caller_ref),
+                    Some(VoiceAlertMode::WaitForConnectOrder),
+                    "standard alert",
+                ),
+                (Some(VoiceSessionKind::MobileOriginatedExternal), Some(VoiceLegRole::Caller)) => (
+                    self.send_alert_with_info(walsh_code, ack_seq, None),
+                    Some(VoiceAlertMode::WaitForPeerAnswer),
+                    "external ringback",
+                ),
+                _ => (
+                    self.send_alert_with_info(walsh_code, ack_seq, caller_ref),
+                    Some(VoiceAlertMode::WaitForPeerAnswer),
+                    "ringback",
+                ),
+            };
+            if let Err(e) = send_result {
+                warn!(
+                    "BSC: failed to send AWIM {} on walsh={} after {}: {}",
+                    log_label, walsh_code, trigger, e
+                );
+            } else {
+                if should_send_assignment_complete {
+                    if let Some(call_id) = a1_call_id {
+                        self.a1.send_assignment_complete(
+                            &self.mobiles,
+                            call_id,
+                            walsh_code,
+                            voice_service_option,
+                        );
+                    }
+                }
+                info!(
+                    "BSC: sent AWIM {} on F-TCH walsh={} after {}",
+                    log_label, walsh_code, trigger
+                );
+                if let Some(tc) = self.mobiles.get_traffic_channel_mut(walsh_code) {
+                    match mode {
+                        Some(m) => tc.mark_voice_alerting(m),
+                        None => tc.mark_active(),
+                    }
+                }
+                if let Some(session_id) = session_id {
+                    if let Some(session) = self.voice.session_mut(session_id) {
+                        let party = match leg_role {
+                            Some(VoiceLegRole::Caller) => session.caller.as_mut(),
+                            Some(VoiceLegRole::Callee) => session.callee.as_mut(),
+                            None => None,
+                        };
+                        if let Some(party) = party {
+                            party.service_connected = true;
+                        }
+                    }
+                    if matches!(
+                        session_kind,
+                        Some(VoiceSessionKind::MobileOriginatedExternal)
+                    ) && leg_role == Some(VoiceLegRole::Caller)
+                    {
+                        self.note_msc_external_call_after_service_connect(session_id, walsh_code);
+                    }
+                }
+            }
+        } else {
+            let is_packet_data = self
+                .mobiles
+                .get_traffic_channel(walsh_code)
+                .map_or(false, |tc| is_packet_data_so(tc.service_option));
+            if is_packet_data {
+                info!(
+                    "BSC: packet-data service accepted on walsh={} for {} after {}",
+                    walsh_code,
+                    format_ms_address(addr),
+                    trigger
+                );
+            }
+            if let Some(tc) = self.mobiles.get_traffic_channel_mut(walsh_code) {
+                tc.mark_active();
+            }
+            if is_packet_data {
+                self.start_packet_session_after_service_connect(walsh_code)
+                    .await;
+            }
         }
     }
 
@@ -288,7 +450,8 @@ impl Bsc {
                     walsh_code,
                     event.msg_seq.unwrap_or(0),
                     event.msg_type_name.as_str(),
-                );
+                )
+                .await;
             }
         }
 
@@ -358,7 +521,8 @@ impl Bsc {
                                 walsh_code,
                                 ack_seq,
                                 "Mobile Station Acknowledgment Order",
-                            );
+                            )
+                            .await;
                         } else if tc.is_sms_pending_release() {
                             // MS acked SMS Cause Code — teardown
                             // (currently commented out / skip)
@@ -596,132 +760,14 @@ impl Bsc {
                 walsh_code, serv_con_seq
             );
 
-            // For voice calls: send Alert With Information now that service
-            // negotiation is complete. The MSC owns answer/media progression.
-            let is_voice = self
-                .mobiles
-                .get_traffic_channel(walsh_code)
-                .and_then(super::traffic_forward::voice_service_option_for_channel)
-                .is_some();
-            if is_voice {
-                let ack_seq = event.msg_seq.unwrap_or(0);
-                let replaced_packet_session = self.replace_packet_service_with_voice(walsh_code);
-                if let Some(packet_session_id) = replaced_packet_session {
-                    self.close_packet_session_background(walsh_code, packet_session_id);
-                }
-                let (
-                    session_id,
-                    leg_role,
-                    a1_call_id,
-                    should_send_assignment_complete,
-                    voice_service_option,
-                ) = self
-                    .mobiles
-                    .get_traffic_channel(walsh_code)
-                    .map(|tc| {
-                        (
-                            tc.voice_session_id,
-                            tc.voice_leg_role,
-                            tc.a1_call_id,
-                            tc.is_service_connecting(),
-                            super::traffic_forward::voice_service_option_for_channel(tc)
-                                .unwrap_or(tc.service_option),
-                        )
-                    })
-                    .unwrap_or((None, None, None, false, 3));
-                let session = session_id.and_then(|id| self.voice.session(id));
-                let session_kind = session.map(|s| s.kind);
-                // Use the session's caller_number for caller ID on the callee's AWIM.
-                let caller_number: Option<String> = match leg_role {
-                    Some(VoiceLegRole::Callee) => session.and_then(|s| s.caller_number.clone()),
-                    _ => None,
-                };
-                let caller_ref = caller_number.as_deref();
-                let (send_result, mode, log_label) = match (session_kind, leg_role) {
-                    (_, Some(VoiceLegRole::Callee)) => (
-                        self.send_standard_alert(walsh_code, ack_seq, caller_ref),
-                        Some(VoiceAlertMode::WaitForConnectOrder),
-                        "standard alert",
-                    ),
-                    (
-                        Some(VoiceSessionKind::MobileOriginatedExternal),
-                        Some(VoiceLegRole::Caller),
-                    ) => (
-                        self.send_alert_with_info(walsh_code, ack_seq, None),
-                        Some(VoiceAlertMode::WaitForPeerAnswer),
-                        "external ringback",
-                    ),
-                    _ => (
-                        self.send_alert_with_info(walsh_code, ack_seq, caller_ref),
-                        Some(VoiceAlertMode::WaitForPeerAnswer),
-                        "ringback",
-                    ),
-                };
-                if let Err(e) = send_result {
-                    warn!(
-                        "BSC: failed to send AWIM {} on walsh={}: {}",
-                        log_label, walsh_code, e
-                    );
-                } else {
-                    if should_send_assignment_complete {
-                        if let Some(call_id) = a1_call_id {
-                            self.a1.send_assignment_complete(
-                                &self.mobiles,
-                                call_id,
-                                walsh_code,
-                                voice_service_option,
-                            );
-                        }
-                    }
-                    info!("BSC: sent AWIM {} on F-TCH walsh={}", log_label, walsh_code);
-                    if let Some(tc) = self.mobiles.get_traffic_channel_mut(walsh_code) {
-                        match mode {
-                            Some(m) => tc.mark_voice_alerting(m),
-                            None => tc.mark_active(),
-                        }
-                    }
-                    if let Some(session_id) = session_id {
-                        if let Some(session) = self.voice.session_mut(session_id) {
-                            let party = match leg_role {
-                                Some(VoiceLegRole::Caller) => session.caller.as_mut(),
-                                Some(VoiceLegRole::Callee) => session.callee.as_mut(),
-                                None => None,
-                            };
-                            if let Some(party) = party {
-                                party.service_connected = true;
-                            }
-                        }
-                        if matches!(
-                            session_kind,
-                            Some(VoiceSessionKind::MobileOriginatedExternal)
-                        ) && leg_role == Some(VoiceLegRole::Caller)
-                        {
-                            self.note_msc_external_call_after_service_connect(
-                                session_id, walsh_code,
-                            );
-                        }
-                    }
-                }
-            } else {
-                let is_packet_data = self
-                    .mobiles
-                    .get_traffic_channel(walsh_code)
-                    .map_or(false, |tc| is_packet_data_so(tc.service_option));
-                if is_packet_data {
-                    info!(
-                        "BSC: packet-data service negotiation complete on walsh={} for {}",
-                        walsh_code,
-                        format_ms_address(&addr),
-                    );
-                }
-                if let Some(tc) = self.mobiles.get_traffic_channel_mut(walsh_code) {
-                    tc.mark_active();
-                }
-                if is_packet_data {
-                    self.start_packet_session_after_service_connect(walsh_code)
-                        .await;
-                }
-            }
+            let ack_seq = event.msg_seq.unwrap_or(0);
+            self.complete_service_negotiation(
+                walsh_code,
+                ack_seq,
+                &addr,
+                "Service Connect Completion",
+            )
+            .await;
             // Issue-tracked: F-SCH setup should send ESCAM to activate the
             // supplemental channel after service negotiation. Disabled until
             // the ESCAM encoder is validated end-to-end with a handset.

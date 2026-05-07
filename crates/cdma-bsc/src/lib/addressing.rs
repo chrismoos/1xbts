@@ -21,12 +21,22 @@ pub(crate) fn select_initial_traffic_rcs(
     rev_pref: Option<u8>,
     mob_p_rev: u8,
 ) -> Option<(u8, u8)> {
-    // Helper: treat empty list as "not restricted" (supports any RC).
-    // The origination message may not always include forward RC capability
-    // fields, but IS-2000 mobiles that support RC3+ reverse always support
-    // RC3+ forward as well.
-    let for_has = |rc: u8| for_rcs.is_empty() || for_rcs.contains(&rc);
-    let rev_has = |rc: u8| rev_rcs.is_empty() || rev_rcs.contains(&rc);
+    // Force IS-95 into RC1
+    let pre_is2000 = mob_p_rev < 6;
+    let for_has = |rc: u8| {
+        if pre_is2000 {
+            rc == 1
+        } else {
+            for_rcs.is_empty() || for_rcs.contains(&rc)
+        }
+    };
+    let rev_has = |rc: u8| {
+        if pre_is2000 {
+            rc == 1
+        } else {
+            rev_rcs.is_empty() || rev_rcs.contains(&rc)
+        }
+    };
     let allowed_by_policy = |pair: (u8, u8)| {
         matches!(pair, (1, 1) | (3, 3))
             && policy.supported_for_rcs.contains(&pair.0)
@@ -574,6 +584,22 @@ mod tests {
         // Mobile only lists RC1, but mob_p_rev >= 6 implies baseline RC3 support.
         let result = select_initial_traffic_rcs(&policy, &[1], &[1], None, None, 6);
         assert_eq!(result, Some((3, 3)));
+    }
+
+    #[test]
+    fn rc_selection_pre_is2000_mobile_with_rc3_policy_falls_back_to_rc1() {
+        let policy = default_policy();
+        let result = select_initial_traffic_rcs(&policy, &[], &[], None, None, 3);
+        assert_eq!(result, Some((1, 1)));
+    }
+
+    #[test]
+    fn rc_selection_pre_is2000_returns_none_when_policy_excludes_rc1() {
+        // If the operator policy excludes RC1, a pre-IS-2000 mobile cannot be
+        // assigned at all — RC3 is not decodable by these handsets.
+        let policy = rc3_only_policy();
+        let result = select_initial_traffic_rcs(&policy, &[], &[], None, None, 3);
+        assert!(result.is_none());
     }
 
     #[test]

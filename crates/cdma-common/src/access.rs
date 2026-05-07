@@ -4822,8 +4822,8 @@ fn encode_origination_body(bs: &mut Bitstream, m: &OriginationMessage) -> Result
     Ok(())
 }
 
-fn page_response_p_rev(ctx: AccessDecodeContext, m: &PageResponseMessage) -> u8 {
-    ctx.p_rev_in_use.unwrap_or(m.mob_p_rev)
+fn page_response_p_rev(_ctx: AccessDecodeContext, m: &PageResponseMessage) -> u8 {
+    m.mob_p_rev
 }
 
 fn encode_page_response_body(
@@ -4832,9 +4832,9 @@ fn encode_page_response_body(
     ctx: AccessDecodeContext,
 ) -> Result<(), String> {
     ensure_count("NUM_ALT_SO", m.alt_service_options.len(), 7)?;
-    let p_rev_in_use = page_response_p_rev(ctx, m);
-    let include_encryption_supported = match (ctx.p_rev_in_use, ctx.auth_mode) {
-        (Some(p_rev), Some(auth_mode)) => p_rev < 7 && auth_mode != 0,
+    let effective_p_rev_in_use = page_response_p_rev(ctx, m);
+    let include_encryption_supported = match ctx.auth_mode {
+        Some(auth_mode) if effective_p_rev_in_use < 7 => auth_mode != 0,
         _ => m.encryption_supported.is_some(),
     };
 
@@ -4854,7 +4854,7 @@ fn encode_page_response_body(
         bs.write_u32(so as u32, 16);
     }
 
-    if p_rev_in_use >= 6 {
+    if effective_p_rev_in_use >= 6 {
         let uzid_incl = m.uzid_incl.unwrap_or(m.uzid.is_some());
         bs.write_u8(uzid_incl as u8, 1);
         if uzid_incl {
@@ -4891,7 +4891,7 @@ fn encode_page_response_body(
         bs.write_u8(m.rev_fch_gating_req.unwrap_or(false) as u8, 1);
     }
 
-    if p_rev_in_use >= 7 {
+    if effective_p_rev_in_use >= 7 {
         bs.write_u8(m.sts_supported.unwrap_or(false) as u8, 1);
         bs.write_u8(m.cch_3x_supported.unwrap_or(false) as u8, 1);
         let wll_incl = m.wll_incl.unwrap_or(m.wll_device_type.is_some());
@@ -4941,11 +4941,11 @@ fn encode_page_response_body(
         }
     }
 
-    if p_rev_in_use >= 8 {
+    if effective_p_rev_in_use >= 8 {
         bs.write_u8(m.alt_band_class_sup.unwrap_or(false) as u8, 1);
     }
 
-    if p_rev_in_use >= 9 {
+    if effective_p_rev_in_use >= 9 {
         let msg_int_info_incl = m
             .msg_int_info_incl
             .unwrap_or(m.sig_integrity_sup_incl.is_some() || m.new_key_id.is_some());
@@ -4972,7 +4972,7 @@ fn encode_page_response_body(
         }
     }
 
-    if p_rev_in_use >= 9 {
+    if effective_p_rev_in_use >= 9 {
         let for_pdch_supported = m
             .for_pdch_supported
             .unwrap_or(m.for_pdch_capability.is_some());
@@ -4996,7 +4996,7 @@ fn encode_page_response_body(
         }
     }
 
-    if p_rev_in_use >= 11 {
+    if effective_p_rev_in_use >= 11 {
         if m.slot_cycle_index != 0 {
             bs.write_u8(m.sign_slot_cycle_index.unwrap_or(false) as u8, 1);
         }
@@ -5253,10 +5253,12 @@ fn decode_origination(
     for idx in 0..num_fields {
         digits.push(read(bs, char_bits, &format!("CHAR[{idx}]"))? as u8);
     }
-    let nar_an_cap = read(bs, 1, "NAR_AN_CAP")? == 1;
-    let paca_reorig = read(bs, 1, "PACA_REORIG")? == 1;
-    let return_cause = read(bs, 4, "RETURN_CAUSE")? as u8;
-    let more_records = read(bs, 1, "MORE_RECORDS")? == 1;
+    // Legacy MOB_P_REV<6 mobiles can omit trailing C.S0005-E fields; treat
+    // them as their default values when the SDU runs out.
+    let nar_an_cap = read(bs, 1, "NAR_AN_CAP").unwrap_or(0) == 1;
+    let paca_reorig = read(bs, 1, "PACA_REORIG").unwrap_or(0) == 1;
+    let return_cause = read(bs, 4, "RETURN_CAUSE").unwrap_or(0) as u8;
+    let more_records = read(bs, 1, "MORE_RECORDS").unwrap_or(0) == 1;
     let tail = bs.clone();
 
     let base = OriginationBaseFields {
@@ -5345,11 +5347,15 @@ fn decode_origination_tail(
         None
     };
 
-    let paca_supported = read(&mut bs, 1, "PACA_SUPPORTED")? == 1;
-    let num_alt_so = read(&mut bs, 3, "NUM_ALT_SO")? as u8;
+    // Legacy tail fields default to absent/false if the SDU ends here.
+    let paca_supported = read(&mut bs, 1, "PACA_SUPPORTED").unwrap_or(0) == 1;
+    let num_alt_so = read(&mut bs, 3, "NUM_ALT_SO").unwrap_or(0) as u8;
     let mut alt_service_options = Vec::with_capacity(num_alt_so as usize);
     for idx in 0..num_alt_so {
-        alt_service_options.push(read(&mut bs, 16, &format!("ALT_SO[{idx}]"))? as u16);
+        match read(&mut bs, 16, &format!("ALT_SO[{idx}]")) {
+            Ok(v) => alt_service_options.push(v as u16),
+            Err(_) => break,
+        }
     }
 
     let mut drs = None;
@@ -7290,14 +7296,15 @@ fn decode_page_response(
     let service_option = read(bs, 16, "SERVICE_OPTION")? as u16;
     let pm = read(bs, 1, "PM")? == 1;
     let nar_an_cap = read(bs, 1, "NAR_AN_CAP")? == 1;
-    let p_rev_in_use = ctx
-        .p_rev_in_use
-        .ok_or_else(|| "Page Response decode requires P_REV_IN_USE context".to_string())?;
-    let auth_mode = ctx
-        .auth_mode
-        .ok_or_else(|| "Page Response decode requires AUTH_MODE context".to_string())?;
-    let encryption_supported = if p_rev_in_use < 7 && auth_mode != 0 {
-        Some(read(bs, 4, "ENCRYPTION_SUPPORTED")? as u8)
+    let p_rev_in_use = mob_p_rev;
+    let encryption_supported = if p_rev_in_use < 7 {
+        match ctx.auth_mode {
+            Some(0) => None,
+            Some(_) => Some(read(bs, 4, "ENCRYPTION_SUPPORTED")? as u8),
+            None => {
+                return Err("Page Response decode requires AUTH_MODE context".to_string());
+            }
+        }
     } else {
         None
     };
@@ -10690,6 +10697,42 @@ mod tests {
     }
 
     #[test]
+    fn test_access_message_decoder_page_response_uses_payload_p_rev_for_tail_gating() {
+        let mut pdu = Bitstream::new_bytes(&[
+            0x05, 0x13, 0x4e, 0xac, 0xf5, 0x7d, 0x61, 0x88, 0x63, 0xc6, 0xa4, 0x3a, 0x44, 0x49,
+            0x03, 0x6a, 0x60, 0x00, 0xc0, 0x00,
+        ]);
+        let sdu = pdu.drain(108..154);
+        let header = AccessMessageHeader {
+            pd: 0,
+            message_id: MessageId::PageResponse,
+        };
+
+        let msg = AccessMessage::decode_sdu_with_context(
+            header,
+            &sdu,
+            AccessDecodeContext::new(Some(0), Some(6)),
+        )
+        .expect("decode IS-95 page response under P_REV 6 cell context");
+
+        let AccessMessage::PageResponse(msg) = msg else {
+            panic!("expected page response message");
+        };
+        assert!(msg.mob_term);
+        assert_eq!(1, msg.slot_cycle_index);
+        assert_eq!(3, msg.mob_p_rev);
+        assert_eq!(0x6a, msg.scm);
+        assert_eq!(3, msg.request_mode);
+        assert_eq!(6, msg.service_option);
+        assert!(!msg.pm);
+        assert!(!msg.nar_an_cap);
+        assert_eq!(None, msg.encryption_supported);
+        assert_eq!(0, msg.num_alt_so);
+        assert_eq!(None, msg.ch_ind);
+        assert_eq!(2, msg.remaining_bits);
+    }
+
+    #[test]
     fn test_access_message_decoder_page_response_p_rev6_capabilities() {
         let mut bits = Bitstream::new();
         bits.write_u8(rcsch_wire(MessageId::PageResponse), 8);
@@ -11159,12 +11202,12 @@ mod tests {
     }
 
     #[test]
-    fn test_access_message_decoder_page_response_requires_context() {
+    fn test_access_message_decoder_page_response_requires_auth_context() {
         let mut bits = Bitstream::new();
         bits.write_u8(rcsch_wire(MessageId::PageResponse), 8);
         bits.write_u8(0, 1);
         bits.write_u8(0b001, 3);
-        bits.write_u8(12, 8);
+        bits.write_u8(5, 8);
         bits.write_u8(0x42, 8);
         bits.write_u8(0b000, 3);
         bits.write_u32(1, 16);
@@ -11177,7 +11220,7 @@ mod tests {
         assert!(
             AccessMessage::decode(&bits)
                 .unwrap_err()
-                .contains("requires P_REV_IN_USE context")
+                .contains("requires AUTH_MODE context")
         );
     }
 

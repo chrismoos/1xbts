@@ -23,8 +23,9 @@ use crate::abis_edge::BtsTrafficChannelHandle;
 use crate::addressing::{format_ms_address, is_packet_data_so, select_initial_traffic_rcs};
 
 use super::{
-    Bsc, MobileRegistryService, MsState, TrafficChannelInfo, TrafficPowerOverrideAction,
-    TrafficPowerOverrideRequest, VoiceLegRole, VoiceService, traffic_channel_power_snapshot,
+    Bsc, MobileRegistryService, MsState, ServiceNegotiationMode, TrafficChannelInfo,
+    TrafficPowerOverrideAction, TrafficPowerOverrideRequest, VoiceLegRole, VoiceService,
+    traffic_channel_power_snapshot,
 };
 
 #[derive(Default)]
@@ -41,6 +42,7 @@ impl TrafficAssignmentService {
         service_option: u16,
         origination_service_option: Option<u16>,
         service_ref_id: u8,
+        service_negotiation_mode: ServiceNegotiationMode,
         session_id: Option<Uuid>,
         leg_role: Option<VoiceLegRole>,
         a1_call_id: Option<u64>,
@@ -56,12 +58,21 @@ impl TrafficAssignmentService {
                 service_option,
                 origination_service_option,
                 service_ref_id,
+                service_negotiation_mode,
                 session_id,
                 leg_role,
                 a1_call_id,
             ));
         });
         (walsh_code, assigned_rcs)
+    }
+
+    pub(crate) fn service_negotiation_mode_for_mob_p_rev(mob_p_rev: u8) -> ServiceNegotiationMode {
+        if mob_p_rev >= 6 {
+            ServiceNegotiationMode::ServiceNegotiation
+        } else {
+            ServiceNegotiationMode::ServiceOptionNegotiation
+        }
     }
 }
 
@@ -634,8 +645,14 @@ impl TrafficAssignmentService {
             };
             let early_rl = false;
             info!(
-                "BSC: IS-2000 mobile (mob_p_rev={}), using ECAM for_rc={} rev_rc={} early_rl={} (for_rcs={:?}, rev_rcs={:?})",
-                mob_p_rev, for_rc, rev_rc, early_rl as u8, for_rcs, rev_rcs
+                "BSC: IS-2000 mobile (mob_p_rev={}), using ECAM for_rc={} rev_rc={} early_rl={} serv_neg={} (for_rcs={:?}, rev_rcs={:?})",
+                mob_p_rev,
+                for_rc,
+                rev_rc,
+                early_rl as u8,
+                ServiceNegotiationMode::ServiceNegotiation.label(),
+                for_rcs,
+                rev_rcs
             );
             let mut ecam = ExtendedChannelAssignmentMessage::new_f_fch_r_fch_assignment(
                 pilot_offset as u16,
@@ -684,8 +701,9 @@ impl TrafficAssignmentService {
                 .into());
             }
             info!(
-                "BSC: legacy mobile (mob_p_rev={}), using CAM ASSIGN_MODE=000",
-                mob_p_rev
+                "BSC: legacy mobile (mob_p_rev={}), using CAM ASSIGN_MODE=000 serv_neg={}",
+                mob_p_rev,
+                ServiceNegotiationMode::ServiceOptionNegotiation.label()
             );
             let cam = ChannelAssignmentMessage::new_traffic_assignment(walsh_code, 0);
             (
@@ -727,6 +745,13 @@ impl Bsc {
         leg_role: Option<VoiceLegRole>,
         a1_call_id: Option<u64>,
     ) -> (u8, (u8, u8)) {
+        let service_negotiation_mode = self
+            .mobiles
+            .get(fwd_address)
+            .map(|ms| {
+                TrafficAssignmentService::service_negotiation_mode_for_mob_p_rev(ms.mob_p_rev)
+            })
+            .unwrap_or(ServiceNegotiationMode::ServiceOptionNegotiation);
         self.traffic_assignment.assign_channel_to_mobile(
             &mut self.mobiles,
             &mut self.voice,
@@ -736,6 +761,7 @@ impl Bsc {
             service_option,
             origination_service_option,
             service_ref_id,
+            service_negotiation_mode,
             session_id,
             leg_role,
             a1_call_id,
