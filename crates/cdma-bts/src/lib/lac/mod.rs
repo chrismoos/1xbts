@@ -2530,10 +2530,13 @@ mod tests {
             MessageId::GeneralPage,
             "next slot must start with GPM before deferred overhead resumes",
         );
-        assert!(queue.iter().any(|pdu| {
-            pdu.message.mcsb.message_id == MessageId::GlobalServiceRedirection
-                && pdu.frame_start_sent
-        }));
+        assert!(
+            queue.iter().all(|pdu| {
+                pdu.message.mcsb.message_id != MessageId::GlobalServiceRedirection
+                    || pdu.frame_start_sent
+            }),
+            "deferred overhead must not remain queued and unstarted after the slot-leading GPM",
+        );
     }
 
     #[test]

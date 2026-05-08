@@ -742,7 +742,10 @@ async fn a1_mt_page_response_defers_l2_ack_until_assignment() {
         .await
         .expect("A1 Paging Response should be sent")
         .expect("A1 endpoint should receive Paging Response");
-    assert_eq!(outbound.message_type(), cdma_ios::MessageType::PagingResponse);
+    assert_eq!(
+        outbound.message_type(),
+        cdma_ios::MessageType::PagingResponse
+    );
     assert!(
         bts_client.pch_messages.lock().is_empty(),
         "A1 Page Response should not send a standalone BS Ack before AssignmentRequest"

@@ -5184,7 +5184,7 @@ async fn test_e2e_sync_and_overhead_boundaries_over_5s() -> Result<(), Error> {
                 .then(|| nominal_start_chip(message.start_chip))
         })
         .collect::<Vec<_>>();
-    let effective_sci = E2E_SMS_PAGE_SCI.min(E2E_MAX_SLOT_CYCLE_INDEX);
+    let effective_sci = E2E_MAX_SLOT_CYCLE_INDEX;
     let assigned_slot_period_chips =
         CHIPS_PER_PAGING_SLOT * 16 * (1usize << effective_sci as usize);
     assert_eq!(

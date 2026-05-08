@@ -839,11 +839,14 @@ mod tests {
         record.exhausted_at_chip = Some(0);
         state.pending_page_records.push(record);
 
-        state.check_page_record_failures(SR1_CHIP_RATE_HZ - 1, SR1_CHIP_RATE_HZ);
+        let guard_chips =
+            PENDING_PAGE_RECORD_FAILURE_GUARD_MS.saturating_mul(SR1_CHIP_RATE_HZ) / 1000;
+
+        state.check_page_record_failures(guard_chips - 1, SR1_CHIP_RATE_HZ);
         assert_eq!(state.pending_page_records.len(), 1);
         assert!(state.drain_retry_events().is_empty());
 
-        state.check_page_record_failures(SR1_CHIP_RATE_HZ, SR1_CHIP_RATE_HZ);
+        state.check_page_record_failures(guard_chips, SR1_CHIP_RATE_HZ);
         assert!(state.pending_page_records.is_empty());
         assert!(matches!(
             state.drain_retry_events().as_slice(),
