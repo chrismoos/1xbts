@@ -2658,6 +2658,126 @@ async fn packet_data_origination_assigns_non_voice_traffic_channel() {
 }
 
 #[tokio::test]
+async fn qualcomm_proprietary_voice_origination_so_maps_to_evrc() {
+    let bts_client = Arc::new(CapturingBtsClient::default());
+    let (msc_client, msc_endpoint) = crate::a1_edge::InProcessMscClient::pair(32);
+    let mut bsc = Bsc::new(Config {
+        pilot_offset: 0,
+        overhead: OverheadParameters::default(),
+        paging: PagingChannelSettings::default(),
+        traffic_assignment: TrafficAssignmentConfig::default(),
+        access_event_rx: None,
+        access_event_broadcast: None,
+        sms_request_rx: None,
+        sms_request_tx: None,
+        data_request_rx: None,
+        data_request_tx: None,
+        power_override_request_rx: None,
+        power_override_request_tx: None,
+        mobiles_tx: None,
+        paging_broadcast: None,
+        traffic_broadcast: None,
+        rx_reference_dbm: None,
+        hlr_repo: None,
+        msc_client: Arc::new(msc_client),
+        bts_client: Some(bts_client.clone() as Arc<dyn BtsControlClient>),
+        traffic_retry: TrafficRetryConfig::default(),
+        paging_retry: PagingRetryConfig::default(),
+        voice_policy: test_voice_policy(),
+        pcf_client: None,
+        mobile_idle_timeout_s: 0,
+        bts_paging_state: None,
+        node_id: "bsc-test".to_string(),
+        msc_voice_bearer: None,
+    });
+
+    let mut origination = test_access_event();
+    origination.message_id = MessageId::Origination;
+    origination.msg_type_name = "Origination Message".to_string();
+    origination.msg_seq = Some(4);
+    origination.ack_req = true;
+    origination.esn = Some(0x1234_5678);
+    origination.imsi = Some("310990000011239".to_string());
+    origination.imsi_m_s1 = Some(0x0091_989e);
+    origination.imsi_m_s2 = Some(0x0326);
+    origination.imsi_class = Some(0);
+    origination.imsi_mcc = Some(310);
+    origination.imsi_11_12 = Some(99);
+    origination.mob_p_rev = Some(3);
+    origination.slot_cycle_index = Some(2);
+    origination.scm = Some(0x6a);
+    origination.service_option = Some(32768);
+    let mut decoded = test_origination_l3(32768, 1);
+    if let AccessMessage::Origination(ref mut msg) = decoded {
+        msg.mob_p_rev = 3;
+        msg.scm = 0x6a;
+        msg.num_fields = 3;
+        msg.digits = vec![5, 10, 10];
+    }
+    origination.decoded_l3 = Some(decoded);
+
+    bsc.inject_access_event(origination).await;
+
+    assert_eq!(bsc.mobiles.tracked_count(), 1);
+    assert_eq!(bsc.voice.sessions.len(), 1);
+    assert_eq!(bsc.voice.sessions[0].service_option, 3);
+    assert!(
+        bsc.mobiles[0].traffic_channel.is_none(),
+        "MO voice origination should wait for MSC assignment"
+    );
+
+    let messages = bts_client.pch_messages.lock();
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].layer2_ack_request_results.is_none());
+    assert!(messages[0].abis_ack_notify.is_none());
+    let aim = messages[0]
+        .air_interface_message
+        .as_ref()
+        .expect("SO32768 mapping should still acknowledge the Origination");
+    assert_eq!(aim.message_type, 0x07);
+
+    let mut bits = Bitstream::new_bytes(&aim.message);
+    let order = lac::paging_messages::OrderMessage::from_sdu(&mut bits)
+        .expect("Origination acknowledgement should decode as an Order");
+    assert_eq!(order.order, 0b010000, "expected BS Ack Order");
+    assert_eq!(order.ordq, 0);
+    assert!(order.order_specific_fields.is_empty());
+
+    let mut found_mo_cli3 = false;
+    for _ in 0..4 {
+        let msg =
+            match tokio::time::timeout(Duration::from_millis(200), msc_endpoint.recv_from_bsc())
+                .await
+            {
+                Ok(Some(msg)) => msg,
+                _ => break,
+            };
+        if msg.message_type() == cdma_ios::MessageType::CompleteLayer3Information
+            && msg.call_id().is_some()
+        {
+            let decoded = msg.decode().expect("decode CLI3 envelope");
+            let cli3 = cdma_ios::CompleteLayer3InformationMessage::decode(&decoded.payload)
+                .expect("decode CLI3 body");
+            let cm_service_request = cli3
+                .layer3_information
+                .decode_cm_service_request()
+                .expect("MO CLI3 should carry a CM Service Request");
+            assert_eq!(
+                cm_service_request.service_option,
+                Some(cdma_ios::ServiceOption(3)),
+                "A1 MO Origination must carry normalized SO3, not Qualcomm SO32768"
+            );
+            found_mo_cli3 = true;
+            break;
+        }
+    }
+    assert!(
+        found_mo_cli3,
+        "SO32768 voice Origination should be sent to the MSC as an MO CLI3"
+    );
+}
+
+#[tokio::test]
 async fn unsupported_origination_service_option_gets_release_rejection() {
     let bts_client = Arc::new(CapturingBtsClient::default());
     let mut bsc = Bsc::new(Config {
@@ -2704,7 +2824,7 @@ async fn unsupported_origination_service_option_gets_release_rejection() {
     origination.mob_p_rev = Some(3);
     origination.slot_cycle_index = Some(2);
     origination.scm = Some(0x6a);
-    origination.service_option = Some(32768);
+    origination.service_option = Some(32769);
 
     bsc.inject_access_event(origination).await;
 

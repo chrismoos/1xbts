@@ -28,6 +28,9 @@ use super::{
     mark_reverse_regular_msg_seq_received, next_pch_correlation_id,
 };
 
+const EVRC_VOICE_SERVICE_OPTION: u16 = 3;
+const QUALCOMM_PROPRIETARY_VOICE_SERVICE_OPTION: u16 = 32768;
+
 /// Result of an async HLR subscriber lookup, sent back to the BSC run loop.
 pub(crate) struct HlrResolution {
     pub(crate) fwd_address: MsAddress,
@@ -795,10 +798,11 @@ impl AccessService {
 
         // Voice service options - assign traffic channel for voice call.
         'assign_voice_traffic: {
-            let so = match event.service_option {
+            let requested_so = match event.service_option {
                 Some(so) => so,
                 None => break 'assign_voice_traffic,
             };
+            let so = normalize_origination_service_option(requested_so);
 
             if !is_supported_origination_service_option(so) {
                 info!(
@@ -818,6 +822,15 @@ impl AccessService {
                     );
                 }
                 return;
+            }
+
+            if so != requested_so {
+                info!(
+                    "BSC: mapping Origination service option SO{} to SO{} for {}",
+                    requested_so,
+                    so,
+                    format_ms_address(&fwd_address)
+                );
             }
 
             if !is_voice_origination_service_option(so) {
@@ -879,6 +892,16 @@ impl AccessService {
         // Voice page consumption is handled exclusively by handle_page_response()
         // per §3.6.3.3.
         bsc.try_deliver_pending_sms_from_access(event, &fwd_address, "Origination");
+    }
+}
+
+fn normalize_origination_service_option(so: u16) -> u16 {
+    // Qualcomm proprietary compatibility: some IS-95 handsets originate
+    // voice calls with SO32768. Treat it as the normal EVRC voice SO.
+    if so == QUALCOMM_PROPRIETARY_VOICE_SERVICE_OPTION {
+        EVRC_VOICE_SERVICE_OPTION
+    } else {
+        so
     }
 }
 
