@@ -3490,6 +3490,88 @@ fn pch_failure_clears_pending_sms_ack() {
 }
 
 #[test]
+fn correlated_gpm_page_response_ack_does_not_clear_pending_sms_page() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let mut bsc = test_bsc_with_max_slot_cycle_index(2);
+        bsc.paging.queue_sms_page(PendingPage {
+            sms: SmsRequest {
+                originating_number: "5551234".to_string(),
+                text: "pending".to_string(),
+                target_address: Some("ESN:0x11111111".to_string()),
+                target_subscriber_id: None,
+                timeout_ms: Some(60_000),
+                destination_number: Some("5559999".to_string()),
+                sms_id: None,
+                delivery_attempt_id: None,
+                a1_tag: None,
+                raw_payload: None,
+            },
+            page_address: MsPageAddress::Esn(0x1111_1111),
+            fwd_address: MsAddress::Esn(0x1111_1111),
+            pgslot: Some(100),
+            slot_cycle_index: 2,
+            started_at: Instant::now(),
+            timeout: Duration::from_secs(60),
+            retry_count: 0,
+            next_retry_at: tokio::time::Instant::now(),
+            last_target_chip: None,
+            page_msg_seq: Some(3),
+            page_correlation_id: Some(77),
+        });
+
+        bsc.handle_pch_transfer_ack(PchTransferAckEvent {
+            correlation_id: Some(77),
+            cause: None,
+            bts_l2_termination: Some(true),
+        });
+
+        assert!(bsc.paging.has_pending_sms_page());
+    });
+}
+
+#[test]
+fn correlated_gpm_page_failure_clears_pending_sms_page() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let mut bsc = test_bsc_with_max_slot_cycle_index(2);
+        bsc.paging.queue_sms_page(PendingPage {
+            sms: SmsRequest {
+                originating_number: "5551234".to_string(),
+                text: "pending".to_string(),
+                target_address: Some("ESN:0x11111111".to_string()),
+                target_subscriber_id: None,
+                timeout_ms: Some(60_000),
+                destination_number: Some("5559999".to_string()),
+                sms_id: None,
+                delivery_attempt_id: None,
+                a1_tag: None,
+                raw_payload: None,
+            },
+            page_address: MsPageAddress::Esn(0x1111_1111),
+            fwd_address: MsAddress::Esn(0x1111_1111),
+            pgslot: Some(100),
+            slot_cycle_index: 2,
+            started_at: Instant::now(),
+            timeout: Duration::from_secs(60),
+            retry_count: 0,
+            next_retry_at: tokio::time::Instant::now(),
+            last_target_chip: None,
+            page_msg_seq: Some(3),
+            page_correlation_id: Some(77),
+        });
+
+        bsc.handle_pch_transfer_ack(PchTransferAckEvent {
+            correlation_id: Some(77),
+            cause: Some(0x07),
+            bts_l2_termination: None,
+        });
+
+        assert!(!bsc.paging.has_pending_sms_page());
+    });
+}
+
+#[test]
 fn rejected_sms_request_warns_and_does_not_page() {
     // BSC no longer updates SMSC state; it just warns and returns.
     // Verify the page-in-progress guard still prevents double paging.
@@ -3533,6 +3615,7 @@ fn rejected_sms_request_warns_and_does_not_page() {
             next_retry_at: tokio::time::Instant::now(),
             last_target_chip: None,
             page_msg_seq: None,
+            page_correlation_id: None,
         });
 
         bsc.handle_sms_request(SmsRequest {

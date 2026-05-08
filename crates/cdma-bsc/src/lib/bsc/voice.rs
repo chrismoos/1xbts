@@ -595,6 +595,7 @@ impl Bsc {
             a1_call_id,
             imsi,
             page_msg_seq: None,
+            page_correlation_id: None,
         });
         self.publish_mobiles();
         match self.send_page_for_voice(
@@ -605,11 +606,15 @@ impl Bsc {
             service_option,
             None,
         ) {
-            Ok((target_chip, page_seq)) => {
+            Ok((target_chip, page_seq, page_correlation_id)) => {
                 let next_retry_at =
                     self.compute_next_retry_at(pgslot, slot_cycle_index, target_chip);
-                self.paging
-                    .record_voice_page_sent(target_chip, next_retry_at, page_seq);
+                self.paging.record_voice_page_sent(
+                    target_chip,
+                    next_retry_at,
+                    page_seq,
+                    page_correlation_id,
+                );
             }
             Err(e) => warn!("BSC: failed to send voice page: {}", e),
         }

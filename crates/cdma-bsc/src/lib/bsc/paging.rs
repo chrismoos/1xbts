@@ -26,7 +26,7 @@ use crate::addressing::format_ms_address;
 
 use super::{
     Bsc, MsState, PAGE_RETRY_GUARD_MS, SmsAckKey, SmsRequest, VoiceLegRole,
-    build_scheduled_message, next_bsc_event_id,
+    build_scheduled_message, next_bsc_event_id, next_pch_correlation_id,
 };
 
 pub(crate) fn mobile_identity_for_ms_address(
@@ -187,6 +187,8 @@ pub(crate) struct PendingPage {
     pub(crate) last_target_chip: Option<u64>,
     /// Stored msg_seq from the first GPM send, reused on retries.
     pub(crate) page_msg_seq: Option<u8>,
+    /// Abis PchMessageTransfer correlation for the BTS-owned GPM page record.
+    pub(crate) page_correlation_id: Option<u32>,
 }
 
 /// Voice page that is actively being retried until the MS responds or times out.
@@ -209,6 +211,8 @@ pub(crate) struct PendingVoicePage {
     pub(crate) imsi: Option<String>,
     /// Stored msg_seq from the first GPM send, reused on retries.
     pub(crate) page_msg_seq: Option<u8>,
+    /// Abis PchMessageTransfer correlation for the BTS-owned GPM page record.
+    pub(crate) page_correlation_id: Option<u32>,
 }
 
 pub(crate) struct SmsPageRetry {
@@ -509,11 +513,13 @@ impl PagingState {
         target_chip: Option<u64>,
         next_retry_at: tokio::time::Instant,
         page_msg_seq: u8,
+        page_correlation_id: Option<u32>,
     ) {
         if let Some(pending) = self.pending_page.as_mut() {
             pending.last_target_chip = target_chip;
             pending.next_retry_at = next_retry_at;
             pending.page_msg_seq = Some(page_msg_seq);
+            pending.page_correlation_id = page_correlation_id;
         }
     }
 
@@ -522,11 +528,13 @@ impl PagingState {
         target_chip: Option<u64>,
         next_retry_at: tokio::time::Instant,
         page_msg_seq: u8,
+        page_correlation_id: Option<u32>,
     ) {
         if let Some(pending) = self.pending_voice_page.as_mut() {
             pending.last_target_chip = target_chip;
             pending.next_retry_at = next_retry_at;
             pending.page_msg_seq = Some(page_msg_seq);
+            pending.page_correlation_id = page_correlation_id;
         }
     }
 
@@ -562,6 +570,36 @@ impl PagingState {
 
     pub(crate) fn take_voice_page(&mut self) -> Option<PendingVoicePage> {
         self.pending_voice_page.take()
+    }
+
+    pub(crate) fn pending_sms_page_correlation_matches(&self, correlation_id: u32) -> bool {
+        self.pending_page
+            .as_ref()
+            .is_some_and(|pending| pending.page_correlation_id == Some(correlation_id))
+    }
+
+    pub(crate) fn pending_voice_page_correlation_matches(&self, correlation_id: u32) -> bool {
+        self.pending_voice_page
+            .as_ref()
+            .is_some_and(|pending| pending.page_correlation_id == Some(correlation_id))
+    }
+
+    pub(crate) fn take_sms_page_by_correlation(
+        &mut self,
+        correlation_id: u32,
+    ) -> Option<PendingPage> {
+        self.pending_sms_page_correlation_matches(correlation_id)
+            .then(|| self.pending_page.take())
+            .flatten()
+    }
+
+    pub(crate) fn take_voice_page_by_correlation(
+        &mut self,
+        correlation_id: u32,
+    ) -> Option<PendingVoicePage> {
+        self.pending_voice_page_correlation_matches(correlation_id)
+            .then(|| self.pending_voice_page.take())
+            .flatten()
     }
 
     pub(crate) fn cancel_sms_page(&mut self) {
@@ -669,6 +707,50 @@ impl Bsc {
         }
     }
 
+    fn mobile_identity_for_adds_page_ack(&self, addr: &MsAddress) -> cdma_ios::MobileIdentity {
+        self.mobiles
+            .iter()
+            .find(|ms| ms.fwd_address == *addr)
+            .and_then(|ms| {
+                ms.imsi
+                    .as_ref()
+                    .map(|imsi| cdma_ios::MobileIdentity::Imsi(imsi.clone()))
+                    .or_else(|| ms.esn.map(cdma_ios::MobileIdentity::Esn))
+            })
+            .unwrap_or_else(|| cdma_ios::MobileIdentity::Imsi("UNKNOWN".to_string()))
+    }
+
+    fn send_adds_page_ack_to_msc(
+        &self,
+        addr: &MsAddress,
+        a1_tag: u32,
+        cause: Option<u8>,
+        context: &'static str,
+    ) {
+        let client = self.a1.msc_client.clone();
+        let mobile_identity = self.mobile_identity_for_adds_page_ack(addr);
+        tokio::spawn(async move {
+            let ack_msg = cdma_ios::AddsPageAckMessage {
+                mobile_identity,
+                tag: Some(cdma_ios::Tag(a1_tag)),
+                mobile_identity_esn: None,
+                cause: cause.map(cdma_ios::Cause),
+            };
+            match ack_msg.encode() {
+                Ok(payload) => {
+                    let msg = cdma_ios::EncodedA1Message::from_message(&cdma_ios::Message::new(
+                        cdma_ios::MessageType::AddsPageAck,
+                        payload,
+                    ));
+                    if let Err(e) = client.send_a1(msg).await {
+                        log::warn!("BSC: failed to send ADDS Page Ack ({context}) to MSC: {e}");
+                    }
+                }
+                Err(e) => log::warn!("BSC: failed to encode ADDS Page Ack ({context}): {e}"),
+            }
+        });
+    }
+
     pub(crate) fn handle_pch_transfer_ack(&mut self, ack: PchTransferAckEvent) {
         let Some(correlation_id) = ack.correlation_id else {
             debug!(
@@ -680,6 +762,19 @@ impl Bsc {
 
         let key = SmsAckKey::PchCorrelation(correlation_id);
         if ack.bts_l2_termination == Some(true) {
+            if self
+                .paging
+                .pending_sms_page_correlation_matches(correlation_id)
+                || self
+                    .paging
+                    .pending_voice_page_correlation_matches(correlation_id)
+            {
+                debug!(
+                    "BSC: page response observed for GPM correlation_id={} - waiting for ACH Page Response",
+                    correlation_id
+                );
+                return;
+            }
             match self.sms.complete_delivery(&key) {
                 None => debug!(
                     "BSC: PchMsgTransferAck L2 termination for untracked correlation_id={}",
@@ -692,43 +787,7 @@ impl Bsc {
                             a1_tag,
                             format_ms_address(&pending.addr)
                         );
-                        let client = self.a1.msc_client.clone();
-                        let ms = self
-                            .mobiles
-                            .iter()
-                            .find(|ms| ms.fwd_address == pending.addr);
-                        let mobile_identity = ms
-                            .and_then(|ms| {
-                                ms.imsi
-                                    .as_ref()
-                                    .map(|imsi| cdma_ios::MobileIdentity::Imsi(imsi.clone()))
-                                    .or_else(|| ms.esn.map(cdma_ios::MobileIdentity::Esn))
-                            })
-                            .unwrap_or_else(|| {
-                                cdma_ios::MobileIdentity::Imsi("UNKNOWN".to_string())
-                            });
-                        tokio::spawn(async move {
-                            let ack_msg = cdma_ios::AddsPageAckMessage {
-                                mobile_identity,
-                                tag: Some(cdma_ios::Tag(a1_tag)),
-                                mobile_identity_esn: None,
-                                cause: None,
-                            };
-                            match ack_msg.encode() {
-                                Ok(payload) => {
-                                    let msg = cdma_ios::EncodedA1Message::from_message(
-                                        &cdma_ios::Message::new(
-                                            cdma_ios::MessageType::AddsPageAck,
-                                            payload,
-                                        ),
-                                    );
-                                    if let Err(e) = client.send_a1(msg).await {
-                                        log::warn!("BSC: failed to send ADDS Page Ack to MSC: {e}");
-                                    }
-                                }
-                                Err(e) => log::warn!("BSC: failed to encode ADDS Page Ack: {e}"),
-                            }
-                        });
+                        self.send_adds_page_ack_to_msc(&pending.addr, a1_tag, None, "success");
                     }
                 }
             }
@@ -736,6 +795,49 @@ impl Bsc {
         }
 
         if let Some(cause) = ack.cause {
+            if let Some(pending) = self.paging.take_sms_page_by_correlation(correlation_id) {
+                self.clear_pending_page_records_for(&pending.page_address);
+                warn!(
+                    "BSC: page record delivery failed correlation_id={} cause=0x{:02X}; giving up on SMS to {}",
+                    correlation_id,
+                    cause,
+                    format_ms_address(&pending.fwd_address),
+                );
+                if let Some(a1_tag) = pending.sms.a1_tag {
+                    self.send_adds_page_ack_to_msc(
+                        &pending.fwd_address,
+                        a1_tag,
+                        Some(cause),
+                        "page failure",
+                    );
+                }
+                self.mobiles
+                    .set_state(&pending.fwd_address, MsState::Registered);
+                self.publish_mobiles();
+                return;
+            }
+            if let Some(pending) = self.paging.take_voice_page_by_correlation(correlation_id) {
+                self.clear_pending_page_records_for(&pending.page_address);
+                warn!(
+                    "BSC: voice page record delivery failed correlation_id={} cause=0x{:02X}; giving up on {}",
+                    correlation_id,
+                    cause,
+                    format_ms_address(&pending.fwd_address),
+                );
+                self.mobiles
+                    .set_state(&pending.fwd_address, MsState::Registered);
+                let caller_addr = self
+                    .mobiles
+                    .get_by_session_leg(pending.session_id, VoiceLegRole::Caller)
+                    .map(|ms| ms.fwd_address.clone());
+                if let Some(addr) = caller_addr {
+                    self.begin_voice_release(&addr, 0b111, "voice page failure");
+                }
+                self.voice
+                    .retain_sessions(|session| session.id != pending.session_id);
+                self.publish_mobiles();
+                return;
+            }
             match self.sms.fail_delivery(&key, cause) {
                 None => debug!(
                     "BSC: PchMsgTransferAck failure for untracked correlation_id={} cause=0x{:02X}",
@@ -743,47 +845,12 @@ impl Bsc {
                 ),
                 Some(pending) => {
                     if let Some(a1_tag) = pending.a1_tag {
-                        let client = self.a1.msc_client.clone();
-                        let ms = self
-                            .mobiles
-                            .iter()
-                            .find(|ms| ms.fwd_address == pending.addr);
-                        let mobile_identity = ms
-                            .and_then(|ms| {
-                                ms.imsi
-                                    .as_ref()
-                                    .map(|imsi| cdma_ios::MobileIdentity::Imsi(imsi.clone()))
-                                    .or_else(|| ms.esn.map(cdma_ios::MobileIdentity::Esn))
-                            })
-                            .unwrap_or_else(|| {
-                                cdma_ios::MobileIdentity::Imsi("UNKNOWN".to_string())
-                            });
-                        tokio::spawn(async move {
-                            let ack_msg = cdma_ios::AddsPageAckMessage {
-                                mobile_identity,
-                                tag: Some(cdma_ios::Tag(a1_tag)),
-                                mobile_identity_esn: None,
-                                cause: Some(cdma_ios::Cause(cause)),
-                            };
-                            match ack_msg.encode() {
-                                Ok(payload) => {
-                                    let msg = cdma_ios::EncodedA1Message::from_message(
-                                        &cdma_ios::Message::new(
-                                            cdma_ios::MessageType::AddsPageAck,
-                                            payload,
-                                        ),
-                                    );
-                                    if let Err(e) = client.send_a1(msg).await {
-                                        log::warn!(
-                                            "BSC: failed to send ADDS Page Ack (failure) to MSC: {e}"
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    log::warn!("BSC: failed to encode ADDS Page Ack (failure): {e}")
-                                }
-                            }
-                        });
+                        self.send_adds_page_ack_to_msc(
+                            &pending.addr,
+                            a1_tag,
+                            Some(cause),
+                            "failure",
+                        );
                     }
                 }
             }
@@ -888,6 +955,14 @@ impl Bsc {
             // Reset MS state back to Registered if it still exists
             self.mobiles
                 .set_state(&pending.fwd_address, MsState::Registered);
+            if let Some(a1_tag) = pending.sms.a1_tag {
+                self.send_adds_page_ack_to_msc(
+                    &pending.fwd_address,
+                    a1_tag,
+                    Some(0x07),
+                    "page timeout",
+                );
+            }
             self.publish_mobiles();
         }
     }
@@ -901,7 +976,7 @@ impl Bsc {
         service_option: Option<u16>,
         purpose: &str,
         override_msg_seq: Option<u8>,
-    ) -> Result<(Option<u64>, u8), Error> {
+    ) -> Result<(Option<u64>, u8, Option<u32>), Error> {
         let page_seq = override_msg_seq.unwrap_or_else(|| self.paging.next_gpm_page_seq(page_addr));
         // Current overhead for subclass selection at page-send time
         // (C.S0004-E 3.1.2.2.1.1.1.2: BS picks shortest format that
@@ -941,7 +1016,7 @@ impl Bsc {
 
         info!("BSC: page record for {}: {:?}", purpose, record);
 
-        self.send_gpm_via_abis(page_addr, record, purpose);
+        let page_correlation_id = self.send_gpm_via_abis(page_addr, record, purpose);
 
         // Compute BSC-local retry scheduling: find the next assigned paging
         // slot so the retry timer can wake up before the next slot boundary.
@@ -963,7 +1038,7 @@ impl Bsc {
             used_target_chip = Some(slot.target_chip);
         }
 
-        Ok((used_target_chip, page_seq))
+        Ok((used_target_chip, page_seq, page_correlation_id))
     }
 
     /// Send a General Page Message for voice call delivery.
@@ -975,7 +1050,7 @@ impl Bsc {
         after_chip: Option<u64>,
         service_option: u16,
         override_msg_seq: Option<u8>,
-    ) -> Result<(Option<u64>, u8), Error> {
+    ) -> Result<(Option<u64>, u8, Option<u32>), Error> {
         self.send_general_page(
             page_addr,
             pgslot,
@@ -1005,8 +1080,10 @@ impl Bsc {
         page_addr: &MsPageAddress,
         record: GeneralPageRecord,
         purpose: &str,
-    ) {
-        use cdma_abis::control::typed::{AirInterfaceMessagePayload, PchMessageTransferMessage};
+    ) -> Option<u32> {
+        use cdma_abis::control::typed::{
+            AirInterfaceMessagePayload, CorrelationId, PchMessageTransferMessage,
+        };
         use cdma_common::lac::paging_messages::GeneralPageMessage;
 
         let gpm = GeneralPageMessage {
@@ -1033,12 +1110,13 @@ impl Bsc {
                     "BSC: failed to build GPM Air Interface Message for {}: {}",
                     purpose, e
                 );
-                return;
+                return None;
             }
         };
         let mobile_id = mobile_identity_for_page_address(page_addr);
+        let correlation_id = next_pch_correlation_id();
         let pch = PchMessageTransferMessage {
-            correlation_id: None,
+            correlation_id: Some(CorrelationId(correlation_id)),
             mobile_identities: vec![mobile_id],
             cell_identifier_list: None,
             air_interface_message: Some(aim),
@@ -1048,11 +1126,17 @@ impl Bsc {
         if let Some(ref bts_client) = self.config.bts_client {
             if let Err(e) = bts_client.send_pch_message(pch) {
                 warn!("BSC: send GPM via Abis failed for {}: {}", purpose, e);
+                None
             } else {
-                info!("BSC: sent GPM page record via Abis for {}", purpose);
+                info!(
+                    "BSC: sent GPM page record via Abis for {} correlation_id={}",
+                    purpose, correlation_id
+                );
+                Some(correlation_id)
             }
         } else {
             warn!("BSC: no bts_client — cannot send GPM for {}", purpose);
+            None
         }
     }
 

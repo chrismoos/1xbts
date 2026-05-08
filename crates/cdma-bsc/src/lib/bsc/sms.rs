@@ -548,14 +548,19 @@ impl Bsc {
             next_retry_at: tokio::time::Instant::now(),
             last_target_chip: None,
             page_msg_seq: None,
+            page_correlation_id: None,
         });
 
         self.publish_mobiles();
         match self.send_page_for_sms(&page_addr, pgslot, sci, None, None) {
-            Ok((target_chip, page_seq)) => {
+            Ok((target_chip, page_seq, page_correlation_id)) => {
                 let next_retry_at = self.compute_next_retry_at(pgslot, sci, target_chip);
-                self.paging
-                    .record_sms_page_sent(target_chip, next_retry_at, page_seq);
+                self.paging.record_sms_page_sent(
+                    target_chip,
+                    next_retry_at,
+                    page_seq,
+                    page_correlation_id,
+                );
             }
             Err(e) => warn!("BSC: failed to send page: {}", e),
         }
@@ -569,7 +574,7 @@ impl Bsc {
         slot_cycle_index: u8,
         after_chip: Option<u64>,
         override_msg_seq: Option<u8>,
-    ) -> Result<(Option<u64>, u8), Error> {
+    ) -> Result<(Option<u64>, u8, Option<u32>), Error> {
         self.send_general_page(
             page_addr,
             pgslot,

@@ -13,8 +13,8 @@ use log::{info, warn};
 
 use cdma_abis::control::typed::{
     A3ConnectInformation, CellId, CellIdWithMscId, CellInfoRecord, ChannelElementStatus,
-    PhysicalChannelInfo, PhysicalChannelType, PilotGatingRate, TrafficChannelStatusMessage,
-    TrafficCircuitId,
+    CorrelationId, PhysicalChannelInfo, PhysicalChannelType, PilotGatingRate,
+    TrafficChannelStatusMessage, TrafficCircuitId,
 };
 use cdma_abis::control::{
     AbisMessage, AbisTimerKind, BtsReleaseAckMessage, BtsReleaseMessage, BtsSetupAckMessage,
@@ -222,12 +222,12 @@ impl AbisAgent {
 
     /// Cancel pending page records when a Page Response is received on the
     /// access channel. Called from the BTS access event handler.
-    pub fn check_page_response_cancel(&self, event: &AccessChannelEvent) {
+    pub fn check_page_response_cancel(&self, event: &AccessChannelEvent) -> Vec<AbisMessage> {
         let Some(AccessMessage::PageResponse(_)) = event.decoded_l3 else {
-            return;
+            return Vec::new();
         };
         let Some(ref paging_state) = self.paging_state else {
-            return;
+            return Vec::new();
         };
         let page_addr = if let (Some(s1), Some(s2)) = (event.imsi_m_s1, event.imsi_m_s2) {
             Some(MsPageAddress::ImsiS {
@@ -242,14 +242,29 @@ impl AbisAgent {
             None
         };
         if let Some(addr) = page_addr {
-            let removed = paging_state.lock().cancel_pages_for_address(&addr);
-            if removed > 0 {
+            let correlations = paging_state.lock().complete_pages_for_address(&addr);
+            if !correlations.is_empty() {
                 info!(
-                    "abis_agent: cancelled {} pending page record(s) on Page Response from {:?}",
-                    removed, addr,
+                    "abis_agent: completed {} pending page record(s) on Page Response from {:?}",
+                    correlations.len(),
+                    addr,
                 );
             }
+            return correlations
+                .into_iter()
+                .filter_map(|correlation_id| {
+                    let ack = PchMessageTransferAckMessage {
+                        correlation_id: Some(CorrelationId(correlation_id)),
+                        cause: None,
+                        bts_l2_termination: Some(true),
+                    };
+                    ack.encode()
+                        .ok()
+                        .and_then(|bytes| abis_message_from_typed(&bytes))
+                })
+                .collect();
         }
+        Vec::new()
     }
 
     /// Returns the number of active sessions.
@@ -727,12 +742,16 @@ impl AbisAgent {
                             continue;
                         };
                         info!(
-                            "abis_agent: GPM page record queued: {:?} addr={:?}",
-                            record, page_address,
+                            "abis_agent: GPM page record queued: {:?} addr={:?} corr={:?}",
+                            record, page_address, correlation_id,
                         );
                         guard
                             .pending_page_records
-                            .push(PendingPageRecord::new(record, page_address));
+                            .push(PendingPageRecord::new_with_correlation(
+                                record,
+                                page_address,
+                                correlation_id,
+                            ));
                     }
                 }
                 Err(e) => {
@@ -1065,7 +1084,10 @@ impl AbisAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lac::paging_messages::{ChannelAssignmentMessage, ExtendedChannelAssignmentMessage};
+    use crate::lac::paging_messages::{
+        ChannelAssignmentMessage, ExtendedChannelAssignmentMessage, GeneralPageRecord,
+    };
+    use crate::receiver::access_layer3::{AccessMessageHeader, PageResponseMessage};
     use cdma_abis::control::typed::{
         A3ConnectAckInformation, AirInterfaceMessagePayload, CdmaServingOneWayDelay,
         Layer2AckRequestResults, MobileIdentity, ServiceOption,
@@ -1154,6 +1176,82 @@ mod tests {
             traffic_voice_rate_bps: None,
             raw_pdu_bits: None,
         }
+    }
+
+    fn minimal_page_response_event(imsi: &str) -> AccessChannelEvent {
+        let mut event = minimal_access_event(imsi, 0);
+        event.message_id = MessageId::PageResponse;
+        event.msg_type_name = "Page Response Message".to_string();
+        event.decoded_l3 = Some(AccessMessage::PageResponse(PageResponseMessage {
+            header: AccessMessageHeader {
+                pd: 1,
+                message_id: MessageId::PageResponse,
+            },
+            mob_term: true,
+            slot_cycle_index: 0,
+            mob_p_rev: 6,
+            scm: 0,
+            request_mode: 0,
+            service_option: 6,
+            pm: false,
+            nar_an_cap: false,
+            encryption_supported: None,
+            num_alt_so: 0,
+            alt_service_options: Vec::new(),
+            uzid_incl: None,
+            uzid: None,
+            ch_ind: None,
+            otd_supported: None,
+            qpch_supported: None,
+            enhanced_rc: None,
+            for_rc_pref: None,
+            rev_rc_pref: None,
+            fch_supported: None,
+            fch_capability: None,
+            dcch_supported: None,
+            dcch_capability: None,
+            rev_fch_gating_req: None,
+            sts_supported: None,
+            cch_3x_supported: None,
+            wll_incl: None,
+            wll_device_type: None,
+            hook_status: None,
+            enc_info_incl: None,
+            sig_encrypt_sup: None,
+            d_sig_encrypt_req: None,
+            c_sig_encrypt_req: None,
+            new_sseq_h: None,
+            new_sseq_h_sig: None,
+            ui_encrypt_req: None,
+            ui_encrypt_sup: None,
+            sync_id_incl: None,
+            sync_id_len: None,
+            sync_id: None,
+            so_bitmap_ind: None,
+            so_group_num: None,
+            so_bitmap: None,
+            alt_band_class_sup: None,
+            msg_int_info_incl: None,
+            sig_integrity_sup_incl: None,
+            sig_integrity_sup: None,
+            sig_integrity_req: None,
+            new_key_id: None,
+            new_sseq_h_incl: None,
+            for_pdch_supported: None,
+            for_pdch_capability: None,
+            ext_ch_ind: None,
+            sign_slot_cycle_index: None,
+            bcmc_incl: None,
+            bcmc_pref_incl: None,
+            bcmc: None,
+            rev_pdch_supported: None,
+            rev_pdch_capability: None,
+            band_sub_rep_incl: None,
+            num_band_subclass: None,
+            band_subclass_sup: None,
+            remaining_bits: 0,
+        }));
+        event
     }
 
     fn make_bts_setup(ccr: CallConnectionReference, esn: u32) -> AbisMessage {
@@ -1474,6 +1572,107 @@ mod tests {
             MessageType::PchMessageTransferAck
         );
         assert!(events.is_empty());
+        assert!(paging_state.lock().pending_page_records.is_empty());
+    }
+
+    #[test]
+    fn gpm_pch_queues_correlated_page_record() {
+        let controller = Arc::new(TrafficResourceService::new());
+        let mut agent = AbisAgent::new(test_config(), controller);
+        let paging_state = Arc::new(Mutex::new(PagingSupplierState::new(0, 0)));
+        agent.set_paging_state(paging_state.clone());
+
+        let record = GeneralPageRecord::Class1 {
+            esn: 0x1234_5678,
+            msg_seq: 3,
+            special_service: false,
+            service_option: None,
+        };
+        let gpm = GeneralPageMessage {
+            config_msg_seq: 0,
+            acc_msg_seq: 0,
+            class_0_done: true,
+            class_1_done: true,
+            tmsi_done: true,
+            ordered_tmsis: false,
+            broadcast_done: false,
+            reserved: 0,
+            add_pfield: Vec::new(),
+            page_records: vec![record.clone()],
+        };
+        let wire_type = MessageId::GeneralPage
+            .wire_type(WireChannel::ForwardCommon)
+            .unwrap();
+        let pch = PchMessageTransferMessage {
+            correlation_id: Some(cdma_abis::control::CorrelationId(43)),
+            mobile_identities: vec![MobileIdentity::Esn(0x1234_5678)],
+            cell_identifier_list: None,
+            air_interface_message: Some(
+                AirInterfaceMessagePayload::new(wire_type, gpm.to_sdu().to_packed_bytes()).unwrap(),
+            ),
+            layer2_ack_request_results: None,
+            abis_ack_notify: None,
+        };
+        let bytes = pch.encode().unwrap();
+        let msg = decode(&bytes).unwrap();
+
+        let (responses, events) = agent.handle_message(&msg);
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0].message_type,
+            MessageType::PchMessageTransferAck
+        );
+        assert!(events.is_empty());
+
+        let guard = paging_state.lock();
+        assert_eq!(guard.pending_page_records.len(), 1);
+        assert_eq!(guard.pending_page_records[0].record, record);
+        assert_eq!(guard.pending_page_records[0].correlation_id, Some(43));
+    }
+
+    #[test]
+    fn page_response_cancel_sends_positive_pch_ack() {
+        let controller = Arc::new(TrafficResourceService::new());
+        let mut agent = AbisAgent::new(test_config(), controller);
+        let paging_state = Arc::new(Mutex::new(PagingSupplierState::new(0, 0)));
+        agent.set_paging_state(paging_state.clone());
+        let (imsi_m_s1, imsi_m_s2) =
+            cdma_common::paging::imsi_s_from_imsi("209990123456789").unwrap();
+
+        paging_state
+            .lock()
+            .pending_page_records
+            .push(PendingPageRecord::new_with_correlation(
+                GeneralPageRecord::Class0 {
+                    page_subclass: 3,
+                    msg_seq: 0,
+                    imsi_s: None,
+                    imsi_11_12: Some(cdma_common::paging::imsi_11_12_from_digits("99").unwrap()),
+                    mcc: None,
+                    imsi_addr_num: None,
+                    imsi_m_s1: Some(imsi_m_s1),
+                    imsi_m_s2: Some(imsi_m_s2),
+                    special_service: false,
+                    service_option: None,
+                },
+                MsPageAddress::ImsiS {
+                    imsi_m_s1,
+                    imsi_m_s2,
+                    mcc: None,
+                    imsi_11_12: Some(cdma_common::paging::imsi_11_12_from_digits("99").unwrap()),
+                },
+                Some(55),
+            ));
+
+        let responses =
+            agent.check_page_response_cancel(&minimal_page_response_event("209990123456789"));
+
+        assert_eq!(responses.len(), 1);
+        let ack_bytes = encode(&responses[0]).unwrap();
+        let ack = PchMessageTransferAckMessage::decode(&ack_bytes).unwrap();
+        assert_eq!(ack.correlation_id.map(|c| c.0), Some(55));
+        assert_eq!(ack.cause, None);
+        assert_eq!(ack.bts_l2_termination, Some(true));
         assert!(paging_state.lock().pending_page_records.is_empty());
     }
 

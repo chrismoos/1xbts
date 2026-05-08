@@ -598,7 +598,12 @@ pub async fn spawn_local_abis_endpoint(
                             warn!("BTS Abis L2 ack send failed: {e}");
                         }
                     }
-                    agent.check_page_response_cancel(&access_event);
+                    let page_response_acks = agent.check_page_response_cancel(&access_event);
+                    for resp in page_response_acks {
+                        if let Err(e) = sender.send(&resp).await {
+                            warn!("BTS Abis page-response ack send failed: {e}");
+                        }
+                    }
                     let raw_bits = match &access_event.raw_pdu_bits {
                         Some(bits) => bits.clone(),
                         None => continue,

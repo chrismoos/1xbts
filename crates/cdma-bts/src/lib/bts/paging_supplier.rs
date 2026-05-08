@@ -15,6 +15,7 @@ use crate::mac::types::ChannelType;
 use super::settings::{OverheadParameters, PagingChannelSettings, build_scheduled_message};
 
 const PENDING_PAGE_RECORD_ASSIGNED_SLOT_ATTEMPTS: u16 = 4;
+const PENDING_PAGE_RECORD_FAILURE_GUARD_MS: u64 = 1_000;
 
 /// Event emitted when the BTS paging supplier transmits a directed SDU
 /// or GPM on F-PCH. Carries the real on-air MSG_SEQ assigned by the BTS.
@@ -37,14 +38,26 @@ pub struct PendingPageRecord {
     pub record: GeneralPageRecord,
     pub page_address: MsPageAddress,
     pub remaining_assigned_slot_attempts: u16,
+    pub correlation_id: Option<u32>,
+    exhausted_at_chip: Option<u64>,
 }
 
 impl PendingPageRecord {
     pub fn new(record: GeneralPageRecord, page_address: MsPageAddress) -> Self {
+        Self::new_with_correlation(record, page_address, None)
+    }
+
+    pub fn new_with_correlation(
+        record: GeneralPageRecord,
+        page_address: MsPageAddress,
+        correlation_id: Option<u32>,
+    ) -> Self {
         Self {
             record,
             page_address,
             remaining_assigned_slot_attempts: PENDING_PAGE_RECORD_ASSIGNED_SLOT_ATTEMPTS,
+            correlation_id,
+            exhausted_at_chip: None,
         }
     }
 }
@@ -179,6 +192,23 @@ impl PagingSupplierState {
         self.pending_page_records
             .retain(|p| p.page_address != *addr);
         before - self.pending_page_records.len()
+    }
+
+    /// Complete pending page records for a mobile that sent a Page Response.
+    /// Returns Abis correlation IDs that need final positive PCH transfer acks.
+    pub fn complete_pages_for_address(&mut self, addr: &MsPageAddress) -> Vec<u32> {
+        let mut correlations = Vec::new();
+        self.pending_page_records.retain(|pending| {
+            if pending.page_address == *addr {
+                if let Some(correlation_id) = pending.correlation_id {
+                    correlations.push(correlation_id);
+                }
+                false
+            } else {
+                true
+            }
+        });
+        correlations
     }
 
     /// Record the ARQ msg_seq from an incoming access probe so that the
@@ -387,6 +417,32 @@ impl PagingSupplierState {
         }
     }
 
+    pub fn check_page_record_failures(&mut self, chip_cursor: u64, chip_rate_hz: u64) {
+        let guard_chips = PENDING_PAGE_RECORD_FAILURE_GUARD_MS.saturating_mul(chip_rate_hz) / 1000;
+        let mut failed_correlations = Vec::new();
+        self.pending_page_records.retain(|pending| {
+            let Some(exhausted_at_chip) = pending.exhausted_at_chip else {
+                return true;
+            };
+            if chip_cursor.saturating_sub(exhausted_at_chip) < guard_chips {
+                return true;
+            }
+            if let Some(correlation_id) = pending.correlation_id {
+                info!(
+                    "BTS paging supplier: page record attempts exhausted for correlation_id={}",
+                    correlation_id
+                );
+                failed_correlations.push(correlation_id);
+            }
+            false
+        });
+        self.pending_retry_events.extend(
+            failed_correlations
+                .into_iter()
+                .map(|correlation_id| PagingRetryEvent::Failed { correlation_id }),
+        );
+    }
+
     /// Drain buffered retry events (failures produced by `check_slot_retries`).
     pub fn drain_retry_events(&mut self) -> Vec<PagingRetryEvent> {
         std::mem::take(&mut self.pending_retry_events)
@@ -520,6 +576,7 @@ pub fn build_bts_paging_supplier(
             gpm_sent_this_slot = false;
             {
                 let mut guard = state.lock();
+                guard.check_page_record_failures(chip_cursor, chip_rate_hz);
                 guard.check_slot_retries(chip_cursor, overhead.max_slot_cycle_index, chip_rate_hz);
             }
         }
@@ -532,6 +589,9 @@ pub fn build_bts_paging_supplier(
                 let mut guard = state.lock();
                 let max_sci = overhead.max_slot_cycle_index;
                 guard.pending_page_records.retain_mut(|pending| {
+                    if pending.exhausted_at_chip.is_some() {
+                        return true;
+                    }
                     let include = pending_page_record_active_in_slot(
                         pending,
                         chip_cursor,
@@ -547,7 +607,14 @@ pub fn build_bts_paging_supplier(
                         }
                         pending.remaining_assigned_slot_attempts =
                             pending.remaining_assigned_slot_attempts.saturating_sub(1);
-                        pending.remaining_assigned_slot_attempts > 0
+                        if pending.remaining_assigned_slot_attempts > 0 {
+                            true
+                        } else if pending.correlation_id.is_some() {
+                            pending.exhausted_at_chip = Some(chip_cursor);
+                            true
+                        } else {
+                            false
+                        }
                     } else {
                         true
                     }
@@ -561,6 +628,7 @@ pub fn build_bts_paging_supplier(
                     guard
                         .pending_page_records
                         .iter()
+                        .filter(|pending| pending.exhausted_at_chip.is_none())
                         .filter(|pending| {
                             pending_page_record_active_in_slot(
                                 pending,
@@ -574,6 +642,7 @@ pub fn build_bts_paging_supplier(
                     guard
                         .pending_page_records
                         .iter()
+                        .filter(|pending| pending.exhausted_at_chip.is_none())
                         .filter(|pending| {
                             pending_page_record_active_in_slot(
                                 pending,
@@ -587,6 +656,7 @@ pub fn build_bts_paging_supplier(
                     guard
                         .pending_page_records
                         .iter()
+                        .filter(|pending| pending.exhausted_at_chip.is_none())
                         .filter(|pending| {
                             pending_page_record_active_in_slot(
                                 pending,
@@ -750,6 +820,35 @@ mod tests {
         let dr = state.pending_directed_sdus.pop_front().unwrap();
         assert!(!dr.mcsb.valid_ack);
         assert_eq!(dr.mcsb.ack_seq, 0);
+    }
+
+    #[test]
+    fn exhausted_correlated_page_record_emits_failure_after_guard() {
+        let mut state = PagingSupplierState::new(0x03ff, 0x7f);
+        let mut record = PendingPageRecord::new_with_correlation(
+            GeneralPageRecord::Class1 {
+                esn: 0x1234_5678,
+                msg_seq: 0,
+                special_service: false,
+                service_option: None,
+            },
+            MsPageAddress::Esn(0x1234_5678),
+            Some(99),
+        );
+        record.remaining_assigned_slot_attempts = 0;
+        record.exhausted_at_chip = Some(0);
+        state.pending_page_records.push(record);
+
+        state.check_page_record_failures(SR1_CHIP_RATE_HZ - 1, SR1_CHIP_RATE_HZ);
+        assert_eq!(state.pending_page_records.len(), 1);
+        assert!(state.drain_retry_events().is_empty());
+
+        state.check_page_record_failures(SR1_CHIP_RATE_HZ, SR1_CHIP_RATE_HZ);
+        assert!(state.pending_page_records.is_empty());
+        assert!(matches!(
+            state.drain_retry_events().as_slice(),
+            [PagingRetryEvent::Failed { correlation_id: 99 }]
+        ));
     }
 
     /// The ECAM is queued via Abis with a partial IMSI_S identity, which the
