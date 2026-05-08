@@ -2658,6 +2658,159 @@ async fn packet_data_origination_assigns_non_voice_traffic_channel() {
 }
 
 #[tokio::test]
+async fn unsupported_origination_service_option_gets_release_rejection() {
+    let bts_client = Arc::new(CapturingBtsClient::default());
+    let mut bsc = Bsc::new(Config {
+        pilot_offset: 0,
+        overhead: OverheadParameters::default(),
+        paging: PagingChannelSettings::default(),
+        traffic_assignment: TrafficAssignmentConfig::default(),
+        access_event_rx: None,
+        access_event_broadcast: None,
+        sms_request_rx: None,
+        sms_request_tx: None,
+        data_request_rx: None,
+        data_request_tx: None,
+        power_override_request_rx: None,
+        power_override_request_tx: None,
+        mobiles_tx: None,
+        paging_broadcast: None,
+        traffic_broadcast: None,
+        rx_reference_dbm: None,
+        hlr_repo: None,
+        msc_client: test_msc_client(),
+        bts_client: Some(bts_client.clone() as Arc<dyn BtsControlClient>),
+        traffic_retry: TrafficRetryConfig::default(),
+        paging_retry: PagingRetryConfig::default(),
+        voice_policy: test_voice_policy(),
+        pcf_client: None,
+        mobile_idle_timeout_s: 0,
+        bts_paging_state: None,
+        node_id: "bsc-test".to_string(),
+        msc_voice_bearer: None,
+    });
+
+    let mut origination = test_access_event();
+    origination.message_id = MessageId::Origination;
+    origination.msg_type_name = "Origination Message".to_string();
+    origination.msg_seq = Some(4);
+    origination.ack_req = true;
+    origination.esn = Some(0x1234_5678);
+    origination.imsi_m_s1 = Some(0x0091_989e);
+    origination.imsi_m_s2 = Some(0x0326);
+    origination.imsi_class = Some(0);
+    origination.imsi_mcc = Some(310);
+    origination.imsi_11_12 = Some(99);
+    origination.mob_p_rev = Some(3);
+    origination.slot_cycle_index = Some(2);
+    origination.scm = Some(0x6a);
+    origination.service_option = Some(32768);
+
+    bsc.inject_access_event(origination).await;
+
+    assert_eq!(bsc.mobiles.tracked_count(), 1);
+    assert!(
+        bsc.mobiles[0].traffic_channel.is_none(),
+        "unsupported SO must not assign traffic"
+    );
+
+    let messages = bts_client.pch_messages.lock();
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].layer2_ack_request_results.is_some());
+    assert!(messages[0].abis_ack_notify.is_some());
+    let aim = messages[0]
+        .air_interface_message
+        .as_ref()
+        .expect("Release rejection should carry an air-interface message");
+    assert_eq!(aim.message_type, 0x07);
+
+    let mut bits = Bitstream::new_bytes(&aim.message);
+    let order = lac::paging_messages::OrderMessage::from_sdu(&mut bits)
+        .expect("Release rejection should decode as an Order");
+    assert_eq!(order.order, 0b010101, "expected Release Order");
+    assert_eq!(
+        order.ordq, 0b00000010,
+        "ORDQ=2 means requested service option is rejected"
+    );
+    assert!(order.order_specific_fields.is_empty());
+}
+
+#[tokio::test]
+async fn supported_packet_origination_so_is_not_rejected_when_assignment_falls_back() {
+    let bts_client = Arc::new(CapturingBtsClient::default());
+    let mut bsc = Bsc::new(Config {
+        pilot_offset: 0,
+        overhead: OverheadParameters::default(),
+        paging: PagingChannelSettings::default(),
+        traffic_assignment: TrafficAssignmentConfig::default(),
+        access_event_rx: None,
+        access_event_broadcast: None,
+        sms_request_rx: None,
+        sms_request_tx: None,
+        data_request_rx: None,
+        data_request_tx: None,
+        power_override_request_rx: None,
+        power_override_request_tx: None,
+        mobiles_tx: None,
+        paging_broadcast: None,
+        traffic_broadcast: None,
+        rx_reference_dbm: None,
+        hlr_repo: None,
+        msc_client: test_msc_client(),
+        bts_client: Some(bts_client.clone() as Arc<dyn BtsControlClient>),
+        traffic_retry: TrafficRetryConfig::default(),
+        paging_retry: PagingRetryConfig::default(),
+        voice_policy: test_voice_policy(),
+        pcf_client: None,
+        mobile_idle_timeout_s: 0,
+        bts_paging_state: None,
+        node_id: "bsc-test".to_string(),
+        msc_voice_bearer: None,
+    });
+
+    let mut origination = test_access_event();
+    origination.message_id = MessageId::Origination;
+    origination.msg_type_name = "Origination Message".to_string();
+    origination.msg_seq = Some(4);
+    origination.ack_req = true;
+    origination.esn = Some(0x1234_5678);
+    origination.imsi_m_s1 = Some(0x0091_989e);
+    origination.imsi_m_s2 = Some(0x0326);
+    origination.imsi_class = Some(0);
+    origination.imsi_mcc = Some(310);
+    origination.imsi_11_12 = Some(99);
+    origination.mob_p_rev = Some(3);
+    origination.slot_cycle_index = Some(2);
+    origination.scm = Some(0x6a);
+    origination.service_option = Some(7);
+
+    bsc.inject_access_event(origination).await;
+
+    assert_eq!(bsc.mobiles.tracked_count(), 1);
+    assert!(
+        bsc.mobiles[0].traffic_channel.is_none(),
+        "fallback packet SO path must not assign traffic when no channel is available"
+    );
+
+    let messages = bts_client.pch_messages.lock();
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].layer2_ack_request_results.is_none());
+    assert!(messages[0].abis_ack_notify.is_none());
+    let aim = messages[0]
+        .air_interface_message
+        .as_ref()
+        .expect("fallback should carry an air-interface message");
+    assert_eq!(aim.message_type, 0x07);
+
+    let mut bits = Bitstream::new_bytes(&aim.message);
+    let order = lac::paging_messages::OrderMessage::from_sdu(&mut bits)
+        .expect("fallback should decode as an Order");
+    assert_eq!(order.order, 0b010000, "expected BS Ack Order");
+    assert_eq!(order.ordq, 0);
+    assert!(order.order_specific_fields.is_empty());
+}
+
+#[tokio::test]
 async fn packet_data_service_connect_completion_marks_channel_active() {
     use std::sync::{Arc, mpsc::channel};
     let traffic_channels = Arc::new(Mutex::new(Vec::new()));
