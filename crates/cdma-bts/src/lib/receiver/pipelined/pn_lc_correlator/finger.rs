@@ -465,6 +465,10 @@ impl PnLcFinger {
             self.reset_rc3_pcg_measurement();
             return;
         };
+        let raw_power_dbfs = 10.0
+            * ((self.rc3_pcg_measurement_prompt_chip_power / RC3_PCG_CHIPS as f64)
+                .max(1e-15)
+                .log10() as f32);
         let ec_io_db = Self::pilot_ec_io_db_from_prompt_power(
             self.rc3_pcg_measurement_pilot_prompt_power,
             self.rc3_pcg_measurement_prompt_chip_power,
@@ -481,6 +485,10 @@ impl PnLcFinger {
             .insert("absolute_chip_start", abs_chip_start as i64);
         block.tags.insert("traffic_pcg_measurement", 1);
         block.tags.insert("traffic_measurement_age_chips", 0);
+        block.tags.insert(
+            "traffic_pcg_raw_power_mdb",
+            (raw_power_dbfs * 1000.0) as i64,
+        );
         block.tags.insert("finger_id", self.base.id as i64);
         block.pcg_signal_snr_db = Some(vec![ec_io_db]);
         self.pending_output.push(block);

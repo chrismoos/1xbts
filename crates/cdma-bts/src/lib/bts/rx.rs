@@ -1501,9 +1501,17 @@ fn run_sub_chain_timed(
 
 #[derive(Debug, Default)]
 struct PowerControlRxCounterWindow {
+    log_periodic: bool,
     total_measurements: u64,
     window_measurements: u64,
     window_eb_nt_sum_db: f64,
+    window_raw_power_count: u64,
+    window_raw_power_sum_db: f64,
+    window_raw_power_min_db: f32,
+    window_raw_power_max_db: f32,
+    last_raw_power_db: Option<f32>,
+    last_filtered_raw_power_db: Option<f32>,
+    window_raw_power_clamp_down: u64,
     window_age_chips_sum: u64,
     window_max_age_chips: u64,
     window_over_1pcg: u64,
@@ -1511,17 +1519,58 @@ struct PowerControlRxCounterWindow {
 }
 
 impl PowerControlRxCounterWindow {
-    fn record(&mut self, abs_pcg: u64, eb_nt_db: f32, age_chips: u64) -> bool {
+    fn record(
+        &mut self,
+        abs_pcg: u64,
+        eb_nt_db: f32,
+        raw_power_db: Option<f32>,
+        filtered_raw_power_db: Option<f32>,
+        raw_power_clamp_active: bool,
+        age_chips: u64,
+    ) -> bool {
         self.total_measurements = self.total_measurements.saturating_add(1);
         self.window_measurements = self.window_measurements.saturating_add(1);
         self.window_eb_nt_sum_db += eb_nt_db as f64;
+        if let Some(raw_power_db) = raw_power_db.filter(|db| db.is_finite()) {
+            self.window_raw_power_count = self.window_raw_power_count.saturating_add(1);
+            self.window_raw_power_sum_db += raw_power_db as f64;
+            self.window_raw_power_min_db = if self.window_raw_power_count == 1 {
+                raw_power_db
+            } else {
+                self.window_raw_power_min_db.min(raw_power_db)
+            };
+            self.window_raw_power_max_db = if self.window_raw_power_count == 1 {
+                raw_power_db
+            } else {
+                self.window_raw_power_max_db.max(raw_power_db)
+            };
+            self.last_raw_power_db = Some(raw_power_db);
+        }
+        if let Some(filtered_raw_power_db) = filtered_raw_power_db.filter(|db| db.is_finite()) {
+            self.last_filtered_raw_power_db = Some(filtered_raw_power_db);
+        }
+        if raw_power_clamp_active {
+            self.window_raw_power_clamp_down = self.window_raw_power_clamp_down.saturating_add(1);
+        }
         self.window_age_chips_sum = self.window_age_chips_sum.saturating_add(age_chips);
         self.window_max_age_chips = self.window_max_age_chips.max(age_chips);
         if age_chips > 1536 {
             self.window_over_1pcg = self.window_over_1pcg.saturating_add(1);
         }
         self.last_abs_pcg = abs_pcg;
-        self.window_measurements >= power_control_verbose_summary_every()
+        if self.window_measurements < power_control_verbose_summary_every() {
+            return false;
+        }
+        if self.log_periodic || self.window_raw_power_clamp_down > 0 {
+            true
+        } else {
+            self.reset_window();
+            false
+        }
+    }
+
+    fn should_log_partial(&self) -> bool {
+        self.window_measurements > 0 && (self.log_periodic || self.window_raw_power_clamp_down > 0)
     }
 
     fn log_and_reset(&mut self, walsh_code: u8) {
@@ -1532,19 +1581,46 @@ impl PowerControlRxCounterWindow {
         let avg_age_pcgs =
             self.window_age_chips_sum as f64 / self.window_measurements as f64 / 1536.0;
         let max_age_pcgs = self.window_max_age_chips as f64 / 1536.0;
+        let raw_power_summary = if self.window_raw_power_count > 0 {
+            format!(
+                " raw_power_count={} raw_power_avg_dbfs={:.2} raw_power_min_dbfs={:.2} raw_power_max_dbfs={:.2} raw_power_last_dbfs={:.2} raw_power_filt_dbfs={}",
+                self.window_raw_power_count,
+                self.window_raw_power_sum_db / self.window_raw_power_count as f64,
+                self.window_raw_power_min_db,
+                self.window_raw_power_max_db,
+                self.last_raw_power_db.unwrap_or(f32::NAN),
+                self.last_filtered_raw_power_db
+                    .map(|db| format!("{db:.2}"))
+                    .unwrap_or_else(|| "none".to_string()),
+            )
+        } else {
+            " raw_power=none".to_string()
+        };
         info!(
-            "rx_traffic[w{}]: [power counters] total_meas={} window_meas={} raw_ec_io_avg={:.2}(all_pcgs) age_avg_pcgs={:.2} age_max_pcgs={:.2} over_1pcg={} last_abs_pcg={}",
+            "rx_traffic[w{}]: [power counters] total_meas={} window_meas={} raw_ec_io_avg={:.2}(all_pcgs){} raw_power_clamp_down={} age_avg_pcgs={:.2} age_max_pcgs={:.2} over_1pcg={} last_abs_pcg={}",
             walsh_code,
             self.total_measurements,
             self.window_measurements,
             avg_raw_ec_io_db,
+            raw_power_summary,
+            self.window_raw_power_clamp_down,
             avg_age_pcgs,
             max_age_pcgs,
             self.window_over_1pcg,
             self.last_abs_pcg,
         );
+        self.reset_window();
+    }
+
+    fn reset_window(&mut self) {
         self.window_measurements = 0;
         self.window_eb_nt_sum_db = 0.0;
+        self.window_raw_power_count = 0;
+        self.window_raw_power_sum_db = 0.0;
+        self.window_raw_power_min_db = 0.0;
+        self.window_raw_power_max_db = 0.0;
+        self.last_raw_power_db = None;
+        self.window_raw_power_clamp_down = 0;
         self.window_age_chips_sum = 0;
         self.window_max_age_chips = 0;
         self.window_over_1pcg = 0;
@@ -1592,8 +1668,10 @@ fn run_traffic_rx_thread(
     let mut latency_recomputed_chips_sum: u64 = 0;
     let mut latency_recomputed_chips_max: u64 = 0;
     let mut latency_measurement_count: u64 = 0;
-    let mut power_control_counters = power_control_verbose_enabled_for_walsh(walsh_code)
-        .then(PowerControlRxCounterWindow::default);
+    let mut power_control_counters = PowerControlRxCounterWindow {
+        log_periodic: power_control_verbose_enabled_for_walsh(walsh_code),
+        ..PowerControlRxCounterWindow::default()
+    };
     let mut continuity_state = TrafficContinuityState::new(continuity_configured);
 
     let mut emit_outputs = |outputs: Vec<SampleBlock>,
@@ -1686,6 +1764,9 @@ fn run_traffic_rx_thread(
                         .and_then(|values| values.first())
                         .copied()
                         .unwrap_or(f32::NAN);
+                    let mut tick_raw_power = None;
+                    let mut tick_filtered_raw_power = None;
+                    let mut raw_power_clamp_active = false;
                     if let (Some(power_control), Some(traffic_channels), Some(abs_chip)) = (
                         power_control.as_ref(),
                         traffic_channels.as_ref(),
@@ -1699,14 +1780,25 @@ fn run_traffic_rx_thread(
                             measured_abs_pcg,
                             tx_abs_pcg,
                             eb_nt_db,
+                            event.raw_power_db,
                         ) {
-                            let _ = tick;
+                            tick_raw_power = tick.raw_power_db;
+                            tick_filtered_raw_power = tick.filtered_raw_power_db;
+                            raw_power_clamp_active = tick.raw_power_clamp_active;
                         }
                     }
-                    if let Some(counters) = power_control_counters.as_mut() {
+                    {
+                        let counters = &mut power_control_counters;
                         let abs_pcg = event.absolute_chip_start.unwrap_or(0) / 1536;
                         let age_chips = event.traffic_measurement_age_chips.unwrap_or(0);
-                        if counters.record(abs_pcg, eb_nt_db, age_chips) {
+                        if counters.record(
+                            abs_pcg,
+                            eb_nt_db,
+                            tick_raw_power.or(event.raw_power_db),
+                            tick_filtered_raw_power,
+                            raw_power_clamp_active,
+                            age_chips,
+                        ) {
                             counters.log_and_reset(walsh_code);
                         }
                     }
@@ -1986,8 +2078,8 @@ fn run_traffic_rx_thread(
     let mut flushed = flush_sub_chain(&mut processors, &mut flush_emitter);
     flushed.extend(flush_emitter.blocks);
     emit_outputs(flushed, 0, last_processing_absolute_chip_end);
-    if let Some(counters) = power_control_counters.as_mut() {
-        counters.log_and_reset(walsh_code);
+    if power_control_counters.should_log_partial() {
+        power_control_counters.log_and_reset(walsh_code);
     }
 
     info!("rx_traffic[w{}]: thread exiting", walsh_code);
@@ -2889,7 +2981,8 @@ fn build_traffic_pcg_measurement_event(
         reverse_pilot_ec_io_db: reverse_pilot_ec_io_db_from_tags(blk),
         raw_power_db: blk
             .tags
-            .get("finger_raw_power_mdb")
+            .get("traffic_pcg_raw_power_mdb")
+            .or_else(|| blk.tags.get("finger_raw_power_mdb"))
             .map(|v| *v as f32 / 1000.0),
         demod_quality_pct: None,
         pcg_signal_snr_db: Some(vec![eb_nt_db]),

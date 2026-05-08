@@ -803,7 +803,8 @@ pub(super) fn build_traffic_pcg_measurement_event(
         reverse_pilot_ec_io_db: reverse_pilot_ec_io_db_from_tags(blk),
         raw_power_db: blk
             .tags
-            .get("finger_raw_power_mdb")
+            .get("traffic_pcg_raw_power_mdb")
+            .or_else(|| blk.tags.get("finger_raw_power_mdb"))
             .map(|v| *v as f32 / 1000.0),
         demod_quality_pct: None,
         pcg_signal_snr_db: Some(vec![eb_nt_db]),

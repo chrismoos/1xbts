@@ -19,6 +19,10 @@ const PCG_HOLD_BAND_DB: f32 = 0.15;
 const PCG_RESPONSE_GAIN_DB_PER_DB: f32 = 0.5;
 const PCG_DESIRED_STEP_CLAMP_DB: f32 = 1.0;
 const PCG_RESIDUAL_CLAMP_DB: f32 = 2.0;
+const RAW_POWER_FILTER_ALPHA: f32 = 0.05;
+const RAW_POWER_DOWN_CLAMP_THRESHOLD_DBFS: f32 = -23.0;
+const RAW_POWER_CLAMP_WINDOW_PCGS: u64 = 2 * 800;
+const PCG_CHIPS: u64 = 1_536;
 const RC3_STARTUP_SEED_PCGS: usize = 32;
 const FER_WINDOW: usize = 50;
 const OUTER_LOOP_MIN_VALID_FRAMES: u64 = 10;
@@ -34,6 +38,9 @@ pub struct BtsPowerControlTick {
     pub pcb: u8,
     pub target_db: f32,
     pub control_metric_db: f32,
+    pub raw_power_db: Option<f32>,
+    pub filtered_raw_power_db: Option<f32>,
+    pub raw_power_clamp_active: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +101,70 @@ impl StartupTargetSeedState {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rc3_state_without_startup_seed() -> BtsReversePowerControlState {
+        BtsReversePowerControlState::with_params(
+            RC3_INITIAL_TARGET_DB,
+            RC3_AUTO_MIN_DB,
+            RC3_AUTO_MAX_DB,
+            RC3_MANUAL_MIN_DB,
+            RC3_MANUAL_MAX_DB,
+            None,
+        )
+    }
+
+    #[test]
+    fn raw_power_clamp_window_uses_first_three_seconds_of_channel_age() {
+        let start_pcg = 10_000;
+        let start_chip = start_pcg * PCG_CHIPS;
+
+        assert!(BtsPowerControlRegistry::raw_power_clamp_window_active(
+            Some(start_chip),
+            start_pcg
+        ));
+        assert!(BtsPowerControlRegistry::raw_power_clamp_window_active(
+            Some(start_chip),
+            start_pcg + RAW_POWER_CLAMP_WINDOW_PCGS - 1
+        ));
+        assert!(!BtsPowerControlRegistry::raw_power_clamp_window_active(
+            Some(start_chip),
+            start_pcg + RAW_POWER_CLAMP_WINDOW_PCGS
+        ));
+        assert!(!BtsPowerControlRegistry::raw_power_clamp_window_active(
+            None, start_pcg
+        ));
+    }
+
+    #[test]
+    fn raw_power_clamp_forces_down_only_inside_start_window() {
+        let mut state = rc3_state_without_startup_seed();
+
+        let clamped = state.tick_single_pcg(10, 100, -20.0, Some(-10.0), true);
+        assert_eq!(clamped.pcb, 1);
+        assert!(clamped.raw_power_clamp_active);
+
+        let unclamped = state.tick_single_pcg(10, 101, -20.0, Some(-10.0), false);
+        assert_eq!(unclamped.pcb, 0);
+        assert!(!unclamped.raw_power_clamp_active);
+    }
+
+    #[test]
+    fn raw_power_filter_updates_after_clamp_window_closes() {
+        let mut state = rc3_state_without_startup_seed();
+
+        let first = state.tick_single_pcg(10, 100, -20.0, Some(-10.0), false);
+        assert_eq!(first.filtered_raw_power_db, Some(-10.0));
+        assert!(!first.raw_power_clamp_active);
+
+        let second = state.tick_single_pcg(10, 101, -20.0, Some(-30.0), false);
+        assert!(second.filtered_raw_power_db.is_some_and(|db| db < -10.0));
+        assert!(!second.raw_power_clamp_active);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct BtsReversePowerControlState {
     target_db: f32,
@@ -103,6 +174,7 @@ struct BtsReversePowerControlState {
     manual_max_db: f32,
     held_setpoint_db: Option<f32>,
     filtered_metric_db: Option<f32>,
+    filtered_raw_power_db: Option<f32>,
     residual_db: f32,
     last_pcg_pilot_db: [f32; 16],
     last_pcbs: [u8; 16],
@@ -155,6 +227,7 @@ impl BtsReversePowerControlState {
             manual_max_db,
             held_setpoint_db: None,
             filtered_metric_db: None,
+            filtered_raw_power_db: None,
             residual_db: 0.0,
             last_pcg_pilot_db: [f32::NAN; 16],
             last_pcbs: [0; 16],
@@ -180,6 +253,7 @@ impl BtsReversePowerControlState {
         self.target_db = clamped;
         self.held_setpoint_db = setpoint.held.then_some(clamped);
         self.filtered_metric_db = None;
+        self.filtered_raw_power_db = None;
         self.residual_db = 0.0;
         if setpoint.held
             && let Some(seed) = self.startup_seed.as_mut()
@@ -277,11 +351,40 @@ impl BtsReversePowerControlState {
         walsh_code: u8,
         abs_pcg: u64,
         metric_db: f32,
+        raw_power_db: Option<f32>,
+        raw_power_clamp_window_active: bool,
     ) -> BtsPowerControlTick {
         let slot = (abs_pcg % 16) as usize;
         let measurement_valid = metric_db.is_finite();
         if measurement_valid {
             self.last_pcg_pilot_db[slot] = metric_db;
+        }
+
+        let raw_power_db = raw_power_db.filter(|db| db.is_finite());
+        if let Some(raw_power_db) = raw_power_db {
+            let filtered = match self.filtered_raw_power_db {
+                Some(prev) => prev + RAW_POWER_FILTER_ALPHA * (raw_power_db - prev),
+                None => raw_power_db,
+            };
+            self.filtered_raw_power_db = Some(filtered);
+        }
+
+        if raw_power_clamp_window_active
+            && raw_power_db.is_some()
+            && self
+                .filtered_raw_power_db
+                .is_some_and(|db| db > RAW_POWER_DOWN_CLAMP_THRESHOLD_DBFS)
+        {
+            let pcb = 1;
+            self.last_pcbs[slot] = pcb;
+            return BtsPowerControlTick {
+                pcb,
+                target_db: self.effective_target_db(),
+                control_metric_db: self.filtered_metric_db.unwrap_or(metric_db),
+                raw_power_db,
+                filtered_raw_power_db: self.filtered_raw_power_db,
+                raw_power_clamp_active: true,
+            };
         }
 
         if self.held_setpoint_db.is_none() {
@@ -313,6 +416,9 @@ impl BtsReversePowerControlState {
                     pcb,
                     target_db: self.effective_target_db(),
                     control_metric_db: metric_db,
+                    raw_power_db,
+                    filtered_raw_power_db: self.filtered_raw_power_db,
+                    raw_power_clamp_active: false,
                 };
             }
         }
@@ -346,6 +452,9 @@ impl BtsReversePowerControlState {
             pcb,
             target_db: effective_target_db,
             control_metric_db,
+            raw_power_db,
+            filtered_raw_power_db: self.filtered_raw_power_db,
+            raw_power_clamp_active: false,
         }
     }
 
@@ -379,6 +488,14 @@ impl BtsPowerControlRegistry {
             .find(|slot| slot.walsh_code == walsh_code)
             .map(|slot| matches!(slot.channel, TrafficChannelWrapper::Rc3(_)))
             .unwrap_or(true)
+    }
+
+    fn raw_power_clamp_window_active(start_chip: Option<u64>, measured_abs_pcg: u64) -> bool {
+        let Some(start_chip) = start_chip else {
+            return false;
+        };
+        let start_abs_pcg = start_chip / PCG_CHIPS;
+        measured_abs_pcg.saturating_sub(start_abs_pcg) < RAW_POWER_CLAMP_WINDOW_PCGS
     }
 
     pub fn set_target(&self, walsh_code: u8, target_db: f32, held: bool) {
@@ -431,8 +548,16 @@ impl BtsPowerControlRegistry {
         measured_abs_pcg: u64,
         tx_abs_pcg: u64,
         metric_db: f32,
+        raw_power_db: Option<f32>,
     ) -> Option<BtsPowerControlTick> {
-        let use_rc3 = Self::traffic_channel_uses_rc3(traffic_channels, walsh_code);
+        let (use_rc3, raw_power_clamp_window_active) = {
+            let slots = traffic_channels.lock();
+            let slot = slots.iter().find(|slot| slot.walsh_code == walsh_code)?;
+            (
+                matches!(slot.channel, TrafficChannelWrapper::Rc3(_)),
+                Self::raw_power_clamp_window_active(slot.start_chip, measured_abs_pcg),
+            )
+        };
         let tick = {
             let mut states = self.states.lock();
             let state = states.entry(walsh_code).or_insert_with(|| {
@@ -442,7 +567,13 @@ impl BtsPowerControlRegistry {
                     BtsReversePowerControlState::new_rc1()
                 }
             });
-            state.tick_single_pcg(walsh_code, measured_abs_pcg, metric_db)
+            state.tick_single_pcg(
+                walsh_code,
+                measured_abs_pcg,
+                metric_db,
+                raw_power_db,
+                raw_power_clamp_window_active,
+            )
         };
 
         let slots = traffic_channels.lock();
