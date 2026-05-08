@@ -3399,16 +3399,28 @@ fn pch_l2_ack_clears_pending_sms_ack() {
     runtime.block_on(async {
         let sms_id = Uuid::new_v4();
         let attempt_id = Uuid::new_v4();
+        let bts_client = Arc::new(CapturingBtsClient::default());
         let mut bsc = test_bsc_with_max_slot_cycle_index(2);
+        bsc.access_tx = AccessTx::new(Some(bts_client.clone() as Arc<dyn BtsControlClient>));
+        let addr = MsAddress::ImsiS {
+            imsi_m_s1: 16369843,
+            imsi_m_s2: 999,
+        };
+        bsc.mobiles.push(MobileStation::new_for_test(
+            addr.clone(),
+            None,
+            None,
+            6,
+            MsState::PageResponseReceived,
+            2,
+            Some(100),
+        ));
 
         bsc.sms.pending_acks.push(PendingSmsAck {
             key: SmsAckKey::PchCorrelation(77),
-            sms_id,
+            sms_id: Some(sms_id),
             delivery_attempt_id: Some(attempt_id),
-            addr: MsAddress::ImsiS {
-                imsi_m_s1: 16369843,
-                imsi_m_s2: 999,
-            },
+            addr: addr.clone(),
             sent_at: Instant::now(),
             a1_tag: None,
         });
@@ -3420,6 +3432,36 @@ fn pch_l2_ack_clears_pending_sms_ack() {
         });
 
         assert!(bsc.sms.pending_acks.is_empty());
+        assert_eq!(
+            bsc.mobiles.get(&addr).map(|ms| ms.state.clone()),
+            Some(MsState::Registered)
+        );
+
+        let messages = bts_client.pch_messages.lock();
+        assert_eq!(
+            messages.len(),
+            1,
+            "SMS ACK should trigger one Release Order"
+        );
+        let aim = messages[0]
+            .air_interface_message
+            .as_ref()
+            .expect("Release Order should carry an air-interface message");
+        assert_eq!(
+            MessageId::from_wire(
+                cdma_common::lac::message_types::WireChannel::ForwardCommon,
+                aim.message_type,
+            ),
+            Some(MessageId::Order)
+        );
+        let mut bits = Bitstream::new_bytes(&aim.message);
+        let order = lac::paging_messages::OrderMessage::from_sdu(&mut bits)
+            .expect("Release Order should decode");
+        assert_eq!(order.order, 0b010101);
+        assert_eq!(order.ordq, 0);
+        assert!(order.order_specific_fields.is_empty());
+        assert!(messages[0].layer2_ack_request_results.is_none());
+        assert!(messages[0].abis_ack_notify.is_none());
     });
 }
 
@@ -3435,7 +3477,7 @@ fn stale_pch_sms_ack_is_still_cleared_on_bts_l2_result() {
 
         bsc.sms.pending_acks.push(PendingSmsAck {
             key: SmsAckKey::PchCorrelation(77),
-            sms_id,
+            sms_id: Some(sms_id),
             delivery_attempt_id: Some(attempt_id),
             addr: MsAddress::ImsiS {
                 imsi_m_s1: 16369843,
@@ -3469,7 +3511,7 @@ fn pch_failure_clears_pending_sms_ack() {
 
         bsc.sms.pending_acks.push(PendingSmsAck {
             key: SmsAckKey::PchCorrelation(88),
-            sms_id,
+            sms_id: Some(sms_id),
             delivery_attempt_id: Some(attempt_id),
             addr: MsAddress::ImsiS {
                 imsi_m_s1: 16369843,

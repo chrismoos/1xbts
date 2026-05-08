@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cdma_common::access::{AccessMessage, OriginationMessage};
+use cdma_common::bits::Bitstream;
 use cdma_common::error::Error;
 use cdma_common::events::AccessChannelEvent;
 use cdma_common::formatting::format_dtmf_digits;
@@ -175,6 +176,40 @@ impl AccessTx {
             requested_tx_time,
             tx_deadline,
         )
+    }
+
+    pub(crate) fn send_release_order(
+        &self,
+        addr: &MsAddress,
+        requested_tx_time: Option<cdma_common::time::CdmaSystemTime>,
+        tx_deadline: Option<cdma_common::time::CdmaSystemTime>,
+    ) -> Result<(), Error> {
+        let order_msg = OrderMessage {
+            order: 0b010101,
+            ordq: 0,
+            order_specific_fields: Vec::new(),
+        };
+        let mut sdu = Bitstream::new();
+        sdu.write_u8(order_msg.order, 6);
+        sdu.write_u8(1, 3);
+        sdu.write_u8(order_msg.ordq, 8);
+
+        let correlation_id = self.send_directed_fpch(
+            addr,
+            MessageId::Order,
+            PagingChannelMessage::Order(order_msg),
+            sdu,
+            false,
+        )?;
+
+        let req_tx_chip =
+            requested_tx_time.map(|t| cdma_common::time::chips_since_epoch(t, 1_228_800));
+        let deadline_chip = tx_deadline.map(|t| cdma_common::time::chips_since_epoch(t, 1_228_800));
+        info!(
+            "BSC: sending Release Order (correlation_id={}, ack_req=false) requested_tx_chip={:?} deadline_chip={:?}",
+            correlation_id, req_tx_chip, deadline_chip,
+        );
+        Ok(())
     }
 }
 
@@ -656,12 +691,12 @@ impl AccessService {
                 bsc.access_ack_deadline(event),
             ) {
                 warn!("BSC: failed to send SMS data burst: {}", e);
+                bsc.mobiles.mark_registered(&addr);
             }
 
-            // Per C.S0005-E §2.6.3.3: after the BS sends its response
-            // (Data Burst), the MS processes it and returns to Idle.
-            // Reflect this on the BS side.
-            bsc.mobiles.mark_registered(&addr);
+            // The directed Data Burst requested L2 acknowledgment. Keep the
+            // MS in PageResponseReceived until BTS reports the DBM result,
+            // then send the Release Order from handle_pch_transfer_ack.
         } else if let Some(pending) = bsc.paging.take_voice_page() {
             bsc.clear_pending_page_records_for(&pending.page_address);
             info!(

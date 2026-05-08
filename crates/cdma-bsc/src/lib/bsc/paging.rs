@@ -789,6 +789,15 @@ impl Bsc {
                         );
                         self.send_adds_page_ack_to_msc(&pending.addr, a1_tag, None, "success");
                     }
+                    if let Err(e) = self.access_tx.send_release_order(&pending.addr, None, None) {
+                        warn!(
+                            "BSC: failed to send Release Order after SMS delivery ack for {}: {}",
+                            format_ms_address(&pending.addr),
+                            e
+                        );
+                    }
+                    self.mobiles.mark_registered(&pending.addr);
+                    self.publish_mobiles();
                 }
             }
             return;
@@ -852,6 +861,8 @@ impl Bsc {
                             "failure",
                         );
                     }
+                    self.mobiles.mark_registered(&pending.addr);
+                    self.publish_mobiles();
                 }
             }
             return;

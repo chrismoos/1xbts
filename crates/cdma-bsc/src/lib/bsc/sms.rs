@@ -127,7 +127,7 @@ pub(crate) enum SmsAckKey {
 /// SMS Data Burst awaiting delivery confirmation.
 pub(crate) struct PendingSmsAck {
     pub(crate) key: SmsAckKey,
-    pub(crate) sms_id: Uuid,
+    pub(crate) sms_id: Option<Uuid>,
     pub(crate) delivery_attempt_id: Option<Uuid>,
     pub(crate) addr: MsAddress,
     pub(crate) sent_at: Instant,
@@ -182,7 +182,7 @@ impl SmsService {
     pub(crate) fn track_pending_ack(
         &mut self,
         key: SmsAckKey,
-        sms_id: Uuid,
+        sms_id: Option<Uuid>,
         delivery_attempt_id: Option<Uuid>,
         addr: MsAddress,
         sent_at: Instant,
@@ -216,7 +216,7 @@ impl SmsService {
             };
             self.track_pending_ack(
                 key,
-                sms_id,
+                Some(sms_id),
                 delivery_attempt_id,
                 addr.clone(),
                 Instant::now(),
@@ -269,19 +269,15 @@ impl SmsService {
             data_burst.fields.len()
         );
 
-        if sms_req.sms_id.is_some() || sms_req.a1_tag.is_some() {
-            let sms_id = sms_req.sms_id.unwrap_or_else(Uuid::new_v4);
-            let delivery_attempt_id = sms_req.delivery_attempt_id;
-            let key = SmsAckKey::PchCorrelation(correlation_id);
-            self.track_pending_ack(
-                key,
-                sms_id,
-                delivery_attempt_id,
-                addr.clone(),
-                Instant::now(),
-                sms_req.a1_tag,
-            );
-        }
+        let key = SmsAckKey::PchCorrelation(correlation_id);
+        self.track_pending_ack(
+            key,
+            sms_req.sms_id,
+            sms_req.delivery_attempt_id,
+            addr.clone(),
+            Instant::now(),
+            sms_req.a1_tag,
+        );
 
         Ok(())
     }
@@ -290,14 +286,17 @@ impl SmsService {
     /// Abis correlation_id (PCH) or (addr, msg_seq) (traffic channel).
     pub(crate) fn complete_delivery(&mut self, key: &SmsAckKey) -> Option<PendingSmsAck> {
         let pending = self.complete_ack(key)?;
-        info!("BSC: SMS {} delivery confirmed ({:?})", pending.sms_id, key);
+        info!(
+            "BSC: SMS {:?} delivery confirmed ({:?})",
+            pending.sms_id, key
+        );
         Some(pending)
     }
 
     pub(crate) fn fail_delivery(&mut self, key: &SmsAckKey, cause: u8) -> Option<PendingSmsAck> {
         let pending = self.fail_ack(key)?;
         info!(
-            "BSC: SMS {} delivery failed ({:?}, cause=0x{:02X})",
+            "BSC: SMS {:?} delivery failed ({:?}, cause=0x{:02X})",
             pending.sms_id, key, cause
         );
         Some(pending)
