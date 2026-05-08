@@ -212,8 +212,8 @@ impl PnLcConfig {
             preamble_hits_required: 1,
             replay_preamble_symbols: 16,
             noncoherent_segments: 1,
-            // 2 chips worth of guard at 4× oversample
-            peak_suppress_samples: 8,
+            // 4 chips worth of guard at 4× oversample
+            peak_suppress_samples: 16,
             // Two matched-filter passes, each 48 taps with group delay
             // (48-1)/2 = 23.5 samples per pass: 23.5 × 2 = 47 total.
             composite_filter_delay: 47,
