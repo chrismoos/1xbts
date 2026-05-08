@@ -15,7 +15,7 @@ use crate::mac::types::ChannelType;
 use super::settings::{OverheadParameters, PagingChannelSettings, build_scheduled_message};
 
 const PENDING_PAGE_RECORD_ASSIGNED_SLOT_ATTEMPTS: u16 = 4;
-const PENDING_PAGE_RECORD_FAILURE_GUARD_MS: u64 = 1_000;
+const PENDING_PAGE_RECORD_FAILURE_GUARD_MS: u64 = 10_000;
 
 /// Event emitted when the BTS paging supplier transmits a directed SDU
 /// or GPM on F-PCH. Carries the real on-air MSG_SEQ assigned by the BTS.
