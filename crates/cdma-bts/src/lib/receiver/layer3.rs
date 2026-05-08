@@ -836,33 +836,28 @@ fn decode_general_page(
                         if bs.len() < 41 {
                             break;
                         }
-                        (
-                            Some(read(bs, 34, "IMSI_S")?),
-                            Some(read(bs, 7, "IMSI_11_12")? as u8),
-                            None,
-                        )
+                        let imsi_11_12 = read(bs, 7, "IMSI_11_12")? as u8;
+                        let imsi_s = read(bs, 34, "IMSI_S")?;
+                        (Some(imsi_s), Some(imsi_11_12), None)
                     }
                     2 => {
                         // Format 2: MCC (10) + IMSI_S (34)
                         if bs.len() < 44 {
                             break;
                         }
-                        (
-                            Some(read(bs, 34, "IMSI_S")?),
-                            None,
-                            Some(read(bs, 10, "MCC")? as u16),
-                        )
+                        let mcc = read(bs, 10, "MCC")? as u16;
+                        let imsi_s = read(bs, 34, "IMSI_S")?;
+                        (Some(imsi_s), None, Some(mcc))
                     }
                     3 => {
                         // Format 3: MCC (10) + IMSI_11_12 (7) + IMSI_S (34)
                         if bs.len() < 51 {
                             break;
                         }
-                        (
-                            Some(read(bs, 34, "IMSI_S")?),
-                            Some(read(bs, 7, "IMSI_11_12")? as u8),
-                            Some(read(bs, 10, "MCC")? as u16),
-                        )
+                        let mcc = read(bs, 10, "MCC")? as u16;
+                        let imsi_11_12 = read(bs, 7, "IMSI_11_12")? as u8;
+                        let imsi_s = read(bs, 34, "IMSI_S")?;
+                        (Some(imsi_s), Some(imsi_11_12), Some(mcc))
                     }
                     _ => break,
                 };

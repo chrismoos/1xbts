@@ -477,9 +477,17 @@ impl PagingState {
     }
 
     pub(crate) fn next_retry_at(&self) -> Option<tokio::time::Instant> {
+        fn timeout_deadline(started_at: Instant, timeout: Duration) -> tokio::time::Instant {
+            tokio::time::Instant::now() + timeout.saturating_sub(started_at.elapsed())
+        }
+
         match (
-            self.pending_page.as_ref().map(|p| p.next_retry_at),
-            self.pending_voice_page.as_ref().map(|p| p.next_retry_at),
+            self.pending_page
+                .as_ref()
+                .map(|p| timeout_deadline(p.started_at, p.timeout)),
+            self.pending_voice_page
+                .as_ref()
+                .map(|p| timeout_deadline(p.started_at, p.timeout)),
         ) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
@@ -839,7 +847,9 @@ impl Bsc {
             .next_retry_at(pgslot, slot_cycle_index, last_target_chip)
     }
 
-    /// Called when the retry timer fires. Re-sends the GPM or gives up on timeout.
+    /// Called when the paging timeout timer fires. GPM page-record repeats are
+    /// owned by the BTS pending page-record queue, so the BSC only handles
+    /// timeout/cancel state here.
     pub(crate) fn handle_page_retry(&mut self) {
         if self.paging.has_pending_voice_page() {
             if let Some(pending) = self.paging.take_timed_out_voice_page() {
@@ -864,43 +874,6 @@ impl Bsc {
                 self.publish_mobiles();
                 return;
             }
-
-            let Some(retry) = self.paging.prepare_voice_retry() else {
-                return;
-            };
-
-            if self.mobiles.get(&retry.fwd_address).is_none() {
-                warn!("BSC: paged voice MS no longer registered — cancelling page retry");
-                self.paging.cancel_voice_page();
-                return;
-            }
-
-            self.mobiles.set_state(&retry.fwd_address, MsState::Paged);
-
-            info!(
-                "BSC: voice page retry #{} for {}",
-                retry.retry_count,
-                format_ms_address(&retry.fwd_address)
-            );
-            match self.send_page_for_voice(
-                &retry.page_address,
-                retry.pgslot,
-                retry.slot_cycle_index,
-                retry.last_target_chip,
-                retry.service_option,
-                retry.page_msg_seq,
-            ) {
-                Ok((target_chip, _page_seq)) => {
-                    let next_retry_at = self.compute_next_retry_at(
-                        retry.pgslot,
-                        retry.slot_cycle_index,
-                        target_chip,
-                    );
-                    self.paging
-                        .record_voice_retry_scheduled(target_chip, next_retry_at);
-                }
-                Err(e) => warn!("BSC: failed to send voice page retry: {}", e),
-            }
             return;
         }
 
@@ -916,43 +889,6 @@ impl Bsc {
             self.mobiles
                 .set_state(&pending.fwd_address, MsState::Registered);
             self.publish_mobiles();
-            return;
-        }
-
-        // Re-send the GPM
-        let Some(retry) = self.paging.prepare_sms_retry() else {
-            return;
-        };
-
-        // Check the MS still exists
-        if self.mobiles.get(&retry.fwd_address).is_none() {
-            warn!("BSC: paged MS no longer registered — cancelling page retry");
-            self.paging.cancel_sms_page();
-            return;
-        }
-
-        // Set MS state back to Paged (in case it re-registered in the meantime)
-        self.mobiles.set_state(&retry.fwd_address, MsState::Paged);
-
-        info!(
-            "BSC: page retry #{} for {}",
-            retry.retry_count,
-            format_ms_address(&retry.fwd_address)
-        );
-        match self.send_page_for_sms(
-            &retry.page_address,
-            retry.pgslot,
-            retry.slot_cycle_index,
-            retry.last_target_chip,
-            retry.page_msg_seq,
-        ) {
-            Ok((target_chip, _page_seq)) => {
-                let next_retry_at =
-                    self.compute_next_retry_at(retry.pgslot, retry.slot_cycle_index, target_chip);
-                self.paging
-                    .record_sms_retry_scheduled(target_chip, next_retry_at);
-            }
-            Err(e) => warn!("BSC: failed to send page retry: {}", e),
         }
     }
 

@@ -14,6 +14,8 @@ use crate::mac::types::ChannelType;
 
 use super::settings::{OverheadParameters, PagingChannelSettings, build_scheduled_message};
 
+const PENDING_PAGE_RECORD_ASSIGNED_SLOT_ATTEMPTS: u16 = 4;
+
 /// Event emitted when the BTS paging supplier transmits a directed SDU
 /// or GPM on F-PCH. Carries the real on-air MSG_SEQ assigned by the BTS.
 #[derive(Clone, Debug)]
@@ -34,6 +36,17 @@ pub struct PchTransmitEvent {
 pub struct PendingPageRecord {
     pub record: GeneralPageRecord,
     pub page_address: MsPageAddress,
+    pub remaining_assigned_slot_attempts: u16,
+}
+
+impl PendingPageRecord {
+    pub fn new(record: GeneralPageRecord, page_address: MsPageAddress) -> Self {
+        Self {
+            record,
+            page_address,
+            remaining_assigned_slot_attempts: PENDING_PAGE_RECORD_ASSIGNED_SLOT_ATTEMPTS,
+        }
+    }
 }
 
 /// Configuration for BTS-side paging channel retransmission.
@@ -422,6 +435,25 @@ fn pgslot_from_address(addr: &MsAddress) -> Option<u16> {
     }
 }
 
+fn pending_page_record_active_in_slot(
+    pending: &PendingPageRecord,
+    chip_cursor: u64,
+    max_sci: u8,
+    chip_rate_hz: u64,
+) -> bool {
+    match &pending.page_address {
+        MsPageAddress::ImsiS {
+            imsi_m_s1,
+            imsi_m_s2,
+            ..
+        } => {
+            let pgslot = cdma_common::paging::compute_pgslot(*imsi_m_s1, *imsi_m_s2);
+            cdma_common::paging::is_assigned_slot(chip_cursor, pgslot, max_sci, chip_rate_hz)
+        }
+        MsPageAddress::Esn(_) => true,
+    }
+}
+
 /// Convert an Abis MobileIdentity to an air-interface MsAddress.
 ///
 /// For ESN: direct mapping. For IMSI: derive IMSI_M_S1/S2 from the IMSI
@@ -499,24 +531,13 @@ pub fn build_bts_paging_supplier(
             {
                 let mut guard = state.lock();
                 let max_sci = overhead.max_slot_cycle_index;
-                guard.pending_page_records.retain(|pending| {
-                    let pgslot = match &pending.page_address {
-                        MsPageAddress::ImsiS {
-                            imsi_m_s1,
-                            imsi_m_s2,
-                            ..
-                        } => Some(cdma_common::paging::compute_pgslot(*imsi_m_s1, *imsi_m_s2)),
-                        MsPageAddress::Esn(_) => None,
-                    };
-                    let include = match pgslot {
-                        Some(pg) => cdma_common::paging::is_assigned_slot(
-                            chip_cursor,
-                            pg,
-                            max_sci,
-                            chip_rate_hz,
-                        ),
-                        None => true,
-                    };
+                guard.pending_page_records.retain_mut(|pending| {
+                    let include = pending_page_record_active_in_slot(
+                        pending,
+                        chip_cursor,
+                        max_sci,
+                        chip_rate_hz,
+                    );
                     if include {
                         if !records_for_slot
                             .iter()
@@ -524,7 +545,9 @@ pub fn build_bts_paging_supplier(
                         {
                             records_for_slot.push(pending.record.clone());
                         }
-                        false
+                        pending.remaining_assigned_slot_attempts =
+                            pending.remaining_assigned_slot_attempts.saturating_sub(1);
+                        pending.remaining_assigned_slot_attempts > 0
                     } else {
                         true
                     }
@@ -533,18 +556,46 @@ pub fn build_bts_paging_supplier(
 
             let (has_remaining_class0, has_remaining_class1, has_remaining_tmsi) = {
                 let guard = state.lock();
+                let max_sci = overhead.max_slot_cycle_index;
                 (
                     guard
                         .pending_page_records
                         .iter()
+                        .filter(|pending| {
+                            pending_page_record_active_in_slot(
+                                pending,
+                                chip_cursor,
+                                max_sci,
+                                chip_rate_hz,
+                            )
+                        })
+                        .filter(|pending| !records_for_slot.contains(&pending.record))
                         .any(|p| matches!(p.record, GeneralPageRecord::Class0 { .. })),
                     guard
                         .pending_page_records
                         .iter()
+                        .filter(|pending| {
+                            pending_page_record_active_in_slot(
+                                pending,
+                                chip_cursor,
+                                max_sci,
+                                chip_rate_hz,
+                            )
+                        })
+                        .filter(|pending| !records_for_slot.contains(&pending.record))
                         .any(|p| matches!(p.record, GeneralPageRecord::Class1 { .. })),
                     guard
                         .pending_page_records
                         .iter()
+                        .filter(|pending| {
+                            pending_page_record_active_in_slot(
+                                pending,
+                                chip_cursor,
+                                max_sci,
+                                chip_rate_hz,
+                            )
+                        })
+                        .filter(|pending| !records_for_slot.contains(&pending.record))
                         .any(|p| matches!(p.record, GeneralPageRecord::Tmsi { .. })),
                 )
             };

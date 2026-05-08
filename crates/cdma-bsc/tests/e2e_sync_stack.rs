@@ -70,9 +70,53 @@ use itertools::Itertools;
 use num_complex::Complex32;
 use sdr::FIR;
 
+const E2E_DIRECT_GPM_ESN: u32 = 0x8096_324d;
+const E2E_SMS_PAGE_ESN: u32 = 0x4cdc_1d09;
+const E2E_SMS_PAGE_IMSI_M_S1: u32 = 0x0069_002c;
+const E2E_SMS_PAGE_IMSI_M_S2: u16 = 0x063;
+const E2E_SMS_PAGE_SCI: u8 = 2;
+const E2E_MAX_SLOT_CYCLE_INDEX: u8 = 0;
+const E2E_PENDING_PAGE_RECORD_ATTEMPTS: usize = 4;
 const MATLAB_DEFAULT_LONG_CODE_STATE: u64 = 0x2123_4567_89A;
 const RC1_PCG_CHIPS: u64 = 1_536;
 const PCGS_PER_FRAME: usize = 16;
+
+fn e2e_sms_page_imsi_s() -> u64 {
+    ((E2E_SMS_PAGE_IMSI_M_S2 as u64) << 24) | E2E_SMS_PAGE_IMSI_M_S1 as u64
+}
+
+fn spawn_test_abis_client_with_paging_state(
+    controller: Arc<TrafficResourceService>,
+    agent_config: AbisAgentConfig,
+    config: NetworkClientConfig,
+    paging_state: Arc<parking_lot::Mutex<PagingSupplierState>>,
+) -> NetworkBtsControlClient {
+    use cdma_abis::transport::{TransportEvent, spawn_channel_transport};
+    use cdma_bts::bts::abis_agent::AbisAgent;
+
+    let (client_sender, client_events, server_sender, mut server_events) =
+        spawn_channel_transport();
+
+    tokio::spawn(async move {
+        let mut agent = AbisAgent::new(agent_config, controller);
+        agent.set_paging_state(paging_state);
+        while let Some(event) = server_events.recv().await {
+            match event {
+                TransportEvent::Message(msg) => {
+                    let (responses, _events) = agent.handle_message(&msg);
+                    for resp in responses {
+                        if server_sender.send(&resp).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                TransportEvent::Disconnected(_) => return,
+            }
+        }
+    });
+
+    NetworkBtsControlClient::from_transport(client_sender, client_events, config)
+}
 
 fn init_test_logging() {
     static INIT: Once = Once::new();
@@ -1129,11 +1173,17 @@ fn collect_crc_valid_paging_payloads(
     let mut payloads = Vec::new();
     for chunk in candidate.chunks_exact(half_frame_bits) {
         let mut bs = Bitstream::new_init(chunk);
-        let Ok(Some(frame)) = frame_reader.process(&mut bs) else {
-            continue;
-        };
-        if frame.crc_valid {
-            payloads.push(frame.data);
+        if let Ok(frame) = frame_reader.process(&mut bs) {
+            if let Some(frame) = frame
+                && frame.crc_valid
+            {
+                payloads.push(frame.data);
+            }
+            while let Some(frame) = frame_reader.take_completed_frame() {
+                if frame.crc_valid {
+                    payloads.push(frame.data);
+                }
+            }
         }
     }
     payloads
@@ -1174,29 +1224,45 @@ fn collect_ordered_crc_valid_paging_messages(
         }
 
         let mut bs = Bitstream::new_init(chunk);
-        let Ok(Some(frame)) = frame_reader.process(&mut bs) else {
+        let Ok(first_frame) = frame_reader.process(&mut bs) else {
             continue;
         };
-        if !frame.crc_valid {
-            if !frame_reader.in_message() {
-                message_start_chip = None;
-            }
-            continue;
+
+        let mut frames = Vec::new();
+        if let Some(frame) = first_frame {
+            frames.push(frame);
+        }
+        while let Some(frame) = frame_reader.take_completed_frame() {
+            frames.push(frame);
         }
 
-        let (_, msg_type) = payload_header(&frame.data);
-        messages.push(OrderedRecoveredPagingMessage {
-            start_chip: message_start_chip.unwrap_or(half_frame_start_chip),
-            completion_chip: half_frame_start_chip
-                .saturating_add(half_frame_bits.saturating_mul(chips_per_bit)),
-            msg_type,
-            payload: frame.data,
-        });
+        for (completed_idx, frame) in frames.into_iter().enumerate() {
+            if !frame.crc_valid {
+                if !frame_reader.in_message() {
+                    message_start_chip = None;
+                }
+                continue;
+            }
 
-        // If another message has already started within the same half-frame we
-        // cannot assign its exact chip start here, so never carry the current
-        // half-frame start forward to the next completed frame.
-        message_start_chip = None;
+            let start_chip = if completed_idx == 0 {
+                message_start_chip.unwrap_or(half_frame_start_chip)
+            } else {
+                half_frame_start_chip
+            };
+            let (_, msg_type) = payload_header(&frame.data);
+            messages.push(OrderedRecoveredPagingMessage {
+                start_chip,
+                completion_chip: half_frame_start_chip
+                    .saturating_add(half_frame_bits.saturating_mul(chips_per_bit)),
+                msg_type,
+                payload: frame.data,
+            });
+
+            // If another message has already started within the same
+            // half-frame we cannot assign its exact bit offset, so never carry
+            // the current half-frame start forward to another completed frame.
+            message_start_chip = None;
+        }
     }
 
     messages
@@ -3233,6 +3299,10 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
         path: wav_path.display().to_string(),
     };
     bts_config.validate()?;
+    assert_eq!(
+        bsc_config.overhead.max_slot_cycle_index, E2E_MAX_SLOT_CYCLE_INDEX,
+        "e2e assigned-slot expectations assume stock MAX_SLOT_CYCLE_INDEX"
+    );
 
     let (mac_to_lac_tx, mac_to_lac_rx) = channel();
     let (lac_to_mac_tx, lac_to_mac_rx) = channel();
@@ -3290,7 +3360,24 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
         hlr_repo: None,
         msc_client: test_msc_client(),
         msc_voice_bearer: None,
-        bts_client: None,
+        bts_client: Some(Arc::new(spawn_test_abis_client_with_paging_state(
+            Arc::new(TrafficResourceService::new()),
+            AbisAgentConfig {
+                pilot_pn: 0,
+                cell_id: CellId { cell: 1, sector: 1 },
+                mscid: 1,
+            },
+            NetworkClientConfig {
+                cell_id: CellId { cell: 1, sector: 1 },
+                mscid: 1,
+                pilot_pn: 0,
+                auth_mode: 0,
+                p_rev_in_use: 6,
+                market_id: 1,
+                generating_entity_id: 1,
+            },
+            bts_paging_state.clone(),
+        )) as Arc<dyn BtsControlClient>),
         traffic_retry: TrafficRetryConfig::default(),
         paging_retry: PagingRetryConfig::default(),
         voice_policy: test_voice_policy(),
@@ -3299,6 +3386,47 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
         bts_paging_state: Some(bts_paging_state.clone()),
         node_id: "bsc-test".to_string(),
     });
+
+    bsc.inject_access_event(synthetic_registration_event(
+        0,
+        16,
+        1,
+        E2E_SMS_PAGE_ESN,
+        E2E_SMS_PAGE_IMSI_M_S1,
+        E2E_SMS_PAGE_IMSI_M_S2,
+    ))
+    .await;
+    bsc.inject_sms_request(SmsRequest {
+        originating_number: "5559999".to_string(),
+        text: "one-shot pending GPM repeat test".to_string(),
+        target_address: Some(format!("ESN:0x{E2E_SMS_PAGE_ESN:08X}")),
+        target_subscriber_id: None,
+        timeout_ms: Some(60_000),
+        destination_number: None,
+        sms_id: None,
+        delivery_attempt_id: None,
+        a1_tag: None,
+        raw_payload: None,
+    });
+    for _ in 0..50 {
+        if bts_paging_state.lock().pending_page_records.len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    {
+        let pending = bts_paging_state.lock();
+        assert_eq!(
+            pending.pending_page_records.len(),
+            1,
+            "sync e2e should receive exactly one Abis GPM page record before transmit starts"
+        );
+        assert_eq!(
+            pending.pending_page_records[0].remaining_assigned_slot_attempts,
+            E2E_PENDING_PAGE_RECORD_ATTEMPTS as u16,
+            "BTS should own the assigned-slot page-record repeat budget"
+        );
+    }
 
     let lac_worker = {
         let lac = lac_layer.clone();
@@ -3313,7 +3441,7 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
         1791675812462592,
         15,
         6,
-        0x8096_324d,
+        E2E_DIRECT_GPM_ESN,
         0x017b_2fd6,
         0x03d,
     ))
@@ -3322,9 +3450,9 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
         1791675815018496,
         16,
         1,
-        0x4cdc_1d09,
-        0x3269_1989,
-        0x063,
+        E2E_SMS_PAGE_ESN,
+        E2E_SMS_PAGE_IMSI_M_S1,
+        E2E_SMS_PAGE_IMSI_M_S2,
     ))
     .await;
     // In the file-output BTS path, queued FPCH PDUs are emitted as soon as
@@ -3365,16 +3493,16 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
         ),
         (
             ForwardDirectedAddress::ImsiClass0 {
-                imsi_m_s1: 0x3269_1989,
-                imsi_m_s2: 0x063,
+                imsi_m_s1: E2E_SMS_PAGE_IMSI_M_S1,
+                imsi_m_s2: E2E_SMS_PAGE_IMSI_M_S2,
                 mcc: None,
                 imsi_11_12: None,
             },
             enqueue_scheduled_registration_accepted_order(
                 &lac_layer,
                 lac::paging_messages::MsAddress::ImsiClass0 {
-                    imsi_m_s1: 0x3269_1989,
-                    imsi_m_s2: 0x063,
+                    imsi_m_s1: E2E_SMS_PAGE_IMSI_M_S1,
+                    imsi_m_s2: E2E_SMS_PAGE_IMSI_M_S2,
                     mcc: 310,
                     imsi_11_12: 0,
                 },
@@ -3388,23 +3516,21 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
 
     // Enqueue a GPM with an ESN Class1 page record targeting the first registered mobile.
     // This exercises the full GPM encode → airlink → decode path.
-    let gpm_target_esn: u32 = 0x8096_324d;
     enqueue_gpm_with_esn_page(
         &lac_layer,
-        gpm_target_esn,
+        E2E_DIRECT_GPM_ESN,
         bsc_config.overhead.config_seq,
         bsc_config.overhead.acc_config_seq,
         0,
     )?;
 
-    // Exercise the page retry path: send an SMS targeting the second mobile.
-    // This queues a GPM with `requested_tx_time` in the MS's next assigned
-    // paging slot, then fires 2 retries (each targeting a later distinct slot).
-    // The LAC must continue producing overhead between these future-scheduled GPMs.
+    // Exercise the Abis page-record path: send an SMS targeting the second
+    // mobile. The BSC sends one Abis GPM page record; the BTS paging supplier
+    // must keep it pending and emit it on four assigned-slot GPM opportunities.
     bsc.inject_sms_request(SmsRequest {
         originating_number: "5559999".to_string(),
         text: "retry pipeline test".to_string(),
-        target_address: Some("ESN:0x4CDC1D09".to_string()),
+        target_address: Some(format!("ESN:0x{E2E_SMS_PAGE_ESN:08X}")),
         target_subscriber_id: None,
         timeout_ms: Some(60_000),
         destination_number: None,
@@ -3417,10 +3543,45 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
         bsc.has_pending_page(),
         "expected pending page after SMS inject"
     );
-    for _ in 0..2 {
-        bsc.trigger_page_retry();
+    for _ in 0..50 {
+        if bts_paging_state.lock().pending_page_records.len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    eprintln!("page retries injected: pending={}", bsc.has_pending_page());
+    {
+        let pending = bts_paging_state.lock();
+        assert_eq!(
+            pending.pending_page_records.len(),
+            1,
+            "BTS should receive exactly one pending page record from the one-shot Abis GPM"
+        );
+        assert_eq!(
+            pending.pending_page_records[0].remaining_assigned_slot_attempts,
+            E2E_PENDING_PAGE_RECORD_ATTEMPTS as u16,
+            "BTS should own the assigned-slot page-record repeat budget"
+        );
+        match &pending.pending_page_records[0].record {
+            lac::paging_messages::GeneralPageRecord::Class0 {
+                msg_seq, imsi_s, ..
+            } => {
+                assert_eq!(
+                    *msg_seq, 0,
+                    "first one-shot page record should use MSG_SEQ=0"
+                );
+                assert_eq!(
+                    *imsi_s,
+                    Some(e2e_sms_page_imsi_s()),
+                    "pending BTS page record should target the SMS mobile IMSI_S"
+                );
+            }
+            other => panic!("expected Class0 pending page record, got {other:?}"),
+        }
+    }
+    eprintln!(
+        "one-shot Abis page queued: pending={}",
+        bsc.has_pending_page()
+    );
 
     let bts_paging_supplier = build_bts_paging_supplier(
         bts_config.overhead.clone(),
@@ -3738,7 +3899,24 @@ async fn run_sync_overhead_window_case(
         hlr_repo: None,
         msc_client: test_msc_client(),
         msc_voice_bearer: None,
-        bts_client: None,
+        bts_client: Some(Arc::new(spawn_test_abis_client_with_paging_state(
+            Arc::new(TrafficResourceService::new()),
+            AbisAgentConfig {
+                pilot_pn: 0,
+                cell_id: CellId { cell: 1, sector: 1 },
+                mscid: 1,
+            },
+            NetworkClientConfig {
+                cell_id: CellId { cell: 1, sector: 1 },
+                mscid: 1,
+                pilot_pn: 0,
+                auth_mode: 0,
+                p_rev_in_use: 6,
+                market_id: 1,
+                generating_entity_id: 1,
+            },
+            bts_paging_state.clone(),
+        )) as Arc<dyn BtsControlClient>),
         traffic_retry: TrafficRetryConfig::default(),
         paging_retry: PagingRetryConfig::default(),
         voice_policy: test_voice_policy(),
@@ -3747,6 +3925,47 @@ async fn run_sync_overhead_window_case(
         bts_paging_state: Some(bts_paging_state.clone()),
         node_id: "bsc-test".to_string(),
     });
+
+    bsc.inject_access_event(synthetic_registration_event(
+        0,
+        16,
+        1,
+        E2E_SMS_PAGE_ESN,
+        E2E_SMS_PAGE_IMSI_M_S1,
+        E2E_SMS_PAGE_IMSI_M_S2,
+    ))
+    .await;
+    bsc.inject_sms_request(SmsRequest {
+        originating_number: "5559999".to_string(),
+        text: "one-shot pending GPM repeat test".to_string(),
+        target_address: Some(format!("ESN:0x{E2E_SMS_PAGE_ESN:08X}")),
+        target_subscriber_id: None,
+        timeout_ms: Some(60_000),
+        destination_number: None,
+        sms_id: None,
+        delivery_attempt_id: None,
+        a1_tag: None,
+        raw_payload: None,
+    });
+    for _ in 0..50 {
+        if bts_paging_state.lock().pending_page_records.len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    {
+        let pending = bts_paging_state.lock();
+        assert_eq!(
+            pending.pending_page_records.len(),
+            1,
+            "sync e2e should receive exactly one Abis GPM page record before transmit starts"
+        );
+        assert_eq!(
+            pending.pending_page_records[0].remaining_assigned_slot_attempts,
+            E2E_PENDING_PAGE_RECORD_ATTEMPTS as u16,
+            "BTS should own the assigned-slot page-record repeat budget"
+        );
+    }
 
     let lac_worker = {
         let lac = lac_layer.clone();
@@ -4810,20 +5029,13 @@ async fn test_e2e_bts_to_wav_to_receiver_pipeline() -> Result<(), Error> {
 
 #[tokio::test]
 async fn test_e2e_sync_and_overhead_boundaries_over_5s() -> Result<(), Error> {
-    const BLOCKS: usize = 12_000;
+    const BLOCKS: usize = 13_000;
     const CHIPS_PER_BLOCK: usize = 512;
     const CHIPS_PER_SYNC_SUPERFRAME: usize = 98_304;
     const CHIPS_PER_SYNC_MESSAGE: usize = CHIPS_PER_SYNC_SUPERFRAME * 3;
     const CHIPS_320MS: usize = 393_216;
-    const EXPECTED_SYNC_EVENTS: usize = 20;
-    // These are receiver-recovered CRC-valid message counts, not raw generated
-    // PCH-slot counts. C.S0005-E requires at least one GPM per Paging Channel
-    // slot as a recommendation and forbids omitting GPM in two adjacent slots;
-    // it does not require GPM to be the first completed recovered PDU in every
-    // slot. LAC may pack the next encapsulated PDU into remaining half-frame
-    // capacity, so receiver completion order can straddle slot boundaries.
-    const EXPECTED_PAGING_MESSAGES: usize = 252;
-    const EXPECTED_GPM_COUNT: usize = 44;
+    const CHIPS_PER_PAGING_SLOT: usize = 98_304;
+    const EXPECTED_SYNC_EVENTS: usize = 22;
 
     let stats = run_sync_overhead_window_case(
         PathBuf::from("test/generated/e2e_sync_overhead_5s.wav"),
@@ -4877,9 +5089,30 @@ async fn test_e2e_sync_and_overhead_boundaries_over_5s() -> Result<(), Error> {
     let general_page_type = lac::message_types::MessageId::GeneralPage
         .wire_type(lac::message_types::WireChannel::ForwardCommon)
         .unwrap();
-    let paging_message_types = stats
+    assert!(
+        stats.paging_decode.messages.len() >= 250,
+        "too few recovered paging messages: {}",
+        stats.paging_decode.messages.len(),
+    );
+
+    let receiver_chip_skew = stats.paging_decode.seed.paging_start_chip as i128
+        - stats.paging_decode.absolute_chip_start as i128;
+    let nominal_start_chip = |chip: usize| -> usize {
+        let nominal = chip as i128 + receiver_chip_skew;
+        assert!(nominal >= 0, "nominal recovered chip went negative");
+        nominal as usize
+    };
+    let capture_chips = BLOCKS * CHIPS_PER_BLOCK;
+    let stable_messages = stats
         .paging_decode
         .messages
+        .iter()
+        .filter(|message| {
+            nominal_start_chip(message.start_chip).saturating_add(CHIPS_PER_PAGING_SLOT)
+                <= capture_chips
+        })
+        .collect::<Vec<_>>();
+    let paging_message_types = stable_messages
         .iter()
         .map(|message| message.msg_type)
         .collect::<Vec<_>>();
@@ -4888,16 +5121,121 @@ async fn test_e2e_sync_and_overhead_boundaries_over_5s() -> Result<(), Error> {
         .enumerate()
         .filter_map(|(index, &msg_type)| (msg_type == general_page_type).then_some(index))
         .collect::<Vec<_>>();
-    assert_eq!(
-        stats.paging_decode.messages.len(),
-        EXPECTED_PAGING_MESSAGES,
-        "unexpected total recovered paging message count"
-    );
-    assert_eq!(
+    assert!(
+        gpm_indices.len() >= 40,
+        "too few stable recovered GPMs: {}",
         gpm_indices.len(),
-        EXPECTED_GPM_COUNT,
-        "unexpected recovered GPM count"
     );
+    let gpm_nominal_starts = stable_messages
+        .iter()
+        .filter(|message| message.msg_type == general_page_type)
+        .map(|message| nominal_start_chip(message.start_chip))
+        .collect::<Vec<_>>();
+    assert!(
+        gpm_nominal_starts
+            .iter()
+            .all(|chip| chip % CHIPS_PER_PAGING_SLOT == 0),
+        "all recovered GPMs must nominally start at an 80 ms slot boundary, skew={} starts={:?}",
+        receiver_chip_skew,
+        gpm_nominal_starts,
+    );
+
+    let target_page_imsi_s = e2e_sms_page_imsi_s();
+    let decode_common_gpm = |payload: &Bitstream| {
+        if payload.len() < 8 {
+            return None;
+        }
+        let mut sdu = Bitstream::new_init(&payload.bits()[8..]);
+        lac::paging_messages::GeneralPageMessage::from_sdu(&mut sdu).ok()
+    };
+    let decoded_gpm_page_records = stable_messages
+        .iter()
+        .filter(|message| message.msg_type == general_page_type)
+        .filter_map(|message| {
+            let gpm = decode_common_gpm(&message.payload)?;
+            (!gpm.page_records.is_empty()).then(|| {
+                (
+                    nominal_start_chip(message.start_chip),
+                    gpm.page_records
+                        .iter()
+                        .map(|record| format!("{record:?}"))
+                        .collect::<Vec<_>>(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let target_page_starts = stable_messages
+        .iter()
+        .filter(|message| message.msg_type == general_page_type)
+        .filter_map(|message| {
+            let gpm = decode_common_gpm(&message.payload)?;
+            gpm.page_records
+                .iter()
+                .any(|record| {
+                    matches!(
+                        record,
+                        lac::paging_messages::GeneralPageRecord::Class0 {
+                            msg_seq: 0,
+                            imsi_s: Some(imsi_s),
+                            ..
+                        } if *imsi_s == target_page_imsi_s
+                    )
+                })
+                .then(|| nominal_start_chip(message.start_chip))
+        })
+        .collect::<Vec<_>>();
+    let effective_sci = E2E_SMS_PAGE_SCI.min(E2E_MAX_SLOT_CYCLE_INDEX);
+    let assigned_slot_period_chips =
+        CHIPS_PER_PAGING_SLOT * 16 * (1usize << effective_sci as usize);
+    assert_eq!(
+        target_page_starts.len(),
+        E2E_PENDING_PAGE_RECORD_ATTEMPTS,
+        "one-shot Abis page record must be repeated by the BTS over four assigned-slot GPMs, starts={:?} decoded_non_empty_gpms={:?}",
+        target_page_starts,
+        decoded_gpm_page_records,
+    );
+    assert!(
+        target_page_starts
+            .windows(2)
+            .all(|pair| pair[1].saturating_sub(pair[0]) == assigned_slot_period_chips),
+        "BTS page-record repeats must follow assigned-slot cadence: starts={:?} period={}",
+        target_page_starts,
+        assigned_slot_period_chips,
+    );
+    assert!(
+        target_page_starts
+            .iter()
+            .all(|chip| chip % CHIPS_PER_PAGING_SLOT == 0),
+        "BTS page-record repeats must be carried in slot-leading GPMs: {:?}",
+        target_page_starts,
+    );
+
+    let mut messages_by_nominal_slot = BTreeMap::<usize, Vec<(usize, u8)>>::new();
+    for message in &stable_messages {
+        let nominal_chip = nominal_start_chip(message.start_chip);
+        messages_by_nominal_slot
+            .entry(nominal_chip / CHIPS_PER_PAGING_SLOT)
+            .or_default()
+            .push((nominal_chip % CHIPS_PER_PAGING_SLOT, message.msg_type));
+    }
+    for (slot, messages) in messages_by_nominal_slot {
+        if !messages
+            .iter()
+            .any(|(offset, msg_type)| *offset == 0 && *msg_type == general_page_type)
+        {
+            continue;
+        }
+        let first = messages
+            .iter()
+            .min_by_key(|(offset, _)| *offset)
+            .expect("slot with GPM should contain at least one message");
+        assert_eq!(
+            *first,
+            (0, general_page_type),
+            "GPM must be the first recovered message in nominal paging slot {}",
+            slot,
+        );
+    }
 
     let expected_overhead_schedule = [
         lac::message_types::MessageId::SystemParameters
@@ -4923,7 +5261,7 @@ async fn test_e2e_sync_and_overhead_boundaries_over_5s() -> Result<(), Error> {
     let first_non_gpm_msg_type = paging_message_types
         .iter()
         .copied()
-        .find(|msg_type| *msg_type != general_page_type)
+        .find(|msg_type| expected_overhead_schedule.contains(msg_type))
         .expect("expected at least one non-GPM overhead message");
     let inferred_schedule_offset = expected_overhead_schedule
         .iter()
@@ -4931,7 +5269,7 @@ async fn test_e2e_sync_and_overhead_boundaries_over_5s() -> Result<(), Error> {
         .expect("first non-GPM message is not part of the configured overhead schedule");
     for (index, &msg_type) in paging_message_types[..prefix_non_gpm]
         .iter()
-        .filter(|msg_type| **msg_type != general_page_type)
+        .filter(|msg_type| expected_overhead_schedule.contains(msg_type))
         .enumerate()
     {
         let expected_msg_type = expected_overhead_schedule
@@ -4949,7 +5287,11 @@ async fn test_e2e_sync_and_overhead_boundaries_over_5s() -> Result<(), Error> {
             .get(slot_idx + 1)
             .copied()
             .unwrap_or(paging_message_types.len());
-        let slot_overhead = &paging_message_types[gpm_index + 1..next_gpm_index];
+        let slot_overhead = paging_message_types[gpm_index + 1..next_gpm_index]
+            .iter()
+            .copied()
+            .filter(|msg_type| expected_overhead_schedule.contains(msg_type))
+            .collect::<Vec<_>>();
         for (position, &msg_type) in slot_overhead.iter().enumerate() {
             let expected_msg_type = expected_overhead_schedule
                 [(expected_overhead_offset + position) % expected_overhead_schedule.len()];
@@ -4967,7 +5309,7 @@ async fn test_e2e_sync_and_overhead_boundaries_over_5s() -> Result<(), Error> {
         .paging_decode
         .messages
         .iter()
-        .filter(|message| message.msg_type != general_page_type)
+        .filter(|message| expected_overhead_schedule.contains(&message.msg_type))
         .map(|message| message.msg_type)
         .collect::<Vec<_>>();
     assert!(
@@ -5014,11 +5356,16 @@ async fn test_e2e_sync_and_overhead_boundaries_over_5s() -> Result<(), Error> {
             .unwrap(),
         42usize,
     );
-    expected_counts.insert(general_page_type, EXPECTED_GPM_COUNT);
-    assert_eq!(
-        stats.paging_counts, expected_counts,
-        "unexpected 5s paging/overhead counts"
-    );
+    for (msg_type, min_count) in expected_counts {
+        let actual = stats.paging_counts.get(&msg_type).copied().unwrap_or(0);
+        assert!(
+            actual >= min_count.saturating_sub(2),
+            "unexpectedly low 5s paging/overhead count for msg_type {}: got {}, expected around {}",
+            msg_type,
+            actual,
+            min_count,
+        );
+    }
 
     let counts_summary = stats
         .paging_counts

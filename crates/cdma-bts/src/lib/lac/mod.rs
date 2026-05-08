@@ -34,6 +34,8 @@ const SYNC_FRAMES_PER_SUPERFRAME: usize = 3;
 const PAGING_CHANNEL_NUMBER_SR1: u8 = 1;
 const FPCH_HALF_FRAME_BITS_9600: usize = 96;
 const FPCH_HALF_FRAME_CHIPS: u64 = SR1_CHIP_RATE_HZ / 100;
+const FPCH_HALF_FRAME_PAYLOAD_BITS_9600: usize = FPCH_HALF_FRAME_BITS_9600 - 1;
+const FPCH_SLOT_CHIPS: u64 = FPCH_HALF_FRAME_CHIPS * 8;
 
 pub struct LinkAccessControl {}
 
@@ -357,6 +359,120 @@ impl Layer2Lac {
             .and_then(|f| f(chip_cursor))
     }
 
+    fn is_empty_general_page_request(request: &DataRequest) -> bool {
+        request.mcsb.channel == ChannelType::FPch
+            && request.mcsb.message_id == MessageId::GeneralPage
+            && request.mcsb.length_bits <= 24
+    }
+
+    fn next_paging_pdu_for_fragment(
+        &self,
+        chip_cursor: u64,
+    ) -> Result<Option<EncapsulatedPdu>, Error> {
+        loop {
+            let Some(data_request) = self.next_paging_data_request(chip_cursor) else {
+                return Ok(None);
+            };
+            if !Self::is_fpch_slot_start(chip_cursor)
+                && Self::is_empty_general_page_request(&data_request)
+            {
+                trace!(
+                    "lac_fpch_skip_empty_gpm_inside_slot: chip={} slot_num={}",
+                    chip_cursor,
+                    cdma_common::paging::slot_num_from_chips(chip_cursor, 1_228_800),
+                );
+                continue;
+            }
+            return Ok(Some(Self::assemble_pdu(data_request)?));
+        }
+    }
+
+    fn is_fpch_slot_start(chip_cursor: u64) -> bool {
+        chip_cursor.is_multiple_of(FPCH_SLOT_CHIPS)
+    }
+
+    fn is_fpch_general_page_pdu(pdu: &EncapsulatedPdu) -> bool {
+        pdu.message.mcsb.channel == ChannelType::FPch
+            && pdu.message.mcsb.message_id == MessageId::GeneralPage
+    }
+
+    fn is_unaddressed_fpch_overhead_pdu(pdu: &EncapsulatedPdu) -> bool {
+        pdu.message.mcsb.channel == ChannelType::FPch
+            && pdu.message.mcsb.address.is_none()
+            && pdu.message.mcsb.message_id != MessageId::GeneralPage
+    }
+
+    fn fpch_payload_bits_until_slot_end(
+        chip_cursor: u64,
+        current_half_frame_payload_bits: usize,
+    ) -> usize {
+        let slot_offset_chips = chip_cursor % FPCH_SLOT_CHIPS;
+        let half_frame_idx = (slot_offset_chips / FPCH_HALF_FRAME_CHIPS).min(7) as usize;
+        let later_half_frames = 7usize.saturating_sub(half_frame_idx);
+        current_half_frame_payload_bits
+            + later_half_frames.saturating_mul(FPCH_HALF_FRAME_PAYLOAD_BITS_9600)
+    }
+
+    fn unstarted_pdu_fits_before_fpch_slot_end(
+        pdu: &EncapsulatedPdu,
+        chip_cursor: u64,
+        current_half_frame_payload_bits: usize,
+    ) -> bool {
+        pdu.e_pdu.len()
+            <= Self::fpch_payload_bits_until_slot_end(chip_cursor, current_half_frame_payload_bits)
+    }
+
+    fn inject_slot_first_gpm(
+        &self,
+        queue: &mut VecDeque<EncapsulatedPdu>,
+        _current_system_time: CdmaSystemTime,
+        chip_cursor: u64,
+    ) -> Result<(), Error> {
+        if !Self::is_fpch_slot_start(chip_cursor) {
+            return Ok(());
+        }
+
+        if let Some(front) = queue.front() {
+            if front.frame_start_sent {
+                warn!(
+                    "lac_fpch_slot_first_gpm_conflict: chip={} slot_num={} front_tag={} front_started=true",
+                    chip_cursor,
+                    cdma_common::paging::slot_num_from_chips(chip_cursor, 1_228_800),
+                    front.message.mcsb.message_id.tag(),
+                );
+                return Ok(());
+            }
+            if Self::is_fpch_general_page_pdu(front) {
+                return Ok(());
+            }
+        }
+
+        let Some(data_request) = self.next_paging_data_request(chip_cursor) else {
+            return Ok(());
+        };
+        let pdu = Self::assemble_pdu(data_request)?;
+        let tag = pdu.message.mcsb.message_id.tag();
+        if Self::is_fpch_general_page_pdu(&pdu) {
+            queue.push_front(pdu);
+        } else {
+            warn!(
+                "lac_fpch_slot_first_gpm_missing: chip={} slot_num={} supplier_tag={}",
+                chip_cursor,
+                cdma_common::paging::slot_num_from_chips(chip_cursor, 1_228_800),
+                tag,
+            );
+            queue.push_front(pdu);
+        }
+        Ok(())
+    }
+
+    fn has_slot_first_gpm_at_front(queue: &VecDeque<EncapsulatedPdu>, chip_cursor: u64) -> bool {
+        Self::is_fpch_slot_start(chip_cursor)
+            && queue
+                .front()
+                .is_some_and(|pdu| !pdu.frame_start_sent && Self::is_fpch_general_page_pdu(pdu))
+    }
+
     fn fpch_queue_candidate_key(
         pdu: &EncapsulatedPdu,
         current_system_time: CdmaSystemTime,
@@ -415,15 +531,21 @@ impl Layer2Lac {
         let mut remaining_payload_bits = max_size - 1;
         let mut first_mcsb = None;
 
+        self.inject_slot_first_gpm(queue, current_system_time, chip_cursor)?;
+
         loop {
             self.apply_pending_future_general_page_cancellation(queue);
-            Self::reprioritize_fpch_queue(queue, current_system_time);
+            if !Self::has_slot_first_gpm_at_front(queue, chip_cursor) {
+                Self::reprioritize_fpch_queue(queue, current_system_time);
+            }
             if queue.is_empty() {
-                let Some(data_request) = self.next_paging_data_request(chip_cursor) else {
+                let Some(pdu) = self.next_paging_pdu_for_fragment(chip_cursor)? else {
                     break;
                 };
-                queue.push_back(Self::assemble_pdu(data_request)?);
-                Self::reprioritize_fpch_queue(queue, current_system_time);
+                queue.push_back(pdu);
+                if !Self::has_slot_first_gpm_at_front(queue, chip_cursor) {
+                    Self::reprioritize_fpch_queue(queue, current_system_time);
+                }
             }
 
             let front = queue.front_mut().unwrap();
@@ -435,8 +557,8 @@ impl Layer2Lac {
             if !front.frame_start_sent {
                 if let Some(tx_time) = front.message.mcsb.requested_tx_time {
                     if tx_time > current_system_time {
-                        if let Some(data_request) = self.next_paging_data_request(chip_cursor) {
-                            queue.push_back(Self::assemble_pdu(data_request)?);
+                        if let Some(pdu) = self.next_paging_pdu_for_fragment(chip_cursor)? {
+                            queue.push_back(pdu);
                             Self::reprioritize_fpch_queue(queue, current_system_time);
                             continue;
                         }
@@ -446,6 +568,24 @@ impl Layer2Lac {
             }
 
             let frame_bits_before_pdu = fragment.len();
+            if !front.frame_start_sent
+                && Self::is_unaddressed_fpch_overhead_pdu(front)
+                && !Self::unstarted_pdu_fits_before_fpch_slot_end(
+                    front,
+                    chip_cursor,
+                    remaining_payload_bits,
+                )
+            {
+                debug!(
+                    "lac_fpch_defer_overhead_for_slot_gpm: chip={} slot_num={} tag={} epdu_bits={} payload_until_slot_end={}",
+                    chip_cursor,
+                    cdma_common::paging::slot_num_from_chips(chip_cursor, 1_228_800),
+                    front.message.mcsb.message_id.tag(),
+                    front.e_pdu.len(),
+                    Self::fpch_payload_bits_until_slot_end(chip_cursor, remaining_payload_bits),
+                );
+                break;
+            }
             if fragment.len() == 0 {
                 fragment.write_u8(if front.frame_start_sent { 0 } else { 1 }, 1);
                 first_mcsb = Some(front.message.mcsb.clone());
@@ -1791,22 +1931,32 @@ fn pad_8k2(bits: &mut Bitstream) {
 mod tests {
     use std::{
         collections::VecDeque,
-        sync::mpsc,
+        sync::{Arc, mpsc},
         time::{Duration, Instant},
     };
 
     use cdma_common::bits::Bitstream;
     use chrono::Utc;
+    use parking_lot::Mutex;
 
     use crate::{
+        bts::{
+            paging_supplier::{PagingSupplierState, PendingPageRecord, build_bts_paging_supplier},
+            settings::{OverheadParameters, PagingChannelSettings},
+        },
         lac::{
-            DataRequest, MessageControlStatusBlock, MsAddress, message_types::MessageId, pad_8k2,
+            DataRequest, MessageControlStatusBlock, MsAddress,
+            message_types::{MessageId, WireChannel},
+            pad_8k2,
+            paging_messages::{GeneralPageMessage, GeneralPageRecord, MsPageAddress},
         },
         mac::types::ChannelType,
+        receiver::paging::{PagingChannelRate, PagingFrameReader},
     };
 
     use super::{
-        DirectedSduRequest, Layer2Lac, MsgSeqTracker, T4M_DURATION, crc16_fdsch, crc30,
+        DirectedSduRequest, FPCH_HALF_FRAME_CHIPS, FPCH_HALF_FRAME_PAYLOAD_BITS_9600,
+        FPCH_SLOT_CHIPS, Layer2Lac, MsgSeqTracker, T4M_DURATION, crc16_fdsch, crc30,
         sar_encapsulate_ftch_pdu_dsch, sar_encapsulate_pdu, sar_fragment_ftch_pdu_dsch,
         utility_assemble_f_csch, utility_assemble_f_dsch,
     };
@@ -2292,6 +2442,354 @@ mod tests {
     }
 
     #[test]
+    fn paging_slot_boundary_inserts_gpm_before_queued_overhead() {
+        let (lac_to_mac_tx, _lac_to_mac_rx) = mpsc::channel();
+        let (_mac_to_lac_tx, mac_to_lac_rx) = mpsc::channel();
+        let lac = Layer2Lac::new(lac_to_mac_tx, mac_to_lac_rx);
+
+        let gpm_request = make_paging_request(&[1, 0], MessageId::GeneralPage);
+        let overhead_request =
+            make_paging_request(&vec![0; 90], MessageId::GlobalServiceRedirection);
+        let mut scheduled = VecDeque::from([gpm_request.clone()]);
+        lac.set_paging_supplier(Box::new(move |_chip| scheduled.pop_front()));
+
+        let mut queue = VecDeque::from([Layer2Lac::assemble_pdu(overhead_request).unwrap()]);
+        let request = lac
+            .build_paging_fragment_request(&mut queue, 96, Utc::now(), 0)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(request.channel_type, ChannelType::FPch);
+        assert_eq!(request.mcsb.message_id, MessageId::GeneralPage);
+        assert_eq!(request.data.bits()[0], 1, "slot-leading GPM must be SCI=1");
+        assert!(
+            queue
+                .iter()
+                .any(|pdu| pdu.message.mcsb.message_id == MessageId::GlobalServiceRedirection),
+            "queued overhead should be preserved after slot-leading GPM",
+        );
+    }
+
+    #[test]
+    fn paging_overhead_that_would_cross_slot_boundary_is_deferred() {
+        let (lac_to_mac_tx, _lac_to_mac_rx) = mpsc::channel();
+        let (_mac_to_lac_tx, mac_to_lac_rx) = mpsc::channel();
+        let lac = Layer2Lac::new(lac_to_mac_tx, mac_to_lac_rx);
+
+        let overhead_request =
+            make_paging_request(&vec![1; 90], MessageId::GlobalServiceRedirection);
+        let mut queue = VecDeque::from([Layer2Lac::assemble_pdu(overhead_request).unwrap()]);
+        assert!(
+            queue.front().unwrap().e_pdu.len() > FPCH_HALF_FRAME_PAYLOAD_BITS_9600,
+            "test overhead must not fit in one remaining half-frame",
+        );
+
+        let last_half_frame_in_slot = FPCH_SLOT_CHIPS - FPCH_HALF_FRAME_CHIPS;
+        let request = lac
+            .build_paging_fragment_request(&mut queue, 96, Utc::now(), last_half_frame_in_slot)
+            .unwrap();
+
+        assert!(
+            request.is_none(),
+            "overhead should not start when it would continue into the next slot",
+        );
+        assert_eq!(queue.len(), 1);
+        assert!(
+            !queue.front().unwrap().frame_start_sent,
+            "deferred overhead must remain unstarted",
+        );
+    }
+
+    #[test]
+    fn deferred_overhead_resumes_after_next_slot_gpm() {
+        let (lac_to_mac_tx, _lac_to_mac_rx) = mpsc::channel();
+        let (_mac_to_lac_tx, mac_to_lac_rx) = mpsc::channel();
+        let lac = Layer2Lac::new(lac_to_mac_tx, mac_to_lac_rx);
+
+        let gpm_request = make_paging_request(&[1, 0], MessageId::GeneralPage);
+        let overhead_request =
+            make_paging_request(&vec![1; 90], MessageId::GlobalServiceRedirection);
+        let mut queue = VecDeque::from([Layer2Lac::assemble_pdu(overhead_request).unwrap()]);
+
+        let last_half_frame_in_slot = FPCH_SLOT_CHIPS - FPCH_HALF_FRAME_CHIPS;
+        let deferred = lac
+            .build_paging_fragment_request(&mut queue, 96, Utc::now(), last_half_frame_in_slot)
+            .unwrap();
+        assert!(deferred.is_none());
+
+        let mut scheduled = VecDeque::from([gpm_request]);
+        lac.set_paging_supplier(Box::new(move |_chip| scheduled.pop_front()));
+
+        let request = lac
+            .build_paging_frame_request(&mut queue, 192, Utc::now(), FPCH_SLOT_CHIPS)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            request.mcsb.message_id,
+            MessageId::GeneralPage,
+            "next slot must start with GPM before deferred overhead resumes",
+        );
+        assert!(queue.iter().any(|pdu| {
+            pdu.message.mcsb.message_id == MessageId::GlobalServiceRedirection
+                && pdu.frame_start_sent
+        }));
+    }
+
+    #[test]
+    fn overhead_is_not_started_if_it_would_overflow_next_slot() {
+        let (lac_to_mac_tx, _lac_to_mac_rx) = mpsc::channel();
+        let (_mac_to_lac_tx, mac_to_lac_rx) = mpsc::channel();
+        let lac = Layer2Lac::new(lac_to_mac_tx, mac_to_lac_rx);
+
+        let first_request = make_paging_request(&[1, 0], MessageId::GlobalServiceRedirection);
+        let first_encapsulated = Layer2Lac::assemble_pdu(first_request.clone()).unwrap();
+        let remaining_after_first =
+            FPCH_HALF_FRAME_PAYLOAD_BITS_9600 - first_encapsulated.e_pdu.len();
+        let overflow_bits = remaining_after_first + FPCH_HALF_FRAME_PAYLOAD_BITS_9600 + 1;
+        let overflow_request =
+            make_paging_request(&vec![1; overflow_bits], MessageId::GlobalServiceRedirection);
+        let overflow_encapsulated = Layer2Lac::assemble_pdu(overflow_request.clone()).unwrap();
+        assert!(
+            overflow_encapsulated.e_pdu.len()
+                > remaining_after_first + FPCH_HALF_FRAME_PAYLOAD_BITS_9600,
+            "test overhead must overflow the next slot after prior packed overhead",
+        );
+
+        let mut scheduled = VecDeque::from([first_request, overflow_request]);
+        lac.set_paging_supplier(Box::new(move |_chip| scheduled.pop_front()));
+
+        let chip_one_half_before_slot = FPCH_SLOT_CHIPS - FPCH_HALF_FRAME_CHIPS;
+        let mut queue = VecDeque::new();
+        let request = lac
+            .build_paging_fragment_request(&mut queue, 96, Utc::now(), chip_one_half_before_slot)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(request.mcsb.message_id, MessageId::GlobalServiceRedirection);
+        assert!(
+            queue.front().is_some_and(|pdu| !pdu.frame_start_sent
+                && pdu.message.mcsb.message_id == MessageId::GlobalServiceRedirection),
+            "overflowing overhead must remain queued and unstarted",
+        );
+    }
+
+    #[test]
+    fn stock_paging_supplier_gpm_starts_each_slot() {
+        let (lac_to_mac_tx, _lac_to_mac_rx) = mpsc::channel();
+        let (_mac_to_lac_tx, mac_to_lac_rx) = mpsc::channel();
+        let lac = Layer2Lac::new(lac_to_mac_tx, mac_to_lac_rx);
+
+        let overhead = OverheadParameters::default();
+        let paging = PagingChannelSettings::default();
+        let paging_state = Arc::new(Mutex::new(PagingSupplierState::new(0x03ff, 0x7f)));
+        lac.set_paging_supplier(build_bts_paging_supplier(overhead, paging, 0, paging_state));
+
+        let general_page_type = MessageId::GeneralPage
+            .wire_type(WireChannel::ForwardCommon)
+            .unwrap();
+        let mut queue = VecDeque::new();
+        let mut reader = PagingFrameReader::new_with_rate(PagingChannelRate::Rate9600);
+        let mut message_start_chip = None::<u64>;
+        let mut gpm_starts = Vec::new();
+
+        for frame_idx in 0..220u64 {
+            let chip = frame_idx * FPCH_HALF_FRAME_CHIPS * 2;
+            let Some(request) = lac
+                .build_paging_frame_request(&mut queue, 192, Utc::now(), chip)
+                .unwrap()
+            else {
+                continue;
+            };
+
+            for (half_idx, chunk) in request.data.bits().chunks_exact(96).enumerate() {
+                let half_chip = chip + (half_idx as u64 * FPCH_HALF_FRAME_CHIPS);
+                if chunk.first() == Some(&1) {
+                    message_start_chip = Some(half_chip);
+                }
+                let mut half_frame = Bitstream::new_init(chunk);
+                let mut frames = Vec::new();
+                if let Some(frame) = reader.process(&mut half_frame).unwrap() {
+                    frames.push(frame);
+                }
+                while let Some(frame) = reader.take_completed_frame() {
+                    frames.push(frame);
+                }
+                for (completed_idx, frame) in frames.into_iter().enumerate() {
+                    if !frame.crc_valid {
+                        continue;
+                    }
+                    let mut payload = frame.data.clone();
+                    let msg_type = payload.read_bits(8).unwrap() as u8;
+                    if msg_type == general_page_type {
+                        let start_chip = if completed_idx == 0 {
+                            message_start_chip.unwrap_or(half_chip)
+                        } else {
+                            half_chip
+                        };
+                        gpm_starts.push(start_chip);
+                    }
+                    message_start_chip = None;
+                }
+            }
+        }
+
+        assert!(
+            gpm_starts.len() >= 50,
+            "expected one GPM per 80 ms slot, got starts={:?}",
+            gpm_starts,
+        );
+        assert!(
+            gpm_starts.iter().all(|chip| chip % FPCH_SLOT_CHIPS == 0),
+            "GPM starts must align to 80 ms slots: {:?}",
+            gpm_starts,
+        );
+    }
+
+    #[test]
+    fn stock_paging_supplier_injects_page_record_in_assigned_slot_gpm() {
+        let (lac_to_mac_tx, _lac_to_mac_rx) = mpsc::channel();
+        let (_mac_to_lac_tx, mac_to_lac_rx) = mpsc::channel();
+        let lac = Layer2Lac::new(lac_to_mac_tx, mac_to_lac_rx);
+
+        let target_slot_num = 11u16;
+        let (imsi_m_s1, imsi_m_s2) = (0..20_000u32)
+            .find_map(|s1| {
+                let s2 = 123u16;
+                (cdma_common::paging::compute_pgslot(s1, s2) == target_slot_num).then_some((s1, s2))
+            })
+            .expect("test IMSI search should find a matching PGSLOT");
+        let imsi_s = ((imsi_m_s2 as u64) << 24) | imsi_m_s1 as u64;
+        let page_record = GeneralPageRecord::Class0 {
+            page_subclass: 0,
+            msg_seq: 5,
+            imsi_s: Some(imsi_s),
+            imsi_11_12: None,
+            mcc: None,
+            imsi_addr_num: None,
+            imsi_m_s1: Some(imsi_m_s1),
+            imsi_m_s2: Some(imsi_m_s2),
+            special_service: false,
+            service_option: None,
+        };
+        let page_address = MsPageAddress::ImsiS {
+            imsi_m_s1,
+            imsi_m_s2,
+            mcc: None,
+            imsi_11_12: None,
+        };
+
+        let overhead = OverheadParameters::default();
+        let paging = PagingChannelSettings::default();
+        let paging_state = Arc::new(Mutex::new(PagingSupplierState::new(0x03ff, 0x7f)));
+        paging_state
+            .lock()
+            .pending_page_records
+            .push(PendingPageRecord::new(page_record.clone(), page_address));
+        lac.set_paging_supplier(build_bts_paging_supplier(
+            overhead,
+            paging,
+            0,
+            paging_state.clone(),
+        ));
+
+        let general_page_type = MessageId::GeneralPage
+            .wire_type(WireChannel::ForwardCommon)
+            .unwrap();
+        let mut queue = VecDeque::new();
+        let mut reader = PagingFrameReader::new_with_rate(PagingChannelRate::Rate9600);
+        let mut message_start_chip = None::<u64>;
+        let mut decoded_gpms = Vec::<(u64, GeneralPageMessage)>::new();
+
+        for frame_idx in 0..260u64 {
+            let chip = frame_idx * FPCH_HALF_FRAME_CHIPS * 2;
+            let Some(request) = lac
+                .build_paging_frame_request(&mut queue, 192, Utc::now(), chip)
+                .unwrap()
+            else {
+                continue;
+            };
+
+            for (half_idx, chunk) in request.data.bits().chunks_exact(96).enumerate() {
+                let half_chip = chip + (half_idx as u64 * FPCH_HALF_FRAME_CHIPS);
+                if chunk.first() == Some(&1) {
+                    message_start_chip = Some(half_chip);
+                }
+                let mut half_frame = Bitstream::new_init(chunk);
+                let mut frames = Vec::new();
+                if let Some(frame) = reader.process(&mut half_frame).unwrap() {
+                    frames.push(frame);
+                }
+                while let Some(frame) = reader.take_completed_frame() {
+                    frames.push(frame);
+                }
+
+                for (completed_idx, frame) in frames.into_iter().enumerate() {
+                    if !frame.crc_valid {
+                        continue;
+                    }
+                    let start_chip = if completed_idx == 0 {
+                        message_start_chip.unwrap_or(half_chip)
+                    } else {
+                        half_chip
+                    };
+                    let mut payload = frame.data.clone();
+                    let msg_type = payload.read_bits(8).unwrap() as u8;
+                    if msg_type == general_page_type {
+                        decoded_gpms.push((
+                            start_chip,
+                            GeneralPageMessage::from_sdu(&mut payload).unwrap(),
+                        ));
+                    }
+                    message_start_chip = None;
+                }
+            }
+        }
+
+        let expected_chip = target_slot_num as u64 * FPCH_SLOT_CHIPS;
+        let matching = decoded_gpms
+            .iter()
+            .filter(|(_, gpm)| gpm.page_records.contains(&page_record))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            matching.len(),
+            4,
+            "page record must be injected into four assigned-slot GPMs: {:?}",
+            decoded_gpms
+                .iter()
+                .map(|(chip, gpm)| (*chip, gpm.page_records.clone()))
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            decoded_gpms.iter().all(|(_, gpm)| gpm.class_0_done),
+            "CLASS_0_DONE is slot-local; a future-slot Class 0 page must not hold it low: {:?}",
+            decoded_gpms
+                .iter()
+                .map(|(chip, gpm)| (*chip, gpm.class_0_done, gpm.page_records.clone()))
+                .collect::<Vec<_>>(),
+        );
+        let expected_chips = (0..4)
+            .map(|attempt| expected_chip + attempt * 16 * FPCH_SLOT_CHIPS)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching.iter().map(|(chip, _)| *chip).collect::<Vec<_>>(),
+            expected_chips,
+            "page record GPMs must start in assigned slots",
+        );
+        assert!(
+            decoded_gpms
+                .iter()
+                .all(|(chip, _)| chip % FPCH_SLOT_CHIPS == 0),
+            "all decoded GPMs should still start at slot boundaries",
+        );
+        assert!(
+            paging_state.lock().pending_page_records.is_empty(),
+            "page record should be consumed after four assigned-slot GPMs",
+        );
+    }
+
+    #[test]
     fn paging_frame_availability_keeps_long_pdu_contiguous_across_half_frames() {
         let (lac_to_mac_tx, _lac_to_mac_rx) = mpsc::channel();
         let (_mac_to_lac_tx, mac_to_lac_rx) = mpsc::channel();
@@ -2532,7 +3030,7 @@ mod tests {
             Layer2Lac::assemble_pdu(directed).unwrap(),
         ]);
         let request = lac
-            .build_paging_fragment_request(&mut queue, 96, now, 0)
+            .build_paging_fragment_request(&mut queue, 96, now, FPCH_HALF_FRAME_CHIPS)
             .unwrap()
             .unwrap();
 

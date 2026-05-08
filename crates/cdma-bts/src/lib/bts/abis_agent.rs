@@ -730,10 +730,9 @@ impl AbisAgent {
                             "abis_agent: GPM page record queued: {:?} addr={:?}",
                             record, page_address,
                         );
-                        guard.pending_page_records.push(PendingPageRecord {
-                            record,
-                            page_address,
-                        });
+                        guard
+                            .pending_page_records
+                            .push(PendingPageRecord::new(record, page_address));
                     }
                 }
                 Err(e) => {
