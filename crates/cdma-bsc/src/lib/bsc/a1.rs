@@ -412,18 +412,6 @@ impl Bsc {
         let requested_tx_time = super::access::access_response_tx_time(event);
         let tx_deadline = self.access_ack_deadline(event);
         let ack_msg_seq = event.msg_seq.unwrap_or(0);
-        if let Err(error) = self.access_tx.send_bs_ack_order(
-            fwd_address,
-            ack_msg_seq,
-            requested_tx_time,
-            tx_deadline,
-        ) {
-            warn!(
-                "BSC: failed to send BS Ack before A1 Paging Response call_id={}: {}",
-                call_id, error
-            );
-            return false;
-        }
 
         self.a1.push_pending_assignment(
             call_id,
@@ -436,6 +424,10 @@ impl Bsc {
                 leg_role: pending.leg_role,
                 bind_existing_traffic: false,
             },
+        );
+        info!(
+            "BSC: deferring Page Response ACK to A1 assignment for call_id={} ack_seq={}",
+            call_id, ack_msg_seq
         );
 
         if let Some(pending) = self.paging.take_voice_page_for_a1_call(call_id) {

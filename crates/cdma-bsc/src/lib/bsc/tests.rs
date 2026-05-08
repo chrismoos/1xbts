@@ -364,6 +364,41 @@ fn test_access_event() -> AccessChannelEvent {
     }
 }
 
+fn test_assignment_request_message(
+    call_id: u64,
+    circuit_id: u16,
+) -> crate::a1_edge::EncodedA1Message {
+    crate::a1_edge::EncodedA1Message::from_message_for_call(
+        &cdma_ios::Message::new(
+            cdma_ios::MessageType::AssignmentRequest,
+            cdma_ios::AssignmentRequestMessage {
+                channel_type: cdma_ios::ChannelType {
+                    speech_or_data_indicator: 0x01,
+                    channel_rate_and_type: 0x08,
+                    coding: 0x05,
+                },
+                circuit_identity_code: cdma_ios::CircuitIdentityCode {
+                    pcm_multiplexer: (circuit_id >> 5) & 0x07ff,
+                    timeslot: (circuit_id & 0x1f) as u8,
+                },
+                encryption_information: None,
+                service_option: Some(cdma_ios::ServiceOption(3)),
+                signals: Vec::new(),
+                calling_party_ascii_number: None,
+                ms_information_records: None,
+                priority: None,
+                paca_timestamp: None,
+                quality_of_service_parameters: None,
+                a2p_bearer_session_params: None,
+                a2p_bearer_format_params: None,
+            }
+            .encode()
+            .unwrap(),
+        ),
+        Some(call_id),
+    )
+}
+
 fn test_origination_l3(service_option: u16, sr_id: u8) -> AccessMessage {
     AccessMessage::Origination(OriginationMessage {
         header: AccessMessageHeader {
@@ -618,6 +653,117 @@ pub(super) async fn test_bsc_with_active_traffic_channel(
     }
 
     (bsc, traffic_rx, walsh_code)
+}
+
+#[tokio::test]
+async fn a1_mt_page_response_defers_l2_ack_until_assignment() {
+    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
+    let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
+    let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
+    let bts_client = test_capturing_bts_client(
+        walsh_allocator,
+        traffic_channels,
+        traffic_rx_pool,
+        traffic_rx_removals,
+    );
+    let (msc_client, msc_endpoint) = crate::a1_edge::InProcessMscClient::pair(4);
+    let msc: Arc<dyn crate::a1_edge::MscClient> = Arc::new(msc_client);
+
+    let mut bsc = test_bsc_with_max_slot_cycle_index(2);
+    bsc.config.bts_client = Some(bts_client.clone() as Arc<dyn BtsControlClient>);
+    bsc.access_tx = AccessTx::new(Some(bts_client.clone() as Arc<dyn BtsControlClient>));
+    bsc.config.msc_client = msc.clone();
+    bsc.a1.msc_client = msc;
+
+    let addr = MsAddress::ImsiS {
+        imsi_m_s1: 7_137_214,
+        imsi_m_s2: 512,
+    };
+    bsc.mobiles.push(MobileStation::new_for_test(
+        addr.clone(),
+        Some(0x1234_5678),
+        Some("31099007137214".to_string()),
+        6,
+        MsState::Registered,
+        2,
+        Some(100),
+    ));
+    bsc.mobiles[0].for_supported_rcs = vec![1, 2, 3, 4, 5];
+    bsc.mobiles[0].rev_supported_rcs = vec![1, 2, 3, 4];
+
+    let mut page_response = test_access_event();
+    page_response.message_id = MessageId::PageResponse;
+    page_response.msg_type_name = "Page Response Message".to_string();
+    page_response.msg_seq = Some(3);
+    page_response.ack_req = true;
+    page_response.esn = Some(0x1234_5678);
+    page_response.imsi_m_s1 = Some(7_137_214);
+    page_response.imsi_m_s2 = Some(512);
+    page_response.imsi_class = Some(1);
+    page_response.imsi_mcc = Some(310);
+    page_response.imsi_11_12 = Some(99);
+    page_response.mob_p_rev = Some(6);
+    page_response.slot_cycle_index = Some(2);
+    page_response.scm = Some(0x2a);
+    page_response.service_option = Some(3);
+    page_response.for_supported_rcs = vec![1, 2, 3, 4, 5];
+    page_response.rev_supported_rcs = vec![1, 2, 3, 4];
+
+    let call_id = 0x1000_0001;
+    let session_id = Uuid::new_v4();
+    let pending = PendingVoicePage {
+        session_id,
+        page_address: MsPageAddress::ImsiS {
+            imsi_m_s1: 7_137_214,
+            imsi_m_s2: 512,
+            mcc: Some(310),
+            imsi_11_12: Some(99),
+        },
+        fwd_address: addr.clone(),
+        pgslot: Some(100),
+        slot_cycle_index: 2,
+        started_at: Instant::now(),
+        timeout: Duration::from_secs(10),
+        retry_count: 0,
+        next_retry_at: tokio::time::Instant::now(),
+        last_target_chip: None,
+        service_option: 3,
+        leg_role: VoiceLegRole::Callee,
+        a1_tag: Some(cdma_ios::Tag(9)),
+        a1_call_id: Some(call_id),
+        imsi: Some("31099007137214".to_string()),
+        page_msg_seq: Some(5),
+        page_correlation_id: Some(55),
+    };
+
+    assert!(bsc.handle_mt_page_response(&page_response, &pending, &addr));
+    let outbound = tokio::time::timeout(Duration::from_secs(1), msc_endpoint.recv_from_bsc())
+        .await
+        .expect("A1 Paging Response should be sent")
+        .expect("A1 endpoint should receive Paging Response");
+    assert_eq!(outbound.message_type(), cdma_ios::MessageType::PagingResponse);
+    assert!(
+        bts_client.pch_messages.lock().is_empty(),
+        "A1 Page Response should not send a standalone BS Ack before AssignmentRequest"
+    );
+
+    let pending_assignment = bsc
+        .a1
+        .pop_pending_assignment(call_id)
+        .expect("Page Response should leave pending assignment state");
+    assert_eq!(pending_assignment.ack_msg_seq, 3);
+    bsc.a1.push_pending_assignment(call_id, pending_assignment);
+
+    bsc.handle_incoming_a1_message(test_assignment_request_message(call_id, 0x0123))
+        .await;
+
+    let pch_types = pch_message_types(&bts_client);
+    assert_eq!(pch_types, vec![MessageId::ExtChannelAssignment]);
+    let messages = bts_client.pch_messages.lock();
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].layer2_ack_request_results.is_some());
+    assert!(messages[0].abis_ack_notify.is_some());
 }
 
 #[tokio::test]
