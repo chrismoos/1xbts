@@ -24,3 +24,4 @@ config/*.secret.json
 *.swp
 *~
 !config/*.wav
+capture-iq-wav
