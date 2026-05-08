@@ -16,11 +16,12 @@ use cdma_common::lac::{
     message_types::MessageId,
     paging_messages::{MsAddress, MsPageAddress, OrderMessage, PagingChannelMessage},
 };
+use cdma_voice::VoiceCodec;
 use chrono::Duration as ChronoDuration;
 use log::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::addressing::{format_ms_address, select_imsi_class0_forward_address};
+use crate::addressing::{format_ms_address, is_packet_data_so, select_imsi_class0_forward_address};
 use cdma_common::consts::SR1_CHIP_RATE_HZ;
 
 use super::{
@@ -210,6 +211,25 @@ impl AccessTx {
             correlation_id, req_tx_chip, deadline_chip,
         );
         Ok(())
+    }
+
+    pub(crate) fn send_service_option_rejected_release(
+        &self,
+        addr: &MsAddress,
+        ack_msg_seq: u8,
+        requested_tx_time: Option<cdma_common::time::CdmaSystemTime>,
+        tx_deadline: Option<cdma_common::time::CdmaSystemTime>,
+    ) -> Result<(), Error> {
+        self.send_order(
+            addr,
+            ack_msg_seq,
+            true,
+            0b010101,
+            0b00000010,
+            "Release Order (requested service option rejected)",
+            requested_tx_time,
+            tx_deadline,
+        )
     }
 }
 
@@ -815,6 +835,30 @@ impl AccessService {
                 None => break 'assign_voice_traffic,
             };
 
+            if !is_supported_origination_service_option(so) {
+                info!(
+                    "BSC: rejecting unsupported Origination service option SO{} from {}",
+                    so,
+                    format_ms_address(&fwd_address)
+                );
+                if let Err(e) = bsc.access_tx.send_service_option_rejected_release(
+                    &fwd_address,
+                    last_msg_seq,
+                    access_response_tx_time(event),
+                    bsc.access_ack_deadline(event),
+                ) {
+                    warn!(
+                        "BSC: failed to send service-option rejection Release Order for SO{}: {}",
+                        so, e
+                    );
+                }
+                return;
+            }
+
+            if !is_voice_origination_service_option(so) {
+                break 'assign_voice_traffic;
+            }
+
             if bsc.mobiles.get(&fwd_address).is_none() {
                 break 'assign_voice_traffic;
             }
@@ -871,6 +915,14 @@ impl AccessService {
         // per §3.6.3.3.
         bsc.try_deliver_pending_sms_from_access(event, &fwd_address, "Origination");
     }
+}
+
+fn is_supported_origination_service_option(so: u16) -> bool {
+    matches!(so, 6) || is_packet_data_so(so) || is_voice_origination_service_option(so)
+}
+
+fn is_voice_origination_service_option(so: u16) -> bool {
+    VoiceCodec::from_service_option(so).is_some()
 }
 
 impl Bsc {
