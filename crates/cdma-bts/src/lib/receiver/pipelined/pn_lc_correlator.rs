@@ -1235,7 +1235,7 @@ impl PnLcCorrelator {
                         PnReferenceKind::Oqpsk => Arc::clone(&self.pn_despread_seq),
                     };
 
-                    info!(
+                    debug!(
                         "PnLcCorrelator: PREAMBLE DETECTED id={} delay={} lc_phase={} tx_chip={} \
                          first_verified_tx_chip={} first_verified_sample={} despread_phase={} \
                          center_offset={} ref={:?} timing_mu={:+.3} timing_hyp={}/{} finger_start={} replay_samples={} skip={} cfo={:.6}",
