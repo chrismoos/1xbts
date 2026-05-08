@@ -140,6 +140,18 @@ fn encode_bearer_data(buf: &mut Vec<u8>, text: &str, message_id: u16) {
 ///
 /// Returns Transport Layer bytes suitable for wrapping in a ForwardDataBurstMessage.
 pub fn encode_sms_cause_code(reply_seq: u8, error_class: u8) -> Vec<u8> {
+    encode_sms_cause_code_with_cause(reply_seq, error_class, None)
+}
+
+/// Encode an SMS Cause Code with an optional SMS_CauseCode value.
+///
+/// C.S0015-B requires CAUSE_CODE to be omitted when ERROR_CLASS is `00` and
+/// present when ERROR_CLASS indicates a temporary or permanent condition.
+pub fn encode_sms_cause_code_with_cause(
+    reply_seq: u8,
+    error_class: u8,
+    cause_code: Option<u8>,
+) -> Vec<u8> {
     let mut buf = Vec::new();
 
     // Transport Layer SMS_MSG_TYPE = 0x02 (Cause Code)
@@ -147,9 +159,13 @@ pub fn encode_sms_cause_code(reply_seq: u8, error_class: u8) -> Vec<u8> {
 
     // Cause Codes parameter (tag=0x07)
     buf.push(0x07); // PARAMETER_ID
-    buf.push(0x01); // PARAMETER_LEN = 1 byte
+    let include_cause = (error_class & 0x03) != 0 && cause_code.is_some();
+    buf.push(if include_cause { 0x02 } else { 0x01 }); // PARAMETER_LEN
     // REPLY_SEQ(6) | ERROR_CLASS(2)
     buf.push((reply_seq & 0x3F) << 2 | (error_class & 0x03));
+    if include_cause {
+        buf.push(cause_code.unwrap());
+    }
 
     buf
 }

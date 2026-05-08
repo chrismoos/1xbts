@@ -1831,6 +1831,54 @@ async fn duplicate_reverse_traffic_data_burst_is_acked_but_not_reprocessed() {
 }
 
 #[tokio::test]
+async fn traffic_mo_sms_without_subscriber_sends_temporary_cause_code() {
+    let (mut bsc, mut traffic_rx, walsh_code) = test_bsc_with_active_traffic_channel(6).await;
+    bsc.mobiles[0].phone_number = None;
+    bsc.mobiles[0].subscriber_id = None;
+
+    while traffic_rx.try_recv().is_ok() {}
+
+    let mut data_burst = test_access_event();
+    data_burst.message_id = MessageId::DataBurst;
+    data_burst.msg_type_name = "Data Burst Message".to_string();
+    data_burst.msg_seq = Some(1);
+    data_burst.ack_seq = Some(3);
+    data_burst.ack_req = true;
+    data_burst.valid_ack = true;
+    data_burst.traffic_walsh_code = Some(walsh_code);
+    data_burst.burst_type = Some(3);
+    data_burst.data_burst_num_msgs = Some(1);
+    data_burst.data_burst_msg_number = Some(1);
+    data_burst.data_burst_fields = Some(vec![
+        0x00, 0x00, 0x02, 0x10, 0x02, 0x04, 0x05, 0x01, 0x95, 0x54, 0x48, 0x80, 0x06, 0x01, 0x84,
+        0x08, 0x18, 0x00, 0x03, 0x20, 0x0A, 0x90, 0x01, 0x05, 0x10, 0x1C, 0x8D, 0x3A, 0x40, 0x0A,
+        0x01, 0x40, 0x0E, 0x07, 0x05, 0x48, 0xBB, 0x49, 0xB1, 0x34, 0x80,
+    ]);
+
+    bsc.inject_access_event(data_burst).await;
+
+    let mut saw_bs_ack = false;
+    let mut cause_fields = None;
+    while let Ok(event) = traffic_rx.try_recv() {
+        match event.mcsb.message_id {
+            MessageId::Order => saw_bs_ack = true,
+            MessageId::DataBurst => {
+                cause_fields = event.data_burst.as_ref().map(|db| db.fields.clone());
+            }
+            _ => {}
+        }
+    }
+
+    assert!(saw_bs_ack, "expected L2 BS Ack for reverse DBM");
+    let fields = cause_fields.expect("expected SMS Cause Code DBM");
+    assert_eq!(fields[0], 0x02, "SMS Acknowledge message type");
+    assert_eq!(fields[1], 0x07, "Cause Codes parameter");
+    assert_eq!(fields[2], 0x02, "temporary error includes CAUSE_CODE octet");
+    assert_eq!(fields[3] & 0x03, 0b10, "temporary ERROR_CLASS");
+    assert_eq!(fields[4], 0x03, "SMS_CauseCode NetworkFailure");
+}
+
+#[tokio::test]
 async fn pmrm_ack_of_bs_ack_advances_waiting_ms_ack() {
     let (mut bsc, _traffic_rx, walsh_code) = test_bsc_with_active_traffic_channel(33).await;
 

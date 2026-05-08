@@ -630,14 +630,12 @@ impl Bsc {
             fields.len()
         );
 
-        let Some((originating_number, originating_subscriber_id)) = self
+        let sender = self
             .mobiles
             .get_by_walsh(walsh_code)
-            .and_then(|ms| ms.phone_number.clone().map(|n| (n, ms.subscriber_id)))
-        else {
-            warn!("BSC: MO SMS on traffic dropped - originating MS has no phone number in HLR");
-            return;
-        };
+            .and_then(|ms| ms.phone_number.clone().map(|n| (n, ms.subscriber_id)));
+        let (originating_number, originating_subscriber_id) =
+            sender.clone().unwrap_or_else(|| (String::new(), None));
 
         let Some(sms) = self.decode_reverse_sms(
             fields,
@@ -648,10 +646,39 @@ impl Bsc {
             return;
         };
 
+        let reply_seq = sms.reply_seq.unwrap_or(0);
+        if sender.is_none() {
+            const TEMPORARY_ERROR_CLASS: u8 = 0b10;
+            const SMS_CAUSE_NETWORK_FAILURE: u8 = 0x03;
+            warn!(
+                "BSC: rejecting MO SMS on traffic walsh={} with temporary SMS Cause Code: no subscriber/phone number resolved for originating MS (dest=\"{}\" teleservice=0x{:04X} msg_id={} reply_seq={})",
+                walsh_code, sms.destination_number, sms.teleservice_id, sms.message_id, reply_seq,
+            );
+            self.send_traffic_sms_cause_code(
+                walsh_code,
+                ack_seq,
+                reply_seq,
+                TEMPORARY_ERROR_CLASS,
+                Some(SMS_CAUSE_NETWORK_FAILURE),
+            );
+            return;
+        }
+
         self.send_traffic_mo_sms_to_msc(walsh_code, fields);
 
-        let reply_seq = sms.reply_seq.unwrap_or(0);
-        let cause_code_bytes = air_sms::encode_sms_cause_code(reply_seq, 0);
+        self.send_traffic_sms_cause_code(walsh_code, ack_seq, reply_seq, 0, None);
+    }
+
+    fn send_traffic_sms_cause_code(
+        &mut self,
+        walsh_code: u8,
+        ack_seq: u8,
+        reply_seq: u8,
+        error_class: u8,
+        cause_code: Option<u8>,
+    ) {
+        let cause_code_bytes =
+            air_sms::encode_sms_cause_code_with_cause(reply_seq, error_class, cause_code);
         let data_burst = ForwardDataBurstMessage {
             msg_number: 1,
             burst_type: 3,
@@ -672,11 +699,14 @@ impl Bsc {
             None,
         ) {
             warn!(
-                "BSC: failed to send SMS Cause Code on walsh={}: {}",
-                walsh_code, e
+                "BSC: failed to send SMS Cause Code on walsh={} reply_seq={} error_class={} cause_code={:?}: {}",
+                walsh_code, reply_seq, error_class, cause_code, e
             );
         } else {
-            info!("BSC: sent SMS Cause Code on F-TCH walsh={}", walsh_code);
+            info!(
+                "BSC: sent SMS Cause Code on F-TCH walsh={} reply_seq={} error_class={} cause_code={:?}",
+                walsh_code, reply_seq, error_class, cause_code
+            );
         }
 
         self.mobiles.update_tc(walsh_code, |_, tc| {
