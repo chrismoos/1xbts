@@ -16,12 +16,15 @@
     "auth_mode": 0,
     "p_rev": 6,
     "min_p_rev": 3,
-    "lp_sec": 0,
+    "lp_sec": 18,
     "ltm_off": -14,
     "daylt": 0,
     "prat": 0,
     "cdma_freq": 384,
     "ext_cdma_freq": 384
+  },
+  "timezone": {
+    "source": "overhead"
   },
   "runtime": {
     "spreading_rate": "sr1",

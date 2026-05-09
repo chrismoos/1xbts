@@ -653,6 +653,8 @@ message BtsConfig {
   PagingConfig paging = 12;
 
   OverheadConfig overhead = 20;
+  TimezoneConfig timezone = 21;
+  TimezoneStatus timezone_status = 22;
 }
 
 // Pilot channel configuration.
@@ -691,6 +693,29 @@ message OverheadConfig {
   bool power_up_reg = 11;
   bool parameter_reg = 12;
   uint32 auth_mode = 13;
+  uint32 lp_sec = 14;
+  int32 ltm_off = 15;
+  uint32 daylt = 16;
+}
+
+// Configured timezone source for the broadcast LTM_OFF and DAYLT fields.
+// LP_SEC is not driven by this section; it lives on OverheadConfig.
+message TimezoneConfig {
+  // "overhead" | "system" | "user"
+  string source = 1;
+  // Set when source == "user".
+  optional string tz = 2;
+}
+
+// Currently resolved timezone values, computed at the time of the request.
+// Reflects what would be broadcast right now on the next sync frame.
+message TimezoneStatus {
+  string source = 1;
+  optional string tz = 2;
+  int32 ltm_off = 3;
+  uint32 daylt = 4;
+  uint32 lp_sec = 5;
+  int32 utc_offset_seconds = 6;
 }
 
 // ─── Mobiles ────────────────────────────────────────────────────

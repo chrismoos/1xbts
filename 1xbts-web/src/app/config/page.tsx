@@ -84,6 +84,33 @@ export default async function ConfigPage() {
                 <Stat label="POWER_UP_REG" value={config.overhead.powerUpReg ? "Yes" : "No"} />
                 <Stat label="PARAMETER_REG" value={config.overhead.parameterReg ? "Yes" : "No"} />
                 <Stat label="AUTH_MODE" value={String(config.overhead.authMode)} />
+                <Stat label="LP_SEC" value={String(config.overhead.lpSec)} />
+                <Stat label="LTM_OFF" value={`${config.overhead.ltmOff} (${formatLtmOff(config.overhead.ltmOff)})`} />
+                <Stat label="DAYLT" value={config.overhead.daylt ? "1 (DST)" : "0"} />
+              </>
+            )}
+          </Card>
+
+          <Card title="Timezone">
+            {config.timezone && config.timezoneStatus && (
+              <>
+                <Stat label="Source" value={config.timezone.source} />
+                {config.timezoneStatus.tz && (
+                  <Stat label="Zone" value={config.timezoneStatus.tz} />
+                )}
+                <Stat
+                  label="LTM_OFF"
+                  value={`${config.timezoneStatus.ltmOff} (${formatLtmOff(config.timezoneStatus.ltmOff)})`}
+                />
+                <Stat
+                  label="DAYLT"
+                  value={config.timezoneStatus.daylt ? "1 (DST active)" : "0 (no DST)"}
+                />
+                <Stat label="LP_SEC" value={String(config.timezoneStatus.lpSec)} />
+                <Stat
+                  label="UTC offset"
+                  value={formatUtcOffset(config.timezoneStatus.utcOffsetSeconds)}
+                />
               </>
             )}
           </Card>
@@ -91,4 +118,21 @@ export default async function ConfigPage() {
       )}
     </div>
   );
+}
+
+function formatLtmOff(halfHours: number): string {
+  const minutes = halfHours * 30;
+  const sign = minutes < 0 ? "-" : "+";
+  const abs = Math.abs(minutes);
+  const h = Math.floor(abs / 60);
+  const m = abs % 60;
+  return `UTC${sign}${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}
+
+function formatUtcOffset(seconds: number): string {
+  const sign = seconds < 0 ? "-" : "+";
+  const abs = Math.abs(seconds);
+  const h = Math.floor(abs / 3600);
+  const m = Math.floor((abs % 3600) / 60);
+  return `${sign}${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
 }

@@ -94,8 +94,12 @@ pub(super) fn handle_sync_frame(
     if state.current_sync_pdu.is_none() {
         let max_size = runtime.downlink.sync.availability_max_size_bits;
         let pch_num = runtime.downlink.paging.paging_channel_number;
-        let stamped =
-            Layer2Lac::stamp_and_serialize_sync(template.clone(), chip_cursor, max_size, pch_num)?;
+        let resolved = resolve_timezone_cached(state, &config.timezone, &config.overhead);
+        let mut tmpl = template.clone();
+        tmpl.ltm_off = resolved.ltm_off;
+        tmpl.daylt = resolved.daylt;
+        tmpl.lp_sec = resolved.lp_sec;
+        let stamped = Layer2Lac::stamp_and_serialize_sync(tmpl, chip_cursor, max_size, pch_num)?;
         state.current_sync_pdu = Some(Layer2Lac::assemble_pdu(stamped)?);
     }
 
@@ -195,6 +199,27 @@ pub(super) fn handle_paging_frame(
     }
     fpch.channel.send_fragment(fragment);
     Ok(())
+}
+
+/// Recompute the resolved timezone at most once per second. The Sync
+/// Channel Message is rebuilt at superframe rate (~80 ms); refreshing every
+/// frame would call `chrono::Utc::now()` plus `chrono-tz` lookups on the hot
+/// path. One second is well below the 80 ms PDU boundary at which a DST
+/// transition could shift the broadcast value mid-PDU.
+fn resolve_timezone_cached(
+    state: &mut TxLoopState,
+    cfg: &cdma_common::timezone::TimezoneConfig,
+    overhead: &cdma_common::overhead::OverheadParameters,
+) -> cdma_common::timezone::ResolvedTimezone {
+    let now = std::time::Instant::now();
+    if let Some((at, cached)) = &state.timezone_cache
+        && now.duration_since(*at) < std::time::Duration::from_secs(1)
+    {
+        return *cached;
+    }
+    let resolved = cdma_common::timezone::resolve(cfg, overhead, chrono::Utc::now());
+    state.timezone_cache = Some((now, resolved));
+    resolved
 }
 
 pub(super) fn send_availability_indications(

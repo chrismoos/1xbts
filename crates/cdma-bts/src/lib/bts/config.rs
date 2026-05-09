@@ -453,6 +453,9 @@ pub struct BtsNodeConfig {
     /// Cell-level overhead parameters for the sync and paging channels.
     /// The BTS generates the overhead train locally from these values.
     pub overhead: super::settings::OverheadParameters,
+    /// Source for the broadcast `LTM_OFF` / `DAYLT` / `LP_SEC` fields.
+    /// When absent, the static overhead values are used (legacy behavior).
+    pub timezone: cdma_common::timezone::TimezoneConfig,
     /// Abis bearer (UDP) addressing for traffic frames.
     pub bearer: BtsBearerConfig,
 }
@@ -466,6 +469,7 @@ impl Default for BtsNodeConfig {
             abis_timers: BtsAbisTimers::default(),
             abis: BtsAbisConfig::default(),
             overhead: super::settings::OverheadParameters::default(),
+            timezone: cdma_common::timezone::TimezoneConfig::default(),
             bearer: BtsBearerConfig::default(),
         }
     }
@@ -481,6 +485,7 @@ struct BtsNodeConfigFile {
     pub abis_timers: BtsAbisTimers,
     pub abis: BtsAbisConfig,
     pub overhead: super::settings::OverheadParameters,
+    pub timezone: cdma_common::timezone::TimezoneConfig,
     pub bearer: BtsBearerConfig,
 }
 
@@ -494,6 +499,7 @@ impl Default for BtsNodeConfigFile {
             abis_timers: BtsAbisTimers::default(),
             abis: BtsAbisConfig::default(),
             overhead: super::settings::OverheadParameters::default(),
+            timezone: cdma_common::timezone::TimezoneConfig::default(),
             bearer: BtsBearerConfig::default(),
         }
     }
@@ -522,6 +528,7 @@ impl BtsNodeConfig {
             abis_timers: source.abis_timers,
             abis: source.abis,
             overhead: source.overhead,
+            timezone: source.timezone,
             bearer: source.bearer,
         };
         config.validate()?;
@@ -536,6 +543,8 @@ impl BtsNodeConfig {
             return Err("bts.pilot_offset must be in 0..=511".into());
         }
         self.runtime.validate()?;
+        cdma_common::timezone::validate(&self.timezone)
+            .map_err(|e| Error::from(format!("bts.timezone: {e}")))?;
         Ok(())
     }
 }
@@ -636,6 +645,80 @@ mod tests {
 
         let config = BtsNodeConfig::load_from_path(&config_path).expect("load config");
         assert!(matches!(config.radio, RadioConfig::Noop));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn loads_timezone_overhead_default() {
+        use cdma_common::timezone::TimezoneSource;
+        let dir = temp_test_dir("tz-default");
+        let path = dir.join("bts.json");
+        fs::write(&path, r#"{ "radio": { "kind": "noop" } }"#).unwrap();
+        let cfg = BtsNodeConfig::load_from_path(&path).expect("load");
+        assert_eq!(cfg.timezone.source, TimezoneSource::Overhead);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn loads_timezone_user_block() {
+        use cdma_common::timezone::TimezoneSource;
+        let dir = temp_test_dir("tz-user");
+        let path = dir.join("bts.json");
+        fs::write(
+            &path,
+            r#"{
+  "radio": { "kind": "noop" },
+  "timezone": { "source": "user", "tz": "America/Los_Angeles" }
+}"#,
+        )
+        .unwrap();
+        let cfg = BtsNodeConfig::load_from_path(&path).expect("load");
+        assert_eq!(
+            cfg.timezone.source,
+            TimezoneSource::User {
+                tz: "America/Los_Angeles".into()
+            }
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn rejects_user_timezone_with_invalid_iana() {
+        let dir = temp_test_dir("tz-bad-iana");
+        let path = dir.join("bts.json");
+        fs::write(
+            &path,
+            r#"{
+  "radio": { "kind": "noop" },
+  "timezone": { "source": "user", "tz": "Mars/Olympus_Mons" }
+}"#,
+        )
+        .unwrap();
+        let err = BtsNodeConfig::load_from_path(&path).expect_err("expected validation error");
+        assert!(
+            err.to_string().contains("invalid IANA timezone"),
+            "unexpected error: {err}"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn rejects_user_timezone_missing_tz_field() {
+        let dir = temp_test_dir("tz-missing");
+        let path = dir.join("bts.json");
+        fs::write(
+            &path,
+            r#"{
+  "radio": { "kind": "noop" },
+  "timezone": { "source": "user" }
+}"#,
+        )
+        .unwrap();
+        let err = BtsNodeConfig::load_from_path(&path).expect_err("expected parse error");
+        assert!(
+            err.to_string().contains("required when source"),
+            "unexpected error: {err}"
+        );
         fs::remove_dir_all(dir).ok();
     }
 

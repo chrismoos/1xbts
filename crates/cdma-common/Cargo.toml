@@ -10,10 +10,15 @@ description = "Shared utilities, error types, bitstreams, and timing helpers for
 
 [dependencies]
 chrono = "0.4"
+chrono-tz = "0.9"
+iana-time-zone = "0.1"
 hound = "3"
 num-complex = "0.4"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
 serde_json = "1"
 
 [lints]

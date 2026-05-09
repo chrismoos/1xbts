@@ -1312,6 +1312,8 @@ async fn test_e2e_so7_packet_data_full_negotiation() {
                 sr3_incl: false,
                 ds_incl: false,
             }),
+            timezone: cdma_common::timezone::TimezoneConfig::default(),
+            overhead: cdma_common::overhead::OverheadParameters::default(),
             rx: Some(bts::RxSettings {
                 sample_rate_hz: 1_228_800 * 4,
                 auth_mode: 0,
@@ -1912,6 +1914,8 @@ async fn test_e2e_so7_packet_data_phy_bidirectional() {
                 sr3_incl: false,
                 ds_incl: false,
             }),
+            timezone: cdma_common::timezone::TimezoneConfig::default(),
+            overhead: cdma_common::overhead::OverheadParameters::default(),
             rx: Some(bts::RxSettings {
                 sample_rate_hz: chip_rate * oversample,
                 auth_mode: 0,
@@ -2576,6 +2580,8 @@ async fn test_e2e_so7_rc3_reverse_preamble_queues_bs_ack() {
                 sr3_incl: false,
                 ds_incl: false,
             }),
+            timezone: cdma_common::timezone::TimezoneConfig::default(),
+            overhead: cdma_common::overhead::OverheadParameters::default(),
             rx: Some(bts::RxSettings {
                 sample_rate_hz: chip_rate * oversample,
                 auth_mode: 0,
@@ -3622,6 +3628,8 @@ async fn test_e2e_so6_sms_data_burst_phy_bidirectional() {
                 sr3_incl: false,
                 ds_incl: false,
             }),
+            timezone: cdma_common::timezone::TimezoneConfig::default(),
+            overhead: cdma_common::overhead::OverheadParameters::default(),
             rx: Some(bts::RxSettings {
                 sample_rate_hz: chip_rate * oversample,
                 auth_mode: 0,

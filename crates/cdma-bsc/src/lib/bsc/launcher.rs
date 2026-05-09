@@ -73,6 +73,7 @@ pub async fn connect_configured_bts_client(
 pub struct BscLaunchInputs {
     pub pilot_offset: usize,
     pub overhead: OverheadParameters,
+    pub timezone: cdma_common::timezone::TimezoneConfig,
     pub paging: PagingChannelSettings,
     pub traffic_assignment: TrafficAssignmentConfig,
     pub traffic_retry: TrafficRetryConfig,
@@ -124,6 +125,7 @@ pub fn build_bsc_launch_parts(inputs: BscLaunchInputs) -> BscLaunchParts {
         rx_metrics: inputs.rx_metrics,
         bts_config: inputs.bts_config,
         overhead: inputs.overhead.clone(),
+        timezone: inputs.timezone.clone(),
         pilot_offset: inputs.pilot_offset,
         access_broadcast: access_broadcast_tx.clone(),
         mobiles: mobiles_rx,

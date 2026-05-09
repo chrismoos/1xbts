@@ -181,6 +181,12 @@ pub struct Config {
     /// going through the MAC/LAC availability-indication path. The template
     /// is re-stamped with `lc_state` and `sys_time` at each superframe start.
     pub sync_channel_template: Option<SyncChannelMessage>,
+    /// Source policy + overrides for the broadcast `LTM_OFF` / `DAYLT` /
+    /// `LP_SEC` fields. The static fallback values live on `overhead`.
+    pub timezone: cdma_common::timezone::TimezoneConfig,
+    /// Static overhead values (used as the `Overhead` source fallback and
+    /// for `lp_sec` defaults).
+    pub overhead: settings::OverheadParameters,
     /// Optional reverse-link RX configuration.
     pub rx: Option<RxSettings>,
 }
@@ -219,6 +225,7 @@ pub(crate) struct TxLoopState {
     paging_requested_fragments: usize,
     paging_sent_fragments: usize,
     current_sync_pdu: Option<crate::lac::EncapsulatedPdu>,
+    timezone_cache: Option<(Instant, cdma_common::timezone::ResolvedTimezone)>,
     hardware_start_tick: u64,
     hardware_start_chip: u64,
     gen_time_sum_us: u64,
@@ -414,6 +421,7 @@ impl Bts {
             paging_requested_fragments: 0,
             paging_sent_fragments: 0,
             current_sync_pdu: None,
+            timezone_cache: None,
             hardware_start_tick: 0,
             hardware_start_chip: 0,
             gen_time_sum_us: 0,

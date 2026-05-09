@@ -23,6 +23,7 @@ pub struct BscState {
     pub rx_metrics: watch::Receiver<BtsRxMetrics>,
     pub bts_config: Arc<BtsRuntimeSettings>,
     pub overhead: OverheadParameters,
+    pub timezone: cdma_common::timezone::TimezoneConfig,
     pub pilot_offset: usize,
     pub access_broadcast: broadcast::Sender<AccessChannelEvent>,
     pub mobiles: watch::Receiver<Vec<MobileInfo>>,

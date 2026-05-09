@@ -1193,8 +1193,19 @@ fn to_proto_paging_event(ev: &PagingEvent) -> proto::PagingEvent {
 fn to_proto_config(
     cfg: &BtsRuntimeSettings,
     overhead: &crate::bsc::OverheadParameters,
+    timezone: &cdma_common::timezone::TimezoneConfig,
     pilot_offset: usize,
 ) -> proto::BtsConfig {
+    use cdma_common::timezone::TimezoneSource;
+    let resolved = cdma_common::timezone::resolve(timezone, overhead, chrono::Utc::now());
+    let (source_str, tz_name) = match &timezone.source {
+        TimezoneSource::Overhead => ("overhead".to_string(), None),
+        TimezoneSource::System => (
+            "system".to_string(),
+            cdma_common::timezone::host_iana_name(),
+        ),
+        TimezoneSource::User { tz } => ("user".to_string(), Some(tz.clone())),
+    };
     proto::BtsConfig {
         pilot_offset: pilot_offset as u32,
         spreading_rate: format!("{:?}", cfg.spreading_rate),
@@ -1233,6 +1244,24 @@ fn to_proto_config(
             power_up_reg: overhead.power_up_reg,
             parameter_reg: overhead.parameter_reg,
             auth_mode: overhead.auth_mode as u32,
+            lp_sec: overhead.lp_sec as u32,
+            ltm_off: overhead.ltm_off as i32,
+            daylt: overhead.daylt as u32,
+        }),
+        timezone: Some(proto::TimezoneConfig {
+            source: source_str.clone(),
+            tz: match &timezone.source {
+                TimezoneSource::User { tz } => Some(tz.clone()),
+                _ => None,
+            },
+        }),
+        timezone_status: Some(proto::TimezoneStatus {
+            source: source_str,
+            tz: tz_name,
+            ltm_off: resolved.ltm_off as i32,
+            daylt: resolved.daylt as u32,
+            lp_sec: resolved.lp_sec as u32,
+            utc_offset_seconds: (resolved.ltm_off as i32) * 1800,
         }),
     }
 }
@@ -1285,6 +1314,7 @@ impl BscService for BscServiceImpl {
         let cfg = to_proto_config(
             &self.state.bts_config,
             &self.state.overhead,
+            &self.state.timezone,
             self.state.pilot_offset,
         );
         Ok(Response::new(cfg))

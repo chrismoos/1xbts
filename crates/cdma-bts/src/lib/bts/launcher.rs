@@ -383,6 +383,8 @@ pub fn build_bts_launch_parts(
                 sr3_incl: false,
                 ds_incl: false,
             }),
+            timezone: bts_config.timezone.clone(),
+            overhead: bts_config.overhead.clone(),
             rx,
         },
         bts_config.runtime.clone(),

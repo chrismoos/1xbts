@@ -59,9 +59,6 @@ pub struct OverheadConfig {
     pub auth_mode: u8,
     pub p_rev: u8,
     pub min_p_rev: u8,
-    pub lp_sec: u8,
-    pub ltm_off: i8,
-    pub daylt: u8,
     pub prat: u8,
     /// CDMA channel number for the sync channel message. If not set (0),
     /// callers may derive from `BtsNodeConfig.runtime.tx_center_frequency_hz`
@@ -96,9 +93,6 @@ impl Default for OverheadConfig {
             auth_mode: 0,
             p_rev: 6,
             min_p_rev: 6,
-            lp_sec: 0,
-            ltm_off: 0,
-            daylt: 0,
             prat: 0,
             cdma_freq: 0,
             ext_cdma_freq: 0,
@@ -309,7 +303,7 @@ impl Default for BscBearerConfig {
 #[serde(default)]
 pub struct BscNodeConfig {
     /// Overhead message contents that the BSC instructs the BTS to broadcast
-    /// (SID/NID, registration, P_REV, page channel, time/zone, CDMA freq).
+    /// (SID/NID, registration, P_REV, page channel, CDMA freq).
     pub overhead: OverheadConfig,
     /// Radio configuration / service-option policy applied during traffic
     /// channel assignment.

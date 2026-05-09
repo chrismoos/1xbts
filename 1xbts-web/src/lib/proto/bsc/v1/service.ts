@@ -667,6 +667,8 @@ export interface BtsConfig {
   sync: SyncConfig | undefined;
   paging: PagingConfig | undefined;
   overhead: OverheadConfig | undefined;
+  timezone: TimezoneConfig | undefined;
+  timezoneStatus: TimezoneStatus | undefined;
 }
 
 /** Pilot channel configuration. */
@@ -705,6 +707,33 @@ export interface OverheadConfig {
   powerUpReg: boolean;
   parameterReg: boolean;
   authMode: number;
+  lpSec: number;
+  ltmOff: number;
+  daylt: number;
+}
+
+/**
+ * Configured timezone source for the broadcast LTM_OFF and DAYLT fields.
+ * LP_SEC is not driven by this section; it lives on OverheadConfig.
+ */
+export interface TimezoneConfig {
+  /** "overhead" | "system" | "user" */
+  source: string;
+  /** Set when source == "user". */
+  tz?: string | undefined;
+}
+
+/**
+ * Currently resolved timezone values, computed at the time of the request.
+ * Reflects what would be broadcast right now on the next sync frame.
+ */
+export interface TimezoneStatus {
+  source: string;
+  tz?: string | undefined;
+  ltmOff: number;
+  daylt: number;
+  lpSec: number;
+  utcOffsetSeconds: number;
 }
 
 /** Mobile/subscriber state currently known by the BSC. */
@@ -10936,6 +10965,8 @@ function createBaseBtsConfig(): BtsConfig {
     sync: undefined,
     paging: undefined,
     overhead: undefined,
+    timezone: undefined,
+    timezoneStatus: undefined,
   };
 }
 
@@ -10976,6 +11007,12 @@ export const BtsConfig: MessageFns<BtsConfig> = {
     }
     if (message.overhead !== undefined) {
       OverheadConfig.encode(message.overhead, writer.uint32(162).fork()).join();
+    }
+    if (message.timezone !== undefined) {
+      TimezoneConfig.encode(message.timezone, writer.uint32(170).fork()).join();
+    }
+    if (message.timezoneStatus !== undefined) {
+      TimezoneStatus.encode(message.timezoneStatus, writer.uint32(178).fork()).join();
     }
     return writer;
   },
@@ -11083,6 +11120,22 @@ export const BtsConfig: MessageFns<BtsConfig> = {
           message.overhead = OverheadConfig.decode(reader, reader.uint32());
           continue;
         }
+        case 21: {
+          if (tag !== 170) {
+            break;
+          }
+
+          message.timezone = TimezoneConfig.decode(reader, reader.uint32());
+          continue;
+        }
+        case 22: {
+          if (tag !== 178) {
+            break;
+          }
+
+          message.timezoneStatus = TimezoneStatus.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -11138,6 +11191,12 @@ export const BtsConfig: MessageFns<BtsConfig> = {
       sync: isSet(object.sync) ? SyncConfig.fromJSON(object.sync) : undefined,
       paging: isSet(object.paging) ? PagingConfig.fromJSON(object.paging) : undefined,
       overhead: isSet(object.overhead) ? OverheadConfig.fromJSON(object.overhead) : undefined,
+      timezone: isSet(object.timezone) ? TimezoneConfig.fromJSON(object.timezone) : undefined,
+      timezoneStatus: isSet(object.timezoneStatus)
+        ? TimezoneStatus.fromJSON(object.timezoneStatus)
+        : isSet(object.timezone_status)
+        ? TimezoneStatus.fromJSON(object.timezone_status)
+        : undefined,
     };
   },
 
@@ -11179,6 +11238,12 @@ export const BtsConfig: MessageFns<BtsConfig> = {
     if (message.overhead !== undefined) {
       obj.overhead = OverheadConfig.toJSON(message.overhead);
     }
+    if (message.timezone !== undefined) {
+      obj.timezone = TimezoneConfig.toJSON(message.timezone);
+    }
+    if (message.timezoneStatus !== undefined) {
+      obj.timezoneStatus = TimezoneStatus.toJSON(message.timezoneStatus);
+    }
     return obj;
   },
 
@@ -11206,6 +11271,12 @@ export const BtsConfig: MessageFns<BtsConfig> = {
       : undefined;
     message.overhead = (object.overhead !== undefined && object.overhead !== null)
       ? OverheadConfig.fromPartial(object.overhead)
+      : undefined;
+    message.timezone = (object.timezone !== undefined && object.timezone !== null)
+      ? TimezoneConfig.fromPartial(object.timezone)
+      : undefined;
+    message.timezoneStatus = (object.timezoneStatus !== undefined && object.timezoneStatus !== null)
+      ? TimezoneStatus.fromPartial(object.timezoneStatus)
       : undefined;
     return message;
   },
@@ -11526,6 +11597,9 @@ function createBaseOverheadConfig(): OverheadConfig {
     powerUpReg: false,
     parameterReg: false,
     authMode: 0,
+    lpSec: 0,
+    ltmOff: 0,
+    daylt: 0,
   };
 }
 
@@ -11569,6 +11643,15 @@ export const OverheadConfig: MessageFns<OverheadConfig> = {
     }
     if (message.authMode !== 0) {
       writer.uint32(104).uint32(message.authMode);
+    }
+    if (message.lpSec !== 0) {
+      writer.uint32(112).uint32(message.lpSec);
+    }
+    if (message.ltmOff !== 0) {
+      writer.uint32(120).int32(message.ltmOff);
+    }
+    if (message.daylt !== 0) {
+      writer.uint32(128).uint32(message.daylt);
     }
     return writer;
   },
@@ -11684,6 +11767,30 @@ export const OverheadConfig: MessageFns<OverheadConfig> = {
           message.authMode = reader.uint32();
           continue;
         }
+        case 14: {
+          if (tag !== 112) {
+            break;
+          }
+
+          message.lpSec = reader.uint32();
+          continue;
+        }
+        case 15: {
+          if (tag !== 120) {
+            break;
+          }
+
+          message.ltmOff = reader.int32();
+          continue;
+        }
+        case 16: {
+          if (tag !== 128) {
+            break;
+          }
+
+          message.daylt = reader.uint32();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -11752,6 +11859,17 @@ export const OverheadConfig: MessageFns<OverheadConfig> = {
         : isSet(object.auth_mode)
         ? globalThis.Number(object.auth_mode)
         : 0,
+      lpSec: isSet(object.lpSec)
+        ? globalThis.Number(object.lpSec)
+        : isSet(object.lp_sec)
+        ? globalThis.Number(object.lp_sec)
+        : 0,
+      ltmOff: isSet(object.ltmOff)
+        ? globalThis.Number(object.ltmOff)
+        : isSet(object.ltm_off)
+        ? globalThis.Number(object.ltm_off)
+        : 0,
+      daylt: isSet(object.daylt) ? globalThis.Number(object.daylt) : 0,
     };
   },
 
@@ -11796,6 +11914,15 @@ export const OverheadConfig: MessageFns<OverheadConfig> = {
     if (message.authMode !== 0) {
       obj.authMode = Math.round(message.authMode);
     }
+    if (message.lpSec !== 0) {
+      obj.lpSec = Math.round(message.lpSec);
+    }
+    if (message.ltmOff !== 0) {
+      obj.ltmOff = Math.round(message.ltmOff);
+    }
+    if (message.daylt !== 0) {
+      obj.daylt = Math.round(message.daylt);
+    }
     return obj;
   },
 
@@ -11817,6 +11944,237 @@ export const OverheadConfig: MessageFns<OverheadConfig> = {
     message.powerUpReg = object.powerUpReg ?? false;
     message.parameterReg = object.parameterReg ?? false;
     message.authMode = object.authMode ?? 0;
+    message.lpSec = object.lpSec ?? 0;
+    message.ltmOff = object.ltmOff ?? 0;
+    message.daylt = object.daylt ?? 0;
+    return message;
+  },
+};
+
+function createBaseTimezoneConfig(): TimezoneConfig {
+  return { source: "", tz: undefined };
+}
+
+export const TimezoneConfig: MessageFns<TimezoneConfig> = {
+  encode(message: TimezoneConfig, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.source !== "") {
+      writer.uint32(10).string(message.source);
+    }
+    if (message.tz !== undefined) {
+      writer.uint32(18).string(message.tz);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): TimezoneConfig {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseTimezoneConfig();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.source = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.tz = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): TimezoneConfig {
+    return {
+      source: isSet(object.source) ? globalThis.String(object.source) : "",
+      tz: isSet(object.tz) ? globalThis.String(object.tz) : undefined,
+    };
+  },
+
+  toJSON(message: TimezoneConfig): unknown {
+    const obj: any = {};
+    if (message.source !== "") {
+      obj.source = message.source;
+    }
+    if (message.tz !== undefined) {
+      obj.tz = message.tz;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<TimezoneConfig>): TimezoneConfig {
+    return TimezoneConfig.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<TimezoneConfig>): TimezoneConfig {
+    const message = createBaseTimezoneConfig();
+    message.source = object.source ?? "";
+    message.tz = object.tz ?? undefined;
+    return message;
+  },
+};
+
+function createBaseTimezoneStatus(): TimezoneStatus {
+  return { source: "", tz: undefined, ltmOff: 0, daylt: 0, lpSec: 0, utcOffsetSeconds: 0 };
+}
+
+export const TimezoneStatus: MessageFns<TimezoneStatus> = {
+  encode(message: TimezoneStatus, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.source !== "") {
+      writer.uint32(10).string(message.source);
+    }
+    if (message.tz !== undefined) {
+      writer.uint32(18).string(message.tz);
+    }
+    if (message.ltmOff !== 0) {
+      writer.uint32(24).int32(message.ltmOff);
+    }
+    if (message.daylt !== 0) {
+      writer.uint32(32).uint32(message.daylt);
+    }
+    if (message.lpSec !== 0) {
+      writer.uint32(40).uint32(message.lpSec);
+    }
+    if (message.utcOffsetSeconds !== 0) {
+      writer.uint32(48).int32(message.utcOffsetSeconds);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): TimezoneStatus {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseTimezoneStatus();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.source = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.tz = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.ltmOff = reader.int32();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.daylt = reader.uint32();
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.lpSec = reader.uint32();
+          continue;
+        }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.utcOffsetSeconds = reader.int32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): TimezoneStatus {
+    return {
+      source: isSet(object.source) ? globalThis.String(object.source) : "",
+      tz: isSet(object.tz) ? globalThis.String(object.tz) : undefined,
+      ltmOff: isSet(object.ltmOff)
+        ? globalThis.Number(object.ltmOff)
+        : isSet(object.ltm_off)
+        ? globalThis.Number(object.ltm_off)
+        : 0,
+      daylt: isSet(object.daylt) ? globalThis.Number(object.daylt) : 0,
+      lpSec: isSet(object.lpSec)
+        ? globalThis.Number(object.lpSec)
+        : isSet(object.lp_sec)
+        ? globalThis.Number(object.lp_sec)
+        : 0,
+      utcOffsetSeconds: isSet(object.utcOffsetSeconds)
+        ? globalThis.Number(object.utcOffsetSeconds)
+        : isSet(object.utc_offset_seconds)
+        ? globalThis.Number(object.utc_offset_seconds)
+        : 0,
+    };
+  },
+
+  toJSON(message: TimezoneStatus): unknown {
+    const obj: any = {};
+    if (message.source !== "") {
+      obj.source = message.source;
+    }
+    if (message.tz !== undefined) {
+      obj.tz = message.tz;
+    }
+    if (message.ltmOff !== 0) {
+      obj.ltmOff = Math.round(message.ltmOff);
+    }
+    if (message.daylt !== 0) {
+      obj.daylt = Math.round(message.daylt);
+    }
+    if (message.lpSec !== 0) {
+      obj.lpSec = Math.round(message.lpSec);
+    }
+    if (message.utcOffsetSeconds !== 0) {
+      obj.utcOffsetSeconds = Math.round(message.utcOffsetSeconds);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<TimezoneStatus>): TimezoneStatus {
+    return TimezoneStatus.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<TimezoneStatus>): TimezoneStatus {
+    const message = createBaseTimezoneStatus();
+    message.source = object.source ?? "";
+    message.tz = object.tz ?? undefined;
+    message.ltmOff = object.ltmOff ?? 0;
+    message.daylt = object.daylt ?? 0;
+    message.lpSec = object.lpSec ?? 0;
+    message.utcOffsetSeconds = object.utcOffsetSeconds ?? 0;
     return message;
   },
 };

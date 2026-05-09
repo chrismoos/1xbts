@@ -275,6 +275,7 @@ async fn main() -> Result<(), Error> {
     let bsc_parts = cdma_bsc::bsc::build_bsc_launch_parts(cdma_bsc::bsc::BscLaunchInputs {
         pilot_offset: bts_config.pilot_offset,
         overhead: overhead_params,
+        timezone: bts_config.timezone.clone(),
         paging: paging_settings.clone(),
         traffic_assignment: bsc_config.traffic_assignment.clone(),
         traffic_retry: bsc_config.traffic_retry.clone(),
