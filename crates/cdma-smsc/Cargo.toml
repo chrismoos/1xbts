@@ -9,6 +9,7 @@ homepage.workspace = true
 description = "PostgreSQL-backed SMSC service and repository for 1xBTS."
 
 [dependencies]
+cdma-common = { path = "../cdma-common" }
 tokio = { version = "1", features = ["full"] }
 tonic = "0.13"
 prost = "0.13"

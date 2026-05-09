@@ -1,6 +1,6 @@
 //! HLR node configuration (loaded from `config/hlr.json`).
 
-use std::{fs, net::SocketAddr, path::Path};
+use std::{net::SocketAddr, path::Path};
 
 use serde::{Deserialize, Serialize};
 
@@ -17,8 +17,8 @@ pub struct HlrNodeConfig {
 impl HlrNodeConfig {
     /// Load an `HlrNodeConfig` from a JSON file.
     pub fn load_from_path(path: &Path) -> Result<Self, std::io::Error> {
-        let raw = fs::read_to_string(path)?;
-        serde_json::from_str(&raw)
+        let merged = cdma_common::config_load::load_json_with_local_override(path)?;
+        serde_json::from_value(merged)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 }

@@ -1,12 +1,11 @@
 //! BTS node configuration.
 //!
-//! `BtsNodeConfig` is loaded from `config/bts.json` (see
-//! `docs/architecture-update/06-config-split-plan.md`). This is the
+//! `BtsNodeConfig` is loaded from `config/bts.json`. This is the
 //! standalone BTS-side configuration — it carries radio hardware setup,
 //! BTS runtime settings, and the BTS-owned half of the Abis timers
 //! (A.S0003-A §8 Table 8-1).
 
-use std::{fs, path::Path};
+use std::path::Path;
 
 use std::net::SocketAddr;
 
@@ -506,8 +505,8 @@ impl BtsNodeConfig {
     /// `radio_config_path` (relative paths resolve against the parent of
     /// `path`); specifying both is an error.
     pub fn load_from_path(path: &Path) -> Result<Self, Error> {
-        let raw = fs::read_to_string(path)?;
-        let source: BtsNodeConfigFile = serde_json::from_str(&raw)?;
+        let merged = cdma_common::config_load::load_json_with_local_override(path)?;
+        let source: BtsNodeConfigFile = serde_json::from_value(merged)?;
         let radio = match (source.radio, source.radio_config_path.as_deref()) {
             (Some(_), Some(_)) => {
                 return Err("config must specify only one of radio or radio_config_path".into());
@@ -545,8 +544,8 @@ impl BtsNodeConfig {
 /// fields). Used by the CLI to override the radio section without rewriting
 /// `bts.json`.
 pub fn load_radio_from_path(path: &Path) -> Result<RadioConfig, Error> {
-    let raw = fs::read_to_string(path)?;
-    let radio: RadioConfig = serde_json::from_str(&raw)?;
+    let merged = cdma_common::config_load::load_json_with_local_override(path)?;
+    let radio: RadioConfig = serde_json::from_value(merged)?;
     Ok(radio)
 }
 

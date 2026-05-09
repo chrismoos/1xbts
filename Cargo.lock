@@ -460,6 +460,7 @@ dependencies = [
  "log",
  "num-complex 0.4.6",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -557,6 +558,7 @@ dependencies = [
  "cdma-a11",
  "cdma-a8",
  "cdma-a9",
+ "cdma-common",
  "serde",
  "serde_json",
 ]
@@ -567,6 +569,7 @@ version = "0.1.0"
 dependencies = [
  "cdma-a10",
  "cdma-a11",
+ "cdma-common",
  "cdma-packet",
  "log",
  "serde",
@@ -580,6 +583,7 @@ name = "cdma-smsc"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "cdma-common",
  "chrono",
  "log",
  "prost",
@@ -607,6 +611,7 @@ name = "cdma-voice-gw"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "cdma-common",
  "cdma-voice",
  "clap",
  "env_logger",

@@ -13,8 +13,6 @@ test/capture/*
 .claude/
 .worktrees
 config/*.local.json
-config/*.private.json
-config/*.secret.json
 .env
 .env.*
 !.env.example

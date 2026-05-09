@@ -1,14 +1,12 @@
 //! BSC node configuration and management plane configuration.
 //!
-//! Loaded from `config/bsc.json` and `config/management.json` per
-//! `docs/architecture-update/06-config-split-plan.md`.
+//! Loaded from `config/bsc.json` and `config/management.json`.
 //!
 //! Voice/circuit policy now lives in `cdma-msc::config`; BSC runtime code
 //! imports the MSC-owned policy types directly where radio execution needs
 //! them.
 
 use std::{
-    fs,
     net::{Ipv4Addr, SocketAddr},
     path::Path,
     path::PathBuf,
@@ -21,7 +19,6 @@ use cdma_common::error::Error;
 use serde::{Deserialize, Serialize};
 
 // Default per-node config filenames within the configured config directory.
-// See `docs/architecture-update/06-config-split-plan.md`.
 
 /// Filename of the standalone BTS node config inside the config directory.
 pub const BTS_CONFIG_FILENAME: &str = "bts.json";
@@ -376,8 +373,8 @@ fn default_mobile_idle_timeout_s() -> u64 {
 impl BscNodeConfig {
     /// Load and validate a `BscNodeConfig` from a JSON file.
     pub fn load_from_path(path: &Path) -> Result<Self, Error> {
-        let raw = fs::read_to_string(path)?;
-        let cfg: Self = serde_json::from_str(&raw)?;
+        let merged = cdma_common::config_load::load_json_with_local_override(path)?;
+        let cfg: Self = serde_json::from_value(merged)?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -441,8 +438,8 @@ impl ManagementConfig {
     /// Load a `ManagementConfig` from a JSON file. Missing fields fall
     /// back to defaults (no mTLS, plaintext server, console disabled).
     pub fn load_from_path(path: &Path) -> Result<Self, Error> {
-        let raw = fs::read_to_string(path)?;
-        let cfg: Self = serde_json::from_str(&raw)?;
+        let merged = cdma_common::config_load::load_json_with_local_override(path)?;
+        let cfg: Self = serde_json::from_value(merged)?;
         Ok(cfg)
     }
 }

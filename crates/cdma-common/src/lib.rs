@@ -1,6 +1,7 @@
 pub mod access;
 pub mod bits;
 pub mod channel;
+pub mod config_load;
 pub mod consts;
 pub mod crc;
 pub mod diagnostics;

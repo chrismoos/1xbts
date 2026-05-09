@@ -10,6 +10,7 @@ description = "PDSN session and packet-data gateway support for 1xBTS."
 
 [dependencies]
 cdma-a10 = { path = "../cdma-a10" }
+cdma-common = { path = "../cdma-common" }
 cdma-a11 = { path = "../cdma-a11" }
 cdma-packet = { path = "../cdma-packet" }
 log = "0.4"

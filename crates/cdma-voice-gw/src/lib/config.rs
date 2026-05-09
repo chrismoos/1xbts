@@ -1,6 +1,6 @@
+use std::error::Error;
 use std::fmt;
 use std::path::Path;
-use std::{error::Error, fs};
 
 use serde::{Deserialize, Serialize};
 
@@ -20,8 +20,8 @@ pub struct VoiceGatewayConfig {
 
 impl VoiceGatewayConfig {
     pub fn load_from_path(path: &Path) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let raw = fs::read_to_string(path)?;
-        let config = serde_json::from_str(&raw)?;
+        let merged = cdma_common::config_load::load_json_with_local_override(path)?;
+        let config = serde_json::from_value(merged)?;
         Self::validate(&config)?;
         Ok(config)
     }
@@ -596,6 +596,7 @@ fn validate_host_port(field: &str, value: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_config_path(name: &str) -> std::path::PathBuf {
@@ -863,7 +864,7 @@ mod tests {
     #[test]
     fn example_config_file_loads() {
         let config: VoiceGatewayConfig =
-            serde_json::from_str(include_str!("../../../../config/voice-gw.example.json"))
+            serde_json::from_str(include_str!("../../../../config/voice-gw.json"))
                 .expect("example voice gateway config should parse");
 
         assert_eq!(config.grpc.listen_addr, "127.0.0.1:17015");

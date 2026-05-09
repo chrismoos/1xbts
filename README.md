@@ -146,6 +146,11 @@ cargo run --release -p cdma-nib --no-default-features --features bladerf-backend
 Default service ports are listed in `docs/PORTS.md`. If port 3000 is already in
 use, set `ONEXBTS_WEB_PORT`, for example `ONEXBTS_WEB_PORT=3001 docker compose up 1xbts-web`.
 
+To customize a config without editing the checked-in defaults, drop a sibling
+`<name>.local.json` next to it (e.g. `config/bts.local.json`). The loader
+deep-merges the local file on top of the base before validation. `*.local.json`
+is gitignored. See the [Configuration guide](https://1xbts.org/docs/getting-started/configuration/#local-overrides).
+
 ### SDR Backend Features
 
 Enable exactly one SDR backend at build time:

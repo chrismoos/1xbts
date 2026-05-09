@@ -4,7 +4,6 @@
 //! sources that policy from `bsc.json`.
 
 use std::{
-    fs,
     net::{Ipv4Addr, SocketAddr},
     path::Path,
 };
@@ -371,8 +370,8 @@ pub struct MscNodeConfig {
 impl MscNodeConfig {
     /// Load and validate an `MscNodeConfig` from a JSON file.
     pub fn load_from_path(path: &Path) -> Result<Self, std::io::Error> {
-        let raw = fs::read_to_string(path)?;
-        let cfg: Self = serde_json::from_str(&raw)
+        let merged = cdma_common::config_load::load_json_with_local_override(path)?;
+        let cfg: Self = serde_json::from_value(merged)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         cfg.validate()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;

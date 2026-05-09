@@ -10,6 +10,7 @@ description = "SIP/media voice gateway for 1xBTS."
 
 [dependencies]
 async-trait = "0.1"
+cdma-common = { path = "../cdma-common" }
 cdma-voice = { path = "../cdma-voice" }
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"

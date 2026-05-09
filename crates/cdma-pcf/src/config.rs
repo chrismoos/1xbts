@@ -2,7 +2,7 @@
 //!
 //! Empty in WS-0 PR1; fields land alongside the A9/A8 implementation.
 
-use std::{fs, path::Path};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -33,8 +33,8 @@ impl PcfNodeConfig {
     /// Load a `PcfNodeConfig` from a JSON file. An empty object (`{}`)
     /// is the typical PR1 content.
     pub fn load_from_path(path: &Path) -> Result<Self, std::io::Error> {
-        let raw = fs::read_to_string(path)?;
-        serde_json::from_str(&raw)
+        let merged = cdma_common::config_load::load_json_with_local_override(path)?;
+        serde_json::from_value(merged)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 }

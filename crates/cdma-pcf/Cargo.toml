@@ -10,6 +10,7 @@ description = "PCF session and packet-data control support for 1xBTS."
 
 [dependencies]
 cdma-a8 = { path = "../cdma-a8" }
+cdma-common = { path = "../cdma-common" }
 cdma-a9 = { path = "../cdma-a9" }
 cdma-a10 = { path = "../cdma-a10" }
 cdma-a11 = { path = "../cdma-a11" }
