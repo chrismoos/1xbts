@@ -208,9 +208,12 @@ pub fn imsi_11_12_to_digits(encoded_imsi_11_12: u8) -> Option<String> {
         return None;
     }
 
+    // Spec: encoded = 10 * N(P11) + N(P12) - 11, where N(0) = 10 and
+    // N(d) = d for d in 1..=9. Inverse: with s = encoded + 11,
+    // N(P12) is the low component (1..=10) and N(P11) is the high component.
     let s = encoded_imsi_11_12 as u16 + 11;
-    let d12 = (s - 1) / 10;
-    let d11 = s - 10 * d12;
+    let n_p12 = ((s - 1) % 10) + 1;
+    let n_p11 = (s - n_p12) / 10;
 
     let to_digit = |v: u16| -> Option<u8> {
         match v {
@@ -220,7 +223,7 @@ pub fn imsi_11_12_to_digits(encoded_imsi_11_12: u8) -> Option<String> {
         }
     };
 
-    Some(format!("{}{}", to_digit(d11)?, to_digit(d12)?))
+    Some(format!("{}{}", to_digit(n_p11)?, to_digit(n_p12)?))
 }
 
 /// Reverse-derive a 10-digit IMSI_S decimal string from IMSI_M_S1_p (24 bits)
@@ -472,11 +475,35 @@ mod tests {
 
     #[test]
     fn test_imsi_11_12_to_digits_spec_encoding() {
-        // Digits 26: 10*D12 + D11 - 11 = 10*6 + 2 - 11 = 51.
-        assert_eq!(imsi_11_12_to_digits(51).as_deref(), Some("26"));
-        // Digits 00: 10*10 + 10 - 11 = 99.
+        // Digits "26" (P11=2, P12=6): 10*N(P11) + N(P12) - 11 = 10*2 + 6 - 11 = 15.
+        assert_eq!(imsi_11_12_to_digits(15).as_deref(), Some("26"));
+        // Digits "62" (P11=6, P12=2): 10*6 + 2 - 11 = 51.
+        assert_eq!(imsi_11_12_to_digits(51).as_deref(), Some("62"));
+        // Digits "00": 10*10 + 10 - 11 = 99.
         assert_eq!(imsi_11_12_to_digits(99).as_deref(), Some("00"));
+        // Digits "10" (P11=1, P12=0 → N(P12)=10): 10*1 + 10 - 11 = 9.
+        assert_eq!(imsi_11_12_to_digits(9).as_deref(), Some("10"));
+        // Digits "01" (P11=0, P12=1 → N(P11)=10): 10*10 + 1 - 11 = 90.
+        assert_eq!(imsi_11_12_to_digits(90).as_deref(), Some("01"));
         assert_eq!(imsi_11_12_to_digits(0x7f), None);
+    }
+
+    /// Asymmetric digit pairs (P11 != P12) must round-trip exactly. The
+    /// previous decoder swapped the two output digits so this passed only
+    /// for symmetric pairs like "00", "55", "99".
+    #[test]
+    fn imsi_11_12_round_trips_for_all_valid_pairs() {
+        for d11 in 0u8..=9 {
+            for d12 in 0u8..=9 {
+                let s = format!("{d11}{d12}");
+                let encoded = imsi_11_12_from_digits(&s).expect("valid 2-digit");
+                let decoded = imsi_11_12_to_digits(encoded).expect("valid raw");
+                assert_eq!(
+                    decoded, s,
+                    "round-trip failed for digits=\"{s}\" raw={encoded}"
+                );
+            }
+        }
     }
 
     #[test]
