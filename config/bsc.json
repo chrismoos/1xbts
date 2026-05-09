@@ -5,7 +5,8 @@
     "preferred_pairs": [
       { "for_rc": 3, "rev_rc": 3 }
     ],
-    "idle_timeout_s": 30
+    "idle_timeout_s": 30,
+    "ms_ack_timeout_ms": 5000
   },
   "traffic_retry": {
     "ack_timeout_ms": 3000,

@@ -114,6 +114,14 @@ pub(crate) enum VoicePollAction {
     },
 }
 
+pub(crate) enum TrafficChannelAction {
+    None,
+    Teardown {
+        reason: &'static str,
+        timeout_ms: u64,
+    },
+}
+
 pub(crate) fn traffic_channel_power_snapshot(
     tc: &TrafficChannelInfo,
 ) -> TrafficChannelPowerSnapshot {
@@ -400,6 +408,34 @@ impl TrafficChannelInfo {
             .unwrap_or(self.last_activity_at)
     }
 
+    pub(crate) fn traffic_lifecycle_action(
+        &self,
+        ms_ack_timeout: Duration,
+        now: Instant,
+    ) -> TrafficChannelAction {
+        match self.channel_state {
+            ChannelState::WaitingMsAck { bs_ack_sent_at }
+                if now.duration_since(bs_ack_sent_at) >= ms_ack_timeout =>
+            {
+                TrafficChannelAction::Teardown {
+                    reason: "MS Ack timeout",
+                    timeout_ms: ms_ack_timeout.as_millis() as u64,
+                }
+            }
+            _ => TrafficChannelAction::None,
+        }
+    }
+
+    pub(crate) fn next_traffic_lifecycle_deadline(
+        &self,
+        ms_ack_timeout: Duration,
+    ) -> Option<Instant> {
+        match self.channel_state {
+            ChannelState::WaitingMsAck { bs_ack_sent_at } => Some(bs_ack_sent_at + ms_ack_timeout),
+            _ => None,
+        }
+    }
+
     pub(crate) fn voice_poll_action(
         &self,
         service_connect_timeout: Duration,
@@ -411,14 +447,6 @@ impl TrafficChannelInfo {
             {
                 VoicePollAction::Teardown {
                     reason: "voice assignment timeout",
-                    timeout_ms: service_connect_timeout.as_millis() as u64,
-                }
-            }
-            ChannelState::WaitingMsAck { bs_ack_sent_at, .. }
-                if bs_ack_sent_at.elapsed() >= service_connect_timeout =>
-            {
-                VoicePollAction::Teardown {
-                    reason: "MS Ack timeout",
                     timeout_ms: service_connect_timeout.as_millis() as u64,
                 }
             }
@@ -452,9 +480,6 @@ impl TrafficChannelInfo {
     ) -> Option<Instant> {
         match self.channel_state {
             ChannelState::Assigned { assigned_at } => Some(assigned_at + service_connect_timeout),
-            ChannelState::WaitingMsAck { bs_ack_sent_at, .. } => {
-                Some(bs_ack_sent_at + service_connect_timeout)
-            }
             ChannelState::ServiceConnecting { sc_sent_at } => {
                 Some(sc_sent_at + service_connect_timeout)
             }

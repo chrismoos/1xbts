@@ -1612,6 +1612,7 @@ fn traffic_assignment_policy_can_force_rc3_only() {
         supported_rev_rcs: vec![3],
         preferred_pairs: vec![crate::config::RcPairConfig::new(3, 3)],
         idle_timeout_s: TrafficAssignmentConfig::default().idle_timeout_s,
+        ms_ack_timeout_ms: TrafficAssignmentConfig::default().ms_ack_timeout_ms,
         rev_fch_gating_mode: false,
     };
 
@@ -2055,6 +2056,76 @@ async fn pmrm_ack_of_bs_ack_advances_waiting_ms_ack() {
             .as_ref()
             .is_some_and(|tc| matches!(tc.channel_state, ChannelState::ServiceConnecting { .. })),
         "matching ACK_SEQ should move WaitingMsAck into ServiceConnecting"
+    );
+}
+
+#[tokio::test]
+async fn waiting_ms_ack_timeout_tears_down_voice_traffic_channel() {
+    let (mut bsc, _traffic_rx, _walsh_code) = test_bsc_with_active_traffic_channel(3).await;
+
+    let tc = bsc.mobiles[0].traffic_channel.as_mut().unwrap();
+    tc.channel_state = ChannelState::WaitingMsAck {
+        bs_ack_sent_at: Instant::now() - Duration::from_millis(5001),
+    };
+
+    bsc.poll_traffic_channel_lifecycle(Duration::from_millis(5000))
+        .await;
+
+    assert!(
+        bsc.mobiles[0].traffic_channel.is_none(),
+        "voice traffic channel should be torn down after generic MS Ack timeout"
+    );
+}
+
+#[tokio::test]
+async fn waiting_ms_ack_timeout_tears_down_packet_traffic_channel() {
+    let (mut bsc, _traffic_rx, _walsh_code) = test_bsc_with_active_traffic_channel(33).await;
+
+    let tc = bsc.mobiles[0].traffic_channel.as_mut().unwrap();
+    tc.channel_state = ChannelState::WaitingMsAck {
+        bs_ack_sent_at: Instant::now() - Duration::from_millis(5001),
+    };
+
+    bsc.poll_traffic_channel_lifecycle(Duration::from_millis(5000))
+        .await;
+
+    assert!(
+        bsc.mobiles[0].traffic_channel.is_none(),
+        "packet traffic channel should be torn down after generic MS Ack timeout"
+    );
+}
+
+#[tokio::test]
+async fn waiting_ms_ack_lifecycle_does_not_teardown_before_timeout() {
+    let (mut bsc, _traffic_rx, _walsh_code) = test_bsc_with_active_traffic_channel(33).await;
+
+    let tc = bsc.mobiles[0].traffic_channel.as_mut().unwrap();
+    tc.channel_state = ChannelState::WaitingMsAck {
+        bs_ack_sent_at: Instant::now() - Duration::from_millis(4999),
+    };
+
+    bsc.poll_traffic_channel_lifecycle(Duration::from_millis(5000))
+        .await;
+
+    assert!(
+        bsc.mobiles[0].traffic_channel.is_some(),
+        "traffic channel should remain before generic MS Ack timeout"
+    );
+}
+
+#[tokio::test]
+async fn traffic_lifecycle_ignores_channels_after_waiting_ms_ack() {
+    let (mut bsc, _traffic_rx, _walsh_code) = test_bsc_with_active_traffic_channel(33).await;
+
+    let tc = bsc.mobiles[0].traffic_channel.as_mut().unwrap();
+    tc.channel_state = ChannelState::Active;
+
+    bsc.poll_traffic_channel_lifecycle(Duration::from_millis(5000))
+        .await;
+
+    assert!(
+        bsc.mobiles[0].traffic_channel.is_some(),
+        "active traffic channel should not be handled by generic MS Ack timeout"
     );
 }
 
@@ -2569,6 +2640,7 @@ async fn legacy_origination_fails_before_cam_when_selected_rc_is_not_rc1() {
             supported_rev_rcs: vec![3],
             preferred_pairs: vec![crate::config::RcPairConfig::new(3, 3)],
             idle_timeout_s: TrafficAssignmentConfig::default().idle_timeout_s,
+            ms_ack_timeout_ms: TrafficAssignmentConfig::default().ms_ack_timeout_ms,
             rev_fch_gating_mode: false,
         },
         access_event_rx: None,
@@ -2717,6 +2789,7 @@ async fn origination_can_prefer_rc3_when_policy_requests_it() {
             supported_rev_rcs: vec![1, 3],
             preferred_pairs: vec![crate::config::RcPairConfig::new(3, 3)],
             idle_timeout_s: TrafficAssignmentConfig::default().idle_timeout_s,
+            ms_ack_timeout_ms: TrafficAssignmentConfig::default().ms_ack_timeout_ms,
             rev_fch_gating_mode: false,
         },
         access_event_rx: None,

@@ -1,9 +1,9 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cdma_common::error::Error;
 use log::{debug, info, warn};
 
-use super::{A1ClearState, Bsc, recv_or_pending, recv_unbounded_or_pending};
+use super::{A1ClearState, Bsc, TrafficChannelAction, recv_or_pending, recv_unbounded_or_pending};
 
 impl Bsc {
     pub async fn run(mut self) -> Result<(), Error> {
@@ -16,6 +16,8 @@ impl Bsc {
         let mut power_override_rx = self.config.power_override_request_rx.take();
         let msc_client = self.config.msc_client.clone();
         let traffic_timeout = Duration::from_secs(self.config.traffic_assignment.idle_timeout_s);
+        let ms_ack_timeout =
+            Duration::from_millis(self.config.traffic_assignment.ms_ack_timeout_ms);
         let mut stale_channel_interval = tokio::time::interval(Duration::from_secs(1));
         let mut bearer_poll_interval = tokio::time::interval(Duration::from_millis(20));
 
@@ -37,6 +39,14 @@ impl Bsc {
             let voice_poll_deadline = self.next_voice_poll_deadline();
             let voice_poll_sleep = async {
                 match voice_poll_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+
+            let traffic_lifecycle_deadline = self.next_traffic_lifecycle_deadline(ms_ack_timeout);
+            let traffic_lifecycle_sleep = async {
+                match traffic_lifecycle_deadline {
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
                     None => std::future::pending().await,
                 }
@@ -83,6 +93,9 @@ impl Bsc {
                 _ = voice_poll_sleep => {
                     self.poll_voice_calls().await;
                 }
+                _ = traffic_lifecycle_sleep => {
+                    self.poll_traffic_channel_lifecycle(ms_ack_timeout).await;
+                }
                 _ = stale_channel_interval.tick() => {
                     self.drain_pch_transfer_acks();
                     self.teardown_stale_traffic_channels(traffic_timeout).await;
@@ -93,6 +106,50 @@ impl Bsc {
                     self.apply_rx_measurements();
                 }
             }
+        }
+    }
+
+    pub(crate) fn next_traffic_lifecycle_deadline(
+        &self,
+        ms_ack_timeout: Duration,
+    ) -> Option<tokio::time::Instant> {
+        self.mobiles
+            .iter()
+            .filter_map(|ms| {
+                ms.traffic_channel()
+                    .and_then(|tc| tc.next_traffic_lifecycle_deadline(ms_ack_timeout))
+            })
+            .min()
+            .map(tokio::time::Instant::from_std)
+    }
+
+    pub(crate) async fn poll_traffic_channel_lifecycle(&mut self, ms_ack_timeout: Duration) {
+        let now = Instant::now();
+        let actions: Vec<_> = self
+            .mobiles
+            .iter()
+            .filter_map(|ms| {
+                let tc = ms.traffic_channel()?;
+                match tc.traffic_lifecycle_action(ms_ack_timeout, now) {
+                    TrafficChannelAction::Teardown { reason, timeout_ms } => Some((
+                        tc.walsh_code,
+                        tc.voice_session_id,
+                        tc.voice_leg_role,
+                        reason,
+                        timeout_ms,
+                    )),
+                    TrafficChannelAction::None => None,
+                }
+            })
+            .collect();
+
+        for (walsh_code, voice_session_id, voice_leg_role, reason, timeout_ms) in actions {
+            warn!(
+                "BSC: {} on walsh={} ({}ms), tearing down",
+                reason, walsh_code, timeout_ms
+            );
+            self.teardown_traffic_channel(walsh_code).await;
+            self.on_voice_leg_released(voice_session_id, voice_leg_role);
         }
     }
 

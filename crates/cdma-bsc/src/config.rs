@@ -133,6 +133,10 @@ pub struct TrafficAssignmentConfig {
     /// voice calls stuck in setup. Default: 30 seconds.
     #[serde(default = "default_traffic_idle_timeout_s")]
     pub idle_timeout_s: u64,
+    /// Tear down a traffic channel if the MS does not acknowledge the BS Ack
+    /// Order sent after reverse preamble detection. Default: 5 seconds.
+    #[serde(default = "default_ms_ack_timeout_ms")]
+    pub ms_ack_timeout_ms: u64,
     /// Per C.S0002-E §2.1.3.12.7: when true and RC3 rate is 1500 bps,
     /// the mobile only transmits R-FCH on PCGs {2,3,6,7,10,11,14,15}.
     /// Sent in the ECAM as REV_FCH_GATING_MODE. Default: false (no gating).
@@ -147,6 +151,7 @@ impl Default for TrafficAssignmentConfig {
             supported_rev_rcs: vec![1, 3],
             preferred_pairs: vec![RcPairConfig::new(1, 1), RcPairConfig::new(3, 3)],
             idle_timeout_s: default_traffic_idle_timeout_s(),
+            ms_ack_timeout_ms: default_ms_ack_timeout_ms(),
             rev_fch_gating_mode: false,
         }
     }
@@ -154,6 +159,10 @@ impl Default for TrafficAssignmentConfig {
 
 fn default_traffic_idle_timeout_s() -> u64 {
     30
+}
+
+fn default_ms_ack_timeout_ms() -> u64 {
+    5000
 }
 
 fn default_traffic_ack_timeout_ms() -> u64 {
