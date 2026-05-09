@@ -24,7 +24,7 @@
     "ext_cdma_freq": 384
   },
   "timezone": {
-    "source": "overhead"
+    "source": "system"
   },
   "runtime": {
     "spreading_rate": "sr1",
