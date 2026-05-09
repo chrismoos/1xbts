@@ -581,6 +581,13 @@ impl MscRuntime {
                     );
                 }
                 self.flush_deferred_paging_response(a1, call_id).await;
+                if completed_leg == Some(MscVoiceLeg::Primary)
+                    && self.controller.snapshot(call_id).is_some_and(|snapshot| {
+                        snapshot.direction == CallDirection::MobileOriginated
+                    })
+                {
+                    self.flush_deferred_paging_request(a1, call_id).await;
+                }
             }
             cdma_ios::MessageType::Connect => {
                 let connect = match cdma_ios::ConnectMessage::decode(&decoded.payload) {
@@ -729,7 +736,6 @@ impl MscRuntime {
                 let subscriber_route = if let Some(called_number) = called_number.as_deref() {
                     self.mo_call
                         .send_mo_mobile_to_mobile_page(
-                            a1,
                             call_id,
                             called_number,
                             service_option,
@@ -1044,6 +1050,43 @@ impl MscRuntime {
             .await;
     }
 
+    /// Send the MO M2M PagingRequest that was held until the primary leg's
+    /// AssignmentComplete arrived. The callee is paged at this point — never
+    /// before, so a callee PagingResponse cannot race the MO leg's setup.
+    async fn flush_deferred_paging_request(&mut self, a1: &dyn MscA1Endpoint, call_id: CallId) {
+        let Some(paging_request) = self.circuits.take_deferred_paging_request(call_id) else {
+            return;
+        };
+        let payload = match paging_request.encode() {
+            Ok(payload) => payload,
+            Err(error) => {
+                warn!(
+                    "MSC: failed to encode deferred MO M2M Paging Request call_id={}: {}",
+                    call_id.0, error
+                );
+                self.circuits.paging_requests.remove(&call_id);
+                return;
+            }
+        };
+        info!(
+            "MSC: A1 tx PagingRequest for MO M2M call_id={} (deferred until primary AssignmentComplete)",
+            call_id.0
+        );
+        if let Err(error) = a1
+            .send_to_bsc(EncodedA1Message::from_message_for_call(
+                &cdma_ios::Message::new(cdma_ios::MessageType::PagingRequest, payload),
+                Some(call_id.0),
+            ))
+            .await
+        {
+            warn!(
+                "MSC: failed to send deferred MO M2M Paging Request call_id={}: {}",
+                call_id.0, error
+            );
+            self.circuits.paging_requests.remove(&call_id);
+        }
+    }
+
     fn stop_media_for_call(&mut self, call_id: CallId) {
         self.mo_call.cleanup_call(call_id);
         stop_media_for_call(
@@ -1340,6 +1383,24 @@ mod tests {
 
     struct StubHlrRepo;
 
+    /// HLR stub that resolves a single phone number to a Registered subscriber
+    /// with one primary IMSI, used to drive the MO M2M paging path.
+    struct M2mHlrRepo {
+        phone_number: &'static str,
+        subscriber_id: uuid::Uuid,
+        imsi: &'static str,
+    }
+
+    impl M2mHlrRepo {
+        fn new() -> Self {
+            Self {
+                phone_number: "5559876543",
+                subscriber_id: uuid::Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888),
+                imsi: "111111111111111",
+            }
+        }
+    }
+
     #[derive(Default)]
     struct StubMediaGateway {
         forwarded: std::sync::Mutex<Vec<(CallHandle, VocoderFrame)>>,
@@ -1537,6 +1598,134 @@ mod tests {
             _: uuid::Uuid,
         ) -> Result<Option<cdma_hlr::model::RegistrationBinding>, String> {
             unimplemented!()
+        }
+        async fn upsert_mobile_seen(
+            &self,
+            _: Option<u32>,
+            _: Option<&str>,
+            _: Option<u8>,
+        ) -> Result<cdma_hlr::MobileSeenUpsert, String> {
+            Ok(cdma_hlr::MobileSeenUpsert {
+                is_new: true,
+                previous_last_seen_at: None,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cdma_hlr::repository::HlrRepository for M2mHlrRepo {
+        async fn upsert_subscriber(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<cdma_hlr::model::Subscriber, String> {
+            unimplemented!()
+        }
+        async fn get_subscriber_by_phone_number(
+            &self,
+            phone_number: &str,
+        ) -> Result<Option<cdma_hlr::model::Subscriber>, String> {
+            if phone_number == self.phone_number {
+                Ok(Some(cdma_hlr::model::Subscriber {
+                    subscriber_id: self.subscriber_id,
+                    phone_number: self.phone_number.to_string(),
+                    display_name: "M2M Test".to_string(),
+                    status: cdma_hlr::model::SubscriberStatus::Active,
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+        async fn get_subscriber_by_id(
+            &self,
+            _: uuid::Uuid,
+        ) -> Result<Option<cdma_hlr::model::Subscriber>, String> {
+            unimplemented!()
+        }
+        async fn update_subscriber(
+            &self,
+            _: uuid::Uuid,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<cdma_hlr::model::Subscriber>, String> {
+            unimplemented!()
+        }
+        async fn list_subscribers(
+            &self,
+            _: u32,
+            _: u32,
+        ) -> Result<(Vec<cdma_hlr::model::Subscriber>, u32), String> {
+            unimplemented!()
+        }
+        async fn delete_subscriber(&self, _: uuid::Uuid) -> Result<bool, String> {
+            unimplemented!()
+        }
+        async fn upsert_identity(
+            &self,
+            _: uuid::Uuid,
+            _: Option<&str>,
+            _: Option<u32>,
+        ) -> Result<cdma_hlr::model::SubscriberIdentity, String> {
+            unimplemented!()
+        }
+        async fn replace_primary_identity(
+            &self,
+            _: uuid::Uuid,
+            _: Option<&str>,
+            _: Option<u32>,
+        ) -> Result<cdma_hlr::model::SubscriberIdentity, String> {
+            unimplemented!()
+        }
+        async fn get_identities_for_subscriber(
+            &self,
+            subscriber_id: uuid::Uuid,
+        ) -> Result<Vec<cdma_hlr::model::SubscriberIdentity>, String> {
+            assert_eq!(subscriber_id, self.subscriber_id);
+            Ok(vec![cdma_hlr::model::SubscriberIdentity {
+                subscriber_identity_id: uuid::Uuid::nil(),
+                subscriber_id,
+                imsi: Some(self.imsi.to_string()),
+                esn: None,
+                is_primary: true,
+                created_at: chrono::Utc::now(),
+            }])
+        }
+        async fn resolve_by_identity(
+            &self,
+            _: Option<u32>,
+            _: Option<&str>,
+        ) -> Result<Option<cdma_hlr::model::Subscriber>, String> {
+            Ok(None)
+        }
+        async fn upsert_registration_binding(
+            &self,
+            _: cdma_hlr::model::RegistrationBinding,
+        ) -> Result<cdma_hlr::model::RegistrationBinding, String> {
+            unimplemented!()
+        }
+        async fn get_registration_binding(
+            &self,
+            subscriber_id: uuid::Uuid,
+        ) -> Result<Option<cdma_hlr::model::RegistrationBinding>, String> {
+            assert_eq!(subscriber_id, self.subscriber_id);
+            Ok(Some(cdma_hlr::model::RegistrationBinding {
+                subscriber_id,
+                serving_node_id: "test".to_string(),
+                state: cdma_hlr::model::RegistrationState::Registered,
+                imsi: Some(self.imsi.to_string()),
+                esn: None,
+                mob_p_rev: Some(6),
+                pgslot: Some(0),
+                slot_cycle_index: Some(2),
+                last_msg_seq: None,
+                last_registered_at: chrono::Utc::now(),
+                last_seen_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            }))
         }
         async fn upsert_mobile_seen(
             &self,
@@ -1927,6 +2116,186 @@ mod tests {
             call_id: CallId(call_id),
             leg_role: MscVoiceLeg::Secondary,
         }));
+    }
+
+    /// MO M2M scenario: the secondary-leg PagingRequest must NOT be sent to
+    /// the BSC until the primary (MO) leg's AssignmentComplete arrives.
+    /// This prevents the callee from page-responding before the caller is on
+    /// traffic — the race that orphaned a deferred PagingResponse in the
+    /// trace investigated alongside this change.
+    #[tokio::test]
+    async fn mo_m2m_paging_request_deferred_until_primary_assignment_complete() {
+        let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(8);
+        let hlr = Arc::new(M2mHlrRepo::new());
+        let mut runtime = MscRuntime::new(MscRuntimeConfig {
+            hlr_repo: hlr.clone(),
+            smsc_repo: None,
+            welcome_sms: None,
+            sms_retry: crate::config::SmsRetryConfig::default(),
+            default_voice_service_option: 3,
+            wav_file: None,
+            gateway_fallback_to_wav: true,
+            local_answer_delay_ms: 10_000,
+            media_ringback_enabled: false,
+            media_ringback_type: MediaRingbackType::Nanp,
+            voice_bearer: None,
+            media_gateway: None,
+        });
+
+        // BCD encoding of "5559876543" with TON/NPI 0x81.
+        // Pairs are nibble-swapped: "55" -> 0x55, "59" -> 0x95, "87" -> 0x78,
+        // "65" -> 0x56, "43" -> 0x34. Trailing nibble 0xf would pad an odd
+        // count; the number has 10 digits so no pad.
+        let cli3 = cm_service_request_cli3(Some(vec![0x81, 0x55, 0x95, 0x78, 0x56, 0x34]));
+        let call_id = 4242;
+        let cli3_msg = EncodedA1Message::from_message_for_call(
+            &cdma_ios::Message::new(
+                cdma_ios::MessageType::CompleteLayer3Information,
+                cli3.encode().unwrap(),
+            ),
+            Some(call_id),
+        );
+        runtime.handle_bsc_a1_message(&endpoint, cli3_msg).await;
+
+        // Drain whatever the MSC sent for the MO leg setup. We expect to see
+        // an AssignmentRequest (one or more depending on the M2M flow), but
+        // *not* a PagingRequest — that's the message we're deferring.
+        let mut saw_assignment_request = false;
+        let mut assignment_circuit_id: Option<u16> = None;
+        loop {
+            match timeout(Duration::from_millis(50), client.poll_a1()).await {
+                Ok(Some(msg)) => {
+                    assert_ne!(
+                        msg.message_type(),
+                        cdma_ios::MessageType::PagingRequest,
+                        "PagingRequest must be deferred until primary AssignmentComplete"
+                    );
+                    if msg.message_type() == cdma_ios::MessageType::AssignmentRequest {
+                        saw_assignment_request = true;
+                        let payload = msg.decode().unwrap();
+                        let req =
+                            cdma_ios::AssignmentRequestMessage::decode(&payload.payload).unwrap();
+                        assignment_circuit_id = Some(req.circuit_identity_code.to_packed());
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            saw_assignment_request,
+            "MO leg AssignmentRequest should have been sent immediately"
+        );
+        assert!(
+            runtime
+                .circuits
+                .deferred_paging_requests
+                .contains_key(&CallId(call_id)),
+            "deferred MO M2M PagingRequest should be stored"
+        );
+
+        // Feed AssignmentComplete for the primary leg; this should flush the
+        // deferred PagingRequest to the BSC.
+        let assignment_complete = EncodedA1Message::from_message_for_call(
+            &cdma_ios::Message::new(
+                cdma_ios::MessageType::AssignmentComplete,
+                AssignmentCompleteMessage {
+                    channel_number: ChannelNumber(0x4321),
+                    encryption_information: None,
+                    service_option: Some(ServiceOption(0x0003)),
+                    a2p_bearer_session_params: None,
+                    a2p_bearer_format_params: None,
+                }
+                .encode()
+                .unwrap(),
+            ),
+            Some(call_id),
+        );
+        runtime
+            .handle_bsc_a1_message(&endpoint, assignment_complete)
+            .await;
+
+        // Now expect the deferred PagingRequest to land on the wire.
+        let paging_request = timeout(Duration::from_millis(50), client.poll_a1())
+            .await
+            .expect("PagingRequest should be sent after primary AssignmentComplete")
+            .expect("A1 channel should remain open");
+        assert_eq!(
+            paging_request.message_type(),
+            cdma_ios::MessageType::PagingRequest
+        );
+        assert_eq!(paging_request.call_id(), Some(call_id));
+        assert!(
+            !runtime
+                .circuits
+                .deferred_paging_requests
+                .contains_key(&CallId(call_id)),
+            "deferred entry should be cleared after flush"
+        );
+        // Sanity: the assignment circuit id the MSC chose for the MO leg is
+        // tracked in circuits and matches what the BSC would AssignmentComplete.
+        let _ = assignment_circuit_id; // value retained for future assertions
+    }
+
+    /// If the call is torn down before the MO leg's AssignmentComplete
+    /// arrives, the deferred PagingRequest must be dropped — the callee is
+    /// never disturbed.
+    #[tokio::test]
+    async fn mo_m2m_deferred_paging_request_dropped_on_cleanup() {
+        let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(8);
+        let hlr = Arc::new(M2mHlrRepo::new());
+        let mut runtime = MscRuntime::new(MscRuntimeConfig {
+            hlr_repo: hlr.clone(),
+            smsc_repo: None,
+            welcome_sms: None,
+            sms_retry: crate::config::SmsRetryConfig::default(),
+            default_voice_service_option: 3,
+            wav_file: None,
+            gateway_fallback_to_wav: true,
+            local_answer_delay_ms: 10_000,
+            media_ringback_enabled: false,
+            media_ringback_type: MediaRingbackType::Nanp,
+            voice_bearer: None,
+            media_gateway: None,
+        });
+
+        let cli3 = cm_service_request_cli3(Some(vec![0x81, 0x55, 0x95, 0x78, 0x56, 0x34]));
+        let call_id = 7777;
+        let cli3_msg = EncodedA1Message::from_message_for_call(
+            &cdma_ios::Message::new(
+                cdma_ios::MessageType::CompleteLayer3Information,
+                cli3.encode().unwrap(),
+            ),
+            Some(call_id),
+        );
+        runtime.handle_bsc_a1_message(&endpoint, cli3_msg).await;
+
+        // Drain the MO leg traffic, asserting no PagingRequest leaked.
+        while let Ok(Some(msg)) = timeout(Duration::from_millis(20), client.poll_a1()).await {
+            assert_ne!(msg.message_type(), cdma_ios::MessageType::PagingRequest);
+        }
+        assert!(
+            runtime
+                .circuits
+                .deferred_paging_requests
+                .contains_key(&CallId(call_id))
+        );
+
+        // Tear down before AssignmentComplete arrives.
+        runtime.circuits.cleanup_call(CallId(call_id), None);
+
+        assert!(
+            !runtime
+                .circuits
+                .deferred_paging_requests
+                .contains_key(&CallId(call_id)),
+            "cleanup_call must drop the deferred PagingRequest"
+        );
+        assert!(
+            timeout(Duration::from_millis(20), client.poll_a1())
+                .await
+                .is_err(),
+            "no PagingRequest should be sent after cleanup"
+        );
     }
 
     #[tokio::test]

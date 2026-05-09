@@ -7,13 +7,10 @@ use std::collections::HashMap;
 
 use log::{info, warn};
 
-use cdma_ios::EncodedA1Message;
-
 use crate::runtime::select_pageable_imsi;
 
 use crate::call_control::CallId;
 use crate::circuit::CircuitService;
-use crate::runtime::MscA1Endpoint;
 
 /// Routing decision for an MO call's called-party number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +63,6 @@ impl MoCallService {
 
     pub(crate) async fn send_mo_mobile_to_mobile_page(
         &mut self,
-        a1: &dyn MscA1Endpoint,
         call_id: CallId,
         called_number: &str,
         service_option: u16,
@@ -161,35 +157,13 @@ impl MoCallService {
         circuits
             .paging_requests
             .insert(call_id, paging_request.clone());
+        circuits
+            .deferred_paging_requests
+            .insert(call_id, paging_request);
         info!(
-            "MSC: A1 tx PagingRequest for MO M2M call_id={} subscriber={} called_number='{}'",
+            "MSC: deferring MO M2M PagingRequest call_id={} subscriber={} called_number='{}' until primary leg AssignmentComplete",
             call_id.0, subscriber.subscriber_id, called_number
         );
-        let payload = match paging_request.encode() {
-            Ok(payload) => payload,
-            Err(error) => {
-                warn!(
-                    "MSC: failed to encode MO M2M Paging Request call_id={}: {}",
-                    call_id.0, error
-                );
-                circuits.paging_requests.remove(&call_id);
-                return MoSubscriberRoute::Rejected;
-            }
-        };
-        if let Err(error) = a1
-            .send_to_bsc(EncodedA1Message::from_message_for_call(
-                &cdma_ios::Message::new(cdma_ios::MessageType::PagingRequest, payload),
-                Some(call_id.0),
-            ))
-            .await
-        {
-            warn!(
-                "MSC: failed to send MO M2M Paging Request call_id={}: {}",
-                call_id.0, error
-            );
-            circuits.paging_requests.remove(&call_id);
-            return MoSubscriberRoute::Rejected;
-        }
         MoSubscriberRoute::Paged
     }
 

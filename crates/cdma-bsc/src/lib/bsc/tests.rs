@@ -769,6 +769,114 @@ async fn a1_mt_page_response_defers_l2_ack_until_assignment() {
     assert!(messages[0].abis_ack_notify.is_some());
 }
 
+/// Verifies the BSC's A1 PagingRequest handling does not depend on prior
+/// state for the same call_id. This is the order-tolerance the MSC-side
+/// "defer the secondary-leg PagingRequest until primary AssignmentComplete"
+/// change relies on: the PagingRequest may now arrive seconds after the
+/// AssignmentRequest for the same call_id.
+#[tokio::test]
+async fn a1_paging_request_processes_independently_of_prior_assignment_request() {
+    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
+    let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
+    let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
+    let bts_client = test_capturing_bts_client(
+        walsh_allocator,
+        traffic_channels,
+        traffic_rx_pool,
+        traffic_rx_removals,
+    );
+    let (msc_client, _msc_endpoint) = crate::a1_edge::InProcessMscClient::pair(4);
+    let msc: Arc<dyn crate::a1_edge::MscClient> = Arc::new(msc_client);
+
+    let mut bsc = test_bsc_with_max_slot_cycle_index(2);
+    bsc.config.bts_client = Some(bts_client.clone() as Arc<dyn BtsControlClient>);
+    bsc.access_tx = AccessTx::new(Some(bts_client.clone() as Arc<dyn BtsControlClient>));
+    bsc.config.msc_client = msc.clone();
+    bsc.a1.msc_client = msc;
+
+    let imsi = "31099007137215".to_string();
+    let addr = MsAddress::ImsiS {
+        imsi_m_s1: 7_137_215,
+        imsi_m_s2: 512,
+    };
+    bsc.mobiles.push(MobileStation::new_for_test(
+        addr.clone(),
+        Some(0xCAFE_BABE),
+        Some(imsi.clone()),
+        6,
+        MsState::Registered,
+        2,
+        Some(101),
+    ));
+
+    let call_id: u64 = 0x2000_0001;
+
+    // 1) Send a stray AssignmentRequest first. Without a PendingA1Assignment
+    //    queued (i.e., no Page Response has been seen for this call_id), the
+    //    BSC's handler should warn and drop it without panicking or stamping
+    //    any state that would block later PagingRequest handling.
+    let assignment_request = crate::a1_edge::EncodedA1Message::from_message_for_call(
+        &cdma_ios::Message::new(
+            cdma_ios::MessageType::AssignmentRequest,
+            cdma_ios::AssignmentRequestMessage {
+                channel_type: cdma_ios::ChannelType {
+                    speech_or_data_indicator: 0x01,
+                    channel_rate_and_type: 0x08,
+                    coding: 0x05,
+                },
+                circuit_identity_code: cdma_ios::CircuitIdentityCode {
+                    pcm_multiplexer: 0x0001,
+                    timeslot: 0x01,
+                },
+                encryption_information: None,
+                service_option: Some(cdma_ios::ServiceOption(3)),
+                signals: Vec::new(),
+                calling_party_ascii_number: None,
+                ms_information_records: None,
+                priority: None,
+                paca_timestamp: None,
+                quality_of_service_parameters: None,
+                a2p_bearer_session_params: None,
+                a2p_bearer_format_params: None,
+            }
+            .encode()
+            .unwrap(),
+        ),
+        Some(call_id),
+    );
+    bsc.handle_incoming_a1_message(assignment_request).await;
+    assert!(
+        !bsc.paging.has_pending_voice_page(),
+        "stray AssignmentRequest must not queue a voice page"
+    );
+
+    // 2) Now send PagingRequest for the registered mobile under the same
+    //    call_id. The BSC should process it normally and queue a voice page.
+    let paging_request = crate::a1_edge::EncodedA1Message::from_message_for_call(
+        &cdma_ios::Message::new(
+            cdma_ios::MessageType::PagingRequest,
+            cdma_ios::PagingRequestMessage {
+                mobile_identity_imsi: cdma_ios::MobileIdentity::Imsi(imsi.clone()),
+                tag: Some(cdma_ios::Tag(call_id as u32)),
+                cell_identifier_list: None,
+                slot_cycle_index: Some(cdma_ios::SlotCycleIndex(2)),
+                service_option: Some(cdma_ios::ServiceOption(3)),
+                is2000_mobile_capabilities: None,
+            }
+            .encode()
+            .unwrap(),
+        ),
+        Some(call_id),
+    );
+    bsc.handle_incoming_a1_message(paging_request).await;
+
+    assert!(
+        bsc.paging.has_pending_voice_page(),
+        "PagingRequest after AssignmentRequest must queue a voice page"
+    );
+}
+
 #[tokio::test]
 async fn mt_voice_on_existing_so33_uses_traffic_service_negotiation() {
     let (mut bsc, mut traffic_rx, walsh_code) = test_bsc_with_active_traffic_channel(33).await;

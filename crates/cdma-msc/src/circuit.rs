@@ -55,7 +55,17 @@ pub(crate) struct CircuitService {
     /// Call ID -> currently outstanding assignment leg.
     pub(crate) active_assignment_legs: HashMap<CallId, MscVoiceLeg>,
     /// Secondary leg page responses waiting for the active assignment to finish.
+    ///
+    /// Used by MT multi-leg flows where a second PagingResponse can arrive
+    /// while the first leg's AssignmentComplete is still pending. MO M2M no
+    /// longer reaches this path because the secondary-leg PagingRequest is
+    /// itself deferred (`deferred_paging_requests`) until the MO leg
+    /// completes — so no callee response can race the MO assignment.
     pub(crate) deferred_paging_responses: HashMap<CallId, VecDeque<DeferredPagingResponse>>,
+    /// Outgoing MO M2M PagingRequests held until the primary (MO) leg's
+    /// AssignmentComplete arrives, so the callee is never paged before the
+    /// caller is fully on the traffic channel.
+    pub(crate) deferred_paging_requests: HashMap<CallId, cdma_ios::PagingRequestMessage>,
     /// Initial Paging Request per MT call, reused to initialize per-leg A1 procedure engines.
     pub(crate) paging_requests: HashMap<CallId, cdma_ios::PagingRequestMessage>,
 }
@@ -68,6 +78,7 @@ impl CircuitService {
             pending_assignment_completes: HashMap::new(),
             active_assignment_legs: HashMap::new(),
             deferred_paging_responses: HashMap::new(),
+            deferred_paging_requests: HashMap::new(),
             paging_requests: HashMap::new(),
         }
     }
@@ -215,6 +226,16 @@ impl CircuitService {
         response.map(|r| r.response)
     }
 
+    /// Take the deferred outgoing PagingRequest for a call, if any.
+    ///
+    /// Returns `Some(request)` if one was stored, `None` otherwise.
+    pub(crate) fn take_deferred_paging_request(
+        &mut self,
+        call_id: CallId,
+    ) -> Option<cdma_ios::PagingRequestMessage> {
+        self.deferred_paging_requests.remove(&call_id)
+    }
+
     /// Clean up all circuit state associated with a call.
     pub(crate) fn cleanup_call(
         &mut self,
@@ -225,6 +246,7 @@ impl CircuitService {
             .retain(|leg, _| leg.call_id != call_id);
         self.active_assignment_legs.remove(&call_id);
         self.deferred_paging_responses.remove(&call_id);
+        self.deferred_paging_requests.remove(&call_id);
         self.paging_requests.remove(&call_id);
         self.leg_procedures.retain(|leg, _| leg.call_id != call_id);
 
