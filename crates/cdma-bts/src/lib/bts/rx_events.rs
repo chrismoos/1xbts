@@ -390,6 +390,7 @@ pub(super) fn build_traffic_event(
 pub(super) fn reverse_pilot_ec_io_db_from_tags(blk: &SampleBlock) -> Option<f32> {
     blk.tags
         .get("finger_pilot_ec_io_mdb")
+        .or_else(|| blk.tags.get("traffic_pcg_pilot_ec_io_mdb"))
         .map(|value| *value as f32 / 1000.0)
 }
 

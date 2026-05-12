@@ -106,6 +106,9 @@ pub(crate) use pn_helpers::{
 pub use runner::{PipelinedReceiver, flush_sub_chain, run_sub_chain};
 pub use sample_block::SampleBlock;
 
+#[cfg(test)]
+pub(crate) use rc3_bpsk_despread::Rc3BpskDespread;
+
 // ---------------------------------------------------------------------------
 // Shared soft-decision helper
 // ---------------------------------------------------------------------------
@@ -6477,6 +6480,166 @@ mod tests {
             Some(vec![10]),
             None,
             None,
+        );
+    }
+
+    /// FER-vs-pilot-symbol-SINR calibration sweep for RC3 9600 bps on AWGN.
+    /// Prints the SINR at which FER crosses 1%.
+    ///
+    /// **Lock-step with `rlgain_adj` in `paging_messages.rs`**: if it changes,
+    /// update `PROD_RLGAIN_ADJ_QUARTERS` below and re-run before adjusting setpoints.
+    #[test]
+    #[ignore]
+    fn rc3_pilot_sinr_at_1pct_fer_calibration() {
+        init_test_logger();
+
+        fn next_uniform(state: &mut u64) -> f32 {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (((*state >> 32) as u32 | 1) as f32) / (u32::MAX as f32)
+        }
+        fn box_muller_pair(state: &mut u64) -> (f32, f32) {
+            let u1 = next_uniform(state);
+            let u2 = next_uniform(state);
+            let r = (-2.0 * u1.ln()).sqrt();
+            let theta = std::f32::consts::TAU * u2;
+            (r * theta.cos(), r * theta.sin())
+        }
+
+        fn measure_pilot_sym_sinr_db(chips: Vec<Complex32>) -> f32 {
+            const SYMBOLS_PER_PCG: usize = 96;
+            let mut despreader =
+                super::rc3_bpsk_despread::Rc3BpskDespread::with_output_symbols(SYMBOLS_PER_PCG);
+            let mut block = SampleBlock::new(chips, 0).with_sample_rate_hz(1_228_800.0);
+            block.tags.insert("absolute_chip_start", 0);
+            let outputs = PipelineProcessor::process_block(&mut despreader, block);
+            let mut sum = 0.0f32;
+            let mut n = 0usize;
+            for blk in outputs {
+                let Some(metrics) = blk.pcg_pilot_metrics else {
+                    continue;
+                };
+                for (pn_sq, ps_pwr, _, _) in metrics {
+                    let nf = SYMBOLS_PER_PCG as f32;
+                    let mean_sq = pn_sq / (nf * nf);
+                    let var = (ps_pwr / nf - mean_sq).max(1e-12);
+                    sum += 10.0 * (mean_sq / var).max(1e-12).log10();
+                    n += 1;
+                }
+            }
+            if n == 0 { f32::NAN } else { sum / n as f32 }
+        }
+
+        let walsh = REVERSE_RC3_GOLDEN_WALSH;
+        let rate = GoldenRc3Rate::Full;
+        let target_rate_bps = rate.rate_bps();
+        let n_frames_per_point: usize = 200;
+        let sigma_n: f32 = 1.0;
+
+        const NOMINAL_RC3_FULL_TDG_DB: f32 = 3.75;
+        // Lock-step with `rlgain_adj` in paging_messages.rs (0.25 dB units).
+        const PROD_RLGAIN_ADJ_QUARTERS: i32 = -4;
+        const TDG_DB: f32 = NOMINAL_RC3_FULL_TDG_DB + (PROD_RLGAIN_ADJ_QUARTERS as f32) * 0.25;
+        let tdg_lin = 10f32.powf(TDG_DB / 20.0);
+        eprintln!(
+            "    TDG: nominal {} dB + rlgain_adj {} × 0.25 dB = {:.2} dB (×{:.3} on traffic axis)",
+            NOMINAL_RC3_FULL_TDG_DB, PROD_RLGAIN_ADJ_QUARTERS, TDG_DB, tdg_lin
+        );
+
+        eprintln!(
+            "\n=== RC3 {} bps FER vs pilot-symbol SINR calibration ===",
+            target_rate_bps
+        );
+        eprintln!(
+            "    walsh={}  sigma_n={}  frames/point={}\n",
+            walsh, sigma_n, n_frames_per_point
+        );
+        eprintln!("  amp_dB | pilot_SINR_dB | crc_valid | FER%   | predicted_SINR_dB");
+        eprintln!("  -------+---------------+-----------+--------+------------------");
+
+        let amp_db_range: Vec<f32> = (-26..=-6).map(|v| v as f32).collect();
+        let mut results: Vec<(f32, f32, f32)> = Vec::new();
+
+        for amp_db in &amp_db_range {
+            let amp = 10f32.powf(amp_db / 20.0);
+            let mut crc_valid = 0usize;
+            let mut sinr_sum = 0.0f32;
+            let mut sinr_n = 0usize;
+            let mut rng_state: u64 = 0xC0FFEE_u64
+                .wrapping_add(((*amp_db as i64) as u64).wrapping_mul(0x9E3779B97F4A7C15));
+
+            for frame_idx in 0..n_frames_per_point {
+                let mut info = Vec::with_capacity(rate.info_bits());
+                let mut bit_state: u32 = 0xC0FFEE_00u32.wrapping_add(frame_idx as u32);
+                for _ in 0..rate.info_bits() {
+                    bit_state = bit_state.wrapping_mul(1664525).wrapping_add(1013904223);
+                    info.push(((bit_state >> 31) & 1) as u8);
+                }
+
+                let symbols = encode_reverse_rc3_fch_symbols(&info, rate);
+                let mut chips = build_reverse_rc3_despread_chips_from_symbols(&symbols);
+                // Pilot on +real, traffic on -imag with production TDG.
+                for c in chips.iter_mut() {
+                    c.re *= amp;
+                    c.im *= amp * tdg_lin;
+                }
+                for c in chips.iter_mut() {
+                    let (nr, ni) = box_muller_pair(&mut rng_state);
+                    c.re += nr * sigma_n;
+                    c.im += ni * sigma_n;
+                }
+
+                let sinr = measure_pilot_sym_sinr_db(chips.clone());
+                if sinr.is_finite() {
+                    sinr_sum += sinr;
+                    sinr_n += 1;
+                }
+
+                let outputs = run_rc3_reverse_traffic_despread_frame_outputs(chips, walsh);
+                for blk in outputs {
+                    if blk.tags.get("traffic_phy_frame") == Some(&1)
+                        && blk.tags.get("traffic_fqi_valid") == Some(&1)
+                        && blk.tags.get("traffic_rate_bps") == Some(&target_rate_bps)
+                    {
+                        crc_valid += 1;
+                    }
+                }
+            }
+
+            let fer_pct = 100.0 * (1.0 - crc_valid as f32 / n_frames_per_point as f32);
+            let pilot_sinr = sinr_sum / sinr_n.max(1) as f32;
+            let predicted = 10.0 * (8.0 * amp * amp / (sigma_n * sigma_n)).log10();
+            eprintln!(
+                "   {:+5.1}  |   {:+7.2}     |  {:>3}/{:<3}   | {:>5.1}  |   {:+7.2}",
+                amp_db, pilot_sinr, crc_valid, n_frames_per_point, fer_pct, predicted
+            );
+            results.push((*amp_db, pilot_sinr, fer_pct));
+        }
+
+        let mut knee: Option<f32> = None;
+        for w in results.windows(2) {
+            if w[0].2 > 1.0 && w[1].2 <= 1.0 {
+                let s0 = w[0].1;
+                let s1 = w[1].1;
+                let f0 = (w[0].2.max(1e-3) / 100.0).ln();
+                let f1 = (w[1].2.max(1e-3) / 100.0).ln();
+                let target = 0.01_f32.ln();
+                let t = ((target - f0) / (f1 - f0)).clamp(0.0, 1.0);
+                knee = Some(s0 + t * (s1 - s0));
+                break;
+            }
+        }
+        eprintln!(
+            "\n  RC3 {} bps FER=1% pilot-symbol SINR knee: {}",
+            target_rate_bps,
+            knee.map(|s| format!("{:+.2} dB", s))
+                .unwrap_or_else(|| "(FER never crossed 1% in sweep range)".to_string()),
+        );
+        eprintln!(
+            "  → suggested Phase 2 RC3_INITIAL_TARGET_PILOT_SYM_SINR_DB ≈ {}",
+            knee.map(|s| format!("{:+.1} dB  (knee + 1.5 dB margin)", s + 1.5))
+                .unwrap_or_else(|| "TBD (extend sweep range)".to_string()),
         );
     }
 }
