@@ -13,6 +13,7 @@ default = ["uhd-backend", "lime-backend", "bladerf-backend"]
 uhd-backend = ["cdma-bts/uhd-backend"]
 lime-backend = ["cdma-bts/lime-backend"]
 bladerf-backend = ["cdma-bts/bladerf-backend"]
+soapy-backend = ["cdma-bts/soapy-backend"]
 test-utils = []
 
 [dependencies]

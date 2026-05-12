@@ -13,6 +13,7 @@ default = ["uhd-backend", "lime-backend", "bladerf-backend"]
 uhd-backend = ["cdma-bts/uhd-backend", "cdma-bsc/uhd-backend"]
 lime-backend = ["cdma-bts/lime-backend", "cdma-bsc/lime-backend"]
 bladerf-backend = ["cdma-bts/bladerf-backend", "cdma-bsc/bladerf-backend"]
+soapy-backend = ["cdma-bts/soapy-backend", "cdma-bsc/soapy-backend"]
 
 [dependencies]
 cdma-bts = { path = "../cdma-bts", default-features = false }
