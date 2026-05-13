@@ -7,6 +7,7 @@ use cdma_common::consts::SR1_CHIPS_PER_FRAME;
 /// Walsh length for R-FCH in RC3: W(4,16) → 16-chip Walsh cover.
 const WALSH_LENGTH: usize = 16;
 const CHIPS_PER_PCG: usize = 1_536;
+const PILOT_CHIPS_PER_PCG: usize = 1_152;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
@@ -43,6 +44,7 @@ const INITIAL_ALIGNMENT_MODE: InitialAlignmentMode = InitialAlignmentMode::Pcg12
 /// axis estimation and use the pilot-referenced soft bits directly.
 /// Number of 16-chip symbols per PCG (1536 / 16 = 96).
 const SYMBOLS_PER_PCG: usize = CHIPS_PER_PCG / WALSH_LENGTH;
+const PILOT_SYMBOLS_PER_PCG: usize = PILOT_CHIPS_PER_PCG / WALSH_LENGTH;
 
 pub struct Rc3BpskDespread {
     /// W(4,16) Walsh cover
@@ -252,8 +254,11 @@ impl PipelineProcessor for Rc3BpskDespread {
                 let pilot_sym: Complex32 = self.chip_buf.iter().copied().sum();
                 let traffic_sym = self.despread_one_symbol(&self.chip_buf);
 
-                self.pcg_pilot_accum += pilot_sym;
-                self.pcg_pilot_sym_power_sum += pilot_sym.norm_sqr();
+                let symbol_index_in_pcg = self.pcg_traffic_buf.len();
+                if symbol_index_in_pcg < PILOT_SYMBOLS_PER_PCG {
+                    self.pcg_pilot_accum += pilot_sym;
+                    self.pcg_pilot_sym_power_sum += pilot_sym.norm_sqr();
+                }
                 self.pcg_traffic_buf.push(traffic_sym);
                 self.chip_buf.clear();
 

@@ -285,7 +285,7 @@ function ChannelTable({
               ch.walshCode != null &&
               ch.trafficPower != null;
             const isRc3 = ch.trafficPower?.reverseRadioConfig === 3;
-            const reversePowerMetric = isRc3 ? "Ec/Io" : "Eb/Nt";
+            const reversePowerMetric = isRc3 ? "Pilot SINR" : "Eb/Nt";
             const draftValue =
               canControlPower && ch.walshCode != null
                 ? powerDrafts[ch.walshCode] ??

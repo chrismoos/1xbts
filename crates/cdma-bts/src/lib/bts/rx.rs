@@ -39,6 +39,7 @@ use super::{
     AccessChannelEvent, BtsCommand, BtsPowerControlRegistry, IqCaptureControlResult,
     IqCaptureStatus, RxSettings,
     handle::{RxMetrics, StageMetrics, TrafficChannelPool},
+    power_control::PCG_PREDICTION_LEAD_PCGS,
     settings,
 };
 
@@ -1504,7 +1505,21 @@ struct PowerControlRxCounterWindow {
     log_periodic: bool,
     total_measurements: u64,
     window_measurements: u64,
-    window_eb_nt_sum_db: f64,
+    /// Sum of pilot symbol SINR (dB) — the loop's control metric.
+    window_metric_sum_db: f64,
+    /// Min/max of the per-PCG pilot SINR within the window.
+    window_metric_min_db: f32,
+    window_metric_max_db: f32,
+    /// Sum/count of legacy Ec/Io for the diagnostic log line.
+    window_legacy_ec_io_sum_db: f64,
+    window_legacy_ec_io_count: u64,
+    /// Raw (un-smoothed) per-PCG pilot SINR stats — diagnostic only.
+    window_raw_sinr_sum_db: f64,
+    window_raw_sinr_count: u64,
+    window_raw_sinr_min_db: f32,
+    window_raw_sinr_max_db: f32,
+    /// Latest smoothing-window length reported by the finger (PCGs).
+    last_smoothing_window: Option<u32>,
     window_raw_power_count: u64,
     window_raw_power_sum_db: f64,
     window_raw_power_min_db: f32,
@@ -1512,25 +1527,81 @@ struct PowerControlRxCounterWindow {
     last_raw_power_db: Option<f32>,
     last_filtered_raw_power_db: Option<f32>,
     window_raw_power_clamp_down: u64,
+    /// PCB direction counts: PCB=0 is UP (raise MS Tx), PCB=1 is DOWN.
+    window_pcb_up: u64,
+    window_pcb_down: u64,
     window_age_chips_sum: u64,
     window_max_age_chips: u64,
     window_over_1pcg: u64,
     last_abs_pcg: u64,
+    /// Latest closed-loop snapshot fields (sampled once per record()).
+    last_target_db: Option<f32>,
+    last_filtered_metric_db: Option<f32>,
+    last_fer_pct: Option<f32>,
+    last_frames_total: u64,
+    last_frames_crc_error: u64,
+    last_brake_offset_db: Option<f32>,
 }
 
 impl PowerControlRxCounterWindow {
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &mut self,
         abs_pcg: u64,
-        eb_nt_db: f32,
+        metric_db: f32,
+        legacy_ec_io_db: Option<f32>,
+        raw_sinr_db: Option<f32>,
+        smoothing_window_len: Option<u32>,
         raw_power_db: Option<f32>,
         filtered_raw_power_db: Option<f32>,
         raw_power_clamp_active: bool,
+        pcb: Option<u8>,
+        target_db: Option<f32>,
+        filtered_metric_db: Option<f32>,
+        fer_pct: Option<f32>,
+        frames_total: u64,
+        frames_crc_error: u64,
+        brake_offset_db: Option<f32>,
         age_chips: u64,
     ) -> bool {
         self.total_measurements = self.total_measurements.saturating_add(1);
         self.window_measurements = self.window_measurements.saturating_add(1);
-        self.window_eb_nt_sum_db += eb_nt_db as f64;
+        if metric_db.is_finite() {
+            self.window_metric_sum_db += metric_db as f64;
+            self.window_metric_min_db =
+                if self.window_metric_min_db == 0.0 && self.window_measurements == 1 {
+                    metric_db
+                } else {
+                    self.window_metric_min_db.min(metric_db)
+                };
+            self.window_metric_max_db =
+                if self.window_metric_max_db == 0.0 && self.window_measurements == 1 {
+                    metric_db
+                } else {
+                    self.window_metric_max_db.max(metric_db)
+                };
+        }
+        if let Some(legacy_db) = legacy_ec_io_db.filter(|db| db.is_finite()) {
+            self.window_legacy_ec_io_sum_db += legacy_db as f64;
+            self.window_legacy_ec_io_count = self.window_legacy_ec_io_count.saturating_add(1);
+        }
+        if let Some(raw_db) = raw_sinr_db.filter(|db| db.is_finite()) {
+            self.window_raw_sinr_sum_db += raw_db as f64;
+            self.window_raw_sinr_count = self.window_raw_sinr_count.saturating_add(1);
+            self.window_raw_sinr_min_db = if self.window_raw_sinr_count == 1 {
+                raw_db
+            } else {
+                self.window_raw_sinr_min_db.min(raw_db)
+            };
+            self.window_raw_sinr_max_db = if self.window_raw_sinr_count == 1 {
+                raw_db
+            } else {
+                self.window_raw_sinr_max_db.max(raw_db)
+            };
+        }
+        if smoothing_window_len.is_some() {
+            self.last_smoothing_window = smoothing_window_len;
+        }
         if let Some(raw_power_db) = raw_power_db.filter(|db| db.is_finite()) {
             self.window_raw_power_count = self.window_raw_power_count.saturating_add(1);
             self.window_raw_power_sum_db += raw_power_db as f64;
@@ -1551,6 +1622,25 @@ impl PowerControlRxCounterWindow {
         }
         if raw_power_clamp_active {
             self.window_raw_power_clamp_down = self.window_raw_power_clamp_down.saturating_add(1);
+        }
+        match pcb {
+            Some(0) => self.window_pcb_up = self.window_pcb_up.saturating_add(1),
+            Some(1) => self.window_pcb_down = self.window_pcb_down.saturating_add(1),
+            _ => {}
+        }
+        if let Some(t) = target_db.filter(|db| db.is_finite()) {
+            self.last_target_db = Some(t);
+        }
+        if let Some(f) = filtered_metric_db.filter(|db| db.is_finite()) {
+            self.last_filtered_metric_db = Some(f);
+        }
+        if let Some(fer) = fer_pct.filter(|f| f.is_finite()) {
+            self.last_fer_pct = Some(fer);
+        }
+        self.last_frames_total = frames_total;
+        self.last_frames_crc_error = frames_crc_error;
+        if let Some(brake) = brake_offset_db.filter(|b| b.is_finite()) {
+            self.last_brake_offset_db = Some(brake);
         }
         self.window_age_chips_sum = self.window_age_chips_sum.saturating_add(age_chips);
         self.window_max_age_chips = self.window_max_age_chips.max(age_chips);
@@ -1577,14 +1667,73 @@ impl PowerControlRxCounterWindow {
         if self.window_measurements == 0 {
             return;
         }
-        let avg_raw_ec_io_db = self.window_eb_nt_sum_db / self.window_measurements as f64;
-        let avg_age_pcgs =
-            self.window_age_chips_sum as f64 / self.window_measurements as f64 / 1536.0;
+        let n = self.window_measurements as f64;
+        let avg_metric_db = self.window_metric_sum_db / n;
+        let metric_summary = format!(
+            "pilot_sinr_avg={:.2} (min={:.2} max={:.2}) filt={}",
+            avg_metric_db,
+            self.window_metric_min_db,
+            self.window_metric_max_db,
+            self.last_filtered_metric_db
+                .map(|db| format!("{db:.2}"))
+                .unwrap_or_else(|| "none".to_string()),
+        );
+        let raw_sinr_summary = if self.window_raw_sinr_count > 0 {
+            format!(
+                " raw_sinr_avg={:.2} (min={:.2} max={:.2}){}",
+                self.window_raw_sinr_sum_db / self.window_raw_sinr_count as f64,
+                self.window_raw_sinr_min_db,
+                self.window_raw_sinr_max_db,
+                self.last_smoothing_window
+                    .map(|w| format!(" smooth_w={w}"))
+                    .unwrap_or_default(),
+            )
+        } else {
+            String::new()
+        };
+        let legacy_summary = if self.window_legacy_ec_io_count > 0 {
+            format!(
+                " legacy_ec_io_avg={:.2}",
+                self.window_legacy_ec_io_sum_db / self.window_legacy_ec_io_count as f64
+            )
+        } else {
+            " legacy_ec_io=missing".to_string()
+        };
+        let target_summary = self
+            .last_target_db
+            .map(|t| {
+                let brake = self
+                    .last_brake_offset_db
+                    .map(|b| format!(" brake={b:.2}"))
+                    .unwrap_or_default();
+                format!(" target={t:.2}{brake}")
+            })
+            .unwrap_or_default();
+        let pcb_total = self.window_pcb_up + self.window_pcb_down;
+        let pcb_summary = if pcb_total > 0 {
+            format!(
+                " pcb_up={}/{} ({:.0}% UP)",
+                self.window_pcb_up,
+                pcb_total,
+                100.0 * self.window_pcb_up as f64 / pcb_total as f64,
+            )
+        } else {
+            String::new()
+        };
+        let fer_summary = self
+            .last_fer_pct
+            .map(|fer| {
+                format!(
+                    " fer={:.2}% frames={}/{}err",
+                    fer, self.last_frames_total, self.last_frames_crc_error
+                )
+            })
+            .unwrap_or_default();
+        let avg_age_pcgs = self.window_age_chips_sum as f64 / n / 1536.0;
         let max_age_pcgs = self.window_max_age_chips as f64 / 1536.0;
         let raw_power_summary = if self.window_raw_power_count > 0 {
             format!(
-                " raw_power_count={} raw_power_avg_dbfs={:.2} raw_power_min_dbfs={:.2} raw_power_max_dbfs={:.2} raw_power_last_dbfs={:.2} raw_power_filt_dbfs={}",
-                self.window_raw_power_count,
+                " raw_power_avg_dbfs={:.2} (min={:.2} max={:.2} last={:.2}) filt={}",
                 self.window_raw_power_sum_db / self.window_raw_power_count as f64,
                 self.window_raw_power_min_db,
                 self.window_raw_power_max_db,
@@ -1597,11 +1746,16 @@ impl PowerControlRxCounterWindow {
             " raw_power=none".to_string()
         };
         info!(
-            "rx_traffic[w{}]: [power counters] total_meas={} window_meas={} raw_ec_io_avg={:.2}(all_pcgs){} raw_power_clamp_down={} age_avg_pcgs={:.2} age_max_pcgs={:.2} over_1pcg={} last_abs_pcg={}",
+            "rx_traffic[w{}]: [power counters] total_meas={} window_meas={} {}{}{}{}{}{}{} clamp_down={} age_avg_pcgs={:.2} age_max_pcgs={:.2} over_1pcg={} last_abs_pcg={}",
             walsh_code,
             self.total_measurements,
             self.window_measurements,
-            avg_raw_ec_io_db,
+            metric_summary,
+            raw_sinr_summary,
+            legacy_summary,
+            target_summary,
+            pcb_summary,
+            fer_summary,
             raw_power_summary,
             self.window_raw_power_clamp_down,
             avg_age_pcgs,
@@ -1614,13 +1768,23 @@ impl PowerControlRxCounterWindow {
 
     fn reset_window(&mut self) {
         self.window_measurements = 0;
-        self.window_eb_nt_sum_db = 0.0;
+        self.window_metric_sum_db = 0.0;
+        self.window_metric_min_db = 0.0;
+        self.window_metric_max_db = 0.0;
+        self.window_legacy_ec_io_sum_db = 0.0;
+        self.window_legacy_ec_io_count = 0;
+        self.window_raw_sinr_sum_db = 0.0;
+        self.window_raw_sinr_count = 0;
+        self.window_raw_sinr_min_db = 0.0;
+        self.window_raw_sinr_max_db = 0.0;
         self.window_raw_power_count = 0;
         self.window_raw_power_sum_db = 0.0;
         self.window_raw_power_min_db = 0.0;
         self.window_raw_power_max_db = 0.0;
         self.last_raw_power_db = None;
         self.window_raw_power_clamp_down = 0;
+        self.window_pcb_up = 0;
+        self.window_pcb_down = 0;
         self.window_age_chips_sum = 0;
         self.window_max_age_chips = 0;
         self.window_over_1pcg = 0;
@@ -1695,6 +1859,29 @@ fn run_traffic_rx_thread(
                     "rx_traffic[w{}]: PREAMBLE DETECTED pcgs={} abs_chip={}",
                     walsh_code, preamble_pcgs, abs_chip
                 );
+                if let (Some(power_control), Some(traffic_channels)) =
+                    (power_control.as_ref(), traffic_channels.as_ref())
+                    && let Some(raw_power_db) = out_blk
+                        .tags
+                        .get("finger_raw_power_mdb")
+                        .map(|v| *v as f32 / 1000.0)
+                    && power_control.note_hot_preamble(walsh_code, raw_power_db)
+                {
+                    let start_abs_pcg =
+                        processing_absolute_chip_end / 1536 + PCG_PREDICTION_LEAD_PCGS as u64;
+                    let down_pcgs = BtsPowerControlRegistry::hot_start_bootstrap_down_pcgs();
+                    if power_control.schedule_down_burst(
+                        traffic_channels,
+                        walsh_code,
+                        start_abs_pcg,
+                        down_pcgs,
+                    ) {
+                        info!(
+                            "rx_traffic[w{}]: hot preamble raw={:.2} dBFS; armed dynamic DOWN guard and scheduled {} bootstrap DOWN PCBs from abs_pcg={}",
+                            walsh_code, raw_power_db, down_pcgs, start_abs_pcg
+                        );
+                    }
+                }
 
                 // Send preamble as FCH Rvs null frame over Abis UDP bearer
                 emit_reverse_preamble_bearer(
@@ -1764,16 +1951,37 @@ fn run_traffic_rx_thread(
                         .and_then(|values| values.first())
                         .copied()
                         .unwrap_or(f32::NAN);
+                    let legacy_ec_io_db = event.reverse_pilot_ec_io_db.or_else(|| {
+                        out_blk
+                            .tags
+                            .get("traffic_pcg_pilot_ec_io_mdb")
+                            .map(|v| *v as f32 / 1000.0)
+                    });
+                    let raw_sinr_db = out_blk
+                        .tags
+                        .get("traffic_pcg_pilot_sinr_raw_mdb")
+                        .map(|v| *v as f32 / 1000.0);
+                    let smoothing_window_len = out_blk
+                        .tags
+                        .get("traffic_pcg_smoothing_window")
+                        .and_then(|v| u32::try_from(*v).ok());
                     let mut tick_raw_power = None;
                     let mut tick_filtered_raw_power = None;
                     let mut raw_power_clamp_active = false;
+                    let mut tick_pcb: Option<u8> = None;
+                    let mut tick_target_db: Option<f32> = None;
+                    let mut tick_filtered_metric_db: Option<f32> = None;
+                    let mut snapshot_fer_pct: Option<f32> = None;
+                    let mut snapshot_frames_total: u64 = 0;
+                    let mut snapshot_frames_crc_error: u64 = 0;
+                    let mut snapshot_brake_offset_db: Option<f32> = None;
                     if let (Some(power_control), Some(traffic_channels), Some(abs_chip)) = (
                         power_control.as_ref(),
                         traffic_channels.as_ref(),
                         event.absolute_chip_start,
                     ) {
                         let measured_abs_pcg = abs_chip / 1536;
-                        let tx_abs_pcg = measured_abs_pcg + 8;
+                        let tx_abs_pcg = measured_abs_pcg + PCG_PREDICTION_LEAD_PCGS as u64;
                         if let Some(tick) = power_control.tick_and_schedule(
                             traffic_channels,
                             walsh_code,
@@ -1785,6 +1993,17 @@ fn run_traffic_rx_thread(
                             tick_raw_power = tick.raw_power_db;
                             tick_filtered_raw_power = tick.filtered_raw_power_db;
                             raw_power_clamp_active = tick.raw_power_clamp_active;
+                            tick_pcb = Some(tick.pcb);
+                            tick_target_db = Some(tick.target_db);
+                            if tick.control_metric_db.is_finite() {
+                                tick_filtered_metric_db = Some(tick.control_metric_db);
+                            }
+                        }
+                        if let Some(snap) = power_control.snapshot(walsh_code) {
+                            snapshot_fer_pct = Some(snap.fer_pct);
+                            snapshot_frames_total = snap.frames_total;
+                            snapshot_frames_crc_error = snap.frames_crc_error;
+                            snapshot_brake_offset_db = Some(snap.last_brake_offset_db);
                         }
                     }
                     {
@@ -1794,9 +2013,19 @@ fn run_traffic_rx_thread(
                         if counters.record(
                             abs_pcg,
                             eb_nt_db,
+                            legacy_ec_io_db,
+                            raw_sinr_db,
+                            smoothing_window_len,
                             tick_raw_power.or(event.raw_power_db),
                             tick_filtered_raw_power,
                             raw_power_clamp_active,
+                            tick_pcb,
+                            tick_target_db,
+                            tick_filtered_metric_db,
+                            snapshot_fer_pct,
+                            snapshot_frames_total,
+                            snapshot_frames_crc_error,
+                            snapshot_brake_offset_db,
                             age_chips,
                         ) {
                             counters.log_and_reset(walsh_code);

@@ -613,8 +613,7 @@ export default function MobileDetailPage({
   const canCreateSubscriber = !mobile.subscriberId && (mobile.esn != null || Boolean(mobile.imsi));
   const trafficPower = mobile.trafficPower;
   const isRc3 = (trafficPower?.reverseRadioConfig ?? 0) === 3;
-  // Inner-loop metric: pilot Ec/Io (RC3) or data Eb/Nt (RC1).
-  // Falls back to the frame snapshot if pilot array is not yet populated.
+  // Inner-loop metric: pilot SINR (RC3) or Eb/Nt (RC1); falls back to frame snapshot.
   const pilotArr = trafficPower?.lastPcgPilotEcNtDb ?? [];
   const innerLoopPcgDb =
     pilotArr.length > 0
@@ -622,7 +621,7 @@ export default function MobileDetailPage({
       : trafficPower?.lastPcgSnrDb ?? [];
   // Per-frame data Eb/Nt snapshot (always from decoded frame).
   const frameEbNtDb = trafficPower?.lastPcgSnrDb ?? [];
-  const metricLabel = isRc3 ? "Pilot Ec/Io" : "Eb/Nt";
+  const metricLabel = isRc3 ? "Pilot SINR" : "Eb/Nt";
   const reverseTargetDb =
     trafficPower?.effectiveTargetEbNtDb ?? trafficPower?.targetEbNtDb ?? null;
   const reverseFrameMax =
@@ -1031,7 +1030,7 @@ export default function MobileDetailPage({
               <div className="grid gap-4 xl:grid-cols-2">
                 <section className="rounded-lg border border-border bg-surface p-4">
                   <div className="mb-4">
-                    <div className="text-sm font-medium text-primary">Reverse Power Control {isRc3 ? "(RC3 — Pilot Ec/Io)" : "(RC1 — Data Eb/Nt)"}</div>
+                    <div className="text-sm font-medium text-primary">Reverse Power Control {isRc3 ? "(RC3 — Pilot SINR)" : "(RC1 — Data Eb/Nt)"}</div>
                     <div className="text-xs text-muted">
                       Closed-loop reverse traffic measurements, live per-PCG PCB scheduling, and bad-frame accounting.
                     </div>
@@ -1062,11 +1061,11 @@ export default function MobileDetailPage({
                     </div>
                     {reversePilotEcIoText ? (
                       <div className="rounded-md border border-border bg-surface px-3 py-2">
-                        <div className="text-[11px] uppercase tracking-wide text-muted">Reverse Pilot Ec/Io</div>
+                        <div className="text-[11px] uppercase tracking-wide text-muted">Pilot Ec/Io (legacy)</div>
                         <div className="mt-1 font-mono text-base text-primary">
                           {reversePilotEcIoText}
                         </div>
-                        <div className="text-[11px] text-muted">1 s smoothed validated reverse traffic finger</div>
+                        <div className="text-[11px] text-muted">1 s smoothed reverse traffic finger — diagnostic only</div>
                       </div>
                     ) : null}
                     <div className="rounded-md border border-border bg-surface px-3 py-2">
@@ -1170,7 +1169,7 @@ export default function MobileDetailPage({
                     </div>
                     <div className="mb-2 text-[11px] text-muted">
                       {isRc3
-                        ? "Showing pilot Ec/Io (inner-loop control metric). Frame data Eb/Nt shown below each value."
+                        ? "Showing pilot SINR (inner-loop control metric). Frame data Eb/Nt shown below each value."
                         : "Peak highlighting is diagnostic only."}{" "}
                       Reverse closed-loop decisions are scheduled one PCG at a time on the absolute-PCG timeline.
                     </div>

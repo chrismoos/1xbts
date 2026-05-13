@@ -79,6 +79,21 @@ pub fn power_control_verbose_summary_every() -> u64 {
     power_control_verbose_config().summary_every
 }
 
+/// Per-PCG verbose logging in the BTS reverse power-control loop.
+/// Set `CDMA_POWER_CONTROL_VERBOSE_PER_PCG=1` to log every tick.
+pub fn power_control_verbose_per_pcg() -> bool {
+    static CONFIG: OnceLock<bool> = OnceLock::new();
+    *CONFIG.get_or_init(|| env_bool_or("CDMA_POWER_CONTROL_VERBOSE_PER_PCG", false))
+}
+
+pub fn power_control_verbose_per_pcg_enabled_for_walsh(walsh_code: u8) -> bool {
+    power_control_verbose_per_pcg()
+        && power_control_verbose_config()
+            .walsh_filter
+            .map(|filter| filter == walsh_code)
+            .unwrap_or(true)
+}
+
 pub fn rc3_lower_rate_diag_enabled_for_walsh(walsh_code: u8) -> bool {
     let config = rc3_lower_rate_diag_config();
     config.enabled

@@ -4119,6 +4119,10 @@ impl ExtendedChannelAssignmentMessage {
             enc_key_size: None,
             // FPC values matched to working Anritsu MD8470A trace (RecNo 50).
             fpc_subchan_gain: 12,
+            // R-FCH traffic-to-pilot gain adjustment, signed 4-bit two's
+            // complement in 0.25 dB units. **LOCK-STEP** with the inner-loop
+            // SINR setpoint in power_control.rs (calibrated via
+            // `rc3_pilot_sinr_at_1pct_fer_calibration`). Re-run before changing.
             rlgain_adj: -4,
             ch_ind: 0b01,
             raw_ch_record_fields: None,

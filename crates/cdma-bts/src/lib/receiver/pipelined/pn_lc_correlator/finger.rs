@@ -176,13 +176,20 @@ pub struct PnLcFinger {
     /// Replay outputs generated before the finger is first polled live.
     pending_output: Vec<SampleBlock>,
     /// RC3 closed-loop power-control measurement state. Accumulates one
-    /// pilot Ec/Io estimate per 1.25 ms PCG directly at the finger.
+    /// pilot symbol SINR estimate per 1.25 ms PCG directly at the finger.
     rc3_pcg_measurement_abs_chip_start: Option<u64>,
     rc3_pcg_measurement_prompt_chip_power: f64,
     rc3_pcg_measurement_pilot_run_prompt: Complex32,
     rc3_pcg_measurement_pilot_prompt_power: f64,
     rc3_pcg_measurement_pilot_chip_idx: usize,
     rc3_pcg_measurement_chip_count: usize,
+    /// Coherent sum of 16-chip pilot symbols within the current PCG.
+    rc3_pcg_measurement_pilot_coherent_sum: Complex32,
+    /// Number of 16-chip pilot symbols accumulated in the current PCG.
+    rc3_pcg_measurement_pilot_symbol_count: usize,
+    /// Sliding window of per-PCG pilot moment tuples `(|Σ pilot_sym|²,
+    /// Σ |pilot_sym|², n_symbols)` over the last RC3_PCG_SMOOTH_WINDOW PCGs.
+    rc3_pcg_measurement_smoothing_window: VecDeque<(f64, f64, usize)>,
 
     // Raw (pre-despread) input power accumulator for Rx Power reporting
     raw_input_power_accum: f64,
@@ -428,20 +435,33 @@ const PILOT_CFO_GAIN_WARMUP: f32 = 0.30;
 const PILOT_CFO_WARMUP_UPDATES: usize = 240;
 const RC3_PCG_CHIPS: usize = 1_536;
 const RC3_PILOT_SYMBOL_CHIPS: usize = 16;
+const RC3_PILOT_CHIPS_PER_PCG: usize = 1_152;
+/// `N` factor in the per-symbol SINR formula. Always per-PCG, never K*N
+/// across the smoothing window — passing K*N mis-reports SINR by 10·log10(K) dB.
+const RC3_PILOT_SYMBOLS_PER_PCG: usize = RC3_PILOT_CHIPS_PER_PCG / RC3_PILOT_SYMBOL_CHIPS;
+
+/// Sliding window length for per-PCG pilot moment aggregation.
+const RC3_PCG_SMOOTH_WINDOW: usize = 8;
 
 impl PnLcFinger {
-    /// Estimate reverse pilot Ec/Io from coherent 16-chip Walsh-0 prompt
-    /// power and the matching prompt-chip total power over the same span.
-    ///
-    /// Over an interval with N chips and N/16 pilot symbols:
-    ///   - `pilot_prompt_power = Σ |Σ_{16 chips} x[n]|²`
-    ///   - `prompt_chip_power  = Σ |x[n]|²`
-    ///
-    /// The average pilot chip power is `pilot_prompt_power / (16 * N)`,
-    /// while the average total chip power is `prompt_chip_power / N`, so
-    /// the textbook `Ec/Io = Pc / Ptotal` estimate simplifies to:
-    ///
-    ///   `Ec/Io ≈ pilot_prompt_power / (16 * prompt_chip_power)`
+    /// Per-PCG pilot symbol SINR (dB) from on-axis vs. off-axis decomposition
+    /// of despread pilot symbols. Chosen over Ec/Io because Ec/Io saturates
+    /// with Tx power; pilot symbol SINR scales 1:1 in the noise-limited regime.
+    fn pilot_sym_sinr_db_from_metrics(
+        pilot_norm_sq: f64,
+        pilot_prompt_power: f64,
+        n_symbols: usize,
+    ) -> f32 {
+        if n_symbols == 0 {
+            return f32::NAN;
+        }
+        let n = n_symbols as f64;
+        let denom = (n * pilot_prompt_power - pilot_norm_sq).max(1e-12);
+        let lin = (pilot_norm_sq / denom).max(1e-12);
+        10.0 * (lin as f32).log10()
+    }
+
+    /// Legacy pilot Ec/Io (dB) — diagnostic tag only, does not drive the loop.
     fn pilot_ec_io_db_from_prompt_power(pilot_prompt_power: f64, prompt_chip_power: f64) -> f32 {
         let linear = if prompt_chip_power > 1e-12 {
             (pilot_prompt_power / (16.0 * prompt_chip_power)).max(1e-12)
@@ -458,6 +478,8 @@ impl PnLcFinger {
         self.rc3_pcg_measurement_pilot_prompt_power = 0.0;
         self.rc3_pcg_measurement_pilot_chip_idx = 0;
         self.rc3_pcg_measurement_chip_count = 0;
+        self.rc3_pcg_measurement_pilot_coherent_sum = Complex32::new(0.0, 0.0);
+        self.rc3_pcg_measurement_pilot_symbol_count = 0;
     }
 
     fn emit_rc3_pcg_measurement(&mut self) {
@@ -469,6 +491,39 @@ impl PnLcFinger {
             * ((self.rc3_pcg_measurement_prompt_chip_power / RC3_PCG_CHIPS as f64)
                 .max(1e-15)
                 .log10() as f32);
+        let pilot_norm_sq = self.rc3_pcg_measurement_pilot_coherent_sum.norm_sqr() as f64;
+        let n_symbols_this_pcg = self.rc3_pcg_measurement_pilot_symbol_count;
+        let pilot_prompt_power_this_pcg = self.rc3_pcg_measurement_pilot_prompt_power;
+        let raw_sinr_db = Self::pilot_sym_sinr_db_from_metrics(
+            pilot_norm_sq,
+            pilot_prompt_power_this_pcg,
+            n_symbols_this_pcg,
+        );
+        if self.rc3_pcg_measurement_smoothing_window.len() >= RC3_PCG_SMOOTH_WINDOW {
+            self.rc3_pcg_measurement_smoothing_window.pop_front();
+        }
+        self.rc3_pcg_measurement_smoothing_window.push_back((
+            pilot_norm_sq,
+            pilot_prompt_power_this_pcg,
+            n_symbols_this_pcg,
+        ));
+        // K factor cancels in the ratio: pass per-PCG N below (not K*N),
+        // or SINR is mis-reported by 10·log10(K) dB low.
+        let mut window_norm_sq = 0.0_f64;
+        let mut window_prompt_pwr = 0.0_f64;
+        let mut window_pcgs = 0_usize;
+        for &(ns, pp, _) in &self.rc3_pcg_measurement_smoothing_window {
+            window_norm_sq += ns;
+            window_prompt_pwr += pp;
+            window_pcgs += 1;
+        }
+        let avg_norm_sq = window_norm_sq / window_pcgs.max(1) as f64;
+        let avg_prompt_pwr = window_prompt_pwr / window_pcgs.max(1) as f64;
+        let sinr_db = Self::pilot_sym_sinr_db_from_metrics(
+            avg_norm_sq,
+            avg_prompt_pwr,
+            RC3_PILOT_SYMBOLS_PER_PCG,
+        );
         let ec_io_db = Self::pilot_ec_io_db_from_prompt_power(
             self.rc3_pcg_measurement_pilot_prompt_power,
             self.rc3_pcg_measurement_prompt_chip_power,
@@ -489,8 +544,19 @@ impl PnLcFinger {
             "traffic_pcg_raw_power_mdb",
             (raw_power_dbfs * 1000.0) as i64,
         );
+        block
+            .tags
+            .insert("traffic_pcg_pilot_ec_io_mdb", (ec_io_db * 1000.0) as i64);
+        block.tags.insert(
+            "traffic_pcg_pilot_sinr_raw_mdb",
+            (raw_sinr_db * 1000.0) as i64,
+        );
+        block.tags.insert(
+            "traffic_pcg_smoothing_window",
+            self.rc3_pcg_measurement_smoothing_window.len() as i64,
+        );
         block.tags.insert("finger_id", self.base.id as i64);
-        block.pcg_signal_snr_db = Some(vec![ec_io_db]);
+        block.pcg_signal_snr_db = Some(vec![sinr_db]);
         self.pending_output.push(block);
         self.reset_rc3_pcg_measurement();
     }
@@ -498,6 +564,8 @@ impl PnLcFinger {
     fn update_rc3_pcg_measurement(&mut self, chip_tx: usize, prompt_chip: Complex32) {
         if !self.current_chip_enabled || !self.base.is_hard_validated() {
             self.reset_rc3_pcg_measurement();
+            // Lock loss → smoothing window is no longer meaningful.
+            self.rc3_pcg_measurement_smoothing_window.clear();
             return;
         }
 
@@ -509,13 +577,18 @@ impl PnLcFinger {
         }
 
         self.rc3_pcg_measurement_prompt_chip_power += prompt_chip.norm_sqr() as f64;
-        self.rc3_pcg_measurement_pilot_run_prompt += prompt_chip;
-        self.rc3_pcg_measurement_pilot_chip_idx += 1;
+        let pcg_chip_offset = self.rc3_pcg_measurement_chip_count % RC3_PCG_CHIPS;
+        if pcg_chip_offset < RC3_PILOT_CHIPS_PER_PCG {
+            self.rc3_pcg_measurement_pilot_run_prompt += prompt_chip;
+            self.rc3_pcg_measurement_pilot_chip_idx += 1;
+        }
         self.rc3_pcg_measurement_chip_count += 1;
 
         if self.rc3_pcg_measurement_pilot_chip_idx >= RC3_PILOT_SYMBOL_CHIPS {
-            self.rc3_pcg_measurement_pilot_prompt_power +=
-                self.rc3_pcg_measurement_pilot_run_prompt.norm_sqr() as f64;
+            let pilot_sym = self.rc3_pcg_measurement_pilot_run_prompt;
+            self.rc3_pcg_measurement_pilot_prompt_power += pilot_sym.norm_sqr() as f64;
+            self.rc3_pcg_measurement_pilot_coherent_sum += pilot_sym;
+            self.rc3_pcg_measurement_pilot_symbol_count += 1;
             self.rc3_pcg_measurement_pilot_run_prompt = Complex32::new(0.0, 0.0);
             self.rc3_pcg_measurement_pilot_chip_idx = 0;
         }
@@ -671,6 +744,9 @@ impl PnLcFinger {
             rc3_pcg_measurement_pilot_prompt_power: 0.0,
             rc3_pcg_measurement_pilot_chip_idx: 0,
             rc3_pcg_measurement_chip_count: 0,
+            rc3_pcg_measurement_pilot_coherent_sum: Complex32::new(0.0, 0.0),
+            rc3_pcg_measurement_pilot_symbol_count: 0,
+            rc3_pcg_measurement_smoothing_window: VecDeque::with_capacity(RC3_PCG_SMOOTH_WINDOW),
             raw_input_power_accum: 0.0,
             raw_input_power_count: 0,
             despread_ns: 0,
@@ -1100,7 +1176,7 @@ impl PnLcFinger {
                         }
                     }
 
-                    self.epl_finalize_chip();
+                    self.epl_finalize_chip(chip_tx);
                 }
             }
 
@@ -1121,29 +1197,33 @@ impl PnLcFinger {
     /// the 4-chip coherent rollup, the window-chip counter, the per-log
     /// chip counter, runs the slew loop at window rollup, and emits a
     /// log line when the log interval elapses.
-    fn epl_finalize_chip(&mut self) {
+    fn epl_finalize_chip(&mut self, chip_tx: usize) {
         if self.epl_pilot_mode {
             // Pilot-coherent: dump every 16 chips (one Walsh 0 symbol).
             self.epl_pilot_chip_idx += 1;
             if self.epl_pilot_chip_idx >= 16 {
+                let symbol_start = chip_tx.saturating_add(1).saturating_sub(16);
+                let is_pilot_symbol = symbol_start % RC3_PCG_CHIPS < RC3_PILOT_CHIPS_PER_PCG;
                 let prompt = self.epl_pilot_run_prompt;
-                self.epl_window_pilot_pwr_early += self.epl_pilot_run_early.norm_sqr() as f64;
-                self.epl_window_pilot_pwr_prompt += prompt.norm_sqr() as f64;
-                self.epl_window_pilot_pwr_late += self.epl_pilot_run_late.norm_sqr() as f64;
+                if is_pilot_symbol {
+                    self.epl_window_pilot_pwr_early += self.epl_pilot_run_early.norm_sqr() as f64;
+                    self.epl_window_pilot_pwr_prompt += prompt.norm_sqr() as f64;
+                    self.epl_window_pilot_pwr_late += self.epl_pilot_run_late.norm_sqr() as f64;
+                }
 
                 // Pilot CFO tracking: accumulate 16-chip pilot sums over
                 // 8 PCGs (12288 chips) for a high-SNR phase measurement.
                 // Shorter windows (e.g. 1 PCG) widen the unambiguous range but
                 // produce noise-dominated observations that degrade tracking.
-                if let Some(ref mut cfo) = self.rc3_cfo {
+                if is_pilot_symbol && let Some(ref mut cfo) = self.rc3_cfo {
                     self.rc3_cfo_pilot_accum += prompt;
                     self.rc3_cfo_pilot_chips += 16;
-                    if self.rc3_cfo_pilot_chips >= 12288 {
+                    if self.rc3_cfo_pilot_chips >= 8 * RC3_PILOT_CHIPS_PER_PCG {
                         cfo.observe_pilot(self.rc3_cfo_pilot_accum, self.rc3_cfo_pilot_chips);
                         self.rc3_cfo_pilot_accum = Complex32::new(0.0, 0.0);
                         self.rc3_cfo_pilot_chips = 0;
                     }
-                } else if prompt.norm_sqr() > 1e-12 {
+                } else if is_pilot_symbol && prompt.norm_sqr() > 1e-12 {
                     // RC1 fallback: inline pilot CFO (kept for non-pilot
                     // modes that still want supplementary pilot CFO).
                     if let Some(prev) = self.epl_pilot_prev_prompt {

@@ -17,8 +17,8 @@ pub struct SampleBlock {
     /// populate this on decoded 20 ms frames with 16 entries (one per PCG,
     /// traffic Eb/Nt for active PCGs) and on `traffic_pcg_measurement` event
     /// blocks with one entry for the measured PCG. For RC3 per-PCG
-    /// measurements the metric is pilot Ec/Io (coherent pilot energy over
-    /// total wideband chip power, rate-independent).
+    /// measurements the metric is pilot symbol SINR; pilot Ec/Io is preserved
+    /// as the `traffic_pcg_pilot_ec_io_mdb` tag.
     /// Consumed by the BSC closed-loop power control path. `None` for blocks
     /// that don't carry traffic measurements.
     pub pcg_signal_snr_db: Option<Vec<f32>>,

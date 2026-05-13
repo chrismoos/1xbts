@@ -361,10 +361,11 @@ pub fn allocate_traffic_channel(
             interleaver: BitReversalInterleaver::new(SR1_PARAMS_384),
             long_code_generator: lc_generator,
             lc_chip_cursor: 0,
-            pcb_scheduler: PcgPcbScheduler::new_named(
+            pcb_scheduler: PcgPcbScheduler::new_named_with_fallback(
                 0,
                 walsh_code,
                 format!("rc1-w{}", walsh_code),
+                PcgPcbFallbackMode::AlternatingHold,
             ),
         }),
     );
@@ -443,7 +444,7 @@ pub fn allocate_traffic_channel_rc3(
                 0,
                 walsh_code,
                 format!("rc3-w{}", walsh_code),
-                PcgPcbFallbackMode::Up,
+                PcgPcbFallbackMode::AlternatingHold,
             ),
             fpc_subchan_gain_linear: gain_linear,
             prev_frame_last_chip: 0,
@@ -484,10 +485,11 @@ pub fn commit_traffic_channel(
             interleaver: BitReversalInterleaver::new(SR1_PARAMS_384),
             long_code_generator: lc_generator,
             lc_chip_cursor: 0,
-            pcb_scheduler: PcgPcbScheduler::new_named(
+            pcb_scheduler: PcgPcbScheduler::new_named_with_fallback(
                 0,
                 walsh_code,
                 format!("rc1-w{}", walsh_code),
+                PcgPcbFallbackMode::AlternatingHold,
             ),
         }),
     );
@@ -535,7 +537,7 @@ pub fn commit_traffic_channel_rc3(
                 0,
                 walsh_code,
                 format!("rc3-w{}", walsh_code),
-                PcgPcbFallbackMode::Up,
+                PcgPcbFallbackMode::AlternatingHold,
             ),
             fpc_subchan_gain_linear: gain_linear,
             prev_frame_last_chip: 0,

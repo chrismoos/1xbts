@@ -10,7 +10,7 @@ use log::info;
 pub struct PowerControlHistoryEntry {
     /// Wall-clock timestamp at window close, Unix milliseconds.
     pub timestamp_ms: u64,
-    /// Mean measured Eb/Nt (or pilot Ec/Nt for RC3) over the 500ms window.
+    /// Window mean of the filtered inner-loop metric (Eb/Nt for RC1, pilot SINR for RC3).
     pub measured_mean_db: f32,
     /// Effective inner-loop target at window close.
     pub target_db: f32,
@@ -960,7 +960,12 @@ impl PowerControlState {
             );
         }
 
-        self.record_history_measurement(abs_pcg, measurement_valid, eb_nt_db, effective_target_db);
+        self.record_history_measurement(
+            abs_pcg,
+            measurement_valid,
+            control_metric_db,
+            effective_target_db,
+        );
 
         pcb
     }

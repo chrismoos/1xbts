@@ -5,7 +5,7 @@
   "tx_antenna": "BAND1",
   "tx_gain_db": 60,
   "rx_antenna": "LNAW",
-  "rx_gain_db": 20,
+  "rx_gain_db": 32,
   "rx_freq_hz": 836520000,
   "rx_sample_rate_hz": 4915200,
   "rx_bandwidth_hz": 5000000,

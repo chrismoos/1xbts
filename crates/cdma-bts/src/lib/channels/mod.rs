@@ -48,6 +48,7 @@ pub struct PcgPcbScheduler {
 #[derive(Debug, Clone, Copy)]
 pub enum PcgPcbFallbackMode {
     Up,
+    Down,
     AlternatingHold,
 }
 
@@ -286,6 +287,8 @@ impl PcgPcbScheduler {
             // drop power during scheduling gaps. A slight upward creep is
             // preferable to losing the reverse link.
             PcgPcbFallbackMode::Up => 0,
+            // Conservative fallback until the inner loop schedules commands.
+            PcgPcbFallbackMode::Down => 1,
             // Alternating UP/DOWN is the closest representable HOLD command.
             PcgPcbFallbackMode::AlternatingHold => (abs_pcg as u8) & 1,
         }
