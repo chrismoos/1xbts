@@ -1680,16 +1680,14 @@ mod tests {
         // Third frame should be idle (interval reached).
         let frame3 = bs.next_frame(FrameRate::Full);
 
-        // Verify frame3 decodes as idle/fill (they share wire format).
+        // Verify frame3 decodes as a valid idle/fill frame.
         let decoded = rlp3_frames::decode_rlp3_frame(&frame3, mux()).unwrap();
-        // Idle1 and Fill share the same encoding; we verify the frame was produced.
         match decoded {
             Rlp3Frame::Data { data, .. } if data.is_empty() => {
                 // zero-length data interpreted as idle is fine
             }
             _ => {
-                // Fill/Idle1 share encoding, decode_rlp3_frame may return Data with len=0
-                // or the fill decoder could catch it. Either way, a valid frame was produced.
+                // Either way, a valid frame was produced.
             }
         }
 

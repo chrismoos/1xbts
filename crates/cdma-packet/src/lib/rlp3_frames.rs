@@ -743,17 +743,12 @@ fn encode_fill(seq: u8, seq_hi: u8, mux: MuxOption) -> Result<Vec<u8>, RlpError>
     let mut info = vec![0u8; info_bits];
     let mut pos = 0;
 
-    // SEQ(8) + CTL(4='1001') + SEQ_HI(4) + Padding_1(variable) + FCS(16) + Padding_2(variable)
+    // SEQ(8) + CTL(4='1001') + SEQ_HI(4) + Padding(variable)
     put_bits(&mut info, pos, seq as u32, 8);
     pos += 8;
     put_bits(&mut info, pos, 0b1001, 4);
     pos += 4;
     put_bits(&mut info, pos, seq_hi as u32, 4);
-    pos += 4;
-
-    // FCS-16 covers bits 0..pos (SEQ + CTL + SEQ_HI = 16 bits).
-    let fcs = fcs16(&info[0..pos]);
-    put_fcs16(&mut info, pos, fcs);
 
     let mut frame = vec![0u8; total_bits];
     frame[..info_bits].copy_from_slice(&info);
@@ -766,25 +761,55 @@ fn encode_fill(seq: u8, seq_hi: u8, mux: MuxOption) -> Result<Vec<u8>, RlpError>
     Ok(frame)
 }
 
-/// Encode idle frame Format 1 (Section 4.5.1). Same layout as fill.
+/// Encode idle frame Format 1 (Section 4.5.1).
 fn encode_idle1(seq: u8, seq_hi: u8, mux: MuxOption) -> Result<Vec<u8>, RlpError> {
-    // Identical wire format to fill; differentiated by RLP state machine context.
-    encode_fill(seq, seq_hi, mux)
+    let info_bits = mux.info_bits();
+    let total_bits = mux.frame_bits();
+    let mut info = vec![0u8; info_bits];
+    let mut pos = 0;
+
+    // SEQ(8) + CTL(4='1010') + SEQ_HI(4) + Padding(variable)
+    put_bits(&mut info, pos, seq as u32, 8);
+    pos += 8;
+    put_bits(&mut info, pos, 0b1010, 4);
+    pos += 4;
+    put_bits(&mut info, pos, seq_hi as u32, 4);
+
+    let mut frame = vec![0u8; total_bits];
+    frame[..info_bits].copy_from_slice(&info);
+    put_bits(
+        &mut frame,
+        info_bits,
+        mux.type_format_a() as u32,
+        mux.type_bits(),
+    );
+    Ok(frame)
 }
 
-/// Encode idle frame Format 2 (Section 4.5.2). No SEQ_HI.
+/// Encode idle frame Format 2 (Section 4.5.2).
 fn encode_idle2(seq: u8, mux: MuxOption) -> Result<Vec<u8>, RlpError> {
     let info_bits = mux.info_bits();
     let total_bits = mux.frame_bits();
     let mut info = vec![0u8; info_bits];
     let mut pos = 0;
 
-    // SEQ(8) + Padding_1(variable) + FCS(16) + Padding_2(variable)
+    // SEQ(8) + CTL(4='1000') + SQI(1) + LAST_SEG(1='0') + REXMIT(1='0')
+    // + LEN(5='00000') + SEQ_HI(4) + S_SEQ(12) + Padding(variable).
     put_bits(&mut info, pos, seq as u32, 8);
     pos += 8;
-
-    let fcs = fcs16(&info[0..pos]);
-    put_fcs16(&mut info, pos, fcs);
+    put_bits(&mut info, pos, 0b1000, 4);
+    pos += 4;
+    put_bits(&mut info, pos, 1, 1); // SQI
+    pos += 1;
+    put_bits(&mut info, pos, 0, 1); // LAST_SEG
+    pos += 1;
+    put_bits(&mut info, pos, 0, 1); // REXMIT
+    pos += 1;
+    put_bits(&mut info, pos, 0, 5); // LEN
+    pos += 5;
+    put_bits(&mut info, pos, 0, 4); // SEQ_HI
+    pos += 4;
+    put_bits(&mut info, pos, 0, 12); // S_SEQ
 
     let mut frame = vec![0u8; total_bits];
     frame[..info_bits].copy_from_slice(&info);
@@ -876,18 +901,22 @@ fn decode_format_a(info: &[u8], mux: MuxOption) -> Result<Rlp3Frame, RlpError> {
     let bit9 = info[9];
 
     if bit9 == 0 && info[10] == 0 && info[11] == 0 {
-        // CTL starts '1000' -> segmented data frame.
+        // CTL='1000' can be Idle Format 2, or a segmented data frame.
+        // Idle2 is the zero-length segmented-format pattern defined in §4.5.2.
+        if is_idle2_info(info) {
+            return Ok(Rlp3Frame::Idle2 { seq });
+        }
         return decode_segmented_frame(info, mux);
     }
 
-    // CTL='1001' -> fill/idle1 frame at Rate 1.
+    // CTL='1001' -> Fill, CTL='1010' -> Idle Format 1.
     if bit9 == 0 && info[10] == 0 && info[11] == 1 {
         let seq_hi = get_bits(info, 12, 4) as u8;
-        let fcs_expected = fcs16(&info[0..16]);
-        let fcs_got = get_fcs16(info, 16);
-        if fcs_expected == fcs_got {
-            return Ok(Rlp3Frame::Fill { seq, seq_hi });
-        }
+        return Ok(Rlp3Frame::Fill { seq, seq_hi });
+    }
+    if bit9 == 0 && info[10] == 1 && info[11] == 0 {
+        let seq_hi = get_bits(info, 12, 4) as u8;
+        return Ok(Rlp3Frame::Idle1 { seq, seq_hi });
     }
 
     // Read full 6-bit CTL field.
@@ -1084,6 +1113,15 @@ fn decode_segmented_frame(info: &[u8], _mux: MuxOption) -> Result<Rlp3Frame, Rlp
     })
 }
 
+fn is_idle2_info(info: &[u8]) -> bool {
+    info.len() >= 36
+        && get_bits(info, 8, 4) == 0b1000
+        && info[12] == 1
+        && info[13] == 0
+        && info[14] == 0
+        && get_bits(info, 15, 5) == 0
+}
+
 /// Decode a Format B frame.
 fn decode_format_b(bits: &[u8], mux: MuxOption, rexmit: bool) -> Result<Rlp3Frame, RlpError> {
     let seq = get_bits(bits, 0, 8) as u8;
@@ -1097,14 +1135,9 @@ fn decode_format_b(bits: &[u8], mux: MuxOption, rexmit: bool) -> Result<Rlp3Fram
 
 /// Try to decode a fill or idle frame from Format A information bits.
 ///
-/// Fill frames and Idle Format 1 have the same wire format:
-/// SEQ(8) + SEQ_HI(4) + Padding_1 + FCS(16) + Padding_2.
-///
-/// Idle Format 2: SEQ(8) + Padding_1 + FCS(16) + Padding_2 (no SEQ_HI).
-///
-/// Since both Fill and Idle1 share the same encoding, this function returns
-/// a `Fill` variant. The caller (RLP session state machine) disambiguates
-/// based on RLP state. For Idle2, use `try_decode_idle2`.
+/// Fill: SEQ(8) + CTL(4='1001') + SEQ_HI(4) + Padding.
+/// Idle1: SEQ(8) + CTL(4='1010') + SEQ_HI(4) + Padding.
+/// For Idle2, use `try_decode_idle2`.
 pub fn try_decode_fill_or_idle1(bits: &[u8], mux: MuxOption) -> Result<Rlp3Frame, RlpError> {
     let expected = mux.frame_bits();
     if bits.len() < expected {
@@ -1125,25 +1158,15 @@ pub fn try_decode_fill_or_idle1(bits: &[u8], mux: MuxOption) -> Result<Rlp3Frame
     let info = &bits[..info_bits];
     let seq = get_bits(info, 0, 8) as u8;
     let ctl = get_bits(info, 8, 4) as u8;
-    if ctl != 0b1001 {
-        return Err(RlpError::InvalidFrame(format!(
-            "fill/idle1 CTL={:#06b}, expected 1001",
-            ctl
-        )));
-    }
     let seq_hi = get_bits(info, 12, 4) as u8;
-
-    // FCS covers SEQ(8) + CTL(4) + SEQ_HI(4) = 16 bits.
-    let fcs_expected = fcs16(&info[0..16]);
-    let fcs_got = get_fcs16(info, 16);
-    if fcs_expected != fcs_got {
-        return Err(RlpError::FcsInvalid {
-            expected: fcs_expected,
-            got: fcs_got,
-        });
+    match ctl {
+        0b1001 => Ok(Rlp3Frame::Fill { seq, seq_hi }),
+        0b1010 => Ok(Rlp3Frame::Idle1 { seq, seq_hi }),
+        _ => Err(RlpError::InvalidFrame(format!(
+            "fill/idle1 CTL={:#06b}, expected 1001 or 1010",
+            ctl
+        ))),
     }
-
-    Ok(Rlp3Frame::Fill { seq, seq_hi })
 }
 
 /// Try to decode an Idle Format 2 frame (no SEQ_HI).
@@ -1166,15 +1189,10 @@ pub fn try_decode_idle2(bits: &[u8], mux: MuxOption) -> Result<Rlp3Frame, RlpErr
 
     let info = &bits[..info_bits];
     let seq = get_bits(info, 0, 8) as u8;
-
-    // FCS covers SEQ(8) = 8 bits.
-    let fcs_expected = fcs16(&info[0..8]);
-    let fcs_got = get_fcs16(info, 8);
-    if fcs_expected != fcs_got {
-        return Err(RlpError::FcsInvalid {
-            expected: fcs_expected,
-            got: fcs_got,
-        });
+    if !is_idle2_info(info) {
+        return Err(RlpError::InvalidFrame(
+            "not an Idle Format 2 frame".into(),
+        ));
     }
 
     Ok(Rlp3Frame::Idle2 { seq })
@@ -1186,16 +1204,16 @@ pub fn try_decode_idle2(bits: &[u8], mux: MuxOption) -> Result<Rlp3Frame, RlpErr
 
 /// Encode a sub-rate Fill/Idle1 frame without a Rate-1 TYPE field.
 ///
-/// Sub-rate fill/idle1 uses SEQ(8) + CTL(4='1001') + SEQ_HI(4) + FCS(16),
-/// padded to the physical-rate information bit count.
+/// Sub-rate fill uses SEQ(8) + CTL(4='1001') + SEQ_HI(4), padded to the
+/// physical-rate information bit count.
 pub fn encode_sub_rate_fill(
     seq: u8,
     seq_hi: u8,
     num_info_bits: usize,
 ) -> Result<Vec<u8>, RlpError> {
-    if num_info_bits < 32 {
+    if num_info_bits < 16 {
         return Err(RlpError::InsufficientBits {
-            expected: 32,
+            expected: 16,
             got: num_info_bits,
         });
     }
@@ -1204,8 +1222,6 @@ pub fn encode_sub_rate_fill(
     put_bits(&mut info, 0, seq as u32, 8);
     put_bits(&mut info, 8, 0b1001, 4);
     put_bits(&mut info, 12, (seq_hi & 0x0f) as u32, 4);
-    let fcs = fcs16(&info[0..16]);
-    put_fcs16(&mut info, 16, fcs);
     Ok(info)
 }
 
@@ -1213,7 +1229,7 @@ pub fn encode_sub_rate_fill(
 ///
 /// Sub-rate frames do NOT have a TYPE field — the raw information content
 /// (§4.2 control, §4.3 data, §4.4 fill, §4.5 idle) is placed directly in
-/// the info bits. We use FCS validation to disambiguate frame types.
+/// the info bits.
 ///
 /// `bits` contains individual bit values (0 or 1).
 /// `num_info_bits` is the number of information bits at this rate:
@@ -1227,29 +1243,24 @@ pub fn decode_sub_rate_frame(bits: &[u8], num_info_bits: usize) -> Result<Rlp3Fr
     }
     let info = &bits[..num_info_bits];
 
-    // Try fill / idle1: SEQ(8) + CTL(4='1001') + SEQ_HI(4) + Padding + FCS(16)
-    // FCS covers SEQ(8) + CTL(4) + SEQ_HI(4) = 16 bits, FCS at bits 16..32.
-    if num_info_bits >= 32 {
+    // Try fill / idle1: SEQ(8) + CTL(4) + SEQ_HI(4) + Padding.
+    if num_info_bits >= 16 {
         let ctl4 = get_bits(info, 8, 4) as u8;
-        if ctl4 == 0b1001 {
-            let fcs_expected = fcs16(&info[0..16]);
-            let fcs_got = get_fcs16(info, 16);
-            if fcs_expected == fcs_got {
-                let seq = get_bits(info, 0, 8) as u8;
-                let seq_hi = get_bits(info, 12, 4) as u8;
-                return Ok(Rlp3Frame::Fill { seq, seq_hi });
-            }
+        if ctl4 == 0b1001 || ctl4 == 0b1010 {
+            let seq = get_bits(info, 0, 8) as u8;
+            let seq_hi = get_bits(info, 12, 4) as u8;
+            return if ctl4 == 0b1001 {
+                Ok(Rlp3Frame::Fill { seq, seq_hi })
+            } else {
+                Ok(Rlp3Frame::Idle1 { seq, seq_hi })
+            };
         }
     }
 
-    // Try idle2: SEQ(8) + FCS(16) = 24 bits
-    if num_info_bits >= 24 {
-        let fcs_expected = fcs16(&info[0..8]);
-        let fcs_got = get_fcs16(info, 8);
-        if fcs_expected == fcs_got {
-            let seq = get_bits(info, 0, 8) as u8;
-            return Ok(Rlp3Frame::Idle2 { seq });
-        }
+    // Try idle2: zero-length segmented-format idle.
+    if num_info_bits >= 36 && is_idle2_info(info) {
+        let seq = get_bits(info, 0, 8) as u8;
+        return Ok(Rlp3Frame::Idle2 { seq });
     }
 
     // Try unsegmented data: SEQ(8) + CTL(1='0') + REXMIT(1) + LEN(6) + Data(8*LEN)
@@ -1782,13 +1793,9 @@ mod tests {
             seq_hi: 0x07,
         };
         let bits = frame.encode(MUX).unwrap();
-        // Idle1 and Fill have same wire format; decode as fill.
         let decoded = try_decode_fill_or_idle1(&bits, MUX).unwrap();
-        // Wire format identical to fill, so we get Fill back.
-        assert_eq!(decoded.seq(), 0xBB);
-        if let Rlp3Frame::Fill { seq_hi, .. } = decoded {
-            assert_eq!(seq_hi, 0x07);
-        }
+        assert_eq!(decoded, frame);
+        assert_eq!(decode_rlp3_frame(&bits, MUX).unwrap(), frame);
     }
 
     #[test]
@@ -1808,6 +1815,23 @@ mod tests {
         assert_eq!(bits.len(), mux.frame_bits());
         let decoded = try_decode_idle2(&bits, mux).unwrap();
         assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn test_full_rate_idle1_ctl_1010_from_live_trace() {
+        let mut bits = vec![0u8; MUX.frame_bits()];
+        put_bits(&mut bits, 0, 0, 8);
+        put_bits(&mut bits, 8, 0b1010, 4);
+        put_bits(&mut bits, 12, 0, 4);
+        put_bits(
+            &mut bits,
+            MUX.info_bits(),
+            MUX.type_format_a() as u32,
+            MUX.type_bits(),
+        );
+
+        let decoded = decode_rlp3_frame(&bits, MUX).unwrap();
+        assert_eq!(decoded, Rlp3Frame::Idle1 { seq: 0, seq_hi: 0 });
     }
 
     // -----------------------------------------------------------------------
@@ -1843,25 +1867,24 @@ mod tests {
     }
 
     #[test]
-    fn test_fcs_corrupted_fill() {
+    fn test_fill_rejects_non_fill_idle_ctl() {
         let frame = Rlp3Frame::Fill {
             seq: 0x0A,
             seq_hi: 0x03,
         };
         let mut bits = frame.encode(MUX).unwrap();
-        // Corrupt a data bit.
-        bits[0] ^= 1;
+        put_bits(&mut bits, 8, 0b1011, 4);
         let result = try_decode_fill_or_idle1(&bits, MUX);
-        assert!(matches!(result, Err(RlpError::FcsInvalid { .. })));
+        assert!(matches!(result, Err(RlpError::InvalidFrame(_))));
     }
 
     #[test]
-    fn test_fcs_corrupted_idle2() {
+    fn test_idle2_rejects_bad_idle2_header() {
         let frame = Rlp3Frame::Idle2 { seq: 0x55 };
         let mut bits = frame.encode(MUX).unwrap();
-        bits[3] ^= 1;
+        bits[12] = 0; // SQI must be 1 for Idle Format 2.
         let result = try_decode_idle2(&bits, MUX);
-        assert!(matches!(result, Err(RlpError::FcsInvalid { .. })));
+        assert!(matches!(result, Err(RlpError::InvalidFrame(_))));
     }
 
     #[test]
