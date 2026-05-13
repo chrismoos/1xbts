@@ -242,7 +242,7 @@ impl Bsc {
         let mut awim = AlertWithInformationMessage::ringback();
         awim.calling_party = caller_number.map(|digits| {
             CallingPartyNumberRecord {
-                number_type: 0,            // unknown
+                number_type: 3,            // network-specific
                 number_plan: 1,            // ISDN/telephony (E.164)
                 presentation_indicator: 0, // presentation allowed
                 screening_indicator: 3,    // network provided
@@ -542,7 +542,7 @@ impl Bsc {
                 signal: 0x01,
             }),
             calling_party: caller_number.map(|digits| CallingPartyNumberRecord {
-                number_type: 0,
+                number_type: 3,
                 number_plan: 1,
                 presentation_indicator: 0,
                 screening_indicator: 3,
