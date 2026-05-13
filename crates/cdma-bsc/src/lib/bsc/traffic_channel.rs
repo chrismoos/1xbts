@@ -381,6 +381,16 @@ impl TrafficChannelInfo {
         matches!(self.channel_state, ChannelState::VoiceConnected { .. })
     }
 
+    pub(crate) fn is_waiting_for_mt_connect_order(&self) -> bool {
+        matches!(
+            self.channel_state,
+            ChannelState::VoiceAlerting {
+                mode: VoiceAlertMode::WaitForConnectOrder,
+                ..
+            }
+        )
+    }
+
     pub(crate) fn is_sms_pending_release(&self) -> bool {
         matches!(self.channel_state, ChannelState::SmsPendingRelease)
     }

@@ -438,6 +438,18 @@ impl Bsc {
             .get(&fwd_address)
             .map(|ms| ms.is_voice_connected())
             .unwrap_or(false);
+        let waiting_for_mt_connect = self
+            .mobiles
+            .get_traffic_channel(walsh_code)
+            .is_some_and(|tc| tc.is_waiting_for_mt_connect_order());
+        if waiting_for_mt_connect {
+            log::debug!(
+                "BSC: dropping pre-answer MSC bearer frame circuit_id={} walsh={} while waiting for MS Connect Order",
+                frame.circuit_id,
+                walsh_code
+            );
+            return;
+        }
         if !voice_connected {
             if let Err(e) = self.send_tones_off(walsh_code, 0b111) {
                 warn!(

@@ -927,6 +927,81 @@ async fn mt_voice_on_existing_so33_uses_traffic_service_negotiation() {
 }
 
 #[tokio::test]
+async fn mt_callee_pre_answer_bearer_does_not_stop_handset_alerting() {
+    let (mut bsc, _traffic_rx, walsh_code) = test_bsc_with_active_traffic_channel(3).await;
+    let session_id = Uuid::new_v4();
+    let circuit_id = 0x0123;
+
+    {
+        let tc = bsc.mobiles[0]
+            .find_traffic_channel_by_walsh_mut(walsh_code)
+            .expect("traffic channel should exist");
+        tc.voice_session_id = Some(session_id);
+        tc.voice_leg_role = Some(VoiceLegRole::Callee);
+        tc.msc_circuit_id = Some(circuit_id);
+        tc.mark_voice_alerting(VoiceAlertMode::WaitForConnectOrder);
+        assert!(tc.last_forward_enqueue_at.is_none());
+    }
+
+    bsc.handle_forward_bearer_frame(cdma_ios::VoiceBearerFrame {
+        circuit_id,
+        rate_bps: 9600,
+        payload: vec![1; 171],
+    });
+
+    let tc = bsc.mobiles[0]
+        .find_traffic_channel_by_walsh(walsh_code)
+        .expect("traffic channel should still exist");
+    assert!(matches!(
+        tc.channel_state,
+        ChannelState::VoiceAlerting {
+            mode: VoiceAlertMode::WaitForConnectOrder,
+            ..
+        }
+    ));
+    assert!(
+        tc.last_forward_enqueue_at.is_none(),
+        "pre-answer bearer media must not enqueue tones-off or traffic"
+    );
+}
+
+#[tokio::test]
+async fn mt_callee_connected_bearer_frames_are_forwarded() {
+    let (mut bsc, _traffic_rx, walsh_code) = test_bsc_with_active_traffic_channel(3).await;
+    let session_id = Uuid::new_v4();
+    let circuit_id = 0x0124;
+
+    {
+        let tc = bsc.mobiles[0]
+            .find_traffic_channel_by_walsh_mut(walsh_code)
+            .expect("traffic channel should exist");
+        tc.voice_session_id = Some(session_id);
+        tc.voice_leg_role = Some(VoiceLegRole::Callee);
+        tc.msc_circuit_id = Some(circuit_id);
+        tc.mark_voice_connected(true);
+        assert!(tc.last_forward_enqueue_at.is_none());
+    }
+
+    bsc.handle_forward_bearer_frame(cdma_ios::VoiceBearerFrame {
+        circuit_id,
+        rate_bps: 9600,
+        payload: vec![1; 171],
+    });
+
+    let tc = bsc.mobiles[0]
+        .find_traffic_channel_by_walsh(walsh_code)
+        .expect("traffic channel should still exist");
+    assert!(matches!(
+        tc.channel_state,
+        ChannelState::VoiceConnected { bridged: true }
+    ));
+    assert!(
+        tc.last_forward_enqueue_at.is_some(),
+        "connected bearer media should be forwarded after answer"
+    );
+}
+
+#[tokio::test]
 async fn assigned_channel_preamble_sends_bs_ack_even_if_mobile_state_drifted() {
     use std::sync::Arc;
     let traffic_channels = Arc::new(Mutex::new(Vec::new()));
