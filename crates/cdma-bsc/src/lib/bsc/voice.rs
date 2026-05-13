@@ -65,6 +65,15 @@ pub(crate) struct VoiceCallSession {
     pub(crate) called_number: Option<String>,
 }
 
+/// MT call_id stashed when an SR-to-add-voice is refused; the BSC emits
+/// A1 `AssignmentFailure(call_id)` once the TCH teardown returns the MS
+/// to `Registered`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingAssignmentFailure {
+    pub(crate) call_id: u64,
+    pub(crate) queued_at: Instant,
+}
+
 pub(crate) struct VoiceService {
     pub(crate) sessions: Vec<VoiceCallSession>,
     pub(crate) next_call_connection_ref: u32,
@@ -198,6 +207,43 @@ impl Bsc {
         self.mobiles.update_tc(walsh_code, |_, tc| {
             tc.mark_releasing();
         });
+    }
+
+    /// Packet TCHs have no A1 `a1_call_id`, so no A1 ClearRequest is sent.
+    pub(crate) fn release_tch_for_assignment_failure(&mut self, walsh_code: u8, reason: &str) {
+        info!(
+            "BSC: releasing walsh={} for MT assignment-failure signal ({})",
+            walsh_code, reason
+        );
+        if let Err(e) = self.send_traffic_release_order(walsh_code, 0b111) {
+            warn!(
+                "BSC: failed to send Release Order on walsh={} during {}: {}",
+                walsh_code, reason, e
+            );
+        }
+        self.mobiles.update_tc(walsh_code, |_, tc| {
+            tc.mark_releasing();
+        });
+    }
+
+    pub(crate) fn fire_pending_a1_failure_after_release(
+        &mut self,
+        fwd_address: &cdma_common::lac::paging_messages::MsAddress,
+    ) {
+        let Some(idx) = self
+            .pending_a1_failure_after_release
+            .iter()
+            .position(|(addr, _)| addr == fwd_address)
+        else {
+            return;
+        };
+        let (_, entry) = self.pending_a1_failure_after_release.remove(idx);
+        info!(
+            "BSC: sending A1 AssignmentFailure for {} call_id={} after TCH teardown",
+            format_ms_address(fwd_address),
+            entry.call_id,
+        );
+        self.a1.send_assignment_failure(entry.call_id, 0x16);
     }
 
     pub(crate) fn on_voice_leg_released(

@@ -547,6 +547,7 @@ impl MscRuntime {
                         }
                     }
                 }
+                self.circuits.reset_assignment_failure_retries(call_id);
                 if completed_circuit_id
                     .and_then(|cid| self.circuits.circuits.get(&cid))
                     .is_some_and(|session| {
@@ -588,6 +589,9 @@ impl MscRuntime {
                 {
                     self.flush_deferred_paging_request(a1, call_id).await;
                 }
+            }
+            cdma_ios::MessageType::AssignmentFailure => {
+                self.handle_assignment_failure(a1, call_id).await;
             }
             cdma_ios::MessageType::Connect => {
                 let connect = match cdma_ios::ConnectMessage::decode(&decoded.payload) {
@@ -1048,6 +1052,97 @@ impl MscRuntime {
                 self.config.default_voice_service_option,
             )
             .await;
+    }
+
+    const MT_ASSIGNMENT_FAILURE_MAX_RETRIES: u8 = 3;
+
+    async fn handle_assignment_failure(&mut self, a1: &dyn MscA1Endpoint, call_id: CallId) {
+        let abandoned = self
+            .circuits
+            .cancel_secondary_leg(call_id, self.config.voice_bearer.as_ref());
+        let attempts = self.circuits.bump_assignment_failure_retry(call_id);
+        info!(
+            "MSC: A1 rx AssignmentFailure call_id={} (attempt {}/{}); abandoned circuit_id={:?}",
+            call_id.0,
+            attempts,
+            Self::MT_ASSIGNMENT_FAILURE_MAX_RETRIES,
+            abandoned,
+        );
+        if attempts > Self::MT_ASSIGNMENT_FAILURE_MAX_RETRIES {
+            warn!(
+                "MSC: AssignmentFailure retries exhausted for call_id={}; sending ClearCommand",
+                call_id.0
+            );
+            self.circuits.reset_assignment_failure_retries(call_id);
+            self.send_clear_command(a1, call_id).await;
+            return;
+        }
+        self.reissue_paging_request(a1, call_id).await;
+    }
+
+    async fn reissue_paging_request(&mut self, a1: &dyn MscA1Endpoint, call_id: CallId) {
+        let Some(paging_request) = self.circuits.paging_requests.get(&call_id).cloned() else {
+            warn!(
+                "MSC: cannot re-page call_id={} — no original PagingRequest retained",
+                call_id.0
+            );
+            return;
+        };
+        let payload = match paging_request.encode() {
+            Ok(payload) => payload,
+            Err(error) => {
+                warn!(
+                    "MSC: failed to encode re-page PagingRequest call_id={}: {}",
+                    call_id.0, error
+                );
+                return;
+            }
+        };
+        info!(
+            "MSC: A1 tx PagingRequest call_id={} (re-page after AssignmentFailure)",
+            call_id.0
+        );
+        if let Err(error) = a1
+            .send_to_bsc(EncodedA1Message::from_message_for_call(
+                &cdma_ios::Message::new(cdma_ios::MessageType::PagingRequest, payload),
+                Some(call_id.0),
+            ))
+            .await
+        {
+            warn!(
+                "MSC: failed to send re-page PagingRequest call_id={}: {}",
+                call_id.0, error
+            );
+        }
+    }
+
+    async fn send_clear_command(&self, a1: &dyn MscA1Endpoint, call_id: CallId) {
+        let clear_command = cdma_ios::ClearCommandMessage {
+            cause: cdma_ios::Cause(0x16),
+            cause_layer3: None,
+        };
+        let payload = match clear_command.encode() {
+            Ok(payload) => payload,
+            Err(error) => {
+                warn!(
+                    "MSC: failed to encode ClearCommand call_id={}: {}",
+                    call_id.0, error
+                );
+                return;
+            }
+        };
+        if let Err(error) = a1
+            .send_to_bsc(EncodedA1Message::from_message_for_call(
+                &cdma_ios::Message::new(cdma_ios::MessageType::ClearCommand, payload),
+                Some(call_id.0),
+            ))
+            .await
+        {
+            warn!(
+                "MSC: failed to send ClearCommand call_id={}: {}",
+                call_id.0, error
+            );
+        }
     }
 
     /// Send the MO M2M PagingRequest that was held until the primary leg's
@@ -2116,6 +2211,251 @@ mod tests {
             call_id: CallId(call_id),
             leg_role: MscVoiceLeg::Secondary,
         }));
+    }
+
+    /// Build a runtime with a Secondary leg already in `AssignmentPending`
+    /// for `call_id` (Primary leg fully connected first). Returns the
+    /// runtime, the test client, and the call_id.
+    async fn setup_msc_with_secondary_pending(
+        call_id: u64,
+    ) -> (
+        MscRuntime,
+        cdma_bsc_a1_edge_compat::InProcessMscClient,
+        cdma_bsc_a1_edge_compat::InProcessMscEndpoint,
+    ) {
+        let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(8);
+        let mut runtime = MscRuntime::new(MscRuntimeConfig {
+            hlr_repo: Arc::new(StubHlrRepo),
+            smsc_repo: None,
+            welcome_sms: None,
+            sms_retry: crate::config::SmsRetryConfig::default(),
+            default_voice_service_option: 3,
+            wav_file: None,
+            gateway_fallback_to_wav: true,
+            local_answer_delay_ms: 10_000,
+            media_ringback_enabled: false,
+            media_ringback_type: MediaRingbackType::Nanp,
+            voice_bearer: None,
+            media_gateway: None,
+        });
+        let call_id_typed = runtime.controller.create_call_with_id(
+            CallId(call_id),
+            CallDirection::MobileTerminated,
+            Some(MobileIdentity::Imsi("12345678901".to_string())),
+        );
+        let page = paging_request();
+        runtime
+            .controller
+            .apply_from_msc(
+                call_id_typed,
+                &ProcedureMessage::PagingRequest(page.clone()),
+            )
+            .unwrap();
+        runtime.circuits.paging_requests.insert(call_id_typed, page);
+
+        // Primary leg: PagingResponse → AssignmentRequest → AssignmentComplete.
+        let primary_pr = EncodedA1Message::from_message_for_call(
+            &cdma_ios::Message::new(
+                cdma_ios::MessageType::PagingResponse,
+                paging_response().encode().unwrap(),
+            ),
+            Some(call_id),
+        );
+        runtime.handle_bsc_a1_message(&endpoint, primary_pr).await;
+        let _ = timeout(Duration::from_millis(50), client.poll_a1())
+            .await
+            .unwrap()
+            .unwrap();
+        let primary_ac = EncodedA1Message::from_message_for_call(
+            &cdma_ios::Message::new(
+                cdma_ios::MessageType::AssignmentComplete,
+                AssignmentCompleteMessage {
+                    channel_number: ChannelNumber(0x1122),
+                    encryption_information: None,
+                    service_option: Some(ServiceOption(0x0003)),
+                    a2p_bearer_session_params: None,
+                    a2p_bearer_format_params: None,
+                }
+                .encode()
+                .unwrap(),
+            ),
+            Some(call_id),
+        );
+        runtime.handle_bsc_a1_message(&endpoint, primary_ac).await;
+
+        // Secondary leg: PagingResponse → AssignmentRequest (Secondary leg
+        // now in AssignmentPending).
+        let secondary_pr = EncodedA1Message::from_message_for_call(
+            &cdma_ios::Message::new(
+                cdma_ios::MessageType::PagingResponse,
+                paging_response().encode().unwrap(),
+            ),
+            Some(call_id),
+        );
+        runtime.handle_bsc_a1_message(&endpoint, secondary_pr).await;
+        let _ = timeout(Duration::from_millis(50), client.poll_a1())
+            .await
+            .unwrap()
+            .unwrap();
+
+        (runtime, client, endpoint)
+    }
+
+    fn assignment_failure_msg(call_id: u64) -> EncodedA1Message {
+        EncodedA1Message::from_message_for_call(
+            &cdma_ios::Message::new(
+                cdma_ios::MessageType::AssignmentFailure,
+                cdma_ios::AssignmentFailureMessage {
+                    cause: cdma_ios::Cause(0x16),
+                }
+                .encode()
+                .unwrap(),
+            ),
+            Some(call_id),
+        )
+    }
+
+    #[tokio::test]
+    async fn mt_assignment_failure_triggers_repage() {
+        let call_id = 1001;
+        let (mut runtime, client, endpoint) = setup_msc_with_secondary_pending(call_id).await;
+
+        // Sanity: stale secondary state exists before injection.
+        assert!(
+            runtime
+                .circuits
+                .has_pending_assignment_complete(CallId(call_id))
+        );
+        assert!(runtime.circuits.leg_procedures.contains_key(&MscLegKey {
+            call_id: CallId(call_id),
+            leg_role: MscVoiceLeg::Secondary,
+        }));
+
+        runtime
+            .handle_bsc_a1_message(&endpoint, assignment_failure_msg(call_id))
+            .await;
+
+        // MSC re-pages the same call_id.
+        let repage = timeout(Duration::from_millis(50), client.poll_a1())
+            .await
+            .expect("MSC should emit re-page PagingRequest")
+            .unwrap();
+        assert_eq!(repage.message_type(), cdma_ios::MessageType::PagingRequest);
+        assert_eq!(repage.call_id(), Some(call_id));
+
+        // Secondary-leg state wiped, retry counter at 1.
+        assert!(
+            !runtime
+                .circuits
+                .has_pending_assignment_complete(CallId(call_id))
+        );
+        assert!(!runtime.circuits.leg_procedures.contains_key(&MscLegKey {
+            call_id: CallId(call_id),
+            leg_role: MscVoiceLeg::Secondary,
+        }));
+        assert_eq!(
+            runtime
+                .circuits
+                .mt_assignment_failure_retries
+                .get(&CallId(call_id))
+                .copied(),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn mt_assignment_failure_over_retry_cap_clears_call() {
+        let call_id = 1002;
+        let (mut runtime, client, endpoint) = setup_msc_with_secondary_pending(call_id).await;
+
+        // Pre-bump to the cap so the next failure tips over it.
+        for _ in 0..MscRuntime::MT_ASSIGNMENT_FAILURE_MAX_RETRIES {
+            runtime
+                .circuits
+                .bump_assignment_failure_retry(CallId(call_id));
+        }
+
+        runtime
+            .handle_bsc_a1_message(&endpoint, assignment_failure_msg(call_id))
+            .await;
+
+        let next = timeout(Duration::from_millis(50), client.poll_a1())
+            .await
+            .expect("MSC should emit ClearCommand at retry cap")
+            .unwrap();
+        assert_eq!(next.message_type(), cdma_ios::MessageType::ClearCommand);
+        assert_eq!(next.call_id(), Some(call_id));
+        assert!(
+            runtime
+                .circuits
+                .mt_assignment_failure_retries
+                .get(&CallId(call_id))
+                .is_none(),
+            "retry counter must reset after ClearCommand"
+        );
+    }
+
+    #[tokio::test]
+    async fn mt_assignment_complete_resets_retry_counter() {
+        let call_id = 1003;
+        let (mut runtime, client, endpoint) = setup_msc_with_secondary_pending(call_id).await;
+
+        // Drive one AssignmentFailure → re-page.
+        runtime
+            .handle_bsc_a1_message(&endpoint, assignment_failure_msg(call_id))
+            .await;
+        let _ = timeout(Duration::from_millis(50), client.poll_a1())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            runtime
+                .circuits
+                .mt_assignment_failure_retries
+                .get(&CallId(call_id))
+                .copied(),
+            Some(1)
+        );
+
+        // Simulate the BSC's fresh PagingResponse → AssignmentRequest →
+        // AssignmentComplete on the new leg.
+        let fresh_pr = EncodedA1Message::from_message_for_call(
+            &cdma_ios::Message::new(
+                cdma_ios::MessageType::PagingResponse,
+                paging_response().encode().unwrap(),
+            ),
+            Some(call_id),
+        );
+        runtime.handle_bsc_a1_message(&endpoint, fresh_pr).await;
+        let _ = timeout(Duration::from_millis(50), client.poll_a1())
+            .await
+            .unwrap()
+            .unwrap();
+        let ac = EncodedA1Message::from_message_for_call(
+            &cdma_ios::Message::new(
+                cdma_ios::MessageType::AssignmentComplete,
+                AssignmentCompleteMessage {
+                    channel_number: ChannelNumber(0x1122),
+                    encryption_information: None,
+                    service_option: Some(ServiceOption(0x0003)),
+                    a2p_bearer_session_params: None,
+                    a2p_bearer_format_params: None,
+                }
+                .encode()
+                .unwrap(),
+            ),
+            Some(call_id),
+        );
+        runtime.handle_bsc_a1_message(&endpoint, ac).await;
+
+        assert!(
+            runtime
+                .circuits
+                .mt_assignment_failure_retries
+                .get(&CallId(call_id))
+                .is_none(),
+            "AssignmentComplete must reset the retry counter"
+        );
     }
 
     /// MO M2M scenario: the secondary-leg PagingRequest must NOT be sent to

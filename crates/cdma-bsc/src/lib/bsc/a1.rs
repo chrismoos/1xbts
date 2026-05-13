@@ -258,6 +258,27 @@ impl A1Service {
         self.send_message(call_id, cdma_ios::MessageType::ClearRequest, payload);
     }
 
+    pub(crate) fn send_assignment_failure(&self, call_id: u64, cause: u8) {
+        let msg = cdma_ios::AssignmentFailureMessage {
+            cause: cdma_ios::Cause(cause),
+        };
+        let payload = match msg.encode() {
+            Ok(payload) => payload,
+            Err(error) => {
+                warn!(
+                    "BSC: failed to encode A1 Assignment Failure for call_id={}: {}",
+                    call_id, error
+                );
+                return;
+            }
+        };
+        info!(
+            "BSC: A1 tx AssignmentFailure call_id={} cause=0x{:02x}",
+            call_id, cause
+        );
+        self.send_message(call_id, cdma_ios::MessageType::AssignmentFailure, payload);
+    }
+
     pub(crate) fn send_clear_complete(&self, call_id: u64, power_down_indicator: bool) {
         let clear_complete = cdma_ios::ClearCompleteMessage {
             power_down_indicator,

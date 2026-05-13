@@ -1190,9 +1190,7 @@ pub fn try_decode_idle2(bits: &[u8], mux: MuxOption) -> Result<Rlp3Frame, RlpErr
     let info = &bits[..info_bits];
     let seq = get_bits(info, 0, 8) as u8;
     if !is_idle2_info(info) {
-        return Err(RlpError::InvalidFrame(
-            "not an Idle Format 2 frame".into(),
-        ));
+        return Err(RlpError::InvalidFrame("not an Idle Format 2 frame".into()));
     }
 
     Ok(Rlp3Frame::Idle2 { seq })

@@ -107,6 +107,8 @@ impl Bsc {
         }
 
         self.publish_mobiles();
+
+        self.fire_pending_a1_failure_after_release(&addr);
     }
 
     /// Send a Release Order on the forward traffic channel.

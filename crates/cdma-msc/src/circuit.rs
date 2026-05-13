@@ -68,6 +68,9 @@ pub(crate) struct CircuitService {
     pub(crate) deferred_paging_requests: HashMap<CallId, cdma_ios::PagingRequestMessage>,
     /// Initial Paging Request per MT call, reused to initialize per-leg A1 procedure engines.
     pub(crate) paging_requests: HashMap<CallId, cdma_ios::PagingRequestMessage>,
+    /// Per-call retry counter for MT-leg AssignmentFailure-driven re-pages.
+    /// Reset on successful AssignmentComplete or call cleanup.
+    pub(crate) mt_assignment_failure_retries: HashMap<CallId, u8>,
 }
 
 impl CircuitService {
@@ -80,7 +83,21 @@ impl CircuitService {
             deferred_paging_responses: HashMap::new(),
             deferred_paging_requests: HashMap::new(),
             paging_requests: HashMap::new(),
+            mt_assignment_failure_retries: HashMap::new(),
         }
+    }
+
+    pub(crate) fn bump_assignment_failure_retry(&mut self, call_id: CallId) -> u8 {
+        let entry = self
+            .mt_assignment_failure_retries
+            .entry(call_id)
+            .or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
+    pub(crate) fn reset_assignment_failure_retries(&mut self, call_id: CallId) {
+        self.mt_assignment_failure_retries.remove(&call_id);
     }
 
     pub(crate) fn insert_circuit_session(&mut self, circuit_id: u16, mut session: CircuitSession) {
@@ -236,6 +253,32 @@ impl CircuitService {
         self.deferred_paging_requests.remove(&call_id)
     }
 
+    /// Wipe all secondary-leg state for `call_id` so the next inbound
+    /// PagingResponse hits the lazy-init path in
+    /// `apply_secondary_leg_from_bsc`. Returns the abandoned circuit_id.
+    pub(crate) fn cancel_secondary_leg(
+        &mut self,
+        call_id: CallId,
+        voice_bearer: Option<&std::sync::Arc<cdma_ios::VoiceBearerManager>>,
+    ) -> Option<u16> {
+        let key = MscLegKey {
+            call_id,
+            leg_role: MscVoiceLeg::Secondary,
+        };
+        let pending_circuit = self.pending_assignment_completes.remove(&key);
+        if self.active_assignment_legs.get(&call_id) == Some(&MscVoiceLeg::Secondary) {
+            self.active_assignment_legs.remove(&call_id);
+        }
+        self.leg_procedures.remove(&key);
+        if let Some(circuit_id) = pending_circuit {
+            if let Some(bearer) = voice_bearer {
+                bearer.close_circuit(circuit_id);
+            }
+            self.circuits.remove(&circuit_id);
+        }
+        pending_circuit
+    }
+
     /// Clean up all circuit state associated with a call.
     pub(crate) fn cleanup_call(
         &mut self,
@@ -249,6 +292,7 @@ impl CircuitService {
         self.deferred_paging_requests.remove(&call_id);
         self.paging_requests.remove(&call_id);
         self.leg_procedures.retain(|leg, _| leg.call_id != call_id);
+        self.mt_assignment_failure_retries.remove(&call_id);
 
         let circuit_ids: Vec<u16> = self
             .circuits

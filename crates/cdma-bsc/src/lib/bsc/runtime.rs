@@ -100,6 +100,7 @@ impl Bsc {
                     self.drain_pch_transfer_acks();
                     self.teardown_stale_traffic_channels(traffic_timeout).await;
                     self.evict_stale_mobiles();
+                    self.expire_stale_pending_a1_failures();
                 }
                 _ = bearer_poll_interval.tick() => {
                     self.poll_reverse_bearer_preambles().await;
@@ -174,6 +175,23 @@ impl Bsc {
             self.teardown_traffic_channel(stale.walsh_code).await;
             self.on_voice_leg_released(stale.voice_session_id, stale.voice_leg_role);
         }
+    }
+
+    fn expire_stale_pending_a1_failures(&mut self) {
+        const PENDING_A1_FAILURE_TIMEOUT: Duration = Duration::from_secs(10);
+        let now = Instant::now();
+        self.pending_a1_failure_after_release.retain(|(addr, entry)| {
+            let aged = now.duration_since(entry.queued_at) > PENDING_A1_FAILURE_TIMEOUT;
+            if aged {
+                warn!(
+                    "BSC: discarding pending A1 AssignmentFailure for {} call_id={} (TCH teardown did not complete within {}s)",
+                    crate::addressing::format_ms_address(addr),
+                    entry.call_id,
+                    PENDING_A1_FAILURE_TIMEOUT.as_secs(),
+                );
+            }
+            !aged
+        });
     }
 
     fn evict_stale_mobiles(&mut self) {

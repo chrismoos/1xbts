@@ -4,6 +4,7 @@ use std::sync::{
 };
 
 use cdma_bts::bts::{AccessChannelEvent, PagingChannelSettings};
+use cdma_common::lac::paging_messages::MsAddress;
 use cdma_common::overhead::OverheadParameters;
 use cdma_hlr::repository::HlrRepository;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -12,9 +13,9 @@ use crate::config::{PagingRetryConfig, TrafficAssignmentConfig, TrafficRetryConf
 
 use super::{
     A1Service, AccessService, DataCallRequest, EventService, HlrResolution, MobileInfo,
-    MobileRegistryService, PacketService, PagingEvent, PagingService, SmsRequest, SmsService,
-    TrafficAssignmentService, TrafficBearerService, TrafficEvent, TrafficLifecycleService,
-    TrafficPowerOverrideRequest, TrafficSignalingService, VoiceService,
+    MobileRegistryService, PacketService, PagingEvent, PagingService, PendingAssignmentFailure,
+    SmsRequest, SmsService, TrafficAssignmentService, TrafficBearerService, TrafficEvent,
+    TrafficLifecycleService, TrafficPowerOverrideRequest, TrafficSignalingService, VoiceService,
 };
 
 pub(crate) async fn recv_or_pending<T>(
@@ -138,6 +139,7 @@ pub struct Bsc {
     pub(crate) voice: VoiceService,
     pub(crate) traffic_signaling: TrafficSignalingService,
     pub(crate) traffic_bearer: TrafficBearerService,
+    pub(crate) pending_a1_failure_after_release: Vec<(MsAddress, PendingAssignmentFailure)>,
 }
 
 impl Bsc {
@@ -173,6 +175,7 @@ impl Bsc {
             voice: VoiceService::default(),
             traffic_signaling: TrafficSignalingService::default(),
             traffic_bearer: TrafficBearerService::default(),
+            pending_a1_failure_after_release: Vec::new(),
         }
     }
 }

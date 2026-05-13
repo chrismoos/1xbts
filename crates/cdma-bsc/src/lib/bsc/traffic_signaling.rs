@@ -88,6 +88,48 @@ impl Bsc {
         }
     }
 
+    /// Returns `true` if a voice add-on attempt was in progress on this
+    /// TCH and we kicked off the release-and-signal-failure path. The A1
+    /// AssignmentFailure is emitted at the end of `teardown_traffic_channel`.
+    pub(crate) fn release_tch_and_signal_assignment_failure(
+        &mut self,
+        walsh_code: u8,
+        fwd_address: &MsAddress,
+        reason: &str,
+    ) -> bool {
+        let Some(tc) = self.mobiles.get_traffic_channel(walsh_code) else {
+            return false;
+        };
+        if tc.voice_service_option.is_none() {
+            return false;
+        }
+        let Some(call_id) = tc.a1_call_id else {
+            return false;
+        };
+        self.pending_a1_failure_after_release
+            .retain(|(addr, _)| addr != fwd_address);
+        self.pending_a1_failure_after_release.push((
+            fwd_address.clone(),
+            super::PendingAssignmentFailure {
+                call_id,
+                queued_at: Instant::now(),
+            },
+        ));
+        // Strip voice add-on so teardown doesn't fire on_voice_leg_released.
+        self.mobiles.update_tc(walsh_code, |_, tc| {
+            tc.clear_voice_service_connection();
+        });
+        info!(
+            "BSC: stashed A1 AssignmentFailure for {} call_id={} ({}); releasing walsh={}",
+            format_ms_address(fwd_address),
+            call_id,
+            reason,
+            walsh_code,
+        );
+        self.release_tch_for_assignment_failure(walsh_code, reason);
+        true
+    }
+
     pub(crate) async fn advance_waiting_ms_ack(
         &mut self,
         walsh_code: u8,
@@ -643,27 +685,15 @@ impl Bsc {
                         }
                     }
                     0b0001 => {
-                        // Reject — if this was adding a voice service option
-                        // to an existing packet session, release only the
-                        // proposed voice connection and keep the TCH/SO33
-                        // connection. If the whole TCH represented the
-                        // requested service, tear the channel down.
                         warn!(
                             "BSC: mobile rejected Service Request on walsh={}",
                             walsh_code
                         );
-                        let voice_context =
-                            self.mobiles.get_traffic_channel(walsh_code).and_then(|tc| {
-                                tc.voice_service_option
-                                    .map(|_| (tc.voice_session_id, tc.voice_leg_role))
-                            });
-                        if let Some((session_id, leg_role)) = voice_context {
-                            self.mobiles.update_tc(walsh_code, |_, tc| {
-                                tc.clear_voice_service_connection();
-                                tc.mark_active();
-                            });
-                            self.on_voice_leg_released(session_id, leg_role);
-                        } else {
+                        if !self.release_tch_and_signal_assignment_failure(
+                            walsh_code,
+                            &addr,
+                            "Service Response reject",
+                        ) {
                             self.teardown_traffic_channel(walsh_code).await;
                         }
                     }
@@ -711,18 +741,10 @@ impl Bsc {
                                     "BSC: rejecting counter-propose on walsh={} — proposed SO={} not in supported set ({:?})",
                                     walsh_code, so, ACCEPTABLE_COUNTER_PROPOSE_SOS
                                 );
-                                let voice_context =
-                                    self.mobiles.get_traffic_channel(walsh_code).and_then(|tc| {
-                                        tc.voice_service_option
-                                            .map(|_| (tc.voice_session_id, tc.voice_leg_role))
-                                    });
-                                if let Some((session_id, leg_role)) = voice_context {
-                                    self.mobiles.update_tc(walsh_code, |_, tc| {
-                                        tc.clear_voice_service_connection();
-                                        tc.mark_active();
-                                    });
-                                    self.on_voice_leg_released(session_id, leg_role);
-                                } else {
+                                let reason = format!("counter-propose SO={} unsupported", so);
+                                if !self.release_tch_and_signal_assignment_failure(
+                                    walsh_code, &addr, &reason,
+                                ) {
                                     self.teardown_traffic_channel(walsh_code).await;
                                 }
                             }

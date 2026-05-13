@@ -78,7 +78,9 @@ pub(crate) use traffic_lifecycle::TrafficLifecycleService;
 pub(crate) use traffic_signaling::{
     TrafficSignalingService, mark_reverse_regular_msg_seq_received,
 };
-pub(crate) use voice::{VoiceAlertMode, VoiceLegRole, VoiceService, VoiceSessionKind};
+pub(crate) use voice::{
+    PendingAssignmentFailure, VoiceAlertMode, VoiceLegRole, VoiceService, VoiceSessionKind,
+};
 
 /// Re-export the generated `bsc.v1` protobuf API at the path tonic-build uses
 /// for cross-package references from the management protos.

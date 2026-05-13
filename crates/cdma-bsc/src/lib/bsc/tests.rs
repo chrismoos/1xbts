@@ -25,7 +25,10 @@ use cdma_bts::bts::{
     TrafficChannelPool, TrafficResourceController, TrafficRxPool, TrafficRxRemovals, WalshAllocator,
 };
 use cdma_bts::lac as bts_lac;
-use cdma_common::access::{AccessMessage, AccessMessageHeader, OriginationMessage};
+use cdma_common::access::{
+    AccessMessage, AccessMessageHeader, OriginationMessage, ServiceConfigRecord,
+    ServiceConnectConnectionRecord, ServiceResponseMessage,
+};
 use cdma_common::bits::Bitstream;
 use cdma_common::events::AccessChannelEvent;
 use cdma_common::formatting::format_dtmf_digits;
@@ -559,6 +562,13 @@ fn test_bsc_with_max_slot_cycle_index(max_slot_cycle_index: u8) -> Bsc {
 pub(super) async fn test_bsc_with_active_traffic_channel(
     service_option: u16,
 ) -> (Bsc, broadcast::Receiver<TrafficEvent>, u8) {
+    test_bsc_with_active_traffic_channel_and_msc_client(service_option, test_msc_client()).await
+}
+
+pub(super) async fn test_bsc_with_active_traffic_channel_and_msc_client(
+    service_option: u16,
+    msc_client: Arc<dyn crate::a1_edge::MscClient>,
+) -> (Bsc, broadcast::Receiver<TrafficEvent>, u8) {
     use std::sync::Arc;
     let traffic_channels = Arc::new(Mutex::new(Vec::new()));
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
@@ -584,7 +594,7 @@ pub(super) async fn test_bsc_with_active_traffic_channel(
         traffic_broadcast: Some(traffic_tx),
         rx_reference_dbm: None,
         hlr_repo: None,
-        msc_client: test_msc_client(),
+        msc_client,
         bts_client: Some(test_bts_client(
             walsh_allocator,
             traffic_channels,
@@ -924,6 +934,259 @@ async fn mt_voice_on_existing_so33_uses_traffic_service_negotiation() {
     assert_eq!(service_options, vec![3]);
     assert_eq!(cfg.connections[0].con_ref, 0);
     assert_eq!(cfg.connections[0].sr_id, 2);
+}
+
+/// Build a reverse Service Response carrying a counter-propose with the
+/// given SO. Suitable for `bsc.inject_access_event(...)` against a TCH
+/// currently in `WaitingServiceResponse`.
+fn test_service_response_counter_propose(
+    walsh_code: u8,
+    serv_req_seq: u8,
+    proposed_so: u16,
+) -> AccessChannelEvent {
+    let mut event = test_access_event();
+    event.message_id = MessageId::ServiceResponse;
+    event.msg_type_name = "Service Response Message".to_string();
+    event.msg_seq = Some(0);
+    event.ack_req = true;
+    event.ack_seq = Some(0);
+    event.traffic_walsh_code = Some(walsh_code);
+    event.decoded_l3 = Some(AccessMessage::ServiceResponse(ServiceResponseMessage {
+        serv_req_seq,
+        resp_purpose: 0b0010, // counter-propose
+        service_config: Some(ServiceConfigRecord {
+            for_mux_option: 1,
+            rev_mux_option: 1,
+            for_rates: 0xF0,
+            rev_rates: 0xF0,
+            connection_records: vec![ServiceConnectConnectionRecord {
+                con_ref: 0,
+                service_option: proposed_so,
+                for_traffic: 1,
+                rev_traffic: 1,
+                ui_encrypt_mode: 0,
+                sr_id: 1,
+                rlp_info_incl: false,
+                rlp_blob: None,
+                qos_parms: None,
+            }],
+            fch_cc_incl: true,
+            fch_frame_size: Some(0),
+            for_fch_rc: Some(3),
+            rev_fch_rc: Some(3),
+            dcch_cc_incl: false,
+            for_sch_cc_incl: false,
+            rev_sch_cc_incl: false,
+        }),
+    }));
+    event
+}
+
+fn test_service_response_reject(walsh_code: u8, serv_req_seq: u8) -> AccessChannelEvent {
+    let mut event = test_access_event();
+    event.message_id = MessageId::ServiceResponse;
+    event.msg_type_name = "Service Response Message".to_string();
+    event.msg_seq = Some(0);
+    event.ack_req = true;
+    event.ack_seq = Some(0);
+    event.traffic_walsh_code = Some(walsh_code);
+    event.decoded_l3 = Some(AccessMessage::ServiceResponse(ServiceResponseMessage {
+        serv_req_seq,
+        resp_purpose: 0b0001, // reject
+        service_config: None,
+    }));
+    event
+}
+
+fn test_ms_release_order(walsh_code: u8) -> AccessChannelEvent {
+    let mut event = test_access_event();
+    event.message_id = MessageId::Order;
+    event.msg_type_name = "Order Message".to_string();
+    event.msg_seq = Some(1);
+    event.ack_req = false;
+    event.traffic_walsh_code = Some(walsh_code);
+    event.order_code = Some(0b010101); // Release
+    event
+}
+
+/// Wait briefly for a captured A1 message from the BSC and decode its type.
+async fn recv_a1_with_timeout(
+    endpoint: &crate::a1_edge::InProcessMscEndpoint,
+) -> Option<(cdma_ios::MessageType, Option<u64>)> {
+    let msg = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        endpoint.recv_from_bsc(),
+    )
+    .await
+    .ok()
+    .flatten()?;
+    let call_id = msg.call_id();
+    let decoded = msg.decode().ok()?;
+    Some((decoded.message_type, call_id))
+}
+
+async fn drain_a1_until_assignment_failure(
+    endpoint: &crate::a1_edge::InProcessMscEndpoint,
+) -> Option<u64> {
+    for _ in 0..16 {
+        match recv_a1_with_timeout(endpoint).await {
+            Some((cdma_ios::MessageType::AssignmentFailure, Some(call_id))) => {
+                return Some(call_id);
+            }
+            Some(_) => continue,
+            None => return None,
+        }
+    }
+    None
+}
+
+#[tokio::test]
+async fn mt_voice_so15_counter_propose_releases_and_signals_failure() {
+    let (client, endpoint) = crate::a1_edge::InProcessMscClient::pair(8);
+    let (mut bsc, mut traffic_rx, walsh_code) =
+        test_bsc_with_active_traffic_channel_and_msc_client(33, Arc::new(client)).await;
+    bsc.mobiles[0].subscriber_id = Some(Uuid::new_v4());
+    bsc.mobiles[0].phone_number = Some("5551234567".to_string());
+
+    let addr = bsc.mobiles[0].fwd_address.clone();
+    let fake_call_id: u64 = 0xABCD_1234;
+    let session_id = Uuid::new_v4();
+    bsc.start_mt_voice_on_existing_traffic(
+        &addr,
+        3,
+        session_id,
+        VoiceLegRole::Callee,
+        Some(fake_call_id),
+    )
+    .expect("MT voice add-on should be initiated");
+
+    let sr_event = traffic_rx
+        .try_recv()
+        .expect("Service Request should be sent on F-TCH");
+    let serv_req_seq = sr_event
+        .service_request
+        .expect("traffic event should carry Service Request params")
+        .serv_req_seq;
+
+    bsc.inject_access_event(test_service_response_counter_propose(
+        walsh_code,
+        serv_req_seq,
+        15,
+    ))
+    .await;
+
+    let tc = bsc.mobiles[0]
+        .traffic_channel
+        .as_ref()
+        .expect("TCH should still be present pending release");
+    assert!(matches!(tc.channel_state, ChannelState::Releasing { .. }));
+    assert!(tc.voice_service_option.is_none());
+    assert!(tc.voice_session_id.is_none());
+    assert_eq!(bsc.pending_a1_failure_after_release.len(), 1);
+
+    // Pre-teardown: no AssignmentFailure must be on the wire yet
+    // (CompleteLayer3Information from the fixture's Origination may have
+    // already been emitted — that's fine, only AssignmentFailure is gated).
+    for _ in 0..4 {
+        match recv_a1_with_timeout(&endpoint).await {
+            Some((cdma_ios::MessageType::AssignmentFailure, _)) => {
+                panic!("AssignmentFailure must not be sent before TCH teardown")
+            }
+            Some(_) => continue,
+            None => break,
+        }
+    }
+
+    let mut saw_release = false;
+    while let Ok(event) = traffic_rx.try_recv() {
+        if let Some(order) = event.order {
+            if order.order == 0b010101 {
+                saw_release = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_release, "Release Order must be sent on F-TCH");
+
+    bsc.inject_access_event(test_ms_release_order(walsh_code))
+        .await;
+
+    assert!(bsc.mobiles[0].traffic_channel.is_none());
+    assert!(bsc.pending_a1_failure_after_release.is_empty());
+
+    let failure_call_id = drain_a1_until_assignment_failure(&endpoint)
+        .await
+        .expect("BSC must emit AssignmentFailure after teardown");
+    assert_eq!(failure_call_id, fake_call_id);
+}
+
+#[tokio::test]
+async fn mt_voice_reject_releases_and_signals_failure() {
+    let (client, endpoint) = crate::a1_edge::InProcessMscClient::pair(8);
+    let (mut bsc, mut traffic_rx, walsh_code) =
+        test_bsc_with_active_traffic_channel_and_msc_client(33, Arc::new(client)).await;
+    bsc.mobiles[0].subscriber_id = Some(Uuid::new_v4());
+    bsc.mobiles[0].phone_number = Some("5551234567".to_string());
+
+    let addr = bsc.mobiles[0].fwd_address.clone();
+    let fake_call_id: u64 = 0xDEAD_BEEF;
+    let session_id = Uuid::new_v4();
+    bsc.start_mt_voice_on_existing_traffic(
+        &addr,
+        3,
+        session_id,
+        VoiceLegRole::Callee,
+        Some(fake_call_id),
+    )
+    .expect("MT voice add-on should be initiated");
+
+    let sr_event = traffic_rx
+        .try_recv()
+        .expect("Service Request should be sent on F-TCH");
+    let serv_req_seq = sr_event
+        .service_request
+        .expect("traffic event should carry Service Request params")
+        .serv_req_seq;
+
+    bsc.inject_access_event(test_service_response_reject(walsh_code, serv_req_seq))
+        .await;
+
+    let tc = bsc.mobiles[0]
+        .traffic_channel
+        .as_ref()
+        .expect("TCH should still be present pending release");
+    assert!(matches!(tc.channel_state, ChannelState::Releasing { .. }));
+    assert_eq!(bsc.pending_a1_failure_after_release.len(), 1);
+    for _ in 0..4 {
+        match recv_a1_with_timeout(&endpoint).await {
+            Some((cdma_ios::MessageType::AssignmentFailure, _)) => {
+                panic!("AssignmentFailure must not be sent before TCH teardown")
+            }
+            Some(_) => continue,
+            None => break,
+        }
+    }
+
+    let mut saw_release = false;
+    while let Ok(event) = traffic_rx.try_recv() {
+        if let Some(order) = event.order {
+            if order.order == 0b010101 {
+                saw_release = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_release, "Release Order must be sent on F-TCH");
+
+    bsc.inject_access_event(test_ms_release_order(walsh_code))
+        .await;
+
+    assert!(bsc.mobiles[0].traffic_channel.is_none());
+    assert!(bsc.pending_a1_failure_after_release.is_empty());
+    let failure_call_id = drain_a1_until_assignment_failure(&endpoint)
+        .await
+        .expect("BSC must emit AssignmentFailure after teardown");
+    assert_eq!(failure_call_id, fake_call_id);
 }
 
 #[tokio::test]
