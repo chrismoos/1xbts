@@ -88,6 +88,25 @@ pub trait HlrRepository: Send + Sync {
         &self,
         subscriber_id: Uuid,
     ) -> Result<Option<RegistrationBinding>, String>;
+
+    // Ringtone
+    /// Persist a custom ringtone for one subscriber. The implementation
+    /// preencodes the WAV into every supported voice codec and stores the
+    /// resulting frame streams.
+    async fn set_ringtone(
+        &self,
+        subscriber_id: Uuid,
+        wav_bytes: Vec<u8>,
+        original_filename: &str,
+    ) -> Result<SetRingtoneOutcome, String>;
+
+    async fn clear_ringtone(&self, subscriber_id: Uuid) -> Result<(), String>;
+
+    async fn get_ringtone_codec(
+        &self,
+        subscriber_id: Uuid,
+        codec: &str,
+    ) -> Result<Option<SubscriberRingtoneCodecBlob>, String>;
 }
 
 /// gRPC-backed HLR repository adapter.
@@ -180,6 +199,8 @@ fn subscriber_from_proto(value: proto::Subscriber) -> Result<Subscriber, String>
         updated_at: timestamp_to_datetime(value.updated_at)?,
         number_type: number_type_from_proto(value.number_type),
         number_plan: number_plan_from_proto(value.number_plan),
+        has_ringtone: value.has_ringtone,
+        ringtone_duration_ms: value.ringtone_duration_ms,
     })
 }
 
@@ -521,6 +542,74 @@ impl HlrRepository for GrpcHlrRepository {
             .into_inner();
         response.binding.map(binding_from_proto).transpose()
     }
+
+    async fn set_ringtone(
+        &self,
+        subscriber_id: Uuid,
+        wav_bytes: Vec<u8>,
+        original_filename: &str,
+    ) -> Result<SetRingtoneOutcome, String> {
+        let mut client = self.client();
+        let response = client
+            .set_subscriber_ringtone(proto::SetSubscriberRingtoneRequest {
+                subscriber_id: subscriber_id.to_string(),
+                wav_bytes,
+                original_filename: original_filename.to_string(),
+            })
+            .await
+            .map_err(|e| format!("HLR SetSubscriberRingtone: {e}"))?
+            .into_inner();
+        Ok(SetRingtoneOutcome {
+            codecs: response
+                .codecs
+                .into_iter()
+                .map(|c| SetRingtoneCodecOutcome {
+                    codec: c.codec,
+                    encoded_bytes: c.encoded_bytes,
+                    frame_count: c.frame_count,
+                })
+                .collect(),
+            duration_ms: response.duration_ms,
+        })
+    }
+
+    async fn clear_ringtone(&self, subscriber_id: Uuid) -> Result<(), String> {
+        let mut client = self.client();
+        client
+            .clear_subscriber_ringtone(proto::ClearSubscriberRingtoneRequest {
+                subscriber_id: subscriber_id.to_string(),
+            })
+            .await
+            .map_err(|e| format!("HLR ClearSubscriberRingtone: {e}"))?;
+        Ok(())
+    }
+
+    async fn get_ringtone_codec(
+        &self,
+        subscriber_id: Uuid,
+        codec: &str,
+    ) -> Result<Option<SubscriberRingtoneCodecBlob>, String> {
+        let mut client = self.client();
+        match client
+            .get_subscriber_ringtone_codec(proto::GetSubscriberRingtoneCodecRequest {
+                subscriber_id: subscriber_id.to_string(),
+                codec: codec.to_string(),
+            })
+            .await
+        {
+            Ok(response) => {
+                let r = response.into_inner();
+                Ok(Some(SubscriberRingtoneCodecBlob {
+                    codec: codec.to_string(),
+                    encoded_frames: r.encoded_frames,
+                    frame_count: r.frame_count,
+                    duration_ms: r.duration_ms,
+                }))
+            }
+            Err(status) if status.code() == Code::NotFound => Ok(None),
+            Err(status) => Err(format!("HLR GetSubscriberRingtoneCodec: {status}")),
+        }
+    }
 }
 
 // ─── PostgreSQL Implementation ─────────────────────────────────
@@ -570,6 +659,16 @@ impl PostgresHlrRepository {
     }
 }
 
+const RINGTONE_MAX_BYTES_PER_CODEC: usize = 256 * 1024;
+
+fn voice_codec_to_str(codec: cdma_voice::VoiceCodec) -> &'static str {
+    match codec {
+        cdma_voice::VoiceCodec::EvrcA => "evrc_a",
+        cdma_voice::VoiceCodec::EvrcB => "evrc_b",
+        cdma_voice::VoiceCodec::EvrcWb => "evrc_wb",
+    }
+}
+
 fn format_postgres_connect_error(component: &str, error: &sqlx::Error) -> String {
     format!(
         "failed to connect to {component} database: {error}; ensure PostgreSQL is running and reachable (default dev database: `docker compose up -d postgres`)"
@@ -590,19 +689,25 @@ impl HlrRepository for PostgresHlrRepository {
         let id = Uuid::new_v4();
         let row = sqlx::query_as::<_, SubscriberRow>(
             r#"
-            INSERT INTO subscribers (
-                subscriber_id, phone_number, display_name, status,
-                created_at, updated_at, number_type, number_plan
+            WITH up AS (
+                INSERT INTO subscribers (
+                    subscriber_id, phone_number, display_name, status,
+                    created_at, updated_at, number_type, number_plan
+                )
+                VALUES ($1, $2, $3, $4, $5, $5, $6, $7)
+                ON CONFLICT (phone_number) DO UPDATE SET
+                    display_name = EXCLUDED.display_name,
+                    status = EXCLUDED.status,
+                    updated_at = EXCLUDED.updated_at,
+                    number_type = EXCLUDED.number_type,
+                    number_plan = EXCLUDED.number_plan
+                RETURNING subscriber_id, phone_number, display_name, status,
+                    created_at, updated_at, number_type, number_plan
             )
-            VALUES ($1, $2, $3, $4, $5, $5, $6, $7)
-            ON CONFLICT (phone_number) DO UPDATE SET
-                display_name = EXCLUDED.display_name,
-                status = EXCLUDED.status,
-                updated_at = EXCLUDED.updated_at,
-                number_type = EXCLUDED.number_type,
-                number_plan = EXCLUDED.number_plan
-            RETURNING subscriber_id, phone_number, display_name, status,
-                created_at, updated_at, number_type, number_plan
+            SELECT up.*,
+                EXISTS (SELECT 1 FROM subscriber_ringtones r WHERE r.subscriber_id = up.subscriber_id) AS has_ringtone,
+                (SELECT MIN(duration_ms) FROM subscriber_ringtones r WHERE r.subscriber_id = up.subscriber_id) AS ringtone_duration_ms
+            FROM up
             "#,
         )
         .bind(id)
@@ -623,7 +728,13 @@ impl HlrRepository for PostgresHlrRepository {
         phone_number: &str,
     ) -> Result<Option<Subscriber>, String> {
         let row = sqlx::query_as::<_, SubscriberRow>(
-            "SELECT subscriber_id, phone_number, display_name, status, created_at, updated_at, number_type, number_plan FROM subscribers WHERE phone_number = $1",
+            r#"
+            SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at,
+                s.number_type, s.number_plan,
+                EXISTS (SELECT 1 FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS has_ringtone,
+                (SELECT MIN(duration_ms) FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS ringtone_duration_ms
+            FROM subscribers s WHERE s.phone_number = $1
+            "#,
         )
         .bind(phone_number)
         .fetch_optional(&self.pool)
@@ -637,7 +748,13 @@ impl HlrRepository for PostgresHlrRepository {
         subscriber_id: Uuid,
     ) -> Result<Option<Subscriber>, String> {
         let row = sqlx::query_as::<_, SubscriberRow>(
-            "SELECT subscriber_id, phone_number, display_name, status, created_at, updated_at, number_type, number_plan FROM subscribers WHERE subscriber_id = $1",
+            r#"
+            SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at,
+                s.number_type, s.number_plan,
+                EXISTS (SELECT 1 FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS has_ringtone,
+                (SELECT MIN(duration_ms) FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS ringtone_duration_ms
+            FROM subscribers s WHERE s.subscriber_id = $1
+            "#,
         )
         .bind(subscriber_id)
         .fetch_optional(&self.pool)
@@ -658,16 +775,22 @@ impl HlrRepository for PostgresHlrRepository {
         let now = Utc::now();
         let row = sqlx::query_as::<_, SubscriberRow>(
             r#"
-            UPDATE subscribers
-            SET phone_number = $2,
-                display_name = $3,
-                status = $4,
-                updated_at = $5,
-                number_type = $6,
-                number_plan = $7
-            WHERE subscriber_id = $1
-            RETURNING subscriber_id, phone_number, display_name, status,
-                created_at, updated_at, number_type, number_plan
+            WITH up AS (
+                UPDATE subscribers
+                SET phone_number = $2,
+                    display_name = $3,
+                    status = $4,
+                    updated_at = $5,
+                    number_type = $6,
+                    number_plan = $7
+                WHERE subscriber_id = $1
+                RETURNING subscriber_id, phone_number, display_name, status,
+                    created_at, updated_at, number_type, number_plan
+            )
+            SELECT up.*,
+                EXISTS (SELECT 1 FROM subscriber_ringtones r WHERE r.subscriber_id = up.subscriber_id) AS has_ringtone,
+                (SELECT MIN(duration_ms) FROM subscriber_ringtones r WHERE r.subscriber_id = up.subscriber_id) AS ringtone_duration_ms
+            FROM up
             "#,
         )
         .bind(subscriber_id)
@@ -693,7 +816,13 @@ impl HlrRepository for PostgresHlrRepository {
             .await
             .map_err(|e| format!("list_subscribers count: {e}"))?;
         let rows = sqlx::query_as::<_, SubscriberRow>(
-            "SELECT subscriber_id, phone_number, display_name, status, created_at, updated_at, number_type, number_plan FROM subscribers ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+            r#"
+            SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at,
+                s.number_type, s.number_plan,
+                EXISTS (SELECT 1 FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS has_ringtone,
+                (SELECT MIN(duration_ms) FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS ringtone_duration_ms
+            FROM subscribers s ORDER BY s.created_at DESC LIMIT $1 OFFSET $2
+            "#,
         )
         .bind(limit as i64)
         .bind(offset as i64)
@@ -862,7 +991,10 @@ impl HlrRepository for PostgresHlrRepository {
         if let Some(esn_val) = esn {
             let row = sqlx::query_as::<_, SubscriberRow>(
                 r#"
-                SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at, s.number_type, s.number_plan
+                SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at,
+                    s.number_type, s.number_plan,
+                    EXISTS (SELECT 1 FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS has_ringtone,
+                    (SELECT MIN(duration_ms) FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS ringtone_duration_ms
                 FROM subscribers s
                 JOIN subscriber_identities i ON s.subscriber_id = i.subscriber_id
                 WHERE i.esn = $1
@@ -880,7 +1012,10 @@ impl HlrRepository for PostgresHlrRepository {
         if let Some(imsi_val) = imsi {
             let row = sqlx::query_as::<_, SubscriberRow>(
                 r#"
-                SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at, s.number_type, s.number_plan
+                SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at,
+                    s.number_type, s.number_plan,
+                    EXISTS (SELECT 1 FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS has_ringtone,
+                    (SELECT MIN(duration_ms) FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS ringtone_duration_ms
                 FROM subscribers s
                 JOIN subscriber_identities i ON s.subscriber_id = i.subscriber_id
                 WHERE i.imsi = $1
@@ -1027,6 +1162,111 @@ impl HlrRepository for PostgresHlrRepository {
             .transpose()
             .map_err(|e| format!("get_registration_binding: {e}"))
     }
+
+    async fn set_ringtone(
+        &self,
+        subscriber_id: Uuid,
+        wav_bytes: Vec<u8>,
+        original_filename: &str,
+    ) -> Result<SetRingtoneOutcome, String> {
+        if wav_bytes.is_empty() {
+            return Err("set_ringtone: wav_bytes is empty".to_string());
+        }
+        // Preencode is CPU-bound (WAV decode + resample + 3× EVRC encode); run
+        // on a blocking thread so we don't stall the tokio worker.
+        let preencoded = tokio::task::spawn_blocking(move || {
+            cdma_voice::ringtone_preencode::preencode_wav_all_codecs(
+                &wav_bytes,
+                RINGTONE_MAX_BYTES_PER_CODEC,
+            )
+        })
+        .await
+        .map_err(|e| format!("set_ringtone preencode join: {e}"))?
+        .map_err(|e| format!("set_ringtone preencode: {e}"))?;
+        if preencoded.is_empty() {
+            return Err("set_ringtone: preencode produced no codecs".to_string());
+        }
+        let duration_ms = preencoded[0].duration_ms as u64;
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| format!("set_ringtone begin: {e}"))?;
+        sqlx::query("DELETE FROM subscriber_ringtones WHERE subscriber_id = $1")
+            .bind(subscriber_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("set_ringtone delete: {e}"))?;
+        let mut codecs = Vec::with_capacity(preencoded.len());
+        for p in &preencoded {
+            let codec_str = voice_codec_to_str(p.codec);
+            sqlx::query(
+                r#"
+                INSERT INTO subscriber_ringtones
+                    (subscriber_id, codec, encoded_frames, frame_count, duration_ms, original_filename)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                "#,
+            )
+            .bind(subscriber_id)
+            .bind(codec_str)
+            .bind(&p.bytes)
+            .bind(p.frame_count as i64)
+            .bind(p.duration_ms as i64)
+            .bind(original_filename)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("set_ringtone insert: {e}"))?;
+            codecs.push(SetRingtoneCodecOutcome {
+                codec: codec_str.to_string(),
+                encoded_bytes: p.bytes.len() as u32,
+                frame_count: p.frame_count as u64,
+            });
+        }
+        tx.commit()
+            .await
+            .map_err(|e| format!("set_ringtone commit: {e}"))?;
+        Ok(SetRingtoneOutcome {
+            codecs,
+            duration_ms,
+        })
+    }
+
+    async fn clear_ringtone(&self, subscriber_id: Uuid) -> Result<(), String> {
+        sqlx::query("DELETE FROM subscriber_ringtones WHERE subscriber_id = $1")
+            .bind(subscriber_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("clear_ringtone: {e}"))?;
+        Ok(())
+    }
+
+    async fn get_ringtone_codec(
+        &self,
+        subscriber_id: Uuid,
+        codec: &str,
+    ) -> Result<Option<SubscriberRingtoneCodecBlob>, String> {
+        let row: Option<(Vec<u8>, i64, i64)> = sqlx::query_as(
+            r#"
+            SELECT encoded_frames, frame_count, duration_ms
+            FROM subscriber_ringtones
+            WHERE subscriber_id = $1 AND codec = $2
+            "#,
+        )
+        .bind(subscriber_id)
+        .bind(codec)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("get_ringtone_codec: {e}"))?;
+        Ok(row.map(
+            |(encoded_frames, frame_count, duration_ms)| SubscriberRingtoneCodecBlob {
+                codec: codec.to_string(),
+                encoded_frames,
+                frame_count: frame_count as u64,
+                duration_ms: duration_ms as u64,
+            },
+        ))
+    }
 }
 
 // ─── Row types for sqlx ────────────────────────────────────────
@@ -1041,6 +1281,10 @@ struct SubscriberRow {
     updated_at: DateTime<Utc>,
     number_type: NumberType,
     number_plan: NumberPlan,
+    #[sqlx(default)]
+    has_ringtone: Option<bool>,
+    #[sqlx(default)]
+    ringtone_duration_ms: Option<i64>,
 }
 
 impl TryFrom<SubscriberRow> for Subscriber {
@@ -1056,6 +1300,8 @@ impl TryFrom<SubscriberRow> for Subscriber {
             updated_at: r.updated_at,
             number_type: r.number_type,
             number_plan: r.number_plan,
+            has_ringtone: r.has_ringtone.unwrap_or(false),
+            ringtone_duration_ms: r.ringtone_duration_ms.map(|v| v as u64),
         })
     }
 }

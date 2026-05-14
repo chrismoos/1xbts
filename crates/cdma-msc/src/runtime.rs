@@ -200,6 +200,7 @@ impl MscRuntime {
                             self.config.media_gateway.as_ref(),
                             self.config.media_ringback_enabled,
                             self.config.media_ringback_type,
+                            Some(&self.config.hlr_repo),
                         ).await;
                     }
                 }
@@ -571,6 +572,7 @@ impl MscRuntime {
                         self.config.voice_bearer.as_ref(),
                         self.config.media_ringback_enabled,
                         self.config.media_ringback_type,
+                        Some(&self.config.hlr_repo),
                     );
                 } else if completed_leg == Some(MscVoiceLeg::Primary) {
                     self.media.start_ringback_for_call(
@@ -580,6 +582,7 @@ impl MscRuntime {
                         self.config.voice_bearer.as_ref(),
                         self.config.media_ringback_enabled,
                         self.config.media_ringback_type,
+                        Some(&self.config.hlr_repo),
                     );
                 }
                 self.flush_deferred_paging_response(a1, call_id).await;
@@ -842,6 +845,7 @@ impl MscRuntime {
                         peer_circuit_id: None,
                         bearer_remote_ready: self.config.voice_bearer.is_none(),
                         media_gateway_handle,
+                        called_number: called_number.clone(),
                     },
                 );
                 self.circuits.queue_assignment_complete_circuit(
@@ -1710,6 +1714,27 @@ mod tests {
                 previous_last_seen_at: None,
             })
         }
+        async fn set_ringtone(
+            &self,
+            _: uuid::Uuid,
+            _: Vec<u8>,
+            _: &str,
+        ) -> Result<cdma_hlr::model::SetRingtoneOutcome, String> {
+            Ok(cdma_hlr::model::SetRingtoneOutcome {
+                codecs: vec![],
+                duration_ms: 0,
+            })
+        }
+        async fn clear_ringtone(&self, _: uuid::Uuid) -> Result<(), String> {
+            Ok(())
+        }
+        async fn get_ringtone_codec(
+            &self,
+            _: uuid::Uuid,
+            _: &str,
+        ) -> Result<Option<cdma_hlr::model::SubscriberRingtoneCodecBlob>, String> {
+            Ok(None)
+        }
     }
 
     #[async_trait::async_trait]
@@ -1738,6 +1763,8 @@ mod tests {
                     updated_at: chrono::Utc::now(),
                     number_type: cdma_hlr::model::NumberType::NetworkSpecific,
                     number_plan: cdma_hlr::model::NumberPlan::IsdnE164,
+                    has_ringtone: false,
+                    ringtone_duration_ms: None,
                 }))
             } else {
                 Ok(None)
@@ -1843,6 +1870,27 @@ mod tests {
                 is_new: true,
                 previous_last_seen_at: None,
             })
+        }
+        async fn set_ringtone(
+            &self,
+            _: uuid::Uuid,
+            _: Vec<u8>,
+            _: &str,
+        ) -> Result<cdma_hlr::model::SetRingtoneOutcome, String> {
+            Ok(cdma_hlr::model::SetRingtoneOutcome {
+                codecs: vec![],
+                duration_ms: 0,
+            })
+        }
+        async fn clear_ringtone(&self, _: uuid::Uuid) -> Result<(), String> {
+            Ok(())
+        }
+        async fn get_ringtone_codec(
+            &self,
+            _: uuid::Uuid,
+            _: &str,
+        ) -> Result<Option<cdma_hlr::model::SubscriberRingtoneCodecBlob>, String> {
+            Ok(None)
         }
     }
 
@@ -2730,6 +2778,7 @@ mod tests {
                 peer_circuit_id: None,
                 bearer_remote_ready: true,
                 media_gateway_handle: None,
+                called_number: None,
             },
         );
 

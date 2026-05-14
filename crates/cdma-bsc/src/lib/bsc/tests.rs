@@ -1923,6 +1923,28 @@ impl HlrRepository for FakeHlrRepository {
     ) -> Result<cdma_hlr::MobileSeenUpsert, String> {
         Ok(self.mobile_seen_result.clone())
     }
+
+    async fn set_ringtone(
+        &self,
+        _: Uuid,
+        _: Vec<u8>,
+        _: &str,
+    ) -> Result<cdma_hlr::model::SetRingtoneOutcome, String> {
+        Ok(cdma_hlr::model::SetRingtoneOutcome {
+            codecs: vec![],
+            duration_ms: 0,
+        })
+    }
+    async fn clear_ringtone(&self, _: Uuid) -> Result<(), String> {
+        Ok(())
+    }
+    async fn get_ringtone_codec(
+        &self,
+        _: Uuid,
+        _: &str,
+    ) -> Result<Option<cdma_hlr::model::SubscriberRingtoneCodecBlob>, String> {
+        Ok(None)
+    }
 }
 
 fn test_sms_submission(sms_id: Uuid, state: SmsState, destination_number: &str) -> SmsSubmission {
@@ -4911,6 +4933,8 @@ fn fake_hlr_for_welcome(mobile_seen: cdma_hlr::MobileSeenUpsert) -> Arc<FakeHlrR
             updated_at: now,
             number_type: cdma_hlr::model::NumberType::NetworkSpecific,
             number_plan: cdma_hlr::model::NumberPlan::IsdnE164,
+            has_ringtone: false,
+            ringtone_duration_ms: None,
         },
         binding: RegistrationBinding {
             subscriber_id,

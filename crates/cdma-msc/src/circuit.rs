@@ -36,6 +36,9 @@ pub(crate) struct CircuitSession {
     pub(crate) peer_circuit_id: Option<u16>,
     pub(crate) bearer_remote_ready: bool,
     pub(crate) media_gateway_handle: Option<crate::media_gateway::CallHandle>,
+    /// Called party number for this leg, when known. Used to look up the
+    /// subscriber's custom ringtone for ringback playback.
+    pub(crate) called_number: Option<String>,
 }
 
 /// A paging response waiting for the active assignment to finish.

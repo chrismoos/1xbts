@@ -40,6 +40,7 @@ impl MediaGatewayService {
         media_gateway: Option<&Arc<dyn MediaGatewayClient>>,
         media_ringback_enabled: bool,
         media_ringback_type: crate::config::MediaRingbackType,
+        hlr_repo: Option<&Arc<dyn cdma_hlr::repository::HlrRepository>>,
     ) {
         match event {
             MediaGatewayEvent::Ringing { handle, sip_status } => {
@@ -55,6 +56,7 @@ impl MediaGatewayService {
                         voice_bearer,
                         media_ringback_enabled,
                         media_ringback_type,
+                        hlr_repo,
                     );
                 }
             }

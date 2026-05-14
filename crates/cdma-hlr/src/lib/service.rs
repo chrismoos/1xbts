@@ -27,12 +27,11 @@ pub async fn run_grpc_server(
     addr: SocketAddr,
     repo: Arc<dyn HlrRepository>,
 ) -> Result<(), tonic::transport::Error> {
-    Server::builder()
-        .add_service(proto::hlr_service_server::HlrServiceServer::new(
-            HlrServiceImpl::new(repo),
-        ))
-        .serve(addr)
-        .await
+    // Raw ringtone WAV uploads can be up to a few MB. Default tonic decode
+    // cap (4 MiB) is too tight for that path.
+    let svc = proto::hlr_service_server::HlrServiceServer::new(HlrServiceImpl::new(repo))
+        .max_decoding_message_size(8 * 1024 * 1024);
+    Server::builder().add_service(svc).serve(addr).await
 }
 
 pub async fn spawn_configured_hlr_service(
@@ -67,6 +66,8 @@ fn subscriber_to_proto(s: &model::Subscriber) -> proto::Subscriber {
         updated_at: Some(datetime_to_timestamp(s.updated_at)),
         number_type: number_type_to_proto(s.number_type) as i32,
         number_plan: number_plan_to_proto(s.number_plan) as i32,
+        has_ringtone: s.has_ringtone,
+        ringtone_duration_ms: s.ringtone_duration_ms,
     }
 }
 
@@ -561,4 +562,96 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             binding: binding.as_ref().map(binding_to_proto),
         }))
     }
+
+    async fn set_subscriber_ringtone(
+        &self,
+        request: Request<proto::SetSubscriberRingtoneRequest>,
+    ) -> Result<Response<proto::SetSubscriberRingtoneResponse>, Status> {
+        let req = request.into_inner();
+        let subscriber_id = parse_uuid(&req.subscriber_id)?;
+        if req.wav_bytes.is_empty() {
+            return Err(Status::invalid_argument("wav_bytes is empty"));
+        }
+        if req.original_filename.is_empty() {
+            return Err(Status::invalid_argument("original_filename is empty"));
+        }
+        if req.original_filename.len() > 255 {
+            return Err(Status::invalid_argument(
+                "original_filename exceeds 255 chars",
+            ));
+        }
+
+        let outcome = self
+            .repo
+            .set_ringtone(subscriber_id, req.wav_bytes, &req.original_filename)
+            .await
+            .map_err(|e| {
+                log::warn!("HLR set_ringtone: {e}");
+                if e.contains("preencode") {
+                    Status::invalid_argument(e)
+                } else if e.contains("not found") {
+                    Status::not_found("subscriber not found")
+                } else {
+                    Status::internal("internal error")
+                }
+            })?;
+
+        Ok(Response::new(proto::SetSubscriberRingtoneResponse {
+            codecs: outcome
+                .codecs
+                .into_iter()
+                .map(|c| proto::RingtoneCodecInfo {
+                    codec: c.codec,
+                    encoded_bytes: c.encoded_bytes,
+                    frame_count: c.frame_count,
+                })
+                .collect(),
+            duration_ms: outcome.duration_ms,
+        }))
+    }
+
+    async fn clear_subscriber_ringtone(
+        &self,
+        request: Request<proto::ClearSubscriberRingtoneRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        let subscriber_id = parse_uuid(&req.subscriber_id)?;
+        self.repo.clear_ringtone(subscriber_id).await.map_err(|e| {
+            log::error!("HLR: {e}");
+            Status::internal("internal error")
+        })?;
+        Ok(Response::new(()))
+    }
+
+    async fn get_subscriber_ringtone_codec(
+        &self,
+        request: Request<proto::GetSubscriberRingtoneCodecRequest>,
+    ) -> Result<Response<proto::GetSubscriberRingtoneCodecResponse>, Status> {
+        let req = request.into_inner();
+        let subscriber_id = parse_uuid(&req.subscriber_id)?;
+        if !is_valid_codec_name(&req.codec) {
+            return Err(Status::invalid_argument(format!(
+                "unknown codec: {}",
+                req.codec
+            )));
+        }
+        let blob = self
+            .repo
+            .get_ringtone_codec(subscriber_id, &req.codec)
+            .await
+            .map_err(|e| {
+                log::error!("HLR: {e}");
+                Status::internal("internal error")
+            })?
+            .ok_or_else(|| Status::not_found("ringtone not found"))?;
+        Ok(Response::new(proto::GetSubscriberRingtoneCodecResponse {
+            encoded_frames: blob.encoded_frames,
+            frame_count: blob.frame_count,
+            duration_ms: blob.duration_ms,
+        }))
+    }
+}
+
+fn is_valid_codec_name(name: &str) -> bool {
+    matches!(name, "evrc_a" | "evrc_b" | "evrc_wb")
 }

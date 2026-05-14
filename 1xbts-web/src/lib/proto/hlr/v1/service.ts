@@ -147,6 +147,10 @@ export interface Subscriber {
   updatedAt: Date | undefined;
   numberType: NumberType;
   numberPlan: NumberPlan;
+  /** True when a custom ringtone is stored for this subscriber. */
+  hasRingtone: boolean;
+  /** Duration of the stored ringtone in milliseconds (if any). */
+  ringtoneDurationMs?: number | undefined;
 }
 
 /** Radio identity attached to one subscriber. */
@@ -367,6 +371,45 @@ export interface GetRegistrationBindingResponse {
   binding?: RegistrationBinding | undefined;
 }
 
+/**
+ * Uploads a WAV ringtone for one subscriber. The HLR server transcodes the
+ * WAV into every supported voice codec at upload time.
+ */
+export interface SetSubscriberRingtoneRequest {
+  subscriberId: string;
+  wavBytes: Uint8Array;
+  originalFilename: string;
+}
+
+/** Per-codec result returned after a ringtone upload. */
+export interface RingtoneCodecInfo {
+  /** "evrc_a", "evrc_b", "evrc_wb" */
+  codec: string;
+  encodedBytes: number;
+  frameCount: number;
+}
+
+export interface SetSubscriberRingtoneResponse {
+  codecs: RingtoneCodecInfo[];
+  durationMs: number;
+}
+
+export interface ClearSubscriberRingtoneRequest {
+  subscriberId: string;
+}
+
+/** Fetches the pre-encoded frame stream for one codec. */
+export interface GetSubscriberRingtoneCodecRequest {
+  subscriberId: string;
+  codec: string;
+}
+
+export interface GetSubscriberRingtoneCodecResponse {
+  encodedFrames: Uint8Array;
+  frameCount: number;
+  durationMs: number;
+}
+
 function createBaseSubscriber(): Subscriber {
   return {
     subscriberId: "",
@@ -377,6 +420,8 @@ function createBaseSubscriber(): Subscriber {
     updatedAt: undefined,
     numberType: 0,
     numberPlan: 0,
+    hasRingtone: false,
+    ringtoneDurationMs: undefined,
   };
 }
 
@@ -405,6 +450,12 @@ export const Subscriber: MessageFns<Subscriber> = {
     }
     if (message.numberPlan !== 0) {
       writer.uint32(64).int32(message.numberPlan);
+    }
+    if (message.hasRingtone !== false) {
+      writer.uint32(72).bool(message.hasRingtone);
+    }
+    if (message.ringtoneDurationMs !== undefined) {
+      writer.uint32(80).uint64(message.ringtoneDurationMs);
     }
     return writer;
   },
@@ -480,6 +531,22 @@ export const Subscriber: MessageFns<Subscriber> = {
           message.numberPlan = reader.int32() as any;
           continue;
         }
+        case 9: {
+          if (tag !== 72) {
+            break;
+          }
+
+          message.hasRingtone = reader.bool();
+          continue;
+        }
+        case 10: {
+          if (tag !== 80) {
+            break;
+          }
+
+          message.ringtoneDurationMs = longToNumber(reader.uint64());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -527,6 +594,16 @@ export const Subscriber: MessageFns<Subscriber> = {
         : isSet(object.number_plan)
         ? numberPlanFromJSON(object.number_plan)
         : 0,
+      hasRingtone: isSet(object.hasRingtone)
+        ? globalThis.Boolean(object.hasRingtone)
+        : isSet(object.has_ringtone)
+        ? globalThis.Boolean(object.has_ringtone)
+        : false,
+      ringtoneDurationMs: isSet(object.ringtoneDurationMs)
+        ? globalThis.Number(object.ringtoneDurationMs)
+        : isSet(object.ringtone_duration_ms)
+        ? globalThis.Number(object.ringtone_duration_ms)
+        : undefined,
     };
   },
 
@@ -556,6 +633,12 @@ export const Subscriber: MessageFns<Subscriber> = {
     if (message.numberPlan !== 0) {
       obj.numberPlan = numberPlanToJSON(message.numberPlan);
     }
+    if (message.hasRingtone !== false) {
+      obj.hasRingtone = message.hasRingtone;
+    }
+    if (message.ringtoneDurationMs !== undefined) {
+      obj.ringtoneDurationMs = Math.round(message.ringtoneDurationMs);
+    }
     return obj;
   },
 
@@ -572,6 +655,8 @@ export const Subscriber: MessageFns<Subscriber> = {
     message.updatedAt = object.updatedAt ?? undefined;
     message.numberType = object.numberType ?? 0;
     message.numberPlan = object.numberPlan ?? 0;
+    message.hasRingtone = object.hasRingtone ?? false;
+    message.ringtoneDurationMs = object.ringtoneDurationMs ?? undefined;
     return message;
   },
 };
@@ -3541,6 +3626,540 @@ export const GetRegistrationBindingResponse: MessageFns<GetRegistrationBindingRe
   },
 };
 
+function createBaseSetSubscriberRingtoneRequest(): SetSubscriberRingtoneRequest {
+  return { subscriberId: "", wavBytes: new Uint8Array(0), originalFilename: "" };
+}
+
+export const SetSubscriberRingtoneRequest: MessageFns<SetSubscriberRingtoneRequest> = {
+  encode(message: SetSubscriberRingtoneRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.subscriberId !== "") {
+      writer.uint32(10).string(message.subscriberId);
+    }
+    if (message.wavBytes.length !== 0) {
+      writer.uint32(18).bytes(message.wavBytes);
+    }
+    if (message.originalFilename !== "") {
+      writer.uint32(26).string(message.originalFilename);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SetSubscriberRingtoneRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSetSubscriberRingtoneRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.subscriberId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.wavBytes = reader.bytes();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.originalFilename = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SetSubscriberRingtoneRequest {
+    return {
+      subscriberId: isSet(object.subscriberId)
+        ? globalThis.String(object.subscriberId)
+        : isSet(object.subscriber_id)
+        ? globalThis.String(object.subscriber_id)
+        : "",
+      wavBytes: isSet(object.wavBytes)
+        ? bytesFromBase64(object.wavBytes)
+        : isSet(object.wav_bytes)
+        ? bytesFromBase64(object.wav_bytes)
+        : new Uint8Array(0),
+      originalFilename: isSet(object.originalFilename)
+        ? globalThis.String(object.originalFilename)
+        : isSet(object.original_filename)
+        ? globalThis.String(object.original_filename)
+        : "",
+    };
+  },
+
+  toJSON(message: SetSubscriberRingtoneRequest): unknown {
+    const obj: any = {};
+    if (message.subscriberId !== "") {
+      obj.subscriberId = message.subscriberId;
+    }
+    if (message.wavBytes.length !== 0) {
+      obj.wavBytes = base64FromBytes(message.wavBytes);
+    }
+    if (message.originalFilename !== "") {
+      obj.originalFilename = message.originalFilename;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<SetSubscriberRingtoneRequest>): SetSubscriberRingtoneRequest {
+    return SetSubscriberRingtoneRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<SetSubscriberRingtoneRequest>): SetSubscriberRingtoneRequest {
+    const message = createBaseSetSubscriberRingtoneRequest();
+    message.subscriberId = object.subscriberId ?? "";
+    message.wavBytes = object.wavBytes ?? new Uint8Array(0);
+    message.originalFilename = object.originalFilename ?? "";
+    return message;
+  },
+};
+
+function createBaseRingtoneCodecInfo(): RingtoneCodecInfo {
+  return { codec: "", encodedBytes: 0, frameCount: 0 };
+}
+
+export const RingtoneCodecInfo: MessageFns<RingtoneCodecInfo> = {
+  encode(message: RingtoneCodecInfo, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.codec !== "") {
+      writer.uint32(10).string(message.codec);
+    }
+    if (message.encodedBytes !== 0) {
+      writer.uint32(16).uint32(message.encodedBytes);
+    }
+    if (message.frameCount !== 0) {
+      writer.uint32(24).uint64(message.frameCount);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): RingtoneCodecInfo {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseRingtoneCodecInfo();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.codec = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.encodedBytes = reader.uint32();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.frameCount = longToNumber(reader.uint64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): RingtoneCodecInfo {
+    return {
+      codec: isSet(object.codec) ? globalThis.String(object.codec) : "",
+      encodedBytes: isSet(object.encodedBytes)
+        ? globalThis.Number(object.encodedBytes)
+        : isSet(object.encoded_bytes)
+        ? globalThis.Number(object.encoded_bytes)
+        : 0,
+      frameCount: isSet(object.frameCount)
+        ? globalThis.Number(object.frameCount)
+        : isSet(object.frame_count)
+        ? globalThis.Number(object.frame_count)
+        : 0,
+    };
+  },
+
+  toJSON(message: RingtoneCodecInfo): unknown {
+    const obj: any = {};
+    if (message.codec !== "") {
+      obj.codec = message.codec;
+    }
+    if (message.encodedBytes !== 0) {
+      obj.encodedBytes = Math.round(message.encodedBytes);
+    }
+    if (message.frameCount !== 0) {
+      obj.frameCount = Math.round(message.frameCount);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<RingtoneCodecInfo>): RingtoneCodecInfo {
+    return RingtoneCodecInfo.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<RingtoneCodecInfo>): RingtoneCodecInfo {
+    const message = createBaseRingtoneCodecInfo();
+    message.codec = object.codec ?? "";
+    message.encodedBytes = object.encodedBytes ?? 0;
+    message.frameCount = object.frameCount ?? 0;
+    return message;
+  },
+};
+
+function createBaseSetSubscriberRingtoneResponse(): SetSubscriberRingtoneResponse {
+  return { codecs: [], durationMs: 0 };
+}
+
+export const SetSubscriberRingtoneResponse: MessageFns<SetSubscriberRingtoneResponse> = {
+  encode(message: SetSubscriberRingtoneResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.codecs) {
+      RingtoneCodecInfo.encode(v!, writer.uint32(10).fork()).join();
+    }
+    if (message.durationMs !== 0) {
+      writer.uint32(16).uint64(message.durationMs);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SetSubscriberRingtoneResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSetSubscriberRingtoneResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.codecs.push(RingtoneCodecInfo.decode(reader, reader.uint32()));
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.durationMs = longToNumber(reader.uint64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SetSubscriberRingtoneResponse {
+    return {
+      codecs: globalThis.Array.isArray(object?.codecs)
+        ? object.codecs.map((e: any) => RingtoneCodecInfo.fromJSON(e))
+        : [],
+      durationMs: isSet(object.durationMs)
+        ? globalThis.Number(object.durationMs)
+        : isSet(object.duration_ms)
+        ? globalThis.Number(object.duration_ms)
+        : 0,
+    };
+  },
+
+  toJSON(message: SetSubscriberRingtoneResponse): unknown {
+    const obj: any = {};
+    if (message.codecs?.length) {
+      obj.codecs = message.codecs.map((e) => RingtoneCodecInfo.toJSON(e));
+    }
+    if (message.durationMs !== 0) {
+      obj.durationMs = Math.round(message.durationMs);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<SetSubscriberRingtoneResponse>): SetSubscriberRingtoneResponse {
+    return SetSubscriberRingtoneResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<SetSubscriberRingtoneResponse>): SetSubscriberRingtoneResponse {
+    const message = createBaseSetSubscriberRingtoneResponse();
+    message.codecs = object.codecs?.map((e) => RingtoneCodecInfo.fromPartial(e)) || [];
+    message.durationMs = object.durationMs ?? 0;
+    return message;
+  },
+};
+
+function createBaseClearSubscriberRingtoneRequest(): ClearSubscriberRingtoneRequest {
+  return { subscriberId: "" };
+}
+
+export const ClearSubscriberRingtoneRequest: MessageFns<ClearSubscriberRingtoneRequest> = {
+  encode(message: ClearSubscriberRingtoneRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.subscriberId !== "") {
+      writer.uint32(10).string(message.subscriberId);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ClearSubscriberRingtoneRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseClearSubscriberRingtoneRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.subscriberId = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ClearSubscriberRingtoneRequest {
+    return {
+      subscriberId: isSet(object.subscriberId)
+        ? globalThis.String(object.subscriberId)
+        : isSet(object.subscriber_id)
+        ? globalThis.String(object.subscriber_id)
+        : "",
+    };
+  },
+
+  toJSON(message: ClearSubscriberRingtoneRequest): unknown {
+    const obj: any = {};
+    if (message.subscriberId !== "") {
+      obj.subscriberId = message.subscriberId;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<ClearSubscriberRingtoneRequest>): ClearSubscriberRingtoneRequest {
+    return ClearSubscriberRingtoneRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<ClearSubscriberRingtoneRequest>): ClearSubscriberRingtoneRequest {
+    const message = createBaseClearSubscriberRingtoneRequest();
+    message.subscriberId = object.subscriberId ?? "";
+    return message;
+  },
+};
+
+function createBaseGetSubscriberRingtoneCodecRequest(): GetSubscriberRingtoneCodecRequest {
+  return { subscriberId: "", codec: "" };
+}
+
+export const GetSubscriberRingtoneCodecRequest: MessageFns<GetSubscriberRingtoneCodecRequest> = {
+  encode(message: GetSubscriberRingtoneCodecRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.subscriberId !== "") {
+      writer.uint32(10).string(message.subscriberId);
+    }
+    if (message.codec !== "") {
+      writer.uint32(18).string(message.codec);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): GetSubscriberRingtoneCodecRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseGetSubscriberRingtoneCodecRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.subscriberId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.codec = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): GetSubscriberRingtoneCodecRequest {
+    return {
+      subscriberId: isSet(object.subscriberId)
+        ? globalThis.String(object.subscriberId)
+        : isSet(object.subscriber_id)
+        ? globalThis.String(object.subscriber_id)
+        : "",
+      codec: isSet(object.codec) ? globalThis.String(object.codec) : "",
+    };
+  },
+
+  toJSON(message: GetSubscriberRingtoneCodecRequest): unknown {
+    const obj: any = {};
+    if (message.subscriberId !== "") {
+      obj.subscriberId = message.subscriberId;
+    }
+    if (message.codec !== "") {
+      obj.codec = message.codec;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<GetSubscriberRingtoneCodecRequest>): GetSubscriberRingtoneCodecRequest {
+    return GetSubscriberRingtoneCodecRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<GetSubscriberRingtoneCodecRequest>): GetSubscriberRingtoneCodecRequest {
+    const message = createBaseGetSubscriberRingtoneCodecRequest();
+    message.subscriberId = object.subscriberId ?? "";
+    message.codec = object.codec ?? "";
+    return message;
+  },
+};
+
+function createBaseGetSubscriberRingtoneCodecResponse(): GetSubscriberRingtoneCodecResponse {
+  return { encodedFrames: new Uint8Array(0), frameCount: 0, durationMs: 0 };
+}
+
+export const GetSubscriberRingtoneCodecResponse: MessageFns<GetSubscriberRingtoneCodecResponse> = {
+  encode(message: GetSubscriberRingtoneCodecResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.encodedFrames.length !== 0) {
+      writer.uint32(10).bytes(message.encodedFrames);
+    }
+    if (message.frameCount !== 0) {
+      writer.uint32(16).uint64(message.frameCount);
+    }
+    if (message.durationMs !== 0) {
+      writer.uint32(24).uint64(message.durationMs);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): GetSubscriberRingtoneCodecResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseGetSubscriberRingtoneCodecResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.encodedFrames = reader.bytes();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.frameCount = longToNumber(reader.uint64());
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.durationMs = longToNumber(reader.uint64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): GetSubscriberRingtoneCodecResponse {
+    return {
+      encodedFrames: isSet(object.encodedFrames)
+        ? bytesFromBase64(object.encodedFrames)
+        : isSet(object.encoded_frames)
+        ? bytesFromBase64(object.encoded_frames)
+        : new Uint8Array(0),
+      frameCount: isSet(object.frameCount)
+        ? globalThis.Number(object.frameCount)
+        : isSet(object.frame_count)
+        ? globalThis.Number(object.frame_count)
+        : 0,
+      durationMs: isSet(object.durationMs)
+        ? globalThis.Number(object.durationMs)
+        : isSet(object.duration_ms)
+        ? globalThis.Number(object.duration_ms)
+        : 0,
+    };
+  },
+
+  toJSON(message: GetSubscriberRingtoneCodecResponse): unknown {
+    const obj: any = {};
+    if (message.encodedFrames.length !== 0) {
+      obj.encodedFrames = base64FromBytes(message.encodedFrames);
+    }
+    if (message.frameCount !== 0) {
+      obj.frameCount = Math.round(message.frameCount);
+    }
+    if (message.durationMs !== 0) {
+      obj.durationMs = Math.round(message.durationMs);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<GetSubscriberRingtoneCodecResponse>): GetSubscriberRingtoneCodecResponse {
+    return GetSubscriberRingtoneCodecResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<GetSubscriberRingtoneCodecResponse>): GetSubscriberRingtoneCodecResponse {
+    const message = createBaseGetSubscriberRingtoneCodecResponse();
+    message.encodedFrames = object.encodedFrames ?? new Uint8Array(0);
+    message.frameCount = object.frameCount ?? 0;
+    message.durationMs = object.durationMs ?? 0;
+    return message;
+  },
+};
+
 /** HLR service for subscriber profiles, radio identities, and registrations. */
 export type HlrServiceDefinition = typeof HlrServiceDefinition;
 export const HlrServiceDefinition = {
@@ -3673,6 +4292,33 @@ export const HlrServiceDefinition = {
       responseStream: false,
       options: {},
     },
+    /** Uploads a WAV ringtone for one subscriber; transcoded to every codec. */
+    setSubscriberRingtone: {
+      name: "SetSubscriberRingtone",
+      requestType: SetSubscriberRingtoneRequest as typeof SetSubscriberRingtoneRequest,
+      requestStream: false,
+      responseType: SetSubscriberRingtoneResponse as typeof SetSubscriberRingtoneResponse,
+      responseStream: false,
+      options: {},
+    },
+    /** Removes any stored ringtone for one subscriber. */
+    clearSubscriberRingtone: {
+      name: "ClearSubscriberRingtone",
+      requestType: ClearSubscriberRingtoneRequest as typeof ClearSubscriberRingtoneRequest,
+      requestStream: false,
+      responseType: Empty as typeof Empty,
+      responseStream: false,
+      options: {},
+    },
+    /** Fetches the pre-encoded ringtone frame stream for one codec. */
+    getSubscriberRingtoneCodec: {
+      name: "GetSubscriberRingtoneCodec",
+      requestType: GetSubscriberRingtoneCodecRequest as typeof GetSubscriberRingtoneCodecRequest,
+      requestStream: false,
+      responseType: GetSubscriberRingtoneCodecResponse as typeof GetSubscriberRingtoneCodecResponse,
+      responseStream: false,
+      options: {},
+    },
   },
 } as const;
 
@@ -3747,6 +4393,21 @@ export interface HlrServiceImplementation<CallContextExt = {}> {
     request: GetRegistrationBindingRequest,
     context: CallContext & CallContextExt,
   ): Promise<DeepPartial<GetRegistrationBindingResponse>>;
+  /** Uploads a WAV ringtone for one subscriber; transcoded to every codec. */
+  setSubscriberRingtone(
+    request: SetSubscriberRingtoneRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<SetSubscriberRingtoneResponse>>;
+  /** Removes any stored ringtone for one subscriber. */
+  clearSubscriberRingtone(
+    request: ClearSubscriberRingtoneRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<Empty>>;
+  /** Fetches the pre-encoded ringtone frame stream for one codec. */
+  getSubscriberRingtoneCodec(
+    request: GetSubscriberRingtoneCodecRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<GetSubscriberRingtoneCodecResponse>>;
 }
 
 export interface HlrServiceClient<CallOptionsExt = {}> {
@@ -3820,6 +4481,46 @@ export interface HlrServiceClient<CallOptionsExt = {}> {
     request: DeepPartial<GetRegistrationBindingRequest>,
     options?: CallOptions & CallOptionsExt,
   ): Promise<GetRegistrationBindingResponse>;
+  /** Uploads a WAV ringtone for one subscriber; transcoded to every codec. */
+  setSubscriberRingtone(
+    request: DeepPartial<SetSubscriberRingtoneRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<SetSubscriberRingtoneResponse>;
+  /** Removes any stored ringtone for one subscriber. */
+  clearSubscriberRingtone(
+    request: DeepPartial<ClearSubscriberRingtoneRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<Empty>;
+  /** Fetches the pre-encoded ringtone frame stream for one codec. */
+  getSubscriberRingtoneCodec(
+    request: DeepPartial<GetSubscriberRingtoneCodecRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<GetSubscriberRingtoneCodecResponse>;
+}
+
+function bytesFromBase64(b64: string): Uint8Array {
+  if ((globalThis as any).Buffer) {
+    return Uint8Array.from(globalThis.Buffer.from(b64, "base64"));
+  } else {
+    const bin = globalThis.atob(b64);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; ++i) {
+      arr[i] = bin.charCodeAt(i);
+    }
+    return arr;
+  }
+}
+
+function base64FromBytes(arr: Uint8Array): string {
+  if ((globalThis as any).Buffer) {
+    return globalThis.Buffer.from(arr).toString("base64");
+  } else {
+    const bin: string[] = [];
+    arr.forEach((byte) => {
+      bin.push(globalThis.String.fromCharCode(byte));
+    });
+    return globalThis.btoa(bin.join(""));
+  }
 }
 
 type Builtin = Date | Function | Uint8Array | string | number | boolean | undefined;
@@ -3850,6 +4551,17 @@ function fromJsonTimestamp(o: any): Date {
   } else {
     return fromTimestamp(Timestamp.fromJSON(o));
   }
+}
+
+function longToNumber(int64: { toString(): string }): number {
+  const num = globalThis.Number(int64.toString());
+  if (num > globalThis.Number.MAX_SAFE_INTEGER) {
+    throw new globalThis.Error("Value is larger than Number.MAX_SAFE_INTEGER");
+  }
+  if (num < globalThis.Number.MIN_SAFE_INTEGER) {
+    throw new globalThis.Error("Value is smaller than Number.MIN_SAFE_INTEGER");
+  }
+  return num;
 }
 
 function isSet(value: any): boolean {

@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import { esnManufacturer } from "@/lib/esn-manufacturer";
 import { formatEsn } from "@/lib/format";
 import { Card, Stat } from "@/components/card";
+import { validateRingtoneFile } from "@/lib/validation";
 import {
   NumberPlan,
   NumberType,
@@ -83,6 +84,9 @@ export default function SubscriberDetailPage({
   const [startingData, setStartingData] = useState(false);
   const [dataResult, setDataResult] = useState<string | null>(null);
   const [dataSo, setDataSo] = useState(33);
+  const [ringtoneFile, setRingtoneFile] = useState<File | null>(null);
+  const [ringtoneBusy, setRingtoneBusy] = useState(false);
+  const [ringtoneResult, setRingtoneResult] = useState<string | null>(null);
 
   const primaryIdentity = useMemo(
     () =>
@@ -264,6 +268,59 @@ export default function SubscriberDetailPage({
       setCallResult(err instanceof Error ? err.message : "unknown error");
     } finally {
       setCalling(false);
+    }
+  };
+
+  const handleRingtoneUpload = async () => {
+    if (!ringtoneFile) return;
+    const validation = validateRingtoneFile(ringtoneFile);
+    if (!validation.ok) {
+      setRingtoneResult(validation.error);
+      return;
+    }
+    setRingtoneBusy(true);
+    setRingtoneResult(null);
+    try {
+      const form = new FormData();
+      form.append("file", ringtoneFile);
+      const res = await fetch(
+        `/api/subscribers/${encodeURIComponent(id)}/ringtone`,
+        { method: "POST", body: form }
+      );
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        throw new Error(data.error || `HTTP ${res.status}`);
+      }
+      setRingtoneResult(
+        `Uploaded (${data.codecs?.length ?? 0} codecs, ${(data.durationMs ?? 0) / 1000}s)`
+      );
+      setRingtoneFile(null);
+      await fetchDetail();
+    } catch (err) {
+      setRingtoneResult(err instanceof Error ? err.message : "unknown error");
+    } finally {
+      setRingtoneBusy(false);
+    }
+  };
+
+  const handleRingtoneClear = async () => {
+    setRingtoneBusy(true);
+    setRingtoneResult(null);
+    try {
+      const res = await fetch(
+        `/api/subscribers/${encodeURIComponent(id)}/ringtone`,
+        { method: "DELETE" }
+      );
+      if (!res.ok && res.status !== 204) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `HTTP ${res.status}`);
+      }
+      setRingtoneResult("Removed");
+      await fetchDetail();
+    } catch (err) {
+      setRingtoneResult(err instanceof Error ? err.message : "unknown error");
+    } finally {
+      setRingtoneBusy(false);
     }
   };
 
@@ -528,6 +585,78 @@ export default function SubscriberDetailPage({
               }`}
             >
               {dataResult}
+            </p>
+          )}
+        </div>
+      </Card>
+
+      <Card title="Custom Ringtone">
+        <div className="space-y-3">
+          {subscriber.hasRingtone ? (
+            <div className="text-xs space-y-1">
+              <div className="text-secondary">
+                A custom ringtone is stored
+                {subscriber.ringtoneDurationMs != null && (
+                  <span className="text-muted">
+                    {" "}
+                    ({(subscriber.ringtoneDurationMs / 1000).toFixed(1)}s)
+                  </span>
+                )}
+                .
+              </div>
+              <div className="text-muted">
+                Encoded for all supported codecs (EVRC-A, EVRC-B, EVRC-WB).
+              </div>
+            </div>
+          ) : (
+            <div className="text-xs text-muted">
+              No custom ringtone uploaded. Default ringback tone will be played.
+            </div>
+          )}
+
+          <div className="flex flex-wrap items-end gap-3">
+            <div>
+              <label className="block text-xs text-muted mb-1">
+                WAV File (max 4 MB)
+              </label>
+              <input
+                type="file"
+                accept=".wav,audio/wav,audio/x-wav"
+                onChange={(e) => setRingtoneFile(e.target.files?.[0] ?? null)}
+                className="text-xs"
+              />
+            </div>
+            <button
+              type="button"
+              onClick={handleRingtoneUpload}
+              disabled={ringtoneBusy || !ringtoneFile}
+              className="text-xs px-4 py-2 rounded bg-accent-blue hover:bg-accent-blue/80 text-primary disabled:opacity-50 transition-colors"
+            >
+              {ringtoneBusy ? "Working..." : subscriber.hasRingtone ? "Replace" : "Upload"}
+            </button>
+            {subscriber.hasRingtone && (
+              <button
+                type="button"
+                onClick={handleRingtoneClear}
+                disabled={ringtoneBusy}
+                className="text-xs px-3 py-2 rounded bg-accent-red-bg text-accent-red border border-accent-red/20 hover:bg-accent-red/15 disabled:opacity-50 transition-colors"
+              >
+                Remove
+              </button>
+            )}
+          </div>
+          {ringtoneResult && (
+            <p
+              className={`text-xs ${
+                ringtoneResult.toLowerCase().includes("error") ||
+                ringtoneResult.toLowerCase().includes("fail") ||
+                ringtoneResult.toLowerCase().includes("must") ||
+                ringtoneResult.toLowerCase().includes("not")
+                  ? "text-accent-red"
+                  : "text-accent-green"
+              }`}
+            >
+              {ringtoneResult}
             </p>
           )}
         </div>

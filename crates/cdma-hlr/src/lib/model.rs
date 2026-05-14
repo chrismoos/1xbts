@@ -24,6 +24,10 @@ pub struct Subscriber {
     pub updated_at: DateTime<Utc>,
     pub number_type: NumberType,
     pub number_plan: NumberPlan,
+    /// True when a custom ringtone is stored for this subscriber.
+    pub has_ringtone: bool,
+    /// Duration of the stored ringtone in milliseconds (if any).
+    pub ringtone_duration_ms: Option<u64>,
 }
 
 /// AWIM Calling Party Number Type per C.S0005-E 3.7.5.10 / ANSI T1.607.
@@ -86,6 +90,31 @@ impl Default for NumberPlan {
     fn default() -> Self {
         Self::IsdnE164
     }
+}
+
+/// Per-codec ringtone blob row.
+#[derive(Debug, Clone)]
+pub struct SubscriberRingtoneCodecBlob {
+    pub codec: String,
+    pub encoded_frames: Vec<u8>,
+    pub frame_count: u64,
+    pub duration_ms: u64,
+}
+
+/// Per-codec summary returned by `set_ringtone` after preencode.
+#[derive(Debug, Clone)]
+pub struct SetRingtoneCodecOutcome {
+    pub codec: String,
+    pub encoded_bytes: u32,
+    pub frame_count: u64,
+}
+
+/// Result of a successful `set_ringtone`: per-codec summaries plus the
+/// canonical duration of the stored audio in milliseconds.
+#[derive(Debug, Clone)]
+pub struct SetRingtoneOutcome {
+    pub codecs: Vec<SetRingtoneCodecOutcome>,
+    pub duration_ms: u64,
 }
 
 /// Lifecycle status of a subscriber account.

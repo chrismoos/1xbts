@@ -1,5 +1,9 @@
+pub mod encoded_stream;
 pub mod evrc;
 pub mod evrc_b_wb;
+pub mod resample;
+pub mod ringtone_player;
+pub mod ringtone_preencode;
 pub mod tone_player;
 pub mod wav_player;
 

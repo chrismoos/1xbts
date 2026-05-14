@@ -2943,6 +2943,8 @@ impl FakeHlrRepository {
                 updated_at: now,
                 number_type: cdma_hlr::model::NumberType::NetworkSpecific,
                 number_plan: cdma_hlr::model::NumberPlan::IsdnE164,
+                has_ringtone: false,
+                ringtone_duration_ms: None,
             },
         }
     }
@@ -3051,6 +3053,27 @@ impl HlrRepository for FakeHlrRepository {
             is_new: true,
             previous_last_seen_at: None,
         })
+    }
+    async fn set_ringtone(
+        &self,
+        _: uuid::Uuid,
+        _: Vec<u8>,
+        _: &str,
+    ) -> Result<cdma_hlr::model::SetRingtoneOutcome, String> {
+        Ok(cdma_hlr::model::SetRingtoneOutcome {
+            codecs: vec![],
+            duration_ms: 0,
+        })
+    }
+    async fn clear_ringtone(&self, _: uuid::Uuid) -> Result<(), String> {
+        Ok(())
+    }
+    async fn get_ringtone_codec(
+        &self,
+        _: uuid::Uuid,
+        _: &str,
+    ) -> Result<Option<cdma_hlr::model::SubscriberRingtoneCodecBlob>, String> {
+        Ok(None)
     }
 }
 

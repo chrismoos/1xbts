@@ -471,6 +471,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "cdma-common",
+ "cdma-voice",
  "chrono",
  "log",
  "prost",

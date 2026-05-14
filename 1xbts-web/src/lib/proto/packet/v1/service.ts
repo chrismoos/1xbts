@@ -94,6 +94,23 @@ export interface SetSessionCaptureResponse {
   session: PacketSessionDetail | undefined;
 }
 
+/** Toggles F-SCH downlink frame generation on one packet session. */
+export interface SetSchActiveRequest {
+  /** Packet session identifier. */
+  sessionId: string;
+  /** True to enable RLP3 SCH frame generation, false to disable. */
+  active: boolean;
+  /** RC3 F-SCH rate in bps. Omitted/zero defaults to 19200 for compatibility. */
+  rateBps: number;
+}
+
+/**
+ * Empty response for a successful SCH-active toggle. The error case is
+ * surfaced via gRPC status (NotFound when session_id is unknown, etc.).
+ */
+export interface SetSchActiveResponse {
+}
+
 /** Summary state for a packet data session. */
 export interface PacketSessionInfo {
   /** Packet session identifier. */
@@ -1026,6 +1043,149 @@ export const SetSessionCaptureResponse: MessageFns<SetSessionCaptureResponse> = 
     message.session = (object.session !== undefined && object.session !== null)
       ? PacketSessionDetail.fromPartial(object.session)
       : undefined;
+    return message;
+  },
+};
+
+function createBaseSetSchActiveRequest(): SetSchActiveRequest {
+  return { sessionId: "", active: false, rateBps: 0 };
+}
+
+export const SetSchActiveRequest: MessageFns<SetSchActiveRequest> = {
+  encode(message: SetSchActiveRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.sessionId !== "") {
+      writer.uint32(10).string(message.sessionId);
+    }
+    if (message.active !== false) {
+      writer.uint32(16).bool(message.active);
+    }
+    if (message.rateBps !== 0) {
+      writer.uint32(24).uint32(message.rateBps);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SetSchActiveRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSetSchActiveRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.sessionId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.active = reader.bool();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.rateBps = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SetSchActiveRequest {
+    return {
+      sessionId: isSet(object.sessionId)
+        ? globalThis.String(object.sessionId)
+        : isSet(object.session_id)
+        ? globalThis.String(object.session_id)
+        : "",
+      active: isSet(object.active) ? globalThis.Boolean(object.active) : false,
+      rateBps: isSet(object.rateBps)
+        ? globalThis.Number(object.rateBps)
+        : isSet(object.rate_bps)
+        ? globalThis.Number(object.rate_bps)
+        : 0,
+    };
+  },
+
+  toJSON(message: SetSchActiveRequest): unknown {
+    const obj: any = {};
+    if (message.sessionId !== "") {
+      obj.sessionId = message.sessionId;
+    }
+    if (message.active !== false) {
+      obj.active = message.active;
+    }
+    if (message.rateBps !== 0) {
+      obj.rateBps = Math.round(message.rateBps);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<SetSchActiveRequest>): SetSchActiveRequest {
+    return SetSchActiveRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<SetSchActiveRequest>): SetSchActiveRequest {
+    const message = createBaseSetSchActiveRequest();
+    message.sessionId = object.sessionId ?? "";
+    message.active = object.active ?? false;
+    message.rateBps = object.rateBps ?? 0;
+    return message;
+  },
+};
+
+function createBaseSetSchActiveResponse(): SetSchActiveResponse {
+  return {};
+}
+
+export const SetSchActiveResponse: MessageFns<SetSchActiveResponse> = {
+  encode(_: SetSchActiveResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SetSchActiveResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSetSchActiveResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(_: any): SetSchActiveResponse {
+    return {};
+  },
+
+  toJSON(_: SetSchActiveResponse): unknown {
+    const obj: any = {};
+    return obj;
+  },
+
+  create(base?: DeepPartial<SetSchActiveResponse>): SetSchActiveResponse {
+    return SetSchActiveResponse.fromPartial(base ?? {});
+  },
+  fromPartial(_: DeepPartial<SetSchActiveResponse>): SetSchActiveResponse {
+    const message = createBaseSetSchActiveResponse();
     return message;
   },
 };
@@ -1994,6 +2154,19 @@ export const PacketServiceDefinition = {
       responseStream: false,
       options: {},
     },
+    /**
+     * Enables or disables F-SCH downlink frame generation on a running session.
+     * Called by the BSC after a successful F-SCH allocation (active=true) and
+     * during teardown / SCH release (active=false).
+     */
+    setSchActive: {
+      name: "SetSchActive",
+      requestType: SetSchActiveRequest as typeof SetSchActiveRequest,
+      requestStream: false,
+      responseType: SetSchActiveResponse as typeof SetSchActiveResponse,
+      responseStream: false,
+      options: {},
+    },
   },
 } as const;
 
@@ -2028,6 +2201,15 @@ export interface PacketServiceImplementation<CallContextExt = {}> {
     request: SetSessionCaptureRequest,
     context: CallContext & CallContextExt,
   ): Promise<DeepPartial<SetSessionCaptureResponse>>;
+  /**
+   * Enables or disables F-SCH downlink frame generation on a running session.
+   * Called by the BSC after a successful F-SCH allocation (active=true) and
+   * during teardown / SCH release (active=false).
+   */
+  setSchActive(
+    request: SetSchActiveRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<SetSchActiveResponse>>;
 }
 
 export interface PacketServiceClient<CallOptionsExt = {}> {
@@ -2061,6 +2243,15 @@ export interface PacketServiceClient<CallOptionsExt = {}> {
     request: DeepPartial<SetSessionCaptureRequest>,
     options?: CallOptions & CallOptionsExt,
   ): Promise<SetSessionCaptureResponse>;
+  /**
+   * Enables or disables F-SCH downlink frame generation on a running session.
+   * Called by the BSC after a successful F-SCH allocation (active=true) and
+   * during teardown / SCH release (active=false).
+   */
+  setSchActive(
+    request: DeepPartial<SetSchActiveRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<SetSchActiveResponse>;
 }
 
 function bytesFromBase64(b64: string): Uint8Array {

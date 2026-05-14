@@ -9,13 +9,43 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use log::{debug, info, warn};
 
+use cdma_voice::ringtone_player::EncodedRingtonePlayer;
 use cdma_voice::tone_player::{RingbackToneKind, RingbackTonePlayer};
 
+use cdma_hlr::repository::HlrRepository;
 use cdma_ios::{VoiceBearerFrame, VoiceBearerManager};
 
 use crate::call_control::{CallDirection, CallId, MscCallController};
 use crate::circuit::{CircuitService, MscVoiceLeg};
 use crate::config::MediaRingbackType;
+
+/// Maximum time to wait for the HLR ringtone lookup before falling back to
+/// the synthetic ringback tone. The calling mobile hears (at most) this much
+/// silence at ringback start when a custom ringtone is configured.
+const HLR_RINGTONE_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+fn voice_codec_str(codec: cdma_voice::VoiceCodec) -> &'static str {
+    match codec {
+        cdma_voice::VoiceCodec::EvrcA => "evrc_a",
+        cdma_voice::VoiceCodec::EvrcB => "evrc_b",
+        cdma_voice::VoiceCodec::EvrcWb => "evrc_wb",
+    }
+}
+
+/// Source of frames for the ringback feeder.
+enum RingbackSource {
+    Synthetic(Box<RingbackTonePlayer>),
+    Encoded(Box<EncodedRingtonePlayer>),
+}
+
+impl RingbackSource {
+    fn next_frame(&mut self) -> cdma_voice::VoiceFrame {
+        match self {
+            Self::Synthetic(p) => p.next_frame(),
+            Self::Encoded(p) => p.next_frame(),
+        }
+    }
+}
 
 /// Active MSC-owned voice media feeder that sends generated frames via voice bearer.
 pub(crate) struct ActiveVoiceFeeder {
@@ -57,6 +87,7 @@ impl MediaService {
         voice_bearer: Option<&Arc<VoiceBearerManager>>,
         media_ringback_enabled: bool,
         media_ringback_type: MediaRingbackType,
+        hlr_repo: Option<&Arc<dyn HlrRepository>>,
     ) {
         if !media_ringback_enabled {
             return;
@@ -76,6 +107,7 @@ impl MediaService {
             return;
         }
         let service_option = session.service_option;
+        let called_number = session.called_number.clone();
         let Some(bearer) = voice_bearer else {
             debug!(
                 "MSC: no voice bearer configured, cannot start ringback for call_id={}",
@@ -91,14 +123,40 @@ impl MediaService {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
         let bearer_ref = bearer.clone();
+        let hlr_repo = hlr_repo.cloned();
 
         let handle = tokio::task::spawn(async move {
-            let mut player = match RingbackTonePlayer::new_with_codec(kind, codec) {
-                Ok(player) => player,
-                Err(error) => {
-                    warn!("MSC: failed to initialize ringback feeder: {error}");
-                    return;
+            let custom = match (&hlr_repo, &called_number) {
+                (Some(repo), Some(number)) => {
+                    let fut = load_custom_ringtone(repo.as_ref(), number, codec);
+                    match tokio::time::timeout(HLR_RINGTONE_LOOKUP_TIMEOUT, fut).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            warn!(
+                                "MSC: HLR ringtone lookup timed out after {:?} for call_id={}, falling back to synthetic ringback",
+                                HLR_RINGTONE_LOOKUP_TIMEOUT, call_id.0
+                            );
+                            None
+                        }
+                    }
                 }
+                _ => None,
+            };
+            let mut source = match custom {
+                Some(player) => {
+                    info!(
+                        "MSC: using custom ringtone for call_id={} circuit_id={} called={:?}",
+                        call_id.0, circuit_id, called_number
+                    );
+                    RingbackSource::Encoded(Box::new(player))
+                }
+                None => match RingbackTonePlayer::new_with_codec(kind, codec) {
+                    Ok(player) => RingbackSource::Synthetic(Box::new(player)),
+                    Err(error) => {
+                        warn!("MSC: failed to initialize ringback feeder: {error}");
+                        return;
+                    }
+                },
             };
             info!(
                 "MSC: started ringback feeder for call_id={} circuit_id={} kind={:?}",
@@ -110,7 +168,7 @@ impl MediaService {
                 if shutdown_clone.load(Ordering::Relaxed) {
                     break;
                 }
-                let frame = player.next_frame();
+                let frame = source.next_frame();
                 let bearer_frame = VoiceBearerFrame {
                     circuit_id,
                     rate_bps: voice_rate_bps(frame.rate),
@@ -170,6 +228,7 @@ impl MediaService {
         voice_bearer: Option<&Arc<VoiceBearerManager>>,
         media_ringback_enabled: bool,
         media_ringback_type: MediaRingbackType,
+        hlr_repo: Option<&Arc<dyn HlrRepository>>,
     ) {
         if self.delayed_wav_starts.contains_key(&call_id) {
             return;
@@ -184,6 +243,7 @@ impl MediaService {
             voice_bearer,
             media_ringback_enabled,
             media_ringback_type,
+            hlr_repo,
         );
         info!(
             "MSC: scheduled local WAV playback for call_id={} after {}ms",
@@ -311,6 +371,46 @@ fn media_ringback_kind(media_ringback_type: MediaRingbackType) -> RingbackToneKi
     match media_ringback_type {
         MediaRingbackType::Nanp => RingbackToneKind::Nanp,
         MediaRingbackType::Etsi => RingbackToneKind::Etsi,
+    }
+}
+
+/// Resolve the called subscriber and fetch a pre-encoded ringtone for the
+/// given codec, if any. Returns None on any lookup miss / error — callers
+/// should fall back to synthetic ringback so ringtone trouble never breaks
+/// call setup.
+async fn load_custom_ringtone(
+    hlr_repo: &dyn HlrRepository,
+    called_number: &str,
+    codec: cdma_voice::VoiceCodec,
+) -> Option<EncodedRingtonePlayer> {
+    let subscriber = match hlr_repo.get_subscriber_by_phone_number(called_number).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return None,
+        Err(e) => {
+            warn!("MSC: HLR lookup failed for ringtone called_number={called_number}: {e}");
+            return None;
+        }
+    };
+    if !subscriber.has_ringtone {
+        return None;
+    }
+    let codec_str = voice_codec_str(codec);
+    match hlr_repo
+        .get_ringtone_codec(subscriber.subscriber_id, codec_str)
+        .await
+    {
+        Ok(Some(blob)) => match EncodedRingtonePlayer::new(blob.encoded_frames, codec) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                warn!("MSC: stored ringtone for {called_number} is invalid: {e}");
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(e) => {
+            warn!("MSC: HLR ringtone fetch failed for {called_number}: {e}");
+            None
+        }
     }
 }
 

@@ -37,6 +37,10 @@ message Subscriber {
   google.protobuf.Timestamp updated_at = 6;
   NumberType number_type = 7;
   NumberPlan number_plan = 8;
+  // True when a custom ringtone is stored for this subscriber.
+  bool has_ringtone = 9;
+  // Duration of the stored ringtone in milliseconds (if any).
+  optional uint64 ringtone_duration_ms = 10;
 }
 
 // Radio identity attached to one subscriber.
@@ -249,6 +253,44 @@ message GetRegistrationBindingResponse {
   optional RegistrationBinding binding = 1;
 }
 
+// --- Ringtone Messages ---
+
+// Uploads a WAV ringtone for one subscriber. The HLR server transcodes the
+// WAV into every supported voice codec at upload time.
+message SetSubscriberRingtoneRequest {
+  string subscriber_id = 1;
+  bytes wav_bytes = 2;
+  string original_filename = 3;
+}
+
+// Per-codec result returned after a ringtone upload.
+message RingtoneCodecInfo {
+  string codec = 1;          // "evrc_a", "evrc_b", "evrc_wb"
+  uint32 encoded_bytes = 2;
+  uint64 frame_count = 3;
+}
+
+message SetSubscriberRingtoneResponse {
+  repeated RingtoneCodecInfo codecs = 1;
+  uint64 duration_ms = 2;
+}
+
+message ClearSubscriberRingtoneRequest {
+  string subscriber_id = 1;
+}
+
+// Fetches the pre-encoded frame stream for one codec.
+message GetSubscriberRingtoneCodecRequest {
+  string subscriber_id = 1;
+  string codec = 2;
+}
+
+message GetSubscriberRingtoneCodecResponse {
+  bytes encoded_frames = 1;
+  uint64 frame_count = 2;
+  uint64 duration_ms = 3;
+}
+
 // --- Service ---
 
 // HLR service for subscriber profiles, radio identities, and registrations.
@@ -281,4 +323,10 @@ service HlrService {
   rpc DeleteSubscriber(DeleteSubscriberRequest) returns (google.protobuf.Empty);
   // Returns the current registration binding for a subscriber.
   rpc GetRegistrationBinding(GetRegistrationBindingRequest) returns (GetRegistrationBindingResponse);
+  // Uploads a WAV ringtone for one subscriber; transcoded to every codec.
+  rpc SetSubscriberRingtone(SetSubscriberRingtoneRequest) returns (SetSubscriberRingtoneResponse);
+  // Removes any stored ringtone for one subscriber.
+  rpc ClearSubscriberRingtone(ClearSubscriberRingtoneRequest) returns (google.protobuf.Empty);
+  // Fetches the pre-encoded ringtone frame stream for one codec.
+  rpc GetSubscriberRingtoneCodec(GetSubscriberRingtoneCodecRequest) returns (GetSubscriberRingtoneCodecResponse);
 }

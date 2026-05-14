@@ -80,6 +80,7 @@ impl MtCallService {
                 media_gateway_handle: controller
                     .snapshot(call_id)
                     .and_then(|snapshot| snapshot.media_gateway_handle),
+                called_number: None,
             },
         );
         let leg_role = if secondary_leg {
