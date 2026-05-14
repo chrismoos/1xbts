@@ -387,7 +387,6 @@ fn test_assignment_request_message(
                 encryption_information: None,
                 service_option: Some(cdma_ios::ServiceOption(3)),
                 signals: Vec::new(),
-                calling_party_ascii_number: None,
                 ms_information_records: None,
                 priority: None,
                 paca_timestamp: None,
@@ -842,7 +841,6 @@ async fn a1_paging_request_processes_independently_of_prior_assignment_request()
                 encryption_information: None,
                 service_option: Some(cdma_ios::ServiceOption(3)),
                 signals: Vec::new(),
-                calling_party_ascii_number: None,
                 ms_information_records: None,
                 priority: None,
                 paca_timestamp: None,
@@ -894,7 +892,7 @@ async fn mt_voice_on_existing_so33_uses_traffic_service_negotiation() {
     bsc.mobiles[0].phone_number = Some("5551234567".to_string());
 
     let addr = bsc.mobiles[0].fwd_address.clone();
-    bsc.start_bs_voice_call_for_mobile(&addr, 3, Some("5550001111".to_string()), None, None, None);
+    bsc.start_bs_voice_call_for_mobile(&addr, 3, None, None, None);
 
     assert!(
         !bsc.paging.has_pending_voice_page(),
@@ -1837,6 +1835,8 @@ impl HlrRepository for FakeHlrRepository {
         _phone_number: &str,
         _display_name: &str,
         _status: &str,
+        _number_type: cdma_hlr::model::NumberType,
+        _number_plan: cdma_hlr::model::NumberPlan,
     ) -> Result<Subscriber, String> {
         Ok(self.subscriber.clone())
     }
@@ -1861,6 +1861,8 @@ impl HlrRepository for FakeHlrRepository {
         _phone_number: &str,
         _display_name: &str,
         _status: &str,
+        _number_type: cdma_hlr::model::NumberType,
+        _number_plan: cdma_hlr::model::NumberPlan,
     ) -> Result<Option<Subscriber>, String> {
         Ok(Some(self.subscriber.clone()))
     }
@@ -4915,6 +4917,8 @@ fn fake_hlr_for_welcome(mobile_seen: cdma_hlr::MobileSeenUpsert) -> Arc<FakeHlrR
             status: SubscriberStatus::Active,
             created_at: now,
             updated_at: now,
+            number_type: cdma_hlr::model::NumberType::NetworkSpecific,
+            number_plan: cdma_hlr::model::NumberPlan::IsdnE164,
         },
         binding: RegistrationBinding {
             subscriber_id,

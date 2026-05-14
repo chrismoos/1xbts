@@ -78,7 +78,6 @@ const IE_CELL_IDENTIFIER_LIST: u8 = 0x1a;
 const IE_TAG: u8 = 0x33;
 const IE_SIGNAL: u8 = 0x34;
 const IE_SLOT_CYCLE_INDEX: u8 = 0x35;
-const IE_CALLING_PARTY_ASCII_NUMBER: u8 = 0x4b;
 const IE_PACA_TIMESTAMP: u8 = 0x4e;
 const IE_CALLED_PARTY_BCD_NUMBER: u8 = 0x5e;
 const IE_CALLED_PARTY_ASCII_NUMBER_ALT: u8 = 0x5b;
@@ -3270,7 +3269,6 @@ pub struct AssignmentRequestMessage {
     pub encryption_information: Option<EncryptionInformation>,
     pub service_option: Option<ServiceOption>,
     pub signals: Vec<Signal>,
-    pub calling_party_ascii_number: Option<CallingPartyAsciiNumber>,
     pub ms_information_records: Option<MsInformationRecords>,
     pub priority: Option<Priority>,
     pub paca_timestamp: Option<PacaTimestamp>,
@@ -3298,13 +3296,6 @@ impl AssignmentRequestMessage {
         }
         for signal in &self.signals {
             push_fixed(&mut body, IE_SIGNAL, &[signal.encode()?]);
-        }
-        if let Some(calling_party_ascii_number) = &self.calling_party_ascii_number {
-            push_tlv(
-                &mut body,
-                IE_CALLING_PARTY_ASCII_NUMBER,
-                calling_party_ascii_number.encode()?,
-            )?;
         }
         if let Some(ms_information_records) = &self.ms_information_records {
             let payload = ms_information_records.encode()?;
@@ -3341,7 +3332,6 @@ impl AssignmentRequestMessage {
         let mut encryption_information = None;
         let mut service_option = None;
         let mut signals = Vec::new();
-        let mut calling_party_ascii_number = None;
         let mut ms_information_records = None;
         let mut priority = None;
         let mut paca_timestamp = None;
@@ -3394,16 +3384,6 @@ impl AssignmentRequestMessage {
                     ensure_remaining(body, offset + 1, 1)?;
                     signals.push(Signal::decode(body[offset + 1]));
                     offset += 2;
-                }
-                IE_CALLING_PARTY_ASCII_NUMBER => {
-                    let (_, payload, consumed) = decode_tlv(&body[offset..])?;
-                    set_once(
-                        &mut calling_party_ascii_number,
-                        CallingPartyAsciiNumber::decode(payload)?,
-                        ASSIGNMENT_REQUEST,
-                        IE_CALLING_PARTY_ASCII_NUMBER,
-                    )?;
-                    offset += consumed;
                 }
                 IE_MS_INFORMATION_RECORDS => {
                     let (_, payload, consumed) = decode_tlv(&body[offset..])?;
@@ -3480,7 +3460,6 @@ impl AssignmentRequestMessage {
             encryption_information,
             service_option,
             signals,
-            calling_party_ascii_number,
             ms_information_records,
             priority,
             paca_timestamp,

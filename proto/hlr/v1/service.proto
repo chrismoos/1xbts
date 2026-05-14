@@ -6,6 +6,27 @@ import "google/protobuf/timestamp.proto";
 
 // --- Messages ---
 
+// AWIM Calling Party Number Type per C.S0005-E 3.7.5.10 / ANSI T1.607.
+enum NumberType {
+  NUMBER_TYPE_UNSPECIFIED = 0;
+  NUMBER_TYPE_UNKNOWN = 1;
+  NUMBER_TYPE_INTERNATIONAL = 2;
+  NUMBER_TYPE_NATIONAL = 3;
+  NUMBER_TYPE_NETWORK_SPECIFIC = 4;
+  NUMBER_TYPE_SUBSCRIBER = 5;
+  NUMBER_TYPE_ABBREVIATED = 6;
+}
+
+// AWIM Calling Party Numbering Plan per C.S0005-E 3.7.5.10 / ANSI T1.607.
+enum NumberPlan {
+  NUMBER_PLAN_UNSPECIFIED = 0;
+  NUMBER_PLAN_UNKNOWN = 1;
+  NUMBER_PLAN_ISDN_E164 = 2;
+  NUMBER_PLAN_DATA = 3;
+  NUMBER_PLAN_TELEX = 4;
+  NUMBER_PLAN_PRIVATE = 5;
+}
+
 // Subscriber account record managed by the HLR.
 message Subscriber {
   string subscriber_id = 1;  // UUID
@@ -14,6 +35,8 @@ message Subscriber {
   string status = 4;         // "active", "suspended", "disabled"
   google.protobuf.Timestamp created_at = 5;
   google.protobuf.Timestamp updated_at = 6;
+  NumberType number_type = 7;
+  NumberPlan number_plan = 8;
 }
 
 // Radio identity attached to one subscriber.
@@ -59,6 +82,8 @@ message UpsertSubscriberRequest {
   // Identity to attach
   optional string imsi = 16;
   optional uint32 esn = 10;
+  NumberType number_type = 20;
+  NumberPlan number_plan = 21;
 }
 
 // Created or updated subscriber and identity.
@@ -203,6 +228,8 @@ message UpdateSubscriberRequest {
   string status = 4;
   optional string imsi = 16;
   optional uint32 esn = 10;
+  NumberType number_type = 20;
+  NumberPlan number_plan = 21;
 }
 
 // Updated subscriber, identity, and registration state.

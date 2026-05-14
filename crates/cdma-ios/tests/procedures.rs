@@ -35,7 +35,6 @@ fn assignment_request() -> AssignmentRequestMessage {
         encryption_information: None,
         service_option: None,
         signals: vec![],
-        calling_party_ascii_number: None,
         ms_information_records: None,
         priority: None,
         paca_timestamp: None,

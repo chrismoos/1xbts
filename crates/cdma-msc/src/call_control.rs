@@ -317,7 +317,6 @@ mod tests {
             encryption_information: None,
             service_option: Some(ServiceOption(0x0003)),
             signals: Vec::new(),
-            calling_party_ascii_number: None,
             ms_information_records: None,
             priority: None,
             paca_timestamp: None,

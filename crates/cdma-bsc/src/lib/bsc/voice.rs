@@ -57,12 +57,35 @@ pub(crate) struct VoiceCallSession {
     pub(crate) service_option: u16,
     pub(crate) caller: Option<VoiceCallParty>,
     pub(crate) callee: Option<VoiceCallParty>,
-    /// Explicit caller ID digits for the AWIM Calling Party Number record.
-    /// For BS-originated calls this comes from the UI; for M2M it's the
-    /// caller's phone_number.
-    pub(crate) caller_number: Option<String>,
+    /// AWIM Calling Party Number information record (C.S0005-E 3.7.5.10)
+    /// supplied by the MSC inside the A1 MS Information Records IE. Emitted
+    /// verbatim in the AWIM SDU on F-TCH alerting.
+    pub(crate) calling_party_record: Option<CallingPartyNumberRecord>,
     /// Dialed external number for MSC-controlled mobile-originated calls.
     pub(crate) called_number: Option<String>,
+}
+
+/// Strip non-digits and truncate to E.164's 15-digit maximum.
+/// Logs when characters were dropped so stale stored data surfaces.
+pub(crate) fn sanitize_e164_digits(input: &str) -> String {
+    const MAX: usize = 15;
+    let mut out: String = input.chars().filter(|c| c.is_ascii_digit()).collect();
+    if out.len() > MAX {
+        out.truncate(MAX);
+    }
+    if out.len() != input.len() {
+        warn!(
+            "BSC: AWIM caller digits sanitized: {:?} -> {:?}",
+            input, out
+        );
+    }
+    out
+}
+
+/// Defensive sanitization at the AWIM emit boundary regardless of source.
+pub(crate) fn sanitize_record(mut record: CallingPartyNumberRecord) -> CallingPartyNumberRecord {
+    record.digits = sanitize_e164_digits(&record.digits);
+    record
 }
 
 /// MT call_id stashed when an SR-to-add-voice is refused; the BSC emits
@@ -276,25 +299,15 @@ impl Bsc {
     // Voice call signaling
     // -----------------------------------------------------------------------
 
-    /// Send Alert With Information Message (ringback) on the forward traffic
-    /// channel. Per C.S0005-E 3.7.3.3.2.3, tells the MS to play a call
-    /// progress tone (normal ringback for MO calls).
+    /// Send AWIM ringback on the F-TCH (C.S0005-E 3.7.3.3.2.3).
     pub(crate) fn send_alert_with_info(
         &mut self,
         walsh_code: u8,
         ack_seq: u8,
-        caller_number: Option<&str>,
+        calling_party: Option<CallingPartyNumberRecord>,
     ) -> Result<(), Error> {
         let mut awim = AlertWithInformationMessage::ringback();
-        awim.calling_party = caller_number.map(|digits| {
-            CallingPartyNumberRecord {
-                number_type: 3,            // network-specific
-                number_plan: 1,            // ISDN/telephony (E.164)
-                presentation_indicator: 0, // presentation allowed
-                screening_indicator: 3,    // network provided
-                digits: digits.to_string(),
-            }
-        });
+        awim.calling_party = calling_party.map(sanitize_record);
         let sdu = awim.to_ftch_sdu();
 
         info!(
@@ -579,7 +592,7 @@ impl Bsc {
         &mut self,
         walsh_code: u8,
         ack_seq: u8,
-        caller_number: Option<&str>,
+        calling_party: Option<CallingPartyNumberRecord>,
     ) -> Result<(), Error> {
         let awim = AlertWithInformationMessage {
             signal_info: Some(SignalInfoRecord {
@@ -587,13 +600,7 @@ impl Bsc {
                 alert_pitch: 0x00,
                 signal: 0x01,
             }),
-            calling_party: caller_number.map(|digits| CallingPartyNumberRecord {
-                number_type: 3,
-                number_plan: 1,
-                presentation_indicator: 0,
-                screening_indicator: 3,
-                digits: digits.to_string(),
-            }),
+            calling_party: calling_party.map(sanitize_record),
         };
         let sdu = awim.to_ftch_sdu();
         self.send_traffic_signaling(
@@ -682,7 +689,6 @@ impl Bsc {
         &mut self,
         fwd_address: &cdma_common::lac::paging_messages::MsAddress,
         service_option: u16,
-        caller_number: Option<String>,
         a1_tag: Option<cdma_ios::Tag>,
         a1_call_id: Option<u64>,
         imsi: Option<String>,
@@ -694,8 +700,8 @@ impl Bsc {
             .map(|ms| (ms.subscriber_id, ms.has_traffic_channel()))
             .unwrap_or((None, false));
         info!(
-            "BSC: initiating MSC-controlled MT voice call session={} subscriber={:?} caller_number={:?}",
-            session_id, subscriber_id, caller_number,
+            "BSC: initiating MSC-controlled MT voice call session={} subscriber={:?}",
+            session_id, subscriber_id,
         );
         let callee = self.create_voice_party_from_mobile(fwd_address);
         self.voice.push_session(VoiceCallSession {
@@ -704,7 +710,7 @@ impl Bsc {
             service_option,
             caller: None,
             callee,
-            caller_number,
+            calling_party_record: None,
             called_number: None,
         });
         if has_tc {
@@ -773,10 +779,6 @@ impl Bsc {
         called_number: String,
     ) -> Uuid {
         let session_id = Uuid::new_v4();
-        let caller_number = self
-            .mobiles
-            .get(fwd_address)
-            .and_then(|ms| ms.phone_number.clone());
         let caller = self.create_voice_party_from_mobile(fwd_address);
         self.voice.push_session(VoiceCallSession {
             id: session_id,
@@ -784,9 +786,43 @@ impl Bsc {
             service_option,
             caller,
             callee: None,
-            caller_number,
+            calling_party_record: None,
             called_number: (!called_number.is_empty()).then_some(called_number),
         });
         session_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_e164_digits;
+
+    #[test]
+    fn sanitize_strips_non_digits() {
+        assert_eq!(sanitize_e164_digits("555-123-4567"), "5551234567");
+        assert_eq!(
+            sanitize_e164_digits("(555) 123 4567 ext.99"),
+            "555123456799"
+        );
+        assert_eq!(sanitize_e164_digits("+1 555 123 4567"), "15551234567");
+    }
+
+    #[test]
+    fn sanitize_truncates_to_15_digits() {
+        assert_eq!(
+            sanitize_e164_digits("1234567890123456789"),
+            "123456789012345"
+        );
+    }
+
+    #[test]
+    fn sanitize_returns_empty_for_no_digits() {
+        assert_eq!(sanitize_e164_digits("abc-def"), "");
+        assert_eq!(sanitize_e164_digits(""), "");
+    }
+
+    #[test]
+    fn sanitize_passes_clean_digits_unchanged() {
+        assert_eq!(sanitize_e164_digits("5551234567"), "5551234567");
     }
 }

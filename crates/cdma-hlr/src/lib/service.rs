@@ -8,7 +8,10 @@ use uuid::Uuid;
 
 use crate::model;
 use crate::proto;
-use crate::repository::{HlrRepository, PostgresHlrRepository};
+use crate::repository::{
+    HlrRepository, PostgresHlrRepository, number_plan_from_proto, number_plan_to_proto,
+    number_type_from_proto, number_type_to_proto,
+};
 
 pub struct HlrServiceImpl {
     repo: Arc<dyn HlrRepository>,
@@ -62,6 +65,8 @@ fn subscriber_to_proto(s: &model::Subscriber) -> proto::Subscriber {
         status: s.status.as_str().to_string(),
         created_at: Some(datetime_to_timestamp(s.created_at)),
         updated_at: Some(datetime_to_timestamp(s.updated_at)),
+        number_type: number_type_to_proto(s.number_type) as i32,
+        number_plan: number_plan_to_proto(s.number_plan) as i32,
     }
 }
 
@@ -129,9 +134,18 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         validate_phone_number(&req.phone_number)?;
         validate_optional_imsi(req.imsi.as_deref())?;
 
+        let number_type = number_type_from_proto(req.number_type);
+        let number_plan = number_plan_from_proto(req.number_plan);
+
         let subscriber = self
             .repo
-            .upsert_subscriber(&req.phone_number, &req.display_name, &req.status)
+            .upsert_subscriber(
+                &req.phone_number,
+                &req.display_name,
+                &req.status,
+                number_type,
+                number_plan,
+            )
             .await
             .map_err(|e| {
                 log::error!("HLR: {e}");
@@ -450,6 +464,9 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         let subscriber_id = parse_uuid(&req.subscriber_id)?;
         validate_phone_number(&req.phone_number)?;
 
+        let number_type = number_type_from_proto(req.number_type);
+        let number_plan = number_plan_from_proto(req.number_plan);
+
         let subscriber = self
             .repo
             .update_subscriber(
@@ -457,6 +474,8 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
                 &req.phone_number,
                 &req.display_name,
                 &req.status,
+                number_type,
+                number_plan,
             )
             .await
             .map_err(|e| {

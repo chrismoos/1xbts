@@ -251,14 +251,13 @@ impl Bsc {
                 .unwrap_or((None, None, None, false, 3));
             let session = session_id.and_then(|id| self.voice.session(id));
             let session_kind = session.map(|s| s.kind);
-            let caller_number: Option<String> = match leg_role {
-                Some(VoiceLegRole::Callee) => session.and_then(|s| s.caller_number.clone()),
+            let calling_party = match leg_role {
+                Some(VoiceLegRole::Callee) => session.and_then(|s| s.calling_party_record.clone()),
                 _ => None,
             };
-            let caller_ref = caller_number.as_deref();
             let (send_result, mode, log_label) = match (session_kind, leg_role) {
                 (_, Some(VoiceLegRole::Callee)) => (
-                    self.send_standard_alert(walsh_code, ack_seq, caller_ref),
+                    self.send_standard_alert(walsh_code, ack_seq, calling_party),
                     Some(VoiceAlertMode::WaitForConnectOrder),
                     "standard alert",
                 ),
@@ -268,7 +267,7 @@ impl Bsc {
                     "external ringback",
                 ),
                 _ => (
-                    self.send_alert_with_info(walsh_code, ack_seq, caller_ref),
+                    self.send_alert_with_info(walsh_code, ack_seq, calling_party),
                     Some(VoiceAlertMode::WaitForPeerAnswer),
                     "ringback",
                 ),

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cdma_common::lac::paging_messages::MsAddress;
+use cdma_common::lac::paging_messages::{CallingPartyNumberRecord, MsAddress};
 use log::{info, warn};
 use tokio::spawn;
 
@@ -623,9 +623,9 @@ impl Bsc {
 
         let circuit_id = request.circuit_identity_code.to_packed();
         let calling_party = request
-            .calling_party_ascii_number
+            .ms_information_records
             .as_ref()
-            .and_then(|number| String::from_utf8(number.0.clone()).ok());
+            .and_then(extract_calling_party_number_record);
 
         let existing_voice_walsh = mobile.existing_voice_walsh_for_assignment(
             pending.bind_existing_traffic,
@@ -640,9 +640,9 @@ impl Bsc {
                 tc.voice_leg_role = Some(pending.leg_role);
                 tc.a1_call_id = Some(call_id);
             });
-            if let Some(calling_party) = calling_party.clone() {
+            if let Some(record) = calling_party.clone() {
                 if let Some(session) = self.voice.session_mut(pending.session_id) {
-                    session.caller_number = Some(calling_party);
+                    session.calling_party_record = Some(record);
                 }
             }
 
@@ -734,9 +734,9 @@ impl Bsc {
                 }
             }
         }
-        if let Some(calling_party) = calling_party {
+        if let Some(record) = calling_party {
             if let Some(session) = self.voice.session_mut(pending.session_id) {
-                session.caller_number = Some(calling_party);
+                session.calling_party_record = Some(record);
             }
         }
     }
@@ -848,7 +848,6 @@ impl Bsc {
         self.start_bs_voice_call_for_mobile(
             fwd_address,
             staging.service_option,
-            staging.caller_number,
             Some(tag),
             call_id,
             Some(staging.imsi),
@@ -882,6 +881,27 @@ pub(crate) enum A1ClearState {
 impl Bsc {
     pub(crate) async fn handle_incoming_a1_message(&mut self, message: EncodedA1Message) {
         self.handle_incoming_a1_message_inner(message).await;
+    }
+}
+
+/// Pull a Calling Party Number record (`record_type = 0x03`) out of the
+/// IOS-A.S0014-D §4.2.55 MS Information Records IE. Per the spec the BS
+/// transparently re-emits these bytes inside the AWIM SDU on the F-TCH,
+/// so we just decode the C.S0005-E §3.7.5.10 content and stash it.
+fn extract_calling_party_number_record(
+    records: &cdma_ios::MsInformationRecords,
+) -> Option<CallingPartyNumberRecord> {
+    const CALLING_PARTY_NUMBER_RECORD_TYPE: u8 = 0x03;
+    let record = records
+        .records
+        .iter()
+        .find(|r| r.record_type == CALLING_PARTY_NUMBER_RECORD_TYPE)?;
+    match CallingPartyNumberRecord::decode_content_bytes(&record.content) {
+        Ok(decoded) => Some(decoded),
+        Err(e) => {
+            warn!("BSC: failed to decode AWIM Calling Party Number record: {e}");
+            None
+        }
     }
 }
 
@@ -1527,7 +1547,6 @@ mod tests {
                     encryption_information: None,
                     service_option: Some(cdma_ios::ServiceOption(3)),
                     signals: Vec::new(),
-                    calling_party_ascii_number: None,
                     ms_information_records: None,
                     priority: None,
                     paca_timestamp: None,

@@ -12,6 +12,128 @@ import { Timestamp } from "../../google/protobuf/timestamp";
 
 export const protobufPackage = "hlr.v1";
 
+/** AWIM Calling Party Number Type per C.S0005-E 3.7.5.10 / ANSI T1.607. */
+export enum NumberType {
+  NUMBER_TYPE_UNSPECIFIED = 0,
+  NUMBER_TYPE_UNKNOWN = 1,
+  NUMBER_TYPE_INTERNATIONAL = 2,
+  NUMBER_TYPE_NATIONAL = 3,
+  NUMBER_TYPE_NETWORK_SPECIFIC = 4,
+  NUMBER_TYPE_SUBSCRIBER = 5,
+  NUMBER_TYPE_ABBREVIATED = 6,
+  UNRECOGNIZED = -1,
+}
+
+export function numberTypeFromJSON(object: any): NumberType {
+  switch (object) {
+    case 0:
+    case "NUMBER_TYPE_UNSPECIFIED":
+      return NumberType.NUMBER_TYPE_UNSPECIFIED;
+    case 1:
+    case "NUMBER_TYPE_UNKNOWN":
+      return NumberType.NUMBER_TYPE_UNKNOWN;
+    case 2:
+    case "NUMBER_TYPE_INTERNATIONAL":
+      return NumberType.NUMBER_TYPE_INTERNATIONAL;
+    case 3:
+    case "NUMBER_TYPE_NATIONAL":
+      return NumberType.NUMBER_TYPE_NATIONAL;
+    case 4:
+    case "NUMBER_TYPE_NETWORK_SPECIFIC":
+      return NumberType.NUMBER_TYPE_NETWORK_SPECIFIC;
+    case 5:
+    case "NUMBER_TYPE_SUBSCRIBER":
+      return NumberType.NUMBER_TYPE_SUBSCRIBER;
+    case 6:
+    case "NUMBER_TYPE_ABBREVIATED":
+      return NumberType.NUMBER_TYPE_ABBREVIATED;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return NumberType.UNRECOGNIZED;
+  }
+}
+
+export function numberTypeToJSON(object: NumberType): string {
+  switch (object) {
+    case NumberType.NUMBER_TYPE_UNSPECIFIED:
+      return "NUMBER_TYPE_UNSPECIFIED";
+    case NumberType.NUMBER_TYPE_UNKNOWN:
+      return "NUMBER_TYPE_UNKNOWN";
+    case NumberType.NUMBER_TYPE_INTERNATIONAL:
+      return "NUMBER_TYPE_INTERNATIONAL";
+    case NumberType.NUMBER_TYPE_NATIONAL:
+      return "NUMBER_TYPE_NATIONAL";
+    case NumberType.NUMBER_TYPE_NETWORK_SPECIFIC:
+      return "NUMBER_TYPE_NETWORK_SPECIFIC";
+    case NumberType.NUMBER_TYPE_SUBSCRIBER:
+      return "NUMBER_TYPE_SUBSCRIBER";
+    case NumberType.NUMBER_TYPE_ABBREVIATED:
+      return "NUMBER_TYPE_ABBREVIATED";
+    case NumberType.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
+/** AWIM Calling Party Numbering Plan per C.S0005-E 3.7.5.10 / ANSI T1.607. */
+export enum NumberPlan {
+  NUMBER_PLAN_UNSPECIFIED = 0,
+  NUMBER_PLAN_UNKNOWN = 1,
+  NUMBER_PLAN_ISDN_E164 = 2,
+  NUMBER_PLAN_DATA = 3,
+  NUMBER_PLAN_TELEX = 4,
+  NUMBER_PLAN_PRIVATE = 5,
+  UNRECOGNIZED = -1,
+}
+
+export function numberPlanFromJSON(object: any): NumberPlan {
+  switch (object) {
+    case 0:
+    case "NUMBER_PLAN_UNSPECIFIED":
+      return NumberPlan.NUMBER_PLAN_UNSPECIFIED;
+    case 1:
+    case "NUMBER_PLAN_UNKNOWN":
+      return NumberPlan.NUMBER_PLAN_UNKNOWN;
+    case 2:
+    case "NUMBER_PLAN_ISDN_E164":
+      return NumberPlan.NUMBER_PLAN_ISDN_E164;
+    case 3:
+    case "NUMBER_PLAN_DATA":
+      return NumberPlan.NUMBER_PLAN_DATA;
+    case 4:
+    case "NUMBER_PLAN_TELEX":
+      return NumberPlan.NUMBER_PLAN_TELEX;
+    case 5:
+    case "NUMBER_PLAN_PRIVATE":
+      return NumberPlan.NUMBER_PLAN_PRIVATE;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return NumberPlan.UNRECOGNIZED;
+  }
+}
+
+export function numberPlanToJSON(object: NumberPlan): string {
+  switch (object) {
+    case NumberPlan.NUMBER_PLAN_UNSPECIFIED:
+      return "NUMBER_PLAN_UNSPECIFIED";
+    case NumberPlan.NUMBER_PLAN_UNKNOWN:
+      return "NUMBER_PLAN_UNKNOWN";
+    case NumberPlan.NUMBER_PLAN_ISDN_E164:
+      return "NUMBER_PLAN_ISDN_E164";
+    case NumberPlan.NUMBER_PLAN_DATA:
+      return "NUMBER_PLAN_DATA";
+    case NumberPlan.NUMBER_PLAN_TELEX:
+      return "NUMBER_PLAN_TELEX";
+    case NumberPlan.NUMBER_PLAN_PRIVATE:
+      return "NUMBER_PLAN_PRIVATE";
+    case NumberPlan.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
 /** Subscriber account record managed by the HLR. */
 export interface Subscriber {
   /** UUID */
@@ -23,6 +145,8 @@ export interface Subscriber {
   status: string;
   createdAt: Date | undefined;
   updatedAt: Date | undefined;
+  numberType: NumberType;
+  numberPlan: NumberPlan;
 }
 
 /** Radio identity attached to one subscriber. */
@@ -72,6 +196,8 @@ export interface UpsertSubscriberRequest {
   /** Identity to attach */
   imsi?: string | undefined;
   esn?: number | undefined;
+  numberType: NumberType;
+  numberPlan: NumberPlan;
 }
 
 /** Created or updated subscriber and identity. */
@@ -220,6 +346,8 @@ export interface UpdateSubscriberRequest {
   status: string;
   imsi?: string | undefined;
   esn?: number | undefined;
+  numberType: NumberType;
+  numberPlan: NumberPlan;
 }
 
 /** Updated subscriber, identity, and registration state. */
@@ -240,7 +368,16 @@ export interface GetRegistrationBindingResponse {
 }
 
 function createBaseSubscriber(): Subscriber {
-  return { subscriberId: "", phoneNumber: "", displayName: "", status: "", createdAt: undefined, updatedAt: undefined };
+  return {
+    subscriberId: "",
+    phoneNumber: "",
+    displayName: "",
+    status: "",
+    createdAt: undefined,
+    updatedAt: undefined,
+    numberType: 0,
+    numberPlan: 0,
+  };
 }
 
 export const Subscriber: MessageFns<Subscriber> = {
@@ -262,6 +399,12 @@ export const Subscriber: MessageFns<Subscriber> = {
     }
     if (message.updatedAt !== undefined) {
       Timestamp.encode(toTimestamp(message.updatedAt), writer.uint32(50).fork()).join();
+    }
+    if (message.numberType !== 0) {
+      writer.uint32(56).int32(message.numberType);
+    }
+    if (message.numberPlan !== 0) {
+      writer.uint32(64).int32(message.numberPlan);
     }
     return writer;
   },
@@ -321,6 +464,22 @@ export const Subscriber: MessageFns<Subscriber> = {
           message.updatedAt = fromTimestamp(Timestamp.decode(reader, reader.uint32()));
           continue;
         }
+        case 7: {
+          if (tag !== 56) {
+            break;
+          }
+
+          message.numberType = reader.int32() as any;
+          continue;
+        }
+        case 8: {
+          if (tag !== 64) {
+            break;
+          }
+
+          message.numberPlan = reader.int32() as any;
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -358,6 +517,16 @@ export const Subscriber: MessageFns<Subscriber> = {
         : isSet(object.updated_at)
         ? fromJsonTimestamp(object.updated_at)
         : undefined,
+      numberType: isSet(object.numberType)
+        ? numberTypeFromJSON(object.numberType)
+        : isSet(object.number_type)
+        ? numberTypeFromJSON(object.number_type)
+        : 0,
+      numberPlan: isSet(object.numberPlan)
+        ? numberPlanFromJSON(object.numberPlan)
+        : isSet(object.number_plan)
+        ? numberPlanFromJSON(object.number_plan)
+        : 0,
     };
   },
 
@@ -381,6 +550,12 @@ export const Subscriber: MessageFns<Subscriber> = {
     if (message.updatedAt !== undefined) {
       obj.updatedAt = message.updatedAt.toISOString();
     }
+    if (message.numberType !== 0) {
+      obj.numberType = numberTypeToJSON(message.numberType);
+    }
+    if (message.numberPlan !== 0) {
+      obj.numberPlan = numberPlanToJSON(message.numberPlan);
+    }
     return obj;
   },
 
@@ -395,6 +570,8 @@ export const Subscriber: MessageFns<Subscriber> = {
     message.status = object.status ?? "";
     message.createdAt = object.createdAt ?? undefined;
     message.updatedAt = object.updatedAt ?? undefined;
+    message.numberType = object.numberType ?? 0;
+    message.numberPlan = object.numberPlan ?? 0;
     return message;
   },
 };
@@ -928,7 +1105,15 @@ export const MobileSeenUpsert: MessageFns<MobileSeenUpsert> = {
 };
 
 function createBaseUpsertSubscriberRequest(): UpsertSubscriberRequest {
-  return { phoneNumber: "", displayName: "", status: "", imsi: undefined, esn: undefined };
+  return {
+    phoneNumber: "",
+    displayName: "",
+    status: "",
+    imsi: undefined,
+    esn: undefined,
+    numberType: 0,
+    numberPlan: 0,
+  };
 }
 
 export const UpsertSubscriberRequest: MessageFns<UpsertSubscriberRequest> = {
@@ -947,6 +1132,12 @@ export const UpsertSubscriberRequest: MessageFns<UpsertSubscriberRequest> = {
     }
     if (message.esn !== undefined) {
       writer.uint32(80).uint32(message.esn);
+    }
+    if (message.numberType !== 0) {
+      writer.uint32(160).int32(message.numberType);
+    }
+    if (message.numberPlan !== 0) {
+      writer.uint32(168).int32(message.numberPlan);
     }
     return writer;
   },
@@ -998,6 +1189,22 @@ export const UpsertSubscriberRequest: MessageFns<UpsertSubscriberRequest> = {
           message.esn = reader.uint32();
           continue;
         }
+        case 20: {
+          if (tag !== 160) {
+            break;
+          }
+
+          message.numberType = reader.int32() as any;
+          continue;
+        }
+        case 21: {
+          if (tag !== 168) {
+            break;
+          }
+
+          message.numberPlan = reader.int32() as any;
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1022,6 +1229,16 @@ export const UpsertSubscriberRequest: MessageFns<UpsertSubscriberRequest> = {
       status: isSet(object.status) ? globalThis.String(object.status) : "",
       imsi: isSet(object.imsi) ? globalThis.String(object.imsi) : undefined,
       esn: isSet(object.esn) ? globalThis.Number(object.esn) : undefined,
+      numberType: isSet(object.numberType)
+        ? numberTypeFromJSON(object.numberType)
+        : isSet(object.number_type)
+        ? numberTypeFromJSON(object.number_type)
+        : 0,
+      numberPlan: isSet(object.numberPlan)
+        ? numberPlanFromJSON(object.numberPlan)
+        : isSet(object.number_plan)
+        ? numberPlanFromJSON(object.number_plan)
+        : 0,
     };
   },
 
@@ -1042,6 +1259,12 @@ export const UpsertSubscriberRequest: MessageFns<UpsertSubscriberRequest> = {
     if (message.esn !== undefined) {
       obj.esn = Math.round(message.esn);
     }
+    if (message.numberType !== 0) {
+      obj.numberType = numberTypeToJSON(message.numberType);
+    }
+    if (message.numberPlan !== 0) {
+      obj.numberPlan = numberPlanToJSON(message.numberPlan);
+    }
     return obj;
   },
 
@@ -1055,6 +1278,8 @@ export const UpsertSubscriberRequest: MessageFns<UpsertSubscriberRequest> = {
     message.status = object.status ?? "";
     message.imsi = object.imsi ?? undefined;
     message.esn = object.esn ?? undefined;
+    message.numberType = object.numberType ?? 0;
+    message.numberPlan = object.numberPlan ?? 0;
     return message;
   },
 };
@@ -2894,7 +3119,16 @@ export const DeleteSubscriberRequest: MessageFns<DeleteSubscriberRequest> = {
 };
 
 function createBaseUpdateSubscriberRequest(): UpdateSubscriberRequest {
-  return { subscriberId: "", phoneNumber: "", displayName: "", status: "", imsi: undefined, esn: undefined };
+  return {
+    subscriberId: "",
+    phoneNumber: "",
+    displayName: "",
+    status: "",
+    imsi: undefined,
+    esn: undefined,
+    numberType: 0,
+    numberPlan: 0,
+  };
 }
 
 export const UpdateSubscriberRequest: MessageFns<UpdateSubscriberRequest> = {
@@ -2916,6 +3150,12 @@ export const UpdateSubscriberRequest: MessageFns<UpdateSubscriberRequest> = {
     }
     if (message.esn !== undefined) {
       writer.uint32(80).uint32(message.esn);
+    }
+    if (message.numberType !== 0) {
+      writer.uint32(160).int32(message.numberType);
+    }
+    if (message.numberPlan !== 0) {
+      writer.uint32(168).int32(message.numberPlan);
     }
     return writer;
   },
@@ -2975,6 +3215,22 @@ export const UpdateSubscriberRequest: MessageFns<UpdateSubscriberRequest> = {
           message.esn = reader.uint32();
           continue;
         }
+        case 20: {
+          if (tag !== 160) {
+            break;
+          }
+
+          message.numberType = reader.int32() as any;
+          continue;
+        }
+        case 21: {
+          if (tag !== 168) {
+            break;
+          }
+
+          message.numberPlan = reader.int32() as any;
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -3004,6 +3260,16 @@ export const UpdateSubscriberRequest: MessageFns<UpdateSubscriberRequest> = {
       status: isSet(object.status) ? globalThis.String(object.status) : "",
       imsi: isSet(object.imsi) ? globalThis.String(object.imsi) : undefined,
       esn: isSet(object.esn) ? globalThis.Number(object.esn) : undefined,
+      numberType: isSet(object.numberType)
+        ? numberTypeFromJSON(object.numberType)
+        : isSet(object.number_type)
+        ? numberTypeFromJSON(object.number_type)
+        : 0,
+      numberPlan: isSet(object.numberPlan)
+        ? numberPlanFromJSON(object.numberPlan)
+        : isSet(object.number_plan)
+        ? numberPlanFromJSON(object.number_plan)
+        : 0,
     };
   },
 
@@ -3027,6 +3293,12 @@ export const UpdateSubscriberRequest: MessageFns<UpdateSubscriberRequest> = {
     if (message.esn !== undefined) {
       obj.esn = Math.round(message.esn);
     }
+    if (message.numberType !== 0) {
+      obj.numberType = numberTypeToJSON(message.numberType);
+    }
+    if (message.numberPlan !== 0) {
+      obj.numberPlan = numberPlanToJSON(message.numberPlan);
+    }
     return obj;
   },
 
@@ -3041,6 +3313,8 @@ export const UpdateSubscriberRequest: MessageFns<UpdateSubscriberRequest> = {
     message.status = object.status ?? "";
     message.imsi = object.imsi ?? undefined;
     message.esn = object.esn ?? undefined;
+    message.numberType = object.numberType ?? 0;
+    message.numberPlan = object.numberPlan ?? 0;
     return message;
   },
 };

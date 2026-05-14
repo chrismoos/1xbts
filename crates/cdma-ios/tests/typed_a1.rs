@@ -178,9 +178,6 @@ fn assignment_request_roundtrip() {
                 alert_pitch: 0x02,
             },
         ],
-        calling_party_ascii_number: Some(CallingPartyAsciiNumber(vec![
-            0x80, 0x80, b'5', b'5', b'5',
-        ])),
         ms_information_records: Some(MsInformationRecords {
             records: vec![MsInformationRecord {
                 record_type: 0x42,
@@ -256,7 +253,6 @@ fn assignment_request_with_a2p_bearer_format_roundtrip() {
         encryption_information: None,
         service_option: Some(ServiceOption(0x0003)),
         signals: vec![],
-        calling_party_ascii_number: None,
         ms_information_records: None,
         priority: None,
         paca_timestamp: None,

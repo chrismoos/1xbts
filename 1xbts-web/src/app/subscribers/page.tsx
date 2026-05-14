@@ -3,6 +3,26 @@
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { Card } from "@/components/card";
+import { NumberPlan, NumberType } from "@/lib/proto/hlr/v1/service";
+import {
+  DEFAULT_NUMBER_PLAN,
+  DEFAULT_NUMBER_TYPE,
+  NUMBER_PLAN_OPTIONS,
+  NUMBER_TYPE_OPTIONS,
+} from "@/lib/subscriber-options";
+import {
+  IMSI_DIGITS,
+  PHONE_MAX_DIGITS,
+  validateImsi,
+  validatePhoneNumber,
+} from "@/lib/validation";
+
+type FieldErrors = {
+  phoneNumber?: string;
+  imsi?: string;
+  esn?: string;
+  form?: string;
+};
 
 interface Subscriber {
   subscriberId: string;
@@ -51,8 +71,19 @@ export default function SubscribersPage() {
   const [displayName, setDisplayName] = useState("");
   const [esnHex, setEsnHex] = useState("");
   const [imsi, setImsi] = useState("");
-  const [formError, setFormError] = useState<string | null>(null);
+  const [numberType, setNumberType] = useState<NumberType>(DEFAULT_NUMBER_TYPE);
+  const [numberPlan, setNumberPlan] = useState<NumberPlan>(DEFAULT_NUMBER_PLAN);
+  const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
   const [submitting, setSubmitting] = useState(false);
+
+  const clearFieldError = (field: keyof FieldErrors) =>
+    setFieldErrors((prev) => {
+      if (prev[field] === undefined && prev.form === undefined) return prev;
+      const next = { ...prev };
+      delete next[field];
+      delete next.form;
+      return next;
+    });
 
   const fetchSubscribers = useCallback(async () => {
     try {
@@ -88,46 +119,47 @@ export default function SubscribersPage() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    setFormError(null);
     setSubmitting(true);
 
     try {
-      const body: Record<string, unknown> = {
-        phoneNumber: phoneNumber.trim(),
-        displayName,
-        status: "active",
-      };
-
       const normalizedPhoneNumber = phoneNumber.trim();
       const normalizedEsn = esnHex.trim();
       const normalizedImsi = imsi.trim();
+      const errors: FieldErrors = {};
 
-      if (!/^\d+$/.test(normalizedPhoneNumber)) {
-        setFormError("Phone number must contain at least one digit and only digits");
-        return;
-      }
+      const phoneCheck = validatePhoneNumber(normalizedPhoneNumber);
+      if (!phoneCheck.ok) errors.phoneNumber = phoneCheck.error;
 
-      if (!normalizedEsn && !normalizedImsi) {
-        setFormError("Enter ESN, IMSI, or both");
-        return;
-      }
-
+      let esnValue: number | undefined;
       if (normalizedEsn) {
-        const esn = parseInt(esnHex, 16);
-        if (isNaN(esn)) {
-          setFormError("Invalid ESN hex value");
-          return;
-        }
-        body.esn = esn;
+        esnValue = parseInt(normalizedEsn, 16);
+        if (isNaN(esnValue)) errors.esn = "ESN must be valid hexadecimal";
       }
 
       if (normalizedImsi) {
-        if (!/^\d{10,15}$/.test(normalizedImsi)) {
-          setFormError("IMSI must be 10 to 15 digits");
-          return;
-        }
-        body.imsi = normalizedImsi;
+        const imsiCheck = validateImsi(normalizedImsi);
+        if (!imsiCheck.ok) errors.imsi = imsiCheck.error;
       }
+
+      if (!errors.esn && !errors.imsi && !normalizedEsn && !normalizedImsi) {
+        errors.form = "Enter ESN, IMSI, or both";
+      }
+
+      if (Object.keys(errors).length > 0) {
+        setFieldErrors(errors);
+        return;
+      }
+      setFieldErrors({});
+
+      const body: Record<string, unknown> = {
+        phoneNumber: normalizedPhoneNumber,
+        displayName,
+        status: "active",
+        numberType,
+        numberPlan,
+      };
+      if (esnValue !== undefined) body.esn = esnValue;
+      if (normalizedImsi) body.imsi = normalizedImsi;
 
       const res = await fetch("/api/subscribers", {
         method: "POST",
@@ -153,10 +185,14 @@ export default function SubscribersPage() {
       setDisplayName("");
       setEsnHex("");
       setImsi("");
+      setNumberType(DEFAULT_NUMBER_TYPE);
+      setNumberPlan(DEFAULT_NUMBER_PLAN);
       setShowForm(false);
       void fetchSubscribers();
     } catch (err) {
-      setFormError(err instanceof Error ? err.message : "unknown error");
+      setFieldErrors({
+        form: err instanceof Error ? err.message : "unknown error",
+      });
     } finally {
       setSubmitting(false);
     }
@@ -189,18 +225,35 @@ export default function SubscribersPage() {
 
       {showForm && (
         <Card title="New Subscriber">
-          <form onSubmit={handleSubmit} className="space-y-4">
+          <form onSubmit={handleSubmit} className="space-y-4" noValidate>
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <label className="block text-xs text-muted mb-1">Phone Number</label>
+                <label className="block text-xs text-muted mb-1" htmlFor="new-phone-number">
+                  Phone Number
+                </label>
                 <input
+                  id="new-phone-number"
                   type="text"
                   value={phoneNumber}
-                  onChange={(e) => setPhoneNumber(e.target.value)}
+                  onChange={(e) => {
+                    setPhoneNumber(e.target.value);
+                    clearFieldError("phoneNumber");
+                  }}
+                  inputMode="numeric"
+                  maxLength={PHONE_MAX_DIGITS}
                   placeholder="5551234567"
                   required
+                  aria-invalid={!!fieldErrors.phoneNumber}
+                  aria-describedby={
+                    fieldErrors.phoneNumber ? "new-phone-number-error" : undefined
+                  }
                   className="w-full glass-input font-mono"
                 />
+                {fieldErrors.phoneNumber && (
+                  <p id="new-phone-number-error" className="text-accent-red text-xs mt-1">
+                    {fieldErrors.phoneNumber}
+                  </p>
+                )}
               </div>
               <div>
                 <label className="block text-xs text-muted mb-1">Display Name</label>
@@ -216,30 +269,95 @@ export default function SubscribersPage() {
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div>
-                <label className="block text-xs text-muted mb-1">ESN (hex)</label>
+                <label className="block text-xs text-muted mb-1" htmlFor="new-esn">
+                  ESN (hex)
+                </label>
                 <input
+                  id="new-esn"
                   type="text"
                   value={esnHex}
-                  onChange={(e) => setEsnHex(e.target.value)}
+                  onChange={(e) => {
+                    setEsnHex(e.target.value);
+                    clearFieldError("esn");
+                  }}
                   placeholder="A0000001"
                   maxLength={8}
+                  aria-invalid={!!fieldErrors.esn}
+                  aria-describedby={fieldErrors.esn ? "new-esn-error" : undefined}
                   className="w-full glass-input font-mono"
                 />
+                {fieldErrors.esn && (
+                  <p id="new-esn-error" className="text-accent-red text-xs mt-1">
+                    {fieldErrors.esn}
+                  </p>
+                )}
               </div>
               <div>
-                <label className="block text-xs text-muted mb-1">IMSI</label>
+                <label className="block text-xs text-muted mb-1" htmlFor="new-imsi">
+                  IMSI
+                </label>
                 <input
+                  id="new-imsi"
                   type="text"
                   value={imsi}
-                  onChange={(e) => setImsi(e.target.value)}
-                  placeholder="12345678901"
+                  onChange={(e) => {
+                    setImsi(e.target.value);
+                    clearFieldError("imsi");
+                  }}
+                  inputMode="numeric"
+                  maxLength={IMSI_DIGITS}
+                  placeholder="123456789012345"
+                  aria-invalid={!!fieldErrors.imsi}
+                  aria-describedby={fieldErrors.imsi ? "new-imsi-error" : undefined}
                   className="w-full glass-input font-mono"
                 />
+                {fieldErrors.imsi && (
+                  <p id="new-imsi-error" className="text-accent-red text-xs mt-1">
+                    {fieldErrors.imsi}
+                  </p>
+                )}
               </div>
             </div>
 
-            {formError && (
-              <p className="text-accent-red text-xs">{formError}</p>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs text-muted mb-1" htmlFor="new-number-type">
+                  Number Type
+                </label>
+                <select
+                  id="new-number-type"
+                  value={numberType}
+                  onChange={(e) => setNumberType(Number(e.target.value) as NumberType)}
+                  className="w-full glass-input"
+                >
+                  {NUMBER_TYPE_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs text-muted mb-1" htmlFor="new-number-plan">
+                  Numbering Plan
+                </label>
+                <select
+                  id="new-number-plan"
+                  value={numberPlan}
+                  onChange={(e) => setNumberPlan(Number(e.target.value) as NumberPlan)}
+                  className="w-full glass-input"
+                >
+                  {NUMBER_PLAN_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            {fieldErrors.form && (
+              <p className="text-accent-red text-xs">{fieldErrors.form}</p>
             )}
 
             <button

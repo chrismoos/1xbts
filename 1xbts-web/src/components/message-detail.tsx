@@ -21,6 +21,7 @@ import type {
   TrafficServiceConnect,
   TrafficServiceRequest,
 } from "@/lib/proto/bsc/v1/service";
+import { formatNumberPlan, formatNumberType } from "@/lib/number-format";
 export { shouldHideAccessEvent } from "@/lib/access-event-filter";
 
 function formatBool(value: boolean): string {
@@ -357,8 +358,8 @@ function AccessOriginationDetail({ message }: { message: AccessOrigination }) {
         <Field label="SERVICE_OPTION" value={message.serviceOption} />
         <Field label="PM" value={formatBool(message.pm)} />
         <Field label="DIGIT_MODE" value={formatBool(message.digitMode)} />
-        <Field label="NUMBER_TYPE" value={message.numberType} />
-        <Field label="NUMBER_PLAN" value={message.numberPlan} />
+        <Field label="NUMBER_TYPE" value={formatNumberType(message.numberType)} />
+        <Field label="NUMBER_PLAN" value={formatNumberPlan(message.numberPlan)} />
         <Field label="MORE_FIELDS" value={formatBool(message.moreFields)} />
         <Field label="NUM_FIELDS" value={message.numFields} />
         <Field label="DIGITS" value={message.digits} />
@@ -725,8 +726,8 @@ function AlertWithInfoDetail({ message }: { message: TrafficAlertWithInfo }) {
           <div className="text-secondary font-medium">Calling Party Number</div>
           <FieldGrid>
             <Field label="DIGITS" value={cpn.digits} />
-            <Field label="NUMBER_TYPE" value={cpn.numberType} />
-            <Field label="NUMBER_PLAN" value={cpn.numberPlan} />
+            <Field label="NUMBER_TYPE" value={formatNumberType(cpn.numberType)} />
+            <Field label="NUMBER_PLAN" value={formatNumberPlan(cpn.numberPlan)} />
             <Field label="PI" value={cpn.presentationIndicator} />
             <Field label="SI" value={cpn.screeningIndicator} />
           </FieldGrid>

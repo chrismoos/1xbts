@@ -478,6 +478,7 @@ impl MscRuntime {
                         &self.mo_call,
                         self.config.voice_bearer.as_ref(),
                         self.config.default_voice_service_option,
+                        &self.config.hlr_repo,
                     )
                     .await;
             }
@@ -889,7 +890,6 @@ impl MscRuntime {
                     encryption_information: None,
                     service_option: Some(cdma_ios::ServiceOption(service_option)),
                     signals: Vec::new(),
-                    calling_party_ascii_number: None,
                     ms_information_records: None,
                     priority: None,
                     paca_timestamp: None,
@@ -1050,6 +1050,7 @@ impl MscRuntime {
                 &self.mo_call,
                 self.config.voice_bearer.as_ref(),
                 self.config.default_voice_service_option,
+                &self.config.hlr_repo,
             )
             .await;
     }
@@ -1619,6 +1620,8 @@ mod tests {
             _: &str,
             _: &str,
             _: &str,
+            _: cdma_hlr::model::NumberType,
+            _: cdma_hlr::model::NumberPlan,
         ) -> Result<cdma_hlr::model::Subscriber, String> {
             unimplemented!()
         }
@@ -1640,6 +1643,8 @@ mod tests {
             _: &str,
             _: &str,
             _: &str,
+            _: cdma_hlr::model::NumberType,
+            _: cdma_hlr::model::NumberPlan,
         ) -> Result<Option<cdma_hlr::model::Subscriber>, String> {
             unimplemented!()
         }
@@ -1714,6 +1719,8 @@ mod tests {
             _: &str,
             _: &str,
             _: &str,
+            _: cdma_hlr::model::NumberType,
+            _: cdma_hlr::model::NumberPlan,
         ) -> Result<cdma_hlr::model::Subscriber, String> {
             unimplemented!()
         }
@@ -1729,6 +1736,8 @@ mod tests {
                     status: cdma_hlr::model::SubscriberStatus::Active,
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
+                    number_type: cdma_hlr::model::NumberType::NetworkSpecific,
+                    number_plan: cdma_hlr::model::NumberPlan::IsdnE164,
                 }))
             } else {
                 Ok(None)
@@ -1746,6 +1755,8 @@ mod tests {
             _: &str,
             _: &str,
             _: &str,
+            _: cdma_hlr::model::NumberType,
+            _: cdma_hlr::model::NumberPlan,
         ) -> Result<Option<cdma_hlr::model::Subscriber>, String> {
             unimplemented!()
         }
@@ -2010,7 +2021,6 @@ mod tests {
                     encryption_information: None,
                     service_option: Some(ServiceOption(0x0003)),
                     signals: Vec::new(),
-                    calling_party_ascii_number: None,
                     ms_information_records: None,
                     priority: None,
                     paca_timestamp: None,

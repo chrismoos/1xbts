@@ -1,4 +1,10 @@
 import { getHlrClient, waitForHlrReady } from "@/lib/grpc/hlr-client";
+import { NumberPlan, NumberType } from "@/lib/proto/hlr/v1/service";
+import {
+  DEFAULT_NUMBER_PLAN,
+  DEFAULT_NUMBER_TYPE,
+} from "@/lib/subscriber-options";
+import { validateImsi, validatePhoneNumber } from "@/lib/validation";
 
 export const dynamic = "force-dynamic";
 
@@ -6,14 +12,18 @@ function asString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function validatePhoneNumber(phoneNumber: string): Response | null {
-  if (!/^\d+$/.test(phoneNumber)) {
-    return Response.json(
-      { error: "phoneNumber must contain at least one digit and only digits" },
-      { status: 400 }
-    );
+function coerceNumberType(value: unknown): NumberType {
+  if (typeof value === "number" && NumberType[value] !== undefined) {
+    return value as NumberType;
   }
-  return null;
+  return DEFAULT_NUMBER_TYPE;
+}
+
+function coerceNumberPlan(value: unknown): NumberPlan {
+  if (typeof value === "number" && NumberPlan[value] !== undefined) {
+    return value as NumberPlan;
+  }
+  return DEFAULT_NUMBER_PLAN;
 }
 
 export async function GET(
@@ -52,8 +62,18 @@ export async function PATCH(
     const { id } = await params;
     const body = await request.json();
     const phoneNumber = asString(body.phoneNumber);
-    const validationError = validatePhoneNumber(phoneNumber);
-    if (validationError) return validationError;
+    const phoneCheck = validatePhoneNumber(phoneNumber);
+    if (!phoneCheck.ok) {
+      return Response.json({ error: phoneCheck.error }, { status: 400 });
+    }
+
+    const imsi = asString(body.imsi);
+    if (imsi) {
+      const imsiCheck = validateImsi(imsi);
+      if (!imsiCheck.ok) {
+        return Response.json({ error: imsiCheck.error }, { status: 400 });
+      }
+    }
 
     await waitForHlrReady();
     const client = getHlrClient();
@@ -63,8 +83,10 @@ export async function PATCH(
         phoneNumber,
         displayName: asString(body.displayName),
         status: asString(body.status) || "active",
-        imsi: asString(body.imsi) || undefined,
+        imsi: imsi || undefined,
         esn: body.esn != null ? Number(body.esn) : undefined,
+        numberType: coerceNumberType(body.numberType),
+        numberPlan: coerceNumberPlan(body.numberPlan),
       },
       { signal: abort.signal }
     );

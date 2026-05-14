@@ -6,11 +6,35 @@ import { useRouter } from "next/navigation";
 import { esnManufacturer } from "@/lib/esn-manufacturer";
 import { formatEsn } from "@/lib/format";
 import { Card, Stat } from "@/components/card";
-import type {
-  RegistrationBinding,
-  Subscriber,
-  SubscriberIdentity,
+import {
+  NumberPlan,
+  NumberType,
+  type RegistrationBinding,
+  type Subscriber,
+  type SubscriberIdentity,
 } from "@/lib/proto/hlr/v1/service";
+import {
+  DEFAULT_NUMBER_PLAN,
+  DEFAULT_NUMBER_TYPE,
+  NUMBER_PLAN_OPTIONS,
+  NUMBER_TYPE_OPTIONS,
+  normalizeNumberPlan,
+  normalizeNumberType,
+} from "@/lib/subscriber-options";
+import {
+  IMSI_DIGITS,
+  PHONE_MAX_DIGITS,
+  validateImsi,
+  validatePhoneNumber,
+} from "@/lib/validation";
+
+type FieldErrors = {
+  phoneNumber?: string;
+  imsi?: string;
+  esn?: string;
+  callerNumber?: string;
+  form?: string;
+};
 
 type SubscriberDetail = {
   subscriber?: Subscriber;
@@ -72,7 +96,18 @@ export default function SubscriberDetailPage({
   const [status, setStatus] = useState("active");
   const [esnHex, setEsnHex] = useState("");
   const [imsi, setImsi] = useState("");
-  const [formError, setFormError] = useState<string | null>(null);
+  const [numberType, setNumberType] = useState<NumberType>(DEFAULT_NUMBER_TYPE);
+  const [numberPlan, setNumberPlan] = useState<NumberPlan>(DEFAULT_NUMBER_PLAN);
+  const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
+
+  const clearFieldError = (field: keyof FieldErrors) =>
+    setFieldErrors((prev) => {
+      if (prev[field] === undefined && prev.form === undefined) return prev;
+      const next = { ...prev };
+      delete next[field];
+      delete next.form;
+      return next;
+    });
 
   const fetchDetail = useCallback(async () => {
     try {
@@ -100,6 +135,8 @@ export default function SubscriberDetailPage({
     setPhoneNumber(subscriber.phoneNumber);
     setDisplayName(subscriber.displayName || "");
     setStatus(subscriber.status || "active");
+    setNumberType(normalizeNumberType(subscriber.numberType));
+    setNumberPlan(normalizeNumberPlan(subscriber.numberPlan));
 
     setEsnHex(
       primaryIdentity?.esn != null
@@ -111,39 +148,44 @@ export default function SubscriberDetailPage({
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    setFormError(null);
     setSaveResult(null);
     setSaving(true);
 
     try {
-      const body: Record<string, unknown> = {
-        phoneNumber: phoneNumber.trim(),
-        displayName,
-        status,
-      };
-
       const normalizedPhoneNumber = phoneNumber.trim();
       const normalizedEsn = esnHex.trim();
       const normalizedImsi = imsi.trim();
+      const errors: FieldErrors = {};
 
-      if (!/^\d+$/.test(normalizedPhoneNumber)) {
-        throw new Error("Phone number must contain at least one digit and only digits");
-      }
+      const phoneCheck = validatePhoneNumber(normalizedPhoneNumber);
+      if (!phoneCheck.ok) errors.phoneNumber = phoneCheck.error;
 
+      let esnValue: number | undefined;
       if (normalizedEsn) {
-        const esn = parseInt(normalizedEsn, 16);
-        if (isNaN(esn)) {
-          throw new Error("Invalid ESN hex value");
-        }
-        body.esn = esn;
+        esnValue = parseInt(normalizedEsn, 16);
+        if (isNaN(esnValue)) errors.esn = "ESN must be valid hexadecimal";
       }
 
       if (normalizedImsi) {
-        if (!/^\d{10,15}$/.test(normalizedImsi)) {
-          throw new Error("IMSI must be 10 to 15 digits");
-        }
-        body.imsi = normalizedImsi;
+        const imsiCheck = validateImsi(normalizedImsi);
+        if (!imsiCheck.ok) errors.imsi = imsiCheck.error;
       }
+
+      if (Object.keys(errors).length > 0) {
+        setFieldErrors(errors);
+        return;
+      }
+      setFieldErrors({});
+
+      const body: Record<string, unknown> = {
+        phoneNumber: normalizedPhoneNumber,
+        displayName,
+        status,
+        numberType,
+        numberPlan,
+      };
+      if (esnValue !== undefined) body.esn = esnValue;
+      if (normalizedImsi) body.imsi = normalizedImsi;
 
       const res = await fetch(`/api/subscribers/${encodeURIComponent(id)}`, {
         method: "PATCH",
@@ -157,7 +199,9 @@ export default function SubscriberDetailPage({
       setSaveResult("Saved");
       await fetchDetail();
     } catch (err) {
-      setFormError(err instanceof Error ? err.message : "unknown error");
+      setFieldErrors({
+        form: err instanceof Error ? err.message : "unknown error",
+      });
     } finally {
       setSaving(false);
     }
@@ -185,8 +229,22 @@ export default function SubscriberDetailPage({
 
   const handleCall = async () => {
     if (!detail?.subscriber) return;
-    setCalling(true);
     setCallResult(null);
+    const trimmedCaller = callerNumber.trim();
+    if (trimmedCaller) {
+      const check = validatePhoneNumber(trimmedCaller);
+      if (!check.ok) {
+        setFieldErrors((prev) => ({ ...prev, callerNumber: check.error }));
+        return;
+      }
+    }
+    setFieldErrors((prev) => {
+      if (prev.callerNumber === undefined) return prev;
+      const next = { ...prev };
+      delete next.callerNumber;
+      return next;
+    });
+    setCalling(true);
     try {
       const res = await fetch("/api/calls", {
         method: "POST",
@@ -194,7 +252,7 @@ export default function SubscriberDetailPage({
         body: JSON.stringify({
           subscriberId: detail.subscriber.subscriberId,
           audioFile: callAudioFile.trim() || undefined,
-          callerNumber: callerNumber.trim() || undefined,
+          callerNumber: trimmedCaller || undefined,
         }),
       });
       const data = await res.json();
@@ -362,16 +420,36 @@ export default function SubscriberDetailPage({
         <div className="space-y-4">
           <div className="grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] gap-4 items-end">
             <div>
-              <label className="block text-xs text-muted mb-1">
+              <label className="block text-xs text-muted mb-1" htmlFor="caller-number">
                 Caller ID Number
               </label>
               <input
+                id="caller-number"
                 type="text"
                 value={callerNumber}
-                onChange={(e) => setCallerNumber(e.target.value)}
+                onChange={(e) => {
+                  setCallerNumber(e.target.value);
+                  setFieldErrors((prev) => {
+                    if (prev.callerNumber === undefined) return prev;
+                    const next = { ...prev };
+                    delete next.callerNumber;
+                    return next;
+                  });
+                }}
+                inputMode="numeric"
+                maxLength={PHONE_MAX_DIGITS}
                 placeholder="0000000000"
+                aria-invalid={!!fieldErrors.callerNumber}
+                aria-describedby={
+                  fieldErrors.callerNumber ? "caller-number-error" : undefined
+                }
                 className="w-full glass-input font-mono"
               />
+              {fieldErrors.callerNumber && (
+                <p id="caller-number-error" className="text-accent-red text-xs mt-1">
+                  {fieldErrors.callerNumber}
+                </p>
+              )}
             </div>
             <div>
               <label className="block text-xs text-muted mb-1">
@@ -456,16 +534,33 @@ export default function SubscriberDetailPage({
       </Card>
 
       <Card title="Edit Subscriber">
-        <form onSubmit={handleSave} className="space-y-4">
+        <form onSubmit={handleSave} className="space-y-4" noValidate>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div>
-              <label className="block text-xs text-muted mb-1">Phone Number</label>
+              <label className="block text-xs text-muted mb-1" htmlFor="edit-phone-number">
+                Phone Number
+              </label>
               <input
+                id="edit-phone-number"
                 type="text"
                 value={phoneNumber}
-                onChange={(e) => setPhoneNumber(e.target.value)}
+                onChange={(e) => {
+                  setPhoneNumber(e.target.value);
+                  clearFieldError("phoneNumber");
+                }}
+                inputMode="numeric"
+                maxLength={PHONE_MAX_DIGITS}
+                aria-invalid={!!fieldErrors.phoneNumber}
+                aria-describedby={
+                  fieldErrors.phoneNumber ? "edit-phone-number-error" : undefined
+                }
                 className="w-full glass-input font-mono"
               />
+              {fieldErrors.phoneNumber && (
+                <p id="edit-phone-number-error" className="text-accent-red text-xs mt-1">
+                  {fieldErrors.phoneNumber}
+                </p>
+              )}
             </div>
             <div>
               <label className="block text-xs text-muted mb-1">Display Name</label>
@@ -492,26 +587,92 @@ export default function SubscriberDetailPage({
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
-              <label className="block text-xs text-muted mb-1">ESN (hex)</label>
+              <label className="block text-xs text-muted mb-1" htmlFor="edit-esn">
+                ESN (hex)
+              </label>
               <input
+                id="edit-esn"
                 type="text"
                 value={esnHex}
-                onChange={(e) => setEsnHex(e.target.value)}
+                onChange={(e) => {
+                  setEsnHex(e.target.value);
+                  clearFieldError("esn");
+                }}
+                maxLength={8}
+                aria-invalid={!!fieldErrors.esn}
+                aria-describedby={fieldErrors.esn ? "edit-esn-error" : undefined}
                 className="w-full glass-input font-mono"
               />
+              {fieldErrors.esn && (
+                <p id="edit-esn-error" className="text-accent-red text-xs mt-1">
+                  {fieldErrors.esn}
+                </p>
+              )}
             </div>
             <div>
-              <label className="block text-xs text-muted mb-1">IMSI</label>
+              <label className="block text-xs text-muted mb-1" htmlFor="edit-imsi">
+                IMSI
+              </label>
               <input
+                id="edit-imsi"
                 type="text"
                 value={imsi}
-                onChange={(e) => setImsi(e.target.value)}
+                onChange={(e) => {
+                  setImsi(e.target.value);
+                  clearFieldError("imsi");
+                }}
+                inputMode="numeric"
+                maxLength={IMSI_DIGITS}
+                aria-invalid={!!fieldErrors.imsi}
+                aria-describedby={fieldErrors.imsi ? "edit-imsi-error" : undefined}
                 className="w-full glass-input font-mono"
               />
+              {fieldErrors.imsi && (
+                <p id="edit-imsi-error" className="text-accent-red text-xs mt-1">
+                  {fieldErrors.imsi}
+                </p>
+              )}
             </div>
           </div>
 
-          {formError && <p className="text-xs text-accent-red">{formError}</p>}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs text-muted mb-1" htmlFor="edit-number-type">
+                Number Type
+              </label>
+              <select
+                id="edit-number-type"
+                value={numberType}
+                onChange={(e) => setNumberType(Number(e.target.value) as NumberType)}
+                className="w-full glass-input"
+              >
+                {NUMBER_TYPE_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs text-muted mb-1" htmlFor="edit-number-plan">
+                Numbering Plan
+              </label>
+              <select
+                id="edit-number-plan"
+                value={numberPlan}
+                onChange={(e) => setNumberPlan(Number(e.target.value) as NumberPlan)}
+                className="w-full glass-input"
+              >
+                {NUMBER_PLAN_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          {fieldErrors.form && <p className="text-xs text-accent-red">{fieldErrors.form}</p>}
           {saveResult && <p className="text-xs text-accent-green">{saveResult}</p>}
 
           <button

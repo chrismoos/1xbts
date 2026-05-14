@@ -1,4 +1,5 @@
 import { getMscManagementClient, waitForBscReady } from "@/lib/grpc/client";
+import { validatePhoneNumber } from "@/lib/validation";
 
 export const dynamic = "force-dynamic";
 
@@ -8,13 +9,24 @@ export async function POST(request: Request) {
 
   try {
     const body = await request.json();
+    const callerNumber =
+      typeof body.callerNumber === "string" ? body.callerNumber.trim() : "";
+    if (callerNumber) {
+      const check = validatePhoneNumber(callerNumber);
+      if (!check.ok) {
+        return Response.json(
+          { accepted: false, message: `callerNumber: ${check.error}` },
+          { status: 400 }
+        );
+      }
+    }
     await waitForBscReady();
     const client = getMscManagementClient();
     const result = await client.initiateCall(
       {
         subscriberId: body.subscriberId || "",
         audioFile: body.audioFile || undefined,
-        callerNumber: body.callerNumber || undefined,
+        callerNumber: callerNumber || undefined,
       },
       { signal: abort.signal }
     );

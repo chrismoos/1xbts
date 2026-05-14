@@ -14,6 +14,8 @@ pub trait HlrRepository: Send + Sync {
         phone_number: &str,
         display_name: &str,
         status: &str,
+        number_type: NumberType,
+        number_plan: NumberPlan,
     ) -> Result<Subscriber, String>;
 
     async fn get_subscriber_by_phone_number(
@@ -30,6 +32,8 @@ pub trait HlrRepository: Send + Sync {
         phone_number: &str,
         display_name: &str,
         status: &str,
+        number_type: NumberType,
+        number_plan: NumberPlan,
     ) -> Result<Option<Subscriber>, String>;
 
     async fn list_subscribers(
@@ -119,6 +123,52 @@ fn timestamp_to_datetime(ts: Option<prost_types::Timestamp>) -> Result<DateTime<
         .ok_or_else(|| "invalid timestamp".to_string())
 }
 
+/// Maps proto enum (UNSPECIFIED → default) to the model enum.
+pub(crate) fn number_type_from_proto(value: i32) -> NumberType {
+    match proto::NumberType::try_from(value).unwrap_or(proto::NumberType::Unspecified) {
+        proto::NumberType::Unspecified => NumberType::default(),
+        proto::NumberType::Unknown => NumberType::Unknown,
+        proto::NumberType::International => NumberType::International,
+        proto::NumberType::National => NumberType::National,
+        proto::NumberType::NetworkSpecific => NumberType::NetworkSpecific,
+        proto::NumberType::Subscriber => NumberType::Subscriber,
+        proto::NumberType::Abbreviated => NumberType::Abbreviated,
+    }
+}
+
+/// Maps proto enum (UNSPECIFIED → default) to the model enum.
+pub(crate) fn number_plan_from_proto(value: i32) -> NumberPlan {
+    match proto::NumberPlan::try_from(value).unwrap_or(proto::NumberPlan::Unspecified) {
+        proto::NumberPlan::Unspecified => NumberPlan::default(),
+        proto::NumberPlan::Unknown => NumberPlan::Unknown,
+        proto::NumberPlan::IsdnE164 => NumberPlan::IsdnE164,
+        proto::NumberPlan::Data => NumberPlan::Data,
+        proto::NumberPlan::Telex => NumberPlan::Telex,
+        proto::NumberPlan::Private => NumberPlan::Private,
+    }
+}
+
+pub(crate) fn number_type_to_proto(value: NumberType) -> proto::NumberType {
+    match value {
+        NumberType::Unknown => proto::NumberType::Unknown,
+        NumberType::International => proto::NumberType::International,
+        NumberType::National => proto::NumberType::National,
+        NumberType::NetworkSpecific => proto::NumberType::NetworkSpecific,
+        NumberType::Subscriber => proto::NumberType::Subscriber,
+        NumberType::Abbreviated => proto::NumberType::Abbreviated,
+    }
+}
+
+pub(crate) fn number_plan_to_proto(value: NumberPlan) -> proto::NumberPlan {
+    match value {
+        NumberPlan::Unknown => proto::NumberPlan::Unknown,
+        NumberPlan::IsdnE164 => proto::NumberPlan::IsdnE164,
+        NumberPlan::Data => proto::NumberPlan::Data,
+        NumberPlan::Telex => proto::NumberPlan::Telex,
+        NumberPlan::Private => proto::NumberPlan::Private,
+    }
+}
+
 fn subscriber_from_proto(value: proto::Subscriber) -> Result<Subscriber, String> {
     Ok(Subscriber {
         subscriber_id: Uuid::parse_str(&value.subscriber_id)
@@ -128,6 +178,8 @@ fn subscriber_from_proto(value: proto::Subscriber) -> Result<Subscriber, String>
         status: SubscriberStatus::from_str(&value.status)?,
         created_at: timestamp_to_datetime(value.created_at)?,
         updated_at: timestamp_to_datetime(value.updated_at)?,
+        number_type: number_type_from_proto(value.number_type),
+        number_plan: number_plan_from_proto(value.number_plan),
     })
 }
 
@@ -180,6 +232,8 @@ impl HlrRepository for GrpcHlrRepository {
         phone_number: &str,
         display_name: &str,
         status: &str,
+        number_type: NumberType,
+        number_plan: NumberPlan,
     ) -> Result<Subscriber, String> {
         let mut client = self.client();
         let response = client
@@ -189,6 +243,8 @@ impl HlrRepository for GrpcHlrRepository {
                 status: status.to_string(),
                 imsi: None,
                 esn: None,
+                number_type: number_type_to_proto(number_type) as i32,
+                number_plan: number_plan_to_proto(number_plan) as i32,
             })
             .await
             .map_err(|e| format!("HLR UpsertSubscriber: {e}"))?
@@ -252,6 +308,8 @@ impl HlrRepository for GrpcHlrRepository {
         phone_number: &str,
         display_name: &str,
         status: &str,
+        number_type: NumberType,
+        number_plan: NumberPlan,
     ) -> Result<Option<Subscriber>, String> {
         let mut client = self.client();
         match client
@@ -262,6 +320,8 @@ impl HlrRepository for GrpcHlrRepository {
                 status: status.to_string(),
                 imsi: None,
                 esn: None,
+                number_type: number_type_to_proto(number_type) as i32,
+                number_plan: number_plan_to_proto(number_plan) as i32,
             })
             .await
         {
@@ -523,18 +583,26 @@ impl HlrRepository for PostgresHlrRepository {
         phone_number: &str,
         display_name: &str,
         status: &str,
+        number_type: NumberType,
+        number_plan: NumberPlan,
     ) -> Result<Subscriber, String> {
         let now = Utc::now();
         let id = Uuid::new_v4();
         let row = sqlx::query_as::<_, SubscriberRow>(
             r#"
-            INSERT INTO subscribers (subscriber_id, phone_number, display_name, status, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $5)
+            INSERT INTO subscribers (
+                subscriber_id, phone_number, display_name, status,
+                created_at, updated_at, number_type, number_plan
+            )
+            VALUES ($1, $2, $3, $4, $5, $5, $6, $7)
             ON CONFLICT (phone_number) DO UPDATE SET
                 display_name = EXCLUDED.display_name,
                 status = EXCLUDED.status,
-                updated_at = EXCLUDED.updated_at
-            RETURNING subscriber_id, phone_number, display_name, status, created_at, updated_at
+                updated_at = EXCLUDED.updated_at,
+                number_type = EXCLUDED.number_type,
+                number_plan = EXCLUDED.number_plan
+            RETURNING subscriber_id, phone_number, display_name, status,
+                created_at, updated_at, number_type, number_plan
             "#,
         )
         .bind(id)
@@ -542,6 +610,8 @@ impl HlrRepository for PostgresHlrRepository {
         .bind(display_name)
         .bind(status)
         .bind(now)
+        .bind(number_type)
+        .bind(number_plan)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| format!("upsert_subscriber: {e}"))?;
@@ -553,7 +623,7 @@ impl HlrRepository for PostgresHlrRepository {
         phone_number: &str,
     ) -> Result<Option<Subscriber>, String> {
         let row = sqlx::query_as::<_, SubscriberRow>(
-            "SELECT subscriber_id, phone_number, display_name, status, created_at, updated_at FROM subscribers WHERE phone_number = $1",
+            "SELECT subscriber_id, phone_number, display_name, status, created_at, updated_at, number_type, number_plan FROM subscribers WHERE phone_number = $1",
         )
         .bind(phone_number)
         .fetch_optional(&self.pool)
@@ -567,7 +637,7 @@ impl HlrRepository for PostgresHlrRepository {
         subscriber_id: Uuid,
     ) -> Result<Option<Subscriber>, String> {
         let row = sqlx::query_as::<_, SubscriberRow>(
-            "SELECT subscriber_id, phone_number, display_name, status, created_at, updated_at FROM subscribers WHERE subscriber_id = $1",
+            "SELECT subscriber_id, phone_number, display_name, status, created_at, updated_at, number_type, number_plan FROM subscribers WHERE subscriber_id = $1",
         )
         .bind(subscriber_id)
         .fetch_optional(&self.pool)
@@ -582,6 +652,8 @@ impl HlrRepository for PostgresHlrRepository {
         phone_number: &str,
         display_name: &str,
         status: &str,
+        number_type: NumberType,
+        number_plan: NumberPlan,
     ) -> Result<Option<Subscriber>, String> {
         let now = Utc::now();
         let row = sqlx::query_as::<_, SubscriberRow>(
@@ -590,9 +662,12 @@ impl HlrRepository for PostgresHlrRepository {
             SET phone_number = $2,
                 display_name = $3,
                 status = $4,
-                updated_at = $5
+                updated_at = $5,
+                number_type = $6,
+                number_plan = $7
             WHERE subscriber_id = $1
-            RETURNING subscriber_id, phone_number, display_name, status, created_at, updated_at
+            RETURNING subscriber_id, phone_number, display_name, status,
+                created_at, updated_at, number_type, number_plan
             "#,
         )
         .bind(subscriber_id)
@@ -600,6 +675,8 @@ impl HlrRepository for PostgresHlrRepository {
         .bind(display_name)
         .bind(status)
         .bind(now)
+        .bind(number_type)
+        .bind(number_plan)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| format!("update_subscriber: {e}"))?;
@@ -616,7 +693,7 @@ impl HlrRepository for PostgresHlrRepository {
             .await
             .map_err(|e| format!("list_subscribers count: {e}"))?;
         let rows = sqlx::query_as::<_, SubscriberRow>(
-            "SELECT subscriber_id, phone_number, display_name, status, created_at, updated_at FROM subscribers ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+            "SELECT subscriber_id, phone_number, display_name, status, created_at, updated_at, number_type, number_plan FROM subscribers ORDER BY created_at DESC LIMIT $1 OFFSET $2",
         )
         .bind(limit as i64)
         .bind(offset as i64)
@@ -785,7 +862,7 @@ impl HlrRepository for PostgresHlrRepository {
         if let Some(esn_val) = esn {
             let row = sqlx::query_as::<_, SubscriberRow>(
                 r#"
-                SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at
+                SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at, s.number_type, s.number_plan
                 FROM subscribers s
                 JOIN subscriber_identities i ON s.subscriber_id = i.subscriber_id
                 WHERE i.esn = $1
@@ -803,7 +880,7 @@ impl HlrRepository for PostgresHlrRepository {
         if let Some(imsi_val) = imsi {
             let row = sqlx::query_as::<_, SubscriberRow>(
                 r#"
-                SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at
+                SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at, s.number_type, s.number_plan
                 FROM subscribers s
                 JOIN subscriber_identities i ON s.subscriber_id = i.subscriber_id
                 WHERE i.imsi = $1
@@ -962,6 +1039,8 @@ struct SubscriberRow {
     status: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    number_type: NumberType,
+    number_plan: NumberPlan,
 }
 
 impl TryFrom<SubscriberRow> for Subscriber {
@@ -975,6 +1054,8 @@ impl TryFrom<SubscriberRow> for Subscriber {
             status: SubscriberStatus::from_str(&r.status)?,
             created_at: r.created_at,
             updated_at: r.updated_at,
+            number_type: r.number_type,
+            number_plan: r.number_plan,
         })
     }
 }

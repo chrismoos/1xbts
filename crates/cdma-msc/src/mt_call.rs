@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use log::{info, warn};
 
-use cdma_ios::{EncodedA1Message, VoiceBearerManager};
+use cdma_common::lac::paging_messages::CallingPartyNumberRecord;
+use cdma_hlr::repository::HlrRepository;
+use cdma_ios::{EncodedA1Message, MsInformationRecord, MsInformationRecords, VoiceBearerManager};
 
 use crate::call_control::{CallId, MscCallController};
 use crate::circuit::{CircuitService, CircuitSession, MscVoiceLeg};
@@ -40,6 +42,7 @@ impl MtCallService {
         mo_call: &MoCallService,
         voice_bearer: Option<&Arc<VoiceBearerManager>>,
         default_voice_service_option: u16,
+        hlr_repo: &Arc<dyn HlrRepository>,
     ) {
         let cic = circuits.assignment_circuit_identity_code_for_next_leg(call_id);
         let tag_val = response.tag.map(|t| t.0).unwrap_or(call_id.0 as u32);
@@ -115,6 +118,8 @@ impl MtCallService {
                         bearer_addr: None,
                     }],
                 });
+        let ms_information_records =
+            build_calling_party_ms_information_records(caller_number.as_deref(), hlr_repo).await;
         let assignment_request = cdma_ios::AssignmentRequestMessage {
             channel_type: cdma_ios::ChannelType {
                 speech_or_data_indicator: 0x01,
@@ -125,9 +130,7 @@ impl MtCallService {
             encryption_information: None,
             service_option: response.service_option,
             signals: Vec::new(),
-            calling_party_ascii_number: caller_number
-                .map(|n| cdma_ios::CallingPartyAsciiNumber(n.into_bytes())),
-            ms_information_records: None,
+            ms_information_records,
             priority: None,
             paca_timestamp: None,
             quality_of_service_parameters: None,
@@ -192,4 +195,40 @@ impl MtCallService {
             );
         }
     }
+}
+
+/// Build the A1 MS Information Records IE (IOS-A.S0014-D §4.2.55) carrying
+/// the AWIM Calling Party Number record (C.S0005-E §3.7.5.10). If the caller
+/// has a subscriber row in HLR, use their configured NUMBER_TYPE /
+/// NUMBER_PLAN; otherwise fall back to network-specific / ISDN-E.164.
+async fn build_calling_party_ms_information_records(
+    caller_number: Option<&str>,
+    hlr_repo: &Arc<dyn HlrRepository>,
+) -> Option<MsInformationRecords> {
+    const CALLING_PARTY_NUMBER_RECORD_TYPE: u8 = 0x03;
+    let digits = caller_number?.to_string();
+    if digits.is_empty() {
+        return None;
+    }
+    let (number_type, number_plan) = match hlr_repo.get_subscriber_by_phone_number(&digits).await {
+        Ok(Some(sub)) => (sub.number_type, sub.number_plan),
+        Ok(None) => Default::default(),
+        Err(e) => {
+            warn!("MSC: HLR lookup for AWIM caller {:?} failed: {}", digits, e);
+            Default::default()
+        }
+    };
+    let record = CallingPartyNumberRecord {
+        number_type: number_type.to_wire(),
+        number_plan: number_plan.to_wire(),
+        presentation_indicator: 0,
+        screening_indicator: 3,
+        digits,
+    };
+    Some(MsInformationRecords {
+        records: vec![MsInformationRecord {
+            record_type: CALLING_PARTY_NUMBER_RECORD_TYPE,
+            content: record.encode_content_bytes(),
+        }],
+    })
 }

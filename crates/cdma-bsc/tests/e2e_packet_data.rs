@@ -2937,6 +2937,8 @@ impl FakeHlrRepository {
                 status: SubscriberStatus::Active,
                 created_at: now,
                 updated_at: now,
+                number_type: cdma_hlr::model::NumberType::NetworkSpecific,
+                number_plan: cdma_hlr::model::NumberPlan::IsdnE164,
             },
         }
     }
@@ -2944,7 +2946,14 @@ impl FakeHlrRepository {
 
 #[tonic::async_trait]
 impl HlrRepository for FakeHlrRepository {
-    async fn upsert_subscriber(&self, _: &str, _: &str, _: &str) -> Result<Subscriber, String> {
+    async fn upsert_subscriber(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: cdma_hlr::model::NumberType,
+        _: cdma_hlr::model::NumberPlan,
+    ) -> Result<Subscriber, String> {
         Ok(self.subscriber.clone())
     }
     async fn get_subscriber_by_phone_number(
@@ -2962,6 +2971,8 @@ impl HlrRepository for FakeHlrRepository {
         _: &str,
         _: &str,
         _: &str,
+        _: cdma_hlr::model::NumberType,
+        _: cdma_hlr::model::NumberPlan,
     ) -> Result<Option<Subscriber>, String> {
         Ok(Some(self.subscriber.clone()))
     }
