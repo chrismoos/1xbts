@@ -212,7 +212,7 @@ async fn build_calling_party_ms_information_records(
         return None;
     }
     let (number_type, number_plan) = match hlr_repo.get_subscriber_by_phone_number(&digits).await {
-        Ok(Some(sub)) => (sub.number_type, sub.number_plan),
+        Ok(Some(r)) => (r.subscriber.number_type, r.subscriber.number_plan),
         Ok(None) => Default::default(),
         Err(e) => {
             warn!("MSC: HLR lookup for AWIM caller {:?} failed: {}", digits, e);

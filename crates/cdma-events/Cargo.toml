@@ -1,0 +1,34 @@
+[package]
+name = "cdma-events"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Aggregated network-event bus and gRPC service for 1xBTS components."
+
+[dependencies]
+cdma-hlr = { path = "../cdma-hlr" }
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tonic = { version = "0.13", features = ["tls-ring"] }
+prost = "0.13"
+prost-types = "0.13"
+async-stream = "0.3"
+log = "0.4"
+lru = "0.12"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = "1"
+
+[build-dependencies]
+tonic-build = "0.13"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util", "macros"] }
+
+[lints]
+workspace = true

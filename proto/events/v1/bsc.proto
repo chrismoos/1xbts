@@ -1,0 +1,6 @@
+syntax = "proto3";
+package events.v1;
+
+// BSC-originated events. Empty placeholder; variants added in follow-ups
+// (bridging the existing AccessEvent / PagingEvent / TrafficEvent streams).
+message BscNetworkEvent {}

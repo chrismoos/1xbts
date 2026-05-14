@@ -1,0 +1,115 @@
+syntax = "proto3";
+package events.v1;
+
+import "google/protobuf/timestamp.proto";
+import "events/v1/pdsn.proto";
+import "events/v1/bsc.proto";
+import "events/v1/msc.proto";
+import "events/v1/pcf.proto";
+import "events/v1/hlr.proto";
+import "events/v1/smsc.proto";
+import "events/v1/bts.proto";
+
+// Aggregated event bus. Every component publishes events here as a gRPC
+// client; every consumer subscribes to ListenEvents.
+service EventService {
+  // Long-lived server-streaming subscription. The server fans out matching
+  // events to each subscriber. Slow subscribers are disconnected.
+  rpc ListenEvents(ListenEventsRequest) returns (stream NetworkEvent);
+
+  // Unary publish. Producers hold a long-lived gRPC channel and rely on
+  // HTTP/2 multiplexing — each call is a cheap stream on the existing
+  // connection, no per-event TCP/TLS handshake.
+  rpc Publish(PublishRequest) returns (PublishAck);
+}
+
+// Originating component identity for a NetworkEvent.
+enum EventSource {
+  EVENT_SOURCE_UNSPECIFIED = 0;
+  EVENT_SOURCE_BTS  = 1;
+  EVENT_SOURCE_BSC  = 2;
+  EVENT_SOURCE_MSC  = 3;
+  EVENT_SOURCE_PCF  = 4;
+  EVENT_SOURCE_PDSN = 5;
+  EVENT_SOURCE_HLR  = 6;
+  EVENT_SOURCE_SMSC = 7;
+  EVENT_SOURCE_NIB  = 8;
+}
+
+// Radio-layer identifiers known at the producer site. Producers fill in
+// whichever fields they have; the bus uses these to resolve an HLR
+// `Subscriber` record before fan-out. Empty fields mean unknown — not
+// the same as a particular zero/empty value.
+message MobileIdentity {
+  // IMSI as 10-15 decimal digits. Empty if unknown.
+  string imsi = 1;
+  // Raw 32-bit ESN value. Zero if unknown (treated as "not set").
+  uint32 esn = 2;
+  // MEID as a 14-hex string. Empty if unknown. Carried for forward
+  // compatibility; HLR does not currently index by MEID.
+  string meid = 3;
+}
+
+// HLR-resolved subscriber record. Populated by the bus when an HLR
+// lookup of `MobileIdentity` succeeds. Empty for roaming or unprovisioned
+// mobiles (the air-interface event still flows with `identity` set).
+message Subscriber {
+  // HLR record UUID — stable correlation key for this subscriber.
+  string subscriber_id = 1;
+  // MDN / phone number in E.164 form.
+  string phone_number = 2;
+  // Human-readable name from the HLR record.
+  string display_name = 3;
+  // Account lifecycle state from the HLR record.
+  SubscriberStatus status = 4;
+}
+
+// Account lifecycle state. Mirrors `cdma_hlr::model::SubscriberStatus`.
+enum SubscriberStatus {
+  SUBSCRIBER_STATUS_UNSPECIFIED = 0;
+  SUBSCRIBER_STATUS_ACTIVE = 1;
+  SUBSCRIBER_STATUS_SUSPENDED = 2;
+  SUBSCRIBER_STATUS_DISABLED = 3;
+}
+
+// One event on the unified bus. The top-level envelope is intentionally
+// thin — each component owns its own wrapper sub-message in a dedicated
+// proto file. Adding a new component is one new file + one new oneof arm.
+message NetworkEvent {
+  google.protobuf.Timestamp timestamp = 1;
+  EventSource source = 2;
+  // Monotonic per-server sequence; the bus assigns this before fan-out.
+  // Producers leave it zero on Publish.
+  uint64 sequence = 3;
+  // Free-form producer identity (e.g. "pdsn-0") for multi-instance setups.
+  string producer_instance = 4;
+  // The mobile this event pertains to. Either or both of `identity` and
+  // `subscriber` may be set by the producer; the bus enriches the
+  // missing side via HLR. Both empty = system event with no associated
+  // mobile.
+  MobileIdentity identity = 5;
+  Subscriber subscriber = 6;
+
+  oneof body {
+    PdsnNetworkEvent pdsn = 10;
+    BscNetworkEvent  bsc  = 11;
+    MscNetworkEvent  msc  = 12;
+    PcfNetworkEvent  pcf  = 13;
+    HlrNetworkEvent  hlr  = 14;
+    SmscNetworkEvent smsc = 15;
+    BtsNetworkEvent  bts  = 16;
+  }
+}
+
+message PublishRequest {
+  NetworkEvent event = 1;
+}
+
+message PublishAck {
+  uint64 assigned_sequence = 1;
+}
+
+message ListenEventsRequest {
+  // Empty = all sources.
+  repeated EventSource source_filter = 1;
+}

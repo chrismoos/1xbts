@@ -2948,6 +2948,15 @@ impl FakeHlrRepository {
             },
         }
     }
+
+    fn resolved(&self) -> cdma_hlr::model::ResolvedSubscriber {
+        cdma_hlr::model::ResolvedSubscriber {
+            subscriber: self.subscriber.clone(),
+            identities: Vec::new(),
+            primary_identity: None,
+            binding: None,
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -2965,11 +2974,14 @@ impl HlrRepository for FakeHlrRepository {
     async fn get_subscriber_by_phone_number(
         &self,
         phone: &str,
-    ) -> Result<Option<Subscriber>, String> {
-        Ok((self.subscriber.phone_number == phone).then_some(self.subscriber.clone()))
+    ) -> Result<Option<cdma_hlr::model::ResolvedSubscriber>, String> {
+        Ok((self.subscriber.phone_number == phone).then(|| self.resolved()))
     }
-    async fn get_subscriber_by_id(&self, id: uuid::Uuid) -> Result<Option<Subscriber>, String> {
-        Ok((self.subscriber.subscriber_id == id).then_some(self.subscriber.clone()))
+    async fn get_subscriber_by_id(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Option<cdma_hlr::model::ResolvedSubscriber>, String> {
+        Ok((self.subscriber.subscriber_id == id).then(|| self.resolved()))
     }
     async fn update_subscriber(
         &self,
@@ -3014,8 +3026,8 @@ impl HlrRepository for FakeHlrRepository {
         &self,
         _: Option<u32>,
         _: Option<&str>,
-    ) -> Result<Option<Subscriber>, String> {
-        Ok(Some(self.subscriber.clone()))
+    ) -> Result<Option<cdma_hlr::model::ResolvedSubscriber>, String> {
+        Ok(Some(self.resolved()))
     }
     async fn upsert_registration_binding(
         &self,

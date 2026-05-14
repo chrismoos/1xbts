@@ -100,6 +100,10 @@ pub struct PdsnNodeConfig {
     /// the A10 GRE bearer.
     #[serde(default)]
     pub packet: PacketTransportConfig,
+    /// Optional events-bus endpoint (e.g. `"http://127.0.0.1:17023"`). When
+    /// set, PDSN publishes packet-session bind/unbind events to the bus.
+    #[serde(default)]
+    pub events_endpoint: Option<String>,
 }
 
 impl PdsnNodeConfig {
@@ -126,6 +130,7 @@ mod tests {
         PdsnNodeConfig {
             packet_grpc_listen_addr: "127.0.0.1:17021".parse().unwrap(),
             packet: PacketTransportConfig::default(),
+            events_endpoint: None,
         }
     }
 

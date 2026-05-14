@@ -286,7 +286,7 @@ impl MscRuntime {
         a1: &dyn MscA1Endpoint,
         request: InitiateCallRequest,
     ) -> Result<InitiateCallAccepted, ManagementError> {
-        let Some(subscriber) = self
+        let Some(resolved) = self
             .config
             .hlr_repo
             .get_subscriber_by_id(request.subscriber_id)
@@ -295,23 +295,21 @@ impl MscRuntime {
         else {
             return Err(ManagementError::UnknownSubscriber(request.subscriber_id));
         };
-        if !matches!(subscriber.status, cdma_hlr::model::SubscriberStatus::Active) {
+        let subscriber_id = resolved.subscriber.subscriber_id;
+        if !matches!(
+            resolved.subscriber.status,
+            cdma_hlr::model::SubscriberStatus::Active
+        ) {
             return Err(ManagementError::Rejected(format!(
                 "subscriber {} is not active",
-                subscriber.subscriber_id
+                subscriber_id
             )));
         }
 
-        let Some(binding) = self
-            .config
-            .hlr_repo
-            .get_registration_binding(subscriber.subscriber_id)
-            .await
-            .map_err(ManagementError::Rejected)?
-        else {
+        let Some(binding) = resolved.binding.as_ref() else {
             return Err(ManagementError::Rejected(format!(
                 "subscriber {} is not currently registered",
-                subscriber.subscriber_id
+                subscriber_id
             )));
         };
         if !matches!(
@@ -321,21 +319,15 @@ impl MscRuntime {
         ) {
             return Err(ManagementError::Rejected(format!(
                 "subscriber {} is not pageable in state {}",
-                subscriber.subscriber_id,
+                subscriber_id,
                 binding.state.as_str()
             )));
         }
 
-        let identities = self
-            .config
-            .hlr_repo
-            .get_identities_for_subscriber(subscriber.subscriber_id)
-            .await
-            .map_err(ManagementError::Rejected)?;
-        let imsi = select_pageable_imsi(&identities, &binding).ok_or_else(|| {
+        let imsi = select_pageable_imsi(&resolved.identities, binding).ok_or_else(|| {
             ManagementError::Rejected(format!(
                 "subscriber {} has no IMSI for A1 paging",
-                subscriber.subscriber_id
+                subscriber_id
             ))
         })?;
 
@@ -365,7 +357,7 @@ impl MscRuntime {
         self.mt_call.mt_plans.insert(
             tag.0,
             MtCallPlan {
-                subscriber_id: subscriber.subscriber_id,
+                subscriber_id,
                 imsi: imsi.to_string(),
                 audio_file: request.audio_file,
                 caller_number: request.caller_number,
@@ -1354,12 +1346,12 @@ impl MscRuntime {
                 return;
             }
         };
-        let destination = if let Some(ref subscriber) = subscriber {
+        let destination = if let Some(ref resolved) = subscriber {
             info!(
                 "MSC: sending welcome SMS to {} on registration",
-                subscriber.phone_number
+                resolved.subscriber.phone_number
             );
-            crate::sms::SmsDestinationKey::PhoneNumber(subscriber.phone_number.clone())
+            crate::sms::SmsDestinationKey::PhoneNumber(resolved.subscriber.phone_number.clone())
         } else if let Some(imsi) = imsi {
             info!(
                 "MSC: sending welcome SMS to non-subscriber by IMSI {} on registration",
@@ -1632,13 +1624,13 @@ mod tests {
         async fn get_subscriber_by_phone_number(
             &self,
             _: &str,
-        ) -> Result<Option<cdma_hlr::model::Subscriber>, String> {
+        ) -> Result<Option<cdma_hlr::model::ResolvedSubscriber>, String> {
             Ok(None)
         }
         async fn get_subscriber_by_id(
             &self,
             _: uuid::Uuid,
-        ) -> Result<Option<cdma_hlr::model::Subscriber>, String> {
+        ) -> Result<Option<cdma_hlr::model::ResolvedSubscriber>, String> {
             unimplemented!()
         }
         async fn update_subscriber(
@@ -1688,7 +1680,7 @@ mod tests {
             &self,
             _: Option<u32>,
             _: Option<&str>,
-        ) -> Result<Option<cdma_hlr::model::Subscriber>, String> {
+        ) -> Result<Option<cdma_hlr::model::ResolvedSubscriber>, String> {
             Ok(None)
         }
         async fn upsert_registration_binding(
@@ -1752,9 +1744,9 @@ mod tests {
         async fn get_subscriber_by_phone_number(
             &self,
             phone_number: &str,
-        ) -> Result<Option<cdma_hlr::model::Subscriber>, String> {
+        ) -> Result<Option<cdma_hlr::model::ResolvedSubscriber>, String> {
             if phone_number == self.phone_number {
-                Ok(Some(cdma_hlr::model::Subscriber {
+                let subscriber = cdma_hlr::model::Subscriber {
                     subscriber_id: self.subscriber_id,
                     phone_number: self.phone_number.to_string(),
                     display_name: "M2M Test".to_string(),
@@ -1765,6 +1757,34 @@ mod tests {
                     number_plan: cdma_hlr::model::NumberPlan::IsdnE164,
                     has_ringtone: false,
                     ringtone_duration_ms: None,
+                };
+                let primary = cdma_hlr::model::SubscriberIdentity {
+                    subscriber_identity_id: uuid::Uuid::nil(),
+                    subscriber_id: self.subscriber_id,
+                    imsi: Some(self.imsi.to_string()),
+                    esn: None,
+                    is_primary: true,
+                    created_at: chrono::Utc::now(),
+                };
+                let binding = cdma_hlr::model::RegistrationBinding {
+                    subscriber_id: self.subscriber_id,
+                    serving_node_id: "test".to_string(),
+                    state: cdma_hlr::model::RegistrationState::Registered,
+                    imsi: Some(self.imsi.to_string()),
+                    esn: None,
+                    mob_p_rev: Some(6),
+                    pgslot: Some(0),
+                    slot_cycle_index: Some(2),
+                    last_msg_seq: None,
+                    last_registered_at: chrono::Utc::now(),
+                    last_seen_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                };
+                Ok(Some(cdma_hlr::model::ResolvedSubscriber {
+                    subscriber,
+                    identities: vec![primary.clone()],
+                    primary_identity: Some(primary),
+                    binding: Some(binding),
                 }))
             } else {
                 Ok(None)
@@ -1773,7 +1793,7 @@ mod tests {
         async fn get_subscriber_by_id(
             &self,
             _: uuid::Uuid,
-        ) -> Result<Option<cdma_hlr::model::Subscriber>, String> {
+        ) -> Result<Option<cdma_hlr::model::ResolvedSubscriber>, String> {
             unimplemented!()
         }
         async fn update_subscriber(
@@ -1831,7 +1851,7 @@ mod tests {
             &self,
             _: Option<u32>,
             _: Option<&str>,
-        ) -> Result<Option<cdma_hlr::model::Subscriber>, String> {
+        ) -> Result<Option<cdma_hlr::model::ResolvedSubscriber>, String> {
             Ok(None)
         }
         async fn upsert_registration_binding(

@@ -9,6 +9,7 @@ members = [
     "crates/cdma-bsc",
     "crates/cdma-bts",
     "crates/cdma-common",
+    "crates/cdma-events",
     "crates/cdma-hlr",
     "crates/cdma-ios",
     "crates/cdma-msc",

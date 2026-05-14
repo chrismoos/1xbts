@@ -12,12 +12,17 @@ description = "PDSN session and packet-data gateway support for 1xBTS."
 cdma-a10 = { path = "../cdma-a10" }
 cdma-common = { path = "../cdma-common" }
 cdma-a11 = { path = "../cdma-a11" }
+cdma-events = { path = "../cdma-events" }
 cdma-packet = { path = "../cdma-packet" }
+prost-types = "0.13"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "sync"] }
 tonic = "0.13"
+
+[dev-dependencies]
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [lib]
 path = "src/lib.rs"

@@ -37,6 +37,8 @@ pub const HLR_CONFIG_FILENAME: &str = "hlr.json";
 pub const SMSC_CONFIG_FILENAME: &str = "smsc.json";
 /// Filename of the management plane config inside the config directory.
 pub const MANAGEMENT_CONFIG_FILENAME: &str = "management.json";
+/// Filename of the aggregated event bus config inside the config directory.
+pub const EVENTS_CONFIG_FILENAME: &str = "events.json";
 
 /// Default config directory used when neither `--config-dir` nor
 /// `CDMA_CONFIG_DIR` is set.

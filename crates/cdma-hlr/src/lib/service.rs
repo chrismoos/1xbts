@@ -61,13 +61,32 @@ fn subscriber_to_proto(s: &model::Subscriber) -> proto::Subscriber {
         subscriber_id: s.subscriber_id.to_string(),
         phone_number: s.phone_number.clone(),
         display_name: s.display_name.clone(),
-        status: s.status.as_str().to_string(),
+        status: status_to_proto(&s.status) as i32,
         created_at: Some(datetime_to_timestamp(s.created_at)),
         updated_at: Some(datetime_to_timestamp(s.updated_at)),
         number_type: number_type_to_proto(s.number_type) as i32,
         number_plan: number_plan_to_proto(s.number_plan) as i32,
         has_ringtone: s.has_ringtone,
         ringtone_duration_ms: s.ringtone_duration_ms,
+    }
+}
+
+fn status_to_proto(s: &model::SubscriberStatus) -> proto::SubscriberStatus {
+    match s {
+        model::SubscriberStatus::Active => proto::SubscriberStatus::Active,
+        model::SubscriberStatus::Suspended => proto::SubscriberStatus::Suspended,
+        model::SubscriberStatus::Disabled => proto::SubscriberStatus::Disabled,
+    }
+}
+
+fn status_from_proto_i32(value: i32) -> Result<model::SubscriberStatus, Status> {
+    match proto::SubscriberStatus::try_from(value) {
+        Ok(proto::SubscriberStatus::Active) => Ok(model::SubscriberStatus::Active),
+        Ok(proto::SubscriberStatus::Suspended) => Ok(model::SubscriberStatus::Suspended),
+        Ok(proto::SubscriberStatus::Disabled) => Ok(model::SubscriberStatus::Disabled),
+        Ok(proto::SubscriberStatus::Unspecified) | Err(_) => Err(Status::invalid_argument(
+            format!("invalid subscriber status: {value}"),
+        )),
     }
 }
 
@@ -137,13 +156,14 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
 
         let number_type = number_type_from_proto(req.number_type);
         let number_plan = number_plan_from_proto(req.number_plan);
+        let status = status_from_proto_i32(req.status)?;
 
         let subscriber = self
             .repo
             .upsert_subscriber(
                 &req.phone_number,
                 &req.display_name,
-                &req.status,
+                status.as_str(),
                 number_type,
                 number_plan,
             )
@@ -252,7 +272,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
     ) -> Result<Response<proto::GetSubscriberByPhoneNumberResponse>, Status> {
         let req = request.into_inner();
 
-        let subscriber = self
+        let resolved = self
             .repo
             .get_subscriber_by_phone_number(&req.phone_number)
             .await
@@ -262,28 +282,11 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             })?
             .ok_or_else(|| Status::not_found("subscriber not found"))?;
 
-        let identities = self
-            .repo
-            .get_identities_for_subscriber(subscriber.subscriber_id)
-            .await
-            .map_err(|e| {
-                log::error!("HLR: {e}");
-                Status::internal("internal error")
-            })?;
-
-        let binding = self
-            .repo
-            .get_registration_binding(subscriber.subscriber_id)
-            .await
-            .map_err(|e| {
-                log::error!("HLR: {e}");
-                Status::internal("internal error")
-            })?;
-
         Ok(Response::new(proto::GetSubscriberByPhoneNumberResponse {
-            subscriber: Some(subscriber_to_proto(&subscriber)),
-            identities: identities.iter().map(identity_to_proto).collect(),
-            binding: binding.as_ref().map(binding_to_proto),
+            subscriber: Some(subscriber_to_proto(&resolved.subscriber)),
+            identities: resolved.identities.iter().map(identity_to_proto).collect(),
+            binding: resolved.binding.as_ref().map(binding_to_proto),
+            primary_identity: resolved.primary_identity.as_ref().map(identity_to_proto),
         }))
     }
 
@@ -294,7 +297,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         let req = request.into_inner();
         let subscriber_id = parse_uuid(&req.subscriber_id)?;
 
-        let subscriber = self
+        let resolved = self
             .repo
             .get_subscriber_by_id(subscriber_id)
             .await
@@ -304,28 +307,11 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             })?
             .ok_or_else(|| Status::not_found("subscriber not found"))?;
 
-        let identities = self
-            .repo
-            .get_identities_for_subscriber(subscriber_id)
-            .await
-            .map_err(|e| {
-                log::error!("HLR: {e}");
-                Status::internal("internal error")
-            })?;
-
-        let binding = self
-            .repo
-            .get_registration_binding(subscriber_id)
-            .await
-            .map_err(|e| {
-                log::error!("HLR: {e}");
-                Status::internal("internal error")
-            })?;
-
         Ok(Response::new(proto::GetSubscriberResponse {
-            subscriber: Some(subscriber_to_proto(&subscriber)),
-            identities: identities.iter().map(identity_to_proto).collect(),
-            binding: binding.as_ref().map(binding_to_proto),
+            subscriber: Some(subscriber_to_proto(&resolved.subscriber)),
+            identities: resolved.identities.iter().map(identity_to_proto).collect(),
+            binding: resolved.binding.as_ref().map(binding_to_proto),
+            primary_identity: resolved.primary_identity.as_ref().map(identity_to_proto),
         }))
     }
 
@@ -335,7 +321,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
     ) -> Result<Response<proto::ResolveSubscriberByIdentityResponse>, Status> {
         let req = request.into_inner();
 
-        let subscriber = self
+        let resolved = self
             .repo
             .resolve_by_identity(req.esn, req.imsi.as_deref())
             .await
@@ -344,21 +330,18 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
                 Status::internal("internal error")
             })?;
 
-        let binding = if let Some(ref sub) = subscriber {
-            self.repo
-                .get_registration_binding(sub.subscriber_id)
-                .await
-                .map_err(|e| {
-                    log::error!("HLR: {e}");
-                    Status::internal("internal error")
-                })?
-        } else {
-            None
-        };
-
         Ok(Response::new(proto::ResolveSubscriberByIdentityResponse {
-            subscriber: subscriber.as_ref().map(subscriber_to_proto),
-            binding: binding.as_ref().map(binding_to_proto),
+            subscriber: resolved
+                .as_ref()
+                .map(|r| subscriber_to_proto(&r.subscriber)),
+            binding: resolved
+                .as_ref()
+                .and_then(|r| r.binding.as_ref())
+                .map(binding_to_proto),
+            primary_identity: resolved
+                .as_ref()
+                .and_then(|r| r.primary_identity.as_ref())
+                .map(identity_to_proto),
         }))
     }
 
@@ -408,7 +391,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
     ) -> Result<Response<proto::ResolveSmsTargetResponse>, Status> {
         let req = request.into_inner();
 
-        let subscriber = self
+        let resolved = self
             .repo
             .get_subscriber_by_phone_number(&req.destination_number)
             .await
@@ -418,18 +401,9 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             })?
             .ok_or_else(|| Status::not_found("subscriber not found"))?;
 
-        let binding = self
-            .repo
-            .get_registration_binding(subscriber.subscriber_id)
-            .await
-            .map_err(|e| {
-                log::error!("HLR: {e}");
-                Status::internal("internal error")
-            })?;
-
         Ok(Response::new(proto::ResolveSmsTargetResponse {
-            subscriber: Some(subscriber_to_proto(&subscriber)),
-            binding: binding.as_ref().map(binding_to_proto),
+            subscriber: Some(subscriber_to_proto(&resolved.subscriber)),
+            binding: resolved.binding.as_ref().map(binding_to_proto),
         }))
     }
 
@@ -467,6 +441,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
 
         let number_type = number_type_from_proto(req.number_type);
         let number_plan = number_plan_from_proto(req.number_plan);
+        let status = status_from_proto_i32(req.status)?;
 
         let subscriber = self
             .repo
@@ -474,7 +449,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
                 subscriber_id,
                 &req.phone_number,
                 &req.display_name,
-                &req.status,
+                status.as_str(),
                 number_type,
                 number_plan,
             )

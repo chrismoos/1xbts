@@ -1,0 +1,5 @@
+{
+  "grpc_listen_addr": "127.0.0.1:17023",
+  "subscriber_queue_capacity": 1024,
+  "hlr_endpoint": "http://127.0.0.1:17019"
+}

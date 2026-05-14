@@ -275,6 +275,7 @@ impl PdsnSessionManager {
             .ok_or(PdsnError::UnknownSession(key))?;
         let (uplink_tx, uplink_rx) = mpsc::channel(256);
         let (downlink_tx, downlink_rx) = mpsc::channel(256);
+        let metadata_for_task = metadata.clone();
         let status = Arc::new(Mutex::new(cdma_packet::session_task::SessionStatus::new(
             service_option,
             metadata,
@@ -285,6 +286,8 @@ impl PdsnSessionManager {
         // `None` and the session stays FCH-only.
         let (_control_tx, control_rx) =
             mpsc::channel::<cdma_packet::session_task::SessionControl>(1);
+        let sink: Arc<dyn cdma_packet::session_lifecycle::SessionLifecycleSink> =
+            Arc::new(cdma_packet::session_lifecycle::NullSink);
         tokio::spawn(async move {
             cdma_packet::session_task::run_session(
                 session_id,
@@ -295,6 +298,8 @@ impl PdsnSessionManager {
                 status,
                 allocator,
                 control_rx,
+                metadata_for_task,
+                sink,
             )
             .await;
         });

@@ -541,8 +541,8 @@ impl MscSmsCoordinator {
         &self,
         phone_number: &str,
     ) -> Option<(SmsDestination, MobileIdentity, Option<Uuid>)> {
-        let subscriber = match self.hlr.get_subscriber_by_phone_number(phone_number).await {
-            Ok(Some(s)) => s,
+        let resolved = match self.hlr.get_subscriber_by_phone_number(phone_number).await {
+            Ok(Some(r)) => r,
             Ok(None) => {
                 info!("MSC SMS: no HLR subscriber for phone number {phone_number}");
                 return None;
@@ -552,23 +552,13 @@ impl MscSmsCoordinator {
                 return None;
             }
         };
-        let binding = match self
-            .hlr
-            .get_registration_binding(subscriber.subscriber_id)
-            .await
-        {
-            Ok(Some(b)) => b,
-            Ok(None) => {
-                info!(
-                    "MSC SMS: subscriber {} ({phone_number}) not registered",
-                    subscriber.subscriber_id
-                );
-                return None;
-            }
-            Err(e) => {
-                warn!("MSC SMS: registration binding lookup failed: {e}");
-                return None;
-            }
+        let subscriber_id = resolved.subscriber.subscriber_id;
+        let Some(binding) = resolved.binding.as_ref() else {
+            info!(
+                "MSC SMS: subscriber {} ({phone_number}) not registered",
+                subscriber_id
+            );
+            return None;
         };
 
         // Prefer IMSI for ADDS Page (spec requires IMSI in Mobile Identity IE).
@@ -577,14 +567,14 @@ impl MscSmsCoordinator {
             return Some((
                 SmsDestination::PhoneNumber(phone_number.to_string()),
                 mobile_identity,
-                Some(subscriber.subscriber_id),
+                Some(subscriber_id),
             ));
         }
 
         // ESN-only mobile: ADDS Page spec requires IMSI. Cannot deliver for now.
         warn!(
             "MSC SMS: subscriber {} ({phone_number}) has no IMSI — cannot send ADDS Page",
-            subscriber.subscriber_id
+            subscriber_id
         );
         None
     }
@@ -628,8 +618,8 @@ impl MscSmsCoordinator {
             }
         };
 
-        let originating_subscriber = match self.hlr.resolve_by_identity(None, Some(imsi)).await {
-            Ok(Some(s)) => s,
+        let originating = match self.hlr.resolve_by_identity(None, Some(imsi)).await {
+            Ok(Some(r)) => r.subscriber,
             Ok(None) => {
                 warn!("MSC SMS: IMSI {imsi} not in HLR — recording MO SMS with unknown originator");
                 // Still record the SMS with IMSI as originator placeholder
@@ -656,7 +646,7 @@ impl MscSmsCoordinator {
             }
         };
 
-        let originating_number = &originating_subscriber.phone_number;
+        let originating_number = &originating.phone_number;
         info!(
             "MSC SMS: MO SMS from {} to {} text=\"{}\"",
             originating_number, decoded.destination_number, decoded.text
@@ -668,7 +658,7 @@ impl MscSmsCoordinator {
                 originating_number,
                 &decoded.destination_number,
                 &decoded.text,
-                Some(originating_subscriber.subscriber_id),
+                Some(originating.subscriber_id),
                 None,
                 &MoSmsFingerprint {
                     teleservice_id: decoded.teleservice_id,
@@ -680,8 +670,8 @@ impl MscSmsCoordinator {
     }
 
     async fn record_mo_sms_by_esn(&self, esn: u32, decoded: &cdma_common::sms::DecodedMoSms) {
-        let originating_subscriber = match self.hlr.resolve_by_identity(Some(esn), None).await {
-            Ok(Some(s)) => s,
+        let originating = match self.hlr.resolve_by_identity(Some(esn), None).await {
+            Ok(Some(r)) => r.subscriber,
             Ok(None) => {
                 let esn_str = format!("ESN:0x{esn:08X}");
                 let _ = self
@@ -707,14 +697,14 @@ impl MscSmsCoordinator {
             }
         };
 
-        let originating_number = &originating_subscriber.phone_number;
+        let originating_number = &originating.phone_number;
         let _ = self
             .smsc
             .create_or_get_recent_mo_submission(
                 originating_number,
                 &decoded.destination_number,
                 &decoded.text,
-                Some(originating_subscriber.subscriber_id),
+                Some(originating.subscriber_id),
                 None,
                 &MoSmsFingerprint {
                     teleservice_id: decoded.teleservice_id,

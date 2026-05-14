@@ -146,6 +146,19 @@ impl SubscriberStatus {
     }
 }
 
+/// A resolved subscriber plus the auxiliary data callers typically need
+/// in the same breath: the full identity list, the primary identity
+/// (convenience accessor — same one that's in `identities`), and the
+/// current registration binding. Returned by the read methods on
+/// `HlrRepository` so callers don't have to chase a second RPC.
+#[derive(Debug, Clone)]
+pub struct ResolvedSubscriber {
+    pub subscriber: Subscriber,
+    pub identities: Vec<SubscriberIdentity>,
+    pub primary_identity: Option<SubscriberIdentity>,
+    pub binding: Option<RegistrationBinding>,
+}
+
 /// A single identity (IMSI or ESN) associated with a subscriber.
 #[derive(Debug, Clone)]
 pub struct SubscriberIdentity {

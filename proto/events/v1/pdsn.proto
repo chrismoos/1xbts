@@ -1,0 +1,58 @@
+syntax = "proto3";
+package events.v1;
+
+// PDSN-originated events.
+message PdsnNetworkEvent {
+  oneof event {
+    PacketSessionBound   bound   = 1;
+    PacketSessionUnbound unbound = 2;
+  }
+}
+
+// A packet-data session has been established: a mobile now owns an IP.
+// Subscriber/identity context for the mobile lives in the NetworkEvent
+// envelope; this message carries only the session-specific details.
+message PacketSessionBound {
+  string session_id = 1;
+  string mobile_ip = 2;
+  string pdsn_ip = 3;
+  ServiceOption service_option = 4;
+}
+
+// CDMA Service Option per 3GPP2 / IS-707. Variant numbers equal the
+// standard SO wire value, so producers may also set this field to a raw
+// integer SO not yet listed here and consumers will receive the number
+// untranslated.
+enum ServiceOption {
+  SERVICE_OPTION_UNSPECIFIED = 0;
+  // SO1 — basic voice (8 kbps QCELP).
+  SERVICE_OPTION_VOICE_8K = 1;
+  // SO3 — EVRC voice (8 kbps).
+  SERVICE_OPTION_EVRC = 3;
+  // SO6 — SMS (short message service).
+  SERVICE_OPTION_SMS = 6;
+  // SO7 — packet data, RLP Type 1 (legacy).
+  SERVICE_OPTION_PACKET_DATA_RC1 = 7;
+  // SO33 — packet data, RLP Type 3 (cdma2000).
+  SERVICE_OPTION_PACKET_DATA_RC3 = 33;
+  // SO68 — EVRC-B voice.
+  SERVICE_OPTION_EVRC_B = 68;
+  // SO70 — extended SMS encoding.
+  SERVICE_OPTION_SMS_EXT = 70;
+}
+
+// A packet-data session has been torn down: the IP is released.
+message PacketSessionUnbound {
+  string session_id = 1;
+  string mobile_ip = 2;
+  PacketSessionUnbindReason reason = 3;
+}
+
+enum PacketSessionUnbindReason {
+  PACKET_SESSION_UNBIND_REASON_UNSPECIFIED = 0;
+  // Mobile dropped the session (uplink channel closed).
+  PACKET_SESSION_UNBIND_REASON_UPLINK_CLOSED = 1;
+  // (2 reserved: was ALLOCATOR_FAILURE; allocator failures now never emit
+  // events since the session never reached the bound state.)
+  reserved 2;
+}

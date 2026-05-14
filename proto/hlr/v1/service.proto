@@ -32,7 +32,7 @@ message Subscriber {
   string subscriber_id = 1;  // UUID
   string phone_number = 2;   // one or more decimal digits
   string display_name = 3;
-  string status = 4;         // "active", "suspended", "disabled"
+  SubscriberStatus status = 4;
   google.protobuf.Timestamp created_at = 5;
   google.protobuf.Timestamp updated_at = 6;
   NumberType number_type = 7;
@@ -41,6 +41,15 @@ message Subscriber {
   bool has_ringtone = 9;
   // Duration of the stored ringtone in milliseconds (if any).
   optional uint64 ringtone_duration_ms = 10;
+}
+
+// Subscriber account lifecycle state. Mirrors
+// `cdma_hlr::model::SubscriberStatus`.
+enum SubscriberStatus {
+  SUBSCRIBER_STATUS_UNSPECIFIED = 0;
+  SUBSCRIBER_STATUS_ACTIVE = 1;
+  SUBSCRIBER_STATUS_SUSPENDED = 2;
+  SUBSCRIBER_STATUS_DISABLED = 3;
 }
 
 // Radio identity attached to one subscriber.
@@ -82,7 +91,7 @@ message MobileSeenUpsert {
 message UpsertSubscriberRequest {
   string phone_number = 1;  // one or more decimal digits
   string display_name = 2;
-  string status = 3;
+  SubscriberStatus status = 3;
   // Identity to attach
   optional string imsi = 16;
   optional uint32 esn = 10;
@@ -148,6 +157,9 @@ message GetSubscriberByPhoneNumberResponse {
   Subscriber subscriber = 1;
   repeated SubscriberIdentity identities = 2;
   optional RegistrationBinding binding = 3;
+  // The is_primary=true identity (if any). Surfaced directly so callers
+  // don't have to filter `identities` themselves.
+  optional SubscriberIdentity primary_identity = 4;
 }
 
 // Looks up a subscriber by UUID.
@@ -160,6 +172,9 @@ message GetSubscriberResponse {
   Subscriber subscriber = 1;
   repeated SubscriberIdentity identities = 2;
   optional RegistrationBinding binding = 3;
+  // The is_primary=true identity (if any). Surfaced directly so callers
+  // don't have to filter `identities` themselves.
+  optional SubscriberIdentity primary_identity = 4;
 }
 
 // Resolves a mobile identity observed on the air interface to a subscriber.
@@ -176,6 +191,10 @@ message ResolveSubscriberByIdentityRequest {
 message ResolveSubscriberByIdentityResponse {
   optional Subscriber subscriber = 1;
   optional RegistrationBinding binding = 2;
+  // The is_primary=true identity (if any). Surfaced directly so callers
+  // don't have to follow up with a separate
+  // `GetIdentitiesForSubscriber` RPC to find the canonical IMSI/ESN.
+  optional SubscriberIdentity primary_identity = 3;
 }
 
 // Creates or updates the serving-node registration binding for a subscriber.
@@ -229,7 +248,7 @@ message UpdateSubscriberRequest {
   string subscriber_id = 1;
   string phone_number = 2;
   string display_name = 3;
-  string status = 4;
+  SubscriberStatus status = 4;
   optional string imsi = 16;
   optional uint32 esn = 10;
   NumberType number_type = 20;

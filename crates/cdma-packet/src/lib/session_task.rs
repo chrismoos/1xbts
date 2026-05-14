@@ -13,11 +13,21 @@ use crate::ip_transport::IpTransport;
 use crate::ppp::ipcp::IpcpConfig;
 
 /// Status snapshot for a session, shared with the gRPC query handlers.
+///
+/// `subscriber_id` is `None` for unprovisioned/roaming mobiles. The
+/// `Option` flavor must be propagated through to the event bus so it
+/// can do forward enrichment from `imsi`/`esn` instead of resolving a
+/// bogus subscriber. Callers at the gRPC boundary should map empty
+/// strings to `None`.
 #[derive(Debug, Clone, Default)]
 pub struct SessionMetadata {
     pub mobile_address: String,
-    pub subscriber_id: String,
+    pub subscriber_id: Option<String>,
     pub phone_number: String,
+    /// IMSI of the handset, if known at session-open time.
+    pub imsi: Option<String>,
+    /// ESN of the handset, if known at session-open time.
+    pub esn: Option<u32>,
     pub traffic_walsh_code: u32,
 }
 
@@ -78,7 +88,11 @@ impl SessionStatus {
             last_uplink_rate_bps: 0,
             last_downlink_rate_bps: 0,
             mobile_address: metadata.mobile_address,
-            subscriber_id: metadata.subscriber_id,
+            // SessionStatus is a display-side snapshot; an empty string
+            // means "unknown subscriber" here. The Option flavor on
+            // SessionMetadata is what flows to the event bus where None
+            // vs Some matters.
+            subscriber_id: metadata.subscriber_id.unwrap_or_default(),
             phone_number: metadata.phone_number,
             traffic_walsh_code: metadata.traffic_walsh_code,
             rlp_state: "sync".into(),
@@ -280,9 +294,13 @@ pub async fn run_session(
     status: Arc<Mutex<SessionStatus>>,
     allocator: Arc<dyn IpAllocator>,
     mut control_rx: mpsc::Receiver<SessionControl>,
+    metadata: SessionMetadata,
+    lifecycle_sink: Arc<dyn crate::session_lifecycle::SessionLifecycleSink>,
 ) {
     let allocation_key = session_allocation_key(&session_id, &status);
-    let ipcp_config = allocator.allocate(&allocation_key).unwrap_or_else(|| {
+    let allocated = allocator.allocate(&allocation_key);
+    let allocator_failed = allocated.is_none();
+    let ipcp_config = allocated.unwrap_or_else(|| {
         log::warn!(
             "packet-service: IP pool exhausted for session {} key {}, falling back to default",
             session_id,
@@ -296,6 +314,20 @@ pub async fn run_session(
         ipcp_config.peer_ip,
         allocation_key
     );
+
+    let bind_peer_ip = ipcp_config.peer_ip;
+    let bind_our_ip = ipcp_config.our_ip;
+    if !allocator_failed {
+        lifecycle_sink.on_bound(crate::session_lifecycle::SessionBoundInfo {
+            session_id: session_id.clone(),
+            service_option,
+            subscriber_id: metadata.subscriber_id.clone(),
+            imsi: metadata.imsi.clone(),
+            esn: metadata.esn,
+            peer_ip: bind_peer_ip,
+            our_ip: bind_our_ip,
+        });
+    }
     let mut session = PacketSession::new(service_option, ipcp_config);
     session.set_log_context(session_id.clone());
     let mut transport_ready = false;
@@ -502,6 +534,18 @@ pub async fn run_session(
     {
         let mut s = status.lock().unwrap();
         s.sync_telemetry(SessionPhase::Closed, session.telemetry());
+    }
+    // Only emit unbound if we actually emitted bound. AllocatorFailure
+    // means the session never became observable to the bus.
+    if !allocator_failed {
+        lifecycle_sink.on_unbound(crate::session_lifecycle::SessionUnboundInfo {
+            session_id: session_id.clone(),
+            subscriber_id: metadata.subscriber_id.clone(),
+            imsi: metadata.imsi.clone(),
+            esn: metadata.esn,
+            peer_ip: bind_peer_ip,
+            reason: crate::session_lifecycle::UnbindReason::UplinkClosed,
+        });
     }
     log::info!("packet-service: session {} ended", session_id);
 }

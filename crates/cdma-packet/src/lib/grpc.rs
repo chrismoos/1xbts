@@ -19,6 +19,7 @@ use crate::proto::{
     SessionFrame, SetSchActiveRequest, SetSchActiveResponse, SetSessionCaptureRequest,
     SetSessionCaptureResponse,
 };
+use crate::session_lifecycle::{NullSink, SessionLifecycleSink};
 use crate::session_task::{self, SessionControl, SessionMetadata, SessionStatus};
 use crate::tun_transport::TunTransport;
 
@@ -41,6 +42,7 @@ pub struct PacketServiceImpl {
     fou_tunnel: Option<Arc<FouTunnel>>,
     fou_tcp_tunnel: Option<Arc<FouTcpTunnel>>,
     allocator: Arc<dyn IpAllocator>,
+    lifecycle_sink: Arc<dyn SessionLifecycleSink>,
 }
 
 impl PacketServiceImpl {
@@ -55,6 +57,7 @@ impl PacketServiceImpl {
             fou_tunnel,
             fou_tcp_tunnel,
             allocator: Arc::new(SubnetIpAllocator::default_subnet()),
+            lifecycle_sink: Arc::new(NullSink),
         }
     }
 
@@ -70,7 +73,16 @@ impl PacketServiceImpl {
             fou_tunnel,
             fou_tcp_tunnel,
             allocator,
+            lifecycle_sink: Arc::new(NullSink),
         }
+    }
+
+    /// Attaches a lifecycle sink. The sink fires on session bind (after IP
+    /// allocation) and unbind. Calling this replaces any previously
+    /// installed sink.
+    pub fn with_lifecycle_sink(mut self, sink: Arc<dyn SessionLifecycleSink>) -> Self {
+        self.lifecycle_sink = sink;
+        self
     }
 
     fn create_transport(&self) -> Box<dyn crate::ip_transport::IpTransport> {
@@ -115,13 +127,18 @@ impl PacketServiceImpl {
         let (downlink_tx, downlink_rx) = mpsc::channel(256);
         let (control_tx, control_rx) = mpsc::channel::<SessionControl>(8);
 
-        let status = Arc::new(Mutex::new(SessionStatus::new(service_option, metadata)));
+        let metadata_for_status = metadata.clone();
+        let status = Arc::new(Mutex::new(SessionStatus::new(
+            service_option,
+            metadata_for_status,
+        )));
         let status_clone = status.clone();
         let sid = session_id.clone();
         let so = service_option;
 
         let transport = self.create_transport();
         let alloc = Arc::clone(&self.allocator);
+        let sink = Arc::clone(&self.lifecycle_sink);
         let task_handle = tokio::spawn(async move {
             session_task::run_session(
                 sid,
@@ -132,6 +149,8 @@ impl PacketServiceImpl {
                 status_clone,
                 alloc,
                 control_rx,
+                metadata,
+                sink,
             )
             .await;
         });
@@ -177,16 +196,36 @@ impl PacketServiceImpl {
             .map_err(|e| format!("session {} control send failed: {e}", session_id))
     }
 
-    /// Close a session (for in-process use).
-    pub fn close_session_direct(&self, session_id: &str) {
+    /// Close a session (for in-process use). Drops the uplink sender to
+    /// signal `run_session` to exit its loop and run cleanup (which fires
+    /// the lifecycle sink's `on_unbound`), then awaits the task with a
+    /// 5 s timeout. Aborting here would skip the cleanup block and
+    /// silently drop the unbind event.
+    pub async fn close_session_direct(&self, session_id: &str) {
         let entry = {
             let mut sessions = self.sessions.lock().unwrap();
             sessions.remove(session_id)
         };
         if let Some(entry) = entry {
             drop(entry.uplink_tx);
-            entry.task_handle.abort();
-            log::info!("packet-service: closed session {}", session_id);
+            match tokio::time::timeout(std::time::Duration::from_secs(5), entry.task_handle).await {
+                Ok(Ok(())) => {
+                    log::info!("packet-service: closed session {}", session_id);
+                }
+                Ok(Err(err)) => {
+                    log::warn!(
+                        "packet-service: session {} task panicked on close: {}",
+                        session_id,
+                        err
+                    );
+                }
+                Err(_) => {
+                    log::warn!(
+                        "packet-service: session {} task did not exit within 5s",
+                        session_id
+                    );
+                }
+            }
         }
     }
 
@@ -317,14 +356,17 @@ impl PacketService for PacketServiceImpl {
         let (downlink_tx, downlink_rx) = mpsc::channel(256);
         let (control_tx, control_rx) = mpsc::channel::<SessionControl>(8);
 
+        let metadata = SessionMetadata {
+            mobile_address: req.mobile_address.clone(),
+            subscriber_id: (!req.subscriber_id.is_empty()).then(|| req.subscriber_id.clone()),
+            phone_number: req.phone_number.clone(),
+            imsi: (!req.imsi.is_empty()).then(|| req.imsi.clone()),
+            esn: (req.esn != 0).then_some(req.esn),
+            traffic_walsh_code: req.traffic_walsh_code,
+        };
         let status = Arc::new(Mutex::new(SessionStatus::new(
             req.service_option,
-            SessionMetadata {
-                mobile_address: req.mobile_address.clone(),
-                subscriber_id: req.subscriber_id.clone(),
-                phone_number: req.phone_number.clone(),
-                traffic_walsh_code: req.traffic_walsh_code,
-            },
+            metadata.clone(),
         )));
         let status_clone = status.clone();
         let sid = session_id.clone();
@@ -332,6 +374,7 @@ impl PacketService for PacketServiceImpl {
 
         let transport = self.create_transport();
         let alloc = Arc::clone(&self.allocator);
+        let sink = Arc::clone(&self.lifecycle_sink);
         let task_handle = tokio::spawn(async move {
             session_task::run_session(
                 sid,
@@ -342,6 +385,8 @@ impl PacketService for PacketServiceImpl {
                 status_clone,
                 alloc,
                 control_rx,
+                metadata,
+                sink,
             )
             .await;
         });

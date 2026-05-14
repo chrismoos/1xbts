@@ -28,11 +28,19 @@ pub struct PacketBearerFrame {
 }
 
 /// Radio-edge metadata supplied when BSC asks PCF to establish packet data.
+///
+/// `subscriber_id` is `None` for unprovisioned/roaming mobiles — those
+/// sessions still open, but the envelope's `Subscriber` field stays empty
+/// and the bus relies on forward-enrichment from `imsi`/`esn`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PacketSessionMetadata {
     pub mobile_address: String,
-    pub subscriber_id: String,
+    pub subscriber_id: Option<uuid::Uuid>,
     pub phone_number: String,
+    /// IMSI of the handset, if available.
+    pub imsi: Option<String>,
+    /// ESN of the handset, if available.
+    pub esn: Option<u32>,
     pub traffic_walsh_code: u32,
 }
 
@@ -93,8 +101,10 @@ impl PcfClient for LegacyPcfClient {
     > {
         let metadata = cdma_packet::session_task::SessionMetadata {
             mobile_address: metadata.mobile_address,
-            subscriber_id: metadata.subscriber_id,
+            subscriber_id: metadata.subscriber_id.map(|u| u.to_string()),
             phone_number: metadata.phone_number,
+            imsi: metadata.imsi,
+            esn: metadata.esn,
             traffic_walsh_code: metadata.traffic_walsh_code,
         };
         let (legacy_uplink_tx, mut legacy_downlink_rx) =
@@ -135,7 +145,7 @@ impl PcfClient for LegacyPcfClient {
     }
 
     async fn close_packet_session(&self, session_id: &str) {
-        self.inner.close_session_direct(session_id);
+        self.inner.close_session_direct(session_id).await;
     }
 
     async fn set_sch_active(
@@ -313,10 +323,15 @@ impl PcfClient for GrpcPcfClient {
         let open_req = proto::OpenSessionRequest {
             session_id: session_id.clone(),
             service_option,
-            esn: 0,
-            imsi: String::new(),
+            esn: metadata.esn.unwrap_or(0),
+            imsi: metadata.imsi.clone().unwrap_or_default(),
             mobile_address: metadata.mobile_address,
-            subscriber_id: metadata.subscriber_id,
+            // Proto3 represents "not set" as empty string. The receiver
+            // converts back to `Option<String>` at the gRPC boundary.
+            subscriber_id: metadata
+                .subscriber_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
             phone_number: metadata.phone_number,
             traffic_walsh_code: metadata.traffic_walsh_code,
         };

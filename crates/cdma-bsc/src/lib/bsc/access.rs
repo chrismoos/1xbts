@@ -1249,10 +1249,10 @@ impl Bsc {
                 .await;
 
             let resolution = match result {
-                Ok(Some(subscriber)) => {
-                    let sub_id = subscriber.subscriber_id;
-                    let phone = subscriber.phone_number.clone();
-                    let display_name = subscriber.display_name.clone();
+                Ok(Some(resolved)) => {
+                    let sub_id = resolved.subscriber.subscriber_id;
+                    let phone = resolved.subscriber.phone_number.clone();
+                    let display_name = resolved.subscriber.display_name.clone();
                     info!(
                         "BSC: HLR resolved {} → subscriber {} ({})",
                         format_ms_address(&fwd_addr),
@@ -1287,16 +1287,12 @@ impl Bsc {
                         warn!("BSC: HLR upsert_registration_binding failed: {}", e);
                     }
 
-                    let canonical_imsi = match repo.get_identities_for_subscriber(sub_id).await {
-                        Ok(identities) => identities
-                            .iter()
-                            .find(|identity| identity.is_primary)
-                            .and_then(|identity| identity.imsi.clone()),
-                        Err(e) => {
-                            warn!("BSC: HLR get_identities_for_subscriber failed: {}", e);
-                            None
-                        }
-                    };
+                    // Primary identity comes pre-resolved on the response
+                    // — no need for a follow-up get_identities_for_subscriber.
+                    let canonical_imsi = resolved
+                        .primary_identity
+                        .as_ref()
+                        .and_then(|identity| identity.imsi.clone());
 
                     HlrResolution {
                         fwd_address: fwd_addr,

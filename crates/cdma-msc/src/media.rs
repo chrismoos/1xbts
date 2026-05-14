@@ -391,12 +391,12 @@ async fn load_custom_ringtone(
             return None;
         }
     };
-    if !subscriber.has_ringtone {
+    if !subscriber.subscriber.has_ringtone {
         return None;
     }
     let codec_str = voice_codec_str(codec);
     match hlr_repo
-        .get_ringtone_codec(subscriber.subscriber_id, codec_str)
+        .get_ringtone_codec(subscriber.subscriber.subscriber_id, codec_str)
         .await
     {
         Ok(Some(blob)) => match EncodedRingtonePlayer::new(blob.encoded_frames, codec) {

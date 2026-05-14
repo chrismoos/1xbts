@@ -116,8 +116,13 @@ impl Bsc {
         let service_option = tc.service_option;
         let pcf_metadata = crate::packet::PacketSessionMetadata {
             mobile_address: format_ms_address(&ms.fwd_address),
-            subscriber_id: ms.subscriber_id.unwrap_or_default().to_string(),
+            // None preserves the unprovisioned/roamer case all the way to
+            // the event bus, which can then forward-enrich from IMSI/ESN
+            // (or ship the event with no subscriber if HLR has nothing).
+            subscriber_id: ms.subscriber_id,
             phone_number: ms.phone_number.clone().unwrap_or_default(),
+            imsi: ms.imsi.clone(),
+            esn: ms.esn,
             traffic_walsh_code: walsh_code as u32,
         };
         let session_id = Uuid::new_v4().to_string();

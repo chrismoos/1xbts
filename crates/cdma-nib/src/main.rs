@@ -9,6 +9,7 @@ use cdma_bts::bts::{
     build_radio_from_config, load_radio_from_path, spawn_configured_local_abis_endpoint,
 };
 use cdma_common::error::Error;
+use cdma_events::EventsNodeConfig;
 use cdma_hlr::{HlrNodeConfig, repository::GrpcHlrRepository};
 use cdma_msc::{MscRuntime, MscRuntimeConfig, StaticVoicePolicy};
 use cdma_pdsn::PdsnNodeConfig;
@@ -119,6 +120,15 @@ async fn main() -> Result<(), Error> {
             .map_err(|e| Error::from(format!("load smsc config: {e}")))?;
     let mgmt_config =
         ManagementConfig::load_from_path(&config_dir.join(config::MANAGEMENT_CONFIG_FILENAME))?;
+    let events_config_path = config_dir.join(config::EVENTS_CONFIG_FILENAME);
+    let events_config = if events_config_path.exists() {
+        Some(
+            EventsNodeConfig::load_from_path(&events_config_path)
+                .map_err(|e| Error::from(format!("load events config: {e}")))?,
+        )
+    } else {
+        None
+    };
 
     validate_page_chan_alignment(
         bts_config.overhead.page_chan,
@@ -210,10 +220,63 @@ async fn main() -> Result<(), Error> {
     info!("HLR gRPC service listening on {hlr_addr}");
     info!("SMSC gRPC service listening on {smsc_addr}");
 
+    // Aggregated event bus (subscribed via gRPC ListenEvents; producers
+    // publish via gRPC Publish — no in-process bus by design). The bus
+    // owns its own HLR client per `events.json` and enriches events
+    // before fan-out; nib just hands it the config.
+    if let Some(cfg) = events_config.as_ref() {
+        let addr = cfg.grpc_listen_addr;
+        let bus_cfg = cdma_events::EventBusConfig {
+            subscriber_queue_capacity: cfg.subscriber_queue_capacity,
+        };
+        let enricher = cdma_events::build_default_enricher(cfg)
+            .await
+            .map_err(|e| Error::from(format!("event bus HLR enricher: {e}")))?;
+        let mut bus = cdma_events::EventBusServer::new(bus_cfg);
+        if let Some(enricher) = enricher {
+            bus = bus.with_enricher(enricher);
+            info!(
+                "Event bus HLR enrichment enabled via {:?}",
+                cfg.hlr_endpoint
+            );
+        }
+        tokio::spawn(async move {
+            if let Err(err) = tonic::transport::Server::builder()
+                .add_service(bus.into_service())
+                .serve(addr)
+                .await
+            {
+                log::error!("event bus gRPC server error: {err}");
+            }
+        });
+        info!("Event bus gRPC service listening on {addr}");
+    } else {
+        info!(
+            "Event bus disabled (no {} in {})",
+            config::EVENTS_CONFIG_FILENAME,
+            config_dir.display()
+        );
+    }
+
     // Packet data
     info!("Packet data transport: {:?}", pdsn_config.packet.transport);
+    let lifecycle_sink: Option<Arc<dyn cdma_packet::session_lifecycle::SessionLifecycleSink>> =
+        match pdsn_config.events_endpoint.as_deref() {
+            Some(endpoint) => {
+                let publisher = cdma_events::EventPublisher::spawn(
+                    cdma_events::EventPublisherConfig::new(endpoint.to_string(), "pdsn-0"),
+                )
+                .map_err(|e| Error::from(format!("invalid pdsn.events_endpoint: {e}")))?;
+                info!("PDSN packet-session events publishing to {endpoint}");
+                Some(Arc::new(cdma_pdsn::events::PdsnLifecycleSink::new(
+                    publisher,
+                )))
+            }
+            None => None,
+        };
     let (packet_endpoint, _packet_server) =
-        cdma_pdsn::spawn_configured_packet_service(&pdsn_config).map_err(Error::from)?;
+        cdma_pdsn::spawn_configured_packet_service_with_sink(&pdsn_config, lifecycle_sink)
+            .map_err(Error::from)?;
     let pcf_endpoint = pcf_config.packet_grpc_endpoint.clone();
     let pcf_client: Arc<dyn cdma_bsc::packet::PcfClient> =
         Arc::new(cdma_bsc::packet::GrpcPcfClient::new(pcf_endpoint.clone()));

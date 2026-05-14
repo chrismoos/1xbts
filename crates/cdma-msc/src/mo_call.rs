@@ -52,7 +52,7 @@ impl MoCallService {
         };
 
         match hlr_repo.resolve_by_identity(esn, imsi).await {
-            Ok(Some(subscriber)) => Some(subscriber.phone_number),
+            Ok(Some(resolved)) => Some(resolved.subscriber.phone_number),
             Ok(None) => None,
             Err(error) => {
                 warn!("MSC: HLR originator lookup failed for MO call: {}", error);
@@ -69,8 +69,8 @@ impl MoCallService {
         hlr_repo: &dyn cdma_hlr::repository::HlrRepository,
         circuits: &mut CircuitService,
     ) -> MoSubscriberRoute {
-        let subscriber = match hlr_repo.get_subscriber_by_phone_number(called_number).await {
-            Ok(Some(subscriber)) => subscriber,
+        let resolved = match hlr_repo.get_subscriber_by_phone_number(called_number).await {
+            Ok(Some(resolved)) => resolved,
             Ok(None) => return MoSubscriberRoute::NotSubscriber,
             Err(error) => {
                 warn!(
@@ -80,34 +80,25 @@ impl MoCallService {
                 return MoSubscriberRoute::NotSubscriber;
             }
         };
+        let subscriber_id = resolved.subscriber.subscriber_id;
 
-        if !matches!(subscriber.status, cdma_hlr::model::SubscriberStatus::Active) {
+        if !matches!(
+            resolved.subscriber.status,
+            cdma_hlr::model::SubscriberStatus::Active
+        ) {
             warn!(
                 "MSC: refusing MO M2M call_id={} to inactive subscriber {}",
-                call_id.0, subscriber.subscriber_id
+                call_id.0, subscriber_id
             );
             return MoSubscriberRoute::Rejected;
         }
 
-        let binding = match hlr_repo
-            .get_registration_binding(subscriber.subscriber_id)
-            .await
-        {
-            Ok(Some(binding)) => binding,
-            Ok(None) => {
-                warn!(
-                    "MSC: refusing MO M2M call_id={} to unregistered subscriber {}",
-                    call_id.0, subscriber.subscriber_id
-                );
-                return MoSubscriberRoute::Rejected;
-            }
-            Err(error) => {
-                warn!(
-                    "MSC: HLR binding lookup failed for MO M2M call_id={} subscriber={}: {}",
-                    call_id.0, subscriber.subscriber_id, error
-                );
-                return MoSubscriberRoute::Rejected;
-            }
+        let Some(binding) = resolved.binding.as_ref() else {
+            warn!(
+                "MSC: refusing MO M2M call_id={} to unregistered subscriber {}",
+                call_id.0, subscriber_id
+            );
+            return MoSubscriberRoute::Rejected;
         };
         if !matches!(
             binding.state,
@@ -117,29 +108,16 @@ impl MoCallService {
             warn!(
                 "MSC: refusing MO M2M call_id={} to subscriber {} in state {}",
                 call_id.0,
-                subscriber.subscriber_id,
+                subscriber_id,
                 binding.state.as_str()
             );
             return MoSubscriberRoute::Rejected;
         }
 
-        let identities = match hlr_repo
-            .get_identities_for_subscriber(subscriber.subscriber_id)
-            .await
-        {
-            Ok(identities) => identities,
-            Err(error) => {
-                warn!(
-                    "MSC: HLR identity lookup failed for MO M2M call_id={} subscriber={}: {}",
-                    call_id.0, subscriber.subscriber_id, error
-                );
-                return MoSubscriberRoute::Rejected;
-            }
-        };
-        let Some(imsi): Option<&str> = select_pageable_imsi(&identities, &binding) else {
+        let Some(imsi): Option<&str> = select_pageable_imsi(&resolved.identities, binding) else {
             warn!(
                 "MSC: refusing MO M2M call_id={} to subscriber {} with no IMSI",
-                call_id.0, subscriber.subscriber_id
+                call_id.0, subscriber_id
             );
             return MoSubscriberRoute::Rejected;
         };
@@ -162,7 +140,7 @@ impl MoCallService {
             .insert(call_id, paging_request);
         info!(
             "MSC: deferring MO M2M PagingRequest call_id={} subscriber={} called_number='{}' until primary leg AssignmentComplete",
-            call_id.0, subscriber.subscriber_id, called_number
+            call_id.0, subscriber_id, called_number
         );
         MoSubscriberRoute::Paged
     }

@@ -21,10 +21,12 @@ pub trait HlrRepository: Send + Sync {
     async fn get_subscriber_by_phone_number(
         &self,
         phone_number: &str,
-    ) -> Result<Option<Subscriber>, String>;
+    ) -> Result<Option<ResolvedSubscriber>, String>;
 
-    async fn get_subscriber_by_id(&self, subscriber_id: Uuid)
-    -> Result<Option<Subscriber>, String>;
+    async fn get_subscriber_by_id(
+        &self,
+        subscriber_id: Uuid,
+    ) -> Result<Option<ResolvedSubscriber>, String>;
 
     async fn update_subscriber(
         &self,
@@ -68,7 +70,7 @@ pub trait HlrRepository: Send + Sync {
         &self,
         esn: Option<u32>,
         imsi: Option<&str>,
-    ) -> Result<Option<Subscriber>, String>;
+    ) -> Result<Option<ResolvedSubscriber>, String>;
 
     // Mobile sightings
     async fn upsert_mobile_seen(
@@ -194,7 +196,7 @@ fn subscriber_from_proto(value: proto::Subscriber) -> Result<Subscriber, String>
             .map_err(|e| format!("invalid subscriber_id: {e}"))?,
         phone_number: value.phone_number,
         display_name: value.display_name,
-        status: SubscriberStatus::from_str(&value.status)?,
+        status: subscriber_status_from_proto(value.status)?,
         created_at: timestamp_to_datetime(value.created_at)?,
         updated_at: timestamp_to_datetime(value.updated_at)?,
         number_type: number_type_from_proto(value.number_type),
@@ -202,6 +204,25 @@ fn subscriber_from_proto(value: proto::Subscriber) -> Result<Subscriber, String>
         has_ringtone: value.has_ringtone,
         ringtone_duration_ms: value.ringtone_duration_ms,
     })
+}
+
+fn subscriber_status_from_proto(value: i32) -> Result<SubscriberStatus, String> {
+    match proto::SubscriberStatus::try_from(value) {
+        Ok(proto::SubscriberStatus::Active) => Ok(SubscriberStatus::Active),
+        Ok(proto::SubscriberStatus::Suspended) => Ok(SubscriberStatus::Suspended),
+        Ok(proto::SubscriberStatus::Disabled) => Ok(SubscriberStatus::Disabled),
+        Ok(proto::SubscriberStatus::Unspecified) | Err(_) => {
+            Err(format!("unknown subscriber status: {value}"))
+        }
+    }
+}
+
+pub(crate) fn subscriber_status_to_proto(value: &SubscriberStatus) -> i32 {
+    match value {
+        SubscriberStatus::Active => proto::SubscriberStatus::Active as i32,
+        SubscriberStatus::Suspended => proto::SubscriberStatus::Suspended as i32,
+        SubscriberStatus::Disabled => proto::SubscriberStatus::Disabled as i32,
+    }
 }
 
 fn identity_from_proto(value: proto::SubscriberIdentity) -> Result<SubscriberIdentity, String> {
@@ -256,12 +277,13 @@ impl HlrRepository for GrpcHlrRepository {
         number_type: NumberType,
         number_plan: NumberPlan,
     ) -> Result<Subscriber, String> {
+        let status = SubscriberStatus::from_str(status)?;
         let mut client = self.client();
         let response = client
             .upsert_subscriber(proto::UpsertSubscriberRequest {
                 phone_number: phone_number.to_string(),
                 display_name: display_name.to_string(),
-                status: status.to_string(),
+                status: subscriber_status_to_proto(&status),
                 imsi: None,
                 esn: None,
                 number_type: number_type_to_proto(number_type) as i32,
@@ -280,7 +302,7 @@ impl HlrRepository for GrpcHlrRepository {
     async fn get_subscriber_by_phone_number(
         &self,
         phone_number: &str,
-    ) -> Result<Option<Subscriber>, String> {
+    ) -> Result<Option<ResolvedSubscriber>, String> {
         let mut client = self.client();
         match client
             .get_subscriber_by_phone_number(proto::GetSubscriberByPhoneNumberRequest {
@@ -288,13 +310,30 @@ impl HlrRepository for GrpcHlrRepository {
             })
             .await
         {
-            Ok(response) => subscriber_from_proto(
-                response
-                    .into_inner()
-                    .subscriber
-                    .ok_or_else(|| "missing subscriber".to_string())?,
-            )
-            .map(Some),
+            Ok(response) => {
+                let inner = response.into_inner();
+                let subscriber = subscriber_from_proto(
+                    inner
+                        .subscriber
+                        .ok_or_else(|| "missing subscriber".to_string())?,
+                )?;
+                let identities = inner
+                    .identities
+                    .into_iter()
+                    .map(identity_from_proto)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let primary_identity = inner
+                    .primary_identity
+                    .map(identity_from_proto)
+                    .transpose()?;
+                let binding = inner.binding.map(binding_from_proto).transpose()?;
+                Ok(Some(ResolvedSubscriber {
+                    subscriber,
+                    identities,
+                    primary_identity,
+                    binding,
+                }))
+            }
             Err(status) if status.code() == Code::NotFound => Ok(None),
             Err(status) => Err(format!("HLR GetSubscriberByPhoneNumber: {status}")),
         }
@@ -303,7 +342,7 @@ impl HlrRepository for GrpcHlrRepository {
     async fn get_subscriber_by_id(
         &self,
         subscriber_id: Uuid,
-    ) -> Result<Option<Subscriber>, String> {
+    ) -> Result<Option<ResolvedSubscriber>, String> {
         let mut client = self.client();
         match client
             .get_subscriber(proto::GetSubscriberRequest {
@@ -311,13 +350,30 @@ impl HlrRepository for GrpcHlrRepository {
             })
             .await
         {
-            Ok(response) => subscriber_from_proto(
-                response
-                    .into_inner()
-                    .subscriber
-                    .ok_or_else(|| "missing subscriber".to_string())?,
-            )
-            .map(Some),
+            Ok(response) => {
+                let inner = response.into_inner();
+                let subscriber = subscriber_from_proto(
+                    inner
+                        .subscriber
+                        .ok_or_else(|| "missing subscriber".to_string())?,
+                )?;
+                let identities = inner
+                    .identities
+                    .into_iter()
+                    .map(identity_from_proto)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let primary_identity = inner
+                    .primary_identity
+                    .map(identity_from_proto)
+                    .transpose()?;
+                let binding = inner.binding.map(binding_from_proto).transpose()?;
+                Ok(Some(ResolvedSubscriber {
+                    subscriber,
+                    identities,
+                    primary_identity,
+                    binding,
+                }))
+            }
             Err(status) if status.code() == Code::NotFound => Ok(None),
             Err(status) => Err(format!("HLR GetSubscriber: {status}")),
         }
@@ -332,13 +388,14 @@ impl HlrRepository for GrpcHlrRepository {
         number_type: NumberType,
         number_plan: NumberPlan,
     ) -> Result<Option<Subscriber>, String> {
+        let status = SubscriberStatus::from_str(status)?;
         let mut client = self.client();
         match client
             .update_subscriber(proto::UpdateSubscriberRequest {
                 subscriber_id: subscriber_id.to_string(),
                 phone_number: phone_number.to_string(),
                 display_name: display_name.to_string(),
-                status: status.to_string(),
+                status: subscriber_status_to_proto(&status),
                 imsi: None,
                 esn: None,
                 number_type: number_type_to_proto(number_type) as i32,
@@ -463,7 +520,7 @@ impl HlrRepository for GrpcHlrRepository {
         &self,
         esn: Option<u32>,
         imsi: Option<&str>,
-    ) -> Result<Option<Subscriber>, String> {
+    ) -> Result<Option<ResolvedSubscriber>, String> {
         let mut client = self.client();
         let response = client
             .resolve_subscriber_by_identity(proto::ResolveSubscriberByIdentityRequest {
@@ -475,7 +532,24 @@ impl HlrRepository for GrpcHlrRepository {
             .await
             .map_err(|e| format!("HLR ResolveSubscriberByIdentity: {e}"))?
             .into_inner();
-        response.subscriber.map(subscriber_from_proto).transpose()
+        let Some(subscriber_proto) = response.subscriber else {
+            return Ok(None);
+        };
+        let subscriber = subscriber_from_proto(subscriber_proto)?;
+        let primary_identity = response
+            .primary_identity
+            .map(identity_from_proto)
+            .transpose()?;
+        let binding = response.binding.map(binding_from_proto).transpose()?;
+        // The resolve response intentionally doesn't include the full
+        // identity list — only the primary one. Callers that need the
+        // whole list should use GetSubscriber.
+        Ok(Some(ResolvedSubscriber {
+            subscriber,
+            identities: Vec::new(),
+            primary_identity,
+            binding,
+        }))
     }
 
     async fn upsert_mobile_seen(
@@ -646,6 +720,27 @@ impl PostgresHlrRepository {
         Ok(repo)
     }
 
+    /// Build a `ResolvedSubscriber` by fetching the primary identity and
+    /// current registration binding (if any) for a subscriber that we
+    /// already loaded. This is the in-process equivalent of the bundle
+    /// the gRPC service returns to callers — keeps Postgres callers
+    /// (BSC/MSC/nib via in-process repo) symmetric with the gRPC path.
+    async fn assemble_resolved(
+        &self,
+        subscriber: Subscriber,
+        subscriber_id: Uuid,
+    ) -> Result<ResolvedSubscriber, String> {
+        let identities = self.get_identities_for_subscriber(subscriber_id).await?;
+        let primary_identity = identities.iter().find(|i| i.is_primary).cloned();
+        let binding = self.get_registration_binding(subscriber_id).await?;
+        Ok(ResolvedSubscriber {
+            subscriber,
+            identities,
+            primary_identity,
+            binding,
+        })
+    }
+
     pub async fn run_migrations(&self) -> Result<(), String> {
         sqlx::query("CREATE SCHEMA IF NOT EXISTS hlr")
             .execute(&self.pool)
@@ -726,7 +821,7 @@ impl HlrRepository for PostgresHlrRepository {
     async fn get_subscriber_by_phone_number(
         &self,
         phone_number: &str,
-    ) -> Result<Option<Subscriber>, String> {
+    ) -> Result<Option<ResolvedSubscriber>, String> {
         let row = sqlx::query_as::<_, SubscriberRow>(
             r#"
             SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at,
@@ -740,13 +835,18 @@ impl HlrRepository for PostgresHlrRepository {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| format!("get_subscriber_by_phone_number: {e}"))?;
-        row.map(TryInto::try_into).transpose()
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let subscriber: Subscriber = row.try_into()?;
+        let sid = subscriber.subscriber_id;
+        Ok(Some(self.assemble_resolved(subscriber, sid).await?))
     }
 
     async fn get_subscriber_by_id(
         &self,
         subscriber_id: Uuid,
-    ) -> Result<Option<Subscriber>, String> {
+    ) -> Result<Option<ResolvedSubscriber>, String> {
         let row = sqlx::query_as::<_, SubscriberRow>(
             r#"
             SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at,
@@ -760,7 +860,13 @@ impl HlrRepository for PostgresHlrRepository {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| format!("get_subscriber_by_id: {e}"))?;
-        row.map(TryInto::try_into).transpose()
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let subscriber: Subscriber = row.try_into()?;
+        Ok(Some(
+            self.assemble_resolved(subscriber, subscriber_id).await?,
+        ))
     }
 
     async fn update_subscriber(
@@ -987,9 +1093,9 @@ impl HlrRepository for PostgresHlrRepository {
         &self,
         esn: Option<u32>,
         imsi: Option<&str>,
-    ) -> Result<Option<Subscriber>, String> {
-        if let Some(esn_val) = esn {
-            let row = sqlx::query_as::<_, SubscriberRow>(
+    ) -> Result<Option<ResolvedSubscriber>, String> {
+        let row = if let Some(esn_val) = esn {
+            let r = sqlx::query_as::<_, SubscriberRow>(
                 r#"
                 SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at,
                     s.number_type, s.number_plan,
@@ -1005,12 +1111,27 @@ impl HlrRepository for PostgresHlrRepository {
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| format!("resolve_by_identity esn: {e}"))?;
-            if row.is_some() {
-                return row.map(TryInto::try_into).transpose();
+            if r.is_some() {
+                r
+            } else if let Some(imsi_val) = imsi {
+                sqlx::query_as::<_, SubscriberRow>(
+                    r#"
+                    SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at
+                    FROM subscribers s
+                    JOIN subscriber_identities i ON s.subscriber_id = i.subscriber_id
+                    WHERE i.imsi = $1
+                    LIMIT 1
+                    "#,
+                )
+                .bind(imsi_val)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| format!("resolve_by_identity imsi: {e}"))?
+            } else {
+                None
             }
-        }
-        if let Some(imsi_val) = imsi {
-            let row = sqlx::query_as::<_, SubscriberRow>(
+        } else if let Some(imsi_val) = imsi {
+            sqlx::query_as::<_, SubscriberRow>(
                 r#"
                 SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at,
                     s.number_type, s.number_plan,
@@ -1025,12 +1146,14 @@ impl HlrRepository for PostgresHlrRepository {
             .bind(imsi_val)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| format!("resolve_by_identity imsi: {e}"))?;
-            if row.is_some() {
-                return row.map(TryInto::try_into).transpose();
-            }
-        }
-        Ok(None)
+            .map_err(|e| format!("resolve_by_identity imsi: {e}"))?
+        } else {
+            None
+        };
+        let Some(row) = row else { return Ok(None) };
+        let subscriber: Subscriber = row.try_into()?;
+        let sid = subscriber.subscriber_id;
+        Ok(Some(self.assemble_resolved(subscriber, sid).await?))
     }
 
     async fn upsert_mobile_seen(

@@ -7,6 +7,7 @@
 
 pub mod a11_agent;
 pub mod config;
+pub mod events;
 pub mod session;
 
 use std::{net::SocketAddr, sync::Arc};
@@ -19,6 +20,16 @@ pub use session::{
 
 pub fn build_packet_service(
     cfg: &PdsnNodeConfig,
+) -> std::result::Result<Arc<cdma_packet::grpc::PacketServiceImpl>, String> {
+    build_packet_service_with_sink(cfg, None)
+}
+
+/// Build the packet service with an optional lifecycle sink attached.
+/// The sink fires on session bind (after IP allocation) and unbind, and is
+/// what bridges packet-session lifecycle to the aggregated event bus.
+pub fn build_packet_service_with_sink(
+    cfg: &PdsnNodeConfig,
+    lifecycle_sink: Option<Arc<dyn cdma_packet::session_lifecycle::SessionLifecycleSink>>,
 ) -> std::result::Result<Arc<cdma_packet::grpc::PacketServiceImpl>, String> {
     let transport_config = packet_transport_config(&cfg.packet)?;
     let allocator = Arc::new(cdma_packet::ip_allocator::SubnetIpAllocator::new(
@@ -43,14 +54,16 @@ pub fn build_packet_service(
         ),
         _ => None,
     };
-    Ok(Arc::new(
-        cdma_packet::grpc::PacketServiceImpl::with_allocator(
-            transport_config,
-            fou_tunnel,
-            fou_tcp_tunnel,
-            allocator,
-        ),
-    ))
+    let mut service = cdma_packet::grpc::PacketServiceImpl::with_allocator(
+        transport_config,
+        fou_tunnel,
+        fou_tcp_tunnel,
+        allocator,
+    );
+    if let Some(sink) = lifecycle_sink {
+        service = service.with_lifecycle_sink(sink);
+    }
+    Ok(Arc::new(service))
 }
 
 pub async fn run_packet_grpc_server(
@@ -74,8 +87,15 @@ pub fn packet_grpc_endpoint(addr: SocketAddr) -> String {
 pub fn spawn_configured_packet_service(
     cfg: &PdsnNodeConfig,
 ) -> std::result::Result<(String, tokio::task::JoinHandle<()>), String> {
+    spawn_configured_packet_service_with_sink(cfg, None)
+}
+
+pub fn spawn_configured_packet_service_with_sink(
+    cfg: &PdsnNodeConfig,
+    lifecycle_sink: Option<Arc<dyn cdma_packet::session_lifecycle::SessionLifecycleSink>>,
+) -> std::result::Result<(String, tokio::task::JoinHandle<()>), String> {
     let addr = cfg.packet_grpc_listen_addr;
-    let service = build_packet_service(cfg)?;
+    let service = build_packet_service_with_sink(cfg, lifecycle_sink)?;
     let handle = tokio::spawn(async move {
         if let Err(error) = run_packet_grpc_server(addr, (*service).clone()).await {
             log::error!("packet gRPC server error: {error}");
