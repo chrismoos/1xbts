@@ -34,6 +34,9 @@ BTS/BSC operation uses the same config fields pointed at the remote peer.
 | 17011 | UDP      | PDSN (local)  | FOU tunnel local port         | `pdsn.json: packet.fou_local_port` |
 | 45432 | TCP      | PostgreSQL | HLR + SMSC database (`1xbts`)    | `hlr.json: postgres_dsn`, `smsc.json: postgres_dsn` |
 | 3000  | HTTP     | 1xbts-web   | Web dashboard dev server         | `docker-compose.yml: 1xbts-web`, `ONEXBTS_WEB_PORT` |
+| 5656  | HTTP     | Speed test  | Host access to FOU gateway proxy | `docker-compose.yml: fou-nat`, `SPEEDTEST_PORT` |
+| 80    | HTTP     | FOU gateway | Mobile access to speed test (`http://speed/`, `http://speed.local.1xbts.org/`) | `docker/fou-nat`, nginx proxy |
+| 53    | DNS      | FOU gateway | Mobile DNS resolver for packet data | `docker/fou-nat`, Unbound; `pdsn.json: packet.primary_dns` |
 
 ## Quick reference
 
@@ -53,5 +56,7 @@ PDSN FOU local ....... 127.0.0.1:17011
 FOU-TCP relay ........ 127.0.0.1:17012
 PostgreSQL ........... localhost:45432
 Web dashboard ........ http://localhost:3000 (or `ONEXBTS_WEB_PORT`)
+Speed test ........... http://localhost:5656 (or `SPEEDTEST_PORT`)
+Mobile speed URL ..... http://speed/ or http://speed.local.1xbts.org/ (DNS via packet gateway 10.55.0.1)
 Tokio console ........ 127.0.0.1:17018
 ```

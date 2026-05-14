@@ -5,9 +5,11 @@ RUN apt-get update \
         iproute2 \
         iptables \
         iputils-ping \
+        nginx \
         python3 \
         procps \
         tcpdump \
+        unbound \
     && rm -rf /var/lib/apt/lists/*
 
 COPY entrypoint.sh /usr/local/bin/fou-nat-entrypoint

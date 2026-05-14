@@ -132,12 +132,12 @@ cd 1xbts
 
 # Linux:
 sudo modprobe fou ipip   # load kernel modules required by fou-nat
-docker compose up -d
+docker compose up -d --build
 
 # macOS (uses bridge networking + host.docker.internal):
-docker compose -f docker-compose.yml -f docker-compose.macos.yml up -d
+docker compose -f docker-compose.yml -f docker-compose.macos.yml up -d --build
 
-# postgres :45432 · dashboard :3000 · fou-nat :17012
+# postgres :45432 · dashboard :3000 · fou-nat :17012 · speed test :5656
 cargo run --release -p cdma-nib --no-default-features --features bladerf-backend -- \
     --config-dir config \
     --radio-config config/radio_bladerf_micro2.json
@@ -145,11 +145,19 @@ cargo run --release -p cdma-nib --no-default-features --features bladerf-backend
 
 Default service ports are listed in `docs/PORTS.md`. If port 3000 is already in
 use, set `ONEXBTS_WEB_PORT`, for example `ONEXBTS_WEB_PORT=3001 docker compose up 1xbts-web`.
+Use `--build` after pulling repo updates so Compose rebuilds images that copy
+local files, such as `fou-nat` and `speedtest`.
+The packet-data speed test is available on the host at `http://localhost:5656`
+by default, and from mobile packet-data clients at `http://speed/` or
+`http://speed.local.1xbts.org/`.
 
 To customize a config without editing the checked-in defaults, drop a sibling
 `<name>.local.json` next to it (e.g. `config/bts.local.json`). The loader
 deep-merges the local file on top of the base before validation. `*.local.json`
 is gitignored. See the [Configuration guide](https://1xbts.org/docs/getting-started/configuration/#local-overrides).
+Packet-data DNS advertised to mobiles is configured in `config/pdsn.json` under
+`packet.primary_dns` and `packet.secondary_dns`; the checked-in defaults point to
+the FOU gateway resolver so `speed` and `speed.local.1xbts.org` resolve locally.
 
 ### SDR Backend Features
 

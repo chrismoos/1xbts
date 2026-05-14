@@ -21,6 +21,11 @@ pub fn build_packet_service(
     cfg: &PdsnNodeConfig,
 ) -> std::result::Result<Arc<cdma_packet::grpc::PacketServiceImpl>, String> {
     let transport_config = packet_transport_config(&cfg.packet)?;
+    let allocator = Arc::new(cdma_packet::ip_allocator::SubnetIpAllocator::new(
+        cfg.packet.gateway_ip,
+        cfg.packet.primary_dns,
+        cfg.packet.secondary_dns,
+    ));
     let fou_tunnel = match &transport_config {
         cdma_packet::ip_transport::IpTransportConfig::Fou {
             remote_addr,
@@ -38,11 +43,14 @@ pub fn build_packet_service(
         ),
         _ => None,
     };
-    Ok(Arc::new(cdma_packet::grpc::PacketServiceImpl::new(
-        transport_config,
-        fou_tunnel,
-        fou_tcp_tunnel,
-    )))
+    Ok(Arc::new(
+        cdma_packet::grpc::PacketServiceImpl::with_allocator(
+            transport_config,
+            fou_tunnel,
+            fou_tcp_tunnel,
+            allocator,
+        ),
+    ))
 }
 
 pub async fn run_packet_grpc_server(

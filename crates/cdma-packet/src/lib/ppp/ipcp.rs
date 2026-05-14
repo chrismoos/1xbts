@@ -163,8 +163,8 @@ impl Default for IpcpConfig {
         Self {
             our_ip: Ipv4Addr::new(10, 0, 0, 1),
             peer_ip: Ipv4Addr::new(10, 0, 0, 2),
-            primary_dns: Ipv4Addr::new(8, 8, 8, 8),
-            secondary_dns: Ipv4Addr::new(8, 8, 4, 4),
+            primary_dns: Ipv4Addr::new(10, 55, 0, 1),
+            secondary_dns: Ipv4Addr::new(10, 55, 0, 1),
         }
     }
 }
@@ -729,13 +729,13 @@ mod tests {
         assert_eq!(nak_opts[1].opt_type, OPT_PRIMARY_DNS);
         assert_eq!(
             bytes_to_ip(&nak_opts[1].data),
-            Some(Ipv4Addr::new(8, 8, 8, 8))
+            Some(Ipv4Addr::new(10, 55, 0, 1))
         );
         // Secondary DNS
         assert_eq!(nak_opts[2].opt_type, OPT_SECONDARY_DNS);
         assert_eq!(
             bytes_to_ip(&nak_opts[2].data),
-            Some(Ipv4Addr::new(8, 8, 4, 4))
+            Some(Ipv4Addr::new(10, 55, 0, 1))
         );
     }
 
@@ -747,11 +747,11 @@ mod tests {
         let mobile_req_data = serialize_options(&[
             IpcpOption {
                 opt_type: OPT_PRIMARY_DNS,
-                data: vec![8, 8, 8, 8],
+                data: vec![10, 55, 0, 1],
             },
             IpcpOption {
                 opt_type: OPT_SECONDARY_DNS,
-                data: vec![8, 8, 4, 4],
+                data: vec![10, 55, 0, 1],
             },
         ]);
 
@@ -832,11 +832,11 @@ mod tests {
             },
             IpcpOption {
                 opt_type: OPT_PRIMARY_DNS,
-                data: vec![8, 8, 8, 8],
+                data: vec![10, 55, 0, 1],
             },
             IpcpOption {
                 opt_type: OPT_SECONDARY_DNS,
-                data: vec![8, 8, 4, 4],
+                data: vec![10, 55, 0, 1],
             },
         ]);
         let mobile_req = IpcpPacket {

@@ -33,16 +33,27 @@ services:
       - 1xbts-web-node-modules:/app/node_modules
     restart: unless-stopped
 
+  speedtest:
+    build:
+      context: ./apps/speedtest
+    container_name: 1xbts-speedtest
+    environment:
+      PORT: "5656"
+    restart: unless-stopped
+
   fou-nat:
     build:
       context: ./docker/fou-nat
     container_name: 1xbts-fou-nat
+    depends_on:
+      - speedtest
     privileged: true
     cap_add:
       - NET_ADMIN
       - NET_RAW
     ports:
       - "17012:17012/tcp"
+      - "${SPEEDTEST_PORT:-5656}:80/tcp"
     environment:
       FOU_LISTEN_PORT: "17010"
       FOU_REMOTE_PORT: "17011"
@@ -50,6 +61,9 @@ services:
       MOBILE_CIDR: "10.55.0.0/24"
       TUNNEL_ADDR: "10.55.0.1/24"
       FOU_LOCAL_IP: "127.0.0.1"
+      SPEEDTEST_UPSTREAM: "http://speedtest:5656"
+      LOCAL_DNS_ZONE: "local.1xbts.org"
+      UNBOUND_FORWARD_ADDRS: ${UNBOUND_FORWARD_ADDRS:-8.8.8.8}
     restart: unless-stopped
 
 volumes:

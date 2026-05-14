@@ -5,7 +5,10 @@
 //! These will be replaced when the A10 GRE bearer lands; FOU is legacy
 //! per `docs/architecture-update/02-code-migration-map.md`.
 
-use std::{net::SocketAddr, path::Path};
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    path::Path,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +33,13 @@ pub struct PacketTransportConfig {
     /// Host egress interface for TUN NAT, e.g. `"eth0"`, `"enp3s0"`, or
     /// `"en0"`. Required when `transport = "tun"`.
     pub tun_nat_interface: Option<String>,
+    /// Packet-data gateway IP advertised via IPCP and used as the mobile
+    /// subnet gateway. Must be the `.1` address for the configured `/24`.
+    pub gateway_ip: Ipv4Addr,
+    /// Primary DNS server advertised to mobiles via IPCP.
+    pub primary_dns: Ipv4Addr,
+    /// Secondary DNS server advertised to mobiles via IPCP.
+    pub secondary_dns: Ipv4Addr,
 }
 
 impl Default for PacketTransportConfig {
@@ -39,12 +49,20 @@ impl Default for PacketTransportConfig {
             fou_remote: None,
             fou_local_port: 17011,
             tun_nat_interface: None,
+            gateway_ip: Ipv4Addr::new(10, 55, 0, 1),
+            primary_dns: Ipv4Addr::new(10, 55, 0, 1),
+            secondary_dns: Ipv4Addr::new(10, 55, 0, 1),
         }
     }
 }
 
 impl PacketTransportConfig {
     pub fn validate(&self) -> Result<(), String> {
+        if self.gateway_ip.octets()[3] != 1 {
+            return Err(
+                "pdsn.packet.gateway_ip must be the .1 address of a /24 subnet".to_string(),
+            );
+        }
         match self.transport.as_str() {
             "tun" => {
                 let has_nat_interface = self
@@ -116,6 +134,9 @@ mod tests {
         let cfg = test_config();
         assert_eq!(cfg.packet.transport, "tun");
         assert_eq!(cfg.packet.fou_local_port, 17011);
+        assert_eq!(cfg.packet.gateway_ip, Ipv4Addr::new(10, 55, 0, 1));
+        assert_eq!(cfg.packet.primary_dns, Ipv4Addr::new(10, 55, 0, 1));
+        assert_eq!(cfg.packet.secondary_dns, Ipv4Addr::new(10, 55, 0, 1));
     }
 
     #[test]
@@ -151,5 +172,44 @@ mod tests {
         cfg.packet.transport = "fou_tcp".to_string();
         cfg.validate()
             .expect("FOU TCP should not require TUN NAT interface");
+    }
+
+    #[test]
+    fn custom_dns_values_deserialize() {
+        let cfg: PdsnNodeConfig = serde_json::from_str(
+            r#"{
+                "packet_grpc_listen_addr": "127.0.0.1:17021",
+                "packet": {
+                    "transport": "fou_tcp",
+                    "fou_remote": "127.0.0.1:17012",
+                    "primary_dns": "8.8.8.8",
+                    "secondary_dns": "8.8.4.4"
+                }
+            }"#,
+        )
+        .expect("config should deserialize");
+        assert_eq!(cfg.packet.primary_dns, Ipv4Addr::new(8, 8, 8, 8));
+        assert_eq!(cfg.packet.secondary_dns, Ipv4Addr::new(8, 8, 4, 4));
+        cfg.validate().expect("custom DNS config should validate");
+    }
+
+    #[test]
+    fn invalid_dns_rejected_by_deserializer() {
+        let err = serde_json::from_str::<PdsnNodeConfig>(
+            r#"{
+                "packet_grpc_listen_addr": "127.0.0.1:17021",
+                "packet": { "primary_dns": "not-an-ip" }
+            }"#,
+        )
+        .expect_err("invalid DNS address should fail JSON config parsing");
+        assert!(err.to_string().contains("not-an-ip") || err.to_string().contains("IPv4"));
+    }
+
+    #[test]
+    fn gateway_must_be_first_host() {
+        let mut cfg = test_config();
+        cfg.packet.gateway_ip = Ipv4Addr::new(10, 55, 0, 2);
+        let err = cfg.validate().expect_err("gateway .2 should be rejected");
+        assert!(err.contains("gateway_ip"));
     }
 }

@@ -107,12 +107,12 @@ impl SubnetIpAllocator {
         allocator
     }
 
-    /// Create a pool with default settings: `10.55.0.0/24`, Google DNS.
+    /// Create a pool with default settings: `10.55.0.0/24`, gateway DNS.
     pub fn default_subnet() -> Self {
         Self::new(
             Ipv4Addr::new(10, 55, 0, 1),
-            Ipv4Addr::new(8, 8, 8, 8),
-            Ipv4Addr::new(8, 8, 4, 4),
+            Ipv4Addr::new(10, 55, 0, 1),
+            Ipv4Addr::new(10, 55, 0, 1),
         )
     }
 }
@@ -305,6 +305,8 @@ mod tests {
         assert_eq!(c1.our_ip, c2.our_ip); // same gateway
         assert_eq!(c1.peer_ip, Ipv4Addr::new(10, 55, 0, 2));
         assert_eq!(c2.peer_ip, Ipv4Addr::new(10, 55, 0, 3));
+        assert_eq!(c1.primary_dns, Ipv4Addr::new(10, 55, 0, 1));
+        assert_eq!(c1.secondary_dns, Ipv4Addr::new(10, 55, 0, 1));
     }
 
     #[test]
