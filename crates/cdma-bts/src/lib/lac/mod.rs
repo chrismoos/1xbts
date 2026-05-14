@@ -1936,6 +1936,7 @@ mod tests {
     };
 
     use cdma_common::bits::Bitstream;
+    use cdma_common::consts::SERVICE_OPTION_SMS;
     use chrono::Utc;
     use parking_lot::Mutex;
 
@@ -2245,7 +2246,7 @@ mod tests {
         assert_eq!(cfg.rev_rates, 0xF0);
         assert_eq!(cfg.connection_records.len(), 1);
         assert_eq!(cfg.connection_records[0].con_ref, 0);
-        assert_eq!(cfg.connection_records[0].service_option, 6);
+        assert_eq!(cfg.connection_records[0].service_option, SERVICE_OPTION_SMS);
         assert_eq!(cfg.connection_records[0].for_traffic, 1);
         assert_eq!(cfg.connection_records[0].rev_traffic, 1);
         assert_eq!(cfg.connection_records[0].ui_encrypt_mode, 0);
@@ -2259,7 +2260,7 @@ mod tests {
         let ServiceConnectRecord::NonNegServiceConfig(ref nn) = sc.records[1] else {
             panic!("expected NonNegServiceConfig record");
         };
-        assert_eq!(nn.raw_bytes, vec![0x84, 0x40, 0x0A, 0x08, 0x00]);
+        assert_eq!(nn.raw_bytes, vec![0x84, 0x40, 0x0A, 0x02, 0x00]);
     }
 
     #[test]

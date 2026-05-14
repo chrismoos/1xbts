@@ -53,6 +53,17 @@ pub trait PcfClient: Send + Sync {
     >;
 
     async fn close_packet_session(&self, session_id: &str);
+
+    /// Toggle F-SCH downlink frame generation on a running session.
+    /// Called by the BSC after a successful F-SCH allocation (active=true)
+    /// and during teardown / SCH release (active=false). Errors are
+    /// non-fatal: the BSC logs and continues with FCH-only.
+    async fn set_sch_active(
+        &self,
+        session_id: &str,
+        active: bool,
+        rate_bps: u32,
+    ) -> Result<(), String>;
 }
 
 /// Legacy in-process PCF adapter backed by the old packet service.
@@ -125,6 +136,17 @@ impl PcfClient for LegacyPcfClient {
 
     async fn close_packet_session(&self, session_id: &str) {
         self.inner.close_session_direct(session_id);
+    }
+
+    async fn set_sch_active(
+        &self,
+        session_id: &str,
+        active: bool,
+        rate_bps: u32,
+    ) -> Result<(), String> {
+        self.inner
+            .set_session_sch_active(session_id, active, rate_bps)
+            .await
     }
 }
 
@@ -241,6 +263,17 @@ impl PcfClient for InProcessPcfClient {
 
     async fn close_packet_session(&self, session_id: &str) {
         self.legacy.close_packet_session(session_id).await;
+    }
+
+    async fn set_sch_active(
+        &self,
+        session_id: &str,
+        active: bool,
+        rate_bps: u32,
+    ) -> Result<(), String> {
+        self.legacy
+            .set_sch_active(session_id, active, rate_bps)
+            .await
     }
 }
 
@@ -361,5 +394,30 @@ impl PcfClient for GrpcPcfClient {
                 warn!("pcf gRPC connect failed for close: {e}");
             }
         }
+    }
+
+    async fn set_sch_active(
+        &self,
+        session_id: &str,
+        active: bool,
+        rate_bps: u32,
+    ) -> Result<(), String> {
+        use crate::grpc::packet_proto::{
+            self as proto, packet_service_client::PacketServiceClient,
+        };
+
+        let mut client = PacketServiceClient::connect(self.endpoint.clone())
+            .await
+            .map_err(|e| format!("pcf gRPC connect failed for set_sch_active: {e}"))?;
+        let req = proto::SetSchActiveRequest {
+            session_id: session_id.to_string(),
+            active,
+            rate_bps,
+        };
+        client
+            .set_sch_active(req)
+            .await
+            .map_err(|e| format!("pcf SetSchActive RPC failed: {e}"))?;
+        Ok(())
     }
 }

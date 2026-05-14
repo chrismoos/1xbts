@@ -300,7 +300,7 @@ impl FrameContent {
             | Self::DcchRc5Forward5ms_9600 => 24,
             Self::Sch20msRc5_614400 => 12264,
             Self::Sch20msRc3_307200 | Self::Sch40msRc3_153600 | Self::Sch80msRc3_76800 => 6120,
-            Self::Sch20msRc3_153600 => 3084,
+            Self::Sch20msRc3_153600 => 3048,
             Self::Sch20msRc3_76800 | Self::Sch40msRc3_38400 | Self::Sch80msRc3_19200 => 1512,
             Self::Sch20msRc3_38400 | Self::Sch40msRc3_19200 | Self::Sch80msRc3_9600 => 744,
             Self::Sch20msRc3_19200 | Self::Sch40msRc3_9600 | Self::Sch80msRc3_4800 => 360,

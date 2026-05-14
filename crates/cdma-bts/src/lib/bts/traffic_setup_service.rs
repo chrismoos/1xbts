@@ -44,6 +44,9 @@ pub(crate) struct Session {
     pub(crate) setup: TrafficSetupProcedure,
     pub(crate) release: TrafficReleaseProcedure,
     pub(crate) traffic_lac: Option<TrafficChannelArqState>,
+    /// F-SCH code allocated through the Abis Burst path for this FCH session,
+    /// or `None` before supplemental allocation. Freed in `handle_remove`.
+    pub(crate) sch_walsh_code: Option<u8>,
 }
 
 /// Service responsible for traffic channel setup and release procedures.
@@ -100,6 +103,21 @@ impl TrafficSetupService {
             return;
         };
 
+        // F-SCH is now allocated through the rate-aware Abis Burst path after
+        // FCH setup. Ignore legacy setup-time SCH requests so this path cannot
+        // reserve a fixed 19.2k W(32) supplemental channel.
+        let requested_sch = setup
+            .physical_channel_info
+            .as_ref()
+            .map(|p| p.physical_channels.contains(&PhysicalChannelType::Sch))
+            .unwrap_or(false);
+        if requested_sch {
+            info!(
+                "traffic_setup: ignoring legacy setup-time SCH request for CCR {:?}; SCH uses Abis Burst allocation",
+                ccr
+            );
+        }
+        let sch_walsh_code: Option<u8> = None;
         info!(
             "traffic_setup: reserved Walsh code {} for CCR {:?} (channel pending ECAM)",
             walsh_code, ccr
@@ -112,30 +130,31 @@ impl TrafficSetupService {
             return;
         }
 
+        let connect_information = vec![A3ConnectInformation {
+            physical_channel_type: PhysicalChannelType::Fch,
+            new_a3: true,
+            cell_info_records: vec![CellInfoRecord {
+                cell: self.config.cell_id,
+                qof_mask: 0,
+                new_cell: true,
+                power_combine_indication: false,
+                pilot_pn: self.config.pilot_pn,
+                code_channel: walsh_code,
+            }],
+            traffic_circuit_id: TrafficCircuitId {
+                traffic_circuit_identifier: walsh_code as u16,
+                traffic_connection_identifier: 0,
+            },
+            extended_handoff_direction_parameters: None,
+            channel_element_id: vec![walsh_code],
+            a3_originating_id: 1,
+            a7_destination_id: 0,
+        }];
         let connect = ConnectMessage {
             call_connection_reference: ccr,
             correlation_id: None,
             sdu_id: None,
-            connect_information: vec![A3ConnectInformation {
-                physical_channel_type: PhysicalChannelType::Fch,
-                new_a3: true,
-                cell_info_records: vec![CellInfoRecord {
-                    cell: self.config.cell_id,
-                    qof_mask: 0,
-                    new_cell: true,
-                    power_combine_indication: false,
-                    pilot_pn: self.config.pilot_pn,
-                    code_channel: walsh_code,
-                }],
-                traffic_circuit_id: TrafficCircuitId {
-                    traffic_circuit_identifier: walsh_code as u16,
-                    traffic_connection_identifier: 0,
-                },
-                extended_handoff_direction_parameters: None,
-                channel_element_id: vec![walsh_code],
-                a3_originating_id: 1,
-                a7_destination_id: 0,
-            }],
+            connect_information,
             physical_channel_info: setup.physical_channel_info.clone().unwrap_or(
                 PhysicalChannelInfo {
                     frame_offset: 0,
@@ -166,6 +185,7 @@ impl TrafficSetupService {
                             setup: setup_proc,
                             release: TrafficReleaseProcedure::new(ccr),
                             traffic_lac: None,
+                            sch_walsh_code,
                         },
                     );
                     responses.push(msg);
@@ -294,8 +314,12 @@ impl TrafficSetupService {
         }
 
         let walsh_code = session.walsh_code;
+        let sch_walsh_code = session.sch_walsh_code;
         self.controller.deallocate_traffic(walsh_code);
         self.controller.request_rx_removal(walsh_code);
+        if let Some(w32) = sch_walsh_code {
+            self.controller.deallocate_sch(w32);
+        }
 
         let ack = RemoveAckMessage {
             call_connection_reference: ccr,
@@ -309,8 +333,8 @@ impl TrafficSetupService {
         }
 
         info!(
-            "traffic_setup: traffic released for CCR {:?} walsh={}",
-            ccr, walsh_code
+            "traffic_setup: traffic released for CCR {:?} walsh={} sch_w32={:?}",
+            ccr, walsh_code, sch_walsh_code
         );
         events.push(AbisAgentEvent::TrafficReleased { ccr, walsh_code });
         self.sessions.remove(&ccr);

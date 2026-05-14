@@ -15,12 +15,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::capture::{self, Direction as CaptureDirection};
 use crate::ppp::framing::{self, HdlcDeframer, PppPacket};
-use crate::ppp::ipcp::{IPCP_PROTOCOL, IpcpConfig, IpcpSession};
-use crate::ppp::lcp::{LCP_PROTOCOL, LcpSession};
+use crate::ppp::ipcp::{IPCP_PROTOCOL, IpcpConfig, IpcpSession, configure_request_peer_ip};
+use crate::ppp::lcp::{LCP_PROTOCOL, LcpSession, LcpState};
 use crate::rlp::{self as rlp_codec, RlpFrame};
 use crate::rlp_session::{RlpOutput, RlpSession, RlpState};
 use crate::rlp3_frames::MuxOption;
 use crate::rlp3_session::{FrameRate, Rlp3Config, Rlp3Session, Rlp3State, RlpEvent};
+use cdma_common::consts::SERVICE_OPTION_HIGH_RATE_PACKET_DATA;
+use cdma_common::crc::crc16_sch;
+use cdma_common::sch::{DEFAULT_RC3_F_SCH_RATE_BPS, Rc3FschProfile};
 
 /// Session phase — tracks the overall negotiation progress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +49,14 @@ pub enum SessionAction {
     SendSchFrame { bits: Vec<u8>, rate_bps: u32 },
     /// An IP packet was received from the mobile and is ready for the TUN/network.
     DeliverIpPacket(Vec<u8>),
+    /// The mobile resumed with a cached peer IP during LCP/IPCP. The caller
+    /// must atomically claim this IP before forwarding the packet.
+    ClaimPeerIp {
+        peer_ip: Ipv4Addr,
+        resume_packet: Option<Vec<u8>>,
+    },
+    /// The packet session should be closed and cleaned up by the owner.
+    CloseSession { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -63,6 +74,9 @@ pub struct PacketSessionTelemetry {
     pub rlp_state: String,
     pub lcp_state: String,
     pub ipcp_state: String,
+    pub lcp_configure_restarts: u32,
+    pub ipcp_configure_restarts: u32,
+    pub ipcp_omitted_peer_ip_naks: u32,
     pub last_rx_control: String,
     pub last_tx_control: String,
     pub last_rx_control_repeats: u64,
@@ -96,12 +110,15 @@ trait RlpBackend: Send {
     fn enqueue_data(&mut self, data: &[u8]);
 
     /// Generate the next downlink frame as (bits, rate_bps) for the FCH.
-    fn next_frame_bits(&mut self) -> (Vec<u8>, u32);
+    ///
+    /// When `allow_payload` is false, only RLP control/fill/idle should be
+    /// emitted; byte-stream payload remains queued for SCH.
+    fn next_frame_bits(&mut self, allow_payload: bool) -> (Vec<u8>, u32);
 
     /// Generate a supplemental channel frame with `info_bits` usable bits.
     /// Returns (bits, rate_bps) or None if no SCH data to send.
     /// Default: no SCH support.
-    fn next_sch_frame_bits(&mut self, _info_bits: usize) -> Option<(Vec<u8>, u32)> {
+    fn next_sch_frame_bits(&mut self, _info_bits: usize, _rate_bps: u32) -> Option<(Vec<u8>, u32)> {
         None
     }
 
@@ -174,7 +191,7 @@ impl RlpBackend for Rlp1Backend {
         self.session.enqueue_data(data);
     }
 
-    fn next_frame_bits(&mut self) -> (Vec<u8>, u32) {
+    fn next_frame_bits(&mut self, _allow_payload: bool) -> (Vec<u8>, u32) {
         match self.session.next_frame() {
             RlpOutput::SendFrame(frame) => {
                 if !frame.is_idle() && !is_rlp_handshake(&frame) {
@@ -235,6 +252,11 @@ struct Rlp3Backend {
     tx_control_log: RepeatedControlLog,
     rx_control_log: RepeatedControlLog,
     rx_frame_count: u64,
+    rx_decoded_count: u64,
+    rx_decode_error_count: u64,
+    tx_frame_count: u64,
+    tx_sch_sdu_count: u64,
+    tx_sch_blocked_count: u64,
     last_uplink_rate_bps: u32,
     last_downlink_rate_bps: u32,
 }
@@ -247,6 +269,11 @@ impl Rlp3Backend {
             tx_control_log: RepeatedControlLog::default(),
             rx_control_log: RepeatedControlLog::default(),
             rx_frame_count: 0,
+            rx_decoded_count: 0,
+            rx_decode_error_count: 0,
+            tx_frame_count: 0,
+            tx_sch_sdu_count: 0,
+            tx_sch_blocked_count: 0,
             last_uplink_rate_bps: 0,
             last_downlink_rate_bps: 0,
         }
@@ -332,6 +359,7 @@ impl RlpBackend for Rlp3Backend {
         if let Some(ref result) = decoded_for_log {
             match result {
                 Ok(frame) => {
+                    self.rx_decoded_count = self.rx_decoded_count.saturating_add(1);
                     if matches!(frame, crate::rlp3_frames::Rlp3Frame::Control { .. }) {
                         Self::log_control_frame(
                             self.log_context.as_deref(),
@@ -340,25 +368,62 @@ impl RlpBackend for Rlp3Backend {
                             frame,
                         );
                     }
-                }
-                Err(e) => {
-                    if self.rx_frame_count <= 5 || self.rx_frame_count % 100 == 0 {
-                        let all_bits: String = bits
-                            .iter()
-                            .take(48)
-                            .map(|&b| if b != 0 { '1' } else { '0' })
-                            .collect();
-                        log::warn!(
-                            "RLP3 UL[{}]: decode failed: {:?} (frame={} rate={} len={} bits={}{})",
+                    if let crate::rlp3_frames::Rlp3Frame::Nak {
+                        seq,
+                        seq_hi,
+                        payload,
+                    } = frame
+                    {
+                        log::debug!(
+                            "RLP3 PEER NAK[{}]: frame={} rate={} seq={} seq_hi={} payload={} tx_q={} rexmit_q={}",
                             self.log_context.as_deref().unwrap_or("?"),
-                            e,
                             self.rx_frame_count,
                             rate_bps,
-                            bits.len(),
-                            all_bits,
-                            if bits.len() > 48 { "..." } else { "" }
+                            seq,
+                            seq_hi,
+                            summarize_rlp3_nak_payload(payload),
+                            self.session.tx_queue_len(),
+                            self.session.rexmit_queue_len()
                         );
                     }
+                    if !is_rlp3_idle_like(frame)
+                        || self.rx_decoded_count <= 10
+                        || self.rx_decoded_count % 500 == 0
+                    {
+                        log::debug!(
+                            "RLP3 RXF[{}]: frame={} rate={} decoded={} summary={}",
+                            self.log_context.as_deref().unwrap_or("?"),
+                            self.rx_frame_count,
+                            rate_bps,
+                            self.rx_decoded_count,
+                            summarize_rlp3_tx_frame(frame)
+                        );
+                    }
+                }
+                Err(e) => {
+                    self.rx_decode_error_count = self.rx_decode_error_count.saturating_add(1);
+                    let all_bits: String = bits
+                        .iter()
+                        .take(96)
+                        .map(|&b| if b != 0 { '1' } else { '0' })
+                        .collect();
+                    let detail = if let Some(n) = crate::rlp3_frames::sub_rate_info_bits(rate) {
+                        crate::rlp3_frames::diagnose_sub_rate_frame(bits, n)
+                    } else {
+                        "rate1_or_unknown".to_string()
+                    };
+                    log::warn!(
+                        "RLP3 UL[{}]: decode failed: {:?} (error_count={} frame={} rate={} len={} detail={} bits={}{})",
+                        self.log_context.as_deref().unwrap_or("?"),
+                        e,
+                        self.rx_decode_error_count,
+                        self.rx_frame_count,
+                        rate_bps,
+                        bits.len(),
+                        detail,
+                        all_bits,
+                        if bits.len() > 96 { "..." } else { "" }
+                    );
                 }
             }
         }
@@ -395,13 +460,17 @@ impl RlpBackend for Rlp3Backend {
         self.session.send_data(data);
     }
 
-    fn next_frame_bits(&mut self) -> (Vec<u8>, u32) {
+    fn next_frame_bits(&mut self, allow_payload: bool) -> (Vec<u8>, u32) {
         // Use full rate if we have data pending, pending controls (NAKs),
         // or are in handshake. In data-transfer idle periods, use quarter
         // rate: RLP3 less-than-Rate-1 fill/idle needs at least 40 info bits.
-        let has_data = self.session.state() != Rlp3State::DataTransfer
-            || !self.session.tx_queue_is_empty()
-            || self.session.has_pending_controls();
+        let has_data = if self.session.state() != Rlp3State::DataTransfer {
+            true
+        } else if allow_payload {
+            !self.session.tx_queue_is_empty() || self.session.has_pending_controls()
+        } else {
+            self.session.has_pending_control_frames()
+        };
         let rate = if has_data {
             FrameRate::Full
         } else {
@@ -409,7 +478,11 @@ impl RlpBackend for Rlp3Backend {
         };
         let state_before = self.session.state();
         let queue_before = self.session.tx_queue_len();
-        let bits = self.session.next_frame(rate);
+        let bits = if allow_payload {
+            self.session.next_frame(rate)
+        } else {
+            self.session.next_frame_control_only(rate)
+        };
         let queue_after = self.session.tx_queue_len();
         self.last_downlink_rate_bps = match rate {
             FrameRate::Full => 9600,
@@ -439,6 +512,7 @@ impl RlpBackend for Rlp3Backend {
             FrameRate::Blank => 0,
         };
         if rate != FrameRate::Blank && !bits.is_empty() {
+            self.tx_frame_count = self.tx_frame_count.saturating_add(1);
             capture::write_rlp_frame(CaptureDirection::Downlink, rate_bps, &bits);
             let summary = if rate == FrameRate::Full {
                 crate::rlp3_frames::decode_rlp3_frame(&bits, crate::rlp3_frames::MuxOption::Odd)
@@ -451,43 +525,110 @@ impl RlpBackend for Rlp3Backend {
             } else {
                 "blank_or_unsupported".to_string()
             };
-            log::trace!(
-                "RLP3 TXF[{}]: rate={} frame={} q_before={} q_after={}",
-                self.log_context.as_deref().unwrap_or("?"),
-                rate_bps,
-                summary,
-                queue_before,
-                queue_after
-            );
+            let should_log = !summary.starts_with("fill") && !summary.starts_with("idle")
+                || self.tx_frame_count <= 10
+                || self.tx_frame_count % 500 == 0;
+            if should_log {
+                log::debug!(
+                    "RLP3 TXF[{}]: frame={} rate={} summary={} q_before={} q_after={}",
+                    self.log_context.as_deref().unwrap_or("?"),
+                    self.tx_frame_count,
+                    rate_bps,
+                    summary,
+                    queue_before,
+                    queue_after
+                );
+            } else {
+                log::trace!(
+                    "RLP3 TXF[{}]: rate={} frame={} q_before={} q_after={}",
+                    self.log_context.as_deref().unwrap_or("?"),
+                    rate_bps,
+                    summary,
+                    queue_before,
+                    queue_after
+                );
+            }
         }
         (bits, rate_bps)
     }
 
-    fn next_sch_frame_bits(&mut self, info_bits: usize) -> Option<(Vec<u8>, u32)> {
-        // Only produce SCH frames when in data transfer state with data pending
-        if self.session.state() != Rlp3State::DataTransfer || self.session.tx_queue_is_empty() {
+    fn next_sch_frame_bits(&mut self, info_bits: usize, rate_bps: u32) -> Option<(Vec<u8>, u32)> {
+        let profile = Rc3FschProfile::from_rate_bps(rate_bps)?;
+        if self.session.state() != Rlp3State::DataTransfer || info_bits != profile.info_bits {
             return None;
         }
-        // Generate a full-rate RLP3 data frame for the SCH.
-        // The SCH carries bulk data using the shared sequence space.
-        let bits = self.session.next_frame(FrameRate::Full);
-        // Pad or truncate to the SCH info_bits size.
-        // At 19.2 kbps, info_bits=360 vs FCH full-rate=172.
-        // The RLP3 frame is 172 bits (FCH full rate); we need to fill
-        // the larger SCH frame. For Phase 1, we generate one RLP3 frame
-        // and zero-pad the remainder of the SCH frame.
-        let mut sch_bits = Vec::with_capacity(info_bits);
-        // MUX header: bit 0 = 1 (data present)
-        sch_bits.push(1);
-        // Copy RLP3 frame data (up to info_bits - 1 for MUX header)
-        let data_bits = info_bits - 1;
-        let copy_len = bits.len().min(data_bits);
-        sch_bits.extend_from_slice(&bits[..copy_len]);
-        // Zero-pad remainder
-        for _ in sch_bits.len()..info_bits {
-            sch_bits.push(0);
+
+        let data_block_bits = sch_type3_data_block_bits(profile)?;
+        let queue_before = self.session.tx_queue_len();
+        let rexmit_before = self.session.rexmit_queue_len();
+        let Some(first) = self.session.next_supplemental_frame(data_block_bits) else {
+            if queue_before != 0 || rexmit_before != 0 {
+                self.tx_sch_blocked_count = self.tx_sch_blocked_count.saturating_add(1);
+                if self.tx_sch_blocked_count <= 10 || self.tx_sch_blocked_count % 50 == 0 {
+                    log::debug!(
+                        "RLP3 TX SCH blocked[{}]: count={} rate={} info_bits={} block_bits={} q={} rexmit_q={} l_v_s={} l_v_n_peer={} needs_seq_hi={}",
+                        self.log_context.as_deref().unwrap_or("?"),
+                        self.tx_sch_blocked_count,
+                        rate_bps,
+                        info_bits,
+                        data_block_bits,
+                        queue_before,
+                        rexmit_before,
+                        self.session.l_v_s(),
+                        self.session.l_v_n_peer(),
+                        self.session.next_new_data_requires_seq_hi()
+                    );
+                }
+            }
+            return None;
+        };
+        let mut blocks = vec![first];
+        let max_blocks = max_sch_type3_blocks_for_profile(profile);
+        while blocks.len() < max_blocks {
+            let Some(block) = self.session.next_supplemental_frame(data_block_bits) else {
+                break;
+            };
+            blocks.push(block);
         }
-        Some((sch_bits, 19200))
+        let queue_after = self.session.tx_queue_len();
+        let rexmit_after = self.session.rexmit_queue_len();
+        let data_block_octets =
+            crate::rlp3_frames::supplemental_format_c_data_len(data_block_bits).unwrap_or(0);
+        let rexmit_blocks = blocks
+            .iter()
+            .filter(|block| block.len() >= 2 && block[0] == 1 && block[1] == 1)
+            .count();
+        let new_blocks = blocks.len().saturating_sub(rexmit_blocks);
+        let sch_bits = build_sch_type3_sdu(&blocks, profile);
+
+        self.tx_sch_sdu_count = self.tx_sch_sdu_count.saturating_add(1);
+        if self.tx_sch_sdu_count <= 10 || self.tx_sch_sdu_count % 50 == 0 {
+            log::debug!(
+                "RLP3 TX SCH[{}]: sdu={} blocks={} new={} rexmit={} rate={} info_bits={} block_bits={} block_octets={} q_before={} q_after={} rexmit_q_before={} rexmit_q_after={}",
+                self.log_context.as_deref().unwrap_or("?"),
+                self.tx_sch_sdu_count,
+                blocks.len(),
+                new_blocks,
+                rexmit_blocks,
+                profile.rate_bps,
+                info_bits,
+                data_block_bits,
+                data_block_octets,
+                queue_before,
+                queue_after,
+                rexmit_before,
+                rexmit_after
+            );
+        } else {
+            log::trace!(
+                "RLP3 TX SCH: {} supplemental Format C frame(s) rate={} info_bits={} block_octets={}",
+                blocks.len(),
+                profile.rate_bps,
+                info_bits,
+                data_block_octets
+            );
+        }
+        Some((sch_bits, profile.rate_bps))
     }
 
     fn is_data_transfer(&self) -> bool {
@@ -515,9 +656,146 @@ impl RlpBackend for Rlp3Backend {
 // Packet data session engine.
 // ---------------------------------------------------------------------------
 
-/// Packet data session engine.
-/// F-SCH info bits per frame at 19.2 kbps.
-const SCH_19K2_INFO_BITS: usize = 360;
+const SCH_0X0809_DATA_BLOCK_BITS: usize = 170;
+const SCH_0X0921_DATA_BLOCK_BITS: usize = 346;
+const SCH_TYPE3_HEADER_BITS: usize = 6;
+const SCH_TYPE3_LTUS_REQUIRED_INFO_BITS: usize = 744;
+const SCH_TYPE3_LTUS_SIZE_BITS: usize = 368;
+const SCH_TYPE3_LTUS_PAYLOAD_BITS: usize = 352;
+const SCH_TYPE3_LTUS_CRC_BITS: usize = 16;
+const SCH_PRIMARY_SR_ID: u8 = 1;
+const SCH_FILL_SR_ID: u8 = 0b111;
+
+fn max_sch_type3_blocks_for_profile(profile: Rc3FschProfile) -> usize {
+    let Some(data_block_bits) = sch_type3_data_block_bits(profile) else {
+        return 0;
+    };
+    if sch_type3_uses_ltus(profile.info_bits) {
+        let blocks_per_ltu = match data_block_bits {
+            SCH_0X0809_DATA_BLOCK_BITS => 2,
+            SCH_0X0921_DATA_BLOCK_BITS => 1,
+            _ => 0,
+        };
+        return (profile.info_bits / SCH_TYPE3_LTUS_SIZE_BITS) * blocks_per_ltu;
+    }
+    profile.info_bits / (SCH_TYPE3_HEADER_BITS + data_block_bits)
+}
+
+fn sch_type3_data_block_bits(profile: Rc3FschProfile) -> Option<usize> {
+    match profile.mux_option {
+        0x0809 | 0x0811 | 0x0821 => Some(SCH_0X0809_DATA_BLOCK_BITS),
+        0x0921 => Some(SCH_0X0921_DATA_BLOCK_BITS),
+        _ => None,
+    }
+}
+
+fn sch_type3_uses_ltus(info_bits: usize) -> bool {
+    info_bits >= SCH_TYPE3_LTUS_REQUIRED_INFO_BITS
+}
+
+fn build_sch_type3_sdu(blocks: &[Vec<u8>], profile: Rc3FschProfile) -> Vec<u8> {
+    debug_assert!(!blocks.is_empty());
+    let info_bits = profile.info_bits;
+    let data_block_bits = sch_type3_data_block_bits(profile).unwrap_or(SCH_0X0809_DATA_BLOCK_BITS);
+
+    if sch_type3_uses_ltus(info_bits) {
+        return build_sch_type3_ltu_sdu(blocks, info_bits, data_block_bits);
+    }
+
+    let mut bits = Vec::with_capacity(info_bits);
+    for block in blocks {
+        debug_assert_eq!(block.len(), data_block_bits);
+        if bits.len() + SCH_TYPE3_HEADER_BITS + data_block_bits > info_bits {
+            break;
+        }
+        append_sch_type3_muxpdu(&mut bits, SCH_PRIMARY_SR_ID, block);
+    }
+    if bits.len() + SCH_TYPE3_HEADER_BITS <= info_bits {
+        append_sch_type3_fill_muxpdu(&mut bits);
+    }
+    bits.resize(info_bits, 0);
+    bits
+}
+
+fn build_sch_type3_ltu_sdu(
+    blocks: &[Vec<u8>],
+    info_bits: usize,
+    data_block_bits: usize,
+) -> Vec<u8> {
+    let ltu_count = info_bits / SCH_TYPE3_LTUS_SIZE_BITS;
+    let mut bits = Vec::with_capacity(info_bits);
+    let mut next_block = blocks.iter();
+    let blocks_per_ltu = match data_block_bits {
+        SCH_0X0809_DATA_BLOCK_BITS => 2,
+        SCH_0X0921_DATA_BLOCK_BITS => 1,
+        _ => 0,
+    };
+
+    for _ in 0..ltu_count {
+        let mut ltu_payload = Vec::with_capacity(SCH_TYPE3_LTUS_PAYLOAD_BITS);
+        for _ in 0..blocks_per_ltu {
+            if let Some(block) = next_block.next() {
+                debug_assert_eq!(block.len(), data_block_bits);
+                append_sch_type3_ltu_muxpdu(&mut ltu_payload, SCH_PRIMARY_SR_ID, block);
+            } else {
+                append_sch_type3_ltu_fill_muxpdu(&mut ltu_payload, data_block_bits);
+            }
+        }
+        debug_assert_eq!(ltu_payload.len(), SCH_TYPE3_LTUS_PAYLOAD_BITS);
+        let crc = crc16_sch(&ltu_payload);
+        bits.extend_from_slice(&ltu_payload);
+        push_bits(&mut bits, crc as u32, SCH_TYPE3_LTUS_CRC_BITS);
+    }
+
+    bits.resize(info_bits, 0);
+    bits
+}
+
+fn append_sch_type3_muxpdu(bits: &mut Vec<u8>, sr_id: u8, data_block: &[u8]) {
+    debug_assert!(matches!(sr_id, 1..=6));
+    debug_assert!(matches!(
+        data_block.len(),
+        SCH_0X0809_DATA_BLOCK_BITS | SCH_0X0921_DATA_BLOCK_BITS
+    ));
+    let header_start = bits.len();
+    push_bits(bits, sr_id as u32, 3);
+    push_bits(bits, 0, 3);
+    debug_assert_eq!(bits.len() - header_start, SCH_TYPE3_HEADER_BITS);
+    bits.extend_from_slice(data_block);
+}
+
+fn append_sch_type3_fill_muxpdu(bits: &mut Vec<u8>) {
+    let header_start = bits.len();
+    push_bits(bits, SCH_FILL_SR_ID as u32, 3);
+    push_bits(bits, 0, 3);
+    debug_assert_eq!(bits.len() - header_start, SCH_TYPE3_HEADER_BITS);
+    bits.resize(bits.len() + SCH_0X0809_DATA_BLOCK_BITS, 0);
+}
+
+fn append_sch_type3_ltu_muxpdu(bits: &mut Vec<u8>, sr_id: u8, data_block: &[u8]) {
+    debug_assert!(matches!(sr_id, 1..=6));
+    debug_assert!(matches!(
+        data_block.len(),
+        SCH_0X0809_DATA_BLOCK_BITS | SCH_0X0921_DATA_BLOCK_BITS
+    ));
+    append_sch_type3_muxpdu(bits, sr_id, data_block);
+}
+
+fn append_sch_type3_ltu_fill_muxpdu(bits: &mut Vec<u8>, data_block_bits: usize) {
+    let muxpdu_bits = SCH_TYPE3_HEADER_BITS + data_block_bits;
+    debug_assert!(bits.len() + muxpdu_bits <= SCH_TYPE3_LTUS_PAYLOAD_BITS);
+    let header_start = bits.len();
+    push_bits(bits, SCH_FILL_SR_ID as u32, 3);
+    push_bits(bits, 0, 3);
+    debug_assert_eq!(bits.len() - header_start, SCH_TYPE3_HEADER_BITS);
+    bits.resize(bits.len() + data_block_bits, 0);
+}
+
+fn push_bits(bits: &mut Vec<u8>, value: u32, width: usize) {
+    for bit in (0..width).rev() {
+        bits.push(((value >> bit) & 1) as u8);
+    }
+}
 
 pub struct PacketSession {
     rlp: Box<dyn RlpBackend>,
@@ -535,22 +813,27 @@ pub struct PacketSession {
     recent_ppp_events: VecDeque<PacketTraceEvent>,
     /// When true, also generate supplemental channel frames each tick.
     sch_active: bool,
-    /// SCH info bits per frame (360 for 19.2 kbps).
+    /// SCH info bits per frame for the configured RC3 F-SCH rate.
     sch_info_bits: usize,
+    /// Configured RC3 F-SCH rate.
+    sch_rate_bps: u32,
+    /// True after first IP traffic; PPP control stays on FCH before this.
+    sch_data_ready: bool,
 }
 
 impl PacketSession {
     pub fn new(service_option: u32, ipcp_config: IpcpConfig) -> Self {
-        let rlp: Box<dyn RlpBackend> = if service_option == 33 {
-            log::debug!("PacketSession: using RLP Type 3 for SO {}", service_option);
-            Box::new(Rlp3Backend::new(Rlp3Config {
-                mux_option: MuxOption::Odd, // 171-bit frames (MUX option 0x1, Rate Set 1)
-                ..Rlp3Config::default()
-            }))
-        } else {
-            log::debug!("PacketSession: using RLP Type 1 for SO {}", service_option);
-            Box::new(Rlp1Backend::new())
-        };
+        let rlp: Box<dyn RlpBackend> =
+            if service_option == u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA) {
+                log::debug!("PacketSession: using RLP Type 3 for SO {}", service_option);
+                Box::new(Rlp3Backend::new(Rlp3Config {
+                    mux_option: MuxOption::Odd, // 171-bit frames (MUX option 0x1, Rate Set 1)
+                    ..Rlp3Config::default()
+                }))
+            } else {
+                log::debug!("PacketSession: using RLP Type 1 for SO {}", service_option);
+                Box::new(Rlp1Backend::new())
+            };
         Self {
             rlp,
             deframer: HdlcDeframer::new(),
@@ -562,22 +845,52 @@ impl PacketSession {
             ipcp_started: false,
             recent_ppp_events: VecDeque::new(),
             sch_active: false,
-            sch_info_bits: SCH_19K2_INFO_BITS,
+            sch_info_bits: Rc3FschProfile::default_19k2().info_bits,
+            sch_rate_bps: DEFAULT_RC3_F_SCH_RATE_BPS,
+            sch_data_ready: false,
         }
     }
 
     /// Enable or disable supplemental channel frame generation.
     pub fn set_sch_active(&mut self, active: bool) {
         self.sch_active = active;
+        if !active {
+            self.sch_data_ready = false;
+        }
         log::info!(
             "PacketSession: SCH {}",
             if active { "activated" } else { "deactivated" }
         );
     }
 
+    pub fn set_sch_active_with_rate(&mut self, active: bool, rate_bps: u32) {
+        if let Some(profile) = Rc3FschProfile::from_rate_bps(rate_bps) {
+            self.sch_info_bits = profile.info_bits;
+            self.sch_rate_bps = profile.rate_bps;
+        } else {
+            log::warn!(
+                "PacketSession: unsupported SCH rate {}, keeping {}",
+                rate_bps,
+                self.sch_rate_bps
+            );
+        }
+        self.set_sch_active(active);
+    }
+
     /// Returns whether SCH is active.
     pub fn is_sch_active(&self) -> bool {
         self.sch_active
+    }
+
+    pub fn enable_sch_data_path(&mut self) {
+        if !self.sch_data_ready {
+            self.sch_data_ready = true;
+            log::info!("PacketSession: SCH data path enabled after first downlink IP");
+        }
+    }
+
+    pub fn downlink_queue_len(&self) -> usize {
+        self.rlp.tx_queue_len()
     }
 
     pub fn set_log_context(&mut self, context: String) {
@@ -594,6 +907,23 @@ impl PacketSession {
 
     pub fn our_ip(&self) -> Ipv4Addr {
         self.ipcp.our_ip()
+    }
+
+    pub fn activate_claimed_peer_ip(&mut self, peer_ip: Ipv4Addr) {
+        self.lcp.force_open();
+        self.ipcp.force_open_with_peer_ip(peer_ip);
+        self.phase = SessionPhase::Active;
+        self.ipcp_started = true;
+        log::info!(
+            "Packet session active from claimed peer IP: peer={} gateway={}",
+            self.ipcp.peer_ip(),
+            self.ipcp.our_ip()
+        );
+    }
+
+    pub fn set_claimed_peer_ip(&mut self, peer_ip: Ipv4Addr) {
+        self.ipcp.set_peer_ip(peer_ip);
+        log::info!("Packet session peer IP reassigned to {}", peer_ip);
     }
 
     /// Inject an IP packet from the network/TUN side for delivery to the mobile.
@@ -668,11 +998,27 @@ impl PacketSession {
         {
             self.ppp_tx_queue.push(req);
         }
+        if self.phase == SessionPhase::Lcp && self.lcp.configure_failed() {
+            actions.push(SessionAction::CloseSession {
+                reason: format!(
+                    "LCP Configure-Request failed after {} retransmits",
+                    self.lcp.configure_restarts()
+                ),
+            });
+        }
 
         if self.phase == SessionPhase::Ipcp
             && let Some(req) = self.ipcp.maybe_retransmit_configure_request()
         {
             self.ppp_tx_queue.push(req);
+        }
+        if self.phase == SessionPhase::Ipcp && self.ipcp.configure_failed() {
+            actions.push(SessionAction::CloseSession {
+                reason: format!(
+                    "IPCP Configure-Request failed after {} retransmits",
+                    self.ipcp.configure_restarts()
+                ),
+            });
         }
 
         // --- Downlink: convert queued PPP packets to RLP byte stream ---
@@ -706,14 +1052,20 @@ impl PacketSession {
         }
 
         // --- Get next downlink FCH frame ---
-        let (bits, rate_bps) = self.rlp.next_frame_bits();
+        let sch_data_path =
+            self.sch_active && self.phase == SessionPhase::Active && self.sch_data_ready;
+        let allow_fch_payload = !sch_data_path;
+        let (bits, rate_bps) = self.rlp.next_frame_bits(allow_fch_payload);
         if !bits.is_empty() {
             actions.push(SessionAction::SendFrame { bits, rate_bps });
         }
 
         // --- Get next downlink SCH frame (if active) ---
-        if self.sch_active {
-            if let Some((sch_bits, sch_rate)) = self.rlp.next_sch_frame_bits(self.sch_info_bits) {
+        if self.sch_active && self.phase == SessionPhase::Active && self.sch_data_ready {
+            if let Some((sch_bits, sch_rate)) = self
+                .rlp
+                .next_sch_frame_bits(self.sch_info_bits, self.sch_rate_bps)
+            {
                 actions.push(SessionAction::SendSchFrame {
                     bits: sch_bits,
                     rate_bps: sch_rate,
@@ -756,6 +1108,9 @@ impl PacketSession {
             rlp_state: rlp.state,
             lcp_state: format_lcp_state(self.lcp.state),
             ipcp_state: format_ipcp_state(self.ipcp.state),
+            lcp_configure_restarts: self.lcp.configure_restarts(),
+            ipcp_configure_restarts: self.ipcp.configure_restarts(),
+            ipcp_omitted_peer_ip_naks: self.ipcp.omitted_peer_ip_naks(),
             last_rx_control: rlp.last_rx_control,
             last_tx_control: rlp.last_tx_control,
             last_rx_control_repeats: rlp.last_rx_control_repeats,
@@ -779,12 +1134,14 @@ impl PacketSession {
                     self.ppp_tx_queue.push(resp);
                 }
 
-                // Peer restarted LCP while we were in IPCP or Active — reset
-                // upper layers and go back to LCP phase.
+                // Peer restarted LCP while we were in IPCP or Active. RFC
+                // 1661 sends PPP back to Link Establishment; the traffic
+                // channel stays up while upper-layer NCPs renegotiate.
                 if was_open && !self.lcp.is_open() {
                     log::info!("LCP: peer restarted, resetting IPCP and returning to LCP phase");
                     self.ipcp = IpcpSession::new(self.ipcp.config.clone());
                     self.ipcp_started = false;
+                    self.sch_data_ready = false;
                     self.phase = SessionPhase::Lcp;
                 }
 
@@ -795,34 +1152,30 @@ impl PacketSession {
                 }
             }
             IPCP_PROTOCOL => {
-                // NOTE: force-open disabled — the two root causes that
-                // required it have been fixed:
-                //
-                // 1. Uplink frame queuing: session_task used Option::replace
-                //    which silently dropped frames delivered in bursts between
-                //    20ms ticks.  Fixed by using VecDeque with one-per-tick
-                //    dequeue (commit 3b0c1b3).
-                //
-                // 2. NAK rate selection: RLP NAK control frames could only be
-                //    sent on full-rate downlink frames, but the rate selector
-                //    chose eighth-rate when the tx_queue was empty.  NAKs sat
-                //    in pending_controls unable to go out, so retransmission
-                //    rounds expired without ever reaching the MS.  Fixed by
-                //    including has_pending_controls() in the rate decision.
-                //
-                // If IPCP frames arrive while LCP is still in AckSent, it
-                // means the peer's Configure-Ack was genuinely lost despite
-                // working retransmission.  Re-enable this block if that
-                // occurs on real air-interface links.
-                //
-                // if !self.lcp.is_open() && self.lcp.state == LcpState::AckSent {
-                //     log::info!(
-                //         "LCP: received IPCP while in AckSent — peer's Configure-Ack \
-                //          was lost, forcing LCP open"
-                //     );
-                //     self.lcp.force_open();
-                //     self.phase = SessionPhase::Ipcp;
-                // }
+                if !self.lcp.is_open() && self.lcp.state == LcpState::AckSent {
+                    log::info!("LCP: received IPCP while in AckSent, forcing LCP open");
+                    self.lcp.force_open();
+                    self.phase = SessionPhase::Ipcp;
+                }
+
+                if let Some(requested_ip) = configure_request_peer_ip(ppp)
+                    && !requested_ip.is_unspecified()
+                    && requested_ip != self.ipcp.peer_ip()
+                    && matches!(self.phase, SessionPhase::Ipcp | SessionPhase::Lcp)
+                    && self.lcp.is_open()
+                {
+                    log::info!(
+                        "Packet session requesting peer IP claim from IPCP: requested={} previous_assigned={} phase={:?}",
+                        requested_ip,
+                        self.ipcp.peer_ip(),
+                        self.phase
+                    );
+                    actions.push(SessionAction::ClaimPeerIp {
+                        peer_ip: requested_ip,
+                        resume_packet: None,
+                    });
+                    return;
+                }
 
                 let responses = self.ipcp.receive(ppp);
                 for resp in responses {
@@ -840,40 +1193,63 @@ impl PacketSession {
             }
             0x0021 => {
                 // IP packet from mobile.
+                let Some(src_ip) = self.parse_uplink_ipv4(&ppp.payload) else {
+                    return;
+                };
+
                 if self.phase == SessionPhase::Active {
-                    let payload = &ppp.payload;
-                    // Basic IPv4 validation + source IP ingress filter.
-                    if payload.len() < 20 || (payload[0] >> 4) != 4 {
-                        log::warn!(
-                            "IP ingress: dropping malformed packet (len={} ver={})",
-                            payload.len(),
-                            payload.get(0).map(|b| b >> 4).unwrap_or(0),
-                        );
-                        return;
-                    }
-                    let src_ip = Ipv4Addr::new(payload[12], payload[13], payload[14], payload[15]);
                     let expected = self.ipcp.peer_ip();
-                    if src_ip != expected && !src_ip.is_unspecified() {
-                        log::warn!(
-                            "IP ingress: dropping spoofed source {} (expected {})",
+                    if src_ip != expected {
+                        log::info!(
+                            "Packet session requesting peer IP claim from active uplink IP: peer={} previous_assigned={}",
                             src_ip,
                             expected,
                         );
-                        return;
-                    }
-                    if src_ip.is_unspecified() {
-                        // DHCP discover (0.0.0.0 → 255.255.255.255) — normal phone behavior,
-                        // not needed for CDMA2000 (IP assigned via IPCP). Drop silently.
-                        log::debug!("IP ingress: ignoring DHCP discover from 0.0.0.0");
+                        actions.push(SessionAction::ClaimPeerIp {
+                            peer_ip: src_ip,
+                            resume_packet: Some(ppp.payload.clone()),
+                        });
                         return;
                     }
                     actions.push(SessionAction::DeliverIpPacket(ppp.payload.clone()));
+                } else if matches!(self.phase, SessionPhase::Lcp | SessionPhase::Ipcp)
+                    && self.lcp.peer_acked_our_request()
+                {
+                    log::info!(
+                        "Packet session requesting peer IP claim from uplink IP: peer={} previous_assigned={} phase={:?}",
+                        src_ip,
+                        self.ipcp.peer_ip(),
+                        self.phase
+                    );
+                    actions.push(SessionAction::ClaimPeerIp {
+                        peer_ip: src_ip,
+                        resume_packet: Some(ppp.payload.clone()),
+                    });
                 }
             }
             other => {
                 log::debug!("Ignoring PPP protocol 0x{:04X}", other);
             }
         }
+    }
+
+    fn parse_uplink_ipv4(&self, payload: &[u8]) -> Option<Ipv4Addr> {
+        if payload.len() < 20 || (payload[0] >> 4) != 4 {
+            log::warn!(
+                "IP ingress: dropping malformed packet (len={} ver={})",
+                payload.len(),
+                payload.get(0).map(|b| b >> 4).unwrap_or(0),
+            );
+            return None;
+        }
+        let src_ip = Ipv4Addr::new(payload[12], payload[13], payload[14], payload[15]);
+        if src_ip.is_unspecified() {
+            // DHCP discover (0.0.0.0 -> 255.255.255.255) is normal phone
+            // behavior, but CDMA2000 packet data assigns IP via IPCP.
+            log::debug!("IP ingress: ignoring DHCP discover from 0.0.0.0");
+            return None;
+        }
+        Some(src_ip)
     }
 
     fn uplink_capture_frame_options(&self, ppp: &PppPacket) -> framing::FrameOptions {
@@ -1058,6 +1434,16 @@ fn format_rlp3_frame(frame: &crate::rlp3_frames::Rlp3Frame) -> String {
     }
 }
 
+fn is_rlp3_idle_like(frame: &crate::rlp3_frames::Rlp3Frame) -> bool {
+    match frame {
+        crate::rlp3_frames::Rlp3Frame::Fill { .. }
+        | crate::rlp3_frames::Rlp3Frame::Idle1 { .. }
+        | crate::rlp3_frames::Rlp3Frame::Idle2 { .. } => true,
+        crate::rlp3_frames::Rlp3Frame::Data { data, .. } => data.is_empty(),
+        _ => false,
+    }
+}
+
 fn summarize_rlp3_tx_frame(frame: &crate::rlp3_frames::Rlp3Frame) -> String {
     match frame {
         crate::rlp3_frames::Rlp3Frame::Control { control_type, .. } => {
@@ -1093,8 +1479,60 @@ fn summarize_rlp3_tx_frame(frame: &crate::rlp3_frames::Rlp3Frame) -> String {
         crate::rlp3_frames::Rlp3Frame::Fill { seq, .. } => format!("fill seq={}", seq),
         crate::rlp3_frames::Rlp3Frame::Idle1 { seq, .. } => format!("idle1 seq={}", seq),
         crate::rlp3_frames::Rlp3Frame::Idle2 { seq } => format!("idle2 seq={}", seq),
-        crate::rlp3_frames::Rlp3Frame::Nak { seq, payload, .. } => {
-            format!("nak seq={} payload={:?}", seq, payload)
+        crate::rlp3_frames::Rlp3Frame::Nak {
+            seq,
+            seq_hi,
+            payload,
+            ..
+        } => {
+            format!("nak seq={} seq_hi={} payload={:?}", seq, seq_hi, payload)
+        }
+    }
+}
+
+fn summarize_rlp3_nak_payload(payload: &crate::rlp3_frames::NakPayload) -> String {
+    match payload {
+        crate::rlp3_frames::NakPayload::Gap(entries) => {
+            let ranges = entries
+                .iter()
+                .map(|entry| format!("{}-{}", entry.first, entry.last))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("gap[{}]", ranges)
+        }
+        crate::rlp3_frames::NakPayload::Map(entries) => {
+            let ranges = entries
+                .iter()
+                .map(|entry| format!("first={} bitmap=0x{:02x}", entry.nak_map_seq, entry.nak_map))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("map[{}]", ranges)
+        }
+        crate::rlp3_frames::NakPayload::SegmentRange(entries) => {
+            let ranges = entries
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "seq={} s_seq={}-{}",
+                        entry.frame_seq, entry.first_s_seq, entry.last_s_seq
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("segment_range[{}]", ranges)
+        }
+        crate::rlp3_frames::NakPayload::SegmentLength(entries) => {
+            let ranges = entries
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "seq={} s_seq={} len={}",
+                        entry.frame_seq, entry.first_s_seq, entry.length_s_seq
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("segment_length[{}]", ranges)
         }
     }
 }
@@ -1458,6 +1896,112 @@ mod tests {
     use crate::ppp::ipcp;
     use crate::ppp::lcp;
     use crate::rlp;
+    use cdma_common::consts::SERVICE_OPTION_PACKET_DATA;
+
+    #[test]
+    fn sch_0x0809_sdu_wraps_one_data_block_and_fill_muxpdu() {
+        let data = vec![1u8; SCH_0X0809_DATA_BLOCK_BITS];
+        let profile = Rc3FschProfile::default_19k2();
+        let bits = build_sch_type3_sdu(&[data], profile);
+
+        assert_eq!(bits.len(), profile.info_bits);
+        assert_eq!(&bits[0..SCH_TYPE3_HEADER_BITS], &[0, 0, 1, 0, 0, 0]);
+        let fill_start = SCH_TYPE3_HEADER_BITS + SCH_0X0809_DATA_BLOCK_BITS;
+        assert_eq!(
+            &bits[fill_start..fill_start + SCH_TYPE3_HEADER_BITS],
+            &[1, 1, 1, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn sch_0x0809_sdu_wraps_two_data_blocks() {
+        let first = vec![1u8; SCH_0X0809_DATA_BLOCK_BITS];
+        let second = vec![0u8; SCH_0X0809_DATA_BLOCK_BITS];
+        let profile = Rc3FschProfile::default_19k2();
+        let bits = build_sch_type3_sdu(&[first, second], profile);
+
+        assert_eq!(bits.len(), profile.info_bits);
+        assert_eq!(&bits[0..SCH_TYPE3_HEADER_BITS], &[0, 0, 1, 0, 0, 0]);
+        let second_start = SCH_TYPE3_HEADER_BITS + SCH_0X0809_DATA_BLOCK_BITS;
+        assert_eq!(
+            &bits[second_start..second_start + SCH_TYPE3_HEADER_BITS],
+            &[0, 0, 1, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn sch_0x0811_sdu_uses_two_ltu_crc_blocks() {
+        let first = vec![1u8; SCH_0X0809_DATA_BLOCK_BITS];
+        let second = vec![0u8; SCH_0X0809_DATA_BLOCK_BITS];
+        let profile = Rc3FschProfile::from_rate_bps(38_400).unwrap();
+        let bits = build_sch_type3_sdu(&[first, second], profile);
+
+        assert_eq!(bits.len(), profile.info_bits);
+        assert_eq!(bits.len(), 744);
+        assert_eq!(&bits[0..SCH_TYPE3_HEADER_BITS], &[0, 0, 1, 0, 0, 0]);
+        let second_start = SCH_TYPE3_HEADER_BITS + SCH_0X0809_DATA_BLOCK_BITS;
+        assert_eq!(
+            &bits[second_start..second_start + SCH_TYPE3_HEADER_BITS],
+            &[0, 0, 1, 0, 0, 0]
+        );
+        assert_eq!(
+            &bits[SCH_TYPE3_LTUS_SIZE_BITS..SCH_TYPE3_LTUS_SIZE_BITS + SCH_TYPE3_HEADER_BITS],
+            &[1, 1, 1, 0, 0, 0]
+        );
+        assert_ltu_crc(&bits[0..SCH_TYPE3_LTUS_SIZE_BITS]);
+        assert_ltu_crc(&bits[SCH_TYPE3_LTUS_SIZE_BITS..SCH_TYPE3_LTUS_SIZE_BITS * 2]);
+    }
+
+    #[test]
+    fn sch_0x0821_sdu_uses_four_ltu_crc_blocks() {
+        let data = vec![1u8; SCH_0X0809_DATA_BLOCK_BITS];
+        let blocks = vec![data; 8];
+        let profile = Rc3FschProfile::from_rate_bps(76_800).unwrap();
+        let bits = build_sch_type3_sdu(&blocks, profile);
+
+        assert_eq!(bits.len(), profile.info_bits);
+        assert_eq!(bits.len(), 1512);
+        for ltu_start in (0..SCH_TYPE3_LTUS_SIZE_BITS * 4).step_by(SCH_TYPE3_LTUS_SIZE_BITS) {
+            let second_muxpdu = ltu_start + SCH_TYPE3_HEADER_BITS + SCH_0X0809_DATA_BLOCK_BITS;
+            assert_eq!(
+                &bits[second_muxpdu..second_muxpdu + SCH_TYPE3_HEADER_BITS],
+                &[0, 0, 1, 0, 0, 0]
+            );
+        }
+        for ltu in bits[..SCH_TYPE3_LTUS_SIZE_BITS * 4].chunks_exact(SCH_TYPE3_LTUS_SIZE_BITS) {
+            assert_ltu_crc(ltu);
+        }
+    }
+
+    #[test]
+    fn sch_153k6_sdu_uses_eight_ltu_crc_blocks() {
+        let data = vec![1u8; SCH_0X0921_DATA_BLOCK_BITS];
+        let profile = Rc3FschProfile::from_rate_bps(153_600).unwrap();
+        let bits = build_sch_type3_sdu(&[data], profile);
+
+        assert_eq!(bits.len(), profile.info_bits);
+        assert_eq!(bits.len(), 3048);
+        assert_eq!(&bits[0..SCH_TYPE3_HEADER_BITS], &[0, 0, 1, 0, 0, 0]);
+        assert_eq!(
+            &bits[SCH_TYPE3_HEADER_BITS..SCH_TYPE3_HEADER_BITS + SCH_0X0921_DATA_BLOCK_BITS],
+            &[1u8; SCH_0X0921_DATA_BLOCK_BITS]
+        );
+        for ltu in bits[..SCH_TYPE3_LTUS_SIZE_BITS * 8].chunks_exact(SCH_TYPE3_LTUS_SIZE_BITS) {
+            assert_ltu_crc(ltu);
+        }
+    }
+
+    fn assert_ltu_crc(ltu: &[u8]) {
+        assert_eq!(ltu.len(), SCH_TYPE3_LTUS_SIZE_BITS);
+        let expected = crc16_sch(&ltu[..SCH_TYPE3_LTUS_PAYLOAD_BITS]);
+        let actual = bits_to_u16(&ltu[SCH_TYPE3_LTUS_PAYLOAD_BITS..]);
+        assert_eq!(actual, expected);
+    }
+
+    fn bits_to_u16(bits: &[u8]) -> u16 {
+        bits.iter()
+            .fold(0u16, |acc, bit| (acc << 1) | ((*bit as u16) & 1))
+    }
 
     /// Helper: encode an RLP Type 1 frame to raw bits for feeding into tick().
     fn encode_rlp1(frame: &rlp::RlpFrame) -> (Vec<u8>, u32) {
@@ -1544,6 +2088,16 @@ mod tests {
         ipcp.to_ppp()
     }
 
+    fn mobile_ipv4_packet(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
+        let src = src.octets();
+        let dst = dst.octets();
+        vec![
+            0x45, 0x00, 0x00, 0x1C, 0x00, 0x01, 0x00, 0x00, 0x40, 0x11, 0x00, 0x00, src[0], src[1],
+            src[2], src[3], dst[0], dst[1], dst[2], dst[3], 0xC0, 0x00, 0x00, 0x35, 0x00, 0x08,
+            0x00, 0x00,
+        ]
+    }
+
     /// Feed a PPP packet to the session via RLP data frames.
     /// Splits the HDLC bytes across multiple RLP frames if needed.
     /// Tracks the uplink SEQ number to maintain proper RLP sequencing.
@@ -1569,20 +2123,23 @@ mod tests {
 
     #[test]
     fn session_starts_in_rlp_sync() {
-        let session = PacketSession::new(7, IpcpConfig::default());
+        let session =
+            PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), IpcpConfig::default());
         assert_eq!(session.phase(), SessionPhase::RlpSync);
     }
 
     #[test]
     fn rlp_handshake_transitions_to_lcp() {
-        let mut session = PacketSession::new(7, IpcpConfig::default());
+        let mut session =
+            PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), IpcpConfig::default());
         complete_rlp_handshake(&mut session);
         assert_eq!(session.phase(), SessionPhase::Lcp);
     }
 
     #[test]
     fn full_negotiation_to_active() {
-        let mut session = PacketSession::new(7, IpcpConfig::default());
+        let mut session =
+            PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), IpcpConfig::default());
         complete_rlp_handshake(&mut session);
         assert_eq!(session.phase(), SessionPhase::Lcp);
 
@@ -1623,8 +2180,55 @@ mod tests {
     }
 
     #[test]
+    fn lcp_restart_after_active_renegotiates_without_closing_session() {
+        let mut session =
+            PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), IpcpConfig::default());
+        let mut seq = drive_to_active(&mut session);
+        assert_eq!(session.phase(), SessionPhase::Active);
+
+        let actions = feed_ppp_via_rlp(&mut session, &mobile_lcp_configure_request(9), &mut seq);
+        assert!(
+            actions
+                .iter()
+                .all(|a| !matches!(a, SessionAction::CloseSession { .. })),
+            "LCP restart should renegotiate PPP in-place"
+        );
+        assert_eq!(session.phase(), SessionPhase::Lcp);
+
+        let mobile_lcp_ack = mobile_lcp_configure_ack(2, vec![1, 4, 0x05, 0xDC]);
+        feed_ppp_via_rlp(&mut session, &mobile_lcp_ack, &mut seq);
+        assert_eq!(session.phase(), SessionPhase::Ipcp);
+    }
+
+    #[test]
+    fn sch_dtxes_control_frames_until_ppp_active() {
+        let mut session =
+            PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), IpcpConfig::default());
+        complete_rlp_handshake(&mut session);
+        session.set_sch_active(true);
+
+        let mut seq = 0;
+        let actions = feed_ppp_via_rlp(&mut session, &mobile_lcp_configure_request(1), &mut seq);
+
+        assert_eq!(session.phase(), SessionPhase::Lcp);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, SessionAction::SendFrame { .. })),
+            "LCP control should still go out on FCH"
+        );
+        assert!(
+            actions
+                .iter()
+                .all(|a| !matches!(a, SessionAction::SendSchFrame { .. })),
+            "SCH should remain DTX/blank before PPP is active"
+        );
+    }
+
+    #[test]
     fn ip_packet_delivery_uplink() {
-        let mut session = PacketSession::new(7, IpcpConfig::default());
+        let mut session =
+            PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), IpcpConfig::default());
         let mut seq = drive_to_active(&mut session);
 
         // Mobile sends an IP packet via PPP.
@@ -1653,8 +2257,62 @@ mod tests {
     }
 
     #[test]
+    fn requests_peer_ip_claim_from_uplink_ip_after_lcp_ack() {
+        let mut session =
+            PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), IpcpConfig::default());
+        complete_rlp_handshake(&mut session);
+        assert_eq!(session.phase(), SessionPhase::Lcp);
+
+        let mut seq = 0;
+        let mobile_lcp_ack = mobile_lcp_configure_ack(1, vec![1, 4, 0x05, 0xDC]);
+        feed_ppp_via_rlp(&mut session, &mobile_lcp_ack, &mut seq);
+        assert_eq!(session.phase(), SessionPhase::Lcp);
+
+        let ip_packet = mobile_ipv4_packet(Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(8, 8, 8, 8));
+        let ppp = PppPacket {
+            protocol: 0x0021,
+            payload: ip_packet.clone(),
+        };
+        let actions = feed_ppp_via_rlp(&mut session, &ppp, &mut seq);
+
+        assert_eq!(session.phase(), SessionPhase::Lcp);
+        assert!(actions.iter().any(
+            |a| matches!(a, SessionAction::ClaimPeerIp { peer_ip, resume_packet: Some(packet) }
+                    if *peer_ip == Ipv4Addr::new(10, 0, 0, 2) && packet == &ip_packet)
+        ));
+    }
+
+    #[test]
+    fn requests_peer_ip_claim_from_ipcp_requested_address() {
+        let mut session =
+            PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), IpcpConfig::default());
+        complete_rlp_handshake(&mut session);
+
+        let mut seq = 0;
+        feed_ppp_via_rlp(&mut session, &mobile_lcp_configure_request(1), &mut seq);
+        feed_ppp_via_rlp(
+            &mut session,
+            &mobile_lcp_configure_ack(1, vec![1, 4, 0x05, 0xDC]),
+            &mut seq,
+        );
+        assert_eq!(session.phase(), SessionPhase::Ipcp);
+
+        let actions = feed_ppp_via_rlp(
+            &mut session,
+            &mobile_ipcp_request_ip(4, Ipv4Addr::new(10, 0, 0, 3)),
+            &mut seq,
+        );
+
+        assert!(actions.iter().any(
+            |a| matches!(a, SessionAction::ClaimPeerIp { peer_ip, resume_packet: None }
+                    if *peer_ip == Ipv4Addr::new(10, 0, 0, 3))
+        ));
+    }
+
+    #[test]
     fn ip_packet_delivery_downlink() {
-        let mut session = PacketSession::new(7, IpcpConfig::default());
+        let mut session =
+            PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), IpcpConfig::default());
         drive_to_active(&mut session);
 
         // Inject an IP packet for downlink delivery.
@@ -1685,7 +2343,8 @@ mod tests {
 
     #[test]
     fn send_ip_packet_ignored_before_active() {
-        let mut session = PacketSession::new(7, IpcpConfig::default());
+        let mut session =
+            PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), IpcpConfig::default());
         complete_rlp_handshake(&mut session);
         assert_eq!(session.phase(), SessionPhase::Lcp);
 
@@ -1701,7 +2360,8 @@ mod tests {
 
     #[test]
     fn close_session() {
-        let mut session = PacketSession::new(7, IpcpConfig::default());
+        let mut session =
+            PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), IpcpConfig::default());
         session.close();
         assert_eq!(session.phase(), SessionPhase::Closed);
     }

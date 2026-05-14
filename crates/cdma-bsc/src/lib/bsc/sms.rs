@@ -8,6 +8,7 @@
 
 use std::time::{Duration, Instant};
 
+use cdma_common::consts::SERVICE_OPTION_SMS;
 use cdma_common::error::Error;
 use cdma_common::events::AccessChannelEvent;
 use cdma_common::lac::message_types::MessageId;
@@ -21,8 +22,6 @@ use uuid::Uuid;
 use crate::addressing::{format_ms_address, parse_sms_target_address};
 
 use super::{Bsc, DEFAULT_PAGE_TIMEOUT_MS, MobileStation, MsState, PendingPage};
-
-const SMS_SERVICE_OPTION: u16 = 6;
 
 /// SMS request to deliver to a registered mobile station.
 pub struct SmsRequest {
@@ -581,7 +580,7 @@ impl Bsc {
             pgslot,
             slot_cycle_index,
             after_chip,
-            Some(SMS_SERVICE_OPTION),
+            Some(SERVICE_OPTION_SMS),
             "SMS delivery",
             override_msg_seq,
         )

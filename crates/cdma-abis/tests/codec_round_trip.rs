@@ -266,7 +266,7 @@ fn round_trip_bts_setup_full() {
         sdu_id: Some(SduId::new(vec![0x01]).unwrap()),
         mobile_identities: vec![MobileIdentity::Esn(0x12345678)],
         physical_channel_info: Some(test_physical_channel_info()),
-        service_option: Some(ServiceOption(33)),
+        service_option: Some(ServiceOption::HIGH_RATE_PACKET_DATA),
         paca_timestamp: Some(PacaTimestamp(1000)),
         quality_of_service_parameters: Some(QualityOfServiceParameters { packet_priority: 5 }),
         connect_information: vec![test_a3_connect_info()],

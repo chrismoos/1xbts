@@ -6539,7 +6539,7 @@ mod tests {
 
         const NOMINAL_RC3_FULL_TDG_DB: f32 = 3.75;
         // Lock-step with `rlgain_adj` in paging_messages.rs (0.25 dB units).
-        const PROD_RLGAIN_ADJ_QUARTERS: i32 = -4;
+        const PROD_RLGAIN_ADJ_QUARTERS: i32 = 0;
         const TDG_DB: f32 = NOMINAL_RC3_FULL_TDG_DB + (PROD_RLGAIN_ADJ_QUARTERS as f32) * 0.25;
         let tdg_lin = 10f32.powf(TDG_DB / 20.0);
         eprintln!(

@@ -584,7 +584,7 @@ impl MessageId {
             Self::ServiceRequest => 0x12,                        // 00010010 SRQM
             Self::ServiceResponse => 0x13,                       // 00010011 SRPM
             Self::ServiceConnect => 0x14,                        // 00010100 SCM
-            Self::ExtendedSupplementalChannelAssignment => 0x22, // 00100010 ESCAM
+            Self::ExtendedSupplementalChannelAssignment => 0x23, // 00100011 ESCAM (C.S0005-E §3.7.3.3.2.37)
             _ => return None,
         })
     }
@@ -599,7 +599,7 @@ impl MessageId {
             0x12 => Self::ServiceRequest,
             0x13 => Self::ServiceResponse,
             0x14 => Self::ServiceConnect,
-            0x22 => Self::ExtendedSupplementalChannelAssignment,
+            0x23 => Self::ExtendedSupplementalChannelAssignment,
             _ => return None,
         })
     }

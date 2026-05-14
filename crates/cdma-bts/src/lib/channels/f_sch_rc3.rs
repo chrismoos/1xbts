@@ -1,38 +1,37 @@
-//! Forward Supplemental Channel (F-SCH) for RC3 at 19.2 kbps.
+//! Forward Supplemental Channel (F-SCH) for RC3.
 //!
-//! Per IS-2000 C.S0002-E, the F-SCH at 19.2 kbps uses:
-//!   360 info + 16 CRC-16 + 8 tail = 384 bits
-//!   → R=1/4 K=9 convolutional encode → 1536 code symbols
-//!   → no repetition (1×)
-//!   → interleave (1536 fwd-bwd bit-reversal)
+//! Per IS-2000 C.S0002-E, the RC3 F-SCH uses:
+//!   N info + 16 CRC-16 + 8 tail bits
+//!   → R=1/4 K=9 convolutional encode
+//!   → interleave using the selected rate's block size
 //!   → LC scramble (32-chip pair extractor, same PLCM as F-FCH)
-//!   → PC puncture (4 symbols per PCG, LC-derived position)
-//!   → signal-point map → I/Q demux → W(n,32) Walsh spread
+//!   → signal-point map → I/Q demux → rate-specific Walsh spread
 //!
-//! The modulation symbol rate is 76,800 sps (vs 38,400 for F-FCH),
-//! so each mod symbol spans 16 chips (vs 32 for F-FCH).
+//! The modulation symbol rate scales with the selected Walsh length:
+//! W(32)=19.2 kbps, W(16)=38.4 kbps, W(8)=76.8 kbps, and W(4)=153.6 kbps.
 
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 
+use cdma_common::sch::Rc3FschProfile;
 use cdma_common::time::CdmaSystemTime;
 use log::trace;
 use num::complex::Complex32;
 
 use crate::phy::coding::{
-    block_interleaver::{ForwardBackwardsBitReversalInterleaver, SR1_PARAMS_1536},
+    block_interleaver::{
+        ForwardBackwardsBitReversalInterleaver, InterleaverParams, SR1_PARAMS_1536,
+        SR1_PARAMS_3072, SR1_PARAMS_6144, SR1_PARAMS_12288,
+    },
     convolutional::{Encoder, get_1_4_k9_encoder},
     long_code::LongCodeGenerator,
 };
 
-use super::{Channel, PcgPcbSchedulerHandle};
+use super::Channel;
 use cdma_common::consts::SR1_PCGS_PER_FRAME;
 
 // Re-use crc16 from ftch_rc3
 use super::ftch_rc3::crc16;
-
-/// F-SCH info bits per 20ms frame at 19.2 kbps.
-const SCH_INFO_BITS: usize = 360;
 
 /// CRC bits for F-SCH (CRC-16 for all SCH rates).
 const SCH_CRC_BITS: usize = 16;
@@ -40,31 +39,20 @@ const SCH_CRC_BITS: usize = 16;
 /// Encoder tail bits.
 const SCH_TAIL_BITS: usize = 8;
 
-/// Total frame bits before encoding: 360 + 16 + 8 = 384.
-const SCH_FRAME_BITS: usize = SCH_INFO_BITS + SCH_CRC_BITS + SCH_TAIL_BITS;
-
-/// Modulation symbols per 20ms frame at 19.2 kbps.
-/// 384 bits × 4 (R=1/4) = 1536 symbols.
-const MOD_SYMBOLS_PER_FRAME: usize = 1536;
-
-/// QPSK output symbols per 20ms frame after I/Q demux.
-/// 1536 mod symbols → 768 complex (I+jQ) symbols.
-const OUTPUT_SYMBOLS_PER_FRAME: usize = MOD_SYMBOLS_PER_FRAME / 2;
-
-/// Modulation symbols per PCG (pre-demux).
-const SYMBOLS_PER_PCG: usize = MOD_SYMBOLS_PER_FRAME / SR1_PCGS_PER_FRAME; // = 96
-
-/// Number of modulation symbols punctured per PCG for power control.
-const PC_PUNCTURE_SYMBOLS: usize = 4;
-
-/// Chips per modulation symbol at 19.2 kbps SCH.
-/// 1,228,800 chips/sec / 76,800 symbols/sec = 16 chips/symbol.
-const LC_DECIMATION: usize = 16;
-
 const LONG_CODE_PERIOD: u64 = (1u64 << 42) - 1;
 
-/// Chips per PCG: 96 symbols × 16 chips/symbol = 1536 chips.
-const PCG_CHIPS: usize = SYMBOLS_PER_PCG * LC_DECIMATION;
+/// Chips per PCG on Spreading Rate 1.
+const PCG_CHIPS: usize = 1536;
+
+pub fn interleaver_params(profile: Rc3FschProfile) -> InterleaverParams {
+    match profile.rate_bps {
+        19_200 => SR1_PARAMS_1536,
+        38_400 => SR1_PARAMS_3072,
+        76_800 => SR1_PARAMS_6144,
+        153_600 => SR1_PARAMS_12288,
+        _ => SR1_PARAMS_1536,
+    }
+}
 
 struct PreparedSchFrame {
     interleaved: Vec<u8>,
@@ -78,43 +66,43 @@ struct SchTxState {
 }
 
 pub struct SchConfigRc3 {
+    pub profile: Rc3FschProfile,
     pub encoder: Encoder<9, 4>,
     pub interleaver: ForwardBackwardsBitReversalInterleaver,
     pub scrambling_lc: LongCodeGenerator,
     pub puncture_lc: LongCodeGenerator,
     pub lc_chip_cursor: u64,
-    pub pcb_scheduler: PcgPcbSchedulerHandle,
     /// Gain for the SCH relative to pilot, from FPC_SCH_INIT_SETPT.
     pub sch_gain_linear: f32,
     pub prev_frame_last_chip: u8,
+    pub frame_pcg_index: usize,
     pub disable_lc_scrambling: bool,
 }
 
-/// RC3 Forward Supplemental Channel (F-SCH) at 19.2 kbps.
+/// RC3 Forward Supplemental Channel (F-SCH).
 ///
-/// Operates on a separate W(32) Walsh code from the F-FCH but shares the
-/// same long-code mask (PLCM). Produces 768 complex QPSK symbols per 20ms
-/// frame (twice the F-FCH output, since shorter Walsh = higher symbol rate).
+/// Operates on a separate supplemental Walsh code from the F-FCH but shares
+/// the same long-code mask (PLCM). Shorter Walsh lengths carry proportionally
+/// more QPSK symbols per 20 ms frame.
 pub struct ForwardSupplementalChannelRc3 {
     config: Mutex<SchConfigRc3>,
     tx_state: Mutex<SchTxState>,
     frames: Mutex<VecDeque<Vec<u8>>>,
-    pcb_scheduler: PcgPcbSchedulerHandle,
 }
 
 /// Build the complete encoder input (info + CRC-16 + tail) for an SCH frame.
-fn build_sch_frame_bits(data: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(SCH_FRAME_BITS);
+fn build_sch_frame_bits(profile: Rc3FschProfile, data: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(profile.frame_bits());
 
-    // Info bits (pad or truncate to SCH_INFO_BITS)
-    let info_len = data.len().min(SCH_INFO_BITS);
+    // Info bits (pad or truncate to the selected profile).
+    let info_len = data.len().min(profile.info_bits);
     frame.extend_from_slice(&data[..info_len]);
-    for _ in info_len..SCH_INFO_BITS {
+    for _ in info_len..profile.info_bits {
         frame.push(0);
     }
 
     // CRC-16 over info bits, MSB first
-    let crc = crc16(&frame[..SCH_INFO_BITS]);
+    let crc = crc16(&frame[..profile.info_bits]);
     for bit in (0..SCH_CRC_BITS).rev() {
         frame.push(((crc >> bit) & 1) as u8);
     }
@@ -124,13 +112,12 @@ fn build_sch_frame_bits(data: &[u8]) -> Vec<u8> {
         frame.push(0);
     }
 
-    debug_assert_eq!(frame.len(), SCH_FRAME_BITS);
+    debug_assert_eq!(frame.len(), profile.frame_bits());
     frame
 }
 
 impl ForwardSupplementalChannelRc3 {
     pub fn new(config: SchConfigRc3) -> Self {
-        let pcb_scheduler = config.pcb_scheduler.clone();
         ForwardSupplementalChannelRc3 {
             config: Mutex::new(config),
             tx_state: Mutex::new(SchTxState {
@@ -138,34 +125,31 @@ impl ForwardSupplementalChannelRc3 {
                 prepared_frame: None,
             }),
             frames: Mutex::new(VecDeque::new()),
-            pcb_scheduler,
         }
     }
 
     /// Create an F-SCH channel with default configuration.
     pub fn new_default(esn: u32) -> Self {
+        let profile = Rc3FschProfile::default_19k2();
         Self::new(SchConfigRc3 {
             encoder: get_1_4_k9_encoder(),
-            interleaver: ForwardBackwardsBitReversalInterleaver::new(SR1_PARAMS_1536),
+            interleaver: ForwardBackwardsBitReversalInterleaver::new(interleaver_params(profile)),
             scrambling_lc: LongCodeGenerator::new_traffic_channel(esn),
             puncture_lc: LongCodeGenerator::new_traffic_channel(esn),
+            profile,
             lc_chip_cursor: 0,
-            pcb_scheduler: crate::channels::PcgPcbScheduler::new(0),
             sch_gain_linear: 1.0,
             prev_frame_last_chip: 0,
+            frame_pcg_index: 0,
             disable_lc_scrambling: false,
         })
     }
 
     /// Queue a frame (info bits) for transmission.
-    /// The data should be SCH_INFO_BITS (360) bits of MUX PDU Type 2 content.
+    /// Queue SCH MAC SDU content. The active profile pads/truncates to its
+    /// configured info-bit count.
     pub fn send_frame(&self, data: Vec<u8>) {
         self.frames.lock().push_back(data);
-    }
-
-    /// Schedule a single power-control bit for an absolute PCG index.
-    pub fn schedule_power_control_bit(&self, abs_pcg: u64, bit: u8) {
-        self.pcb_scheduler.lock().schedule(abs_pcg, bit);
     }
 
     /// Seed both long-code generators at the given CDMA chip position.
@@ -186,6 +170,7 @@ impl ForwardSupplementalChannelRc3 {
         config.scrambling_lc.advance_chips(delta as usize);
         config.puncture_lc.advance_chips(delta as usize);
         config.lc_chip_cursor = chip;
+        config.frame_pcg_index = 0;
     }
 
     /// Number of frames currently queued.
@@ -193,37 +178,55 @@ impl ForwardSupplementalChannelRc3 {
         self.frames.lock().len()
     }
 
-    /// Produce one 20ms frame of 768 complex (QPSK) symbols.
-    pub fn next(&self, current_system_time: CdmaSystemTime) -> Vec<Complex32> {
-        self.next_block(OUTPUT_SYMBOLS_PER_FRAME, current_system_time)
+    pub fn profile(&self) -> Rc3FschProfile {
+        self.config.lock().profile
     }
 
-    fn pop_next_frame(&self) -> Vec<u8> {
-        self.frames.lock().pop_front().unwrap_or_else(|| {
-            // Blank/fill frame: MUX header = 0, rest zeros
-            vec![0u8; SCH_INFO_BITS]
-        })
+    /// Produce one 20ms frame of 768 complex (QPSK) symbols.
+    pub fn next(&self, current_system_time: CdmaSystemTime) -> Vec<Complex32> {
+        let profile = self.config.lock().profile;
+        self.next_block(profile.qpsk_symbols(), current_system_time)
+    }
+
+    fn pop_next_frame(&self) -> Option<Vec<u8>> {
+        self.frames.lock().pop_front()
+    }
+
+    fn emit_dtx_pcg(config: &mut SchConfigRc3, tx_state: &mut SchTxState) {
+        let mut probe = config.scrambling_lc.clone();
+        probe.advance_chips(PCG_CHIPS - 1);
+        config.prev_frame_last_chip = probe.next_chip();
+
+        config.scrambling_lc.advance_chips(PCG_CHIPS);
+        config.puncture_lc.advance_chips(PCG_CHIPS);
+        config.lc_chip_cursor = config.lc_chip_cursor.saturating_add(PCG_CHIPS as u64);
+        config.frame_pcg_index = (config.frame_pcg_index + 1) % SR1_PCGS_PER_FRAME;
+
+        tx_state.symbol_buffer.extend(std::iter::repeat_n(
+            Complex32::new(0.0, 0.0),
+            config.profile.symbols_per_pcg() / 2,
+        ));
     }
 
     fn prepare_frame(&self, config: &mut SchConfigRc3, data: Vec<u8>) -> PreparedSchFrame {
         // Step 1: Build complete frame (info + CRC-16 + tail)
-        let frame_data = build_sch_frame_bits(&data);
+        let profile = config.profile;
+        let frame_data = build_sch_frame_bits(profile, &data);
         let frame_start_chip = config.lc_chip_cursor;
 
         // Step 2: Convolutional encode (R=1/4, K=9) — each bit → 4 symbols
         config.encoder.reset();
-        let mut encoded = Vec::with_capacity(SCH_FRAME_BITS * 4);
+        let mut encoded = Vec::with_capacity(profile.coded_symbols());
         for &bit in &frame_data {
             for &sym in config.encoder.encode(bit).iter() {
                 encoded.push(sym);
             }
         }
-        debug_assert_eq!(encoded.len(), MOD_SYMBOLS_PER_FRAME);
+        debug_assert_eq!(encoded.len(), profile.coded_symbols());
 
-        // Step 3: No repetition at 19.2 kbps (1×)
-        // Step 4: No puncturing (1536 symbols = target)
+        // Step 3/4: no repetition or rate-matching puncturing for these RC3 profiles.
 
-        // Step 5: Forward-backwards bit-reversal interleave (1536 symbols)
+        // Step 5: forward-backwards bit-reversal interleave.
         let interleaved = config.interleaver.encode(&encoded);
 
         PreparedSchFrame {
@@ -235,7 +238,14 @@ impl ForwardSupplementalChannelRc3 {
 
     fn emit_next_pcg(&self, config: &mut SchConfigRc3, tx_state: &mut SchTxState) {
         if tx_state.prepared_frame.is_none() {
-            let data = self.pop_next_frame();
+            if config.frame_pcg_index != 0 {
+                Self::emit_dtx_pcg(config, tx_state);
+                return;
+            }
+            let Some(data) = self.pop_next_frame() else {
+                Self::emit_dtx_pcg(config, tx_state);
+                return;
+            };
             tx_state.prepared_frame = Some(self.prepare_frame(config, data));
         }
 
@@ -244,39 +254,23 @@ impl ForwardSupplementalChannelRc3 {
             .as_mut()
             .expect("prepared SCH frame must exist");
         let pcg_index = prepared.next_pcg;
-        let start = pcg_index * SYMBOLS_PER_PCG;
-        let end = start + SYMBOLS_PER_PCG;
+        let profile = config.profile;
+        let symbols_per_pcg = profile.symbols_per_pcg();
+        let start = pcg_index * symbols_per_pcg;
+        let end = start + symbols_per_pcg;
 
-        let abs_pcg = config.lc_chip_cursor / PCG_CHIPS as u64;
-        let pcb = self.pcb_scheduler.lock().read(abs_pcg);
-
-        // PC puncture position decimator: extract one LC chip per mod symbol
-        // (every LC_DECIMATION=16 chips), then use the last 4 bits of the PCG
-        // to select the puncture start position.
-        let mut pcg_bits = vec![0u8; SYMBOLS_PER_PCG];
-        for bit in pcg_bits.iter_mut() {
-            *bit = config.puncture_lc.next_chip();
-            for _ in 0..(LC_DECIMATION - 1) {
-                config.puncture_lc.next_chip();
-            }
-        }
-        // Last 4 decimator outputs of the PCG select the position
-        let b3 = pcg_bits[SYMBOLS_PER_PCG - 1] as usize;
-        let b2 = pcg_bits[SYMBOLS_PER_PCG - 2] as usize;
-        let b1 = pcg_bits[SYMBOLS_PER_PCG - 3] as usize;
-        let b0 = pcg_bits[SYMBOLS_PER_PCG - 4] as usize;
-        let pc_start = ((b3 << 3) | (b2 << 2) | (b1 << 1) | b0) * 2;
-
-        // LC scramble + signal-point map + PC puncture
+        // LC scramble + signal-point map. Reverse power-control bits are
+        // transmitted on F-FCH/F-DCCH only, not punctured into F-SCH.
+        let lc_decimation = profile.lc_decimation();
         let mut previous_chip = config.prev_frame_last_chip;
-        let mut mapped = vec![0.0f32; SYMBOLS_PER_PCG];
+        let mut mapped = vec![0.0f32; symbols_per_pcg];
         for (pair_idx, pair) in prepared.interleaved[start..end].chunks_exact(2).enumerate() {
             let q_chip = previous_chip;
             let i_chip = config.scrambling_lc.next_chip();
             previous_chip = i_chip;
             // Advance LC through the remaining chips of this 2-symbol group
-            // Group = 2 mod symbols × LC_DECIMATION chips = 32 chips total
-            for _ in 0..((2 * LC_DECIMATION) - 1) {
+            // Group = 2 mod symbols × LC decimation chips.
+            for _ in 0..((2 * lc_decimation) - 1) {
                 previous_chip = config.scrambling_lc.next_chip();
             }
 
@@ -289,16 +283,7 @@ impl ForwardSupplementalChannelRc3 {
                 } else {
                     pair[lane] ^ lc_scr
                 };
-                let is_pc =
-                    symbol_in_pcg >= pc_start && symbol_in_pcg < pc_start + PC_PUNCTURE_SYMBOLS;
-                mapped[symbol_in_pcg] = if is_pc {
-                    let sign = if pcb == 0 { 1.0f32 } else { -1.0f32 };
-                    sign * config.sch_gain_linear
-                } else if scrambled == 0 {
-                    1.0f32
-                } else {
-                    -1.0f32
-                };
+                mapped[symbol_in_pcg] = if scrambled == 0 { 1.0f32 } else { -1.0f32 };
             }
         }
 
@@ -311,14 +296,15 @@ impl ForwardSupplementalChannelRc3 {
 
         config.prev_frame_last_chip = previous_chip;
         config.lc_chip_cursor = config.lc_chip_cursor.saturating_add(PCG_CHIPS as u64);
+        config.frame_pcg_index = (config.frame_pcg_index + 1) % SR1_PCGS_PER_FRAME;
         prepared.next_pcg += 1;
         if prepared.next_pcg == SR1_PCGS_PER_FRAME {
             trace!(
                 "tx_fsch_rc3_frame: start_chip={} end_chip={} mod_symbols={} qpsk_symbols={}",
                 prepared.frame_start_chip,
                 config.lc_chip_cursor,
-                MOD_SYMBOLS_PER_FRAME,
-                OUTPUT_SYMBOLS_PER_FRAME,
+                profile.coded_symbols(),
+                profile.qpsk_symbols(),
             );
             tx_state.prepared_frame = None;
         }
@@ -347,29 +333,57 @@ mod tests {
     #[test]
     fn sch_frame_produces_correct_symbol_count() {
         let sch = ForwardSupplementalChannelRc3::new_default(0xDEADBEEF);
+        let profile = Rc3FschProfile::default_19k2();
         // Send a data frame
-        sch.send_frame(vec![1u8; SCH_INFO_BITS]);
+        sch.send_frame(vec![1u8; profile.info_bits]);
         let symbols = sch.next(CdmaSystemTime::default());
         assert_eq!(
             symbols.len(),
-            OUTPUT_SYMBOLS_PER_FRAME,
+            profile.qpsk_symbols(),
             "F-SCH should produce {} QPSK symbols per frame",
-            OUTPUT_SYMBOLS_PER_FRAME
+            profile.qpsk_symbols()
         );
+    }
+
+    #[test]
+    fn sch_153k6_frame_produces_correct_symbol_count() {
+        let profile = Rc3FschProfile::from_rate_bps(153_600).unwrap();
+        let sch = ForwardSupplementalChannelRc3::new(SchConfigRc3 {
+            encoder: get_1_4_k9_encoder(),
+            interleaver: ForwardBackwardsBitReversalInterleaver::new(interleaver_params(profile)),
+            scrambling_lc: LongCodeGenerator::new_traffic_channel(0xDEADBEEF),
+            puncture_lc: LongCodeGenerator::new_traffic_channel(0xDEADBEEF),
+            profile,
+            lc_chip_cursor: 0,
+            sch_gain_linear: 1.0,
+            prev_frame_last_chip: 0,
+            frame_pcg_index: 0,
+            disable_lc_scrambling: false,
+        });
+        sch.send_frame(vec![1u8; profile.info_bits]);
+
+        let symbols = sch.next(CdmaSystemTime::default());
+
+        assert_eq!(profile.frame_bits(), 3072);
+        assert_eq!(profile.qpsk_symbols(), 6144);
+        assert_eq!(symbols.len(), profile.qpsk_symbols());
     }
 
     #[test]
     fn sch_blank_frame_produces_correct_symbol_count() {
         let sch = ForwardSupplementalChannelRc3::new_default(0);
-        // No frame queued — should produce blank/fill
+        let profile = Rc3FschProfile::default_19k2();
+        // No queued SCH MAC SDU means DTX for this PCG/frame.
         let symbols = sch.next(CdmaSystemTime::default());
-        assert_eq!(symbols.len(), OUTPUT_SYMBOLS_PER_FRAME);
+        assert_eq!(symbols.len(), profile.qpsk_symbols());
+        assert!(symbols.iter().all(|s| s.re == 0.0 && s.im == 0.0));
     }
 
     #[test]
     fn sch_symbols_are_unit_magnitude() {
         let sch = ForwardSupplementalChannelRc3::new_default(0xAABBCCDD);
-        sch.send_frame(vec![0u8; SCH_INFO_BITS]);
+        let profile = Rc3FschProfile::default_19k2();
+        sch.send_frame(vec![0u8; profile.info_bits]);
         let symbols = sch.next(CdmaSystemTime::default());
         for (i, s) in symbols.iter().enumerate() {
             // Each component should be ±1.0 (data) or ±gain (PC puncture)
@@ -406,10 +420,32 @@ mod tests {
     }
 
     #[test]
+    fn sch_queued_data_waits_for_next_20ms_boundary() {
+        let sch = ForwardSupplementalChannelRc3::new_default(0xAABBCCDD);
+        let profile = Rc3FschProfile::default_19k2();
+        let qpsk_per_pcg = profile.symbols_per_pcg() / 2;
+
+        let first_pcg = sch.next_block(qpsk_per_pcg, CdmaSystemTime::default());
+        assert!(first_pcg.iter().all(|s| s.re == 0.0 && s.im == 0.0));
+
+        sch.send_frame(vec![1u8; profile.info_bits]);
+
+        let rest_of_frame = sch.next_block(qpsk_per_pcg * 15, CdmaSystemTime::default());
+        assert!(rest_of_frame.iter().all(|s| s.re == 0.0 && s.im == 0.0));
+
+        let first_data_pcg = sch.next_block(qpsk_per_pcg, CdmaSystemTime::default());
+        assert!(
+            first_data_pcg.iter().any(|s| s.re != 0.0 || s.im != 0.0),
+            "queued SCH frame should start at the next 20ms boundary"
+        );
+    }
+
+    #[test]
     fn build_sch_frame_bits_correct_length() {
-        let data = vec![0u8; SCH_INFO_BITS];
-        let frame = build_sch_frame_bits(&data);
-        assert_eq!(frame.len(), SCH_FRAME_BITS);
+        let profile = Rc3FschProfile::default_19k2();
+        let data = vec![0u8; profile.info_bits];
+        let frame = build_sch_frame_bits(profile, &data);
+        assert_eq!(frame.len(), profile.frame_bits());
     }
 
     #[test]

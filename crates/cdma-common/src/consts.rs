@@ -1,5 +1,23 @@
 //! Shared CDMA2000 SR1 physical-layer constants.
 
+/// SO3: EVRC-A / IS-127 narrowband.
+pub const SERVICE_OPTION_EVRC_A: u16 = 3;
+
+/// SO6: Short Message Services.
+pub const SERVICE_OPTION_SMS: u16 = 6;
+
+/// SO7: Packet data, async/fax data service.
+pub const SERVICE_OPTION_PACKET_DATA: u16 = 7;
+
+/// SO33: High-rate packet data service.
+pub const SERVICE_OPTION_HIGH_RATE_PACKET_DATA: u16 = 33;
+
+/// SO68: EVRC-B narrowband.
+pub const SERVICE_OPTION_EVRC_B: u16 = 68;
+
+/// SO70: EVRC-WB.
+pub const SERVICE_OPTION_EVRC_WB: u16 = 70;
+
 /// SR1 chip rate in chips per second (C.S0002-E §1.1).
 pub const SR1_CHIP_RATE_HZ: u64 = 1_228_800;
 

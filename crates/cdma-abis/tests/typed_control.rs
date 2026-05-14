@@ -126,7 +126,7 @@ fn bts_setup_roundtrip() {
             MobileIdentity::Esn(0x01020304),
         ],
         physical_channel_info: Some(physical_channel_info()),
-        service_option: Some(ServiceOption(0x0021)),
+        service_option: Some(ServiceOption::HIGH_RATE_PACKET_DATA),
         paca_timestamp: Some(PacaTimestamp(0x01020304)),
         quality_of_service_parameters: Some(QualityOfServiceParameters {
             packet_priority: 0x0a,

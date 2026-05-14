@@ -277,7 +277,7 @@ mod tests {
             authentication_challenge_parameter: Some(AuthenticationChallengeParameter([
                 0x10, 0x01, 0x02, 0x03, 0x04,
             ])),
-            service_option: Some(ServiceOption(0x0021)),
+            service_option: Some(ServiceOption::HIGH_RATE_PACKET_DATA),
             voice_privacy_request: true,
             circuit_identity_code: Some(CircuitIdentityCode {
                 pcm_multiplexer: 0x0123,

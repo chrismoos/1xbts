@@ -16,9 +16,10 @@ use crate::proto::{
     CloseSessionRequest, CloseSessionResponse, GetSessionStatusRequest, GetSessionStatusResponse,
     ListSessionsRequest, ListSessionsResponse, OpenSessionRequest, OpenSessionResponse,
     PacketSessionDetail, PacketSessionInfo, PacketTraceEvent as ProtoPacketTraceEvent,
-    SessionFrame, SetSessionCaptureRequest, SetSessionCaptureResponse,
+    SessionFrame, SetSchActiveRequest, SetSchActiveResponse, SetSessionCaptureRequest,
+    SetSessionCaptureResponse,
 };
-use crate::session_task::{self, SessionMetadata, SessionStatus};
+use crate::session_task::{self, SessionControl, SessionMetadata, SessionStatus};
 use crate::tun_transport::TunTransport;
 
 #[allow(dead_code)]
@@ -28,6 +29,9 @@ struct SessionEntry {
     status: Arc<Mutex<SessionStatus>>,
     task_handle: JoinHandle<()>,
     service_option: u32,
+    /// Out-of-band control sender — F-SCH activation, etc. The session task
+    /// selects on this alongside the bearer channels.
+    control_tx: mpsc::Sender<SessionControl>,
 }
 
 #[derive(Clone)]
@@ -109,6 +113,7 @@ impl PacketServiceImpl {
 
         let (uplink_tx, uplink_rx) = mpsc::channel(256);
         let (downlink_tx, downlink_rx) = mpsc::channel(256);
+        let (control_tx, control_rx) = mpsc::channel::<SessionControl>(8);
 
         let status = Arc::new(Mutex::new(SessionStatus::new(service_option, metadata)));
         let status_clone = status.clone();
@@ -126,6 +131,7 @@ impl PacketServiceImpl {
                 downlink_tx,
                 status_clone,
                 alloc,
+                control_rx,
             )
             .await;
         });
@@ -136,6 +142,7 @@ impl PacketServiceImpl {
             status,
             task_handle,
             service_option,
+            control_tx,
         };
 
         {
@@ -144,6 +151,30 @@ impl PacketServiceImpl {
         }
 
         Ok((uplink_tx, downlink_rx))
+    }
+
+    /// Toggle F-SCH downlink generation on a running session. Sends a
+    /// `SessionControl::SetSchActive` to the session task; the actual flip
+    /// of `PacketSession::sch_active` happens inside the task. Returns
+    /// `Err` if the session is unknown or its control channel is closed
+    /// (which only happens if the session task has already exited).
+    pub async fn set_session_sch_active(
+        &self,
+        session_id: &str,
+        active: bool,
+        rate_bps: u32,
+    ) -> Result<(), String> {
+        let control_tx = {
+            let sessions = self.sessions.lock().unwrap();
+            sessions
+                .get(session_id)
+                .map(|entry| entry.control_tx.clone())
+                .ok_or_else(|| format!("session {} not found", session_id))?
+        };
+        control_tx
+            .send(SessionControl::SetSchActive { active, rate_bps })
+            .await
+            .map_err(|e| format!("session {} control send failed: {e}", session_id))
     }
 
     /// Close a session (for in-process use).
@@ -284,6 +315,7 @@ impl PacketService for PacketServiceImpl {
 
         let (uplink_tx, uplink_rx) = mpsc::channel(256);
         let (downlink_tx, downlink_rx) = mpsc::channel(256);
+        let (control_tx, control_rx) = mpsc::channel::<SessionControl>(8);
 
         let status = Arc::new(Mutex::new(SessionStatus::new(
             req.service_option,
@@ -309,6 +341,7 @@ impl PacketService for PacketServiceImpl {
                 downlink_tx,
                 status_clone,
                 alloc,
+                control_rx,
             )
             .await;
         });
@@ -319,6 +352,7 @@ impl PacketService for PacketServiceImpl {
             status,
             task_handle,
             service_option: req.service_option,
+            control_tx,
         };
 
         {
@@ -449,5 +483,27 @@ impl PacketService for PacketServiceImpl {
         Ok(Response::new(SetSessionCaptureResponse {
             session: Some(session),
         }))
+    }
+
+    async fn set_sch_active(
+        &self,
+        request: Request<SetSchActiveRequest>,
+    ) -> Result<Response<SetSchActiveResponse>, Status> {
+        let req = request.into_inner();
+        let rate_bps = if req.rate_bps == 0 {
+            cdma_common::sch::DEFAULT_RC3_F_SCH_RATE_BPS
+        } else {
+            req.rate_bps
+        };
+        self.set_session_sch_active(&req.session_id, req.active, rate_bps)
+            .await
+            .map_err(|e| {
+                if e.contains("not found") {
+                    Status::not_found(e)
+                } else {
+                    Status::failed_precondition(e)
+                }
+            })?;
+        Ok(Response::new(SetSchActiveResponse {}))
     }
 }

@@ -12,9 +12,10 @@ use std::sync::Arc;
 use log::{info, warn};
 
 use cdma_abis::control::typed::{
-    A3ConnectInformation, CellId, CellIdWithMscId, CellInfoRecord, ChannelElementStatus,
-    CorrelationId, PhysicalChannelInfo, PhysicalChannelType, PilotGatingRate,
-    TrafficChannelStatusMessage, TrafficCircuitId,
+    A3ConnectInformation, BurstCommitMessage, BurstRequestMessage, BurstResponseMessage, CellId,
+    CellIdWithMscId, CellInfoRecord, ChannelElementStatus, CorrelationId, ForwardBurstRadioInfo,
+    PhysicalChannelInfo, PhysicalChannelType, PilotGatingRate, TrafficChannelStatusMessage,
+    TrafficCircuitId,
 };
 use cdma_abis::control::{
     AbisMessage, AbisTimerKind, BtsReleaseAckMessage, BtsReleaseMessage, BtsSetupAckMessage,
@@ -38,6 +39,7 @@ use crate::lac::paging_messages::{
 use crate::phy::coding::long_code::LongCodeGenerator;
 use crate::receiver::access_layer3::AccessMessage;
 use cdma_common::bits::Bitstream;
+use cdma_common::sch::Rc3FschProfile;
 
 pub(crate) fn abis_message_from_typed(bytes: &[u8]) -> Option<AbisMessage> {
     match decode(bytes) {
@@ -46,6 +48,16 @@ pub(crate) fn abis_message_from_typed(bytes: &[u8]) -> Option<AbisMessage> {
             warn!("abis_agent: failed to build AbisMessage from typed: {e}");
             None
         }
+    }
+}
+
+fn profile_from_sch_rate_index(index: u8) -> Option<Rc3FschProfile> {
+    match index {
+        0x1 => Rc3FschProfile::from_rate_bps(19_200),
+        0x2 => Rc3FschProfile::from_rate_bps(38_400),
+        0x3 => Rc3FschProfile::from_rate_bps(76_800),
+        0x4 => Rc3FschProfile::from_rate_bps(153_600),
+        _ => None,
     }
 }
 
@@ -63,6 +75,10 @@ struct Session {
     setup: TrafficSetupProcedure,
     release: TrafficReleaseProcedure,
     traffic_lac: Option<TrafficChannelArqState>,
+    /// F-SCH code allocated through the Abis Burst path for this FCH session,
+    /// or `None` before supplemental allocation. Freed when the session is
+    /// removed.
+    sch_walsh_code: Option<u8>,
 }
 
 /// Events emitted by the agent to BTS-internal consumers.
@@ -157,6 +173,12 @@ impl AbisAgent {
             }
             MessageType::PchMessageTransfer => {
                 self.handle_pch_msg_transfer(message, &mut responses, &mut events);
+            }
+            MessageType::BurstRequest => {
+                self.handle_burst_request(message, &mut responses);
+            }
+            MessageType::BurstCommit => {
+                self.handle_burst_commit(message);
             }
             other => {
                 warn!("abis_agent: unhandled message type {:?}", other);
@@ -434,8 +456,9 @@ impl AbisAgent {
             return;
         };
 
+        let sch_walsh_code: Option<u8> = None;
         info!(
-            "abis_agent: reserved Walsh code {} for CCR {:?} (channel pending ECAM)",
+            "abis_agent: reserved Walsh code {} for CCR {:?} (channel pending ECAM/SCH burst)",
             walsh_code, ccr
         );
 
@@ -446,30 +469,31 @@ impl AbisAgent {
             return;
         }
 
+        let connect_information = vec![A3ConnectInformation {
+            physical_channel_type: PhysicalChannelType::Fch,
+            new_a3: true,
+            cell_info_records: vec![CellInfoRecord {
+                cell: self.config.cell_id,
+                qof_mask: 0,
+                new_cell: true,
+                power_combine_indication: false,
+                pilot_pn: self.config.pilot_pn,
+                code_channel: walsh_code,
+            }],
+            traffic_circuit_id: TrafficCircuitId {
+                traffic_circuit_identifier: walsh_code as u16,
+                traffic_connection_identifier: 0,
+            },
+            extended_handoff_direction_parameters: None,
+            channel_element_id: vec![walsh_code],
+            a3_originating_id: 1,
+            a7_destination_id: 0,
+        }];
         let connect = ConnectMessage {
             call_connection_reference: ccr,
             correlation_id: None,
             sdu_id: None,
-            connect_information: vec![A3ConnectInformation {
-                physical_channel_type: PhysicalChannelType::Fch,
-                new_a3: true,
-                cell_info_records: vec![CellInfoRecord {
-                    cell: self.config.cell_id,
-                    qof_mask: 0,
-                    new_cell: true,
-                    power_combine_indication: false,
-                    pilot_pn: self.config.pilot_pn,
-                    code_channel: walsh_code,
-                }],
-                traffic_circuit_id: TrafficCircuitId {
-                    traffic_circuit_identifier: walsh_code as u16,
-                    traffic_connection_identifier: 0,
-                },
-                extended_handoff_direction_parameters: None,
-                channel_element_id: vec![walsh_code],
-                a3_originating_id: 1,
-                a7_destination_id: 0,
-            }],
+            connect_information,
             physical_channel_info: setup.physical_channel_info.unwrap_or(PhysicalChannelInfo {
                 frame_offset: 0,
                 pilot_gating_rate: PilotGatingRate::Full,
@@ -498,6 +522,7 @@ impl AbisAgent {
                             setup: setup_proc,
                             release: TrafficReleaseProcedure::new(ccr),
                             traffic_lac: None,
+                            sch_walsh_code,
                         },
                     );
                     responses.push(msg);
@@ -507,6 +532,136 @@ impl AbisAgent {
                 warn!("abis_agent: Connect encode failed: {e}");
                 self.controller.deallocate_traffic(walsh_code);
             }
+        }
+    }
+
+    fn handle_burst_request(&mut self, message: &AbisMessage, responses: &mut Vec<AbisMessage>) {
+        let Some(request) = self.decode_typed(message, BurstRequestMessage::decode) else {
+            return;
+        };
+        let Some(ccr) = request.call_connection_reference else {
+            warn!("abis_agent: BurstRequest missing CCR");
+            return;
+        };
+        let Some(request_info) = request.forward_burst_radio_info else {
+            warn!(
+                "abis_agent: BurstRequest for CCR {:?} missing ForwardBurstRadioInfo",
+                ccr
+            );
+            return;
+        };
+        let Some(profile) =
+            profile_from_sch_rate_index(request_info.forward_supplemental_channel_rate)
+        else {
+            warn!(
+                "abis_agent: BurstRequest for CCR {:?} unsupported F-SCH rate index {}",
+                ccr, request_info.forward_supplemental_channel_rate
+            );
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&ccr) else {
+            warn!("abis_agent: BurstRequest for unknown CCR {:?}", ccr);
+            return;
+        };
+        if request_info.forward_supplemental_channel_duration == 0 {
+            let release_code = if let Some(code) = session.sch_walsh_code.take() {
+                self.controller.deallocate_sch(code);
+                info!(
+                    "abis_agent: released F-SCH W({})={} for CCR {:?}",
+                    profile.walsh_len, code, ccr
+                );
+                code
+            } else {
+                let code = request_info.forward_code_channel_index as u8;
+                warn!(
+                    "abis_agent: F-SCH release for CCR {:?} with no active SCH; requested code={}",
+                    ccr, code
+                );
+                code
+            };
+            let mut response_info: ForwardBurstRadioInfo = request_info;
+            response_info.forward_code_channel_index = release_code as u16;
+            response_info.pilot_pn_code = self.config.pilot_pn;
+            response_info.forward_supplemental_channel_rate = profile.num_bits_idx;
+            let response = BurstResponseMessage {
+                call_connection_reference: Some(ccr),
+                correlation_id: request.correlation_id,
+                committed_cell_identifier_list: request
+                    .cell_identifier_list
+                    .clone()
+                    .or_else(|| Some(vec![self.config.cell_id])),
+                uncommitted_cell_identifier_list: None,
+                forward_burst_radio_info: Some(response_info),
+                reverse_burst_radio_info: None,
+                abis_destination_id: request.abis_destination_id.clone(),
+            };
+            if let Ok(bytes) = response.encode()
+                && let Some(msg) = abis_message_from_typed(&bytes)
+            {
+                responses.push(msg);
+            }
+            return;
+        }
+        let sch_code = if let Some(code) = session.sch_walsh_code {
+            code
+        } else {
+            let lc_gen = LongCodeGenerator::new_traffic_channel(session.esn);
+            let sch_gain_linear = profile.nominal_gain_linear();
+            match self
+                .controller
+                .allocate_rc3_sch(lc_gen, sch_gain_linear, profile)
+            {
+                Some((code, _ch)) => {
+                    session.sch_walsh_code = Some(code);
+                    info!(
+                        "abis_agent: allocated F-SCH W({})={} rate={} gain={:.3}",
+                        profile.walsh_len, code, profile.rate_bps, sch_gain_linear
+                    );
+                    code
+                }
+                None => {
+                    warn!(
+                        "abis_agent: BurstRequest for CCR {:?} no W({}) code available",
+                        ccr, profile.walsh_len
+                    );
+                    return;
+                }
+            }
+        };
+
+        let mut response_info: ForwardBurstRadioInfo = request_info;
+        response_info.forward_code_channel_index = sch_code as u16;
+        response_info.pilot_pn_code = self.config.pilot_pn;
+        response_info.forward_supplemental_channel_rate = profile.num_bits_idx;
+        let response = BurstResponseMessage {
+            call_connection_reference: Some(ccr),
+            correlation_id: request.correlation_id,
+            committed_cell_identifier_list: request
+                .cell_identifier_list
+                .clone()
+                .or_else(|| Some(vec![self.config.cell_id])),
+            uncommitted_cell_identifier_list: None,
+            forward_burst_radio_info: Some(response_info),
+            reverse_burst_radio_info: None,
+            abis_destination_id: request.abis_destination_id.clone(),
+        };
+        if let Ok(bytes) = response.encode()
+            && let Some(msg) = abis_message_from_typed(&bytes)
+        {
+            info!(
+                "abis_agent: BurstResponse CCR {:?} F-SCH W({})={} rate={}",
+                ccr, profile.walsh_len, sch_code, profile.rate_bps
+            );
+            responses.push(msg);
+        }
+    }
+
+    fn handle_burst_commit(&mut self, message: &AbisMessage) {
+        let Some(commit) = self.decode_typed(message, BurstCommitMessage::decode) else {
+            return;
+        };
+        if let Some(ccr) = commit.call_connection_reference {
+            info!("abis_agent: BurstCommit for CCR {:?}", ccr);
         }
     }
 
@@ -634,8 +789,12 @@ impl AbisAgent {
         }
 
         let walsh_code = session.walsh_code;
+        let sch_walsh_code = session.sch_walsh_code;
         self.controller.deallocate_traffic(walsh_code);
         self.controller.request_rx_removal(walsh_code);
+        if let Some(w32) = sch_walsh_code {
+            self.controller.deallocate_sch(w32);
+        }
 
         let ack = RemoveAckMessage {
             call_connection_reference: ccr,
@@ -649,8 +808,8 @@ impl AbisAgent {
         }
 
         info!(
-            "abis_agent: traffic released for CCR {:?} walsh={}",
-            ccr, walsh_code
+            "abis_agent: traffic released for CCR {:?} walsh={} sch_w32={:?}",
+            ccr, walsh_code, sch_walsh_code
         );
         events.push(AbisAgentEvent::TrafficReleased { ccr, walsh_code });
         self.sessions.remove(&ccr);
@@ -1092,6 +1251,7 @@ mod tests {
         A3ConnectAckInformation, AirInterfaceMessagePayload, CdmaServingOneWayDelay,
         Layer2AckRequestResults, MobileIdentity, ServiceOption,
     };
+    use cdma_common::consts::{SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_SMS};
 
     fn test_config() -> AbisAgentConfig {
         AbisAgentConfig {
@@ -1688,7 +1848,11 @@ mod tests {
         agent.set_paging_state(paging_state.clone());
 
         let ccr = test_ccr();
-        let setup_msg = make_bts_setup_with_so(ccr, 0xDEAD, Some(ServiceOption(33)));
+        let setup_msg = make_bts_setup_with_so(
+            ccr,
+            0xDEAD,
+            Some(ServiceOption(SERVICE_OPTION_HIGH_RATE_PACKET_DATA)),
+        );
         let _ = agent.handle_message(&setup_msg);
         let walsh_code = agent.walsh_code_for(&ccr).unwrap();
 
@@ -1752,7 +1916,11 @@ mod tests {
         let mut agent = AbisAgent::new(test_config(), controller.clone());
 
         let ccr = test_ccr();
-        let setup_msg = make_bts_setup_with_so(ccr, 0xDEAD, Some(ServiceOption(33)));
+        let setup_msg = make_bts_setup_with_so(
+            ccr,
+            0xDEAD,
+            Some(ServiceOption(SERVICE_OPTION_HIGH_RATE_PACKET_DATA)),
+        );
 
         let (responses, _events) = agent.handle_message(&setup_msg);
         assert_eq!(responses.len(), 1);
@@ -1795,7 +1963,8 @@ mod tests {
         let mut agent = AbisAgent::new(test_config(), controller.clone());
 
         let ccr = test_ccr();
-        let setup_msg = make_bts_setup_with_so(ccr, 0xDEAD, Some(ServiceOption(6)));
+        let setup_msg =
+            make_bts_setup_with_so(ccr, 0xDEAD, Some(ServiceOption(SERVICE_OPTION_SMS)));
 
         let (responses, _events) = agent.handle_message(&setup_msg);
         assert_eq!(responses.len(), 1);

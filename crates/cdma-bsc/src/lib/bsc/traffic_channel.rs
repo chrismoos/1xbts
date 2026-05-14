@@ -248,10 +248,14 @@ pub(crate) struct TrafficChannelInfo {
     /// Closed-loop forward power control state, driven by PMRMs from the
     /// mobile. See `ForwardPowerControlState` and `docs/power-control.md`.
     pub(crate) forward_power_control: ForwardPowerControlState,
-    /// F-SCH W(32) Walsh code when supplemental channel is allocated, or None.
+    /// F-SCH Walsh code when supplemental channel is allocated, or None.
     pub(crate) sch_walsh_code: Option<u8>,
     /// F-SCH bearer id when supplemental channel is allocated, or None.
     pub(crate) sch_bearer_id: Option<u32>,
+    /// Forward active-set PILOT_PN values, in 64-chip units.
+    pub(crate) active_set_pns: Vec<u16>,
+    /// ORDQ from an MS Reject of an ESCAM that disabled F-SCH for this call.
+    pub(crate) fsch_ms_reject_ordq: Option<u8>,
 }
 
 impl TrafficChannelInfo {
@@ -265,6 +269,7 @@ impl TrafficChannelInfo {
         origination_service_option: Option<u16>,
         service_ref_id: u8,
         service_negotiation_mode: ServiceNegotiationMode,
+        active_set_pns: Vec<u16>,
         voice_session_id: Option<Uuid>,
         voice_leg_role: Option<VoiceLegRole>,
         a1_call_id: Option<u64>,
@@ -314,9 +319,23 @@ impl TrafficChannelInfo {
             } else {
                 RC1_TRAFFIC_INITIAL_GAIN_LINEAR
             }),
-            sch_walsh_code: None,
-            sch_bearer_id: None,
+            // Usually None at traffic setup; rate-specific F-SCH allocation is
+            // recorded later after the Abis Burst request succeeds.
+            sch_walsh_code: handle.sch_walsh_code,
+            sch_bearer_id: handle.sch_walsh_code.map(|w| w as u32),
+            active_set_pns,
+            fsch_ms_reject_ordq: None,
         }
+    }
+
+    pub(crate) fn fsch_allowed(&self) -> bool {
+        self.fsch_ms_reject_ordq.is_none()
+    }
+
+    pub(crate) fn disable_fsch_after_ms_reject(&mut self, ordq: u8) {
+        self.sch_walsh_code = None;
+        self.sch_bearer_id = None;
+        self.fsch_ms_reject_ordq = Some(ordq);
     }
 
     /// Reset the reverse ARQ duplicate-detection state for this traffic channel

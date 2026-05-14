@@ -212,9 +212,12 @@ fn fixed_service_option_ie_rejects_truncated_payload() {
 #[test]
 fn fixed_service_option_ie_encodes_without_length_octet() {
     let mut encoded = Vec::new();
-    InformationElement::new(ElementId::ServiceOption, ServiceOption(0x0021).encode())
-        .encode(&mut encoded)
-        .unwrap();
+    InformationElement::new(
+        ElementId::ServiceOption,
+        ServiceOption::HIGH_RATE_PACKET_DATA.encode(),
+    )
+    .encode(&mut encoded)
+    .unwrap();
     assert_eq!(encoded, vec![ElementId::ServiceOption.value(), 0x00, 0x21]);
 }
 

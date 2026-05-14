@@ -167,7 +167,7 @@ fn assignment_request_roundtrip() {
                 },
             ],
         }),
-        service_option: Some(ServiceOption(0x0021)),
+        service_option: Some(ServiceOption::HIGH_RATE_PACKET_DATA),
         signals: vec![
             Signal {
                 signal_value: 0x10,
@@ -481,7 +481,7 @@ fn bs_service_request_roundtrip() {
     let message = BsServiceRequestMessage {
         mobile_identity_imsi: MobileIdentity::Imsi("12345678901".to_string()),
         mobile_identity_esn: Some(MobileIdentity::Esn(0x11223344)),
-        service_option: Some(ServiceOption(0x0021)),
+        service_option: Some(ServiceOption::HIGH_RATE_PACKET_DATA),
         tag: Some(Tag(0x01020304)),
     };
     let encoded = message.encode().unwrap();
@@ -564,7 +564,7 @@ fn handoff_required_roundtrip() {
                 cdma_target_one_way_delay: 0x1234,
             }],
         }),
-        service_option: Some(ServiceOption(0x0021)),
+        service_option: Some(ServiceOption::HIGH_RATE_PACKET_DATA),
         cdma_serving_one_way_delay: Some(HandoffCdmaServingOneWayDelay {
             cell: HandoffCellIdentifier::Cell(cell_id()),
             delay_100ns: 0x0123,
@@ -610,7 +610,7 @@ fn handoff_request_roundtrip() {
         mobile_identity_imsi: MobileIdentity::Imsi("12345678901".to_string()),
         mobile_identity_esn: Some(MobileIdentity::Esn(0x11223344)),
         downlink_radio_environment: None,
-        service_option: Some(ServiceOption(0x0021)),
+        service_option: Some(ServiceOption::HIGH_RATE_PACKET_DATA),
         cdma_serving_one_way_delay: None,
         is95_ms_measured_channel_identity: Some(Is95MsMeasuredChannelIdentity {
             band_class: 1,
@@ -1085,7 +1085,7 @@ fn cm_service_request_roundtrip() {
         authentication_challenge_parameter: Some(AuthenticationChallengeParameter([
             0x10, 0x01, 0x02, 0x03, 0x04,
         ])),
-        service_option: Some(ServiceOption(0x0021)),
+        service_option: Some(ServiceOption::HIGH_RATE_PACKET_DATA),
         voice_privacy_request: true,
         radio_environment_and_resources: Some(RadioEnvironmentAndResources {
             include_priority: false,
@@ -1136,7 +1136,7 @@ fn paging_response_roundtrip() {
         authentication_challenge_parameter: Some(AuthenticationChallengeParameter([
             0x10, 0x01, 0x02, 0x03, 0x04,
         ])),
-        service_option: Some(ServiceOption(0x0021)),
+        service_option: Some(ServiceOption::HIGH_RATE_PACKET_DATA),
         voice_privacy_request: true,
         circuit_identity_code: Some(CircuitIdentityCode {
             pcm_multiplexer: 0x0123,

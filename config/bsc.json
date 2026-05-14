@@ -6,7 +6,9 @@
       { "for_rc": 3, "rev_rc": 3 }
     ],
     "idle_timeout_s": 30,
-    "ms_ack_timeout_ms": 5000
+    "ms_ack_timeout_ms": 5000,
+    "enable_f_sch": true,
+    "f_sch_rate_bps": 153600
   },
   "traffic_retry": {
     "ack_timeout_ms": 3000,

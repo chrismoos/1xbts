@@ -7,9 +7,10 @@ use cdma_common::lac::{
     MessageControlStatusBlock,
     message_types::MessageId,
     paging_messages::{
-        AlertWithInformationMessage, ForwardDataBurstMessage, MsAddress, NonNegServiceConfig,
-        OrderMessage, ServiceConnectCallAssignment, ServiceConnectConnectionRecord,
-        ServiceConnectParams, ServiceRequestConfig, ServiceRequestParams,
+        AlertWithInformationMessage, EscamParams, ForSchConfig, ForwardDataBurstMessage, MsAddress,
+        NonNegServiceConfig, OrderMessage, ServiceConnectCallAssignment,
+        ServiceConnectConnectionRecord, ServiceConnectParams, ServiceRequestConfig,
+        ServiceRequestParams,
     },
 };
 use cdma_common::mac::ChannelType;
@@ -19,12 +20,21 @@ use uuid::Uuid;
 
 use crate::abis_edge::ForwardBearerQueue;
 use crate::addressing::{format_ms_address, is_packet_data_so};
+use cdma_common::sch::Rc3FschProfile;
 
 use super::traffic_bearer::send_forward_fch_bits_with_bearer_client;
 use super::{
     Bsc, MsState, VOICE_REPLACEMENT_CON_REF, VOICE_TRAFFIC_CON_REF, VOICE_TRAFFIC_SR_ID,
     VoiceLegRole,
 };
+
+const FSCH_ESCAM_START_DELAY_FRAMES: u64 = 12;
+
+pub(crate) fn fsch_escam_start_time_mod32() -> u8 {
+    let start = cdma_common::time::system_time_now()
+        + chrono::Duration::milliseconds((FSCH_ESCAM_START_DELAY_FRAMES * 20) as i64);
+    (cdma_common::time::system_time_20ms_frames(start) % 32) as u8
+}
 
 /// Result of `send_forward_signaling_paging_or_traffic`.
 pub(crate) enum ForwardSignalingRoute {
@@ -185,6 +195,130 @@ impl Bsc {
         Ok(ForwardSignalingRoute::SentOnTraffic { msg_seq })
     }
 
+    /// Decide whether to negotiate F-SCH for an SO33 packet-data call.
+    ///
+    /// Uses an implicit gate: enabled config, SO33, RC3, MOB_P_REV >= 6, and
+    /// RC3 mobile capability. Returns `None` for FCH-only Service Connect.
+    pub(crate) fn fsch_for_service_connect(&self, walsh_code: u8) -> Option<ForSchConfig> {
+        let tc = self.mobiles.get_traffic_channel(walsh_code)?;
+        let ms = self.mobiles.get_by_walsh(walsh_code)?;
+        if !crate::addressing::ms_eligible_for_fsch_phase1(
+            self.config.traffic_assignment.enable_f_sch,
+            tc.service_option,
+            tc.for_rc,
+            ms.mob_p_rev,
+            ms.for_preferred_rc,
+            &ms.for_supported_rcs,
+        ) {
+            return None;
+        }
+        let profile = Rc3FschProfile::from_rate_bps(self.config.traffic_assignment.f_sch_rate_bps)
+            .unwrap_or_else(Rc3FschProfile::default_19k2);
+        Some(ForSchConfig {
+            sch_id: 0,
+            mux_option: profile.mux_option,
+            rc: 3,
+            coding: 0, // Convolutional.
+            rate: profile.num_bits_idx,
+        })
+    }
+
+    /// Send ESCAM on F-FCH to activate the configured F-SCH profile.
+    pub(crate) fn send_escam_for_fsch(
+        &mut self,
+        walsh_code: u8,
+        sch_code: u8,
+        profile: Rc3FschProfile,
+    ) -> Result<(), Error> {
+        let for_sch_start_time = fsch_escam_start_time_mod32();
+        let params = EscamParams {
+            start_time_unit: 0,
+            for_sch_id: 0,
+            sccl_index: 0,
+            for_sch_num_bits_idx: profile.num_bits_idx,
+            pilot_pn: self.config.pilot_offset as u16, // PN offset index, already in 64-chip units.
+            code_chan_sch: sch_code as u16,
+            qof_mask_id_sch: 0,
+            for_sch_duration: 0x0F, // 0xF = infinite (until next ESCAM).
+            for_sch_start_time_incl: true,
+            for_sch_start_time,
+            // Service Connect already carries baseline forward power-control
+            // config. Keep ESCAM to the SCH assignment fields so handsets do
+            // not reject optional SCH FPC values while enabling higher rates.
+            fpc_incl: false,
+            fpc_mode_sch: 0,
+            fpc_sch_init_setpt_op: 0,
+            fpc_sch_fer: 0b00010,     // 1% target FER.
+            fpc_sch_init_setpt: 0x30, // 6.0 dB.
+            fpc_sch_min_setpt: 0x00,
+            fpc_sch_max_setpt: 0x50, // 10.0 dB.
+        };
+        let sdu = params.to_ftch_sdu();
+        let ack_seq = self
+            .mobiles
+            .get_traffic_channel(walsh_code)
+            .map(|tc| tc.forward_msg_seq_ack & 0x07)
+            .unwrap_or(0);
+        self.send_traffic_signaling(
+            walsh_code,
+            sdu,
+            MessageId::ExtendedSupplementalChannelAssignment,
+            ack_seq,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Send an ESCAM that releases the active F-SCH assignment.
+    pub(crate) fn send_escam_release_for_fsch(
+        &mut self,
+        walsh_code: u8,
+        sch_code: u8,
+        profile: Rc3FschProfile,
+    ) -> Result<(), Error> {
+        let params = EscamParams {
+            start_time_unit: 0,
+            for_sch_id: 0,
+            sccl_index: 0,
+            for_sch_num_bits_idx: profile.num_bits_idx,
+            pilot_pn: self.config.pilot_offset as u16,
+            code_chan_sch: sch_code as u16,
+            qof_mask_id_sch: 0,
+            for_sch_duration: 0,
+            for_sch_start_time_incl: false,
+            for_sch_start_time: 0,
+            fpc_incl: false,
+            fpc_mode_sch: 0,
+            fpc_sch_init_setpt_op: 0,
+            fpc_sch_fer: 0b00010,
+            fpc_sch_init_setpt: 0x30,
+            fpc_sch_min_setpt: 0x00,
+            fpc_sch_max_setpt: 0x50,
+        };
+        let sdu = params.to_ftch_sdu();
+        let ack_seq = self
+            .mobiles
+            .get_traffic_channel(walsh_code)
+            .map(|tc| tc.forward_msg_seq_ack & 0x07)
+            .unwrap_or(0);
+        self.send_traffic_signaling(
+            walsh_code,
+            sdu,
+            MessageId::ExtendedSupplementalChannelAssignment,
+            ack_seq,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
     /// Send a Service Connect Message on the forward traffic channel.
     ///
     /// Negotiates the service option (SO6 for SMS) with the mobile.
@@ -221,6 +355,17 @@ impl Bsc {
 
         let mux_option: u16 = 0x0001;
 
+        let for_sch_config = self.fsch_for_service_connect(walsh_code);
+        let non_neg = Some(if for_rc >= 3 {
+            if for_sch_config.is_some() {
+                NonNegServiceConfig::rc3_fsch_default()
+            } else {
+                NonNegServiceConfig::rc3_default()
+            }
+        } else {
+            NonNegServiceConfig::rc1_default()
+        });
+
         let params = ServiceConnectParams {
             serv_con_seq,
             use_old_serv_config: 0,
@@ -235,12 +380,8 @@ impl Bsc {
             rev_fch_rc: rev_rc,
             call_assignments,
             use_type0_plcm: false,
-            non_neg: Some(if for_rc >= 3 {
-                NonNegServiceConfig::rc3_default()
-            } else {
-                NonNegServiceConfig::rc1_default()
-            }),
-            for_sch_config: None,
+            non_neg,
+            for_sch_config,
         };
 
         let sdu = params.to_ftch_sdu();

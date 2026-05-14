@@ -62,7 +62,7 @@ fn test_msc_client() -> Arc<dyn cdma_bsc::a1_edge::MscClient> {
     let (client, _) = cdma_bsc::a1_edge::InProcessMscClient::pair(32);
     Arc::new(client)
 }
-use cdma_common::{bits::Bitstream, error::Error, time};
+use cdma_common::{bits::Bitstream, consts::SERVICE_OPTION_SMS, error::Error, time};
 use chrono::Duration as ChronoDuration;
 use chrono::Utc;
 use env_logger::Env;
@@ -5939,7 +5939,7 @@ fn synthetic_origination_event(
         traffic_voice_bits: None,
         traffic_voice_rate_bps: None,
         order_code: None,
-        service_option: Some(6),
+        service_option: Some(SERVICE_OPTION_SMS),
         for_rc_pref: None,
         rev_rc_pref: None,
         rev_fch_gating_req: None,

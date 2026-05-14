@@ -10,22 +10,26 @@ use tokio::sync::mpsc;
 use crate::ip_transport::IpTransport;
 
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(3);
+const IPV4_MIN_HEADER_LEN: usize = 20;
 
 pub struct FouTcpTunnel {
     writer: Arc<Mutex<Option<TcpStream>>>,
     pub remote_addr: SocketAddr,
     routes: Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<Vec<u8>>>>>,
+    tx_stats: Arc<Mutex<FouTcpStats>>,
 }
 
 impl FouTcpTunnel {
     pub fn new(remote_addr: SocketAddr) -> Arc<Self> {
         let routes = Arc::new(Mutex::new(HashMap::new()));
         let writer: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
+        let tx_stats = Arc::new(Mutex::new(FouTcpStats::new()));
 
         let tunnel = Arc::new(Self {
             writer: writer.clone(),
             remote_addr,
             routes: routes.clone(),
+            tx_stats,
         });
 
         thread::Builder::new()
@@ -67,9 +71,68 @@ impl FouTcpTunnel {
         })?;
         if let Err(e) = stream.write_all(&frame).and_then(|_| stream.flush()) {
             *guard = None;
+            self.tx_stats.lock().unwrap().record_error();
             return Err(e);
         }
+        self.tx_stats.lock().unwrap().record_packet(ip_packet.len());
         Ok(())
+    }
+}
+
+struct FouTcpStats {
+    window_started: Instant,
+    packets: u64,
+    bytes: u64,
+    max_packet_len: usize,
+    errors: u64,
+}
+
+impl FouTcpStats {
+    fn new() -> Self {
+        Self {
+            window_started: Instant::now(),
+            packets: 0,
+            bytes: 0,
+            max_packet_len: 0,
+            errors: 0,
+        }
+    }
+
+    fn record_packet(&mut self, packet_len: usize) {
+        self.packets = self.packets.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(packet_len as u64);
+        self.max_packet_len = self.max_packet_len.max(packet_len);
+        self.maybe_log("tx");
+    }
+
+    fn record_error(&mut self) {
+        self.errors = self.errors.saturating_add(1);
+        self.maybe_log("tx");
+    }
+
+    fn maybe_log(&mut self, direction: &str) {
+        if self.window_started.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        let avg_len = if self.packets == 0 {
+            0
+        } else {
+            self.bytes / self.packets
+        };
+        log::debug!(
+            "FOU TCP {} health: pkts={} bytes={} avg_len={} max_len={} errors={}",
+            direction,
+            self.packets,
+            self.bytes,
+            avg_len,
+            self.max_packet_len,
+            self.errors
+        );
+        self.window_started = Instant::now();
+        self.packets = 0;
+        self.bytes = 0;
+        self.max_packet_len = 0;
+        self.errors = 0;
     }
 }
 
@@ -122,6 +185,7 @@ fn run_reader(
     let mut window_started = Instant::now();
     let mut rx_packets = 0u64;
     let mut rx_bytes = 0u64;
+    let mut max_packet_len = 0usize;
     let mut routed_packets = 0u64;
     let mut no_route_drops = 0u64;
     let mut channel_drops = 0u64;
@@ -130,9 +194,13 @@ fn run_reader(
         let mut len_buf = [0u8; 2];
         reader.read_exact(&mut len_buf)?;
         let packet_len = u16::from_be_bytes(len_buf) as usize;
-        if packet_len < 20 {
+        if packet_len < IPV4_MIN_HEADER_LEN {
             let mut discard = vec![0u8; packet_len];
             reader.read_exact(&mut discard)?;
+            log::warn!(
+                "FOU TCP dispatcher: dropping short framed packet len={}",
+                packet_len
+            );
             continue;
         }
 
@@ -141,6 +209,7 @@ fn run_reader(
 
         rx_packets = rx_packets.saturating_add(1);
         rx_bytes = rx_bytes.saturating_add(packet_len as u64);
+        max_packet_len = max_packet_len.max(packet_len);
 
         let dst_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
         let routes = routes.lock().unwrap();
@@ -155,16 +224,24 @@ fn run_reader(
         }
 
         if window_started.elapsed() >= Duration::from_secs(5) {
+            let avg_len = if rx_packets == 0 {
+                0
+            } else {
+                rx_bytes / rx_packets
+            };
             log::debug!(
-                "FOU TCP dispatcher health: rx_pkts={} rx_bytes={} routed={} no_route_drops={} channel_drops={}",
+                "FOU TCP rx health: pkts={} bytes={} avg_len={} max_len={} routed={} no_route_drops={} channel_drops={}",
                 rx_packets,
                 rx_bytes,
+                avg_len,
+                max_packet_len,
                 routed_packets,
                 no_route_drops,
                 channel_drops
             );
             rx_packets = 0;
             rx_bytes = 0;
+            max_packet_len = 0;
             routed_packets = 0;
             no_route_drops = 0;
             channel_drops = 0;

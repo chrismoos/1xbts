@@ -76,14 +76,15 @@ impl Bsc {
         }
 
         let bts_client = self.config.bts_client.clone();
-        if let Some(sch_w32) = tc.sch_walsh_code.take() {
-            if let Some(ref bts_client) = bts_client {
-                bts_client.deallocate_sch(sch_w32).await;
-                info!(
-                    "BSC: released F-SCH W(32) code {} for walsh={}",
-                    sch_w32, walsh_code
-                );
-            }
+        // F-SCH lives on the same BTS-side session as the FCH and is released
+        // by the BTS when it processes `Remove` for the FCH CCR. We just drop
+        // the local reference; no separate deallocate exchange is needed here.
+        let sch_code = tc.sch_walsh_code.take();
+        if let Some(sch_code) = sch_code {
+            info!(
+                "BSC: F-SCH code {} will be released alongside walsh={} by BtsRelease",
+                sch_code, walsh_code
+            );
         }
 
         if let Some(ref bts_client) = bts_client {

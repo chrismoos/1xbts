@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -8,7 +8,7 @@ use crate::engine::{
     PacketSession, PacketSessionTelemetry, PacketTraceEvent, SessionAction, SessionPhase,
     bytes_to_hex, format_tcp_flags, now_ms,
 };
-use crate::ip_allocator::IpAllocator;
+use crate::ip_allocator::{IpAllocator, IpClaimResult};
 use crate::ip_transport::IpTransport;
 use crate::ppp::ipcp::IpcpConfig;
 
@@ -45,6 +45,9 @@ pub struct SessionStatus {
     pub rlp_state: String,
     pub lcp_state: String,
     pub ipcp_state: String,
+    pub lcp_configure_restarts: u32,
+    pub ipcp_configure_restarts: u32,
+    pub ipcp_omitted_peer_ip_naks: u32,
     pub capture_enabled: bool,
     pub last_rx_control: String,
     pub last_tx_control: String,
@@ -81,6 +84,9 @@ impl SessionStatus {
             rlp_state: "sync".into(),
             lcp_state: "closed".into(),
             ipcp_state: "closed".into(),
+            lcp_configure_restarts: 0,
+            ipcp_configure_restarts: 0,
+            ipcp_omitted_peer_ip_naks: 0,
             capture_enabled: false,
             last_rx_control: String::new(),
             last_tx_control: String::new(),
@@ -144,6 +150,9 @@ impl SessionStatus {
         self.rlp_state = telemetry.rlp_state;
         self.lcp_state = telemetry.lcp_state;
         self.ipcp_state = telemetry.ipcp_state;
+        self.lcp_configure_restarts = telemetry.lcp_configure_restarts;
+        self.ipcp_configure_restarts = telemetry.ipcp_configure_restarts;
+        self.ipcp_omitted_peer_ip_naks = telemetry.ipcp_omitted_peer_ip_naks;
         self.last_rx_control = telemetry.last_rx_control;
         self.last_tx_control = telemetry.last_tx_control;
         self.last_rx_control_repeats = telemetry.last_rx_control_repeats;
@@ -175,6 +184,35 @@ struct PacketPathStats {
     pending_uplinks_at_last_report: usize,
 }
 
+#[derive(Debug, Default)]
+struct TcpLogState {
+    logged_packets: u64,
+    uplink_syn: u64,
+    downlink_syn_ack: u64,
+    uplink_ack_after_syn_ack: u64,
+    uplink_payload: u64,
+    downlink_payload: u64,
+    pending_syns: HashMap<TcpFlowKey, u32>,
+    pending_syn_acks: HashMap<TcpFlowKey, TcpSynAckState>,
+    handshake_logged: bool,
+    data_exchange_logged: bool,
+    window_uplink_syn: u64,
+    window_uplink_syn_retx: u64,
+    window_downlink_syn_ack: u64,
+    window_downlink_syn_ack_retx: u64,
+    window_uplink_payload_packets: u64,
+    window_downlink_payload_packets: u64,
+    window_uplink_payload_bytes: u64,
+    window_downlink_payload_bytes: u64,
+    window_downlink_payload_retx_packets: u64,
+    window_downlink_payload_retx_bytes: u64,
+    window_uplink_payload_retx_packets: u64,
+    window_uplink_payload_retx_bytes: u64,
+    window_downlink_acked_bytes: u64,
+    window_uplink_acked_bytes: u64,
+    flow_progress: HashMap<TcpFlowKey, TcpFlowProgress>,
+}
+
 impl PacketPathStats {
     fn record_downlink_frame(&mut self, rate_bps: u32, bits: u32) {
         self.downlink_rlp_frames = self.downlink_rlp_frames.saturating_add(1);
@@ -204,10 +242,35 @@ impl PacketPathStats {
     }
 }
 
+impl TcpLogState {
+    fn reset_window(&mut self) {
+        self.window_uplink_syn = 0;
+        self.window_uplink_syn_retx = 0;
+        self.window_downlink_syn_ack = 0;
+        self.window_downlink_syn_ack_retx = 0;
+        self.window_uplink_payload_packets = 0;
+        self.window_downlink_payload_packets = 0;
+        self.window_uplink_payload_bytes = 0;
+        self.window_downlink_payload_bytes = 0;
+        self.window_downlink_payload_retx_packets = 0;
+        self.window_downlink_payload_retx_bytes = 0;
+        self.window_uplink_payload_retx_packets = 0;
+        self.window_uplink_payload_retx_bytes = 0;
+        self.window_downlink_acked_bytes = 0;
+        self.window_uplink_acked_bytes = 0;
+    }
+}
+
 /// Run a single packet data session as an async task.
 ///
 /// This owns the PacketSession engine and IP transport lifecycle.
 /// The BSC communicates via the mpsc channels only.
+/// Out-of-band session-control commands sent from BSC to the session task.
+#[derive(Debug, Clone)]
+pub enum SessionControl {
+    SetSchActive { active: bool, rate_bps: u32 },
+}
+
 pub async fn run_session(
     session_id: String,
     service_option: u32,
@@ -216,18 +279,22 @@ pub async fn run_session(
     downlink_tx: mpsc::Sender<SessionFrame>,
     status: Arc<Mutex<SessionStatus>>,
     allocator: Arc<dyn IpAllocator>,
+    mut control_rx: mpsc::Receiver<SessionControl>,
 ) {
-    let ipcp_config = allocator.allocate(&session_id).unwrap_or_else(|| {
+    let allocation_key = session_allocation_key(&session_id, &status);
+    let ipcp_config = allocator.allocate(&allocation_key).unwrap_or_else(|| {
         log::warn!(
-            "packet-service: IP pool exhausted for session {}, falling back to default",
-            session_id
+            "packet-service: IP pool exhausted for session {} key {}, falling back to default",
+            session_id,
+            allocation_key
         );
         IpcpConfig::default()
     });
     log::info!(
-        "packet-service: session {} allocated peer_ip={}",
+        "packet-service: session {} allocated peer_ip={} key={}",
         session_id,
-        ipcp_config.peer_ip
+        ipcp_config.peer_ip,
+        allocation_key
     );
     let mut session = PacketSession::new(service_option, ipcp_config);
     session.set_log_context(session_id.clone());
@@ -247,6 +314,10 @@ pub async fn run_session(
     // frames in bursts, so we queue them and dequeue one per tick to keep the
     // RLP timing correct (one frame period = one tick).
     let mut pending_uplinks: VecDeque<SessionFrame> = VecDeque::new();
+    let mut first_sch_payload_logged = false;
+    let mut first_uplink_ip_logged = false;
+    let mut first_downlink_ip_logged = false;
+    let mut tcp_log_state = TcpLogState::default();
 
     log::info!(
         "packet-service: session {} started (SO {})",
@@ -256,6 +327,27 @@ pub async fn run_session(
 
     loop {
         tokio::select! {
+            // Out-of-band control commands from BSC.
+            ctl = control_rx.recv() => {
+                match ctl {
+                    Some(SessionControl::SetSchActive { active, rate_bps }) => {
+                        log::info!(
+                            "packet-service: session {} SetSchActive({}, rate={})",
+                            session_id, active, rate_bps
+                        );
+                        session.set_sch_active_with_rate(active, rate_bps);
+                    }
+                    None => {
+                        // Sender dropped. The session keeps running on the
+                        // bearer channels; only the control surface is gone.
+                        log::debug!(
+                            "packet-service: session {} control channel closed",
+                            session_id
+                        );
+                    }
+                }
+            }
+
             // Uplink frame from BSC
             frame = uplink_rx.recv() => {
                 let frame = match frame {
@@ -292,36 +384,74 @@ pub async fn run_session(
                 } else {
                     session.tick(None)
                 };
-                process_actions(
+                if process_actions(
                     &session_id, &mut session, &mut transport, &mut transport_ready,
-                    &to_mobile_tx, &downlink_tx, &status, &mut path_stats, actions,
-                ).await;
+                    &to_mobile_tx, &downlink_tx, &status, &allocator, &allocation_key, &mut path_stats,
+                    &mut first_sch_payload_logged, &mut first_uplink_ip_logged,
+                    &mut tcp_log_state, actions,
+                ).await {
+                    break;
+                }
             }
 
             _ = path_health_interval.tick() => {
                 path_stats.pending_uplinks_at_last_report = pending_uplinks.len();
+                const PATH_HEALTH_WINDOW_SECS: f64 = 5.0;
+                let ul_ip_kbps =
+                    path_stats.uplink_ip_bytes as f64 * 8.0 / PATH_HEALTH_WINDOW_SECS / 1000.0;
+                let dl_ip_kbps =
+                    path_stats.downlink_ip_bytes as f64 * 8.0 / PATH_HEALTH_WINDOW_SECS / 1000.0;
+                let fch_air_kbps =
+                    path_stats.downlink_rlp_bits as f64 / PATH_HEALTH_WINDOW_SECS / 1000.0;
+                let sch_air_kbps =
+                    path_stats.downlink_sch_bits as f64 / PATH_HEALTH_WINDOW_SECS / 1000.0;
+                let telemetry = session.telemetry();
                 log::debug!(
-                    "packet-service: session {} path_health age_ms={} phase={:?} transport_ready={} uplink_ip={} uplink_ip_bytes={} downlink_ip={} downlink_ip_bytes={} downlink_rlp_frames={} downlink_rlp_bits={} rates={{9600:{},4800:{},2700:{},1200:{}}} downlink_sch_frames={} downlink_sch_bits={} pending_uplinks={} max_pending_uplinks={}",
+                    "packet-service: session {} path_health age_ms={} phase={:?} lcp={} ipcp={} ppp_restarts={{lcp:{} ipcp:{} ipcp_omitted_ip_naks:{}}} transport_ready={} uplink_ip={} uplink_ip_bytes={} ul_ip_kbps={:.1} downlink_ip={} downlink_ip_bytes={} dl_ip_kbps={:.1} downlink_rlp_frames={} downlink_rlp_bits={} fch_air_kbps={:.1} rates={{9600:{},4800:{},2700:{},1200:{}}} downlink_sch_frames={} downlink_sch_bits={} sch_air_kbps={:.1} pending_uplinks={} max_pending_uplinks={} tcp={{ul_syn:{} ul_syn_retx:{} dl_syn_ack:{} dl_syn_ack_retx:{} ul_payload_pkts:{} ul_payload_bytes:{} ul_retx_pkts:{} ul_retx_bytes:{} ul_acked_bytes:{} dl_payload_pkts:{} dl_payload_bytes:{} dl_retx_pkts:{} dl_retx_bytes:{} dl_acked_bytes:{}}}",
                     session_id,
                     session_started.elapsed().as_millis(),
                     session.phase(),
+                    telemetry.lcp_state,
+                    telemetry.ipcp_state,
+                    telemetry.lcp_configure_restarts,
+                    telemetry.ipcp_configure_restarts,
+                    telemetry.ipcp_omitted_peer_ip_naks,
                     transport_ready,
                     path_stats.uplink_ip_packets,
                     path_stats.uplink_ip_bytes,
+                    ul_ip_kbps,
                     path_stats.downlink_ip_packets,
                     path_stats.downlink_ip_bytes,
+                    dl_ip_kbps,
                     path_stats.downlink_rlp_frames,
                     path_stats.downlink_rlp_bits,
+                    fch_air_kbps,
                     path_stats.downlink_full_frames,
                     path_stats.downlink_half_frames,
                     path_stats.downlink_quarter_frames,
                     path_stats.downlink_eighth_frames,
                     path_stats.downlink_sch_frames,
                     path_stats.downlink_sch_bits,
+                    sch_air_kbps,
                     pending_uplinks.len(),
-                    path_stats.max_pending_uplinks
+                    path_stats.max_pending_uplinks,
+                    tcp_log_state.window_uplink_syn,
+                    tcp_log_state.window_uplink_syn_retx,
+                    tcp_log_state.window_downlink_syn_ack,
+                    tcp_log_state.window_downlink_syn_ack_retx,
+                    tcp_log_state.window_uplink_payload_packets,
+                    tcp_log_state.window_uplink_payload_bytes,
+                    tcp_log_state.window_uplink_payload_retx_packets,
+                    tcp_log_state.window_uplink_payload_retx_bytes,
+                    tcp_log_state.window_uplink_acked_bytes,
+                    tcp_log_state.window_downlink_payload_packets,
+                    tcp_log_state.window_downlink_payload_bytes,
+                    tcp_log_state.window_downlink_payload_retx_packets,
+                    tcp_log_state.window_downlink_payload_retx_bytes,
+                    tcp_log_state.window_downlink_acked_bytes
                 );
                 path_stats.reset_window();
+                tcp_log_state.reset_window();
             }
 
             // LCP Echo keepalive (every 30s)
@@ -342,6 +472,16 @@ pub async fn run_session(
                 path_stats.downlink_ip_bytes =
                     path_stats.downlink_ip_bytes.saturating_add(ip_data.len() as u64);
                 record_ip_capture(&status, "downlink", &ip_data, "network -> mobile");
+                if !first_downlink_ip_logged {
+                    log::info!(
+                        "packet-service: session {} first downlink IP {}",
+                        session_id,
+                        summarize_ip_packet(&ip_data)
+                    );
+                    first_downlink_ip_logged = true;
+                    session.enable_sch_data_path();
+                }
+                log_tcp_packet(&session_id, "downlink", &ip_data, &mut tcp_log_state);
                 log::debug!(
                     "packet-service: session {} downlink IP {}",
                     session_id,
@@ -358,12 +498,23 @@ pub async fn run_session(
 
     // Cleanup
     transport.teardown();
-    allocator.release(&session_id);
+    allocator.release(&allocation_key);
     {
         let mut s = status.lock().unwrap();
         s.sync_telemetry(SessionPhase::Closed, session.telemetry());
     }
     log::info!("packet-service: session {} ended", session_id);
+}
+
+fn session_allocation_key(session_id: &str, status: &Arc<Mutex<SessionStatus>>) -> String {
+    let s = status.lock().unwrap();
+    if !s.mobile_address.is_empty() {
+        return format!("mobile:{}", s.mobile_address);
+    }
+    if !s.subscriber_id.is_empty() {
+        return format!("subscriber:{}", s.subscriber_id);
+    }
+    format!("session:{}", session_id)
 }
 
 /// Process session actions: send downlink RLP frames, set up IP transport on first IP packet.
@@ -375,11 +526,70 @@ async fn process_actions(
     to_mobile_tx: &mpsc::Sender<Vec<u8>>,
     downlink_tx: &mpsc::Sender<SessionFrame>,
     status: &Arc<Mutex<SessionStatus>>,
+    allocator: &Arc<dyn IpAllocator>,
+    allocation_key: &str,
     path_stats: &mut PacketPathStats,
+    first_sch_payload_logged: &mut bool,
+    first_uplink_ip_logged: &mut bool,
+    tcp_log_state: &mut TcpLogState,
     actions: Vec<SessionAction>,
-) {
+) -> bool {
     for action in actions {
+        let action = match action {
+            SessionAction::ClaimPeerIp {
+                peer_ip,
+                resume_packet,
+            } => match allocator.claim_peer_ip(allocation_key, peer_ip) {
+                IpClaimResult::Claimed(config) | IpClaimResult::AlreadyOwned(config) => {
+                    log::info!(
+                        "packet-service: session {} claimed resumed peer_ip={} key={}",
+                        session_id,
+                        config.peer_ip,
+                        allocation_key
+                    );
+                    session.set_claimed_peer_ip(config.peer_ip);
+                    if let Some(packet) = resume_packet {
+                        session.activate_claimed_peer_ip(config.peer_ip);
+                        SessionAction::DeliverIpPacket(packet)
+                    } else {
+                        continue;
+                    }
+                }
+                IpClaimResult::Conflict { current_owner } => {
+                    log::warn!(
+                        "packet-service: session {} peer_ip={} key={} conflicts with {}, closing",
+                        session_id,
+                        peer_ip,
+                        allocation_key,
+                        current_owner
+                    );
+                    session.close();
+                    return true;
+                }
+                IpClaimResult::OutOfPool => {
+                    log::warn!(
+                        "packet-service: session {} peer_ip={} key={} is outside pool, closing",
+                        session_id,
+                        peer_ip,
+                        allocation_key
+                    );
+                    session.close();
+                    return true;
+                }
+            },
+            other => other,
+        };
+
         match action {
+            SessionAction::CloseSession { reason } => {
+                log::warn!(
+                    "packet-service: session {} closing from engine: {}",
+                    session_id,
+                    reason
+                );
+                session.close();
+                return true;
+            }
             SessionAction::SendFrame { bits, rate_bps } => {
                 let num_bits = bits.len() as u32;
 
@@ -395,7 +605,7 @@ async fn process_actions(
                         "packet-service: session {} downlink channel closed",
                         session_id
                     );
-                    return;
+                    return true;
                 }
                 path_stats.record_downlink_frame(rate_bps, num_bits);
 
@@ -412,6 +622,15 @@ async fn process_actions(
                 // SCH frames are sent to the same downlink channel.
                 // The BSC will route them to the SCH physical channel.
                 let num_bits = bits.len() as u32;
+                if !*first_sch_payload_logged {
+                    log::info!(
+                        "packet-service: session {} first SCH payload frame rate={} bits={}",
+                        session_id,
+                        rate_bps,
+                        num_bits
+                    );
+                    *first_sch_payload_logged = true;
+                }
                 let frame = SessionFrame {
                     session_id: session_id.to_string(),
                     bits,
@@ -423,7 +642,7 @@ async fn process_actions(
                         "packet-service: session {} SCH downlink channel closed",
                         session_id
                     );
-                    return;
+                    return true;
                 }
                 path_stats.record_downlink_sch_frame(num_bits);
             }
@@ -433,6 +652,15 @@ async fn process_actions(
                     .uplink_ip_bytes
                     .saturating_add(ip_data.len() as u64);
                 record_ip_capture(status, "uplink", &ip_data, "mobile -> network");
+                if !*first_uplink_ip_logged {
+                    log::info!(
+                        "packet-service: session {} first uplink IP {}",
+                        session_id,
+                        summarize_ip_packet(&ip_data)
+                    );
+                    *first_uplink_ip_logged = true;
+                }
+                log_tcp_packet(session_id, "uplink", &ip_data, tcp_log_state);
                 // Lazily set up transport
                 if !*transport_ready {
                     let local_ip = session.our_ip();
@@ -477,6 +705,7 @@ async fn process_actions(
                     }
                 }
             }
+            SessionAction::ClaimPeerIp { .. } => unreachable!(),
         }
     }
 
@@ -488,6 +717,7 @@ async fn process_actions(
             s.our_ip = session.our_ip().to_string();
         }
     }
+    false
 }
 
 fn push_ring<T>(ring: &mut VecDeque<T>, item: T, max_len: usize) {
@@ -571,6 +801,361 @@ fn summarize_ip_packet(packet: &[u8]) -> String {
     )
 }
 
+#[derive(Debug)]
+struct TcpPacketInfo {
+    src: String,
+    dst: String,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    ip_total_len: usize,
+    tcp_header_len: usize,
+    payload_len: usize,
+    options: TcpOptionsInfo,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct TcpOptionsInfo {
+    mss: Option<u16>,
+    window_scale: Option<u8>,
+    sack_permitted: bool,
+    timestamp: Option<(u32, u32)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TcpFlowKey {
+    client: String,
+    server: String,
+    client_port: u16,
+    server_port: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TcpSynAckState {
+    client_next_seq: u32,
+    server_next_seq: u32,
+}
+
+#[derive(Debug, Default)]
+struct TcpFlowProgress {
+    highest_downlink_end: Option<u32>,
+    highest_uplink_end: Option<u32>,
+    highest_downlink_ack: Option<u32>,
+    highest_uplink_ack: Option<u32>,
+}
+
+fn log_tcp_packet(session_id: &str, direction: &str, packet: &[u8], state: &mut TcpLogState) {
+    let Some(tcp) = parse_tcp_packet(packet) else {
+        return;
+    };
+    let syn = tcp.flags & 0x02 != 0;
+    let ack_flag = tcp.flags & 0x10 != 0;
+    match direction {
+        "uplink" => {
+            let key = tcp.uplink_flow_key();
+            let progress = state.flow_progress.entry(key.clone()).or_default();
+            if ack_flag {
+                let acked = tcp_ack_delta(&mut progress.highest_downlink_ack, tcp.ack);
+                state.window_downlink_acked_bytes =
+                    state.window_downlink_acked_bytes.saturating_add(acked);
+            }
+            if syn && !ack_flag {
+                state.uplink_syn = state.uplink_syn.saturating_add(1);
+                state.window_uplink_syn = state.window_uplink_syn.saturating_add(1);
+                let client_next_seq = tcp.seq.wrapping_add(1);
+                if state.pending_syns.get(&key) == Some(&client_next_seq) {
+                    state.window_uplink_syn_retx = state.window_uplink_syn_retx.saturating_add(1);
+                }
+                state.pending_syns.insert(key, client_next_seq);
+            } else if ack_flag && !syn && state.downlink_syn_ack > 0 {
+                let key = tcp.uplink_flow_key();
+                if let Some(syn_ack) = state.pending_syn_acks.remove(&key)
+                    && tcp.seq == syn_ack.client_next_seq
+                    && tcp.ack == syn_ack.server_next_seq
+                {
+                    state.uplink_ack_after_syn_ack =
+                        state.uplink_ack_after_syn_ack.saturating_add(1);
+                    if !state.handshake_logged {
+                        log::info!(
+                            "packet-service: session {} TCP handshake observed {}:{} -> {}:{} client_next_seq={} server_next_seq={}",
+                            session_id,
+                            key.client,
+                            key.client_port,
+                            key.server,
+                            key.server_port,
+                            syn_ack.client_next_seq,
+                            syn_ack.server_next_seq
+                        );
+                        state.handshake_logged = true;
+                    }
+                }
+            }
+            if tcp.payload_len > 0 {
+                let end_seq = tcp.seq.wrapping_add(tcp.payload_len as u32);
+                if tcp_range_retransmitted(&mut progress.highest_uplink_end, end_seq) {
+                    state.window_uplink_payload_retx_packets =
+                        state.window_uplink_payload_retx_packets.saturating_add(1);
+                    state.window_uplink_payload_retx_bytes = state
+                        .window_uplink_payload_retx_bytes
+                        .saturating_add(tcp.payload_len as u64);
+                }
+                state.uplink_payload = state.uplink_payload.saturating_add(1);
+                state.window_uplink_payload_packets =
+                    state.window_uplink_payload_packets.saturating_add(1);
+                state.window_uplink_payload_bytes = state
+                    .window_uplink_payload_bytes
+                    .saturating_add(tcp.payload_len as u64);
+            }
+        }
+        "downlink" => {
+            let key = tcp.downlink_flow_key();
+            let progress = state.flow_progress.entry(key.clone()).or_default();
+            if ack_flag {
+                let acked = tcp_ack_delta(&mut progress.highest_uplink_ack, tcp.ack);
+                state.window_uplink_acked_bytes =
+                    state.window_uplink_acked_bytes.saturating_add(acked);
+            }
+            if syn && ack_flag {
+                if let Some(client_next_seq) = state.pending_syns.remove(&key)
+                    && tcp.ack == client_next_seq
+                {
+                    state.downlink_syn_ack = state.downlink_syn_ack.saturating_add(1);
+                    state.window_downlink_syn_ack = state.window_downlink_syn_ack.saturating_add(1);
+                    state.pending_syn_acks.insert(
+                        key,
+                        TcpSynAckState {
+                            client_next_seq,
+                            server_next_seq: tcp.seq.wrapping_add(1),
+                        },
+                    );
+                } else if let Some(syn_ack) = state.pending_syn_acks.get(&key)
+                    && syn_ack.client_next_seq == tcp.ack
+                    && syn_ack.server_next_seq == tcp.seq.wrapping_add(1)
+                {
+                    state.window_downlink_syn_ack_retx =
+                        state.window_downlink_syn_ack_retx.saturating_add(1);
+                }
+            }
+            if tcp.payload_len > 0 {
+                let end_seq = tcp.seq.wrapping_add(tcp.payload_len as u32);
+                if tcp_range_retransmitted(&mut progress.highest_downlink_end, end_seq) {
+                    state.window_downlink_payload_retx_packets =
+                        state.window_downlink_payload_retx_packets.saturating_add(1);
+                    state.window_downlink_payload_retx_bytes = state
+                        .window_downlink_payload_retx_bytes
+                        .saturating_add(tcp.payload_len as u64);
+                }
+                state.downlink_payload = state.downlink_payload.saturating_add(1);
+                state.window_downlink_payload_packets =
+                    state.window_downlink_payload_packets.saturating_add(1);
+                state.window_downlink_payload_bytes = state
+                    .window_downlink_payload_bytes
+                    .saturating_add(tcp.payload_len as u64);
+            }
+        }
+        _ => {}
+    }
+
+    if state.logged_packets < 40 || tcp.payload_len > 0 || syn {
+        let tcp_options = if syn {
+            let summary = tcp.options.summary();
+            if summary.is_empty() {
+                String::new()
+            } else {
+                format!(" opts=[{}]", summary)
+            }
+        } else {
+            String::new()
+        };
+        log::debug!(
+            "packet-service: session {} TCP {} {}:{} -> {}:{} flags={} seq={} ack={} win={} ip_len={} tcp_hlen={} payload={}{}",
+            session_id,
+            direction,
+            tcp.src,
+            tcp.src_port,
+            tcp.dst,
+            tcp.dst_port,
+            format_tcp_flags(tcp.flags),
+            tcp.seq,
+            tcp.ack,
+            tcp.window,
+            tcp.ip_total_len,
+            tcp.tcp_header_len,
+            tcp.payload_len,
+            tcp_options
+        );
+        state.logged_packets = state.logged_packets.saturating_add(1);
+    }
+
+    if !state.data_exchange_logged && state.uplink_payload > 0 && state.downlink_payload > 0 {
+        log::info!(
+            "packet-service: session {} TCP data exchanged uplink_payload_packets={} downlink_payload_packets={}",
+            session_id,
+            state.uplink_payload,
+            state.downlink_payload
+        );
+        state.data_exchange_logged = true;
+    }
+}
+
+fn tcp_range_retransmitted(highest_end: &mut Option<u32>, end_seq: u32) -> bool {
+    match *highest_end {
+        Some(prev) if !tcp_seq_after(end_seq, prev) => true,
+        Some(_) | None => {
+            *highest_end = Some(end_seq);
+            false
+        }
+    }
+}
+
+fn tcp_ack_delta(highest_ack: &mut Option<u32>, ack: u32) -> u64 {
+    match *highest_ack {
+        Some(prev) if tcp_seq_after(ack, prev) => {
+            *highest_ack = Some(ack);
+            ack.wrapping_sub(prev) as u64
+        }
+        Some(_) => 0,
+        None => {
+            *highest_ack = Some(ack);
+            0
+        }
+    }
+}
+
+fn tcp_seq_after(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) > 0
+}
+
+impl TcpPacketInfo {
+    fn uplink_flow_key(&self) -> TcpFlowKey {
+        TcpFlowKey {
+            client: self.src.clone(),
+            server: self.dst.clone(),
+            client_port: self.src_port,
+            server_port: self.dst_port,
+        }
+    }
+
+    fn downlink_flow_key(&self) -> TcpFlowKey {
+        TcpFlowKey {
+            client: self.dst.clone(),
+            server: self.src.clone(),
+            client_port: self.dst_port,
+            server_port: self.src_port,
+        }
+    }
+}
+
+fn parse_tcp_packet(packet: &[u8]) -> Option<TcpPacketInfo> {
+    if packet.len() < 40 || packet[0] >> 4 != 4 || packet[9] != 6 {
+        return None;
+    }
+    let ihl_bytes = usize::from(packet[0] & 0x0f) * 4;
+    if ihl_bytes < 20 || packet.len() < ihl_bytes + 20 {
+        return None;
+    }
+    let total_len = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+    let data_offset = usize::from(packet[ihl_bytes + 12] >> 4) * 4;
+    let header_len = ihl_bytes + data_offset;
+    if data_offset < 20 || packet.len() < header_len || total_len < header_len {
+        return None;
+    }
+    let total_len = total_len.min(packet.len());
+    Some(TcpPacketInfo {
+        src: format!(
+            "{}.{}.{}.{}",
+            packet[12], packet[13], packet[14], packet[15]
+        ),
+        dst: format!(
+            "{}.{}.{}.{}",
+            packet[16], packet[17], packet[18], packet[19]
+        ),
+        src_port: u16::from_be_bytes([packet[ihl_bytes], packet[ihl_bytes + 1]]),
+        dst_port: u16::from_be_bytes([packet[ihl_bytes + 2], packet[ihl_bytes + 3]]),
+        seq: u32::from_be_bytes([
+            packet[ihl_bytes + 4],
+            packet[ihl_bytes + 5],
+            packet[ihl_bytes + 6],
+            packet[ihl_bytes + 7],
+        ]),
+        ack: u32::from_be_bytes([
+            packet[ihl_bytes + 8],
+            packet[ihl_bytes + 9],
+            packet[ihl_bytes + 10],
+            packet[ihl_bytes + 11],
+        ]),
+        flags: packet[ihl_bytes + 13],
+        window: u16::from_be_bytes([packet[ihl_bytes + 14], packet[ihl_bytes + 15]]),
+        ip_total_len: total_len,
+        tcp_header_len: data_offset,
+        payload_len: total_len.saturating_sub(ihl_bytes.saturating_add(data_offset)),
+        options: parse_tcp_options(&packet[ihl_bytes + 20..ihl_bytes + data_offset]),
+    })
+}
+
+impl TcpOptionsInfo {
+    fn summary(&self) -> String {
+        let mut fields = Vec::new();
+        if let Some(mss) = self.mss {
+            fields.push(format!("mss={}", mss));
+        }
+        if let Some(window_scale) = self.window_scale {
+            fields.push(format!("wscale={}", window_scale));
+        }
+        if self.sack_permitted {
+            fields.push("sack=ok".to_string());
+        }
+        if let Some((ts_val, ts_ecr)) = self.timestamp {
+            fields.push(format!("ts={}:{}", ts_val, ts_ecr));
+        }
+        fields.join(" ")
+    }
+}
+
+fn parse_tcp_options(options: &[u8]) -> TcpOptionsInfo {
+    let mut parsed = TcpOptionsInfo::default();
+    let mut pos = 0usize;
+    while pos < options.len() {
+        match options[pos] {
+            0 => break,    // End of option list.
+            1 => pos += 1, // NOP.
+            kind => {
+                if pos + 1 >= options.len() {
+                    break;
+                }
+                let len = usize::from(options[pos + 1]);
+                if len < 2 || pos + len > options.len() {
+                    break;
+                }
+                let data = &options[pos + 2..pos + len];
+                match kind {
+                    2 if data.len() == 2 => {
+                        parsed.mss = Some(u16::from_be_bytes([data[0], data[1]]));
+                    }
+                    3 if data.len() == 1 => {
+                        parsed.window_scale = Some(data[0]);
+                    }
+                    4 if data.is_empty() => {
+                        parsed.sack_permitted = true;
+                    }
+                    8 if data.len() == 8 => {
+                        parsed.timestamp = Some((
+                            u32::from_be_bytes([data[0], data[1], data[2], data[3]]),
+                            u32::from_be_bytes([data[4], data[5], data[6], data[7]]),
+                        ));
+                    }
+                    _ => {}
+                }
+                pos += len;
+            }
+        }
+    }
+    parsed
+}
+
 fn summarize_udp_packet(
     packet: &[u8],
     ihl_bytes: usize,
@@ -617,8 +1202,20 @@ fn summarize_tcp_packet(
     let data_offset = usize::from(packet[ihl_bytes + 12] >> 4) * 4;
     let payload_len = usize::from(total_len).saturating_sub(ihl_bytes.saturating_add(data_offset));
     let flags = packet[ihl_bytes + 13];
+    let window = u16::from_be_bytes([packet[ihl_bytes + 14], packet[ihl_bytes + 15]]);
+    let options = if flags & 0x02 != 0 {
+        let parsed = parse_tcp_options(&packet[ihl_bytes + 20..ihl_bytes + data_offset]);
+        let summary = parsed.summary();
+        if summary.is_empty() {
+            String::new()
+        } else {
+            format!(" opts=[{}]", summary)
+        }
+    } else {
+        String::new()
+    };
     format!(
-        "IPv4 {}:{} -> {}:{} TCP flags={} seq={} ack={} payload={}",
+        "IPv4 {}:{} -> {}:{} TCP flags={} seq={} ack={} win={} tcp_hlen={} payload={}{}",
         src,
         src_port,
         dst,
@@ -626,6 +1223,9 @@ fn summarize_tcp_packet(
         format_tcp_flags(flags),
         seq,
         ack,
-        payload_len
+        window,
+        data_offset,
+        payload_len,
+        options
     )
 }

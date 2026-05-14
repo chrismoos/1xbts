@@ -58,10 +58,10 @@ pub fn crc16_ccitt(data: &[u8]) -> u16 {
     register ^ 0xFFFF
 }
 
-/// CRC-16 for supplemental channels: g(x) = x^16 + x^15 + x^13 + ... (poly 0xBE07, init 0xFFFF).
-/// Per C.S0002-E 2.1.3.1.4.1.1. Used for SCH frames (≥360 bits).
+/// Air-interface CRC-16 FQI per C.S0002-E §2.1.3.1.4.1.1.
+/// Polynomial 0xC867, init 0xFFFF, no final XOR.
 pub fn crc16_sch(data: &[u8]) -> u16 {
-    let poly: u16 = 0xBE07;
+    let poly: u16 = 0xC867;
     let mut register: u16 = 0xFFFF;
     for &bit in data {
         let feedback = ((register >> 15) & 1) ^ (bit as u16 & 1);
@@ -71,4 +71,40 @@ pub fn crc16_sch(data: &[u8]) -> u16 {
         }
     }
     register
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// First-bit check independent of the polynomial.
+    #[test]
+    fn crc16_sch_one_bit_input_is_polynomial_independent() {
+        assert_eq!(crc16_sch(&[1u8]), 0xFFFE);
+    }
+
+    /// Pins the SCH polynomial tap constant.
+    #[test]
+    fn crc16_sch_zero_bit_input_pins_spec_polynomial() {
+        assert_eq!(crc16_sch(&[0u8]), 0xFFFE ^ 0xC867);
+        assert_eq!(crc16_sch(&[0u8]), 0x3799);
+    }
+
+    /// Empty-input edge case: register passes through untouched.
+    #[test]
+    fn crc16_sch_empty_input_returns_init() {
+        assert_eq!(crc16_sch(&[]), 0xFFFF);
+    }
+
+    /// Pins the 360-bit all-zero F-SCH frame size.
+    #[test]
+    fn crc16_sch_full_360_zero_frame_pins_value() {
+        let bits = vec![0u8; 360];
+        let crc = crc16_sch(&bits);
+        // If this constant ever changes, the polynomial or shift-register
+        // logic was modified — cross-check with an external reference
+        // before bumping the pin.
+        const PINNED_360_ZERO_CRC: u16 = 0x42FB;
+        assert_eq!(crc, PINNED_360_ZERO_CRC, "got 0x{:04X}", crc);
+    }
 }

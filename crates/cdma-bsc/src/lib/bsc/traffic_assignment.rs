@@ -7,6 +7,7 @@
 //! WS-0 PR3 sibling module per
 //! `docs/architecture-update/09-pr3-method-map.md`.
 
+use cdma_common::consts::{SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_SMS};
 use cdma_common::error::Error;
 use cdma_common::events::AccessChannelEvent;
 use cdma_common::lac::message_types::MessageId;
@@ -43,6 +44,7 @@ impl TrafficAssignmentService {
         origination_service_option: Option<u16>,
         service_ref_id: u8,
         service_negotiation_mode: ServiceNegotiationMode,
+        active_set_pns: Vec<u16>,
         session_id: Option<Uuid>,
         leg_role: Option<VoiceLegRole>,
         a1_call_id: Option<u64>,
@@ -59,6 +61,7 @@ impl TrafficAssignmentService {
                 origination_service_option,
                 service_ref_id,
                 service_negotiation_mode,
+                active_set_pns,
                 session_id,
                 leg_role,
                 a1_call_id,
@@ -83,7 +86,7 @@ impl Bsc {
         event: &AccessChannelEvent,
         last_msg_seq: u8,
     ) -> bool {
-        if event.service_option != Some(6) {
+        if event.service_option != Some(SERVICE_OPTION_SMS) {
             return false;
         }
 
@@ -167,9 +170,10 @@ impl Bsc {
         };
         let use_rc3 = selected_rcs == (3, 3);
 
+        // F-SCH is only for SO33 packet data.
         let alloc_result = if use_rc3 {
             bts_client
-                .allocate_rc3_traffic(traffic_lc.clone(), 0, 12, esn)
+                .allocate_rc3_traffic(traffic_lc.clone(), 0, 12, esn, false)
                 .await
         } else {
             bts_client
@@ -275,7 +279,7 @@ impl Bsc {
             .unwrap_or(1);
         let so = if digits == "#777" || digits == "777" {
             info!("BSC: #777 dialed, defaulting packet data to SO33");
-            33u16
+            SERVICE_OPTION_HIGH_RATE_PACKET_DATA
         } else {
             event.service_option.unwrap_or(0)
         };
@@ -361,9 +365,12 @@ impl Bsc {
             return false;
         };
         let use_rc3 = selected_rcs == (3, 3);
+        // Keep traffic setup FCH-only. F-SCH is allocated separately through the
+        // rate-aware Abis Burst Request path after the packet service is up.
+        let include_sch = false;
         let alloc_result = if use_rc3 {
             bts_client
-                .allocate_rc3_traffic(traffic_lc.clone(), 0, 12, esn)
+                .allocate_rc3_traffic(traffic_lc.clone(), 0, 12, esn, include_sch)
                 .await
         } else {
             bts_client
@@ -379,6 +386,15 @@ impl Bsc {
         };
 
         let walsh_code = handle.walsh_code;
+        if let Some(sch_code) = handle.sch_walsh_code {
+            info!(
+                "BSC: allocated setup-time F-SCH code {} alongside walsh={} for {} (SO{} packet data)",
+                sch_code,
+                walsh_code,
+                format_ms_address(fwd_address),
+                so
+            );
+        }
         info!(
             "BSC: allocated {} traffic channel walsh={} for {} (SO{} packet data)",
             if use_rc3 { "RC3" } else { "RC1" },
@@ -513,9 +529,10 @@ impl Bsc {
         }
         .ok_or_else(|| "no configured traffic RC pair matches mobile capabilities".to_string())?;
         let use_rc3 = selected_rcs == (3, 3);
+        // F-SCH is only for SO33 packet data.
         let alloc_result = if use_rc3 {
             bts_client
-                .allocate_rc3_traffic(traffic_lc.clone(), 0, 12, esn)
+                .allocate_rc3_traffic(traffic_lc.clone(), 0, 12, esn, false)
                 .await
         } else {
             bts_client
@@ -762,6 +779,7 @@ impl Bsc {
             origination_service_option,
             service_ref_id,
             service_negotiation_mode,
+            vec![self.config.pilot_offset as u16],
             session_id,
             leg_role,
             a1_call_id,

@@ -186,6 +186,27 @@ pub const SR1_PARAMS_1536: InterleaverParams = InterleaverParams {
     j: 24,
 };
 
+/// Per C.S0002-E Table 3.1.3.1.8-1: block size 3072 -> m=6, J=48.
+pub const SR1_PARAMS_3072: InterleaverParams = InterleaverParams {
+    block_size: 3072,
+    m: 6,
+    j: 48,
+};
+
+/// Per C.S0002-E Table 3.1.3.1.8-1: block size 6144 -> m=7, J=48.
+pub const SR1_PARAMS_6144: InterleaverParams = InterleaverParams {
+    block_size: 6144,
+    m: 7,
+    j: 48,
+};
+
+/// Per C.S0002-E Table 3.1.3.1.8-1: block size 12288 -> m=7, J=96.
+pub const SR1_PARAMS_12288: InterleaverParams = InterleaverParams {
+    block_size: 12288,
+    m: 7,
+    j: 96,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rc12ReverseTrafficRate {
     Full,
@@ -288,7 +309,7 @@ pub mod test {
 
     use super::{
         BitReversalInterleaver, Rc12ReverseTrafficInterleaver, Rc12ReverseTrafficRate,
-        SR1_PARAMS_48, SR1_PARAMS_384, SR1_PARAMS_576,
+        SR1_PARAMS_48, SR1_PARAMS_384, SR1_PARAMS_576, SR1_PARAMS_12288,
     };
 
     #[test]
@@ -351,6 +372,17 @@ pub mod test {
         assert_eq!(
             2_usize.pow(SR1_PARAMS_576.m as u32) * SR1_PARAMS_576.j,
             SR1_PARAMS_576.block_size
+        );
+    }
+
+    #[test]
+    pub fn test_sr1_fsch_12288_parameters() {
+        assert_eq!(12288, SR1_PARAMS_12288.block_size);
+        assert_eq!(7, SR1_PARAMS_12288.m);
+        assert_eq!(96, SR1_PARAMS_12288.j);
+        assert_eq!(
+            2_usize.pow(SR1_PARAMS_12288.m as u32) * SR1_PARAMS_12288.j,
+            SR1_PARAMS_12288.block_size
         );
     }
 

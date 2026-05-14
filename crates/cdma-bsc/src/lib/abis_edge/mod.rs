@@ -12,9 +12,8 @@ use async_trait::async_trait;
 use std::time::Instant;
 
 use cdma_abis::bearer::{ChannelFamily, TrafficFrame};
-use cdma_abis::control::typed::PchMessageTransferMessage;
+use cdma_abis::control::typed::{ForwardBurstRadioInfo, PchMessageTransferMessage};
 use cdma_abis::udp_bearer::UdpBearerDatagram;
-use cdma_bts::bts::SchWalshChannelRc3;
 use cdma_common::phy::long_code::LongCodeGenerator;
 use cdma_common::traffic::TrafficRxRequest;
 
@@ -72,6 +71,9 @@ pub struct BtsTrafficChannelHandle {
     pub rev_rc: u8,
     pub rc_label: &'static str,
     pub power_control_delay_pcgs: u64,
+    /// Setup-time SCH code, if returned by legacy transports. Packet F-SCH is
+    /// normally allocated later through Abis Burst.
+    pub sch_walsh_code: Option<u8>,
 }
 
 /// BSC-facing traffic bearer for a single BTS peer.
@@ -109,26 +111,20 @@ pub trait BtsControlClient: Send + Sync {
     ) -> Option<BtsTrafficChannelHandle>;
 
     /// Allocate an RC3 forward traffic channel.
+    ///
+    /// `include_sch` is legacy; packet F-SCH is allocated later via Abis Burst.
     async fn allocate_rc3_traffic(
         &self,
         lc_generator: LongCodeGenerator,
         initial_lc_chip: u64,
         fpc_subchan_gain: u8,
         esn: u32,
+        include_sch: bool,
     ) -> Option<BtsTrafficChannelHandle>;
 
-    /// Allocate an RC3 forward Supplemental Channel (F-SCH).
-    async fn allocate_rc3_sch(
-        &self,
-        lc_generator: LongCodeGenerator,
-        sch_gain_linear: f32,
-    ) -> Option<(u8, SchWalshChannelRc3)>;
-
     /// Deallocate an RC1 / RC3 forward traffic channel by Walsh code.
+    /// Also frees any F-SCH bound to the same BTS-side session.
     async fn deallocate_traffic(&self, walsh_code: u8);
-
-    /// Deallocate an F-SCH by W(32) code.
-    async fn deallocate_sch(&self, w32_code: u8);
 
     /// Update an allocated traffic channel's composite gain.
     async fn set_traffic_gain(&self, walsh_code: u8, gain_linear: f32) -> bool;
@@ -148,6 +144,17 @@ pub trait BtsControlClient: Send + Sync {
     /// Drain received PCH transfer acknowledgments from the BTS.
     fn drain_pch_transfer_acks(&self) -> Vec<PchTransferAckEvent> {
         Vec::new()
+    }
+
+    /// Reserve and commit a forward supplemental-channel burst allocation
+    /// through Abis Burst Request/Response/Commit.
+    async fn commit_forward_sch_burst(
+        &self,
+        walsh_code: u8,
+        request: ForwardBurstRadioInfo,
+    ) -> Option<ForwardBurstRadioInfo> {
+        let _ = (walsh_code, request);
+        None
     }
 
     /// Forward traffic queue depth for bearer pacing.

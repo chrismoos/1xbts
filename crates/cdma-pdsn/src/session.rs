@@ -280,6 +280,11 @@ impl PdsnSessionManager {
             metadata,
         )));
         session.legacy_status = Some(status.clone());
+        // PDSN-managed sessions don't currently expose F-SCH control; the
+        // sender is dropped immediately so `control_rx.recv()` always yields
+        // `None` and the session stays FCH-only.
+        let (_control_tx, control_rx) =
+            mpsc::channel::<cdma_packet::session_task::SessionControl>(1);
         tokio::spawn(async move {
             cdma_packet::session_task::run_session(
                 session_id,
@@ -289,6 +294,7 @@ impl PdsnSessionManager {
                 downlink_tx,
                 status,
                 allocator,
+                control_rx,
             )
             .await;
         });

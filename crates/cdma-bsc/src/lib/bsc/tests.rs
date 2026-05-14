@@ -6,6 +6,10 @@ use crate::addressing::is_packet_data_so;
 use crate::config::{PagingRetryConfig, TrafficAssignmentConfig, TrafficRetryConfig};
 use cdma_abis::bearer::{ChannelFamily, FrameContent, ReverseFchDcchFrame};
 use cdma_bts::bts::PagingChannelSettings;
+use cdma_common::consts::{
+    SERVICE_OPTION_EVRC_A, SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_PACKET_DATA,
+    SERVICE_OPTION_SMS,
+};
 use cdma_common::error::Error;
 use cdma_common::lac::paging_messages::MsAddress;
 use cdma_common::lac::paging_messages::MsPageAddress;
@@ -86,21 +90,12 @@ impl BtsControlClient for CapturingBtsClient {
         _initial_lc_chip: u64,
         _fpc_subchan_gain: u8,
         _esn: u32,
+        _include_sch: bool,
     ) -> Option<crate::abis_edge::BtsTrafficChannelHandle> {
         None
     }
 
-    async fn allocate_rc3_sch(
-        &self,
-        _lc_generator: cdma_common::phy::long_code::LongCodeGenerator,
-        _sch_gain_linear: f32,
-    ) -> Option<(u8, cdma_bts::bts::SchWalshChannelRc3)> {
-        None
-    }
-
     async fn deallocate_traffic(&self, _walsh_code: u8) {}
-
-    async fn deallocate_sch(&self, _w32_code: u8) {}
 
     async fn set_traffic_gain(&self, _walsh_code: u8, _gain_linear: f32) -> bool {
         false
@@ -152,28 +147,21 @@ impl BtsControlClient for CapturingNetworkBtsClient {
         initial_lc_chip: u64,
         fpc_subchan_gain: u8,
         esn: u32,
+        include_sch: bool,
     ) -> Option<crate::abis_edge::BtsTrafficChannelHandle> {
         self.inner
-            .allocate_rc3_traffic(lc_generator, initial_lc_chip, fpc_subchan_gain, esn)
-            .await
-    }
-
-    async fn allocate_rc3_sch(
-        &self,
-        lc_generator: cdma_common::phy::long_code::LongCodeGenerator,
-        sch_gain_linear: f32,
-    ) -> Option<(u8, cdma_bts::bts::SchWalshChannelRc3)> {
-        self.inner
-            .allocate_rc3_sch(lc_generator, sch_gain_linear)
+            .allocate_rc3_traffic(
+                lc_generator,
+                initial_lc_chip,
+                fpc_subchan_gain,
+                esn,
+                include_sch,
+            )
             .await
     }
 
     async fn deallocate_traffic(&self, walsh_code: u8) {
         self.inner.deallocate_traffic(walsh_code).await;
-    }
-
-    async fn deallocate_sch(&self, w32_code: u8) {
-        self.inner.deallocate_sch(w32_code).await;
     }
 
     async fn set_traffic_gain(&self, walsh_code: u8, gain_linear: f32) -> bool {
@@ -385,7 +373,7 @@ fn test_assignment_request_message(
                     timeslot: (circuit_id & 0x1f) as u8,
                 },
                 encryption_information: None,
-                service_option: Some(cdma_ios::ServiceOption(3)),
+                service_option: Some(cdma_ios::ServiceOption::EVRC_A),
                 signals: Vec::new(),
                 ms_information_records: None,
                 priority: None,
@@ -715,7 +703,7 @@ async fn a1_mt_page_response_defers_l2_ack_until_assignment() {
     page_response.mob_p_rev = Some(6);
     page_response.slot_cycle_index = Some(2);
     page_response.scm = Some(0x2a);
-    page_response.service_option = Some(3);
+    page_response.service_option = Some(SERVICE_OPTION_EVRC_A);
     page_response.for_supported_rcs = vec![1, 2, 3, 4, 5];
     page_response.rev_supported_rcs = vec![1, 2, 3, 4];
 
@@ -839,7 +827,7 @@ async fn a1_paging_request_processes_independently_of_prior_assignment_request()
                     timeslot: 0x01,
                 },
                 encryption_information: None,
-                service_option: Some(cdma_ios::ServiceOption(3)),
+                service_option: Some(cdma_ios::ServiceOption::EVRC_A),
                 signals: Vec::new(),
                 ms_information_records: None,
                 priority: None,
@@ -869,7 +857,7 @@ async fn a1_paging_request_processes_independently_of_prior_assignment_request()
                 tag: Some(cdma_ios::Tag(call_id as u32)),
                 cell_identifier_list: None,
                 slot_cycle_index: Some(cdma_ios::SlotCycleIndex(2)),
-                service_option: Some(cdma_ios::ServiceOption(3)),
+                service_option: Some(cdma_ios::ServiceOption::EVRC_A),
                 is2000_mobile_capabilities: None,
             }
             .encode()
@@ -887,7 +875,8 @@ async fn a1_paging_request_processes_independently_of_prior_assignment_request()
 
 #[tokio::test]
 async fn mt_voice_on_existing_so33_uses_traffic_service_negotiation() {
-    let (mut bsc, mut traffic_rx, walsh_code) = test_bsc_with_active_traffic_channel(33).await;
+    let (mut bsc, mut traffic_rx, walsh_code) =
+        test_bsc_with_active_traffic_channel(SERVICE_OPTION_HIGH_RATE_PACKET_DATA).await;
     bsc.mobiles[0].subscriber_id = Some(Uuid::new_v4());
     bsc.mobiles[0].phone_number = Some("5551234567".to_string());
 
@@ -904,10 +893,10 @@ async fn mt_voice_on_existing_so33_uses_traffic_service_negotiation() {
         .expect("SO33 traffic channel should remain assigned");
     assert_eq!(tc.walsh_code, walsh_code);
     assert_eq!(
-        tc.service_option, 33,
+        tc.service_option, SERVICE_OPTION_HIGH_RATE_PACKET_DATA,
         "SO33 packet connection stays primary"
     );
-    assert_eq!(tc.voice_service_option, Some(3));
+    assert_eq!(tc.voice_service_option, Some(SERVICE_OPTION_EVRC_A));
     assert_eq!(tc.voice_connection_ref, Some(0));
     assert_eq!(tc.voice_service_ref_id, Some(2));
     assert!(matches!(
@@ -929,7 +918,7 @@ async fn mt_voice_on_existing_so33_uses_traffic_service_negotiation() {
         .iter()
         .map(|connection| connection.service_option)
         .collect();
-    assert_eq!(service_options, vec![3]);
+    assert_eq!(service_options, vec![SERVICE_OPTION_EVRC_A]);
     assert_eq!(cfg.connections[0].con_ref, 0);
     assert_eq!(cfg.connections[0].sr_id, 2);
 }
@@ -2059,9 +2048,7 @@ fn traffic_assignment_policy_can_force_rc3_only() {
         supported_for_rcs: vec![3],
         supported_rev_rcs: vec![3],
         preferred_pairs: vec![crate::config::RcPairConfig::new(3, 3)],
-        idle_timeout_s: TrafficAssignmentConfig::default().idle_timeout_s,
-        ms_ack_timeout_ms: TrafficAssignmentConfig::default().ms_ack_timeout_ms,
-        rev_fch_gating_mode: false,
+        ..TrafficAssignmentConfig::default()
     };
 
     let selected = select_initial_traffic_rcs(&policy, &[1, 3], &[1, 3], None, None, 6);
@@ -2360,7 +2347,7 @@ async fn duplicate_reverse_traffic_data_burst_is_acked_but_not_reprocessed() {
     origination.mob_p_rev = Some(6);
     origination.slot_cycle_index = Some(2);
     origination.scm = Some(0x2a);
-    origination.service_option = Some(6);
+    origination.service_option = Some(SERVICE_OPTION_SMS);
     origination.for_supported_rcs = vec![1, 2, 3, 4, 5];
     origination.rev_supported_rcs = vec![1, 2, 3, 4];
 
@@ -2430,7 +2417,8 @@ async fn duplicate_reverse_traffic_data_burst_is_acked_but_not_reprocessed() {
 
 #[tokio::test]
 async fn traffic_mo_sms_without_subscriber_sends_temporary_cause_code() {
-    let (mut bsc, mut traffic_rx, walsh_code) = test_bsc_with_active_traffic_channel(6).await;
+    let (mut bsc, mut traffic_rx, walsh_code) =
+        test_bsc_with_active_traffic_channel(SERVICE_OPTION_SMS).await;
     bsc.mobiles[0].phone_number = None;
     bsc.mobiles[0].subscriber_id = None;
 
@@ -2478,7 +2466,8 @@ async fn traffic_mo_sms_without_subscriber_sends_temporary_cause_code() {
 
 #[tokio::test]
 async fn pmrm_ack_of_bs_ack_advances_waiting_ms_ack() {
-    let (mut bsc, _traffic_rx, walsh_code) = test_bsc_with_active_traffic_channel(33).await;
+    let (mut bsc, _traffic_rx, walsh_code) =
+        test_bsc_with_active_traffic_channel(SERVICE_OPTION_HIGH_RATE_PACKET_DATA).await;
 
     bsc.send_traffic_bs_ack(walsh_code, 0b111)
         .expect("BS Ack should send via bearer");
@@ -2527,7 +2516,8 @@ async fn waiting_ms_ack_timeout_tears_down_voice_traffic_channel() {
 
 #[tokio::test]
 async fn waiting_ms_ack_timeout_tears_down_packet_traffic_channel() {
-    let (mut bsc, _traffic_rx, _walsh_code) = test_bsc_with_active_traffic_channel(33).await;
+    let (mut bsc, _traffic_rx, _walsh_code) =
+        test_bsc_with_active_traffic_channel(SERVICE_OPTION_HIGH_RATE_PACKET_DATA).await;
 
     let tc = bsc.mobiles[0].traffic_channel.as_mut().unwrap();
     tc.channel_state = ChannelState::WaitingMsAck {
@@ -2545,7 +2535,8 @@ async fn waiting_ms_ack_timeout_tears_down_packet_traffic_channel() {
 
 #[tokio::test]
 async fn waiting_ms_ack_lifecycle_does_not_teardown_before_timeout() {
-    let (mut bsc, _traffic_rx, _walsh_code) = test_bsc_with_active_traffic_channel(33).await;
+    let (mut bsc, _traffic_rx, _walsh_code) =
+        test_bsc_with_active_traffic_channel(SERVICE_OPTION_HIGH_RATE_PACKET_DATA).await;
 
     let tc = bsc.mobiles[0].traffic_channel.as_mut().unwrap();
     tc.channel_state = ChannelState::WaitingMsAck {
@@ -2563,7 +2554,8 @@ async fn waiting_ms_ack_lifecycle_does_not_teardown_before_timeout() {
 
 #[tokio::test]
 async fn traffic_lifecycle_ignores_channels_after_waiting_ms_ack() {
-    let (mut bsc, _traffic_rx, _walsh_code) = test_bsc_with_active_traffic_channel(33).await;
+    let (mut bsc, _traffic_rx, _walsh_code) =
+        test_bsc_with_active_traffic_channel(SERVICE_OPTION_HIGH_RATE_PACKET_DATA).await;
 
     let tc = bsc.mobiles[0].traffic_channel.as_mut().unwrap();
     tc.channel_state = ChannelState::Active;
@@ -2635,7 +2627,7 @@ async fn service_connect_completion_ack_clears_pending_traffic_retry() {
     origination.mob_p_rev = Some(6);
     origination.slot_cycle_index = Some(2);
     origination.scm = Some(0x2a);
-    origination.service_option = Some(6);
+    origination.service_option = Some(SERVICE_OPTION_SMS);
     origination.for_supported_rcs = vec![1, 2, 3, 4, 5];
     origination.rev_supported_rcs = vec![1, 2, 3, 4];
 
@@ -2734,7 +2726,7 @@ async fn service_connect_completion_ack_seq_7_clears_pending_traffic_retry() {
     origination.mob_p_rev = Some(6);
     origination.slot_cycle_index = Some(2);
     origination.scm = Some(0x2a);
-    origination.service_option = Some(6);
+    origination.service_option = Some(SERVICE_OPTION_SMS);
     origination.for_supported_rcs = vec![1, 2, 3, 4, 5];
     origination.rev_supported_rcs = vec![1, 2, 3, 4];
 
@@ -2918,7 +2910,7 @@ async fn origination_retry_reuses_pending_traffic_channel() {
     origination.mob_p_rev = Some(6);
     origination.slot_cycle_index = Some(2);
     origination.scm = Some(0x2a);
-    origination.service_option = Some(6);
+    origination.service_option = Some(SERVICE_OPTION_SMS);
     origination.for_supported_rcs = vec![1, 2, 3, 4, 5];
     origination.rev_supported_rcs = vec![1, 2, 3, 4];
 
@@ -3046,7 +3038,7 @@ async fn legacy_origination_uses_cam_for_rc1_assignment() {
     origination.mob_p_rev = Some(5);
     origination.slot_cycle_index = Some(2);
     origination.scm = Some(0x2a);
-    origination.service_option = Some(6);
+    origination.service_option = Some(SERVICE_OPTION_SMS);
     origination.for_supported_rcs = vec![1];
     origination.rev_supported_rcs = vec![1];
 
@@ -3087,9 +3079,7 @@ async fn legacy_origination_fails_before_cam_when_selected_rc_is_not_rc1() {
             supported_for_rcs: vec![3],
             supported_rev_rcs: vec![3],
             preferred_pairs: vec![crate::config::RcPairConfig::new(3, 3)],
-            idle_timeout_s: TrafficAssignmentConfig::default().idle_timeout_s,
-            ms_ack_timeout_ms: TrafficAssignmentConfig::default().ms_ack_timeout_ms,
-            rev_fch_gating_mode: false,
+            ..TrafficAssignmentConfig::default()
         },
         access_event_rx: None,
         access_event_broadcast: None,
@@ -3130,7 +3120,7 @@ async fn legacy_origination_fails_before_cam_when_selected_rc_is_not_rc1() {
     origination.mob_p_rev = Some(5);
     origination.slot_cycle_index = Some(2);
     origination.scm = Some(0x2a);
-    origination.service_option = Some(6);
+    origination.service_option = Some(SERVICE_OPTION_SMS);
     origination.for_supported_rcs = vec![1, 3];
     origination.rev_supported_rcs = vec![1, 3];
 
@@ -3203,7 +3193,7 @@ async fn origination_prefers_policy_rc1_over_mobile_rc3_preference() {
     origination.mob_p_rev = Some(6);
     origination.slot_cycle_index = Some(2);
     origination.scm = Some(0x2a);
-    origination.service_option = Some(6);
+    origination.service_option = Some(SERVICE_OPTION_SMS);
     origination.for_supported_rcs = vec![1, 2, 3, 4, 5];
     origination.rev_supported_rcs = vec![1, 2, 3, 4];
     origination.for_rc_pref = Some(3);
@@ -3236,9 +3226,7 @@ async fn origination_can_prefer_rc3_when_policy_requests_it() {
             supported_for_rcs: vec![1, 3],
             supported_rev_rcs: vec![1, 3],
             preferred_pairs: vec![crate::config::RcPairConfig::new(3, 3)],
-            idle_timeout_s: TrafficAssignmentConfig::default().idle_timeout_s,
-            ms_ack_timeout_ms: TrafficAssignmentConfig::default().ms_ack_timeout_ms,
-            rev_fch_gating_mode: false,
+            ..TrafficAssignmentConfig::default()
         },
         access_event_rx: None,
         access_event_broadcast: None,
@@ -3284,7 +3272,7 @@ async fn origination_can_prefer_rc3_when_policy_requests_it() {
     origination.mob_p_rev = Some(6);
     origination.slot_cycle_index = Some(2);
     origination.scm = Some(0x2a);
-    origination.service_option = Some(6);
+    origination.service_option = Some(SERVICE_OPTION_SMS);
     origination.for_supported_rcs = vec![1, 2, 3, 4, 5];
     origination.rev_supported_rcs = vec![1, 2, 3, 4];
     origination.for_rc_pref = Some(1);
@@ -3358,7 +3346,7 @@ async fn packet_data_origination_assigns_non_voice_traffic_channel() {
     origination.mob_p_rev = Some(6);
     origination.slot_cycle_index = Some(2);
     origination.scm = Some(0x2a);
-    origination.service_option = Some(7);
+    origination.service_option = Some(SERVICE_OPTION_PACKET_DATA);
     origination.for_supported_rcs = vec![1, 2, 3, 4, 5];
     origination.rev_supported_rcs = vec![1, 2, 3, 4];
 
@@ -3369,7 +3357,7 @@ async fn packet_data_origination_assigns_non_voice_traffic_channel() {
         .as_ref()
         .expect("packet-data traffic channel should be assigned");
     assert_eq!(bsc.mobiles[0].state, MsState::TrafficAssigning);
-    assert_eq!(tc.service_option, 7);
+    assert_eq!(tc.service_option, SERVICE_OPTION_PACKET_DATA);
     assert!(matches!(tc.channel_state, ChannelState::Assigned { .. }));
     assert!(tc.recent_primary_frames.is_empty());
     assert_eq!(traffic_rx_pool.lock().len(), 1);
@@ -3500,7 +3488,7 @@ async fn supported_packet_origination_so_is_not_rejected_when_assignment_falls_b
     origination.mob_p_rev = Some(3);
     origination.slot_cycle_index = Some(2);
     origination.scm = Some(0x6a);
-    origination.service_option = Some(7);
+    origination.service_option = Some(SERVICE_OPTION_PACKET_DATA);
 
     bsc.inject_access_event(origination).await;
 
@@ -3585,7 +3573,7 @@ async fn packet_data_service_connect_completion_marks_channel_active() {
     origination.mob_p_rev = Some(6);
     origination.slot_cycle_index = Some(2);
     origination.scm = Some(0x2a);
-    origination.service_option = Some(7);
+    origination.service_option = Some(SERVICE_OPTION_PACKET_DATA);
     origination.for_supported_rcs = vec![1, 2, 3, 4, 5];
     origination.rev_supported_rcs = vec![1, 2, 3, 4];
 
@@ -3669,8 +3657,8 @@ async fn packet_data_send_service_connect_uses_origination_sr_id_and_omits_optio
     origination.mob_p_rev = Some(6);
     origination.slot_cycle_index = Some(2);
     origination.scm = Some(0x2a);
-    origination.service_option = Some(7);
-    origination.decoded_l3 = Some(test_origination_l3(7, 3));
+    origination.service_option = Some(SERVICE_OPTION_PACKET_DATA);
+    origination.decoded_l3 = Some(test_origination_l3(SERVICE_OPTION_PACKET_DATA, 3));
     origination.for_supported_rcs = vec![1, 2, 3, 4, 5];
     origination.rev_supported_rcs = vec![1, 2, 3, 4];
 
@@ -3749,8 +3737,8 @@ async fn so33_service_connect_omits_rlp_blob_and_uses_origination_sr_id() {
     origination.mob_p_rev = Some(6);
     origination.slot_cycle_index = Some(2);
     origination.scm = Some(0x2a);
-    origination.service_option = Some(33);
-    origination.decoded_l3 = Some(test_origination_l3(33, 1));
+    origination.service_option = Some(SERVICE_OPTION_HIGH_RATE_PACKET_DATA);
+    origination.decoded_l3 = Some(test_origination_l3(SERVICE_OPTION_HIGH_RATE_PACKET_DATA, 1));
     origination.for_supported_rcs = vec![1, 2, 3, 4, 5];
     origination.rev_supported_rcs = vec![1, 2, 3, 4];
 
@@ -3829,7 +3817,7 @@ async fn packet_data_reverse_bearer_primary_frame_feeds_packet_session() {
     origination.mob_p_rev = Some(6);
     origination.slot_cycle_index = Some(2);
     origination.scm = Some(0x2a);
-    origination.service_option = Some(7);
+    origination.service_option = Some(SERVICE_OPTION_PACKET_DATA);
     origination.for_supported_rcs = vec![1, 2, 3, 4, 5];
     origination.rev_supported_rcs = vec![1, 2, 3, 4];
 
@@ -4306,7 +4294,11 @@ async fn sms_page_gpm_includes_so6_special_service() {
             ..
         } => {
             assert!(*special_service, "SMS page must set SPECIAL_SERVICE");
-            assert_eq!(*service_option, Some(6), "SMS page must announce SO6");
+            assert_eq!(
+                *service_option,
+                Some(SERVICE_OPTION_SMS),
+                "SMS page must announce SO6"
+            );
         }
         record => panic!("expected ESN Class1 page record, got {record:?}"),
     }
@@ -4986,5 +4978,256 @@ async fn registration_upserts_mobile_seen_in_hlr() {
     assert!(
         bsc.mobiles[0].phone_number.is_some(),
         "HLR resolution should populate phone_number"
+    );
+}
+
+// F-SCH activation tests using the in-process BTS resource controller.
+
+/// Build a BSC + active SO33 traffic channel with `enable_f_sch=true`.
+/// Returns the BSC, a traffic-event receiver (for asserting ESCAM), the
+/// shared MS ESN, and the assigned FCH walsh code.
+async fn fsch_test_bsc() -> (Bsc, broadcast::Receiver<TrafficEvent>, u32, u8) {
+    use std::sync::Arc;
+    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
+    let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
+    let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
+    let (traffic_tx, traffic_rx) = broadcast::channel(32);
+
+    // Force RC3; F-SCH is RC3-only here.
+    let mut traffic_assignment = TrafficAssignmentConfig {
+        supported_for_rcs: vec![3],
+        supported_rev_rcs: vec![3],
+        preferred_pairs: vec![crate::config::RcPairConfig::new(3, 3)],
+        ..TrafficAssignmentConfig::default()
+    };
+    traffic_assignment.enable_f_sch = true;
+
+    let mut bsc = Bsc::new(Config {
+        pilot_offset: 0,
+        overhead: OverheadParameters::default(),
+        paging: PagingChannelSettings::default(),
+        traffic_assignment,
+        access_event_rx: None,
+        access_event_broadcast: None,
+        sms_request_rx: None,
+        sms_request_tx: None,
+        data_request_rx: None,
+        data_request_tx: None,
+        power_override_request_rx: None,
+        power_override_request_tx: None,
+        mobiles_tx: None,
+        paging_broadcast: None,
+        traffic_broadcast: Some(traffic_tx),
+        rx_reference_dbm: None,
+        hlr_repo: None,
+        msc_client: test_msc_client(),
+        bts_client: Some(test_bts_client(
+            walsh_allocator,
+            traffic_channels,
+            traffic_rx_pool,
+            traffic_rx_removals,
+        )),
+        traffic_retry: TrafficRetryConfig::default(),
+        paging_retry: PagingRetryConfig::default(),
+        voice_policy: test_voice_policy(),
+        pcf_client: None,
+        mobile_idle_timeout_s: 0,
+        bts_paging_state: None,
+        node_id: "bsc-fsch-test".to_string(),
+        msc_voice_bearer: None,
+    });
+
+    // Drive an SO33 origination through the access event path so the
+    // mobile lands in TrafficActive with RC3 + p_rev=6 + RC pref including 3.
+    let esn: u32 = 0x1234_5678;
+    let mut event = test_access_event();
+    event.message_id = MessageId::Origination;
+    event.msg_type_name = "Origination Message".to_string();
+    event.msg_seq = Some(2);
+    event.ack_req = true;
+    event.esn = Some(esn);
+    event.imsi_m_s1 = Some(0x0091_989e);
+    event.imsi_m_s2 = Some(0x0326);
+    event.imsi_class = Some(0);
+    event.imsi_mcc = Some(310);
+    event.imsi_11_12 = Some(99);
+    event.mob_p_rev = Some(6);
+    event.slot_cycle_index = Some(2);
+    event.scm = Some(0x2a);
+    event.service_option = Some(SERVICE_OPTION_HIGH_RATE_PACKET_DATA);
+    event.for_supported_rcs = vec![1, 2, 3, 4, 5];
+    event.rev_supported_rcs = vec![1, 2, 3, 4];
+    bsc.inject_access_event(event).await;
+
+    let walsh_code = bsc.mobiles[0]
+        .traffic_channel
+        .as_ref()
+        .expect("SO33 traffic channel should be assigned")
+        .walsh_code;
+    bsc.mobiles[0].set_state(MsState::TrafficActive);
+    if let Some(tc) = bsc.mobiles[0].traffic_channel.as_mut() {
+        tc.channel_state = ChannelState::Active;
+    }
+    // Capability fields are populated by the access decoder in production
+    // but the test access-event injection stops short of that. Set them
+    // directly so the F-SCH eligibility predicate sees a fully-capable MS.
+    bsc.mobiles[0].mob_p_rev = 6;
+    bsc.mobiles[0].for_supported_rcs = vec![1, 2, 3, 4, 5];
+    bsc.mobiles[0].for_preferred_rc = Some(3);
+
+    (bsc, traffic_rx, esn, walsh_code)
+}
+
+#[tokio::test]
+async fn fsch_disabled_flag_leaves_tc_without_w32() {
+    // Default config has enable_f_sch=false; the access-event-driven
+    // BtsSetup must not include Sch in physical_channels, so the BTS
+    // doesn't allocate a W(32) and tc.sch_walsh_code stays None.
+    let (bsc, _rx, _walsh) =
+        test_bsc_with_active_traffic_channel(SERVICE_OPTION_HIGH_RATE_PACKET_DATA).await;
+    let stored = bsc.mobiles[0]
+        .traffic_channel
+        .as_ref()
+        .and_then(|tc| tc.sch_walsh_code);
+    assert!(
+        stored.is_none(),
+        "default-disabled F-SCH must leave tc.sch_walsh_code = None"
+    );
+}
+
+#[tokio::test]
+async fn fsch_eligibility_drops_w32_when_p_rev_below_6() {
+    use crate::addressing::ms_eligible_for_fsch_phase1;
+    // The eligibility predicate is the gate now (used at allocation time).
+    // Confirm a P_REV<6 mobile fails it even with the flag on.
+    assert!(
+        !ms_eligible_for_fsch_phase1(
+            true,
+            SERVICE_OPTION_HIGH_RATE_PACKET_DATA,
+            3,
+            5,
+            Some(3),
+            &[1, 2, 3, 4, 5]
+        ),
+        "MOB_P_REV<6 must fail the F-SCH eligibility gate"
+    );
+    assert!(
+        ms_eligible_for_fsch_phase1(
+            true,
+            SERVICE_OPTION_HIGH_RATE_PACKET_DATA,
+            3,
+            6,
+            Some(3),
+            &[1, 2, 3, 4, 5]
+        ),
+        "MOB_P_REV>=6 with SO33+RC3 must pass the gate"
+    );
+    assert!(
+        !ms_eligible_for_fsch_phase1(true, SERVICE_OPTION_SMS, 3, 6, Some(3), &[1, 2, 3, 4, 5]),
+        "non-SO33 service options must fail the gate"
+    );
+    assert!(
+        !ms_eligible_for_fsch_phase1(
+            false,
+            SERVICE_OPTION_HIGH_RATE_PACKET_DATA,
+            3,
+            6,
+            Some(3),
+            &[1, 2, 3, 4, 5]
+        ),
+        "enable_f_sch=false must fail the gate regardless of mobile"
+    );
+}
+
+#[tokio::test]
+async fn fsch_eligible_so33_call_defers_sch_until_burst_activation() {
+    let (bsc, _rx, _esn, _walsh) = fsch_test_bsc().await;
+    let stored = bsc.mobiles[0]
+        .traffic_channel
+        .as_ref()
+        .and_then(|tc| tc.sch_walsh_code);
+    assert!(
+        stored.is_none(),
+        "eligible SO33 + RC3 + P_REV=6 call must defer SCH code allocation until Abis Burst"
+    );
+}
+
+#[tokio::test]
+async fn fsch_activate_commits_burst_and_sends_escam() {
+    let (mut bsc, mut traffic_rx, _esn, walsh) = fsch_test_bsc().await;
+
+    let sch_code = bsc
+        .try_activate_fsch(walsh)
+        .await
+        .expect("ESCAM-only activation must succeed when tc.sch_walsh_code is set");
+    let stored = bsc.mobiles[0]
+        .traffic_channel
+        .as_ref()
+        .and_then(|tc| tc.sch_walsh_code)
+        .expect("burst activation must stamp SCH code");
+    assert_eq!(
+        sch_code, stored,
+        "try_activate_fsch returns the committed SCH code"
+    );
+
+    // ESCAM is sent on the F-FCH; it surfaces on the traffic broadcast.
+    let mut saw_escam = false;
+    while let Ok(event) = traffic_rx.try_recv() {
+        if event.mcsb.message_id == MessageId::ExtendedSupplementalChannelAssignment {
+            saw_escam = true;
+            break;
+        }
+    }
+    assert!(
+        saw_escam,
+        "ESCAM should be queued on F-FCH after try_activate_fsch"
+    );
+}
+
+#[tokio::test]
+async fn fsch_release_rollback_clears_state_and_frees_code() {
+    let (mut bsc, _traffic_rx, _esn, walsh) = fsch_test_bsc().await;
+
+    let profile = cdma_common::sch::Rc3FschProfile::from_rate_bps(
+        bsc.config.traffic_assignment.f_sch_rate_bps,
+    )
+    .unwrap();
+    let sch_code = bsc
+        .try_activate_fsch(walsh)
+        .await
+        .expect("initial F-SCH activation should succeed");
+
+    bsc.release_fsch_allocation(walsh, sch_code, profile, true, "test rollback")
+        .await;
+
+    let stored = bsc.mobiles[0]
+        .traffic_channel
+        .as_ref()
+        .and_then(|tc| tc.sch_walsh_code);
+    assert!(
+        stored.is_none(),
+        "release rollback must clear BSC SCH state"
+    );
+
+    let reacquired = bsc
+        .try_activate_fsch(walsh)
+        .await
+        .expect("SCH should be allocatable again after rollback release");
+    assert_eq!(
+        reacquired, sch_code,
+        "rollback release should free the original supplemental code"
+    );
+}
+
+#[tokio::test]
+async fn fsch_activate_returns_none_when_no_w32_stamped() {
+    let (mut bsc, _rx, walsh) =
+        test_bsc_with_active_traffic_channel(SERVICE_OPTION_HIGH_RATE_PACKET_DATA).await;
+    // Default config has F-SCH disabled; try_activate_fsch should be a no-op.
+    let result = bsc.try_activate_fsch(walsh).await;
+    assert!(
+        result.is_none(),
+        "try_activate_fsch must return None when no W(32) was reserved"
     );
 }

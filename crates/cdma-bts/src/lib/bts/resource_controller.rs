@@ -138,17 +138,19 @@ impl TrafficResourceService {
         )
     }
 
-    /// Allocate an RC3 forward Supplemental Channel (F-SCH) at 19.2 kbps.
+    /// Allocate an RC3 forward Supplemental Channel (F-SCH).
     pub fn allocate_rc3_sch(
         &self,
         lc_generator: LongCodeGenerator,
         sch_gain_linear: f32,
+        profile: cdma_common::sch::Rc3FschProfile,
     ) -> Option<(u8, SchWalshChannelRc3)> {
         allocate_sch_rc3(
             &self.walsh_allocator,
             &self.traffic_channels,
             lc_generator,
             sch_gain_linear,
+            profile,
         )
     }
 

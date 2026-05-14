@@ -21,7 +21,7 @@ fn setup_message() -> SetupA8Message {
         quality_of_service_parameters: None,
         bsc_id: BscId(vec![0xaa, 0xbb]),
         a8_traffic_id: A8TrafficId::gre_ppp(0x01020304, [192, 0, 2, 10]),
-        service_option: ServiceOptionValue(0x0021),
+        service_option: ServiceOptionValue::HIGH_RATE_PACKET_DATA,
         a9_indicators: A9Indicators {
             packet_boundary_supported: false,
             gre_segmentation_supported: false,
@@ -492,7 +492,7 @@ fn bs_service_requires_request_response_ordering() {
                 imsi: Some("123456789012345".into()),
                 esn: None,
                 meid: None,
-                service_option: ServiceOptionValue(0x0021),
+                service_option: ServiceOptionValue::HIGH_RATE_PACKET_DATA,
                 data_count: DataCount(0x0010),
             },
         ))
@@ -505,7 +505,7 @@ fn bs_service_requires_request_response_ordering() {
                 imsi: Some("123456789012345".into()),
                 esn: None,
                 meid: None,
-                service_option: ServiceOptionValue(0x0021),
+                service_option: ServiceOptionValue::HIGH_RATE_PACKET_DATA,
                 data_count: DataCount(0x0010),
             },
             initiated_by_local: false,
@@ -537,7 +537,7 @@ fn bs_service_response_requires_opposite_direction_and_matching_correlation() {
                 imsi: Some("123456789012345".into()),
                 esn: None,
                 meid: None,
-                service_option: ServiceOptionValue(0x0021),
+                service_option: ServiceOptionValue::HIGH_RATE_PACKET_DATA,
                 data_count: DataCount(0x0010),
             },
         ))
@@ -580,7 +580,7 @@ fn bs_service_response_rejects_unexpected_correlation_when_request_has_none() {
                 imsi: Some("123456789012345".into()),
                 esn: None,
                 meid: None,
-                service_option: ServiceOptionValue(0x0021),
+                service_option: ServiceOptionValue::HIGH_RATE_PACKET_DATA,
                 data_count: DataCount(0x0010),
             },
         ))

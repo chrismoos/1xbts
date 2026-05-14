@@ -13,6 +13,7 @@ use std::{
 };
 
 use cdma_common::error::Error;
+use cdma_common::sch::{DEFAULT_RC3_F_SCH_RATE_BPS, Rc3FschProfile};
 // VoiceConfig, VoiceGatewayConfig, and MediaRingbackType are MSC-owned types
 // defined in cdma_msc::config. BSC code that needs them imports from cdma_msc
 // directly rather than re-exporting through cdma_bsc::config.
@@ -133,6 +134,13 @@ pub struct TrafficAssignmentConfig {
     /// Sent in the ECAM as REV_FCH_GATING_MODE. Default: false (no gating).
     #[serde(default)]
     pub rev_fch_gating_mode: bool,
+    /// Enable F-SCH for eligible SO33 RC3 packet calls. Disabled calls stay
+    /// FCH-only regardless of mobile capability.
+    #[serde(default)]
+    pub enable_f_sch: bool,
+    /// Target RC3 F-SCH rate. Supported values: 19200, 38400, 76800, 153600.
+    #[serde(default = "default_f_sch_rate_bps")]
+    pub f_sch_rate_bps: u32,
 }
 
 impl Default for TrafficAssignmentConfig {
@@ -144,8 +152,14 @@ impl Default for TrafficAssignmentConfig {
             idle_timeout_s: default_traffic_idle_timeout_s(),
             ms_ack_timeout_ms: default_ms_ack_timeout_ms(),
             rev_fch_gating_mode: false,
+            enable_f_sch: false,
+            f_sch_rate_bps: default_f_sch_rate_bps(),
         }
     }
+}
+
+fn default_f_sch_rate_bps() -> u32 {
+    DEFAULT_RC3_F_SCH_RATE_BPS
 }
 
 fn default_traffic_idle_timeout_s() -> u64 {
@@ -439,6 +453,14 @@ impl ManagementConfig {
 }
 
 fn validate_traffic_assignment(cfg: &TrafficAssignmentConfig) -> Result<(), Error> {
+    if cfg.enable_f_sch && Rc3FschProfile::from_rate_bps(cfg.f_sch_rate_bps).is_none() {
+        return Err(format!(
+            "bsc.traffic_assignment.f_sch_rate_bps={} is unsupported; F-SCH is supplemental-channel data, not the 9600 bps FCH data rate; supported RC3 F-SCH rates are 19200, 38400, 76800, and 153600",
+            cfg.f_sch_rate_bps
+        )
+        .into());
+    }
+
     for &rc in &cfg.supported_for_rcs {
         if !matches!(rc, 1 | 3) {
             return Err(format!(
@@ -560,6 +582,37 @@ mod tests {
         assert_eq!(timers.tchanstatb_ms, 500);
         assert_eq!(timers.tdrptgtb_ms, 500);
         assert_eq!(timers.tbstreqb_ms, 500);
+    }
+
+    #[test]
+    fn f_sch_rate_accepts_supported_supplemental_tiers() {
+        for f_sch_rate_bps in [19_200, 38_400, 76_800, 153_600] {
+            let mut cfg = TrafficAssignmentConfig::default();
+            cfg.enable_f_sch = true;
+            cfg.f_sch_rate_bps = f_sch_rate_bps;
+            validate_traffic_assignment(&cfg).expect("supported F-SCH rate");
+        }
+    }
+
+    #[test]
+    fn f_sch_rate_rejects_fch_data_rate() {
+        let mut cfg = TrafficAssignmentConfig::default();
+        cfg.enable_f_sch = true;
+        cfg.f_sch_rate_bps = 9_600;
+
+        let err = validate_traffic_assignment(&cfg).expect_err("9600 is FCH data rate, not F-SCH");
+        let msg = err.to_string();
+        assert!(msg.contains("not the 9600 bps FCH data rate"));
+        assert!(msg.contains("19200, 38400, 76800, and 153600"));
+    }
+
+    #[test]
+    fn f_sch_rate_is_ignored_when_f_sch_disabled() {
+        let mut cfg = TrafficAssignmentConfig::default();
+        cfg.enable_f_sch = false;
+        cfg.f_sch_rate_bps = 9_600;
+
+        validate_traffic_assignment(&cfg).expect("disabled F-SCH ignores rate field");
     }
 
     #[test]

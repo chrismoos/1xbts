@@ -1,10 +1,36 @@
+use cdma_common::consts::{SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_PACKET_DATA};
 use cdma_common::lac::paging_messages::{self as paging_messages, MsAddress, MsPageAddress};
 use log::{info, warn};
 
 use crate::config::TrafficAssignmentConfig;
 
 pub(crate) fn is_packet_data_so(so: u16) -> bool {
-    so == 7 || so == 33
+    matches!(
+        so,
+        SERVICE_OPTION_PACKET_DATA | SERVICE_OPTION_HIGH_RATE_PACKET_DATA
+    )
+}
+
+/// F-SCH eligibility predicate.
+///
+/// Returns `true` when an F-SCH should be advertised in Service Connect and
+/// later allocated through the Abis Burst procedure. All conditions must hold:
+/// the operator has flipped `enable_f_sch=true`, the call is SO33 packet data,
+/// the negotiated RC is RC3+, the mobile reports MOB_P_REV ≥ 6, and the mobile
+/// actually advertises RC3 in its capabilities.
+pub(crate) fn ms_eligible_for_fsch_phase1(
+    enable_f_sch: bool,
+    service_option: u16,
+    for_rc: u8,
+    mob_p_rev: u8,
+    for_preferred_rc: Option<u8>,
+    for_supported_rcs: &[u8],
+) -> bool {
+    enable_f_sch
+        && service_option == SERVICE_OPTION_HIGH_RATE_PACKET_DATA
+        && for_rc >= 3
+        && mob_p_rev >= 6
+        && (for_preferred_rc == Some(3) || for_supported_rcs.contains(&3))
 }
 
 /// Select the initial explicit RC pair for ECAM based on the mobile's

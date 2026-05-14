@@ -11,6 +11,7 @@ mod tests {
     use crate::lac::message_types::MessageId;
     use crate::receiver::layer3::{self, PagingMessage};
     use cdma_common::bits::Bitstream;
+    use cdma_common::consts::SERVICE_OPTION_SMS;
 
     fn decode_roundtrip(message: PagingChannelMessage) -> PagingMessage {
         let mut pdu = cdma_common::bits::Bitstream::new();
@@ -644,7 +645,7 @@ mod tests {
                 msg_seq: 3,
                 esn: 0x1234_5678,
                 special_service: true,
-                service_option: Some(32),
+                service_option: Some(SERVICE_OPTION_SMS),
             }],
         };
         let sdu = original.to_sdu();
@@ -663,7 +664,7 @@ mod tests {
                 assert_eq!(*msg_seq, 3);
                 assert_eq!(*esn, 0x1234_5678);
                 assert!(*special_service);
-                assert_eq!(*service_option, Some(32));
+                assert_eq!(*service_option, Some(SERVICE_OPTION_SMS));
             }
             _ => panic!("expected Class1"),
         }
@@ -791,7 +792,7 @@ mod tests {
         assert_eq!(sdu.read_bits(4).unwrap(), 0); // FRAME_OFFSET
         assert_eq!(sdu.read_bits(2).unwrap(), 0); // ENCRYPT_MODE
         assert_eq!(sdu.read_bits(5).unwrap(), 12); // FPC_SUBCHAN_GAIN
-        assert_eq!(sdu.read_bits(4).unwrap(), 12); // RLGAIN_ADJ = -4 encoded in 4-bit two's complement
+        assert_eq!(sdu.read_bits(4).unwrap(), 0); // RLGAIN_ADJ = 0
         assert_eq!(sdu.read_bits(3).unwrap(), 0); // NUM_PILOTS
         assert_eq!(sdu.read_bits(2).unwrap(), 0b01); // CH_IND
 
@@ -1040,7 +1041,7 @@ mod escam_tests {
             code_chan_sch: w32_code,
             qof_mask_id_sch: 0,
             for_sch_duration: 0x0F, // infinite
-            for_sch_start_time_incl: false,
+            for_sch_start_time_incl: true,
             for_sch_start_time: 0,
             fpc_incl: true,
             fpc_mode_sch: 0,
@@ -1081,6 +1082,7 @@ mod escam_tests {
     fn escam_encode_release_sch() {
         let mut params = make_escam_19k2(5, 0);
         params.for_sch_duration = 0; // stop
+        params.for_sch_start_time_incl = false;
         params.fpc_incl = false;
         let sdu = params.encode_sdu();
         assert!(!sdu.is_empty());

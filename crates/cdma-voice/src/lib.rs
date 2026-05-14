@@ -9,6 +9,15 @@ use crate::evrc_b_wb::{EvrcBEncoder, EvrcWbEncoder};
 /// Number of PCM samples per 20ms frame at 8 kHz.
 pub(crate) const SAMPLES_PER_FRAME: usize = 160;
 
+/// SO3: EVRC-A / IS-127 narrowband.
+pub const SERVICE_OPTION_EVRC_A: u16 = 3;
+
+/// SO68: EVRC-B narrowband.
+pub const SERVICE_OPTION_EVRC_B: u16 = 68;
+
+/// SO70: EVRC-WB.
+pub const SERVICE_OPTION_EVRC_WB: u16 = 70;
+
 /// Voice frame rate indicator, matching MuxPDU Rate Set 1 rates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VoiceRate {
@@ -36,18 +45,18 @@ pub enum VoiceCodec {
 impl VoiceCodec {
     pub fn from_service_option(service_option: u16) -> Option<Self> {
         match service_option {
-            3 => Some(Self::EvrcA),
-            68 => Some(Self::EvrcB),
-            70 => Some(Self::EvrcWb),
+            SERVICE_OPTION_EVRC_A => Some(Self::EvrcA),
+            SERVICE_OPTION_EVRC_B => Some(Self::EvrcB),
+            SERVICE_OPTION_EVRC_WB => Some(Self::EvrcWb),
             _ => None,
         }
     }
 
     pub fn service_option(self) -> u16 {
         match self {
-            Self::EvrcA => 3,
-            Self::EvrcB => 68,
-            Self::EvrcWb => 70,
+            Self::EvrcA => SERVICE_OPTION_EVRC_A,
+            Self::EvrcB => SERVICE_OPTION_EVRC_B,
+            Self::EvrcWb => SERVICE_OPTION_EVRC_WB,
         }
     }
 }

@@ -23,6 +23,7 @@ use cdma_common::events::AccessChannelEvent;
 use cdma_common::lac::message_types::MessageId;
 use cdma_common::{bits::Bitstream, error::Error};
 use log::{debug, info, warn};
+use tokio::sync::mpsc::error::TrySendError;
 use uuid::Uuid;
 
 use crate::abis_edge::{BearerFrame, BtsControlClient, ForwardBearerQueue};
@@ -41,6 +42,55 @@ fn encode_forward_bearer_rate(for_rc: u8, rate: TrafficRate) -> FrameContent {
         (_, TrafficRate::Quarter) => FrameContent::FchRc3_2700,
         (_, TrafficRate::Eighth) => FrameContent::FchRc3_1500,
     }
+}
+
+/// Map an RC3 SCH downlink rate (in bps) to the BTS-side `FrameContent` tag.
+fn encode_sch_bearer_rate(rate_bps: u32) -> Result<FrameContent, Error> {
+    match rate_bps {
+        153_600 => Ok(FrameContent::Sch20msRc3_153600),
+        76_800 => Ok(FrameContent::Sch20msRc3_76800),
+        38_400 => Ok(FrameContent::Sch20msRc3_38400),
+        19_200 => Ok(FrameContent::Sch20msRc3_19200),
+        9_600 => Ok(FrameContent::Sch20msRc3_9600),
+        other => Err(Error::from(format!(
+            "unsupported RC3 F-SCH bearer rate {} bps",
+            other
+        ))),
+    }
+}
+
+/// Free-function variant of `send_forward_sch_bits` callable from a spawned
+/// task that doesn't hold `&mut Bsc`. Used by the SO33 packet downlink task
+/// to deliver rate-specific SCH frames to the BTS bearer without going back
+/// through the BSC's `&mut self` API surface.
+pub(crate) fn send_forward_sch_bits_with_bearer_client(
+    bts_client: Option<&std::sync::Arc<dyn BtsControlClient>>,
+    tx_frame_number: u32,
+    sch_code: u8,
+    rate_bps: u32,
+    bits: Vec<u8>,
+) -> Result<(), Error> {
+    let bts_client = bts_client.ok_or("bts_client not configured for Abis SCH bearer send")?;
+    let bearer_client = bts_client
+        .bearer_client()
+        .ok_or("BTS peer has no Abis bearer client configured")?;
+    let frame_content = encode_sch_bearer_rate(rate_bps)?;
+    bearer_client
+        .send_frame(BearerFrame {
+            channel_family: ChannelFamily::Sch,
+            bearer_id: sch_code as u32,
+            tx_frame_number,
+            traffic_frame: AbisTrafficFrame::ForwardSch(ForwardSchFrame {
+                fpc_slc: 1,
+                fsn: 0,
+                fpc_gr: 0,
+                frame_content,
+                forward_link_information: bits,
+                message_crc: 0,
+            }),
+            queue: ForwardBearerQueue::Traffic,
+        })
+        .map_err(|e| Error::from(format!("Abis bearer SCH send failed: {}", e)))
 }
 
 pub(crate) fn send_forward_fch_bits_with_bearer_client(
@@ -127,38 +177,6 @@ impl Bsc {
         rate: TrafficRate,
     ) -> Result<(), Error> {
         self.send_forward_fch_bits(walsh_code, bits, rate, ForwardBearerQueue::Traffic)
-    }
-
-    pub(super) fn send_forward_sch_bits(
-        &mut self,
-        w32_code: u8,
-        bits: Vec<u8>,
-    ) -> Result<(), Error> {
-        let tx_frame_number = self.traffic_bearer.next_bearer_tx_frame_number();
-        let bts_client = self
-            .config
-            .bts_client
-            .as_ref()
-            .ok_or("bts_client not configured for Abis SCH bearer send")?;
-        let bearer_client = bts_client
-            .bearer_client()
-            .ok_or("BTS peer has no Abis bearer client configured")?;
-        bearer_client
-            .send_frame(BearerFrame {
-                channel_family: ChannelFamily::Sch,
-                bearer_id: w32_code as u32,
-                tx_frame_number,
-                traffic_frame: AbisTrafficFrame::ForwardSch(ForwardSchFrame {
-                    fpc_slc: 1,
-                    fsn: 0,
-                    fpc_gr: 0,
-                    frame_content: FrameContent::Sch20msRc3_9600,
-                    forward_link_information: bits,
-                    message_crc: 0,
-                }),
-                queue: ForwardBearerQueue::Traffic,
-            })
-            .map_err(|e| Error::from(format!("Abis bearer SCH send failed: {}", e)))
     }
 
     fn send_forward_fch_bits(
@@ -302,7 +320,7 @@ impl Bsc {
         };
         let num_bits = primary_bits.len() as u32;
         let frame = crate::packet::PacketBearerFrame {
-            session_id,
+            session_id: session_id.clone(),
             bits: primary_bits,
             num_bits,
             rate_bps: primary_rate_bps,
@@ -314,6 +332,29 @@ impl Bsc {
                     walsh_code, primary_rate_bps, num_bits
                 );
                 true
+            }
+            Err(TrySendError::Closed(_)) => {
+                let detached = self
+                    .mobiles
+                    .update_tc(walsh_code, |_, tc| {
+                        if tc.packet_session_id.as_deref() != Some(session_id.as_str()) {
+                            return false;
+                        }
+                        tc.packet_session_id = None;
+                        tc.packet_uplink_tx = None;
+                        if let Some(task) = tc.packet_downlink_task.take() {
+                            task.abort();
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if detached {
+                    info!(
+                        "BSC: detached closed packet session {} on walsh={}",
+                        session_id, walsh_code
+                    );
+                }
+                false
             }
             Err(e) => {
                 warn!(
@@ -765,5 +806,30 @@ mod tests {
             encode_forward_bearer_rate(3, TrafficRate::Eighth),
             FrameContent::FchRc3_1500
         );
+    }
+
+    #[test]
+    fn encode_sch_bearer_rate_supports_configurable_rc3_rates() {
+        assert_eq!(
+            encode_sch_bearer_rate(19_200).unwrap(),
+            FrameContent::Sch20msRc3_19200
+        );
+        assert_eq!(
+            encode_sch_bearer_rate(38_400).unwrap(),
+            FrameContent::Sch20msRc3_38400
+        );
+        assert_eq!(
+            encode_sch_bearer_rate(76_800).unwrap(),
+            FrameContent::Sch20msRc3_76800
+        );
+        assert_eq!(
+            encode_sch_bearer_rate(153_600).unwrap(),
+            FrameContent::Sch20msRc3_153600
+        );
+    }
+
+    #[test]
+    fn encode_sch_bearer_rate_rejects_unsupported_rc3_rates() {
+        assert!(encode_sch_bearer_rate(307_200).is_err());
     }
 }

@@ -697,8 +697,7 @@ impl Bsc {
                         }
                     }
                     0b0010 => {
-                        // Counter-propose — accept iff the proposed service
-                        // option is one we're willing to honor (SO7 or SO33).
+                        // Counter-propose: accept packet data or an implemented voice codec.
                         let proposed_so = event.decoded_l3.as_ref().and_then(|l3| match l3 {
                             AccessMessage::ServiceResponse(m) => m
                                 .service_config
@@ -707,9 +706,11 @@ impl Bsc {
                                 .map(|cr| cr.service_option),
                             _ => None,
                         });
-                        const ACCEPTABLE_COUNTER_PROPOSE_SOS: [u16; 5] = [3, 7, 33, 68, 70];
                         match proposed_so {
-                            Some(so) if ACCEPTABLE_COUNTER_PROPOSE_SOS.contains(&so) => {
+                            Some(so)
+                                if is_packet_data_so(so)
+                                    || VoiceCodec::from_service_option(so).is_some() =>
+                            {
                                 info!(
                                     "BSC: accepting counter-propose on walsh={} SO={} — sending Service Connect",
                                     walsh_code, so
@@ -737,8 +738,8 @@ impl Bsc {
                             }
                             Some(so) => {
                                 warn!(
-                                    "BSC: rejecting counter-propose on walsh={} — proposed SO={} not in supported set ({:?})",
-                                    walsh_code, so, ACCEPTABLE_COUNTER_PROPOSE_SOS
+                                    "BSC: rejecting counter-propose on walsh={} — proposed SO={} is unsupported",
+                                    walsh_code, so
                                 );
                                 let reason = format!("counter-propose SO={} unsupported", so);
                                 if !self.release_tch_and_signal_assignment_failure(

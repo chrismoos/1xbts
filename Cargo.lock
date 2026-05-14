@@ -541,6 +541,7 @@ dependencies = [
 name = "cdma-packet"
 version = "0.1.0"
 dependencies = [
+ "cdma-common",
  "libc",
  "log",
  "prost",

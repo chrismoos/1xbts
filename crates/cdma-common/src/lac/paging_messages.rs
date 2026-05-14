@@ -4210,7 +4210,7 @@ impl ExtendedChannelAssignmentMessage {
             // complement in 0.25 dB units. **LOCK-STEP** with the inner-loop
             // SINR setpoint in power_control.rs (calibrated via
             // `rc3_pilot_sinr_at_1pct_fer_calibration`). Re-run before changing.
-            rlgain_adj: -4,
+            rlgain_adj: 0,
             ch_ind: 0b01,
             raw_ch_record_fields: None,
             fpc_fch_init_setpt: 0x20, // 32 (4.0 dB)
@@ -13208,6 +13208,15 @@ pub struct NonNegServiceConfig {
     pub fpc_dcch_min_setpt: u8,
     /// FPC_DCCH_MAX_SETPT (8 bits).
     pub fpc_dcch_max_setpt: u8,
+    /// Include SCH outer-loop power control records.
+    /// When true, NUM_SUP and one SCH FER/min/max record are emitted.
+    pub fpc_sch_incl: bool,
+    /// FPC_SCH_FER — target FER for SCH (5 bits).
+    pub fpc_sch_fer: u8,
+    /// FPC_SCH_MIN_SETPT (8 bits, 0.125 dB units).
+    pub fpc_sch_min_setpt: u8,
+    /// FPC_SCH_MAX_SETPT (8 bits, 0.125 dB units).
+    pub fpc_sch_max_setpt: u8,
     /// GATING_RATE_INCL — include pilot gating rate.
     pub gating_rate_incl: bool,
     /// PILOT_GATING_RATE (2 bits): 0=gating off, 1=1/2, 2=1/4.
@@ -13231,6 +13240,10 @@ impl NonNegServiceConfig {
             fpc_dcch_fer: 0,
             fpc_dcch_min_setpt: 0,
             fpc_dcch_max_setpt: 0,
+            fpc_sch_incl: false,
+            fpc_sch_fer: 0,
+            fpc_sch_min_setpt: 0,
+            fpc_sch_max_setpt: 0,
             gating_rate_incl: false,
             pilot_gating_rate: 0,
             lpm_ind: 0,
@@ -13251,31 +13264,80 @@ impl NonNegServiceConfig {
             fpc_dcch_fer: 0,
             fpc_dcch_min_setpt: 0,
             fpc_dcch_max_setpt: 0,
+            fpc_sch_incl: false,
+            fpc_sch_fer: 0,
+            fpc_sch_min_setpt: 0,
+            fpc_sch_max_setpt: 0,
             gating_rate_incl: true,
             pilot_gating_rate: 0, // gating off
             lpm_ind: 0,
         }
     }
 
+    /// RC3 F-SCH defaults for SO33 Service Connect.
+    pub fn rc3_fsch_default() -> Self {
+        Self {
+            fpc_sch_incl: true,
+            fpc_sch_fer: 0b00010,    // 1% target FER (matches FCH default).
+            fpc_sch_min_setpt: 0x00, // 0.0 dB
+            fpc_sch_max_setpt: 0x50, // 10.0 dB (80 * 0.125)
+            ..Self::rc3_default()
+        }
+    }
+
+    fn validate(&self) {
+        assert!(self.fpc_pri_chan <= 1, "FPC_PRI_CHAN exceeds 1 bit");
+        assert!(self.fpc_mode <= 0b111, "FPC_MODE exceeds 3 bits");
+        assert!(self.fpc_fch_fer != 0b11111, "FPC_FCH_FER=11111 is reserved");
+        assert!(
+            self.fpc_dcch_fer != 0b11111,
+            "FPC_DCCH_FER=11111 is reserved"
+        );
+        assert!(self.fpc_sch_fer != 0b11111, "FPC_SCH_FER=11111 is reserved");
+        assert!(
+            self.fpc_sch_min_setpt <= self.fpc_sch_max_setpt,
+            "FPC_SCH_MIN_SETPT must be <= FPC_SCH_MAX_SETPT"
+        );
+        assert!(
+            self.pilot_gating_rate <= 0b11,
+            "PILOT_GATING_RATE exceeds 2 bits"
+        );
+        assert!(self.lpm_ind <= 0b11, "LPM_IND exceeds 2 bits");
+    }
+
     /// Encode to bytes per C.S0004-E Table 3.7.2.3.2.21-3.
     pub fn encode(&self) -> Vec<u8> {
+        self.validate();
         let mut bs = Bitstream::new();
 
         bs.write_u8(self.fpc_incl as u8, 1);
         if self.fpc_incl {
-            bs.write_u8(self.fpc_pri_chan & 0x01, 1);
-            bs.write_u8(self.fpc_mode & 0x07, 3);
+            let mode = self.fpc_mode;
+            bs.write_u8(self.fpc_pri_chan, 1);
+            bs.write_u8(mode, 3);
             bs.write_u8(self.fpc_olpc_fch_incl as u8, 1);
             if self.fpc_olpc_fch_incl {
-                bs.write_u8(self.fpc_fch_fer & 0x1F, 5);
+                bs.write_u8(self.fpc_fch_fer, 5);
                 bs.write_u8(self.fpc_fch_min_setpt, 8);
                 bs.write_u8(self.fpc_fch_max_setpt, 8);
             }
             bs.write_u8(self.fpc_olpc_dcch_incl as u8, 1);
             if self.fpc_olpc_dcch_incl {
-                bs.write_u8(self.fpc_dcch_fer & 0x1F, 5);
+                bs.write_u8(self.fpc_dcch_fer, 5);
                 bs.write_u8(self.fpc_dcch_min_setpt, 8);
                 bs.write_u8(self.fpc_dcch_max_setpt, 8);
+            }
+            if matches!(mode, 0b001 | 0b010 | 0b101 | 0b110) {
+                bs.write_u8(0, 1); // FPC_SEC_CHAN
+            }
+            if self.fpc_sch_incl {
+                bs.write_u8(1, 2); // NUM_SUP = one SCH FPC record.
+                bs.write_u8(0, 1); // SCH_ID = SCH0.
+                bs.write_u8(self.fpc_sch_fer, 5);
+                bs.write_u8(self.fpc_sch_min_setpt, 8);
+                bs.write_u8(self.fpc_sch_max_setpt, 8);
+            } else {
+                bs.write_u8(0, 2); // NUM_SUP = 0.
             }
         }
 
@@ -13318,7 +13380,7 @@ impl NonNegServiceConfig {
 pub struct ForSchConfig {
     /// SCH identifier (0 or 1).
     pub sch_id: u8,
-    /// MUX option for SCH (0x0003 = MUX PDU Type 2).
+    /// MUX option for SCH (Rate Set 1, MuxPDU Type 3 single).
     pub mux_option: u16,
     /// Radio configuration (3 = RC3).
     pub rc: u8,
@@ -13350,6 +13412,20 @@ pub struct ServiceConnectParams {
 }
 
 impl ServiceConnectParams {
+    fn validate_for_sch_config(sch: &ForSchConfig) {
+        assert!(sch.sch_id <= 1, "FOR_SCH_ID must be SCH0 or SCH1");
+        assert!(
+            matches!(sch.mux_option, 0x0809 | 0x0811 | 0x0821 | 0x0921),
+            "F-SCH FOR_SCH_MUX must be Rate Set 1 MuxPDU Type 3"
+        );
+        assert!(sch.rc == 3, "Phase 1 F-SCH requires SCH_RC=3");
+        assert!(sch.coding <= 1, "SCH CODING exceeds 1 bit");
+        assert!(
+            matches!(sch.rate, 0x1..=0x4),
+            "F-SCH MAX_RATE must be 0x1..=0x4 for convolutional RC3"
+        );
+    }
+
     /// Encode the f-dsch Service Connect Message SDU.
     ///
     /// Format: USE_TIME(1) + ACTION_TIME(6) + SERV_CON_SEQ(3) + RESERVED(2) +
@@ -13468,13 +13544,22 @@ impl ServiceConnectParams {
         bs.write_u8(self.rev_fch_rc & 0x1F, 5); // REV_FCH_RC (5 bits)
         bs.write_u8(0, 1); // DCCH_CC_INCL = 0
         if let Some(ref sch) = self.for_sch_config {
+            Self::validate_for_sch_config(sch);
+            // FOR_SCH_CC block per C.S0005-E §3.7.5.7. Phase 1 sends a single
+            // F-SCH (NUM_FOR_SCH=1) with the SCH_CC_Type-specific subrecord
+            // formatted per §3.7.5.7.1 (16 bits / 2 octets).
             bs.write_u8(1, 1); // FOR_SCH_CC_INCL = 1
-            bs.write_u8(0, 3); // FOR_SCH_NUM = 0 (1 SCH)
-            bs.write_u8(sch.sch_id & 1, 1); // FOR_SCH_ID
+            bs.write_u8(1, 2); // NUM_FOR_SCH = 1 (spec forbids '00' when INCL=1)
+            // Per-SCH 3-field record: FOR_SCH_ID + FOR_SCH_MUX + SCH_CC_Type-specific
+            bs.write_u8(sch.sch_id, 2); // FOR_SCH_ID (Table 3.7.5.7-5: 00=SCH0, 01=SCH1)
             bs.write_u32(sch.mux_option as u32, 16); // FOR_SCH_MUX
-            bs.write_u8(sch.rc & 0x1F, 5); // FOR_SCH_RC
-            bs.write_u8(sch.coding & 1, 1); // FOR_SCH_CODING
-            bs.write_u8(sch.rate & 0x0F, 4); // FOR_SCH_RATE
+            // SCH_CC_Type-specific subfields per §3.7.5.7.1:
+            bs.write_u8(2, 4); // SCH_REC_LEN = 2 (record length in octets, includes this field)
+            bs.write_u8(sch.rc, 5); // SCH_RC
+            bs.write_u8(sch.coding, 1); // CODING (0 = convolutional)
+            bs.write_u8(0, 1); // FRAME_40_USED = 0 (Phase 1: 20 ms frames only)
+            bs.write_u8(0, 1); // FRAME_80_USED = 0
+            bs.write_u8(sch.rate, 4); // MAX_RATE
         } else {
             bs.write_u8(0, 1); // FOR_SCH_CC_INCL = 0
         }
@@ -13809,6 +13894,54 @@ pub struct EscamParams {
 }
 
 impl EscamParams {
+    fn validate(&self) {
+        assert!(
+            self.start_time_unit <= 0b111,
+            "START_TIME_UNIT exceeds 3 bits"
+        );
+        assert!(self.for_sch_id <= 1, "FOR_SCH_ID exceeds 1 bit");
+        assert!(self.sccl_index <= 0x0f, "SCCL_INDEX exceeds 4 bits");
+        assert!(
+            matches!(self.for_sch_num_bits_idx, 0x1..=0x4),
+            "ESCAM FOR_SCH_NUM_BITS_IDX must be 0x1..=0x4 for convolutional RC3"
+        );
+        assert!(self.pilot_pn <= 0x1ff, "PILOT_PN exceeds 9 bits");
+        assert!(self.code_chan_sch <= 0x7ff, "CODE_CHAN_SCH exceeds 11 bits");
+        assert!(
+            self.qof_mask_id_sch <= 0b11,
+            "QOF_MASK_ID_SCH exceeds 2 bits"
+        );
+        assert!(
+            self.for_sch_duration <= 0x0f,
+            "FOR_SCH_DURATION exceeds 4 bits"
+        );
+        assert!(
+            self.for_sch_duration == 0 || self.for_sch_start_time_incl,
+            "FOR_SCH_START_TIME_INCL must be 1 when FOR_SCH_DURATION is non-zero"
+        );
+        assert!(
+            !self.for_sch_start_time_incl || self.for_sch_start_time <= 0x1f,
+            "FOR_SCH_START_TIME exceeds 5 bits"
+        );
+        assert!(self.fpc_mode_sch <= 0b111, "FPC_MODE_SCH exceeds 3 bits");
+        assert!(
+            self.fpc_sch_init_setpt_op <= 1,
+            "FPC_SCH_INIT_SETPT_OP exceeds 1 bit"
+        );
+        assert!(self.fpc_sch_fer != 0b11111, "FPC_SCH_FER=11111 is reserved");
+        assert!(
+            self.fpc_sch_min_setpt <= self.fpc_sch_max_setpt,
+            "FPC_SCH_MIN_SETPT must be <= FPC_SCH_MAX_SETPT"
+        );
+        if self.fpc_sch_init_setpt_op == 0 {
+            assert!(
+                self.fpc_sch_min_setpt <= self.fpc_sch_init_setpt
+                    && self.fpc_sch_init_setpt <= self.fpc_sch_max_setpt,
+                "absolute FPC_SCH_INIT_SETPT must be within min/max setpoints"
+            );
+        }
+    }
+
     /// Encode the ESCAM as a traffic channel signaling SDU (bit vector).
     pub fn encode_sdu(&self) -> Vec<u8> {
         bitstream_to_byte_vec(&self.to_ftch_sdu())
@@ -13819,10 +13952,11 @@ impl EscamParams {
     /// Encodes the complete message structure. Sections not needed for
     /// Phase 1 (reverse SCH, 3X, BCMC, soft handoff) are set to "not included".
     pub fn to_ftch_sdu(&self) -> Bitstream {
+        self.validate();
         let mut bs = Bitstream::new();
 
         // ---- Section 1: Timing and control ----
-        bs.write_u8(self.start_time_unit & 0x07, 3); // START_TIME_UNIT
+        bs.write_u8(self.start_time_unit, 3); // START_TIME_UNIT
         bs.write_u8(0, 4); // REV_SCH_DTX_DURATION = 0 (no reverse SCH)
         bs.write_u8(0, 1); // USE_T_ADD_ABORT = 0
         bs.write_u8(0, 1); // USE_SCRM_SEQ_NUM = 0 (no SCRM_SEQ_NUM)
@@ -13842,40 +13976,44 @@ impl EscamParams {
         bs.write_u8(0, 5); // NUM_FOR_CFG_RECS = 0 (means 1 record)
 
         // Forward config record:
-        bs.write_u8(self.for_sch_id & 1, 1); // FOR_SCH_ID
-        bs.write_u8(self.sccl_index & 0x0F, 4); // SCCL_INDEX
-        bs.write_u8(self.for_sch_num_bits_idx & 0x0F, 4); // FOR_SCH_NUM_BITS_IDX
+        bs.write_u8(self.for_sch_id, 1); // FOR_SCH_ID
+        bs.write_u8(self.sccl_index, 4); // SCCL_INDEX
+        bs.write_u8(self.for_sch_num_bits_idx, 4); // FOR_SCH_NUM_BITS_IDX
         bs.write_u8(0, 3); // NUM_SUP_SHO = 0 (1 pilot, no soft handoff)
 
         // Single pilot record (our serving sector):
-        bs.write_u32((self.pilot_pn & 0x1FF) as u32, 9); // PILOT_PN (9 bits)
+        bs.write_u32(self.pilot_pn as u32, 9); // PILOT_PN (9 bits)
         bs.write_u8(0, 1); // ADD_PILOT_REC_INCL = 0
         // No ACTIVE_PILOT_REC_TYPE or RECORD_LEN since ADD_PILOT_REC_INCL=0
-        bs.write_u32((self.code_chan_sch & 0x7FF) as u32, 11); // CODE_CHAN_SCH (11 bits!)
-        bs.write_u8(self.qof_mask_id_sch & 0x03, 2); // QOF_MASK_ID_SCH
+        bs.write_u32(self.code_chan_sch as u32, 11); // CODE_CHAN_SCH
+        bs.write_u8(self.qof_mask_id_sch, 2); // QOF_MASK_ID_SCH
 
         // ---- Section 5: Forward SCH assignments ----
         bs.write_u8(1, 2); // NUM_FOR_SCH = 1
 
         // Single forward SCH assignment:
-        bs.write_u8(self.for_sch_id & 1, 1); // FOR_SCH_ID
-        bs.write_u8(self.for_sch_duration & 0x0F, 4); // FOR_SCH_DURATION
+        bs.write_u8(self.for_sch_id, 1); // FOR_SCH_ID
+        bs.write_u8(self.for_sch_duration, 4); // FOR_SCH_DURATION
         bs.write_u8(if self.for_sch_start_time_incl { 1 } else { 0 }, 1);
         if self.for_sch_start_time_incl {
-            bs.write_u8(self.for_sch_start_time & 0x1F, 5); // FOR_SCH_START_TIME
+            bs.write_u8(self.for_sch_start_time, 5); // FOR_SCH_START_TIME
         }
-        bs.write_u8(self.sccl_index & 0x0F, 4); // SCCL_INDEX
+        bs.write_u8(self.sccl_index, 4); // SCCL_INDEX
 
         // ---- Section 6: Forward power control ----
         bs.write_u8(if self.fpc_incl { 1 } else { 0 }, 1); // FPC_INCL
         if self.fpc_incl {
-            bs.write_u8(self.fpc_mode_sch & 0x07, 3); // FPC_MODE_SCH
-            bs.write_u8(self.fpc_sch_init_setpt_op & 1, 1); // FPC_SCH_INIT_SETPT_OP
-            bs.write_u8(0, 1); // FPC_SEC_CHAN = 0
-            bs.write_u8(1, 2); // NUM_SUP = 1 (direct count, not N-1; see C.S0005-E §3.7.3.3.2.37)
+            let mode = self.fpc_mode_sch;
+            bs.write_u8(mode, 3); // FPC_MODE_SCH
+            bs.write_u8(self.fpc_sch_init_setpt_op, 1); // FPC_SCH_INIT_SETPT_OP
+            // Present only for SCH FPC modes that use a secondary channel.
+            if matches!(mode, 0b001 | 0b010 | 0b101 | 0b110) {
+                bs.write_u8(0, 1); // FPC_SEC_CHAN — placeholder; we don't use FPC modes that need it.
+            }
+            bs.write_u8(1, 2); // NUM_SUP = 1, direct count.
             // FPC record for the single SCH:
-            bs.write_u8(self.for_sch_id & 1, 1); // SCH_ID
-            bs.write_u8(self.fpc_sch_fer & 0x1F, 5); // FPC_SCH_FER
+            bs.write_u8(self.for_sch_id, 1); // SCH_ID
+            bs.write_u8(self.fpc_sch_fer, 5); // FPC_SCH_FER
             bs.write_u8(self.fpc_sch_init_setpt, 8); // FPC_SCH_INIT_SETPT
             bs.write_u8(self.fpc_sch_min_setpt, 8); // FPC_SCH_MIN_SETPT
             bs.write_u8(self.fpc_sch_max_setpt, 8); // FPC_SCH_MAX_SETPT
@@ -13891,14 +14029,16 @@ impl EscamParams {
         // ---- Section 9: Code channel soft handoff (not included) ----
         bs.write_u8(0, 1); // CCSH_INCLUDED = 0
 
-        // ---- Section 10: Forward SCH service config (not included) ----
+        // ---- Section 10: Forward SCH service config ----
+        // Service Connect already supplied this; ESCAM only assigns timing.
         bs.write_u8(0, 1); // FOR_SCH_CC_INCL = 0
 
         // ---- Section 11: Reverse SCH service config (not included) ----
         bs.write_u8(0, 1); // REV_SCH_CC_INCL = 0
 
-        // SCH_BCMC_IND is conditional on P_REV >= 11. For P_REV=6 phones
-        // this field is not present. Skip it for now.
+        // ---- Section 12: SCH BCMC / outer code extensions ----
+        // Point-to-point F-SCH only.
+        bs.write_u8(0, 1); // SCH_BCMC_IND = 0
 
         bs
     }
@@ -13906,6 +14046,8 @@ impl EscamParams {
 
 #[cfg(test)]
 mod forward_overhead_decode_tests {
+    use crate::consts::SERVICE_OPTION_EVRC_A;
+
     use super::*;
 
     fn common_roundtrip(message: PagingChannelMessage) -> PagingChannelMessage {
@@ -17885,7 +18027,7 @@ mod forward_overhead_decode_tests {
                 assert_eq!(m.init_pwr, -4);
                 assert_eq!(m.rand, 0x1234_5678);
                 assert_eq!(m.psist_emg, 5);
-                assert_eq!(m.acct_so_records[0].service_option, 3);
+                assert_eq!(m.acct_so_records[0].service_option, SERVICE_OPTION_EVRC_A);
                 assert_eq!(m.acct_so_grp_records[0].service_option_group, 7);
             }
             _ => panic!("unexpected decoded message"),
@@ -17999,6 +18141,11 @@ mod forward_overhead_decode_tests {
 mod escam_tests {
     use super::*;
 
+    fn bits_to_u16(bits: &[u8]) -> u16 {
+        bits.iter()
+            .fold(0u16, |value, bit| (value << 1) | u16::from(*bit))
+    }
+
     fn make_escam_19k2(w32_code: u16, pilot_pn: u16) -> EscamParams {
         EscamParams {
             start_time_unit: 0,
@@ -18009,7 +18156,7 @@ mod escam_tests {
             code_chan_sch: w32_code,
             qof_mask_id_sch: 0,
             for_sch_duration: 0x0F, // infinite
-            for_sch_start_time_incl: false,
+            for_sch_start_time_incl: true,
             for_sch_start_time: 0,
             fpc_incl: true,
             fpc_mode_sch: 0,
@@ -18038,7 +18185,6 @@ mod escam_tests {
     fn escam_encode_with_start_time() {
         let mut params = make_escam_19k2(12, 9);
         params.for_sch_duration = 5;
-        params.for_sch_start_time_incl = true;
         params.for_sch_start_time = 10;
         let sdu = params.encode_sdu();
         assert!(!sdu.is_empty());
@@ -18050,6 +18196,7 @@ mod escam_tests {
     fn escam_encode_release_sch() {
         let mut params = make_escam_19k2(5, 0);
         params.for_sch_duration = 0; // stop
+        params.for_sch_start_time_incl = false;
         params.fpc_incl = false;
         let sdu = params.encode_sdu();
         assert!(!sdu.is_empty());
@@ -18087,6 +18234,109 @@ mod escam_tests {
         params.code_chan_sch = 300;
         let sdu = params.encode_sdu();
         assert!(!sdu.is_empty());
+    }
+
+    #[test]
+    fn escam_assignment_start_time_required_for_nonzero_duration() {
+        let params = make_escam_19k2(5, 0);
+        let sdu = params.to_ftch_sdu();
+        let bits = sdu.bits();
+
+        assert_eq!(&bits[55..57], &[0, 1], "NUM_FOR_SCH = 1");
+        assert_eq!(&bits[58..62], &[1, 1, 1, 1], "infinite duration");
+        assert_eq!(bits[62], 1, "FOR_SCH_START_TIME_INCL must be 1");
+        assert_eq!(&bits[63..68], &[0, 0, 0, 0, 0], "FOR_SCH_START_TIME = 0");
+    }
+
+    #[test]
+    fn escam_fpc_mode_zero_omits_fpc_sec_chan() {
+        let params = make_escam_19k2(5, 0);
+        let sdu = params.to_ftch_sdu();
+        let bits = sdu.bits();
+
+        assert_eq!(bits[72], 1, "FPC_INCL");
+        assert_eq!(&bits[73..76], &[0, 0, 0], "FPC_MODE_SCH = 000");
+        assert_eq!(bits[76], 0, "FPC_SCH_INIT_SETPT_OP = 0");
+        assert_eq!(&bits[77..79], &[0, 1], "NUM_SUP follows init-setpoint op");
+        assert_eq!(bits[79], 0, "SCH_ID = SCH0");
+        assert_eq!(&bits[80..85], &[0, 0, 0, 1, 0], "FPC_SCH_FER = 2");
+    }
+
+    #[test]
+    fn escam_includes_sch_bcmc_ind_when_forward_sch_is_assigned() {
+        let params = make_escam_19k2(6, 0);
+        let sdu = params.to_ftch_sdu();
+        let bits = sdu.bits();
+
+        assert_eq!(bits.len(), 116, "ESCAM SDU bit length");
+        assert_eq!(
+            bits[113], 0,
+            "FOR_SCH_CC_INCL = 0, using Service Connect SCH config"
+        );
+        assert_eq!(bits[114], 0, "REV_SCH_CC_INCL = 0");
+        assert_eq!(bits[115], 0, "SCH_BCMC_IND = 0");
+    }
+
+    #[test]
+    fn escam_assignment_rate_matches_requested_profile() {
+        let mut params = make_escam_19k2(6, 0);
+        params.for_sch_num_bits_idx = 0x2;
+        let sdu = params.to_ftch_sdu();
+        let bits = sdu.bits();
+
+        assert_eq!(
+            &bits[25..29],
+            &[0, 0, 1, 0],
+            "FOR_SCH_NUM_BITS_IDX = 38.4 kbps"
+        );
+        assert_eq!(bits[113], 0, "ESCAM does not duplicate SCH MAX_RATE");
+    }
+
+    #[test]
+    fn ecam_and_escam_use_same_pilot_pn_units() {
+        let pilot_pn = 0x12;
+        let fch_walsh = 10;
+        let sch_walsh = 6;
+
+        let ecam = ExtendedChannelAssignmentMessage::new_f_fch_r_fch_assignment(
+            pilot_pn, fch_walsh, 0, 3, 3, false,
+        );
+        let mut ecam_sdu = ecam.try_to_sdu().unwrap();
+        let decoded_ecam = ExtendedChannelAssignmentMessage::from_sdu(&mut ecam_sdu).unwrap();
+
+        assert_eq!(decoded_ecam.pilots.len(), 1);
+        assert_eq!(decoded_ecam.pilots[0].pilot_pn, pilot_pn);
+        assert_eq!(decoded_ecam.pilots[0].code_chan_fch, u16::from(fch_walsh));
+
+        let escam = make_escam_19k2(sch_walsh, pilot_pn);
+        let escam_sdu = escam.to_ftch_sdu();
+        let escam_bits = escam_sdu.bits();
+
+        assert_eq!(
+            bits_to_u16(&escam_bits[32..41]),
+            decoded_ecam.pilots[0].pilot_pn,
+            "ESCAM PILOT_PN must reference the ECAM active-set PN"
+        );
+        assert_eq!(
+            bits_to_u16(&escam_bits[42..53]),
+            sch_walsh,
+            "ESCAM CODE_CHAN_SCH is the W32 SCH code channel"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "PILOT_PN exceeds 9 bits")]
+    fn escam_rejects_pilot_pn_out_of_range() {
+        let params = make_escam_19k2(5, 512);
+        params.to_ftch_sdu();
+    }
+
+    #[test]
+    #[should_panic(expected = "FOR_SCH_START_TIME_INCL must be 1")]
+    fn escam_rejects_nonzero_duration_without_start_time() {
+        let mut params = make_escam_19k2(5, 0);
+        params.for_sch_start_time_incl = false;
+        params.to_ftch_sdu();
     }
 
     // ---- select_imsi_class0_forward_address (core function) ----
@@ -18417,5 +18667,240 @@ mod escam_tests {
         let decoded = ExtendedChannelAssignmentMessage::from_sdu(&mut decode_bits).unwrap();
         assert_eq!(decoded.assign_mode, 0b001);
         assert_eq!(decoded.to_sdu().bits(), encoded.bits());
+    }
+}
+
+#[cfg(test)]
+mod nonneg_sch_fpc_tests {
+    use super::*;
+
+    /// Bit-walk an encoded NonNegServiceConfig and return the bits as a string
+    /// of '0'/'1', stripping the trailing pad. Lets a test assert exact field
+    /// boundaries in the SCH FPC block without fighting byte alignment.
+    fn encoded_bit_string(cfg: &NonNegServiceConfig) -> String {
+        let bytes = cfg.encode();
+        let mut s = String::with_capacity(bytes.len() * 8);
+        for b in bytes {
+            for i in (0..8).rev() {
+                s.push(if (b >> i) & 1 == 1 { '1' } else { '0' });
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn rc3_default_omits_sch_fpc_block_for_backward_compat() {
+        // The plain rc3_default (FCH-only) must keep producing the same wire
+        // shape it did before SCH support was added. The shape we lock in
+        // here matches the pre-SCH encoder: FPC_INCL + FPC_PRI_CHAN + FPC_MODE
+        // + FPC_OLPC_FCH_INCL=1 + FCH triplet + FPC_OLPC_DCCH_INCL=0 +
+        // GATING_RATE_INCL=1 + PILOT_GATING_RATE + RESERVED + LPM_IND.
+        let baseline = NonNegServiceConfig::rc3_default();
+        let bits = encoded_bit_string(&baseline);
+        // Header + FCH block: 1+1+3+1+(5+8+8) = 27 bits,
+        // DCCH gate = 1 bit, NUM_SUP = 2 bits, gating = 3 bits, then
+        // reserved/LPM = 4 bits. Padded to 40 bits.
+        assert_eq!(bits.len(), 40);
+        assert_eq!(&bits[0..1], "1");
+        assert_eq!(
+            &bits[27..28],
+            "0",
+            "DCCH OLPC must remain 0 for the default"
+        );
+        assert_eq!(&bits[28..30], "00", "NUM_SUP must be 0 for the default");
+        assert_eq!(&bits[30..31], "1", "GATING_RATE_INCL follows NUM_SUP");
+    }
+
+    #[test]
+    fn rc3_fsch_default_emits_sch_fpc_block() {
+        let cfg = NonNegServiceConfig::rc3_fsch_default();
+        assert!(cfg.fpc_sch_incl);
+        let bits = encoded_bit_string(&cfg);
+
+        // With FPC_MODE=000 and no DCCH block, NUM_SUP sits right after the
+        // DCCH OLPC bit. It is a direct count, not N-1.
+        assert_eq!(&bits[28..30], "01", "NUM_SUP must be 1");
+        assert_eq!(&bits[30..31], "0", "SCH_ID = SCH0");
+
+        let fer = u8::from_str_radix(&bits[31..36], 2).unwrap();
+        let min = u8::from_str_radix(&bits[36..44], 2).unwrap();
+        let max = u8::from_str_radix(&bits[44..52], 2).unwrap();
+        assert_eq!(fer, 0b00010, "1% FER target");
+        assert_eq!(min, 0x00);
+        assert_eq!(max, 0x50, "10.0 dB max setpoint");
+        assert_eq!(&bits[52..53], "1", "GATING_RATE_INCL follows SCH record");
+    }
+
+    #[test]
+    fn fsch_block_is_independent_of_dcch_state() {
+        // Turning DCCH OLPC on must not displace the SCH bit interpretation
+        // by the test. Re-derive positions and walk both blocks.
+        let mut cfg = NonNegServiceConfig::rc3_fsch_default();
+        cfg.fpc_olpc_dcch_incl = true;
+        cfg.fpc_dcch_fer = 0b00011;
+        cfg.fpc_dcch_min_setpt = 0x10;
+        cfg.fpc_dcch_max_setpt = 0x40;
+
+        let bits = encoded_bit_string(&cfg);
+        // Header (1+1+3) + FCH OLPC (1) + FCH triplet (5+8+8) = 27
+        // + DCCH OLPC (1) + DCCH triplet (5+8+8) = 49
+        assert_eq!(&bits[27..28], "1", "DCCH OLPC bit");
+        assert_eq!(&bits[49..51], "01", "NUM_SUP follows DCCH triplet");
+        assert_eq!(&bits[51..52], "0", "SCH_ID follows NUM_SUP");
+        let max = u8::from_str_radix(&bits[65..73], 2).unwrap();
+        assert_eq!(max, 0x50);
+    }
+
+    #[test]
+    #[should_panic(expected = "FPC_SCH_FER=11111 is reserved")]
+    fn nonneg_rejects_reserved_sch_fer() {
+        let mut cfg = NonNegServiceConfig::rc3_fsch_default();
+        cfg.fpc_sch_fer = 0b11111;
+        let _ = cfg.encode();
+    }
+}
+
+#[cfg(test)]
+mod service_connect_fsch_wire_tests {
+    use super::*;
+
+    fn minimal_sc_params(for_sch_config: Option<ForSchConfig>) -> ServiceConnectParams {
+        ServiceConnectParams {
+            serv_con_seq: 0,
+            use_old_serv_config: 0,
+            for_mux_option: 0x0001,
+            rev_mux_option: 0x0001,
+            for_rates: 0xF0,
+            rev_rates: 0xF0,
+            sync_id: None,
+            connections: vec![],
+            fch_frame_size: 0,
+            for_fch_rc: 3,
+            rev_fch_rc: 3,
+            call_assignments: vec![],
+            use_type0_plcm: false,
+            non_neg: None,
+            for_sch_config,
+        }
+    }
+
+    fn bits_of(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() * 8);
+        for b in bytes {
+            for i in (0..8).rev() {
+                s.push(if (b >> i) & 1 == 1 { '1' } else { '0' });
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn service_config_record_no_sch_emits_for_sch_cc_incl_zero() {
+        let params = minimal_sc_params(None);
+        let bytes = params.encode_service_config_record();
+        let bits = bits_of(&bytes);
+
+        // Header: FOR_MUX(16) + REV_MUX(16) + FOR_RATES(8) + REV_RATES(8)
+        // + NUM_CON_REC(8) = 56 bits, then channel config:
+        //   FCH_CC_INCL(1) + FCH_FRAME_SIZE(1) + FOR_FCH_RC(5) + REV_FCH_RC(5)
+        //   + DCCH_CC_INCL(1) = 13 bits → through bit position 56+13 = 69.
+        // Bit 69 is FOR_SCH_CC_INCL.
+        assert_eq!(
+            &bits[69..70],
+            "0",
+            "FOR_SCH_CC_INCL must be 0 when no SCH config is provided"
+        );
+    }
+
+    #[test]
+    fn service_config_record_with_sch_emits_for_sch_cc_fields() {
+        let params = minimal_sc_params(Some(ForSchConfig {
+            sch_id: 0,
+            mux_option: 0x0809,
+            rc: 3,
+            coding: 0,
+            rate: 0x1, // 19.2 kbps for F-SCH RC3 per Table 2.7.4.27.3-2
+        }));
+        let bytes = params.encode_service_config_record();
+        let bits = bits_of(&bytes);
+
+        // Bit 69 = FOR_SCH_CC_INCL (after 56 header bits + 13 channel-cfg bits).
+        assert_eq!(&bits[69..70], "1", "FOR_SCH_CC_INCL must be 1");
+
+        // Per C.S0005-E §3.7.5.7 + §3.7.5.7.1, the SCH block layout when
+        // FOR_SCH_CC_INCL=1 is:
+        //   NUM_FOR_SCH         (2)   bits 70..72
+        //   FOR_SCH_ID          (2)   bits 72..74    Table 3.7.5.7-5 (00=SCH0)
+        //   FOR_SCH_MUX         (16)  bits 74..90
+        //   SCH_CC_Type-specific subrecord (16) — per §3.7.5.7.1:
+        //     SCH_REC_LEN       (4)   bits 90..94
+        //     SCH_RC            (5)   bits 94..99
+        //     CODING            (1)   bits 99..100
+        //     FRAME_40_USED     (1)   bits 100..101
+        //     FRAME_80_USED     (1)   bits 101..102
+        //     MAX_RATE          (4)   bits 102..106  Table 2.7.4.27.3-2
+        let num_for_sch = u8::from_str_radix(&bits[70..72], 2).unwrap();
+        let for_sch_id = u8::from_str_radix(&bits[72..74], 2).unwrap();
+        let for_sch_mux = u16::from_str_radix(&bits[74..90], 2).unwrap();
+        let sch_rec_len = u8::from_str_radix(&bits[90..94], 2).unwrap();
+        let sch_rc = u8::from_str_radix(&bits[94..99], 2).unwrap();
+        let coding = u8::from_str_radix(&bits[99..100], 2).unwrap();
+        let frame_40 = u8::from_str_radix(&bits[100..101], 2).unwrap();
+        let frame_80 = u8::from_str_radix(&bits[101..102], 2).unwrap();
+        let max_rate = u8::from_str_radix(&bits[102..106], 2).unwrap();
+
+        assert_eq!(
+            num_for_sch, 1,
+            "NUM_FOR_SCH = 1 (one SCH; '00' is forbidden)"
+        );
+        assert_eq!(for_sch_id, 0, "FOR_SCH_ID = 0 (SCH0)");
+        assert_eq!(
+            for_sch_mux, 0x0809,
+            "FOR_SCH_MUX = 360-bit Rate Set 1 Type 3 single"
+        );
+        assert_eq!(
+            sch_rec_len, 2,
+            "SCH_REC_LEN = 2 octets (the subrecord size)"
+        );
+        assert_eq!(sch_rc, 3, "SCH_RC = 3 (RC3)");
+        assert_eq!(coding, 0, "CODING = 0 (convolutional)");
+        assert_eq!(frame_40, 0, "FRAME_40_USED = 0 (Phase 1 = 20ms only)");
+        assert_eq!(frame_80, 0, "FRAME_80_USED = 0");
+        assert_eq!(max_rate, 0x1, "MAX_RATE = 0x1 (= 19.2 kbps for F-SCH RC3)");
+    }
+
+    #[test]
+    fn service_config_record_with_153k6_sch_uses_0x0921_mux() {
+        let params = minimal_sc_params(Some(ForSchConfig {
+            sch_id: 0,
+            mux_option: 0x0921,
+            rc: 3,
+            coding: 0,
+            rate: 0x4,
+        }));
+        let bytes = params.encode_service_config_record();
+        let bits = bits_of(&bytes);
+
+        let for_sch_mux = u16::from_str_radix(&bits[74..90], 2).unwrap();
+        let max_rate = u8::from_str_radix(&bits[102..106], 2).unwrap();
+
+        assert_eq!(
+            for_sch_mux, 0x0921,
+            "FOR_SCH_MUX = 3048-bit Rate Set 1 Type 3 double"
+        );
+        assert_eq!(max_rate, 0x4, "MAX_RATE = 0x4 (= 153.6 kbps for F-SCH RC3)");
+    }
+
+    #[test]
+    #[should_panic(expected = "F-SCH MAX_RATE must be 0x1..=0x4 for convolutional RC3")]
+    fn service_config_record_rejects_out_of_range_phase1_rate() {
+        let params = minimal_sc_params(Some(ForSchConfig {
+            sch_id: 0,
+            mux_option: 0x0809,
+            rc: 3,
+            coding: 0,
+            rate: 0x5,
+        }));
+        let _ = params.encode_service_config_record();
     }
 }

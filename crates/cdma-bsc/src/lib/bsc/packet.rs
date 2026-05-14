@@ -4,14 +4,20 @@
 //! remains as the radio-edge home for BSC-side packet assignment helpers; the
 //! actual packet control boundary lives at [`crate::packet::PcfClient`].
 
+use cdma_abis::control::typed::ForwardBurstRadioInfo;
 use cdma_common::channel::TrafficRate;
+use cdma_common::consts::{SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_PACKET_DATA};
+use cdma_common::sch::Rc3FschProfile;
 use log::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::abis_edge::ForwardBearerQueue;
 use crate::addressing::{format_ms_address, is_packet_data_so};
 
-use super::traffic_bearer::send_forward_fch_bits_with_bearer_client;
+use super::traffic_bearer::{
+    send_forward_fch_bits_with_bearer_client, send_forward_sch_bits_with_bearer_client,
+};
+use super::traffic_forward::fsch_escam_start_time_mod32;
 use super::{Bsc, TrafficChannelInfo, VOICE_REPLACEMENT_CON_REF, VoiceLegRole};
 
 /// Request to initiate a BS-originated data call (SO 7 or SO 33) to a subscriber.
@@ -60,7 +66,11 @@ impl Bsc {
             );
             return;
         };
-        let service_option = if req.service_option == 7 { 7u16 } else { 33u16 };
+        let service_option = if req.service_option == SERVICE_OPTION_PACKET_DATA {
+            SERVICE_OPTION_PACKET_DATA
+        } else {
+            SERVICE_OPTION_HIGH_RATE_PACKET_DATA
+        };
         info!(
             "BSC: initiating BS-originated data call subscriber={} SO={}",
             req.subscriber_id, service_option,
@@ -126,20 +136,54 @@ impl Bsc {
             }
         };
 
-        // Issue-tracked: F-SCH allocation remains disabled until ESCAM is
-        // validated end-to-end. Re-enable allocate_sch_rc3() + ESCAM send once
-        // the mobile accepts the supplemental channel assignment.
-        let sch_bearer_for_task: Option<(u8, u32)> = None;
+        // Abis Burst allocates the SCH code; ESCAM activates it on the MS.
         let bts_client = self.config.bts_client.clone();
+        let sch_code: Option<u8> = self.try_activate_fsch(walsh_code).await;
+        // After ESCAM, enable rate-matched SCH frames in the packet session.
+        let f_sch_rate_bps = self.config.traffic_assignment.f_sch_rate_bps;
+        if let Some(sch_code) = sch_code {
+            if let Err(e) = pcf_client
+                .set_sch_active(&session_id, true, f_sch_rate_bps)
+                .await
+            {
+                warn!(
+                    "BSC: F-SCH on walsh={} ESCAM sent but PCF set_sch_active(true) failed: {}; \
+                     releasing SCH",
+                    walsh_code, e
+                );
+                let profile = Rc3FschProfile::from_rate_bps(f_sch_rate_bps)
+                    .unwrap_or_else(Rc3FschProfile::default_19k2);
+                self.release_fsch_allocation(walsh_code, sch_code, profile, true, "PCF failure")
+                    .await;
+            }
+        }
+        // Re-read after the possible rollback above.
+        let sch_code: Option<u8> = self
+            .mobiles
+            .get_traffic_channel(walsh_code)
+            .and_then(|tc| tc.sch_walsh_code);
+        let sch_bearer_for_task: Option<(u8, u32)> = sch_code.map(|code| (code, 0));
         let walsh_for_log = walsh_code;
         let dl_task = tokio::spawn(async move {
             let mut dl_count: u64 = 0;
             while let Some(frame) = downlink_rx.recv().await {
-                if frame.rate_bps == 19200 {
-                    if let Some((w32_code, _bearer_id)) = sch_bearer_for_task {
+                if frame.rate_bps == f_sch_rate_bps {
+                    let Some((sch_code, _bearer_id)) = sch_bearer_for_task else {
+                        // No SCH allocated for this call — drop silently.
+                        // This happens when enable_f_sch is off or the
+                        // mobile is ineligible.
+                        continue;
+                    };
+                    if let Err(e) = send_forward_sch_bits_with_bearer_client(
+                        bts_client.as_ref(),
+                        0,
+                        sch_code,
+                        frame.rate_bps,
+                        frame.bits,
+                    ) {
                         warn!(
-                            "BSC: SCH packet DL bearer send not active for w32={}",
-                            w32_code
+                            "BSC: failed to send SCH DL frame sch_code={}: {}",
+                            sch_code, e
                         );
                     }
                     continue;
@@ -240,6 +284,104 @@ impl Bsc {
                 packet_session_id
             })
             .flatten()
+    }
+
+    /// Allocate F-SCH through Abis Burst, then activate it with ESCAM.
+    /// Returns the SCH Walsh code on success.
+    pub(crate) async fn try_activate_fsch(&mut self, walsh_code: u8) -> Option<u8> {
+        self.fsch_for_service_connect(walsh_code)?;
+        let profile = Rc3FschProfile::from_rate_bps(self.config.traffic_assignment.f_sch_rate_bps)
+            .unwrap_or_else(Rc3FschProfile::default_19k2);
+        let bts_client = self.config.bts_client.clone()?;
+        let request = ForwardBurstRadioInfo {
+            coding_indicator: profile.coding_indicator,
+            qof_mask: 0,
+            forward_code_channel_index: 0,
+            pilot_pn_code: self.config.pilot_offset as u16,
+            forward_supplemental_channel_rate: profile.num_bits_idx,
+            forward_supplemental_channel_start_time: fsch_escam_start_time_mod32(),
+            start_time_unit: 0,
+            forward_supplemental_channel_duration: 0x0f,
+        };
+        let committed = bts_client
+            .commit_forward_sch_burst(walsh_code, request)
+            .await?;
+        let sch_code = committed.forward_code_channel_index as u8;
+
+        if let Err(e) = self.send_escam_for_fsch(walsh_code, sch_code, profile) {
+            warn!(
+                "BSC: F-SCH allocated (code={}) on walsh={} but ESCAM send failed: {}; \
+                 releasing SCH",
+                sch_code, walsh_code, e
+            );
+            self.release_fsch_allocation(
+                walsh_code,
+                sch_code,
+                profile,
+                false,
+                "ESCAM send failure",
+            )
+            .await;
+            return None;
+        }
+        self.mobiles.update_tc(walsh_code, |_, tc| {
+            tc.sch_walsh_code = Some(sch_code);
+            tc.sch_bearer_id = Some(sch_code as u32);
+        });
+
+        info!(
+            "BSC: F-SCH activated walsh={} code={} rate={}",
+            walsh_code, sch_code, profile.rate_bps
+        );
+        Some(sch_code)
+    }
+
+    pub(crate) async fn release_fsch_allocation(
+        &mut self,
+        walsh_code: u8,
+        sch_code: u8,
+        profile: Rc3FschProfile,
+        notify_ms: bool,
+        reason: &str,
+    ) {
+        if notify_ms && let Err(e) = self.send_escam_release_for_fsch(walsh_code, sch_code, profile)
+        {
+            warn!(
+                "BSC: failed to send F-SCH release ESCAM walsh={} sch_code={} after {}: {}",
+                walsh_code, sch_code, reason, e
+            );
+        }
+
+        self.mobiles.update_tc(walsh_code, |_, tc| {
+            if tc.sch_walsh_code == Some(sch_code) {
+                tc.sch_walsh_code = None;
+                tc.sch_bearer_id = None;
+            }
+        });
+
+        let Some(bts_client) = self.config.bts_client.clone() else {
+            return;
+        };
+        let release = ForwardBurstRadioInfo {
+            coding_indicator: profile.coding_indicator,
+            qof_mask: 0,
+            forward_code_channel_index: sch_code as u16,
+            pilot_pn_code: self.config.pilot_offset as u16,
+            forward_supplemental_channel_rate: profile.num_bits_idx,
+            forward_supplemental_channel_start_time: 0,
+            start_time_unit: 0,
+            forward_supplemental_channel_duration: 0,
+        };
+        if bts_client
+            .commit_forward_sch_burst(walsh_code, release)
+            .await
+            .is_none()
+        {
+            warn!(
+                "BSC: BTS did not confirm F-SCH release walsh={} sch_code={} after {}",
+                walsh_code, sch_code, reason
+            );
+        }
     }
 
     pub(crate) fn close_packet_session_background(&self, walsh_code: u8, session_id: String) {

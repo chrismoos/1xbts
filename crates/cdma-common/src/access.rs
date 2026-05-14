@@ -7586,6 +7586,9 @@ fn decode_page_response(
 #[cfg(test)]
 mod tests {
     use crate::bits::Bitstream;
+    use crate::consts::{
+        SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_PACKET_DATA, SERVICE_OPTION_SMS,
+    };
     use crate::lac::message_types::{MessageId, WireChannel};
 
     use super::{
@@ -9838,7 +9841,7 @@ mod tests {
         bits.write_u8(rcsch_wire(MessageId::Reconnect), 8);
         bits.write_u8(1, 1); // ORIG_IND
         bits.write_u8(0, 1); // SYNC_ID_INCL
-        bits.write_u32(33, 16); // SERVICE_OPTION
+        bits.write_u32(u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA), 16); // SERVICE_OPTION
         bits.write_u8(0b010, 3); // SR_ID
 
         let msg =
@@ -9850,7 +9853,10 @@ mod tests {
         };
         assert!(msg.orig_ind);
         assert!(!msg.sync_id_incl);
-        assert_eq!(Some(33), msg.service_option);
+        assert_eq!(
+            Some(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+            msg.service_option
+        );
         assert_eq!(Some(0b010), msg.sr_id);
         assert_eq!(None, msg.sdb_incl);
         assert_eq!(0, msg.remaining_bits);
@@ -10019,7 +10025,7 @@ mod tests {
             scm: 0x2a,
             request_mode: 1,
             special_service: true,
-            service_option: Some(33),
+            service_option: Some(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
             pm: false,
             digit_mode: false,
             number_type: None,
@@ -10377,7 +10383,7 @@ mod tests {
             scm: 0x2a,
             request_mode: 1,
             special_service: true,
-            service_option: Some(33),
+            service_option: Some(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
             pm: false,
             digit_mode: false,
             number_type: Some(0),
@@ -10467,7 +10473,7 @@ mod tests {
                 add_sr_id: 4,
                 add_drs: true,
                 add_service_option_incl: Some(true),
-                add_service_option: Some(7),
+                add_service_option: Some(SERVICE_OPTION_PACKET_DATA),
                 add_qos_parms_incl: Some(true),
                 add_qos_parms_len: Some(1),
                 add_qos_parms: vec![0xa5],
@@ -10723,7 +10729,7 @@ mod tests {
         assert_eq!(3, msg.mob_p_rev);
         assert_eq!(0x6a, msg.scm);
         assert_eq!(3, msg.request_mode);
-        assert_eq!(6, msg.service_option);
+        assert_eq!(SERVICE_OPTION_SMS, msg.service_option);
         assert!(!msg.pm);
         assert!(!msg.nar_an_cap);
         assert_eq!(None, msg.encryption_supported);
@@ -10741,7 +10747,7 @@ mod tests {
         bits.write_u8(6, 8);
         bits.write_u8(0x3a, 8);
         bits.write_u8(0b001, 3);
-        bits.write_u32(6, 16);
+        bits.write_u32(u32::from(SERVICE_OPTION_SMS), 16);
         bits.write_u8(0, 1);
         bits.write_u8(0, 1);
         bits.write_u8(0b0001, 4); // ENCRYPTION_SUPPORTED
@@ -10781,7 +10787,7 @@ mod tests {
         assert_eq!(6, msg.mob_p_rev);
         assert_eq!(0x3a, msg.scm);
         assert_eq!(1, msg.request_mode);
-        assert_eq!(6, msg.service_option);
+        assert_eq!(SERVICE_OPTION_SMS, msg.service_option);
         assert_eq!(Some(0b0001), msg.encryption_supported);
         assert_eq!(1, msg.num_alt_so);
         assert_eq!(vec![0x22], msg.alt_service_options);
@@ -10807,7 +10813,7 @@ mod tests {
         assert_eq!(vec![3], dcch.rev_supported_rcs);
 
         let access = AccessMessage::PageResponse(msg);
-        assert_eq!(Some(6), access.service_option());
+        assert_eq!(Some(SERVICE_OPTION_SMS), access.service_option());
         assert_eq!(vec![1, 3], access.for_supported_rcs());
         assert_eq!(vec![1, 2], access.rev_supported_rcs());
     }
@@ -11007,7 +11013,7 @@ mod tests {
         bits.write_u8(9, 8); // MOB_P_REV
         bits.write_u8(0x2a, 8); // SCM
         bits.write_u8(0b001, 3); // REQUEST_MODE
-        bits.write_u32(33, 16); // SERVICE_OPTION
+        bits.write_u32(u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA), 16); // SERVICE_OPTION
         bits.write_u8(0, 1); // PM
         bits.write_u8(0, 1); // NAR_AN_CAP
         // ENCRYPTION_SUPPORTED omitted (p_rev >= 7)
@@ -11099,7 +11105,7 @@ mod tests {
         bits.write_u8(11, 8); // MOB_P_REV
         bits.write_u8(0x2a, 8); // SCM
         bits.write_u8(0b001, 3); // REQUEST_MODE
-        bits.write_u32(33, 16); // SERVICE_OPTION
+        bits.write_u32(u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA), 16); // SERVICE_OPTION
         bits.write_u8(0, 1); // PM
         bits.write_u8(0, 1); // NAR_AN_CAP
         bits.write_u8(0, 3); // NUM_ALT_SO
@@ -11604,7 +11610,7 @@ mod tests {
         // Connection record 0
         bs.write_u32(7, 8); // RECORD_LEN includes the length octet
         bs.write_u32(0, 8); // CON_REF = 0
-        bs.write_u32(6, 16); // SERVICE_OPTION = 6 (SO6 SMS)
+        bs.write_u32(u32::from(SERVICE_OPTION_SMS), 16); // SERVICE_OPTION = 6 (SO6 SMS)
         bs.write_u32(1, 4); // FOR_TRAFFIC = 1
         bs.write_u32(1, 4); // REV_TRAFFIC = 1
         bs.write_u32(0, 3); // UI_ENCRYPT_MODE = 0
@@ -11683,7 +11689,7 @@ mod tests {
         assert_eq!(1, cfg.connection_records.len());
         let cr = &cfg.connection_records[0];
         assert_eq!(0, cr.con_ref);
-        assert_eq!(6, cr.service_option); // SO6 = SMS
+        assert_eq!(SERVICE_OPTION_SMS, cr.service_option); // SO6 = SMS
         assert_eq!(1, cr.for_traffic);
         assert_eq!(1, cr.rev_traffic);
         assert_eq!(0, cr.ui_encrypt_mode);
@@ -11878,7 +11884,7 @@ mod tests {
         let ServiceConnectRecord::ServiceConfig(ref cfg) = sc.records[0] else {
             panic!("expected ServiceConfig");
         };
-        assert_eq!(6, cfg.connection_records[0].service_option); // SO6
+        assert_eq!(SERVICE_OPTION_SMS, cfg.connection_records[0].service_option); // SO6
 
         // Step 2: MS responds with Service Connect Completion (r-dsch)
         let mut scc_bs = Bitstream::new();
@@ -11963,7 +11969,7 @@ mod tests {
             sync_id: None,
             connections: vec![EncConnRec {
                 con_ref: 0,
-                service_option: 6,
+                service_option: SERVICE_OPTION_SMS,
                 for_traffic: 1,
                 rev_traffic: 1,
                 ui_encrypt_mode: 0,
@@ -12016,7 +12022,7 @@ mod tests {
         assert_eq!(0xF0, cfg.for_rates);
         assert_eq!(0xF0, cfg.rev_rates);
         assert_eq!(1, cfg.connection_records.len());
-        assert_eq!(6, cfg.connection_records[0].service_option);
+        assert_eq!(SERVICE_OPTION_SMS, cfg.connection_records[0].service_option);
         assert_eq!(1, cfg.connection_records[0].for_traffic);
         assert_eq!(1, cfg.connection_records[0].rev_traffic);
         assert_eq!(0, cfg.connection_records[0].ui_encrypt_mode);
@@ -12029,7 +12035,7 @@ mod tests {
         let ServiceConnectRecord::NonNegServiceConfig(ref nn) = sc.records[1] else {
             panic!("expected NonNegServiceConfig");
         };
-        assert_eq!(vec![0x84, 0x40, 0x0A, 0x08, 0x00], nn.raw_bytes);
+        assert_eq!(vec![0x84, 0x40, 0x0A, 0x02, 0x00], nn.raw_bytes);
     }
 
     #[test]
@@ -12049,7 +12055,7 @@ mod tests {
             sync_id: None,
             connections: vec![EncConnRec {
                 con_ref: 0,
-                service_option: 6,
+                service_option: SERVICE_OPTION_SMS,
                 for_traffic: 1,
                 rev_traffic: 1,
                 ui_encrypt_mode: 0,
@@ -12158,7 +12164,7 @@ mod tests {
             .expect("expected one connection record");
 
         assert_eq!(sc.serv_con_seq, 3);
-        assert_eq!(conn.service_option, 7);
+        assert_eq!(conn.service_option, SERVICE_OPTION_PACKET_DATA);
         assert_eq!(conn.sr_id, 2);
         assert!(conn.rlp_info_incl);
         assert_eq!(conn.rlp_blob.as_deref(), Some(&[0x12, 0x34, 0x56][..]));

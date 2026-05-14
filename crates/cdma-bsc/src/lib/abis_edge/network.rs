@@ -21,7 +21,8 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use cdma_abis::bearer::TrafficFrame;
 use cdma_abis::bearer_transport::BearerTransport;
 use cdma_abis::control::typed::{
-    A3RemoveInformation, CdmaServingOneWayDelay, CellId, CellIdWithMscId, MobileIdentity,
+    A3RemoveInformation, BurstCommitMessage, BurstRequestMessage, BurstResponseMessage,
+    CdmaServingOneWayDelay, CellId, CellIdWithMscId, ForwardBurstRadioInfo, MobileIdentity,
     PhysicalChannelInfo, PhysicalChannelType, PilotGatingRate,
 };
 use cdma_abis::control::{
@@ -32,7 +33,7 @@ use cdma_abis::control::{
 use cdma_abis::transport::{TransportEvent, TransportSender};
 use cdma_abis::udp_bearer::UdpBearerDatagram;
 
-use cdma_bts::bts::{SchWalshChannelRc3, TrafficResourceService};
+use cdma_bts::bts::TrafficResourceService;
 use cdma_common::events::AccessChannelEvent;
 use cdma_common::phy::long_code::LongCodeGenerator;
 use cdma_common::traffic::TrafficRxRequest;
@@ -49,8 +50,14 @@ struct PendingSetup {
     tx: oneshot::Sender<SetupResult>,
 }
 
+struct PendingBurst {
+    tx: oneshot::Sender<ForwardBurstRadioInfo>,
+}
+
 struct SetupResult {
     walsh_code: u8,
+    /// Setup-time SCH code, if returned by legacy transports.
+    sch_walsh_code: Option<u8>,
 }
 
 /// Network-backed Abis control client.
@@ -91,6 +98,7 @@ pub struct NetworkClientConfig {
 struct NetworkClientInner {
     next_ccr: u32,
     pending_setups: HashMap<CallConnectionReference, PendingSetup>,
+    pending_bursts: HashMap<CallConnectionReference, PendingBurst>,
     pending_releases: HashMap<CallConnectionReference, oneshot::Sender<()>>,
     walsh_to_ccr: HashMap<u8, CallConnectionReference>,
     access_event_tx: Option<mpsc::UnboundedSender<AccessChannelEvent>>,
@@ -158,6 +166,7 @@ impl NetworkBtsControlClient {
         let inner = Arc::new(Mutex::new(NetworkClientInner {
             next_ccr: 1,
             pending_setups: HashMap::new(),
+            pending_bursts: HashMap::new(),
             pending_releases: HashMap::new(),
             walsh_to_ccr: HashMap::new(),
             access_event_tx,
@@ -341,12 +350,28 @@ impl NetworkBtsControlClient {
                 let ccr = connect.call_connection_reference;
                 info!("abis_network: received Connect for CCR {:?}", ccr);
 
-                let walsh_code = connect
-                    .connect_information
-                    .first()
-                    .and_then(|ci| ci.cell_info_records.first())
-                    .map(|r| r.code_channel)
-                    .unwrap_or(0);
+                // Extract the FCH walsh by matching on PhysicalChannelType so a
+                // BtsSetup that requested both Fch and Sch surfaces both codes
+                // unambiguously regardless of order.
+                let extract_code = |ty: PhysicalChannelType| -> Option<u8> {
+                    connect
+                        .connect_information
+                        .iter()
+                        .find(|ci| ci.physical_channel_type == ty)
+                        .and_then(|ci| ci.cell_info_records.first())
+                        .map(|r| r.code_channel)
+                };
+                let walsh_code = extract_code(PhysicalChannelType::Fch).unwrap_or_else(|| {
+                    // Fallback: legacy BTS responding without explicit
+                    // physical_channel_type tagging — take the first entry.
+                    connect
+                        .connect_information
+                        .first()
+                        .and_then(|ci| ci.cell_info_records.first())
+                        .map(|r| r.code_channel)
+                        .unwrap_or(0)
+                });
+                let sch_walsh_code = extract_code(PhysicalChannelType::Sch);
 
                 let ack = ConnectAckMessage {
                     call_connection_reference: ccr,
@@ -373,7 +398,10 @@ impl NetworkBtsControlClient {
 
                 let mut guard = inner.lock().await;
                 if let Some(pending) = guard.pending_setups.remove(&ccr) {
-                    let _ = pending.tx.send(SetupResult { walsh_code });
+                    let _ = pending.tx.send(SetupResult {
+                        walsh_code,
+                        sch_walsh_code,
+                    });
                 }
             }
             MessageType::BtsSetupAck => {
@@ -391,6 +419,46 @@ impl NetworkBtsControlClient {
             }
             MessageType::BtsReleaseAck => {
                 info!("abis_network: received BtsReleaseAck");
+            }
+            MessageType::BurstResponse => {
+                let Ok(bytes) = encode(msg) else { return };
+                let Ok(response) = BurstResponseMessage::decode(&bytes) else {
+                    return;
+                };
+                let Some(ccr) = response.call_connection_reference else {
+                    return;
+                };
+                let Some(info) = response.forward_burst_radio_info else {
+                    warn!(
+                        "abis_network: BurstResponse for CCR {:?} missing ForwardBurstRadioInfo",
+                        ccr
+                    );
+                    return;
+                };
+                info!(
+                    "abis_network: received BurstResponse for CCR {:?} sch_code={} rate_idx={}",
+                    ccr, info.forward_code_channel_index, info.forward_supplemental_channel_rate
+                );
+                let commit = BurstCommitMessage {
+                    call_connection_reference: Some(ccr),
+                    correlation_id: response.correlation_id,
+                    forward_cell_identifier_list: response.committed_cell_identifier_list.clone(),
+                    reverse_cell_identifier_list: Some(Vec::new()),
+                    forward_burst_radio_info: Some(info),
+                    reverse_burst_radio_info: None,
+                    is2000_forward_power_control_mode: None,
+                    is2000_fpc_gain_ratio_info: None,
+                    abis_destination_id: response.abis_destination_id.clone(),
+                };
+                if let Ok(commit_bytes) = commit.encode()
+                    && let Ok(commit_msg) = decode(&commit_bytes)
+                {
+                    let _ = sender.send(&commit_msg).await;
+                }
+                let mut guard = inner.lock().await;
+                if let Some(pending) = guard.pending_bursts.remove(&ccr) {
+                    let _ = pending.tx.send(info);
+                }
             }
             MessageType::RemoveAck => {
                 let Ok(bytes) = encode(msg) else { return };
@@ -740,7 +808,18 @@ impl NetworkBtsControlClient {
         }
     }
 
-    async fn send_bts_setup(&self, ccr: CallConnectionReference, esn: u32) -> Option<SetupResult> {
+    async fn send_bts_setup(
+        &self,
+        ccr: CallConnectionReference,
+        esn: u32,
+        include_sch: bool,
+    ) -> Option<SetupResult> {
+        if include_sch {
+            log::info!(
+                "abis_edge: ignoring legacy setup-time SCH request; SCH uses Abis Burst allocation"
+            );
+        }
+        let physical_channels = vec![PhysicalChannelType::Fch];
         let setup = BtsSetupMessage {
             call_connection_reference: ccr,
             band_class: None,
@@ -752,7 +831,7 @@ impl NetworkBtsControlClient {
                 pilot_gating_rate: PilotGatingRate::Full,
                 arfcn: 0,
                 otd: false,
-                physical_channels: vec![PhysicalChannelType::Fch],
+                physical_channels,
             }),
             service_option: None,
             paca_timestamp: None,
@@ -1079,7 +1158,8 @@ impl BtsControlClient for NetworkBtsControlClient {
             let mut guard = self.inner.lock().await;
             self.allocate_ccr(&mut guard)
         };
-        let result = self.send_bts_setup(ccr, esn).await?;
+        // RC1 calls never carry F-SCH (Phase 1 is RC3-only).
+        let result = self.send_bts_setup(ccr, esn, false).await?;
         {
             let mut guard = self.inner.lock().await;
             guard.walsh_to_ccr.insert(result.walsh_code, ccr);
@@ -1095,6 +1175,7 @@ impl BtsControlClient for NetworkBtsControlClient {
             rev_rc: 1,
             rc_label: "RC1",
             power_control_delay_pcgs: 8,
+            sch_walsh_code: None,
         })
     }
 
@@ -1104,12 +1185,13 @@ impl BtsControlClient for NetworkBtsControlClient {
         _initial_lc_chip: u64,
         _fpc_subchan_gain: u8,
         esn: u32,
+        include_sch: bool,
     ) -> Option<BtsTrafficChannelHandle> {
         let ccr = {
             let mut guard = self.inner.lock().await;
             self.allocate_ccr(&mut guard)
         };
-        let result = self.send_bts_setup(ccr, esn).await?;
+        let result = self.send_bts_setup(ccr, esn, include_sch).await?;
         {
             let mut guard = self.inner.lock().await;
             guard.walsh_to_ccr.insert(result.walsh_code, ccr);
@@ -1125,16 +1207,8 @@ impl BtsControlClient for NetworkBtsControlClient {
             rev_rc: 3,
             rc_label: "RC3",
             power_control_delay_pcgs: 8,
+            sch_walsh_code: result.sch_walsh_code,
         })
-    }
-
-    async fn allocate_rc3_sch(
-        &self,
-        _lc_generator: LongCodeGenerator,
-        _sch_gain_linear: f32,
-    ) -> Option<(u8, SchWalshChannelRc3)> {
-        warn!("abis_network: allocate_rc3_sch not yet implemented over Abis");
-        None
     }
 
     async fn deallocate_traffic(&self, walsh_code: u8) {
@@ -1159,8 +1233,51 @@ impl BtsControlClient for NetworkBtsControlClient {
         }
     }
 
-    async fn deallocate_sch(&self, _w32_code: u8) {
-        warn!("abis_network: deallocate_sch not yet implemented over Abis");
+    async fn commit_forward_sch_burst(
+        &self,
+        walsh_code: u8,
+        request: ForwardBurstRadioInfo,
+    ) -> Option<ForwardBurstRadioInfo> {
+        let ccr = {
+            let guard = self.inner.lock().await;
+            *guard.walsh_to_ccr.get(&walsh_code)?
+        };
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut guard = self.inner.lock().await;
+            guard.pending_bursts.insert(ccr, PendingBurst { tx });
+        }
+        let msg = BurstRequestMessage {
+            call_connection_reference: Some(ccr),
+            band_class: None,
+            downlink_radio_environment: None,
+            cdma_serving_one_way_delay: None,
+            privacy_info: None,
+            correlation_id: Some(cdma_abis::control::CorrelationId(
+                walsh_code as u32 | ((request.forward_supplemental_channel_rate as u32) << 8),
+            )),
+            sdu_id: None,
+            mobile_identities: Vec::new(),
+            cell_identifier_list: Some(vec![self.config.cell_id]),
+            forward_burst_radio_info: Some(request),
+            reverse_burst_radio_info: None,
+            abis_destination_id: None,
+        };
+        let bytes = msg.encode().ok()?;
+        let abis = decode(&bytes).ok()?;
+        if self.sender.send(&abis).await.is_err() {
+            let mut guard = self.inner.lock().await;
+            guard.pending_bursts.remove(&ccr);
+            return None;
+        }
+        match tokio::time::timeout(Duration::from_millis(500), rx).await {
+            Ok(Ok(info)) => Some(info),
+            _ => {
+                let mut guard = self.inner.lock().await;
+                guard.pending_bursts.remove(&ccr);
+                None
+            }
+        }
     }
 
     async fn set_traffic_gain(&self, walsh_code: u8, gain_linear: f32) -> bool {

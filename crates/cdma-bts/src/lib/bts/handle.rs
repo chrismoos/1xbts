@@ -5,12 +5,12 @@ use parking_lot::Mutex;
 
 use tokio::sync::{mpsc, oneshot, watch};
 
-use cdma_common::time::CdmaSystemTime;
+use cdma_common::{sch::Rc3FschProfile, time::CdmaSystemTime};
 
 use crate::{
     channels::{
         Channel, PcgPcbFallbackMode, PcgPcbScheduler, WalshChannel, WalshChannelWrapper,
-        f_sch_rc3::{ForwardSupplementalChannelRc3, SchConfigRc3},
+        f_sch_rc3::{ForwardSupplementalChannelRc3, SchConfigRc3, interleaver_params},
         ftch::{self, ForwardTrafficChannel},
         ftch_rc3::{self, ForwardTrafficChannelRc3},
     },
@@ -270,27 +270,37 @@ impl WalshAllocator {
         }
     }
 
-    /// Allocate a W(32) code for F-SCH at 19.2 kbps.
-    /// A W(32) code N aliases W(64) codes 2N and 2N+1; both must be free.
-    /// Returns the W(32) code index (0..31), or None if no pair is available.
-    pub fn allocate_w32(&mut self) -> Option<u8> {
-        for base in (FIRST_TRAFFIC_WALSH_CODE..64).step_by(2) {
-            if !self.in_use[base] && !self.in_use[base + 1] {
-                self.in_use[base] = true;
-                self.in_use[base + 1] = true;
-                return Some((base / 2) as u8);
+    /// Allocate a W(4), W(8), W(16), or W(32) code for F-SCH.
+    pub fn allocate_sch(&mut self, walsh_len: usize) -> Option<u8> {
+        if !matches!(walsh_len, 4 | 8 | 16 | 32) {
+            return None;
+        }
+        let aliases = 64 / walsh_len;
+        let first_code = FIRST_TRAFFIC_WALSH_CODE.div_ceil(aliases);
+        let code_count = walsh_len;
+        for code in first_code..code_count {
+            let base = code * aliases;
+            if (base..base + aliases).all(|i| !self.in_use[i]) {
+                for i in base..base + aliases {
+                    self.in_use[i] = true;
+                }
+                return Some(code as u8);
             }
         }
         None
     }
 
-    /// Release a W(32) code allocated by `allocate_w32`.
-    /// Frees the two aliased W(64) slots.
-    pub fn release_w32(&mut self, w32_code: u8) {
-        let base = (w32_code as usize) * 2;
-        if base + 1 < 64 {
-            self.in_use[base] = false;
-            self.in_use[base + 1] = false;
+    /// Release a W(4), W(8), W(16), or W(32) F-SCH code.
+    pub fn release_sch(&mut self, walsh_len: usize, code: u8) {
+        if !matches!(walsh_len, 4 | 8 | 16 | 32) {
+            return;
+        }
+        let aliases = 64 / walsh_len;
+        let base = (code as usize) * aliases;
+        if base + aliases <= 64 {
+            for i in base..base + aliases {
+                self.in_use[i] = false;
+            }
         }
     }
 }
@@ -559,35 +569,42 @@ pub fn commit_traffic_channel_rc3(
     channel_ref
 }
 
-/// Allocate an RC3 Forward Supplemental Channel (F-SCH) at 19.2 kbps.
+/// Allocate an RC3 Forward Supplemental Channel (F-SCH).
 ///
-/// Uses W(32) Walsh codes (each consuming 2 W(64) code slots).
+/// Uses the Walsh length required by the selected SCH profile.
 /// The SCH uses the same PLCM as the paired F-FCH (same ESN).
-/// Returns the W(32) code index and a cloned reference to the channel.
+/// Returns the SCH Walsh code index and a cloned reference to the channel.
 pub fn allocate_sch_rc3(
     walsh_allocator: &Arc<Mutex<WalshAllocator>>,
     traffic_channels: &TrafficChannelPool,
     lc_generator: LongCodeGenerator,
     sch_gain_linear: f32,
+    profile: Rc3FschProfile,
 ) -> Option<(u8, SchWalshChannelRc3)> {
-    let w32_code = walsh_allocator.lock().allocate_w32()?;
+    let sch_code = walsh_allocator.lock().allocate_sch(profile.walsh_len)?;
 
     let scrambling_lc = lc_generator.clone();
     let puncture_lc = lc_generator;
+    let walsh = match profile.walsh_len {
+        4 => WalshGenerator::new::<4>(sch_code as usize, 1),
+        8 => WalshGenerator::new::<8>(sch_code as usize, 1),
+        16 => WalshGenerator::new::<16>(sch_code as usize, 1),
+        32 => WalshGenerator::new::<32>(sch_code as usize, 1),
+        _ => return None,
+    };
 
     let sch = WalshChannel::new(
-        WalshGenerator::new::<32>(w32_code as usize, 1),
+        walsh,
         ForwardSupplementalChannelRc3::new(SchConfigRc3 {
+            profile,
             encoder: get_1_4_k9_encoder(),
-            interleaver: ForwardBackwardsBitReversalInterleaver::new(
-                crate::phy::coding::block_interleaver::SR1_PARAMS_1536,
-            ),
+            interleaver: ForwardBackwardsBitReversalInterleaver::new(interleaver_params(profile)),
             scrambling_lc,
             puncture_lc,
             lc_chip_cursor: 0,
-            pcb_scheduler: PcgPcbScheduler::new_named(0, w32_code, format!("sch-w{}", w32_code)),
             sch_gain_linear,
             prev_frame_last_chip: 0,
+            frame_pcg_index: 0,
             disable_lc_scrambling: false,
         }),
     );
@@ -595,7 +612,7 @@ pub fn allocate_sch_rc3(
     let channel_ref = sch.clone();
 
     traffic_channels.lock().push(TrafficChannelSlot {
-        walsh_code: w32_code,
+        walsh_code: sch_code,
         gain: sch_gain_linear,
         channel: TrafficChannelWrapper::SchRc3(sch),
         start_chip: None,
@@ -603,26 +620,36 @@ pub fn allocate_sch_rc3(
         frame_align_verified: false,
     });
 
-    Some((w32_code, channel_ref))
+    Some((sch_code, channel_ref))
 }
 
-/// Deallocate an F-SCH by W(32) code and free it from the pool/allocator.
+/// Deallocate an F-SCH by code and free it from the pool/allocator.
 pub fn deallocate_sch(
     walsh_allocator: &Arc<Mutex<WalshAllocator>>,
     traffic_channels: &TrafficChannelPool,
-    w32_code: u8,
+    sch_code: u8,
 ) {
     let mut pool = traffic_channels.lock();
+    let mut walsh_len = None;
     pool.retain(|slot| {
-        !(slot.walsh_code == w32_code && matches!(slot.channel, TrafficChannelWrapper::SchRc3(_)))
+        let remove =
+            slot.walsh_code == sch_code && matches!(slot.channel, TrafficChannelWrapper::SchRc3(_));
+        if remove && let TrafficChannelWrapper::SchRc3(ch) = &slot.channel {
+            walsh_len = Some(ch.channel.profile().walsh_len);
+        }
+        !remove
     });
-    walsh_allocator.lock().release_w32(w32_code);
-    log::info!(
-        "deallocate_sch: released W(32) code {} (W64 aliases {}, {})",
-        w32_code,
-        w32_code as u16 * 2,
-        w32_code as u16 * 2 + 1,
-    );
+    drop(pool);
+    if let Some(walsh_len) = walsh_len {
+        walsh_allocator.lock().release_sch(walsh_len, sch_code);
+        log::info!(
+            "deallocate_sch: released W({}) code {}",
+            walsh_len,
+            sch_code
+        );
+    } else {
+        log::warn!("deallocate_sch: no active SCH code {} found", sch_code);
+    }
 }
 
 /// Deallocate a traffic channel by Walsh code and free it from the pool/allocator.
@@ -715,7 +742,11 @@ pub(crate) fn create_handle(config: Arc<BtsRuntimeSettings>) -> (BtsHandleSender
 
 #[cfg(test)]
 mod tests {
-    use super::WalshAllocator;
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+
+    use super::{TrafficChannelPool, WalshAllocator, deallocate_sch};
 
     #[test]
     fn walsh_allocator_starts_traffic_pool_at_ten() {
@@ -724,5 +755,73 @@ mod tests {
 
         assert_eq!(alloc.allocate(), Some(10));
         assert_eq!(alloc.allocate(), Some(11));
+    }
+
+    #[test]
+    fn sch_allocator_returns_aligned_walsh_codes() {
+        let mut alloc = WalshAllocator::new();
+        alloc.reserve_system_channels(0, 1, 32);
+
+        assert_eq!(alloc.allocate_sch(16), Some(3));
+        assert!(alloc.in_use[12]);
+        assert!(alloc.in_use[13]);
+        assert!(alloc.in_use[14]);
+        assert!(alloc.in_use[15]);
+        assert!(!alloc.in_use[10]);
+        assert!(!alloc.in_use[11]);
+        assert!(!alloc.in_use[16]);
+        assert!(!alloc.in_use[17]);
+    }
+
+    #[test]
+    fn sch_allocator_avoids_fch_alias_overlap() {
+        let mut alloc = WalshAllocator::new();
+        alloc.reserve_system_channels(0, 1, 32);
+
+        assert_eq!(alloc.allocate(), Some(10));
+        assert_eq!(alloc.allocate(), Some(11));
+        assert_eq!(alloc.allocate(), Some(12));
+        assert_eq!(alloc.allocate(), Some(13));
+
+        assert_eq!(alloc.allocate_sch(16), Some(4));
+        assert!(alloc.in_use[16]);
+        assert!(alloc.in_use[17]);
+        assert!(alloc.in_use[18]);
+        assert!(alloc.in_use[19]);
+    }
+
+    #[test]
+    fn sch_allocator_reserves_full_w4_subtree() {
+        let mut alloc = WalshAllocator::new();
+        alloc.reserve_system_channels(0, 1, 32);
+
+        assert_eq!(alloc.allocate_sch(4), Some(1));
+        for code in 16..32 {
+            assert!(alloc.in_use[code], "W64 descendant {code} must be blocked");
+        }
+        assert!(!alloc.in_use[33]);
+
+        assert_eq!(alloc.allocate_sch(4), Some(3));
+        for code in 48..64 {
+            assert!(alloc.in_use[code], "W64 descendant {code} must be blocked");
+        }
+
+        assert_eq!(alloc.allocate_sch(4), None);
+    }
+
+    #[test]
+    fn deallocate_sch_missing_slot_does_not_free_aliases() {
+        let allocator = Arc::new(Mutex::new(WalshAllocator::new()));
+        allocator.lock().reserve_system_channels(0, 1, 32);
+        assert_eq!(allocator.lock().allocate(), Some(10));
+        assert!(allocator.lock().in_use[10]);
+
+        let traffic_channels: TrafficChannelPool = Arc::new(Mutex::new(Vec::new()));
+        deallocate_sch(&allocator, &traffic_channels, 5);
+
+        assert!(
+            allocator.lock().in_use[10],
+            "missing SCH deallocation must not release W64 aliases owned by other channels"
+        );
     }
 }

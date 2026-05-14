@@ -84,7 +84,7 @@ fn setup_message() -> BtsSetupMessage {
         sdu_id: None,
         mobile_identities: vec![MobileIdentity::Imsi("12345678901".to_string())],
         physical_channel_info: Some(physical_channel_info()),
-        service_option: Some(ServiceOption(0x0021)),
+        service_option: Some(ServiceOption::HIGH_RATE_PACKET_DATA),
         paca_timestamp: None,
         quality_of_service_parameters: Some(QualityOfServiceParameters {
             packet_priority: 0x0a,

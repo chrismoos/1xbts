@@ -47,6 +47,7 @@ use cdma_bts::sdr::cdma2000_baseband_filter_taps_f64;
 use cdma_bts::sdr::pipe::RadioPipe;
 
 use cdma_common::bits::Bitstream;
+use cdma_common::consts::{SERVICE_OPTION_PACKET_DATA, SERVICE_OPTION_SMS};
 use cdma_common::error::Error;
 
 use cdma_packet::grpc::PacketServiceImpl;
@@ -146,7 +147,7 @@ fn synthetic_origination_so7(esn: u32) -> AccessChannelEvent {
         mob_p_rev: Some(6),
         slot_cycle_index: Some(2),
         scm: Some(0x2a),
-        service_option: Some(7),
+        service_option: Some(SERVICE_OPTION_PACKET_DATA),
         wall_clock_us: chrono::Utc::now().timestamp_micros() as u64,
         rx_wall_time: None,
         rx_hw_time_ns: None,
@@ -2810,7 +2811,10 @@ async fn test_e2e_so7_rc3_reverse_preamble_queues_bs_ack() {
     .clone();
 
     assert_eq!(mobile.traffic_walsh_code, Some(walsh_code));
-    assert_eq!(mobile.traffic_service_option, Some(7));
+    assert_eq!(
+        mobile.traffic_service_option,
+        Some(SERVICE_OPTION_PACKET_DATA)
+    );
     assert_eq!(mobile.state, "TrafficActive");
     assert_eq!(mobile.voice_call_state.as_deref(), Some("WaitingMsAck"));
 
@@ -3225,7 +3229,7 @@ fn synthetic_origination_so6(esn: u32) -> AccessChannelEvent {
         mob_p_rev: Some(6),
         slot_cycle_index: Some(2),
         scm: Some(0x2a),
-        service_option: Some(6),
+        service_option: Some(SERVICE_OPTION_SMS),
         wall_clock_us: chrono::Utc::now().timestamp_micros() as u64,
         rx_wall_time: None,
         rx_hw_time_ns: None,

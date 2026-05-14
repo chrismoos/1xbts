@@ -130,6 +130,24 @@ impl MobileIdentity {
 pub struct ServiceOptionValue(pub u16);
 
 impl ServiceOptionValue {
+    /// SO3: EVRC-A / IS-127 narrowband.
+    pub const EVRC_A: Self = Self(3);
+
+    /// SO6: Short Message Services.
+    pub const SMS: Self = Self(6);
+
+    /// SO7: Packet data, async/fax data service.
+    pub const PACKET_DATA: Self = Self(7);
+
+    /// SO33: High-rate packet data service.
+    pub const HIGH_RATE_PACKET_DATA: Self = Self(33);
+
+    /// SO68: EVRC-B narrowband.
+    pub const EVRC_B: Self = Self(68);
+
+    /// SO70: EVRC-WB.
+    pub const EVRC_WB: Self = Self(70);
+
     /// Encodes the service-option payload.
     pub const fn encode(self) -> [u8; 2] {
         self.0.to_be_bytes()

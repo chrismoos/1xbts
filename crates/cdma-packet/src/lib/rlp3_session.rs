@@ -6,6 +6,7 @@
 /// Frame-synchronous: the caller drives the session by calling `receive_frame()`
 /// for each received traffic frame and `next_frame()` to get the next outbound frame.
 use crate::rlp3_frames::{self, MuxOption, NakGapEntry, NakPayload, Rlp3ControlType, Rlp3Frame};
+use std::collections::VecDeque;
 
 // ---------------------------------------------------------------------------
 // Frame rate
@@ -121,6 +122,10 @@ struct RexmitEntry {
     l_seq: u16,
     /// Data payload.
     data: Vec<u8>,
+    /// Byte offset for segmented SCH retransmission.
+    segment_offset: usize,
+    /// Segment sequence for segmented SCH retransmission.
+    next_s_seq: u16,
 }
 
 // ---------------------------------------------------------------------------
@@ -184,7 +189,7 @@ pub struct Rlp3Session {
     nak_list: Vec<NakEntry>,
 
     /// Retransmission queue: frames we sent that were NAK'd and need retransmitting.
-    rexmit_queue: Vec<RexmitEntry>,
+    rexmit_queue: VecDeque<RexmitEntry>,
 
     /// Sent data frames kept for retransmission, indexed by L_SEQ mod 4096.
     sent_buffer: Vec<Option<Vec<u8>>>,
@@ -222,7 +227,7 @@ impl Rlp3Session {
             rx_buffer: Vec::new(),
             reseq_buffer: vec![None; SEQ_MODULUS as usize],
             nak_list: Vec::new(),
-            rexmit_queue: Vec::new(),
+            rexmit_queue: VecDeque::new(),
             sent_buffer: vec![None; SEQ_MODULUS as usize],
             idle_timer: 0,
             idle_interval: 10, // send idle every 10 frames (~200ms)
@@ -255,6 +260,10 @@ impl Rlp3Session {
         self.l_v_n_peer
     }
 
+    pub fn next_new_data_requires_seq_hi(&self) -> bool {
+        self.new_data_requires_seq_hi(self.l_v_s)
+    }
+
     pub fn rlp_delay(&self) -> u32 {
         self.rlp_delay
     }
@@ -278,10 +287,18 @@ impl Rlp3Session {
         self.tx_queue.len()
     }
 
+    pub fn rexmit_queue_len(&self) -> usize {
+        self.rexmit_queue.len()
+    }
+
     /// Returns true if there are pending control frames (NAKs) or
     /// retransmissions that require a full-rate frame to send.
     pub fn has_pending_controls(&self) -> bool {
         !self.pending_controls.is_empty() || !self.rexmit_queue.is_empty()
+    }
+
+    pub fn has_pending_control_frames(&self) -> bool {
+        !self.pending_controls.is_empty()
     }
 
     /// Returns data delivered in-order from the resequencing buffer, if any.
@@ -400,6 +417,14 @@ impl Rlp3Session {
     /// Returns the encoded bit vector for the given rate.
     /// Should be called once per 20ms frame period.
     pub fn next_frame(&mut self, rate: FrameRate) -> Vec<u8> {
+        self.next_frame_with_payload(rate, true)
+    }
+
+    pub fn next_frame_control_only(&mut self, rate: FrameRate) -> Vec<u8> {
+        self.next_frame_with_payload(rate, false)
+    }
+
+    fn next_frame_with_payload(&mut self, rate: FrameRate, allow_payload: bool) -> Vec<u8> {
         if self.state == Rlp3State::Uninitialized {
             self.initialize();
         }
@@ -435,7 +460,7 @@ impl Rlp3Session {
                 self.handshake_frames_sent += 1;
                 if self.handshake_frames_sent > self.round_trip_counter {
                     self.enter_data_transfer();
-                    return self.build_data_frame(rate);
+                    return self.build_data_frame(rate, allow_payload);
                 }
                 let frame = Rlp3Frame::Control {
                     seq: v_r_8(self.l_v_s),
@@ -446,8 +471,134 @@ impl Rlp3Session {
                 frame.encode(mux).unwrap_or_default()
             }
 
-            Rlp3State::DataTransfer => self.build_data_frame(rate),
+            Rlp3State::DataTransfer => self.build_data_frame(rate, allow_payload),
         }
+    }
+
+    /// Get the next supplemental Rate 1 RLP data block for SCH.
+    ///
+    /// Supplemental RLP frames cannot carry RLP control, fill, or idle frames.
+    /// Controls continue on the fundamental channel while SCH carries fixed-size
+    /// Format C new-data or retransmission blocks.
+    pub fn next_supplemental_frame_170(&mut self) -> Option<Vec<u8>> {
+        self.next_supplemental_frame(170)
+    }
+
+    pub fn next_supplemental_frame(&mut self, block_bits: usize) -> Option<Vec<u8>> {
+        let format_c_data_len = rlp3_frames::supplemental_format_c_data_len(block_bits)?;
+        let format_d_data_len = rlp3_frames::supplemental_format_d_data_len(block_bits)?;
+        if self.state != Rlp3State::DataTransfer {
+            return None;
+        }
+
+        let rexmit_idx = self.rexmit_queue.iter().position(|entry| {
+            let remaining = entry.data.len().saturating_sub(entry.segment_offset);
+            let needs_seq_hi = self.new_data_requires_seq_hi(entry.l_seq);
+            entry.segment_offset > 0
+                || entry.data.len() == format_c_data_len
+                || (!entry.data.is_empty() && entry.data.len() <= format_d_data_len)
+                || (needs_seq_hi
+                    && remaining > 0
+                    && rlp3_frames::supplemental_format_d_segment_data_len(
+                        block_bits,
+                        entry.segment_offset == 0,
+                    )
+                    .is_some())
+        });
+
+        if let Some(rexmit_idx) = rexmit_idx {
+            let mut rexmit = self.rexmit_queue.remove(rexmit_idx)?;
+            let seq_8 = v_r_8(rexmit.l_seq);
+            let needs_seq_hi = self.new_data_requires_seq_hi(rexmit.l_seq);
+            let remaining = rexmit.data.len().saturating_sub(rexmit.segment_offset);
+            let segment_max = rlp3_frames::supplemental_format_d_segment_data_len(
+                block_bits,
+                rexmit.segment_offset == 0,
+            )?;
+            let use_segmented =
+                rexmit.segment_offset > 0 || (needs_seq_hi && remaining > format_d_data_len);
+            let use_format_d = use_segmented
+                || (!rexmit.data.is_empty()
+                    && rexmit.data.len() <= format_d_data_len
+                    && (rexmit.data.len() != format_c_data_len || needs_seq_hi));
+            let bits = if use_segmented {
+                let data_len = remaining.min(segment_max);
+                let offset = rexmit.segment_offset;
+                let next_offset = offset + data_len;
+                let last_seg = next_offset == rexmit.data.len();
+                let data = rexmit.data[offset..next_offset].to_vec();
+                let seq_hi = (offset == 0).then_some((rexmit.l_seq >> 8) as u8);
+                let bits = rlp3_frames::encode_supplemental_format_d_segment_block(
+                    seq_8,
+                    seq_hi,
+                    rexmit.next_s_seq,
+                    last_seg,
+                    true,
+                    &data,
+                    block_bits,
+                )
+                .ok()?;
+                if !last_seg {
+                    rexmit.segment_offset = next_offset;
+                    rexmit.next_s_seq = rexmit.next_s_seq.saturating_add(1);
+                    self.rexmit_queue.push_front(rexmit);
+                }
+                bits
+            } else if use_format_d {
+                rlp3_frames::encode_supplemental_format_d_block(
+                    seq_8,
+                    needs_seq_hi.then_some((rexmit.l_seq >> 8) as u8),
+                    true,
+                    &rexmit.data,
+                    block_bits,
+                )
+                .ok()?
+            } else {
+                rlp3_frames::encode_supplemental_format_c_block(
+                    seq_8,
+                    true,
+                    &rexmit.data,
+                    block_bits,
+                )
+                .ok()?
+            };
+            self.idle_timer = 0;
+            return Some(bits);
+        }
+
+        let needs_seq_hi = self.new_data_requires_seq_hi(self.l_v_s);
+        let use_format_d =
+            needs_seq_hi || (self.tx_queue.len() < format_c_data_len && !self.tx_queue.is_empty());
+        let data_len = if use_format_d {
+            self.tx_queue.len().min(format_d_data_len)
+        } else {
+            format_c_data_len
+        };
+        if data_len == 0 || self.tx_queue.len() < data_len {
+            return None;
+        }
+
+        let l_seq = self.l_v_s;
+        let seq_8 = v_r_8(l_seq);
+        let data: Vec<u8> = self.tx_queue.drain(..data_len).collect();
+        let bits = if use_format_d {
+            rlp3_frames::encode_supplemental_format_d_block(
+                seq_8,
+                needs_seq_hi.then_some((l_seq >> 8) as u8),
+                false,
+                &data,
+                block_bits,
+            )
+            .ok()?
+        } else {
+            rlp3_frames::encode_supplemental_format_c_block(seq_8, false, &data, block_bits).ok()?
+        };
+
+        self.sent_buffer[l_seq as usize] = Some(data);
+        self.l_v_s = (self.l_v_s + 1) % SEQ_MODULUS;
+        self.idle_timer = 0;
+
+        Some(bits)
     }
 
     // -----------------------------------------------------------------------
@@ -585,11 +736,7 @@ impl Rlp3Session {
                 self.l_v_n_peer = l_seq;
                 vec![]
             }
-            Rlp3Frame::Idle1 { seq, seq_hi } => {
-                let l_seq = ((*seq_hi as u16) << 8) | (*seq as u16);
-                self.l_v_n_peer = l_seq;
-                vec![]
-            }
+            Rlp3Frame::Idle1 { .. } => vec![],
             Rlp3Frame::Idle2 { .. } => vec![],
             Rlp3Frame::Control { .. } => vec![],
             Rlp3Frame::Segmented {
@@ -633,6 +780,7 @@ impl Rlp3Session {
                 events.push(RlpEvent::SendNak { first: s, last: s });
                 s = (s + 1) % SEQ_MODULUS;
             }
+            self.queue_nak_range(gap_start, (gap_end + SEQ_MODULUS - 1) % SEQ_MODULUS);
             // Store this frame and advance L_V(R).
             self.reseq_buffer[l_seq as usize] = Some(data.to_vec());
             self.l_v_r = (l_seq + 1) % SEQ_MODULUS;
@@ -646,6 +794,7 @@ impl Rlp3Session {
                 self.reseq_buffer[l_seq as usize] = Some(data.to_vec());
                 // Remove from NAK list if present.
                 self.nak_list.retain(|e| e.l_seq != l_seq);
+                self.remove_pending_naks_for(l_seq);
                 if l_seq == self.l_v_n {
                     self.deliver_contiguous();
                     return self.flush_delivery_events();
@@ -663,6 +812,7 @@ impl Rlp3Session {
             let l_seq = entry.l_seq;
             // Remove from NAK list.
             self.nak_list.retain(|e| e.l_seq != l_seq);
+            self.remove_pending_naks_for(l_seq);
             // Store in resequencing buffer.
             if self.reseq_buffer[l_seq as usize].is_none() {
                 self.reseq_buffer[l_seq as usize] = Some(data.to_vec());
@@ -831,36 +981,125 @@ impl Rlp3Session {
             round_counter: 1,
             rexmit_timer: timer,
         });
-        // Queue NAK control frame for transmission.
-        self.queue_nak_for(l_seq);
     }
 
-    /// Queue a NAK gap frame for a single missing sequence.
-    fn queue_nak_for(&mut self, l_seq: u16) {
-        let frame = Rlp3Frame::Nak {
-            seq: v_r_8(l_seq),
-            seq_hi: (l_seq >> 8) as u8,
-            payload: NakPayload::Gap(vec![NakGapEntry {
-                first: l_seq,
-                last: l_seq,
-            }]),
-        };
-        self.pending_controls.push(frame);
+    /// Queue a NAK gap frame for a contiguous missing sequence range.
+    fn queue_nak_range(&mut self, first: u16, last: u16) {
+        self.queue_nak_entries(vec![NakGapEntry { first, last }]);
+    }
+
+    fn queue_nak_entries(&mut self, entries: Vec<NakGapEntry>) {
+        for chunk in entries.chunks(4) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let frame = Rlp3Frame::Nak {
+                seq: v_r_8(self.l_v_n),
+                seq_hi: (self.l_v_n >> 8) as u8,
+                payload: NakPayload::Gap(chunk.to_vec()),
+            };
+            self.pending_controls.push(frame);
+        }
+    }
+
+    fn coalesced_nak_entries(seqs: &[u16]) -> Vec<NakGapEntry> {
+        let mut entries: Vec<NakGapEntry> = Vec::new();
+        for &seq in seqs {
+            match entries.last_mut() {
+                Some(entry) if (entry.last + 1) % SEQ_MODULUS == seq => {
+                    entry.last = seq;
+                }
+                _ => entries.push(NakGapEntry {
+                    first: seq,
+                    last: seq,
+                }),
+            }
+        }
+        entries
+    }
+
+    fn nak_entries_without_seq(entries: &[NakGapEntry], l_seq: u16) -> Vec<NakGapEntry> {
+        let mut remaining = Vec::new();
+        for entry in entries {
+            let mut seqs = Vec::new();
+            let mut seq = entry.first;
+            loop {
+                if seq != l_seq {
+                    seqs.push(seq);
+                }
+                if seq == entry.last {
+                    break;
+                }
+                seq = (seq + 1) % SEQ_MODULUS;
+            }
+            remaining.extend(Self::coalesced_nak_entries(&seqs));
+        }
+        remaining
+    }
+
+    fn pending_nak_ranges(&self) -> Vec<NakGapEntry> {
+        self.pending_controls
+            .iter()
+            .filter_map(|frame| match frame {
+                Rlp3Frame::Nak {
+                    payload: NakPayload::Gap(entries),
+                    ..
+                } => Some(entries.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
+    fn remove_pending_naks_for(&mut self, l_seq: u16) {
+        let mut controls = Vec::with_capacity(self.pending_controls.len());
+        for frame in std::mem::take(&mut self.pending_controls) {
+            match frame {
+                Rlp3Frame::Nak {
+                    seq,
+                    seq_hi,
+                    payload: NakPayload::Gap(entries),
+                } if entries
+                    .iter()
+                    .any(|entry| seq_in_closed_range(l_seq, entry.first, entry.last)) =>
+                {
+                    let entries = Self::nak_entries_without_seq(&entries, l_seq);
+                    if !entries.is_empty() {
+                        controls.push(Rlp3Frame::Nak {
+                            seq,
+                            seq_hi,
+                            payload: NakPayload::Gap(entries),
+                        });
+                    }
+                }
+                other => controls.push(other),
+            }
+        }
+        self.pending_controls = controls;
     }
 
     /// Tick NAK timers (called once per frame period). Returns events for expired entries.
     fn tick_nak_timers(&mut self) -> Vec<RlpEvent> {
         let mut events = Vec::new();
         let mut expired_seqs = Vec::new();
-        let mut new_nak_frames = Vec::new();
+        let mut naks_to_send: Vec<(usize, u16)> = Vec::new();
         let timer_val = self.rexmit_timer_frames();
         let max_rounds = self.config.nak_rounds_fwd;
+        let pending_naks = self.pending_nak_ranges();
 
         for entry in &mut self.nak_list {
             if entry.rexmit_timer > 0 {
                 entry.rexmit_timer -= 1;
             }
             if entry.rexmit_timer == 0 {
+                if pending_naks
+                    .iter()
+                    .any(|nak| seq_in_closed_range(entry.l_seq, nak.first, nak.last))
+                {
+                    entry.rexmit_timer = timer_val;
+                    continue;
+                }
                 if entry.round_counter < max_rounds {
                     // Send NAK_COUNT[round] copies per C.S0017 §3.7.2.5.
                     let round_idx = entry.round_counter as usize;
@@ -872,23 +1111,27 @@ impl Rlp3Session {
                         .unwrap_or(1) as usize;
                     entry.round_counter += 1;
                     entry.rexmit_timer = timer_val;
-                    for _ in 0..nak_count {
-                        new_nak_frames.push(Rlp3Frame::Nak {
-                            seq: v_r_8(entry.l_seq),
-                            seq_hi: (entry.l_seq >> 8) as u8,
-                            payload: NakPayload::Gap(vec![NakGapEntry {
-                                first: entry.l_seq,
-                                last: entry.l_seq,
-                            }]),
-                        });
-                    }
+                    naks_to_send.push((nak_count, entry.l_seq));
                 } else {
                     // Rounds exhausted: abandon.
                     expired_seqs.push(entry.l_seq);
                 }
             }
         }
-        self.pending_controls.extend(new_nak_frames);
+        let mut grouped: Vec<(usize, Vec<u16>)> = Vec::new();
+        for (nak_count, seq) in naks_to_send {
+            if let Some((_, seqs)) = grouped.iter_mut().find(|(count, _)| *count == nak_count) {
+                seqs.push(seq);
+            } else {
+                grouped.push((nak_count, vec![seq]));
+            }
+        }
+        for (nak_count, seqs) in grouped {
+            let entries = Self::coalesced_nak_entries(&seqs);
+            for _ in 0..nak_count {
+                self.queue_nak_entries(entries.clone());
+            }
+        }
 
         for seq in &expired_seqs {
             events.push(RlpEvent::NakAbandoned {
@@ -939,23 +1182,27 @@ impl Rlp3Session {
         let delay = if self.config.rlp_delay > 0 {
             self.config.rlp_delay as u32
         } else {
-            self.rlp_delay.max(1)
+            // Keep the inferred delay at least as large as the four-frame
+            // post-SYNC guard we use before entering data transfer. Live
+            // mobiles commonly deliver RLP retransmissions after that guard,
+            // and a shorter estimate stacks later NAK rounds before the peer
+            // has a chance to answer the first one.
+            self.rlp_delay.max(self.round_trip_counter).max(1)
         };
         2 * delay + 1
     }
 
     /// Process an incoming NAK from the peer: queue retransmissions.
-    fn process_nak(&mut self, _seq: u8, _seq_hi: u8, payload: &NakPayload) {
+    fn process_nak(&mut self, seq: u8, seq_hi: u8, payload: &NakPayload) {
+        self.l_v_n_peer = ((seq_hi as u16) << 8) | (seq as u16);
+        let mut queued = 0usize;
         match payload {
             NakPayload::Gap(entries) => {
                 for entry in entries {
                     let mut s = entry.first;
                     loop {
-                        if let Some(data) = &self.sent_buffer[s as usize] {
-                            self.rexmit_queue.push(RexmitEntry {
-                                l_seq: s,
-                                data: data.clone(),
-                            });
+                        if self.queue_retransmission(s) {
+                            queued += 1;
                         }
                         if s == entry.last {
                             break;
@@ -964,9 +1211,68 @@ impl Rlp3Session {
                     }
                 }
             }
-            _ => {
-                // Map/segment NAK types not implemented.
+            NakPayload::Map(entries) => {
+                for entry in entries {
+                    if self.queue_retransmission(entry.nak_map_seq) {
+                        queued += 1;
+                    }
+                    for bit in 0..8 {
+                        let mask = 0x80 >> bit;
+                        if entry.nak_map & mask != 0 {
+                            let l_seq = (entry.nak_map_seq + 1 + bit) % SEQ_MODULUS;
+                            if self.queue_retransmission(l_seq) {
+                                queued += 1;
+                            }
+                        }
+                    }
+                }
             }
+            NakPayload::SegmentRange(entries) => {
+                for entry in entries {
+                    if self.queue_retransmission(entry.frame_seq) {
+                        queued += 1;
+                    }
+                }
+                log::debug!(
+                    "RLP3: approximating segment-range NAK with whole-frame retransmission entries={}",
+                    entries.len()
+                );
+            }
+            NakPayload::SegmentLength(entries) => {
+                for entry in entries {
+                    if self.queue_retransmission(entry.frame_seq) {
+                        queued += 1;
+                    }
+                }
+                log::debug!(
+                    "RLP3: approximating segment-length NAK with whole-frame retransmission entries={}",
+                    entries.len()
+                );
+            }
+        }
+        log::info!(
+            "RLP3: processed peer NAK kind={} peer_l_v_n={} queued_rexmit={}",
+            nak_payload_kind(payload),
+            self.l_v_n_peer,
+            queued
+        );
+    }
+
+    fn queue_retransmission(&mut self, l_seq: u16) -> bool {
+        if self.rexmit_queue.iter().any(|entry| entry.l_seq == l_seq) {
+            return false;
+        }
+        if let Some(data) = &self.sent_buffer[l_seq as usize] {
+            self.rexmit_queue.push_back(RexmitEntry {
+                l_seq,
+                data: data.clone(),
+                segment_offset: 0,
+                next_s_seq: 0,
+            });
+            true
+        } else {
+            log::debug!("RLP3: peer NAK requested unsaved frame l_seq={}", l_seq);
+            false
         }
     }
 
@@ -975,7 +1281,7 @@ impl Rlp3Session {
     // -----------------------------------------------------------------------
 
     /// Build the next frame to transmit. Priority: control > rexmit > new data > idle > fill.
-    fn build_data_frame(&mut self, rate: FrameRate) -> Vec<u8> {
+    fn build_data_frame(&mut self, rate: FrameRate, allow_payload: bool) -> Vec<u8> {
         let mux = self.config.mux_option;
 
         // At sub-rate, only control/idle/fill frames fit.
@@ -996,8 +1302,17 @@ impl Rlp3Session {
             return ctrl.encode(mux).unwrap_or_default();
         }
 
+        if !allow_payload {
+            self.idle_timer += 1;
+            if self.idle_timer >= self.idle_interval {
+                self.idle_timer = 0;
+                return self.build_idle_frame();
+            }
+            return self.build_fill_frame();
+        }
+
         // Priority 2: Retransmitted data.
-        if let Some(rexmit) = self.rexmit_queue.pop() {
+        if let Some(rexmit) = self.rexmit_queue.pop_front() {
             self.idle_timer = 0;
             let seq_8 = v_r_8(rexmit.l_seq);
             let data_len = mux.format_b_data_len();
@@ -1096,9 +1411,9 @@ impl Rlp3Session {
     fn new_data_requires_seq_hi(&self, l_seq: u16) -> bool {
         // C.S0017-010-A 3.7.1: when NUM_ROUNDSpeer > 0 and the 12-bit sequence
         // is more than 255 ahead of L_V(N)peer, the new data frame shall include
-        // SEQ_HI. We model NUM_ROUNDSpeer with the negotiated reverse-direction
-        // NAK rounds.
-        self.config.nak_rounds_rev > 0
+        // SEQ_HI. For BS-originated forward-link frames, peer NUM_ROUNDS is
+        // represented by the negotiated forward-link NAK rounds.
+        self.config.nak_rounds_fwd > 0
             && ((l_seq + SEQ_MODULUS - self.l_v_n_peer) % SEQ_MODULUS) > 255
     }
 
@@ -1152,6 +1467,15 @@ fn max_segmented_single_segment_len(mux: MuxOption) -> usize {
     (mux.info_bits().saturating_sub(header_bits)) / 8
 }
 
+fn nak_payload_kind(payload: &NakPayload) -> &'static str {
+    match payload {
+        NakPayload::Gap(_) => "gap",
+        NakPayload::Map(_) => "map",
+        NakPayload::SegmentRange(_) => "segment_range",
+        NakPayload::SegmentLength(_) => "segment_length",
+    }
+}
+
 /// Compare two 12-bit sequence numbers: returns true if a > b in mod-4096 space.
 fn seq12_gt(a: u16, b: u16) -> bool {
     if a == b {
@@ -1167,6 +1491,14 @@ fn seq12_lt(a: u16, b: u16) -> bool {
         return false;
     }
     !seq12_gt(a, b)
+}
+
+fn seq_in_closed_range(seq: u16, first: u16, last: u16) -> bool {
+    if first <= last {
+        seq >= first && seq <= last
+    } else {
+        seq >= first || seq <= last
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1277,6 +1609,14 @@ mod tests {
         frame.encode(mux()).unwrap()
     }
 
+    fn bits_to_u32(bits: &[u8], offset: usize, n: usize) -> u32 {
+        let mut value = 0u32;
+        for i in 0..n {
+            value = (value << 1) | (bits[offset + i] as u32);
+        }
+        value
+    }
+
     #[test]
     fn quarter_rate_idle_fill_is_encoded_as_sub_rate_bits() {
         let mut session = setup_connected_session();
@@ -1285,6 +1625,345 @@ mod tests {
         assert_eq!(bits.len(), 40);
         let decoded = rlp3_frames::decode_sub_rate_frame(&bits, 40).unwrap();
         assert!(matches!(decoded, Rlp3Frame::Fill { .. }));
+    }
+
+    #[test]
+    fn supplemental_frame_uses_format_c_and_shared_sequence_space() {
+        let mut session = setup_connected_session();
+        let payload: Vec<u8> = (0..25).collect();
+        session.send_data(&payload);
+
+        let bits = session.next_supplemental_frame_170().unwrap();
+
+        assert_eq!(bits.len(), 170);
+        assert_eq!(bits[0..2], [1, 0]);
+        assert_eq!(session.l_v_s(), 1);
+        assert_eq!(session.tx_queue_len(), 5);
+    }
+
+    #[test]
+    fn supplemental_frame_uses_double_size_format_c_for_0x0921() {
+        let mut session = setup_connected_session();
+        let payload: Vec<u8> = (0..50).collect();
+        session.send_data(&payload);
+
+        let bits = session.next_supplemental_frame(346).unwrap();
+
+        assert_eq!(bits.len(), 346);
+        assert_eq!(bits[0..2], [1, 0]);
+        assert_eq!(session.l_v_s(), 1);
+        assert_eq!(session.tx_queue_len(), 8);
+    }
+
+    #[test]
+    fn supplemental_frame_retransmits_matching_sch_blocks() {
+        let mut session = setup_connected_session();
+        let payload: Vec<u8> = (0..84).collect();
+        session.send_data(&payload);
+
+        let first = session.next_supplemental_frame(346).unwrap();
+        assert_eq!(first[0..2], [1, 0]);
+        assert_eq!(bits_to_u32(&first, 2, 8), 0);
+        assert_eq!(session.tx_queue_len(), 42);
+
+        let peer_nak = Rlp3Frame::Nak {
+            seq: 0,
+            seq_hi: 0,
+            payload: NakPayload::Gap(vec![NakGapEntry { first: 0, last: 0 }]),
+        };
+        session.receive_frame(&encode_frame(&peer_nak), FrameRate::Full);
+
+        let rexmit = session.next_supplemental_frame(346).unwrap();
+        assert_eq!(rexmit[0..2], [1, 1]);
+        assert_eq!(bits_to_u32(&rexmit, 2, 8), 0);
+        assert_eq!(session.tx_queue_len(), 42);
+
+        let second = session.next_supplemental_frame(346).unwrap();
+        assert_eq!(second[0..2], [1, 0]);
+        assert_eq!(bits_to_u32(&second, 2, 8), 1);
+        assert!(session.tx_queue_is_empty());
+    }
+
+    #[test]
+    fn repeated_peer_nak_does_not_duplicate_queued_retransmission() {
+        let mut session = setup_connected_session();
+        let payload: Vec<u8> = (0..42).collect();
+        session.send_data(&payload);
+        assert!(session.next_supplemental_frame(346).is_some());
+
+        let peer_nak = Rlp3Frame::Nak {
+            seq: 0,
+            seq_hi: 0,
+            payload: NakPayload::Gap(vec![NakGapEntry { first: 0, last: 0 }]),
+        };
+        session.receive_frame(&encode_frame(&peer_nak), FrameRate::Full);
+        session.receive_frame(&encode_frame(&peer_nak), FrameRate::Full);
+
+        assert_eq!(session.rexmit_queue_len(), 1);
+    }
+
+    #[test]
+    fn generated_nak_header_reports_l_v_n_not_missing_sequence() {
+        let mut session = setup_connected_session();
+        session.l_v_r = 10;
+        session.l_v_n = 10;
+
+        let peer_frame = Rlp3Frame::DataFormatB {
+            seq: 12,
+            rexmit: false,
+            data: vec![0x55; 20],
+        };
+        let events = session.receive_frame(&encode_frame(&peer_frame), FrameRate::Full);
+
+        assert_eq!(
+            events,
+            vec![
+                RlpEvent::SendNak {
+                    first: 10,
+                    last: 10
+                },
+                RlpEvent::SendNak {
+                    first: 11,
+                    last: 11
+                }
+            ]
+        );
+
+        let nak = session.next_frame(FrameRate::Full);
+        let nak = rlp3_frames::decode_rlp3_frame(&nak, mux()).unwrap();
+        match nak {
+            Rlp3Frame::Nak {
+                seq,
+                seq_hi,
+                payload: NakPayload::Gap(entries),
+            } => {
+                assert_eq!(seq, 10);
+                assert_eq!(seq_hi, 0);
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].first, 10);
+                assert_eq!(entries[0].last, 11);
+            }
+            other => panic!("expected NAK, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_coalesced_nak_preserves_remaining_gap_when_one_frame_arrives() {
+        let mut session = setup_connected_session();
+        session.l_v_r = 10;
+        session.l_v_n = 10;
+
+        let peer_frame = Rlp3Frame::DataFormatB {
+            seq: 14,
+            rexmit: false,
+            data: vec![0x55; 20],
+        };
+        session.receive_frame(&encode_frame(&peer_frame), FrameRate::Full);
+
+        let retransmit = Rlp3Frame::DataFormatB {
+            seq: 11,
+            rexmit: true,
+            data: vec![0x66; 20],
+        };
+        session.receive_frame(&encode_frame(&retransmit), FrameRate::Full);
+
+        let nak = session.next_frame(FrameRate::Full);
+        let nak = rlp3_frames::decode_rlp3_frame(&nak, mux()).unwrap();
+        match nak {
+            Rlp3Frame::Nak {
+                payload: NakPayload::Gap(entries),
+                ..
+            } => {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].first, 10);
+                assert_eq!(entries[0].last, 10);
+                assert_eq!(entries[1].first, 12);
+                assert_eq!(entries[1].last, 13);
+            }
+            other => panic!("expected NAK, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nak_timer_waits_when_matching_nak_is_still_pending() {
+        let mut config = default_config();
+        config.nak_rounds_fwd = 3;
+        config.rlp_delay = 1;
+        let mut session = Rlp3Session::new(config);
+        session.initialize();
+        session.state = Rlp3State::DataTransfer;
+
+        let peer_frame = Rlp3Frame::Data {
+            seq: 1,
+            rexmit: false,
+            data: vec![0xBB],
+        };
+        session.receive_frame(&encode_frame(&peer_frame), FrameRate::Full);
+        assert_eq!(session.nak_list[0].round_counter, 1);
+        assert_eq!(session.pending_controls.len(), 1);
+
+        let timer = session.nak_list[0].rexmit_timer;
+        for _ in 0..timer {
+            session.receive_frame(&[], FrameRate::Blank);
+        }
+
+        assert_eq!(session.nak_list[0].round_counter, 1);
+        assert_eq!(
+            session.nak_list[0].rexmit_timer,
+            session.rexmit_timer_frames()
+        );
+        assert_eq!(session.pending_controls.len(), 1);
+    }
+
+    #[test]
+    fn peer_nak_updates_l_v_n_peer_for_sch_seq_hi_window() {
+        let mut session = setup_connected_session();
+        session.l_v_s = 300;
+        session.l_v_n_peer = 0;
+        session.send_data(&[0x55; 42]);
+
+        let bits = session.next_supplemental_frame(346).unwrap();
+        assert_eq!(bits[0..2], [0, 0]);
+        assert_eq!(bits_to_u32(&bits, 2, 8), v_r_8(300) as u32);
+        assert_eq!(bits_to_u32(&bits, 11, 1), 1);
+        assert_eq!(bits_to_u32(&bits, 14, 8), 40);
+        assert_eq!(bits_to_u32(&bits, 22, 4), 1);
+        assert_eq!(session.l_v_s(), 301);
+        assert_eq!(session.tx_queue_len(), 2);
+
+        let peer_nak = Rlp3Frame::Nak {
+            seq: 100,
+            seq_hi: 0,
+            payload: NakPayload::Gap(vec![NakGapEntry { first: 0, last: 0 }]),
+        };
+        session.receive_frame(&encode_frame(&peer_nak), FrameRate::Full);
+
+        assert_eq!(session.l_v_n_peer(), 100);
+    }
+
+    #[test]
+    fn supplemental_retransmits_saved_seq_hi_blocks_after_peer_window_moves() {
+        let mut session = setup_connected_session();
+        session.l_v_s = 300;
+        session.l_v_n_peer = 0;
+        session.send_data(&[0x55; 18]);
+
+        let first = session.next_supplemental_frame_170().unwrap();
+        assert_eq!(first[0..2], [0, 0]);
+        assert_eq!(bits_to_u32(&first, 2, 8), v_r_8(300) as u32);
+        assert_eq!(bits_to_u32(&first, 11, 1), 1);
+        assert_eq!(bits_to_u32(&first, 13, 1), 0);
+        assert_eq!(bits_to_u32(&first, 14, 8), 18);
+        assert_eq!(session.l_v_s(), 301);
+
+        let peer_nak = Rlp3Frame::Nak {
+            seq: v_r_8(300),
+            seq_hi: 1,
+            payload: NakPayload::Gap(vec![NakGapEntry {
+                first: 300,
+                last: 300,
+            }]),
+        };
+        session.receive_frame(&encode_frame(&peer_nak), FrameRate::Full);
+        assert_eq!(session.l_v_n_peer(), 300);
+        assert_eq!(session.rexmit_queue_len(), 1);
+
+        let rexmit = session.next_supplemental_frame_170().unwrap();
+        assert_eq!(rexmit[0..2], [0, 0]);
+        assert_eq!(bits_to_u32(&rexmit, 2, 8), v_r_8(300) as u32);
+        assert_eq!(bits_to_u32(&rexmit, 11, 1), 0);
+        assert_eq!(bits_to_u32(&rexmit, 13, 1), 1);
+        assert_eq!(bits_to_u32(&rexmit, 14, 8), 18);
+        assert_eq!(session.rexmit_queue_len(), 0);
+    }
+
+    #[test]
+    fn idle_frame_does_not_update_peer_receive_window() {
+        let mut session = setup_connected_session();
+        session.l_v_n_peer = 100;
+
+        let idle = Rlp3Frame::Idle1 { seq: 44, seq_hi: 1 };
+        session.receive_frame(&encode_frame(&idle), FrameRate::Full);
+
+        assert_eq!(session.l_v_n_peer(), 100);
+    }
+
+    #[test]
+    fn supplemental_retransmit_segments_full_frame_when_seq_hi_required() {
+        let mut session = setup_connected_session();
+        session.l_v_s = 300;
+        session.l_v_n_peer = 100;
+        session.send_data(&[0x55; 20]);
+
+        let first = session.next_supplemental_frame_170().unwrap();
+        assert_eq!(first[0..2], [1, 0]);
+        assert_eq!(bits_to_u32(&first, 2, 8), v_r_8(300) as u32);
+        assert_eq!(session.tx_queue_len(), 0);
+
+        let peer_nak = Rlp3Frame::Nak {
+            seq: 0,
+            seq_hi: 0,
+            payload: NakPayload::Gap(vec![NakGapEntry {
+                first: 300,
+                last: 300,
+            }]),
+        };
+        session.receive_frame(&encode_frame(&peer_nak), FrameRate::Full);
+        assert_eq!(session.l_v_n_peer(), 0);
+        assert_eq!(session.rexmit_queue_len(), 1);
+
+        let rexmit_first = session.next_supplemental_frame_170().unwrap();
+        assert_eq!(rexmit_first[0..2], [0, 0]);
+        assert_eq!(bits_to_u32(&rexmit_first, 2, 8), v_r_8(300) as u32);
+        assert_eq!(bits_to_u32(&rexmit_first, 10, 1), 1);
+        assert_eq!(bits_to_u32(&rexmit_first, 11, 1), 1);
+        assert_eq!(bits_to_u32(&rexmit_first, 12, 1), 0);
+        assert_eq!(bits_to_u32(&rexmit_first, 13, 1), 1);
+        assert_eq!(bits_to_u32(&rexmit_first, 14, 8), 16);
+        assert_eq!(bits_to_u32(&rexmit_first, 22, 4), 1);
+        assert_eq!(bits_to_u32(&rexmit_first, 26, 12), 0);
+        assert_eq!(session.rexmit_queue_len(), 1);
+
+        let rexmit_last = session.next_supplemental_frame_170().unwrap();
+        assert_eq!(rexmit_last[0..2], [0, 0]);
+        assert_eq!(bits_to_u32(&rexmit_last, 2, 8), v_r_8(300) as u32);
+        assert_eq!(bits_to_u32(&rexmit_last, 10, 1), 1);
+        assert_eq!(bits_to_u32(&rexmit_last, 11, 1), 0);
+        assert_eq!(bits_to_u32(&rexmit_last, 12, 1), 1);
+        assert_eq!(bits_to_u32(&rexmit_last, 13, 1), 1);
+        assert_eq!(bits_to_u32(&rexmit_last, 14, 8), 4);
+        assert_eq!(bits_to_u32(&rexmit_last, 22, 12), 1);
+        assert_eq!(session.rexmit_queue_len(), 0);
+    }
+
+    #[test]
+    fn supplemental_frame_drains_short_tail_with_format_d() {
+        let mut session = setup_connected_session();
+        session.send_data(&[0xAA; 15]);
+
+        let bits = session.next_supplemental_frame_170().unwrap();
+
+        assert_eq!(bits.len(), 170);
+        assert_eq!(bits[0..2], [0, 0]);
+        assert_eq!(bits_to_u32(&bits, 11, 1), 0);
+        assert_eq!(bits_to_u32(&bits, 12, 1), 1);
+        assert_eq!(bits_to_u32(&bits, 13, 1), 0);
+        assert_eq!(bits_to_u32(&bits, 14, 8), 15);
+        assert!(session.tx_queue_is_empty());
+        assert_eq!(session.l_v_s(), 1);
+    }
+
+    #[test]
+    fn supplemental_frame_splits_nineteen_byte_tail_with_format_d() {
+        let mut session = setup_connected_session();
+        session.send_data(&[0xAA; 19]);
+
+        let bits = session.next_supplemental_frame_170().unwrap();
+
+        assert_eq!(bits[0..2], [0, 0]);
+        assert_eq!(bits_to_u32(&bits, 14, 8), 18);
+        assert_eq!(session.tx_queue_len(), 1);
+        assert_eq!(session.l_v_s(), 1);
     }
 
     // -------------------------------------------------------------------
@@ -1446,6 +2125,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_peer_map_nak_queues_retransmissions() {
+        let mut bs = setup_connected_session();
+
+        for seq in 0u8..10 {
+            bs.send_data(&[seq]);
+            let _ = bs.next_frame(FrameRate::Full);
+        }
+        assert_eq!(bs.l_v_s(), 10);
+
+        let nak = Rlp3Frame::Nak {
+            seq: 0,
+            seq_hi: 0,
+            payload: NakPayload::Map(vec![rlp3_frames::NakMapEntry {
+                nak_map_seq: 2,
+                // Request 2 explicitly plus 4 and 7 via MSB-first map bits.
+                nak_map: 0b0100_1000,
+            }]),
+        };
+        let events = bs.receive_frame(&encode_frame(&nak), FrameRate::Full);
+        assert!(events.is_empty());
+
+        let frame2 =
+            rlp3_frames::decode_rlp3_frame(&bs.next_frame(FrameRate::Full), mux()).unwrap();
+        let frame4 =
+            rlp3_frames::decode_rlp3_frame(&bs.next_frame(FrameRate::Full), mux()).unwrap();
+        let frame7 =
+            rlp3_frames::decode_rlp3_frame(&bs.next_frame(FrameRate::Full), mux()).unwrap();
+
+        assert!(matches!(
+            frame2,
+            Rlp3Frame::Data {
+                seq: 2,
+                rexmit: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            frame4,
+            Rlp3Frame::Data {
+                seq: 4,
+                rexmit: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            frame7,
+            Rlp3Frame::Data {
+                seq: 7,
+                rexmit: true,
+                ..
+            }
+        ));
+    }
+
     // -------------------------------------------------------------------
     // Test 5: Receive single data frame in order -> delivered to upper layer
     // -------------------------------------------------------------------
@@ -1535,6 +2269,51 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, RlpEvent::DataDelivered(d) if d == &vec![0xAA, 0xBB]))
         );
+    }
+
+    #[test]
+    fn test_retransmitted_frame_clears_queued_naks_for_gap() {
+        let mut bs = setup_connected_session();
+
+        let frame1 = Rlp3Frame::Data {
+            seq: 1,
+            rexmit: false,
+            data: vec![0xBB],
+        };
+        bs.receive_frame(&encode_frame(&frame1), FrameRate::Full);
+
+        for _ in 0..bs.rexmit_timer_frames() {
+            bs.receive_frame(&[], FrameRate::Blank);
+        }
+
+        assert!(bs.pending_controls.iter().any(|frame| {
+            matches!(
+                frame,
+                Rlp3Frame::Nak {
+                    seq: 0,
+                    seq_hi: 0,
+                    ..
+                }
+            )
+        }));
+
+        let rexmit_frame0 = Rlp3Frame::Data {
+            seq: 0,
+            rexmit: true,
+            data: vec![0xAA],
+        };
+        bs.receive_frame(&encode_frame(&rexmit_frame0), FrameRate::Full);
+
+        assert!(!bs.pending_controls.iter().any(|frame| {
+            matches!(
+                frame,
+                Rlp3Frame::Nak {
+                    seq: 0,
+                    seq_hi: 0,
+                    ..
+                }
+            )
+        }));
     }
 
     // -------------------------------------------------------------------
@@ -1856,6 +2635,29 @@ mod tests {
         }
 
         assert_eq!(bs.l_v_s(), 302);
+    }
+
+    #[test]
+    fn seq_hi_requirement_uses_forward_nak_rounds_for_forward_data() {
+        let mut bs = setup_connected_session();
+        bs.config.nak_rounds_fwd = 0;
+        bs.config.nak_rounds_rev = 3;
+
+        bs.l_v_s = 300;
+        bs.l_v_n_peer = 0;
+        bs.send_data(&(0..20).collect::<Vec<u8>>());
+
+        let frame_bits = bs.next_frame(FrameRate::Full);
+        let decoded = rlp3_frames::decode_rlp3_frame(&frame_bits, mux()).unwrap();
+        match decoded {
+            Rlp3Frame::DataFormatB { seq, data, .. } => {
+                assert_eq!(seq, v_r_8(300));
+                assert_eq!(data, (0..20).collect::<Vec<u8>>());
+            }
+            other => panic!(
+                "forward data should not carry SEQ_HI when forward NAK rounds are zero: {other:?}"
+            ),
+        }
     }
 
     // -------------------------------------------------------------------

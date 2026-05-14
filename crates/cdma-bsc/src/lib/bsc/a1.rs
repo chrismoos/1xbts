@@ -1141,6 +1141,7 @@ mod tests {
     use cdma_common::access::{
         AccessMessage, AccessMessageHeader, OriginationMessage, PageResponseMessage,
     };
+    use cdma_common::consts::{SERVICE_OPTION_EVRC_A, SERVICE_OPTION_HIGH_RATE_PACKET_DATA};
     use cdma_common::events::AccessChannelEvent;
     use cdma_common::lac::message_types::MessageId;
     use tokio::time::timeout;
@@ -1545,7 +1546,7 @@ mod tests {
                         timeslot: (circuit_id & 0x1f) as u8,
                     },
                     encryption_information: None,
-                    service_option: Some(cdma_ios::ServiceOption(3)),
+                    service_option: Some(cdma_ios::ServiceOption::EVRC_A),
                     signals: Vec::new(),
                     ms_information_records: None,
                     priority: None,
@@ -1597,8 +1598,8 @@ mod tests {
             .unwrap();
         assert_eq!(tc.msc_circuit_id, Some(circuit_id));
         assert_eq!(tc.a1_call_id, Some(call_id));
-        assert_eq!(tc.service_option, 33);
-        assert_eq!(tc.voice_service_option, Some(3));
+        assert_eq!(tc.service_option, SERVICE_OPTION_HIGH_RATE_PACKET_DATA);
+        assert_eq!(tc.voice_service_option, Some(SERVICE_OPTION_EVRC_A));
         assert!(tc.is_waiting_service_response());
 
         let event = traffic_rx
@@ -1613,7 +1614,7 @@ mod tests {
             .iter()
             .map(|connection| connection.service_option)
             .collect();
-        assert_eq!(service_options, vec![3]);
+        assert_eq!(service_options, vec![SERVICE_OPTION_EVRC_A]);
     }
 
     #[tokio::test]
@@ -1647,7 +1648,10 @@ mod tests {
             response.classmark_information_type_2.0.len() >= 4,
             "A1 Paging Response must carry a valid Classmark Information Type 2"
         );
-        assert_eq!(response.service_option, Some(cdma_ios::ServiceOption(3)));
+        assert_eq!(
+            response.service_option,
+            Some(cdma_ios::ServiceOption::EVRC_A)
+        );
     }
 
     #[tokio::test]

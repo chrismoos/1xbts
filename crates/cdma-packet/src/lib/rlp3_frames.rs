@@ -141,6 +141,222 @@ impl MuxOption {
     }
 }
 
+/// Data octets carried by a 170-bit odd-mux supplemental Rate 1 Format C frame.
+pub const SUPPLEMENTAL_FORMAT_C_DATA_LEN: usize = 20;
+/// Data octets carried by a 346-bit odd-mux supplemental Rate 1 Format C frame.
+pub const SUPPLEMENTAL_FORMAT_C_DOUBLE_DATA_LEN: usize = 42;
+
+/// Encode a 170-bit supplemental Rate 1 Format C RLP frame for SCH/F-PDCH.
+///
+/// C.S0017-010-A §4.3.4 defines Format C as TYPE(2), SEQ(8), DATA(var). For
+/// mux option 0x809 the MAC data block is 170 bits, leaving 160 data bits.
+pub fn encode_supplemental_format_c(
+    seq: u8,
+    rexmit: bool,
+    data: &[u8],
+) -> Result<Vec<u8>, RlpError> {
+    encode_supplemental_format_c_block(seq, rexmit, data, 170)
+}
+
+pub fn supplemental_format_c_data_len(block_bits: usize) -> Option<usize> {
+    match block_bits {
+        170 => Some(SUPPLEMENTAL_FORMAT_C_DATA_LEN),
+        346 => Some(SUPPLEMENTAL_FORMAT_C_DOUBLE_DATA_LEN),
+        _ => None,
+    }
+}
+
+pub fn supplemental_format_d_data_len(block_bits: usize) -> Option<usize> {
+    match block_bits {
+        170 => Some(18),
+        346 => Some(40),
+        _ => None,
+    }
+}
+
+pub fn supplemental_format_d_segment_data_len(block_bits: usize, seq_hi: bool) -> Option<usize> {
+    let mut header_bits = 2 + 8 + 1 + 1 + 1 + 1 + 8 + 12;
+    if seq_hi {
+        header_bits += 4;
+    }
+    while (header_bits - 2) % 8 != 0 {
+        header_bits += 1;
+    }
+    block_bits
+        .checked_sub(header_bits)
+        .map(|payload_bits| payload_bits / 8)
+        .filter(|payload_octets| *payload_octets > 0)
+}
+
+/// Encode an odd-mux supplemental Rate 1 Format C RLP frame.
+pub fn encode_supplemental_format_c_block(
+    seq: u8,
+    rexmit: bool,
+    data: &[u8],
+    block_bits: usize,
+) -> Result<Vec<u8>, RlpError> {
+    let Some(data_len) = supplemental_format_c_data_len(block_bits) else {
+        return Err(RlpError::InvalidFrame(format!(
+            "unsupported supplemental Format C block size {} bits",
+            block_bits
+        )));
+    };
+    if data.len() != data_len {
+        return Err(RlpError::InvalidFrame(format!(
+            "supplemental Format C requires {} octets, got {}",
+            data_len,
+            data.len()
+        )));
+    }
+
+    let mut frame = vec![0u8; block_bits];
+    put_bits(&mut frame, 0, if rexmit { 0b11 } else { 0b10 }, 2);
+    put_bits(&mut frame, 2, seq as u32, 8);
+    let mut pos = 10;
+    for byte in data {
+        put_bits(&mut frame, pos, *byte as u32, 8);
+        pos += 8;
+    }
+    Ok(frame)
+}
+
+/// Encode an odd-mux supplemental Rate 1 Format D RLP frame.
+///
+/// C.S0017-010-A §4.3.5 defines Format D as the SCH/F-PDCH frame format that
+/// can carry SEQ_HI. For 0x809/0x811/0x821/0x921 style mux options the LEN
+/// field is present, so this encoder emits a single unsegmented frame with
+/// LAST_SEG=1 and S_SEQ omitted.
+pub fn encode_supplemental_format_d_block(
+    seq: u8,
+    seq_hi: Option<u8>,
+    rexmit: bool,
+    data: &[u8],
+    block_bits: usize,
+) -> Result<Vec<u8>, RlpError> {
+    let Some(max_data_len) = supplemental_format_d_data_len(block_bits) else {
+        return Err(RlpError::InvalidFrame(format!(
+            "unsupported supplemental Format D block size {} bits",
+            block_bits
+        )));
+    };
+    if data.is_empty() || data.len() > max_data_len {
+        return Err(RlpError::InvalidFrame(format!(
+            "supplemental Format D requires 1..={} octets, got {}",
+            max_data_len,
+            data.len()
+        )));
+    }
+    if seq_hi.is_some_and(|v| v > 0x0f) {
+        return Err(RlpError::InvalidFrame(format!(
+            "supplemental Format D SEQ_HI out of range: {}",
+            seq_hi.unwrap()
+        )));
+    }
+
+    let mut frame = vec![0u8; block_bits];
+    let mut pos = 0usize;
+    put_bits(&mut frame, pos, 0b00, 2);
+    pos += 2;
+    put_bits(&mut frame, pos, seq as u32, 8);
+    pos += 8;
+    put_bits(&mut frame, pos, 0, 1); // SSP: S_SEQ omitted.
+    pos += 1;
+    put_bits(&mut frame, pos, u32::from(seq_hi.is_some()), 1);
+    pos += 1;
+    put_bits(&mut frame, pos, 1, 1); // LAST_SEG.
+    pos += 1;
+    put_bits(&mut frame, pos, u32::from(rexmit), 1);
+    pos += 1;
+    put_bits(&mut frame, pos, data.len() as u32, 8);
+    pos += 8;
+    if let Some(seq_hi) = seq_hi {
+        put_bits(&mut frame, pos, seq_hi as u32, 4);
+        pos += 4;
+    }
+
+    while (pos - 2) % 8 != 0 {
+        pos += 1;
+    }
+
+    for byte in data {
+        put_bits(&mut frame, pos, *byte as u32, 8);
+        pos += 8;
+    }
+
+    Ok(frame)
+}
+
+pub fn encode_supplemental_format_d_segment_block(
+    seq: u8,
+    seq_hi: Option<u8>,
+    s_seq: u16,
+    last_seg: bool,
+    rexmit: bool,
+    data: &[u8],
+    block_bits: usize,
+) -> Result<Vec<u8>, RlpError> {
+    let Some(max_data_len) = supplemental_format_d_segment_data_len(block_bits, seq_hi.is_some())
+    else {
+        return Err(RlpError::InvalidFrame(format!(
+            "unsupported supplemental segmented Format D block size {} bits",
+            block_bits
+        )));
+    };
+    if data.is_empty() || data.len() > max_data_len {
+        return Err(RlpError::InvalidFrame(format!(
+            "supplemental segmented Format D requires 1..={} octets, got {}",
+            max_data_len,
+            data.len()
+        )));
+    }
+    if seq_hi.is_some_and(|v| v > 0x0f) {
+        return Err(RlpError::InvalidFrame(format!(
+            "supplemental segmented Format D SEQ_HI out of range: {}",
+            seq_hi.unwrap()
+        )));
+    }
+    if s_seq > 0x0fff {
+        return Err(RlpError::InvalidFrame(format!(
+            "supplemental segmented Format D S_SEQ out of range: {}",
+            s_seq
+        )));
+    }
+
+    let mut frame = vec![0u8; block_bits];
+    let mut pos = 0usize;
+    put_bits(&mut frame, pos, 0b00, 2);
+    pos += 2;
+    put_bits(&mut frame, pos, seq as u32, 8);
+    pos += 8;
+    put_bits(&mut frame, pos, 1, 1); // SSP: S_SEQ present.
+    pos += 1;
+    put_bits(&mut frame, pos, u32::from(seq_hi.is_some()), 1);
+    pos += 1;
+    put_bits(&mut frame, pos, u32::from(last_seg), 1);
+    pos += 1;
+    put_bits(&mut frame, pos, u32::from(rexmit), 1);
+    pos += 1;
+    put_bits(&mut frame, pos, data.len() as u32, 8);
+    pos += 8;
+    if let Some(seq_hi) = seq_hi {
+        put_bits(&mut frame, pos, seq_hi as u32, 4);
+        pos += 4;
+    }
+    put_bits(&mut frame, pos, s_seq as u32, 12);
+    pos += 12;
+
+    while (pos - 2) % 8 != 0 {
+        pos += 1;
+    }
+
+    for byte in data {
+        put_bits(&mut frame, pos, *byte as u32, 8);
+        pos += 8;
+    }
+
+    Ok(frame)
+}
+
 // ---------------------------------------------------------------------------
 // Control frame types
 // ---------------------------------------------------------------------------
@@ -578,10 +794,17 @@ fn encode_nak(
         }
     }
 
-    // Padding_1 to align before FCS (remaining bits minus 16 for FCS are padding).
-    // FCS covers bits 0..pos.
-    let fcs = fcs16(&info[0..pos]);
-    put_fcs16(&mut info, pos, fcs);
+    // Padding_1 octet-aligns the FCS field. FCS covers all fields before it,
+    // including Padding_1.
+    let fcs_pos = align_to_octet(pos);
+    if fcs_pos + 16 > info_bits {
+        return Err(RlpError::InsufficientBits {
+            expected: fcs_pos + 16,
+            got: info_bits,
+        });
+    }
+    let fcs = fcs16(&info[0..fcs_pos]);
+    put_fcs16(&mut info, fcs_pos, fcs);
     // Remaining bits are Padding_2 (zero).
 
     let mut frame = vec![0u8; total_bits];
@@ -1048,9 +1271,17 @@ fn decode_nak_frame(info: &[u8], _mux: MuxOption) -> Result<Rlp3Frame, RlpError>
         _ => return Err(RlpError::InvalidNakType(nak_type)),
     };
 
-    // FCS covers bits 0..pos.
-    let fcs_expected = fcs16(&info[0..pos]);
-    let fcs_got = get_fcs16(info, pos);
+    // Padding_1 octet-aligns the FCS field. FCS covers all fields before it,
+    // including Padding_1.
+    let fcs_pos = align_to_octet(pos);
+    if fcs_pos + 16 > len {
+        return Err(RlpError::InsufficientBits {
+            expected: fcs_pos + 16,
+            got: len,
+        });
+    }
+    let fcs_expected = fcs16(&info[0..fcs_pos]);
+    let fcs_got = get_fcs16(info, fcs_pos);
     if fcs_expected != fcs_got {
         return Err(RlpError::FcsInvalid {
             expected: fcs_expected,
@@ -1063,6 +1294,10 @@ fn decode_nak_frame(info: &[u8], _mux: MuxOption) -> Result<Rlp3Frame, RlpError>
         seq_hi,
         payload,
     })
+}
+
+fn align_to_octet(pos: usize) -> usize {
+    (pos + 7) & !7
 }
 
 /// Decode a segmented data frame from the information field.
@@ -1284,6 +1519,8 @@ pub fn decode_sub_rate_frame(bits: &[u8], num_info_bits: usize) -> Result<Rlp3Fr
         }
     }
 
+    let mut control_error = None;
+
     // Try control frame: SEQ(8) + CTL(6) + INIT_VAR(1) + NAK_PARAM_INCL(1) + FCS(16) = 32 bits
     if num_info_bits >= 32 {
         let ctl = get_bits(info, 8, 6) as u8;
@@ -1303,20 +1540,116 @@ pub fn decode_sub_rate_frame(bits: &[u8], num_info_bits: usize) -> Result<Rlp3Fr
                         nak_param_incl,
                     });
                 }
+                control_error = Some(RlpError::FcsInvalid {
+                    expected: fcs_expected,
+                    got: fcs_got,
+                });
             }
             // NAK at sub-rate: needs at least ~44 bits for the smallest NAK.
             // Try at half rate only.
             if ct == Rlp3ControlType::Nak && num_info_bits >= 60 {
-                if let Ok(f) = decode_nak_frame(info, MuxOption::Odd) {
-                    return Ok(f);
+                match decode_nak_frame(info, MuxOption::Odd) {
+                    Ok(f) => return Ok(f),
+                    Err(e) => control_error = Some(e),
                 }
             }
         }
     }
 
+    if let Some(e) = control_error {
+        return Err(e);
+    }
+
     Err(RlpError::InvalidFrame(
         "no valid sub-rate frame found".into(),
     ))
+}
+
+/// Return a short structural diagnosis for a sub-rate frame that failed decode.
+pub fn diagnose_sub_rate_frame(bits: &[u8], num_info_bits: usize) -> String {
+    if bits.len() < num_info_bits {
+        return format!(
+            "short_sub_rate expected_info_bits={} got_bits={}",
+            num_info_bits,
+            bits.len()
+        );
+    }
+    let info = &bits[..num_info_bits];
+    if num_info_bits < 16 {
+        return format!("unsupported_sub_rate_info_bits={}", num_info_bits);
+    }
+
+    let seq = get_bits(info, 0, 8) as u8;
+    let ctl4 = get_bits(info, 8, 4) as u8;
+    let ctl6 = if num_info_bits >= 14 {
+        Some(get_bits(info, 8, 6) as u8)
+    } else {
+        None
+    };
+
+    if info[8] == 0 {
+        let rexmit = info[9] == 1;
+        let len = get_bits(info, 10, 6) as usize;
+        let end = 16 + len * 8;
+        return format!(
+            "candidate=data seq={} rexmit={} len={} data_end={} info_bits={}",
+            seq, rexmit, len, end, num_info_bits
+        );
+    }
+
+    if ctl4 == 0b1001 || ctl4 == 0b1010 {
+        let seq_hi = get_bits(info, 12, 4) as u8;
+        return format!(
+            "candidate={} seq={} seq_hi={}",
+            if ctl4 == 0b1001 { "fill" } else { "idle1" },
+            seq,
+            seq_hi
+        );
+    }
+
+    if ctl4 == 0b1000 {
+        return format!("candidate=segmented_or_idle2 seq={} ctl4=0b1000", seq);
+    }
+
+    if let Some(ctl) = ctl6 {
+        if let Some(ct) = Rlp3ControlType::from_ctl_bits(ctl) {
+            if ct == Rlp3ControlType::Nak {
+                let nak_type = if num_info_bits >= 16 {
+                    Some(get_bits(info, 14, 2) as u8)
+                } else {
+                    None
+                };
+                let seq_hi = if num_info_bits >= 20 {
+                    Some(get_bits(info, 16, 4) as u8)
+                } else {
+                    None
+                };
+                return format!(
+                    "candidate=nak seq={} ctl=0b{:06b} nak_type={:?} seq_hi={:?} decode={:?}",
+                    seq,
+                    ctl,
+                    nak_type,
+                    seq_hi,
+                    decode_nak_frame(info, MuxOption::Odd)
+                );
+            }
+
+            let fcs_expected = fcs16(&info[0..16]);
+            let fcs_got = get_fcs16(info, 16);
+            return format!(
+                "candidate=control seq={} ctl={:?}/0b{:06b} fcs_expected=0x{:04x} fcs_got=0x{:04x}",
+                seq, ct, ctl, fcs_expected, fcs_got
+            );
+        }
+    }
+
+    format!(
+        "unknown_sub_rate seq={} ctl4=0b{:04b} ctl6={}",
+        seq,
+        ctl4,
+        ctl6.map(|v| format!("0b{:06b}", v))
+            .unwrap_or_else(|| "n/a".to_string())
+    )
 }
 
 /// Map a physical layer rate to the number of info bits for sub-rate frames.
@@ -1513,6 +1846,33 @@ mod tests {
         assert_eq!(bits.len(), MUX.frame_bits());
         let decoded = decode_rlp3_frame(&bits, MUX).unwrap();
         assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn test_sub_rate_nak_from_live_ms_has_octet_aligned_fcs() {
+        let bits: Vec<u8> =
+            "00100011110000000000000000001000110000001010100011001111000100000000000000000000"
+                .chars()
+                .map(|c| match c {
+                    '0' => 0,
+                    '1' => 1,
+                    _ => panic!("invalid bit"),
+                })
+                .collect();
+
+        let decoded = decode_sub_rate_frame(&bits, 80).unwrap();
+
+        assert_eq!(
+            decoded,
+            Rlp3Frame::Nak {
+                seq: 35,
+                seq_hi: 0,
+                payload: NakPayload::Gap(vec![NakGapEntry {
+                    first: 35,
+                    last: 42,
+                }]),
+            }
+        );
     }
 
     #[test]
@@ -2060,6 +2420,69 @@ mod tests {
         let bits = frame.encode(MUX).unwrap();
         let decoded = decode_rlp3_frame(&bits, MUX).unwrap();
         assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn test_supplemental_format_c_uses_170_bits() {
+        let data: Vec<u8> = (0..20).collect();
+        let bits = encode_supplemental_format_c(0x34, false, &data).unwrap();
+
+        assert_eq!(bits.len(), 170);
+        assert_eq!(get_bits(&bits, 0, 2), 0b10);
+        assert_eq!(get_bits(&bits, 2, 8), 0x34);
+        assert_eq!(get_bits(&bits, 10, 8), 0);
+        assert_eq!(get_bits(&bits, 162, 8), 19);
+    }
+
+    #[test]
+    fn test_supplemental_format_c_uses_346_bits() {
+        let data: Vec<u8> = (0..42).collect();
+        let bits = encode_supplemental_format_c_block(0x34, false, &data, 346).unwrap();
+
+        assert_eq!(bits.len(), 346);
+        assert_eq!(get_bits(&bits, 0, 2), 0b10);
+        assert_eq!(get_bits(&bits, 2, 8), 0x34);
+        assert_eq!(get_bits(&bits, 10, 8), 0);
+        assert_eq!(get_bits(&bits, 338, 8), 41);
+    }
+
+    #[test]
+    fn test_supplemental_format_c_rejects_short_data() {
+        let result = encode_supplemental_format_c(0, false, &[0u8; 19]);
+        assert!(matches!(result, Err(RlpError::InvalidFrame(_))));
+    }
+
+    #[test]
+    fn test_supplemental_format_d_carries_seq_hi() {
+        let data: Vec<u8> = (0..40).collect();
+        let bits = encode_supplemental_format_d_block(0x34, Some(0x7), false, &data, 346).unwrap();
+
+        assert_eq!(bits.len(), 346);
+        assert_eq!(get_bits(&bits, 0, 2), 0b00);
+        assert_eq!(get_bits(&bits, 2, 8), 0x34);
+        assert_eq!(get_bits(&bits, 10, 1), 0);
+        assert_eq!(get_bits(&bits, 11, 1), 1);
+        assert_eq!(get_bits(&bits, 12, 1), 1);
+        assert_eq!(get_bits(&bits, 13, 1), 0);
+        assert_eq!(get_bits(&bits, 14, 8), 40);
+        assert_eq!(get_bits(&bits, 22, 4), 0x7);
+        assert_eq!(get_bits(&bits, 26, 8), 0);
+        assert_eq!(get_bits(&bits, 338, 8), 39);
+    }
+
+    #[test]
+    fn test_supplemental_format_d_uses_170_bits() {
+        let data: Vec<u8> = (0..18).collect();
+        let bits = encode_supplemental_format_d_block(0x12, Some(0x1), true, &data, 170).unwrap();
+
+        assert_eq!(bits.len(), 170);
+        assert_eq!(get_bits(&bits, 0, 2), 0b00);
+        assert_eq!(get_bits(&bits, 2, 8), 0x12);
+        assert_eq!(get_bits(&bits, 13, 1), 1);
+        assert_eq!(get_bits(&bits, 14, 8), 18);
+        assert_eq!(get_bits(&bits, 22, 4), 0x1);
+        assert_eq!(get_bits(&bits, 26, 8), 0);
+        assert_eq!(get_bits(&bits, 162, 8), 17);
     }
 
     #[test]

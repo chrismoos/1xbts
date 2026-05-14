@@ -15,6 +15,10 @@ service PacketService {
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   // Enables or disables per-session packet trace capture.
   rpc SetSessionCapture(SetSessionCaptureRequest) returns (SetSessionCaptureResponse);
+  // Enables or disables F-SCH downlink frame generation on a running session.
+  // Called by the BSC after a successful F-SCH allocation (active=true) and
+  // during teardown / SCH release (active=false).
+  rpc SetSchActive(SetSchActiveRequest) returns (SetSchActiveResponse);
 }
 
 // One RLP traffic frame moving between the radio stack and packet engine.
@@ -98,6 +102,20 @@ message SetSessionCaptureResponse {
   // Updated session detail.
   PacketSessionDetail session = 1;
 }
+
+// Toggles F-SCH downlink frame generation on one packet session.
+message SetSchActiveRequest {
+  // Packet session identifier.
+  string session_id = 1;
+  // True to enable RLP3 SCH frame generation, false to disable.
+  bool active = 2;
+  // RC3 F-SCH rate in bps. Omitted/zero defaults to 19200 for compatibility.
+  uint32 rate_bps = 3;
+}
+
+// Empty response for a successful SCH-active toggle. The error case is
+// surfaced via gRPC status (NotFound when session_id is unknown, etc.).
+message SetSchActiveResponse {}
 
 // Summary state for a packet data session.
 message PacketSessionInfo {

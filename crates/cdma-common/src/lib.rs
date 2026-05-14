@@ -14,6 +14,7 @@ pub mod metrics;
 pub mod overhead;
 pub mod paging;
 pub mod phy;
+pub mod sch;
 pub mod sms;
 pub mod time;
 pub mod timezone;

@@ -95,7 +95,7 @@ fn typed_setup_a8_roundtrip() {
         quality_of_service_parameters: Some(QualityOfServiceParametersTyped { packet_priority: 4 }),
         bsc_id: BscId(vec![0xaa, 0xbb]),
         a8_traffic_id: A8TrafficId::gre_ppp(0x01020304, [10, 0, 0, 1]),
-        service_option: ServiceOptionValue(0x0021),
+        service_option: ServiceOptionValue::HIGH_RATE_PACKET_DATA,
         a9_indicators: A9Indicators {
             packet_boundary_supported: false,
             gre_segmentation_supported: false,
@@ -176,7 +176,7 @@ fn typed_message_roundtrips_cover_full_inventory() {
         imsi: Some("123456789012345".into()),
         esn: Some(0x01020304),
         meid: None,
-        service_option: ServiceOptionValue(0x0021),
+        service_option: ServiceOptionValue::HIGH_RATE_PACKET_DATA,
         data_count: DataCount(0x0102),
     };
     assert_eq!(
@@ -258,7 +258,7 @@ fn typed_message_golden_encodings_cover_full_inventory() {
         quality_of_service_parameters: None,
         bsc_id: BscId(vec![0xaa, 0xbb]),
         a8_traffic_id: traffic_id.clone(),
-        service_option: ServiceOptionValue(0x0021),
+        service_option: ServiceOptionValue::HIGH_RATE_PACKET_DATA,
         a9_indicators: A9Indicators {
             packet_boundary_supported: false,
             gre_segmentation_supported: false,
@@ -352,7 +352,7 @@ fn typed_message_golden_encodings_cover_full_inventory() {
         imsi: None,
         esn: None,
         meid: None,
-        service_option: ServiceOptionValue(0x0021),
+        service_option: ServiceOptionValue::HIGH_RATE_PACKET_DATA,
         data_count: DataCount(0x0102),
     };
     assert_eq!(
@@ -497,7 +497,7 @@ fn rejects_mobile_identity_esn_without_imsi() {
         imsi: None,
         esn: Some(0x01020304),
         meid: None,
-        service_option: ServiceOptionValue(0x0021),
+        service_option: ServiceOptionValue::HIGH_RATE_PACKET_DATA,
         data_count: DataCount(0x0010),
     }
     .encode()
@@ -735,7 +735,7 @@ fn typed_roundtrips_cover_version_update_and_short_data_families() {
             fill_bits: 3,
             content: vec![0xaa, 0xbb, 0xcc],
         }),
-        service_option: Some(ServiceOptionValue(0x0021)),
+        service_option: Some(ServiceOptionValue::HIGH_RATE_PACKET_DATA),
         user_zone_id: Some(UserZoneId(0x0102)),
         quality_of_service_parameters: Some(QualityOfServiceParametersTyped { packet_priority: 7 }),
         cause: Some(CauseValue(0x1b)),

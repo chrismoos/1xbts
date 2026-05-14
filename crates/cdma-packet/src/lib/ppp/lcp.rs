@@ -27,6 +27,7 @@ const DISCARD_REQUEST: u8 = 11;
 /// PPP restart timer in packet-session ticks. Packet sessions tick every 20 ms,
 /// so this retransmits pending Configure-Requests once per second.
 const CONFIGURE_RESTART_TICKS: u16 = 50;
+const MAX_CONFIGURE_RESTARTS: u32 = 10;
 
 // LCP option types.
 const OPT_MRU: u8 = 1;
@@ -193,6 +194,7 @@ pub struct LcpSession {
     last_request_data: Vec<u8>,
     restart_ticks_remaining: u16,
     configure_restarts: u32,
+    configure_failed: bool,
     /// Negotiated options — valid once LCP is Opened.
     pub negotiated: NegotiatedOptions,
     /// Echo keepalive: identifier of the last Echo-Request we sent.
@@ -217,6 +219,7 @@ impl LcpSession {
             last_request_data: Vec::new(),
             restart_ticks_remaining: 0,
             configure_restarts: 0,
+            configure_failed: false,
             negotiated: NegotiatedOptions::default(),
             echo_pending_id: None,
             echo_failures: 0,
@@ -238,7 +241,7 @@ impl LcpSession {
     }
 
     fn send_configure_request(&mut self, data: Vec<u8>) -> PppPacket {
-        log::info!("LCP TX: Configure-Request (MRU={})", self.our_mru);
+        log::debug!("LCP TX: Configure-Request (MRU={})", self.our_mru);
         let id = self.alloc_id();
         let pkt = LcpPacket {
             code: CONFIGURE_REQUEST,
@@ -249,6 +252,7 @@ impl LcpSession {
         self.last_request_data = data;
         self.restart_ticks_remaining = CONFIGURE_RESTART_TICKS;
         self.state = LcpState::RequestSent;
+        self.configure_failed = false;
         pkt.to_ppp()
     }
 
@@ -267,8 +271,22 @@ impl LcpSession {
         }
 
         self.configure_restarts = self.configure_restarts.saturating_add(1);
+        if self.configure_restarts > MAX_CONFIGURE_RESTARTS {
+            log::warn!(
+                "LCP: Configure-Request failed after {} retransmits",
+                self.configure_restarts - 1
+            );
+            self.state = LcpState::Closed;
+            self.peer_acked = false;
+            self.we_acked = false;
+            self.last_request_id = None;
+            self.last_request_data.clear();
+            self.restart_ticks_remaining = 0;
+            self.configure_failed = true;
+            return None;
+        }
         self.restart_ticks_remaining = CONFIGURE_RESTART_TICKS;
-        log::info!(
+        log::debug!(
             "LCP TX: Configure-Request retransmit id={} restart_count={}",
             id,
             self.configure_restarts
@@ -294,7 +312,7 @@ impl LcpSession {
 
         match lcp.code {
             CONFIGURE_REQUEST => {
-                log::info!(
+                log::debug!(
                     "LCP RX: Configure-Request id={} opts=[{}]",
                     lcp.identifier,
                     format_lcp_options(&lcp.data)
@@ -355,7 +373,7 @@ impl LcpSession {
                         }
                         _ => {
                             // Unknown/unsupported option — reject per RFC 1661.
-                            log::info!(
+                            log::debug!(
                                 "LCP: rejecting unknown option type={} len={}",
                                 opt.opt_type,
                                 opt.data.len()
@@ -372,7 +390,7 @@ impl LcpSession {
                         identifier: lcp.identifier,
                         data: serialize_options(&reject_opts),
                     };
-                    log::info!(
+                    log::debug!(
                         "LCP TX: Configure-Reject id={} opts=[{}]",
                         lcp.identifier,
                         format_lcp_options(&reject.data)
@@ -386,7 +404,7 @@ impl LcpSession {
                         identifier: lcp.identifier,
                         data: lcp.data.clone(),
                     };
-                    log::info!("LCP TX: Configure-Ack id={}", lcp.identifier);
+                    log::debug!("LCP TX: Configure-Ack id={}", lcp.identifier);
                     responses.push(ack.to_ppp());
 
                     // Record negotiated options from the peer's request.
@@ -427,7 +445,7 @@ impl LcpSession {
                     );
                     return responses;
                 }
-                log::info!("LCP RX: Configure-Ack id={}", lcp.identifier);
+                log::debug!("LCP RX: Configure-Ack id={}", lcp.identifier);
                 self.peer_acked = true;
                 self.restart_ticks_remaining = 0;
                 self.update_state();
@@ -441,7 +459,7 @@ impl LcpSession {
                     );
                     return responses;
                 }
-                log::info!(
+                log::debug!(
                     "LCP RX: Configure-Nak id={} opts=[{}]",
                     lcp.identifier,
                     format_lcp_options(&lcp.data)
@@ -463,7 +481,7 @@ impl LcpSession {
                     );
                     return responses;
                 }
-                log::info!(
+                log::debug!(
                     "LCP RX: Configure-Reject id={} opts=[{}]",
                     lcp.identifier,
                     format_lcp_options(&lcp.data)
@@ -484,7 +502,7 @@ impl LcpSession {
                 self.update_state();
             }
             ECHO_REQUEST => {
-                log::info!("LCP RX: Echo-Request id={}", lcp.identifier);
+                log::debug!("LCP RX: Echo-Request id={}", lcp.identifier);
                 // Reply with Echo-Reply, same identifier, our magic number (0) + their data.
                 let mut reply_data = vec![0x00, 0x00, 0x00, 0x00]; // magic number = 0
                 if lcp.data.len() > 4 {
@@ -526,6 +544,7 @@ impl LcpSession {
                 self.last_request_data.clear();
                 self.restart_ticks_remaining = 0;
                 self.negotiated = NegotiatedOptions::default();
+                self.configure_failed = false;
             }
             DISCARD_REQUEST => {
                 // Per RFC 1661 §5.9: silently discard. No response required.
@@ -599,12 +618,26 @@ impl LcpSession {
         self.echo_failures >= ECHO_MAX_FAILURES
     }
 
+    pub fn configure_failed(&self) -> bool {
+        self.configure_failed
+    }
+
+    pub fn configure_restarts(&self) -> u32 {
+        self.configure_restarts
+    }
+
+    /// Returns true once the peer has ACKed our Configure-Request.
+    pub fn peer_acked_our_request(&self) -> bool {
+        self.peer_acked
+    }
+
     /// Force LCP to Opened state.  Used when upper-layer traffic (IPCP/IP)
     /// proves the peer considers LCP open but we missed their Configure-Ack.
     pub fn force_open(&mut self) {
         self.peer_acked = true;
         self.we_acked = true;
         self.restart_ticks_remaining = 0;
+        self.configure_failed = false;
         self.state = LcpState::Opened;
     }
 
@@ -790,6 +823,26 @@ mod tests {
         let retransmit_lcp = LcpPacket::parse(&retransmit.payload).unwrap();
         assert_eq!(retransmit_lcp.identifier, first_lcp.identifier);
         assert_eq!(retransmit_lcp.data, first_lcp.data);
+    }
+
+    #[test]
+    fn configure_request_fails_after_max_restarts() {
+        let mut session = LcpSession::new();
+        session.start();
+
+        for _ in 0..MAX_CONFIGURE_RESTARTS {
+            for _ in 0..CONFIGURE_RESTART_TICKS {
+                assert!(session.maybe_retransmit_configure_request().is_none());
+            }
+            assert!(session.maybe_retransmit_configure_request().is_some());
+        }
+
+        for _ in 0..CONFIGURE_RESTART_TICKS {
+            assert!(session.maybe_retransmit_configure_request().is_none());
+        }
+        assert!(session.maybe_retransmit_configure_request().is_none());
+        assert!(session.configure_failed());
+        assert_eq!(session.state, LcpState::Closed);
     }
 
     #[test]

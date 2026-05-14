@@ -163,6 +163,7 @@ fn frame_content_maps_all_is2001_table_values() {
     assert!(FrameContent::from_u8(0x13).is_none());
     assert_eq!(FrameContent::FchRc5_7200.value(), 0x10);
     assert_eq!(FrameContent::FchRc5_7200.rate_bps(), Some(7200));
+    assert_eq!(FrameContent::Sch20msRc3_153600.information_bits(), 3048);
 }
 
 #[test]
@@ -308,7 +309,7 @@ fn generic_decode_preserves_bts_setup_ie07_roles_and_status_inventory() {
         sdu_id: Some(SduId::new([0x55]).unwrap()),
         mobile_identities: vec![],
         physical_channel_info: Some(physical_channel_info()),
-        service_option: Some(ServiceOption(0x0021)),
+        service_option: Some(ServiceOption::HIGH_RATE_PACKET_DATA),
         paca_timestamp: Some(PacaTimestamp(0x01020304)),
         quality_of_service_parameters: Some(QualityOfServiceParameters {
             packet_priority: 0x0a,
@@ -369,7 +370,7 @@ fn bts_setup_service_option_uses_fixed_framing() {
         sdu_id: None,
         mobile_identities: vec![],
         physical_channel_info: Some(physical_channel_info()),
-        service_option: Some(ServiceOption(0x0021)),
+        service_option: Some(ServiceOption::HIGH_RATE_PACKET_DATA),
         paca_timestamp: None,
         quality_of_service_parameters: None,
         connect_information: vec![connect_information()],

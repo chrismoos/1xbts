@@ -8,6 +8,7 @@ use cdma_bts::bts::{
     RxMetrics as BtsRxMetrics, TxMetrics as BtsTxMetrics,
 };
 use cdma_common::access::AccessMessage;
+use cdma_common::consts::{SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_PACKET_DATA};
 use cdma_common::events::AccessChannelEvent;
 use cdma_common::lac::{
     message_types::{MessageId, WireChannel},
@@ -138,6 +139,13 @@ impl PacketService for PacketServiceProxy {
         request: Request<cdma_packet::proto::SetSessionCaptureRequest>,
     ) -> Result<Response<cdma_packet::proto::SetSessionCaptureResponse>, Status> {
         self.client().set_session_capture(request).await
+    }
+
+    async fn set_sch_active(
+        &self,
+        request: Request<cdma_packet::proto::SetSchActiveRequest>,
+    ) -> Result<Response<cdma_packet::proto::SetSchActiveResponse>, Status> {
+        self.client().set_sch_active(request).await
     }
 }
 
@@ -1713,7 +1721,11 @@ impl BscService for BscServiceImpl {
         let req = request.into_inner();
         let subscriber_id = Uuid::parse_str(&req.subscriber_id)
             .map_err(|_| Status::invalid_argument("subscriber_id must be a valid UUID"))?;
-        let service_option = if req.service_option == 7 { 7u16 } else { 33u16 };
+        let service_option = if req.service_option == u32::from(SERVICE_OPTION_PACKET_DATA) {
+            SERVICE_OPTION_PACKET_DATA
+        } else {
+            SERVICE_OPTION_HIGH_RATE_PACKET_DATA
+        };
 
         self.state
             .data_request_tx
