@@ -36,7 +36,7 @@
     "tx_lo_offset_hz": 200000,
     "tx_digital_backoff": 0.5,
     "block_size_chips": 512,
-    "tx_batch_chips": 1536,
+    "tx_batch_chips": 3072,
     "short_code_length_chips": 32768,
     "downlink": {
       "pilot": {

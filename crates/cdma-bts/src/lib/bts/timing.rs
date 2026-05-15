@@ -1,6 +1,7 @@
 use std::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     thread,
+    time::{Duration, Instant},
 };
 
 use cdma_common::{error::Error, time};
@@ -52,6 +53,8 @@ impl TxRxAnchor {
 }
 
 pub(super) const HARDWARE_START_LEAD_NS: u64 = 100_000_000;
+const LOOKAHEAD_SLEEP_GUARD_NS: u64 = 1_000_000;
+const LOOKAHEAD_FINAL_SPIN_NS: u64 = 150_000;
 
 pub(super) struct TxAnchor {
     pub hardware_start_tick: u64,
@@ -89,8 +92,50 @@ pub(super) fn chips_to_ticks(chips: u64, chip_rate_hz: u64, tick_rate: u64) -> u
     ticks.min(u64::MAX as u128) as u64
 }
 
+fn ticks_to_nanos(ticks: u64, tick_rate: u64) -> u64 {
+    if tick_rate == 0 {
+        return 0;
+    }
+    let ns = (ticks as u128).saturating_mul(1_000_000_000u128) / tick_rate as u128;
+    ns.min(u64::MAX as u128) as u64
+}
+
 pub(super) fn pilot_offset_chips(pilot_offset: usize) -> u64 {
     (pilot_offset as u64) * 64
+}
+
+pub(super) fn wait_until_within_tx_lookahead(
+    batch_playout_tick: u64,
+    wall_anchor_tick: u64,
+    wall_anchor_instant: Instant,
+    tick_rate: u64,
+    max_tx_lookahead_ms: u32,
+    shutdown: &AtomicBool,
+) {
+    if max_tx_lookahead_ms == 0 || tick_rate == 0 {
+        return;
+    }
+    let lookahead_ticks = max_tx_lookahead_ms as u64 * tick_rate / 1_000;
+
+    loop {
+        let elapsed_ns = wall_anchor_instant.elapsed().as_nanos() as u64;
+        let estimated_hw = wall_anchor_tick
+            .saturating_add((elapsed_ns as u128 * tick_rate as u128 / 1_000_000_000) as u64);
+        let ahead_ticks = batch_playout_tick.saturating_sub(estimated_hw);
+        if ahead_ticks <= lookahead_ticks || shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let wait_ns = ticks_to_nanos(ahead_ticks - lookahead_ticks, tick_rate);
+        if wait_ns > LOOKAHEAD_SLEEP_GUARD_NS {
+            let sleep_ns = (wait_ns - LOOKAHEAD_SLEEP_GUARD_NS).min(LOOKAHEAD_SLEEP_GUARD_NS);
+            thread::sleep(Duration::from_nanos(sleep_ns));
+        } else if wait_ns > LOOKAHEAD_FINAL_SPIN_NS {
+            thread::yield_now();
+        } else {
+            std::hint::spin_loop();
+        }
+    }
 }
 
 pub(super) fn prime_hardware_clock(

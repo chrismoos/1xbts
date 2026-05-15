@@ -625,18 +625,14 @@ impl Bts {
 
             let batch_playout_tick = timing::batch_playout_tick(&state, chip_cursor, tick_rate);
             if max_blocks.is_none() && self.runtime.max_tx_lookahead_ms > 0 {
-                let lookahead_ticks = self.runtime.max_tx_lookahead_ms as u64 * tick_rate / 1_000;
-                loop {
-                    let elapsed_ns = wall_anchor_instant.elapsed().as_nanos() as u64;
-                    let estimated_hw = wall_anchor_tick
-                        + (elapsed_ns as u128 * tick_rate as u128 / 1_000_000_000) as u64;
-                    if batch_playout_tick.saturating_sub(estimated_hw) <= lookahead_ticks
-                        || shutdown.load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        break;
-                    }
-                    std::hint::spin_loop();
-                }
+                timing::wait_until_within_tx_lookahead(
+                    batch_playout_tick,
+                    wall_anchor_tick,
+                    wall_anchor_instant,
+                    tick_rate,
+                    self.runtime.max_tx_lookahead_ms,
+                    &shutdown,
+                );
             }
 
             if max_blocks.is_none()
