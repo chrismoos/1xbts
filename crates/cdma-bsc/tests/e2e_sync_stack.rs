@@ -3999,7 +3999,7 @@ async fn run_sync_overhead_window_case(
         bts::Config {
             pilot_offset: bts_config.pilot_offset,
             mac_layer,
-            start_system_time: None,
+            start_system_time: Some(time::system_time_from_chips(9 * 98_304, 1_228_800)),
             sync_channel_template: Some(SyncChannelMessage {
                 pd: 0,
                 msg_type: 1,
@@ -5037,13 +5037,13 @@ async fn test_e2e_bts_to_wav_to_receiver_pipeline() -> Result<(), Error> {
 
 #[tokio::test]
 async fn test_e2e_sync_and_overhead_boundaries_over_5s() -> Result<(), Error> {
-    const BLOCKS: usize = 13_000;
+    const BLOCKS: usize = 15_000;
     const CHIPS_PER_BLOCK: usize = 512;
     const CHIPS_PER_SYNC_SUPERFRAME: usize = 98_304;
     const CHIPS_PER_SYNC_MESSAGE: usize = CHIPS_PER_SYNC_SUPERFRAME * 3;
     const CHIPS_320MS: usize = 393_216;
     const CHIPS_PER_PAGING_SLOT: usize = 98_304;
-    const EXPECTED_SYNC_EVENTS: usize = 22;
+    const EXPECTED_SYNC_EVENTS: usize = (BLOCKS * CHIPS_PER_BLOCK) / CHIPS_PER_SYNC_MESSAGE;
 
     let stats = run_sync_overhead_window_case(
         PathBuf::from("test/generated/e2e_sync_overhead_5s.wav"),
