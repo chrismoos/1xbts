@@ -510,17 +510,9 @@ pub async fn spawn_local_abis_endpoint(
             for event in events {
                 match event {
                     AbisAgentEvent::ForwardTrafficFrames { walsh_code, frames } => {
-                        let channel = {
-                            let pool = ctrl.traffic_channels_pool();
-                            let slots = pool.lock();
-                            slots
-                                .iter()
-                                .find(|s| s.walsh_code == walsh_code)
-                                .map(|s| s.channel.clone())
-                        };
-                        if let Some(channel) = channel {
+                        if let Some(slot) = ctrl.traffic_channels_pool().lookup(walsh_code) {
                             for frame in frames {
-                                channel.send_signaling_bits(frame.bits().to_vec());
+                                slot.channel.send_signaling_bits(frame.bits().to_vec());
                             }
                         } else {
                             warn!("BTS: ForwardTrafficFrames for unknown walsh={}", walsh_code);

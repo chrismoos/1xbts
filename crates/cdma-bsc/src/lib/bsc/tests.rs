@@ -26,7 +26,8 @@ use crate::addressing::{select_imsi_class0_forward_address, select_initial_traff
 use cdma_abis::control::typed::CellId;
 use cdma_bts::bts::abis_agent::AbisAgentConfig;
 use cdma_bts::bts::{
-    TrafficChannelPool, TrafficResourceController, TrafficRxPool, TrafficRxRemovals, WalshAllocator,
+    ChannelRegistry, TrafficChannelPool, TrafficResourceController, TrafficRxPool,
+    TrafficRxRemovals, WalshAllocator,
 };
 use cdma_bts::lac as bts_lac;
 use cdma_common::access::{
@@ -557,7 +558,7 @@ pub(super) async fn test_bsc_with_active_traffic_channel_and_msc_client(
     msc_client: Arc<dyn crate::a1_edge::MscClient>,
 ) -> (Bsc, broadcast::Receiver<TrafficEvent>, u8) {
     use std::sync::Arc;
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -654,7 +655,7 @@ pub(super) async fn test_bsc_with_active_traffic_channel_and_msc_client(
 
 #[tokio::test]
 async fn a1_mt_page_response_defers_l2_ack_until_assignment() {
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -773,7 +774,7 @@ async fn a1_mt_page_response_defers_l2_ack_until_assignment() {
 /// AssignmentRequest for the same call_id.
 #[tokio::test]
 async fn a1_paging_request_processes_independently_of_prior_assignment_request() {
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -1254,7 +1255,7 @@ async fn mt_callee_connected_bearer_frames_are_forwarded() {
 #[tokio::test]
 async fn assigned_channel_preamble_sends_bs_ack_even_if_mobile_state_drifted() {
     use std::sync::Arc;
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -2324,7 +2325,7 @@ fn reverse_regular_msg_seq_tracker_detects_duplicates_and_advances_window() {
 #[tokio::test]
 async fn duplicate_reverse_traffic_data_burst_is_acked_but_not_reprocessed() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -2605,7 +2606,7 @@ async fn traffic_lifecycle_ignores_channels_after_waiting_ms_ack() {
 #[tokio::test]
 async fn service_connect_completion_ack_clears_pending_traffic_retry() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -2704,7 +2705,7 @@ async fn service_connect_completion_ack_clears_pending_traffic_retry() {
 #[tokio::test]
 async fn service_connect_completion_ack_seq_7_clears_pending_traffic_retry() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -2803,7 +2804,7 @@ async fn service_connect_completion_ack_seq_7_clears_pending_traffic_retry() {
 #[tokio::test]
 async fn voice_service_connect_retry_targets_voice_channel() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -2887,7 +2888,7 @@ async fn voice_service_connect_retry_targets_voice_channel() {
 #[tokio::test]
 async fn origination_retry_reuses_pending_traffic_channel() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -2957,7 +2958,7 @@ async fn origination_retry_reuses_pending_traffic_channel() {
     assert_eq!(bsc.mobiles[0].traffic_channel.as_ref().unwrap().for_rc, 1);
     assert_eq!(bsc.mobiles[0].traffic_channel.as_ref().unwrap().rev_rc, 1);
     assert_eq!(bsc.mobiles[0].state, MsState::TrafficAssigning);
-    assert_eq!(traffic_channels.lock().len(), 1);
+    assert_eq!(traffic_channels.len(), 1);
     assert_eq!(traffic_rx_pool.lock().len(), 1);
     assert_eq!(traffic_rx_pool.lock()[0].walsh_code, first_walsh);
 
@@ -2985,7 +2986,7 @@ async fn origination_retry_reuses_pending_traffic_channel() {
         ChannelState::Assigned { assigned_at } => assert!(assigned_at >= first_assigned_at),
         _ => panic!("expected Assigned state"),
     }
-    assert_eq!(traffic_channels.lock().len(), 1);
+    assert_eq!(traffic_channels.len(), 1);
     assert_eq!(traffic_rx_pool.lock().len(), 1);
     assert_eq!(traffic_rx_pool.lock()[0].walsh_code, first_walsh);
 
@@ -3016,7 +3017,7 @@ async fn origination_retry_reuses_pending_traffic_channel() {
 #[tokio::test]
 async fn legacy_origination_uses_cam_for_rc1_assignment() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -3093,7 +3094,7 @@ async fn legacy_origination_uses_cam_for_rc1_assignment() {
 #[tokio::test]
 async fn legacy_origination_fails_before_cam_when_selected_rc_is_not_rc1() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -3161,7 +3162,7 @@ async fn legacy_origination_fails_before_cam_when_selected_rc_is_not_rc1() {
 
     assert!(bsc.mobiles[0].traffic_channel.is_none());
     assert_eq!(bsc.mobiles[0].state, MsState::Registered);
-    assert!(traffic_channels.lock().is_empty());
+    assert!(traffic_channels.is_empty());
     assert!(traffic_rx_pool.lock().is_empty());
 
     let pch_types = pch_message_types(&bts_client);
@@ -3172,7 +3173,7 @@ async fn legacy_origination_fails_before_cam_when_selected_rc_is_not_rc1() {
 #[tokio::test]
 async fn origination_prefers_policy_rc1_over_mobile_rc3_preference() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -3246,7 +3247,7 @@ async fn origination_prefers_policy_rc1_over_mobile_rc3_preference() {
 #[tokio::test]
 async fn origination_can_prefer_rc3_when_policy_requests_it() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -3325,7 +3326,7 @@ async fn origination_can_prefer_rc3_when_policy_requests_it() {
 #[tokio::test]
 async fn packet_data_origination_assigns_non_voice_traffic_channel() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -3552,7 +3553,7 @@ async fn supported_packet_origination_so_is_not_rejected_when_assignment_falls_b
 #[tokio::test]
 async fn packet_data_service_connect_completion_marks_channel_active() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -3636,7 +3637,7 @@ async fn packet_data_service_connect_completion_marks_channel_active() {
 #[tokio::test]
 async fn packet_data_send_service_connect_uses_origination_sr_id_and_omits_optional_fields() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -3716,7 +3717,7 @@ async fn packet_data_send_service_connect_uses_origination_sr_id_and_omits_optio
 #[tokio::test]
 async fn so33_service_connect_omits_rlp_blob_and_uses_origination_sr_id() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -3796,7 +3797,7 @@ async fn so33_service_connect_omits_rlp_blob_and_uses_origination_sr_id() {
 #[tokio::test]
 async fn packet_data_reverse_bearer_primary_frame_feeds_packet_session() {
     use std::sync::Arc;
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -5023,7 +5024,7 @@ async fn registration_upserts_mobile_seen_in_hlr() {
 /// shared MS ESN, and the assigned FCH walsh code.
 async fn fsch_test_bsc() -> (Bsc, broadcast::Receiver<TrafficEvent>, u32, u8) {
     use std::sync::Arc;
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));

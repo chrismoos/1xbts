@@ -1057,9 +1057,7 @@ impl Default for BtsPowerControlRegistry {
 impl BtsPowerControlRegistry {
     fn traffic_channel_uses_rc3(traffic_channels: &TrafficChannelPool, walsh_code: u8) -> bool {
         traffic_channels
-            .lock()
-            .iter()
-            .find(|slot| slot.walsh_code == walsh_code)
+            .lookup(walsh_code)
             .map(|slot| matches!(slot.channel, TrafficChannelWrapper::Rc3(_)))
             .unwrap_or(true)
     }
@@ -1124,15 +1122,8 @@ impl BtsPowerControlRegistry {
         metric_db: f32,
         raw_power_db: Option<f32>,
     ) -> Option<BtsPowerControlTick> {
-        // Keep per-PCG work out of the traffic-pool lock.
-        let channel = {
-            let slots = traffic_channels.lock();
-            slots
-                .iter()
-                .find(|slot| slot.walsh_code == walsh_code)
-                .map(|s| s.channel.clone())?
-        };
-        let use_rc3 = matches!(channel, TrafficChannelWrapper::Rc3(_));
+        let slot = traffic_channels.lookup(walsh_code)?;
+        let use_rc3 = matches!(slot.channel, TrafficChannelWrapper::Rc3(_));
         let tick = {
             let mut states = self.states.lock();
             let is_new_state = !states.contains_key(&walsh_code);
@@ -1158,7 +1149,7 @@ impl BtsPowerControlRegistry {
             )
         };
 
-        match &channel {
+        match &slot.channel {
             TrafficChannelWrapper::Rc1(ch) => {
                 ch.channel.schedule_power_control_bit(tx_abs_pcg, tick.pcb)
             }
@@ -1177,16 +1168,12 @@ impl BtsPowerControlRegistry {
         start_abs_pcg: u64,
         pcgs: u64,
     ) -> bool {
-        let channel = {
-            let slots = traffic_channels.lock();
-            let Some(slot) = slots.iter().find(|slot| slot.walsh_code == walsh_code) else {
-                return false;
-            };
-            slot.channel.clone()
+        let Some(slot) = traffic_channels.lookup(walsh_code) else {
+            return false;
         };
         for offset in 0..pcgs {
             let abs_pcg = start_abs_pcg.saturating_add(offset);
-            match &channel {
+            match &slot.channel {
                 TrafficChannelWrapper::Rc1(ch) => ch.channel.schedule_power_control_bit(abs_pcg, 1),
                 TrafficChannelWrapper::Rc3(ch) => ch.channel.schedule_power_control_bit(abs_pcg, 1),
                 TrafficChannelWrapper::SchRc3(_) => return false,

@@ -253,6 +253,10 @@ pub(crate) struct TxLoopState {
     pub(super) last_tc_n: usize,
     pub(super) last_tc_max_us: u64,
     pub(super) last_tc_sum_us: u64,
+    /// TX-private traffic channel working list. Updated via the lock-free
+    /// command queue from `ChannelRegistry`; the TX synth loop iterates
+    /// this list with no blocking lock on the hot path.
+    pub(super) tx_pool: handle::TxPool,
 }
 
 impl Bts {
@@ -454,6 +458,7 @@ impl Bts {
             scratch_paging: Vec::new(),
             scratch_tc_snapshot: Vec::new(),
             scratch_tc_blocks: Vec::new(),
+            tx_pool: handle::TxPool::new(self.traffic_channels.tx_cmd_queue()),
             last_snap_us: 0,
             last_tc_n: 0,
             last_tc_max_us: 0,
@@ -781,7 +786,6 @@ impl Bts {
                 let block_gen_start = Instant::now();
                 synth::synthesize_block(
                     &self.runtime,
-                    &self.traffic_channels,
                     &mut state,
                     gen_start,
                     &pch,

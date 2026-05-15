@@ -7826,18 +7826,18 @@ async fn run_traffic_channel_e2e(
     .await;
 
     // Verify traffic channel was allocated
-    let traffic_pool = bts_handle.traffic_channels.lock();
+    let walsh_codes = bts_handle.traffic_channels.walsh_codes();
     assert!(
-        !traffic_pool.is_empty(),
+        !walsh_codes.is_empty(),
         "expected at least one traffic channel to be allocated after origination"
     );
-    let assigned_walsh = traffic_pool[0].walsh_code;
+    let assigned_walsh = walsh_codes[0];
     eprintln!(
         "traffic channel allocated: walsh_code={} pool_size={}",
         assigned_walsh,
-        traffic_pool.len()
+        walsh_codes.len()
     );
-    drop(traffic_pool);
+    drop(walsh_codes);
 
     // Run BTS — generates pulse-shaped WAV with pilot + sync + paging + traffic
     bts.run_for_blocks(32_000).await?;
@@ -8160,12 +8160,12 @@ async fn test_e2e_rc1_reverse_preamble_triggers_crc_valid_bs_ack_order() -> Resu
         .await;
 
     let assigned_walsh = {
-        let pool = traffic_channels.lock();
+        let codes = traffic_channels.walsh_codes();
         assert!(
-            !pool.is_empty(),
+            !codes.is_empty(),
             "expected RC1 traffic channel to be allocated before BTS run"
         );
-        pool[0].walsh_code
+        codes[0]
     };
     assert_eq!(assigned_walsh, 10, "expected first traffic Walsh to be W10");
 

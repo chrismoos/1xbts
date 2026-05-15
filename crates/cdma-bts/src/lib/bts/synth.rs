@@ -9,7 +9,7 @@ use crate::{
 };
 
 use super::{
-    PagingWalshChannel, PilotWalshChannel, SyncWalshChannel, TrafficChannelPool, TxLoopState,
+    PagingWalshChannel, PilotWalshChannel, SyncWalshChannel, TxLoopState,
     handle::TrafficChannelWrapper, settings::BtsRuntimeSettings,
 };
 
@@ -25,21 +25,19 @@ pub(super) fn aligned_spreader(
     spreader
 }
 
-/// Align any unstarted traffic channels to the next frame boundary, mark
-/// `frame_align_verified` on first use, and return a snapshot of active
-/// channel handles with their gains.  The pool lock is held only for this
-/// brief metadata pass; `next_block()` is called by the caller after the
-/// lock has been released.
+/// Drain Add/Remove commands into the TX-private working list, align any
+/// unstarted channels to the next 20 ms frame boundary, and produce a
+/// `(gain, channel_handle)` snapshot ready for synthesis. No locks held.
 fn snapshot_traffic_channels_into(
-    traffic_channels: &TrafficChannelPool,
+    tx_pool: &mut super::handle::TxPool,
     chip_cursor: u64,
     pilot_offset_chips: u64,
     out: &mut Vec<(f32, TrafficChannelWrapper)>,
 ) {
+    tx_pool.drain_commands();
     out.clear();
-    let mut tc_pool = traffic_channels.lock();
-    for slot in tc_pool.iter_mut() {
-        if !slot.lc_aligned {
+    for tx_slot in tx_pool.slots_mut() {
+        if !tx_slot.lc_aligned {
             let offset = (chip_cursor - pilot_offset_chips) % SR1_CHIPS_PER_FRAME;
             let start_chip = if offset == 0 {
                 chip_cursor
@@ -48,42 +46,40 @@ fn snapshot_traffic_channels_into(
             };
             log::info!(
                 "bts_tx: aligning traffic channel walsh={} start_chip={} chip_cursor={}",
-                slot.walsh_code,
+                tx_slot.walsh_code,
                 start_chip,
                 chip_cursor,
             );
-            slot.channel.advance_lc_to_chip(start_chip);
-            slot.start_chip = Some(start_chip);
-            slot.lc_aligned = true;
+            tx_slot.slot.channel.advance_lc_to_chip(start_chip);
+            tx_slot.start_chip = Some(start_chip);
+            tx_slot.lc_aligned = true;
         }
-    }
-    for slot in tc_pool.iter_mut() {
-        let Some(start) = slot.start_chip else {
+        let Some(start) = tx_slot.start_chip else {
             continue;
         };
         if chip_cursor < start {
             continue;
         }
-        if !slot.frame_align_verified {
+        if !tx_slot.frame_align_verified {
             assert_eq!(
                 chip_cursor,
                 start,
                 "traffic channel walsh={} missed frame boundary: \
                  chip_cursor={} start_chip={} overshoot={}",
-                slot.walsh_code,
+                tx_slot.walsh_code,
                 chip_cursor,
                 start,
                 chip_cursor - start,
             );
-            slot.frame_align_verified = true;
+            tx_slot.frame_align_verified = true;
         }
-        out.push((slot.gain, slot.channel.clone()));
+        let gain = tx_slot.slot.gain();
+        out.push((gain, tx_slot.slot.channel.clone()));
     }
 }
 
 pub(super) fn synthesize_block(
     runtime: &BtsRuntimeSettings,
-    traffic_channels: &TrafficChannelPool,
     state: &mut TxLoopState,
     gen_start: Instant,
     pch: &PilotWalshChannel,
@@ -115,7 +111,7 @@ pub(super) fn synthesize_block(
     let t0 = Instant::now();
     let snap_start = Instant::now();
     snapshot_traffic_channels_into(
-        traffic_channels,
+        &mut state.tx_pool,
         chip_cursor,
         state.pilot_offset_chips,
         &mut state.scratch_tc_snapshot,

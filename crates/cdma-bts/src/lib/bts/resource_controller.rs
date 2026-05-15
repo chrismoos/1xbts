@@ -62,7 +62,7 @@ impl TrafficResourceService {
     pub fn new() -> Self {
         Self {
             walsh_allocator: Arc::new(Mutex::new(WalshAllocator::new())),
-            traffic_channels: Arc::new(Mutex::new(Vec::new())),
+            traffic_channels: Arc::new(super::handle::ChannelRegistry::new()),
             traffic_rx_pool: Arc::new(Mutex::new(Vec::new())),
             traffic_rx_removals: Arc::new(Mutex::new(Vec::new())),
         }
