@@ -3873,12 +3873,13 @@ async fn packet_data_send_service_connect_uses_origination_sr_id_and_omits_optio
 }
 
 #[tokio::test]
-async fn so33_service_connect_omits_rlp_blob_and_uses_origination_sr_id() {
+async fn so33_service_connect_includes_rlp_sync_blob_and_uses_origination_sr_id() {
     use std::sync::{Arc, mpsc::channel};
     let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
+    let (traffic_tx, mut traffic_rx) = broadcast::channel(32);
 
     let mut bsc = Bsc::new(Config {
         pilot_offset: 0,
@@ -3895,7 +3896,7 @@ async fn so33_service_connect_omits_rlp_blob_and_uses_origination_sr_id() {
         power_override_request_tx: None,
         mobiles_tx: None,
         paging_broadcast: None,
-        traffic_broadcast: None,
+        traffic_broadcast: Some(traffic_tx),
         rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
@@ -3950,6 +3951,27 @@ async fn so33_service_connect_omits_rlp_blob_and_uses_origination_sr_id() {
 
     bsc.send_service_connect(walsh_code, 0)
         .expect("SO33 Service Connect should produce FchForward");
+
+    let event = traffic_rx
+        .try_recv()
+        .expect("SO33 Service Connect should emit a traffic event");
+    let service_connect = event
+        .service_connect
+        .as_ref()
+        .expect("traffic event should carry Service Connect details");
+    let conn = service_connect
+        .connections
+        .iter()
+        .find(|conn| conn.service_option == SERVICE_OPTION_HIGH_RATE_PACKET_DATA)
+        .expect("Service Connect should include the SO33 connection");
+
+    assert_eq!(conn.sr_id, 1);
+    assert!(conn.rlp_info_incl);
+    assert_eq!(
+        conn.rlp_blob.as_deref(),
+        Some(&[0x2c, 0x2d, 0x92, 0x49, 0x20][..])
+    );
+    assert!(conn.qos_parms.is_none());
 }
 
 #[tokio::test]

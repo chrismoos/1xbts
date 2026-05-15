@@ -483,6 +483,38 @@ impl TrafficChannelInfo {
         }
     }
 
+    /// Tear down packet-data channels stuck in ServiceConnecting past the
+    /// configured timeout (no SCCM from the MS).
+    pub(crate) fn packet_service_connecting_action(
+        &self,
+        packet_service_connect_timeout: Duration,
+        now: Instant,
+    ) -> TrafficChannelAction {
+        match self.channel_state {
+            ChannelState::ServiceConnecting { sc_sent_at }
+                if now.duration_since(sc_sent_at) >= packet_service_connect_timeout =>
+            {
+                TrafficChannelAction::Teardown {
+                    reason: "packet Service Connect timeout (no SCCM from MS)",
+                    timeout_ms: packet_service_connect_timeout.as_millis() as u64,
+                }
+            }
+            _ => TrafficChannelAction::None,
+        }
+    }
+
+    pub(crate) fn next_packet_service_connecting_deadline(
+        &self,
+        packet_service_connect_timeout: Duration,
+    ) -> Option<Instant> {
+        match self.channel_state {
+            ChannelState::ServiceConnecting { sc_sent_at } => {
+                Some(sc_sent_at + packet_service_connect_timeout)
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn voice_poll_action(
         &self,
         service_connect_timeout: Duration,

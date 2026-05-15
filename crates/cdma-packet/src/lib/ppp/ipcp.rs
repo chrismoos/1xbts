@@ -12,6 +12,7 @@
 /// - We include primary/secondary DNS in our NAK responses
 /// - Mobile acks our request → IPCP is open
 use super::framing::PppPacket;
+use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 
 pub const IPCP_PROTOCOL: u16 = 0x8021;
@@ -20,12 +21,19 @@ const CONFIGURE_REQUEST: u8 = 1;
 const CONFIGURE_ACK: u8 = 2;
 const CONFIGURE_NAK: u8 = 3;
 const CONFIGURE_REJECT: u8 = 4;
+const TERMINATE_REQUEST: u8 = 5;
+const TERMINATE_ACK: u8 = 6;
+const CODE_REJECT: u8 = 7;
 
 /// PPP restart timer in packet-session ticks. Packet sessions tick every 20 ms,
 /// so this retransmits pending Configure-Requests once per second.
 const CONFIGURE_RESTART_TICKS: u16 = 50;
 const MAX_CONFIGURE_RESTARTS: u32 = 10;
-const OMITTED_PEER_IP_NAK_LIMIT: u32 = 3;
+/// RFC 1661 §4.6 Max-Failure: after this many NAKs for an option without an
+/// intervening ACK, convert to Reject (or drop if it was an appended suggestion).
+const MAX_FAILURE: u32 = 5;
+/// RFC 1661 §5.6: Rejected-Packet clamped below the default MRU.
+const CODE_REJECT_MAX_DATA: usize = 1400;
 
 // IPCP option types.
 const OPT_IP_ADDRESS: u8 = 3;
@@ -158,6 +166,13 @@ pub struct IpcpConfig {
     pub secondary_dns: Ipv4Addr,
 }
 
+#[derive(Debug, Clone)]
+pub struct IpcpOpenState {
+    pub config: IpcpConfig,
+    pub request_local_ip: bool,
+    pub last_acked_peer_request_data: Vec<u8>,
+}
+
 impl Default for IpcpConfig {
     fn default() -> Self {
         Self {
@@ -174,15 +189,18 @@ impl Default for IpcpConfig {
 pub struct IpcpSession {
     pub state: IpcpState,
     pub config: IpcpConfig,
+    log_context: Option<String>,
     next_id: u8,
     peer_acked: bool,
     we_acked: bool,
     last_request_id: Option<u8>,
     last_request_data: Vec<u8>,
+    last_acked_peer_request_data: Vec<u8>,
     restart_ticks_remaining: u16,
     configure_restarts: u32,
     configure_failed: bool,
-    omitted_peer_ip_naks: u32,
+    /// RFC 1661 §4.6 Max-Failure: NAKs sent per option since last ACK.
+    consecutive_naks_sent: BTreeMap<u8, u32>,
     request_local_ip: bool,
 }
 
@@ -191,16 +209,29 @@ impl IpcpSession {
         Self {
             state: IpcpState::Closed,
             config,
+            log_context: None,
             next_id: 1,
             peer_acked: false,
             we_acked: false,
             last_request_id: None,
             last_request_data: Vec::new(),
+            last_acked_peer_request_data: Vec::new(),
             restart_ticks_remaining: 0,
             configure_restarts: 0,
             configure_failed: false,
-            omitted_peer_ip_naks: 0,
+            consecutive_naks_sent: BTreeMap::new(),
             request_local_ip: true,
+        }
+    }
+
+    pub fn set_log_context(&mut self, context: String) {
+        self.log_context = Some(context);
+    }
+
+    fn log_prefix(&self, label: &str) -> String {
+        match self.log_context.as_deref() {
+            Some(context) => format!("{}[{}]", label, context),
+            None => label.to_string(),
         }
     }
 
@@ -222,8 +253,13 @@ impl IpcpSession {
     }
 
     fn send_configure_request(&mut self, data: Vec<u8>) -> PppPacket {
-        log::debug!("IPCP TX: Configure-Request (our_ip={})", self.config.our_ip);
         let id = self.alloc_id();
+        log::info!(
+            "{}: Configure-Request id={} opts=[{}]",
+            self.log_prefix("IPCP TX"),
+            id,
+            format_ipcp_options(&data)
+        );
         let pkt = IpcpPacket {
             code: CONFIGURE_REQUEST,
             identifier: id,
@@ -254,7 +290,8 @@ impl IpcpSession {
         self.configure_restarts = self.configure_restarts.saturating_add(1);
         if self.configure_restarts > MAX_CONFIGURE_RESTARTS {
             log::warn!(
-                "IPCP: Configure-Request failed after {} retransmits",
+                "{}: Configure-Request failed after {} retransmits",
+                self.log_prefix("IPCP"),
                 self.configure_restarts - 1
             );
             self.state = IpcpState::Closed;
@@ -267,10 +304,12 @@ impl IpcpSession {
             return None;
         }
         self.restart_ticks_remaining = CONFIGURE_RESTART_TICKS;
-        log::debug!(
-            "IPCP TX: Configure-Request retransmit id={} restart_count={}",
+        log::info!(
+            "{}: Configure-Request retransmit id={} restart_count={} opts=[{}]",
+            self.log_prefix("IPCP TX"),
             id,
-            self.configure_restarts
+            self.configure_restarts,
+            format_ipcp_options(&self.last_request_data)
         );
         Some(
             IpcpPacket {
@@ -293,64 +332,134 @@ impl IpcpSession {
 
         match ipcp.code {
             CONFIGURE_REQUEST => {
-                log::debug!(
-                    "IPCP RX: Configure-Request id={} opts=[{}]",
+                log::info!(
+                    "{}: Configure-Request id={} state={:?} opts=[{}]",
+                    self.log_prefix("IPCP RX"),
                     ipcp.identifier,
+                    self.state,
                     format_ipcp_options(&ipcp.data)
                 );
+
+                // RFC 1661 §4.3: RCR in Opened triggers renegotiation.
+                if self.state == IpcpState::Opened && ipcp.data == self.last_acked_peer_request_data
+                {
+                    log::info!(
+                        "{}: duplicate Configure-Request id={} in Opened, re-ACKing without resetting IP",
+                        self.log_prefix("IPCP RX"),
+                        ipcp.identifier
+                    );
+                    let ack = IpcpPacket {
+                        code: CONFIGURE_ACK,
+                        identifier: ipcp.identifier,
+                        data: ipcp.data.clone(),
+                    };
+                    log::info!(
+                        "{}: Configure-Ack id={} opts=[{}]",
+                        self.log_prefix("IPCP TX"),
+                        ipcp.identifier,
+                        format_ipcp_options(&ipcp.data)
+                    );
+                    responses.push(ack.to_ppp());
+                    return responses;
+                }
+                if self.state == IpcpState::Opened {
+                    log::info!(
+                        "{}: peer restarted negotiation, re-sending Configure-Request",
+                        self.log_prefix("IPCP")
+                    );
+                    self.peer_acked = false;
+                    self.we_acked = false;
+                    self.last_request_id = None;
+                    self.last_request_data.clear();
+                    self.last_acked_peer_request_data.clear();
+                    self.restart_ticks_remaining = 0;
+                    self.consecutive_naks_sent.clear();
+                    self.request_local_ip = true;
+                    self.state = IpcpState::RequestSent;
+                    responses.push(self.start());
+                }
+
                 let opts = parse_options(&ipcp.data);
-                let mut nak_opts = Vec::new();
-                let mut reject_opts = Vec::new();
+                // peer_naks: peer sent option but value isn't acceptable.
+                // appended: option to suggest the peer add to its next request.
+                // rejects: peer sent option we don't recognise.
+                let mut peer_naks: Vec<IpcpOption> = Vec::new();
+                let mut appended: Vec<IpcpOption> = Vec::new();
+                let mut rejects: Vec<IpcpOption> = Vec::new();
 
                 for opt in &opts {
                     match opt.opt_type {
                         OPT_IP_ADDRESS => {
-                            let requested_ip = bytes_to_ip(&opt.data);
-                            if requested_ip == Some(self.config.peer_ip) {
-                                // They're requesting the correct IP — will ACK.
-                            } else {
-                                // NAK with the IP we want to assign.
-                                nak_opts.push(IpcpOption {
+                            if bytes_to_ip(&opt.data) != Some(self.config.peer_ip) {
+                                peer_naks.push(IpcpOption {
                                     opt_type: OPT_IP_ADDRESS,
                                     data: ip_to_bytes(self.config.peer_ip),
                                 });
                             }
                         }
                         OPT_PRIMARY_DNS => {
-                            let requested_dns = bytes_to_ip(&opt.data);
-                            if requested_dns != Some(self.config.primary_dns) {
-                                nak_opts.push(IpcpOption {
+                            if bytes_to_ip(&opt.data) != Some(self.config.primary_dns) {
+                                peer_naks.push(IpcpOption {
                                     opt_type: OPT_PRIMARY_DNS,
                                     data: ip_to_bytes(self.config.primary_dns),
                                 });
                             }
                         }
                         OPT_SECONDARY_DNS => {
-                            let requested_dns = bytes_to_ip(&opt.data);
-                            if requested_dns != Some(self.config.secondary_dns) {
-                                nak_opts.push(IpcpOption {
+                            if bytes_to_ip(&opt.data) != Some(self.config.secondary_dns) {
+                                peer_naks.push(IpcpOption {
                                     opt_type: OPT_SECONDARY_DNS,
                                     data: ip_to_bytes(self.config.secondary_dns),
                                 });
                             }
                         }
                         _ => {
-                            reject_opts.push(opt.clone());
+                            rejects.push(opt.clone());
                         }
                     }
                 }
 
-                if !reject_opts.is_empty() {
-                    log::debug!(
-                        "IPCP TX: Configure-Reject id={} opts=[{}]",
+                // RFC 1661 §5.3: append our IP-Address suggestion when the peer
+                // didn't list it, bounded by Max-Failure.
+                let peer_sent_ip = opts.iter().any(|o| o.opt_type == OPT_IP_ADDRESS);
+                if !peer_sent_ip && self.nak_count(OPT_IP_ADDRESS) < MAX_FAILURE {
+                    appended.push(IpcpOption {
+                        opt_type: OPT_IP_ADDRESS,
+                        data: ip_to_bytes(self.config.peer_ip),
+                    });
+                }
+
+                // RFC 1661 §4.6: at Max-Failure, peer-sent NAKs convert to Reject.
+                peer_naks.retain(|opt| {
+                    if self.nak_count(opt.opt_type) >= MAX_FAILURE {
+                        log::info!(
+                            "{}: Max-Failure hit for option type={}, converting to Configure-Reject",
+                            self.log_prefix("IPCP"),
+                            opt.opt_type
+                        );
+                        if let Some(peer_opt) =
+                            opts.iter().find(|o| o.opt_type == opt.opt_type)
+                        {
+                            rejects.push(peer_opt.clone());
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
+
+                if !rejects.is_empty() {
+                    log::info!(
+                        "{}: Configure-Reject id={} opts=[{}]",
+                        self.log_prefix("IPCP TX"),
                         ipcp.identifier,
-                        format_ipcp_options(&serialize_options(&reject_opts))
+                        format_ipcp_options(&serialize_options(&rejects))
                     );
                     responses.push(
                         IpcpPacket {
                             code: CONFIGURE_REJECT,
                             identifier: ipcp.identifier,
-                            data: serialize_options(&reject_opts),
+                            data: serialize_options(&rejects),
                         }
                         .to_ppp(),
                     );
@@ -359,39 +468,16 @@ impl IpcpSession {
                     return responses;
                 }
 
-                let has_ip_opt = opts.iter().any(|o| o.opt_type == OPT_IP_ADDRESS);
-                if !has_ip_opt {
-                    if self.omitted_peer_ip_naks < OMITTED_PEER_IP_NAK_LIMIT {
-                        self.omitted_peer_ip_naks = self.omitted_peer_ip_naks.saturating_add(1);
-                        log::debug!(
-                            "IPCP: peer omitted IP-Address, suggesting assigned IP {} via Configure-Nak (attempt {}/{})",
-                            self.config.peer_ip,
-                            self.omitted_peer_ip_naks,
-                            OMITTED_PEER_IP_NAK_LIMIT
-                        );
-                        nak_opts.push(IpcpOption {
-                            opt_type: OPT_IP_ADDRESS,
-                            data: ip_to_bytes(self.config.peer_ip),
-                        });
-                    } else if nak_opts.is_empty() {
-                        log::debug!(
-                            "IPCP: peer omitted IP-Address after {} NAKs, accepting request with assigned peer IP {}",
-                            self.omitted_peer_ip_naks,
-                            self.config.peer_ip
-                        );
-                    } else {
-                        log::debug!(
-                            "IPCP: peer omitted IP-Address after {} NAKs, not appending IP option while NAKing other options",
-                            self.omitted_peer_ip_naks
-                        );
-                    }
-                } else {
-                    self.omitted_peer_ip_naks = 0;
-                }
+                let nak_opts: Vec<IpcpOption> =
+                    peer_naks.iter().chain(appended.iter()).cloned().collect();
 
                 if nak_opts.is_empty() {
-                    // ACK — all options are acceptable.
-                    log::debug!("IPCP TX: Configure-Ack id={}", ipcp.identifier);
+                    log::info!(
+                        "{}: Configure-Ack id={} opts=[{}]",
+                        self.log_prefix("IPCP TX"),
+                        ipcp.identifier,
+                        format_ipcp_options(&ipcp.data)
+                    );
                     let ack = IpcpPacket {
                         code: CONFIGURE_ACK,
                         identifier: ipcp.identifier,
@@ -399,10 +485,13 @@ impl IpcpSession {
                     };
                     responses.push(ack.to_ppp());
                     self.we_acked = true;
+                    self.last_acked_peer_request_data = ipcp.data.clone();
+                    // RFC 1661 §4.6: ACK resets Max-Failure.
+                    self.consecutive_naks_sent.clear();
                 } else {
-                    // NAK — suggest correct values.
-                    log::debug!(
-                        "IPCP TX: Configure-Nak id={} opts=[{}]",
+                    log::info!(
+                        "{}: Configure-Nak id={} opts=[{}]",
+                        self.log_prefix("IPCP TX"),
                         ipcp.identifier,
                         format_ipcp_options(&serialize_options(&nak_opts))
                     );
@@ -412,6 +501,9 @@ impl IpcpSession {
                         data: serialize_options(&nak_opts),
                     };
                     responses.push(nak.to_ppp());
+                    for opt in &nak_opts {
+                        *self.consecutive_naks_sent.entry(opt.opt_type).or_insert(0) += 1;
+                    }
                 }
 
                 self.update_state();
@@ -420,52 +512,55 @@ impl IpcpSession {
                 if self.last_request_id != Some(ipcp.identifier)
                     || ipcp.data != self.last_request_data
                 {
-                    log::debug!(
-                        "IPCP RX: invalid Configure-Ack id={} expected_id={:?} opts=[{}], discarding",
+                    log::info!(
+                        "{}: invalid Configure-Ack id={} expected_id={:?} opts=[{}], discarding",
+                        self.log_prefix("IPCP RX"),
                         ipcp.identifier,
                         self.last_request_id,
                         format_ipcp_options(&ipcp.data)
                     );
                     return responses;
                 }
-                log::debug!("IPCP RX: Configure-Ack id={}", ipcp.identifier);
+                log::info!(
+                    "{}: Configure-Ack id={} opts=[{}]",
+                    self.log_prefix("IPCP RX"),
+                    ipcp.identifier,
+                    format_ipcp_options(&ipcp.data)
+                );
                 self.peer_acked = true;
                 self.restart_ticks_remaining = 0;
                 self.update_state();
             }
             CONFIGURE_NAK => {
                 if self.last_request_id != Some(ipcp.identifier) {
-                    log::debug!(
-                        "IPCP RX: Configure-Nak id={} does not match last request {:?}, discarding",
+                    log::info!(
+                        "{}: Configure-Nak id={} does not match last request {:?}, discarding",
+                        self.log_prefix("IPCP RX"),
                         ipcp.identifier,
                         self.last_request_id
                     );
                     return responses;
                 }
-                log::debug!(
-                    "IPCP RX: Configure-Nak id={} opts=[{}]",
+                log::info!(
+                    "{}: Configure-Nak id={} opts=[{}]",
+                    self.log_prefix("IPCP RX"),
                     ipcp.identifier,
                     format_ipcp_options(&ipcp.data)
                 );
-                // Peer suggests different values for our options. Adopt and retry.
-                let opts = parse_options(&ipcp.data);
-                for opt in &opts {
-                    if opt.opt_type == OPT_IP_ADDRESS {
-                        if let Some(ip) = bytes_to_ip(&opt.data) {
-                            if ip == self.config.our_ip {
-                                // Already using the suggested local address.
-                            } else {
-                                log::debug!(
-                                    "IPCP: peer NAKed our local IP {} with {}, continuing without local IP option",
-                                    self.config.our_ip,
-                                    ip
-                                );
-                                self.request_local_ip = false;
-                            }
-                        }
+                // RFC 1661 §5.3 adoption is MAY; keep our IP-Address value.
+                for opt in parse_options(&ipcp.data) {
+                    if opt.opt_type == OPT_IP_ADDRESS
+                        && let Some(ip) = bytes_to_ip(&opt.data)
+                        && ip != self.config.our_ip
+                    {
+                        log::info!(
+                            "{}: peer NAKed our local IP {} with {}, keeping our value",
+                            self.log_prefix("IPCP"),
+                            self.config.our_ip,
+                            ip
+                        );
                     }
                 }
-                // Resend Configure-Request with updated values.
                 let data = self.our_request_data();
                 self.peer_acked = false;
                 responses.push(self.send_configure_request(data));
@@ -473,22 +568,25 @@ impl IpcpSession {
             }
             CONFIGURE_REJECT => {
                 if self.last_request_id != Some(ipcp.identifier) {
-                    log::debug!(
-                        "IPCP RX: Configure-Reject id={} does not match last request {:?}, discarding",
+                    log::info!(
+                        "{}: Configure-Reject id={} does not match last request {:?}, discarding",
+                        self.log_prefix("IPCP RX"),
                         ipcp.identifier,
                         self.last_request_id
                     );
                     return responses;
                 }
-                log::debug!(
-                    "IPCP RX: Configure-Reject id={} opts=[{}]",
+                log::info!(
+                    "{}: Configure-Reject id={} opts=[{}]",
+                    self.log_prefix("IPCP RX"),
                     ipcp.identifier,
                     format_ipcp_options(&ipcp.data)
                 );
                 for opt in parse_options(&ipcp.data) {
                     if opt.opt_type == OPT_IP_ADDRESS {
-                        log::debug!(
-                            "IPCP: peer rejected our local IP option, continuing without it"
+                        log::info!(
+                            "{}: peer rejected our local IP option, continuing without it",
+                            self.log_prefix("IPCP")
                         );
                         self.request_local_ip = false;
                     }
@@ -497,8 +595,80 @@ impl IpcpSession {
                 responses.push(self.send_configure_request(self.our_request_data()));
                 self.update_state();
             }
+            TERMINATE_REQUEST => {
+                // RFC 1661 §5.5: ACK and close down.
+                log::info!(
+                    "{}: Terminate-Request id={} data=[{}]",
+                    self.log_prefix("IPCP RX"),
+                    ipcp.identifier,
+                    ipcp.data
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<String>()
+                );
+                let ack = IpcpPacket {
+                    code: TERMINATE_ACK,
+                    identifier: ipcp.identifier,
+                    data: vec![],
+                };
+                responses.push(ack.to_ppp());
+                self.state = IpcpState::Closed;
+                self.peer_acked = false;
+                self.we_acked = false;
+                self.last_request_id = None;
+                self.last_request_data.clear();
+                self.last_acked_peer_request_data.clear();
+                self.restart_ticks_remaining = 0;
+                self.configure_failed = false;
+                self.consecutive_naks_sent.clear();
+                self.request_local_ip = true;
+            }
+            TERMINATE_ACK => {
+                // RFC 1661 §5.5: peer reports Closed; informational since we never
+                // send Terminate-Request today.
+                log::info!(
+                    "{}: Terminate-Ack id={} (peer reports IPCP closed)",
+                    self.log_prefix("IPCP RX"),
+                    ipcp.identifier
+                );
+                self.state = IpcpState::Closed;
+                self.peer_acked = false;
+                self.we_acked = false;
+                self.last_request_id = None;
+                self.last_request_data.clear();
+                self.last_acked_peer_request_data.clear();
+                self.restart_ticks_remaining = 0;
+            }
+            CODE_REJECT => {
+                // RFC 1661 §5.6: peer rejected a standard IPCP code; let LCP teardown handle it.
+                log::warn!(
+                    "{}: Code-Reject id={} data=[{}]",
+                    self.log_prefix("IPCP RX"),
+                    ipcp.identifier,
+                    ipcp.data
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<String>()
+                );
+            }
             _ => {
-                log::debug!("IPCP: ignoring code {}", ipcp.code);
+                // RFC 1661 §5.6: unknown code → Code-Reject with the offending packet.
+                log::info!(
+                    "{}: Code-Reject for unknown code={} id={}",
+                    self.log_prefix("IPCP TX"),
+                    ipcp.code,
+                    ipcp.identifier
+                );
+                let mut data = ppp.payload.clone();
+                if data.len() > CODE_REJECT_MAX_DATA {
+                    data.truncate(CODE_REJECT_MAX_DATA);
+                }
+                let reject = IpcpPacket {
+                    code: CODE_REJECT,
+                    identifier: self.alloc_id(),
+                    data,
+                };
+                responses.push(reject.to_ppp());
             }
         }
 
@@ -510,18 +680,31 @@ impl IpcpSession {
         self.state == IpcpState::Opened
     }
 
-    /// Force IPCP open for a peer that resumed IP traffic without replaying
-    /// full IPCP negotiation.
-    pub fn force_open_with_peer_ip(&mut self, peer_ip: Ipv4Addr) {
-        self.config.peer_ip = peer_ip;
-        self.peer_acked = true;
-        self.we_acked = true;
-        self.restart_ticks_remaining = 0;
-        self.configure_failed = false;
-        self.state = IpcpState::Opened;
+    pub fn open_state(&self) -> Option<IpcpOpenState> {
+        self.is_open().then(|| IpcpOpenState {
+            config: self.config.clone(),
+            request_local_ip: self.request_local_ip,
+            last_acked_peer_request_data: self.last_acked_peer_request_data.clone(),
+        })
     }
 
-    pub fn set_peer_ip(&mut self, peer_ip: Ipv4Addr) {
+    pub fn restore_open_state(&mut self, state: IpcpOpenState) {
+        self.config = state.config;
+        self.request_local_ip = state.request_local_ip;
+        self.last_acked_peer_request_data = state.last_acked_peer_request_data;
+        self.state = IpcpState::Opened;
+        self.peer_acked = true;
+        self.we_acked = true;
+        self.last_request_id = None;
+        self.last_request_data.clear();
+        self.restart_ticks_remaining = 0;
+        self.configure_failed = false;
+        self.consecutive_naks_sent.clear();
+    }
+
+    /// Reassign the configured peer IP without touching state flags or timers;
+    /// the next peer Configure-Request decides ACK vs NAK normally.
+    pub fn reassign_peer_ip(&mut self, peer_ip: Ipv4Addr) {
         self.config.peer_ip = peer_ip;
     }
 
@@ -543,8 +726,16 @@ impl IpcpSession {
         self.configure_restarts
     }
 
+    /// Telemetry: NAKs containing IP-Address since last ACK.
     pub fn omitted_peer_ip_naks(&self) -> u32 {
-        self.omitted_peer_ip_naks
+        self.nak_count(OPT_IP_ADDRESS)
+    }
+
+    fn nak_count(&self, opt_type: u8) -> u32 {
+        self.consecutive_naks_sent
+            .get(&opt_type)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn update_state(&mut self) {
@@ -740,7 +931,10 @@ mod tests {
     }
 
     #[test]
-    fn omitted_peer_ip_accepts_after_bounded_naks() {
+    fn omitted_peer_ip_accepts_after_max_failure() {
+        // RFC 1661 §4.6 Max-Failure: after MAX_FAILURE NAKs appending the
+        // IP-Address option (peer kept omitting it), we stop appending
+        // and ACK whatever the peer sent.
         let mut session = IpcpSession::new(IpcpConfig::default());
         session.start();
 
@@ -755,7 +949,7 @@ mod tests {
             },
         ]);
 
-        for id in 1..=OMITTED_PEER_IP_NAK_LIMIT {
+        for id in 1..=MAX_FAILURE {
             let mobile_req = IpcpPacket {
                 code: CONFIGURE_REQUEST,
                 identifier: id as u8,
@@ -777,7 +971,7 @@ mod tests {
 
         let mobile_req = IpcpPacket {
             code: CONFIGURE_REQUEST,
-            identifier: (OMITTED_PEER_IP_NAK_LIMIT + 1) as u8,
+            identifier: (MAX_FAILURE + 1) as u8,
             data: mobile_req_data.clone(),
         };
         let responses = session.receive(&mobile_req.to_ppp());
@@ -786,7 +980,8 @@ mod tests {
         assert_eq!(ack.code, CONFIGURE_ACK);
         assert_eq!(ack.data, mobile_req_data);
 
-        assert_eq!(session.omitted_peer_ip_naks(), OMITTED_PEER_IP_NAK_LIMIT);
+        // ACK clears the counter per RFC §4.6.
+        assert_eq!(session.omitted_peer_ip_naks(), 0);
         assert_eq!(session.peer_ip(), Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(session.state, IpcpState::AckSent);
     }
@@ -851,11 +1046,13 @@ mod tests {
     }
 
     #[test]
-    fn our_ip_nak_does_not_rewrite_gateway() {
+    fn our_ip_nak_keeps_our_value() {
+        // RFC 1661 §5.3: adoption of the peer's NAK suggestion is MAY.
+        // We refuse — re-propose the same IP-Address option with our
+        // gateway value.
         let mut session = IpcpSession::new(IpcpConfig::default());
         session.start();
 
-        // Mobile NAKs our IP, suggests 10.0.0.100.
         let nak = IpcpPacket {
             code: CONFIGURE_NAK,
             identifier: 1,
@@ -869,7 +1066,9 @@ mod tests {
         let retry = IpcpPacket::parse(&responses[0].payload).unwrap();
         assert_eq!(retry.code, CONFIGURE_REQUEST);
         let opts = parse_options(&retry.data);
-        assert!(opts.is_empty());
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0].opt_type, OPT_IP_ADDRESS);
+        assert_eq!(bytes_to_ip(&opts[0].data), Some(Ipv4Addr::new(10, 0, 0, 1)));
         assert_eq!(session.our_ip(), Ipv4Addr::new(10, 0, 0, 1));
     }
 
@@ -995,5 +1194,223 @@ mod tests {
         };
         let responses = session.receive(&bad);
         assert!(responses.is_empty());
+    }
+
+    #[test]
+    fn max_failure_converts_peer_ip_nak_to_reject() {
+        // RFC 1661 §4.6: after MAX_FAILURE Configure-Naks for a
+        // peer-requested option without an intervening Configure-Ack, the
+        // option must be Configure-Rejected on the next round.
+        let mut session = IpcpSession::new(IpcpConfig::default());
+        session.start();
+
+        for id in 1..=MAX_FAILURE {
+            let mobile_req = IpcpPacket {
+                code: CONFIGURE_REQUEST,
+                identifier: id as u8,
+                data: serialize_options(&[IpcpOption {
+                    opt_type: OPT_IP_ADDRESS,
+                    data: vec![10, 0, 0, 99], // not our peer_ip
+                }]),
+            };
+            let responses = session.receive(&mobile_req.to_ppp());
+            assert_eq!(responses.len(), 1);
+            let resp = IpcpPacket::parse(&responses[0].payload).unwrap();
+            assert_eq!(resp.code, CONFIGURE_NAK);
+        }
+
+        // MAX_FAILURE+1: peer still proposes the same bad IP — we Reject.
+        let mobile_req = IpcpPacket {
+            code: CONFIGURE_REQUEST,
+            identifier: (MAX_FAILURE + 1) as u8,
+            data: serialize_options(&[IpcpOption {
+                opt_type: OPT_IP_ADDRESS,
+                data: vec![10, 0, 0, 99],
+            }]),
+        };
+        let responses = session.receive(&mobile_req.to_ppp());
+        assert_eq!(responses.len(), 1);
+        let resp = IpcpPacket::parse(&responses[0].payload).unwrap();
+        assert_eq!(resp.code, CONFIGURE_REJECT);
+        let reject_opts = parse_options(&resp.data);
+        assert_eq!(reject_opts.len(), 1);
+        assert_eq!(reject_opts[0].opt_type, OPT_IP_ADDRESS);
+        // The Rejected option echoes the peer's original value (RFC §5.4).
+        assert_eq!(
+            bytes_to_ip(&reject_opts[0].data),
+            Some(Ipv4Addr::new(10, 0, 0, 99))
+        );
+    }
+
+    #[test]
+    fn configure_ack_clears_max_failure_counter() {
+        let mut session = IpcpSession::new(IpcpConfig::default());
+        session.start();
+
+        // Two NAKs for IP-Address, then an ACKable request — counter resets.
+        for id in 1..=2 {
+            let req = IpcpPacket {
+                code: CONFIGURE_REQUEST,
+                identifier: id,
+                data: serialize_options(&[IpcpOption {
+                    opt_type: OPT_IP_ADDRESS,
+                    data: vec![0, 0, 0, 0],
+                }]),
+            };
+            session.receive(&req.to_ppp());
+        }
+        assert_eq!(session.omitted_peer_ip_naks(), 2);
+
+        let good_req = IpcpPacket {
+            code: CONFIGURE_REQUEST,
+            identifier: 3,
+            data: serialize_options(&[IpcpOption {
+                opt_type: OPT_IP_ADDRESS,
+                data: vec![10, 0, 0, 2],
+            }]),
+        };
+        session.receive(&good_req.to_ppp());
+        assert_eq!(session.omitted_peer_ip_naks(), 0);
+    }
+
+    #[test]
+    fn terminate_request_acked_and_state_closed() {
+        // RFC 1661 §5.5: on Terminate-Request, MUST send Terminate-Ack and
+        // close down our side.
+        let mut session = IpcpSession::new(IpcpConfig::default());
+        session.start();
+        // Get to Opened.
+        let req = IpcpPacket {
+            code: CONFIGURE_REQUEST,
+            identifier: 1,
+            data: serialize_options(&[IpcpOption {
+                opt_type: OPT_IP_ADDRESS,
+                data: vec![10, 0, 0, 2],
+            }]),
+        };
+        session.receive(&req.to_ppp());
+        let ack = IpcpPacket {
+            code: CONFIGURE_ACK,
+            identifier: 1,
+            data: vec![3, 6, 10, 0, 0, 1],
+        };
+        session.receive(&ack.to_ppp());
+        assert!(session.is_open());
+
+        let term = IpcpPacket {
+            code: TERMINATE_REQUEST,
+            identifier: 42,
+            data: b"bye".to_vec(),
+        };
+        let responses = session.receive(&term.to_ppp());
+        assert_eq!(responses.len(), 1);
+        let resp = IpcpPacket::parse(&responses[0].payload).unwrap();
+        assert_eq!(resp.code, TERMINATE_ACK);
+        assert_eq!(resp.identifier, 42);
+        assert_eq!(resp.data, Vec::<u8>::new());
+        assert_eq!(session.state, IpcpState::Closed);
+    }
+
+    #[test]
+    fn code_reject_emitted_for_unknown_code() {
+        // RFC 1661 §5.6: unknown code MUST elicit a Code-Reject.
+        let mut session = IpcpSession::new(IpcpConfig::default());
+        session.start();
+        let unknown = IpcpPacket {
+            code: 99,
+            identifier: 5,
+            data: vec![0xaa, 0xbb, 0xcc],
+        };
+        let responses = session.receive(&unknown.to_ppp());
+        assert_eq!(responses.len(), 1);
+        let resp = IpcpPacket::parse(&responses[0].payload).unwrap();
+        assert_eq!(resp.code, CODE_REJECT);
+        // Rejected-Packet field is the offending packet bytes.
+        assert_eq!(&resp.data, &unknown.to_bytes());
+    }
+
+    #[test]
+    fn opened_state_renegotiates_on_new_configure_request() {
+        // RFC 1661 §4.3: RCR in Opened triggers a fresh Configure-Request
+        // from us before evaluating the peer's request.
+        let mut session = IpcpSession::new(IpcpConfig::default());
+        session.start();
+        // Drive to Opened.
+        let req = IpcpPacket {
+            code: CONFIGURE_REQUEST,
+            identifier: 1,
+            data: serialize_options(&[IpcpOption {
+                opt_type: OPT_IP_ADDRESS,
+                data: vec![10, 0, 0, 2],
+            }]),
+        };
+        session.receive(&req.to_ppp());
+        let ack = IpcpPacket {
+            code: CONFIGURE_ACK,
+            identifier: 1,
+            data: vec![3, 6, 10, 0, 0, 1],
+        };
+        session.receive(&ack.to_ppp());
+        assert!(session.is_open());
+
+        // Peer sends a brand-new Configure-Request.
+        let renegotiate = IpcpPacket {
+            code: CONFIGURE_REQUEST,
+            identifier: 10,
+            data: serialize_options(&[
+                IpcpOption {
+                    opt_type: OPT_IP_ADDRESS,
+                    data: vec![10, 0, 0, 2],
+                },
+                IpcpOption {
+                    opt_type: OPT_PRIMARY_DNS,
+                    data: vec![10, 55, 0, 1],
+                },
+            ]),
+        };
+        let responses = session.receive(&renegotiate.to_ppp());
+        // Expect a fresh Configure-Request from us AND a Configure-Ack for theirs.
+        assert_eq!(responses.len(), 2);
+        let our_req = IpcpPacket::parse(&responses[0].payload).unwrap();
+        assert_eq!(our_req.code, CONFIGURE_REQUEST);
+        let their_ack = IpcpPacket::parse(&responses[1].payload).unwrap();
+        assert_eq!(their_ack.code, CONFIGURE_ACK);
+        assert_eq!(their_ack.identifier, 10);
+        assert_eq!(session.state, IpcpState::AckSent);
+    }
+
+    #[test]
+    fn duplicate_peer_configure_request_after_opened_is_acked_without_restart() {
+        let mut session = IpcpSession::new(IpcpConfig::default());
+        session.start();
+
+        let req = IpcpPacket {
+            code: CONFIGURE_REQUEST,
+            identifier: 1,
+            data: serialize_options(&[IpcpOption {
+                opt_type: OPT_IP_ADDRESS,
+                data: vec![10, 0, 0, 2],
+            }]),
+        };
+        session.receive(&req.to_ppp());
+        let ack = IpcpPacket {
+            code: CONFIGURE_ACK,
+            identifier: 1,
+            data: vec![3, 6, 10, 0, 0, 1],
+        };
+        session.receive(&ack.to_ppp());
+        assert!(session.is_open());
+
+        let duplicate = IpcpPacket {
+            code: CONFIGURE_REQUEST,
+            identifier: 2,
+            data: req.data.clone(),
+        };
+        let responses = session.receive(&duplicate.to_ppp());
+        assert_eq!(responses.len(), 1);
+        let resp = IpcpPacket::parse(&responses[0].payload).unwrap();
+        assert_eq!(resp.code, CONFIGURE_ACK);
+        assert_eq!(resp.identifier, 2);
+        assert_eq!(session.state, IpcpState::Opened);
     }
 }

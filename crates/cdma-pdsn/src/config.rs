@@ -12,6 +12,12 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_PPP_SESSION_TIMEOUT_SECS: u64 = 30 * 60;
+
+fn default_ppp_session_timeout_secs() -> u64 {
+    DEFAULT_PPP_SESSION_TIMEOUT_SECS
+}
+
 /// Legacy packet-data transport configuration carried by `PdsnNodeConfig`.
 ///
 /// FOU is the legacy/no-root path; TUN is the standard path. Both are
@@ -100,6 +106,10 @@ pub struct PdsnNodeConfig {
     /// the A10 GRE bearer.
     #[serde(default)]
     pub packet: PacketTransportConfig,
+    /// How long an open PPP/LCP/IPCP session remains resumable after the
+    /// traffic channel closes, measured since last PPP control or IP activity.
+    #[serde(default = "default_ppp_session_timeout_secs")]
+    pub ppp_session_timeout_secs: u64,
     /// Optional events-bus endpoint (e.g. `"http://127.0.0.1:17023"`). When
     /// set, PDSN publishes packet-session bind/unbind events to the bus.
     #[serde(default)]
@@ -108,6 +118,9 @@ pub struct PdsnNodeConfig {
 
 impl PdsnNodeConfig {
     pub fn validate(&self) -> Result<(), String> {
+        if self.ppp_session_timeout_secs == 0 {
+            return Err("pdsn.ppp_session_timeout_secs must be greater than zero".to_string());
+        }
         self.packet.validate()
     }
 
@@ -130,6 +143,7 @@ mod tests {
         PdsnNodeConfig {
             packet_grpc_listen_addr: "127.0.0.1:17021".parse().unwrap(),
             packet: PacketTransportConfig::default(),
+            ppp_session_timeout_secs: DEFAULT_PPP_SESSION_TIMEOUT_SECS,
             events_endpoint: None,
         }
     }
@@ -142,6 +156,10 @@ mod tests {
         assert_eq!(cfg.packet.gateway_ip, Ipv4Addr::new(10, 55, 0, 1));
         assert_eq!(cfg.packet.primary_dns, Ipv4Addr::new(10, 55, 0, 1));
         assert_eq!(cfg.packet.secondary_dns, Ipv4Addr::new(10, 55, 0, 1));
+        assert_eq!(
+            cfg.ppp_session_timeout_secs,
+            DEFAULT_PPP_SESSION_TIMEOUT_SECS
+        );
     }
 
     #[test]
@@ -196,6 +214,30 @@ mod tests {
         assert_eq!(cfg.packet.primary_dns, Ipv4Addr::new(8, 8, 8, 8));
         assert_eq!(cfg.packet.secondary_dns, Ipv4Addr::new(8, 8, 4, 4));
         cfg.validate().expect("custom DNS config should validate");
+    }
+
+    #[test]
+    fn ppp_session_timeout_deserializes() {
+        let cfg: PdsnNodeConfig = serde_json::from_str(
+            r#"{
+                "packet_grpc_listen_addr": "127.0.0.1:17021",
+                "ppp_session_timeout_secs": 900,
+                "packet": { "transport": "fou_tcp", "fou_remote": "127.0.0.1:17012" }
+            }"#,
+        )
+        .expect("config should deserialize");
+        assert_eq!(cfg.ppp_session_timeout_secs, 900);
+        cfg.validate().expect("timeout config should validate");
+    }
+
+    #[test]
+    fn ppp_session_timeout_must_be_nonzero() {
+        let mut cfg = test_config();
+        cfg.ppp_session_timeout_secs = 0;
+        let err = cfg
+            .validate()
+            .expect_err("zero PPP timeout should be invalid");
+        assert!(err.contains("ppp_session_timeout_secs"));
     }
 
     #[test]

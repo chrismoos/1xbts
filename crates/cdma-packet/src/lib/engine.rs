@@ -15,8 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::capture::{self, Direction as CaptureDirection};
 use crate::ppp::framing::{self, HdlcDeframer, PppPacket};
-use crate::ppp::ipcp::{IPCP_PROTOCOL, IpcpConfig, IpcpSession, configure_request_peer_ip};
-use crate::ppp::lcp::{LCP_PROTOCOL, LcpSession, LcpState};
+use crate::ppp::ipcp::{IPCP_PROTOCOL, IpcpConfig, IpcpOpenState, IpcpSession};
+use crate::ppp::lcp::{LCP_PROTOCOL, LcpOpenState, LcpSession, LcpState};
 use crate::rlp::{self as rlp_codec, RlpFrame};
 use crate::rlp_session::{RlpOutput, RlpSession, RlpState};
 use crate::rlp3_frames::MuxOption;
@@ -49,12 +49,6 @@ pub enum SessionAction {
     SendSchFrame { bits: Vec<u8>, rate_bps: u32 },
     /// An IP packet was received from the mobile and is ready for the TUN/network.
     DeliverIpPacket(Vec<u8>),
-    /// The mobile resumed with a cached peer IP during LCP/IPCP. The caller
-    /// must atomically claim this IP before forwarding the packet.
-    ClaimPeerIp {
-        peer_ip: Ipv4Addr,
-        resume_packet: Option<Vec<u8>>,
-    },
     /// The packet session should be closed and cleaned up by the owner.
     CloseSession { reason: String },
 }
@@ -823,6 +817,7 @@ pub struct PacketSession {
     deframer: HdlcDeframer,
     lcp: LcpSession,
     ipcp: IpcpSession,
+    log_context: Option<String>,
     phase: SessionPhase,
     /// Pending PPP packets to send on downlink (queued during a single tick).
     ppp_tx_queue: Vec<PppPacket>,
@@ -840,10 +835,34 @@ pub struct PacketSession {
     sch_rate_bps: u32,
     /// True after first IP traffic; PPP control stays on FCH before this.
     sch_data_ready: bool,
+    /// Ticks spent in RlpSync without SYNC completing; bounded by
+    /// `RLP_SYNC_MAX_TICKS` so a stuck MS gets torn down.
+    rlp_sync_ticks: u32,
+    /// Cached open PPP state to restore once this traffic channel's RLP is up.
+    pending_ppp_resume: Option<PppSessionState>,
+    /// Set whenever PPP control or IP payload crosses this engine.
+    ppp_activity_since_last_check: bool,
+}
+
+/// Max RlpSync ticks (20 ms each) before giving up. 500 = 10 s.
+const RLP_SYNC_MAX_TICKS: u32 = 500;
+
+#[derive(Debug, Clone)]
+pub struct PppSessionState {
+    pub lcp: LcpOpenState,
+    pub ipcp: IpcpOpenState,
 }
 
 impl PacketSession {
     pub fn new(service_option: u32, ipcp_config: IpcpConfig) -> Self {
+        Self::new_with_ppp_resume(service_option, ipcp_config, None)
+    }
+
+    pub fn new_with_ppp_resume(
+        service_option: u32,
+        ipcp_config: IpcpConfig,
+        ppp_resume: Option<PppSessionState>,
+    ) -> Self {
         let rlp: Box<dyn RlpBackend> =
             if service_option == u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA) {
                 log::debug!("PacketSession: using RLP Type 3 for SO {}", service_option);
@@ -860,6 +879,7 @@ impl PacketSession {
             deframer: HdlcDeframer::new(),
             lcp: LcpSession::new(),
             ipcp: IpcpSession::new(ipcp_config),
+            log_context: None,
             phase: SessionPhase::RlpSync,
             ppp_tx_queue: Vec::new(),
             lcp_started: false,
@@ -869,6 +889,9 @@ impl PacketSession {
             sch_info_bits: Rc3FschProfile::default_19k2().info_bits,
             sch_rate_bps: DEFAULT_RC3_F_SCH_RATE_BPS,
             sch_data_ready: false,
+            rlp_sync_ticks: 0,
+            pending_ppp_resume: ppp_resume,
+            ppp_activity_since_last_check: false,
         }
     }
 
@@ -879,7 +902,8 @@ impl PacketSession {
             self.sch_data_ready = false;
         }
         log::info!(
-            "PacketSession: SCH {}",
+            "{}: SCH {}",
+            self.log_prefix("PacketSession"),
             if active { "activated" } else { "deactivated" }
         );
     }
@@ -890,7 +914,8 @@ impl PacketSession {
             self.sch_rate_bps = profile.rate_bps;
         } else {
             log::warn!(
-                "PacketSession: unsupported SCH rate {}, keeping {}",
+                "{}: unsupported SCH rate {}, keeping {}",
+                self.log_prefix("PacketSession"),
                 rate_bps,
                 self.sch_rate_bps
             );
@@ -906,7 +931,10 @@ impl PacketSession {
     pub fn enable_sch_data_path(&mut self) {
         if !self.sch_data_ready {
             self.sch_data_ready = true;
-            log::info!("PacketSession: SCH data path enabled after first downlink IP");
+            log::info!(
+                "{}: SCH data path enabled after first downlink IP",
+                self.log_prefix("PacketSession")
+            );
         }
     }
 
@@ -915,7 +943,17 @@ impl PacketSession {
     }
 
     pub fn set_log_context(&mut self, context: String) {
-        self.rlp.set_log_context(context);
+        self.rlp.set_log_context(context.clone());
+        self.lcp.set_log_context(context.clone());
+        self.ipcp.set_log_context(context.clone());
+        self.log_context = Some(context);
+    }
+
+    fn log_prefix(&self, label: &str) -> String {
+        match self.log_context.as_deref() {
+            Some(context) => format!("{}[{}]", label, context),
+            None => label.to_string(),
+        }
     }
 
     pub fn phase(&self) -> SessionPhase {
@@ -930,21 +968,15 @@ impl PacketSession {
         self.ipcp.our_ip()
     }
 
-    pub fn activate_claimed_peer_ip(&mut self, peer_ip: Ipv4Addr) {
-        self.lcp.force_open();
-        self.ipcp.force_open_with_peer_ip(peer_ip);
-        self.phase = SessionPhase::Active;
-        self.ipcp_started = true;
+    /// Reassign the configured peer IP after a successful allocator claim;
+    /// IPCP state flags are untouched.
+    pub fn reassign_peer_ip(&mut self, peer_ip: Ipv4Addr) {
+        self.ipcp.reassign_peer_ip(peer_ip);
         log::info!(
-            "Packet session active from claimed peer IP: peer={} gateway={}",
-            self.ipcp.peer_ip(),
-            self.ipcp.our_ip()
+            "{}: peer IP reassigned to {}",
+            self.log_prefix("PacketSession"),
+            peer_ip
         );
-    }
-
-    pub fn set_claimed_peer_ip(&mut self, peer_ip: Ipv4Addr) {
-        self.ipcp.set_peer_ip(peer_ip);
-        log::info!("Packet session peer IP reassigned to {}", peer_ip);
     }
 
     /// Inject an IP packet from the network/TUN side for delivery to the mobile.
@@ -953,11 +985,25 @@ impl PacketSession {
         if self.phase != SessionPhase::Active {
             return;
         }
+        self.ppp_activity_since_last_check = true;
         let ppp = PppPacket {
             protocol: 0x0021, // IP
             payload: ip_packet.to_vec(),
         };
         self.ppp_tx_queue.push(ppp);
+    }
+
+    pub fn snapshot_ppp_state(&self) -> Option<PppSessionState> {
+        Some(PppSessionState {
+            lcp: self.lcp.open_state()?,
+            ipcp: self.ipcp.open_state()?,
+        })
+    }
+
+    pub fn take_ppp_activity(&mut self) -> bool {
+        let active = self.ppp_activity_since_last_check;
+        self.ppp_activity_since_last_check = false;
+        active
     }
 
     /// Process one frame period (20ms tick).
@@ -978,22 +1024,65 @@ impl PacketSession {
 
         // Check if RLP just entered DataTransfer (phase transition RlpSync → Lcp).
         if self.phase == SessionPhase::RlpSync && self.rlp.is_data_transfer() {
-            log::debug!("RLP: link established, entering LCP phase");
-            self.phase = SessionPhase::Lcp;
+            if let Some(ppp_state) = self.pending_ppp_resume.take() {
+                self.lcp.restore_open_state(ppp_state.lcp);
+                self.ipcp.restore_open_state(ppp_state.ipcp);
+                self.lcp_started = true;
+                self.ipcp_started = true;
+                self.phase = SessionPhase::Active;
+                self.ppp_activity_since_last_check = true;
+                log::info!(
+                    "{}: link established, resumed open PPP session peer={} gateway={}",
+                    self.log_prefix("RLP"),
+                    self.ipcp.peer_ip(),
+                    self.ipcp.our_ip()
+                );
+            } else {
+                log::debug!(
+                    "{}: link established, entering LCP phase",
+                    self.log_prefix("RLP")
+                );
+                self.phase = SessionPhase::Lcp;
+            }
+            self.rlp_sync_ticks = 0;
+        }
+
+        // Bound RlpSync: close the session if the MS never engages RLP3.
+        if self.phase == SessionPhase::RlpSync {
+            self.rlp_sync_ticks = self.rlp_sync_ticks.saturating_add(1);
+            if self.rlp_sync_ticks == RLP_SYNC_MAX_TICKS {
+                log::warn!(
+                    "{}: SYNC handshake did not complete in {} ticks ({} ms), closing session",
+                    self.log_prefix("RLP"),
+                    RLP_SYNC_MAX_TICKS,
+                    RLP_SYNC_MAX_TICKS * 20
+                );
+                actions.push(SessionAction::CloseSession {
+                    reason: format!("RLP3 SYNC timeout after {} ms", RLP_SYNC_MAX_TICKS * 20),
+                });
+                return actions;
+            }
+        } else {
+            self.rlp_sync_ticks = 0;
         }
 
         // Feed any delivered bytes into the PPP deframer.
         if let Some(data) = delivery {
-            log::debug!("RLP: delivered {} bytes to PPP deframer", data.len());
+            log::debug!(
+                "{}: delivered {} bytes to PPP deframer",
+                self.log_prefix("RLP"),
+                data.len()
+            );
             let ppp_packets = self.deframer.feed(&data);
             for ppp in ppp_packets {
+                self.ppp_activity_since_last_check = true;
                 capture::write_ppp_packet(
                     CaptureDirection::Uplink,
                     &ppp,
                     &self.uplink_capture_frame_options(&ppp),
                 );
                 self.record_ppp_event("uplink", &ppp);
-                log::debug!("PPP RX: {}", format_ppp_packet(&ppp));
+                log::debug!("{}: {}", self.log_prefix("PPP RX"), format_ppp_packet(&ppp));
                 self.process_uplink_ppp(&ppp, &mut actions);
             }
         }
@@ -1055,8 +1144,9 @@ impl PacketSession {
         };
         let ppp_queue: Vec<PppPacket> = self.ppp_tx_queue.drain(..).collect();
         for ppp in &ppp_queue {
+            self.ppp_activity_since_last_check = true;
             self.record_ppp_event("downlink", ppp);
-            log::debug!("PPP TX: {}", format_ppp_packet(ppp));
+            log::debug!("{}: {}", self.log_prefix("PPP TX"), format_ppp_packet(ppp));
             let txq_before = self.rlp.tx_queue_len();
             capture::write_ppp_packet(CaptureDirection::Downlink, ppp, &frame_opts);
             let hdlc_bytes = framing::frame_with_options(ppp, &frame_opts);
@@ -1064,7 +1154,8 @@ impl PacketSession {
             self.rlp.enqueue_data(&hdlc_bytes);
             let txq_after = self.rlp.tx_queue_len();
             log::debug!(
-                "PPP TX enqueue: {} hdlc_len={} rlp_txq_before={} rlp_txq_after={}",
+                "{}: {} hdlc_len={} rlp_txq_before={} rlp_txq_after={}",
+                self.log_prefix("PPP TX enqueue"),
                 format_ppp_packet(ppp),
                 hdlc_len,
                 txq_before,
@@ -1103,6 +1194,7 @@ impl PacketSession {
     /// send via the RLP downlink, or None.
     pub fn maybe_send_echo(&mut self) -> Option<Vec<u8>> {
         let ppp = self.lcp.maybe_send_echo()?;
+        self.ppp_activity_since_last_check = true;
         self.record_ppp_event("TX", &ppp);
         capture::write_ppp_packet(
             CaptureDirection::Downlink,
@@ -1159,8 +1251,14 @@ impl PacketSession {
                 // 1661 sends PPP back to Link Establishment; the traffic
                 // channel stays up while upper-layer NCPs renegotiate.
                 if was_open && !self.lcp.is_open() {
-                    log::info!("LCP: peer restarted, resetting IPCP and returning to LCP phase");
+                    log::info!(
+                        "{}: peer restarted, resetting IPCP and returning to LCP phase",
+                        self.log_prefix("LCP")
+                    );
                     self.ipcp = IpcpSession::new(self.ipcp.config.clone());
+                    if let Some(context) = &self.log_context {
+                        self.ipcp.set_log_context(context.clone());
+                    }
                     self.ipcp_started = false;
                     self.sch_data_ready = false;
                     self.phase = SessionPhase::Lcp;
@@ -1168,34 +1266,21 @@ impl PacketSession {
 
                 // Check for LCP open → transition to IPCP.
                 if self.lcp.is_open() && self.phase == SessionPhase::Lcp {
-                    log::info!("LCP: link opened, entering IPCP phase");
+                    log::info!(
+                        "{}: link opened, entering IPCP phase",
+                        self.log_prefix("LCP")
+                    );
                     self.phase = SessionPhase::Ipcp;
                 }
             }
             IPCP_PROTOCOL => {
                 if !self.lcp.is_open() && self.lcp.state == LcpState::AckSent {
-                    log::info!("LCP: received IPCP while in AckSent, forcing LCP open");
+                    log::info!(
+                        "{}: received IPCP while in AckSent, forcing LCP open",
+                        self.log_prefix("LCP")
+                    );
                     self.lcp.force_open();
                     self.phase = SessionPhase::Ipcp;
-                }
-
-                if let Some(requested_ip) = configure_request_peer_ip(ppp)
-                    && !requested_ip.is_unspecified()
-                    && requested_ip != self.ipcp.peer_ip()
-                    && matches!(self.phase, SessionPhase::Ipcp | SessionPhase::Lcp)
-                    && self.lcp.is_open()
-                {
-                    log::info!(
-                        "Packet session requesting peer IP claim from IPCP: requested={} previous_assigned={} phase={:?}",
-                        requested_ip,
-                        self.ipcp.peer_ip(),
-                        self.phase
-                    );
-                    actions.push(SessionAction::ClaimPeerIp {
-                        peer_ip: requested_ip,
-                        resume_packet: None,
-                    });
-                    return;
                 }
 
                 let responses = self.ipcp.receive(ppp);
@@ -1206,50 +1291,47 @@ impl PacketSession {
                 if self.ipcp.is_open() && self.phase == SessionPhase::Ipcp {
                     self.phase = SessionPhase::Active;
                     log::info!(
-                        "Packet session active: peer={} gateway={}",
+                        "{}: active peer={} gateway={}",
+                        self.log_prefix("PacketSession"),
                         self.ipcp.peer_ip(),
                         self.ipcp.our_ip()
                     );
                 }
             }
             0x0021 => {
-                // IP packet from mobile.
+                // Forward only in Active when src matches the IPCP-negotiated peer.
                 let Some(src_ip) = self.parse_uplink_ipv4(&ppp.payload) else {
                     return;
                 };
 
-                if self.phase == SessionPhase::Active {
-                    let expected = self.ipcp.peer_ip();
-                    if src_ip != expected {
-                        log::info!(
-                            "Packet session requesting peer IP claim from active uplink IP: peer={} previous_assigned={}",
-                            src_ip,
-                            expected,
-                        );
-                        actions.push(SessionAction::ClaimPeerIp {
-                            peer_ip: src_ip,
-                            resume_packet: Some(ppp.payload.clone()),
-                        });
-                        return;
-                    }
-                    actions.push(SessionAction::DeliverIpPacket(ppp.payload.clone()));
-                } else if matches!(self.phase, SessionPhase::Lcp | SessionPhase::Ipcp)
-                    && self.lcp.peer_acked_our_request()
-                {
-                    log::info!(
-                        "Packet session requesting peer IP claim from uplink IP: peer={} previous_assigned={} phase={:?}",
+                if self.phase != SessionPhase::Active {
+                    log::debug!(
+                        "{}: dropping uplink IP packet src={} in phase={:?} (IPCP not yet open)",
+                        self.log_prefix("IP ingress"),
                         src_ip,
-                        self.ipcp.peer_ip(),
                         self.phase
                     );
-                    actions.push(SessionAction::ClaimPeerIp {
-                        peer_ip: src_ip,
-                        resume_packet: Some(ppp.payload.clone()),
-                    });
+                    return;
                 }
+                let expected = self.ipcp.peer_ip();
+                if src_ip != expected {
+                    log::debug!(
+                        "{}: dropping uplink IP packet src={} (expected {} per IPCP)",
+                        self.log_prefix("IP ingress"),
+                        src_ip,
+                        expected
+                    );
+                    return;
+                }
+                actions.push(SessionAction::DeliverIpPacket(ppp.payload.clone()));
+                self.ppp_activity_since_last_check = true;
             }
             other => {
-                log::debug!("Ignoring PPP protocol 0x{:04X}", other);
+                log::debug!(
+                    "{}: ignoring PPP protocol 0x{:04X}",
+                    self.log_prefix("PPP RX"),
+                    other
+                );
             }
         }
     }
@@ -1257,7 +1339,8 @@ impl PacketSession {
     fn parse_uplink_ipv4(&self, payload: &[u8]) -> Option<Ipv4Addr> {
         if payload.len() < 20 || (payload[0] >> 4) != 4 {
             log::warn!(
-                "IP ingress: dropping malformed packet (len={} ver={})",
+                "{}: dropping malformed packet (len={} ver={})",
+                self.log_prefix("IP ingress"),
                 payload.len(),
                 payload.get(0).map(|b| b >> 4).unwrap_or(0),
             );
@@ -1267,7 +1350,10 @@ impl PacketSession {
         if src_ip.is_unspecified() {
             // DHCP discover (0.0.0.0 -> 255.255.255.255) is normal phone
             // behavior, but CDMA2000 packet data assigns IP via IPCP.
-            log::debug!("IP ingress: ignoring DHCP discover from 0.0.0.0");
+            log::debug!(
+                "{}: ignoring DHCP discover from 0.0.0.0",
+                self.log_prefix("IP ingress")
+            );
             return None;
         }
         Some(src_ip)
@@ -2188,6 +2274,54 @@ mod tests {
     }
 
     #[test]
+    fn rlp_sync_timeout_closes_session_when_ms_never_engages() {
+        // Simulate the w14 pathology: BTS RX delivers signaling but the
+        // MS never sends RLP3 SYNC/ACK. After RLP_SYNC_MAX_TICKS ticks
+        // the engine must emit CloseSession with an RLP3 SYNC timeout
+        // reason.
+        let mut session =
+            PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), IpcpConfig::default());
+        assert_eq!(session.phase(), SessionPhase::RlpSync);
+
+        // Tick up to (but not including) the threshold — no close yet.
+        for _ in 0..(RLP_SYNC_MAX_TICKS - 1) {
+            let actions = session.tick(None);
+            assert!(
+                actions
+                    .iter()
+                    .all(|a| !matches!(a, SessionAction::CloseSession { .. }))
+            );
+        }
+        // One more tick should trip the timeout.
+        let actions = session.tick(None);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, SessionAction::CloseSession { reason }
+                    if reason.contains("RLP3 SYNC timeout")))
+        );
+    }
+
+    #[test]
+    fn rlp_sync_timer_resets_after_handshake_completes() {
+        // Ticks accumulated in RlpSync do not arm a close once RLP
+        // has transitioned to DataTransfer / Lcp.
+        let mut session =
+            PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), IpcpConfig::default());
+        complete_rlp_handshake(&mut session);
+        assert_eq!(session.phase(), SessionPhase::Lcp);
+        // Tick well past the timeout threshold — no close.
+        for _ in 0..(RLP_SYNC_MAX_TICKS + 10) {
+            let actions = session.tick(None);
+            assert!(
+                actions
+                    .iter()
+                    .all(|a| !matches!(a, SessionAction::CloseSession { .. }))
+            );
+        }
+    }
+
+    #[test]
     fn rlp_handshake_transitions_to_lcp() {
         let mut session =
             PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), IpcpConfig::default());
@@ -2239,13 +2373,61 @@ mod tests {
     }
 
     #[test]
+    fn cached_ppp_state_resumes_to_active_after_fresh_rlp_sync() {
+        let mut first =
+            PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), IpcpConfig::default());
+        drive_to_active(&mut first);
+        let snapshot = first
+            .snapshot_ppp_state()
+            .expect("active PPP session should snapshot");
+
+        let mut resumed = PacketSession::new_with_ppp_resume(
+            u32::from(SERVICE_OPTION_PACKET_DATA),
+            snapshot.ipcp.config.clone(),
+            Some(snapshot),
+        );
+
+        resumed.tick(None);
+        let sync_ack = rlp::sync_ack_frame(0);
+        let (bits, rate) = encode_rlp1(&sync_ack);
+        resumed.tick(Some((&bits, rate)));
+        for _ in 0..6 {
+            let idle = rlp::idle_frame(0);
+            let (bits, rate) = encode_rlp1(&idle);
+            resumed.tick(Some((&bits, rate)));
+        }
+
+        assert_eq!(resumed.phase(), SessionPhase::Active);
+        assert_eq!(resumed.peer_ip(), Ipv4Addr::new(10, 0, 0, 2));
+
+        let mut seq = 0;
+        let ip_packet = mobile_ipv4_packet(Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(8, 8, 8, 8));
+        let ppp = PppPacket {
+            protocol: 0x0021,
+            payload: ip_packet.clone(),
+        };
+        let actions = feed_ppp_via_rlp(&mut resumed, &ppp, &mut seq);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, SessionAction::DeliverIpPacket(data) if data == &ip_packet))
+        );
+    }
+
+    #[test]
     fn lcp_restart_after_active_renegotiates_without_closing_session() {
         let mut session =
             PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), IpcpConfig::default());
         let mut seq = drive_to_active(&mut session);
         assert_eq!(session.phase(), SessionPhase::Active);
 
-        let actions = feed_ppp_via_rlp(&mut session, &mobile_lcp_configure_request(9), &mut seq);
+        let changed_lcp_req = lcp::LcpPacket {
+            code: 1,
+            identifier: 9,
+            data: vec![1, 4, 0x05, 0xDC],
+        }
+        .to_ppp();
+        let actions = feed_ppp_via_rlp(&mut session, &changed_lcp_req, &mut seq);
         assert!(
             actions
                 .iter()
@@ -2291,7 +2473,25 @@ mod tests {
             IpcpConfig::default(),
         );
         complete_rlp3_handshake(&mut session);
-        session.activate_claimed_peer_ip(Ipv4Addr::new(10, 0, 0, 2));
+
+        // Drive PPP through LCP + IPCP to Active via the real handshake.
+        let mut seq: u8 = 0;
+        feed_ppp_via_rlp(&mut session, &mobile_lcp_configure_request(1), &mut seq);
+        feed_ppp_via_rlp(
+            &mut session,
+            &mobile_lcp_configure_ack(1, vec![1, 4, 0x05, 0xDC]),
+            &mut seq,
+        );
+        feed_ppp_via_rlp(&mut session, &mobile_ipcp_request_zero(1), &mut seq);
+        feed_ppp_via_rlp(
+            &mut session,
+            &mobile_ipcp_request_ip(2, Ipv4Addr::new(10, 0, 0, 2)),
+            &mut seq,
+        );
+        let our_ipcp_data = vec![3, 6, 10, 0, 0, 1];
+        feed_ppp_via_rlp(&mut session, &mobile_ipcp_ack(1, our_ipcp_data), &mut seq);
+        assert_eq!(session.phase(), SessionPhase::Active);
+
         session.set_sch_active(true);
         session.enable_sch_data_path();
 
@@ -2340,11 +2540,11 @@ mod tests {
     }
 
     #[test]
-    fn requests_peer_ip_claim_from_uplink_ip_after_lcp_ack() {
+    fn uplink_ip_packet_dropped_before_active() {
+        // IP packets before IPCP completes must be dropped, no claim or delivery.
         let mut session =
             PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), IpcpConfig::default());
         complete_rlp_handshake(&mut session);
-        assert_eq!(session.phase(), SessionPhase::Lcp);
 
         let mut seq = 0;
         let mobile_lcp_ack = mobile_lcp_configure_ack(1, vec![1, 4, 0x05, 0xDC]);
@@ -2354,19 +2554,20 @@ mod tests {
         let ip_packet = mobile_ipv4_packet(Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(8, 8, 8, 8));
         let ppp = PppPacket {
             protocol: 0x0021,
-            payload: ip_packet.clone(),
+            payload: ip_packet,
         };
         let actions = feed_ppp_via_rlp(&mut session, &ppp, &mut seq);
 
         assert_eq!(session.phase(), SessionPhase::Lcp);
-        assert!(actions.iter().any(
-            |a| matches!(a, SessionAction::ClaimPeerIp { peer_ip, resume_packet: Some(packet) }
-                    if *peer_ip == Ipv4Addr::new(10, 0, 0, 2) && packet == &ip_packet)
-        ));
+        assert!(
+            actions
+                .iter()
+                .all(|a| !matches!(a, SessionAction::DeliverIpPacket(_)))
+        );
     }
 
     #[test]
-    fn requests_peer_ip_claim_from_ipcp_requested_address() {
+    fn stale_ipcp_requested_address_is_handled_by_ipcp_nak_only() {
         let mut session =
             PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), IpcpConfig::default());
         complete_rlp_handshake(&mut session);
@@ -2386,10 +2587,18 @@ mod tests {
             &mut seq,
         );
 
-        assert!(actions.iter().any(
-            |a| matches!(a, SessionAction::ClaimPeerIp { peer_ip, resume_packet: None }
-                    if *peer_ip == Ipv4Addr::new(10, 0, 0, 3))
-        ));
+        assert!(
+            actions
+                .iter()
+                .all(|a| !matches!(a, SessionAction::CloseSession { .. }))
+        );
+        assert!(
+            actions
+                .iter()
+                .all(|a| !matches!(a, SessionAction::DeliverIpPacket(_)))
+        );
+        assert_eq!(session.phase(), SessionPhase::Ipcp);
+        assert_eq!(session.peer_ip(), Ipv4Addr::new(10, 0, 0, 2));
     }
 
     #[test]

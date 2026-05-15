@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -20,8 +21,10 @@ use crate::proto::{
     SetSessionCaptureResponse,
 };
 use crate::session_lifecycle::{NullSink, SessionLifecycleSink};
-use crate::session_task::{self, SessionControl, SessionMetadata, SessionStatus};
+use crate::session_task::{self, PppSessionStore, SessionControl, SessionMetadata, SessionStatus};
 use crate::tun_transport::TunTransport;
+
+const PPP_SESSION_REAPER_MAX_INTERVAL: Duration = Duration::from_secs(60);
 
 #[allow(dead_code)]
 struct SessionEntry {
@@ -43,6 +46,8 @@ pub struct PacketServiceImpl {
     fou_tcp_tunnel: Option<Arc<FouTcpTunnel>>,
     allocator: Arc<dyn IpAllocator>,
     lifecycle_sink: Arc<dyn SessionLifecycleSink>,
+    ppp_session_store: Option<Arc<PppSessionStore>>,
+    ppp_session_timeout: Duration,
 }
 
 impl PacketServiceImpl {
@@ -58,6 +63,8 @@ impl PacketServiceImpl {
             fou_tcp_tunnel,
             allocator: Arc::new(SubnetIpAllocator::default_subnet()),
             lifecycle_sink: Arc::new(NullSink),
+            ppp_session_store: None,
+            ppp_session_timeout: Duration::ZERO,
         }
     }
 
@@ -74,6 +81,8 @@ impl PacketServiceImpl {
             fou_tcp_tunnel,
             allocator,
             lifecycle_sink: Arc::new(NullSink),
+            ppp_session_store: None,
+            ppp_session_timeout: Duration::ZERO,
         }
     }
 
@@ -82,6 +91,14 @@ impl PacketServiceImpl {
     /// installed sink.
     pub fn with_lifecycle_sink(mut self, sink: Arc<dyn SessionLifecycleSink>) -> Self {
         self.lifecycle_sink = sink;
+        self
+    }
+
+    pub fn with_ppp_session_cache(mut self, timeout: Duration) -> Self {
+        let store = Arc::new(PppSessionStore::new());
+        spawn_ppp_session_reaper(store.clone(), Arc::clone(&self.allocator), timeout);
+        self.ppp_session_store = Some(store);
+        self.ppp_session_timeout = timeout;
         self
     }
 
@@ -139,6 +156,8 @@ impl PacketServiceImpl {
         let transport = self.create_transport();
         let alloc = Arc::clone(&self.allocator);
         let sink = Arc::clone(&self.lifecycle_sink);
+        let ppp_store = self.ppp_session_store.clone();
+        let ppp_timeout = self.ppp_session_timeout;
         let task_handle = tokio::spawn(async move {
             session_task::run_session(
                 sid,
@@ -151,6 +170,8 @@ impl PacketServiceImpl {
                 control_rx,
                 metadata,
                 sink,
+                ppp_store,
+                ppp_timeout,
             )
             .await;
         });
@@ -271,6 +292,48 @@ impl PacketServiceImpl {
     }
 }
 
+fn spawn_ppp_session_reaper(
+    store: Arc<PppSessionStore>,
+    allocator: Arc<dyn IpAllocator>,
+    timeout: Duration,
+) {
+    if timeout.is_zero() {
+        return;
+    }
+
+    let interval = ppp_session_reaper_interval(timeout);
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        log::warn!(
+            "packet-service: PPP session cache reaper not started because no Tokio runtime is active"
+        );
+        return;
+    };
+
+    handle.spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            for expired in store.reap_expired(timeout) {
+                log::info!(
+                    "packet-service: PPP cache reaper expired identity={} peer_ip={} idle_secs={} allocation_key={}",
+                    expired.identity_key,
+                    expired.peer_ip,
+                    expired.idle_for.as_secs(),
+                    expired.allocation_key
+                );
+                allocator.release(&expired.allocation_key);
+            }
+        }
+    });
+}
+
+fn ppp_session_reaper_interval(timeout: Duration) -> Duration {
+    timeout
+        .min(PPP_SESSION_REAPER_MAX_INTERVAL)
+        .max(Duration::from_secs(1))
+}
+
 fn to_proto_trace_event(event: &crate::engine::PacketTraceEvent) -> ProtoPacketTraceEvent {
     ProtoPacketTraceEvent {
         timestamp_ms: event.timestamp_ms,
@@ -375,6 +438,8 @@ impl PacketService for PacketServiceImpl {
         let transport = self.create_transport();
         let alloc = Arc::clone(&self.allocator);
         let sink = Arc::clone(&self.lifecycle_sink);
+        let ppp_store = self.ppp_session_store.clone();
+        let ppp_timeout = self.ppp_session_timeout;
         let task_handle = tokio::spawn(async move {
             session_task::run_session(
                 sid,
@@ -387,6 +452,8 @@ impl PacketService for PacketServiceImpl {
                 control_rx,
                 metadata,
                 sink,
+                ppp_store,
+                ppp_timeout,
             )
             .await;
         });
@@ -550,5 +617,26 @@ impl PacketService for PacketServiceImpl {
                 }
             })?;
         Ok(Response::new(SetSchActiveResponse {}))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ppp_session_reaper_interval_is_bounded() {
+        assert_eq!(
+            ppp_session_reaper_interval(Duration::from_millis(500)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            ppp_session_reaper_interval(Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            ppp_session_reaper_interval(Duration::from_secs(1800)),
+            Duration::from_secs(60)
+        );
     }
 }

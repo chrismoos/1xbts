@@ -10,7 +10,7 @@ pub mod config;
 pub mod events;
 pub mod session;
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 pub use config::{PacketTransportConfig, PdsnNodeConfig};
 pub use session::{
@@ -59,7 +59,8 @@ pub fn build_packet_service_with_sink(
         fou_tunnel,
         fou_tcp_tunnel,
         allocator,
-    );
+    )
+    .with_ppp_session_cache(Duration::from_secs(cfg.ppp_session_timeout_secs));
     if let Some(sink) = lifecycle_sink {
         service = service.with_lifecycle_sink(sink);
     }

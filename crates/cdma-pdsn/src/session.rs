@@ -300,6 +300,8 @@ impl PdsnSessionManager {
                 control_rx,
                 metadata_for_task,
                 sink,
+                None,
+                Duration::ZERO,
             )
             .await;
         });

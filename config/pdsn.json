@@ -1,5 +1,6 @@
 {
   "packet_grpc_listen_addr": "127.0.0.1:17021",
+  "ppp_session_timeout_secs": 1800,
   "packet": {
     "transport": "fou_tcp",
     "fou_remote": "127.0.0.1:17012",
