@@ -47,13 +47,13 @@ pub(super) const PCG_PREDICTION_LEAD_PCGS: u32 = 12;
 const PCG_PREDICTION_CLAMP_DB: f32 = 1.0;
 // Brake offset subtracted from the PCB error in the pre-clip region to keep
 // the reverse link below the ADC knee.
-const BRAKE_BEGIN_DBFS: f32 = -22.0;
-const BRAKE_FULL_DBFS: f32 = -12.0;
+const BRAKE_BEGIN_DBFS: f32 = -12.0;
+const BRAKE_FULL_DBFS: f32 = -2.0;
 const BRAKE_MAX_OFFSET_DB: f32 = 8.0;
 const CLIP_BEGIN_DBFS: f32 = -8.0;
 const PCG_CLIP_COOLDOWN_PCGS: u8 = 32;
-const PCG_RAW_HOT_LIMIT_DBFS: f32 = -16.0;
-const PCG_RAW_HOT_RELEASE_DBFS: f32 = -18.0;
+const PCG_RAW_HOT_LIMIT_DBFS: f32 = -8.0;
+const PCG_RAW_HOT_RELEASE_DBFS: f32 = -10.0;
 const OUTER_LOOP_OVERPOWER_CLIP_PCGS: usize = 4;
 const OUTER_LOOP_UNDERPOWER_ERROR_DB: f32 = 4.0;
 const OUTER_LOOP_UNDERPOWER_MIN_UP_PCBS: usize = 12;
