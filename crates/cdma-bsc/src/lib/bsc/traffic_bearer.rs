@@ -240,7 +240,8 @@ impl Bsc {
                     );
                     self.handle_access_event(event).await;
                 } else if fch.fqi {
-                    self.route_reverse_bearer_packet_primary(walsh_code, fch);
+                    self.route_reverse_bearer_packet_primary(walsh_code, fch)
+                        .await;
                     if let Some(event) = Self::bearer_reverse_primary_to_event(
                         walsh_code,
                         fch,
@@ -280,7 +281,8 @@ impl Bsc {
                         }
                     }
                 } else {
-                    self.route_reverse_bearer_packet_primary(walsh_code, fch);
+                    self.route_reverse_bearer_packet_primary(walsh_code, fch)
+                        .await;
                     debug!(
                         "BSC: reverse bearer voice/data walsh={} frame_content=0x{:02X} bits={}",
                         walsh_code,
@@ -292,7 +294,7 @@ impl Bsc {
         }
     }
 
-    pub(crate) fn route_reverse_bearer_packet_primary(
+    pub(crate) async fn route_reverse_bearer_packet_primary(
         &mut self,
         walsh_code: u8,
         fch: &ReverseFchDcchFrame,
@@ -350,9 +352,10 @@ impl Bsc {
                     .unwrap_or(false);
                 if detached {
                     info!(
-                        "BSC: detached closed packet session {} on walsh={}",
+                        "BSC: detached closed packet session {} on walsh={}, initiating traffic release",
                         session_id, walsh_code
                     );
+                    self.begin_packet_tch_release(walsh_code, "closed packet session");
                 }
                 false
             }

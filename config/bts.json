@@ -147,7 +147,7 @@
           "access_parameters": {
             "acc_chan": 0,
             "nom_pwr": -8,
-            "init_pwr": -8,
+            "init_pwr": -16,
             "pwr_step": 3,
             "num_step": 3,
             "max_cap_sz": 4,

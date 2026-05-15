@@ -236,6 +236,14 @@ impl<const EK: usize, const ER: usize> ForwardTrafficChannel<EK, ER> {
         scheduler.lock().schedule(abs_pcg, bit);
     }
 
+    pub fn schedule_power_control_burst(&self, start_abs_pcg: u64, pcgs: u64, bit: u8) {
+        let scheduler = {
+            let config = self.config.lock();
+            config.pcb_scheduler.clone()
+        };
+        scheduler.lock().schedule_burst(start_abs_pcg, pcgs, bit);
+    }
+
     /// Advance the internal long code generator to the given absolute chip
     /// position. Uses delta from current position, safe to call multiple times.
     pub fn advance_lc_to_chip(&self, chip: u64) {

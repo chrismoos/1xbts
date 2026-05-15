@@ -349,6 +349,12 @@ impl ForwardTrafficChannelRc3 {
         self.pcb_scheduler.lock().schedule(abs_pcg, bit);
     }
 
+    pub fn schedule_power_control_burst(&self, start_abs_pcg: u64, pcgs: u64, bit: u8) {
+        self.pcb_scheduler
+            .lock()
+            .schedule_burst(start_abs_pcg, pcgs, bit);
+    }
+
     /// Seed both long-code generators for this channel at the given CDMA
     /// system chip position and align the carry-in Q-lane scrambling chip.
     ///

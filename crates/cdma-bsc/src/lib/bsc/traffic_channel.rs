@@ -443,11 +443,27 @@ impl TrafficChannelInfo {
         now: Instant,
     ) -> TrafficChannelAction {
         match self.channel_state {
+            ChannelState::Assigned { assigned_at }
+                if now.duration_since(assigned_at) >= ms_ack_timeout =>
+            {
+                TrafficChannelAction::Teardown {
+                    reason: "traffic assignment timeout",
+                    timeout_ms: ms_ack_timeout.as_millis() as u64,
+                }
+            }
             ChannelState::WaitingMsAck { bs_ack_sent_at }
                 if now.duration_since(bs_ack_sent_at) >= ms_ack_timeout =>
             {
                 TrafficChannelAction::Teardown {
                     reason: "MS Ack timeout",
+                    timeout_ms: ms_ack_timeout.as_millis() as u64,
+                }
+            }
+            ChannelState::Releasing { release_sent_at }
+                if now.duration_since(release_sent_at) >= ms_ack_timeout =>
+            {
+                TrafficChannelAction::Teardown {
+                    reason: "traffic release timeout",
                     timeout_ms: ms_ack_timeout.as_millis() as u64,
                 }
             }
@@ -460,7 +476,9 @@ impl TrafficChannelInfo {
         ms_ack_timeout: Duration,
     ) -> Option<Instant> {
         match self.channel_state {
+            ChannelState::Assigned { assigned_at } => Some(assigned_at + ms_ack_timeout),
             ChannelState::WaitingMsAck { bs_ack_sent_at } => Some(bs_ack_sent_at + ms_ack_timeout),
+            ChannelState::Releasing { release_sent_at } => Some(release_sent_at + ms_ack_timeout),
             _ => None,
         }
     }

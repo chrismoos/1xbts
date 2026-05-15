@@ -925,8 +925,10 @@ impl Layer2Lac {
                         })
                         .collect::<Vec<_>>()
                         .join(" ");
-                    // Log sendable_now and chip deltas for each addressed PDU
-                    // (only when sendable or first/last frame to avoid spam)
+                    // Keep addressed PCH scheduling visible in normal live
+                    // runs. ECAM/CAM access responses are timing-sensitive,
+                    // and this shows whether they are blocked behind queued
+                    // PDUs, a requested_tx_time, or an already-started frame.
                     for pdu in queue.iter().filter(|p| p.message.mcsb.address.is_some()) {
                         let sendable_now = pdu
                             .message
@@ -950,7 +952,7 @@ impl Layer2Lac {
                             .map(|ts| cdma_common::time::chips_since_epoch(ts, 1_228_800));
                         let indication_chip =
                             cdma_common::time::chips_since_epoch(indication.system_time, 1_228_800);
-                        trace!(
+                        info!(
                             "lac_fpch_avail: queued_pdus={} chip={} tag={} sendable_now={} req_chip={:?} deadline_chip={:?} indication_chip={} frame_start_sent={} queue={}",
                             queued_count,
                             indication.chip_cursor,
