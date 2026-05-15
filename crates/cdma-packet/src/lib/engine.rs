@@ -116,7 +116,7 @@ trait RlpBackend: Send {
     fn next_frame_bits(&mut self, allow_payload: bool) -> (Vec<u8>, u32);
 
     /// Generate a supplemental channel frame with `info_bits` usable bits.
-    /// Returns (bits, rate_bps) or None if no SCH data to send.
+    /// Returns (bits, rate_bps) or None if SCH is unavailable.
     /// Default: no SCH support.
     fn next_sch_frame_bits(&mut self, _info_bits: usize, _rate_bps: u32) -> Option<(Vec<u8>, u32)> {
         None
@@ -561,7 +561,10 @@ impl RlpBackend for Rlp3Backend {
         let data_block_bits = sch_type3_data_block_bits(profile)?;
         let queue_before = self.session.tx_queue_len();
         let rexmit_before = self.session.rexmit_queue_len();
-        let Some(first) = self.session.next_supplemental_frame(data_block_bits) else {
+        let mut blocks = Vec::new();
+        if let Some(first) = self.session.next_supplemental_frame(data_block_bits) {
+            blocks.push(first);
+        } else {
             if queue_before != 0 || rexmit_before != 0 {
                 self.tx_sch_blocked_count = self.tx_sch_blocked_count.saturating_add(1);
                 if self.tx_sch_blocked_count <= 10 || self.tx_sch_blocked_count % 50 == 0 {
@@ -580,9 +583,7 @@ impl RlpBackend for Rlp3Backend {
                     );
                 }
             }
-            return None;
-        };
-        let mut blocks = vec![first];
+        }
         let max_blocks = max_sch_type3_blocks_for_profile(profile);
         while blocks.len() < max_blocks {
             let Some(block) = self.session.next_supplemental_frame(data_block_bits) else {
@@ -599,10 +600,31 @@ impl RlpBackend for Rlp3Backend {
             .filter(|block| block.len() >= 2 && block[0] == 1 && block[1] == 1)
             .count();
         let new_blocks = blocks.len().saturating_sub(rexmit_blocks);
+        let fill_only = blocks.is_empty();
         let sch_bits = build_sch_type3_sdu(&blocks, profile);
 
         self.tx_sch_sdu_count = self.tx_sch_sdu_count.saturating_add(1);
-        if self.tx_sch_sdu_count <= 10 || self.tx_sch_sdu_count % 50 == 0 {
+        if fill_only {
+            if self.tx_sch_sdu_count <= 10 || self.tx_sch_sdu_count % 500 == 0 {
+                log::debug!(
+                    "RLP3 TX SCH fill[{}]: sdu={} rate={} info_bits={} block_bits={} q={} rexmit_q={}",
+                    self.log_context.as_deref().unwrap_or("?"),
+                    self.tx_sch_sdu_count,
+                    profile.rate_bps,
+                    info_bits,
+                    data_block_bits,
+                    queue_before,
+                    rexmit_before
+                );
+            } else {
+                log::trace!(
+                    "RLP3 TX SCH fill: rate={} info_bits={} block_bits={}",
+                    profile.rate_bps,
+                    info_bits,
+                    data_block_bits
+                );
+            }
+        } else if self.tx_sch_sdu_count <= 10 || self.tx_sch_sdu_count % 50 == 0 {
             log::debug!(
                 "RLP3 TX SCH[{}]: sdu={} blocks={} new={} rexmit={} rate={} info_bits={} block_bits={} block_octets={} q_before={} q_after={} rexmit_q_before={} rexmit_q_after={}",
                 self.log_context.as_deref().unwrap_or("?"),
@@ -694,7 +716,6 @@ fn sch_type3_uses_ltus(info_bits: usize) -> bool {
 }
 
 fn build_sch_type3_sdu(blocks: &[Vec<u8>], profile: Rc3FschProfile) -> Vec<u8> {
-    debug_assert!(!blocks.is_empty());
     let info_bits = profile.info_bits;
     let data_block_bits = sch_type3_data_block_bits(profile).unwrap_or(SCH_0X0809_DATA_BLOCK_BITS);
 
@@ -1914,6 +1935,16 @@ mod tests {
     }
 
     #[test]
+    fn sch_0x0809_empty_sdu_uses_fill_muxpdu() {
+        let profile = Rc3FschProfile::default_19k2();
+        let bits = build_sch_type3_sdu(&[], profile);
+
+        assert_eq!(bits.len(), profile.info_bits);
+        assert_eq!(&bits[0..SCH_TYPE3_HEADER_BITS], &[1, 1, 1, 0, 0, 0]);
+        assert!(bits[SCH_TYPE3_HEADER_BITS..].iter().all(|bit| *bit == 0));
+    }
+
+    #[test]
     fn sch_0x0809_sdu_wraps_two_data_blocks() {
         let first = vec![1u8; SCH_0X0809_DATA_BLOCK_BITS];
         let second = vec![0u8; SCH_0X0809_DATA_BLOCK_BITS];
@@ -2017,6 +2048,15 @@ mod tests {
         )
     }
 
+    fn encode_rlp3(frame: &crate::rlp3_frames::Rlp3Frame) -> (Vec<u8>, u32) {
+        (
+            frame
+                .encode(crate::rlp3_frames::MuxOption::Odd)
+                .expect("test RLP3 frame must encode"),
+            9600,
+        )
+    }
+
     /// Helper: drive the BS through the RLP SYNC handshake with a simulated mobile.
     fn complete_rlp_handshake(bs: &mut PacketSession) {
         // Tick 1: BS sends SYNC (auto-initializes).
@@ -2032,6 +2072,25 @@ mod tests {
             let idle = rlp::idle_frame(0);
             let (bits, rate) = encode_rlp1(&idle);
             bs.tick(Some((&bits, rate)));
+        }
+
+        assert_eq!(bs.phase(), SessionPhase::Lcp);
+    }
+
+    fn complete_rlp3_handshake(bs: &mut PacketSession) {
+        bs.tick(None);
+
+        let sync_ack = crate::rlp3_frames::Rlp3Frame::Control {
+            seq: 0,
+            control_type: crate::rlp3_frames::Rlp3ControlType::SyncAck,
+            init_var: false,
+            nak_param_incl: false,
+        };
+        let (bits, rate) = encode_rlp3(&sync_ack);
+        bs.tick(Some((&bits, rate)));
+
+        for _ in 0..6 {
+            bs.tick(None);
         }
 
         assert_eq!(bs.phase(), SessionPhase::Lcp);
@@ -2223,6 +2282,30 @@ mod tests {
                 .all(|a| !matches!(a, SessionAction::SendSchFrame { .. })),
             "SCH should remain DTX/blank before PPP is active"
         );
+    }
+
+    #[test]
+    fn active_sch_emits_fill_muxpdu_when_rlp_queue_empty() {
+        let mut session = PacketSession::new(
+            u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+            IpcpConfig::default(),
+        );
+        complete_rlp3_handshake(&mut session);
+        session.activate_claimed_peer_ip(Ipv4Addr::new(10, 0, 0, 2));
+        session.set_sch_active(true);
+        session.enable_sch_data_path();
+
+        let actions = session.tick(None);
+        let sch_frame = actions
+            .iter()
+            .find_map(|action| match action {
+                SessionAction::SendSchFrame { bits, rate_bps } => Some((bits, *rate_bps)),
+                _ => None,
+            })
+            .expect("active SCH should emit a fill SDU instead of DTX");
+
+        assert_eq!(sch_frame.1, DEFAULT_RC3_F_SCH_RATE_BPS);
+        assert_eq!(&sch_frame.0[0..SCH_TYPE3_HEADER_BITS], &[1, 1, 1, 0, 0, 0]);
     }
 
     #[test]
