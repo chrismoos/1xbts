@@ -1200,6 +1200,9 @@ fn to_proto_paging_event(ev: &PagingEvent) -> proto::PagingEvent {
 
 fn to_proto_config(
     cfg: &BtsRuntimeSettings,
+    channel: cdma_common::band_class::ChannelPlan,
+    tx_center_frequency_hz: usize,
+    rx_center_frequency_hz: usize,
     overhead: &crate::bsc::OverheadParameters,
     timezone: &cdma_common::timezone::TimezoneConfig,
     pilot_offset: usize,
@@ -1220,7 +1223,11 @@ fn to_proto_config(
         chip_rate_hz: cfg.chip_rate_hz as u32,
         tx_sample_rate_hz: cfg.tx_sample_rate_hz as u32,
         tx_bandwidth_hz: cfg.tx_bandwidth_hz as u32,
-        tx_center_frequency_hz: cfg.tx_center_frequency_hz as u32,
+        tx_center_frequency_hz: tx_center_frequency_hz as u32,
+        rx_center_frequency_hz: rx_center_frequency_hz as u32,
+        band_class: channel.band_class.as_str().to_string(),
+        cdma_channel: channel.cdma_channel as u32,
+        band_subclass: channel.band_subclass as u32,
         tx_digital_backoff: cfg.tx_digital_backoff,
         block_size_chips: cfg.block_size_chips as u32,
         pilot: Some(proto::PilotConfig {
@@ -1321,6 +1328,9 @@ impl BscService for BscServiceImpl {
     async fn get_config(&self, _: Request<()>) -> Result<Response<proto::BtsConfig>, Status> {
         let cfg = to_proto_config(
             &self.state.bts_config,
+            self.state.channel,
+            self.state.tx_center_frequency_hz,
+            self.state.rx_center_frequency_hz,
             &self.state.overhead,
             &self.state.timezone,
             self.state.pilot_offset,

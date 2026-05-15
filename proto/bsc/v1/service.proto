@@ -647,6 +647,14 @@ message BtsConfig {
   uint32 tx_center_frequency_hz = 6;
   float tx_digital_backoff = 7;
   uint32 block_size_chips = 8;
+  // Resolved RX (uplink) center frequency in Hz.
+  uint32 rx_center_frequency_hz = 30;
+  // Configured CDMA2000 band class (e.g. "BC0", "BC1").
+  string band_class = 31;
+  // Configured CDMA channel number within the band class.
+  uint32 cdma_channel = 32;
+  // Configured 5-bit BAND_SUBCLASS broadcast in handoff messages.
+  uint32 band_subclass = 33;
 
   PilotConfig pilot = 10;
   SyncConfig sync = 11;

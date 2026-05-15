@@ -226,11 +226,13 @@ pub struct BtsRuntimeSettings {
     pub chip_rate_hz: usize,
     pub tx_sample_rate_hz: usize,
     pub tx_bandwidth_hz: usize,
-    pub tx_center_frequency_hz: usize,
+    /// Lab override; `None` → derive from `BtsNodeConfig.channel`.
+    #[serde(default)]
+    pub tx_freq_hz_override: Option<usize>,
     /// Hardware TX LO offset in Hz. The SDR is tuned to
-    /// `tx_center_frequency_hz + tx_lo_offset_hz`, and the baseband is
-    /// digitally rotated by the negative offset so the on-air carrier remains
-    /// centered at `tx_center_frequency_hz`.
+    /// `<resolved_tx_center_hz> + tx_lo_offset_hz`, and the baseband is
+    /// digitally rotated by the negative offset so the on-air carrier
+    /// remains centered at the resolved TX frequency.
     pub tx_lo_offset_hz: i64,
     pub tx_digital_backoff: f32,
     /// Logical synthesis step in chip-rate samples. The BTS evaluates paging,
@@ -259,7 +261,7 @@ impl Default for BtsRuntimeSettings {
             chip_rate_hz: SR1_CHIP_RATE_HZ as usize,
             tx_sample_rate_hz: SR1_CHIP_RATE_HZ as usize * 4,
             tx_bandwidth_hz: 3_000_000,
-            tx_center_frequency_hz: 870_000_000,
+            tx_freq_hz_override: None,
             tx_lo_offset_hz: 0,
             tx_digital_backoff: 0.15,
             block_size_chips: 64,
@@ -565,10 +567,20 @@ pub fn build_scheduled_message(
         }
         PagingMessageKind::CdmaChannelList => {
             let defaults = &paging.message_defaults.cdma_channel_list;
+            // Default to the operating channel when no explicit list.
+            let channels = if defaults.channels.is_empty() {
+                vec![
+                    overhead
+                        .cdma_freq
+                        .expect("cdma_freq resolved by BTS launcher"),
+                ]
+            } else {
+                defaults.channels.clone()
+            };
             PagingChannelMessage::CdmaChannelList(CdmaChannelListMessage {
                 pilot_pn: pilot_offset as u16,
                 config_msg_seq: overhead.config_seq,
-                channels: defaults.channels.clone(),
+                channels,
             })
         }
         PagingMessageKind::ExtendedSystemParameters => {

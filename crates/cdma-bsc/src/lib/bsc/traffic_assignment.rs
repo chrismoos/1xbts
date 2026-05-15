@@ -654,8 +654,8 @@ impl TrafficAssignmentService {
             );
             ecam.rev_fch_gating_mode = ms_gating_req;
             ecam.freq_incl = true;
-            ecam.band_class = Some(0);
-            ecam.cdma_freq = Some(overhead.cdma_freq);
+            ecam.band_class = overhead.band_class;
+            ecam.cdma_freq = overhead.cdma_freq;
             info!(
                 "BSC: ECAM detail walsh={} {} sdu_hex={}",
                 walsh_code,

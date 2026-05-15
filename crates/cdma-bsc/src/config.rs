@@ -63,11 +63,9 @@ pub struct OverheadConfig {
     pub p_rev: u8,
     pub min_p_rev: u8,
     pub prat: u8,
-    /// CDMA channel number for the sync channel message. If not set (0),
-    /// callers may derive from `BtsNodeConfig.runtime.tx_center_frequency_hz`
-    /// using Band Class 0 formula: `(freq_hz - 870_000_000) / 30_000`.
-    pub cdma_freq: u16,
-    pub ext_cdma_freq: u16,
+    /// `None` → derive from BTS `ChannelPlan`.
+    pub cdma_freq: Option<u16>,
+    pub ext_cdma_freq: Option<u16>,
     /// T1b timer period in milliseconds (default 1280). Each required overhead
     /// message must be sent at least once per T1b on the paging channel.
     #[serde(default = "default_t1b_ms")]
@@ -97,8 +95,8 @@ impl Default for OverheadConfig {
             p_rev: 6,
             min_p_rev: 6,
             prat: 0,
-            cdma_freq: 0,
-            ext_cdma_freq: 0,
+            cdma_freq: None,
+            ext_cdma_freq: None,
             t1b_ms: 1280,
         }
     }
@@ -528,25 +526,15 @@ fn validate_traffic_assignment(cfg: &TrafficAssignmentConfig) -> Result<(), Erro
     Ok(())
 }
 
-/// Resolve the CDMA channel number from the BSC overhead config and the BTS
-/// transmit center frequency.
-///
-/// Uses `overhead.cdma_freq` directly when non-zero; otherwise derives from
-/// `tx_center_frequency_hz` using the Band Class 0 formula
-/// `(freq_hz - 870_000_000) / 30_000`. Returns 0 below the band-class-0
-/// floor.
-///
-/// Cross-node helper called from bootstrap (BSC owns the policy; BTS owns
-/// the transmit frequency).
-pub fn resolved_cdma_freq(overhead: &OverheadConfig, tx_center_frequency_hz: usize) -> u16 {
-    if overhead.cdma_freq != 0 {
-        return overhead.cdma_freq;
-    }
-    if tx_center_frequency_hz >= 870_000_000 {
-        ((tx_center_frequency_hz - 870_000_000) / 30_000) as u16
-    } else {
-        0
-    }
+/// Resolve `CDMA_FREQ`: `overhead.cdma_freq` if set, else derive from
+/// the BTS `ChannelPlan`.
+pub fn resolved_cdma_freq(
+    overhead: &OverheadConfig,
+    channel: cdma_common::band_class::ChannelPlan,
+) -> u16 {
+    overhead
+        .cdma_freq
+        .unwrap_or_else(|| channel.cdma_freq_field())
 }
 
 /// Cross-node validation: BSC `overhead.page_chan` must match the BTS
@@ -580,12 +568,14 @@ mod tests {
     }
 
     #[test]
-    fn cdma_freq_resolves_from_band_class_zero() {
+    fn cdma_freq_resolves_from_channel_plan() {
+        use cdma_common::band_class::{BandClass, ChannelPlan};
+        let plan = ChannelPlan::new(BandClass::Bc0, 0, 384);
         let mut overhead = OverheadConfig::default();
-        overhead.cdma_freq = 0;
-        assert_eq!(resolved_cdma_freq(&overhead, 881_520_000), 384);
-        overhead.cdma_freq = 100;
-        assert_eq!(resolved_cdma_freq(&overhead, 881_520_000), 100);
+        overhead.cdma_freq = None;
+        assert_eq!(resolved_cdma_freq(&overhead, plan), 384);
+        overhead.cdma_freq = Some(100);
+        assert_eq!(resolved_cdma_freq(&overhead, plan), 100);
     }
 
     #[test]

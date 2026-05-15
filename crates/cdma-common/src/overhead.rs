@@ -28,8 +28,14 @@ pub struct OverheadParameters {
     pub ltm_off: i8,
     pub daylt: u8,
     pub prat: u8,
-    pub cdma_freq: u16,
-    pub ext_cdma_freq: u16,
+    /// `CDMA_FREQ`. `None` → derive from BTS `ChannelPlan`.
+    pub cdma_freq: Option<u16>,
+    /// `EXT_CDMA_FREQ`. `None` → derive from BTS `ChannelPlan`.
+    pub ext_cdma_freq: Option<u16>,
+    /// `BAND_CLASS`. `None` → derive from BTS `ChannelPlan`. Override only
+    /// when the broadcast band class must differ from the operating band
+    /// (e.g. handoff redirect to another carrier).
+    pub band_class: Option<u8>,
 }
 
 impl Default for OverheadParameters {
@@ -55,8 +61,9 @@ impl Default for OverheadParameters {
             ltm_off: 0,
             daylt: 0,
             prat: 0,
-            cdma_freq: 384,
-            ext_cdma_freq: 0,
+            cdma_freq: None,
+            ext_cdma_freq: None,
+            band_class: None,
         }
     }
 }

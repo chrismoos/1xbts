@@ -1,4 +1,5 @@
 pub mod access;
+pub mod band_class;
 pub mod bits;
 pub mod channel;
 pub mod config_load;

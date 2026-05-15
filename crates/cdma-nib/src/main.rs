@@ -161,8 +161,13 @@ async fn main() -> Result<(), Error> {
 
     // Radio and BTS
     info!("Starting BTS/BSC/MSC stack (network-in-a-box)");
+    let rx_freq_hz = bts_config
+        .radio
+        .rx_freq_hz_override()
+        .unwrap_or_else(|| bts_config.channel.uplink_hz() as usize);
     let radio = build_radio_from_config(
         &bts_config.radio,
+        rx_freq_hz,
         RadioBuildOptions {
             null_radio: cli.null_radio,
         },
@@ -335,8 +340,19 @@ async fn main() -> Result<(), Error> {
         runtime.run_with_grpc(msc_mgmt_addr, &msc_a1_endpoint).await;
     });
     // BSC runtime and management state
+    let tx_center_frequency_hz = bts_config
+        .runtime
+        .tx_freq_hz_override
+        .unwrap_or_else(|| bts_config.channel.downlink_hz() as usize);
+    let rx_center_frequency_hz = bts_config
+        .radio
+        .rx_freq_hz_override()
+        .unwrap_or_else(|| bts_config.channel.uplink_hz() as usize);
     let bsc_parts = cdma_bsc::bsc::build_bsc_launch_parts(cdma_bsc::bsc::BscLaunchInputs {
         pilot_offset: bts_config.pilot_offset,
+        channel: bts_config.channel,
+        tx_center_frequency_hz,
+        rx_center_frequency_hz,
         overhead: overhead_params,
         timezone: bts_config.timezone.clone(),
         paging: paging_settings.clone(),

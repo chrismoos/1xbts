@@ -2044,6 +2044,7 @@ async fn generate_bts_buffer_samples(
     let (bts, _bts_handle) = Bts::new_with_settings(
         Box::new(radio),
         bts::Config {
+            tx_center_frequency_hz: 881_520_000,
             pilot_offset: 0,
             mac_layer,
             start_system_time: Some(time::cdma_epoch()),
@@ -3339,11 +3340,12 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
             ltm_off: 0,
             daylt: 0,
             prat: bsc_config.overhead.prat,
-            cdma_freq: config::resolved_cdma_freq(
+            cdma_freq: Some(config::resolved_cdma_freq(
                 &bsc_config.overhead,
-                bts_config.runtime.tx_center_frequency_hz,
-            ),
+                bts_config.channel,
+            )),
             ext_cdma_freq: bsc_config.overhead.ext_cdma_freq,
+            band_class: None,
         },
         paging: bts_config.runtime.downlink.paging.clone(),
         traffic_assignment: TrafficAssignmentConfig::default(),
@@ -3597,14 +3599,12 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
 
     let mut runtime = bts_config.runtime.clone();
     runtime.downlink.paging.bypass_long_code = debug.bypass_paging_long_code;
-    let cdma_freq = config::resolved_cdma_freq(
-        &bsc_config.overhead,
-        bts_config.runtime.tx_center_frequency_hz,
-    );
+    let cdma_freq = config::resolved_cdma_freq(&bsc_config.overhead, bts_config.channel);
 
     let (bts, _bts_handle) = Bts::new_with_radio_pipe(
         radio,
         bts::Config {
+            tx_center_frequency_hz: 881_520_000,
             pilot_offset: bts_config.pilot_offset,
             mac_layer,
             start_system_time: None,
@@ -3623,7 +3623,7 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
                 daylt: 0,
                 prat: bsc_config.overhead.prat,
                 cdma_freq,
-                ext_cdma_freq: bsc_config.overhead.ext_cdma_freq,
+                ext_cdma_freq: bsc_config.overhead.ext_cdma_freq.unwrap_or(0),
                 sr1_bcch_non_td_incl: false,
                 sr1_td_incl: false,
                 sr3_incl: false,
@@ -3880,11 +3880,12 @@ async fn run_sync_overhead_window_case(
             ltm_off: 0,
             daylt: 0,
             prat: bsc_config.overhead.prat,
-            cdma_freq: config::resolved_cdma_freq(
+            cdma_freq: Some(config::resolved_cdma_freq(
                 &bsc_config.overhead,
-                bts_config.runtime.tx_center_frequency_hz,
-            ),
+                bts_config.channel,
+            )),
             ext_cdma_freq: bsc_config.overhead.ext_cdma_freq,
+            band_class: None,
         },
         paging: bts_config.runtime.downlink.paging.clone(),
         traffic_assignment: TrafficAssignmentConfig::default(),
@@ -3990,13 +3991,11 @@ async fn run_sync_overhead_window_case(
 
     let (radio, pipe_handle) = RadioPipe::new(256);
 
-    let cdma_freq = config::resolved_cdma_freq(
-        &bsc_config.overhead,
-        bts_config.runtime.tx_center_frequency_hz,
-    );
+    let cdma_freq = config::resolved_cdma_freq(&bsc_config.overhead, bts_config.channel);
     let (bts, _bts_handle) = Bts::new_with_radio_pipe(
         radio,
         bts::Config {
+            tx_center_frequency_hz: 881_520_000,
             pilot_offset: bts_config.pilot_offset,
             mac_layer,
             start_system_time: Some(time::system_time_from_chips(9 * 98_304, 1_228_800)),
@@ -4015,7 +4014,7 @@ async fn run_sync_overhead_window_case(
                 daylt: 0,
                 prat: bsc_config.overhead.prat,
                 cdma_freq,
-                ext_cdma_freq: bsc_config.overhead.ext_cdma_freq,
+                ext_cdma_freq: bsc_config.overhead.ext_cdma_freq.unwrap_or(0),
                 sr1_bcch_non_td_incl: false,
                 sr1_td_incl: false,
                 sr3_incl: false,
@@ -4533,6 +4532,7 @@ async fn test_e2e_sync_stack_generated_samples() -> Result<(), Error> {
     let (bts, _bts_handle) = Bts::new(
         Box::new(radio),
         bts::Config {
+            tx_center_frequency_hz: 881_520_000,
             pilot_offset: 0,
             mac_layer,
             start_system_time: None,
@@ -5779,6 +5779,7 @@ async fn test_e2e_page_retry_does_not_disrupt_overhead() -> Result<(), Error> {
     let (bts, _bts_handle) = Bts::new_with_settings(
         Box::new(radio),
         bts::Config {
+            tx_center_frequency_hz: 881_520_000,
             pilot_offset: 0,
             mac_layer,
             start_system_time: Some(time::cdma_epoch()),
@@ -7713,6 +7714,7 @@ async fn run_traffic_channel_e2e(
     let (bts, bts_handle) = Bts::new_with_settings(
         Box::new(radio),
         bts::Config {
+            tx_center_frequency_hz: 881_520_000,
             pilot_offset: 0,
             mac_layer,
             start_system_time: None,
@@ -8014,6 +8016,7 @@ async fn test_e2e_rc1_reverse_preamble_triggers_crc_valid_bs_ack_order() -> Resu
     let (bts, bts_handle) = Bts::new_with_radio_pipe(
         radio,
         bts::Config {
+            tx_center_frequency_hz: 881_520_000,
             pilot_offset: 0,
             mac_layer: mac_layer.clone(),
             start_system_time: Some(start_system_time),
@@ -8096,7 +8099,7 @@ async fn test_e2e_rc1_reverse_preamble_triggers_crc_valid_bs_ack_order() -> Resu
         overhead: OverheadParameters {
             sid: 42,
             nid: 7,
-            cdma_freq: 384,
+            cdma_freq: Some(384),
             ..Default::default()
         },
         paging: bts::PagingChannelSettings::default(),

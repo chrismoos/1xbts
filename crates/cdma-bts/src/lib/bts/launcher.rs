@@ -32,6 +32,7 @@ pub struct RadioBuildOptions {
 
 pub fn build_radio_from_config(
     radio_config: &RadioConfig,
+    rx_freq_hz: usize,
     options: RadioBuildOptions,
 ) -> Result<Box<dyn Radio>, Error> {
     if options.null_radio {
@@ -51,7 +52,6 @@ pub fn build_radio_from_config(
             rx_antenna,
             tx_gain_db,
             rx_gain_db,
-            rx_freq_hz,
             rx_sample_rate_hz,
             rx_bandwidth_hz,
             ..
@@ -59,7 +59,7 @@ pub fn build_radio_from_config(
             let mut radio = SoapySdrRadio::new(device, *channel, antenna, *tx_gain_db)?;
 
             let rx_ant = rx_antenna.as_deref().unwrap_or("LNAW");
-            let freq_hz = *rx_freq_hz as f64;
+            let freq_hz = rx_freq_hz as f64;
             let sample_rate_hz = *rx_sample_rate_hz as f64;
             let bandwidth_hz = rx_bandwidth_hz.unwrap_or(*rx_sample_rate_hz) as f64;
             radio.setup_rx(
@@ -92,7 +92,6 @@ pub fn build_radio_from_config(
             time_source,
             rx_antenna,
             rx_gain_db,
-            rx_freq_hz,
             rx_sample_rate_hz,
             rx_bandwidth_hz,
             ..
@@ -111,7 +110,7 @@ pub fn build_radio_from_config(
                 radio.set_time_source(src)?;
             }
             let rx_ant = rx_antenna.as_deref().unwrap_or("RX2");
-            let freq_hz = *rx_freq_hz as f64;
+            let freq_hz = rx_freq_hz as f64;
             let sample_rate_hz = *rx_sample_rate_hz as f64;
             let bandwidth_hz = rx_bandwidth_hz.unwrap_or(*rx_sample_rate_hz) as f64;
             radio.setup_rx(
@@ -140,7 +139,6 @@ pub fn build_radio_from_config(
             tx_gain_db,
             rx_antenna,
             rx_gain_db,
-            rx_freq_hz,
             rx_sample_rate_hz,
             rx_bandwidth_hz,
             oversample,
@@ -168,7 +166,7 @@ pub fn build_radio_from_config(
             radio.setup_rx(
                 *channel,
                 rx_ant,
-                *rx_freq_hz as f64,
+                rx_freq_hz as f64,
                 *rx_sample_rate_hz as f64,
                 rx_bandwidth_hz.unwrap_or(*rx_sample_rate_hz) as f64,
                 rx_gain_db.map(|g| g as f64),
@@ -196,7 +194,6 @@ pub fn build_radio_from_config(
             rx_antenna,
             tx_gain_db,
             rx_gain_db,
-            rx_freq_hz,
             rx_sample_rate_hz,
             rx_bandwidth_hz,
             tx_lo_offset_hz,
@@ -222,7 +219,7 @@ pub fn build_radio_from_config(
                 radio.set_tx_lo_offset(*offset)?;
             }
             let rx_ant = rx_antenna.as_deref().unwrap_or("");
-            let freq_hz = *rx_freq_hz as f64;
+            let freq_hz = rx_freq_hz as f64;
             let sample_rate_hz = *rx_sample_rate_hz as f64;
             let bandwidth_hz = rx_bandwidth_hz.unwrap_or(*rx_sample_rate_hz) as f64;
             radio.setup_rx(
@@ -347,19 +344,50 @@ pub fn build_bts_launch_parts(
     let lac_layer = lac::Layer2Lac::new(lac_to_mac_tx, mac_to_lac_rx);
     let mac_layer = mac::Layer2Mac::new(lac_to_mac_rx, mac_to_lac_tx);
 
-    if bts_config.overhead.cdma_freq == 0 {
-        let freq = bts_config.runtime.tx_center_frequency_hz;
-        if freq >= 870_000_000 {
-            bts_config.overhead.cdma_freq = ((freq - 870_000_000) / 30_000) as u16;
-        }
+    let channel_plan = bts_config.channel;
+    let tx_override = bts_config.runtime.tx_freq_hz_override;
+    let rx_override = bts_config.radio.rx_freq_hz_override();
+    let tx_center_frequency_hz = tx_override.unwrap_or_else(|| channel_plan.downlink_hz() as usize);
+    let rx_center_frequency_hz = rx_override.unwrap_or_else(|| channel_plan.uplink_hz() as usize);
+    info!(
+        "channel plan: band_class={} subclass={} cdma_channel={} tx={:.4} MHz ({} Hz) rx={:.4} MHz ({} Hz) tx_override={} rx_override={}",
+        channel_plan.band_class.as_str(),
+        channel_plan.band_subclass,
+        channel_plan.cdma_channel,
+        tx_center_frequency_hz as f64 / 1_000_000.0,
+        tx_center_frequency_hz,
+        rx_center_frequency_hz as f64 / 1_000_000.0,
+        rx_center_frequency_hz,
+        tx_override
+            .map(|hz| format!("{hz}"))
+            .unwrap_or_else(|| "none".into()),
+        rx_override
+            .map(|hz| format!("{hz}"))
+            .unwrap_or_else(|| "none".into()),
+    );
+    let derived_cdma_freq = channel_plan.cdma_freq_field();
+    let derived_band_class = channel_plan.band_class.field_value();
+    if bts_config.overhead.cdma_freq.is_none() {
+        bts_config.overhead.cdma_freq = Some(derived_cdma_freq);
     }
-    let cdma_freq = bts_config.overhead.cdma_freq;
+    if bts_config.overhead.ext_cdma_freq.is_none() {
+        bts_config.overhead.ext_cdma_freq = Some(derived_cdma_freq);
+    }
+    if bts_config.overhead.band_class.is_none() {
+        bts_config.overhead.band_class = Some(derived_band_class);
+    }
+    let cdma_freq = bts_config.overhead.cdma_freq.unwrap_or(derived_cdma_freq);
+    let ext_cdma_freq = bts_config
+        .overhead
+        .ext_cdma_freq
+        .unwrap_or(derived_cdma_freq);
     let paging_settings = bts_config.runtime.downlink.paging.clone();
     let mac_layer_for_bts = mac_layer.clone();
     let rx_power_adj = bts_config.radio.rx_power_adj();
     let (bts, handle) = Bts::new_with_settings(
         radio,
         Config {
+            tx_center_frequency_hz,
             pilot_offset: bts_config.pilot_offset,
             mac_layer: mac_layer_for_bts,
             start_system_time: None,
@@ -378,7 +406,7 @@ pub fn build_bts_launch_parts(
                 daylt: bts_config.overhead.daylt,
                 prat: bts_config.overhead.prat,
                 cdma_freq,
-                ext_cdma_freq: bts_config.overhead.ext_cdma_freq,
+                ext_cdma_freq,
                 sr1_bcch_non_td_incl: false,
                 sr1_td_incl: false,
                 sr3_incl: false,
@@ -727,7 +755,7 @@ mod tests {
                 paging_max_retries: 0,
             },
         );
-        assert_eq!(parts.overhead.cdma_freq, 384);
+        assert_eq!(parts.overhead.cdma_freq, Some(384));
         assert_eq!(parts.paging_settings.paging_channel_number, 1);
     }
 }

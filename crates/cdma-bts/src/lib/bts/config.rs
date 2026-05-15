@@ -9,14 +9,11 @@ use std::path::Path;
 
 use std::net::SocketAddr;
 
+use cdma_common::band_class::ChannelPlan;
 use cdma_common::error::Error;
 use serde::{Deserialize, Serialize};
 
 use super::settings::BtsRuntimeSettings;
-
-fn default_rx_freq_hz() -> usize {
-    836_520_000
-}
 
 fn default_rx_sample_rate_hz() -> usize {
     1_228_800 * 4
@@ -85,8 +82,9 @@ pub enum RadioConfig {
         rx_antenna: Option<String>,
         #[serde(default)]
         rx_gain_db: Option<f64>,
-        #[serde(default = "default_rx_freq_hz")]
-        rx_freq_hz: usize,
+        /// Lab override; `None` → derive from `BtsNodeConfig.channel`.
+        #[serde(default)]
+        rx_freq_hz_override: Option<usize>,
         #[serde(default = "default_rx_sample_rate_hz")]
         rx_sample_rate_hz: usize,
         #[serde(default)]
@@ -120,8 +118,9 @@ pub enum RadioConfig {
         rx_antenna: Option<String>,
         #[serde(default)]
         rx_gain_db: Option<f64>,
-        #[serde(default = "default_rx_freq_hz")]
-        rx_freq_hz: usize,
+        /// Lab override; `None` → derive from `BtsNodeConfig.channel`.
+        #[serde(default)]
+        rx_freq_hz_override: Option<usize>,
         #[serde(default = "default_rx_sample_rate_hz")]
         rx_sample_rate_hz: usize,
         #[serde(default)]
@@ -150,8 +149,9 @@ pub enum RadioConfig {
         rx_antenna: Option<String>,
         #[serde(default)]
         rx_gain_db: Option<u32>,
-        #[serde(default = "default_rx_freq_hz")]
-        rx_freq_hz: usize,
+        /// Lab override; `None` → derive from `BtsNodeConfig.channel`.
+        #[serde(default)]
+        rx_freq_hz_override: Option<usize>,
         #[serde(default = "default_rx_sample_rate_hz")]
         rx_sample_rate_hz: usize,
         #[serde(default)]
@@ -199,8 +199,9 @@ pub enum RadioConfig {
         tx_gain_db: i32,
         #[serde(default)]
         rx_gain_db: Option<i32>,
-        #[serde(default = "default_rx_freq_hz")]
-        rx_freq_hz: usize,
+        /// Lab override; `None` → derive from `BtsNodeConfig.channel`.
+        #[serde(default)]
+        rx_freq_hz_override: Option<usize>,
         #[serde(default = "default_rx_sample_rate_hz")]
         rx_sample_rate_hz: usize,
         #[serde(default)]
@@ -239,6 +240,28 @@ impl Default for RadioConfig {
 }
 
 impl RadioConfig {
+    pub fn rx_freq_hz_override(&self) -> Option<usize> {
+        match self {
+            Self::Soapy {
+                rx_freq_hz_override,
+                ..
+            }
+            | Self::Uhd {
+                rx_freq_hz_override,
+                ..
+            }
+            | Self::Lime {
+                rx_freq_hz_override,
+                ..
+            }
+            | Self::BladeRf {
+                rx_freq_hz_override,
+                ..
+            } => *rx_freq_hz_override,
+            _ => None,
+        }
+    }
+
     /// RX sample rate in Hz for this radio backend, falling back to the
     /// project default when the variant has no RX (e.g., `FileOutput`,
     /// `Noop`).
@@ -467,6 +490,10 @@ impl Default for BtsBearerConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BtsNodeConfig {
+    /// Drives TX/RX frequencies and broadcast `CDMA_FREQ` / `BAND_CLASS`
+    /// via C.S0057-F. Per-radio `rx_freq_hz_override` and
+    /// `runtime.tx_freq_hz_override` override the derived values.
+    pub channel: ChannelPlan,
     /// SDR backend selection and per-backend hardware parameters.
     pub radio: RadioConfig,
     /// Pilot PN offset (chips, in units of 64). Must be in `0..=511`.
@@ -491,6 +518,7 @@ pub struct BtsNodeConfig {
 impl Default for BtsNodeConfig {
     fn default() -> Self {
         Self {
+            channel: ChannelPlan::default(),
             radio: RadioConfig::default(),
             pilot_offset: 0,
             runtime: BtsRuntimeSettings::default(),
@@ -506,6 +534,7 @@ impl Default for BtsNodeConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 struct BtsNodeConfigFile {
+    pub channel: ChannelPlan,
     pub radio: Option<RadioConfig>,
     pub radio_config_path: Option<String>,
     pub pilot_offset: usize,
@@ -520,6 +549,7 @@ struct BtsNodeConfigFile {
 impl Default for BtsNodeConfigFile {
     fn default() -> Self {
         Self {
+            channel: ChannelPlan::default(),
             radio: None,
             radio_config_path: None,
             pilot_offset: 0,
@@ -550,6 +580,7 @@ impl BtsNodeConfig {
             (None, None) => RadioConfig::default(),
         };
         let config = BtsNodeConfig {
+            channel: source.channel,
             radio,
             pilot_offset: source.pilot_offset,
             runtime: source.runtime,
@@ -570,6 +601,9 @@ impl BtsNodeConfig {
         if self.pilot_offset > 511 {
             return Err("bts.pilot_offset must be in 0..=511".into());
         }
+        self.channel
+            .validate()
+            .map_err(|e| Error::from(format!("bts.channel: {e}")))?;
         self.runtime.validate()?;
         cdma_common::timezone::validate(&self.timezone)
             .map_err(|e| Error::from(format!("bts.timezone: {e}")))?;
@@ -634,7 +668,6 @@ mod tests {
   "tx_gain_db": 80.0,
   "rx_antenna": "LNAW",
   "rx_gain_db": 45.0,
-  "rx_freq_hz": 836520000,
   "rx_sample_rate_hz": 4915200,
   "rx_bandwidth_hz": 2500000,
   "rx_reference_dbm": null,
@@ -678,6 +711,23 @@ mod tests {
         .expect("parse radio config");
 
         assert_eq!(radio.rx_power_adj(), 0.0);
+    }
+
+    #[test]
+    fn loads_production_bts_json_with_channel_plan() {
+        // Pins the shipped `config/bts.json` schema.
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/bts.json")
+            .canonicalize()
+            .expect("canonicalize");
+        let cfg = BtsNodeConfig::load_from_path(&path).expect("load config/bts.json");
+        use cdma_common::band_class::BandClass;
+        assert_eq!(cfg.channel.band_class, BandClass::Bc0);
+        assert_eq!(cfg.channel.band_subclass, 0);
+        assert_eq!(cfg.channel.cdma_channel, 384);
+        assert_eq!(cfg.channel.downlink_hz(), 881_520_000);
+        assert_eq!(cfg.channel.uplink_hz(), 836_520_000);
+        assert!(cfg.runtime.tx_freq_hz_override.is_none());
     }
 
     #[test]

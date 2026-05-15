@@ -663,6 +663,14 @@ export interface BtsConfig {
   txCenterFrequencyHz: number;
   txDigitalBackoff: number;
   blockSizeChips: number;
+  /** Resolved RX (uplink) center frequency in Hz. */
+  rxCenterFrequencyHz: number;
+  /** Configured CDMA2000 band class (e.g. "BC0", "BC1"). */
+  bandClass: string;
+  /** Configured CDMA channel number within the band class. */
+  cdmaChannel: number;
+  /** Configured 5-bit BAND_SUBCLASS broadcast in handoff messages. */
+  bandSubclass: number;
   pilot: PilotConfig | undefined;
   sync: SyncConfig | undefined;
   paging: PagingConfig | undefined;
@@ -10961,6 +10969,10 @@ function createBaseBtsConfig(): BtsConfig {
     txCenterFrequencyHz: 0,
     txDigitalBackoff: 0,
     blockSizeChips: 0,
+    rxCenterFrequencyHz: 0,
+    bandClass: "",
+    cdmaChannel: 0,
+    bandSubclass: 0,
     pilot: undefined,
     sync: undefined,
     paging: undefined,
@@ -10995,6 +11007,18 @@ export const BtsConfig: MessageFns<BtsConfig> = {
     }
     if (message.blockSizeChips !== 0) {
       writer.uint32(64).uint32(message.blockSizeChips);
+    }
+    if (message.rxCenterFrequencyHz !== 0) {
+      writer.uint32(240).uint32(message.rxCenterFrequencyHz);
+    }
+    if (message.bandClass !== "") {
+      writer.uint32(250).string(message.bandClass);
+    }
+    if (message.cdmaChannel !== 0) {
+      writer.uint32(256).uint32(message.cdmaChannel);
+    }
+    if (message.bandSubclass !== 0) {
+      writer.uint32(264).uint32(message.bandSubclass);
     }
     if (message.pilot !== undefined) {
       PilotConfig.encode(message.pilot, writer.uint32(82).fork()).join();
@@ -11086,6 +11110,38 @@ export const BtsConfig: MessageFns<BtsConfig> = {
           }
 
           message.blockSizeChips = reader.uint32();
+          continue;
+        }
+        case 30: {
+          if (tag !== 240) {
+            break;
+          }
+
+          message.rxCenterFrequencyHz = reader.uint32();
+          continue;
+        }
+        case 31: {
+          if (tag !== 250) {
+            break;
+          }
+
+          message.bandClass = reader.string();
+          continue;
+        }
+        case 32: {
+          if (tag !== 256) {
+            break;
+          }
+
+          message.cdmaChannel = reader.uint32();
+          continue;
+        }
+        case 33: {
+          if (tag !== 264) {
+            break;
+          }
+
+          message.bandSubclass = reader.uint32();
           continue;
         }
         case 10: {
@@ -11187,6 +11243,26 @@ export const BtsConfig: MessageFns<BtsConfig> = {
         : isSet(object.block_size_chips)
         ? globalThis.Number(object.block_size_chips)
         : 0,
+      rxCenterFrequencyHz: isSet(object.rxCenterFrequencyHz)
+        ? globalThis.Number(object.rxCenterFrequencyHz)
+        : isSet(object.rx_center_frequency_hz)
+        ? globalThis.Number(object.rx_center_frequency_hz)
+        : 0,
+      bandClass: isSet(object.bandClass)
+        ? globalThis.String(object.bandClass)
+        : isSet(object.band_class)
+        ? globalThis.String(object.band_class)
+        : "",
+      cdmaChannel: isSet(object.cdmaChannel)
+        ? globalThis.Number(object.cdmaChannel)
+        : isSet(object.cdma_channel)
+        ? globalThis.Number(object.cdma_channel)
+        : 0,
+      bandSubclass: isSet(object.bandSubclass)
+        ? globalThis.Number(object.bandSubclass)
+        : isSet(object.band_subclass)
+        ? globalThis.Number(object.band_subclass)
+        : 0,
       pilot: isSet(object.pilot) ? PilotConfig.fromJSON(object.pilot) : undefined,
       sync: isSet(object.sync) ? SyncConfig.fromJSON(object.sync) : undefined,
       paging: isSet(object.paging) ? PagingConfig.fromJSON(object.paging) : undefined,
@@ -11226,6 +11302,18 @@ export const BtsConfig: MessageFns<BtsConfig> = {
     if (message.blockSizeChips !== 0) {
       obj.blockSizeChips = Math.round(message.blockSizeChips);
     }
+    if (message.rxCenterFrequencyHz !== 0) {
+      obj.rxCenterFrequencyHz = Math.round(message.rxCenterFrequencyHz);
+    }
+    if (message.bandClass !== "") {
+      obj.bandClass = message.bandClass;
+    }
+    if (message.cdmaChannel !== 0) {
+      obj.cdmaChannel = Math.round(message.cdmaChannel);
+    }
+    if (message.bandSubclass !== 0) {
+      obj.bandSubclass = Math.round(message.bandSubclass);
+    }
     if (message.pilot !== undefined) {
       obj.pilot = PilotConfig.toJSON(message.pilot);
     }
@@ -11260,6 +11348,10 @@ export const BtsConfig: MessageFns<BtsConfig> = {
     message.txCenterFrequencyHz = object.txCenterFrequencyHz ?? 0;
     message.txDigitalBackoff = object.txDigitalBackoff ?? 0;
     message.blockSizeChips = object.blockSizeChips ?? 0;
+    message.rxCenterFrequencyHz = object.rxCenterFrequencyHz ?? 0;
+    message.bandClass = object.bandClass ?? "";
+    message.cdmaChannel = object.cdmaChannel ?? 0;
+    message.bandSubclass = object.bandSubclass ?? 0;
     message.pilot = (object.pilot !== undefined && object.pilot !== null)
       ? PilotConfig.fromPartial(object.pilot)
       : undefined;

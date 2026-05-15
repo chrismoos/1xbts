@@ -1289,6 +1289,7 @@ async fn test_e2e_so7_packet_data_full_negotiation() {
     let (_bts, bts_handle) = bts::Bts::new_with_radio_pipe(
         radio,
         bts::Config {
+            tx_center_frequency_hz: 881_520_000,
             pilot_offset: 0,
             mac_layer: mac_layer.clone(),
             start_system_time: Some(start_system_time),
@@ -1398,7 +1399,7 @@ async fn test_e2e_so7_packet_data_full_negotiation() {
         overhead: OverheadParameters {
             sid: 42,
             nid: 7,
-            cdma_freq: 384,
+            cdma_freq: Some(384),
             ..Default::default()
         },
         paging: bts::PagingChannelSettings::default(),
@@ -1891,6 +1892,7 @@ async fn test_e2e_so7_packet_data_phy_bidirectional() {
     let (bts, bts_handle) = bts::Bts::new_with_radio_pipe(
         radio,
         bts::Config {
+            tx_center_frequency_hz: 881_520_000,
             pilot_offset: 0,
             mac_layer: mac_layer.clone(),
             start_system_time: Some(start_system_time),
@@ -1998,7 +2000,7 @@ async fn test_e2e_so7_packet_data_phy_bidirectional() {
         overhead: OverheadParameters {
             sid: 42,
             nid: 7,
-            cdma_freq: 384,
+            cdma_freq: Some(384),
             ..Default::default()
         },
         paging: bts::PagingChannelSettings::default(),
@@ -2557,6 +2559,7 @@ async fn test_e2e_so7_rc3_reverse_preamble_queues_bs_ack() {
     let (bts, bts_handle) = bts::Bts::new_with_radio_pipe(
         radio,
         bts::Config {
+            tx_center_frequency_hz: 881_520_000,
             pilot_offset: 0,
             mac_layer: mac_layer.clone(),
             start_system_time: Some(start_system_time),
@@ -2641,7 +2644,7 @@ async fn test_e2e_so7_rc3_reverse_preamble_queues_bs_ack() {
         overhead: OverheadParameters {
             sid: 42,
             nid: 7,
-            cdma_freq: 384,
+            cdma_freq: Some(384),
             ..Default::default()
         },
         paging: bts::PagingChannelSettings::default(),
@@ -3654,6 +3657,7 @@ async fn test_e2e_so6_sms_data_burst_phy_bidirectional() {
     let (bts, bts_handle) = bts::Bts::new_with_radio_pipe(
         radio,
         bts::Config {
+            tx_center_frequency_hz: 881_520_000,
             pilot_offset: 0,
             mac_layer: mac_layer.clone(),
             start_system_time: Some(start_system_time),
@@ -3737,7 +3741,7 @@ async fn test_e2e_so6_sms_data_burst_phy_bidirectional() {
         overhead: OverheadParameters {
             sid: 42,
             nid: 7,
-            cdma_freq: 384,
+            cdma_freq: Some(384),
             ..Default::default()
         },
         paging: bts::PagingChannelSettings::default(),

@@ -33,7 +33,11 @@ export default async function ConfigPage() {
             <Stat label="Chip Rate" value={`${config.chipRateHz} Hz`} />
             <Stat label="TX Sample Rate" value={`${config.txSampleRateHz} Hz`} />
             <Stat label="TX Bandwidth" value={`${config.txBandwidthHz} Hz`} />
+            <Stat label="Band Class" value={config.bandClass} />
+            <Stat label="Band Subclass" value={String(config.bandSubclass)} />
+            <Stat label="CDMA Channel" value={String(config.cdmaChannel)} />
             <Stat label="TX Center Freq" value={`${config.txCenterFrequencyHz} Hz`} />
+            <Stat label="RX Center Freq" value={`${config.rxCenterFrequencyHz} Hz`} />
             <Stat label="TX Backoff" value={String(config.txDigitalBackoff)} />
             <Stat label="Block Size" value={`${config.blockSizeChips} chips`} />
           </Card>

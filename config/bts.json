@@ -1,4 +1,9 @@
 {
+  "channel": {
+    "band_class": "bc0",
+    "band_subclass": 0,
+    "cdma_channel": 384
+  },
   "pilot_offset": 0,
   "overhead": {
     "sid": 22,
@@ -19,9 +24,7 @@
     "lp_sec": 18,
     "ltm_off": -14,
     "daylt": 0,
-    "prat": 0,
-    "cdma_freq": 384,
-    "ext_cdma_freq": 384
+    "prat": 0
   },
   "timezone": {
     "source": "system"
@@ -32,7 +35,6 @@
     "chip_rate_hz": 1228800,
     "tx_sample_rate_hz": 4915200,
     "tx_bandwidth_hz": 3000000,
-    "tx_center_frequency_hz": 881520000,
     "tx_lo_offset_hz": 200000,
     "tx_digital_backoff": 0.5,
     "block_size_chips": 512,
@@ -178,7 +180,7 @@
             "neighbors": []
           },
           "cdma_channel_list": {
-            "channels": [384]
+            "channels": []
           },
           "general_page": {
             "class_0_done": true,

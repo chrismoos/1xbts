@@ -170,6 +170,8 @@ fn set_thread_priority(label: &str, hard_rt: bool) {
 
 /// Static BTS wiring and protocol dependencies.
 pub struct Config {
+    /// Resolved TX center frequency in Hz (channel plan or override).
+    pub tx_center_frequency_hz: usize,
     /// Pilot PN offset index in units of 64 chips.
     pub pilot_offset: usize,
     /// MAC service used for paging fragments and overhead availability.
@@ -322,11 +324,11 @@ impl Bts {
         radio.set_tx_bandwidth(self.runtime.tx_bandwidth_hz)?;
         radio.set_tx_sample_rate(self.runtime.tx_sample_rate_hz)?;
         radio.set_tx_lo_offset_hz(self.runtime.tx_lo_offset_hz)?;
-        radio.set_tx_frequency(self.runtime.tx_center_frequency_hz)?;
+        radio.set_tx_frequency(self.config.tx_center_frequency_hz)?;
 
         info!(
             "Set TX center frequency to {:.04}Mhz (LO offset {:+.03}kHz), sample rate {:.04}Mhz, spreading rate {:?}",
-            self.runtime.tx_center_frequency_hz as f64 / 1_000_000.0,
+            self.config.tx_center_frequency_hz as f64 / 1_000_000.0,
             self.runtime.tx_lo_offset_hz as f64 / 1_000.0,
             self.runtime.tx_sample_rate_hz as f64 / 1_000_000.0,
             self.runtime.spreading_rate,
