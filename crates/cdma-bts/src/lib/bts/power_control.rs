@@ -1124,11 +1124,15 @@ impl BtsPowerControlRegistry {
         metric_db: f32,
         raw_power_db: Option<f32>,
     ) -> Option<BtsPowerControlTick> {
-        let use_rc3 = {
+        // Keep per-PCG work out of the traffic-pool lock.
+        let channel = {
             let slots = traffic_channels.lock();
-            let slot = slots.iter().find(|slot| slot.walsh_code == walsh_code)?;
-            matches!(slot.channel, TrafficChannelWrapper::Rc3(_))
+            slots
+                .iter()
+                .find(|slot| slot.walsh_code == walsh_code)
+                .map(|s| s.channel.clone())?
         };
+        let use_rc3 = matches!(channel, TrafficChannelWrapper::Rc3(_));
         let tick = {
             let mut states = self.states.lock();
             let is_new_state = !states.contains_key(&walsh_code);
@@ -1154,9 +1158,7 @@ impl BtsPowerControlRegistry {
             )
         };
 
-        let slots = traffic_channels.lock();
-        let slot = slots.iter().find(|slot| slot.walsh_code == walsh_code)?;
-        match &slot.channel {
+        match &channel {
             TrafficChannelWrapper::Rc1(ch) => {
                 ch.channel.schedule_power_control_bit(tx_abs_pcg, tick.pcb)
             }
@@ -1175,13 +1177,16 @@ impl BtsPowerControlRegistry {
         start_abs_pcg: u64,
         pcgs: u64,
     ) -> bool {
-        let slots = traffic_channels.lock();
-        let Some(slot) = slots.iter().find(|slot| slot.walsh_code == walsh_code) else {
-            return false;
+        let channel = {
+            let slots = traffic_channels.lock();
+            let Some(slot) = slots.iter().find(|slot| slot.walsh_code == walsh_code) else {
+                return false;
+            };
+            slot.channel.clone()
         };
         for offset in 0..pcgs {
             let abs_pcg = start_abs_pcg.saturating_add(offset);
-            match &slot.channel {
+            match &channel {
                 TrafficChannelWrapper::Rc1(ch) => ch.channel.schedule_power_control_bit(abs_pcg, 1),
                 TrafficChannelWrapper::Rc3(ch) => ch.channel.schedule_power_control_bit(abs_pcg, 1),
                 TrafficChannelWrapper::SchRc3(_) => return false,

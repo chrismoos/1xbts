@@ -30,11 +30,13 @@ pub(super) fn aligned_spreader(
 /// channel handles with their gains.  The pool lock is held only for this
 /// brief metadata pass; `next_block()` is called by the caller after the
 /// lock has been released.
-fn snapshot_traffic_channels(
+fn snapshot_traffic_channels_into(
     traffic_channels: &TrafficChannelPool,
     chip_cursor: u64,
     pilot_offset_chips: u64,
-) -> Vec<(f32, TrafficChannelWrapper)> {
+    out: &mut Vec<(f32, TrafficChannelWrapper)>,
+) {
+    out.clear();
     let mut tc_pool = traffic_channels.lock();
     for slot in tc_pool.iter_mut() {
         if !slot.lc_aligned {
@@ -55,29 +57,28 @@ fn snapshot_traffic_channels(
             slot.lc_aligned = true;
         }
     }
-    tc_pool
-        .iter_mut()
-        .filter_map(|slot| {
-            let start = slot.start_chip?;
-            if chip_cursor < start {
-                return None;
-            }
-            if !slot.frame_align_verified {
-                assert_eq!(
-                    chip_cursor,
-                    start,
-                    "traffic channel walsh={} missed frame boundary: \
-                     chip_cursor={} start_chip={} overshoot={}",
-                    slot.walsh_code,
-                    chip_cursor,
-                    start,
-                    chip_cursor - start,
-                );
-                slot.frame_align_verified = true;
-            }
-            Some((slot.gain, slot.channel.clone()))
-        })
-        .collect()
+    for slot in tc_pool.iter_mut() {
+        let Some(start) = slot.start_chip else {
+            continue;
+        };
+        if chip_cursor < start {
+            continue;
+        }
+        if !slot.frame_align_verified {
+            assert_eq!(
+                chip_cursor,
+                start,
+                "traffic channel walsh={} missed frame boundary: \
+                 chip_cursor={} start_chip={} overshoot={}",
+                slot.walsh_code,
+                chip_cursor,
+                start,
+                chip_cursor - start,
+            );
+            slot.frame_align_verified = true;
+        }
+        out.push((slot.gain, slot.channel.clone()));
+    }
 }
 
 pub(super) fn synthesize_block(
@@ -97,31 +98,65 @@ pub(super) fn synthesize_block(
     let synth_start = Instant::now();
 
     let t0 = Instant::now();
-    let pilot_block = pch.next_block(block_size, frame_system_time);
+    state.scratch_pilot.clear();
+    pch.next_block_into(&mut state.scratch_pilot, block_size, frame_system_time);
     state.synth_pilot_us += t0.elapsed().as_micros() as u64;
 
     let t0 = Instant::now();
-    let sync_block = fsch.next_block(block_size, frame_system_time);
+    state.scratch_sync.clear();
+    fsch.next_block_into(&mut state.scratch_sync, block_size, frame_system_time);
     state.synth_fsch_us += t0.elapsed().as_micros() as u64;
 
     let t0 = Instant::now();
-    let paging_block = fpch.next_block(block_size, frame_system_time);
+    state.scratch_paging.clear();
+    fpch.next_block_into(&mut state.scratch_paging, block_size, frame_system_time);
     state.synth_fpch_us += t0.elapsed().as_micros() as u64;
 
     let t0 = Instant::now();
-    let tc_snapshots =
-        snapshot_traffic_channels(traffic_channels, chip_cursor, state.pilot_offset_chips);
-    let tc_blocks: Vec<(f32, Vec<Complex32>)> = tc_snapshots
-        .iter()
-        .map(|(gain, ch)| (*gain, ch.next_block(block_size, frame_system_time)))
-        .collect();
+    let snap_start = Instant::now();
+    snapshot_traffic_channels_into(
+        traffic_channels,
+        chip_cursor,
+        state.pilot_offset_chips,
+        &mut state.scratch_tc_snapshot,
+    );
+    let snap_us = snap_start.elapsed().as_micros() as u64;
+    while state.scratch_tc_blocks.len() < state.scratch_tc_snapshot.len() {
+        state.scratch_tc_blocks.push((0.0, Vec::new()));
+    }
+    state
+        .scratch_tc_blocks
+        .truncate(state.scratch_tc_snapshot.len());
+    let mut tc_sum_us = 0u64;
+    let mut tc_max_us = 0u64;
+    for (i, (gain, ch)) in state.scratch_tc_snapshot.iter().enumerate() {
+        let (g_slot, buf) = &mut state.scratch_tc_blocks[i];
+        *g_slot = *gain;
+        buf.clear();
+        let tc_start = Instant::now();
+        ch.next_block_into(buf, block_size, frame_system_time);
+        let dt = tc_start.elapsed().as_micros() as u64;
+        tc_sum_us += dt;
+        if dt > tc_max_us {
+            tc_max_us = dt;
+        }
+    }
     state.synth_ftch_us += t0.elapsed().as_micros() as u64;
+    state.last_snap_us = snap_us;
+    state.last_tc_n = state.scratch_tc_snapshot.len();
+    state.last_tc_sum_us = tc_sum_us;
+    state.last_tc_max_us = tc_max_us;
 
     let pilot_gain = runtime.downlink.pilot.gain;
     let sync_gain = runtime.downlink.sync.gain;
     let paging_gain = runtime.downlink.paging.gain;
-    let tc_gain_sum: f32 = tc_blocks.iter().map(|(g, _)| *g).sum();
+    let tc_gain_sum: f32 = state.scratch_tc_blocks.iter().map(|(g, _)| *g).sum();
     let inv_gain_sum = 1.0 / (pilot_gain + sync_gain + paging_gain + tc_gain_sum);
+
+    let pilot_block = &state.scratch_pilot;
+    let sync_block = &state.scratch_sync;
+    let paging_block = &state.scratch_paging;
+    let tc_blocks = &state.scratch_tc_blocks;
 
     let t0 = Instant::now();
     for x in 0..block_size {
@@ -132,7 +167,7 @@ pub(super) fn synthesize_block(
             + sync_block[x].im * sync_gain
             + paging_block[x].im * paging_gain;
 
-        for (tc_gain, tc_samples) in &tc_blocks {
+        for (tc_gain, tc_samples) in tc_blocks {
             re += tc_samples[x].re * tc_gain;
             im += tc_samples[x].im * tc_gain;
         }

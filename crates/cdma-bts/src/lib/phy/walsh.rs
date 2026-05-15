@@ -78,6 +78,33 @@ impl WalshGenerator {
         bits.iter().flat_map(|b| self.feed(*b)).collect()
     }
 
+    /// Chips emitted per input symbol (`code.len() * repetition`).
+    pub fn chips_per_symbol(&self) -> usize {
+        self.code.len() * self.repetition
+    }
+
+    /// The selected Walsh row as ±1 chips.
+    pub fn code(&self) -> &[i8] {
+        &self.code
+    }
+
+    /// Per-symbol repetition factor.
+    pub fn repetition(&self) -> usize {
+        self.repetition
+    }
+
+    /// Spread `bits` into `out` without allocating intermediate vectors.
+    pub fn feed_many_into(&self, bits: &[Complex32], out: &mut Vec<Complex32>) {
+        out.reserve(bits.len() * self.chips_per_symbol());
+        for sample in bits {
+            for _ in 0..self.repetition {
+                for c in &self.code {
+                    out.push(Complex32::new(*c as f32 * sample.re, *c as f32 * sample.im));
+                }
+            }
+        }
+    }
+
     /// In-place Fast Walsh-Hadamard Transform on a power-of-two slice of
     /// Complex32 values.  After the transform, `values[k]` contains the
     /// Walsh-row-k correlation (unnormalised).  O(N log N) vs O(N²) for

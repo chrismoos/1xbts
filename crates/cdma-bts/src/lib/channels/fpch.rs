@@ -212,10 +212,20 @@ impl<const EK: usize, const ER: usize> ForwardPagingChannel<EK, ER> {
 
 impl<const EK: usize, const ER: usize> Channel for ForwardPagingChannel<EK, ER> {
     fn next_block(&self, num_samples: usize, system_time: CdmaSystemTime) -> Vec<Complex32> {
-        let mut output = vec![];
-        while output.len() < num_samples {
-            output.extend(self.next(system_time));
-        }
+        let mut output = Vec::with_capacity(num_samples);
+        self.next_block_into(&mut output, num_samples, system_time);
         output
+    }
+
+    fn next_block_into(
+        &self,
+        out: &mut Vec<Complex32>,
+        num_samples: usize,
+        system_time: CdmaSystemTime,
+    ) {
+        let start = out.len();
+        while out.len() - start < num_samples {
+            out.extend(self.next(system_time));
+        }
     }
 }

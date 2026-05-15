@@ -243,6 +243,16 @@ pub(crate) struct TxLoopState {
     synth_blocks: usize,
     tx_batches: usize,
     interval_start: Instant,
+    pub(super) scratch_pilot: Vec<num::complex::Complex32>,
+    pub(super) scratch_sync: Vec<num::complex::Complex32>,
+    pub(super) scratch_paging: Vec<num::complex::Complex32>,
+    pub(super) scratch_tc_snapshot: Vec<(f32, handle::TrafficChannelWrapper)>,
+    pub(super) scratch_tc_blocks: Vec<(f32, Vec<num::complex::Complex32>)>,
+    /// Last per-block FTCH timing breakdown.
+    pub(super) last_snap_us: u64,
+    pub(super) last_tc_n: usize,
+    pub(super) last_tc_max_us: u64,
+    pub(super) last_tc_sum_us: u64,
 }
 
 impl Bts {
@@ -439,6 +449,15 @@ impl Bts {
             synth_blocks: 0,
             tx_batches: 0,
             interval_start: Instant::now(),
+            scratch_pilot: Vec::new(),
+            scratch_sync: Vec::new(),
+            scratch_paging: Vec::new(),
+            scratch_tc_snapshot: Vec::new(),
+            scratch_tc_blocks: Vec::new(),
+            last_snap_us: 0,
+            last_tc_n: 0,
+            last_tc_max_us: 0,
+            last_tc_sum_us: 0,
         };
 
         if let Some(rx) = radio_rx.as_mut() {
@@ -758,6 +777,9 @@ impl Bts {
                     state.paging_time_sum_us += t.elapsed().as_micros() as u64;
                 }
 
+                let prev_synth_pilot_us = state.synth_pilot_us;
+                let prev_synth_fsch_us = state.synth_fsch_us;
+                let prev_synth_fpch_us = state.synth_fpch_us;
                 let prev_synth_ftch_us = state.synth_ftch_us;
                 let prev_synth_spread_us = state.synth_spread_us;
                 let block_gen_start = Instant::now();
@@ -778,11 +800,18 @@ impl Bts {
                 let block_gen_us = block_gen_start.elapsed().as_micros() as u64;
                 if block_gen_us > 500 {
                     log::warn!(
-                        "tx_slow_gen: {}us (block #{}, chip={}) ftch={}us spread={}us",
+                        "tx_slow_gen: {}us (block #{}, chip={}) pilot={}us sync={}us paging={}us ftch={}us [snap={}us tc_n={} tc_sum={}us tc_max={}us] spread={}us",
                         block_gen_us,
                         state.synth_blocks,
                         block_chip,
+                        state.synth_pilot_us.saturating_sub(prev_synth_pilot_us),
+                        state.synth_fsch_us.saturating_sub(prev_synth_fsch_us),
+                        state.synth_fpch_us.saturating_sub(prev_synth_fpch_us),
                         state.synth_ftch_us.saturating_sub(prev_synth_ftch_us),
+                        state.last_snap_us,
+                        state.last_tc_n,
+                        state.last_tc_sum_us,
+                        state.last_tc_max_us,
                         state.synth_spread_us.saturating_sub(prev_synth_spread_us),
                     );
                 }
@@ -845,6 +874,7 @@ impl Bts {
         thread::Builder::new()
             .name("bts-tx".into())
             .spawn(move || {
+                set_thread_priority("bts-tx", true);
                 let result = self.run_loop(None);
                 let _ = tx.send(result);
             })

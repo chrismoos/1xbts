@@ -133,20 +133,20 @@ impl<const EK: usize, const ER: usize> Channel for ForwardSyncChannel<EK, ER> {
         num_samples: usize,
         system_time: CdmaSystemTime,
     ) -> Vec<num::complex::Complex32> {
-        let mut output = vec![];
-        while output.len() < num_samples {
-            output.extend(self.next(system_time));
-        }
+        let mut output = Vec::with_capacity(num_samples);
+        self.next_block_into(&mut output, num_samples, system_time);
         output
-        /*let block = (0..num_samples)
-            .map(|_| {
-                let out = self.next();
-                //info!("producted {}", out.len());
-                out
-            })
-            .flatten()
-            .collect::<Vec<_>>();
-        //info!("produced block of {}", block.len());
-        block*/
+    }
+
+    fn next_block_into(
+        &self,
+        out: &mut Vec<Complex32>,
+        num_samples: usize,
+        system_time: CdmaSystemTime,
+    ) {
+        let start = out.len();
+        while out.len() - start < num_samples {
+            out.extend(self.next(system_time));
+        }
     }
 }

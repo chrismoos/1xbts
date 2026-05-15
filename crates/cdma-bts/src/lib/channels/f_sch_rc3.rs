@@ -62,6 +62,7 @@ struct PreparedSchFrame {
 
 struct SchTxState {
     symbol_buffer: VecDeque<Complex32>,
+    pcg_scratch: Vec<Complex32>,
     prepared_frame: Option<PreparedSchFrame>,
 }
 
@@ -79,6 +80,13 @@ pub struct SchConfigRc3 {
     pub disable_lc_scrambling: bool,
 }
 
+/// SCH frame prep state.
+struct PrepEngine {
+    profile: Rc3FschProfile,
+    encoder: Encoder<9, 4>,
+    interleaver: ForwardBackwardsBitReversalInterleaver,
+}
+
 /// RC3 Forward Supplemental Channel (F-SCH).
 ///
 /// Operates on a separate supplemental Walsh code from the F-FCH but shares
@@ -87,7 +95,8 @@ pub struct SchConfigRc3 {
 pub struct ForwardSupplementalChannelRc3 {
     config: Mutex<SchConfigRc3>,
     tx_state: Mutex<SchTxState>,
-    frames: Mutex<VecDeque<Vec<u8>>>,
+    prep: Mutex<PrepEngine>,
+    frames: Mutex<VecDeque<PreparedSchFrame>>,
 }
 
 /// Build the complete encoder input (info + CRC-16 + tail) for an SCH frame.
@@ -118,12 +127,20 @@ fn build_sch_frame_bits(profile: Rc3FschProfile, data: &[u8]) -> Vec<u8> {
 
 impl ForwardSupplementalChannelRc3 {
     pub fn new(config: SchConfigRc3) -> Self {
+        let profile = config.profile;
+        let prep = PrepEngine {
+            profile,
+            encoder: get_1_4_k9_encoder(),
+            interleaver: ForwardBackwardsBitReversalInterleaver::new(interleaver_params(profile)),
+        };
         ForwardSupplementalChannelRc3 {
             config: Mutex::new(config),
             tx_state: Mutex::new(SchTxState {
                 symbol_buffer: VecDeque::new(),
+                pcg_scratch: Vec::new(),
                 prepared_frame: None,
             }),
+            prep: Mutex::new(prep),
             frames: Mutex::new(VecDeque::new()),
         }
     }
@@ -145,11 +162,35 @@ impl ForwardSupplementalChannelRc3 {
         })
     }
 
-    /// Queue a frame (info bits) for transmission.
     /// Queue SCH MAC SDU content. The active profile pads/truncates to its
     /// configured info-bit count.
     pub fn send_frame(&self, data: Vec<u8>) {
-        self.frames.lock().push_back(data);
+        let prepared = {
+            let mut prep = self.prep.lock();
+            Self::prepare_frame_static(&mut prep, &data)
+        };
+        self.frames.lock().push_back(prepared);
+    }
+
+    fn prepare_frame_static(prep: &mut PrepEngine, data: &[u8]) -> PreparedSchFrame {
+        let profile = prep.profile;
+        let frame_data = build_sch_frame_bits(profile, data);
+
+        prep.encoder.reset();
+        let mut encoded = Vec::with_capacity(profile.coded_symbols());
+        for &bit in &frame_data {
+            for &sym in prep.encoder.encode(bit).iter() {
+                encoded.push(sym);
+            }
+        }
+        debug_assert_eq!(encoded.len(), profile.coded_symbols());
+
+        let interleaved = prep.interleaver.encode(&encoded);
+        PreparedSchFrame {
+            interleaved,
+            next_pcg: 0,
+            frame_start_chip: 0,
+        }
     }
 
     /// Seed both long-code generators at the given CDMA chip position.
@@ -188,11 +229,11 @@ impl ForwardSupplementalChannelRc3 {
         self.next_block(profile.qpsk_symbols(), current_system_time)
     }
 
-    fn pop_next_frame(&self) -> Option<Vec<u8>> {
+    fn pop_next_frame(&self) -> Option<PreparedSchFrame> {
         self.frames.lock().pop_front()
     }
 
-    fn emit_dtx_pcg(config: &mut SchConfigRc3, tx_state: &mut SchTxState) {
+    fn emit_dtx_pcg_into(config: &mut SchConfigRc3, out: &mut Vec<Complex32>) {
         let mut probe = config.scrambling_lc.clone();
         probe.advance_chips(PCG_CHIPS - 1);
         config.prev_frame_last_chip = probe.next_chip();
@@ -202,51 +243,29 @@ impl ForwardSupplementalChannelRc3 {
         config.lc_chip_cursor = config.lc_chip_cursor.saturating_add(PCG_CHIPS as u64);
         config.frame_pcg_index = (config.frame_pcg_index + 1) % SR1_PCGS_PER_FRAME;
 
-        tx_state.symbol_buffer.extend(std::iter::repeat_n(
+        out.extend(std::iter::repeat_n(
             Complex32::new(0.0, 0.0),
             config.profile.symbols_per_pcg() / 2,
         ));
     }
 
-    fn prepare_frame(&self, config: &mut SchConfigRc3, data: Vec<u8>) -> PreparedSchFrame {
-        // Step 1: Build complete frame (info + CRC-16 + tail)
-        let profile = config.profile;
-        let frame_data = build_sch_frame_bits(profile, &data);
-        let frame_start_chip = config.lc_chip_cursor;
-
-        // Step 2: Convolutional encode (R=1/4, K=9) — each bit → 4 symbols
-        config.encoder.reset();
-        let mut encoded = Vec::with_capacity(profile.coded_symbols());
-        for &bit in &frame_data {
-            for &sym in config.encoder.encode(bit).iter() {
-                encoded.push(sym);
-            }
-        }
-        debug_assert_eq!(encoded.len(), profile.coded_symbols());
-
-        // Step 3/4: no repetition or rate-matching puncturing for these RC3 profiles.
-
-        // Step 5: forward-backwards bit-reversal interleave.
-        let interleaved = config.interleaver.encode(&encoded);
-
-        PreparedSchFrame {
-            interleaved,
-            next_pcg: 0,
-            frame_start_chip,
-        }
-    }
-
-    fn emit_next_pcg(&self, config: &mut SchConfigRc3, tx_state: &mut SchTxState) {
+    fn emit_next_pcg_into(
+        &self,
+        config: &mut SchConfigRc3,
+        tx_state: &mut SchTxState,
+        out: &mut Vec<Complex32>,
+    ) {
         if tx_state.prepared_frame.is_none() {
             if config.frame_pcg_index != 0 {
-                Self::emit_dtx_pcg(config, tx_state);
+                Self::emit_dtx_pcg_into(config, out);
                 return;
             }
-            let Some(data) = self.pop_next_frame() else {
-                Self::emit_dtx_pcg(config, tx_state);
+            let Some(mut prepared) = self.pop_next_frame() else {
+                Self::emit_dtx_pcg_into(config, out);
                 return;
             };
-            tx_state.prepared_frame = Some(self.prepare_frame(config, data));
+            prepared.frame_start_chip = config.lc_chip_cursor;
+            tx_state.prepared_frame = Some(prepared);
         }
 
         let prepared = tx_state
@@ -263,8 +282,8 @@ impl ForwardSupplementalChannelRc3 {
         // transmitted on F-FCH/F-DCCH only, not punctured into F-SCH.
         let lc_decimation = profile.lc_decimation();
         let mut previous_chip = config.prev_frame_last_chip;
-        let mut mapped = vec![0.0f32; symbols_per_pcg];
-        for (pair_idx, pair) in prepared.interleaved[start..end].chunks_exact(2).enumerate() {
+        out.reserve(symbols_per_pcg / 2);
+        for pair in prepared.interleaved[start..end].chunks_exact(2) {
             let q_chip = previous_chip;
             let i_chip = config.scrambling_lc.next_chip();
             previous_chip = i_chip;
@@ -274,24 +293,19 @@ impl ForwardSupplementalChannelRc3 {
                 previous_chip = config.scrambling_lc.next_chip();
             }
 
-            let mod_index = pair_idx * 2;
-            for lane in 0..2 {
-                let symbol_in_pcg = mod_index + lane;
-                let lc_scr = if lane == 0 { i_chip } else { q_chip };
-                let scrambled = if config.disable_lc_scrambling {
-                    pair[lane]
-                } else {
-                    pair[lane] ^ lc_scr
-                };
-                mapped[symbol_in_pcg] = if scrambled == 0 { 1.0f32 } else { -1.0f32 };
-            }
-        }
-
-        // I/Q demux: consecutive pairs → complex QPSK symbols
-        for pair in mapped.chunks_exact(2) {
-            tx_state
-                .symbol_buffer
-                .push_back(Complex32::new(pair[0], pair[1]));
+            let i_bit = if config.disable_lc_scrambling {
+                pair[0]
+            } else {
+                pair[0] ^ i_chip
+            };
+            let q_bit = if config.disable_lc_scrambling {
+                pair[1]
+            } else {
+                pair[1] ^ q_chip
+            };
+            let i = if i_bit == 0 { 1.0f32 } else { -1.0f32 };
+            let q = if q_bit == 0 { 1.0f32 } else { -1.0f32 };
+            out.push(Complex32::new(i, q));
         }
 
         config.prev_frame_last_chip = previous_chip;
@@ -313,16 +327,45 @@ impl ForwardSupplementalChannelRc3 {
 
 impl Channel for ForwardSupplementalChannelRc3 {
     fn next_block(&self, num_samples: usize, system_time: CdmaSystemTime) -> Vec<Complex32> {
-        let _ = system_time;
+        let mut out = Vec::with_capacity(num_samples);
+        self.next_block_into(&mut out, num_samples, system_time);
+        out
+    }
+
+    fn next_block_into(
+        &self,
+        out: &mut Vec<Complex32>,
+        num_samples: usize,
+        _system_time: CdmaSystemTime,
+    ) {
         let mut config = self.config.lock();
         let mut tx_state = self.tx_state.lock();
-        while tx_state.symbol_buffer.len() < num_samples {
-            self.emit_next_pcg(&mut config, &mut tx_state);
+        let target_len = out.len() + num_samples;
+        out.reserve(num_samples);
+
+        while out.len() < target_len {
+            if let Some(sample) = tx_state.symbol_buffer.pop_front() {
+                out.push(sample);
+                continue;
+            }
+
+            let pcg_samples = config.profile.symbols_per_pcg() / 2;
+            if target_len - out.len() >= pcg_samples {
+                self.emit_next_pcg_into(&mut config, &mut tx_state, out);
+                continue;
+            }
+
+            let mut scratch = std::mem::take(&mut tx_state.pcg_scratch);
+            scratch.clear();
+            self.emit_next_pcg_into(&mut config, &mut tx_state, &mut scratch);
+
+            let needed = target_len - out.len();
+            out.extend(scratch.iter().take(needed).copied());
+            tx_state
+                .symbol_buffer
+                .extend(scratch.iter().skip(needed).copied());
+            tx_state.pcg_scratch = scratch;
         }
-        tx_state
-            .symbol_buffer
-            .drain(..num_samples)
-            .collect::<Vec<_>>()
     }
 }
 

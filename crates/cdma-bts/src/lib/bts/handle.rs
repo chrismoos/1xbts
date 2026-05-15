@@ -185,6 +185,19 @@ impl Channel for TrafficChannelWrapper {
             TrafficChannelWrapper::SchRc3(ch) => ch.next_block(num_samples, system_time),
         }
     }
+
+    fn next_block_into(
+        &self,
+        out: &mut Vec<num::complex::Complex32>,
+        num_samples: usize,
+        system_time: CdmaSystemTime,
+    ) {
+        match self {
+            TrafficChannelWrapper::Rc1(ch) => ch.next_block_into(out, num_samples, system_time),
+            TrafficChannelWrapper::Rc3(ch) => ch.next_block_into(out, num_samples, system_time),
+            TrafficChannelWrapper::SchRc3(ch) => ch.next_block_into(out, num_samples, system_time),
+        }
+    }
 }
 
 /// A single active traffic channel slot in the shared pool.

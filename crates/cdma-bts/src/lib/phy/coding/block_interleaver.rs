@@ -1,3 +1,4 @@
+#[derive(Clone)]
 pub struct BitReversalInterleaver {
     params: InterleaverParams,
 }
@@ -52,6 +53,7 @@ impl BitReversalInterleaver {
     }
 }
 
+#[derive(Clone)]
 pub struct ForwardBackwardsBitReversalInterleaver {
     params: InterleaverParams,
 }

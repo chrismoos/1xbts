@@ -26,6 +26,17 @@ use crate::{phy::spread::Spreader, phy::walsh::WalshGenerator};
 pub trait Channel {
     /// Generate the next `num_samples` chip-rate samples for `system_time`.
     fn next_block(&self, num_samples: usize, system_time: CdmaSystemTime) -> Vec<Complex32>;
+
+    /// Append the next `num_samples` chip-rate samples into `out`.
+    fn next_block_into(
+        &self,
+        out: &mut Vec<Complex32>,
+        num_samples: usize,
+        system_time: CdmaSystemTime,
+    ) {
+        let block = self.next_block(num_samples, system_time);
+        out.extend_from_slice(&block);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +382,7 @@ where
 struct WalshState {
     walsh: WalshGenerator,
     buffer: VecDeque<Complex32>,
+    symbol_scratch: Vec<Complex32>,
 }
 
 impl<T> WalshChannel<T>
@@ -383,6 +395,7 @@ where
             state: Mutex::new(WalshState {
                 walsh,
                 buffer: VecDeque::new(),
+                symbol_scratch: Vec::new(),
             }),
         })
     }
@@ -406,13 +419,42 @@ where
     T: Channel,
 {
     fn next_block(&self, num_samples: usize, system_time: CdmaSystemTime) -> Vec<Complex32> {
+        let mut out = Vec::with_capacity(num_samples);
+        self.next_block_into(&mut out, num_samples, system_time);
+        out
+    }
+
+    fn next_block_into(
+        &self,
+        out: &mut Vec<Complex32>,
+        num_samples: usize,
+        system_time: CdmaSystemTime,
+    ) {
         let mut state = self.state.lock();
-        while state.buffer.len() < num_samples {
-            let next_block = self.channel.next_block(1, system_time);
-            let walsh_encoded = state.walsh.feed_many(&next_block);
-            state.buffer.extend(walsh_encoded);
+        if state.buffer.len() < num_samples {
+            let chips_per_symbol = state.walsh.chips_per_symbol();
+            let deficit = num_samples - state.buffer.len();
+            let symbols_needed = deficit.div_ceil(chips_per_symbol);
+            let state = &mut *state;
+            state.symbol_scratch.clear();
+            self.channel
+                .next_block_into(&mut state.symbol_scratch, symbols_needed, system_time);
+            for sample in &state.symbol_scratch {
+                for _ in 0..state.walsh.repetition() {
+                    for c in state.walsh.code() {
+                        state.buffer.push_back(Complex32::new(
+                            *c as f32 * sample.re,
+                            *c as f32 * sample.im,
+                        ));
+                    }
+                }
+            }
+            debug_assert!(state.buffer.len() >= num_samples);
         }
-        state.buffer.drain(0..num_samples).collect::<Vec<_>>()
+        out.reserve(num_samples);
+        for _ in 0..num_samples {
+            out.push(state.buffer.pop_front().unwrap());
+        }
     }
 }
 

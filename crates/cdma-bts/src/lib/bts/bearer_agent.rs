@@ -100,18 +100,22 @@ pub fn deliver_forward_frame(
     frame: TrafficFrame,
     is_signaling: bool,
 ) -> Result<(), String> {
-    let pool = controller.traffic_channels_pool();
-    let slots = pool.lock();
-    let slot = slots
-        .iter()
-        .find(|s| s.walsh_code == walsh_code)
-        .ok_or_else(|| format!("unknown bearer walsh={}", walsh_code))?;
+    // Keep encode work out of the traffic-pool lock.
+    let channel = {
+        let pool = controller.traffic_channels_pool();
+        let slots = pool.lock();
+        slots
+            .iter()
+            .find(|s| s.walsh_code == walsh_code)
+            .map(|s| s.channel.clone())
+            .ok_or_else(|| format!("unknown bearer walsh={}", walsh_code))?
+    };
 
     match frame {
         TrafficFrame::ForwardFchDcch(payload) => {
             let rate = decode_frame_content_rate(payload.frame_content)?;
             let info_len = payload.forward_link_information.len();
-            match &slot.channel {
+            match &channel {
                 TrafficChannelWrapper::Rc1(ch) => {
                     if is_signaling {
                         let bits = unpack_bytes_to_bits(
@@ -157,7 +161,7 @@ pub fn deliver_forward_frame(
                 }
             }
         }
-        TrafficFrame::ForwardSch(payload) => match &slot.channel {
+        TrafficFrame::ForwardSch(payload) => match &channel {
             TrafficChannelWrapper::SchRc3(ch) => {
                 ch.channel.send_frame(payload.forward_link_information);
             }
