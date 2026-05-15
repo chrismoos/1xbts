@@ -1,10 +1,27 @@
 import { getHlrClient, waitForHlrReady } from "@/lib/grpc/hlr-client";
-import { NumberPlan, NumberType } from "@/lib/proto/hlr/v1/service";
+import {
+  NumberPlan,
+  NumberType,
+  Subscriber,
+} from "@/lib/proto/hlr/v1/service";
 import {
   DEFAULT_NUMBER_PLAN,
   DEFAULT_NUMBER_TYPE,
+  parseSubscriberStatus,
+  subscriberStatusLabel,
 } from "@/lib/subscriber-options";
 import { validateImsi, validatePhoneNumber } from "@/lib/validation";
+
+function withStatusLabel<T extends { subscriber?: Subscriber }>(result: T) {
+  if (!result.subscriber) return result;
+  return {
+    ...result,
+    subscriber: {
+      ...result.subscriber,
+      status: subscriberStatusLabel(result.subscriber.status),
+    },
+  };
+}
 
 export const dynamic = "force-dynamic";
 
@@ -41,7 +58,7 @@ export async function GET(
       { subscriberId: id },
       { signal: abort.signal }
     );
-    return Response.json(result);
+    return Response.json(withStatusLabel(result));
   } catch (err) {
     const msg = err instanceof Error ? err.message : "unknown error";
     const status = msg.toLowerCase().includes("not found") ? 404 : 502;
@@ -82,7 +99,7 @@ export async function PATCH(
         subscriberId: id,
         phoneNumber,
         displayName: asString(body.displayName),
-        status: asString(body.status) || "active",
+        status: parseSubscriberStatus(body.status),
         imsi: imsi || undefined,
         esn: body.esn != null ? Number(body.esn) : undefined,
         numberType: coerceNumberType(body.numberType),
@@ -90,7 +107,7 @@ export async function PATCH(
       },
       { signal: abort.signal }
     );
-    return Response.json(result);
+    return Response.json(withStatusLabel(result));
   } catch (err) {
     const msg = err instanceof Error ? err.message : "unknown error";
     const status = msg.toLowerCase().includes("not found") ? 404 : 502;

@@ -37,8 +37,10 @@ type FieldErrors = {
   form?: string;
 };
 
+type UiSubscriber = Omit<Subscriber, "status"> & { status: string };
+
 type SubscriberDetail = {
-  subscriber?: Subscriber;
+  subscriber?: UiSubscriber;
   identities: SubscriberIdentity[];
   binding?: RegistrationBinding;
   error?: string;

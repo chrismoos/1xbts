@@ -134,6 +134,55 @@ export function numberPlanToJSON(object: NumberPlan): string {
   }
 }
 
+/**
+ * Subscriber account lifecycle state. Mirrors
+ * `cdma_hlr::model::SubscriberStatus`.
+ */
+export enum SubscriberStatus {
+  SUBSCRIBER_STATUS_UNSPECIFIED = 0,
+  SUBSCRIBER_STATUS_ACTIVE = 1,
+  SUBSCRIBER_STATUS_SUSPENDED = 2,
+  SUBSCRIBER_STATUS_DISABLED = 3,
+  UNRECOGNIZED = -1,
+}
+
+export function subscriberStatusFromJSON(object: any): SubscriberStatus {
+  switch (object) {
+    case 0:
+    case "SUBSCRIBER_STATUS_UNSPECIFIED":
+      return SubscriberStatus.SUBSCRIBER_STATUS_UNSPECIFIED;
+    case 1:
+    case "SUBSCRIBER_STATUS_ACTIVE":
+      return SubscriberStatus.SUBSCRIBER_STATUS_ACTIVE;
+    case 2:
+    case "SUBSCRIBER_STATUS_SUSPENDED":
+      return SubscriberStatus.SUBSCRIBER_STATUS_SUSPENDED;
+    case 3:
+    case "SUBSCRIBER_STATUS_DISABLED":
+      return SubscriberStatus.SUBSCRIBER_STATUS_DISABLED;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return SubscriberStatus.UNRECOGNIZED;
+  }
+}
+
+export function subscriberStatusToJSON(object: SubscriberStatus): string {
+  switch (object) {
+    case SubscriberStatus.SUBSCRIBER_STATUS_UNSPECIFIED:
+      return "SUBSCRIBER_STATUS_UNSPECIFIED";
+    case SubscriberStatus.SUBSCRIBER_STATUS_ACTIVE:
+      return "SUBSCRIBER_STATUS_ACTIVE";
+    case SubscriberStatus.SUBSCRIBER_STATUS_SUSPENDED:
+      return "SUBSCRIBER_STATUS_SUSPENDED";
+    case SubscriberStatus.SUBSCRIBER_STATUS_DISABLED:
+      return "SUBSCRIBER_STATUS_DISABLED";
+    case SubscriberStatus.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
 /** Subscriber account record managed by the HLR. */
 export interface Subscriber {
   /** UUID */
@@ -141,8 +190,7 @@ export interface Subscriber {
   /** one or more decimal digits */
   phoneNumber: string;
   displayName: string;
-  /** "active", "suspended", "disabled" */
-  status: string;
+  status: SubscriberStatus;
   createdAt: Date | undefined;
   updatedAt: Date | undefined;
   numberType: NumberType;
@@ -196,7 +244,7 @@ export interface UpsertSubscriberRequest {
   /** one or more decimal digits */
   phoneNumber: string;
   displayName: string;
-  status: string;
+  status: SubscriberStatus;
   /** Identity to attach */
   imsi?: string | undefined;
   esn?: number | undefined;
@@ -261,7 +309,14 @@ export interface GetSubscriberByPhoneNumberRequest {
 export interface GetSubscriberByPhoneNumberResponse {
   subscriber: Subscriber | undefined;
   identities: SubscriberIdentity[];
-  binding?: RegistrationBinding | undefined;
+  binding?:
+    | RegistrationBinding
+    | undefined;
+  /**
+   * The is_primary=true identity (if any). Surfaced directly so callers
+   * don't have to filter `identities` themselves.
+   */
+  primaryIdentity?: SubscriberIdentity | undefined;
 }
 
 /** Looks up a subscriber by UUID. */
@@ -273,7 +328,14 @@ export interface GetSubscriberRequest {
 export interface GetSubscriberResponse {
   subscriber: Subscriber | undefined;
   identities: SubscriberIdentity[];
-  binding?: RegistrationBinding | undefined;
+  binding?:
+    | RegistrationBinding
+    | undefined;
+  /**
+   * The is_primary=true identity (if any). Surfaced directly so callers
+   * don't have to filter `identities` themselves.
+   */
+  primaryIdentity?: SubscriberIdentity | undefined;
 }
 
 /** Resolves a mobile identity observed on the air interface to a subscriber. */
@@ -293,7 +355,15 @@ export interface ResolveSubscriberByIdentityRequest {
 /** Resolved subscriber and current registration binding, if any. */
 export interface ResolveSubscriberByIdentityResponse {
   subscriber?: Subscriber | undefined;
-  binding?: RegistrationBinding | undefined;
+  binding?:
+    | RegistrationBinding
+    | undefined;
+  /**
+   * The is_primary=true identity (if any). Surfaced directly so callers
+   * don't have to follow up with a separate
+   * `GetIdentitiesForSubscriber` RPC to find the canonical IMSI/ESN.
+   */
+  primaryIdentity?: SubscriberIdentity | undefined;
 }
 
 /** Creates or updates the serving-node registration binding for a subscriber. */
@@ -347,7 +417,7 @@ export interface UpdateSubscriberRequest {
   subscriberId: string;
   phoneNumber: string;
   displayName: string;
-  status: string;
+  status: SubscriberStatus;
   imsi?: string | undefined;
   esn?: number | undefined;
   numberType: NumberType;
@@ -415,7 +485,7 @@ function createBaseSubscriber(): Subscriber {
     subscriberId: "",
     phoneNumber: "",
     displayName: "",
-    status: "",
+    status: 0,
     createdAt: undefined,
     updatedAt: undefined,
     numberType: 0,
@@ -436,8 +506,8 @@ export const Subscriber: MessageFns<Subscriber> = {
     if (message.displayName !== "") {
       writer.uint32(26).string(message.displayName);
     }
-    if (message.status !== "") {
-      writer.uint32(34).string(message.status);
+    if (message.status !== 0) {
+      writer.uint32(32).int32(message.status);
     }
     if (message.createdAt !== undefined) {
       Timestamp.encode(toTimestamp(message.createdAt), writer.uint32(42).fork()).join();
@@ -492,11 +562,11 @@ export const Subscriber: MessageFns<Subscriber> = {
           continue;
         }
         case 4: {
-          if (tag !== 34) {
+          if (tag !== 32) {
             break;
           }
 
-          message.status = reader.string();
+          message.status = reader.int32() as any;
           continue;
         }
         case 5: {
@@ -573,7 +643,7 @@ export const Subscriber: MessageFns<Subscriber> = {
         : isSet(object.display_name)
         ? globalThis.String(object.display_name)
         : "",
-      status: isSet(object.status) ? globalThis.String(object.status) : "",
+      status: isSet(object.status) ? subscriberStatusFromJSON(object.status) : 0,
       createdAt: isSet(object.createdAt)
         ? fromJsonTimestamp(object.createdAt)
         : isSet(object.created_at)
@@ -618,8 +688,8 @@ export const Subscriber: MessageFns<Subscriber> = {
     if (message.displayName !== "") {
       obj.displayName = message.displayName;
     }
-    if (message.status !== "") {
-      obj.status = message.status;
+    if (message.status !== 0) {
+      obj.status = subscriberStatusToJSON(message.status);
     }
     if (message.createdAt !== undefined) {
       obj.createdAt = message.createdAt.toISOString();
@@ -650,7 +720,7 @@ export const Subscriber: MessageFns<Subscriber> = {
     message.subscriberId = object.subscriberId ?? "";
     message.phoneNumber = object.phoneNumber ?? "";
     message.displayName = object.displayName ?? "";
-    message.status = object.status ?? "";
+    message.status = object.status ?? 0;
     message.createdAt = object.createdAt ?? undefined;
     message.updatedAt = object.updatedAt ?? undefined;
     message.numberType = object.numberType ?? 0;
@@ -1190,15 +1260,7 @@ export const MobileSeenUpsert: MessageFns<MobileSeenUpsert> = {
 };
 
 function createBaseUpsertSubscriberRequest(): UpsertSubscriberRequest {
-  return {
-    phoneNumber: "",
-    displayName: "",
-    status: "",
-    imsi: undefined,
-    esn: undefined,
-    numberType: 0,
-    numberPlan: 0,
-  };
+  return { phoneNumber: "", displayName: "", status: 0, imsi: undefined, esn: undefined, numberType: 0, numberPlan: 0 };
 }
 
 export const UpsertSubscriberRequest: MessageFns<UpsertSubscriberRequest> = {
@@ -1209,8 +1271,8 @@ export const UpsertSubscriberRequest: MessageFns<UpsertSubscriberRequest> = {
     if (message.displayName !== "") {
       writer.uint32(18).string(message.displayName);
     }
-    if (message.status !== "") {
-      writer.uint32(26).string(message.status);
+    if (message.status !== 0) {
+      writer.uint32(24).int32(message.status);
     }
     if (message.imsi !== undefined) {
       writer.uint32(130).string(message.imsi);
@@ -1251,11 +1313,11 @@ export const UpsertSubscriberRequest: MessageFns<UpsertSubscriberRequest> = {
           continue;
         }
         case 3: {
-          if (tag !== 26) {
+          if (tag !== 24) {
             break;
           }
 
-          message.status = reader.string();
+          message.status = reader.int32() as any;
           continue;
         }
         case 16: {
@@ -1311,7 +1373,7 @@ export const UpsertSubscriberRequest: MessageFns<UpsertSubscriberRequest> = {
         : isSet(object.display_name)
         ? globalThis.String(object.display_name)
         : "",
-      status: isSet(object.status) ? globalThis.String(object.status) : "",
+      status: isSet(object.status) ? subscriberStatusFromJSON(object.status) : 0,
       imsi: isSet(object.imsi) ? globalThis.String(object.imsi) : undefined,
       esn: isSet(object.esn) ? globalThis.Number(object.esn) : undefined,
       numberType: isSet(object.numberType)
@@ -1335,8 +1397,8 @@ export const UpsertSubscriberRequest: MessageFns<UpsertSubscriberRequest> = {
     if (message.displayName !== "") {
       obj.displayName = message.displayName;
     }
-    if (message.status !== "") {
-      obj.status = message.status;
+    if (message.status !== 0) {
+      obj.status = subscriberStatusToJSON(message.status);
     }
     if (message.imsi !== undefined) {
       obj.imsi = message.imsi;
@@ -1360,7 +1422,7 @@ export const UpsertSubscriberRequest: MessageFns<UpsertSubscriberRequest> = {
     const message = createBaseUpsertSubscriberRequest();
     message.phoneNumber = object.phoneNumber ?? "";
     message.displayName = object.displayName ?? "";
-    message.status = object.status ?? "";
+    message.status = object.status ?? 0;
     message.imsi = object.imsi ?? undefined;
     message.esn = object.esn ?? undefined;
     message.numberType = object.numberType ?? 0;
@@ -2108,7 +2170,7 @@ export const GetSubscriberByPhoneNumberRequest: MessageFns<GetSubscriberByPhoneN
 };
 
 function createBaseGetSubscriberByPhoneNumberResponse(): GetSubscriberByPhoneNumberResponse {
-  return { subscriber: undefined, identities: [], binding: undefined };
+  return { subscriber: undefined, identities: [], binding: undefined, primaryIdentity: undefined };
 }
 
 export const GetSubscriberByPhoneNumberResponse: MessageFns<GetSubscriberByPhoneNumberResponse> = {
@@ -2121,6 +2183,9 @@ export const GetSubscriberByPhoneNumberResponse: MessageFns<GetSubscriberByPhone
     }
     if (message.binding !== undefined) {
       RegistrationBinding.encode(message.binding, writer.uint32(26).fork()).join();
+    }
+    if (message.primaryIdentity !== undefined) {
+      SubscriberIdentity.encode(message.primaryIdentity, writer.uint32(34).fork()).join();
     }
     return writer;
   },
@@ -2156,6 +2221,14 @@ export const GetSubscriberByPhoneNumberResponse: MessageFns<GetSubscriberByPhone
           message.binding = RegistrationBinding.decode(reader, reader.uint32());
           continue;
         }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.primaryIdentity = SubscriberIdentity.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -2172,6 +2245,11 @@ export const GetSubscriberByPhoneNumberResponse: MessageFns<GetSubscriberByPhone
         ? object.identities.map((e: any) => SubscriberIdentity.fromJSON(e))
         : [],
       binding: isSet(object.binding) ? RegistrationBinding.fromJSON(object.binding) : undefined,
+      primaryIdentity: isSet(object.primaryIdentity)
+        ? SubscriberIdentity.fromJSON(object.primaryIdentity)
+        : isSet(object.primary_identity)
+        ? SubscriberIdentity.fromJSON(object.primary_identity)
+        : undefined,
     };
   },
 
@@ -2185,6 +2263,9 @@ export const GetSubscriberByPhoneNumberResponse: MessageFns<GetSubscriberByPhone
     }
     if (message.binding !== undefined) {
       obj.binding = RegistrationBinding.toJSON(message.binding);
+    }
+    if (message.primaryIdentity !== undefined) {
+      obj.primaryIdentity = SubscriberIdentity.toJSON(message.primaryIdentity);
     }
     return obj;
   },
@@ -2200,6 +2281,9 @@ export const GetSubscriberByPhoneNumberResponse: MessageFns<GetSubscriberByPhone
     message.identities = object.identities?.map((e) => SubscriberIdentity.fromPartial(e)) || [];
     message.binding = (object.binding !== undefined && object.binding !== null)
       ? RegistrationBinding.fromPartial(object.binding)
+      : undefined;
+    message.primaryIdentity = (object.primaryIdentity !== undefined && object.primaryIdentity !== null)
+      ? SubscriberIdentity.fromPartial(object.primaryIdentity)
       : undefined;
     return message;
   },
@@ -2270,7 +2354,7 @@ export const GetSubscriberRequest: MessageFns<GetSubscriberRequest> = {
 };
 
 function createBaseGetSubscriberResponse(): GetSubscriberResponse {
-  return { subscriber: undefined, identities: [], binding: undefined };
+  return { subscriber: undefined, identities: [], binding: undefined, primaryIdentity: undefined };
 }
 
 export const GetSubscriberResponse: MessageFns<GetSubscriberResponse> = {
@@ -2283,6 +2367,9 @@ export const GetSubscriberResponse: MessageFns<GetSubscriberResponse> = {
     }
     if (message.binding !== undefined) {
       RegistrationBinding.encode(message.binding, writer.uint32(26).fork()).join();
+    }
+    if (message.primaryIdentity !== undefined) {
+      SubscriberIdentity.encode(message.primaryIdentity, writer.uint32(34).fork()).join();
     }
     return writer;
   },
@@ -2318,6 +2405,14 @@ export const GetSubscriberResponse: MessageFns<GetSubscriberResponse> = {
           message.binding = RegistrationBinding.decode(reader, reader.uint32());
           continue;
         }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.primaryIdentity = SubscriberIdentity.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -2334,6 +2429,11 @@ export const GetSubscriberResponse: MessageFns<GetSubscriberResponse> = {
         ? object.identities.map((e: any) => SubscriberIdentity.fromJSON(e))
         : [],
       binding: isSet(object.binding) ? RegistrationBinding.fromJSON(object.binding) : undefined,
+      primaryIdentity: isSet(object.primaryIdentity)
+        ? SubscriberIdentity.fromJSON(object.primaryIdentity)
+        : isSet(object.primary_identity)
+        ? SubscriberIdentity.fromJSON(object.primary_identity)
+        : undefined,
     };
   },
 
@@ -2347,6 +2447,9 @@ export const GetSubscriberResponse: MessageFns<GetSubscriberResponse> = {
     }
     if (message.binding !== undefined) {
       obj.binding = RegistrationBinding.toJSON(message.binding);
+    }
+    if (message.primaryIdentity !== undefined) {
+      obj.primaryIdentity = SubscriberIdentity.toJSON(message.primaryIdentity);
     }
     return obj;
   },
@@ -2362,6 +2465,9 @@ export const GetSubscriberResponse: MessageFns<GetSubscriberResponse> = {
     message.identities = object.identities?.map((e) => SubscriberIdentity.fromPartial(e)) || [];
     message.binding = (object.binding !== undefined && object.binding !== null)
       ? RegistrationBinding.fromPartial(object.binding)
+      : undefined;
+    message.primaryIdentity = (object.primaryIdentity !== undefined && object.primaryIdentity !== null)
+      ? SubscriberIdentity.fromPartial(object.primaryIdentity)
       : undefined;
     return message;
   },
@@ -2484,7 +2590,7 @@ export const ResolveSubscriberByIdentityRequest: MessageFns<ResolveSubscriberByI
 };
 
 function createBaseResolveSubscriberByIdentityResponse(): ResolveSubscriberByIdentityResponse {
-  return { subscriber: undefined, binding: undefined };
+  return { subscriber: undefined, binding: undefined, primaryIdentity: undefined };
 }
 
 export const ResolveSubscriberByIdentityResponse: MessageFns<ResolveSubscriberByIdentityResponse> = {
@@ -2494,6 +2600,9 @@ export const ResolveSubscriberByIdentityResponse: MessageFns<ResolveSubscriberBy
     }
     if (message.binding !== undefined) {
       RegistrationBinding.encode(message.binding, writer.uint32(18).fork()).join();
+    }
+    if (message.primaryIdentity !== undefined) {
+      SubscriberIdentity.encode(message.primaryIdentity, writer.uint32(26).fork()).join();
     }
     return writer;
   },
@@ -2521,6 +2630,14 @@ export const ResolveSubscriberByIdentityResponse: MessageFns<ResolveSubscriberBy
           message.binding = RegistrationBinding.decode(reader, reader.uint32());
           continue;
         }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.primaryIdentity = SubscriberIdentity.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -2534,6 +2651,11 @@ export const ResolveSubscriberByIdentityResponse: MessageFns<ResolveSubscriberBy
     return {
       subscriber: isSet(object.subscriber) ? Subscriber.fromJSON(object.subscriber) : undefined,
       binding: isSet(object.binding) ? RegistrationBinding.fromJSON(object.binding) : undefined,
+      primaryIdentity: isSet(object.primaryIdentity)
+        ? SubscriberIdentity.fromJSON(object.primaryIdentity)
+        : isSet(object.primary_identity)
+        ? SubscriberIdentity.fromJSON(object.primary_identity)
+        : undefined,
     };
   },
 
@@ -2544,6 +2666,9 @@ export const ResolveSubscriberByIdentityResponse: MessageFns<ResolveSubscriberBy
     }
     if (message.binding !== undefined) {
       obj.binding = RegistrationBinding.toJSON(message.binding);
+    }
+    if (message.primaryIdentity !== undefined) {
+      obj.primaryIdentity = SubscriberIdentity.toJSON(message.primaryIdentity);
     }
     return obj;
   },
@@ -2558,6 +2683,9 @@ export const ResolveSubscriberByIdentityResponse: MessageFns<ResolveSubscriberBy
       : undefined;
     message.binding = (object.binding !== undefined && object.binding !== null)
       ? RegistrationBinding.fromPartial(object.binding)
+      : undefined;
+    message.primaryIdentity = (object.primaryIdentity !== undefined && object.primaryIdentity !== null)
+      ? SubscriberIdentity.fromPartial(object.primaryIdentity)
       : undefined;
     return message;
   },
@@ -3208,7 +3336,7 @@ function createBaseUpdateSubscriberRequest(): UpdateSubscriberRequest {
     subscriberId: "",
     phoneNumber: "",
     displayName: "",
-    status: "",
+    status: 0,
     imsi: undefined,
     esn: undefined,
     numberType: 0,
@@ -3227,8 +3355,8 @@ export const UpdateSubscriberRequest: MessageFns<UpdateSubscriberRequest> = {
     if (message.displayName !== "") {
       writer.uint32(26).string(message.displayName);
     }
-    if (message.status !== "") {
-      writer.uint32(34).string(message.status);
+    if (message.status !== 0) {
+      writer.uint32(32).int32(message.status);
     }
     if (message.imsi !== undefined) {
       writer.uint32(130).string(message.imsi);
@@ -3277,11 +3405,11 @@ export const UpdateSubscriberRequest: MessageFns<UpdateSubscriberRequest> = {
           continue;
         }
         case 4: {
-          if (tag !== 34) {
+          if (tag !== 32) {
             break;
           }
 
-          message.status = reader.string();
+          message.status = reader.int32() as any;
           continue;
         }
         case 16: {
@@ -3342,7 +3470,7 @@ export const UpdateSubscriberRequest: MessageFns<UpdateSubscriberRequest> = {
         : isSet(object.display_name)
         ? globalThis.String(object.display_name)
         : "",
-      status: isSet(object.status) ? globalThis.String(object.status) : "",
+      status: isSet(object.status) ? subscriberStatusFromJSON(object.status) : 0,
       imsi: isSet(object.imsi) ? globalThis.String(object.imsi) : undefined,
       esn: isSet(object.esn) ? globalThis.Number(object.esn) : undefined,
       numberType: isSet(object.numberType)
@@ -3369,8 +3497,8 @@ export const UpdateSubscriberRequest: MessageFns<UpdateSubscriberRequest> = {
     if (message.displayName !== "") {
       obj.displayName = message.displayName;
     }
-    if (message.status !== "") {
-      obj.status = message.status;
+    if (message.status !== 0) {
+      obj.status = subscriberStatusToJSON(message.status);
     }
     if (message.imsi !== undefined) {
       obj.imsi = message.imsi;
@@ -3395,7 +3523,7 @@ export const UpdateSubscriberRequest: MessageFns<UpdateSubscriberRequest> = {
     message.subscriberId = object.subscriberId ?? "";
     message.phoneNumber = object.phoneNumber ?? "";
     message.displayName = object.displayName ?? "";
-    message.status = object.status ?? "";
+    message.status = object.status ?? 0;
     message.imsi = object.imsi ?? undefined;
     message.esn = object.esn ?? undefined;
     message.numberType = object.numberType ?? 0;

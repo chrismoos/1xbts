@@ -1,4 +1,8 @@
-import { NumberPlan, NumberType } from "@/lib/proto/hlr/v1/service";
+import {
+  NumberPlan,
+  NumberType,
+  SubscriberStatus,
+} from "@/lib/proto/hlr/v1/service";
 
 export const NUMBER_TYPE_OPTIONS: { value: NumberType; label: string }[] = [
   { value: NumberType.NUMBER_TYPE_NETWORK_SPECIFIC, label: "Network specific" },
@@ -42,4 +46,36 @@ export function normalizeNumberPlan(value: NumberPlan | undefined | null): Numbe
     return DEFAULT_NUMBER_PLAN;
   }
   return value;
+}
+
+export type SubscriberStatusLabel = "active" | "suspended" | "disabled";
+
+export function parseSubscriberStatus(value: unknown): SubscriberStatus {
+  if (typeof value === "number") {
+    return value as SubscriberStatus;
+  }
+  if (typeof value === "string") {
+    switch (value.toLowerCase()) {
+      case "active":
+        return SubscriberStatus.SUBSCRIBER_STATUS_ACTIVE;
+      case "suspended":
+        return SubscriberStatus.SUBSCRIBER_STATUS_SUSPENDED;
+      case "disabled":
+        return SubscriberStatus.SUBSCRIBER_STATUS_DISABLED;
+    }
+  }
+  return SubscriberStatus.SUBSCRIBER_STATUS_ACTIVE;
+}
+
+export function subscriberStatusLabel(
+  value: SubscriberStatus | undefined | null
+): SubscriberStatusLabel {
+  switch (value) {
+    case SubscriberStatus.SUBSCRIBER_STATUS_SUSPENDED:
+      return "suspended";
+    case SubscriberStatus.SUBSCRIBER_STATUS_DISABLED:
+      return "disabled";
+    default:
+      return "active";
+  }
 }

@@ -1,10 +1,20 @@
 import { getHlrClient, waitForHlrReady } from "@/lib/grpc/hlr-client";
-import { NumberPlan, NumberType } from "@/lib/proto/hlr/v1/service";
+import {
+  NumberPlan,
+  NumberType,
+  Subscriber,
+} from "@/lib/proto/hlr/v1/service";
 import {
   DEFAULT_NUMBER_PLAN,
   DEFAULT_NUMBER_TYPE,
+  parseSubscriberStatus,
+  subscriberStatusLabel,
 } from "@/lib/subscriber-options";
 import { validateImsi, validatePhoneNumber } from "@/lib/validation";
+
+function withStatusLabel(subscriber: Subscriber) {
+  return { ...subscriber, status: subscriberStatusLabel(subscriber.status) };
+}
 
 export const dynamic = "force-dynamic";
 
@@ -38,7 +48,7 @@ export async function GET() {
       { signal: abort.signal }
     );
     return Response.json({
-      subscribers: result.subscribers,
+      subscribers: result.subscribers.map(withStatusLabel),
       total: result.total,
     });
   } catch (err) {
@@ -75,7 +85,7 @@ export async function POST(request: Request) {
       {
         phoneNumber,
         displayName: asString(body.displayName),
-        status: asString(body.status) || "active",
+        status: parseSubscriberStatus(body.status),
         imsi: imsi || undefined,
         esn: body.esn != null ? Number(body.esn) : undefined,
         numberType: coerceNumberType(body.numberType),
@@ -83,7 +93,11 @@ export async function POST(request: Request) {
       },
       { signal: abort.signal }
     );
-    return Response.json(result);
+    return Response.json(
+      result.subscriber
+        ? { ...result, subscriber: withStatusLabel(result.subscriber) }
+        : result
+    );
   } catch (err) {
     const msg = err instanceof Error ? err.message : "unknown error";
     return Response.json({ error: msg }, { status: 502 });
