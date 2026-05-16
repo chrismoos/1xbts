@@ -887,7 +887,7 @@ impl Bsc {
 /// Pull a Calling Party Number record (`record_type = 0x03`) out of the
 /// IOS-A.S0014-D §4.2.55 MS Information Records IE. Per the spec the BS
 /// transparently re-emits these bytes inside the AWIM SDU on the F-TCH,
-/// so we just decode the C.S0005-E §3.7.5.10 content and stash it.
+/// so we just decode the C.S0005-E §3.7.5.3 content and stash it.
 fn extract_calling_party_number_record(
     records: &cdma_ios::MsInformationRecords,
 ) -> Option<CallingPartyNumberRecord> {

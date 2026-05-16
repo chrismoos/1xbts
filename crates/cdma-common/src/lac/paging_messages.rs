@@ -3544,10 +3544,11 @@ impl InfoRecordType {
 /// - SIGNAL (6 bits): specific signal pattern
 /// - RESERVED (6 bits): padding
 ///
-/// Calling Party Number information record per C.S0005-E 3.7.5.10.
+/// Calling Party Number information record per C.S0005-E 3.7.5.3.
 ///
-/// Encodes: NUMBER_TYPE(3) + NUMBER_PLAN(4) + PI(2) + SI(2) + NUMBER_LEN(8)
-/// + CHARi(8) × NUMBER_LEN.  Per Table 3.7.5.10-1.
+/// Encodes: NUMBER_TYPE(3) + NUMBER_PLAN(4) + PI(2) + SI(2)
+/// + CHARi(8) × digits + RESERVED(5). The outer RECORD_LEN identifies
+/// the number of octets in this type-specific payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallingPartyNumberRecord {
     /// 3-bit number type per ANSI T1.607: 0=unknown, 1=international,
@@ -3567,58 +3568,36 @@ pub struct CallingPartyNumberRecord {
 
 impl CallingPartyNumberRecord {
     /// Encode the record content (everything after RECORD_TYPE/RECORD_LEN)
-    /// per C.S0005-E 3.7.5.10 Table 3.7.5.10-1, padded to a whole number
+    /// per C.S0005-E 3.7.5.3, padded to a whole number
     /// of octets. The returned `Vec<u8>` is the value carried inside the
     /// IOS A.S0014-D `MS Information Records` IE (§4.2.55) for a record
     /// whose Information Record Type field is `0x03`.
     pub fn encode_content_bytes(&self) -> Vec<u8> {
-        let mut bs = Bitstream::new();
-        let num_len = self.digits.len();
-        bs.write_u8(self.number_type, 3);
-        bs.write_u8(self.number_plan, 4);
-        bs.write_u8(self.presentation_indicator, 2);
-        bs.write_u8(self.screening_indicator, 2);
-        bs.write_u8(num_len as u8, 8);
-        for &ch in self.digits.as_bytes() {
-            bs.write_u8(ch, 8);
-        }
-        let payload_bits = 19 + 8 * num_len;
-        let octets = payload_bits.div_ceil(8);
-        let pad_bits = octets * 8 - payload_bits;
-        if pad_bits > 0 {
-            bs.write_u8(0, pad_bits);
-        }
-        bs.to_packed_bytes()
+        InformationRecord::party_number(
+            InfoRecordType::CallingPartyNumber,
+            PartyNumberRecord {
+                number_type: self.number_type,
+                number_plan: self.number_plan,
+                presentation_indicator: Some(self.presentation_indicator),
+                screening_indicator: Some(self.screening_indicator),
+                redirection_reason: None,
+                digits: self.digits.clone(),
+            },
+        )
+        .data
     }
 
     /// Decode the record content (everything after RECORD_TYPE/RECORD_LEN).
     /// Mirror of `encode_content_bytes`.
     pub fn decode_content_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
-        if bytes.len() < 3 {
-            return Err("Calling Party Number record too short");
-        }
-        let b0 = bytes[0];
-        let b1 = bytes[1];
-        let number_type = b0 >> 5;
-        let number_plan = (b0 >> 1) & 0x0F;
-        let presentation_indicator = ((b0 & 0x01) << 1) | (b1 >> 7);
-        let screening_indicator = (b1 >> 5) & 0x03;
-        let num_len = (((b1 & 0x1F) as usize) << 3) | ((bytes[2] >> 5) as usize);
-        if bytes.len() < 3 + num_len {
-            return Err("Calling Party Number record digits truncated");
-        }
-        let mut digits = String::with_capacity(num_len);
-        for i in 0..num_len {
-            let hi = bytes[2 + i] & 0x1F;
-            let lo = bytes[3 + i] >> 5;
-            digits.push((((hi as u8) << 3) | (lo as u8)) as char);
-        }
+        let record = decode_party_number_record(InfoRecordType::CallingPartyNumber, bytes)
+            .map_err(|_| "invalid Calling Party Number record")?;
         Ok(Self {
-            number_type,
-            number_plan,
-            presentation_indicator,
-            screening_indicator,
-            digits,
+            number_type: record.number_type,
+            number_plan: record.number_plan,
+            presentation_indicator: record.presentation_indicator.unwrap_or(0),
+            screening_indicator: record.screening_indicator.unwrap_or(0),
+            digits: record.digits,
         })
     }
 }
@@ -3723,6 +3702,18 @@ mod calling_party_number_codec_tests {
         let bytes = rec.encode_content_bytes();
         let decoded = CallingPartyNumberRecord::decode_content_bytes(&bytes).unwrap();
         assert_eq!(decoded, rec);
+    }
+
+    #[test]
+    fn encodes_spec_payload_without_number_length_field() {
+        let rec = CallingPartyNumberRecord {
+            number_type: 1,
+            number_plan: 1,
+            presentation_indicator: 0,
+            screening_indicator: 3,
+            digits: "1".to_string(),
+        };
+        assert_eq!(rec.encode_content_bytes(), vec![0x22, 0x66, 0x20]);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 // On-air NUMBER_TYPE / NUMBER_PLAN wire values per ANSI T1.607
-// (carried in C.S0005-E §3.7.5.10 Calling Party Number records and in
+// (carried in C.S0005-E §3.7.5.3 Calling Party Number records and in
 // C.S0005-E §2.7.1.3.2.4 Origination messages).
 
 export function numberTypeName(value: number | null | undefined): string | null {

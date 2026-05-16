@@ -1200,7 +1200,7 @@ impl Bsc {
     }
 
     pub(crate) fn format_origination_digits(&self, msg: &OriginationMessage) -> String {
-        format_dtmf_digits(&msg.digits, msg.digit_mode)
+        normalize_origination_called_number(&format_dtmf_digits(&msg.digits, msg.digit_mode))
     }
 
     /// Resolve subscriber identity via HLR and update the mobile's phone_number
@@ -1403,5 +1403,33 @@ impl Bsc {
             self.restore_pending_page(pending);
         }
         true
+    }
+}
+
+fn normalize_origination_called_number(digits: &str) -> String {
+    digits
+        .strip_prefix("011")
+        .filter(|rest| !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()))
+        .map(|rest| format!("+{rest}"))
+        .unwrap_or_else(|| digits.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_origination_called_number;
+
+    #[test]
+    fn callback_international_access_prefix_becomes_international_number() {
+        assert_eq!(
+            normalize_origination_called_number("01112125550123"),
+            "+12125550123"
+        );
+    }
+
+    #[test]
+    fn leaves_local_and_service_digits_unchanged() {
+        assert_eq!(normalize_origination_called_number("5551234"), "5551234");
+        assert_eq!(normalize_origination_called_number("#777"), "#777");
+        assert_eq!(normalize_origination_called_number("011"), "011");
     }
 }

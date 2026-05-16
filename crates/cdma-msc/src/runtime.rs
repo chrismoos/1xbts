@@ -1407,13 +1407,15 @@ fn decode_cm_service_request(
 }
 
 fn cm_service_request_called_number(request: &cdma_ios::CmServiceRequestMessage) -> Option<String> {
-    decode_called_party_bcd_number(request.called_party_bcd_number.as_ref()).or_else(|| {
-        request
-            .called_party_ascii_number
-            .as_ref()
-            .and_then(|number| String::from_utf8(number.0.clone()).ok())
-            .filter(|number| !number.is_empty())
-    })
+    decode_called_party_bcd_number(request.called_party_bcd_number.as_ref())
+        .or_else(|| {
+            request
+                .called_party_ascii_number
+                .as_ref()
+                .and_then(|number| String::from_utf8(number.0.clone()).ok())
+                .filter(|number| !number.is_empty())
+        })
+        .map(|number| normalize_mo_called_number_for_routing(&number))
 }
 
 fn decode_called_party_bcd_number(
@@ -1443,6 +1445,17 @@ fn decode_called_party_bcd_number(
         }
     }
     (!digits.is_empty()).then_some(digits)
+}
+
+fn normalize_mo_called_number_for_routing(number: &str) -> String {
+    if let Some(rest) = number
+        .strip_prefix('+')
+        .or_else(|| number.strip_prefix("011"))
+        .filter(|rest| !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return rest.to_string();
+    }
+    number.to_string()
 }
 
 pub(crate) fn select_pageable_imsi<'a>(
@@ -1949,6 +1962,52 @@ mod tests {
             cm_service_request_called_number(&request).as_deref(),
             Some("555998")
         );
+    }
+
+    #[test]
+    fn cm_service_request_called_number_canonicalizes_international_bcd() {
+        let request = cdma_ios::CmServiceRequestMessage {
+            cm_service_type: cdma_ios::CmServiceType::MobileOriginatingCallEstablishment,
+            classmark_information_type_2: cdma_ios::ClassmarkInformationType2(vec![
+                0xc1, 0x00, 0x66, 0x00,
+            ]),
+            mobile_identity_imsi: MobileIdentity::Imsi("12345678901".to_string()),
+            called_party_bcd_number: Some(cdma_ios::CalledPartyBcdNumber(vec![
+                0x91, 0x21, 0x21, 0x55, 0x05, 0x21, 0xf3,
+            ])),
+            tag: None,
+            mobile_identity_esn: None,
+            slot_cycle_index: None,
+            authentication_response_parameter: None,
+            authentication_confirmation_parameter: None,
+            authentication_parameter_count: None,
+            authentication_challenge_parameter: None,
+            service_option: Some(ServiceOption::EVRC_A),
+            voice_privacy_request: false,
+            radio_environment_and_resources: None,
+            called_party_ascii_number: None,
+            circuit_identity_code: None,
+            authentication_event: None,
+            authentication_data: None,
+            paca_reorigination_indicator: false,
+            user_zone_id: None,
+            is2000_mobile_capabilities: None,
+            cdma_serving_one_way_delay: None,
+        };
+
+        assert_eq!(
+            cm_service_request_called_number(&request).as_deref(),
+            Some("12125550123")
+        );
+    }
+
+    #[test]
+    fn mo_called_number_strips_international_access_prefix_for_routing() {
+        assert_eq!(
+            normalize_mo_called_number_for_routing("01112125550123"),
+            "12125550123"
+        );
+        assert_eq!(normalize_mo_called_number_for_routing("5551234"), "5551234");
     }
 
     /// Minimal shim wrapping InProcessMscEndpoint as MscA1Endpoint for tests.

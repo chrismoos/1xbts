@@ -57,7 +57,7 @@ pub(crate) struct VoiceCallSession {
     pub(crate) service_option: u16,
     pub(crate) caller: Option<VoiceCallParty>,
     pub(crate) callee: Option<VoiceCallParty>,
-    /// AWIM Calling Party Number information record (C.S0005-E 3.7.5.10)
+    /// AWIM Calling Party Number information record (C.S0005-E 3.7.5.3)
     /// supplied by the MSC inside the A1 MS Information Records IE. Emitted
     /// verbatim in the AWIM SDU on F-TCH alerting.
     pub(crate) calling_party_record: Option<CallingPartyNumberRecord>,

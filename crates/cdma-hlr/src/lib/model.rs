@@ -30,7 +30,7 @@ pub struct Subscriber {
     pub ringtone_duration_ms: Option<u64>,
 }
 
-/// AWIM Calling Party Number Type per C.S0005-E 3.7.5.10 / ANSI T1.607.
+/// AWIM Calling Party Number Type per C.S0005-E 3.7.5.3 / ANSI T1.607.
 /// `to_wire()` returns the 3-bit on-air value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
 #[sqlx(type_name = "number_type", rename_all = "snake_case")]
@@ -62,7 +62,7 @@ impl Default for NumberType {
     }
 }
 
-/// AWIM Calling Party Numbering Plan per C.S0005-E 3.7.5.10 / ANSI T1.607.
+/// AWIM Calling Party Numbering Plan per C.S0005-E 3.7.5.3 / ANSI T1.607.
 /// `to_wire()` returns the 4-bit on-air value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
 #[sqlx(type_name = "number_plan", rename_all = "snake_case")]

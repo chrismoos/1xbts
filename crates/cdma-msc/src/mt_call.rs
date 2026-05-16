@@ -199,7 +199,7 @@ impl MtCallService {
 }
 
 /// Build the A1 MS Information Records IE (IOS-A.S0014-D §4.2.55) carrying
-/// the AWIM Calling Party Number record (C.S0005-E §3.7.5.10). If the caller
+/// the AWIM Calling Party Number record (C.S0005-E §3.7.5.3). If the caller
 /// has a subscriber row in HLR, use their configured NUMBER_TYPE /
 /// NUMBER_PLAN; otherwise fall back to network-specific / ISDN-E.164.
 async fn build_calling_party_ms_information_records(
@@ -207,23 +207,28 @@ async fn build_calling_party_ms_information_records(
     hlr_repo: &Arc<dyn HlrRepository>,
 ) -> Option<MsInformationRecords> {
     const CALLING_PARTY_NUMBER_RECORD_TYPE: u8 = 0x03;
-    let digits = caller_number?.to_string();
+    let digits: String = caller_number?
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .take(15)
+        .collect();
     if digits.is_empty() {
         return None;
     }
-    let (number_type, number_plan) = match hlr_repo.get_subscriber_by_phone_number(&digits).await {
-        Ok(Some(r)) => (r.subscriber.number_type, r.subscriber.number_plan),
-        Ok(None) => Default::default(),
-        Err(e) => {
-            warn!("MSC: HLR lookup for AWIM caller {:?} failed: {}", digits, e);
-            Default::default()
-        }
-    };
+    let (number_type, number_plan, screening_indicator) =
+        match hlr_repo.get_subscriber_by_phone_number(&digits).await {
+            Ok(Some(r)) => (r.subscriber.number_type, r.subscriber.number_plan, 3),
+            Ok(None) => (Default::default(), Default::default(), 1),
+            Err(e) => {
+                warn!("MSC: HLR lookup for AWIM caller {:?} failed: {}", digits, e);
+                (Default::default(), Default::default(), 1)
+            }
+        };
     let record = CallingPartyNumberRecord {
         number_type: number_type.to_wire(),
         number_plan: number_plan.to_wire(),
         presentation_indicator: 0,
-        screening_indicator: 1,
+        screening_indicator,
         digits,
     };
     Some(MsInformationRecords {
