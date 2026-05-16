@@ -2,6 +2,7 @@
 
 use cdma_bts::lac as bts_lac;
 use cdma_common::channel::TrafficRate;
+use cdma_common::consts::SERVICE_OPTION_HIGH_RATE_PACKET_DATA;
 use cdma_common::error::Error;
 use cdma_common::lac::{
     MessageControlStatusBlock,
@@ -29,6 +30,9 @@ use super::{
 };
 
 const FSCH_ESCAM_START_DELAY_FRAMES: u64 = 12;
+// C.S0017-0-2.10 RLP Type 3 BLOB:
+// type=1, version=3, RTT=0 (perform SYNC), INIT_VAR=1, NAK rounds 3/3, one NAK per round.
+const SO33_RLP3_SYNC_BLOB: [u8; 5] = [0x2c, 0x2d, 0x92, 0x49, 0x20];
 
 pub(crate) fn fsch_escam_start_time_mod32() -> u8 {
     let start = cdma_common::time::system_time_now()
@@ -49,6 +53,14 @@ pub(crate) enum ForwardSignalingRoute {
 pub(crate) fn voice_service_option_for_channel(tc: &super::TrafficChannelInfo) -> Option<u16> {
     tc.voice_service_option
         .or_else(|| VoiceCodec::from_service_option(tc.service_option).map(|_| tc.service_option))
+}
+
+fn rlp_blob_for_service_option(service_option: u16) -> Option<Vec<u8>> {
+    if service_option == SERVICE_OPTION_HIGH_RATE_PACKET_DATA {
+        Some(SO33_RLP3_SYNC_BLOB.to_vec())
+    } else {
+        None
+    }
 }
 
 impl Bsc {
@@ -76,6 +88,7 @@ impl Bsc {
             }
         }
         let mut connections = Vec::new();
+        let rlp_blob = rlp_blob_for_service_option(tc.service_option);
         connections.push(ServiceConnectConnectionRecord {
             con_ref: 0,
             service_option: tc.service_option,
@@ -83,8 +96,8 @@ impl Bsc {
             rev_traffic: 1,
             ui_encrypt_mode: 0,
             sr_id: tc.service_ref_id,
-            rlp_info_incl: false,
-            rlp_blob: None,
+            rlp_info_incl: rlp_blob.is_some(),
+            rlp_blob,
             qos_parms: None,
         });
 

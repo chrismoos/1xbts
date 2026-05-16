@@ -56,11 +56,18 @@ struct PreparedFrameRc3 {
     rate: TrafficRate,
     next_pcg: usize,
     frame_start_chip: u64,
+    is_queued: bool,
 }
 
 struct TxState {
     symbol_buffer: VecDeque<Complex32>,
     prepared_frame: Option<PreparedFrameRc3>,
+}
+
+/// Frame prep state.
+struct PrepEngineRc3 {
+    encoder: Encoder<9, 4>,
+    interleaver: ForwardBackwardsBitReversalInterleaver,
 }
 
 /// A frame to be transmitted on the forward traffic channel.
@@ -129,8 +136,9 @@ pub struct ConfigRc3 {
 pub struct ForwardTrafficChannelRc3 {
     config: Mutex<ConfigRc3>,
     tx_state: Mutex<TxState>,
-    frames: Mutex<VecDeque<TrafficFrameRc3>>,
-    signaling_frames: Mutex<VecDeque<TrafficFrameRc3>>,
+    prep: Mutex<PrepEngineRc3>,
+    frames: Mutex<VecDeque<PreparedFrameRc3>>,
+    signaling_frames: Mutex<VecDeque<PreparedFrameRc3>>,
     queue_diag: Mutex<QueueDiagState>,
     /// Timestamp of the last frame enqueued via `send_frame`.
     last_enqueue_at: Mutex<Option<std::time::Instant>>,
@@ -229,12 +237,17 @@ fn puncture_rc3(symbols: &[u8], rate: TrafficRate) -> Vec<u8> {
 impl ForwardTrafficChannelRc3 {
     pub fn new(config: ConfigRc3) -> Self {
         let pcb_scheduler = config.pcb_scheduler.clone();
+        let prep = PrepEngineRc3 {
+            encoder: config.encoder,
+            interleaver: config.interleaver.clone(),
+        };
         ForwardTrafficChannelRc3 {
             config: Mutex::new(config),
             tx_state: Mutex::new(TxState {
                 symbol_buffer: VecDeque::new(),
                 prepared_frame: None,
             }),
+            prep: Mutex::new(prep),
             frames: Mutex::new(VecDeque::new()),
             signaling_frames: Mutex::new(VecDeque::new()),
             queue_diag: Mutex::new(QueueDiagState {
@@ -251,19 +264,63 @@ impl ForwardTrafficChannelRc3 {
         }
     }
 
-    /// Queue a frame for transmission.
+    /// Queue a traffic frame for transmission.
     pub fn send_frame(&self, frame: TrafficFrameRc3) {
-        self.frames.lock().push_back(frame);
+        let prepared = {
+            let mut prep = self.prep.lock();
+            Self::prepare_frame_static(&mut prep, &frame.data, frame.rate, true)
+        };
+        self.frames.lock().push_back(prepared);
         *self.last_enqueue_at.lock() = Some(std::time::Instant::now());
     }
 
     /// Queue a signaling frame for transmission before any queued voice frames.
     pub fn send_signaling_bits(&self, bits: Vec<u8>) {
-        self.signaling_frames.lock().push_back(TrafficFrameRc3 {
-            data: bits,
-            rate: TrafficRate::Full,
-        });
+        let prepared = {
+            let mut prep = self.prep.lock();
+            Self::prepare_frame_static(&mut prep, &bits, TrafficRate::Full, true)
+        };
+        self.signaling_frames.lock().push_back(prepared);
         *self.last_enqueue_at.lock() = Some(std::time::Instant::now());
+    }
+
+    fn prepare_frame_static(
+        prep: &mut PrepEngineRc3,
+        data: &[u8],
+        rate: TrafficRate,
+        is_queued: bool,
+    ) -> PreparedFrameRc3 {
+        let frame_data = build_frame_bits_rc3(data, rate);
+
+        prep.encoder.reset();
+        let mut encoded = Vec::with_capacity(frame_data.len() * 4);
+        for &bit in &frame_data {
+            for &sym in prep.encoder.encode(bit).iter() {
+                encoded.push(sym);
+            }
+        }
+
+        let repeat_factor = rate.rc3_repeat_factor();
+        let repeated = if repeat_factor > 1 {
+            let mut rep = SymbolRepetition::new(repeat_factor);
+            for &sym in &encoded {
+                rep.feed(sym);
+            }
+            rep.take_all()
+        } else {
+            encoded
+        };
+
+        let punctured = puncture_rc3(&repeated, rate);
+        assert_eq!(punctured.len(), MOD_SYMBOLS_PER_FRAME);
+        let interleaved = prep.interleaver.encode(&punctured);
+        PreparedFrameRc3 {
+            interleaved,
+            rate,
+            next_pcg: 0,
+            frame_start_chip: 0,
+            is_queued,
+        }
     }
 
     /// Returns the timestamp of the last frame enqueued, if any.
@@ -292,6 +349,12 @@ impl ForwardTrafficChannelRc3 {
         self.pcb_scheduler.lock().schedule(abs_pcg, bit);
     }
 
+    pub fn schedule_power_control_burst(&self, start_abs_pcg: u64, pcgs: u64, bit: u8) {
+        self.pcb_scheduler
+            .lock()
+            .schedule_burst(start_abs_pcg, pcgs, bit);
+    }
+
     /// Seed both long-code generators for this channel at the given CDMA
     /// system chip position and align the carry-in Q-lane scrambling chip.
     ///
@@ -318,37 +381,11 @@ impl ForwardTrafficChannelRc3 {
         config.lc_chip_cursor = chip;
     }
 
-    fn pop_next_frame(&self) -> (Vec<u8>, TrafficRate, bool) {
-        if let Some(f) = self.signaling_frames.lock().pop_front() {
-            log::debug!(
-                "tx_ftch_rc3: signaling frame queued, rate={:?}, data_len={}, first_bytes={:?}",
-                f.rate,
-                f.data.len(),
-                &f.data[..f.data.len().min(16)]
-            );
-            return (f.data, f.rate, true);
-        }
-
-        match self.frames.lock().pop_front() {
-            Some(f) => {
-                log::debug!(
-                    "tx_ftch_rc3: traffic frame queued, rate={:?}, data_len={}, first_bytes={:?}",
-                    f.rate,
-                    f.data.len(),
-                    &f.data[..f.data.len().min(16)]
-                );
-                (f.data, f.rate, true)
-            }
-            None => {
-                // Null traffic MuxPDU: lowest negotiated rate with all bits = 1
-                // per C.S0003-E Section 2.2.1.1.1.3.1.1.
-                (
-                    vec![1u8; TrafficRate::Eighth.info_bits()],
-                    TrafficRate::Eighth,
-                    false,
-                )
-            }
-        }
+    fn pop_next_frame(&self) -> Option<PreparedFrameRc3> {
+        self.signaling_frames
+            .lock()
+            .pop_front()
+            .or_else(|| self.frames.lock().pop_front())
     }
 
     fn note_frame_source(&self, is_queued: bool, rate: TrafficRate, frame_start_chip: u64) {
@@ -412,65 +449,46 @@ impl ForwardTrafficChannelRc3 {
         }
     }
 
-    fn prepare_frame(
-        &self,
-        config: &mut ConfigRc3,
-        data: Vec<u8>,
-        rate: TrafficRate,
-        is_queued: bool,
-    ) -> PreparedFrameRc3 {
-        // Step 1: Build complete frame (info + FQI + tail)
+    /// Build an inline null traffic MuxPDU.
+    fn build_null_frame(config: &mut ConfigRc3) -> PreparedFrameRc3 {
+        let data = vec![1u8; TrafficRate::Eighth.info_bits()];
+        let rate = TrafficRate::Eighth;
         let frame_data = build_frame_bits_rc3(&data, rate);
-        let frame_start_chip = config.lc_chip_cursor;
-        self.note_frame_source(is_queued, rate, frame_start_chip);
-        let frame_bits = frame_data.len();
 
-        // Step 2: Convolutional encode (R=1/4, K=9) — each bit → 4 symbols
         config.encoder.reset();
-        let mut encoded = Vec::with_capacity(frame_bits * 4);
+        let mut encoded = Vec::with_capacity(frame_data.len() * 4);
         for &bit in &frame_data {
             for &sym in config.encoder.encode(bit).iter() {
                 encoded.push(sym);
             }
         }
 
-        // Step 3: Symbol repetition (rate-dependent)
-        let repeat_factor = rate.rc3_repeat_factor();
-        let repeated = if repeat_factor > 1 {
-            let mut rep = SymbolRepetition::new(repeat_factor);
-            for &sym in &encoded {
-                rep.feed(sym);
-            }
-            rep.take_all()
-        } else {
-            encoded
-        };
-
-        // Step 4: Puncture to 768 modulation symbols
+        let mut rep = SymbolRepetition::new(rate.rc3_repeat_factor());
+        for &sym in &encoded {
+            rep.feed(sym);
+        }
+        let repeated = rep.take_all();
         let punctured = puncture_rc3(&repeated, rate);
-        assert_eq!(
-            punctured.len(),
-            MOD_SYMBOLS_PER_FRAME,
-            "Expected {} symbols after puncture, got {} (rate={:?})",
-            MOD_SYMBOLS_PER_FRAME,
-            punctured.len(),
-            rate
-        );
-
-        // Step 5: Forward-backwards bit-reversal interleave (768 symbols)
+        assert_eq!(punctured.len(), MOD_SYMBOLS_PER_FRAME);
         let interleaved = config.interleaver.encode(&punctured);
+
         PreparedFrameRc3 {
             interleaved,
             rate,
             next_pcg: 0,
-            frame_start_chip,
+            frame_start_chip: 0,
+            is_queued: false,
         }
     }
 
     fn emit_next_pcg(&self, config: &mut ConfigRc3, tx_state: &mut TxState) {
         if tx_state.prepared_frame.is_none() {
-            let (data, rate, is_queued) = self.pop_next_frame();
-            tx_state.prepared_frame = Some(self.prepare_frame(config, data, rate, is_queued));
+            let mut prepared = self
+                .pop_next_frame()
+                .unwrap_or_else(|| Self::build_null_frame(config));
+            prepared.frame_start_chip = config.lc_chip_cursor;
+            self.note_frame_source(prepared.is_queued, prepared.rate, prepared.frame_start_chip);
+            tx_state.prepared_frame = Some(prepared);
         }
 
         let prepared = tx_state
@@ -559,16 +577,26 @@ impl ForwardTrafficChannelRc3 {
 
 impl Channel for ForwardTrafficChannelRc3 {
     fn next_block(&self, num_samples: usize, system_time: CdmaSystemTime) -> Vec<Complex32> {
-        let _ = system_time;
+        let mut out = Vec::with_capacity(num_samples);
+        self.next_block_into(&mut out, num_samples, system_time);
+        out
+    }
+
+    fn next_block_into(
+        &self,
+        out: &mut Vec<Complex32>,
+        num_samples: usize,
+        _system_time: CdmaSystemTime,
+    ) {
         let mut config = self.config.lock();
         let mut tx_state = self.tx_state.lock();
         while tx_state.symbol_buffer.len() < num_samples {
             self.emit_next_pcg(&mut config, &mut tx_state);
         }
-        tx_state
-            .symbol_buffer
-            .drain(..num_samples)
-            .collect::<Vec<_>>()
+        out.reserve(num_samples);
+        for _ in 0..num_samples {
+            out.push(tx_state.symbol_buffer.pop_front().unwrap());
+        }
     }
 }
 

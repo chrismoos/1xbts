@@ -280,11 +280,7 @@ impl NetworkBtsControlClient {
         let ctrl = self.local_controller.as_ref().unwrap();
         for _ in 0..50 {
             tokio::task::yield_now().await;
-            let found = ctrl
-                .traffic_channels_pool()
-                .lock()
-                .iter()
-                .any(|s| s.walsh_code == walsh_code);
+            let found = ctrl.traffic_channels_pool().contains(walsh_code);
             if found {
                 return;
             }
@@ -1330,9 +1326,7 @@ impl BtsControlClient for NetworkBtsControlClient {
     fn traffic_queue_len(&self, walsh_code: u8) -> Option<usize> {
         self.local_controller.as_ref().and_then(|ctrl| {
             ctrl.traffic_channels_pool()
-                .lock()
-                .iter()
-                .find(|s| s.walsh_code == walsh_code)
+                .lookup(walsh_code)
                 .map(|s| s.channel.queue_len())
         })
     }
@@ -1340,9 +1334,7 @@ impl BtsControlClient for NetworkBtsControlClient {
     fn last_traffic_enqueue_at(&self, walsh_code: u8) -> Option<std::time::Instant> {
         self.local_controller.as_ref().and_then(|ctrl| {
             ctrl.traffic_channels_pool()
-                .lock()
-                .iter()
-                .find(|s| s.walsh_code == walsh_code)
+                .lookup(walsh_code)
                 .and_then(|s| s.channel.last_enqueue_at())
         })
     }

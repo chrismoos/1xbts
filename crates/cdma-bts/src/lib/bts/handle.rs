@@ -1,6 +1,9 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
+use crossbeam_queue::ArrayQueue;
 use parking_lot::Mutex;
 
 use tokio::sync::{mpsc, oneshot, watch};
@@ -185,27 +188,215 @@ impl Channel for TrafficChannelWrapper {
             TrafficChannelWrapper::SchRc3(ch) => ch.next_block(num_samples, system_time),
         }
     }
+
+    fn next_block_into(
+        &self,
+        out: &mut Vec<num::complex::Complex32>,
+        num_samples: usize,
+        system_time: CdmaSystemTime,
+    ) {
+        match self {
+            TrafficChannelWrapper::Rc1(ch) => ch.next_block_into(out, num_samples, system_time),
+            TrafficChannelWrapper::Rc3(ch) => ch.next_block_into(out, num_samples, system_time),
+            TrafficChannelWrapper::SchRc3(ch) => ch.next_block_into(out, num_samples, system_time),
+        }
+    }
 }
 
-/// A single active traffic channel slot in the shared pool.
+/// A single active traffic channel slot in the registry.
+///
+/// Shared by `Arc` between the BTS-side non-TX threads (bearer agent,
+/// power-control, abis agent) and the TX thread's private working list.
+/// Only `gain` is mutated post-publication, via atomics — all other fields
+/// are immutable once the slot is constructed.
 pub struct TrafficChannelSlot {
     pub walsh_code: u8,
-    pub gain: f32,
     pub channel: TrafficChannelWrapper,
+    /// `f32::to_bits` of the linear gain. Power control writes via
+    /// `gain.store(f32::to_bits(g), Relaxed)`; TX reads via
+    /// `f32::from_bits(gain.load(Relaxed))` once per block per slot.
+    pub gain: AtomicU32,
+}
+
+impl TrafficChannelSlot {
+    pub fn new(walsh_code: u8, channel: TrafficChannelWrapper, gain_linear: f32) -> Arc<Self> {
+        Arc::new(Self {
+            walsh_code,
+            channel,
+            gain: AtomicU32::new(gain_linear.to_bits()),
+        })
+    }
+
+    /// Current gain as a linear amplitude ratio.
+    pub fn gain(&self) -> f32 {
+        f32::from_bits(self.gain.load(Ordering::Relaxed))
+    }
+
+    pub fn set_gain(&self, gain_linear: f32) {
+        self.gain.store(gain_linear.to_bits(), Ordering::Relaxed);
+    }
+}
+
+/// Command sent from the registry to the TX thread's private `TxPool`.
+pub enum PoolCommand {
+    Add(Arc<TrafficChannelSlot>),
+    Remove(u8),
+}
+
+const POOL_CMD_QUEUE_CAPACITY: usize = 64;
+
+/// Shared registry of active traffic channel slots.
+///
+/// Non-TX threads (bearer agent, abis agent, power control) look up channels
+/// here by walsh code under a brief `Mutex<HashMap>`. The TX thread never
+/// touches this lock — it maintains its own private working list (`TxPool`)
+/// updated via a lock-free MPMC ring (`ArrayQueue`) that the registry feeds
+/// on every `add`/`remove`.
+pub struct ChannelRegistry {
+    slots: Mutex<HashMap<u8, Arc<TrafficChannelSlot>>>,
+    tx_cmd: Arc<ArrayQueue<PoolCommand>>,
+}
+
+impl ChannelRegistry {
+    pub fn new() -> Self {
+        Self {
+            slots: Mutex::new(HashMap::new()),
+            tx_cmd: Arc::new(ArrayQueue::new(POOL_CMD_QUEUE_CAPACITY)),
+        }
+    }
+
+    /// Return the shared TX command queue so the TX thread can drain it.
+    pub fn tx_cmd_queue(&self) -> Arc<ArrayQueue<PoolCommand>> {
+        self.tx_cmd.clone()
+    }
+
+    pub fn add(&self, slot: Arc<TrafficChannelSlot>) {
+        let walsh = slot.walsh_code;
+        self.slots.lock().insert(walsh, slot.clone());
+        if self.tx_cmd.push(PoolCommand::Add(slot)).is_err() {
+            log::error!(
+                "ChannelRegistry::add: tx-cmd queue overflow for walsh={}",
+                walsh
+            );
+        }
+    }
+
+    pub fn remove(&self, walsh_code: u8) -> Option<Arc<TrafficChannelSlot>> {
+        let removed = self.slots.lock().remove(&walsh_code);
+        if removed.is_some() && self.tx_cmd.push(PoolCommand::Remove(walsh_code)).is_err() {
+            log::error!(
+                "ChannelRegistry::remove: tx-cmd queue overflow for walsh={}",
+                walsh_code
+            );
+        }
+        removed
+    }
+
+    pub fn lookup(&self, walsh_code: u8) -> Option<Arc<TrafficChannelSlot>> {
+        self.slots.lock().get(&walsh_code).cloned()
+    }
+
+    pub fn contains(&self, walsh_code: u8) -> bool {
+        self.slots.lock().contains_key(&walsh_code)
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.lock().is_empty()
+    }
+
+    /// Snapshot of currently-registered walsh codes. Useful for tests and
+    /// administrative iteration; not called on any hot path.
+    pub fn walsh_codes(&self) -> Vec<u8> {
+        self.slots.lock().keys().copied().collect()
+    }
+}
+
+impl Default for ChannelRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Shared handle to the channel registry. Cloned by every BTS thread that
+/// needs to look up channels by walsh code (bearer, power-control, abis,
+/// launcher event loop). The TX thread does **not** use this handle on its
+/// hot path — it consumes from the `ArrayQueue<PoolCommand>` obtained via
+/// [`ChannelRegistry::tx_cmd_queue`] into its private `TxPool`.
+pub type TrafficChannelPool = Arc<ChannelRegistry>;
+
+/// TX-thread-private working list of active traffic channels.
+///
+/// Updated only by the TX thread, sourced via the lock-free command queue
+/// from [`ChannelRegistry`]. The TX hot path iterates this list without
+/// taking any blocking lock.
+pub struct TxPool {
+    slots: Vec<TxSlot>,
+    cmd_rx: Arc<ArrayQueue<PoolCommand>>,
+}
+
+pub struct TxSlot {
+    pub walsh_code: u8,
+    pub slot: Arc<TrafficChannelSlot>,
     /// Absolute chip time at which the channel becomes active on the air.
     /// Before this boundary the TX loop mixes zeros for the slot.
     pub start_chip: Option<u64>,
-    /// False until the TX loop has aligned the channel's LC generator to the
-    /// live chip cursor. The TX loop sets this on first use so the LC stays
-    /// in lockstep with the system timeline from that point on.
+    /// False until the TX loop has aligned the channel's LC generator to
+    /// the live chip cursor. Set on first observation.
     pub lc_aligned: bool,
     /// Set after the first block verifies frame-boundary alignment.
     pub frame_align_verified: bool,
 }
 
-/// Shared pool of active forward traffic channels. The BSC adds/removes
-/// channels; the BTS TX loop reads the pool each block to mix them in.
-pub type TrafficChannelPool = Arc<Mutex<Vec<TrafficChannelSlot>>>;
+impl TxPool {
+    pub fn new(cmd_rx: Arc<ArrayQueue<PoolCommand>>) -> Self {
+        Self {
+            slots: Vec::new(),
+            cmd_rx,
+        }
+    }
+
+    /// Drain pending Add/Remove commands. Called by the TX thread at the
+    /// top of each `synthesize_block`.
+    pub fn drain_commands(&mut self) {
+        while let Some(cmd) = self.cmd_rx.pop() {
+            match cmd {
+                PoolCommand::Add(slot) => {
+                    let walsh_code = slot.walsh_code;
+                    // Replace any prior entry with the same walsh; the
+                    // registry guarantees a Remove precedes an Add for
+                    // the same code in steady state, but be defensive.
+                    self.slots.retain(|s| s.walsh_code != walsh_code);
+                    self.slots.push(TxSlot {
+                        walsh_code,
+                        slot,
+                        start_chip: None,
+                        lc_aligned: false,
+                        frame_align_verified: false,
+                    });
+                }
+                PoolCommand::Remove(walsh_code) => {
+                    self.slots.retain(|s| s.walsh_code != walsh_code);
+                }
+            }
+        }
+    }
+
+    pub fn slots_mut(&mut self) -> &mut [TxSlot] {
+        &mut self.slots
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+}
 
 pub use cdma_common::traffic::{
     RC1_TRAFFIC_INITIAL_GAIN_LINEAR, RC3_TRAFFIC_INITIAL_GAIN_LINEAR, TrafficRxRequest,
@@ -375,7 +566,7 @@ pub fn allocate_traffic_channel(
                 0,
                 walsh_code,
                 format!("rc1-w{}", walsh_code),
-                PcgPcbFallbackMode::AlternatingHold,
+                PcgPcbFallbackMode::UpBeforeFirstThenHold,
             ),
         }),
     );
@@ -385,14 +576,11 @@ pub fn allocate_traffic_channel(
 
     let channel_ref = ftch.clone();
 
-    traffic_channels.lock().push(TrafficChannelSlot {
+    traffic_channels.add(TrafficChannelSlot::new(
         walsh_code,
-        gain: RC1_TRAFFIC_INITIAL_GAIN_LINEAR,
-        channel: TrafficChannelWrapper::Rc1(ftch),
-        start_chip: None,
-        lc_aligned: false,
-        frame_align_verified: false,
-    });
+        TrafficChannelWrapper::Rc1(ftch),
+        RC1_TRAFFIC_INITIAL_GAIN_LINEAR,
+    ));
 
     Some((walsh_code, channel_ref))
 }
@@ -406,14 +594,12 @@ pub fn set_traffic_channel_gain(
     walsh_code: u8,
     new_gain_linear: f32,
 ) -> bool {
-    let mut pool = traffic_channels.lock();
-    for slot in pool.iter_mut() {
-        if slot.walsh_code == walsh_code {
-            slot.gain = new_gain_linear;
-            return true;
-        }
+    if let Some(slot) = traffic_channels.lookup(walsh_code) {
+        slot.set_gain(new_gain_linear);
+        true
+    } else {
+        false
     }
-    false
 }
 
 /// Allocate a forward traffic channel on the given pool/allocator (RC3).
@@ -454,7 +640,7 @@ pub fn allocate_traffic_channel_rc3(
                 0,
                 walsh_code,
                 format!("rc3-w{}", walsh_code),
-                PcgPcbFallbackMode::AlternatingHold,
+                PcgPcbFallbackMode::UpBeforeFirstThenHold,
             ),
             fpc_subchan_gain_linear: gain_linear,
             prev_frame_last_chip: 0,
@@ -466,14 +652,11 @@ pub fn allocate_traffic_channel_rc3(
 
     let channel_ref = ftch.clone();
 
-    traffic_channels.lock().push(TrafficChannelSlot {
+    traffic_channels.add(TrafficChannelSlot::new(
         walsh_code,
-        gain: RC3_TRAFFIC_INITIAL_GAIN_LINEAR,
-        channel: TrafficChannelWrapper::Rc3(ftch),
-        start_chip: None,
-        lc_aligned: false,
-        frame_align_verified: false,
-    });
+        TrafficChannelWrapper::Rc3(ftch),
+        RC3_TRAFFIC_INITIAL_GAIN_LINEAR,
+    ));
 
     Some((walsh_code, channel_ref))
 }
@@ -499,21 +682,18 @@ pub fn commit_traffic_channel(
                 0,
                 walsh_code,
                 format!("rc1-w{}", walsh_code),
-                PcgPcbFallbackMode::AlternatingHold,
+                PcgPcbFallbackMode::UpBeforeFirstThenHold,
             ),
         }),
     );
 
     let channel_ref = ftch.clone();
 
-    traffic_channels.lock().push(TrafficChannelSlot {
+    traffic_channels.add(TrafficChannelSlot::new(
         walsh_code,
-        gain: RC1_TRAFFIC_INITIAL_GAIN_LINEAR,
-        channel: TrafficChannelWrapper::Rc1(ftch),
-        start_chip: None,
-        lc_aligned: false,
-        frame_align_verified: false,
-    });
+        TrafficChannelWrapper::Rc1(ftch),
+        RC1_TRAFFIC_INITIAL_GAIN_LINEAR,
+    ));
 
     channel_ref
 }
@@ -547,7 +727,7 @@ pub fn commit_traffic_channel_rc3(
                 0,
                 walsh_code,
                 format!("rc3-w{}", walsh_code),
-                PcgPcbFallbackMode::AlternatingHold,
+                PcgPcbFallbackMode::UpBeforeFirstThenHold,
             ),
             fpc_subchan_gain_linear: gain_linear,
             prev_frame_last_chip: 0,
@@ -557,14 +737,11 @@ pub fn commit_traffic_channel_rc3(
 
     let channel_ref = ftch.clone();
 
-    traffic_channels.lock().push(TrafficChannelSlot {
+    traffic_channels.add(TrafficChannelSlot::new(
         walsh_code,
-        gain: RC3_TRAFFIC_INITIAL_GAIN_LINEAR,
-        channel: TrafficChannelWrapper::Rc3(ftch),
-        start_chip: None,
-        lc_aligned: false,
-        frame_align_verified: false,
-    });
+        TrafficChannelWrapper::Rc3(ftch),
+        RC3_TRAFFIC_INITIAL_GAIN_LINEAR,
+    ));
 
     channel_ref
 }
@@ -611,14 +788,11 @@ pub fn allocate_sch_rc3(
 
     let channel_ref = sch.clone();
 
-    traffic_channels.lock().push(TrafficChannelSlot {
-        walsh_code: sch_code,
-        gain: sch_gain_linear,
-        channel: TrafficChannelWrapper::SchRc3(sch),
-        start_chip: None,
-        lc_aligned: false,
-        frame_align_verified: false,
-    });
+    traffic_channels.add(TrafficChannelSlot::new(
+        sch_code,
+        TrafficChannelWrapper::SchRc3(sch),
+        sch_gain_linear,
+    ));
 
     Some((sch_code, channel_ref))
 }
@@ -629,17 +803,16 @@ pub fn deallocate_sch(
     traffic_channels: &TrafficChannelPool,
     sch_code: u8,
 ) {
-    let mut pool = traffic_channels.lock();
-    let mut walsh_len = None;
-    pool.retain(|slot| {
-        let remove =
-            slot.walsh_code == sch_code && matches!(slot.channel, TrafficChannelWrapper::SchRc3(_));
-        if remove && let TrafficChannelWrapper::SchRc3(ch) = &slot.channel {
-            walsh_len = Some(ch.channel.profile().walsh_len);
-        }
-        !remove
-    });
-    drop(pool);
+    let walsh_len = match traffic_channels.lookup(sch_code) {
+        Some(slot) => match &slot.channel {
+            TrafficChannelWrapper::SchRc3(ch) => Some(ch.channel.profile().walsh_len),
+            _ => None,
+        },
+        None => None,
+    };
+    if walsh_len.is_some() {
+        traffic_channels.remove(sch_code);
+    }
     if let Some(walsh_len) = walsh_len {
         walsh_allocator.lock().release_sch(walsh_len, sch_code);
         log::info!(
@@ -658,17 +831,15 @@ pub fn deallocate_traffic_channel(
     traffic_channels: &TrafficChannelPool,
     walsh_code: u8,
 ) {
-    let mut pool = traffic_channels.lock();
-    let before = pool.len();
-    pool.retain(|slot| slot.walsh_code != walsh_code);
-    let after = pool.len();
+    let before = traffic_channels.len();
+    traffic_channels.remove(walsh_code);
+    let after = traffic_channels.len();
     log::info!(
         "deallocate_traffic_channel: walsh={} pool_before={} pool_after={}",
         walsh_code,
         before,
         after
     );
-    drop(pool);
     walsh_allocator.lock().release(walsh_code);
 }
 
@@ -697,7 +868,7 @@ pub(crate) fn create_handle(config: Arc<BtsRuntimeSettings>) -> (BtsHandleSender
     let (access_tx, access_rx) = mpsc::unbounded_channel();
     let (commands_tx, commands_rx) = mpsc::channel(16);
 
-    let traffic_channels: TrafficChannelPool = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let traffic_rx_pool: TrafficRxPool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals: TrafficRxRemovals = Arc::new(Mutex::new(Vec::new()));
     let power_control = BtsPowerControlRegistry::default();
@@ -746,7 +917,7 @@ mod tests {
 
     use parking_lot::Mutex;
 
-    use super::{TrafficChannelPool, WalshAllocator, deallocate_sch};
+    use super::{ChannelRegistry, TrafficChannelPool, WalshAllocator, deallocate_sch};
 
     #[test]
     fn walsh_allocator_starts_traffic_pool_at_ten() {
@@ -816,7 +987,7 @@ mod tests {
         assert_eq!(allocator.lock().allocate(), Some(10));
         assert!(allocator.lock().in_use[10]);
 
-        let traffic_channels: TrafficChannelPool = Arc::new(Mutex::new(Vec::new()));
+        let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
         deallocate_sch(&allocator, &traffic_channels, 5);
 
         assert!(

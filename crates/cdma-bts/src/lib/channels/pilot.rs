@@ -18,7 +18,16 @@ impl ForwardPilotChannel {
 
 impl Channel for ForwardPilotChannel {
     fn next_block(&self, num_samples: usize, _system_time: CdmaSystemTime) -> Vec<Complex32> {
-        (0..num_samples).map(|_| self.next()).collect::<Vec<_>>()
+        vec![Complex32::new(1.0, 0.0); num_samples]
+    }
+
+    fn next_block_into(
+        &self,
+        out: &mut Vec<Complex32>,
+        num_samples: usize,
+        _system_time: CdmaSystemTime,
+    ) {
+        out.resize(out.len() + num_samples, Complex32::new(1.0, 0.0));
     }
 }
 

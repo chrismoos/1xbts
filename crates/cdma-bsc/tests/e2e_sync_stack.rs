@@ -3999,7 +3999,7 @@ async fn run_sync_overhead_window_case(
         bts::Config {
             pilot_offset: bts_config.pilot_offset,
             mac_layer,
-            start_system_time: None,
+            start_system_time: Some(time::system_time_from_chips(9 * 98_304, 1_228_800)),
             sync_channel_template: Some(SyncChannelMessage {
                 pd: 0,
                 msg_type: 1,
@@ -5037,13 +5037,13 @@ async fn test_e2e_bts_to_wav_to_receiver_pipeline() -> Result<(), Error> {
 
 #[tokio::test]
 async fn test_e2e_sync_and_overhead_boundaries_over_5s() -> Result<(), Error> {
-    const BLOCKS: usize = 13_000;
+    const BLOCKS: usize = 15_000;
     const CHIPS_PER_BLOCK: usize = 512;
     const CHIPS_PER_SYNC_SUPERFRAME: usize = 98_304;
     const CHIPS_PER_SYNC_MESSAGE: usize = CHIPS_PER_SYNC_SUPERFRAME * 3;
     const CHIPS_320MS: usize = 393_216;
     const CHIPS_PER_PAGING_SLOT: usize = 98_304;
-    const EXPECTED_SYNC_EVENTS: usize = 22;
+    const EXPECTED_SYNC_EVENTS: usize = (BLOCKS * CHIPS_PER_BLOCK) / CHIPS_PER_SYNC_MESSAGE;
 
     let stats = run_sync_overhead_window_case(
         PathBuf::from("test/generated/e2e_sync_overhead_5s.wav"),
@@ -7826,18 +7826,18 @@ async fn run_traffic_channel_e2e(
     .await;
 
     // Verify traffic channel was allocated
-    let traffic_pool = bts_handle.traffic_channels.lock();
+    let walsh_codes = bts_handle.traffic_channels.walsh_codes();
     assert!(
-        !traffic_pool.is_empty(),
+        !walsh_codes.is_empty(),
         "expected at least one traffic channel to be allocated after origination"
     );
-    let assigned_walsh = traffic_pool[0].walsh_code;
+    let assigned_walsh = walsh_codes[0];
     eprintln!(
         "traffic channel allocated: walsh_code={} pool_size={}",
         assigned_walsh,
-        traffic_pool.len()
+        walsh_codes.len()
     );
-    drop(traffic_pool);
+    drop(walsh_codes);
 
     // Run BTS — generates pulse-shaped WAV with pilot + sync + paging + traffic
     bts.run_for_blocks(32_000).await?;
@@ -8160,12 +8160,12 @@ async fn test_e2e_rc1_reverse_preamble_triggers_crc_valid_bs_ack_order() -> Resu
         .await;
 
     let assigned_walsh = {
-        let pool = traffic_channels.lock();
+        let codes = traffic_channels.walsh_codes();
         assert!(
-            !pool.is_empty(),
+            !codes.is_empty(),
             "expected RC1 traffic channel to be allocated before BTS run"
         );
-        pool[0].walsh_code
+        codes[0]
     };
     assert_eq!(assigned_walsh, 10, "expected first traffic Walsh to be W10");
 

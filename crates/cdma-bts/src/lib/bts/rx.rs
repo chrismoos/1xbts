@@ -1855,34 +1855,19 @@ fn run_traffic_rx_thread(
                     .get("absolute_chip_start")
                     .copied()
                     .unwrap_or(0);
-                debug!(
-                    "rx_traffic[w{}]: PREAMBLE DETECTED pcgs={} abs_chip={}",
-                    walsh_code, preamble_pcgs, abs_chip
+                let preamble_raw_power_db = out_blk
+                    .tags
+                    .get("finger_raw_power_mdb")
+                    .map(|v| *v as f32 / 1000.0);
+                info!(
+                    "rx_traffic[w{}]: traffic preamble detected pcgs={} abs_chip={} raw_power_dbfs={}",
+                    walsh_code,
+                    preamble_pcgs,
+                    abs_chip,
+                    preamble_raw_power_db
+                        .map(|db| format!("{db:.2}"))
+                        .unwrap_or_else(|| "none".to_string())
                 );
-                if let (Some(power_control), Some(traffic_channels)) =
-                    (power_control.as_ref(), traffic_channels.as_ref())
-                    && let Some(raw_power_db) = out_blk
-                        .tags
-                        .get("finger_raw_power_mdb")
-                        .map(|v| *v as f32 / 1000.0)
-                    && power_control.note_hot_preamble(walsh_code, raw_power_db)
-                {
-                    let start_abs_pcg =
-                        processing_absolute_chip_end / 1536 + PCG_PREDICTION_LEAD_PCGS as u64;
-                    let down_pcgs = BtsPowerControlRegistry::hot_start_bootstrap_down_pcgs();
-                    if power_control.schedule_down_burst(
-                        traffic_channels,
-                        walsh_code,
-                        start_abs_pcg,
-                        down_pcgs,
-                    ) {
-                        info!(
-                            "rx_traffic[w{}]: hot preamble raw={:.2} dBFS; armed dynamic DOWN guard and scheduled {} bootstrap DOWN PCBs from abs_pcg={}",
-                            walsh_code, raw_power_db, down_pcgs, start_abs_pcg
-                        );
-                    }
-                }
-
                 // Send preamble as FCH Rvs null frame over Abis UDP bearer
                 emit_reverse_preamble_bearer(
                     &reverse_bearer_tx,

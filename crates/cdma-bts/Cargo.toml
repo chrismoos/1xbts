@@ -43,6 +43,7 @@ signal-hook = "0.3"
 clap = { version = "4", features = ["derive"] }
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
+crossbeam-queue = "0.3"
 cdma-abis = { path = "../cdma-abis" }
 
 [lints]

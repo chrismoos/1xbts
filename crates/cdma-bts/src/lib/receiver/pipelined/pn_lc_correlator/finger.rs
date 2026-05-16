@@ -487,6 +487,7 @@ impl PnLcFinger {
             self.reset_rc3_pcg_measurement();
             return;
         };
+        let hard_validated = self.base.is_hard_validated();
         let raw_power_dbfs = 10.0
             * ((self.rc3_pcg_measurement_prompt_chip_power / RC3_PCG_CHIPS as f64)
                 .max(1e-15)
@@ -494,40 +495,49 @@ impl PnLcFinger {
         let pilot_norm_sq = self.rc3_pcg_measurement_pilot_coherent_sum.norm_sqr() as f64;
         let n_symbols_this_pcg = self.rc3_pcg_measurement_pilot_symbol_count;
         let pilot_prompt_power_this_pcg = self.rc3_pcg_measurement_pilot_prompt_power;
-        let raw_sinr_db = Self::pilot_sym_sinr_db_from_metrics(
-            pilot_norm_sq,
-            pilot_prompt_power_this_pcg,
-            n_symbols_this_pcg,
-        );
-        if self.rc3_pcg_measurement_smoothing_window.len() >= RC3_PCG_SMOOTH_WINDOW {
-            self.rc3_pcg_measurement_smoothing_window.pop_front();
-        }
-        self.rc3_pcg_measurement_smoothing_window.push_back((
-            pilot_norm_sq,
-            pilot_prompt_power_this_pcg,
-            n_symbols_this_pcg,
-        ));
-        // K factor cancels in the ratio: pass per-PCG N below (not K*N),
-        // or SINR is mis-reported by 10·log10(K) dB low.
-        let mut window_norm_sq = 0.0_f64;
-        let mut window_prompt_pwr = 0.0_f64;
-        let mut window_pcgs = 0_usize;
-        for &(ns, pp, _) in &self.rc3_pcg_measurement_smoothing_window {
-            window_norm_sq += ns;
-            window_prompt_pwr += pp;
-            window_pcgs += 1;
-        }
-        let avg_norm_sq = window_norm_sq / window_pcgs.max(1) as f64;
-        let avg_prompt_pwr = window_prompt_pwr / window_pcgs.max(1) as f64;
-        let sinr_db = Self::pilot_sym_sinr_db_from_metrics(
-            avg_norm_sq,
-            avg_prompt_pwr,
-            RC3_PILOT_SYMBOLS_PER_PCG,
-        );
-        let ec_io_db = Self::pilot_ec_io_db_from_prompt_power(
-            self.rc3_pcg_measurement_pilot_prompt_power,
-            self.rc3_pcg_measurement_prompt_chip_power,
-        );
+        let (raw_sinr_db, sinr_db, ec_io_db, smoothing_window_len) = if hard_validated {
+            let raw_sinr_db = Self::pilot_sym_sinr_db_from_metrics(
+                pilot_norm_sq,
+                pilot_prompt_power_this_pcg,
+                n_symbols_this_pcg,
+            );
+            if self.rc3_pcg_measurement_smoothing_window.len() >= RC3_PCG_SMOOTH_WINDOW {
+                self.rc3_pcg_measurement_smoothing_window.pop_front();
+            }
+            self.rc3_pcg_measurement_smoothing_window.push_back((
+                pilot_norm_sq,
+                pilot_prompt_power_this_pcg,
+                n_symbols_this_pcg,
+            ));
+            // K factor cancels in the ratio: pass per-PCG N below (not K*N),
+            // or SINR is mis-reported by 10·log10(K) dB low.
+            let mut window_norm_sq = 0.0_f64;
+            let mut window_prompt_pwr = 0.0_f64;
+            let mut window_pcgs = 0_usize;
+            for &(ns, pp, _) in &self.rc3_pcg_measurement_smoothing_window {
+                window_norm_sq += ns;
+                window_prompt_pwr += pp;
+                window_pcgs += 1;
+            }
+            let avg_norm_sq = window_norm_sq / window_pcgs.max(1) as f64;
+            let avg_prompt_pwr = window_prompt_pwr / window_pcgs.max(1) as f64;
+            (
+                Some(raw_sinr_db),
+                Self::pilot_sym_sinr_db_from_metrics(
+                    avg_norm_sq,
+                    avg_prompt_pwr,
+                    RC3_PILOT_SYMBOLS_PER_PCG,
+                ),
+                Some(Self::pilot_ec_io_db_from_prompt_power(
+                    self.rc3_pcg_measurement_pilot_prompt_power,
+                    self.rc3_pcg_measurement_prompt_chip_power,
+                )),
+                self.rc3_pcg_measurement_smoothing_window.len(),
+            )
+        } else {
+            self.rc3_pcg_measurement_smoothing_window.clear();
+            (None, f32::NAN, None, 0)
+        };
         let chip_rate_hz = if self.oversample > 0 {
             self.sample_rate_hz / self.oversample as f64
         } else {
@@ -544,17 +554,23 @@ impl PnLcFinger {
             "traffic_pcg_raw_power_mdb",
             (raw_power_dbfs * 1000.0) as i64,
         );
+        if let Some(ec_io_db) = ec_io_db {
+            block
+                .tags
+                .insert("traffic_pcg_pilot_ec_io_mdb", (ec_io_db * 1000.0) as i64);
+        }
+        if let Some(raw_sinr_db) = raw_sinr_db {
+            block.tags.insert(
+                "traffic_pcg_pilot_sinr_raw_mdb",
+                (raw_sinr_db * 1000.0) as i64,
+            );
+        }
         block
             .tags
-            .insert("traffic_pcg_pilot_ec_io_mdb", (ec_io_db * 1000.0) as i64);
-        block.tags.insert(
-            "traffic_pcg_pilot_sinr_raw_mdb",
-            (raw_sinr_db * 1000.0) as i64,
-        );
-        block.tags.insert(
-            "traffic_pcg_smoothing_window",
-            self.rc3_pcg_measurement_smoothing_window.len() as i64,
-        );
+            .insert("traffic_pcg_smoothing_window", smoothing_window_len as i64);
+        if !hard_validated {
+            block.tags.insert("traffic_pcg_raw_only", 1);
+        }
         block.tags.insert("finger_id", self.base.id as i64);
         block.pcg_signal_snr_db = Some(vec![sinr_db]);
         self.pending_output.push(block);
@@ -562,7 +578,7 @@ impl PnLcFinger {
     }
 
     fn update_rc3_pcg_measurement(&mut self, chip_tx: usize, prompt_chip: Complex32) {
-        if !self.current_chip_enabled || !self.base.is_hard_validated() {
+        if !self.current_chip_enabled {
             self.reset_rc3_pcg_measurement();
             // Lock loss → smoothing window is no longer meaningful.
             self.rc3_pcg_measurement_smoothing_window.clear();

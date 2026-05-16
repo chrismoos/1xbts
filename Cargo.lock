@@ -431,6 +431,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossbeam-channel",
+ "crossbeam-queue",
  "env_logger",
  "hound",
  "libc",

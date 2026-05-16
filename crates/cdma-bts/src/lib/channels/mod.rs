@@ -26,6 +26,17 @@ use crate::{phy::spread::Spreader, phy::walsh::WalshGenerator};
 pub trait Channel {
     /// Generate the next `num_samples` chip-rate samples for `system_time`.
     fn next_block(&self, num_samples: usize, system_time: CdmaSystemTime) -> Vec<Complex32>;
+
+    /// Append the next `num_samples` chip-rate samples into `out`.
+    fn next_block_into(
+        &self,
+        out: &mut Vec<Complex32>,
+        num_samples: usize,
+        system_time: CdmaSystemTime,
+    ) {
+        let block = self.next_block(num_samples, system_time);
+        out.extend_from_slice(&block);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -50,6 +61,7 @@ pub enum PcgPcbFallbackMode {
     Up,
     Down,
     AlternatingHold,
+    UpBeforeFirstThenHold,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -257,19 +269,49 @@ impl PcgPcbScheduler {
         }
     }
 
+    pub fn schedule_burst(&mut self, start_abs_pcg: u64, pcgs: u64, bit: u8) {
+        let last_read_abs_pcg = self.last_read_abs_pcg;
+        let bit = bit & 1;
+        for offset in 0..pcgs {
+            let abs_pcg = start_abs_pcg.saturating_add(offset);
+            self.scheduled.insert(abs_pcg, bit);
+            if self.missed_fallbacks.remove(&abs_pcg).is_some()
+                && let Some(counters) = self.verbose_counters.as_mut()
+            {
+                counters.record_late_fill();
+            }
+            if let Some(last_read_abs_pcg) = last_read_abs_pcg
+                && abs_pcg <= last_read_abs_pcg
+                && let Some(counters) = self.verbose_counters.as_mut()
+            {
+                counters.record_schedule_late(last_read_abs_pcg.saturating_sub(abs_pcg));
+            }
+        }
+        self.trim_before(start_abs_pcg.saturating_sub(64));
+        self.trim_missed_before(start_abs_pcg.saturating_sub(64));
+    }
+
     pub fn read(&mut self, abs_pcg: u64) -> u8 {
         self.last_read_abs_pcg = Some(abs_pcg);
         self.trim_before(abs_pcg.saturating_sub(64));
         self.trim_missed_before(abs_pcg.saturating_sub(64));
         let scheduled = self.scheduled.get(&abs_pcg).copied();
-        if scheduled.is_none() {
+        let fallback_cause = if scheduled.is_none() {
             let (cause, gap_pcgs) = self.classify_fallback(abs_pcg);
             self.missed_fallbacks.insert(abs_pcg, cause);
             if let Some(counters) = self.verbose_counters.as_mut() {
                 counters.record_fallback_cause(cause, gap_pcgs);
             }
-        }
-        let bit = scheduled.unwrap_or_else(|| self.fallback_for(abs_pcg));
+            Some(cause)
+        } else {
+            None
+        };
+        let bit = scheduled.unwrap_or_else(|| {
+            self.fallback_for(
+                abs_pcg,
+                fallback_cause.expect("fallback cause exists when schedule is absent"),
+            )
+        });
         if let (Some(counters), Some(walsh_code), Some(label)) = (
             self.verbose_counters.as_mut(),
             self.walsh_code,
@@ -281,7 +323,7 @@ impl PcgPcbScheduler {
         bit
     }
 
-    fn fallback_for(&self, abs_pcg: u64) -> u8 {
+    fn fallback_for(&self, abs_pcg: u64, _cause: PcgFallbackCause) -> u8 {
         match self.fallback_mode {
             // Always command "up" (0) on unscheduled PCGs so the MS doesn't
             // drop power during scheduling gaps. A slight upward creep is
@@ -291,6 +333,7 @@ impl PcgPcbScheduler {
             PcgPcbFallbackMode::Down => 1,
             // Alternating UP/DOWN is the closest representable HOLD command.
             PcgPcbFallbackMode::AlternatingHold => (abs_pcg as u8) & 1,
+            PcgPcbFallbackMode::UpBeforeFirstThenHold => (abs_pcg as u8) & 1,
         }
     }
 
@@ -352,6 +395,45 @@ mod pcb_scheduler_tests {
         assert_eq!(scheduler.read(11), 1);
         assert_eq!(scheduler.read(12), 0);
     }
+
+    #[test]
+    fn up_before_first_then_hold_fallback_is_neutral_hold() {
+        let scheduler = PcgPcbScheduler::new_named_with_fallback(
+            0,
+            11,
+            "rc3-test",
+            PcgPcbFallbackMode::UpBeforeFirstThenHold,
+        );
+        let mut scheduler = scheduler.lock();
+
+        assert_eq!(scheduler.read(8), 0);
+        assert_eq!(scheduler.read(9), 1);
+        assert_eq!(scheduler.read(65), 1);
+        assert_eq!(scheduler.read(67), 1);
+        scheduler.schedule(70, 0);
+        assert_eq!(scheduler.read(68), 0);
+        assert_eq!(scheduler.read(69), 1);
+        assert_eq!(scheduler.read(70), 0);
+        assert_eq!(scheduler.read(71), 1);
+        assert_eq!(scheduler.read(72), 0);
+    }
+
+    #[test]
+    fn scheduled_burst_keeps_all_future_pcgs() {
+        let scheduler = PcgPcbScheduler::new_named_with_fallback(
+            0,
+            11,
+            "rc3-test",
+            PcgPcbFallbackMode::AlternatingHold,
+        );
+        let mut scheduler = scheduler.lock();
+
+        scheduler.schedule_burst(100, 160, 1);
+
+        for abs_pcg in 100..260 {
+            assert_eq!(scheduler.read(abs_pcg), 1, "abs_pcg={abs_pcg}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +453,7 @@ where
 struct WalshState {
     walsh: WalshGenerator,
     buffer: VecDeque<Complex32>,
+    symbol_scratch: Vec<Complex32>,
 }
 
 impl<T> WalshChannel<T>
@@ -383,6 +466,7 @@ where
             state: Mutex::new(WalshState {
                 walsh,
                 buffer: VecDeque::new(),
+                symbol_scratch: Vec::new(),
             }),
         })
     }
@@ -406,13 +490,42 @@ where
     T: Channel,
 {
     fn next_block(&self, num_samples: usize, system_time: CdmaSystemTime) -> Vec<Complex32> {
+        let mut out = Vec::with_capacity(num_samples);
+        self.next_block_into(&mut out, num_samples, system_time);
+        out
+    }
+
+    fn next_block_into(
+        &self,
+        out: &mut Vec<Complex32>,
+        num_samples: usize,
+        system_time: CdmaSystemTime,
+    ) {
         let mut state = self.state.lock();
-        while state.buffer.len() < num_samples {
-            let next_block = self.channel.next_block(1, system_time);
-            let walsh_encoded = state.walsh.feed_many(&next_block);
-            state.buffer.extend(walsh_encoded);
+        if state.buffer.len() < num_samples {
+            let chips_per_symbol = state.walsh.chips_per_symbol();
+            let deficit = num_samples - state.buffer.len();
+            let symbols_needed = deficit.div_ceil(chips_per_symbol);
+            let state = &mut *state;
+            state.symbol_scratch.clear();
+            self.channel
+                .next_block_into(&mut state.symbol_scratch, symbols_needed, system_time);
+            for sample in &state.symbol_scratch {
+                for _ in 0..state.walsh.repetition() {
+                    for c in state.walsh.code() {
+                        state.buffer.push_back(Complex32::new(
+                            *c as f32 * sample.re,
+                            *c as f32 * sample.im,
+                        ));
+                    }
+                }
+            }
+            debug_assert!(state.buffer.len() >= num_samples);
         }
-        state.buffer.drain(0..num_samples).collect::<Vec<_>>()
+        out.reserve(num_samples);
+        for _ in 0..num_samples {
+            out.push(state.buffer.pop_front().unwrap());
+        }
     }
 }
 

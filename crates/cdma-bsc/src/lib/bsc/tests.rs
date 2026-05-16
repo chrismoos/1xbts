@@ -26,7 +26,8 @@ use crate::addressing::{select_imsi_class0_forward_address, select_initial_traff
 use cdma_abis::control::typed::CellId;
 use cdma_bts::bts::abis_agent::AbisAgentConfig;
 use cdma_bts::bts::{
-    TrafficChannelPool, TrafficResourceController, TrafficRxPool, TrafficRxRemovals, WalshAllocator,
+    ChannelRegistry, TrafficChannelPool, TrafficResourceController, TrafficRxPool,
+    TrafficRxRemovals, WalshAllocator,
 };
 use cdma_bts::lac as bts_lac;
 use cdma_common::access::{
@@ -557,7 +558,7 @@ pub(super) async fn test_bsc_with_active_traffic_channel_and_msc_client(
     msc_client: Arc<dyn crate::a1_edge::MscClient>,
 ) -> (Bsc, broadcast::Receiver<TrafficEvent>, u8) {
     use std::sync::Arc;
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -654,7 +655,7 @@ pub(super) async fn test_bsc_with_active_traffic_channel_and_msc_client(
 
 #[tokio::test]
 async fn a1_mt_page_response_defers_l2_ack_until_assignment() {
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -773,7 +774,7 @@ async fn a1_mt_page_response_defers_l2_ack_until_assignment() {
 /// AssignmentRequest for the same call_id.
 #[tokio::test]
 async fn a1_paging_request_processes_independently_of_prior_assignment_request() {
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -1254,7 +1255,7 @@ async fn mt_callee_connected_bearer_frames_are_forwarded() {
 #[tokio::test]
 async fn assigned_channel_preamble_sends_bs_ack_even_if_mobile_state_drifted() {
     use std::sync::Arc;
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -2324,7 +2325,7 @@ fn reverse_regular_msg_seq_tracker_detects_duplicates_and_advances_window() {
 #[tokio::test]
 async fn duplicate_reverse_traffic_data_burst_is_acked_but_not_reprocessed() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -2530,6 +2531,44 @@ async fn pmrm_ack_of_bs_ack_advances_waiting_ms_ack() {
 }
 
 #[tokio::test]
+async fn assigned_timeout_tears_down_packet_traffic_channel() {
+    let (mut bsc, _traffic_rx, _walsh_code) =
+        test_bsc_with_active_traffic_channel(SERVICE_OPTION_HIGH_RATE_PACKET_DATA).await;
+
+    let tc = bsc.mobiles[0].traffic_channel.as_mut().unwrap();
+    tc.channel_state = ChannelState::Assigned {
+        assigned_at: Instant::now() - Duration::from_millis(5001),
+    };
+
+    bsc.poll_traffic_channel_lifecycle(Duration::from_millis(5000))
+        .await;
+
+    assert!(
+        bsc.mobiles[0].traffic_channel.is_none(),
+        "packet traffic channel should be torn down after assignment timeout"
+    );
+}
+
+#[tokio::test]
+async fn assigned_lifecycle_does_not_teardown_before_timeout() {
+    let (mut bsc, _traffic_rx, _walsh_code) =
+        test_bsc_with_active_traffic_channel(SERVICE_OPTION_HIGH_RATE_PACKET_DATA).await;
+
+    let tc = bsc.mobiles[0].traffic_channel.as_mut().unwrap();
+    tc.channel_state = ChannelState::Assigned {
+        assigned_at: Instant::now() - Duration::from_millis(4999),
+    };
+
+    bsc.poll_traffic_channel_lifecycle(Duration::from_millis(5000))
+        .await;
+
+    assert!(
+        bsc.mobiles[0].traffic_channel.is_some(),
+        "traffic channel should remain before assignment timeout"
+    );
+}
+
+#[tokio::test]
 async fn waiting_ms_ack_timeout_tears_down_voice_traffic_channel() {
     let (mut bsc, _traffic_rx, _walsh_code) = test_bsc_with_active_traffic_channel(3).await;
 
@@ -2586,6 +2625,25 @@ async fn waiting_ms_ack_lifecycle_does_not_teardown_before_timeout() {
 }
 
 #[tokio::test]
+async fn traffic_release_timeout_tears_down_packet_traffic_channel() {
+    let (mut bsc, _traffic_rx, _walsh_code) =
+        test_bsc_with_active_traffic_channel(SERVICE_OPTION_HIGH_RATE_PACKET_DATA).await;
+
+    let tc = bsc.mobiles[0].traffic_channel.as_mut().unwrap();
+    tc.channel_state = ChannelState::Releasing {
+        release_sent_at: Instant::now() - Duration::from_millis(5001),
+    };
+
+    bsc.poll_traffic_channel_lifecycle(Duration::from_millis(5000))
+        .await;
+
+    assert!(
+        bsc.mobiles[0].traffic_channel.is_none(),
+        "packet traffic channel should be torn down after release timeout"
+    );
+}
+
+#[tokio::test]
 async fn traffic_lifecycle_ignores_channels_after_waiting_ms_ack() {
     let (mut bsc, _traffic_rx, _walsh_code) =
         test_bsc_with_active_traffic_channel(SERVICE_OPTION_HIGH_RATE_PACKET_DATA).await;
@@ -2605,7 +2663,7 @@ async fn traffic_lifecycle_ignores_channels_after_waiting_ms_ack() {
 #[tokio::test]
 async fn service_connect_completion_ack_clears_pending_traffic_retry() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -2704,7 +2762,7 @@ async fn service_connect_completion_ack_clears_pending_traffic_retry() {
 #[tokio::test]
 async fn service_connect_completion_ack_seq_7_clears_pending_traffic_retry() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -2803,7 +2861,7 @@ async fn service_connect_completion_ack_seq_7_clears_pending_traffic_retry() {
 #[tokio::test]
 async fn voice_service_connect_retry_targets_voice_channel() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -2887,7 +2945,7 @@ async fn voice_service_connect_retry_targets_voice_channel() {
 #[tokio::test]
 async fn origination_retry_reuses_pending_traffic_channel() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -2957,7 +3015,7 @@ async fn origination_retry_reuses_pending_traffic_channel() {
     assert_eq!(bsc.mobiles[0].traffic_channel.as_ref().unwrap().for_rc, 1);
     assert_eq!(bsc.mobiles[0].traffic_channel.as_ref().unwrap().rev_rc, 1);
     assert_eq!(bsc.mobiles[0].state, MsState::TrafficAssigning);
-    assert_eq!(traffic_channels.lock().len(), 1);
+    assert_eq!(traffic_channels.len(), 1);
     assert_eq!(traffic_rx_pool.lock().len(), 1);
     assert_eq!(traffic_rx_pool.lock()[0].walsh_code, first_walsh);
 
@@ -2985,7 +3043,7 @@ async fn origination_retry_reuses_pending_traffic_channel() {
         ChannelState::Assigned { assigned_at } => assert!(assigned_at >= first_assigned_at),
         _ => panic!("expected Assigned state"),
     }
-    assert_eq!(traffic_channels.lock().len(), 1);
+    assert_eq!(traffic_channels.len(), 1);
     assert_eq!(traffic_rx_pool.lock().len(), 1);
     assert_eq!(traffic_rx_pool.lock()[0].walsh_code, first_walsh);
 
@@ -3016,7 +3074,7 @@ async fn origination_retry_reuses_pending_traffic_channel() {
 #[tokio::test]
 async fn legacy_origination_uses_cam_for_rc1_assignment() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -3093,7 +3151,7 @@ async fn legacy_origination_uses_cam_for_rc1_assignment() {
 #[tokio::test]
 async fn legacy_origination_fails_before_cam_when_selected_rc_is_not_rc1() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -3161,7 +3219,7 @@ async fn legacy_origination_fails_before_cam_when_selected_rc_is_not_rc1() {
 
     assert!(bsc.mobiles[0].traffic_channel.is_none());
     assert_eq!(bsc.mobiles[0].state, MsState::Registered);
-    assert!(traffic_channels.lock().is_empty());
+    assert!(traffic_channels.is_empty());
     assert!(traffic_rx_pool.lock().is_empty());
 
     let pch_types = pch_message_types(&bts_client);
@@ -3172,7 +3230,7 @@ async fn legacy_origination_fails_before_cam_when_selected_rc_is_not_rc1() {
 #[tokio::test]
 async fn origination_prefers_policy_rc1_over_mobile_rc3_preference() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -3246,7 +3304,7 @@ async fn origination_prefers_policy_rc1_over_mobile_rc3_preference() {
 #[tokio::test]
 async fn origination_can_prefer_rc3_when_policy_requests_it() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -3325,7 +3383,7 @@ async fn origination_can_prefer_rc3_when_policy_requests_it() {
 #[tokio::test]
 async fn packet_data_origination_assigns_non_voice_traffic_channel() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -3394,6 +3452,107 @@ async fn packet_data_origination_assigns_non_voice_traffic_channel() {
     assert!(matches!(tc.channel_state, ChannelState::Assigned { .. }));
     assert!(tc.recent_primary_frames.is_empty());
     assert_eq!(traffic_rx_pool.lock().len(), 1);
+}
+
+#[tokio::test]
+async fn packet_origination_retry_replaces_stale_pending_traffic_channel() {
+    use std::sync::{Arc, mpsc::channel};
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
+    let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
+    let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
+    let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
+    let bts_client = test_capturing_bts_client(
+        walsh_allocator,
+        traffic_channels.clone(),
+        traffic_rx_pool.clone(),
+        traffic_rx_removals.clone(),
+    );
+
+    let mut bsc = Bsc::new(Config {
+        pilot_offset: 0,
+        overhead: OverheadParameters::default(),
+        paging: PagingChannelSettings::default(),
+        traffic_assignment: TrafficAssignmentConfig::default(),
+        access_event_rx: None,
+        access_event_broadcast: None,
+        sms_request_rx: None,
+        sms_request_tx: None,
+        data_request_rx: None,
+        data_request_tx: None,
+        power_override_request_rx: None,
+        power_override_request_tx: None,
+        mobiles_tx: None,
+        paging_broadcast: None,
+        traffic_broadcast: None,
+        rx_reference_dbm: None,
+        hlr_repo: None,
+        msc_client: test_msc_client(),
+        bts_client: Some(bts_client.clone() as Arc<dyn BtsControlClient>),
+        traffic_retry: TrafficRetryConfig::default(),
+        paging_retry: PagingRetryConfig::default(),
+        voice_policy: test_voice_policy(),
+        pcf_client: None,
+        mobile_idle_timeout_s: 0,
+        bts_paging_state: None,
+        node_id: "bsc-test".to_string(),
+        msc_voice_bearer: None,
+    });
+
+    let mut origination = test_access_event();
+    origination.message_id = MessageId::Origination;
+    origination.msg_type_name = "Origination Message".to_string();
+    origination.msg_seq = Some(2);
+    origination.ack_req = true;
+    origination.esn = Some(0x1234_5678);
+    origination.imsi_m_s1 = Some(0x0091_989e);
+    origination.imsi_m_s2 = Some(0x0326);
+    origination.imsi_class = Some(0);
+    origination.imsi_mcc = Some(310);
+    origination.imsi_11_12 = Some(99);
+    origination.mob_p_rev = Some(6);
+    origination.slot_cycle_index = Some(2);
+    origination.scm = Some(0x2a);
+    origination.service_option = Some(SERVICE_OPTION_PACKET_DATA);
+    origination.for_supported_rcs = vec![1, 2, 3, 4, 5];
+    origination.rev_supported_rcs = vec![1, 2, 3, 4];
+
+    bsc.inject_access_event(origination.clone()).await;
+
+    let first_walsh = bsc.mobiles[0]
+        .traffic_channel
+        .as_ref()
+        .expect("packet-data traffic channel should be assigned")
+        .walsh_code;
+    assert_eq!(traffic_channels.len(), 1);
+    assert_eq!(traffic_rx_pool.lock().len(), 1);
+    assert_eq!(traffic_rx_removals.lock().len(), 0);
+
+    let mut retry = origination;
+    retry.msg_seq = Some(3);
+    bsc.inject_access_event(retry).await;
+
+    let tc = bsc.mobiles[0]
+        .traffic_channel
+        .as_ref()
+        .expect("packet-data traffic channel should be reassigned");
+    assert_eq!(bsc.mobiles[0].state, MsState::TrafficAssigning);
+    assert_eq!(tc.service_option, SERVICE_OPTION_PACKET_DATA);
+    assert!(matches!(tc.channel_state, ChannelState::Assigned { .. }));
+    assert_eq!(traffic_channels.len(), 1);
+    assert_eq!(traffic_rx_pool.lock().len(), 1);
+    assert!(
+        traffic_rx_removals.lock().contains(&first_walsh),
+        "retry should remove the stale pending RX before fresh assignment"
+    );
+
+    let pch_types = pch_message_types(&bts_client);
+    assert_eq!(
+        pch_types
+            .iter()
+            .filter(|&&msg| msg == MessageId::ExtChannelAssignment)
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]
@@ -3552,7 +3711,7 @@ async fn supported_packet_origination_so_is_not_rejected_when_assignment_falls_b
 #[tokio::test]
 async fn packet_data_service_connect_completion_marks_channel_active() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -3636,7 +3795,7 @@ async fn packet_data_service_connect_completion_marks_channel_active() {
 #[tokio::test]
 async fn packet_data_send_service_connect_uses_origination_sr_id_and_omits_optional_fields() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -3714,12 +3873,13 @@ async fn packet_data_send_service_connect_uses_origination_sr_id_and_omits_optio
 }
 
 #[tokio::test]
-async fn so33_service_connect_omits_rlp_blob_and_uses_origination_sr_id() {
+async fn so33_service_connect_includes_rlp_sync_blob_and_uses_origination_sr_id() {
     use std::sync::{Arc, mpsc::channel};
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
+    let (traffic_tx, mut traffic_rx) = broadcast::channel(32);
 
     let mut bsc = Bsc::new(Config {
         pilot_offset: 0,
@@ -3736,7 +3896,7 @@ async fn so33_service_connect_omits_rlp_blob_and_uses_origination_sr_id() {
         power_override_request_tx: None,
         mobiles_tx: None,
         paging_broadcast: None,
-        traffic_broadcast: None,
+        traffic_broadcast: Some(traffic_tx),
         rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
@@ -3791,12 +3951,33 @@ async fn so33_service_connect_omits_rlp_blob_and_uses_origination_sr_id() {
 
     bsc.send_service_connect(walsh_code, 0)
         .expect("SO33 Service Connect should produce FchForward");
+
+    let event = traffic_rx
+        .try_recv()
+        .expect("SO33 Service Connect should emit a traffic event");
+    let service_connect = event
+        .service_connect
+        .as_ref()
+        .expect("traffic event should carry Service Connect details");
+    let conn = service_connect
+        .connections
+        .iter()
+        .find(|conn| conn.service_option == SERVICE_OPTION_HIGH_RATE_PACKET_DATA)
+        .expect("Service Connect should include the SO33 connection");
+
+    assert_eq!(conn.sr_id, 1);
+    assert!(conn.rlp_info_incl);
+    assert_eq!(
+        conn.rlp_blob.as_deref(),
+        Some(&[0x2c, 0x2d, 0x92, 0x49, 0x20][..])
+    );
+    assert!(conn.qos_parms.is_none());
 }
 
 #[tokio::test]
 async fn packet_data_reverse_bearer_primary_frame_feeds_packet_session() {
     use std::sync::Arc;
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
@@ -3892,7 +4073,10 @@ async fn packet_data_reverse_bearer_primary_frame_feeds_packet_session() {
         message_crc: 0,
     };
 
-    assert!(bsc.route_reverse_bearer_packet_primary(walsh_code, &fch));
+    assert!(
+        bsc.route_reverse_bearer_packet_primary(walsh_code, &fch)
+            .await
+    );
 
     let tc = bsc.mobiles[0]
         .traffic_channel
@@ -3909,6 +4093,148 @@ async fn packet_data_reverse_bearer_primary_frame_feeds_packet_session() {
     assert_eq!(packet_frame.bits, vec![1u8; 171]);
     assert_eq!(packet_frame.num_bits, 171);
     assert_eq!(packet_frame.rate_bps, 9600);
+}
+
+#[tokio::test]
+async fn closed_packet_session_sends_release_before_traffic_teardown() {
+    use std::sync::Arc;
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
+    let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
+    let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
+    let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
+    let (traffic_tx, mut traffic_rx) = broadcast::channel(32);
+
+    let mut bsc = Bsc::new(Config {
+        pilot_offset: 0,
+        overhead: OverheadParameters::default(),
+        paging: PagingChannelSettings::default(),
+        traffic_assignment: TrafficAssignmentConfig::default(),
+        access_event_rx: None,
+        access_event_broadcast: None,
+        sms_request_rx: None,
+        sms_request_tx: None,
+        data_request_rx: None,
+        data_request_tx: None,
+        power_override_request_rx: None,
+        power_override_request_tx: None,
+        mobiles_tx: None,
+        paging_broadcast: None,
+        traffic_broadcast: Some(traffic_tx),
+        rx_reference_dbm: None,
+        hlr_repo: None,
+        msc_client: test_msc_client(),
+        bts_client: Some(test_bts_client(
+            walsh_allocator,
+            traffic_channels,
+            traffic_rx_pool,
+            traffic_rx_removals.clone(),
+        )),
+        traffic_retry: TrafficRetryConfig::default(),
+        paging_retry: PagingRetryConfig::default(),
+        voice_policy: test_voice_policy(),
+        pcf_client: None,
+        mobile_idle_timeout_s: 0,
+        bts_paging_state: None,
+        node_id: "bsc-test".to_string(),
+        msc_voice_bearer: None,
+    });
+
+    let mut origination = test_access_event();
+    origination.message_id = MessageId::Origination;
+    origination.msg_type_name = "Origination Message".to_string();
+    origination.msg_seq = Some(2);
+    origination.ack_req = true;
+    origination.esn = Some(0x1234_5678);
+    origination.imsi_m_s1 = Some(0x0091_989e);
+    origination.imsi_m_s2 = Some(0x0326);
+    origination.imsi_class = Some(0);
+    origination.imsi_mcc = Some(310);
+    origination.imsi_11_12 = Some(99);
+    origination.mob_p_rev = Some(6);
+    origination.slot_cycle_index = Some(2);
+    origination.scm = Some(0x2a);
+    origination.service_option = Some(SERVICE_OPTION_PACKET_DATA);
+    origination.for_supported_rcs = vec![1, 2, 3, 4, 5];
+    origination.rev_supported_rcs = vec![1, 2, 3, 4];
+
+    bsc.inject_access_event(origination).await;
+
+    let walsh_code = bsc.mobiles[0]
+        .traffic_channel
+        .as_ref()
+        .expect("packet-data traffic channel should be assigned")
+        .walsh_code;
+    bsc.mobiles[0].set_state(MsState::TrafficActive);
+    if let Some(tc) = bsc.mobiles[0].traffic_channel.as_mut() {
+        tc.channel_state = ChannelState::Active;
+        tc.packet_session_id = Some("packet-test-session".to_string());
+    }
+
+    let (packet_uplink_tx, packet_uplink_rx) =
+        tokio::sync::mpsc::channel::<crate::packet::PacketBearerFrame>(4);
+    drop(packet_uplink_rx);
+    bsc.mobiles[0]
+        .traffic_channel
+        .as_mut()
+        .expect("packet-data traffic channel should remain assigned")
+        .packet_uplink_tx = Some(packet_uplink_tx);
+
+    let mut information = vec![0u8];
+    information.extend(vec![1u8; 171]);
+    let fch = ReverseFchDcchFrame {
+        channel_family: ChannelFamily::Fch,
+        soft_handoff_leg: 0,
+        fsn: 0,
+        fqi: true,
+        reverse_link_quality: 0,
+        scaling: 0,
+        packet_arrival_time_error: 0,
+        frame_content: FrameContent::FchRc3_9600,
+        fpc_s: 0,
+        eib: false,
+        reverse_link_information: information,
+        message_crc: 0,
+    };
+
+    assert!(
+        !bsc.route_reverse_bearer_packet_primary(walsh_code, &fch)
+            .await
+    );
+    let tc = bsc.mobiles[0]
+        .traffic_channel
+        .as_ref()
+        .expect("closed packet uplink should keep TCH pending MS release");
+    assert!(
+        matches!(tc.channel_state, ChannelState::Releasing { .. }),
+        "closed packet uplink should put the radio traffic channel into release"
+    );
+    assert!(
+        !traffic_rx_removals.lock().contains(&walsh_code),
+        "BSC should not remove BTS RX before release signaling completes"
+    );
+
+    let mut saw_release = false;
+    while let Ok(event) = traffic_rx.try_recv() {
+        if let Some(order) = event.order {
+            if order.order == 0b010101 {
+                saw_release = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_release, "Release Order must be sent on F-TCH");
+
+    bsc.inject_access_event(test_ms_release_order(walsh_code))
+        .await;
+
+    assert!(
+        bsc.mobiles[0].traffic_channel.is_none(),
+        "MS Release Order should tear down the radio traffic channel"
+    );
+    assert!(
+        traffic_rx_removals.lock().contains(&walsh_code),
+        "BSC should request BTS RX removal after MS release"
+    );
 }
 
 #[test]
@@ -5023,7 +5349,7 @@ async fn registration_upserts_mobile_seen_in_hlr() {
 /// shared MS ESN, and the assigned FCH walsh code.
 async fn fsch_test_bsc() -> (Bsc, broadcast::Receiver<TrafficEvent>, u32, u8) {
     use std::sync::Arc;
-    let traffic_channels = Arc::new(Mutex::new(Vec::new()));
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
     let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));

@@ -77,6 +77,8 @@ struct PreparedFrame {
     rate: TrafficRate,
     next_pcg: usize,
     frame_start_chip: u64,
+    /// False for inline null frames.
+    is_queued: bool,
 }
 
 struct TxState {
@@ -95,11 +97,18 @@ pub struct Config<const EK: usize, const ER: usize> {
     pub pcb_scheduler: PcgPcbSchedulerHandle,
 }
 
+/// Caller-side frame prep state.
+struct PrepEngine<const EK: usize, const ER: usize> {
+    encoder: Encoder<EK, ER>,
+    interleaver: BitReversalInterleaver,
+}
+
 pub struct ForwardTrafficChannel<const EK: usize, const ER: usize> {
     config: Mutex<Config<EK, ER>>,
     tx_state: Mutex<TxState>,
-    frames: Mutex<VecDeque<TrafficFrame>>,
-    signaling_frames: Mutex<VecDeque<TrafficFrame>>,
+    prep: Mutex<PrepEngine<EK, ER>>,
+    frames: Mutex<VecDeque<PreparedFrame>>,
+    signaling_frames: Mutex<VecDeque<PreparedFrame>>,
     /// Tracks consecutive null frames for rate-limited logging.
     null_frame_state: Mutex<NullFrameState>,
     /// Timestamp of the last frame enqueued via `send_frame`.
@@ -119,12 +128,17 @@ struct NullFrameState {
 
 impl<const EK: usize, const ER: usize> ForwardTrafficChannel<EK, ER> {
     pub fn new(config: Config<EK, ER>) -> Self {
+        let prep = PrepEngine {
+            encoder: config.encoder,
+            interleaver: config.interleaver.clone(),
+        };
         ForwardTrafficChannel {
             config: Mutex::new(config),
             tx_state: Mutex::new(TxState {
                 symbol_buffer: VecDeque::new(),
                 prepared_frame: None,
             }),
+            prep: Mutex::new(prep),
             frames: Mutex::new(VecDeque::new()),
             signaling_frames: Mutex::new(VecDeque::new()),
             null_frame_state: Mutex::new(NullFrameState {
@@ -136,19 +150,63 @@ impl<const EK: usize, const ER: usize> ForwardTrafficChannel<EK, ER> {
         }
     }
 
-    /// Queue a frame for transmission.
+    /// Queue a traffic frame for transmission.
     pub fn send_frame(&self, frame: TrafficFrame) {
-        self.frames.lock().push_back(frame);
+        let prepared = {
+            let mut prep = self.prep.lock();
+            Self::prepare_frame_static(&mut prep, &frame.data, frame.rate, true)
+        };
+        self.frames.lock().push_back(prepared);
         *self.last_enqueue_at.lock() = Some(std::time::Instant::now());
     }
 
     /// Queue a signaling frame for transmission before any queued voice frames.
     pub fn send_signaling_bits(&self, bits: Vec<u8>) {
-        self.signaling_frames.lock().push_back(TrafficFrame {
-            data: bits,
-            rate: TrafficRate::Full,
-        });
+        let prepared = {
+            let mut prep = self.prep.lock();
+            Self::prepare_frame_static(&mut prep, &bits, TrafficRate::Full, true)
+        };
+        self.signaling_frames.lock().push_back(prepared);
         *self.last_enqueue_at.lock() = Some(std::time::Instant::now());
+    }
+
+    fn prepare_frame_static(
+        prep: &mut PrepEngine<EK, ER>,
+        data: &[u8],
+        rate: TrafficRate,
+        is_queued: bool,
+    ) -> PreparedFrame {
+        let frame_data = build_frame_bits(data, rate);
+        let repeat_factor = rate.repeat_factor();
+
+        prep.encoder.reset();
+        let mut encoded = Vec::with_capacity(frame_data.len() * ER);
+        for &bit in &frame_data {
+            for &sym in prep.encoder.encode(bit).iter() {
+                encoded.push(sym);
+            }
+        }
+
+        let repeated = if repeat_factor > 1 {
+            let mut rep = SymbolRepetition::new(repeat_factor);
+            for &sym in &encoded {
+                rep.feed(sym);
+            }
+            rep.take_all()
+        } else {
+            encoded
+        };
+
+        assert_eq!(repeated.len(), SYMBOLS_PER_FRAME);
+        let interleaved = prep.interleaver.encode(&repeated);
+
+        PreparedFrame {
+            interleaved,
+            rate,
+            next_pcg: 0,
+            frame_start_chip: 0,
+            is_queued,
+        }
     }
 
     /// Returns the timestamp of the last frame enqueued, if any.
@@ -178,6 +236,14 @@ impl<const EK: usize, const ER: usize> ForwardTrafficChannel<EK, ER> {
         scheduler.lock().schedule(abs_pcg, bit);
     }
 
+    pub fn schedule_power_control_burst(&self, start_abs_pcg: u64, pcgs: u64, bit: u8) {
+        let scheduler = {
+            let config = self.config.lock();
+            config.pcb_scheduler.clone()
+        };
+        scheduler.lock().schedule_burst(start_abs_pcg, pcgs, bit);
+    }
+
     /// Advance the internal long code generator to the given absolute chip
     /// position. Uses delta from current position, safe to call multiple times.
     pub fn advance_lc_to_chip(&self, chip: u64) {
@@ -187,25 +253,12 @@ impl<const EK: usize, const ER: usize> ForwardTrafficChannel<EK, ER> {
         config.lc_chip_cursor = chip;
     }
 
-    fn pop_next_frame(&self) -> (Vec<u8>, TrafficRate, bool) {
+    fn pop_next_frame(&self) -> Option<PreparedFrame> {
         // Traffic signaling has priority over queued voice payloads.
-        let frame = self
-            .signaling_frames
+        self.signaling_frames
             .lock()
             .pop_front()
-            .or_else(|| self.frames.lock().pop_front());
-        match frame {
-            Some(f) => (f.data, f.rate, true),
-            None => {
-                // Null traffic MuxPDU: lowest negotiated rate with all bits = 1
-                // (C.S0003-E Section 2.2.1.1.1.3.1.1).
-                (
-                    vec![1u8; TrafficRate::Eighth.info_bits()],
-                    TrafficRate::Eighth,
-                    false,
-                )
-            }
-        }
+            .or_else(|| self.frames.lock().pop_front())
     }
 
     fn note_frame_source(&self, is_queued: bool, rate: TrafficRate, frame_start_chip: u64) {
@@ -258,66 +311,45 @@ impl<const EK: usize, const ER: usize> ForwardTrafficChannel<EK, ER> {
         }
     }
 
-    fn prepare_frame(
-        &self,
-        config: &mut Config<EK, ER>,
-        data: Vec<u8>,
-        rate: TrafficRate,
-        is_queued: bool,
-    ) -> PreparedFrame {
-        let frame_start_chip = config.lc_chip_cursor;
-        self.note_frame_source(is_queued, rate, frame_start_chip);
-
-        // Build complete frame: info bits + CRC + tail bits.
+    /// Build an inline null traffic MuxPDU.
+    fn build_null_frame(config: &mut Config<EK, ER>) -> PreparedFrame {
+        let data = vec![1u8; TrafficRate::Eighth.info_bits()];
+        let rate = TrafficRate::Eighth;
         let frame_data = build_frame_bits(&data, rate);
-        let frame_bits = frame_data.len();
-        let repeat_factor = rate.repeat_factor();
 
-        // Reset encoder for each frame
         config.encoder.reset();
-
-        // Encode: each input bit → ER output symbols (rate-1/2 → 2 symbols per bit)
-        let mut encoded = Vec::with_capacity(frame_bits * ER);
+        let mut encoded = Vec::with_capacity(frame_data.len() * ER);
         for &bit in &frame_data {
             for &sym in config.encoder.encode(bit).iter() {
                 encoded.push(sym);
             }
         }
 
-        // Symbol repetition for sub-full-rate frames
-        let repeated = if repeat_factor > 1 {
-            let mut rep = SymbolRepetition::new(repeat_factor);
-            for &sym in &encoded {
-                rep.feed(sym);
-            }
-            rep.take_all()
-        } else {
-            encoded
-        };
-
-        assert_eq!(
-            repeated.len(),
-            SYMBOLS_PER_FRAME,
-            "Expected {} symbols after repetition, got {}",
-            SYMBOLS_PER_FRAME,
-            repeated.len()
-        );
-
-        // Interleave
+        let mut rep = SymbolRepetition::new(rate.repeat_factor());
+        for &sym in &encoded {
+            rep.feed(sym);
+        }
+        let repeated = rep.take_all();
+        assert_eq!(repeated.len(), SYMBOLS_PER_FRAME);
         let interleaved = config.interleaver.encode(&repeated);
 
         PreparedFrame {
             interleaved,
             rate,
             next_pcg: 0,
-            frame_start_chip,
+            frame_start_chip: 0,
+            is_queued: false,
         }
     }
 
     fn emit_next_pcg(&self, config: &mut Config<EK, ER>, tx_state: &mut TxState) {
         if tx_state.prepared_frame.is_none() {
-            let (data, rate, is_queued) = self.pop_next_frame();
-            tx_state.prepared_frame = Some(self.prepare_frame(config, data, rate, is_queued));
+            let mut prepared = self
+                .pop_next_frame()
+                .unwrap_or_else(|| Self::build_null_frame(config));
+            prepared.frame_start_chip = config.lc_chip_cursor;
+            self.note_frame_source(prepared.is_queued, prepared.rate, prepared.frame_start_chip);
+            tx_state.prepared_frame = Some(prepared);
         }
 
         let prepared = tx_state
@@ -378,16 +410,26 @@ impl<const EK: usize, const ER: usize> ForwardTrafficChannel<EK, ER> {
 
 impl<const EK: usize, const ER: usize> Channel for ForwardTrafficChannel<EK, ER> {
     fn next_block(&self, num_samples: usize, system_time: CdmaSystemTime) -> Vec<Complex32> {
-        let _ = system_time;
+        let mut out = Vec::with_capacity(num_samples);
+        self.next_block_into(&mut out, num_samples, system_time);
+        out
+    }
+
+    fn next_block_into(
+        &self,
+        out: &mut Vec<Complex32>,
+        num_samples: usize,
+        _system_time: CdmaSystemTime,
+    ) {
         let mut config = self.config.lock();
         let mut tx_state = self.tx_state.lock();
         while tx_state.symbol_buffer.len() < num_samples {
             self.emit_next_pcg(&mut config, &mut tx_state);
         }
-        tx_state
-            .symbol_buffer
-            .drain(..num_samples)
-            .collect::<Vec<_>>()
+        out.reserve(num_samples);
+        for _ in 0..num_samples {
+            out.push(tx_state.symbol_buffer.pop_front().unwrap());
+        }
     }
 }
 

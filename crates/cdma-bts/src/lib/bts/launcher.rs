@@ -356,6 +356,7 @@ pub fn build_bts_launch_parts(
     let cdma_freq = bts_config.overhead.cdma_freq;
     let paging_settings = bts_config.runtime.downlink.paging.clone();
     let mac_layer_for_bts = mac_layer.clone();
+    let rx_power_adj = bts_config.radio.rx_power_adj();
     let (bts, handle) = Bts::new_with_settings(
         radio,
         Config {
@@ -388,6 +389,11 @@ pub fn build_bts_launch_parts(
             rx,
         },
         bts_config.runtime.clone(),
+    );
+    handle.power_control.set_rx_power_adj_dbfs(rx_power_adj);
+    info!(
+        "rx: power-control dBFS threshold adjustment={:+.2} dB",
+        rx_power_adj
     );
 
     let overhead = bts_config.overhead.clone();
@@ -510,9 +516,7 @@ pub async fn spawn_local_abis_endpoint(
             for event in events {
                 match event {
                     AbisAgentEvent::ForwardTrafficFrames { walsh_code, frames } => {
-                        let pool = ctrl.traffic_channels_pool();
-                        let slots = pool.lock();
-                        if let Some(slot) = slots.iter().find(|s| s.walsh_code == walsh_code) {
+                        if let Some(slot) = ctrl.traffic_channels_pool().lookup(walsh_code) {
                             for frame in frames {
                                 slot.channel.send_signaling_bits(frame.bits().to_vec());
                             }

@@ -8,11 +8,12 @@
   "clock_source": null,
   "time_source": null,
   "rx_antenna": "RX2",
-  "rx_gain_db": 20.0,
+  "rx_gain_db": 50.0,
   "rx_freq_hz": 836520000,
   "rx_sample_rate_hz": 4915200,
   "rx_bandwidth_hz": 5000000,
   "rx_reference_dbm": null,
+  "rx_power_adj": 0.0,
   "rx_sample_delay": 50,
   "traffic_rx_continuity": true,
   "rx_batch_pcgs": 2

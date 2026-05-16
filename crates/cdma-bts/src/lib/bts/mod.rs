@@ -243,6 +243,20 @@ pub(crate) struct TxLoopState {
     synth_blocks: usize,
     tx_batches: usize,
     interval_start: Instant,
+    pub(super) scratch_pilot: Vec<num::complex::Complex32>,
+    pub(super) scratch_sync: Vec<num::complex::Complex32>,
+    pub(super) scratch_paging: Vec<num::complex::Complex32>,
+    pub(super) scratch_tc_snapshot: Vec<(f32, handle::TrafficChannelWrapper)>,
+    pub(super) scratch_tc_blocks: Vec<(f32, Vec<num::complex::Complex32>)>,
+    /// Last per-block FTCH timing breakdown.
+    pub(super) last_snap_us: u64,
+    pub(super) last_tc_n: usize,
+    pub(super) last_tc_max_us: u64,
+    pub(super) last_tc_sum_us: u64,
+    /// TX-private traffic channel working list. Updated via the lock-free
+    /// command queue from `ChannelRegistry`; the TX synth loop iterates
+    /// this list with no blocking lock on the hot path.
+    pub(super) tx_pool: handle::TxPool,
 }
 
 impl Bts {
@@ -439,6 +453,16 @@ impl Bts {
             synth_blocks: 0,
             tx_batches: 0,
             interval_start: Instant::now(),
+            scratch_pilot: Vec::new(),
+            scratch_sync: Vec::new(),
+            scratch_paging: Vec::new(),
+            scratch_tc_snapshot: Vec::new(),
+            scratch_tc_blocks: Vec::new(),
+            tx_pool: handle::TxPool::new(self.traffic_channels.tx_cmd_queue()),
+            last_snap_us: 0,
+            last_tc_n: 0,
+            last_tc_max_us: 0,
+            last_tc_sum_us: 0,
         };
 
         if let Some(rx) = radio_rx.as_mut() {
@@ -606,18 +630,14 @@ impl Bts {
 
             let batch_playout_tick = timing::batch_playout_tick(&state, chip_cursor, tick_rate);
             if max_blocks.is_none() && self.runtime.max_tx_lookahead_ms > 0 {
-                let lookahead_ticks = self.runtime.max_tx_lookahead_ms as u64 * tick_rate / 1_000;
-                loop {
-                    let elapsed_ns = wall_anchor_instant.elapsed().as_nanos() as u64;
-                    let estimated_hw = wall_anchor_tick
-                        + (elapsed_ns as u128 * tick_rate as u128 / 1_000_000_000) as u64;
-                    if batch_playout_tick.saturating_sub(estimated_hw) <= lookahead_ticks
-                        || shutdown.load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        break;
-                    }
-                    std::hint::spin_loop();
-                }
+                timing::wait_until_within_tx_lookahead(
+                    batch_playout_tick,
+                    wall_anchor_tick,
+                    wall_anchor_instant,
+                    tick_rate,
+                    self.runtime.max_tx_lookahead_ms,
+                    &shutdown,
+                );
             }
 
             if max_blocks.is_none()
@@ -758,12 +778,14 @@ impl Bts {
                     state.paging_time_sum_us += t.elapsed().as_micros() as u64;
                 }
 
+                let prev_synth_pilot_us = state.synth_pilot_us;
+                let prev_synth_fsch_us = state.synth_fsch_us;
+                let prev_synth_fpch_us = state.synth_fpch_us;
                 let prev_synth_ftch_us = state.synth_ftch_us;
                 let prev_synth_spread_us = state.synth_spread_us;
                 let block_gen_start = Instant::now();
                 synth::synthesize_block(
                     &self.runtime,
-                    &self.traffic_channels,
                     &mut state,
                     gen_start,
                     &pch,
@@ -778,11 +800,18 @@ impl Bts {
                 let block_gen_us = block_gen_start.elapsed().as_micros() as u64;
                 if block_gen_us > 500 {
                     log::warn!(
-                        "tx_slow_gen: {}us (block #{}, chip={}) ftch={}us spread={}us",
+                        "tx_slow_gen: {}us (block #{}, chip={}) pilot={}us sync={}us paging={}us ftch={}us [snap={}us tc_n={} tc_sum={}us tc_max={}us] spread={}us",
                         block_gen_us,
                         state.synth_blocks,
                         block_chip,
+                        state.synth_pilot_us.saturating_sub(prev_synth_pilot_us),
+                        state.synth_fsch_us.saturating_sub(prev_synth_fsch_us),
+                        state.synth_fpch_us.saturating_sub(prev_synth_fpch_us),
                         state.synth_ftch_us.saturating_sub(prev_synth_ftch_us),
+                        state.last_snap_us,
+                        state.last_tc_n,
+                        state.last_tc_sum_us,
+                        state.last_tc_max_us,
                         state.synth_spread_us.saturating_sub(prev_synth_spread_us),
                     );
                 }
@@ -845,6 +874,7 @@ impl Bts {
         thread::Builder::new()
             .name("bts-tx".into())
             .spawn(move || {
+                set_thread_priority("bts-tx", true);
                 let result = self.run_loop(None);
                 let _ = tx.send(result);
             })

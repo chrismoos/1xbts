@@ -8,7 +8,7 @@ use num::complex::Complex32;
 use crate::phy::spread::Spreader;
 
 use super::{
-    PagingWalshChannel, PilotWalshChannel, SyncWalshChannel, TrafficChannelPool, TxLoopState,
+    PagingWalshChannel, PilotWalshChannel, SyncWalshChannel, TxLoopState,
     settings::BtsRuntimeSettings,
 };
 
@@ -35,7 +35,6 @@ impl SynthesisService {
     pub(crate) fn synthesize_block(
         &self,
         runtime: &BtsRuntimeSettings,
-        traffic_channels: &TrafficChannelPool,
         state: &mut TxLoopState,
         gen_start: Instant,
         pch: &PilotWalshChannel,
@@ -49,7 +48,6 @@ impl SynthesisService {
     ) -> Result<(), Error> {
         super::synth::synthesize_block(
             runtime,
-            traffic_channels,
             state,
             gen_start,
             pch,

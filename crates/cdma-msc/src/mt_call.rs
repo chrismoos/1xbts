@@ -223,7 +223,7 @@ async fn build_calling_party_ms_information_records(
         number_type: number_type.to_wire(),
         number_plan: number_plan.to_wire(),
         presentation_indicator: 0,
-        screening_indicator: 3,
+        screening_indicator: 1,
         digits,
     };
     Some(MsInformationRecords {

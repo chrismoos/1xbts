@@ -5,10 +5,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::engine::{
-    PacketSession, PacketSessionTelemetry, PacketTraceEvent, SessionAction, SessionPhase,
-    bytes_to_hex, format_tcp_flags, now_ms,
+    PacketSession, PacketSessionTelemetry, PacketTraceEvent, PppSessionState, SessionAction,
+    SessionPhase, bytes_to_hex, format_tcp_flags, now_ms,
 };
-use crate::ip_allocator::{IpAllocator, IpClaimResult};
+use crate::ip_allocator::IpAllocator;
 use crate::ip_transport::IpTransport;
 use crate::ppp::ipcp::IpcpConfig;
 
@@ -65,6 +65,111 @@ pub struct SessionStatus {
     pub last_tx_control_repeats: u64,
     pub recent_ppp_events: VecDeque<PacketTraceEvent>,
     pub capture_events: VecDeque<PacketTraceEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PppSessionCacheHit {
+    pub state: PppSessionState,
+    pub allocation_key: String,
+    pub peer_ip: std::net::Ipv4Addr,
+    pub idle_for: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct PppSessionCacheExpired {
+    pub identity_key: String,
+    pub allocation_key: String,
+    pub peer_ip: std::net::Ipv4Addr,
+    pub idle_for: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub enum PppSessionCacheLookup {
+    Hit(PppSessionCacheHit),
+    Expired(PppSessionCacheExpired),
+    Miss,
+}
+
+#[derive(Debug, Clone)]
+struct CachedPppSession {
+    state: PppSessionState,
+    allocation_key: String,
+    last_activity_at: Instant,
+}
+
+#[derive(Debug, Default)]
+pub struct PppSessionStore {
+    sessions: Mutex<HashMap<String, CachedPppSession>>,
+}
+
+impl PppSessionStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn lookup(&self, identity_key: &str, timeout: Duration) -> PppSessionCacheLookup {
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(cached) = sessions.get(identity_key) else {
+            return PppSessionCacheLookup::Miss;
+        };
+        let idle_for = cached.last_activity_at.elapsed();
+        if idle_for >= timeout {
+            let expired = sessions
+                .remove(identity_key)
+                .expect("cached PPP session disappeared while locked");
+            return PppSessionCacheLookup::Expired(PppSessionCacheExpired {
+                identity_key: identity_key.to_string(),
+                allocation_key: expired.allocation_key,
+                peer_ip: expired.state.ipcp.config.peer_ip,
+                idle_for,
+            });
+        }
+        PppSessionCacheLookup::Hit(PppSessionCacheHit {
+            state: cached.state.clone(),
+            allocation_key: cached.allocation_key.clone(),
+            peer_ip: cached.state.ipcp.config.peer_ip,
+            idle_for,
+        })
+    }
+
+    pub fn store(
+        &self,
+        identity_key: String,
+        allocation_key: String,
+        state: PppSessionState,
+        last_activity_at: Instant,
+    ) {
+        self.sessions.lock().unwrap().insert(
+            identity_key,
+            CachedPppSession {
+                state,
+                allocation_key,
+                last_activity_at,
+            },
+        );
+    }
+
+    pub fn reap_expired(&self, timeout: Duration) -> Vec<PppSessionCacheExpired> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let expired_keys = sessions
+            .iter()
+            .filter(|(_, cached)| cached.last_activity_at.elapsed() >= timeout)
+            .map(|(identity_key, _)| identity_key.clone())
+            .collect::<Vec<_>>();
+
+        expired_keys
+            .into_iter()
+            .filter_map(|identity_key| {
+                let expired = sessions.remove(&identity_key)?;
+                Some(PppSessionCacheExpired {
+                    identity_key,
+                    allocation_key: expired.allocation_key,
+                    peer_ip: expired.state.ipcp.config.peer_ip,
+                    idle_for: expired.last_activity_at.elapsed(),
+                })
+            })
+            .collect()
+    }
 }
 
 impl SessionStatus {
@@ -296,11 +401,58 @@ pub async fn run_session(
     mut control_rx: mpsc::Receiver<SessionControl>,
     metadata: SessionMetadata,
     lifecycle_sink: Arc<dyn crate::session_lifecycle::SessionLifecycleSink>,
+    ppp_session_store: Option<Arc<PppSessionStore>>,
+    ppp_session_timeout: Duration,
 ) {
-    let allocation_key = session_allocation_key(&session_id, &status);
+    let ppp_identity_key = ppp_identity_key(&metadata);
+    let allocation_key = session_allocation_key(&session_id, &status, &metadata);
+    let mut ppp_resume_state = None;
+    if let (Some(store), Some(identity_key)) = (&ppp_session_store, &ppp_identity_key) {
+        match store.lookup(identity_key, ppp_session_timeout) {
+            PppSessionCacheLookup::Hit(hit) => {
+                log::info!(
+                    "packet-service: session {} walsh={} PPP cache hit identity={} peer_ip={} idle_secs={} allocation_key={}",
+                    session_id,
+                    metadata.traffic_walsh_code,
+                    identity_key,
+                    hit.peer_ip,
+                    hit.idle_for.as_secs(),
+                    hit.allocation_key
+                );
+                ppp_resume_state = Some(hit.state);
+            }
+            PppSessionCacheLookup::Expired(expired) => {
+                log::info!(
+                    "packet-service: session {} walsh={} PPP cache expired identity={} peer_ip={} idle_secs={} allocation_key={}",
+                    session_id,
+                    metadata.traffic_walsh_code,
+                    identity_key,
+                    expired.peer_ip,
+                    expired.idle_for.as_secs(),
+                    expired.allocation_key
+                );
+                allocator.release(&expired.allocation_key);
+            }
+            PppSessionCacheLookup::Miss => {
+                log::info!(
+                    "packet-service: session {} walsh={} PPP cache miss identity={}",
+                    session_id,
+                    metadata.traffic_walsh_code,
+                    identity_key
+                );
+            }
+        }
+    } else {
+        log::info!(
+            "packet-service: session {} walsh={} PPP cache unavailable identity={}",
+            session_id,
+            metadata.traffic_walsh_code,
+            ppp_identity_key.as_deref().unwrap_or("unknown")
+        );
+    }
     let allocated = allocator.allocate(&allocation_key);
     let allocator_failed = allocated.is_none();
-    let ipcp_config = allocated.unwrap_or_else(|| {
+    let mut ipcp_config = allocated.unwrap_or_else(|| {
         log::warn!(
             "packet-service: IP pool exhausted for session {} key {}, falling back to default",
             session_id,
@@ -308,11 +460,30 @@ pub async fn run_session(
         );
         IpcpConfig::default()
     });
+    if let Some(resume_state) = &ppp_resume_state {
+        let cached_config = resume_state.ipcp.config.clone();
+        if !allocator_failed && cached_config.peer_ip == ipcp_config.peer_ip {
+            ipcp_config = cached_config;
+        } else {
+            log::warn!(
+                "packet-service: session {} walsh={} PPP cache discarded identity={} cached_peer_ip={} allocated_peer_ip={} allocator_failed={}",
+                session_id,
+                metadata.traffic_walsh_code,
+                ppp_identity_key.as_deref().unwrap_or("unknown"),
+                cached_config.peer_ip,
+                ipcp_config.peer_ip,
+                allocator_failed
+            );
+            ppp_resume_state = None;
+        }
+    }
     log::info!(
-        "packet-service: session {} allocated peer_ip={} key={}",
+        "packet-service: session {} walsh={} allocated peer_ip={} key={} ppp_resume={}",
         session_id,
+        metadata.traffic_walsh_code,
         ipcp_config.peer_ip,
-        allocation_key
+        allocation_key,
+        ppp_resume_state.is_some()
     );
 
     let bind_peer_ip = ipcp_config.peer_ip;
@@ -328,8 +499,12 @@ pub async fn run_session(
             our_ip: bind_our_ip,
         });
     }
-    let mut session = PacketSession::new(service_option, ipcp_config);
-    session.set_log_context(session_id.clone());
+    let mut session =
+        PacketSession::new_with_ppp_resume(service_option, ipcp_config, ppp_resume_state);
+    session.set_log_context(format!(
+        "session={} walsh={}",
+        session_id, metadata.traffic_walsh_code
+    ));
     let mut transport_ready = false;
     let (to_mobile_tx, mut to_mobile_rx) = mpsc::channel::<Vec<u8>>(256);
 
@@ -350,10 +525,12 @@ pub async fn run_session(
     let mut first_uplink_ip_logged = false;
     let mut first_downlink_ip_logged = false;
     let mut tcp_log_state = TcpLogState::default();
+    let mut last_ppp_activity_at = Instant::now();
 
     log::info!(
-        "packet-service: session {} started (SO {})",
+        "packet-service: session {} walsh={} started (SO {})",
         session_id,
+        metadata.traffic_walsh_code,
         service_option
     );
 
@@ -416,12 +593,16 @@ pub async fn run_session(
                 } else {
                     session.tick(None)
                 };
-                if process_actions(
+                let close_session = process_actions(
                     &session_id, &mut session, &mut transport, &mut transport_ready,
                     &to_mobile_tx, &downlink_tx, &status, &allocator, &allocation_key, &mut path_stats,
                     &mut first_sch_payload_logged, &mut first_uplink_ip_logged,
                     &mut tcp_log_state, actions,
-                ).await {
+                ).await;
+                if session.take_ppp_activity() {
+                    last_ppp_activity_at = Instant::now();
+                }
+                if close_session {
                     break;
                 }
             }
@@ -489,6 +670,9 @@ pub async fn run_session(
             // LCP Echo keepalive (every 30s)
             _ = echo_interval.tick() => {
                 session.maybe_send_echo();
+                if session.take_ppp_activity() {
+                    last_ppp_activity_at = Instant::now();
+                }
                 if session.echo_dead() {
                     log::warn!(
                         "packet-service: session {} LCP echo dead, closing",
@@ -520,6 +704,9 @@ pub async fn run_session(
                     summarize_ip_packet(&ip_data)
                 );
                 session.send_ip_packet(&ip_data);
+                if session.take_ppp_activity() {
+                    last_ppp_activity_at = Instant::now();
+                }
                 // Do not advance RLP here. Packet sessions are driven strictly
                 // by the 20 ms traffic-channel cadence above; generating frames
                 // from network arrival skews RLP timing and injects synthetic
@@ -528,9 +715,43 @@ pub async fn run_session(
         }
     }
 
+    let ppp_snapshot = session.snapshot_ppp_state();
+    let ppp_cache_kept = if let (Some(store), Some(identity_key), Some(snapshot)) =
+        (&ppp_session_store, ppp_identity_key.as_ref(), ppp_snapshot)
+    {
+        let peer_ip = snapshot.ipcp.config.peer_ip;
+        store.store(
+            identity_key.clone(),
+            allocation_key.clone(),
+            snapshot,
+            last_ppp_activity_at,
+        );
+        log::info!(
+            "packet-service: session {} walsh={} stored open PPP session identity={} peer_ip={} allocation_key={} idle_secs={}",
+            session_id,
+            metadata.traffic_walsh_code,
+            identity_key,
+            peer_ip,
+            allocation_key,
+            last_ppp_activity_at.elapsed().as_secs()
+        );
+        true
+    } else {
+        false
+    };
+
     // Cleanup
     transport.teardown();
-    allocator.release(&allocation_key);
+    if ppp_cache_kept {
+        log::info!(
+            "packet-service: session {} walsh={} keeping IP allocation for cached PPP session key={}",
+            session_id,
+            metadata.traffic_walsh_code,
+            allocation_key
+        );
+    } else {
+        allocator.release(&allocation_key);
+    }
     {
         let mut s = status.lock().unwrap();
         s.sync_telemetry(SessionPhase::Closed, session.telemetry());
@@ -550,7 +771,14 @@ pub async fn run_session(
     log::info!("packet-service: session {} ended", session_id);
 }
 
-fn session_allocation_key(session_id: &str, status: &Arc<Mutex<SessionStatus>>) -> String {
+fn session_allocation_key(
+    session_id: &str,
+    status: &Arc<Mutex<SessionStatus>>,
+    metadata: &SessionMetadata,
+) -> String {
+    if let Some(key) = ppp_identity_key(metadata) {
+        return format!("device:{}", key);
+    }
     let s = status.lock().unwrap();
     if !s.mobile_address.is_empty() {
         return format!("mobile:{}", s.mobile_address);
@@ -559,6 +787,15 @@ fn session_allocation_key(session_id: &str, status: &Arc<Mutex<SessionStatus>>) 
         return format!("subscriber:{}", s.subscriber_id);
     }
     format!("session:{}", session_id)
+}
+
+pub fn ppp_identity_key(metadata: &SessionMetadata) -> Option<String> {
+    match (metadata.imsi.as_deref(), metadata.esn) {
+        (Some(imsi), Some(esn)) => Some(format!("imsi:{}:esn:{:08x}", imsi, esn)),
+        (Some(imsi), None) => Some(format!("imsi:{}", imsi)),
+        (None, Some(esn)) => Some(format!("esn:{:08x}", esn)),
+        (None, None) => None,
+    }
 }
 
 /// Process session actions: send downlink RLP frames, set up IP transport on first IP packet.
@@ -570,8 +807,8 @@ async fn process_actions(
     to_mobile_tx: &mpsc::Sender<Vec<u8>>,
     downlink_tx: &mpsc::Sender<SessionFrame>,
     status: &Arc<Mutex<SessionStatus>>,
-    allocator: &Arc<dyn IpAllocator>,
-    allocation_key: &str,
+    _allocator: &Arc<dyn IpAllocator>,
+    _allocation_key: &str,
     path_stats: &mut PacketPathStats,
     first_sch_payload_logged: &mut bool,
     first_uplink_ip_logged: &mut bool,
@@ -579,51 +816,6 @@ async fn process_actions(
     actions: Vec<SessionAction>,
 ) -> bool {
     for action in actions {
-        let action = match action {
-            SessionAction::ClaimPeerIp {
-                peer_ip,
-                resume_packet,
-            } => match allocator.claim_peer_ip(allocation_key, peer_ip) {
-                IpClaimResult::Claimed(config) | IpClaimResult::AlreadyOwned(config) => {
-                    log::info!(
-                        "packet-service: session {} claimed resumed peer_ip={} key={}",
-                        session_id,
-                        config.peer_ip,
-                        allocation_key
-                    );
-                    session.set_claimed_peer_ip(config.peer_ip);
-                    if let Some(packet) = resume_packet {
-                        session.activate_claimed_peer_ip(config.peer_ip);
-                        SessionAction::DeliverIpPacket(packet)
-                    } else {
-                        continue;
-                    }
-                }
-                IpClaimResult::Conflict { current_owner } => {
-                    log::warn!(
-                        "packet-service: session {} peer_ip={} key={} conflicts with {}, closing",
-                        session_id,
-                        peer_ip,
-                        allocation_key,
-                        current_owner
-                    );
-                    session.close();
-                    return true;
-                }
-                IpClaimResult::OutOfPool => {
-                    log::warn!(
-                        "packet-service: session {} peer_ip={} key={} is outside pool, closing",
-                        session_id,
-                        peer_ip,
-                        allocation_key
-                    );
-                    session.close();
-                    return true;
-                }
-            },
-            other => other,
-        };
-
         match action {
             SessionAction::CloseSession { reason } => {
                 log::warn!(
@@ -749,7 +941,6 @@ async fn process_actions(
                     }
                 }
             }
-            SessionAction::ClaimPeerIp { .. } => unreachable!(),
         }
     }
 
@@ -1042,6 +1233,113 @@ fn log_tcp_packet(session_id: &str, direction: &str, packet: &[u8], state: &mut 
             state.downlink_payload
         );
         state.data_exchange_logged = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ppp::ipcp::IpcpOpenState;
+    use crate::ppp::lcp::{LcpOpenState, NegotiatedOptions};
+    use std::net::Ipv4Addr;
+
+    fn ppp_state(peer_ip: Ipv4Addr) -> PppSessionState {
+        PppSessionState {
+            lcp: LcpOpenState {
+                negotiated: NegotiatedOptions::default(),
+                last_acked_peer_request_data: Vec::new(),
+            },
+            ipcp: IpcpOpenState {
+                config: IpcpConfig {
+                    our_ip: Ipv4Addr::new(10, 55, 0, 1),
+                    peer_ip,
+                    primary_dns: Ipv4Addr::new(10, 55, 0, 1),
+                    secondary_dns: Ipv4Addr::new(10, 55, 0, 1),
+                },
+                request_local_ip: true,
+                last_acked_peer_request_data: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn ppp_identity_uses_imsi_and_esn() {
+        let metadata = SessionMetadata {
+            imsi: Some("001010123456789".to_string()),
+            esn: Some(0x1234abcd),
+            ..SessionMetadata::default()
+        };
+        assert_eq!(
+            ppp_identity_key(&metadata).as_deref(),
+            Some("imsi:001010123456789:esn:1234abcd")
+        );
+    }
+
+    #[test]
+    fn ppp_session_store_hits_and_expires_by_last_activity() {
+        let store = PppSessionStore::new();
+        store.store(
+            "imsi:test:esn:00000001".to_string(),
+            "device:imsi:test:esn:00000001".to_string(),
+            ppp_state(Ipv4Addr::new(10, 55, 0, 7)),
+            Instant::now(),
+        );
+
+        match store.lookup("imsi:test:esn:00000001", Duration::from_secs(30)) {
+            PppSessionCacheLookup::Hit(hit) => {
+                assert_eq!(hit.peer_ip, Ipv4Addr::new(10, 55, 0, 7));
+            }
+            other => panic!("expected cache hit, got {other:?}"),
+        }
+
+        store.store(
+            "imsi:test:esn:00000002".to_string(),
+            "device:imsi:test:esn:00000002".to_string(),
+            ppp_state(Ipv4Addr::new(10, 55, 0, 8)),
+            Instant::now() - Duration::from_secs(31),
+        );
+        match store.lookup("imsi:test:esn:00000002", Duration::from_secs(30)) {
+            PppSessionCacheLookup::Expired(expired) => {
+                assert_eq!(expired.peer_ip, Ipv4Addr::new(10, 55, 0, 8));
+            }
+            other => panic!("expected cache expiry, got {other:?}"),
+        }
+        assert!(matches!(
+            store.lookup("imsi:test:esn:00000002", Duration::from_secs(30)),
+            PppSessionCacheLookup::Miss
+        ));
+    }
+
+    #[test]
+    fn ppp_session_store_reaps_expired_sessions() {
+        let store = PppSessionStore::new();
+        store.store(
+            "imsi:test:esn:00000001".to_string(),
+            "device:imsi:test:esn:00000001".to_string(),
+            ppp_state(Ipv4Addr::new(10, 55, 0, 7)),
+            Instant::now() - Duration::from_secs(29),
+        );
+        store.store(
+            "imsi:test:esn:00000002".to_string(),
+            "device:imsi:test:esn:00000002".to_string(),
+            ppp_state(Ipv4Addr::new(10, 55, 0, 8)),
+            Instant::now() - Duration::from_secs(31),
+        );
+
+        let expired = store.reap_expired(Duration::from_secs(30));
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].identity_key, "imsi:test:esn:00000002");
+        assert_eq!(expired[0].allocation_key, "device:imsi:test:esn:00000002");
+        assert_eq!(expired[0].peer_ip, Ipv4Addr::new(10, 55, 0, 8));
+
+        assert!(matches!(
+            store.lookup("imsi:test:esn:00000001", Duration::from_secs(30)),
+            PppSessionCacheLookup::Hit(_)
+        ));
+        assert!(matches!(
+            store.lookup("imsi:test:esn:00000002", Duration::from_secs(30)),
+            PppSessionCacheLookup::Miss
+        ));
     }
 }
 

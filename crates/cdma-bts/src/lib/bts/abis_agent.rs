@@ -1653,7 +1653,7 @@ mod tests {
         assert_eq!(responses[0].message_type, MessageType::RemoveAck);
         assert_eq!(agent.active_session_count(), 0);
 
-        assert!(controller.traffic_channels_pool().lock().is_empty());
+        assert!(controller.traffic_channels_pool().is_empty());
 
         assert_eq!(events.len(), 1);
         assert!(matches!(
@@ -1991,7 +1991,7 @@ mod tests {
         let rx = rx_pool.iter().find(|r| r.walsh_code == walsh_code);
         assert!(rx.is_some());
         assert_eq!(rx.unwrap().assigned_rev_rc, 1);
-        assert_eq!(controller.traffic_channels_pool().lock().len(), 1);
+        assert_eq!(controller.traffic_channels_pool().len(), 1);
     }
 
     #[test]

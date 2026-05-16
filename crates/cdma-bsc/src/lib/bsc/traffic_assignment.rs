@@ -296,44 +296,17 @@ impl Bsc {
         let esn = ms.esn.unwrap_or(0);
         let traffic_lc = LongCodeGenerator::new_traffic_channel(esn);
 
-        if let Some(existing_tc) = ms.pending_packet_traffic_assignment() {
-            let walsh_code = existing_tc.walsh_code;
-            let assigned_rcs = (existing_tc.for_rc, existing_tc.rev_rc);
+        let stale_pending_packet = ms
+            .pending_packet_traffic_assignment()
+            .map(|tc| (tc.walsh_code, tc.rc_label));
+        if let Some((walsh_code, rc_label)) = stale_pending_packet {
             info!(
-                "BSC: reusing pending {} packet-data channel walsh={} for {}",
-                existing_tc.rc_label,
+                "BSC: tearing down stale pending {} packet-data channel walsh={} for {} before retry",
+                rc_label,
                 walsh_code,
                 format_ms_address(fwd_address)
             );
-
-            match self.traffic_assignment.send_channel_assignment(
-                &self.mobiles,
-                &self.access_tx,
-                self.config.pilot_offset,
-                &self.config.overhead,
-                &self.config.traffic_assignment,
-                fwd_address,
-                last_msg_seq,
-                walsh_code,
-                Some(assigned_rcs),
-                super::access::access_response_tx_time(event),
-                ack_deadline,
-            ) {
-                Ok(()) => {
-                    self.mobiles.update(fwd_address, |ms| {
-                        ms.mark_traffic_channel_assigned(walsh_code);
-                    });
-                }
-                Err(e) => {
-                    log::warn!(
-                        "BSC: failed to resend packet-data Channel Assignment for {} on walsh={}: {}",
-                        format_ms_address(fwd_address),
-                        walsh_code,
-                        e
-                    );
-                }
-            }
-            return true;
+            self.teardown_traffic_channel(walsh_code).await;
         }
 
         let Some(bts_client) = bts_client.as_ref() else {

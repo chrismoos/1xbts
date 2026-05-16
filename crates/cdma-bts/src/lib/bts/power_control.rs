@@ -16,7 +16,7 @@ const RC1_AUTO_MAX_DB: f32 = 12.0;
 const RC1_MANUAL_MIN_DB: f32 = 0.0;
 const RC1_MANUAL_MAX_DB: f32 = 40.0;
 const RC3_INITIAL_TARGET_DB: f32 = -5.5;
-const RC3_AUTO_MIN_DB: f32 = -8.0;
+const RC3_AUTO_MIN_DB: f32 = -5.5;
 const RC3_AUTO_MAX_DB: f32 = -1.5;
 const RC3_MANUAL_MIN_DB: f32 = -40.0;
 const RC3_MANUAL_MAX_DB: f32 = 40.0;
@@ -47,13 +47,13 @@ pub(super) const PCG_PREDICTION_LEAD_PCGS: u32 = 12;
 const PCG_PREDICTION_CLAMP_DB: f32 = 1.0;
 // Brake offset subtracted from the PCB error in the pre-clip region to keep
 // the reverse link below the ADC knee.
-const BRAKE_BEGIN_DBFS: f32 = -22.0;
-const BRAKE_FULL_DBFS: f32 = -12.0;
+const BRAKE_BEGIN_DBFS: f32 = -12.0;
+const BRAKE_FULL_DBFS: f32 = -2.0;
 const BRAKE_MAX_OFFSET_DB: f32 = 8.0;
 const CLIP_BEGIN_DBFS: f32 = -8.0;
 const PCG_CLIP_COOLDOWN_PCGS: u8 = 32;
-const PCG_FORCE_DOWN_BRAKE_DB: f32 = 5.0;
-const PCG_PRECLIP_GUARD_DBFS: f32 = -16.0;
+const PCG_RAW_HOT_LIMIT_DBFS: f32 = -8.0;
+const PCG_RAW_HOT_RELEASE_DBFS: f32 = -10.0;
 const OUTER_LOOP_OVERPOWER_CLIP_PCGS: usize = 4;
 const OUTER_LOOP_UNDERPOWER_ERROR_DB: f32 = 4.0;
 const OUTER_LOOP_UNDERPOWER_MIN_UP_PCBS: usize = 12;
@@ -62,17 +62,6 @@ const OUTER_LOOP_UNDERPOWER_MAX_BRAKE_DB: f32 = 2.0;
 const OUTER_LOOP_MIN_FRAME_OBSERVATION_PCGS: usize = 8;
 const OUTER_LOOP_CELL_SETTLING_FRAMES: u64 = 0;
 const OUTER_LOOP_TRANSIENT_RECOVERY_FRAMES: u64 = 0;
-const HOT_START_PREAMBLE_RAW_DBFS: f32 = -30.0;
-const HOT_START_BOOTSTRAP_DOWN_PCGS: u64 = 40;
-const HOT_START_HARD_RAW_DBFS: f32 = -16.0;
-const HOT_START_SOFT_RAW_DBFS: f32 = -18.0;
-const HOT_START_RELEASE_RAW_DBFS: f32 = -21.0;
-const HOT_START_HARD_BRAKE_DB: f32 = 5.0;
-const HOT_START_SOFT_BRAKE_DB: f32 = 3.0;
-const HOT_START_RELEASE_BRAKE_DB: f32 = 1.5;
-const HOT_START_SOFT_EXTEND_PCGS: u16 = 48;
-const HOT_START_HARD_EXTEND_PCGS: u16 = 160;
-const HOT_START_RELEASE_DECAY_PCGS: u16 = 8;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BtsPowerControlTick {
@@ -138,7 +127,7 @@ mod tests {
             10,
             100,
             -20.0,
-            Some((BRAKE_BEGIN_DBFS + PCG_PRECLIP_GUARD_DBFS) * 0.5),
+            Some((BRAKE_BEGIN_DBFS + PCG_RAW_HOT_LIMIT_DBFS) * 0.5),
             0,
         );
         assert!(state.last_brake_offset_db > 0.0);
@@ -151,6 +140,25 @@ mod tests {
         let tick = state.tick_single_pcg(10, 100, -30.0, Some(CLIP_BEGIN_DBFS + 1.0), 0);
         assert_eq!(tick.pcb, 1);
         assert!(tick.raw_power_clamp_active);
+    }
+
+    #[test]
+    fn outer_loop_ignores_frames_before_pcg_observations_for_lifetime_fer() {
+        let mut state = rc3_state_without_startup_seed();
+
+        for _ in 0..10 {
+            let snap = state.outer_loop_tick(10, false, None);
+            assert_eq!(snap.frames_total, 0);
+            assert_eq!(snap.frames_crc_error, 0);
+            assert_eq!(snap.fer_pct, 0.0);
+        }
+
+        for pcg in 0..16 {
+            let _ = state.tick_single_pcg(10, pcg, -6.0, Some(-24.0), 0);
+        }
+        let snap = state.outer_loop_tick(10, false, None);
+        assert_eq!(snap.frames_total, 1);
+        assert_eq!(snap.frames_crc_error, 1);
     }
 
     fn rc3_state_for_predictor() -> BtsReversePowerControlState {
@@ -327,7 +335,7 @@ mod tests {
         let mut up = 0;
         let mut down = 0;
         for pcg in 0..200u64 {
-            let tick = state.tick_single_pcg(10, pcg, -14.0, None, 0);
+            let tick = state.tick_single_pcg(10, pcg, -10.0, None, 0);
             if tick.pcb == 0 {
                 up += 1;
             } else {
@@ -359,6 +367,91 @@ mod tests {
             "cold filt should not engage brake: up={up} down={down}",
         );
         assert_eq!(state.last_brake_offset_db, 0.0);
+    }
+
+    #[test]
+    fn raw_power_guard_releases_when_underpowered_and_rx_power_cold() {
+        let mut state = rc3_state_for_predictor();
+        state.brake_filtered_raw_power_db = Some(OUTER_LOOP_UNDERPOWER_MAX_RAW_DBFS - 5.0);
+
+        let tick = state.tick_single_pcg(
+            10,
+            100,
+            -14.0,
+            Some(OUTER_LOOP_UNDERPOWER_MAX_RAW_DBFS - 5.0),
+            0,
+        );
+
+        assert_eq!(tick.pcb, 0);
+        assert!(!tick.raw_power_clamp_active);
+    }
+
+    #[test]
+    fn raw_power_hot_limiter_holds_until_raw_release_threshold() {
+        let mut state = rc3_state_for_predictor();
+
+        let hot = state.tick_single_pcg(10, 100, -14.0, Some(PCG_RAW_HOT_LIMIT_DBFS + 0.5), 0);
+        assert_eq!(hot.pcb, 1);
+        assert!(hot.raw_power_clamp_active);
+
+        let held = state.tick_single_pcg(10, 101, -14.0, Some(PCG_RAW_HOT_RELEASE_DBFS + 0.5), 0);
+        assert_eq!(held.pcb, 1);
+        assert!(held.raw_power_clamp_active);
+
+        let released =
+            state.tick_single_pcg(10, 102, -14.0, Some(PCG_RAW_HOT_RELEASE_DBFS - 0.5), 0);
+
+        assert_eq!(released.pcb, 0);
+        assert!(!released.raw_power_clamp_active);
+    }
+
+    #[test]
+    fn raw_only_measurement_commands_up_until_hot_limit() {
+        let mut state = rc3_state_for_predictor();
+
+        let cold = state.tick_single_pcg(10, 101, f32::NAN, Some(PCG_RAW_HOT_LIMIT_DBFS - 2.0), 0);
+        assert_eq!(cold.pcb, 0);
+        assert!(!cold.raw_power_clamp_active);
+
+        let hot = state.tick_single_pcg(10, 102, f32::NAN, Some(PCG_RAW_HOT_LIMIT_DBFS + 0.1), 0);
+        assert_eq!(hot.pcb, 1);
+        assert!(hot.raw_power_clamp_active);
+    }
+
+    #[test]
+    fn raw_power_hot_limit_overrides_underpowered_metric() {
+        let mut state = rc3_state_for_predictor();
+
+        let tick = state.tick_single_pcg(10, 100, -14.0, Some(PCG_RAW_HOT_LIMIT_DBFS + 0.1), 0);
+
+        assert_eq!(tick.pcb, 1);
+        assert!(tick.raw_power_clamp_active);
+    }
+
+    #[test]
+    fn raw_power_guard_does_not_release_while_actually_clipping() {
+        let mut state = rc3_state_for_predictor();
+        state.last_fer_pct = 10.0;
+
+        let tick = state.tick_single_pcg(10, 100, -14.0, Some(CLIP_BEGIN_DBFS + 1.0), 0);
+
+        assert_eq!(tick.pcb, 1);
+        assert!(tick.raw_power_clamp_active);
+    }
+
+    #[test]
+    fn rx_power_adj_moves_raw_hot_thresholds() {
+        let mut state = rc3_state_for_predictor();
+        state.set_rx_power_adj_dbfs(3.0);
+
+        let below_adjusted_hot =
+            state.tick_single_pcg(10, 100, -14.0, Some(PCG_RAW_HOT_LIMIT_DBFS + 2.5), 0);
+        assert!(!below_adjusted_hot.raw_power_clamp_active);
+
+        let at_adjusted_hot =
+            state.tick_single_pcg(10, 101, -14.0, Some(PCG_RAW_HOT_LIMIT_DBFS + 3.0), 0);
+        assert_eq!(at_adjusted_hot.pcb, 1);
+        assert!(at_adjusted_hot.raw_power_clamp_active);
     }
 }
 
@@ -393,8 +486,9 @@ struct BtsReversePowerControlState {
     last_slope_db_per_pcg: f32,
     last_brake_offset_db: f32,
     clip_cooldown_pcgs: u8,
-    hot_start_guard_remaining_pcgs: u16,
+    raw_hot_limiter_active: bool,
     transient_recovery_frames_remaining: u64,
+    rx_power_adj_dbfs: f32,
 }
 
 impl BtsReversePowerControlState {
@@ -455,9 +549,14 @@ impl BtsReversePowerControlState {
             last_slope_db_per_pcg: 0.0,
             last_brake_offset_db: 0.0,
             clip_cooldown_pcgs: 0,
-            hot_start_guard_remaining_pcgs: 0,
+            raw_hot_limiter_active: false,
             transient_recovery_frames_remaining: 0,
+            rx_power_adj_dbfs: 0.0,
         }
+    }
+
+    fn set_rx_power_adj_dbfs(&mut self, rx_power_adj_dbfs: f32) {
+        self.rx_power_adj_dbfs = rx_power_adj_dbfs;
     }
 
     fn apply_setpoint(&mut self, setpoint: BtsReversePowerSetpoint) {
@@ -485,7 +584,7 @@ impl BtsReversePowerControlState {
         self.last_slope_db_per_pcg = 0.0;
         self.last_brake_offset_db = 0.0;
         self.clip_cooldown_pcgs = 0;
-        self.hot_start_guard_remaining_pcgs = 0;
+        self.raw_hot_limiter_active = false;
         self.transient_recovery_frames_remaining = 0;
     }
 
@@ -515,6 +614,20 @@ impl BtsReversePowerControlState {
         let frame_underpowered =
             has_frame_observations && !frame_overpowered && self.recent_frame_underpowered();
 
+        if !has_frame_observations {
+            if cdma_common::diagnostics::power_control_verbose_enabled_for_walsh(walsh_code) {
+                log::info!(
+                    "power_frame[w{}]: crc={} counted=no_pcg_observation lifetime_frames={} fer={:.2}% target={:.2}",
+                    walsh_code,
+                    crc_valid as u8,
+                    self.total_frames,
+                    self.last_fer_pct,
+                    self.effective_target_db(),
+                );
+            }
+            return self.snapshot(walsh_code);
+        }
+
         if crc_valid {
             self.total_valid_frames = self.total_valid_frames.saturating_add(1);
         } else {
@@ -530,19 +643,6 @@ impl BtsReversePowerControlState {
             self.last_fer_pct = 100.0 * errors as f32 / self.crc_window.len() as f32;
         }
 
-        if !has_frame_observations {
-            if cdma_common::diagnostics::power_control_verbose_enabled_for_walsh(walsh_code) {
-                log::info!(
-                    "power_frame[w{}]: crc={} counted=no_pcg_observation frame={} fer={:.2}% target={:.2}",
-                    walsh_code,
-                    crc_valid as u8,
-                    self.total_frames,
-                    self.last_fer_pct,
-                    self.effective_target_db(),
-                );
-            }
-            return self.snapshot(walsh_code);
-        }
         if crc_valid {
             self.target_adaptation_valid_frames =
                 self.target_adaptation_valid_frames.saturating_add(1);
@@ -677,9 +777,13 @@ impl BtsReversePowerControlState {
         self.recent_clip_pcgs() >= OUTER_LOOP_OVERPOWER_CLIP_PCGS
     }
 
+    fn adjusted_dbfs(&self, threshold_dbfs: f32) -> f32 {
+        threshold_dbfs + self.rx_power_adj_dbfs
+    }
+
     fn recent_frame_underpowered(&self) -> bool {
         if Self::finite_stats(&self.last_pcg_raw_power_db)
-            .map(|(avg, _, _, _)| avg >= OUTER_LOOP_UNDERPOWER_MAX_RAW_DBFS)
+            .map(|(avg, _, _, _)| avg >= self.adjusted_dbfs(OUTER_LOOP_UNDERPOWER_MAX_RAW_DBFS))
             .unwrap_or(false)
         {
             return false;
@@ -779,13 +883,20 @@ impl BtsReversePowerControlState {
     }
 
     /// dB to subtract from the PCB error to brake UP commands at high Rx power.
-    fn brake_offset_db(filtered_raw_power_db: f32) -> f32 {
-        if !filtered_raw_power_db.is_finite() || filtered_raw_power_db <= BRAKE_BEGIN_DBFS {
+    fn brake_offset_db_with_adj(filtered_raw_power_db: f32, rx_power_adj_dbfs: f32) -> f32 {
+        let begin_dbfs = BRAKE_BEGIN_DBFS + rx_power_adj_dbfs;
+        let full_dbfs = BRAKE_FULL_DBFS + rx_power_adj_dbfs;
+        if !filtered_raw_power_db.is_finite() || filtered_raw_power_db <= begin_dbfs {
             return 0.0;
         }
-        let span = BRAKE_FULL_DBFS - BRAKE_BEGIN_DBFS;
-        let frac = ((filtered_raw_power_db - BRAKE_BEGIN_DBFS) / span).clamp(0.0, 1.0);
+        let span = full_dbfs - begin_dbfs;
+        let frac = ((filtered_raw_power_db - begin_dbfs) / span).clamp(0.0, 1.0);
         BRAKE_MAX_OFFSET_DB * frac
+    }
+
+    #[cfg(test)]
+    fn brake_offset_db(filtered_raw_power_db: f32) -> f32 {
+        Self::brake_offset_db_with_adj(filtered_raw_power_db, 0.0)
     }
 
     fn brake_input_raw_power_db(
@@ -798,65 +909,6 @@ impl BtsReversePowerControlState {
             (None, Some(instant)) => Some(instant),
             (None, None) => None,
         }
-    }
-
-    fn extend_hot_start_guard(&mut self, pcgs: u16) {
-        self.hot_start_guard_remaining_pcgs = self.hot_start_guard_remaining_pcgs.max(pcgs);
-    }
-
-    fn prime_hot_start_guard(&mut self, raw_power_db: f32) {
-        if !raw_power_db.is_finite() || raw_power_db < HOT_START_PREAMBLE_RAW_DBFS {
-            return;
-        }
-        self.filtered_raw_power_db = Some(
-            self.filtered_raw_power_db
-                .map(|filtered| filtered.max(raw_power_db))
-                .unwrap_or(raw_power_db),
-        );
-        self.brake_filtered_raw_power_db = Some(
-            self.brake_filtered_raw_power_db
-                .map(|filtered| filtered.max(raw_power_db))
-                .unwrap_or(raw_power_db),
-        );
-        self.extend_hot_start_guard(HOT_START_SOFT_EXTEND_PCGS);
-        if raw_power_db >= HOT_START_HARD_RAW_DBFS {
-            self.clip_cooldown_pcgs = self.clip_cooldown_pcgs.max(PCG_CLIP_COOLDOWN_PCGS);
-        }
-    }
-
-    fn update_hot_start_guard(
-        &mut self,
-        raw_power_db: Option<f32>,
-        brake_offset_db: f32,
-        is_clipping: bool,
-    ) -> bool {
-        let hard_raw = raw_power_db
-            .map(|db| db >= HOT_START_HARD_RAW_DBFS)
-            .unwrap_or(false);
-        let soft_raw = raw_power_db
-            .map(|db| db >= HOT_START_SOFT_RAW_DBFS)
-            .unwrap_or(false);
-        let released_raw = raw_power_db
-            .map(|db| db <= HOT_START_RELEASE_RAW_DBFS)
-            .unwrap_or(true);
-
-        if is_clipping || hard_raw || brake_offset_db >= HOT_START_HARD_BRAKE_DB {
-            self.extend_hot_start_guard(HOT_START_HARD_EXTEND_PCGS);
-        } else if self.hot_start_guard_remaining_pcgs > 0
-            && (soft_raw || brake_offset_db >= HOT_START_SOFT_BRAKE_DB)
-        {
-            self.extend_hot_start_guard(HOT_START_SOFT_EXTEND_PCGS);
-        } else if self.hot_start_guard_remaining_pcgs > 0 {
-            let decay = if released_raw && brake_offset_db <= HOT_START_RELEASE_BRAKE_DB {
-                HOT_START_RELEASE_DECAY_PCGS
-            } else {
-                1
-            };
-            self.hot_start_guard_remaining_pcgs =
-                self.hot_start_guard_remaining_pcgs.saturating_sub(decay);
-        }
-
-        self.hot_start_guard_remaining_pcgs > 0
     }
 
     /// Least-squares fit of `y = a*t + b` over evenly-spaced samples
@@ -918,9 +970,8 @@ impl BtsReversePowerControlState {
 
         // Clipping inflates pilot variance and fakes a low-SINR reading, so
         // reject the measurement and force DOWN while in the clipping zone.
-        let is_clipping = raw_power_db.map(|db| db > CLIP_BEGIN_DBFS).unwrap_or(false);
-        let preclip_guard_active = raw_power_db
-            .map(|db| db >= PCG_PRECLIP_GUARD_DBFS)
+        let is_clipping = raw_power_db
+            .map(|db| db > self.adjusted_dbfs(CLIP_BEGIN_DBFS))
             .unwrap_or(false);
         let clip_guard_active = if is_clipping {
             self.clip_cooldown_pcgs = PCG_CLIP_COOLDOWN_PCGS;
@@ -939,10 +990,22 @@ impl BtsReversePowerControlState {
 
         let effective_target_db = self.effective_target_db();
         let brake = Self::brake_input_raw_power_db(self.brake_filtered_raw_power_db, raw_power_db)
-            .map(Self::brake_offset_db)
+            .map(|db| Self::brake_offset_db_with_adj(db, self.rx_power_adj_dbfs))
             .unwrap_or(0.0);
         self.last_brake_offset_db = brake;
-        let hot_start_guard_active = self.update_hot_start_guard(raw_power_db, brake, is_clipping);
+        if raw_power_db
+            .map(|db| db >= self.adjusted_dbfs(PCG_RAW_HOT_LIMIT_DBFS))
+            .unwrap_or(false)
+            || is_clipping
+        {
+            self.raw_hot_limiter_active = true;
+        } else if raw_power_db
+            .map(|db| db <= self.adjusted_dbfs(PCG_RAW_HOT_RELEASE_DBFS))
+            .unwrap_or(false)
+        {
+            self.raw_hot_limiter_active = false;
+        }
+        let raw_hot_limiter_active = self.raw_hot_limiter_active;
         let (pcb, control_metric_db) = if measurement_valid {
             // Diagnostic EMA for the per-PCG log line — does not feed the loop.
             let filtered_metric_db = match self.filtered_metric_db {
@@ -975,15 +1038,17 @@ impl BtsReversePowerControlState {
                 self.quantize_pcb(effective_target_db - held_metric - brake),
                 held_metric,
             )
+        } else if raw_power_db.is_some() {
+            // Raw-only traffic bootstrap measurement: keep raising the MS
+            // until the raw limiter has a reason to brake it.
+            (0, f32::NAN)
         } else {
             (Self::fallback_pcb_for_abs_pcg(abs_pcg), f32::NAN)
         };
 
-        // Force DOWN in the clipping/guard zone, overriding the loop error.
-        let raw_power_clamp_active = preclip_guard_active
-            || clip_guard_active
-            || hot_start_guard_active
-            || self.last_brake_offset_db >= PCG_FORCE_DOWN_BRAKE_DB;
+        // Raw input power is a first-priority safety limiter. Once the raw
+        // level leaves the hot region, pilot quality owns the UP/DOWN decision.
+        let raw_power_clamp_active = is_clipping || clip_guard_active || raw_hot_limiter_active;
         let pcb = if raw_power_clamp_active { 1 } else { pcb };
 
         self.last_pcg_control_metric_db[slot] = control_metric_db;
@@ -991,13 +1056,15 @@ impl BtsReversePowerControlState {
 
         if cdma_common::diagnostics::power_control_verbose_per_pcg_enabled_for_walsh(walsh_code) {
             log::info!(
-                "pcg[w{}] abs_pcg={} raw={:?} brake_filt={:?} clip={} hot_guard={} metric_db={:.2} pred={:.2} target={:.2} brake={:.2} residual={:+.2} pcb={}",
+                "pcg[w{}] abs_pcg={} raw={:?} brake_filt={:?} clip={} clip_guard={} raw_hot={} raw_clamp={} metric_db={:.2} pred={:.2} target={:.2} brake={:.2} residual={:+.2} pcb={}",
                 walsh_code,
                 abs_pcg,
                 raw_power_db,
                 self.brake_filtered_raw_power_db,
                 is_clipping as u8,
-                self.hot_start_guard_remaining_pcgs,
+                clip_guard_active as u8,
+                raw_hot_limiter_active as u8,
+                raw_power_clamp_active as u8,
                 metric_db,
                 control_metric_db,
                 effective_target_db,
@@ -1043,6 +1110,7 @@ mod sinr_tests;
 pub struct BtsPowerControlRegistry {
     states: Arc<Mutex<HashMap<u8, BtsReversePowerControlState>>>,
     cell_settling_frames_remaining: Arc<Mutex<u64>>,
+    rx_power_adj_dbfs: Arc<Mutex<f32>>,
 }
 
 impl Default for BtsPowerControlRegistry {
@@ -1050,25 +1118,51 @@ impl Default for BtsPowerControlRegistry {
         Self {
             states: Arc::default(),
             cell_settling_frames_remaining: Arc::default(),
+            rx_power_adj_dbfs: Arc::default(),
         }
     }
 }
 
 impl BtsPowerControlRegistry {
+    pub fn set_rx_power_adj_dbfs(&self, rx_power_adj_dbfs: f32) {
+        let rx_power_adj_dbfs = if rx_power_adj_dbfs.is_finite() {
+            rx_power_adj_dbfs
+        } else {
+            0.0
+        };
+        *self.rx_power_adj_dbfs.lock() = rx_power_adj_dbfs;
+        for state in self.states.lock().values_mut() {
+            state.set_rx_power_adj_dbfs(rx_power_adj_dbfs);
+        }
+    }
+
+    pub fn rx_power_adj_dbfs(&self) -> f32 {
+        *self.rx_power_adj_dbfs.lock()
+    }
+
+    fn state_for(use_rc3: bool, rx_power_adj_dbfs: f32) -> BtsReversePowerControlState {
+        let mut state = if use_rc3 {
+            BtsReversePowerControlState::new_rc3()
+        } else {
+            BtsReversePowerControlState::new_rc1()
+        };
+        state.set_rx_power_adj_dbfs(rx_power_adj_dbfs);
+        state
+    }
+
     fn traffic_channel_uses_rc3(traffic_channels: &TrafficChannelPool, walsh_code: u8) -> bool {
         traffic_channels
-            .lock()
-            .iter()
-            .find(|slot| slot.walsh_code == walsh_code)
+            .lookup(walsh_code)
             .map(|slot| matches!(slot.channel, TrafficChannelWrapper::Rc3(_)))
             .unwrap_or(true)
     }
 
     pub fn set_target(&self, walsh_code: u8, target_db: f32, held: bool) {
+        let rx_power_adj_dbfs = self.rx_power_adj_dbfs();
         let mut states = self.states.lock();
         let state = states
             .entry(walsh_code)
-            .or_insert_with(BtsReversePowerControlState::new_rc3);
+            .or_insert_with(|| Self::state_for(true, rx_power_adj_dbfs));
         state.apply_setpoint(BtsReversePowerSetpoint { target_db, held });
     }
 
@@ -1081,15 +1175,12 @@ impl BtsPowerControlRegistry {
         let use_rc3 = traffic_channels
             .map(|channels| Self::traffic_channel_uses_rc3(channels, walsh_code))
             .unwrap_or(true);
+        let rx_power_adj_dbfs = self.rx_power_adj_dbfs();
         let mut states = self.states.lock();
         let is_new_state = !states.contains_key(&walsh_code);
-        let state = states.entry(walsh_code).or_insert_with(|| {
-            if use_rc3 {
-                BtsReversePowerControlState::new_rc3()
-            } else {
-                BtsReversePowerControlState::new_rc1()
-            }
-        });
+        let state = states
+            .entry(walsh_code)
+            .or_insert_with(|| Self::state_for(use_rc3, rx_power_adj_dbfs));
         if is_new_state && use_rc3 {
             self.start_cell_settling(walsh_code);
         }
@@ -1124,21 +1215,15 @@ impl BtsPowerControlRegistry {
         metric_db: f32,
         raw_power_db: Option<f32>,
     ) -> Option<BtsPowerControlTick> {
-        let use_rc3 = {
-            let slots = traffic_channels.lock();
-            let slot = slots.iter().find(|slot| slot.walsh_code == walsh_code)?;
-            matches!(slot.channel, TrafficChannelWrapper::Rc3(_))
-        };
+        let slot = traffic_channels.lookup(walsh_code)?;
+        let use_rc3 = matches!(slot.channel, TrafficChannelWrapper::Rc3(_));
         let tick = {
+            let rx_power_adj_dbfs = self.rx_power_adj_dbfs();
             let mut states = self.states.lock();
             let is_new_state = !states.contains_key(&walsh_code);
-            let state = states.entry(walsh_code).or_insert_with(|| {
-                if use_rc3 {
-                    BtsReversePowerControlState::new_rc3()
-                } else {
-                    BtsReversePowerControlState::new_rc1()
-                }
-            });
+            let state = states
+                .entry(walsh_code)
+                .or_insert_with(|| Self::state_for(use_rc3, rx_power_adj_dbfs));
             if is_new_state && use_rc3 {
                 self.start_cell_settling(walsh_code);
             }
@@ -1154,8 +1239,6 @@ impl BtsPowerControlRegistry {
             )
         };
 
-        let slots = traffic_channels.lock();
-        let slot = slots.iter().find(|slot| slot.walsh_code == walsh_code)?;
         match &slot.channel {
             TrafficChannelWrapper::Rc1(ch) => {
                 ch.channel.schedule_power_control_bit(tx_abs_pcg, tick.pcb)
@@ -1166,44 +1249,6 @@ impl BtsPowerControlRegistry {
             TrafficChannelWrapper::SchRc3(_) => return None,
         }
         Some(tick)
-    }
-
-    pub fn schedule_down_burst(
-        &self,
-        traffic_channels: &TrafficChannelPool,
-        walsh_code: u8,
-        start_abs_pcg: u64,
-        pcgs: u64,
-    ) -> bool {
-        let slots = traffic_channels.lock();
-        let Some(slot) = slots.iter().find(|slot| slot.walsh_code == walsh_code) else {
-            return false;
-        };
-        for offset in 0..pcgs {
-            let abs_pcg = start_abs_pcg.saturating_add(offset);
-            match &slot.channel {
-                TrafficChannelWrapper::Rc1(ch) => ch.channel.schedule_power_control_bit(abs_pcg, 1),
-                TrafficChannelWrapper::Rc3(ch) => ch.channel.schedule_power_control_bit(abs_pcg, 1),
-                TrafficChannelWrapper::SchRc3(_) => return false,
-            }
-        }
-        true
-    }
-
-    pub fn note_hot_preamble(&self, walsh_code: u8, raw_power_db: f32) -> bool {
-        if !raw_power_db.is_finite() || raw_power_db < HOT_START_PREAMBLE_RAW_DBFS {
-            return false;
-        }
-        let mut states = self.states.lock();
-        let state = states
-            .entry(walsh_code)
-            .or_insert_with(BtsReversePowerControlState::new_rc3);
-        state.prime_hot_start_guard(raw_power_db);
-        true
-    }
-
-    pub fn hot_start_bootstrap_down_pcgs() -> u64 {
-        HOT_START_BOOTSTRAP_DOWN_PCGS
     }
 
     fn start_cell_settling(&self, walsh_code: u8) {

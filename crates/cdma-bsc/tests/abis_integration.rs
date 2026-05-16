@@ -130,12 +130,12 @@ async fn abis_tcp_setup_allocates_walsh() {
 
     let controller = harness.controller.clone();
     // Phase 1: walsh reserved, session created, but pool empty until ECAM
-    assert_eq!(controller.traffic_channels_pool().lock().len(), 0);
+    assert_eq!(controller.traffic_channels_pool().len(), 0);
 
     // Phase 2: send ECAM to commit the traffic channel
     send_ecam_commit(harness.client(), handle.walsh_code);
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(controller.traffic_channels_pool().lock().len(), 1);
+    assert_eq!(controller.traffic_channels_pool().len(), 1);
 
     let agent = harness.shutdown().await;
     assert_eq!(agent.active_session_count(), 1);
@@ -160,7 +160,7 @@ async fn abis_tcp_setup_then_release() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let controller = harness.controller.clone();
-    assert_eq!(controller.traffic_channels_pool().lock().len(), 1);
+    assert_eq!(controller.traffic_channels_pool().len(), 1);
 
     // Deallocate sends BtsRelease + Remove over the wire; the agent
     // processes both and frees the walsh code back to the pool.
@@ -171,7 +171,7 @@ async fn abis_tcp_setup_then_release() {
 
     let agent = harness.shutdown().await;
     assert_eq!(agent.active_session_count(), 0);
-    assert!(controller.traffic_channels_pool().lock().is_empty());
+    assert!(controller.traffic_channels_pool().is_empty());
 }
 
 /// Full network path for traffic: TCP Abis setup plus UDP bearer delivery into
@@ -303,9 +303,7 @@ fn send_ecam_commit(client: &dyn BtsControlClient, walsh_code: u8) {
 fn harness_queue_len(controller: &Arc<TrafficResourceService>, walsh_code: u8) -> Option<usize> {
     controller
         .traffic_channels_pool()
-        .lock()
-        .iter()
-        .find(|slot| slot.walsh_code == walsh_code)
+        .lookup(walsh_code)
         .map(|slot| match &slot.channel {
             cdma_bts::bts::TrafficChannelWrapper::Rc1(ch) => ch.channel.queue_len(),
             cdma_bts::bts::TrafficChannelWrapper::Rc3(ch) => ch.channel.queue_len(),

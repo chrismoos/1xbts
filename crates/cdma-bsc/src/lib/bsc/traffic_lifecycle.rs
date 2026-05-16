@@ -29,6 +29,50 @@ impl TrafficLifecycleService {
 }
 
 impl Bsc {
+    /// Ask the MS to release a packet-data traffic channel before removing the
+    /// BTS-side resources. Immediate deallocate can leave the MS transmitting
+    /// reverse traffic without forward power control and pollute other Walshes.
+    pub(crate) fn begin_packet_tch_release(&mut self, walsh_code: u8, reason: &str) {
+        let Some(ms) = self.mobiles.get_by_walsh(walsh_code) else {
+            warn!(
+                "BSC: begin_packet_tch_release called but no traffic channel walsh={}",
+                walsh_code
+            );
+            return;
+        };
+        let Some(tc) = ms.find_traffic_channel_by_walsh(walsh_code) else {
+            warn!(
+                "BSC: begin_packet_tch_release found no traffic channel walsh={}",
+                walsh_code
+            );
+            return;
+        };
+        if tc.is_releasing() {
+            info!(
+                "BSC: packet TCH walsh={} already releasing ({})",
+                walsh_code, reason
+            );
+            return;
+        }
+        let addr = ms.fwd_address.clone();
+
+        info!(
+            "BSC: initiating packet TCH release on walsh={} for {} ({})",
+            walsh_code,
+            format_ms_address(&addr),
+            reason
+        );
+        if let Err(e) = self.send_traffic_release_order(walsh_code, 0b111) {
+            warn!(
+                "BSC: failed to send packet Release Order on walsh={} during {}: {}",
+                walsh_code, reason, e
+            );
+        }
+        self.mobiles.update_tc(walsh_code, |_, tc| {
+            tc.mark_releasing();
+        });
+    }
+
     /// Tear down a traffic channel keyed by Walsh code (the unique stable
     /// key for an active TC). The owning mobile is resolved through the
     /// registry, so callers never need to track an `idx` across `.await`.

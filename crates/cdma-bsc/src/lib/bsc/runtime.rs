@@ -4,6 +4,7 @@ use cdma_common::error::Error;
 use log::{debug, info, warn};
 
 use super::{A1ClearState, Bsc, TrafficChannelAction, recv_or_pending, recv_unbounded_or_pending};
+use crate::addressing::is_packet_data_so;
 
 impl Bsc {
     pub async fn run(mut self) -> Result<(), Error> {
@@ -18,6 +19,11 @@ impl Bsc {
         let traffic_timeout = Duration::from_secs(self.config.traffic_assignment.idle_timeout_s);
         let ms_ack_timeout =
             Duration::from_millis(self.config.traffic_assignment.ms_ack_timeout_ms);
+        let packet_service_connect_timeout = Duration::from_millis(
+            self.config
+                .traffic_assignment
+                .packet_service_connect_timeout_ms,
+        );
         let mut stale_channel_interval = tokio::time::interval(Duration::from_secs(1));
         let mut bearer_poll_interval = tokio::time::interval(Duration::from_millis(20));
 
@@ -44,7 +50,11 @@ impl Bsc {
                 }
             };
 
-            let traffic_lifecycle_deadline = self.next_traffic_lifecycle_deadline(ms_ack_timeout);
+            let traffic_lifecycle_deadline = self
+                .next_traffic_lifecycle_deadline(ms_ack_timeout)
+                .into_iter()
+                .chain(self.next_packet_service_connecting_deadline(packet_service_connect_timeout))
+                .min();
             let traffic_lifecycle_sleep = async {
                 match traffic_lifecycle_deadline {
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -95,6 +105,7 @@ impl Bsc {
                 }
                 _ = traffic_lifecycle_sleep => {
                     self.poll_traffic_channel_lifecycle(ms_ack_timeout).await;
+                    self.poll_packet_service_connecting(packet_service_connect_timeout).await;
                 }
                 _ = stale_channel_interval.tick() => {
                     self.drain_pch_transfer_acks();
@@ -132,6 +143,59 @@ impl Bsc {
             .filter_map(|ms| {
                 let tc = ms.traffic_channel()?;
                 match tc.traffic_lifecycle_action(ms_ack_timeout, now) {
+                    TrafficChannelAction::Teardown { reason, timeout_ms } => Some((
+                        tc.walsh_code,
+                        tc.voice_session_id,
+                        tc.voice_leg_role,
+                        reason,
+                        timeout_ms,
+                    )),
+                    TrafficChannelAction::None => None,
+                }
+            })
+            .collect();
+
+        for (walsh_code, voice_session_id, voice_leg_role, reason, timeout_ms) in actions {
+            warn!(
+                "BSC: {} on walsh={} ({}ms), tearing down",
+                reason, walsh_code, timeout_ms
+            );
+            self.teardown_traffic_channel(walsh_code).await;
+            self.on_voice_leg_released(voice_session_id, voice_leg_role);
+        }
+    }
+
+    pub(crate) fn next_packet_service_connecting_deadline(
+        &self,
+        packet_service_connect_timeout: Duration,
+    ) -> Option<tokio::time::Instant> {
+        self.mobiles
+            .iter()
+            .filter_map(|ms| {
+                let tc = ms.traffic_channel()?;
+                if !is_packet_data_so(tc.service_option) {
+                    return None;
+                }
+                tc.next_packet_service_connecting_deadline(packet_service_connect_timeout)
+            })
+            .min()
+            .map(tokio::time::Instant::from_std)
+    }
+
+    pub(crate) async fn poll_packet_service_connecting(
+        &mut self,
+        packet_service_connect_timeout: Duration,
+    ) {
+        let now = Instant::now();
+        let actions: Vec<_> = self
+            .mobiles
+            .iter()
+            .filter_map(|ms| {
+                let tc = ms.traffic_channel()?;
+                if !is_packet_data_so(tc.service_option) {
+                    return None;
+                }
+                match tc.packet_service_connecting_action(packet_service_connect_timeout, now) {
                     TrafficChannelAction::Teardown { reason, timeout_ms } => Some((
                         tc.walsh_code,
                         tc.voice_session_id,
