@@ -390,7 +390,7 @@ mod tests {
     fn raw_power_hot_limiter_holds_until_raw_release_threshold() {
         let mut state = rc3_state_for_predictor();
 
-        let hot = state.tick_single_pcg(10, 100, -14.0, Some(PCG_RAW_HOT_LIMIT_DBFS + 0.5), 0);
+        let hot = state.tick_single_pcg(10, 100, -14.0, Some(PCG_RAW_HOT_LIMIT_DBFS), 0);
         assert_eq!(hot.pcb, 1);
         assert!(hot.raw_power_clamp_active);
 
