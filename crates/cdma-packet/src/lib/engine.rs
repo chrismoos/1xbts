@@ -17,6 +17,7 @@ use crate::capture::{self, Direction as CaptureDirection};
 use crate::ppp::framing::{self, HdlcDeframer, PppPacket};
 use crate::ppp::ipcp::{IPCP_PROTOCOL, IpcpConfig, IpcpOpenState, IpcpSession};
 use crate::ppp::lcp::{LCP_PROTOCOL, LcpOpenState, LcpSession, LcpState};
+use crate::ppp::vj::{PPP_IP_PROTOCOL, PPP_VJ_COMPRESSED_TCP, PPP_VJ_UNCOMPRESSED_TCP, VjState};
 use crate::rlp::{self as rlp_codec, RlpFrame};
 use crate::rlp_session::{RlpOutput, RlpSession, RlpState};
 use crate::rlp3_frames::MuxOption;
@@ -817,6 +818,7 @@ pub struct PacketSession {
     deframer: HdlcDeframer,
     lcp: LcpSession,
     ipcp: IpcpSession,
+    vj: VjState,
     log_context: Option<String>,
     phase: SessionPhase,
     /// Pending PPP packets to send on downlink (queued during a single tick).
@@ -851,6 +853,7 @@ const RLP_SYNC_MAX_TICKS: u32 = 500;
 pub struct PppSessionState {
     pub lcp: LcpOpenState,
     pub ipcp: IpcpOpenState,
+    pub vj: VjState,
 }
 
 impl PacketSession {
@@ -879,6 +882,7 @@ impl PacketSession {
             deframer: HdlcDeframer::new(),
             lcp: LcpSession::new(),
             ipcp: IpcpSession::new(ipcp_config),
+            vj: VjState::default(),
             log_context: None,
             phase: SessionPhase::RlpSync,
             ppp_tx_queue: Vec::new(),
@@ -986,10 +990,7 @@ impl PacketSession {
             return;
         }
         self.ppp_activity_since_last_check = true;
-        let ppp = PppPacket {
-            protocol: 0x0021, // IP
-            payload: ip_packet.to_vec(),
-        };
+        let ppp = self.vj.compress_ip_packet(ip_packet);
         self.ppp_tx_queue.push(ppp);
     }
 
@@ -997,6 +998,7 @@ impl PacketSession {
         Some(PppSessionState {
             lcp: self.lcp.open_state()?,
             ipcp: self.ipcp.open_state()?,
+            vj: self.vj.clone(),
         })
     }
 
@@ -1027,6 +1029,7 @@ impl PacketSession {
             if let Some(ppp_state) = self.pending_ppp_resume.take() {
                 self.lcp.restore_open_state(ppp_state.lcp);
                 self.ipcp.restore_open_state(ppp_state.ipcp);
+                self.vj = ppp_state.vj;
                 self.lcp_started = true;
                 self.ipcp_started = true;
                 self.phase = SessionPhase::Active;
@@ -1259,6 +1262,7 @@ impl PacketSession {
                     if let Some(context) = &self.log_context {
                         self.ipcp.set_log_context(context.clone());
                     }
+                    self.vj = VjState::default();
                     self.ipcp_started = false;
                     self.sch_data_ready = false;
                     self.phase = SessionPhase::Lcp;
@@ -1289,6 +1293,8 @@ impl PacketSession {
                 }
                 // Check for IPCP open → transition to Active.
                 if self.ipcp.is_open() && self.phase == SessionPhase::Ipcp {
+                    self.vj
+                        .configure(self.ipcp.peer_vj_options(), self.ipcp.local_vj_options());
                     self.phase = SessionPhase::Active;
                     log::info!(
                         "{}: active peer={} gateway={}",
@@ -1298,33 +1304,22 @@ impl PacketSession {
                     );
                 }
             }
-            0x0021 => {
-                // Forward only in Active when src matches the IPCP-negotiated peer.
-                let Some(src_ip) = self.parse_uplink_ipv4(&ppp.payload) else {
-                    return;
-                };
-
-                if self.phase != SessionPhase::Active {
-                    log::debug!(
-                        "{}: dropping uplink IP packet src={} in phase={:?} (IPCP not yet open)",
-                        self.log_prefix("IP ingress"),
-                        src_ip,
-                        self.phase
-                    );
-                    return;
+            PPP_IP_PROTOCOL => {
+                self.deliver_uplink_ip_packet(&ppp.payload, actions);
+            }
+            PPP_VJ_UNCOMPRESSED_TCP | PPP_VJ_COMPRESSED_TCP => {
+                match self.vj.decompress_packet(ppp.protocol, &ppp.payload) {
+                    Ok(ip_packet) => self.deliver_uplink_ip_packet(&ip_packet, actions),
+                    Err(err) => {
+                        log::warn!(
+                            "{}: dropping VJ packet protocol=0x{:04X} err={:?} len={}",
+                            self.log_prefix("PPP RX"),
+                            ppp.protocol,
+                            err,
+                            ppp.payload.len()
+                        );
+                    }
                 }
-                let expected = self.ipcp.peer_ip();
-                if src_ip != expected {
-                    log::debug!(
-                        "{}: dropping uplink IP packet src={} (expected {} per IPCP)",
-                        self.log_prefix("IP ingress"),
-                        src_ip,
-                        expected
-                    );
-                    return;
-                }
-                actions.push(SessionAction::DeliverIpPacket(ppp.payload.clone()));
-                self.ppp_activity_since_last_check = true;
             }
             other => {
                 log::debug!(
@@ -1334,6 +1329,35 @@ impl PacketSession {
                 );
             }
         }
+    }
+
+    fn deliver_uplink_ip_packet(&mut self, ip_packet: &[u8], actions: &mut Vec<SessionAction>) {
+        // Forward only in Active when src matches the IPCP-negotiated peer.
+        let Some(src_ip) = self.parse_uplink_ipv4(ip_packet) else {
+            return;
+        };
+
+        if self.phase != SessionPhase::Active {
+            log::debug!(
+                "{}: dropping uplink IP packet src={} in phase={:?} (IPCP not yet open)",
+                self.log_prefix("IP ingress"),
+                src_ip,
+                self.phase
+            );
+            return;
+        }
+        let expected = self.ipcp.peer_ip();
+        if src_ip != expected {
+            log::debug!(
+                "{}: dropping uplink IP packet src={} (expected {} per IPCP)",
+                self.log_prefix("IP ingress"),
+                src_ip,
+                expected
+            );
+            return;
+        }
+        actions.push(SessionAction::DeliverIpPacket(ip_packet.to_vec()));
+        self.ppp_activity_since_last_check = true;
     }
 
     fn parse_uplink_ipv4(&self, payload: &[u8]) -> Option<Ipv4Addr> {
@@ -1372,7 +1396,7 @@ impl PacketSession {
     }
 
     fn record_ppp_event(&mut self, direction: &str, ppp: &PppPacket) {
-        if ppp.protocol == 0x0021 {
+        if ppp.protocol == PPP_IP_PROTOCOL {
             return;
         }
         const MAX_EVENTS: usize = 64;
@@ -1649,14 +1673,32 @@ fn format_ppp_packet(ppp: &PppPacket) -> String {
     let proto_name = match ppp.protocol {
         0xC021 => "LCP",
         0x8021 => "IPCP",
-        0x0021 => "IP",
+        PPP_IP_PROTOCOL => "IP",
+        PPP_VJ_COMPRESSED_TCP => "VJ-Compressed-TCP",
+        PPP_VJ_UNCOMPRESSED_TCP => "VJ-Uncompressed-TCP",
         0xC023 => "PAP",
         0xC223 => "CHAP",
         other => return format!("proto=0x{:04X} len={}", other, ppp.payload.len()),
     };
 
-    if ppp.protocol == 0x0021 {
+    if ppp.protocol == PPP_IP_PROTOCOL {
         return format!("{} {}", proto_name, summarize_ipv4_packet(&ppp.payload));
+    }
+    if ppp.protocol == PPP_VJ_UNCOMPRESSED_TCP {
+        let slot = ppp.payload.get(9).copied();
+        let mut restored = ppp.payload.clone();
+        if restored.len() > 9 {
+            restored[9] = 6;
+        }
+        return format!(
+            "{} slot={:?} {}",
+            proto_name,
+            slot,
+            summarize_ipv4_packet(&restored)
+        );
+    }
+    if ppp.protocol == PPP_VJ_COMPRESSED_TCP {
+        return format!("{} {}", proto_name, summarize_vj_compressed(&ppp.payload));
     }
 
     // LCP/IPCP: show code, id, and payload
@@ -1701,6 +1743,26 @@ fn format_ppp_packet(ppp: &PppPacket) -> String {
             hex_preview(&ppp.payload, 32)
         )
     }
+}
+
+fn summarize_vj_compressed(payload: &[u8]) -> String {
+    let Some(changes) = payload.first().copied() else {
+        return "len=0".to_string();
+    };
+    let has_slot = changes & 0x40 != 0;
+    let header_len = 1 + usize::from(has_slot) + 2;
+    let slot = if has_slot {
+        payload.get(1).copied()
+    } else {
+        None
+    };
+    format!(
+        "changes=0x{:02x} slot={:?} len={} payload={}",
+        changes,
+        slot,
+        payload.len(),
+        hex_preview(payload.get(header_len..).unwrap_or(&[]), 24)
+    )
 }
 
 fn summarize_ipv4_packet(packet: &[u8]) -> String {
@@ -1917,7 +1979,9 @@ fn format_ppp_protocol(protocol: u16) -> &'static str {
     match protocol {
         0xC021 => "LCP",
         0x8021 => "IPCP",
-        0x0021 => "IP",
+        PPP_IP_PROTOCOL => "IP",
+        PPP_VJ_COMPRESSED_TCP => "VJ-Compressed-TCP",
+        PPP_VJ_UNCOMPRESSED_TCP => "VJ-Uncompressed-TCP",
         0xC023 => "PAP",
         0xC223 => "CHAP",
         _ => "UNKNOWN",
@@ -2223,6 +2287,18 @@ mod tests {
         ipcp.to_ppp()
     }
 
+    fn mobile_ipcp_request_ip_with_vj(id: u8, ip: Ipv4Addr) -> PppPacket {
+        let octets = ip.octets();
+        let ipcp = ipcp::IpcpPacket {
+            code: 1,
+            identifier: id,
+            data: vec![
+                3, 6, octets[0], octets[1], octets[2], octets[3], 2, 6, 0x00, 0x2d, 0x0f, 0x01,
+            ],
+        };
+        ipcp.to_ppp()
+    }
+
     /// Build IPCP Configure-Ack from mobile.
     fn mobile_ipcp_ack(id: u8, data: Vec<u8>) -> PppPacket {
         let ipcp = ipcp::IpcpPacket {
@@ -2233,6 +2309,25 @@ mod tests {
         ipcp.to_ppp()
     }
 
+    fn our_default_ipcp_request_data() -> Vec<u8> {
+        vec![3, 6, 10, 0, 0, 1] // IP-Address 10.0.0.1
+    }
+
+    fn our_vj_ipcp_request_data() -> Vec<u8> {
+        vec![
+            3, 6, 10, 0, 0, 1, // IP-Address 10.0.0.1
+            2, 6, 0x00, 0x2d, 0x0f,
+            0x01, // VJ compressed TCP/IP, 16 slots, slot id compression
+        ]
+    }
+
+    fn ipcp_config_with_local_vj() -> IpcpConfig {
+        IpcpConfig {
+            request_vj: true,
+            ..IpcpConfig::default()
+        }
+    }
+
     fn mobile_ipv4_packet(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
         let src = src.octets();
         let dst = dst.octets();
@@ -2241,6 +2336,31 @@ mod tests {
             src[2], src[3], dst[0], dst[1], dst[2], dst[3], 0xC0, 0x00, 0x00, 0x35, 0x00, 0x08,
             0x00, 0x00,
         ]
+    }
+
+    fn mobile_tcp_packet(src: Ipv4Addr, dst: Ipv4Addr, seq_no: u32, ip_id: u16) -> Vec<u8> {
+        let src = src.octets();
+        let dst = dst.octets();
+        let mut packet = vec![0u8; 41];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&41u16.to_be_bytes());
+        packet[4..6].copy_from_slice(&ip_id.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 6;
+        packet[12..16].copy_from_slice(&src);
+        packet[16..20].copy_from_slice(&dst);
+        packet[20..22].copy_from_slice(&1234u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&80u16.to_be_bytes());
+        packet[24..28].copy_from_slice(&seq_no.to_be_bytes());
+        packet[28..32].copy_from_slice(&1u32.to_be_bytes());
+        packet[32] = 5 << 4;
+        packet[33] = 0x10;
+        packet[34..36].copy_from_slice(&4096u16.to_be_bytes());
+        packet[36..38].copy_from_slice(&0x1234u16.to_be_bytes());
+        packet[40] = b'x';
+        let sum = checksum16(&[&packet[..20]]);
+        packet[10..12].copy_from_slice(&sum.to_be_bytes());
+        packet
     }
 
     /// Feed a PPP packet to the session via RLP data frames.
@@ -2363,7 +2483,7 @@ mod tests {
         feed_ppp_via_rlp(&mut session, &mobile_ipcp_req2, &mut seq);
 
         // Mobile acks our IPCP request (ID=1).
-        let our_ipcp_data = vec![3, 6, 10, 0, 0, 1]; // IP-Address 10.0.0.1
+        let our_ipcp_data = our_default_ipcp_request_data();
         let mobile_ipcp_ack = mobile_ipcp_ack(1, our_ipcp_data);
         feed_ppp_via_rlp(&mut session, &mobile_ipcp_ack, &mut seq);
 
@@ -2488,7 +2608,7 @@ mod tests {
             &mobile_ipcp_request_ip(2, Ipv4Addr::new(10, 0, 0, 2)),
             &mut seq,
         );
-        let our_ipcp_data = vec![3, 6, 10, 0, 0, 1];
+        let our_ipcp_data = our_default_ipcp_request_data();
         feed_ppp_via_rlp(&mut session, &mobile_ipcp_ack(1, our_ipcp_data), &mut seq);
         assert_eq!(session.phase(), SessionPhase::Active);
 
@@ -2537,6 +2657,93 @@ mod tests {
         if let SessionAction::DeliverIpPacket(data) = ip_actions[0] {
             assert_eq!(data, &ip_packet);
         }
+    }
+
+    #[test]
+    fn vj_uplink_tcp_packets_are_restored_and_delivered() {
+        let mut session = PacketSession::new(
+            u32::from(SERVICE_OPTION_PACKET_DATA),
+            ipcp_config_with_local_vj(),
+        );
+        let mut seq = drive_to_active_with_our_ipcp_data(&mut session, our_vj_ipcp_request_data());
+
+        let mut mobile_vj = VjState::default();
+        mobile_vj.configure(Some(crate::ppp::vj::VjCompressionOptions::default()), None);
+        let first = mobile_tcp_packet(
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(10, 0, 0, 1),
+            100,
+            1,
+        );
+        let second = mobile_tcp_packet(
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(10, 0, 0, 1),
+            101,
+            2,
+        );
+
+        let seed = mobile_vj.compress_ip_packet(&first);
+        assert_eq!(seed.protocol, PPP_VJ_UNCOMPRESSED_TCP);
+        let seed_actions = feed_ppp_via_rlp(&mut session, &seed, &mut seq);
+        assert!(
+            seed_actions
+                .iter()
+                .any(|a| matches!(a, SessionAction::DeliverIpPacket(data) if data == &first))
+        );
+
+        let compressed = mobile_vj.compress_ip_packet(&second);
+        assert_eq!(compressed.protocol, PPP_VJ_COMPRESSED_TCP);
+        let compressed_actions = feed_ppp_via_rlp(&mut session, &compressed, &mut seq);
+        assert!(
+            compressed_actions
+                .iter()
+                .any(|a| matches!(a, SessionAction::DeliverIpPacket(data) if data == &second))
+        );
+    }
+
+    #[test]
+    fn vj_downlink_tcp_packets_are_compressed_when_peer_negotiates_vj() {
+        let mut session =
+            PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), IpcpConfig::default());
+        complete_rlp_handshake(&mut session);
+        let mut seq = 0;
+
+        feed_ppp_via_rlp(&mut session, &mobile_lcp_configure_request(1), &mut seq);
+        feed_ppp_via_rlp(
+            &mut session,
+            &mobile_lcp_configure_ack(1, vec![1, 4, 0x05, 0xDC]),
+            &mut seq,
+        );
+        feed_ppp_via_rlp(
+            &mut session,
+            &mobile_ipcp_request_ip_with_vj(1, Ipv4Addr::new(10, 0, 0, 2)),
+            &mut seq,
+        );
+        feed_ppp_via_rlp(
+            &mut session,
+            &mobile_ipcp_ack(1, our_default_ipcp_request_data()),
+            &mut seq,
+        );
+        assert_eq!(session.phase(), SessionPhase::Active);
+
+        let first = mobile_tcp_packet(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+            100,
+            1,
+        );
+        let second = mobile_tcp_packet(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+            101,
+            2,
+        );
+        session.send_ip_packet(&first);
+        session.send_ip_packet(&second);
+
+        assert_eq!(session.ppp_tx_queue.len(), 2);
+        assert_eq!(session.ppp_tx_queue[0].protocol, PPP_VJ_UNCOMPRESSED_TCP);
+        assert_eq!(session.ppp_tx_queue[1].protocol, PPP_VJ_COMPRESSED_TCP);
     }
 
     #[test]
@@ -2664,6 +2871,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn drive_to_active(session: &mut PacketSession) -> u8 {
+        drive_to_active_with_our_ipcp_data(session, our_default_ipcp_request_data())
+    }
+
+    fn drive_to_active_with_our_ipcp_data(
+        session: &mut PacketSession,
+        our_ipcp_data: Vec<u8>,
+    ) -> u8 {
         complete_rlp_handshake(session);
 
         let mut seq: u8 = 0;
@@ -2684,7 +2898,6 @@ mod tests {
         let mobile_ipcp_req2 = mobile_ipcp_request_ip(2, Ipv4Addr::new(10, 0, 0, 2));
         feed_ppp_via_rlp(session, &mobile_ipcp_req2, &mut seq);
 
-        let our_ipcp_data = vec![3, 6, 10, 0, 0, 1];
         let mobile_ipcp_ack = mobile_ipcp_ack(1, our_ipcp_data);
         feed_ppp_via_rlp(session, &mobile_ipcp_ack, &mut seq);
 

@@ -1,5 +1,8 @@
 # HEAD 
 
+- PPP packet data sessions now support peer-requested Van Jacobson TCP/IP header
+  compression. PDSN-originated VJ requests are opt-in with
+  `pdsn.packet.enable_vj_compression_default` (default `false`).
 - Traffic-channel SMS and packet-data originations now keep A1 call context, so
   MO SMS can resolve the originating subscriber on the MSC.
 - DTMF pressed during a call is now delivered to the SIP peer.

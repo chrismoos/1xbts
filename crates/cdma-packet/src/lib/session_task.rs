@@ -1241,6 +1241,7 @@ mod tests {
     use super::*;
     use crate::ppp::ipcp::IpcpOpenState;
     use crate::ppp::lcp::{LcpOpenState, NegotiatedOptions};
+    use crate::ppp::vj::{VjCompressionOptions, VjState};
     use std::net::Ipv4Addr;
 
     fn ppp_state(peer_ip: Ipv4Addr) -> PppSessionState {
@@ -1255,10 +1256,16 @@ mod tests {
                     peer_ip,
                     primary_dns: Ipv4Addr::new(10, 55, 0, 1),
                     secondary_dns: Ipv4Addr::new(10, 55, 0, 1),
+                    request_vj: false,
                 },
                 request_local_ip: true,
+                request_vj: false,
+                requested_vj: VjCompressionOptions::default(),
+                peer_vj: None,
+                local_vj: None,
                 last_acked_peer_request_data: Vec::new(),
             },
+            vj: VjState::default(),
         }
     }
 

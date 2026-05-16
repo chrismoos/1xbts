@@ -12,6 +12,7 @@
 /// - We include primary/secondary DNS in our NAK responses
 /// - Mobile acks our request → IPCP is open
 use super::framing::PppPacket;
+use super::vj::{VJ_COMPRESSION_PROTOCOL, VjCompressionOptions};
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 
@@ -36,6 +37,7 @@ const MAX_FAILURE: u32 = 5;
 const CODE_REJECT_MAX_DATA: usize = 1400;
 
 // IPCP option types.
+pub const IPCP_OPT_IP_COMPRESSION: u8 = 2;
 const OPT_IP_ADDRESS: u8 = 3;
 const OPT_PRIMARY_DNS: u8 = 129; // 0x81
 const OPT_SECONDARY_DNS: u8 = 131; // 0x83
@@ -164,12 +166,18 @@ pub struct IpcpConfig {
     pub primary_dns: Ipv4Addr,
     /// Secondary DNS server.
     pub secondary_dns: Ipv4Addr,
+    /// Whether our IPCP Configure-Request should ask the peer to send us VJ.
+    pub request_vj: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct IpcpOpenState {
     pub config: IpcpConfig,
     pub request_local_ip: bool,
+    pub request_vj: bool,
+    pub requested_vj: VjCompressionOptions,
+    pub peer_vj: Option<VjCompressionOptions>,
+    pub local_vj: Option<VjCompressionOptions>,
     pub last_acked_peer_request_data: Vec<u8>,
 }
 
@@ -180,6 +188,7 @@ impl Default for IpcpConfig {
             peer_ip: Ipv4Addr::new(10, 0, 0, 2),
             primary_dns: Ipv4Addr::new(10, 55, 0, 1),
             secondary_dns: Ipv4Addr::new(10, 55, 0, 1),
+            request_vj: false,
         }
     }
 }
@@ -202,10 +211,15 @@ pub struct IpcpSession {
     /// RFC 1661 §4.6 Max-Failure: NAKs sent per option since last ACK.
     consecutive_naks_sent: BTreeMap<u8, u32>,
     request_local_ip: bool,
+    request_vj: bool,
+    requested_vj: VjCompressionOptions,
+    peer_vj: Option<VjCompressionOptions>,
+    local_vj: Option<VjCompressionOptions>,
 }
 
 impl IpcpSession {
     pub fn new(config: IpcpConfig) -> Self {
+        let request_vj = config.request_vj;
         Self {
             state: IpcpState::Closed,
             config,
@@ -221,6 +235,10 @@ impl IpcpSession {
             configure_failed: false,
             consecutive_naks_sent: BTreeMap::new(),
             request_local_ip: true,
+            request_vj,
+            requested_vj: VjCompressionOptions::default(),
+            peer_vj: None,
+            local_vj: None,
         }
     }
 
@@ -242,14 +260,20 @@ impl IpcpSession {
     }
 
     fn our_request_data(&self) -> Vec<u8> {
+        let mut opts = Vec::new();
         if self.request_local_ip {
-            serialize_options(&[IpcpOption {
+            opts.push(IpcpOption {
                 opt_type: OPT_IP_ADDRESS,
                 data: ip_to_bytes(self.config.our_ip),
-            }])
-        } else {
-            Vec::new()
+            });
         }
+        if self.request_vj {
+            opts.push(IpcpOption {
+                opt_type: IPCP_OPT_IP_COMPRESSION,
+                data: self.requested_vj.to_ipcp_data().to_vec(),
+            });
+        }
+        serialize_options(&opts)
     }
 
     fn send_configure_request(&mut self, data: Vec<u8>) -> PppPacket {
@@ -375,6 +399,10 @@ impl IpcpSession {
                     self.restart_ticks_remaining = 0;
                     self.consecutive_naks_sent.clear();
                     self.request_local_ip = true;
+                    self.request_vj = self.config.request_vj;
+                    self.requested_vj = VjCompressionOptions::default();
+                    self.peer_vj = None;
+                    self.local_vj = None;
                     self.state = IpcpState::RequestSent;
                     responses.push(self.start());
                 }
@@ -411,6 +439,11 @@ impl IpcpSession {
                                     opt_type: OPT_SECONDARY_DNS,
                                     data: ip_to_bytes(self.config.secondary_dns),
                                 });
+                            }
+                        }
+                        IPCP_OPT_IP_COMPRESSION => {
+                            if VjCompressionOptions::from_ipcp_data(&opt.data).is_none() {
+                                rejects.push(opt.clone());
                             }
                         }
                         _ => {
@@ -464,6 +497,7 @@ impl IpcpSession {
                         .to_ppp(),
                     );
                     self.we_acked = false;
+                    self.peer_vj = None;
                     self.update_state();
                     return responses;
                 }
@@ -486,6 +520,7 @@ impl IpcpSession {
                     responses.push(ack.to_ppp());
                     self.we_acked = true;
                     self.last_acked_peer_request_data = ipcp.data.clone();
+                    self.peer_vj = parse_vj_option(&ipcp.data);
                     // RFC 1661 §4.6: ACK resets Max-Failure.
                     self.consecutive_naks_sent.clear();
                 } else {
@@ -504,6 +539,7 @@ impl IpcpSession {
                     for opt in &nak_opts {
                         *self.consecutive_naks_sent.entry(opt.opt_type).or_insert(0) += 1;
                     }
+                    self.peer_vj = None;
                 }
 
                 self.update_state();
@@ -528,6 +564,7 @@ impl IpcpSession {
                     format_ipcp_options(&ipcp.data)
                 );
                 self.peer_acked = true;
+                self.local_vj = parse_vj_option(&ipcp.data);
                 self.restart_ticks_remaining = 0;
                 self.update_state();
             }
@@ -560,9 +597,28 @@ impl IpcpSession {
                             ip
                         );
                     }
+                    if opt.opt_type == IPCP_OPT_IP_COMPRESSION {
+                        if let Some(vj) = VjCompressionOptions::from_ipcp_data(&opt.data) {
+                            log::info!(
+                                "{}: peer NAKed VJ compression with protocol=0x{:04x} max_slot_id={} comp_slot_id={}, adopting",
+                                self.log_prefix("IPCP"),
+                                VJ_COMPRESSION_PROTOCOL,
+                                vj.max_slot_id,
+                                u8::from(vj.comp_slot_id)
+                            );
+                            self.requested_vj = vj;
+                        } else {
+                            log::info!(
+                                "{}: peer NAKed VJ compression with unsupported data, continuing without it",
+                                self.log_prefix("IPCP")
+                            );
+                            self.request_vj = false;
+                        }
+                    }
                 }
                 let data = self.our_request_data();
                 self.peer_acked = false;
+                self.local_vj = None;
                 responses.push(self.send_configure_request(data));
                 self.update_state();
             }
@@ -590,8 +646,16 @@ impl IpcpSession {
                         );
                         self.request_local_ip = false;
                     }
+                    if opt.opt_type == IPCP_OPT_IP_COMPRESSION {
+                        log::info!(
+                            "{}: peer rejected our VJ compression option, continuing without it",
+                            self.log_prefix("IPCP")
+                        );
+                        self.request_vj = false;
+                    }
                 }
                 self.peer_acked = false;
+                self.local_vj = None;
                 responses.push(self.send_configure_request(self.our_request_data()));
                 self.update_state();
             }
@@ -622,6 +686,10 @@ impl IpcpSession {
                 self.configure_failed = false;
                 self.consecutive_naks_sent.clear();
                 self.request_local_ip = true;
+                self.request_vj = self.config.request_vj;
+                self.requested_vj = VjCompressionOptions::default();
+                self.peer_vj = None;
+                self.local_vj = None;
             }
             TERMINATE_ACK => {
                 // RFC 1661 §5.5: peer reports Closed; informational since we never
@@ -638,6 +706,8 @@ impl IpcpSession {
                 self.last_request_data.clear();
                 self.last_acked_peer_request_data.clear();
                 self.restart_ticks_remaining = 0;
+                self.peer_vj = None;
+                self.local_vj = None;
             }
             CODE_REJECT => {
                 // RFC 1661 §5.6: peer rejected a standard IPCP code; let LCP teardown handle it.
@@ -684,6 +754,10 @@ impl IpcpSession {
         self.is_open().then(|| IpcpOpenState {
             config: self.config.clone(),
             request_local_ip: self.request_local_ip,
+            request_vj: self.request_vj,
+            requested_vj: self.requested_vj,
+            peer_vj: self.peer_vj,
+            local_vj: self.local_vj,
             last_acked_peer_request_data: self.last_acked_peer_request_data.clone(),
         })
     }
@@ -691,6 +765,10 @@ impl IpcpSession {
     pub fn restore_open_state(&mut self, state: IpcpOpenState) {
         self.config = state.config;
         self.request_local_ip = state.request_local_ip;
+        self.request_vj = state.request_vj;
+        self.requested_vj = state.requested_vj;
+        self.peer_vj = state.peer_vj;
+        self.local_vj = state.local_vj;
         self.last_acked_peer_request_data = state.last_acked_peer_request_data;
         self.state = IpcpState::Opened;
         self.peer_acked = true;
@@ -726,6 +804,14 @@ impl IpcpSession {
         self.configure_restarts
     }
 
+    pub fn peer_vj_options(&self) -> Option<VjCompressionOptions> {
+        self.peer_vj
+    }
+
+    pub fn local_vj_options(&self) -> Option<VjCompressionOptions> {
+        self.local_vj
+    }
+
     /// Telemetry: NAKs containing IP-Address since last ACK.
     pub fn omitted_peer_ip_naks(&self) -> u32 {
         self.nak_count(OPT_IP_ADDRESS)
@@ -754,22 +840,50 @@ impl IpcpSession {
     }
 }
 
+fn parse_vj_option(data: &[u8]) -> Option<VjCompressionOptions> {
+    parse_options(data)
+        .into_iter()
+        .find(|opt| opt.opt_type == IPCP_OPT_IP_COMPRESSION)
+        .and_then(|opt| VjCompressionOptions::from_ipcp_data(&opt.data))
+}
+
 /// Format IPCP options for logging.
 fn format_ipcp_options(data: &[u8]) -> String {
     let opts = parse_options(data);
     opts.iter()
-        .map(|o| {
-            let name = match o.opt_type {
-                OPT_IP_ADDRESS => "IP",
-                OPT_PRIMARY_DNS => "PrimaryDNS",
-                OPT_SECONDARY_DNS => "SecondaryDNS",
-                _ => "Unknown",
-            };
-            if o.data.len() == 4 {
-                let ip = Ipv4Addr::new(o.data[0], o.data[1], o.data[2], o.data[3]);
-                format!("{}={}", name, ip)
-            } else {
-                format!("{}(type={} len={})", name, o.opt_type, o.data.len())
+        .map(|o| match o.opt_type {
+            IPCP_OPT_IP_COMPRESSION => {
+                if o.data.len() == 4 {
+                    let protocol = u16::from_be_bytes([o.data[0], o.data[1]]);
+                    format!(
+                        "IPCompression(protocol=0x{:04x},max_slot_id={},comp_slot_id={})",
+                        protocol, o.data[2], o.data[3]
+                    )
+                } else {
+                    format!("IPCompression(type={} len={})", o.opt_type, o.data.len())
+                }
+            }
+            OPT_IP_ADDRESS | OPT_PRIMARY_DNS | OPT_SECONDARY_DNS => {
+                let name = match o.opt_type {
+                    OPT_IP_ADDRESS => "IP",
+                    OPT_PRIMARY_DNS => "PrimaryDNS",
+                    OPT_SECONDARY_DNS => "SecondaryDNS",
+                    _ => unreachable!(),
+                };
+                if o.data.len() == 4 {
+                    let ip = Ipv4Addr::new(o.data[0], o.data[1], o.data[2], o.data[3]);
+                    format!("{}={}", name, ip)
+                } else {
+                    format!("{}(type={} len={})", name, o.opt_type, o.data.len())
+                }
+            }
+            _ => {
+                if o.data.len() == 4 {
+                    let ip = Ipv4Addr::new(o.data[0], o.data[1], o.data[2], o.data[3]);
+                    format!("Unknown={}", ip)
+                } else {
+                    format!("Unknown(type={} len={})", o.opt_type, o.data.len())
+                }
             }
         })
         .collect::<Vec<_>>()
@@ -779,6 +893,24 @@ fn format_ipcp_options(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn local_vj_config() -> IpcpConfig {
+        IpcpConfig {
+            request_vj: true,
+            ..IpcpConfig::default()
+        }
+    }
+
+    fn ack_last_request(session: &mut IpcpSession) {
+        let ack = IpcpPacket {
+            code: CONFIGURE_ACK,
+            identifier: session
+                .last_request_id
+                .expect("session should have an outstanding request"),
+            data: session.last_request_data.clone(),
+        };
+        session.receive(&ack.to_ppp());
+    }
 
     #[test]
     fn ipcp_packet_round_trip() {
@@ -1066,9 +1198,11 @@ mod tests {
         let retry = IpcpPacket::parse(&responses[0].payload).unwrap();
         assert_eq!(retry.code, CONFIGURE_REQUEST);
         let opts = parse_options(&retry.data);
-        assert_eq!(opts.len(), 1);
-        assert_eq!(opts[0].opt_type, OPT_IP_ADDRESS);
-        assert_eq!(bytes_to_ip(&opts[0].data), Some(Ipv4Addr::new(10, 0, 0, 1)));
+        let ip = opts
+            .iter()
+            .find(|opt| opt.opt_type == OPT_IP_ADDRESS)
+            .expect("retry should still include our IP option");
+        assert_eq!(bytes_to_ip(&ip.data), Some(Ipv4Addr::new(10, 0, 0, 1)));
         assert_eq!(session.our_ip(), Ipv4Addr::new(10, 0, 0, 1));
     }
 
@@ -1103,8 +1237,159 @@ mod tests {
     }
 
     #[test]
-    fn configure_reject_removes_our_ip_option() {
+    fn peer_vj_ip_compression_option_is_acked() {
         let mut session = IpcpSession::new(IpcpConfig::default());
+        session.start();
+
+        let mobile_req_data = serialize_options(&[
+            IpcpOption {
+                opt_type: OPT_IP_ADDRESS,
+                data: vec![10, 0, 0, 2],
+            },
+            IpcpOption {
+                opt_type: IPCP_OPT_IP_COMPRESSION,
+                data: vec![0x00, 0x2d, 0x0f, 0x01],
+            },
+        ]);
+        let mobile_req = IpcpPacket {
+            code: CONFIGURE_REQUEST,
+            identifier: 9,
+            data: mobile_req_data.clone(),
+        };
+        let responses = session.receive(&mobile_req.to_ppp());
+        assert_eq!(responses.len(), 1);
+        let ack = IpcpPacket::parse(&responses[0].payload).unwrap();
+        assert_eq!(ack.code, CONFIGURE_ACK);
+        assert_eq!(ack.data, mobile_req_data);
+        assert_eq!(
+            session.peer_vj_options(),
+            Some(VjCompressionOptions {
+                max_slot_id: 15,
+                comp_slot_id: true,
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_or_unsupported_peer_vj_option_is_rejected() {
+        let mut session = IpcpSession::new(IpcpConfig::default());
+        session.start();
+
+        for (identifier, data) in [
+            (1, vec![0x00, 0x2d, 0x0f]),
+            (2, vec![0x00, 0x21, 0x0f, 0x01]),
+        ] {
+            let mobile_req = IpcpPacket {
+                code: CONFIGURE_REQUEST,
+                identifier,
+                data: serialize_options(&[
+                    IpcpOption {
+                        opt_type: OPT_IP_ADDRESS,
+                        data: vec![10, 0, 0, 2],
+                    },
+                    IpcpOption {
+                        opt_type: IPCP_OPT_IP_COMPRESSION,
+                        data,
+                    },
+                ]),
+            };
+            let responses = session.receive(&mobile_req.to_ppp());
+            assert_eq!(responses.len(), 1);
+            let reject = IpcpPacket::parse(&responses[0].payload).unwrap();
+            assert_eq!(reject.code, CONFIGURE_REJECT);
+            let reject_opts = parse_options(&reject.data);
+            assert_eq!(reject_opts.len(), 1);
+            assert_eq!(reject_opts[0].opt_type, IPCP_OPT_IP_COMPRESSION);
+            assert_eq!(session.peer_vj_options(), None);
+        }
+    }
+
+    #[test]
+    fn default_request_omits_vj() {
+        let mut session = IpcpSession::new(IpcpConfig::default());
+        let our_req = session.start();
+        let our_ipcp = IpcpPacket::parse(&our_req.payload).unwrap();
+        let opts = parse_options(&our_ipcp.data);
+        assert!(
+            !opts
+                .iter()
+                .any(|opt| opt.opt_type == IPCP_OPT_IP_COMPRESSION)
+        );
+    }
+
+    #[test]
+    fn local_vj_request_includes_vj_and_peer_reject_disables_it() {
+        let mut session = IpcpSession::new(local_vj_config());
+        let our_req = session.start();
+        let our_ipcp = IpcpPacket::parse(&our_req.payload).unwrap();
+        let opts = parse_options(&our_ipcp.data);
+        assert!(
+            opts.iter()
+                .any(|opt| opt.opt_type == IPCP_OPT_IP_COMPRESSION
+                    && opt.data == VjCompressionOptions::default().to_ipcp_data().to_vec())
+        );
+
+        let reject = IpcpPacket {
+            code: CONFIGURE_REJECT,
+            identifier: our_ipcp.identifier,
+            data: serialize_options(&[IpcpOption {
+                opt_type: IPCP_OPT_IP_COMPRESSION,
+                data: VjCompressionOptions::default().to_ipcp_data().to_vec(),
+            }]),
+        };
+        let responses = session.receive(&reject.to_ppp());
+        assert_eq!(responses.len(), 1);
+        let retry = IpcpPacket::parse(&responses[0].payload).unwrap();
+        assert_eq!(retry.code, CONFIGURE_REQUEST);
+        assert!(
+            !parse_options(&retry.data)
+                .iter()
+                .any(|opt| opt.opt_type == IPCP_OPT_IP_COMPRESSION)
+        );
+    }
+
+    #[test]
+    fn peer_nak_of_local_vj_option_is_adopted_when_supported() {
+        let mut session = IpcpSession::new(local_vj_config());
+        let our_req = session.start();
+        let our_ipcp = IpcpPacket::parse(&our_req.payload).unwrap();
+        let suggested = VjCompressionOptions {
+            max_slot_id: 3,
+            comp_slot_id: false,
+        };
+        let nak = IpcpPacket {
+            code: CONFIGURE_NAK,
+            identifier: our_ipcp.identifier,
+            data: serialize_options(&[IpcpOption {
+                opt_type: IPCP_OPT_IP_COMPRESSION,
+                data: suggested.to_ipcp_data().to_vec(),
+            }]),
+        };
+        let responses = session.receive(&nak.to_ppp());
+        assert_eq!(responses.len(), 1);
+        let retry = IpcpPacket::parse(&responses[0].payload).unwrap();
+        let vj = parse_options(&retry.data)
+            .into_iter()
+            .find(|opt| opt.opt_type == IPCP_OPT_IP_COMPRESSION)
+            .expect("retry should include adopted VJ option");
+        assert_eq!(vj.data, suggested.to_ipcp_data().to_vec());
+    }
+
+    #[test]
+    fn vj_option_is_formatted_without_ipv4_mislabel() {
+        let data = serialize_options(&[IpcpOption {
+            opt_type: IPCP_OPT_IP_COMPRESSION,
+            data: vec![0x00, 0x2d, 0x0f, 0x01],
+        }]);
+        assert_eq!(
+            format_ipcp_options(&data),
+            "IPCompression(protocol=0x002d,max_slot_id=15,comp_slot_id=1)"
+        );
+    }
+
+    #[test]
+    fn configure_reject_removes_our_ip_option() {
+        let mut session = IpcpSession::new(local_vj_config());
         let our_req = session.start();
         let our_ipcp = IpcpPacket::parse(&our_req.payload).unwrap();
 
@@ -1120,7 +1405,13 @@ mod tests {
         assert_eq!(responses.len(), 1);
         let retry = IpcpPacket::parse(&responses[0].payload).unwrap();
         assert_eq!(retry.code, CONFIGURE_REQUEST);
-        assert!(parse_options(&retry.data).is_empty());
+        let retry_opts = parse_options(&retry.data);
+        assert!(!retry_opts.iter().any(|opt| opt.opt_type == OPT_IP_ADDRESS));
+        assert!(
+            retry_opts
+                .iter()
+                .any(|opt| opt.opt_type == IPCP_OPT_IP_COMPRESSION)
+        );
     }
 
     #[test]
@@ -1289,12 +1580,7 @@ mod tests {
             }]),
         };
         session.receive(&req.to_ppp());
-        let ack = IpcpPacket {
-            code: CONFIGURE_ACK,
-            identifier: 1,
-            data: vec![3, 6, 10, 0, 0, 1],
-        };
-        session.receive(&ack.to_ppp());
+        ack_last_request(&mut session);
         assert!(session.is_open());
 
         let term = IpcpPacket {
@@ -1345,12 +1631,7 @@ mod tests {
             }]),
         };
         session.receive(&req.to_ppp());
-        let ack = IpcpPacket {
-            code: CONFIGURE_ACK,
-            identifier: 1,
-            data: vec![3, 6, 10, 0, 0, 1],
-        };
-        session.receive(&ack.to_ppp());
+        ack_last_request(&mut session);
         assert!(session.is_open());
 
         // Peer sends a brand-new Configure-Request.
@@ -1393,12 +1674,7 @@ mod tests {
             }]),
         };
         session.receive(&req.to_ppp());
-        let ack = IpcpPacket {
-            code: CONFIGURE_ACK,
-            identifier: 1,
-            data: vec![3, 6, 10, 0, 0, 1],
-        };
-        session.receive(&ack.to_ppp());
+        ack_last_request(&mut session);
         assert!(session.is_open());
 
         let duplicate = IpcpPacket {

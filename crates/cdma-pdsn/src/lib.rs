@@ -32,11 +32,14 @@ pub fn build_packet_service_with_sink(
     lifecycle_sink: Option<Arc<dyn cdma_packet::session_lifecycle::SessionLifecycleSink>>,
 ) -> std::result::Result<Arc<cdma_packet::grpc::PacketServiceImpl>, String> {
     let transport_config = packet_transport_config(&cfg.packet)?;
-    let allocator = Arc::new(cdma_packet::ip_allocator::SubnetIpAllocator::new(
-        cfg.packet.gateway_ip,
-        cfg.packet.primary_dns,
-        cfg.packet.secondary_dns,
-    ));
+    let allocator = Arc::new(
+        cdma_packet::ip_allocator::SubnetIpAllocator::new_with_vj_compression_default(
+            cfg.packet.gateway_ip,
+            cfg.packet.primary_dns,
+            cfg.packet.secondary_dns,
+            cfg.packet.enable_vj_compression_default,
+        ),
+    );
     let fou_tunnel = match &transport_config {
         cdma_packet::ip_transport::IpTransportConfig::Fou {
             remote_addr,

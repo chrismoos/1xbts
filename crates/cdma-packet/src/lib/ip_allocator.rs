@@ -66,6 +66,7 @@ struct SubnetIpAllocatorInner {
     /// DNS servers to include in IPCP config.
     primary_dns: Ipv4Addr,
     secondary_dns: Ipv4Addr,
+    request_vj: bool,
 }
 
 impl SubnetIpAllocator {
@@ -76,6 +77,21 @@ impl SubnetIpAllocator {
     /// # Panics
     /// Panics if the gateway's last octet is not `1`.
     pub fn new(gateway: Ipv4Addr, primary_dns: Ipv4Addr, secondary_dns: Ipv4Addr) -> Self {
+        Self::new_with_vj_compression_default(gateway, primary_dns, secondary_dns, false)
+    }
+
+    /// Create a pool allocator and set whether local IPCP requests advertise VJ by default.
+    ///
+    /// `gateway` must end in `.1`; mobile addresses are `.2`–`.254`.
+    ///
+    /// # Panics
+    /// Panics if the gateway's last octet is not `1`.
+    pub fn new_with_vj_compression_default(
+        gateway: Ipv4Addr,
+        primary_dns: Ipv4Addr,
+        secondary_dns: Ipv4Addr,
+        request_vj: bool,
+    ) -> Self {
         let octets = gateway.octets();
         assert_eq!(octets[3], 1, "gateway must be x.x.x.1");
         let prefix = [octets[0], octets[1], octets[2]];
@@ -91,6 +107,7 @@ impl SubnetIpAllocator {
                 release_grace: DEFAULT_RELEASE_GRACE,
                 primary_dns,
                 secondary_dns,
+                request_vj,
             }),
         }
     }
@@ -130,6 +147,7 @@ impl IpAllocator for SubnetIpAllocator {
                 peer_ip: Ipv4Addr::new(p[0], p[1], p[2], host),
                 primary_dns: inner.primary_dns,
                 secondary_dns: inner.secondary_dns,
+                request_vj: inner.request_vj,
             });
         }
 
@@ -153,6 +171,7 @@ impl IpAllocator for SubnetIpAllocator {
             peer_ip: Ipv4Addr::new(p[0], p[1], p[2], host),
             primary_dns: inner.primary_dns,
             secondary_dns: inner.secondary_dns,
+            request_vj: inner.request_vj,
         })
     }
 
@@ -249,6 +268,7 @@ impl SubnetIpAllocatorInner {
             peer_ip: Ipv4Addr::new(p[0], p[1], p[2], host),
             primary_dns: self.primary_dns,
             secondary_dns: self.secondary_dns,
+            request_vj: self.request_vj,
         }
     }
 
@@ -307,6 +327,19 @@ mod tests {
         assert_eq!(c2.peer_ip, Ipv4Addr::new(10, 55, 0, 3));
         assert_eq!(c1.primary_dns, Ipv4Addr::new(10, 55, 0, 1));
         assert_eq!(c1.secondary_dns, Ipv4Addr::new(10, 55, 0, 1));
+    }
+
+    #[test]
+    fn allocation_preserves_vj_request_default() {
+        let alloc = SubnetIpAllocator::new_with_vj_compression_default(
+            Ipv4Addr::new(10, 55, 0, 1),
+            Ipv4Addr::new(10, 55, 0, 1),
+            Ipv4Addr::new(10, 55, 0, 1),
+            true,
+        );
+
+        let cfg = alloc.allocate("s1").unwrap();
+        assert!(cfg.request_vj);
     }
 
     #[test]

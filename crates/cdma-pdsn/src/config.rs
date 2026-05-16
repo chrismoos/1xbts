@@ -46,6 +46,8 @@ pub struct PacketTransportConfig {
     pub primary_dns: Ipv4Addr,
     /// Secondary DNS server advertised to mobiles via IPCP.
     pub secondary_dns: Ipv4Addr,
+    /// Whether PDSN-originated IPCP Configure-Requests advertise VJ compression.
+    pub enable_vj_compression_default: bool,
 }
 
 impl Default for PacketTransportConfig {
@@ -58,6 +60,7 @@ impl Default for PacketTransportConfig {
             gateway_ip: Ipv4Addr::new(10, 55, 0, 1),
             primary_dns: Ipv4Addr::new(10, 55, 0, 1),
             secondary_dns: Ipv4Addr::new(10, 55, 0, 1),
+            enable_vj_compression_default: false,
         }
     }
 }
@@ -156,6 +159,7 @@ mod tests {
         assert_eq!(cfg.packet.gateway_ip, Ipv4Addr::new(10, 55, 0, 1));
         assert_eq!(cfg.packet.primary_dns, Ipv4Addr::new(10, 55, 0, 1));
         assert_eq!(cfg.packet.secondary_dns, Ipv4Addr::new(10, 55, 0, 1));
+        assert!(!cfg.packet.enable_vj_compression_default);
         assert_eq!(
             cfg.ppp_session_timeout_secs,
             DEFAULT_PPP_SESSION_TIMEOUT_SECS

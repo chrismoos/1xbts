@@ -8,7 +8,8 @@
     "tun_nat_interface": null,
     "gateway_ip": "10.55.0.1",
     "primary_dns": "10.55.0.1",
-    "secondary_dns": "10.55.0.1"
+    "secondary_dns": "10.55.0.1",
+    "enable_vj_compression_default": false
   },
   "events_endpoint": "http://127.0.0.1:17023"
 }
