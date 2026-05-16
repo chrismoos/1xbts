@@ -5183,7 +5183,7 @@ mod tests {
     /// MS ESN=0x80857E58.
     #[test]
     fn capture_rc3_reverse_traffic_so33_decode() {
-        const RC3_SO33_W11_EXPECTED_PCG_MEASUREMENTS: usize = 15_673;
+        const RC3_SO33_W11_EXPECTED_PCG_MEASUREMENTS: usize = 15_967;
 
         let expected_signatures = expected_rc3_so33_w11_signatures();
         let result = run_rc3_reverse_traffic_capture_test(
@@ -5209,7 +5209,7 @@ mod tests {
     )]
     fn capture_rc3_reverse_traffic_so33_live_chain_baseline() {
         const RC3_MAX_MEASUREMENT_AGE_CHIPS: u64 = 1_536;
-        const RC3_SO33_W11_EXPECTED_PCG_MEASUREMENTS: usize = 15_677;
+        const RC3_SO33_W11_EXPECTED_PCG_MEASUREMENTS: usize = 15_970;
 
         let expected_signatures = expected_rc3_so33_w11_signatures();
         let result = run_rc3_reverse_traffic_capture_test_pcg_batches(

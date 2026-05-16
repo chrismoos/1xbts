@@ -78,6 +78,17 @@ const E2E_SMS_PAGE_SCI: u8 = 2;
 const E2E_MAX_SLOT_CYCLE_INDEX: u8 = 0;
 const E2E_PENDING_PAGE_RECORD_ATTEMPTS: usize = 4;
 const MATLAB_DEFAULT_LONG_CODE_STATE: u64 = 0x2123_4567_89A;
+
+fn direct_bts_overhead(
+    cdma_freq: u16,
+    ext_cdma_freq: u16,
+) -> cdma_common::overhead::OverheadParameters {
+    cdma_common::overhead::OverheadParameters {
+        cdma_freq: Some(cdma_freq),
+        ext_cdma_freq: Some(ext_cdma_freq),
+        ..Default::default()
+    }
+}
 const RC1_PCG_CHIPS: u64 = 1_536;
 const PCGS_PER_FRAME: usize = 16;
 
@@ -2070,7 +2081,7 @@ async fn generate_bts_buffer_samples(
                 ds_incl: false,
             }),
             timezone: cdma_common::timezone::TimezoneConfig::default(),
-            overhead: cdma_common::overhead::OverheadParameters::default(),
+            overhead: direct_bts_overhead(384, 0),
             rx: None,
         },
         runtime,
@@ -3587,8 +3598,11 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
         bsc.has_pending_page()
     );
 
+    let cdma_freq = config::resolved_cdma_freq(&bsc_config.overhead, bts_config.channel);
+    let ext_cdma_freq = bsc_config.overhead.ext_cdma_freq.unwrap_or(0);
+
     let bts_paging_supplier = build_bts_paging_supplier(
-        bts_config.overhead.clone(),
+        direct_bts_overhead(cdma_freq, ext_cdma_freq),
         bts_config.runtime.downlink.paging.clone(),
         bts_config.pilot_offset,
         bts_paging_state.clone(),
@@ -3599,7 +3613,6 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
 
     let mut runtime = bts_config.runtime.clone();
     runtime.downlink.paging.bypass_long_code = debug.bypass_paging_long_code;
-    let cdma_freq = config::resolved_cdma_freq(&bsc_config.overhead, bts_config.channel);
 
     let (bts, _bts_handle) = Bts::new_with_radio_pipe(
         radio,
@@ -3623,14 +3636,14 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
                 daylt: 0,
                 prat: bsc_config.overhead.prat,
                 cdma_freq,
-                ext_cdma_freq: bsc_config.overhead.ext_cdma_freq.unwrap_or(0),
+                ext_cdma_freq,
                 sr1_bcch_non_td_incl: false,
                 sr1_td_incl: false,
                 sr3_incl: false,
                 ds_incl: false,
             }),
             timezone: cdma_common::timezone::TimezoneConfig::default(),
-            overhead: cdma_common::overhead::OverheadParameters::default(),
+            overhead: direct_bts_overhead(cdma_freq, ext_cdma_freq),
             rx: None,
         },
         runtime,
@@ -3981,8 +3994,11 @@ async fn run_sync_overhead_window_case(
         thread::spawn(move || mac.run_for(100_000, Duration::from_secs(10)).unwrap())
     };
 
+    let cdma_freq = config::resolved_cdma_freq(&bsc_config.overhead, bts_config.channel);
+    let ext_cdma_freq = bsc_config.overhead.ext_cdma_freq.unwrap_or(0);
+
     let bts_paging_supplier = build_bts_paging_supplier(
-        bts_config.overhead.clone(),
+        direct_bts_overhead(cdma_freq, ext_cdma_freq),
         bts_config.runtime.downlink.paging.clone(),
         bts_config.pilot_offset,
         bts_paging_state.clone(),
@@ -3991,7 +4007,6 @@ async fn run_sync_overhead_window_case(
 
     let (radio, pipe_handle) = RadioPipe::new(256);
 
-    let cdma_freq = config::resolved_cdma_freq(&bsc_config.overhead, bts_config.channel);
     let (bts, _bts_handle) = Bts::new_with_radio_pipe(
         radio,
         bts::Config {
@@ -4014,14 +4029,14 @@ async fn run_sync_overhead_window_case(
                 daylt: 0,
                 prat: bsc_config.overhead.prat,
                 cdma_freq,
-                ext_cdma_freq: bsc_config.overhead.ext_cdma_freq.unwrap_or(0),
+                ext_cdma_freq,
                 sr1_bcch_non_td_incl: false,
                 sr1_td_incl: false,
                 sr3_incl: false,
                 ds_incl: false,
             }),
             timezone: cdma_common::timezone::TimezoneConfig::default(),
-            overhead: cdma_common::overhead::OverheadParameters::default(),
+            overhead: direct_bts_overhead(cdma_freq, ext_cdma_freq),
             rx: None,
         },
         bts_config.runtime.clone(),
@@ -4558,7 +4573,7 @@ async fn test_e2e_sync_stack_generated_samples() -> Result<(), Error> {
                 ds_incl: false,
             }),
             timezone: cdma_common::timezone::TimezoneConfig::default(),
-            overhead: cdma_common::overhead::OverheadParameters::default(),
+            overhead: direct_bts_overhead(384, 0),
             rx: None,
         },
     );
@@ -5805,7 +5820,7 @@ async fn test_e2e_page_retry_does_not_disrupt_overhead() -> Result<(), Error> {
                 ds_incl: false,
             }),
             timezone: cdma_common::timezone::TimezoneConfig::default(),
-            overhead: cdma_common::overhead::OverheadParameters::default(),
+            overhead: direct_bts_overhead(384, 0),
             rx: None,
         },
         bts::BtsRuntimeSettings::default(),
@@ -7740,7 +7755,7 @@ async fn run_traffic_channel_e2e(
                 ds_incl: false,
             }),
             timezone: cdma_common::timezone::TimezoneConfig::default(),
-            overhead: cdma_common::overhead::OverheadParameters::default(),
+            overhead: direct_bts_overhead(384, 0),
             rx: None,
         },
         bts::BtsRuntimeSettings::default(),
@@ -8042,7 +8057,7 @@ async fn test_e2e_rc1_reverse_preamble_triggers_crc_valid_bs_ack_order() -> Resu
                 ds_incl: false,
             }),
             timezone: cdma_common::timezone::TimezoneConfig::default(),
-            overhead: cdma_common::overhead::OverheadParameters::default(),
+            overhead: direct_bts_overhead(384, 0),
             rx: Some(bts::RxSettings {
                 sample_rate_hz: 1_228_800 * 4,
                 auth_mode: 0,
