@@ -778,11 +778,13 @@ impl libre::OutboundSipSessionHandler for LibreSessionEventHandler {
                     self.apply_sdp(&session_id, sip_status, &sdp, true);
                 }
                 if sip_status != 100 {
+                    let codec = self.negotiated_codec.lock().clone().unwrap_or_default();
                     send_backend_event(
                         &self.events,
                         SipBackendEvent::Ringing {
                             session_id,
                             sip_status,
+                            codec,
                         },
                         "ringing",
                     );

@@ -61,6 +61,8 @@ pub struct MscRuntimeConfig {
     pub media_ringback_enabled: bool,
     /// Ringback cadence to synthesize when enabled.
     pub media_ringback_type: MediaRingbackType,
+    pub sip_ringback_disable: bool,
+    pub failure_tone_duration_ms: u64,
     /// Voice bearer manager for MSC<->BSC per-circuit RTP voice sessions.
     pub voice_bearer: Option<Arc<VoiceBearerManager>>,
     /// Optional MSC-owned media gateway client for external voice legs.
@@ -93,6 +95,8 @@ impl MscRuntimeConfig {
             local_answer_delay_ms: config.voice.answer_delay_ms,
             media_ringback_enabled: config.voice.media_ringback_enabled,
             media_ringback_type: config.voice.media_ringback_type,
+            sip_ringback_disable: config.voice.sip_ringback_disable,
+            failure_tone_duration_ms: config.voice.failure_tone_duration_ms,
             voice_bearer: Some(Arc::new(VoiceBearerManager::new(
                 config.voice.voice_bearer_bind_ip,
             ))),
@@ -160,6 +164,12 @@ impl MscRuntime {
                     None => std::future::pending().await,
                 }
             };
+            let pending_clear_sleep = async {
+                match self.media_gw.next_pending_clear_deadline() {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 request = management_rx.recv() => {
                     let Some(request) = request else {
@@ -200,6 +210,8 @@ impl MscRuntime {
                             self.config.media_gateway.as_ref(),
                             self.config.media_ringback_enabled,
                             self.config.media_ringback_type,
+                            self.config.sip_ringback_disable,
+                            self.config.failure_tone_duration_ms,
                             Some(&self.config.hlr_repo),
                         ).await;
                     }
@@ -209,6 +221,9 @@ impl MscRuntime {
                         &self.circuits,
                         self.config.voice_bearer.as_ref(),
                     );
+                }
+                _ = pending_clear_sleep => {
+                    self.fire_due_pending_clears(a1).await;
                 }
                 _ = sms_expiry_interval.tick() => {
                     if let Some(smsc) = self.smsc.as_mut() {
@@ -566,7 +581,12 @@ impl MscRuntime {
                         self.config.media_ringback_type,
                         Some(&self.config.hlr_repo),
                     );
-                } else if completed_leg == Some(MscVoiceLeg::Primary) {
+                } else if completed_leg == Some(MscVoiceLeg::Primary)
+                    && !self.config.sip_ringback_disable
+                {
+                    // `sip_ringback_disable=true` keeps the bearer silent so
+                    // the BSC's bearer-flow → tones-off doesn't fire before
+                    // SIP audio arrives.
                     self.media.start_ringback_for_call(
                         call_id,
                         &self.controller,
@@ -584,7 +604,11 @@ impl MscRuntime {
                     })
                 {
                     self.flush_deferred_paging_request(a1, call_id).await;
+                    self.fire_deferred_sip_invite(a1, call_id).await;
                 }
+                self.media_gw
+                    .flush_pending_post_assignment(a1, call_id, &mut self.controller)
+                    .await;
             }
             cdma_ios::MessageType::AssignmentFailure => {
                 self.handle_assignment_failure(a1, call_id).await;
@@ -759,69 +783,29 @@ impl MscRuntime {
                 let routes_to_subscriber = subscriber_route == MoSubscriberRoute::Paged;
 
                 let mut audio_file = None;
-                let media_gateway_handle = if !routes_to_subscriber {
-                    if let (Some(gateway), Some(called_number)) =
+                // SIP INVITE is deferred until AssignmentComplete so failure
+                // tones have a bearer; handle attaches there.
+                let media_gateway_handle: Option<crate::media_gateway::CallHandle> = None;
+                if !routes_to_subscriber {
+                    if let (Some(_gateway), Some(called_number)) =
                         (self.config.media_gateway.as_ref(), called_number.as_deref())
                     {
-                        match gateway
-                            .create_call(CreateCallRequest {
-                                call_id: call_id.0,
-                                calling_party: calling_number.clone(),
-                                called_party: Some(called_number.to_string()),
+                        self.mo_call.pending_sip_routes.insert(
+                            call_id,
+                            crate::mo_call::PendingSipRoute {
+                                called_number: called_number.to_string(),
+                                calling_number: calling_number.clone(),
                                 service_option,
-                            })
-                            .await
-                        {
-                            Ok(handle) => {
-                                self.media_gw.media_gateway_calls.insert(handle, call_id);
-                                if let Err(error) =
-                                    self.controller.attach_media_gateway_handle(call_id, handle)
-                                {
-                                    warn!(
-                                        "MSC: failed to attach media gateway handle to call_id={}: {}",
-                                        call_id.0, error
-                                    );
-                                }
-                                Some(handle)
-                            }
-                            Err(error) => {
-                                warn!(
-                                    "MSC: failed to create media gateway call for MO call_id={}: {}",
-                                    call_id.0, error
-                                );
-                                if self.config.gateway_fallback_to_wav {
-                                    audio_file = self.config.wav_file.clone();
-                                    if audio_file.is_some() {
-                                        info!(
-                                            "MSC: falling back to WAV playback for MO call_id={} after media gateway setup failure",
-                                            call_id.0
-                                        );
-                                    } else {
-                                        warn!(
-                                            "MSC: media gateway fallback enabled for MO call_id={} but no WAV file is configured",
-                                            call_id.0
-                                        );
-                                    }
-                                } else {
-                                    send_gateway_clear_command(
-                                        a1,
-                                        call_id,
-                                        &mut self.controller,
-                                        gateway_clear_cause(ReleaseCause::SetupFailed, None),
-                                    )
-                                    .await;
-                                    return;
-                                }
-                                None
-                            }
-                        }
+                            },
+                        );
+                        info!(
+                            "MSC: deferred SIP INVITE for MO call_id={} until AssignmentComplete",
+                            call_id.0
+                        );
                     } else {
                         audio_file = self.config.wav_file.clone();
-                        None
                     }
-                } else {
-                    None
-                };
+                }
 
                 let cic = self
                     .circuits
@@ -1176,6 +1160,116 @@ impl MscRuntime {
                 call_id.0, error
             );
             self.circuits.paging_requests.remove(&call_id);
+        }
+    }
+
+    async fn fire_due_pending_clears(&mut self, a1: &dyn MscA1Endpoint) {
+        for (call_id, cause) in self.media_gw.drain_due_pending_clears() {
+            crate::media_gateway_service::send_gateway_clear_command(
+                a1,
+                call_id,
+                &mut self.controller,
+                cause,
+            )
+            .await;
+            stop_media_for_call(
+                call_id,
+                &mut self.controller,
+                &mut self.circuits,
+                &mut self.media,
+                &mut self.media_gw,
+                self.config.voice_bearer.as_ref(),
+                self.config.media_gateway.as_ref(),
+            );
+        }
+    }
+
+    async fn fire_deferred_sip_invite(&mut self, a1: &dyn MscA1Endpoint, call_id: CallId) {
+        let Some(route) = self.mo_call.pending_sip_routes.remove(&call_id) else {
+            return;
+        };
+        let Some(gateway) = self.config.media_gateway.as_ref() else {
+            return;
+        };
+        info!(
+            "MSC: firing deferred SIP INVITE for MO call_id={} called={} so={}",
+            call_id.0, route.called_number, route.service_option
+        );
+        match gateway
+            .create_call(CreateCallRequest {
+                call_id: call_id.0,
+                calling_party: route.calling_number,
+                called_party: Some(route.called_number),
+                service_option: route.service_option,
+            })
+            .await
+        {
+            Ok(handle) => {
+                self.media_gw.media_gateway_calls.insert(handle, call_id);
+                if let Err(error) = self.controller.attach_media_gateway_handle(call_id, handle) {
+                    warn!(
+                        "MSC: failed to attach media gateway handle to call_id={}: {}",
+                        call_id.0, error
+                    );
+                }
+                for (_, session) in self.circuits.circuits.iter_mut() {
+                    if session.call_id == call_id
+                        && session.leg_role == MscVoiceLeg::Primary
+                        && session.media_gateway_handle.is_none()
+                    {
+                        session.media_gateway_handle = Some(handle);
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(
+                    "MSC: failed to create media gateway call for MO call_id={}: {}",
+                    call_id.0, error
+                );
+                let wav_fallback = self
+                    .config
+                    .gateway_fallback_to_wav
+                    .then(|| self.config.wav_file.clone())
+                    .flatten();
+                if let Some(path) = wav_fallback {
+                    info!(
+                        "MSC: falling back to WAV playback for MO call_id={} file={}",
+                        call_id.0, path
+                    );
+                    for (_, session) in self.circuits.circuits.iter_mut() {
+                        if session.call_id == call_id
+                            && session.leg_role == MscVoiceLeg::Primary
+                            && session.audio_file.is_none()
+                        {
+                            session.audio_file = Some(path.clone());
+                        }
+                    }
+                    self.media.schedule_delayed_wav_start(
+                        call_id,
+                        self.config.local_answer_delay_ms,
+                        &self.controller,
+                        &self.circuits,
+                        self.config.voice_bearer.as_ref(),
+                        self.config.media_ringback_enabled,
+                        self.config.media_ringback_type,
+                        Some(&self.config.hlr_repo),
+                    );
+                } else {
+                    self.media_gw
+                        .signal_call_failure(
+                            a1,
+                            call_id,
+                            &mut self.controller,
+                            &mut self.circuits,
+                            &mut self.media,
+                            self.config.voice_bearer.as_ref(),
+                            self.config.failure_tone_duration_ms,
+                            crate::media_gateway::ReleaseCause::SipFailure,
+                            None,
+                        )
+                        .await;
+                }
+            }
         }
     }
 
@@ -2111,6 +2205,8 @@ mod tests {
             local_answer_delay_ms: 10_000,
             media_ringback_enabled: false,
             media_ringback_type: MediaRingbackType::Nanp,
+            sip_ringback_disable: false,
+            failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: None,
         });
@@ -2230,6 +2326,8 @@ mod tests {
             local_answer_delay_ms: 10_000,
             media_ringback_enabled: false,
             media_ringback_type: MediaRingbackType::Nanp,
+            sip_ringback_disable: false,
+            failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: None,
         });
@@ -2372,6 +2470,8 @@ mod tests {
             local_answer_delay_ms: 10_000,
             media_ringback_enabled: false,
             media_ringback_type: MediaRingbackType::Nanp,
+            sip_ringback_disable: false,
+            failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: None,
         });
@@ -2615,6 +2715,8 @@ mod tests {
             local_answer_delay_ms: 10_000,
             media_ringback_enabled: false,
             media_ringback_type: MediaRingbackType::Nanp,
+            sip_ringback_disable: false,
+            failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: None,
         });
@@ -2731,6 +2833,8 @@ mod tests {
             local_answer_delay_ms: 10_000,
             media_ringback_enabled: false,
             media_ringback_type: MediaRingbackType::Nanp,
+            sip_ringback_disable: false,
+            failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: None,
         });
@@ -2776,7 +2880,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mo_cli3_falls_back_to_wav_when_gateway_create_fails() {
+    async fn mo_cli3_defers_sip_invite_until_assignment_complete() {
         let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
         let mut runtime = MscRuntime::new(MscRuntimeConfig {
             hlr_repo: Arc::new(StubHlrRepo),
@@ -2789,6 +2893,8 @@ mod tests {
             local_answer_delay_ms: 10_000,
             media_ringback_enabled: false,
             media_ringback_type: MediaRingbackType::Nanp,
+            sip_ringback_disable: false,
+            failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: Some(Arc::new(FailingMediaGateway)),
         });
@@ -2806,21 +2912,110 @@ mod tests {
 
         let outbound = timeout(Duration::from_millis(50), client.poll_a1())
             .await
-            .expect("AssignmentRequest should be sent after WAV fallback")
+            .expect("AssignmentRequest should be sent")
             .unwrap();
         assert_eq!(
             outbound.message_type(),
             cdma_ios::MessageType::AssignmentRequest
         );
+        // SIP INVITE is deferred to AssignmentComplete, so no gateway handle
+        // exists yet and the FailingMediaGateway hasn't been invoked.
         assert_eq!(runtime.media_gw.media_gateway_calls.len(), 0);
+        assert!(
+            runtime
+                .mo_call
+                .pending_sip_routes
+                .contains_key(&CallId(call_id)),
+            "MO origination must stash a pending SIP route until TCH is up"
+        );
         let circuit = runtime
             .circuits
             .circuits
             .values()
             .find(|session| session.call_id == CallId(call_id))
             .expect("MO circuit should be inserted");
-        assert_eq!(circuit.audio_file.as_deref(), Some("sample-sound.wav"));
+        assert_eq!(circuit.audio_file, None);
         assert_eq!(circuit.media_gateway_handle, None);
+    }
+
+    #[tokio::test]
+    async fn sip_ringback_disable_suppresses_ringback_after_assignment_complete() {
+        // Regression test: `sip_ringback_disable=true` must suppress the
+        // MSC-side ringback feeder that the AssignmentComplete handler
+        // would otherwise start unconditionally for primary-leg MO calls.
+        // Without this, the bearer-frame stream from the ringback feeder
+        // makes the BSC's auto-tones-off fire prematurely and the MS
+        // ignores any later Progress(Signal) failure tone.
+        let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
+        let mut runtime = MscRuntime::new(MscRuntimeConfig {
+            hlr_repo: Arc::new(StubHlrRepo),
+            smsc_repo: None,
+            welcome_sms: None,
+            sms_retry: crate::config::SmsRetryConfig::default(),
+            default_voice_service_option: 3,
+            wav_file: None,
+            gateway_fallback_to_wav: false,
+            local_answer_delay_ms: 10_000,
+            // `media_ringback_enabled=true` would normally start a ringback
+            // feeder on AssignmentComplete. The new `sip_ringback_disable`
+            // gate must override it for SIP-routed calls.
+            media_ringback_enabled: true,
+            media_ringback_type: MediaRingbackType::Nanp,
+            sip_ringback_disable: true,
+            failure_tone_duration_ms: 0,
+            voice_bearer: None,
+            media_gateway: Some(Arc::new(StubMediaGateway::default())),
+        });
+
+        let cli3 = cm_service_request_cli3(Some(vec![0x81, 0x00, 0x00, 0x00, 0x00, 0x00]));
+        let call_id_raw = 4242;
+        let cli3_msg = EncodedA1Message::from_message_for_call(
+            &cdma_ios::Message::new(
+                cdma_ios::MessageType::CompleteLayer3Information,
+                cli3.encode().unwrap(),
+            ),
+            Some(call_id_raw),
+        );
+        runtime.handle_bsc_a1_message(&endpoint, cli3_msg).await;
+
+        // Drain the AssignmentRequest the MSC just sent.
+        let outbound = timeout(Duration::from_millis(50), client.poll_a1())
+            .await
+            .expect("AssignmentRequest should be sent")
+            .unwrap();
+        assert_eq!(
+            outbound.message_type(),
+            cdma_ios::MessageType::AssignmentRequest
+        );
+
+        // Now deliver AssignmentComplete to drive the primary-leg branch
+        // that would otherwise start the ringback feeder.
+        let ac = AssignmentCompleteMessage {
+            channel_number: ChannelNumber(0x100e),
+            encryption_information: None,
+            service_option: Some(ServiceOption(0x0003)),
+            a2p_bearer_session_params: None,
+            a2p_bearer_format_params: None,
+        };
+        let ac_msg = EncodedA1Message::from_message_for_call(
+            &cdma_ios::Message::new(
+                cdma_ios::MessageType::AssignmentComplete,
+                ac.encode().unwrap(),
+            ),
+            Some(call_id_raw),
+        );
+        runtime.handle_bsc_a1_message(&endpoint, ac_msg).await;
+
+        assert!(
+            runtime.media.feeders.is_empty(),
+            "sip_ringback_disable=true must keep MSC-side ringback off; feeders={:?}",
+            runtime
+                .media
+                .feeders
+                .iter()
+                .map(|(cid, f)| (*cid, f.kind))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
@@ -2837,6 +3032,8 @@ mod tests {
             local_answer_delay_ms: 10_000,
             media_ringback_enabled: false,
             media_ringback_type: MediaRingbackType::Nanp,
+            sip_ringback_disable: false,
+            failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: Some(gateway.clone()),
         });
@@ -2894,6 +3091,8 @@ mod tests {
             local_answer_delay_ms: 10_000,
             media_ringback_enabled: false,
             media_ringback_type: MediaRingbackType::Nanp,
+            sip_ringback_disable: false,
+            failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: None,
         });

@@ -329,6 +329,40 @@ impl Bsc {
         )
     }
 
+    /// AWIM carrying a caller-supplied Signal Info Record (A.S0014-D §2.1.6
+    /// DTAP Progress relay).
+    pub(crate) fn send_alert_with_info_signal(
+        &mut self,
+        walsh_code: u8,
+        ack_seq: u8,
+        signal_info: SignalInfoRecord,
+    ) -> Result<(), Error> {
+        let signal_value = signal_info.signal;
+        let awim = AlertWithInformationMessage {
+            signal_info: Some(signal_info),
+            calling_party: None,
+        };
+        let sdu = awim.to_ftch_sdu();
+
+        info!(
+            "BSC: sending AWIM Progress signal=0x{:02x} on F-TCH walsh={} ack_seq={}",
+            signal_value, walsh_code, ack_seq
+        );
+
+        self.send_traffic_signaling(
+            walsh_code,
+            sdu,
+            MessageId::AlertWithInformation,
+            ack_seq,
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some(awim),
+        )
+    }
+
     /// Send AWIM "tones off" on the forward traffic channel.
     ///
     /// Per C.S0005-E Annex B call flow: after the answer delay, the BS sends

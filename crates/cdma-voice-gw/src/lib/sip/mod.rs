@@ -23,6 +23,8 @@ pub enum SipBackendEvent {
     Ringing {
         session_id: String,
         sip_status: u16,
+        /// SDP-derived codec; empty if provisional had no SDP.
+        codec: String,
     },
     Answered {
         session_id: String,

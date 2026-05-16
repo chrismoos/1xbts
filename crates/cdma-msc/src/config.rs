@@ -34,6 +34,14 @@ fn default_media_ringback_enabled() -> bool {
     false
 }
 
+fn default_sip_ringback_disable() -> bool {
+    false
+}
+
+fn default_failure_tone_duration_ms() -> u64 {
+    3000
+}
+
 /// Ringback cadence selection for MSC-synthesized bearer media.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -82,6 +90,13 @@ pub struct VoiceConfig {
     /// Ringback cadence to synthesize when enabled.
     #[serde(default = "default_media_ringback_type")]
     pub media_ringback_type: MediaRingbackType,
+    /// Suppress MSC-side ringback for voice-gateway calls; rely on SIP early
+    /// media / 200 OK instead.
+    #[serde(default = "default_sip_ringback_disable")]
+    pub sip_ringback_disable: bool,
+    /// Failure tone playback duration (ms) before ClearCommand; 0 disables.
+    #[serde(default = "default_failure_tone_duration_ms")]
+    pub failure_tone_duration_ms: u64,
     /// Delay before automatic answer in local simulation paths.
     #[serde(default = "default_answer_delay_ms")]
     pub answer_delay_ms: u64,
@@ -113,6 +128,8 @@ impl Default for VoiceConfig {
             wav_file: None,
             media_ringback_enabled: default_media_ringback_enabled(),
             media_ringback_type: default_media_ringback_type(),
+            sip_ringback_disable: default_sip_ringback_disable(),
+            failure_tone_duration_ms: default_failure_tone_duration_ms(),
             answer_delay_ms: default_answer_delay_ms(),
             release_timeout_ms: default_voice_release_timeout_ms(),
             service_connect_timeout_ms: default_service_connect_timeout_ms(),
@@ -144,6 +161,8 @@ pub struct VoicePolicySnapshot {
     pub media_ringback_enabled: bool,
     /// Ringback cadence to synthesize when enabled.
     pub media_ringback_type: MediaRingbackType,
+    pub sip_ringback_disable: bool,
+    pub failure_tone_duration_ms: u64,
     /// Delay before automatic answer in local simulation paths.
     pub answer_delay_ms: u64,
     /// Timeout before the call is force-cleared after release starts.
@@ -247,6 +266,8 @@ impl From<VoiceConfig> for VoicePolicySnapshot {
             wav_file: value.wav_file,
             media_ringback_enabled: value.media_ringback_enabled,
             media_ringback_type: value.media_ringback_type,
+            sip_ringback_disable: value.sip_ringback_disable,
+            failure_tone_duration_ms: value.failure_tone_duration_ms,
             answer_delay_ms: value.answer_delay_ms,
             release_timeout_ms: value.release_timeout_ms,
             service_connect_timeout_ms: value.service_connect_timeout_ms,

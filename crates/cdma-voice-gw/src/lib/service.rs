@@ -281,7 +281,8 @@ fn describe_gateway_event(event: &SipBackendEvent) -> String {
         SipBackendEvent::Ringing {
             session_id,
             sip_status,
-        } => format!("Ringing session={session_id} sip_status={sip_status}"),
+            codec,
+        } => format!("Ringing session={session_id} sip_status={sip_status} codec={codec}"),
         SipBackendEvent::Answered {
             session_id,
             sip_status,
@@ -314,9 +315,11 @@ fn sip_backend_event_to_gateway_event(event: SipBackendEvent) -> GatewayToMscEve
         SipBackendEvent::Ringing {
             session_id,
             sip_status,
+            codec,
         } => GatewayEvent::Ringing(GatewayRinging {
             session_id,
             sip_status: u32::from(sip_status),
+            codec,
         }),
         SipBackendEvent::Answered {
             session_id,

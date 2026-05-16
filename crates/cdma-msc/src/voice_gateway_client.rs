@@ -328,6 +328,7 @@ fn convert_gateway_event(
         proto::gateway_to_msc_event::Event::Ringing(ringing) => Some(MediaGatewayEvent::Ringing {
             handle: handle_for_session(handles, &ringing.session_id)?,
             sip_status: ringing.sip_status,
+            codec: ringing.codec,
         }),
         proto::gateway_to_msc_event::Event::Answered(answered) => {
             Some(MediaGatewayEvent::Answered {

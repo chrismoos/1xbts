@@ -76,12 +76,11 @@ message GatewayToMscEvent {
   }
 }
 
-// SIP provisional ringing/progress notification.
+// SIP 180/183 provisional. `codec` is set when the provisional carried SDP.
 message GatewayRinging {
-  // MSC call/session identifier.
   string session_id = 1;
-  // 180 Ringing or 183 Session Progress. Zero means unavailable.
   uint32 sip_status = 2;
+  string codec = 3;
 }
 
 // SIP call answered notification.

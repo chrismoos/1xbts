@@ -8,6 +8,7 @@
       "endpoint": "http://127.0.0.1:17015",
       "fallback_to_wav": true
     },
+    "sip_ringback_disable": false,
     "wav_file": "config/sample-sound.wav",
     "media_ringback_enabled": true,
     "media_ringback_type": "nanp",

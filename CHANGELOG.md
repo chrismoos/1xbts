@@ -1,5 +1,11 @@
 # HEAD 
 
+- SIP voice-gateway failures play a busy tone on the FTCH before clearing.
+- SIP `INVITE` is sent only after the mobile is on the traffic channel.
+- `voice.failure_tone_duration_ms` (default `3000`, `0` disables).
+- `voice.sip_ringback_disable` (default `false`): skip MSC ringback for
+  SIP-routed calls; let the SIP side provide ringback / early media.
+
 - Select your CDMA carrier with a single `channel` block (band class,
   subclass, channel number) — TX/RX frequencies and overhead fields
   are derived automatically. All 23 C.S0057-F band classes supported.

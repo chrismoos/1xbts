@@ -23,16 +23,24 @@ pub(crate) enum MoSubscriberRoute {
     Rejected,
 }
 
-/// Manages MO call state (calling party number cache, M2M paging).
+/// Routing recorded at MO origination, held until AssignmentComplete.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingSipRoute {
+    pub called_number: String,
+    pub calling_number: Option<String>,
+    pub service_option: u16,
+}
+
 pub(crate) struct MoCallService {
-    /// MO calling party number resolved from the originating mobile identity.
     pub(crate) mo_calling_numbers: HashMap<CallId, String>,
+    pub(crate) pending_sip_routes: HashMap<CallId, PendingSipRoute>,
 }
 
 impl MoCallService {
     pub(crate) fn new() -> Self {
         Self {
             mo_calling_numbers: HashMap::new(),
+            pending_sip_routes: HashMap::new(),
         }
     }
 
@@ -148,5 +156,6 @@ impl MoCallService {
     /// Clean up MO state associated with a call.
     pub(crate) fn cleanup_call(&mut self, call_id: CallId) {
         self.mo_calling_numbers.remove(&call_id);
+        self.pending_sip_routes.remove(&call_id);
     }
 }

@@ -55,8 +55,12 @@ pub struct VocoderFrame {
 /// Events emitted by the media gateway toward the MSC.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaGatewayEvent {
-    /// Remote side is ringing.
-    Ringing { handle: CallHandle, sip_status: u32 },
+    /// SIP 180/183. `codec` is set when the provisional carried SDP.
+    Ringing {
+        handle: CallHandle,
+        sip_status: u32,
+        codec: String,
+    },
     /// Remote side answered.
     Answered {
         handle: CallHandle,

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use cdma_common::lac::paging_messages::{CallingPartyNumberRecord, MsAddress};
-use log::{info, warn};
+use log::{debug, info, warn};
 use tokio::spawn;
 
 use crate::a1_edge::EncodedA1Message;
@@ -127,6 +127,19 @@ impl Bsc {
                 };
                 self.handle_a1_adds_page(msg);
             }
+            cdma_ios::MessageType::AlertWithInformation => {
+                self.handle_a1_alert_with_information(call_id);
+            }
+            cdma_ios::MessageType::Progress => {
+                let progress = match cdma_ios::ProgressMessage::decode(&decoded.payload) {
+                    Ok(p) => p,
+                    Err(error) => {
+                        warn!("BSC: failed to decode A1 Progress: {}", error);
+                        return;
+                    }
+                };
+                self.handle_a1_progress(call_id, progress);
+            }
             other => {
                 warn!("BSC: A1 message {:?} not yet handled on live path", other);
             }
@@ -135,6 +148,56 @@ impl Bsc {
 }
 
 impl Bsc {
+    fn handle_a1_alert_with_information(&mut self, call_id: Option<u64>) {
+        let Some(call_id) = call_id else {
+            warn!("BSC: refusing A1 AlertWithInformation without call correlation");
+            return;
+        };
+        let Some((_, walsh_code)) = self.mobiles.locate_a1_call(call_id) else {
+            warn!(
+                "BSC: A1 AlertWithInformation for unknown call_id={}, ignoring",
+                call_id
+            );
+            return;
+        };
+        if let Err(error) = self.send_alert_with_info(walsh_code, 0b111, None) {
+            warn!(
+                "BSC: failed to forward MSC AWIM to MS on walsh={}: {}",
+                walsh_code, error
+            );
+        }
+    }
+
+    /// A.S0014-D §2.1.6: relay Signal IE to air-interface AWIM.
+    fn handle_a1_progress(&mut self, call_id: Option<u64>, progress: cdma_ios::ProgressMessage) {
+        let Some(call_id) = call_id else {
+            warn!("BSC: refusing A1 Progress without call correlation");
+            return;
+        };
+        let Some(signal) = progress.signal else {
+            debug!(
+                "BSC: A1 Progress call_id={} has no Signal IE, nothing to forward",
+                call_id
+            );
+            return;
+        };
+        let Some((_, walsh_code)) = self.mobiles.locate_a1_call(call_id) else {
+            warn!("BSC: A1 Progress for unknown call_id={}, ignoring", call_id);
+            return;
+        };
+        let signal_info = cdma_common::lac::paging_messages::SignalInfoRecord {
+            signal_type: 0x00, // C.S0005-E §3.7.5.5 SIGNAL_TYPE=Tone
+            alert_pitch: signal.alert_pitch,
+            signal: signal.signal_value,
+        };
+        if let Err(error) = self.send_alert_with_info_signal(walsh_code, 0b111, signal_info) {
+            warn!(
+                "BSC: failed to forward MSC Progress signal to MS on walsh={}: {}",
+                walsh_code, error
+            );
+        }
+    }
+
     fn handle_a1_adds_page(&mut self, msg: cdma_ios::AddsPageMessage) {
         let imsi = match &msg.mobile_identity {
             cdma_ios::MobileIdentity::Imsi(imsi) => imsi.clone(),
