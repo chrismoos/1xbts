@@ -438,6 +438,21 @@ mod tests {
         assert_eq!(tick.pcb, 1);
         assert!(tick.raw_power_clamp_active);
     }
+
+    #[test]
+    fn rx_power_adj_moves_raw_hot_thresholds() {
+        let mut state = rc3_state_for_predictor();
+        state.set_rx_power_adj_dbfs(3.0);
+
+        let below_adjusted_hot =
+            state.tick_single_pcg(10, 100, -14.0, Some(PCG_RAW_HOT_LIMIT_DBFS + 2.5), 0);
+        assert!(!below_adjusted_hot.raw_power_clamp_active);
+
+        let at_adjusted_hot =
+            state.tick_single_pcg(10, 101, -14.0, Some(PCG_RAW_HOT_LIMIT_DBFS + 3.0), 0);
+        assert_eq!(at_adjusted_hot.pcb, 1);
+        assert!(at_adjusted_hot.raw_power_clamp_active);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -473,6 +488,7 @@ struct BtsReversePowerControlState {
     clip_cooldown_pcgs: u8,
     raw_hot_limiter_active: bool,
     transient_recovery_frames_remaining: u64,
+    rx_power_adj_dbfs: f32,
 }
 
 impl BtsReversePowerControlState {
@@ -535,7 +551,12 @@ impl BtsReversePowerControlState {
             clip_cooldown_pcgs: 0,
             raw_hot_limiter_active: false,
             transient_recovery_frames_remaining: 0,
+            rx_power_adj_dbfs: 0.0,
         }
+    }
+
+    fn set_rx_power_adj_dbfs(&mut self, rx_power_adj_dbfs: f32) {
+        self.rx_power_adj_dbfs = rx_power_adj_dbfs;
     }
 
     fn apply_setpoint(&mut self, setpoint: BtsReversePowerSetpoint) {
@@ -756,9 +777,13 @@ impl BtsReversePowerControlState {
         self.recent_clip_pcgs() >= OUTER_LOOP_OVERPOWER_CLIP_PCGS
     }
 
+    fn adjusted_dbfs(&self, threshold_dbfs: f32) -> f32 {
+        threshold_dbfs + self.rx_power_adj_dbfs
+    }
+
     fn recent_frame_underpowered(&self) -> bool {
         if Self::finite_stats(&self.last_pcg_raw_power_db)
-            .map(|(avg, _, _, _)| avg >= OUTER_LOOP_UNDERPOWER_MAX_RAW_DBFS)
+            .map(|(avg, _, _, _)| avg >= self.adjusted_dbfs(OUTER_LOOP_UNDERPOWER_MAX_RAW_DBFS))
             .unwrap_or(false)
         {
             return false;
@@ -858,13 +883,20 @@ impl BtsReversePowerControlState {
     }
 
     /// dB to subtract from the PCB error to brake UP commands at high Rx power.
-    fn brake_offset_db(filtered_raw_power_db: f32) -> f32 {
-        if !filtered_raw_power_db.is_finite() || filtered_raw_power_db <= BRAKE_BEGIN_DBFS {
+    fn brake_offset_db_with_adj(filtered_raw_power_db: f32, rx_power_adj_dbfs: f32) -> f32 {
+        let begin_dbfs = BRAKE_BEGIN_DBFS + rx_power_adj_dbfs;
+        let full_dbfs = BRAKE_FULL_DBFS + rx_power_adj_dbfs;
+        if !filtered_raw_power_db.is_finite() || filtered_raw_power_db <= begin_dbfs {
             return 0.0;
         }
-        let span = BRAKE_FULL_DBFS - BRAKE_BEGIN_DBFS;
-        let frac = ((filtered_raw_power_db - BRAKE_BEGIN_DBFS) / span).clamp(0.0, 1.0);
+        let span = full_dbfs - begin_dbfs;
+        let frac = ((filtered_raw_power_db - begin_dbfs) / span).clamp(0.0, 1.0);
         BRAKE_MAX_OFFSET_DB * frac
+    }
+
+    #[cfg(test)]
+    fn brake_offset_db(filtered_raw_power_db: f32) -> f32 {
+        Self::brake_offset_db_with_adj(filtered_raw_power_db, 0.0)
     }
 
     fn brake_input_raw_power_db(
@@ -938,7 +970,9 @@ impl BtsReversePowerControlState {
 
         // Clipping inflates pilot variance and fakes a low-SINR reading, so
         // reject the measurement and force DOWN while in the clipping zone.
-        let is_clipping = raw_power_db.map(|db| db > CLIP_BEGIN_DBFS).unwrap_or(false);
+        let is_clipping = raw_power_db
+            .map(|db| db > self.adjusted_dbfs(CLIP_BEGIN_DBFS))
+            .unwrap_or(false);
         let clip_guard_active = if is_clipping {
             self.clip_cooldown_pcgs = PCG_CLIP_COOLDOWN_PCGS;
             true
@@ -956,17 +990,17 @@ impl BtsReversePowerControlState {
 
         let effective_target_db = self.effective_target_db();
         let brake = Self::brake_input_raw_power_db(self.brake_filtered_raw_power_db, raw_power_db)
-            .map(Self::brake_offset_db)
+            .map(|db| Self::brake_offset_db_with_adj(db, self.rx_power_adj_dbfs))
             .unwrap_or(0.0);
         self.last_brake_offset_db = brake;
         if raw_power_db
-            .map(|db| db >= PCG_RAW_HOT_LIMIT_DBFS)
+            .map(|db| db >= self.adjusted_dbfs(PCG_RAW_HOT_LIMIT_DBFS))
             .unwrap_or(false)
             || is_clipping
         {
             self.raw_hot_limiter_active = true;
         } else if raw_power_db
-            .map(|db| db <= PCG_RAW_HOT_RELEASE_DBFS)
+            .map(|db| db <= self.adjusted_dbfs(PCG_RAW_HOT_RELEASE_DBFS))
             .unwrap_or(false)
         {
             self.raw_hot_limiter_active = false;
@@ -1076,6 +1110,7 @@ mod sinr_tests;
 pub struct BtsPowerControlRegistry {
     states: Arc<Mutex<HashMap<u8, BtsReversePowerControlState>>>,
     cell_settling_frames_remaining: Arc<Mutex<u64>>,
+    rx_power_adj_dbfs: Arc<Mutex<f32>>,
 }
 
 impl Default for BtsPowerControlRegistry {
@@ -1083,11 +1118,38 @@ impl Default for BtsPowerControlRegistry {
         Self {
             states: Arc::default(),
             cell_settling_frames_remaining: Arc::default(),
+            rx_power_adj_dbfs: Arc::default(),
         }
     }
 }
 
 impl BtsPowerControlRegistry {
+    pub fn set_rx_power_adj_dbfs(&self, rx_power_adj_dbfs: f32) {
+        let rx_power_adj_dbfs = if rx_power_adj_dbfs.is_finite() {
+            rx_power_adj_dbfs
+        } else {
+            0.0
+        };
+        *self.rx_power_adj_dbfs.lock() = rx_power_adj_dbfs;
+        for state in self.states.lock().values_mut() {
+            state.set_rx_power_adj_dbfs(rx_power_adj_dbfs);
+        }
+    }
+
+    pub fn rx_power_adj_dbfs(&self) -> f32 {
+        *self.rx_power_adj_dbfs.lock()
+    }
+
+    fn state_for(use_rc3: bool, rx_power_adj_dbfs: f32) -> BtsReversePowerControlState {
+        let mut state = if use_rc3 {
+            BtsReversePowerControlState::new_rc3()
+        } else {
+            BtsReversePowerControlState::new_rc1()
+        };
+        state.set_rx_power_adj_dbfs(rx_power_adj_dbfs);
+        state
+    }
+
     fn traffic_channel_uses_rc3(traffic_channels: &TrafficChannelPool, walsh_code: u8) -> bool {
         traffic_channels
             .lookup(walsh_code)
@@ -1096,10 +1158,11 @@ impl BtsPowerControlRegistry {
     }
 
     pub fn set_target(&self, walsh_code: u8, target_db: f32, held: bool) {
+        let rx_power_adj_dbfs = self.rx_power_adj_dbfs();
         let mut states = self.states.lock();
         let state = states
             .entry(walsh_code)
-            .or_insert_with(BtsReversePowerControlState::new_rc3);
+            .or_insert_with(|| Self::state_for(true, rx_power_adj_dbfs));
         state.apply_setpoint(BtsReversePowerSetpoint { target_db, held });
     }
 
@@ -1112,15 +1175,12 @@ impl BtsPowerControlRegistry {
         let use_rc3 = traffic_channels
             .map(|channels| Self::traffic_channel_uses_rc3(channels, walsh_code))
             .unwrap_or(true);
+        let rx_power_adj_dbfs = self.rx_power_adj_dbfs();
         let mut states = self.states.lock();
         let is_new_state = !states.contains_key(&walsh_code);
-        let state = states.entry(walsh_code).or_insert_with(|| {
-            if use_rc3 {
-                BtsReversePowerControlState::new_rc3()
-            } else {
-                BtsReversePowerControlState::new_rc1()
-            }
-        });
+        let state = states
+            .entry(walsh_code)
+            .or_insert_with(|| Self::state_for(use_rc3, rx_power_adj_dbfs));
         if is_new_state && use_rc3 {
             self.start_cell_settling(walsh_code);
         }
@@ -1158,15 +1218,12 @@ impl BtsPowerControlRegistry {
         let slot = traffic_channels.lookup(walsh_code)?;
         let use_rc3 = matches!(slot.channel, TrafficChannelWrapper::Rc3(_));
         let tick = {
+            let rx_power_adj_dbfs = self.rx_power_adj_dbfs();
             let mut states = self.states.lock();
             let is_new_state = !states.contains_key(&walsh_code);
-            let state = states.entry(walsh_code).or_insert_with(|| {
-                if use_rc3 {
-                    BtsReversePowerControlState::new_rc3()
-                } else {
-                    BtsReversePowerControlState::new_rc1()
-                }
-            });
+            let state = states
+                .entry(walsh_code)
+                .or_insert_with(|| Self::state_for(use_rc3, rx_power_adj_dbfs));
             if is_new_state && use_rc3 {
                 self.start_cell_settling(walsh_code);
             }

@@ -10,6 +10,7 @@
   "rx_sample_rate_hz": 4915200,
   "rx_bandwidth_hz": 2500000,
   "rx_reference_dbm": null,
+  "rx_power_adj": 0.0,
   "rx_sample_delay": 0,
   "rx_batch_pcgs": 2,
   "traffic_rx_continuity": true

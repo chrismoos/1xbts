@@ -27,6 +27,12 @@ impl PowerControlService {
         &self.registry
     }
 
+    /// Configure radio-specific dBFS threshold adjustment for raw-power
+    /// brake/clamp decisions. Positive values move thresholds hotter.
+    pub fn set_rx_power_adj_dbfs(&self, rx_power_adj_dbfs: f32) {
+        self.registry.set_rx_power_adj_dbfs(rx_power_adj_dbfs);
+    }
+
     /// Override the Eb/Nt target for a given walsh code.
     ///
     /// When `held` is true the target is treated as a manual override and

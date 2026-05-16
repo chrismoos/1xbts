@@ -356,6 +356,7 @@ pub fn build_bts_launch_parts(
     let cdma_freq = bts_config.overhead.cdma_freq;
     let paging_settings = bts_config.runtime.downlink.paging.clone();
     let mac_layer_for_bts = mac_layer.clone();
+    let rx_power_adj = bts_config.radio.rx_power_adj();
     let (bts, handle) = Bts::new_with_settings(
         radio,
         Config {
@@ -388,6 +389,11 @@ pub fn build_bts_launch_parts(
             rx,
         },
         bts_config.runtime.clone(),
+    );
+    handle.power_control.set_rx_power_adj_dbfs(rx_power_adj);
+    info!(
+        "rx: power-control dBFS threshold adjustment={:+.2} dB",
+        rx_power_adj
     );
 
     let overhead = bts_config.overhead.clone();

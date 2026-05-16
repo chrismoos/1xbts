@@ -93,6 +93,10 @@ pub enum RadioConfig {
         rx_bandwidth_hz: Option<usize>,
         #[serde(default)]
         rx_reference_dbm: Option<f64>,
+        /// Radio-specific dBFS calibration offset applied to reverse-link raw
+        /// power-control thresholds. Defaults to 0 dBFS.
+        #[serde(default)]
+        rx_power_adj: f32,
         #[serde(default)]
         rx_sample_delay: i64,
         #[serde(default = "default_rx_batch_pcgs")]
@@ -124,6 +128,10 @@ pub enum RadioConfig {
         rx_bandwidth_hz: Option<usize>,
         #[serde(default)]
         rx_reference_dbm: Option<f64>,
+        /// Radio-specific dBFS calibration offset applied to reverse-link raw
+        /// power-control thresholds. Defaults to 0 dBFS.
+        #[serde(default)]
+        rx_power_adj: f32,
         #[serde(default)]
         rx_sample_delay: i64,
         #[serde(default = "default_rx_batch_pcgs")]
@@ -150,6 +158,10 @@ pub enum RadioConfig {
         rx_bandwidth_hz: Option<usize>,
         #[serde(default)]
         rx_reference_dbm: Option<f64>,
+        /// Radio-specific dBFS calibration offset applied to reverse-link raw
+        /// power-control thresholds. Defaults to 0 dBFS.
+        #[serde(default)]
+        rx_power_adj: f32,
         #[serde(default)]
         rx_sample_delay: i64,
         #[serde(default = "default_rx_batch_pcgs")]
@@ -195,6 +207,10 @@ pub enum RadioConfig {
         rx_bandwidth_hz: Option<usize>,
         #[serde(default)]
         rx_reference_dbm: Option<f64>,
+        /// Radio-specific dBFS calibration offset applied to reverse-link raw
+        /// power-control thresholds. Defaults to 0 dBFS.
+        #[serde(default)]
+        rx_power_adj: f32,
         #[serde(default)]
         rx_sample_delay: i64,
         #[serde(default = "default_rx_batch_pcgs")]
@@ -322,6 +338,18 @@ impl RadioConfig {
                 rx_reference_dbm, ..
             } => *rx_reference_dbm,
             _ => None,
+        }
+    }
+
+    /// Radio-specific dBFS calibration offset applied to reverse-link raw
+    /// power-control thresholds. Positive values move the thresholds hotter.
+    pub fn rx_power_adj(&self) -> f32 {
+        match self {
+            Self::Soapy { rx_power_adj, .. }
+            | Self::Uhd { rx_power_adj, .. }
+            | Self::Lime { rx_power_adj, .. }
+            | Self::BladeRf { rx_power_adj, .. } => *rx_power_adj,
+            _ => 0.0,
         }
     }
 
@@ -609,7 +637,8 @@ mod tests {
   "rx_freq_hz": 836520000,
   "rx_sample_rate_hz": 4915200,
   "rx_bandwidth_hz": 2500000,
-  "rx_reference_dbm": null
+  "rx_reference_dbm": null,
+  "rx_power_adj": 3.5
 }
 "#,
         )
@@ -623,10 +652,32 @@ mod tests {
 
         let config = BtsNodeConfig::load_from_path(&config_path).expect("load config");
         match config.radio {
-            RadioConfig::Soapy { device, .. } => assert_eq!(device, "driver=lime"),
+            RadioConfig::Soapy {
+                device,
+                rx_power_adj,
+                ..
+            } => {
+                assert_eq!(device, "driver=lime");
+                assert_eq!(rx_power_adj, 3.5);
+            }
             other => panic!("expected soapy radio, got {other:?}"),
         }
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn radio_rx_power_adj_defaults_to_zero() {
+        let radio: RadioConfig = serde_json::from_str(
+            r#"{
+  "kind": "uhd",
+  "device": "type=b200",
+  "channel": 0,
+  "antenna": "TX/RX"
+}"#,
+        )
+        .expect("parse radio config");
+
+        assert_eq!(radio.rx_power_adj(), 0.0);
     }
 
     #[test]
