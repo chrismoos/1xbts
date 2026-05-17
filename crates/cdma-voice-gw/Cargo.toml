@@ -14,7 +14,7 @@ cdma-common = { path = "../cdma-common" }
 cdma-voice = { path = "../cdma-voice" }
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
-libre = { path = "../../external/libre" }
+libre = { path = "../../external/libre", features = ["required"] }
 log = "0.4"
 parking_lot = "0.12"
 prost = "0.13"
