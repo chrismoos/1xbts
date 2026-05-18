@@ -330,6 +330,152 @@ void cdma_libre_sipsess_deref(struct sipsess *sess)
 	mem_deref(sess);
 }
 
+/* ---- Inbound SIP support ---- */
+
+static void inbound_conn_handler(const struct sip_msg *msg, void *arg)
+{
+	struct cdma_libre_inbound_sipsess_ctx *ctx = arg;
+
+	if (ctx && ctx->handlers && ctx->handlers->invite)
+		ctx->handlers->invite(ctx->arg, msg);
+}
+
+int cdma_libre_sipsess_listen_with_handler(
+	struct sipsess_sock **sockp, struct sip *sip,
+	struct cdma_libre_inbound_sipsess_ctx *ctx)
+{
+	sipsess_conn_h *connh = NULL;
+
+	if (ctx && ctx->handlers && ctx->handlers->invite)
+		connh = inbound_conn_handler;
+
+	return sipsess_listen(sockp, sip, 32, connh, ctx);
+}
+
+int cdma_libre_sip_treply(struct sip *sip, const struct sip_msg *msg,
+			  uint16_t scode, const char *reason)
+{
+	if (!sip || !msg)
+		return EINVAL;
+
+	return sip_treply(NULL, sip, msg, scode, reason ? reason : "");
+}
+
+int cdma_libre_sipsess_accept(struct sipsess **sessp,
+			      struct sipsess_sock *sock,
+			      const struct sip_msg *msg, uint16_t scode,
+			      const char *reason, const char *contact_user,
+			      struct mbuf *desc,
+			      struct cdma_libre_sipsess_ctx *sess_ctx)
+{
+	if (!sessp || !sock || !msg || !contact_user || !sess_ctx)
+		return EINVAL;
+
+	return sipsess_accept(sessp, sock, msg, scode,
+			      reason ? reason : "Trying", REL100_DISABLED,
+			      contact_user, "application/sdp", desc, NULL,
+			      NULL, false, NULL, NULL,
+#ifdef CDMA_LIBRE_HAS_SIPSESS_ESTAB_H
+			      established_handler,
+#endif
+			      NULL, NULL, close_handler, sess_ctx, NULL);
+}
+
+int cdma_libre_sipsess_answer(struct sipsess *sess, uint16_t scode,
+			      const char *reason, struct mbuf *answer)
+{
+	if (!sess)
+		return EINVAL;
+
+	return sipsess_answer(sess, scode, reason ? reason : "OK", answer,
+			      NULL);
+}
+
+int cdma_libre_sipsess_progress(struct sipsess *sess, uint16_t scode,
+				const char *reason)
+{
+	if (!sess)
+		return EINVAL;
+
+	return sipsess_progress(sess, scode, reason ? reason : "",
+				REL100_DISABLED, NULL, NULL);
+}
+
+int cdma_libre_sipsess_reject(struct sipsess *sess, uint16_t scode,
+			      const char *reason)
+{
+	if (!sess)
+		return EINVAL;
+
+	return sipsess_reject(sess, scode, reason ? reason : "", NULL);
+}
+
+const struct sip_msg *cdma_libre_sip_msg_ref(const struct sip_msg *msg)
+{
+	if (!msg)
+		return NULL;
+
+	return mem_ref((void *)msg);
+}
+
+void cdma_libre_sip_msg_deref(const struct sip_msg *msg)
+{
+	if (msg)
+		mem_deref((void *)msg);
+}
+
+static int copy_pl_str(const struct pl *p, char *out, size_t out_len)
+{
+	if (!out || out_len == 0)
+		return -1;
+	if (!p || p->l + 1 > out_len)
+		return -1;
+	if (p->p && p->l > 0)
+		memcpy(out, p->p, p->l);
+	out[p->l] = '\0';
+	return (int)p->l;
+}
+
+int cdma_libre_sip_msg_ruri_user(const struct sip_msg *msg, char *out,
+				 size_t out_len)
+{
+	if (!msg)
+		return -1;
+	return copy_pl_str(&msg->uri.user, out, out_len);
+}
+
+int cdma_libre_sip_msg_from_user(const struct sip_msg *msg, char *out,
+				 size_t out_len)
+{
+	if (!msg)
+		return -1;
+	return copy_pl_str(&msg->from.uri.user, out, out_len);
+}
+
+int cdma_libre_sip_msg_from_display(const struct sip_msg *msg, char *out,
+				    size_t out_len)
+{
+	if (!msg)
+		return -1;
+	return copy_pl_str(&msg->from.dname, out, out_len);
+}
+
+int cdma_libre_sip_msg_body(const struct sip_msg *msg, uint8_t *out,
+			    size_t out_len)
+{
+	size_t avail;
+
+	if (!msg || !msg->mb)
+		return -1;
+
+	avail = mbuf_get_left(msg->mb);
+	if (avail > out_len)
+		return -1;
+	if (avail > 0)
+		memcpy(out, mbuf_buf(msg->mb), avail);
+	return (int)avail;
+}
+
 struct mbuf *cdma_libre_mbuf_from_str(const char *value)
 {
 	struct mbuf *mb;

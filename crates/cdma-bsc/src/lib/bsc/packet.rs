@@ -18,7 +18,7 @@ use super::traffic_bearer::{
     send_forward_fch_bits_with_bearer_client, send_forward_sch_bits_with_bearer_client,
 };
 use super::traffic_forward::fsch_escam_start_time_mod32;
-use super::{Bsc, TrafficChannelInfo, VOICE_REPLACEMENT_CON_REF, VoiceLegRole};
+use super::{Bsc, TrafficChannelInfo, VoiceLegRole};
 
 /// Request to initiate a BS-originated data call (SO 7 or SO 33) to a subscriber.
 pub struct DataCallRequest {
@@ -277,9 +277,7 @@ impl Bsc {
         self.mobiles
             .update_tc(walsh_code, |_, tc| {
                 let voice_so = tc.voice_service_option?;
-                if !is_packet_data_so(tc.service_option)
-                    || tc.voice_connection_ref != Some(VOICE_REPLACEMENT_CON_REF)
-                {
+                if !is_packet_data_so(tc.service_option) {
                     return None;
                 }
                 let packet_session_id = PacketService::detach_session_inner(tc);

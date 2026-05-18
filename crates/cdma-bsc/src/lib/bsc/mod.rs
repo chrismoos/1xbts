@@ -67,11 +67,10 @@ pub(crate) use sms::PendingSmsAck;
 pub(crate) use sms::{SmsAckKey, SmsService};
 pub(crate) use traffic_assignment::TrafficAssignmentService;
 pub(crate) use traffic_bearer::TrafficBearerService;
-#[cfg(test)]
 pub(crate) use traffic_channel::ChannelState;
 pub(crate) use traffic_channel::{
-    ServiceNegotiationMode, TrafficChannelAction, TrafficChannelInfo, VOICE_REPLACEMENT_CON_REF,
-    VOICE_TRAFFIC_CON_REF, VOICE_TRAFFIC_SR_ID, VoicePollAction, traffic_channel_power_snapshot,
+    ServiceNegotiationMode, TrafficChannelAction, TrafficChannelInfo, VOICE_TRAFFIC_CON_REF,
+    VOICE_TRAFFIC_SR_ID, VoicePollAction, traffic_channel_power_snapshot,
 };
 pub(crate) use traffic_forward::ForwardSignalingRoute;
 pub(crate) use traffic_lifecycle::TrafficLifecycleService;

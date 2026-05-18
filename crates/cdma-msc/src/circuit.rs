@@ -256,30 +256,31 @@ impl CircuitService {
         self.deferred_paging_requests.remove(&call_id)
     }
 
-    /// Wipe all secondary-leg state for `call_id` so the next inbound
-    /// PagingResponse hits the lazy-init path in
-    /// `apply_secondary_leg_from_bsc`. Returns the abandoned circuit_id.
-    pub(crate) fn cancel_secondary_leg(
+    /// Purge state for whichever leg of `call_id` has an outstanding
+    /// AssignmentRequest, inferred from `active_assignment_legs` (A1
+    /// AssignmentFailure carries no leg discriminator on the wire).
+    pub(crate) fn cancel_pending_assignment_leg(
         &mut self,
         call_id: CallId,
         voice_bearer: Option<&std::sync::Arc<cdma_ios::VoiceBearerManager>>,
-    ) -> Option<u16> {
-        let key = MscLegKey {
-            call_id,
-            leg_role: MscVoiceLeg::Secondary,
-        };
+    ) -> Option<(MscVoiceLeg, u16)> {
+        let leg_role = self.active_assignment_legs.remove(&call_id)?;
+        let key = MscLegKey { call_id, leg_role };
         let pending_circuit = self.pending_assignment_completes.remove(&key);
-        if self.active_assignment_legs.get(&call_id) == Some(&MscVoiceLeg::Secondary) {
-            self.active_assignment_legs.remove(&call_id);
+        if leg_role == MscVoiceLeg::Secondary {
+            self.leg_procedures.remove(&key);
         }
-        self.leg_procedures.remove(&key);
-        if let Some(circuit_id) = pending_circuit {
-            if let Some(bearer) = voice_bearer {
-                bearer.close_circuit(circuit_id);
-            }
-            self.circuits.remove(&circuit_id);
+        let circuit_id = pending_circuit?;
+        if let Some(bearer) = voice_bearer {
+            bearer.close_circuit(circuit_id);
         }
-        pending_circuit
+        if let Some(session) = self.circuits.remove(&circuit_id)
+            && let Some(peer_id) = session.peer_circuit_id
+            && let Some(peer) = self.circuits.get_mut(&peer_id)
+        {
+            peer.peer_circuit_id = None;
+        }
+        Some((leg_role, circuit_id))
     }
 
     /// Clean up all circuit state associated with a call.

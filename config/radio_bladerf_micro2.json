@@ -5,7 +5,7 @@
   "tx_antenna": "TXA",
   "rx_antenna": "A_BALANCED",
   "tx_gain_db": 60,
-  "rx_gain_db": 50,
+  "rx_gain_db": 60,
   "rx_sample_rate_hz": 4915200,
   "rx_bandwidth_hz": 2500000,
   "rx_reference_dbm": null,

@@ -67,6 +67,8 @@ pub(crate) enum ActiveVoiceFeederKind {
 pub(crate) struct MediaService {
     /// Active voice feeder tasks, keyed by circuit_id.
     pub(crate) feeders: HashMap<u16, ActiveVoiceFeeder>,
+    /// Inbound-SIP ringback feeders (no circuit yet pre-answer), keyed by CallId.
+    inbound_feeders: HashMap<CallId, ActiveVoiceFeeder>,
     /// Local WAV calls waiting for simulated answer before media starts.
     pub(crate) delayed_wav_starts: HashMap<CallId, tokio::time::Instant>,
 }
@@ -75,6 +77,7 @@ impl MediaService {
     pub(crate) fn new() -> Self {
         Self {
             feeders: HashMap::new(),
+            inbound_feeders: HashMap::new(),
             delayed_wav_starts: HashMap::new(),
         }
     }
@@ -358,6 +361,96 @@ impl MediaService {
                 feeder.shutdown.store(true, Ordering::Relaxed);
                 feeder.handle.abort();
             }
+        }
+        if let Some(feeder) = self.inbound_feeders.remove(&call_id) {
+            feeder.shutdown.store(true, Ordering::Relaxed);
+            feeder.handle.abort();
+        }
+    }
+
+    /// Generate pre-answer ringback toward the SIP trunk for an inbound MT
+    /// call. Uses the subscriber's HLR custom ringtone if configured, else
+    /// synthetic NANP.
+    pub(crate) fn start_inbound_ringback(
+        &mut self,
+        call_id: CallId,
+        handle: crate::media_gateway::CallHandle,
+        gateway: Arc<dyn crate::media_gateway::MediaGatewayClient>,
+        service_option: u16,
+        hlr_repo: Option<Arc<dyn HlrRepository>>,
+        called_number: Option<String>,
+    ) {
+        if self.inbound_feeders.contains_key(&call_id) {
+            return;
+        }
+        let Some(codec) = cdma_voice::VoiceCodec::from_service_option(service_option) else {
+            warn!("MSC: unsupported service option {service_option} for inbound ringback");
+            return;
+        };
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+        let task = tokio::spawn(async move {
+            let custom = match (&hlr_repo, &called_number) {
+                (Some(repo), Some(number)) => {
+                    let fut = load_custom_ringtone(repo.as_ref(), number, codec);
+                    tokio::time::timeout(HLR_RINGTONE_LOOKUP_TIMEOUT, fut)
+                        .await
+                        .unwrap_or_default()
+                }
+                _ => None,
+            };
+            let mut source = match custom {
+                Some(player) => RingbackSource::Encoded(Box::new(player)),
+                None => match RingbackTonePlayer::new_with_codec(RingbackToneKind::Nanp, codec) {
+                    Ok(player) => RingbackSource::Synthetic(Box::new(player)),
+                    Err(error) => {
+                        warn!("MSC: inbound ringback init failed: {error}");
+                        return;
+                    }
+                },
+            };
+            info!(
+                "MSC: started inbound ringback feeder call_id={} codec={}",
+                call_id.0,
+                voice_codec_str(codec)
+            );
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(20));
+            loop {
+                interval.tick().await;
+                if shutdown_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+                let frame = source.next_frame();
+                let payload = crate::media_gateway::VocoderFrame {
+                    payload: frame.bits,
+                    rate_bps: voice_rate_bps(frame.rate),
+                };
+                if let Err(error) = gateway.forward_payload(handle, payload).await {
+                    debug!("MSC: inbound ringback forward failed: {error}; stopping feeder");
+                    break;
+                }
+            }
+            info!("MSC: stopped inbound ringback feeder call_id={}", call_id.0);
+        });
+        self.inbound_feeders.insert(
+            call_id,
+            ActiveVoiceFeeder {
+                kind: ActiveVoiceFeederKind::Ringback,
+                shutdown,
+                handle: task,
+            },
+        );
+    }
+
+    pub(crate) fn inbound_ringback_active(&self, call_id: CallId) -> bool {
+        self.inbound_feeders.contains_key(&call_id)
+    }
+
+    pub(crate) fn stop_inbound_ringback(&mut self, call_id: CallId) {
+        if let Some(feeder) = self.inbound_feeders.remove(&call_id) {
+            feeder.shutdown.store(true, Ordering::Relaxed);
+            feeder.handle.abort();
+            info!("MSC: stopped inbound ringback for call_id={}", call_id.0);
         }
     }
 

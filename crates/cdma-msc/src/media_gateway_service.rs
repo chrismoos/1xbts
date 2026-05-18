@@ -10,7 +10,8 @@ use log::{debug, info, warn};
 
 use cdma_ios::{
     AlertWithInformationMessage, CallControlState, EncodedA1Message, Message, MessageType,
-    ProcedureMessage, ProgressMessage, Signal, VoiceBearerFrame, VoiceBearerManager,
+    MsInformationRecords, ProcedureMessage, ProgressMessage, Signal, VoiceBearerFrame,
+    VoiceBearerManager,
 };
 
 use crate::call_control::{CallId, MscCallController};
@@ -21,15 +22,22 @@ use crate::runtime::MscA1Endpoint;
 
 pub(crate) struct MediaGatewayService {
     pub(crate) media_gateway_calls: HashMap<CallHandle, CallId>,
-    alert_sent: HashSet<CallId>,
-    /// Distinguishes pre-answer failures (Progress tone) from mid-call drops
-    /// (silent Clear).
+    pub(crate) alert_sent: HashSet<CallId>,
     answered_locally: HashSet<CallId>,
     failure_signaled: HashSet<CallId>,
     pending_clears: HashMap<CallId, PendingClear>,
-    /// AWIM stashed when SIP events arrive before AssignmentComplete; flushed
-    /// once state reaches `Assigned`.
     pending_post_assignment: HashMap<CallId, PendingPostAssignment>,
+    inbound_sessions: HashMap<String, InboundSessionMeta>,
+    pub(crate) inbound_by_call: HashMap<CallId, String>,
+    active_subscribers: HashMap<uuid::Uuid, CallId>,
+    subscriber_by_call: HashMap<CallId, uuid::Uuid>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct InboundSessionMeta {
+    pub session_id: String,
+    pub codec: String,
+    pub progress_sent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -59,7 +67,66 @@ impl MediaGatewayService {
             failure_signaled: HashSet::new(),
             pending_clears: HashMap::new(),
             pending_post_assignment: HashMap::new(),
+            inbound_sessions: HashMap::new(),
+            inbound_by_call: HashMap::new(),
+            active_subscribers: HashMap::new(),
+            subscriber_by_call: HashMap::new(),
         }
+    }
+
+    pub(crate) fn register_active_subscriber(
+        &mut self,
+        subscriber_id: uuid::Uuid,
+        call_id: CallId,
+    ) {
+        self.active_subscribers.insert(subscriber_id, call_id);
+        self.subscriber_by_call.insert(call_id, subscriber_id);
+    }
+
+    pub(crate) fn register_inbound_session(
+        &mut self,
+        session_id: String,
+        call_id: CallId,
+        codec: String,
+    ) {
+        self.inbound_by_call.insert(call_id, session_id.clone());
+        self.inbound_sessions.insert(
+            session_id.clone(),
+            InboundSessionMeta {
+                session_id,
+                codec,
+                progress_sent: false,
+            },
+        );
+    }
+
+    pub(crate) fn is_subscriber_busy(&self, subscriber_id: uuid::Uuid) -> bool {
+        self.active_subscribers.contains_key(&subscriber_id)
+    }
+
+    /// Set once MSC drives a local-side answer for `call_id`. `cleanup_call`
+    /// reads this to skip the pre-answer 487 reject.
+    pub(crate) fn mark_answered(&mut self, call_id: CallId) {
+        self.answered_locally.insert(call_id);
+    }
+
+    pub(crate) fn inbound_session_for_call(&self, call_id: CallId) -> Option<&InboundSessionMeta> {
+        self.inbound_by_call
+            .get(&call_id)
+            .and_then(|sid| self.inbound_sessions.get(sid))
+    }
+
+    pub(crate) fn mark_inbound_progress_sent(&mut self, call_id: CallId) {
+        if let Some(sid) = self.inbound_by_call.get(&call_id).cloned()
+            && let Some(meta) = self.inbound_sessions.get_mut(&sid)
+        {
+            meta.progress_sent = true;
+        }
+    }
+
+    pub(crate) fn take_inbound_session(&mut self, call_id: CallId) -> Option<InboundSessionMeta> {
+        let sid = self.inbound_by_call.remove(&call_id)?;
+        self.inbound_sessions.remove(&sid)
     }
 
     pub(crate) async fn flush_pending_post_assignment(
@@ -67,12 +134,13 @@ impl MediaGatewayService {
         a1: &dyn MscA1Endpoint,
         call_id: CallId,
         controller: &mut MscCallController,
+        send_tones_alert: bool,
     ) {
         let Some(pending) = self.pending_post_assignment.remove(&call_id) else {
             return;
         };
-        if pending.send_alert {
-            send_alert_with_information(a1, call_id, controller, &mut self.alert_sent).await;
+        if pending.send_alert && send_tones_alert && self.alert_sent.insert(call_id) {
+            send_progress_ringback(a1, call_id, controller).await;
         }
     }
 
@@ -141,6 +209,8 @@ impl MediaGatewayService {
         media_ringback_enabled: bool,
         media_ringback_type: crate::config::MediaRingbackType,
         sip_ringback_disable: bool,
+        generate_ringback: bool,
+        send_tones_alert: bool,
         failure_tone_duration_ms: u64,
         hlr_repo: Option<&Arc<dyn cdma_hlr::repository::HlrRepository>>,
     ) {
@@ -157,14 +227,37 @@ impl MediaGatewayService {
                 let Some(call_id) = self.media_gateway_calls.get(&handle).copied() else {
                     return;
                 };
-                if sip_ringback_disable {
+                if sip_ringback_disable || (!generate_ringback && !send_tones_alert) {
                     return;
                 }
                 if !ready_for_alert(controller.state(call_id)) {
+                    // Defer the Signal IE until primary AssignmentComplete
+                    // (flushed in `flush_pending_post_assignment`); bearer
+                    // ringback can start immediately on the circuit's bearer.
                     self.pending_post_assignment
                         .entry(call_id)
                         .or_default()
-                        .send_alert = true;
+                        .send_alert = send_tones_alert;
+                    if generate_ringback {
+                        media.start_ringback_for_call(
+                            call_id,
+                            controller,
+                            circuits,
+                            voice_bearer,
+                            media_ringback_enabled,
+                            media_ringback_type,
+                            hlr_repo,
+                        );
+                    }
+                    return;
+                }
+                // A bare AWIM toward the caller is ambiguous — some MS
+                // firmwares interpret it as an incoming-call alert. Only the
+                // Ringback Signal IE is unambiguous.
+                if send_tones_alert && self.alert_sent.insert(call_id) {
+                    send_progress_ringback(a1, call_id, controller).await;
+                }
+                if generate_ringback {
                     media.start_ringback_for_call(
                         call_id,
                         controller,
@@ -174,18 +267,7 @@ impl MediaGatewayService {
                         media_ringback_type,
                         hlr_repo,
                     );
-                    return;
                 }
-                send_alert_with_information(a1, call_id, controller, &mut self.alert_sent).await;
-                media.start_ringback_for_call(
-                    call_id,
-                    controller,
-                    circuits,
-                    voice_bearer,
-                    media_ringback_enabled,
-                    media_ringback_type,
-                    hlr_repo,
-                );
             }
             MediaGatewayEvent::Answered {
                 handle,
@@ -201,25 +283,10 @@ impl MediaGatewayService {
                 };
                 media.stop_ringback_for_call(call_id, circuits);
                 self.answered_locally.insert(call_id);
-                // Per A.S0014-D §2.1.8 the MO answer is implicit; conversation
-                // state is reached when bearer audio flows. AWIM is only sent
-                // here in disable=true mode so the MS reaches Alerting before
-                // the BSC's bearer-flow → tones-off transition fires.
-                if sip_ringback_disable {
-                    if !ready_for_alert(controller.state(call_id)) {
-                        self.pending_post_assignment
-                            .entry(call_id)
-                            .or_default()
-                            .send_alert = true;
-                        debug!(
-                            "MSC: deferring AlertWithInformation call_id={} (state pre-Assigned)",
-                            call_id.0
-                        );
-                        return;
-                    }
-                    send_alert_with_information(a1, call_id, controller, &mut self.alert_sent)
-                        .await;
-                }
+                // Tones Off on answer — kills any ringback tone the MS is
+                // playing before bearer audio flows. The 200 OK itself is
+                // implicit per A.S0014-D §2.1.8 (no Connect to BSC).
+                send_progress_tones_off(a1, call_id, controller).await;
             }
             MediaGatewayEvent::Failed {
                 handle,
@@ -281,6 +348,10 @@ impl MediaGatewayService {
                     );
                 }
             }
+            MediaGatewayEvent::InboundCall { .. } | MediaGatewayEvent::InboundCancel { .. } => {
+                // Routed directly by the runtime event loop.
+                debug!("MSC: media_gw event arm reached unexpectedly for inbound SIP variant");
+            }
             MediaGatewayEvent::MediaFrame {
                 handle,
                 payload,
@@ -330,10 +401,22 @@ impl MediaGatewayService {
         media_gateway: Option<&Arc<dyn MediaGatewayClient>>,
     ) {
         self.alert_sent.remove(&call_id);
-        self.answered_locally.remove(&call_id);
+        let answered = self.answered_locally.remove(&call_id);
         self.failure_signaled.remove(&call_id);
         self.pending_clears.remove(&call_id);
         self.pending_post_assignment.remove(&call_id);
+        if let Some(sub) = self.subscriber_by_call.remove(&call_id) {
+            self.active_subscribers.remove(&sub);
+        }
+        if let Some(meta) = self.take_inbound_session(call_id)
+            && !answered
+            && let Some(gateway) = media_gateway.cloned()
+        {
+            let session_id = meta.session_id;
+            tokio::spawn(async move {
+                let _ = gateway.inbound_reject(&session_id, 487).await;
+            });
+        }
         let gateway_handles: Vec<CallHandle> = self
             .media_gateway_calls
             .iter()
@@ -350,6 +433,43 @@ impl MediaGatewayService {
             }
         }
     }
+}
+
+/// C.S0005-E §3.7.5.5 SIGNAL = Ringback (0x01).
+pub(crate) async fn send_progress_ringback(
+    a1: &dyn MscA1Endpoint,
+    call_id: CallId,
+    controller: &mut MscCallController,
+) {
+    send_progress_with_signal(
+        a1,
+        call_id,
+        controller,
+        Signal {
+            signal_value: 0x01,
+            alert_pitch: 0,
+        },
+    )
+    .await;
+}
+
+/// C.S0005-E §3.7.5.5 SIGNAL = Tones Off (0x3F). Sent on call answer/connect
+/// so the MS stops any in-progress ringback or progress tone.
+pub(crate) async fn send_progress_tones_off(
+    a1: &dyn MscA1Endpoint,
+    call_id: CallId,
+    controller: &mut MscCallController,
+) {
+    send_progress_with_signal(
+        a1,
+        call_id,
+        controller,
+        Signal {
+            signal_value: 0x3F,
+            alert_pitch: 0,
+        },
+    )
+    .await;
 }
 
 async fn send_progress_with_signal(
@@ -380,7 +500,7 @@ async fn send_progress_with_signal(
         }
     };
     info!(
-        "MSC: A1 tx Progress for media-gateway failure call_id={} signal=0x{:02x}",
+        "MSC: A1 tx Progress call_id={} signal=0x{:02x}",
         call_id.0, signal.signal_value
     );
     if let Err(error) = a1
@@ -407,17 +527,18 @@ fn signal_for_cause(_cause: &GatewayClearCause) -> Signal {
     }
 }
 
-async fn send_alert_with_information(
+pub(crate) async fn send_alert_with_information(
     a1: &dyn MscA1Endpoint,
     call_id: CallId,
     controller: &mut MscCallController,
     already_sent: &mut HashSet<CallId>,
+    ms_information_records: Option<MsInformationRecords>,
 ) {
     if !already_sent.insert(call_id) {
         return;
     }
     let msg = AlertWithInformationMessage {
-        ms_information_records: None,
+        ms_information_records,
     };
     if let Err(error) = controller.apply_from_msc(
         call_id,
@@ -715,6 +836,8 @@ mod tests {
             false,
             MediaRingbackType::Nanp,
             sip_ringback_disable,
+            true,
+            false,
             0,
             None,
         )
@@ -745,6 +868,8 @@ mod tests {
             false,
             MediaRingbackType::Nanp,
             sip_ringback_disable,
+            true,
+            false,
             0,
             None,
         )
@@ -752,48 +877,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ringback_enabled_path_alerts_on_ringing_and_stays_silent_on_answer() {
+    async fn ringback_enabled_path_is_silent_on_ringing_without_tones_alert() {
+        // Caller-side A1 AWI is suppressed (bare AWIM confuses MS firmware
+        // into thinking it's the alerted party). MSC's bearer ringback feeder
+        // provides audible ringback; A1 stays quiet until Answer's Tones-Off.
         let a1 = CapturingA1::new();
         let mut svc = MediaGatewayService::new();
         let mut controller = MscCallController::new();
         let handle = register_call(&mut svc, &mut controller);
 
         fire_ringing(&mut svc, &a1, &mut controller, handle, false).await;
-        assert_eq!(a1.message_types(), vec![MessageType::AlertWithInformation]);
+        assert!(a1.message_types().is_empty());
 
-        // Per A.S0014-D §2.1.8, MO answer is implicit: no MSC->BSC L3 message.
-        // The BSC transitions the MS to conversation when bearer audio flows.
         fire_answered(&mut svc, &a1, &mut controller, handle, false).await;
         assert_eq!(
             a1.message_types(),
-            vec![MessageType::AlertWithInformation],
-            "Answered must not produce any additional MSC->BSC signaling for MO calls"
+            vec![MessageType::Progress],
+            "Answered drives a single Tones-Off Progress"
         );
     }
 
     #[tokio::test]
-    async fn ringback_disabled_path_emits_alert_only_on_answer() {
+    async fn ringback_disabled_path_only_emits_tones_off_on_answer() {
         let a1 = CapturingA1::new();
         let mut svc = MediaGatewayService::new();
         let mut controller = MscCallController::new();
         let handle = register_call(&mut svc, &mut controller);
 
         fire_ringing(&mut svc, &a1, &mut controller, handle, true).await;
-        assert!(
-            a1.message_types().is_empty(),
-            "ringback-disabled path must not send any L3 on 180/183, got {:?}",
-            a1.message_types()
-        );
+        assert!(a1.message_types().is_empty());
 
-        // disable=true: AWIM moves to 200 OK so the MS reaches Alerting before
-        // the BSC's bearer-flow→tones-off transition kicks in. Still no
-        // Connect message — spec-implicit MO answer.
         fire_answered(&mut svc, &a1, &mut controller, handle, true).await;
-        assert_eq!(
-            a1.message_types(),
-            vec![MessageType::AlertWithInformation],
-            "Answered emits AWIM only; conversation transition is implicit"
-        );
+        assert_eq!(a1.message_types(), vec![MessageType::Progress]);
     }
 
     #[tokio::test]
@@ -803,14 +918,11 @@ mod tests {
         let mut controller = MscCallController::new();
         let handle = register_call(&mut svc, &mut controller);
 
-        // 180 Ringing followed by 183 Session Progress both surface as Ringing.
+        // 180 Ringing followed by 183 Session Progress both surface as Ringing;
+        // neither emits A1 in the default (send_tones_alert=false) mode.
         fire_ringing(&mut svc, &a1, &mut controller, handle, false).await;
         fire_ringing(&mut svc, &a1, &mut controller, handle, false).await;
-        assert_eq!(
-            a1.message_types(),
-            vec![MessageType::AlertWithInformation],
-            "duplicate progress events must not re-send AlertWithInformation"
-        );
+        assert!(a1.message_types().is_empty());
     }
 
     async fn fire_failed(
@@ -837,6 +949,8 @@ mod tests {
             None,
             false,
             MediaRingbackType::Nanp,
+            false,
+            true,
             false,
             // failure_tone_duration_ms = 0 → skip tone, send Clear directly.
             0,
@@ -899,9 +1013,10 @@ mod tests {
 
     #[tokio::test]
     async fn answer_does_not_send_msc_to_bsc_connect() {
-        // Per A.S0014-D §2.1.8, MO answer is implicit. The MSC must not send
+        // Per A.S0014-D §2.1.8, MO answer is implicit — MSC must not send
         // Connect to the BSC; conversation state is reached when bearer audio
-        // flows. AWIM goes out on 180 alerting; nothing on 200 OK.
+        // flows. MSC does send a Tones-Off Progress on Answer (to silence any
+        // ringback the MS is playing), but it is *not* a Connect message.
         let a1 = CapturingA1::new();
         let mut svc = MediaGatewayService::new();
         let mut controller = MscCallController::new();
@@ -910,10 +1025,10 @@ mod tests {
         fire_ringing(&mut svc, &a1, &mut controller, handle, false).await;
         fire_answered(&mut svc, &a1, &mut controller, handle, false).await;
         fire_answered(&mut svc, &a1, &mut controller, handle, false).await;
-        assert_eq!(
-            a1.message_types(),
-            vec![MessageType::AlertWithInformation],
-            "Answered must not produce any MscToBsc Connect (per IS-2000 IOS)"
+        assert!(
+            !a1.message_types().contains(&MessageType::Connect),
+            "Answered must not produce any MscToBsc Connect (per IS-2000 IOS); got {:?}",
+            a1.message_types()
         );
     }
 }

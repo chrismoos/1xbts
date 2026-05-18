@@ -10,7 +10,7 @@ use tokio::spawn;
 use crate::a1_edge::EncodedA1Message;
 use crate::addressing::format_ms_address;
 
-use super::{Bsc, MobileRegistryService, VoiceLegRole};
+use super::{Bsc, MobileRegistryService, VoiceAlertMode, VoiceLegRole, VoiceSessionKind};
 
 /// Pending state for an MT call between sending the L3 trigger to the MSC
 /// and receiving the A1 Assignment Request back. Keyed by the *stable*
@@ -128,7 +128,14 @@ impl Bsc {
                 self.handle_a1_adds_page(msg);
             }
             cdma_ios::MessageType::AlertWithInformation => {
-                self.handle_a1_alert_with_information(call_id);
+                let awi = match cdma_ios::AlertWithInformationMessage::decode(&decoded.payload) {
+                    Ok(awi) => awi,
+                    Err(error) => {
+                        warn!("BSC: failed to decode A1 AlertWithInformation: {}", error);
+                        return;
+                    }
+                };
+                self.handle_a1_alert_with_information(call_id, awi);
             }
             cdma_ios::MessageType::Progress => {
                 let progress = match cdma_ios::ProgressMessage::decode(&decoded.payload) {
@@ -148,23 +155,105 @@ impl Bsc {
 }
 
 impl Bsc {
-    fn handle_a1_alert_with_information(&mut self, call_id: Option<u64>) {
+    fn handle_a1_alert_with_information(
+        &mut self,
+        call_id: Option<u64>,
+        msg: cdma_ios::AlertWithInformationMessage,
+    ) {
         let Some(call_id) = call_id else {
             warn!("BSC: refusing A1 AlertWithInformation without call correlation");
             return;
         };
-        let Some((_, walsh_code)) = self.mobiles.locate_a1_call(call_id) else {
+        // MS-MS calls share one call_id across two TCs (caller + callee); pick
+        // the Callee leg first since AWI with caller-ID belongs to it. Fall
+        // back to whichever TC matches the call_id.
+        let candidates = self.mobiles.all_walshes_for_a1_call(call_id);
+        let walsh_code = candidates
+            .iter()
+            .find(|(_, w)| {
+                self.mobiles
+                    .get_traffic_channel(*w)
+                    .and_then(|tc| tc.voice_leg_role)
+                    == Some(VoiceLegRole::Callee)
+            })
+            .or_else(|| candidates.first())
+            .map(|(_, w)| *w);
+        let Some(walsh_code) = walsh_code else {
             warn!(
                 "BSC: A1 AlertWithInformation for unknown call_id={}, ignoring",
                 call_id
             );
             return;
         };
-        if let Err(error) = self.send_alert_with_info(walsh_code, 0b111, None) {
+
+        let (leg_role, session_id) = self
+            .mobiles
+            .get_traffic_channel(walsh_code)
+            .map(|tc| (tc.voice_leg_role, tc.voice_session_id))
+            .unwrap_or((None, None));
+        let session_kind = session_id.and_then(|id| self.voice.session(id).map(|s| s.kind));
+        let stashed_calling_party = session_id.and_then(|id| {
+            self.voice
+                .session(id)
+                .and_then(|s| s.calling_party_record.clone())
+        });
+
+        // ack_seq 0b111 is the documented default for air-interface AWIM.
+        let (send_result, mode, log_label) = match leg_role {
+            Some(VoiceLegRole::Callee) => {
+                // Fall back to the AssignmentRequest-stashed record for senders
+                // that don't populate ms_information_records on AWIM.
+                let calling_party = msg
+                    .ms_information_records
+                    .as_ref()
+                    .and_then(extract_calling_party_number_record)
+                    .or(stashed_calling_party);
+                (
+                    self.send_standard_alert(walsh_code, 0b111, calling_party),
+                    VoiceAlertMode::WaitForConnectOrder,
+                    "standard alert",
+                )
+            }
+            _ => (
+                self.send_alert_with_info(walsh_code, 0b111, None),
+                VoiceAlertMode::WaitForPeerAnswer,
+                "ringback",
+            ),
+        };
+
+        if let Err(error) = send_result {
             warn!(
                 "BSC: failed to forward MSC AWIM to MS on walsh={}: {}",
                 walsh_code, error
             );
+            return;
+        }
+        info!(
+            "BSC: forwarded MSC AWIM as {} on F-TCH walsh={} call_id={}",
+            log_label, walsh_code, call_id
+        );
+
+        if let Some(tc) = self.mobiles.get_traffic_channel_mut(walsh_code) {
+            tc.mark_voice_alerting(mode);
+        }
+        if let Some(session_id) = session_id {
+            if let Some(session) = self.voice.session_mut(session_id) {
+                let party = match leg_role {
+                    Some(VoiceLegRole::Caller) => session.caller.as_mut(),
+                    Some(VoiceLegRole::Callee) => session.callee.as_mut(),
+                    None => None,
+                };
+                if let Some(party) = party {
+                    party.service_connected = true;
+                }
+            }
+            if matches!(
+                session_kind,
+                Some(VoiceSessionKind::MobileOriginatedExternal)
+            ) && leg_role == Some(VoiceLegRole::Caller)
+            {
+                self.note_msc_external_call_after_service_connect(session_id, walsh_code);
+            }
         }
     }
 
@@ -181,7 +270,21 @@ impl Bsc {
             );
             return;
         };
-        let Some((_, walsh_code)) = self.mobiles.locate_a1_call(call_id) else {
+        // Signal IE always targets the Caller leg (the one we instructed to
+        // play ringback). Callee AWI carries no Signal IE so it has no
+        // network-instructed tone to silence on answer.
+        let candidates = self.mobiles.all_walshes_for_a1_call(call_id);
+        let walsh_code = candidates
+            .iter()
+            .find(|(_, w)| {
+                self.mobiles
+                    .get_traffic_channel(*w)
+                    .and_then(|tc| tc.voice_leg_role)
+                    == Some(VoiceLegRole::Caller)
+            })
+            .or_else(|| candidates.first())
+            .map(|(_, w)| *w);
+        let Some(walsh_code) = walsh_code else {
             warn!("BSC: A1 Progress for unknown call_id={}, ignoring", call_id);
             return;
         };
@@ -870,16 +973,31 @@ impl Bsc {
 
         let service_option = request.service_option.map(|so| so.0).unwrap_or(3);
 
-        let Some(mobile) = self.mobiles.get_by_imsi(&imsi) else {
-            warn!(
-                "BSC: A1 Paging Request target IMSI {} is not currently registered",
-                imsi
-            );
-            return;
+        let (fwd_address, subscriber_id) = match self.mobiles.get_by_imsi(&imsi) {
+            Some(mobile) => (
+                mobile.fwd_address.clone(),
+                mobile.subscriber_id.unwrap_or_default(),
+            ),
+            None => {
+                // Page anyway via a synthesized address; queue_voice_page_for_mobile
+                // falls back to slot_cycle_index=0 when the registry is empty.
+                let Some(addr) = synthesize_fwd_address_from_imsi(&imsi) else {
+                    warn!(
+                        "BSC: A1 Paging Request IMSI {} could not be parsed; replying ClearRequest(0x6E)",
+                        imsi
+                    );
+                    if let Some(call_id) = call_id {
+                        self.a1.send_clear_request(call_id, 0x6E);
+                    }
+                    return;
+                };
+                warn!(
+                    "BSC: A1 Paging Request target IMSI {} not in registry; attempting page from synthesized address",
+                    imsi
+                );
+                (addr, uuid::Uuid::nil())
+            }
         };
-
-        let fwd_address = mobile.fwd_address.clone();
-        let subscriber_id = mobile.subscriber_id.unwrap_or_default();
 
         let staging = cdma_msc::MtCallPlan {
             subscriber_id,
@@ -951,6 +1069,28 @@ impl Bsc {
 /// IOS-A.S0014-D §4.2.55 MS Information Records IE. Per the spec the BS
 /// transparently re-emits these bytes inside the AWIM SDU on the F-TCH,
 /// so we just decode the C.S0005-E §3.7.5.3 content and stash it.
+/// Build a paging address from a 10–15 digit IMSI for pages to unregistered
+/// MSs. 15 digits → `ImsiClass0` (carries MCC + IMSI_11_12); else `ImsiS`.
+fn synthesize_fwd_address_from_imsi(imsi: &str) -> Option<MsAddress> {
+    let (imsi_m_s1, imsi_m_s2) = cdma_common::paging::imsi_s_from_imsi(imsi)?;
+    let digits: String = imsi.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() == 15 {
+        let mcc = cdma_common::paging::mcc_from_digits(&digits[0..3])?;
+        let imsi_11_12 = cdma_common::paging::imsi_11_12_from_digits(&digits[3..5])?;
+        Some(MsAddress::ImsiClass0 {
+            imsi_m_s1,
+            imsi_m_s2,
+            mcc,
+            imsi_11_12,
+        })
+    } else {
+        Some(MsAddress::ImsiS {
+            imsi_m_s1,
+            imsi_m_s2,
+        })
+    }
+}
+
 fn extract_calling_party_number_record(
     records: &cdma_ios::MsInformationRecords,
 ) -> Option<CallingPartyNumberRecord> {

@@ -39,7 +39,28 @@ message MscToGatewayEvent {
   oneof event {
     StartOutboundCall start_outbound_call = 10;
     ReleaseCall release_call = 11;
+    InboundCallProgress inbound_call_progress = 12;
+    InboundCallAnswer inbound_call_answer = 13;
+    InboundCallReject inbound_call_reject = 14;
   }
+}
+
+// Tells the gateway to send 180 Ringing for an inbound INVITE the MSC accepted.
+message InboundCallProgress {
+  string session_id = 1;
+}
+
+// Tells the gateway to send 200 OK for an inbound INVITE after the MS answered.
+message InboundCallAnswer {
+  string session_id = 1;
+  // Codec the MSC selected from the offered list (PCMU/PCMA).
+  string codec = 2;
+}
+
+// Tells the gateway to send a 4xx/5xx/6xx final response for an inbound INVITE.
+message InboundCallReject {
+  string session_id = 1;
+  uint32 sip_status = 2;
 }
 
 // Requests that the gateway place an outbound SIP call.
@@ -73,7 +94,29 @@ message GatewayToMscEvent {
     GatewayAnswered answered = 11;
     GatewayFailed failed = 12;
     GatewayReleased released = 13;
+    GatewayInboundCall inbound_call = 14;
+    GatewayInboundCancel inbound_cancel = 15;
   }
+}
+
+// SIP trunk cancelled the INVITE (or the dialog closed) before MSC answered.
+// MSC must clear the matching MT call.
+message GatewayInboundCancel {
+  string session_id = 1;
+}
+
+// SIP trunk dialled a subscriber; MSC must accept (page the MS) or reject.
+message GatewayInboundCall {
+  // Gateway-assigned correlation id (used in subsequent MSC commands).
+  string session_id = 1;
+  // Request-URI user, normalized (leading `+` stripped, digits only).
+  string called_number = 2;
+  // From-header user portion, best effort.
+  string caller_number = 3;
+  // From-header display name, optional.
+  string caller_display = 4;
+  // Codecs offered in the SDP. The MSC echoes one of these in InboundCallAnswer.
+  repeated string offered_codecs = 5;
 }
 
 // SIP 180/183 provisional. `codec` is set when the provisional carried SDP.

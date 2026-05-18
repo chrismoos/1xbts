@@ -23,7 +23,6 @@ use crate::power_control::{
 use super::{A1ClearState, VoiceAlertMode, VoiceLegRole};
 
 pub(crate) const VOICE_TRAFFIC_CON_REF: u8 = 1;
-pub(crate) const VOICE_REPLACEMENT_CON_REF: u8 = 0;
 pub(crate) const VOICE_TRAFFIC_SR_ID: u8 = 2;
 
 /// Request to pin or clear the reverse inner-loop target on an active

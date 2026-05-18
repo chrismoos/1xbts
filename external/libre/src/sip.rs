@@ -867,6 +867,416 @@ static SIP_REGISTRATION_HANDLERS: libre_sys::cdma_libre_sipreg_handlers =
         response: Some(registration_response_handler),
     };
 
+// ---- Inbound SIP support ----
+
+/// Borrowed handle to an inbound SIP message. Refcounted via `mem_ref` so the
+/// underlying `sip_msg` stays alive until this is dropped.
+pub struct InboundSipMessage {
+    ptr: NonNull<libre_sys::sip_msg>,
+}
+
+// SAFETY: libre's mem allocator is internally thread-safe; deref runs under
+// ThreadGuard.
+unsafe impl Send for InboundSipMessage {}
+unsafe impl Sync for InboundSipMessage {}
+
+const INBOUND_MSG_FIELD_BUF: usize = 256;
+const INBOUND_MSG_BODY_BUF: usize = 4096;
+
+impl InboundSipMessage {
+    /// SAFETY: `msg` must point to a valid `sip_msg` provided by libre for the
+    /// duration of this call.
+    unsafe fn from_borrowed(msg: *const libre_sys::sip_msg) -> Option<Self> {
+        if !libre_sys::LIBRE_AVAILABLE || msg.is_null() {
+            return None;
+        }
+        let _guard = ThreadGuard::enter();
+        let bumped = unsafe { libre_sys::cdma_libre_sip_msg_ref(msg) };
+        NonNull::new(bumped as *mut libre_sys::sip_msg).map(|ptr| Self { ptr })
+    }
+
+    fn copy_field(
+        &self,
+        copier: unsafe extern "C" fn(*const libre_sys::sip_msg, *mut c_char, usize) -> c_int,
+    ) -> Option<String> {
+        let _guard = ThreadGuard::enter();
+        let mut buf = [0u8; INBOUND_MSG_FIELD_BUF];
+        // SAFETY: ptr is valid; buf is a writable region of the declared length.
+        let n = unsafe {
+            copier(
+                self.ptr.as_ptr(),
+                buf.as_mut_ptr() as *mut c_char,
+                buf.len(),
+            )
+        };
+        if n <= 0 {
+            return None;
+        }
+        let n = n as usize;
+        Some(String::from_utf8_lossy(&buf[..n]).into_owned())
+    }
+
+    pub fn request_uri_user(&self) -> Option<String> {
+        self.copy_field(libre_sys::cdma_libre_sip_msg_ruri_user)
+    }
+
+    pub fn from_user(&self) -> Option<String> {
+        self.copy_field(libre_sys::cdma_libre_sip_msg_from_user)
+    }
+
+    pub fn from_display(&self) -> Option<String> {
+        self.copy_field(libre_sys::cdma_libre_sip_msg_from_display)
+    }
+
+    pub fn body(&self) -> Vec<u8> {
+        let _guard = ThreadGuard::enter();
+        let mut buf = vec![0u8; INBOUND_MSG_BODY_BUF];
+        // SAFETY: ptr is valid; buf is writable.
+        let n = unsafe {
+            libre_sys::cdma_libre_sip_msg_body(self.ptr.as_ptr(), buf.as_mut_ptr(), buf.len())
+        };
+        if n <= 0 {
+            return Vec::new();
+        }
+        buf.truncate(n as usize);
+        buf
+    }
+
+    pub(crate) fn as_ptr(&self) -> *const libre_sys::sip_msg {
+        self.ptr.as_ptr()
+    }
+}
+
+impl Drop for InboundSipMessage {
+    fn drop(&mut self) {
+        if !libre_sys::LIBRE_AVAILABLE {
+            return;
+        }
+        let _guard = ThreadGuard::enter();
+        // SAFETY: ptr was bumped via cdma_libre_sip_msg_ref in from_borrowed.
+        unsafe { libre_sys::cdma_libre_sip_msg_deref(self.ptr.as_ptr()) };
+    }
+}
+
+/// Fires once per inbound INVITE arriving on the listening socket.
+pub trait InboundSipSessionHandler: Send + Sync + 'static {
+    fn on_invite(&self, msg: InboundSipMessage);
+}
+
+struct InboundListenerState {
+    handler: Arc<dyn InboundSipSessionHandler>,
+}
+
+unsafe extern "C" fn inbound_invite_handler(arg: *mut c_void, msg: *const libre_sys::sip_msg) {
+    if arg.is_null() {
+        return;
+    }
+    // SAFETY: arg is the InboundListenerState retained by InboundListener.
+    let state = unsafe { &*(arg as *const InboundListenerState) };
+    // SAFETY: msg is valid for the duration of the callback.
+    let Some(owned) = (unsafe { InboundSipMessage::from_borrowed(msg) }) else {
+        return;
+    };
+    state.handler.on_invite(owned);
+}
+
+static INBOUND_LISTENER_HANDLERS: libre_sys::cdma_libre_inbound_sipsess_handlers =
+    libre_sys::cdma_libre_inbound_sipsess_handlers {
+        invite: Some(inbound_invite_handler),
+    };
+
+/// Lifetime guard for the inbound listener context. Must outlive the
+/// `SipSessionSocket` returned alongside it.
+pub struct InboundListener {
+    _ctx: Box<libre_sys::cdma_libre_inbound_sipsess_ctx>,
+    _state: Box<InboundListenerState>,
+}
+
+// SAFETY: InboundListener owns boxed state retained for the listener's lifetime.
+unsafe impl Send for InboundListener {}
+unsafe impl Sync for InboundListener {}
+
+impl SipSessionSocket {
+    /// Like [`SipSessionSocket::listen`] but wires an inbound INVITE callback.
+    /// The returned `InboundListener` retains the callback state and must
+    /// outlive the socket.
+    pub fn listen_with_inbound_handler(
+        stack: &SipStack,
+        handler: Arc<dyn InboundSipSessionHandler>,
+    ) -> Result<(Self, InboundListener)> {
+        if !libre_sys::LIBRE_AVAILABLE {
+            return Err(Error::NativeUnavailable);
+        }
+
+        let mut state = Box::new(InboundListenerState { handler });
+        let mut ctx = Box::new(libre_sys::cdma_libre_inbound_sipsess_ctx {
+            handlers: &INBOUND_LISTENER_HANDLERS,
+            arg: state.as_mut() as *mut InboundListenerState as *mut c_void,
+        });
+
+        let _guard = ThreadGuard::enter();
+        let mut sock = std::ptr::null_mut();
+
+        // SAFETY: sock is an out pointer, stack is valid, ctx is retained by
+        // the returned InboundListener.
+        let status = unsafe {
+            libre_sys::cdma_libre_sipsess_listen_with_handler(
+                &mut sock,
+                stack.as_ptr(),
+                ctx.as_mut() as *mut libre_sys::cdma_libre_inbound_sipsess_ctx,
+            )
+        };
+        native_status("cdma_libre_sipsess_listen_with_handler", status)?;
+
+        let ptr = NonNull::new(sock).ok_or(Error::Native {
+            operation: "cdma_libre_sipsess_listen_with_handler",
+            status: -1,
+        })?;
+
+        Ok((
+            Self { ptr },
+            InboundListener {
+                _ctx: ctx,
+                _state: state,
+            },
+        ))
+    }
+}
+
+/// Sends a stateless SIP response to an inbound message without creating a
+/// session. Use for early rejections (404/488/503) and the unconditional 100
+/// Trying.
+pub fn sip_treply(
+    stack: &SipStack,
+    msg: &InboundSipMessage,
+    sip_status: u16,
+    reason: &str,
+) -> Result<()> {
+    if !libre_sys::LIBRE_AVAILABLE {
+        return Err(Error::NativeUnavailable);
+    }
+
+    let reason = CString::new(reason)?;
+    let _guard = ThreadGuard::enter();
+    // SAFETY: stack and msg are valid; reason is a NUL-terminated C string.
+    let status = unsafe {
+        libre_sys::cdma_libre_sip_treply(stack.as_ptr(), msg.as_ptr(), sip_status, reason.as_ptr())
+    };
+    native_status("cdma_libre_sip_treply", status)
+}
+
+/// Per-session event handler for an accepted inbound call.
+pub trait InboundSipSessionEventHandler: Send + Sync + 'static {
+    fn on_established(&self, _sip_status: u16) {}
+    fn on_closed(&self, _error: i32, _sip_status: u16) {}
+}
+
+struct InboundSipSessionState {
+    handler: Arc<dyn InboundSipSessionEventHandler>,
+    ctx: libre_sys::cdma_libre_sipsess_ctx,
+}
+
+unsafe extern "C" fn inbound_session_established(arg: *mut c_void, scode: u16) {
+    if arg.is_null() {
+        return;
+    }
+    // SAFETY: arg is the leaked InboundSipSessionState Box from accept;
+    // close_h is what reclaims it, so established_h only borrows.
+    let state = unsafe { &*(arg as *const InboundSipSessionState) };
+    state.handler.on_established(scode);
+}
+
+unsafe extern "C" fn inbound_session_close(arg: *mut c_void, err: c_int, scode: u16) {
+    if arg.is_null() {
+        return;
+    }
+    // SAFETY: arg is the leaked InboundSipSessionState Box from accept.
+    // Reclaiming here is what frees the handler Arc and embedded ctx — paired
+    // with `Box::into_raw` after a successful sipsess_accept.
+    let state = unsafe { Box::from_raw(arg as *mut InboundSipSessionState) };
+    state.handler.on_closed(err, scode);
+}
+
+static INBOUND_SESSION_HANDLERS: libre_sys::cdma_libre_sipsess_handlers =
+    libre_sys::cdma_libre_sipsess_handlers {
+        desc: None,
+        auth: None,
+        answer: None,
+        progress: None,
+        established: Some(inbound_session_established),
+        close: Some(inbound_session_close),
+    };
+
+/// Live SIP session created via `InboundSipSession::accept`. Backing state
+/// (callback handler + ctx) is leaked into libre at accept time and reclaimed
+/// in `close_h`, so the wrapper itself doesn't own that memory.
+pub struct InboundSipSession {
+    ptr: NonNull<libre_sys::sipsess>,
+}
+
+// SAFETY: All C operations go through ThreadGuard; state lives until close_h.
+unsafe impl Send for InboundSipSession {}
+unsafe impl Sync for InboundSipSession {}
+
+impl InboundSipSession {
+    /// Accept the inbound INVITE with a 1xx provisional. If `sdp_answer` is
+    /// `Some`, the SDP body is sent with the provisional (early-media
+    /// negotiation); the same SDP should be echoed in the final `answer`.
+    pub fn accept(
+        socket: &SipSessionSocket,
+        msg: &InboundSipMessage,
+        sip_status: u16,
+        reason: &str,
+        contact_user: &str,
+        sdp_answer: Option<&str>,
+        handler: Arc<dyn InboundSipSessionEventHandler>,
+    ) -> Result<Self> {
+        if !libre_sys::LIBRE_AVAILABLE {
+            return Err(Error::NativeUnavailable);
+        }
+
+        let contact_user = CString::new(contact_user)?;
+        let reason = CString::new(reason)?;
+
+        let mut state = Box::new(InboundSipSessionState {
+            handler,
+            ctx: libre_sys::cdma_libre_sipsess_ctx {
+                handlers: &INBOUND_SESSION_HANDLERS,
+                arg: std::ptr::null_mut(),
+            },
+        });
+        let state_ptr: *mut InboundSipSessionState = state.as_mut();
+        state.ctx.arg = state_ptr as *mut c_void;
+        // Leak the Box; libre's `close_h` reclaims via `Box::from_raw`.
+        let state_ptr = Box::into_raw(state);
+        let ctx_ptr = unsafe { &mut (*state_ptr).ctx as *mut libre_sys::cdma_libre_sipsess_ctx };
+
+        let _guard = ThreadGuard::enter();
+        let desc_mbuf = match sdp_answer {
+            Some(sdp) => {
+                let cstr = match CString::new(sdp) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // Reclaim leaked state before returning.
+                        unsafe { drop(Box::from_raw(state_ptr)) };
+                        return Err(e.into());
+                    }
+                };
+                // SAFETY: cstr is NUL-terminated; libre takes ownership of the mbuf.
+                let mbuf = unsafe { libre_sys::cdma_libre_mbuf_from_str(cstr.as_ptr()) };
+                if mbuf.is_null() {
+                    unsafe { drop(Box::from_raw(state_ptr)) };
+                    return Err(Error::Native {
+                        operation: "cdma_libre_mbuf_from_str",
+                        status: ENOMEM,
+                    });
+                }
+                mbuf
+            }
+            None => std::ptr::null_mut(),
+        };
+        let mut sess = std::ptr::null_mut();
+        // SAFETY: all pointers are valid for this call; ctx is leaked into
+        // libre and reclaimed in close_h; desc_mbuf ownership transfers to libre.
+        let status = unsafe {
+            libre_sys::cdma_libre_sipsess_accept(
+                &mut sess,
+                socket.as_ptr(),
+                msg.as_ptr(),
+                sip_status,
+                reason.as_ptr(),
+                contact_user.as_ptr(),
+                desc_mbuf,
+                ctx_ptr,
+            )
+        };
+        if let Err(error) = native_status("cdma_libre_sipsess_accept", status) {
+            // Accept failed before libre registered our callbacks; close_h
+            // will not fire, so reclaim and drop the leaked state here.
+            unsafe { drop(Box::from_raw(state_ptr)) };
+            return Err(error);
+        }
+
+        let ptr = NonNull::new(sess).ok_or_else(|| {
+            unsafe { drop(Box::from_raw(state_ptr)) };
+            Error::Native {
+                operation: "cdma_libre_sipsess_accept",
+                status: -1,
+            }
+        })?;
+
+        Ok(Self { ptr })
+    }
+
+    /// Send the final 2xx response with the SDP answer body.
+    pub fn answer(&self, sip_status: u16, reason: &str, sdp_answer: &str) -> Result<()> {
+        if !libre_sys::LIBRE_AVAILABLE {
+            return Err(Error::NativeUnavailable);
+        }
+        let reason = CString::new(reason)?;
+        let answer_cstr = CString::new(sdp_answer)?;
+        let _guard = ThreadGuard::enter();
+        // SAFETY: answer_cstr is NUL-terminated; mbuf ownership transfers to libre.
+        let mbuf = unsafe { libre_sys::cdma_libre_mbuf_from_str(answer_cstr.as_ptr()) };
+        if mbuf.is_null() {
+            return Err(Error::Native {
+                operation: "cdma_libre_mbuf_from_str",
+                status: ENOMEM,
+            });
+        }
+        // SAFETY: ptr is a valid sipsess; reason is NUL-terminated.
+        let status = unsafe {
+            libre_sys::cdma_libre_sipsess_answer(
+                self.ptr.as_ptr(),
+                sip_status,
+                reason.as_ptr(),
+                mbuf,
+            )
+        };
+        native_status("cdma_libre_sipsess_answer", status)
+    }
+
+    /// Send a 1xx provisional from this session (typically 180 Ringing).
+    pub fn progress(&self, sip_status: u16, reason: &str) -> Result<()> {
+        if !libre_sys::LIBRE_AVAILABLE {
+            return Err(Error::NativeUnavailable);
+        }
+        let reason = CString::new(reason)?;
+        let _guard = ThreadGuard::enter();
+        // SAFETY: ptr is a valid sipsess; reason is NUL-terminated.
+        let status = unsafe {
+            libre_sys::cdma_libre_sipsess_progress(self.ptr.as_ptr(), sip_status, reason.as_ptr())
+        };
+        native_status("cdma_libre_sipsess_progress", status)
+    }
+
+    /// Send a final 4xx/5xx/6xx rejection from this session. Consumes the
+    /// session.
+    pub fn reject(self, sip_status: u16, reason: &str) -> Result<()> {
+        if !libre_sys::LIBRE_AVAILABLE {
+            return Err(Error::NativeUnavailable);
+        }
+        let reason = CString::new(reason)?;
+        let _guard = ThreadGuard::enter();
+        // SAFETY: ptr is a valid sipsess owned by self; reason is NUL-terminated.
+        let status = unsafe {
+            libre_sys::cdma_libre_sipsess_reject(self.ptr.as_ptr(), sip_status, reason.as_ptr())
+        };
+        native_status("cdma_libre_sipsess_reject", status)
+    }
+}
+
+impl Drop for InboundSipSession {
+    fn drop(&mut self) {
+        if !libre_sys::LIBRE_AVAILABLE {
+            return;
+        }
+        let _guard = ThreadGuard::enter();
+        // SAFETY: ptr is owned by this wrapper.
+        unsafe { libre_sys::cdma_libre_sipsess_deref(self.ptr.as_ptr()) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{SipCredentials, Transport};

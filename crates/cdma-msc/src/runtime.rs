@@ -23,7 +23,9 @@ use crate::management::{
     InitiateCallAccepted, InitiateCallRequest, ManagementError, MtCallPlan, PendingControlRequest,
 };
 use crate::media::MediaService;
-use crate::media_gateway::{CreateCallRequest, MediaGatewayClient, ReleaseCause, VocoderFrame};
+use crate::media_gateway::{
+    CreateCallRequest, MediaGatewayClient, MediaGatewayEvent, ReleaseCause, VocoderFrame,
+};
 use crate::media_gateway_service::{
     MediaGatewayService, gateway_clear_cause, send_forward_bearer_frame,
     send_gateway_clear_command, stop_media_for_call,
@@ -41,6 +43,71 @@ pub trait MscA1Endpoint: Send + Sync {
 
     /// Sends one A1 message toward the BSC.
     async fn send_to_bsc(&self, message: EncodedA1Message) -> Result<(), A1TransportError>;
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum PagePurpose {
+    Initial,
+    Retry,
+    RepageAfterAf { failed_leg: MscVoiceLeg },
+    M2mSecondary,
+}
+
+impl PagePurpose {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Initial => "",
+            Self::Retry => " (retry)",
+            Self::RepageAfterAf { .. } => " (re-page after AssignmentFailure)",
+            Self::M2mSecondary => " for MO M2M (deferred until primary AssignmentComplete)",
+        }
+    }
+
+    /// `Retry` reuses the existing `mt_page_retry` entry; re-registering
+    /// would reset `give_up_at` and prevent the hunt from ever timing out.
+    fn starts_hunt_window(self) -> bool {
+        !matches!(self, Self::Retry)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum MtSetupError {
+    SubscriberInactive(uuid::Uuid),
+    NotRegistered(uuid::Uuid),
+    NotPageable(uuid::Uuid, cdma_hlr::model::RegistrationState),
+    NoPageableImsi(uuid::Uuid),
+    A1Closed,
+    Other(String),
+}
+
+impl MtSetupError {
+    pub(crate) fn into_management_error(self) -> ManagementError {
+        match self {
+            Self::SubscriberInactive(id) => {
+                ManagementError::Rejected(format!("subscriber {id} is not active"))
+            }
+            Self::NotRegistered(id) => {
+                ManagementError::Rejected(format!("subscriber {id} is not currently registered"))
+            }
+            Self::NotPageable(id, state) => ManagementError::Rejected(format!(
+                "subscriber {id} is not pageable in state {}",
+                state.as_str()
+            )),
+            Self::NoPageableImsi(id) => {
+                ManagementError::Rejected(format!("subscriber {id} has no IMSI for A1 paging"))
+            }
+            Self::A1Closed => ManagementError::Unavailable("A1 edge to BSC is closed"),
+            Self::Other(msg) => ManagementError::Rejected(msg),
+        }
+    }
+
+    pub(crate) fn to_sip_status(&self) -> u16 {
+        match self {
+            Self::SubscriberInactive(_) => 404,
+            Self::NotRegistered(_) | Self::NotPageable(_, _) | Self::NoPageableImsi(_) => 480,
+            Self::A1Closed | Self::Other(_) => 503,
+        }
+    }
 }
 
 /// Configuration for the MSC runtime.
@@ -62,6 +129,11 @@ pub struct MscRuntimeConfig {
     /// Ringback cadence to synthesize when enabled.
     pub media_ringback_type: MediaRingbackType,
     pub sip_ringback_disable: bool,
+    pub inbound_sip_msc_ringback: bool,
+    pub generate_ringback: bool,
+    pub send_tones_alert: bool,
+    pub page_retry_cooldown_ms: u64,
+    pub page_retry_max_duration_ms: u64,
     pub failure_tone_duration_ms: u64,
     /// Voice bearer manager for MSC<->BSC per-circuit RTP voice sessions.
     pub voice_bearer: Option<Arc<VoiceBearerManager>>,
@@ -96,6 +168,11 @@ impl MscRuntimeConfig {
             media_ringback_enabled: config.voice.media_ringback_enabled,
             media_ringback_type: config.voice.media_ringback_type,
             sip_ringback_disable: config.voice.sip_ringback_disable,
+            inbound_sip_msc_ringback: config.voice.inbound_sip_msc_ringback,
+            generate_ringback: config.voice.generate_ringback,
+            send_tones_alert: config.voice.send_tones_alert,
+            page_retry_cooldown_ms: config.voice.page_retry_cooldown_ms,
+            page_retry_max_duration_ms: config.voice.page_retry_max_duration_ms,
             failure_tone_duration_ms: config.voice.failure_tone_duration_ms,
             voice_bearer: Some(Arc::new(VoiceBearerManager::new(
                 config.voice.voice_bearer_bind_ip,
@@ -116,6 +193,7 @@ pub struct MscRuntime {
     pub(crate) media_gw: MediaGatewayService,
     pub(crate) mt_call: MtCallService,
     pub(crate) mo_call: MoCallService,
+    pub(crate) mt_page_retry: crate::mt_page_retry::MtPageRetryService,
     pub(crate) smsc: Option<crate::sms::MscSmsCoordinator>,
 }
 
@@ -125,6 +203,10 @@ impl MscRuntime {
         let smsc = config.smsc_repo.as_ref().map(|smsc_repo| {
             crate::sms::MscSmsCoordinator::new(Arc::clone(smsc_repo), Arc::clone(&config.hlr_repo))
         });
+        let mt_page_retry = crate::mt_page_retry::MtPageRetryService::new(
+            config.page_retry_cooldown_ms,
+            config.page_retry_max_duration_ms,
+        );
         Self {
             controller: MscCallController::new(),
             config,
@@ -133,6 +215,7 @@ impl MscRuntime {
             media_gw: MediaGatewayService::new(),
             mt_call: MtCallService::new(),
             mo_call: MoCallService::new(),
+            mt_page_retry,
             smsc,
         }
     }
@@ -170,6 +253,12 @@ impl MscRuntime {
                     None => std::future::pending().await,
                 }
             };
+            let page_retry_sleep = async {
+                match self.mt_page_retry.next_retry_deadline() {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 request = management_rx.recv() => {
                     let Some(request) = request else {
@@ -200,20 +289,47 @@ impl MscRuntime {
                     }
                 } => {
                     if let Some(event) = event {
-                        self.media_gw.handle_media_gateway_event(
-                            a1,
-                            event,
-                            &mut self.controller,
-                            &mut self.circuits,
-                            &mut self.media,
-                            self.config.voice_bearer.as_ref(),
-                            self.config.media_gateway.as_ref(),
-                            self.config.media_ringback_enabled,
-                            self.config.media_ringback_type,
-                            self.config.sip_ringback_disable,
-                            self.config.failure_tone_duration_ms,
-                            Some(&self.config.hlr_repo),
-                        ).await;
+                        match event {
+                            MediaGatewayEvent::InboundCall {
+                                session_id,
+                                called_number,
+                                caller_number,
+                                caller_display: _,
+                                offered_codecs,
+                            } => {
+                                self.handle_inbound_sip_invite(
+                                    a1,
+                                    session_id,
+                                    called_number,
+                                    caller_number,
+                                    offered_codecs,
+                                )
+                                .await;
+                            }
+                            MediaGatewayEvent::InboundCancel { session_id } => {
+                                self.handle_inbound_sip_cancel(a1, session_id).await;
+                            }
+                            other => {
+                                self.media_gw
+                                    .handle_media_gateway_event(
+                                        a1,
+                                        other,
+                                        &mut self.controller,
+                                        &mut self.circuits,
+                                        &mut self.media,
+                                        self.config.voice_bearer.as_ref(),
+                                        self.config.media_gateway.as_ref(),
+                                        self.config.media_ringback_enabled,
+                                        self.config.media_ringback_type,
+                                        self.config.sip_ringback_disable,
+                                        self.config.generate_ringback,
+                                        self.config.send_tones_alert,
+                                        self.config.failure_tone_duration_ms,
+                                        Some(&self.config.hlr_repo),
+                                    )
+                                    .await;
+                            }
+                        }
                     }
                 }
                 _ = delayed_wav_sleep => {
@@ -224,6 +340,9 @@ impl MscRuntime {
                 }
                 _ = pending_clear_sleep => {
                     self.fire_due_pending_clears(a1).await;
+                }
+                _ = page_retry_sleep => {
+                    self.fire_due_page_retries(a1).await;
                 }
                 _ = sms_expiry_interval.tick() => {
                     if let Some(smsc) = self.smsc.as_mut() {
@@ -310,46 +429,50 @@ impl MscRuntime {
         else {
             return Err(ManagementError::UnknownSubscriber(request.subscriber_id));
         };
+        self.start_mt_call(a1, resolved, request.caller_number, request.audio_file)
+            .await
+            .map(|call_id| InitiateCallAccepted { call_id })
+            .map_err(MtSetupError::into_management_error)
+    }
+
+    pub(crate) async fn start_mt_call(
+        &mut self,
+        a1: &dyn MscA1Endpoint,
+        resolved: cdma_hlr::model::ResolvedSubscriber,
+        caller_number: Option<String>,
+        audio_file: Option<String>,
+    ) -> Result<CallId, MtSetupError> {
         let subscriber_id = resolved.subscriber.subscriber_id;
         if !matches!(
             resolved.subscriber.status,
             cdma_hlr::model::SubscriberStatus::Active
         ) {
-            return Err(ManagementError::Rejected(format!(
-                "subscriber {} is not active",
-                subscriber_id
-            )));
+            return Err(MtSetupError::SubscriberInactive(subscriber_id));
         }
 
         let Some(binding) = resolved.binding.as_ref() else {
-            return Err(ManagementError::Rejected(format!(
-                "subscriber {} is not currently registered",
-                subscriber_id
-            )));
+            return Err(MtSetupError::NotRegistered(subscriber_id));
         };
         if !matches!(
             binding.state,
             cdma_hlr::model::RegistrationState::Registered
                 | cdma_hlr::model::RegistrationState::PageResponseReceived
         ) {
-            return Err(ManagementError::Rejected(format!(
-                "subscriber {} is not pageable in state {}",
+            return Err(MtSetupError::NotPageable(
                 subscriber_id,
-                binding.state.as_str()
-            )));
+                binding.state.clone(),
+            ));
         }
 
-        let imsi = select_pageable_imsi(&resolved.identities, binding).ok_or_else(|| {
-            ManagementError::Rejected(format!(
-                "subscriber {} has no IMSI for A1 paging",
-                subscriber_id
-            ))
-        })?;
+        let imsi = select_pageable_imsi(&resolved.identities, binding)
+            .ok_or(MtSetupError::NoPageableImsi(subscriber_id))?;
 
         let call_id = self.controller.create_call(
             CallDirection::MobileTerminated,
             Some(cdma_ios::MobileIdentity::Imsi(imsi.to_string())),
         );
+        self.media_gw
+            .register_active_subscriber(subscriber_id, call_id);
         let tag = cdma_ios::Tag(call_id.0 as u32);
         let paging_request = cdma_ios::PagingRequestMessage {
             mobile_identity_imsi: cdma_ios::MobileIdentity::Imsi(imsi.to_string()),
@@ -363,39 +486,155 @@ impl MscRuntime {
             )),
             is2000_mobile_capabilities: None,
         };
-        self.controller
-            .apply_from_msc(
-                call_id,
-                &cdma_ios::ProcedureMessage::PagingRequest(paging_request.clone()),
-            )
-            .map_err(|e| ManagementError::Rejected(format!("msc paging state error: {e}")))?;
+        if let Err(e) = self.controller.apply_from_msc(
+            call_id,
+            &cdma_ios::ProcedureMessage::PagingRequest(paging_request.clone()),
+        ) {
+            self.abort_mt_setup(call_id);
+            return Err(MtSetupError::Other(format!("msc paging state error: {e}")));
+        }
         self.mt_call.mt_plans.insert(
             tag.0,
             MtCallPlan {
                 subscriber_id,
                 imsi: imsi.to_string(),
-                audio_file: request.audio_file,
-                caller_number: request.caller_number,
+                audio_file,
+                caller_number,
                 service_option: self.config.default_voice_service_option,
             },
         );
         self.circuits
             .paging_requests
             .insert(call_id, paging_request.clone());
-        info!("MSC: A1 tx PagingRequest call_id={}", call_id.0);
-        a1.send_to_bsc(EncodedA1Message::from_message_for_call(
-            &cdma_ios::Message::new(
-                cdma_ios::MessageType::PagingRequest,
-                paging_request.encode().map_err(|e| {
-                    ManagementError::Rejected(format!("encode A1 Paging Request: {e}"))
-                })?,
-            ),
-            Some(call_id.0),
-        ))
-        .await
-        .map_err(|_| ManagementError::Unavailable("A1 edge to BSC is closed"))?;
+        if !self
+            .send_paging_request_to_bsc(a1, call_id, paging_request, PagePurpose::Initial)
+            .await
+        {
+            self.abort_mt_setup(call_id);
+            return Err(MtSetupError::A1Closed);
+        }
+        Ok(call_id)
+    }
 
-        Ok(InitiateCallAccepted { call_id })
+    fn abort_mt_setup(&mut self, call_id: CallId) {
+        self.mt_page_retry.cancel(call_id);
+        self.controller.remove_call(call_id);
+        self.stop_media_for_call(call_id);
+    }
+
+    /// Send an A1 PagingRequest; rearms the controller engine on
+    /// `RepageAfterAf{ Primary }` and registers with `mt_page_retry` unless
+    /// `purpose == Retry`. Returns `false` if rearm/encode/transport failed.
+    async fn send_paging_request_to_bsc(
+        &mut self,
+        a1: &dyn MscA1Endpoint,
+        call_id: CallId,
+        paging_request: cdma_ios::PagingRequestMessage,
+        purpose: PagePurpose,
+    ) -> bool {
+        if let PagePurpose::RepageAfterAf { failed_leg } = purpose
+            && failed_leg == MscVoiceLeg::Primary
+            && let Err(error) = self.controller.rearm_for_repage(
+                call_id,
+                &cdma_ios::ProcedureMessage::PagingRequest(paging_request.clone()),
+            )
+        {
+            warn!(
+                "MSC: failed to rearm call-control state for re-page call_id={}: {:?}",
+                call_id.0, error
+            );
+            return false;
+        }
+        let payload = match paging_request.encode() {
+            Ok(p) => p,
+            Err(error) => {
+                warn!(
+                    "MSC: failed to encode PagingRequest{} call_id={}: {}",
+                    purpose.tag(),
+                    call_id.0,
+                    error
+                );
+                return false;
+            }
+        };
+        info!(
+            "MSC: A1 tx PagingRequest{} call_id={}",
+            purpose.tag(),
+            call_id.0
+        );
+        if let Err(error) = a1
+            .send_to_bsc(EncodedA1Message::from_message_for_call(
+                &cdma_ios::Message::new(cdma_ios::MessageType::PagingRequest, payload),
+                Some(call_id.0),
+            ))
+            .await
+        {
+            warn!(
+                "MSC: failed to send PagingRequest{} call_id={}: {}",
+                purpose.tag(),
+                call_id.0,
+                error
+            );
+            return false;
+        }
+        if purpose.starts_hunt_window() {
+            self.mt_page_retry.register(call_id, paging_request);
+        }
+        true
+    }
+
+    /// Returns true if the BSC ClearRequest was consumed (handled as a hunt
+    /// retry or hunt give-up). False means the caller should fall through to
+    /// the normal ClearRequest processing.
+    async fn handle_mt_page_timeout(&mut self, a1: &dyn MscA1Endpoint, call_id: CallId) -> bool {
+        use crate::mt_page_retry::PageTimeoutOutcome;
+        match self.mt_page_retry.handle_page_timeout(call_id) {
+            PageTimeoutOutcome::Retry(deadline) => {
+                info!(
+                    "MSC: page timeout for call_id={} — retrying in {}ms",
+                    call_id.0,
+                    deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .as_millis()
+                );
+                true
+            }
+            PageTimeoutOutcome::GiveUp => {
+                warn!(
+                    "MSC: page hunt exhausted for call_id={} — declaring call failed",
+                    call_id.0
+                );
+                self.fail_mt_call(a1, call_id, 480).await;
+                true
+            }
+            PageTimeoutOutcome::Unknown => false,
+        }
+    }
+
+    async fn fire_due_page_retries(&mut self, a1: &dyn MscA1Endpoint) {
+        let due = self.mt_page_retry.drain_due(tokio::time::Instant::now());
+        for (call_id, paging_request) in due {
+            self.send_paging_request_to_bsc(a1, call_id, paging_request, PagePurpose::Retry)
+                .await;
+        }
+    }
+
+    /// Tear down an MT call that never reached Connect. For SIP-inbound calls
+    /// this also drives `inbound_reject(sip_status)` so the caller gets a final
+    /// SIP response immediately (no 30 s gateway-watchdog wait).
+    async fn fail_mt_call(&mut self, a1: &dyn MscA1Endpoint, call_id: CallId, sip_status: u16) {
+        self.mt_page_retry.cancel(call_id);
+        if let Some(meta) = self.media_gw.take_inbound_session(call_id)
+            && let Some(gateway) = self.config.media_gateway.clone()
+        {
+            let session_id = meta.session_id;
+            tokio::spawn(async move {
+                let _ = gateway.inbound_reject(&session_id, sip_status).await;
+            });
+        }
+        self.send_clear_command(a1, call_id).await;
+        self.controller.remove_call(call_id);
+        self.stop_media_for_call(call_id);
     }
 
     /// Handles one inbound A1 message from the BSC.
@@ -442,6 +681,7 @@ impl MscRuntime {
 
         match decoded.message_type {
             cdma_ios::MessageType::PagingResponse => {
+                self.mt_page_retry.cancel(call_id);
                 let response = match cdma_ios::PagingResponseMessage::decode(&decoded.payload) {
                     Ok(response) => response,
                     Err(error) => {
@@ -607,8 +847,35 @@ impl MscRuntime {
                     self.fire_deferred_sip_invite(a1, call_id).await;
                 }
                 self.media_gw
-                    .flush_pending_post_assignment(a1, call_id, &mut self.controller)
+                    .flush_pending_post_assignment(
+                        a1,
+                        call_id,
+                        &mut self.controller,
+                        self.config.send_tones_alert,
+                    )
                     .await;
+
+                self.fire_assignment_complete_awi(a1, call_id, completed_leg)
+                    .await;
+
+                // Send 180 Ringing only when the trunk is doing ringback;
+                // when MSC sends 183 + early media many trunks interpret 180
+                // as "switch to local ringback" and clobber our audio.
+                if let Some(meta) = self.media_gw.inbound_session_for_call(call_id).cloned()
+                    && !meta.progress_sent
+                    && !self.config.inbound_sip_msc_ringback
+                {
+                    if let Some(session_id) = self.media_gw.inbound_by_call.get(&call_id).cloned() {
+                        if let Some(gateway) = self.config.media_gateway.clone() {
+                            if let Err(error) = gateway.inbound_progress(&session_id).await {
+                                warn!(
+                                    "MSC: inbound_progress failed for session={session_id}: {error}"
+                                );
+                            }
+                        }
+                    }
+                    self.media_gw.mark_inbound_progress_sent(call_id);
+                }
             }
             cdma_ios::MessageType::AssignmentFailure => {
                 self.handle_assignment_failure(a1, call_id).await;
@@ -621,6 +888,15 @@ impl MscRuntime {
                         return;
                     }
                 };
+                // Tones-Off Progress must precede Connect: the engine accepts
+                // Progress only from Assigned/Alerting (Connect advances to
+                // Connected). BSC routes Signal=0x3F to the Caller leg.
+                crate::media_gateway_service::send_progress_tones_off(
+                    a1,
+                    call_id,
+                    &mut self.controller,
+                )
+                .await;
                 if let Err(error) = self
                     .controller
                     .apply_from_bsc(call_id, &cdma_ios::ProcedureMessage::Connect(connect))
@@ -628,11 +904,27 @@ impl MscRuntime {
                     warn!("MSC: failed to apply A1 Connect: {}", error);
                 }
                 self.media.stop_ringback_for_call(call_id, &self.circuits);
+                self.media.stop_inbound_ringback(call_id);
                 self.media.start_media_for_call(
                     call_id,
                     &self.circuits,
                     self.config.voice_bearer.as_ref(),
                 );
+                if let Some(meta) = self.media_gw.inbound_session_for_call(call_id).cloned() {
+                    if let Some(session_id) = self.media_gw.inbound_by_call.get(&call_id).cloned() {
+                        if let Some(gateway) = self.config.media_gateway.clone() {
+                            if let Err(error) =
+                                gateway.inbound_answer(&session_id, &meta.codec).await
+                            {
+                                warn!(
+                                    "MSC: inbound_answer failed for session={session_id}: {error}"
+                                );
+                            } else {
+                                self.media_gw.mark_answered(call_id);
+                            }
+                        }
+                    }
+                }
             }
             cdma_ios::MessageType::ClearRequest => {
                 let clear_request = match cdma_ios::ClearRequestMessage::decode(&decoded.payload) {
@@ -642,6 +934,11 @@ impl MscRuntime {
                         return;
                     }
                 };
+                if clear_request.cause.0 == crate::mt_page_retry::A1_CAUSE_PAGE_RESP_TIMEOUT
+                    && self.handle_mt_page_timeout(a1, call_id).await
+                {
+                    return;
+                }
                 if let Err(error) = self.controller.apply_from_bsc(
                     call_id,
                     &cdma_ios::ProcedureMessage::ClearRequest(clear_request.clone()),
@@ -692,11 +989,21 @@ impl MscRuntime {
                     call_id,
                     &cdma_ios::ProcedureMessage::ClearComplete(clear_complete),
                 ) {
-                    warn!("MSC: failed to apply A1 Clear Complete: {}", error);
+                    // Common when MSC drove a local cleanup (SIP cancel / page-hunt
+                    // give-up) before BSC's ClearComplete arrived — controller has
+                    // already dropped the call. Benign.
+                    log::debug!(
+                        "MSC: ClearComplete for call_id={} not applied (already cleaned up): {}",
+                        call_id.0,
+                        error
+                    );
                     return;
                 }
                 if self.controller.remove_call(call_id).is_none() {
-                    warn!("MSC: no call found to remove after Clear Complete");
+                    log::debug!(
+                        "MSC: no call to remove after ClearComplete call_id={} (already cleaned up)",
+                        call_id.0
+                    );
                 }
                 self.stop_media_for_call(call_id);
             }
@@ -722,13 +1029,14 @@ impl MscRuntime {
                 let called_number = cm_service_request
                     .as_ref()
                     .and_then(cm_service_request_called_number);
-                let calling_number = self
+                let originator = self
                     .mo_call
-                    .resolve_mo_calling_number(
+                    .resolve_mo_originator(
                         cm_service_request.as_ref(),
                         self.config.hlr_repo.as_ref(),
                     )
                     .await;
+                let calling_number = originator.as_ref().map(|(n, _)| n.clone());
 
                 let mobile_identity = cm_service_request
                     .as_ref()
@@ -740,6 +1048,10 @@ impl MscRuntime {
                 );
                 if let Some(number) = calling_number.clone() {
                     self.mo_call.mo_calling_numbers.insert(call_id, number);
+                }
+                if let Some((_, subscriber_id)) = originator {
+                    self.media_gw
+                        .register_active_subscriber(subscriber_id, call_id);
                 }
                 if let Err(error) = self.controller.apply_from_bsc(
                     call_id,
@@ -974,6 +1286,17 @@ impl MscRuntime {
             return;
         }
 
+        // Pre-answer inbound SIP: MSC is generating ringback toward the trunk
+        // via the same forward_payload path. Forwarding MS pre-answer null
+        // frames would interleave with and corrupt the ringback audio.
+        if self.media.inbound_ringback_active(call_id) {
+            log::trace!(
+                "MSC: dropping reverse bearer frame call_id={} (inbound ringback active)",
+                call_id.0
+            );
+            return;
+        }
+
         let media_gateway_handle = media_gateway_handle.or_else(|| {
             self.controller
                 .snapshot(call_id)
@@ -1040,10 +1363,10 @@ impl MscRuntime {
     async fn handle_assignment_failure(&mut self, a1: &dyn MscA1Endpoint, call_id: CallId) {
         let abandoned = self
             .circuits
-            .cancel_secondary_leg(call_id, self.config.voice_bearer.as_ref());
+            .cancel_pending_assignment_leg(call_id, self.config.voice_bearer.as_ref());
         let attempts = self.circuits.bump_assignment_failure_retry(call_id);
         info!(
-            "MSC: A1 rx AssignmentFailure call_id={} (attempt {}/{}); abandoned circuit_id={:?}",
+            "MSC: A1 rx AssignmentFailure call_id={} (attempt {}/{}); abandoned leg={:?}",
             call_id.0,
             attempts,
             Self::MT_ASSIGNMENT_FAILURE_MAX_RETRIES,
@@ -1058,10 +1381,18 @@ impl MscRuntime {
             self.send_clear_command(a1, call_id).await;
             return;
         }
-        self.reissue_paging_request(a1, call_id).await;
+        let failed_leg = abandoned
+            .map(|(leg, _)| leg)
+            .unwrap_or(MscVoiceLeg::Primary);
+        self.reissue_paging_request(a1, call_id, failed_leg).await;
     }
 
-    async fn reissue_paging_request(&mut self, a1: &dyn MscA1Endpoint, call_id: CallId) {
+    async fn reissue_paging_request(
+        &mut self,
+        a1: &dyn MscA1Endpoint,
+        call_id: CallId,
+        failed_leg: MscVoiceLeg,
+    ) {
         let Some(paging_request) = self.circuits.paging_requests.get(&call_id).cloned() else {
             warn!(
                 "MSC: cannot re-page call_id={} — no original PagingRequest retained",
@@ -1069,31 +1400,99 @@ impl MscRuntime {
             );
             return;
         };
-        let payload = match paging_request.encode() {
-            Ok(payload) => payload,
-            Err(error) => {
-                warn!(
-                    "MSC: failed to encode re-page PagingRequest call_id={}: {}",
-                    call_id.0, error
-                );
-                return;
-            }
-        };
-        info!(
-            "MSC: A1 tx PagingRequest call_id={} (re-page after AssignmentFailure)",
-            call_id.0
-        );
-        if let Err(error) = a1
-            .send_to_bsc(EncodedA1Message::from_message_for_call(
-                &cdma_ios::Message::new(cdma_ios::MessageType::PagingRequest, payload),
-                Some(call_id.0),
-            ))
-            .await
+        if self
+            .circuits
+            .deferred_paging_responses
+            .remove(&call_id)
+            .is_some_and(|q| !q.is_empty())
         {
             warn!(
-                "MSC: failed to send re-page PagingRequest call_id={}: {}",
-                call_id.0, error
+                "MSC: discarded stale deferred PagingResponse(s) for call_id={} before re-page",
+                call_id.0
             );
+        }
+        self.send_paging_request_to_bsc(
+            a1,
+            call_id,
+            paging_request,
+            PagePurpose::RepageAfterAf { failed_leg },
+        )
+        .await;
+    }
+
+    /// Drive A1 `AlertWithInformation` (and optionally `Progress{Ringback}`)
+    /// after `AssignmentComplete`. BSC's leg-role mapper translates the AWI
+    /// into a standard alert (Callee) or ringback AWIM (Caller) on the air.
+    async fn fire_assignment_complete_awi(
+        &mut self,
+        a1: &dyn MscA1Endpoint,
+        call_id: CallId,
+        completed_leg: Option<MscVoiceLeg>,
+    ) {
+        use crate::media_gateway_service::send_alert_with_information;
+
+        let direction = self
+            .controller
+            .snapshot(call_id)
+            .map(|snapshot| snapshot.direction);
+        let has_peer = self
+            .circuits
+            .circuits
+            .values()
+            .any(|s| s.call_id == call_id && s.peer_circuit_id.is_some());
+
+        // Caller-ID for callee-side alerts comes from mt_call's per-call stash
+        // (populated at PagingResponse time from MO calling number / MT plan).
+        let build_caller_id_records = async |this: &mut Self| {
+            if let Some(digits) = this.mt_call.caller_numbers.get(&call_id).cloned() {
+                crate::mt_call::build_calling_party_ms_information_records(
+                    Some(digits.as_str()),
+                    &this.config.hlr_repo,
+                )
+                .await
+            } else {
+                None
+            }
+        };
+
+        match completed_leg {
+            Some(MscVoiceLeg::Secondary) => {
+                // MS-MS callee alerting; AWI (records only) goes to the
+                // Callee leg. Caller-side ringback was already kicked off
+                // at MO M2M page send (see flush_deferred_paging_request).
+                let records = build_caller_id_records(self).await;
+                send_alert_with_information(
+                    a1,
+                    call_id,
+                    &mut self.controller,
+                    &mut self.media_gw.alert_sent,
+                    records,
+                )
+                .await;
+            }
+            Some(MscVoiceLeg::Primary) => match direction {
+                Some(CallDirection::MobileTerminated) => {
+                    // SIP-inbound or MSC-initiated MT: mandatory callee alert
+                    // with caller-ID (from SIP From-header / configured caller).
+                    let records = build_caller_id_records(self).await;
+                    send_alert_with_information(
+                        a1,
+                        call_id,
+                        &mut self.controller,
+                        &mut self.media_gw.alert_sent,
+                        records,
+                    )
+                    .await;
+                }
+                Some(CallDirection::MobileOriginated) => {
+                    // Caller-side ringback is driven from the callee-alerting
+                    // event, not from Primary AssignmentComplete: Secondary
+                    // arm above for MS-MS, `Ringing` (180) for SIP-outbound.
+                    let _ = has_peer;
+                }
+                None => {}
+            },
+            None => {}
         }
     }
 
@@ -1133,33 +1532,19 @@ impl MscRuntime {
         let Some(paging_request) = self.circuits.take_deferred_paging_request(call_id) else {
             return;
         };
-        let payload = match paging_request.encode() {
-            Ok(payload) => payload,
-            Err(error) => {
-                warn!(
-                    "MSC: failed to encode deferred MO M2M Paging Request call_id={}: {}",
-                    call_id.0, error
-                );
-                self.circuits.paging_requests.remove(&call_id);
-                return;
-            }
-        };
-        info!(
-            "MSC: A1 tx PagingRequest for MO M2M call_id={} (deferred until primary AssignmentComplete)",
-            call_id.0
-        );
-        if let Err(error) = a1
-            .send_to_bsc(EncodedA1Message::from_message_for_call(
-                &cdma_ios::Message::new(cdma_ios::MessageType::PagingRequest, payload),
-                Some(call_id.0),
-            ))
+        if !self
+            .send_paging_request_to_bsc(a1, call_id, paging_request, PagePurpose::M2mSecondary)
             .await
         {
-            warn!(
-                "MSC: failed to send deferred MO M2M Paging Request call_id={}: {}",
-                call_id.0, error
-            );
             self.circuits.paging_requests.remove(&call_id);
+            return;
+        }
+        // Caller-side ringback fires at the same point as MSC's bearer-side
+        // ringback feeder (Primary AssignmentComplete) so audio and Signal
+        // IE stay in sync for MS-MS.
+        if self.config.send_tones_alert {
+            crate::media_gateway_service::send_progress_ringback(a1, call_id, &mut self.controller)
+                .await;
         }
     }
 
@@ -1273,8 +1658,134 @@ impl MscRuntime {
         }
     }
 
+    async fn handle_inbound_sip_invite(
+        &mut self,
+        a1: &dyn MscA1Endpoint,
+        session_id: String,
+        called_number: String,
+        caller_number: String,
+        offered_codecs: Vec<String>,
+    ) {
+        let Some(gateway) = self.config.media_gateway.clone() else {
+            log::warn!(
+                "MSC: inbound SIP call session={session_id} arrived with no gateway client; dropping"
+            );
+            return;
+        };
+
+        // Voice-gw already filtered to G.711; echo the first offered back.
+        let chosen_codec = offered_codecs
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "PCMU".to_string());
+
+        let lookup = self
+            .config
+            .hlr_repo
+            .get_subscriber_by_phone_number(&called_number)
+            .await;
+        let resolved = match lookup {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => {
+                info!(
+                    "MSC: inbound SIP call session={session_id} no subscriber for called={called_number}; rejecting 404"
+                );
+                let _ = gateway.inbound_reject(&session_id, 404).await;
+                return;
+            }
+            Err(error) => {
+                warn!(
+                    "MSC: inbound SIP call session={session_id} HLR lookup failed for {called_number}: {error}; rejecting 503"
+                );
+                let _ = gateway.inbound_reject(&session_id, 503).await;
+                return;
+            }
+        };
+
+        let subscriber_id = resolved.subscriber.subscriber_id;
+        if self.media_gw.is_subscriber_busy(subscriber_id) {
+            info!(
+                "MSC: inbound SIP call session={session_id} subscriber {subscriber_id} busy; rejecting 486"
+            );
+            let _ = gateway.inbound_reject(&session_id, 486).await;
+            return;
+        }
+
+        let caller_for_id = (!caller_number.is_empty()).then(|| caller_number.clone());
+        let call_id = match self.start_mt_call(a1, resolved, caller_for_id, None).await {
+            Ok(call_id) => call_id,
+            Err(error) => {
+                let sip_status = error.to_sip_status();
+                warn!(
+                    "MSC: inbound SIP call session={session_id} setup failed: {error:?}; rejecting {sip_status}"
+                );
+                let _ = gateway.inbound_reject(&session_id, sip_status).await;
+                return;
+            }
+        };
+        info!(
+            "MSC: inbound SIP call session={session_id} routed to MT call_id={} subscriber={subscriber_id}",
+            call_id.0
+        );
+        let service_option = self.config.default_voice_service_option;
+        match gateway
+            .register_inbound_session(session_id.clone(), service_option)
+            .await
+        {
+            Ok(handle) => {
+                self.media_gw.media_gateway_calls.insert(handle, call_id);
+                if let Err(error) = self.controller.attach_media_gateway_handle(call_id, handle) {
+                    warn!(
+                        "MSC: failed to attach gateway handle to inbound call_id={}: {}",
+                        call_id.0, error
+                    );
+                }
+                if self.config.inbound_sip_msc_ringback {
+                    self.media.start_inbound_ringback(
+                        call_id,
+                        handle,
+                        gateway.clone(),
+                        service_option,
+                        Some(self.config.hlr_repo.clone()),
+                        Some(called_number),
+                    );
+                }
+            }
+            Err(error) => {
+                warn!(
+                    "MSC: failed to register inbound gateway handle for call_id={}: {}",
+                    call_id.0, error
+                );
+            }
+        }
+        self.media_gw
+            .register_inbound_session(session_id, call_id, chosen_codec);
+    }
+
+    async fn handle_inbound_sip_cancel(&mut self, a1: &dyn MscA1Endpoint, session_id: String) {
+        let call_id = self
+            .media_gw
+            .inbound_by_call
+            .iter()
+            .find_map(|(cid, sid)| (*sid == session_id).then_some(*cid));
+        info!(
+            "MSC: inbound SIP CANCEL session={session_id} call_id={:?}",
+            call_id.map(|c| c.0)
+        );
+        if let Some(call_id) = call_id {
+            self.send_clear_command(a1, call_id).await;
+            // BSC may not send ClearComplete if the call never reached an
+            // established state (page failure, no MS response). Drive local
+            // cleanup directly so active_subscribers and the controller don't
+            // leak. A later ClearComplete becomes a harmless no-op.
+            self.controller.remove_call(call_id);
+            self.stop_media_for_call(call_id);
+        }
+    }
+
     fn stop_media_for_call(&mut self, call_id: CallId) {
         self.mo_call.cleanup_call(call_id);
+        self.mt_call.cleanup_call(call_id);
         stop_media_for_call(
             call_id,
             &mut self.controller,
@@ -1603,6 +2114,72 @@ mod tests {
     #[derive(Default)]
     struct StubMediaGateway {
         forwarded: std::sync::Mutex<Vec<(CallHandle, VocoderFrame)>>,
+    }
+
+    #[derive(Default)]
+    struct RecordingInboundGateway {
+        progress: std::sync::Mutex<Vec<String>>,
+        answer: std::sync::Mutex<Vec<(String, String)>>,
+        reject: std::sync::Mutex<Vec<(String, u16)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MediaGatewayClient for RecordingInboundGateway {
+        async fn create_call(
+            &self,
+            _: crate::media_gateway::CreateCallRequest,
+        ) -> Result<CallHandle, crate::media_gateway::MgwError> {
+            Err(crate::media_gateway::MgwError::Unavailable)
+        }
+        async fn answer_call(&self, _: CallHandle) -> Result<(), crate::media_gateway::MgwError> {
+            Ok(())
+        }
+        async fn release_call(
+            &self,
+            _: CallHandle,
+            _: crate::media_gateway::ReleaseCause,
+        ) -> Result<(), crate::media_gateway::MgwError> {
+            Ok(())
+        }
+        async fn forward_payload(
+            &self,
+            _: CallHandle,
+            _: VocoderFrame,
+        ) -> Result<(), crate::media_gateway::MgwError> {
+            Ok(())
+        }
+        async fn recv_event(&self) -> Option<MediaGatewayEvent> {
+            std::future::pending().await
+        }
+        async fn inbound_progress(
+            &self,
+            session_id: &str,
+        ) -> Result<(), crate::media_gateway::MgwError> {
+            self.progress.lock().unwrap().push(session_id.to_string());
+            Ok(())
+        }
+        async fn inbound_answer(
+            &self,
+            session_id: &str,
+            codec: &str,
+        ) -> Result<(), crate::media_gateway::MgwError> {
+            self.answer
+                .lock()
+                .unwrap()
+                .push((session_id.to_string(), codec.to_string()));
+            Ok(())
+        }
+        async fn inbound_reject(
+            &self,
+            session_id: &str,
+            sip_status: u16,
+        ) -> Result<(), crate::media_gateway::MgwError> {
+            self.reject
+                .lock()
+                .unwrap()
+                .push((session_id.to_string(), sip_status));
+            Ok(())
+        }
     }
 
     struct FailingMediaGateway;
@@ -2206,6 +2783,11 @@ mod tests {
             media_ringback_enabled: false,
             media_ringback_type: MediaRingbackType::Nanp,
             sip_ringback_disable: false,
+            inbound_sip_msc_ringback: false,
+            generate_ringback: true,
+            send_tones_alert: false,
+            page_retry_cooldown_ms: 1000,
+            page_retry_max_duration_ms: 60_000,
             failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: None,
@@ -2327,6 +2909,11 @@ mod tests {
             media_ringback_enabled: false,
             media_ringback_type: MediaRingbackType::Nanp,
             sip_ringback_disable: false,
+            inbound_sip_msc_ringback: false,
+            generate_ringback: true,
+            send_tones_alert: false,
+            page_retry_cooldown_ms: 1000,
+            page_retry_max_duration_ms: 60_000,
             failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: None,
@@ -2471,6 +3058,11 @@ mod tests {
             media_ringback_enabled: false,
             media_ringback_type: MediaRingbackType::Nanp,
             sip_ringback_disable: false,
+            inbound_sip_msc_ringback: false,
+            generate_ringback: true,
+            send_tones_alert: false,
+            page_retry_cooldown_ms: 1000,
+            page_retry_max_duration_ms: 60_000,
             failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: None,
@@ -2519,6 +3111,12 @@ mod tests {
             Some(call_id),
         );
         runtime.handle_bsc_a1_message(&endpoint, primary_ac).await;
+        // Drain the AlertWithInformation MSC now sends on every MT
+        // AssignmentComplete (BSC-autonomous AWIM was retired).
+        let _ = timeout(Duration::from_millis(50), client.poll_a1())
+            .await
+            .unwrap()
+            .unwrap();
 
         // Secondary leg: PagingResponse → AssignmentRequest (Secondary leg
         // now in AssignmentPending).
@@ -2597,6 +3195,153 @@ mod tests {
                 .get(&CallId(call_id))
                 .copied(),
             Some(1)
+        );
+        // MS-MS regression: secondary-leg AssignmentFailure must NOT rearm the
+        // primary engine. The setup helper already drove the Primary leg
+        // past AssignmentComplete (state Assigned, then Alerting after the
+        // MSC-emitted AWI). Either is acceptable; both leave the engine
+        // ready to accept a Connect from the callee. The bug being prevented
+        // here is rearm dropping the engine back to Paging.
+        let primary_state = runtime.controller.state(CallId(call_id));
+        assert!(
+            matches!(
+                primary_state,
+                Some(cdma_ios::CallControlState::Assigned)
+                    | Some(cdma_ios::CallControlState::Alerting)
+            ),
+            "primary leg's call-control state must be preserved after secondary-leg AssignmentFailure (was {:?})",
+            primary_state
+        );
+    }
+
+    /// SIP-inbound regression: AssignmentFailure on the **Primary** leg must
+    /// purge that leg's CircuitSession + active-leg entry, so the re-page
+    /// PagingResponse drives a fresh AssignmentRequest instead of being
+    /// deferred forever as "secondary-leg".
+    #[tokio::test]
+    async fn mt_assignment_failure_on_primary_leg_allows_repage_to_proceed() {
+        let call_id = 1004;
+        let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(8);
+        let mut runtime = MscRuntime::new(MscRuntimeConfig {
+            hlr_repo: Arc::new(StubHlrRepo),
+            smsc_repo: None,
+            welcome_sms: None,
+            sms_retry: crate::config::SmsRetryConfig::default(),
+            default_voice_service_option: 3,
+            wav_file: None,
+            gateway_fallback_to_wav: true,
+            local_answer_delay_ms: 10_000,
+            media_ringback_enabled: false,
+            media_ringback_type: MediaRingbackType::Nanp,
+            sip_ringback_disable: false,
+            inbound_sip_msc_ringback: false,
+            generate_ringback: true,
+            send_tones_alert: false,
+            page_retry_cooldown_ms: 1000,
+            page_retry_max_duration_ms: 60_000,
+            failure_tone_duration_ms: 0,
+            voice_bearer: None,
+            media_gateway: None,
+        });
+        let call_id_typed = runtime.controller.create_call_with_id(
+            CallId(call_id),
+            CallDirection::MobileTerminated,
+            Some(MobileIdentity::Imsi("12345678901".to_string())),
+        );
+        let page = paging_request();
+        runtime
+            .controller
+            .apply_from_msc(
+                call_id_typed,
+                &ProcedureMessage::PagingRequest(page.clone()),
+            )
+            .unwrap();
+        runtime.circuits.paging_requests.insert(call_id_typed, page);
+
+        // First PagingResponse → Primary AssignmentRequest. Primary leg is now
+        // in AssignmentPending — this is the exact state the BSC abandons
+        // when it hits TCH-setup teardown timeout.
+        let first_pr = EncodedA1Message::from_message_for_call(
+            &cdma_ios::Message::new(
+                cdma_ios::MessageType::PagingResponse,
+                paging_response().encode().unwrap(),
+            ),
+            Some(call_id),
+        );
+        runtime.handle_bsc_a1_message(&endpoint, first_pr).await;
+        let first_ar = timeout(Duration::from_millis(50), client.poll_a1())
+            .await
+            .expect("MSC should emit Primary AssignmentRequest")
+            .unwrap();
+        assert_eq!(
+            first_ar.message_type(),
+            cdma_ios::MessageType::AssignmentRequest
+        );
+        assert_eq!(
+            runtime
+                .circuits
+                .active_assignment_legs
+                .get(&CallId(call_id)),
+            Some(&MscVoiceLeg::Primary)
+        );
+
+        // BSC: AssignmentFailure (TCH teardown timed out).
+        runtime
+            .handle_bsc_a1_message(&endpoint, assignment_failure_msg(call_id))
+            .await;
+        let repage = timeout(Duration::from_millis(50), client.poll_a1())
+            .await
+            .expect("MSC should re-page after Primary AssignmentFailure")
+            .unwrap();
+        assert_eq!(repage.message_type(), cdma_ios::MessageType::PagingRequest);
+
+        // Primary leg state must be wiped: no lingering CircuitSession, no
+        // pending assignment, no active-leg entry. Otherwise the next
+        // PagingResponse trips the `secondary_leg` heuristic.
+        assert!(
+            !runtime
+                .circuits
+                .circuits
+                .values()
+                .any(|s| s.call_id == CallId(call_id)),
+            "Primary CircuitSession must be gone after AssignmentFailure"
+        );
+        assert!(
+            !runtime
+                .circuits
+                .has_pending_assignment_complete(CallId(call_id))
+        );
+        assert!(
+            !runtime
+                .circuits
+                .deferred_paging_responses
+                .contains_key(&CallId(call_id))
+        );
+
+        // Second PagingResponse (after the re-page) must produce a fresh
+        // AssignmentRequest, not get parked in deferred_paging_responses.
+        let second_pr = EncodedA1Message::from_message_for_call(
+            &cdma_ios::Message::new(
+                cdma_ios::MessageType::PagingResponse,
+                paging_response().encode().unwrap(),
+            ),
+            Some(call_id),
+        );
+        runtime.handle_bsc_a1_message(&endpoint, second_pr).await;
+        let second_ar = timeout(Duration::from_millis(50), client.poll_a1())
+            .await
+            .expect("MSC should emit a fresh AssignmentRequest after re-page")
+            .unwrap();
+        assert_eq!(
+            second_ar.message_type(),
+            cdma_ios::MessageType::AssignmentRequest
+        );
+        assert!(
+            !runtime
+                .circuits
+                .deferred_paging_responses
+                .contains_key(&CallId(call_id)),
+            "re-page response must not be deferred"
         );
     }
 
@@ -2716,6 +3461,11 @@ mod tests {
             media_ringback_enabled: false,
             media_ringback_type: MediaRingbackType::Nanp,
             sip_ringback_disable: false,
+            inbound_sip_msc_ringback: false,
+            generate_ringback: true,
+            send_tones_alert: false,
+            page_retry_cooldown_ms: 1000,
+            page_retry_max_duration_ms: 60_000,
             failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: None,
@@ -2834,6 +3584,11 @@ mod tests {
             media_ringback_enabled: false,
             media_ringback_type: MediaRingbackType::Nanp,
             sip_ringback_disable: false,
+            inbound_sip_msc_ringback: false,
+            generate_ringback: true,
+            send_tones_alert: false,
+            page_retry_cooldown_ms: 1000,
+            page_retry_max_duration_ms: 60_000,
             failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: None,
@@ -2894,6 +3649,11 @@ mod tests {
             media_ringback_enabled: false,
             media_ringback_type: MediaRingbackType::Nanp,
             sip_ringback_disable: false,
+            inbound_sip_msc_ringback: false,
+            generate_ringback: true,
+            send_tones_alert: false,
+            page_retry_cooldown_ms: 1000,
+            page_retry_max_duration_ms: 60_000,
             failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: Some(Arc::new(FailingMediaGateway)),
@@ -2962,6 +3722,11 @@ mod tests {
             media_ringback_enabled: true,
             media_ringback_type: MediaRingbackType::Nanp,
             sip_ringback_disable: true,
+            inbound_sip_msc_ringback: false,
+            generate_ringback: true,
+            send_tones_alert: false,
+            page_retry_cooldown_ms: 1000,
+            page_retry_max_duration_ms: 60_000,
             failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: Some(Arc::new(StubMediaGateway::default())),
@@ -3033,6 +3798,11 @@ mod tests {
             media_ringback_enabled: false,
             media_ringback_type: MediaRingbackType::Nanp,
             sip_ringback_disable: false,
+            inbound_sip_msc_ringback: false,
+            generate_ringback: true,
+            send_tones_alert: false,
+            page_retry_cooldown_ms: 1000,
+            page_retry_max_duration_ms: 60_000,
             failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: Some(gateway.clone()),
@@ -3092,6 +3862,11 @@ mod tests {
             media_ringback_enabled: false,
             media_ringback_type: MediaRingbackType::Nanp,
             sip_ringback_disable: false,
+            inbound_sip_msc_ringback: false,
+            generate_ringback: true,
+            send_tones_alert: false,
+            page_retry_cooldown_ms: 1000,
+            page_retry_max_duration_ms: 60_000,
             failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: None,
@@ -3117,5 +3892,55 @@ mod tests {
         assert_eq!(runtime.circuits.assignment_complete_circuit(call_id), None);
         assert!(runtime.circuits.pending_assignment_completes.is_empty());
         assert!(runtime.circuits.active_assignment_legs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inbound_sip_unknown_did_emits_404_reject() {
+        let (_, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
+        let gateway = Arc::new(RecordingInboundGateway::default());
+        let mut runtime = MscRuntime::new(MscRuntimeConfig {
+            hlr_repo: Arc::new(StubHlrRepo),
+            smsc_repo: None,
+            welcome_sms: None,
+            sms_retry: crate::config::SmsRetryConfig::default(),
+            default_voice_service_option: 3,
+            wav_file: None,
+            gateway_fallback_to_wav: false,
+            local_answer_delay_ms: 10_000,
+            media_ringback_enabled: false,
+            media_ringback_type: MediaRingbackType::Nanp,
+            sip_ringback_disable: false,
+            inbound_sip_msc_ringback: false,
+            generate_ringback: true,
+            send_tones_alert: false,
+            page_retry_cooldown_ms: 1000,
+            page_retry_max_duration_ms: 60_000,
+            failure_tone_duration_ms: 0,
+            voice_bearer: None,
+            media_gateway: Some(gateway.clone() as Arc<dyn MediaGatewayClient>),
+        });
+
+        runtime
+            .handle_inbound_sip_invite(
+                &endpoint,
+                "test-session".to_string(),
+                "14805551212".to_string(),
+                "13105550000".to_string(),
+                vec!["PCMU".to_string()],
+            )
+            .await;
+
+        let rejects = gateway.reject.lock().unwrap().clone();
+        assert_eq!(
+            rejects,
+            vec![("test-session".to_string(), 404u16)],
+            "unknown DID must emit inbound_reject(404)"
+        );
+        assert!(gateway.progress.lock().unwrap().is_empty());
+        assert!(gateway.answer.lock().unwrap().is_empty());
+        assert!(
+            runtime.media_gw.inbound_by_call.is_empty(),
+            "no inbound session should be tracked when DID lookup misses"
+        );
     }
 }

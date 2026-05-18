@@ -79,6 +79,16 @@ pub enum MediaGatewayEvent {
         handle: CallHandle,
         cause: ReleaseCause,
     },
+    InboundCall {
+        session_id: String,
+        called_number: String,
+        caller_number: String,
+        caller_display: String,
+        offered_codecs: Vec<String>,
+    },
+    InboundCancel {
+        session_id: String,
+    },
     /// Gateway media frame toward the mobile.
     MediaFrame {
         handle: CallHandle,
@@ -130,4 +140,26 @@ pub trait MediaGatewayClient: Send + Sync {
 
     /// Receives the next media-gateway event.
     async fn recv_event(&self) -> Option<MediaGatewayEvent>;
+
+    /// Bind the gateway-allocated inbound `session_id` to a local `CallHandle`
+    /// so MSC can drive audio toward the trunk via `forward_payload`.
+    async fn register_inbound_session(
+        &self,
+        _session_id: String,
+        _service_option: u16,
+    ) -> Result<CallHandle, MgwError> {
+        Err(MgwError::Unavailable)
+    }
+
+    async fn inbound_progress(&self, _session_id: &str) -> Result<(), MgwError> {
+        Ok(())
+    }
+
+    async fn inbound_answer(&self, _session_id: &str, _codec: &str) -> Result<(), MgwError> {
+        Ok(())
+    }
+
+    async fn inbound_reject(&self, _session_id: &str, _sip_status: u16) -> Result<(), MgwError> {
+        Ok(())
+    }
 }

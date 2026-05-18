@@ -19,10 +19,7 @@ use log::{debug, info, warn};
 use crate::addressing::{format_ms_address, is_packet_data_so};
 use crate::power_control::ForwardPowerControlState;
 
-use super::{
-    A1ClearState, Bsc, MsState, ServiceNegotiationMode, VoiceAlertMode, VoiceLegRole,
-    VoiceSessionKind,
-};
+use super::{A1ClearState, Bsc, MsState, ServiceNegotiationMode, VoiceLegRole};
 
 #[derive(Default)]
 pub(crate) struct TrafficSignalingService {
@@ -183,7 +180,6 @@ impl Bsc {
                 );
                 self.complete_service_negotiation(
                     walsh_code,
-                    ack_seq,
                     &addr,
                     "MS Ack with SERV_NEG disabled",
                 )
@@ -215,7 +211,6 @@ impl Bsc {
     async fn complete_service_negotiation(
         &mut self,
         walsh_code: u8,
-        ack_seq: u8,
         addr: &MsAddress,
         trigger: &str,
     ) {
@@ -229,95 +224,30 @@ impl Bsc {
             if let Some(packet_session_id) = replaced_packet_session {
                 self.close_packet_session_background(walsh_code, packet_session_id);
             }
-            let (
-                session_id,
-                leg_role,
-                a1_call_id,
-                should_send_assignment_complete,
-                voice_service_option,
-            ) = self
+            let (a1_call_id, should_send_assignment_complete, voice_service_option) = self
                 .mobiles
                 .get_traffic_channel(walsh_code)
                 .map(|tc| {
                     (
-                        tc.voice_session_id,
-                        tc.voice_leg_role,
                         tc.a1_call_id,
                         tc.is_service_connecting() || tc.is_waiting_ms_ack(),
                         super::traffic_forward::voice_service_option_for_channel(tc)
                             .unwrap_or(tc.service_option),
                     )
                 })
-                .unwrap_or((None, None, None, false, 3));
-            let session = session_id.and_then(|id| self.voice.session(id));
-            let session_kind = session.map(|s| s.kind);
-            let calling_party = match leg_role {
-                Some(VoiceLegRole::Callee) => session.and_then(|s| s.calling_party_record.clone()),
-                _ => None,
-            };
-            let (send_result, mode, log_label) = match (session_kind, leg_role) {
-                (_, Some(VoiceLegRole::Callee)) => (
-                    self.send_standard_alert(walsh_code, ack_seq, calling_party),
-                    Some(VoiceAlertMode::WaitForConnectOrder),
-                    "standard alert",
-                ),
-                (Some(VoiceSessionKind::MobileOriginatedExternal), Some(VoiceLegRole::Caller)) => (
-                    self.send_alert_with_info(walsh_code, ack_seq, None),
-                    Some(VoiceAlertMode::WaitForPeerAnswer),
-                    "external ringback",
-                ),
-                _ => (
-                    self.send_alert_with_info(walsh_code, ack_seq, calling_party),
-                    Some(VoiceAlertMode::WaitForPeerAnswer),
-                    "ringback",
-                ),
-            };
-            if let Err(e) = send_result {
-                warn!(
-                    "BSC: failed to send AWIM {} on walsh={} after {}: {}",
-                    log_label, walsh_code, trigger, e
+                .unwrap_or((None, false, 3));
+            if should_send_assignment_complete && let Some(call_id) = a1_call_id {
+                self.a1.send_assignment_complete(
+                    &self.mobiles,
+                    call_id,
+                    walsh_code,
+                    voice_service_option,
                 );
-            } else {
-                if should_send_assignment_complete {
-                    if let Some(call_id) = a1_call_id {
-                        self.a1.send_assignment_complete(
-                            &self.mobiles,
-                            call_id,
-                            walsh_code,
-                            voice_service_option,
-                        );
-                    }
-                }
-                info!(
-                    "BSC: sent AWIM {} on F-TCH walsh={} after {}",
-                    log_label, walsh_code, trigger
-                );
-                if let Some(tc) = self.mobiles.get_traffic_channel_mut(walsh_code) {
-                    match mode {
-                        Some(m) => tc.mark_voice_alerting(m),
-                        None => tc.mark_active(),
-                    }
-                }
-                if let Some(session_id) = session_id {
-                    if let Some(session) = self.voice.session_mut(session_id) {
-                        let party = match leg_role {
-                            Some(VoiceLegRole::Caller) => session.caller.as_mut(),
-                            Some(VoiceLegRole::Callee) => session.callee.as_mut(),
-                            None => None,
-                        };
-                        if let Some(party) = party {
-                            party.service_connected = true;
-                        }
-                    }
-                    if matches!(
-                        session_kind,
-                        Some(VoiceSessionKind::MobileOriginatedExternal)
-                    ) && leg_role == Some(VoiceLegRole::Caller)
-                    {
-                        self.note_msc_external_call_after_service_connect(session_id, walsh_code);
-                    }
-                }
             }
+            info!(
+                "BSC: voice service negotiation complete on walsh={} after {}",
+                walsh_code, trigger
+            );
         } else {
             let is_packet_data = self
                 .mobiles
@@ -612,12 +542,10 @@ impl Bsc {
                         .unwrap_or((None, None, None));
                     match (session_id, leg_role) {
                         (Some(session_id), Some(VoiceLegRole::Callee)) => {
-                            if let Err(e) = self.send_tones_off(walsh_code, ack_seq) {
-                                warn!(
-                                    "BSC: failed to send tones-off after Connect Order on walsh={}: {}",
-                                    walsh_code, e
-                                );
-                            }
+                            // MSC drives the tones-off AWIM in response to A1
+                            // Connect via `Progress{Signal=0x3F}`. BSC only
+                            // forwards air-side signaling driven by MSC.
+                            let _ = ack_seq;
                             if let Some(call_id) = a1_call_id {
                                 self.a1.send_connect(call_id);
                             }
@@ -782,14 +710,8 @@ impl Bsc {
                 walsh_code, serv_con_seq
             );
 
-            let ack_seq = event.msg_seq.unwrap_or(0);
-            self.complete_service_negotiation(
-                walsh_code,
-                ack_seq,
-                &addr,
-                "Service Connect Completion",
-            )
-            .await;
+            self.complete_service_negotiation(walsh_code, &addr, "Service Connect Completion")
+                .await;
             // Issue-tracked: F-SCH setup should send ESCAM to activate the
             // supplemental channel after service negotiation. Disabled until
             // the ESCAM encoder is validated end-to-end with a handset.

@@ -7,7 +7,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  PKG_CONFIG_PATH: /usr/local/lib/pkgconfig:/usr/local/lib/x86_64-linux-gnu/pkgconfig
 
 jobs:
   rust:
@@ -40,8 +39,6 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential \
             clang \
-            cmake \
-            git \
             libclang-dev \
             pkg-config \
             protobuf-compiler \
@@ -49,6 +46,7 @@ jobs:
             libboost-system-dev \
             libssl-dev \
             zstd \
+            libre-dev \
             libsoapysdr-dev \
             soapysdr-tools \
             libuhd-dev \
@@ -57,14 +55,6 @@ jobs:
             bladerf \
             liblimesuite-dev \
             limesuite
-
-      - name: Install Baresip re/libre
-        run: |
-          git clone --branch v4.6.0 --depth 1 https://github.com/baresip/re.git /tmp/re
-          cmake -S /tmp/re -B /tmp/re/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local
-          cmake --build /tmp/re/build -j"$(nproc)"
-          sudo cmake --install /tmp/re/build
-          sudo ldconfig
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

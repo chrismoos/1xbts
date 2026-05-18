@@ -55,6 +55,17 @@ enum VoiceGatewayCommand {
         sequence: u64,
         service_option: u16,
     },
+    InboundProgress {
+        session_id: String,
+    },
+    InboundAnswer {
+        session_id: String,
+        codec: String,
+    },
+    InboundReject {
+        session_id: String,
+        sip_status: u16,
+    },
 }
 
 pub fn spawn_voice_gateway_client(config: VoiceGatewayConfig) -> Arc<VoiceGatewayClient> {
@@ -141,6 +152,64 @@ impl MediaGatewayClient for VoiceGatewayClient {
 
     async fn recv_event(&self) -> Option<MediaGatewayEvent> {
         self.event_rx.lock().await.recv().await
+    }
+
+    async fn register_inbound_session(
+        &self,
+        session_id: String,
+        service_option: u16,
+    ) -> Result<CallHandle, MgwError> {
+        if !*self.ready_rx.borrow() {
+            return Err(MgwError::Unavailable);
+        }
+        let handle = CallHandle(self.next_handle.fetch_add(1, Ordering::Relaxed));
+        self.handles
+            .lock()
+            .map_err(|_| MgwError::Transport("voice gateway handle map poisoned".to_string()))?
+            .insert(
+                handle,
+                GatewayCallState {
+                    session_id,
+                    service_option,
+                    next_sequence: 0,
+                },
+            );
+        Ok(handle)
+    }
+
+    async fn inbound_progress(&self, session_id: &str) -> Result<(), MgwError> {
+        if !*self.ready_rx.borrow() {
+            return Err(MgwError::Unavailable);
+        }
+        self.command_tx
+            .send(VoiceGatewayCommand::InboundProgress {
+                session_id: session_id.to_string(),
+            })
+            .map_err(|_| MgwError::Unavailable)
+    }
+
+    async fn inbound_answer(&self, session_id: &str, codec: &str) -> Result<(), MgwError> {
+        if !*self.ready_rx.borrow() {
+            return Err(MgwError::Unavailable);
+        }
+        self.command_tx
+            .send(VoiceGatewayCommand::InboundAnswer {
+                session_id: session_id.to_string(),
+                codec: codec.to_string(),
+            })
+            .map_err(|_| MgwError::Unavailable)
+    }
+
+    async fn inbound_reject(&self, session_id: &str, sip_status: u16) -> Result<(), MgwError> {
+        if !*self.ready_rx.borrow() {
+            return Err(MgwError::Unavailable);
+        }
+        self.command_tx
+            .send(VoiceGatewayCommand::InboundReject {
+                session_id: session_id.to_string(),
+                sip_status,
+            })
+            .map_err(|_| MgwError::Unavailable)
     }
 }
 
@@ -317,6 +386,39 @@ async fn send_command(
             Err(TrySendError::Full(_)) => Ok(()),
             Err(TrySendError::Closed(_)) => Err("voice gateway media stream closed".to_string()),
         },
+        VoiceGatewayCommand::InboundProgress { session_id } => control_tx
+            .send(proto::MscToGatewayEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                event: Some(proto::msc_to_gateway_event::Event::InboundCallProgress(
+                    proto::InboundCallProgress { session_id },
+                )),
+            })
+            .await
+            .map_err(|_| "voice gateway control stream closed".to_string()),
+        VoiceGatewayCommand::InboundAnswer { session_id, codec } => control_tx
+            .send(proto::MscToGatewayEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                event: Some(proto::msc_to_gateway_event::Event::InboundCallAnswer(
+                    proto::InboundCallAnswer { session_id, codec },
+                )),
+            })
+            .await
+            .map_err(|_| "voice gateway control stream closed".to_string()),
+        VoiceGatewayCommand::InboundReject {
+            session_id,
+            sip_status,
+        } => control_tx
+            .send(proto::MscToGatewayEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                event: Some(proto::msc_to_gateway_event::Event::InboundCallReject(
+                    proto::InboundCallReject {
+                        session_id,
+                        sip_status: u32::from(sip_status),
+                    },
+                )),
+            })
+            .await
+            .map_err(|_| "voice gateway control stream closed".to_string()),
     }
 }
 
@@ -347,6 +449,20 @@ fn convert_gateway_event(
             Some(MediaGatewayEvent::Released {
                 handle: handle_for_session(handles, &released.session_id)?,
                 cause: release_cause_from_i32(released.reason),
+            })
+        }
+        proto::gateway_to_msc_event::Event::InboundCall(call) => {
+            Some(MediaGatewayEvent::InboundCall {
+                session_id: call.session_id,
+                called_number: call.called_number,
+                caller_number: call.caller_number,
+                caller_display: call.caller_display,
+                offered_codecs: call.offered_codecs,
+            })
+        }
+        proto::gateway_to_msc_event::Event::InboundCancel(cancel) => {
+            Some(MediaGatewayEvent::InboundCancel {
+                session_id: cancel.session_id,
             })
         }
     }

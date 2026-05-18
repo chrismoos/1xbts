@@ -44,11 +44,11 @@ impl MoCallService {
         }
     }
 
-    pub(crate) async fn resolve_mo_calling_number(
+    pub(crate) async fn resolve_mo_originator(
         &self,
         request: Option<&cdma_ios::CmServiceRequestMessage>,
         hlr_repo: &dyn cdma_hlr::repository::HlrRepository,
-    ) -> Option<String> {
+    ) -> Option<(String, uuid::Uuid)> {
         let request = request?;
         let imsi = match &request.mobile_identity_imsi {
             cdma_ios::MobileIdentity::Imsi(imsi) => Some(imsi.as_str()),
@@ -60,7 +60,10 @@ impl MoCallService {
         };
 
         match hlr_repo.resolve_by_identity(esn, imsi).await {
-            Ok(Some(resolved)) => Some(resolved.subscriber.phone_number),
+            Ok(Some(resolved)) => Some((
+                resolved.subscriber.phone_number,
+                resolved.subscriber.subscriber_id,
+            )),
             Ok(None) => None,
             Err(error) => {
                 warn!("MSC: HLR originator lookup failed for MO call: {}", error);

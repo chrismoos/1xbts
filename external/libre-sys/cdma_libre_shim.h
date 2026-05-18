@@ -7,6 +7,7 @@ struct mbuf;
 struct sa;
 struct sip;
 struct sip_keepalive;
+struct sip_msg;
 struct sipreg;
 struct sipsess;
 struct sipsess_sock;
@@ -108,6 +109,76 @@ int cdma_libre_sipsess_connect(struct sipsess **sessp,
 			       const struct cdma_libre_outbound_call *call);
 void cdma_libre_sipsess_abort(struct sipsess *sess);
 void cdma_libre_sipsess_deref(struct sipsess *sess);
+
+/* ---- Inbound SIP support ---- */
+
+/* Notifies the Rust side that an INVITE arrived. The `msg` pointer is borrowed
+ * from libre and is valid only for the duration of the callback unless the
+ * Rust side bumps its refcount with cdma_libre_sip_msg_ref(). */
+typedef void (*cdma_libre_inbound_invite_h)(void *arg,
+					    const struct sip_msg *msg);
+
+struct cdma_libre_inbound_sipsess_handlers {
+	cdma_libre_inbound_invite_h invite;
+};
+
+struct cdma_libre_inbound_sipsess_ctx {
+	const struct cdma_libre_inbound_sipsess_handlers *handlers;
+	void *arg;
+};
+
+/* Replaces cdma_libre_sipsess_listen — additionally wires the inbound INVITE
+ * callback. The ctx must outlive the returned socket. */
+int cdma_libre_sipsess_listen_with_handler(
+	struct sipsess_sock **sockp, struct sip *sip,
+	struct cdma_libre_inbound_sipsess_ctx *ctx);
+
+/* Sends a stateless final/provisional response to `msg` without creating a
+ * session. Use for early rejections (404/488/503/etc.) and the unconditional
+ * 100 Trying. */
+int cdma_libre_sip_treply(struct sip *sip, const struct sip_msg *msg,
+			  uint16_t scode, const char *reason);
+
+/* Creates a session and replies with a 1xx provisional response. `desc` is
+ * an optional SDP answer body delivered with the provisional (early media);
+ * pass NULL to send the provisional with no SDP. libre takes ownership of
+ * the mbuf. `sess_ctx` carries the post-accept handlers (close/established)
+ * and must outlive the session. */
+int cdma_libre_sipsess_accept(struct sipsess **sessp,
+			      struct sipsess_sock *sock,
+			      const struct sip_msg *msg, uint16_t scode,
+			      const char *reason, const char *contact_user,
+			      struct mbuf *desc,
+			      struct cdma_libre_sipsess_ctx *sess_ctx);
+
+/* Sends a 2xx final response with the supplied SDP answer body. */
+int cdma_libre_sipsess_answer(struct sipsess *sess, uint16_t scode,
+			      const char *reason, struct mbuf *answer);
+
+/* Sends a 1xx provisional from an accepted session (typically 180 Ringing). */
+int cdma_libre_sipsess_progress(struct sipsess *sess, uint16_t scode,
+				const char *reason);
+
+/* Sends a final 4xx/5xx/6xx rejection from an accepted-but-not-answered
+ * session. Releases the session. */
+int cdma_libre_sipsess_reject(struct sipsess *sess, uint16_t scode,
+			      const char *reason);
+
+/* Bump / drop the refcount on a sip_msg held across callback boundaries. */
+const struct sip_msg *cdma_libre_sip_msg_ref(const struct sip_msg *msg);
+void cdma_libre_sip_msg_deref(const struct sip_msg *msg);
+
+/* Accessors that copy fields out of a sip_msg into caller-owned buffers.
+ * Each returns the number of bytes written (excluding NUL) or -1 if the
+ * destination is too small. The buffer is always NUL-terminated on success. */
+int cdma_libre_sip_msg_ruri_user(const struct sip_msg *msg, char *out,
+				 size_t out_len);
+int cdma_libre_sip_msg_from_user(const struct sip_msg *msg, char *out,
+				 size_t out_len);
+int cdma_libre_sip_msg_from_display(const struct sip_msg *msg, char *out,
+				    size_t out_len);
+int cdma_libre_sip_msg_body(const struct sip_msg *msg, uint8_t *out,
+			    size_t out_len);
 
 struct mbuf *cdma_libre_mbuf_from_str(const char *value);
 void cdma_libre_mbuf_rewind(struct mbuf *mb);

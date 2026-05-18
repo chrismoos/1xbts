@@ -40,6 +40,16 @@ pub enum SipBackendEvent {
         session_id: String,
         reason: ReleaseReason,
     },
+    InboundInvite {
+        session_id: String,
+        called_number: String,
+        caller_number: String,
+        caller_display: String,
+        offered_codecs: Vec<String>,
+    },
+    InboundCancel {
+        session_id: String,
+    },
 }
 
 pub type SipBackendEventSender = mpsc::UnboundedSender<SipBackendEvent>;
@@ -90,6 +100,26 @@ pub trait SipBackend: Send + Sync + 'static {
     async fn handle_air_frame(&self, frame: AirVoiceFrame) -> Result<()>;
 
     fn subscribe_gateway_voice_frames(&self) -> broadcast::Receiver<GatewayVoiceFrame>;
+
+    async fn register_inbound_handler(&self, _events: SipBackendEventSender) -> Result<()> {
+        Ok(())
+    }
+
+    async fn inbound_progress(&self, _session_id: &str) -> Result<()> {
+        Err(SipBackendError::Unavailable(
+            "inbound SIP not available — no SIP backend configured".to_string(),
+        ))
+    }
+
+    async fn inbound_answer(&self, _session_id: &str, _codec: &str) -> Result<()> {
+        Err(SipBackendError::Unavailable(
+            "inbound SIP not available — no SIP backend configured".to_string(),
+        ))
+    }
+
+    async fn inbound_reject(&self, _session_id: &str, _sip_status: u16) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default)]

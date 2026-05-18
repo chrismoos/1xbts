@@ -19,9 +19,6 @@ fn main() {
         Ok(discovery) => {
             println!("cargo:rustc-cfg=libre_available");
             let header_capabilities = detect_header_capabilities(&discovery.include_paths);
-            if env::var_os("CARGO_FEATURE_REQUIRED").is_some() {
-                require_header_capabilities(&header_capabilities);
-            }
             compile_shim(&discovery.include_paths, &header_capabilities);
             generate_bindings(&bindings_path, &discovery.include_paths);
         }
@@ -36,33 +33,6 @@ fn main() {
             write_stub_bindings(&bindings_path);
         }
     }
-}
-
-fn require_header_capabilities(capabilities: &HeaderCapabilities) {
-    let mut missing = Vec::new();
-
-    if !capabilities.sipreg {
-        missing.push("re_sipreg.h with sipreg_alloc()");
-    }
-
-    if !capabilities.sipsess_connect_desc_handler {
-        missing.push("re_sipsess.h with sipsess_desc_h connect support");
-    }
-
-    if !capabilities.sipsess_abort {
-        missing.push("re_sipsess.h with sipsess_abort()");
-    }
-
-    if missing.is_empty() {
-        return;
-    }
-
-    panic!(
-        "native libre/re was found, but it lacks APIs required by cdma-voice-gw: {}. \
-         Install a newer libre-dev/libre build or set LIBRE_INCLUDE_DIR and LIBRE_LIB_DIR \
-         to a libre installation that provides these headers/APIs.",
-        missing.join(", ")
-    );
 }
 
 struct LibreDiscovery {

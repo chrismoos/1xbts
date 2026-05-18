@@ -741,6 +741,19 @@ impl MobileRegistry {
         })
     }
 
+    /// All `(fwd_address, walsh_code)` for an A1 call. MS-MS calls share one
+    /// call_id across both legs; routers need to disambiguate by inspecting
+    /// each TC's `voice_leg_role`.
+    pub(crate) fn all_walshes_for_a1_call(&self, call_id: u64) -> Vec<(MsAddress, u8)> {
+        self.entries
+            .iter()
+            .filter_map(|ms| {
+                ms.a1_call_walsh(call_id)
+                    .map(|walsh| (ms.fwd_address.clone(), walsh))
+            })
+            .collect()
+    }
+
     /// Resolve `(fwd_address, walsh_code)` for an MSC bearer circuit ID.
     pub(crate) fn locate_msc_circuit(&self, circuit_id: u16) -> Option<(MsAddress, u8)> {
         self.entries.iter().find_map(|ms| {

@@ -9,6 +9,11 @@
       "fallback_to_wav": true
     },
     "sip_ringback_disable": false,
+    "generate_ringback": true,
+    "send_tones_alert": false,
+    "inbound_sip_msc_ringback": true,
+    "page_retry_cooldown_ms": 1000,
+    "page_retry_max_duration_ms": 60000,
     "wav_file": "config/sample-sound.wav",
     "media_ringback_enabled": true,
     "media_ringback_type": "nanp",

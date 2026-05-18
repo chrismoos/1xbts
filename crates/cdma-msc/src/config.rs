@@ -38,6 +38,26 @@ fn default_sip_ringback_disable() -> bool {
     false
 }
 
+fn default_inbound_sip_msc_ringback() -> bool {
+    true
+}
+
+fn default_generate_ringback() -> bool {
+    true
+}
+
+fn default_send_tones_alert() -> bool {
+    false
+}
+
+fn default_page_retry_cooldown_ms() -> u64 {
+    1000
+}
+
+fn default_page_retry_max_duration_ms() -> u64 {
+    60_000
+}
+
 fn default_failure_tone_duration_ms() -> u64 {
     3000
 }
@@ -90,10 +110,30 @@ pub struct VoiceConfig {
     /// Ringback cadence to synthesize when enabled.
     #[serde(default = "default_media_ringback_type")]
     pub media_ringback_type: MediaRingbackType,
+    /// Tell the caller MS to play ringback while the callee is being alerted.
+    /// Disable to keep the caller MS silent during alerting.
+    #[serde(default = "default_generate_ringback")]
+    pub generate_ringback: bool,
+    /// When sending caller-side ringback, also emit A1 `Progress` with
+    /// `Signal{0x01 Ringback}` so the MS plays the network-instructed tone.
+    #[serde(default = "default_send_tones_alert")]
+    pub send_tones_alert: bool,
     /// Suppress MSC-side ringback for voice-gateway calls; rely on SIP early
     /// media / 200 OK instead.
     #[serde(default = "default_sip_ringback_disable")]
     pub sip_ringback_disable: bool,
+    /// Generate MSC-side ringback toward the SIP caller for inbound INVITEs
+    /// (subscriber custom ringtone if configured in HLR, synthetic NANP
+    /// otherwise). Disable to let the SIP trunk provide ringback / early media.
+    #[serde(default = "default_inbound_sip_msc_ringback")]
+    pub inbound_sip_msc_ringback: bool,
+    /// Delay between a BSC page-timeout and the next MSC paging burst, ms.
+    #[serde(default = "default_page_retry_cooldown_ms")]
+    pub page_retry_cooldown_ms: u64,
+    /// Total time MSC will retry MT paging before declaring the call failed, ms.
+    /// Must be greater than zero.
+    #[serde(default = "default_page_retry_max_duration_ms")]
+    pub page_retry_max_duration_ms: u64,
     /// Failure tone playback duration (ms) before ClearCommand; 0 disables.
     #[serde(default = "default_failure_tone_duration_ms")]
     pub failure_tone_duration_ms: u64,
@@ -128,7 +168,12 @@ impl Default for VoiceConfig {
             wav_file: None,
             media_ringback_enabled: default_media_ringback_enabled(),
             media_ringback_type: default_media_ringback_type(),
+            generate_ringback: default_generate_ringback(),
+            send_tones_alert: default_send_tones_alert(),
             sip_ringback_disable: default_sip_ringback_disable(),
+            inbound_sip_msc_ringback: default_inbound_sip_msc_ringback(),
+            page_retry_cooldown_ms: default_page_retry_cooldown_ms(),
+            page_retry_max_duration_ms: default_page_retry_max_duration_ms(),
             failure_tone_duration_ms: default_failure_tone_duration_ms(),
             answer_delay_ms: default_answer_delay_ms(),
             release_timeout_ms: default_voice_release_timeout_ms(),
@@ -161,7 +206,12 @@ pub struct VoicePolicySnapshot {
     pub media_ringback_enabled: bool,
     /// Ringback cadence to synthesize when enabled.
     pub media_ringback_type: MediaRingbackType,
+    pub generate_ringback: bool,
+    pub send_tones_alert: bool,
     pub sip_ringback_disable: bool,
+    pub inbound_sip_msc_ringback: bool,
+    pub page_retry_cooldown_ms: u64,
+    pub page_retry_max_duration_ms: u64,
     pub failure_tone_duration_ms: u64,
     /// Delay before automatic answer in local simulation paths.
     pub answer_delay_ms: u64,
@@ -266,7 +316,12 @@ impl From<VoiceConfig> for VoicePolicySnapshot {
             wav_file: value.wav_file,
             media_ringback_enabled: value.media_ringback_enabled,
             media_ringback_type: value.media_ringback_type,
+            generate_ringback: value.generate_ringback,
+            send_tones_alert: value.send_tones_alert,
             sip_ringback_disable: value.sip_ringback_disable,
+            inbound_sip_msc_ringback: value.inbound_sip_msc_ringback,
+            page_retry_cooldown_ms: value.page_retry_cooldown_ms,
+            page_retry_max_duration_ms: value.page_retry_max_duration_ms,
             failure_tone_duration_ms: value.failure_tone_duration_ms,
             answer_delay_ms: value.answer_delay_ms,
             release_timeout_ms: value.release_timeout_ms,
@@ -405,6 +460,9 @@ impl MscNodeConfig {
             return Err(
                 "msc.voice.gateway.endpoint must be set when gateway is enabled".to_string(),
             );
+        }
+        if self.voice.page_retry_max_duration_ms == 0 {
+            return Err("msc.voice.page_retry_max_duration_ms must be > 0".to_string());
         }
         Ok(())
     }

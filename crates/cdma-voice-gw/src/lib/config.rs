@@ -188,6 +188,13 @@ pub struct SipConfig {
     pub keepalive_interval_secs: u32,
     pub auth: SipAuthConfig,
     pub registration: SipRegistrationConfig,
+    /// Auto-reject inbound INVITEs with 408 if MSC hasn't decided in this many ms; 0 disables.
+    #[serde(default = "default_inbound_decision_timeout_ms")]
+    pub inbound_decision_timeout_ms: u64,
+}
+
+fn default_inbound_decision_timeout_ms() -> u64 {
+    30_000
 }
 
 impl Default for SipConfig {
@@ -202,6 +209,7 @@ impl Default for SipConfig {
             keepalive_interval_secs: 0,
             auth: SipAuthConfig::default(),
             registration: SipRegistrationConfig::default(),
+            inbound_decision_timeout_ms: default_inbound_decision_timeout_ms(),
         }
     }
 }

@@ -203,6 +203,24 @@ impl MscCallController {
             .apply(ProcedureDirection::MscToBsc, message)?)
     }
 
+    /// Reset the call-control engine to post-PagingRequest so a fresh
+    /// PagingResponse is accepted.
+    pub fn rearm_for_repage(
+        &mut self,
+        call_id: CallId,
+        paging_request: &ProcedureMessage,
+    ) -> Result<(), CallControlError> {
+        let session = self
+            .calls
+            .get_mut(&call_id)
+            .ok_or(CallControlError::UnknownCall(call_id))?;
+        session.engine = ProcedureEngine::new();
+        session
+            .engine
+            .apply(ProcedureDirection::MscToBsc, paging_request)?;
+        Ok(())
+    }
+
     /// Removes a call session once higher layers are done with it.
     pub fn remove_call(&mut self, call_id: CallId) -> Option<CallSessionSnapshot> {
         self.calls

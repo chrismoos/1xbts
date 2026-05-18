@@ -898,7 +898,7 @@ async fn mt_voice_on_existing_so33_uses_traffic_service_negotiation() {
         "SO33 packet connection stays primary"
     );
     assert_eq!(tc.voice_service_option, Some(SERVICE_OPTION_EVRC_A));
-    assert_eq!(tc.voice_connection_ref, Some(0));
+    assert_eq!(tc.voice_connection_ref, Some(1));
     assert_eq!(tc.voice_service_ref_id, Some(2));
     assert!(matches!(
         tc.channel_state,
@@ -920,7 +920,7 @@ async fn mt_voice_on_existing_so33_uses_traffic_service_negotiation() {
         .map(|connection| connection.service_option)
         .collect();
     assert_eq!(service_options, vec![SERVICE_OPTION_EVRC_A]);
-    assert_eq!(cfg.connections[0].con_ref, 0);
+    assert_eq!(cfg.connections[0].con_ref, 1);
     assert_eq!(cfg.connections[0].sr_id, 2);
 }
 
@@ -1250,6 +1250,47 @@ async fn mt_callee_connected_bearer_frames_are_forwarded() {
         tc.last_forward_enqueue_at.is_some(),
         "connected bearer media should be forwarded after answer"
     );
+}
+
+#[tokio::test]
+async fn legacy_service_option_negotiation_sends_accept_order_after_bs_ack() {
+    let (mut bsc, mut traffic_rx, walsh_code) =
+        test_bsc_with_active_traffic_channel(SERVICE_OPTION_EVRC_A).await;
+    while traffic_rx.try_recv().is_ok() {}
+
+    {
+        let tc = bsc.mobiles[0]
+            .find_traffic_channel_by_walsh_mut(walsh_code)
+            .expect("traffic channel should exist");
+        tc.service_negotiation_mode = ServiceNegotiationMode::ServiceOptionNegotiation;
+        tc.origination_service_option = Some(SERVICE_OPTION_EVRC_A);
+        tc.service_option = SERVICE_OPTION_EVRC_A;
+        tc.mark_waiting_ms_ack();
+    }
+
+    bsc.advance_waiting_ms_ack(walsh_code, 0, "Power Measurement Report Message")
+        .await;
+
+    let event = traffic_rx
+        .recv()
+        .await
+        .expect("Service Option Response Order should emit a traffic event");
+    let order = event
+        .order
+        .as_ref()
+        .expect("traffic event should carry an Order Message");
+    assert_eq!(order.order, 0b010100);
+    assert_eq!(order.ordq, 0);
+    assert_eq!(
+        order
+            .forward_detail()
+            .expect("Service Option Response Order should parse"),
+        lac::paging_messages::ForwardOrderDetail::ServiceOptionResponse {
+            service_option: SERVICE_OPTION_EVRC_A
+        }
+    );
+    assert_eq!(event.mcsb.ack_seq, 0);
+    assert!(event.mcsb.ack_req);
 }
 
 #[tokio::test]

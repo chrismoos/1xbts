@@ -842,6 +842,10 @@ impl Bsc {
                 if let Some(addr) = caller_addr {
                     self.begin_voice_release(&addr, 0b111, "voice page failure");
                 }
+                // A.S0014 cause 0x6E = "Paging response not received".
+                if let Some(call_id) = pending.a1_call_id {
+                    self.a1.send_clear_request(call_id, 0x6E);
+                }
                 self.voice
                     .retain_sessions(|session| session.id != pending.session_id);
                 self.publish_mobiles();
@@ -946,6 +950,10 @@ impl Bsc {
                     .map(|ms| ms.fwd_address.clone());
                 if let Some(addr) = caller_addr {
                     self.begin_voice_release(&addr, 0b111, "voice page timeout");
+                }
+                // A.S0014 cause 0x6E = "Paging response not received".
+                if let Some(call_id) = pending.a1_call_id {
+                    self.a1.send_clear_request(call_id, 0x6E);
                 }
                 self.voice
                     .retain_sessions(|session| session.id != pending.session_id);

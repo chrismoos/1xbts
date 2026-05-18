@@ -15,6 +15,7 @@ pub mod media_gateway;
 pub mod media_gateway_service;
 pub mod mo_call;
 pub mod mt_call;
+pub mod mt_page_retry;
 pub mod runtime;
 pub(crate) mod sms;
 pub mod voice_gateway_client;

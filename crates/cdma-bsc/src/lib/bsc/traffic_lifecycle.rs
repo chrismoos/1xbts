@@ -8,7 +8,7 @@ use log::{info, warn};
 
 use crate::addressing::format_ms_address;
 
-use super::{A1ClearState, Bsc, MobileStation, MsState, TrafficChannelInfo};
+use super::{A1ClearState, Bsc, ChannelState, MobileStation, MsState, TrafficChannelInfo};
 
 #[derive(Default)]
 pub(crate) struct TrafficLifecycleService;
@@ -88,6 +88,18 @@ impl Bsc {
             .find_traffic_channel_by_walsh(walsh_code)
             .map(|tc| tc.state_label())
             .unwrap_or("?");
+        // Pre-AC states (mirrors the AC-send guard in traffic_signaling).
+        let pre_assignment_complete =
+            ms.find_traffic_channel_by_walsh(walsh_code)
+                .is_some_and(|tc| {
+                    matches!(
+                        tc.channel_state,
+                        ChannelState::Assigned { .. }
+                            | ChannelState::WaitingMsAck { .. }
+                            | ChannelState::WaitingServiceResponse { .. }
+                            | ChannelState::ServiceConnecting { .. }
+                    )
+                });
         let addr = ms.fwd_address.clone();
 
         info!(
@@ -148,6 +160,16 @@ impl Bsc {
         if let Some(call_id) = tc.a1_call_id {
             if matches!(tc.a1_clear_state, A1ClearState::ClearCommandReceived) {
                 self.a1.send_clear_complete(call_id, false);
+            } else if pre_assignment_complete
+                && !self
+                    .pending_a1_failure_after_release
+                    .iter()
+                    .any(|(stash_addr, _)| stash_addr == &addr)
+            {
+                info!(
+                    "BSC: A1 tx AssignmentFailure call_id={call_id} after teardown (no prior AC)"
+                );
+                self.a1.send_assignment_failure(call_id, 0x16);
             }
         }
 

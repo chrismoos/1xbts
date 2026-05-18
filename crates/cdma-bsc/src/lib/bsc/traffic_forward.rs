@@ -24,10 +24,7 @@ use crate::addressing::{format_ms_address, is_packet_data_so};
 use cdma_common::sch::Rc3FschProfile;
 
 use super::traffic_bearer::send_forward_fch_bits_with_bearer_client;
-use super::{
-    Bsc, MsState, VOICE_REPLACEMENT_CON_REF, VOICE_TRAFFIC_CON_REF, VOICE_TRAFFIC_SR_ID,
-    VoiceLegRole,
-};
+use super::{Bsc, MsState, VOICE_TRAFFIC_CON_REF, VOICE_TRAFFIC_SR_ID, VoiceLegRole};
 
 const FSCH_ESCAM_START_DELAY_FRAMES: u64 = 12;
 // C.S0017-0-2.10 RLP Type 3 BLOB:
@@ -72,10 +69,12 @@ impl Bsc {
             .mobiles
             .get_traffic_channel(walsh_code)
             .ok_or("no traffic channel for service configuration")?;
+        // Voice-over-packet: omit the packet CON_REF to delete it per
+        // C.S0005-E §3.7.2.3.2.4.4.
         if let Some(voice_so) = tc.voice_service_option {
             if is_packet_data_so(tc.service_option) {
                 return Ok(vec![ServiceConnectConnectionRecord {
-                    con_ref: tc.voice_connection_ref.unwrap_or(VOICE_REPLACEMENT_CON_REF),
+                    con_ref: tc.voice_connection_ref.unwrap_or(VOICE_TRAFFIC_CON_REF),
                     service_option: voice_so,
                     for_traffic: 1,
                     rev_traffic: 1,
@@ -139,11 +138,7 @@ impl Bsc {
                 return Err::<(), Error>("traffic channel is releasing".into());
             }
             tc.voice_service_option = Some(voice_service_option);
-            tc.voice_connection_ref = Some(if is_packet_data_so(tc.service_option) {
-                VOICE_REPLACEMENT_CON_REF
-            } else {
-                VOICE_TRAFFIC_CON_REF
-            });
+            tc.voice_connection_ref = Some(VOICE_TRAFFIC_CON_REF);
             tc.voice_service_ref_id = Some(VOICE_TRAFFIC_SR_ID);
             tc.voice_session_id = Some(session_id);
             tc.voice_leg_role = Some(leg_role);

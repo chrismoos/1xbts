@@ -299,19 +299,22 @@ impl Bsc {
     // Voice call signaling
     // -----------------------------------------------------------------------
 
-    /// Send AWIM ringback on the F-TCH (C.S0005-E 3.7.3.3.2.3).
+    /// Send AWIM on F-TCH (C.S0005-E 3.7.3.3.2.3) without a Signal IE. Use
+    /// `send_alert_with_info_signal` to embed a tone.
     pub(crate) fn send_alert_with_info(
         &mut self,
         walsh_code: u8,
         ack_seq: u8,
         calling_party: Option<CallingPartyNumberRecord>,
     ) -> Result<(), Error> {
-        let mut awim = AlertWithInformationMessage::ringback();
-        awim.calling_party = calling_party.map(sanitize_record);
+        let awim = AlertWithInformationMessage {
+            signal_info: None,
+            calling_party: calling_party.map(sanitize_record),
+        };
         let sdu = awim.to_ftch_sdu();
 
         info!(
-            "BSC: sending Alert With Information (ringback) on F-TCH walsh={} ack_seq={}",
+            "BSC: sending Alert With Information on F-TCH walsh={} ack_seq={}",
             walsh_code, ack_seq
         );
 
@@ -544,14 +547,8 @@ impl Bsc {
             return;
         }
         if !voice_connected {
-            if let Err(e) = self.send_tones_off(walsh_code, 0b111) {
-                warn!(
-                    "BSC: failed to send tones-off for MSC bearer circuit_id={} walsh={}: {}",
-                    frame.circuit_id, walsh_code, e
-                );
-                self.begin_voice_release(&fwd_address, 0b111, "failed tones-off for MSC bearer");
-                return;
-            }
+            // Mark connected; tones-off is MSC-driven (Progress{Signal=0x3F}
+            // on Connect).
             self.mobiles.update_tc(walsh_code, |_, tc| {
                 tc.mark_voice_connected(true);
             });
@@ -665,15 +662,22 @@ impl Bsc {
             warn!("BSC: page already in progress — cannot queue voice page");
             return;
         }
-        let Some((page_address, pgslot, slot_cycle_index)) =
-            self.mobiles.get(fwd_address).and_then(|ms| {
+        // Page-from-unregistered IMSI falls back to SCI=0 (non-slotted: MS
+        // listens every slot) so we don't need a registered PGSLOT.
+        let (page_address, pgslot, slot_cycle_index) = self
+            .mobiles
+            .get(fwd_address)
+            .and_then(|ms| {
                 ms.page_address()
                     .map(|p| (p, ms.pgslot, ms.slot_cycle_index))
             })
-        else {
-            warn!("BSC: mobile has no pageable address for voice page");
-            return;
-        };
+            .unwrap_or_else(|| {
+                (
+                    cdma_common::lac::paging_messages::MsPageAddress::from(fwd_address),
+                    None,
+                    0,
+                )
+            });
         let fwd_address = fwd_address.clone();
         self.mobiles.set_state(&fwd_address, MsState::Paged);
         let timeout = Duration::from_millis(DEFAULT_PAGE_TIMEOUT_MS);

@@ -22,13 +22,21 @@ use crate::runtime::MscA1Endpoint;
 pub(crate) struct MtCallService {
     /// Locally-staged MT call plans, keyed by A1 Tag.
     pub(crate) mt_plans: HashMap<u32, MtCallPlan>,
+    /// Caller-ID digits per active MT call. Outlives `mt_plans`; read at
+    /// AssignmentComplete to build the AWI calling-party record.
+    pub(crate) caller_numbers: HashMap<CallId, String>,
 }
 
 impl MtCallService {
     pub(crate) fn new() -> Self {
         Self {
             mt_plans: HashMap::new(),
+            caller_numbers: HashMap::new(),
         }
+    }
+
+    pub(crate) fn cleanup_call(&mut self, call_id: CallId) {
+        self.caller_numbers.remove(&call_id);
     }
 
     pub(crate) async fn send_assignment_request_for_paging_response(
@@ -56,6 +64,9 @@ impl MtCallService {
         } else {
             mt_plan.as_ref().and_then(|p| p.caller_number.clone())
         };
+        if let Some(digits) = caller_number.as_ref() {
+            self.caller_numbers.insert(call_id, digits.clone());
+        }
         let audio_file = mt_plan.as_ref().and_then(|p| p.audio_file.clone());
         let service_option = mt_plan
             .as_ref()
@@ -202,7 +213,7 @@ impl MtCallService {
 /// the AWIM Calling Party Number record (C.S0005-E §3.7.5.3). If the caller
 /// has a subscriber row in HLR, use their configured NUMBER_TYPE /
 /// NUMBER_PLAN; otherwise fall back to network-specific / ISDN-E.164.
-async fn build_calling_party_ms_information_records(
+pub(crate) async fn build_calling_party_ms_information_records(
     caller_number: Option<&str>,
     hlr_repo: &Arc<dyn HlrRepository>,
 ) -> Option<MsInformationRecords> {

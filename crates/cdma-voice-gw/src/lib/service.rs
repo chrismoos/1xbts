@@ -89,6 +89,13 @@ impl VoiceGateway for VoiceGatewayService {
         let sip_outbound_tx = outbound_tx.clone();
         let logging = self.logging.clone();
 
+        if let Err(error) = sip_backend
+            .register_inbound_handler(sip_event_tx.clone())
+            .await
+        {
+            log::warn!("VoiceGW failed to register inbound SIP handler: {error}");
+        }
+
         tokio::spawn(async move {
             while let Some(event) = sip_event_rx.recv().await {
                 if logging.control_events {
@@ -253,6 +260,22 @@ async fn handle_control_event(
                 }))
                 .await;
         }
+        Some(MscEvent::InboundCallProgress(p)) => {
+            if let Err(err) = sip_backend.inbound_progress(&p.session_id).await {
+                log::warn!("VoiceGW inbound_progress({}) failed: {}", p.session_id, err);
+            }
+        }
+        Some(MscEvent::InboundCallAnswer(a)) => {
+            if let Err(err) = sip_backend.inbound_answer(&a.session_id, &a.codec).await {
+                log::warn!("VoiceGW inbound_answer({}) failed: {}", a.session_id, err);
+            }
+        }
+        Some(MscEvent::InboundCallReject(r)) => {
+            let sip_status = u16::try_from(r.sip_status).unwrap_or(503);
+            if let Err(err) = sip_backend.inbound_reject(&r.session_id, sip_status).await {
+                log::warn!("VoiceGW inbound_reject({}) failed: {}", r.session_id, err);
+            }
+        }
         None => {
             log::warn!("received empty VoiceGW control event from MSC");
         }
@@ -271,6 +294,17 @@ fn describe_msc_event(event: &MscToGatewayEvent) -> String {
             "ReleaseCall session={} reason={:?}",
             release.session_id,
             ReleaseReason::try_from(release.reason).unwrap_or(ReleaseReason::Unspecified)
+        ),
+        Some(MscEvent::InboundCallProgress(p)) => {
+            format!("InboundCallProgress session={}", p.session_id)
+        }
+        Some(MscEvent::InboundCallAnswer(a)) => format!(
+            "InboundCallAnswer session={} codec={}",
+            a.session_id, a.codec
+        ),
+        Some(MscEvent::InboundCallReject(r)) => format!(
+            "InboundCallReject session={} sip_status={}",
+            r.session_id, r.sip_status
         ),
         None => "Empty".to_string(),
     }
@@ -295,6 +329,18 @@ fn describe_gateway_event(event: &SipBackendEvent) -> String {
         } => format!("Failed session={session_id} sip_status={sip_status:?} reason={reason}"),
         SipBackendEvent::Released { session_id, reason } => {
             format!("Released session={session_id} reason={reason:?}")
+        }
+        SipBackendEvent::InboundInvite {
+            session_id,
+            called_number,
+            caller_number,
+            caller_display,
+            offered_codecs,
+        } => format!(
+            "InboundInvite session={session_id} called={called_number} from=\"{caller_display}\" <{caller_number}> codecs={offered_codecs:?}"
+        ),
+        SipBackendEvent::InboundCancel { session_id } => {
+            format!("InboundCancel session={session_id}")
         }
     }
 }
@@ -345,6 +391,22 @@ fn sip_backend_event_to_gateway_event(event: SipBackendEvent) -> GatewayToMscEve
                 session_id,
                 reason: reason as i32,
             })
+        }
+        SipBackendEvent::InboundInvite {
+            session_id,
+            called_number,
+            caller_number,
+            caller_display,
+            offered_codecs,
+        } => GatewayEvent::InboundCall(crate::proto::GatewayInboundCall {
+            session_id,
+            called_number,
+            caller_number,
+            caller_display,
+            offered_codecs,
+        }),
+        SipBackendEvent::InboundCancel { session_id } => {
+            GatewayEvent::InboundCancel(crate::proto::GatewayInboundCancel { session_id })
         }
     };
 
