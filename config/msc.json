@@ -23,7 +23,7 @@
   },
   "welcome_sms": {
     "enabled": true,
-    "text": "Welcome to 1xBTS! You are now connected to a live CDMA2000 1X base station. Enjoy your stay on the network.",
+    "text": "Welcome! You are now connected to a live CDMA2000 1X base station. Enjoy your stay on the network.",
     "originating_number": "0000",
     "inactive_days_threshold": 30
   },
