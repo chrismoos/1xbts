@@ -5,8 +5,8 @@ use cdma_common::lac::{
     MessageControlStatusBlock,
     message_types::MessageId,
     paging_messages::{
-        AlertWithInformationMessage, ForwardDataBurstMessage, MsAddress, OrderMessage,
-        ServiceConnectParams, ServiceRequestParams,
+        AlertWithInformationMessage, ForwardDataBurstMessage, ForwardOrderDetail, MsAddress,
+        OrderMessage, ServiceConnectParams, ServiceRequestParams,
     },
 };
 use cdma_common::sms as air_sms;
@@ -38,6 +38,14 @@ pub struct TrafficEvent {
     pub voice_call_state: Option<String>,
 }
 
+pub(crate) fn forward_order_display_name(message: &OrderMessage) -> &'static str {
+    match message.forward_detail() {
+        Ok(ForwardOrderDetail::ServiceOptionRequest { .. }) => "Service Option Request",
+        Ok(ForwardOrderDetail::ServiceOptionResponse { .. }) => "Service Option Response",
+        _ => forward_order_name(message.order),
+    }
+}
+
 pub(crate) fn traffic_event_l3_summary(
     msg_id: MessageId,
     order: &Option<OrderMessage>,
@@ -45,14 +53,11 @@ pub(crate) fn traffic_event_l3_summary(
     alert_with_info: &Option<AlertWithInformationMessage>,
 ) -> Option<String> {
     if let Some(message) = order.as_ref() {
+        let order_name = forward_order_display_name(message);
         Some(if message.ordq == 0 {
-            forward_order_name(message.order).to_string()
+            order_name.to_string()
         } else {
-            format!(
-                "{} | ORDQ={}",
-                forward_order_name(message.order),
-                message.ordq
-            )
+            format!("{} | ORDQ={}", order_name, message.ordq)
         })
     } else if msg_id == MessageId::ServiceConnect {
         Some("Service Connect Message".to_string())

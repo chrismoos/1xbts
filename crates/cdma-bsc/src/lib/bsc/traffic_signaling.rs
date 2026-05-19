@@ -7,6 +7,7 @@
 use std::time::Instant;
 
 use cdma_common::access::AccessMessage;
+use cdma_common::error::Error;
 use cdma_common::events::AccessChannelEvent;
 use cdma_common::formatting::reverse_order_name;
 use cdma_common::lac::{
@@ -175,13 +176,22 @@ impl Bsc {
                 self.teardown_traffic_channel(walsh_code).await;
             } else {
                 info!(
-                    "BSC: SERV_NEG disabled on walsh={}; accepting implicit SO{} on MS Ack without Service Connect",
+                    "BSC: SERV_NEG disabled on walsh={}; accepting SO{} with Service Option Response Order",
                     walsh_code, service_option
                 );
+                if let Err(e) =
+                    self.send_service_option_response_order(walsh_code, ack_seq, service_option)
+                {
+                    warn!(
+                        "BSC: failed to send Service Option Response Order on walsh={}: {}",
+                        walsh_code, e
+                    );
+                    return;
+                }
                 self.complete_service_negotiation(
                     walsh_code,
                     &addr,
-                    "MS Ack with SERV_NEG disabled",
+                    "Service Option Response Order with SERV_NEG disabled",
                 )
                 .await;
             }
@@ -206,6 +216,33 @@ impl Bsc {
                 tc.mark_service_connecting();
             });
         }
+    }
+
+    fn send_service_option_response_order(
+        &mut self,
+        walsh_code: u8,
+        ack_seq: u8,
+        service_option: u16,
+    ) -> Result<(), Error> {
+        let order_msg = OrderMessage {
+            order: 0b010100,
+            ordq: 0,
+            order_specific_fields: service_option.to_be_bytes().to_vec(),
+        };
+        let sdu = order_msg.to_ftch_sdu();
+
+        self.send_traffic_signaling(
+            walsh_code,
+            sdu,
+            MessageId::Order,
+            ack_seq,
+            true,
+            Some(order_msg),
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     async fn complete_service_negotiation(
@@ -248,6 +285,9 @@ impl Bsc {
                 "BSC: voice service negotiation complete on walsh={} after {}",
                 walsh_code, trigger
             );
+            if let Some(tc) = self.mobiles.get_traffic_channel_mut(walsh_code) {
+                tc.mark_active();
+            }
         } else {
             let is_packet_data = self
                 .mobiles

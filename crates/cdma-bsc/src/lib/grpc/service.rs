@@ -44,6 +44,7 @@ use super::pdsn_management_proto::{
 use super::proto;
 use super::proto::bsc_service_server::{BscService, BscServiceServer};
 use super::state::BscState;
+use crate::bsc::traffic_events::forward_order_display_name;
 use crate::bsc::{DataCallRequest, PagingEvent, TrafficEvent, TrafficPowerOverrideAction};
 use crate::config::MtlsConfig;
 use crate::power_control::TrafficChannelPowerSnapshot;
@@ -614,7 +615,7 @@ fn to_proto_traffic_event(ev: &TrafficEvent) -> proto::TrafficEvent {
         Some(proto::traffic_event::Body::Order(proto::PagingOrder {
             order: order.order as u32,
             ordq: order.ordq as u32,
-            order_name: forward_order_name(order.order).to_string(),
+            order_name: forward_order_display_name(order).to_string(),
         }))
     } else if let Some(sr) = ev.service_request.as_ref() {
         let (so, for_mux, rev_mux, for_rc, rev_rc) = sr

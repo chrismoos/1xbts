@@ -1253,7 +1253,7 @@ async fn mt_callee_connected_bearer_frames_are_forwarded() {
 }
 
 #[tokio::test]
-async fn legacy_service_option_negotiation_sends_accept_order_after_bs_ack() {
+async fn legacy_service_option_negotiation_sends_one_accept_order_after_bs_ack() {
     let (mut bsc, mut traffic_rx, walsh_code) =
         test_bsc_with_active_traffic_channel(SERVICE_OPTION_EVRC_A).await;
     while traffic_rx.try_recv().is_ok() {}
@@ -1291,6 +1291,17 @@ async fn legacy_service_option_negotiation_sends_accept_order_after_bs_ack() {
     );
     assert_eq!(event.mcsb.ack_seq, 0);
     assert!(event.mcsb.ack_req);
+    assert_eq!(
+        bsc.mobiles[0]
+            .find_traffic_channel_by_walsh(walsh_code)
+            .expect("traffic channel should exist")
+            .state_label(),
+        "Active"
+    );
+    assert!(
+        traffic_rx.try_recv().is_err(),
+        "legacy SO acceptance should emit exactly one Service Option Response Order"
+    );
 }
 
 #[tokio::test]

@@ -1,5 +1,7 @@
 # HEAD 
 
+- Legacy IS-95 voice calls complete setup by sending a single Service Option
+  Response and labeling it correctly in traffic events.
 - Inbound SIP: the voice gateway accepts trunk `INVITE`s and routes them
   to subscribers by matching the Request-URI user against
   `subscriber.phone_number`. Unknown → 404, not registered → 480, busy →
