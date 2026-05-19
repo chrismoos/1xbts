@@ -981,9 +981,7 @@ mod tests {
         let mut controller = MscCallController::new();
         let handle = register_call(&mut svc, &mut controller);
         fire_failed(&mut svc, &a1, &mut controller, handle, 403).await;
-        // Even if the gateway re-emits Failed (or sends Released after Failed),
-        // we must not double-Clear. The handle has been removed; re-register
-        // manually for the second fire to reach the arm.
+        // Re-register the handle to exercise duplicate failure suppression.
         svc.media_gateway_calls.insert(
             handle,
             controller.snapshot(CallId(1)).map(|s| s.id).unwrap(),
@@ -998,9 +996,7 @@ mod tests {
 
     #[test]
     fn signal_busy_for_all_failure_causes() {
-        // Per the comment on `signal_for_cause`, every SIP failure currently
-        // maps to Busy (0x04) since most handsets ignore the other Tone-group
-        // signals. If we ever resurrect per-cause tones we'll need to revisit.
+        // Most handsets ignore other Tone-group signals; keep failures Busy.
         for status in [403_u32, 404, 408, 480, 486, 487, 500, 503, 600] {
             let cause = gateway_clear_cause(ReleaseCause::SipFailure, Some(status));
             assert_eq!(

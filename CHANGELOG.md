@@ -1,5 +1,7 @@
 # HEAD 
 
+- Access-channel probe defaults use higher initial and nominal power for SDRs
+  with lower RX sensitivity.
 - Legacy IS-95 voice calls complete setup by sending a single Service Option
   Response and labeling it correctly in traffic events.
 - Inbound SIP: the voice gateway accepts trunk `INVITE`s and routes them

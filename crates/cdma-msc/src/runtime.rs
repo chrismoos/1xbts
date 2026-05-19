@@ -989,9 +989,7 @@ impl MscRuntime {
                     call_id,
                     &cdma_ios::ProcedureMessage::ClearComplete(clear_complete),
                 ) {
-                    // Common when MSC drove a local cleanup (SIP cancel / page-hunt
-                    // give-up) before BSC's ClearComplete arrived — controller has
-                    // already dropped the call. Benign.
+                    // ClearComplete may arrive after MSC-local cleanup.
                     log::debug!(
                         "MSC: ClearComplete for call_id={} not applied (already cleaned up): {}",
                         call_id.0,
