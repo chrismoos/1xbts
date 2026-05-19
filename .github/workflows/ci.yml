@@ -46,7 +46,6 @@ jobs:
             libboost-system-dev \
             libssl-dev \
             zstd \
-            libre-dev \
             libsoapysdr-dev \
             soapysdr-tools \
             libuhd-dev \
@@ -55,6 +54,14 @@ jobs:
             bladerf \
             liblimesuite-dev \
             limesuite
+
+      - name: Build libre from upstream
+        run: |
+          git clone --depth 1 --branch v4.6.0 https://github.com/baresip/re.git /tmp/re
+          cmake -S /tmp/re -B /tmp/re/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build /tmp/re/build -j"$(nproc)"
+          sudo cmake --install /tmp/re/build
+          sudo ldconfig
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
