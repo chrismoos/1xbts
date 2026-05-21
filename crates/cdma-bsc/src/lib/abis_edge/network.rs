@@ -675,6 +675,9 @@ impl NetworkBtsControlClient {
             decoded_l3.for_supported_rcs(),
             decoded_l3.rev_supported_rcs(),
         );
+        let data_burst_info = decoded_l3
+            .data_burst_fields()
+            .map(|(bt, mn, nm, f)| (bt, mn, nm, f.to_vec()));
 
         let msg_type_name = cdma_common::access::access_message_type_name(raw_msg_type).to_string();
 
@@ -709,10 +712,10 @@ impl NetworkBtsControlClient {
             mob_p_rev,
             slot_cycle_index,
             scm,
-            burst_type: None,
-            data_burst_fields: None,
-            data_burst_num_msgs: None,
-            data_burst_msg_number: None,
+            burst_type: data_burst_info.as_ref().map(|(bt, _, _, _)| *bt),
+            data_burst_fields: data_burst_info.as_ref().map(|(_, _, _, f)| f.clone()),
+            data_burst_num_msgs: data_burst_info.as_ref().map(|(_, _, nm, _)| *nm),
+            data_burst_msg_number: data_burst_info.as_ref().map(|(_, mn, _, _)| *mn),
             wall_clock_us: now.timestamp_micros() as u64,
             rx_wall_time: Some(std::time::Instant::now()),
             rx_hw_time_ns: None,
@@ -916,6 +919,8 @@ impl NetworkBtsControlClient {
 mod tests {
     use super::*;
     use cdma_abis::control::typed::{AirInterfaceMessagePayload, CdmaServingOneWayDelay};
+    use cdma_common::access::AccessMessage;
+    use cdma_common::lac::message_types::MessageId;
 
     fn test_config() -> NetworkClientConfig {
         NetworkClientConfig {
@@ -987,6 +992,47 @@ mod tests {
         let err = NetworkBtsControlClient::ach_to_access_event(&ach, &test_config()).unwrap_err();
 
         assert!(err.contains("access Layer 3 decode failed"));
+    }
+
+    #[test]
+    fn ach_to_access_event_populates_reverse_access_dbm_fields() {
+        let reverse_access_dbm_pdu = vec![
+            0x43, 0x71, 0x92, 0x74, 0x87, 0x40, 0x9d, 0xfc, 0x43, 0x1e, 0x30, 0xd6, 0x88, 0xde,
+            0x00, 0x1a, 0x00, 0x21, 0x80, 0x8f, 0x80, 0x00, 0x01, 0x08, 0x01, 0x02, 0x02, 0x00,
+            0x95, 0x55, 0x40, 0x03, 0x00, 0x80, 0x04, 0x07, 0x80, 0x01, 0x90, 0x0f, 0xa0, 0x00,
+            0x82, 0x88, 0x0f, 0x66, 0x78, 0x20, 0x05, 0x00, 0xa0, 0x00,
+        ];
+        let ach = AchMessageTransferMessage {
+            correlation_id: None,
+            mobile_identities: Vec::new(),
+            cell_identifier: None,
+            bts_l2_termination: None,
+            air_interface_message: Some(AirInterfaceMessagePayload {
+                message_type: 0x03,
+                message: reverse_access_dbm_pdu,
+            }),
+            cdma_serving_one_way_delay: CdmaServingOneWayDelay {
+                cell: CellId { cell: 1, sector: 0 },
+                delay_100ns: 0,
+            },
+            authentication_challenge_parameter: None,
+        };
+
+        let event = NetworkBtsControlClient::ach_to_access_event(&ach, &test_config())
+            .expect("reverse access channel DBM should decode");
+
+        assert_eq!(event.message_id, MessageId::DataBurst);
+        assert_eq!(event.burst_type, Some(3));
+        assert_eq!(event.data_burst_num_msgs, Some(1));
+        assert_eq!(event.data_burst_msg_number, Some(1));
+        assert_eq!(
+            event.data_burst_fields.as_ref().map(|fields| fields.len()),
+            Some(31)
+        );
+        assert!(matches!(
+            event.decoded_l3,
+            Some(AccessMessage::DataBurst(_))
+        ));
     }
 }
 

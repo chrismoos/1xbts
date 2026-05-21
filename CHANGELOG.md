@@ -1,5 +1,6 @@
 # HEAD 
 
+- Reverse access-channel SMS Data Burst messages are now handled by the BSC.
 - Access-channel probe defaults use higher initial and nominal power for SDRs
   with lower RX sensitivity.
 - Legacy IS-95 voice calls complete setup by sending a single Service Option
