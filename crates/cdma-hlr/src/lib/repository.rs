@@ -746,7 +746,9 @@ impl PostgresHlrRepository {
             .execute(&self.pool)
             .await
             .map_err(|e| format!("create schema hlr: {e}"))?;
-        sqlx::migrate!("./migrations")
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.set_ignore_missing(true);
+        migrator
             .run(&self.pool)
             .await
             .map_err(|e| format!("migration error: {e}"))?;
