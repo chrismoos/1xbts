@@ -606,38 +606,37 @@ impl MscSmsCoordinator {
         let imsi = match mobile_identity_imsi {
             MobileIdentity::Imsi(s) => s.as_str(),
             MobileIdentity::Esn(_) => {
-                // Access channel path: try ESN
                 if let Some(MobileIdentity::Esn(esn)) = mobile_identity_esn {
-                    // Use ESN directly
-                    let esn_val = *esn;
-                    self.record_mo_sms_by_esn(esn_val, &decoded).await;
+                    let esn_originator = format!("ESN:0x{esn:08X}");
+                    self.record_mo_sms_unknown_originator(&esn_originator, &decoded)
+                        .await;
                     return;
                 }
                 warn!("MSC SMS: ADDS Transfer with ESN-only identity, no IMSI");
                 return;
             }
         };
+        let esn = match mobile_identity_esn {
+            Some(MobileIdentity::Esn(esn)) => Some(*esn),
+            _ => None,
+        };
+        let identity_key =
+            match cdma_hlr::model::MobileIdentityKey::from_parts(Some(imsi), esn, None) {
+                Ok(identity_key) => identity_key,
+                Err(_) => {
+                    warn!(
+                        "MSC SMS: MO SMS from IMSI {imsi} has no hardware identity for HLR lookup"
+                    );
+                    self.record_mo_sms_unknown_originator(imsi, &decoded).await;
+                    return;
+                }
+            };
 
-        let originating = match self.hlr.resolve_by_identity(None, Some(imsi)).await {
+        let originating = match self.hlr.resolve_by_identity(&identity_key).await {
             Ok(Some(r)) => r.subscriber,
             Ok(None) => {
                 warn!("MSC SMS: IMSI {imsi} not in HLR — recording MO SMS with unknown originator");
-                // Still record the SMS with IMSI as originator placeholder
-                let _ = self
-                    .smsc
-                    .create_or_get_recent_mo_submission(
-                        imsi, // use IMSI as originating_number placeholder
-                        &decoded.destination_number,
-                        &decoded.text,
-                        None,
-                        None,
-                        &MoSmsFingerprint {
-                            teleservice_id: decoded.teleservice_id,
-                            message_type: decoded.message_type,
-                            message_id: decoded.message_id,
-                        },
-                    )
-                    .await;
+                self.record_mo_sms_unknown_originator(imsi, &decoded).await;
                 return;
             }
             Err(e) => {
@@ -669,42 +668,18 @@ impl MscSmsCoordinator {
             .await;
     }
 
-    async fn record_mo_sms_by_esn(&self, esn: u32, decoded: &cdma_common::sms::DecodedMoSms) {
-        let originating = match self.hlr.resolve_by_identity(Some(esn), None).await {
-            Ok(Some(r)) => r.subscriber,
-            Ok(None) => {
-                let esn_str = format!("ESN:0x{esn:08X}");
-                let _ = self
-                    .smsc
-                    .create_or_get_recent_mo_submission(
-                        &esn_str,
-                        &decoded.destination_number,
-                        &decoded.text,
-                        None,
-                        None,
-                        &MoSmsFingerprint {
-                            teleservice_id: decoded.teleservice_id,
-                            message_type: decoded.message_type,
-                            message_id: decoded.message_id,
-                        },
-                    )
-                    .await;
-                return;
-            }
-            Err(e) => {
-                warn!("MSC SMS: HLR resolve_by_identity(ESN) failed: {e}");
-                return;
-            }
-        };
-
-        let originating_number = &originating.phone_number;
+    async fn record_mo_sms_unknown_originator(
+        &self,
+        originating_number: &str,
+        decoded: &cdma_common::sms::DecodedMoSms,
+    ) {
         let _ = self
             .smsc
             .create_or_get_recent_mo_submission(
                 originating_number,
                 &decoded.destination_number,
                 &decoded.text,
-                Some(originating.subscriber_id),
+                None,
                 None,
                 &MoSmsFingerprint {
                     teleservice_id: decoded.teleservice_id,

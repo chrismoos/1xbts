@@ -12,7 +12,7 @@ import { Timestamp } from "../../google/protobuf/timestamp";
 
 export const protobufPackage = "hlr.v1";
 
-/** AWIM Calling Party Number Type per C.S0005-E 3.7.5.10 / ANSI T1.607. */
+/** AWIM Calling Party Number Type per C.S0005-E 3.7.5.3 / ANSI T1.607. */
 export enum NumberType {
   NUMBER_TYPE_UNSPECIFIED = 0,
   NUMBER_TYPE_UNKNOWN = 1,
@@ -76,7 +76,7 @@ export function numberTypeToJSON(object: NumberType): string {
   }
 }
 
-/** AWIM Calling Party Numbering Plan per C.S0005-E 3.7.5.10 / ANSI T1.607. */
+/** AWIM Calling Party Numbering Plan per C.S0005-E 3.7.5.3 / ANSI T1.607. */
 export enum NumberPlan {
   NUMBER_PLAN_UNSPECIFIED = 0,
   NUMBER_PLAN_UNKNOWN = 1,
@@ -208,9 +208,23 @@ export interface SubscriberIdentity {
   /** FK */
   subscriberId: string;
   imsi?: string | undefined;
-  esn?: number | undefined;
+  esn?:
+    | number
+    | undefined;
+  /** 14 hex digits */
+  meid?: string | undefined;
   isPrimary: boolean;
   createdAt: Date | undefined;
+}
+
+/** Complete mobile identity forms accepted for subscriber resolution. */
+export interface MobileIdentityKey {
+  imsi?: string | undefined;
+  esn?:
+    | number
+    | undefined;
+  /** 14 hex digits */
+  meid?: string | undefined;
 }
 
 /** Current serving-node registration state for one subscriber. */
@@ -222,6 +236,10 @@ export interface RegistrationBinding {
   imsi?: string | undefined;
   esn?:
     | number
+    | undefined;
+  /** 14 hex digits */
+  meid?:
+    | string
     | undefined;
   /** Radio state */
   mobPRev?: number | undefined;
@@ -248,6 +266,7 @@ export interface UpsertSubscriberRequest {
   /** Identity to attach */
   imsi?: string | undefined;
   esn?: number | undefined;
+  meid?: string | undefined;
   numberType: NumberType;
   numberPlan: NumberPlan;
 }
@@ -263,6 +282,7 @@ export interface UpsertIdentityRequest {
   subscriberId: string;
   imsi?: string | undefined;
   esn?: number | undefined;
+  meid?: string | undefined;
 }
 
 export interface UpsertIdentityResponse {
@@ -274,6 +294,7 @@ export interface ReplacePrimaryIdentityRequest {
   subscriberId: string;
   imsi?: string | undefined;
   esn?: number | undefined;
+  meid?: string | undefined;
 }
 
 export interface ReplacePrimaryIdentityResponse {
@@ -291,8 +312,7 @@ export interface GetIdentitiesForSubscriberResponse {
 
 /** Records that a mobile identity was observed on the air interface. */
 export interface UpsertMobileSeenRequest {
-  esn?: number | undefined;
-  imsi?: string | undefined;
+  identity: MobileIdentityKey | undefined;
   mobPRev?: number | undefined;
 }
 
@@ -340,16 +360,7 @@ export interface GetSubscriberResponse {
 
 /** Resolves a mobile identity observed on the air interface to a subscriber. */
 export interface ResolveSubscriberByIdentityRequest {
-  esn?: number | undefined;
-  imsi?:
-    | string
-    | undefined;
-  /**
-   * Radio-derived IMSI_S pieces. The HLR derives these from stored IMSI
-   * strings when an access event cannot provide the full IMSI.
-   */
-  imsiMS1?: number | undefined;
-  imsiMS2?: number | undefined;
+  identity: MobileIdentityKey | undefined;
 }
 
 /** Resolved subscriber and current registration binding, if any. */
@@ -373,6 +384,7 @@ export interface UpsertRegistrationBindingRequest {
   state: string;
   imsi?: string | undefined;
   esn?: number | undefined;
+  meid?: string | undefined;
   mobPRev?: number | undefined;
   pgslot?: number | undefined;
   slotCycleIndex?: number | undefined;
@@ -420,6 +432,7 @@ export interface UpdateSubscriberRequest {
   status: SubscriberStatus;
   imsi?: string | undefined;
   esn?: number | undefined;
+  meid?: string | undefined;
   numberType: NumberType;
   numberPlan: NumberPlan;
 }
@@ -737,6 +750,7 @@ function createBaseSubscriberIdentity(): SubscriberIdentity {
     subscriberId: "",
     imsi: undefined,
     esn: undefined,
+    meid: undefined,
     isPrimary: false,
     createdAt: undefined,
   };
@@ -755,6 +769,9 @@ export const SubscriberIdentity: MessageFns<SubscriberIdentity> = {
     }
     if (message.esn !== undefined) {
       writer.uint32(24).uint32(message.esn);
+    }
+    if (message.meid !== undefined) {
+      writer.uint32(98).string(message.meid);
     }
     if (message.isPrimary !== false) {
       writer.uint32(72).bool(message.isPrimary);
@@ -804,6 +821,14 @@ export const SubscriberIdentity: MessageFns<SubscriberIdentity> = {
           message.esn = reader.uint32();
           continue;
         }
+        case 12: {
+          if (tag !== 98) {
+            break;
+          }
+
+          message.meid = reader.string();
+          continue;
+        }
         case 9: {
           if (tag !== 72) {
             break;
@@ -843,6 +868,7 @@ export const SubscriberIdentity: MessageFns<SubscriberIdentity> = {
         : "",
       imsi: isSet(object.imsi) ? globalThis.String(object.imsi) : undefined,
       esn: isSet(object.esn) ? globalThis.Number(object.esn) : undefined,
+      meid: isSet(object.meid) ? globalThis.String(object.meid) : undefined,
       isPrimary: isSet(object.isPrimary)
         ? globalThis.Boolean(object.isPrimary)
         : isSet(object.is_primary)
@@ -870,6 +896,9 @@ export const SubscriberIdentity: MessageFns<SubscriberIdentity> = {
     if (message.esn !== undefined) {
       obj.esn = Math.round(message.esn);
     }
+    if (message.meid !== undefined) {
+      obj.meid = message.meid;
+    }
     if (message.isPrimary !== false) {
       obj.isPrimary = message.isPrimary;
     }
@@ -888,8 +917,101 @@ export const SubscriberIdentity: MessageFns<SubscriberIdentity> = {
     message.subscriberId = object.subscriberId ?? "";
     message.imsi = object.imsi ?? undefined;
     message.esn = object.esn ?? undefined;
+    message.meid = object.meid ?? undefined;
     message.isPrimary = object.isPrimary ?? false;
     message.createdAt = object.createdAt ?? undefined;
+    return message;
+  },
+};
+
+function createBaseMobileIdentityKey(): MobileIdentityKey {
+  return { imsi: undefined, esn: undefined, meid: undefined };
+}
+
+export const MobileIdentityKey: MessageFns<MobileIdentityKey> = {
+  encode(message: MobileIdentityKey, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.imsi !== undefined) {
+      writer.uint32(10).string(message.imsi);
+    }
+    if (message.esn !== undefined) {
+      writer.uint32(16).uint32(message.esn);
+    }
+    if (message.meid !== undefined) {
+      writer.uint32(26).string(message.meid);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): MobileIdentityKey {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseMobileIdentityKey();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.imsi = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.esn = reader.uint32();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.meid = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): MobileIdentityKey {
+    return {
+      imsi: isSet(object.imsi) ? globalThis.String(object.imsi) : undefined,
+      esn: isSet(object.esn) ? globalThis.Number(object.esn) : undefined,
+      meid: isSet(object.meid) ? globalThis.String(object.meid) : undefined,
+    };
+  },
+
+  toJSON(message: MobileIdentityKey): unknown {
+    const obj: any = {};
+    if (message.imsi !== undefined) {
+      obj.imsi = message.imsi;
+    }
+    if (message.esn !== undefined) {
+      obj.esn = Math.round(message.esn);
+    }
+    if (message.meid !== undefined) {
+      obj.meid = message.meid;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<MobileIdentityKey>): MobileIdentityKey {
+    return MobileIdentityKey.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<MobileIdentityKey>): MobileIdentityKey {
+    const message = createBaseMobileIdentityKey();
+    message.imsi = object.imsi ?? undefined;
+    message.esn = object.esn ?? undefined;
+    message.meid = object.meid ?? undefined;
     return message;
   },
 };
@@ -901,6 +1023,7 @@ function createBaseRegistrationBinding(): RegistrationBinding {
     state: "",
     imsi: undefined,
     esn: undefined,
+    meid: undefined,
     mobPRev: undefined,
     pgslot: undefined,
     slotCycleIndex: undefined,
@@ -927,6 +1050,9 @@ export const RegistrationBinding: MessageFns<RegistrationBinding> = {
     }
     if (message.esn !== undefined) {
       writer.uint32(80).uint32(message.esn);
+    }
+    if (message.meid !== undefined) {
+      writer.uint32(410).string(message.meid);
     }
     if (message.mobPRev !== undefined) {
       writer.uint32(240).uint32(message.mobPRev);
@@ -997,6 +1123,14 @@ export const RegistrationBinding: MessageFns<RegistrationBinding> = {
           }
 
           message.esn = reader.uint32();
+          continue;
+        }
+        case 51: {
+          if (tag !== 410) {
+            break;
+          }
+
+          message.meid = reader.string();
           continue;
         }
         case 30: {
@@ -1079,6 +1213,7 @@ export const RegistrationBinding: MessageFns<RegistrationBinding> = {
       state: isSet(object.state) ? globalThis.String(object.state) : "",
       imsi: isSet(object.imsi) ? globalThis.String(object.imsi) : undefined,
       esn: isSet(object.esn) ? globalThis.Number(object.esn) : undefined,
+      meid: isSet(object.meid) ? globalThis.String(object.meid) : undefined,
       mobPRev: isSet(object.mobPRev)
         ? globalThis.Number(object.mobPRev)
         : isSet(object.mob_p_rev)
@@ -1130,6 +1265,9 @@ export const RegistrationBinding: MessageFns<RegistrationBinding> = {
     if (message.esn !== undefined) {
       obj.esn = Math.round(message.esn);
     }
+    if (message.meid !== undefined) {
+      obj.meid = message.meid;
+    }
     if (message.mobPRev !== undefined) {
       obj.mobPRev = Math.round(message.mobPRev);
     }
@@ -1164,6 +1302,7 @@ export const RegistrationBinding: MessageFns<RegistrationBinding> = {
     message.state = object.state ?? "";
     message.imsi = object.imsi ?? undefined;
     message.esn = object.esn ?? undefined;
+    message.meid = object.meid ?? undefined;
     message.mobPRev = object.mobPRev ?? undefined;
     message.pgslot = object.pgslot ?? undefined;
     message.slotCycleIndex = object.slotCycleIndex ?? undefined;
@@ -1260,7 +1399,16 @@ export const MobileSeenUpsert: MessageFns<MobileSeenUpsert> = {
 };
 
 function createBaseUpsertSubscriberRequest(): UpsertSubscriberRequest {
-  return { phoneNumber: "", displayName: "", status: 0, imsi: undefined, esn: undefined, numberType: 0, numberPlan: 0 };
+  return {
+    phoneNumber: "",
+    displayName: "",
+    status: 0,
+    imsi: undefined,
+    esn: undefined,
+    meid: undefined,
+    numberType: 0,
+    numberPlan: 0,
+  };
 }
 
 export const UpsertSubscriberRequest: MessageFns<UpsertSubscriberRequest> = {
@@ -1279,6 +1427,9 @@ export const UpsertSubscriberRequest: MessageFns<UpsertSubscriberRequest> = {
     }
     if (message.esn !== undefined) {
       writer.uint32(80).uint32(message.esn);
+    }
+    if (message.meid !== undefined) {
+      writer.uint32(138).string(message.meid);
     }
     if (message.numberType !== 0) {
       writer.uint32(160).int32(message.numberType);
@@ -1336,6 +1487,14 @@ export const UpsertSubscriberRequest: MessageFns<UpsertSubscriberRequest> = {
           message.esn = reader.uint32();
           continue;
         }
+        case 17: {
+          if (tag !== 138) {
+            break;
+          }
+
+          message.meid = reader.string();
+          continue;
+        }
         case 20: {
           if (tag !== 160) {
             break;
@@ -1376,6 +1535,7 @@ export const UpsertSubscriberRequest: MessageFns<UpsertSubscriberRequest> = {
       status: isSet(object.status) ? subscriberStatusFromJSON(object.status) : 0,
       imsi: isSet(object.imsi) ? globalThis.String(object.imsi) : undefined,
       esn: isSet(object.esn) ? globalThis.Number(object.esn) : undefined,
+      meid: isSet(object.meid) ? globalThis.String(object.meid) : undefined,
       numberType: isSet(object.numberType)
         ? numberTypeFromJSON(object.numberType)
         : isSet(object.number_type)
@@ -1406,6 +1566,9 @@ export const UpsertSubscriberRequest: MessageFns<UpsertSubscriberRequest> = {
     if (message.esn !== undefined) {
       obj.esn = Math.round(message.esn);
     }
+    if (message.meid !== undefined) {
+      obj.meid = message.meid;
+    }
     if (message.numberType !== 0) {
       obj.numberType = numberTypeToJSON(message.numberType);
     }
@@ -1425,6 +1588,7 @@ export const UpsertSubscriberRequest: MessageFns<UpsertSubscriberRequest> = {
     message.status = object.status ?? 0;
     message.imsi = object.imsi ?? undefined;
     message.esn = object.esn ?? undefined;
+    message.meid = object.meid ?? undefined;
     message.numberType = object.numberType ?? 0;
     message.numberPlan = object.numberPlan ?? 0;
     return message;
@@ -1512,7 +1676,7 @@ export const UpsertSubscriberResponse: MessageFns<UpsertSubscriberResponse> = {
 };
 
 function createBaseUpsertIdentityRequest(): UpsertIdentityRequest {
-  return { subscriberId: "", imsi: undefined, esn: undefined };
+  return { subscriberId: "", imsi: undefined, esn: undefined, meid: undefined };
 }
 
 export const UpsertIdentityRequest: MessageFns<UpsertIdentityRequest> = {
@@ -1525,6 +1689,9 @@ export const UpsertIdentityRequest: MessageFns<UpsertIdentityRequest> = {
     }
     if (message.esn !== undefined) {
       writer.uint32(24).uint32(message.esn);
+    }
+    if (message.meid !== undefined) {
+      writer.uint32(34).string(message.meid);
     }
     return writer;
   },
@@ -1560,6 +1727,14 @@ export const UpsertIdentityRequest: MessageFns<UpsertIdentityRequest> = {
           message.esn = reader.uint32();
           continue;
         }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.meid = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1578,6 +1753,7 @@ export const UpsertIdentityRequest: MessageFns<UpsertIdentityRequest> = {
         : "",
       imsi: isSet(object.imsi) ? globalThis.String(object.imsi) : undefined,
       esn: isSet(object.esn) ? globalThis.Number(object.esn) : undefined,
+      meid: isSet(object.meid) ? globalThis.String(object.meid) : undefined,
     };
   },
 
@@ -1592,6 +1768,9 @@ export const UpsertIdentityRequest: MessageFns<UpsertIdentityRequest> = {
     if (message.esn !== undefined) {
       obj.esn = Math.round(message.esn);
     }
+    if (message.meid !== undefined) {
+      obj.meid = message.meid;
+    }
     return obj;
   },
 
@@ -1603,6 +1782,7 @@ export const UpsertIdentityRequest: MessageFns<UpsertIdentityRequest> = {
     message.subscriberId = object.subscriberId ?? "";
     message.imsi = object.imsi ?? undefined;
     message.esn = object.esn ?? undefined;
+    message.meid = object.meid ?? undefined;
     return message;
   },
 };
@@ -1668,7 +1848,7 @@ export const UpsertIdentityResponse: MessageFns<UpsertIdentityResponse> = {
 };
 
 function createBaseReplacePrimaryIdentityRequest(): ReplacePrimaryIdentityRequest {
-  return { subscriberId: "", imsi: undefined, esn: undefined };
+  return { subscriberId: "", imsi: undefined, esn: undefined, meid: undefined };
 }
 
 export const ReplacePrimaryIdentityRequest: MessageFns<ReplacePrimaryIdentityRequest> = {
@@ -1681,6 +1861,9 @@ export const ReplacePrimaryIdentityRequest: MessageFns<ReplacePrimaryIdentityReq
     }
     if (message.esn !== undefined) {
       writer.uint32(24).uint32(message.esn);
+    }
+    if (message.meid !== undefined) {
+      writer.uint32(34).string(message.meid);
     }
     return writer;
   },
@@ -1716,6 +1899,14 @@ export const ReplacePrimaryIdentityRequest: MessageFns<ReplacePrimaryIdentityReq
           message.esn = reader.uint32();
           continue;
         }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.meid = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1734,6 +1925,7 @@ export const ReplacePrimaryIdentityRequest: MessageFns<ReplacePrimaryIdentityReq
         : "",
       imsi: isSet(object.imsi) ? globalThis.String(object.imsi) : undefined,
       esn: isSet(object.esn) ? globalThis.Number(object.esn) : undefined,
+      meid: isSet(object.meid) ? globalThis.String(object.meid) : undefined,
     };
   },
 
@@ -1748,6 +1940,9 @@ export const ReplacePrimaryIdentityRequest: MessageFns<ReplacePrimaryIdentityReq
     if (message.esn !== undefined) {
       obj.esn = Math.round(message.esn);
     }
+    if (message.meid !== undefined) {
+      obj.meid = message.meid;
+    }
     return obj;
   },
 
@@ -1759,6 +1954,7 @@ export const ReplacePrimaryIdentityRequest: MessageFns<ReplacePrimaryIdentityReq
     message.subscriberId = object.subscriberId ?? "";
     message.imsi = object.imsi ?? undefined;
     message.esn = object.esn ?? undefined;
+    message.meid = object.meid ?? undefined;
     return message;
   },
 };
@@ -1950,16 +2146,13 @@ export const GetIdentitiesForSubscriberResponse: MessageFns<GetIdentitiesForSubs
 };
 
 function createBaseUpsertMobileSeenRequest(): UpsertMobileSeenRequest {
-  return { esn: undefined, imsi: undefined, mobPRev: undefined };
+  return { identity: undefined, mobPRev: undefined };
 }
 
 export const UpsertMobileSeenRequest: MessageFns<UpsertMobileSeenRequest> = {
   encode(message: UpsertMobileSeenRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.esn !== undefined) {
-      writer.uint32(8).uint32(message.esn);
-    }
-    if (message.imsi !== undefined) {
-      writer.uint32(18).string(message.imsi);
+    if (message.identity !== undefined) {
+      MobileIdentityKey.encode(message.identity, writer.uint32(10).fork()).join();
     }
     if (message.mobPRev !== undefined) {
       writer.uint32(24).uint32(message.mobPRev);
@@ -1975,19 +2168,11 @@ export const UpsertMobileSeenRequest: MessageFns<UpsertMobileSeenRequest> = {
       const tag = reader.uint32();
       switch (tag >>> 3) {
         case 1: {
-          if (tag !== 8) {
+          if (tag !== 10) {
             break;
           }
 
-          message.esn = reader.uint32();
-          continue;
-        }
-        case 2: {
-          if (tag !== 18) {
-            break;
-          }
-
-          message.imsi = reader.string();
+          message.identity = MobileIdentityKey.decode(reader, reader.uint32());
           continue;
         }
         case 3: {
@@ -2009,8 +2194,7 @@ export const UpsertMobileSeenRequest: MessageFns<UpsertMobileSeenRequest> = {
 
   fromJSON(object: any): UpsertMobileSeenRequest {
     return {
-      esn: isSet(object.esn) ? globalThis.Number(object.esn) : undefined,
-      imsi: isSet(object.imsi) ? globalThis.String(object.imsi) : undefined,
+      identity: isSet(object.identity) ? MobileIdentityKey.fromJSON(object.identity) : undefined,
       mobPRev: isSet(object.mobPRev)
         ? globalThis.Number(object.mobPRev)
         : isSet(object.mob_p_rev)
@@ -2021,11 +2205,8 @@ export const UpsertMobileSeenRequest: MessageFns<UpsertMobileSeenRequest> = {
 
   toJSON(message: UpsertMobileSeenRequest): unknown {
     const obj: any = {};
-    if (message.esn !== undefined) {
-      obj.esn = Math.round(message.esn);
-    }
-    if (message.imsi !== undefined) {
-      obj.imsi = message.imsi;
+    if (message.identity !== undefined) {
+      obj.identity = MobileIdentityKey.toJSON(message.identity);
     }
     if (message.mobPRev !== undefined) {
       obj.mobPRev = Math.round(message.mobPRev);
@@ -2038,8 +2219,9 @@ export const UpsertMobileSeenRequest: MessageFns<UpsertMobileSeenRequest> = {
   },
   fromPartial(object: DeepPartial<UpsertMobileSeenRequest>): UpsertMobileSeenRequest {
     const message = createBaseUpsertMobileSeenRequest();
-    message.esn = object.esn ?? undefined;
-    message.imsi = object.imsi ?? undefined;
+    message.identity = (object.identity !== undefined && object.identity !== null)
+      ? MobileIdentityKey.fromPartial(object.identity)
+      : undefined;
     message.mobPRev = object.mobPRev ?? undefined;
     return message;
   },
@@ -2474,22 +2656,13 @@ export const GetSubscriberResponse: MessageFns<GetSubscriberResponse> = {
 };
 
 function createBaseResolveSubscriberByIdentityRequest(): ResolveSubscriberByIdentityRequest {
-  return { esn: undefined, imsi: undefined, imsiMS1: undefined, imsiMS2: undefined };
+  return { identity: undefined };
 }
 
 export const ResolveSubscriberByIdentityRequest: MessageFns<ResolveSubscriberByIdentityRequest> = {
   encode(message: ResolveSubscriberByIdentityRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.esn !== undefined) {
-      writer.uint32(8).uint32(message.esn);
-    }
-    if (message.imsi !== undefined) {
-      writer.uint32(18).string(message.imsi);
-    }
-    if (message.imsiMS1 !== undefined) {
-      writer.uint32(24).uint32(message.imsiMS1);
-    }
-    if (message.imsiMS2 !== undefined) {
-      writer.uint32(32).uint32(message.imsiMS2);
+    if (message.identity !== undefined) {
+      MobileIdentityKey.encode(message.identity, writer.uint32(10).fork()).join();
     }
     return writer;
   },
@@ -2502,35 +2675,11 @@ export const ResolveSubscriberByIdentityRequest: MessageFns<ResolveSubscriberByI
       const tag = reader.uint32();
       switch (tag >>> 3) {
         case 1: {
-          if (tag !== 8) {
+          if (tag !== 10) {
             break;
           }
 
-          message.esn = reader.uint32();
-          continue;
-        }
-        case 2: {
-          if (tag !== 18) {
-            break;
-          }
-
-          message.imsi = reader.string();
-          continue;
-        }
-        case 3: {
-          if (tag !== 24) {
-            break;
-          }
-
-          message.imsiMS1 = reader.uint32();
-          continue;
-        }
-        case 4: {
-          if (tag !== 32) {
-            break;
-          }
-
-          message.imsiMS2 = reader.uint32();
+          message.identity = MobileIdentityKey.decode(reader, reader.uint32());
           continue;
         }
       }
@@ -2543,35 +2692,13 @@ export const ResolveSubscriberByIdentityRequest: MessageFns<ResolveSubscriberByI
   },
 
   fromJSON(object: any): ResolveSubscriberByIdentityRequest {
-    return {
-      esn: isSet(object.esn) ? globalThis.Number(object.esn) : undefined,
-      imsi: isSet(object.imsi) ? globalThis.String(object.imsi) : undefined,
-      imsiMS1: isSet(object.imsiMS1)
-        ? globalThis.Number(object.imsiMS1)
-        : isSet(object.imsi_m_s1)
-        ? globalThis.Number(object.imsi_m_s1)
-        : undefined,
-      imsiMS2: isSet(object.imsiMS2)
-        ? globalThis.Number(object.imsiMS2)
-        : isSet(object.imsi_m_s2)
-        ? globalThis.Number(object.imsi_m_s2)
-        : undefined,
-    };
+    return { identity: isSet(object.identity) ? MobileIdentityKey.fromJSON(object.identity) : undefined };
   },
 
   toJSON(message: ResolveSubscriberByIdentityRequest): unknown {
     const obj: any = {};
-    if (message.esn !== undefined) {
-      obj.esn = Math.round(message.esn);
-    }
-    if (message.imsi !== undefined) {
-      obj.imsi = message.imsi;
-    }
-    if (message.imsiMS1 !== undefined) {
-      obj.imsiMS1 = Math.round(message.imsiMS1);
-    }
-    if (message.imsiMS2 !== undefined) {
-      obj.imsiMS2 = Math.round(message.imsiMS2);
+    if (message.identity !== undefined) {
+      obj.identity = MobileIdentityKey.toJSON(message.identity);
     }
     return obj;
   },
@@ -2581,10 +2708,9 @@ export const ResolveSubscriberByIdentityRequest: MessageFns<ResolveSubscriberByI
   },
   fromPartial(object: DeepPartial<ResolveSubscriberByIdentityRequest>): ResolveSubscriberByIdentityRequest {
     const message = createBaseResolveSubscriberByIdentityRequest();
-    message.esn = object.esn ?? undefined;
-    message.imsi = object.imsi ?? undefined;
-    message.imsiMS1 = object.imsiMS1 ?? undefined;
-    message.imsiMS2 = object.imsiMS2 ?? undefined;
+    message.identity = (object.identity !== undefined && object.identity !== null)
+      ? MobileIdentityKey.fromPartial(object.identity)
+      : undefined;
     return message;
   },
 };
@@ -2698,6 +2824,7 @@ function createBaseUpsertRegistrationBindingRequest(): UpsertRegistrationBinding
     state: "",
     imsi: undefined,
     esn: undefined,
+    meid: undefined,
     mobPRev: undefined,
     pgslot: undefined,
     slotCycleIndex: undefined,
@@ -2721,6 +2848,9 @@ export const UpsertRegistrationBindingRequest: MessageFns<UpsertRegistrationBind
     }
     if (message.esn !== undefined) {
       writer.uint32(80).uint32(message.esn);
+    }
+    if (message.meid !== undefined) {
+      writer.uint32(410).string(message.meid);
     }
     if (message.mobPRev !== undefined) {
       writer.uint32(240).uint32(message.mobPRev);
@@ -2784,6 +2914,14 @@ export const UpsertRegistrationBindingRequest: MessageFns<UpsertRegistrationBind
           message.esn = reader.uint32();
           continue;
         }
+        case 51: {
+          if (tag !== 410) {
+            break;
+          }
+
+          message.meid = reader.string();
+          continue;
+        }
         case 30: {
           if (tag !== 240) {
             break;
@@ -2840,6 +2978,7 @@ export const UpsertRegistrationBindingRequest: MessageFns<UpsertRegistrationBind
       state: isSet(object.state) ? globalThis.String(object.state) : "",
       imsi: isSet(object.imsi) ? globalThis.String(object.imsi) : undefined,
       esn: isSet(object.esn) ? globalThis.Number(object.esn) : undefined,
+      meid: isSet(object.meid) ? globalThis.String(object.meid) : undefined,
       mobPRev: isSet(object.mobPRev)
         ? globalThis.Number(object.mobPRev)
         : isSet(object.mob_p_rev)
@@ -2876,6 +3015,9 @@ export const UpsertRegistrationBindingRequest: MessageFns<UpsertRegistrationBind
     if (message.esn !== undefined) {
       obj.esn = Math.round(message.esn);
     }
+    if (message.meid !== undefined) {
+      obj.meid = message.meid;
+    }
     if (message.mobPRev !== undefined) {
       obj.mobPRev = Math.round(message.mobPRev);
     }
@@ -2901,6 +3043,7 @@ export const UpsertRegistrationBindingRequest: MessageFns<UpsertRegistrationBind
     message.state = object.state ?? "";
     message.imsi = object.imsi ?? undefined;
     message.esn = object.esn ?? undefined;
+    message.meid = object.meid ?? undefined;
     message.mobPRev = object.mobPRev ?? undefined;
     message.pgslot = object.pgslot ?? undefined;
     message.slotCycleIndex = object.slotCycleIndex ?? undefined;
@@ -3339,6 +3482,7 @@ function createBaseUpdateSubscriberRequest(): UpdateSubscriberRequest {
     status: 0,
     imsi: undefined,
     esn: undefined,
+    meid: undefined,
     numberType: 0,
     numberPlan: 0,
   };
@@ -3363,6 +3507,9 @@ export const UpdateSubscriberRequest: MessageFns<UpdateSubscriberRequest> = {
     }
     if (message.esn !== undefined) {
       writer.uint32(80).uint32(message.esn);
+    }
+    if (message.meid !== undefined) {
+      writer.uint32(138).string(message.meid);
     }
     if (message.numberType !== 0) {
       writer.uint32(160).int32(message.numberType);
@@ -3428,6 +3575,14 @@ export const UpdateSubscriberRequest: MessageFns<UpdateSubscriberRequest> = {
           message.esn = reader.uint32();
           continue;
         }
+        case 17: {
+          if (tag !== 138) {
+            break;
+          }
+
+          message.meid = reader.string();
+          continue;
+        }
         case 20: {
           if (tag !== 160) {
             break;
@@ -3473,6 +3628,7 @@ export const UpdateSubscriberRequest: MessageFns<UpdateSubscriberRequest> = {
       status: isSet(object.status) ? subscriberStatusFromJSON(object.status) : 0,
       imsi: isSet(object.imsi) ? globalThis.String(object.imsi) : undefined,
       esn: isSet(object.esn) ? globalThis.Number(object.esn) : undefined,
+      meid: isSet(object.meid) ? globalThis.String(object.meid) : undefined,
       numberType: isSet(object.numberType)
         ? numberTypeFromJSON(object.numberType)
         : isSet(object.number_type)
@@ -3506,6 +3662,9 @@ export const UpdateSubscriberRequest: MessageFns<UpdateSubscriberRequest> = {
     if (message.esn !== undefined) {
       obj.esn = Math.round(message.esn);
     }
+    if (message.meid !== undefined) {
+      obj.meid = message.meid;
+    }
     if (message.numberType !== 0) {
       obj.numberType = numberTypeToJSON(message.numberType);
     }
@@ -3526,6 +3685,7 @@ export const UpdateSubscriberRequest: MessageFns<UpdateSubscriberRequest> = {
     message.status = object.status ?? 0;
     message.imsi = object.imsi ?? undefined;
     message.esn = object.esn ?? undefined;
+    message.meid = object.meid ?? undefined;
     message.numberType = object.numberType ?? 0;
     message.numberPlan = object.numberPlan ?? 0;
     return message;
@@ -4357,7 +4517,7 @@ export const HlrServiceDefinition = {
       responseStream: false,
       options: {},
     },
-    /** Resolves ESN, IMSI, or IMSI_S fields to subscriber state. */
+    /** Resolves a complete mobile identity to subscriber state. */
     resolveSubscriberByIdentity: {
       name: "ResolveSubscriberByIdentity",
       requestType: ResolveSubscriberByIdentityRequest as typeof ResolveSubscriberByIdentityRequest,
@@ -4486,7 +4646,7 @@ export interface HlrServiceImplementation<CallContextExt = {}> {
     request: GetSubscriberRequest,
     context: CallContext & CallContextExt,
   ): Promise<DeepPartial<GetSubscriberResponse>>;
-  /** Resolves ESN, IMSI, or IMSI_S fields to subscriber state. */
+  /** Resolves a complete mobile identity to subscriber state. */
   resolveSubscriberByIdentity(
     request: ResolveSubscriberByIdentityRequest,
     context: CallContext & CallContextExt,
@@ -4574,7 +4734,7 @@ export interface HlrServiceClient<CallOptionsExt = {}> {
     request: DeepPartial<GetSubscriberRequest>,
     options?: CallOptions & CallOptionsExt,
   ): Promise<GetSubscriberResponse>;
-  /** Resolves ESN, IMSI, or IMSI_S fields to subscriber state. */
+  /** Resolves a complete mobile identity to subscriber state. */
   resolveSubscriberByIdentity(
     request: DeepPartial<ResolveSubscriberByIdentityRequest>,
     options?: CallOptions & CallOptionsExt,

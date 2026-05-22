@@ -2,6 +2,10 @@ export function formatEsn(esn: number): string {
   return `0x${(esn >>> 0).toString(16).toUpperCase().padStart(8, "0")}`;
 }
 
+export function formatMeid(meid: string): string {
+  return meid.trim().toUpperCase();
+}
+
 export function formatTimeMs(ts: number): string {
   const d = new Date(ts);
   const Y = d.getFullYear();

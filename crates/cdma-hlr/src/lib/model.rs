@@ -11,6 +11,7 @@ pub struct MobileSeenUpsert {
 }
 
 pub const IMSI_LEN: usize = 15;
+pub const MEID_HEX_LEN: usize = 14;
 pub const MAX_PHONE_LEN: usize = 15;
 
 /// A provisioned subscriber record from the HLR.
@@ -159,13 +160,82 @@ pub struct ResolvedSubscriber {
     pub binding: Option<RegistrationBinding>,
 }
 
-/// A single identity (IMSI or ESN) associated with a subscriber.
+/// Complete mobile identity forms that can identify a subscriber.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MobileIdentityKey {
+    ImsiEsn {
+        imsi: String,
+        esn: u32,
+    },
+    ImsiMeid {
+        imsi: String,
+        meid: String,
+    },
+    ImsiEsnMeid {
+        imsi: String,
+        esn: u32,
+        meid: String,
+    },
+}
+
+impl MobileIdentityKey {
+    pub fn from_parts(
+        imsi: Option<&str>,
+        esn: Option<u32>,
+        meid: Option<&str>,
+    ) -> Result<Self, String> {
+        let imsi = imsi.ok_or_else(|| "identity key requires IMSI".to_string())?;
+        validate_imsi(imsi)?;
+        let meid = meid.map(normalize_meid).transpose()?;
+        match (esn, meid) {
+            (Some(esn), Some(meid)) => Ok(Self::ImsiEsnMeid {
+                imsi: imsi.to_string(),
+                esn,
+                meid,
+            }),
+            (Some(esn), None) => Ok(Self::ImsiEsn {
+                imsi: imsi.to_string(),
+                esn,
+            }),
+            (None, Some(meid)) => Ok(Self::ImsiMeid {
+                imsi: imsi.to_string(),
+                meid,
+            }),
+            (None, None) => Err("identity key requires ESN or MEID with IMSI".to_string()),
+        }
+    }
+
+    pub fn imsi(&self) -> &str {
+        match self {
+            Self::ImsiEsn { imsi, .. }
+            | Self::ImsiMeid { imsi, .. }
+            | Self::ImsiEsnMeid { imsi, .. } => imsi,
+        }
+    }
+
+    pub fn esn(&self) -> Option<u32> {
+        match self {
+            Self::ImsiEsn { esn, .. } | Self::ImsiEsnMeid { esn, .. } => Some(*esn),
+            Self::ImsiMeid { .. } => None,
+        }
+    }
+
+    pub fn meid(&self) -> Option<&str> {
+        match self {
+            Self::ImsiMeid { meid, .. } | Self::ImsiEsnMeid { meid, .. } => Some(meid.as_str()),
+            Self::ImsiEsn { .. } => None,
+        }
+    }
+}
+
+/// A single complete identity associated with a subscriber.
 #[derive(Debug, Clone)]
 pub struct SubscriberIdentity {
     pub subscriber_identity_id: Uuid,
     pub subscriber_id: Uuid,
     pub imsi: Option<String>,
     pub esn: Option<u32>,
+    pub meid: Option<String>,
     pub is_primary: bool,
     pub created_at: DateTime<Utc>,
 }
@@ -183,6 +253,21 @@ pub fn validate_imsi(imsi: &str) -> Result<(), String> {
         return Err("IMSI must contain only decimal digits".to_string());
     }
     Ok(())
+}
+
+pub fn normalize_meid(meid: &str) -> Result<String, String> {
+    let meid = meid.trim();
+    if meid.len() != MEID_HEX_LEN {
+        return Err(format!(
+            "MEID must be exactly {} hex digits, got {}",
+            MEID_HEX_LEN,
+            meid.len()
+        ));
+    }
+    if !meid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("MEID must contain only hexadecimal digits".to_string());
+    }
+    Ok(meid.to_ascii_lowercase())
 }
 
 /// Validates a phone number: 1–15 decimal digits (E.164 max).
@@ -212,6 +297,7 @@ pub struct RegistrationBinding {
     /// Authoritative IMSI string, sourced from `SubscriberIdentity`.
     pub imsi: Option<String>,
     pub esn: Option<u32>,
+    pub meid: Option<String>,
     pub mob_p_rev: Option<u32>,
     pub pgslot: Option<u32>,
     pub slot_cycle_index: Option<u32>,
@@ -255,7 +341,7 @@ impl RegistrationState {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_imsi, validate_phone_number};
+    use super::{MobileIdentityKey, normalize_meid, validate_imsi, validate_phone_number};
 
     #[test]
     fn accepts_exact_15_digit_imsi() {
@@ -273,6 +359,17 @@ mod tests {
     fn rejects_non_digit_imsi() {
         assert!(validate_imsi("12345abcdef0123").is_err());
         assert!(validate_imsi("12345 6789012345").is_err());
+    }
+
+    #[test]
+    fn normalizes_meid() {
+        assert_eq!(normalize_meid("A000000123ABCD").unwrap(), "a000000123abcd");
+    }
+
+    #[test]
+    fn rejects_partial_mobile_identity_key() {
+        assert!(MobileIdentityKey::from_parts(Some("123456789012345"), None, None).is_err());
+        assert!(MobileIdentityKey::from_parts(None, Some(0x12345678), None).is_err());
     }
 
     #[test]

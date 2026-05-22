@@ -58,8 +58,9 @@ impl MoCallService {
             Some(cdma_ios::MobileIdentity::Esn(esn)) => Some(esn),
             _ => None,
         };
+        let identity_key = cdma_hlr::model::MobileIdentityKey::from_parts(imsi, esn, None).ok()?;
 
-        match hlr_repo.resolve_by_identity(esn, imsi).await {
+        match hlr_repo.resolve_by_identity(&identity_key).await {
             Ok(Some(resolved)) => Some((
                 resolved.subscriber.phone_number,
                 resolved.subscriber.subscriber_id,

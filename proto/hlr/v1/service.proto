@@ -58,8 +58,16 @@ message SubscriberIdentity {
   string subscriber_id = 2;           // FK
   optional string imsi = 11;
   optional uint32 esn = 3;
+  optional string meid = 12;          // 14 hex digits
   bool is_primary = 9;
   google.protobuf.Timestamp created_at = 10;
+}
+
+// Complete mobile identity forms accepted for subscriber resolution.
+message MobileIdentityKey {
+  optional string imsi = 1;
+  optional uint32 esn = 2;
+  optional string meid = 3;  // 14 hex digits
 }
 
 // Current serving-node registration state for one subscriber.
@@ -69,6 +77,7 @@ message RegistrationBinding {
   string state = 3;  // "registered", "paged", "page_response_received", "stale"
   optional string imsi = 50;
   optional uint32 esn = 10;
+  optional string meid = 51;  // 14 hex digits
   // Radio state
   optional uint32 mob_p_rev = 30;
   optional uint32 pgslot = 31;
@@ -95,6 +104,7 @@ message UpsertSubscriberRequest {
   // Identity to attach
   optional string imsi = 16;
   optional uint32 esn = 10;
+  optional string meid = 17;
   NumberType number_type = 20;
   NumberPlan number_plan = 21;
 }
@@ -110,6 +120,7 @@ message UpsertIdentityRequest {
   string subscriber_id = 1;
   optional string imsi = 2;
   optional uint32 esn = 3;
+  optional string meid = 4;
 }
 
 message UpsertIdentityResponse {
@@ -121,6 +132,7 @@ message ReplacePrimaryIdentityRequest {
   string subscriber_id = 1;
   optional string imsi = 2;
   optional uint32 esn = 3;
+  optional string meid = 4;
 }
 
 message ReplacePrimaryIdentityResponse {
@@ -138,8 +150,7 @@ message GetIdentitiesForSubscriberResponse {
 
 // Records that a mobile identity was observed on the air interface.
 message UpsertMobileSeenRequest {
-  optional uint32 esn = 1;
-  optional string imsi = 2;
+  MobileIdentityKey identity = 1;
   optional uint32 mob_p_rev = 3;
 }
 
@@ -179,12 +190,7 @@ message GetSubscriberResponse {
 
 // Resolves a mobile identity observed on the air interface to a subscriber.
 message ResolveSubscriberByIdentityRequest {
-  optional uint32 esn = 1;
-  optional string imsi = 2;
-  // Radio-derived IMSI_S pieces. The HLR derives these from stored IMSI
-  // strings when an access event cannot provide the full IMSI.
-  optional uint32 imsi_m_s1 = 3;
-  optional uint32 imsi_m_s2 = 4;
+  MobileIdentityKey identity = 1;
 }
 
 // Resolved subscriber and current registration binding, if any.
@@ -204,6 +210,7 @@ message UpsertRegistrationBindingRequest {
   string state = 3;
   optional string imsi = 50;
   optional uint32 esn = 10;
+  optional string meid = 51;
   optional uint32 mob_p_rev = 30;
   optional uint32 pgslot = 31;
   optional uint32 slot_cycle_index = 32;
@@ -251,6 +258,7 @@ message UpdateSubscriberRequest {
   SubscriberStatus status = 4;
   optional string imsi = 16;
   optional uint32 esn = 10;
+  optional string meid = 17;
   NumberType number_type = 20;
   NumberPlan number_plan = 21;
 }
@@ -328,7 +336,7 @@ service HlrService {
   rpc GetSubscriberByPhoneNumber(GetSubscriberByPhoneNumberRequest) returns (GetSubscriberByPhoneNumberResponse);
   // Looks up subscriber state by subscriber UUID.
   rpc GetSubscriber(GetSubscriberRequest) returns (GetSubscriberResponse);
-  // Resolves ESN, IMSI, or IMSI_S fields to subscriber state.
+  // Resolves a complete mobile identity to subscriber state.
   rpc ResolveSubscriberByIdentity(ResolveSubscriberByIdentityRequest) returns (ResolveSubscriberByIdentityResponse);
   // Updates the serving-node registration binding for a subscriber.
   rpc UpsertRegistrationBinding(UpsertRegistrationBindingRequest) returns (UpsertRegistrationBindingResponse);

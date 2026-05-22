@@ -662,6 +662,7 @@ export function AccessDetail({ event }: { event: AccessEvent }) {
         <Field label="MSG_SEQ" value={event.msgSeq} />
         <Field label="MSID_TYPE" value={event.msidType} />
         <Field label="ESN" value={event.esn != null ? formatHex(event.esn, 8) : null} />
+        <Field label="MEID" value={event.meid ? event.meid.toUpperCase() : null} />
         <Field label="IMSI_M_S1" value={event.imsiMS1} />
         <Field label="IMSI_M_S2" value={event.imsiMS2} />
         <Field label="MOB_P_REV" value={event.mobPRev} />

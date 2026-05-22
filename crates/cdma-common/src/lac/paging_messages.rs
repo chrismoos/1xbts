@@ -738,6 +738,8 @@ pub struct ExtendedSystemParametersDefaults {
     pub delete_for_tmsi: bool,
     pub use_tmsi: bool,
     pub pref_msid_type: u8,
+    pub ext_pref_msid_type: Option<u8>,
+    pub meid_reqd: Option<bool>,
     #[serde(
         serialize_with = "serde_mcc::serialize",
         deserialize_with = "serde_mcc::deserialize"
@@ -805,13 +807,15 @@ impl Default for ExtendedSystemParametersDefaults {
             // Prefer full IMSI+ESN on access so the network can retain richer identity state.
             use_tmsi: false,
             pref_msid_type: 3,
+            ext_pref_msid_type: Some(1),
+            meid_reqd: Some(true),
             mcc: 0x03ff,
             imsi_11_12: 0x7f,
             tmsi_zone: vec![0],
             bcast_index: 0,
             imsi_t_supported: false,
-            p_rev: 6,
-            min_p_rev: 6,
+            p_rev: 11,
+            min_p_rev: 3,
             soft_slope: 0,
             add_intercept: 0,
             drop_intercept: 0,
@@ -1015,6 +1019,16 @@ pub struct SystemParametersMessage {
     pub user_zone_id: bool,
     pub ext_global_redirect: bool,
     pub ext_chan_lst: bool,
+    // C.S0005-E Table 3.7.2.3.2.1 mandatory tail at P_REV >= 6/7/8.
+    pub t_tdrop_range_incl: bool,
+    pub t_tdrop_range: u8,
+    pub neg_slot_cycle_index_sup: bool,
+    pub crrm_msg_ind: bool,
+    /// Count of the optional-overhead-message flag bits that follow
+    /// (AP_PILOT_INFO, AP_IDT, AP_ID_TEXT, GEN_OVHD_INF_IND, FD_CHAN_LST_IND,
+    /// ATIM_IND) plus their reserved tail. Encoder asserts 0.
+    pub num_opt_msg_bits: u8,
+    pub add_loc_info_incl: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1135,6 +1149,8 @@ pub struct ExtendedSystemParametersMessage {
     pub bcch_supported: bool,
     pub ms_init_pos_loc_sup_ind: bool,
     pub pilot_info_req_supported: bool,
+    pub ext_pref_msid_type: Option<u8>,
+    pub meid_reqd: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -5374,56 +5390,148 @@ impl SystemParametersMessage {
         bs.write_u8(self.user_zone_id as u8, 1);
         bs.write_u8(self.ext_global_redirect as u8, 1);
         bs.write_u8(self.ext_chan_lst as u8, 1);
+        bs.write_u8(self.t_tdrop_range_incl as u8, 1);
+        if self.t_tdrop_range_incl {
+            bs.write_u8(self.t_tdrop_range, 4);
+        }
+        bs.write_u8(self.neg_slot_cycle_index_sup as u8, 1);
+        bs.write_u8(self.crrm_msg_ind as u8, 1);
+        assert_eq!(
+            self.num_opt_msg_bits, 0,
+            "SPM optional overhead message bits not yet implemented"
+        );
+        bs.write_u8(self.num_opt_msg_bits, 4);
+        bs.write_u8(self.add_loc_info_incl as u8, 1);
+        assert!(
+            !self.add_loc_info_incl,
+            "SPM ADD_LOC_INFO not yet implemented"
+        );
         bs
     }
 
     pub fn from_sdu(bs: &mut Bitstream) -> Result<Self, crate::error::Error> {
+        let pilot_pn = bs.read_bits(9)? as u16;
+        let config_msg_seq = bs.read_bits(6)? as u8;
+        let sid = bs.read_bits(15)? as u16;
+        let nid = bs.read_bits(16)? as u16;
+        let reg_zone = bs.read_bits(12)? as u16;
+        let total_zones = bs.read_bits(3)? as u8;
+        let zone_timer = bs.read_bits(3)? as u8;
+        let mult_sids = bs.read_bits(1)? != 0;
+        let mult_nids = bs.read_bits(1)? != 0;
+        let base_id = bs.read_bits(16)? as u16;
+        let base_class = bs.read_bits(4)? as u8;
+        let page_chan = bs.read_bits(3)? as u8;
+        let max_slot_cycle_index = bs.read_bits(3)? as u8;
+        let home_reg = bs.read_bits(1)? != 0;
+        let for_sid_reg = bs.read_bits(1)? != 0;
+        let for_nid_reg = bs.read_bits(1)? != 0;
+        let power_up_reg = bs.read_bits(1)? != 0;
+        let power_down_reg = bs.read_bits(1)? != 0;
+        let parameter_reg = bs.read_bits(1)? != 0;
+        let reg_prd = bs.read_bits(7)? as u8;
+        let base_lat = bs.read_bits(22)? as u32;
+        let base_long = bs.read_bits(23)? as u32;
+        let reg_dist = bs.read_bits(11)? as u16;
+        let srch_win_a = bs.read_bits(4)? as u8;
+        let srch_win_n = bs.read_bits(4)? as u8;
+        let srch_win_r = bs.read_bits(4)? as u8;
+        let nghbr_max_age = bs.read_bits(4)? as u8;
+        let pwr_rep_thresh = bs.read_bits(5)? as u8;
+        let pwr_rep_frames = bs.read_bits(4)? as u8;
+        let pwr_thresh_enable = bs.read_bits(1)? != 0;
+        let pwr_period_enable = bs.read_bits(1)? != 0;
+        let pwr_rep_delay = bs.read_bits(5)? as u8;
+        let rescan = bs.read_bits(1)? != 0;
+        let t_add = bs.read_bits(6)? as u8;
+        let t_drop = bs.read_bits(6)? as u8;
+        let t_comp = bs.read_bits(4)? as u8;
+        let t_tdrop = bs.read_bits(4)? as u8;
+        let ext_sys_parameter = bs.read_bits(1)? != 0;
+        let ext_nghbr_lst = bs.read_bits(1)? != 0;
+        let gen_nghbr_lst = bs.read_bits(1)? != 0;
+        let global_redirect = bs.read_bits(1)? != 0;
+        let pri_nghbr_lst = bs.read_bits(1)? != 0;
+        let user_zone_id = bs.read_bits(1)? != 0;
+        let ext_global_redirect = bs.read_bits(1)? != 0;
+        let ext_chan_lst = bs.read_bits(1)? != 0;
+        // Pre-P_REV-6 traces stop at EXT_CHAN_LST; default to absent.
+        let t_tdrop_range_incl = !bs.is_empty() && bs.read_bits(1)? != 0;
+        let t_tdrop_range = if t_tdrop_range_incl {
+            bs.read_bits(4)? as u8
+        } else {
+            0
+        };
+        let neg_slot_cycle_index_sup = !bs.is_empty() && bs.read_bits(1)? != 0;
+        let crrm_msg_ind = !bs.is_empty() && bs.read_bits(1)? != 0;
+        let num_opt_msg_bits = if bs.is_empty() {
+            0
+        } else {
+            bs.read_bits(4)? as u8
+        };
+        if num_opt_msg_bits != 0 {
+            return Err(
+                "SPM NUM_OPT_MSG_BITS != 0 (optional overhead messages not implemented)".into(),
+            );
+        }
+        let add_loc_info_incl = !bs.is_empty() && bs.read_bits(1)? != 0;
+        if add_loc_info_incl {
+            return Err(
+                "SPM ADD_LOC_INFO_INCL=1 (additional location info not implemented)".into(),
+            );
+        }
         Ok(Self {
-            pilot_pn: bs.read_bits(9)? as u16,
-            config_msg_seq: bs.read_bits(6)? as u8,
-            sid: bs.read_bits(15)? as u16,
-            nid: bs.read_bits(16)? as u16,
-            reg_zone: bs.read_bits(12)? as u16,
-            total_zones: bs.read_bits(3)? as u8,
-            zone_timer: bs.read_bits(3)? as u8,
-            mult_sids: bs.read_bits(1)? != 0,
-            mult_nids: bs.read_bits(1)? != 0,
-            base_id: bs.read_bits(16)? as u16,
-            base_class: bs.read_bits(4)? as u8,
-            page_chan: bs.read_bits(3)? as u8,
-            max_slot_cycle_index: bs.read_bits(3)? as u8,
-            home_reg: bs.read_bits(1)? != 0,
-            for_sid_reg: bs.read_bits(1)? != 0,
-            for_nid_reg: bs.read_bits(1)? != 0,
-            power_up_reg: bs.read_bits(1)? != 0,
-            power_down_reg: bs.read_bits(1)? != 0,
-            parameter_reg: bs.read_bits(1)? != 0,
-            reg_prd: bs.read_bits(7)? as u8,
-            base_lat: bs.read_bits(22)? as u32,
-            base_long: bs.read_bits(23)? as u32,
-            reg_dist: bs.read_bits(11)? as u16,
-            srch_win_a: bs.read_bits(4)? as u8,
-            srch_win_n: bs.read_bits(4)? as u8,
-            srch_win_r: bs.read_bits(4)? as u8,
-            nghbr_max_age: bs.read_bits(4)? as u8,
-            pwr_rep_thresh: bs.read_bits(5)? as u8,
-            pwr_rep_frames: bs.read_bits(4)? as u8,
-            pwr_thresh_enable: bs.read_bits(1)? != 0,
-            pwr_period_enable: bs.read_bits(1)? != 0,
-            pwr_rep_delay: bs.read_bits(5)? as u8,
-            rescan: bs.read_bits(1)? != 0,
-            t_add: bs.read_bits(6)? as u8,
-            t_drop: bs.read_bits(6)? as u8,
-            t_comp: bs.read_bits(4)? as u8,
-            t_tdrop: bs.read_bits(4)? as u8,
-            ext_sys_parameter: bs.read_bits(1)? != 0,
-            ext_nghbr_lst: bs.read_bits(1)? != 0,
-            gen_nghbr_lst: bs.read_bits(1)? != 0,
-            global_redirect: bs.read_bits(1)? != 0,
-            pri_nghbr_lst: bs.read_bits(1)? != 0,
-            user_zone_id: bs.read_bits(1)? != 0,
-            ext_global_redirect: bs.read_bits(1)? != 0,
-            ext_chan_lst: bs.read_bits(1)? != 0,
+            pilot_pn,
+            config_msg_seq,
+            sid,
+            nid,
+            reg_zone,
+            total_zones,
+            zone_timer,
+            mult_sids,
+            mult_nids,
+            base_id,
+            base_class,
+            page_chan,
+            max_slot_cycle_index,
+            home_reg,
+            for_sid_reg,
+            for_nid_reg,
+            power_up_reg,
+            power_down_reg,
+            parameter_reg,
+            reg_prd,
+            base_lat,
+            base_long,
+            reg_dist,
+            srch_win_a,
+            srch_win_n,
+            srch_win_r,
+            nghbr_max_age,
+            pwr_rep_thresh,
+            pwr_rep_frames,
+            pwr_thresh_enable,
+            pwr_period_enable,
+            pwr_rep_delay,
+            rescan,
+            t_add,
+            t_drop,
+            t_comp,
+            t_tdrop,
+            ext_sys_parameter,
+            ext_nghbr_lst,
+            gen_nghbr_lst,
+            global_redirect,
+            pri_nghbr_lst,
+            user_zone_id,
+            ext_global_redirect,
+            ext_chan_lst,
+            t_tdrop_range_incl,
+            t_tdrop_range,
+            neg_slot_cycle_index_sup,
+            crrm_msg_ind,
+            num_opt_msg_bits,
+            add_loc_info_incl,
         })
     }
 }
@@ -5686,8 +5794,49 @@ impl CdmaChannelListMessage {
 }
 
 impl ExtendedSystemParametersMessage {
+    fn meid_reqd_present(pref_msid_type: u8, ext_pref_msid_type: u8) -> bool {
+        !(ext_pref_msid_type == 0b11 && matches!(pref_msid_type, 0b00 | 0b11))
+    }
+
+    fn valid_msid_selector(use_tmsi: bool, pref_msid_type: u8, ext_pref_msid_type: u8) -> bool {
+        ext_pref_msid_type != 0b10
+            && matches!(
+                (use_tmsi, pref_msid_type, ext_pref_msid_type),
+                (false, 0b00, 0b00)
+                    | (false, 0b10, 0b00)
+                    | (false, 0b11, 0b00)
+                    | (true, 0b10, 0b00)
+                    | (true, 0b11, 0b00)
+                    | (false, 0b00, 0b01)
+                    | (false, 0b10, 0b01)
+                    | (false, 0b11, 0b01)
+                    | (true, 0b10, 0b01)
+                    | (true, 0b11, 0b01)
+                    | (false, 0b00, 0b11)
+                    | (false, 0b10, 0b11)
+                    | (false, 0b11, 0b11)
+                    | (true, 0b10, 0b11)
+                    | (true, 0b11, 0b11)
+            )
+    }
+
     pub fn to_sdu(&self) -> Bitstream {
         let mut bs = Bitstream::new();
+        if let Some(ext_pref_msid_type) = self.ext_pref_msid_type {
+            assert!(
+                self.p_rev >= 11,
+                "ESPM EXT_PREF_MSID_TYPE requires P_REV >= 11"
+            );
+            assert!(
+                Self::valid_msid_selector(self.use_tmsi, self.pref_msid_type, ext_pref_msid_type),
+                "ESPM reserved USE_TMSI/PREF_MSID_TYPE/EXT_PREF_MSID_TYPE combination"
+            );
+            assert_eq!(
+                self.meid_reqd.is_some(),
+                Self::meid_reqd_present(self.pref_msid_type, ext_pref_msid_type),
+                "ESPM MEID_REQD presence must follow PREF_MSID_TYPE/EXT_PREF_MSID_TYPE"
+            );
+        }
         bs.write_u32(self.pilot_pn as u32, 9);
         bs.write_u8(self.config_msg_seq, 6);
         bs.write_u8(self.delete_for_tmsi as u8, 1);
@@ -5790,6 +5939,36 @@ impl ExtendedSystemParametersMessage {
         bs.write_u8(self.bcch_supported as u8, 1);
         bs.write_u8(self.ms_init_pos_loc_sup_ind as u8, 1);
         bs.write_u8(self.pilot_info_req_supported as u8, 1);
+        if let Some(ext_pref_msid_type) = self.ext_pref_msid_type {
+            if self.qpch_supported {
+                bs.write_u8(0, 1); // QPCH_BI_SUPPORTED
+            }
+            bs.write_u8(0, 1); // BAND_CLASS_INFO_REQ
+            bs.write_u8(0, 1); // CDMA_OFF_TIME_REP_SUP_IND
+            bs.write_u8(0, 1); // CHM_SUPPORTED
+            bs.write_u8(0, 1); // RELEASE_TO_IDLE_IND
+            bs.write_u8(0, 1); // RECONNECT_MSG_IND
+            bs.write_u8(0, 1); // MSG_INTEGRITY_SUP
+            bs.write_u8(0, 1); // FOR_PDCH_SUPPORTED
+            bs.write_u8(0, 1); // IMSI_10_INCL
+            if self.cs_supported {
+                bs.write_u8(0, 3); // MAX_ADD_SERV_INSTANCE
+            }
+            bs.write_u8(0, 1); // RER_MODE_SUPPORTED
+            bs.write_u8(0, 1); // TKZ_MODE_SUPPORTED
+            if self.packet_zone_id != 0 {
+                bs.write_u8(0, 1); // PZ_HYST_ENABLED
+            }
+            bs.write_u8(ext_pref_msid_type, 2);
+            if Self::meid_reqd_present(self.pref_msid_type, ext_pref_msid_type) {
+                bs.write_u8(self.meid_reqd.expect("validated") as u8, 1);
+            }
+            bs.write_u8(0, 1); // AUTO_FCSO_ALLOWED
+            bs.write_u8(0, 1); // SENDING_BSPM
+            bs.write_u8(0, 1); // CAND_BAND_INFO_REQ
+            bs.write_u8(0, 1); // TX_PWR_LIMIT_INCL
+            bs.write_u8(0, 2); // BYPASS_REG_IND
+        }
         bs
     }
 
@@ -5911,6 +6090,168 @@ impl ExtendedSystemParametersMessage {
         let bcch_supported = bs.read_bits(1)? != 0;
         let ms_init_pos_loc_sup_ind = bs.read_bits(1)? != 0;
         let pilot_info_req_supported = bs.read_bits(1)? != 0;
+        let (ext_pref_msid_type, meid_reqd) = if bs.is_empty() {
+            (None, None)
+        } else {
+            if qpch_supported {
+                let qpch_bi_supported = bs.read_bits(1)? != 0;
+                if qpch_bi_supported {
+                    let _qpch_power_level_bcast = bs.read_bits(3)?;
+                }
+            }
+            let band_class_info_req = bs.read_bits(1)? != 0;
+            if band_class_info_req {
+                let _alt_band_class = bs.read_bits(5)?;
+            }
+            let cdma_off_time_rep_sup_ind = bs.read_bits(1)? != 0;
+            if cdma_off_time_rep_sup_ind {
+                let _cdma_off_time_rep_threshold_unit = bs.read_bits(1)?;
+                let _cdma_off_time_rep_threshold = bs.read_bits(3)?;
+            }
+            let _chm_supported = bs.read_bits(1)? != 0;
+            let _release_to_idle_ind = bs.read_bits(1)? != 0;
+            let reconnect_msg_ind = bs.read_bits(1)? != 0;
+            let msg_integrity_sup = bs.read_bits(1)? != 0;
+            if msg_integrity_sup && bs.read_bits(1)? != 0 {
+                let sig_integrity_sup = bs.read_bits(8)?;
+                if sig_integrity_sup != 0 {
+                    return Err("ESPM SIG_INTEGRITY_SUP reserved bits must be zero".into());
+                }
+            }
+            let for_pdch_supported = bs.read_bits(1)? != 0;
+            if for_pdch_supported {
+                let pdch_chm_supported = bs.read_bits(1)? != 0;
+                let pdch_parms_incl = bs.read_bits(1)? != 0;
+                let for_pdch_rlgain_incl = bs.read_bits(1)? != 0;
+                if for_pdch_rlgain_incl {
+                    let _rlgain_ackch_pilot = bs.read_bits(6)?;
+                    let _rlgain_cqich_pilot = bs.read_bits(6)?;
+                }
+                if pdch_chm_supported {
+                    let _num_soft_switching_frames = bs.read_bits(4)?;
+                    let _num_softer_switching_frames = bs.read_bits(4)?;
+                    let _num_soft_switching_slots = bs.read_bits(2)?;
+                    let _num_softer_switching_slots = bs.read_bits(2)?;
+                    let _pdch_soft_switching_delay = bs.read_bits(8)?;
+                    let _pdch_softer_switching_delay = bs.read_bits(8)?;
+                }
+                if pdch_parms_incl {
+                    let _walsh_table_id = bs.read_bits(3)?;
+                    let num_pdcch = bs.read_bits(3)? as usize;
+                    for _ in 0..=num_pdcch {
+                        let _for_pdcch_walsh = bs.read_bits(6)?;
+                    }
+                }
+            }
+            let imsi_10_incl = bs.read_bits(1)? != 0;
+            if imsi_10_incl {
+                let _imsi_10 = bs.read_bits(4)?;
+            }
+            if cs_supported {
+                let _max_add_serv_instance = bs.read_bits(3)?;
+            }
+            let _rer_mode_supported = bs.read_bits(1)? != 0;
+            let tkz_mode_supported = bs.read_bits(1)? != 0;
+            if tkz_mode_supported {
+                let _tkz_id = bs.read_bits(8)?;
+            }
+            if packet_zone_id != 0 {
+                let pz_hyst_enabled = bs.read_bits(1)? != 0;
+                if pz_hyst_enabled && bs.read_bits(1)? != 0 {
+                    let pz_hyst_list_len = bs.read_bits(4)?;
+                    let pz_hyst_act_timer = bs.read_bits(8)?;
+                    let pz_hyst_timer_mul = bs.read_bits(3)?;
+                    let pz_hyst_timer_exp = bs.read_bits(5)?;
+                    if pz_hyst_list_len == 0
+                        || pz_hyst_act_timer == 0
+                        || pz_hyst_timer_mul == 0
+                        || pz_hyst_timer_exp > 4
+                    {
+                        return Err("ESPM packet-zone hysteresis values out of spec".into());
+                    }
+                }
+            }
+            let ext_pref_msid_type = bs.read_bits(2)? as u8;
+            if !Self::valid_msid_selector(use_tmsi, pref_msid_type, ext_pref_msid_type) {
+                return Err(
+                    "ESPM reserved USE_TMSI/PREF_MSID_TYPE/EXT_PREF_MSID_TYPE combination".into(),
+                );
+            }
+            let meid_reqd = if Self::meid_reqd_present(pref_msid_type, ext_pref_msid_type) {
+                Some(bs.read_bits(1)? != 0)
+            } else {
+                None
+            };
+            if !bs.is_empty() {
+                let _auto_fcso_allowed = bs.read_bits(1)? != 0;
+            }
+            let rev_pdch_supported = if for_pdch_supported && !bs.is_empty() {
+                bs.read_bits(1)? != 0
+            } else {
+                false
+            };
+            if rev_pdch_supported {
+                let rev_pdch_parms_incl = bs.read_bits(1)? != 0;
+                if rev_pdch_parms_incl {
+                    let rev_pdch_rlgain_incl = bs.read_bits(1)? != 0;
+                    if rev_pdch_rlgain_incl {
+                        let _rlgain_spich_pilot = bs.read_bits(6)?;
+                        let _rlgain_reqch_pilot = bs.read_bits(6)?;
+                        let _rlgain_pdcch_pilot = bs.read_bits(6)?;
+                    }
+                    let rev_pdch_parms_1_incl = bs.read_bits(1)? != 0;
+                    if rev_pdch_parms_1_incl {
+                        let _rev_pdch_table_sel = bs.read_bits(1)?;
+                        let _rev_pdch_max_auto_tpr = bs.read_bits(8)?;
+                        let _rev_pdch_num_arq_rounds_normal = bs.read_bits(2)?;
+                    }
+                    let rev_pdch_oper_parms_incl = bs.read_bits(1)? != 0;
+                    if rev_pdch_oper_parms_incl {
+                        let _rev_pdch_max_size_allowed_encoder_packet = bs.read_bits(4)?;
+                        let _rev_pdch_default_persistence = bs.read_bits(1)?;
+                        let _rev_pdch_reset_persistence = bs.read_bits(1)?;
+                        let _rev_pdch_grant_precedence = bs.read_bits(1)?;
+                        let _rev_pdch_msib_supported = bs.read_bits(1)?;
+                        let _rev_pdch_soft_switching_reset_ind = bs.read_bits(1)?;
+                    }
+                }
+            }
+            if reconnect_msg_ind && sdb_supported && !bs.is_empty() {
+                let _sdb_in_rcnm_ind = bs.read_bits(1)? != 0;
+            }
+            if !bs.is_empty() {
+                let sending_bspm = bs.read_bits(1)? != 0;
+                if sending_bspm {
+                    let _bspm_period_index = bs.read_bits(4)?;
+                }
+            }
+            if !bs.is_empty() {
+                let cand_band_info_req = bs.read_bits(1)? != 0;
+                if cand_band_info_req {
+                    let num_cand_band_class = bs.read_bits(3)? as usize;
+                    for _ in 0..=num_cand_band_class {
+                        let _cand_band_class = bs.read_bits(5)?;
+                        let subclass_info_incl = bs.read_bits(1)? != 0;
+                        if subclass_info_incl {
+                            let subclass_rec_len = bs.read_bits(5)? as usize;
+                            for _ in 0..=subclass_rec_len {
+                                let _band_subclass_ind = bs.read_bits(1)?;
+                            }
+                        }
+                    }
+                }
+            }
+            if !bs.is_empty() {
+                let tx_pwr_limit_incl = bs.read_bits(1)? != 0;
+                if tx_pwr_limit_incl {
+                    let _tx_pwr_limit = bs.read_bits(6)?;
+                }
+            }
+            if !bs.is_empty() {
+                let _bypass_reg_ind = bs.read_bits(2)?;
+            }
+            (Some(ext_pref_msid_type), meid_reqd)
+        };
 
         Ok(Self {
             pilot_pn,
@@ -5968,6 +6309,8 @@ impl ExtendedSystemParametersMessage {
             bcch_supported,
             ms_init_pos_loc_sup_ind,
             pilot_info_req_supported,
+            ext_pref_msid_type,
+            meid_reqd,
         })
     }
 }
@@ -17953,6 +18296,12 @@ mod forward_overhead_decode_tests {
                 user_zone_id: false,
                 ext_global_redirect: true,
                 ext_chan_lst: true,
+                t_tdrop_range_incl: false,
+                t_tdrop_range: 0,
+                neg_slot_cycle_index_sup: false,
+                crrm_msg_ind: false,
+                num_opt_msg_bits: 0,
+                add_loc_info_incl: false,
             },
         ));
         match decoded {
@@ -17961,6 +18310,79 @@ mod forward_overhead_decode_tests {
                 assert_eq!(m.nid, 65535);
                 assert!(m.ext_sys_parameter);
                 assert!(m.ext_chan_lst);
+                assert!(!m.t_tdrop_range_incl);
+                assert!(!m.neg_slot_cycle_index_sup);
+                assert!(!m.crrm_msg_ind);
+                assert_eq!(m.num_opt_msg_bits, 0);
+                assert!(!m.add_loc_info_incl);
+            }
+            _ => panic!("unexpected decoded message"),
+        }
+    }
+
+    #[test]
+    fn common_system_parameters_from_sdu_roundtrip_with_t_tdrop_range() {
+        let decoded = common_roundtrip(PagingChannelMessage::SystemParameters(
+            SystemParametersMessage {
+                pilot_pn: 0,
+                config_msg_seq: 1,
+                sid: 1,
+                nid: 0,
+                reg_zone: 0,
+                total_zones: 1,
+                zone_timer: 0,
+                mult_sids: false,
+                mult_nids: false,
+                base_id: 1,
+                base_class: 0,
+                page_chan: 1,
+                max_slot_cycle_index: 0,
+                home_reg: true,
+                for_sid_reg: true,
+                for_nid_reg: true,
+                power_up_reg: true,
+                power_down_reg: false,
+                parameter_reg: false,
+                reg_prd: 0,
+                base_lat: 0,
+                base_long: 0,
+                reg_dist: 0,
+                srch_win_a: 0,
+                srch_win_n: 0,
+                srch_win_r: 0,
+                nghbr_max_age: 0,
+                pwr_rep_thresh: 0,
+                pwr_rep_frames: 0,
+                pwr_thresh_enable: false,
+                pwr_period_enable: false,
+                pwr_rep_delay: 0,
+                rescan: false,
+                t_add: 0,
+                t_drop: 0,
+                t_comp: 0,
+                t_tdrop: 0,
+                ext_sys_parameter: false,
+                ext_nghbr_lst: false,
+                gen_nghbr_lst: false,
+                global_redirect: false,
+                pri_nghbr_lst: false,
+                user_zone_id: false,
+                ext_global_redirect: false,
+                ext_chan_lst: false,
+                t_tdrop_range_incl: true,
+                t_tdrop_range: 0b1010,
+                neg_slot_cycle_index_sup: true,
+                crrm_msg_ind: true,
+                num_opt_msg_bits: 0,
+                add_loc_info_incl: false,
+            },
+        ));
+        match decoded {
+            PagingChannelMessage::SystemParameters(m) => {
+                assert!(m.t_tdrop_range_incl);
+                assert_eq!(m.t_tdrop_range, 0b1010);
+                assert!(m.neg_slot_cycle_index_sup);
+                assert!(m.crrm_msg_ind);
             }
             _ => panic!("unexpected decoded message"),
         }
@@ -18112,6 +18534,8 @@ mod forward_overhead_decode_tests {
                 bcch_supported: false,
                 ms_init_pos_loc_sup_ind: true,
                 pilot_info_req_supported: true,
+                ext_pref_msid_type: None,
+                meid_reqd: None,
             },
         ));
         match decoded {
@@ -18122,6 +18546,78 @@ mod forward_overhead_decode_tests {
                 assert_eq!(m.access_ho_allowed, vec![false, true]);
                 assert_eq!(m.sig_encrypt_sup, 0xaa);
                 assert_eq!(m.ui_encrypt_sup, 0x55);
+            }
+            _ => panic!("unexpected decoded message"),
+        }
+    }
+
+    #[test]
+    fn common_extended_system_parameters_roundtrip_with_meid_request() {
+        let decoded = common_roundtrip(PagingChannelMessage::ExtendedSystemParameters(
+            ExtendedSystemParametersMessage {
+                pilot_pn: 4,
+                config_msg_seq: 23,
+                delete_for_tmsi: false,
+                use_tmsi: false,
+                pref_msid_type: 3,
+                mcc: 310,
+                imsi_11_12: 55,
+                tmsi_zone: vec![0],
+                bcast_index: 0,
+                imsi_t_supported: false,
+                p_rev: 11,
+                min_p_rev: 3,
+                soft_slope: 0,
+                add_intercept: 0,
+                drop_intercept: 0,
+                packet_zone_id: 0,
+                max_num_alt_so: 0,
+                reselect_included: false,
+                ec_thresh: 0,
+                ec_io_thresh: 0,
+                pilot_report: false,
+                nghbr_set_entry_info: false,
+                acc_ent_ho_order: false,
+                nghbr_set_access_info: false,
+                access_ho: false,
+                access_ho_msg_rsp: false,
+                access_probe_ho: false,
+                acc_ho_list_upd: false,
+                acc_probe_ho_other_msg: false,
+                max_num_probe_ho: 0,
+                nghbr_set_size: 0,
+                access_entry_ho: Vec::new(),
+                access_ho_allowed: Vec::new(),
+                broadcast_gps_asst: false,
+                qpch_supported: false,
+                num_qpch: 0,
+                qpch_rate: 0,
+                qpch_power_level_page: 0,
+                qpch_cci_supported: false,
+                qpch_power_level_config: 0,
+                sdb_supported: false,
+                rlgain_traffic_pilot: 0,
+                rev_pwr_cntl_delay_incl: false,
+                rev_pwr_cntl_delay: 0,
+                auto_msg_supported: false,
+                auto_msg_interval: 0,
+                mob_qos: false,
+                enc_supported: false,
+                sig_encrypt_sup: 0,
+                ui_encrypt_sup: 0,
+                use_sync_id: false,
+                cs_supported: false,
+                bcch_supported: false,
+                ms_init_pos_loc_sup_ind: false,
+                pilot_info_req_supported: false,
+                ext_pref_msid_type: Some(1),
+                meid_reqd: Some(true),
+            },
+        ));
+        match decoded {
+            PagingChannelMessage::ExtendedSystemParameters(m) => {
+                assert_eq!(m.ext_pref_msid_type, Some(1));
+                assert_eq!(m.meid_reqd, Some(true));
             }
             _ => panic!("unexpected decoded message"),
         }

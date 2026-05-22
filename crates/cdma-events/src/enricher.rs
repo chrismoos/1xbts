@@ -20,7 +20,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cdma_hlr::proto::hlr_service_client::HlrServiceClient;
-use cdma_hlr::proto::{GetSubscriberRequest, ResolveSubscriberByIdentityRequest};
+use cdma_hlr::proto::{
+    GetSubscriberRequest, MobileIdentityKey, ResolveSubscriberByIdentityRequest,
+};
 use lru::LruCache;
 use parking_lot::Mutex;
 use tonic::transport::{Channel, Endpoint};
@@ -42,7 +44,7 @@ pub trait HlrEnricher: Send + Sync {
 
 /// Convenience: identity carries no resolvable hint.
 pub fn identity_is_empty(id: &MobileIdentity) -> bool {
-    id.imsi.is_empty() && id.esn == 0
+    id.imsi.is_empty() && id.esn == 0 && id.meid.is_empty()
 }
 
 /// Convenience: subscriber carries no resolved UUID.
@@ -54,7 +56,11 @@ pub fn subscriber_is_unresolved(sub: &Subscriber) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum CacheKey {
-    ByIdentity { imsi: String, esn: u32 },
+    ByIdentity {
+        imsi: String,
+        esn: u32,
+        meid: String,
+    },
     BySubscriberId(String),
 }
 
@@ -152,7 +158,7 @@ fn hlr_identity_to_bus(hlr: cdma_hlr::proto::SubscriberIdentity) -> MobileIdenti
     MobileIdentity {
         imsi: hlr.imsi.unwrap_or_default(),
         esn: hlr.esn.unwrap_or(0),
-        meid: String::new(),
+        meid: hlr.meid.unwrap_or_default(),
     }
 }
 
@@ -167,20 +173,28 @@ impl HlrEnricher for CachingHlrEnricher {
             let key = CacheKey::ByIdentity {
                 imsi: identity.imsi.clone(),
                 esn: identity.esn,
+                meid: identity.meid.clone(),
             };
             let cached = self.lookup_cache(&key);
             let record = if let Some(record) = cached {
                 record
             } else {
-                let imsi = (!identity.imsi.is_empty()).then(|| identity.imsi.clone());
-                let esn = (identity.esn != 0).then_some(identity.esn);
+                let identity_key = match cdma_hlr::model::MobileIdentityKey::from_parts(
+                    (!identity.imsi.is_empty()).then_some(identity.imsi.as_str()),
+                    (identity.esn != 0).then_some(identity.esn),
+                    (!identity.meid.is_empty()).then_some(identity.meid.as_str()),
+                ) {
+                    Ok(identity_key) => MobileIdentityKey {
+                        imsi: Some(identity_key.imsi().to_string()),
+                        esn: identity_key.esn(),
+                        meid: identity_key.meid().map(ToOwned::to_owned),
+                    },
+                    Err(_) => return,
+                };
                 let mut client = self.client.clone();
                 match client
                     .resolve_subscriber_by_identity(ResolveSubscriberByIdentityRequest {
-                        esn,
-                        imsi,
-                        imsi_m_s1: None,
-                        imsi_m_s2: None,
+                        identity: Some(identity_key),
                     })
                     .await
                 {
@@ -200,7 +214,7 @@ impl HlrEnricher for CachingHlrEnricher {
                                 .unwrap_or_else(|| MobileIdentity {
                                     imsi: identity.imsi.clone(),
                                     esn: identity.esn,
-                                    meid: String::new(),
+                                    meid: identity.meid.clone(),
                                 }),
                         });
                         self.insert_cache(key, record.clone());

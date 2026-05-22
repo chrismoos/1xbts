@@ -75,6 +75,12 @@ mod tests {
                 user_zone_id: false,
                 ext_global_redirect: false,
                 ext_chan_lst: false,
+                t_tdrop_range_incl: false,
+                t_tdrop_range: 0,
+                neg_slot_cycle_index_sup: false,
+                crrm_msg_ind: false,
+                num_opt_msg_bits: 0,
+                add_loc_info_incl: false,
             },
         ));
 
@@ -136,6 +142,12 @@ mod tests {
             user_zone_id: false,
             ext_global_redirect: false,
             ext_chan_lst: false,
+            t_tdrop_range_incl: false,
+            t_tdrop_range: 0,
+            neg_slot_cycle_index_sup: false,
+            crrm_msg_ind: false,
+            num_opt_msg_bits: 0,
+            add_loc_info_incl: false,
         });
 
         let mut pdu = Bitstream::new();
@@ -153,7 +165,7 @@ mod tests {
             vec![
                 0x01, 0x00, 0x2e, 0x00, 0x5b, 0xff, 0xfc, 0x00, 0x08, 0x00, 0x00, 0x40, 0x8f, 0x00,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x45, 0x50, 0x03, 0x00, 0x1c, 0x81, 0x4e,
-                0x00,
+                0x00, 0x00,
             ]
         );
     }
@@ -476,6 +488,8 @@ mod tests {
                 bcch_supported: false,
                 ms_init_pos_loc_sup_ind: false,
                 pilot_info_req_supported: false,
+                ext_pref_msid_type: None,
+                meid_reqd: None,
             },
         ));
 
@@ -552,6 +566,8 @@ mod tests {
                 bcch_supported: false,
                 ms_init_pos_loc_sup_ind: false,
                 pilot_info_req_supported: false,
+                ext_pref_msid_type: None,
+                meid_reqd: None,
             });
 
         let mut pdu = Bitstream::new();

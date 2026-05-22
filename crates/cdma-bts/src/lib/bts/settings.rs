@@ -209,7 +209,7 @@ impl Default for OverheadSettings {
             sync_superframe_interval_chips: 98_304,
             t1b_ms: 640,
             auth_mode: 0,
-            p_rev_in_use: 6,
+            p_rev_in_use: 11,
             require_spm: true,
             require_apm: true,
             require_cclm: true,
@@ -515,6 +515,13 @@ pub fn build_scheduled_message(
                 user_zone_id: defaults.user_zone_id,
                 ext_global_redirect: false,
                 ext_chan_lst: false,
+                // SPM tail per C.S0005-E §3.7.2.3.2.1, mandatory at P_REV >= 6.
+                t_tdrop_range_incl: false,
+                t_tdrop_range: 0,
+                neg_slot_cycle_index_sup: false,
+                crrm_msg_ind: false,
+                num_opt_msg_bits: 0,
+                add_loc_info_incl: false,
             })
         }
         PagingMessageKind::AccessParameters => {
@@ -641,6 +648,8 @@ pub fn build_scheduled_message(
                 bcch_supported: defaults.bcch_supported,
                 ms_init_pos_loc_sup_ind: defaults.ms_init_pos_loc_sup_ind,
                 pilot_info_req_supported: defaults.pilot_info_req_supported,
+                ext_pref_msid_type: defaults.ext_pref_msid_type,
+                meid_reqd: defaults.meid_reqd,
             })
         }
         PagingMessageKind::GeneralPage => {

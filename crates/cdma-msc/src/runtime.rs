@@ -1898,12 +1898,19 @@ impl MscRuntime {
             Ok(r) => r,
             Err(_) => return, // not a LocationUpdatingRequest — ignore silently
         };
-        let (esn, imsi) = match &lur.mobile_identity_imsi {
-            cdma_ios::MobileIdentity::Imsi(s) if s != "UNKNOWN" => (None, Some(s.as_str())),
-            cdma_ios::MobileIdentity::Esn(e) => (Some(*e), None),
+        let imsi = match &lur.mobile_identity_imsi {
+            cdma_ios::MobileIdentity::Imsi(s) if s != "UNKNOWN" => Some(s.as_str()),
+            _ => None,
+        };
+        let esn = match &lur.mobile_identity_esn {
+            Some(cdma_ios::MobileIdentity::Esn(e)) => Some(*e),
+            _ => None,
+        };
+        let identity_key = match cdma_hlr::model::MobileIdentityKey::from_parts(imsi, esn, None) {
+            Ok(identity_key) => identity_key,
             _ => {
                 warn!(
-                    "MSC: registration notification has no usable identity — welcome SMS skipped"
+                    "MSC: registration notification has no complete identity — welcome SMS skipped"
                 );
                 return;
             }
@@ -1911,7 +1918,7 @@ impl MscRuntime {
         let upsert = match self
             .config
             .hlr_repo
-            .upsert_mobile_seen(esn, imsi, None)
+            .upsert_mobile_seen(&identity_key, None)
             .await
         {
             Ok(u) => u,
@@ -1941,7 +1948,12 @@ impl MscRuntime {
         if !should_send {
             return;
         }
-        let subscriber = match self.config.hlr_repo.resolve_by_identity(esn, imsi).await {
+        let subscriber = match self
+            .config
+            .hlr_repo
+            .resolve_by_identity(&identity_key)
+            .await
+        {
             Ok(Some(s)) => Some(s),
             Ok(None) => None,
             Err(e) => {
@@ -1955,20 +1967,13 @@ impl MscRuntime {
                 resolved.subscriber.phone_number
             );
             crate::sms::SmsDestinationKey::PhoneNumber(resolved.subscriber.phone_number.clone())
-        } else if let Some(imsi) = imsi {
+        } else {
+            let imsi = identity_key.imsi();
             info!(
                 "MSC: sending welcome SMS to non-subscriber by IMSI {} on registration",
                 imsi
             );
             crate::sms::SmsDestinationKey::Imsi(imsi.to_string())
-        } else {
-            // ADDS Page requires an IMSI on the wire — ESN-only mobiles cannot
-            // be welcomed until they next provide an IMSI.
-            info!(
-                "MSC: registration: ESN-only mobile (esn={:?}) and no HLR record — welcome SMS skipped",
-                esn
-            );
-            return;
         };
         smsc.send_sms(
             crate::sms::SmsSendRequest {
@@ -2341,6 +2346,7 @@ mod tests {
             _: uuid::Uuid,
             _: Option<&str>,
             _: Option<u32>,
+            _: Option<&str>,
         ) -> Result<cdma_hlr::model::SubscriberIdentity, String> {
             unimplemented!()
         }
@@ -2349,6 +2355,7 @@ mod tests {
             _: uuid::Uuid,
             _: Option<&str>,
             _: Option<u32>,
+            _: Option<&str>,
         ) -> Result<cdma_hlr::model::SubscriberIdentity, String> {
             unimplemented!()
         }
@@ -2360,8 +2367,7 @@ mod tests {
         }
         async fn resolve_by_identity(
             &self,
-            _: Option<u32>,
-            _: Option<&str>,
+            _: &cdma_hlr::model::MobileIdentityKey,
         ) -> Result<Option<cdma_hlr::model::ResolvedSubscriber>, String> {
             Ok(None)
         }
@@ -2379,8 +2385,7 @@ mod tests {
         }
         async fn upsert_mobile_seen(
             &self,
-            _: Option<u32>,
-            _: Option<&str>,
+            _: &cdma_hlr::model::MobileIdentityKey,
             _: Option<u8>,
         ) -> Result<cdma_hlr::MobileSeenUpsert, String> {
             Ok(cdma_hlr::MobileSeenUpsert {
@@ -2445,6 +2450,7 @@ mod tests {
                     subscriber_id: self.subscriber_id,
                     imsi: Some(self.imsi.to_string()),
                     esn: None,
+                    meid: None,
                     is_primary: true,
                     created_at: chrono::Utc::now(),
                 };
@@ -2454,6 +2460,7 @@ mod tests {
                     state: cdma_hlr::model::RegistrationState::Registered,
                     imsi: Some(self.imsi.to_string()),
                     esn: None,
+                    meid: None,
                     mob_p_rev: Some(6),
                     pgslot: Some(0),
                     slot_cycle_index: Some(2),
@@ -2504,6 +2511,7 @@ mod tests {
             _: uuid::Uuid,
             _: Option<&str>,
             _: Option<u32>,
+            _: Option<&str>,
         ) -> Result<cdma_hlr::model::SubscriberIdentity, String> {
             unimplemented!()
         }
@@ -2512,6 +2520,7 @@ mod tests {
             _: uuid::Uuid,
             _: Option<&str>,
             _: Option<u32>,
+            _: Option<&str>,
         ) -> Result<cdma_hlr::model::SubscriberIdentity, String> {
             unimplemented!()
         }
@@ -2525,14 +2534,14 @@ mod tests {
                 subscriber_id,
                 imsi: Some(self.imsi.to_string()),
                 esn: None,
+                meid: None,
                 is_primary: true,
                 created_at: chrono::Utc::now(),
             }])
         }
         async fn resolve_by_identity(
             &self,
-            _: Option<u32>,
-            _: Option<&str>,
+            _: &cdma_hlr::model::MobileIdentityKey,
         ) -> Result<Option<cdma_hlr::model::ResolvedSubscriber>, String> {
             Ok(None)
         }
@@ -2553,6 +2562,7 @@ mod tests {
                 state: cdma_hlr::model::RegistrationState::Registered,
                 imsi: Some(self.imsi.to_string()),
                 esn: None,
+                meid: None,
                 mob_p_rev: Some(6),
                 pgslot: Some(0),
                 slot_cycle_index: Some(2),
@@ -2564,8 +2574,7 @@ mod tests {
         }
         async fn upsert_mobile_seen(
             &self,
-            _: Option<u32>,
-            _: Option<&str>,
+            _: &cdma_hlr::model::MobileIdentityKey,
             _: Option<u8>,
         ) -> Result<cdma_hlr::MobileSeenUpsert, String> {
             Ok(cdma_hlr::MobileSeenUpsert {
@@ -3716,7 +3725,7 @@ mod tests {
             local_answer_delay_ms: 10_000,
             // `media_ringback_enabled=true` would normally start a ringback
             // feeder on AssignmentComplete. The new `sip_ringback_disable`
-            // gate must override it for SIP-routed calls.
+            // setting must override it for SIP-routed calls.
             media_ringback_enabled: true,
             media_ringback_type: MediaRingbackType::Nanp,
             sip_ringback_disable: true,

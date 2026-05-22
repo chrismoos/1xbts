@@ -100,6 +100,7 @@ export interface AccessEvent {
   esn?: number | undefined;
   imsiMS1?: number | undefined;
   imsiMS2?: number | undefined;
+  meid?: string | undefined;
   mobPRev?:
     | number
     | undefined;
@@ -537,6 +538,8 @@ export interface PagingExtendedSystemParameters {
   useTmsi: boolean;
   prefMsidType: number;
   maxNumAltSo: number;
+  extPrefMsidType?: number | undefined;
+  meidReqd?: boolean | undefined;
 }
 
 /** General Page Message fields and page records. */
@@ -752,7 +755,8 @@ export interface MobileInfo {
   mobPRev: number;
   /** Structured identity */
   esn?: number | undefined;
-  imsi?:
+  imsi?: string | undefined;
+  meid?:
     | string
     | undefined;
   /** Slotted mode paging */
@@ -2249,6 +2253,7 @@ function createBaseAccessEvent(): AccessEvent {
     esn: undefined,
     imsiMS1: undefined,
     imsiMS2: undefined,
+    meid: undefined,
     mobPRev: undefined,
     timestampUs: 0,
     snrDb: undefined,
@@ -2326,6 +2331,9 @@ export const AccessEvent: MessageFns<AccessEvent> = {
     }
     if (message.imsiMS2 !== undefined) {
       writer.uint32(104).uint32(message.imsiMS2);
+    }
+    if (message.meid !== undefined) {
+      writer.uint32(378).string(message.meid);
     }
     if (message.mobPRev !== undefined) {
       writer.uint32(112).uint32(message.mobPRev);
@@ -2536,6 +2544,14 @@ export const AccessEvent: MessageFns<AccessEvent> = {
           }
 
           message.imsiMS2 = reader.uint32();
+          continue;
+        }
+        case 47: {
+          if (tag !== 378) {
+            break;
+          }
+
+          message.meid = reader.string();
           continue;
         }
         case 14: {
@@ -2779,6 +2795,7 @@ export const AccessEvent: MessageFns<AccessEvent> = {
         : isSet(object.imsi_m_s2)
         ? globalThis.Number(object.imsi_m_s2)
         : undefined,
+      meid: isSet(object.meid) ? globalThis.String(object.meid) : undefined,
       mobPRev: isSet(object.mobPRev)
         ? globalThis.Number(object.mobPRev)
         : isSet(object.mob_p_rev)
@@ -2921,6 +2938,9 @@ export const AccessEvent: MessageFns<AccessEvent> = {
     if (message.imsiMS2 !== undefined) {
       obj.imsiMS2 = Math.round(message.imsiMS2);
     }
+    if (message.meid !== undefined) {
+      obj.meid = message.meid;
+    }
     if (message.mobPRev !== undefined) {
       obj.mobPRev = Math.round(message.mobPRev);
     }
@@ -3004,6 +3024,7 @@ export const AccessEvent: MessageFns<AccessEvent> = {
     message.esn = object.esn ?? undefined;
     message.imsiMS1 = object.imsiMS1 ?? undefined;
     message.imsiMS2 = object.imsiMS2 ?? undefined;
+    message.meid = object.meid ?? undefined;
     message.mobPRev = object.mobPRev ?? undefined;
     message.timestampUs = object.timestampUs ?? 0;
     message.snrDb = object.snrDb ?? undefined;
@@ -8924,7 +8945,18 @@ export const PagingCdmaChannelList: MessageFns<PagingCdmaChannelList> = {
 };
 
 function createBasePagingExtendedSystemParameters(): PagingExtendedSystemParameters {
-  return { pilotPn: 0, pRev: 0, minPRev: 0, mcc: 0, imsi1112: 0, useTmsi: false, prefMsidType: 0, maxNumAltSo: 0 };
+  return {
+    pilotPn: 0,
+    pRev: 0,
+    minPRev: 0,
+    mcc: 0,
+    imsi1112: 0,
+    useTmsi: false,
+    prefMsidType: 0,
+    maxNumAltSo: 0,
+    extPrefMsidType: undefined,
+    meidReqd: undefined,
+  };
 }
 
 export const PagingExtendedSystemParameters: MessageFns<PagingExtendedSystemParameters> = {
@@ -8952,6 +8984,12 @@ export const PagingExtendedSystemParameters: MessageFns<PagingExtendedSystemPara
     }
     if (message.maxNumAltSo !== 0) {
       writer.uint32(64).uint32(message.maxNumAltSo);
+    }
+    if (message.extPrefMsidType !== undefined) {
+      writer.uint32(72).uint32(message.extPrefMsidType);
+    }
+    if (message.meidReqd !== undefined) {
+      writer.uint32(80).bool(message.meidReqd);
     }
     return writer;
   },
@@ -9027,6 +9065,22 @@ export const PagingExtendedSystemParameters: MessageFns<PagingExtendedSystemPara
           message.maxNumAltSo = reader.uint32();
           continue;
         }
+        case 9: {
+          if (tag !== 72) {
+            break;
+          }
+
+          message.extPrefMsidType = reader.uint32();
+          continue;
+        }
+        case 10: {
+          if (tag !== 80) {
+            break;
+          }
+
+          message.meidReqd = reader.bool();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -9074,6 +9128,16 @@ export const PagingExtendedSystemParameters: MessageFns<PagingExtendedSystemPara
         : isSet(object.max_num_alt_so)
         ? globalThis.Number(object.max_num_alt_so)
         : 0,
+      extPrefMsidType: isSet(object.extPrefMsidType)
+        ? globalThis.Number(object.extPrefMsidType)
+        : isSet(object.ext_pref_msid_type)
+        ? globalThis.Number(object.ext_pref_msid_type)
+        : undefined,
+      meidReqd: isSet(object.meidReqd)
+        ? globalThis.Boolean(object.meidReqd)
+        : isSet(object.meid_reqd)
+        ? globalThis.Boolean(object.meid_reqd)
+        : undefined,
     };
   },
 
@@ -9103,6 +9167,12 @@ export const PagingExtendedSystemParameters: MessageFns<PagingExtendedSystemPara
     if (message.maxNumAltSo !== 0) {
       obj.maxNumAltSo = Math.round(message.maxNumAltSo);
     }
+    if (message.extPrefMsidType !== undefined) {
+      obj.extPrefMsidType = Math.round(message.extPrefMsidType);
+    }
+    if (message.meidReqd !== undefined) {
+      obj.meidReqd = message.meidReqd;
+    }
     return obj;
   },
 
@@ -9119,6 +9189,8 @@ export const PagingExtendedSystemParameters: MessageFns<PagingExtendedSystemPara
     message.useTmsi = object.useTmsi ?? false;
     message.prefMsidType = object.prefMsidType ?? 0;
     message.maxNumAltSo = object.maxNumAltSo ?? 0;
+    message.extPrefMsidType = object.extPrefMsidType ?? undefined;
+    message.meidReqd = object.meidReqd ?? undefined;
     return message;
   },
 };
@@ -12279,6 +12351,7 @@ function createBaseMobileInfo(): MobileInfo {
     mobPRev: 0,
     esn: undefined,
     imsi: undefined,
+    meid: undefined,
     pgslot: undefined,
     slotCycleIndex: 0,
     snrDb: undefined,
@@ -12318,6 +12391,9 @@ export const MobileInfo: MessageFns<MobileInfo> = {
     }
     if (message.imsi !== undefined) {
       writer.uint32(202).string(message.imsi);
+    }
+    if (message.meid !== undefined) {
+      writer.uint32(218).string(message.meid);
     }
     if (message.pgslot !== undefined) {
       writer.uint32(72).uint32(message.pgslot);
@@ -12426,6 +12502,14 @@ export const MobileInfo: MessageFns<MobileInfo> = {
           }
 
           message.imsi = reader.string();
+          continue;
+        }
+        case 27: {
+          if (tag !== 218) {
+            break;
+          }
+
+          message.meid = reader.string();
           continue;
         }
         case 9: {
@@ -12589,6 +12673,7 @@ export const MobileInfo: MessageFns<MobileInfo> = {
         : 0,
       esn: isSet(object.esn) ? globalThis.Number(object.esn) : undefined,
       imsi: isSet(object.imsi) ? globalThis.String(object.imsi) : undefined,
+      meid: isSet(object.meid) ? globalThis.String(object.meid) : undefined,
       pgslot: isSet(object.pgslot) ? globalThis.Number(object.pgslot) : undefined,
       slotCycleIndex: isSet(object.slotCycleIndex)
         ? globalThis.Number(object.slotCycleIndex)
@@ -12693,6 +12778,9 @@ export const MobileInfo: MessageFns<MobileInfo> = {
     if (message.imsi !== undefined) {
       obj.imsi = message.imsi;
     }
+    if (message.meid !== undefined) {
+      obj.meid = message.meid;
+    }
     if (message.pgslot !== undefined) {
       obj.pgslot = Math.round(message.pgslot);
     }
@@ -12758,6 +12846,7 @@ export const MobileInfo: MessageFns<MobileInfo> = {
     message.mobPRev = object.mobPRev ?? 0;
     message.esn = object.esn ?? undefined;
     message.imsi = object.imsi ?? undefined;
+    message.meid = object.meid ?? undefined;
     message.pgslot = object.pgslot ?? undefined;
     message.slotCycleIndex = object.slotCycleIndex ?? 0;
     message.snrDb = object.snrDb ?? undefined;

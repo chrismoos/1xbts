@@ -10,7 +10,7 @@ import {
   parseSubscriberStatus,
   subscriberStatusLabel,
 } from "@/lib/subscriber-options";
-import { validateImsi, validatePhoneNumber } from "@/lib/validation";
+import { validateImsi, validateMeid, validatePhoneNumber } from "@/lib/validation";
 
 function withStatusLabel(subscriber: Subscriber) {
   return { ...subscriber, status: subscriberStatusLabel(subscriber.status) };
@@ -72,11 +72,25 @@ export async function POST(request: Request) {
     }
 
     const imsi = asString(body.imsi);
+    const meid = asString(body.meid).toLowerCase();
+    const esn = body.esn != null ? Number(body.esn) : undefined;
     if (imsi) {
       const imsiCheck = validateImsi(imsi);
       if (!imsiCheck.ok) {
         return Response.json({ error: imsiCheck.error }, { status: 400 });
       }
+    }
+    if (meid) {
+      const meidCheck = validateMeid(meid);
+      if (!meidCheck.ok) {
+        return Response.json({ error: meidCheck.error }, { status: 400 });
+      }
+    }
+    if ((imsi || esn !== undefined || meid) && (!imsi || (esn === undefined && !meid))) {
+      return Response.json(
+        { error: "Subscriber identity requires IMSI plus ESN or MEID" },
+        { status: 400 }
+      );
     }
 
     await waitForHlrReady();
@@ -87,7 +101,8 @@ export async function POST(request: Request) {
         displayName: asString(body.displayName),
         status: parseSubscriberStatus(body.status),
         imsi: imsi || undefined,
-        esn: body.esn != null ? Number(body.esn) : undefined,
+        esn,
+        meid: meid || undefined,
         numberType: coerceNumberType(body.numberType),
         numberPlan: coerceNumberPlan(body.numberPlan),
       },

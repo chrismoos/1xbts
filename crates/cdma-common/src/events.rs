@@ -52,6 +52,8 @@ pub struct AccessChannelEvent {
     /// Full decoded IMSI string, if the access identity plus overhead context
     /// provide all digits.
     pub imsi: Option<String>,
+    /// Decoded MEID, if present in extended MSID addressing fields.
+    pub meid: Option<String>,
     /// Decoded IMSI_M_S1, if present in the addressing fields.
     pub imsi_m_s1: Option<u32>,
     /// Decoded IMSI_M_S2, if present in the addressing fields.

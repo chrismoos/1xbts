@@ -1373,6 +1373,7 @@ mod tests {
             msid_type: None,
             esn: None,
             imsi: None,
+            meid: None,
             imsi_m_s1: None,
             imsi_m_s2: None,
             imsi_class: None,

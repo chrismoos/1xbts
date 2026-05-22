@@ -2,6 +2,7 @@ export type ValidationResult = { ok: true } | { ok: false; error: string };
 
 export const PHONE_MAX_DIGITS = 15;
 export const IMSI_DIGITS = 15;
+export const MEID_HEX_DIGITS = 14;
 
 export function validatePhoneNumber(value: string): ValidationResult {
   if (value.length === 0) return { ok: false, error: "Phone number is required" };
@@ -20,6 +21,14 @@ export function validateImsi(value: string): ValidationResult {
     return { ok: false, error: "IMSI must contain only digits 0–9" };
   if (value.length !== IMSI_DIGITS)
     return { ok: false, error: `IMSI must be exactly ${IMSI_DIGITS} digits` };
+  return { ok: true };
+}
+
+export function validateMeid(value: string): ValidationResult {
+  if (!/^[0-9a-fA-F]+$/.test(value))
+    return { ok: false, error: "MEID must contain only hexadecimal digits" };
+  if (value.length !== MEID_HEX_DIGITS)
+    return { ok: false, error: `MEID must be exactly ${MEID_HEX_DIGITS} hex digits` };
   return { ok: true };
 }
 

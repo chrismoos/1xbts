@@ -1288,6 +1288,7 @@ mod tests {
             msid_type: Some(0b011),
             esn: Some(0x808B_0B33),
             imsi: Some(imsi.to_string()),
+            meid: None,
             imsi_m_s1: Some(imsi_m_s1),
             imsi_m_s2: Some(imsi_m_s2),
             imsi_class: Some(0),

@@ -24,7 +24,7 @@ import {
 } from "@/lib/event-fingerprint";
 import { useEventStream } from "@/lib/use-event-stream";
 import { type LogEntry, makeLogEntryId, makeSortKey, sortLogEntries, formatTime } from "@/lib/message-log";
-import { formatEsn } from "@/lib/format";
+import { formatEsn, formatMeid } from "@/lib/format";
 import type { AccessEvent, PagingEvent, TrafficEvent } from "@/lib/proto/bsc/v1/service";
 import type { SubscriberIdentity } from "@/lib/proto/hlr/v1/service";
 
@@ -35,6 +35,7 @@ interface MobileInfo {
   mobPRev: number;
   esn?: number;
   imsi?: string;
+  meid?: string;
   pgslot?: number;
   slotCycleIndex: number;
   snrDb?: number;
@@ -168,12 +169,14 @@ function isActivePcg(
 function formatMobileTitle(mobile: MobileInfo): string {
   if (mobile.phoneNumber) return mobile.phoneNumber;
   if (mobile.esn != null) return `ESN ${formatEsn(mobile.esn)}`;
+  if (mobile.meid) return `MEID ${formatMeid(mobile.meid)}`;
   if (mobile.imsi) return `IMSI ${mobile.imsi}`;
   return mobile.address;
 }
 
 function defaultSubscriberName(mobile: MobileInfo): string {
   if (mobile.esn != null) return `Mobile ${formatEsn(mobile.esn)}`;
+  if (mobile.meid) return `Mobile MEID ${formatMeid(mobile.meid)}`;
   if (mobile.imsi) return `Mobile IMSI ${mobile.imsi}`;
   return "Mobile Station";
 }
@@ -498,8 +501,8 @@ export default function MobileDetailPage({
       setCreateError("Phone number must contain at least one digit and only digits");
       return;
     }
-    if (mobile.esn == null && !mobile.imsi) {
-      setCreateError("Mobile has no ESN or IMSI");
+    if (!mobile.imsi || (mobile.esn == null && !mobile.meid)) {
+      setCreateError("Mobile needs IMSI plus ESN or MEID");
       return;
     }
 
@@ -515,6 +518,7 @@ export default function MobileDetailPage({
           status: "active",
           esn: mobile.esn,
           imsi: mobile.imsi,
+          meid: mobile.meid,
         }),
       });
       const data: UpsertSubscriberResponse = await res.json();
@@ -607,10 +611,12 @@ export default function MobileDetailPage({
   }
 
   const observedEsnHex = mobile.esn != null ? formatEsn(mobile.esn) : null;
+  const observedMeid = mobile.meid ? formatMeid(mobile.meid) : null;
   const provisionedEsnHex =
     primarySubscriberIdentity?.esn != null ? formatEsn(primarySubscriberIdentity.esn) : null;
   const provisionedImsi = primarySubscriberIdentity?.imsi || null;
-  const canCreateSubscriber = !mobile.subscriberId && (mobile.esn != null || Boolean(mobile.imsi));
+  const provisionedMeid = primarySubscriberIdentity?.meid ? formatMeid(primarySubscriberIdentity.meid) : null;
+  const canCreateSubscriber = !mobile.subscriberId && Boolean(mobile.imsi) && (mobile.esn != null || Boolean(mobile.meid));
   const trafficPower = mobile.trafficPower;
   const isRc3 = (trafficPower?.reverseRadioConfig ?? 0) === 3;
   // Inner-loop metric: pilot SINR (RC3) or Eb/Nt (RC1); falls back to frame snapshot.
@@ -675,6 +681,7 @@ export default function MobileDetailPage({
           <h1 className="text-lg font-bold font-mono">{formatMobileTitle(mobile)}</h1>
           <div className="text-xs text-muted font-mono truncate">
             Registered IMSI {mobile.imsi || "Not Available"}
+            {observedMeid ? ` / MEID ${observedMeid}` : ""}
           </div>
         </div>
         <span
@@ -738,6 +745,7 @@ export default function MobileDetailPage({
               </div>
               <Stat label="Provisioned ESN" value={provisionedEsnHex || "Not Available"} mono />
               <Stat label="Provisioned IMSI" value={provisionedImsi || "Not Available"} mono />
+              <Stat label="Provisioned MEID" value={provisionedMeid || "Not Available"} mono />
               {primarySubscriberIdentity?.esn != null && esnManufacturer(primarySubscriberIdentity.esn) && (
                 <Stat label="Manufacturer" value={esnManufacturer(primarySubscriberIdentity.esn)!} />
               )}
@@ -745,6 +753,7 @@ export default function MobileDetailPage({
           ) : (
             <>
               <Stat label="Observed ESN" value={observedEsnHex || "Not Available"} mono />
+              <Stat label="Observed MEID" value={observedMeid || "Not Available"} mono />
               <Stat label="Registered IMSI" value={mobile.imsi || "Not Available"} mono />
               <Stat label="MOB_P_REV" value={String(mobile.mobPRev)} />
               <Stat

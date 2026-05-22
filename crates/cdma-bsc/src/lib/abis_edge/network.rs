@@ -591,6 +591,7 @@ impl NetworkBtsControlClient {
             arq_valid_ack,
             msid_type,
             pdu_esn,
+            pdu_meid,
             imsi_m_s1,
             imsi_m_s2,
             imsi_class,
@@ -611,6 +612,7 @@ impl NetworkBtsControlClient {
                     valid_ack,
                     ea.msid_type,
                     ea.esn,
+                    ea.meid,
                     ea.imsi_m_s1,
                     ea.imsi_m_s2,
                     ea.imsi_class,
@@ -632,6 +634,7 @@ impl NetworkBtsControlClient {
                     valid_ack,
                     ea.msid_type,
                     ea.esn,
+                    ea.meid,
                     ea.imsi_m_s1,
                     ea.imsi_m_s2,
                     ea.imsi_class,
@@ -641,7 +644,7 @@ impl NetworkBtsControlClient {
                 )
             }
             _ => (
-                None, None, false, false, None, None, None, None, None, None, None, None,
+                None, None, false, false, None, None, None, None, None, None, None, None, None,
             ),
         };
 
@@ -702,6 +705,7 @@ impl NetworkBtsControlClient {
             valid_ack: arq_valid_ack,
             msid_type,
             esn: pdu_esn.or(esn),
+            meid: pdu_meid,
             imsi: mobile_identity_imsi,
             imsi_m_s1,
             imsi_m_s2,

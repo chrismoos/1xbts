@@ -138,6 +138,7 @@ fn synthetic_origination_so7(esn: u32) -> AccessChannelEvent {
         msid_type: Some(0b011),
         esn: Some(esn),
         imsi: None,
+        meid: None,
         imsi_m_s1: Some(0x0091_989e),
         imsi_m_s2: Some(0x0326),
         imsi_class: Some(0),
@@ -946,6 +947,7 @@ fn synthetic_traffic_preamble(walsh_code: u8) -> AccessChannelEvent {
         msid_type: None,
         esn: None,
         imsi: None,
+        meid: None,
         imsi_m_s1: None,
         imsi_m_s2: None,
         imsi_class: None,
@@ -1019,6 +1021,7 @@ fn synthetic_ms_ack_order(walsh_code: u8) -> AccessChannelEvent {
         msid_type: None,
         esn: None,
         imsi: None,
+        meid: None,
         imsi_m_s1: None,
         imsi_m_s2: None,
         imsi_class: None,
@@ -1092,6 +1095,7 @@ fn synthetic_service_connect_completion(walsh_code: u8) -> AccessChannelEvent {
         msid_type: None,
         esn: None,
         imsi: None,
+        meid: None,
         imsi_m_s1: None,
         imsi_m_s2: None,
         imsi_class: None,
@@ -3008,6 +3012,7 @@ impl HlrRepository for FakeHlrRepository {
         _: uuid::Uuid,
         _: Option<&str>,
         _: Option<u32>,
+        _: Option<&str>,
     ) -> Result<SubscriberIdentity, String> {
         Err("not implemented in test".to_string())
     }
@@ -3016,6 +3021,7 @@ impl HlrRepository for FakeHlrRepository {
         _: uuid::Uuid,
         _: Option<&str>,
         _: Option<u32>,
+        _: Option<&str>,
     ) -> Result<SubscriberIdentity, String> {
         Err("not implemented in test".to_string())
     }
@@ -3027,8 +3033,7 @@ impl HlrRepository for FakeHlrRepository {
     }
     async fn resolve_by_identity(
         &self,
-        _: Option<u32>,
-        _: Option<&str>,
+        _: &cdma_hlr::model::MobileIdentityKey,
     ) -> Result<Option<cdma_hlr::model::ResolvedSubscriber>, String> {
         Ok(Some(self.resolved()))
     }
@@ -3049,6 +3054,7 @@ impl HlrRepository for FakeHlrRepository {
             state: RegistrationState::Registered,
             imsi: None,
             esn: None,
+            meid: None,
             mob_p_rev: None,
             pgslot: None,
             slot_cycle_index: None,
@@ -3060,8 +3066,7 @@ impl HlrRepository for FakeHlrRepository {
     }
     async fn upsert_mobile_seen(
         &self,
-        _: Option<u32>,
-        _: Option<&str>,
+        _: &cdma_hlr::model::MobileIdentityKey,
         _: Option<u8>,
     ) -> Result<cdma_hlr::MobileSeenUpsert, String> {
         Ok(cdma_hlr::MobileSeenUpsert {
@@ -3258,6 +3263,7 @@ fn synthetic_origination_so6(esn: u32) -> AccessChannelEvent {
         msid_type: Some(0b011),
         esn: Some(esn),
         imsi: None,
+        meid: None,
         imsi_m_s1: Some(0x0091_989e),
         imsi_m_s2: Some(0x0326),
         imsi_class: Some(0),
@@ -3332,6 +3338,7 @@ fn synthetic_traffic_data_burst(walsh_code: u8, sms_payload: Vec<u8>) -> AccessC
         msid_type: None,
         esn: None,
         imsi: None,
+        meid: None,
         imsi_m_s1: None,
         imsi_m_s2: None,
         imsi_class: None,

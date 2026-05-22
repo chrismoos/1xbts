@@ -8,6 +8,7 @@ export interface MobileDirectoryEntry {
   address: string;
   esn?: number;
   imsi?: string;
+  meid?: string;
   phoneNumber?: string;
   subscriberId?: string;
   trafficWalshCode?: number;
@@ -71,6 +72,11 @@ export function mobileForEvent(
     const m = mobiles.find((m) => m.esn === esn);
     if (m) return m;
   }
+  if ("meid" in event && typeof event.meid === "string" && event.meid) {
+    const meid = event.meid;
+    const m = mobiles.find((m) => m.meid === meid);
+    if (m) return m;
+  }
 
   // PagingEvent uses header.resolvedAddress / header.address.{esn,imsiS,...}
   const header = "header" in event ? event.header : undefined;
@@ -99,7 +105,7 @@ export function mobileForEvent(
 /// Identifier kind used to render the message-log MS column. The single
 /// letters keep the column tight; the cell renders a tooltip with the full
 /// "phone / IMSI / ESN" name.
-export type MobileLabelKind = "P" | "I" | "E" | "?";
+export type MobileLabelKind = "P" | "I" | "E" | "M" | "?";
 
 export interface MobileLabel {
   kind: MobileLabelKind;
@@ -126,6 +132,9 @@ export function mobileLabel(mobile: MobileDirectoryEntry): MobileLabel {
       value: `0x${(mobile.esn >>> 0).toString(16).toUpperCase().padStart(8, "0")}`,
       full: "ESN",
     };
+  }
+  if (mobile.meid) {
+    return { kind: "M", value: mobile.meid.toUpperCase(), full: "MEID" };
   }
   return { kind: "?", value: mobile.address, full: "address" };
 }

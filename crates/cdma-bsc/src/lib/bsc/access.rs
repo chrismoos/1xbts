@@ -284,9 +284,9 @@ impl AccessService {
         // (Registration, Origination, PageResponse, Reconnect, …) so the
         // MSC's `mobiles_seen` table refreshes `last_seen_at` on real
         // contact, not just on explicit Registration Messages. The MSC
-        // gates welcome SMS on `is_new || elapsed > threshold`, so this
+        // only sends welcome SMS on `is_new || elapsed > threshold`, so this
         // does not multiply welcome traffic.
-        bsc.notify_msc_registration(&outcome.fwd_address, registration_imsi);
+        bsc.notify_msc_registration(&outcome.fwd_address, registration_imsi, event.esn);
         outcome.fwd_address
     }
 
@@ -1119,11 +1119,14 @@ impl Bsc {
         &self,
         fwd_address: &MsAddress,
         registration_imsi: Option<String>,
+        event_esn: Option<u32>,
     ) {
-        let esn_val = match fwd_address {
+        // ESN-only mobiles carry it in fwd_address; IMSI+ESN class-0 mobiles
+        // carry it in the access PDU addressing fields.
+        let esn_val = event_esn.or(match fwd_address {
             MsAddress::Esn(e) => Some(*e),
             _ => None,
-        };
+        });
         let a1_client = self.a1.msc_client.clone();
         let cell_id = cdma_ios::CellId {
             cell: self.config.overhead.base_id,
@@ -1217,7 +1220,25 @@ impl Bsc {
         };
 
         let esn = event.esn;
+        let meid = event.meid.clone();
         let registration_imsi = self.derive_registration_imsi(event);
+        let identity_key = match cdma_hlr::model::MobileIdentityKey::from_parts(
+            registration_imsi.as_deref(),
+            esn,
+            meid.as_deref(),
+        ) {
+            Ok(identity_key) => identity_key,
+            Err(_) => {
+                debug!(
+                    "BSC: skipping HLR subscriber resolution for partial identity \
+                     (esn={:?}, imsi_present={}, meid_present={})",
+                    event.esn,
+                    registration_imsi.is_some(),
+                    event.meid.is_some(),
+                );
+                return;
+            }
+        };
         if registration_imsi.is_none() && esn.is_none() {
             log::error!(
                 "BSC: dropping registration — no resolvable identity \
@@ -1244,9 +1265,7 @@ impl Bsc {
         let node_id = self.config.node_id.clone();
 
         tokio::spawn(async move {
-            let result = repo
-                .resolve_by_identity(esn, registration_imsi.as_deref())
-                .await;
+            let result = repo.resolve_by_identity(&identity_key).await;
 
             let resolution = match result {
                 Ok(Some(resolved)) => {
@@ -1274,6 +1293,7 @@ impl Bsc {
                         state: cdma_hlr::model::RegistrationState::Registered,
                         imsi: registration_imsi.clone(),
                         esn: binding_esn,
+                        meid: meid.clone(),
                         mob_p_rev: Some(mob_p_rev),
                         pgslot,
                         slot_cycle_index: Some(slot_cycle_index),

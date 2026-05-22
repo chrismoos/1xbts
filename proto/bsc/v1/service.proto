@@ -100,6 +100,7 @@ message AccessEvent {
   optional uint32 esn = 11;
   optional uint32 imsi_m_s1 = 12;
   optional uint32 imsi_m_s2 = 13;
+  optional string meid = 47;
   optional uint32 mob_p_rev = 14;
   // Microseconds since Unix epoch (RX wall-clock time)
   uint64 timestamp_us = 15;
@@ -519,6 +520,8 @@ message PagingExtendedSystemParameters {
   bool use_tmsi = 6;
   uint32 pref_msid_type = 7;
   uint32 max_num_alt_so = 8;
+  optional uint32 ext_pref_msid_type = 9;
+  optional bool meid_reqd = 10;
 }
 
 // General Page Message fields and page records.
@@ -739,6 +742,7 @@ message MobileInfo {
   // Structured identity
   optional uint32 esn = 6;
   optional string imsi = 25;
+  optional string meid = 27;
   // Slotted mode paging
   optional uint32 pgslot = 9;
   uint32 slot_cycle_index = 10;

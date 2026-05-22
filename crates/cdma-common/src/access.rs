@@ -5431,257 +5431,276 @@ fn decode_origination_tail(
     let mut add_geo_loc_type_len_ind = None;
     let mut add_geo_loc_type = None;
 
-    if base.mob_p_rev >= 6 {
-        drs = Some(read(&mut bs, 1, "DRS")? == 1);
-        let uzid_incl_value = read(&mut bs, 1, "UZID_INCL")? == 1;
-        uzid_incl = Some(uzid_incl_value);
-        if uzid_incl_value {
-            uzid = Some(read(&mut bs, 16, "UZID")? as u16);
-        }
-        ch_ind = Some(read(&mut bs, 2, "CH_IND")? as u8);
-        sr_id = Some(read(&mut bs, 3, "SR_ID")? as u8);
-        otd_supported = Some(read(&mut bs, 1, "OTD_SUPPORTED")? == 1);
-        qpch_supported = Some(read(&mut bs, 1, "QPCH_SUPPORTED")? == 1);
-        enhanced_rc = Some(read(&mut bs, 1, "ENHANCED_RC")? == 1);
-        for_rc_pref = Some(read(&mut bs, 5, "FOR_RC_PREF")? as u8);
-        rev_rc_pref = Some(read(&mut bs, 5, "REV_RC_PREF")? as u8);
-
-        let fch_supported_value = read(&mut bs, 1, "FCH_SUPPORTED")? == 1;
-        fch_supported = Some(fch_supported_value);
-        if fch_supported_value {
-            fch_capability = Some(decode_fch_type_specific_fields(&mut bs)?);
-        }
-
-        let dcch_supported_value = read(&mut bs, 1, "DCCH_SUPPORTED")? == 1;
-        dcch_supported = Some(dcch_supported_value);
-        if dcch_supported_value {
-            dcch_capability = Some(decode_dcch_type_specific_fields(&mut bs)?);
-        }
-
-        let geo_loc_incl_value = read(&mut bs, 1, "GEO_LOC_INCL")? == 1;
-        geo_loc_incl = Some(geo_loc_incl_value);
-        if geo_loc_incl_value {
-            geo_loc_type = Some(read(&mut bs, 3, "GEO_LOC_TYPE")? as u8);
-        }
-        rev_fch_gating_req = Some(read(&mut bs, 1, "REV_FCH_GATING_REQ")? == 1);
-    }
-
-    if base.mob_p_rev >= 7 {
-        orig_reason = Some(read(&mut bs, 1, "ORIG_REASON")? == 1);
-        orig_count = Some(read(&mut bs, 2, "ORIG_COUNT")? as u8);
-        sts_supported = Some(read(&mut bs, 1, "STS_SUPPORTED")? == 1);
-        cch_3x_supported = Some(read(&mut bs, 1, "3X_CCH_SUPPORTED")? == 1);
-
-        let wll_incl_value = read(&mut bs, 1, "WLL_INCL")? == 1;
-        wll_incl = Some(wll_incl_value);
-        if wll_incl_value {
-            wll_device_type = Some(read(&mut bs, 3, "WLL_DEVICE_TYPE")? as u8);
-        }
-
-        let global_emergency_call_value = read(&mut bs, 1, "GLOBAL_EMERGENCY_CALL")? == 1;
-        global_emergency_call = Some(global_emergency_call_value);
-        if global_emergency_call_value {
-            ms_init_pos_loc_ind = Some(read(&mut bs, 1, "MS_INIT_POS_LOC_IND")? == 1);
-        }
-
-        let qos_parms_incl_value = read(&mut bs, 1, "QOS_PARMS_INCL")? == 1;
-        qos_parms_incl = Some(qos_parms_incl_value);
-        if qos_parms_incl_value {
-            let len = read(&mut bs, 5, "QOS_PARMS_LEN")? as u8;
-            qos_parms_len = Some(len);
-            qos_parms = read_octets(&mut bs, len as usize, "QOS_PARMS")?;
-        }
-
-        let enc_info_incl_value = read(&mut bs, 1, "ENC_INFO_INCL")? == 1;
-        enc_info_incl = Some(enc_info_incl_value);
-        if enc_info_incl_value {
-            let sig_sup = read(&mut bs, 8, "SIG_ENCRYPT_SUP")? as u8;
-            validate_sig_encrypt_sup(sig_sup)?;
-            sig_encrypt_sup = Some(sig_sup);
-            d_sig_encrypt_req = Some(read(&mut bs, 1, "D_SIG_ENCRYPT_REQ")? == 1);
-            c_sig_encrypt_req = Some(read(&mut bs, 1, "C_SIG_ENCRYPT_REQ")? == 1);
-            let ecmea = (sig_sup >> 6) & 1;
-            let rea = (sig_sup >> 5) & 1;
-            if ecmea == 1 || rea == 1 {
-                new_sseq_h = Some(read(&mut bs, 24, "NEW_SSEQ_H")? as u32);
-                new_sseq_h_sig = Some(read(&mut bs, 8, "NEW_SSEQ_H_SIG")? as u8);
+    // P_REV-gated tail: IS-95-A field-defaults convention allows the mobile
+    // to omit trailing fields when the SDU runs out; absent fields take their
+    // default (0/false/None). Non-EOF parse errors still propagate.
+    let tail_result: Result<(), String> = (|| {
+        if base.mob_p_rev >= 6 {
+            drs = Some(read(&mut bs, 1, "DRS")? == 1);
+            let uzid_incl_value = read(&mut bs, 1, "UZID_INCL")? == 1;
+            uzid_incl = Some(uzid_incl_value);
+            if uzid_incl_value {
+                uzid = Some(read(&mut bs, 16, "UZID")? as u16);
             }
-            ui_encrypt_req = Some(read(&mut bs, 1, "UI_ENCRYPT_REQ")? == 1);
-            let ui_sup = read(&mut bs, 8, "UI_ENCRYPT_SUP")? as u8;
-            validate_ui_encrypt_sup(ui_sup)?;
-            ui_encrypt_sup = Some(ui_sup);
-        }
+            ch_ind = Some(read(&mut bs, 2, "CH_IND")? as u8);
+            sr_id = Some(read(&mut bs, 3, "SR_ID")? as u8);
+            otd_supported = Some(read(&mut bs, 1, "OTD_SUPPORTED")? == 1);
+            qpch_supported = Some(read(&mut bs, 1, "QPCH_SUPPORTED")? == 1);
+            enhanced_rc = Some(read(&mut bs, 1, "ENHANCED_RC")? == 1);
+            for_rc_pref = Some(read(&mut bs, 5, "FOR_RC_PREF")? as u8);
+            rev_rc_pref = Some(read(&mut bs, 5, "REV_RC_PREF")? as u8);
 
-        let sync_id_incl_value = read(&mut bs, 1, "SYNC_ID_INCL")? == 1;
-        sync_id_incl = Some(sync_id_incl_value);
-        if sync_id_incl_value {
-            let len = read(&mut bs, 4, "SYNC_ID_LEN")? as u8;
-            sync_id_len = Some(len);
-            if len > 4 {
-                return Err(format!("SYNC_ID_LEN={} exceeds local u32 storage", len));
+            let fch_supported_value = read(&mut bs, 1, "FCH_SUPPORTED")? == 1;
+            fch_supported = Some(fch_supported_value);
+            if fch_supported_value {
+                fch_capability = Some(decode_fch_type_specific_fields(&mut bs)?);
             }
-            if len > 0 {
-                sync_id = Some(read(&mut bs, len as usize * 8, "SYNC_ID")? as u32);
+
+            let dcch_supported_value = read(&mut bs, 1, "DCCH_SUPPORTED")? == 1;
+            dcch_supported = Some(dcch_supported_value);
+            if dcch_supported_value {
+                dcch_capability = Some(decode_dcch_type_specific_fields(&mut bs)?);
             }
-        }
 
-        let prev_sid_incl_value = read(&mut bs, 1, "PREV_SID_INCL")? == 1;
-        prev_sid_incl = Some(prev_sid_incl_value);
-        if prev_sid_incl_value {
-            prev_sid = Some(read(&mut bs, 15, "PREV_SID")? as u16);
-        }
-
-        let prev_nid_incl_value = read(&mut bs, 1, "PREV_NID_INCL")? == 1;
-        prev_nid_incl = Some(prev_nid_incl_value);
-        if prev_nid_incl_value {
-            prev_nid = Some(read(&mut bs, 16, "PREV_NID")? as u16);
-        }
-
-        let prev_pzid_incl_value = read(&mut bs, 1, "PREV_PZID_INCL")? == 1;
-        prev_pzid_incl = Some(prev_pzid_incl_value);
-        if prev_pzid_incl_value {
-            prev_pzid = Some(read(&mut bs, 8, "PREV_PZID")? as u8);
-        }
-
-        let so_bitmap_ind_value = read(&mut bs, 2, "SO_BITMAP_IND")? as u8;
-        so_bitmap_ind = Some(so_bitmap_ind_value);
-        if so_bitmap_ind_value > 0 {
-            so_group_num = Some(read(&mut bs, 5, "SO_GROUP_NUM")? as u8);
-            let bitmap_bits = 1usize << (1 + so_bitmap_ind_value as usize);
-            so_bitmap = Some(read(&mut bs, bitmap_bits, "SO_BITMAP")? as u16);
-        }
-    }
-
-    if base.mob_p_rev >= 8 {
-        sdb_desired_only = Some(read(&mut bs, 1, "SDB_DESIRED_ONLY")? == 1);
-        alt_band_class_sup = Some(read(&mut bs, 1, "ALT_BAND_CLASS_SUP")? == 1);
-    }
-
-    if base.mob_p_rev >= 9 {
-        let msg_int_info_incl_value = read(&mut bs, 1, "MSG_INT_INFO_INCL")? == 1;
-        msg_int_info_incl = Some(msg_int_info_incl_value);
-        if msg_int_info_incl_value {
-            let sig_integrity_sup_incl_value = read(&mut bs, 1, "SIG_INTEGRITY_SUP_INCL")? == 1;
-            sig_integrity_sup_incl = Some(sig_integrity_sup_incl_value);
-            if sig_integrity_sup_incl_value {
-                let sig_sup = read(&mut bs, 8, "SIG_INTEGRITY_SUP")? as u8;
-                let sig_req = read(&mut bs, 3, "SIG_INTEGRITY_REQ")? as u8;
-                validate_sig_integrity_fields(sig_sup, sig_req)?;
-                sig_integrity_sup = Some(sig_sup);
-                sig_integrity_req = Some(sig_req);
+            let geo_loc_incl_value = read(&mut bs, 1, "GEO_LOC_INCL")? == 1;
+            geo_loc_incl = Some(geo_loc_incl_value);
+            if geo_loc_incl_value {
+                geo_loc_type = Some(read(&mut bs, 3, "GEO_LOC_TYPE")? as u8);
             }
-            new_key_id = Some(read(&mut bs, 2, "NEW_KEY_ID")? as u8);
-            let new_sseq_h_incl_value = read(&mut bs, 1, "NEW_SSEQ_H_INCL")? == 1;
-            new_sseq_h_incl = Some(new_sseq_h_incl_value);
-            if new_sseq_h_incl_value {
-                new_sseq_h = Some(read(&mut bs, 24, "NEW_SSEQ_H")? as u32);
-                new_sseq_h_sig = Some(read(&mut bs, 8, "NEW_SSEQ_H_SIG")? as u8);
+            rev_fch_gating_req = Some(read(&mut bs, 1, "REV_FCH_GATING_REQ")? == 1);
+        }
+
+        if base.mob_p_rev >= 7 {
+            orig_reason = Some(read(&mut bs, 1, "ORIG_REASON")? == 1);
+            orig_count = Some(read(&mut bs, 2, "ORIG_COUNT")? as u8);
+            sts_supported = Some(read(&mut bs, 1, "STS_SUPPORTED")? == 1);
+            cch_3x_supported = Some(read(&mut bs, 1, "3X_CCH_SUPPORTED")? == 1);
+
+            let wll_incl_value = read(&mut bs, 1, "WLL_INCL")? == 1;
+            wll_incl = Some(wll_incl_value);
+            if wll_incl_value {
+                wll_device_type = Some(read(&mut bs, 3, "WLL_DEVICE_TYPE")? as u8);
+            }
+
+            let global_emergency_call_value = read(&mut bs, 1, "GLOBAL_EMERGENCY_CALL")? == 1;
+            global_emergency_call = Some(global_emergency_call_value);
+            if global_emergency_call_value {
+                ms_init_pos_loc_ind = Some(read(&mut bs, 1, "MS_INIT_POS_LOC_IND")? == 1);
+            }
+
+            let qos_parms_incl_value = read(&mut bs, 1, "QOS_PARMS_INCL")? == 1;
+            qos_parms_incl = Some(qos_parms_incl_value);
+            if qos_parms_incl_value {
+                let len = read(&mut bs, 5, "QOS_PARMS_LEN")? as u8;
+                qos_parms_len = Some(len);
+                qos_parms = read_octets(&mut bs, len as usize, "QOS_PARMS")?;
+            }
+
+            let enc_info_incl_value = read(&mut bs, 1, "ENC_INFO_INCL")? == 1;
+            enc_info_incl = Some(enc_info_incl_value);
+            if enc_info_incl_value {
+                let sig_sup = read(&mut bs, 8, "SIG_ENCRYPT_SUP")? as u8;
+                validate_sig_encrypt_sup(sig_sup)?;
+                sig_encrypt_sup = Some(sig_sup);
+                d_sig_encrypt_req = Some(read(&mut bs, 1, "D_SIG_ENCRYPT_REQ")? == 1);
+                c_sig_encrypt_req = Some(read(&mut bs, 1, "C_SIG_ENCRYPT_REQ")? == 1);
+                let ecmea = (sig_sup >> 6) & 1;
+                let rea = (sig_sup >> 5) & 1;
+                if ecmea == 1 || rea == 1 {
+                    new_sseq_h = Some(read(&mut bs, 24, "NEW_SSEQ_H")? as u32);
+                    new_sseq_h_sig = Some(read(&mut bs, 8, "NEW_SSEQ_H_SIG")? as u8);
+                }
+                ui_encrypt_req = Some(read(&mut bs, 1, "UI_ENCRYPT_REQ")? == 1);
+                let ui_sup = read(&mut bs, 8, "UI_ENCRYPT_SUP")? as u8;
+                validate_ui_encrypt_sup(ui_sup)?;
+                ui_encrypt_sup = Some(ui_sup);
+            }
+
+            let sync_id_incl_value = read(&mut bs, 1, "SYNC_ID_INCL")? == 1;
+            sync_id_incl = Some(sync_id_incl_value);
+            if sync_id_incl_value {
+                let len = read(&mut bs, 4, "SYNC_ID_LEN")? as u8;
+                sync_id_len = Some(len);
+                if len > 4 {
+                    return Err(format!("SYNC_ID_LEN={} exceeds local u32 storage", len));
+                }
+                if len > 0 {
+                    sync_id = Some(read(&mut bs, len as usize * 8, "SYNC_ID")? as u32);
+                }
+            }
+
+            let prev_sid_incl_value = read(&mut bs, 1, "PREV_SID_INCL")? == 1;
+            prev_sid_incl = Some(prev_sid_incl_value);
+            if prev_sid_incl_value {
+                prev_sid = Some(read(&mut bs, 15, "PREV_SID")? as u16);
+            }
+
+            let prev_nid_incl_value = read(&mut bs, 1, "PREV_NID_INCL")? == 1;
+            prev_nid_incl = Some(prev_nid_incl_value);
+            if prev_nid_incl_value {
+                prev_nid = Some(read(&mut bs, 16, "PREV_NID")? as u16);
+            }
+
+            let prev_pzid_incl_value = read(&mut bs, 1, "PREV_PZID_INCL")? == 1;
+            prev_pzid_incl = Some(prev_pzid_incl_value);
+            if prev_pzid_incl_value {
+                prev_pzid = Some(read(&mut bs, 8, "PREV_PZID")? as u8);
+            }
+
+            let so_bitmap_ind_value = read(&mut bs, 2, "SO_BITMAP_IND")? as u8;
+            so_bitmap_ind = Some(so_bitmap_ind_value);
+            if so_bitmap_ind_value > 0 {
+                so_group_num = Some(read(&mut bs, 5, "SO_GROUP_NUM")? as u8);
+                let bitmap_bits = 1usize << (1 + so_bitmap_ind_value as usize);
+                so_bitmap = Some(read(&mut bs, bitmap_bits, "SO_BITMAP")? as u16);
             }
         }
 
-        let for_pdch_supported_value = read(&mut bs, 1, "FOR_PDCH_SUPPORTED")? == 1;
-        for_pdch_supported = Some(for_pdch_supported_value);
-        if for_pdch_supported_value {
-            for_pdch_capability = Some(decode_for_pdch_type_specific_fields(&mut bs)?);
+        if base.mob_p_rev >= 8 {
+            sdb_desired_only = Some(read(&mut bs, 1, "SDB_DESIRED_ONLY")? == 1);
+            alt_band_class_sup = Some(read(&mut bs, 1, "ALT_BAND_CLASS_SUP")? == 1);
         }
 
-        if ch_ind == Some(0) {
-            let value = read(&mut bs, 5, "EXT_CH_IND")? as u8;
-            if !is_valid_origination_ext_ch_ind(value) {
-                return Err(format!("EXT_CH_IND=0b{value:05b} is reserved"));
+        if base.mob_p_rev >= 9 {
+            let msg_int_info_incl_value = read(&mut bs, 1, "MSG_INT_INFO_INCL")? == 1;
+            msg_int_info_incl = Some(msg_int_info_incl_value);
+            if msg_int_info_incl_value {
+                let sig_integrity_sup_incl_value = read(&mut bs, 1, "SIG_INTEGRITY_SUP_INCL")? == 1;
+                sig_integrity_sup_incl = Some(sig_integrity_sup_incl_value);
+                if sig_integrity_sup_incl_value {
+                    let sig_sup = read(&mut bs, 8, "SIG_INTEGRITY_SUP")? as u8;
+                    let sig_req = read(&mut bs, 3, "SIG_INTEGRITY_REQ")? as u8;
+                    validate_sig_integrity_fields(sig_sup, sig_req)?;
+                    sig_integrity_sup = Some(sig_sup);
+                    sig_integrity_req = Some(sig_req);
+                }
+                new_key_id = Some(read(&mut bs, 2, "NEW_KEY_ID")? as u8);
+                let new_sseq_h_incl_value = read(&mut bs, 1, "NEW_SSEQ_H_INCL")? == 1;
+                new_sseq_h_incl = Some(new_sseq_h_incl_value);
+                if new_sseq_h_incl_value {
+                    new_sseq_h = Some(read(&mut bs, 24, "NEW_SSEQ_H")? as u32);
+                    new_sseq_h_sig = Some(read(&mut bs, 8, "NEW_SSEQ_H_SIG")? as u8);
+                }
             }
-            ext_ch_ind = Some(value);
-        }
-    }
 
-    if base.mob_p_rev >= 11 {
-        if base.slot_cycle_index != 0 {
-            sign_slot_cycle_index = Some(read(&mut bs, 1, "SIGN_SLOT_CYCLE_INDEX")? == 1);
+            let for_pdch_supported_value = read(&mut bs, 1, "FOR_PDCH_SUPPORTED")? == 1;
+            for_pdch_supported = Some(for_pdch_supported_value);
+            if for_pdch_supported_value {
+                for_pdch_capability = Some(decode_for_pdch_type_specific_fields(&mut bs)?);
+            }
+
+            if ch_ind == Some(0) {
+                let value = read(&mut bs, 5, "EXT_CH_IND")? as u8;
+                if !is_valid_origination_ext_ch_ind(value) {
+                    return Err(format!("EXT_CH_IND=0b{value:05b} is reserved"));
+                }
+                ext_ch_ind = Some(value);
+            }
         }
 
-        if sr_id != Some(0b111) {
-            let add_serv_instance_incl_value = read(&mut bs, 1, "ADD_SERV_INSTANCE_INCL")? == 1;
-            add_serv_instance_incl = Some(add_serv_instance_incl_value);
-            if add_serv_instance_incl_value {
-                let num_add_serv_instance = read(&mut bs, 3, "NUM_ADD_SERV_INSTANCE")? as u8;
-                let sync_id_present = sync_id_incl == Some(true);
-                for idx in 0..num_add_serv_instance {
-                    let add_sr_id = read(&mut bs, 3, &format!("ADD_SR_ID[{idx}]"))? as u8;
-                    let add_drs = read(&mut bs, 1, &format!("ADD_DRS[{idx}]"))? == 1;
-                    let mut add_service_option_incl = None;
-                    let mut add_service_option = None;
-                    let mut add_qos_parms_incl = None;
-                    let mut add_qos_parms_len = None;
-                    let mut add_qos_parms = Vec::new();
-                    if !sync_id_present {
-                        let incl =
-                            read(&mut bs, 1, &format!("ADD_SERVICE_OPTION_INCL[{idx}]"))? == 1;
-                        add_service_option_incl = Some(incl);
-                        if incl {
-                            add_service_option =
-                                Some(read(&mut bs, 16, &format!("ADD_SERVICE_OPTION[{idx}]"))?
-                                    as u16);
+        if base.mob_p_rev >= 11 {
+            if base.slot_cycle_index != 0 {
+                sign_slot_cycle_index = Some(read(&mut bs, 1, "SIGN_SLOT_CYCLE_INDEX")? == 1);
+            }
+
+            if sr_id != Some(0b111) {
+                let add_serv_instance_incl_value = read(&mut bs, 1, "ADD_SERV_INSTANCE_INCL")? == 1;
+                add_serv_instance_incl = Some(add_serv_instance_incl_value);
+                if add_serv_instance_incl_value {
+                    let num_add_serv_instance = read(&mut bs, 3, "NUM_ADD_SERV_INSTANCE")? as u8;
+                    let sync_id_present = sync_id_incl == Some(true);
+                    for idx in 0..num_add_serv_instance {
+                        let add_sr_id = read(&mut bs, 3, &format!("ADD_SR_ID[{idx}]"))? as u8;
+                        let add_drs = read(&mut bs, 1, &format!("ADD_DRS[{idx}]"))? == 1;
+                        let mut add_service_option_incl = None;
+                        let mut add_service_option = None;
+                        let mut add_qos_parms_incl = None;
+                        let mut add_qos_parms_len = None;
+                        let mut add_qos_parms = Vec::new();
+                        if !sync_id_present {
+                            let incl =
+                                read(&mut bs, 1, &format!("ADD_SERVICE_OPTION_INCL[{idx}]"))? == 1;
+                            add_service_option_incl = Some(incl);
+                            if incl {
+                                add_service_option =
+                                    Some(read(&mut bs, 16, &format!("ADD_SERVICE_OPTION[{idx}]"))?
+                                        as u16);
+                            }
+                            let qos_incl =
+                                read(&mut bs, 1, &format!("ADD_QOS_PARMS_INCL[{idx}]"))? == 1;
+                            add_qos_parms_incl = Some(qos_incl);
+                            if qos_incl {
+                                let len =
+                                    read(&mut bs, 5, &format!("ADD_QOS_PARMS_LEN[{idx}]"))? as u8;
+                                add_qos_parms_len = Some(len);
+                                add_qos_parms = read_octets(
+                                    &mut bs,
+                                    len as usize,
+                                    &format!("ADD_QOS_PARMS[{idx}]"),
+                                )?;
+                            }
                         }
-                        let qos_incl =
-                            read(&mut bs, 1, &format!("ADD_QOS_PARMS_INCL[{idx}]"))? == 1;
-                        add_qos_parms_incl = Some(qos_incl);
-                        if qos_incl {
-                            let len = read(&mut bs, 5, &format!("ADD_QOS_PARMS_LEN[{idx}]"))? as u8;
-                            add_qos_parms_len = Some(len);
-                            add_qos_parms = read_octets(
-                                &mut bs,
-                                len as usize,
-                                &format!("ADD_QOS_PARMS[{idx}]"),
-                            )?;
-                        }
+                        add_service_instances.push(OriginationAdditionalServiceInstance {
+                            add_sr_id,
+                            add_drs,
+                            add_service_option_incl,
+                            add_service_option,
+                            add_qos_parms_incl,
+                            add_qos_parms_len,
+                            add_qos_parms,
+                        });
                     }
-                    add_service_instances.push(OriginationAdditionalServiceInstance {
-                        add_sr_id,
-                        add_drs,
-                        add_service_option_incl,
-                        add_service_option,
-                        add_qos_parms_incl,
-                        add_qos_parms_len,
-                        add_qos_parms,
-                    });
+                }
+            }
+
+            let bcmc_incl_value = read(&mut bs, 1, "BCMC_INCL")? == 1;
+            bcmc_incl = Some(bcmc_incl_value);
+            if bcmc_incl_value {
+                bcmc = Some(decode_origination_bcmc_fields(&mut bs)?);
+            }
+
+            if for_pdch_supported == Some(true) {
+                let rev_pdch_supported_value = read(&mut bs, 1, "REV_PDCH_SUPPORTED")? == 1;
+                rev_pdch_supported = Some(rev_pdch_supported_value);
+                if rev_pdch_supported_value {
+                    rev_pdch_capability = Some(decode_rev_pdch_type_specific_fields(&mut bs)?);
+                }
+            }
+
+            let band_sub_rep_incl_value = read(&mut bs, 1, "BAND_SUB_REP_INCL")? == 1;
+            band_sub_rep_incl = Some(band_sub_rep_incl_value);
+            if band_sub_rep_incl_value {
+                let num = read(&mut bs, 4, "NUM_BAND_SUBCLASS")? as u8;
+                num_band_subclass = Some(num);
+                for idx in 0..num {
+                    band_subclass_sup
+                        .push(read(&mut bs, 1, &format!("BAND_SUBCLASS_SUP[{idx}]"))? as u8);
                 }
             }
         }
 
-        let bcmc_incl_value = read(&mut bs, 1, "BCMC_INCL")? == 1;
-        bcmc_incl = Some(bcmc_incl_value);
-        if bcmc_incl_value {
-            bcmc = Some(decode_origination_bcmc_fields(&mut bs)?);
-        }
-
-        if for_pdch_supported == Some(true) {
-            let rev_pdch_supported_value = read(&mut bs, 1, "REV_PDCH_SUPPORTED")? == 1;
-            rev_pdch_supported = Some(rev_pdch_supported_value);
-            if rev_pdch_supported_value {
-                rev_pdch_capability = Some(decode_rev_pdch_type_specific_fields(&mut bs)?);
+        if base.mob_p_rev >= 12 {
+            let add_geo_loc_incl_value = read(&mut bs, 1, "ADD_GEO_LOC_INCL")? == 1;
+            add_geo_loc_incl = Some(add_geo_loc_incl_value);
+            if add_geo_loc_incl_value {
+                let len_ind = read(&mut bs, 1, "ADD_GEO_LOC_TYPE_LEN_IND")? == 1;
+                add_geo_loc_type_len_ind = Some(len_ind);
+                let bits = if len_ind { 24 } else { 16 };
+                add_geo_loc_type = Some(read(&mut bs, bits, "ADD_GEO_LOC_TYPE")? as u32);
             }
         }
-
-        let band_sub_rep_incl_value = read(&mut bs, 1, "BAND_SUB_REP_INCL")? == 1;
-        band_sub_rep_incl = Some(band_sub_rep_incl_value);
-        if band_sub_rep_incl_value {
-            let num = read(&mut bs, 4, "NUM_BAND_SUBCLASS")? as u8;
-            num_band_subclass = Some(num);
-            for idx in 0..num {
-                band_subclass_sup
-                    .push(read(&mut bs, 1, &format!("BAND_SUBCLASS_SUP[{idx}]"))? as u8);
-            }
-        }
-    }
-
-    if base.mob_p_rev >= 12 {
-        let add_geo_loc_incl_value = read(&mut bs, 1, "ADD_GEO_LOC_INCL")? == 1;
-        add_geo_loc_incl = Some(add_geo_loc_incl_value);
-        if add_geo_loc_incl_value {
-            let len_ind = read(&mut bs, 1, "ADD_GEO_LOC_TYPE_LEN_IND")? == 1;
-            add_geo_loc_type_len_ind = Some(len_ind);
-            let bits = if len_ind { 24 } else { 16 };
-            add_geo_loc_type = Some(read(&mut bs, bits, "ADD_GEO_LOC_TYPE")? as u32);
+        Ok(())
+    })();
+    if let Err(err) = tail_result {
+        if err.starts_with("EOF reading ") {
+            log::warn!(
+                "ORM: post-MORE_RECORDS tail truncated at mob_p_rev={}: {} \
+                 (remaining trailing fields defaulted)",
+                base.mob_p_rev,
+                err
+            );
+        } else {
+            return Err(err);
         }
     }
 
@@ -10010,6 +10029,51 @@ mod tests {
         assert_eq!(0b01, dcch.frame_size_mode);
         assert_eq!(vec![2], dcch.for_supported_rcs);
         assert_eq!(vec![3], dcch.rev_supported_rcs);
+    }
+
+    #[test]
+    fn test_origination_p_rev6_truncated_tail_iphone_compat() {
+        // 14 BCD dialed digits fill the SDU before DRS; trailing P_REV-gated
+        // fields take default values per IS-95-A field-defaults convention.
+        let mut bits = Bitstream::new();
+        bits.write_u8(rcsch_wire(MessageId::Origination), 8);
+        bits.write_u8(1, 1); // MOB_TERM
+        bits.write_u8(0b010, 3); // SLOT_CYCLE_INDEX
+        bits.write_u8(6, 8); // MOB_P_REV
+        bits.write_u8(0x38, 8); // SCM
+        bits.write_u8(0b001, 3); // REQUEST_MODE
+        bits.write_u8(1, 1); // SPECIAL_SERVICE
+        bits.write_u32(3, 16); // SERVICE_OPTION = 3 (8K voice)
+        bits.write_u8(0, 1); // PM
+        bits.write_u8(0, 1); // DIGIT_MODE = BCD
+        bits.write_u8(0, 1); // MORE_FIELDS
+        bits.write_u8(14, 8); // NUM_FIELDS
+        for d in [10u8, 1, 1, 3, 6, 7, 10, 7, 4, 3, 7, 2, 8, 10] {
+            bits.write_u8(d, 4);
+        }
+        // 3 stray bits left in the on-air SDU (NAR_AN_CAP + PACA_REORIG +
+        // first bit of RETURN_CAUSE). Everything past these is truncated.
+        bits.write_u8(0, 1); // NAR_AN_CAP
+        bits.write_u8(0, 1); // PACA_REORIG
+        bits.write_u8(0, 1); // first/only bit of partial RETURN_CAUSE
+
+        let msg = AccessMessage::decode(&bits).expect("truncated ORM should decode");
+        let AccessMessage::Origination(msg) = msg else {
+            panic!("expected origination message");
+        };
+        assert_eq!(6, msg.mob_p_rev);
+        assert_eq!(14, msg.num_fields);
+        assert_eq!(
+            vec![10, 1, 1, 3, 6, 7, 10, 7, 4, 3, 7, 2, 8, 10],
+            msg.digits
+        );
+        // P_REV-gated tail was truncated → all defaults.
+        assert_eq!(None, msg.drs);
+        assert_eq!(None, msg.uzid_incl);
+        assert_eq!(None, msg.ch_ind);
+        assert_eq!(None, msg.sr_id);
+        assert_eq!(None, msg.fch_supported);
+        assert_eq!(None, msg.rev_fch_gating_req);
     }
 
     #[test]

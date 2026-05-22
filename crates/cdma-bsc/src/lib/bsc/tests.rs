@@ -306,6 +306,7 @@ fn test_access_event() -> AccessChannelEvent {
         msid_type: None,
         esn: None,
         imsi: None,
+        meid: None,
         imsi_m_s1: None,
         imsi_m_s2: None,
         imsi_class: None,
@@ -1937,6 +1938,7 @@ impl HlrRepository for FakeHlrRepository {
         _subscriber_id: Uuid,
         _imsi: Option<&str>,
         _esn: Option<u32>,
+        _meid: Option<&str>,
     ) -> Result<SubscriberIdentity, String> {
         Err("not implemented in test".to_string())
     }
@@ -1946,6 +1948,7 @@ impl HlrRepository for FakeHlrRepository {
         _subscriber_id: Uuid,
         _imsi: Option<&str>,
         _esn: Option<u32>,
+        _meid: Option<&str>,
     ) -> Result<SubscriberIdentity, String> {
         Err("not implemented in test".to_string())
     }
@@ -1959,8 +1962,7 @@ impl HlrRepository for FakeHlrRepository {
 
     async fn resolve_by_identity(
         &self,
-        _esn: Option<u32>,
-        _imsi: Option<&str>,
+        _identity: &cdma_hlr::model::MobileIdentityKey,
     ) -> Result<Option<cdma_hlr::model::ResolvedSubscriber>, String> {
         Ok(Some(self.resolved()))
     }
@@ -1981,8 +1983,7 @@ impl HlrRepository for FakeHlrRepository {
 
     async fn upsert_mobile_seen(
         &self,
-        _esn: Option<u32>,
-        _imsi: Option<&str>,
+        _identity: &cdma_hlr::model::MobileIdentityKey,
         _mob_p_rev: Option<u8>,
     ) -> Result<cdma_hlr::MobileSeenUpsert, String> {
         Ok(self.mobile_seen_result.clone())
@@ -5331,6 +5332,7 @@ fn fake_hlr_for_welcome(mobile_seen: cdma_hlr::MobileSeenUpsert) -> Arc<FakeHlrR
             state: RegistrationState::Registered,
             imsi: None,
             esn: Some(0x1234_5678),
+            meid: None,
             mob_p_rev: Some(6),
             pgslot: Some(1769),
             slot_cycle_index: Some(2),

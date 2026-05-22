@@ -52,6 +52,7 @@ pub trait HlrRepository: Send + Sync {
         subscriber_id: Uuid,
         imsi: Option<&str>,
         esn: Option<u32>,
+        meid: Option<&str>,
     ) -> Result<SubscriberIdentity, String>;
 
     async fn replace_primary_identity(
@@ -59,6 +60,7 @@ pub trait HlrRepository: Send + Sync {
         subscriber_id: Uuid,
         imsi: Option<&str>,
         esn: Option<u32>,
+        meid: Option<&str>,
     ) -> Result<SubscriberIdentity, String>;
 
     async fn get_identities_for_subscriber(
@@ -68,15 +70,13 @@ pub trait HlrRepository: Send + Sync {
 
     async fn resolve_by_identity(
         &self,
-        esn: Option<u32>,
-        imsi: Option<&str>,
+        identity: &MobileIdentityKey,
     ) -> Result<Option<ResolvedSubscriber>, String>;
 
     // Mobile sightings
     async fn upsert_mobile_seen(
         &self,
-        esn: Option<u32>,
-        imsi: Option<&str>,
+        identity: &MobileIdentityKey,
         mob_p_rev: Option<u8>,
     ) -> Result<MobileSeenUpsert, String>;
 
@@ -233,9 +233,18 @@ fn identity_from_proto(value: proto::SubscriberIdentity) -> Result<SubscriberIde
             .map_err(|e| format!("invalid subscriber_id: {e}"))?,
         imsi: value.imsi,
         esn: value.esn,
+        meid: value.meid,
         is_primary: value.is_primary,
         created_at: timestamp_to_datetime(value.created_at)?,
     })
+}
+
+fn identity_key_to_proto(value: &MobileIdentityKey) -> proto::MobileIdentityKey {
+    proto::MobileIdentityKey {
+        imsi: Some(value.imsi().to_string()),
+        esn: value.esn(),
+        meid: value.meid().map(ToOwned::to_owned),
+    }
 }
 
 fn binding_from_proto(value: proto::RegistrationBinding) -> Result<RegistrationBinding, String> {
@@ -247,6 +256,7 @@ fn binding_from_proto(value: proto::RegistrationBinding) -> Result<RegistrationB
             .map_err(|e| format!("invalid registration state: {e}"))?,
         imsi: value.imsi,
         esn: value.esn,
+        meid: value.meid,
         mob_p_rev: value.mob_p_rev,
         pgslot: value.pgslot,
         slot_cycle_index: value.slot_cycle_index,
@@ -286,6 +296,7 @@ impl HlrRepository for GrpcHlrRepository {
                 status: subscriber_status_to_proto(&status),
                 imsi: None,
                 esn: None,
+                meid: None,
                 number_type: number_type_to_proto(number_type) as i32,
                 number_plan: number_plan_to_proto(number_plan) as i32,
             })
@@ -398,6 +409,7 @@ impl HlrRepository for GrpcHlrRepository {
                 status: subscriber_status_to_proto(&status),
                 imsi: None,
                 esn: None,
+                meid: None,
                 number_type: number_type_to_proto(number_type) as i32,
                 number_plan: number_plan_to_proto(number_plan) as i32,
             })
@@ -456,6 +468,7 @@ impl HlrRepository for GrpcHlrRepository {
         subscriber_id: Uuid,
         imsi: Option<&str>,
         esn: Option<u32>,
+        meid: Option<&str>,
     ) -> Result<SubscriberIdentity, String> {
         let mut client = self.client();
         let response = client
@@ -463,6 +476,7 @@ impl HlrRepository for GrpcHlrRepository {
                 subscriber_id: subscriber_id.to_string(),
                 imsi: imsi.map(ToOwned::to_owned),
                 esn,
+                meid: meid.map(ToOwned::to_owned),
             })
             .await
             .map_err(|e| format!("HLR UpsertIdentity: {e}"))?
@@ -479,6 +493,7 @@ impl HlrRepository for GrpcHlrRepository {
         subscriber_id: Uuid,
         imsi: Option<&str>,
         esn: Option<u32>,
+        meid: Option<&str>,
     ) -> Result<SubscriberIdentity, String> {
         let mut client = self.client();
         let response = client
@@ -486,6 +501,7 @@ impl HlrRepository for GrpcHlrRepository {
                 subscriber_id: subscriber_id.to_string(),
                 imsi: imsi.map(ToOwned::to_owned),
                 esn,
+                meid: meid.map(ToOwned::to_owned),
             })
             .await
             .map_err(|e| format!("HLR ReplacePrimaryIdentity: {e}"))?
@@ -518,16 +534,12 @@ impl HlrRepository for GrpcHlrRepository {
 
     async fn resolve_by_identity(
         &self,
-        esn: Option<u32>,
-        imsi: Option<&str>,
+        identity: &MobileIdentityKey,
     ) -> Result<Option<ResolvedSubscriber>, String> {
         let mut client = self.client();
         let response = client
             .resolve_subscriber_by_identity(proto::ResolveSubscriberByIdentityRequest {
-                esn,
-                imsi: imsi.map(ToOwned::to_owned),
-                imsi_m_s1: None,
-                imsi_m_s2: None,
+                identity: Some(identity_key_to_proto(identity)),
             })
             .await
             .map_err(|e| format!("HLR ResolveSubscriberByIdentity: {e}"))?
@@ -554,15 +566,13 @@ impl HlrRepository for GrpcHlrRepository {
 
     async fn upsert_mobile_seen(
         &self,
-        esn: Option<u32>,
-        imsi: Option<&str>,
+        identity: &MobileIdentityKey,
         mob_p_rev: Option<u8>,
     ) -> Result<MobileSeenUpsert, String> {
         let mut client = self.client();
         let response = client
             .upsert_mobile_seen(proto::UpsertMobileSeenRequest {
-                esn,
-                imsi: imsi.map(ToOwned::to_owned),
+                identity: Some(identity_key_to_proto(identity)),
                 mob_p_rev: mob_p_rev.map(u32::from),
             })
             .await
@@ -587,6 +597,7 @@ impl HlrRepository for GrpcHlrRepository {
                 state: binding.state.as_str().to_string(),
                 imsi: binding.imsi,
                 esn: binding.esn,
+                meid: binding.meid,
                 mob_p_rev: binding.mob_p_rev,
                 pgslot: binding.pgslot,
                 slot_cycle_index: binding.slot_cycle_index,
@@ -770,6 +781,151 @@ fn format_postgres_connect_error(component: &str, error: &sqlx::Error) -> String
     format!(
         "failed to connect to {component} database: {error}; ensure PostgreSQL is running and reachable (default dev database: `docker compose up -d postgres`)"
     )
+}
+
+#[derive(sqlx::FromRow)]
+struct MobileSeenIdentityRow {
+    id: Uuid,
+    last_seen_at: DateTime<Utc>,
+}
+
+async fn select_mobile_seen_by_key(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    identity: &MobileIdentityKey,
+) -> Result<Option<MobileSeenIdentityRow>, String> {
+    match identity {
+        MobileIdentityKey::ImsiEsn { imsi, esn } => sqlx::query_as::<_, MobileSeenIdentityRow>(
+            r#"
+            SELECT id, last_seen_at
+            FROM mobiles_seen
+            WHERE imsi = $1 AND esn = $2 AND meid IS NULL
+            LIMIT 1
+            "#,
+        )
+        .bind(imsi)
+        .bind(*esn as i64)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| format!("select_mobile_seen imsi+esn: {e}")),
+        MobileIdentityKey::ImsiMeid { imsi, meid } => sqlx::query_as::<_, MobileSeenIdentityRow>(
+            r#"
+            SELECT id, last_seen_at
+            FROM mobiles_seen
+            WHERE imsi = $1 AND esn IS NULL AND meid = $2
+            LIMIT 1
+            "#,
+        )
+        .bind(imsi)
+        .bind(meid)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| format!("select_mobile_seen imsi+meid: {e}")),
+        MobileIdentityKey::ImsiEsnMeid { imsi, esn, meid } => {
+            sqlx::query_as::<_, MobileSeenIdentityRow>(
+                r#"
+                SELECT id, last_seen_at
+                FROM mobiles_seen
+                WHERE imsi = $1 AND esn = $2 AND meid = $3
+                LIMIT 1
+                "#,
+            )
+            .bind(imsi)
+            .bind(*esn as i64)
+            .bind(meid)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|e| format!("select_mobile_seen imsi+esn+meid: {e}"))
+        }
+    }
+}
+
+async fn select_legacy_mobile_seen_by_imsi(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    imsi: &str,
+) -> Result<Option<MobileSeenIdentityRow>, String> {
+    sqlx::query_as::<_, MobileSeenIdentityRow>(
+        r#"
+        SELECT id, last_seen_at
+        FROM mobiles_seen
+        WHERE imsi = $1 AND esn IS NULL AND meid IS NULL
+        LIMIT 1
+        "#,
+    )
+    .bind(imsi)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| format!("select legacy mobile_seen by imsi: {e}"))
+}
+
+async fn update_mobile_seen_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: Uuid,
+    mob_p_rev: Option<u8>,
+    identity: &MobileIdentityKey,
+) -> Result<(), String> {
+    sqlx::query(
+        r#"
+        UPDATE mobiles_seen
+        SET imsi = $2,
+            esn = $3,
+            meid = $4,
+            mob_p_rev = COALESCE($5, mob_p_rev),
+            last_seen_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(identity.imsi())
+    .bind(identity.esn().map(|v| v as i64))
+    .bind(identity.meid())
+    .bind(mob_p_rev.map(|v| v as i32))
+    .execute(&mut **tx)
+    .await
+    .map(|_| ())
+    .map_err(|e| format!("update_mobile_seen row: {e}"))
+}
+
+async fn delete_legacy_mobile_seen(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    imsi: &str,
+    except_id: Option<Uuid>,
+) -> Result<(), String> {
+    sqlx::query(
+        r#"
+        DELETE FROM mobiles_seen
+        WHERE imsi = $1
+          AND esn IS NULL
+          AND meid IS NULL
+          AND ($2::uuid IS NULL OR id <> $2)
+        "#,
+    )
+    .bind(imsi)
+    .bind(except_id)
+    .execute(&mut **tx)
+    .await
+    .map(|_| ())
+    .map_err(|e| format!("delete legacy mobile_seen: {e}"))
+}
+
+async fn insert_mobile_seen(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    mob_p_rev: Option<u8>,
+    identity: &MobileIdentityKey,
+) -> Result<(), String> {
+    sqlx::query(
+        r#"
+        INSERT INTO mobiles_seen (imsi, esn, meid, mob_p_rev)
+        VALUES ($1, $2, $3, $4)
+        "#,
+    )
+    .bind(identity.imsi())
+    .bind(identity.esn().map(|v| v as i64))
+    .bind(identity.meid())
+    .bind(mob_p_rev.map(|v| v as i32))
+    .execute(&mut **tx)
+    .await
+    .map(|_| ())
+    .map_err(|e| format!("insert mobile_seen: {e}"))
 }
 
 #[async_trait]
@@ -956,7 +1112,12 @@ impl HlrRepository for PostgresHlrRepository {
         subscriber_id: Uuid,
         imsi: Option<&str>,
         esn: Option<u32>,
+        meid: Option<&str>,
     ) -> Result<SubscriberIdentity, String> {
+        let identity_key = MobileIdentityKey::from_parts(imsi, esn, meid)?;
+        let imsi = identity_key.imsi();
+        let esn = identity_key.esn();
+        let meid = identity_key.meid();
         let now = Utc::now();
         let id = Uuid::new_v4();
         let mut tx = self
@@ -966,7 +1127,7 @@ impl HlrRepository for PostgresHlrRepository {
             .map_err(|e| format!("upsert_identity begin: {e}"))?;
 
         let existing = sqlx::query_as::<_, IdentityRow>(
-            "SELECT subscriber_identity_id, subscriber_id, imsi, esn, is_primary, created_at FROM subscriber_identities WHERE subscriber_id = $1 LIMIT 1",
+            "SELECT subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at FROM subscriber_identities WHERE subscriber_id = $1 LIMIT 1",
         )
         .bind(subscriber_id)
         .fetch_optional(&mut *tx)
@@ -977,15 +1138,17 @@ impl HlrRepository for PostgresHlrRepository {
             sqlx::query_as::<_, IdentityRow>(
                 r#"
                 UPDATE subscriber_identities SET
-                    imsi = COALESCE($2, imsi),
-                    esn = COALESCE($3, esn)
+                    imsi = $2,
+                    esn = $3,
+                    meid = $4
                 WHERE subscriber_identity_id = $1
-                RETURNING subscriber_identity_id, subscriber_id, imsi, esn, is_primary, created_at
+                RETURNING subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at
                 "#,
             )
             .bind(existing.subscriber_identity_id)
             .bind(imsi)
             .bind(esn.map(|v| v as i64))
+            .bind(meid)
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| format!("upsert_identity update: {e}"))?
@@ -993,15 +1156,16 @@ impl HlrRepository for PostgresHlrRepository {
             let is_primary = true;
             sqlx::query_as::<_, IdentityRow>(
                 r#"
-                INSERT INTO subscriber_identities (subscriber_identity_id, subscriber_id, imsi, esn, is_primary, created_at)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING subscriber_identity_id, subscriber_id, imsi, esn, is_primary, created_at
+                INSERT INTO subscriber_identities (subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at
                 "#,
             )
             .bind(id)
             .bind(subscriber_id)
             .bind(imsi)
             .bind(esn.map(|v| v as i64))
+            .bind(meid)
             .bind(is_primary)
             .bind(now)
             .fetch_one(&mut *tx)
@@ -1020,12 +1184,17 @@ impl HlrRepository for PostgresHlrRepository {
         subscriber_id: Uuid,
         imsi: Option<&str>,
         esn: Option<u32>,
+        meid: Option<&str>,
     ) -> Result<SubscriberIdentity, String> {
+        let identity_key = MobileIdentityKey::from_parts(imsi, esn, meid)?;
+        let imsi = identity_key.imsi();
+        let esn = identity_key.esn();
+        let meid = identity_key.meid();
         let now = Utc::now();
         let id = Uuid::new_v4();
         let existing = sqlx::query_as::<_, IdentityRow>(
             r#"
-            SELECT subscriber_identity_id, subscriber_id, imsi, esn, is_primary, created_at
+            SELECT subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at
             FROM subscriber_identities
             WHERE subscriber_id = $1
             ORDER BY is_primary DESC, created_at ASC
@@ -1043,14 +1212,16 @@ impl HlrRepository for PostgresHlrRepository {
                 UPDATE subscriber_identities
                 SET imsi = $2,
                     esn = $3,
+                    meid = $4,
                     is_primary = true
                 WHERE subscriber_identity_id = $1
-                RETURNING subscriber_identity_id, subscriber_id, imsi, esn, is_primary, created_at
+                RETURNING subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at
                 "#,
             )
             .bind(existing.subscriber_identity_id)
             .bind(imsi)
             .bind(esn.map(|v| v as i64))
+            .bind(meid)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| format!("replace_primary_identity update: {e}"))?;
@@ -1059,16 +1230,17 @@ impl HlrRepository for PostgresHlrRepository {
             let row = sqlx::query_as::<_, IdentityRow>(
                 r#"
                 INSERT INTO subscriber_identities (
-                    subscriber_identity_id, subscriber_id, imsi, esn, is_primary, created_at
+                    subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at
                 )
-                VALUES ($1, $2, $3, $4, true, $5)
-                RETURNING subscriber_identity_id, subscriber_id, imsi, esn, is_primary, created_at
+                VALUES ($1, $2, $3, $4, $5, true, $6)
+                RETURNING subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at
                 "#,
             )
             .bind(id)
             .bind(subscriber_id)
             .bind(imsi)
             .bind(esn.map(|v| v as i64))
+            .bind(meid)
             .bind(now)
             .fetch_one(&self.pool)
             .await
@@ -1082,7 +1254,7 @@ impl HlrRepository for PostgresHlrRepository {
         subscriber_id: Uuid,
     ) -> Result<Vec<SubscriberIdentity>, String> {
         let rows = sqlx::query_as::<_, IdentityRow>(
-            "SELECT subscriber_identity_id, subscriber_id, imsi, esn, is_primary, created_at FROM subscriber_identities WHERE subscriber_id = $1 ORDER BY is_primary DESC, created_at ASC",
+            "SELECT subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at FROM subscriber_identities WHERE subscriber_id = $1 ORDER BY is_primary DESC, created_at ASC",
         )
         .bind(subscriber_id)
         .fetch_all(&self.pool)
@@ -1093,11 +1265,10 @@ impl HlrRepository for PostgresHlrRepository {
 
     async fn resolve_by_identity(
         &self,
-        esn: Option<u32>,
-        imsi: Option<&str>,
+        identity: &MobileIdentityKey,
     ) -> Result<Option<ResolvedSubscriber>, String> {
-        let row = if let Some(esn_val) = esn {
-            let r = sqlx::query_as::<_, SubscriberRow>(
+        let row = match identity {
+            MobileIdentityKey::ImsiEsn { imsi, esn } => sqlx::query_as::<_, SubscriberRow>(
                 r#"
                 SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at,
                     s.number_type, s.number_plan,
@@ -1105,52 +1276,52 @@ impl HlrRepository for PostgresHlrRepository {
                     (SELECT MIN(duration_ms) FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS ringtone_duration_ms
                 FROM subscribers s
                 JOIN subscriber_identities i ON s.subscriber_id = i.subscriber_id
-                WHERE i.esn = $1
+                WHERE i.imsi = $1 AND i.esn = $2 AND i.meid IS NULL
                 LIMIT 1
                 "#,
             )
-            .bind(esn_val as i64)
+            .bind(imsi)
+            .bind(*esn as i64)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| format!("resolve_by_identity esn: {e}"))?;
-            if r.is_some() {
-                r
-            } else if let Some(imsi_val) = imsi {
+            .map_err(|e| format!("resolve_by_identity imsi+esn: {e}"))?,
+            MobileIdentityKey::ImsiMeid { imsi, meid } => sqlx::query_as::<_, SubscriberRow>(
+                r#"
+                SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at,
+                    s.number_type, s.number_plan,
+                    EXISTS (SELECT 1 FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS has_ringtone,
+                    (SELECT MIN(duration_ms) FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS ringtone_duration_ms
+                FROM subscribers s
+                JOIN subscriber_identities i ON s.subscriber_id = i.subscriber_id
+                WHERE i.imsi = $1 AND i.esn IS NULL AND i.meid = $2
+                LIMIT 1
+                "#,
+            )
+            .bind(imsi)
+            .bind(meid)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("resolve_by_identity imsi+meid: {e}"))?,
+            MobileIdentityKey::ImsiEsnMeid { imsi, esn, meid } => {
                 sqlx::query_as::<_, SubscriberRow>(
                     r#"
-                    SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at
+                    SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at,
+                        s.number_type, s.number_plan,
+                        EXISTS (SELECT 1 FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS has_ringtone,
+                        (SELECT MIN(duration_ms) FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS ringtone_duration_ms
                     FROM subscribers s
                     JOIN subscriber_identities i ON s.subscriber_id = i.subscriber_id
-                    WHERE i.imsi = $1
+                    WHERE i.imsi = $1 AND i.esn = $2 AND i.meid = $3
                     LIMIT 1
                     "#,
                 )
-                .bind(imsi_val)
+                .bind(imsi)
+                .bind(*esn as i64)
+                .bind(meid)
                 .fetch_optional(&self.pool)
                 .await
-                .map_err(|e| format!("resolve_by_identity imsi: {e}"))?
-            } else {
-                None
+                .map_err(|e| format!("resolve_by_identity imsi+esn+meid: {e}"))?
             }
-        } else if let Some(imsi_val) = imsi {
-            sqlx::query_as::<_, SubscriberRow>(
-                r#"
-                SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at,
-                    s.number_type, s.number_plan,
-                    EXISTS (SELECT 1 FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS has_ringtone,
-                    (SELECT MIN(duration_ms) FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS ringtone_duration_ms
-                FROM subscribers s
-                JOIN subscriber_identities i ON s.subscriber_id = i.subscriber_id
-                WHERE i.imsi = $1
-                LIMIT 1
-                "#,
-            )
-            .bind(imsi_val)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| format!("resolve_by_identity imsi: {e}"))?
-        } else {
-            None
         };
         let Some(row) = row else { return Ok(None) };
         let subscriber: Subscriber = row.try_into()?;
@@ -1160,63 +1331,45 @@ impl HlrRepository for PostgresHlrRepository {
 
     async fn upsert_mobile_seen(
         &self,
-        esn: Option<u32>,
-        imsi: Option<&str>,
+        identity: &MobileIdentityKey,
         mob_p_rev: Option<u8>,
     ) -> Result<MobileSeenUpsert, String> {
-        if esn.is_none() && imsi.is_none() {
-            return Err("upsert_mobile_seen: need ESN or IMSI".to_string());
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| format!("upsert_mobile_seen begin: {e}"))?;
+        let existing = select_mobile_seen_by_key(&mut tx, identity).await?;
+        if let Some(row) = existing {
+            update_mobile_seen_row(&mut tx, row.id, mob_p_rev, identity).await?;
+            delete_legacy_mobile_seen(&mut tx, identity.imsi(), Some(row.id)).await?;
+            tx.commit()
+                .await
+                .map_err(|e| format!("upsert_mobile_seen commit: {e}"))?;
+            return Ok(MobileSeenUpsert {
+                is_new: false,
+                previous_last_seen_at: Some(row.last_seen_at),
+            });
         }
 
-        let row = if let Some(esn_val) = esn {
-            sqlx::query_as::<_, MobileSeenRow>(
-                r#"
-                WITH prev AS (
-                    SELECT last_seen_at FROM mobiles_seen WHERE esn = $1
-                )
-                INSERT INTO mobiles_seen (esn, imsi, mob_p_rev)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (esn) WHERE esn IS NOT NULL DO UPDATE SET
-                    imsi = COALESCE(EXCLUDED.imsi, mobiles_seen.imsi),
-                    mob_p_rev = COALESCE(EXCLUDED.mob_p_rev, mobiles_seen.mob_p_rev),
-                    last_seen_at = NOW()
-                RETURNING
-                    (SELECT last_seen_at FROM prev) AS previous_last_seen_at,
-                    (xmax = 0) AS is_new
-                "#,
-            )
-            .bind(esn_val as i64)
-            .bind(imsi)
-            .bind(mob_p_rev.map(|v| v as i32))
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| format!("upsert_mobile_seen (esn): {e}"))?
-        } else {
-            sqlx::query_as::<_, MobileSeenRow>(
-                r#"
-                WITH prev AS (
-                    SELECT last_seen_at FROM mobiles_seen WHERE imsi = $1
-                )
-                INSERT INTO mobiles_seen (imsi, mob_p_rev)
-                VALUES ($1, $2)
-                ON CONFLICT (imsi) WHERE imsi IS NOT NULL DO UPDATE SET
-                    mob_p_rev = COALESCE(EXCLUDED.mob_p_rev, mobiles_seen.mob_p_rev),
-                    last_seen_at = NOW()
-                RETURNING
-                    (SELECT last_seen_at FROM prev) AS previous_last_seen_at,
-                    (xmax = 0) AS is_new
-                "#,
-            )
-            .bind(imsi)
-            .bind(mob_p_rev.map(|v| v as i32))
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| format!("upsert_mobile_seen (imsi): {e}"))?
-        };
+        if let Some(row) = select_legacy_mobile_seen_by_imsi(&mut tx, identity.imsi()).await? {
+            update_mobile_seen_row(&mut tx, row.id, mob_p_rev, identity).await?;
+            tx.commit()
+                .await
+                .map_err(|e| format!("upsert_mobile_seen legacy commit: {e}"))?;
+            return Ok(MobileSeenUpsert {
+                is_new: false,
+                previous_last_seen_at: Some(row.last_seen_at),
+            });
+        }
 
+        insert_mobile_seen(&mut tx, mob_p_rev, identity).await?;
+        tx.commit()
+            .await
+            .map_err(|e| format!("upsert_mobile_seen insert commit: {e}"))?;
         Ok(MobileSeenUpsert {
-            is_new: row.is_new,
-            previous_last_seen_at: row.previous_last_seen_at,
+            is_new: true,
+            previous_last_seen_at: None,
         })
     }
 
@@ -1227,15 +1380,16 @@ impl HlrRepository for PostgresHlrRepository {
         let row = sqlx::query_as::<_, BindingRow>(
             r#"
             INSERT INTO registration_bindings (
-                subscriber_id, serving_node_id, state, imsi, esn,
+                subscriber_id, serving_node_id, state, imsi, esn, meid,
                 mob_p_rev, pgslot, slot_cycle_index, last_msg_seq,
                 last_registered_at, last_seen_at, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             ON CONFLICT (subscriber_id) DO UPDATE SET
                 serving_node_id = EXCLUDED.serving_node_id,
                 state = EXCLUDED.state,
                 imsi = EXCLUDED.imsi,
                 esn = EXCLUDED.esn,
+                meid = EXCLUDED.meid,
                 mob_p_rev = EXCLUDED.mob_p_rev,
                 pgslot = EXCLUDED.pgslot,
                 slot_cycle_index = EXCLUDED.slot_cycle_index,
@@ -1243,7 +1397,7 @@ impl HlrRepository for PostgresHlrRepository {
                 last_registered_at = EXCLUDED.last_registered_at,
                 last_seen_at = EXCLUDED.last_seen_at,
                 updated_at = EXCLUDED.updated_at
-            RETURNING subscriber_id, serving_node_id, state, imsi, esn,
+            RETURNING subscriber_id, serving_node_id, state, imsi, esn, meid,
                 mob_p_rev, pgslot, slot_cycle_index, last_msg_seq,
                 last_registered_at, last_seen_at, updated_at
             "#,
@@ -1253,6 +1407,7 @@ impl HlrRepository for PostgresHlrRepository {
         .bind(binding.state.as_str())
         .bind(binding.imsi.as_deref())
         .bind(binding.esn.map(|v| v as i64))
+        .bind(binding.meid.as_deref())
         .bind(binding.mob_p_rev.map(|v| v as i64))
         .bind(binding.pgslot.map(|v| v as i64))
         .bind(binding.slot_cycle_index.map(|v| v as i64))
@@ -1274,7 +1429,7 @@ impl HlrRepository for PostgresHlrRepository {
         let row = sqlx::query_as::<_, BindingRow>(
             r#"
             SELECT subscriber_id, serving_node_id, state, imsi, esn,
-                mob_p_rev, pgslot, slot_cycle_index, last_msg_seq,
+                meid, mob_p_rev, pgslot, slot_cycle_index, last_msg_seq,
                 last_registered_at, last_seen_at, updated_at
             FROM registration_bindings WHERE subscriber_id = $1
             "#,
@@ -1437,6 +1592,7 @@ struct IdentityRow {
     subscriber_id: Uuid,
     imsi: Option<String>,
     esn: Option<i64>,
+    meid: Option<String>,
     is_primary: bool,
     created_at: DateTime<Utc>,
 }
@@ -1448,16 +1604,11 @@ impl From<IdentityRow> for SubscriberIdentity {
             subscriber_id: r.subscriber_id,
             imsi: r.imsi,
             esn: r.esn.map(|v| v as u32),
+            meid: r.meid,
             is_primary: r.is_primary,
             created_at: r.created_at,
         }
     }
-}
-
-#[derive(sqlx::FromRow)]
-struct MobileSeenRow {
-    previous_last_seen_at: Option<DateTime<Utc>>,
-    is_new: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1467,6 +1618,7 @@ struct BindingRow {
     state: String,
     imsi: Option<String>,
     esn: Option<i64>,
+    meid: Option<String>,
     mob_p_rev: Option<i64>,
     pgslot: Option<i64>,
     slot_cycle_index: Option<i64>,
@@ -1486,6 +1638,7 @@ impl TryFrom<BindingRow> for RegistrationBinding {
             state: RegistrationState::from_str(&r.state)?,
             imsi: r.imsi,
             esn: r.esn.map(|v| v as u32),
+            meid: r.meid,
             mob_p_rev: r.mob_p_rev.map(|v| v as u32),
             pgslot: r.pgslot.map(|v| v as u32),
             slot_cycle_index: r.slot_cycle_index.map(|v| v as u32),

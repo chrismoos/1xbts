@@ -4,7 +4,7 @@ import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { Card } from "@/components/card";
 import { esnManufacturer } from "@/lib/esn-manufacturer";
-import { formatEsn, formatTimeMs as formatTime } from "@/lib/format";
+import { formatEsn, formatMeid, formatTimeMs as formatTime } from "@/lib/format";
 
 interface MobileInfo {
   address: string;
@@ -13,6 +13,7 @@ interface MobileInfo {
   mobPRev: number;
   esn?: number;
   imsi?: string;
+  meid?: string;
   imsiMS1?: number;
   imsiMS2?: number;
   pgslot?: number;
@@ -39,6 +40,7 @@ function qualityColor(pct: number): string {
 function formatMobileLabel(ms: MobileInfo): string {
   const parts: string[] = [];
   if (ms.esn != null) parts.push(`ESN ${formatEsn(ms.esn)}`);
+  if (ms.meid) parts.push(`MEID ${formatMeid(ms.meid)}`);
   return parts.length > 0 ? parts.join(" / ") : ms.address;
 }
 
@@ -114,6 +116,11 @@ export default function MobilesPage() {
                           <div className="font-mono">
                             IMSI {ms.imsi || "Not Available"}
                           </div>
+                          {ms.meid && (
+                            <div className="font-mono">
+                              MEID {formatMeid(ms.meid)}
+                            </div>
+                          )}
                           {ms.esn != null && esnManufacturer(ms.esn) && (
                             <span className="text-dimmed">{esnManufacturer(ms.esn)}</span>
                           )}

@@ -729,11 +729,16 @@ impl Bsc {
     ) {
         let client = self.a1.msc_client.clone();
         let mobile_identity = self.mobile_identity_for_adds_page_ack(addr);
+        let esn = self
+            .mobiles
+            .iter()
+            .find(|ms| ms.fwd_address == *addr)
+            .and_then(|ms| ms.esn);
         tokio::spawn(async move {
             let ack_msg = cdma_ios::AddsPageAckMessage {
                 mobile_identity,
                 tag: Some(cdma_ios::Tag(a1_tag)),
-                mobile_identity_esn: None,
+                mobile_identity_esn: esn.map(cdma_ios::MobileIdentity::Esn),
                 cause: cause.map(cdma_ios::Cause),
             };
             match ack_msg.encode() {

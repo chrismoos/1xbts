@@ -45,6 +45,7 @@ pub struct MobileInfo {
     // Structured identity fields
     pub esn: Option<u32>,
     pub imsi: Option<String>,
+    pub meid: Option<String>,
     /// Computed paging slot (0..2047) per C.S0005-E 2.6.7.1.
     pub pgslot: Option<u16>,
     /// Slot cycle index from the mobile's registration.
@@ -99,6 +100,7 @@ pub(crate) struct MobileStation {
     /// forward/page address so the UI can show the full identity set.
     pub(crate) esn: Option<u32>,
     pub(crate) imsi: Option<String>,
+    pub(crate) meid: Option<String>,
     /// Cached IMSI components derived from the full IMSI string.
     /// Used to compute page addresses and OTA encoding without re-parsing.
     imsi_m_s1: Option<u32>,
@@ -184,6 +186,7 @@ impl MobileStation {
             fwd_address,
             esn,
             imsi,
+            meid: None,
             imsi_m_s1,
             imsi_m_s2,
             imsi_mcc,
@@ -508,10 +511,9 @@ pub(crate) struct VoiceReleaseTarget {
     pub(crate) a1_clear_state: super::A1ClearState,
 }
 
-/// Outcome of `apply_access_registration`. Currently just the stable
-/// `fwd_address` the entry is keyed on; an `is_new` flag was previously
-/// here to gate MSC notification, but the BSC now notifies on every event
-/// (the MSC dedupes via `upsert_mobile_seen`).
+/// Outcome of `apply_access_registration`: the stable `fwd_address` the
+/// entry is keyed on. MSC notification is fired on every event regardless
+/// of new/repeat; the MSC dedupes via `upsert_mobile_seen`.
 pub(crate) struct RegistrationOutcome {
     pub(crate) fwd_address: MsAddress,
 }
@@ -907,6 +909,7 @@ impl MobileRegistry {
                 mob_p_rev: ms.mob_p_rev,
                 esn: ms.esn,
                 imsi: ms.imsi.clone(),
+                meid: ms.meid.clone(),
                 pgslot: ms.pgslot,
                 slot_cycle_index: ms.slot_cycle_index,
                 snr_db: ms.snr_db,
@@ -1140,6 +1143,7 @@ impl MobileRegistry {
             fwd_address: update.fwd_address,
             esn: event.esn,
             imsi: update.registration_imsi,
+            meid: event.meid.clone(),
             imsi_m_s1: event.imsi_m_s1,
             imsi_m_s2: event.imsi_m_s2,
             imsi_mcc: update.imsi_mcc,
@@ -1214,6 +1218,9 @@ impl MobileRegistry {
         resolved_imsi_11_12: Option<u8>,
     ) {
         ms.esn = event.esn.or(ms.esn);
+        if let Some(meid) = event.meid.clone() {
+            ms.meid = Some(meid);
+        }
         if let Some(imsi) = registration_imsi {
             ms.imsi = Some(imsi);
         }

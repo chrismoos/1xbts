@@ -575,6 +575,7 @@ fn to_proto_access_event(e: &AccessChannelEvent) -> proto::AccessEvent {
         esn: e.esn,
         imsi_m_s1: e.imsi_m_s1,
         imsi_m_s2: e.imsi_m_s2.map(|v| v as u32),
+        meid: e.meid.clone(),
         mob_p_rev: e.mob_p_rev.map(|v| v as u32),
         timestamp_us,
         snr_db: e.snr_db,
@@ -942,6 +943,8 @@ fn to_proto_paging_event(ev: &PagingEvent) -> proto::PagingEvent {
                     use_tmsi: m.use_tmsi,
                     pref_msid_type: m.pref_msid_type as u32,
                     max_num_alt_so: m.max_num_alt_so as u32,
+                    ext_pref_msid_type: m.ext_pref_msid_type.map(u32::from),
+                    meid_reqd: m.meid_reqd,
                 },
             ))
         }
@@ -1512,6 +1515,7 @@ impl BscService for BscServiceImpl {
                         mob_p_rev: m.mob_p_rev as u32,
                         esn: m.esn,
                         imsi: m.imsi.clone(),
+                        meid: m.meid.clone(),
                         pgslot: m.pgslot.map(|v| v as u32),
                         slot_cycle_index: m.slot_cycle_index as u32,
                         snr_db: m.snr_db,

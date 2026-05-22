@@ -68,6 +68,12 @@ pub struct SystemParametersMessage {
     pub user_zone_id: bool,
     pub ext_global_redirect: bool,
     pub ext_chan_lst: bool,
+    pub t_tdrop_range_incl: bool,
+    pub t_tdrop_range: u8,
+    pub neg_slot_cycle_index_sup: bool,
+    pub crrm_msg_ind: bool,
+    pub num_opt_msg_bits: u8,
+    pub add_loc_info_incl: bool,
 }
 
 #[derive(Debug)]
@@ -341,53 +347,125 @@ fn decode_system_parameters(
     header: PagingMessageHeader,
     bs: &mut Bitstream,
 ) -> Result<PagingMessage, String> {
+    let pilot_pn = read(bs, 9, "PILOT_PN")? as u16;
+    let config_msg_seq = read(bs, 6, "CONFIG_MSG_SEQ")? as u8;
+    let sid = read(bs, 15, "SID")? as u16;
+    let nid = read(bs, 16, "NID")? as u16;
+    let reg_zone = read(bs, 12, "REG_ZONE")? as u16;
+    let total_zones = read(bs, 3, "TOTAL_ZONES")? as u8;
+    let zone_timer = read(bs, 3, "ZONE_TIMER")? as u8;
+    let mult_sids = read(bs, 1, "MULT_SIDS")? == 1;
+    let mult_nids = read(bs, 1, "MULT_NIDS")? == 1;
+    let base_id = read(bs, 16, "BASE_ID")? as u16;
+    let base_class = read(bs, 4, "BASE_CLASS")? as u8;
+    let page_chan = read(bs, 3, "PAGE_CHAN")? as u8;
+    let max_slot_cycle_index = read(bs, 3, "MAX_SLOT_CYCLE_INDEX")? as u8;
+    let home_reg = read(bs, 1, "HOME_REG")? == 1;
+    let for_sid_reg = read(bs, 1, "FOR_SID_REG")? == 1;
+    let for_nid_reg = read(bs, 1, "FOR_NID_REG")? == 1;
+    let power_up_reg = read(bs, 1, "POWER_UP_REG")? == 1;
+    let power_down_reg = read(bs, 1, "POWER_DOWN_REG")? == 1;
+    let parameter_reg = read(bs, 1, "PARAMETER_REG")? == 1;
+    let reg_prd = read(bs, 7, "REG_PRD")? as u8;
+    let base_lat = read(bs, 22, "BASE_LAT")? as u32;
+    let base_long = read(bs, 23, "BASE_LONG")? as u32;
+    let reg_dist = read(bs, 11, "REG_DIST")? as u16;
+    let srch_win_a = read(bs, 4, "SRCH_WIN_A")? as u8;
+    let srch_win_n = read(bs, 4, "SRCH_WIN_N")? as u8;
+    let srch_win_r = read(bs, 4, "SRCH_WIN_R")? as u8;
+    let nghbr_max_age = read(bs, 4, "NGHBR_MAX_AGE")? as u8;
+    let pwr_rep_thresh = read(bs, 5, "PWR_REP_THRESH")? as u8;
+    let pwr_rep_frames = read(bs, 4, "PWR_REP_FRAMES")? as u8;
+    let pwr_thresh_enable = read(bs, 1, "PWR_THRESH_ENABLE")? == 1;
+    let pwr_period_enable = read(bs, 1, "PWR_PERIOD_ENABLE")? == 1;
+    let pwr_rep_delay = read(bs, 5, "PWR_REP_DELAY")? as u8;
+    let rescan = read(bs, 1, "RESCAN")? == 1;
+    let t_add = read(bs, 6, "T_ADD")? as u8;
+    let t_drop = read(bs, 6, "T_DROP")? as u8;
+    let t_comp = read(bs, 4, "T_COMP")? as u8;
+    let t_tdrop = read(bs, 4, "T_TDROP")? as u8;
+    let ext_sys_parameter = read(bs, 1, "EXT_SYS_PARAMETER")? == 1;
+    let ext_nghbr_lst = read(bs, 1, "EXT_NGHBR_LST")? == 1;
+    let gen_nghbr_lst = read(bs, 1, "GEN_NGHBR_LST")? == 1;
+    let global_redirect = read(bs, 1, "GLOBAL_REDIRECT")? == 1;
+    let pri_nghbr_lst = read(bs, 1, "PRI_NGHBR_LST")? == 1;
+    let user_zone_id = read(bs, 1, "USER_ZONE_ID")? == 1;
+    let ext_global_redirect = read(bs, 1, "EXT_GLOBAL_REDIRECT")? == 1;
+    let ext_chan_lst = read(bs, 1, "EXT_CHAN_LST")? == 1;
+    // Pre-P_REV-6 traces stop at EXT_CHAN_LST; default to absent.
+    let t_tdrop_range_incl = !bs.is_empty() && read(bs, 1, "T_TDROP_RANGE_INCL")? == 1;
+    let t_tdrop_range = if t_tdrop_range_incl {
+        read(bs, 4, "T_TDROP_RANGE")? as u8
+    } else {
+        0
+    };
+    let neg_slot_cycle_index_sup = !bs.is_empty() && read(bs, 1, "NEG_SLOT_CYCLE_INDEX_SUP")? == 1;
+    let crrm_msg_ind = !bs.is_empty() && read(bs, 1, "CRRM_MSG_IND")? == 1;
+    let num_opt_msg_bits = if bs.is_empty() {
+        0
+    } else {
+        read(bs, 4, "NUM_OPT_MSG_BITS")? as u8
+    };
+    if num_opt_msg_bits != 0 {
+        return Err("SPM NUM_OPT_MSG_BITS != 0 not implemented".to_string());
+    }
+    let add_loc_info_incl = !bs.is_empty() && read(bs, 1, "ADD_LOC_INFO_INCL")? == 1;
+    if add_loc_info_incl {
+        return Err("SPM ADD_LOC_INFO_INCL=1 not implemented".to_string());
+    }
     Ok(PagingMessage::SystemParameters(SystemParametersMessage {
         header,
-        pilot_pn: read(bs, 9, "PILOT_PN")? as u16,
-        config_msg_seq: read(bs, 6, "CONFIG_MSG_SEQ")? as u8,
-        sid: read(bs, 15, "SID")? as u16,
-        nid: read(bs, 16, "NID")? as u16,
-        reg_zone: read(bs, 12, "REG_ZONE")? as u16,
-        total_zones: read(bs, 3, "TOTAL_ZONES")? as u8,
-        zone_timer: read(bs, 3, "ZONE_TIMER")? as u8,
-        mult_sids: read(bs, 1, "MULT_SIDS")? == 1,
-        mult_nids: read(bs, 1, "MULT_NIDS")? == 1,
-        base_id: read(bs, 16, "BASE_ID")? as u16,
-        base_class: read(bs, 4, "BASE_CLASS")? as u8,
-        page_chan: read(bs, 3, "PAGE_CHAN")? as u8,
-        max_slot_cycle_index: read(bs, 3, "MAX_SLOT_CYCLE_INDEX")? as u8,
-        home_reg: read(bs, 1, "HOME_REG")? == 1,
-        for_sid_reg: read(bs, 1, "FOR_SID_REG")? == 1,
-        for_nid_reg: read(bs, 1, "FOR_NID_REG")? == 1,
-        power_up_reg: read(bs, 1, "POWER_UP_REG")? == 1,
-        power_down_reg: read(bs, 1, "POWER_DOWN_REG")? == 1,
-        parameter_reg: read(bs, 1, "PARAMETER_REG")? == 1,
-        reg_prd: read(bs, 7, "REG_PRD")? as u8,
-        base_lat: read(bs, 22, "BASE_LAT")? as u32,
-        base_long: read(bs, 23, "BASE_LONG")? as u32,
-        reg_dist: read(bs, 11, "REG_DIST")? as u16,
-        srch_win_a: read(bs, 4, "SRCH_WIN_A")? as u8,
-        srch_win_n: read(bs, 4, "SRCH_WIN_N")? as u8,
-        srch_win_r: read(bs, 4, "SRCH_WIN_R")? as u8,
-        nghbr_max_age: read(bs, 4, "NGHBR_MAX_AGE")? as u8,
-        pwr_rep_thresh: read(bs, 5, "PWR_REP_THRESH")? as u8,
-        pwr_rep_frames: read(bs, 4, "PWR_REP_FRAMES")? as u8,
-        pwr_thresh_enable: read(bs, 1, "PWR_THRESH_ENABLE")? == 1,
-        pwr_period_enable: read(bs, 1, "PWR_PERIOD_ENABLE")? == 1,
-        pwr_rep_delay: read(bs, 5, "PWR_REP_DELAY")? as u8,
-        rescan: read(bs, 1, "RESCAN")? == 1,
-        t_add: read(bs, 6, "T_ADD")? as u8,
-        t_drop: read(bs, 6, "T_DROP")? as u8,
-        t_comp: read(bs, 4, "T_COMP")? as u8,
-        t_tdrop: read(bs, 4, "T_TDROP")? as u8,
-        ext_sys_parameter: read(bs, 1, "EXT_SYS_PARAMETER")? == 1,
-        ext_nghbr_lst: read(bs, 1, "EXT_NGHBR_LST")? == 1,
-        gen_nghbr_lst: read(bs, 1, "GEN_NGHBR_LST")? == 1,
-        global_redirect: read(bs, 1, "GLOBAL_REDIRECT")? == 1,
-        pri_nghbr_lst: read(bs, 1, "PRI_NGHBR_LST")? == 1,
-        user_zone_id: read(bs, 1, "USER_ZONE_ID")? == 1,
-        ext_global_redirect: read(bs, 1, "EXT_GLOBAL_REDIRECT")? == 1,
-        ext_chan_lst: read(bs, 1, "EXT_CHAN_LST")? == 1,
+        pilot_pn,
+        config_msg_seq,
+        sid,
+        nid,
+        reg_zone,
+        total_zones,
+        zone_timer,
+        mult_sids,
+        mult_nids,
+        base_id,
+        base_class,
+        page_chan,
+        max_slot_cycle_index,
+        home_reg,
+        for_sid_reg,
+        for_nid_reg,
+        power_up_reg,
+        power_down_reg,
+        parameter_reg,
+        reg_prd,
+        base_lat,
+        base_long,
+        reg_dist,
+        srch_win_a,
+        srch_win_n,
+        srch_win_r,
+        nghbr_max_age,
+        pwr_rep_thresh,
+        pwr_rep_frames,
+        pwr_thresh_enable,
+        pwr_period_enable,
+        pwr_rep_delay,
+        rescan,
+        t_add,
+        t_drop,
+        t_comp,
+        t_tdrop,
+        ext_sys_parameter,
+        ext_nghbr_lst,
+        gen_nghbr_lst,
+        global_redirect,
+        pri_nghbr_lst,
+        user_zone_id,
+        ext_global_redirect,
+        ext_chan_lst,
+        t_tdrop_range_incl,
+        t_tdrop_range,
+        neg_slot_cycle_index_sup,
+        crrm_msg_ind,
+        num_opt_msg_bits,
+        add_loc_info_incl,
     }))
 }
 

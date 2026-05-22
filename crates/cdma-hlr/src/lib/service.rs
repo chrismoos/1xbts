@@ -96,6 +96,7 @@ fn identity_to_proto(i: &model::SubscriberIdentity) -> proto::SubscriberIdentity
         subscriber_id: i.subscriber_id.to_string(),
         imsi: i.imsi.clone(),
         esn: i.esn,
+        meid: i.meid.clone(),
         is_primary: i.is_primary,
         created_at: Some(datetime_to_timestamp(i.created_at)),
     }
@@ -108,6 +109,7 @@ fn binding_to_proto(b: &model::RegistrationBinding) -> proto::RegistrationBindin
         state: b.state.as_str().to_string(),
         imsi: b.imsi.clone(),
         esn: b.esn,
+        meid: b.meid.clone(),
         mob_p_rev: b.mob_p_rev,
         pgslot: b.pgslot,
         slot_cycle_index: b.slot_cycle_index,
@@ -137,6 +139,26 @@ fn validate_optional_imsi(imsi: Option<&str>) -> Result<(), Status> {
     Ok(())
 }
 
+fn validate_optional_meid(meid: Option<&str>) -> Result<(), Status> {
+    if let Some(meid) = meid {
+        model::normalize_meid(meid)
+            .map_err(|e| Status::invalid_argument(format!("invalid MEID: {e}")))?;
+    }
+    Ok(())
+}
+
+fn parse_identity_key(
+    identity: Option<proto::MobileIdentityKey>,
+) -> Result<model::MobileIdentityKey, Status> {
+    let identity = identity.ok_or_else(|| Status::invalid_argument("identity is required"))?;
+    model::MobileIdentityKey::from_parts(
+        identity.imsi.as_deref(),
+        identity.esn,
+        identity.meid.as_deref(),
+    )
+    .map_err(Status::invalid_argument)
+}
+
 fn validate_phone_number(phone_number: &str) -> Result<(), Status> {
     model::validate_phone_number(phone_number)
         .map_err(|e| Status::invalid_argument(format!("invalid phone number: {e}")))
@@ -153,6 +175,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         let req = request.into_inner();
         validate_phone_number(&req.phone_number)?;
         validate_optional_imsi(req.imsi.as_deref())?;
+        validate_optional_meid(req.meid.as_deref())?;
 
         let number_type = number_type_from_proto(req.number_type);
         let number_plan = number_plan_from_proto(req.number_plan);
@@ -173,12 +196,17 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
                 Status::internal("internal error")
             })?;
 
-        let has_identity = req.imsi.is_some() || req.esn.is_some();
+        let has_identity = req.imsi.is_some() || req.esn.is_some() || req.meid.is_some();
 
         let identity = if has_identity {
             let id = self
                 .repo
-                .upsert_identity(subscriber.subscriber_id, req.imsi.as_deref(), req.esn)
+                .upsert_identity(
+                    subscriber.subscriber_id,
+                    req.imsi.as_deref(),
+                    req.esn,
+                    req.meid.as_deref(),
+                )
                 .await
                 .map_err(|e| {
                     log::error!("HLR: {e}");
@@ -202,9 +230,15 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         let req = request.into_inner();
         let subscriber_id = parse_uuid(&req.subscriber_id)?;
         validate_optional_imsi(req.imsi.as_deref())?;
+        validate_optional_meid(req.meid.as_deref())?;
         let identity = self
             .repo
-            .upsert_identity(subscriber_id, req.imsi.as_deref(), req.esn)
+            .upsert_identity(
+                subscriber_id,
+                req.imsi.as_deref(),
+                req.esn,
+                req.meid.as_deref(),
+            )
             .await
             .map_err(Status::internal)?;
         Ok(Response::new(proto::UpsertIdentityResponse {
@@ -219,9 +253,15 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         let req = request.into_inner();
         let subscriber_id = parse_uuid(&req.subscriber_id)?;
         validate_optional_imsi(req.imsi.as_deref())?;
+        validate_optional_meid(req.meid.as_deref())?;
         let identity = self
             .repo
-            .replace_primary_identity(subscriber_id, req.imsi.as_deref(), req.esn)
+            .replace_primary_identity(
+                subscriber_id,
+                req.imsi.as_deref(),
+                req.esn,
+                req.meid.as_deref(),
+            )
             .await
             .map_err(Status::internal)?;
         Ok(Response::new(proto::ReplacePrimaryIdentityResponse {
@@ -249,7 +289,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         request: Request<proto::UpsertMobileSeenRequest>,
     ) -> Result<Response<proto::UpsertMobileSeenResponse>, Status> {
         let req = request.into_inner();
-        validate_optional_imsi(req.imsi.as_deref())?;
+        let identity = parse_identity_key(req.identity)?;
         let mob_p_rev = req
             .mob_p_rev
             .map(|value| {
@@ -258,7 +298,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             .transpose()?;
         let result = self
             .repo
-            .upsert_mobile_seen(req.esn, req.imsi.as_deref(), mob_p_rev)
+            .upsert_mobile_seen(&identity, mob_p_rev)
             .await
             .map_err(Status::internal)?;
         Ok(Response::new(proto::UpsertMobileSeenResponse {
@@ -320,10 +360,11 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         request: Request<proto::ResolveSubscriberByIdentityRequest>,
     ) -> Result<Response<proto::ResolveSubscriberByIdentityResponse>, Status> {
         let req = request.into_inner();
+        let identity = parse_identity_key(req.identity)?;
 
         let resolved = self
             .repo
-            .resolve_by_identity(req.esn, req.imsi.as_deref())
+            .resolve_by_identity(&identity)
             .await
             .map_err(|e| {
                 log::error!("HLR: {e}");
@@ -362,6 +403,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             })?,
             imsi: req.imsi,
             esn: req.esn,
+            meid: req.meid,
             mob_p_rev: req.mob_p_rev,
             pgslot: req.pgslot,
             slot_cycle_index: req.slot_cycle_index,
@@ -461,13 +503,19 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             .ok_or_else(|| Status::not_found("subscriber not found"))?;
 
         validate_optional_imsi(req.imsi.as_deref())?;
+        validate_optional_meid(req.meid.as_deref())?;
 
-        let has_identity = req.imsi.is_some() || req.esn.is_some();
+        let has_identity = req.imsi.is_some() || req.esn.is_some() || req.meid.is_some();
 
         let identity = if has_identity {
             Some(
                 self.repo
-                    .replace_primary_identity(subscriber_id, req.imsi.as_deref(), req.esn)
+                    .replace_primary_identity(
+                        subscriber_id,
+                        req.imsi.as_deref(),
+                        req.esn,
+                        req.meid.as_deref(),
+                    )
                     .await
                     .map_err(|e| {
                         log::error!("HLR: {e}");

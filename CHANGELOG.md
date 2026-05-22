@@ -1,5 +1,14 @@
 # HEAD 
 
+- Registrations now require a complete mobile identity (IMSI+ESN or
+  IMSI+MEID) for HLR resolution and welcome-SMS gating. Subscriber
+  create/update in the web UI requires the same.
+- P_REV 11 ESPM support (EXT_PREF_MSID_TYPE, MEID_REQD) and the SPM
+  P_REV 6/7/8 tail fields are implemented but not enabled in the
+  shipped `config/bts.json`. To enable, set the overhead and ESPM
+  `p_rev` to 11 and fill in `ext_pref_msid_type` and `meid_reqd`.
+  Not fully supported yet: some mobiles do not register cleanly at
+  P_REV 11, leave it at 6 for production.
 - Reverse access-channel SMS Data Burst messages are now handled by the BSC.
 - Access-channel probe defaults use higher initial and nominal power for SDRs
   with lower RX sensitivity.

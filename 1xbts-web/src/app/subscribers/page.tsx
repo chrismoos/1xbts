@@ -14,6 +14,7 @@ import {
   IMSI_DIGITS,
   PHONE_MAX_DIGITS,
   validateImsi,
+  validateMeid,
   validatePhoneNumber,
 } from "@/lib/validation";
 
@@ -21,6 +22,7 @@ type FieldErrors = {
   phoneNumber?: string;
   imsi?: string;
   esn?: string;
+  meid?: string;
   form?: string;
 };
 
@@ -38,6 +40,7 @@ interface SubscriberIdentity {
   subscriberId: string;
   imsi?: string;
   esn?: number;
+  meid?: string;
   isPrimary: boolean;
 }
 
@@ -71,6 +74,7 @@ export default function SubscribersPage() {
   const [displayName, setDisplayName] = useState("");
   const [esnHex, setEsnHex] = useState("");
   const [imsi, setImsi] = useState("");
+  const [meid, setMeid] = useState("");
   const [numberType, setNumberType] = useState<NumberType>(DEFAULT_NUMBER_TYPE);
   const [numberPlan, setNumberPlan] = useState<NumberPlan>(DEFAULT_NUMBER_PLAN);
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
@@ -125,6 +129,7 @@ export default function SubscribersPage() {
       const normalizedPhoneNumber = phoneNumber.trim();
       const normalizedEsn = esnHex.trim();
       const normalizedImsi = imsi.trim();
+      const normalizedMeid = meid.trim().toLowerCase();
       const errors: FieldErrors = {};
 
       const phoneCheck = validatePhoneNumber(normalizedPhoneNumber);
@@ -141,8 +146,15 @@ export default function SubscribersPage() {
         if (!imsiCheck.ok) errors.imsi = imsiCheck.error;
       }
 
-      if (!errors.esn && !errors.imsi && !normalizedEsn && !normalizedImsi) {
-        errors.form = "Enter ESN, IMSI, or both";
+      if (normalizedMeid) {
+        const meidCheck = validateMeid(normalizedMeid);
+        if (!meidCheck.ok) errors.meid = meidCheck.error;
+      }
+
+      if (!errors.esn && !errors.imsi && !errors.meid) {
+        if (!normalizedImsi || (!normalizedEsn && !normalizedMeid)) {
+          errors.form = "Enter IMSI plus ESN or MEID";
+        }
       }
 
       if (Object.keys(errors).length > 0) {
@@ -160,6 +172,7 @@ export default function SubscribersPage() {
       };
       if (esnValue !== undefined) body.esn = esnValue;
       if (normalizedImsi) body.imsi = normalizedImsi;
+      if (normalizedMeid) body.meid = normalizedMeid;
 
       const res = await fetch("/api/subscribers", {
         method: "POST",
@@ -185,6 +198,7 @@ export default function SubscribersPage() {
       setDisplayName("");
       setEsnHex("");
       setImsi("");
+      setMeid("");
       setNumberType(DEFAULT_NUMBER_TYPE);
       setNumberPlan(DEFAULT_NUMBER_PLAN);
       setShowForm(false);
@@ -267,7 +281,7 @@ export default function SubscribersPage() {
               </div>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <div>
                 <label className="block text-xs text-muted mb-1" htmlFor="new-esn">
                   ESN (hex)
@@ -314,6 +328,30 @@ export default function SubscribersPage() {
                 {fieldErrors.imsi && (
                   <p id="new-imsi-error" className="text-accent-red text-xs mt-1">
                     {fieldErrors.imsi}
+                  </p>
+                )}
+              </div>
+              <div>
+                <label className="block text-xs text-muted mb-1" htmlFor="new-meid">
+                  MEID (hex)
+                </label>
+                <input
+                  id="new-meid"
+                  type="text"
+                  value={meid}
+                  onChange={(e) => {
+                    setMeid(e.target.value);
+                    clearFieldError("meid");
+                  }}
+                  placeholder="A000000123ABCD"
+                  maxLength={14}
+                  aria-invalid={!!fieldErrors.meid}
+                  aria-describedby={fieldErrors.meid ? "new-meid-error" : undefined}
+                  className="w-full glass-input font-mono"
+                />
+                {fieldErrors.meid && (
+                  <p id="new-meid-error" className="text-accent-red text-xs mt-1">
+                    {fieldErrors.meid}
                   </p>
                 )}
               </div>

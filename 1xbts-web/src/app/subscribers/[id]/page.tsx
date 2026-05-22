@@ -4,7 +4,7 @@ import { use, useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { esnManufacturer } from "@/lib/esn-manufacturer";
-import { formatEsn } from "@/lib/format";
+import { formatEsn, formatMeid } from "@/lib/format";
 import { Card, Stat } from "@/components/card";
 import { validateRingtoneFile } from "@/lib/validation";
 import {
@@ -26,6 +26,7 @@ import {
   IMSI_DIGITS,
   PHONE_MAX_DIGITS,
   validateImsi,
+  validateMeid,
   validatePhoneNumber,
 } from "@/lib/validation";
 
@@ -33,6 +34,7 @@ type FieldErrors = {
   phoneNumber?: string;
   imsi?: string;
   esn?: string;
+  meid?: string;
   callerNumber?: string;
   form?: string;
 };
@@ -61,7 +63,11 @@ function formatTimestamp(
 
 function formatBindingIdentity(binding?: RegistrationBinding): string {
   if (!binding) return "-";
-  return [binding.esn != null ? `ESN ${formatEsn(binding.esn)}` : null, binding.imsi ? `IMSI ${binding.imsi}` : null]
+  return [
+    binding.esn != null ? `ESN ${formatEsn(binding.esn)}` : null,
+    binding.meid ? `MEID ${formatMeid(binding.meid)}` : null,
+    binding.imsi ? `IMSI ${binding.imsi}` : null,
+  ]
     .filter(Boolean)
     .join(" / ") || "-";
 }
@@ -102,6 +108,7 @@ export default function SubscriberDetailPage({
   const [status, setStatus] = useState("active");
   const [esnHex, setEsnHex] = useState("");
   const [imsi, setImsi] = useState("");
+  const [meid, setMeid] = useState("");
   const [numberType, setNumberType] = useState<NumberType>(DEFAULT_NUMBER_TYPE);
   const [numberPlan, setNumberPlan] = useState<NumberPlan>(DEFAULT_NUMBER_PLAN);
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
@@ -150,6 +157,7 @@ export default function SubscriberDetailPage({
         : ""
     );
     setImsi(primaryIdentity?.imsi ?? "");
+    setMeid(primaryIdentity?.meid ?? "");
   }, [detail, primaryIdentity]);
 
   const handleSave = async (e: React.FormEvent) => {
@@ -161,6 +169,7 @@ export default function SubscriberDetailPage({
       const normalizedPhoneNumber = phoneNumber.trim();
       const normalizedEsn = esnHex.trim();
       const normalizedImsi = imsi.trim();
+      const normalizedMeid = meid.trim().toLowerCase();
       const errors: FieldErrors = {};
 
       const phoneCheck = validatePhoneNumber(normalizedPhoneNumber);
@@ -175,6 +184,17 @@ export default function SubscriberDetailPage({
       if (normalizedImsi) {
         const imsiCheck = validateImsi(normalizedImsi);
         if (!imsiCheck.ok) errors.imsi = imsiCheck.error;
+      }
+
+      if (normalizedMeid) {
+        const meidCheck = validateMeid(normalizedMeid);
+        if (!meidCheck.ok) errors.meid = meidCheck.error;
+      }
+
+      if (!errors.esn && !errors.imsi && !errors.meid) {
+        if (!normalizedImsi || (!normalizedEsn && !normalizedMeid)) {
+          errors.form = "Enter IMSI plus ESN or MEID";
+        }
       }
 
       if (Object.keys(errors).length > 0) {
@@ -192,6 +212,7 @@ export default function SubscriberDetailPage({
       };
       if (esnValue !== undefined) body.esn = esnValue;
       if (normalizedImsi) body.imsi = normalizedImsi;
+      if (normalizedMeid) body.meid = normalizedMeid;
 
       const res = await fetch(`/api/subscribers/${encodeURIComponent(id)}`, {
         method: "PATCH",
@@ -468,6 +489,11 @@ export default function SubscriberDetailPage({
                   <div className="font-mono text-secondary">
                     IMSI {identity.imsi || "Not Available"}
                   </div>
+                  {identity.meid && (
+                    <div className="font-mono text-secondary">
+                      MEID {formatMeid(identity.meid)}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -716,7 +742,7 @@ export default function SubscriberDetailPage({
             </div>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div>
               <label className="block text-xs text-muted mb-1" htmlFor="edit-esn">
                 ESN (hex)
@@ -761,6 +787,29 @@ export default function SubscriberDetailPage({
               {fieldErrors.imsi && (
                 <p id="edit-imsi-error" className="text-accent-red text-xs mt-1">
                   {fieldErrors.imsi}
+                </p>
+              )}
+            </div>
+            <div>
+              <label className="block text-xs text-muted mb-1" htmlFor="edit-meid">
+                MEID (hex)
+              </label>
+              <input
+                id="edit-meid"
+                type="text"
+                value={meid}
+                onChange={(e) => {
+                  setMeid(e.target.value);
+                  clearFieldError("meid");
+                }}
+                maxLength={14}
+                aria-invalid={!!fieldErrors.meid}
+                aria-describedby={fieldErrors.meid ? "edit-meid-error" : undefined}
+                className="w-full glass-input font-mono"
+              />
+              {fieldErrors.meid && (
+                <p id="edit-meid-error" className="text-accent-red text-xs mt-1">
+                  {fieldErrors.meid}
                 </p>
               )}
             </div>

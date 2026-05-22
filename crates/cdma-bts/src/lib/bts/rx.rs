@@ -2458,6 +2458,7 @@ fn build_access_event(
         arq_valid_ack,
         msid_type,
         esn,
+        meid,
         imsi_m_s1,
         imsi_m_s2,
         imsi_class,
@@ -2478,6 +2479,7 @@ fn build_access_event(
                 valid_ack,
                 ea.msid_type,
                 ea.esn,
+                ea.meid,
                 ea.imsi_m_s1,
                 ea.imsi_m_s2,
                 ea.imsi_class,
@@ -2499,6 +2501,7 @@ fn build_access_event(
                 valid_ack,
                 ea.msid_type,
                 ea.esn,
+                ea.meid,
                 ea.imsi_m_s1,
                 ea.imsi_m_s2,
                 ea.imsi_class,
@@ -2508,7 +2511,7 @@ fn build_access_event(
             )
         }
         _ => (
-            None, None, false, false, None, None, None, None, None, None, None, None,
+            None, None, false, false, None, None, None, None, None, None, None, None, None,
         ),
     };
 
@@ -2570,6 +2573,7 @@ fn build_access_event(
         valid_ack: arq_valid_ack,
         msid_type,
         esn,
+        meid,
         imsi,
         imsi_m_s1,
         imsi_m_s2,
@@ -2723,6 +2727,7 @@ fn build_traffic_event(
         msid_type: None,
         esn: None,
         imsi: None,
+        meid: None,
         imsi_m_s1: None,
         imsi_m_s2: None,
         imsi_class: None,
@@ -2849,6 +2854,7 @@ fn build_traffic_phy_status_event(
         msid_type: None,
         esn: None,
         imsi: None,
+        meid: None,
         imsi_m_s1: None,
         imsi_m_s2: None,
         imsi_class: None,
@@ -2973,6 +2979,7 @@ fn build_traffic_voice_event(
         msid_type: None,
         esn: None,
         imsi: None,
+        meid: None,
         imsi_m_s1: None,
         imsi_m_s2: None,
         imsi_class: None,
@@ -3065,6 +3072,7 @@ fn build_traffic_preamble_event(
         msid_type: None,
         esn: None,
         imsi: None,
+        meid: None,
         imsi_m_s1: None,
         imsi_m_s2: None,
         imsi_class: None,
@@ -3171,6 +3179,7 @@ fn build_traffic_pcg_measurement_event(
         msid_type: None,
         esn: None,
         imsi: None,
+        meid: None,
         imsi_m_s1: None,
         imsi_m_s2: None,
         imsi_class: None,
@@ -3466,6 +3475,7 @@ fn extract_imsi_from_class_fields(bits: &mut cdma_common::bits::Bitstream) -> Op
 pub struct ExtractedAddr {
     pub msid_type: Option<u8>,
     pub esn: Option<u32>,
+    pub meid: Option<String>,
     pub imsi_m_s1: Option<u32>,
     pub imsi_m_s2: Option<u16>,
     pub imsi_class: Option<u8>,
@@ -3482,6 +3492,7 @@ pub fn extract_addressing_fields(
         return ExtractedAddr {
             msid_type: None,
             esn: None,
+            meid: None,
             imsi_m_s1: None,
             imsi_m_s2: None,
             imsi_class: None,
@@ -3492,6 +3503,7 @@ pub fn extract_addressing_fields(
     };
     let msid_type = Some(addr.msid_type);
     let mut esn = None;
+    let mut meid = None;
     let mut imsi_m_s1 = None;
     let mut imsi_m_s2 = None;
     let mut imsi_class = None;
@@ -3561,11 +3573,15 @@ pub fn extract_addressing_fields(
         0b100 => {
             // Extended MSID (MEID, IMSI+MEID, IMSI+ESN+MEID)
             match addr.ext_msid_type {
+                Some(0b000) if addr.msid_raw.len() >= 56 => {
+                    let mut bits = addr.msid_raw.clone();
+                    meid = bits.read_bits(56).ok().map(|v| format!("{v:014x}"));
+                }
                 Some(0b010) if addr.msid_raw.len() >= 32 => {
                     // IMSI+ESN+MEID: ESN(32) + MEID(56) + IMSI
                     let mut bits = addr.msid_raw.clone();
                     esn = bits.read_bits(32).ok().map(|v| v as u32);
-                    let _ = bits.read_bits(56); // skip MEID
+                    meid = bits.read_bits(56).ok().map(|v| format!("{v:014x}"));
                     if let Some(fields) = extract_imsi_from_class_fields(&mut bits) {
                         apply_imsi(
                             &fields,
@@ -3581,7 +3597,7 @@ pub fn extract_addressing_fields(
                 Some(0b001) if addr.msid_raw.len() >= 56 => {
                     // IMSI+MEID: MEID(56) + IMSI
                     let mut bits = addr.msid_raw.clone();
-                    let _ = bits.read_bits(56); // skip MEID
+                    meid = bits.read_bits(56).ok().map(|v| format!("{v:014x}"));
                     if let Some(fields) = extract_imsi_from_class_fields(&mut bits) {
                         apply_imsi(
                             &fields,
@@ -3603,6 +3619,7 @@ pub fn extract_addressing_fields(
     ExtractedAddr {
         msid_type,
         esn,
+        meid,
         imsi_m_s1,
         imsi_m_s2,
         imsi_class,
