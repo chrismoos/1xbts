@@ -8,9 +8,21 @@ use log::{debug, info, warn};
 use tokio::spawn;
 
 use crate::a1_edge::EncodedA1Message;
-use crate::addressing::format_ms_address;
+use crate::addressing::{format_ms_address, is_packet_data_so};
 
 use super::{Bsc, MobileRegistryService, VoiceAlertMode, VoiceLegRole, VoiceSessionKind};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingA1AssignmentKind {
+    Voice {
+        session_id: uuid::Uuid,
+        leg_role: VoiceLegRole,
+    },
+    SmsTraffic,
+    PacketData {
+        service_ref_id: u8,
+    },
+}
 
 /// Pending state for an MT call between sending the L3 trigger to the MSC
 /// and receiving the A1 Assignment Request back. Keyed by the *stable*
@@ -21,8 +33,7 @@ pub(crate) struct PendingA1Assignment {
     pub(crate) ack_msg_seq: u8,
     pub(crate) requested_tx_time: Option<cdma_common::time::CdmaSystemTime>,
     pub(crate) tx_deadline: Option<cdma_common::time::CdmaSystemTime>,
-    pub(crate) session_id: uuid::Uuid,
-    pub(crate) leg_role: VoiceLegRole,
+    pub(crate) kind: PendingA1AssignmentKind,
     pub(crate) bind_existing_traffic: bool,
 }
 
@@ -470,8 +481,7 @@ impl Bsc {
         event: &cdma_common::events::AccessChannelEvent,
         service_option: u16,
         called_number: Option<&str>,
-        session_id: uuid::Uuid,
-        leg_role: super::VoiceLegRole,
+        kind: PendingA1AssignmentKind,
     ) -> Option<u64> {
         let call_id = self.voice.allocate_mo_call_id();
 
@@ -517,8 +527,7 @@ impl Bsc {
                 ack_msg_seq,
                 requested_tx_time,
                 tx_deadline,
-                session_id,
-                leg_role,
+                kind,
                 bind_existing_traffic: false,
             },
         );
@@ -607,8 +616,10 @@ impl Bsc {
                 ack_msg_seq,
                 requested_tx_time,
                 tx_deadline,
-                session_id: pending.session_id,
-                leg_role: pending.leg_role,
+                kind: PendingA1AssignmentKind::Voice {
+                    session_id: pending.session_id,
+                    leg_role: pending.leg_role,
+                },
                 bind_existing_traffic: false,
             },
         );
@@ -721,8 +732,10 @@ impl Bsc {
                 ack_msg_seq: 0,
                 requested_tx_time: None,
                 tx_deadline: None,
-                session_id,
-                leg_role,
+                kind: PendingA1AssignmentKind::Voice {
+                    session_id,
+                    leg_role,
+                },
                 bind_existing_traffic: true,
             },
         );
@@ -793,21 +806,37 @@ impl Bsc {
             .as_ref()
             .and_then(extract_calling_party_number_record);
 
-        let existing_voice_walsh = mobile.existing_voice_walsh_for_assignment(
-            pending.bind_existing_traffic,
-            pending.session_id,
-            pending.leg_role,
-        );
+        let voice_assignment = match pending.kind {
+            PendingA1AssignmentKind::Voice {
+                session_id,
+                leg_role,
+            } => Some((session_id, leg_role)),
+            _ => None,
+        };
+        let existing_voice_walsh = voice_assignment.and_then(|(session_id, leg_role)| {
+            mobile.existing_voice_walsh_for_assignment(
+                pending.bind_existing_traffic,
+                session_id,
+                leg_role,
+            )
+        });
 
         if let Some(walsh_code) = existing_voice_walsh {
+            let Some((session_id, leg_role)) = voice_assignment else {
+                warn!(
+                    "BSC: non-voice A1 Assignment Request unexpectedly matched existing voice traffic call_id={}",
+                    call_id
+                );
+                return;
+            };
             self.mobiles.update_tc(walsh_code, |_, tc| {
                 tc.msc_circuit_id = Some(circuit_id);
-                tc.voice_session_id = Some(pending.session_id);
-                tc.voice_leg_role = Some(pending.leg_role);
+                tc.voice_session_id = Some(session_id);
+                tc.voice_leg_role = Some(leg_role);
                 tc.a1_call_id = Some(call_id);
             });
             if let Some(record) = calling_party.clone() {
-                if let Some(session) = self.voice.session_mut(pending.session_id) {
+                if let Some(session) = self.voice.session_mut(session_id) {
                     session.calling_party_record = Some(record);
                 }
             }
@@ -836,8 +865,8 @@ impl Bsc {
             match self.start_mt_voice_on_existing_traffic(
                 &pending.fwd_address,
                 service_option,
-                pending.session_id,
-                pending.leg_role,
+                session_id,
+                leg_role,
                 Some(call_id),
             ) {
                 Ok(started_walsh) => {
@@ -856,15 +885,36 @@ impl Bsc {
             return;
         }
 
+        let (session_id, leg_role, origination_service_option, service_ref_id) = match pending.kind
+        {
+            PendingA1AssignmentKind::Voice {
+                session_id,
+                leg_role,
+            } => (Some(session_id), Some(leg_role), None, 1),
+            PendingA1AssignmentKind::SmsTraffic => (None, None, Some(service_option), 1),
+            PendingA1AssignmentKind::PacketData { service_ref_id } => {
+                if !is_packet_data_so(service_option) {
+                    warn!(
+                        "BSC: A1 packet-data Assignment Request call_id={} carried non-packet SO{}",
+                        call_id, service_option
+                    );
+                    return;
+                }
+                (None, None, Some(service_option), service_ref_id)
+            }
+        };
+
         if let Err(error) = self
             .allocate_voice_channel_for_mobile(
                 &pending.fwd_address,
                 service_option,
+                origination_service_option,
+                service_ref_id,
                 pending.ack_msg_seq,
                 pending.requested_tx_time,
                 pending.tx_deadline,
-                Some(pending.session_id),
-                Some(pending.leg_role),
+                session_id,
+                leg_role,
                 Some(call_id),
             )
             .await
@@ -873,12 +923,13 @@ impl Bsc {
             return;
         }
 
-        let assigned_circuit = self
-            .mobiles
-            .update(&pending.fwd_address, |ms| {
-                ms.set_msc_circuit_id(circuit_id).is_some()
-            })
-            .unwrap_or(false);
+        let assigned_circuit = voice_assignment.is_some()
+            && self
+                .mobiles
+                .update(&pending.fwd_address, |ms| {
+                    ms.set_msc_circuit_id(circuit_id).is_some()
+                })
+                .unwrap_or(false);
 
         if assigned_circuit {
             if let Some(bearer) = self.config.msc_voice_bearer.as_ref() {
@@ -900,8 +951,8 @@ impl Bsc {
                 }
             }
         }
-        if let Some(record) = calling_party {
-            if let Some(session) = self.voice.session_mut(pending.session_id) {
+        if let (Some(record), Some((session_id, _))) = (calling_party, voice_assignment) {
+            if let Some(session) = self.voice.session_mut(session_id) {
                 session.calling_party_record = Some(record);
             }
         }
@@ -918,8 +969,10 @@ impl Bsc {
         };
 
         if let Some(pending) = self.a1.pop_pending_assignment(call_id) {
-            self.voice
-                .retain_sessions(|session| session.id != pending.session_id);
+            if let PendingA1AssignmentKind::Voice { session_id, .. } = pending.kind {
+                self.voice
+                    .retain_sessions(|session| session.id != session_id);
+            }
             self.a1.send_clear_complete(call_id, false);
             return;
         }
@@ -1115,9 +1168,9 @@ fn complete_layer3_information_from_origination(
     service_option: u16,
     called_number: Option<&str>,
 ) -> Option<Vec<u8>> {
-    let cdma_common::access::AccessMessage::Origination(origination) = event.decoded_l3.as_ref()?
-    else {
-        return None;
+    let origination = match event.decoded_l3.as_ref() {
+        Some(cdma_common::access::AccessMessage::Origination(origination)) => Some(origination),
+        _ => None,
     };
     let mobile = bsc.mobiles.get(fwd_address)?;
     let imsi = event
@@ -1141,7 +1194,12 @@ fn complete_layer3_information_from_origination(
         called_party_bcd_number,
         tag: None,
         mobile_identity_esn: event.esn.or(mobile.esn).map(cdma_ios::MobileIdentity::Esn),
-        slot_cycle_index: Some(cdma_ios::SlotCycleIndex(origination.slot_cycle_index)),
+        slot_cycle_index: Some(cdma_ios::SlotCycleIndex(
+            origination
+                .map(|origination| origination.slot_cycle_index)
+                .or(event.slot_cycle_index)
+                .unwrap_or(0),
+        )),
         authentication_response_parameter: None,
         authentication_confirmation_parameter: None,
         authentication_parameter_count: None,
@@ -1153,8 +1211,11 @@ fn complete_layer3_information_from_origination(
         circuit_identity_code: None,
         authentication_event: None,
         authentication_data: None,
-        paca_reorigination_indicator: origination.paca_reorig,
-        user_zone_id: origination.uzid.map(cdma_ios::UserZoneId),
+        paca_reorigination_indicator: origination
+            .is_some_and(|origination| origination.paca_reorig),
+        user_zone_id: origination
+            .and_then(|origination| origination.uzid)
+            .map(cdma_ios::UserZoneId),
         is2000_mobile_capabilities: None,
         cdma_serving_one_way_delay: None,
     };
@@ -1340,7 +1401,7 @@ mod tests {
     };
     use crate::a1_edge::{EncodedA1Message, InProcessMscClient};
     use crate::bsc::tests::test_bsc_with_active_traffic_channel;
-    use crate::bsc::{PendingA1Assignment, VoiceLegRole};
+    use crate::bsc::{PendingA1Assignment, PendingA1AssignmentKind, VoiceLegRole};
     use cdma_common::access::{
         AccessMessage, AccessMessageHeader, OriginationMessage, PageResponseMessage,
     };
@@ -1788,8 +1849,10 @@ mod tests {
                 ack_msg_seq: 0,
                 requested_tx_time: None,
                 tx_deadline: None,
-                session_id,
-                leg_role: VoiceLegRole::Callee,
+                kind: PendingA1AssignmentKind::Voice {
+                    session_id,
+                    leg_role: VoiceLegRole::Callee,
+                },
                 bind_existing_traffic: true,
             },
         );

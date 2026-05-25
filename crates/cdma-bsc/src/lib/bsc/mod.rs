@@ -41,7 +41,7 @@ pub(crate) mod voice;
 
 #[cfg(test)]
 pub(crate) use a1::PendingA1Assignment;
-pub(crate) use a1::{A1ClearState, A1Service};
+pub(crate) use a1::{A1ClearState, A1Service, PendingA1AssignmentKind};
 pub(crate) use access::{AccessService, AccessTx, HlrResolution};
 pub use core::{Bsc, Config};
 pub use launcher::{
@@ -51,6 +51,8 @@ pub use mobiles::MobileInfo;
 pub use packet::DataCallRequest;
 pub use paging::{PagingEvent, pch_transmit_event_to_paging_event};
 pub use sms::SmsRequest;
+#[cfg(any(test, feature = "test-utils"))]
+pub use test_utils::AutoAssignmentMscClient;
 pub use traffic_channel::{TrafficPowerOverrideAction, TrafficPowerOverrideRequest};
 pub use traffic_events::TrafficEvent;
 

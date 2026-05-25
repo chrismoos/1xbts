@@ -33,6 +33,8 @@ pub struct CallSessionSnapshot {
     pub state: CallControlState,
     /// Mobile identity associated with the call when known.
     pub mobile_identity: Option<MobileIdentity>,
+    /// Hardware identity associated with the call when known.
+    pub mobile_identity_esn: Option<MobileIdentity>,
     /// Attached media-gateway handle when the call has been bound to one.
     pub media_gateway_handle: Option<CallHandle>,
 }
@@ -42,6 +44,7 @@ struct CallSession {
     id: CallId,
     direction: CallDirection,
     mobile_identity: Option<MobileIdentity>,
+    mobile_identity_esn: Option<MobileIdentity>,
     media_gateway_handle: Option<CallHandle>,
     engine: ProcedureEngine,
 }
@@ -53,6 +56,7 @@ impl CallSession {
             direction: self.direction,
             state: self.engine.call_control().state(),
             mobile_identity: self.mobile_identity.clone(),
+            mobile_identity_esn: self.mobile_identity_esn.clone(),
             media_gateway_handle: self.media_gateway_handle,
         }
     }
@@ -141,10 +145,25 @@ impl MscCallController {
                 id,
                 direction,
                 mobile_identity,
+                mobile_identity_esn: None,
                 media_gateway_handle: None,
                 engine: ProcedureEngine::new(),
             },
         );
+    }
+
+    /// Stores the ESN/MEID identity learned from Layer 3 for this call.
+    pub fn set_mobile_identity_esn(
+        &mut self,
+        call_id: CallId,
+        mobile_identity_esn: Option<MobileIdentity>,
+    ) -> Result<(), CallControlError> {
+        let session = self
+            .calls
+            .get_mut(&call_id)
+            .ok_or(CallControlError::UnknownCall(call_id))?;
+        session.mobile_identity_esn = mobile_identity_esn;
+        Ok(())
     }
 
     /// Returns an immutable snapshot of the named call session.

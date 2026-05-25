@@ -59,8 +59,7 @@ fn test_voice_policy() -> std::sync::Arc<dyn cdma_msc::VoicePolicy> {
 }
 
 fn test_msc_client() -> Arc<dyn cdma_bsc::a1_edge::MscClient> {
-    let (client, _) = cdma_bsc::a1_edge::InProcessMscClient::pair(32);
-    Arc::new(client)
+    Arc::new(cdma_bsc::bsc::AutoAssignmentMscClient::new())
 }
 use cdma_common::{bits::Bitstream, consts::SERVICE_OPTION_SMS, error::Error, time};
 use chrono::Duration as ChronoDuration;

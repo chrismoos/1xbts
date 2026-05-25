@@ -60,8 +60,7 @@ fn test_voice_policy() -> Arc<dyn cdma_msc::VoicePolicy> {
 }
 
 fn test_msc_client() -> Arc<dyn crate::a1_edge::MscClient> {
-    let (client, _) = crate::a1_edge::InProcessMscClient::pair(32);
-    Arc::new(client)
+    Arc::new(crate::bsc::test_utils::AutoAssignmentMscClient::new())
 }
 
 #[derive(Default)]
@@ -619,27 +618,25 @@ pub(super) async fn test_bsc_with_active_traffic_channel_and_msc_client(
     event.for_supported_rcs = vec![1, 2, 3, 4, 5];
     event.rev_supported_rcs = vec![1, 2, 3, 4];
 
-    if is_packet_data_so(service_option) {
-        bsc.inject_access_event(event).await;
-    } else {
-        event.message_id = MessageId::Registration;
-        event.msg_type_name = "Registration Message".to_string();
-        event.service_option = None;
-        bsc.inject_access_event(event).await;
-        let addr = bsc.mobiles[0].fwd_address.clone();
-        bsc.allocate_voice_channel_for_mobile(
-            &addr,
-            service_option,
-            2,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .expect("voice traffic channel should be assigned");
-    }
+    event.message_id = MessageId::Registration;
+    event.msg_type_name = "Registration Message".to_string();
+    event.service_option = None;
+    bsc.inject_access_event(event).await;
+    let addr = bsc.mobiles[0].fwd_address.clone();
+    bsc.allocate_voice_channel_for_mobile(
+        &addr,
+        service_option,
+        Some(service_option),
+        1,
+        2,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("traffic channel should be assigned");
 
     let walsh_code = bsc.mobiles[0]
         .traffic_channel
@@ -1368,7 +1365,7 @@ async fn assigned_channel_preamble_sends_bs_ack_even_if_mobile_state_drifted() {
 
     bsc.inject_access_event(registration).await;
     let addr = bsc.mobiles[0].fwd_address.clone();
-    bsc.allocate_voice_channel_for_mobile(&addr, 3, 2, None, None, None, None, None)
+    bsc.allocate_voice_channel_for_mobile(&addr, 3, None, 1, 2, None, None, None, None, None)
         .await
         .expect("voice traffic channel should be assigned");
 
@@ -2552,6 +2549,61 @@ async fn traffic_mo_sms_without_subscriber_sends_temporary_cause_code() {
 }
 
 #[tokio::test]
+async fn traffic_mo_sms_with_a1_call_id_uses_adds_deliver() {
+    let (msc_client, msc_endpoint) = crate::a1_edge::InProcessMscClient::pair(4);
+    let (mut bsc, mut traffic_rx, walsh_code) =
+        test_bsc_with_active_traffic_channel_and_msc_client(
+            SERVICE_OPTION_SMS,
+            Arc::new(msc_client),
+        )
+        .await;
+    bsc.mobiles[0].phone_number = Some("5551234567".to_string());
+    bsc.mobiles[0].subscriber_id = Some(Uuid::new_v4());
+    bsc.mobiles.update_tc(walsh_code, |_, tc| {
+        tc.a1_call_id = Some(42);
+    });
+
+    while traffic_rx.try_recv().is_ok() {}
+    while tokio::time::timeout(Duration::from_millis(20), msc_endpoint.recv_from_bsc())
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+    {}
+
+    let mut data_burst = test_access_event();
+    data_burst.message_id = MessageId::DataBurst;
+    data_burst.msg_type_name = "Data Burst Message".to_string();
+    data_burst.msg_seq = Some(1);
+    data_burst.ack_seq = Some(3);
+    data_burst.ack_req = true;
+    data_burst.valid_ack = true;
+    data_burst.traffic_walsh_code = Some(walsh_code);
+    data_burst.burst_type = Some(3);
+    data_burst.data_burst_num_msgs = Some(1);
+    data_burst.data_burst_msg_number = Some(1);
+    data_burst.data_burst_fields = Some(vec![
+        0x00, 0x00, 0x02, 0x10, 0x02, 0x04, 0x05, 0x01, 0x95, 0x54, 0x48, 0x80, 0x06, 0x01, 0x84,
+        0x08, 0x18, 0x00, 0x03, 0x20, 0x0A, 0x90, 0x01, 0x05, 0x10, 0x1C, 0x8D, 0x3A, 0x40, 0x0A,
+        0x01, 0x40, 0x0E, 0x07, 0x05, 0x48, 0xBB, 0x49, 0xB1, 0x34, 0x80,
+    ]);
+
+    bsc.inject_access_event(data_burst).await;
+
+    let outbound = tokio::time::timeout(Duration::from_secs(1), msc_endpoint.recv_from_bsc())
+        .await
+        .expect("ADDS Deliver should be sent")
+        .expect("A1 endpoint should receive ADDS Deliver");
+    assert_eq!(outbound.message_type(), cdma_ios::MessageType::AddsDeliver);
+    assert_eq!(outbound.call_id(), Some(42));
+
+    let decoded = outbound.decode().expect("ADDS Deliver should decode");
+    let deliver = cdma_ios::AddsDeliverMessage::decode(&decoded.payload)
+        .expect("ADDS Deliver payload should decode");
+    assert_eq!(deliver.adds_user_part.burst_type, 0x03);
+}
+
+#[tokio::test]
 async fn pmrm_ack_of_bs_ack_advances_waiting_ms_ack() {
     let (mut bsc, _traffic_rx, walsh_code) =
         test_bsc_with_active_traffic_channel(SERVICE_OPTION_HIGH_RATE_PACKET_DATA).await;
@@ -2975,7 +3027,7 @@ async fn voice_service_connect_retry_targets_voice_channel() {
     bsc.mobiles[0].phone_number = Some("5551234567".to_string());
 
     let addr = bsc.mobiles[0].fwd_address.clone();
-    bsc.allocate_voice_channel_for_mobile(&addr, 3, 1, None, None, None, None, None)
+    bsc.allocate_voice_channel_for_mobile(&addr, 3, None, 1, 1, None, None, None, None, None)
         .await
         .expect("voice traffic channel should be assigned");
     bsc.mobiles[0].set_state(MsState::TrafficActive);

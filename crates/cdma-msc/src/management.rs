@@ -150,6 +150,7 @@ mod tests {
             direction: crate::call_control::CallDirection::MobileOriginated,
             state: CallControlState::Idle,
             mobile_identity: None,
+            mobile_identity_esn: None,
             media_gateway_handle: None,
         };
         reply_tx.send(Ok(vec![snapshot.clone()])).unwrap();

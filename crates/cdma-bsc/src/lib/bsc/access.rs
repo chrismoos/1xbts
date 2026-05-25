@@ -22,11 +22,11 @@ use log::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::addressing::{format_ms_address, is_packet_data_so, select_imsi_class0_forward_address};
-use cdma_common::consts::SR1_CHIP_RATE_HZ;
+use cdma_common::consts::{SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SR1_CHIP_RATE_HZ};
 
 use super::{
-    AccessRegistrationUpdate, Bsc, MobileStation, PendingPage, VoiceLegRole,
-    mark_reverse_regular_msg_seq_received, next_pch_correlation_id,
+    AccessRegistrationUpdate, Bsc, MobileStation, PendingA1AssignmentKind, PendingPage,
+    VoiceLegRole, mark_reverse_regular_msg_seq_received, next_pch_correlation_id,
 };
 
 /// Result of an async HLR subscriber lookup, sent back to the BSC run loop.
@@ -744,6 +744,8 @@ impl AccessService {
                 .allocate_voice_channel_for_mobile(
                     &addr,
                     pending.service_option,
+                    None,
+                    1,
                     ack_msg_seq,
                     access_response_tx_time(event),
                     bsc.access_ack_deadline(event),
@@ -814,18 +816,101 @@ impl AccessService {
         bsc.mobiles
             .apply_origination_capabilities(&fwd_address, event);
 
-        if bsc
-            .try_assign_access_sms_traffic(&fwd_address, event, last_msg_seq)
-            .await
-        {
-            return;
-        }
+        let origination_digits = bsc
+            .decoded_origination(event)
+            .map(|msg| bsc.format_origination_digits(msg))
+            .unwrap_or_default();
+        let packet_sr_id = bsc
+            .decoded_origination(event)
+            .and_then(|msg| msg.sr_id)
+            .unwrap_or(1);
+        let requested_so = if origination_digits == "#777" || origination_digits == "777" {
+            Some(SERVICE_OPTION_HIGH_RATE_PACKET_DATA)
+        } else {
+            event.service_option
+        };
 
-        if bsc
-            .try_assign_access_packet_data_traffic(&fwd_address, event, last_msg_seq)
-            .await
-        {
-            return;
+        if let Some(so) = requested_so {
+            let a1_kind = if is_sms_traffic_service_option(so) {
+                if bsc
+                    .mobiles
+                    .get(&fwd_address)
+                    .and_then(|ms| ms.pending_traffic_assignment())
+                    .is_some()
+                    && bsc
+                        .try_assign_access_sms_traffic(&fwd_address, event, last_msg_seq)
+                        .await
+                {
+                    return;
+                }
+                Some(PendingA1AssignmentKind::SmsTraffic)
+            } else if is_packet_data_so(so) {
+                let pending_packet_call_id = bsc
+                    .mobiles
+                    .get(&fwd_address)
+                    .and_then(|ms| ms.pending_packet_traffic_assignment())
+                    .and_then(|tc| tc.a1_call_id);
+                if pending_packet_call_id.is_some()
+                    && bsc
+                        .try_assign_access_packet_data_traffic(
+                            &fwd_address,
+                            event,
+                            last_msg_seq,
+                            pending_packet_call_id,
+                        )
+                        .await
+                {
+                    return;
+                }
+                Some(PendingA1AssignmentKind::PacketData {
+                    service_ref_id: packet_sr_id,
+                })
+            } else {
+                None
+            };
+            if let Some(a1_kind) = a1_kind {
+                if let Err(e) = bsc.access_tx.send_bs_ack_order(
+                    &fwd_address,
+                    last_msg_seq,
+                    access_response_tx_time(event),
+                    bsc.access_ack_deadline(event),
+                ) {
+                    warn!("BSC: failed to send BS Ack for A1 origination: {}", e);
+                    return;
+                }
+                let called_number =
+                    (!origination_digits.is_empty()).then_some(origination_digits.as_str());
+                if bsc
+                    .send_complete_layer3_for_origination(
+                        &fwd_address,
+                        event,
+                        so,
+                        called_number,
+                        a1_kind,
+                    )
+                    .await
+                    .is_some()
+                {
+                    return;
+                }
+                warn!(
+                    "BSC: failed to send CLI3 for SO{} origination from {}; releasing access attempt",
+                    so,
+                    format_ms_address(&fwd_address)
+                );
+                if let Err(e) = bsc.access_tx.send_service_option_rejected_release(
+                    &fwd_address,
+                    last_msg_seq,
+                    access_response_tx_time(event),
+                    bsc.access_ack_deadline(event),
+                ) {
+                    warn!(
+                        "BSC: failed to send service-option rejection Release Order for SO{}: {}",
+                        so, e
+                    );
+                }
+                return;
+            }
         }
 
         // Voice service options - assign traffic channel for voice call.
@@ -884,8 +969,10 @@ impl AccessService {
                     event,
                     so,
                     called_number,
-                    session_id,
-                    VoiceLegRole::Caller,
+                    PendingA1AssignmentKind::Voice {
+                        session_id,
+                        leg_role: VoiceLegRole::Caller,
+                    },
                 )
                 .await
                 .is_some()
@@ -918,7 +1005,13 @@ impl AccessService {
 }
 
 fn is_supported_origination_service_option(so: u16) -> bool {
-    matches!(so, 6) || is_packet_data_so(so) || is_voice_origination_service_option(so)
+    is_sms_traffic_service_option(so)
+        || is_packet_data_so(so)
+        || is_voice_origination_service_option(so)
+}
+
+fn is_sms_traffic_service_option(so: u16) -> bool {
+    matches!(so, 6 | 14)
 }
 
 fn is_voice_origination_service_option(so: u16) -> bool {

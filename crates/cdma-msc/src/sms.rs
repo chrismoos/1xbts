@@ -307,8 +307,9 @@ impl MscSmsCoordinator {
         &self,
         msg: &AddsDeliverMessage,
         mobile_identity: &MobileIdentity,
+        mobile_identity_esn: Option<&MobileIdentity>,
     ) {
-        self.record_mo_sms(mobile_identity, None, &msg.adds_user_part)
+        self.record_mo_sms(mobile_identity, mobile_identity_esn, &msg.adds_user_part)
             .await;
     }
 

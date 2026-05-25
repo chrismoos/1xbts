@@ -13,6 +13,9 @@ use std::time::Duration;
 
 use log::{debug, info, warn};
 
+use cdma_common::consts::{
+    SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_PACKET_DATA, SERVICE_OPTION_SMS,
+};
 use cdma_hlr::model::{RegistrationBinding, SubscriberIdentity};
 use cdma_ios::{A1TransportError, EncodedA1Message, VoiceBearerFrame, VoiceBearerManager};
 
@@ -51,6 +54,21 @@ pub(crate) enum PagePurpose {
     Retry,
     RepageAfterAf { failed_leg: MscVoiceLeg },
     M2mSecondary,
+}
+
+fn is_sms_traffic_service_option(so: u16) -> bool {
+    matches!(so, SERVICE_OPTION_SMS | 14)
+}
+
+fn is_packet_data_service_option(so: u16) -> bool {
+    matches!(
+        so,
+        SERVICE_OPTION_PACKET_DATA | SERVICE_OPTION_HIGH_RATE_PACKET_DATA
+    )
+}
+
+fn is_non_voice_a1_service_option(so: u16) -> bool {
+    is_sms_traffic_service_option(so) || is_packet_data_service_option(so)
 }
 
 impl PagePurpose {
@@ -799,6 +817,16 @@ impl MscRuntime {
                 self.circuits.reset_assignment_failure_retries(call_id);
                 if completed_circuit_id
                     .and_then(|cid| self.circuits.circuits.get(&cid))
+                    .is_some_and(|session| is_non_voice_a1_service_option(session.service_option))
+                {
+                    debug!(
+                        "MSC: AssignmentComplete call_id={} completed non-voice A1 context",
+                        call_id.0
+                    );
+                    return;
+                }
+                if completed_circuit_id
+                    .and_then(|cid| self.circuits.circuits.get(&cid))
                     .is_some_and(|session| {
                         session.audio_file.is_some()
                             && session.peer_circuit_id.is_none()
@@ -1039,17 +1067,22 @@ impl MscRuntime {
                 let mobile_identity = cm_service_request
                     .as_ref()
                     .map(|req| req.mobile_identity_imsi.clone());
+                let mobile_identity_esn = cm_service_request
+                    .as_ref()
+                    .and_then(|req| req.mobile_identity_esn.clone());
                 let call_id = self.controller.create_call_with_id(
                     call_id,
                     CallDirection::MobileOriginated,
                     mobile_identity,
                 );
-                if let Some(number) = calling_number.clone() {
-                    self.mo_call.mo_calling_numbers.insert(call_id, number);
-                }
-                if let Some((_, subscriber_id)) = originator {
-                    self.media_gw
-                        .register_active_subscriber(subscriber_id, call_id);
+                if let Err(error) = self
+                    .controller
+                    .set_mobile_identity_esn(call_id, mobile_identity_esn)
+                {
+                    warn!(
+                        "MSC: failed to store MO hardware identity for call_id={}: {}",
+                        call_id_raw, error
+                    );
                 }
                 if let Err(error) = self.controller.apply_from_bsc(
                     call_id,
@@ -1065,6 +1098,96 @@ impl MscRuntime {
                         call_id_raw, error
                     );
                     return;
+                }
+
+                if is_non_voice_a1_service_option(service_option) {
+                    let cic = self
+                        .circuits
+                        .assignment_circuit_identity_code_for_next_leg(call_id);
+                    let circuit_id = cic.to_packed();
+                    self.circuits.insert_circuit_session(
+                        circuit_id,
+                        CircuitSession {
+                            call_id,
+                            audio_file: None,
+                            service_option,
+                            leg_role: MscVoiceLeg::Primary,
+                            peer_circuit_id: None,
+                            bearer_remote_ready: true,
+                            media_gateway_handle: None,
+                            called_number: called_number.clone(),
+                        },
+                    );
+                    self.circuits.queue_assignment_complete_circuit(
+                        call_id,
+                        MscVoiceLeg::Primary,
+                        circuit_id,
+                    );
+                    let assignment_request = cdma_ios::AssignmentRequestMessage {
+                        channel_type: cdma_ios::ChannelType {
+                            speech_or_data_indicator: 0x01,
+                            channel_rate_and_type: 0x08,
+                            coding: 0x05,
+                        },
+                        circuit_identity_code: cic,
+                        encryption_information: None,
+                        service_option: Some(cdma_ios::ServiceOption(service_option)),
+                        signals: Vec::new(),
+                        ms_information_records: None,
+                        priority: None,
+                        paca_timestamp: None,
+                        quality_of_service_parameters: None,
+                        a2p_bearer_session_params: None,
+                        a2p_bearer_format_params: None,
+                    };
+                    if let Err(error) = self.controller.apply_from_msc(
+                        call_id,
+                        &cdma_ios::ProcedureMessage::AssignmentRequest(assignment_request.clone()),
+                    ) {
+                        warn!(
+                            "MSC: failed to apply non-voice Assignment Request state for MO call_id={}: {}",
+                            call_id_raw, error
+                        );
+                        return;
+                    }
+                    let payload = match assignment_request.encode() {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            warn!(
+                                "MSC: failed to encode non-voice A1 Assignment Request for MO call_id={}: {}",
+                                call_id_raw, error
+                            );
+                            return;
+                        }
+                    };
+                    info!(
+                        "MSC: A1 tx AssignmentRequest (MO non-voice SO{}) call_id={}",
+                        service_option, call_id_raw
+                    );
+                    if let Err(error) = a1
+                        .send_to_bsc(EncodedA1Message::from_message_for_call(
+                            &cdma_ios::Message::new(
+                                cdma_ios::MessageType::AssignmentRequest,
+                                payload,
+                            ),
+                            Some(call_id_raw),
+                        ))
+                        .await
+                    {
+                        warn!(
+                            "MSC: failed to send non-voice A1 Assignment Request to BSC for MO call_id={}: {}",
+                            call_id_raw, error
+                        );
+                    }
+                    return;
+                }
+
+                if let Some(number) = calling_number.clone() {
+                    self.mo_call.mo_calling_numbers.insert(call_id, number);
+                }
+                if let Some((_, subscriber_id)) = originator {
+                    self.media_gw
+                        .register_active_subscriber(subscriber_id, call_id);
                 }
 
                 let subscriber_route = if let Some(called_number) = called_number.as_deref() {
@@ -1839,14 +1962,18 @@ impl MscRuntime {
                 match cdma_ios::AddsDeliverMessage::decode(&decoded.payload) {
                     Ok(msg) => {
                         let call_id_raw = message.call_id().unwrap_or(0);
-                        let mobile_identity = self
-                            .controller
-                            .snapshot(CallId(call_id_raw))
+                        let snapshot = self.controller.snapshot(CallId(call_id_raw));
+                        let mobile_identity = snapshot
+                            .as_ref()
                             .and_then(|snap| snap.mobile_identity.clone())
                             .unwrap_or_else(|| {
                                 cdma_ios::MobileIdentity::Imsi(format!("UNKNOWN-{call_id_raw}"))
                             });
-                        smsc.handle_adds_deliver_mo(&msg, &mobile_identity).await;
+                        let mobile_identity_esn = snapshot
+                            .as_ref()
+                            .and_then(|snap| snap.mobile_identity_esn.as_ref());
+                        smsc.handle_adds_deliver_mo(&msg, &mobile_identity, mobile_identity_esn)
+                            .await;
                     }
                     Err(e) => warn!("MSC: failed to decode ADDS Deliver (MO): {e}"),
                 }

@@ -1,5 +1,7 @@
 # HEAD 
 
+- Traffic-channel SMS and packet-data originations now keep A1 call context, so
+  MO SMS can resolve the originating subscriber on the MSC.
 - Registrations now require a complete mobile identity (IMSI+ESN or
   IMSI+MEID) for HLR resolution and welcome-SMS gating. Subscriber
   create/update in the web UI requires the same.

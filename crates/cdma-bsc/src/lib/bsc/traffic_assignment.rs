@@ -268,6 +268,7 @@ impl Bsc {
         fwd_address: &MsAddress,
         event: &AccessChannelEvent,
         last_msg_seq: u8,
+        a1_call_id: Option<u64>,
     ) -> bool {
         let digits = self
             .decoded_origination(event)
@@ -396,7 +397,7 @@ impl Bsc {
             packet_sr_id,
             None,
             None,
-            None,
+            a1_call_id,
         );
 
         let ms_gating = self
@@ -456,6 +457,8 @@ impl Bsc {
         &mut self,
         fwd_address: &MsAddress,
         service_option: u16,
+        origination_service_option: Option<u16>,
+        service_ref_id: u8,
         ack_msg_seq: u8,
         requested_tx_time: Option<cdma_common::time::CdmaSystemTime>,
         tx_deadline: Option<cdma_common::time::CdmaSystemTime>,
@@ -518,8 +521,8 @@ impl Bsc {
             fwd_address,
             handle,
             service_option,
-            None,
-            1,
+            origination_service_option,
+            service_ref_id,
             session_id,
             leg_role,
             a1_call_id,
