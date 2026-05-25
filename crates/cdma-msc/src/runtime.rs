@@ -296,8 +296,14 @@ impl MscRuntime {
                         None => std::future::pending().await,
                     }
                 } => {
-                    if let Some(frame) = result {
-                        self.handle_reverse_bearer_frame(frame).await;
+                    match result {
+                        Some(cdma_ios::BearerEvent::Voice(frame)) => {
+                            self.handle_reverse_bearer_frame(frame).await;
+                        }
+                        Some(cdma_ios::BearerEvent::Dtmf(event)) => {
+                            self.handle_reverse_bearer_dtmf(event).await;
+                        }
+                        None => {}
                     }
                 }
                 event = async {
@@ -1282,17 +1288,26 @@ impl MscRuntime {
                         None
                     };
 
-                let a2p_bearer_format_params =
-                    a2p_bearer_session_params
-                        .as_ref()
-                        .map(|_| cdma_ios::A2pBearerFormatParams {
-                            formats: vec![cdma_ios::BearerFormatEntry {
-                                bearer_format_tag_type: 1,
-                                bearer_format_id: 0,
-                                rtp_payload_type: cdma_ios::voice_bearer::EVRC_RTP_PAYLOAD_TYPE,
-                                bearer_addr: None,
-                            }],
-                        });
+                let a2p_bearer_format_params = a2p_bearer_session_params.as_ref().map(|_| {
+                    cdma_ios::A2pBearerFormatParams::evrc_with_telephone_event(
+                        cdma_ios::voice_bearer::EVRC_RTP_PAYLOAD_TYPE,
+                        cdma_ios::voice_bearer::TELEPHONE_EVENT_RTP_PAYLOAD_TYPE,
+                    )
+                });
+                if let (Some(bearer), Some(format_params)) = (
+                    self.config.voice_bearer.as_ref(),
+                    a2p_bearer_format_params.as_ref(),
+                ) {
+                    bearer.set_circuit_payload_types(
+                        circuit_id,
+                        cdma_ios::BearerPayloadTypes {
+                            evrc: format_params
+                                .evrc_pt()
+                                .unwrap_or(cdma_ios::voice_bearer::EVRC_RTP_PAYLOAD_TYPE),
+                            telephone_event: format_params.telephone_event_pt(),
+                        },
+                    );
+                }
                 let assignment_request = cdma_ios::AssignmentRequestMessage {
                     channel_type: cdma_ios::ChannelType {
                         speech_or_data_indicator: 0x01,
@@ -1354,6 +1369,49 @@ impl MscRuntime {
     }
 
     /// Handles a reverse voice bearer frame from the BSC (mobile->MSC).
+    async fn handle_reverse_bearer_dtmf(&mut self, event: cdma_ios::DtmfBearerEvent) {
+        let Some(session) = self.circuits.circuits.get(&event.circuit_id) else {
+            log::trace!(
+                "MSC: reverse DTMF event for unknown circuit_id={}",
+                event.circuit_id,
+            );
+            return;
+        };
+        let call_id = session.call_id;
+        let media_gateway_handle = session.media_gateway_handle.or_else(|| {
+            self.controller
+                .snapshot(call_id)
+                .and_then(|snapshot| snapshot.media_gateway_handle)
+        });
+        let (Some(media_gateway), Some(handle)) =
+            (self.config.media_gateway.as_ref(), media_gateway_handle)
+        else {
+            log::debug!(
+                "MSC: dropping reverse DTMF event call_id={} circuit_id={} (no gateway or handle)",
+                call_id.0,
+                event.circuit_id,
+            );
+            return;
+        };
+        if let Err(error) = media_gateway
+            .send_dtmf(
+                handle,
+                event.event,
+                event.volume,
+                event.duration_samples,
+                event.end,
+                event.start_of_event,
+            )
+            .await
+        {
+            log::warn!(
+                "MSC: failed to forward reverse DTMF to media gateway call_id={}: {:?}",
+                call_id.0,
+                error,
+            );
+        }
+    }
+
     async fn handle_reverse_bearer_frame(&mut self, frame: VoiceBearerFrame) {
         let Some((call_id, peer_circuit_id, media_gateway_handle)) = self
             .circuits

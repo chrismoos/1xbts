@@ -66,6 +66,14 @@ enum VoiceGatewayCommand {
         session_id: String,
         sip_status: u16,
     },
+    SendDtmf {
+        session_id: String,
+        event_code: u8,
+        volume: u8,
+        duration_samples: u16,
+        end: bool,
+        start_of_event: bool,
+    },
 }
 
 pub fn spawn_voice_gateway_client(config: VoiceGatewayConfig) -> Arc<VoiceGatewayClient> {
@@ -208,6 +216,38 @@ impl MediaGatewayClient for VoiceGatewayClient {
             .send(VoiceGatewayCommand::InboundReject {
                 session_id: session_id.to_string(),
                 sip_status,
+            })
+            .map_err(|_| MgwError::Unavailable)
+    }
+
+    async fn send_dtmf(
+        &self,
+        handle: CallHandle,
+        event_code: u8,
+        volume: u8,
+        duration_samples: u16,
+        end: bool,
+        start_of_event: bool,
+    ) -> Result<(), MgwError> {
+        if !*self.ready_rx.borrow() {
+            return Err(MgwError::Unavailable);
+        }
+        let session_id = self
+            .handles
+            .lock()
+            .map_err(|_| MgwError::Transport("voice gateway handle map poisoned".to_string()))?
+            .get(&handle)
+            .ok_or(MgwError::UnknownCall(handle))?
+            .session_id
+            .clone();
+        self.command_tx
+            .send(VoiceGatewayCommand::SendDtmf {
+                session_id,
+                event_code,
+                volume,
+                duration_samples,
+                end,
+                start_of_event,
             })
             .map_err(|_| MgwError::Unavailable)
     }
@@ -414,6 +454,29 @@ async fn send_command(
                     proto::InboundCallReject {
                         session_id,
                         sip_status: u32::from(sip_status),
+                    },
+                )),
+            })
+            .await
+            .map_err(|_| "voice gateway control stream closed".to_string()),
+        VoiceGatewayCommand::SendDtmf {
+            session_id,
+            event_code,
+            volume,
+            duration_samples,
+            end,
+            start_of_event,
+        } => control_tx
+            .send(proto::MscToGatewayEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                event: Some(proto::msc_to_gateway_event::Event::SendDtmf(
+                    proto::SendDtmf {
+                        session_id,
+                        event_code: u32::from(event_code),
+                        volume: u32::from(volume),
+                        duration_samples: u32::from(duration_samples),
+                        end,
+                        start_of_event,
                     },
                 )),
             })

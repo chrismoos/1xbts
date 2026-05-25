@@ -85,8 +85,14 @@ impl Bsc {
                         None => std::future::pending().await,
                     }
                 } => {
-                    if let Some(frame) = result {
-                        self.handle_forward_bearer_frame(frame);
+                    match result {
+                        Some(cdma_ios::BearerEvent::Voice(frame)) => {
+                            self.handle_forward_bearer_frame(frame);
+                        }
+                        Some(cdma_ios::BearerEvent::Dtmf(event)) => {
+                            self.handle_forward_bearer_dtmf(event);
+                        }
+                        None => {}
                     }
                 }
                 Some(resolution) = self.hlr_result_rx.recv() => {

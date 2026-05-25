@@ -162,4 +162,18 @@ pub trait MediaGatewayClient: Send + Sync {
     async fn inbound_reject(&self, _session_id: &str, _sip_status: u16) -> Result<(), MgwError> {
         Ok(())
     }
+
+    /// Asks the gateway to emit one RFC 4733 telephone-event packet on the
+    /// session's SIP RTP stream. Mirrors the A2p `DtmfBearerEvent` shape.
+    async fn send_dtmf(
+        &self,
+        _handle: CallHandle,
+        _event_code: u8,
+        _volume: u8,
+        _duration_samples: u16,
+        _end: bool,
+        _start_of_event: bool,
+    ) -> Result<(), MgwError> {
+        Ok(())
+    }
 }

@@ -516,6 +516,19 @@ impl Bsc {
         );
     }
 
+    /// Records a forward telephone-event report from the MSC. The audible
+    /// rendition lives at the SIP edge; the BSC only sees these for
+    /// MSC-originated DTMF such as supplementary-service tones.
+    pub(crate) fn handle_forward_bearer_dtmf(&mut self, event: cdma_ios::DtmfBearerEvent) {
+        log::info!(
+            "BSC: forward DTMF on A2p circuit_id={} event={} duration={} end={}",
+            event.circuit_id,
+            event.event,
+            event.duration_samples,
+            event.end,
+        );
+    }
+
     /// Handles a forward voice bearer frame from the MSC and relays it to the BTS.
     pub(crate) fn handle_forward_bearer_frame(&mut self, frame: cdma_ios::VoiceBearerFrame) {
         let Some(rate) = traffic_rate_from_bps(frame.rate_bps) else {
@@ -571,6 +584,94 @@ impl Bsc {
                 frame.payload.len()
             );
         }
+    }
+
+    /// Plays a BDTMFM digit sequence (C.S0005-E §2.7.2.3.2.7) on the A2p
+    /// bearer as RFC 4733 telephone-event packets. Spawned on a tokio task
+    /// so on/off-length sleeps do not block the traffic dispatcher.
+    pub(crate) fn play_bdtmfm_sequence(
+        &self,
+        walsh_code: u8,
+        msg: &cdma_common::access::SendBurstDtmfMessage,
+    ) {
+        let Some(bearer) = self.config.msc_voice_bearer.clone() else {
+            return;
+        };
+        let Some(circuit_id) = self
+            .mobiles
+            .get_traffic_channel(walsh_code)
+            .and_then(|tc| tc.msc_circuit_id)
+        else {
+            log::debug!(
+                "BSC: cannot play BDTMFM on walsh={} — no msc_circuit_id",
+                walsh_code
+            );
+            return;
+        };
+        let on_ms = cdma_common::access::bdtmfm_on_length_ms(msg.dtmf_on_length).unwrap_or(150);
+        let off_ms = cdma_common::access::bdtmfm_off_length_ms(msg.dtmf_off_length).unwrap_or(100);
+        let digits = msg.digits.clone();
+        tokio::spawn(async move {
+            for digit in digits {
+                let Some(event_code) = cdma_ios::DtmfBearerEvent::event_from_cdma_digit(digit)
+                else {
+                    log::warn!(
+                        "BSC: dropping BDTMFM digit code 0x{:02x} (reserved per Table 2.7.1.3.2.4-4)",
+                        digit
+                    );
+                    continue;
+                };
+                emit_bdtmfm_digit(&bearer, circuit_id, event_code, on_ms).await;
+                tokio::time::sleep(std::time::Duration::from_millis(off_ms as u64)).await;
+            }
+        });
+    }
+
+    /// Marker packet on `start = true`, three end-of-event repeats with a
+    /// fixed `STOP_DURATION_SAMPLES` on `start = false`. No refresh pump
+    /// during the hold, so the SIP-side tone length does not track the MS
+    /// hold time.
+    pub(crate) fn emit_continuous_dtmf_order(&self, walsh_code: u8, digit: u8, start: bool) {
+        let Some(event_code) = cdma_ios::DtmfBearerEvent::event_from_cdma_digit(digit) else {
+            log::warn!(
+                "BSC: dropping Continuous DTMF Order digit code 0x{:02x} (reserved per Table 2.7.1.3.2.4-4)",
+                digit
+            );
+            return;
+        };
+        let Some(bearer) = self.config.msc_voice_bearer.clone() else {
+            return;
+        };
+        let Some(circuit_id) = self
+            .mobiles
+            .get_traffic_channel(walsh_code)
+            .and_then(|tc| tc.msc_circuit_id)
+        else {
+            return;
+        };
+        tokio::spawn(async move {
+            if start {
+                let _ = bearer
+                    .send_dtmf_event(circuit_id, event_code, BDTMFM_VOLUME_DBM0, 0, false, true)
+                    .await;
+            } else {
+                // No timed duration tracking for continuous DTMF; emit the
+                // RFC 4733 end-of-event trio at a representative duration.
+                const STOP_DURATION_SAMPLES: u16 = 1600;
+                for _ in 0..cdma_ios::voice_bearer::RFC4733_END_REPEAT_COUNT {
+                    let _ = bearer
+                        .send_dtmf_event(
+                            circuit_id,
+                            event_code,
+                            BDTMFM_VOLUME_DBM0,
+                            STOP_DURATION_SAMPLES,
+                            true,
+                            false,
+                        )
+                        .await;
+                }
+            }
+        });
     }
 
     /// Relays a reverse voice frame to the MSC via the voice bearer transport.
@@ -828,6 +929,68 @@ impl Bsc {
             called_number: (!called_number.is_empty()).then_some(called_number),
         });
         session_id
+    }
+}
+
+/// RFC 4733 §2.5.1.3 recommended default volume (10 dBm0).
+const BDTMFM_VOLUME_DBM0: u8 = 10;
+
+/// Sample rate × 1 ms for the bearer's 8 kHz clock.
+const SAMPLES_PER_MS: u32 = 8;
+
+/// RFC 4733 §2.5.1.4 refresh cadence within one event.
+const REFRESH_PERIOD_MS: u32 = 20;
+
+/// Emits one BDTMFM digit: start packet, refresh packets across the
+/// on-length window, then three end-of-event repeats per
+/// RFC 4733 §2.5.1.4. Errors are logged and skipped — a single failed
+/// digit does not abort the rest of the burst.
+async fn emit_bdtmfm_digit(
+    bearer: &cdma_ios::VoiceBearerManager,
+    circuit_id: u16,
+    event_code: u8,
+    on_ms: u32,
+) {
+    let mut elapsed_ms: u32 = 0;
+    if let Err(err) = bearer
+        .send_dtmf_event(circuit_id, event_code, BDTMFM_VOLUME_DBM0, 0, false, true)
+        .await
+    {
+        log::warn!(
+            "BSC: failed BDTMFM start packet circuit_id={} event={}: {}",
+            circuit_id,
+            event_code,
+            err
+        );
+        return;
+    }
+    while elapsed_ms + REFRESH_PERIOD_MS < on_ms {
+        tokio::time::sleep(std::time::Duration::from_millis(REFRESH_PERIOD_MS as u64)).await;
+        elapsed_ms += REFRESH_PERIOD_MS;
+        let duration = (elapsed_ms * SAMPLES_PER_MS).min(u16::MAX as u32) as u16;
+        let _ = bearer
+            .send_dtmf_event(
+                circuit_id,
+                event_code,
+                BDTMFM_VOLUME_DBM0,
+                duration,
+                false,
+                false,
+            )
+            .await;
+    }
+    let final_duration = (on_ms * SAMPLES_PER_MS).min(u16::MAX as u32) as u16;
+    for _ in 0..cdma_ios::voice_bearer::RFC4733_END_REPEAT_COUNT {
+        let _ = bearer
+            .send_dtmf_event(
+                circuit_id,
+                event_code,
+                BDTMFM_VOLUME_DBM0,
+                final_duration,
+                true,
+                false,
+            )
+            .await;
     }
 }
 

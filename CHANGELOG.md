@@ -2,6 +2,9 @@
 
 - Traffic-channel SMS and packet-data originations now keep A1 call context, so
   MO SMS can resolve the originating subscriber on the MSC.
+- DTMF pressed during a call is now delivered to the SIP peer.
+  Migration: `dtmf_mode` in `config/voice-gw.json` now defaults to
+  `"rfc2833"`. Set it to `"disabled"` to disable DTMF forwarding.
 - Registrations now require a complete mobile identity (IMSI+ESN or
   IMSI+MEID) for HLR resolution and welcome-SMS gating. Subscriber
   create/update in the web UI requires the same.

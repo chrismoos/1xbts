@@ -372,17 +372,12 @@ impl A1Service {
                 },
                 udp_port: addr.port(),
             });
-        let a2p_bearer_format_params =
-            a2p_bearer_session_params
-                .as_ref()
-                .map(|_| cdma_ios::A2pBearerFormatParams {
-                    formats: vec![cdma_ios::BearerFormatEntry {
-                        bearer_format_tag_type: 1,
-                        bearer_format_id: 0,
-                        rtp_payload_type: cdma_ios::voice_bearer::EVRC_RTP_PAYLOAD_TYPE,
-                        bearer_addr: None,
-                    }],
-                });
+        let a2p_bearer_format_params = a2p_bearer_session_params.as_ref().map(|_| {
+            cdma_ios::A2pBearerFormatParams::evrc_with_telephone_event(
+                cdma_ios::voice_bearer::EVRC_RTP_PAYLOAD_TYPE,
+                cdma_ios::voice_bearer::TELEPHONE_EVENT_RTP_PAYLOAD_TYPE,
+            )
+        });
         let assignment_complete = cdma_ios::AssignmentCompleteMessage {
             channel_number: cdma_ios::ChannelNumber(walsh_code as u16),
             encryption_information: None,
@@ -855,6 +850,11 @@ impl Bsc {
                         self.mobiles.update_tc(walsh_code, |_, tc| {
                             tc.msc_bearer_local_addr = Some(local_addr);
                         });
+                        apply_negotiated_bearer_payload_types(
+                            bearer,
+                            circuit_id,
+                            request.a2p_bearer_format_params.as_ref(),
+                        );
                     }
                     Err(e) => {
                         warn!("BSC: failed to open bearer circuit {circuit_id}: {e}");
@@ -944,6 +944,11 @@ impl Bsc {
                         self.mobiles.update(&pending.fwd_address, |ms| {
                             ms.set_msc_bearer_local_addr(local_addr);
                         });
+                        apply_negotiated_bearer_payload_types(
+                            bearer,
+                            circuit_id,
+                            request.a2p_bearer_format_params.as_ref(),
+                        );
                     }
                     Err(e) => {
                         warn!("BSC: failed to open bearer circuit {circuit_id}: {e}");
@@ -1142,6 +1147,27 @@ fn synthesize_fwd_address_from_imsi(imsi: &str) -> Option<MsAddress> {
             imsi_m_s2,
         })
     }
+}
+
+/// Applies the PTs the MSC proposed via the BearerFormatEntry IE so the
+/// recv loop matches inbound RTP and the send paths use the right PT.
+fn apply_negotiated_bearer_payload_types(
+    bearer: &cdma_ios::VoiceBearerManager,
+    circuit_id: u16,
+    format_params: Option<&cdma_ios::A2pBearerFormatParams>,
+) {
+    let Some(params) = format_params else {
+        return;
+    };
+    bearer.set_circuit_payload_types(
+        circuit_id,
+        cdma_ios::BearerPayloadTypes {
+            evrc: params
+                .evrc_pt()
+                .unwrap_or(cdma_ios::voice_bearer::EVRC_RTP_PAYLOAD_TYPE),
+            telephone_event: params.telephone_event_pt(),
+        },
+    );
 }
 
 fn extract_calling_party_number_record(

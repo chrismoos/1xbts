@@ -3037,6 +3037,97 @@ fn validate_dtmf_digit(digit: u8) -> Result<(), String> {
     }
 }
 
+/// BDTMFM DIGIT codes from C.S0005-E Table 2.7.1.3.2.4-4.
+pub mod bdtmfm_digit {
+    pub const ZERO: u8 = 0x0A;
+    pub const STAR: u8 = 0x0B;
+    pub const POUND: u8 = 0x0C;
+}
+
+/// DTMF pulse width codes from C.S0005-E Table 2.7.2.3.2.7-1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BdtmfmOnLength {
+    Ms95 = 0b000,
+    Ms150 = 0b001,
+    Ms200 = 0b010,
+    Ms250 = 0b011,
+    Ms300 = 0b100,
+    Ms350 = 0b101,
+}
+
+impl BdtmfmOnLength {
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0b000 => Some(Self::Ms95),
+            0b001 => Some(Self::Ms150),
+            0b010 => Some(Self::Ms200),
+            0b011 => Some(Self::Ms250),
+            0b100 => Some(Self::Ms300),
+            0b101 => Some(Self::Ms350),
+            _ => None,
+        }
+    }
+
+    pub fn to_ms(self) -> u32 {
+        match self {
+            Self::Ms95 => 95,
+            Self::Ms150 => 150,
+            Self::Ms200 => 200,
+            Self::Ms250 => 250,
+            Self::Ms300 => 300,
+            Self::Ms350 => 350,
+        }
+    }
+}
+
+/// DTMF inter-digit interval codes from C.S0005-E Table 2.7.2.3.2.7-2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BdtmfmOffLength {
+    Ms60 = 0b000,
+    Ms100 = 0b001,
+    Ms150 = 0b010,
+    Ms200 = 0b011,
+}
+
+impl BdtmfmOffLength {
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0b000 => Some(Self::Ms60),
+            0b001 => Some(Self::Ms100),
+            0b010 => Some(Self::Ms150),
+            0b011 => Some(Self::Ms200),
+            _ => None,
+        }
+    }
+
+    pub fn to_ms(self) -> u32 {
+        match self {
+            Self::Ms60 => 60,
+            Self::Ms100 => 100,
+            Self::Ms150 => 150,
+            Self::Ms200 => 200,
+        }
+    }
+}
+
+/// Reverse Order codes from C.S0005-E Table 3.7.2-1.
+pub mod reverse_order {
+    /// Continuous DTMF Tone Order (C.S0005-E §3.7.4).
+    pub const CONTINUOUS_DTMF_TONE: u8 = 0b011001;
+    /// Continuous DTMF Tone Stop Order (C.S0005-E §3.7.4).
+    pub const CONTINUOUS_DTMF_TONE_STOP: u8 = 0b011010;
+}
+
+pub fn bdtmfm_on_length_ms(code: u8) -> Option<u32> {
+    BdtmfmOnLength::from_code(code).map(BdtmfmOnLength::to_ms)
+}
+
+pub fn bdtmfm_off_length_ms(code: u8) -> Option<u32> {
+    BdtmfmOffLength::from_code(code).map(BdtmfmOffLength::to_ms)
+}
+
 fn validate_send_burst_dtmf_fields(
     dtmf_on_length: u8,
     dtmf_off_length: u8,

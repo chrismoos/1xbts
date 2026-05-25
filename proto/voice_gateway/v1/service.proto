@@ -42,7 +42,25 @@ message MscToGatewayEvent {
     InboundCallProgress inbound_call_progress = 12;
     InboundCallAnswer inbound_call_answer = 13;
     InboundCallReject inbound_call_reject = 14;
+    SendDtmf send_dtmf = 15;
   }
+}
+
+// One RFC 4733 telephone-event report observed on the A2p bearer. The
+// gateway re-emits matching telephone-event RTP packets on the SIP-side
+// stream of the matching session.
+message SendDtmf {
+  string session_id = 1;
+  // RFC 4733 event code (0-15 for DTMF digits 0-9, *, #, A-D).
+  uint32 event_code = 2;
+  // RFC 4733 §2.5.1.3 dBm0 volume, 0-63.
+  uint32 volume = 3;
+  // Cumulative event duration in 8 kHz samples.
+  uint32 duration_samples = 4;
+  // True for the trailing end-of-event packets.
+  bool end = 5;
+  // True for the first packet of a new event (sets the RTP marker bit).
+  bool start_of_event = 6;
 }
 
 // Tells the gateway to send 180 Ringing for an inbound INVITE the MSC accepted.

@@ -9,6 +9,7 @@ homepage.workspace = true
 description = "IOS/A1 signaling support used by the 1xBTS BSC and MSC."
 
 [dependencies]
+cdma-common = { path = "../cdma-common" }
 log = "0.4"
 rand = "0.8"
 tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "macros", "time"] }

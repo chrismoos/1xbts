@@ -138,8 +138,20 @@ impl VoiceGatewayConfig {
         if config.queues.media_stream_frames == 0 {
             return Err("queues.media_stream_frames must be greater than zero".to_string());
         }
-        if config.dtmf_mode.trim().to_ascii_lowercase() != "disabled" {
-            return Err("dtmf_mode currently supports only \"disabled\"".to_string());
+        match config.dtmf_mode.trim().to_ascii_lowercase().as_str() {
+            "disabled" | "rfc2833" => {}
+            other => {
+                return Err(format!(
+                    "dtmf_mode must be \"disabled\" or \"rfc2833\", got {other:?}"
+                ));
+            }
+        }
+        if config.dtmf_mode.trim().eq_ignore_ascii_case("rfc2833")
+            && config.rtp.telephone_event_payload_type.is_none()
+        {
+            return Err(
+                "dtmf_mode=\"rfc2833\" requires rtp.telephone_event_payload_type".to_string(),
+            );
         }
 
         Ok(())
@@ -157,7 +169,7 @@ impl Default for VoiceGatewayConfig {
             queues: QueueConfig::default(),
             logging: LoggingConfig::default(),
             jitter_buffer_ms: 60,
-            dtmf_mode: "disabled".to_string(),
+            dtmf_mode: "rfc2833".to_string(),
         }
     }
 }
@@ -431,6 +443,9 @@ pub struct RtpConfig {
     pub advertise_addr: Option<String>,
     pub port_range: [u16; 2],
     pub preferred_codecs: Vec<String>,
+    /// Dynamic PT for RFC 4733 telephone-event advertised in SDP. `None`
+    /// disables in-band DTMF (no telephone-event entry, no `a=rtpmap`).
+    pub telephone_event_payload_type: Option<u8>,
 }
 
 impl Default for RtpConfig {
@@ -440,6 +455,7 @@ impl Default for RtpConfig {
             advertise_addr: None,
             port_range: [17100, 17200],
             preferred_codecs: vec!["PCMU".to_string(), "PCMA".to_string()],
+            telephone_event_payload_type: Some(101),
         }
     }
 }
@@ -660,7 +676,8 @@ mod tests {
         assert_eq!(config.calls.media_idle_timeout_ms, 30_000);
         assert_eq!(config.queues.gateway_voice_frames, 512);
         assert_eq!(config.queues.media_stream_frames, 256);
-        assert_eq!(config.dtmf_mode, "disabled");
+        assert_eq!(config.dtmf_mode, "rfc2833");
+        assert_eq!(config.rtp.telephone_event_payload_type, Some(101));
     }
 
     #[test]
@@ -882,7 +899,7 @@ mod tests {
         assert_eq!(config.rtp.preferred_codecs, ["PCMU", "PCMA"]);
         assert_eq!(config.nat.mode().unwrap(), NatMode::Disabled);
         assert!(config.logging.media_summary);
-        assert_eq!(config.dtmf_mode, "disabled");
+        assert_eq!(config.dtmf_mode, "rfc2833");
         VoiceGatewayConfig::validate(&config).unwrap();
     }
 }

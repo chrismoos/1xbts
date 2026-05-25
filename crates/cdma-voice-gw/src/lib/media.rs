@@ -158,6 +158,10 @@ pub struct RtpMediaSession {
     erasure_frames: AtomicU64,
     recv_sequence: AtomicU64,
     ssrc: u32,
+    /// RFC 4733 §2.5.1.2 — captured at the start of an in-flight DTMF event
+    /// so every packet of the event carries the same RTP timestamp.
+    dtmf_event_timestamp: Mutex<Option<u32>>,
+    telephone_event_payload_type: Option<u8>,
 }
 
 impl RtpMediaSession {
@@ -171,6 +175,7 @@ impl RtpMediaSession {
         log_media_frames: bool,
         log_media_summary: bool,
         gateway_voice_tx: broadcast::Sender<GatewayVoiceFrame>,
+        telephone_event_payload_type: Option<u8>,
     ) -> Result<Arc<Self>, String> {
         let bind_addr: SocketAddr = format!("{listen_addr}:{port}")
             .parse()
@@ -211,6 +216,8 @@ impl RtpMediaSession {
             erasure_frames: AtomicU64::new(0),
             recv_sequence: AtomicU64::new(0),
             ssrc,
+            dtmf_event_timestamp: Mutex::new(None),
+            telephone_event_payload_type,
         }))
     }
 
@@ -425,6 +432,49 @@ impl RtpMediaSession {
                 bits.len()
             );
         }
+        self.mark_activity();
+        Ok(())
+    }
+
+    /// Emits one RFC 4733 telephone-event RTP packet on the session's SIP
+    /// RTP socket. Same SSRC and sequence stream as voice; the event's RTP
+    /// timestamp is captured on `start_of_event` and reused on subsequent
+    /// continuation / end-of-event packets (RFC 4733 §2.5.1.2).
+    pub async fn send_dtmf_event(
+        &self,
+        event_code: u8,
+        volume: u8,
+        duration_samples: u16,
+        end: bool,
+        start_of_event: bool,
+    ) -> Result<(), String> {
+        let Some(pt) = self.telephone_event_payload_type else {
+            return Err("telephone-event payload type not configured".to_string());
+        };
+        let remote = match *self.remote_addr.lock() {
+            Some(remote) => remote,
+            None => return Ok(()),
+        };
+        let timestamp = {
+            let mut held = self.dtmf_event_timestamp.lock();
+            if start_of_event || held.is_none() {
+                *held = Some(self.send_timestamp.load(Ordering::Relaxed));
+            }
+            held.expect("dtmf_event_timestamp set above")
+        };
+        let sequence = self.send_sequence.fetch_add(1, Ordering::Relaxed);
+        let body = [
+            event_code,
+            (if end { 0x80 } else { 0x00 }) | (volume & 0x3F),
+            (duration_samples >> 8) as u8,
+            duration_samples as u8,
+        ];
+        let rtp =
+            build_rtp_packet_with_marker(pt, start_of_event, sequence, timestamp, self.ssrc, &body);
+        self.socket
+            .send_to(&rtp, remote)
+            .await
+            .map_err(|err| format!("RTP DTMF send to {remote} failed: {err}"))?;
         self.mark_activity();
         Ok(())
     }
@@ -778,9 +828,21 @@ pub fn build_rtp_packet(
     ssrc: u32,
     payload: &[u8],
 ) -> Vec<u8> {
+    build_rtp_packet_with_marker(payload_type, false, sequence, timestamp, ssrc, payload)
+}
+
+pub fn build_rtp_packet_with_marker(
+    payload_type: u8,
+    marker: bool,
+    sequence: u16,
+    timestamp: u32,
+    ssrc: u32,
+    payload: &[u8],
+) -> Vec<u8> {
     let mut packet = Vec::with_capacity(RTP_HEADER_LEN + payload.len());
     packet.push(0x80);
-    packet.push(payload_type & 0x7f);
+    let mb: u8 = if marker { 0x80 } else { 0x00 };
+    packet.push(mb | (payload_type & 0x7f));
     packet.extend_from_slice(&sequence.to_be_bytes());
     packet.extend_from_slice(&timestamp.to_be_bytes());
     packet.extend_from_slice(&ssrc.to_be_bytes());
@@ -1216,6 +1278,7 @@ mod tests {
             false,
             false,
             gateway_voice_tx,
+            None,
         )
         .await
         .unwrap();
@@ -1260,6 +1323,7 @@ mod tests {
             false,
             false,
             gateway_voice_tx,
+            None,
         )
         .await
         .unwrap();
@@ -1328,6 +1392,7 @@ mod tests {
             false,
             false,
             gateway_voice_tx,
+            None,
         )
         .await
         .unwrap();

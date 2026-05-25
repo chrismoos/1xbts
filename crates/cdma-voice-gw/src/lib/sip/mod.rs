@@ -120,6 +120,21 @@ pub trait SipBackend: Send + Sync + 'static {
     async fn inbound_reject(&self, _session_id: &str, _sip_status: u16) -> Result<()> {
         Ok(())
     }
+
+    async fn send_dtmf(&self, _event: SendDtmfRequest) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// RFC 4733 telephone-event request for the gateway's SIP RTP stream.
+#[derive(Debug, Clone)]
+pub struct SendDtmfRequest {
+    pub session_id: String,
+    pub event_code: u8,
+    pub volume: u8,
+    pub duration_samples: u16,
+    pub end: bool,
+    pub start_of_event: bool,
 }
 
 #[derive(Clone, Debug, Default)]

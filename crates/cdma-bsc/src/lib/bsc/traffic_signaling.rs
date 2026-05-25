@@ -600,6 +600,27 @@ impl Bsc {
                         }
                         _ => {}
                     }
+                } else if order == cdma_common::access::reverse_order::CONTINUOUS_DTMF_TONE
+                    || order == cdma_common::access::reverse_order::CONTINUOUS_DTMF_TONE_STOP
+                {
+                    // r-dsch Continuous DTMF Tone Order: ORDQ carries the
+                    // digit per C.S0005-E §3.7.4 (same encoding as BDTMFM).
+                    let start = order == cdma_common::access::reverse_order::CONTINUOUS_DTMF_TONE;
+                    let digit = event
+                        .decoded_l3
+                        .as_ref()
+                        .and_then(|l3| match l3 {
+                            AccessMessage::Order(o) => o.order_specific.first().copied(),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    info!(
+                        "BSC: Continuous DTMF Tone {} walsh={} digit=0x{:02x}",
+                        if start { "start" } else { "stop" },
+                        walsh_code,
+                        digit,
+                    );
+                    self.emit_continuous_dtmf_order(walsh_code, digit, start);
                 } else {
                     info!(
                         "BSC: received {} (0x{:02x}) on R-TCH walsh={}, ignoring",
@@ -608,6 +629,22 @@ impl Bsc {
                         walsh_code
                     );
                 }
+            }
+        } else if event.message_id == MessageId::SendBurstDtmf {
+            if let Some(AccessMessage::SendBurstDtmf(ref msg)) = event.decoded_l3 {
+                info!(
+                    "BSC: BDTMFM on walsh={} digits={} on_len=0b{:03b} off_len=0b{:03b}",
+                    walsh_code,
+                    msg.digits.len(),
+                    msg.dtmf_on_length,
+                    msg.dtmf_off_length,
+                );
+                self.play_bdtmfm_sequence(walsh_code, msg);
+            } else {
+                warn!(
+                    "BSC: BDTMFM on walsh={} missing decoded L3, ignoring",
+                    walsh_code
+                );
             }
         } else if event.message_id == MessageId::ServiceResponse {
             // Service Response — MS accepts/rejects/counter-proposes our Service Request

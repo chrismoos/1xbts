@@ -17,14 +17,36 @@ use std::sync::Mutex;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
-/// Dynamic RTP payload type for EVRC header-full (A.S0014-D Table 4.2.90-3,
-/// range 0x60-0x7F).
+/// Bearer Format IDs from A.S0014-D Table 4.2.90-3.
+pub mod bearer_format_id {
+    pub const PCMU: u8 = 0;
+    pub const PCMA: u8 = 1;
+    pub const VOCODER_13K: u8 = 2;
+    pub const EVRC: u8 = 3;
+    pub const EVRC0: u8 = 4;
+    pub const SMV: u8 = 5;
+    pub const SMV0: u8 = 6;
+    pub const TELEPHONE_EVENT: u8 = 7;
+    pub const EVRCB: u8 = 8;
+    pub const EVRCB0: u8 = 9;
+    pub const EVRCWB: u8 = 0xA;
+    pub const EVRCWB0: u8 = 0xB;
+    pub const EVRCNW: u8 = 0xC;
+    pub const EVRCNW0: u8 = 0xD;
+}
+
+/// Default dynamic PT for EVRC. The actual PT is negotiated per call via the
+/// BearerFormatEntry IE (A.S0014-D §4.2.90); this is the historical fallback.
 pub const EVRC_RTP_PAYLOAD_TYPE: u8 = 96;
 
-/// Timestamp increment per 20 ms voice frame (8000 Hz x 0.020 s = 160 samples).
+/// Default dynamic PT for telephone-event. Negotiated per call; see EVRC.
+pub const TELEPHONE_EVENT_RTP_PAYLOAD_TYPE: u8 = 101;
+
 const TIMESTAMP_INCREMENT: u32 = 160;
 
-/// RTP fixed header length (RFC 3550 §5.1).
+/// RFC 4733 §2.5.1.4: end-of-event packet is repeated three times.
+pub const RFC4733_END_REPEAT_COUNT: usize = 3;
+
 const RTP_HEADER_LEN: usize = 12;
 
 /// RFC 3558 §4, Table 1: EVRC frame type codes used in the ToC entry.
@@ -71,6 +93,48 @@ impl EvrcFrameType {
             _ => None,
         }
     }
+}
+
+/// RFC 4733 telephone-event report on the A2p bearer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DtmfBearerEvent {
+    pub circuit_id: u16,
+    pub event: u8,
+    pub volume: u8,
+    pub duration_samples: u16,
+    pub end: bool,
+    /// RTP marker bit, set on the first packet of an event (RFC 4733 §2.5).
+    pub start_of_event: bool,
+}
+
+/// RFC 4733 §3.2 telephone-event numbers for DTMF.
+pub mod rfc4733_event {
+    pub const ZERO: u8 = 0;
+    pub const STAR: u8 = 10;
+    pub const POUND: u8 = 11;
+}
+
+impl DtmfBearerEvent {
+    /// Map a 4-bit BDTMFM / Continuous DTMF DIGIT (C.S0005-E
+    /// Table 2.7.1.3.2.4-4) to an RFC 4733 event number.
+    /// Reserved codes (0x0D-0x0F) return `None`, matching
+    /// `validate_dtmf_digit` in cdma-common.
+    pub fn event_from_cdma_digit(digit: u8) -> Option<u8> {
+        use cdma_common::access::bdtmfm_digit;
+        match digit & 0x0F {
+            d @ 0x01..=0x09 => Some(d),
+            bdtmfm_digit::ZERO => Some(rfc4733_event::ZERO),
+            bdtmfm_digit::STAR => Some(rfc4733_event::STAR),
+            bdtmfm_digit::POUND => Some(rfc4733_event::POUND),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BearerEvent {
+    Voice(VoiceBearerFrame),
+    Dtmf(DtmfBearerEvent),
 }
 
 /// Per-circuit RTP sequence number and timestamp tracker.
@@ -164,12 +228,73 @@ impl VoiceBearerFrame {
     }
 }
 
-/// Per-circuit bearer session state.
+/// Per-circuit RTP payload types negotiated via the BearerFormatEntry IE
+/// (A.S0014-D §4.2.90). `telephone_event = None` disables DTMF on this
+/// circuit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BearerPayloadTypes {
+    pub evrc: u8,
+    pub telephone_event: Option<u8>,
+}
+
+impl Default for BearerPayloadTypes {
+    fn default() -> Self {
+        Self {
+            evrc: EVRC_RTP_PAYLOAD_TYPE,
+            telephone_event: None,
+        }
+    }
+}
+
 struct CircuitBearerSession {
     socket: std::sync::Arc<UdpSocket>,
     remote_addr: Option<SocketAddr>,
     send_state: RtpSendState,
+    /// RFC 4733 §2.5.1.2 holds the RTP timestamp constant across every
+    /// packet of one event; captured on the marker packet, reused thereafter.
+    dtmf_event_timestamp: Option<u32>,
+    /// Shared with the recv task so PT renegotiation is observable there.
+    payload_types: std::sync::Arc<Mutex<BearerPayloadTypes>>,
     ssrc: u32,
+}
+
+fn encode_dtmf_payload(event_code: u8, volume: u8, duration_samples: u16, end: bool) -> [u8; 4] {
+    let e_bit: u8 = if end { 0x80 } else { 0x00 };
+    [
+        event_code,
+        e_bit | (volume & 0x3F),
+        (duration_samples >> 8) as u8,
+        duration_samples as u8,
+    ]
+}
+
+fn decode_dtmf_payload(buf: &[u8]) -> Option<(u8, u8, u16, bool)> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let end = (buf[1] & 0x80) != 0;
+    let volume = buf[1] & 0x3F;
+    let duration = u16::from_be_bytes([buf[2], buf[3]]);
+    Some((buf[0], volume, duration, end))
+}
+
+fn encode_rtp_packet(
+    payload_type: u8,
+    marker: bool,
+    seq: u16,
+    timestamp: u32,
+    ssrc: u32,
+    body: &[u8],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(RTP_HEADER_LEN + body.len());
+    buf.push(0x80); // V=2, P=0, X=0, CC=0
+    let mb: u8 = if marker { 0x80 } else { 0x00 };
+    buf.push(mb | (payload_type & 0x7F));
+    buf.extend_from_slice(&seq.to_be_bytes());
+    buf.extend_from_slice(&timestamp.to_be_bytes());
+    buf.extend_from_slice(&ssrc.to_be_bytes());
+    buf.extend_from_slice(body);
+    buf
 }
 
 /// A2p voice bearer manager with per-circuit RTP sessions.
@@ -182,8 +307,8 @@ pub struct VoiceBearerManager {
     /// node's interface address).
     bind_ip: Ipv4Addr,
     circuits: Mutex<HashMap<u16, CircuitBearerSession>>,
-    frame_tx: mpsc::Sender<VoiceBearerFrame>,
-    frame_rx: tokio::sync::Mutex<mpsc::Receiver<VoiceBearerFrame>>,
+    frame_tx: mpsc::Sender<BearerEvent>,
+    frame_rx: tokio::sync::Mutex<mpsc::Receiver<BearerEvent>>,
 }
 
 impl VoiceBearerManager {
@@ -212,11 +337,14 @@ impl VoiceBearerManager {
         let socket = UdpSocket::bind(SocketAddr::new(self.bind_ip.into(), 0)).await?;
         let local_addr = socket.local_addr()?;
         let socket = std::sync::Arc::new(socket);
+        let payload_types = std::sync::Arc::new(Mutex::new(BearerPayloadTypes::default()));
 
         let session = CircuitBearerSession {
             socket: socket.clone(),
             remote_addr,
             send_state: RtpSendState::new(),
+            dtmf_event_timestamp: None,
+            payload_types: payload_types.clone(),
             ssrc: rand_ssrc(),
         };
 
@@ -229,8 +357,33 @@ impl VoiceBearerManager {
         tokio::spawn(async move {
             let mut buf = [0u8; 1500];
             while let Ok((len, _src)) = socket.recv_from(&mut buf).await {
-                if let Some(frame) = VoiceBearerFrame::decode_rtp(&buf[..len], circuit_id)
-                    && tx.send(frame).await.is_err()
+                let datagram = &buf[..len];
+                if datagram.len() < RTP_HEADER_LEN + 1 || (datagram[0] >> 6) != 2 {
+                    continue;
+                }
+                let marker = (datagram[1] & 0x80) != 0;
+                let pt = datagram[1] & 0x7F;
+                let pts = *payload_types.lock().unwrap();
+                let event = if Some(pt) == pts.telephone_event {
+                    decode_dtmf_payload(&datagram[RTP_HEADER_LEN..]).map(
+                        |(event_code, volume, duration_samples, end)| {
+                            BearerEvent::Dtmf(DtmfBearerEvent {
+                                circuit_id,
+                                event: event_code,
+                                volume,
+                                duration_samples,
+                                end,
+                                start_of_event: marker,
+                            })
+                        },
+                    )
+                } else if pt == pts.evrc {
+                    VoiceBearerFrame::decode_rtp(datagram, circuit_id).map(BearerEvent::Voice)
+                } else {
+                    None
+                };
+                if let Some(event) = event
+                    && tx.send(event).await.is_err()
                 {
                     break;
                 }
@@ -238,6 +391,16 @@ impl VoiceBearerManager {
         });
 
         Ok(local_addr)
+    }
+
+    /// Records the per-circuit PTs negotiated via the BearerFormatEntry IE.
+    /// Until this is called, DTMF events are dropped at recv time and the
+    /// `send_dtmf_event` path returns `NotFound`.
+    pub fn set_circuit_payload_types(&self, circuit_id: u16, pts: BearerPayloadTypes) {
+        let circuits = self.circuits.lock().unwrap();
+        if let Some(session) = circuits.get(&circuit_id) {
+            *session.payload_types.lock().unwrap() = pts;
+        }
     }
 
     /// Sets or updates the remote address for an existing circuit.
@@ -257,18 +420,13 @@ impl VoiceBearerManager {
         circuits.remove(&circuit_id);
     }
 
-    /// Receives the next voice bearer frame from any circuit.
-    ///
-    /// Blocks until a valid RTP datagram arrives on any circuit's socket.
-    pub async fn recv(&self) -> Option<VoiceBearerFrame> {
+    /// Returns a voice frame (EVRC) or a DTMF event (telephone-event), each
+    /// matched against the per-circuit negotiated PT.
+    pub async fn recv(&self) -> Option<BearerEvent> {
         let mut rx = self.frame_rx.lock().await;
         rx.recv().await
     }
 
-    /// Sends a voice bearer frame on its circuit's socket.
-    ///
-    /// Returns `Ok(())` if sent, or an error if the circuit doesn't exist,
-    /// has no remote address, or the send fails.
     pub async fn send_frame(&self, frame: &VoiceBearerFrame) -> io::Result<()> {
         let (socket, remote, encoded) = {
             let mut circuits = self.circuits.lock().unwrap();
@@ -292,7 +450,98 @@ impl VoiceBearerManager {
         Ok(())
     }
 
-    /// Non-blocking send for use in sync contexts (e.g. spawned tasks).
+    /// Build an RFC 4733 packet on `circuit_id` using the negotiated
+    /// telephone-event PT. `start_of_event` selects the RTP marker bit and
+    /// captures the event timestamp per RFC 4733 §2.5.1.2.
+    fn prepare_dtmf_packet(
+        &self,
+        circuit_id: u16,
+        event_code: u8,
+        volume: u8,
+        duration_samples: u16,
+        end: bool,
+        start_of_event: bool,
+    ) -> io::Result<(std::sync::Arc<UdpSocket>, SocketAddr, Vec<u8>)> {
+        let mut circuits = self.circuits.lock().unwrap();
+        let session = circuits.get_mut(&circuit_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no bearer circuit for circuit_id={}", circuit_id),
+            )
+        })?;
+        let remote = session.remote_addr.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("no remote addr for bearer circuit_id={}", circuit_id),
+            )
+        })?;
+        let pt = session
+            .payload_types
+            .lock()
+            .unwrap()
+            .telephone_event
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "telephone-event PT not negotiated on circuit_id={}",
+                        circuit_id
+                    ),
+                )
+            })?;
+        if start_of_event || session.dtmf_event_timestamp.is_none() {
+            session.dtmf_event_timestamp = Some(session.send_state.timestamp);
+        }
+        let timestamp = session.dtmf_event_timestamp.unwrap();
+        let seq = session.send_state.seq;
+        session.send_state.seq = session.send_state.seq.wrapping_add(1);
+        let body = encode_dtmf_payload(event_code, volume, duration_samples, end);
+        let packet = encode_rtp_packet(pt, start_of_event, seq, timestamp, session.ssrc, &body);
+        Ok((session.socket.clone(), remote, packet))
+    }
+
+    pub async fn send_dtmf_event(
+        &self,
+        circuit_id: u16,
+        event_code: u8,
+        volume: u8,
+        duration_samples: u16,
+        end: bool,
+        start_of_event: bool,
+    ) -> io::Result<()> {
+        let (socket, remote, packet) = self.prepare_dtmf_packet(
+            circuit_id,
+            event_code,
+            volume,
+            duration_samples,
+            end,
+            start_of_event,
+        )?;
+        socket.send_to(&packet, remote).await?;
+        Ok(())
+    }
+
+    pub fn try_send_dtmf_event(
+        &self,
+        circuit_id: u16,
+        event_code: u8,
+        volume: u8,
+        duration_samples: u16,
+        end: bool,
+        start_of_event: bool,
+    ) -> io::Result<()> {
+        let (socket, remote, packet) = self.prepare_dtmf_packet(
+            circuit_id,
+            event_code,
+            volume,
+            duration_samples,
+            end,
+            start_of_event,
+        )?;
+        socket.try_send_to(&packet, remote)?;
+        Ok(())
+    }
+
     pub fn try_send_frame(&self, frame: &VoiceBearerFrame) -> io::Result<()> {
         let mut circuits = self.circuits.lock().unwrap();
         let session = circuits.get_mut(&frame.circuit_id).ok_or_else(|| {
@@ -438,7 +687,10 @@ mod tests {
         };
 
         mgr_a.send_frame(&frame).await.unwrap();
-        let received = mgr_b.recv().await.unwrap();
+        let received = match mgr_b.recv().await.unwrap() {
+            BearerEvent::Voice(f) => f,
+            BearerEvent::Dtmf(_) => panic!("expected voice frame"),
+        };
         assert_eq!(received.circuit_id, frame.circuit_id);
         assert_eq!(received.rate_bps, frame.rate_bps);
         assert_eq!(received.payload, frame.payload);
@@ -474,9 +726,13 @@ mod tests {
         mgr_a.send_frame(&frame1).await.unwrap();
         mgr_a.send_frame(&frame2).await.unwrap();
 
-        let mut received = Vec::new();
-        received.push(mgr_b.recv().await.unwrap());
-        received.push(mgr_b.recv().await.unwrap());
+        let mut received: Vec<VoiceBearerFrame> = Vec::new();
+        for _ in 0..2 {
+            match mgr_b.recv().await.unwrap() {
+                BearerEvent::Voice(f) => received.push(f),
+                BearerEvent::Dtmf(_) => panic!("expected voice frame"),
+            }
+        }
         received.sort_by_key(|f| f.circuit_id);
 
         assert_eq!(received[0].circuit_id, cid1);
@@ -503,10 +759,84 @@ mod tests {
         };
 
         mgr_a.send_frame(&frame).await.unwrap();
-        let received = mgr_b.recv().await.unwrap();
+        let received = match mgr_b.recv().await.unwrap() {
+            BearerEvent::Voice(f) => f,
+            BearerEvent::Dtmf(_) => panic!("expected voice frame"),
+        };
         assert_eq!(received.circuit_id, frame.circuit_id);
         assert_eq!(received.rate_bps, frame.rate_bps);
         assert_eq!(received.payload, frame.payload);
+    }
+
+    #[test]
+    fn dtmf_payload_roundtrip() {
+        let body = encode_dtmf_payload(5, 10, 800, false);
+        let (event_code, volume, duration, end) = decode_dtmf_payload(&body).unwrap();
+        assert_eq!(event_code, 5);
+        assert_eq!(volume, 10);
+        assert_eq!(duration, 800);
+        assert!(!end);
+
+        // End-of-event sets the E bit.
+        let body = encode_dtmf_payload(0, 5, 1600, true);
+        let (_e, _v, _d, end) = decode_dtmf_payload(&body).unwrap();
+        assert!(end);
+    }
+
+    #[test]
+    fn dtmf_event_from_cdma_digit_maps_per_table() {
+        // C.S0005-E Table 2.7.1.3.2.4-4
+        assert_eq!(DtmfBearerEvent::event_from_cdma_digit(0x01), Some(1));
+        assert_eq!(DtmfBearerEvent::event_from_cdma_digit(0x09), Some(9));
+        assert_eq!(DtmfBearerEvent::event_from_cdma_digit(0x0A), Some(0));
+        assert_eq!(DtmfBearerEvent::event_from_cdma_digit(0x0B), Some(10)); // '*'
+        assert_eq!(DtmfBearerEvent::event_from_cdma_digit(0x0C), Some(11)); // '#'
+        assert_eq!(DtmfBearerEvent::event_from_cdma_digit(0x00), None);
+    }
+
+    #[tokio::test]
+    async fn manager_sends_and_receives_dtmf_event() {
+        let mgr_a = VoiceBearerManager::new(Ipv4Addr::LOCALHOST);
+        let mgr_b = VoiceBearerManager::new(Ipv4Addr::LOCALHOST);
+
+        let circuit_id: u16 = 9;
+
+        let a_local = mgr_a.open_circuit(circuit_id, None).await.unwrap();
+        let b_local = mgr_b.open_circuit(circuit_id, Some(a_local)).await.unwrap();
+        mgr_a.set_circuit_remote(circuit_id, b_local);
+        let pts = BearerPayloadTypes {
+            evrc: EVRC_RTP_PAYLOAD_TYPE,
+            telephone_event: Some(TELEPHONE_EVENT_RTP_PAYLOAD_TYPE),
+        };
+        mgr_a.set_circuit_payload_types(circuit_id, pts);
+        mgr_b.set_circuit_payload_types(circuit_id, pts);
+
+        mgr_a
+            .send_dtmf_event(circuit_id, 5, 10, 160, false, true)
+            .await
+            .unwrap();
+        match mgr_b.recv().await.unwrap() {
+            BearerEvent::Dtmf(ev) => {
+                assert_eq!(ev.circuit_id, circuit_id);
+                assert_eq!(ev.event, 5);
+                assert_eq!(ev.duration_samples, 160);
+                assert!(!ev.end);
+            }
+            BearerEvent::Voice(_) => panic!("expected dtmf event"),
+        }
+
+        // End-of-event packet.
+        mgr_a
+            .send_dtmf_event(circuit_id, 5, 10, 1600, true, false)
+            .await
+            .unwrap();
+        match mgr_b.recv().await.unwrap() {
+            BearerEvent::Dtmf(ev) => {
+                assert!(ev.end);
+                assert_eq!(ev.duration_samples, 1600);
+            }
+            BearerEvent::Voice(_) => panic!("expected dtmf event"),
+        }
     }
 
     #[tokio::test]

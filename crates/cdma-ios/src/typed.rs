@@ -1595,6 +1595,43 @@ pub struct A2pBearerFormatParams {
 }
 
 impl A2pBearerFormatParams {
+    /// Canonical entry list for a voice call carrying EVRC plus RFC 4733
+    /// telephone-event for DTMF (A.S0014-D Table 4.2.90-3 IDs 3 and 7).
+    pub fn evrc_with_telephone_event(evrc_pt: u8, telephone_event_pt: u8) -> Self {
+        Self {
+            formats: vec![
+                BearerFormatEntry {
+                    bearer_format_tag_type: 1,
+                    bearer_format_id: crate::voice_bearer::bearer_format_id::EVRC,
+                    rtp_payload_type: evrc_pt,
+                    bearer_addr: None,
+                },
+                BearerFormatEntry {
+                    bearer_format_tag_type: 1,
+                    bearer_format_id: crate::voice_bearer::bearer_format_id::TELEPHONE_EVENT,
+                    rtp_payload_type: telephone_event_pt,
+                    bearer_addr: None,
+                },
+            ],
+        }
+    }
+
+    /// PT for the first telephone-event entry, if present.
+    pub fn telephone_event_pt(&self) -> Option<u8> {
+        self.formats
+            .iter()
+            .find(|f| f.bearer_format_id == crate::voice_bearer::bearer_format_id::TELEPHONE_EVENT)
+            .map(|f| f.rtp_payload_type)
+    }
+
+    /// PT for the first EVRC entry, if present.
+    pub fn evrc_pt(&self) -> Option<u8> {
+        self.formats
+            .iter()
+            .find(|f| f.bearer_format_id == crate::voice_bearer::bearer_format_id::EVRC)
+            .map(|f| f.rtp_payload_type)
+    }
+
     /// Encodes per §4.2.90.
     ///
     /// Octet 3: bits 7-2 = number of bearer formats, bits 1-0 = IP addr type (00=IPv4).

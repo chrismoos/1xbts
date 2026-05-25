@@ -511,6 +511,7 @@ dependencies = [
 name = "cdma-ios"
 version = "0.1.0"
 dependencies = [
+ "cdma-common",
  "log",
  "rand 0.8.6",
  "tokio",

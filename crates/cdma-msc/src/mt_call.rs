@@ -119,17 +119,25 @@ impl MtCallService {
             None
         };
 
-        let a2p_bearer_format_params =
-            a2p_bearer_session_params
-                .as_ref()
-                .map(|_| cdma_ios::A2pBearerFormatParams {
-                    formats: vec![cdma_ios::BearerFormatEntry {
-                        bearer_format_tag_type: 1,
-                        bearer_format_id: 0,
-                        rtp_payload_type: cdma_ios::voice_bearer::EVRC_RTP_PAYLOAD_TYPE,
-                        bearer_addr: None,
-                    }],
-                });
+        let a2p_bearer_format_params = a2p_bearer_session_params.as_ref().map(|_| {
+            cdma_ios::A2pBearerFormatParams::evrc_with_telephone_event(
+                cdma_ios::voice_bearer::EVRC_RTP_PAYLOAD_TYPE,
+                cdma_ios::voice_bearer::TELEPHONE_EVENT_RTP_PAYLOAD_TYPE,
+            )
+        });
+        if let (Some(bearer), Some(format_params)) =
+            (voice_bearer, a2p_bearer_format_params.as_ref())
+        {
+            bearer.set_circuit_payload_types(
+                circuit_id,
+                cdma_ios::BearerPayloadTypes {
+                    evrc: format_params
+                        .evrc_pt()
+                        .unwrap_or(cdma_ios::voice_bearer::EVRC_RTP_PAYLOAD_TYPE),
+                    telephone_event: format_params.telephone_event_pt(),
+                },
+            );
+        }
         let ms_information_records =
             build_calling_party_ms_information_records(caller_number.as_deref(), hlr_repo).await;
         let assignment_request = cdma_ios::AssignmentRequestMessage {

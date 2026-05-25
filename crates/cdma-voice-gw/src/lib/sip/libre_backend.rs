@@ -214,6 +214,7 @@ impl LibreSipBackend {
             preferred_codecs: config.rtp.preferred_codecs.clone(),
             jitter_buffer_ms: config.jitter_buffer_ms,
             rtp_listen_addr: config.rtp.listen_addr.clone(),
+            telephone_event_payload_type: config.rtp.telephone_event_payload_type,
             log_media_frames: config.logging.media_frames,
             log_media_summary: config.logging.media_summary,
             log_sip_sdp: config.logging.sip_sdp,
@@ -295,6 +296,7 @@ impl LibreSipBackend {
                 self.config.logging.media_frames,
                 self.config.logging.media_summary,
                 self.gateway_voice_tx.clone(),
+                self.config.rtp.telephone_event_payload_type,
             )
             .await
             {
@@ -359,15 +361,20 @@ impl LibreSipBackend {
         let addr = &endpoint.addr;
         let rtp_port = endpoint.port;
         let codecs = offered_g711_codecs(&self.config.rtp.preferred_codecs);
-        let payloads = codecs
-            .iter()
-            .map(|codec| codec.payload.to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let rtpmap = codecs
+        let telephone_event_pt = self.config.rtp.telephone_event_payload_type;
+        let mut payloads: Vec<String> = codecs.iter().map(|c| c.payload.to_string()).collect();
+        if let Some(pt) = telephone_event_pt {
+            payloads.push(pt.to_string());
+        }
+        let payloads = payloads.join(" ");
+        let mut rtpmap: String = codecs
             .iter()
             .map(|codec| format!("a=rtpmap:{} {}/8000\r\n", codec.payload, codec.name))
-            .collect::<String>();
+            .collect();
+        if let Some(pt) = telephone_event_pt {
+            rtpmap.push_str(&format!("a=rtpmap:{pt} telephone-event/8000\r\n"));
+            rtpmap.push_str(&format!("a=fmtp:{pt} 0-15\r\n"));
+        }
 
         format!(
             "v=0\r\n\
@@ -567,6 +574,37 @@ impl SipBackend for LibreSipBackend {
 
         media
             .send_air_frame(&frame.bits, frame.rate_bps, frame.service_option)
+            .await
+            .map_err(SipBackendError::Media)
+    }
+
+    async fn send_dtmf(&self, req: crate::sip::SendDtmfRequest) -> Result<()> {
+        let media = self
+            .sessions
+            .lock()
+            .get(&req.session_id)
+            .map(|session| session.media.clone())
+            .or_else(|| {
+                self.inbound_sessions
+                    .lock()
+                    .get(&req.session_id)
+                    .map(|state| state.media.clone())
+            });
+        let Some(media) = media else {
+            log::trace!(
+                "dropping DTMF event for unknown SIP session {}",
+                req.session_id
+            );
+            return Ok(());
+        };
+        media
+            .send_dtmf_event(
+                req.event_code,
+                req.volume,
+                req.duration_samples,
+                req.end,
+                req.start_of_event,
+            )
             .await
             .map_err(SipBackendError::Media)
     }
@@ -1530,6 +1568,7 @@ mod tests {
             false,
             false,
             gateway_voice_tx,
+            None,
         )
         .await
         .unwrap();
@@ -1634,6 +1673,7 @@ struct InboundWorkerDeps {
     preferred_codecs: Vec<String>,
     jitter_buffer_ms: u64,
     rtp_listen_addr: String,
+    telephone_event_payload_type: Option<u8>,
     log_media_frames: bool,
     log_media_summary: bool,
     log_sip_sdp: bool,
@@ -1706,7 +1746,12 @@ async fn handle_inbound_invite(deps: &InboundWorkerDeps, msg: libre::InboundSipM
         );
     }
 
-    let sdp_answer = build_sdp_answer(&advertised_addr, local_port, chosen_codec);
+    let sdp_answer = build_sdp_answer(
+        &advertised_addr,
+        local_port,
+        chosen_codec,
+        deps.telephone_event_payload_type,
+    );
     if let Err(error) = media.set_remote_from_sdp(&body, chosen_codec) {
         log::warn!("inbound: failed to set RTP remote from offer session={session_id}: {error}");
     }
@@ -1853,6 +1898,7 @@ async fn bind_inbound_media(
             deps.log_media_frames,
             deps.log_media_summary,
             deps.gateway_voice_tx.clone(),
+            deps.telephone_event_payload_type,
         )
         .await
         {
@@ -1939,17 +1985,30 @@ fn g711_codec_name(codec: G711Codec) -> &'static str {
     }
 }
 
-fn build_sdp_answer(addr: &str, rtp_port: u16, codec: G711Codec) -> String {
+fn build_sdp_answer(
+    addr: &str,
+    rtp_port: u16,
+    codec: G711Codec,
+    telephone_event_pt: Option<u8>,
+) -> String {
     let pt = codec.payload_type();
     let name = g711_codec_name(codec);
+    let (audio_pts, extra_rtpmap) = match telephone_event_pt {
+        Some(te_pt) => (
+            format!("{pt} {te_pt}"),
+            format!("a=rtpmap:{te_pt} telephone-event/8000\r\na=fmtp:{te_pt} 0-15\r\n"),
+        ),
+        None => (pt.to_string(), String::new()),
+    };
     format!(
         "v=0\r\n\
          o=- 0 0 IN IP4 {addr}\r\n\
          s=-\r\n\
          c=IN IP4 {addr}\r\n\
          t=0 0\r\n\
-         m=audio {rtp_port} RTP/AVP {pt}\r\n\
+         m=audio {rtp_port} RTP/AVP {audio_pts}\r\n\
          a=rtpmap:{pt} {name}/8000\r\n\
+         {extra_rtpmap}\
          a=sendrecv\r\n"
     )
 }

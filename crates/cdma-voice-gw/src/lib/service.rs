@@ -276,6 +276,19 @@ async fn handle_control_event(
                 log::warn!("VoiceGW inbound_reject({}) failed: {}", r.session_id, err);
             }
         }
+        Some(MscEvent::SendDtmf(d)) => {
+            let request = crate::sip::SendDtmfRequest {
+                session_id: d.session_id.clone(),
+                event_code: d.event_code as u8,
+                volume: d.volume as u8,
+                duration_samples: u16::try_from(d.duration_samples).unwrap_or(u16::MAX),
+                end: d.end,
+                start_of_event: d.start_of_event,
+            };
+            if let Err(err) = sip_backend.send_dtmf(request).await {
+                log::warn!("VoiceGW send_dtmf({}) failed: {}", d.session_id, err);
+            }
+        }
         None => {
             log::warn!("received empty VoiceGW control event from MSC");
         }
@@ -305,6 +318,10 @@ fn describe_msc_event(event: &MscToGatewayEvent) -> String {
         Some(MscEvent::InboundCallReject(r)) => format!(
             "InboundCallReject session={} sip_status={}",
             r.session_id, r.sip_status
+        ),
+        Some(MscEvent::SendDtmf(d)) => format!(
+            "SendDtmf session={} event={} duration={} end={} start={}",
+            d.session_id, d.event_code, d.duration_samples, d.end, d.start_of_event
         ),
         None => "Empty".to_string(),
     }
