@@ -515,10 +515,13 @@ impl PostgresSmscRepository {
             .execute(&self.pool)
             .await
             .map_err(|e| format!("create schema smsc: {e}"))?;
-        sqlx::migrate!("./migrations")
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.set_ignore_missing(true);
+        migrator
             .run(&self.pool)
             .await
-            .map_err(|e| format!("migration error: {}", e))
+            .map_err(|e| format!("migration error: {e}"))?;
+        Ok(())
     }
 }
 
