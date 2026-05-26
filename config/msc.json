@@ -1,6 +1,6 @@
 {
   "a1_listen_addr": "127.0.0.1:17013",
-  "mgmt_grpc_addr": "127.0.0.1:17017",
+  "mgmt_grpc_addr": "0.0.0.0:17017",
   "a1_peers": [],
   "voice": {
     "gateway": {

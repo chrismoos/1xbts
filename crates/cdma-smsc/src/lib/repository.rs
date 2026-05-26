@@ -13,6 +13,19 @@ use crate::proto;
 /// Window within which duplicate MO SMS submissions are de-duplicated.
 const MO_SMS_DEDUP_WINDOW_MINUTES: i32 = 10;
 
+/// Bearer-data payload for a forward SMS submission. Defaults to plain text
+/// under teleservice WMT; the typed variant carries a C.S0015-B teleservice
+/// ID and an opaque User Data byte payload (used for WAP Push notifications).
+#[derive(Debug, Clone, Default)]
+pub struct CreateSubmissionOptions<'a> {
+    /// C.S0015-B teleservice ID. `None` selects WMT (0x1002).
+    pub teleservice_id: Option<u16>,
+    /// Opaque User Data bytes. When set, the BSC must emit these verbatim
+    /// as the bearer-data User Data sub-parameter (MSG_ENCODING=0x00 octet)
+    /// and ignore the submission text.
+    pub raw_user_data: Option<&'a [u8]>,
+}
+
 #[async_trait]
 pub trait SmscRepository: Send + Sync {
     async fn create_submission(
@@ -22,6 +35,7 @@ pub trait SmscRepository: Send + Sync {
         text: &str,
         originating_subscriber_id: Option<Uuid>,
         destination_subscriber_id: Option<Uuid>,
+        options: CreateSubmissionOptions<'_>,
     ) -> Result<SmsSubmission, String>;
 
     async fn create_or_get_recent_mo_submission(
@@ -51,6 +65,7 @@ pub trait SmscRepository: Send + Sync {
         destination_esn: Option<u32>,
         destination_imsi: Option<&str>,
         state: Option<&str>,
+        originating_number: Option<&str>,
     ) -> Result<(Vec<SmsSubmission>, u32), String>;
 
     async fn create_delivery_attempt(
@@ -133,6 +148,11 @@ fn submission_from_proto(value: proto::SmsSubmission) -> Result<SmsSubmission, S
         failure_reason: value.failure_reason,
         created_at: timestamp_to_datetime(value.created_at)?,
         updated_at: timestamp_to_datetime(value.updated_at)?,
+        teleservice_id: value
+            .teleservice_id
+            .map(|v| u16::try_from(v).map_err(|_| "teleservice_id > 65535".to_string()))
+            .transpose()?,
+        raw_user_data: value.raw_user_data,
     })
 }
 
@@ -182,6 +202,7 @@ impl SmscRepository for GrpcSmscRepository {
         text: &str,
         originating_subscriber_id: Option<Uuid>,
         destination_subscriber_id: Option<Uuid>,
+        options: CreateSubmissionOptions<'_>,
     ) -> Result<SmsSubmission, String> {
         let (destination_number, destination_esn, destination_imsi) =
             destination_to_proto(destination);
@@ -195,6 +216,8 @@ impl SmscRepository for GrpcSmscRepository {
                 destination_subscriber_id: destination_subscriber_id.map(|id| id.to_string()),
                 destination_esn,
                 destination_imsi,
+                teleservice_id: options.teleservice_id.map(u32::from),
+                raw_user_data: options.raw_user_data.map(<[u8]>::to_vec),
             })
             .await
             .map_err(|e| format!("SMSC CreateSmsSubmission: {e}"))?
@@ -293,6 +316,7 @@ impl SmscRepository for GrpcSmscRepository {
         destination_esn: Option<u32>,
         destination_imsi: Option<&str>,
         state: Option<&str>,
+        originating_number: Option<&str>,
     ) -> Result<(Vec<SmsSubmission>, u32), String> {
         let mut client = self.client();
         let response = client
@@ -303,6 +327,7 @@ impl SmscRepository for GrpcSmscRepository {
                 state: state.map(ToOwned::to_owned),
                 destination_esn: destination_esn.map(u64::from),
                 destination_imsi: destination_imsi.map(ToOwned::to_owned),
+                originating_number: originating_number.map(ToOwned::to_owned),
             })
             .await
             .map_err(|e| format!("SMSC ListSmsSubmissions: {e}"))?
@@ -400,7 +425,8 @@ const SUBMISSION_COLUMNS: &str = "sms_id, originating_number, \
     destination_number, destination_esn, destination_imsi, \
     originating_subscriber_id, destination_subscriber_id, text, \
     mo_teleservice_id, mo_message_type, mo_message_id, \
-    state, failure_reason, created_at, updated_at";
+    state, failure_reason, created_at, updated_at, \
+    teleservice_id, raw_user_data";
 
 #[derive(sqlx::FromRow)]
 struct SmsSubmissionRow {
@@ -422,12 +448,18 @@ struct SmsSubmissionRow {
     pub failure_reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub teleservice_id: Option<i32>,
+    pub raw_user_data: Option<Vec<u8>>,
 }
 
 impl SmsSubmissionRow {
     fn try_into_submission(self) -> Result<SmsSubmission, String> {
         let state = SmsState::from_str(&self.state)
             .ok_or_else(|| format!("unknown SmsState: {}", self.state))?;
+        let teleservice_id = self
+            .teleservice_id
+            .map(|v| u16::try_from(v).map_err(|_| "teleservice_id out of range".to_string()))
+            .transpose()?;
         Ok(SmsSubmission {
             sms_id: self.sms_id,
             originating_number: self.originating_number,
@@ -441,6 +473,8 @@ impl SmsSubmissionRow {
             failure_reason: self.failure_reason,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            teleservice_id,
+            raw_user_data: self.raw_user_data,
         })
     }
 }
@@ -540,6 +574,7 @@ impl SmscRepository for PostgresSmscRepository {
         text: &str,
         originating_subscriber_id: Option<Uuid>,
         destination_subscriber_id: Option<Uuid>,
+        options: CreateSubmissionOptions<'_>,
     ) -> Result<SmsSubmission, String> {
         let (dest_number, dest_esn, dest_imsi): (Option<String>, Option<i64>, Option<String>) =
             match destination {
@@ -555,9 +590,10 @@ impl SmscRepository for PostgresSmscRepository {
                 sms_id, originating_number,
                 destination_number, destination_esn, destination_imsi,
                 text, originating_subscriber_id, destination_subscriber_id,
-                mo_teleservice_id, mo_message_type, mo_message_id
+                mo_teleservice_id, mo_message_type, mo_message_id,
+                teleservice_id, raw_user_data
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NULL, NULL)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NULL, NULL, $9, $10)
             RETURNING {SUBMISSION_COLUMNS}
             "#,
             SUBMISSION_COLUMNS = SUBMISSION_COLUMNS
@@ -570,6 +606,8 @@ impl SmscRepository for PostgresSmscRepository {
         .bind(text)
         .bind(originating_subscriber_id)
         .bind(destination_subscriber_id)
+        .bind(options.teleservice_id.map(i32::from))
+        .bind(options.raw_user_data)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| format!("db error: {}", e))?;
@@ -627,9 +665,10 @@ impl SmscRepository for PostgresSmscRepository {
                 sms_id, originating_number,
                 destination_number, destination_esn, destination_imsi,
                 text, originating_subscriber_id, destination_subscriber_id,
-                mo_teleservice_id, mo_message_type, mo_message_id
+                mo_teleservice_id, mo_message_type, mo_message_id,
+                teleservice_id, raw_user_data
             )
-            VALUES ($1, $2, $3, NULL, NULL, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, NULL, NULL, $4, $5, $6, $7, $8, $9, NULL, NULL)
             RETURNING {SUBMISSION_COLUMNS}
             "#,
             SUBMISSION_COLUMNS = SUBMISSION_COLUMNS
@@ -701,6 +740,7 @@ impl SmscRepository for PostgresSmscRepository {
         destination_esn: Option<u32>,
         destination_imsi: Option<&str>,
         state: Option<&str>,
+        originating_number: Option<&str>,
     ) -> Result<(Vec<SmsSubmission>, u32), String> {
         let mut count_sql = String::from("SELECT COUNT(*) as cnt FROM sms_submissions WHERE 1=1");
         let mut query_sql = format!(
@@ -725,6 +765,10 @@ impl SmscRepository for PostgresSmscRepository {
         }
         if state.is_some() {
             conditions.push(format!(" AND state = ${}", param_idx));
+            param_idx += 1;
+        }
+        if originating_number.is_some() {
+            conditions.push(format!(" AND originating_number = ${}", param_idx));
             param_idx += 1;
         }
 
@@ -754,6 +798,9 @@ impl SmscRepository for PostgresSmscRepository {
         if let Some(st) = state {
             count_q = count_q.bind(st);
         }
+        if let Some(on) = originating_number {
+            count_q = count_q.bind(on);
+        }
         let total = count_q
             .fetch_one(&self.pool)
             .await
@@ -771,6 +818,9 @@ impl SmscRepository for PostgresSmscRepository {
         }
         if let Some(st) = state {
             main_q = main_q.bind(st);
+        }
+        if let Some(on) = originating_number {
+            main_q = main_q.bind(on);
         }
         main_q = main_q.bind(limit as i64).bind(offset as i64);
 

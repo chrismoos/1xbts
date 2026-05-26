@@ -18,10 +18,36 @@ use cdma_ios::{
     AddsDeliverAckMessage, AddsDeliverMessage, AddsPageAckMessage, AddsPageMessage,
     AddsTransferMessage, AddsUserPart, MobileIdentity, Tag,
 };
-use cdma_smsc::model::{DeliveryAttemptState, MoSmsFingerprint, SmsDestination, SmsState};
+use cdma_smsc::model::{
+    DeliveryAttemptState, MoSmsFingerprint, SmsDestination, SmsState, SmsSubmission,
+};
 use cdma_smsc::repository::SmscRepository;
 
 use crate::runtime::MscA1Endpoint;
+
+/// Encode the C.S0015-B Transport Layer payload for an SMSC submission.
+/// Raw user data takes precedence over text so WAP Push PDUs round-trip
+/// verbatim.
+fn encode_submission_payload(submission: &SmsSubmission, message_id: u16) -> Vec<u8> {
+    use cdma_common::sms::{
+        TELESERVICE_WMT, UserData, encode_sms_deliver, encode_sms_deliver_typed,
+    };
+
+    let teleservice = submission.teleservice_id.unwrap_or(TELESERVICE_WMT);
+    if teleservice == TELESERVICE_WMT && submission.raw_user_data.is_none() {
+        return encode_sms_deliver(&submission.originating_number, &submission.text, message_id);
+    }
+    let user_data = match submission.raw_user_data.as_deref() {
+        Some(bytes) => UserData::Octet(bytes.to_vec()),
+        None => UserData::Ascii7(submission.text.clone()),
+    };
+    encode_sms_deliver_typed(
+        &submission.originating_number,
+        teleservice,
+        &user_data,
+        message_id,
+    )
+}
 
 /// Correlation between a Tag value and the SMSC submission being delivered.
 struct SmsCorrelation {
@@ -42,6 +68,26 @@ pub(crate) struct MscSmsCoordinator {
     next_tag: u32,
     /// Outstanding deliveries waiting for ADDS Page Ack or ADDS Deliver Ack.
     pending: HashMap<u32, SmsCorrelation>,
+}
+
+/// Outcome of an HLR phone-number lookup used by SMS send/retry paths.
+enum ResolveResult {
+    /// Subscriber is provisioned and currently registered — page now.
+    Ready {
+        destination: SmsDestination,
+        mobile_identity: MobileIdentity,
+        subscriber_id: Option<Uuid>,
+    },
+    /// Subscriber is provisioned but not currently registered. The SMSC
+    /// accepts the submission and the retry sweep delivers once the MS
+    /// re-registers.
+    Deferred {
+        destination: SmsDestination,
+        subscriber_id: Uuid,
+    },
+    /// No provisioned subscriber for this phone number, or the HLR
+    /// lookup itself failed. The submission is rejected.
+    Unknown,
 }
 
 /// Where to deliver an MT SMS.
@@ -70,6 +116,13 @@ pub struct SmsSendRequest {
     pub text: String,
     pub destination: SmsDestinationKey,
     pub timeout_ms: u64,
+    /// C.S0015-B teleservice ID. `None` selects WMT (0x1002).
+    pub teleservice_id: Option<u16>,
+    /// Opaque User Data bytes for non-text teleservices. When set, the BSC
+    /// emits these verbatim as the bearer-data User Data sub-parameter
+    /// (MSG_ENCODING=0x00 octet) instead of encoding `text`. Used to carry
+    /// WAP Push PDUs end to end.
+    pub raw_user_data: Option<Vec<u8>>,
 }
 
 impl MscSmsCoordinator {
@@ -96,13 +149,21 @@ impl MscSmsCoordinator {
         let (destination, mobile_identity, destination_subscriber_id) = match &req.destination {
             SmsDestinationKey::PhoneNumber(phone_number) => {
                 match self.resolve_by_phone_number(phone_number).await {
-                    Some(result) => result,
-                    None => return None,
+                    ResolveResult::Ready {
+                        destination,
+                        mobile_identity,
+                        subscriber_id,
+                    } => (destination, Some(mobile_identity), subscriber_id),
+                    ResolveResult::Deferred {
+                        destination,
+                        subscriber_id,
+                    } => (destination, None, Some(subscriber_id)),
+                    ResolveResult::Unknown => return None,
                 }
             }
             SmsDestinationKey::Imsi(imsi) => (
                 SmsDestination::Imsi(imsi.clone()),
-                MobileIdentity::Imsi(imsi.clone()),
+                Some(MobileIdentity::Imsi(imsi.clone())),
                 None,
             ),
         };
@@ -116,6 +177,10 @@ impl MscSmsCoordinator {
                 &req.text,
                 None,
                 destination_subscriber_id,
+                cdma_smsc::repository::CreateSubmissionOptions {
+                    teleservice_id: req.teleservice_id,
+                    raw_user_data: req.raw_user_data.as_deref(),
+                },
             )
             .await
         {
@@ -139,6 +204,25 @@ impl MscSmsCoordinator {
                 return None;
             }
         };
+
+        // ── Deferred path: subscriber offline, leave for the retry sweep ────
+        let Some(mobile_identity) = mobile_identity else {
+            let _ = self
+                .smsc
+                .update_delivery_attempt_state(
+                    attempt.sms_delivery_attempt_id,
+                    DeliveryAttemptState::Failed,
+                    Some("subscriber not registered".to_string()),
+                )
+                .await;
+            // Submission stays at its default `Accepted` state so the
+            // periodic retry sweep picks it up once the binding appears.
+            info!(
+                "MSC SMS: accepted sms_id={sms_id} for offline subscriber — retry sweep will deliver on next registration"
+            );
+            return Some(sms_id);
+        };
+
         let _ = self
             .smsc
             .update_delivery_attempt_state(
@@ -155,8 +239,7 @@ impl MscSmsCoordinator {
         // ── Encode SMS Deliver payload ───────────────────────────────────────
         let message_id = self.alloc_tag() as u16;
         let tag_value = self.alloc_tag();
-        let encoded_payload =
-            cdma_common::sms::encode_sms_deliver(&req.originating_number, &req.text, message_id);
+        let encoded_payload = encode_submission_payload(&submission, message_id);
 
         // ── Build and send ADDS Page ─────────────────────────────────────────
         let adds_page = AddsPageMessage {
@@ -171,7 +254,20 @@ impl MscSmsCoordinator {
         let payload = match adds_page.encode() {
             Ok(p) => p,
             Err(e) => {
-                warn!("MSC SMS: failed to encode ADDS Page: {e}");
+                let cause = format!("payload too large for A1 ADDS Page: {e}");
+                warn!("MSC SMS: {cause} — marking sms_id={sms_id} Failed permanently");
+                let _ = self
+                    .smsc
+                    .update_delivery_attempt_state(
+                        attempt.sms_delivery_attempt_id,
+                        DeliveryAttemptState::Failed,
+                        Some(cause.clone()),
+                    )
+                    .await;
+                let _ = self
+                    .smsc
+                    .update_submission_state(sms_id, SmsState::Failed, Some(cause))
+                    .await;
                 return None;
             }
         };
@@ -293,24 +389,35 @@ impl MscSmsCoordinator {
     }
 
     /// Handles an ADDS Transfer from BS (MO SMS received on access channel).
-    pub(crate) async fn handle_adds_transfer(&self, msg: &AddsTransferMessage) {
+    pub(crate) async fn handle_adds_transfer(
+        &mut self,
+        msg: &AddsTransferMessage,
+        a1: &dyn MscA1Endpoint,
+    ) {
         self.record_mo_sms(
             &msg.mobile_identity_imsi,
             msg.mobile_identity_esn.as_ref(),
             &msg.adds_user_part,
+            a1,
         )
         .await;
     }
 
     /// Handles an ADDS Deliver from BS (MO SMS received on traffic channel).
     pub(crate) async fn handle_adds_deliver_mo(
-        &self,
+        &mut self,
         msg: &AddsDeliverMessage,
         mobile_identity: &MobileIdentity,
         mobile_identity_esn: Option<&MobileIdentity>,
+        a1: &dyn MscA1Endpoint,
     ) {
-        self.record_mo_sms(mobile_identity, mobile_identity_esn, &msg.adds_user_part)
-            .await;
+        self.record_mo_sms(
+            mobile_identity,
+            mobile_identity_esn,
+            &msg.adds_user_part,
+            a1,
+        )
+        .await;
     }
 
     /// Expires pending deliveries older than `timeout`, restoring SMSC state to Accepted.
@@ -346,6 +453,105 @@ impl MscSmsCoordinator {
         }
     }
 
+    /// One-shot recovery for submissions left in `Paging` across a restart.
+    ///
+    /// The in-flight ADDS Page correlation lives only in the in-memory
+    /// `pending` map. If the MSC process restarts (crash or operator
+    /// redeploy) while a page is outstanding, the map is lost: there is
+    /// nothing left to match an incoming ack against, and no `sent_at`
+    /// Instant for `expire_pending` to compare. The submission and its
+    /// attempt remain in `Paging` forever — the regular retry sweep
+    /// explicitly skips that state.
+    ///
+    /// On startup, scan for submissions in `Paging` whose latest attempt
+    /// is also in `Paging` and was last updated more than `stale_after`
+    /// ago. Transition the attempt to `Failed` and the submission back to
+    /// `Accepted` so the retry sweep can pick them up.
+    pub(crate) async fn recover_stuck_paging(&mut self, stale_after: Duration) {
+        const PAGE_SIZE: u32 = 100;
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::from_std(stale_after).unwrap_or(chrono::Duration::seconds(120));
+        let mut offset: u32 = 0;
+        let mut recovered: u32 = 0;
+        loop {
+            let (submissions, total) = match self
+                .smsc
+                .list_submissions(PAGE_SIZE, offset, None, None, None, Some("paging"), None)
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("MSC SMS startup recovery: list_submissions failed: {e}");
+                    return;
+                }
+            };
+            for submission in &submissions {
+                let attempts = match self.smsc.get_delivery_attempts(submission.sms_id).await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        warn!(
+                            "MSC SMS startup recovery: get_delivery_attempts({}) failed: {e}",
+                            submission.sms_id
+                        );
+                        continue;
+                    }
+                };
+                let Some(latest) = attempts.iter().max_by_key(|a| a.attempt_number) else {
+                    continue;
+                };
+                if latest.state != DeliveryAttemptState::Paging {
+                    continue;
+                }
+                if latest.updated_at >= cutoff {
+                    continue;
+                }
+                if let Err(e) = self
+                    .smsc
+                    .update_delivery_attempt_state(
+                        latest.sms_delivery_attempt_id,
+                        DeliveryAttemptState::Failed,
+                        Some(
+                            "recovered after MSC restart — in-memory pending entry lost"
+                                .to_string(),
+                        ),
+                    )
+                    .await
+                {
+                    warn!(
+                        "MSC SMS startup recovery: failed to update attempt {}: {e}",
+                        latest.sms_delivery_attempt_id
+                    );
+                    continue;
+                }
+                if let Err(e) = self
+                    .smsc
+                    .update_submission_state(submission.sms_id, SmsState::Accepted, None)
+                    .await
+                {
+                    warn!(
+                        "MSC SMS startup recovery: failed to update submission {}: {e}",
+                        submission.sms_id
+                    );
+                    continue;
+                }
+                recovered += 1;
+                info!(
+                    "MSC SMS: recovered stuck-paging sms_id={} attempt_id={} (last updated {})",
+                    submission.sms_id, latest.sms_delivery_attempt_id, latest.updated_at
+                );
+            }
+            offset += submissions.len() as u32;
+            if offset >= total || submissions.is_empty() {
+                break;
+            }
+        }
+        if recovered > 0 {
+            info!(
+                "MSC SMS: startup recovery transitioned {recovered} stuck-paging submission(s) back to Accepted"
+            );
+        }
+    }
+
     /// Sweep retry-eligible submissions and create a fresh delivery attempt
     /// for each. A submission is eligible iff it is in `Accepted` and its
     /// most recent delivery attempt is `Failed` with `completed_at`
@@ -369,7 +575,7 @@ impl MscSmsCoordinator {
         loop {
             let (submissions, total) = match self
                 .smsc
-                .list_submissions(PAGE_SIZE, offset, None, None, None, Some("accepted"))
+                .list_submissions(PAGE_SIZE, offset, None, None, None, Some("accepted"), None)
                 .await
             {
                 Ok(p) => p,
@@ -431,12 +637,27 @@ impl MscSmsCoordinator {
             // Phone-number-addressed submissions need a fresh HLR lookup
             // because the registration binding (IMSI) may have rotated.
             match self.resolve_by_phone_number(phone_number).await {
-                Some((_, mid, _)) => mid,
-                None => {
+                ResolveResult::Ready {
+                    mobile_identity, ..
+                } => mobile_identity,
+                ResolveResult::Deferred { .. } => {
                     info!(
-                        "MSC SMS retry: cannot resolve {phone_number} for sms_id={} — skipping this tick",
+                        "MSC SMS retry: subscriber for {phone_number} still offline — skipping this tick (sms_id={})",
                         submission.sms_id
                     );
+                    return;
+                }
+                ResolveResult::Unknown => {
+                    let cause =
+                        format!("destination subscriber not provisioned (phone={phone_number})");
+                    warn!(
+                        "MSC SMS retry: cannot resolve {phone_number} for sms_id={} — marking Failed permanently",
+                        submission.sms_id
+                    );
+                    let _ = self
+                        .smsc
+                        .update_submission_state(submission.sms_id, SmsState::Failed, Some(cause))
+                        .await;
                     return;
                 }
             }
@@ -485,11 +706,7 @@ impl MscSmsCoordinator {
 
         let message_id = self.alloc_tag() as u16;
         let tag_value = self.alloc_tag();
-        let encoded_payload = cdma_common::sms::encode_sms_deliver(
-            &submission.originating_number,
-            &submission.text,
-            message_id,
-        );
+        let encoded_payload = encode_submission_payload(submission, message_id);
         let adds_page = AddsPageMessage {
             mobile_identity,
             adds_user_part: AddsUserPart {
@@ -502,7 +719,23 @@ impl MscSmsCoordinator {
         let payload = match adds_page.encode() {
             Ok(p) => p,
             Err(e) => {
-                warn!("MSC SMS retry: failed to encode ADDS Page: {e}");
+                let cause = format!("payload too large for A1 ADDS Page: {e}");
+                warn!(
+                    "MSC SMS retry: {cause} — marking sms_id={} Failed permanently",
+                    submission.sms_id
+                );
+                let _ = self
+                    .smsc
+                    .update_delivery_attempt_state(
+                        attempt.sms_delivery_attempt_id,
+                        DeliveryAttemptState::Failed,
+                        Some(cause.clone()),
+                    )
+                    .await;
+                let _ = self
+                    .smsc
+                    .update_submission_state(submission.sms_id, SmsState::Failed, Some(cause))
+                    .await;
                 return;
             }
         };
@@ -536,56 +769,60 @@ impl MscSmsCoordinator {
         tag
     }
 
-    /// Resolves a phone number to a mobile identity (IMSI) via HLR, returning
-    /// (SmsDestination, MobileIdentity, subscriber_id) or None on failure.
-    async fn resolve_by_phone_number(
-        &self,
-        phone_number: &str,
-    ) -> Option<(SmsDestination, MobileIdentity, Option<Uuid>)> {
+    /// Resolves a phone number against the HLR into a `ResolveResult`.
+    async fn resolve_by_phone_number(&self, phone_number: &str) -> ResolveResult {
         let resolved = match self.hlr.get_subscriber_by_phone_number(phone_number).await {
             Ok(Some(r)) => r,
             Ok(None) => {
                 info!("MSC SMS: no HLR subscriber for phone number {phone_number}");
-                return None;
+                return ResolveResult::Unknown;
             }
             Err(e) => {
                 warn!("MSC SMS: HLR lookup failed for {phone_number}: {e}");
-                return None;
+                return ResolveResult::Unknown;
             }
         };
         let subscriber_id = resolved.subscriber.subscriber_id;
+
         let Some(binding) = resolved.binding.as_ref() else {
             info!(
-                "MSC SMS: subscriber {} ({phone_number}) not registered",
-                subscriber_id
+                "MSC SMS: subscriber {subscriber_id} ({phone_number}) not registered — deferring for retry sweep",
             );
-            return None;
+            return ResolveResult::Deferred {
+                destination: SmsDestination::PhoneNumber(phone_number.to_string()),
+                subscriber_id,
+            };
         };
 
         // Prefer IMSI for ADDS Page (spec requires IMSI in Mobile Identity IE).
         if let Some(ref imsi) = binding.imsi {
-            let mobile_identity = MobileIdentity::Imsi(imsi.clone());
-            return Some((
-                SmsDestination::PhoneNumber(phone_number.to_string()),
-                mobile_identity,
-                Some(subscriber_id),
-            ));
+            return ResolveResult::Ready {
+                destination: SmsDestination::PhoneNumber(phone_number.to_string()),
+                mobile_identity: MobileIdentity::Imsi(imsi.clone()),
+                subscriber_id: Some(subscriber_id),
+            };
         }
 
-        // ESN-only mobile: ADDS Page spec requires IMSI. Cannot deliver for now.
+        // Provisioned + registered but no IMSI on the binding — ADDS Page
+        // requires IMSI. Treat as deferred so the sweep can pick up an
+        // updated binding rather than rejecting outright.
         warn!(
-            "MSC SMS: subscriber {} ({phone_number}) has no IMSI — cannot send ADDS Page",
-            subscriber_id
+            "MSC SMS: subscriber {subscriber_id} ({phone_number}) has no IMSI on current binding — deferring"
         );
-        None
+        ResolveResult::Deferred {
+            destination: SmsDestination::PhoneNumber(phone_number.to_string()),
+            subscriber_id,
+        }
     }
 
-    /// Decodes a MO SMS user part and records it in the SMSC.
+    /// Records a MO SMS in the SMSC; if the destination is a known
+    /// subscriber, also queues MT delivery to them.
     async fn record_mo_sms(
-        &self,
+        &mut self,
         mobile_identity_imsi: &MobileIdentity,
         mobile_identity_esn: Option<&MobileIdentity>,
         adds_user_part: &AddsUserPart,
+        a1: &dyn MscA1Endpoint,
     ) {
         if adds_user_part.burst_type != 0x03 {
             warn!(
@@ -646,20 +883,29 @@ impl MscSmsCoordinator {
             }
         };
 
-        let originating_number = &originating.phone_number;
+        let originating_number = originating.phone_number.clone();
         info!(
             "MSC SMS: MO SMS from {} to {} text=\"{}\"",
             originating_number, decoded.destination_number, decoded.text
         );
 
-        let _ = self
+        let dest_subscriber_id = match self
+            .hlr
+            .get_subscriber_by_phone_number(&decoded.destination_number)
+            .await
+        {
+            Ok(Some(r)) => Some(r.subscriber.subscriber_id),
+            _ => None,
+        };
+
+        let mo = self
             .smsc
             .create_or_get_recent_mo_submission(
-                originating_number,
+                &originating_number,
                 &decoded.destination_number,
                 &decoded.text,
                 Some(originating.subscriber_id),
-                None,
+                dest_subscriber_id,
                 &MoSmsFingerprint {
                     teleservice_id: decoded.teleservice_id,
                     message_type: decoded.message_type,
@@ -667,6 +913,10 @@ impl MscSmsCoordinator {
                 },
             )
             .await;
+
+        if let (Ok((submission, _)), Some(_)) = (mo, dest_subscriber_id) {
+            self.retry_submission(&submission, a1).await;
+        }
     }
 
     async fn record_mo_sms_unknown_originator(

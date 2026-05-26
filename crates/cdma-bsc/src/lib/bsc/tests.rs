@@ -1659,6 +1659,7 @@ impl SmscRepository for FakeSmscRepository {
         text: &str,
         originating_subscriber_id: Option<Uuid>,
         destination_subscriber_id: Option<Uuid>,
+        options: cdma_smsc::repository::CreateSubmissionOptions<'_>,
     ) -> Result<SmsSubmission, String> {
         let (dest_number, dest_esn, dest_imsi) = match destination {
             cdma_smsc::model::SmsDestination::PhoneNumber(n) => (Some(n), None, None),
@@ -1680,6 +1681,8 @@ impl SmscRepository for FakeSmscRepository {
             failure_reason: None,
             created_at: now,
             updated_at: now,
+            teleservice_id: options.teleservice_id,
+            raw_user_data: options.raw_user_data.map(<[u8]>::to_vec),
         };
         self.submissions
             .lock()
@@ -1728,6 +1731,8 @@ impl SmscRepository for FakeSmscRepository {
             failure_reason: None,
             created_at: now,
             updated_at: now,
+            teleservice_id: None,
+            raw_user_data: None,
         };
         self.submissions
             .lock()
@@ -1763,6 +1768,7 @@ impl SmscRepository for FakeSmscRepository {
         destination_esn: Option<u32>,
         destination_imsi: Option<&str>,
         state: Option<&str>,
+        originating_number: Option<&str>,
     ) -> Result<(Vec<SmsSubmission>, u32), String> {
         let mut submissions: Vec<_> = self
             .submissions
@@ -1774,6 +1780,7 @@ impl SmscRepository for FakeSmscRepository {
                     && destination_imsi
                         .is_none_or(|imsi| sub.destination_imsi.as_deref() == Some(imsi))
                     && state.is_none_or(|st| sub.state.as_str() == st)
+                    && originating_number.is_none_or(|on| sub.originating_number == on)
             })
             .cloned()
             .collect();
@@ -2025,6 +2032,8 @@ fn test_sms_submission(sms_id: Uuid, state: SmsState, destination_number: &str) 
         failure_reason: None,
         created_at: now,
         updated_at: now,
+        teleservice_id: None,
+        raw_user_data: None,
     }
 }
 
@@ -2048,6 +2057,8 @@ fn test_sms_submission_for_esn(
         failure_reason: None,
         created_at: now,
         updated_at: now,
+        teleservice_id: None,
+        raw_user_data: None,
     }
 }
 
@@ -4840,13 +4851,15 @@ fn pch_l2_ack_clears_pending_sms_ack() {
             addr: addr.clone(),
             sent_at: Instant::now(),
             a1_tag: None,
+            escalation: None,
         });
 
         bsc.handle_pch_transfer_ack(PchTransferAckEvent {
             correlation_id: Some(77),
             cause: None,
             bts_l2_termination: Some(true),
-        });
+        })
+        .await;
 
         assert!(bsc.sms.pending_acks.is_empty());
         assert_eq!(
@@ -4902,6 +4915,7 @@ fn stale_pch_sms_ack_is_still_cleared_on_bts_l2_result() {
             },
             sent_at: Instant::now() - Duration::from_secs(6),
             a1_tag: None,
+            escalation: None,
         });
 
         // PCH correlation acks are NOT expired by expire_stale_acks
@@ -4912,7 +4926,8 @@ fn stale_pch_sms_ack_is_still_cleared_on_bts_l2_result() {
             correlation_id: Some(77),
             cause: None,
             bts_l2_termination: Some(true),
-        });
+        })
+        .await;
 
         assert!(bsc.sms.pending_acks.is_empty());
     });
@@ -4936,13 +4951,15 @@ fn pch_failure_clears_pending_sms_ack() {
             },
             sent_at: Instant::now(),
             a1_tag: None,
+            escalation: None,
         });
 
         bsc.handle_pch_transfer_ack(PchTransferAckEvent {
             correlation_id: Some(88),
             cause: Some(0x07),
             bts_l2_termination: None,
-        });
+        })
+        .await;
 
         assert!(bsc.sms.pending_acks.is_empty());
     });
@@ -4983,7 +5000,8 @@ fn correlated_gpm_page_response_ack_does_not_clear_pending_sms_page() {
             correlation_id: Some(77),
             cause: None,
             bts_l2_termination: Some(true),
-        });
+        })
+        .await;
 
         assert!(bsc.paging.has_pending_sms_page());
     });
@@ -5024,7 +5042,8 @@ fn correlated_gpm_page_failure_clears_pending_sms_page() {
             correlation_id: Some(77),
             cause: Some(0x07),
             bts_l2_termination: None,
-        });
+        })
+        .await;
 
         assert!(!bsc.paging.has_pending_sms_page());
     });

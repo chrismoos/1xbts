@@ -93,6 +93,12 @@ impl MscManagementService for MscManagementServiceImpl {
                 ));
             }
         };
+        let teleservice_id = inner
+            .teleservice_id
+            .map(|v| {
+                u16::try_from(v).map_err(|_| Status::invalid_argument("teleservice_id > 65535"))
+            })
+            .transpose()?;
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         self.mgmt_tx
             .send(crate::management::PendingControlRequest::SendSms {
@@ -101,6 +107,8 @@ impl MscManagementService for MscManagementServiceImpl {
                     text: inner.text,
                     destination,
                     timeout_ms: inner.timeout_ms.unwrap_or(30_000),
+                    teleservice_id,
+                    raw_user_data: inner.raw_user_data,
                 },
                 response_tx,
             })

@@ -22,7 +22,29 @@ import type {
   TrafficServiceRequest,
 } from "@/lib/proto/bsc/v1/service";
 import { formatNumberPlan, formatNumberType } from "@/lib/number-format";
+import { teleserviceKind, teleserviceName } from "@/lib/teleservice";
+import { parseMNotificationInd } from "@/lib/wap-push";
+import { WapBody } from "@/components/wap-body";
 export { shouldHideAccessEvent } from "@/lib/access-event-filter";
+
+function smsSummary(
+  sms: { teleserviceId: number; text: string; userData?: Uint8Array },
+  peer: string,
+): string {
+  if (teleserviceKind(sms.teleserviceId) === "wap-push") {
+    const parsed = sms.userData && sms.userData.length > 0
+      ? parseMNotificationInd(sms.userData)
+      : null;
+    const target = parsed?.contentLocation ? ` -> ${parsed.contentLocation}` : peer;
+    return `MMS Push |${target}`;
+  }
+  const body = sms.text ? ` "${sms.text}"` : "";
+  return `SMS |${body}${peer}`;
+}
+
+function teleserviceField(id: number): string {
+  return `${teleserviceName(id)} (${formatHex(id, 4)})`;
+}
 
 function formatBool(value: boolean): string {
   return value ? "1" : "0";
@@ -87,7 +109,7 @@ export function formatAccessSummary(event: AccessEvent): string {
     if (db.decodedSms) {
       const sms = db.decodedSms;
       const dest = sms.destinationNumber ? ` -> ${sms.destinationNumber}` : "";
-      return `SMS | "${sms.text}"${dest}`;
+      return smsSummary(sms, dest);
     }
     return `${db.burstTypeName} | ${db.payloadBytes}B`;
   }
@@ -147,7 +169,7 @@ export function formatPagingSummary(event: PagingEvent): string {
     if (event.dataBurst.decodedSms) {
       const sms = event.dataBurst.decodedSms;
       const orig = sms.originatingNumber ? ` from=${sms.originatingNumber}` : "";
-      return `SMS | "${sms.text}"${orig}`;
+      return smsSummary(sms, orig);
     }
     return `${event.dataBurst.burstType === 3 ? "SMS" : `burst=${event.dataBurst.burstType}`} | ${event.dataBurst.payloadBytes}B`;
   }
@@ -181,7 +203,7 @@ export function formatTrafficSummary(event: TrafficEvent): string {
     if (event.dataBurst.decodedSms) {
       const sms = event.dataBurst.decodedSms;
       const orig = sms.originatingNumber ? ` from=${sms.originatingNumber}` : "";
-      return `SMS | "${sms.text}"${orig}`;
+      return smsSummary(sms, orig);
     }
     if (event.l3Summary) return event.l3Summary;
     return `${event.dataBurst.burstType === 3 ? "SMS" : `burst=${event.dataBurst.burstType}`} | ${event.dataBurst.payloadBytes}B`;
@@ -512,26 +534,32 @@ function AccessServiceResponseDetail({ message }: { message: AccessServiceRespon
 }
 
 function AccessDataBurstDetail({ message }: { message: AccessDataBurst }) {
+  const sms = message.decodedSms;
+  const isWap = sms ? teleserviceKind(sms.teleserviceId) === "wap-push" : false;
   return (
-    <FieldGrid>
-      <Field label="MSG_NUMBER" value={message.msgNumber} />
-      <Field label="BURST_TYPE" value={`0b${message.burstType.toString(2).padStart(6, "0")} (${message.burstTypeName})`} />
-      <Field label="NUM_MSGS" value={message.numMsgs} />
-      <Field label="NUM_FIELDS" value={message.numFields} />
-      <Field label="PAYLOAD_BYTES" value={message.payloadBytes} />
-      <Field label="PAYLOAD_HEX" value={message.payloadHex || null} />
-      <Field label="REMAINING_BITS" value={message.remainingBits} />
-      {message.decodedSms && (
-        <>
-          <Field label="SMS_TELESERVICE" value={`0x${message.decodedSms.teleserviceId.toString(16).toUpperCase().padStart(4, "0")}`} />
-          <Field label="SMS_DEST" value={message.decodedSms.destinationNumber || null} />
-          <Field label="SMS_ORIG" value={message.decodedSms.originatingNumber || null} />
-          <Field label="SMS_MSG_TYPE" value={message.decodedSms.messageType} />
-          <Field label="SMS_MSG_ID" value={message.decodedSms.messageId} />
-          <Field label="SMS_TEXT" value={message.decodedSms.text || null} />
-        </>
-      )}
-    </FieldGrid>
+    <div className="flex flex-col gap-2">
+      <FieldGrid>
+        <Field label="MSG_NUMBER" value={message.msgNumber} />
+        <Field label="BURST_TYPE" value={`0b${message.burstType.toString(2).padStart(6, "0")} (${message.burstTypeName})`} />
+        <Field label="NUM_MSGS" value={message.numMsgs} />
+        <Field label="NUM_FIELDS" value={message.numFields} />
+        <Field label="PAYLOAD_BYTES" value={message.payloadBytes} />
+        <Field label="PAYLOAD_HEX" value={message.payloadHex || null} />
+        <Field label="REMAINING_BITS" value={message.remainingBits} />
+        {sms && (
+          <>
+            <Field label="SMS_TELESERVICE" value={teleserviceField(sms.teleserviceId)} />
+            <Field label="SMS_DEST" value={sms.destinationNumber || null} />
+            <Field label="SMS_ORIG" value={sms.originatingNumber || null} />
+            <Field label="SMS_MSG_TYPE" value={sms.messageType} />
+            <Field label="SMS_MSG_ID" value={sms.messageId} />
+            {!isWap && <Field label="SMS_TEXT" value={sms.text || null} />}
+            {isWap && <Field label="SMS_USER_DATA" value={`${sms.userData?.length ?? 0} bytes`} />}
+          </>
+        )}
+      </FieldGrid>
+      {isWap && sms?.userData && sms.userData.length > 0 && <WapBody bytes={sms.userData} />}
+    </div>
   );
 }
 
@@ -627,22 +655,28 @@ export function PagingDetail({ event }: { event: PagingEvent }) {
     );
   }
   if (event.dataBurst) {
+    const sms = event.dataBurst.decodedSms;
+    const isWap = sms ? teleserviceKind(sms.teleserviceId) === "wap-push" : false;
     return (
-      <FieldGrid>
-        <Field label="BURST" value={event.dataBurst.burstType === 3 ? "SMS" : `type=${event.dataBurst.burstType}`} />
-        <Field label="MSG_NUMBER" value={event.dataBurst.msgNumber} />
-        <Field label="NUM_MSGS" value={event.dataBurst.numMsgs} />
-        <Field label="PAYLOAD" value={`${event.dataBurst.payloadBytes} bytes`} />
-        {event.dataBurst.decodedSms && (
-          <>
-            <Field label="SMS_TELESERVICE" value={`0x${event.dataBurst.decodedSms.teleserviceId.toString(16).toUpperCase().padStart(4, "0")}`} />
-            <Field label="SMS_ORIG" value={event.dataBurst.decodedSms.originatingNumber || null} />
-            <Field label="SMS_MSG_TYPE" value={event.dataBurst.decodedSms.messageType} />
-            <Field label="SMS_MSG_ID" value={event.dataBurst.decodedSms.messageId} />
-            <Field label="SMS_TEXT" value={event.dataBurst.decodedSms.text || null} />
-          </>
-        )}
-      </FieldGrid>
+      <div className="flex flex-col gap-2">
+        <FieldGrid>
+          <Field label="BURST" value={event.dataBurst.burstType === 3 ? "SMS" : `type=${event.dataBurst.burstType}`} />
+          <Field label="MSG_NUMBER" value={event.dataBurst.msgNumber} />
+          <Field label="NUM_MSGS" value={event.dataBurst.numMsgs} />
+          <Field label="PAYLOAD" value={`${event.dataBurst.payloadBytes} bytes`} />
+          {sms && (
+            <>
+              <Field label="SMS_TELESERVICE" value={teleserviceField(sms.teleserviceId)} />
+              <Field label="SMS_ORIG" value={sms.originatingNumber || null} />
+              <Field label="SMS_MSG_TYPE" value={sms.messageType} />
+              <Field label="SMS_MSG_ID" value={sms.messageId} />
+              {!isWap && <Field label="SMS_TEXT" value={sms.text || null} />}
+              {isWap && <Field label="SMS_USER_DATA" value={`${sms.userData?.length ?? 0} bytes`} />}
+            </>
+          )}
+        </FieldGrid>
+        {isWap && sms?.userData && sms.userData.length > 0 && <WapBody bytes={sms.userData} />}
+      </div>
     );
   }
   if (event.channelAssignment) {
@@ -807,23 +841,34 @@ export function TrafficDetail({ event }: { event: TrafficEvent }) {
           <Field label="ORDQ" value={event.order.ordq} />
         </FieldGrid>
       )}
-      {event.dataBurst && (
-        <FieldGrid>
-          <Field label="BURST" value={event.dataBurst.burstType === 3 ? "SMS" : `type=${event.dataBurst.burstType}`} />
-          <Field label="MSG_NUMBER" value={event.dataBurst.msgNumber} />
-          <Field label="NUM_MSGS" value={event.dataBurst.numMsgs} />
-          <Field label="PAYLOAD" value={`${event.dataBurst.payloadBytes} bytes`} />
-          {event.dataBurst.decodedSms && (
-            <>
-              <Field label="SMS_TELESERVICE" value={`0x${event.dataBurst.decodedSms.teleserviceId.toString(16).toUpperCase().padStart(4, "0")}`} />
-              <Field label="SMS_ORIG" value={event.dataBurst.decodedSms.originatingNumber || null} />
-              <Field label="SMS_MSG_TYPE" value={event.dataBurst.decodedSms.messageType} />
-              <Field label="SMS_MSG_ID" value={event.dataBurst.decodedSms.messageId} />
-              <Field label="SMS_TEXT" value={event.dataBurst.decodedSms.text || null} />
-            </>
-          )}
-        </FieldGrid>
-      )}
+      {event.dataBurst && (() => {
+        const db = event.dataBurst;
+        const sms = db.decodedSms;
+        const isWap = sms ? teleserviceKind(sms.teleserviceId) === "wap-push" : false;
+        return (
+          <>
+            <FieldGrid>
+              <Field label="BURST" value={db.burstType === 3 ? "SMS" : `type=${db.burstType}`} />
+              <Field label="MSG_NUMBER" value={db.msgNumber} />
+              <Field label="NUM_MSGS" value={db.numMsgs} />
+              <Field label="PAYLOAD" value={`${db.payloadBytes} bytes`} />
+              {sms && (
+                <>
+                  <Field label="SMS_TELESERVICE" value={teleserviceField(sms.teleserviceId)} />
+                  <Field label="SMS_ORIG" value={sms.originatingNumber || null} />
+                  <Field label="SMS_MSG_TYPE" value={sms.messageType} />
+                  <Field label="SMS_MSG_ID" value={sms.messageId} />
+                  {!isWap && <Field label="SMS_TEXT" value={sms.text || null} />}
+                  {isWap && <Field label="SMS_USER_DATA" value={`${sms.userData?.length ?? 0} bytes`} />}
+                </>
+              )}
+            </FieldGrid>
+            {isWap && sms?.userData && sms.userData.length > 0 && (
+              <WapBody bytes={sms.userData} />
+            )}
+          </>
+        );
+      })()}
       {event.serviceRequest && <TrafficServiceRequestDetail message={event.serviceRequest} />}
       {event.serviceConnect && <TrafficServiceConnectDetail message={event.serviceConnect} />}
       {event.alertWithInfo && <AlertWithInfoDetail message={event.alertWithInfo} />}

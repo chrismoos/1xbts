@@ -41,6 +41,12 @@ pub struct SmsSubmission {
     pub failure_reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// C.S0015-B teleservice ID. `None` selects WMT (0x1002).
+    pub teleservice_id: Option<u16>,
+    /// Opaque User Data bytes for non-text teleservices. When set, the BSC
+    /// emits these verbatim as the bearer-data User Data sub-parameter
+    /// (MSG_ENCODING=0x00 octet) instead of encoding `text`.
+    pub raw_user_data: Option<Vec<u8>>,
 }
 
 /// Lifecycle state of an SMS submission.

@@ -16,6 +16,12 @@ message GetPdsnSessionRequest {
   string session_id = 1;
 }
 
+// Selects a PDSN packet session by its assigned mobile IP.
+message GetPdsnSessionByIpRequest {
+  // Mobile (peer) IP address as the engine reports it, e.g. "10.55.0.2".
+  string peer_ip = 1;
+}
+
 // Enables or disables packet trace capture for one session.
 message SetPacketTraceCaptureRequest {
   // Packet session identifier.
@@ -30,6 +36,10 @@ service PdsnManagementService {
   rpc ListPdsnSessions(google.protobuf.Empty) returns (PdsnSessionList);
   // Returns detailed status for one packet session.
   rpc GetPdsnSession(GetPdsnSessionRequest) returns (packet.v1.GetSessionStatusResponse);
+  // Looks up one active packet session by its assigned mobile IP. Used by
+  // the edge MSISDN resolver in fou-nat to attribute inbound HTTP requests
+  // to a subscriber. Returns an unset `session` field on miss.
+  rpc GetPdsnSessionByIp(GetPdsnSessionByIpRequest) returns (packet.v1.GetSessionByIpResponse);
   // Enables or disables trace capture on one packet session.
   rpc SetPacketTraceCapture(SetPacketTraceCaptureRequest) returns (packet.v1.SetSessionCaptureResponse);
 }

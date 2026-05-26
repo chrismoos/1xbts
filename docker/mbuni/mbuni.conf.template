@@ -1,0 +1,56 @@
+# Mbuni MMSC config template — env-substituted by entrypoint.sh.
+#
+# Modeled on /opt/mbuni/doc/examples/mmsc.conf from the upstream sources.
+# We enable MM1 + Relay so the global queue runner scans /r/au/ and
+# routes accepted MO MMS toward local subscribers. MM3/MM4/MM7/VAS
+# gateway are out of scope — anything that does not resolve to a local
+# subscriber fails after the usual retry/expiry cadence.
+#
+# Variables expanded at container start:
+#   MMSC_HOSTNAME    FQDN advertised in M-Notification.ind URLs (e.g. mmsc.local.1xbts.org)
+#   MMSC_PORT        Port the MMSC listens on for MM1 HTTP (default 80)
+#   BRIDGE_BIND_ADDR Loopback addr the mbuni-msc-bridge listens on (e.g. 127.0.0.1:8081)
+
+group = core
+log-level = 0
+
+group = mbuni
+name = "1xBTS MMSC"
+hostname = ${MMSC_HOSTNAME}
+host-alias = ${MMSC_HOSTNAME}
+storage-directory = /var/spool/mbuni
+mms-port = ${MMSC_PORT}
+# Enable the Global Queue Runner (Relay) alongside the MM1 inbound HTTP
+# listener so accepted MO MMS gets routed instead of stranded in r/au/.
+mmsc-services = MM1, Relay
+# Treat every destination as "local to this MMSC". With this list every
+# phone-number prefix maps to our hostname, so mms_resolve() always
+# returns local. The HLR check then happens downstream when the MSC
+# tries to resolve the recipient for delivery — if the HLR does not
+# know the number, the MMS fails after `maximum-send-attempts` retries.
+local-prefixes = "0;1;2;3;4;5;6;7;8;9;+"
+# Skip content adaptation. With this on, every M-Retrieve.conf is delayed
+# by a synchronous HTTP fetch of the handset's UAProf URL (e.g.
+# uaprof.vtext.com), which takes ~75s to time out on networks that can't
+# reach it. We don't transcode anyway, so disable adaptation entirely.
+content-adaptation = false
+# Read sender attribution from our authoritative header. fou-nat's nginx
+# vhost injects this on every incoming MM1 POST using PDSN session
+# lookup. Phone-supplied X-Vzw-MDN / X-Up-Calling-Line-ID / etc are not
+# listed here so Mbuni ignores them entirely.
+mms-client-msisdn-header = "X-1xBTS-MSISDN"
+maximum-send-attempts = 5
+mm1-maximum-notify-attempts = 3
+default-message-expiry = 86400
+queue-run-interval = 10
+mm1-queue-run-interval = 10
+send-attempt-back-off = 10
+# Outbound WAP Push notification SMS is dispatched via mbuni-msc-bridge,
+# which speaks Kannel's `sendsms` HTTP API on its loopback port and
+# translates each request into an MscManagementService.SendSms call
+# against the MSC. The MSC then resolves the recipient via HLR, creates
+# the SMSC submission, and pages the destination MS.
+sendsms-url = http://${BRIDGE_BIND_ADDR}/cgi-bin/sendsms
+sendsms-username = mbuni
+sendsms-password = mbuni
+mms-notify-text = "You have received an MMS message from %S"

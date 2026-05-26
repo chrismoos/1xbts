@@ -1,5 +1,36 @@
 # HEAD 
 
+- MT SMS to an unprovisioned phone number or with a payload that won't
+  fit on A1 ADDS Page is marked Failed instead of looping in the retry
+  sweep forever.
+- Concurrent SMS to the same subscriber are queued instead of rejected,
+  so MSC retry sweeps no longer drop submissions when an earlier SMS is
+  still being delivered.
+- Optional MMS support via an Mbuni MMSC. Enable with
+  `docker compose --profile mms up` and configure handsets with MMSC URL
+  `http://mmsc.local.1xbts.org/`. Migration: set `mgmt_grpc_addr` in
+  `config/msc.json` to `0.0.0.0:17017`.
+- Captive DNS redirects well-known carrier MMSC hostnames to the local
+  MMSC, so handsets with a baked-in carrier MMSC reach the cell MMSC
+  without reprovisioning. Override with `MMSC_HIJACK_HOSTS`. HTTP only.
+- MMS messages are attributed to the real subscriber phone number
+  rather than a NAT'd IP. Migration: set `grpc_listen_addr` in
+  `config/management.json` to `0.0.0.0:17016`.
+- Oversized SMS escalates from the paging channel to an SO6 traffic
+  channel and delivers on F-DSCH instead of failing.
+- MS-to-MS SMS now delivers to the destination subscriber.
+- MT SMS for an offline subscriber is queued and delivered when the
+  subscriber next registers.
+- MT SMS delivered on an active traffic channel is now acknowledged
+  back to the MSC, so submissions no longer get stuck in retry.
+- MSC recovers SMS submissions left mid-page across a restart.
+- Message log decodes WAP Push bursts and no longer renders binary
+  bearer-data bytes as if they were SMS text.
+- SMSC list shows MMS rows with inline decode (Transaction-ID,
+  Content-Location, Size, Expiry, From). Click a row to expand.
+- `/mobiles/[id]` and `/subscribers/[id]` show a Recent Messages card.
+- `MscManagementService.SendSms` accepts an optional teleservice ID
+  and binary user data, for WAP Push and other non-text teleservices.
 - PPP packet data sessions now support peer-requested Van Jacobson TCP/IP header
   compression. PDSN-originated VJ requests are opt-in with
   `pdsn.packet.enable_vj_compression_default` (default `false`).

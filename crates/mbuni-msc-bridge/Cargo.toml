@@ -1,0 +1,33 @@
+[package]
+name = "mbuni-msc-bridge"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Kannel-compatible sendsms HTTP shim that forwards SMS submissions from Mbuni's MMSC to the MSC management gRPC service for immediate dispatch. Used by the optional MMS docker compose profile to deliver WAP Push notifications over CDMA."
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tonic = "0.13"
+prost = "0.13"
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+hex = "0.4"
+
+[build-dependencies]
+tonic-build = "0.13"
+
+[dev-dependencies]
+async-trait = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[[bin]]
+name = "mbuni-msc-bridge"
+path = "src/main.rs"
+
+[lints]
+workspace = true

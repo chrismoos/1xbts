@@ -39,7 +39,7 @@ use super::pdsn_management_proto::pdsn_management_service_server::{
     PdsnManagementService, PdsnManagementServiceServer,
 };
 use super::pdsn_management_proto::{
-    GetPdsnSessionRequest, PdsnSessionList, SetPacketTraceCaptureRequest,
+    GetPdsnSessionByIpRequest, GetPdsnSessionRequest, PdsnSessionList, SetPacketTraceCaptureRequest,
 };
 use super::proto;
 use super::proto::bsc_service_server::{BscService, BscServiceServer};
@@ -133,6 +133,13 @@ impl PacketService for PacketServiceProxy {
         request: Request<cdma_packet::proto::ListSessionsRequest>,
     ) -> Result<Response<cdma_packet::proto::ListSessionsResponse>, Status> {
         self.client().list_sessions(request).await
+    }
+
+    async fn get_session_by_ip(
+        &self,
+        request: Request<cdma_packet::proto::GetSessionByIpRequest>,
+    ) -> Result<Response<cdma_packet::proto::GetSessionByIpResponse>, Status> {
+        self.client().get_session_by_ip(request).await
     }
 
     async fn set_session_capture(
@@ -476,6 +483,7 @@ fn to_proto_access_event(e: &AccessChannelEvent) -> proto::AccessEvent {
                     message_type: d.message_type as u32,
                     message_id: d.message_id as u32,
                     text: d.text,
+                    user_data: d.user_data,
                 })
             } else {
                 None
@@ -693,6 +701,7 @@ fn to_proto_traffic_event(ev: &TrafficEvent) -> proto::TrafficEvent {
                 } else {
                     d.text
                 },
+                user_data: d.user_data,
             })
         } else {
             None
@@ -1046,6 +1055,7 @@ fn to_proto_paging_event(ev: &PagingEvent) -> proto::PagingEvent {
                     } else {
                         d.text
                     },
+                    user_data: d.user_data,
                 })
             } else {
                 None
@@ -2120,6 +2130,20 @@ async fn packet_set_capture(
         .ok_or_else(|| Status::not_found("packet session not found"))
 }
 
+async fn packet_get_session_by_ip(
+    endpoint: &str,
+    peer_ip: String,
+) -> Result<Option<cdma_packet::proto::PacketSessionInfo>, Status> {
+    let mut client = PacketServiceClient::connect(endpoint.to_string())
+        .await
+        .map_err(|e| Status::unavailable(format!("packet gRPC connect failed: {e}")))?;
+    Ok(client
+        .get_session_by_ip(cdma_packet::proto::GetSessionByIpRequest { peer_ip })
+        .await?
+        .into_inner()
+        .session)
+}
+
 #[tonic::async_trait]
 impl PcfManagementService for BscServiceImpl {
     async fn initiate_data_call(
@@ -2183,6 +2207,19 @@ impl PdsnManagementService for BscServiceImpl {
                 session: Some(session),
             },
         ))
+    }
+
+    async fn get_pdsn_session_by_ip(
+        &self,
+        request: Request<GetPdsnSessionByIpRequest>,
+    ) -> Result<Response<super::packet_proto::GetSessionByIpResponse>, Status> {
+        let peer_ip = request.into_inner().peer_ip;
+        let session = packet_get_session_by_ip(&self.state.packet_endpoint, peer_ip)
+            .await?
+            .map(to_management_packet_session_info);
+        Ok(Response::new(super::packet_proto::GetSessionByIpResponse {
+            session,
+        }))
     }
 
     async fn set_packet_trace_capture(

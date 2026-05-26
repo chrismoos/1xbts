@@ -74,6 +74,18 @@ export interface GetSessionStatusResponse {
 export interface ListSessionsRequest {
 }
 
+/** Selects one packet session by its mobile-side IP address. */
+export interface GetSessionByIpRequest {
+  /** Mobile (peer) IP address as the engine reports it, e.g. "10.55.0.2". */
+  peerIp: string;
+}
+
+/** Response carrying the matching session summary, if any. */
+export interface GetSessionByIpResponse {
+  /** Set when an active session matches `peer_ip`; unset on miss. */
+  session: PacketSessionInfo | undefined;
+}
+
 /** List of packet session summaries. */
 export interface ListSessionsResponse {
   /** Session summaries sorted by implementation-defined recency. */
@@ -841,6 +853,130 @@ export const ListSessionsRequest: MessageFns<ListSessionsRequest> = {
   },
   fromPartial(_: DeepPartial<ListSessionsRequest>): ListSessionsRequest {
     const message = createBaseListSessionsRequest();
+    return message;
+  },
+};
+
+function createBaseGetSessionByIpRequest(): GetSessionByIpRequest {
+  return { peerIp: "" };
+}
+
+export const GetSessionByIpRequest: MessageFns<GetSessionByIpRequest> = {
+  encode(message: GetSessionByIpRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.peerIp !== "") {
+      writer.uint32(10).string(message.peerIp);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): GetSessionByIpRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseGetSessionByIpRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.peerIp = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): GetSessionByIpRequest {
+    return {
+      peerIp: isSet(object.peerIp)
+        ? globalThis.String(object.peerIp)
+        : isSet(object.peer_ip)
+        ? globalThis.String(object.peer_ip)
+        : "",
+    };
+  },
+
+  toJSON(message: GetSessionByIpRequest): unknown {
+    const obj: any = {};
+    if (message.peerIp !== "") {
+      obj.peerIp = message.peerIp;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<GetSessionByIpRequest>): GetSessionByIpRequest {
+    return GetSessionByIpRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<GetSessionByIpRequest>): GetSessionByIpRequest {
+    const message = createBaseGetSessionByIpRequest();
+    message.peerIp = object.peerIp ?? "";
+    return message;
+  },
+};
+
+function createBaseGetSessionByIpResponse(): GetSessionByIpResponse {
+  return { session: undefined };
+}
+
+export const GetSessionByIpResponse: MessageFns<GetSessionByIpResponse> = {
+  encode(message: GetSessionByIpResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.session !== undefined) {
+      PacketSessionInfo.encode(message.session, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): GetSessionByIpResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseGetSessionByIpResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.session = PacketSessionInfo.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): GetSessionByIpResponse {
+    return { session: isSet(object.session) ? PacketSessionInfo.fromJSON(object.session) : undefined };
+  },
+
+  toJSON(message: GetSessionByIpResponse): unknown {
+    const obj: any = {};
+    if (message.session !== undefined) {
+      obj.session = PacketSessionInfo.toJSON(message.session);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<GetSessionByIpResponse>): GetSessionByIpResponse {
+    return GetSessionByIpResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<GetSessionByIpResponse>): GetSessionByIpResponse {
+    const message = createBaseGetSessionByIpResponse();
+    message.session = (object.session !== undefined && object.session !== null)
+      ? PacketSessionInfo.fromPartial(object.session)
+      : undefined;
     return message;
   },
 };
@@ -2145,6 +2281,20 @@ export const PacketServiceDefinition = {
       responseStream: false,
       options: {},
     },
+    /**
+     * Looks up one active packet session by its assigned mobile (peer) IP.
+     * Used by the edge MSISDN resolver in fou-nat to attribute inbound HTTP
+     * requests to a subscriber. Returns the session summary, or an unset
+     * `session` field when no active session has that peer_ip.
+     */
+    getSessionByIp: {
+      name: "GetSessionByIp",
+      requestType: GetSessionByIpRequest as typeof GetSessionByIpRequest,
+      requestStream: false,
+      responseType: GetSessionByIpResponse as typeof GetSessionByIpResponse,
+      responseStream: false,
+      options: {},
+    },
     /** Enables or disables per-session packet trace capture. */
     setSessionCapture: {
       name: "SetSessionCapture",
@@ -2196,6 +2346,16 @@ export interface PacketServiceImplementation<CallContextExt = {}> {
     request: ListSessionsRequest,
     context: CallContext & CallContextExt,
   ): Promise<DeepPartial<ListSessionsResponse>>;
+  /**
+   * Looks up one active packet session by its assigned mobile (peer) IP.
+   * Used by the edge MSISDN resolver in fou-nat to attribute inbound HTTP
+   * requests to a subscriber. Returns the session summary, or an unset
+   * `session` field when no active session has that peer_ip.
+   */
+  getSessionByIp(
+    request: GetSessionByIpRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<GetSessionByIpResponse>>;
   /** Enables or disables per-session packet trace capture. */
   setSessionCapture(
     request: SetSessionCaptureRequest,
@@ -2238,6 +2398,16 @@ export interface PacketServiceClient<CallOptionsExt = {}> {
     request: DeepPartial<ListSessionsRequest>,
     options?: CallOptions & CallOptionsExt,
   ): Promise<ListSessionsResponse>;
+  /**
+   * Looks up one active packet session by its assigned mobile (peer) IP.
+   * Used by the edge MSISDN resolver in fou-nat to attribute inbound HTTP
+   * requests to a subscriber. Returns the session summary, or an unset
+   * `session` field when no active session has that peer_ip.
+   */
+  getSessionByIp(
+    request: DeepPartial<GetSessionByIpRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<GetSessionByIpResponse>;
   /** Enables or disables per-session packet trace capture. */
   setSessionCapture(
     request: DeepPartial<SetSessionCaptureRequest>,

@@ -19,6 +19,8 @@ members = [
     "crates/cdma-pdsn",
     "crates/cdma-smsc",
     "crates/cdma-voice",
+    "crates/edge-resolver",
+    "crates/mbuni-msc-bridge",
     "crates/cdma-voice-gw",
     "external/bladerf",
     "external/bladerf-sys",

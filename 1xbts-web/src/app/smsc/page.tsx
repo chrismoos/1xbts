@@ -1,8 +1,11 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { Fragment, useState, useEffect, useCallback } from "react";
 import { Card } from "@/components/card";
-import { formatTimeMs as formatTime } from "@/lib/format";
+import { KV, WapBody } from "@/components/wap-body";
+import { formatTimeMs as formatTime, hexToBytes } from "@/lib/format";
+import { smsStateColor } from "@/lib/sms-state";
+import { teleserviceKind, teleserviceName } from "@/lib/teleservice";
 
 // ─── Types ──────────────────────────────────────────────────────
 
@@ -10,11 +13,17 @@ interface SmsSubmission {
   smsId: string;
   originatingNumber: string;
   destinationNumber: string;
+  originatingSubscriberId?: string;
+  destinationSubscriberId?: string;
+  destinationEsn?: number;
+  destinationImsi?: string;
   text: string;
   state: string;
   failureReason?: string;
   createdAt?: string;
   updatedAt?: string;
+  teleserviceId?: number;
+  rawUserDataHex?: string;
 }
 
 // ─── Helpers ────────────────────────────────────────────────────
@@ -25,14 +34,47 @@ function formatIsoTime(value?: string): string {
   return Number.isFinite(ts) ? formatTime(ts) : "-";
 }
 
-function smsStateColor(state: string): string {
-  switch (state) {
-    case "delivered": return "bg-badge-green-bg text-badge-green-text";
-    case "sent": return "bg-badge-green-bg text-badge-green-text";
-    case "paging": case "page_response_received": return "bg-badge-yellow-bg text-badge-yellow-text";
-    case "failed": case "expired": return "bg-badge-red-bg text-badge-red-text";
-    default: return "bg-badge-blue-bg text-badge-blue-text";
-  }
+// ─── Per-row expanded detail ────────────────────────────────────
+
+function SubmissionDetail({ sms }: { sms: SmsSubmission }) {
+  const kind = teleserviceKind(sms.teleserviceId);
+  const teleHex = sms.teleserviceId !== undefined
+    ? `0x${sms.teleserviceId.toString(16).toUpperCase().padStart(4, "0")}`
+    : "-";
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-1">
+        <KV label="sms_id" value={sms.smsId} />
+        <KV label="Teleservice" value={`${teleserviceName(sms.teleserviceId)} (${teleHex})`} />
+        {sms.originatingSubscriberId && (
+          <KV label="From subscriber" value={sms.originatingSubscriberId} />
+        )}
+        {sms.destinationSubscriberId && (
+          <KV label="To subscriber" value={sms.destinationSubscriberId} />
+        )}
+        {sms.destinationEsn !== undefined && sms.destinationEsn !== 0 && (
+          <KV label="Destination ESN" value={`0x${sms.destinationEsn.toString(16).toUpperCase()}`} />
+        )}
+        {sms.destinationImsi && (
+          <KV label="Destination IMSI" value={sms.destinationImsi} />
+        )}
+        {sms.updatedAt && <KV label="Updated" value={formatIsoTime(sms.updatedAt)} />}
+      </div>
+      <div>
+        <div className="text-xs text-muted mb-1">Body</div>
+        {kind === "wap-push" && sms.rawUserDataHex ? (
+          <WapBody bytes={hexToBytes(sms.rawUserDataHex)} />
+        ) : sms.text ? (
+          <pre className="text-xs font-mono text-secondary bg-surface-solid p-2 rounded whitespace-pre-wrap break-all">
+            {sms.text}
+          </pre>
+        ) : (
+          <span className="text-xs text-dimmed">(empty)</span>
+        )}
+      </div>
+    </div>
+  );
 }
 
 // ─── Send SMS Form ──────────────────────────────────────────────
@@ -145,6 +187,7 @@ function SmsHistoryTable() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [stateFilter, setStateFilter] = useState<string | "">("");
+  const [expandedId, setExpandedId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -208,38 +251,69 @@ function SmsHistoryTable() {
           <table className="w-full text-sm">
             <thead>
               <tr className="text-muted text-xs">
-                <th className="text-left py-1">Time</th>
-                <th className="text-left py-1">From</th>
-                <th className="text-left py-1">To</th>
-                <th className="text-left py-1">Text</th>
+                <th className="text-left py-1 pr-6">Time</th>
+                <th className="text-left py-1 pr-6">From</th>
+                <th className="text-left py-1 pr-6">To</th>
+                <th className="text-left py-1 pr-6">Type</th>
+                <th className="text-left py-1 pr-6">Body</th>
                 <th className="text-left py-1">State</th>
               </tr>
             </thead>
             <tbody>
-              {submissions.map((sms) => (
-                <tr key={sms.smsId} className="border-t border-border hover:bg-hover">
-                  <td className="py-1.5 text-muted font-mono text-xs whitespace-nowrap">
-                    {formatIsoTime(sms.createdAt)}
-                  </td>
-                  <td className="py-1.5 text-muted font-mono text-xs">
-                    {sms.originatingNumber || "-"}
-                  </td>
-                  <td className="py-1.5 text-secondary font-mono text-xs">
-                    {sms.destinationNumber || "-"}
-                  </td>
-                  <td className="py-1.5 text-secondary text-xs max-w-[20rem] truncate">
-                    {sms.text}
-                  </td>
-                  <td className="py-1.5">
-                    <span className={`text-xs px-2 py-0.5 rounded ${smsStateColor(sms.state)}`}>
-                      {sms.state}
-                    </span>
-                    {sms.failureReason && (
-                      <span className="text-xs text-accent-red ml-1">{sms.failureReason}</span>
+              {submissions.map((sms) => {
+                const kind = teleserviceKind(sms.teleserviceId);
+                const isOpen = expandedId === sms.smsId;
+                const bodyPreview = kind === "wap-push"
+                  ? `[binary, ${sms.rawUserDataHex ? sms.rawUserDataHex.length / 2 : 0} bytes]`
+                  : (sms.text || "");
+                return (
+                  <Fragment key={sms.smsId}>
+                    <tr
+                      className="border-t border-border hover:bg-hover cursor-pointer"
+                      onClick={() => setExpandedId(isOpen ? null : sms.smsId)}
+                    >
+                      <td className="py-1.5 pr-6 text-muted font-mono text-xs whitespace-nowrap">
+                        {formatIsoTime(sms.createdAt)}
+                      </td>
+                      <td className="py-1.5 pr-6 text-muted font-mono text-xs whitespace-nowrap">
+                        {sms.originatingNumber || "-"}
+                      </td>
+                      <td className="py-1.5 pr-6 text-secondary font-mono text-xs whitespace-nowrap">
+                        {sms.destinationNumber || "-"}
+                      </td>
+                      <td className="py-1.5 pr-6">
+                        <span className={`text-xs px-2 py-0.5 rounded ${
+                          kind === "wap-push"
+                            ? "bg-badge-blue-bg text-badge-blue-text"
+                            : "bg-surface-raised text-muted"
+                        }`}>
+                          {teleserviceName(sms.teleserviceId)}
+                        </span>
+                      </td>
+                      <td className={`py-1.5 pr-6 text-xs max-w-[20rem] truncate ${
+                        kind === "wap-push" ? "text-dimmed font-mono" : "text-secondary"
+                      }`}>
+                        {bodyPreview}
+                      </td>
+                      <td className="py-1.5">
+                        <span className={`text-xs px-2 py-0.5 rounded ${smsStateColor(sms.state)}`}>
+                          {sms.state}
+                        </span>
+                        {sms.failureReason && (
+                          <span className="text-xs text-accent-red ml-1">{sms.failureReason}</span>
+                        )}
+                      </td>
+                    </tr>
+                    {isOpen && (
+                      <tr className="bg-surface-raised/30">
+                        <td colSpan={6} className="px-3 py-3">
+                          <SubmissionDetail sms={sms} />
+                        </td>
+                      </tr>
                     )}
-                  </td>
-                </tr>
-              ))}
+                  </Fragment>
+                );
+              })}
             </tbody>
           </table>
         </div>

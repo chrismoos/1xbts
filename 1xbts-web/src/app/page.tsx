@@ -3,6 +3,8 @@
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { Card, Stat } from "@/components/card";
+import { serviceOptionName } from "@/lib/service-option";
+import { smsStateColor } from "@/lib/sms-state";
 import { useEventStream } from "@/lib/use-event-stream";
 import {
   formatAccessTypeName,
@@ -106,27 +108,6 @@ function stateColor(state: string): string {
     case "Registered": return "bg-badge-green-bg text-badge-green-text";
     case "Paged": return "bg-badge-yellow-bg text-badge-yellow-text";
     case "TrafficAssigning": case "TrafficActive": return "bg-badge-purple-bg text-badge-purple-text";
-    default: return "bg-badge-blue-bg text-badge-blue-text";
-  }
-}
-
-function serviceOptionName(so: number): string {
-  switch (so) {
-    case 1: return "Voice";
-    case 3: return "EVRC";
-    case 6: return "SMS";
-    case 7: return "Data";
-    case 33: return "Data HR";
-    default: return `SO${so}`;
-  }
-}
-
-function smsStateColor(state: string): string {
-  switch (state) {
-    case "delivered": return "bg-badge-green-bg text-badge-green-text";
-    case "sent": return "bg-badge-green-bg text-badge-green-text";
-    case "paging": case "page_response_received": return "bg-badge-yellow-bg text-badge-yellow-text";
-    case "failed": case "expired": return "bg-badge-red-bg text-badge-red-text";
     default: return "bg-badge-blue-bg text-badge-blue-text";
   }
 }

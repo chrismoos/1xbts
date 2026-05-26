@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import { esnManufacturer } from "@/lib/esn-manufacturer";
 import { formatEsn, formatMeid } from "@/lib/format";
 import { Card, Stat } from "@/components/card";
+import { RecentMessagesCard } from "@/components/recent-messages-card";
 import { validateRingtoneFile } from "@/lib/validation";
 import {
   NumberPlan,
@@ -500,6 +501,8 @@ export default function SubscriberDetailPage({
           )}
         </Card>
       </div>
+
+      <RecentMessagesCard phone={subscriber.phoneNumber} />
 
       <Card title="Voice Call">
         <div className="space-y-4">

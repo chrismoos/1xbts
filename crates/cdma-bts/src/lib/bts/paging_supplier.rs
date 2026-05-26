@@ -9,13 +9,21 @@ use crate::lac::paging_messages::{
     GeneralPageMessage, GeneralPageRecord, MsAddress, MsPageAddress, PagingChannelMessage,
     PagingMessageKind,
 };
-use crate::lac::{DataRequest, MessageControlStatusBlock, PagingSupplierFn};
+use crate::lac::{DataRequest, Layer2Lac, MessageControlStatusBlock, PagingSupplierFn};
 use crate::mac::types::ChannelType;
 
 use super::settings::{OverheadParameters, PagingChannelSettings, build_scheduled_message};
 
 const PENDING_PAGE_RECORD_ASSIGNED_SLOT_ATTEMPTS: u16 = 4;
 const PENDING_PAGE_RECORD_FAILURE_GUARD_MS: u64 = 10_000;
+
+/// Outcome of `queue_directed_pch`. `Oversize` means the encapsulated F-PCH
+/// capsule would not fit in the 8-bit MSG_LENGTH field.
+#[derive(Debug, Clone)]
+pub enum DirectedPchQueueError {
+    InvalidIdentity,
+    Oversize(String),
+}
 
 /// Event emitted when the BTS paging supplier transmits a directed SDU
 /// or GPM on F-PCH. Carries the real on-air MSG_SEQ assigned by the BTS.
@@ -245,16 +253,55 @@ impl PagingSupplierState {
         ack_req: bool,
         correlation_id: Option<u32>,
         ack_notify: bool,
-    ) {
+    ) -> Result<(), DirectedPchQueueError> {
         let addr = match mobile_identity_to_ms_address(mobile_identity) {
             Some(a) => a,
             None => {
                 warn!(
                     "BTS paging supplier: cannot convert MobileIdentity to MsAddress, dropping SDU"
                 );
-                return;
+                return Err(DirectedPchQueueError::InvalidIdentity);
             }
         };
+        let sdu = cdma_common::bits::Bitstream::new_bytes(&air_interface_message.message);
+        let message_id = MessageId::from_wire(
+            WireChannel::ForwardCommon,
+            air_interface_message.message_type,
+        )
+        .unwrap_or(MessageId::ExtChannelAssignment);
+
+        // Ensure the encapsulated PDU fits before mutating msg_seq / retry
+        // state. ARQ widths are fixed, so probe seq/ack values don't affect
+        // the capsule size.
+        let probe_dr = DataRequest {
+            sdu: sdu.clone(),
+            mcsb: MessageControlStatusBlock {
+                channel: ChannelType::FPch,
+                length_bits: sdu.len(),
+                mobile_p_rev: None,
+                extended_encryption: false,
+                message_id,
+                requested_tx_time: None,
+                tx_deadline: None,
+                address: Some(addr.clone()),
+                ack_seq: 0,
+                msg_seq: 0,
+                ack_req,
+                valid_ack: false,
+                overhead_mcc: self.overhead_mcc,
+                overhead_imsi_11_12: self.overhead_imsi_11_12,
+            },
+        };
+        if let Err(e) = Layer2Lac::assemble_pdu(probe_dr) {
+            warn!(
+                "BTS paging supplier: directed PCH would overflow MSG_LENGTH, dropping (corr={:?} sdu_bytes={}): {}",
+                correlation_id,
+                air_interface_message.message.len(),
+                e,
+            );
+            return Err(DirectedPchQueueError::Oversize(e.to_string()));
+        }
+
         let msg_seq = self.next_msg_seq(&addr, ack_req);
         let (ack_addr_type, ack_addr_bytes) =
             addr.ack_identity_key(self.overhead_mcc, self.overhead_imsi_11_12);
@@ -263,12 +310,6 @@ impl PagingSupplierState {
             Some(&seq) => (true, seq),
             None => (false, 0),
         };
-        let sdu = cdma_common::bits::Bitstream::new_bytes(&air_interface_message.message);
-        let message_id = MessageId::from_wire(
-            WireChannel::ForwardCommon,
-            air_interface_message.message_type,
-        )
-        .unwrap_or(MessageId::ExtChannelAssignment);
 
         if ack_notify {
             if let Some(corr_id) = correlation_id {
@@ -328,6 +369,7 @@ impl PagingSupplierState {
         }
 
         self.pending_directed_sdus.push_back(dr);
+        Ok(())
     }
 
     /// Check if an MS ACK matches a pending ack-notify request.
@@ -757,8 +799,12 @@ mod tests {
         let first = AirInterfaceMessagePayload::new(wire_type, [0xAA]).unwrap();
         let second = AirInterfaceMessagePayload::new(wire_type, [0xBB]).unwrap();
 
-        state.queue_directed_pch(&identity, &first, true, Some(1), true);
-        state.queue_directed_pch(&identity, &second, true, Some(2), true);
+        state
+            .queue_directed_pch(&identity, &first, true, Some(1), true)
+            .unwrap();
+        state
+            .queue_directed_pch(&identity, &second, true, Some(2), true)
+            .unwrap();
 
         let first_tx = state.pending_directed_sdus.pop_front().unwrap();
         let second_tx = state.pending_directed_sdus.pop_front().unwrap();
@@ -792,7 +838,9 @@ mod tests {
             .wire_type(WireChannel::ForwardCommon)
             .unwrap();
         let payload = AirInterfaceMessagePayload::new(wire_type, [0xCC]).unwrap();
-        state.queue_directed_pch(&identity, &payload, true, Some(10), true);
+        state
+            .queue_directed_pch(&identity, &payload, true, Some(10), true)
+            .unwrap();
 
         let dr = state.pending_directed_sdus.pop_front().unwrap();
         assert!(
@@ -815,11 +863,34 @@ mod tests {
             .wire_type(WireChannel::ForwardCommon)
             .unwrap();
         let payload = AirInterfaceMessagePayload::new(wire_type, [0xAA]).unwrap();
-        state.queue_directed_pch(&identity, &payload, true, Some(1), false);
+        state
+            .queue_directed_pch(&identity, &payload, true, Some(1), false)
+            .unwrap();
 
         let dr = state.pending_directed_sdus.pop_front().unwrap();
         assert!(!dr.mcsb.valid_ack);
         assert_eq!(dr.mcsb.ack_seq, 0);
+    }
+
+    /// Oversized SDU on F-PCH must be rejected before any state mutation so
+    /// the abis_agent can ack with SMS_MESSAGE_TOO_LONG.
+    #[test]
+    fn queue_directed_pch_rejects_oversize_without_mutating_state() {
+        let mut state = PagingSupplierState::new(0x03ff, 0x7f);
+        let identity = MobileIdentity::Esn(0xDEAD_BEEF);
+        let wire_type = MessageId::DataBurst
+            .wire_type(WireChannel::ForwardCommon)
+            .unwrap();
+        // ~250 SDU bytes blows past the 255-octet MSG_LENGTH cap once
+        // wrap overhead (MSG_LENGTH + MSG_TYPE + ARQ + address + CRC30) is
+        // added.
+        let big = vec![0x5Au8; 250];
+        let payload = AirInterfaceMessagePayload::new(wire_type, big).unwrap();
+        let result = state.queue_directed_pch(&identity, &payload, true, Some(1), false);
+        assert!(matches!(result, Err(DirectedPchQueueError::Oversize(_))));
+        assert!(state.pending_directed_sdus.is_empty());
+        assert!(state.pending_retries.is_empty());
+        assert!(state.pending_ack_notifies.is_empty());
     }
 
     #[test]
@@ -871,7 +942,9 @@ mod tests {
             .wire_type(WireChannel::ForwardCommon)
             .unwrap();
         let ecam_payload = AirInterfaceMessagePayload::new(wire_type, [0xAA]).unwrap();
-        state.queue_directed_pch(&identity, &ecam_payload, true, Some(42), true);
+        state
+            .queue_directed_pch(&identity, &ecam_payload, true, Some(42), true)
+            .unwrap();
 
         // The ECAM got msg_seq=0.
         assert_eq!(state.pending_retries.len(), 1);
@@ -914,7 +987,9 @@ mod tests {
             .wire_type(WireChannel::ForwardCommon)
             .unwrap();
         let payload = AirInterfaceMessagePayload::new(wire_type, [0x6C, 0x00]).unwrap();
-        state.queue_directed_pch(&identity, &payload, true, Some(77), true);
+        state
+            .queue_directed_pch(&identity, &payload, true, Some(77), true)
+            .unwrap();
 
         assert_eq!(state.pending_retries.len(), 1);
         assert_eq!(state.pending_ack_notifies.len(), 1);
@@ -957,7 +1032,9 @@ mod tests {
             .wire_type(WireChannel::ForwardCommon)
             .unwrap();
         let payload = AirInterfaceMessagePayload::new(wire_type, [0xDD]).unwrap();
-        state.queue_directed_pch(&identity, &payload, true, Some(99), true);
+        state
+            .queue_directed_pch(&identity, &payload, true, Some(99), true)
+            .unwrap();
 
         // Drain the initial TX and mark it as transmitted.
         assert_eq!(state.pending_directed_sdus.len(), 1);
@@ -1043,7 +1120,9 @@ mod tests {
             .wire_type(WireChannel::ForwardCommon)
             .unwrap();
         let payload = AirInterfaceMessagePayload::new(wire_type, [0xDD]).unwrap();
-        state.queue_directed_pch(&identity, &payload, true, Some(99), true);
+        state
+            .queue_directed_pch(&identity, &payload, true, Some(99), true)
+            .unwrap();
 
         let (s1, s2) = cdma_common::paging::imsi_s_from_imsi("999990123456789").unwrap();
         let pgslot = cdma_common::paging::compute_pgslot(s1, s2);
@@ -1087,7 +1166,9 @@ mod tests {
             .wire_type(WireChannel::ForwardCommon)
             .unwrap();
         let payload = AirInterfaceMessagePayload::new(wire_type, [0xDD]).unwrap();
-        state.queue_directed_pch(&identity, &payload, true, Some(99), true);
+        state
+            .queue_directed_pch(&identity, &payload, true, Some(99), true)
+            .unwrap();
 
         assert_eq!(state.pending_directed_sdus.len(), 1);
         let initial_dr = state.pending_directed_sdus.pop_front().unwrap();

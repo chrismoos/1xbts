@@ -4,6 +4,7 @@ import { useEffect, useState, useCallback, useRef, use, useMemo, type FormEvent 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Card, Stat } from "@/components/card";
+import { RecentMessagesCard } from "@/components/recent-messages-card";
 import { TimeSeriesChart, type Series } from "@/components/time-series-chart";
 import { esnManufacturer } from "@/lib/esn-manufacturer";
 import {
@@ -907,6 +908,8 @@ export default function MobileDetailPage({
           </div>
         </Card>
       </div>
+
+      <RecentMessagesCard phone={mobile.phoneNumber} />
 
       {mobilePacketSessions.length > 0 && (
         <Card title={`Active Sessions (${mobilePacketSessions.length})`}>

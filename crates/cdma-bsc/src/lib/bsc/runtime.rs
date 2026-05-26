@@ -28,7 +28,7 @@ impl Bsc {
         let mut bearer_poll_interval = tokio::time::interval(Duration::from_millis(20));
 
         loop {
-            self.drain_pch_transfer_acks();
+            self.drain_pch_transfer_acks().await;
 
             let retry_sleep = async {
                 match self.paging.next_retry_at() {
@@ -114,7 +114,7 @@ impl Bsc {
                     self.poll_packet_service_connecting(packet_service_connect_timeout).await;
                 }
                 _ = stale_channel_interval.tick() => {
-                    self.drain_pch_transfer_acks();
+                    self.drain_pch_transfer_acks().await;
                     self.teardown_stale_traffic_channels(traffic_timeout).await;
                     self.evict_stale_mobiles();
                     self.expire_stale_pending_a1_failures();

@@ -73,6 +73,8 @@ fn submission_to_proto(s: &SmsSubmission) -> crate::proto::SmsSubmission {
         failure_reason: s.failure_reason.clone(),
         created_at: Some(datetime_to_timestamp(s.created_at)),
         updated_at: Some(datetime_to_timestamp(s.updated_at)),
+        teleservice_id: s.teleservice_id.map(u32::from),
+        raw_user_data: s.raw_user_data.clone(),
     }
 }
 
@@ -94,6 +96,16 @@ fn delivery_attempt_to_proto(a: &SmsDeliveryAttempt) -> crate::proto::SmsDeliver
 fn parse_uuid(s: &str, field: &str) -> Result<Uuid, Status> {
     Uuid::parse_str(s)
         .map_err(|_| Status::invalid_argument(format!("invalid UUID for {}: {}", field, s)))
+}
+
+fn cdma_smsc_lib_options<'a>(
+    teleservice_id: Option<u16>,
+    raw_user_data: Option<&'a [u8]>,
+) -> crate::repository::CreateSubmissionOptions<'a> {
+    crate::repository::CreateSubmissionOptions {
+        teleservice_id,
+        raw_user_data,
+    }
 }
 
 #[tonic::async_trait]
@@ -125,6 +137,14 @@ impl SmscService for SmscServiceImpl {
             ));
         };
 
+        let teleservice_id = req
+            .teleservice_id
+            .map(|v| {
+                u16::try_from(v).map_err(|_| Status::invalid_argument("teleservice_id > 65535"))
+            })
+            .transpose()?;
+        let options = cdma_smsc_lib_options(teleservice_id, req.raw_user_data.as_deref());
+
         let submission = self
             .repo
             .create_submission(
@@ -133,6 +153,7 @@ impl SmscService for SmscServiceImpl {
                 &req.text,
                 orig_sub_id,
                 dest_sub_id,
+                options,
             )
             .await
             .map_err(|e| {
@@ -263,6 +284,7 @@ impl SmscService for SmscServiceImpl {
                 req.destination_esn.map(|v| v as u32),
                 req.destination_imsi.as_deref(),
                 req.state.as_deref(),
+                req.originating_number.as_deref(),
             )
             .await
             .map_err(|e| {

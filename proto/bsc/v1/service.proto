@@ -261,7 +261,12 @@ message DecodedSms {
   string originating_number = 3;
   uint32 message_type = 4;
   uint32 message_id = 5;
+  // Decoded user data text. Empty for non-text encodings (octet
+  // payloads such as WAP Push) — see `user_data`.
   string text = 6;
+  // Raw CHARi byte payload for octet-style MSG_ENCODINGs (0x00 etc.).
+  // For teleservice 0x1004 (WAP Push) this is the WSP PDU.
+  bytes  user_data = 7;
 }
 
 // Service Connect Completion fields decoded from the reverse dedicated channel.

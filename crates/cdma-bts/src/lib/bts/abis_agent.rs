@@ -825,16 +825,10 @@ impl AbisAgent {
             return;
         };
 
-        let ack = PchMessageTransferAckMessage {
-            correlation_id: pch.correlation_id,
-            cause: None,
-            bts_l2_termination: None,
-        };
-        if let Ok(bytes) = ack.encode() {
-            if let Some(msg) = abis_message_from_typed(&bytes) {
-                responses.push(msg);
-            }
-        }
+        // Ack cause is set to SMS_MESSAGE_TOO_LONG if the encapsulated PCH
+        // capsule won't fit, telling the BSC to escalate to a dedicated
+        // channel.
+        let mut ack_cause: Option<u8> = None;
 
         // Check if this PchMessageTransfer carries a channel assignment
         // (ECAM or CAM) that should commit a pending traffic channel.
@@ -868,67 +862,85 @@ impl AbisAgent {
                 .unwrap_or(0),
         );
 
-        let Some(ref aim) = pch.air_interface_message else {
-            return;
-        };
-        let Some(ref paging_state) = self.paging_state else {
-            warn!("abis_agent: PchMessageTransfer received but no paging state attached");
-            return;
-        };
-
-        let gpm_wire_type = MessageId::GeneralPage
-            .wire_type(WireChannel::ForwardCommon)
-            .unwrap();
-        if aim.message_type == gpm_wire_type {
-            let mut bs = Bitstream::new_bytes(&aim.message);
-            match GeneralPageMessage::from_sdu(&mut bs) {
-                Ok(gpm) => {
-                    let mut guard = paging_state.lock();
-                    for record in gpm.page_records {
-                        if guard
-                            .pending_page_records
-                            .iter()
-                            .any(|p| p.record == record)
-                        {
-                            info!("abis_agent: de-duplicated GPM page record");
-                            continue;
-                        }
-                        let Some(page_address) = record.page_address() else {
-                            warn!(
-                                "abis_agent: GPM page record has no mobile page address, dropping: {:?}",
-                                record
+        if let (Some(aim), Some(paging_state)) = (&pch.air_interface_message, &self.paging_state) {
+            let gpm_wire_type = MessageId::GeneralPage
+                .wire_type(WireChannel::ForwardCommon)
+                .unwrap();
+            if aim.message_type == gpm_wire_type {
+                let mut bs = Bitstream::new_bytes(&aim.message);
+                match GeneralPageMessage::from_sdu(&mut bs) {
+                    Ok(gpm) => {
+                        let mut guard = paging_state.lock();
+                        for record in gpm.page_records {
+                            if guard
+                                .pending_page_records
+                                .iter()
+                                .any(|p| p.record == record)
+                            {
+                                info!("abis_agent: de-duplicated GPM page record");
+                                continue;
+                            }
+                            let Some(page_address) = record.page_address() else {
+                                warn!(
+                                    "abis_agent: GPM page record has no mobile page address, dropping: {:?}",
+                                    record
+                                );
+                                continue;
+                            };
+                            info!(
+                                "abis_agent: GPM page record queued: {:?} addr={:?} corr={:?}",
+                                record, page_address, correlation_id,
                             );
-                            continue;
-                        };
-                        info!(
-                            "abis_agent: GPM page record queued: {:?} addr={:?} corr={:?}",
-                            record, page_address, correlation_id,
-                        );
-                        guard
-                            .pending_page_records
-                            .push(PendingPageRecord::new_with_correlation(
-                                record,
-                                page_address,
-                                correlation_id,
-                            ));
+                            guard.pending_page_records.push(
+                                PendingPageRecord::new_with_correlation(
+                                    record,
+                                    page_address,
+                                    correlation_id,
+                                ),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!("abis_agent: failed to decode GPM from Abis: {}", e);
                     }
                 }
-                Err(e) => {
-                    warn!("abis_agent: failed to decode GPM from Abis: {}", e);
+            } else {
+                let identity = pch.mobile_identities.first();
+                if let Some(identity) = identity {
+                    let result = paging_state.lock().queue_directed_pch(
+                        identity,
+                        aim,
+                        ack_req,
+                        correlation_id,
+                        ack_notify,
+                    );
+                    if let Err(super::paging_supplier::DirectedPchQueueError::Oversize(reason)) =
+                        result
+                    {
+                        warn!(
+                            "abis_agent: directed PCH oversized for F-PCH (corr={:?}): {} — acking SMS_MESSAGE_TOO_LONG",
+                            correlation_id, reason
+                        );
+                        ack_cause = Some(
+                            cdma_abis::control::typed::pch_message_transfer_ack_cause::SMS_MESSAGE_TOO_LONG,
+                        );
+                    }
+                } else {
+                    warn!("abis_agent: directed PCH with no mobile identity, dropping");
                 }
             }
-        } else {
-            let identity = pch.mobile_identities.first();
-            if let Some(identity) = identity {
-                paging_state.lock().queue_directed_pch(
-                    identity,
-                    aim,
-                    ack_req,
-                    correlation_id,
-                    ack_notify,
-                );
-            } else {
-                warn!("abis_agent: directed PCH with no mobile identity, dropping");
+        } else if pch.air_interface_message.is_some() && self.paging_state.is_none() {
+            warn!("abis_agent: PchMessageTransfer received but no paging state attached");
+        }
+
+        let ack = PchMessageTransferAckMessage {
+            correlation_id: pch.correlation_id,
+            cause: ack_cause,
+            bts_l2_termination: None,
+        };
+        if let Ok(bytes) = ack.encode() {
+            if let Some(msg) = abis_message_from_typed(&bytes) {
+                responses.push(msg);
             }
         }
     }
@@ -1893,13 +1905,16 @@ mod tests {
             .wire_type(WireChannel::ForwardCommon)
             .unwrap();
         let payload = AirInterfaceMessagePayload::new(wire_type, [0x6C, 0x00]).unwrap();
-        paging_state.lock().queue_directed_pch(
-            &MobileIdentity::Imsi("209990123456789".to_string()),
-            &payload,
-            true,
-            Some(99),
-            true,
-        );
+        paging_state
+            .lock()
+            .queue_directed_pch(
+                &MobileIdentity::Imsi("209990123456789".to_string()),
+                &payload,
+                true,
+                Some(99),
+                true,
+            )
+            .unwrap();
 
         let mut guard = paging_state.lock();
         let dr = guard.pending_directed_sdus.pop_front().unwrap();

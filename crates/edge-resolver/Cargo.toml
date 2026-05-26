@@ -1,0 +1,32 @@
+[package]
+name = "edge-resolver"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "HTTP sidecar that maps mobile peer IPs to MSISDNs via the PDSN management gRPC service. Called by nginx (auth_request) in fou-nat to inject an authoritative X-1xBTS-MSISDN header into proxied requests."
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tonic = "0.13"
+prost = "0.13"
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+
+[build-dependencies]
+tonic-build = "0.13"
+
+[dev-dependencies]
+async-trait = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[[bin]]
+name = "edge-resolver"
+path = "src/main.rs"
+
+[lints]
+workspace = true

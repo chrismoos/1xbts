@@ -8,7 +8,12 @@
 import { BinaryReader, BinaryWriter } from "@bufbuild/protobuf/wire";
 import type { CallContext, CallOptions } from "nice-grpc-common";
 import { Empty } from "../../google/protobuf/empty";
-import { GetSessionStatusResponse, PacketSessionInfo, SetSessionCaptureResponse } from "../../packet/v1/service";
+import {
+  GetSessionByIpResponse,
+  GetSessionStatusResponse,
+  PacketSessionInfo,
+  SetSessionCaptureResponse,
+} from "../../packet/v1/service";
 
 export const protobufPackage = "pdsn_management.v1";
 
@@ -22,6 +27,12 @@ export interface PdsnSessionList {
 export interface GetPdsnSessionRequest {
   /** Packet session identifier allocated by packet-call setup. */
   sessionId: string;
+}
+
+/** Selects a PDSN packet session by its assigned mobile IP. */
+export interface GetPdsnSessionByIpRequest {
+  /** Mobile (peer) IP address as the engine reports it, e.g. "10.55.0.2". */
+  peerIp: string;
 }
 
 /** Enables or disables packet trace capture for one session. */
@@ -158,6 +169,70 @@ export const GetPdsnSessionRequest: MessageFns<GetPdsnSessionRequest> = {
   },
 };
 
+function createBaseGetPdsnSessionByIpRequest(): GetPdsnSessionByIpRequest {
+  return { peerIp: "" };
+}
+
+export const GetPdsnSessionByIpRequest: MessageFns<GetPdsnSessionByIpRequest> = {
+  encode(message: GetPdsnSessionByIpRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.peerIp !== "") {
+      writer.uint32(10).string(message.peerIp);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): GetPdsnSessionByIpRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseGetPdsnSessionByIpRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.peerIp = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): GetPdsnSessionByIpRequest {
+    return {
+      peerIp: isSet(object.peerIp)
+        ? globalThis.String(object.peerIp)
+        : isSet(object.peer_ip)
+        ? globalThis.String(object.peer_ip)
+        : "",
+    };
+  },
+
+  toJSON(message: GetPdsnSessionByIpRequest): unknown {
+    const obj: any = {};
+    if (message.peerIp !== "") {
+      obj.peerIp = message.peerIp;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<GetPdsnSessionByIpRequest>): GetPdsnSessionByIpRequest {
+    return GetPdsnSessionByIpRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<GetPdsnSessionByIpRequest>): GetPdsnSessionByIpRequest {
+    const message = createBaseGetPdsnSessionByIpRequest();
+    message.peerIp = object.peerIp ?? "";
+    return message;
+  },
+};
+
 function createBaseSetPacketTraceCaptureRequest(): SetPacketTraceCaptureRequest {
   return { sessionId: "", enabled: false };
 }
@@ -262,6 +337,19 @@ export const PdsnManagementServiceDefinition = {
       responseStream: false,
       options: {},
     },
+    /**
+     * Looks up one active packet session by its assigned mobile IP. Used by
+     * the edge MSISDN resolver in fou-nat to attribute inbound HTTP requests
+     * to a subscriber. Returns an unset `session` field on miss.
+     */
+    getPdsnSessionByIp: {
+      name: "GetPdsnSessionByIp",
+      requestType: GetPdsnSessionByIpRequest as typeof GetPdsnSessionByIpRequest,
+      requestStream: false,
+      responseType: GetSessionByIpResponse as typeof GetSessionByIpResponse,
+      responseStream: false,
+      options: {},
+    },
     /** Enables or disables trace capture on one packet session. */
     setPacketTraceCapture: {
       name: "SetPacketTraceCapture",
@@ -282,6 +370,15 @@ export interface PdsnManagementServiceImplementation<CallContextExt = {}> {
     request: GetPdsnSessionRequest,
     context: CallContext & CallContextExt,
   ): Promise<DeepPartial<GetSessionStatusResponse>>;
+  /**
+   * Looks up one active packet session by its assigned mobile IP. Used by
+   * the edge MSISDN resolver in fou-nat to attribute inbound HTTP requests
+   * to a subscriber. Returns an unset `session` field on miss.
+   */
+  getPdsnSessionByIp(
+    request: GetPdsnSessionByIpRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<GetSessionByIpResponse>>;
   /** Enables or disables trace capture on one packet session. */
   setPacketTraceCapture(
     request: SetPacketTraceCaptureRequest,
@@ -297,6 +394,15 @@ export interface PdsnManagementServiceClient<CallOptionsExt = {}> {
     request: DeepPartial<GetPdsnSessionRequest>,
     options?: CallOptions & CallOptionsExt,
   ): Promise<GetSessionStatusResponse>;
+  /**
+   * Looks up one active packet session by its assigned mobile IP. Used by
+   * the edge MSISDN resolver in fou-nat to attribute inbound HTTP requests
+   * to a subscriber. Returns an unset `session` field on miss.
+   */
+  getPdsnSessionByIp(
+    request: DeepPartial<GetPdsnSessionByIpRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<GetSessionByIpResponse>;
   /** Enables or disables trace capture on one packet session. */
   setPacketTraceCapture(
     request: DeepPartial<SetPacketTraceCaptureRequest>,

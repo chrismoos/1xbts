@@ -24,6 +24,13 @@ message SendSmsRequest {
     string destination_number = 4;
     string destination_imsi = 5;
   }
+  // C.S0015-B teleservice ID. Defaults to 0x1002 (WMT) when absent.
+  // 0x1004 (WAP) selects WAP Push delivery used by MMS M-Notification.ind.
+  optional uint32 teleservice_id = 6;
+  // Opaque User Data bytes for non-text teleservices (binary WAP Push PDU
+  // already framed per WAP-259 §6.5). When set, `text` is ignored and the
+  // BSC emits these as MSG_ENCODING=0x00 octet user data.
+  optional bytes raw_user_data = 7;
 }
 
 message SendSmsResponse {

@@ -1358,7 +1358,7 @@ pub fn sar_encapsulate_pdu(
         .into());
     }
     let mut encapsulated = Bitstream::new();
-    let msg_length_octets = sar_message_length_octets(&pdu);
+    let msg_length_octets = sar_message_length_octets_checked(&pdu)?;
     sar_write_msg_length8(&mut encapsulated, msg_length_octets);
     encapsulated.extend(&pdu);
     sar_write_crc30(&mut encapsulated, msg_length_octets, &pdu);
@@ -1581,6 +1581,23 @@ pub fn sar_fragment_ftch_pdu_dsch(pdu: &Bitstream) -> Vec<Bitstream> {
 
 fn sar_message_length_octets(pdu: &Bitstream) -> u8 {
     ((8 + pdu.len() + 30) / 8) as u8
+}
+
+/// Compute MSG_LENGTH and reject capsules that don't fit in the 8-bit
+/// MSG_LENGTH field. Callers should escalate oversized PDUs to a
+/// dedicated channel.
+fn sar_message_length_octets_checked(pdu: &Bitstream) -> Result<u8, Error> {
+    let total_bits = 8 + pdu.len() + 30;
+    let octets = total_bits.div_ceil(8);
+    if octets > u8::MAX as usize {
+        return Err(format!(
+            "f-csch capsule too large: pdu={} bits, encapsulated={} octets (max 255)",
+            pdu.len(),
+            octets,
+        )
+        .into());
+    }
+    Ok(octets as u8)
 }
 
 fn sar_write_crc30(bs: &mut Bitstream, msg_length_octets: u8, pdu: &Bitstream) {

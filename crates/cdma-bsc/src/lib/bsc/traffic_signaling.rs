@@ -83,6 +83,8 @@ impl Bsc {
                     }
                 });
             }
+            let addr = pending.addr.clone();
+            self.dispatch_next_queued_sms_for(&addr);
         }
     }
 
@@ -308,6 +310,58 @@ impl Bsc {
                 self.start_packet_session_after_service_connect(walsh_code)
                     .await;
             }
+            // SO6 escalation: an SMS was parked on this channel after the BTS
+            // rejected the original F-PCH attempt with cause 0x71. Re-deliver
+            // it now on F-DSCH.
+            self.dispatch_pending_sms_escalation(walsh_code, addr);
+        }
+    }
+
+    /// Take any SMS parked on `walsh_code` by the 0x71-escalation path and
+    /// re-send it on F-DSCH. The F-TCH ack tracker is installed by
+    /// `send_sms_data_burst_auto` so the existing TrafficMsgSeq ack path
+    /// relays success/failure to the MSC.
+    fn dispatch_pending_sms_escalation(&mut self, walsh_code: u8, addr: &MsAddress) {
+        let Some(parked) = self.pending_sms_escalations.remove(&walsh_code) else {
+            return;
+        };
+        let Some(payload) = parked.escalation.clone() else {
+            warn!(
+                "BSC: parked escalation on walsh={} has no payload, dropping",
+                walsh_code
+            );
+            return;
+        };
+        let sms_req = super::sms::SmsRequest {
+            originating_number: payload.originating_number,
+            text: payload.text,
+            target_address: None,
+            target_subscriber_id: payload.target_subscriber_id,
+            timeout_ms: payload.timeout_ms,
+            destination_number: payload.destination_number,
+            sms_id: parked.sms_id,
+            delivery_attempt_id: parked.delivery_attempt_id,
+            a1_tag: parked.a1_tag,
+            raw_payload: payload.raw_payload,
+        };
+        info!(
+            "BSC: 0x71 escalation: re-delivering SMS {:?} on F-DSCH walsh={} for {}",
+            sms_req.sms_id,
+            walsh_code,
+            format_ms_address(addr)
+        );
+        match self.send_sms_data_burst_auto(addr, &sms_req) {
+            Ok(super::ForwardSignalingRoute::SentOnTraffic { .. }) => {}
+            Ok(super::ForwardSignalingRoute::NeedsPaging) => {
+                warn!(
+                    "BSC: 0x71 escalation: walsh={} not active when dispatching parked SMS",
+                    walsh_code
+                );
+            }
+            Err(e) => warn!(
+                "BSC: 0x71 escalation: F-DSCH re-delivery failed on walsh={}: {}",
+                walsh_code, e
+            ),
         }
     }
 

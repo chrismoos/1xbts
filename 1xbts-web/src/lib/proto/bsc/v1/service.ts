@@ -263,7 +263,16 @@ export interface DecodedSms {
   originatingNumber: string;
   messageType: number;
   messageId: number;
+  /**
+   * Decoded user data text. Empty for non-text encodings (octet
+   * payloads such as WAP Push) — see `user_data`.
+   */
   text: string;
+  /**
+   * Raw CHARi byte payload for octet-style MSG_ENCODINGs (0x00 etc.).
+   * For teleservice 0x1004 (WAP Push) this is the WSP PDU.
+   */
+  userData: Uint8Array;
 }
 
 /** Service Connect Completion fields decoded from the reverse dedicated channel. */
@@ -5384,7 +5393,15 @@ export const AccessDataBurst: MessageFns<AccessDataBurst> = {
 };
 
 function createBaseDecodedSms(): DecodedSms {
-  return { teleserviceId: 0, destinationNumber: "", originatingNumber: "", messageType: 0, messageId: 0, text: "" };
+  return {
+    teleserviceId: 0,
+    destinationNumber: "",
+    originatingNumber: "",
+    messageType: 0,
+    messageId: 0,
+    text: "",
+    userData: new Uint8Array(0),
+  };
 }
 
 export const DecodedSms: MessageFns<DecodedSms> = {
@@ -5406,6 +5423,9 @@ export const DecodedSms: MessageFns<DecodedSms> = {
     }
     if (message.text !== "") {
       writer.uint32(50).string(message.text);
+    }
+    if (message.userData.length !== 0) {
+      writer.uint32(58).bytes(message.userData);
     }
     return writer;
   },
@@ -5465,6 +5485,14 @@ export const DecodedSms: MessageFns<DecodedSms> = {
           message.text = reader.string();
           continue;
         }
+        case 7: {
+          if (tag !== 58) {
+            break;
+          }
+
+          message.userData = reader.bytes();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -5502,6 +5530,11 @@ export const DecodedSms: MessageFns<DecodedSms> = {
         ? globalThis.Number(object.message_id)
         : 0,
       text: isSet(object.text) ? globalThis.String(object.text) : "",
+      userData: isSet(object.userData)
+        ? bytesFromBase64(object.userData)
+        : isSet(object.user_data)
+        ? bytesFromBase64(object.user_data)
+        : new Uint8Array(0),
     };
   },
 
@@ -5525,6 +5558,9 @@ export const DecodedSms: MessageFns<DecodedSms> = {
     if (message.text !== "") {
       obj.text = message.text;
     }
+    if (message.userData.length !== 0) {
+      obj.userData = base64FromBytes(message.userData);
+    }
     return obj;
   },
 
@@ -5539,6 +5575,7 @@ export const DecodedSms: MessageFns<DecodedSms> = {
     message.messageType = object.messageType ?? 0;
     message.messageId = object.messageId ?? 0;
     message.text = object.text ?? "";
+    message.userData = object.userData ?? new Uint8Array(0);
     return message;
   },
 };
@@ -15485,6 +15522,31 @@ export interface BscServiceClient<CallOptionsExt = {}> {
     request: DeepPartial<InitiateDataCallRequest>,
     options?: CallOptions & CallOptionsExt,
   ): Promise<InitiateDataCallResponse>;
+}
+
+function bytesFromBase64(b64: string): Uint8Array {
+  if ((globalThis as any).Buffer) {
+    return Uint8Array.from(globalThis.Buffer.from(b64, "base64"));
+  } else {
+    const bin = globalThis.atob(b64);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; ++i) {
+      arr[i] = bin.charCodeAt(i);
+    }
+    return arr;
+  }
+}
+
+function base64FromBytes(arr: Uint8Array): string {
+  if ((globalThis as any).Buffer) {
+    return globalThis.Buffer.from(arr).toString("base64");
+  } else {
+    const bin: string[] = [];
+    arr.forEach((byte) => {
+      bin.push(globalThis.String.fromCharCode(byte));
+    });
+    return globalThis.btoa(bin.join(""));
+  }
 }
 
 type Builtin = Date | Function | Uint8Array | string | number | boolean | undefined;

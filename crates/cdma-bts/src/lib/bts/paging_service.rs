@@ -69,9 +69,9 @@ impl PagingService {
         ack_req: bool,
         correlation_id: Option<u32>,
         ack_notify: bool,
-    ) {
+    ) -> Result<(), super::paging_supplier::DirectedPchQueueError> {
         let mut guard = self.state.lock();
-        guard.queue_directed_pch(identity, aim, ack_req, correlation_id, ack_notify);
+        guard.queue_directed_pch(identity, aim, ack_req, correlation_id, ack_notify)
     }
 
     /// Check if an MS ACK matches a pending ack-notify request.

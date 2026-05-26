@@ -125,6 +125,18 @@ pub(crate) enum SmsAckKey {
     TrafficMsgSeq { addr: MsAddress, msg_seq: u8 },
 }
 
+/// SMS payload retained alongside `PendingSmsAck` so the BSC can re-send
+/// the same SMS on a different channel after the original one rejected it.
+#[derive(Clone)]
+pub(crate) struct EscalationPayload {
+    pub(crate) originating_number: String,
+    pub(crate) text: String,
+    pub(crate) raw_payload: Option<Vec<u8>>,
+    pub(crate) destination_number: Option<String>,
+    pub(crate) target_subscriber_id: Option<Uuid>,
+    pub(crate) timeout_ms: Option<u64>,
+}
+
 /// SMS Data Burst awaiting delivery confirmation.
 pub(crate) struct PendingSmsAck {
     pub(crate) key: SmsAckKey,
@@ -133,6 +145,10 @@ pub(crate) struct PendingSmsAck {
     pub(crate) addr: MsAddress,
     pub(crate) sent_at: Instant,
     pub(crate) a1_tag: Option<u32>,
+    /// Retained payload for re-delivery if the original channel rejects
+    /// the PDU. `None` when re-delivery does not apply (e.g. already on
+    /// F-TCH).
+    pub(crate) escalation: Option<EscalationPayload>,
 }
 
 pub(crate) struct ExpiredSmsAck {
@@ -188,6 +204,7 @@ impl SmsService {
         addr: MsAddress,
         sent_at: Instant,
         a1_tag: Option<u32>,
+        escalation: Option<EscalationPayload>,
     ) {
         self.pending_acks.retain(|p| p.key != key);
         self.pending_acks.push(PendingSmsAck {
@@ -197,33 +214,38 @@ impl SmsService {
             addr,
             sent_at,
             a1_tag,
+            escalation,
         });
     }
 
     /// Track a pending SMS ACK after a Data Burst has been sent on the
     /// forward traffic channel. Keyed by (addr, msg_seq) since BSC owns
     /// F-TCH ARQ.
+    ///
+    /// Tracks every Data Burst we send — mirrors the F-PCH path.
+    /// `sms_id` is an SMSC-internal identifier the BSC never sees on
+    /// the wire for MSC-originated MT SMS (A1 ADDS Page carries only
+    /// `tag`), so requiring it would silently drop the ack relay for
+    /// any MT SMS delivered as a Data Burst on F-TCH.
     pub(crate) fn track_pending_traffic_ack(
         &mut self,
         msg_seq: u8,
         addr: &MsAddress,
         sms_req: &SmsRequest,
     ) {
-        if let Some(sms_id) = sms_req.sms_id {
-            let delivery_attempt_id = sms_req.delivery_attempt_id;
-            let key = SmsAckKey::TrafficMsgSeq {
-                addr: addr.clone(),
-                msg_seq,
-            };
-            self.track_pending_ack(
-                key,
-                Some(sms_id),
-                delivery_attempt_id,
-                addr.clone(),
-                Instant::now(),
-                sms_req.a1_tag,
-            );
-        }
+        let key = SmsAckKey::TrafficMsgSeq {
+            addr: addr.clone(),
+            msg_seq,
+        };
+        self.track_pending_ack(
+            key,
+            sms_req.sms_id,
+            sms_req.delivery_attempt_id,
+            addr.clone(),
+            Instant::now(),
+            sms_req.a1_tag,
+            None,
+        );
     }
 
     pub(crate) fn send_access_data_burst(
@@ -271,6 +293,14 @@ impl SmsService {
         );
 
         let key = SmsAckKey::PchCorrelation(correlation_id);
+        let escalation = Some(EscalationPayload {
+            originating_number: sms_req.originating_number.clone(),
+            text: sms_req.text.clone(),
+            raw_payload: Some(data_burst.fields.clone()),
+            destination_number: sms_req.destination_number.clone(),
+            target_subscriber_id: sms_req.target_subscriber_id,
+            timeout_ms: sms_req.timeout_ms,
+        });
         self.track_pending_ack(
             key,
             sms_req.sms_id,
@@ -278,6 +308,7 @@ impl SmsService {
             addr.clone(),
             Instant::now(),
             sms_req.a1_tag,
+            escalation,
         );
 
         Ok(())
@@ -516,9 +547,15 @@ impl Bsc {
             }
         }
 
-        if self.paging.has_pending_sms_page() {
-            warn!("BSC: page already in progress — rejecting SMS request");
-            warn!("MSC SMS: cannot deliver — page already in progress");
+        if self.is_ms_busy_with_sms_delivery(&target_addr) {
+            let key = format_ms_address(&target_addr);
+            let q = self.pending_sms_queue.entry(key.clone()).or_default();
+            q.push_back(sms_req);
+            info!(
+                "BSC: SMS delivery for {} already in progress, queuing (depth={})",
+                key,
+                q.len()
+            );
             return;
         }
 
@@ -563,6 +600,52 @@ impl Bsc {
                 );
             }
             Err(e) => warn!("BSC: failed to send page: {}", e),
+        }
+    }
+
+    /// True while an earlier SMS to `addr` is still paging, parked on SO6
+    /// escalation, or awaiting a PCH/F-TCH ack.
+    pub(crate) fn is_ms_busy_with_sms_delivery(&self, addr: &MsAddress) -> bool {
+        if self.paging.pending_sms_page_for_address(addr) {
+            return true;
+        }
+        if self.sms.has_pending_ack_for(addr) {
+            return true;
+        }
+        if self
+            .pending_sms_escalations
+            .values()
+            .any(|p| p.addr == *addr)
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Pop the next queued SMS for `addr` and re-dispatch it.
+    pub(crate) fn dispatch_next_queued_sms_for(&mut self, addr: &MsAddress) {
+        let key = format_ms_address(addr);
+        let next = self
+            .pending_sms_queue
+            .get_mut(&key)
+            .and_then(|q| q.pop_front());
+        if self
+            .pending_sms_queue
+            .get(&key)
+            .is_some_and(|q| q.is_empty())
+        {
+            self.pending_sms_queue.remove(&key);
+        }
+        if let Some(sms_req) = next {
+            info!(
+                "BSC: dispatching next queued SMS for {} (remaining depth={})",
+                key,
+                self.pending_sms_queue
+                    .get(&key)
+                    .map(|q| q.len())
+                    .unwrap_or(0)
+            );
+            self.handle_sms_request(sms_req);
         }
     }
 

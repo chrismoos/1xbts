@@ -20,6 +20,13 @@ message SmsSubmission {
   google.protobuf.Timestamp updated_at = 10;
   optional uint64 destination_esn = 11;     // set when targeting by ESN
   optional string destination_imsi = 12;    // set when targeting by IMSI/IMSI_S digits
+  // C.S0015-B teleservice ID. Defaults to 0x1002 (WMT) when not set.
+  // 0x1004 (CATPT) selects WAP Push delivery used by MMS M-Notification.ind.
+  optional uint32 teleservice_id = 13;
+  // Opaque User Data bytes (MSG_ENCODING=0x00 octet). When set, the BSC
+  // emits these bytes verbatim as the bearer-data User Data sub-parameter
+  // and ignores `text`. Used to carry WAP Push PDUs end to end.
+  optional bytes raw_user_data = 14;
 }
 
 // One delivery attempt for an SMS submission.
@@ -54,6 +61,11 @@ message CreateSmsSubmissionRequest {
   optional string destination_subscriber_id = 5;
   optional uint64 destination_esn = 6;
   optional string destination_imsi = 7;
+  // C.S0015-B teleservice ID. Defaults to 0x1002 (WMT) when absent.
+  optional uint32 teleservice_id = 8;
+  // Opaque User Data bytes for non-text teleservices (e.g. 0x1004 WAP Push
+  // carrying an MMS M-Notification.ind PDU). When set, `text` is ignored.
+  optional bytes raw_user_data = 9;
 }
 
 // Created SMS submission.
@@ -107,6 +119,7 @@ message ListSmsSubmissionsRequest {
   optional string state = 4;
   optional uint64 destination_esn = 5;
   optional string destination_imsi = 6;
+  optional string originating_number = 7;
 }
 
 // SMS submission list page and total count.

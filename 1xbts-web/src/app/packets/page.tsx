@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Card } from "@/components/card";
+import { serviceOptionName } from "@/lib/service-option";
 
 interface PacketSessionInfo {
   sessionId: string;
@@ -81,17 +82,6 @@ function formatStateLabel(value: string): string {
     .split("_")
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ");
-}
-
-function serviceOptionName(so: number): string {
-  switch (so) {
-    case 7:
-      return "SO 7";
-    case 33:
-      return "SO 33";
-    default:
-      return `SO ${so}`;
-  }
 }
 
 function healthForSession(session: PacketSessionInfo): {

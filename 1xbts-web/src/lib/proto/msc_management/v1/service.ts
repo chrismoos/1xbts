@@ -31,7 +31,22 @@ export interface SendSmsRequest {
   text: string;
   timeoutMs?: number | undefined;
   destinationNumber?: string | undefined;
-  destinationImsi?: string | undefined;
+  destinationImsi?:
+    | string
+    | undefined;
+  /**
+   * C.S0015-B teleservice ID. Defaults to 0x1002 (WMT) when absent.
+   * 0x1004 (WAP) selects WAP Push delivery used by MMS M-Notification.ind.
+   */
+  teleserviceId?:
+    | number
+    | undefined;
+  /**
+   * Opaque User Data bytes for non-text teleservices (binary WAP Push PDU
+   * already framed per WAP-259 §6.5). When set, `text` is ignored and the
+   * BSC emits these as MSG_ENCODING=0x00 octet user data.
+   */
+  rawUserData?: Uint8Array | undefined;
 }
 
 export interface SendSmsResponse {
@@ -110,6 +125,8 @@ function createBaseSendSmsRequest(): SendSmsRequest {
     timeoutMs: undefined,
     destinationNumber: undefined,
     destinationImsi: undefined,
+    teleserviceId: undefined,
+    rawUserData: undefined,
   };
 }
 
@@ -129,6 +146,12 @@ export const SendSmsRequest: MessageFns<SendSmsRequest> = {
     }
     if (message.destinationImsi !== undefined) {
       writer.uint32(42).string(message.destinationImsi);
+    }
+    if (message.teleserviceId !== undefined) {
+      writer.uint32(48).uint32(message.teleserviceId);
+    }
+    if (message.rawUserData !== undefined) {
+      writer.uint32(58).bytes(message.rawUserData);
     }
     return writer;
   },
@@ -180,6 +203,22 @@ export const SendSmsRequest: MessageFns<SendSmsRequest> = {
           message.destinationImsi = reader.string();
           continue;
         }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.teleserviceId = reader.uint32();
+          continue;
+        }
+        case 7: {
+          if (tag !== 58) {
+            break;
+          }
+
+          message.rawUserData = reader.bytes();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -212,6 +251,16 @@ export const SendSmsRequest: MessageFns<SendSmsRequest> = {
         : isSet(object.destination_imsi)
         ? globalThis.String(object.destination_imsi)
         : undefined,
+      teleserviceId: isSet(object.teleserviceId)
+        ? globalThis.Number(object.teleserviceId)
+        : isSet(object.teleservice_id)
+        ? globalThis.Number(object.teleservice_id)
+        : undefined,
+      rawUserData: isSet(object.rawUserData)
+        ? bytesFromBase64(object.rawUserData)
+        : isSet(object.raw_user_data)
+        ? bytesFromBase64(object.raw_user_data)
+        : undefined,
     };
   },
 
@@ -232,6 +281,12 @@ export const SendSmsRequest: MessageFns<SendSmsRequest> = {
     if (message.destinationImsi !== undefined) {
       obj.destinationImsi = message.destinationImsi;
     }
+    if (message.teleserviceId !== undefined) {
+      obj.teleserviceId = Math.round(message.teleserviceId);
+    }
+    if (message.rawUserData !== undefined) {
+      obj.rawUserData = base64FromBytes(message.rawUserData);
+    }
     return obj;
   },
 
@@ -245,6 +300,8 @@ export const SendSmsRequest: MessageFns<SendSmsRequest> = {
     message.timeoutMs = object.timeoutMs ?? undefined;
     message.destinationNumber = object.destinationNumber ?? undefined;
     message.destinationImsi = object.destinationImsi ?? undefined;
+    message.teleserviceId = object.teleserviceId ?? undefined;
+    message.rawUserData = object.rawUserData ?? undefined;
     return message;
   },
 };
@@ -383,6 +440,31 @@ export interface MscManagementServiceClient<CallOptionsExt = {}> {
   sendSms(request: DeepPartial<SendSmsRequest>, options?: CallOptions & CallOptionsExt): Promise<SendSmsResponse>;
   /** Lists active MSC call IDs. */
   listCalls(request: DeepPartial<Empty>, options?: CallOptions & CallOptionsExt): Promise<CallList>;
+}
+
+function bytesFromBase64(b64: string): Uint8Array {
+  if ((globalThis as any).Buffer) {
+    return Uint8Array.from(globalThis.Buffer.from(b64, "base64"));
+  } else {
+    const bin = globalThis.atob(b64);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; ++i) {
+      arr[i] = bin.charCodeAt(i);
+    }
+    return arr;
+  }
+}
+
+function base64FromBytes(arr: Uint8Array): string {
+  if ((globalThis as any).Buffer) {
+    return globalThis.Buffer.from(arr).toString("base64");
+  } else {
+    const bin: string[] = [];
+    arr.forEach((byte) => {
+      bin.push(globalThis.String.fromCharCode(byte));
+    });
+    return globalThis.btoa(bin.join(""));
+  }
 }
 
 type Builtin = Date | Function | Uint8Array | string | number | boolean | undefined;

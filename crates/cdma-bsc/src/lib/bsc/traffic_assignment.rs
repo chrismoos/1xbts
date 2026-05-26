@@ -263,6 +263,170 @@ impl Bsc {
         true
     }
 
+    /// Set up an SO6 traffic channel so the BSC can re-deliver an oversized
+    /// SMS on F-DSCH instead of giving up. Returns `true` when escalation
+    /// took over the outstanding ack; `false` means the caller's generic
+    /// failure path should run.
+    pub(crate) async fn try_escalate_oversized_sms_to_so6(&mut self, correlation_id: u32) -> bool {
+        use super::sms::SmsAckKey;
+        let key = SmsAckKey::PchCorrelation(correlation_id);
+        let pos = match self
+            .sms
+            .pending_acks
+            .iter()
+            .position(|p| p.key == key && p.escalation.is_some())
+        {
+            Some(p) => p,
+            None => {
+                log::debug!(
+                    "BSC: oversize escalation: no escalatable pending SMS for correlation_id={}",
+                    correlation_id
+                );
+                return false;
+            }
+        };
+        let fwd_address = self.sms.pending_acks[pos].addr.clone();
+
+        let Some(ms) = self.mobiles.get(&fwd_address) else {
+            log::warn!(
+                "BSC: oversize escalation: mobile {} no longer registered",
+                format_ms_address(&fwd_address)
+            );
+            return false;
+        };
+        if !matches!(
+            ms.state,
+            MsState::PageResponseReceived | MsState::Registered | MsState::Paged
+        ) {
+            log::warn!(
+                "BSC: oversize escalation: mobile {} not in a state ready for traffic assignment (state={:?})",
+                format_ms_address(&fwd_address),
+                ms.state
+            );
+            return false;
+        }
+
+        let Some(bts_client) = self.config.bts_client.clone() else {
+            log::warn!("BSC: oversize escalation: no BTS client configured");
+            return false;
+        };
+        let esn = ms.esn.unwrap_or(0);
+        let traffic_lc = LongCodeGenerator::new_traffic_channel(esn);
+
+        // Pick the best RC pair the MS and config agree on (Page Response
+        // already populated the MS capability fields). RC3/RC3 when the
+        // negotiator prefers it; otherwise fall back to RC1/RC1.
+        let Some(selected_rcs) = select_initial_traffic_rcs(
+            &self.config.traffic_assignment,
+            &ms.for_supported_rcs,
+            &ms.rev_supported_rcs,
+            ms.for_preferred_rc,
+            ms.rev_preferred_rc,
+            ms.mob_p_rev,
+        ) else {
+            log::warn!(
+                "BSC: oversize escalation: no traffic RC pair matches mobile {} capabilities",
+                format_ms_address(&fwd_address)
+            );
+            return false;
+        };
+        let use_rc3 = selected_rcs == (3, 3);
+
+        let alloc_result = if use_rc3 {
+            bts_client
+                .allocate_rc3_traffic(traffic_lc.clone(), 0, 12, esn, false)
+                .await
+        } else {
+            bts_client
+                .allocate_rc1_traffic(traffic_lc.clone(), 0, esn)
+                .await
+        };
+        let Some(handle) = alloc_result else {
+            log::warn!(
+                "BSC: oversize escalation: no walsh codes available for SO6 traffic, falling through to fail"
+            );
+            return false;
+        };
+        let walsh_code = handle.walsh_code;
+        info!(
+            "BSC: oversize escalation: allocated {} traffic walsh={} for {} (SO6 SMS re-delivery)",
+            if use_rc3 { "RC3" } else { "RC1" },
+            walsh_code,
+            format_ms_address(&fwd_address)
+        );
+
+        let (walsh_code, assigned_rcs) = self.assign_traffic_channel_to_mobile(
+            &fwd_address,
+            handle,
+            SERVICE_OPTION_SMS,
+            Some(SERVICE_OPTION_SMS),
+            1,
+            None,
+            None,
+            None,
+        );
+
+        let ms_gating = self
+            .mobiles
+            .get(&fwd_address)
+            .map(|ms| ms.rev_fch_gating_req)
+            .unwrap_or(false);
+        bts_client
+            .install_rx_request(cdma_common::traffic::TrafficRxRequest {
+                walsh_code,
+                esn,
+                assigned_rev_rc: assigned_rcs.1,
+                preamble_num_pcgs: None,
+                rev_fch_gating_mode: ms_gating,
+            })
+            .await;
+
+        // ack_msg_seq is just for logging; BTS stamps real ARQ values per
+        // address. We don't have an access event in this MT path, so pass 0.
+        if let Err(e) = self.traffic_assignment.send_channel_assignment(
+            &self.mobiles,
+            &self.access_tx,
+            self.config.pilot_offset,
+            &self.config.overhead,
+            &self.config.traffic_assignment,
+            &fwd_address,
+            0,
+            walsh_code,
+            Some(assigned_rcs),
+            None,
+            None,
+        ) {
+            log::warn!(
+                "BSC: oversize escalation: failed to send Channel Assignment for {}: {}",
+                format_ms_address(&fwd_address),
+                e
+            );
+            let bearer = self.config.msc_voice_bearer.clone();
+            self.mobiles.update(&fwd_address, |ms| {
+                ms.set_state(MsState::Registered);
+                ms.remove_traffic_channel_by_walsh(walsh_code, bearer.as_ref());
+            });
+            bts_client.deallocate_traffic(walsh_code).await;
+            bts_client.drop_pending_rx_request(walsh_code).await;
+            bts_client.request_rx_removal(walsh_code).await;
+            return false;
+        }
+
+        // Move pending ack from PchCorrelation keying to walsh-keyed escalation
+        // queue. On Service Connect Completion the BSC pops it and re-sends
+        // the bytes on F-DSCH; `track_pending_traffic_ack` then re-installs
+        // the F-TCH ack tracker with the real msg_seq.
+        let pending = self.sms.pending_acks.remove(pos);
+        let sms_id = pending.sms_id;
+        self.pending_sms_escalations.insert(walsh_code, pending);
+        log::info!(
+            "BSC: oversize escalation: SMS {:?} parked on walsh={} pending Service Connect Completion",
+            sms_id,
+            walsh_code
+        );
+        true
+    }
+
     pub(crate) async fn try_assign_access_packet_data_traffic(
         &mut self,
         fwd_address: &MsAddress,

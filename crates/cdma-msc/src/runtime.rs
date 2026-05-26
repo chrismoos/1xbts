@@ -257,6 +257,17 @@ impl MscRuntime {
         sms_retry_interval.tick().await; // consume the immediate first tick
         let sms_retry_after = Duration::from_secs(self.config.sms_retry.retry_after_secs);
         let sms_retry_enabled = self.config.sms_retry.enabled;
+
+        // Restart recovery: the in-flight ADDS Page correlation lives only
+        // in MscSmsCoordinator::pending (in-memory). Anything left in DB
+        // state `Paging` on a fresh boot was orphaned by the previous
+        // process and the retry sweep will skip it forever otherwise.
+        // Threshold is 2× the regular in-flight timeout so we don't fight
+        // with `expire_pending` over genuinely fresh attempts.
+        if sms_retry_enabled && let Some(smsc) = self.smsc.as_mut() {
+            smsc.recover_stuck_paging(Duration::from_secs(120)).await;
+        }
+
         loop {
             let delayed_wav_sleep = async {
                 let next_deadline = self.media.next_delayed_wav_deadline();
@@ -1977,7 +1988,7 @@ impl MscRuntime {
     }
 
     /// Routes an inbound ADDS message from the BSC to the SMS coordinator.
-    async fn handle_adds_message(&mut self, _a1: &dyn MscA1Endpoint, message: EncodedA1Message) {
+    async fn handle_adds_message(&mut self, a1: &dyn MscA1Endpoint, message: EncodedA1Message) {
         let smsc = match self.smsc.as_mut() {
             Some(s) => s,
             None => {
@@ -2010,7 +2021,7 @@ impl MscRuntime {
             }
             cdma_ios::MessageType::AddsTransfer => {
                 match cdma_ios::AddsTransferMessage::decode(&decoded.payload) {
-                    Ok(msg) => smsc.handle_adds_transfer(&msg).await,
+                    Ok(msg) => smsc.handle_adds_transfer(&msg, a1).await,
                     Err(e) => warn!("MSC: failed to decode ADDS Transfer: {e}"),
                 }
             }
@@ -2030,8 +2041,13 @@ impl MscRuntime {
                         let mobile_identity_esn = snapshot
                             .as_ref()
                             .and_then(|snap| snap.mobile_identity_esn.as_ref());
-                        smsc.handle_adds_deliver_mo(&msg, &mobile_identity, mobile_identity_esn)
-                            .await;
+                        smsc.handle_adds_deliver_mo(
+                            &msg,
+                            &mobile_identity,
+                            mobile_identity_esn,
+                            a1,
+                        )
+                        .await;
                     }
                     Err(e) => warn!("MSC: failed to decode ADDS Deliver (MO): {e}"),
                 }
@@ -2166,6 +2182,8 @@ impl MscRuntime {
                 text: welcome_cfg.text.clone(),
                 destination,
                 timeout_ms: 30_000,
+                teleservice_id: None,
+                raw_user_data: None,
             },
             a1,
         )

@@ -1,5 +1,5 @@
 {
-  "grpc_listen_addr": "127.0.0.1:17016",
+  "grpc_listen_addr": "0.0.0.0:17016",
   "tokio_console": false,
   "iq_capture_dir": "capture-iq-wav"
 }

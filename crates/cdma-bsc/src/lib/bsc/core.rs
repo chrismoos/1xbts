@@ -140,6 +140,14 @@ pub struct Bsc {
     pub(crate) traffic_signaling: TrafficSignalingService,
     pub(crate) traffic_bearer: TrafficBearerService,
     pub(crate) pending_a1_failure_after_release: Vec<(MsAddress, PendingAssignmentFailure)>,
+    /// SMS submissions parked on an SO6 traffic channel after the BTS
+    /// rejected the original F-PCH attempt. Keyed by walsh_code; consumed
+    /// on Service Connect Completion to re-deliver the SMS over F-DSCH.
+    pub(crate) pending_sms_escalations: std::collections::HashMap<u8, super::sms::PendingSmsAck>,
+    /// Per-MS FIFO of SMS waiting for the in-flight delivery to the same
+    /// destination to ack. Keyed by `format_ms_address` (MsAddress isn't Hash).
+    pub(crate) pending_sms_queue:
+        std::collections::HashMap<String, std::collections::VecDeque<SmsRequest>>,
 }
 
 impl Bsc {
@@ -176,6 +184,8 @@ impl Bsc {
             traffic_signaling: TrafficSignalingService::default(),
             traffic_bearer: TrafficBearerService::default(),
             pending_a1_failure_after_release: Vec::new(),
+            pending_sms_escalations: std::collections::HashMap::new(),
+            pending_sms_queue: std::collections::HashMap::new(),
         }
     }
 }

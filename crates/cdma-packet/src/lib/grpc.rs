@@ -14,11 +14,11 @@ use crate::ip_allocator::{IpAllocator, SubnetIpAllocator};
 use crate::ip_transport::IpTransportConfig;
 use crate::proto::packet_service_server::PacketService;
 use crate::proto::{
-    CloseSessionRequest, CloseSessionResponse, GetSessionStatusRequest, GetSessionStatusResponse,
-    ListSessionsRequest, ListSessionsResponse, OpenSessionRequest, OpenSessionResponse,
-    PacketSessionDetail, PacketSessionInfo, PacketTraceEvent as ProtoPacketTraceEvent,
-    SessionFrame, SetSchActiveRequest, SetSchActiveResponse, SetSessionCaptureRequest,
-    SetSessionCaptureResponse,
+    CloseSessionRequest, CloseSessionResponse, GetSessionByIpRequest, GetSessionByIpResponse,
+    GetSessionStatusRequest, GetSessionStatusResponse, ListSessionsRequest, ListSessionsResponse,
+    OpenSessionRequest, OpenSessionResponse, PacketSessionDetail, PacketSessionInfo,
+    PacketTraceEvent as ProtoPacketTraceEvent, SessionFrame, SetSchActiveRequest,
+    SetSchActiveResponse, SetSessionCaptureRequest, SetSessionCaptureResponse,
 };
 use crate::session_lifecycle::{NullSink, SessionLifecycleSink};
 use crate::session_task::{self, PppSessionStore, SessionControl, SessionMetadata, SessionStatus};
@@ -289,6 +289,18 @@ impl PacketServiceImpl {
         let mut status = entry.status.lock().unwrap();
         status.set_capture_enabled(enabled);
         Some(to_proto_session_detail(session_id, &status))
+    }
+
+    pub fn find_session_by_peer_ip(&self, peer_ip: &str) -> Option<PacketSessionInfo> {
+        let sessions = self.sessions.lock().unwrap();
+        for (id, entry) in sessions.iter() {
+            let status = entry.status.lock().unwrap();
+            let info = to_proto_session_info(id, &status);
+            if info.peer_ip == peer_ip {
+                return Some(info);
+            }
+        }
+        None
     }
 }
 
@@ -581,6 +593,15 @@ impl PacketService for PacketServiceImpl {
     ) -> Result<Response<ListSessionsResponse>, Status> {
         let sessions = self.list_all_sessions();
         Ok(Response::new(ListSessionsResponse { sessions }))
+    }
+
+    async fn get_session_by_ip(
+        &self,
+        request: Request<GetSessionByIpRequest>,
+    ) -> Result<Response<GetSessionByIpResponse>, Status> {
+        let peer_ip = request.into_inner().peer_ip;
+        let session = self.find_session_by_peer_ip(&peer_ip);
+        Ok(Response::new(GetSessionByIpResponse { session }))
     }
 
     async fn set_session_capture(

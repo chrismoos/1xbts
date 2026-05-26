@@ -5,14 +5,60 @@
 
 use crate::bits::Bitstream;
 
-/// Encode an SMS Deliver message as C.S0015-B Transport Layer bytes.
+/// C.S0015-B Teleservice Identifier for plain text SMS (WMT, CMT-95).
+pub const TELESERVICE_WMT: u16 = 0x1002;
+
+/// C.S0015-B / WAP-259 Teleservice Identifier for Wireless Application
+/// Protocol (WDP datagrams per WAP-259 §6.5).
+pub const TELESERVICE_WAP: u16 = 0x1004;
+
+/// MSG_ENCODING values for the User Data subparameter (C.S0015-B 4.5.2).
+mod msg_encoding {
+    pub const OCTET: u8 = 0x00;
+    pub const IS91_EXT: u8 = 0x01;
+    pub const ASCII_7BIT: u8 = 0x02;
+    pub const IA5: u8 = 0x03;
+    pub const UNICODE: u8 = 0x04;
+    pub const SHIFT_JIS: u8 = 0x05;
+    pub const KOREAN: u8 = 0x06;
+    pub const LATIN_HEBREW: u8 = 0x07;
+    pub const LATIN: u8 = 0x08;
+    pub const GSM_7BIT: u8 = 0x09;
+    pub const GSM_DCS: u8 = 0x0A;
+}
+
+/// Bearer-data User Data payload for the MT SMS encoder.
+#[derive(Debug, Clone)]
+pub enum UserData {
+    /// C.R1001 7-bit ASCII (MSG_ENCODING = 0x02). NUM_FIELDS = char count.
+    Ascii7(String),
+    /// Octet/binary payload (MSG_ENCODING = 0x00). NUM_FIELDS = byte count.
+    Octet(Vec<u8>),
+}
+
+/// Encode a plain text SMS Deliver message as C.S0015-B Transport Layer
+/// bytes (teleservice WMT, 7-bit ASCII).
 ///
-/// MVP constraints:
-///   - Originating addresses are encoded as 4-bit DTMF when possible, otherwise
-///     as DIGIT_MODE=1 / NUMBER_MODE=0 / 8-bit ASCII per C.S0015-B 3.4.3.3.
-///   - No Bearer Reply Option -- delivery is unconfirmed (see MVP Scope).
-///   - 7-bit ASCII user data encoding (MSG_ENCODING=0x02).
+/// Originating addresses are encoded as 4-bit DTMF when possible,
+/// otherwise as DIGIT_MODE=1 / NUMBER_MODE=0 / 8-bit ASCII per
+/// C.S0015-B §3.4.3.3. No Bearer Reply Option (delivery unconfirmed).
 pub fn encode_sms_deliver(originating_number: &str, text: &str, message_id: u16) -> Vec<u8> {
+    encode_sms_deliver_typed(
+        originating_number,
+        TELESERVICE_WMT,
+        &UserData::Ascii7(text.to_string()),
+        message_id,
+    )
+}
+
+/// Encode an SMS Deliver message with an explicit teleservice and
+/// user-data encoding.
+pub fn encode_sms_deliver_typed(
+    originating_number: &str,
+    teleservice_id: u16,
+    user_data: &UserData,
+    message_id: u16,
+) -> Vec<u8> {
     let mut buf = Vec::new();
 
     // Transport Layer MSG_TYPE = 0x00 (point-to-point)
@@ -21,14 +67,14 @@ pub fn encode_sms_deliver(originating_number: &str, text: &str, message_id: u16)
     // Teleservice Identifier parameter (tag=0x00)
     buf.push(0x00); // tag
     buf.push(0x02); // len
-    buf.push(0x10); // TELESERVICE_ID high byte (0x1002 = WMT)
-    buf.push(0x02); // TELESERVICE_ID low byte
+    buf.push((teleservice_id >> 8) as u8);
+    buf.push(teleservice_id as u8);
 
     // Originating Address parameter (tag=0x02)
     encode_originating_address(&mut buf, originating_number);
 
     // Bearer Data parameter (tag=0x08)
-    encode_bearer_data(&mut buf, text, message_id);
+    encode_bearer_data(&mut buf, user_data, message_id);
 
     buf
 }
@@ -93,7 +139,7 @@ fn encode_originating_address(buf: &mut Vec<u8>, number: &str) {
     buf.extend_from_slice(&bytes);
 }
 
-fn encode_bearer_data(buf: &mut Vec<u8>, text: &str, message_id: u16) {
+fn encode_bearer_data(buf: &mut Vec<u8>, user_data: &UserData, message_id: u16) {
     let mut bearer = Vec::new();
 
     // Message Identifier sub-parameter (tag=0x00)
@@ -109,12 +155,22 @@ fn encode_bearer_data(buf: &mut Vec<u8>, text: &str, message_id: u16) {
     bearer.extend_from_slice(&id_bytes);
 
     // User Data sub-parameter (tag=0x01)
-    // MSG_ENCODING=0x02 (7-bit ASCII), NUM_FIELDS, then 7-bit chars
     let mut ud = Bitstream::new();
-    ud.write_u8(0x02, 5); // MSG_ENCODING = 7-bit ASCII
-    ud.write_u8(text.len() as u8, 8);
-    for &b in text.as_bytes() {
-        ud.write_u8(b & 0x7F, 7);
+    match user_data {
+        UserData::Ascii7(text) => {
+            ud.write_u8(msg_encoding::ASCII_7BIT, 5);
+            ud.write_u8(text.len() as u8, 8); // NUM_FIELDS = char count
+            for &b in text.as_bytes() {
+                ud.write_u8(b & 0x7F, 7);
+            }
+        }
+        UserData::Octet(bytes) => {
+            ud.write_u8(msg_encoding::OCTET, 5);
+            ud.write_u8(bytes.len() as u8, 8); // NUM_FIELDS = byte count
+            for &b in bytes {
+                ud.write_u8(b, 8);
+            }
+        }
     }
     let remainder = ud.len() % 8;
     if remainder != 0 {
@@ -199,8 +255,12 @@ pub struct DecodedMoSms {
     pub message_type: u8,
     /// Message identifier from the bearer data.
     pub message_id: u16,
-    /// Decoded user data text (CDMA ASCII, GSM 7-bit, Unicode, or 8-bit best effort).
+    /// Decoded user data text. Empty for non-text MSG_ENCODINGs (octet,
+    /// WAP Push, etc.).
     pub text: String,
+    /// Raw CHARi byte payload when MSG_ENCODING is octet-style (e.g.
+    /// 0x00 for WAP Push). Empty for text encodings.
+    pub user_data: Vec<u8>,
     /// Raw bearer data bytes for passthrough if needed.
     pub raw_bearer_data: Vec<u8>,
     /// Bearer Reply Option REPLY_SEQ, if present (tag 0x06).
@@ -221,8 +281,12 @@ pub struct DecodedMtSms {
     pub message_type: u8,
     /// Message identifier from the bearer data. Zero for cause codes.
     pub message_id: u16,
-    /// Decoded user data text. Empty for cause codes.
+    /// Decoded user data text. Empty for cause codes and for non-text
+    /// MSG_ENCODINGs (octet, WAP Push, etc.).
     pub text: String,
+    /// Raw CHARi byte payload when MSG_ENCODING is octet-style (e.g.
+    /// 0x00 for WAP Push). Empty for text encodings and cause codes.
+    pub user_data: Vec<u8>,
     /// For cause codes: REPLY_SEQ.
     pub reply_seq: Option<u8>,
     /// For cause codes: ERROR_CLASS.
@@ -251,6 +315,7 @@ pub fn decode_mt_sms(data: &[u8]) -> Option<DecodedMtSms> {
                 message_type: 0,
                 message_id: 0,
                 text: String::new(),
+                user_data: Vec::new(),
                 reply_seq: Some(reply_seq),
                 error_class: Some(error_class),
             });
@@ -297,6 +362,7 @@ pub fn decode_mt_sms(data: &[u8]) -> Option<DecodedMtSms> {
     let mut message_type_bd: u8 = 0;
     let mut message_id: u16 = 0;
     let mut text = String::new();
+    let mut user_data: Vec<u8> = Vec::new();
 
     let mut bpos = 0;
     while bpos + 2 <= raw_bearer_data.len() {
@@ -322,7 +388,9 @@ pub fn decode_mt_sms(data: &[u8]) -> Option<DecodedMtSms> {
             }
             0x01 => {
                 if sub_value.len() >= 2 {
-                    text = decode_user_data_subparameter(sub_value);
+                    let (t, ud) = decode_user_data_subparameter(sub_value);
+                    text = t;
+                    user_data = ud;
                 }
             }
             _ => {}
@@ -336,6 +404,7 @@ pub fn decode_mt_sms(data: &[u8]) -> Option<DecodedMtSms> {
         message_type: message_type_bd,
         message_id,
         text,
+        user_data,
         reply_seq: None,
         error_class: None,
     })
@@ -408,6 +477,7 @@ pub fn decode_mo_sms(data: &[u8]) -> Option<DecodedMoSms> {
     let mut message_type_bd: u8 = 0;
     let mut message_id: u16 = 0;
     let mut text = String::new();
+    let mut user_data: Vec<u8> = Vec::new();
 
     let mut bpos = 0;
     while bpos + 2 <= raw_bearer_data.len() {
@@ -435,7 +505,9 @@ pub fn decode_mo_sms(data: &[u8]) -> Option<DecodedMoSms> {
             0x01 => {
                 // User Data: MSG_ENCODING(5) + NUM_FIELDS(8) + CHARi(variable)
                 if sub_value.len() >= 2 {
-                    text = decode_user_data_subparameter(sub_value);
+                    let (t, ud) = decode_user_data_subparameter(sub_value);
+                    text = t;
+                    user_data = ud;
                 }
             }
             _ => {}
@@ -448,6 +520,7 @@ pub fn decode_mo_sms(data: &[u8]) -> Option<DecodedMoSms> {
         message_type: message_type_bd,
         message_id,
         text,
+        user_data,
         raw_bearer_data,
         reply_seq,
     })
@@ -526,18 +599,22 @@ fn decode_address(data: &[u8]) -> String {
 ///
 /// C.S0015-B 4.5.2 defines MSG_ENCODING(5), optional MESSAGE_TYPE(8) for
 /// IS-91 extended protocol and GSM DCS encodings, NUM_FIELDS(8), then CHARi.
-fn decode_user_data_subparameter(data: &[u8]) -> String {
+///
+/// Returns `(text, octet_payload)`. Text encodings populate `text` and
+/// leave the payload empty; octet encodings (0x00, 0x01, 0x05/0x06,
+/// unknown) populate `octet_payload` and leave `text` empty.
+fn decode_user_data_subparameter(data: &[u8]) -> (String, Vec<u8>) {
     let bs = Bitstream::new_bytes(data);
     let bits = bs.bits();
     if bits.len() < 13 {
-        return String::new();
+        return (String::new(), Vec::new());
     }
 
     let msg_encoding = bits_to_u8(&bits[0..5]);
     let mut offset = 5;
     let encoding_message_type = if matches!(msg_encoding, 0x01 | 0x0A) {
         if offset + 8 > bits.len() {
-            return String::new();
+            return (String::new(), Vec::new());
         }
         let message_type = bits_to_u8(&bits[offset..offset + 8]);
         offset += 8;
@@ -547,17 +624,33 @@ fn decode_user_data_subparameter(data: &[u8]) -> String {
     };
 
     if offset + 8 > bits.len() {
-        return String::new();
+        return (String::new(), Vec::new());
     }
     let num_fields = bits_to_u8(&bits[offset..offset + 8]);
     offset += 8;
 
-    decode_user_data(
+    let payload_bits = &bits[offset..];
+    use msg_encoding::*;
+    let is_text_encoding = matches!(
         msg_encoding,
-        encoding_message_type,
-        num_fields,
-        &bits[offset..],
-    )
+        ASCII_7BIT | IA5 | UNICODE | LATIN_HEBREW | LATIN | GSM_7BIT | GSM_DCS,
+    );
+    if is_text_encoding {
+        (
+            decode_user_data(
+                msg_encoding,
+                encoding_message_type,
+                num_fields,
+                payload_bits,
+            ),
+            Vec::new(),
+        )
+    } else {
+        (
+            String::new(),
+            read_octets(payload_bits, num_fields as usize),
+        )
+    }
 }
 
 /// Decode user data text from CHARi bits based on MSG_ENCODING.
@@ -567,51 +660,28 @@ pub(crate) fn decode_user_data(
     num_fields: u8,
     bits: &[u8],
 ) -> String {
+    use msg_encoding::*;
     match msg_encoding {
-        0x00 => {
-            // Octet, unspecified: treat CHARi as bytes and render as UTF-8 best effort.
+        OCTET | IS91_EXT => {
+            // CHARi as bytes, rendered as UTF-8 best effort.
             decode_octet_user_data(num_fields, bits)
         }
-        0x01 => {
-            // IS-91 Extended Protocol Message. MESSAGE_TYPE was consumed by
-            // decode_user_data_subparameter; expose printable octets best effort.
+        ASCII_7BIT | IA5 => decode_msb_7bit_user_data(num_fields, bits),
+        UNICODE => decode_unicode_user_data(num_fields, bits),
+        SHIFT_JIS | KOREAN => {
+            // No stdlib decoder; preserve printable ASCII, lossy elsewhere.
             decode_octet_user_data(num_fields, bits)
         }
-        0x02 => {
-            // C.R1001 7-bit ASCII.
-            decode_msb_7bit_user_data(num_fields, bits)
-        }
-        0x03 => {
-            // IA5 is a 7-bit coded character set.
-            decode_msb_7bit_user_data(num_fields, bits)
-        }
-        0x04 => {
-            // Unicode (16-bit)
-            decode_unicode_user_data(num_fields, bits)
-        }
-        0x05 | 0x06 => {
-            // Shift-JIS and Korean use NUM_FIELDS as byte length per C.S0015-B.
-            // The standard library has no decoder for these; preserve printable
-            // ASCII and use UTF-8 replacement for non-UTF-8 byte sequences.
-            decode_octet_user_data(num_fields, bits)
-        }
-        0x07 | 0x08 => {
-            // Latin/Hebrew and Latin are 8-bit character sets.
-            decode_latin1_user_data(num_fields, bits)
-        }
-        0x09 => {
-            // GSM 7-bit default alphabet. These septets are packed LSB-first
-            // inside the CHARi octets per 3GPP TS 23.038.
+        LATIN_HEBREW | LATIN => decode_latin1_user_data(num_fields, bits),
+        GSM_7BIT => {
+            // Septets packed LSB-first inside CHARi per 3GPP TS 23.038.
             decode_gsm7_user_data(num_fields, bits)
         }
-        0x0A => {
-            // GSM Data-Coding-Scheme. MESSAGE_TYPE carries the SMS DCS.
+        GSM_DCS => {
+            // MESSAGE_TYPE carries the SMS Data-Coding-Scheme.
             decode_gsm_dcs_user_data(encoding_message_type.unwrap_or(0), num_fields, bits)
         }
-        _ => {
-            // Octet / unknown — extract as 8-bit bytes, render as lossy UTF-8
-            decode_octet_user_data(num_fields, bits)
-        }
+        _ => decode_octet_user_data(num_fields, bits),
     }
 }
 
@@ -858,6 +928,73 @@ mod tests {
     }
 
     #[test]
+    fn test_encode_sms_deliver_wap_push_octet() {
+        // Synthetic WAP Push PDU with binary bytes that aren't valid 7-bit
+        // ASCII — picks up any accidental 7-bit truncation in the encoder.
+        let pdu: Vec<u8> = vec![0x01, 0x06, 0x03, 0xAE, 0x84, 0xB4, 0x86, 0xC3, 0x95];
+        let bytes =
+            encode_sms_deliver_typed("1234", TELESERVICE_WAP, &UserData::Octet(pdu.clone()), 7);
+
+        // Teleservice ID is the first TLV after the transport MSG_TYPE.
+        assert_eq!(bytes[0], 0x00, "MSG_TYPE should be point-to-point");
+        assert_eq!(bytes[1], 0x00, "Teleservice tag");
+        assert_eq!(bytes[2], 0x02, "Teleservice len");
+        assert_eq!(bytes[3], 0x10, "Teleservice high (0x1004)");
+        assert_eq!(bytes[4], 0x04, "Teleservice low (0x1004)");
+
+        // Walk past Originating Address to find Bearer Data TLV.
+        let bd_pos = bytes
+            .iter()
+            .position(|&b| b == 0x08)
+            .expect("bearer data tag must be present");
+        let bd_len = bytes[bd_pos + 1] as usize;
+        let bearer = &bytes[bd_pos + 2..bd_pos + 2 + bd_len];
+
+        // Locate the User Data sub-parameter (sub-tag 0x01).
+        let mut bp = 0;
+        let mut ud_value: Option<&[u8]> = None;
+        while bp + 2 <= bearer.len() {
+            let st = bearer[bp];
+            let sl = bearer[bp + 1] as usize;
+            bp += 2;
+            if bp + sl > bearer.len() {
+                break;
+            }
+            if st == 0x01 {
+                ud_value = Some(&bearer[bp..bp + sl]);
+                break;
+            }
+            bp += sl;
+        }
+        let ud = ud_value.expect("User Data subparameter must be present");
+
+        // MSG_ENCODING(5) + NUM_FIELDS(8) + octets. Read bits-precisely.
+        let bs = Bitstream::new_bytes(ud);
+        let bits = bs.bits();
+        assert!(bits.len() >= 13 + 8 * pdu.len());
+        assert_eq!(bits_to_u8(&bits[0..5]), 0x00, "MSG_ENCODING octet");
+        assert_eq!(bits_to_u8(&bits[5..13]) as usize, pdu.len(), "NUM_FIELDS");
+        for (i, expected) in pdu.iter().enumerate() {
+            let off = 13 + i * 8;
+            assert_eq!(
+                bits_to_u8(&bits[off..off + 8]),
+                *expected,
+                "octet {i} should round-trip"
+            );
+        }
+
+        // Full decode also reflects the new teleservice and surfaces the
+        // raw octet payload so the BSC event stream can carry it to the UI.
+        let decoded = decode_mt_sms(&bytes).expect("encoded SMS should decode");
+        assert_eq!(decoded.teleservice_id, TELESERVICE_WAP);
+        assert!(
+            decoded.text.is_empty(),
+            "octet encoding should not produce text"
+        );
+        assert_eq!(decoded.user_data, pdu);
+    }
+
+    #[test]
     fn mt_sms_data_burst_sdu_roundtrips_non_byte_aligned_text() {
         for expected in ["test", "test1", "test2"] {
             let fields = encode_sms_deliver("5551234", expected, 1);
@@ -957,7 +1094,12 @@ mod tests {
         }
 
         let sub_value = bitstream_to_packed_bytes(&ud_bs);
-        assert_eq!(decode_user_data_subparameter(&sub_value), "Hi");
+        let (text, octets) = decode_user_data_subparameter(&sub_value);
+        assert_eq!(text, "Hi");
+        assert!(
+            octets.is_empty(),
+            "ASCII encoding should not emit octet payload"
+        );
     }
 
     #[test]

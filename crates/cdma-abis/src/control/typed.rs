@@ -3180,9 +3180,20 @@ fn validate_bts_setup_ack_cause(cause: u8) -> Result<u8> {
     Ok(cause)
 }
 
+/// `PchMessageTransferAck` cause values (TIA-828-A §6.2.4).
+pub mod pch_message_transfer_ack_cause {
+    /// OAM&P intervention.
+    pub const OAMP_INTERVENTION: u8 = 0x07;
+    /// Equipment failure.
+    pub const EQUIPMENT_FAILURE: u8 = 0x20;
+    /// SMS message too long for delivery on the paging channel.
+    pub const SMS_MESSAGE_TOO_LONG: u8 = 0x71;
+}
+
 fn validate_pch_message_transfer_ack_cause(cause: u8) -> Result<u8> {
+    use pch_message_transfer_ack_cause::*;
     match cause {
-        0x07 | 0x20 | 0x71 => Ok(cause),
+        OAMP_INTERVENTION | EQUIPMENT_FAILURE | SMS_MESSAGE_TOO_LONG => Ok(cause),
         other => Err(Error::ReservedValue {
             context: "Abis-PCH Msg Transfer Ack cause",
             value: other,

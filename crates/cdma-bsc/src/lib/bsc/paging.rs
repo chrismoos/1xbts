@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use cdma_abis::control::typed::pch_message_transfer_ack_cause::SMS_MESSAGE_TOO_LONG;
 use cdma_common::consts::{SR1_CHIP_RATE_HZ, SR1_CHIPS_PER_80MS};
 use cdma_common::error::Error;
 use cdma_common::lac::MessageControlStatusBlock;
@@ -476,6 +477,13 @@ impl PagingState {
         self.pending_page.is_some()
     }
 
+    /// Is there a pending SMS page in flight to this specific MS?
+    pub(crate) fn pending_sms_page_for_address(&self, addr: &MsAddress) -> bool {
+        self.pending_page
+            .as_ref()
+            .is_some_and(|p| p.fwd_address == *addr)
+    }
+
     pub(crate) fn has_pending_voice_page(&self) -> bool {
         self.pending_voice_page.is_some()
     }
@@ -698,12 +706,12 @@ impl Bsc {
         PagingSlotPlanner::new(self.config.overhead.max_slot_cycle_index)
     }
 
-    pub(crate) fn drain_pch_transfer_acks(&mut self) {
-        let Some(ref bts_client) = self.config.bts_client else {
+    pub(crate) async fn drain_pch_transfer_acks(&mut self) {
+        let Some(bts_client) = self.config.bts_client.clone() else {
             return;
         };
         for ack in bts_client.drain_pch_transfer_acks() {
-            self.handle_pch_transfer_ack(ack);
+            self.handle_pch_transfer_ack(ack).await;
         }
     }
 
@@ -756,7 +764,7 @@ impl Bsc {
         });
     }
 
-    pub(crate) fn handle_pch_transfer_ack(&mut self, ack: PchTransferAckEvent) {
+    pub(crate) async fn handle_pch_transfer_ack(&mut self, ack: PchTransferAckEvent) {
         let Some(correlation_id) = ack.correlation_id else {
             debug!(
                 "BSC: ignoring PchMsgTransferAck without correlation_id cause={:?} bts_l2_termination={:?}",
@@ -803,8 +811,18 @@ impl Bsc {
                     }
                     self.mobiles.mark_registered(&pending.addr);
                     self.publish_mobiles();
+                    let addr = pending.addr.clone();
+                    self.dispatch_next_queued_sms_for(&addr);
                 }
             }
+            return;
+        }
+
+        // Oversized SMS: set up an SO6 traffic channel and re-deliver on
+        // F-DSCH instead of failing.
+        if ack.cause == Some(SMS_MESSAGE_TOO_LONG)
+            && self.try_escalate_oversized_sms_to_so6(correlation_id).await
+        {
             return;
         }
 
@@ -828,6 +846,8 @@ impl Bsc {
                 self.mobiles
                     .set_state(&pending.fwd_address, MsState::Registered);
                 self.publish_mobiles();
+                let addr = pending.fwd_address.clone();
+                self.dispatch_next_queued_sms_for(&addr);
                 return;
             }
             if let Some(pending) = self.paging.take_voice_page_by_correlation(correlation_id) {
@@ -872,6 +892,8 @@ impl Bsc {
                     }
                     self.mobiles.mark_registered(&pending.addr);
                     self.publish_mobiles();
+                    let addr = pending.addr.clone();
+                    self.dispatch_next_queued_sms_for(&addr);
                 }
             }
             return;

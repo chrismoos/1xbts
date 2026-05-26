@@ -13,6 +13,11 @@ service PacketService {
   rpc GetSessionStatus(GetSessionStatusRequest) returns (GetSessionStatusResponse);
   // Lists known packet sessions.
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  // Looks up one active packet session by its assigned mobile (peer) IP.
+  // Used by the edge MSISDN resolver in fou-nat to attribute inbound HTTP
+  // requests to a subscriber. Returns the session summary, or an unset
+  // `session` field when no active session has that peer_ip.
+  rpc GetSessionByIp(GetSessionByIpRequest) returns (GetSessionByIpResponse);
   // Enables or disables per-session packet trace capture.
   rpc SetSessionCapture(SetSessionCaptureRequest) returns (SetSessionCaptureResponse);
   // Enables or disables F-SCH downlink frame generation on a running session.
@@ -82,6 +87,18 @@ message GetSessionStatusResponse {
 
 // Request to list packet sessions.
 message ListSessionsRequest {}
+
+// Selects one packet session by its mobile-side IP address.
+message GetSessionByIpRequest {
+  // Mobile (peer) IP address as the engine reports it, e.g. "10.55.0.2".
+  string peer_ip = 1;
+}
+
+// Response carrying the matching session summary, if any.
+message GetSessionByIpResponse {
+  // Set when an active session matches `peer_ip`; unset on miss.
+  PacketSessionInfo session = 1;
+}
 
 // List of packet session summaries.
 message ListSessionsResponse {

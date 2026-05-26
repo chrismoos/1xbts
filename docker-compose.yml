@@ -43,7 +43,8 @@ services:
 
   fou-nat:
     build:
-      context: ./docker/fou-nat
+      context: .
+      dockerfile: docker/fou-nat/Dockerfile
     container_name: 1xbts-fou-nat
     depends_on:
       - speedtest
@@ -64,8 +65,42 @@ services:
       SPEEDTEST_UPSTREAM: "http://speedtest:5656"
       LOCAL_DNS_ZONE: "local.1xbts.org"
       UNBOUND_FORWARD_ADDRS: ${UNBOUND_FORWARD_ADDRS:-8.8.8.8}
+      # Used by the edge-resolver sidecar to look up subscriber MSISDN
+      # via the BSC's PdsnManagementService facade for the X-1xBTS-MSISDN
+      # header it injects into MMSC traffic.
+      MGMT_GRPC_ADDR: "${MGMT_GRPC_ADDR:-host.docker.internal:17016}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  # Optional MMS profile: enable with `docker compose --profile mms up`.
+  # Runs Mbuni MMSC + the in-tree smsc-bridge in one container. Reachable
+  # from mobiles at http://mmsc.local.1xbts.org/ via the captive DNS in
+  # fou-nat (which forwards local.1xbts.org to docker's embedded DNS).
+  mbuni:
+    build:
+      context: .
+      dockerfile: docker/mbuni/Dockerfile
+    container_name: 1xbts-mbuni
+    profiles: ["mms"]
+    networks:
+      default:
+        aliases:
+          - mmsc.local.1xbts.org
+    environment:
+      MMSC_HOSTNAME: "mmsc.local.1xbts.org"
+      MMSC_PORT: "80"
+      BRIDGE_BIND_ADDR: "127.0.0.1:8081"
+      MSC_GRPC_ADDR: "${MSC_GRPC_ADDR:-host.docker.internal:17017}"
+    depends_on:
+      - fou-nat
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - mbuni-store:/var/spool/mbuni
     restart: unless-stopped
 
 volumes:
   postgres-data:
   1xbts-web-node-modules:
+  mbuni-store:

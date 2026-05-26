@@ -1,0 +1,14 @@
+# Keep the build context smaller.
+
+target/
+**/target/
+.worktrees/
+1xbts-web/node_modules/
+1xbts-web/.next/
+test/capture/
+test/iq/
+docs/
+.git/
+.idea/
+.vscode/
+*.log

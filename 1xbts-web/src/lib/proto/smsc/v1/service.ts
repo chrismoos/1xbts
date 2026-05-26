@@ -34,7 +34,22 @@ export interface SmsSubmission {
     | number
     | undefined;
   /** set when targeting by IMSI/IMSI_S digits */
-  destinationImsi?: string | undefined;
+  destinationImsi?:
+    | string
+    | undefined;
+  /**
+   * C.S0015-B teleservice ID. Defaults to 0x1002 (WMT) when not set.
+   * 0x1004 (CATPT) selects WAP Push delivery used by MMS M-Notification.ind.
+   */
+  teleserviceId?:
+    | number
+    | undefined;
+  /**
+   * Opaque User Data bytes (MSG_ENCODING=0x00 octet). When set, the BSC
+   * emits these bytes verbatim as the bearer-data User Data sub-parameter
+   * and ignores `text`. Used to carry WAP Push PDUs end to end.
+   */
+  rawUserData?: Uint8Array | undefined;
 }
 
 /** One delivery attempt for an SMS submission. */
@@ -71,7 +86,18 @@ export interface CreateSmsSubmissionRequest {
   originatingSubscriberId?: string | undefined;
   destinationSubscriberId?: string | undefined;
   destinationEsn?: number | undefined;
-  destinationImsi?: string | undefined;
+  destinationImsi?:
+    | string
+    | undefined;
+  /** C.S0015-B teleservice ID. Defaults to 0x1002 (WMT) when absent. */
+  teleserviceId?:
+    | number
+    | undefined;
+  /**
+   * Opaque User Data bytes for non-text teleservices (e.g. 0x1004 WAP Push
+   * carrying an MMS M-Notification.ind PDU). When set, `text` is ignored.
+   */
+  rawUserData?: Uint8Array | undefined;
 }
 
 /** Created SMS submission. */
@@ -125,6 +151,7 @@ export interface ListSmsSubmissionsRequest {
   state?: string | undefined;
   destinationEsn?: number | undefined;
   destinationImsi?: string | undefined;
+  originatingNumber?: string | undefined;
 }
 
 /** SMS submission list page and total count. */
@@ -177,6 +204,8 @@ function createBaseSmsSubmission(): SmsSubmission {
     updatedAt: undefined,
     destinationEsn: undefined,
     destinationImsi: undefined,
+    teleserviceId: undefined,
+    rawUserData: undefined,
   };
 }
 
@@ -217,6 +246,12 @@ export const SmsSubmission: MessageFns<SmsSubmission> = {
     }
     if (message.destinationImsi !== undefined) {
       writer.uint32(98).string(message.destinationImsi);
+    }
+    if (message.teleserviceId !== undefined) {
+      writer.uint32(104).uint32(message.teleserviceId);
+    }
+    if (message.rawUserData !== undefined) {
+      writer.uint32(114).bytes(message.rawUserData);
     }
     return writer;
   },
@@ -324,6 +359,22 @@ export const SmsSubmission: MessageFns<SmsSubmission> = {
           message.destinationImsi = reader.string();
           continue;
         }
+        case 13: {
+          if (tag !== 104) {
+            break;
+          }
+
+          message.teleserviceId = reader.uint32();
+          continue;
+        }
+        case 14: {
+          if (tag !== 114) {
+            break;
+          }
+
+          message.rawUserData = reader.bytes();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -387,6 +438,16 @@ export const SmsSubmission: MessageFns<SmsSubmission> = {
         : isSet(object.destination_imsi)
         ? globalThis.String(object.destination_imsi)
         : undefined,
+      teleserviceId: isSet(object.teleserviceId)
+        ? globalThis.Number(object.teleserviceId)
+        : isSet(object.teleservice_id)
+        ? globalThis.Number(object.teleservice_id)
+        : undefined,
+      rawUserData: isSet(object.rawUserData)
+        ? bytesFromBase64(object.rawUserData)
+        : isSet(object.raw_user_data)
+        ? bytesFromBase64(object.raw_user_data)
+        : undefined,
     };
   },
 
@@ -428,6 +489,12 @@ export const SmsSubmission: MessageFns<SmsSubmission> = {
     if (message.destinationImsi !== undefined) {
       obj.destinationImsi = message.destinationImsi;
     }
+    if (message.teleserviceId !== undefined) {
+      obj.teleserviceId = Math.round(message.teleserviceId);
+    }
+    if (message.rawUserData !== undefined) {
+      obj.rawUserData = base64FromBytes(message.rawUserData);
+    }
     return obj;
   },
 
@@ -448,6 +515,8 @@ export const SmsSubmission: MessageFns<SmsSubmission> = {
     message.updatedAt = object.updatedAt ?? undefined;
     message.destinationEsn = object.destinationEsn ?? undefined;
     message.destinationImsi = object.destinationImsi ?? undefined;
+    message.teleserviceId = object.teleserviceId ?? undefined;
+    message.rawUserData = object.rawUserData ?? undefined;
     return message;
   },
 };
@@ -816,6 +885,8 @@ function createBaseCreateSmsSubmissionRequest(): CreateSmsSubmissionRequest {
     destinationSubscriberId: undefined,
     destinationEsn: undefined,
     destinationImsi: undefined,
+    teleserviceId: undefined,
+    rawUserData: undefined,
   };
 }
 
@@ -841,6 +912,12 @@ export const CreateSmsSubmissionRequest: MessageFns<CreateSmsSubmissionRequest> 
     }
     if (message.destinationImsi !== undefined) {
       writer.uint32(58).string(message.destinationImsi);
+    }
+    if (message.teleserviceId !== undefined) {
+      writer.uint32(64).uint32(message.teleserviceId);
+    }
+    if (message.rawUserData !== undefined) {
+      writer.uint32(74).bytes(message.rawUserData);
     }
     return writer;
   },
@@ -908,6 +985,22 @@ export const CreateSmsSubmissionRequest: MessageFns<CreateSmsSubmissionRequest> 
           message.destinationImsi = reader.string();
           continue;
         }
+        case 8: {
+          if (tag !== 64) {
+            break;
+          }
+
+          message.teleserviceId = reader.uint32();
+          continue;
+        }
+        case 9: {
+          if (tag !== 74) {
+            break;
+          }
+
+          message.rawUserData = reader.bytes();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -950,6 +1043,16 @@ export const CreateSmsSubmissionRequest: MessageFns<CreateSmsSubmissionRequest> 
         : isSet(object.destination_imsi)
         ? globalThis.String(object.destination_imsi)
         : undefined,
+      teleserviceId: isSet(object.teleserviceId)
+        ? globalThis.Number(object.teleserviceId)
+        : isSet(object.teleservice_id)
+        ? globalThis.Number(object.teleservice_id)
+        : undefined,
+      rawUserData: isSet(object.rawUserData)
+        ? bytesFromBase64(object.rawUserData)
+        : isSet(object.raw_user_data)
+        ? bytesFromBase64(object.raw_user_data)
+        : undefined,
     };
   },
 
@@ -976,6 +1079,12 @@ export const CreateSmsSubmissionRequest: MessageFns<CreateSmsSubmissionRequest> 
     if (message.destinationImsi !== undefined) {
       obj.destinationImsi = message.destinationImsi;
     }
+    if (message.teleserviceId !== undefined) {
+      obj.teleserviceId = Math.round(message.teleserviceId);
+    }
+    if (message.rawUserData !== undefined) {
+      obj.rawUserData = base64FromBytes(message.rawUserData);
+    }
     return obj;
   },
 
@@ -991,6 +1100,8 @@ export const CreateSmsSubmissionRequest: MessageFns<CreateSmsSubmissionRequest> 
     message.destinationSubscriberId = object.destinationSubscriberId ?? undefined;
     message.destinationEsn = object.destinationEsn ?? undefined;
     message.destinationImsi = object.destinationImsi ?? undefined;
+    message.teleserviceId = object.teleserviceId ?? undefined;
+    message.rawUserData = object.rawUserData ?? undefined;
     return message;
   },
 };
@@ -1612,6 +1723,7 @@ function createBaseListSmsSubmissionsRequest(): ListSmsSubmissionsRequest {
     state: undefined,
     destinationEsn: undefined,
     destinationImsi: undefined,
+    originatingNumber: undefined,
   };
 }
 
@@ -1634,6 +1746,9 @@ export const ListSmsSubmissionsRequest: MessageFns<ListSmsSubmissionsRequest> = 
     }
     if (message.destinationImsi !== undefined) {
       writer.uint32(50).string(message.destinationImsi);
+    }
+    if (message.originatingNumber !== undefined) {
+      writer.uint32(58).string(message.originatingNumber);
     }
     return writer;
   },
@@ -1693,6 +1808,14 @@ export const ListSmsSubmissionsRequest: MessageFns<ListSmsSubmissionsRequest> = 
           message.destinationImsi = reader.string();
           continue;
         }
+        case 7: {
+          if (tag !== 58) {
+            break;
+          }
+
+          message.originatingNumber = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1722,6 +1845,11 @@ export const ListSmsSubmissionsRequest: MessageFns<ListSmsSubmissionsRequest> = 
         : isSet(object.destination_imsi)
         ? globalThis.String(object.destination_imsi)
         : undefined,
+      originatingNumber: isSet(object.originatingNumber)
+        ? globalThis.String(object.originatingNumber)
+        : isSet(object.originating_number)
+        ? globalThis.String(object.originating_number)
+        : undefined,
     };
   },
 
@@ -1745,6 +1873,9 @@ export const ListSmsSubmissionsRequest: MessageFns<ListSmsSubmissionsRequest> = 
     if (message.destinationImsi !== undefined) {
       obj.destinationImsi = message.destinationImsi;
     }
+    if (message.originatingNumber !== undefined) {
+      obj.originatingNumber = message.originatingNumber;
+    }
     return obj;
   },
 
@@ -1759,6 +1890,7 @@ export const ListSmsSubmissionsRequest: MessageFns<ListSmsSubmissionsRequest> = 
     message.state = object.state ?? undefined;
     message.destinationEsn = object.destinationEsn ?? undefined;
     message.destinationImsi = object.destinationImsi ?? undefined;
+    message.originatingNumber = object.originatingNumber ?? undefined;
     return message;
   },
 };
@@ -2394,6 +2526,31 @@ export interface SmscServiceClient<CallOptionsExt = {}> {
     request: DeepPartial<UpdateDestinationSubscriberRequest>,
     options?: CallOptions & CallOptionsExt,
   ): Promise<Empty>;
+}
+
+function bytesFromBase64(b64: string): Uint8Array {
+  if ((globalThis as any).Buffer) {
+    return Uint8Array.from(globalThis.Buffer.from(b64, "base64"));
+  } else {
+    const bin = globalThis.atob(b64);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; ++i) {
+      arr[i] = bin.charCodeAt(i);
+    }
+    return arr;
+  }
+}
+
+function base64FromBytes(arr: Uint8Array): string {
+  if ((globalThis as any).Buffer) {
+    return globalThis.Buffer.from(arr).toString("base64");
+  } else {
+    const bin: string[] = [];
+    arr.forEach((byte) => {
+      bin.push(globalThis.String.fromCharCode(byte));
+    });
+    return globalThis.btoa(bin.join(""));
+  }
 }
 
 type Builtin = Date | Function | Uint8Array | string | number | boolean | undefined;
