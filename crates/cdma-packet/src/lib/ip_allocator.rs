@@ -8,6 +8,7 @@ use std::net::Ipv4Addr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::mobile_ip::MobileIpConfig;
 use crate::ppp::ipcp::IpcpConfig;
 
 const DEFAULT_RELEASE_GRACE: Duration = Duration::from_secs(60);
@@ -67,6 +68,7 @@ struct SubnetIpAllocatorInner {
     primary_dns: Ipv4Addr,
     secondary_dns: Ipv4Addr,
     request_vj: bool,
+    mobile_ip: MobileIpConfig,
 }
 
 impl SubnetIpAllocator {
@@ -92,6 +94,28 @@ impl SubnetIpAllocator {
         secondary_dns: Ipv4Addr,
         request_vj: bool,
     ) -> Self {
+        Self::new_with_packet_options(
+            gateway,
+            primary_dns,
+            secondary_dns,
+            request_vj,
+            MobileIpConfig::default(),
+        )
+    }
+
+    /// Create a pool allocator with packet-data options shared by all assignments.
+    ///
+    /// `gateway` must end in `.1`; mobile addresses are `.2`–`.254`.
+    ///
+    /// # Panics
+    /// Panics if the gateway's last octet is not `1`.
+    pub fn new_with_packet_options(
+        gateway: Ipv4Addr,
+        primary_dns: Ipv4Addr,
+        secondary_dns: Ipv4Addr,
+        request_vj: bool,
+        mobile_ip: MobileIpConfig,
+    ) -> Self {
         let octets = gateway.octets();
         assert_eq!(octets[3], 1, "gateway must be x.x.x.1");
         let prefix = [octets[0], octets[1], octets[2]];
@@ -108,6 +132,7 @@ impl SubnetIpAllocator {
                 primary_dns,
                 secondary_dns,
                 request_vj,
+                mobile_ip,
             }),
         }
     }
@@ -148,6 +173,7 @@ impl IpAllocator for SubnetIpAllocator {
                 primary_dns: inner.primary_dns,
                 secondary_dns: inner.secondary_dns,
                 request_vj: inner.request_vj,
+                mobile_ip: inner.mobile_ip.clone(),
             });
         }
 
@@ -172,6 +198,7 @@ impl IpAllocator for SubnetIpAllocator {
             primary_dns: inner.primary_dns,
             secondary_dns: inner.secondary_dns,
             request_vj: inner.request_vj,
+            mobile_ip: inner.mobile_ip.clone(),
         })
     }
 
@@ -269,6 +296,7 @@ impl SubnetIpAllocatorInner {
             primary_dns: self.primary_dns,
             secondary_dns: self.secondary_dns,
             request_vj: self.request_vj,
+            mobile_ip: self.mobile_ip.clone(),
         }
     }
 

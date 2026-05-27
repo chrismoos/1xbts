@@ -33,11 +33,12 @@ pub fn build_packet_service_with_sink(
 ) -> std::result::Result<Arc<cdma_packet::grpc::PacketServiceImpl>, String> {
     let transport_config = packet_transport_config(&cfg.packet)?;
     let allocator = Arc::new(
-        cdma_packet::ip_allocator::SubnetIpAllocator::new_with_vj_compression_default(
+        cdma_packet::ip_allocator::SubnetIpAllocator::new_with_packet_options(
             cfg.packet.gateway_ip,
             cfg.packet.primary_dns,
             cfg.packet.secondary_dns,
             cfg.packet.enable_vj_compression_default,
+            cfg.packet.mobile_ip.to_packet_config(),
         ),
     );
     let fou_tunnel = match &transport_config {

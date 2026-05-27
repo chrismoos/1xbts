@@ -259,6 +259,7 @@ impl SessionStatus {
             SessionPhase::RlpSync => "rlp_sync",
             SessionPhase::Lcp => "lcp",
             SessionPhase::Ipcp => "ipcp",
+            SessionPhase::Mip4Pending => "mip4_pending",
             SessionPhase::Active => "active",
             SessionPhase::Closed => "closed",
         };
@@ -1239,6 +1240,7 @@ fn log_tcp_packet(session_id: &str, direction: &str, packet: &[u8], state: &mut 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mobile_ip::{MobileIpConfig, MobileIpSession};
     use crate::ppp::ipcp::IpcpOpenState;
     use crate::ppp::lcp::{LcpOpenState, NegotiatedOptions};
     use crate::ppp::vj::{VjCompressionOptions, VjState};
@@ -1257,6 +1259,7 @@ mod tests {
                     primary_dns: Ipv4Addr::new(10, 55, 0, 1),
                     secondary_dns: Ipv4Addr::new(10, 55, 0, 1),
                     request_vj: false,
+                    mobile_ip: MobileIpConfig::default(),
                 },
                 request_local_ip: true,
                 request_vj: false,
@@ -1265,6 +1268,7 @@ mod tests {
                 local_vj: None,
                 last_acked_peer_request_data: Vec::new(),
             },
+            mobile_ip: Box::new(MobileIpSession::new(MobileIpConfig::default())),
             vj: VjState::default(),
         }
     }

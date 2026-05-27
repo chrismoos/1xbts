@@ -13,6 +13,7 @@
 /// - Mobile acks our request → IPCP is open
 use super::framing::PppPacket;
 use super::vj::{VJ_COMPRESSION_PROTOCOL, VjCompressionOptions};
+use crate::mobile_ip::MobileIpConfig;
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 
@@ -39,6 +40,7 @@ const CODE_REJECT_MAX_DATA: usize = 1400;
 // IPCP option types.
 pub const IPCP_OPT_IP_COMPRESSION: u8 = 2;
 const OPT_IP_ADDRESS: u8 = 3;
+const OPT_MOBILE_IPV4: u8 = 4;
 const OPT_PRIMARY_DNS: u8 = 129; // 0x81
 const OPT_SECONDARY_DNS: u8 = 131; // 0x83
 
@@ -168,6 +170,8 @@ pub struct IpcpConfig {
     pub secondary_dns: Ipv4Addr,
     /// Whether our IPCP Configure-Request should ask the peer to send us VJ.
     pub request_vj: bool,
+    /// Mobile IPv4 service behavior after IPCP opens without a peer address.
+    pub mobile_ip: MobileIpConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +193,7 @@ impl Default for IpcpConfig {
             primary_dns: Ipv4Addr::new(10, 55, 0, 1),
             secondary_dns: Ipv4Addr::new(10, 55, 0, 1),
             request_vj: false,
+            mobile_ip: MobileIpConfig::default(),
         }
     }
 }
@@ -446,6 +451,9 @@ impl IpcpSession {
                                 rejects.push(opt.clone());
                             }
                         }
+                        OPT_MOBILE_IPV4 => {
+                            rejects.push(opt.clone());
+                        }
                         _ => {
                             rejects.push(opt.clone());
                         }
@@ -455,7 +463,10 @@ impl IpcpSession {
                 // RFC 1661 §5.3: append our IP-Address suggestion when the peer
                 // didn't list it, bounded by Max-Failure.
                 let peer_sent_ip = opts.iter().any(|o| o.opt_type == OPT_IP_ADDRESS);
-                if !peer_sent_ip && self.nak_count(OPT_IP_ADDRESS) < MAX_FAILURE {
+                if !peer_sent_ip
+                    && !self.config.mobile_ip.enabled
+                    && self.nak_count(OPT_IP_ADDRESS) < MAX_FAILURE
+                {
                     appended.push(IpcpOption {
                         opt_type: OPT_IP_ADDRESS,
                         data: ip_to_bytes(self.config.peer_ip),
@@ -780,6 +791,28 @@ impl IpcpSession {
         self.consecutive_naks_sent.clear();
     }
 
+    pub fn restart_for_simple_ip(&mut self) -> PppPacket {
+        self.config.mobile_ip.enabled = false;
+        self.peer_acked = false;
+        self.we_acked = false;
+        self.last_request_id = None;
+        self.last_request_data.clear();
+        self.last_acked_peer_request_data.clear();
+        self.restart_ticks_remaining = 0;
+        self.configure_failed = false;
+        self.consecutive_naks_sent.clear();
+        self.request_local_ip = true;
+        self.request_vj = self.config.request_vj;
+        self.requested_vj = VjCompressionOptions::default();
+        self.peer_vj = None;
+        self.local_vj = None;
+        log::info!(
+            "{}: restarting negotiation in Simple IP mode",
+            self.log_prefix("IPCP")
+        );
+        self.start()
+    }
+
     /// Reassign the configured peer IP without touching state flags or timers;
     /// the next peer Configure-Request decides ACK vs NAK normally.
     pub fn reassign_peer_ip(&mut self, peer_ip: Ipv4Addr) {
@@ -810,6 +843,12 @@ impl IpcpSession {
 
     pub fn local_vj_options(&self) -> Option<VjCompressionOptions> {
         self.local_vj
+    }
+
+    pub fn peer_ip_address_negotiated(&self) -> bool {
+        parse_options(&self.last_acked_peer_request_data)
+            .iter()
+            .any(|opt| opt.opt_type == OPT_IP_ADDRESS)
     }
 
     /// Telemetry: NAKs containing IP-Address since last ACK.
@@ -863,6 +902,7 @@ fn format_ipcp_options(data: &[u8]) -> String {
                     format!("IPCompression(type={} len={})", o.opt_type, o.data.len())
                 }
             }
+            OPT_MOBILE_IPV4 => format!("MobileIPv4(len={})", o.data.len()),
             OPT_IP_ADDRESS | OPT_PRIMARY_DNS | OPT_SECONDARY_DNS => {
                 let name = match o.opt_type {
                     OPT_IP_ADDRESS => "IP",
@@ -986,6 +1026,43 @@ mod tests {
         assert!(session.is_open());
         assert_eq!(session.peer_ip(), Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(session.our_ip(), Ipv4Addr::new(10, 0, 0, 1));
+    }
+
+    #[test]
+    fn mobile_ip_mode_acks_dns_only_request_without_peer_ip() {
+        let mut session = IpcpSession::new(IpcpConfig {
+            mobile_ip: MobileIpConfig {
+                enabled: true,
+                ..MobileIpConfig::default()
+            },
+            ..IpcpConfig::default()
+        });
+        session.start();
+        ack_last_request(&mut session);
+
+        let mobile_req_data = serialize_options(&[
+            IpcpOption {
+                opt_type: OPT_PRIMARY_DNS,
+                data: ip_to_bytes(Ipv4Addr::new(10, 55, 0, 1)),
+            },
+            IpcpOption {
+                opt_type: OPT_SECONDARY_DNS,
+                data: ip_to_bytes(Ipv4Addr::new(10, 55, 0, 1)),
+            },
+        ]);
+        let mobile_req = IpcpPacket {
+            code: CONFIGURE_REQUEST,
+            identifier: 7,
+            data: mobile_req_data.clone(),
+        };
+        let responses = session.receive(&mobile_req.to_ppp());
+
+        assert_eq!(responses.len(), 1);
+        let ack = IpcpPacket::parse(&responses[0].payload).unwrap();
+        assert_eq!(ack.code, CONFIGURE_ACK);
+        assert_eq!(ack.data, mobile_req_data);
+        assert_eq!(session.state, IpcpState::Opened);
+        assert!(!session.peer_ip_address_negotiated());
     }
 
     #[test]

@@ -5,6 +5,7 @@ pub mod fou_transport;
 pub mod grpc;
 pub mod ip_allocator;
 pub mod ip_transport;
+pub mod mobile_ip;
 pub mod ppp;
 pub mod rlp;
 pub mod rlp3_frames;

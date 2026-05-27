@@ -14,6 +14,7 @@ use std::net::Ipv4Addr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::capture::{self, Direction as CaptureDirection};
+use crate::mobile_ip::{MobileIpPacketResult, MobileIpSession};
 use crate::ppp::framing::{self, HdlcDeframer, PppPacket};
 use crate::ppp::ipcp::{IPCP_PROTOCOL, IpcpConfig, IpcpOpenState, IpcpSession};
 use crate::ppp::lcp::{LCP_PROTOCOL, LcpOpenState, LcpSession, LcpState};
@@ -35,6 +36,8 @@ pub enum SessionPhase {
     Lcp,
     /// LCP is open, IPCP negotiation in progress.
     Ipcp,
+    /// IPCP is open, waiting for Mobile IPv4 registration.
+    Mip4Pending,
     /// IPCP is open — forwarding IP packets.
     Active,
     /// Session terminated.
@@ -818,6 +821,7 @@ pub struct PacketSession {
     deframer: HdlcDeframer,
     lcp: LcpSession,
     ipcp: IpcpSession,
+    mobile_ip: MobileIpSession,
     vj: VjState,
     log_context: Option<String>,
     phase: SessionPhase,
@@ -853,6 +857,7 @@ const RLP_SYNC_MAX_TICKS: u32 = 500;
 pub struct PppSessionState {
     pub lcp: LcpOpenState,
     pub ipcp: IpcpOpenState,
+    pub mobile_ip: Box<MobileIpSession>,
     pub vj: VjState,
 }
 
@@ -877,11 +882,16 @@ impl PacketSession {
                 log::debug!("PacketSession: using RLP Type 1 for SO {}", service_option);
                 Box::new(Rlp1Backend::new())
             };
+        let mobile_ip = ppp_resume
+            .as_ref()
+            .map(|state| state.mobile_ip.as_ref().clone())
+            .unwrap_or_else(|| MobileIpSession::new(ipcp_config.mobile_ip.clone()));
         Self {
             rlp,
             deframer: HdlcDeframer::new(),
             lcp: LcpSession::new(),
             ipcp: IpcpSession::new(ipcp_config),
+            mobile_ip,
             vj: VjState::default(),
             log_context: None,
             phase: SessionPhase::RlpSync,
@@ -998,6 +1008,7 @@ impl PacketSession {
         Some(PppSessionState {
             lcp: self.lcp.open_state()?,
             ipcp: self.ipcp.open_state()?,
+            mobile_ip: Box::new(self.mobile_ip.clone()),
             vj: self.vj.clone(),
         })
     }
@@ -1029,6 +1040,7 @@ impl PacketSession {
             if let Some(ppp_state) = self.pending_ppp_resume.take() {
                 self.lcp.restore_open_state(ppp_state.lcp);
                 self.ipcp.restore_open_state(ppp_state.ipcp);
+                self.mobile_ip = *ppp_state.mobile_ip;
                 self.vj = ppp_state.vj;
                 self.lcp_started = true;
                 self.ipcp_started = true;
@@ -1259,6 +1271,7 @@ impl PacketSession {
                         self.log_prefix("LCP")
                     );
                     self.ipcp = IpcpSession::new(self.ipcp.config.clone());
+                    self.mobile_ip = MobileIpSession::new(self.ipcp.config.mobile_ip.clone());
                     if let Some(context) = &self.log_context {
                         self.ipcp.set_log_context(context.clone());
                     }
@@ -1291,17 +1304,9 @@ impl PacketSession {
                 for resp in responses {
                     self.ppp_tx_queue.push(resp);
                 }
-                // Check for IPCP open → transition to Active.
+                // Check for IPCP open → transition to IP forwarding or MIP4 registration.
                 if self.ipcp.is_open() && self.phase == SessionPhase::Ipcp {
-                    self.vj
-                        .configure(self.ipcp.peer_vj_options(), self.ipcp.local_vj_options());
-                    self.phase = SessionPhase::Active;
-                    log::info!(
-                        "{}: active peer={} gateway={}",
-                        self.log_prefix("PacketSession"),
-                        self.ipcp.peer_ip(),
-                        self.ipcp.our_ip()
-                    );
+                    self.enter_ipcp_open_phase();
                 }
             }
             PPP_IP_PROTOCOL => {
@@ -1332,6 +1337,22 @@ impl PacketSession {
     }
 
     fn deliver_uplink_ip_packet(&mut self, ip_packet: &[u8], actions: &mut Vec<SessionAction>) {
+        if self.phase == SessionPhase::Mip4Pending {
+            if !self.handle_mobile_ip_packet(ip_packet) {
+                log::debug!(
+                    "{}: dropping non-MIP4 packet while registration is pending",
+                    self.log_prefix("IP ingress")
+                );
+            }
+            return;
+        }
+        if self.mobile_ip.config().enabled
+            && self.mobile_ip.binding().is_some()
+            && self.handle_mobile_ip_packet(ip_packet)
+        {
+            return;
+        }
+
         // Forward only in Active when src matches the IPCP-negotiated peer.
         let Some(src_ip) = self.parse_uplink_ipv4(ip_packet) else {
             return;
@@ -1358,6 +1379,82 @@ impl PacketSession {
         }
         actions.push(SessionAction::DeliverIpPacket(ip_packet.to_vec()));
         self.ppp_activity_since_last_check = true;
+    }
+
+    fn handle_mobile_ip_packet(&mut self, ip_packet: &[u8]) -> bool {
+        match self
+            .mobile_ip
+            .handle_ipv4_packet(ip_packet, self.ipcp.peer_ip())
+        {
+            MobileIpPacketResult::NotMobileIp => false,
+            MobileIpPacketResult::Ignored => true,
+            MobileIpPacketResult::AuthenticationRequired => {
+                let req = self.ipcp.restart_for_simple_ip();
+                self.ppp_tx_queue.push(req);
+                self.phase = SessionPhase::Ipcp;
+                self.ppp_activity_since_last_check = true;
+                true
+            }
+            MobileIpPacketResult::Reply(reply) | MobileIpPacketResult::Deregistered { reply } => {
+                self.ppp_tx_queue.push(PppPacket {
+                    protocol: PPP_IP_PROTOCOL,
+                    payload: reply,
+                });
+                self.ppp_activity_since_last_check = true;
+                if self.mobile_ip.binding().is_none() && self.phase == SessionPhase::Active {
+                    self.phase = SessionPhase::Mip4Pending;
+                }
+                true
+            }
+            MobileIpPacketResult::Registered { binding, reply } => {
+                self.ppp_tx_queue.push(PppPacket {
+                    protocol: PPP_IP_PROTOCOL,
+                    payload: reply,
+                });
+                self.ipcp.reassign_peer_ip(binding.home_address);
+                self.phase = SessionPhase::Active;
+                self.ppp_activity_since_last_check = true;
+                log::info!(
+                    "{}: MIP4 registration accepted, active peer={} home_agent={} lifetime={}",
+                    self.log_prefix("PacketSession"),
+                    binding.home_address,
+                    binding.home_agent,
+                    binding.lifetime_secs
+                );
+                true
+            }
+        }
+    }
+
+    fn enter_ipcp_open_phase(&mut self) {
+        self.vj
+            .configure(self.ipcp.peer_vj_options(), self.ipcp.local_vj_options());
+        if self.ipcp.config.mobile_ip.enabled && !self.ipcp.peer_ip_address_negotiated() {
+            self.mobile_ip.reset(self.ipcp.config.mobile_ip.clone());
+            self.phase = SessionPhase::Mip4Pending;
+            log::info!(
+                "{}: IPCP opened without peer IP, waiting for MIP4 registration peer={} fa={} ha={}",
+                self.log_prefix("PacketSession"),
+                self.ipcp.peer_ip(),
+                self.mobile_ip.config().fa_address,
+                self.mobile_ip.config().home_agent_address
+            );
+            if let Some(advertisement) = self.mobile_ip.next_unsolicited_advertisement() {
+                self.ppp_tx_queue.push(PppPacket {
+                    protocol: PPP_IP_PROTOCOL,
+                    payload: advertisement,
+                });
+            }
+            return;
+        }
+
+        self.phase = SessionPhase::Active;
+        log::info!(
+            "{}: active peer={} gateway={}",
+            self.log_prefix("PacketSession"),
+            self.ipcp.peer_ip(),
+            self.ipcp.our_ip()
+        );
     }
 
     fn parse_uplink_ipv4(&self, payload: &[u8]) -> Option<Ipv4Addr> {
@@ -2063,11 +2160,25 @@ fn hex_preview(data: &[u8], max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mobile_ip::{
+        MobileIpConfig, UDP_PORT_MOBILE_IP, build_ipv4_packet, build_udp_packet,
+    };
     use crate::ppp::framing::{self, PppPacket};
     use crate::ppp::ipcp;
     use crate::ppp::lcp;
     use crate::rlp;
     use cdma_common::consts::SERVICE_OPTION_PACKET_DATA;
+
+    const TEST_MIP_RRQ_TYPE: u8 = 1;
+    const TEST_MIP_RRQ_FLAGS_NONE: u8 = 0;
+    const TEST_MIP_RRQ_LIFETIME_SECS: u16 = 600;
+    const TEST_MIP_RRQ_IDENTIFICATION: u64 = 0x0102_0304_0506_0708;
+    const TEST_MIP_MOBILE_HOME_AUTH_EXT: u8 = 32;
+    const TEST_MIP_GENERALIZED_AUTH_EXT: u8 = 36;
+    const TEST_MIP_GENERALIZED_AUTH_SUBTYPE_MN_AAA: u8 = 1;
+    const TEST_MIP_NAI_EXT: u8 = 131;
+    const TEST_MIP_NAI: &[u8] = b"ms@test";
+    const TEST_IP_PROTO_UDP: u8 = 17;
 
     #[test]
     fn sch_0x0809_sdu_wraps_one_data_block_and_fill_muxpdu() {
@@ -2287,6 +2398,18 @@ mod tests {
         ipcp.to_ppp()
     }
 
+    fn mobile_ipcp_request_dns_only(id: u8, dns: Ipv4Addr) -> PppPacket {
+        let dns = dns.octets();
+        let ipcp = ipcp::IpcpPacket {
+            code: 1,
+            identifier: id,
+            data: vec![
+                129, 6, dns[0], dns[1], dns[2], dns[3], 131, 6, dns[0], dns[1], dns[2], dns[3],
+            ],
+        };
+        ipcp.to_ppp()
+    }
+
     fn mobile_ipcp_request_ip_with_vj(id: u8, ip: Ipv4Addr) -> PppPacket {
         let octets = ip.octets();
         let ipcp = ipcp::IpcpPacket {
@@ -2361,6 +2484,44 @@ mod tests {
         let sum = checksum16(&[&packet[..20]]);
         packet[10..12].copy_from_slice(&sum.to_be_bytes());
         packet
+    }
+
+    fn mobile_mip_rrq_packet(src: Ipv4Addr, fa: Ipv4Addr) -> Vec<u8> {
+        mobile_mip_rrq_packet_with_extensions(src, fa, &[])
+    }
+
+    fn mobile_mip_rrq_packet_with_extensions(
+        src: Ipv4Addr,
+        fa: Ipv4Addr,
+        extensions: &[u8],
+    ) -> Vec<u8> {
+        let mut rrq = Vec::new();
+        rrq.push(TEST_MIP_RRQ_TYPE);
+        rrq.push(TEST_MIP_RRQ_FLAGS_NONE);
+        rrq.extend_from_slice(&TEST_MIP_RRQ_LIFETIME_SECS.to_be_bytes());
+        rrq.extend_from_slice(&Ipv4Addr::UNSPECIFIED.octets());
+        rrq.extend_from_slice(&Ipv4Addr::BROADCAST.octets());
+        rrq.extend_from_slice(&fa.octets());
+        rrq.extend_from_slice(&TEST_MIP_RRQ_IDENTIFICATION.to_be_bytes());
+        rrq.extend_from_slice(&[TEST_MIP_NAI_EXT, TEST_MIP_NAI.len() as u8]);
+        rrq.extend_from_slice(TEST_MIP_NAI);
+        rrq.extend_from_slice(extensions);
+        let udp = build_udp_packet(UDP_PORT_MOBILE_IP, UDP_PORT_MOBILE_IP, &rrq);
+        build_ipv4_packet(src, fa, TEST_IP_PROTO_UDP, &udp)
+    }
+
+    fn mobile_mip_rrq_auth_extensions() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(TEST_MIP_MOBILE_HOME_AUTH_EXT);
+        out.push(20);
+        out.extend_from_slice(&300u32.to_be_bytes());
+        out.extend_from_slice(&[0x11; 16]);
+        out.push(TEST_MIP_GENERALIZED_AUTH_EXT);
+        out.push(TEST_MIP_GENERALIZED_AUTH_SUBTYPE_MN_AAA);
+        out.extend_from_slice(&20u16.to_be_bytes());
+        out.extend_from_slice(&2u32.to_be_bytes());
+        out.extend_from_slice(&[0x22; 16]);
+        out
     }
 
     /// Feed a PPP packet to the session via RLP data frames.
@@ -2490,6 +2651,141 @@ mod tests {
         assert_eq!(session.phase(), SessionPhase::Active);
         assert_eq!(session.peer_ip(), Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(session.our_ip(), Ipv4Addr::new(10, 0, 0, 1));
+    }
+
+    #[test]
+    fn mobile_ip_mode_waits_for_registration_after_ipcp_without_peer_ip() {
+        let config = IpcpConfig {
+            mobile_ip: MobileIpConfig {
+                enabled: true,
+                fa_address: Ipv4Addr::new(10, 0, 0, 1),
+                home_agent_address: Ipv4Addr::new(10, 0, 0, 1),
+                ..MobileIpConfig::default()
+            },
+            ..IpcpConfig::default()
+        };
+        let mut session = PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), config);
+        complete_rlp_handshake(&mut session);
+
+        let mut seq: u8 = 0;
+        feed_ppp_via_rlp(&mut session, &mobile_lcp_configure_request(1), &mut seq);
+        feed_ppp_via_rlp(
+            &mut session,
+            &mobile_lcp_configure_ack(1, vec![1, 4, 0x05, 0xDC]),
+            &mut seq,
+        );
+        assert_eq!(session.phase(), SessionPhase::Ipcp);
+
+        feed_ppp_via_rlp(
+            &mut session,
+            &mobile_ipcp_request_dns_only(1, Ipv4Addr::UNSPECIFIED),
+            &mut seq,
+        );
+        feed_ppp_via_rlp(
+            &mut session,
+            &mobile_ipcp_request_dns_only(2, Ipv4Addr::new(10, 55, 0, 1)),
+            &mut seq,
+        );
+        feed_ppp_via_rlp(
+            &mut session,
+            &mobile_ipcp_ack(1, our_default_ipcp_request_data()),
+            &mut seq,
+        );
+        assert_eq!(session.phase(), SessionPhase::Mip4Pending);
+
+        let rrq = mobile_mip_rrq_packet(Ipv4Addr::UNSPECIFIED, Ipv4Addr::new(10, 0, 0, 1));
+        let ppp = PppPacket {
+            protocol: PPP_IP_PROTOCOL,
+            payload: rrq,
+        };
+        let actions = feed_ppp_via_rlp(&mut session, &ppp, &mut seq);
+        assert_eq!(session.phase(), SessionPhase::Active);
+        assert!(
+            actions
+                .iter()
+                .all(|a| !matches!(a, SessionAction::DeliverIpPacket(_))),
+            "MIP4 Registration Request must not be forwarded as user IP"
+        );
+
+        let ip_packet = mobile_ipv4_packet(Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(8, 8, 8, 8));
+        let ppp = PppPacket {
+            protocol: PPP_IP_PROTOCOL,
+            payload: ip_packet.clone(),
+        };
+        let actions = feed_ppp_via_rlp(&mut session, &ppp, &mut seq);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, SessionAction::DeliverIpPacket(data) if data == &ip_packet))
+        );
+    }
+
+    #[test]
+    fn authenticated_mobile_ip_rrq_falls_back_to_simple_ip() {
+        let config = IpcpConfig {
+            mobile_ip: MobileIpConfig {
+                enabled: true,
+                ..MobileIpConfig::default()
+            },
+            ..IpcpConfig::default()
+        };
+        let mut session = PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), config);
+        complete_rlp_handshake(&mut session);
+
+        let mut seq: u8 = 0;
+        feed_ppp_via_rlp(&mut session, &mobile_lcp_configure_request(1), &mut seq);
+        feed_ppp_via_rlp(
+            &mut session,
+            &mobile_lcp_configure_ack(1, vec![1, 4, 0x05, 0xDC]),
+            &mut seq,
+        );
+        feed_ppp_via_rlp(
+            &mut session,
+            &mobile_ipcp_request_dns_only(1, Ipv4Addr::UNSPECIFIED),
+            &mut seq,
+        );
+        feed_ppp_via_rlp(
+            &mut session,
+            &mobile_ipcp_request_dns_only(2, Ipv4Addr::new(10, 55, 0, 1)),
+            &mut seq,
+        );
+        feed_ppp_via_rlp(
+            &mut session,
+            &mobile_ipcp_ack(1, our_default_ipcp_request_data()),
+            &mut seq,
+        );
+        assert_eq!(session.phase(), SessionPhase::Mip4Pending);
+
+        let rrq = mobile_mip_rrq_packet_with_extensions(
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::new(10, 0, 0, 1),
+            &mobile_mip_rrq_auth_extensions(),
+        );
+        let ppp = PppPacket {
+            protocol: PPP_IP_PROTOCOL,
+            payload: rrq,
+        };
+        let actions = feed_ppp_via_rlp(&mut session, &ppp, &mut seq);
+        assert_eq!(session.phase(), SessionPhase::Ipcp);
+        assert!(
+            actions
+                .iter()
+                .all(|a| !matches!(a, SessionAction::DeliverIpPacket(_))),
+            "Authenticated MIP4 RRQ must not be forwarded as user IP"
+        );
+
+        feed_ppp_via_rlp(&mut session, &mobile_ipcp_request_zero(3), &mut seq);
+        feed_ppp_via_rlp(
+            &mut session,
+            &mobile_ipcp_request_ip(4, Ipv4Addr::new(10, 0, 0, 2)),
+            &mut seq,
+        );
+        feed_ppp_via_rlp(
+            &mut session,
+            &mobile_ipcp_ack(2, our_default_ipcp_request_data()),
+            &mut seq,
+        );
+        assert_eq!(session.phase(), SessionPhase::Active);
     }
 
     #[test]

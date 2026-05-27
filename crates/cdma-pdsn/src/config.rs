@@ -10,12 +10,115 @@ use std::{
     path::Path,
 };
 
+use cdma_packet::mobile_ip::{MobileIpAuthMode, MobileIpConfig};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_PPP_SESSION_TIMEOUT_SECS: u64 = 30 * 60;
+const MIN_ENABLED_MOBILE_IP_ADVERTISEMENT_COUNT: u8 = 1;
+const MIN_ENABLED_MOBILE_IP_LIFETIME_SECS: u16 = 1;
 
 fn default_ppp_session_timeout_secs() -> u64 {
     DEFAULT_PPP_SESSION_TIMEOUT_SECS
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketMobileIpAuthMode {
+    Insecure,
+}
+
+impl Default for PacketMobileIpAuthMode {
+    fn default() -> Self {
+        Self::Insecure
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PacketMobileIpConfig {
+    /// Enables local Mobile IPv4 Foreign Agent registration after IPCP.
+    pub enabled: bool,
+    /// Foreign Agent address announced in MIP Agent Advertisements.
+    pub fa_address: Ipv4Addr,
+    /// Home Agent address returned in local Registration Replies.
+    pub home_agent_address: Ipv4Addr,
+    /// Number of unsolicited Agent Advertisements sent after IPCP opens.
+    pub advertisement_count: u8,
+    /// ICMP Router Advertisement lifetime.
+    pub advertisement_lifetime_secs: u16,
+    /// Maximum lifetime accepted for Mobile IPv4 registrations.
+    pub registration_lifetime_secs: u16,
+    /// Local and/or testing auth mode. Only `insecure` is currently implemented.
+    pub auth_mode: PacketMobileIpAuthMode,
+    /// Optional CIDR for the home-address pool. Defaults to the packet `/24`.
+    pub home_address_pool: Option<String>,
+}
+
+impl Default for PacketMobileIpConfig {
+    fn default() -> Self {
+        let defaults = MobileIpConfig::default();
+        Self {
+            enabled: defaults.enabled,
+            fa_address: defaults.fa_address,
+            home_agent_address: defaults.home_agent_address,
+            advertisement_count: defaults.advertisement_count,
+            advertisement_lifetime_secs: defaults.advertisement_lifetime_secs,
+            registration_lifetime_secs: defaults.registration_lifetime_secs,
+            auth_mode: PacketMobileIpAuthMode::default(),
+            home_address_pool: None,
+        }
+    }
+}
+
+impl PacketMobileIpConfig {
+    fn validate(&self, gateway_ip: Ipv4Addr) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.advertisement_count < MIN_ENABLED_MOBILE_IP_ADVERTISEMENT_COUNT {
+            return Err("pdsn.packet.mobile_ip.advertisement_count must be greater than zero when Mobile IP is enabled".to_string());
+        }
+        if self.advertisement_lifetime_secs < MIN_ENABLED_MOBILE_IP_LIFETIME_SECS {
+            return Err("pdsn.packet.mobile_ip.advertisement_lifetime_secs must be greater than zero when Mobile IP is enabled".to_string());
+        }
+        if self.registration_lifetime_secs < MIN_ENABLED_MOBILE_IP_LIFETIME_SECS {
+            return Err("pdsn.packet.mobile_ip.registration_lifetime_secs must be greater than zero when Mobile IP is enabled".to_string());
+        }
+        if self.fa_address.is_unspecified() {
+            return Err("pdsn.packet.mobile_ip.fa_address must not be 0.0.0.0".to_string());
+        }
+        if self.home_agent_address.is_unspecified() {
+            return Err("pdsn.packet.mobile_ip.home_agent_address must not be 0.0.0.0".to_string());
+        }
+        if let Some(pool) = self.home_address_pool.as_deref() {
+            let expected = format!(
+                "{}.{}.{}.0/24",
+                gateway_ip.octets()[0],
+                gateway_ip.octets()[1],
+                gateway_ip.octets()[2]
+            );
+            if pool.trim() != expected {
+                return Err(format!(
+                    "pdsn.packet.mobile_ip.home_address_pool currently supports only the packet /24 ({expected})"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn to_packet_config(&self) -> MobileIpConfig {
+        MobileIpConfig {
+            enabled: self.enabled,
+            fa_address: self.fa_address,
+            home_agent_address: self.home_agent_address,
+            advertisement_count: self.advertisement_count,
+            advertisement_lifetime_secs: self.advertisement_lifetime_secs,
+            registration_lifetime_secs: self.registration_lifetime_secs,
+            auth_mode: match self.auth_mode {
+                PacketMobileIpAuthMode::Insecure => MobileIpAuthMode::Insecure,
+            },
+        }
+    }
 }
 
 /// Legacy packet-data transport configuration carried by `PdsnNodeConfig`.
@@ -48,6 +151,8 @@ pub struct PacketTransportConfig {
     pub secondary_dns: Ipv4Addr,
     /// Whether PDSN-originated IPCP Configure-Requests advertise VJ compression.
     pub enable_vj_compression_default: bool,
+    /// Mobile IPv4 Foreign Agent behavior after IPCP opens without a peer IP.
+    pub mobile_ip: PacketMobileIpConfig,
 }
 
 impl Default for PacketTransportConfig {
@@ -61,6 +166,7 @@ impl Default for PacketTransportConfig {
             primary_dns: Ipv4Addr::new(10, 55, 0, 1),
             secondary_dns: Ipv4Addr::new(10, 55, 0, 1),
             enable_vj_compression_default: false,
+            mobile_ip: PacketMobileIpConfig::default(),
         }
     }
 }
@@ -72,6 +178,7 @@ impl PacketTransportConfig {
                 "pdsn.packet.gateway_ip must be the .1 address of a /24 subnet".to_string(),
             );
         }
+        self.mobile_ip.validate(self.gateway_ip)?;
         match self.transport.as_str() {
             "tun" => {
                 let has_nat_interface = self
@@ -124,7 +231,14 @@ impl PdsnNodeConfig {
         if self.ppp_session_timeout_secs == 0 {
             return Err("pdsn.ppp_session_timeout_secs must be greater than zero".to_string());
         }
-        self.packet.validate()
+        self.packet.validate()?;
+        if self.packet.mobile_ip.enabled
+            && u64::from(self.packet.mobile_ip.registration_lifetime_secs)
+                >= self.ppp_session_timeout_secs
+        {
+            return Err("pdsn.packet.mobile_ip.registration_lifetime_secs must be less than pdsn.ppp_session_timeout_secs".to_string());
+        }
+        Ok(())
     }
 
     /// Load and validate a `PdsnNodeConfig` from a JSON file.
@@ -160,6 +274,8 @@ mod tests {
         assert_eq!(cfg.packet.primary_dns, Ipv4Addr::new(10, 55, 0, 1));
         assert_eq!(cfg.packet.secondary_dns, Ipv4Addr::new(10, 55, 0, 1));
         assert!(!cfg.packet.enable_vj_compression_default);
+        assert!(!cfg.packet.mobile_ip.enabled);
+        assert_eq!(cfg.packet.mobile_ip.registration_lifetime_secs, 1200);
         assert_eq!(
             cfg.ppp_session_timeout_secs,
             DEFAULT_PPP_SESSION_TIMEOUT_SECS
@@ -242,6 +358,44 @@ mod tests {
             .validate()
             .expect_err("zero PPP timeout should be invalid");
         assert!(err.contains("ppp_session_timeout_secs"));
+    }
+
+    #[test]
+    fn mobile_ip_config_deserializes() {
+        let cfg: PdsnNodeConfig = serde_json::from_str(
+            r#"{
+                "packet_grpc_listen_addr": "127.0.0.1:17021",
+                "packet": {
+                    "transport": "fou_tcp",
+                    "fou_remote": "127.0.0.1:17012",
+                    "mobile_ip": {
+                        "enabled": true,
+                        "fa_address": "10.55.0.1",
+                        "home_agent_address": "10.55.0.1",
+                        "advertisement_count": 2,
+                        "registration_lifetime_secs": 600,
+                        "auth_mode": "insecure",
+                        "home_address_pool": "10.55.0.0/24"
+                    }
+                }
+            }"#,
+        )
+        .expect("config should deserialize");
+        cfg.validate().expect("mobile IP config should validate");
+        assert!(cfg.packet.mobile_ip.enabled);
+        assert_eq!(cfg.packet.mobile_ip.advertisement_count, 2);
+    }
+
+    #[test]
+    fn mobile_ip_lifetime_must_be_below_ppp_cache_timeout() {
+        let mut cfg = test_config();
+        cfg.packet.transport = "fou_tcp".to_string();
+        cfg.packet.mobile_ip.enabled = true;
+        cfg.packet.mobile_ip.registration_lifetime_secs = DEFAULT_PPP_SESSION_TIMEOUT_SECS as u16;
+        let err = cfg
+            .validate()
+            .expect_err("MIP lifetime should be shorter than PPP cache timeout");
+        assert!(err.contains("registration_lifetime_secs"));
     }
 
     #[test]
