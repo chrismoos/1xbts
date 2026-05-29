@@ -64,8 +64,9 @@ jobs:
           sudo ldconfig
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.96.0"
           components: clippy, rustfmt
 
       - name: Cache cargo

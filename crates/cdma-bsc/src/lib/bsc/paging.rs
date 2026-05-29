@@ -50,10 +50,7 @@ pub(crate) fn mobile_identity_for_ms_address(
             imsi_11_12,
         } => {
             let imsi = cdma_common::paging::mcc_to_digits(*mcc)
-                .and_then(|mcc_digits| {
-                    cdma_common::paging::imsi_11_12_to_digits(*imsi_11_12)
-                        .map(|imsi_11_12_digits| (mcc_digits, imsi_11_12_digits))
-                })
+                .zip(cdma_common::paging::imsi_11_12_to_digits(*imsi_11_12))
                 .map(|(mcc_digits, imsi_11_12_digits)| {
                     format!(
                         "{}{}{}",
