@@ -53,17 +53,12 @@ impl Device {
     }
 
     /// Initialize the device with default configuration.
-    pub fn init(&mut self) -> Result<(), Error> {
+    pub fn init(&self) -> Result<(), Error> {
         check_lms(unsafe { limesuite_sys::LMS_Init(self.0) }, "LMS_Init")
     }
 
     /// Enable or disable a channel.
-    pub fn enable_channel(
-        &mut self,
-        dir_tx: bool,
-        chan: usize,
-        enabled: bool,
-    ) -> Result<(), Error> {
+    pub fn enable_channel(&self, dir_tx: bool, chan: usize, enabled: bool) -> Result<(), Error> {
         check_lms(
             unsafe { limesuite_sys::LMS_EnableChannel(self.0, dir_tx, chan, enabled) },
             "LMS_EnableChannel",
@@ -71,7 +66,7 @@ impl Device {
     }
 
     /// Set the sample rate for both TX and RX. oversample=0 for auto.
-    pub fn set_sample_rate(&mut self, rate: f64, oversample: usize) -> Result<(), Error> {
+    pub fn set_sample_rate(&self, rate: f64, oversample: usize) -> Result<(), Error> {
         check_lms(
             unsafe { limesuite_sys::LMS_SetSampleRate(self.0, rate, oversample) },
             "LMS_SetSampleRate",
@@ -92,7 +87,7 @@ impl Device {
     }
 
     /// Set the LO frequency for a channel.
-    pub fn set_lo_frequency(&mut self, dir_tx: bool, chan: usize, freq: f64) -> Result<(), Error> {
+    pub fn set_lo_frequency(&self, dir_tx: bool, chan: usize, freq: f64) -> Result<(), Error> {
         check_lms(
             unsafe { limesuite_sys::LMS_SetLOFrequency(self.0, dir_tx, chan, freq) },
             "LMS_SetLOFrequency",
@@ -110,7 +105,7 @@ impl Device {
     }
 
     /// Set the antenna index for a channel.
-    pub fn set_antenna(&mut self, dir_tx: bool, chan: usize, index: usize) -> Result<(), Error> {
+    pub fn set_antenna(&self, dir_tx: bool, chan: usize, index: usize) -> Result<(), Error> {
         check_lms(
             unsafe { limesuite_sys::LMS_SetAntenna(self.0, dir_tx, chan, index) },
             "LMS_SetAntenna",
@@ -127,7 +122,7 @@ impl Device {
     }
 
     /// Set gain in dB for a channel.
-    pub fn set_gain_db(&mut self, dir_tx: bool, chan: usize, gain: u32) -> Result<(), Error> {
+    pub fn set_gain_db(&self, dir_tx: bool, chan: usize, gain: u32) -> Result<(), Error> {
         check_lms(
             unsafe { limesuite_sys::LMS_SetGaindB(self.0, dir_tx, chan, gain) },
             "LMS_SetGaindB",
@@ -135,7 +130,7 @@ impl Device {
     }
 
     /// Set the analog LPF bandwidth.
-    pub fn set_lpf_bw(&mut self, dir_tx: bool, chan: usize, bw: f64) -> Result<(), Error> {
+    pub fn set_lpf_bw(&self, dir_tx: bool, chan: usize, bw: f64) -> Result<(), Error> {
         check_lms(
             unsafe { limesuite_sys::LMS_SetLPFBW(self.0, dir_tx, chan, bw) },
             "LMS_SetLPFBW",
@@ -143,7 +138,7 @@ impl Device {
     }
 
     /// Run automatic calibration.
-    pub fn calibrate(&mut self, dir_tx: bool, chan: usize, bw: f64) -> Result<(), Error> {
+    pub fn calibrate(&self, dir_tx: bool, chan: usize, bw: f64) -> Result<(), Error> {
         check_lms(
             unsafe { limesuite_sys::LMS_Calibrate(self.0, dir_tx, chan, bw, 0) },
             "LMS_Calibrate",
@@ -151,7 +146,7 @@ impl Device {
     }
 
     /// Set a clock frequency. clk_id: 0=REF, 3=CGEN, etc.
-    pub fn set_clock_freq(&mut self, clk_id: usize, freq: f64) -> Result<(), Error> {
+    pub fn set_clock_freq(&self, clk_id: usize, freq: f64) -> Result<(), Error> {
         check_lms(
             unsafe { limesuite_sys::LMS_SetClockFreq(self.0, clk_id, freq) },
             "LMS_SetClockFreq",
@@ -203,7 +198,7 @@ impl Device {
     }
 
     /// Raw device pointer for stream setup.
-    pub(crate) fn raw(&mut self) -> *mut limesuite_sys::lms_device_t {
+    pub(crate) fn raw(&self) -> *mut limesuite_sys::lms_device_t {
         self.0
     }
 }

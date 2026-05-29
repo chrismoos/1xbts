@@ -470,7 +470,9 @@ mod lime_bench {
         } else {
             Some(device_str)
         };
-        let mut device = limesuite::Device::open(info).map_err(|e| format!("Lime: open: {}", e))?;
+        let device = std::sync::Arc::new(
+            limesuite::Device::open(info).map_err(|e| format!("Lime: open: {}", e))?,
+        );
         device.init().map_err(|e| format!("Lime: init: {}", e))?;
 
         // Enable TX channel.
@@ -548,7 +550,7 @@ mod lime_bench {
 
         // Create TX stream.
         let mut tx_stream = limesuite::TxStream::with_throughput(
-            &mut device,
+            device.clone(),
             channel as u32,
             fifo_size,
             throughput_vs_latency,
@@ -559,7 +561,7 @@ mod lime_bench {
         let mut rx_stream = if cli.full_duplex {
             Some(
                 limesuite::RxStream::with_throughput(
-                    &mut device,
+                    device.clone(),
                     channel as u32,
                     fifo_size,
                     throughput_vs_latency,

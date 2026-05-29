@@ -49,7 +49,7 @@ fn resolve_antenna_index(device: &Device, dir_tx: bool, chan: usize, name: &str)
 }
 
 pub struct LimeRadio {
-    device: Device,
+    device: Arc<Device>,
     channel: usize,
     sample_rate: u64,
     oversample: usize,
@@ -109,8 +109,10 @@ impl LimeRadio {
         } else {
             Some(device_str)
         };
-        let mut device = Device::open(info)
-            .map_err(|e| Error::from(format!("Lime: failed to open device: {}", e)))?;
+        let device = Arc::new(
+            Device::open(info)
+                .map_err(|e| Error::from(format!("Lime: failed to open device: {}", e)))?,
+        );
         info!("Lime: device opened");
 
         device
@@ -156,7 +158,7 @@ impl LimeRadio {
         // since LMS_Calibrate/LMS_SetupStream on RX can reset active streams).
         let tx_fifo = tx_fifo_size.unwrap_or(DEFAULT_FIFO_SIZE);
         let tvl = throughput_vs_latency.unwrap_or(DEFAULT_THROUGHPUT_VS_LATENCY);
-        let tx_stream = TxStream::with_throughput(&mut device, channel as u32, tx_fifo, tvl)
+        let tx_stream = TxStream::with_throughput(device.clone(), channel as u32, tx_fifo, tvl)
             .map_err(|e| Error::from(format!("Lime: create TX stream: {}", e)))?;
         info!(
             "Lime: TX stream FIFO size={} samples throughput_vs_latency={:.2}",
@@ -312,7 +314,7 @@ impl Radio for LimeRadio {
         // Create RX stream.
         let rx_fifo = self.rx_fifo_size;
         let rx_stream = RxStream::with_throughput(
-            &mut self.device,
+            self.device.clone(),
             channel as u32,
             rx_fifo,
             self.throughput_vs_latency,
@@ -352,8 +354,7 @@ impl Radio for LimeRadio {
         // stream status only reflects the last submitted TX timestamp.
         let shared_clock = Arc::new(AtomicU64::new(0));
 
-        let device = Arc::new(self.device);
-        tx_stream.bind_device(device.clone());
+        let device = self.device.clone();
         let tx = LimeTxHalf {
             _device: device.clone(),
             tx_stream: UnsafeCell::new(tx_stream),
@@ -367,8 +368,7 @@ impl Radio for LimeRadio {
             tx_send_count: 0,
             last_underrun: 0,
         };
-        let rx = self.rx_stream.take().map(|mut s| -> Box<dyn RadioRx> {
-            s.bind_device(device.clone());
+        let rx = self.rx_stream.take().map(|s| -> Box<dyn RadioRx> {
             Box::new(LimeRxHalf {
                 _device: device.clone(),
                 rx_stream: UnsafeCell::new(s),

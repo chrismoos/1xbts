@@ -31,28 +31,23 @@ pub struct StreamStatus {
     pub timestamp: u64,
 }
 
-/// A transmit stream.
-///
-/// Holds an optional `Arc<Device>` to prevent the device from being closed
-/// before the stream is destroyed. Call [`bind_device`](Self::bind_device)
-/// after wrapping the `Device` in `Arc` to enable safe automatic cleanup
-/// in `Drop`.
+/// A transmit stream. Co-owns the `Arc<Device>` because `LMS_DestroyStream`
+/// dereferences the device handle, so the stream must outlive any `LMS_Close`.
 pub struct TxStream {
     inner: limesuite_sys::lms_stream_t,
-    device_ptr: *mut limesuite_sys::lms_device_t,
-    _owner: Option<Arc<Device>>,
+    device: Arc<Device>,
     started: bool,
 }
 
 impl TxStream {
     /// Create a new TX stream. Must call start() before sending.
-    pub fn new(device: &mut Device, channel: u32, fifo_size: u32) -> Result<Self, Error> {
+    pub fn new(device: Arc<Device>, channel: u32, fifo_size: u32) -> Result<Self, Error> {
         Self::with_throughput(device, channel, fifo_size, 0.5)
     }
 
     /// Create a TX stream with explicit throughput vs latency tradeoff (0.0-1.0).
     pub fn with_throughput(
-        device: &mut Device,
+        device: Arc<Device>,
         channel: u32,
         fifo_size: u32,
         throughput_vs_latency: f32,
@@ -70,18 +65,9 @@ impl TxStream {
         )?;
         Ok(TxStream {
             inner: stream,
-            device_ptr: device.raw(),
-            _owner: None,
+            device,
             started: false,
         })
-    }
-
-    /// Bind shared device ownership so `Drop` can safely destroy the stream.
-    ///
-    /// Call this after moving the `Device` into an `Arc`. Without binding,
-    /// the caller must ensure the `Device` outlives the stream manually.
-    pub fn bind_device(&mut self, device: Arc<Device>) {
-        self._owner = Some(device);
     }
 
     /// Start the TX stream.
@@ -153,43 +139,31 @@ impl TxStream {
             timestamp: st.timestamp,
         })
     }
-
-    fn destroy_inner(&mut self) {
-        let _ = self.stop();
-        if !self.device_ptr.is_null() {
-            unsafe { limesuite_sys::LMS_DestroyStream(self.device_ptr, &mut self.inner) };
-            self.device_ptr = std::ptr::null_mut();
-        }
-    }
 }
 
 impl Drop for TxStream {
     fn drop(&mut self) {
-        self.destroy_inner();
+        let _ = self.stop();
+        unsafe { limesuite_sys::LMS_DestroyStream(self.device.raw(), &mut self.inner) };
     }
 }
 
-/// A receive stream.
-///
-/// Holds an optional `Arc<Device>` to prevent the device from being closed
-/// before the stream is destroyed. Call [`bind_device`](Self::bind_device)
-/// after wrapping the `Device` in `Arc`.
+/// A receive stream. See [`TxStream`] for the device-lifetime contract.
 pub struct RxStream {
     inner: limesuite_sys::lms_stream_t,
-    device_ptr: *mut limesuite_sys::lms_device_t,
-    _owner: Option<Arc<Device>>,
+    device: Arc<Device>,
     started: bool,
 }
 
 impl RxStream {
     /// Create a new RX stream. Must call start() before receiving.
-    pub fn new(device: &mut Device, channel: u32, fifo_size: u32) -> Result<Self, Error> {
+    pub fn new(device: Arc<Device>, channel: u32, fifo_size: u32) -> Result<Self, Error> {
         Self::with_throughput(device, channel, fifo_size, 0.5)
     }
 
     /// Create an RX stream with explicit throughput vs latency tradeoff (0.0-1.0).
     pub fn with_throughput(
-        device: &mut Device,
+        device: Arc<Device>,
         channel: u32,
         fifo_size: u32,
         throughput_vs_latency: f32,
@@ -207,18 +181,9 @@ impl RxStream {
         )?;
         Ok(RxStream {
             inner: stream,
-            device_ptr: device.raw(),
-            _owner: None,
+            device,
             started: false,
         })
-    }
-
-    /// Bind shared device ownership so `Drop` can safely destroy the stream.
-    ///
-    /// Call this after moving the `Device` into an `Arc`. Without binding,
-    /// the caller must ensure the `Device` outlives the stream manually.
-    pub fn bind_device(&mut self, device: Arc<Device>) {
-        self._owner = Some(device);
     }
 
     /// Start the RX stream.
@@ -291,19 +256,12 @@ impl RxStream {
             timestamp: st.timestamp,
         })
     }
-
-    fn destroy_inner(&mut self) {
-        let _ = self.stop();
-        if !self.device_ptr.is_null() {
-            unsafe { limesuite_sys::LMS_DestroyStream(self.device_ptr, &mut self.inner) };
-            self.device_ptr = std::ptr::null_mut();
-        }
-    }
 }
 
 impl Drop for RxStream {
     fn drop(&mut self) {
-        self.destroy_inner();
+        let _ = self.stop();
+        unsafe { limesuite_sys::LMS_DestroyStream(self.device.raw(), &mut self.inner) };
     }
 }
 

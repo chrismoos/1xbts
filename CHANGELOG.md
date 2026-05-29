@@ -1,5 +1,6 @@
 # HEAD 
 
+- Fixed a LimeSDR crash on BTS shutdown. Fixes #19.
 - Added initial support for Mobile IP via `packet.mobile_ip.enabled` for
   devices that use it instead of Simple IP.
 - MT SMS to an unprovisioned phone number or with a payload that won't

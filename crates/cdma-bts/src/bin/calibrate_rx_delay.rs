@@ -756,7 +756,7 @@ impl CalibrationBackend for UhdBackend {
 
 #[cfg(feature = "lime-backend")]
 struct LimeBackend {
-    _device: limesuite::Device,
+    _device: std::sync::Arc<limesuite::Device>,
     tx_stream: limesuite::TxStream,
     rx_stream: limesuite::RxStream,
     sample_rate: u64,
@@ -781,8 +781,10 @@ impl LimeBackend {
         } else {
             Some(device_str)
         };
-        let mut device = limesuite::Device::open(info)
-            .map_err(|e| format!("Lime: failed to open device: {}", e))?;
+        let device = std::sync::Arc::new(
+            limesuite::Device::open(info)
+                .map_err(|e| format!("Lime: failed to open device: {}", e))?,
+        );
 
         device.init().map_err(|e| format!("Lime: init: {}", e))?;
 
@@ -850,9 +852,9 @@ impl LimeBackend {
 
         // Create streams.
         let fifo_size = 1024 * 1024;
-        let tx_stream = limesuite::TxStream::new(&mut device, channel as u32, fifo_size)
+        let tx_stream = limesuite::TxStream::new(device.clone(), channel as u32, fifo_size)
             .map_err(|e| format!("Lime: create TX stream: {}", e))?;
-        let rx_stream = limesuite::RxStream::new(&mut device, channel as u32, fifo_size)
+        let rx_stream = limesuite::RxStream::new(device.clone(), channel as u32, fifo_size)
             .map_err(|e| format!("Lime: create RX stream: {}", e))?;
 
         Ok(LimeBackend {
