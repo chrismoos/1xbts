@@ -16,6 +16,7 @@ pub mod media_gateway_service;
 pub mod mo_call;
 pub mod mt_call;
 pub mod mt_page_retry;
+pub mod otasp;
 pub mod runtime;
 pub(crate) mod sms;
 pub mod voice_gateway_client;
@@ -24,9 +25,10 @@ pub use call_control::{
     CallControlError, CallDirection, CallId, CallSessionSnapshot, MscCallController,
 };
 pub use config::{
-    A1PeerConfig, MediaRingbackType, MoOriginationContext, MoRoutingDecision, MscNodeConfig,
-    StaticVoicePolicy, VoiceConfig, VoiceGatewayConfig, VoicePolicy, VoicePolicySnapshot,
-    WelcomeSmsConfig,
+    A1PeerConfig, BtsOverheadConfig, MediaRingbackType, MmsConfig, MoOriginationContext,
+    MoRoutingDecision, MscNodeConfig, NamDefaultsConfig, OtaspConfig, OtaspWritesConfig,
+    StaticVoicePolicy, SystemTagConfig, VoiceConfig, VoiceGatewayConfig, VoicePolicy,
+    VoicePolicySnapshot, WelcomeSmsConfig,
 };
 pub use management::{
     InitiateCallAccepted, InitiateCallRequest, ManagementError, MtCallPlan, PendingControlRequest,

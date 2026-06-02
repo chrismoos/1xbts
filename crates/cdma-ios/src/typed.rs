@@ -96,8 +96,9 @@ const IE_POWER_DOWN_INDICATOR: u8 = 0xa2;
 const IE_LOCATION_AREA_IDENTIFICATION: u8 = 0x13;
 // ADDS message type codes (A.S0001 §6.1.7) — used in BSMAP/DTAP inner payload
 const ADDS_PAGE: u8 = 0x65;
-const ADDS_TRANSFER: u8 = 0x67;
 const ADDS_PAGE_ACK: u8 = 0x66;
+const ADDS_TRANSFER: u8 = 0x67;
+const ADDS_TRANSFER_ACK: u8 = 0x68;
 const ADDS_DELIVER_DTAP: u8 = 0x53; // DTAP msg type; same value as BSMAP Privacy Mode Command
 const ADDS_DELIVER_ACK_DTAP: u8 = 0x54;
 const IE_ADDS_USER_PART: u8 = 0x3d;
@@ -153,6 +154,8 @@ impl CellId {
 pub enum MobileIdentity {
     Imsi(String),
     Esn(u32),
+    /// MEID as 14 hex digits packed into 7 bytes (A.S0014-D §4.2.13).
+    Meid([u8; 7]),
 }
 
 impl MobileIdentity {
@@ -164,6 +167,21 @@ impl MobileIdentity {
                 let mut out = vec![0x05];
                 out.extend_from_slice(&esn.to_be_bytes());
                 Ok(out)
+            }
+            Self::Meid(digits) => {
+                // A.S0014-D §4.2.13: 14 hex digits packed odd-in-high, even-in-low,
+                // with Fill=F in the high nibble of the final octet.
+                let d = digits;
+                Ok(vec![
+                    (d[0] & 0xf0) | 0x01,
+                    (d[1] & 0xf0) | (d[0] & 0x0f),
+                    (d[2] & 0xf0) | (d[1] & 0x0f),
+                    (d[3] & 0xf0) | (d[2] & 0x0f),
+                    (d[4] & 0xf0) | (d[3] & 0x0f),
+                    (d[5] & 0xf0) | (d[4] & 0x0f),
+                    (d[6] & 0xf0) | (d[5] & 0x0f),
+                    0xf0 | (d[6] & 0x0f),
+                ])
             }
         }
     }
@@ -188,6 +206,24 @@ impl MobileIdentity {
                 Ok(Self::Esn(u32::from_be_bytes([
                     input[1], input[2], input[3], input[4],
                 ])))
+            }
+            0x01 => {
+                if input.len() != 8 {
+                    return Err(Error::InvalidLength {
+                        expected: 8,
+                        actual: input.len(),
+                    });
+                }
+                let _ = rest;
+                Ok(Self::Meid([
+                    (input[0] & 0xf0) | (input[1] & 0x0f),
+                    (input[1] & 0xf0) | (input[2] & 0x0f),
+                    (input[2] & 0xf0) | (input[3] & 0x0f),
+                    (input[3] & 0xf0) | (input[4] & 0x0f),
+                    (input[4] & 0xf0) | (input[5] & 0x0f),
+                    (input[5] & 0xf0) | (input[6] & 0x0f),
+                    (input[6] & 0xf0) | (input[7] & 0x0f),
+                ]))
             }
             other => Err(Error::ReservedValue {
                 context: "Mobile Identity type",
@@ -2566,6 +2602,12 @@ impl AuthenticationResponseBsmapMessage {
                             AUTHENTICATION_RESPONSE,
                             IE_MOBILE_IDENTITY,
                         )?,
+                        MobileIdentity::Meid(_) => {
+                            return Err(Error::InvalidValue {
+                                context: "Authentication Response",
+                                reason: "MEID identity not expected here",
+                            });
+                        }
                     }
                     offset += consumed;
                 }
@@ -7090,6 +7132,16 @@ pub struct AddsUserPart {
 }
 
 impl AddsUserPart {
+    /// Public encoder for tests and external decoders.
+    pub fn encode_body_public(&self) -> Vec<u8> {
+        self.encode_body()
+    }
+
+    /// Public decoder for tests and external decoders.
+    pub fn decode_body_public(input: &[u8]) -> Result<Self> {
+        Self::decode_body(input)
+    }
+
     /// Encodes as a BSMAP TLV value body (IE tag and length not included).
     pub(crate) fn encode_body(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(1 + self.data.len());
@@ -7221,31 +7273,39 @@ impl AddsPageMessage {
     }
 }
 
-/// BSMAP `ADDS Transfer` message — BS→MSC (A.S0001 §6.1.7.2).
+/// BSMAP `ADDS Transfer` message — BS→MSC (A.S0014-D §3.6.3).
 ///
 /// Sent by the BS to the MSC when a mobile-originated application data message
-/// is received on the access channel. For SMS, carries the MO SMS payload.
+/// is received on the access channel. Carries SMS, OTASP, PDS, or SDB payloads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddsTransferMessage {
     /// IMSI of the originating mobile.
     pub mobile_identity_imsi: MobileIdentity,
-    /// Application data received from the MS (SMS payload + burst type).
+    /// Application data received from the MS (payload + Data Burst Type).
     pub adds_user_part: AddsUserPart,
-    /// ESN of the originating mobile (second Mobile Identity IE occurrence).
+    /// ESN of the originating mobile.
     pub mobile_identity_esn: Option<MobileIdentity>,
+    /// MEID of the originating mobile.
+    pub mobile_identity_meid: Option<MobileIdentity>,
+    /// Cell identifier where the application data was received.
+    pub cell_identifier: Option<CellId>,
+    /// Correlation tag echoed in the ADDS Transfer Ack.
+    pub tag: Option<Tag>,
+    /// Service Option (included when origination-triggered).
+    pub service_option: Option<ServiceOption>,
 }
 
 impl AddsTransferMessage {
     /// Encodes the message using the exact A1 BSMAP wire format.
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut body = Vec::new();
-        let imsi = self.mobile_identity_imsi.encode()?;
         if !matches!(self.mobile_identity_imsi, MobileIdentity::Imsi(_)) {
             return Err(Error::InvalidValue {
                 context: "ADDS Transfer",
                 reason: "first mobile identity must be IMSI",
             });
         }
+        let imsi = self.mobile_identity_imsi.encode()?;
         push_tlv(&mut body, IE_MOBILE_IDENTITY, &imsi)?;
         let user_part_body = self.adds_user_part.encode_body();
         push_tlv(&mut body, IE_ADDS_USER_PART, &user_part_body)?;
@@ -7253,10 +7313,28 @@ impl AddsTransferMessage {
             if !matches!(esn, MobileIdentity::Esn(_)) {
                 return Err(Error::InvalidValue {
                     context: "ADDS Transfer",
-                    reason: "second mobile identity must be ESN",
+                    reason: "ESN identity must be ESN variant",
                 });
             }
             push_tlv(&mut body, IE_MOBILE_IDENTITY, &esn.encode()?)?;
+        }
+        if let Some(cell) = self.cell_identifier {
+            push_tlv(&mut body, IE_CELL_IDENTIFIER, &cell.encode()?)?;
+        }
+        if let Some(tag) = self.tag {
+            push_fixed(&mut body, IE_TAG, &tag.encode());
+        }
+        if let Some(service_option) = self.service_option {
+            push_fixed(&mut body, IE_SERVICE_OPTION, &service_option.encode());
+        }
+        if let Some(meid) = &self.mobile_identity_meid {
+            if !matches!(meid, MobileIdentity::Meid(_)) {
+                return Err(Error::InvalidValue {
+                    context: "ADDS Transfer",
+                    reason: "MEID identity must be MEID variant",
+                });
+            }
+            push_tlv(&mut body, IE_MOBILE_IDENTITY, &meid.encode()?)?;
         }
         encode_bsmap(ADDS_TRANSFER, &body)
     }
@@ -7268,15 +7346,27 @@ impl AddsTransferMessage {
         let mut mobile_identity_imsi = None;
         let mut adds_user_part = None;
         let mut mobile_identity_esn = None;
+        let mut mobile_identity_meid = None;
+        let mut cell_identifier = None;
+        let mut tag = None;
+        let mut service_option = None;
         while offset < body.len() {
             match body[offset] {
                 IE_MOBILE_IDENTITY => {
                     let (_, payload, consumed) = decode_tlv(&body[offset..])?;
                     let identity = MobileIdentity::decode(payload)?;
-                    if mobile_identity_imsi.is_none() {
-                        mobile_identity_imsi = Some(identity);
-                    } else {
-                        mobile_identity_esn = Some(identity);
+                    match &identity {
+                        MobileIdentity::Imsi(_) => {
+                            if mobile_identity_imsi.is_some() {
+                                return Err(Error::DuplicateElement {
+                                    message_type: ADDS_TRANSFER,
+                                    id: IE_MOBILE_IDENTITY,
+                                });
+                            }
+                            mobile_identity_imsi = Some(identity);
+                        }
+                        MobileIdentity::Esn(_) => mobile_identity_esn = Some(identity),
+                        MobileIdentity::Meid(_) => mobile_identity_meid = Some(identity),
                     }
                     offset += consumed;
                 }
@@ -7289,6 +7379,31 @@ impl AddsTransferMessage {
                         IE_ADDS_USER_PART,
                     )?;
                     offset += consumed;
+                }
+                IE_CELL_IDENTIFIER => {
+                    let (_, payload, consumed) = decode_tlv(&body[offset..])?;
+                    set_once(
+                        &mut cell_identifier,
+                        CellId::decode(payload)?,
+                        ADDS_TRANSFER,
+                        IE_CELL_IDENTIFIER,
+                    )?;
+                    offset += consumed;
+                }
+                IE_TAG => {
+                    let payload = take_fixed(&body[offset..], 4)?;
+                    set_once(&mut tag, Tag::decode(payload)?, ADDS_TRANSFER, IE_TAG)?;
+                    offset += 5;
+                }
+                IE_SERVICE_OPTION => {
+                    let payload = take_fixed(&body[offset..], 2)?;
+                    set_once(
+                        &mut service_option,
+                        ServiceOption::decode(payload)?,
+                        ADDS_TRANSFER,
+                        IE_SERVICE_OPTION,
+                    )?;
+                    offset += 3;
                 }
                 _ => {
                     let (_, _, consumed) = decode_tlv(&body[offset..])?;
@@ -7306,6 +7421,99 @@ impl AddsTransferMessage {
                 id: IE_ADDS_USER_PART,
             })?,
             mobile_identity_esn,
+            mobile_identity_meid,
+            cell_identifier,
+            tag,
+            service_option,
+        })
+    }
+}
+
+/// BSMAP `ADDS Transfer Ack` message — MSC→BS (A.S0014-D §3.6.4).
+///
+/// Sent by the MSC to acknowledge an ADDS Transfer. Required for SDB and
+/// dormant-handoff flows; the Tag is echoed from the original Transfer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddsTransferAckMessage {
+    /// IMSI of the mobile (mandatory per §3.6.4).
+    pub mobile_identity_imsi: MobileIdentity,
+    /// Correlation tag echoed from the ADDS Transfer.
+    pub tag: Option<Tag>,
+    /// Failure cause — absent on success.
+    pub cause: Option<Cause>,
+}
+
+impl AddsTransferAckMessage {
+    /// Encodes the message using the exact A1 BSMAP wire format.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        if !matches!(self.mobile_identity_imsi, MobileIdentity::Imsi(_)) {
+            return Err(Error::InvalidValue {
+                context: "ADDS Transfer Ack",
+                reason: "mobile identity must be IMSI",
+            });
+        }
+        let mut body = Vec::new();
+        push_tlv(
+            &mut body,
+            IE_MOBILE_IDENTITY,
+            &self.mobile_identity_imsi.encode()?,
+        )?;
+        if let Some(tag) = self.tag {
+            push_fixed(&mut body, IE_TAG, &tag.encode());
+        }
+        if let Some(cause) = self.cause {
+            push_fixed(&mut body, IE_CAUSE, &cause.encode());
+        }
+        encode_bsmap(ADDS_TRANSFER_ACK, &body)
+    }
+
+    /// Decodes the message from the exact A1 BSMAP wire format.
+    pub fn decode(input: &[u8]) -> Result<Self> {
+        let body = parse_bsmap(ADDS_TRANSFER_ACK, input)?;
+        let mut offset = 0;
+        let mut mobile_identity_imsi = None;
+        let mut tag = None;
+        let mut cause = None;
+        while offset < body.len() {
+            match body[offset] {
+                IE_MOBILE_IDENTITY => {
+                    let (_, payload, consumed) = decode_tlv(&body[offset..])?;
+                    set_once(
+                        &mut mobile_identity_imsi,
+                        MobileIdentity::decode(payload)?,
+                        ADDS_TRANSFER_ACK,
+                        IE_MOBILE_IDENTITY,
+                    )?;
+                    offset += consumed;
+                }
+                IE_TAG => {
+                    let payload = take_fixed(&body[offset..], 4)?;
+                    set_once(&mut tag, Tag::decode(payload)?, ADDS_TRANSFER_ACK, IE_TAG)?;
+                    offset += 5;
+                }
+                IE_CAUSE => {
+                    let payload = take_fixed(&body[offset..], 1)?;
+                    set_once(
+                        &mut cause,
+                        Cause::decode(payload)?,
+                        ADDS_TRANSFER_ACK,
+                        IE_CAUSE,
+                    )?;
+                    offset += 2;
+                }
+                _ => {
+                    let (_, _, consumed) = decode_tlv(&body[offset..])?;
+                    offset += consumed;
+                }
+            }
+        }
+        Ok(Self {
+            mobile_identity_imsi: mobile_identity_imsi.ok_or(Error::MissingRequiredElement {
+                message_type: ADDS_TRANSFER_ACK,
+                id: IE_MOBILE_IDENTITY,
+            })?,
+            tag,
+            cause,
         })
     }
 }

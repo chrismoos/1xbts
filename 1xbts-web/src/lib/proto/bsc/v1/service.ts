@@ -730,6 +730,14 @@ export interface OverheadConfig {
   lpSec: number;
   ltmOff: number;
   daylt: number;
+  /**
+   * MCC and IMSI_11_12 from the Extended System Parameters Message,
+   * decoded back to digit strings ("310", "55"). Useful for the web
+   * UI's IMSI generator, which concatenates these with a 10-digit
+   * MIN to produce the 15-digit IMSI.
+   */
+  mccDigits: string;
+  imsi1112Digits: string;
 }
 
 /**
@@ -11801,6 +11809,8 @@ function createBaseOverheadConfig(): OverheadConfig {
     lpSec: 0,
     ltmOff: 0,
     daylt: 0,
+    mccDigits: "",
+    imsi1112Digits: "",
   };
 }
 
@@ -11853,6 +11863,12 @@ export const OverheadConfig: MessageFns<OverheadConfig> = {
     }
     if (message.daylt !== 0) {
       writer.uint32(128).uint32(message.daylt);
+    }
+    if (message.mccDigits !== "") {
+      writer.uint32(138).string(message.mccDigits);
+    }
+    if (message.imsi1112Digits !== "") {
+      writer.uint32(146).string(message.imsi1112Digits);
     }
     return writer;
   },
@@ -11992,6 +12008,22 @@ export const OverheadConfig: MessageFns<OverheadConfig> = {
           message.daylt = reader.uint32();
           continue;
         }
+        case 17: {
+          if (tag !== 138) {
+            break;
+          }
+
+          message.mccDigits = reader.string();
+          continue;
+        }
+        case 18: {
+          if (tag !== 146) {
+            break;
+          }
+
+          message.imsi1112Digits = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -12071,6 +12103,16 @@ export const OverheadConfig: MessageFns<OverheadConfig> = {
         ? globalThis.Number(object.ltm_off)
         : 0,
       daylt: isSet(object.daylt) ? globalThis.Number(object.daylt) : 0,
+      mccDigits: isSet(object.mccDigits)
+        ? globalThis.String(object.mccDigits)
+        : isSet(object.mcc_digits)
+        ? globalThis.String(object.mcc_digits)
+        : "",
+      imsi1112Digits: isSet(object.imsi1112Digits)
+        ? globalThis.String(object.imsi1112Digits)
+        : isSet(object.imsi_11_12_digits)
+        ? globalThis.String(object.imsi_11_12_digits)
+        : "",
     };
   },
 
@@ -12124,6 +12166,12 @@ export const OverheadConfig: MessageFns<OverheadConfig> = {
     if (message.daylt !== 0) {
       obj.daylt = Math.round(message.daylt);
     }
+    if (message.mccDigits !== "") {
+      obj.mccDigits = message.mccDigits;
+    }
+    if (message.imsi1112Digits !== "") {
+      obj.imsi1112Digits = message.imsi1112Digits;
+    }
     return obj;
   },
 
@@ -12148,6 +12196,8 @@ export const OverheadConfig: MessageFns<OverheadConfig> = {
     message.lpSec = object.lpSec ?? 0;
     message.ltmOff = object.ltmOff ?? 0;
     message.daylt = object.daylt ?? 0;
+    message.mccDigits = object.mccDigits ?? "";
+    message.imsi1112Digits = object.imsi1112Digits ?? "";
     return message;
   },
 };

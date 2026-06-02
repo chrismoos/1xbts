@@ -1,5 +1,489 @@
 syntax = "proto3";
 package events.v1;
 
-// MSC-originated events. Empty placeholder.
-message MscNetworkEvent {}
+import "google/protobuf/timestamp.proto";
+
+// MSC-originated events.
+message MscNetworkEvent {
+  oneof event {
+    OtaspEvent otasp = 1;
+  }
+}
+
+// OTASP `*228` session lifecycle. One MscNetworkEvent is emitted per
+// session-significant step (start, capability exchange, per-block results,
+// commit, termination).
+message OtaspEvent {
+  oneof kind {
+    OtaspSessionStart                 session_start                  = 1;
+    OtaspProtocolCapabilityReceived   protocol_capability_received   = 2;
+    OtaspSpcMismatch                  spc_mismatch                   = 3;
+    OtaspHlrMiss                      hlr_miss                       = 4;
+    OtaspNoNamCapacity                no_nam_capacity                = 5;
+    OtaspBlockDownloaded              block_downloaded               = 6;
+    OtaspBlockRejected                block_rejected                 = 7;
+    OtaspCommitResult                 commit_result                  = 8;
+    OtaspSessionEnded                 session_ended                  = 10;
+    OtaspSpcVerified                  spc_verified                   = 11;
+    OtaspBlockSkipped                 block_skipped                  = 12;
+    OtaspTimeout                      timeout                        = 13;
+    OtaspNamReadback                  nam_readback                   = 14;
+    OtaspStationClassMark             station_class_mark             = 15;
+    OtaspPrlReadback                  prl_readback                   = 16;
+  }
+  reserved 9;
+  reserved "nothing_to_commit";
+}
+
+// SSPR PRL read-back. One emit per session, after the segmented
+// SSPR Configuration Response retrieval completes (or is skipped).
+message OtaspPrlReadback {
+  uint32 max_pr_list_size = 1;
+  uint32 cur_pr_list_size = 2;
+  // PR_LIST_ID from the PRL Dimensions block (or the decoded PRL).
+  // Absent when nothing was retrieved.
+  optional uint32 pr_list_id = 3;
+  // Number of SSPR segment fetches performed.
+  uint32 segment_count = 4;
+  oneof outcome {
+    OtaspPrlDecoded decoded = 5;
+    OtaspPrlAbsent absent = 6;
+    OtaspPrlFeatureNotAdvertised feature_not_advertised = 7;
+    OtaspPrlRejected rejected = 9;
+    OtaspPrlDecodeFailed decode_failed = 10;
+    // Extended PRL (SSPR_P_REV >= 3) summary. The full structured
+    // decode lives in cdma_otasp::param::prl_ext and is too large
+    // for the event bus. Ships counts + CRC + raw bytes so the
+    // operator can save the PRL for inspection in the dedicated
+    // PRL editor.
+    OtaspPrlDecodedExtended decoded_extended = 11;
+  }
+}
+
+message OtaspPrlDecodedExtended {
+  uint32 pr_list_size  = 1;
+  uint32 pr_list_id    = 2;
+  uint32 cur_sspr_p_rev = 3;
+  bool   pref_only     = 4;
+  OtaspPrlRoamingIndicator def_roam_ind = 5;
+  uint32 pr_list_crc   = 6;
+  uint32 computed_crc  = 7;
+  bool   crc_ok        = 8;
+  // Counts from the PRL header so the UI can show "N acq, M sys"
+  // without rendering the whole tree.
+  uint32 num_acq_records           = 9;
+  uint32 num_common_subnet_records = 10;
+  uint32 num_ext_sys_records       = 11;
+  // The assembled on-wire bytes. Lets the operator download or
+  // import into the PRL editor for full inspection.
+  bytes raw_bytes = 12;
+}
+
+message OtaspPrlAbsent {}
+message OtaspPrlFeatureNotAdvertised {}
+
+message OtaspPrlRejected {
+  uint32 block_id    = 1;
+  uint32 result_code = 2;
+}
+
+message OtaspPrlDecodeFailed {
+  string reason = 1;
+  // Raw on-wire PRL bytes (whatever was assembled) for offline analysis.
+  bytes raw_bytes = 2;
+}
+
+message OtaspPrlDecoded {
+  // PR_LIST_SIZE field reported in the PRL header (octets).
+  uint32 pr_list_size = 1;
+  uint32 pr_list_id   = 2;
+  bool   pref_only    = 3;
+  OtaspPrlRoamingIndicator def_roam_ind = 4;
+  // PRL CRC values: `pr_list_crc` is what the MS sent; `computed_crc`
+  // is what the BS computed over the assembled bytes. They must match
+  // for `crc_ok` to be true.
+  uint32 pr_list_crc  = 5;
+  uint32 computed_crc = 6;
+  bool   crc_ok       = 7;
+  repeated OtaspPrlAcqRecord acquisition_records = 8;
+  repeated OtaspPrlSysRecord system_records      = 9;
+  // Canonical on-wire PRL bytes (re-encoded from the decoded tree;
+  // round-trip equality with the read-back is asserted by
+  // encoder_round_trip.rs). Lets the session page offer a .prl
+  // download for re-import into the editor.
+  bytes raw_bytes = 10;
+}
+
+// Roaming indicator (TSB-58). `raw` is the on-wire byte; `kind` is the
+// typed name when the spec defines one.
+message OtaspPrlRoamingIndicator {
+  uint32 raw = 1;
+  OtaspPrlRoamingIndicatorKind kind = 2;
+}
+
+enum OtaspPrlRoamingIndicatorKind {
+  OTASP_PRL_ROAMING_INDICATOR_KIND_UNSPECIFIED = 0;
+  OTASP_PRL_ROAMING_INDICATOR_KIND_ON_HOME = 1;
+  OTASP_PRL_ROAMING_INDICATOR_KIND_ROAMING = 2;
+  OTASP_PRL_ROAMING_INDICATOR_KIND_INTERNATIONAL = 3;
+  OTASP_PRL_ROAMING_INDICATOR_KIND_LTE = 4;
+  OTASP_PRL_ROAMING_INDICATOR_KIND_FLASHING = 5;
+  // Wire value outside the named set; see `raw` for the value.
+  OTASP_PRL_ROAMING_INDICATOR_KIND_OTHER = 6;
+}
+
+message OtaspPrlAcqRecord {
+  // Raw ACQ_TYPE nibble (0–15). Provides ground truth even for record
+  // types this decoder doesn't know yet.
+  uint32 acq_type_raw = 1;
+  oneof body {
+    OtaspPrlAcqCellularAnalog cellular_analog = 2;
+    OtaspPrlAcqCellularCdmaStandard cellular_cdma_standard = 3;
+    OtaspPrlAcqCellularCdmaCustom cellular_cdma_custom = 4;
+    OtaspPrlAcqCellularCdmaPreferred cellular_cdma_preferred = 5;
+    OtaspPrlAcqPcsCdmaUsingBlocks pcs_cdma_using_blocks = 6;
+    OtaspPrlAcqPcsCdmaUsingChannels pcs_cdma_using_channels = 7;
+    OtaspPrlAcqJtacsCdmaStandard jtacs_cdma_standard = 8;
+    OtaspPrlAcqJtacsCdmaCustom jtacs_cdma_custom = 9;
+    OtaspPrlAcqBandClass6UsingChannels band_class6_using_channels = 10;
+    OtaspPrlAcqUnknown unknown = 11;
+  }
+}
+
+enum OtaspPrlAbSelection {
+  OTASP_PRL_AB_SELECTION_UNSPECIFIED = 0;
+  OTASP_PRL_AB_SELECTION_SYSTEM_A = 1;
+  OTASP_PRL_AB_SELECTION_SYSTEM_B = 2;
+  OTASP_PRL_AB_SELECTION_RESERVED = 3;
+  OTASP_PRL_AB_SELECTION_EITHER = 4;
+}
+
+enum OtaspPrlStandardChannel {
+  OTASP_PRL_STANDARD_CHANNEL_UNSPECIFIED = 0;
+  OTASP_PRL_STANDARD_CHANNEL_RESERVED = 1;
+  OTASP_PRL_STANDARD_CHANNEL_PRIMARY = 2;
+  OTASP_PRL_STANDARD_CHANNEL_SECONDARY = 3;
+  OTASP_PRL_STANDARD_CHANNEL_PRIMARY_OR_SECONDARY = 4;
+}
+
+enum OtaspPrlPcsBlock {
+  OTASP_PRL_PCS_BLOCK_UNSPECIFIED = 0;
+  OTASP_PRL_PCS_BLOCK_A = 1;
+  OTASP_PRL_PCS_BLOCK_B = 2;
+  OTASP_PRL_PCS_BLOCK_C = 3;
+  OTASP_PRL_PCS_BLOCK_D = 4;
+  OTASP_PRL_PCS_BLOCK_E = 5;
+  OTASP_PRL_PCS_BLOCK_F = 6;
+  OTASP_PRL_PCS_BLOCK_RESERVED = 7;
+  OTASP_PRL_PCS_BLOCK_ANY = 8;
+}
+
+message OtaspPrlAcqCellularAnalog { OtaspPrlAbSelection ab = 1; }
+message OtaspPrlAcqCellularCdmaStandard {
+  OtaspPrlAbSelection ab = 1;
+  OtaspPrlStandardChannel pri_sec = 2;
+}
+message OtaspPrlAcqCellularCdmaCustom { repeated uint32 channels = 1; }
+message OtaspPrlAcqCellularCdmaPreferred { OtaspPrlAbSelection ab = 1; }
+message OtaspPrlAcqPcsCdmaUsingBlocks { repeated OtaspPrlPcsBlock blocks = 1; }
+message OtaspPrlAcqPcsCdmaUsingChannels { repeated uint32 channels = 1; }
+message OtaspPrlAcqJtacsCdmaStandard {
+  OtaspPrlAbSelection ab = 1;
+  OtaspPrlStandardChannel pri_sec = 2;
+}
+message OtaspPrlAcqJtacsCdmaCustom { repeated uint32 channels = 1; }
+message OtaspPrlAcqBandClass6UsingChannels { repeated uint32 channels = 1; }
+message OtaspPrlAcqUnknown {}
+
+enum OtaspPrlNidInclusion {
+  OTASP_PRL_NID_INCLUSION_UNSPECIFIED = 0;
+  // NID omitted on wire, assume 0xFFFF (any-NID wildcard).
+  OTASP_PRL_NID_INCLUSION_ANY = 1;
+  // NID explicit on wire.
+  OTASP_PRL_NID_INCLUSION_SINGLE = 2;
+  // NID omitted, assume 0x0000 (public NID).
+  OTASP_PRL_NID_INCLUSION_PUBLIC = 3;
+  OTASP_PRL_NID_INCLUSION_RESERVED = 4;
+}
+
+enum OtaspPrlPrefNeg {
+  OTASP_PRL_PREF_NEG_UNSPECIFIED = 0;
+  OTASP_PRL_PREF_NEG_PREFERRED = 1;
+  OTASP_PRL_PREF_NEG_NEGATIVE = 2;
+}
+
+enum OtaspPrlPriority {
+  OTASP_PRL_PRIORITY_UNSPECIFIED = 0;
+  OTASP_PRL_PRIORITY_MORE_DESIRABLE = 1;
+  OTASP_PRL_PRIORITY_EQUALLY_DESIRABLE = 2;
+}
+
+message OtaspPrlSysRecord {
+  uint32 sid = 1;
+  OtaspPrlNidInclusion nid_incl = 2;
+  // Present iff `nid_incl == SINGLE`.
+  optional uint32 nid = 3;
+  bool same_geo_as_prev = 4;
+  OtaspPrlPrefNeg pref_neg = 5;
+  uint32 acq_index = 6;
+  // Present iff `pref_neg == PREFERRED`.
+  optional OtaspPrlRoamingIndicator roaming_indicator = 7;
+  optional OtaspPrlPriority priority = 8;
+}
+
+message OtaspSpcVerified {}
+
+message OtaspBlockSkipped {
+  uint32 block_id = 1;
+  // Human-readable reason; today always "MS did not advertise FEATURE_ID=0xNN".
+  string reason   = 2;
+  OtaspBlockFeature feature = 3;
+}
+
+message OtaspTimeout {
+  // Brief label naming what we were waiting on when the timer fired.
+  string phase = 1;
+}
+
+message OtaspNamReadback {
+  uint32 block_id = 1;
+  // Human-readable block name, e.g. "CDMA/Analog NAM".
+  string label = 2;
+  // Ordered (field_name, value) pairs decoded from the read-back, ready for
+  // operator display. Order is preserved so the UI can show fields in
+  // spec/intuitive order.
+  repeated OtaspNamReadbackField fields = 3;
+  OtaspBlockFeature feature = 4;
+}
+
+message OtaspNamReadbackField {
+  string name  = 1;
+  string value = 2;
+}
+
+// Decoded Station Class Mark per C.S0005-E §2.3.3 Table 2.3.3-1.
+message OtaspStationClassMark {
+  // Original SCM byte for reference.
+  uint32 raw = 1;
+  OtaspScmExtended    extended            = 2;
+  OtaspScmDualMode    dual_mode           = 3;
+  OtaspScmSlottedClass slotted_class      = 4;
+  OtaspScmMeidSupport meid_support        = 5;
+  // Bit 3 — spec mandates 1.
+  bool                bandwidth_25mhz     = 6;
+  OtaspScmTransmission transmission       = 7;
+  // Power Class for Band Class 0 Analog (bits 1–0). Spec mandates 00 for
+  // CDMA-only stations; legacy radios may set non-zero.
+  uint32              analog_power_class  = 8;
+}
+
+enum OtaspScmExtended {
+  OTASP_SCM_EXTENDED_UNSPECIFIED = 0;
+  OTASP_SCM_EXTENDED_STANDARD_BANDS = 1;
+  // Bit 7 = 1. Band Classes 1, 4, 14 (PCS family).
+  OTASP_SCM_EXTENDED_PCS_FAMILY = 2;
+}
+
+enum OtaspScmDualMode {
+  OTASP_SCM_DUAL_MODE_UNSPECIFIED = 0;
+  // Spec mandates this value; analog support deprecated.
+  OTASP_SCM_DUAL_MODE_CDMA_ONLY = 1;
+  OTASP_SCM_DUAL_MODE_DUAL = 2;
+}
+
+enum OtaspScmSlottedClass {
+  OTASP_SCM_SLOTTED_CLASS_UNSPECIFIED = 0;
+  OTASP_SCM_SLOTTED_CLASS_NON_SLOTTED = 1;
+  OTASP_SCM_SLOTTED_CLASS_SLOTTED = 2;
+}
+
+enum OtaspScmMeidSupport {
+  OTASP_SCM_MEID_SUPPORT_UNSPECIFIED = 0;
+  OTASP_SCM_MEID_SUPPORT_NOT_CONFIGURED = 1;
+  OTASP_SCM_MEID_SUPPORT_CONFIGURED = 2;
+}
+
+enum OtaspScmTransmission {
+  OTASP_SCM_TRANSMISSION_UNSPECIFIED = 0;
+  OTASP_SCM_TRANSMISSION_CONTINUOUS = 1;
+  // DTX — MS may stop transmitting between voice frames.
+  OTASP_SCM_TRANSMISSION_DISCONTINUOUS = 2;
+}
+
+// Hardware identity reported by the originating mobile. Either or both may
+// be set; OTASP originations carry ESN-only (`MSID_TYPE = 000`) or
+// MEID-only (`MSID_TYPE = 011`).
+message OtaspHardwareIdentity {
+  uint32 esn  = 1;
+  string meid = 2;
+}
+
+message OtaspSessionStart {
+  OtaspHardwareIdentity device = 1;
+  string feature_code = 2;
+  uint32 service_option = 3;
+}
+
+message OtaspProtocolCapabilityReceived {
+  uint32 mob_firm_rev = 1;
+  uint32 mob_model    = 2;
+  // Decoded BAND_MODE_CAP byte per C.S0016-D Table 3.5.1.7-2.
+  OtaspBandModeCap band_mode_cap = 3;
+  // OTASP_P_REV the MS reports, from the OTASP feature entry in the features
+  // list (Table 3.5.1.7-1, FEATURE_ID = 0x04). Absent if the MS did not report it.
+  optional uint32 otasp_p_rev = 4;
+  // All (FEATURE_ID, FEATURE_P_REV) pairs the MS advertised. Per C.S0016-D
+  // Table 3.5.1.7-1 — FEATURE_IDs 0x00=NAM, 0x04=OTASP, 0x09=System Tag, etc.
+  repeated OtaspFeatureCapability features = 5;
+}
+
+// Decoded BAND_MODE_CAP byte per C.S0016-D Table 3.5.1.7-2. Bits MSB→LSB.
+message OtaspBandModeCap {
+  // On-wire byte for reference.
+  uint32 raw = 1;
+  // Bit 7.
+  bool band_class_0_analog = 2;
+  // Bit 6. Cellular CDMA (800 MHz).
+  bool band_class_0_cdma   = 3;
+  // Bit 5. PCS CDMA (1900 MHz).
+  bool band_class_1_cdma   = 4;
+  // Bit 4. JTACS / Japanese 800 MHz.
+  bool band_class_3_cdma   = 5;
+  // Bit 3. 2 GHz.
+  bool band_class_6_cdma   = 6;
+  // Bits 2–0. Spec mandates 0; kept so non-compliant MS values stay visible.
+  uint32 reserved          = 7;
+}
+
+message OtaspFeatureCapability {
+  OtaspFeatureId feature_id = 1;
+  uint32 feature_p_rev     = 2;
+  // Raw FEATURE_ID octet. Kept alongside the enum so reserved,
+  // manufacturer-specific, and future-standardized values survive JSON
+  // rendering even when they are not named in this schema revision.
+  uint32 feature_id_raw = 3;
+}
+
+// C.S0016-D Table 3.5.1.7-1 — Protocol Capability Response FEATURE_ID.
+// Values 0x0C..0xBF are reserved for future standardization, 0xC0..0xFE are
+// manufacturer-specific, and 0xFF is reserved.
+enum OtaspFeatureId {
+  OTASP_FEATURE_ID_NAM_DOWNLOAD = 0;
+  OTASP_FEATURE_ID_KEY_EXCHANGE = 1;
+  OTASP_FEATURE_ID_SSPR = 2;
+  OTASP_FEATURE_ID_SERVICE_PROGRAMMING_LOCK = 3;
+  OTASP_FEATURE_ID_OTASP = 4;
+  OTASP_FEATURE_ID_PUZL = 5;
+  OTASP_FEATURE_ID_PACKET_DATA_3GPD = 6;
+  OTASP_FEATURE_ID_SECURE_MODE = 7;
+  OTASP_FEATURE_ID_MMD = 8;
+  OTASP_FEATURE_ID_SYSTEM_TAG_DOWNLOAD = 9;
+  OTASP_FEATURE_ID_MMS = 10;
+  OTASP_FEATURE_ID_MMSS = 11;
+
+  reserved 12 to 191;
+  reserved 192 to 254;
+  reserved 255;
+}
+
+message OtaspSpcMismatch {}
+
+message OtaspHlrMiss {
+  OtaspHardwareIdentity device = 1;
+}
+
+message OtaspNoNamCapacity {
+  // NAM block ID that reported `MAX_SID_NID = 0`.
+  uint32 block_id = 1;
+  // Always NAM in practice today (NoNamCapacity is NAM-specific) but
+  // carried for label-rendering consistency.
+  OtaspBlockFeature feature = 2;
+}
+
+// Disambiguates which feature space the `block_id` lives in for events
+// that carry one. Multiple feature spaces overload the low BLOCK_ID
+// values (0x00 = CDMA/Analog NAM in NAM space but = Home System Tag in
+// the System Tag space, etc.), so consumers need this discriminator to
+// render the right label.
+enum OtaspBlockFeature {
+  // Set when the event was recorded before the discriminator existed
+  // (pre-2026-06 sessions). Renderers must show the raw BLOCK_ID
+  // value rather than guess at the family.
+  OTASP_BLOCK_FEATURE_UNSPECIFIED = 0;
+  OTASP_BLOCK_FEATURE_NAM = 1;
+  OTASP_BLOCK_FEATURE_SYSTEM_TAG = 2;
+  OTASP_BLOCK_FEATURE_MMS_URI = 3;
+  OTASP_BLOCK_FEATURE_PRL = 4;
+}
+
+// OTASP RESULT_CODE per C.S0016-D Table 3.5.1.2-1. Variant numbers equal
+// the standard wire value so producers may set the raw `uint32 result_code`
+// on `OtaspBlockDownloaded` / `OtaspBlockRejected` / `OtaspCommitResult`
+// directly and consumers can name-check known values.
+enum OtaspResultCode {
+  OTASP_RESULT_CODE_ACCEPTED = 0;
+  OTASP_RESULT_CODE_REJECTED_UNKNOWN = 1;
+  OTASP_RESULT_CODE_REJECTED_DATA_SIZE_MISMATCH = 2;
+  OTASP_RESULT_CODE_REJECTED_PROTOCOL_VERSION_MISMATCH = 3;
+  OTASP_RESULT_CODE_REJECTED_INVALID_PARAMETER = 4;
+  OTASP_RESULT_CODE_REJECTED_SID_NID_LENGTH_MISMATCH = 5;
+  OTASP_RESULT_CODE_REJECTED_MESSAGE_NOT_EXPECTED_IN_MODE = 6;
+  OTASP_RESULT_CODE_REJECTED_BLOCK_ID_NOT_SUPPORTED = 7;
+  OTASP_RESULT_CODE_REJECTED_PRL_LENGTH_MISMATCH = 8;
+  OTASP_RESULT_CODE_REJECTED_CRC_ERROR = 9;
+  OTASP_RESULT_CODE_REJECTED_MOBILE_STATION_LOCKED = 10;
+  OTASP_RESULT_CODE_REJECTED_INVALID_SPC = 11;
+  OTASP_RESULT_CODE_REJECTED_SPC_CHANGE_DENIED_BY_USER = 12;
+  OTASP_RESULT_CODE_REJECTED_INVALID_SPASM = 13;
+  OTASP_RESULT_CODE_REJECTED_BLOCK_ID_NOT_EXPECTED_IN_MODE = 14;
+}
+
+message OtaspBlockDownloaded {
+  uint32 block_id    = 1;
+  uint32 result_code = 2;
+  OtaspBlockFeature feature = 3;
+  // Decoded values written to the MS for this block, in the same
+  // shape as `OtaspNamReadback.fields`. Empty for blocks with no
+  // structured field view (PRL push).
+  repeated OtaspNamReadbackField fields = 4;
+}
+
+message OtaspBlockRejected {
+  uint32 block_id    = 1;
+  uint32 result_code = 2;
+  OtaspBlockFeature feature = 3;
+}
+
+message OtaspCommitResult {
+  uint32 result_code = 1;
+}
+
+enum OtaspSessionOutcome {
+  OTASP_SESSION_OUTCOME_UNSPECIFIED = 0;
+  OTASP_SESSION_OUTCOME_COMMITTED = 1;
+  OTASP_SESSION_OUTCOME_SPC_REJECTED = 2;
+  OTASP_SESSION_OUTCOME_HLR_UNKNOWN = 3;
+  OTASP_SESSION_OUTCOME_REJECTED = 4;
+  OTASP_SESSION_OUTCOME_NO_CAPACITY = 5;
+  OTASP_SESSION_OUTCOME_PROTOCOL_ERROR = 6;
+  OTASP_SESSION_OUTCOME_NOTHING_TO_COMMIT = 7;
+  OTASP_SESSION_OUTCOME_TIMED_OUT = 8;
+}
+
+message OtaspSessionEnded {
+  uint32 completed_blocks = 1;
+  OtaspSessionOutcome outcome = 2;
+}
+
+// One event entry in a persisted session timeline.
+message OtaspRecordedEvent {
+  google.protobuf.Timestamp timestamp = 1;
+  OtaspEvent event = 2;
+}
+
+// Storage wrapper for the full event timeline. Encoded once by MSC at
+// save time and stored verbatim in `otasp_sessions.events_proto`; HLR
+// decodes it on GetOtaspSession.
+message OtaspRecordedEvents {
+  repeated OtaspRecordedEvent events = 1;
+}

@@ -1,5 +1,12 @@
 # HEAD 
 
+- Added OTASP (`*228`) over-the-air provisioning. Dial `*228` to
+  program the handset's CDMA/Analog NAM (IMSI, MDN, home system
+  banner), MMS URI, and Preferred Roaming List (classic and
+  extended). PRL can be managed in the web interface. Writes are
+  off by default — set
+  `otasp.writes.{cdma_analog_nam,mdn,cdma_nam,home_system_tag,mms_uri,prl}`
+  in `config/msc.json` to enable.
 - Fixed a LimeSDR crash on BTS shutdown. Fixes #19.
 - Added initial support for Mobile IP via `packet.mobile_ip.enabled` for
   devices that use it instead of Simple IP.

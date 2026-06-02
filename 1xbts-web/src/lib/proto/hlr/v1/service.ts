@@ -7,6 +7,12 @@
 /* eslint-disable */
 import { BinaryReader, BinaryWriter } from "@bufbuild/protobuf/wire";
 import type { CallContext, CallOptions } from "nice-grpc-common";
+import {
+  OtaspRecordedEvent,
+  OtaspSessionOutcome,
+  otaspSessionOutcomeFromJSON,
+  otaspSessionOutcomeToJSON,
+} from "../../events/v1/msc";
 import { Empty } from "../../google/protobuf/empty";
 import { Timestamp } from "../../google/protobuf/timestamp";
 
@@ -183,6 +189,432 @@ export function subscriberStatusToJSON(object: SubscriberStatus): string {
   }
 }
 
+export enum PrlRoamingIndicatorKind {
+  PRL_ROAMING_INDICATOR_KIND_UNSPECIFIED = 0,
+  PRL_ROAMING_INDICATOR_KIND_ON_HOME = 1,
+  PRL_ROAMING_INDICATOR_KIND_ROAMING = 2,
+  PRL_ROAMING_INDICATOR_KIND_INTERNATIONAL = 3,
+  PRL_ROAMING_INDICATOR_KIND_LTE = 4,
+  PRL_ROAMING_INDICATOR_KIND_FLASHING = 5,
+  PRL_ROAMING_INDICATOR_KIND_OTHER = 6,
+  UNRECOGNIZED = -1,
+}
+
+export function prlRoamingIndicatorKindFromJSON(object: any): PrlRoamingIndicatorKind {
+  switch (object) {
+    case 0:
+    case "PRL_ROAMING_INDICATOR_KIND_UNSPECIFIED":
+      return PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_UNSPECIFIED;
+    case 1:
+    case "PRL_ROAMING_INDICATOR_KIND_ON_HOME":
+      return PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_ON_HOME;
+    case 2:
+    case "PRL_ROAMING_INDICATOR_KIND_ROAMING":
+      return PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_ROAMING;
+    case 3:
+    case "PRL_ROAMING_INDICATOR_KIND_INTERNATIONAL":
+      return PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_INTERNATIONAL;
+    case 4:
+    case "PRL_ROAMING_INDICATOR_KIND_LTE":
+      return PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_LTE;
+    case 5:
+    case "PRL_ROAMING_INDICATOR_KIND_FLASHING":
+      return PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_FLASHING;
+    case 6:
+    case "PRL_ROAMING_INDICATOR_KIND_OTHER":
+      return PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_OTHER;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return PrlRoamingIndicatorKind.UNRECOGNIZED;
+  }
+}
+
+export function prlRoamingIndicatorKindToJSON(object: PrlRoamingIndicatorKind): string {
+  switch (object) {
+    case PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_UNSPECIFIED:
+      return "PRL_ROAMING_INDICATOR_KIND_UNSPECIFIED";
+    case PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_ON_HOME:
+      return "PRL_ROAMING_INDICATOR_KIND_ON_HOME";
+    case PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_ROAMING:
+      return "PRL_ROAMING_INDICATOR_KIND_ROAMING";
+    case PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_INTERNATIONAL:
+      return "PRL_ROAMING_INDICATOR_KIND_INTERNATIONAL";
+    case PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_LTE:
+      return "PRL_ROAMING_INDICATOR_KIND_LTE";
+    case PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_FLASHING:
+      return "PRL_ROAMING_INDICATOR_KIND_FLASHING";
+    case PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_OTHER:
+      return "PRL_ROAMING_INDICATOR_KIND_OTHER";
+    case PrlRoamingIndicatorKind.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
+export enum PrlAbSelection {
+  PRL_AB_SELECTION_UNSPECIFIED = 0,
+  PRL_AB_SELECTION_SYSTEM_A = 1,
+  PRL_AB_SELECTION_SYSTEM_B = 2,
+  PRL_AB_SELECTION_RESERVED = 3,
+  PRL_AB_SELECTION_EITHER = 4,
+  UNRECOGNIZED = -1,
+}
+
+export function prlAbSelectionFromJSON(object: any): PrlAbSelection {
+  switch (object) {
+    case 0:
+    case "PRL_AB_SELECTION_UNSPECIFIED":
+      return PrlAbSelection.PRL_AB_SELECTION_UNSPECIFIED;
+    case 1:
+    case "PRL_AB_SELECTION_SYSTEM_A":
+      return PrlAbSelection.PRL_AB_SELECTION_SYSTEM_A;
+    case 2:
+    case "PRL_AB_SELECTION_SYSTEM_B":
+      return PrlAbSelection.PRL_AB_SELECTION_SYSTEM_B;
+    case 3:
+    case "PRL_AB_SELECTION_RESERVED":
+      return PrlAbSelection.PRL_AB_SELECTION_RESERVED;
+    case 4:
+    case "PRL_AB_SELECTION_EITHER":
+      return PrlAbSelection.PRL_AB_SELECTION_EITHER;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return PrlAbSelection.UNRECOGNIZED;
+  }
+}
+
+export function prlAbSelectionToJSON(object: PrlAbSelection): string {
+  switch (object) {
+    case PrlAbSelection.PRL_AB_SELECTION_UNSPECIFIED:
+      return "PRL_AB_SELECTION_UNSPECIFIED";
+    case PrlAbSelection.PRL_AB_SELECTION_SYSTEM_A:
+      return "PRL_AB_SELECTION_SYSTEM_A";
+    case PrlAbSelection.PRL_AB_SELECTION_SYSTEM_B:
+      return "PRL_AB_SELECTION_SYSTEM_B";
+    case PrlAbSelection.PRL_AB_SELECTION_RESERVED:
+      return "PRL_AB_SELECTION_RESERVED";
+    case PrlAbSelection.PRL_AB_SELECTION_EITHER:
+      return "PRL_AB_SELECTION_EITHER";
+    case PrlAbSelection.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
+export enum PrlStandardChannel {
+  PRL_STANDARD_CHANNEL_UNSPECIFIED = 0,
+  PRL_STANDARD_CHANNEL_RESERVED = 1,
+  PRL_STANDARD_CHANNEL_PRIMARY = 2,
+  PRL_STANDARD_CHANNEL_SECONDARY = 3,
+  PRL_STANDARD_CHANNEL_PRIMARY_OR_SECONDARY = 4,
+  UNRECOGNIZED = -1,
+}
+
+export function prlStandardChannelFromJSON(object: any): PrlStandardChannel {
+  switch (object) {
+    case 0:
+    case "PRL_STANDARD_CHANNEL_UNSPECIFIED":
+      return PrlStandardChannel.PRL_STANDARD_CHANNEL_UNSPECIFIED;
+    case 1:
+    case "PRL_STANDARD_CHANNEL_RESERVED":
+      return PrlStandardChannel.PRL_STANDARD_CHANNEL_RESERVED;
+    case 2:
+    case "PRL_STANDARD_CHANNEL_PRIMARY":
+      return PrlStandardChannel.PRL_STANDARD_CHANNEL_PRIMARY;
+    case 3:
+    case "PRL_STANDARD_CHANNEL_SECONDARY":
+      return PrlStandardChannel.PRL_STANDARD_CHANNEL_SECONDARY;
+    case 4:
+    case "PRL_STANDARD_CHANNEL_PRIMARY_OR_SECONDARY":
+      return PrlStandardChannel.PRL_STANDARD_CHANNEL_PRIMARY_OR_SECONDARY;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return PrlStandardChannel.UNRECOGNIZED;
+  }
+}
+
+export function prlStandardChannelToJSON(object: PrlStandardChannel): string {
+  switch (object) {
+    case PrlStandardChannel.PRL_STANDARD_CHANNEL_UNSPECIFIED:
+      return "PRL_STANDARD_CHANNEL_UNSPECIFIED";
+    case PrlStandardChannel.PRL_STANDARD_CHANNEL_RESERVED:
+      return "PRL_STANDARD_CHANNEL_RESERVED";
+    case PrlStandardChannel.PRL_STANDARD_CHANNEL_PRIMARY:
+      return "PRL_STANDARD_CHANNEL_PRIMARY";
+    case PrlStandardChannel.PRL_STANDARD_CHANNEL_SECONDARY:
+      return "PRL_STANDARD_CHANNEL_SECONDARY";
+    case PrlStandardChannel.PRL_STANDARD_CHANNEL_PRIMARY_OR_SECONDARY:
+      return "PRL_STANDARD_CHANNEL_PRIMARY_OR_SECONDARY";
+    case PrlStandardChannel.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
+export enum PrlPcsBlock {
+  PRL_PCS_BLOCK_UNSPECIFIED = 0,
+  PRL_PCS_BLOCK_A = 1,
+  PRL_PCS_BLOCK_B = 2,
+  PRL_PCS_BLOCK_C = 3,
+  PRL_PCS_BLOCK_D = 4,
+  PRL_PCS_BLOCK_E = 5,
+  PRL_PCS_BLOCK_F = 6,
+  PRL_PCS_BLOCK_RESERVED = 7,
+  PRL_PCS_BLOCK_ANY = 8,
+  UNRECOGNIZED = -1,
+}
+
+export function prlPcsBlockFromJSON(object: any): PrlPcsBlock {
+  switch (object) {
+    case 0:
+    case "PRL_PCS_BLOCK_UNSPECIFIED":
+      return PrlPcsBlock.PRL_PCS_BLOCK_UNSPECIFIED;
+    case 1:
+    case "PRL_PCS_BLOCK_A":
+      return PrlPcsBlock.PRL_PCS_BLOCK_A;
+    case 2:
+    case "PRL_PCS_BLOCK_B":
+      return PrlPcsBlock.PRL_PCS_BLOCK_B;
+    case 3:
+    case "PRL_PCS_BLOCK_C":
+      return PrlPcsBlock.PRL_PCS_BLOCK_C;
+    case 4:
+    case "PRL_PCS_BLOCK_D":
+      return PrlPcsBlock.PRL_PCS_BLOCK_D;
+    case 5:
+    case "PRL_PCS_BLOCK_E":
+      return PrlPcsBlock.PRL_PCS_BLOCK_E;
+    case 6:
+    case "PRL_PCS_BLOCK_F":
+      return PrlPcsBlock.PRL_PCS_BLOCK_F;
+    case 7:
+    case "PRL_PCS_BLOCK_RESERVED":
+      return PrlPcsBlock.PRL_PCS_BLOCK_RESERVED;
+    case 8:
+    case "PRL_PCS_BLOCK_ANY":
+      return PrlPcsBlock.PRL_PCS_BLOCK_ANY;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return PrlPcsBlock.UNRECOGNIZED;
+  }
+}
+
+export function prlPcsBlockToJSON(object: PrlPcsBlock): string {
+  switch (object) {
+    case PrlPcsBlock.PRL_PCS_BLOCK_UNSPECIFIED:
+      return "PRL_PCS_BLOCK_UNSPECIFIED";
+    case PrlPcsBlock.PRL_PCS_BLOCK_A:
+      return "PRL_PCS_BLOCK_A";
+    case PrlPcsBlock.PRL_PCS_BLOCK_B:
+      return "PRL_PCS_BLOCK_B";
+    case PrlPcsBlock.PRL_PCS_BLOCK_C:
+      return "PRL_PCS_BLOCK_C";
+    case PrlPcsBlock.PRL_PCS_BLOCK_D:
+      return "PRL_PCS_BLOCK_D";
+    case PrlPcsBlock.PRL_PCS_BLOCK_E:
+      return "PRL_PCS_BLOCK_E";
+    case PrlPcsBlock.PRL_PCS_BLOCK_F:
+      return "PRL_PCS_BLOCK_F";
+    case PrlPcsBlock.PRL_PCS_BLOCK_RESERVED:
+      return "PRL_PCS_BLOCK_RESERVED";
+    case PrlPcsBlock.PRL_PCS_BLOCK_ANY:
+      return "PRL_PCS_BLOCK_ANY";
+    case PrlPcsBlock.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
+export enum PrlNidInclusion {
+  PRL_NID_INCLUSION_UNSPECIFIED = 0,
+  PRL_NID_INCLUSION_ANY = 1,
+  PRL_NID_INCLUSION_SINGLE = 2,
+  PRL_NID_INCLUSION_PUBLIC = 3,
+  PRL_NID_INCLUSION_RESERVED = 4,
+  UNRECOGNIZED = -1,
+}
+
+export function prlNidInclusionFromJSON(object: any): PrlNidInclusion {
+  switch (object) {
+    case 0:
+    case "PRL_NID_INCLUSION_UNSPECIFIED":
+      return PrlNidInclusion.PRL_NID_INCLUSION_UNSPECIFIED;
+    case 1:
+    case "PRL_NID_INCLUSION_ANY":
+      return PrlNidInclusion.PRL_NID_INCLUSION_ANY;
+    case 2:
+    case "PRL_NID_INCLUSION_SINGLE":
+      return PrlNidInclusion.PRL_NID_INCLUSION_SINGLE;
+    case 3:
+    case "PRL_NID_INCLUSION_PUBLIC":
+      return PrlNidInclusion.PRL_NID_INCLUSION_PUBLIC;
+    case 4:
+    case "PRL_NID_INCLUSION_RESERVED":
+      return PrlNidInclusion.PRL_NID_INCLUSION_RESERVED;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return PrlNidInclusion.UNRECOGNIZED;
+  }
+}
+
+export function prlNidInclusionToJSON(object: PrlNidInclusion): string {
+  switch (object) {
+    case PrlNidInclusion.PRL_NID_INCLUSION_UNSPECIFIED:
+      return "PRL_NID_INCLUSION_UNSPECIFIED";
+    case PrlNidInclusion.PRL_NID_INCLUSION_ANY:
+      return "PRL_NID_INCLUSION_ANY";
+    case PrlNidInclusion.PRL_NID_INCLUSION_SINGLE:
+      return "PRL_NID_INCLUSION_SINGLE";
+    case PrlNidInclusion.PRL_NID_INCLUSION_PUBLIC:
+      return "PRL_NID_INCLUSION_PUBLIC";
+    case PrlNidInclusion.PRL_NID_INCLUSION_RESERVED:
+      return "PRL_NID_INCLUSION_RESERVED";
+    case PrlNidInclusion.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
+export enum PrlPrefNeg {
+  PRL_PREF_NEG_UNSPECIFIED = 0,
+  PRL_PREF_NEG_PREFERRED = 1,
+  PRL_PREF_NEG_NEGATIVE = 2,
+  UNRECOGNIZED = -1,
+}
+
+export function prlPrefNegFromJSON(object: any): PrlPrefNeg {
+  switch (object) {
+    case 0:
+    case "PRL_PREF_NEG_UNSPECIFIED":
+      return PrlPrefNeg.PRL_PREF_NEG_UNSPECIFIED;
+    case 1:
+    case "PRL_PREF_NEG_PREFERRED":
+      return PrlPrefNeg.PRL_PREF_NEG_PREFERRED;
+    case 2:
+    case "PRL_PREF_NEG_NEGATIVE":
+      return PrlPrefNeg.PRL_PREF_NEG_NEGATIVE;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return PrlPrefNeg.UNRECOGNIZED;
+  }
+}
+
+export function prlPrefNegToJSON(object: PrlPrefNeg): string {
+  switch (object) {
+    case PrlPrefNeg.PRL_PREF_NEG_UNSPECIFIED:
+      return "PRL_PREF_NEG_UNSPECIFIED";
+    case PrlPrefNeg.PRL_PREF_NEG_PREFERRED:
+      return "PRL_PREF_NEG_PREFERRED";
+    case PrlPrefNeg.PRL_PREF_NEG_NEGATIVE:
+      return "PRL_PREF_NEG_NEGATIVE";
+    case PrlPrefNeg.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
+export enum PrlPriority {
+  PRL_PRIORITY_UNSPECIFIED = 0,
+  PRL_PRIORITY_MORE_DESIRABLE = 1,
+  PRL_PRIORITY_EQUALLY_DESIRABLE = 2,
+  UNRECOGNIZED = -1,
+}
+
+export function prlPriorityFromJSON(object: any): PrlPriority {
+  switch (object) {
+    case 0:
+    case "PRL_PRIORITY_UNSPECIFIED":
+      return PrlPriority.PRL_PRIORITY_UNSPECIFIED;
+    case 1:
+    case "PRL_PRIORITY_MORE_DESIRABLE":
+      return PrlPriority.PRL_PRIORITY_MORE_DESIRABLE;
+    case 2:
+    case "PRL_PRIORITY_EQUALLY_DESIRABLE":
+      return PrlPriority.PRL_PRIORITY_EQUALLY_DESIRABLE;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return PrlPriority.UNRECOGNIZED;
+  }
+}
+
+export function prlPriorityToJSON(object: PrlPriority): string {
+  switch (object) {
+    case PrlPriority.PRL_PRIORITY_UNSPECIFIED:
+      return "PRL_PRIORITY_UNSPECIFIED";
+    case PrlPriority.PRL_PRIORITY_MORE_DESIRABLE:
+      return "PRL_PRIORITY_MORE_DESIRABLE";
+    case PrlPriority.PRL_PRIORITY_EQUALLY_DESIRABLE:
+      return "PRL_PRIORITY_EQUALLY_DESIRABLE";
+    case PrlPriority.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
+export enum PrlExtSysRecordType {
+  PRL_EXT_SYS_RECORD_TYPE_UNSPECIFIED = 0,
+  PRL_EXT_SYS_RECORD_TYPE_CDMA2000 = 1,
+  PRL_EXT_SYS_RECORD_TYPE_HRPD = 2,
+  PRL_EXT_SYS_RECORD_TYPE_RESERVED_OBSOLETE = 3,
+  PRL_EXT_SYS_RECORD_TYPE_MCC_MNC = 4,
+  PRL_EXT_SYS_RECORD_TYPE_RESERVED = 5,
+  UNRECOGNIZED = -1,
+}
+
+export function prlExtSysRecordTypeFromJSON(object: any): PrlExtSysRecordType {
+  switch (object) {
+    case 0:
+    case "PRL_EXT_SYS_RECORD_TYPE_UNSPECIFIED":
+      return PrlExtSysRecordType.PRL_EXT_SYS_RECORD_TYPE_UNSPECIFIED;
+    case 1:
+    case "PRL_EXT_SYS_RECORD_TYPE_CDMA2000":
+      return PrlExtSysRecordType.PRL_EXT_SYS_RECORD_TYPE_CDMA2000;
+    case 2:
+    case "PRL_EXT_SYS_RECORD_TYPE_HRPD":
+      return PrlExtSysRecordType.PRL_EXT_SYS_RECORD_TYPE_HRPD;
+    case 3:
+    case "PRL_EXT_SYS_RECORD_TYPE_RESERVED_OBSOLETE":
+      return PrlExtSysRecordType.PRL_EXT_SYS_RECORD_TYPE_RESERVED_OBSOLETE;
+    case 4:
+    case "PRL_EXT_SYS_RECORD_TYPE_MCC_MNC":
+      return PrlExtSysRecordType.PRL_EXT_SYS_RECORD_TYPE_MCC_MNC;
+    case 5:
+    case "PRL_EXT_SYS_RECORD_TYPE_RESERVED":
+      return PrlExtSysRecordType.PRL_EXT_SYS_RECORD_TYPE_RESERVED;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return PrlExtSysRecordType.UNRECOGNIZED;
+  }
+}
+
+export function prlExtSysRecordTypeToJSON(object: PrlExtSysRecordType): string {
+  switch (object) {
+    case PrlExtSysRecordType.PRL_EXT_SYS_RECORD_TYPE_UNSPECIFIED:
+      return "PRL_EXT_SYS_RECORD_TYPE_UNSPECIFIED";
+    case PrlExtSysRecordType.PRL_EXT_SYS_RECORD_TYPE_CDMA2000:
+      return "PRL_EXT_SYS_RECORD_TYPE_CDMA2000";
+    case PrlExtSysRecordType.PRL_EXT_SYS_RECORD_TYPE_HRPD:
+      return "PRL_EXT_SYS_RECORD_TYPE_HRPD";
+    case PrlExtSysRecordType.PRL_EXT_SYS_RECORD_TYPE_RESERVED_OBSOLETE:
+      return "PRL_EXT_SYS_RECORD_TYPE_RESERVED_OBSOLETE";
+    case PrlExtSysRecordType.PRL_EXT_SYS_RECORD_TYPE_MCC_MNC:
+      return "PRL_EXT_SYS_RECORD_TYPE_MCC_MNC";
+    case PrlExtSysRecordType.PRL_EXT_SYS_RECORD_TYPE_RESERVED:
+      return "PRL_EXT_SYS_RECORD_TYPE_RESERVED";
+    case PrlExtSysRecordType.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
 /** Subscriber account record managed by the HLR. */
 export interface Subscriber {
   /** UUID */
@@ -198,7 +630,21 @@ export interface Subscriber {
   /** True when a custom ringtone is stored for this subscriber. */
   hasRingtone: boolean;
   /** Duration of the stored ringtone in milliseconds (if any). */
-  ringtoneDurationMs?: number | undefined;
+  ringtoneDurationMs?:
+    | number
+    | undefined;
+  /**
+   * PRL override (UUID). When set, the OTASP runtime pushes this PRL
+   * to the MS during `*228` instead of the system-default PRL.
+   */
+  prlOverrideId?:
+    | string
+    | undefined;
+  /**
+   * 6-digit Service Programming Code for this subscriber's handset.
+   * Unset means the device uses the IS-95 default "000000".
+   */
+  serviceProgrammingCode?: string | undefined;
 }
 
 /** Radio identity attached to one subscriber. */
@@ -377,6 +823,26 @@ export interface ResolveSubscriberByIdentityResponse {
   primaryIdentity?: SubscriberIdentity | undefined;
 }
 
+/**
+ * Resolves a subscriber by ESN and/or MEID alone, without requiring an
+ * IMSI — for cases where the MS hasn't been programmed with an
+ * MIN/IMSI yet but is identified on the air by hardware ID.
+ */
+export interface ResolveSubscriberByHardwareIdentityRequest {
+  esn?:
+    | number
+    | undefined;
+  /** 14 hex digits */
+  meid?: string | undefined;
+}
+
+/** Resolved subscriber and current registration binding, if any. */
+export interface ResolveSubscriberByHardwareIdentityResponse {
+  subscriber?: Subscriber | undefined;
+  binding?: RegistrationBinding | undefined;
+  primaryIdentity?: SubscriberIdentity | undefined;
+}
+
 /** Creates or updates the serving-node registration binding for a subscriber. */
 export interface UpsertRegistrationBindingRequest {
   subscriberId: string;
@@ -493,6 +959,531 @@ export interface GetSubscriberRingtoneCodecResponse {
   durationMs: number;
 }
 
+export interface SetSubscriberPrlOverrideRequest {
+  subscriberId: string;
+  /** Omit (or empty string) to clear the override. */
+  prlId?: string | undefined;
+}
+
+export interface SetSubscriberSpcRequest {
+  subscriberId: string;
+  /**
+   * Six-digit code. Omit (or empty string) to clear and fall back to
+   * the IS-95 default "000000".
+   */
+  serviceProgrammingCode?: string | undefined;
+}
+
+/** Summary for list view. */
+export interface PrlSummary {
+  prlId: string;
+  name: string;
+  /** PR_LIST_ID from the on-wire header (cached column). */
+  prListId: number;
+  /** 1 = classic, 3 = extended (cached column). */
+  ssprPRev: number;
+  isDefault: boolean;
+  rawBytesSize: number;
+  notes: string;
+  createdAt: Date | undefined;
+  updatedAt: Date | undefined;
+}
+
+/** Full record for the editor. */
+export interface Prl {
+  summary: PrlSummary | undefined;
+  rawBytes: Uint8Array;
+  decoded: PrlDecoded | undefined;
+}
+
+export interface PrlDecoded {
+  classic?: PrlClassicBody | undefined;
+  extended?: PrlExtendedBody | undefined;
+}
+
+export interface PrlClassicBody {
+  prListSize: number;
+  prListId: number;
+  prefOnly: boolean;
+  defRoamInd: PrlRoamingIndicator | undefined;
+  prListCrc: number;
+  computedCrc: number;
+  crcOk: boolean;
+  acquisitionRecords: PrlAcqRecord[];
+  systemRecords: PrlSysRecord[];
+}
+
+export interface PrlExtendedBody {
+  prListSize: number;
+  prListId: number;
+  curSsprPRev: number;
+  prefOnly: boolean;
+  defRoamInd: PrlRoamingIndicator | undefined;
+  prListCrc: number;
+  computedCrc: number;
+  crcOk: boolean;
+  acquisitionRecords: PrlExtAcqRecord[];
+  commonSubnetRecords: PrlCommonSubnetRecord[];
+  systemRecords: PrlExtSysRecord[];
+}
+
+export interface PrlRoamingIndicator {
+  raw: number;
+  kind: PrlRoamingIndicatorKind;
+}
+
+export interface PrlAcqRecord {
+  acqTypeRaw: number;
+  cellularAnalog?: PrlAcqCellularAnalog | undefined;
+  cellularCdmaStandard?: PrlAcqCellularCdmaStandard | undefined;
+  cellularCdmaCustom?: PrlAcqCellularCdmaCustom | undefined;
+  cellularCdmaPreferred?: PrlAcqCellularCdmaPreferred | undefined;
+  pcsCdmaUsingBlocks?: PrlAcqPcsCdmaUsingBlocks | undefined;
+  pcsCdmaUsingChannels?: PrlAcqPcsCdmaUsingChannels | undefined;
+  jtacsCdmaStandard?: PrlAcqJtacsCdmaStandard | undefined;
+  jtacsCdmaCustom?: PrlAcqJtacsCdmaCustom | undefined;
+  bandClass6UsingChannels?: PrlAcqBandClass6UsingChannels | undefined;
+  unknown?: PrlAcqUnknown | undefined;
+}
+
+export interface PrlAcqCellularAnalog {
+  ab: PrlAbSelection;
+}
+
+export interface PrlAcqCellularCdmaStandard {
+  ab: PrlAbSelection;
+  priSec: PrlStandardChannel;
+}
+
+export interface PrlAcqCellularCdmaCustom {
+  channels: number[];
+}
+
+export interface PrlAcqCellularCdmaPreferred {
+  ab: PrlAbSelection;
+}
+
+export interface PrlAcqPcsCdmaUsingBlocks {
+  blocks: PrlPcsBlock[];
+}
+
+export interface PrlAcqPcsCdmaUsingChannels {
+  channels: number[];
+}
+
+export interface PrlAcqJtacsCdmaStandard {
+  ab: PrlAbSelection;
+  priSec: PrlStandardChannel;
+}
+
+export interface PrlAcqJtacsCdmaCustom {
+  channels: number[];
+}
+
+export interface PrlAcqBandClass6UsingChannels {
+  channels: number[];
+}
+
+export interface PrlAcqUnknown {
+}
+
+export interface PrlSysRecord {
+  sid: number;
+  nidIncl: PrlNidInclusion;
+  nid?: number | undefined;
+  sameGeoAsPrev: boolean;
+  prefNeg: PrlPrefNeg;
+  acqIndex: number;
+  /** Present iff pref_neg == PREFERRED. */
+  roamingIndicator?: PrlRoamingIndicator | undefined;
+  priority?: PrlPriority | undefined;
+}
+
+export interface PrlBandClassChannel {
+  bandClass: number;
+  channelNumber: number;
+}
+
+export interface PrlUmbAcqProfile {
+  umbAcqProfile: number;
+  fftSize: number;
+  cyclicPrefixLength: number;
+  numGuardSubcarriers: number;
+}
+
+export interface PrlUmbBlock {
+  bandClass: number;
+  channelNumber: number;
+  umbAcqTableProfile: number;
+}
+
+export interface PrlExtAcqRecord {
+  acqTypeRaw: number;
+  /**
+   * Spec LENGTH field (in octets). Stored so re-encode can match the
+   * original RESERVED padding exactly.
+   */
+  length: number;
+  cellularAnalog?: PrlAcqCellularAnalog | undefined;
+  cellularCdmaStandard?: PrlAcqCellularCdmaStandard | undefined;
+  cellularCdmaCustom?: PrlAcqCellularCdmaCustom | undefined;
+  cellularCdmaPreferred?: PrlAcqCellularCdmaPreferred | undefined;
+  pcsCdmaUsingBlocks?: PrlAcqPcsCdmaUsingBlocks | undefined;
+  pcsCdmaUsingChannels?: PrlAcqPcsCdmaUsingChannels | undefined;
+  jtacsCdmaStandard?: PrlAcqJtacsCdmaStandard | undefined;
+  jtacsCdmaCustom?: PrlAcqJtacsCdmaCustom | undefined;
+  bandClass6UsingChannels?: PrlAcqBandClass6UsingChannels | undefined;
+  generic1xIs95?: PrlExtAcqGeneric1xIs95 | undefined;
+  genericHrpd?: PrlExtAcqGenericHrpd | undefined;
+  umbCommonTable?: PrlExtAcqUmbCommonTable | undefined;
+  genericUmb?: PrlExtAcqGenericUmb | undefined;
+  other?: PrlExtAcqOther | undefined;
+}
+
+export interface PrlExtAcqGeneric1xIs95 {
+  entries: PrlBandClassChannel[];
+}
+
+export interface PrlExtAcqGenericHrpd {
+  entries: PrlBandClassChannel[];
+}
+
+export interface PrlExtAcqUmbCommonTable {
+  entries: PrlUmbAcqProfile[];
+}
+
+export interface PrlExtAcqGenericUmb {
+  blocks: PrlUmbBlock[];
+}
+
+export interface PrlExtAcqOther {
+  raw: Uint8Array;
+}
+
+export interface PrlCommonSubnetRecord {
+  /** Spec SUBNET_COMMON_LENGTH in octets (4 bits, 0–15). */
+  subnetCommonLengthOctets: number;
+  /**
+   * Hex string ("DEADBE"), exactly subnet_common_length_octets * 2
+   * characters. Server packs MSB-first onto the wire (it's already
+   * a clean octet stream — no bit-level padding needed here).
+   */
+  subnetCommonHex: string;
+}
+
+export interface PrlExtSystemAssociation {
+  associationTag: number;
+  pnAssociation: boolean;
+  dataAssociation: boolean;
+}
+
+export interface PrlExtSysRecord {
+  sysRecordLength: number;
+  sysRecordType: PrlExtSysRecordType;
+  /**
+   * Raw 4-bit type code on the wire. Populated for Reserved(_) values
+   * so the editor can preserve them; otherwise mirrors `sys_record_type`.
+   */
+  sysRecordTypeRaw: number;
+  prefNeg: PrlPrefNeg;
+  sameGeoAsPrev: boolean;
+  priority: PrlPriority;
+  acqIndex: number;
+  cdma2000?: PrlExtSysIdCdma2000 | undefined;
+  hrpd?: PrlExtSysIdHrpd | undefined;
+  mccMnc?: PrlExtSysIdMccMnc | undefined;
+  raw?:
+    | PrlExtSysIdRaw
+    | undefined;
+  /**
+   * Tail fields — only present when sys_record_type is known (not Raw)
+   * and the spec rule allows them.
+   */
+  roamingIndicator?: PrlRoamingIndicator | undefined;
+  association?: PrlExtSystemAssociation | undefined;
+}
+
+export interface PrlExtSysIdCdma2000 {
+  nidIncl: PrlNidInclusion;
+  sid: number;
+  nid?: number | undefined;
+}
+
+export interface PrlExtSysIdHrpd {
+  subnetCommonIncluded: boolean;
+  /** Spec SUBNET_LSB_LENGTH in bits (0–127). Drives the wire frame. */
+  subnetLsbLengthBits: number;
+  /**
+   * Hex string ("CAFE01"). Server packs MSB-first into the wire
+   * bit stream; byte count must equal ceil(subnet_lsb_length_bits/8).
+   */
+  subnetLsbHex: string;
+  /** Present iff subnet_common_included. */
+  subnetCommonOffset?: number | undefined;
+}
+
+export interface PrlExtSysIdMccMnc {
+  subtype000?: PrlMccMnc000 | undefined;
+  subtype001?: PrlMccMnc001 | undefined;
+  subtype010?: PrlMccMnc010 | undefined;
+  subtype011?: PrlMccMnc011 | undefined;
+  reserved?: PrlMccMncReserved | undefined;
+}
+
+/**
+ * MCC is a 3-digit decimal string ("310"); MNC is 2 or 3 digits
+ * ("23" or "001"). The Rust gRPC layer handles BCD packing + the
+ * F-padding rule for 2-digit MNCs (§3.5.5.3.2.2).
+ */
+export interface PrlMccMnc000 {
+  mcc: string;
+  mnc: string;
+}
+
+export interface PrlMccMnc001 {
+  mcc: string;
+  mnc: string;
+  /** 16-bit SIDs per spec (distinct from classic 15-bit). */
+  sids: number[];
+}
+
+export interface PrlSidNidPair {
+  sid: number;
+  nid: number;
+}
+
+export interface PrlMccMnc010 {
+  mcc: string;
+  mnc: string;
+  pairs: PrlSidNidPair[];
+}
+
+export interface PrlMccMncSubnet {
+  /** Spec subnet length in bits. */
+  subnetLengthBits: number;
+  /**
+   * Hex string ("CAFE01"), uppercase without separators. Server
+   * unpacks into the spec's MSB-first bit stream.
+   */
+  subnetIdHex: string;
+}
+
+export interface PrlMccMnc011 {
+  mcc: string;
+  mnc: string;
+  subnets: PrlMccMncSubnet[];
+}
+
+export interface PrlMccMncReserved {
+  subtype: number;
+  rawBits: Uint8Array;
+  rawBitLen: number;
+}
+
+export interface PrlExtSysIdRaw {
+  sysRecordType: number;
+  rawBits: Uint8Array;
+  rawBitLen: number;
+}
+
+export interface ListPrlsRequest {
+  limit: number;
+  offset: number;
+  /** Optional filters; absent means "any". */
+  prListId?: number | undefined;
+  ssprPRev?: number | undefined;
+}
+
+export interface ListPrlsResponse {
+  prls: PrlSummary[];
+  total: number;
+}
+
+export interface GetPrlRequest {
+  prlId: string;
+}
+
+export interface GetPrlResponse {
+  prl: Prl | undefined;
+}
+
+/** Editor save: structured body. Upload: raw bytes. */
+export interface CreatePrlRequest {
+  name: string;
+  notes: string;
+  rawBytes?: Uint8Array | undefined;
+  built?: PrlDecoded | undefined;
+}
+
+export interface CreatePrlResponse {
+  prl: Prl | undefined;
+}
+
+export interface UpdatePrlRequest {
+  prlId: string;
+  name?: string | undefined;
+  notes?: string | undefined;
+  rawBytes?: Uint8Array | undefined;
+  built?: PrlDecoded | undefined;
+}
+
+export interface UpdatePrlResponse {
+  prl: Prl | undefined;
+}
+
+export interface DeletePrlRequest {
+  prlId: string;
+}
+
+export interface SetDefaultPrlRequest {
+  prlId: string;
+}
+
+export interface GetDefaultPrlRequest {
+}
+
+/** `prl` is absent when no PRL is marked default. */
+export interface GetDefaultPrlResponse {
+  prl: Prl | undefined;
+}
+
+export interface PrlValidationError {
+  kind: PrlValidationError_Kind;
+  detail: string;
+}
+
+export enum PrlValidationError_Kind {
+  KIND_UNSPECIFIED = 0,
+  KIND_DECODE_FAILED = 1,
+  KIND_CRC_MISMATCH = 2,
+  KIND_UNSUPPORTED_REV = 3,
+  KIND_ENCODE_FAILED = 4,
+  UNRECOGNIZED = -1,
+}
+
+export function prlValidationError_KindFromJSON(object: any): PrlValidationError_Kind {
+  switch (object) {
+    case 0:
+    case "KIND_UNSPECIFIED":
+      return PrlValidationError_Kind.KIND_UNSPECIFIED;
+    case 1:
+    case "KIND_DECODE_FAILED":
+      return PrlValidationError_Kind.KIND_DECODE_FAILED;
+    case 2:
+    case "KIND_CRC_MISMATCH":
+      return PrlValidationError_Kind.KIND_CRC_MISMATCH;
+    case 3:
+    case "KIND_UNSUPPORTED_REV":
+      return PrlValidationError_Kind.KIND_UNSUPPORTED_REV;
+    case 4:
+    case "KIND_ENCODE_FAILED":
+      return PrlValidationError_Kind.KIND_ENCODE_FAILED;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return PrlValidationError_Kind.UNRECOGNIZED;
+  }
+}
+
+export function prlValidationError_KindToJSON(object: PrlValidationError_Kind): string {
+  switch (object) {
+    case PrlValidationError_Kind.KIND_UNSPECIFIED:
+      return "KIND_UNSPECIFIED";
+    case PrlValidationError_Kind.KIND_DECODE_FAILED:
+      return "KIND_DECODE_FAILED";
+    case PrlValidationError_Kind.KIND_CRC_MISMATCH:
+      return "KIND_CRC_MISMATCH";
+    case PrlValidationError_Kind.KIND_UNSUPPORTED_REV:
+      return "KIND_UNSUPPORTED_REV";
+    case PrlValidationError_Kind.KIND_ENCODE_FAILED:
+      return "KIND_ENCODE_FAILED";
+    case PrlValidationError_Kind.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
+export interface PrlDeleteBlockedError {
+  referencingSubscribers: number;
+  /** Up to ~5 referencing subscriber IDs for UI display. */
+  sampleSubscriberIds: string[];
+}
+
+/**
+ * Summary row returned by ListOtaspSessions and as the header on
+ * GetOtaspSessionResponse. Cached columns mirror the otasp_sessions table.
+ */
+export interface OtaspSessionSummary {
+  sessionId: string;
+  /** Resolved at session start via HLR lookup; null on HlrMiss. */
+  subscriberId?:
+    | string
+    | undefined;
+  /**
+   * Hardware identity from the origination. Either may be null
+   * depending on what the MS presented.
+   */
+  esn?: number | undefined;
+  meid?: string | undefined;
+  startedAt: Date | undefined;
+  endedAt?: Date | undefined;
+  outcome: OtaspSessionOutcome;
+  featureCode?: string | undefined;
+  serviceOption?: number | undefined;
+  completedBlocks: number;
+  eventCount: number;
+}
+
+/**
+ * Full session detail: summary + decoded timeline. The timeline
+ * elements come from `events.v1.OtaspRecordedEvent` so MSC (the writer)
+ * and HLR (the reader) share the same wire format.
+ */
+export interface OtaspSessionDetail {
+  summary: OtaspSessionSummary | undefined;
+  events: OtaspRecordedEvent[];
+}
+
+export interface SaveOtaspSessionRequest {
+  summary:
+    | OtaspSessionSummary
+    | undefined;
+  /** Prost-encoded OtaspRecordedEvents. */
+  eventsProto: Uint8Array;
+}
+
+export interface ListOtaspSessionsRequest {
+  /**
+   * Filters apply ANDed. The subscriber page uses subscriber_id; the
+   * mobile page uses esn or meid.
+   */
+  subscriberId?: string | undefined;
+  esn?: number | undefined;
+  meid?:
+    | string
+    | undefined;
+  /** Defaults to 10, clamped to [1, 100]. */
+  limit: number;
+  offset: number;
+}
+
+export interface ListOtaspSessionsResponse {
+  sessions: OtaspSessionSummary[];
+  /**
+   * Unfiltered count for the applied filter so the UI can render
+   * "Showing N–M of T".
+   */
+  total: number;
+}
+
+export interface GetOtaspSessionRequest {
+  sessionId: string;
+}
+
+export interface GetOtaspSessionResponse {
+  session: OtaspSessionDetail | undefined;
+}
+
 function createBaseSubscriber(): Subscriber {
   return {
     subscriberId: "",
@@ -505,6 +1496,8 @@ function createBaseSubscriber(): Subscriber {
     numberPlan: 0,
     hasRingtone: false,
     ringtoneDurationMs: undefined,
+    prlOverrideId: undefined,
+    serviceProgrammingCode: undefined,
   };
 }
 
@@ -539,6 +1532,12 @@ export const Subscriber: MessageFns<Subscriber> = {
     }
     if (message.ringtoneDurationMs !== undefined) {
       writer.uint32(80).uint64(message.ringtoneDurationMs);
+    }
+    if (message.prlOverrideId !== undefined) {
+      writer.uint32(90).string(message.prlOverrideId);
+    }
+    if (message.serviceProgrammingCode !== undefined) {
+      writer.uint32(98).string(message.serviceProgrammingCode);
     }
     return writer;
   },
@@ -630,6 +1629,22 @@ export const Subscriber: MessageFns<Subscriber> = {
           message.ringtoneDurationMs = longToNumber(reader.uint64());
           continue;
         }
+        case 11: {
+          if (tag !== 90) {
+            break;
+          }
+
+          message.prlOverrideId = reader.string();
+          continue;
+        }
+        case 12: {
+          if (tag !== 98) {
+            break;
+          }
+
+          message.serviceProgrammingCode = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -687,6 +1702,16 @@ export const Subscriber: MessageFns<Subscriber> = {
         : isSet(object.ringtone_duration_ms)
         ? globalThis.Number(object.ringtone_duration_ms)
         : undefined,
+      prlOverrideId: isSet(object.prlOverrideId)
+        ? globalThis.String(object.prlOverrideId)
+        : isSet(object.prl_override_id)
+        ? globalThis.String(object.prl_override_id)
+        : undefined,
+      serviceProgrammingCode: isSet(object.serviceProgrammingCode)
+        ? globalThis.String(object.serviceProgrammingCode)
+        : isSet(object.service_programming_code)
+        ? globalThis.String(object.service_programming_code)
+        : undefined,
     };
   },
 
@@ -722,6 +1747,12 @@ export const Subscriber: MessageFns<Subscriber> = {
     if (message.ringtoneDurationMs !== undefined) {
       obj.ringtoneDurationMs = Math.round(message.ringtoneDurationMs);
     }
+    if (message.prlOverrideId !== undefined) {
+      obj.prlOverrideId = message.prlOverrideId;
+    }
+    if (message.serviceProgrammingCode !== undefined) {
+      obj.serviceProgrammingCode = message.serviceProgrammingCode;
+    }
     return obj;
   },
 
@@ -740,6 +1771,8 @@ export const Subscriber: MessageFns<Subscriber> = {
     message.numberPlan = object.numberPlan ?? 0;
     message.hasRingtone = object.hasRingtone ?? false;
     message.ringtoneDurationMs = object.ringtoneDurationMs ?? undefined;
+    message.prlOverrideId = object.prlOverrideId ?? undefined;
+    message.serviceProgrammingCode = object.serviceProgrammingCode ?? undefined;
     return message;
   },
 };
@@ -2817,6 +3850,191 @@ export const ResolveSubscriberByIdentityResponse: MessageFns<ResolveSubscriberBy
   },
 };
 
+function createBaseResolveSubscriberByHardwareIdentityRequest(): ResolveSubscriberByHardwareIdentityRequest {
+  return { esn: undefined, meid: undefined };
+}
+
+export const ResolveSubscriberByHardwareIdentityRequest: MessageFns<ResolveSubscriberByHardwareIdentityRequest> = {
+  encode(message: ResolveSubscriberByHardwareIdentityRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.esn !== undefined) {
+      writer.uint32(8).uint32(message.esn);
+    }
+    if (message.meid !== undefined) {
+      writer.uint32(18).string(message.meid);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ResolveSubscriberByHardwareIdentityRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseResolveSubscriberByHardwareIdentityRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.esn = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.meid = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ResolveSubscriberByHardwareIdentityRequest {
+    return {
+      esn: isSet(object.esn) ? globalThis.Number(object.esn) : undefined,
+      meid: isSet(object.meid) ? globalThis.String(object.meid) : undefined,
+    };
+  },
+
+  toJSON(message: ResolveSubscriberByHardwareIdentityRequest): unknown {
+    const obj: any = {};
+    if (message.esn !== undefined) {
+      obj.esn = Math.round(message.esn);
+    }
+    if (message.meid !== undefined) {
+      obj.meid = message.meid;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<ResolveSubscriberByHardwareIdentityRequest>): ResolveSubscriberByHardwareIdentityRequest {
+    return ResolveSubscriberByHardwareIdentityRequest.fromPartial(base ?? {});
+  },
+  fromPartial(
+    object: DeepPartial<ResolveSubscriberByHardwareIdentityRequest>,
+  ): ResolveSubscriberByHardwareIdentityRequest {
+    const message = createBaseResolveSubscriberByHardwareIdentityRequest();
+    message.esn = object.esn ?? undefined;
+    message.meid = object.meid ?? undefined;
+    return message;
+  },
+};
+
+function createBaseResolveSubscriberByHardwareIdentityResponse(): ResolveSubscriberByHardwareIdentityResponse {
+  return { subscriber: undefined, binding: undefined, primaryIdentity: undefined };
+}
+
+export const ResolveSubscriberByHardwareIdentityResponse: MessageFns<ResolveSubscriberByHardwareIdentityResponse> = {
+  encode(
+    message: ResolveSubscriberByHardwareIdentityResponse,
+    writer: BinaryWriter = new BinaryWriter(),
+  ): BinaryWriter {
+    if (message.subscriber !== undefined) {
+      Subscriber.encode(message.subscriber, writer.uint32(10).fork()).join();
+    }
+    if (message.binding !== undefined) {
+      RegistrationBinding.encode(message.binding, writer.uint32(18).fork()).join();
+    }
+    if (message.primaryIdentity !== undefined) {
+      SubscriberIdentity.encode(message.primaryIdentity, writer.uint32(26).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ResolveSubscriberByHardwareIdentityResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseResolveSubscriberByHardwareIdentityResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.subscriber = Subscriber.decode(reader, reader.uint32());
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.binding = RegistrationBinding.decode(reader, reader.uint32());
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.primaryIdentity = SubscriberIdentity.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ResolveSubscriberByHardwareIdentityResponse {
+    return {
+      subscriber: isSet(object.subscriber) ? Subscriber.fromJSON(object.subscriber) : undefined,
+      binding: isSet(object.binding) ? RegistrationBinding.fromJSON(object.binding) : undefined,
+      primaryIdentity: isSet(object.primaryIdentity)
+        ? SubscriberIdentity.fromJSON(object.primaryIdentity)
+        : isSet(object.primary_identity)
+        ? SubscriberIdentity.fromJSON(object.primary_identity)
+        : undefined,
+    };
+  },
+
+  toJSON(message: ResolveSubscriberByHardwareIdentityResponse): unknown {
+    const obj: any = {};
+    if (message.subscriber !== undefined) {
+      obj.subscriber = Subscriber.toJSON(message.subscriber);
+    }
+    if (message.binding !== undefined) {
+      obj.binding = RegistrationBinding.toJSON(message.binding);
+    }
+    if (message.primaryIdentity !== undefined) {
+      obj.primaryIdentity = SubscriberIdentity.toJSON(message.primaryIdentity);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<ResolveSubscriberByHardwareIdentityResponse>): ResolveSubscriberByHardwareIdentityResponse {
+    return ResolveSubscriberByHardwareIdentityResponse.fromPartial(base ?? {});
+  },
+  fromPartial(
+    object: DeepPartial<ResolveSubscriberByHardwareIdentityResponse>,
+  ): ResolveSubscriberByHardwareIdentityResponse {
+    const message = createBaseResolveSubscriberByHardwareIdentityResponse();
+    message.subscriber = (object.subscriber !== undefined && object.subscriber !== null)
+      ? Subscriber.fromPartial(object.subscriber)
+      : undefined;
+    message.binding = (object.binding !== undefined && object.binding !== null)
+      ? RegistrationBinding.fromPartial(object.binding)
+      : undefined;
+    message.primaryIdentity = (object.primaryIdentity !== undefined && object.primaryIdentity !== null)
+      ? SubscriberIdentity.fromPartial(object.primaryIdentity)
+      : undefined;
+    return message;
+  },
+};
+
 function createBaseUpsertRegistrationBindingRequest(): UpsertRegistrationBindingRequest {
   return {
     subscriberId: "",
@@ -4448,6 +5666,6792 @@ export const GetSubscriberRingtoneCodecResponse: MessageFns<GetSubscriberRington
   },
 };
 
+function createBaseSetSubscriberPrlOverrideRequest(): SetSubscriberPrlOverrideRequest {
+  return { subscriberId: "", prlId: undefined };
+}
+
+export const SetSubscriberPrlOverrideRequest: MessageFns<SetSubscriberPrlOverrideRequest> = {
+  encode(message: SetSubscriberPrlOverrideRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.subscriberId !== "") {
+      writer.uint32(10).string(message.subscriberId);
+    }
+    if (message.prlId !== undefined) {
+      writer.uint32(18).string(message.prlId);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SetSubscriberPrlOverrideRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSetSubscriberPrlOverrideRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.subscriberId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.prlId = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SetSubscriberPrlOverrideRequest {
+    return {
+      subscriberId: isSet(object.subscriberId)
+        ? globalThis.String(object.subscriberId)
+        : isSet(object.subscriber_id)
+        ? globalThis.String(object.subscriber_id)
+        : "",
+      prlId: isSet(object.prlId)
+        ? globalThis.String(object.prlId)
+        : isSet(object.prl_id)
+        ? globalThis.String(object.prl_id)
+        : undefined,
+    };
+  },
+
+  toJSON(message: SetSubscriberPrlOverrideRequest): unknown {
+    const obj: any = {};
+    if (message.subscriberId !== "") {
+      obj.subscriberId = message.subscriberId;
+    }
+    if (message.prlId !== undefined) {
+      obj.prlId = message.prlId;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<SetSubscriberPrlOverrideRequest>): SetSubscriberPrlOverrideRequest {
+    return SetSubscriberPrlOverrideRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<SetSubscriberPrlOverrideRequest>): SetSubscriberPrlOverrideRequest {
+    const message = createBaseSetSubscriberPrlOverrideRequest();
+    message.subscriberId = object.subscriberId ?? "";
+    message.prlId = object.prlId ?? undefined;
+    return message;
+  },
+};
+
+function createBaseSetSubscriberSpcRequest(): SetSubscriberSpcRequest {
+  return { subscriberId: "", serviceProgrammingCode: undefined };
+}
+
+export const SetSubscriberSpcRequest: MessageFns<SetSubscriberSpcRequest> = {
+  encode(message: SetSubscriberSpcRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.subscriberId !== "") {
+      writer.uint32(10).string(message.subscriberId);
+    }
+    if (message.serviceProgrammingCode !== undefined) {
+      writer.uint32(18).string(message.serviceProgrammingCode);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SetSubscriberSpcRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSetSubscriberSpcRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.subscriberId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.serviceProgrammingCode = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SetSubscriberSpcRequest {
+    return {
+      subscriberId: isSet(object.subscriberId)
+        ? globalThis.String(object.subscriberId)
+        : isSet(object.subscriber_id)
+        ? globalThis.String(object.subscriber_id)
+        : "",
+      serviceProgrammingCode: isSet(object.serviceProgrammingCode)
+        ? globalThis.String(object.serviceProgrammingCode)
+        : isSet(object.service_programming_code)
+        ? globalThis.String(object.service_programming_code)
+        : undefined,
+    };
+  },
+
+  toJSON(message: SetSubscriberSpcRequest): unknown {
+    const obj: any = {};
+    if (message.subscriberId !== "") {
+      obj.subscriberId = message.subscriberId;
+    }
+    if (message.serviceProgrammingCode !== undefined) {
+      obj.serviceProgrammingCode = message.serviceProgrammingCode;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<SetSubscriberSpcRequest>): SetSubscriberSpcRequest {
+    return SetSubscriberSpcRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<SetSubscriberSpcRequest>): SetSubscriberSpcRequest {
+    const message = createBaseSetSubscriberSpcRequest();
+    message.subscriberId = object.subscriberId ?? "";
+    message.serviceProgrammingCode = object.serviceProgrammingCode ?? undefined;
+    return message;
+  },
+};
+
+function createBasePrlSummary(): PrlSummary {
+  return {
+    prlId: "",
+    name: "",
+    prListId: 0,
+    ssprPRev: 0,
+    isDefault: false,
+    rawBytesSize: 0,
+    notes: "",
+    createdAt: undefined,
+    updatedAt: undefined,
+  };
+}
+
+export const PrlSummary: MessageFns<PrlSummary> = {
+  encode(message: PrlSummary, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.prlId !== "") {
+      writer.uint32(10).string(message.prlId);
+    }
+    if (message.name !== "") {
+      writer.uint32(18).string(message.name);
+    }
+    if (message.prListId !== 0) {
+      writer.uint32(24).uint32(message.prListId);
+    }
+    if (message.ssprPRev !== 0) {
+      writer.uint32(32).uint32(message.ssprPRev);
+    }
+    if (message.isDefault !== false) {
+      writer.uint32(40).bool(message.isDefault);
+    }
+    if (message.rawBytesSize !== 0) {
+      writer.uint32(48).uint32(message.rawBytesSize);
+    }
+    if (message.notes !== "") {
+      writer.uint32(58).string(message.notes);
+    }
+    if (message.createdAt !== undefined) {
+      Timestamp.encode(toTimestamp(message.createdAt), writer.uint32(66).fork()).join();
+    }
+    if (message.updatedAt !== undefined) {
+      Timestamp.encode(toTimestamp(message.updatedAt), writer.uint32(74).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlSummary {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlSummary();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.prlId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.name = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.prListId = reader.uint32();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.ssprPRev = reader.uint32();
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.isDefault = reader.bool();
+          continue;
+        }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.rawBytesSize = reader.uint32();
+          continue;
+        }
+        case 7: {
+          if (tag !== 58) {
+            break;
+          }
+
+          message.notes = reader.string();
+          continue;
+        }
+        case 8: {
+          if (tag !== 66) {
+            break;
+          }
+
+          message.createdAt = fromTimestamp(Timestamp.decode(reader, reader.uint32()));
+          continue;
+        }
+        case 9: {
+          if (tag !== 74) {
+            break;
+          }
+
+          message.updatedAt = fromTimestamp(Timestamp.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlSummary {
+    return {
+      prlId: isSet(object.prlId)
+        ? globalThis.String(object.prlId)
+        : isSet(object.prl_id)
+        ? globalThis.String(object.prl_id)
+        : "",
+      name: isSet(object.name) ? globalThis.String(object.name) : "",
+      prListId: isSet(object.prListId)
+        ? globalThis.Number(object.prListId)
+        : isSet(object.pr_list_id)
+        ? globalThis.Number(object.pr_list_id)
+        : 0,
+      ssprPRev: isSet(object.ssprPRev)
+        ? globalThis.Number(object.ssprPRev)
+        : isSet(object.sspr_p_rev)
+        ? globalThis.Number(object.sspr_p_rev)
+        : 0,
+      isDefault: isSet(object.isDefault)
+        ? globalThis.Boolean(object.isDefault)
+        : isSet(object.is_default)
+        ? globalThis.Boolean(object.is_default)
+        : false,
+      rawBytesSize: isSet(object.rawBytesSize)
+        ? globalThis.Number(object.rawBytesSize)
+        : isSet(object.raw_bytes_size)
+        ? globalThis.Number(object.raw_bytes_size)
+        : 0,
+      notes: isSet(object.notes) ? globalThis.String(object.notes) : "",
+      createdAt: isSet(object.createdAt)
+        ? fromJsonTimestamp(object.createdAt)
+        : isSet(object.created_at)
+        ? fromJsonTimestamp(object.created_at)
+        : undefined,
+      updatedAt: isSet(object.updatedAt)
+        ? fromJsonTimestamp(object.updatedAt)
+        : isSet(object.updated_at)
+        ? fromJsonTimestamp(object.updated_at)
+        : undefined,
+    };
+  },
+
+  toJSON(message: PrlSummary): unknown {
+    const obj: any = {};
+    if (message.prlId !== "") {
+      obj.prlId = message.prlId;
+    }
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
+    if (message.prListId !== 0) {
+      obj.prListId = Math.round(message.prListId);
+    }
+    if (message.ssprPRev !== 0) {
+      obj.ssprPRev = Math.round(message.ssprPRev);
+    }
+    if (message.isDefault !== false) {
+      obj.isDefault = message.isDefault;
+    }
+    if (message.rawBytesSize !== 0) {
+      obj.rawBytesSize = Math.round(message.rawBytesSize);
+    }
+    if (message.notes !== "") {
+      obj.notes = message.notes;
+    }
+    if (message.createdAt !== undefined) {
+      obj.createdAt = message.createdAt.toISOString();
+    }
+    if (message.updatedAt !== undefined) {
+      obj.updatedAt = message.updatedAt.toISOString();
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlSummary>): PrlSummary {
+    return PrlSummary.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlSummary>): PrlSummary {
+    const message = createBasePrlSummary();
+    message.prlId = object.prlId ?? "";
+    message.name = object.name ?? "";
+    message.prListId = object.prListId ?? 0;
+    message.ssprPRev = object.ssprPRev ?? 0;
+    message.isDefault = object.isDefault ?? false;
+    message.rawBytesSize = object.rawBytesSize ?? 0;
+    message.notes = object.notes ?? "";
+    message.createdAt = object.createdAt ?? undefined;
+    message.updatedAt = object.updatedAt ?? undefined;
+    return message;
+  },
+};
+
+function createBasePrl(): Prl {
+  return { summary: undefined, rawBytes: new Uint8Array(0), decoded: undefined };
+}
+
+export const Prl: MessageFns<Prl> = {
+  encode(message: Prl, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.summary !== undefined) {
+      PrlSummary.encode(message.summary, writer.uint32(10).fork()).join();
+    }
+    if (message.rawBytes.length !== 0) {
+      writer.uint32(18).bytes(message.rawBytes);
+    }
+    if (message.decoded !== undefined) {
+      PrlDecoded.encode(message.decoded, writer.uint32(26).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): Prl {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrl();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.summary = PrlSummary.decode(reader, reader.uint32());
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.rawBytes = reader.bytes();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.decoded = PrlDecoded.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): Prl {
+    return {
+      summary: isSet(object.summary) ? PrlSummary.fromJSON(object.summary) : undefined,
+      rawBytes: isSet(object.rawBytes)
+        ? bytesFromBase64(object.rawBytes)
+        : isSet(object.raw_bytes)
+        ? bytesFromBase64(object.raw_bytes)
+        : new Uint8Array(0),
+      decoded: isSet(object.decoded) ? PrlDecoded.fromJSON(object.decoded) : undefined,
+    };
+  },
+
+  toJSON(message: Prl): unknown {
+    const obj: any = {};
+    if (message.summary !== undefined) {
+      obj.summary = PrlSummary.toJSON(message.summary);
+    }
+    if (message.rawBytes.length !== 0) {
+      obj.rawBytes = base64FromBytes(message.rawBytes);
+    }
+    if (message.decoded !== undefined) {
+      obj.decoded = PrlDecoded.toJSON(message.decoded);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<Prl>): Prl {
+    return Prl.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<Prl>): Prl {
+    const message = createBasePrl();
+    message.summary = (object.summary !== undefined && object.summary !== null)
+      ? PrlSummary.fromPartial(object.summary)
+      : undefined;
+    message.rawBytes = object.rawBytes ?? new Uint8Array(0);
+    message.decoded = (object.decoded !== undefined && object.decoded !== null)
+      ? PrlDecoded.fromPartial(object.decoded)
+      : undefined;
+    return message;
+  },
+};
+
+function createBasePrlDecoded(): PrlDecoded {
+  return { classic: undefined, extended: undefined };
+}
+
+export const PrlDecoded: MessageFns<PrlDecoded> = {
+  encode(message: PrlDecoded, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.classic !== undefined) {
+      PrlClassicBody.encode(message.classic, writer.uint32(10).fork()).join();
+    }
+    if (message.extended !== undefined) {
+      PrlExtendedBody.encode(message.extended, writer.uint32(18).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlDecoded {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlDecoded();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.classic = PrlClassicBody.decode(reader, reader.uint32());
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.extended = PrlExtendedBody.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlDecoded {
+    return {
+      classic: isSet(object.classic) ? PrlClassicBody.fromJSON(object.classic) : undefined,
+      extended: isSet(object.extended) ? PrlExtendedBody.fromJSON(object.extended) : undefined,
+    };
+  },
+
+  toJSON(message: PrlDecoded): unknown {
+    const obj: any = {};
+    if (message.classic !== undefined) {
+      obj.classic = PrlClassicBody.toJSON(message.classic);
+    }
+    if (message.extended !== undefined) {
+      obj.extended = PrlExtendedBody.toJSON(message.extended);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlDecoded>): PrlDecoded {
+    return PrlDecoded.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlDecoded>): PrlDecoded {
+    const message = createBasePrlDecoded();
+    message.classic = (object.classic !== undefined && object.classic !== null)
+      ? PrlClassicBody.fromPartial(object.classic)
+      : undefined;
+    message.extended = (object.extended !== undefined && object.extended !== null)
+      ? PrlExtendedBody.fromPartial(object.extended)
+      : undefined;
+    return message;
+  },
+};
+
+function createBasePrlClassicBody(): PrlClassicBody {
+  return {
+    prListSize: 0,
+    prListId: 0,
+    prefOnly: false,
+    defRoamInd: undefined,
+    prListCrc: 0,
+    computedCrc: 0,
+    crcOk: false,
+    acquisitionRecords: [],
+    systemRecords: [],
+  };
+}
+
+export const PrlClassicBody: MessageFns<PrlClassicBody> = {
+  encode(message: PrlClassicBody, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.prListSize !== 0) {
+      writer.uint32(8).uint32(message.prListSize);
+    }
+    if (message.prListId !== 0) {
+      writer.uint32(16).uint32(message.prListId);
+    }
+    if (message.prefOnly !== false) {
+      writer.uint32(24).bool(message.prefOnly);
+    }
+    if (message.defRoamInd !== undefined) {
+      PrlRoamingIndicator.encode(message.defRoamInd, writer.uint32(34).fork()).join();
+    }
+    if (message.prListCrc !== 0) {
+      writer.uint32(40).uint32(message.prListCrc);
+    }
+    if (message.computedCrc !== 0) {
+      writer.uint32(48).uint32(message.computedCrc);
+    }
+    if (message.crcOk !== false) {
+      writer.uint32(56).bool(message.crcOk);
+    }
+    for (const v of message.acquisitionRecords) {
+      PrlAcqRecord.encode(v!, writer.uint32(66).fork()).join();
+    }
+    for (const v of message.systemRecords) {
+      PrlSysRecord.encode(v!, writer.uint32(74).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlClassicBody {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlClassicBody();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.prListSize = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.prListId = reader.uint32();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.prefOnly = reader.bool();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.defRoamInd = PrlRoamingIndicator.decode(reader, reader.uint32());
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.prListCrc = reader.uint32();
+          continue;
+        }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.computedCrc = reader.uint32();
+          continue;
+        }
+        case 7: {
+          if (tag !== 56) {
+            break;
+          }
+
+          message.crcOk = reader.bool();
+          continue;
+        }
+        case 8: {
+          if (tag !== 66) {
+            break;
+          }
+
+          message.acquisitionRecords.push(PrlAcqRecord.decode(reader, reader.uint32()));
+          continue;
+        }
+        case 9: {
+          if (tag !== 74) {
+            break;
+          }
+
+          message.systemRecords.push(PrlSysRecord.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlClassicBody {
+    return {
+      prListSize: isSet(object.prListSize)
+        ? globalThis.Number(object.prListSize)
+        : isSet(object.pr_list_size)
+        ? globalThis.Number(object.pr_list_size)
+        : 0,
+      prListId: isSet(object.prListId)
+        ? globalThis.Number(object.prListId)
+        : isSet(object.pr_list_id)
+        ? globalThis.Number(object.pr_list_id)
+        : 0,
+      prefOnly: isSet(object.prefOnly)
+        ? globalThis.Boolean(object.prefOnly)
+        : isSet(object.pref_only)
+        ? globalThis.Boolean(object.pref_only)
+        : false,
+      defRoamInd: isSet(object.defRoamInd)
+        ? PrlRoamingIndicator.fromJSON(object.defRoamInd)
+        : isSet(object.def_roam_ind)
+        ? PrlRoamingIndicator.fromJSON(object.def_roam_ind)
+        : undefined,
+      prListCrc: isSet(object.prListCrc)
+        ? globalThis.Number(object.prListCrc)
+        : isSet(object.pr_list_crc)
+        ? globalThis.Number(object.pr_list_crc)
+        : 0,
+      computedCrc: isSet(object.computedCrc)
+        ? globalThis.Number(object.computedCrc)
+        : isSet(object.computed_crc)
+        ? globalThis.Number(object.computed_crc)
+        : 0,
+      crcOk: isSet(object.crcOk)
+        ? globalThis.Boolean(object.crcOk)
+        : isSet(object.crc_ok)
+        ? globalThis.Boolean(object.crc_ok)
+        : false,
+      acquisitionRecords: globalThis.Array.isArray(object?.acquisitionRecords)
+        ? object.acquisitionRecords.map((e: any) => PrlAcqRecord.fromJSON(e))
+        : globalThis.Array.isArray(object?.acquisition_records)
+        ? object.acquisition_records.map((e: any) => PrlAcqRecord.fromJSON(e))
+        : [],
+      systemRecords: globalThis.Array.isArray(object?.systemRecords)
+        ? object.systemRecords.map((e: any) => PrlSysRecord.fromJSON(e))
+        : globalThis.Array.isArray(object?.system_records)
+        ? object.system_records.map((e: any) => PrlSysRecord.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: PrlClassicBody): unknown {
+    const obj: any = {};
+    if (message.prListSize !== 0) {
+      obj.prListSize = Math.round(message.prListSize);
+    }
+    if (message.prListId !== 0) {
+      obj.prListId = Math.round(message.prListId);
+    }
+    if (message.prefOnly !== false) {
+      obj.prefOnly = message.prefOnly;
+    }
+    if (message.defRoamInd !== undefined) {
+      obj.defRoamInd = PrlRoamingIndicator.toJSON(message.defRoamInd);
+    }
+    if (message.prListCrc !== 0) {
+      obj.prListCrc = Math.round(message.prListCrc);
+    }
+    if (message.computedCrc !== 0) {
+      obj.computedCrc = Math.round(message.computedCrc);
+    }
+    if (message.crcOk !== false) {
+      obj.crcOk = message.crcOk;
+    }
+    if (message.acquisitionRecords?.length) {
+      obj.acquisitionRecords = message.acquisitionRecords.map((e) => PrlAcqRecord.toJSON(e));
+    }
+    if (message.systemRecords?.length) {
+      obj.systemRecords = message.systemRecords.map((e) => PrlSysRecord.toJSON(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlClassicBody>): PrlClassicBody {
+    return PrlClassicBody.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlClassicBody>): PrlClassicBody {
+    const message = createBasePrlClassicBody();
+    message.prListSize = object.prListSize ?? 0;
+    message.prListId = object.prListId ?? 0;
+    message.prefOnly = object.prefOnly ?? false;
+    message.defRoamInd = (object.defRoamInd !== undefined && object.defRoamInd !== null)
+      ? PrlRoamingIndicator.fromPartial(object.defRoamInd)
+      : undefined;
+    message.prListCrc = object.prListCrc ?? 0;
+    message.computedCrc = object.computedCrc ?? 0;
+    message.crcOk = object.crcOk ?? false;
+    message.acquisitionRecords = object.acquisitionRecords?.map((e) => PrlAcqRecord.fromPartial(e)) || [];
+    message.systemRecords = object.systemRecords?.map((e) => PrlSysRecord.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBasePrlExtendedBody(): PrlExtendedBody {
+  return {
+    prListSize: 0,
+    prListId: 0,
+    curSsprPRev: 0,
+    prefOnly: false,
+    defRoamInd: undefined,
+    prListCrc: 0,
+    computedCrc: 0,
+    crcOk: false,
+    acquisitionRecords: [],
+    commonSubnetRecords: [],
+    systemRecords: [],
+  };
+}
+
+export const PrlExtendedBody: MessageFns<PrlExtendedBody> = {
+  encode(message: PrlExtendedBody, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.prListSize !== 0) {
+      writer.uint32(8).uint32(message.prListSize);
+    }
+    if (message.prListId !== 0) {
+      writer.uint32(16).uint32(message.prListId);
+    }
+    if (message.curSsprPRev !== 0) {
+      writer.uint32(24).uint32(message.curSsprPRev);
+    }
+    if (message.prefOnly !== false) {
+      writer.uint32(32).bool(message.prefOnly);
+    }
+    if (message.defRoamInd !== undefined) {
+      PrlRoamingIndicator.encode(message.defRoamInd, writer.uint32(42).fork()).join();
+    }
+    if (message.prListCrc !== 0) {
+      writer.uint32(48).uint32(message.prListCrc);
+    }
+    if (message.computedCrc !== 0) {
+      writer.uint32(56).uint32(message.computedCrc);
+    }
+    if (message.crcOk !== false) {
+      writer.uint32(64).bool(message.crcOk);
+    }
+    for (const v of message.acquisitionRecords) {
+      PrlExtAcqRecord.encode(v!, writer.uint32(74).fork()).join();
+    }
+    for (const v of message.commonSubnetRecords) {
+      PrlCommonSubnetRecord.encode(v!, writer.uint32(82).fork()).join();
+    }
+    for (const v of message.systemRecords) {
+      PrlExtSysRecord.encode(v!, writer.uint32(90).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlExtendedBody {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlExtendedBody();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.prListSize = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.prListId = reader.uint32();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.curSsprPRev = reader.uint32();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.prefOnly = reader.bool();
+          continue;
+        }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          message.defRoamInd = PrlRoamingIndicator.decode(reader, reader.uint32());
+          continue;
+        }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.prListCrc = reader.uint32();
+          continue;
+        }
+        case 7: {
+          if (tag !== 56) {
+            break;
+          }
+
+          message.computedCrc = reader.uint32();
+          continue;
+        }
+        case 8: {
+          if (tag !== 64) {
+            break;
+          }
+
+          message.crcOk = reader.bool();
+          continue;
+        }
+        case 9: {
+          if (tag !== 74) {
+            break;
+          }
+
+          message.acquisitionRecords.push(PrlExtAcqRecord.decode(reader, reader.uint32()));
+          continue;
+        }
+        case 10: {
+          if (tag !== 82) {
+            break;
+          }
+
+          message.commonSubnetRecords.push(PrlCommonSubnetRecord.decode(reader, reader.uint32()));
+          continue;
+        }
+        case 11: {
+          if (tag !== 90) {
+            break;
+          }
+
+          message.systemRecords.push(PrlExtSysRecord.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlExtendedBody {
+    return {
+      prListSize: isSet(object.prListSize)
+        ? globalThis.Number(object.prListSize)
+        : isSet(object.pr_list_size)
+        ? globalThis.Number(object.pr_list_size)
+        : 0,
+      prListId: isSet(object.prListId)
+        ? globalThis.Number(object.prListId)
+        : isSet(object.pr_list_id)
+        ? globalThis.Number(object.pr_list_id)
+        : 0,
+      curSsprPRev: isSet(object.curSsprPRev)
+        ? globalThis.Number(object.curSsprPRev)
+        : isSet(object.cur_sspr_p_rev)
+        ? globalThis.Number(object.cur_sspr_p_rev)
+        : 0,
+      prefOnly: isSet(object.prefOnly)
+        ? globalThis.Boolean(object.prefOnly)
+        : isSet(object.pref_only)
+        ? globalThis.Boolean(object.pref_only)
+        : false,
+      defRoamInd: isSet(object.defRoamInd)
+        ? PrlRoamingIndicator.fromJSON(object.defRoamInd)
+        : isSet(object.def_roam_ind)
+        ? PrlRoamingIndicator.fromJSON(object.def_roam_ind)
+        : undefined,
+      prListCrc: isSet(object.prListCrc)
+        ? globalThis.Number(object.prListCrc)
+        : isSet(object.pr_list_crc)
+        ? globalThis.Number(object.pr_list_crc)
+        : 0,
+      computedCrc: isSet(object.computedCrc)
+        ? globalThis.Number(object.computedCrc)
+        : isSet(object.computed_crc)
+        ? globalThis.Number(object.computed_crc)
+        : 0,
+      crcOk: isSet(object.crcOk)
+        ? globalThis.Boolean(object.crcOk)
+        : isSet(object.crc_ok)
+        ? globalThis.Boolean(object.crc_ok)
+        : false,
+      acquisitionRecords: globalThis.Array.isArray(object?.acquisitionRecords)
+        ? object.acquisitionRecords.map((e: any) => PrlExtAcqRecord.fromJSON(e))
+        : globalThis.Array.isArray(object?.acquisition_records)
+        ? object.acquisition_records.map((e: any) => PrlExtAcqRecord.fromJSON(e))
+        : [],
+      commonSubnetRecords: globalThis.Array.isArray(object?.commonSubnetRecords)
+        ? object.commonSubnetRecords.map((e: any) => PrlCommonSubnetRecord.fromJSON(e))
+        : globalThis.Array.isArray(object?.common_subnet_records)
+        ? object.common_subnet_records.map((e: any) => PrlCommonSubnetRecord.fromJSON(e))
+        : [],
+      systemRecords: globalThis.Array.isArray(object?.systemRecords)
+        ? object.systemRecords.map((e: any) => PrlExtSysRecord.fromJSON(e))
+        : globalThis.Array.isArray(object?.system_records)
+        ? object.system_records.map((e: any) => PrlExtSysRecord.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: PrlExtendedBody): unknown {
+    const obj: any = {};
+    if (message.prListSize !== 0) {
+      obj.prListSize = Math.round(message.prListSize);
+    }
+    if (message.prListId !== 0) {
+      obj.prListId = Math.round(message.prListId);
+    }
+    if (message.curSsprPRev !== 0) {
+      obj.curSsprPRev = Math.round(message.curSsprPRev);
+    }
+    if (message.prefOnly !== false) {
+      obj.prefOnly = message.prefOnly;
+    }
+    if (message.defRoamInd !== undefined) {
+      obj.defRoamInd = PrlRoamingIndicator.toJSON(message.defRoamInd);
+    }
+    if (message.prListCrc !== 0) {
+      obj.prListCrc = Math.round(message.prListCrc);
+    }
+    if (message.computedCrc !== 0) {
+      obj.computedCrc = Math.round(message.computedCrc);
+    }
+    if (message.crcOk !== false) {
+      obj.crcOk = message.crcOk;
+    }
+    if (message.acquisitionRecords?.length) {
+      obj.acquisitionRecords = message.acquisitionRecords.map((e) => PrlExtAcqRecord.toJSON(e));
+    }
+    if (message.commonSubnetRecords?.length) {
+      obj.commonSubnetRecords = message.commonSubnetRecords.map((e) => PrlCommonSubnetRecord.toJSON(e));
+    }
+    if (message.systemRecords?.length) {
+      obj.systemRecords = message.systemRecords.map((e) => PrlExtSysRecord.toJSON(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlExtendedBody>): PrlExtendedBody {
+    return PrlExtendedBody.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlExtendedBody>): PrlExtendedBody {
+    const message = createBasePrlExtendedBody();
+    message.prListSize = object.prListSize ?? 0;
+    message.prListId = object.prListId ?? 0;
+    message.curSsprPRev = object.curSsprPRev ?? 0;
+    message.prefOnly = object.prefOnly ?? false;
+    message.defRoamInd = (object.defRoamInd !== undefined && object.defRoamInd !== null)
+      ? PrlRoamingIndicator.fromPartial(object.defRoamInd)
+      : undefined;
+    message.prListCrc = object.prListCrc ?? 0;
+    message.computedCrc = object.computedCrc ?? 0;
+    message.crcOk = object.crcOk ?? false;
+    message.acquisitionRecords = object.acquisitionRecords?.map((e) => PrlExtAcqRecord.fromPartial(e)) || [];
+    message.commonSubnetRecords = object.commonSubnetRecords?.map((e) => PrlCommonSubnetRecord.fromPartial(e)) || [];
+    message.systemRecords = object.systemRecords?.map((e) => PrlExtSysRecord.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBasePrlRoamingIndicator(): PrlRoamingIndicator {
+  return { raw: 0, kind: 0 };
+}
+
+export const PrlRoamingIndicator: MessageFns<PrlRoamingIndicator> = {
+  encode(message: PrlRoamingIndicator, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.raw !== 0) {
+      writer.uint32(8).uint32(message.raw);
+    }
+    if (message.kind !== 0) {
+      writer.uint32(16).int32(message.kind);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlRoamingIndicator {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlRoamingIndicator();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.raw = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.kind = reader.int32() as any;
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlRoamingIndicator {
+    return {
+      raw: isSet(object.raw) ? globalThis.Number(object.raw) : 0,
+      kind: isSet(object.kind) ? prlRoamingIndicatorKindFromJSON(object.kind) : 0,
+    };
+  },
+
+  toJSON(message: PrlRoamingIndicator): unknown {
+    const obj: any = {};
+    if (message.raw !== 0) {
+      obj.raw = Math.round(message.raw);
+    }
+    if (message.kind !== 0) {
+      obj.kind = prlRoamingIndicatorKindToJSON(message.kind);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlRoamingIndicator>): PrlRoamingIndicator {
+    return PrlRoamingIndicator.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlRoamingIndicator>): PrlRoamingIndicator {
+    const message = createBasePrlRoamingIndicator();
+    message.raw = object.raw ?? 0;
+    message.kind = object.kind ?? 0;
+    return message;
+  },
+};
+
+function createBasePrlAcqRecord(): PrlAcqRecord {
+  return {
+    acqTypeRaw: 0,
+    cellularAnalog: undefined,
+    cellularCdmaStandard: undefined,
+    cellularCdmaCustom: undefined,
+    cellularCdmaPreferred: undefined,
+    pcsCdmaUsingBlocks: undefined,
+    pcsCdmaUsingChannels: undefined,
+    jtacsCdmaStandard: undefined,
+    jtacsCdmaCustom: undefined,
+    bandClass6UsingChannels: undefined,
+    unknown: undefined,
+  };
+}
+
+export const PrlAcqRecord: MessageFns<PrlAcqRecord> = {
+  encode(message: PrlAcqRecord, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.acqTypeRaw !== 0) {
+      writer.uint32(8).uint32(message.acqTypeRaw);
+    }
+    if (message.cellularAnalog !== undefined) {
+      PrlAcqCellularAnalog.encode(message.cellularAnalog, writer.uint32(18).fork()).join();
+    }
+    if (message.cellularCdmaStandard !== undefined) {
+      PrlAcqCellularCdmaStandard.encode(message.cellularCdmaStandard, writer.uint32(26).fork()).join();
+    }
+    if (message.cellularCdmaCustom !== undefined) {
+      PrlAcqCellularCdmaCustom.encode(message.cellularCdmaCustom, writer.uint32(34).fork()).join();
+    }
+    if (message.cellularCdmaPreferred !== undefined) {
+      PrlAcqCellularCdmaPreferred.encode(message.cellularCdmaPreferred, writer.uint32(42).fork()).join();
+    }
+    if (message.pcsCdmaUsingBlocks !== undefined) {
+      PrlAcqPcsCdmaUsingBlocks.encode(message.pcsCdmaUsingBlocks, writer.uint32(50).fork()).join();
+    }
+    if (message.pcsCdmaUsingChannels !== undefined) {
+      PrlAcqPcsCdmaUsingChannels.encode(message.pcsCdmaUsingChannels, writer.uint32(58).fork()).join();
+    }
+    if (message.jtacsCdmaStandard !== undefined) {
+      PrlAcqJtacsCdmaStandard.encode(message.jtacsCdmaStandard, writer.uint32(66).fork()).join();
+    }
+    if (message.jtacsCdmaCustom !== undefined) {
+      PrlAcqJtacsCdmaCustom.encode(message.jtacsCdmaCustom, writer.uint32(74).fork()).join();
+    }
+    if (message.bandClass6UsingChannels !== undefined) {
+      PrlAcqBandClass6UsingChannels.encode(message.bandClass6UsingChannels, writer.uint32(82).fork()).join();
+    }
+    if (message.unknown !== undefined) {
+      PrlAcqUnknown.encode(message.unknown, writer.uint32(90).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlAcqRecord {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlAcqRecord();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.acqTypeRaw = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.cellularAnalog = PrlAcqCellularAnalog.decode(reader, reader.uint32());
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.cellularCdmaStandard = PrlAcqCellularCdmaStandard.decode(reader, reader.uint32());
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.cellularCdmaCustom = PrlAcqCellularCdmaCustom.decode(reader, reader.uint32());
+          continue;
+        }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          message.cellularCdmaPreferred = PrlAcqCellularCdmaPreferred.decode(reader, reader.uint32());
+          continue;
+        }
+        case 6: {
+          if (tag !== 50) {
+            break;
+          }
+
+          message.pcsCdmaUsingBlocks = PrlAcqPcsCdmaUsingBlocks.decode(reader, reader.uint32());
+          continue;
+        }
+        case 7: {
+          if (tag !== 58) {
+            break;
+          }
+
+          message.pcsCdmaUsingChannels = PrlAcqPcsCdmaUsingChannels.decode(reader, reader.uint32());
+          continue;
+        }
+        case 8: {
+          if (tag !== 66) {
+            break;
+          }
+
+          message.jtacsCdmaStandard = PrlAcqJtacsCdmaStandard.decode(reader, reader.uint32());
+          continue;
+        }
+        case 9: {
+          if (tag !== 74) {
+            break;
+          }
+
+          message.jtacsCdmaCustom = PrlAcqJtacsCdmaCustom.decode(reader, reader.uint32());
+          continue;
+        }
+        case 10: {
+          if (tag !== 82) {
+            break;
+          }
+
+          message.bandClass6UsingChannels = PrlAcqBandClass6UsingChannels.decode(reader, reader.uint32());
+          continue;
+        }
+        case 11: {
+          if (tag !== 90) {
+            break;
+          }
+
+          message.unknown = PrlAcqUnknown.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlAcqRecord {
+    return {
+      acqTypeRaw: isSet(object.acqTypeRaw)
+        ? globalThis.Number(object.acqTypeRaw)
+        : isSet(object.acq_type_raw)
+        ? globalThis.Number(object.acq_type_raw)
+        : 0,
+      cellularAnalog: isSet(object.cellularAnalog)
+        ? PrlAcqCellularAnalog.fromJSON(object.cellularAnalog)
+        : isSet(object.cellular_analog)
+        ? PrlAcqCellularAnalog.fromJSON(object.cellular_analog)
+        : undefined,
+      cellularCdmaStandard: isSet(object.cellularCdmaStandard)
+        ? PrlAcqCellularCdmaStandard.fromJSON(object.cellularCdmaStandard)
+        : isSet(object.cellular_cdma_standard)
+        ? PrlAcqCellularCdmaStandard.fromJSON(object.cellular_cdma_standard)
+        : undefined,
+      cellularCdmaCustom: isSet(object.cellularCdmaCustom)
+        ? PrlAcqCellularCdmaCustom.fromJSON(object.cellularCdmaCustom)
+        : isSet(object.cellular_cdma_custom)
+        ? PrlAcqCellularCdmaCustom.fromJSON(object.cellular_cdma_custom)
+        : undefined,
+      cellularCdmaPreferred: isSet(object.cellularCdmaPreferred)
+        ? PrlAcqCellularCdmaPreferred.fromJSON(object.cellularCdmaPreferred)
+        : isSet(object.cellular_cdma_preferred)
+        ? PrlAcqCellularCdmaPreferred.fromJSON(object.cellular_cdma_preferred)
+        : undefined,
+      pcsCdmaUsingBlocks: isSet(object.pcsCdmaUsingBlocks)
+        ? PrlAcqPcsCdmaUsingBlocks.fromJSON(object.pcsCdmaUsingBlocks)
+        : isSet(object.pcs_cdma_using_blocks)
+        ? PrlAcqPcsCdmaUsingBlocks.fromJSON(object.pcs_cdma_using_blocks)
+        : undefined,
+      pcsCdmaUsingChannels: isSet(object.pcsCdmaUsingChannels)
+        ? PrlAcqPcsCdmaUsingChannels.fromJSON(object.pcsCdmaUsingChannels)
+        : isSet(object.pcs_cdma_using_channels)
+        ? PrlAcqPcsCdmaUsingChannels.fromJSON(object.pcs_cdma_using_channels)
+        : undefined,
+      jtacsCdmaStandard: isSet(object.jtacsCdmaStandard)
+        ? PrlAcqJtacsCdmaStandard.fromJSON(object.jtacsCdmaStandard)
+        : isSet(object.jtacs_cdma_standard)
+        ? PrlAcqJtacsCdmaStandard.fromJSON(object.jtacs_cdma_standard)
+        : undefined,
+      jtacsCdmaCustom: isSet(object.jtacsCdmaCustom)
+        ? PrlAcqJtacsCdmaCustom.fromJSON(object.jtacsCdmaCustom)
+        : isSet(object.jtacs_cdma_custom)
+        ? PrlAcqJtacsCdmaCustom.fromJSON(object.jtacs_cdma_custom)
+        : undefined,
+      bandClass6UsingChannels: isSet(object.bandClass6UsingChannels)
+        ? PrlAcqBandClass6UsingChannels.fromJSON(object.bandClass6UsingChannels)
+        : isSet(object.band_class6_using_channels)
+        ? PrlAcqBandClass6UsingChannels.fromJSON(object.band_class6_using_channels)
+        : undefined,
+      unknown: isSet(object.unknown) ? PrlAcqUnknown.fromJSON(object.unknown) : undefined,
+    };
+  },
+
+  toJSON(message: PrlAcqRecord): unknown {
+    const obj: any = {};
+    if (message.acqTypeRaw !== 0) {
+      obj.acqTypeRaw = Math.round(message.acqTypeRaw);
+    }
+    if (message.cellularAnalog !== undefined) {
+      obj.cellularAnalog = PrlAcqCellularAnalog.toJSON(message.cellularAnalog);
+    }
+    if (message.cellularCdmaStandard !== undefined) {
+      obj.cellularCdmaStandard = PrlAcqCellularCdmaStandard.toJSON(message.cellularCdmaStandard);
+    }
+    if (message.cellularCdmaCustom !== undefined) {
+      obj.cellularCdmaCustom = PrlAcqCellularCdmaCustom.toJSON(message.cellularCdmaCustom);
+    }
+    if (message.cellularCdmaPreferred !== undefined) {
+      obj.cellularCdmaPreferred = PrlAcqCellularCdmaPreferred.toJSON(message.cellularCdmaPreferred);
+    }
+    if (message.pcsCdmaUsingBlocks !== undefined) {
+      obj.pcsCdmaUsingBlocks = PrlAcqPcsCdmaUsingBlocks.toJSON(message.pcsCdmaUsingBlocks);
+    }
+    if (message.pcsCdmaUsingChannels !== undefined) {
+      obj.pcsCdmaUsingChannels = PrlAcqPcsCdmaUsingChannels.toJSON(message.pcsCdmaUsingChannels);
+    }
+    if (message.jtacsCdmaStandard !== undefined) {
+      obj.jtacsCdmaStandard = PrlAcqJtacsCdmaStandard.toJSON(message.jtacsCdmaStandard);
+    }
+    if (message.jtacsCdmaCustom !== undefined) {
+      obj.jtacsCdmaCustom = PrlAcqJtacsCdmaCustom.toJSON(message.jtacsCdmaCustom);
+    }
+    if (message.bandClass6UsingChannels !== undefined) {
+      obj.bandClass6UsingChannels = PrlAcqBandClass6UsingChannels.toJSON(message.bandClass6UsingChannels);
+    }
+    if (message.unknown !== undefined) {
+      obj.unknown = PrlAcqUnknown.toJSON(message.unknown);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlAcqRecord>): PrlAcqRecord {
+    return PrlAcqRecord.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlAcqRecord>): PrlAcqRecord {
+    const message = createBasePrlAcqRecord();
+    message.acqTypeRaw = object.acqTypeRaw ?? 0;
+    message.cellularAnalog = (object.cellularAnalog !== undefined && object.cellularAnalog !== null)
+      ? PrlAcqCellularAnalog.fromPartial(object.cellularAnalog)
+      : undefined;
+    message.cellularCdmaStandard = (object.cellularCdmaStandard !== undefined && object.cellularCdmaStandard !== null)
+      ? PrlAcqCellularCdmaStandard.fromPartial(object.cellularCdmaStandard)
+      : undefined;
+    message.cellularCdmaCustom = (object.cellularCdmaCustom !== undefined && object.cellularCdmaCustom !== null)
+      ? PrlAcqCellularCdmaCustom.fromPartial(object.cellularCdmaCustom)
+      : undefined;
+    message.cellularCdmaPreferred =
+      (object.cellularCdmaPreferred !== undefined && object.cellularCdmaPreferred !== null)
+        ? PrlAcqCellularCdmaPreferred.fromPartial(object.cellularCdmaPreferred)
+        : undefined;
+    message.pcsCdmaUsingBlocks = (object.pcsCdmaUsingBlocks !== undefined && object.pcsCdmaUsingBlocks !== null)
+      ? PrlAcqPcsCdmaUsingBlocks.fromPartial(object.pcsCdmaUsingBlocks)
+      : undefined;
+    message.pcsCdmaUsingChannels = (object.pcsCdmaUsingChannels !== undefined && object.pcsCdmaUsingChannels !== null)
+      ? PrlAcqPcsCdmaUsingChannels.fromPartial(object.pcsCdmaUsingChannels)
+      : undefined;
+    message.jtacsCdmaStandard = (object.jtacsCdmaStandard !== undefined && object.jtacsCdmaStandard !== null)
+      ? PrlAcqJtacsCdmaStandard.fromPartial(object.jtacsCdmaStandard)
+      : undefined;
+    message.jtacsCdmaCustom = (object.jtacsCdmaCustom !== undefined && object.jtacsCdmaCustom !== null)
+      ? PrlAcqJtacsCdmaCustom.fromPartial(object.jtacsCdmaCustom)
+      : undefined;
+    message.bandClass6UsingChannels =
+      (object.bandClass6UsingChannels !== undefined && object.bandClass6UsingChannels !== null)
+        ? PrlAcqBandClass6UsingChannels.fromPartial(object.bandClass6UsingChannels)
+        : undefined;
+    message.unknown = (object.unknown !== undefined && object.unknown !== null)
+      ? PrlAcqUnknown.fromPartial(object.unknown)
+      : undefined;
+    return message;
+  },
+};
+
+function createBasePrlAcqCellularAnalog(): PrlAcqCellularAnalog {
+  return { ab: 0 };
+}
+
+export const PrlAcqCellularAnalog: MessageFns<PrlAcqCellularAnalog> = {
+  encode(message: PrlAcqCellularAnalog, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.ab !== 0) {
+      writer.uint32(8).int32(message.ab);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlAcqCellularAnalog {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlAcqCellularAnalog();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.ab = reader.int32() as any;
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlAcqCellularAnalog {
+    return { ab: isSet(object.ab) ? prlAbSelectionFromJSON(object.ab) : 0 };
+  },
+
+  toJSON(message: PrlAcqCellularAnalog): unknown {
+    const obj: any = {};
+    if (message.ab !== 0) {
+      obj.ab = prlAbSelectionToJSON(message.ab);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlAcqCellularAnalog>): PrlAcqCellularAnalog {
+    return PrlAcqCellularAnalog.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlAcqCellularAnalog>): PrlAcqCellularAnalog {
+    const message = createBasePrlAcqCellularAnalog();
+    message.ab = object.ab ?? 0;
+    return message;
+  },
+};
+
+function createBasePrlAcqCellularCdmaStandard(): PrlAcqCellularCdmaStandard {
+  return { ab: 0, priSec: 0 };
+}
+
+export const PrlAcqCellularCdmaStandard: MessageFns<PrlAcqCellularCdmaStandard> = {
+  encode(message: PrlAcqCellularCdmaStandard, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.ab !== 0) {
+      writer.uint32(8).int32(message.ab);
+    }
+    if (message.priSec !== 0) {
+      writer.uint32(16).int32(message.priSec);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlAcqCellularCdmaStandard {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlAcqCellularCdmaStandard();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.ab = reader.int32() as any;
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.priSec = reader.int32() as any;
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlAcqCellularCdmaStandard {
+    return {
+      ab: isSet(object.ab) ? prlAbSelectionFromJSON(object.ab) : 0,
+      priSec: isSet(object.priSec)
+        ? prlStandardChannelFromJSON(object.priSec)
+        : isSet(object.pri_sec)
+        ? prlStandardChannelFromJSON(object.pri_sec)
+        : 0,
+    };
+  },
+
+  toJSON(message: PrlAcqCellularCdmaStandard): unknown {
+    const obj: any = {};
+    if (message.ab !== 0) {
+      obj.ab = prlAbSelectionToJSON(message.ab);
+    }
+    if (message.priSec !== 0) {
+      obj.priSec = prlStandardChannelToJSON(message.priSec);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlAcqCellularCdmaStandard>): PrlAcqCellularCdmaStandard {
+    return PrlAcqCellularCdmaStandard.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlAcqCellularCdmaStandard>): PrlAcqCellularCdmaStandard {
+    const message = createBasePrlAcqCellularCdmaStandard();
+    message.ab = object.ab ?? 0;
+    message.priSec = object.priSec ?? 0;
+    return message;
+  },
+};
+
+function createBasePrlAcqCellularCdmaCustom(): PrlAcqCellularCdmaCustom {
+  return { channels: [] };
+}
+
+export const PrlAcqCellularCdmaCustom: MessageFns<PrlAcqCellularCdmaCustom> = {
+  encode(message: PrlAcqCellularCdmaCustom, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    writer.uint32(10).fork();
+    for (const v of message.channels) {
+      writer.uint32(v);
+    }
+    writer.join();
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlAcqCellularCdmaCustom {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlAcqCellularCdmaCustom();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag === 8) {
+            message.channels.push(reader.uint32());
+
+            continue;
+          }
+
+          if (tag === 10) {
+            const end2 = reader.uint32() + reader.pos;
+            while (reader.pos < end2) {
+              message.channels.push(reader.uint32());
+            }
+
+            continue;
+          }
+
+          break;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlAcqCellularCdmaCustom {
+    return {
+      channels: globalThis.Array.isArray(object?.channels) ? object.channels.map((e: any) => globalThis.Number(e)) : [],
+    };
+  },
+
+  toJSON(message: PrlAcqCellularCdmaCustom): unknown {
+    const obj: any = {};
+    if (message.channels?.length) {
+      obj.channels = message.channels.map((e) => Math.round(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlAcqCellularCdmaCustom>): PrlAcqCellularCdmaCustom {
+    return PrlAcqCellularCdmaCustom.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlAcqCellularCdmaCustom>): PrlAcqCellularCdmaCustom {
+    const message = createBasePrlAcqCellularCdmaCustom();
+    message.channels = object.channels?.map((e) => e) || [];
+    return message;
+  },
+};
+
+function createBasePrlAcqCellularCdmaPreferred(): PrlAcqCellularCdmaPreferred {
+  return { ab: 0 };
+}
+
+export const PrlAcqCellularCdmaPreferred: MessageFns<PrlAcqCellularCdmaPreferred> = {
+  encode(message: PrlAcqCellularCdmaPreferred, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.ab !== 0) {
+      writer.uint32(8).int32(message.ab);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlAcqCellularCdmaPreferred {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlAcqCellularCdmaPreferred();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.ab = reader.int32() as any;
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlAcqCellularCdmaPreferred {
+    return { ab: isSet(object.ab) ? prlAbSelectionFromJSON(object.ab) : 0 };
+  },
+
+  toJSON(message: PrlAcqCellularCdmaPreferred): unknown {
+    const obj: any = {};
+    if (message.ab !== 0) {
+      obj.ab = prlAbSelectionToJSON(message.ab);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlAcqCellularCdmaPreferred>): PrlAcqCellularCdmaPreferred {
+    return PrlAcqCellularCdmaPreferred.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlAcqCellularCdmaPreferred>): PrlAcqCellularCdmaPreferred {
+    const message = createBasePrlAcqCellularCdmaPreferred();
+    message.ab = object.ab ?? 0;
+    return message;
+  },
+};
+
+function createBasePrlAcqPcsCdmaUsingBlocks(): PrlAcqPcsCdmaUsingBlocks {
+  return { blocks: [] };
+}
+
+export const PrlAcqPcsCdmaUsingBlocks: MessageFns<PrlAcqPcsCdmaUsingBlocks> = {
+  encode(message: PrlAcqPcsCdmaUsingBlocks, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    writer.uint32(10).fork();
+    for (const v of message.blocks) {
+      writer.int32(v);
+    }
+    writer.join();
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlAcqPcsCdmaUsingBlocks {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlAcqPcsCdmaUsingBlocks();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag === 8) {
+            message.blocks.push(reader.int32() as any);
+
+            continue;
+          }
+
+          if (tag === 10) {
+            const end2 = reader.uint32() + reader.pos;
+            while (reader.pos < end2) {
+              message.blocks.push(reader.int32() as any);
+            }
+
+            continue;
+          }
+
+          break;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlAcqPcsCdmaUsingBlocks {
+    return {
+      blocks: globalThis.Array.isArray(object?.blocks) ? object.blocks.map((e: any) => prlPcsBlockFromJSON(e)) : [],
+    };
+  },
+
+  toJSON(message: PrlAcqPcsCdmaUsingBlocks): unknown {
+    const obj: any = {};
+    if (message.blocks?.length) {
+      obj.blocks = message.blocks.map((e) => prlPcsBlockToJSON(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlAcqPcsCdmaUsingBlocks>): PrlAcqPcsCdmaUsingBlocks {
+    return PrlAcqPcsCdmaUsingBlocks.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlAcqPcsCdmaUsingBlocks>): PrlAcqPcsCdmaUsingBlocks {
+    const message = createBasePrlAcqPcsCdmaUsingBlocks();
+    message.blocks = object.blocks?.map((e) => e) || [];
+    return message;
+  },
+};
+
+function createBasePrlAcqPcsCdmaUsingChannels(): PrlAcqPcsCdmaUsingChannels {
+  return { channels: [] };
+}
+
+export const PrlAcqPcsCdmaUsingChannels: MessageFns<PrlAcqPcsCdmaUsingChannels> = {
+  encode(message: PrlAcqPcsCdmaUsingChannels, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    writer.uint32(10).fork();
+    for (const v of message.channels) {
+      writer.uint32(v);
+    }
+    writer.join();
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlAcqPcsCdmaUsingChannels {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlAcqPcsCdmaUsingChannels();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag === 8) {
+            message.channels.push(reader.uint32());
+
+            continue;
+          }
+
+          if (tag === 10) {
+            const end2 = reader.uint32() + reader.pos;
+            while (reader.pos < end2) {
+              message.channels.push(reader.uint32());
+            }
+
+            continue;
+          }
+
+          break;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlAcqPcsCdmaUsingChannels {
+    return {
+      channels: globalThis.Array.isArray(object?.channels) ? object.channels.map((e: any) => globalThis.Number(e)) : [],
+    };
+  },
+
+  toJSON(message: PrlAcqPcsCdmaUsingChannels): unknown {
+    const obj: any = {};
+    if (message.channels?.length) {
+      obj.channels = message.channels.map((e) => Math.round(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlAcqPcsCdmaUsingChannels>): PrlAcqPcsCdmaUsingChannels {
+    return PrlAcqPcsCdmaUsingChannels.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlAcqPcsCdmaUsingChannels>): PrlAcqPcsCdmaUsingChannels {
+    const message = createBasePrlAcqPcsCdmaUsingChannels();
+    message.channels = object.channels?.map((e) => e) || [];
+    return message;
+  },
+};
+
+function createBasePrlAcqJtacsCdmaStandard(): PrlAcqJtacsCdmaStandard {
+  return { ab: 0, priSec: 0 };
+}
+
+export const PrlAcqJtacsCdmaStandard: MessageFns<PrlAcqJtacsCdmaStandard> = {
+  encode(message: PrlAcqJtacsCdmaStandard, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.ab !== 0) {
+      writer.uint32(8).int32(message.ab);
+    }
+    if (message.priSec !== 0) {
+      writer.uint32(16).int32(message.priSec);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlAcqJtacsCdmaStandard {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlAcqJtacsCdmaStandard();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.ab = reader.int32() as any;
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.priSec = reader.int32() as any;
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlAcqJtacsCdmaStandard {
+    return {
+      ab: isSet(object.ab) ? prlAbSelectionFromJSON(object.ab) : 0,
+      priSec: isSet(object.priSec)
+        ? prlStandardChannelFromJSON(object.priSec)
+        : isSet(object.pri_sec)
+        ? prlStandardChannelFromJSON(object.pri_sec)
+        : 0,
+    };
+  },
+
+  toJSON(message: PrlAcqJtacsCdmaStandard): unknown {
+    const obj: any = {};
+    if (message.ab !== 0) {
+      obj.ab = prlAbSelectionToJSON(message.ab);
+    }
+    if (message.priSec !== 0) {
+      obj.priSec = prlStandardChannelToJSON(message.priSec);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlAcqJtacsCdmaStandard>): PrlAcqJtacsCdmaStandard {
+    return PrlAcqJtacsCdmaStandard.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlAcqJtacsCdmaStandard>): PrlAcqJtacsCdmaStandard {
+    const message = createBasePrlAcqJtacsCdmaStandard();
+    message.ab = object.ab ?? 0;
+    message.priSec = object.priSec ?? 0;
+    return message;
+  },
+};
+
+function createBasePrlAcqJtacsCdmaCustom(): PrlAcqJtacsCdmaCustom {
+  return { channels: [] };
+}
+
+export const PrlAcqJtacsCdmaCustom: MessageFns<PrlAcqJtacsCdmaCustom> = {
+  encode(message: PrlAcqJtacsCdmaCustom, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    writer.uint32(10).fork();
+    for (const v of message.channels) {
+      writer.uint32(v);
+    }
+    writer.join();
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlAcqJtacsCdmaCustom {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlAcqJtacsCdmaCustom();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag === 8) {
+            message.channels.push(reader.uint32());
+
+            continue;
+          }
+
+          if (tag === 10) {
+            const end2 = reader.uint32() + reader.pos;
+            while (reader.pos < end2) {
+              message.channels.push(reader.uint32());
+            }
+
+            continue;
+          }
+
+          break;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlAcqJtacsCdmaCustom {
+    return {
+      channels: globalThis.Array.isArray(object?.channels) ? object.channels.map((e: any) => globalThis.Number(e)) : [],
+    };
+  },
+
+  toJSON(message: PrlAcqJtacsCdmaCustom): unknown {
+    const obj: any = {};
+    if (message.channels?.length) {
+      obj.channels = message.channels.map((e) => Math.round(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlAcqJtacsCdmaCustom>): PrlAcqJtacsCdmaCustom {
+    return PrlAcqJtacsCdmaCustom.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlAcqJtacsCdmaCustom>): PrlAcqJtacsCdmaCustom {
+    const message = createBasePrlAcqJtacsCdmaCustom();
+    message.channels = object.channels?.map((e) => e) || [];
+    return message;
+  },
+};
+
+function createBasePrlAcqBandClass6UsingChannels(): PrlAcqBandClass6UsingChannels {
+  return { channels: [] };
+}
+
+export const PrlAcqBandClass6UsingChannels: MessageFns<PrlAcqBandClass6UsingChannels> = {
+  encode(message: PrlAcqBandClass6UsingChannels, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    writer.uint32(10).fork();
+    for (const v of message.channels) {
+      writer.uint32(v);
+    }
+    writer.join();
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlAcqBandClass6UsingChannels {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlAcqBandClass6UsingChannels();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag === 8) {
+            message.channels.push(reader.uint32());
+
+            continue;
+          }
+
+          if (tag === 10) {
+            const end2 = reader.uint32() + reader.pos;
+            while (reader.pos < end2) {
+              message.channels.push(reader.uint32());
+            }
+
+            continue;
+          }
+
+          break;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlAcqBandClass6UsingChannels {
+    return {
+      channels: globalThis.Array.isArray(object?.channels) ? object.channels.map((e: any) => globalThis.Number(e)) : [],
+    };
+  },
+
+  toJSON(message: PrlAcqBandClass6UsingChannels): unknown {
+    const obj: any = {};
+    if (message.channels?.length) {
+      obj.channels = message.channels.map((e) => Math.round(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlAcqBandClass6UsingChannels>): PrlAcqBandClass6UsingChannels {
+    return PrlAcqBandClass6UsingChannels.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlAcqBandClass6UsingChannels>): PrlAcqBandClass6UsingChannels {
+    const message = createBasePrlAcqBandClass6UsingChannels();
+    message.channels = object.channels?.map((e) => e) || [];
+    return message;
+  },
+};
+
+function createBasePrlAcqUnknown(): PrlAcqUnknown {
+  return {};
+}
+
+export const PrlAcqUnknown: MessageFns<PrlAcqUnknown> = {
+  encode(_: PrlAcqUnknown, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlAcqUnknown {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlAcqUnknown();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(_: any): PrlAcqUnknown {
+    return {};
+  },
+
+  toJSON(_: PrlAcqUnknown): unknown {
+    const obj: any = {};
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlAcqUnknown>): PrlAcqUnknown {
+    return PrlAcqUnknown.fromPartial(base ?? {});
+  },
+  fromPartial(_: DeepPartial<PrlAcqUnknown>): PrlAcqUnknown {
+    const message = createBasePrlAcqUnknown();
+    return message;
+  },
+};
+
+function createBasePrlSysRecord(): PrlSysRecord {
+  return {
+    sid: 0,
+    nidIncl: 0,
+    nid: undefined,
+    sameGeoAsPrev: false,
+    prefNeg: 0,
+    acqIndex: 0,
+    roamingIndicator: undefined,
+    priority: undefined,
+  };
+}
+
+export const PrlSysRecord: MessageFns<PrlSysRecord> = {
+  encode(message: PrlSysRecord, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.sid !== 0) {
+      writer.uint32(8).uint32(message.sid);
+    }
+    if (message.nidIncl !== 0) {
+      writer.uint32(16).int32(message.nidIncl);
+    }
+    if (message.nid !== undefined) {
+      writer.uint32(24).uint32(message.nid);
+    }
+    if (message.sameGeoAsPrev !== false) {
+      writer.uint32(32).bool(message.sameGeoAsPrev);
+    }
+    if (message.prefNeg !== 0) {
+      writer.uint32(40).int32(message.prefNeg);
+    }
+    if (message.acqIndex !== 0) {
+      writer.uint32(48).uint32(message.acqIndex);
+    }
+    if (message.roamingIndicator !== undefined) {
+      PrlRoamingIndicator.encode(message.roamingIndicator, writer.uint32(58).fork()).join();
+    }
+    if (message.priority !== undefined) {
+      writer.uint32(64).int32(message.priority);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlSysRecord {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlSysRecord();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.sid = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.nidIncl = reader.int32() as any;
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.nid = reader.uint32();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.sameGeoAsPrev = reader.bool();
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.prefNeg = reader.int32() as any;
+          continue;
+        }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.acqIndex = reader.uint32();
+          continue;
+        }
+        case 7: {
+          if (tag !== 58) {
+            break;
+          }
+
+          message.roamingIndicator = PrlRoamingIndicator.decode(reader, reader.uint32());
+          continue;
+        }
+        case 8: {
+          if (tag !== 64) {
+            break;
+          }
+
+          message.priority = reader.int32() as any;
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlSysRecord {
+    return {
+      sid: isSet(object.sid) ? globalThis.Number(object.sid) : 0,
+      nidIncl: isSet(object.nidIncl)
+        ? prlNidInclusionFromJSON(object.nidIncl)
+        : isSet(object.nid_incl)
+        ? prlNidInclusionFromJSON(object.nid_incl)
+        : 0,
+      nid: isSet(object.nid) ? globalThis.Number(object.nid) : undefined,
+      sameGeoAsPrev: isSet(object.sameGeoAsPrev)
+        ? globalThis.Boolean(object.sameGeoAsPrev)
+        : isSet(object.same_geo_as_prev)
+        ? globalThis.Boolean(object.same_geo_as_prev)
+        : false,
+      prefNeg: isSet(object.prefNeg)
+        ? prlPrefNegFromJSON(object.prefNeg)
+        : isSet(object.pref_neg)
+        ? prlPrefNegFromJSON(object.pref_neg)
+        : 0,
+      acqIndex: isSet(object.acqIndex)
+        ? globalThis.Number(object.acqIndex)
+        : isSet(object.acq_index)
+        ? globalThis.Number(object.acq_index)
+        : 0,
+      roamingIndicator: isSet(object.roamingIndicator)
+        ? PrlRoamingIndicator.fromJSON(object.roamingIndicator)
+        : isSet(object.roaming_indicator)
+        ? PrlRoamingIndicator.fromJSON(object.roaming_indicator)
+        : undefined,
+      priority: isSet(object.priority) ? prlPriorityFromJSON(object.priority) : undefined,
+    };
+  },
+
+  toJSON(message: PrlSysRecord): unknown {
+    const obj: any = {};
+    if (message.sid !== 0) {
+      obj.sid = Math.round(message.sid);
+    }
+    if (message.nidIncl !== 0) {
+      obj.nidIncl = prlNidInclusionToJSON(message.nidIncl);
+    }
+    if (message.nid !== undefined) {
+      obj.nid = Math.round(message.nid);
+    }
+    if (message.sameGeoAsPrev !== false) {
+      obj.sameGeoAsPrev = message.sameGeoAsPrev;
+    }
+    if (message.prefNeg !== 0) {
+      obj.prefNeg = prlPrefNegToJSON(message.prefNeg);
+    }
+    if (message.acqIndex !== 0) {
+      obj.acqIndex = Math.round(message.acqIndex);
+    }
+    if (message.roamingIndicator !== undefined) {
+      obj.roamingIndicator = PrlRoamingIndicator.toJSON(message.roamingIndicator);
+    }
+    if (message.priority !== undefined) {
+      obj.priority = prlPriorityToJSON(message.priority);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlSysRecord>): PrlSysRecord {
+    return PrlSysRecord.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlSysRecord>): PrlSysRecord {
+    const message = createBasePrlSysRecord();
+    message.sid = object.sid ?? 0;
+    message.nidIncl = object.nidIncl ?? 0;
+    message.nid = object.nid ?? undefined;
+    message.sameGeoAsPrev = object.sameGeoAsPrev ?? false;
+    message.prefNeg = object.prefNeg ?? 0;
+    message.acqIndex = object.acqIndex ?? 0;
+    message.roamingIndicator = (object.roamingIndicator !== undefined && object.roamingIndicator !== null)
+      ? PrlRoamingIndicator.fromPartial(object.roamingIndicator)
+      : undefined;
+    message.priority = object.priority ?? undefined;
+    return message;
+  },
+};
+
+function createBasePrlBandClassChannel(): PrlBandClassChannel {
+  return { bandClass: 0, channelNumber: 0 };
+}
+
+export const PrlBandClassChannel: MessageFns<PrlBandClassChannel> = {
+  encode(message: PrlBandClassChannel, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.bandClass !== 0) {
+      writer.uint32(8).uint32(message.bandClass);
+    }
+    if (message.channelNumber !== 0) {
+      writer.uint32(16).uint32(message.channelNumber);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlBandClassChannel {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlBandClassChannel();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.bandClass = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.channelNumber = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlBandClassChannel {
+    return {
+      bandClass: isSet(object.bandClass)
+        ? globalThis.Number(object.bandClass)
+        : isSet(object.band_class)
+        ? globalThis.Number(object.band_class)
+        : 0,
+      channelNumber: isSet(object.channelNumber)
+        ? globalThis.Number(object.channelNumber)
+        : isSet(object.channel_number)
+        ? globalThis.Number(object.channel_number)
+        : 0,
+    };
+  },
+
+  toJSON(message: PrlBandClassChannel): unknown {
+    const obj: any = {};
+    if (message.bandClass !== 0) {
+      obj.bandClass = Math.round(message.bandClass);
+    }
+    if (message.channelNumber !== 0) {
+      obj.channelNumber = Math.round(message.channelNumber);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlBandClassChannel>): PrlBandClassChannel {
+    return PrlBandClassChannel.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlBandClassChannel>): PrlBandClassChannel {
+    const message = createBasePrlBandClassChannel();
+    message.bandClass = object.bandClass ?? 0;
+    message.channelNumber = object.channelNumber ?? 0;
+    return message;
+  },
+};
+
+function createBasePrlUmbAcqProfile(): PrlUmbAcqProfile {
+  return { umbAcqProfile: 0, fftSize: 0, cyclicPrefixLength: 0, numGuardSubcarriers: 0 };
+}
+
+export const PrlUmbAcqProfile: MessageFns<PrlUmbAcqProfile> = {
+  encode(message: PrlUmbAcqProfile, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.umbAcqProfile !== 0) {
+      writer.uint32(8).uint32(message.umbAcqProfile);
+    }
+    if (message.fftSize !== 0) {
+      writer.uint32(16).uint32(message.fftSize);
+    }
+    if (message.cyclicPrefixLength !== 0) {
+      writer.uint32(24).uint32(message.cyclicPrefixLength);
+    }
+    if (message.numGuardSubcarriers !== 0) {
+      writer.uint32(32).uint32(message.numGuardSubcarriers);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlUmbAcqProfile {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlUmbAcqProfile();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.umbAcqProfile = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.fftSize = reader.uint32();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.cyclicPrefixLength = reader.uint32();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.numGuardSubcarriers = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlUmbAcqProfile {
+    return {
+      umbAcqProfile: isSet(object.umbAcqProfile)
+        ? globalThis.Number(object.umbAcqProfile)
+        : isSet(object.umb_acq_profile)
+        ? globalThis.Number(object.umb_acq_profile)
+        : 0,
+      fftSize: isSet(object.fftSize)
+        ? globalThis.Number(object.fftSize)
+        : isSet(object.fft_size)
+        ? globalThis.Number(object.fft_size)
+        : 0,
+      cyclicPrefixLength: isSet(object.cyclicPrefixLength)
+        ? globalThis.Number(object.cyclicPrefixLength)
+        : isSet(object.cyclic_prefix_length)
+        ? globalThis.Number(object.cyclic_prefix_length)
+        : 0,
+      numGuardSubcarriers: isSet(object.numGuardSubcarriers)
+        ? globalThis.Number(object.numGuardSubcarriers)
+        : isSet(object.num_guard_subcarriers)
+        ? globalThis.Number(object.num_guard_subcarriers)
+        : 0,
+    };
+  },
+
+  toJSON(message: PrlUmbAcqProfile): unknown {
+    const obj: any = {};
+    if (message.umbAcqProfile !== 0) {
+      obj.umbAcqProfile = Math.round(message.umbAcqProfile);
+    }
+    if (message.fftSize !== 0) {
+      obj.fftSize = Math.round(message.fftSize);
+    }
+    if (message.cyclicPrefixLength !== 0) {
+      obj.cyclicPrefixLength = Math.round(message.cyclicPrefixLength);
+    }
+    if (message.numGuardSubcarriers !== 0) {
+      obj.numGuardSubcarriers = Math.round(message.numGuardSubcarriers);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlUmbAcqProfile>): PrlUmbAcqProfile {
+    return PrlUmbAcqProfile.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlUmbAcqProfile>): PrlUmbAcqProfile {
+    const message = createBasePrlUmbAcqProfile();
+    message.umbAcqProfile = object.umbAcqProfile ?? 0;
+    message.fftSize = object.fftSize ?? 0;
+    message.cyclicPrefixLength = object.cyclicPrefixLength ?? 0;
+    message.numGuardSubcarriers = object.numGuardSubcarriers ?? 0;
+    return message;
+  },
+};
+
+function createBasePrlUmbBlock(): PrlUmbBlock {
+  return { bandClass: 0, channelNumber: 0, umbAcqTableProfile: 0 };
+}
+
+export const PrlUmbBlock: MessageFns<PrlUmbBlock> = {
+  encode(message: PrlUmbBlock, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.bandClass !== 0) {
+      writer.uint32(8).uint32(message.bandClass);
+    }
+    if (message.channelNumber !== 0) {
+      writer.uint32(16).uint32(message.channelNumber);
+    }
+    if (message.umbAcqTableProfile !== 0) {
+      writer.uint32(24).uint32(message.umbAcqTableProfile);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlUmbBlock {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlUmbBlock();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.bandClass = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.channelNumber = reader.uint32();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.umbAcqTableProfile = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlUmbBlock {
+    return {
+      bandClass: isSet(object.bandClass)
+        ? globalThis.Number(object.bandClass)
+        : isSet(object.band_class)
+        ? globalThis.Number(object.band_class)
+        : 0,
+      channelNumber: isSet(object.channelNumber)
+        ? globalThis.Number(object.channelNumber)
+        : isSet(object.channel_number)
+        ? globalThis.Number(object.channel_number)
+        : 0,
+      umbAcqTableProfile: isSet(object.umbAcqTableProfile)
+        ? globalThis.Number(object.umbAcqTableProfile)
+        : isSet(object.umb_acq_table_profile)
+        ? globalThis.Number(object.umb_acq_table_profile)
+        : 0,
+    };
+  },
+
+  toJSON(message: PrlUmbBlock): unknown {
+    const obj: any = {};
+    if (message.bandClass !== 0) {
+      obj.bandClass = Math.round(message.bandClass);
+    }
+    if (message.channelNumber !== 0) {
+      obj.channelNumber = Math.round(message.channelNumber);
+    }
+    if (message.umbAcqTableProfile !== 0) {
+      obj.umbAcqTableProfile = Math.round(message.umbAcqTableProfile);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlUmbBlock>): PrlUmbBlock {
+    return PrlUmbBlock.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlUmbBlock>): PrlUmbBlock {
+    const message = createBasePrlUmbBlock();
+    message.bandClass = object.bandClass ?? 0;
+    message.channelNumber = object.channelNumber ?? 0;
+    message.umbAcqTableProfile = object.umbAcqTableProfile ?? 0;
+    return message;
+  },
+};
+
+function createBasePrlExtAcqRecord(): PrlExtAcqRecord {
+  return {
+    acqTypeRaw: 0,
+    length: 0,
+    cellularAnalog: undefined,
+    cellularCdmaStandard: undefined,
+    cellularCdmaCustom: undefined,
+    cellularCdmaPreferred: undefined,
+    pcsCdmaUsingBlocks: undefined,
+    pcsCdmaUsingChannels: undefined,
+    jtacsCdmaStandard: undefined,
+    jtacsCdmaCustom: undefined,
+    bandClass6UsingChannels: undefined,
+    generic1xIs95: undefined,
+    genericHrpd: undefined,
+    umbCommonTable: undefined,
+    genericUmb: undefined,
+    other: undefined,
+  };
+}
+
+export const PrlExtAcqRecord: MessageFns<PrlExtAcqRecord> = {
+  encode(message: PrlExtAcqRecord, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.acqTypeRaw !== 0) {
+      writer.uint32(8).uint32(message.acqTypeRaw);
+    }
+    if (message.length !== 0) {
+      writer.uint32(16).uint32(message.length);
+    }
+    if (message.cellularAnalog !== undefined) {
+      PrlAcqCellularAnalog.encode(message.cellularAnalog, writer.uint32(26).fork()).join();
+    }
+    if (message.cellularCdmaStandard !== undefined) {
+      PrlAcqCellularCdmaStandard.encode(message.cellularCdmaStandard, writer.uint32(34).fork()).join();
+    }
+    if (message.cellularCdmaCustom !== undefined) {
+      PrlAcqCellularCdmaCustom.encode(message.cellularCdmaCustom, writer.uint32(42).fork()).join();
+    }
+    if (message.cellularCdmaPreferred !== undefined) {
+      PrlAcqCellularCdmaPreferred.encode(message.cellularCdmaPreferred, writer.uint32(50).fork()).join();
+    }
+    if (message.pcsCdmaUsingBlocks !== undefined) {
+      PrlAcqPcsCdmaUsingBlocks.encode(message.pcsCdmaUsingBlocks, writer.uint32(58).fork()).join();
+    }
+    if (message.pcsCdmaUsingChannels !== undefined) {
+      PrlAcqPcsCdmaUsingChannels.encode(message.pcsCdmaUsingChannels, writer.uint32(66).fork()).join();
+    }
+    if (message.jtacsCdmaStandard !== undefined) {
+      PrlAcqJtacsCdmaStandard.encode(message.jtacsCdmaStandard, writer.uint32(74).fork()).join();
+    }
+    if (message.jtacsCdmaCustom !== undefined) {
+      PrlAcqJtacsCdmaCustom.encode(message.jtacsCdmaCustom, writer.uint32(82).fork()).join();
+    }
+    if (message.bandClass6UsingChannels !== undefined) {
+      PrlAcqBandClass6UsingChannels.encode(message.bandClass6UsingChannels, writer.uint32(90).fork()).join();
+    }
+    if (message.generic1xIs95 !== undefined) {
+      PrlExtAcqGeneric1xIs95.encode(message.generic1xIs95, writer.uint32(98).fork()).join();
+    }
+    if (message.genericHrpd !== undefined) {
+      PrlExtAcqGenericHrpd.encode(message.genericHrpd, writer.uint32(106).fork()).join();
+    }
+    if (message.umbCommonTable !== undefined) {
+      PrlExtAcqUmbCommonTable.encode(message.umbCommonTable, writer.uint32(114).fork()).join();
+    }
+    if (message.genericUmb !== undefined) {
+      PrlExtAcqGenericUmb.encode(message.genericUmb, writer.uint32(122).fork()).join();
+    }
+    if (message.other !== undefined) {
+      PrlExtAcqOther.encode(message.other, writer.uint32(130).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlExtAcqRecord {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlExtAcqRecord();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.acqTypeRaw = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.length = reader.uint32();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.cellularAnalog = PrlAcqCellularAnalog.decode(reader, reader.uint32());
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.cellularCdmaStandard = PrlAcqCellularCdmaStandard.decode(reader, reader.uint32());
+          continue;
+        }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          message.cellularCdmaCustom = PrlAcqCellularCdmaCustom.decode(reader, reader.uint32());
+          continue;
+        }
+        case 6: {
+          if (tag !== 50) {
+            break;
+          }
+
+          message.cellularCdmaPreferred = PrlAcqCellularCdmaPreferred.decode(reader, reader.uint32());
+          continue;
+        }
+        case 7: {
+          if (tag !== 58) {
+            break;
+          }
+
+          message.pcsCdmaUsingBlocks = PrlAcqPcsCdmaUsingBlocks.decode(reader, reader.uint32());
+          continue;
+        }
+        case 8: {
+          if (tag !== 66) {
+            break;
+          }
+
+          message.pcsCdmaUsingChannels = PrlAcqPcsCdmaUsingChannels.decode(reader, reader.uint32());
+          continue;
+        }
+        case 9: {
+          if (tag !== 74) {
+            break;
+          }
+
+          message.jtacsCdmaStandard = PrlAcqJtacsCdmaStandard.decode(reader, reader.uint32());
+          continue;
+        }
+        case 10: {
+          if (tag !== 82) {
+            break;
+          }
+
+          message.jtacsCdmaCustom = PrlAcqJtacsCdmaCustom.decode(reader, reader.uint32());
+          continue;
+        }
+        case 11: {
+          if (tag !== 90) {
+            break;
+          }
+
+          message.bandClass6UsingChannels = PrlAcqBandClass6UsingChannels.decode(reader, reader.uint32());
+          continue;
+        }
+        case 12: {
+          if (tag !== 98) {
+            break;
+          }
+
+          message.generic1xIs95 = PrlExtAcqGeneric1xIs95.decode(reader, reader.uint32());
+          continue;
+        }
+        case 13: {
+          if (tag !== 106) {
+            break;
+          }
+
+          message.genericHrpd = PrlExtAcqGenericHrpd.decode(reader, reader.uint32());
+          continue;
+        }
+        case 14: {
+          if (tag !== 114) {
+            break;
+          }
+
+          message.umbCommonTable = PrlExtAcqUmbCommonTable.decode(reader, reader.uint32());
+          continue;
+        }
+        case 15: {
+          if (tag !== 122) {
+            break;
+          }
+
+          message.genericUmb = PrlExtAcqGenericUmb.decode(reader, reader.uint32());
+          continue;
+        }
+        case 16: {
+          if (tag !== 130) {
+            break;
+          }
+
+          message.other = PrlExtAcqOther.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlExtAcqRecord {
+    return {
+      acqTypeRaw: isSet(object.acqTypeRaw)
+        ? globalThis.Number(object.acqTypeRaw)
+        : isSet(object.acq_type_raw)
+        ? globalThis.Number(object.acq_type_raw)
+        : 0,
+      length: isSet(object.length) ? globalThis.Number(object.length) : 0,
+      cellularAnalog: isSet(object.cellularAnalog)
+        ? PrlAcqCellularAnalog.fromJSON(object.cellularAnalog)
+        : isSet(object.cellular_analog)
+        ? PrlAcqCellularAnalog.fromJSON(object.cellular_analog)
+        : undefined,
+      cellularCdmaStandard: isSet(object.cellularCdmaStandard)
+        ? PrlAcqCellularCdmaStandard.fromJSON(object.cellularCdmaStandard)
+        : isSet(object.cellular_cdma_standard)
+        ? PrlAcqCellularCdmaStandard.fromJSON(object.cellular_cdma_standard)
+        : undefined,
+      cellularCdmaCustom: isSet(object.cellularCdmaCustom)
+        ? PrlAcqCellularCdmaCustom.fromJSON(object.cellularCdmaCustom)
+        : isSet(object.cellular_cdma_custom)
+        ? PrlAcqCellularCdmaCustom.fromJSON(object.cellular_cdma_custom)
+        : undefined,
+      cellularCdmaPreferred: isSet(object.cellularCdmaPreferred)
+        ? PrlAcqCellularCdmaPreferred.fromJSON(object.cellularCdmaPreferred)
+        : isSet(object.cellular_cdma_preferred)
+        ? PrlAcqCellularCdmaPreferred.fromJSON(object.cellular_cdma_preferred)
+        : undefined,
+      pcsCdmaUsingBlocks: isSet(object.pcsCdmaUsingBlocks)
+        ? PrlAcqPcsCdmaUsingBlocks.fromJSON(object.pcsCdmaUsingBlocks)
+        : isSet(object.pcs_cdma_using_blocks)
+        ? PrlAcqPcsCdmaUsingBlocks.fromJSON(object.pcs_cdma_using_blocks)
+        : undefined,
+      pcsCdmaUsingChannels: isSet(object.pcsCdmaUsingChannels)
+        ? PrlAcqPcsCdmaUsingChannels.fromJSON(object.pcsCdmaUsingChannels)
+        : isSet(object.pcs_cdma_using_channels)
+        ? PrlAcqPcsCdmaUsingChannels.fromJSON(object.pcs_cdma_using_channels)
+        : undefined,
+      jtacsCdmaStandard: isSet(object.jtacsCdmaStandard)
+        ? PrlAcqJtacsCdmaStandard.fromJSON(object.jtacsCdmaStandard)
+        : isSet(object.jtacs_cdma_standard)
+        ? PrlAcqJtacsCdmaStandard.fromJSON(object.jtacs_cdma_standard)
+        : undefined,
+      jtacsCdmaCustom: isSet(object.jtacsCdmaCustom)
+        ? PrlAcqJtacsCdmaCustom.fromJSON(object.jtacsCdmaCustom)
+        : isSet(object.jtacs_cdma_custom)
+        ? PrlAcqJtacsCdmaCustom.fromJSON(object.jtacs_cdma_custom)
+        : undefined,
+      bandClass6UsingChannels: isSet(object.bandClass6UsingChannels)
+        ? PrlAcqBandClass6UsingChannels.fromJSON(object.bandClass6UsingChannels)
+        : isSet(object.band_class6_using_channels)
+        ? PrlAcqBandClass6UsingChannels.fromJSON(object.band_class6_using_channels)
+        : undefined,
+      generic1xIs95: isSet(object.generic1xIs95)
+        ? PrlExtAcqGeneric1xIs95.fromJSON(object.generic1xIs95)
+        : isSet(object.generic_1x_is95)
+        ? PrlExtAcqGeneric1xIs95.fromJSON(object.generic_1x_is95)
+        : undefined,
+      genericHrpd: isSet(object.genericHrpd)
+        ? PrlExtAcqGenericHrpd.fromJSON(object.genericHrpd)
+        : isSet(object.generic_hrpd)
+        ? PrlExtAcqGenericHrpd.fromJSON(object.generic_hrpd)
+        : undefined,
+      umbCommonTable: isSet(object.umbCommonTable)
+        ? PrlExtAcqUmbCommonTable.fromJSON(object.umbCommonTable)
+        : isSet(object.umb_common_table)
+        ? PrlExtAcqUmbCommonTable.fromJSON(object.umb_common_table)
+        : undefined,
+      genericUmb: isSet(object.genericUmb)
+        ? PrlExtAcqGenericUmb.fromJSON(object.genericUmb)
+        : isSet(object.generic_umb)
+        ? PrlExtAcqGenericUmb.fromJSON(object.generic_umb)
+        : undefined,
+      other: isSet(object.other) ? PrlExtAcqOther.fromJSON(object.other) : undefined,
+    };
+  },
+
+  toJSON(message: PrlExtAcqRecord): unknown {
+    const obj: any = {};
+    if (message.acqTypeRaw !== 0) {
+      obj.acqTypeRaw = Math.round(message.acqTypeRaw);
+    }
+    if (message.length !== 0) {
+      obj.length = Math.round(message.length);
+    }
+    if (message.cellularAnalog !== undefined) {
+      obj.cellularAnalog = PrlAcqCellularAnalog.toJSON(message.cellularAnalog);
+    }
+    if (message.cellularCdmaStandard !== undefined) {
+      obj.cellularCdmaStandard = PrlAcqCellularCdmaStandard.toJSON(message.cellularCdmaStandard);
+    }
+    if (message.cellularCdmaCustom !== undefined) {
+      obj.cellularCdmaCustom = PrlAcqCellularCdmaCustom.toJSON(message.cellularCdmaCustom);
+    }
+    if (message.cellularCdmaPreferred !== undefined) {
+      obj.cellularCdmaPreferred = PrlAcqCellularCdmaPreferred.toJSON(message.cellularCdmaPreferred);
+    }
+    if (message.pcsCdmaUsingBlocks !== undefined) {
+      obj.pcsCdmaUsingBlocks = PrlAcqPcsCdmaUsingBlocks.toJSON(message.pcsCdmaUsingBlocks);
+    }
+    if (message.pcsCdmaUsingChannels !== undefined) {
+      obj.pcsCdmaUsingChannels = PrlAcqPcsCdmaUsingChannels.toJSON(message.pcsCdmaUsingChannels);
+    }
+    if (message.jtacsCdmaStandard !== undefined) {
+      obj.jtacsCdmaStandard = PrlAcqJtacsCdmaStandard.toJSON(message.jtacsCdmaStandard);
+    }
+    if (message.jtacsCdmaCustom !== undefined) {
+      obj.jtacsCdmaCustom = PrlAcqJtacsCdmaCustom.toJSON(message.jtacsCdmaCustom);
+    }
+    if (message.bandClass6UsingChannels !== undefined) {
+      obj.bandClass6UsingChannels = PrlAcqBandClass6UsingChannels.toJSON(message.bandClass6UsingChannels);
+    }
+    if (message.generic1xIs95 !== undefined) {
+      obj.generic1xIs95 = PrlExtAcqGeneric1xIs95.toJSON(message.generic1xIs95);
+    }
+    if (message.genericHrpd !== undefined) {
+      obj.genericHrpd = PrlExtAcqGenericHrpd.toJSON(message.genericHrpd);
+    }
+    if (message.umbCommonTable !== undefined) {
+      obj.umbCommonTable = PrlExtAcqUmbCommonTable.toJSON(message.umbCommonTable);
+    }
+    if (message.genericUmb !== undefined) {
+      obj.genericUmb = PrlExtAcqGenericUmb.toJSON(message.genericUmb);
+    }
+    if (message.other !== undefined) {
+      obj.other = PrlExtAcqOther.toJSON(message.other);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlExtAcqRecord>): PrlExtAcqRecord {
+    return PrlExtAcqRecord.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlExtAcqRecord>): PrlExtAcqRecord {
+    const message = createBasePrlExtAcqRecord();
+    message.acqTypeRaw = object.acqTypeRaw ?? 0;
+    message.length = object.length ?? 0;
+    message.cellularAnalog = (object.cellularAnalog !== undefined && object.cellularAnalog !== null)
+      ? PrlAcqCellularAnalog.fromPartial(object.cellularAnalog)
+      : undefined;
+    message.cellularCdmaStandard = (object.cellularCdmaStandard !== undefined && object.cellularCdmaStandard !== null)
+      ? PrlAcqCellularCdmaStandard.fromPartial(object.cellularCdmaStandard)
+      : undefined;
+    message.cellularCdmaCustom = (object.cellularCdmaCustom !== undefined && object.cellularCdmaCustom !== null)
+      ? PrlAcqCellularCdmaCustom.fromPartial(object.cellularCdmaCustom)
+      : undefined;
+    message.cellularCdmaPreferred =
+      (object.cellularCdmaPreferred !== undefined && object.cellularCdmaPreferred !== null)
+        ? PrlAcqCellularCdmaPreferred.fromPartial(object.cellularCdmaPreferred)
+        : undefined;
+    message.pcsCdmaUsingBlocks = (object.pcsCdmaUsingBlocks !== undefined && object.pcsCdmaUsingBlocks !== null)
+      ? PrlAcqPcsCdmaUsingBlocks.fromPartial(object.pcsCdmaUsingBlocks)
+      : undefined;
+    message.pcsCdmaUsingChannels = (object.pcsCdmaUsingChannels !== undefined && object.pcsCdmaUsingChannels !== null)
+      ? PrlAcqPcsCdmaUsingChannels.fromPartial(object.pcsCdmaUsingChannels)
+      : undefined;
+    message.jtacsCdmaStandard = (object.jtacsCdmaStandard !== undefined && object.jtacsCdmaStandard !== null)
+      ? PrlAcqJtacsCdmaStandard.fromPartial(object.jtacsCdmaStandard)
+      : undefined;
+    message.jtacsCdmaCustom = (object.jtacsCdmaCustom !== undefined && object.jtacsCdmaCustom !== null)
+      ? PrlAcqJtacsCdmaCustom.fromPartial(object.jtacsCdmaCustom)
+      : undefined;
+    message.bandClass6UsingChannels =
+      (object.bandClass6UsingChannels !== undefined && object.bandClass6UsingChannels !== null)
+        ? PrlAcqBandClass6UsingChannels.fromPartial(object.bandClass6UsingChannels)
+        : undefined;
+    message.generic1xIs95 = (object.generic1xIs95 !== undefined && object.generic1xIs95 !== null)
+      ? PrlExtAcqGeneric1xIs95.fromPartial(object.generic1xIs95)
+      : undefined;
+    message.genericHrpd = (object.genericHrpd !== undefined && object.genericHrpd !== null)
+      ? PrlExtAcqGenericHrpd.fromPartial(object.genericHrpd)
+      : undefined;
+    message.umbCommonTable = (object.umbCommonTable !== undefined && object.umbCommonTable !== null)
+      ? PrlExtAcqUmbCommonTable.fromPartial(object.umbCommonTable)
+      : undefined;
+    message.genericUmb = (object.genericUmb !== undefined && object.genericUmb !== null)
+      ? PrlExtAcqGenericUmb.fromPartial(object.genericUmb)
+      : undefined;
+    message.other = (object.other !== undefined && object.other !== null)
+      ? PrlExtAcqOther.fromPartial(object.other)
+      : undefined;
+    return message;
+  },
+};
+
+function createBasePrlExtAcqGeneric1xIs95(): PrlExtAcqGeneric1xIs95 {
+  return { entries: [] };
+}
+
+export const PrlExtAcqGeneric1xIs95: MessageFns<PrlExtAcqGeneric1xIs95> = {
+  encode(message: PrlExtAcqGeneric1xIs95, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.entries) {
+      PrlBandClassChannel.encode(v!, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlExtAcqGeneric1xIs95 {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlExtAcqGeneric1xIs95();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.entries.push(PrlBandClassChannel.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlExtAcqGeneric1xIs95 {
+    return {
+      entries: globalThis.Array.isArray(object?.entries)
+        ? object.entries.map((e: any) => PrlBandClassChannel.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: PrlExtAcqGeneric1xIs95): unknown {
+    const obj: any = {};
+    if (message.entries?.length) {
+      obj.entries = message.entries.map((e) => PrlBandClassChannel.toJSON(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlExtAcqGeneric1xIs95>): PrlExtAcqGeneric1xIs95 {
+    return PrlExtAcqGeneric1xIs95.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlExtAcqGeneric1xIs95>): PrlExtAcqGeneric1xIs95 {
+    const message = createBasePrlExtAcqGeneric1xIs95();
+    message.entries = object.entries?.map((e) => PrlBandClassChannel.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBasePrlExtAcqGenericHrpd(): PrlExtAcqGenericHrpd {
+  return { entries: [] };
+}
+
+export const PrlExtAcqGenericHrpd: MessageFns<PrlExtAcqGenericHrpd> = {
+  encode(message: PrlExtAcqGenericHrpd, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.entries) {
+      PrlBandClassChannel.encode(v!, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlExtAcqGenericHrpd {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlExtAcqGenericHrpd();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.entries.push(PrlBandClassChannel.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlExtAcqGenericHrpd {
+    return {
+      entries: globalThis.Array.isArray(object?.entries)
+        ? object.entries.map((e: any) => PrlBandClassChannel.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: PrlExtAcqGenericHrpd): unknown {
+    const obj: any = {};
+    if (message.entries?.length) {
+      obj.entries = message.entries.map((e) => PrlBandClassChannel.toJSON(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlExtAcqGenericHrpd>): PrlExtAcqGenericHrpd {
+    return PrlExtAcqGenericHrpd.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlExtAcqGenericHrpd>): PrlExtAcqGenericHrpd {
+    const message = createBasePrlExtAcqGenericHrpd();
+    message.entries = object.entries?.map((e) => PrlBandClassChannel.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBasePrlExtAcqUmbCommonTable(): PrlExtAcqUmbCommonTable {
+  return { entries: [] };
+}
+
+export const PrlExtAcqUmbCommonTable: MessageFns<PrlExtAcqUmbCommonTable> = {
+  encode(message: PrlExtAcqUmbCommonTable, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.entries) {
+      PrlUmbAcqProfile.encode(v!, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlExtAcqUmbCommonTable {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlExtAcqUmbCommonTable();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.entries.push(PrlUmbAcqProfile.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlExtAcqUmbCommonTable {
+    return {
+      entries: globalThis.Array.isArray(object?.entries)
+        ? object.entries.map((e: any) => PrlUmbAcqProfile.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: PrlExtAcqUmbCommonTable): unknown {
+    const obj: any = {};
+    if (message.entries?.length) {
+      obj.entries = message.entries.map((e) => PrlUmbAcqProfile.toJSON(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlExtAcqUmbCommonTable>): PrlExtAcqUmbCommonTable {
+    return PrlExtAcqUmbCommonTable.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlExtAcqUmbCommonTable>): PrlExtAcqUmbCommonTable {
+    const message = createBasePrlExtAcqUmbCommonTable();
+    message.entries = object.entries?.map((e) => PrlUmbAcqProfile.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBasePrlExtAcqGenericUmb(): PrlExtAcqGenericUmb {
+  return { blocks: [] };
+}
+
+export const PrlExtAcqGenericUmb: MessageFns<PrlExtAcqGenericUmb> = {
+  encode(message: PrlExtAcqGenericUmb, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.blocks) {
+      PrlUmbBlock.encode(v!, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlExtAcqGenericUmb {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlExtAcqGenericUmb();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.blocks.push(PrlUmbBlock.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlExtAcqGenericUmb {
+    return {
+      blocks: globalThis.Array.isArray(object?.blocks) ? object.blocks.map((e: any) => PrlUmbBlock.fromJSON(e)) : [],
+    };
+  },
+
+  toJSON(message: PrlExtAcqGenericUmb): unknown {
+    const obj: any = {};
+    if (message.blocks?.length) {
+      obj.blocks = message.blocks.map((e) => PrlUmbBlock.toJSON(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlExtAcqGenericUmb>): PrlExtAcqGenericUmb {
+    return PrlExtAcqGenericUmb.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlExtAcqGenericUmb>): PrlExtAcqGenericUmb {
+    const message = createBasePrlExtAcqGenericUmb();
+    message.blocks = object.blocks?.map((e) => PrlUmbBlock.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBasePrlExtAcqOther(): PrlExtAcqOther {
+  return { raw: new Uint8Array(0) };
+}
+
+export const PrlExtAcqOther: MessageFns<PrlExtAcqOther> = {
+  encode(message: PrlExtAcqOther, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.raw.length !== 0) {
+      writer.uint32(10).bytes(message.raw);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlExtAcqOther {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlExtAcqOther();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.raw = reader.bytes();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlExtAcqOther {
+    return { raw: isSet(object.raw) ? bytesFromBase64(object.raw) : new Uint8Array(0) };
+  },
+
+  toJSON(message: PrlExtAcqOther): unknown {
+    const obj: any = {};
+    if (message.raw.length !== 0) {
+      obj.raw = base64FromBytes(message.raw);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlExtAcqOther>): PrlExtAcqOther {
+    return PrlExtAcqOther.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlExtAcqOther>): PrlExtAcqOther {
+    const message = createBasePrlExtAcqOther();
+    message.raw = object.raw ?? new Uint8Array(0);
+    return message;
+  },
+};
+
+function createBasePrlCommonSubnetRecord(): PrlCommonSubnetRecord {
+  return { subnetCommonLengthOctets: 0, subnetCommonHex: "" };
+}
+
+export const PrlCommonSubnetRecord: MessageFns<PrlCommonSubnetRecord> = {
+  encode(message: PrlCommonSubnetRecord, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.subnetCommonLengthOctets !== 0) {
+      writer.uint32(8).uint32(message.subnetCommonLengthOctets);
+    }
+    if (message.subnetCommonHex !== "") {
+      writer.uint32(18).string(message.subnetCommonHex);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlCommonSubnetRecord {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlCommonSubnetRecord();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.subnetCommonLengthOctets = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.subnetCommonHex = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlCommonSubnetRecord {
+    return {
+      subnetCommonLengthOctets: isSet(object.subnetCommonLengthOctets)
+        ? globalThis.Number(object.subnetCommonLengthOctets)
+        : isSet(object.subnet_common_length_octets)
+        ? globalThis.Number(object.subnet_common_length_octets)
+        : 0,
+      subnetCommonHex: isSet(object.subnetCommonHex)
+        ? globalThis.String(object.subnetCommonHex)
+        : isSet(object.subnet_common_hex)
+        ? globalThis.String(object.subnet_common_hex)
+        : "",
+    };
+  },
+
+  toJSON(message: PrlCommonSubnetRecord): unknown {
+    const obj: any = {};
+    if (message.subnetCommonLengthOctets !== 0) {
+      obj.subnetCommonLengthOctets = Math.round(message.subnetCommonLengthOctets);
+    }
+    if (message.subnetCommonHex !== "") {
+      obj.subnetCommonHex = message.subnetCommonHex;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlCommonSubnetRecord>): PrlCommonSubnetRecord {
+    return PrlCommonSubnetRecord.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlCommonSubnetRecord>): PrlCommonSubnetRecord {
+    const message = createBasePrlCommonSubnetRecord();
+    message.subnetCommonLengthOctets = object.subnetCommonLengthOctets ?? 0;
+    message.subnetCommonHex = object.subnetCommonHex ?? "";
+    return message;
+  },
+};
+
+function createBasePrlExtSystemAssociation(): PrlExtSystemAssociation {
+  return { associationTag: 0, pnAssociation: false, dataAssociation: false };
+}
+
+export const PrlExtSystemAssociation: MessageFns<PrlExtSystemAssociation> = {
+  encode(message: PrlExtSystemAssociation, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.associationTag !== 0) {
+      writer.uint32(8).uint32(message.associationTag);
+    }
+    if (message.pnAssociation !== false) {
+      writer.uint32(16).bool(message.pnAssociation);
+    }
+    if (message.dataAssociation !== false) {
+      writer.uint32(24).bool(message.dataAssociation);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlExtSystemAssociation {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlExtSystemAssociation();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.associationTag = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.pnAssociation = reader.bool();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.dataAssociation = reader.bool();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlExtSystemAssociation {
+    return {
+      associationTag: isSet(object.associationTag)
+        ? globalThis.Number(object.associationTag)
+        : isSet(object.association_tag)
+        ? globalThis.Number(object.association_tag)
+        : 0,
+      pnAssociation: isSet(object.pnAssociation)
+        ? globalThis.Boolean(object.pnAssociation)
+        : isSet(object.pn_association)
+        ? globalThis.Boolean(object.pn_association)
+        : false,
+      dataAssociation: isSet(object.dataAssociation)
+        ? globalThis.Boolean(object.dataAssociation)
+        : isSet(object.data_association)
+        ? globalThis.Boolean(object.data_association)
+        : false,
+    };
+  },
+
+  toJSON(message: PrlExtSystemAssociation): unknown {
+    const obj: any = {};
+    if (message.associationTag !== 0) {
+      obj.associationTag = Math.round(message.associationTag);
+    }
+    if (message.pnAssociation !== false) {
+      obj.pnAssociation = message.pnAssociation;
+    }
+    if (message.dataAssociation !== false) {
+      obj.dataAssociation = message.dataAssociation;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlExtSystemAssociation>): PrlExtSystemAssociation {
+    return PrlExtSystemAssociation.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlExtSystemAssociation>): PrlExtSystemAssociation {
+    const message = createBasePrlExtSystemAssociation();
+    message.associationTag = object.associationTag ?? 0;
+    message.pnAssociation = object.pnAssociation ?? false;
+    message.dataAssociation = object.dataAssociation ?? false;
+    return message;
+  },
+};
+
+function createBasePrlExtSysRecord(): PrlExtSysRecord {
+  return {
+    sysRecordLength: 0,
+    sysRecordType: 0,
+    sysRecordTypeRaw: 0,
+    prefNeg: 0,
+    sameGeoAsPrev: false,
+    priority: 0,
+    acqIndex: 0,
+    cdma2000: undefined,
+    hrpd: undefined,
+    mccMnc: undefined,
+    raw: undefined,
+    roamingIndicator: undefined,
+    association: undefined,
+  };
+}
+
+export const PrlExtSysRecord: MessageFns<PrlExtSysRecord> = {
+  encode(message: PrlExtSysRecord, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.sysRecordLength !== 0) {
+      writer.uint32(8).uint32(message.sysRecordLength);
+    }
+    if (message.sysRecordType !== 0) {
+      writer.uint32(16).int32(message.sysRecordType);
+    }
+    if (message.sysRecordTypeRaw !== 0) {
+      writer.uint32(24).uint32(message.sysRecordTypeRaw);
+    }
+    if (message.prefNeg !== 0) {
+      writer.uint32(32).int32(message.prefNeg);
+    }
+    if (message.sameGeoAsPrev !== false) {
+      writer.uint32(40).bool(message.sameGeoAsPrev);
+    }
+    if (message.priority !== 0) {
+      writer.uint32(48).int32(message.priority);
+    }
+    if (message.acqIndex !== 0) {
+      writer.uint32(56).uint32(message.acqIndex);
+    }
+    if (message.cdma2000 !== undefined) {
+      PrlExtSysIdCdma2000.encode(message.cdma2000, writer.uint32(66).fork()).join();
+    }
+    if (message.hrpd !== undefined) {
+      PrlExtSysIdHrpd.encode(message.hrpd, writer.uint32(74).fork()).join();
+    }
+    if (message.mccMnc !== undefined) {
+      PrlExtSysIdMccMnc.encode(message.mccMnc, writer.uint32(82).fork()).join();
+    }
+    if (message.raw !== undefined) {
+      PrlExtSysIdRaw.encode(message.raw, writer.uint32(90).fork()).join();
+    }
+    if (message.roamingIndicator !== undefined) {
+      PrlRoamingIndicator.encode(message.roamingIndicator, writer.uint32(98).fork()).join();
+    }
+    if (message.association !== undefined) {
+      PrlExtSystemAssociation.encode(message.association, writer.uint32(106).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlExtSysRecord {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlExtSysRecord();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.sysRecordLength = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.sysRecordType = reader.int32() as any;
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.sysRecordTypeRaw = reader.uint32();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.prefNeg = reader.int32() as any;
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.sameGeoAsPrev = reader.bool();
+          continue;
+        }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.priority = reader.int32() as any;
+          continue;
+        }
+        case 7: {
+          if (tag !== 56) {
+            break;
+          }
+
+          message.acqIndex = reader.uint32();
+          continue;
+        }
+        case 8: {
+          if (tag !== 66) {
+            break;
+          }
+
+          message.cdma2000 = PrlExtSysIdCdma2000.decode(reader, reader.uint32());
+          continue;
+        }
+        case 9: {
+          if (tag !== 74) {
+            break;
+          }
+
+          message.hrpd = PrlExtSysIdHrpd.decode(reader, reader.uint32());
+          continue;
+        }
+        case 10: {
+          if (tag !== 82) {
+            break;
+          }
+
+          message.mccMnc = PrlExtSysIdMccMnc.decode(reader, reader.uint32());
+          continue;
+        }
+        case 11: {
+          if (tag !== 90) {
+            break;
+          }
+
+          message.raw = PrlExtSysIdRaw.decode(reader, reader.uint32());
+          continue;
+        }
+        case 12: {
+          if (tag !== 98) {
+            break;
+          }
+
+          message.roamingIndicator = PrlRoamingIndicator.decode(reader, reader.uint32());
+          continue;
+        }
+        case 13: {
+          if (tag !== 106) {
+            break;
+          }
+
+          message.association = PrlExtSystemAssociation.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlExtSysRecord {
+    return {
+      sysRecordLength: isSet(object.sysRecordLength)
+        ? globalThis.Number(object.sysRecordLength)
+        : isSet(object.sys_record_length)
+        ? globalThis.Number(object.sys_record_length)
+        : 0,
+      sysRecordType: isSet(object.sysRecordType)
+        ? prlExtSysRecordTypeFromJSON(object.sysRecordType)
+        : isSet(object.sys_record_type)
+        ? prlExtSysRecordTypeFromJSON(object.sys_record_type)
+        : 0,
+      sysRecordTypeRaw: isSet(object.sysRecordTypeRaw)
+        ? globalThis.Number(object.sysRecordTypeRaw)
+        : isSet(object.sys_record_type_raw)
+        ? globalThis.Number(object.sys_record_type_raw)
+        : 0,
+      prefNeg: isSet(object.prefNeg)
+        ? prlPrefNegFromJSON(object.prefNeg)
+        : isSet(object.pref_neg)
+        ? prlPrefNegFromJSON(object.pref_neg)
+        : 0,
+      sameGeoAsPrev: isSet(object.sameGeoAsPrev)
+        ? globalThis.Boolean(object.sameGeoAsPrev)
+        : isSet(object.same_geo_as_prev)
+        ? globalThis.Boolean(object.same_geo_as_prev)
+        : false,
+      priority: isSet(object.priority) ? prlPriorityFromJSON(object.priority) : 0,
+      acqIndex: isSet(object.acqIndex)
+        ? globalThis.Number(object.acqIndex)
+        : isSet(object.acq_index)
+        ? globalThis.Number(object.acq_index)
+        : 0,
+      cdma2000: isSet(object.cdma2000) ? PrlExtSysIdCdma2000.fromJSON(object.cdma2000) : undefined,
+      hrpd: isSet(object.hrpd) ? PrlExtSysIdHrpd.fromJSON(object.hrpd) : undefined,
+      mccMnc: isSet(object.mccMnc)
+        ? PrlExtSysIdMccMnc.fromJSON(object.mccMnc)
+        : isSet(object.mcc_mnc)
+        ? PrlExtSysIdMccMnc.fromJSON(object.mcc_mnc)
+        : undefined,
+      raw: isSet(object.raw) ? PrlExtSysIdRaw.fromJSON(object.raw) : undefined,
+      roamingIndicator: isSet(object.roamingIndicator)
+        ? PrlRoamingIndicator.fromJSON(object.roamingIndicator)
+        : isSet(object.roaming_indicator)
+        ? PrlRoamingIndicator.fromJSON(object.roaming_indicator)
+        : undefined,
+      association: isSet(object.association) ? PrlExtSystemAssociation.fromJSON(object.association) : undefined,
+    };
+  },
+
+  toJSON(message: PrlExtSysRecord): unknown {
+    const obj: any = {};
+    if (message.sysRecordLength !== 0) {
+      obj.sysRecordLength = Math.round(message.sysRecordLength);
+    }
+    if (message.sysRecordType !== 0) {
+      obj.sysRecordType = prlExtSysRecordTypeToJSON(message.sysRecordType);
+    }
+    if (message.sysRecordTypeRaw !== 0) {
+      obj.sysRecordTypeRaw = Math.round(message.sysRecordTypeRaw);
+    }
+    if (message.prefNeg !== 0) {
+      obj.prefNeg = prlPrefNegToJSON(message.prefNeg);
+    }
+    if (message.sameGeoAsPrev !== false) {
+      obj.sameGeoAsPrev = message.sameGeoAsPrev;
+    }
+    if (message.priority !== 0) {
+      obj.priority = prlPriorityToJSON(message.priority);
+    }
+    if (message.acqIndex !== 0) {
+      obj.acqIndex = Math.round(message.acqIndex);
+    }
+    if (message.cdma2000 !== undefined) {
+      obj.cdma2000 = PrlExtSysIdCdma2000.toJSON(message.cdma2000);
+    }
+    if (message.hrpd !== undefined) {
+      obj.hrpd = PrlExtSysIdHrpd.toJSON(message.hrpd);
+    }
+    if (message.mccMnc !== undefined) {
+      obj.mccMnc = PrlExtSysIdMccMnc.toJSON(message.mccMnc);
+    }
+    if (message.raw !== undefined) {
+      obj.raw = PrlExtSysIdRaw.toJSON(message.raw);
+    }
+    if (message.roamingIndicator !== undefined) {
+      obj.roamingIndicator = PrlRoamingIndicator.toJSON(message.roamingIndicator);
+    }
+    if (message.association !== undefined) {
+      obj.association = PrlExtSystemAssociation.toJSON(message.association);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlExtSysRecord>): PrlExtSysRecord {
+    return PrlExtSysRecord.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlExtSysRecord>): PrlExtSysRecord {
+    const message = createBasePrlExtSysRecord();
+    message.sysRecordLength = object.sysRecordLength ?? 0;
+    message.sysRecordType = object.sysRecordType ?? 0;
+    message.sysRecordTypeRaw = object.sysRecordTypeRaw ?? 0;
+    message.prefNeg = object.prefNeg ?? 0;
+    message.sameGeoAsPrev = object.sameGeoAsPrev ?? false;
+    message.priority = object.priority ?? 0;
+    message.acqIndex = object.acqIndex ?? 0;
+    message.cdma2000 = (object.cdma2000 !== undefined && object.cdma2000 !== null)
+      ? PrlExtSysIdCdma2000.fromPartial(object.cdma2000)
+      : undefined;
+    message.hrpd = (object.hrpd !== undefined && object.hrpd !== null)
+      ? PrlExtSysIdHrpd.fromPartial(object.hrpd)
+      : undefined;
+    message.mccMnc = (object.mccMnc !== undefined && object.mccMnc !== null)
+      ? PrlExtSysIdMccMnc.fromPartial(object.mccMnc)
+      : undefined;
+    message.raw = (object.raw !== undefined && object.raw !== null)
+      ? PrlExtSysIdRaw.fromPartial(object.raw)
+      : undefined;
+    message.roamingIndicator = (object.roamingIndicator !== undefined && object.roamingIndicator !== null)
+      ? PrlRoamingIndicator.fromPartial(object.roamingIndicator)
+      : undefined;
+    message.association = (object.association !== undefined && object.association !== null)
+      ? PrlExtSystemAssociation.fromPartial(object.association)
+      : undefined;
+    return message;
+  },
+};
+
+function createBasePrlExtSysIdCdma2000(): PrlExtSysIdCdma2000 {
+  return { nidIncl: 0, sid: 0, nid: undefined };
+}
+
+export const PrlExtSysIdCdma2000: MessageFns<PrlExtSysIdCdma2000> = {
+  encode(message: PrlExtSysIdCdma2000, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.nidIncl !== 0) {
+      writer.uint32(8).int32(message.nidIncl);
+    }
+    if (message.sid !== 0) {
+      writer.uint32(16).uint32(message.sid);
+    }
+    if (message.nid !== undefined) {
+      writer.uint32(24).uint32(message.nid);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlExtSysIdCdma2000 {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlExtSysIdCdma2000();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.nidIncl = reader.int32() as any;
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.sid = reader.uint32();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.nid = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlExtSysIdCdma2000 {
+    return {
+      nidIncl: isSet(object.nidIncl)
+        ? prlNidInclusionFromJSON(object.nidIncl)
+        : isSet(object.nid_incl)
+        ? prlNidInclusionFromJSON(object.nid_incl)
+        : 0,
+      sid: isSet(object.sid) ? globalThis.Number(object.sid) : 0,
+      nid: isSet(object.nid) ? globalThis.Number(object.nid) : undefined,
+    };
+  },
+
+  toJSON(message: PrlExtSysIdCdma2000): unknown {
+    const obj: any = {};
+    if (message.nidIncl !== 0) {
+      obj.nidIncl = prlNidInclusionToJSON(message.nidIncl);
+    }
+    if (message.sid !== 0) {
+      obj.sid = Math.round(message.sid);
+    }
+    if (message.nid !== undefined) {
+      obj.nid = Math.round(message.nid);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlExtSysIdCdma2000>): PrlExtSysIdCdma2000 {
+    return PrlExtSysIdCdma2000.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlExtSysIdCdma2000>): PrlExtSysIdCdma2000 {
+    const message = createBasePrlExtSysIdCdma2000();
+    message.nidIncl = object.nidIncl ?? 0;
+    message.sid = object.sid ?? 0;
+    message.nid = object.nid ?? undefined;
+    return message;
+  },
+};
+
+function createBasePrlExtSysIdHrpd(): PrlExtSysIdHrpd {
+  return { subnetCommonIncluded: false, subnetLsbLengthBits: 0, subnetLsbHex: "", subnetCommonOffset: undefined };
+}
+
+export const PrlExtSysIdHrpd: MessageFns<PrlExtSysIdHrpd> = {
+  encode(message: PrlExtSysIdHrpd, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.subnetCommonIncluded !== false) {
+      writer.uint32(8).bool(message.subnetCommonIncluded);
+    }
+    if (message.subnetLsbLengthBits !== 0) {
+      writer.uint32(16).uint32(message.subnetLsbLengthBits);
+    }
+    if (message.subnetLsbHex !== "") {
+      writer.uint32(26).string(message.subnetLsbHex);
+    }
+    if (message.subnetCommonOffset !== undefined) {
+      writer.uint32(32).uint32(message.subnetCommonOffset);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlExtSysIdHrpd {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlExtSysIdHrpd();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.subnetCommonIncluded = reader.bool();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.subnetLsbLengthBits = reader.uint32();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.subnetLsbHex = reader.string();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.subnetCommonOffset = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlExtSysIdHrpd {
+    return {
+      subnetCommonIncluded: isSet(object.subnetCommonIncluded)
+        ? globalThis.Boolean(object.subnetCommonIncluded)
+        : isSet(object.subnet_common_included)
+        ? globalThis.Boolean(object.subnet_common_included)
+        : false,
+      subnetLsbLengthBits: isSet(object.subnetLsbLengthBits)
+        ? globalThis.Number(object.subnetLsbLengthBits)
+        : isSet(object.subnet_lsb_length_bits)
+        ? globalThis.Number(object.subnet_lsb_length_bits)
+        : 0,
+      subnetLsbHex: isSet(object.subnetLsbHex)
+        ? globalThis.String(object.subnetLsbHex)
+        : isSet(object.subnet_lsb_hex)
+        ? globalThis.String(object.subnet_lsb_hex)
+        : "",
+      subnetCommonOffset: isSet(object.subnetCommonOffset)
+        ? globalThis.Number(object.subnetCommonOffset)
+        : isSet(object.subnet_common_offset)
+        ? globalThis.Number(object.subnet_common_offset)
+        : undefined,
+    };
+  },
+
+  toJSON(message: PrlExtSysIdHrpd): unknown {
+    const obj: any = {};
+    if (message.subnetCommonIncluded !== false) {
+      obj.subnetCommonIncluded = message.subnetCommonIncluded;
+    }
+    if (message.subnetLsbLengthBits !== 0) {
+      obj.subnetLsbLengthBits = Math.round(message.subnetLsbLengthBits);
+    }
+    if (message.subnetLsbHex !== "") {
+      obj.subnetLsbHex = message.subnetLsbHex;
+    }
+    if (message.subnetCommonOffset !== undefined) {
+      obj.subnetCommonOffset = Math.round(message.subnetCommonOffset);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlExtSysIdHrpd>): PrlExtSysIdHrpd {
+    return PrlExtSysIdHrpd.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlExtSysIdHrpd>): PrlExtSysIdHrpd {
+    const message = createBasePrlExtSysIdHrpd();
+    message.subnetCommonIncluded = object.subnetCommonIncluded ?? false;
+    message.subnetLsbLengthBits = object.subnetLsbLengthBits ?? 0;
+    message.subnetLsbHex = object.subnetLsbHex ?? "";
+    message.subnetCommonOffset = object.subnetCommonOffset ?? undefined;
+    return message;
+  },
+};
+
+function createBasePrlExtSysIdMccMnc(): PrlExtSysIdMccMnc {
+  return {
+    subtype000: undefined,
+    subtype001: undefined,
+    subtype010: undefined,
+    subtype011: undefined,
+    reserved: undefined,
+  };
+}
+
+export const PrlExtSysIdMccMnc: MessageFns<PrlExtSysIdMccMnc> = {
+  encode(message: PrlExtSysIdMccMnc, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.subtype000 !== undefined) {
+      PrlMccMnc000.encode(message.subtype000, writer.uint32(10).fork()).join();
+    }
+    if (message.subtype001 !== undefined) {
+      PrlMccMnc001.encode(message.subtype001, writer.uint32(18).fork()).join();
+    }
+    if (message.subtype010 !== undefined) {
+      PrlMccMnc010.encode(message.subtype010, writer.uint32(26).fork()).join();
+    }
+    if (message.subtype011 !== undefined) {
+      PrlMccMnc011.encode(message.subtype011, writer.uint32(34).fork()).join();
+    }
+    if (message.reserved !== undefined) {
+      PrlMccMncReserved.encode(message.reserved, writer.uint32(42).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlExtSysIdMccMnc {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlExtSysIdMccMnc();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.subtype000 = PrlMccMnc000.decode(reader, reader.uint32());
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.subtype001 = PrlMccMnc001.decode(reader, reader.uint32());
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.subtype010 = PrlMccMnc010.decode(reader, reader.uint32());
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.subtype011 = PrlMccMnc011.decode(reader, reader.uint32());
+          continue;
+        }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          message.reserved = PrlMccMncReserved.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlExtSysIdMccMnc {
+    return {
+      subtype000: isSet(object.subtype000)
+        ? PrlMccMnc000.fromJSON(object.subtype000)
+        : isSet(object.subtype_000)
+        ? PrlMccMnc000.fromJSON(object.subtype_000)
+        : undefined,
+      subtype001: isSet(object.subtype001)
+        ? PrlMccMnc001.fromJSON(object.subtype001)
+        : isSet(object.subtype_001)
+        ? PrlMccMnc001.fromJSON(object.subtype_001)
+        : undefined,
+      subtype010: isSet(object.subtype010)
+        ? PrlMccMnc010.fromJSON(object.subtype010)
+        : isSet(object.subtype_010)
+        ? PrlMccMnc010.fromJSON(object.subtype_010)
+        : undefined,
+      subtype011: isSet(object.subtype011)
+        ? PrlMccMnc011.fromJSON(object.subtype011)
+        : isSet(object.subtype_011)
+        ? PrlMccMnc011.fromJSON(object.subtype_011)
+        : undefined,
+      reserved: isSet(object.reserved) ? PrlMccMncReserved.fromJSON(object.reserved) : undefined,
+    };
+  },
+
+  toJSON(message: PrlExtSysIdMccMnc): unknown {
+    const obj: any = {};
+    if (message.subtype000 !== undefined) {
+      obj.subtype000 = PrlMccMnc000.toJSON(message.subtype000);
+    }
+    if (message.subtype001 !== undefined) {
+      obj.subtype001 = PrlMccMnc001.toJSON(message.subtype001);
+    }
+    if (message.subtype010 !== undefined) {
+      obj.subtype010 = PrlMccMnc010.toJSON(message.subtype010);
+    }
+    if (message.subtype011 !== undefined) {
+      obj.subtype011 = PrlMccMnc011.toJSON(message.subtype011);
+    }
+    if (message.reserved !== undefined) {
+      obj.reserved = PrlMccMncReserved.toJSON(message.reserved);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlExtSysIdMccMnc>): PrlExtSysIdMccMnc {
+    return PrlExtSysIdMccMnc.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlExtSysIdMccMnc>): PrlExtSysIdMccMnc {
+    const message = createBasePrlExtSysIdMccMnc();
+    message.subtype000 = (object.subtype000 !== undefined && object.subtype000 !== null)
+      ? PrlMccMnc000.fromPartial(object.subtype000)
+      : undefined;
+    message.subtype001 = (object.subtype001 !== undefined && object.subtype001 !== null)
+      ? PrlMccMnc001.fromPartial(object.subtype001)
+      : undefined;
+    message.subtype010 = (object.subtype010 !== undefined && object.subtype010 !== null)
+      ? PrlMccMnc010.fromPartial(object.subtype010)
+      : undefined;
+    message.subtype011 = (object.subtype011 !== undefined && object.subtype011 !== null)
+      ? PrlMccMnc011.fromPartial(object.subtype011)
+      : undefined;
+    message.reserved = (object.reserved !== undefined && object.reserved !== null)
+      ? PrlMccMncReserved.fromPartial(object.reserved)
+      : undefined;
+    return message;
+  },
+};
+
+function createBasePrlMccMnc000(): PrlMccMnc000 {
+  return { mcc: "", mnc: "" };
+}
+
+export const PrlMccMnc000: MessageFns<PrlMccMnc000> = {
+  encode(message: PrlMccMnc000, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.mcc !== "") {
+      writer.uint32(10).string(message.mcc);
+    }
+    if (message.mnc !== "") {
+      writer.uint32(18).string(message.mnc);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlMccMnc000 {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlMccMnc000();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.mcc = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.mnc = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlMccMnc000 {
+    return {
+      mcc: isSet(object.mcc) ? globalThis.String(object.mcc) : "",
+      mnc: isSet(object.mnc) ? globalThis.String(object.mnc) : "",
+    };
+  },
+
+  toJSON(message: PrlMccMnc000): unknown {
+    const obj: any = {};
+    if (message.mcc !== "") {
+      obj.mcc = message.mcc;
+    }
+    if (message.mnc !== "") {
+      obj.mnc = message.mnc;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlMccMnc000>): PrlMccMnc000 {
+    return PrlMccMnc000.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlMccMnc000>): PrlMccMnc000 {
+    const message = createBasePrlMccMnc000();
+    message.mcc = object.mcc ?? "";
+    message.mnc = object.mnc ?? "";
+    return message;
+  },
+};
+
+function createBasePrlMccMnc001(): PrlMccMnc001 {
+  return { mcc: "", mnc: "", sids: [] };
+}
+
+export const PrlMccMnc001: MessageFns<PrlMccMnc001> = {
+  encode(message: PrlMccMnc001, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.mcc !== "") {
+      writer.uint32(10).string(message.mcc);
+    }
+    if (message.mnc !== "") {
+      writer.uint32(18).string(message.mnc);
+    }
+    writer.uint32(26).fork();
+    for (const v of message.sids) {
+      writer.uint32(v);
+    }
+    writer.join();
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlMccMnc001 {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlMccMnc001();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.mcc = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.mnc = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag === 24) {
+            message.sids.push(reader.uint32());
+
+            continue;
+          }
+
+          if (tag === 26) {
+            const end2 = reader.uint32() + reader.pos;
+            while (reader.pos < end2) {
+              message.sids.push(reader.uint32());
+            }
+
+            continue;
+          }
+
+          break;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlMccMnc001 {
+    return {
+      mcc: isSet(object.mcc) ? globalThis.String(object.mcc) : "",
+      mnc: isSet(object.mnc) ? globalThis.String(object.mnc) : "",
+      sids: globalThis.Array.isArray(object?.sids) ? object.sids.map((e: any) => globalThis.Number(e)) : [],
+    };
+  },
+
+  toJSON(message: PrlMccMnc001): unknown {
+    const obj: any = {};
+    if (message.mcc !== "") {
+      obj.mcc = message.mcc;
+    }
+    if (message.mnc !== "") {
+      obj.mnc = message.mnc;
+    }
+    if (message.sids?.length) {
+      obj.sids = message.sids.map((e) => Math.round(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlMccMnc001>): PrlMccMnc001 {
+    return PrlMccMnc001.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlMccMnc001>): PrlMccMnc001 {
+    const message = createBasePrlMccMnc001();
+    message.mcc = object.mcc ?? "";
+    message.mnc = object.mnc ?? "";
+    message.sids = object.sids?.map((e) => e) || [];
+    return message;
+  },
+};
+
+function createBasePrlSidNidPair(): PrlSidNidPair {
+  return { sid: 0, nid: 0 };
+}
+
+export const PrlSidNidPair: MessageFns<PrlSidNidPair> = {
+  encode(message: PrlSidNidPair, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.sid !== 0) {
+      writer.uint32(8).uint32(message.sid);
+    }
+    if (message.nid !== 0) {
+      writer.uint32(16).uint32(message.nid);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlSidNidPair {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlSidNidPair();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.sid = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.nid = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlSidNidPair {
+    return {
+      sid: isSet(object.sid) ? globalThis.Number(object.sid) : 0,
+      nid: isSet(object.nid) ? globalThis.Number(object.nid) : 0,
+    };
+  },
+
+  toJSON(message: PrlSidNidPair): unknown {
+    const obj: any = {};
+    if (message.sid !== 0) {
+      obj.sid = Math.round(message.sid);
+    }
+    if (message.nid !== 0) {
+      obj.nid = Math.round(message.nid);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlSidNidPair>): PrlSidNidPair {
+    return PrlSidNidPair.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlSidNidPair>): PrlSidNidPair {
+    const message = createBasePrlSidNidPair();
+    message.sid = object.sid ?? 0;
+    message.nid = object.nid ?? 0;
+    return message;
+  },
+};
+
+function createBasePrlMccMnc010(): PrlMccMnc010 {
+  return { mcc: "", mnc: "", pairs: [] };
+}
+
+export const PrlMccMnc010: MessageFns<PrlMccMnc010> = {
+  encode(message: PrlMccMnc010, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.mcc !== "") {
+      writer.uint32(10).string(message.mcc);
+    }
+    if (message.mnc !== "") {
+      writer.uint32(18).string(message.mnc);
+    }
+    for (const v of message.pairs) {
+      PrlSidNidPair.encode(v!, writer.uint32(26).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlMccMnc010 {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlMccMnc010();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.mcc = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.mnc = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.pairs.push(PrlSidNidPair.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlMccMnc010 {
+    return {
+      mcc: isSet(object.mcc) ? globalThis.String(object.mcc) : "",
+      mnc: isSet(object.mnc) ? globalThis.String(object.mnc) : "",
+      pairs: globalThis.Array.isArray(object?.pairs) ? object.pairs.map((e: any) => PrlSidNidPair.fromJSON(e)) : [],
+    };
+  },
+
+  toJSON(message: PrlMccMnc010): unknown {
+    const obj: any = {};
+    if (message.mcc !== "") {
+      obj.mcc = message.mcc;
+    }
+    if (message.mnc !== "") {
+      obj.mnc = message.mnc;
+    }
+    if (message.pairs?.length) {
+      obj.pairs = message.pairs.map((e) => PrlSidNidPair.toJSON(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlMccMnc010>): PrlMccMnc010 {
+    return PrlMccMnc010.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlMccMnc010>): PrlMccMnc010 {
+    const message = createBasePrlMccMnc010();
+    message.mcc = object.mcc ?? "";
+    message.mnc = object.mnc ?? "";
+    message.pairs = object.pairs?.map((e) => PrlSidNidPair.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBasePrlMccMncSubnet(): PrlMccMncSubnet {
+  return { subnetLengthBits: 0, subnetIdHex: "" };
+}
+
+export const PrlMccMncSubnet: MessageFns<PrlMccMncSubnet> = {
+  encode(message: PrlMccMncSubnet, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.subnetLengthBits !== 0) {
+      writer.uint32(8).uint32(message.subnetLengthBits);
+    }
+    if (message.subnetIdHex !== "") {
+      writer.uint32(18).string(message.subnetIdHex);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlMccMncSubnet {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlMccMncSubnet();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.subnetLengthBits = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.subnetIdHex = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlMccMncSubnet {
+    return {
+      subnetLengthBits: isSet(object.subnetLengthBits)
+        ? globalThis.Number(object.subnetLengthBits)
+        : isSet(object.subnet_length_bits)
+        ? globalThis.Number(object.subnet_length_bits)
+        : 0,
+      subnetIdHex: isSet(object.subnetIdHex)
+        ? globalThis.String(object.subnetIdHex)
+        : isSet(object.subnet_id_hex)
+        ? globalThis.String(object.subnet_id_hex)
+        : "",
+    };
+  },
+
+  toJSON(message: PrlMccMncSubnet): unknown {
+    const obj: any = {};
+    if (message.subnetLengthBits !== 0) {
+      obj.subnetLengthBits = Math.round(message.subnetLengthBits);
+    }
+    if (message.subnetIdHex !== "") {
+      obj.subnetIdHex = message.subnetIdHex;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlMccMncSubnet>): PrlMccMncSubnet {
+    return PrlMccMncSubnet.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlMccMncSubnet>): PrlMccMncSubnet {
+    const message = createBasePrlMccMncSubnet();
+    message.subnetLengthBits = object.subnetLengthBits ?? 0;
+    message.subnetIdHex = object.subnetIdHex ?? "";
+    return message;
+  },
+};
+
+function createBasePrlMccMnc011(): PrlMccMnc011 {
+  return { mcc: "", mnc: "", subnets: [] };
+}
+
+export const PrlMccMnc011: MessageFns<PrlMccMnc011> = {
+  encode(message: PrlMccMnc011, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.mcc !== "") {
+      writer.uint32(10).string(message.mcc);
+    }
+    if (message.mnc !== "") {
+      writer.uint32(18).string(message.mnc);
+    }
+    for (const v of message.subnets) {
+      PrlMccMncSubnet.encode(v!, writer.uint32(26).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlMccMnc011 {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlMccMnc011();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.mcc = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.mnc = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.subnets.push(PrlMccMncSubnet.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlMccMnc011 {
+    return {
+      mcc: isSet(object.mcc) ? globalThis.String(object.mcc) : "",
+      mnc: isSet(object.mnc) ? globalThis.String(object.mnc) : "",
+      subnets: globalThis.Array.isArray(object?.subnets)
+        ? object.subnets.map((e: any) => PrlMccMncSubnet.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: PrlMccMnc011): unknown {
+    const obj: any = {};
+    if (message.mcc !== "") {
+      obj.mcc = message.mcc;
+    }
+    if (message.mnc !== "") {
+      obj.mnc = message.mnc;
+    }
+    if (message.subnets?.length) {
+      obj.subnets = message.subnets.map((e) => PrlMccMncSubnet.toJSON(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlMccMnc011>): PrlMccMnc011 {
+    return PrlMccMnc011.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlMccMnc011>): PrlMccMnc011 {
+    const message = createBasePrlMccMnc011();
+    message.mcc = object.mcc ?? "";
+    message.mnc = object.mnc ?? "";
+    message.subnets = object.subnets?.map((e) => PrlMccMncSubnet.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBasePrlMccMncReserved(): PrlMccMncReserved {
+  return { subtype: 0, rawBits: new Uint8Array(0), rawBitLen: 0 };
+}
+
+export const PrlMccMncReserved: MessageFns<PrlMccMncReserved> = {
+  encode(message: PrlMccMncReserved, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.subtype !== 0) {
+      writer.uint32(8).uint32(message.subtype);
+    }
+    if (message.rawBits.length !== 0) {
+      writer.uint32(18).bytes(message.rawBits);
+    }
+    if (message.rawBitLen !== 0) {
+      writer.uint32(24).uint32(message.rawBitLen);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlMccMncReserved {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlMccMncReserved();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.subtype = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.rawBits = reader.bytes();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.rawBitLen = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlMccMncReserved {
+    return {
+      subtype: isSet(object.subtype) ? globalThis.Number(object.subtype) : 0,
+      rawBits: isSet(object.rawBits)
+        ? bytesFromBase64(object.rawBits)
+        : isSet(object.raw_bits)
+        ? bytesFromBase64(object.raw_bits)
+        : new Uint8Array(0),
+      rawBitLen: isSet(object.rawBitLen)
+        ? globalThis.Number(object.rawBitLen)
+        : isSet(object.raw_bit_len)
+        ? globalThis.Number(object.raw_bit_len)
+        : 0,
+    };
+  },
+
+  toJSON(message: PrlMccMncReserved): unknown {
+    const obj: any = {};
+    if (message.subtype !== 0) {
+      obj.subtype = Math.round(message.subtype);
+    }
+    if (message.rawBits.length !== 0) {
+      obj.rawBits = base64FromBytes(message.rawBits);
+    }
+    if (message.rawBitLen !== 0) {
+      obj.rawBitLen = Math.round(message.rawBitLen);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlMccMncReserved>): PrlMccMncReserved {
+    return PrlMccMncReserved.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlMccMncReserved>): PrlMccMncReserved {
+    const message = createBasePrlMccMncReserved();
+    message.subtype = object.subtype ?? 0;
+    message.rawBits = object.rawBits ?? new Uint8Array(0);
+    message.rawBitLen = object.rawBitLen ?? 0;
+    return message;
+  },
+};
+
+function createBasePrlExtSysIdRaw(): PrlExtSysIdRaw {
+  return { sysRecordType: 0, rawBits: new Uint8Array(0), rawBitLen: 0 };
+}
+
+export const PrlExtSysIdRaw: MessageFns<PrlExtSysIdRaw> = {
+  encode(message: PrlExtSysIdRaw, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.sysRecordType !== 0) {
+      writer.uint32(8).uint32(message.sysRecordType);
+    }
+    if (message.rawBits.length !== 0) {
+      writer.uint32(18).bytes(message.rawBits);
+    }
+    if (message.rawBitLen !== 0) {
+      writer.uint32(24).uint32(message.rawBitLen);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlExtSysIdRaw {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlExtSysIdRaw();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.sysRecordType = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.rawBits = reader.bytes();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.rawBitLen = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlExtSysIdRaw {
+    return {
+      sysRecordType: isSet(object.sysRecordType)
+        ? globalThis.Number(object.sysRecordType)
+        : isSet(object.sys_record_type)
+        ? globalThis.Number(object.sys_record_type)
+        : 0,
+      rawBits: isSet(object.rawBits)
+        ? bytesFromBase64(object.rawBits)
+        : isSet(object.raw_bits)
+        ? bytesFromBase64(object.raw_bits)
+        : new Uint8Array(0),
+      rawBitLen: isSet(object.rawBitLen)
+        ? globalThis.Number(object.rawBitLen)
+        : isSet(object.raw_bit_len)
+        ? globalThis.Number(object.raw_bit_len)
+        : 0,
+    };
+  },
+
+  toJSON(message: PrlExtSysIdRaw): unknown {
+    const obj: any = {};
+    if (message.sysRecordType !== 0) {
+      obj.sysRecordType = Math.round(message.sysRecordType);
+    }
+    if (message.rawBits.length !== 0) {
+      obj.rawBits = base64FromBytes(message.rawBits);
+    }
+    if (message.rawBitLen !== 0) {
+      obj.rawBitLen = Math.round(message.rawBitLen);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlExtSysIdRaw>): PrlExtSysIdRaw {
+    return PrlExtSysIdRaw.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlExtSysIdRaw>): PrlExtSysIdRaw {
+    const message = createBasePrlExtSysIdRaw();
+    message.sysRecordType = object.sysRecordType ?? 0;
+    message.rawBits = object.rawBits ?? new Uint8Array(0);
+    message.rawBitLen = object.rawBitLen ?? 0;
+    return message;
+  },
+};
+
+function createBaseListPrlsRequest(): ListPrlsRequest {
+  return { limit: 0, offset: 0, prListId: undefined, ssprPRev: undefined };
+}
+
+export const ListPrlsRequest: MessageFns<ListPrlsRequest> = {
+  encode(message: ListPrlsRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.limit !== 0) {
+      writer.uint32(8).uint32(message.limit);
+    }
+    if (message.offset !== 0) {
+      writer.uint32(16).uint32(message.offset);
+    }
+    if (message.prListId !== undefined) {
+      writer.uint32(24).uint32(message.prListId);
+    }
+    if (message.ssprPRev !== undefined) {
+      writer.uint32(32).uint32(message.ssprPRev);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ListPrlsRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseListPrlsRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.limit = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.offset = reader.uint32();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.prListId = reader.uint32();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.ssprPRev = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ListPrlsRequest {
+    return {
+      limit: isSet(object.limit) ? globalThis.Number(object.limit) : 0,
+      offset: isSet(object.offset) ? globalThis.Number(object.offset) : 0,
+      prListId: isSet(object.prListId)
+        ? globalThis.Number(object.prListId)
+        : isSet(object.pr_list_id)
+        ? globalThis.Number(object.pr_list_id)
+        : undefined,
+      ssprPRev: isSet(object.ssprPRev)
+        ? globalThis.Number(object.ssprPRev)
+        : isSet(object.sspr_p_rev)
+        ? globalThis.Number(object.sspr_p_rev)
+        : undefined,
+    };
+  },
+
+  toJSON(message: ListPrlsRequest): unknown {
+    const obj: any = {};
+    if (message.limit !== 0) {
+      obj.limit = Math.round(message.limit);
+    }
+    if (message.offset !== 0) {
+      obj.offset = Math.round(message.offset);
+    }
+    if (message.prListId !== undefined) {
+      obj.prListId = Math.round(message.prListId);
+    }
+    if (message.ssprPRev !== undefined) {
+      obj.ssprPRev = Math.round(message.ssprPRev);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<ListPrlsRequest>): ListPrlsRequest {
+    return ListPrlsRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<ListPrlsRequest>): ListPrlsRequest {
+    const message = createBaseListPrlsRequest();
+    message.limit = object.limit ?? 0;
+    message.offset = object.offset ?? 0;
+    message.prListId = object.prListId ?? undefined;
+    message.ssprPRev = object.ssprPRev ?? undefined;
+    return message;
+  },
+};
+
+function createBaseListPrlsResponse(): ListPrlsResponse {
+  return { prls: [], total: 0 };
+}
+
+export const ListPrlsResponse: MessageFns<ListPrlsResponse> = {
+  encode(message: ListPrlsResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.prls) {
+      PrlSummary.encode(v!, writer.uint32(10).fork()).join();
+    }
+    if (message.total !== 0) {
+      writer.uint32(16).uint32(message.total);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ListPrlsResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseListPrlsResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.prls.push(PrlSummary.decode(reader, reader.uint32()));
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.total = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ListPrlsResponse {
+    return {
+      prls: globalThis.Array.isArray(object?.prls) ? object.prls.map((e: any) => PrlSummary.fromJSON(e)) : [],
+      total: isSet(object.total) ? globalThis.Number(object.total) : 0,
+    };
+  },
+
+  toJSON(message: ListPrlsResponse): unknown {
+    const obj: any = {};
+    if (message.prls?.length) {
+      obj.prls = message.prls.map((e) => PrlSummary.toJSON(e));
+    }
+    if (message.total !== 0) {
+      obj.total = Math.round(message.total);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<ListPrlsResponse>): ListPrlsResponse {
+    return ListPrlsResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<ListPrlsResponse>): ListPrlsResponse {
+    const message = createBaseListPrlsResponse();
+    message.prls = object.prls?.map((e) => PrlSummary.fromPartial(e)) || [];
+    message.total = object.total ?? 0;
+    return message;
+  },
+};
+
+function createBaseGetPrlRequest(): GetPrlRequest {
+  return { prlId: "" };
+}
+
+export const GetPrlRequest: MessageFns<GetPrlRequest> = {
+  encode(message: GetPrlRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.prlId !== "") {
+      writer.uint32(10).string(message.prlId);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): GetPrlRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseGetPrlRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.prlId = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): GetPrlRequest {
+    return {
+      prlId: isSet(object.prlId)
+        ? globalThis.String(object.prlId)
+        : isSet(object.prl_id)
+        ? globalThis.String(object.prl_id)
+        : "",
+    };
+  },
+
+  toJSON(message: GetPrlRequest): unknown {
+    const obj: any = {};
+    if (message.prlId !== "") {
+      obj.prlId = message.prlId;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<GetPrlRequest>): GetPrlRequest {
+    return GetPrlRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<GetPrlRequest>): GetPrlRequest {
+    const message = createBaseGetPrlRequest();
+    message.prlId = object.prlId ?? "";
+    return message;
+  },
+};
+
+function createBaseGetPrlResponse(): GetPrlResponse {
+  return { prl: undefined };
+}
+
+export const GetPrlResponse: MessageFns<GetPrlResponse> = {
+  encode(message: GetPrlResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.prl !== undefined) {
+      Prl.encode(message.prl, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): GetPrlResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseGetPrlResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.prl = Prl.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): GetPrlResponse {
+    return { prl: isSet(object.prl) ? Prl.fromJSON(object.prl) : undefined };
+  },
+
+  toJSON(message: GetPrlResponse): unknown {
+    const obj: any = {};
+    if (message.prl !== undefined) {
+      obj.prl = Prl.toJSON(message.prl);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<GetPrlResponse>): GetPrlResponse {
+    return GetPrlResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<GetPrlResponse>): GetPrlResponse {
+    const message = createBaseGetPrlResponse();
+    message.prl = (object.prl !== undefined && object.prl !== null) ? Prl.fromPartial(object.prl) : undefined;
+    return message;
+  },
+};
+
+function createBaseCreatePrlRequest(): CreatePrlRequest {
+  return { name: "", notes: "", rawBytes: undefined, built: undefined };
+}
+
+export const CreatePrlRequest: MessageFns<CreatePrlRequest> = {
+  encode(message: CreatePrlRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.name !== "") {
+      writer.uint32(10).string(message.name);
+    }
+    if (message.notes !== "") {
+      writer.uint32(18).string(message.notes);
+    }
+    if (message.rawBytes !== undefined) {
+      writer.uint32(26).bytes(message.rawBytes);
+    }
+    if (message.built !== undefined) {
+      PrlDecoded.encode(message.built, writer.uint32(34).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): CreatePrlRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseCreatePrlRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.name = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.notes = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.rawBytes = reader.bytes();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.built = PrlDecoded.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): CreatePrlRequest {
+    return {
+      name: isSet(object.name) ? globalThis.String(object.name) : "",
+      notes: isSet(object.notes) ? globalThis.String(object.notes) : "",
+      rawBytes: isSet(object.rawBytes)
+        ? bytesFromBase64(object.rawBytes)
+        : isSet(object.raw_bytes)
+        ? bytesFromBase64(object.raw_bytes)
+        : undefined,
+      built: isSet(object.built) ? PrlDecoded.fromJSON(object.built) : undefined,
+    };
+  },
+
+  toJSON(message: CreatePrlRequest): unknown {
+    const obj: any = {};
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
+    if (message.notes !== "") {
+      obj.notes = message.notes;
+    }
+    if (message.rawBytes !== undefined) {
+      obj.rawBytes = base64FromBytes(message.rawBytes);
+    }
+    if (message.built !== undefined) {
+      obj.built = PrlDecoded.toJSON(message.built);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<CreatePrlRequest>): CreatePrlRequest {
+    return CreatePrlRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<CreatePrlRequest>): CreatePrlRequest {
+    const message = createBaseCreatePrlRequest();
+    message.name = object.name ?? "";
+    message.notes = object.notes ?? "";
+    message.rawBytes = object.rawBytes ?? undefined;
+    message.built = (object.built !== undefined && object.built !== null)
+      ? PrlDecoded.fromPartial(object.built)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseCreatePrlResponse(): CreatePrlResponse {
+  return { prl: undefined };
+}
+
+export const CreatePrlResponse: MessageFns<CreatePrlResponse> = {
+  encode(message: CreatePrlResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.prl !== undefined) {
+      Prl.encode(message.prl, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): CreatePrlResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseCreatePrlResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.prl = Prl.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): CreatePrlResponse {
+    return { prl: isSet(object.prl) ? Prl.fromJSON(object.prl) : undefined };
+  },
+
+  toJSON(message: CreatePrlResponse): unknown {
+    const obj: any = {};
+    if (message.prl !== undefined) {
+      obj.prl = Prl.toJSON(message.prl);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<CreatePrlResponse>): CreatePrlResponse {
+    return CreatePrlResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<CreatePrlResponse>): CreatePrlResponse {
+    const message = createBaseCreatePrlResponse();
+    message.prl = (object.prl !== undefined && object.prl !== null) ? Prl.fromPartial(object.prl) : undefined;
+    return message;
+  },
+};
+
+function createBaseUpdatePrlRequest(): UpdatePrlRequest {
+  return { prlId: "", name: undefined, notes: undefined, rawBytes: undefined, built: undefined };
+}
+
+export const UpdatePrlRequest: MessageFns<UpdatePrlRequest> = {
+  encode(message: UpdatePrlRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.prlId !== "") {
+      writer.uint32(10).string(message.prlId);
+    }
+    if (message.name !== undefined) {
+      writer.uint32(18).string(message.name);
+    }
+    if (message.notes !== undefined) {
+      writer.uint32(26).string(message.notes);
+    }
+    if (message.rawBytes !== undefined) {
+      writer.uint32(34).bytes(message.rawBytes);
+    }
+    if (message.built !== undefined) {
+      PrlDecoded.encode(message.built, writer.uint32(42).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): UpdatePrlRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseUpdatePrlRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.prlId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.name = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.notes = reader.string();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.rawBytes = reader.bytes();
+          continue;
+        }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          message.built = PrlDecoded.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): UpdatePrlRequest {
+    return {
+      prlId: isSet(object.prlId)
+        ? globalThis.String(object.prlId)
+        : isSet(object.prl_id)
+        ? globalThis.String(object.prl_id)
+        : "",
+      name: isSet(object.name) ? globalThis.String(object.name) : undefined,
+      notes: isSet(object.notes) ? globalThis.String(object.notes) : undefined,
+      rawBytes: isSet(object.rawBytes)
+        ? bytesFromBase64(object.rawBytes)
+        : isSet(object.raw_bytes)
+        ? bytesFromBase64(object.raw_bytes)
+        : undefined,
+      built: isSet(object.built) ? PrlDecoded.fromJSON(object.built) : undefined,
+    };
+  },
+
+  toJSON(message: UpdatePrlRequest): unknown {
+    const obj: any = {};
+    if (message.prlId !== "") {
+      obj.prlId = message.prlId;
+    }
+    if (message.name !== undefined) {
+      obj.name = message.name;
+    }
+    if (message.notes !== undefined) {
+      obj.notes = message.notes;
+    }
+    if (message.rawBytes !== undefined) {
+      obj.rawBytes = base64FromBytes(message.rawBytes);
+    }
+    if (message.built !== undefined) {
+      obj.built = PrlDecoded.toJSON(message.built);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<UpdatePrlRequest>): UpdatePrlRequest {
+    return UpdatePrlRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<UpdatePrlRequest>): UpdatePrlRequest {
+    const message = createBaseUpdatePrlRequest();
+    message.prlId = object.prlId ?? "";
+    message.name = object.name ?? undefined;
+    message.notes = object.notes ?? undefined;
+    message.rawBytes = object.rawBytes ?? undefined;
+    message.built = (object.built !== undefined && object.built !== null)
+      ? PrlDecoded.fromPartial(object.built)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseUpdatePrlResponse(): UpdatePrlResponse {
+  return { prl: undefined };
+}
+
+export const UpdatePrlResponse: MessageFns<UpdatePrlResponse> = {
+  encode(message: UpdatePrlResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.prl !== undefined) {
+      Prl.encode(message.prl, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): UpdatePrlResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseUpdatePrlResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.prl = Prl.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): UpdatePrlResponse {
+    return { prl: isSet(object.prl) ? Prl.fromJSON(object.prl) : undefined };
+  },
+
+  toJSON(message: UpdatePrlResponse): unknown {
+    const obj: any = {};
+    if (message.prl !== undefined) {
+      obj.prl = Prl.toJSON(message.prl);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<UpdatePrlResponse>): UpdatePrlResponse {
+    return UpdatePrlResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<UpdatePrlResponse>): UpdatePrlResponse {
+    const message = createBaseUpdatePrlResponse();
+    message.prl = (object.prl !== undefined && object.prl !== null) ? Prl.fromPartial(object.prl) : undefined;
+    return message;
+  },
+};
+
+function createBaseDeletePrlRequest(): DeletePrlRequest {
+  return { prlId: "" };
+}
+
+export const DeletePrlRequest: MessageFns<DeletePrlRequest> = {
+  encode(message: DeletePrlRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.prlId !== "") {
+      writer.uint32(10).string(message.prlId);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): DeletePrlRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseDeletePrlRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.prlId = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): DeletePrlRequest {
+    return {
+      prlId: isSet(object.prlId)
+        ? globalThis.String(object.prlId)
+        : isSet(object.prl_id)
+        ? globalThis.String(object.prl_id)
+        : "",
+    };
+  },
+
+  toJSON(message: DeletePrlRequest): unknown {
+    const obj: any = {};
+    if (message.prlId !== "") {
+      obj.prlId = message.prlId;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<DeletePrlRequest>): DeletePrlRequest {
+    return DeletePrlRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<DeletePrlRequest>): DeletePrlRequest {
+    const message = createBaseDeletePrlRequest();
+    message.prlId = object.prlId ?? "";
+    return message;
+  },
+};
+
+function createBaseSetDefaultPrlRequest(): SetDefaultPrlRequest {
+  return { prlId: "" };
+}
+
+export const SetDefaultPrlRequest: MessageFns<SetDefaultPrlRequest> = {
+  encode(message: SetDefaultPrlRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.prlId !== "") {
+      writer.uint32(10).string(message.prlId);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SetDefaultPrlRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSetDefaultPrlRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.prlId = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SetDefaultPrlRequest {
+    return {
+      prlId: isSet(object.prlId)
+        ? globalThis.String(object.prlId)
+        : isSet(object.prl_id)
+        ? globalThis.String(object.prl_id)
+        : "",
+    };
+  },
+
+  toJSON(message: SetDefaultPrlRequest): unknown {
+    const obj: any = {};
+    if (message.prlId !== "") {
+      obj.prlId = message.prlId;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<SetDefaultPrlRequest>): SetDefaultPrlRequest {
+    return SetDefaultPrlRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<SetDefaultPrlRequest>): SetDefaultPrlRequest {
+    const message = createBaseSetDefaultPrlRequest();
+    message.prlId = object.prlId ?? "";
+    return message;
+  },
+};
+
+function createBaseGetDefaultPrlRequest(): GetDefaultPrlRequest {
+  return {};
+}
+
+export const GetDefaultPrlRequest: MessageFns<GetDefaultPrlRequest> = {
+  encode(_: GetDefaultPrlRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): GetDefaultPrlRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseGetDefaultPrlRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(_: any): GetDefaultPrlRequest {
+    return {};
+  },
+
+  toJSON(_: GetDefaultPrlRequest): unknown {
+    const obj: any = {};
+    return obj;
+  },
+
+  create(base?: DeepPartial<GetDefaultPrlRequest>): GetDefaultPrlRequest {
+    return GetDefaultPrlRequest.fromPartial(base ?? {});
+  },
+  fromPartial(_: DeepPartial<GetDefaultPrlRequest>): GetDefaultPrlRequest {
+    const message = createBaseGetDefaultPrlRequest();
+    return message;
+  },
+};
+
+function createBaseGetDefaultPrlResponse(): GetDefaultPrlResponse {
+  return { prl: undefined };
+}
+
+export const GetDefaultPrlResponse: MessageFns<GetDefaultPrlResponse> = {
+  encode(message: GetDefaultPrlResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.prl !== undefined) {
+      Prl.encode(message.prl, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): GetDefaultPrlResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseGetDefaultPrlResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.prl = Prl.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): GetDefaultPrlResponse {
+    return { prl: isSet(object.prl) ? Prl.fromJSON(object.prl) : undefined };
+  },
+
+  toJSON(message: GetDefaultPrlResponse): unknown {
+    const obj: any = {};
+    if (message.prl !== undefined) {
+      obj.prl = Prl.toJSON(message.prl);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<GetDefaultPrlResponse>): GetDefaultPrlResponse {
+    return GetDefaultPrlResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<GetDefaultPrlResponse>): GetDefaultPrlResponse {
+    const message = createBaseGetDefaultPrlResponse();
+    message.prl = (object.prl !== undefined && object.prl !== null) ? Prl.fromPartial(object.prl) : undefined;
+    return message;
+  },
+};
+
+function createBasePrlValidationError(): PrlValidationError {
+  return { kind: 0, detail: "" };
+}
+
+export const PrlValidationError: MessageFns<PrlValidationError> = {
+  encode(message: PrlValidationError, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.kind !== 0) {
+      writer.uint32(8).int32(message.kind);
+    }
+    if (message.detail !== "") {
+      writer.uint32(18).string(message.detail);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlValidationError {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlValidationError();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.kind = reader.int32() as any;
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.detail = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlValidationError {
+    return {
+      kind: isSet(object.kind) ? prlValidationError_KindFromJSON(object.kind) : 0,
+      detail: isSet(object.detail) ? globalThis.String(object.detail) : "",
+    };
+  },
+
+  toJSON(message: PrlValidationError): unknown {
+    const obj: any = {};
+    if (message.kind !== 0) {
+      obj.kind = prlValidationError_KindToJSON(message.kind);
+    }
+    if (message.detail !== "") {
+      obj.detail = message.detail;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlValidationError>): PrlValidationError {
+    return PrlValidationError.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlValidationError>): PrlValidationError {
+    const message = createBasePrlValidationError();
+    message.kind = object.kind ?? 0;
+    message.detail = object.detail ?? "";
+    return message;
+  },
+};
+
+function createBasePrlDeleteBlockedError(): PrlDeleteBlockedError {
+  return { referencingSubscribers: 0, sampleSubscriberIds: [] };
+}
+
+export const PrlDeleteBlockedError: MessageFns<PrlDeleteBlockedError> = {
+  encode(message: PrlDeleteBlockedError, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.referencingSubscribers !== 0) {
+      writer.uint32(8).uint32(message.referencingSubscribers);
+    }
+    for (const v of message.sampleSubscriberIds) {
+      writer.uint32(18).string(v!);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PrlDeleteBlockedError {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePrlDeleteBlockedError();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.referencingSubscribers = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.sampleSubscriberIds.push(reader.string());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PrlDeleteBlockedError {
+    return {
+      referencingSubscribers: isSet(object.referencingSubscribers)
+        ? globalThis.Number(object.referencingSubscribers)
+        : isSet(object.referencing_subscribers)
+        ? globalThis.Number(object.referencing_subscribers)
+        : 0,
+      sampleSubscriberIds: globalThis.Array.isArray(object?.sampleSubscriberIds)
+        ? object.sampleSubscriberIds.map((e: any) => globalThis.String(e))
+        : globalThis.Array.isArray(object?.sample_subscriber_ids)
+        ? object.sample_subscriber_ids.map((e: any) => globalThis.String(e))
+        : [],
+    };
+  },
+
+  toJSON(message: PrlDeleteBlockedError): unknown {
+    const obj: any = {};
+    if (message.referencingSubscribers !== 0) {
+      obj.referencingSubscribers = Math.round(message.referencingSubscribers);
+    }
+    if (message.sampleSubscriberIds?.length) {
+      obj.sampleSubscriberIds = message.sampleSubscriberIds;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PrlDeleteBlockedError>): PrlDeleteBlockedError {
+    return PrlDeleteBlockedError.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PrlDeleteBlockedError>): PrlDeleteBlockedError {
+    const message = createBasePrlDeleteBlockedError();
+    message.referencingSubscribers = object.referencingSubscribers ?? 0;
+    message.sampleSubscriberIds = object.sampleSubscriberIds?.map((e) => e) || [];
+    return message;
+  },
+};
+
+function createBaseOtaspSessionSummary(): OtaspSessionSummary {
+  return {
+    sessionId: "",
+    subscriberId: undefined,
+    esn: undefined,
+    meid: undefined,
+    startedAt: undefined,
+    endedAt: undefined,
+    outcome: 0,
+    featureCode: undefined,
+    serviceOption: undefined,
+    completedBlocks: 0,
+    eventCount: 0,
+  };
+}
+
+export const OtaspSessionSummary: MessageFns<OtaspSessionSummary> = {
+  encode(message: OtaspSessionSummary, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.sessionId !== "") {
+      writer.uint32(10).string(message.sessionId);
+    }
+    if (message.subscriberId !== undefined) {
+      writer.uint32(18).string(message.subscriberId);
+    }
+    if (message.esn !== undefined) {
+      writer.uint32(24).uint32(message.esn);
+    }
+    if (message.meid !== undefined) {
+      writer.uint32(34).string(message.meid);
+    }
+    if (message.startedAt !== undefined) {
+      Timestamp.encode(toTimestamp(message.startedAt), writer.uint32(42).fork()).join();
+    }
+    if (message.endedAt !== undefined) {
+      Timestamp.encode(toTimestamp(message.endedAt), writer.uint32(50).fork()).join();
+    }
+    if (message.outcome !== 0) {
+      writer.uint32(56).int32(message.outcome);
+    }
+    if (message.featureCode !== undefined) {
+      writer.uint32(66).string(message.featureCode);
+    }
+    if (message.serviceOption !== undefined) {
+      writer.uint32(72).uint32(message.serviceOption);
+    }
+    if (message.completedBlocks !== 0) {
+      writer.uint32(80).uint32(message.completedBlocks);
+    }
+    if (message.eventCount !== 0) {
+      writer.uint32(88).uint32(message.eventCount);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): OtaspSessionSummary {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseOtaspSessionSummary();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.sessionId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.subscriberId = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.esn = reader.uint32();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.meid = reader.string();
+          continue;
+        }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          message.startedAt = fromTimestamp(Timestamp.decode(reader, reader.uint32()));
+          continue;
+        }
+        case 6: {
+          if (tag !== 50) {
+            break;
+          }
+
+          message.endedAt = fromTimestamp(Timestamp.decode(reader, reader.uint32()));
+          continue;
+        }
+        case 7: {
+          if (tag !== 56) {
+            break;
+          }
+
+          message.outcome = reader.int32() as any;
+          continue;
+        }
+        case 8: {
+          if (tag !== 66) {
+            break;
+          }
+
+          message.featureCode = reader.string();
+          continue;
+        }
+        case 9: {
+          if (tag !== 72) {
+            break;
+          }
+
+          message.serviceOption = reader.uint32();
+          continue;
+        }
+        case 10: {
+          if (tag !== 80) {
+            break;
+          }
+
+          message.completedBlocks = reader.uint32();
+          continue;
+        }
+        case 11: {
+          if (tag !== 88) {
+            break;
+          }
+
+          message.eventCount = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): OtaspSessionSummary {
+    return {
+      sessionId: isSet(object.sessionId)
+        ? globalThis.String(object.sessionId)
+        : isSet(object.session_id)
+        ? globalThis.String(object.session_id)
+        : "",
+      subscriberId: isSet(object.subscriberId)
+        ? globalThis.String(object.subscriberId)
+        : isSet(object.subscriber_id)
+        ? globalThis.String(object.subscriber_id)
+        : undefined,
+      esn: isSet(object.esn) ? globalThis.Number(object.esn) : undefined,
+      meid: isSet(object.meid) ? globalThis.String(object.meid) : undefined,
+      startedAt: isSet(object.startedAt)
+        ? fromJsonTimestamp(object.startedAt)
+        : isSet(object.started_at)
+        ? fromJsonTimestamp(object.started_at)
+        : undefined,
+      endedAt: isSet(object.endedAt)
+        ? fromJsonTimestamp(object.endedAt)
+        : isSet(object.ended_at)
+        ? fromJsonTimestamp(object.ended_at)
+        : undefined,
+      outcome: isSet(object.outcome) ? otaspSessionOutcomeFromJSON(object.outcome) : 0,
+      featureCode: isSet(object.featureCode)
+        ? globalThis.String(object.featureCode)
+        : isSet(object.feature_code)
+        ? globalThis.String(object.feature_code)
+        : undefined,
+      serviceOption: isSet(object.serviceOption)
+        ? globalThis.Number(object.serviceOption)
+        : isSet(object.service_option)
+        ? globalThis.Number(object.service_option)
+        : undefined,
+      completedBlocks: isSet(object.completedBlocks)
+        ? globalThis.Number(object.completedBlocks)
+        : isSet(object.completed_blocks)
+        ? globalThis.Number(object.completed_blocks)
+        : 0,
+      eventCount: isSet(object.eventCount)
+        ? globalThis.Number(object.eventCount)
+        : isSet(object.event_count)
+        ? globalThis.Number(object.event_count)
+        : 0,
+    };
+  },
+
+  toJSON(message: OtaspSessionSummary): unknown {
+    const obj: any = {};
+    if (message.sessionId !== "") {
+      obj.sessionId = message.sessionId;
+    }
+    if (message.subscriberId !== undefined) {
+      obj.subscriberId = message.subscriberId;
+    }
+    if (message.esn !== undefined) {
+      obj.esn = Math.round(message.esn);
+    }
+    if (message.meid !== undefined) {
+      obj.meid = message.meid;
+    }
+    if (message.startedAt !== undefined) {
+      obj.startedAt = message.startedAt.toISOString();
+    }
+    if (message.endedAt !== undefined) {
+      obj.endedAt = message.endedAt.toISOString();
+    }
+    if (message.outcome !== 0) {
+      obj.outcome = otaspSessionOutcomeToJSON(message.outcome);
+    }
+    if (message.featureCode !== undefined) {
+      obj.featureCode = message.featureCode;
+    }
+    if (message.serviceOption !== undefined) {
+      obj.serviceOption = Math.round(message.serviceOption);
+    }
+    if (message.completedBlocks !== 0) {
+      obj.completedBlocks = Math.round(message.completedBlocks);
+    }
+    if (message.eventCount !== 0) {
+      obj.eventCount = Math.round(message.eventCount);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<OtaspSessionSummary>): OtaspSessionSummary {
+    return OtaspSessionSummary.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<OtaspSessionSummary>): OtaspSessionSummary {
+    const message = createBaseOtaspSessionSummary();
+    message.sessionId = object.sessionId ?? "";
+    message.subscriberId = object.subscriberId ?? undefined;
+    message.esn = object.esn ?? undefined;
+    message.meid = object.meid ?? undefined;
+    message.startedAt = object.startedAt ?? undefined;
+    message.endedAt = object.endedAt ?? undefined;
+    message.outcome = object.outcome ?? 0;
+    message.featureCode = object.featureCode ?? undefined;
+    message.serviceOption = object.serviceOption ?? undefined;
+    message.completedBlocks = object.completedBlocks ?? 0;
+    message.eventCount = object.eventCount ?? 0;
+    return message;
+  },
+};
+
+function createBaseOtaspSessionDetail(): OtaspSessionDetail {
+  return { summary: undefined, events: [] };
+}
+
+export const OtaspSessionDetail: MessageFns<OtaspSessionDetail> = {
+  encode(message: OtaspSessionDetail, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.summary !== undefined) {
+      OtaspSessionSummary.encode(message.summary, writer.uint32(10).fork()).join();
+    }
+    for (const v of message.events) {
+      OtaspRecordedEvent.encode(v!, writer.uint32(18).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): OtaspSessionDetail {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseOtaspSessionDetail();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.summary = OtaspSessionSummary.decode(reader, reader.uint32());
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.events.push(OtaspRecordedEvent.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): OtaspSessionDetail {
+    return {
+      summary: isSet(object.summary) ? OtaspSessionSummary.fromJSON(object.summary) : undefined,
+      events: globalThis.Array.isArray(object?.events)
+        ? object.events.map((e: any) => OtaspRecordedEvent.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: OtaspSessionDetail): unknown {
+    const obj: any = {};
+    if (message.summary !== undefined) {
+      obj.summary = OtaspSessionSummary.toJSON(message.summary);
+    }
+    if (message.events?.length) {
+      obj.events = message.events.map((e) => OtaspRecordedEvent.toJSON(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<OtaspSessionDetail>): OtaspSessionDetail {
+    return OtaspSessionDetail.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<OtaspSessionDetail>): OtaspSessionDetail {
+    const message = createBaseOtaspSessionDetail();
+    message.summary = (object.summary !== undefined && object.summary !== null)
+      ? OtaspSessionSummary.fromPartial(object.summary)
+      : undefined;
+    message.events = object.events?.map((e) => OtaspRecordedEvent.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseSaveOtaspSessionRequest(): SaveOtaspSessionRequest {
+  return { summary: undefined, eventsProto: new Uint8Array(0) };
+}
+
+export const SaveOtaspSessionRequest: MessageFns<SaveOtaspSessionRequest> = {
+  encode(message: SaveOtaspSessionRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.summary !== undefined) {
+      OtaspSessionSummary.encode(message.summary, writer.uint32(10).fork()).join();
+    }
+    if (message.eventsProto.length !== 0) {
+      writer.uint32(18).bytes(message.eventsProto);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SaveOtaspSessionRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSaveOtaspSessionRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.summary = OtaspSessionSummary.decode(reader, reader.uint32());
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.eventsProto = reader.bytes();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SaveOtaspSessionRequest {
+    return {
+      summary: isSet(object.summary) ? OtaspSessionSummary.fromJSON(object.summary) : undefined,
+      eventsProto: isSet(object.eventsProto)
+        ? bytesFromBase64(object.eventsProto)
+        : isSet(object.events_proto)
+        ? bytesFromBase64(object.events_proto)
+        : new Uint8Array(0),
+    };
+  },
+
+  toJSON(message: SaveOtaspSessionRequest): unknown {
+    const obj: any = {};
+    if (message.summary !== undefined) {
+      obj.summary = OtaspSessionSummary.toJSON(message.summary);
+    }
+    if (message.eventsProto.length !== 0) {
+      obj.eventsProto = base64FromBytes(message.eventsProto);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<SaveOtaspSessionRequest>): SaveOtaspSessionRequest {
+    return SaveOtaspSessionRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<SaveOtaspSessionRequest>): SaveOtaspSessionRequest {
+    const message = createBaseSaveOtaspSessionRequest();
+    message.summary = (object.summary !== undefined && object.summary !== null)
+      ? OtaspSessionSummary.fromPartial(object.summary)
+      : undefined;
+    message.eventsProto = object.eventsProto ?? new Uint8Array(0);
+    return message;
+  },
+};
+
+function createBaseListOtaspSessionsRequest(): ListOtaspSessionsRequest {
+  return { subscriberId: undefined, esn: undefined, meid: undefined, limit: 0, offset: 0 };
+}
+
+export const ListOtaspSessionsRequest: MessageFns<ListOtaspSessionsRequest> = {
+  encode(message: ListOtaspSessionsRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.subscriberId !== undefined) {
+      writer.uint32(10).string(message.subscriberId);
+    }
+    if (message.esn !== undefined) {
+      writer.uint32(16).uint32(message.esn);
+    }
+    if (message.meid !== undefined) {
+      writer.uint32(26).string(message.meid);
+    }
+    if (message.limit !== 0) {
+      writer.uint32(32).uint32(message.limit);
+    }
+    if (message.offset !== 0) {
+      writer.uint32(40).uint32(message.offset);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ListOtaspSessionsRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseListOtaspSessionsRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.subscriberId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.esn = reader.uint32();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.meid = reader.string();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.limit = reader.uint32();
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.offset = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ListOtaspSessionsRequest {
+    return {
+      subscriberId: isSet(object.subscriberId)
+        ? globalThis.String(object.subscriberId)
+        : isSet(object.subscriber_id)
+        ? globalThis.String(object.subscriber_id)
+        : undefined,
+      esn: isSet(object.esn) ? globalThis.Number(object.esn) : undefined,
+      meid: isSet(object.meid) ? globalThis.String(object.meid) : undefined,
+      limit: isSet(object.limit) ? globalThis.Number(object.limit) : 0,
+      offset: isSet(object.offset) ? globalThis.Number(object.offset) : 0,
+    };
+  },
+
+  toJSON(message: ListOtaspSessionsRequest): unknown {
+    const obj: any = {};
+    if (message.subscriberId !== undefined) {
+      obj.subscriberId = message.subscriberId;
+    }
+    if (message.esn !== undefined) {
+      obj.esn = Math.round(message.esn);
+    }
+    if (message.meid !== undefined) {
+      obj.meid = message.meid;
+    }
+    if (message.limit !== 0) {
+      obj.limit = Math.round(message.limit);
+    }
+    if (message.offset !== 0) {
+      obj.offset = Math.round(message.offset);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<ListOtaspSessionsRequest>): ListOtaspSessionsRequest {
+    return ListOtaspSessionsRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<ListOtaspSessionsRequest>): ListOtaspSessionsRequest {
+    const message = createBaseListOtaspSessionsRequest();
+    message.subscriberId = object.subscriberId ?? undefined;
+    message.esn = object.esn ?? undefined;
+    message.meid = object.meid ?? undefined;
+    message.limit = object.limit ?? 0;
+    message.offset = object.offset ?? 0;
+    return message;
+  },
+};
+
+function createBaseListOtaspSessionsResponse(): ListOtaspSessionsResponse {
+  return { sessions: [], total: 0 };
+}
+
+export const ListOtaspSessionsResponse: MessageFns<ListOtaspSessionsResponse> = {
+  encode(message: ListOtaspSessionsResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.sessions) {
+      OtaspSessionSummary.encode(v!, writer.uint32(10).fork()).join();
+    }
+    if (message.total !== 0) {
+      writer.uint32(16).uint32(message.total);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ListOtaspSessionsResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseListOtaspSessionsResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.sessions.push(OtaspSessionSummary.decode(reader, reader.uint32()));
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.total = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ListOtaspSessionsResponse {
+    return {
+      sessions: globalThis.Array.isArray(object?.sessions)
+        ? object.sessions.map((e: any) => OtaspSessionSummary.fromJSON(e))
+        : [],
+      total: isSet(object.total) ? globalThis.Number(object.total) : 0,
+    };
+  },
+
+  toJSON(message: ListOtaspSessionsResponse): unknown {
+    const obj: any = {};
+    if (message.sessions?.length) {
+      obj.sessions = message.sessions.map((e) => OtaspSessionSummary.toJSON(e));
+    }
+    if (message.total !== 0) {
+      obj.total = Math.round(message.total);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<ListOtaspSessionsResponse>): ListOtaspSessionsResponse {
+    return ListOtaspSessionsResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<ListOtaspSessionsResponse>): ListOtaspSessionsResponse {
+    const message = createBaseListOtaspSessionsResponse();
+    message.sessions = object.sessions?.map((e) => OtaspSessionSummary.fromPartial(e)) || [];
+    message.total = object.total ?? 0;
+    return message;
+  },
+};
+
+function createBaseGetOtaspSessionRequest(): GetOtaspSessionRequest {
+  return { sessionId: "" };
+}
+
+export const GetOtaspSessionRequest: MessageFns<GetOtaspSessionRequest> = {
+  encode(message: GetOtaspSessionRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.sessionId !== "") {
+      writer.uint32(10).string(message.sessionId);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): GetOtaspSessionRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseGetOtaspSessionRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.sessionId = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): GetOtaspSessionRequest {
+    return {
+      sessionId: isSet(object.sessionId)
+        ? globalThis.String(object.sessionId)
+        : isSet(object.session_id)
+        ? globalThis.String(object.session_id)
+        : "",
+    };
+  },
+
+  toJSON(message: GetOtaspSessionRequest): unknown {
+    const obj: any = {};
+    if (message.sessionId !== "") {
+      obj.sessionId = message.sessionId;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<GetOtaspSessionRequest>): GetOtaspSessionRequest {
+    return GetOtaspSessionRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<GetOtaspSessionRequest>): GetOtaspSessionRequest {
+    const message = createBaseGetOtaspSessionRequest();
+    message.sessionId = object.sessionId ?? "";
+    return message;
+  },
+};
+
+function createBaseGetOtaspSessionResponse(): GetOtaspSessionResponse {
+  return { session: undefined };
+}
+
+export const GetOtaspSessionResponse: MessageFns<GetOtaspSessionResponse> = {
+  encode(message: GetOtaspSessionResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.session !== undefined) {
+      OtaspSessionDetail.encode(message.session, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): GetOtaspSessionResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseGetOtaspSessionResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.session = OtaspSessionDetail.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): GetOtaspSessionResponse {
+    return { session: isSet(object.session) ? OtaspSessionDetail.fromJSON(object.session) : undefined };
+  },
+
+  toJSON(message: GetOtaspSessionResponse): unknown {
+    const obj: any = {};
+    if (message.session !== undefined) {
+      obj.session = OtaspSessionDetail.toJSON(message.session);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<GetOtaspSessionResponse>): GetOtaspSessionResponse {
+    return GetOtaspSessionResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<GetOtaspSessionResponse>): GetOtaspSessionResponse {
+    const message = createBaseGetOtaspSessionResponse();
+    message.session = (object.session !== undefined && object.session !== null)
+      ? OtaspSessionDetail.fromPartial(object.session)
+      : undefined;
+    return message;
+  },
+};
+
 /** HLR service for subscriber profiles, radio identities, and registrations. */
 export type HlrServiceDefinition = typeof HlrServiceDefinition;
 export const HlrServiceDefinition = {
@@ -4523,6 +12527,15 @@ export const HlrServiceDefinition = {
       requestType: ResolveSubscriberByIdentityRequest as typeof ResolveSubscriberByIdentityRequest,
       requestStream: false,
       responseType: ResolveSubscriberByIdentityResponse as typeof ResolveSubscriberByIdentityResponse,
+      responseStream: false,
+      options: {},
+    },
+    /** Resolves a subscriber by ESN and/or MEID alone (no IMSI required). */
+    resolveSubscriberByHardwareIdentity: {
+      name: "ResolveSubscriberByHardwareIdentity",
+      requestType: ResolveSubscriberByHardwareIdentityRequest as typeof ResolveSubscriberByHardwareIdentityRequest,
+      requestStream: false,
+      responseType: ResolveSubscriberByHardwareIdentityResponse as typeof ResolveSubscriberByHardwareIdentityResponse,
       responseStream: false,
       options: {},
     },
@@ -4607,6 +12620,120 @@ export const HlrServiceDefinition = {
       responseStream: false,
       options: {},
     },
+    /**
+     * --- PRL management ---
+     * Lists active (non-deleted) PRLs for operator UI pages.
+     */
+    listPrls: {
+      name: "ListPrls",
+      requestType: ListPrlsRequest as typeof ListPrlsRequest,
+      requestStream: false,
+      responseType: ListPrlsResponse as typeof ListPrlsResponse,
+      responseStream: false,
+      options: {},
+    },
+    /** Fetches one PRL by UUID, including the decoded tree for the editor. */
+    getPrl: {
+      name: "GetPrl",
+      requestType: GetPrlRequest as typeof GetPrlRequest,
+      requestStream: false,
+      responseType: GetPrlResponse as typeof GetPrlResponse,
+      responseStream: false,
+      options: {},
+    },
+    /** Creates a new PRL from either uploaded raw bytes or a built tree. */
+    createPrl: {
+      name: "CreatePrl",
+      requestType: CreatePrlRequest as typeof CreatePrlRequest,
+      requestStream: false,
+      responseType: CreatePrlResponse as typeof CreatePrlResponse,
+      responseStream: false,
+      options: {},
+    },
+    /** Updates an existing PRL's metadata and/or body. */
+    updatePrl: {
+      name: "UpdatePrl",
+      requestType: UpdatePrlRequest as typeof UpdatePrlRequest,
+      requestStream: false,
+      responseType: UpdatePrlResponse as typeof UpdatePrlResponse,
+      responseStream: false,
+      options: {},
+    },
+    /** Soft-deletes a PRL. Refuses if any subscriber still uses it as override. */
+    deletePrl: {
+      name: "DeletePrl",
+      requestType: DeletePrlRequest as typeof DeletePrlRequest,
+      requestStream: false,
+      responseType: Empty as typeof Empty,
+      responseStream: false,
+      options: {},
+    },
+    /** Marks one PRL as the system default. Clears any prior default. */
+    setDefaultPrl: {
+      name: "SetDefaultPrl",
+      requestType: SetDefaultPrlRequest as typeof SetDefaultPrlRequest,
+      requestStream: false,
+      responseType: Empty as typeof Empty,
+      responseStream: false,
+      options: {},
+    },
+    /** Fetches the current default PRL (or empty if none is marked). */
+    getDefaultPrl: {
+      name: "GetDefaultPrl",
+      requestType: GetDefaultPrlRequest as typeof GetDefaultPrlRequest,
+      requestStream: false,
+      responseType: GetDefaultPrlResponse as typeof GetDefaultPrlResponse,
+      responseStream: false,
+      options: {},
+    },
+    /** Sets (or clears) a subscriber's PRL override. */
+    setSubscriberPrlOverride: {
+      name: "SetSubscriberPrlOverride",
+      requestType: SetSubscriberPrlOverrideRequest as typeof SetSubscriberPrlOverrideRequest,
+      requestStream: false,
+      responseType: Empty as typeof Empty,
+      responseStream: false,
+      options: {},
+    },
+    /** Sets (or clears) a subscriber's custom Service Programming Code. */
+    setSubscriberSpc: {
+      name: "SetSubscriberSpc",
+      requestType: SetSubscriberSpcRequest as typeof SetSubscriberSpcRequest,
+      requestStream: false,
+      responseType: Empty as typeof Empty,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * --- OTASP session history ---
+     * Persists a completed OTASP session.
+     */
+    saveOtaspSession: {
+      name: "SaveOtaspSession",
+      requestType: SaveOtaspSessionRequest as typeof SaveOtaspSessionRequest,
+      requestStream: false,
+      responseType: Empty as typeof Empty,
+      responseStream: false,
+      options: {},
+    },
+    /** Paginated session list filterable by subscriber, ESN, or MEID. */
+    listOtaspSessions: {
+      name: "ListOtaspSessions",
+      requestType: ListOtaspSessionsRequest as typeof ListOtaspSessionsRequest,
+      requestStream: false,
+      responseType: ListOtaspSessionsResponse as typeof ListOtaspSessionsResponse,
+      responseStream: false,
+      options: {},
+    },
+    /** Single session detail (summary + decoded event timeline). */
+    getOtaspSession: {
+      name: "GetOtaspSession",
+      requestType: GetOtaspSessionRequest as typeof GetOtaspSessionRequest,
+      requestStream: false,
+      responseType: GetOtaspSessionResponse as typeof GetOtaspSessionResponse,
+      responseStream: false,
+      options: {},
+    },
   },
 } as const;
 
@@ -4651,6 +12778,11 @@ export interface HlrServiceImplementation<CallContextExt = {}> {
     request: ResolveSubscriberByIdentityRequest,
     context: CallContext & CallContextExt,
   ): Promise<DeepPartial<ResolveSubscriberByIdentityResponse>>;
+  /** Resolves a subscriber by ESN and/or MEID alone (no IMSI required). */
+  resolveSubscriberByHardwareIdentity(
+    request: ResolveSubscriberByHardwareIdentityRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<ResolveSubscriberByHardwareIdentityResponse>>;
   /** Updates the serving-node registration binding for a subscriber. */
   upsertRegistrationBinding(
     request: UpsertRegistrationBindingRequest,
@@ -4696,6 +12828,54 @@ export interface HlrServiceImplementation<CallContextExt = {}> {
     request: GetSubscriberRingtoneCodecRequest,
     context: CallContext & CallContextExt,
   ): Promise<DeepPartial<GetSubscriberRingtoneCodecResponse>>;
+  /**
+   * --- PRL management ---
+   * Lists active (non-deleted) PRLs for operator UI pages.
+   */
+  listPrls(request: ListPrlsRequest, context: CallContext & CallContextExt): Promise<DeepPartial<ListPrlsResponse>>;
+  /** Fetches one PRL by UUID, including the decoded tree for the editor. */
+  getPrl(request: GetPrlRequest, context: CallContext & CallContextExt): Promise<DeepPartial<GetPrlResponse>>;
+  /** Creates a new PRL from either uploaded raw bytes or a built tree. */
+  createPrl(request: CreatePrlRequest, context: CallContext & CallContextExt): Promise<DeepPartial<CreatePrlResponse>>;
+  /** Updates an existing PRL's metadata and/or body. */
+  updatePrl(request: UpdatePrlRequest, context: CallContext & CallContextExt): Promise<DeepPartial<UpdatePrlResponse>>;
+  /** Soft-deletes a PRL. Refuses if any subscriber still uses it as override. */
+  deletePrl(request: DeletePrlRequest, context: CallContext & CallContextExt): Promise<DeepPartial<Empty>>;
+  /** Marks one PRL as the system default. Clears any prior default. */
+  setDefaultPrl(request: SetDefaultPrlRequest, context: CallContext & CallContextExt): Promise<DeepPartial<Empty>>;
+  /** Fetches the current default PRL (or empty if none is marked). */
+  getDefaultPrl(
+    request: GetDefaultPrlRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<GetDefaultPrlResponse>>;
+  /** Sets (or clears) a subscriber's PRL override. */
+  setSubscriberPrlOverride(
+    request: SetSubscriberPrlOverrideRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<Empty>>;
+  /** Sets (or clears) a subscriber's custom Service Programming Code. */
+  setSubscriberSpc(
+    request: SetSubscriberSpcRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<Empty>>;
+  /**
+   * --- OTASP session history ---
+   * Persists a completed OTASP session.
+   */
+  saveOtaspSession(
+    request: SaveOtaspSessionRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<Empty>>;
+  /** Paginated session list filterable by subscriber, ESN, or MEID. */
+  listOtaspSessions(
+    request: ListOtaspSessionsRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<ListOtaspSessionsResponse>>;
+  /** Single session detail (summary + decoded event timeline). */
+  getOtaspSession(
+    request: GetOtaspSessionRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<GetOtaspSessionResponse>>;
 }
 
 export interface HlrServiceClient<CallOptionsExt = {}> {
@@ -4739,6 +12919,11 @@ export interface HlrServiceClient<CallOptionsExt = {}> {
     request: DeepPartial<ResolveSubscriberByIdentityRequest>,
     options?: CallOptions & CallOptionsExt,
   ): Promise<ResolveSubscriberByIdentityResponse>;
+  /** Resolves a subscriber by ESN and/or MEID alone (no IMSI required). */
+  resolveSubscriberByHardwareIdentity(
+    request: DeepPartial<ResolveSubscriberByHardwareIdentityRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<ResolveSubscriberByHardwareIdentityResponse>;
   /** Updates the serving-node registration binding for a subscriber. */
   upsertRegistrationBinding(
     request: DeepPartial<UpsertRegistrationBindingRequest>,
@@ -4784,6 +12969,54 @@ export interface HlrServiceClient<CallOptionsExt = {}> {
     request: DeepPartial<GetSubscriberRingtoneCodecRequest>,
     options?: CallOptions & CallOptionsExt,
   ): Promise<GetSubscriberRingtoneCodecResponse>;
+  /**
+   * --- PRL management ---
+   * Lists active (non-deleted) PRLs for operator UI pages.
+   */
+  listPrls(request: DeepPartial<ListPrlsRequest>, options?: CallOptions & CallOptionsExt): Promise<ListPrlsResponse>;
+  /** Fetches one PRL by UUID, including the decoded tree for the editor. */
+  getPrl(request: DeepPartial<GetPrlRequest>, options?: CallOptions & CallOptionsExt): Promise<GetPrlResponse>;
+  /** Creates a new PRL from either uploaded raw bytes or a built tree. */
+  createPrl(request: DeepPartial<CreatePrlRequest>, options?: CallOptions & CallOptionsExt): Promise<CreatePrlResponse>;
+  /** Updates an existing PRL's metadata and/or body. */
+  updatePrl(request: DeepPartial<UpdatePrlRequest>, options?: CallOptions & CallOptionsExt): Promise<UpdatePrlResponse>;
+  /** Soft-deletes a PRL. Refuses if any subscriber still uses it as override. */
+  deletePrl(request: DeepPartial<DeletePrlRequest>, options?: CallOptions & CallOptionsExt): Promise<Empty>;
+  /** Marks one PRL as the system default. Clears any prior default. */
+  setDefaultPrl(request: DeepPartial<SetDefaultPrlRequest>, options?: CallOptions & CallOptionsExt): Promise<Empty>;
+  /** Fetches the current default PRL (or empty if none is marked). */
+  getDefaultPrl(
+    request: DeepPartial<GetDefaultPrlRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<GetDefaultPrlResponse>;
+  /** Sets (or clears) a subscriber's PRL override. */
+  setSubscriberPrlOverride(
+    request: DeepPartial<SetSubscriberPrlOverrideRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<Empty>;
+  /** Sets (or clears) a subscriber's custom Service Programming Code. */
+  setSubscriberSpc(
+    request: DeepPartial<SetSubscriberSpcRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<Empty>;
+  /**
+   * --- OTASP session history ---
+   * Persists a completed OTASP session.
+   */
+  saveOtaspSession(
+    request: DeepPartial<SaveOtaspSessionRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<Empty>;
+  /** Paginated session list filterable by subscriber, ESN, or MEID. */
+  listOtaspSessions(
+    request: DeepPartial<ListOtaspSessionsRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<ListOtaspSessionsResponse>;
+  /** Single session detail (summary + decoded event timeline). */
+  getOtaspSession(
+    request: DeepPartial<GetOtaspSessionRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<GetOtaspSessionResponse>;
 }
 
 function bytesFromBase64(b64: string): Uint8Array {

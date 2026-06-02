@@ -5,6 +5,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compile_protos(
             &[
                 "../../proto/bsc/v1/service.proto",
+                "../../proto/events/v1/msc.proto",
                 "../../proto/msc_management/v1/service.proto",
                 "../../proto/voice_gateway/v1/service.proto",
             ],

@@ -502,6 +502,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "cdma-common",
+ "cdma-otasp",
  "cdma-voice",
  "chrono",
  "log",
@@ -530,15 +531,18 @@ dependencies = [
 name = "cdma-msc"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "cdma-common",
  "cdma-hlr",
  "cdma-ios",
+ "cdma-otasp",
  "cdma-smsc",
  "cdma-voice",
  "chrono",
  "log",
  "prost",
+ "prost-types",
  "serde",
  "serde_json",
  "tokio",
@@ -571,6 +575,13 @@ dependencies = [
  "tonic 0.13.1",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "cdma-otasp"
+version = "0.1.0"
+dependencies = [
+ "cdma-common",
 ]
 
 [[package]]
@@ -1807,6 +1818,7 @@ dependencies = [
  "hex",
  "log",
  "prost",
+ "prost-types",
  "serde",
  "tokio",
  "tokio-stream",

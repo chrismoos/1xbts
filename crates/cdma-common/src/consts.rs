@@ -9,6 +9,9 @@ pub const SERVICE_OPTION_SMS: u16 = 6;
 /// SO7: Packet data, async/fax data service.
 pub const SERVICE_OPTION_PACKET_DATA: u16 = 7;
 
+/// SO18: OTASP (C.S0016-D §1.2).
+pub const SERVICE_OPTION_OTASP: u16 = 18;
+
 /// SO33: High-rate packet data service.
 pub const SERVICE_OPTION_HIGH_RATE_PACKET_DATA: u16 = 33;
 
@@ -17,6 +20,12 @@ pub const SERVICE_OPTION_EVRC_B: u16 = 68;
 
 /// SO70: EVRC-WB.
 pub const SERVICE_OPTION_EVRC_WB: u16 = 70;
+
+/// Data Burst Message BURST_TYPE for SMS (TIA-637).
+pub const BURST_TYPE_SMS: u8 = 0b000011;
+
+/// Data Burst Message BURST_TYPE for OTASP/OTAPA payloads (C.S0016-D §2.3).
+pub const BURST_TYPE_OTASP: u8 = 0b000100;
 
 /// SR1 chip rate in chips per second (C.S0002-E §1.1).
 pub const SR1_CHIP_RATE_HZ: u64 = 1_228_800;

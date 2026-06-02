@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { Card } from "@/components/card";
+import { ImsiGenerateButton } from "@/components/imsi-generate-button";
 import { NumberPlan, NumberType } from "@/lib/proto/hlr/v1/service";
 import {
   DEFAULT_NUMBER_PLAN,
@@ -307,9 +308,18 @@ export default function SubscribersPage() {
                 )}
               </div>
               <div>
-                <label className="block text-xs text-muted mb-1" htmlFor="new-imsi">
-                  IMSI
-                </label>
+                <div className="flex items-end justify-between mb-1">
+                  <label className="block text-xs text-muted" htmlFor="new-imsi">
+                    IMSI
+                  </label>
+                  <ImsiGenerateButton
+                    phoneNumber={phoneNumber}
+                    onGenerated={(v) => {
+                      setImsi(v);
+                      clearFieldError("imsi");
+                    }}
+                  />
+                </div>
                 <input
                   id="new-imsi"
                   type="text"

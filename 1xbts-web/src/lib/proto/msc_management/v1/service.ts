@@ -8,6 +8,7 @@
 import { BinaryReader, BinaryWriter } from "@bufbuild/protobuf/wire";
 import type { CallContext, CallOptions } from "nice-grpc-common";
 import { InitiateCallRequest, InitiateCallResponse } from "../../bsc/v1/service";
+import { MscNetworkEvent } from "../../events/v1/msc";
 import { Empty } from "../../google/protobuf/empty";
 
 export const protobufPackage = "msc_management.v1";
@@ -415,6 +416,18 @@ export const MscManagementServiceDefinition = {
       responseStream: false,
       options: {},
     },
+    /**
+     * Streams live OTASP events for real-time dashboards. Persisted
+     * session history is served separately by the HLR service.
+     */
+    streamOtaspEvents: {
+      name: "StreamOtaspEvents",
+      requestType: Empty as typeof Empty,
+      requestStream: false,
+      responseType: MscNetworkEvent as typeof MscNetworkEvent,
+      responseStream: true,
+      options: {},
+    },
   },
 } as const;
 
@@ -428,6 +441,14 @@ export interface MscManagementServiceImplementation<CallContextExt = {}> {
   sendSms(request: SendSmsRequest, context: CallContext & CallContextExt): Promise<DeepPartial<SendSmsResponse>>;
   /** Lists active MSC call IDs. */
   listCalls(request: Empty, context: CallContext & CallContextExt): Promise<DeepPartial<CallList>>;
+  /**
+   * Streams live OTASP events for real-time dashboards. Persisted
+   * session history is served separately by the HLR service.
+   */
+  streamOtaspEvents(
+    request: Empty,
+    context: CallContext & CallContextExt,
+  ): ServerStreamingMethodResult<DeepPartial<MscNetworkEvent>>;
 }
 
 export interface MscManagementServiceClient<CallOptionsExt = {}> {
@@ -440,6 +461,14 @@ export interface MscManagementServiceClient<CallOptionsExt = {}> {
   sendSms(request: DeepPartial<SendSmsRequest>, options?: CallOptions & CallOptionsExt): Promise<SendSmsResponse>;
   /** Lists active MSC call IDs. */
   listCalls(request: DeepPartial<Empty>, options?: CallOptions & CallOptionsExt): Promise<CallList>;
+  /**
+   * Streams live OTASP events for real-time dashboards. Persisted
+   * session history is served separately by the HLR service.
+   */
+  streamOtaspEvents(
+    request: DeepPartial<Empty>,
+    options?: CallOptions & CallOptionsExt,
+  ): AsyncIterable<MscNetworkEvent>;
 }
 
 function bytesFromBase64(b64: string): Uint8Array {
@@ -489,6 +518,8 @@ function longToNumber(int64: { toString(): string }): number {
 function isSet(value: any): boolean {
   return value !== null && value !== undefined;
 }
+
+export type ServerStreamingMethodResult<Response> = { [Symbol.asyncIterator](): AsyncIterator<Response, void> };
 
 export interface MessageFns<T> {
   encode(message: T, writer?: BinaryWriter): BinaryWriter;

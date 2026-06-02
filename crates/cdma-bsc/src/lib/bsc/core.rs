@@ -148,6 +148,15 @@ pub struct Bsc {
     /// destination to ack. Keyed by `format_ms_address` (MsAddress isn't Hash).
     pub(crate) pending_sms_queue:
         std::collections::HashMap<String, std::collections::VecDeque<SmsRequest>>,
+    /// Per-walsh tracker for the most recent **OTASP** ADDS Deliver
+    /// (`burst_type = 0x04`) the BSC sent on the F-TCH that's still
+    /// awaiting an L2 ack or L3 reject from the MS. Records the A1
+    /// `Tag` the MSC put on the deliver so the BSC can correlate its
+    /// outbound `AddsDeliverAck` back to that same deliver. OTASP is
+    /// request-response with at most one outbound DBM in flight per
+    /// walsh, so a single-slot tracker is sufficient.
+    pub(crate) pending_otasp_dbm:
+        std::collections::HashMap<u8, super::traffic_signaling::PendingOtaspDbm>,
 }
 
 impl Bsc {
@@ -186,6 +195,7 @@ impl Bsc {
             pending_a1_failure_after_release: Vec::new(),
             pending_sms_escalations: std::collections::HashMap::new(),
             pending_sms_queue: std::collections::HashMap::new(),
+            pending_otasp_dbm: std::collections::HashMap::new(),
         }
     }
 }

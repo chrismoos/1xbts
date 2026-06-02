@@ -3,6 +3,7 @@ package hlr.v1;
 
 import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
+import "events/v1/msc.proto";
 
 // --- Messages ---
 
@@ -41,6 +42,12 @@ message Subscriber {
   bool has_ringtone = 9;
   // Duration of the stored ringtone in milliseconds (if any).
   optional uint64 ringtone_duration_ms = 10;
+  // PRL override (UUID). When set, the OTASP runtime pushes this PRL
+  // to the MS during `*228` instead of the system-default PRL.
+  optional string prl_override_id = 11;
+  // 6-digit Service Programming Code for this subscriber's handset.
+  // Unset means the device uses the IS-95 default "000000".
+  optional string service_programming_code = 12;
 }
 
 // Subscriber account lifecycle state. Mirrors
@@ -203,6 +210,21 @@ message ResolveSubscriberByIdentityResponse {
   optional SubscriberIdentity primary_identity = 3;
 }
 
+// Resolves a subscriber by ESN and/or MEID alone, without requiring an
+// IMSI — for cases where the MS hasn't been programmed with an
+// MIN/IMSI yet but is identified on the air by hardware ID.
+message ResolveSubscriberByHardwareIdentityRequest {
+  optional uint32 esn = 1;
+  optional string meid = 2;  // 14 hex digits
+}
+
+// Resolved subscriber and current registration binding, if any.
+message ResolveSubscriberByHardwareIdentityResponse {
+  optional Subscriber subscriber = 1;
+  optional RegistrationBinding binding = 2;
+  optional SubscriberIdentity primary_identity = 3;
+}
+
 // Creates or updates the serving-node registration binding for a subscriber.
 message UpsertRegistrationBindingRequest {
   string subscriber_id = 1;
@@ -338,6 +360,8 @@ service HlrService {
   rpc GetSubscriber(GetSubscriberRequest) returns (GetSubscriberResponse);
   // Resolves a complete mobile identity to subscriber state.
   rpc ResolveSubscriberByIdentity(ResolveSubscriberByIdentityRequest) returns (ResolveSubscriberByIdentityResponse);
+  // Resolves a subscriber by ESN and/or MEID alone (no IMSI required).
+  rpc ResolveSubscriberByHardwareIdentity(ResolveSubscriberByHardwareIdentityRequest) returns (ResolveSubscriberByHardwareIdentityResponse);
   // Updates the serving-node registration binding for a subscriber.
   rpc UpsertRegistrationBinding(UpsertRegistrationBindingRequest) returns (UpsertRegistrationBindingResponse);
   // Resolves a destination phone number for SMS routing.
@@ -356,4 +380,518 @@ service HlrService {
   rpc ClearSubscriberRingtone(ClearSubscriberRingtoneRequest) returns (google.protobuf.Empty);
   // Fetches the pre-encoded ringtone frame stream for one codec.
   rpc GetSubscriberRingtoneCodec(GetSubscriberRingtoneCodecRequest) returns (GetSubscriberRingtoneCodecResponse);
+
+  // --- PRL management ---
+  // Lists active (non-deleted) PRLs for operator UI pages.
+  rpc ListPrls(ListPrlsRequest) returns (ListPrlsResponse);
+  // Fetches one PRL by UUID, including the decoded tree for the editor.
+  rpc GetPrl(GetPrlRequest) returns (GetPrlResponse);
+  // Creates a new PRL from either uploaded raw bytes or a built tree.
+  rpc CreatePrl(CreatePrlRequest) returns (CreatePrlResponse);
+  // Updates an existing PRL's metadata and/or body.
+  rpc UpdatePrl(UpdatePrlRequest) returns (UpdatePrlResponse);
+  // Soft-deletes a PRL. Refuses if any subscriber still uses it as override.
+  rpc DeletePrl(DeletePrlRequest) returns (google.protobuf.Empty);
+  // Marks one PRL as the system default. Clears any prior default.
+  rpc SetDefaultPrl(SetDefaultPrlRequest) returns (google.protobuf.Empty);
+  // Fetches the current default PRL (or empty if none is marked).
+  rpc GetDefaultPrl(GetDefaultPrlRequest) returns (GetDefaultPrlResponse);
+  // Sets (or clears) a subscriber's PRL override.
+  rpc SetSubscriberPrlOverride(SetSubscriberPrlOverrideRequest) returns (google.protobuf.Empty);
+  // Sets (or clears) a subscriber's custom Service Programming Code.
+  rpc SetSubscriberSpc(SetSubscriberSpcRequest) returns (google.protobuf.Empty);
+
+  // --- OTASP session history ---
+  // Persists a completed OTASP session.
+  rpc SaveOtaspSession(SaveOtaspSessionRequest) returns (google.protobuf.Empty);
+  // Paginated session list filterable by subscriber, ESN, or MEID.
+  rpc ListOtaspSessions(ListOtaspSessionsRequest) returns (ListOtaspSessionsResponse);
+  // Single session detail (summary + decoded event timeline).
+  rpc GetOtaspSession(GetOtaspSessionRequest) returns (GetOtaspSessionResponse);
 }
+
+message SetSubscriberPrlOverrideRequest {
+  string subscriber_id = 1;
+  // Omit (or empty string) to clear the override.
+  optional string prl_id = 2;
+}
+
+message SetSubscriberSpcRequest {
+  string subscriber_id = 1;
+  // Six-digit code. Omit (or empty string) to clear and fall back to
+  // the IS-95 default "000000".
+  optional string service_programming_code = 2;
+}
+
+// ============================================================================
+// PRL storage and decoded-tree messages
+// ============================================================================
+//
+// Spec reference: C.S0016-D §3.5.5. The decoded messages mirror
+// `cdma_otasp::param::prl` (classic) and `cdma_otasp::param::prl_ext`
+// (extended SSPR_P_REV = 3). See those modules for field-level docs.
+//
+// Storage row vs editor payload: `PrlSummary` is what `ListPrls`
+// returns — cached columns + computed size, no decoded tree. `Prl` is
+// what `GetPrl` returns — summary + raw bytes + freshly decoded tree.
+
+// Summary for list view.
+message PrlSummary {
+  string prl_id = 1;
+  string name = 2;
+  // PR_LIST_ID from the on-wire header (cached column).
+  uint32 pr_list_id = 3;
+  // 1 = classic, 3 = extended (cached column).
+  uint32 sspr_p_rev = 4;
+  bool is_default = 5;
+  uint32 raw_bytes_size = 6;
+  string notes = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp updated_at = 9;
+}
+
+// Full record for the editor.
+message Prl {
+  PrlSummary summary = 1;
+  bytes raw_bytes = 2;
+  PrlDecoded decoded = 3;
+}
+
+message PrlDecoded {
+  oneof body {
+    PrlClassicBody classic = 1;
+    PrlExtendedBody extended = 2;
+  }
+}
+
+// ----- Classic PRL (SSPR_P_REV = 1) -----
+
+message PrlClassicBody {
+  uint32 pr_list_size = 1;
+  uint32 pr_list_id = 2;
+  bool pref_only = 3;
+  PrlRoamingIndicator def_roam_ind = 4;
+  uint32 pr_list_crc = 5;
+  uint32 computed_crc = 6;
+  bool crc_ok = 7;
+  repeated PrlAcqRecord acquisition_records = 8;
+  repeated PrlSysRecord system_records = 9;
+}
+
+// ----- Extended PRL (SSPR_P_REV = 3) -----
+
+message PrlExtendedBody {
+  uint32 pr_list_size = 1;
+  uint32 pr_list_id = 2;
+  uint32 cur_sspr_p_rev = 3;
+  bool pref_only = 4;
+  PrlRoamingIndicator def_roam_ind = 5;
+  uint32 pr_list_crc = 6;
+  uint32 computed_crc = 7;
+  bool crc_ok = 8;
+  repeated PrlExtAcqRecord acquisition_records = 9;
+  repeated PrlCommonSubnetRecord common_subnet_records = 10;
+  repeated PrlExtSysRecord system_records = 11;
+}
+
+// ----- Roaming indicator (shared, TSB-58) -----
+
+message PrlRoamingIndicator {
+  uint32 raw = 1;
+  PrlRoamingIndicatorKind kind = 2;
+}
+
+enum PrlRoamingIndicatorKind {
+  PRL_ROAMING_INDICATOR_KIND_UNSPECIFIED = 0;
+  PRL_ROAMING_INDICATOR_KIND_ON_HOME = 1;
+  PRL_ROAMING_INDICATOR_KIND_ROAMING = 2;
+  PRL_ROAMING_INDICATOR_KIND_INTERNATIONAL = 3;
+  PRL_ROAMING_INDICATOR_KIND_LTE = 4;
+  PRL_ROAMING_INDICATOR_KIND_FLASHING = 5;
+  PRL_ROAMING_INDICATOR_KIND_OTHER = 6;
+}
+
+// ----- Shared enums for acquisition / system bits -----
+
+enum PrlAbSelection {
+  PRL_AB_SELECTION_UNSPECIFIED = 0;
+  PRL_AB_SELECTION_SYSTEM_A = 1;
+  PRL_AB_SELECTION_SYSTEM_B = 2;
+  PRL_AB_SELECTION_RESERVED = 3;
+  PRL_AB_SELECTION_EITHER = 4;
+}
+
+enum PrlStandardChannel {
+  PRL_STANDARD_CHANNEL_UNSPECIFIED = 0;
+  PRL_STANDARD_CHANNEL_RESERVED = 1;
+  PRL_STANDARD_CHANNEL_PRIMARY = 2;
+  PRL_STANDARD_CHANNEL_SECONDARY = 3;
+  PRL_STANDARD_CHANNEL_PRIMARY_OR_SECONDARY = 4;
+}
+
+enum PrlPcsBlock {
+  PRL_PCS_BLOCK_UNSPECIFIED = 0;
+  PRL_PCS_BLOCK_A = 1;
+  PRL_PCS_BLOCK_B = 2;
+  PRL_PCS_BLOCK_C = 3;
+  PRL_PCS_BLOCK_D = 4;
+  PRL_PCS_BLOCK_E = 5;
+  PRL_PCS_BLOCK_F = 6;
+  PRL_PCS_BLOCK_RESERVED = 7;
+  PRL_PCS_BLOCK_ANY = 8;
+}
+
+enum PrlNidInclusion {
+  PRL_NID_INCLUSION_UNSPECIFIED = 0;
+  PRL_NID_INCLUSION_ANY = 1;
+  PRL_NID_INCLUSION_SINGLE = 2;
+  PRL_NID_INCLUSION_PUBLIC = 3;
+  PRL_NID_INCLUSION_RESERVED = 4;
+}
+
+enum PrlPrefNeg {
+  PRL_PREF_NEG_UNSPECIFIED = 0;
+  PRL_PREF_NEG_PREFERRED = 1;
+  PRL_PREF_NEG_NEGATIVE = 2;
+}
+
+enum PrlPriority {
+  PRL_PRIORITY_UNSPECIFIED = 0;
+  PRL_PRIORITY_MORE_DESIRABLE = 1;
+  PRL_PRIORITY_EQUALLY_DESIRABLE = 2;
+}
+
+// ----- Classic acquisition record (§3.5.5.2.1) -----
+
+message PrlAcqRecord {
+  uint32 acq_type_raw = 1;
+  oneof body {
+    PrlAcqCellularAnalog cellular_analog = 2;
+    PrlAcqCellularCdmaStandard cellular_cdma_standard = 3;
+    PrlAcqCellularCdmaCustom cellular_cdma_custom = 4;
+    PrlAcqCellularCdmaPreferred cellular_cdma_preferred = 5;
+    PrlAcqPcsCdmaUsingBlocks pcs_cdma_using_blocks = 6;
+    PrlAcqPcsCdmaUsingChannels pcs_cdma_using_channels = 7;
+    PrlAcqJtacsCdmaStandard jtacs_cdma_standard = 8;
+    PrlAcqJtacsCdmaCustom jtacs_cdma_custom = 9;
+    PrlAcqBandClass6UsingChannels band_class6_using_channels = 10;
+    PrlAcqUnknown unknown = 11;
+  }
+}
+
+message PrlAcqCellularAnalog { PrlAbSelection ab = 1; }
+message PrlAcqCellularCdmaStandard { PrlAbSelection ab = 1; PrlStandardChannel pri_sec = 2; }
+message PrlAcqCellularCdmaCustom { repeated uint32 channels = 1; }
+message PrlAcqCellularCdmaPreferred { PrlAbSelection ab = 1; }
+message PrlAcqPcsCdmaUsingBlocks { repeated PrlPcsBlock blocks = 1; }
+message PrlAcqPcsCdmaUsingChannels { repeated uint32 channels = 1; }
+message PrlAcqJtacsCdmaStandard { PrlAbSelection ab = 1; PrlStandardChannel pri_sec = 2; }
+message PrlAcqJtacsCdmaCustom { repeated uint32 channels = 1; }
+message PrlAcqBandClass6UsingChannels { repeated uint32 channels = 1; }
+message PrlAcqUnknown {}
+
+// ----- Classic system record (§3.5.5.3.1) -----
+
+message PrlSysRecord {
+  uint32 sid = 1;
+  PrlNidInclusion nid_incl = 2;
+  optional uint32 nid = 3;
+  bool same_geo_as_prev = 4;
+  PrlPrefNeg pref_neg = 5;
+  uint32 acq_index = 6;
+  // Present iff pref_neg == PREFERRED.
+  optional PrlRoamingIndicator roaming_indicator = 7;
+  optional PrlPriority priority = 8;
+}
+
+// ----- Extended acquisition record (§3.5.5.2.2) -----
+
+message PrlBandClassChannel {
+  uint32 band_class = 1;
+  uint32 channel_number = 2;
+}
+
+message PrlUmbAcqProfile {
+  uint32 umb_acq_profile = 1;
+  uint32 fft_size = 2;
+  uint32 cyclic_prefix_length = 3;
+  uint32 num_guard_subcarriers = 4;
+}
+
+message PrlUmbBlock {
+  uint32 band_class = 1;
+  uint32 channel_number = 2;
+  uint32 umb_acq_table_profile = 3;
+}
+
+message PrlExtAcqRecord {
+  uint32 acq_type_raw = 1;
+  // Spec LENGTH field (in octets). Stored so re-encode can match the
+  // original RESERVED padding exactly.
+  uint32 length = 2;
+  oneof body {
+    PrlAcqCellularAnalog cellular_analog = 3;
+    PrlAcqCellularCdmaStandard cellular_cdma_standard = 4;
+    PrlAcqCellularCdmaCustom cellular_cdma_custom = 5;
+    PrlAcqCellularCdmaPreferred cellular_cdma_preferred = 6;
+    PrlAcqPcsCdmaUsingBlocks pcs_cdma_using_blocks = 7;
+    PrlAcqPcsCdmaUsingChannels pcs_cdma_using_channels = 8;
+    PrlAcqJtacsCdmaStandard jtacs_cdma_standard = 9;
+    PrlAcqJtacsCdmaCustom jtacs_cdma_custom = 10;
+    PrlAcqBandClass6UsingChannels band_class6_using_channels = 11;
+    PrlExtAcqGeneric1xIs95 generic_1x_is95 = 12;
+    PrlExtAcqGenericHrpd generic_hrpd = 13;
+    PrlExtAcqUmbCommonTable umb_common_table = 14;
+    PrlExtAcqGenericUmb generic_umb = 15;
+    PrlExtAcqOther other = 16;
+  }
+}
+
+message PrlExtAcqGeneric1xIs95 { repeated PrlBandClassChannel entries = 1; }
+message PrlExtAcqGenericHrpd { repeated PrlBandClassChannel entries = 1; }
+message PrlExtAcqUmbCommonTable { repeated PrlUmbAcqProfile entries = 1; }
+message PrlExtAcqGenericUmb { repeated PrlUmbBlock blocks = 1; }
+message PrlExtAcqOther { bytes raw = 1; }
+
+// ----- Common Subnet Table (§3.5.5.3.2.1) -----
+
+message PrlCommonSubnetRecord {
+  // Spec SUBNET_COMMON_LENGTH in octets (4 bits, 0–15).
+  uint32 subnet_common_length_octets = 1;
+  // Hex string ("DEADBE"), exactly subnet_common_length_octets * 2
+  // characters. Server packs MSB-first onto the wire (it's already
+  // a clean octet stream — no bit-level padding needed here).
+  string subnet_common_hex = 2;
+}
+
+// ----- Extended system record (§3.5.5.3.2) -----
+
+enum PrlExtSysRecordType {
+  PRL_EXT_SYS_RECORD_TYPE_UNSPECIFIED = 0;
+  PRL_EXT_SYS_RECORD_TYPE_CDMA2000 = 1;
+  PRL_EXT_SYS_RECORD_TYPE_HRPD = 2;
+  PRL_EXT_SYS_RECORD_TYPE_RESERVED_OBSOLETE = 3;
+  PRL_EXT_SYS_RECORD_TYPE_MCC_MNC = 4;
+  PRL_EXT_SYS_RECORD_TYPE_RESERVED = 5;
+}
+
+message PrlExtSystemAssociation {
+  uint32 association_tag = 1;
+  bool pn_association = 2;
+  bool data_association = 3;
+}
+
+message PrlExtSysRecord {
+  uint32 sys_record_length = 1;
+  PrlExtSysRecordType sys_record_type = 2;
+  // Raw 4-bit type code on the wire. Populated for Reserved(_) values
+  // so the editor can preserve them; otherwise mirrors `sys_record_type`.
+  uint32 sys_record_type_raw = 3;
+  PrlPrefNeg pref_neg = 4;
+  bool same_geo_as_prev = 5;
+  PrlPriority priority = 6;
+  uint32 acq_index = 7;
+  oneof system_id {
+    PrlExtSysIdCdma2000 cdma2000 = 8;
+    PrlExtSysIdHrpd hrpd = 9;
+    PrlExtSysIdMccMnc mcc_mnc = 10;
+    PrlExtSysIdRaw raw = 11;
+  }
+  // Tail fields — only present when sys_record_type is known (not Raw)
+  // and the spec rule allows them.
+  optional PrlRoamingIndicator roaming_indicator = 12;
+  optional PrlExtSystemAssociation association = 13;
+}
+
+message PrlExtSysIdCdma2000 {
+  PrlNidInclusion nid_incl = 1;
+  uint32 sid = 2;
+  optional uint32 nid = 3;
+}
+
+message PrlExtSysIdHrpd {
+  bool subnet_common_included = 1;
+  // Spec SUBNET_LSB_LENGTH in bits (0–127). Drives the wire frame.
+  uint32 subnet_lsb_length_bits = 2;
+  // Hex string ("CAFE01"). Server packs MSB-first into the wire
+  // bit stream; byte count must equal ceil(subnet_lsb_length_bits/8).
+  string subnet_lsb_hex = 3;
+  // Present iff subnet_common_included.
+  optional uint32 subnet_common_offset = 4;
+}
+
+message PrlExtSysIdMccMnc {
+  oneof subtype {
+    PrlMccMnc000 subtype_000 = 1;
+    PrlMccMnc001 subtype_001 = 2;
+    PrlMccMnc010 subtype_010 = 3;
+    PrlMccMnc011 subtype_011 = 4;
+    PrlMccMncReserved reserved = 5;
+  }
+}
+
+// MCC is a 3-digit decimal string ("310"); MNC is 2 or 3 digits
+// ("23" or "001"). The Rust gRPC layer handles BCD packing + the
+// F-padding rule for 2-digit MNCs (§3.5.5.3.2.2).
+message PrlMccMnc000 { string mcc = 1; string mnc = 2; }
+message PrlMccMnc001 {
+  string mcc = 1;
+  string mnc = 2;
+  // 16-bit SIDs per spec (distinct from classic 15-bit).
+  repeated uint32 sids = 3;
+}
+message PrlSidNidPair { uint32 sid = 1; uint32 nid = 2; }
+message PrlMccMnc010 {
+  string mcc = 1;
+  string mnc = 2;
+  repeated PrlSidNidPair pairs = 3;
+}
+message PrlMccMncSubnet {
+  // Spec subnet length in bits.
+  uint32 subnet_length_bits = 1;
+  // Hex string ("CAFE01"), uppercase without separators. Server
+  // unpacks into the spec's MSB-first bit stream.
+  string subnet_id_hex = 2;
+}
+message PrlMccMnc011 {
+  string mcc = 1;
+  string mnc = 2;
+  repeated PrlMccMncSubnet subnets = 3;
+}
+message PrlMccMncReserved {
+  uint32 subtype = 1;
+  bytes raw_bits = 2;
+  uint32 raw_bit_len = 3;
+}
+
+message PrlExtSysIdRaw {
+  uint32 sys_record_type = 1;
+  bytes raw_bits = 2;
+  uint32 raw_bit_len = 3;
+}
+
+// ============================================================================
+// CRUD request/response messages
+// ============================================================================
+
+message ListPrlsRequest {
+  uint32 limit = 1;
+  uint32 offset = 2;
+  // Optional filters; absent means "any".
+  optional uint32 pr_list_id = 3;
+  optional uint32 sspr_p_rev = 4;
+}
+message ListPrlsResponse {
+  repeated PrlSummary prls = 1;
+  uint32 total = 2;
+}
+
+message GetPrlRequest { string prl_id = 1; }
+message GetPrlResponse { Prl prl = 1; }
+
+// Editor save: structured body. Upload: raw bytes.
+message CreatePrlRequest {
+  string name = 1;
+  string notes = 2;
+  oneof source {
+    bytes raw_bytes = 3;
+    PrlDecoded built = 4;
+  }
+}
+message CreatePrlResponse { Prl prl = 1; }
+
+message UpdatePrlRequest {
+  string prl_id = 1;
+  optional string name = 2;
+  optional string notes = 3;
+  // Body update is optional (omit to update name/notes only).
+  oneof body_update {
+    bytes raw_bytes = 4;
+    PrlDecoded built = 5;
+  }
+}
+message UpdatePrlResponse { Prl prl = 1; }
+
+message DeletePrlRequest { string prl_id = 1; }
+message SetDefaultPrlRequest { string prl_id = 1; }
+message GetDefaultPrlRequest {}
+// `prl` is absent when no PRL is marked default.
+message GetDefaultPrlResponse { Prl prl = 1; }
+
+// ----- Typed status detail payloads (returned via gRPC status details) -----
+
+message PrlValidationError {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_DECODE_FAILED = 1;
+    KIND_CRC_MISMATCH = 2;
+    KIND_UNSUPPORTED_REV = 3;
+    KIND_ENCODE_FAILED = 4;
+  }
+  Kind kind = 1;
+  string detail = 2;
+}
+
+message PrlDeleteBlockedError {
+  uint32 referencing_subscribers = 1;
+  // Up to ~5 referencing subscriber IDs for UI display.
+  repeated string sample_subscriber_ids = 2;
+}
+
+// ============================================================================
+// OTASP session history
+// ============================================================================
+
+// Summary row returned by ListOtaspSessions and as the header on
+// GetOtaspSessionResponse. Cached columns mirror the otasp_sessions table.
+message OtaspSessionSummary {
+  string session_id = 1;
+  // Resolved at session start via HLR lookup; null on HlrMiss.
+  optional string subscriber_id = 2;
+  // Hardware identity from the origination. Either may be null
+  // depending on what the MS presented.
+  optional uint32 esn = 3;
+  optional string meid = 4;
+  google.protobuf.Timestamp started_at = 5;
+  optional google.protobuf.Timestamp ended_at = 6;
+  events.v1.OtaspSessionOutcome outcome = 7;
+  optional string feature_code = 8;
+  optional uint32 service_option = 9;
+  uint32 completed_blocks = 10;
+  uint32 event_count = 11;
+}
+
+// Full session detail: summary + decoded timeline. The timeline
+// elements come from `events.v1.OtaspRecordedEvent` so MSC (the writer)
+// and HLR (the reader) share the same wire format.
+message OtaspSessionDetail {
+  OtaspSessionSummary summary = 1;
+  repeated events.v1.OtaspRecordedEvent events = 2;
+}
+
+message SaveOtaspSessionRequest {
+  OtaspSessionSummary summary = 1;
+  // Prost-encoded OtaspRecordedEvents.
+  bytes events_proto = 2;
+}
+
+message ListOtaspSessionsRequest {
+  // Filters apply ANDed. The subscriber page uses subscriber_id; the
+  // mobile page uses esn or meid.
+  optional string subscriber_id = 1;
+  optional uint32 esn = 2;
+  optional string meid = 3;
+  // Defaults to 10, clamped to [1, 100].
+  uint32 limit = 4;
+  uint32 offset = 5;
+}
+
+message ListOtaspSessionsResponse {
+  repeated OtaspSessionSummary sessions = 1;
+  // Unfiltered count for the applied filter so the UI can render
+  // "Showing N–M of T".
+  uint32 total = 2;
+}
+
+message GetOtaspSessionRequest { string session_id = 1; }
+message GetOtaspSessionResponse { OtaspSessionDetail session = 1; }

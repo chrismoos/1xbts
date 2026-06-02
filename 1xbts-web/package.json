@@ -10,18 +10,23 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "proto": "protoc --plugin=./node_modules/.bin/protoc-gen-ts_proto --ts_proto_out=src/lib/proto --ts_proto_opt=outputServices=nice-grpc,outputServices=generic-definitions,useExactTypes=false,esModuleInterop=true -I ../proto ../proto/bsc/v1/service.proto ../proto/management/v1/service.proto ../proto/bts_management/v1/service.proto ../proto/bsc_management/v1/service.proto ../proto/msc_management/v1/service.proto ../proto/pcf_management/v1/service.proto ../proto/pdsn_management/v1/service.proto ../proto/hlr/v1/service.proto ../proto/smsc/v1/service.proto ../proto/packet/v1/service.proto"
+    "proto": "protoc --plugin=./node_modules/.bin/protoc-gen-ts_proto --ts_proto_out=src/lib/proto --ts_proto_opt=outputServices=nice-grpc,outputServices=generic-definitions,useExactTypes=false,esModuleInterop=true -I ../proto ../proto/bsc/v1/service.proto ../proto/events/v1/msc.proto ../proto/management/v1/service.proto ../proto/bts_management/v1/service.proto ../proto/bsc_management/v1/service.proto ../proto/msc_management/v1/service.proto ../proto/pcf_management/v1/service.proto ../proto/pdsn_management/v1/service.proto ../proto/hlr/v1/service.proto ../proto/smsc/v1/service.proto ../proto/packet/v1/service.proto"
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.11.0",
+    "@dnd-kit/core": "^6.3.1",
+    "@dnd-kit/sortable": "^10.0.0",
+    "@dnd-kit/utilities": "^3.2.2",
     "@grpc/grpc-js": "^1.14.3",
     "@grpc/proto-loader": "^0.8.0",
+    "immer": "^11.1.8",
     "next": "16.2.0",
     "nice-grpc": "^2.1.14",
     "nice-grpc-common": "^2.0.2",
     "protobufjs": "^8.0.0",
     "react": "19.2.4",
-    "react-dom": "19.2.4"
+    "react-dom": "19.2.4",
+    "react-virtuoso": "^4.18.7"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",

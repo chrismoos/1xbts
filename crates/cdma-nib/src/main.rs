@@ -334,6 +334,9 @@ async fn main() -> Result<(), Error> {
     // MSC runtime and management gRPC
     let mut msc_runtime_config = MscRuntimeConfig::from_node_config(&msc_config, hlr_repo.clone());
     msc_runtime_config.smsc_repo = Some(smsc_repo.clone());
+    if msc_config.otasp.enabled {
+        msc_runtime_config.bts_overhead = Some(bts_overhead_from_node_configs(&bts_config)?);
+    }
     tokio::spawn(async move {
         info!("MSC management gRPC server on {msc_mgmt_addr}");
         let mut runtime = MscRuntime::new(msc_runtime_config);
@@ -419,4 +422,35 @@ async fn main() -> Result<(), Error> {
     bts.start().await?;
 
     Ok(())
+}
+
+/// Build the OTASP `BtsOverheadConfig` MSC needs for NAM assembly from
+/// `bts.json`. SID/NID/MCC/IMSI_11_12 come from the BTS overhead block
+/// (the same source the BTS broadcasts from) so a `*228` write matches
+/// what the cell advertises.
+fn bts_overhead_from_node_configs(
+    bts_config: &BtsNodeConfig,
+) -> Result<cdma_msc::BtsOverheadConfig, Error> {
+    let esp = &bts_config
+        .runtime
+        .downlink
+        .paging
+        .message_defaults
+        .extended_system_parameters;
+    let mcc = cdma_common::paging::mcc_to_digits(esp.mcc)
+        .ok_or_else(|| Error::from(format!("invalid BTS overhead MCC encoding {}", esp.mcc)))?;
+    let imsi_11_12 =
+        cdma_common::paging::imsi_11_12_to_digits(esp.imsi_11_12).ok_or_else(|| {
+            Error::from(format!(
+                "invalid BTS overhead IMSI_11_12 encoding {}",
+                esp.imsi_11_12
+            ))
+        })?;
+    Ok(cdma_msc::BtsOverheadConfig {
+        mcc,
+        imsi_11_12,
+        sid: bts_config.overhead.sid,
+        nid: bts_config.overhead.nid,
+        paging_channel_number: bts_config.runtime.downlink.paging.paging_channel_number as u16,
+    })
 }

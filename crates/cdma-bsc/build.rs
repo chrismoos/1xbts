@@ -17,6 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compile_protos(
             &[
                 "../../proto/bsc/v1/service.proto",
+                "../../proto/events/v1/msc.proto",
                 "../../proto/management/v1/service.proto",
                 "../../proto/bts_management/v1/service.proto",
                 "../../proto/bsc_management/v1/service.proto",

@@ -12,6 +12,7 @@ description = "Kannel-compatible sendsms HTTP shim that forwards SMS submissions
 tokio = { version = "1", features = ["full"] }
 tonic = "0.13"
 prost = "0.13"
+prost-types = "0.13"
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 log = "0.4"

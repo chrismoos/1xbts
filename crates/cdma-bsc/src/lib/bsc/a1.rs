@@ -138,6 +138,20 @@ impl Bsc {
                 };
                 self.handle_a1_adds_page(msg);
             }
+            cdma_ios::MessageType::AddsDeliver => {
+                let msg = match cdma_ios::AddsDeliverMessage::decode(&decoded.payload) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!("BSC: failed to decode A1 ADDS Deliver: {e}");
+                        return;
+                    }
+                };
+                let Some(call_id) = call_id else {
+                    warn!("BSC: A1 ADDS Deliver without call_id — dropped");
+                    return;
+                };
+                self.handle_a1_adds_deliver(call_id, msg);
+            }
             cdma_ios::MessageType::AlertWithInformation => {
                 let awi = match cdma_ios::AlertWithInformationMessage::decode(&decoded.payload) {
                     Ok(awi) => awi,
@@ -312,6 +326,62 @@ impl Bsc {
         }
     }
 
+    fn handle_a1_adds_deliver(&mut self, call_id: u64, msg: cdma_ios::AddsDeliverMessage) {
+        let walsh = self.mobiles.iter().find_map(|ms| ms.a1_call_walsh(call_id));
+        let Some(walsh) = walsh else {
+            warn!(
+                "BSC: A1 ADDS Deliver call_id={} has no matching traffic channel — dropped",
+                call_id
+            );
+            return;
+        };
+        let burst_type = msg.adds_user_part.burst_type;
+        let data_len = msg.adds_user_part.data.len();
+        let a1_tag = msg.tag;
+        let data_burst = cdma_common::lac::paging_messages::ForwardDataBurstMessage {
+            msg_number: 1,
+            burst_type,
+            num_msgs: 1,
+            fields: msg.adds_user_part.data,
+        };
+        let sdu = data_burst.to_sdu();
+        let send_result = self.send_traffic_signaling(
+            walsh,
+            sdu,
+            cdma_common::lac::message_types::MessageId::DataBurst,
+            0,
+            true,
+            None,
+            None,
+            None,
+            Some(data_burst),
+            None,
+        );
+        if let Err(e) = send_result {
+            warn!(
+                "BSC: failed to send ADDS Deliver burst_type={} on F-TCH walsh={}: {e}",
+                burst_type, walsh
+            );
+            return;
+        }
+        info!(
+            "BSC: sent ADDS Deliver burst_type={} ({} bytes) on F-TCH walsh={}",
+            burst_type, data_len, walsh
+        );
+        // Track OTASP-bearing ADDS Delivers so we can report an
+        // `AddsDeliverAck` to the MSC when the MS either acks (later, on
+        // L2 ack) or rejects (Mobile Station Reject Order). SMS uses a
+        // separate pending-ack flow keyed by msg_seq.
+        if burst_type == cdma_common::consts::BURST_TYPE_OTASP {
+            if let Some(tag) = a1_tag {
+                self.pending_otasp_dbm.insert(
+                    walsh,
+                    super::traffic_signaling::PendingOtaspDbm { a1_tag: tag },
+                );
+            }
+        }
+    }
+
     fn handle_a1_adds_page(&mut self, msg: cdma_ios::AddsPageMessage) {
         let imsi = match &msg.mobile_identity {
             cdma_ios::MobileIdentity::Imsi(imsi) => imsi.clone(),
@@ -410,6 +480,37 @@ impl A1Service {
             }
         };
         self.send_message(call_id, cdma_ios::MessageType::Connect, payload);
+    }
+
+    /// Sends an A1 `AddsDeliverAck` per A.S0001 §6.1.7.5. `cause = None`
+    /// reports success (MS L2-acked); `cause = Some(_)` reports failure.
+    /// The MSC routes the ack based on the echoed `tag` value (OTASP
+    /// vs SMS).
+    pub(crate) fn send_adds_deliver_ack(&self, tag: cdma_ios::Tag, cause: Option<u8>) {
+        let ack_msg = cdma_ios::AddsDeliverAckMessage {
+            tag: Some(tag),
+            cause: cause.map(cdma_ios::Cause),
+        };
+        let payload = match ack_msg.encode() {
+            Ok(payload) => payload,
+            Err(error) => {
+                warn!(
+                    "BSC: failed to encode ADDS Deliver Ack tag=0x{:08x}: {}",
+                    tag.0, error
+                );
+                return;
+            }
+        };
+        let client = self.msc_client.clone();
+        tokio::spawn(async move {
+            let msg = cdma_ios::EncodedA1Message::from_message(&cdma_ios::Message::new(
+                cdma_ios::MessageType::AddsDeliverAck,
+                payload,
+            ));
+            if let Err(e) = client.send_a1(msg).await {
+                log::warn!("BSC: failed to send ADDS Deliver Ack to MSC: {e}");
+            }
+        });
     }
 
     pub(crate) fn send_clear_request(&self, call_id: u64, cause: u8) {

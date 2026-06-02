@@ -175,7 +175,7 @@ fn load_stock_bts_bsc_configs() -> (BtsNodeConfig, BscNodeConfig) {
     let bsc = BscNodeConfig::load_from_path(&dir.join(config::BSC_CONFIG_FILENAME))
         .expect("load bsc.json for tests");
     config::validate_page_chan_alignment(
-        bsc.overhead.page_chan,
+        bts.overhead.page_chan,
         bts.runtime.downlink.paging.paging_channel_number,
     )
     .expect("test stock configs must have aligned page_chan");
@@ -3314,7 +3314,7 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
     };
     bts_config.validate()?;
     assert_eq!(
-        bsc_config.overhead.max_slot_cycle_index, E2E_MAX_SLOT_CYCLE_INDEX,
+        bts_config.overhead.max_slot_cycle_index, E2E_MAX_SLOT_CYCLE_INDEX,
         "e2e assigned-slot expectations assume stock MAX_SLOT_CYCLE_INDEX"
     );
 
@@ -3331,32 +3331,11 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
     let mut bsc = Bsc::new(BscConfig {
         pilot_offset: bts_config.pilot_offset,
         overhead: OverheadParameters {
-            sid: bsc_config.overhead.sid,
-            nid: bsc_config.overhead.nid,
-            base_id: bsc_config.overhead.base_id,
-            reg_zone: bsc_config.overhead.reg_zone,
-            total_zones: bsc_config.overhead.total_zones,
-            zone_timer: bsc_config.overhead.zone_timer,
-            max_slot_cycle_index: bsc_config.overhead.max_slot_cycle_index,
-            page_chan: bsc_config.overhead.page_chan,
-            config_seq: bsc_config.overhead.config_seq,
-            acc_config_seq: bsc_config.overhead.acc_config_seq,
-            power_up_reg: bsc_config.overhead.power_up_reg,
-            parameter_reg: bsc_config.overhead.parameter_reg,
-            auth_mode: bsc_config.overhead.auth_mode,
-            t1b_ms: bsc_config.overhead.t1b_ms,
-            p_rev: bsc_config.overhead.p_rev,
-            min_p_rev: bsc_config.overhead.min_p_rev,
-            lp_sec: 0,
-            ltm_off: 0,
-            daylt: 0,
-            prat: bsc_config.overhead.prat,
             cdma_freq: Some(config::resolved_cdma_freq(
-                &bsc_config.overhead,
+                &bts_config.overhead,
                 bts_config.channel,
             )),
-            ext_cdma_freq: bsc_config.overhead.ext_cdma_freq,
-            band_class: None,
+            ..bts_config.overhead.clone()
         },
         paging: bts_config.runtime.downlink.paging.clone(),
         traffic_assignment: TrafficAssignmentConfig::default(),
@@ -3534,8 +3513,8 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
     enqueue_gpm_with_esn_page(
         &lac_layer,
         E2E_DIRECT_GPM_ESN,
-        bsc_config.overhead.config_seq,
-        bsc_config.overhead.acc_config_seq,
+        bts_config.overhead.config_seq,
+        bts_config.overhead.acc_config_seq,
         0,
     )?;
 
@@ -3598,8 +3577,8 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
         bsc.has_pending_page()
     );
 
-    let cdma_freq = config::resolved_cdma_freq(&bsc_config.overhead, bts_config.channel);
-    let ext_cdma_freq = bsc_config.overhead.ext_cdma_freq.unwrap_or(0);
+    let cdma_freq = config::resolved_cdma_freq(&bts_config.overhead, bts_config.channel);
+    let ext_cdma_freq = bts_config.overhead.ext_cdma_freq.unwrap_or(0);
 
     let bts_paging_supplier = build_bts_paging_supplier(
         direct_bts_overhead(cdma_freq, ext_cdma_freq),
@@ -3624,17 +3603,17 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
             sync_channel_template: Some(SyncChannelMessage {
                 pd: 0,
                 msg_type: 1,
-                p_rev: bsc_config.overhead.p_rev,
-                min_p_rev: bsc_config.overhead.min_p_rev,
-                sid: bsc_config.overhead.sid,
-                nid: bsc_config.overhead.nid,
+                p_rev: bts_config.overhead.p_rev,
+                min_p_rev: bts_config.overhead.min_p_rev,
+                sid: bts_config.overhead.sid,
+                nid: bts_config.overhead.nid,
                 pilot_pn: bts_config.pilot_offset as u16,
                 lc_state: 0,
                 sys_time: 0,
                 lp_sec: 0,
                 ltm_off: 0,
                 daylt: 0,
-                prat: bsc_config.overhead.prat,
+                prat: bts_config.overhead.prat,
                 cdma_freq,
                 ext_cdma_freq,
                 sr1_bcch_non_td_incl: false,
@@ -3873,32 +3852,11 @@ async fn run_sync_overhead_window_case(
     let mut bsc = Bsc::new(BscConfig {
         pilot_offset: bts_config.pilot_offset,
         overhead: OverheadParameters {
-            sid: bsc_config.overhead.sid,
-            nid: bsc_config.overhead.nid,
-            base_id: bsc_config.overhead.base_id,
-            reg_zone: bsc_config.overhead.reg_zone,
-            total_zones: bsc_config.overhead.total_zones,
-            zone_timer: bsc_config.overhead.zone_timer,
-            max_slot_cycle_index: bsc_config.overhead.max_slot_cycle_index,
-            page_chan: bsc_config.overhead.page_chan,
-            config_seq: bsc_config.overhead.config_seq,
-            acc_config_seq: bsc_config.overhead.acc_config_seq,
-            power_up_reg: bsc_config.overhead.power_up_reg,
-            parameter_reg: bsc_config.overhead.parameter_reg,
-            auth_mode: bsc_config.overhead.auth_mode,
-            t1b_ms: bsc_config.overhead.t1b_ms,
-            p_rev: bsc_config.overhead.p_rev,
-            min_p_rev: bsc_config.overhead.min_p_rev,
-            lp_sec: 0,
-            ltm_off: 0,
-            daylt: 0,
-            prat: bsc_config.overhead.prat,
             cdma_freq: Some(config::resolved_cdma_freq(
-                &bsc_config.overhead,
+                &bts_config.overhead,
                 bts_config.channel,
             )),
-            ext_cdma_freq: bsc_config.overhead.ext_cdma_freq,
-            band_class: None,
+            ..bts_config.overhead.clone()
         },
         paging: bts_config.runtime.downlink.paging.clone(),
         traffic_assignment: TrafficAssignmentConfig::default(),
@@ -3994,8 +3952,8 @@ async fn run_sync_overhead_window_case(
         thread::spawn(move || mac.run_for(100_000, Duration::from_secs(10)).unwrap())
     };
 
-    let cdma_freq = config::resolved_cdma_freq(&bsc_config.overhead, bts_config.channel);
-    let ext_cdma_freq = bsc_config.overhead.ext_cdma_freq.unwrap_or(0);
+    let cdma_freq = config::resolved_cdma_freq(&bts_config.overhead, bts_config.channel);
+    let ext_cdma_freq = bts_config.overhead.ext_cdma_freq.unwrap_or(0);
 
     let bts_paging_supplier = build_bts_paging_supplier(
         direct_bts_overhead(cdma_freq, ext_cdma_freq),
@@ -4017,17 +3975,17 @@ async fn run_sync_overhead_window_case(
             sync_channel_template: Some(SyncChannelMessage {
                 pd: 0,
                 msg_type: 1,
-                p_rev: bsc_config.overhead.p_rev,
-                min_p_rev: bsc_config.overhead.min_p_rev,
-                sid: bsc_config.overhead.sid,
-                nid: bsc_config.overhead.nid,
+                p_rev: bts_config.overhead.p_rev,
+                min_p_rev: bts_config.overhead.min_p_rev,
+                sid: bts_config.overhead.sid,
+                nid: bts_config.overhead.nid,
                 pilot_pn: bts_config.pilot_offset as u16,
                 lc_state: 0,
                 sys_time: 0,
                 lp_sec: 0,
                 ltm_off: 0,
                 daylt: 0,
-                prat: bsc_config.overhead.prat,
+                prat: bts_config.overhead.prat,
                 cdma_freq,
                 ext_cdma_freq,
                 sr1_bcch_non_td_incl: false,

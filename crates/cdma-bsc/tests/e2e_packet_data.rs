@@ -2951,6 +2951,8 @@ impl FakeHlrRepository {
                 number_plan: cdma_hlr::model::NumberPlan::IsdnE164,
                 has_ringtone: false,
                 ringtone_duration_ms: None,
+                prl_override_id: None,
+                service_programming_code: None,
             },
         }
     }
@@ -3036,6 +3038,13 @@ impl HlrRepository for FakeHlrRepository {
     ) -> Result<Option<cdma_hlr::model::ResolvedSubscriber>, String> {
         Ok(Some(self.resolved()))
     }
+    async fn resolve_by_hardware_identity(
+        &self,
+        _: Option<u32>,
+        _: Option<&str>,
+    ) -> Result<Option<cdma_hlr::model::ResolvedSubscriber>, String> {
+        Ok(Some(self.resolved()))
+    }
     async fn upsert_registration_binding(
         &self,
         binding: RegistrationBinding,
@@ -3092,6 +3101,76 @@ impl HlrRepository for FakeHlrRepository {
         _: uuid::Uuid,
         _: &str,
     ) -> Result<Option<cdma_hlr::model::SubscriberRingtoneCodecBlob>, String> {
+        Ok(None)
+    }
+    async fn list_prls(
+        &self,
+        _: u32,
+        _: u32,
+        _: cdma_hlr::model::PrlListFilter,
+    ) -> Result<(Vec<cdma_hlr::model::Prl>, u32), String> {
+        Ok((vec![], 0))
+    }
+    async fn get_prl(&self, _: uuid::Uuid) -> Result<Option<cdma_hlr::model::Prl>, String> {
+        Ok(None)
+    }
+    async fn get_default_prl(&self) -> Result<Option<cdma_hlr::model::Prl>, String> {
+        Ok(None)
+    }
+    async fn create_prl(
+        &self,
+        _: &str,
+        _: &[u8],
+        _: i32,
+        _: i16,
+        _: &str,
+    ) -> Result<cdma_hlr::model::Prl, String> {
+        unimplemented!()
+    }
+    async fn update_prl(
+        &self,
+        _: uuid::Uuid,
+        _: Option<&str>,
+        _: Option<&[u8]>,
+        _: Option<(i32, i16)>,
+        _: Option<&str>,
+    ) -> Result<cdma_hlr::model::Prl, String> {
+        unimplemented!()
+    }
+    async fn soft_delete_prl(
+        &self,
+        _: uuid::Uuid,
+    ) -> Result<Result<(), cdma_hlr::model::PrlDeleteBlocked>, String> {
+        Ok(Ok(()))
+    }
+    async fn set_default_prl(&self, _: uuid::Uuid) -> Result<(), String> {
+        Ok(())
+    }
+    async fn set_subscriber_prl_override(
+        &self,
+        _: uuid::Uuid,
+        _: Option<uuid::Uuid>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    async fn set_subscriber_spc(&self, _: uuid::Uuid, _: Option<String>) -> Result<(), String> {
+        Ok(())
+    }
+    async fn save_otasp_session(&self, _: &cdma_hlr::model::OtaspSessionRow) -> Result<(), String> {
+        Ok(())
+    }
+    async fn list_otasp_sessions(
+        &self,
+        _: cdma_hlr::model::OtaspSessionFilter,
+        _: u32,
+        _: u32,
+    ) -> Result<(Vec<cdma_hlr::model::OtaspSessionRow>, u32), String> {
+        Ok((Vec::new(), 0))
+    }
+    async fn get_otasp_session(
+        &self,
+        _: uuid::Uuid,
+    ) -> Result<Option<cdma_hlr::model::OtaspSessionRow>, String> {
         Ok(None)
     }
 }

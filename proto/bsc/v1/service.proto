@@ -712,6 +712,12 @@ message OverheadConfig {
   uint32 lp_sec = 14;
   int32 ltm_off = 15;
   uint32 daylt = 16;
+  // MCC and IMSI_11_12 from the Extended System Parameters Message,
+  // decoded back to digit strings ("310", "55"). Useful for the web
+  // UI's IMSI generator, which concatenates these with a 10-digit
+  // MIN to produce the 15-digit IMSI.
+  string mcc_digits = 17;
+  string imsi_11_12_digits = 18;
 }
 
 // Configured timezone source for the broadcast LTM_OFF and DAYLT fields.

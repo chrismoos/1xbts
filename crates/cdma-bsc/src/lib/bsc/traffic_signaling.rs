@@ -27,6 +27,43 @@ pub(crate) struct TrafficSignalingService {
     pub(crate) serv_con_seq: u8,
 }
 
+/// State the BSC tracks per walsh for the most recent OTASP ADDS
+/// Deliver that's still awaiting either an L2 ack from the MS (success)
+/// or an L3 Mobile Station Reject Order (failure). When either arrives,
+/// the BSC sends an `AddsDeliverAck` to MSC per A.S0001 §6.1.7.5.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingOtaspDbm {
+    /// Tag the MSC put on the original ADDS Deliver. The BSC echoes
+    /// this on the AddsDeliverAck so MSC can correlate.
+    pub a1_tag: cdma_ios::Tag,
+}
+
+/// A1 cause codes the BSC reports on `AddsDeliverAck` failures.
+/// Wire-defined per A.S0014; concrete values are operator-visible only
+/// via the OTASP session's `BlockSkipped` reason text — the MSC
+/// session driver treats any non-`None` cause as "current phase
+/// failed, advance to next plan step".
+/// Reverse-link Order codes the BSC reacts to on R-TCH. Six-bit ORDER
+/// field per C.S0005-E Table 3.7.2.3.2.1-4.
+pub(crate) mod reverse_order_code {
+    /// Connect Order — MS confirms entering Conversation state.
+    pub const CONNECT: u8 = 0b011000;
+    /// Mobile Station Reject Order — C.S0005-E Table 2.7.3-1, with
+    /// ORDQ + REJECTED_TYPE carrying the upper-layer reason.
+    pub const MOBILE_STATION_REJECT: u8 = 0b011111;
+}
+
+pub(crate) mod adds_deliver_ack_cause {
+    /// MS rejected the application data delivery at L3 (Mobile Station
+    /// Reject Order with `REJECTED_TYPE = 0x04 Data Burst Message`).
+    /// Closest A.S0014 code: "Radio interface message failure" (0x00).
+    pub const RADIO_INTERFACE_MESSAGE_FAILURE: u8 = 0x00;
+    /// Forward traffic channel was torn down before the MS L2-acked
+    /// the deliver (mobile dropped the call, BSC released the TCH).
+    /// A.S0014 "Mobile call cleared" maps cleanly to this case.
+    pub const CALL_CLEARED: u8 = 0x0F;
+}
+
 impl TrafficSignalingService {
     pub(crate) fn next_serv_con_seq(&mut self) -> u8 {
         let seq = self.serv_con_seq;
@@ -620,9 +657,8 @@ impl Bsc {
                     }
                     self.teardown_traffic_channel(walsh_code).await;
                     self.on_voice_leg_released(session_id, leg_role);
-                } else if order == 0b011000 {
-                    // r-dsch: Connect Order (0b011000) — MS→BS only
-                    // User answered an MT call.
+                } else if order == reverse_order_code::CONNECT {
+                    // MS→BS only. User answered an MT call.
                     info!(
                         "BSC: received MS Connect Order on R-TCH walsh={} for {}",
                         walsh_code,
@@ -675,6 +711,43 @@ impl Bsc {
                         digit,
                     );
                     self.emit_continuous_dtmf_order(walsh_code, digit, start);
+                } else if order == reverse_order_code::MOBILE_STATION_REJECT {
+                    // Forwards to MSC as an A.S0001 §6.1.7.5
+                    // AddsDeliverAck failure when the rejected type is
+                    // a Data Burst and there's a pending OTASP DBM on
+                    // this walsh — otherwise the MSC session would
+                    // wait through the full inbound-silence timeout.
+                    use cdma_common::lac::message_types::{MessageId, WireChannel};
+                    let detail = event.decoded_l3.as_ref().and_then(|l3| match l3 {
+                        AccessMessage::Order(o) => {
+                            o.parse_mobile_station_reject_order(WireChannel::ForwardDedicated)
+                        }
+                        _ => None,
+                    });
+                    let dbm_wire_type =
+                        MessageId::DataBurst.wire_type(WireChannel::ForwardDedicated);
+                    let mut handled_otasp_reject = false;
+                    if let Some(detail) = detail
+                        && let Some(dbm_wire_type) = dbm_wire_type
+                        && detail.rejected_type == dbm_wire_type
+                        && let Some(pending) = self.pending_otasp_dbm.remove(&walsh_code)
+                    {
+                        info!(
+                            "BSC: MS Reject Order on walsh={} for OTASP DBM (ORDQ=0x{:02x}) — sending AddsDeliverAck failure tag=0x{:08x}",
+                            walsh_code, detail.ordq, pending.a1_tag.0
+                        );
+                        self.a1.send_adds_deliver_ack(
+                            pending.a1_tag,
+                            Some(adds_deliver_ack_cause::RADIO_INTERFACE_MESSAGE_FAILURE),
+                        );
+                        handled_otasp_reject = true;
+                    }
+                    if !handled_otasp_reject {
+                        info!(
+                            "BSC: received Mobile Station Reject Order on R-TCH walsh={} (not OTASP, or no pending DBM), ignoring",
+                            walsh_code
+                        );
+                    }
                 } else {
                     info!(
                         "BSC: received {} (0x{:02x}) on R-TCH walsh={}, ignoring",

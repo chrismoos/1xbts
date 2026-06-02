@@ -14,6 +14,7 @@ members = [
     "crates/cdma-ios",
     "crates/cdma-msc",
     "crates/cdma-nib",
+    "crates/cdma-otasp",
     "crates/cdma-packet",
     "crates/cdma-pcf",
     "crates/cdma-pdsn",

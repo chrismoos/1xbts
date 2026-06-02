@@ -853,6 +853,10 @@ impl MscSmsCoordinator {
                 warn!("MSC SMS: ADDS Transfer with ESN-only identity, no IMSI");
                 return;
             }
+            MobileIdentity::Meid(_) => {
+                warn!("MSC SMS: ADDS Transfer with MEID-only identity, no IMSI");
+                return;
+            }
         };
         let esn = match mobile_identity_esn {
             Some(MobileIdentity::Esn(esn)) => Some(*esn),

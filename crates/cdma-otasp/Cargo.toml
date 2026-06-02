@@ -1,0 +1,18 @@
+[package]
+name = "cdma-otasp"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "OTASP (C.S0016-D) message codecs and CDMA transport state machine for 1xBTS."
+
+[dependencies]
+cdma-common = { path = "../cdma-common" }
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

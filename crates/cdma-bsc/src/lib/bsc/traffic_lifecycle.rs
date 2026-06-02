@@ -77,6 +77,22 @@ impl Bsc {
     /// key for an active TC). The owning mobile is resolved through the
     /// registry, so callers never need to track an `idx` across `.await`.
     pub(crate) async fn teardown_traffic_channel(&mut self, walsh_code: u8) {
+        // If there's a pending OTASP DBM that never got an L2 ack or
+        // L3 reject, the call is going away before MSC will hear back.
+        // Send an AddsDeliverAck(cause=call_cleared) per A.S0001
+        // §6.1.7.5 so the OTASP session can advance / terminate
+        // instead of waiting on the 5 s inbound-silence timeout.
+        if let Some(pending) = self.pending_otasp_dbm.remove(&walsh_code) {
+            log::info!(
+                "BSC: walsh={} teardown with pending OTASP DBM tag=0x{:08x} — sending AddsDeliverAck call_cleared",
+                walsh_code,
+                pending.a1_tag.0
+            );
+            self.a1.send_adds_deliver_ack(
+                pending.a1_tag,
+                Some(super::traffic_signaling::adds_deliver_ack_cause::CALL_CLEARED),
+            );
+        }
         let Some(ms) = self.mobiles.get_by_walsh(walsh_code) else {
             warn!(
                 "BSC: teardown_traffic_channel called but no traffic channel walsh={}",

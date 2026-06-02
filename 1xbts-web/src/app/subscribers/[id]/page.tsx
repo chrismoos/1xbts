@@ -7,6 +7,10 @@ import { esnManufacturer } from "@/lib/esn-manufacturer";
 import { formatEsn, formatMeid } from "@/lib/format";
 import { Card, Stat } from "@/components/card";
 import { RecentMessagesCard } from "@/components/recent-messages-card";
+import { RecentOtaspCard } from "@/components/recent-otasp-card";
+import { PrlOverrideCard } from "@/components/prl-override-card";
+import { SpcOverrideCard } from "@/components/spc-override-card";
+import { ImsiGenerateButton } from "@/components/imsi-generate-button";
 import { validateRingtoneFile } from "@/lib/validation";
 import {
   NumberPlan,
@@ -504,6 +508,20 @@ export default function SubscriberDetailPage({
 
       <RecentMessagesCard phone={subscriber.phoneNumber} />
 
+      <RecentOtaspCard subscriberId={subscriber.subscriberId} />
+
+      <PrlOverrideCard
+        subscriberId={subscriber.subscriberId}
+        currentOverride={subscriber.prlOverrideId ?? undefined}
+        onChanged={fetchDetail}
+      />
+
+      <SpcOverrideCard
+        subscriberId={subscriber.subscriberId}
+        current={subscriber.serviceProgrammingCode ?? undefined}
+        onChanged={fetchDetail}
+      />
+
       <Card title="Voice Call">
         <div className="space-y-4">
           <div className="grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] gap-4 items-end">
@@ -770,9 +788,18 @@ export default function SubscriberDetailPage({
               )}
             </div>
             <div>
-              <label className="block text-xs text-muted mb-1" htmlFor="edit-imsi">
-                IMSI
-              </label>
+              <div className="flex items-end justify-between mb-1">
+                <label className="block text-xs text-muted" htmlFor="edit-imsi">
+                  IMSI
+                </label>
+                <ImsiGenerateButton
+                  phoneNumber={phoneNumber}
+                  onGenerated={(v) => {
+                    setImsi(v);
+                    clearFieldError("imsi");
+                  }}
+                />
+              </div>
               <input
                 id="edit-imsi"
                 type="text"

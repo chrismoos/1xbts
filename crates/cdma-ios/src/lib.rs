@@ -73,6 +73,7 @@ pub use typed::{
     AddsDeliverMessage,
     AddsPageAckMessage,
     AddsPageMessage,
+    AddsTransferAckMessage,
     AddsTransferMessage,
     AddsUserPart,
     AlertWithInformationMessage,
@@ -228,6 +229,7 @@ pub enum MessageType {
     AddsPageAck = 0x4b,
     AddsDeliver = 0x4c,
     AddsDeliverAck = 0x4d,
+    AddsTransferAck = 0x4e,
 }
 
 impl MessageType {
@@ -270,6 +272,7 @@ impl MessageType {
             0x4b => Ok(Self::AddsPageAck),
             0x4c => Ok(Self::AddsDeliver),
             0x4d => Ok(Self::AddsDeliverAck),
+            0x4e => Ok(Self::AddsTransferAck),
             other => Err(Error::UnknownMessageType(other)),
         }
     }

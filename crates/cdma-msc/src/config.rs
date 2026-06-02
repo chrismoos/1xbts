@@ -422,6 +422,131 @@ impl Default for SmsRetryConfig {
     }
 }
 
+/// OTASP (C.S0016-D) configuration.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OtaspConfig {
+    /// Master switch for OTASP `*228`-style originations.
+    pub enabled: bool,
+    /// Dialed-digit prefixes that trigger an OTASP session.
+    pub feature_codes: Vec<String>,
+    /// SPC policy. Only `"leave_default"` is supported today.
+    pub spc_policy: String,
+    /// Home System Tag (operator banner) settings.
+    pub system_tag: SystemTagConfig,
+    /// NAM defaults applied to every download.
+    pub nam_defaults: NamDefaultsConfig,
+    /// MMS URI to push when `writes.mms_uri = true`.
+    pub mms: MmsConfig,
+    /// Per-block write toggles.
+    pub writes: OtaspWritesConfig,
+}
+
+impl Default for OtaspConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            feature_codes: vec!["*228".to_string()],
+            spc_policy: "leave_default".to_string(),
+            system_tag: SystemTagConfig::default(),
+            nam_defaults: NamDefaultsConfig::default(),
+            mms: MmsConfig::default(),
+            writes: OtaspWritesConfig::default(),
+        }
+    }
+}
+
+/// MMS URI download settings (C.S0016-D §3.5.12 MMS Parameter Block).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MmsConfig {
+    /// ASCII URL pushed as MMS URI entry index 0. Empty string disables
+    /// the write even when `writes.mms_uri = true`.
+    pub uri: String,
+}
+
+impl Default for MmsConfig {
+    fn default() -> Self {
+        Self {
+            uri: "http://mmsc.local.1xbts.org/".to_string(),
+        }
+    }
+}
+
+/// Home System Tag operator-configurable banner.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SystemTagConfig {
+    pub name: String,
+    pub tag_p_rev: u8,
+}
+
+impl Default for SystemTagConfig {
+    fn default() -> Self {
+        Self {
+            name: "1xBTS".to_string(),
+            tag_p_rev: 1,
+        }
+    }
+}
+
+/// NAM defaults applied verbatim to every Download Request.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NamDefaultsConfig {
+    pub mob_term_home: bool,
+    pub mob_term_for_sid: bool,
+    pub mob_term_for_nid: bool,
+}
+
+impl Default for NamDefaultsConfig {
+    fn default() -> Self {
+        Self {
+            mob_term_home: true,
+            mob_term_for_sid: true,
+            mob_term_for_nid: true,
+        }
+    }
+}
+
+/// Per-block write toggles. A disabled block is skipped entirely.
+/// Per-block opt-in for OTASP `*228` writes. Every flag defaults to
+/// `false` so a freshly-installed system reads NAM/PRL/MMS blocks
+/// back from the handset, renders them on the session detail page,
+/// but never overwrites anything. Operators flip on the specific
+/// blocks they want programmed after they've eyeballed a few
+/// read-backs.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OtaspWritesConfig {
+    pub cdma_analog_nam: bool,
+    pub mdn: bool,
+    pub cdma_nam: bool,
+    pub home_system_tag: bool,
+    /// Push MMS URI Parameters block to handsets that advertise
+    /// FEATURE_ID = 0x0A. Requires `otasp.mms.uri` to be set.
+    pub mms_uri: bool,
+    /// Push the per-subscriber (or default) PRL via SSPR Download
+    /// after the read-back. Gated on FEATURE_ID = 0x02 (SSPR).
+    pub prl: bool,
+}
+
+/// Overhead values pulled from the BTS/BSC node configs by `cdma-nib`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BtsOverheadConfig {
+    /// MCC string (decimal digits), e.g. `"310"`.
+    pub mcc: String,
+    /// IMSI 11/12 digits as a 2-digit string, e.g. `"55"`.
+    pub imsi_11_12: String,
+    /// Home SID broadcast by the serving BTS.
+    pub sid: u16,
+    /// Home NID broadcast by the serving BTS.
+    pub nid: u16,
+    /// First paging channel number used by the serving BTS.
+    pub paging_channel_number: u16,
+}
+
 /// MSC node configuration (loaded from `config/msc.json`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MscNodeConfig {
@@ -441,6 +566,9 @@ pub struct MscNodeConfig {
     /// MT SMS retry sweep configuration.
     #[serde(default)]
     pub sms_retry: SmsRetryConfig,
+    /// OTASP `*228`-style provisioning.
+    #[serde(default)]
+    pub otasp: OtaspConfig,
 }
 
 impl MscNodeConfig {
@@ -464,6 +592,31 @@ impl MscNodeConfig {
         if self.voice.page_retry_max_duration_ms == 0 {
             return Err("msc.voice.page_retry_max_duration_ms must be > 0".to_string());
         }
+        self.otasp.validate()?;
+        Ok(())
+    }
+}
+
+impl OtaspConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.spc_policy != "leave_default" {
+            return Err(format!(
+                "msc.otasp.spc_policy must be \"leave_default\" (got {:?})",
+                self.spc_policy
+            ));
+        }
+        if self.feature_codes.is_empty() {
+            return Err("msc.otasp.feature_codes must be non-empty".to_string());
+        }
+        if !self.system_tag.name.is_ascii() {
+            return Err("msc.otasp.system_tag.name must be ASCII".to_string());
+        }
+        if self.system_tag.name.len() > 31 {
+            return Err(format!(
+                "msc.otasp.system_tag.name too long: {} bytes (max 31)",
+                self.system_tag.name.len()
+            ));
+        }
         Ok(())
     }
 }
@@ -480,6 +633,7 @@ mod tests {
             voice: VoiceConfig::default(),
             welcome_sms: WelcomeSmsConfig::default(),
             sms_retry: SmsRetryConfig::default(),
+            otasp: OtaspConfig::default(),
         }
     }
 
@@ -557,6 +711,45 @@ mod tests {
         policy.gateway.fallback_to_wav = false;
         let decision = policy.evaluate_mo_origination(&mo_ctx(3, "5551234567", false, false));
         assert!(matches!(decision, MoRoutingDecision::Rejected { .. }));
+    }
+
+    #[test]
+    fn otasp_default_disabled_validates() {
+        let cfg = test_config();
+        assert!(!cfg.otasp.enabled);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn otasp_rejects_non_default_spc_policy() {
+        let mut cfg = test_config();
+        cfg.otasp.spc_policy = "rotate".to_string();
+        let err = cfg.validate().expect_err("expected spc_policy error");
+        assert!(err.contains("spc_policy"));
+    }
+
+    #[test]
+    fn otasp_rejects_empty_feature_codes() {
+        let mut cfg = test_config();
+        cfg.otasp.feature_codes.clear();
+        let err = cfg.validate().expect_err("expected feature_codes error");
+        assert!(err.contains("feature_codes"));
+    }
+
+    #[test]
+    fn otasp_rejects_non_ascii_system_tag_name() {
+        let mut cfg = test_config();
+        cfg.otasp.system_tag.name = "naïve".to_string();
+        let err = cfg.validate().expect_err("expected ASCII error");
+        assert!(err.contains("ASCII"));
+    }
+
+    #[test]
+    fn otasp_rejects_overlong_system_tag_name() {
+        let mut cfg = test_config();
+        cfg.otasp.system_tag.name = "X".repeat(32);
+        let err = cfg.validate().expect_err("expected length error");
+        assert!(err.contains("too long"));
     }
 
     #[test]

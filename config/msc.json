@@ -31,5 +31,27 @@
     "enabled": true,
     "retry_after_secs": 10,
     "sweep_interval_secs": 10
+  },
+  "otasp": {
+    "enabled": true,
+    "feature_codes": ["*228"],
+    "spc_policy": "leave_default",
+    "system_tag": {
+      "name": "1xBTS",
+      "tag_p_rev": 1
+    },
+    "nam_defaults": {
+      "mob_term_home": true,
+      "mob_term_for_sid": true,
+      "mob_term_for_nid": true
+    },
+    "writes": {
+      "cdma_analog_nam": false,
+      "mdn": false,
+      "cdma_nam": false,
+      "home_system_tag": false,
+      "mms_uri": false,
+      "prl": false
+    }
   }
 }

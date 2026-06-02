@@ -14,7 +14,8 @@ use std::time::Duration;
 use log::{debug, info, warn};
 
 use cdma_common::consts::{
-    SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_PACKET_DATA, SERVICE_OPTION_SMS,
+    SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_OTASP, SERVICE_OPTION_PACKET_DATA,
+    SERVICE_OPTION_SMS,
 };
 use cdma_hlr::model::{RegistrationBinding, SubscriberIdentity};
 use cdma_ios::{A1TransportError, EncodedA1Message, VoiceBearerFrame, VoiceBearerManager};
@@ -67,8 +68,14 @@ fn is_packet_data_service_option(so: u16) -> bool {
     )
 }
 
+fn is_otasp_service_option(so: u16) -> bool {
+    matches!(so, SERVICE_OPTION_OTASP)
+}
+
 fn is_non_voice_a1_service_option(so: u16) -> bool {
-    is_sms_traffic_service_option(so) || is_packet_data_service_option(so)
+    is_sms_traffic_service_option(so)
+        || is_packet_data_service_option(so)
+        || is_otasp_service_option(so)
 }
 
 impl PagePurpose {
@@ -161,6 +168,12 @@ pub struct MscRuntimeConfig {
     pub welcome_sms: Option<crate::config::WelcomeSmsConfig>,
     /// MT SMS retry sweep configuration.
     pub sms_retry: crate::config::SmsRetryConfig,
+    /// OTASP configuration. `None` disables OTASP entirely.
+    pub otasp: Option<crate::config::OtaspConfig>,
+    /// BTS overhead values required by OTASP NAM assembly. The launcher
+    /// (cdma-nib) fills this from the loaded BTS/BSC configs; standalone MSC
+    /// launchers must supply it before OTASP sessions can run.
+    pub bts_overhead: Option<crate::config::BtsOverheadConfig>,
 }
 
 impl MscRuntimeConfig {
@@ -198,6 +211,12 @@ impl MscRuntimeConfig {
             media_gateway,
             welcome_sms: Some(config.welcome_sms.clone()),
             sms_retry: config.sms_retry.clone(),
+            otasp: if config.otasp.enabled {
+                Some(config.otasp.clone())
+            } else {
+                None
+            },
+            bts_overhead: None,
         }
     }
 }
@@ -213,6 +232,36 @@ pub struct MscRuntime {
     pub(crate) mo_call: MoCallService,
     pub(crate) mt_page_retry: crate::mt_page_retry::MtPageRetryService,
     pub(crate) smsc: Option<crate::sms::MscSmsCoordinator>,
+    pub(crate) otasp: Option<crate::otasp::OtaspCoordinator>,
+    /// Shared history of recent OTASP sessions; cloned into the gRPC service so
+    /// `ListOtaspSessions` / `GetOtaspSession` can read it concurrently with
+    /// the runtime appending new records.
+    pub(crate) otasp_history: std::sync::Arc<crate::otasp::OtaspHistory>,
+    /// Broadcast channel for live `MscNetworkEvent`s — fans out to any number
+    /// of `StreamOtaspEvents` subscribers without blocking the producer.
+    pub(crate) otasp_event_tx:
+        tokio::sync::broadcast::Sender<crate::grpc::events_proto::v1::MscNetworkEvent>,
+    /// Origination contexts for calls recognized as OTASP at MO CL3 but whose
+    /// traffic channel has not yet come up. Key is the MSC call id; the value
+    /// is the data needed to start the OTASP session at AssignmentComplete.
+    /// Per C.S0016-D §3.2.1 the MS originates with a voice/data SO (not 18),
+    /// so we cannot tell from `service_option` alone that a call is OTASP —
+    /// the dialed-digits match recorded here is what gates voice suppression
+    /// and session start.
+    pub(crate) pending_otasp_originations:
+        std::collections::HashMap<CallId, PendingOtaspOrigination>,
+}
+
+/// Stashed at MO CL3 for an OTASP-recognized call until the traffic channel
+/// comes up at `AssignmentComplete`.
+pub(crate) struct PendingOtaspOrigination {
+    pub device: crate::otasp::HardwareIdentity,
+    pub feature_code: String,
+    pub mobile_identity_imsi: cdma_ios::MobileIdentity,
+    /// Actual Service Option from the Origination Message (typically 3 for
+    /// voice). Per C.S0016-D §3.2.1, user-initiated OTASP rides a vendor-
+    /// chosen voice/data SO, NOT SO 18.
+    pub service_option: u16,
 }
 
 impl MscRuntime {
@@ -221,6 +270,27 @@ impl MscRuntime {
         let smsc = config.smsc_repo.as_ref().map(|smsc_repo| {
             crate::sms::MscSmsCoordinator::new(Arc::clone(smsc_repo), Arc::clone(&config.hlr_repo))
         });
+        let otasp_history = crate::otasp::OtaspHistory::new();
+        let (otasp_event_tx, _) =
+            tokio::sync::broadcast::channel::<crate::grpc::events_proto::v1::MscNetworkEvent>(256);
+        let otasp = match (config.otasp.as_ref(), config.bts_overhead.as_ref()) {
+            (Some(otasp_cfg), Some(bts_overhead)) => {
+                Some(crate::otasp::OtaspCoordinator::with_history(
+                    otasp_cfg.clone(),
+                    bts_overhead.clone(),
+                    Arc::clone(&config.hlr_repo),
+                    Arc::clone(&otasp_history),
+                    Some(otasp_event_tx.clone()),
+                ))
+            }
+            (Some(_), None) => {
+                log::warn!(
+                    "MSC: OTASP enabled in config but bts_overhead not supplied by launcher — OTASP disabled"
+                );
+                None
+            }
+            _ => None,
+        };
         let mt_page_retry = crate::mt_page_retry::MtPageRetryService::new(
             config.page_retry_cooldown_ms,
             config.page_retry_max_duration_ms,
@@ -235,7 +305,25 @@ impl MscRuntime {
             mo_call: MoCallService::new(),
             mt_page_retry,
             smsc,
+            otasp,
+            otasp_history,
+            otasp_event_tx,
+            pending_otasp_originations: std::collections::HashMap::new(),
         }
+    }
+
+    /// Shared snapshot of the OTASP session ring buffer; safe to clone into a
+    /// long-lived gRPC service.
+    pub fn otasp_history(&self) -> std::sync::Arc<crate::otasp::OtaspHistory> {
+        std::sync::Arc::clone(&self.otasp_history)
+    }
+
+    /// Live broadcast channel for OTASP `MscNetworkEvent`s; clone the sender
+    /// to subscribe new receivers.
+    pub fn otasp_event_tx(
+        &self,
+    ) -> tokio::sync::broadcast::Sender<crate::grpc::events_proto::v1::MscNetworkEvent> {
+        self.otasp_event_tx.clone()
     }
 
     /// Returns a reference to the call controller for management queries.
@@ -257,6 +345,8 @@ impl MscRuntime {
         sms_retry_interval.tick().await; // consume the immediate first tick
         let sms_retry_after = Duration::from_secs(self.config.sms_retry.retry_after_secs);
         let sms_retry_enabled = self.config.sms_retry.enabled;
+        let mut otasp_timeout_interval = tokio::time::interval(Duration::from_secs(1));
+        otasp_timeout_interval.tick().await;
 
         // Restart recovery: the in-flight ADDS Page correlation lives only
         // in MscSmsCoordinator::pending (in-memory). Anything left in DB
@@ -389,7 +479,35 @@ impl MscRuntime {
                         smsc.retry_eligible_sweep(a1, sms_retry_after).await;
                     }
                 }
+                _ = otasp_timeout_interval.tick() => {
+                    self.tick_otasp_timeouts(a1).await;
+                }
             }
+        }
+    }
+
+    /// Force-release OTASP sessions whose MS has gone silent past the
+    /// configured threshold. Sends an A1 ClearCommand for each so the BSC
+    /// tears down the traffic channel cleanly.
+    async fn tick_otasp_timeouts(&mut self, a1: &dyn MscA1Endpoint) {
+        let Some(otasp) = self.otasp.as_mut() else {
+            return;
+        };
+        let released = otasp
+            .tick_timeouts(
+                std::time::Instant::now(),
+                crate::otasp::coordinator::DEFAULT_INBOUND_TIMEOUT,
+            )
+            .await;
+        for call_id_raw in released {
+            let call_id = CallId(call_id_raw);
+            send_gateway_clear_command(
+                a1,
+                call_id,
+                &mut self.controller,
+                gateway_clear_cause(ReleaseCause::SetupFailed, None),
+            )
+            .await;
         }
     }
 
@@ -399,7 +517,8 @@ impl MscRuntime {
     /// and feeds them into the runtime's event loop via an internal channel.
     pub async fn run_with_grpc(&mut self, mgmt_addr: std::net::SocketAddr, a1: &dyn MscA1Endpoint) {
         let (mgmt_tx, mgmt_rx) = tokio::sync::mpsc::channel::<PendingControlRequest>(16);
-        let service = crate::grpc::MscManagementServiceImpl::from_channel(mgmt_tx);
+        let service = crate::grpc::MscManagementServiceImpl::from_channel(mgmt_tx)
+            .with_otasp(self.otasp_event_tx());
         let server = tonic::transport::Server::builder()
             .add_service(
                 crate::grpc::msc_management::v1::msc_management_service_server::MscManagementServiceServer::new(service),
@@ -832,6 +951,25 @@ impl MscRuntime {
                     }
                 }
                 self.circuits.reset_assignment_failure_retries(call_id);
+                if let Some(pending) = self.pending_otasp_originations.remove(&call_id)
+                    && let Some(otasp) = self.otasp.as_mut()
+                {
+                    info!(
+                        "MSC: AssignmentComplete call_id={} — starting OTASP session",
+                        call_id.0
+                    );
+                    otasp
+                        .begin_session(
+                            pending.device,
+                            pending.feature_code,
+                            pending.service_option,
+                            pending.mobile_identity_imsi,
+                            call_id.0,
+                            a1,
+                        )
+                        .await;
+                    return;
+                }
                 if completed_circuit_id
                     .and_then(|cid| self.circuits.circuits.get(&cid))
                     .is_some_and(|session| is_non_voice_a1_service_option(session.service_option))
@@ -1072,6 +1210,34 @@ impl MscRuntime {
                 let called_number = cm_service_request
                     .as_ref()
                     .and_then(cm_service_request_called_number);
+
+                if let Some(otasp) = self.otasp.as_ref()
+                    && let Some(dialed) = called_number.as_deref()
+                    && otasp.is_otasp_origination(dialed)
+                {
+                    let feature_code = otasp
+                        .matched_feature_code(dialed)
+                        .unwrap_or_else(|| dialed.to_string());
+                    let (esn, meid) = extract_hardware_identity(cm_service_request.as_ref());
+                    let device = crate::otasp::HardwareIdentity { esn, meid };
+                    let imsi_id = cm_service_request
+                        .as_ref()
+                        .map(|req| req.mobile_identity_imsi.clone())
+                        .unwrap_or_else(|| cdma_ios::MobileIdentity::Imsi("UNKNOWN".to_string()));
+                    self.pending_otasp_originations.insert(
+                        call_id,
+                        PendingOtaspOrigination {
+                            device,
+                            feature_code,
+                            mobile_identity_imsi: imsi_id,
+                            service_option,
+                        },
+                    );
+                    info!(
+                        "MSC: OTASP origination recognized call_id={} dialed={} so={} — deferring session start until AssignmentComplete",
+                        call_id.0, dialed, service_option
+                    );
+                }
                 let originator = self
                     .mo_call
                     .resolve_mo_originator(
@@ -1232,11 +1398,12 @@ impl MscRuntime {
                 }
                 let routes_to_subscriber = subscriber_route == MoSubscriberRoute::Paged;
 
+                let is_otasp_call = self.pending_otasp_originations.contains_key(&call_id);
                 let mut audio_file = None;
                 // SIP INVITE is deferred until AssignmentComplete so failure
                 // tones have a bearer; handle attaches there.
                 let media_gateway_handle: Option<crate::media_gateway::CallHandle> = None;
-                if !routes_to_subscriber {
+                if !routes_to_subscriber && !is_otasp_call {
                     if let (Some(_gateway), Some(called_number)) =
                         (self.config.media_gateway.as_ref(), called_number.as_deref())
                     {
@@ -1987,8 +2154,45 @@ impl MscRuntime {
         );
     }
 
-    /// Routes an inbound ADDS message from the BSC to the SMS coordinator.
+    /// Routes an inbound ADDS message from the BSC to the SMS or OTASP coordinator.
     async fn handle_adds_message(&mut self, a1: &dyn MscA1Endpoint, message: EncodedA1Message) {
+        let decoded = match message.decode() {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("MSC: failed to decode ADDS message: {e}");
+                return;
+            }
+        };
+        // OTASP burst_type=4 routes to the OTASP coordinator regardless of SMS
+        // configuration. Other burst types require the SMS coordinator.
+        if let cdma_ios::MessageType::AddsTransfer = decoded.message_type {
+            if let Ok(msg) = cdma_ios::AddsTransferMessage::decode(&decoded.payload) {
+                if msg.adds_user_part.burst_type == 0x04 {
+                    let release_call_id = match self.otasp.as_mut() {
+                        Some(otasp) => otasp.handle_adds_transfer(&msg, a1).await,
+                        None => {
+                            warn!("MSC: OTASP ADDS Transfer received but coordinator disabled");
+                            None
+                        }
+                    };
+                    if let Some(call_id_raw) = release_call_id {
+                        let call_id = CallId(call_id_raw);
+                        info!(
+                            "MSC: OTASP session terminal — releasing call_id={}",
+                            call_id_raw
+                        );
+                        send_gateway_clear_command(
+                            a1,
+                            call_id,
+                            &mut self.controller,
+                            gateway_clear_cause(ReleaseCause::Administrative, None),
+                        )
+                        .await;
+                    }
+                    return;
+                }
+            }
+        }
         let smsc = match self.smsc.as_mut() {
             Some(s) => s,
             None => {
@@ -1996,13 +2200,6 @@ impl MscRuntime {
                     "MSC: received ADDS {:?} but SMSC coordinator is not configured — dropped",
                     message.message_type()
                 );
-                return;
-            }
-        };
-        let decoded = match message.decode() {
-            Ok(d) => d,
-            Err(e) => {
-                warn!("MSC: failed to decode ADDS message: {e}");
                 return;
             }
         };
@@ -2015,7 +2212,21 @@ impl MscRuntime {
             }
             cdma_ios::MessageType::AddsDeliverAck => {
                 match cdma_ios::AddsDeliverAckMessage::decode(&decoded.payload) {
-                    Ok(msg) => smsc.handle_adds_deliver_ack(&msg).await,
+                    Ok(msg) => {
+                        // Route to OTASP if it owns the tag; else hand
+                        // to SMSC. Tags are namespaced (high bit set =
+                        // OTASP) so the dispatch is O(1).
+                        let routed_to_otasp = match (msg.tag, self.otasp.as_mut()) {
+                            (Some(t), Some(otasp)) if otasp.owns_ack_tag(t.0) => {
+                                otasp.handle_adds_deliver_ack(&msg, a1).await;
+                                true
+                            }
+                            _ => false,
+                        };
+                        if !routed_to_otasp {
+                            smsc.handle_adds_deliver_ack(&msg).await;
+                        }
+                    }
                     Err(e) => warn!("MSC: failed to decode ADDS Deliver Ack: {e}"),
                 }
             }
@@ -2200,6 +2411,21 @@ pub(crate) fn assignment_circuit_identity_code_with_offset(
         pcm_multiplexer: (packed >> 5) & 0x07ff,
         timeslot: (packed & 0x1f) as u8,
     }
+}
+
+fn extract_hardware_identity(
+    request: Option<&cdma_ios::CmServiceRequestMessage>,
+) -> (Option<u32>, Option<String>) {
+    let Some(req) = request else {
+        return (None, None);
+    };
+    let esn = match req.mobile_identity_esn.as_ref() {
+        Some(cdma_ios::MobileIdentity::Esn(e)) => Some(*e),
+        _ => None,
+    };
+    // CmServiceRequest does not currently carry a MEID IE; if a future MEID
+    // form arrives here it'll appear via the IMSI slot encoded as such.
+    (esn, None)
 }
 
 fn decode_cm_service_request(
@@ -2574,6 +2800,13 @@ mod tests {
         ) -> Result<Option<cdma_hlr::model::ResolvedSubscriber>, String> {
             Ok(None)
         }
+        async fn resolve_by_hardware_identity(
+            &self,
+            _: Option<u32>,
+            _: Option<&str>,
+        ) -> Result<Option<cdma_hlr::model::ResolvedSubscriber>, String> {
+            Ok(None)
+        }
         async fn upsert_registration_binding(
             &self,
             _: cdma_hlr::model::RegistrationBinding,
@@ -2617,6 +2850,79 @@ mod tests {
         ) -> Result<Option<cdma_hlr::model::SubscriberRingtoneCodecBlob>, String> {
             Ok(None)
         }
+        async fn list_prls(
+            &self,
+            _: u32,
+            _: u32,
+            _: cdma_hlr::model::PrlListFilter,
+        ) -> Result<(Vec<cdma_hlr::model::Prl>, u32), String> {
+            Ok((vec![], 0))
+        }
+        async fn get_prl(&self, _: uuid::Uuid) -> Result<Option<cdma_hlr::model::Prl>, String> {
+            Ok(None)
+        }
+        async fn get_default_prl(&self) -> Result<Option<cdma_hlr::model::Prl>, String> {
+            Ok(None)
+        }
+        async fn create_prl(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: i32,
+            _: i16,
+            _: &str,
+        ) -> Result<cdma_hlr::model::Prl, String> {
+            unimplemented!()
+        }
+        async fn update_prl(
+            &self,
+            _: uuid::Uuid,
+            _: Option<&str>,
+            _: Option<&[u8]>,
+            _: Option<(i32, i16)>,
+            _: Option<&str>,
+        ) -> Result<cdma_hlr::model::Prl, String> {
+            unimplemented!()
+        }
+        async fn soft_delete_prl(
+            &self,
+            _: uuid::Uuid,
+        ) -> Result<Result<(), cdma_hlr::model::PrlDeleteBlocked>, String> {
+            Ok(Ok(()))
+        }
+        async fn set_default_prl(&self, _: uuid::Uuid) -> Result<(), String> {
+            Ok(())
+        }
+        async fn set_subscriber_prl_override(
+            &self,
+            _: uuid::Uuid,
+            _: Option<uuid::Uuid>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn set_subscriber_spc(&self, _: uuid::Uuid, _: Option<String>) -> Result<(), String> {
+            Ok(())
+        }
+        async fn save_otasp_session(
+            &self,
+            _: &cdma_hlr::model::OtaspSessionRow,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn list_otasp_sessions(
+            &self,
+            _: cdma_hlr::model::OtaspSessionFilter,
+            _: u32,
+            _: u32,
+        ) -> Result<(Vec<cdma_hlr::model::OtaspSessionRow>, u32), String> {
+            Ok((Vec::new(), 0))
+        }
+        async fn get_otasp_session(
+            &self,
+            _: uuid::Uuid,
+        ) -> Result<Option<cdma_hlr::model::OtaspSessionRow>, String> {
+            Ok(None)
+        }
     }
 
     #[async_trait::async_trait]
@@ -2647,6 +2953,8 @@ mod tests {
                     number_plan: cdma_hlr::model::NumberPlan::IsdnE164,
                     has_ringtone: false,
                     ringtone_duration_ms: None,
+                    prl_override_id: None,
+                    service_programming_code: None,
                 };
                 let primary = cdma_hlr::model::SubscriberIdentity {
                     subscriber_identity_id: uuid::Uuid::nil(),
@@ -2748,6 +3056,13 @@ mod tests {
         ) -> Result<Option<cdma_hlr::model::ResolvedSubscriber>, String> {
             Ok(None)
         }
+        async fn resolve_by_hardware_identity(
+            &self,
+            _: Option<u32>,
+            _: Option<&str>,
+        ) -> Result<Option<cdma_hlr::model::ResolvedSubscriber>, String> {
+            Ok(None)
+        }
         async fn upsert_registration_binding(
             &self,
             _: cdma_hlr::model::RegistrationBinding,
@@ -2804,6 +3119,79 @@ mod tests {
             _: uuid::Uuid,
             _: &str,
         ) -> Result<Option<cdma_hlr::model::SubscriberRingtoneCodecBlob>, String> {
+            Ok(None)
+        }
+        async fn list_prls(
+            &self,
+            _: u32,
+            _: u32,
+            _: cdma_hlr::model::PrlListFilter,
+        ) -> Result<(Vec<cdma_hlr::model::Prl>, u32), String> {
+            Ok((vec![], 0))
+        }
+        async fn get_prl(&self, _: uuid::Uuid) -> Result<Option<cdma_hlr::model::Prl>, String> {
+            Ok(None)
+        }
+        async fn get_default_prl(&self) -> Result<Option<cdma_hlr::model::Prl>, String> {
+            Ok(None)
+        }
+        async fn create_prl(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: i32,
+            _: i16,
+            _: &str,
+        ) -> Result<cdma_hlr::model::Prl, String> {
+            unimplemented!()
+        }
+        async fn update_prl(
+            &self,
+            _: uuid::Uuid,
+            _: Option<&str>,
+            _: Option<&[u8]>,
+            _: Option<(i32, i16)>,
+            _: Option<&str>,
+        ) -> Result<cdma_hlr::model::Prl, String> {
+            unimplemented!()
+        }
+        async fn soft_delete_prl(
+            &self,
+            _: uuid::Uuid,
+        ) -> Result<Result<(), cdma_hlr::model::PrlDeleteBlocked>, String> {
+            Ok(Ok(()))
+        }
+        async fn set_default_prl(&self, _: uuid::Uuid) -> Result<(), String> {
+            Ok(())
+        }
+        async fn set_subscriber_prl_override(
+            &self,
+            _: uuid::Uuid,
+            _: Option<uuid::Uuid>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn set_subscriber_spc(&self, _: uuid::Uuid, _: Option<String>) -> Result<(), String> {
+            Ok(())
+        }
+        async fn save_otasp_session(
+            &self,
+            _: &cdma_hlr::model::OtaspSessionRow,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn list_otasp_sessions(
+            &self,
+            _: cdma_hlr::model::OtaspSessionFilter,
+            _: u32,
+            _: u32,
+        ) -> Result<(Vec<cdma_hlr::model::OtaspSessionRow>, u32), String> {
+            Ok((Vec::new(), 0))
+        }
+        async fn get_otasp_session(
+            &self,
+            _: uuid::Uuid,
+        ) -> Result<Option<cdma_hlr::model::OtaspSessionRow>, String> {
             Ok(None)
         }
     }
@@ -3001,6 +3389,8 @@ mod tests {
             failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: None,
+            otasp: None,
+            bts_overhead: None,
         });
 
         let call_id = runtime.controller.create_call(
@@ -3127,6 +3517,8 @@ mod tests {
             failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: None,
+            otasp: None,
+            bts_overhead: None,
         });
         let call_id = 99;
         let call_id_typed = runtime.controller.create_call_with_id(
@@ -3276,6 +3668,8 @@ mod tests {
             failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: None,
+            otasp: None,
+            bts_overhead: None,
         });
         let call_id_typed = runtime.controller.create_call_with_id(
             CallId(call_id),
@@ -3452,6 +3846,8 @@ mod tests {
             failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: None,
+            otasp: None,
+            bts_overhead: None,
         });
         let call_id_typed = runtime.controller.create_call_with_id(
             CallId(call_id),
@@ -3679,6 +4075,8 @@ mod tests {
             failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: None,
+            otasp: None,
+            bts_overhead: None,
         });
 
         // BCD encoding of "5559876543" with TON/NPI 0x81.
@@ -3802,6 +4200,8 @@ mod tests {
             failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: None,
+            otasp: None,
+            bts_overhead: None,
         });
 
         let cli3 = cm_service_request_cli3(Some(vec![0x81, 0x55, 0x95, 0x78, 0x56, 0x34]));
@@ -3867,6 +4267,8 @@ mod tests {
             failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: Some(Arc::new(FailingMediaGateway)),
+            otasp: None,
+            bts_overhead: None,
         });
         let cli3 = cm_service_request_cli3(Some(vec![0x81, 0x00, 0x00, 0x00, 0x00, 0x00]));
         let call_id = 123;
@@ -3940,6 +4342,8 @@ mod tests {
             failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: Some(Arc::new(StubMediaGateway::default())),
+            otasp: None,
+            bts_overhead: None,
         });
 
         let cli3 = cm_service_request_cli3(Some(vec![0x81, 0x00, 0x00, 0x00, 0x00, 0x00]));
@@ -4016,6 +4420,8 @@ mod tests {
             failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: Some(gateway.clone()),
+            otasp: None,
+            bts_overhead: None,
         });
         let call_id = runtime
             .controller
@@ -4080,6 +4486,8 @@ mod tests {
             failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: None,
+            otasp: None,
+            bts_overhead: None,
         });
         let call_id = CallId(42);
 
@@ -4128,6 +4536,8 @@ mod tests {
             failure_tone_duration_ms: 0,
             voice_bearer: None,
             media_gateway: Some(gateway.clone() as Arc<dyn MediaGatewayClient>),
+            otasp: None,
+            bts_overhead: None,
         });
 
         runtime

@@ -12,6 +12,7 @@ const links = [
   { href: "/channels", label: "Channels" },
   { href: "/mobiles", label: "Mobiles" },
   { href: "/subscribers", label: "Subscribers" },
+  { href: "/prls", label: "PRLs" },
   { href: "/smsc", label: "SMSC" },
   { href: "/packets", label: "Packets" },
   { href: "/config", label: "Config" },

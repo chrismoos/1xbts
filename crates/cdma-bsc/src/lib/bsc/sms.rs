@@ -420,6 +420,10 @@ impl Bsc {
                 data: raw_fields.to_vec(),
             },
             mobile_identity_esn: esn.map(cdma_ios::MobileIdentity::Esn),
+            mobile_identity_meid: None,
+            cell_identifier: None,
+            tag: None,
+            service_option: None,
         };
         let client = self.a1.msc_client.clone();
         tokio::spawn(async move {
@@ -434,6 +438,107 @@ impl Bsc {
                     }
                 }
                 Err(e) => log::warn!("BSC: failed to encode ADDS Transfer: {e}"),
+            }
+        });
+    }
+
+    pub(crate) fn forward_traffic_otasp_to_msc(&self, walsh_code: u8, raw_fields: &[u8]) {
+        let call_id = self
+            .mobiles
+            .get_traffic_channel(walsh_code)
+            .and_then(|tc| tc.a1_call_id);
+        let mobile = self.mobiles.get_by_walsh(walsh_code);
+        let imsi = mobile.and_then(|ms| ms.imsi.as_ref()).cloned();
+        let esn = mobile.and_then(|ms| ms.esn);
+        let mobile_identity_imsi = imsi
+            .map(cdma_ios::MobileIdentity::Imsi)
+            .unwrap_or_else(|| cdma_ios::MobileIdentity::Imsi("0".repeat(15)));
+        let transfer = cdma_ios::AddsTransferMessage {
+            mobile_identity_imsi,
+            adds_user_part: cdma_ios::AddsUserPart {
+                burst_type: cdma_common::consts::BURST_TYPE_OTASP,
+                data: raw_fields.to_vec(),
+            },
+            mobile_identity_esn: esn.map(cdma_ios::MobileIdentity::Esn),
+            mobile_identity_meid: None,
+            cell_identifier: None,
+            tag: None,
+            service_option: None,
+        };
+        let client = self.a1.msc_client.clone();
+        tokio::spawn(async move {
+            match transfer.encode() {
+                Ok(payload) => {
+                    let msg = cdma_ios::EncodedA1Message::from_message_for_call(
+                        &cdma_ios::Message::new(cdma_ios::MessageType::AddsTransfer, payload),
+                        call_id,
+                    );
+                    if let Err(e) = client.send_a1(msg).await {
+                        log::warn!(
+                            "BSC: failed to send traffic-channel OTASP ADDS Transfer to MSC: {e}"
+                        );
+                    }
+                }
+                Err(e) => {
+                    log::warn!("BSC: failed to encode traffic-channel OTASP ADDS Transfer: {e}")
+                }
+            }
+        });
+    }
+
+    pub(crate) fn forward_access_otasp_to_msc(&self, fwd_address: &MsAddress, raw_fields: &[u8]) {
+        // C.S0016-D §3.1: default IMSI for an unprogrammed NAM is 15 BCD
+        // digits with the last 4 = ESN mod 10000, other digits zero.
+        const DEFAULT_IMSI_DIGITS: usize = 15;
+        const DEFAULT_IMSI_ESN_DIGITS: usize = 4;
+        const DEFAULT_IMSI_ESN_MODULO: u32 = 10_000;
+        fn default_imsi_for_esn(esn: u32) -> String {
+            let prefix_zeros = DEFAULT_IMSI_DIGITS - DEFAULT_IMSI_ESN_DIGITS;
+            let mut s = "0".repeat(prefix_zeros);
+            s.push_str(&format!(
+                "{:0width$}",
+                esn % DEFAULT_IMSI_ESN_MODULO,
+                width = DEFAULT_IMSI_ESN_DIGITS
+            ));
+            s
+        }
+        let mobile = self
+            .mobiles
+            .iter()
+            .find(|ms| ms.fwd_address == *fwd_address);
+        let imsi = mobile.and_then(|ms| ms.imsi.as_ref()).cloned();
+        let esn = mobile.and_then(|ms| ms.esn);
+        let mobile_identity_imsi = imsi.map(cdma_ios::MobileIdentity::Imsi).unwrap_or_else(|| {
+            let synthetic = esn
+                .map(default_imsi_for_esn)
+                .unwrap_or_else(|| "0".repeat(DEFAULT_IMSI_DIGITS));
+            cdma_ios::MobileIdentity::Imsi(synthetic)
+        });
+        let transfer = cdma_ios::AddsTransferMessage {
+            mobile_identity_imsi,
+            adds_user_part: cdma_ios::AddsUserPart {
+                burst_type: cdma_common::consts::BURST_TYPE_OTASP,
+                data: raw_fields.to_vec(),
+            },
+            mobile_identity_esn: esn.map(cdma_ios::MobileIdentity::Esn),
+            mobile_identity_meid: None,
+            cell_identifier: None,
+            tag: None,
+            service_option: None,
+        };
+        let client = self.a1.msc_client.clone();
+        tokio::spawn(async move {
+            match transfer.encode() {
+                Ok(payload) => {
+                    let msg = cdma_ios::EncodedA1Message::from_message(&cdma_ios::Message::new(
+                        cdma_ios::MessageType::AddsTransfer,
+                        payload,
+                    ));
+                    if let Err(e) = client.send_a1(msg).await {
+                        log::warn!("BSC: failed to send OTASP ADDS Transfer to MSC: {e}");
+                    }
+                }
+                Err(e) => log::warn!("BSC: failed to encode OTASP ADDS Transfer: {e}"),
             }
         });
     }
@@ -699,6 +804,12 @@ impl Bsc {
 
         // BS Ack is sent by the generic ack_req handler in handle_traffic_event.
         let ack_seq = event.msg_seq.unwrap_or(0);
+
+        if burst_type == 4 {
+            // C.S0016 OTASP — wrap as A1 ADDS Transfer to the MSC.
+            self.forward_traffic_otasp_to_msc(walsh_code, fields);
+            return;
+        }
 
         if burst_type != 3 {
             info!(

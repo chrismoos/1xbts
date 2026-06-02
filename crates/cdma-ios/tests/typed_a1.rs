@@ -4,6 +4,7 @@ use cdma_ios::{
     AddsDeliverMessage,
     AddsPageAckMessage,
     AddsPageMessage,
+    AddsTransferAckMessage,
     AddsTransferMessage,
     AddsUserPart,
     AlertWithInformationMessage,
@@ -1505,12 +1506,135 @@ fn adds_transfer_roundtrip_with_esn() {
         mobile_identity_imsi: MobileIdentity::Imsi("31026200000001".to_string()),
         adds_user_part: sms_user_part(),
         mobile_identity_esn: Some(MobileIdentity::Esn(0x12345678)),
+        mobile_identity_meid: None,
+        cell_identifier: None,
+        tag: None,
+        service_option: None,
     };
     let encoded = msg.encode().unwrap();
     assert_eq!(encoded[0], 0x00);
     assert_eq!(encoded[2], 0x67);
     let decoded = AddsTransferMessage::decode(&encoded).unwrap();
     assert_eq!(decoded, msg);
+}
+
+fn otasp_user_part() -> AddsUserPart {
+    AddsUserPart {
+        burst_type: 0x04, // OTASP — C.S0016-D §2.3 BURST_TYPE
+        data: vec![0xAA, 0xBB, 0xCC, 0xDD],
+    }
+}
+
+#[test]
+fn adds_user_part_burst_types_roundtrip() {
+    for bt in [0x03u8, 0x04, 0x05, 0x06] {
+        let up = AddsUserPart {
+            burst_type: bt,
+            data: vec![0x11, 0x22, 0x33],
+        };
+        let body = up.encode_body_public();
+        let decoded = AddsUserPart::decode_body_public(&body).unwrap();
+        assert_eq!(decoded, up);
+        // Reserved high two bits must be zero on the wire.
+        assert_eq!(body[0] & 0xC0, 0);
+        assert_eq!(body[0] & 0x3F, bt);
+    }
+}
+
+#[test]
+fn adds_transfer_otasp_roundtrip_full() {
+    let msg = AddsTransferMessage {
+        mobile_identity_imsi: MobileIdentity::Imsi("310262000000001".to_string()),
+        adds_user_part: otasp_user_part(),
+        mobile_identity_esn: Some(MobileIdentity::Esn(0x12345678)),
+        mobile_identity_meid: Some(MobileIdentity::Meid([
+            0xA0, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78,
+        ])),
+        cell_identifier: Some(CellId {
+            cell: 0x123,
+            sector: 0,
+        }),
+        tag: Some(Tag(0xCAFEBABE)),
+        service_option: Some(ServiceOption(18)),
+    };
+    let encoded = msg.encode().unwrap();
+    assert_eq!(encoded[0], 0x00); // BSMAP disc
+    assert_eq!(encoded[2], 0x67); // ADDS Transfer
+    let decoded = AddsTransferMessage::decode(&encoded).unwrap();
+    assert_eq!(decoded, msg);
+}
+
+#[test]
+fn adds_transfer_ack_roundtrip_success() {
+    let msg = AddsTransferAckMessage {
+        mobile_identity_imsi: MobileIdentity::Imsi("310262000000001".to_string()),
+        tag: Some(Tag(0xCAFEBABE)),
+        cause: None,
+    };
+    let encoded = msg.encode().unwrap();
+    assert_eq!(encoded[0], 0x00);
+    assert_eq!(encoded[2], 0x68);
+    let decoded = AddsTransferAckMessage::decode(&encoded).unwrap();
+    assert_eq!(decoded, msg);
+}
+
+#[test]
+fn adds_transfer_ack_roundtrip_failure() {
+    let msg = AddsTransferAckMessage {
+        mobile_identity_imsi: MobileIdentity::Imsi("310262000000001".to_string()),
+        tag: Some(Tag(0x00000001)),
+        cause: Some(Cause(0x1A)), // Authentication failure
+    };
+    let encoded = msg.encode().unwrap();
+    let decoded = AddsTransferAckMessage::decode(&encoded).unwrap();
+    assert_eq!(decoded, msg);
+}
+
+#[test]
+fn adds_deliver_otasp_roundtrip_bit_exact() {
+    // A.S0014-D §3.6.5 bitmap:
+    //   octet 1: DTAP disc = 0x01
+    //   octet 2: DLCI = 0x00
+    //   octet 3: LI = remaining length
+    //   octet 1 (body): protocol disc = 0x03 (low nibble) | 0x00 (reserved)
+    //   octet 2 (body): reserved octet = 0x00
+    //   octet 3 (body): message type = 0x53
+    //   octet 4 (body): ADDS UP length
+    //   octet 5 (body): [reserved 00 | burst_type 000100] = 0x04
+    //   octet 6..: application data
+    let data = vec![0xAA, 0xBB, 0xCC];
+    let msg = AddsDeliverMessage {
+        adds_user_part: AddsUserPart {
+            burst_type: 0x04,
+            data: data.clone(),
+        },
+        tag: None,
+    };
+    let encoded = msg.encode().unwrap();
+    let body_len = 3 + 1 + 1 + data.len(); // pd+reserved+msgtype + len-of-userpart + userpart
+    let expected: Vec<u8> = {
+        let mut v = vec![0x01, 0x00, body_len as u8, 0x03, 0x00, 0x53];
+        v.push((1 + data.len()) as u8);
+        v.push(0x04);
+        v.extend_from_slice(&data);
+        v
+    };
+    assert_eq!(encoded, expected);
+    let decoded = AddsDeliverMessage::decode(&encoded).unwrap();
+    assert_eq!(decoded, msg);
+}
+
+#[test]
+fn mobile_identity_meid_roundtrip() {
+    let meid = MobileIdentity::Meid([0xA1, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78]);
+    let bytes = meid.encode().unwrap();
+    assert_eq!(bytes.len(), 8);
+    // First octet low nibble carries Type=001 (MEID), bit 3 (odd/even) is 0.
+    assert_eq!(bytes[0] & 0x0F, 0x01);
+    // Last octet high nibble is the Fill=F sentinel.
+    assert_eq!(bytes[7] & 0xF0, 0xF0);
+    let decoded = MobileIdentity::decode(&bytes).unwrap();
+    assert_eq!(decoded, meid);
 }
 
 #[test]

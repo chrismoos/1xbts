@@ -29,6 +29,83 @@ pub struct Subscriber {
     pub has_ringtone: bool,
     /// Duration of the stored ringtone in milliseconds (if any).
     pub ringtone_duration_ms: Option<u64>,
+    /// Optional per-subscriber PRL override. When set, OTASP `*228`
+    /// pushes this PRL instead of the system default.
+    pub prl_override_id: Option<Uuid>,
+    /// Custom 6-digit Service Programming Code for this subscriber's
+    /// device. `None` means the device uses the IS-95 default "000000"
+    /// and OTASP Verify SPC will use that.
+    pub service_programming_code: Option<String>,
+}
+
+/// A row from the `prls` table — the canonical artifact + cached
+/// columns used for list filtering. The decoded tree is recomputed on
+/// demand via `cdma_otasp::param::prl::decode` / `prl_ext::decode`.
+#[derive(Debug, Clone)]
+pub struct Prl {
+    pub prl_id: Uuid,
+    pub name: String,
+    pub pr_list_id: i32,
+    pub sspr_p_rev: i16,
+    pub is_default: bool,
+    pub raw_bytes: Vec<u8>,
+    pub notes: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Reasons a soft-delete might be refused, surfaced via gRPC
+/// `FAILED_PRECONDITION` with structured details.
+#[derive(Debug, Clone)]
+pub enum PrlDeleteBlocked {
+    /// At least one subscriber references this PRL as their override.
+    /// Sample IDs are returned for the operator UI to display.
+    Referenced { count: u32, sample: Vec<Uuid> },
+}
+
+/// Reasons a CreatePrl / UpdatePrl byte payload was rejected.
+#[derive(Debug, Clone)]
+pub enum PrlValidationFailure {
+    DecodeFailed(String),
+    CrcMismatch { ms_crc: u16, computed_crc: u16 },
+    UnsupportedRev(u8),
+    EncodeFailed(String),
+}
+
+/// Filter passed to `list_prls`.
+#[derive(Debug, Clone, Default)]
+pub struct PrlListFilter {
+    pub pr_list_id: Option<u32>,
+    pub sspr_p_rev: Option<u32>,
+}
+
+/// One row of the `otasp_sessions` table. Cached columns let list
+/// queries run without unpacking `events_proto`; the blob carries the
+/// prost-encoded `events.v1.OtaspRecordedEvents` for the timeline.
+#[derive(Debug, Clone)]
+pub struct OtaspSessionRow {
+    pub session_id: Uuid,
+    pub subscriber_id: Option<Uuid>,
+    pub esn: Option<u32>,
+    pub meid: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    /// `events.v1.OtaspSessionOutcome` discriminant.
+    pub outcome: i16,
+    pub feature_code: Option<String>,
+    pub service_option: Option<i32>,
+    pub completed_blocks: i32,
+    pub event_count: i32,
+    pub events_proto: Vec<u8>,
+}
+
+/// Filter passed to `list_otasp_sessions`. Empty filter returns every
+/// session newest-first.
+#[derive(Debug, Clone, Default)]
+pub struct OtaspSessionFilter {
+    pub subscriber_id: Option<Uuid>,
+    pub esn: Option<u32>,
+    pub meid: Option<String>,
 }
 
 /// AWIM Calling Party Number Type per C.S0005-E 3.7.5.3 / ANSI T1.607.

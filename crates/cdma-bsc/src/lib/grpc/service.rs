@@ -1276,6 +1276,22 @@ fn to_proto_config(
             lp_sec: overhead.lp_sec as u32,
             ltm_off: overhead.ltm_off as i32,
             daylt: overhead.daylt as u32,
+            mcc_digits: {
+                let esp = &cfg
+                    .downlink
+                    .paging
+                    .message_defaults
+                    .extended_system_parameters;
+                cdma_common::paging::mcc_to_digits(esp.mcc).unwrap_or_default()
+            },
+            imsi_11_12_digits: {
+                let esp = &cfg
+                    .downlink
+                    .paging
+                    .message_defaults
+                    .extended_system_parameters;
+                cdma_common::paging::imsi_11_12_to_digits(esp.imsi_11_12).unwrap_or_default()
+            },
         }),
         timezone: Some(proto::TimezoneConfig {
             source: source_str.clone(),

@@ -1,5 +1,6 @@
 import {
   getManagementFacadeClient,
+  getMscManagementClient,
   waitForBscReady,
 } from "@/lib/grpc/client";
 import { shouldHideAccessEvent } from "@/lib/access-event-filter";
@@ -155,6 +156,44 @@ export async function GET(request: Request) {
         }
       };
 
+      const runOtaspStream = async () => {
+        let retryMs = STREAM_RETRY_BASE_MS;
+        while (!abort.signal.aborted) {
+          try {
+            const client = getMscManagementClient();
+            for await (const value of client.streamOtaspEvents(
+              {},
+              { signal: abort.signal }
+            )) {
+              if (abort.signal.aborted) {
+                break;
+              }
+              if (value.otasp) {
+                retryMs = STREAM_RETRY_BASE_MS;
+                send(
+                  `event: otasp\ndata: ${JSON.stringify(value.otasp)}\n\n`
+                );
+              }
+            }
+            if (abort.signal.aborted) {
+              break;
+            }
+            console.log("[events] msc otasp stream ended");
+          } catch (err) {
+            if (abort.signal.aborted) {
+              break;
+            }
+            const msg = err instanceof Error ? err.message : "unknown";
+            console.log(`[events] msc otasp stream error: ${msg}`);
+          }
+          if (abort.signal.aborted) {
+            break;
+          }
+          await sleep(retryMs);
+          retryMs = Math.min(retryMs * 2, STREAM_RETRY_MAX_MS);
+        }
+      };
+
       send(`retry: ${SSE_RETRY_MS}\n\n`);
       send('event: connection\ndata: {"connected":false}\n\n');
 
@@ -163,7 +202,7 @@ export async function GET(request: Request) {
       }, KEEPALIVE_MS);
 
       try {
-        await runFacadeStream();
+        await Promise.all([runFacadeStream(), runOtaspStream()]);
       } finally {
         clearInterval(keepalive);
         console.log("[events] management facade stream stopped");

@@ -2,7 +2,9 @@ syntax = "proto3";
 package msc_management.v1;
 
 import "bsc/v1/service.proto";
+import "events/v1/msc.proto";
 import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
 
 // Active MSC call identifiers.
 message CallList {
@@ -46,4 +48,7 @@ service MscManagementService {
   rpc SendSms(SendSmsRequest) returns (SendSmsResponse);
   // Lists active MSC call IDs.
   rpc ListCalls(google.protobuf.Empty) returns (CallList);
+  // Streams live OTASP events for real-time dashboards. Persisted
+  // session history is served separately by the HLR service.
+  rpc StreamOtaspEvents(google.protobuf.Empty) returns (stream events.v1.MscNetworkEvent);
 }

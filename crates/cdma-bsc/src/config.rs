@@ -44,64 +44,6 @@ pub const EVENTS_CONFIG_FILENAME: &str = "events.json";
 /// `CDMA_CONFIG_DIR` is set.
 pub const DEFAULT_CONFIG_DIR: &str = "config";
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
-pub struct OverheadConfig {
-    pub sid: u16,
-    pub nid: u16,
-    pub base_id: u16,
-    pub reg_zone: u16,
-    pub total_zones: u8,
-    pub zone_timer: u8,
-    pub max_slot_cycle_index: u8,
-    pub page_chan: u8,
-    pub config_seq: u8,
-    pub acc_config_seq: u8,
-    pub power_up_reg: bool,
-    pub parameter_reg: bool,
-    pub auth_mode: u8,
-    pub p_rev: u8,
-    pub min_p_rev: u8,
-    pub prat: u8,
-    /// `None` → derive from BTS `ChannelPlan`.
-    pub cdma_freq: Option<u16>,
-    pub ext_cdma_freq: Option<u16>,
-    /// T1b timer period in milliseconds (default 1280). Each required overhead
-    /// message must be sent at least once per T1b on the paging channel.
-    #[serde(default = "default_t1b_ms")]
-    pub t1b_ms: u64,
-}
-
-fn default_t1b_ms() -> u64 {
-    1280
-}
-
-impl Default for OverheadConfig {
-    fn default() -> Self {
-        Self {
-            sid: 1,
-            nid: 1,
-            base_id: 1,
-            reg_zone: 0,
-            total_zones: 1,
-            zone_timer: 0,
-            max_slot_cycle_index: 0,
-            page_chan: 1,
-            config_seq: 24,
-            acc_config_seq: 2,
-            power_up_reg: true,
-            parameter_reg: false,
-            auth_mode: 0,
-            p_rev: 11,
-            min_p_rev: 3,
-            prat: 0,
-            cdma_freq: None,
-            ext_cdma_freq: None,
-            t1b_ms: 1280,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RcPairConfig {
     pub for_rc: u8,
@@ -327,9 +269,6 @@ impl Default for BscBearerConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BscNodeConfig {
-    /// Overhead message contents that the BSC instructs the BTS to broadcast
-    /// (SID/NID, registration, P_REV, page channel, CDMA freq).
-    pub overhead: OverheadConfig,
     /// Radio configuration / service-option policy applied during traffic
     /// channel assignment.
     pub traffic_assignment: TrafficAssignmentConfig,
@@ -371,7 +310,6 @@ fn default_voice_bearer_bind_ip() -> Ipv4Addr {
 impl Default for BscNodeConfig {
     fn default() -> Self {
         Self {
-            overhead: OverheadConfig::default(),
             traffic_assignment: TrafficAssignmentConfig::default(),
             traffic_retry: TrafficRetryConfig::default(),
             paging_retry: PagingRetryConfig::default(),
@@ -403,12 +341,6 @@ impl BscNodeConfig {
     /// in bootstrap via `validate_page_chan_alignment`.
     pub fn validate(&self) -> Result<(), Error> {
         validate_traffic_assignment(&self.traffic_assignment)?;
-        if self.overhead.page_chan == 0 || self.overhead.page_chan > 7 {
-            return Err("overhead.page_chan must be in 1..=7".into());
-        }
-        if self.overhead.auth_mode > 3 {
-            return Err("overhead.auth_mode must be in 0..=3".into());
-        }
         Ok(())
     }
 }
@@ -529,7 +461,7 @@ fn validate_traffic_assignment(cfg: &TrafficAssignmentConfig) -> Result<(), Erro
 /// Resolve `CDMA_FREQ`: `overhead.cdma_freq` if set, else derive from
 /// the BTS `ChannelPlan`.
 pub fn resolved_cdma_freq(
-    overhead: &OverheadConfig,
+    overhead: &cdma_common::overhead::OverheadParameters,
     channel: cdma_common::band_class::ChannelPlan,
 ) -> u16 {
     overhead
@@ -537,20 +469,17 @@ pub fn resolved_cdma_freq(
         .unwrap_or_else(|| channel.cdma_freq_field())
 }
 
-/// Cross-node validation: BSC `overhead.page_chan` must match the BTS
-/// paging channel number.
-///
-/// Called from bootstrap after both `BtsNodeConfig` and `BscNodeConfig` are
-/// loaded. Returns an error describing the mismatch when the two values
-/// disagree; replaces the equivalent check that previously lived inside
-/// `AppConfig::validate`.
+/// Cross-node validation: BTS `overhead.page_chan` must match
+/// `bts.runtime.downlink.paging.paging_channel_number`. Both live in
+/// `bts.json` but in different sections, so the bootstrap still
+/// double-checks them.
 pub fn validate_page_chan_alignment(
-    bsc_page_chan: u8,
+    overhead_page_chan: u8,
     bts_paging_channel_number: u8,
 ) -> Result<(), Error> {
-    if bsc_page_chan != bts_paging_channel_number {
+    if overhead_page_chan != bts_paging_channel_number {
         return Err(
-            "overhead.page_chan must match bts.runtime.downlink.paging.paging_channel_number"
+            "bts.overhead.page_chan must match bts.runtime.downlink.paging.paging_channel_number"
                 .into(),
         );
     }
@@ -571,7 +500,7 @@ mod tests {
     fn cdma_freq_resolves_from_channel_plan() {
         use cdma_common::band_class::{BandClass, ChannelPlan};
         let plan = ChannelPlan::new(BandClass::Bc0, 0, 384);
-        let mut overhead = OverheadConfig::default();
+        let mut overhead = cdma_common::overhead::OverheadParameters::default();
         overhead.cdma_freq = None;
         assert_eq!(resolved_cdma_freq(&overhead, plan), 384);
         overhead.cdma_freq = Some(100);

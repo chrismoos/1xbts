@@ -640,7 +640,18 @@ impl AccessService {
             }
         }
 
-        if burst_type != 3 {
+        if burst_type == cdma_common::consts::BURST_TYPE_OTASP {
+            // C.S0016 OTASP / OTAPA payload. BSC is a transparent relay —
+            // it does not decode OTASP bytes. Forward to MSC via ADDS Transfer.
+            if let Some(ref fwd_address) = bsc.extract_fwd_address(event) {
+                bsc.forward_access_otasp_to_msc(fwd_address, fields);
+            } else {
+                warn!("BSC: OTASP access Data Burst with no forward address — dropped");
+            }
+            return;
+        }
+
+        if burst_type != cdma_common::consts::BURST_TYPE_SMS {
             info!(
                 "BSC: received Data Burst burst_type={} (not SMS), ignoring",
                 burst_type

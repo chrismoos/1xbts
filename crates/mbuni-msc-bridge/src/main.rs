@@ -14,15 +14,21 @@ use axum::routing::get;
 use log::{error, info, warn};
 use tonic::transport::{Channel, Endpoint};
 
+// Module layout mirrors the proto package hierarchy so tonic-generated
+// cross-package references (`crate::events::v1::...`, `crate::bsc::v1::...`)
+// resolve.
+pub mod events {
+    pub mod v1 {
+        tonic::include_proto!("events.v1");
+    }
+}
+
 pub mod msc_management {
     pub mod v1 {
         tonic::include_proto!("msc_management.v1");
     }
 }
 
-// SendSmsRequest references InitiateCallRequest in proto, which lives in bsc.v1.
-// tonic-build emits a stub module for the imported package even though we only
-// use SendSmsRequest at runtime.
 pub mod bsc {
     pub mod v1 {
         tonic::include_proto!("bsc.v1");
@@ -419,6 +425,21 @@ mod tests {
         async fn list_calls(&self, _: Request<()>) -> Result<Response<CallList>, Status> {
             Err(Status::unimplemented(""))
         }
+
+        type StreamOtaspEventsStream = std::pin::Pin<
+            Box<
+                dyn tokio_stream::Stream<Item = Result<events::v1::MscNetworkEvent, Status>>
+                    + Send
+                    + 'static,
+            >,
+        >;
+
+        async fn stream_otasp_events(
+            &self,
+            _: Request<()>,
+        ) -> Result<Response<Self::StreamOtaspEventsStream>, Status> {
+            Err(Status::unimplemented(""))
+        }
     }
 
     async fn start_servers() -> (Arc<CapturingMsc>, SocketAddr) {
@@ -448,6 +469,19 @@ mod tests {
                     request: Request<()>,
                 ) -> Result<Response<CallList>, Status> {
                     self.0.list_calls(request).await
+                }
+                type StreamOtaspEventsStream = std::pin::Pin<
+                    Box<
+                        dyn tokio_stream::Stream<Item = Result<events::v1::MscNetworkEvent, Status>>
+                            + Send
+                            + 'static,
+                    >,
+                >;
+                async fn stream_otasp_events(
+                    &self,
+                    request: Request<()>,
+                ) -> Result<Response<Self::StreamOtaspEventsStream>, Status> {
+                    self.0.stream_otasp_events(request).await
                 }
             }
             let _ = Server::builder()

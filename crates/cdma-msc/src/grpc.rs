@@ -13,6 +13,15 @@ pub mod bsc {
     }
 }
 
+pub mod events {
+    pub mod v1 {
+        tonic::include_proto!("events.v1");
+    }
+}
+
+// Backwards-compatible alias used by `crate::otasp::*` modules.
+pub use events as events_proto;
+
 pub mod msc_management {
     pub mod v1 {
         tonic::include_proto!("msc_management.v1");
@@ -33,6 +42,7 @@ use msc_management::v1::msc_management_service_server::MscManagementService;
 /// MSC-side gRPC management service backed by a channel into the MSC runtime.
 pub struct MscManagementServiceImpl {
     mgmt_tx: tokio::sync::mpsc::Sender<crate::management::PendingControlRequest>,
+    otasp_event_tx: Option<tokio::sync::broadcast::Sender<events_proto::v1::MscNetworkEvent>>,
 }
 
 impl MscManagementServiceImpl {
@@ -40,7 +50,21 @@ impl MscManagementServiceImpl {
     pub fn from_channel(
         mgmt_tx: tokio::sync::mpsc::Sender<crate::management::PendingControlRequest>,
     ) -> Self {
-        Self { mgmt_tx }
+        Self {
+            mgmt_tx,
+            otasp_event_tx: None,
+        }
+    }
+
+    /// Attach the live OTASP event broadcast channel produced by the MSC
+    /// runtime so the `StreamOtaspEvents` RPC can fan events out to
+    /// connected dashboards.
+    pub fn with_otasp(
+        mut self,
+        event_tx: tokio::sync::broadcast::Sender<events_proto::v1::MscNetworkEvent>,
+    ) -> Self {
+        self.otasp_event_tx = Some(event_tx);
+        self
     }
 }
 
@@ -123,6 +147,34 @@ impl MscManagementService for MscManagementServiceImpl {
                 "SMS delivery failed (mobile unreachable or SMSC unavailable)".to_string()
             }),
         }))
+    }
+
+    type StreamOtaspEventsStream = std::pin::Pin<
+        Box<
+            dyn tokio_stream::Stream<Item = Result<events_proto::v1::MscNetworkEvent, Status>>
+                + Send
+                + 'static,
+        >,
+    >;
+
+    async fn stream_otasp_events(
+        &self,
+        _: Request<()>,
+    ) -> Result<Response<Self::StreamOtaspEventsStream>, Status> {
+        let Some(tx) = self.otasp_event_tx.as_ref() else {
+            return Err(Status::unavailable("OTASP event stream not configured"));
+        };
+        let mut rx = tx.subscribe();
+        let stream = async_stream::stream! {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => yield Ok(ev),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        };
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn list_calls(&self, _: Request<()>) -> Result<Response<CallList>, Status> {
