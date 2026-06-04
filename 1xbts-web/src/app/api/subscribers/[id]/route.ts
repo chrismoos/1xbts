@@ -1,3 +1,4 @@
+import { grpcErrorMessage, grpcErrorStatus } from "@/lib/grpc/client";
 import { getHlrClient, waitForHlrReady } from "@/lib/grpc/hlr-client";
 import {
   NumberPlan,
@@ -60,9 +61,10 @@ export async function GET(
     );
     return Response.json(withStatusLabel(result));
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    const status = msg.toLowerCase().includes("not found") ? 404 : 502;
-    return Response.json({ error: msg }, { status });
+    return Response.json(
+      { error: grpcErrorMessage(err) },
+      { status: grpcErrorStatus(err) }
+    );
   } finally {
     clearTimeout(timeout);
   }
@@ -124,9 +126,10 @@ export async function PATCH(
     );
     return Response.json(withStatusLabel(result));
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    const status = msg.toLowerCase().includes("not found") ? 404 : 502;
-    return Response.json({ error: msg }, { status });
+    return Response.json(
+      { error: grpcErrorMessage(err) },
+      { status: grpcErrorStatus(err) }
+    );
   } finally {
     clearTimeout(timeout);
   }

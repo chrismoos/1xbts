@@ -210,10 +210,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
                     req.meid.as_deref(),
                 )
                 .await
-                .map_err(|e| {
-                    log::error!("HLR: {e}");
-                    Status::internal("internal error")
-                })?;
+                .map_err(map_repo_error)?;
             Some(identity_to_proto(&id))
         } else {
             None
@@ -242,7 +239,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
                 req.meid.as_deref(),
             )
             .await
-            .map_err(Status::internal)?;
+            .map_err(map_repo_error)?;
         Ok(Response::new(proto::UpsertIdentityResponse {
             identity: Some(identity_to_proto(&identity)),
         }))
@@ -265,7 +262,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
                 req.meid.as_deref(),
             )
             .await
-            .map_err(Status::internal)?;
+            .map_err(map_repo_error)?;
         Ok(Response::new(proto::ReplacePrimaryIdentityResponse {
             identity: Some(identity_to_proto(&identity)),
         }))
@@ -1118,6 +1115,10 @@ fn map_validation_error(e: model::PrlValidationFailure) -> Status {
 }
 
 fn map_repo_error(e: String) -> Status {
+    if let Some(msg) = e.strip_prefix(crate::repository::VALIDATION_FAILED_PREFIX) {
+        log::warn!("HLR repo validation: {msg}");
+        return Status::invalid_argument(msg.to_string());
+    }
     log::error!("HLR repo: {e}");
     Status::internal("internal error")
 }

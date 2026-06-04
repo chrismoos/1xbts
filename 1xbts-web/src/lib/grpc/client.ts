@@ -1,4 +1,10 @@
-import { createChannel, createClient, waitForChannelReady } from "nice-grpc";
+import {
+  ClientError,
+  Status,
+  createChannel,
+  createClient,
+  waitForChannelReady,
+} from "nice-grpc";
 import { BscServiceDefinition } from "../proto/bsc/v1/service";
 import { BscManagementServiceDefinition } from "../proto/bsc_management/v1/service";
 import { BtsManagementServiceDefinition } from "../proto/bts_management/v1/service";
@@ -65,4 +71,27 @@ export function getPdsnManagementClient() {
 
 export async function waitForBscReady(timeoutMs = BSC_GRPC_READY_TIMEOUT_MS) {
   await waitForChannelReady(channel, new Date(Date.now() + timeoutMs));
+}
+
+// Generic gRPC -> HTTP status mapping for API route error responses.
+// Reads `ClientError.code` (the structured status from the server);
+// anything that isn't a ClientError is treated as an upstream failure.
+export function grpcErrorStatus(err: unknown): number {
+  if (err instanceof ClientError) {
+    switch (err.code) {
+      case Status.INVALID_ARGUMENT:
+        return 400;
+      case Status.NOT_FOUND:
+        return 404;
+      default:
+        return 502;
+    }
+  }
+  return 502;
+}
+
+export function grpcErrorMessage(err: unknown): string {
+  if (err instanceof ClientError) return err.details;
+  if (err instanceof Error) return err.message;
+  return "unknown error";
 }

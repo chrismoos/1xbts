@@ -1,5 +1,6 @@
 # HEAD 
 
+- Require unique ESN/MEID per subscriber.
 - Allow access from all origins in Next dev mode.
 - Improved PRL decode error messages on failed `*228` read-backs.
 - Failed PRL read-backs can be downloaded as `.prl` from the session detail page.

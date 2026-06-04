@@ -1220,6 +1220,56 @@ struct MobileSeenIdentityRow {
     last_seen_at: DateTime<Utc>,
 }
 
+/// Soft uniqueness check: refuse to assign an ESN or MEID already
+/// owned by a different subscriber. Schema-level enforcement is on
+/// the follow-up list; this is the app-side guard.
+///
+/// Returns an error prefixed with `VALIDATION_FAILED:` so the gRPC
+/// layer maps it to `INVALID_ARGUMENT` and the web UI returns a real
+/// 400 with the offending hardware ID.
+async fn check_hardware_identity_unique(
+    pool: &sqlx::PgPool,
+    subscriber_id: Uuid,
+    esn: Option<u32>,
+    meid: Option<&str>,
+) -> Result<(), String> {
+    if let Some(esn) = esn {
+        let row: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT subscriber_id FROM subscriber_identities \
+             WHERE esn = $1 AND subscriber_id <> $2 LIMIT 1",
+        )
+        .bind(esn as i64)
+        .bind(subscriber_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("check_hardware_identity_unique esn: {e}"))?;
+        if row.is_some() {
+            return Err(format!(
+                "{VALIDATION_FAILED_PREFIX}ESN 0x{esn:08X} is already assigned to another subscriber"
+            ));
+        }
+    }
+    if let Some(meid) = meid {
+        let row: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT subscriber_id FROM subscriber_identities \
+             WHERE meid = $1 AND subscriber_id <> $2 LIMIT 1",
+        )
+        .bind(meid)
+        .bind(subscriber_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("check_hardware_identity_unique meid: {e}"))?;
+        if row.is_some() {
+            return Err(format!(
+                "{VALIDATION_FAILED_PREFIX}MEID {meid} is already assigned to another subscriber"
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) const VALIDATION_FAILED_PREFIX: &str = "VALIDATION_FAILED: ";
+
 async fn select_mobile_seen_by_key(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     identity: &MobileIdentityKey,
@@ -1557,6 +1607,8 @@ impl HlrRepository for PostgresHlrRepository {
             .await
             .map_err(|e| format!("upsert_identity begin: {e}"))?;
 
+        check_hardware_identity_unique(&self.pool, subscriber_id, esn, meid).await?;
+
         let existing = sqlx::query_as::<_, IdentityRow>(
             "SELECT subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at FROM subscriber_identities WHERE subscriber_id = $1 LIMIT 1",
         )
@@ -1623,6 +1675,7 @@ impl HlrRepository for PostgresHlrRepository {
         let meid = identity_key.meid();
         let now = Utc::now();
         let id = Uuid::new_v4();
+        check_hardware_identity_unique(&self.pool, subscriber_id, esn, meid).await?;
         let existing = sqlx::query_as::<_, IdentityRow>(
             r#"
             SELECT subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at
@@ -1790,10 +1843,18 @@ impl HlrRepository for PostgresHlrRepository {
         .await
         .map_err(|e| format!("resolve_by_hardware_identity: {e}"))?;
         if rows.len() > 1 {
-            return Err(
-                "resolve_by_hardware_identity: ambiguous match (ESN and MEID resolve to different subscribers)"
-                    .to_string(),
-            );
+            return Err(match (esn, meid.as_deref()) {
+                (Some(esn), Some(_)) => format!(
+                    "ambiguous match: ESN 0x{esn:08X} and MEID resolve to different subscribers"
+                ),
+                (Some(esn), None) => {
+                    format!("ambiguous match: multiple subscribers share ESN 0x{esn:08X}")
+                }
+                (None, Some(_)) => {
+                    "ambiguous match: multiple subscribers share this MEID".to_string()
+                }
+                (None, None) => unreachable!("guarded by earlier check"),
+            });
         }
         let Some(row) = rows.into_iter().next() else {
             return Ok(None);
