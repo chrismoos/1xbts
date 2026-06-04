@@ -358,6 +358,9 @@ impl Bts {
 
     /// Threshold in microseconds: log a warning when a single TX batch exceeds this.
     const TX_SLOW_THRESHOLD_US: u64 = 2_000;
+    const TX_BLOCK_SLOW_GEN_THRESHOLD_US: u64 = 500;
+    const TX_BATCH_GEN_WARN_NUMERATOR: u64 = 4;
+    const TX_BATCH_GEN_WARN_DENOMINATOR: u64 = 5;
 
     fn flush_tx_batch(
         radio_tx: &mut dyn RadioTx,
@@ -800,8 +803,8 @@ impl Bts {
                     block_chip,
                 )?;
                 let block_gen_us = block_gen_start.elapsed().as_micros() as u64;
-                if block_gen_us > 500 {
-                    log::warn!(
+                if block_gen_us > Self::TX_BLOCK_SLOW_GEN_THRESHOLD_US {
+                    log::debug!(
                         "tx_slow_gen: {}us (block #{}, chip={}) pilot={}us sync={}us paging={}us ftch={}us [snap={}us tc_n={} tc_sum={}us tc_max={}us] spread={}us",
                         block_gen_us,
                         state.synth_blocks,
@@ -823,11 +826,23 @@ impl Bts {
             }
 
             let batch_gen_us = gen_start.elapsed().as_micros() as u64;
-            if batch_gen_us > 2000 {
+            let batch_airtime_us = state.tx_batch_chips.saturating_mul(1_000_000) / state.chip_rate;
+            let batch_warn_us = batch_airtime_us.saturating_mul(Self::TX_BATCH_GEN_WARN_NUMERATOR)
+                / Self::TX_BATCH_GEN_WARN_DENOMINATOR;
+            if batch_gen_us > batch_warn_us {
+                let rt_ratio = if batch_gen_us > 0 {
+                    batch_airtime_us as f64 / batch_gen_us as f64
+                } else {
+                    f64::INFINITY
+                };
                 log::warn!(
-                    "tx_slow_batch_gen: {}us ({} blocks, chip={})",
+                    "tx_slow_batch_gen: {}us > {}us warn (airtime={}us, rt={:.2}x, {} blocks, {} chips, chip={})",
                     batch_gen_us,
+                    batch_warn_us,
+                    batch_airtime_us,
+                    rt_ratio,
                     blocks_per_batch,
+                    state.tx_batch_chips,
                     chip_cursor
                 );
             }

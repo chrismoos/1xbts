@@ -1,5 +1,7 @@
 # HEAD 
 
+- BTS TX slow-generation warnings now use full-batch timing instead of
+  per-block timing.
 - Voice originations with SO32768 are now accepted and renegotiated to
   EVRC (SO 3) on the traffic channel instead of being rejected at the
   paging channel.
