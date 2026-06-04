@@ -8,7 +8,7 @@ use cdma_abis::bearer::{ChannelFamily, FrameContent, ReverseFchDcchFrame};
 use cdma_bts::bts::PagingChannelSettings;
 use cdma_common::consts::{
     SERVICE_OPTION_EVRC_A, SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_PACKET_DATA,
-    SERVICE_OPTION_SMS,
+    SERVICE_OPTION_QCELP13, SERVICE_OPTION_SMS,
 };
 use cdma_common::error::Error;
 use cdma_common::lac::paging_messages::MsAddress;
@@ -3792,7 +3792,10 @@ async fn unsupported_origination_service_option_gets_release_rejection() {
     origination.mob_p_rev = Some(3);
     origination.slot_cycle_index = Some(2);
     origination.scm = Some(0x6a);
-    origination.service_option = Some(32768);
+    // SO 65000: in the manufacturer range (≥ 32768) but not on the
+    // renegotiate-to-EVRC whitelist, so we still reject on F-PCH.
+    // SO 32768 is whitelisted and covered by separate tests below.
+    origination.service_option = Some(65000);
 
     bsc.inject_access_event(origination).await;
 
@@ -3821,6 +3824,311 @@ async fn unsupported_origination_service_option_gets_release_rejection() {
         "ORDQ=2 means requested service option is rejected"
     );
     assert!(order.order_specific_fields.is_empty());
+}
+
+/// Origination with SO 32768 (legacy Qualcomm proprietary 13k QCELP) is on
+/// the renegotiate-to-EVRC whitelist. The BSC accepts the access (BS Ack
+/// Order on F-PCH), runs the normal MSC-controlled MO setup as SO 3, and
+/// the resulting traffic channel carries `origination_service_option=
+/// Some(32768)` so the post-F-TCH-handshake counter-propose flow triggers.
+#[tokio::test]
+async fn so32768_origination_is_accepted_as_evrc_and_marked_for_renegotiation() {
+    let bts_client = Arc::new(CapturingBtsClient::default());
+    let mut bsc = Bsc::new(Config {
+        pilot_offset: 0,
+        overhead: OverheadParameters::default(),
+        paging: PagingChannelSettings::default(),
+        traffic_assignment: TrafficAssignmentConfig::default(),
+        access_event_rx: None,
+        access_event_broadcast: None,
+        sms_request_rx: None,
+        sms_request_tx: None,
+        data_request_rx: None,
+        data_request_tx: None,
+        power_override_request_rx: None,
+        power_override_request_tx: None,
+        mobiles_tx: None,
+        paging_broadcast: None,
+        traffic_broadcast: None,
+        rx_reference_dbm: None,
+        hlr_repo: None,
+        msc_client: test_msc_client(),
+        bts_client: Some(bts_client.clone() as Arc<dyn BtsControlClient>),
+        traffic_retry: TrafficRetryConfig::default(),
+        paging_retry: PagingRetryConfig::default(),
+        voice_policy: test_voice_policy(),
+        pcf_client: None,
+        mobile_idle_timeout_s: 0,
+        bts_paging_state: None,
+        node_id: "bsc-test".to_string(),
+        msc_voice_bearer: None,
+    });
+
+    let mut origination = test_access_event();
+    origination.message_id = MessageId::Origination;
+    origination.msg_type_name = "Origination Message".to_string();
+    origination.msg_seq = Some(4);
+    origination.ack_req = true;
+    origination.esn = Some(0x1234_5678);
+    origination.imsi_m_s1 = Some(0x0091_989e);
+    origination.imsi_m_s2 = Some(0x0326);
+    origination.imsi_class = Some(0);
+    origination.imsi_mcc = Some(310);
+    origination.imsi_11_12 = Some(99);
+    origination.mob_p_rev = Some(3);
+    origination.slot_cycle_index = Some(2);
+    origination.scm = Some(0x6a);
+    origination.service_option = Some(SERVICE_OPTION_QCELP13);
+    // P_REV=3 IS-95-class handset (matches CDM-8200 / SCN-150 capture).
+    origination.for_supported_rcs = vec![1];
+    origination.rev_supported_rcs = vec![1];
+
+    bsc.inject_access_event(origination).await;
+
+    // The BSC must NOT send a Release Order on F-PCH for whitelisted SOs.
+    let messages = bts_client.pch_messages.lock();
+    let release_orders: Vec<_> = messages
+        .iter()
+        .filter_map(|m| m.air_interface_message.as_ref())
+        .filter(|aim| aim.message_type == 0x07)
+        .filter_map(|aim| {
+            let mut bits = Bitstream::new_bytes(&aim.message);
+            lac::paging_messages::OrderMessage::from_sdu(&mut bits).ok()
+        })
+        .filter(|o| o.order == 0b010101)
+        .collect();
+    assert!(
+        release_orders.is_empty(),
+        "SO 32768 must not be rejected on F-PCH, got {} Release Order(s)",
+        release_orders.len()
+    );
+
+    // A BS Ack Order must have gone out on F-PCH instead, completing the
+    // L2 access handshake while the call setup proceeds asynchronously
+    // through the MSC.
+    let bs_acks: Vec<_> = messages
+        .iter()
+        .filter_map(|m| m.air_interface_message.as_ref())
+        .filter(|aim| aim.message_type == 0x07)
+        .filter_map(|aim| {
+            let mut bits = Bitstream::new_bytes(&aim.message);
+            lac::paging_messages::OrderMessage::from_sdu(&mut bits).ok()
+        })
+        .filter(|o| o.order == 0b010000)
+        .collect();
+    assert!(
+        !bs_acks.is_empty(),
+        "BS Ack Order must be sent on F-PCH for accepted SO 32768 access"
+    );
+}
+
+/// On the legacy SO-negotiation path (SERV_NEG disabled, P_REV < 6), after
+/// the F-TCH BS Ack handshake the BSC must send a Service Option Request
+/// Order (forward Order code 0b010011) on F-TCH proposing the assigned SO
+/// when it differs from the MS's origination SO. Channel transitions to
+/// WaitingServiceResponse.
+#[tokio::test]
+async fn legacy_so_renegotiation_sends_service_option_request_order_after_bs_ack() {
+    let (mut bsc, mut traffic_rx, walsh_code) =
+        test_bsc_with_active_traffic_channel(SERVICE_OPTION_EVRC_A).await;
+    while traffic_rx.try_recv().is_ok() {}
+
+    {
+        let tc = bsc.mobiles[0]
+            .find_traffic_channel_by_walsh_mut(walsh_code)
+            .expect("traffic channel should exist");
+        tc.service_negotiation_mode = ServiceNegotiationMode::ServiceOptionNegotiation;
+        tc.origination_service_option = Some(SERVICE_OPTION_QCELP13);
+        tc.service_option = SERVICE_OPTION_EVRC_A;
+        tc.mark_waiting_ms_ack();
+    }
+
+    bsc.advance_waiting_ms_ack(walsh_code, 0, "Mobile Station Acknowledgment Order")
+        .await;
+
+    let event = traffic_rx
+        .recv()
+        .await
+        .expect("Service Option Request Order should emit a traffic event");
+    let order = event
+        .order
+        .as_ref()
+        .expect("traffic event should carry an Order Message");
+    assert_eq!(
+        order.order, 0b010011,
+        "expected Service Option Request Order"
+    );
+    assert_eq!(order.ordq, 0);
+    assert_eq!(
+        order
+            .forward_detail()
+            .expect("Service Option Request Order should parse"),
+        lac::paging_messages::ForwardOrderDetail::ServiceOptionRequest {
+            service_option: SERVICE_OPTION_EVRC_A
+        }
+    );
+    assert!(event.mcsb.ack_req);
+    assert_eq!(
+        bsc.mobiles[0]
+            .find_traffic_channel_by_walsh(walsh_code)
+            .expect("traffic channel should exist")
+            .state_label(),
+        "WaitingServiceResponse"
+    );
+}
+
+/// Build an r-tch reverse Service Option Response Order event with the
+/// given SERVICE_OPTION value. Per C.S0005-E §2.7.3.3 the order_specific
+/// layout on r-tch is [ORDQ, SO_hi, SO_lo].
+fn test_reverse_service_option_response_order(walsh_code: u8, so: u16) -> AccessChannelEvent {
+    let mut event = test_access_event();
+    event.message_id = MessageId::Order;
+    event.msg_type_name = "Order Message".to_string();
+    event.msg_seq = Some(1);
+    event.ack_req = false;
+    event.traffic_walsh_code = Some(walsh_code);
+    event.order_code = Some(0b010100);
+    let so_be = so.to_be_bytes();
+    event.decoded_l3 = Some(AccessMessage::Order(cdma_common::access::OrderMessage {
+        header: AccessMessageHeader {
+            pd: 0,
+            message_id: MessageId::Order,
+        },
+        order: 0b010100,
+        add_record_len: 3,
+        order_specific: vec![0, so_be[0], so_be[1]],
+        remaining_bits: 0,
+    }));
+    event
+}
+
+/// MS accepts our Service Option Request Order: the Service Option
+/// Response Order carries the same SO we proposed (SO 3). The BSC must
+/// complete service negotiation and mark the channel Active.
+#[tokio::test]
+async fn so_response_order_accept_completes_service_negotiation() {
+    let (mut bsc, mut traffic_rx, walsh_code) =
+        test_bsc_with_active_traffic_channel(SERVICE_OPTION_EVRC_A).await;
+    while traffic_rx.try_recv().is_ok() {}
+
+    {
+        let tc = bsc.mobiles[0]
+            .find_traffic_channel_by_walsh_mut(walsh_code)
+            .expect("traffic channel should exist");
+        tc.service_negotiation_mode = ServiceNegotiationMode::ServiceOptionNegotiation;
+        tc.origination_service_option = Some(SERVICE_OPTION_QCELP13);
+        tc.service_option = SERVICE_OPTION_EVRC_A;
+        tc.mark_waiting_service_response();
+    }
+
+    bsc.inject_access_event(test_reverse_service_option_response_order(
+        walsh_code,
+        SERVICE_OPTION_EVRC_A,
+    ))
+    .await;
+
+    assert_eq!(
+        bsc.mobiles[0]
+            .find_traffic_channel_by_walsh(walsh_code)
+            .expect("traffic channel should exist")
+            .state_label(),
+        "Active",
+        "accepting MS should drive the channel to Active"
+    );
+}
+
+/// MS rejects our Service Option Request Order: the Service Option
+/// Response Order carries 0xFFFF (or any SO not matching what we proposed).
+/// The BSC must release the channel.
+#[tokio::test]
+async fn so_response_order_reject_tears_down_channel() {
+    let (mut bsc, mut traffic_rx, walsh_code) =
+        test_bsc_with_active_traffic_channel(SERVICE_OPTION_EVRC_A).await;
+    while traffic_rx.try_recv().is_ok() {}
+
+    {
+        let tc = bsc.mobiles[0]
+            .find_traffic_channel_by_walsh_mut(walsh_code)
+            .expect("traffic channel should exist");
+        tc.service_negotiation_mode = ServiceNegotiationMode::ServiceOptionNegotiation;
+        tc.origination_service_option = Some(SERVICE_OPTION_QCELP13);
+        tc.service_option = SERVICE_OPTION_EVRC_A;
+        tc.mark_waiting_service_response();
+    }
+
+    bsc.inject_access_event(test_reverse_service_option_response_order(
+        walsh_code, 0xFFFF,
+    ))
+    .await;
+
+    let tc_state = bsc.mobiles[0]
+        .find_traffic_channel_by_walsh(walsh_code)
+        .map(|tc| tc.state_label());
+    assert!(
+        matches!(tc_state, Some("Releasing") | None),
+        "rejecting MS should release the channel, got {:?}",
+        tc_state
+    );
+}
+
+/// Build an r-tch Mobile Station Reject Order rejecting an Order Message
+/// with a specific REJECTED_ORDER code. Per C.S0005-E §2.7.3-1 / §3.7.4.6
+/// the r-dsch order_specific layout is
+/// [ORDQ, REJECTED_TYPE, REJECTED_ORDER, REJECTED_ORDQ, trailing...].
+fn test_reverse_ms_reject_of_order(walsh_code: u8, rejected_order: u8) -> AccessChannelEvent {
+    let mut event = test_access_event();
+    event.message_id = MessageId::Order;
+    event.msg_type_name = "Order Message".to_string();
+    event.msg_seq = Some(1);
+    event.ack_req = false;
+    event.traffic_walsh_code = Some(walsh_code);
+    event.order_code = Some(0b011111);
+    event.decoded_l3 = Some(AccessMessage::Order(cdma_common::access::OrderMessage {
+        header: AccessMessageHeader {
+            pd: 0,
+            message_id: MessageId::Order,
+        },
+        order: 0b011111,
+        add_record_len: 5,
+        // ORDQ=0x02 "message not accepted in this state",
+        // REJECTED_TYPE=0x01 (Order), REJECTED_ORDER (6-bit value in
+        // byte's low bits), REJECTED_ORDQ=0x00.
+        order_specific: vec![0x02, 0x01, rejected_order & 0x3f, 0x00, 0x00],
+        remaining_bits: 0,
+    }));
+    event
+}
+
+/// MS sends an MS Reject Order rejecting our Service Option Request Order
+/// (typical when the MS is in SERV_NEG-enabled state, e.g. P_REV>=6 that
+/// the BSC's legacy path didn't expect). Channel must release.
+#[tokio::test]
+async fn ms_reject_of_so_request_order_tears_down_channel() {
+    let (mut bsc, mut traffic_rx, walsh_code) =
+        test_bsc_with_active_traffic_channel(SERVICE_OPTION_EVRC_A).await;
+    while traffic_rx.try_recv().is_ok() {}
+
+    {
+        let tc = bsc.mobiles[0]
+            .find_traffic_channel_by_walsh_mut(walsh_code)
+            .expect("traffic channel should exist");
+        tc.service_negotiation_mode = ServiceNegotiationMode::ServiceOptionNegotiation;
+        tc.origination_service_option = Some(SERVICE_OPTION_QCELP13);
+        tc.service_option = SERVICE_OPTION_EVRC_A;
+        tc.mark_waiting_service_response();
+    }
+
+    bsc.inject_access_event(test_reverse_ms_reject_of_order(walsh_code, 0b010011))
+        .await;
+
+    let tc_state = bsc.mobiles[0]
+        .find_traffic_channel_by_walsh(walsh_code)
+        .map(|tc| tc.state_label());
+    assert!(
+        matches!(tc_state, Some("Releasing") | None),
+        "MS Reject of SOReq should release the channel, got {:?}",
+        tc_state
+    );
 }
 
 #[tokio::test]

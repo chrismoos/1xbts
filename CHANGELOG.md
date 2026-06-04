@@ -1,5 +1,8 @@
 # HEAD 
 
+- Voice originations with SO32768 are now accepted and renegotiated to
+  EVRC (SO 3) on the traffic channel instead of being rejected at the
+  paging channel.
 - Require unique ESN/MEID per subscriber.
 - Allow access from all origins in Next dev mode.
 - Improved PRL decode error messages on failed `*228` read-backs.

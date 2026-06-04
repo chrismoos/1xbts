@@ -21,6 +21,12 @@ pub const SERVICE_OPTION_EVRC_B: u16 = 68;
 /// SO70: EVRC-WB.
 pub const SERVICE_OPTION_EVRC_WB: u16 = 70;
 
+/// SO32768: QCELP-13k voice (C.S0020). The SO number itself sits in the
+/// manufacturer-defined range (≥ 32768 per C.S0005-E Annex E). The BSC
+/// accepts these and renegotiates the traffic channel to EVRC-A (SO 3)
+/// on the F-TCH.
+pub const SERVICE_OPTION_QCELP13: u16 = 32768;
+
 /// Data Burst Message BURST_TYPE for SMS (TIA-637).
 pub const BURST_TYPE_SMS: u8 = 0b000011;
 

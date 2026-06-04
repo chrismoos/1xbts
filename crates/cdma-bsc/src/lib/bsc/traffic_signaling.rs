@@ -51,6 +51,20 @@ pub(crate) mod reverse_order_code {
     /// Mobile Station Reject Order — C.S0005-E Table 2.7.3-1, with
     /// ORDQ + REJECTED_TYPE carrying the upper-layer reason.
     pub const MOBILE_STATION_REJECT: u8 = 0b011111;
+    /// Service Option Response Order — MS reply to a BS-initiated
+    /// Service Option Request Order (C.S0005-E §2.6.4 / §3.7.4.3).
+    pub const SERVICE_OPTION_RESPONSE: u8 = 0b010100;
+}
+
+/// Forward-link Order codes the BSC emits on F-TCH. Six-bit ORDER field
+/// per C.S0005-E Table 2.7.3-1.
+pub(crate) mod forward_order_code {
+    /// Service Option Request Order — BS proposes a service option to
+    /// the MS (C.S0005-E §3.6.4).
+    pub const SERVICE_OPTION_REQUEST: u8 = 0b010011;
+    /// Service Option Response Order — BS reply accepting or rejecting
+    /// the MS's requested service option (C.S0005-E §3.7.4.3).
+    pub const SERVICE_OPTION_RESPONSE: u8 = 0b010100;
 }
 
 pub(crate) mod adds_deliver_ack_cause {
@@ -208,11 +222,23 @@ impl Bsc {
 
         if service_negotiation_mode == ServiceNegotiationMode::ServiceOptionNegotiation {
             if needs_negotiation {
-                warn!(
-                    "BSC: SERV_NEG disabled on walsh={} but origination SO={:?} differs from assigned SO={}; legacy SO negotiation orders are not implemented, tearing down",
-                    walsh_code, origination_service_option, service_option
+                info!(
+                    "BSC: SERV_NEG disabled on walsh={}: origination SO={:?} differs from assigned SO={}; sending Service Option Request Order proposing SO{}",
+                    walsh_code, origination_service_option, service_option, service_option
                 );
-                self.teardown_traffic_channel(walsh_code).await;
+                if let Err(e) =
+                    self.send_service_option_request_order(walsh_code, ack_seq, service_option)
+                {
+                    warn!(
+                        "BSC: failed to send Service Option Request Order on walsh={}: {}",
+                        walsh_code, e
+                    );
+                    self.teardown_traffic_channel(walsh_code).await;
+                    return;
+                }
+                self.mobiles.update_tc(walsh_code, |_, tc| {
+                    tc.mark_waiting_service_response();
+                });
             } else {
                 info!(
                     "BSC: SERV_NEG disabled on walsh={}; accepting SO{} with Service Option Response Order",
@@ -264,7 +290,37 @@ impl Bsc {
         service_option: u16,
     ) -> Result<(), Error> {
         let order_msg = OrderMessage {
-            order: 0b010100,
+            order: forward_order_code::SERVICE_OPTION_RESPONSE,
+            ordq: 0,
+            order_specific_fields: service_option.to_be_bytes().to_vec(),
+        };
+        let sdu = order_msg.to_ftch_sdu();
+
+        self.send_traffic_signaling(
+            walsh_code,
+            sdu,
+            MessageId::Order,
+            ack_seq,
+            true,
+            Some(order_msg),
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// BS-side Service Option Request Order on F-TCH (C.S0005-E §3.6.4).
+    /// The MS replies with a Service Option Response Order accepting or
+    /// rejecting.
+    fn send_service_option_request_order(
+        &mut self,
+        walsh_code: u8,
+        ack_seq: u8,
+        service_option: u16,
+    ) -> Result<(), Error> {
+        let order_msg = OrderMessage {
+            order: forward_order_code::SERVICE_OPTION_REQUEST,
             ordq: 0,
             order_specific_fields: service_option.to_be_bytes().to_vec(),
         };
@@ -711,6 +767,59 @@ impl Bsc {
                         digit,
                     );
                     self.emit_continuous_dtmf_order(walsh_code, digit, start);
+                } else if order == reverse_order_code::SERVICE_OPTION_RESPONSE {
+                    // MS reply to our Service Option Request Order. Per
+                    // C.S0005-E §2.6.4: SERVICE_OPTION matches our proposed
+                    // SO on accept, or a different value (typically 0xFFFF)
+                    // on reject.
+                    let resp_so = event.decoded_l3.as_ref().and_then(|l3| match l3 {
+                        AccessMessage::Order(o) => o
+                            .order_specific
+                            .get(1..3)
+                            .map(|bs| u16::from_be_bytes([bs[0], bs[1]])),
+                        _ => None,
+                    });
+                    let waiting_service_response = self
+                        .mobiles
+                        .get_traffic_channel(walsh_code)
+                        .is_some_and(|tc| tc.is_waiting_service_response());
+                    let assigned_so = self
+                        .mobiles
+                        .get_traffic_channel(walsh_code)
+                        .map(|tc| tc.service_option);
+                    info!(
+                        "BSC: received Service Option Response Order on R-TCH walsh={} SO={:?} (assigned SO={:?}, waiting={})",
+                        walsh_code, resp_so, assigned_so, waiting_service_response
+                    );
+                    if waiting_service_response {
+                        match (resp_so, assigned_so) {
+                            (Some(resp), Some(assigned)) if resp == assigned => {
+                                info!(
+                                    "BSC: MS accepted Service Option Request Order on walsh={} SO={} — completing service negotiation",
+                                    walsh_code, assigned
+                                );
+                                self.complete_service_negotiation(
+                                    walsh_code,
+                                    &addr,
+                                    "Service Option Response Order accept",
+                                )
+                                .await;
+                            }
+                            _ => {
+                                warn!(
+                                    "BSC: MS rejected Service Option Request Order on walsh={} (SO={:?}, assigned SO={:?}), tearing down",
+                                    walsh_code, resp_so, assigned_so
+                                );
+                                if !self.release_tch_and_signal_assignment_failure(
+                                    walsh_code,
+                                    &addr,
+                                    "Service Option Response Order reject",
+                                ) {
+                                    self.teardown_traffic_channel(walsh_code).await;
+                                }
+                            }
+                        }
+                    }
                 } else if order == reverse_order_code::MOBILE_STATION_REJECT {
                     // Forwards to MSC as an A.S0001 §6.1.7.5
                     // AddsDeliverAck failure when the rejected type is
@@ -727,7 +836,7 @@ impl Bsc {
                     let dbm_wire_type =
                         MessageId::DataBurst.wire_type(WireChannel::ForwardDedicated);
                     let mut handled_otasp_reject = false;
-                    if let Some(detail) = detail
+                    if let Some(ref detail) = detail
                         && let Some(dbm_wire_type) = dbm_wire_type
                         && detail.rejected_type == dbm_wire_type
                         && let Some(pending) = self.pending_otasp_dbm.remove(&walsh_code)
@@ -742,7 +851,38 @@ impl Bsc {
                         );
                         handled_otasp_reject = true;
                     }
-                    if !handled_otasp_reject {
+                    // MS rejected our outstanding Service Option Request /
+                    // Response Order while we were awaiting its SO Response
+                    // (C.S0005-E §2.6.4: MS sends MS Reject Order with
+                    // REJECTED_ORDER=SOReq/SOResp when SERV_NEG is enabled
+                    // on the channel and it doesn't accept the legacy order).
+                    // Tear down the call.
+                    let waiting_so_response = self
+                        .mobiles
+                        .get_traffic_channel(walsh_code)
+                        .is_some_and(|tc| tc.is_waiting_service_response());
+                    let so_neg_rejected = detail.as_ref().is_some_and(|d| {
+                        matches!(
+                            d.rejected_order,
+                            Some(forward_order_code::SERVICE_OPTION_REQUEST)
+                                | Some(forward_order_code::SERVICE_OPTION_RESPONSE)
+                        )
+                    });
+                    if !handled_otasp_reject && waiting_so_response && so_neg_rejected {
+                        warn!(
+                            "BSC: MS Reject Order on walsh={} rejected our SO negotiation order (REJECTED_ORDER={:?} ORDQ=0x{:02x}), tearing down",
+                            walsh_code,
+                            detail.as_ref().and_then(|d| d.rejected_order),
+                            detail.as_ref().map(|d| d.ordq).unwrap_or(0)
+                        );
+                        if !self.release_tch_and_signal_assignment_failure(
+                            walsh_code,
+                            &addr,
+                            "MS Reject Order rejected SO negotiation",
+                        ) {
+                            self.teardown_traffic_channel(walsh_code).await;
+                        }
+                    } else if !handled_otasp_reject {
                         info!(
                             "BSC: received Mobile Station Reject Order on R-TCH walsh={} (not OTASP, or no pending DBM), ignoring",
                             walsh_code

@@ -17,6 +17,10 @@ pub(crate) enum PendingA1AssignmentKind {
     Voice {
         session_id: uuid::Uuid,
         leg_role: VoiceLegRole,
+        /// Original Origination SO when the access path remapped the call
+        /// to a different internal SO. Carried onto the traffic channel as
+        /// `origination_service_option` to drive F-TCH SO renegotiation.
+        renegotiate_from_so: Option<u16>,
     },
     SmsTraffic,
     PacketData {
@@ -79,6 +83,14 @@ impl A1Service {
 
     pub(crate) fn clear_pending_assignments(&mut self, call_id: u64) {
         self.pending_assignments.remove(&call_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn all_pending_assignment_kinds_for_test(&self) -> Vec<PendingA1AssignmentKind> {
+        self.pending_assignments
+            .values()
+            .flat_map(|v| v.iter().map(|p| p.kind))
+            .collect()
     }
 }
 
@@ -715,6 +727,7 @@ impl Bsc {
                 kind: PendingA1AssignmentKind::Voice {
                     session_id: pending.session_id,
                     leg_role: pending.leg_role,
+                    renegotiate_from_so: None,
                 },
                 bind_existing_traffic: false,
             },
@@ -831,6 +844,7 @@ impl Bsc {
                 kind: PendingA1AssignmentKind::Voice {
                     session_id,
                     leg_role,
+                    renegotiate_from_so: None,
                 },
                 bind_existing_traffic: true,
             },
@@ -906,6 +920,7 @@ impl Bsc {
             PendingA1AssignmentKind::Voice {
                 session_id,
                 leg_role,
+                ..
             } => Some((session_id, leg_role)),
             _ => None,
         };
@@ -991,7 +1006,8 @@ impl Bsc {
             PendingA1AssignmentKind::Voice {
                 session_id,
                 leg_role,
-            } => (Some(session_id), Some(leg_role), None, 1),
+                renegotiate_from_so,
+            } => (Some(session_id), Some(leg_role), renegotiate_from_so, 1),
             PendingA1AssignmentKind::SmsTraffic => (None, None, Some(service_option), 1),
             PendingA1AssignmentKind::PacketData { service_ref_id } => {
                 if !is_packet_data_so(service_option) {
@@ -1979,6 +1995,7 @@ mod tests {
                 kind: PendingA1AssignmentKind::Voice {
                     session_id,
                     leg_role: VoiceLegRole::Callee,
+                    renegotiate_from_so: None,
                 },
                 bind_existing_traffic: true,
             },
