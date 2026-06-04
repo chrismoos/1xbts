@@ -1703,7 +1703,7 @@ impl AccessMessage {
             MessageId::Registration => decode_registration(header, &mut bs),
             MessageId::Order => decode_order(header, &mut bs),
             MessageId::DataBurst => decode_data_burst(header, &mut bs),
-            MessageId::Origination => decode_origination(header, &mut bs),
+            MessageId::Origination => decode_origination(header, &mut bs, ctx),
             MessageId::PageResponse => decode_page_response(header, &mut bs, ctx),
             MessageId::AuthChallengeResponse => decode_auth_challenge_response(header, &mut bs),
             MessageId::StatusResponse => decode_status_response(header, &mut bs),
@@ -1747,7 +1747,7 @@ impl AccessMessage {
             MessageId::Registration => decode_registration(header, &mut bs),
             MessageId::Order => decode_order(header, &mut bs),
             MessageId::DataBurst => decode_data_burst(header, &mut bs),
-            MessageId::Origination => decode_origination(header, &mut bs),
+            MessageId::Origination => decode_origination(header, &mut bs, ctx),
             MessageId::PageResponse => decode_page_response(header, &mut bs, ctx),
             MessageId::AuthChallengeResponse => decode_auth_challenge_response(header, &mut bs),
             MessageId::StatusResponse => decode_status_response(header, &mut bs),
@@ -5313,6 +5313,7 @@ fn decode_registration(
 fn decode_origination(
     header: AccessMessageHeader,
     bs: &mut Bitstream,
+    ctx: AccessDecodeContext,
 ) -> Result<AccessMessage, String> {
     let mob_term = read(bs, 1, "MOB_TERM")? == 1;
     let slot_cycle_index = read(bs, 3, "SLOT_CYCLE_INDEX")? as u8;
@@ -5374,34 +5375,11 @@ fn decode_origination(
         more_records,
     };
 
-    let encryption_options: &[bool] = if mob_p_rev < 7 {
-        &[true, false]
-    } else {
-        &[false]
-    };
-    let mut best: Option<(OriginationMessage, i32)> = None;
-    let mut last_err: Option<String> = None;
-    for &include_encryption_supported in encryption_options {
-        match decode_origination_tail(&base, tail.clone(), include_encryption_supported) {
-            Ok(msg) => {
-                let score = score_origination_candidate(&msg, include_encryption_supported);
-                if best
-                    .as_ref()
-                    .map_or(true, |(_, best_score)| score > *best_score)
-                {
-                    best = Some((msg, score));
-                }
-            }
-            Err(err) => {
-                last_err = Some(err);
-            }
-        }
-    }
-
-    match best {
-        Some((msg, _)) => Ok(AccessMessage::Origination(msg)),
-        None => Err(last_err.unwrap_or_else(|| "failed to decode origination tail".to_string())),
-    }
+    // C.S0005-E §2.7.1.3.2.4: ENCRYPTION_SUPPORTED present iff P_REV<7 and AUTH_MODE != 0.
+    let auth_mode = ctx.auth_mode.unwrap_or(0);
+    let include_encryption_supported = mob_p_rev < 7 && auth_mode != 0;
+    decode_origination_tail(&base, tail, include_encryption_supported)
+        .map(AccessMessage::Origination)
 }
 
 #[derive(Clone)]
@@ -6334,69 +6312,6 @@ fn is_valid_origination_ext_ch_ind(value: u8) -> bool {
 
 fn is_valid_rsci(value: u8) -> bool {
     matches!(value, 0b0000..=0b0100 | 0b0111 | 0b1001..=0b1110)
-}
-
-fn score_origination_candidate(
-    msg: &OriginationMessage,
-    include_encryption_supported: bool,
-) -> i32 {
-    let mut score = 0i32;
-    score -= msg.remaining_bits as i32;
-    if msg.paca_supported {
-        score += 40;
-    }
-    if msg.num_alt_so as usize == msg.alt_service_options.len() {
-        score += 20;
-    }
-    if msg.ch_ind.is_some_and(|v| v <= 0b11) {
-        score += 8;
-    }
-    if msg.sr_id.is_some_and(|v| v <= 0b111) {
-        score += 8;
-    }
-    if msg.mob_p_rev == 6 && msg.geo_loc_incl == Some(false) {
-        score += 25;
-    }
-    if msg.fch_supported == Some(true) && msg.fch_capability.is_some() {
-        score += 10;
-    }
-    if msg.dcch_supported == Some(true) && msg.dcch_capability.is_some() {
-        score += 10;
-    }
-    if msg.remaining_bits == 0 {
-        score += 100;
-    }
-    if include_encryption_supported && msg.encryption_supported.is_some() {
-        score += 2;
-    }
-
-    // Penalize invalid FOR_RC_PREF / REV_RC_PREF values.
-    // Per C.S0005-E Table 3.7.2.3.2.21-4, valid RC values are 1–12
-    // (encoded as 00001–01100). Values 0 or >12 are reserved/undefined
-    // and strongly suggest a bit-alignment error (e.g. ENCRYPTION_SUPPORTED
-    // was incorrectly included, shifting all subsequent fields by 4 bits).
-    if let Some(rc) = msg.for_rc_pref {
-        if rc == 0 || rc > 12 {
-            score -= 80;
-        }
-    }
-    if let Some(rc) = msg.rev_rc_pref {
-        if rc == 0 || rc > 12 {
-            score -= 80;
-        }
-    }
-
-    // Penalize FCH_SUPPORTED=true with empty forward RC list — the mobile
-    // would not declare FCH support without advertising at least one forward RC.
-    if msg.fch_supported == Some(true) {
-        if let Some(ref fch) = msg.fch_capability {
-            if fch.for_supported_rcs.is_empty() {
-                score -= 50;
-            }
-        }
-    }
-
-    score
 }
 
 fn decode_order(header: AccessMessageHeader, bs: &mut Bitstream) -> Result<AccessMessage, String> {
@@ -10072,8 +9987,11 @@ mod tests {
         bits.write_u8(0, 1); // GEO_LOC_INCL
         bits.write_u8(1, 1); // REV_FCH_GATING_REQ
 
-        let msg = AccessMessage::decode(&bits).expect("decode origination");
-        assert_reencodes(&bits, &msg, AccessDecodeContext::default());
+        // ENCRYPTION_SUPPORTED is present in this fixture, so decode with
+        // AUTH_MODE != 0 (per C.S0005-E §2.7.1.3.2.4).
+        let ctx = AccessDecodeContext::new(Some(1), None);
+        let msg = AccessMessage::decode_with_context(&bits, ctx).expect("decode origination");
+        assert_reencodes(&bits, &msg, ctx);
         let AccessMessage::Origination(msg) = msg else {
             panic!("expected origination message");
         };

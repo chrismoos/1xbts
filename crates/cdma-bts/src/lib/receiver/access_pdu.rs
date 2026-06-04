@@ -906,6 +906,8 @@ mod tests {
     use cdma_common::bits::Bitstream;
 
     use super::ReverseAccessPdu;
+    use crate::lac::message_types::{MessageId, WireChannel};
+    use crate::receiver::access_layer3::{AccessDecodeContext, AccessMessage, AccessMessageHeader};
 
     #[test]
     fn test_pd01_p_rev6_wrapper_parse() {
@@ -996,5 +998,110 @@ mod tests {
 
         assert!(summary.contains("unsupported r-csch MSG_TAG 0x0B"));
         assert!(!summary.contains("GeneralExtension"));
+    }
+
+    fn decode_origination_capture(hex: &str) -> AccessMessage {
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex"))
+            .collect();
+        let bits = Bitstream::new_bytes(&bytes);
+        let pdu = ReverseAccessPdu::decode(&bits).expect("decode reverse access PDU");
+        let (pd, msg_type, sdu) = match pdu {
+            ReverseAccessPdu::Pd00Legacy(p) => {
+                (p.header.pd, p.header.msg_type, p.sdu_plus_padding_raw)
+            }
+            ReverseAccessPdu::Pd01PRev6(p) => {
+                (p.header.pd, p.header.msg_type, p.sdu_plus_padding_raw)
+            }
+            _ => panic!("unexpected wrapper variant"),
+        };
+        let message_id = MessageId::from_wire(WireChannel::ReverseCommon, msg_type)
+            .expect("known r-csch MSG_TAG");
+        let header = AccessMessageHeader { pd, message_id };
+        let ctx = AccessDecodeContext::new(Some(0), None);
+        AccessMessage::decode_sdu_with_context(header, &sdu, ctx).expect("decode L3 SDU")
+    }
+
+    #[test]
+    fn capture_origination_p_rev3_so32768_a() {
+        let msg =
+            decode_origination_capture("04e20ed84c60ff9891e36215e2194a036a7800000e42a890e000");
+        let AccessMessage::Origination(orig) = msg else {
+            panic!("expected Origination");
+        };
+        assert_eq!(orig.mob_p_rev, 3);
+        assert_eq!(orig.service_option, Some(32768));
+        assert!(orig.special_service);
+        assert_eq!(orig.for_rc_pref, None);
+        assert_eq!(orig.rev_rc_pref, None);
+        assert_eq!(orig.fch_supported, None);
+        assert_eq!(orig.encryption_supported, None);
+    }
+
+    #[test]
+    fn capture_origination_p_rev3_so32768_b() {
+        let msg = decode_origination_capture("04e20ed95a83761891e3f9fe79104a036a7800000c42aa8a00");
+        let AccessMessage::Origination(orig) = msg else {
+            panic!("expected Origination");
+        };
+        assert_eq!(orig.mob_p_rev, 3);
+        assert_eq!(orig.service_option, Some(32768));
+        assert_eq!(orig.for_rc_pref, None);
+        assert_eq!(orig.encryption_supported, None);
+    }
+
+    #[test]
+    fn capture_origination_p_rev3_so3() {
+        let msg = decode_origination_capture("04020ed3813faa59f3e3d1aa08f789036a7000300906f000");
+        let AccessMessage::Origination(orig) = msg else {
+            panic!("expected Origination");
+        };
+        assert_eq!(orig.mob_p_rev, 3);
+        assert_eq!(orig.service_option, Some(3));
+        assert_eq!(orig.encryption_supported, None);
+    }
+
+    #[test]
+    fn capture_origination_p_rev6_so32768() {
+        let msg = decode_origination_capture(
+            "447f10762b3c3636c48e5b117da040001e140c507000001cdd51204004a6524be5e547231000",
+        );
+        let AccessMessage::Origination(orig) = msg else {
+            panic!("expected Origination");
+        };
+        assert_eq!(orig.mob_p_rev, 6);
+        assert_eq!(orig.service_option, Some(32768));
+        // Valid RC values are 1..=12 per C.S0005-E §3.7.2.3.2.21-4.
+        let for_rc = orig.for_rc_pref.expect("for_rc_pref present for P_REV=6");
+        assert!(
+            (1..=12).contains(&for_rc),
+            "for_rc_pref={} out of range",
+            for_rc
+        );
+        assert_eq!(orig.fch_supported, Some(true));
+        let fch = orig.fch_capability.as_ref().expect("fch_capability");
+        assert!(!fch.for_supported_rcs.is_empty());
+    }
+
+    #[test]
+    fn capture_origination_p_rev6_so33() {
+        let msg = decode_origination_capture(
+            "447f107667f247b2c48f1fcff3ac44001a140cd4600420131ddc0051631cbe5e54723100",
+        );
+        let AccessMessage::Origination(orig) = msg else {
+            panic!("expected Origination");
+        };
+        assert_eq!(orig.mob_p_rev, 6);
+        assert_eq!(orig.service_option, Some(33));
+        let for_rc = orig.for_rc_pref.expect("for_rc_pref present for P_REV=6");
+        assert!(
+            (1..=12).contains(&for_rc),
+            "for_rc_pref={} out of range",
+            for_rc
+        );
+        assert_eq!(orig.fch_supported, Some(true));
+        let fch = orig.fch_capability.as_ref().expect("fch_capability");
+        assert!(!fch.for_supported_rcs.is_empty());
     }
 }
