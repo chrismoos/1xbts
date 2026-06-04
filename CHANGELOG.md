@@ -1,5 +1,7 @@
 # HEAD 
 
+- Improved PRL decode error messages on failed `*228` read-backs.
+- Failed PRL read-backs can be downloaded as `.prl` from the session detail page.
 - Added OTASP (`*228`) over-the-air provisioning. Dial `*228` to
   program the handset's CDMA/Analog NAM (IMSI, MDN, home system
   banner), MMS URI, and Preferred Roaming List (classic and

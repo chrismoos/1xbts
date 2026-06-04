@@ -446,10 +446,20 @@ function PrlReadbackCard({ rb }: { rb: PrlReadbackJson }) {
     );
   }
   if (rb.decodeFailed) {
+    const partialId = rb.prListId ?? 0;
     return (
       <div className="text-xs space-y-1">
         <p className="text-accent-red">✗ PRL decode failed.</p>
         <p className="text-muted">Reason: <span className="font-mono">{rb.decodeFailed.reason ?? ""}</span></p>
+        {rb.decodeFailed.rawBytes && (
+          <p>
+            <DownloadPrlButton
+              base64={rb.decodeFailed.rawBytes}
+              filename={`prl-${partialId}-undecoded.prl`}
+            />
+            <span className="text-dimmed ml-2">Raw PRL.</span>
+          </p>
+        )}
       </div>
     );
   }

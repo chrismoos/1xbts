@@ -147,42 +147,117 @@ impl ClassicPrl {
     }
 }
 
+/// Tracks decode progress so EOF errors can name the failing stage,
+/// the bit offset, and (when relevant) the first unknown ACQ_TYPE we
+/// saw earlier in the table — classic records have no length field, so
+/// an unknown type is usually the real cause of a downstream EOF.
+struct DecodeCtx {
+    total_bits: usize,
+    first_unknown: Option<u8>,
+}
+
+impl DecodeCtx {
+    fn new(total_bits: usize) -> Self {
+        Self {
+            total_bits,
+            first_unknown: None,
+        }
+    }
+
+    fn err(&self, stage: &str, bs: &Bitstream, inner: Error) -> Error {
+        let pos = self.total_bits - bs.len();
+        let mut msg = format!(
+            "EOF decoding classic PRL: {} at bit offset {}/{} (octet {}): {}",
+            stage,
+            pos,
+            self.total_bits,
+            pos / BITS_PER_OCTET,
+            inner
+        );
+        if let Some(raw) = self.first_unknown {
+            msg.push_str(&format!(
+                " — first unknown ACQ_TYPE was 0x{raw:02x}; \
+                 classic records have no length field so an unknown type \
+                 desynchronises the remaining records"
+            ));
+            if raw > 0x09 {
+                msg.push_str(
+                    " (raw exceeds 4-bit classic range — check SSPR_P_REV from PRL Dimensions; \
+                     this may be an Extended PRL)",
+                );
+            }
+        }
+        msg.into()
+    }
+}
+
 /// Parse the classic PRL on-wire bytes (as reassembled from segments).
+///
+/// Decode errors include the failing stage and bit offset. Classic
+/// records have no length field, so the first unknown ACQ_TYPE
+/// encountered is also reported.
 pub fn decode(bytes: &[u8]) -> Result<ClassicPrl, Error> {
     if bytes.len() < MIN_PRL_BYTES {
-        return Err("PRL too short".into());
+        return Err(format!(
+            "PRL too short: {} octets, need at least {}",
+            bytes.len(),
+            MIN_PRL_BYTES
+        )
+        .into());
     }
     let mut bs = from_bytes(bytes);
-    let pr_list_size = read_u16(&mut bs, BITS_PR_LIST_SIZE)?;
-    let pr_list_id = read_u16(&mut bs, BITS_PR_LIST_ID)?;
-    let pref_only = read_bool(&mut bs)?;
-    let def_roam_ind = RoamingIndicator::from_u8(read_u8(&mut bs, BITS_DEF_ROAM_IND)?);
-    let num_acq_recs = read_u16(&mut bs, BITS_NUM_ACQ_RECS)? as usize;
-    let num_sys_recs = read_u32(&mut bs, BITS_NUM_SYS_RECS)? as usize;
+    let mut cx = DecodeCtx::new(bs.len());
+
+    let pr_list_size =
+        read_u16(&mut bs, BITS_PR_LIST_SIZE).map_err(|e| cx.err("PR_LIST_SIZE", &bs, e))?;
+    let pr_list_id =
+        read_u16(&mut bs, BITS_PR_LIST_ID).map_err(|e| cx.err("PR_LIST_ID", &bs, e))?;
+    let pref_only = read_bool(&mut bs).map_err(|e| cx.err("PREF_ONLY", &bs, e))?;
+    let def_roam_ind = RoamingIndicator::from_u8(
+        read_u8(&mut bs, BITS_DEF_ROAM_IND).map_err(|e| cx.err("DEF_ROAM_IND", &bs, e))?,
+    );
+    let num_acq_recs =
+        read_u16(&mut bs, BITS_NUM_ACQ_RECS).map_err(|e| cx.err("NUM_ACQ_RECS", &bs, e))? as usize;
+    let num_sys_recs =
+        read_u32(&mut bs, BITS_NUM_SYS_RECS).map_err(|e| cx.err("NUM_SYS_RECS", &bs, e))? as usize;
 
     let mut acquisition_records = Vec::with_capacity(num_acq_recs);
-    for _ in 0..num_acq_recs {
-        acquisition_records.push(AcquisitionRecord::decode(&mut bs)?);
+    for i in 0..num_acq_recs {
+        let stage = format!("acquisition record {} of {}", i, num_acq_recs);
+        let rec = AcquisitionRecord::decode(&mut bs).map_err(|e| cx.err(&stage, &bs, e))?;
+        if cx.first_unknown.is_none() && matches!(rec.body, AcquisitionBody::Unknown) {
+            cx.first_unknown = Some(rec.acq_type_raw);
+        }
+        acquisition_records.push(rec);
     }
     let mut system_records = Vec::with_capacity(num_sys_recs);
-    for _ in 0..num_sys_recs {
-        system_records.push(SystemRecord::decode(&mut bs)?);
+    for i in 0..num_sys_recs {
+        let stage = format!("system record {} of {}", i, num_sys_recs);
+        system_records.push(SystemRecord::decode(&mut bs).map_err(|e| cx.err(&stage, &bs, e))?);
     }
     // Skip the trailing RESERVED bit-padding so the CRC starts on an
     // octet boundary. `bs.len()` reports remaining bits in the stream;
     // the CRC is the last 16, so anything beyond that is padding.
     let remaining = bs.len();
     if remaining < BITS_CRC {
-        return Err("PRL truncated before CRC".into());
+        return Err(cx.err(
+            "PRL truncated before CRC",
+            &bs,
+            format!("{} bits remain, need {}", remaining, BITS_CRC).into(),
+        ));
     }
     let pad = remaining - BITS_CRC;
     if pad >= BITS_PER_OCTET {
-        return Err("PRL padding too large".into());
+        return Err(cx.err(
+            "PRL padding too large",
+            &bs,
+            format!("{} pad bits, max {}", pad, BITS_PER_OCTET - 1).into(),
+        ));
     }
     if pad != 0 {
-        let _ = read_u8(&mut bs, pad)?;
+        let _ = read_u8(&mut bs, pad).map_err(|e| cx.err("RESERVED padding", &bs, e))?;
     }
-    let pr_list_crc = read_u16(&mut bs, BITS_CRC)?;
+    let pr_list_crc = read_u16(&mut bs, BITS_CRC).map_err(|e| cx.err("PR_LIST_CRC", &bs, e))?;
 
     let computed_crc = compute_prl_crc(bytes);
 
