@@ -95,6 +95,13 @@ pub struct Config<const EK: usize, const ER: usize> {
     pub lc_chip_cursor: u64,
     /// Shared scheduler for absolute-PCG power control bits.
     pub pcb_scheduler: PcgPcbSchedulerHandle,
+    /// FPC subchannel gain as a linear amplitude ratio relative to full-rate
+    /// F-FCH data symbols. C.S0005 FPC_SUBCHAN_GAIN is in 0.25 dB units.
+    pub fpc_subchan_gain_linear: f32,
+    /// RC1 mobiles select the puncture position from the selector latched at
+    /// the end of the previous PCG. This carries that selector across PCGs and
+    /// across 20 ms frame boundaries.
+    pub previous_pcg_pc_start: usize,
 }
 
 /// Caller-side frame prep state.
@@ -109,6 +116,9 @@ pub struct ForwardTrafficChannel<const EK: usize, const ER: usize> {
     prep: Mutex<PrepEngine<EK, ER>>,
     frames: Mutex<VecDeque<PreparedFrame>>,
     signaling_frames: Mutex<VecDeque<PreparedFrame>>,
+    /// Power-control bit scheduler. Stored outside `config` so scheduling a
+    /// future PCB never waits on the TX thread's long-held config lock.
+    pcb_scheduler: PcgPcbSchedulerHandle,
     /// Tracks consecutive null frames for rate-limited logging.
     null_frame_state: Mutex<NullFrameState>,
     /// Timestamp of the last frame enqueued via `send_frame`.
@@ -128,6 +138,7 @@ struct NullFrameState {
 
 impl<const EK: usize, const ER: usize> ForwardTrafficChannel<EK, ER> {
     pub fn new(config: Config<EK, ER>) -> Self {
+        let pcb_scheduler = config.pcb_scheduler.clone();
         let prep = PrepEngine {
             encoder: config.encoder,
             interleaver: config.interleaver.clone(),
@@ -141,6 +152,7 @@ impl<const EK: usize, const ER: usize> ForwardTrafficChannel<EK, ER> {
             prep: Mutex::new(prep),
             frames: Mutex::new(VecDeque::new()),
             signaling_frames: Mutex::new(VecDeque::new()),
+            pcb_scheduler,
             null_frame_state: Mutex::new(NullFrameState {
                 consecutive_nulls: 0,
                 null_run_start: None,
@@ -229,19 +241,13 @@ impl<const EK: usize, const ER: usize> ForwardTrafficChannel<EK, ER> {
 
     /// Schedule a single power-control bit for an absolute PCG index.
     pub fn schedule_power_control_bit(&self, abs_pcg: u64, bit: u8) {
-        let scheduler = {
-            let config = self.config.lock();
-            config.pcb_scheduler.clone()
-        };
-        scheduler.lock().schedule(abs_pcg, bit);
+        self.pcb_scheduler.lock().schedule(abs_pcg, bit);
     }
 
     pub fn schedule_power_control_burst(&self, start_abs_pcg: u64, pcgs: u64, bit: u8) {
-        let scheduler = {
-            let config = self.config.lock();
-            config.pcb_scheduler.clone()
-        };
-        scheduler.lock().schedule_burst(start_abs_pcg, pcgs, bit);
+        self.pcb_scheduler
+            .lock()
+            .schedule_burst(start_abs_pcg, pcgs, bit);
     }
 
     /// Advance the internal long code generator to the given absolute chip
@@ -249,8 +255,32 @@ impl<const EK: usize, const ER: usize> ForwardTrafficChannel<EK, ER> {
     pub fn advance_lc_to_chip(&self, chip: u64) {
         let mut config = self.config.lock();
         let delta = chip.saturating_sub(config.lc_chip_cursor);
+        if chip >= PCG_CHIPS as u64 {
+            let prev_delta = chip
+                .saturating_sub(PCG_CHIPS as u64)
+                .saturating_sub(config.lc_chip_cursor);
+            let mut prev_pcg_lc = config.long_code_generator.clone();
+            prev_pcg_lc.advance_chips(prev_delta as usize);
+            config.previous_pcg_pc_start = Self::pc_start_from_pcg_lc(&mut prev_pcg_lc);
+        }
         config.long_code_generator.advance_chips(delta as usize);
         config.lc_chip_cursor = chip;
+    }
+
+    fn pc_start_from_pcg_lc(long_code_generator: &mut LongCodeGenerator) -> usize {
+        let mut lc_decimated = [0u8; SYMBOLS_PER_PCG];
+        for bit in &mut lc_decimated {
+            *bit = long_code_generator.next_chip();
+            for _ in 1..64 {
+                long_code_generator.next_chip();
+            }
+        }
+
+        let b3 = lc_decimated[23] as usize;
+        let b2 = lc_decimated[22] as usize;
+        let b1 = lc_decimated[21] as usize;
+        let b0 = lc_decimated[20] as usize;
+        (b3 << 3) | (b2 << 2) | (b1 << 1) | b0
     }
 
     fn pop_next_frame(&self) -> Option<PreparedFrame> {
@@ -361,7 +391,7 @@ impl<const EK: usize, const ER: usize> ForwardTrafficChannel<EK, ER> {
         let end = start + SYMBOLS_PER_PCG;
 
         let abs_pcg = config.lc_chip_cursor / PCG_CHIPS as u64;
-        let pcb = config.pcb_scheduler.lock().read(abs_pcg);
+        let pcb = self.pcb_scheduler.lock().read(abs_pcg);
 
         let mut lc_decimated = [0u8; SYMBOLS_PER_PCG];
         for bit in &mut lc_decimated {
@@ -375,23 +405,24 @@ impl<const EK: usize, const ER: usize> ForwardTrafficChannel<EK, ER> {
         let b2 = lc_decimated[22] as usize;
         let b1 = lc_decimated[21] as usize;
         let b0 = lc_decimated[20] as usize;
-        let pc_start = (b3 << 3) | (b2 << 2) | (b1 << 1) | b0;
+        let current_pc_start = (b3 << 3) | (b2 << 2) | (b1 << 1) | b0;
+        let pc_start = config.previous_pcg_pc_start;
 
         for (symbol_in_pcg, &sym) in prepared.interleaved[start..end].iter().enumerate() {
             let scrambled = sym ^ lc_decimated[symbol_in_pcg];
-            let output_bit = if symbol_in_pcg == pc_start || symbol_in_pcg == pc_start + 1 {
-                pcb
+            let output = if symbol_in_pcg == pc_start || symbol_in_pcg == pc_start + 1 {
+                let sign = if pcb == 0 { 1.0 } else { -1.0 };
+                Complex32::new(sign * config.fpc_subchan_gain_linear, 0.0)
+            } else if scrambled == 0 {
+                Complex32::new(1.0, 0.0)
             } else {
-                scrambled
+                Complex32::new(-1.0, 0.0)
             };
-
-            tx_state.symbol_buffer.push_back(Complex32::new(
-                if output_bit == 0 { 1.0 } else { -1.0 },
-                0.0,
-            ));
+            tx_state.symbol_buffer.push_back(output);
         }
 
         config.lc_chip_cursor = config.lc_chip_cursor.saturating_add(PCG_CHIPS as u64);
+        config.previous_pcg_pc_start = current_pc_start;
         prepared.next_pcg += 1;
         if prepared.next_pcg == SR1_PCGS_PER_FRAME {
             trace!(
@@ -449,6 +480,8 @@ mod tests {
             long_code_generator: LongCodeGenerator::new_traffic_channel(0xDEADBEEF),
             lc_chip_cursor: 0,
             pcb_scheduler: crate::channels::PcgPcbScheduler::new(0),
+            fpc_subchan_gain_linear: 1.0,
+            previous_pcg_pc_start: 0,
         })
     }
 
@@ -532,6 +565,29 @@ mod tests {
     }
 
     #[test]
+    fn test_fpc_subchannel_gain_is_applied_with_previous_pcg_selector() {
+        let esn = 0xDEADBEEF;
+        let ch = ForwardTrafficChannel::new(Config {
+            encoder: get_1_2_k9_encoder(),
+            interleaver: BitReversalInterleaver::new(SR1_PARAMS_384),
+            long_code_generator: LongCodeGenerator::new_traffic_channel(esn),
+            lc_chip_cursor: 0,
+            pcb_scheduler: crate::channels::PcgPcbScheduler::new(0),
+            fpc_subchan_gain_linear: 2.0,
+            previous_pcg_pc_start: 0,
+        });
+        ch.schedule_power_control_burst(0, SR1_PCGS_PER_FRAME as u64, 1);
+
+        let frame = ch.next(CdmaSystemTime::default());
+
+        let boosted = frame
+            .iter()
+            .filter(|sym| (sym.re.abs() - 2.0).abs() < f32::EPSILON)
+            .count();
+        assert_eq!(boosted, SR1_PCGS_PER_FRAME * 2);
+    }
+
+    #[test]
     fn test_full_rate_loopback_decode() {
         // Forward link loopback: encode a known full-rate frame through the
         // ForwardTrafficChannel, then manually reverse all processing steps
@@ -545,6 +601,8 @@ mod tests {
             long_code_generator: LongCodeGenerator::new_traffic_channel(esn),
             lc_chip_cursor: 0,
             pcb_scheduler: crate::channels::PcgPcbScheduler::new(0),
+            fpc_subchan_gain_linear: 1.0,
+            previous_pcg_pc_start: 0,
         });
 
         // Build a recognizable 172-bit payload (MuxPDU header + signaling)
@@ -673,6 +731,8 @@ mod tests {
             long_code_generator: LongCodeGenerator::new_traffic_channel(esn),
             lc_chip_cursor: 0,
             pcb_scheduler: crate::channels::PcgPcbScheduler::new(0),
+            fpc_subchan_gain_linear: 1.0,
+            previous_pcg_pc_start: 0,
         });
 
         // Advance LC to frame boundary (like BTS TX loop does)

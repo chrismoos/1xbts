@@ -6089,6 +6089,23 @@ fn rotate_rc1_pcg_positions(
     shifted
 }
 
+fn rc1_tx_pc_positions_with_lc_state(
+    esn: u32,
+    long_code_state: u64,
+    frame_chip_offset: u64,
+) -> [usize; 16] {
+    let (_, current_positions) =
+        rc1_pc_positions_with_lc_state(esn, long_code_state, frame_chip_offset);
+    let mut tx_positions = [0usize; 16];
+    if frame_chip_offset >= RC1_PCG_CHIPS {
+        let (_, prev_positions) =
+            rc1_pc_positions_with_lc_state(esn, long_code_state, frame_chip_offset - RC1_PCG_CHIPS);
+        tx_positions[0] = prev_positions[0];
+    }
+    tx_positions[1..].copy_from_slice(&current_positions[..15]);
+    tx_positions
+}
+
 fn matching_rc1_pcb_bits(observed: &[u8; 16], expected: &[u8; 16]) -> usize {
     observed
         .iter()
@@ -6318,6 +6335,8 @@ fn build_expected_bs_ack_ftch_symbols(
         long_code_generator: LongCodeGenerator::new_traffic_channel(esn),
         lc_chip_cursor: 0,
         pcb_scheduler: scheduled_pcb_bits(absolute_chip_start, [0; 16], 1),
+        fpc_subchan_gain_linear: 1.0,
+        previous_pcg_pc_start: 0,
     });
     ftch.advance_lc_to_chip(absolute_chip_start);
     ftch.send_frame(cdma_bts::channels::ftch::TrafficFrame {
@@ -6459,6 +6478,8 @@ fn build_bs_ack_ftch_symbols_with_lc_state_and_pc_bits(
         ),
         lc_chip_cursor: 0,
         pcb_scheduler: scheduled_pcb_bits(frame_chip_offset, power_control_bits, 1),
+        fpc_subchan_gain_linear: 1.0,
+        previous_pcg_pc_start: 0,
     });
     ftch.advance_lc_to_chip(frame_chip_offset);
     ftch.send_frame(cdma_bts::channels::ftch::TrafficFrame {
@@ -6467,8 +6488,9 @@ fn build_bs_ack_ftch_symbols_with_lc_state_and_pc_bits(
     });
     let raw_symbols = ftch.next(cdma_common::time::CdmaSystemTime::default());
 
-    let (lc_decimated, pc_positions) =
-        rc1_pc_positions_with_lc_state(esn, long_code_state, frame_chip_offset);
+    let (lc_decimated, _) = rc1_pc_positions_with_lc_state(esn, long_code_state, frame_chip_offset);
+    let tx_pc_positions =
+        rc1_tx_pc_positions_with_lc_state(esn, long_code_state, frame_chip_offset);
 
     Ok(raw_symbols
         .into_iter()
@@ -6477,7 +6499,7 @@ fn build_bs_ack_ftch_symbols_with_lc_state_and_pc_bits(
             let sign = if lc_decimated[idx] == 0 { 1.0 } else { -1.0 };
             let pcg = idx / 24;
             let symbol_in_pcg = idx % 24;
-            let pc_start = pc_positions[pcg];
+            let pc_start = tx_pc_positions[pcg];
             if symbol_in_pcg == pc_start || symbol_in_pcg == pc_start + 1 {
                 if erase_punctures { 0.0 } else { s.re }
             } else {
@@ -6531,6 +6553,8 @@ fn build_expected_bs_ack_ftch_chip_samples(
         long_code_generator: LongCodeGenerator::new_traffic_channel(esn),
         lc_chip_cursor: 0,
         pcb_scheduler: scheduled_pcb_bits(absolute_chip_start, [0; 16], 1),
+        fpc_subchan_gain_linear: 1.0,
+        previous_pcg_pc_start: 0,
     });
     ftch.advance_lc_to_chip(absolute_chip_start);
     ftch.send_frame(cdma_bts::channels::ftch::TrafficFrame {
@@ -6597,6 +6621,8 @@ fn build_expected_bs_ack_recovered_chip_samples(
         long_code_generator: LongCodeGenerator::new_traffic_channel(esn),
         lc_chip_cursor: 0,
         pcb_scheduler: scheduled_pcb_bits(context_start, [0; 16], 2),
+        fpc_subchan_gain_linear: 1.0,
+        previous_pcg_pc_start: 0,
     });
     ftch.advance_lc_to_chip(context_start);
     let mut raw_symbols = ftch.next(cdma_common::time::CdmaSystemTime::default());
@@ -6757,6 +6783,8 @@ fn build_local_forward_rc1_composite_iq_samples(
                 alternating_power_control_bits(),
                 frames,
             ),
+            fpc_subchan_gain_linear: 1.0,
+            previous_pcg_pc_start: 0,
         }),
     );
     traffic.channel.advance_lc_to_chip(absolute_chip_start);
@@ -6895,6 +6923,8 @@ fn build_local_forward_rc1_composite_iq_samples_with_lc_state(
             ),
             lc_chip_cursor: 0,
             pcb_scheduler: scheduled_pcb_bits(0, alternating_power_control_bits(), frames),
+            fpc_subchan_gain_linear: 1.0,
+            previous_pcg_pc_start: 0,
         }),
     );
     traffic.channel.send_frame(TrafficFrame {
@@ -8500,19 +8530,21 @@ fn test_local_forward_rc1_bs_ack_alternating_pc_punctures_match_expected() -> Re
         pc_bits,
         false,
     )?;
-    let (_, pc_positions) =
-        rc1_pc_positions_with_lc_state(esn, MATLAB_DEFAULT_LONG_CODE_STATE, frame_chip_offset);
+    let expected_pc_positions =
+        rc1_tx_pc_positions_with_lc_state(esn, MATLAB_DEFAULT_LONG_CODE_STATE, frame_chip_offset);
 
-    for (pcg, pc_start) in pc_positions.iter().copied().enumerate() {
+    for (pcg, pc_start) in expected_pc_positions.iter().copied().enumerate() {
         let expected = if pc_bits[pcg] == 0 { 1.0 } else { -1.0 };
         let base = pcg * 24;
         assert!(
             (symbols[base + pc_start] - expected).abs() < 1e-6,
-            "pcg {pcg} first punctured symbol mismatch"
+            "pcg {pcg} first punctured symbol mismatch pc_start={pc_start} actual={} expected={expected}",
+            symbols[base + pc_start]
         );
         assert!(
             (symbols[base + pc_start + 1] - expected).abs() < 1e-6,
-            "pcg {pcg} second punctured symbol mismatch"
+            "pcg {pcg} second punctured symbol mismatch pc_start={pc_start} actual={} expected={expected}",
+            symbols[base + pc_start + 1]
         );
     }
 
@@ -8600,12 +8632,17 @@ fn test_decode_forward_rc1_bs_ack_from_matlab_composite_wav() -> Result<(), Erro
     assert_bs_ack_frame(&local_observation.iq.decoded);
 
     assert_eq!(
-        local_observation.best_shift.shift, 0,
-        "expected local RC1 PCB positions to use the current PCG selector"
+        local_observation.best_shift.shift, 1,
+        "expected local RC1 PCB positions to use the previous PCG selector"
     );
     assert_eq!(
-        local_observation.best_shift.pc_positions, local_observation.iq.pc_positions,
-        "expected local RC1 PCB positions to use the LC-derived selector directly"
+        local_observation.best_shift.pc_positions,
+        rotate_rc1_pcg_positions(&local_observation.iq.pc_positions, 1, true),
+        "expected local RC1 PCB positions to match a one-PCG right rotation"
+    );
+    assert!(
+        local_observation.best_shift.rotate_right,
+        "expected local RC1 PCB positions to match a one-PCG right rotation"
     );
     assert_eq!(
         matlab_observation.best_shift.shift, 1,
@@ -8806,6 +8843,8 @@ fn test_decode_forward_rc1_bs_ack_from_pulse_shaped_traffic_only_samples() -> Re
         long_code_generator: LongCodeGenerator::new_traffic_channel(esn),
         lc_chip_cursor: 0,
         pcb_scheduler: scheduled_pcb_bits(absolute_chip_start, [0; 16], 2),
+        fpc_subchan_gain_linear: 1.0,
+        previous_pcg_pc_start: 0,
     });
     ftch.advance_lc_to_chip(absolute_chip_start);
     let mut raw_symbols = ftch.next(cdma_common::time::CdmaSystemTime::default());

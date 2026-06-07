@@ -3244,15 +3244,13 @@ fn traffic_frame_validity(event: &AccessChannelEvent) -> bool {
         let tail_valid = event.traffic_tail_valid.unwrap_or(false);
         if fqi_bits > 0 {
             tail_valid && event.traffic_fqi_valid.unwrap_or(false)
-        } else if is_signaling || primary_rate >= 4800 {
-            tail_valid && event.traffic_phy_valid.unwrap_or(true)
         } else {
-            tail_valid && event.traffic_ml_tail_match.unwrap_or(true)
+            tail_valid && event.traffic_phy_valid.unwrap_or(true)
         }
     } else if is_signaling || primary_rate >= 4800 {
         event.traffic_phy_valid.unwrap_or(true)
     } else {
-        event.traffic_ml_tail_match.unwrap_or(true)
+        event.traffic_phy_valid.unwrap_or(true)
     }
 }
 

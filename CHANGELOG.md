@@ -1,5 +1,7 @@
 # HEAD 
 
+- Fixed RC1 voice forward and reverse FER by correcting PCB puncturing and
+  low-rate reverse frame timing.
 - BTS TX slow-generation warnings now use full-batch timing instead of
   per-block timing.
 - Voice originations with SO32768 are now accepted and renegotiated to

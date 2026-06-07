@@ -19,7 +19,7 @@ pub struct TrafficRxRequest {
 }
 
 /// Initial linear amplitude gain for an RC1 forward traffic channel.
-pub const RC1_TRAFFIC_INITIAL_GAIN_LINEAR: f32 = 0.42;
+pub const RC1_TRAFFIC_INITIAL_GAIN_LINEAR: f32 = 0.838;
 
 /// Initial linear amplitude gain for an RC3 forward traffic channel.
 pub const RC3_TRAFFIC_INITIAL_GAIN_LINEAR: f32 = 0.5;

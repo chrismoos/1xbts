@@ -323,7 +323,7 @@ impl PcgPcbScheduler {
         bit
     }
 
-    fn fallback_for(&self, abs_pcg: u64, _cause: PcgFallbackCause) -> u8 {
+    fn fallback_for(&self, abs_pcg: u64, cause: PcgFallbackCause) -> u8 {
         match self.fallback_mode {
             // Always command "up" (0) on unscheduled PCGs so the MS doesn't
             // drop power during scheduling gaps. A slight upward creep is
@@ -333,7 +333,10 @@ impl PcgPcbScheduler {
             PcgPcbFallbackMode::Down => 1,
             // Alternating UP/DOWN is the closest representable HOLD command.
             PcgPcbFallbackMode::AlternatingHold => (abs_pcg as u8) & 1,
-            PcgPcbFallbackMode::UpBeforeFirstThenHold => (abs_pcg as u8) & 1,
+            PcgPcbFallbackMode::UpBeforeFirstThenHold => match cause {
+                PcgFallbackCause::Empty | PcgFallbackCause::BeforeFirstScheduled => 0,
+                PcgFallbackCause::GapWithFuture | PcgFallbackCause::RanDry => (abs_pcg as u8) & 1,
+            },
         }
     }
 
@@ -397,7 +400,7 @@ mod pcb_scheduler_tests {
     }
 
     #[test]
-    fn up_before_first_then_hold_fallback_is_neutral_hold() {
+    fn up_before_first_then_hold_fallback_commands_up_until_first_schedule() {
         let scheduler = PcgPcbScheduler::new_named_with_fallback(
             0,
             11,
@@ -407,12 +410,12 @@ mod pcb_scheduler_tests {
         let mut scheduler = scheduler.lock();
 
         assert_eq!(scheduler.read(8), 0);
-        assert_eq!(scheduler.read(9), 1);
-        assert_eq!(scheduler.read(65), 1);
-        assert_eq!(scheduler.read(67), 1);
+        assert_eq!(scheduler.read(9), 0);
+        assert_eq!(scheduler.read(65), 0);
+        assert_eq!(scheduler.read(67), 0);
         scheduler.schedule(70, 0);
         assert_eq!(scheduler.read(68), 0);
-        assert_eq!(scheduler.read(69), 1);
+        assert_eq!(scheduler.read(69), 0);
         assert_eq!(scheduler.read(70), 0);
         assert_eq!(scheduler.read(71), 1);
         assert_eq!(scheduler.read(72), 0);

@@ -228,7 +228,7 @@ impl Bsc {
                 esn,
                 assigned_rev_rc: assigned_rcs.1,
                 preamble_num_pcgs: None,
-                rev_fch_gating_mode: ms_gating,
+                rev_fch_gating_mode: ms_gating && (3..=6).contains(&assigned_rcs.1),
             })
             .await;
         info!("BSC: requested reverse traffic RX for walsh={}", walsh_code);
@@ -377,7 +377,7 @@ impl Bsc {
                 esn,
                 assigned_rev_rc: assigned_rcs.1,
                 preamble_num_pcgs: None,
-                rev_fch_gating_mode: ms_gating,
+                rev_fch_gating_mode: ms_gating && (3..=6).contains(&assigned_rcs.1),
             })
             .await;
 
@@ -575,7 +575,7 @@ impl Bsc {
                 esn,
                 assigned_rev_rc: assigned_rcs.1,
                 preamble_num_pcgs: None,
-                rev_fch_gating_mode: ms_gating,
+                rev_fch_gating_mode: ms_gating && (3..=6).contains(&assigned_rcs.1),
             })
             .await;
         info!(
@@ -703,7 +703,7 @@ impl Bsc {
                 esn,
                 assigned_rev_rc: assigned_rcs.1,
                 preamble_num_pcgs: None,
-                rev_fch_gating_mode: ms_gating,
+                rev_fch_gating_mode: ms_gating && (3..=6).contains(&assigned_rcs.1),
             })
             .await;
 
@@ -819,7 +819,7 @@ impl TrafficAssignmentService {
                 rev_rc,
                 early_rl,
             );
-            ecam.rev_fch_gating_mode = ms_gating_req;
+            ecam.rev_fch_gating_mode = ms_gating_req && (3..=6).contains(&rev_rc);
             ecam.freq_incl = true;
             ecam.band_class = overhead.band_class;
             ecam.cdma_freq = overhead.cdma_freq;

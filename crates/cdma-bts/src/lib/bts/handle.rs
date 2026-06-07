@@ -534,6 +534,7 @@ impl BtsHandle {
             &self.traffic_channels,
             lc_generator,
             initial_lc_chip,
+            0,
         )
     }
 
@@ -552,9 +553,11 @@ pub fn allocate_traffic_channel(
     traffic_channels: &TrafficChannelPool,
     lc_generator: LongCodeGenerator,
     _initial_lc_chip: u64,
+    fpc_subchan_gain: u8,
 ) -> Option<(u8, TrafficWalshChannel)> {
     let walsh_code = walsh_allocator.lock().allocate()?;
 
+    let fpc_subchan_gain_linear = fpc_subchan_gain_to_linear(fpc_subchan_gain);
     let ftch = WalshChannel::new(
         WalshGenerator::new::<64>(walsh_code as usize, 1),
         ForwardTrafficChannel::new(ftch::Config {
@@ -568,6 +571,8 @@ pub fn allocate_traffic_channel(
                 format!("rc1-w{}", walsh_code),
                 PcgPcbFallbackMode::UpBeforeFirstThenHold,
             ),
+            fpc_subchan_gain_linear,
+            previous_pcg_pc_start: 0,
         }),
     );
 
@@ -602,6 +607,11 @@ pub fn set_traffic_channel_gain(
     }
 }
 
+fn fpc_subchan_gain_to_linear(fpc_subchan_gain: u8) -> f32 {
+    let gain_db = fpc_subchan_gain as f32 * 0.25;
+    10f32.powf(gain_db / 20.0)
+}
+
 /// Allocate a forward traffic channel on the given pool/allocator (RC3).
 ///
 /// RC3 uses R=1/4 K=9 encoding, 768-symbol forward-backwards interleaver
@@ -617,10 +627,7 @@ pub fn allocate_traffic_channel_rc3(
 ) -> Option<(u8, TrafficWalshChannelRc3)> {
     let walsh_code = walsh_allocator.lock().allocate()?;
 
-    // Convert 5-bit FPC_SUBCHAN_GAIN (units of 0.25 dB relative to
-    // full-rate F-FCH) to linear amplitude ratio.
-    let gain_db = fpc_subchan_gain as f32 * 0.25;
-    let gain_linear = 10f32.powf(gain_db / 20.0);
+    let fpc_subchan_gain_linear = fpc_subchan_gain_to_linear(fpc_subchan_gain);
 
     // The RC3 F-FCH TX uses two independent LC generators (one for
     // scrambling, one for PC puncture position extraction) that are
@@ -642,7 +649,7 @@ pub fn allocate_traffic_channel_rc3(
                 format!("rc3-w{}", walsh_code),
                 PcgPcbFallbackMode::UpBeforeFirstThenHold,
             ),
-            fpc_subchan_gain_linear: gain_linear,
+            fpc_subchan_gain_linear,
             prev_frame_last_chip: 0,
             disable_lc_scrambling: false,
         }),
@@ -670,7 +677,9 @@ pub fn commit_traffic_channel(
     traffic_channels: &TrafficChannelPool,
     walsh_code: u8,
     lc_generator: LongCodeGenerator,
+    fpc_subchan_gain: u8,
 ) -> TrafficWalshChannel {
+    let fpc_subchan_gain_linear = fpc_subchan_gain_to_linear(fpc_subchan_gain);
     let ftch = WalshChannel::new(
         WalshGenerator::new::<64>(walsh_code as usize, 1),
         ForwardTrafficChannel::new(ftch::Config {
@@ -684,6 +693,8 @@ pub fn commit_traffic_channel(
                 format!("rc1-w{}", walsh_code),
                 PcgPcbFallbackMode::UpBeforeFirstThenHold,
             ),
+            fpc_subchan_gain_linear,
+            previous_pcg_pc_start: 0,
         }),
     );
 
@@ -709,8 +720,7 @@ pub fn commit_traffic_channel_rc3(
     lc_generator: LongCodeGenerator,
     fpc_subchan_gain: u8,
 ) -> TrafficWalshChannelRc3 {
-    let gain_db = fpc_subchan_gain as f32 * 0.25;
-    let gain_linear = 10f32.powf(gain_db / 20.0);
+    let fpc_subchan_gain_linear = fpc_subchan_gain_to_linear(fpc_subchan_gain);
 
     let scrambling_lc = lc_generator.clone();
     let puncture_lc = lc_generator;
@@ -729,7 +739,7 @@ pub fn commit_traffic_channel_rc3(
                 format!("rc3-w{}", walsh_code),
                 PcgPcbFallbackMode::UpBeforeFirstThenHold,
             ),
-            fpc_subchan_gain_linear: gain_linear,
+            fpc_subchan_gain_linear,
             prev_frame_last_chip: 0,
             disable_lc_scrambling: false,
         }),

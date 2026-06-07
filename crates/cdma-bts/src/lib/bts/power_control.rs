@@ -44,6 +44,13 @@ const METRIC_HISTORY_LEN: usize = 24;
 /// PCGs the inner loop predicts ahead before scheduling the PCB.
 /// Must exceed metric arrival age or the TX scheduler runs late.
 pub(super) const PCG_PREDICTION_LEAD_PCGS: u32 = 12;
+/// Number of future PCB slots one sparse RC1 measurement fills.
+///
+/// RC1 low-rate reverse frames only transmit a subset of R-FCH PCGs, but the
+/// non-gated forward power-control subchannel still carries one PCB every PCG.
+/// Filling one 20 ms frame ahead covers the largest data-burst-randomizer gap
+/// between active eighth-rate PCGs without letting TX fallback drive FPC.
+const RC1_PCB_SPECULATIVE_FILL_PCGS: u64 = 16;
 const PCG_PREDICTION_CLAMP_DB: f32 = 1.0;
 // Brake offset subtracted from the PCB error in the pre-clip region to keep
 // the reverse link below the ADC knee.
@@ -54,6 +61,13 @@ const CLIP_BEGIN_DBFS: f32 = -8.0;
 const PCG_CLIP_COOLDOWN_PCGS: u8 = 32;
 const PCG_RAW_HOT_LIMIT_DBFS: f32 = -8.0;
 const PCG_RAW_HOT_RELEASE_DBFS: f32 = -10.0;
+const RC1_BRAKE_BEGIN_DBFS: f32 = -6.0;
+const RC1_BRAKE_FULL_DBFS: f32 = 0.0;
+const RC1_BRAKE_MAX_OFFSET_DB: f32 = 3.0;
+const RC1_CLIP_BEGIN_DBFS: f32 = -2.0;
+const RC1_PCG_CLIP_COOLDOWN_PCGS: u8 = 8;
+const RC1_PCG_RAW_HOT_LIMIT_DBFS: f32 = -2.0;
+const RC1_PCG_RAW_HOT_RELEASE_DBFS: f32 = -4.0;
 const OUTER_LOOP_OVERPOWER_CLIP_PCGS: usize = 4;
 const OUTER_LOOP_UNDERPOWER_ERROR_DB: f32 = 4.0;
 const OUTER_LOOP_UNDERPOWER_MIN_UP_PCBS: usize = 12;
@@ -91,6 +105,39 @@ pub struct BtsPowerControlSnapshot {
 struct BtsReversePowerSetpoint {
     target_db: f32,
     held: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RawPowerLimiterProfile {
+    brake_begin_dbfs: f32,
+    brake_full_dbfs: f32,
+    brake_max_offset_db: f32,
+    clip_begin_dbfs: f32,
+    clip_cooldown_pcgs: u8,
+    raw_hot_limit_dbfs: f32,
+    raw_hot_release_dbfs: f32,
+}
+
+impl RawPowerLimiterProfile {
+    const RC3: Self = Self {
+        brake_begin_dbfs: BRAKE_BEGIN_DBFS,
+        brake_full_dbfs: BRAKE_FULL_DBFS,
+        brake_max_offset_db: BRAKE_MAX_OFFSET_DB,
+        clip_begin_dbfs: CLIP_BEGIN_DBFS,
+        clip_cooldown_pcgs: PCG_CLIP_COOLDOWN_PCGS,
+        raw_hot_limit_dbfs: PCG_RAW_HOT_LIMIT_DBFS,
+        raw_hot_release_dbfs: PCG_RAW_HOT_RELEASE_DBFS,
+    };
+
+    const RC1: Self = Self {
+        brake_begin_dbfs: RC1_BRAKE_BEGIN_DBFS,
+        brake_full_dbfs: RC1_BRAKE_FULL_DBFS,
+        brake_max_offset_db: RC1_BRAKE_MAX_OFFSET_DB,
+        clip_begin_dbfs: RC1_CLIP_BEGIN_DBFS,
+        clip_cooldown_pcgs: RC1_PCG_CLIP_COOLDOWN_PCGS,
+        raw_hot_limit_dbfs: RC1_PCG_RAW_HOT_LIMIT_DBFS,
+        raw_hot_release_dbfs: RC1_PCG_RAW_HOT_RELEASE_DBFS,
+    };
 }
 
 #[cfg(test)]
@@ -489,35 +536,57 @@ struct BtsReversePowerControlState {
     raw_hot_limiter_active: bool,
     transient_recovery_frames_remaining: u64,
     rx_power_adj_dbfs: f32,
+    raw_power_profile: RawPowerLimiterProfile,
 }
 
 impl BtsReversePowerControlState {
     fn new_rc1() -> Self {
-        Self::with_params(
+        Self::with_params_and_profile(
             RC1_INITIAL_TARGET_DB,
             RC1_AUTO_MIN_DB,
             RC1_AUTO_MAX_DB,
             RC1_MANUAL_MIN_DB,
             RC1_MANUAL_MAX_DB,
+            RawPowerLimiterProfile::RC1,
         )
     }
 
     fn new_rc3() -> Self {
-        Self::with_params(
+        Self::with_params_and_profile(
             RC3_INITIAL_TARGET_DB,
             RC3_AUTO_MIN_DB,
             RC3_AUTO_MAX_DB,
             RC3_MANUAL_MIN_DB,
             RC3_MANUAL_MAX_DB,
+            RawPowerLimiterProfile::RC3,
         )
     }
 
+    #[cfg(test)]
     fn with_params(
         target_db: f32,
         auto_min_db: f32,
         auto_max_db: f32,
         manual_min_db: f32,
         manual_max_db: f32,
+    ) -> Self {
+        Self::with_params_and_profile(
+            target_db,
+            auto_min_db,
+            auto_max_db,
+            manual_min_db,
+            manual_max_db,
+            RawPowerLimiterProfile::RC3,
+        )
+    }
+
+    fn with_params_and_profile(
+        target_db: f32,
+        auto_min_db: f32,
+        auto_max_db: f32,
+        manual_min_db: f32,
+        manual_max_db: f32,
+        raw_power_profile: RawPowerLimiterProfile,
     ) -> Self {
         Self {
             target_db,
@@ -552,6 +621,7 @@ impl BtsReversePowerControlState {
             raw_hot_limiter_active: false,
             transient_recovery_frames_remaining: 0,
             rx_power_adj_dbfs: 0.0,
+            raw_power_profile,
         }
     }
 
@@ -883,15 +953,28 @@ impl BtsReversePowerControlState {
     }
 
     /// dB to subtract from the PCB error to brake UP commands at high Rx power.
+    #[cfg(test)]
     fn brake_offset_db_with_adj(filtered_raw_power_db: f32, rx_power_adj_dbfs: f32) -> f32 {
-        let begin_dbfs = BRAKE_BEGIN_DBFS + rx_power_adj_dbfs;
-        let full_dbfs = BRAKE_FULL_DBFS + rx_power_adj_dbfs;
+        Self::brake_offset_db_with_profile(
+            filtered_raw_power_db,
+            rx_power_adj_dbfs,
+            RawPowerLimiterProfile::RC3,
+        )
+    }
+
+    fn brake_offset_db_with_profile(
+        filtered_raw_power_db: f32,
+        rx_power_adj_dbfs: f32,
+        profile: RawPowerLimiterProfile,
+    ) -> f32 {
+        let begin_dbfs = profile.brake_begin_dbfs + rx_power_adj_dbfs;
+        let full_dbfs = profile.brake_full_dbfs + rx_power_adj_dbfs;
         if !filtered_raw_power_db.is_finite() || filtered_raw_power_db <= begin_dbfs {
             return 0.0;
         }
         let span = full_dbfs - begin_dbfs;
         let frac = ((filtered_raw_power_db - begin_dbfs) / span).clamp(0.0, 1.0);
-        BRAKE_MAX_OFFSET_DB * frac
+        profile.brake_max_offset_db * frac
     }
 
     #[cfg(test)]
@@ -971,10 +1054,10 @@ impl BtsReversePowerControlState {
         // Clipping inflates pilot variance and fakes a low-SINR reading, so
         // reject the measurement and force DOWN while in the clipping zone.
         let is_clipping = raw_power_db
-            .map(|db| db > self.adjusted_dbfs(CLIP_BEGIN_DBFS))
+            .map(|db| db > self.adjusted_dbfs(self.raw_power_profile.clip_begin_dbfs))
             .unwrap_or(false);
         let clip_guard_active = if is_clipping {
-            self.clip_cooldown_pcgs = PCG_CLIP_COOLDOWN_PCGS;
+            self.clip_cooldown_pcgs = self.raw_power_profile.clip_cooldown_pcgs;
             true
         } else if self.clip_cooldown_pcgs > 0 {
             self.clip_cooldown_pcgs = self.clip_cooldown_pcgs.saturating_sub(1);
@@ -990,17 +1073,23 @@ impl BtsReversePowerControlState {
 
         let effective_target_db = self.effective_target_db();
         let brake = Self::brake_input_raw_power_db(self.brake_filtered_raw_power_db, raw_power_db)
-            .map(|db| Self::brake_offset_db_with_adj(db, self.rx_power_adj_dbfs))
+            .map(|db| {
+                Self::brake_offset_db_with_profile(
+                    db,
+                    self.rx_power_adj_dbfs,
+                    self.raw_power_profile,
+                )
+            })
             .unwrap_or(0.0);
         self.last_brake_offset_db = brake;
         if raw_power_db
-            .map(|db| db >= self.adjusted_dbfs(PCG_RAW_HOT_LIMIT_DBFS))
+            .map(|db| db >= self.adjusted_dbfs(self.raw_power_profile.raw_hot_limit_dbfs))
             .unwrap_or(false)
             || is_clipping
         {
             self.raw_hot_limiter_active = true;
         } else if raw_power_db
-            .map(|db| db <= self.adjusted_dbfs(PCG_RAW_HOT_RELEASE_DBFS))
+            .map(|db| db <= self.adjusted_dbfs(self.raw_power_profile.raw_hot_release_dbfs))
             .unwrap_or(false)
         {
             self.raw_hot_limiter_active = false;
@@ -1241,7 +1330,11 @@ impl BtsPowerControlRegistry {
 
         match &slot.channel {
             TrafficChannelWrapper::Rc1(ch) => {
-                ch.channel.schedule_power_control_bit(tx_abs_pcg, tick.pcb)
+                ch.channel.schedule_power_control_burst(
+                    tx_abs_pcg,
+                    RC1_PCB_SPECULATIVE_FILL_PCGS,
+                    tick.pcb,
+                );
             }
             TrafficChannelWrapper::Rc3(ch) => {
                 ch.channel.schedule_power_control_bit(tx_abs_pcg, tick.pcb)

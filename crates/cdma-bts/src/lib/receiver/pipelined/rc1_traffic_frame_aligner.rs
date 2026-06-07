@@ -435,7 +435,7 @@ impl Rc1TrafficFrameAligner {
     /// that determine the RC1 lower-rate active-PCG mask for this frame.
     fn lc_randomizer_bits(&self, frame_chip_start: usize) -> [u8; 14] {
         let mut generator = LongCodeGenerator::new_traffic_channel(self.esn);
-        let offset = frame_chip_start.saturating_sub(1536 + 13);
+        let offset = frame_chip_start.saturating_sub(1536 + 14);
         generator.advance_chips(offset);
         let mut bits = [0u8; 14];
         for bit in &mut bits {

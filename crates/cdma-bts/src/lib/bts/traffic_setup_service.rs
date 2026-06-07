@@ -400,7 +400,8 @@ impl TrafficSetupService {
             self.controller
                 .commit_rc3_traffic(walsh_code, lc_gen, ecam.fpc_subchan_gain);
         } else {
-            self.controller.commit_rc1_traffic(walsh_code, lc_gen);
+            self.controller
+                .commit_rc1_traffic(walsh_code, lc_gen, ecam.fpc_subchan_gain);
         }
 
         let assigned_rev_rc = ecam.rev_rc;

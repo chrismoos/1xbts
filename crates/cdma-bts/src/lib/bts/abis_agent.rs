@@ -1040,7 +1040,8 @@ impl AbisAgent {
             self.controller
                 .commit_rc3_traffic(walsh_code, lc_gen, fpc_subchan_gain);
         } else {
-            self.controller.commit_rc1_traffic(walsh_code, lc_gen);
+            self.controller
+                .commit_rc1_traffic(walsh_code, lc_gen, fpc_subchan_gain);
         }
 
         let rx_request = super::handle::TrafficRxRequest {
@@ -1048,7 +1049,7 @@ impl AbisAgent {
             esn: session.esn,
             assigned_rev_rc: rev_rc,
             preamble_num_pcgs: None,
-            rev_fch_gating_mode,
+            rev_fch_gating_mode: rev_fch_gating_mode && (3..=6).contains(&rev_rc),
         };
         self.controller.install_rx_request(rx_request);
         session.committed = true;

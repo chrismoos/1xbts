@@ -84,8 +84,14 @@ impl TrafficResourceService {
         &self,
         walsh_code: u8,
         lc_generator: LongCodeGenerator,
+        fpc_subchan_gain: u8,
     ) -> TrafficWalshChannel {
-        commit_traffic_channel(&self.traffic_channels, walsh_code, lc_generator)
+        commit_traffic_channel(
+            &self.traffic_channels,
+            walsh_code,
+            lc_generator,
+            fpc_subchan_gain,
+        )
     }
 
     /// Commit a previously-reserved walsh code as an RC3 forward traffic
@@ -112,12 +118,14 @@ impl TrafficResourceService {
         &self,
         lc_generator: LongCodeGenerator,
         initial_lc_chip: u64,
+        fpc_subchan_gain: u8,
     ) -> Option<(u8, TrafficWalshChannel)> {
         allocate_traffic_channel(
             &self.walsh_allocator,
             &self.traffic_channels,
             lc_generator,
             initial_lc_chip,
+            fpc_subchan_gain,
         )
     }
 

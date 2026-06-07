@@ -6409,12 +6409,11 @@ mod tests {
             .unwrap_or(1792143302208325);
         // WAV 1792143302208325: a single 9600 bps signaling burst
         // (the r-dsch MS Ack Order) with the remaining call time
-        // decoded as null-traffic sub-rate frames. The ML-best-state
-        // based rate picker classifies null frames as Eighth (1200)
-        // or Quarter (2400) based on which rate's Viterbi converges
-        // cleanly.
+        // decoded as null-traffic sub-rate frames. The spec-aligned
+        // data burst randomizer window lets the no-FQI low-rate decoder
+        // classify almost all null frames as Eighth (1200).
         let expected: std::collections::BTreeMap<i64, usize> =
-            [(1200, 232), (2400, 777), (4800, 4), (9600, 1)]
+            [(1200, 1001), (2400, 5), (4800, 7), (9600, 1)]
                 .into_iter()
                 .collect();
         run_rc1_reverse_traffic_channel_decode_wav_test(
@@ -6431,11 +6430,11 @@ mod tests {
         let wav_path = test_capture_path("1792734620236321.wav");
         // WAV 1792734620236321: 11 CRC-valid signaling frames at 9600
         // bps, with the rest of the call carried as sub-rate null
-        // traffic frames. The ML-best-state rate picker classifies
-        // those null frames between Eighth (1200) and Quarter (2400)
-        // based on which Viterbi decode terminates cleanly.
+        // traffic frames. The spec-aligned data burst randomizer window
+        // lets the no-FQI low-rate decoder classify most null frames as
+        // Eighth (1200).
         let expected: std::collections::BTreeMap<i64, usize> =
-            [(1200, 79), (2400, 357), (4800, 4), (9600, 12)]
+            [(1200, 409), (2400, 26), (4800, 5), (9600, 12)]
                 .into_iter()
                 .collect();
         run_rc1_reverse_traffic_channel_decode_wav_test_with_options(

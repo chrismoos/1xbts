@@ -280,9 +280,14 @@ impl Rc1ReverseTrafficDecoder {
     // Frame decoding
     // ---------------------------------------------------------------
 
-    fn apply_pcg_mask(&self, raw_soft: &[f32], rate: Rc1TrafficRate) -> Vec<f32> {
+    fn apply_pcg_mask_at(
+        &self,
+        raw_soft: &[f32],
+        rate: Rc1TrafficRate,
+        frame_chip_start: usize,
+    ) -> Vec<f32> {
         let mut masked = raw_soft.to_vec();
-        let active_pcgs = self.active_pcgs_for_rate(rate);
+        let active_pcgs = self.exact_active_pcgs_for_rate(rate, frame_chip_start);
         for (pcg_idx, active) in active_pcgs.iter().copied().enumerate() {
             if active {
                 continue;
@@ -321,7 +326,16 @@ impl Rc1ReverseTrafficDecoder {
     }
 
     fn decode_frame_soft(&self, frame_soft: &[f32], rate: Rc1TrafficRate) -> DecodedTrafficFrame {
-        let masked_soft = self.apply_pcg_mask(frame_soft, rate);
+        self.decode_frame_soft_at(frame_soft, rate, self.frame_chip_start)
+    }
+
+    fn decode_frame_soft_at(
+        &self,
+        frame_soft: &[f32],
+        rate: Rc1TrafficRate,
+        frame_chip_start: usize,
+    ) -> DecodedTrafficFrame {
+        let masked_soft = self.apply_pcg_mask_at(frame_soft, rate, frame_chip_start);
         let interleaver = Rc12ReverseTrafficInterleaver::new(rate.to_interleaver_rate());
         let deinterleaved = interleaver.decode_soft(&masked_soft);
         let collapsed = Self::collapse_repetition(&deinterleaved, rate.repetition_factor());
@@ -343,6 +357,7 @@ impl Rc1ReverseTrafficDecoder {
         let idx = self.rate_history_count % RATE_HISTORY_LEN;
         self.rate_history[idx] = rate;
         self.rate_history_count = self.rate_history_count.saturating_add(1);
+        self.locked_rate = Some(rate);
     }
 
     fn adaptive_search_order(&self) -> [Rc1TrafficRate; 4] {
@@ -379,72 +394,50 @@ impl Rc1ReverseTrafficDecoder {
         order
     }
 
+    fn score_no_fqi_candidate(&self, decoded: &DecodedTrafficFrame) -> usize {
+        let has_nonzero = decoded.bits.iter().any(|bit| *bit != 0);
+        let mut score = 0usize;
+        if Some(decoded.rate) == self.locked_rate {
+            score += 1000;
+        }
+        if decoded.ml_terminal_matches_zero {
+            score += 500;
+        }
+        if has_nonzero {
+            score += 50;
+        }
+        score += match decoded.rate {
+            Rc1TrafficRate::Quarter => 20,
+            Rc1TrafficRate::Eighth => 10,
+            Rc1TrafficRate::Full | Rc1TrafficRate::Half => 0,
+        };
+        score
+    }
+
     fn choose_best_rate(&self, frame_soft: &[f32]) -> Option<DecodedTrafficFrame> {
         let adaptive_order = self.adaptive_search_order();
 
-        // (A) Fast path: try most-likely rate from history. If CRC-bearing
-        // and valid, return immediately.
-        let fast_rate = adaptive_order[0];
-        let fast_tried = if fast_rate.fqi_bits() > 0 {
-            let decoded = self.decode_frame_soft(frame_soft, fast_rate);
-            if decoded.validation.phy_valid {
-                return Some(decoded);
-            }
-            Some(fast_rate)
-        } else {
-            None
-        };
-
-        // (B) Also try locked_rate if different.
-        let locked_tried = if let Some(locked_rate) = self.locked_rate {
-            if Some(locked_rate) != fast_tried && locked_rate.fqi_bits() > 0 {
-                let decoded = self.decode_frame_soft(frame_soft, locked_rate);
-                if decoded.validation.phy_valid {
-                    return Some(decoded);
-                }
-                Some(locked_rate)
-            } else {
-                fast_tried.filter(|_| Some(fast_rate) == self.locked_rate)
-            }
-        } else {
-            None
-        };
-
-        // (C) Fallback: score remaining rates.
-        let mut best: Option<(usize, DecodedTrafficFrame)> = None;
+        // CRC-bearing rates are authoritative when they pass FQI.
         for rate in adaptive_order {
-            if Some(rate) == fast_tried || Some(rate) == locked_tried {
+            if rate.fqi_bits() == 0 {
                 continue;
             }
             let decoded = self.decode_frame_soft(frame_soft, rate);
-            if !decoded.validation.phy_valid {
-                continue;
-            }
-            if rate.fqi_bits() > 0 && decoded.validation.fqi_valid {
+            if decoded.validation.phy_valid {
                 return Some(decoded);
             }
-            let is_full_preamble =
-                rate == Rc1TrafficRate::Full && decoded.bits.iter().all(|bit| *bit == 0);
-            let has_nonzero = decoded.bits.iter().any(|bit| *bit != 0);
-            let mut score = 0usize;
-            if Some(rate) == self.locked_rate {
-                score += 1000;
+        }
+
+        // No-FQI rates must both be tried before choosing. Tail bits alone are
+        // too weak at low power; require the Viterbi terminal state expected by
+        // the all-zero encoder tail before the frame can count as decoded.
+        let mut best: Option<(usize, DecodedTrafficFrame)> = None;
+        for rate in [Rc1TrafficRate::Quarter, Rc1TrafficRate::Eighth] {
+            let decoded = self.decode_frame_soft(frame_soft, rate);
+            if !Self::no_fqi_candidate_acceptable(&decoded) {
+                continue;
             }
-            if decoded.ml_terminal_matches_zero {
-                score += 500;
-            }
-            if has_nonzero {
-                score += 50;
-            }
-            if is_full_preamble {
-                score += 60;
-            }
-            score += match rate {
-                Rc1TrafficRate::Full => 40,
-                Rc1TrafficRate::Half => 30,
-                Rc1TrafficRate::Quarter => 20,
-                Rc1TrafficRate::Eighth => 10,
-            };
+            let score = self.score_no_fqi_candidate(&decoded);
             let replace = best
                 .as_ref()
                 .map(|(best_score, _)| score > *best_score)
@@ -456,13 +449,17 @@ impl Rc1ReverseTrafficDecoder {
         best.map(|(_, decoded)| decoded)
     }
 
+    fn no_fqi_candidate_acceptable(decoded: &DecodedTrafficFrame) -> bool {
+        decoded.validation.phy_valid && decoded.ml_terminal_matches_zero
+    }
+
     // ---------------------------------------------------------------
     // PCG gating (long-code randomizer)
     // ---------------------------------------------------------------
 
     fn lc_randomizer_bits(&self, frame_chip_start: usize) -> [u8; 14] {
         let mut generator = LongCodeGenerator::new_traffic_channel(self.esn);
-        let offset = frame_chip_start.saturating_sub(1536 + 13);
+        let offset = frame_chip_start.saturating_sub(1536 + 14);
         generator.advance_chips(offset);
         let mut bits = [0u8; 14];
         for bit in &mut bits {
@@ -535,6 +532,9 @@ impl Rc1ReverseTrafficDecoder {
 
     fn pcg_eb_nt_db(&self, pcg_idx: usize) -> f32 {
         let sym_start = pcg_idx * RC1_SYMBOLS_PER_PCG;
+        if sym_start >= self.symbol_energies.len() {
+            return -30.0;
+        }
         let sym_end = (sym_start + RC1_SYMBOLS_PER_PCG).min(self.symbol_energies.len());
         let n = sym_end - sym_start;
         if n == 0 {
@@ -698,7 +698,7 @@ impl Rc1ReverseTrafficDecoder {
     fn handle_locked_frame(&mut self) -> Vec<SampleBlock> {
         let frame_soft = self.frame_soft.clone();
         let Some(decoded) = self.choose_best_rate(&frame_soft) else {
-            return Vec::new();
+            return vec![self.build_failed_locked_frame()];
         };
 
         self.frames_decoded += 1;
@@ -762,6 +762,33 @@ impl Rc1ReverseTrafficDecoder {
         // PCG measurements are emitted incrementally in process_symbols()
         // as each 1.25ms PCG completes, so no batch emit needed here.
         vec![block]
+    }
+
+    fn build_failed_locked_frame(&self) -> SampleBlock {
+        let mut tags = self.tags.clone();
+        tags.insert("traffic_decoded_frame", 1);
+        tags.insert("traffic_frame_aligned", 1);
+        tags.insert("traffic_walsh_locked", 1);
+        tags.insert("traffic_rate_bps", 0);
+        tags.insert("traffic_info_bits", 0);
+        tags.insert("traffic_fqi_bits", 0);
+        tags.insert(
+            "traffic_tail_bits",
+            Rc1TrafficRate::Eighth.tail_bits() as i64,
+        );
+        tags.insert("traffic_fqi_valid", 0);
+        tags.insert("traffic_tail_valid", 0);
+        tags.insert("traffic_phy_valid", 0);
+        tags.insert("traffic_ml_tail_match", 0);
+        tags.insert("traffic_is_preamble", 0);
+        tags.insert("absolute_chip_start", self.frame_chip_start as i64);
+
+        let mut block = SampleBlock::new(Vec::new(), self.frame_chip_start)
+            .with_sample_rate_hz(self.sample_rate_hz);
+        block.tags = tags;
+        block.pcg_signal_snr_db = Some(self.pcg_snr_db_for_frame());
+        block.active_pcg_mask = Some([true; SR1_PCGS_PER_FRAME]);
+        block
     }
 
     // ---------------------------------------------------------------
@@ -891,5 +918,60 @@ impl PipelineProcessor for Rc1ReverseTrafficDecoder {
             ("frames", self.frames_decoded.to_string()),
             ("preamble_nulls", self.consecutive_null_frames.to_string()),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn no_fqi_frame(phy_valid: bool, ml_terminal_matches_zero: bool) -> DecodedTrafficFrame {
+        DecodedTrafficFrame {
+            rate: Rc1TrafficRate::Eighth,
+            bits: vec![0; Rc1TrafficRate::Eighth.frame_bits()],
+            validation: FrameValidation {
+                fqi_valid: true,
+                tail_valid: phy_valid,
+                phy_valid,
+            },
+            ml_terminal_matches_zero,
+        }
+    }
+
+    #[test]
+    fn no_fqi_candidate_requires_phy_valid_and_ml_terminal_zero() {
+        assert!(Rc1ReverseTrafficDecoder::no_fqi_candidate_acceptable(
+            &no_fqi_frame(true, true)
+        ));
+        assert!(!Rc1ReverseTrafficDecoder::no_fqi_candidate_acceptable(
+            &no_fqi_frame(true, false)
+        ));
+        assert!(!Rc1ReverseTrafficDecoder::no_fqi_candidate_acceptable(
+            &no_fqi_frame(false, true)
+        ));
+    }
+
+    #[test]
+    fn failed_locked_frame_emits_invalid_decoded_frame_for_fer_counting() {
+        let mut decoder = Rc1ReverseTrafficDecoder::new(0x1234_5678);
+        decoder.frame_chip_start = 24_576;
+        decoder.sample_rate_hz = 1_228_800.0;
+        decoder.tags.insert("traffic_walsh_code", 10);
+
+        let block = decoder.build_failed_locked_frame();
+
+        assert_eq!(block.chip_start, 24_576);
+        assert_eq!(block.sample_rate_hz, 1_228_800.0);
+        assert_eq!(block.tags.get("traffic_decoded_frame"), Some(&1));
+        assert_eq!(block.tags.get("traffic_frame_aligned"), Some(&1));
+        assert_eq!(block.tags.get("traffic_phy_valid"), Some(&0));
+        assert_eq!(block.tags.get("traffic_tail_valid"), Some(&0));
+        assert_eq!(block.tags.get("traffic_fqi_valid"), Some(&0));
+        assert_eq!(block.tags.get("traffic_fqi_bits"), Some(&0));
+        assert_eq!(block.tags.get("traffic_rate_bps"), Some(&0));
+        assert_eq!(block.tags.get("absolute_chip_start"), Some(&24_576));
+        assert!(block.samples.is_empty());
+        assert_eq!(block.pcg_signal_snr_db.as_ref().map(Vec::len), Some(16));
+        assert_eq!(block.active_pcg_mask, Some([true; SR1_PCGS_PER_FRAME]));
     }
 }
