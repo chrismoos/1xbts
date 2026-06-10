@@ -1,5 +1,8 @@
 # HEAD 
 
+- BTS TX pacing no longer busy-waits between batches. It sleeps to the
+  batch deadline with an adaptive wake margin, cutting TX thread CPU
+  roughly 3x at idle.
 - Fixed RC1 voice forward and reverse FER by correcting PCB puncturing and
   low-rate reverse frame timing.
 - BTS TX slow-generation warnings now use full-batch timing instead of

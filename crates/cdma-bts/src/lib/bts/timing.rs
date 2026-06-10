@@ -53,8 +53,17 @@ impl TxRxAnchor {
 }
 
 pub(super) const HARDWARE_START_LEAD_NS: u64 = 100_000_000;
-const LOOKAHEAD_SLEEP_GUARD_NS: u64 = 1_000_000;
-const LOOKAHEAD_FINAL_SPIN_NS: u64 = 150_000;
+const LOOKAHEAD_FINAL_SPIN_NS: u64 = 20_000;
+/// Adaptive sleep margin bounds. The cap stays well under the post-release
+/// underrun cushion (`max_tx_lookahead_ms` minus gen+flush time).
+const PACER_MIN_MARGIN_NS: u64 = 50_000;
+const PACER_MAX_MARGIN_NS: u64 = 2_000_000;
+/// Pad above the worst observed oversleep when raising the margin.
+const PACER_OVERSLEEP_PAD_NS: u64 = 20_000;
+/// Warn when a wake lands this far past the release point.
+const PACER_LATE_WAKE_WARN_NS: u64 = 500_000;
+/// Per-wait margin decay toward the floor: margin -= margin >> SHIFT.
+const PACER_MARGIN_DECAY_SHIFT: u32 = 8;
 
 pub(super) struct TxAnchor {
     pub hardware_start_tick: u64,
@@ -104,36 +113,83 @@ pub(super) fn pilot_offset_chips(pilot_offset: usize) -> u64 {
     (pilot_offset as u64) * 64
 }
 
-pub(super) fn wait_until_within_tx_lookahead(
-    batch_playout_tick: u64,
-    wall_anchor_tick: u64,
-    wall_anchor_instant: Instant,
-    tick_rate: u64,
-    max_tx_lookahead_ms: u32,
-    shutdown: &AtomicBool,
-) {
-    if max_tx_lookahead_ms == 0 || tick_rate == 0 {
-        return;
-    }
-    let lookahead_ticks = max_tx_lookahead_ms as u64 * tick_rate / 1_000;
+/// Lookahead throttle for the TX synth loop. Sleeps to the release point in
+/// one shot, holding back an adaptive margin that tracks observed scheduler
+/// oversleep, then yields/spins only across that margin. The release
+/// condition is re-checked after every wake, so it can never release early;
+/// a late wake only shrinks the post-release underrun cushion.
+pub(super) struct LookaheadPacer {
+    margin_ns: u64,
+}
 
-    loop {
-        let elapsed_ns = wall_anchor_instant.elapsed().as_nanos() as u64;
-        let estimated_hw = wall_anchor_tick
-            .saturating_add((elapsed_ns as u128 * tick_rate as u128 / 1_000_000_000) as u64);
-        let ahead_ticks = batch_playout_tick.saturating_sub(estimated_hw);
-        if ahead_ticks <= lookahead_ticks || shutdown.load(Ordering::Relaxed) {
-            break;
+impl LookaheadPacer {
+    pub(super) fn new() -> Self {
+        Self {
+            margin_ns: PACER_MIN_MARGIN_NS,
         }
+    }
 
-        let wait_ns = ticks_to_nanos(ahead_ticks - lookahead_ticks, tick_rate);
-        if wait_ns > LOOKAHEAD_SLEEP_GUARD_NS {
-            let sleep_ns = (wait_ns - LOOKAHEAD_SLEEP_GUARD_NS).min(LOOKAHEAD_SLEEP_GUARD_NS);
-            thread::sleep(Duration::from_nanos(sleep_ns));
-        } else if wait_ns > LOOKAHEAD_FINAL_SPIN_NS {
-            thread::yield_now();
+    /// Current sleep margin in microseconds (for heartbeat diagnostics).
+    pub(super) fn margin_us(&self) -> u64 {
+        self.margin_ns / 1_000
+    }
+
+    fn adapt_after_sleep(&mut self, requested_ns: u64, actual_ns: u64) {
+        let oversleep_ns = actual_ns.saturating_sub(requested_ns);
+        // Oversleep beyond the held-back margin means we woke past release.
+        let late_past_release_ns = oversleep_ns.saturating_sub(self.margin_ns);
+        if late_past_release_ns > PACER_LATE_WAKE_WARN_NS {
+            log::warn!(
+                "tx_pace_late_wake: slept {}us for a {}us request, {}us past release (margin was {}us)",
+                actual_ns / 1_000,
+                requested_ns / 1_000,
+                late_past_release_ns / 1_000,
+                self.margin_ns / 1_000,
+            );
+        }
+        let needed_ns = oversleep_ns.saturating_add(PACER_OVERSLEEP_PAD_NS);
+        if needed_ns > self.margin_ns {
+            self.margin_ns = needed_ns.min(PACER_MAX_MARGIN_NS);
         } else {
-            std::hint::spin_loop();
+            self.margin_ns = (self.margin_ns - (self.margin_ns >> PACER_MARGIN_DECAY_SHIFT))
+                .max(PACER_MIN_MARGIN_NS);
+        }
+    }
+
+    pub(super) fn wait_until_within_tx_lookahead(
+        &mut self,
+        batch_playout_tick: u64,
+        wall_anchor_tick: u64,
+        wall_anchor_instant: Instant,
+        tick_rate: u64,
+        max_tx_lookahead_ms: u32,
+        shutdown: &AtomicBool,
+    ) {
+        if max_tx_lookahead_ms == 0 || tick_rate == 0 {
+            return;
+        }
+        let lookahead_ticks = max_tx_lookahead_ms as u64 * tick_rate / 1_000;
+
+        loop {
+            let elapsed_ns = wall_anchor_instant.elapsed().as_nanos() as u64;
+            let estimated_hw = wall_anchor_tick
+                .saturating_add((elapsed_ns as u128 * tick_rate as u128 / 1_000_000_000) as u64);
+            let ahead_ticks = batch_playout_tick.saturating_sub(estimated_hw);
+            if ahead_ticks <= lookahead_ticks || shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let wait_ns = ticks_to_nanos(ahead_ticks - lookahead_ticks, tick_rate);
+            if wait_ns > self.margin_ns {
+                let sleep_ns = wait_ns - self.margin_ns;
+                let sleep_start = Instant::now();
+                thread::sleep(Duration::from_nanos(sleep_ns));
+                self.adapt_after_sleep(sleep_ns, sleep_start.elapsed().as_nanos() as u64);
+            } else if wait_ns > LOOKAHEAD_FINAL_SPIN_NS {
+                thread::yield_now();
+            } else {
+                std::hint::spin_loop();
+            }
         }
     }
 }
@@ -248,6 +304,72 @@ pub(super) fn frame_boundaries(state: &TxLoopState, block_chip: u64) -> FrameBou
         paging_frame_boundary: block_chip >= state.pilot_offset_chips
             && (block_chip - state.pilot_offset_chips) % state.paging_frame_chips == 0,
         paging_enabled: block_chip >= state.paging_start_enable_chip,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pacer_margin_rises_to_observed_oversleep_plus_pad() {
+        let mut pacer = LookaheadPacer::new();
+        // Requested 1 ms, took 1.5 ms → 500 µs oversleep.
+        pacer.adapt_after_sleep(1_000_000, 1_500_000);
+        assert_eq!(pacer.margin_ns, 500_000 + PACER_OVERSLEEP_PAD_NS);
+    }
+
+    #[test]
+    fn pacer_margin_is_capped() {
+        let mut pacer = LookaheadPacer::new();
+        pacer.adapt_after_sleep(1_000_000, 100_000_000);
+        assert_eq!(pacer.margin_ns, PACER_MAX_MARGIN_NS);
+    }
+
+    #[test]
+    fn pacer_margin_decays_toward_floor_on_clean_sleeps() {
+        let mut pacer = LookaheadPacer::new();
+        pacer.adapt_after_sleep(1_000_000, 2_000_000);
+        let raised = pacer.margin_ns;
+        for _ in 0..10_000 {
+            pacer.adapt_after_sleep(1_000_000, 1_000_000);
+        }
+        assert!(pacer.margin_ns < raised);
+        assert_eq!(pacer.margin_ns, PACER_MIN_MARGIN_NS);
+    }
+
+    #[test]
+    fn pacer_returns_immediately_when_within_lookahead() {
+        let mut pacer = LookaheadPacer::new();
+        let shutdown = AtomicBool::new(false);
+        let start = Instant::now();
+        // Playout tick equals the anchor tick → 0 ticks ahead, no wait.
+        pacer.wait_until_within_tx_lookahead(
+            1_000,
+            1_000,
+            Instant::now(),
+            1_000_000_000,
+            5,
+            &shutdown,
+        );
+        assert!(start.elapsed() < Duration::from_millis(2));
+    }
+
+    #[test]
+    fn pacer_respects_shutdown() {
+        let mut pacer = LookaheadPacer::new();
+        let shutdown = AtomicBool::new(true);
+        let start = Instant::now();
+        // 10 s ahead of the lookahead window, but shutdown is set.
+        pacer.wait_until_within_tx_lookahead(
+            10_000_000_000,
+            0,
+            Instant::now(),
+            1_000_000_000,
+            5,
+            &shutdown,
+        );
+        assert!(start.elapsed() < Duration::from_millis(2));
     }
 }
 

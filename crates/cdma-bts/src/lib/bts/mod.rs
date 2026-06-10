@@ -621,6 +621,7 @@ impl Bts {
 
         let mut wall_anchor_instant = Instant::now();
         let mut wall_anchor_tick = radio_tx.get_hardware_time()?;
+        let mut pacer = timing::LookaheadPacer::new();
 
         loop {
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -635,7 +636,7 @@ impl Bts {
 
             let batch_playout_tick = timing::batch_playout_tick(&state, chip_cursor, tick_rate);
             if max_blocks.is_none() && self.runtime.max_tx_lookahead_ms > 0 {
-                timing::wait_until_within_tx_lookahead(
+                pacer.wait_until_within_tx_lookahead(
                     batch_playout_tick,
                     wall_anchor_tick,
                     wall_anchor_instant,
@@ -670,7 +671,7 @@ impl Bts {
                 let paging_total_ms = state.paging_time_sum_us / 1000;
                 let synth_total_ms = state.synth_time_sum_us / 1000;
                 debug!(
-                    "transmit t20={} wall={}ms blocks={} tx_batches={} gen={}ms(avg={}us max={}us) sync={}ms paging={}ms synth={}ms[pilot={}ms fsch={}ms fpch={}ms spread={}ms] tx={}ms(avg={}us max={}us) rt={:.1}x",
+                    "transmit t20={} wall={}ms blocks={} tx_batches={} gen={}ms(avg={}us max={}us) sync={}ms paging={}ms synth={}ms[pilot={}ms fsch={}ms fpch={}ms spread={}ms] tx={}ms(avg={}us max={}us) rt={:.1}x pace_margin={}us",
                     t20,
                     wall_ms,
                     state.synth_blocks,
@@ -688,7 +689,8 @@ impl Bts {
                     tx_total_ms,
                     avg_tx_us,
                     state.tx_time_max_us,
-                    rt_ratio
+                    rt_ratio,
+                    pacer.margin_us()
                 );
                 debug!(
                     "tx_hardware_heartbeat: hw_tick={} chip={} rel_chip={} t20={}",
