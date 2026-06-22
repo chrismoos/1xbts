@@ -1,5 +1,6 @@
 # HEAD 
 
+- Fixed page handling for lower P_REV 3 handsets.
 - Speed test downloads can now run up to 2 MiB.
 - BTS TX pacing no longer busy-waits between batches. It sleeps to the
   batch deadline with an adaptive wake margin, cutting TX thread CPU

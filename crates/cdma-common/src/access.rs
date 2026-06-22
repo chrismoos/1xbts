@@ -4913,8 +4913,10 @@ fn encode_origination_body(bs: &mut Bitstream, m: &OriginationMessage) -> Result
     Ok(())
 }
 
-fn page_response_p_rev(_ctx: AccessDecodeContext, m: &PageResponseMessage) -> u8 {
-    m.mob_p_rev
+fn page_response_p_rev(ctx: AccessDecodeContext, m: &PageResponseMessage) -> u8 {
+    ctx.p_rev_in_use
+        .map(|serving_p_rev| serving_p_rev.min(m.mob_p_rev))
+        .unwrap_or(m.mob_p_rev)
 }
 
 fn encode_page_response_body(
@@ -7321,7 +7323,10 @@ fn decode_page_response(
     let service_option = read(bs, 16, "SERVICE_OPTION")? as u16;
     let pm = read(bs, 1, "PM")? == 1;
     let nar_an_cap = read(bs, 1, "NAR_AN_CAP")? == 1;
-    let p_rev_in_use = mob_p_rev;
+    let p_rev_in_use = ctx
+        .p_rev_in_use
+        .map(|serving_p_rev| serving_p_rev.min(mob_p_rev))
+        .unwrap_or(mob_p_rev);
     let encryption_supported = if p_rev_in_use < 7 {
         match ctx.auth_mode {
             Some(0) => None,
@@ -7390,153 +7395,169 @@ fn decode_page_response(
     let mut num_band_subclass = None;
     let mut band_subclass_sup = None;
 
-    if p_rev_in_use >= 6 {
-        let uzid_incl_value = read(bs, 1, "UZID_INCL")? == 1;
-        uzid_incl = Some(uzid_incl_value);
-        if uzid_incl_value {
-            uzid = Some(read(bs, 16, "UZID")? as u16);
-        }
-        ch_ind = Some(read(bs, 2, "CH_IND")? as u8);
-        otd_supported = Some(read(bs, 1, "OTD_SUPPORTED")? == 1);
-        qpch_supported = Some(read(bs, 1, "QPCH_SUPPORTED")? == 1);
-        enhanced_rc = Some(read(bs, 1, "ENHANCED_RC")? == 1);
-        for_rc_pref = Some(read(bs, 5, "FOR_RC_PREF")? as u8);
-        rev_rc_pref = Some(read(bs, 5, "REV_RC_PREF")? as u8);
-
-        let fch_supported_value = read(bs, 1, "FCH_SUPPORTED")? == 1;
-        fch_supported = Some(fch_supported_value);
-        if fch_supported_value {
-            fch_capability = Some(decode_fch_type_specific_fields(bs)?);
-        }
-
-        let dcch_supported_value = read(bs, 1, "DCCH_SUPPORTED")? == 1;
-        dcch_supported = Some(dcch_supported_value);
-        if dcch_supported_value {
-            dcch_capability = Some(decode_dcch_type_specific_fields(bs)?);
-        }
-
-        rev_fch_gating_req = Some(read(bs, 1, "REV_FCH_GATING_REQ")? == 1);
-    }
-
-    if p_rev_in_use >= 7 {
-        sts_supported = Some(read(bs, 1, "STS_SUPPORTED")? == 1);
-        cch_3x_supported = Some(read(bs, 1, "3X_CCH_SUPPORTED")? == 1);
-        let wll_incl_value = read(bs, 1, "WLL_INCL")? == 1;
-        wll_incl = Some(wll_incl_value);
-        if wll_incl_value {
-            wll_device_type = Some(read(bs, 3, "WLL_DEVICE_TYPE")? as u8);
-            hook_status = Some(read(bs, 4, "HOOK_STATUS")? as u8);
-        }
-
-        let enc_info_incl_value = read(bs, 1, "ENC_INFO_INCL")? == 1;
-        enc_info_incl = Some(enc_info_incl_value);
-        if enc_info_incl_value {
-            let sig_sup = read(bs, 8, "SIG_ENCRYPT_SUP")? as u8;
-            sig_encrypt_sup = Some(sig_sup);
-            d_sig_encrypt_req = Some(read(bs, 1, "D_SIG_ENCRYPT_REQ")? as u8);
-            c_sig_encrypt_req = Some(read(bs, 1, "C_SIG_ENCRYPT_REQ")? as u8);
-            // SIG_ENCRYPT_SUP layout: CMEA(1)|ECMEA(1)|REA(1)|RESERVED(5)
-            let ecmea = (sig_sup >> 6) & 1;
-            let rea = (sig_sup >> 5) & 1;
-            if ecmea == 1 || rea == 1 {
-                new_sseq_h = Some(read(bs, 24, "NEW_SSEQ_H")? as u32);
-                new_sseq_h_sig = Some(read(bs, 8, "NEW_SSEQ_H_SIG")? as u32);
+    let tail_result: Result<(), String> = (|| {
+        if p_rev_in_use >= 6 {
+            let uzid_incl_value = read(bs, 1, "UZID_INCL")? == 1;
+            uzid_incl = Some(uzid_incl_value);
+            if uzid_incl_value {
+                uzid = Some(read(bs, 16, "UZID")? as u16);
             }
-            ui_encrypt_req = Some(read(bs, 1, "UI_ENCRYPT_REQ")? as u8);
-            ui_encrypt_sup = Some(read(bs, 8, "UI_ENCRYPT_SUP")? as u8);
-        }
+            ch_ind = Some(read(bs, 2, "CH_IND")? as u8);
+            otd_supported = Some(read(bs, 1, "OTD_SUPPORTED")? == 1);
+            qpch_supported = Some(read(bs, 1, "QPCH_SUPPORTED")? == 1);
+            enhanced_rc = Some(read(bs, 1, "ENHANCED_RC")? == 1);
+            for_rc_pref = Some(read(bs, 5, "FOR_RC_PREF")? as u8);
+            rev_rc_pref = Some(read(bs, 5, "REV_RC_PREF")? as u8);
 
-        let sync_id_incl_value = read(bs, 1, "SYNC_ID_INCL")? == 1;
-        sync_id_incl = Some(sync_id_incl_value);
-        if sync_id_incl_value {
-            let len = read(bs, 4, "SYNC_ID_LEN")? as u8;
-            sync_id_len = Some(len);
-            if len > 0 {
-                sync_id = Some(read(bs, len as usize * 8, "SYNC_ID")? as u32);
+            let fch_supported_value = read(bs, 1, "FCH_SUPPORTED")? == 1;
+            fch_supported = Some(fch_supported_value);
+            if fch_supported_value {
+                fch_capability = Some(decode_fch_type_specific_fields(bs)?);
             }
-        }
 
-        let so_bitmap_ind_val = read(bs, 2, "SO_BITMAP_IND")? as u8;
-        so_bitmap_ind = Some(so_bitmap_ind_val);
-        if so_bitmap_ind_val > 0 {
-            so_group_num = Some(read(bs, 5, "SO_GROUP_NUM")? as u8);
-            let bitmap_bits = 1usize << (1 + so_bitmap_ind_val as usize);
-            so_bitmap = Some(read(bs, bitmap_bits, "SO_BITMAP")? as u16);
-        }
-    }
-
-    if p_rev_in_use >= 8 {
-        alt_band_class_sup = Some(read(bs, 1, "ALT_BAND_CLASS_SUP")? == 1);
-    }
-
-    if p_rev_in_use >= 9 {
-        let msg_int_info_incl_value = read(bs, 1, "MSG_INT_INFO_INCL")? == 1;
-        msg_int_info_incl = Some(msg_int_info_incl_value);
-        if msg_int_info_incl_value {
-            let sig_integrity_sup_incl_value = read(bs, 1, "SIG_INTEGRITY_SUP_INCL")? == 1;
-            sig_integrity_sup_incl = Some(sig_integrity_sup_incl_value);
-            if sig_integrity_sup_incl_value {
-                let sig_sup = read(bs, 8, "SIG_INTEGRITY_SUP")? as u8;
-                let sig_req = read(bs, 3, "SIG_INTEGRITY_REQ")? as u8;
-                validate_sig_integrity_fields(sig_sup, sig_req)?;
-                sig_integrity_sup = Some(sig_sup);
-                sig_integrity_req = Some(sig_req);
+            let dcch_supported_value = read(bs, 1, "DCCH_SUPPORTED")? == 1;
+            dcch_supported = Some(dcch_supported_value);
+            if dcch_supported_value {
+                dcch_capability = Some(decode_dcch_type_specific_fields(bs)?);
             }
-            new_key_id = Some(read(bs, 2, "NEW_KEY_ID")? as u8);
-            let new_sseq_h_incl_value = read(bs, 1, "NEW_SSEQ_H_INCL")? == 1;
-            new_sseq_h_incl = Some(new_sseq_h_incl_value);
-            if new_sseq_h_incl_value {
-                new_sseq_h = Some(read(bs, 24, "NEW_SSEQ_H")? as u32);
-                new_sseq_h_sig = Some(read(bs, 8, "NEW_SSEQ_H_SIG")? as u32);
+
+            rev_fch_gating_req = Some(read(bs, 1, "REV_FCH_GATING_REQ")? == 1);
+        }
+
+        if p_rev_in_use >= 7 {
+            sts_supported = Some(read(bs, 1, "STS_SUPPORTED")? == 1);
+            cch_3x_supported = Some(read(bs, 1, "3X_CCH_SUPPORTED")? == 1);
+            let wll_incl_value = read(bs, 1, "WLL_INCL")? == 1;
+            wll_incl = Some(wll_incl_value);
+            if wll_incl_value {
+                wll_device_type = Some(read(bs, 3, "WLL_DEVICE_TYPE")? as u8);
+                hook_status = Some(read(bs, 4, "HOOK_STATUS")? as u8);
+            }
+
+            let enc_info_incl_value = read(bs, 1, "ENC_INFO_INCL")? == 1;
+            enc_info_incl = Some(enc_info_incl_value);
+            if enc_info_incl_value {
+                let sig_sup = read(bs, 8, "SIG_ENCRYPT_SUP")? as u8;
+                sig_encrypt_sup = Some(sig_sup);
+                d_sig_encrypt_req = Some(read(bs, 1, "D_SIG_ENCRYPT_REQ")? as u8);
+                c_sig_encrypt_req = Some(read(bs, 1, "C_SIG_ENCRYPT_REQ")? as u8);
+                // SIG_ENCRYPT_SUP layout: CMEA(1)|ECMEA(1)|REA(1)|RESERVED(5)
+                let ecmea = (sig_sup >> 6) & 1;
+                let rea = (sig_sup >> 5) & 1;
+                if ecmea == 1 || rea == 1 {
+                    new_sseq_h = Some(read(bs, 24, "NEW_SSEQ_H")? as u32);
+                    new_sseq_h_sig = Some(read(bs, 8, "NEW_SSEQ_H_SIG")? as u32);
+                }
+                ui_encrypt_req = Some(read(bs, 1, "UI_ENCRYPT_REQ")? as u8);
+                ui_encrypt_sup = Some(read(bs, 8, "UI_ENCRYPT_SUP")? as u8);
+            }
+
+            let sync_id_incl_value = read(bs, 1, "SYNC_ID_INCL")? == 1;
+            sync_id_incl = Some(sync_id_incl_value);
+            if sync_id_incl_value {
+                let len = read(bs, 4, "SYNC_ID_LEN")? as u8;
+                sync_id_len = Some(len);
+                if len > 0 {
+                    sync_id = Some(read(bs, len as usize * 8, "SYNC_ID")? as u32);
+                }
+            }
+
+            let so_bitmap_ind_val = read(bs, 2, "SO_BITMAP_IND")? as u8;
+            so_bitmap_ind = Some(so_bitmap_ind_val);
+            if so_bitmap_ind_val > 0 {
+                so_group_num = Some(read(bs, 5, "SO_GROUP_NUM")? as u8);
+                let bitmap_bits = 1usize << (1 + so_bitmap_ind_val as usize);
+                so_bitmap = Some(read(bs, bitmap_bits, "SO_BITMAP")? as u16);
             }
         }
 
-        for_pdch_supported = Some(read(bs, 1, "FOR_PDCH_SUPPORTED")? == 1);
-        if for_pdch_supported == Some(true) {
-            for_pdch_capability = Some(decode_for_pdch_type_specific_fields(bs)?);
+        if p_rev_in_use >= 8 {
+            alt_band_class_sup = Some(read(bs, 1, "ALT_BAND_CLASS_SUP")? == 1);
         }
-        if ch_ind == Some(0) {
-            let value = read(bs, 5, "EXT_CH_IND")? as u8;
-            if !is_valid_origination_ext_ch_ind(value) {
-                return Err(format!(
-                    "EXT_CH_IND value {value:#07b} is reserved or invalid"
-                ));
+
+        if p_rev_in_use >= 9 {
+            let msg_int_info_incl_value = read(bs, 1, "MSG_INT_INFO_INCL")? == 1;
+            msg_int_info_incl = Some(msg_int_info_incl_value);
+            if msg_int_info_incl_value {
+                let sig_integrity_sup_incl_value = read(bs, 1, "SIG_INTEGRITY_SUP_INCL")? == 1;
+                sig_integrity_sup_incl = Some(sig_integrity_sup_incl_value);
+                if sig_integrity_sup_incl_value {
+                    let sig_sup = read(bs, 8, "SIG_INTEGRITY_SUP")? as u8;
+                    let sig_req = read(bs, 3, "SIG_INTEGRITY_REQ")? as u8;
+                    validate_sig_integrity_fields(sig_sup, sig_req)?;
+                    sig_integrity_sup = Some(sig_sup);
+                    sig_integrity_req = Some(sig_req);
+                }
+                new_key_id = Some(read(bs, 2, "NEW_KEY_ID")? as u8);
+                let new_sseq_h_incl_value = read(bs, 1, "NEW_SSEQ_H_INCL")? == 1;
+                new_sseq_h_incl = Some(new_sseq_h_incl_value);
+                if new_sseq_h_incl_value {
+                    new_sseq_h = Some(read(bs, 24, "NEW_SSEQ_H")? as u32);
+                    new_sseq_h_sig = Some(read(bs, 8, "NEW_SSEQ_H_SIG")? as u32);
+                }
             }
-            ext_ch_ind = Some(value);
-        }
-    }
 
-    if p_rev_in_use >= 11 {
-        if slot_cycle_index != 0 {
-            sign_slot_cycle_index = Some(read(bs, 1, "SIGN_SLOT_CYCLE_INDEX")? == 1);
-        }
-
-        let bcmc_incl_value = read(bs, 1, "BCMC_INCL")? == 1;
-        bcmc_incl = Some(bcmc_incl_value);
-        if bcmc_incl_value {
-            let bcmc_pref_incl_value = read(bs, 1, "BCMC_PREF_INCL")? == 1;
-            bcmc_pref_incl = Some(bcmc_pref_incl_value);
-            bcmc = Some(decode_page_response_bcmc_fields(bs, bcmc_pref_incl_value)?);
-        }
-
-        if for_pdch_supported == Some(true) {
-            let rev_pdch_supported_value = read(bs, 1, "REV_PDCH_SUPPORTED")? == 1;
-            rev_pdch_supported = Some(rev_pdch_supported_value);
-            if rev_pdch_supported_value {
-                rev_pdch_capability = Some(decode_rev_pdch_type_specific_fields(bs)?);
+            for_pdch_supported = Some(read(bs, 1, "FOR_PDCH_SUPPORTED")? == 1);
+            if for_pdch_supported == Some(true) {
+                for_pdch_capability = Some(decode_for_pdch_type_specific_fields(bs)?);
+            }
+            if ch_ind == Some(0) {
+                let value = read(bs, 5, "EXT_CH_IND")? as u8;
+                if !is_valid_origination_ext_ch_ind(value) {
+                    return Err(format!(
+                        "EXT_CH_IND value {value:#07b} is reserved or invalid"
+                    ));
+                }
+                ext_ch_ind = Some(value);
             }
         }
 
-        let band_sub_rep_incl_value = read(bs, 1, "BAND_SUB_REP_INCL")? == 1;
-        band_sub_rep_incl = Some(band_sub_rep_incl_value);
-        if band_sub_rep_incl_value {
-            let n = read(bs, 4, "NUM_BAND_SUBCLASS")? as u8;
-            num_band_subclass = Some(n);
-            let mut subs = Vec::with_capacity(n as usize);
-            for i in 0..n {
-                subs.push(read(bs, 1, &format!("BAND_SUBCLASS_SUP[{i}]"))? as u8);
+        if p_rev_in_use >= 11 {
+            if slot_cycle_index != 0 {
+                sign_slot_cycle_index = Some(read(bs, 1, "SIGN_SLOT_CYCLE_INDEX")? == 1);
             }
-            band_subclass_sup = Some(subs);
+
+            let bcmc_incl_value = read(bs, 1, "BCMC_INCL")? == 1;
+            bcmc_incl = Some(bcmc_incl_value);
+            if bcmc_incl_value {
+                let bcmc_pref_incl_value = read(bs, 1, "BCMC_PREF_INCL")? == 1;
+                bcmc_pref_incl = Some(bcmc_pref_incl_value);
+                bcmc = Some(decode_page_response_bcmc_fields(bs, bcmc_pref_incl_value)?);
+            }
+
+            if for_pdch_supported == Some(true) {
+                let rev_pdch_supported_value = read(bs, 1, "REV_PDCH_SUPPORTED")? == 1;
+                rev_pdch_supported = Some(rev_pdch_supported_value);
+                if rev_pdch_supported_value {
+                    rev_pdch_capability = Some(decode_rev_pdch_type_specific_fields(bs)?);
+                }
+            }
+
+            let band_sub_rep_incl_value = read(bs, 1, "BAND_SUB_REP_INCL")? == 1;
+            band_sub_rep_incl = Some(band_sub_rep_incl_value);
+            if band_sub_rep_incl_value {
+                let n = read(bs, 4, "NUM_BAND_SUBCLASS")? as u8;
+                num_band_subclass = Some(n);
+                let mut subs = Vec::with_capacity(n as usize);
+                for i in 0..n {
+                    subs.push(read(bs, 1, &format!("BAND_SUBCLASS_SUP[{i}]"))? as u8);
+                }
+                band_subclass_sup = Some(subs);
+            }
+        }
+
+        Ok(())
+    })();
+    if let Err(err) = tail_result {
+        if err.starts_with("EOF reading ") {
+            log::warn!(
+                "PRM: optional tail truncated at mob_p_rev={}: {} \
+                 (remaining trailing fields defaulted)",
+                mob_p_rev,
+                err
+            );
+        } else {
+            return Err(err);
         }
     }
 
@@ -10776,7 +10797,7 @@ mod tests {
     }
 
     #[test]
-    fn test_access_message_decoder_page_response_uses_payload_p_rev_for_tail_gating() {
+    fn test_access_message_decoder_page_response_clamps_serving_p_rev_to_mob_p_rev() {
         let mut pdu = Bitstream::new_bytes(&[
             0x05, 0x13, 0x4e, 0xac, 0xf5, 0x7d, 0x61, 0x88, 0x63, 0xc6, 0xa4, 0x3a, 0x44, 0x49,
             0x03, 0x6a, 0x60, 0x00, 0xc0, 0x00,
@@ -11074,6 +11095,82 @@ mod tests {
         assert_eq!(Some(3), msg.so_group_num);
         assert_eq!(Some(0b1010), msg.so_bitmap);
         assert_eq!(0, msg.remaining_bits);
+    }
+
+    #[test]
+    fn test_page_response_truncated_optional_tail_defaults_remaining_fields() {
+        let ctx = AccessDecodeContext::new(Some(0), Some(9));
+        let mut bits = Bitstream::new();
+        bits.write_u8(rcsch_wire(MessageId::PageResponse), 8);
+        bits.write_u8(1, 1); // MOB_TERM
+        bits.write_u8(0b010, 3); // SLOT_CYCLE_INDEX
+        bits.write_u8(9, 8); // MOB_P_REV
+        bits.write_u8(0x3a, 8); // SCM
+        bits.write_u8(0b000, 3); // REQUEST_MODE
+        bits.write_u32(3, 16); // SERVICE_OPTION
+        bits.write_u8(0, 1); // PM
+        bits.write_u8(0, 1); // NAR_AN_CAP
+        bits.write_u8(0, 3); // NUM_ALT_SO
+        bits.write_u8(0, 1); // UZID_INCL
+        bits.write_u8(0b01, 2); // CH_IND
+        bits.write_u8(0, 1); // OTD_SUPPORTED
+        bits.write_u8(0, 1); // QPCH_SUPPORTED
+        bits.write_u8(0, 1); // ENHANCED_RC
+        bits.write_u8(1, 5); // FOR_RC_PREF
+        bits.write_u8(1, 5); // REV_RC_PREF
+        bits.write_u8(0, 1); // FCH_SUPPORTED
+        bits.write_u8(0, 1); // DCCH_SUPPORTED
+        bits.write_u8(0, 1); // REV_FCH_GATING_REQ
+        bits.write_u8(0, 1); // STS_SUPPORTED
+        // Truncated here: real ISW11SC traces stop before 3X_CCH_SUPPORTED.
+
+        let msg = AccessMessage::decode_with_context(&bits, ctx)
+            .expect("decode truncated optional PRM tail");
+        let AccessMessage::PageResponse(msg) = msg else {
+            panic!("expected page response");
+        };
+        assert_eq!(9, msg.mob_p_rev);
+        assert_eq!(3, msg.service_option);
+        assert_eq!(Some(false), msg.sts_supported);
+        assert_eq!(None, msg.cch_3x_supported);
+        assert_eq!(0, msg.remaining_bits);
+    }
+
+    #[test]
+    fn test_page_response_serving_p_rev_caps_higher_reported_mob_p_rev() {
+        let ctx = AccessDecodeContext::new(Some(0), Some(6));
+        let mut bits = Bitstream::new();
+        bits.write_u8(rcsch_wire(MessageId::PageResponse), 8);
+        bits.write_u8(1, 1); // MOB_TERM
+        bits.write_u8(0b010, 3); // SLOT_CYCLE_INDEX
+        bits.write_u8(9, 8); // MOB_P_REV
+        bits.write_u8(0x3a, 8); // SCM
+        bits.write_u8(0b000, 3); // REQUEST_MODE
+        bits.write_u32(3, 16); // SERVICE_OPTION
+        bits.write_u8(0, 1); // PM
+        bits.write_u8(0, 1); // NAR_AN_CAP
+        bits.write_u8(0, 3); // NUM_ALT_SO
+        bits.write_u8(0, 1); // UZID_INCL
+        bits.write_u8(0b01, 2); // CH_IND
+        bits.write_u8(0, 1); // OTD_SUPPORTED
+        bits.write_u8(0, 1); // QPCH_SUPPORTED
+        bits.write_u8(0, 1); // ENHANCED_RC
+        bits.write_u8(1, 5); // FOR_RC_PREF
+        bits.write_u8(1, 5); // REV_RC_PREF
+        bits.write_u8(0, 1); // FCH_SUPPORTED
+        bits.write_u8(0, 1); // DCCH_SUPPORTED
+        bits.write_u8(0, 1); // REV_FCH_GATING_REQ
+        bits.write_u8(0, 1); // Would be STS_SUPPORTED only for P_REV_IN_USE >= 7.
+
+        let msg =
+            AccessMessage::decode_with_context(&bits, ctx).expect("decode p_rev6 page response");
+        let AccessMessage::PageResponse(msg) = msg else {
+            panic!("expected page response");
+        };
+        assert_eq!(9, msg.mob_p_rev);
+        assert_eq!(Some(0b01), msg.ch_ind);
+        assert_eq!(None, msg.sts_supported);
+        assert_eq!(1, msg.remaining_bits);
     }
 
     #[test]
