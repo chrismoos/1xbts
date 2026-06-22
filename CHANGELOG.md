@@ -1,5 +1,6 @@
 # HEAD 
 
+- Speed test downloads can now run up to 2 MiB.
 - BTS TX pacing no longer busy-waits between batches. It sleeps to the
   batch deadline with an adaptive wake margin, cutting TX thread CPU
   roughly 3x at idle.

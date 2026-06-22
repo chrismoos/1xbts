@@ -51,6 +51,6 @@ No-JavaScript download results include the callback request latency. The default
 no-JavaScript download size is larger than the JavaScript default to make that
 latency a smaller part of the measurement.
 
-Available test sizes range from 4 KiB through 512 KiB. The defaults are chosen
+Available test sizes range from 4 KiB through 2 MiB. The defaults are chosen
 for roughly sub-150 kbps links: 64 KiB for JavaScript mode and 128 KiB for the
 no-JavaScript download fallback.

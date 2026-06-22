@@ -45,6 +45,22 @@ func TestTextPayloadExactSizeAndFormSafe(t *testing.T) {
 	}
 }
 
+func TestSizeOptionsIncludeLargeHRPDRuns(t *testing.T) {
+	opts := sizeOptions()
+	var hasOneMiB, hasTwoMiB bool
+	for _, opt := range opts {
+		switch opt.Bytes {
+		case 1024 * 1024:
+			hasOneMiB = true
+		case 2 * 1024 * 1024:
+			hasTwoMiB = true
+		}
+	}
+	if !hasOneMiB || !hasTwoMiB {
+		t.Fatalf("size options missing large HRPD runs: 1MiB=%v 2MiB=%v opts=%v", hasOneMiB, hasTwoMiB, opts)
+	}
+}
+
 func TestDownloadBinHeadersAndSize(t *testing.T) {
 	s := testServer()
 	req := httptest.NewRequest(http.MethodGet, "/download.bin?bytes=4096&nonce=x", nil)
