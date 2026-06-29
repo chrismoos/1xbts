@@ -1,37 +1,24 @@
-use num_complex::Complex32;
-use sdr::FIR;
-
-use crate::sdr::cdma2000_baseband_filter_taps_f64;
+use crate::sdr::{cdma2000_baseband_filter_taps_f64, fir::SymmetricComplexFir32};
 
 use super::{PipelineProcessor, SampleBlock};
 
 /// Applies the CDMA2000 baseband matched filter to incoming complex samples.
 pub struct PulseMatchedFilterProcessor {
-    matched_i: FIR<f32>,
-    matched_q: FIR<f32>,
+    matched: SymmetricComplexFir32,
 }
 
 impl PulseMatchedFilterProcessor {
     pub fn new() -> Self {
         let taps = cdma2000_baseband_filter_taps_f64();
         Self {
-            matched_i: FIR::new(&taps, 1, 1),
-            matched_q: FIR::new(&taps, 1, 1),
+            matched: SymmetricComplexFir32::new(&taps),
         }
     }
 }
 
 impl PipelineProcessor for PulseMatchedFilterProcessor {
     fn process_block(&mut self, block: SampleBlock) -> Vec<SampleBlock> {
-        let i_vals: Vec<f32> = block.samples.iter().map(|i| i.re).collect();
-        let q_vals: Vec<f32> = block.samples.iter().map(|i| i.im).collect();
-        let filtered_i = self.matched_i.process(&i_vals);
-        let filtered_q = self.matched_q.process(&q_vals);
-        let filtered: Vec<Complex32> = filtered_i
-            .into_iter()
-            .zip(filtered_q)
-            .map(|(i, q)| Complex32::new(i, q))
-            .collect();
+        let filtered = self.matched.process_block(&block.samples);
 
         let mut out =
             SampleBlock::new(filtered, block.chip_start).with_sample_rate_hz(block.sample_rate_hz);

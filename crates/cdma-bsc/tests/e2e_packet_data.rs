@@ -43,8 +43,8 @@ use cdma_bts::phy::spread::{PnSequence, Spreader};
 use cdma_bts::phy::walsh::WalshGenerator;
 use cdma_bts::receiver::access_layer3::{FdschMessage, FdschPdu};
 use cdma_bts::receiver::sync::SyncChannelMessage;
-use cdma_bts::sdr::cdma2000_baseband_filter_taps_f64;
 use cdma_bts::sdr::pipe::RadioPipe;
+use cdma_bts::sdr::{cdma2000_baseband_filter_taps_f64, fir::ComplexFir32};
 
 use cdma_common::bits::Bitstream;
 use cdma_common::consts::{SERVICE_OPTION_PACKET_DATA, SERVICE_OPTION_SMS};
@@ -70,7 +70,6 @@ use cdma_hlr::model::{
     RegistrationBinding, RegistrationState, Subscriber, SubscriberIdentity, SubscriberStatus,
 };
 use cdma_hlr::repository::HlrRepository;
-use sdr::FIR;
 
 const PCG_CHIPS: u64 = 1_536;
 const PCGS_PER_FRAME: usize = 16;
@@ -224,46 +223,28 @@ fn crc16_fdsch_bits(bits: &[u8]) -> u16 {
 
 fn apply_local_pulse_shape(chip_samples: &[Complex32], zero_stuff: bool) -> Vec<Complex32> {
     let taps = cdma2000_baseband_filter_taps_f64();
-    let mut tx_i = FIR::new(&taps, 1, 1);
-    let mut tx_q = FIR::new(&taps, 1, 1);
+    let mut tx = ComplexFir32::new(&taps);
 
-    let mut upsampled_i = Vec::with_capacity(chip_samples.len() * 4);
-    let mut upsampled_q = Vec::with_capacity(chip_samples.len() * 4);
+    let mut upsampled = Vec::with_capacity(chip_samples.len() * 4);
     for s in chip_samples {
         if zero_stuff {
-            upsampled_i.push(s.re);
-            upsampled_q.push(s.im);
+            upsampled.push(*s);
             for _ in 1..4 {
-                upsampled_i.push(0.0);
-                upsampled_q.push(0.0);
+                upsampled.push(Complex32::new(0.0, 0.0));
             }
         } else {
             for _ in 0..4 {
-                upsampled_i.push(s.re);
-                upsampled_q.push(s.im);
+                upsampled.push(*s);
             }
         }
     }
 
-    tx_i.process(&upsampled_i)
-        .into_iter()
-        .zip(tx_q.process(&upsampled_q))
-        .map(|(re, im)| Complex32::new(re, im))
-        .collect()
+    tx.process_block(&upsampled)
 }
 
 fn apply_local_matched_filter(oversampled: &[Complex32]) -> Vec<Complex32> {
     let taps = cdma2000_baseband_filter_taps_f64();
-    let mut rx_i = FIR::new(&taps, 1, 1);
-    let mut rx_q = FIR::new(&taps, 1, 1);
-    let i_vals = oversampled.iter().map(|s| s.re).collect::<Vec<_>>();
-    let q_vals = oversampled.iter().map(|s| s.im).collect::<Vec<_>>();
-
-    rx_i.process(&i_vals)
-        .into_iter()
-        .zip(rx_q.process(&q_vals))
-        .map(|(re, im)| Complex32::new(re, im))
-        .collect()
+    ComplexFir32::new(&taps).process_block(oversampled)
 }
 
 fn quantize_i16_roundtrip(samples: &[Complex32]) -> Vec<Complex32> {

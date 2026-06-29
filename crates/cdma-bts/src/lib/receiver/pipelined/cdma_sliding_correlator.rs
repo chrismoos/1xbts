@@ -256,21 +256,18 @@ mod tests {
 
     use super::CdmaSlidingCorrelator;
     use crate::{
-        receiver::pipelined::{PipelineProcessor, SampleBlock},
-        sdr::cdma2000_baseband_filter_taps_f64,
         phy::spread::PnSequence,
         phy::walsh::WalshGenerator,
+        receiver::pipelined::{PipelineProcessor, SampleBlock},
+        sdr::{cdma2000_baseband_filter_taps_f64, fir::ComplexFir32},
     };
-
-    use sdr::FIR;
 
     /// Generate a TX signal matching the IS-95 forward link convention
     /// (PN_I - j·PN_Q), pulse-shaped through the RRC filter.
     fn generate_tx_signal(sample_rate: u32, num_symbols: usize) -> Vec<Complex32> {
         let oversample = (sample_rate / 1_228_800).max(1) as usize;
         let taps = cdma2000_baseband_filter_taps_f64();
-        let mut fir_i = FIR::new(&taps, 1, 1);
-        let mut fir_q = FIR::new(&taps, 1, 1);
+        let mut fir = ComplexFir32::new(&taps);
         let walsh0 = WalshGenerator::generate_matrix::<64>()[0];
         let mut pn = PnSequence::new_repeat(0, 32768, oversample.saturating_sub(1));
         let mut tx = Vec::new();
@@ -281,10 +278,7 @@ mod tests {
                     let s = pn.generate_iq();
                     let raw_i = d * s.re;
                     let raw_q = d * (-s.im); // IS-95: PN_I - j·PN_Q
-                    tx.push(Complex32::new(
-                        fir_i.process(&[raw_i])[0],
-                        fir_q.process(&[raw_q])[0],
-                    ));
+                    tx.push(fir.process_sample(Complex32::new(raw_i, raw_q)));
                 }
             }
         }

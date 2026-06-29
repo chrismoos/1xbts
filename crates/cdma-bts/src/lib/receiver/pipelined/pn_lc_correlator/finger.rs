@@ -1013,13 +1013,13 @@ impl PnLcFinger {
             };
             let mut gardner_adjust = GardnerTimingAdjustment::default();
             let mut gardner_finished = false;
+            let gardner_mid = self
+                .gardner_timing
+                .as_ref()
+                .filter(|gardner| gardner.is_tracking_active() && gardner.needs_midpoint())
+                .and_then(|_| interp_complex_contiguous(samples, idx - os as f32 * 0.5));
             if let Some(gardner) = self.gardner_timing.as_mut() {
                 if gardner.is_tracking_active() {
-                    let gardner_mid = if gardner.needs_midpoint() {
-                        interp_complex_contiguous(samples, idx - os as f32 * 0.5)
-                    } else {
-                        None
-                    };
                     gardner_adjust = gardner.observe(val, gardner_mid);
                     gardner_finished = !gardner.is_tracking_active();
                 } else {

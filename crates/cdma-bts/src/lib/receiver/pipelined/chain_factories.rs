@@ -4,7 +4,6 @@ use crate::phy::coding::convolutional::{
 };
 use crate::phy::coding::long_code::LongCodeGenerator;
 use crate::phy::walsh::WalshDecoder;
-use crate::sdr::cdma2000_baseband_filter_taps_f64;
 
 use super::gardner_timing_recovery::GardnerTimingConfig;
 use super::rake_access_searcher;
@@ -178,11 +177,6 @@ pub fn reverse_access_chain(settings: ReverseAccessSettings) -> Vec<PipelineProc
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(10);
 
-    let pulse_shape_taps = cdma2000_baseband_filter_taps_f64()
-        .into_iter()
-        .map(|v| v as f32)
-        .collect::<Vec<_>>();
-
     let correlator = pn_lc_correlator::PnLcCorrelator::new(
         pn_lc_correlator::PnLcConfig::default_4x()
             .with_snr_threshold(20.0)
@@ -198,8 +192,7 @@ pub fn reverse_access_chain(settings: ReverseAccessSettings) -> Vec<PipelineProc
             )
             .with_gardner_timing(GardnerTimingConfig::reverse_access_4x())
             .with_output_oversampled_chips(false)
-            .with_access_cfo(true)
-            .with_pulse_shape_taps(pulse_shape_taps),
+            .with_access_cfo(true),
         LongCodeGenerator::new_access_channel_with_state(
             settings.access_channel_number,
             settings.paging_channel_number,
@@ -284,11 +277,6 @@ pub fn reverse_traffic_chain(settings: ReverseTrafficSettings) -> Vec<PipelinePr
         .map(|pcgs| ((pcgs.max(1)) + 15) / 16)
         .unwrap_or(1);
 
-    let pulse_shape_taps = cdma2000_baseband_filter_taps_f64()
-        .into_iter()
-        .map(|v| v as f32)
-        .collect::<Vec<_>>();
-
     let snr_threshold = settings.snr_threshold.unwrap_or(20.0);
     let correlator = pn_lc_correlator::PnLcCorrelator::new(
         pn_lc_correlator::PnLcConfig::default_4x()
@@ -303,7 +291,6 @@ pub fn reverse_traffic_chain(settings: ReverseTrafficSettings) -> Vec<PipelinePr
             .with_search_interval_windows(32)
             .with_split_pn_reference(true)
             .with_reanchor_origin(settings.reanchor_origin)
-            .with_pulse_shape_taps(pulse_shape_taps)
             .with_suppress_search_when_locked(true)
             // Early/prompt/late chip-timing instrumentation + active
             // sub-chip timing slew. The slew closed loop uses the
@@ -352,11 +339,6 @@ pub fn reverse_traffic_chain_rc3(settings: ReverseTrafficSettings) -> Vec<Pipeli
     let preamble_pcgs = settings.preamble_num_pcgs;
     let rev_fch_gating_mode = settings.rev_fch_gating_mode;
 
-    let pulse_shape_taps = cdma2000_baseband_filter_taps_f64()
-        .into_iter()
-        .map(|v| v as f32)
-        .collect::<Vec<_>>();
-
     let snr_threshold = settings.snr_threshold.unwrap_or(20.0);
     let correlator = pn_lc_correlator::PnLcCorrelator::new(
         pn_lc_correlator::PnLcConfig::default_4x()
@@ -369,7 +351,6 @@ pub fn reverse_traffic_chain_rc3(settings: ReverseTrafficSettings) -> Vec<Pipeli
             .with_search_interval_windows(32)
             .with_split_pn_reference(true)
             .with_reanchor_origin(settings.reanchor_origin)
-            .with_pulse_shape_taps(pulse_shape_taps)
             .with_lc_decimation(2) // HPSK: c_long = c_I + j*c_Q
             .with_suppress_search_when_locked(true)
             .with_epl_pilot(settings.epl_pilot)

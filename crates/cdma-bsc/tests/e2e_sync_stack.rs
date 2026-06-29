@@ -50,7 +50,10 @@ use cdma_bts::{
         },
         sync::SyncChannelMessage,
     },
-    sdr::{Radio, RadioPipe, RadioPipeHandle, RadioTx, cdma2000_baseband_filter_taps_f64},
+    sdr::{
+        Radio, RadioPipe, RadioPipeHandle, RadioTx, cdma2000_baseband_filter_taps_f64,
+        fir::ComplexFir32,
+    },
 };
 use cdma_msc::{StaticVoicePolicy, VoiceConfig};
 
@@ -67,7 +70,6 @@ use chrono::Utc;
 use env_logger::Env;
 use itertools::Itertools;
 use num_complex::Complex32;
-use sdr::FIR;
 
 const E2E_DIRECT_GPM_ESN: u32 = 0x8096_324d;
 const E2E_SMS_PAGE_ESN: u32 = 0x4cdc_1d09;
@@ -2296,46 +2298,28 @@ async fn run_e2e_paging_stack_generated_samples_case(
 
 fn apply_local_pulse_shape(chip_samples: &[Complex32], zero_stuff: bool) -> Vec<Complex32> {
     let taps = cdma2000_baseband_filter_taps_f64();
-    let mut tx_i = FIR::new(&taps, 1, 1);
-    let mut tx_q = FIR::new(&taps, 1, 1);
+    let mut tx = ComplexFir32::new(&taps);
 
-    let mut upsampled_i = Vec::with_capacity(chip_samples.len() * 4);
-    let mut upsampled_q = Vec::with_capacity(chip_samples.len() * 4);
+    let mut upsampled = Vec::with_capacity(chip_samples.len() * 4);
     for s in chip_samples {
         if zero_stuff {
-            upsampled_i.push(s.re);
-            upsampled_q.push(s.im);
+            upsampled.push(*s);
             for _ in 1..4 {
-                upsampled_i.push(0.0);
-                upsampled_q.push(0.0);
+                upsampled.push(Complex32::new(0.0, 0.0));
             }
         } else {
             for _ in 0..4 {
-                upsampled_i.push(s.re);
-                upsampled_q.push(s.im);
+                upsampled.push(*s);
             }
         }
     }
 
-    tx_i.process(&upsampled_i)
-        .into_iter()
-        .zip(tx_q.process(&upsampled_q))
-        .map(|(re, im)| Complex32::new(re, im))
-        .collect()
+    tx.process_block(&upsampled)
 }
 
 fn apply_local_matched_filter(oversampled: &[Complex32]) -> Vec<Complex32> {
     let taps = cdma2000_baseband_filter_taps_f64();
-    let mut rx_i = FIR::new(&taps, 1, 1);
-    let mut rx_q = FIR::new(&taps, 1, 1);
-    let i_vals = oversampled.iter().map(|s| s.re).collect::<Vec<_>>();
-    let q_vals = oversampled.iter().map(|s| s.im).collect::<Vec<_>>();
-
-    rx_i.process(&i_vals)
-        .into_iter()
-        .zip(rx_q.process(&q_vals))
-        .map(|(re, im)| Complex32::new(re, im))
-        .collect()
+    ComplexFir32::new(&taps).process_block(oversampled)
 }
 
 fn quantize_i16_roundtrip(samples: &[Complex32]) -> Vec<Complex32> {
@@ -6213,16 +6197,7 @@ fn generate_reverse_traffic_preamble_samples(
         .collect();
 
     let taps = cdma2000_baseband_filter_taps_f64();
-    let mut fir_i = FIR::new(&taps, 1, 1);
-    let mut fir_q = FIR::new(&taps, 1, 1);
-    tx_raw
-        .iter()
-        .map(|s| {
-            let i = fir_i.process(&[s.re])[0];
-            let q = fir_q.process(&[s.im])[0];
-            Complex32::new(i, q)
-        })
-        .collect()
+    ComplexFir32::new(&taps).process_block(&tx_raw)
 }
 
 fn enqueue_injected_rx_samples(

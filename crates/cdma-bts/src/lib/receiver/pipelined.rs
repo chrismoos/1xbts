@@ -860,9 +860,8 @@ mod tests {
     #[test]
     #[ignore = "diagnostic autocorrelation analysis; run explicitly when requested"]
     fn test_analyze_mft_autocorrelation_sidelobes() {
-        use crate::sdr::cdma2000_baseband_filter_taps_f64;
+        use crate::sdr::{cdma2000_baseband_filter_taps_f64, fir::ComplexFir32};
         use rustfft::FftPlanner;
-        use sdr::FIR;
 
         let oversample = 4usize;
         let pn_len = 32768 * oversample; // 131072
@@ -872,11 +871,10 @@ mod tests {
 
         // Generate filtered PN (same as MFT)
         let taps = cdma2000_baseband_filter_taps_f64();
-        let mut filt_i = FIR::new(&taps, 1, 1);
-        let mut filt_q = FIR::new(&taps, 1, 1);
+        let mut filt = ComplexFir32::new(&taps);
         let pn_filtered: Vec<Complex32> = build_oqpsk_pn_samples(pn_len, oversample)
             .into_iter()
-            .map(|s| Complex32::new(filt_i.process(&[s.re])[0], filt_q.process(&[-s.im])[0]))
+            .map(|s| filt.process_sample(Complex32::new(s.re, -s.im)))
             .collect();
 
         let fft_length = pn_len * 2;
@@ -2478,8 +2476,7 @@ mod tests {
     #[ignore = "diagnostic despread-quality sweep; run explicitly when requested"]
     fn capture_uplink_wav_despread_quality() {
         use crate::phy::walsh::WalshGenerator;
-        use crate::sdr::cdma2000_baseband_filter_taps_f64;
-        use sdr::FIR;
+        use crate::sdr::{cdma2000_baseband_filter_taps_f64, fir::ComplexFir32};
 
         init_test_logger();
         let wav_path = test_capture_path("1791202702894280.wav");
@@ -2495,16 +2492,7 @@ mod tests {
 
         // Apply matched filter
         let taps = cdma2000_baseband_filter_taps_f64();
-        let mut fir_i = FIR::new(&taps, 1, 1);
-        let mut fir_q = FIR::new(&taps, 1, 1);
-        let filtered: Vec<Complex32> = iq_samples
-            .iter()
-            .map(|s| {
-                let i = fir_i.process(&[s.re])[0];
-                let q = fir_q.process(&[s.im])[0];
-                Complex32::new(i, q)
-            })
-            .collect();
+        let filtered = ComplexFir32::new(&taps).process_block(&iq_samples);
 
         // Known parameters from detection log
         let abs_origin = chip_start as usize * oversample;
@@ -2764,8 +2752,7 @@ mod tests {
     fn test_generic_rake_access_channel() {
         use crate::receiver::pipelined::generic_rake_receiver::GenericRakeReceiver;
         use crate::receiver::pipelined::pn_lc_correlator::{PnLcConfig, PnLcCorrelator};
-        use crate::sdr::cdma2000_baseband_filter_taps_f64;
-        use sdr::FIR;
+        use crate::sdr::{cdma2000_baseband_filter_taps_f64, fir::ComplexFir32};
 
         init_test_logger();
 
@@ -2894,16 +2881,7 @@ mod tests {
         assert_eq!(total_tx_chips * oversample, tx_raw.len());
 
         let taps = cdma2000_baseband_filter_taps_f64();
-        let mut fir_i = FIR::new(&taps, 1, 1);
-        let mut fir_q = FIR::new(&taps, 1, 1);
-        let tx_signal: Vec<Complex32> = tx_raw
-            .iter()
-            .map(|s| {
-                let i = fir_i.process(&[s.re])[0];
-                let q = fir_q.process(&[s.im])[0];
-                Complex32::new(i, q)
-            })
-            .collect();
+        let tx_signal = ComplexFir32::new(&taps).process_block(&tx_raw);
         drop(tx_raw);
 
         let offsets = [0i64, 5, -5, 50, -50];
@@ -2985,8 +2963,7 @@ mod tests {
     #[ignore = "legacy RakeAccessSearcher pulse-shaped access test; replaced by GenericRakeReceiver coverage"]
     fn test_rake_access_searcher_pulse_shaped() {
         use crate::receiver::pipelined::rake_access_searcher::RakeAccessSearcher;
-        use crate::sdr::cdma2000_baseband_filter_taps_f64;
-        use sdr::FIR;
+        use crate::sdr::{cdma2000_baseband_filter_taps_f64, fir::ComplexFir32};
 
         init_test_logger();
 
@@ -3100,16 +3077,7 @@ mod tests {
         assert_eq!(total_tx_chips * oversample, tx_raw.len());
 
         let taps = cdma2000_baseband_filter_taps_f64();
-        let mut fir_i = FIR::new(&taps, 1, 1);
-        let mut fir_q = FIR::new(&taps, 1, 1);
-        let tx_signal: Vec<Complex32> = tx_raw
-            .iter()
-            .map(|s| {
-                let i = fir_i.process(&[s.re])[0];
-                let q = fir_q.process(&[s.im])[0];
-                Complex32::new(i, q)
-            })
-            .collect();
+        let tx_signal = ComplexFir32::new(&taps).process_block(&tx_raw);
         drop(tx_raw);
 
         let offsets = [0i64, 5, -5, 50, -50];
@@ -3233,8 +3201,7 @@ mod tests {
     #[ignore = "diagnostic despread-phase sweep; run explicitly when requested"]
     fn test_pulse_shaped_despread_phase_sweep() {
         use crate::phy::walsh::WalshGenerator;
-        use crate::sdr::cdma2000_baseband_filter_taps_f64;
-        use sdr::FIR;
+        use crate::sdr::{cdma2000_baseband_filter_taps_f64, fir::ComplexFir32};
 
         let oversample = 4usize;
         let chip_start: usize = 100_000;
@@ -3263,28 +3230,10 @@ mod tests {
             .collect();
 
         let taps = cdma2000_baseband_filter_taps_f64();
-        let mut fir_i = FIR::new(&taps, 1, 1);
-        let mut fir_q = FIR::new(&taps, 1, 1);
-        let tx_filtered: Vec<Complex32> = tx_raw
-            .iter()
-            .map(|s| {
-                let i = fir_i.process(&[s.re])[0];
-                let q = fir_q.process(&[s.im])[0];
-                Complex32::new(i, q)
-            })
-            .collect();
+        let tx_filtered = ComplexFir32::new(&taps).process_block(&tx_raw);
 
         // RX matched filter (one more pass)
-        let mut mf_i = FIR::new(&taps, 1, 1);
-        let mut mf_q = FIR::new(&taps, 1, 1);
-        let rx_signal: Vec<Complex32> = tx_filtered
-            .iter()
-            .map(|s| {
-                let i = mf_i.process(&[s.re])[0];
-                let q = mf_q.process(&[s.im])[0];
-                Complex32::new(i, q)
-            })
-            .collect();
+        let rx_signal = ComplexFir32::new(&taps).process_block(&tx_filtered);
 
         // Build raw PN reference
         let pn_ref: Vec<Complex32> = build_oqpsk_pn_samples(phase_period, oversample)

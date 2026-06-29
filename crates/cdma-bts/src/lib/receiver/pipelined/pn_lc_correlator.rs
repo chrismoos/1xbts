@@ -86,8 +86,12 @@ pub struct PnLcCorrelator {
     pn_despread_seq: Arc<Vec<Complex32>>,
     phase_period: usize,
 
-    /// Template LC generator; cloned for each search hypothesis.
+    /// Template LC generator used to seed independent cursors and fingers.
     lc_template: LongCodeGenerator,
+    /// Search-side LC cursor used to generate PN×LC reference signs
+    /// incrementally across searches.
+    search_lc_gen: LongCodeGenerator,
+    search_lc_next_chip: usize,
 
     fft_fwd: Arc<dyn Fft<f32>>,
     fft_inv: Arc<dyn Fft<f32>>,
@@ -105,6 +109,10 @@ pub struct PnLcCorrelator {
     search_nc_power: Vec<f32>,
     search_ref_seg: Vec<Complex32>,
     search_result_buf: Vec<Complex32>,
+    search_lc_signs: Vec<f32>,
+    search_cfo_hypotheses: Vec<f32>,
+    search_cfo_phasors: Vec<Vec<Complex32>>,
+    search_cfo_signal_ffts: Vec<Vec<Complex32>>,
 
     /// Builds the signal-processing chain for each newly spawned finger.
     chain_builder: Box<dyn Fn() -> Vec<PipelineProcessorShared> + Send>,
@@ -198,11 +206,43 @@ impl PnLcCorrelator {
             .get_inplace_scratch_len()
             .max(seg_fft_inv.get_inplace_scratch_len());
 
+        // With large coherent windows, carrier frequency offset destroys the
+        // coherent sum. Keep the same fixed CFO grid as the search path, but
+        // precompute phasors and allocate the rotated signal FFT buffers once.
+        let cfo_step: f32 = 0.0005;
+        let cfo_half_count = if cfg.coherent_chips > 1024 { 1i32 } else { 0 };
+        let search_cfo_hypotheses: Vec<f32> = ((-cfo_half_count)..=cfo_half_count)
+            .map(|i| i as f32 * cfo_step)
+            .collect();
+        let search_cfo_phasors: Vec<Vec<Complex32>> = search_cfo_hypotheses
+            .iter()
+            .map(|&cfo| {
+                if cfo == 0.0 {
+                    Vec::new()
+                } else {
+                    (0..window_len)
+                        .map(|n| {
+                            let angle = cfo * n as f32;
+                            Complex32::new(angle.cos(), angle.sin())
+                        })
+                        .collect()
+                }
+            })
+            .collect();
+        let search_cfo_signal_ffts =
+            vec![vec![Complex32::new(0.0, 0.0); window_len]; search_cfo_hypotheses.len()];
+        let search_lc_signs_capacity = cfg.coherent_chips + 2 * cfg.lc_half_span as usize + 2;
+
+        let diag_top_bins = std::env::var_os("CDMA_PNLC_DIAG_TOP_BINS").is_some();
+        let timing_score_diag = std::env::var_os("CDMA_PNLC_TIMING_SCORE_DIAG").is_some();
+
         Self {
             cfg,
             pn_fft_seq,
             pn_despread_seq,
             phase_period,
+            search_lc_gen: lc_template.clone(),
+            search_lc_next_chip: 0,
             lc_template,
             fft_fwd,
             fft_inv,
@@ -215,6 +255,10 @@ impl PnLcCorrelator {
             search_nc_power: vec![0.0f32; seg_len],
             search_ref_seg: vec![Complex32::new(0.0, 0.0); seg_len],
             search_result_buf: vec![Complex32::new(0.0, 0.0); window_len.max(seg_len)],
+            search_lc_signs: Vec::with_capacity(search_lc_signs_capacity),
+            search_cfo_hypotheses,
+            search_cfo_phasors,
+            search_cfo_signal_ffts,
             chain_builder,
             buffer: Vec::new(),
             recent_samples: VecDeque::new(),
@@ -227,8 +271,8 @@ impl PnLcCorrelator {
             next_finger_id: 1,
             sample_rate_hz: 0.0,
             search_paused: false,
-            timing_score_diag: false,
-            diag_top_bins: false,
+            timing_score_diag,
+            diag_top_bins,
             reacquire_signal_lost_chips: DEFAULT_REACQUIRE_SIGNAL_LOST_CHIPS,
             reacquire_crc_miss_count: DEFAULT_REACQUIRE_CRC_MISS_COUNT,
             reacquire_idle_chips: DEFAULT_REACQUIRE_IDLE_CHIPS,
@@ -397,6 +441,29 @@ impl PnLcCorrelator {
             ],
             None => vec![(PnReferenceKind::Plain, &self.pn_fft_seq)],
         }
+    }
+
+    fn fill_search_lc_signs(&mut self, start_chip: usize, count: usize) {
+        if start_chip < self.search_lc_next_chip {
+            self.search_lc_gen = self.lc_template.clone();
+            self.search_lc_next_chip = 0;
+        }
+
+        self.search_lc_gen
+            .advance_chips(start_chip - self.search_lc_next_chip);
+        self.search_lc_next_chip = start_chip;
+
+        self.search_lc_signs.clear();
+        self.search_lc_signs.reserve(count);
+        for _ in 0..count {
+            let sign = if self.search_lc_gen.next_chip() == 1 {
+                -1.0
+            } else {
+                1.0
+            };
+            self.search_lc_signs.push(sign);
+        }
+        self.search_lc_next_chip += count;
     }
 
     fn search_lc_with_signs(
@@ -1391,17 +1458,6 @@ impl PnLcCorrelator {
         let seg_len = self.seg_len; // samples per segment
         let _seg_chips = n_chips / n_seg;
 
-        // --- CFO hypotheses for coherent search ---
-        // With large coherent windows (>256 chips), carrier frequency offset
-        // destroys the coherent sum.  Pre-compute rotated signal FFTs for a
-        // small grid of CFO hypotheses so the search tolerates typical mobile
-        // CFOs (up to ~±1 kHz ≈ ±0.001 rad/sample at 4.9 MHz).
-        let cfo_step: f32 = 0.0005; // rad/sample — keeps residual phase < π over window
-        let cfo_half_count = if n_chips > 1024 { 1i32 } else { 0 }; // CFO only for >1024 chip windows
-        let cfo_hypotheses: Vec<f32> = ((-cfo_half_count)..=cfo_half_count)
-            .map(|i| i as f32 * cfo_step)
-            .collect();
-
         // --- Pre-FFT the signal segments (reused across all LC hypotheses) ---
         // For the coherent path: one FFT per CFO hypothesis.
         // For the segmented path: one set of segment FFTs (CFO is less critical).
@@ -1419,31 +1475,24 @@ impl PnLcCorrelator {
             vec![]
         };
 
-        // Pre-compute CFO-rotated signal FFTs for the coherent path.
-        let cfo_signal_ffts: Vec<Vec<Complex32>> = if n_seg <= 1 {
-            cfo_hypotheses
-                .iter()
-                .map(|&cfo| {
-                    let mut buf: Vec<Complex32> = if cfo == 0.0 {
-                        window[..window_len].to_vec()
-                    } else {
-                        window[..window_len]
-                            .iter()
-                            .enumerate()
-                            .map(|(n, &s)| {
-                                let angle = cfo * n as f32;
-                                s * Complex32::new(angle.cos(), angle.sin())
-                            })
-                            .collect()
-                    };
-                    self.fft_fwd
-                        .process_with_scratch(&mut buf, &mut self.fft_scratch);
-                    buf
-                })
-                .collect()
-        } else {
-            vec![]
-        };
+        // Pre-compute CFO-rotated signal FFTs for the coherent path. Buffers
+        // and phasors are owned by the correlator so each search avoids heap
+        // allocation and per-sample trig.
+        if n_seg <= 1 {
+            for cfo_idx in 0..self.search_cfo_hypotheses.len() {
+                let buf = &mut self.search_cfo_signal_ffts[cfo_idx];
+                if self.search_cfo_hypotheses[cfo_idx] == 0.0 {
+                    buf[..window_len].copy_from_slice(&window[..window_len]);
+                } else {
+                    let phasors = &self.search_cfo_phasors[cfo_idx];
+                    for i in 0..window_len {
+                        buf[i] = window[i] * phasors[i];
+                    }
+                }
+                self.fft_fwd
+                    .process_with_scratch(&mut buf[..window_len], &mut self.fft_scratch);
+            }
+        }
 
         // For coherent (n_seg==1): delay space = window_len.
         // For segmented: delay space = seg_len (each segment gives seg_len delay bins).
@@ -1497,22 +1546,6 @@ impl PnLcCorrelator {
         };
         let hpsk_lc_offset = lc_global_start - hpsk_lc_gen_start;
 
-        let hpsk_lc: Vec<f32> = if hpsk {
-            let mut lc_hpsk_gen = self.lc_template.clone();
-            lc_hpsk_gen.advance_chips(hpsk_lc_gen_start);
-            (0..(lc_total_chips + 2))
-                .map(|_| {
-                    if lc_hpsk_gen.next_chip() == 1 {
-                        -1.0
-                    } else {
-                        1.0
-                    }
-                })
-                .collect()
-        } else {
-            vec![]
-        };
-
         let hpsk_pn_i: Vec<f32> = if hpsk {
             (0..n_chips)
                 .map(|k| self.pn_fft_seq[(base_phase + k * os) % pp].re)
@@ -1528,22 +1561,17 @@ impl PnLcCorrelator {
             vec![]
         };
 
-        let lc_values: Vec<Complex32> = if !hpsk {
-            let mut lc_gen_bulk = self.lc_template.clone();
-            lc_gen_bulk.advance_chips(lc_global_start);
-            (0..lc_total_chips)
-                .map(|_| {
-                    let sign: f32 = if lc_gen_bulk.next_chip() == 1 {
-                        -1.0
-                    } else {
-                        1.0
-                    };
-                    Complex32::new(sign, 0.0)
-                })
-                .collect()
+        let lc_sign_start = if hpsk {
+            hpsk_lc_gen_start
         } else {
-            vec![]
+            lc_global_start
         };
+        let lc_sign_count = if hpsk {
+            lc_total_chips + 2
+        } else {
+            lc_total_chips
+        };
+        self.fill_search_lc_signs(lc_sign_start, lc_sign_count);
 
         let lc_signs_base_offset = (expected_chip as i64 - half as i64) - lc_global_start as i64;
 
@@ -1573,7 +1601,7 @@ impl PnLcCorrelator {
 
                     // I branch: LC at chip rate
                     let lc_i_idx = hpsk_lc_offset + slice_start + k;
-                    let lc_i = hpsk_lc[lc_i_idx];
+                    let lc_i = self.search_lc_signs[lc_i_idx];
                     let s_i = pn_i * lc_i;
 
                     // Absolute chip index determines W12 parity and pair boundaries.
@@ -1598,7 +1626,7 @@ impl PnLcCorrelator {
                     };
                     let lc_q_dec_idx = hpsk_lc_offset as isize + slice_start as isize + even_k;
                     let lc_q_dec = if lc_q_dec_idx > 0 {
-                        hpsk_lc[lc_q_dec_idx as usize - 1]
+                        self.search_lc_signs[lc_q_dec_idx as usize - 1]
                     } else {
                         1.0
                     };
@@ -1612,10 +1640,10 @@ impl PnLcCorrelator {
             } else {
                 // IS-95: real LC sign × PN (original path, unchanged)
                 for k in 0..n_chips {
-                    let lc_val = lc_values[slice_start + k];
+                    let lc_sign = self.search_lc_signs[slice_start + k];
                     let pn_conj = pn_chips[k];
                     self.search_ref_buf[k * os] =
-                        Complex32::new(pn_conj.re * lc_val.re, -pn_conj.im * lc_val.re);
+                        Complex32::new(pn_conj.re * lc_sign, -pn_conj.im * lc_sign);
                 }
             }
 
@@ -1690,7 +1718,8 @@ impl PnLcCorrelator {
                     &mut self.fft_scratch,
                 );
 
-                for cfo_sig_fft in &cfo_signal_ffts {
+                for cfo_sig_fft in &self.search_cfo_signal_ffts[..self.search_cfo_hypotheses.len()]
+                {
                     for i in 0..window_len {
                         let s = cfo_sig_fft[i];
                         let r = self.search_ref_buf[i];
@@ -3400,9 +3429,8 @@ mod tests {
 
     #[test]
     fn pulse_shaped_cross_correlation_has_clear_peak() {
-        use crate::sdr::cdma2000_baseband_filter_taps_f64;
+        use crate::sdr::{cdma2000_baseband_filter_taps_f64, fir::ComplexFir32};
         use rustfft::FftPlanner;
-        use sdr::FIR;
 
         let oversample = 4usize;
         let phase_period = 32768 * oversample;
@@ -3436,28 +3464,10 @@ mod tests {
         }
 
         // TX pulse shaping (1 FIR pass)
-        let mut fir_tx_i = FIR::new(&taps, 1, 1);
-        let mut fir_tx_q = FIR::new(&taps, 1, 1);
-        let tx_shaped: Vec<Complex32> = tx_raw
-            .iter()
-            .map(|s| {
-                let i = fir_tx_i.process(&[s.re])[0];
-                let q = fir_tx_q.process(&[s.im])[0];
-                Complex32::new(i, q)
-            })
-            .collect();
+        let tx_shaped = ComplexFir32::new(&taps).process_block(&tx_raw);
 
         // RX matched filter (1 FIR pass)
-        let mut fir_rx_i = FIR::new(&taps, 1, 1);
-        let mut fir_rx_q = FIR::new(&taps, 1, 1);
-        let rx_signal: Vec<Complex32> = tx_shaped
-            .iter()
-            .map(|s| {
-                let i = fir_rx_i.process(&[s.re])[0];
-                let q = fir_rx_q.process(&[s.im])[0];
-                Complex32::new(i, q)
-            })
-            .collect();
+        let rx_signal = ComplexFir32::new(&taps).process_block(&tx_shaped);
 
         // Extract the window starting after the filter settling time.
         // After 2 FIR passes the peak is delayed by composite_delay samples.
@@ -3605,8 +3615,7 @@ mod tests {
 
     #[test]
     fn correlator_detects_pulse_shaped_signal_at_correct_lc_phase() {
-        use crate::sdr::cdma2000_baseband_filter_taps_f64;
-        use sdr::FIR;
+        use crate::sdr::{cdma2000_baseband_filter_taps_f64, fir::ComplexFir32};
 
         let oversample = 4usize;
         let phase_period = 32768 * oversample;
@@ -3635,28 +3644,10 @@ mod tests {
         }
 
         // TX pulse shape (1 FIR pass)
-        let mut fir_tx_i = FIR::new(&taps, 1, 1);
-        let mut fir_tx_q = FIR::new(&taps, 1, 1);
-        let tx_shaped: Vec<Complex32> = tx_raw
-            .iter()
-            .map(|s| {
-                let i = fir_tx_i.process(&[s.re])[0];
-                let q = fir_tx_q.process(&[s.im])[0];
-                Complex32::new(i, q)
-            })
-            .collect();
+        let tx_shaped = ComplexFir32::new(&taps).process_block(&tx_raw);
 
         // RX matched filter (1 FIR pass)
-        let mut fir_rx_i = FIR::new(&taps, 1, 1);
-        let mut fir_rx_q = FIR::new(&taps, 1, 1);
-        let rx_signal: Vec<Complex32> = tx_shaped
-            .iter()
-            .map(|s| {
-                let i = fir_rx_i.process(&[s.re])[0];
-                let q = fir_rx_q.process(&[s.im])[0];
-                Complex32::new(i, q)
-            })
-            .collect();
+        let rx_signal = ComplexFir32::new(&taps).process_block(&tx_shaped);
 
         // Set up correlator with composite_filter_delay = 47
         let mut cfg = PnLcConfig::default_4x();
@@ -3733,8 +3724,7 @@ mod tests {
 
     #[test]
     fn finger_despreads_pulse_shaped_signal_to_w0() {
-        use crate::sdr::cdma2000_baseband_filter_taps_f64;
-        use sdr::FIR;
+        use crate::sdr::{cdma2000_baseband_filter_taps_f64, fir::ComplexFir32};
 
         let oversample = 4usize;
         let phase_period = 32768 * oversample;
@@ -3762,27 +3752,8 @@ mod tests {
         }
 
         // TX FIR + RX matched filter
-        let mut fir_tx_i = FIR::new(&taps, 1, 1);
-        let mut fir_tx_q = FIR::new(&taps, 1, 1);
-        let tx_shaped: Vec<Complex32> = tx_raw
-            .iter()
-            .map(|s| {
-                let i = fir_tx_i.process(&[s.re])[0];
-                let q = fir_tx_q.process(&[s.im])[0];
-                Complex32::new(i, q)
-            })
-            .collect();
-
-        let mut fir_rx_i = FIR::new(&taps, 1, 1);
-        let mut fir_rx_q = FIR::new(&taps, 1, 1);
-        let rx_signal: Vec<Complex32> = tx_shaped
-            .iter()
-            .map(|s| {
-                let i = fir_rx_i.process(&[s.re])[0];
-                let q = fir_rx_q.process(&[s.im])[0];
-                Complex32::new(i, q)
-            })
-            .collect();
+        let tx_shaped = ComplexFir32::new(&taps).process_block(&tx_raw);
+        let rx_signal = ComplexFir32::new(&taps).process_block(&tx_shaped);
 
         // The finger receives the RX signal starting at sample 0.
         // The filter delay means the first clean chip is at sample

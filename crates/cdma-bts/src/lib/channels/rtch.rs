@@ -1,6 +1,5 @@
 use cdma_common::crc::crc12;
 use num::complex::Complex32;
-use sdr::FIR;
 
 use crate::phy::coding::block_interleaver::{
     Rc12ReverseTrafficInterleaver, Rc12ReverseTrafficRate,
@@ -9,7 +8,7 @@ use crate::phy::coding::convolutional::get_1_3_k9_encoder;
 use crate::phy::coding::long_code::LongCodeGenerator;
 use crate::phy::spread::PnSequence;
 use crate::phy::walsh::WalshGenerator;
-use crate::sdr::cdma2000_baseband_filter_taps_f64;
+use crate::sdr::{cdma2000_baseband_filter_taps_f64, fir::ComplexFir32};
 
 use cdma_common::consts::{RC1_PN_CHIPS_PER_WALSH_CHIP, SR1_CHIPS_PER_FRAME};
 #[cfg(test)]
@@ -19,6 +18,11 @@ const FULL_RATE_INFO_BITS: usize = 172;
 const FULL_RATE_CRC_BITS: usize = 12;
 const FULL_RATE_TAIL_BITS: usize = 8;
 const FULL_RATE_FRAME_BITS: usize = FULL_RATE_INFO_BITS + FULL_RATE_CRC_BITS + FULL_RATE_TAIL_BITS;
+
+fn pulse_filter(samples: &[Complex32]) -> Vec<Complex32> {
+    let taps = cdma2000_baseband_filter_taps_f64();
+    ComplexFir32::new(&taps).process_block(samples)
+}
 
 /// Test-oriented reverse traffic channel encoder (RC1/RC2, full-rate 9600 bps).
 ///
@@ -242,18 +246,7 @@ impl ReverseTrafficChannelEncoder {
             }
         }
 
-        // Pulse shaping FIR
-        let taps = cdma2000_baseband_filter_taps_f64();
-        let mut fir_i = FIR::new(&taps, 1, 1);
-        let mut fir_q = FIR::new(&taps, 1, 1);
-        tx_raw
-            .iter()
-            .map(|s| {
-                let i = fir_i.process(&[s.re])[0];
-                let q = fir_q.process(&[s.im])[0];
-                Complex32::new(i, q)
-            })
-            .collect()
+        pulse_filter(&tx_raw)
     }
 }
 
@@ -261,16 +254,7 @@ impl ReverseTrafficChannelEncoder {
 /// Use this after concatenating multiple frames' raw samples to get
 /// a continuous pulse-shaped signal without frame-boundary transients.
 pub fn pulse_shape(raw: &[Complex32]) -> Vec<Complex32> {
-    let taps = cdma2000_baseband_filter_taps_f64();
-    let mut fir_i = FIR::new(&taps, 1, 1);
-    let mut fir_q = FIR::new(&taps, 1, 1);
-    raw.iter()
-        .map(|s| {
-            let i = fir_i.process(&[s.re])[0];
-            let q = fir_q.process(&[s.im])[0];
-            Complex32::new(i, q)
-        })
-        .collect()
+    pulse_filter(raw)
 }
 
 /// Build OQPSK PN samples with half-chip Q delay.
@@ -474,30 +458,11 @@ mod tests {
         }
 
         // Pulse shape
-        let taps = cdma2000_baseband_filter_taps_f64();
-        let mut fir_i = FIR::new(&taps, 1, 1);
-        let mut fir_q = FIR::new(&taps, 1, 1);
-        let tx_shaped: Vec<Complex32> = tx_raw
-            .iter()
-            .map(|s| {
-                let i = fir_i.process(&[s.re])[0];
-                let q = fir_q.process(&[s.im])[0];
-                Complex32::new(i, q)
-            })
-            .collect();
+        let tx_shaped = pulse_filter(&tx_raw);
 
         // === DECODE (without BTS infrastructure) ===
         // Matched filter
-        let mut mf_i = FIR::new(&taps, 1, 1);
-        let mut mf_q = FIR::new(&taps, 1, 1);
-        let rx_filtered: Vec<Complex32> = tx_shaped
-            .iter()
-            .map(|s| {
-                let i = mf_i.process(&[s.re])[0];
-                let q = mf_q.process(&[s.im])[0];
-                Complex32::new(i, q)
-            })
-            .collect();
+        let rx_filtered = pulse_filter(&tx_shaped);
 
         // PN×LC despread at chip rate
         let pn_period = 32768 * oversample;

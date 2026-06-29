@@ -1,14 +1,24 @@
+use std::sync::LazyLock;
+
 /// Long code generator for CDMA2000 as specified in C.S0002-E v1.0
 ///
 /// The long code is generated using a 42-bit linear feedback shift register (LFSR)
 /// with taps defined by the characteristic polynomial:
 /// p(x) = x^42 + x^35 + x^33 + x^31 + x^27 + x^26 + x^25 + x^22 + x^21 + x^19 + x^18 + x^17 + x^16 + x^10 + x^7 + x^6 + x^5 + x^3 + x^2 + x^1 + 1
-
 #[derive(Clone)]
 pub struct LongCodeGenerator {
     state: u64,
     mask: u64,
 }
+
+static T_MATRIX_POWERS: LazyLock<[[u64; 42]; 64]> = LazyLock::new(|| {
+    let mut powers = [[0u64; 42]; 64];
+    powers[0] = LongCodeGenerator::get_t_matrix();
+    for i in 1..powers.len() {
+        powers[i] = LongCodeGenerator::multiply_matrices(&powers[i - 1], &powers[i - 1]);
+    }
+    powers
+});
 
 impl LongCodeGenerator {
     pub fn new(mask: u64) -> Self {
@@ -204,15 +214,16 @@ impl LongCodeGenerator {
 
     pub fn advance_chips(&mut self, mut num_chips: usize) {
         if num_chips >= 64 {
-            // Use matrix-based jump for large deltas
+            // Use matrix-based jumps for large deltas. The T^(2^n) powers are
+            // process-wide constants, so keep them out of the hot path.
             let mut delta = num_chips as u64;
-            let mut current_matrix = Self::get_t_matrix();
+            let mut power_idx = 0usize;
             while delta > 0 {
                 if delta & 1 == 1 {
-                    self.apply_matrix(&current_matrix);
+                    self.apply_matrix(&T_MATRIX_POWERS[power_idx]);
                 }
-                current_matrix = Self::multiply_matrices(&current_matrix, &current_matrix);
                 delta >>= 1;
+                power_idx += 1;
             }
         } else {
             while num_chips > 0 {

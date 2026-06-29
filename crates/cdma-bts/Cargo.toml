@@ -33,7 +33,6 @@ tracing-subscriber = {version = "0.3", features = ["env-filter"]}
 biquad = "0.6"
 cdma-common = { path = "../cdma-common"}
 chrono = "0.4"
-sdr = "0.7"
 num-complex = "0.4"
 libc = "0.2"
 rustfft = "6"

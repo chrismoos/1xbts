@@ -62,17 +62,6 @@ pub struct PnLcConfig {
     /// Run the joint search once per this many input windows.
     pub search_interval_windows: u64,
 
-    /// Optional pulse-shaping FIR taps applied to the correlator reference.
-    ///
-    /// When `Some`, the chip-rate PN×LC reference is convolved with these taps
-    /// before FFT cross-correlation.  This matches the reference spectral shape
-    /// to the received signal (which was pulse-shaped on TX and matched-filtered
-    /// on RX), sharpening the correlation peak and improving acquisition SNR.
-    ///
-    /// Typically set to the same taps used by [`PulseMatchedFilterProcessor`].
-    /// Leave `None` for the rectangular (ideal chip-rate) reference.
-    pub pulse_shape_taps: Option<Vec<f32>>,
-
     /// When true, use separate PN references for coarse FFT search and finger
     /// despread (`fft` for coarse, OQPSK for despread). When false, use the
     /// coarse FFT PN reference for both stages.
@@ -200,7 +189,6 @@ pub struct PnLcConfig {
 
 impl PnLcConfig {
     /// Sensible defaults for 4× oversample (4.9152 MHz sample rate).
-    /// Pulse shaping is disabled; use [`with_pulse_shape_taps`] to enable it.
     pub fn default_4x() -> Self {
         Self {
             oversample: 4,
@@ -220,7 +208,6 @@ impl PnLcConfig {
             center_offset_override: None,
             chip_block_size: 256,
             search_interval_windows: 16,
-            pulse_shape_taps: None,
             split_pn_reference: true,
             reanchor_origin: false,
             lc_decimation: 1,
@@ -353,12 +340,6 @@ impl PnLcConfig {
     ) -> Self {
         self.suppress_active_finger_delay_overlap = enable;
         self.active_finger_delay_suppress_samples = suppress_samples.max(0);
-        self
-    }
-
-    /// Enable pulse shaping on the correlator reference using `taps`.
-    pub fn with_pulse_shape_taps(mut self, taps: Vec<f32>) -> Self {
-        self.pulse_shape_taps = Some(taps);
         self
     }
 

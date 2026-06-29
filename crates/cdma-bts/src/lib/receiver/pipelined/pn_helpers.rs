@@ -1,8 +1,7 @@
 use num_complex::Complex32;
-use sdr::FIR;
 
 use crate::phy::spread::PnSequence;
-use crate::sdr::cdma2000_baseband_filter_taps_f64;
+use crate::sdr::{cdma2000_baseband_filter_taps_f64, fir::ComplexFir32};
 
 use super::CDMA_CHIP_RATE;
 
@@ -51,11 +50,8 @@ pub(crate) fn build_matched_pn_reference(
     filter_passes: usize,
 ) -> Vec<Complex32> {
     let taps = cdma2000_baseband_filter_taps_f64();
-    let mut ref_matched_i = (0..filter_passes)
-        .map(|_| FIR::new(&taps, 1, 1))
-        .collect::<Vec<_>>();
-    let mut ref_matched_q = (0..filter_passes)
-        .map(|_| FIR::new(&taps, 1, 1))
+    let mut ref_matched = (0..filter_passes)
+        .map(|_| ComplexFir32::new(&taps))
         .collect::<Vec<_>>();
     let pn_oqpsk = build_oqpsk_pn_samples(output_len, oversample);
 
@@ -63,15 +59,11 @@ pub(crate) fn build_matched_pn_reference(
     pn_oqpsk
         .into_iter()
         .map(|s| {
-            let mut i = s.re;
-            let mut q = -s.im;
-            for filter in &mut ref_matched_i {
-                i = filter.process(&[i])[0];
+            let mut sample = Complex32::new(s.re, -s.im);
+            for filter in &mut ref_matched {
+                sample = filter.process_sample(sample);
             }
-            for filter in &mut ref_matched_q {
-                q = filter.process(&[q])[0];
-            }
-            Complex32::new(i, q)
+            sample
         })
         .collect()
 }

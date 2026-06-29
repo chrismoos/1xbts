@@ -1,9 +1,11 @@
 use std::collections::{HashMap, VecDeque};
 
 use num_complex::Complex32;
-use sdr::FIR;
 
-use crate::{phy::spread::PnSequence, sdr::cdma2000_baseband_filter_taps_f64};
+use crate::{
+    phy::spread::PnSequence,
+    sdr::{cdma2000_baseband_filter_taps_f64, fir::ComplexFir32},
+};
 
 use super::{PipelineProcessor, SampleBlock};
 
@@ -27,8 +29,7 @@ pub struct SlidingCorrelatorProcessor {
     history_len: usize,
     history_energy: f32,
     warmup_samples_after_lock: usize,
-    matched_i: FIR<f32>,
-    matched_q: FIR<f32>,
+    matched: ComplexFir32,
     sample_counter: usize,
     decimation_phase_energy: Vec<f32>,
     decimation_phase_alpha: f32,
@@ -66,8 +67,7 @@ impl SlidingCorrelatorProcessor {
             history_len: 128 * oversample,
             history_energy: 0.0,
             warmup_samples_after_lock: 0,
-            matched_i: FIR::new(&taps, 1, 1),
-            matched_q: FIR::new(&taps, 1, 1),
+            matched: ComplexFir32::new(&taps),
             sample_counter: 0,
             decimation_phase_energy: vec![0.0; oversample.max(1)],
             decimation_phase_alpha: 0.01,
@@ -148,10 +148,7 @@ impl SlidingCorrelatorProcessor {
 impl PipelineProcessor for SlidingCorrelatorProcessor {
     fn process_block(&mut self, block: SampleBlock) -> Vec<SampleBlock> {
         for (idx, sample) in block.samples.iter().enumerate() {
-            let matched = Complex32::new(
-                self.matched_i.process(&[sample.re])[0],
-                self.matched_q.process(&[sample.im])[0],
-            );
+            let matched = self.matched.process_sample(*sample);
 
             self.push_history(matched);
             self.processed = self.processed.saturating_add(1);

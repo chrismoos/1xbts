@@ -2,9 +2,11 @@ use std::sync::Arc;
 
 use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
-use sdr::FIR;
 
-use crate::{phy::spread::PnSequence, sdr::cdma2000_baseband_filter_taps_f64};
+use crate::{
+    phy::spread::PnSequence,
+    sdr::{cdma2000_baseband_filter_taps_f64, fir::ComplexFir32},
+};
 
 use super::{PipelineProcessor, SampleBlock};
 
@@ -74,18 +76,14 @@ impl AcquisitionFftSimpleProcessor {
     }
 
     fn build_reference_time(fft_len: usize, oversample: usize, taps: &[f64]) -> Vec<Complex32> {
-        let mut ref_matched_i = FIR::new(taps, 1, 1);
-        let mut ref_matched_q = FIR::new(taps, 1, 1);
+        let mut ref_matched = ComplexFir32::new(taps);
         let mut pn = PnSequence::new_repeat(0, 32768, oversample.saturating_sub(1));
 
         // Forward-link PN convention: PN_I - jPN_Q.
         (0..fft_len)
             .map(|_| {
                 let s = pn.generate_iq();
-                Complex32::new(
-                    ref_matched_i.process(&[s.re])[0],
-                    ref_matched_q.process(&[-s.im])[0],
-                )
+                ref_matched.process_sample(Complex32::new(s.re, -s.im))
             })
             .collect::<Vec<_>>()
     }

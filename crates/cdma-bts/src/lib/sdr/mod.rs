@@ -1,5 +1,6 @@
 #[cfg(feature = "bladerf-backend")]
 pub mod bladerf_radio;
+pub mod fir;
 #[cfg(feature = "lime-backend")]
 pub mod lime_radio;
 pub mod pipe;
@@ -29,7 +30,8 @@ use cdma_common::error::Error;
 use hound::WavWriter;
 use log::debug;
 use num_complex::Complex32;
-use sdr::FIR;
+
+use self::fir::ComplexFir32;
 
 pub struct RxReadResult {
     pub samples_read: usize,
@@ -180,46 +182,35 @@ pub fn cdma2000_pulse_shape_finite(
     }
 
     let taps = cdma2000_baseband_filter_taps_f64();
-    let mut baseband_filter_i = FIR::new(&taps, 1, 1);
-    let mut baseband_filter_q = FIR::new(&taps, 1, 1);
 
-    let mut upsampled_i = Vec::with_capacity(samples.len() * oversample);
-    let mut upsampled_q = Vec::with_capacity(samples.len() * oversample);
+    let mut upsampled = Vec::with_capacity(samples.len() * oversample);
     for s in samples {
-        upsampled_i.push(s.re);
-        upsampled_q.push(s.im);
+        upsampled.push(*s);
         for _ in 1..oversample {
-            upsampled_i.push(0.0);
-            upsampled_q.push(0.0);
+            upsampled.push(Complex32::default());
         }
     }
 
-    let filtered_i = baseband_filter_i.process(&upsampled_i);
-    let filtered_q = baseband_filter_q.process(&upsampled_q);
+    let mut baseband_filter = ComplexFir32::new(&taps);
+    let filtered = baseband_filter.process_block(&upsampled);
 
     if !include_phase_equalizer {
-        return filtered_i
-            .into_iter()
-            .zip(filtered_q)
-            .map(|(re, im)| Complex32::new(re, im))
-            .collect();
+        return filtered;
     }
 
     let sample_rate_hz = SR1_CHIP_RATE_HZ as f64 * oversample as f64;
     let phase_eq = cdma2000_phase_equalizer_coeffs(sample_rate_hz);
     let mut phase_equalizer_i = DirectForm1::new(phase_eq);
     let mut phase_equalizer_q = DirectForm1::new(phase_eq);
-    filtered_i
+    filtered
         .into_iter()
-        .zip(filtered_q)
-        .map(|(re, im)| Complex32::new(phase_equalizer_i.run(re), phase_equalizer_q.run(im)))
+        .map(|s| Complex32::new(phase_equalizer_i.run(s.re), phase_equalizer_q.run(s.im)))
         .collect()
 }
 
 pub struct TxPulseShaper {
     interpolate: usize,
-    baseband_filter_i: FIR<f32>,
-    baseband_filter_q: FIR<f32>,
+    baseband_filter: ComplexFir32,
 }
 
 impl TxPulseShaper {
@@ -233,27 +224,22 @@ impl TxPulseShaper {
         // contributions. 4× fewer MACs and no zero-insert allocation.
         TxPulseShaper {
             interpolate,
-            baseband_filter_i: FIR::new(&taps, 1, interpolate),
-            baseband_filter_q: FIR::new(&taps, 1, interpolate),
+            baseband_filter: ComplexFir32::with_interpolate(&taps, interpolate),
         }
     }
 
     pub fn shape(&mut self, samples: &[Complex32]) -> Vec<Complex32> {
         // Feed chip-rate samples directly; the polyphase FIR handles
         // the 4× interpolation internally.
-        // The sdr crate's FIR divides output by gain(interpolate) = 1/4,
-        // effectively multiplying by interpolate. Compensate to match the
+        // The polyphase FIR matches the previous interpolation convention:
+        // output is multiplied by interpolate, so compensate to match the
         // zero-insert path's unity gain.
         let scale = 1.0 / self.interpolate as f32;
-        let i_in: Vec<f32> = samples.iter().map(|s| s.re).collect();
-        let q_in: Vec<f32> = samples.iter().map(|s| s.im).collect();
-
-        self.baseband_filter_i
-            .process(&i_in)
-            .into_iter()
-            .zip(self.baseband_filter_q.process(&q_in))
-            .map(|(re, im)| Complex32::new(re * scale, im * scale))
-            .collect()
+        let mut out = self.baseband_filter.process_block(samples);
+        for sample in &mut out {
+            *sample *= scale;
+        }
+        out
     }
 }
 

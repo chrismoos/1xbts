@@ -459,13 +459,12 @@ impl Drop for MatchedFilterDespreader {
 mod tests {
     use super::MatchedFilterDespreader;
     use num_complex::Complex32;
-    use sdr::FIR;
 
     use crate::{
         phy::spread::PnSequence,
         phy::walsh::WalshGenerator,
         receiver::pipelined::{PipelineProcessor, PulseMatchedFilterProcessor, SampleBlock},
-        sdr::cdma2000_baseband_filter_taps_f64,
+        sdr::{cdma2000_baseband_filter_taps_f64, fir::ComplexFir32},
     };
 
     #[test]
@@ -538,57 +537,39 @@ mod tests {
     fn generate_pulse_shaped_walsh0(sample_rate: u32, symbols: usize) -> Vec<Complex32> {
         let oversample = (sample_rate / 1_228_800).max(1) as usize;
         let taps = cdma2000_baseband_filter_taps_f64();
-        let mut fir_i = FIR::new(&taps, 1, 1);
-        let mut fir_q = FIR::new(&taps, 1, 1);
+        let mut fir = ComplexFir32::new(&taps);
         let walsh0 = WalshGenerator::generate_matrix::<64>()[0];
         let mut pn = PnSequence::new_repeat(0, 32768, oversample.saturating_sub(1));
-        let mut upsampled_i = Vec::new();
-        let mut upsampled_q = Vec::new();
+        let mut upsampled = Vec::new();
         for _ in 0..symbols {
             for chip in 0..64usize {
                 let d = walsh0[chip] as f32;
                 let s = pn.generate_iq();
-                upsampled_i.push(d * s.re);
-                upsampled_q.push(d * (-s.im));
+                upsampled.push(Complex32::new(d * s.re, d * (-s.im)));
                 for _ in 1..oversample {
                     let _ = pn.generate_iq();
-                    upsampled_i.push(0.0);
-                    upsampled_q.push(0.0);
+                    upsampled.push(Complex32::default());
                 }
             }
         }
-        fir_i
-            .process(&upsampled_i)
-            .into_iter()
-            .zip(fir_q.process(&upsampled_q))
-            .map(|(re, im)| Complex32::new(re, im))
-            .collect()
+        fir.process_block(&upsampled)
     }
 
     fn generate_tx_rx_pulse_response(sample_rate: u32, chips: usize) -> Vec<Complex32> {
         let oversample = (sample_rate / 1_228_800).max(1) as usize;
         let taps = cdma2000_baseband_filter_taps_f64();
-        let mut tx_i = FIR::new(&taps, 1, 1);
-        let mut tx_q = FIR::new(&taps, 1, 1);
+        let mut tx_filter = ComplexFir32::new(&taps);
         let mut rx = PulseMatchedFilterProcessor::new();
 
-        let mut upsampled_i = Vec::with_capacity(chips * oversample);
-        let mut upsampled_q = Vec::with_capacity(chips * oversample);
+        let mut upsampled = Vec::with_capacity(chips * oversample);
         for chip in 0..chips {
-            upsampled_i.push(if chip == 0 { 1.0 } else { 0.0 });
-            upsampled_q.push(0.0);
+            upsampled.push(Complex32::new(if chip == 0 { 1.0 } else { 0.0 }, 0.0));
             for _ in 1..oversample {
-                upsampled_i.push(0.0);
-                upsampled_q.push(0.0);
+                upsampled.push(Complex32::default());
             }
         }
 
-        let tx = tx_i
-            .process(&upsampled_i)
-            .into_iter()
-            .zip(tx_q.process(&upsampled_q))
-            .map(|(re, im)| Complex32::new(re, im))
-            .collect::<Vec<_>>();
+        let tx = tx_filter.process_block(&upsampled);
 
         rx.process_block(SampleBlock::new(tx, 0).with_sample_rate_hz(sample_rate as f64))
             .into_iter()
