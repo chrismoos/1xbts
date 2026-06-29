@@ -36,6 +36,10 @@ pub struct Subscriber {
     /// device. `None` means the device uses the IS-95 default "000000"
     /// and OTASP Verify SPC will use that.
     pub service_programming_code: Option<String>,
+    /// Per-subscriber FIRSTCHP override (analog first paging/control
+    /// channel, 0–2047). `None` means OTASP preserves the handset's
+    /// existing value instead of overwriting it.
+    pub firstchp_override: Option<u16>,
 }
 
 /// A row from the `prls` table — the canonical artifact + cached

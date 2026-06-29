@@ -349,6 +349,7 @@ impl OtaspCoordinator {
                     prl_bytes,
                     prl_meta,
                     service_programming_code: resolved.subscriber.service_programming_code,
+                    firstchp_override: resolved.subscriber.firstchp_override,
                 })
             }
             Ok(None) => {

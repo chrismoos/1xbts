@@ -2903,6 +2903,13 @@ mod tests {
         async fn set_subscriber_spc(&self, _: uuid::Uuid, _: Option<String>) -> Result<(), String> {
             Ok(())
         }
+        async fn set_subscriber_firstchp_override(
+            &self,
+            _: uuid::Uuid,
+            _: Option<u16>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
         async fn save_otasp_session(
             &self,
             _: &cdma_hlr::model::OtaspSessionRow,
@@ -2955,6 +2962,7 @@ mod tests {
                     ringtone_duration_ms: None,
                     prl_override_id: None,
                     service_programming_code: None,
+                    firstchp_override: None,
                 };
                 let primary = cdma_hlr::model::SubscriberIdentity {
                     subscriber_identity_id: uuid::Uuid::nil(),
@@ -3172,6 +3180,13 @@ mod tests {
             Ok(())
         }
         async fn set_subscriber_spc(&self, _: uuid::Uuid, _: Option<String>) -> Result<(), String> {
+            Ok(())
+        }
+        async fn set_subscriber_firstchp_override(
+            &self,
+            _: uuid::Uuid,
+            _: Option<u16>,
+        ) -> Result<(), String> {
             Ok(())
         }
         async fn save_otasp_session(

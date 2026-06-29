@@ -70,6 +70,7 @@ fn subscriber_to_proto(s: &model::Subscriber) -> proto::Subscriber {
         ringtone_duration_ms: s.ringtone_duration_ms,
         prl_override_id: s.prl_override_id.map(|u| u.to_string()),
         service_programming_code: s.service_programming_code.clone(),
+        firstchp_override: s.firstchp_override.map(u32::from),
     }
 }
 
@@ -890,6 +891,28 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         Ok(Response::new(()))
     }
 
+    async fn set_subscriber_firstchp_override(
+        &self,
+        request: Request<proto::SetSubscriberFirstchpOverrideRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        let subscriber_id = parse_uuid(&req.subscriber_id)?;
+        let firstchp = match req.firstchp_override {
+            None => None,
+            Some(v) if v <= 2047 => Some(v as u16),
+            Some(v) => {
+                return Err(Status::invalid_argument(format!(
+                    "firstchp_override {v} out of range 0..=2047"
+                )));
+            }
+        };
+        self.repo
+            .set_subscriber_firstchp_override(subscriber_id, firstchp)
+            .await
+            .map_err(map_repo_error)?;
+        Ok(Response::new(()))
+    }
+
     // ─── OTASP session history ──────────────────────────────────
 
     async fn save_otasp_session(
@@ -1160,6 +1183,7 @@ mod tests {
             ringtone_duration_ms: None,
             prl_override_id: None,
             service_programming_code: None,
+            firstchp_override: None,
         }
     }
 
@@ -1332,6 +1356,13 @@ mod tests {
         async fn set_subscriber_spc(&self, _: Uuid, _: Option<String>) -> Result<(), String> {
             Ok(())
         }
+        async fn set_subscriber_firstchp_override(
+            &self,
+            _: Uuid,
+            _: Option<u16>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
         async fn save_otasp_session(
             &self,
             _: &crate::model::OtaspSessionRow,
@@ -1377,6 +1408,44 @@ mod tests {
                 proto::ResolveSubscriberByHardwareIdentityRequest {
                     esn: None,
                     meid: Some("not-hex".to_string()),
+                },
+            ))
+            .await;
+        assert_eq!(resp.unwrap_err().code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn set_firstchp_override_accepts_in_range_and_clear() {
+        let svc = HlrServiceImpl::new(Arc::new(StubRepo::default()));
+        let id = Uuid::nil().to_string();
+        // In range.
+        svc.set_subscriber_firstchp_override(Request::new(
+            proto::SetSubscriberFirstchpOverrideRequest {
+                subscriber_id: id.clone(),
+                firstchp_override: Some(333),
+            },
+        ))
+        .await
+        .unwrap();
+        // Cleared (None).
+        svc.set_subscriber_firstchp_override(Request::new(
+            proto::SetSubscriberFirstchpOverrideRequest {
+                subscriber_id: id,
+                firstchp_override: None,
+            },
+        ))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_firstchp_override_rejects_out_of_range() {
+        let svc = HlrServiceImpl::new(Arc::new(StubRepo::default()));
+        let resp = svc
+            .set_subscriber_firstchp_override(Request::new(
+                proto::SetSubscriberFirstchpOverrideRequest {
+                    subscriber_id: Uuid::nil().to_string(),
+                    firstchp_override: Some(2048),
                 },
             ))
             .await;

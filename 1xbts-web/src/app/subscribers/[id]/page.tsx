@@ -8,8 +8,7 @@ import { formatEsn, formatMeid } from "@/lib/format";
 import { Card, Stat } from "@/components/card";
 import { RecentMessagesCard } from "@/components/recent-messages-card";
 import { RecentOtaspCard } from "@/components/recent-otasp-card";
-import { PrlOverrideCard } from "@/components/prl-override-card";
-import { SpcOverrideCard } from "@/components/spc-override-card";
+import { OtaspOverridesCard } from "@/components/otasp-overrides-card";
 import { ImsiGenerateButton } from "@/components/imsi-generate-button";
 import { validateRingtoneFile } from "@/lib/validation";
 import {
@@ -34,6 +33,9 @@ import {
   validateMeid,
   validatePhoneNumber,
 } from "@/lib/validation";
+
+// Data Session card is hidden for now; set to true to bring it back.
+const SHOW_DATA_SESSION = false;
 
 type FieldErrors = {
   phoneNumber?: string;
@@ -510,15 +512,11 @@ export default function SubscriberDetailPage({
 
       <RecentOtaspCard subscriberId={subscriber.subscriberId} />
 
-      <PrlOverrideCard
+      <OtaspOverridesCard
         subscriberId={subscriber.subscriberId}
-        currentOverride={subscriber.prlOverrideId ?? undefined}
-        onChanged={fetchDetail}
-      />
-
-      <SpcOverrideCard
-        subscriberId={subscriber.subscriberId}
-        current={subscriber.serviceProgrammingCode ?? undefined}
+        prlOverride={subscriber.prlOverrideId ?? undefined}
+        spc={subscriber.serviceProgrammingCode ?? undefined}
+        analogControlChannel={subscriber.firstchpOverride ?? undefined}
         onChanged={fetchDetail}
       />
 
@@ -596,9 +594,11 @@ export default function SubscriberDetailPage({
         </div>
       </Card>
 
-      <Card title="Data Session">
-        <div className="space-y-4">
-          <div className="grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_auto] gap-4 items-end">
+      {/* Data Session card hidden for now. */}
+      {SHOW_DATA_SESSION && (
+        <Card title="Data Session">
+          <div className="space-y-4">
+            <div className="grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_auto] gap-4 items-end">
             <div>
               <label className="block text-xs text-muted mb-1">
                 Service Option
@@ -637,7 +637,8 @@ export default function SubscriberDetailPage({
             </p>
           )}
         </div>
-      </Card>
+        </Card>
+      )}
 
       <Card title="Custom Ringtone">
         <div className="space-y-3">

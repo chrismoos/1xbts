@@ -35,6 +35,9 @@ pub struct ResolvedSubscriberInput {
     /// Custom 6-digit Service Programming Code for this subscriber's
     /// device. `None` means the device uses the IS-95 default "000000".
     pub service_programming_code: Option<String>,
+    /// FIRSTCHP override (analog first paging/control channel, 0–2047).
+    /// `None` means the handset's read-back value is preserved.
+    pub firstchp_override: Option<u16>,
 }
 
 /// Lightweight metadata about the PRL chosen for this OTASP session.
@@ -56,6 +59,9 @@ pub struct NamReadback {
     /// CDMA/Analog NAM only (BLOCK_ID 0x00). Echoed back on write.
     pub ex: bool,
     pub local_control: bool,
+    /// FIRSTCHP read back from the CDMA/Analog NAM Configuration Response.
+    /// Written back unchanged when the subscriber has no override.
+    pub firstchp: u16,
 }
 
 /// Assembled NAM blocks ready for `cdma_otasp::param::*::encode`.
@@ -121,7 +127,11 @@ pub fn assemble_nam(
 
     let home_sid = bts_overhead.sid;
     let nid = bts_overhead.nid;
-    let firstchp = bts_overhead.paging_channel_number;
+    // FIRSTCHP is the analog first paging/control channel, not the CDMA
+    // paging channel. Use the subscriber override when set, otherwise
+    // preserve the value read back from the handset's Configuration
+    // Response (read before this Download in a normal session).
+    let firstchp = hlr.firstchp_override.unwrap_or(ms_readback.firstchp);
 
     let sid_nid_pairs = vec![SidNidPair { sid: home_sid, nid }];
 
@@ -226,6 +236,7 @@ mod tests {
             prl_bytes: None,
             prl_meta: None,
             service_programming_code: None,
+            firstchp_override: None,
         }
     }
 
@@ -237,6 +248,7 @@ mod tests {
             slotted_mode: true,
             ex: false,
             local_control: false,
+            firstchp: 324,
         }
     }
 
@@ -246,7 +258,8 @@ mod tests {
         assert_eq!(nam.cdma_analog.mcc_m, 209); // "310" -> 209
         assert_eq!(nam.cdma_analog.imsi_m_11_12, 44); // "55" -> 44
         assert_eq!(nam.cdma_analog.home_sid, 22);
-        assert_eq!(nam.cdma_analog.firstchp, 1);
+        // No subscriber override: FIRSTCHP echoes the handset read-back.
+        assert_eq!(nam.cdma_analog.firstchp, 324);
         assert_eq!(nam.cdma_analog.scm, 0x52);
         assert_eq!(nam.cdma_analog.mob_p_rev, 6);
         assert!(!nam.cdma_analog.imsi_m_class);
@@ -276,6 +289,26 @@ mod tests {
         assert_eq!(accolc_from_mdn("5551234560"), Some(0));
         assert_eq!(accolc_from_mdn("5551234561"), Some(1));
         assert_eq!(accolc_from_mdn(""), None);
+    }
+
+    #[test]
+    fn firstchp_defaults_to_handset_readback() {
+        // No override: the Download echoes the handset's read-back FIRSTCHP
+        // rather than the CDMA paging channel.
+        let mut rb = readback();
+        rb.firstchp = 333;
+        let nam = assemble_nam(&hlr(), &bts_overhead(), &cfg(), &rb).unwrap();
+        assert_eq!(nam.cdma_analog.firstchp, 333);
+    }
+
+    #[test]
+    fn firstchp_override_wins_over_readback() {
+        let mut sub = hlr();
+        sub.firstchp_override = Some(334);
+        let mut rb = readback();
+        rb.firstchp = 333;
+        let nam = assemble_nam(&sub, &bts_overhead(), &cfg(), &rb).unwrap();
+        assert_eq!(nam.cdma_analog.firstchp, 334);
     }
 
     #[test]

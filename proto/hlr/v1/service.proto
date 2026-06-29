@@ -48,6 +48,10 @@ message Subscriber {
   // 6-digit Service Programming Code for this subscriber's handset.
   // Unset means the device uses the IS-95 default "000000".
   optional string service_programming_code = 12;
+  // FIRSTCHP override (analog first paging/control channel, 0–2047) for
+  // the CDMA/Analog NAM. Unset means OTASP preserves the handset's
+  // existing value instead of overwriting it.
+  optional uint32 firstchp_override = 13;
 }
 
 // Subscriber account lifecycle state. Mirrors
@@ -400,6 +404,8 @@ service HlrService {
   rpc SetSubscriberPrlOverride(SetSubscriberPrlOverrideRequest) returns (google.protobuf.Empty);
   // Sets (or clears) a subscriber's custom Service Programming Code.
   rpc SetSubscriberSpc(SetSubscriberSpcRequest) returns (google.protobuf.Empty);
+  // Sets (or clears) a subscriber's FIRSTCHP override.
+  rpc SetSubscriberFirstchpOverride(SetSubscriberFirstchpOverrideRequest) returns (google.protobuf.Empty);
 
   // --- OTASP session history ---
   // Persists a completed OTASP session.
@@ -421,6 +427,13 @@ message SetSubscriberSpcRequest {
   // Six-digit code. Omit (or empty string) to clear and fall back to
   // the IS-95 default "000000".
   optional string service_programming_code = 2;
+}
+
+message SetSubscriberFirstchpOverrideRequest {
+  string subscriber_id = 1;
+  // Analog first paging/control channel (0–2047). Omit to clear and let
+  // OTASP preserve the handset's existing value.
+  optional uint32 firstchp_override = 2;
 }
 
 // ============================================================================

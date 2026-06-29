@@ -644,7 +644,15 @@ export interface Subscriber {
    * 6-digit Service Programming Code for this subscriber's handset.
    * Unset means the device uses the IS-95 default "000000".
    */
-  serviceProgrammingCode?: string | undefined;
+  serviceProgrammingCode?:
+    | string
+    | undefined;
+  /**
+   * FIRSTCHP override (analog first paging/control channel, 0–2047) for
+   * the CDMA/Analog NAM. Unset means OTASP preserves the handset's
+   * existing value instead of overwriting it.
+   */
+  firstchpOverride?: number | undefined;
 }
 
 /** Radio identity attached to one subscriber. */
@@ -972,6 +980,15 @@ export interface SetSubscriberSpcRequest {
    * the IS-95 default "000000".
    */
   serviceProgrammingCode?: string | undefined;
+}
+
+export interface SetSubscriberFirstchpOverrideRequest {
+  subscriberId: string;
+  /**
+   * Analog first paging/control channel (0–2047). Omit to clear and let
+   * OTASP preserve the handset's existing value.
+   */
+  firstchpOverride?: number | undefined;
 }
 
 /** Summary for list view. */
@@ -1498,6 +1515,7 @@ function createBaseSubscriber(): Subscriber {
     ringtoneDurationMs: undefined,
     prlOverrideId: undefined,
     serviceProgrammingCode: undefined,
+    firstchpOverride: undefined,
   };
 }
 
@@ -1538,6 +1556,9 @@ export const Subscriber: MessageFns<Subscriber> = {
     }
     if (message.serviceProgrammingCode !== undefined) {
       writer.uint32(98).string(message.serviceProgrammingCode);
+    }
+    if (message.firstchpOverride !== undefined) {
+      writer.uint32(104).uint32(message.firstchpOverride);
     }
     return writer;
   },
@@ -1645,6 +1666,14 @@ export const Subscriber: MessageFns<Subscriber> = {
           message.serviceProgrammingCode = reader.string();
           continue;
         }
+        case 13: {
+          if (tag !== 104) {
+            break;
+          }
+
+          message.firstchpOverride = reader.uint32();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1712,6 +1741,11 @@ export const Subscriber: MessageFns<Subscriber> = {
         : isSet(object.service_programming_code)
         ? globalThis.String(object.service_programming_code)
         : undefined,
+      firstchpOverride: isSet(object.firstchpOverride)
+        ? globalThis.Number(object.firstchpOverride)
+        : isSet(object.firstchp_override)
+        ? globalThis.Number(object.firstchp_override)
+        : undefined,
     };
   },
 
@@ -1753,6 +1787,9 @@ export const Subscriber: MessageFns<Subscriber> = {
     if (message.serviceProgrammingCode !== undefined) {
       obj.serviceProgrammingCode = message.serviceProgrammingCode;
     }
+    if (message.firstchpOverride !== undefined) {
+      obj.firstchpOverride = Math.round(message.firstchpOverride);
+    }
     return obj;
   },
 
@@ -1773,6 +1810,7 @@ export const Subscriber: MessageFns<Subscriber> = {
     message.ringtoneDurationMs = object.ringtoneDurationMs ?? undefined;
     message.prlOverrideId = object.prlOverrideId ?? undefined;
     message.serviceProgrammingCode = object.serviceProgrammingCode ?? undefined;
+    message.firstchpOverride = object.firstchpOverride ?? undefined;
     return message;
   },
 };
@@ -5830,6 +5868,90 @@ export const SetSubscriberSpcRequest: MessageFns<SetSubscriberSpcRequest> = {
     const message = createBaseSetSubscriberSpcRequest();
     message.subscriberId = object.subscriberId ?? "";
     message.serviceProgrammingCode = object.serviceProgrammingCode ?? undefined;
+    return message;
+  },
+};
+
+function createBaseSetSubscriberFirstchpOverrideRequest(): SetSubscriberFirstchpOverrideRequest {
+  return { subscriberId: "", firstchpOverride: undefined };
+}
+
+export const SetSubscriberFirstchpOverrideRequest: MessageFns<SetSubscriberFirstchpOverrideRequest> = {
+  encode(message: SetSubscriberFirstchpOverrideRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.subscriberId !== "") {
+      writer.uint32(10).string(message.subscriberId);
+    }
+    if (message.firstchpOverride !== undefined) {
+      writer.uint32(16).uint32(message.firstchpOverride);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SetSubscriberFirstchpOverrideRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSetSubscriberFirstchpOverrideRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.subscriberId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.firstchpOverride = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SetSubscriberFirstchpOverrideRequest {
+    return {
+      subscriberId: isSet(object.subscriberId)
+        ? globalThis.String(object.subscriberId)
+        : isSet(object.subscriber_id)
+        ? globalThis.String(object.subscriber_id)
+        : "",
+      firstchpOverride: isSet(object.firstchpOverride)
+        ? globalThis.Number(object.firstchpOverride)
+        : isSet(object.firstchp_override)
+        ? globalThis.Number(object.firstchp_override)
+        : undefined,
+    };
+  },
+
+  toJSON(message: SetSubscriberFirstchpOverrideRequest): unknown {
+    const obj: any = {};
+    if (message.subscriberId !== "") {
+      obj.subscriberId = message.subscriberId;
+    }
+    if (message.firstchpOverride !== undefined) {
+      obj.firstchpOverride = Math.round(message.firstchpOverride);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<SetSubscriberFirstchpOverrideRequest>): SetSubscriberFirstchpOverrideRequest {
+    return SetSubscriberFirstchpOverrideRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<SetSubscriberFirstchpOverrideRequest>): SetSubscriberFirstchpOverrideRequest {
+    const message = createBaseSetSubscriberFirstchpOverrideRequest();
+    message.subscriberId = object.subscriberId ?? "";
+    message.firstchpOverride = object.firstchpOverride ?? undefined;
     return message;
   },
 };
@@ -12704,6 +12826,15 @@ export const HlrServiceDefinition = {
       responseStream: false,
       options: {},
     },
+    /** Sets (or clears) a subscriber's FIRSTCHP override. */
+    setSubscriberFirstchpOverride: {
+      name: "SetSubscriberFirstchpOverride",
+      requestType: SetSubscriberFirstchpOverrideRequest as typeof SetSubscriberFirstchpOverrideRequest,
+      requestStream: false,
+      responseType: Empty as typeof Empty,
+      responseStream: false,
+      options: {},
+    },
     /**
      * --- OTASP session history ---
      * Persists a completed OTASP session.
@@ -12858,6 +12989,11 @@ export interface HlrServiceImplementation<CallContextExt = {}> {
     request: SetSubscriberSpcRequest,
     context: CallContext & CallContextExt,
   ): Promise<DeepPartial<Empty>>;
+  /** Sets (or clears) a subscriber's FIRSTCHP override. */
+  setSubscriberFirstchpOverride(
+    request: SetSubscriberFirstchpOverrideRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<Empty>>;
   /**
    * --- OTASP session history ---
    * Persists a completed OTASP session.
@@ -12997,6 +13133,11 @@ export interface HlrServiceClient<CallOptionsExt = {}> {
   /** Sets (or clears) a subscriber's custom Service Programming Code. */
   setSubscriberSpc(
     request: DeepPartial<SetSubscriberSpcRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<Empty>;
+  /** Sets (or clears) a subscriber's FIRSTCHP override. */
+  setSubscriberFirstchpOverride(
+    request: DeepPartial<SetSubscriberFirstchpOverrideRequest>,
     options?: CallOptions & CallOptionsExt,
   ): Promise<Empty>;
   /**

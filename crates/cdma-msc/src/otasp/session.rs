@@ -1061,6 +1061,7 @@ impl OtaspSession {
                         .unwrap_or(false),
                     ex: d.ex,
                     local_control: d.local_control,
+                    firstchp: d.firstchp,
                 },
                 Err(e) => {
                     log::warn!(
@@ -1093,6 +1094,9 @@ impl OtaspSession {
                     slotted_mode: d.slotted_mode,
                     ex: self.readback.as_ref().map(|r| r.ex).unwrap_or(false),
                     local_control: d.local_control,
+                    // FIRSTCHP lives only in the CDMA/Analog block; keep the
+                    // value read there earlier in the session.
+                    firstchp: self.readback.as_ref().map(|r| r.firstchp).unwrap_or(0),
                 },
                 Err(e) => {
                     log::warn!(
@@ -1986,6 +1990,11 @@ fn merge_readback(existing: Option<NamReadback>, new: NamReadback) -> NamReadbac
     out.slotted_mode = new.slotted_mode || out.slotted_mode;
     out.ex = new.ex;
     out.local_control = new.local_control;
+    // FIRSTCHP comes only from the CDMA/Analog block; 0 means "not read
+    // yet", so keep a previously-learned value rather than clobbering it.
+    if new.firstchp != 0 {
+        out.firstchp = new.firstchp;
+    }
     out
 }
 
@@ -2062,6 +2071,7 @@ mod tests {
             prl_bytes: None,
             prl_meta: None,
             service_programming_code: None,
+            firstchp_override: None,
         }
     }
 
@@ -2515,6 +2525,7 @@ mod tests {
                 sspr_p_rev,
             }),
             service_programming_code: None,
+            firstchp_override: None,
         }
     }
 

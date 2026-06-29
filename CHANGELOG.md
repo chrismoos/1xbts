@@ -1,5 +1,6 @@
 # HEAD 
 
+- Fixed OTASP causing AMPS/CDMA dual-mode phones to stop working on AMPS, with an optional per-subscriber analog control channel override on the subscriber page (it had overwritten the phone's analog control channel with the CDMA paging channel).
 - Fixed page handling for lower P_REV 3 handsets.
 - Speed test downloads can now run up to 2 MiB.
 - BTS TX pacing no longer busy-waits between batches. It sleeps to the

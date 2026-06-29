@@ -2071,6 +2071,13 @@ impl HlrRepository for FakeHlrRepository {
     async fn set_subscriber_spc(&self, _: Uuid, _: Option<String>) -> Result<(), String> {
         Ok(())
     }
+    async fn set_subscriber_firstchp_override(
+        &self,
+        _: Uuid,
+        _: Option<u16>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
     async fn save_otasp_session(&self, _: &cdma_hlr::model::OtaspSessionRow) -> Result<(), String> {
         Ok(())
     }
@@ -5780,6 +5787,7 @@ fn fake_hlr_for_welcome(mobile_seen: cdma_hlr::MobileSeenUpsert) -> Arc<FakeHlrR
             ringtone_duration_ms: None,
             prl_override_id: None,
             service_programming_code: None,
+            firstchp_override: None,
         },
         binding: RegistrationBinding {
             subscriber_id,

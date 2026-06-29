@@ -159,6 +159,11 @@ pub trait HlrRepository: Send + Sync {
         subscriber_id: Uuid,
         spc: Option<String>,
     ) -> Result<(), String>;
+    async fn set_subscriber_firstchp_override(
+        &self,
+        subscriber_id: Uuid,
+        firstchp: Option<u16>,
+    ) -> Result<(), String>;
 
     // OTASP session history
     /// Persists a completed OTASP session. Called by MSC when a session
@@ -363,6 +368,7 @@ fn subscriber_from_proto(value: proto::Subscriber) -> Result<Subscriber, String>
             .transpose()
             .map_err(|e| format!("invalid prl_override_id: {e}"))?,
         service_programming_code: value.service_programming_code,
+        firstchp_override: value.firstchp_override.map(|v| v as u16),
     })
 }
 
@@ -1050,6 +1056,21 @@ impl HlrRepository for GrpcHlrRepository {
             .map(|_| ())
             .map_err(|status| format!("HLR SetSubscriberSpc: {status}"))
     }
+    async fn set_subscriber_firstchp_override(
+        &self,
+        subscriber_id: Uuid,
+        firstchp: Option<u16>,
+    ) -> Result<(), String> {
+        let mut client = self.client();
+        client
+            .set_subscriber_firstchp_override(proto::SetSubscriberFirstchpOverrideRequest {
+                subscriber_id: subscriber_id.to_string(),
+                firstchp_override: firstchp.map(u32::from),
+            })
+            .await
+            .map(|_| ())
+            .map_err(|status| format!("HLR SetSubscriberFirstchpOverride: {status}"))
+    }
 
     async fn save_otasp_session(&self, row: &OtaspSessionRow) -> Result<(), String> {
         let mut client = self.client();
@@ -1436,7 +1457,7 @@ impl HlrRepository for PostgresHlrRepository {
                     number_type = EXCLUDED.number_type,
                     number_plan = EXCLUDED.number_plan
                 RETURNING subscriber_id, phone_number, display_name, status,
-                    created_at, updated_at, number_type, number_plan, prl_override_id, service_programming_code
+                    created_at, updated_at, number_type, number_plan, prl_override_id, service_programming_code, firstchp_override
             )
             SELECT up.*,
                 EXISTS (SELECT 1 FROM subscriber_ringtones r WHERE r.subscriber_id = up.subscriber_id) AS has_ringtone,
@@ -1464,7 +1485,7 @@ impl HlrRepository for PostgresHlrRepository {
         let row = sqlx::query_as::<_, SubscriberRow>(
             r#"
             SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at,
-                s.number_type, s.number_plan, s.prl_override_id, s.service_programming_code,
+                s.number_type, s.number_plan, s.prl_override_id, s.service_programming_code, s.firstchp_override,
                 EXISTS (SELECT 1 FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS has_ringtone,
                 (SELECT MIN(duration_ms) FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS ringtone_duration_ms
             FROM subscribers s WHERE s.phone_number = $1
@@ -1489,7 +1510,7 @@ impl HlrRepository for PostgresHlrRepository {
         let row = sqlx::query_as::<_, SubscriberRow>(
             r#"
             SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at,
-                s.number_type, s.number_plan, s.prl_override_id, s.service_programming_code,
+                s.number_type, s.number_plan, s.prl_override_id, s.service_programming_code, s.firstchp_override,
                 EXISTS (SELECT 1 FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS has_ringtone,
                 (SELECT MIN(duration_ms) FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS ringtone_duration_ms
             FROM subscribers s WHERE s.subscriber_id = $1
@@ -1530,7 +1551,7 @@ impl HlrRepository for PostgresHlrRepository {
                     number_plan = $7
                 WHERE subscriber_id = $1
                 RETURNING subscriber_id, phone_number, display_name, status,
-                    created_at, updated_at, number_type, number_plan, prl_override_id, service_programming_code
+                    created_at, updated_at, number_type, number_plan, prl_override_id, service_programming_code, firstchp_override
             )
             SELECT up.*,
                 EXISTS (SELECT 1 FROM subscriber_ringtones r WHERE r.subscriber_id = up.subscriber_id) AS has_ringtone,
@@ -1563,7 +1584,7 @@ impl HlrRepository for PostgresHlrRepository {
         let rows = sqlx::query_as::<_, SubscriberRow>(
             r#"
             SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at,
-                s.number_type, s.number_plan, s.prl_override_id, s.service_programming_code,
+                s.number_type, s.number_plan, s.prl_override_id, s.service_programming_code, s.firstchp_override,
                 EXISTS (SELECT 1 FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS has_ringtone,
                 (SELECT MIN(duration_ms) FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS ringtone_duration_ms
             FROM subscribers s ORDER BY s.created_at DESC LIMIT $1 OFFSET $2
@@ -1755,7 +1776,7 @@ impl HlrRepository for PostgresHlrRepository {
             MobileIdentityKey::ImsiEsn { imsi, esn } => sqlx::query_as::<_, SubscriberRow>(
                 r#"
                 SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at,
-                    s.number_type, s.number_plan, s.prl_override_id, s.service_programming_code, s.service_programming_code, s.prl_override_id,
+                    s.number_type, s.number_plan, s.prl_override_id, s.service_programming_code, s.service_programming_code, s.prl_override_id, s.firstchp_override,
                     EXISTS (SELECT 1 FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS has_ringtone,
                     (SELECT MIN(duration_ms) FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS ringtone_duration_ms
                 FROM subscribers s
@@ -1772,7 +1793,7 @@ impl HlrRepository for PostgresHlrRepository {
             MobileIdentityKey::ImsiMeid { imsi, meid } => sqlx::query_as::<_, SubscriberRow>(
                 r#"
                 SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at,
-                    s.number_type, s.number_plan, s.prl_override_id, s.service_programming_code, s.service_programming_code, s.prl_override_id,
+                    s.number_type, s.number_plan, s.prl_override_id, s.service_programming_code, s.service_programming_code, s.prl_override_id, s.firstchp_override,
                     EXISTS (SELECT 1 FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS has_ringtone,
                     (SELECT MIN(duration_ms) FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS ringtone_duration_ms
                 FROM subscribers s
@@ -1790,7 +1811,7 @@ impl HlrRepository for PostgresHlrRepository {
                 sqlx::query_as::<_, SubscriberRow>(
                     r#"
                     SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at,
-                        s.number_type, s.number_plan, s.prl_override_id, s.service_programming_code, s.service_programming_code, s.prl_override_id,
+                        s.number_type, s.number_plan, s.prl_override_id, s.service_programming_code, s.service_programming_code, s.prl_override_id, s.firstchp_override,
                         EXISTS (SELECT 1 FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS has_ringtone,
                         (SELECT MIN(duration_ms) FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS ringtone_duration_ms
                     FROM subscribers s
@@ -1827,7 +1848,7 @@ impl HlrRepository for PostgresHlrRepository {
         let rows = sqlx::query_as::<_, SubscriberRow>(
             r#"
             SELECT DISTINCT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at,
-                s.number_type, s.number_plan, s.prl_override_id, s.service_programming_code,
+                s.number_type, s.number_plan, s.prl_override_id, s.service_programming_code, s.firstchp_override,
                 EXISTS (SELECT 1 FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS has_ringtone,
                 (SELECT MIN(duration_ms) FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS ringtone_duration_ms
             FROM subscribers s
@@ -2343,6 +2364,30 @@ impl HlrRepository for PostgresHlrRepository {
         Ok(())
     }
 
+    async fn set_subscriber_firstchp_override(
+        &self,
+        subscriber_id: Uuid,
+        firstchp: Option<u16>,
+    ) -> Result<(), String> {
+        if let Some(v) = firstchp
+            && v > 2047
+        {
+            return Err("FIRSTCHP override must be in 0..=2047".into());
+        }
+        let affected = sqlx::query(
+            "UPDATE subscribers SET firstchp_override = $1, updated_at = NOW() WHERE subscriber_id = $2",
+        )
+        .bind(firstchp.map(i32::from))
+        .bind(subscriber_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("set_subscriber_firstchp_override: {e}"))?;
+        if affected.rows_affected() == 0 {
+            return Err("subscriber not found".into());
+        }
+        Ok(())
+    }
+
     async fn save_otasp_session(&self, row: &OtaspSessionRow) -> Result<(), String> {
         sqlx::query(
             "INSERT INTO otasp_sessions (
@@ -2461,6 +2506,8 @@ struct SubscriberRow {
     prl_override_id: Option<Uuid>,
     #[sqlx(default)]
     service_programming_code: Option<String>,
+    #[sqlx(default)]
+    firstchp_override: Option<i32>,
 }
 
 impl TryFrom<SubscriberRow> for Subscriber {
@@ -2480,6 +2527,7 @@ impl TryFrom<SubscriberRow> for Subscriber {
             ringtone_duration_ms: r.ringtone_duration_ms.map(|v| v as u64),
             prl_override_id: r.prl_override_id,
             service_programming_code: r.service_programming_code,
+            firstchp_override: r.firstchp_override.map(|v| v as u16),
         })
     }
 }
