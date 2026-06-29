@@ -1781,7 +1781,7 @@ impl HlrRepository for PostgresHlrRepository {
                     (SELECT MIN(duration_ms) FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS ringtone_duration_ms
                 FROM subscribers s
                 JOIN subscriber_identities i ON s.subscriber_id = i.subscriber_id
-                WHERE i.imsi = $1 AND i.esn = $2 AND i.meid IS NULL
+                WHERE i.imsi = $1 AND i.esn = $2
                 LIMIT 1
                 "#,
             )
@@ -1798,7 +1798,7 @@ impl HlrRepository for PostgresHlrRepository {
                     (SELECT MIN(duration_ms) FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS ringtone_duration_ms
                 FROM subscribers s
                 JOIN subscriber_identities i ON s.subscriber_id = i.subscriber_id
-                WHERE i.imsi = $1 AND i.esn IS NULL AND i.meid = $2
+                WHERE i.imsi = $1 AND i.meid = $2
                 LIMIT 1
                 "#,
             )
