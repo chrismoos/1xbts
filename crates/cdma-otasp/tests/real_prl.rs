@@ -166,6 +166,7 @@ macro_rules! extended_fixture {
 extended_fixture!(verizon_51611_extended, "fixtures/verizon_51611.prl");
 extended_fixture!(sprint_60608_extended, "fixtures/sprint_60608.prl");
 extended_fixture!(usc_15056_extended, "fixtures/usc_15056.prl");
+extended_fixture!(usc_15118_extended, "fixtures/usc_15118.prl");
 extended_fixture!(usc_15508_extended, "fixtures/usc_15508.prl");
 extended_fixture!(bluegrass_07067_extended, "fixtures/bluegrass_07067.prl");
 
@@ -214,10 +215,8 @@ fn extended_decoder_rejects_classic_prl() {
 }
 
 /// Extended PRL fixtures (CUR_SSPR_P_REV = 3 in the header). The
-/// classic decoder must NOT silently accept these. Either it errors,
-/// or it decodes "successfully" but with values that don't reconcile
-/// (CRC mismatch / size mismatch). Real OTASP catches these earlier
-/// when the MS rejects the classic Dimensions request with `0x23`.
+/// classic decoder must NOT silently accept these: it either errors
+/// or produces values that don't reconcile (CRC / size mismatch).
 #[test]
 fn extended_prl_not_decoded_as_classic() {
     for &(name, bytes) in &[
@@ -232,6 +231,10 @@ fn extended_prl_not_decoded_as_classic() {
         (
             "usc_15056",
             include_bytes!("fixtures/usc_15056.prl").as_slice(),
+        ),
+        (
+            "usc_15118",
+            include_bytes!("fixtures/usc_15118.prl").as_slice(),
         ),
         (
             "usc_15508",

@@ -99,5 +99,6 @@ classic_rt!(rt_ntelos_02801, "fixtures/ntelos_02801.prl");
 extended_rt!(rt_verizon_51611, "fixtures/verizon_51611.prl");
 extended_rt!(rt_sprint_60608, "fixtures/sprint_60608.prl");
 extended_rt!(rt_usc_15056, "fixtures/usc_15056.prl");
+extended_rt!(rt_usc_15118, "fixtures/usc_15118.prl");
 extended_rt!(rt_usc_15508, "fixtures/usc_15508.prl");
 extended_rt!(rt_bluegrass_07067, "fixtures/bluegrass_07067.prl");

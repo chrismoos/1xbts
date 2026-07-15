@@ -840,50 +840,7 @@ impl OtaspSession {
             let buffer = state.buffer.clone();
             let dims = state.dimensions;
             let cur_sspr_p_rev = state.cur_sspr_p_rev;
-            let outcome = if cur_sspr_p_rev >= 3 {
-                match cdma_otasp::param::prl_ext::decode(&buffer) {
-                    Ok(prl) => {
-                        if !prl.crc_ok() {
-                            PrlOutcome::DecodeFailed {
-                                reason: format!(
-                                    "Extended PRL CRC mismatch: expected 0x{:04x} computed 0x{:04x}",
-                                    prl.pr_list_crc, prl.computed_crc
-                                ),
-                                raw_bytes: buffer,
-                            }
-                        } else {
-                            PrlOutcome::DecodedExtended {
-                                prl,
-                                raw_bytes: buffer,
-                            }
-                        }
-                    }
-                    Err(e) => PrlOutcome::DecodeFailed {
-                        reason: e.to_string(),
-                        raw_bytes: buffer,
-                    },
-                }
-            } else {
-                match cdma_otasp::param::prl::decode(&buffer) {
-                    Ok(prl) => {
-                        if !prl.crc_ok() {
-                            PrlOutcome::DecodeFailed {
-                                reason: format!(
-                                    "PRL CRC mismatch: expected 0x{:04x} computed 0x{:04x}",
-                                    prl.pr_list_crc, prl.computed_crc
-                                ),
-                                raw_bytes: buffer,
-                            }
-                        } else {
-                            PrlOutcome::Decoded(prl)
-                        }
-                    }
-                    Err(e) => PrlOutcome::DecodeFailed {
-                        reason: e.to_string(),
-                        raw_bytes: buffer,
-                    },
-                }
-            };
+            let outcome = decode_prl_outcome(buffer, cur_sspr_p_rev);
             return self.finish_prl_outcome(t, outcome, dims);
         }
         self.send_next_prl_segment_request(t)
@@ -1976,6 +1933,52 @@ fn hex_dump(bytes: &[u8]) -> String {
         .join(" ")
 }
 
+/// Decode a fully reassembled PRL buffer into a readback outcome.
+///
+/// `cur_sspr_p_rev` selects the decoder, but some mobiles answer the
+/// classic Dimensions request while storing an Extended PRL. If the
+/// classic decode isn't CRC-valid, retry as Extended and accept only
+/// on a CRC match. Otherwise report the classic failure.
+fn decode_prl_outcome(buffer: Vec<u8>, cur_sspr_p_rev: u8) -> PrlOutcome {
+    if cur_sspr_p_rev >= 3 {
+        return match cdma_otasp::param::prl_ext::decode(&buffer) {
+            Ok(prl) if prl.crc_ok() => PrlOutcome::DecodedExtended {
+                prl,
+                raw_bytes: buffer,
+            },
+            Ok(prl) => PrlOutcome::DecodeFailed {
+                reason: format!(
+                    "Extended PRL CRC mismatch: expected 0x{:04x} computed 0x{:04x}",
+                    prl.pr_list_crc, prl.computed_crc
+                ),
+                raw_bytes: buffer,
+            },
+            Err(e) => PrlOutcome::DecodeFailed {
+                reason: e.to_string(),
+                raw_bytes: buffer,
+            },
+        };
+    }
+    let classic_failure = match cdma_otasp::param::prl::decode(&buffer) {
+        Ok(prl) if prl.crc_ok() => return PrlOutcome::Decoded(prl),
+        Ok(prl) => format!(
+            "PRL CRC mismatch: expected 0x{:04x} computed 0x{:04x}",
+            prl.pr_list_crc, prl.computed_crc
+        ),
+        Err(e) => e.to_string(),
+    };
+    match cdma_otasp::param::prl_ext::decode(&buffer) {
+        Ok(prl) if prl.crc_ok() => PrlOutcome::DecodedExtended {
+            prl,
+            raw_bytes: buffer,
+        },
+        _ => PrlOutcome::DecodeFailed {
+            reason: classic_failure,
+            raw_bytes: buffer,
+        },
+    }
+}
+
 fn merge_readback(existing: Option<NamReadback>, new: NamReadback) -> NamReadback {
     let mut out = existing.unwrap_or_default();
     if new.scm != 0 {
@@ -2802,5 +2805,54 @@ mod tests {
         let last = rec.outbound.last().expect("at least one outbound");
         let req = SsprDownloadRequest::decode(&last.bytes).expect("decodes");
         assert_eq!(req.block_id, BLOCK_PRL_EXTENDED);
+    }
+
+    /// Raw US Cellular Extended PRL captured from a phone that accepted
+    /// the classic Dimensions request (it never sent result code 0x23),
+    /// leaving `cur_sspr_p_rev` at the classic default.
+    const USC_15118_PRL: &[u8] = include_bytes!("../../../cdma-otasp/tests/fixtures/usc_15118.prl");
+
+    #[test]
+    fn extended_prl_read_back_under_classic_dims_decodes_as_extended() {
+        match decode_prl_outcome(USC_15118_PRL.to_vec(), 1) {
+            PrlOutcome::DecodedExtended { prl, raw_bytes } => {
+                assert_eq!(prl.pr_list_id, 15118);
+                assert_eq!(prl.cur_sspr_p_rev, 3);
+                assert!(prl.crc_ok());
+                assert_eq!(raw_bytes, USC_15118_PRL);
+            }
+            other => panic!("expected DecodedExtended, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classic_prl_read_back_still_decodes_as_classic() {
+        let bytes = include_bytes!("../../../cdma-otasp/tests/fixtures/verizon_50408.prl");
+        match decode_prl_outcome(bytes.to_vec(), 1) {
+            PrlOutcome::Decoded(prl) => {
+                assert_eq!(prl.pr_list_id, 50408);
+                assert!(prl.crc_ok());
+            }
+            other => panic!("expected Decoded, got {:?}", other),
+        }
+    }
+
+    /// A corrupted buffer must not be accepted by the Extended fallback;
+    /// the reported reason stays the classic decoder's failure.
+    #[test]
+    fn corrupted_extended_prl_under_classic_dims_reports_classic_failure() {
+        let mut bytes = USC_15118_PRL.to_vec();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        match decode_prl_outcome(bytes, 1) {
+            PrlOutcome::DecodeFailed { reason, .. } => {
+                assert!(
+                    !reason.contains("Extended"),
+                    "reason should be the classic failure: {}",
+                    reason
+                );
+            }
+            other => panic!("expected DecodeFailed, got {:?}", other),
+        }
     }
 }

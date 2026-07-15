@@ -109,5 +109,6 @@ fixture!(rt_ntelos_02801, "ntelos_02801.prl");
 fixture!(rt_verizon_51611, "verizon_51611.prl");
 fixture!(rt_sprint_60608, "sprint_60608.prl");
 fixture!(rt_usc_15056, "usc_15056.prl");
+fixture!(rt_usc_15118, "usc_15118.prl");
 fixture!(rt_usc_15508, "usc_15508.prl");
 fixture!(rt_bluegrass_07067, "bluegrass_07067.prl");

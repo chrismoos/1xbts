@@ -1,5 +1,7 @@
 # HEAD 
 
+- Fixed `*228` failed PRL decode for Extended PRLs that responded to a
+  non-Extended PRL Dimensions request.
 - Fix issue with subscriber matching (when both MEID and ESN present).
 - CPU usage reduction via optimizations on RX pipeline. 
 - Fixed OTASP causing AMPS/CDMA dual-mode phones to stop working on AMPS, with an optional per-subscriber analog control channel override on the subscriber page (it had overwritten the phone's analog control channel with the CDMA paging channel).
