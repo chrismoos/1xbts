@@ -1,0 +1,150 @@
+syntax = "proto3";
+package events.v1;
+
+// HRPD (1xEV-DO Rev 0) Access Network events.
+//
+// Per the project's event-bus rule: fields with a defined value set are typed
+// enums, never raw uint32 / string. Raw integer fields are reserved for
+// genuinely unbounded data (timestamps, UATIs, access signatures, opaque
+// payloads).
+
+// Reason an HRPD session-layer event was emitted.
+enum HrpdSessionReason {
+  HRPD_SESSION_REASON_UNSPECIFIED = 0;
+  HRPD_SESSION_REASON_OPENED = 1;
+  HRPD_SESSION_REASON_CLOSED = 2;
+  HRPD_SESSION_REASON_UATI_ASSIGNED = 3;
+  HRPD_SESSION_REASON_PROTOCOL_NEGOTIATED = 4;
+  HRPD_SESSION_REASON_UATI_RELEASED = 5;
+}
+
+// Reason an HRPD access-channel event was emitted.
+enum HrpdAccessReason {
+  HRPD_ACCESS_REASON_UNSPECIFIED = 0;
+  HRPD_ACCESS_REASON_CONNECTION_REQUEST = 1;
+  HRPD_ACCESS_REASON_UATI_REQUEST = 2;
+  HRPD_ACCESS_REASON_ROUTE_UPDATE = 3;
+  HRPD_ACCESS_REASON_KEEP_ALIVE = 4;
+  HRPD_ACCESS_REASON_UNKNOWN = 5;
+}
+
+// Reason an HRPD reverse/forward traffic event was emitted.
+enum HrpdTrafficReason {
+  HRPD_TRAFFIC_REASON_UNSPECIFIED = 0;
+  HRPD_TRAFFIC_REASON_FRAME_DECODED = 1;
+  HRPD_TRAFFIC_REASON_DRC_UPDATED = 2;
+  HRPD_TRAFFIC_REASON_ACK_RECEIVED = 3;
+  HRPD_TRAFFIC_REASON_CONNECTION_CLOSE = 4;
+  HRPD_TRAFFIC_REASON_REVERSE_PILOT_SNR_UPDATED = 5;
+}
+
+// Air-interface direction for a UI-visible HRPD message.
+enum HrpdDirection {
+  HRPD_DIRECTION_UNSPECIFIED = 0;
+  HRPD_DIRECTION_RX = 1;
+  HRPD_DIRECTION_TX = 2;
+}
+
+// Canonical 128-bit HRPD UATI assigned by Address Management. The 32-bit
+// receive ATI used on the air interface is derived as
+// UATIColorCode | UATI[23:0] and is carried separately when needed.
+message HrpdUati {
+  bytes value = 1;
+  uint32 color_code = 2;
+  uint32 subnet_mask = 3;
+  uint32 compact_uati32 = 4;
+}
+
+// One decoded HRPD signaling/message element carried by an access capsule or
+// traffic frame. The detailed fields retain the protocol decode alongside the
+// raw bytes so logs can show what happened without reparsing payloads.
+message HrpdDecodedMessage {
+  // Stable short type label, e.g. "RouteUpdate" or "ConnectionRequest".
+  string type_name = 1;
+  // One-line decoded summary for log rows.
+  string summary = 2;
+  // HRPD protocol type that carried the message, when known.
+  uint32 protocol_type = 3;
+  // MessageID within protocol_type, when known.
+  uint32 message_id = 4;
+  // Raw decoded message payload, when available.
+  bytes payload = 5;
+}
+
+// HRPD session-layer event (UATI assignment, protocol negotiation, teardown).
+message HrpdSessionEvent {
+  uint64 timestamp_ns = 1 [jstype = JS_STRING];
+  uint32 uati = 2;
+  HrpdSessionReason reason = 3;
+  // Sector color code that scopes the UATI.
+  uint32 color_code = 4;
+  // Negotiated protocol subtype per HRPD layer, carried as the raw subtype
+  // number (0 = Default subtype, which is all Rev 0 negotiates). Each layer has
+  // its own subtype number space, so these stay raw integers rather than enums.
+  uint32 air_link_management_subtype = 5;
+  uint32 session_management_subtype = 6;
+  uint32 address_management_subtype = 7;
+  uint32 connection_layer_subtype = 8;
+  uint32 security_subtype = 9;
+  uint32 mac_subtype = 10;
+  uint32 physical_layer_subtype = 11;
+  HrpdUati full_uati = 12;
+}
+
+// HRPD access-channel event (capsule received on the reverse access channel).
+message HrpdAccessEvent {
+  uint64 timestamp_ns = 1 [jstype = JS_STRING];
+  // 32-bit access signature observed for this capsule.
+  uint64 access_signature = 2 [jstype = JS_STRING];
+  HrpdAccessReason reason = 3;
+  // Raw access capsule payload, post-decode.
+  bytes payload = 4;
+  // Sector that received the capsule.
+  uint32 color_code = 5;
+  // Access messages are reverse-link messages from the AT.
+  HrpdDirection direction = 6;
+  // Decoded messages contained in this access capsule.
+  repeated HrpdDecodedMessage decoded_messages = 7;
+  // Payload length retained for JSON/SSE display even when bytes encode as
+  // base64 or an object in JavaScript.
+  uint32 payload_length_bytes = 8;
+  // Session or receive-form UATI when the access capsule can be associated
+  // with one. Zero means the capsule was pre-UATI or unresolved.
+  uint32 uati = 9;
+  HrpdUati full_uati = 10;
+  uint32 receive_ati = 11;
+}
+
+// HRPD traffic-layer event (per-frame decode, DRC update, ACK, teardown).
+message HrpdTrafficEvent {
+  uint64 timestamp_ns = 1 [jstype = JS_STRING];
+  uint32 uati = 2;
+  HrpdTrafficReason reason = 3;
+  // Negotiated MAC index for the AT's traffic channel.
+  uint32 mac_index = 4;
+  // Most recent Data Rate Control value reported by the AT.
+  uint32 drc_value = 5;
+  // Optional decoded frame payload (when reason = FRAME_DECODED).
+  bytes payload = 6;
+  // Reverse-pilot SNR in tenths of a dB, when known (0 = unknown).
+  sint32 reverse_pilot_snr_db_tenths = 7;
+  // Direction of the UI-visible traffic event.
+  HrpdDirection direction = 8;
+  // Decoded signaling/messages carried by this event.
+  repeated HrpdDecodedMessage decoded_messages = 9;
+  // Payload length retained for JSON/SSE display even when bytes encode as
+  // base64 or an object in JavaScript.
+  uint32 payload_length_bytes = 10;
+  HrpdUati full_uati = 11;
+  uint32 receive_ati = 12;
+}
+
+// AN wrapper sub-message for the aggregated event bus. One arm per HRPD
+// event class, matching the per-component wrapper convention of the bus.
+message AnNetworkEvent {
+  oneof event {
+    HrpdSessionEvent session = 1;
+    HrpdAccessEvent access = 2;
+    HrpdTrafficEvent traffic = 3;
+  }
+}

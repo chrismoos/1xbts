@@ -1148,6 +1148,26 @@ impl Bsc {
 
         let service_option = request.service_option.map(|so| so.0).unwrap_or(3);
 
+        // If this IMSI is HRPD-attached per the A21 identity cache, divert the
+        // MT voice page to A21 CrossPageRequest and let the HRPD AN deliver the
+        // page over its own air interface. The 1x F-PCH page is suppressed in
+        // that case.
+        if let Some(coord) = self.hrpd_coord.as_ref() {
+            if coord.is_hrpd_attached(&imsi) {
+                let payload = format!("VOICE:{}:so={}", tag.0, service_option).into_bytes();
+                if coord.emit_cross_page(&imsi, cdma_a21::PagingSource::OneX, payload) {
+                    info!(
+                        "BSC: target IMSI {imsi} HRPD-attached — diverted MT voice page via A21 (tag={})",
+                        tag.0
+                    );
+                    return;
+                }
+                warn!(
+                    "BSC: A21 channel closed; falling back to 1x F-PCH for HRPD-attached IMSI {imsi}"
+                );
+            }
+        }
+
         let (fwd_address, subscriber_id) = match self.mobiles.get_by_imsi(&imsi) {
             Some(mobile) => (
                 mobile.fwd_address.clone(),

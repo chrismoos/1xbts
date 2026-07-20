@@ -1212,11 +1212,39 @@ fn to_proto_paging_event(ev: &PagingEvent) -> proto::PagingEvent {
     }
 }
 
+fn to_proto_evdo(r: &cdma_bts::bts::evdo::ResolvedEvdoConfig) -> proto::EvdoCarrierConfig {
+    use cdma_bts::bts::evdo::EvdoTxMode;
+    let mode = match r.tx_mode {
+        EvdoTxMode::AdjacentComposite => proto::EvdoTxMode::AdjacentComposite,
+        EvdoTxMode::HrpdOnly => proto::EvdoTxMode::HrpdOnly,
+    };
+    let sector_id = r
+        .overhead
+        .sector_id
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    proto::EvdoCarrierConfig {
+        channel: u32::from(r.evdo_channel),
+        band_class: u32::from(r.evdo_band_class),
+        frequency_hz: r.evdo_frequency_hz as u64,
+        reverse_frequency_hz: r.evdo_reverse_frequency_hz as u64,
+        composite_center_frequency_hz: r.composite_center_frequency_hz as u64,
+        mode: mode as i32,
+        gain: r.gain,
+        advertise_on_1x: r.advertise_on_1x,
+        sector_id,
+        color_code: u32::from(r.overhead.color_code),
+        subnet_mask: u32::from(r.overhead.subnet_mask),
+    }
+}
+
 fn to_proto_config(
     cfg: &BtsRuntimeSettings,
     channel: cdma_common::band_class::ChannelPlan,
     tx_center_frequency_hz: usize,
     rx_center_frequency_hz: usize,
+    evdo: Option<&cdma_bts::bts::evdo::ResolvedEvdoConfig>,
     overhead: &crate::bsc::OverheadParameters,
     timezone: &cdma_common::timezone::TimezoneConfig,
     pilot_offset: usize,
@@ -1308,6 +1336,7 @@ fn to_proto_config(
             lp_sec: resolved.lp_sec as u32,
             utc_offset_seconds: (resolved.ltm_off as i32) * 1800,
         }),
+        evdo: evdo.map(to_proto_evdo),
     }
 }
 
@@ -1321,7 +1350,9 @@ fn to_proto_iq_capture_status(status: &BtsIqCaptureStatus) -> proto::IqCaptureSt
             .as_ref()
             .map(|p| p.display().to_string()),
         first_absolute_chip_start: status.first_absolute_chip_start,
-        first_absolute_sample_start: status.first_absolute_sample_start,
+        // Omitted: at 8x capture this exceeds JS's safe integer range. Exact
+        // sample time stays in the sidecar metadata JSON.
+        first_absolute_sample_start: None,
         first_sample_system_time: status
             .first_sample_system_time
             .as_ref()
@@ -1361,6 +1392,7 @@ impl BscService for BscServiceImpl {
             self.state.channel,
             self.state.tx_center_frequency_hz,
             self.state.rx_center_frequency_hz,
+            self.state.evdo.as_ref(),
             &self.state.overhead,
             &self.state.timezone,
             self.state.pilot_offset,
@@ -2289,11 +2321,18 @@ fn to_management_packet_session_info(
         mobile_address: session.mobile_address,
         subscriber_id: session.subscriber_id,
         phone_number: session.phone_number,
+        imsi: session.imsi,
+        esn: session.esn,
+        meid: session.meid,
+        hrpd_mn_id: session.hrpd_mn_id,
+        hrpd_mn_id_source: session.hrpd_mn_id_source,
+        subscriber_imsi: session.subscriber_imsi,
         traffic_walsh_code: session.traffic_walsh_code,
         rlp_state: session.rlp_state,
         lcp_state: session.lcp_state,
         ipcp_state: session.ipcp_state,
         capture_enabled: session.capture_enabled,
+        access_technology: session.access_technology,
     }
 }
 

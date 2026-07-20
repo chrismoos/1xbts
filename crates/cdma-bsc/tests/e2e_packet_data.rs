@@ -1201,6 +1201,32 @@ fn build_ppp_lcp_configure_ack(identifier: u8, options: &[u8]) -> Vec<u8> {
     build_ppp_frame(0xC021, &lcp_payload)
 }
 
+/// Build a PPP LCP Configure-Reject carrying the given option bytes.
+fn build_ppp_lcp_configure_reject(identifier: u8, options: &[u8]) -> Vec<u8> {
+    let mut lcp_payload = vec![
+        0x04, // Code: Configure-Reject
+        identifier,
+    ];
+    let len = 4 + options.len();
+    lcp_payload.push((len >> 8) as u8);
+    lcp_payload.push(len as u8);
+    lcp_payload.extend_from_slice(options);
+    build_ppp_frame(0xC021, &lcp_payload)
+}
+
+/// Option bytes this simulated mobile Configure-Rejects from the BS's LCP
+/// Configure-Request (everything but MRU). The BS filters rejected options
+/// by type, so the ACCM/Magic-Number values here need not match the ones it
+/// sent (the Magic-Number is per-session).
+fn lcp_rejected_option_bytes() -> Vec<u8> {
+    vec![
+        0x02, 0x06, 0x00, 0x00, 0x00, 0x00, // ACCM
+        0x05, 0x06, 0x00, 0x00, 0x00, 0x00, // Magic-Number
+        0x07, 0x02, // Protocol-Field-Compression
+        0x08, 0x02, // Address-and-Control-Field-Compression
+    ]
+}
+
 /// Build a PPP IPCP Configure-Request.
 fn build_ppp_ipcp_configure_request(identifier: u8, ip: [u8; 4]) -> Vec<u8> {
     let ipcp_payload = vec![
@@ -1302,6 +1328,12 @@ async fn test_e2e_so7_packet_data_full_negotiation() {
             overhead: cdma_common::overhead::OverheadParameters::default(),
             rx: Some(bts::RxSettings {
                 sample_rate_hz: 1_228_800 * 4,
+                rx_center_frequency_hz: None,
+                one_x_enabled: true,
+                one_x_reverse_frequency_hz: None,
+                one_x_rx_shift_hz: 0,
+                hrpd_reverse_frequency_hz: None,
+                hrpd_rx_shift_hz: None,
                 auth_mode: 0,
                 p_rev_in_use: 6,
                 capture_iq_wav: None,
@@ -1315,10 +1347,20 @@ async fn test_e2e_so7_packet_data_full_negotiation() {
                 hardware_start_time_ns: 0,
                 tick_rate: 1_000_000_000,
                 access_event_tx: None,
+                hrpd_access_event_tx: None,
+                hrpd_traffic_event_tx: None,
+                hrpd_access_cycle_number: 0,
+                hrpd_access_sector_id_lsb: 0,
+                hrpd_access_color_code: 26,
+                hrpd_access_preamble_frames:
+                    cdma_bts::receiver::hrpd::access::HRPD_DEFAULT_ACCESS_PREAMBLE_FRAMES,
+                hrpd_access_enhanced_rates: false,
                 reverse_bearer_tx: None,
                 rx_metrics_tx: None,
                 reanchor_origin: true,
                 traffic_rx_pool: None,
+                hrpd_traffic_rx_queue: None,
+                hrpd_harq_bus: None,
                 traffic_channels: None,
                 power_control: None,
                 traffic_rx_removals: None,
@@ -1333,6 +1375,7 @@ async fn test_e2e_so7_packet_data_full_negotiation() {
                 traffic_ack_seq_tx: None,
                 rx_measurements: None,
             }),
+            evdo: None,
         },
         bts::BtsRuntimeSettings::default(),
     );
@@ -1342,13 +1385,19 @@ async fn test_e2e_so7_packet_data_full_negotiation() {
         rx_metrics: _,
         config: _,
         access_events: mut _bts_access_rx,
+        hrpd_access_events: _,
+        hrpd_traffic_events: _,
         commands: _,
+        hrpd_forward_signaling: _,
+        hrpd_traffic_assignments: _,
+        hrpd_forward_traffic: _,
         traffic_channels,
         walsh_allocator,
         traffic_rx_pool,
         traffic_rx_removals,
         power_control: _,
         rx_measurements: _,
+        ..
     } = bts_handle;
 
     // -- Create packet service --
@@ -1531,10 +1580,19 @@ async fn test_e2e_so7_packet_data_full_negotiation() {
     // and its own LCP Configure-Request
     let mut rlp_seq: u8 = 0;
 
-    // BS sends Configure-Request with MRU=1500 (option type 1, len 4, value 0x05DC)
-    // Mobile must echo the exact options in Configure-Ack
+    // BS request id=1 carries MRU/ACCM/Magic-Number/PFC/ACFC. This simulated
+    // mobile only implements MRU: Configure-Reject the rest, then ACK the
+    // MRU-only retry the BS resends as id=2.
+    let lcp_reject = build_ppp_lcp_configure_reject(1, &lcp_rejected_option_bytes());
+    for frame in ppp_to_rlp_frames(&lcp_reject, &mut rlp_seq) {
+        let bits = encode_rlp_full_rate(&frame);
+        inject_reverse_bearer_rlp_frame(&mut bsc, &bts_client, walsh_code, bits, 9600).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
     let mru_option = vec![0x01, 0x04, 0x05, 0xDC]; // MRU option: type=1, len=4, value=1500
-    let lcp_ack = build_ppp_lcp_configure_ack(1, &mru_option);
+    let lcp_ack = build_ppp_lcp_configure_ack(2, &mru_option);
     for frame in ppp_to_rlp_frames(&lcp_ack, &mut rlp_seq) {
         let bits = encode_rlp_full_rate(&frame);
         inject_reverse_bearer_rlp_frame(&mut bsc, &bts_client, walsh_code, bits, 9600).await;
@@ -1905,6 +1963,12 @@ async fn test_e2e_so7_packet_data_phy_bidirectional() {
             overhead: cdma_common::overhead::OverheadParameters::default(),
             rx: Some(bts::RxSettings {
                 sample_rate_hz: chip_rate * oversample,
+                rx_center_frequency_hz: None,
+                one_x_enabled: true,
+                one_x_reverse_frequency_hz: None,
+                one_x_rx_shift_hz: 0,
+                hrpd_reverse_frequency_hz: None,
+                hrpd_rx_shift_hz: None,
                 auth_mode: 0,
                 p_rev_in_use: 6,
                 capture_iq_wav: None,
@@ -1918,10 +1982,20 @@ async fn test_e2e_so7_packet_data_phy_bidirectional() {
                 hardware_start_time_ns: 0,
                 tick_rate: 1_000_000_000,
                 access_event_tx: None,
+                hrpd_access_event_tx: None,
+                hrpd_traffic_event_tx: None,
+                hrpd_access_cycle_number: 0,
+                hrpd_access_sector_id_lsb: 0,
+                hrpd_access_color_code: 26,
+                hrpd_access_preamble_frames:
+                    cdma_bts::receiver::hrpd::access::HRPD_DEFAULT_ACCESS_PREAMBLE_FRAMES,
+                hrpd_access_enhanced_rates: false,
                 reverse_bearer_tx: None,
                 rx_metrics_tx: None,
                 reanchor_origin: true,
                 traffic_rx_pool: None,
+                hrpd_traffic_rx_queue: None,
+                hrpd_harq_bus: None,
                 traffic_channels: None,
                 power_control: None,
                 traffic_rx_removals: None,
@@ -1936,6 +2010,7 @@ async fn test_e2e_so7_packet_data_phy_bidirectional() {
                 traffic_ack_seq_tx: None,
                 rx_measurements: None,
             }),
+            evdo: None,
         },
         bts::BtsRuntimeSettings::default(),
     );
@@ -1945,13 +2020,19 @@ async fn test_e2e_so7_packet_data_phy_bidirectional() {
         rx_metrics: _,
         config: _,
         access_events: mut bts_access_rx,
+        hrpd_access_events: _,
+        hrpd_traffic_events: _,
         commands: _,
+        hrpd_forward_signaling: _,
+        hrpd_traffic_assignments: _,
+        hrpd_forward_traffic: _,
         traffic_channels,
         walsh_allocator,
         traffic_rx_pool,
         traffic_rx_removals,
         power_control: _,
         rx_measurements: _,
+        ..
     } = bts_handle;
 
     // -- Create packet service + BSC --
@@ -2113,9 +2194,26 @@ async fn test_e2e_so7_packet_data_phy_bidirectional() {
         frame_chip_offset += chips_per_frame as u64;
     }
 
-    // LCP Configure-Ack (echo BS's MRU=1500)
+    // BS request id=1 carries MRU/ACCM/Magic-Number/PFC/ACFC: reject all but
+    // MRU, give the BS a frame to resend as id=2, then ACK the retry.
+    let lcp_reject = build_ppp_lcp_configure_reject(1, &lcp_rejected_option_bytes());
+    for frame in ppp_to_rlp_frames(&lcp_reject, &mut rlp_seq) {
+        let bits = encode_rlp_full_rate(&frame);
+        let info = rlp_to_info_bits(&bits);
+        let iq = encoder.encode_full_rate_frame(&info, frame_chip_offset);
+        all_rx_samples.extend_from_slice(&iq);
+        frame_chip_offset += chips_per_frame as u64;
+    }
+    for _ in 0..2 {
+        let idle_bits = rlp::encode_frame(&rlp::idle_frame(0), RlpRate::Full)
+            .expect("test RLP idle frame must encode");
+        let idle_info = rlp_to_info_bits(&idle_bits);
+        let idle_iq = encoder.encode_full_rate_frame(&idle_info, frame_chip_offset);
+        all_rx_samples.extend_from_slice(&idle_iq);
+        frame_chip_offset += chips_per_frame as u64;
+    }
     let mru_option = vec![0x01, 0x04, 0x05, 0xDC];
-    let lcp_ack = build_ppp_lcp_configure_ack(1, &mru_option);
+    let lcp_ack = build_ppp_lcp_configure_ack(2, &mru_option);
     for frame in ppp_to_rlp_frames(&lcp_ack, &mut rlp_seq) {
         let bits = encode_rlp_full_rate(&frame);
         let info = rlp_to_info_bits(&bits);
@@ -2387,8 +2485,17 @@ async fn test_e2e_so7_packet_data_phy_bidirectional() {
         }
 
         let mut rlp_seq_fb: u8 = 0;
+        // Reject the non-MRU options from BS request id=1, then ACK the
+        // MRU-only retry (id=2).
+        let lcp_reject = build_ppp_lcp_configure_reject(1, &lcp_rejected_option_bytes());
+        for frame in ppp_to_rlp_frames(&lcp_reject, &mut rlp_seq_fb) {
+            let bits = encode_rlp_full_rate(&frame);
+            inject_reverse_bearer_rlp_frame(&mut bsc, &bts_client, walsh_code, bits, 9600).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
         let mru_option = vec![0x01, 0x04, 0x05, 0xDC];
-        let lcp_ack = build_ppp_lcp_configure_ack(1, &mru_option);
+        let lcp_ack = build_ppp_lcp_configure_ack(2, &mru_option);
         for frame in ppp_to_rlp_frames(&lcp_ack, &mut rlp_seq_fb) {
             let bits = encode_rlp_full_rate(&frame);
             inject_reverse_bearer_rlp_frame(&mut bsc, &bts_client, walsh_code, bits, 9600).await;
@@ -2572,6 +2679,12 @@ async fn test_e2e_so7_rc3_reverse_preamble_queues_bs_ack() {
             overhead: cdma_common::overhead::OverheadParameters::default(),
             rx: Some(bts::RxSettings {
                 sample_rate_hz: chip_rate * oversample,
+                rx_center_frequency_hz: None,
+                one_x_enabled: true,
+                one_x_reverse_frequency_hz: None,
+                one_x_rx_shift_hz: 0,
+                hrpd_reverse_frequency_hz: None,
+                hrpd_rx_shift_hz: None,
                 auth_mode: 0,
                 p_rev_in_use: 6,
                 capture_iq_wav: None,
@@ -2585,10 +2698,20 @@ async fn test_e2e_so7_rc3_reverse_preamble_queues_bs_ack() {
                 hardware_start_time_ns: 0,
                 tick_rate: 1_000_000_000,
                 access_event_tx: None,
+                hrpd_access_event_tx: None,
+                hrpd_traffic_event_tx: None,
+                hrpd_access_cycle_number: 0,
+                hrpd_access_sector_id_lsb: 0,
+                hrpd_access_color_code: 26,
+                hrpd_access_preamble_frames:
+                    cdma_bts::receiver::hrpd::access::HRPD_DEFAULT_ACCESS_PREAMBLE_FRAMES,
+                hrpd_access_enhanced_rates: false,
                 reverse_bearer_tx: None,
                 rx_metrics_tx: None,
                 reanchor_origin: true,
                 traffic_rx_pool: None,
+                hrpd_traffic_rx_queue: None,
+                hrpd_harq_bus: None,
                 traffic_channels: None,
                 power_control: None,
                 traffic_rx_removals: None,
@@ -2603,6 +2726,7 @@ async fn test_e2e_so7_rc3_reverse_preamble_queues_bs_ack() {
                 traffic_ack_seq_tx: None,
                 rx_measurements: None,
             }),
+            evdo: None,
         },
         bts::BtsRuntimeSettings::default(),
     );
@@ -2612,13 +2736,19 @@ async fn test_e2e_so7_rc3_reverse_preamble_queues_bs_ack() {
         rx_metrics: _,
         config: _,
         access_events,
+        hrpd_access_events: _,
+        hrpd_traffic_events: _,
         commands: _,
+        hrpd_forward_signaling: _,
+        hrpd_traffic_assignments: _,
+        hrpd_forward_traffic: _,
         traffic_channels,
         walsh_allocator,
         traffic_rx_pool,
         traffic_rx_removals,
         power_control: _,
         rx_measurements: _,
+        ..
     } = bts_handle;
 
     let (traffic_tx, mut traffic_rx) = tokio::sync::broadcast::channel(16);
@@ -3760,6 +3890,12 @@ async fn test_e2e_so6_sms_data_burst_phy_bidirectional() {
             overhead: cdma_common::overhead::OverheadParameters::default(),
             rx: Some(bts::RxSettings {
                 sample_rate_hz: chip_rate * oversample,
+                rx_center_frequency_hz: None,
+                one_x_enabled: true,
+                one_x_reverse_frequency_hz: None,
+                one_x_rx_shift_hz: 0,
+                hrpd_reverse_frequency_hz: None,
+                hrpd_rx_shift_hz: None,
                 auth_mode: 0,
                 p_rev_in_use: 6,
                 capture_iq_wav: None,
@@ -3773,10 +3909,20 @@ async fn test_e2e_so6_sms_data_burst_phy_bidirectional() {
                 hardware_start_time_ns: 0,
                 tick_rate: 1_000_000_000,
                 access_event_tx: None,
+                hrpd_access_event_tx: None,
+                hrpd_traffic_event_tx: None,
+                hrpd_access_cycle_number: 0,
+                hrpd_access_sector_id_lsb: 0,
+                hrpd_access_color_code: 26,
+                hrpd_access_preamble_frames:
+                    cdma_bts::receiver::hrpd::access::HRPD_DEFAULT_ACCESS_PREAMBLE_FRAMES,
+                hrpd_access_enhanced_rates: false,
                 reverse_bearer_tx: None,
                 rx_metrics_tx: None,
                 reanchor_origin: true,
                 traffic_rx_pool: None,
+                hrpd_traffic_rx_queue: None,
+                hrpd_harq_bus: None,
                 traffic_channels: None,
                 power_control: None,
                 traffic_rx_removals: None,
@@ -3791,6 +3937,7 @@ async fn test_e2e_so6_sms_data_burst_phy_bidirectional() {
                 traffic_ack_seq_tx: None,
                 rx_measurements: None,
             }),
+            evdo: None,
         },
         bts::BtsRuntimeSettings::default(),
     );
@@ -3800,13 +3947,19 @@ async fn test_e2e_so6_sms_data_burst_phy_bidirectional() {
         rx_metrics: _,
         config: _,
         access_events: mut bts_access_rx,
+        hrpd_access_events: _,
+        hrpd_traffic_events: _,
         commands: _,
+        hrpd_forward_signaling: _,
+        hrpd_traffic_assignments: _,
+        hrpd_forward_traffic: _,
         traffic_channels,
         walsh_allocator,
         traffic_rx_pool,
         traffic_rx_removals,
         power_control: _,
         rx_measurements: _,
+        ..
     } = bts_handle;
 
     // -- Create BSC with HLR (no packet_service needed for SMS) --

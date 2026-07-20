@@ -12,6 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "../../proto/events/v1/hlr.proto",
                 "../../proto/events/v1/smsc.proto",
                 "../../proto/events/v1/bts.proto",
+                "../../proto/events/v1/an.proto",
             ],
             &["../../proto"],
         )?;

@@ -8,7 +8,14 @@ use parking_lot::Mutex;
 
 use tokio::sync::{mpsc, oneshot, watch};
 
-use cdma_common::{sch::Rc3FschProfile, time::CdmaSystemTime};
+use cdma_common::{
+    hrpd::air::{
+        HrpdAccessIndication, HrpdForwardSignalingRequest, HrpdTrafficAssignmentRequest,
+        HrpdTrafficEvent, HrpdTrafficReleaseRequest,
+    },
+    sch::Rc3FschProfile,
+    time::CdmaSystemTime,
+};
 
 use crate::{
     channels::{
@@ -29,6 +36,7 @@ use crate::{
 };
 
 use super::{AccessChannelEvent, BtsPowerControlRegistry, BtsRuntimeSettings};
+use crate::bts::hrpd::scheduler::ForwardTrafficPacket;
 
 /// Metrics snapshot from the TX loop, published every ~1 second.
 #[derive(Debug, Clone, Default)]
@@ -402,6 +410,27 @@ pub use cdma_common::traffic::{
     RC1_TRAFFIC_INITIAL_GAIN_LINEAR, RC3_TRAFFIC_INITIAL_GAIN_LINEAR, TrafficRxRequest,
 };
 
+/// Lifecycle command for an HRPD reverse traffic receiver worker.
+///
+/// The forward synth thread produces these as sessions are assigned and
+/// released; the BTS RX loop drains them in FIFO order so assign/release
+/// commands for a reused MAC index cannot cross.
+#[derive(Debug)]
+pub enum HrpdTrafficRxCommand {
+    /// Start a reverse traffic worker for the assigned session.
+    Assign(HrpdTrafficAssignmentRequest),
+    /// Stop the reverse traffic worker for the released session.
+    Release(HrpdTrafficReleaseRequest),
+}
+
+/// Lock-free command stream from the forward synth thread to the BTS RX loop.
+pub type HrpdTrafficRxQueue = Arc<ArrayQueue<HrpdTrafficRxCommand>>;
+
+/// Capacity of the HRPD reverse traffic command queue. Lifecycle events are
+/// rare (per call setup/teardown) and the RX loop drains every block, so this
+/// is far above any realistic in-flight backlog.
+pub const HRPD_TRAFFIC_RX_QUEUE_CAPACITY: usize = 256;
+
 /// Shared pool of pending reverse traffic channel receiver requests.
 ///
 /// The BSC adds entries when assigning traffic channels; the BTS RX loop
@@ -506,7 +535,19 @@ pub struct BtsHandle {
     pub rx_metrics: watch::Receiver<RxMetrics>,
     pub config: Arc<BtsRuntimeSettings>,
     pub access_events: mpsc::UnboundedReceiver<AccessChannelEvent>,
+    /// Decoded HRPD reverse access events emitted by the BTS receiver.
+    pub hrpd_access_events: mpsc::UnboundedReceiver<HrpdAccessIndication>,
+    /// Decoded HRPD reverse traffic events emitted by the BTS receiver.
+    pub hrpd_traffic_events: mpsc::UnboundedReceiver<HrpdTrafficEvent>,
     pub commands: mpsc::Sender<BtsCommand>,
+    /// Queue AN-originated HRPD Default Signaling for the Forward Control Channel.
+    pub hrpd_forward_signaling: mpsc::UnboundedSender<HrpdForwardSignalingRequest>,
+    /// Queue AN-originated HRPD traffic-resource assignments for the forward MAC.
+    pub hrpd_traffic_assignments: mpsc::UnboundedSender<HrpdTrafficAssignmentRequest>,
+    /// Queue AN-originated HRPD traffic releases (session closed/replaced).
+    pub hrpd_traffic_releases: mpsc::UnboundedSender<HrpdTrafficReleaseRequest>,
+    /// Queue AN-originated HRPD Forward Traffic Channel physical packets.
+    pub hrpd_forward_traffic: mpsc::UnboundedSender<ForwardTrafficPacket>,
     /// Shared pool of active forward traffic channels.
     pub traffic_channels: TrafficChannelPool,
     /// BTS-local reverse power-control state keyed by traffic Walsh code.
@@ -515,6 +556,8 @@ pub struct BtsHandle {
     pub walsh_allocator: Arc<Mutex<WalshAllocator>>,
     /// Shared pool of active reverse traffic channel receivers.
     pub traffic_rx_pool: TrafficRxPool,
+    /// Lock-free HRPD reverse traffic worker lifecycle command queue.
+    pub hrpd_traffic_rx_queue: HrpdTrafficRxQueue,
     /// Shared list of Walsh codes to remove from RX processing.
     pub traffic_rx_removals: TrafficRxRemovals,
     /// Shared access-channel signal quality store, written by BTS RX.
@@ -858,11 +901,20 @@ pub(crate) struct BtsHandleSenders {
     pub tx_metrics: watch::Sender<TxMetrics>,
     pub rx_metrics: watch::Sender<RxMetrics>,
     pub access_event_tx: mpsc::UnboundedSender<AccessChannelEvent>,
+    pub hrpd_access_event_tx: mpsc::UnboundedSender<HrpdAccessIndication>,
+    pub hrpd_traffic_event_tx: mpsc::UnboundedSender<HrpdTrafficEvent>,
+    pub hrpd_forward_signaling_rx: mpsc::UnboundedReceiver<HrpdForwardSignalingRequest>,
+    pub hrpd_traffic_assignment_rx: mpsc::UnboundedReceiver<HrpdTrafficAssignmentRequest>,
+    pub hrpd_traffic_release_rx: mpsc::UnboundedReceiver<HrpdTrafficReleaseRequest>,
+    pub hrpd_forward_traffic_rx: mpsc::UnboundedReceiver<ForwardTrafficPacket>,
     pub commands_rx: mpsc::Receiver<BtsCommand>,
     /// Shared reference to the traffic channel pool (same Arc as BtsHandle).
     pub traffic_channels: TrafficChannelPool,
     /// Shared reference to the traffic RX pool (same Arc as BtsHandle).
     pub traffic_rx_pool: TrafficRxPool,
+    /// Shared reference to the HRPD reverse traffic command queue (same Arc as
+    /// BtsHandle).
+    pub hrpd_traffic_rx_queue: HrpdTrafficRxQueue,
     /// Shared reference to the traffic RX removals list (same Arc as BtsHandle).
     pub traffic_rx_removals: TrafficRxRemovals,
     /// BTS-local reverse power-control state keyed by traffic Walsh code.
@@ -876,10 +928,18 @@ pub(crate) fn create_handle(config: Arc<BtsRuntimeSettings>) -> (BtsHandleSender
     let (tx_metrics_tx, tx_metrics_rx) = watch::channel(TxMetrics::default());
     let (rx_metrics_tx, rx_metrics_rx) = watch::channel(RxMetrics::default());
     let (access_tx, access_rx) = mpsc::unbounded_channel();
+    let (hrpd_access_tx, hrpd_access_rx) = mpsc::unbounded_channel();
+    let (hrpd_traffic_event_tx, hrpd_traffic_event_rx) = mpsc::unbounded_channel();
+    let (hrpd_forward_tx, hrpd_forward_rx) = mpsc::unbounded_channel();
+    let (hrpd_traffic_tx, hrpd_traffic_rx) = mpsc::unbounded_channel();
+    let (hrpd_traffic_release_tx, hrpd_traffic_release_rx) = mpsc::unbounded_channel();
+    let (hrpd_forward_traffic_tx, hrpd_forward_traffic_rx) = mpsc::unbounded_channel();
     let (commands_tx, commands_rx) = mpsc::channel(16);
 
     let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
     let traffic_rx_pool: TrafficRxPool = Arc::new(Mutex::new(Vec::new()));
+    let hrpd_traffic_rx_queue: HrpdTrafficRxQueue =
+        Arc::new(ArrayQueue::new(HRPD_TRAFFIC_RX_QUEUE_CAPACITY));
     let traffic_rx_removals: TrafficRxRemovals = Arc::new(Mutex::new(Vec::new()));
     let power_control = BtsPowerControlRegistry::default();
     let rx_measurements: super::settings::RxMeasurementStore =
@@ -896,9 +956,16 @@ pub(crate) fn create_handle(config: Arc<BtsRuntimeSettings>) -> (BtsHandleSender
         tx_metrics: tx_metrics_tx,
         rx_metrics: rx_metrics_tx,
         access_event_tx: access_tx,
+        hrpd_access_event_tx: hrpd_access_tx,
+        hrpd_traffic_event_tx,
+        hrpd_forward_signaling_rx: hrpd_forward_rx,
+        hrpd_traffic_assignment_rx: hrpd_traffic_rx,
+        hrpd_traffic_release_rx,
+        hrpd_forward_traffic_rx,
         commands_rx,
         traffic_channels: traffic_channels.clone(),
         traffic_rx_pool: traffic_rx_pool.clone(),
+        hrpd_traffic_rx_queue: hrpd_traffic_rx_queue.clone(),
         traffic_rx_removals: traffic_rx_removals.clone(),
         power_control: power_control.clone(),
         rx_measurements: rx_measurements.clone(),
@@ -909,11 +976,18 @@ pub(crate) fn create_handle(config: Arc<BtsRuntimeSettings>) -> (BtsHandleSender
         rx_metrics: rx_metrics_rx,
         config,
         access_events: access_rx,
+        hrpd_access_events: hrpd_access_rx,
+        hrpd_traffic_events: hrpd_traffic_event_rx,
         commands: commands_tx,
+        hrpd_forward_signaling: hrpd_forward_tx,
+        hrpd_traffic_assignments: hrpd_traffic_tx,
+        hrpd_traffic_releases: hrpd_traffic_release_tx,
+        hrpd_forward_traffic: hrpd_forward_traffic_tx,
         traffic_channels,
         power_control,
         walsh_allocator: Arc::new(Mutex::new(walsh_alloc)),
         traffic_rx_pool,
+        hrpd_traffic_rx_queue,
         traffic_rx_removals,
         rx_measurements,
     };

@@ -52,6 +52,13 @@ pub(super) const PCG_PREDICTION_LEAD_PCGS: u32 = 12;
 /// between active eighth-rate PCGs without letting TX fallback drive FPC.
 const RC1_PCB_SPECULATIVE_FILL_PCGS: u64 = 16;
 const PCG_PREDICTION_CLAMP_DB: f32 = 1.0;
+const RC3_DELTA_SIGMA_PARAMS: super::reverse_power_predictor::DeltaSigmaParams =
+    super::reverse_power_predictor::DeltaSigmaParams {
+        hold_band_db: PCG_HOLD_BAND_DB,
+        response_gain_db_per_db: PCG_RESPONSE_GAIN_DB_PER_DB,
+        desired_step_clamp_db: PCG_DESIRED_STEP_CLAMP_DB,
+        residual_clamp_db: PCG_RESIDUAL_CLAMP_DB,
+    };
 // Brake offset subtracted from the PCB error in the pre-clip region to keep
 // the reverse link below the ADC knee.
 const BRAKE_BEGIN_DBFS: f32 = -12.0;
@@ -997,26 +1004,7 @@ impl BtsReversePowerControlState {
     /// Least-squares fit of `y = a*t + b` over evenly-spaced samples
     /// `t = 0..n-1`. Returns `(intercept_at_newest_sample, slope_db_per_pcg)`.
     fn lsq_intercept_and_slope_at_newest(samples: &VecDeque<f32>) -> (f32, f32) {
-        let n = samples.len();
-        if n == 0 {
-            return (f32::NAN, 0.0);
-        }
-        if n == 1 {
-            return (samples[0], 0.0);
-        }
-        let nf = n as f32;
-        let t_mean = (nf - 1.0) * 0.5;
-        let y_mean: f32 = samples.iter().sum::<f32>() / nf;
-        let mut num = 0.0_f32;
-        let mut den = 0.0_f32;
-        for (i, &y) in samples.iter().enumerate() {
-            let dt = i as f32 - t_mean;
-            num += dt * (y - y_mean);
-            den += dt * dt;
-        }
-        let slope = if den > 0.0 { num / den } else { 0.0 };
-        let intercept_at_newest = y_mean + slope * ((nf - 1.0) - t_mean);
-        (intercept_at_newest, slope)
+        super::reverse_power_predictor::lsq_intercept_and_slope_at_newest(samples)
     }
 
     fn tick_single_pcg(
@@ -1111,10 +1099,11 @@ impl BtsReversePowerControlState {
             let (intercept_at_now, slope) =
                 Self::lsq_intercept_and_slope_at_newest(&self.metric_history);
             self.last_slope_db_per_pcg = slope;
-            let raw_prediction_db = intercept_at_now + (lead_pcgs as f32) * slope;
-            let predicted_metric_db = raw_prediction_db.clamp(
-                intercept_at_now - PCG_PREDICTION_CLAMP_DB,
-                intercept_at_now + PCG_PREDICTION_CLAMP_DB,
+            let predicted_metric_db = super::reverse_power_predictor::predict_ahead_clamped(
+                intercept_at_now,
+                slope,
+                lead_pcgs as f32,
+                PCG_PREDICTION_CLAMP_DB,
             );
             self.last_predicted_metric_db = Some(predicted_metric_db);
 
@@ -1175,19 +1164,11 @@ impl BtsReversePowerControlState {
     }
 
     fn quantize_pcb(&mut self, filtered_error_db: f32) -> u8 {
-        let effective_error_db = if filtered_error_db.abs() <= PCG_HOLD_BAND_DB {
-            0.0
-        } else {
-            filtered_error_db - PCG_HOLD_BAND_DB * filtered_error_db.signum()
-        };
-        let desired_step_db = (effective_error_db * PCG_RESPONSE_GAIN_DB_PER_DB)
-            .clamp(-PCG_DESIRED_STEP_CLAMP_DB, PCG_DESIRED_STEP_CLAMP_DB);
-        let residual = (self.residual_db + desired_step_db)
-            .clamp(-PCG_RESIDUAL_CLAMP_DB, PCG_RESIDUAL_CLAMP_DB);
-        let (pcb, applied_step_db) = if residual >= 0.0 { (0, 1.0) } else { (1, -1.0) };
-        self.residual_db =
-            (residual - applied_step_db).clamp(-PCG_RESIDUAL_CLAMP_DB, PCG_RESIDUAL_CLAMP_DB);
-        pcb
+        super::reverse_power_predictor::delta_sigma_pcb_step(
+            &mut self.residual_db,
+            filtered_error_db,
+            &RC3_DELTA_SIGMA_PARAMS,
+        )
     }
 }
 

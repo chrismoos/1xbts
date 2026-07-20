@@ -41,7 +41,6 @@ interface IqCaptureStatus {
   wavPath?: string;
   metadataPath?: string;
   firstAbsoluteChipStart?: number;
-  firstAbsoluteSampleStart?: number;
   firstSampleSystemTime?: string;
   firstHardwareTimeNs?: number;
   capturedSamples: number;
@@ -180,14 +179,6 @@ export default function RadioPage() {
                   value={
                     capture.firstAbsoluteChipStart !== undefined
                       ? String(capture.firstAbsoluteChipStart)
-                      : "Unavailable"
-                  }
-                />
-                <Stat
-                  label="First Sample"
-                  value={
-                    capture.firstAbsoluteSampleStart !== undefined
-                      ? String(capture.firstAbsoluteSampleStart)
                       : "Unavailable"
                   }
                 />

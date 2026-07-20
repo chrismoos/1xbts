@@ -3,7 +3,7 @@ use std::f32::consts::{FRAC_PI_2, PI};
 
 use cdma_common::crc::{crc6, crc8, crc12};
 use cdma_common::diagnostics::{rc3_lower_rate_diag_enabled_for_walsh, rc3_lower_rate_diag_limit};
-use log::debug;
+use log::{debug, trace};
 use num_complex::Complex32;
 
 use super::{PipelineProcessor, SampleBlock, raw_to_soft};
@@ -796,7 +796,7 @@ impl Rc3FrameAligner {
                 selected_deinterleaved,
             );
 
-            debug!(
+            trace!(
                 "rc3_frame_aligner: emit rate={} chip_start={} fqi_valid={} tail_valid={} preamble={}",
                 decoded.rate.rate_bps(),
                 self.chip_start,
@@ -840,7 +840,7 @@ impl Rc3FrameAligner {
                 None // 5ms frames don't map cleanly to 16 PCGs
             };
             if let Some(ref pcg_db) = pcg_snr_db {
-                debug!(
+                log::trace!(
                     "rc3_frame_aligner[w{}]: pcg_eb_nt chip={} rate={} [{}]",
                     self.walsh_code.unwrap_or(0),
                     frame_chip_start,

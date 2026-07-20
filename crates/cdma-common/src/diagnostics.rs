@@ -106,3 +106,19 @@ pub fn rc3_lower_rate_diag_enabled_for_walsh(walsh_code: u8) -> bool {
 pub fn rc3_lower_rate_diag_limit() -> usize {
     rc3_lower_rate_diag_config().limit
 }
+
+/// Detailed per-window/per-packet HRPD reverse power-control logs.
+/// Set `CDMA_HRPD_RPC_CONTROL_VERBOSE=1` to enable the detailed `rpc_control`
+/// line in addition to the lower-rate aggregate summary.
+pub fn hrpd_rpc_control_verbose() -> bool {
+    static CONFIG: OnceLock<bool> = OnceLock::new();
+    *CONFIG.get_or_init(|| env_bool_or("CDMA_HRPD_RPC_CONTROL_VERBOSE", false))
+}
+
+/// Detailed per-packet HRPD H-ARQ ACK issue logs.
+/// Set `CDMA_HRPD_HARQ_VERBOSE=1` to show individual packet ACK misses/NAKs;
+/// the default live path emits aggregate H-ARQ issue summaries instead.
+pub fn hrpd_harq_verbose() -> bool {
+    static CONFIG: OnceLock<bool> = OnceLock::new();
+    *CONFIG.get_or_init(|| env_bool_or("CDMA_HRPD_HARQ_VERBOSE", false))
+}

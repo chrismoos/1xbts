@@ -100,11 +100,16 @@ impl PcfClient for LegacyPcfClient {
         String,
     > {
         let metadata = cdma_packet::session_task::SessionMetadata {
+            access_technology: "1x".to_string(),
             mobile_address: metadata.mobile_address,
             subscriber_id: metadata.subscriber_id.map(|u| u.to_string()),
             phone_number: metadata.phone_number,
             imsi: metadata.imsi,
             esn: metadata.esn,
+            meid: None,
+            hrpd_mn_id: None,
+            hrpd_mn_id_source: None,
+            subscriber_imsi: None,
             traffic_walsh_code: metadata.traffic_walsh_code,
         };
         let (legacy_uplink_tx, mut legacy_downlink_rx) =
@@ -334,6 +339,10 @@ impl PcfClient for GrpcPcfClient {
                 .unwrap_or_default(),
             phone_number: metadata.phone_number,
             traffic_walsh_code: metadata.traffic_walsh_code,
+            meid: String::new(),
+            hrpd_mn_id: String::new(),
+            hrpd_mn_id_source: proto::HrpdMnIdSource::Unspecified as i32,
+            subscriber_imsi: String::new(),
         };
         client
             .open_session(open_req)

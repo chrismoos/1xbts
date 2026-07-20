@@ -363,12 +363,26 @@ dependencies = [
 name = "cdma-a11"
 version = "0.1.0"
 dependencies = [
+ "md-5",
+ "serde",
+ "tokio",
+]
+
+[[package]]
+name = "cdma-a21"
+version = "0.1.0"
+dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "cdma-a8"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "socket2 0.5.10",
+ "tokio",
+]
 
 [[package]]
 name = "cdma-a9"
@@ -387,6 +401,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "cdma-an"
+version = "0.1.0"
+dependencies = [
+ "cdma-a21",
+ "cdma-a8",
+ "cdma-a9",
+ "cdma-common",
+ "cdma-events",
+ "cdma-hlr",
+ "cdma-packet",
+ "clap",
+ "env_logger",
+ "getrandom 0.2.17",
+ "log",
+ "num-bigint",
+ "prost",
+ "serde",
+ "sha1",
+ "thiserror 1.0.69",
+ "tokio",
+ "tonic 0.13.1",
+ "tonic-build",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "cdma-bsc"
 version = "0.1.0"
 dependencies = [
@@ -394,6 +436,7 @@ dependencies = [
  "async-trait",
  "cdma-a10",
  "cdma-a11",
+ "cdma-a21",
  "cdma-a8",
  "cdma-abis",
  "cdma-bsc",
@@ -471,6 +514,7 @@ dependencies = [
  "num-complex",
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -554,6 +598,11 @@ dependencies = [
 name = "cdma-nib"
 version = "0.1.0"
 dependencies = [
+ "cdma-a10",
+ "cdma-a11",
+ "cdma-a8",
+ "cdma-a9",
+ "cdma-an",
  "cdma-bsc",
  "cdma-bts",
  "cdma-common",
@@ -607,8 +656,10 @@ dependencies = [
  "cdma-a8",
  "cdma-a9",
  "cdma-common",
+ "log",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -617,6 +668,7 @@ version = "0.1.0"
 dependencies = [
  "cdma-a10",
  "cdma-a11",
+ "cdma-a8",
  "cdma-common",
  "cdma-events",
  "cdma-packet",

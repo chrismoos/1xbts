@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
@@ -14,11 +14,12 @@ use crate::ip_allocator::{IpAllocator, SubnetIpAllocator};
 use crate::ip_transport::IpTransportConfig;
 use crate::proto::packet_service_server::PacketService;
 use crate::proto::{
-    CloseSessionRequest, CloseSessionResponse, GetSessionByIpRequest, GetSessionByIpResponse,
-    GetSessionStatusRequest, GetSessionStatusResponse, ListSessionsRequest, ListSessionsResponse,
-    OpenSessionRequest, OpenSessionResponse, PacketSessionDetail, PacketSessionInfo,
-    PacketTraceEvent as ProtoPacketTraceEvent, SessionFrame, SetSchActiveRequest,
-    SetSchActiveResponse, SetSessionCaptureRequest, SetSessionCaptureResponse,
+    AccessTechnology, CloseSessionRequest, CloseSessionResponse, GetSessionByIpRequest,
+    GetSessionByIpResponse, GetSessionStatusRequest, GetSessionStatusResponse, HrpdMnIdSource,
+    ListSessionsRequest, ListSessionsResponse, OpenSessionRequest, OpenSessionResponse,
+    PacketSessionDetail, PacketSessionInfo, PacketTraceEvent as ProtoPacketTraceEvent,
+    SessionFrame, SetSchActiveRequest, SetSchActiveResponse, SetSessionCaptureRequest,
+    SetSessionCaptureResponse,
 };
 use crate::session_lifecycle::{NullSink, SessionLifecycleSink};
 use crate::session_task::{self, PppSessionStore, SessionControl, SessionMetadata, SessionStatus};
@@ -26,21 +27,29 @@ use crate::tun_transport::TunTransport;
 
 const PPP_SESSION_REAPER_MAX_INTERVAL: Duration = Duration::from_secs(60);
 
-#[allow(dead_code)]
-struct SessionEntry {
-    uplink_tx: mpsc::Sender<SessionFrame>,
-    downlink_rx: Arc<Mutex<Option<mpsc::Receiver<SessionFrame>>>>,
+enum SessionBearer {
+    OneX {
+        uplink_tx: mpsc::Sender<SessionFrame>,
+        downlink_rx: Arc<Mutex<Option<mpsc::Receiver<SessionFrame>>>>,
+        /// Out-of-band control sender — F-SCH activation, etc. The session task
+        /// selects on this alongside the bearer channels.
+        control_tx: mpsc::Sender<SessionControl>,
+    },
+    HrpdA10 {
+        uplink_tx: mpsc::Sender<Vec<u8>>,
+        shutdown_tx: oneshot::Sender<()>,
+    },
+}
+
+struct PacketSessionEntry {
+    bearer: SessionBearer,
     status: Arc<Mutex<SessionStatus>>,
     task_handle: JoinHandle<()>,
-    service_option: u32,
-    /// Out-of-band control sender — F-SCH activation, etc. The session task
-    /// selects on this alongside the bearer channels.
-    control_tx: mpsc::Sender<SessionControl>,
 }
 
 #[derive(Clone)]
 pub struct PacketServiceImpl {
-    sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
+    sessions: Arc<Mutex<HashMap<String, PacketSessionEntry>>>,
     transport_config: IpTransportConfig,
     fou_tunnel: Option<Arc<FouTunnel>>,
     fou_tcp_tunnel: Option<Arc<FouTcpTunnel>>,
@@ -176,19 +185,103 @@ impl PacketServiceImpl {
             .await;
         });
 
-        let entry = SessionEntry {
-            uplink_tx: uplink_tx.clone(),
-            downlink_rx: Arc::new(Mutex::new(None)), // consumed by direct caller
+        let entry = PacketSessionEntry {
+            bearer: SessionBearer::OneX {
+                uplink_tx: uplink_tx.clone(),
+                downlink_rx: Arc::new(Mutex::new(None)), // consumed by direct caller
+                control_tx,
+            },
             status,
             task_handle,
-            service_option,
-            control_tx,
         };
 
         {
             let mut sessions = self.sessions.lock().unwrap();
             sessions.insert(session_id, entry);
         }
+
+        Ok((uplink_tx, downlink_rx))
+    }
+
+    /// Open an HRPD A10 Unstructured Byte Stream session and return the A10
+    /// bearer payload channels directly.
+    ///
+    /// The returned uplink sender accepts decapsulated A10 `0x8881`
+    /// byte-stream payload octets from the PCF. The returned downlink receiver
+    /// emits byte-stream payload octets to be keyed-GRE encapsulated toward the
+    /// PCF. HRPD Default Packet RLP wrapping stays on the AN/BTS air side.
+    pub fn open_hrpd_a10_byte_stream_session_direct(
+        &self,
+        session_id: String,
+        service_option: u32,
+        metadata: SessionMetadata,
+    ) -> Result<(mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>), String> {
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            if sessions
+                .get(&session_id)
+                .is_some_and(|entry| entry.task_handle.is_finished())
+            {
+                sessions.remove(&session_id);
+            }
+            if sessions.contains_key(&session_id) {
+                return Err(format!("packet session {} already exists", session_id));
+            }
+        }
+
+        let (uplink_tx, uplink_rx) = mpsc::channel(256);
+        let (downlink_tx, downlink_rx) = mpsc::channel(256);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let status = Arc::new(Mutex::new(SessionStatus::new(
+            service_option,
+            metadata.clone(),
+        )));
+        let sid = session_id.clone();
+        let so = service_option;
+        let transport = self.create_transport();
+        let alloc = Arc::clone(&self.allocator);
+        let sink = Arc::clone(&self.lifecycle_sink);
+        let ppp_store = self.ppp_session_store.clone();
+        let ppp_timeout = self.ppp_session_timeout;
+        let task_status = Arc::clone(&status);
+        let task_handle = tokio::spawn(async move {
+            crate::hrpd_session_task::run_hrpd_a10_byte_stream_session(
+                sid,
+                so,
+                transport,
+                uplink_rx,
+                downlink_tx,
+                shutdown_rx,
+                task_status,
+                alloc,
+                metadata,
+                sink,
+                ppp_store,
+                ppp_timeout,
+            )
+            .await;
+        });
+
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            sessions.insert(
+                session_id.clone(),
+                PacketSessionEntry {
+                    bearer: SessionBearer::HrpdA10 {
+                        uplink_tx: uplink_tx.clone(),
+                        shutdown_tx,
+                    },
+                    status,
+                    task_handle,
+                },
+            );
+        }
+
+        log::info!(
+            "packet-service: opened HRPD A10 byte-stream session {} (SO {})",
+            session_id,
+            service_option
+        );
 
         Ok((uplink_tx, downlink_rx))
     }
@@ -206,10 +299,18 @@ impl PacketServiceImpl {
     ) -> Result<(), String> {
         let control_tx = {
             let sessions = self.sessions.lock().unwrap();
-            sessions
+            let entry = sessions
                 .get(session_id)
-                .map(|entry| entry.control_tx.clone())
-                .ok_or_else(|| format!("session {} not found", session_id))?
+                .ok_or_else(|| format!("session {} not found", session_id))?;
+            match &entry.bearer {
+                SessionBearer::OneX { control_tx, .. } => control_tx.clone(),
+                SessionBearer::HrpdA10 { .. } => {
+                    return Err(format!(
+                        "session {} bearer does not support SCH",
+                        session_id
+                    ));
+                }
+            }
         };
         control_tx
             .send(SessionControl::SetSchActive { active, rate_bps })
@@ -228,26 +329,13 @@ impl PacketServiceImpl {
             sessions.remove(session_id)
         };
         if let Some(entry) = entry {
-            drop(entry.uplink_tx);
-            match tokio::time::timeout(std::time::Duration::from_secs(5), entry.task_handle).await {
-                Ok(Ok(())) => {
-                    log::info!("packet-service: closed session {}", session_id);
-                }
-                Ok(Err(err)) => {
-                    log::warn!(
-                        "packet-service: session {} task panicked on close: {}",
-                        session_id,
-                        err
-                    );
-                }
-                Err(_) => {
-                    log::warn!(
-                        "packet-service: session {} task did not exit within 5s",
-                        session_id
-                    );
-                }
-            }
+            close_session_entry(session_id, entry).await;
         }
+    }
+
+    /// Close an in-process HRPD A10 Unstructured Byte Stream session.
+    pub async fn close_hrpd_a10_byte_stream_session_direct(&self, session_id: &str) {
+        self.close_session_direct(session_id).await;
     }
 
     /// Get a snapshot of session info for a given session.
@@ -304,6 +392,40 @@ impl PacketServiceImpl {
     }
 }
 
+async fn close_session_entry(session_id: &str, entry: PacketSessionEntry) {
+    match entry.bearer {
+        SessionBearer::OneX { uplink_tx, .. } => {
+            drop(uplink_tx);
+        }
+        SessionBearer::HrpdA10 {
+            uplink_tx,
+            shutdown_tx,
+        } => {
+            drop(uplink_tx);
+            let _ = shutdown_tx.send(());
+        }
+    }
+
+    match tokio::time::timeout(std::time::Duration::from_secs(5), entry.task_handle).await {
+        Ok(Ok(())) => {
+            log::info!("packet-service: closed session {}", session_id);
+        }
+        Ok(Err(err)) => {
+            log::warn!(
+                "packet-service: session {} task panicked on close: {}",
+                session_id,
+                err
+            );
+        }
+        Err(_) => {
+            log::warn!(
+                "packet-service: session {} task did not exit within 5s",
+                session_id
+            );
+        }
+    }
+}
+
 fn spawn_ppp_session_reaper(
     store: Arc<PppSessionStore>,
     allocator: Arc<dyn IpAllocator>,
@@ -357,6 +479,36 @@ fn to_proto_trace_event(event: &crate::engine::PacketTraceEvent) -> ProtoPacketT
     }
 }
 
+/// Map the domain access-technology label to the wire enum.
+fn access_technology_to_proto(label: &str) -> i32 {
+    let tech = match label {
+        "HRPD" => AccessTechnology::Hrpd,
+        "1x" => AccessTechnology::Cdma1x,
+        _ => AccessTechnology::Unspecified,
+    };
+    tech as i32
+}
+
+/// Map the domain HRPD MN-ID source label to the wire enum.
+fn hrpd_mn_id_source_to_proto(label: &str) -> i32 {
+    let source = match label {
+        "a11" => HrpdMnIdSource::A11,
+        "derived_hardware" => HrpdMnIdSource::DerivedHardware,
+        _ => HrpdMnIdSource::Unspecified,
+    };
+    source as i32
+}
+
+/// Map the wire HRPD MN-ID source enum back to the domain label, treating the
+/// unspecified variant as absent.
+fn hrpd_mn_id_source_label(value: i32) -> Option<String> {
+    match HrpdMnIdSource::try_from(value).unwrap_or(HrpdMnIdSource::Unspecified) {
+        HrpdMnIdSource::A11 => Some("a11".to_string()),
+        HrpdMnIdSource::DerivedHardware => Some("derived_hardware".to_string()),
+        HrpdMnIdSource::Unspecified => None,
+    }
+}
+
 fn to_proto_session_info(session_id: &str, status: &SessionStatus) -> PacketSessionInfo {
     PacketSessionInfo {
         session_id: session_id.to_string(),
@@ -379,11 +531,18 @@ fn to_proto_session_info(session_id: &str, status: &SessionStatus) -> PacketSess
         mobile_address: status.mobile_address.clone(),
         subscriber_id: status.subscriber_id.clone(),
         phone_number: status.phone_number.clone(),
+        imsi: status.imsi.clone(),
+        esn: status.esn,
+        meid: status.meid.clone(),
+        hrpd_mn_id: status.hrpd_mn_id.clone(),
+        hrpd_mn_id_source: hrpd_mn_id_source_to_proto(&status.hrpd_mn_id_source),
+        subscriber_imsi: status.subscriber_imsi.clone(),
         traffic_walsh_code: status.traffic_walsh_code,
         rlp_state: status.rlp_state.clone(),
         lcp_state: status.lcp_state.clone(),
         ipcp_state: status.ipcp_state.clone(),
         capture_enabled: status.capture_enabled,
+        access_technology: access_technology_to_proto(&status.access_technology),
     }
 }
 
@@ -432,11 +591,16 @@ impl PacketService for PacketServiceImpl {
         let (control_tx, control_rx) = mpsc::channel::<SessionControl>(8);
 
         let metadata = SessionMetadata {
+            access_technology: "1x".to_string(),
             mobile_address: req.mobile_address.clone(),
             subscriber_id: (!req.subscriber_id.is_empty()).then(|| req.subscriber_id.clone()),
             phone_number: req.phone_number.clone(),
             imsi: (!req.imsi.is_empty()).then(|| req.imsi.clone()),
             esn: (req.esn != 0).then_some(req.esn),
+            meid: (!req.meid.is_empty()).then(|| req.meid.clone()),
+            hrpd_mn_id: (!req.hrpd_mn_id.is_empty()).then(|| req.hrpd_mn_id.clone()),
+            hrpd_mn_id_source: hrpd_mn_id_source_label(req.hrpd_mn_id_source),
+            subscriber_imsi: (!req.subscriber_imsi.is_empty()).then(|| req.subscriber_imsi.clone()),
             traffic_walsh_code: req.traffic_walsh_code,
         };
         let status = Arc::new(Mutex::new(SessionStatus::new(
@@ -470,13 +634,14 @@ impl PacketService for PacketServiceImpl {
             .await;
         });
 
-        let entry = SessionEntry {
-            uplink_tx,
-            downlink_rx: Arc::new(Mutex::new(Some(downlink_rx))),
+        let entry = PacketSessionEntry {
+            bearer: SessionBearer::OneX {
+                uplink_tx,
+                downlink_rx: Arc::new(Mutex::new(Some(downlink_rx))),
+                control_tx,
+            },
             status,
             task_handle,
-            service_option: req.service_option,
-            control_tx,
         };
 
         {
@@ -505,12 +670,7 @@ impl PacketService for PacketServiceImpl {
 
         match entry {
             Some(entry) => {
-                // Drop the uplink sender -- this causes the session task to exit
-                drop(entry.uplink_tx);
-                // Wait for the task to finish (with timeout)
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), entry.task_handle)
-                    .await;
-                log::info!("packet-service: closed session {}", req.session_id);
+                close_session_entry(&req.session_id, entry).await;
                 Ok(Response::new(CloseSessionResponse {}))
             }
             None => Err(Status::not_found(format!(
@@ -544,13 +704,27 @@ impl PacketService for PacketServiceImpl {
             let entry = sessions
                 .get(&session_id)
                 .ok_or_else(|| Status::not_found(format!("session {} not found", session_id)))?;
-            let downlink_rx = entry.downlink_rx.lock().unwrap().take().ok_or_else(|| {
-                Status::already_exists(format!(
-                    "session {} already has an active stream",
-                    session_id
-                ))
-            })?;
-            (entry.uplink_tx.clone(), downlink_rx)
+            match &entry.bearer {
+                SessionBearer::OneX {
+                    uplink_tx,
+                    downlink_rx,
+                    ..
+                } => {
+                    let downlink_rx = downlink_rx.lock().unwrap().take().ok_or_else(|| {
+                        Status::already_exists(format!(
+                            "session {} already has an active stream",
+                            session_id
+                        ))
+                    })?;
+                    (uplink_tx.clone(), downlink_rx)
+                }
+                SessionBearer::HrpdA10 { .. } => {
+                    return Err(Status::failed_precondition(format!(
+                        "session {} uses an A10 byte-stream bearer, not RLP SessionFrame streaming",
+                        session_id
+                    )));
+                }
+            }
         };
 
         // Forward the first frame
@@ -659,5 +833,80 @@ mod tests {
             ppp_session_reaper_interval(Duration::from_secs(1800)),
             Duration::from_secs(60)
         );
+    }
+
+    #[tokio::test]
+    async fn hrpd_a10_sessions_are_visible_in_common_session_list() {
+        let service = PacketServiceImpl::new(
+            crate::ip_transport::IpTransportConfig::FouTcp {
+                remote_addr: "127.0.0.1:1".parse().unwrap(),
+            },
+            None,
+            Some(crate::fou_tcp_transport::FouTcpTunnel::new(
+                "127.0.0.1:1".parse().unwrap(),
+            )),
+        );
+        let session_id = "hrpd-a10-test".to_string();
+        let (_uplink_tx, _downlink_rx) = service
+            .open_hrpd_a10_byte_stream_session_direct(
+                session_id.clone(),
+                u32::from(cdma_common::consts::SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+                SessionMetadata {
+                    access_technology: "HRPD".to_string(),
+                    mobile_address: "hrpd-uati-session:0000002a".to_string(),
+                    subscriber_id: None,
+                    phone_number: String::new(),
+                    imsi: None,
+                    esn: None,
+                    meid: None,
+                    hrpd_mn_id: Some("310556898017332".to_string()),
+                    hrpd_mn_id_source: Some("a11".to_string()),
+                    subscriber_imsi: None,
+                    traffic_walsh_code: 42,
+                },
+            )
+            .expect("open HRPD A10 session");
+
+        let listed = service
+            .list_all_sessions()
+            .into_iter()
+            .find(|session| session.session_id == session_id)
+            .expect("HRPD A10 session should be in common list");
+        assert_eq!(listed.access_technology(), AccessTechnology::Hrpd);
+        assert_eq!(listed.imsi, "");
+        assert_eq!(listed.hrpd_mn_id, "310556898017332");
+        assert_eq!(listed.hrpd_mn_id_source(), HrpdMnIdSource::A11);
+
+        for _ in 0..20 {
+            let ready = service
+                .get_session_info(&session_id)
+                .is_some_and(|session| !session.peer_ip.is_empty());
+            if ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let detail = service
+            .get_session_detail(&session_id)
+            .expect("HRPD A10 detail should be available");
+        let summary = detail.summary.expect("detail should have summary");
+        assert_eq!(summary.access_technology(), AccessTechnology::Hrpd);
+        assert!(!summary.peer_ip.is_empty());
+        assert_eq!(
+            service
+                .find_session_by_peer_ip(&summary.peer_ip)
+                .expect("peer IP lookup should include HRPD sessions")
+                .session_id,
+            session_id
+        );
+        let sch_error = service
+            .set_session_sch_active(&session_id, true, 19_200)
+            .await
+            .expect_err("HRPD A10 session should reject 1x SCH control");
+        assert!(sch_error.contains("does not support SCH"));
+
+        service
+            .close_hrpd_a10_byte_stream_session_direct(&session_id)
+            .await;
     }
 }

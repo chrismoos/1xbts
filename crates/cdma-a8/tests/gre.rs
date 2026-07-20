@@ -1,8 +1,10 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 use cdma_a8::{
-    ApplySessionOutcome, BearerEndpoint, BearerProfile, BearerSession, BearerTable, Error,
-    GrePacket, RebindMode, RebindOutcome, SessionSnapshot, SessionStats,
+    ApplySessionOutcome, BearerEndpoint, BearerProfile, BearerSession, BearerTable,
+    BearerTransportConfig, BearerTransportMode, Error, GrePacket, RebindMode, RebindOutcome,
+    SessionSnapshot, SessionStats, UdpGreEndpoint,
 };
 
 #[test]
@@ -30,6 +32,105 @@ fn gre_ppp_roundtrip() {
         ]
     );
     assert_eq!(GrePacket::decode(&encoded).unwrap(), packet);
+}
+
+#[test]
+fn bearer_transport_config_models_raw_and_udp_exact_gre() {
+    let raw = BearerTransportConfig::raw_gre();
+    assert_eq!(raw.mode, BearerTransportMode::RawGre);
+    raw.validate("a8").unwrap();
+
+    let bind: SocketAddr = "127.0.0.1:17040".parse().unwrap();
+    let peer: SocketAddr = "127.0.0.1:17041".parse().unwrap();
+    let udp = BearerTransportConfig::udp_encapsulated_gre(bind, peer);
+    assert_eq!(udp.mode, BearerTransportMode::UdpEncapsulatedGre);
+    assert_eq!(udp.udp_bind_addr, Some(bind));
+    assert_eq!(udp.udp_peer_addr, Some(peer));
+    udp.validate("a8").unwrap();
+}
+
+#[test]
+fn bearer_transport_config_rejects_mixed_outer_modes() {
+    let mut raw = BearerTransportConfig::raw_gre();
+    raw.udp_bind_addr = Some("127.0.0.1:17040".parse().unwrap());
+    assert!(raw.validate("a8").unwrap_err().contains("raw_gre"));
+
+    let mut udp = BearerTransportConfig {
+        mode: BearerTransportMode::UdpEncapsulatedGre,
+        ..BearerTransportConfig::raw_gre()
+    };
+    assert!(udp.validate("a8").unwrap_err().contains("udp_bind_addr"));
+    udp.udp_bind_addr = Some("127.0.0.1:17040".parse().unwrap());
+    assert!(udp.validate("a8").unwrap_err().contains("udp_peer_addr"));
+}
+
+#[test]
+fn udp_gre_endpoint_carries_exact_encoded_gre_packet() {
+    let left_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let right_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let left_addr = left_socket.local_addr().unwrap();
+    let right_addr = right_socket.local_addr().unwrap();
+    left_socket
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
+    right_socket
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
+
+    let left = UdpGreEndpoint::from_socket(left_socket, right_addr);
+    let right = UdpGreEndpoint::from_socket(right_socket, left_addr);
+    let packet = GrePacket::octet_stream(0x0102_0304, Some(17), [0xde, 0xad, 0xbe, 0xef]);
+    let encoded = packet.encode().unwrap();
+
+    assert_eq!(left.send_gre_packet(&packet).unwrap(), encoded.len());
+    let mut buf = [0_u8; 128];
+    let (decoded, from) = right.recv_gre_packet(&mut buf).unwrap();
+    assert_eq!(from, left_addr);
+    assert_eq!(decoded, packet);
+
+    assert_eq!(right.send_wire_packet(&encoded).unwrap(), encoded.len());
+    let (decoded, from) = left.recv_gre_packet(&mut buf).unwrap();
+    assert_eq!(from, right_addr);
+    assert_eq!(decoded, packet);
+}
+
+#[tokio::test]
+async fn tokio_udp_gre_endpoint_waits_for_readiness_and_drains_nonblocking() {
+    let left_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let right_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let left_addr = left_socket.local_addr().unwrap();
+    let right_addr = right_socket.local_addr().unwrap();
+    let left = UdpGreEndpoint::from_socket(left_socket, right_addr)
+        .into_tokio()
+        .unwrap();
+    let right = UdpGreEndpoint::from_socket(right_socket, left_addr)
+        .into_tokio()
+        .unwrap();
+    let packet = GrePacket::octet_stream(0x0102_0304, Some(23), [0xca, 0xfe]);
+
+    let mut buf = [0_u8; 128];
+    assert!(matches!(
+        right.try_recv_gre_packet(&mut buf),
+        Err(Error::UdpTransport(err)) if err.to_ascii_lowercase().contains("temporarily unavailable")
+            || err.to_ascii_lowercase().contains("would block")
+    ));
+    left.send_gre_packet(&packet).await.unwrap();
+    tokio::time::timeout(Duration::from_millis(250), right.readable())
+        .await
+        .unwrap()
+        .unwrap();
+    let (decoded, from) = right.try_recv_gre_packet(&mut buf).unwrap();
+    assert_eq!(from, left_addr);
+    assert_eq!(decoded, packet);
+
+    right.send_gre_packet(&packet).await.unwrap();
+    let (decoded, from) =
+        tokio::time::timeout(Duration::from_millis(250), left.recv_gre_packet(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(from, right_addr);
+    assert_eq!(decoded, packet);
 }
 
 #[test]

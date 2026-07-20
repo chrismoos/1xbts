@@ -576,7 +576,7 @@ impl Layer2Lac {
                     remaining_payload_bits,
                 )
             {
-                debug!(
+                trace!(
                     "lac_fpch_defer_overhead_for_slot_gpm: chip={} slot_num={} tag={} epdu_bits={} payload_until_slot_end={}",
                     chip_cursor,
                     cdma_common::paging::slot_num_from_chips(chip_cursor, 1_228_800),
@@ -2606,7 +2606,13 @@ mod tests {
         let overhead = OverheadParameters::default();
         let paging = PagingChannelSettings::default();
         let paging_state = Arc::new(Mutex::new(PagingSupplierState::new(0x03ff, 0x7f)));
-        lac.set_paging_supplier(build_bts_paging_supplier(overhead, paging, 0, paging_state));
+        lac.set_paging_supplier(build_bts_paging_supplier(
+            overhead,
+            paging,
+            0,
+            None,
+            paging_state,
+        ));
 
         let general_page_type = MessageId::GeneralPage
             .wire_type(WireChannel::ForwardCommon)
@@ -2713,6 +2719,7 @@ mod tests {
             overhead,
             paging,
             0,
+            None,
             paging_state.clone(),
         ));
 

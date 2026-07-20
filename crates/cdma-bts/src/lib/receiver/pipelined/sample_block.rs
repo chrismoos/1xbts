@@ -1,6 +1,32 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use num_complex::Complex32;
+
+/// Monotonic host-time anchor for an absolute RX sample position.
+#[derive(Clone, Copy, Debug)]
+pub struct RxSampleTimeAnchor {
+    pub absolute_sample_end: u64,
+    pub received_at: Instant,
+}
+
+impl RxSampleTimeAnchor {
+    /// Estimate when an earlier sample reached the host from this block-end anchor.
+    pub fn received_at_sample(self, absolute_sample: u64, sample_rate_hz: f64) -> Option<Instant> {
+        if absolute_sample > self.absolute_sample_end
+            || !sample_rate_hz.is_finite()
+            || sample_rate_hz <= 0.0
+        {
+            return None;
+        }
+        let age = Duration::from_secs_f64(
+            self.absolute_sample_end.saturating_sub(absolute_sample) as f64 / sample_rate_hz,
+        );
+        self.received_at.checked_sub(age)
+    }
+}
 
 /// A contiguous block of samples with shared block-level metadata.
 ///
@@ -12,6 +38,8 @@ pub struct SampleBlock {
     pub chip_start: usize,
     /// Effective sample rate for this block's `samples`.
     pub sample_rate_hz: f64,
+    /// Absolute RX sample/host-time mapping for latency diagnostics.
+    pub rx_sample_time: Option<RxSampleTimeAnchor>,
     pub tags: HashMap<&'static str, i64>,
     /// Per-Power-Control-Group signal metric, in dB. Reverse traffic decoders
     /// populate this on decoded 20 ms frames with 16 entries (one per PCG,
@@ -50,6 +78,7 @@ impl SampleBlock {
             samples,
             chip_start,
             sample_rate_hz: 0.0,
+            rx_sample_time: None,
             tags: HashMap::new(),
             pcg_signal_snr_db: None,
             active_pcg_mask: None,

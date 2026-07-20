@@ -297,6 +297,98 @@ impl ProcedureEngine {
         self.sessions.get(con_ref)
     }
 
+    /// Retargets a connected A8 procedure to the `ConRef` and `A8_Traffic_ID`
+    /// carried by a fresh `SetupA8`/`ConnectA8` exchange.
+    ///
+    /// This is used when the PCF keeps the packet-side A10 session alive while
+    /// the AN reacquires HRPD traffic under a new MAC index. The over-the-wire
+    /// boundary is still A9: the BSC sends `SetupA8`, the PCF sends `ConnectA8`,
+    /// and the procedure engine updates its local key so later `DisconnectA8`
+    /// and `ReleaseA8` messages validate against the retargeted connection.
+    pub fn retarget_connected_a8(
+        &mut self,
+        setup: &SetupA8Message,
+        connect: &ConnectA8Message,
+    ) -> Result<ProcedureEvent> {
+        self.retarget_connected_a8_from(&setup.a8_traffic_id, setup, connect)
+    }
+
+    /// Retargets a connected A8 procedure identified by an existing traffic ID
+    /// to the `ConRef` and `A8_Traffic_ID` carried by a fresh A9 exchange.
+    pub fn retarget_connected_a8_from(
+        &mut self,
+        existing_traffic_id: &A8TrafficId,
+        setup: &SetupA8Message,
+        connect: &ConnectA8Message,
+    ) -> Result<ProcedureEvent> {
+        if setup.a8_traffic_id != connect.a8_traffic_id {
+            return Err(Error::TrafficIdMismatch {
+                expected: setup.a8_traffic_id.key,
+                actual: connect.a8_traffic_id.key,
+            });
+        }
+        if setup.con_ref != connect.con_ref {
+            return Err(Error::InvalidProcedureState {
+                message_type: MessageType::ConnectA8,
+                state: "retargeted connect does not match setup connection reference",
+            });
+        }
+        if setup.call_connection_reference != connect.call_connection_reference {
+            return Err(Error::InvalidProcedureState {
+                message_type: MessageType::ConnectA8,
+                state: "retargeted connect call reference does not match setup request",
+            });
+        }
+        if setup.correlation_id != connect.correlation_id {
+            return Err(Error::InvalidProcedureState {
+                message_type: MessageType::ConnectA8,
+                state: "retargeted connect correlation does not match setup request",
+            });
+        }
+
+        let old_traffic_key = traffic_key(existing_traffic_id);
+        let new_traffic_key = traffic_key(&setup.a8_traffic_id);
+        let old_con_ref = self
+            .traffic_index
+            .get(&old_traffic_key)
+            .cloned()
+            .ok_or(Error::UnknownTrafficId(existing_traffic_id.key))?;
+        let new_con_ref = con_ref_key(&setup.con_ref);
+        if old_con_ref != new_con_ref && self.sessions.contains_key(&new_con_ref) {
+            return Err(Error::DuplicateSession);
+        }
+        if old_traffic_key != new_traffic_key && self.traffic_index.contains_key(&new_traffic_key) {
+            return Err(Error::DuplicateTrafficId(setup.a8_traffic_id.key));
+        }
+
+        let mut session = self
+            .sessions
+            .get(&old_con_ref)
+            .cloned()
+            .ok_or(Error::UnknownSession)?;
+        ensure_matching_traffic_id(&session, existing_traffic_id)?;
+        if !matches!(session.phase, SessionPhase::Connected) {
+            return Err(Error::InvalidProcedureState {
+                message_type: MessageType::SetupA8,
+                state: "retarget requires a connected A8 session",
+            });
+        }
+
+        self.sessions.remove(&old_con_ref);
+        self.remove_indexes(&old_con_ref, &session);
+        session.con_ref = setup.con_ref;
+        session.call_connection_reference = setup.call_connection_reference;
+        session.correlation_id = setup.correlation_id;
+        session.a8_traffic_id = setup.a8_traffic_id.clone();
+        self.insert_indexes(&new_con_ref, &session);
+        self.sessions.insert(new_con_ref.clone(), session.clone());
+        Ok(ProcedureEvent::SessionUpdated {
+            con_ref: new_con_ref,
+            phase: session.phase,
+            access_link_phase: session.access_link_phase,
+        })
+    }
+
     /// Returns the BS service phase.
     pub fn bs_service_phase(&self) -> &BsServicePhase {
         &self.bs_service_phase
@@ -1613,5 +1705,127 @@ fn ensure_optional_scalar_match<T: Copy + PartialEq>(
             state: unexpected_state,
         }),
         (None, None) => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{A8TrafficId, A9Indicators, BscId, CauseValue, PdsnIpAddress};
+
+    fn setup(con_ref: u8, key: u32, correlation: [u8; 4]) -> SetupA8Message {
+        SetupA8Message {
+            call_connection_reference: Some(CallConnectionReference::new(1, 2, u32::from(con_ref))),
+            correlation_id: Some(CorrelationId(correlation)),
+            imsi: Some("001010123456789".to_string()),
+            esn: None,
+            meid: None,
+            con_ref: ConRef(con_ref),
+            quality_of_service_parameters: None,
+            bsc_id: BscId(vec![1]),
+            a8_traffic_id: A8TrafficId::gre_ppp(key, [127, 0, 0, 1]),
+            service_option: ServiceOptionValue::HIGH_RATE_PACKET_DATA,
+            a9_indicators: A9Indicators::default(),
+            user_zone_id: None,
+        }
+    }
+
+    fn connect(setup: &SetupA8Message) -> ConnectA8Message {
+        ConnectA8Message {
+            call_connection_reference: setup.call_connection_reference,
+            correlation_id: setup.correlation_id,
+            imsi: setup.imsi.clone(),
+            esn: setup.esn,
+            meid: setup.meid,
+            con_ref: setup.con_ref,
+            a8_traffic_id: setup.a8_traffic_id.clone(),
+            cause: CauseValue(0x13),
+            pdsn_ip_address: Some(PdsnIpAddress([127, 0, 0, 2])),
+        }
+    }
+
+    fn disconnect(setup: &SetupA8Message) -> DisconnectA8Message {
+        DisconnectA8Message {
+            call_connection_reference: setup.call_connection_reference,
+            correlation_id: setup.correlation_id,
+            imsi: setup.imsi.clone(),
+            esn: setup.esn,
+            meid: setup.meid,
+            con_ref: setup.con_ref,
+            a8_traffic_id: setup.a8_traffic_id.clone(),
+            cause: CauseValue(0x77),
+        }
+    }
+
+    #[test]
+    fn retarget_connected_a8_moves_procedure_to_new_con_ref() {
+        let mut engine = ProcedureEngine::new(ProcedureRole::Pcf);
+        let initial_setup = setup(5, 0x1a05_8001, [1, 2, 3, 4]);
+        let initial_connect = connect(&initial_setup);
+        engine
+            .apply_inbound(ProcedureMessage::SetupA8(initial_setup.clone()))
+            .unwrap();
+        engine
+            .apply_outbound(ProcedureMessage::ConnectA8(initial_connect))
+            .unwrap();
+
+        let retarget_setup = setup(6, 0x1a05_8001, [5, 6, 7, 8]);
+        let retarget_connect = connect(&retarget_setup);
+        engine
+            .retarget_connected_a8(&retarget_setup, &retarget_connect)
+            .unwrap();
+
+        assert!(engine.session(&[5]).is_none());
+        assert_eq!(
+            engine.session(&[6]).map(Session::phase),
+            Some(SessionPhase::Connected)
+        );
+        assert!(matches!(
+            engine.apply_outbound(ProcedureMessage::DisconnectA8(disconnect(&initial_setup))),
+            Err(Error::UnknownSession)
+        ));
+        assert!(
+            engine
+                .apply_outbound(ProcedureMessage::DisconnectA8(disconnect(&retarget_setup)))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn retarget_connected_a8_can_move_to_new_traffic_id() {
+        let mut engine = ProcedureEngine::new(ProcedureRole::Pcf);
+        let initial_setup = setup(5, 0x1a05_8001, [1, 2, 3, 4]);
+        engine
+            .apply_inbound(ProcedureMessage::SetupA8(initial_setup.clone()))
+            .unwrap();
+        engine
+            .apply_outbound(ProcedureMessage::ConnectA8(connect(&initial_setup)))
+            .unwrap();
+
+        let retarget_setup = setup(6, 0x1a05_8002, [5, 6, 7, 8]);
+        engine
+            .retarget_connected_a8_from(
+                &initial_setup.a8_traffic_id,
+                &retarget_setup,
+                &connect(&retarget_setup),
+            )
+            .unwrap();
+
+        assert!(
+            engine
+                .session_by_traffic_id(&initial_setup.a8_traffic_id)
+                .is_none()
+        );
+        assert_eq!(
+            engine
+                .session_by_traffic_id(&retarget_setup.a8_traffic_id)
+                .map(Session::phase),
+            Some(SessionPhase::Connected)
+        );
+        assert!(
+            engine
+                .apply_outbound(ProcedureMessage::DisconnectA8(disconnect(&retarget_setup)))
+                .is_ok()
+        );
     }
 }

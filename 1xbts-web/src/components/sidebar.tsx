@@ -15,6 +15,7 @@ const links = [
   { href: "/prls", label: "PRLs" },
   { href: "/smsc", label: "SMSC" },
   { href: "/packets", label: "Packets" },
+  { href: "/hrpd", label: "HRPD Sessions" },
   { href: "/config", label: "Config" },
 ];
 

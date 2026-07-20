@@ -3,6 +3,8 @@ pub mod engine;
 pub mod fou_tcp_transport;
 pub mod fou_transport;
 pub mod grpc;
+pub mod hrpd_session_task;
+pub mod hrpd_stream_transport;
 pub mod ip_allocator;
 pub mod ip_transport;
 pub mod mobile_ip;

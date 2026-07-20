@@ -413,6 +413,25 @@ fn identity_key_to_proto(value: &MobileIdentityKey) -> proto::MobileIdentityKey 
     }
 }
 
+fn resolved_from_proto(
+    subscriber: Option<proto::Subscriber>,
+    primary_identity: Option<proto::SubscriberIdentity>,
+    binding: Option<proto::RegistrationBinding>,
+) -> Result<Option<ResolvedSubscriber>, String> {
+    let Some(subscriber_proto) = subscriber else {
+        return Ok(None);
+    };
+    let subscriber = subscriber_from_proto(subscriber_proto)?;
+    let primary_identity = primary_identity.map(identity_from_proto).transpose()?;
+    let binding = binding.map(binding_from_proto).transpose()?;
+    Ok(Some(ResolvedSubscriber {
+        subscriber,
+        identities: Vec::new(),
+        primary_identity,
+        binding,
+    }))
+}
+
 fn binding_from_proto(value: proto::RegistrationBinding) -> Result<RegistrationBinding, String> {
     Ok(RegistrationBinding {
         subscriber_id: Uuid::parse_str(&value.subscriber_id)
@@ -710,24 +729,14 @@ impl HlrRepository for GrpcHlrRepository {
             .await
             .map_err(|e| format!("HLR ResolveSubscriberByIdentity: {e}"))?
             .into_inner();
-        let Some(subscriber_proto) = response.subscriber else {
-            return Ok(None);
-        };
-        let subscriber = subscriber_from_proto(subscriber_proto)?;
-        let primary_identity = response
-            .primary_identity
-            .map(identity_from_proto)
-            .transpose()?;
-        let binding = response.binding.map(binding_from_proto).transpose()?;
         // The resolve response intentionally doesn't include the full
         // identity list — only the primary one. Callers that need the
         // whole list should use GetSubscriber.
-        Ok(Some(ResolvedSubscriber {
-            subscriber,
-            identities: Vec::new(),
-            primary_identity,
-            binding,
-        }))
+        resolved_from_proto(
+            response.subscriber,
+            response.primary_identity,
+            response.binding,
+        )
     }
 
     async fn resolve_by_hardware_identity(
@@ -739,28 +748,20 @@ impl HlrRepository for GrpcHlrRepository {
         let response = client
             .resolve_subscriber_by_hardware_identity(
                 proto::ResolveSubscriberByHardwareIdentityRequest {
-                    esn,
-                    meid: meid.map(ToOwned::to_owned),
+                    identity: Some(proto::HardwareIdentityKey {
+                        esn,
+                        meid: meid.map(ToOwned::to_owned),
+                    }),
                 },
             )
             .await
             .map_err(|e| format!("HLR ResolveSubscriberByHardwareIdentity: {e}"))?
             .into_inner();
-        let Some(subscriber_proto) = response.subscriber else {
-            return Ok(None);
-        };
-        let subscriber = subscriber_from_proto(subscriber_proto)?;
-        let primary_identity = response
-            .primary_identity
-            .map(identity_from_proto)
-            .transpose()?;
-        let binding = response.binding.map(binding_from_proto).transpose()?;
-        Ok(Some(ResolvedSubscriber {
-            subscriber,
-            identities: Vec::new(),
-            primary_identity,
-            binding,
-        }))
+        resolved_from_proto(
+            response.subscriber,
+            response.primary_identity,
+            response.binding,
+        )
     }
 
     async fn upsert_mobile_seen(

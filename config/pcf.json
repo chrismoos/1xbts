@@ -1,3 +1,22 @@
 {
-  "packet_grpc_endpoint": "http://127.0.0.1:17021"
+  "packet_grpc_endpoint": "http://127.0.0.1:17021",
+  "a9_bind_addr": "127.0.0.1:17046",
+  "a8_bearer": {
+    "mode": "udp_encapsulated_gre",
+    "udp_bind_addr": "127.0.0.1:17041",
+    "udp_peer_addr": "127.0.0.1:17040"
+  },
+  "a10_bearer": {
+    "mode": "udp_encapsulated_gre",
+    "udp_bind_addr": "127.0.0.1:17042",
+    "udp_peer_addr": "127.0.0.1:17043"
+  },
+  "a11": {
+    "bind_addr": "127.0.0.1:17044",
+    "peer_addr": "127.0.0.1:17045"
+  },
+  "a11_security": {
+    "spi": 256,
+    "shared_secret_hex": "31786274732d6131312d7368617265642d736563726574"
+  }
 }

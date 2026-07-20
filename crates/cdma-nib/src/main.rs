@@ -1,26 +1,57 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, thread};
 
+use cdma_an::HrpdDerivedImsiConfig;
 use cdma_bsc::{
     config::{self, BscNodeConfig, ManagementConfig, validate_page_chan_alignment},
     grpc::run_grpc_server,
 };
 use cdma_bts::bts::{
     BtsLaunchOptions, BtsNodeConfig, RadioBuildOptions, build_bts_launch_parts,
-    build_radio_from_config, load_radio_from_path, spawn_configured_local_abis_endpoint,
+    build_radio_from_config, evdo, load_radio_from_path, resolve_reverse_rx_plan,
+    spawn_configured_local_abis_endpoint,
 };
 use cdma_common::error::Error;
 use cdma_events::EventsNodeConfig;
 use cdma_hlr::{HlrNodeConfig, repository::GrpcHlrRepository};
 use cdma_msc::{MscRuntime, MscRuntimeConfig, StaticVoicePolicy};
-use cdma_pdsn::PdsnNodeConfig;
+use cdma_pcf::spawn_hrpd_pcf_a9_service;
+use cdma_pdsn::{PdsnNodeConfig, spawn_hrpd_pdsn_a11_service};
 use cdma_smsc::{SmscNodeConfig, repository::GrpcSmscRepository};
 use clap::Parser;
 use log::{info, warn};
 use tracing_subscriber::{EnvFilter, prelude::*, util::SubscriberInitExt};
 
 mod debug_dump;
+use cdma_nib::hrpd_bridge::*;
 
 const DEFAULT_LOG_FILTER: &str = "info";
+const DEFAULT_LOG_CLAMPS: &[&str] = &[
+    "sqlx=warn",
+    "h2=warn",
+    "hyper=warn",
+    "hyper_util=warn",
+    "tower=warn",
+    "tonic=warn",
+];
+const DEFAULT_GLOBAL_DEBUG_PROFILE: &[&str] = &[
+    DEFAULT_LOG_FILTER,
+    "cdma_packet=debug",
+    "cdma_an=debug",
+    "cdma_bsc::bsc::packet=debug",
+    "cdma_bsc::bsc::traffic_forward=debug",
+    "cdma_bsc::bsc::traffic_signaling=debug",
+    "cdma_bsc::bsc::access=debug",
+    "cdma_bts::bts::abis_agent=debug",
+    "cdma_bts::bts::evdo=debug",
+    "cdma_bts::bts::hrpd=debug",
+    "cdma_bts::receiver::hrpd::reverse_traffic_rake=debug",
+    "cdma_abis::transport=debug",
+    "cdma_pcf=debug",
+    "cdma_pdsn=debug",
+];
+// Rev 0 Forward Traffic MAC packets have 1000 security-layer bits after the
+// two-bit MAC trailer. Format-B length + Stream header + 22-bit RLP sequence
+// leaves 121 octets for one Default Packet RLP payload.
 
 #[derive(Parser, Debug)]
 #[command(
@@ -36,6 +67,10 @@ struct Cli {
     /// Path to a radio-only config JSON. Overrides the radio config referenced by `bts.json`.
     #[arg(long, value_name = "CONFIG")]
     radio_config: Option<PathBuf>,
+
+    /// Path to a BTS config JSON. Overrides `<config-dir>/bts.json`.
+    #[arg(long, value_name = "CONFIG")]
+    bts_config: Option<PathBuf>,
 
     /// Use a null radio that drops all TX samples and provides no RX.
     #[arg(long)]
@@ -62,10 +97,56 @@ fn resolve_config_dir(cli: &Cli) -> PathBuf {
 }
 
 fn effective_log_filter() -> String {
-    std::env::var("RUST_LOG")
+    let filter = std::env::var("RUST_LOG")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_LOG_FILTER.to_string())
+        .unwrap_or_else(|| DEFAULT_LOG_FILTER.to_string());
+    apply_default_log_clamps(&filter)
+}
+
+fn apply_default_log_clamps(filter: &str) -> String {
+    let requested_directives = filter
+        .split(',')
+        .map(str::trim)
+        .filter(|directive| !directive.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let global_debug_requested = requested_directives
+        .iter()
+        .any(|directive| matches!(directive.as_str(), "debug" | "trace"));
+    let mut directives = Vec::new();
+
+    if global_debug_requested {
+        directives.extend(
+            DEFAULT_GLOBAL_DEBUG_PROFILE
+                .iter()
+                .map(|entry| entry.to_string()),
+        );
+    }
+
+    directives.extend(
+        requested_directives
+            .into_iter()
+            .filter(|directive| !matches!(directive.as_str(), "debug" | "trace")),
+    );
+
+    for clamp in DEFAULT_LOG_CLAMPS {
+        let target = clamp
+            .split_once('=')
+            .map(|(target, _)| target)
+            .unwrap_or(clamp);
+        let target_already_configured = directives.iter().any(|directive| {
+            directive
+                .split_once('=')
+                .map(|(configured_target, _)| configured_target.trim() == target)
+                .unwrap_or(false)
+        });
+        if !target_already_configured {
+            directives.push((*clamp).to_string());
+        }
+    }
+
+    directives.join(",")
 }
 
 fn init_logging(enable_tokio_console: bool) {
@@ -98,11 +179,18 @@ async fn main() -> Result<(), Error> {
     let cli = Cli::parse();
     let config_dir = resolve_config_dir(&cli);
 
-    let mut bts_config =
-        BtsNodeConfig::load_from_path(&config_dir.join(config::BTS_CONFIG_FILENAME))?;
-    if let Some(radio_config_path) = &cli.radio_config {
-        bts_config.radio = load_radio_from_path(radio_config_path)?;
-    }
+    let bts_config_path = cli
+        .bts_config
+        .clone()
+        .unwrap_or_else(|| config_dir.join(config::BTS_CONFIG_FILENAME));
+    let bts_config = if let Some(radio_config_path) = &cli.radio_config {
+        BtsNodeConfig::load_from_path_with_radio_override(
+            &bts_config_path,
+            load_radio_from_path(radio_config_path)?,
+        )?
+    } else {
+        BtsNodeConfig::load_from_path(&bts_config_path)?
+    };
     let bsc_config = BscNodeConfig::load_from_path(&config_dir.join(config::BSC_CONFIG_FILENAME))?;
     let msc_config =
         cdma_msc::MscNodeConfig::load_from_path(&config_dir.join(config::MSC_CONFIG_FILENAME))
@@ -141,6 +229,9 @@ async fn main() -> Result<(), Error> {
     debug_dump::install_stack_dump_on_sigusr1();
 
     info!("Loading per-node configs from {}", config_dir.display());
+    if let Some(path) = &cli.bts_config {
+        info!("BTS config overridden from {}", path.display());
+    }
     if cli.radio_config.is_some() {
         info!("Radio config overridden from CLI");
     }
@@ -161,15 +252,16 @@ async fn main() -> Result<(), Error> {
 
     // Radio and BTS
     info!("Starting BTS/BSC/MSC stack (network-in-a-box)");
-    let rx_freq_hz = bts_config
-        .radio
-        .rx_freq_hz_override()
-        .unwrap_or_else(|| bts_config.channel.uplink_hz() as usize);
+    let reverse_rx_plan = resolve_reverse_rx_plan(&bts_config)?;
     let radio = build_radio_from_config(
         &bts_config.radio,
-        rx_freq_hz,
+        reverse_rx_plan.center_frequency_hz,
         RadioBuildOptions {
             null_radio: cli.null_radio,
+            configure_rx: reverse_rx_plan.configure_rx,
+            tx_sample_rate_hz: bts_config.runtime.tx_sample_rate_hz,
+            rx_sample_rate_hz: reverse_rx_plan.sample_rate_hz,
+            rx_bandwidth_hz: reverse_rx_plan.bandwidth_hz,
         },
     )?;
     let bts_parts = build_bts_launch_parts(
@@ -179,7 +271,7 @@ async fn main() -> Result<(), Error> {
             paging_ack_timeout_ms: bsc_config.paging_retry.ack_timeout_ms,
             paging_max_retries: bsc_config.paging_retry.max_retries,
         },
-    );
+    )?;
     let cdma_bts::bts::BtsLaunchParts {
         bts,
         handle: bts_handle,
@@ -198,10 +290,44 @@ async fn main() -> Result<(), Error> {
         rx_metrics,
         config: bts_runtime_config,
         access_events,
+        hrpd_access_events,
+        hrpd_traffic_events,
         commands: bts_commands,
+        hrpd_forward_signaling,
+        hrpd_traffic_assignments,
+        hrpd_traffic_releases,
+        hrpd_forward_traffic,
         power_control: bts_power_control,
         ..
     } = bts_handle;
+    info!("Packet data transport: {:?}", pdsn_config.packet.transport);
+    let lifecycle_sink: Option<Arc<dyn cdma_packet::session_lifecycle::SessionLifecycleSink>> =
+        match pdsn_config.events_endpoint.as_deref() {
+            Some(endpoint) => {
+                let publisher = cdma_events::EventPublisher::spawn(
+                    cdma_events::EventPublisherConfig::new(endpoint.to_string(), "pdsn-0"),
+                )
+                .map_err(|e| Error::from(format!("invalid pdsn.events_endpoint: {e}")))?;
+                info!("PDSN packet-session events publishing to {endpoint}");
+                Some(Arc::new(cdma_pdsn::events::PdsnLifecycleSink::new(
+                    publisher,
+                )))
+            }
+            None => None,
+        };
+    let packet_service = cdma_pdsn::build_packet_service_with_sink(&pdsn_config, lifecycle_sink)
+        .map_err(Error::from)?;
+    let _hrpd_pdsn_a11_addr = if bts_config.evdo.enabled {
+        Some(spawn_hrpd_pdsn_a11_service(pdsn_config.clone(), packet_service.clone()).await?)
+    } else {
+        None
+    };
+    let hrpd_a9_config = if bts_config.evdo.enabled {
+        Some(spawn_hrpd_pcf_a9_service(pcf_config.clone()).await?)
+    } else {
+        None
+    };
+    let an_service = spawn_nib_an_service(&bts_config, pdsn_config.events_endpoint.as_deref())?;
     // MSC management plane (gRPC hosted internally by MSC runtime)
     let msc_mgmt_addr = cli.msc_mgmt_addr.unwrap_or(msc_config.mgmt_grpc_addr);
 
@@ -224,6 +350,25 @@ async fn main() -> Result<(), Error> {
     );
     info!("HLR gRPC service listening on {hlr_addr}");
     info!("SMSC gRPC service listening on {smsc_addr}");
+    if let Some((an_addr, air, uati)) = an_service {
+        let color_code = bts_config.evdo.overhead.resolve()?.color_code;
+        let derived_imsi_config = hrpd_derived_imsi_config_from_bts(&bts_config)?;
+        spawn_hrpd_air_bridge(
+            an_addr,
+            air,
+            uati,
+            hrpd_access_events,
+            hrpd_traffic_events,
+            hrpd_forward_signaling,
+            hrpd_traffic_assignments,
+            hrpd_traffic_releases,
+            hrpd_forward_traffic,
+            hrpd_a9_config,
+            Some(hlr_repo.clone()),
+            color_code,
+            derived_imsi_config,
+        );
+    }
 
     // Aggregated event bus (subscribed via gRPC ListenEvents; producers
     // publish via gRPC Publish — no in-process bus by design). The bus
@@ -264,24 +409,17 @@ async fn main() -> Result<(), Error> {
     }
 
     // Packet data
-    info!("Packet data transport: {:?}", pdsn_config.packet.transport);
-    let lifecycle_sink: Option<Arc<dyn cdma_packet::session_lifecycle::SessionLifecycleSink>> =
-        match pdsn_config.events_endpoint.as_deref() {
-            Some(endpoint) => {
-                let publisher = cdma_events::EventPublisher::spawn(
-                    cdma_events::EventPublisherConfig::new(endpoint.to_string(), "pdsn-0"),
-                )
-                .map_err(|e| Error::from(format!("invalid pdsn.events_endpoint: {e}")))?;
-                info!("PDSN packet-session events publishing to {endpoint}");
-                Some(Arc::new(cdma_pdsn::events::PdsnLifecycleSink::new(
-                    publisher,
-                )))
-            }
-            None => None,
-        };
-    let (packet_endpoint, _packet_server) =
-        cdma_pdsn::spawn_configured_packet_service_with_sink(&pdsn_config, lifecycle_sink)
-            .map_err(Error::from)?;
+    let packet_addr = pdsn_config.packet_grpc_listen_addr;
+    let packet_endpoint = cdma_pdsn::packet_grpc_endpoint(packet_addr);
+    let packet_service_for_server = packet_service.clone();
+    let _packet_server = tokio::spawn(async move {
+        if let Err(error) =
+            cdma_pdsn::run_packet_grpc_server(packet_addr, (*packet_service_for_server).clone())
+                .await
+        {
+            log::error!("packet gRPC server error: {error}");
+        }
+    });
     let pcf_endpoint = pcf_config.packet_grpc_endpoint.clone();
     let pcf_client: Arc<dyn cdma_bsc::packet::PcfClient> =
         Arc::new(cdma_bsc::packet::GrpcPcfClient::new(pcf_endpoint.clone()));
@@ -347,15 +485,23 @@ async fn main() -> Result<(), Error> {
         .runtime
         .tx_freq_hz_override
         .unwrap_or_else(|| bts_config.channel.downlink_hz() as usize);
-    let rx_center_frequency_hz = bts_config
-        .radio
-        .rx_freq_hz_override()
-        .unwrap_or_else(|| bts_config.channel.uplink_hz() as usize);
+    let rx_center_frequency_hz = bts_config.channel.uplink_hz() as usize;
+    // Resolved EV-DO carrier for the management plane (None when EV-DO is off).
+    let evdo_carrier = evdo::resolve_evdo_config(
+        &bts_config.evdo,
+        bts_config.pilot_offset,
+        bts_config.channel,
+        bts_config.runtime.tx_sample_rate_hz,
+        bts_config.runtime.tx_bandwidth_hz,
+    )
+    .ok()
+    .flatten();
     let bsc_parts = cdma_bsc::bsc::build_bsc_launch_parts(cdma_bsc::bsc::BscLaunchInputs {
         pilot_offset: bts_config.pilot_offset,
         channel: bts_config.channel,
         tx_center_frequency_hz,
         rx_center_frequency_hz,
+        evdo: evdo_carrier,
         overhead: overhead_params,
         timezone: bts_config.timezone.clone(),
         paging: paging_settings.clone(),
@@ -381,6 +527,7 @@ async fn main() -> Result<(), Error> {
         pch_transmit_tx: pch_transmit_tx.clone(),
         voice_bearer_bind_ip: bsc_config.voice_bearer_bind_ip,
         node_id: bsc_config.node_id.clone(),
+        an_a21_addr: bsc_config.an_a21_addr,
     });
     let bsc_state = bsc_parts.state.clone();
     let bsc = bsc_parts.bsc;
@@ -431,6 +578,19 @@ async fn main() -> Result<(), Error> {
 fn bts_overhead_from_node_configs(
     bts_config: &BtsNodeConfig,
 ) -> Result<cdma_msc::BtsOverheadConfig, Error> {
+    let derived_imsi_config = hrpd_derived_imsi_config_from_bts(bts_config)?;
+    Ok(cdma_msc::BtsOverheadConfig {
+        mcc: derived_imsi_config.mcc,
+        imsi_11_12: derived_imsi_config.imsi_11_12,
+        sid: bts_config.overhead.sid,
+        nid: bts_config.overhead.nid,
+        paging_channel_number: bts_config.runtime.downlink.paging.paging_channel_number as u16,
+    })
+}
+
+fn hrpd_derived_imsi_config_from_bts(
+    bts_config: &BtsNodeConfig,
+) -> Result<HrpdDerivedImsiConfig, Error> {
     let esp = &bts_config
         .runtime
         .downlink
@@ -446,11 +606,32 @@ fn bts_overhead_from_node_configs(
                 esp.imsi_11_12
             ))
         })?;
-    Ok(cdma_msc::BtsOverheadConfig {
-        mcc,
-        imsi_11_12,
-        sid: bts_config.overhead.sid,
-        nid: bts_config.overhead.nid,
-        paging_channel_number: bts_config.runtime.downlink.paging.paging_channel_number as u16,
-    })
+    Ok(HrpdDerivedImsiConfig { mcc, imsi_11_12 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_debug_log_filter_uses_targeted_profile() {
+        let filter = apply_default_log_clamps("debug");
+        let directives = filter.split(',').collect::<Vec<_>>();
+
+        assert!(directives.contains(&DEFAULT_LOG_FILTER));
+        assert!(directives.contains(&"cdma_an=debug"));
+        assert!(directives.contains(&"cdma_packet=debug"));
+        assert!(directives.contains(&"cdma_bts::receiver::hrpd::reverse_traffic_rake=debug"));
+        assert!(!directives.contains(&"debug"));
+        assert!(directives.contains(&"tonic=warn"));
+    }
+
+    #[test]
+    fn explicit_log_targets_survive_default_clamps() {
+        let filter = apply_default_log_clamps("cdma_bts::receiver=trace,debug");
+
+        assert!(filter.contains("cdma_bts::receiver=trace"));
+        assert!(filter.contains("cdma_an=debug"));
+        assert!(!filter.split(',').any(|directive| directive == "debug"));
+    }
 }

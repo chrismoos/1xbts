@@ -31,7 +31,7 @@ use hound::WavWriter;
 use log::debug;
 use num_complex::Complex32;
 
-use self::fir::ComplexFir32;
+use self::fir::{ComplexFir32, PolyphaseComplexFir32};
 
 pub struct RxReadResult {
     pub samples_read: usize,
@@ -64,6 +64,10 @@ pub trait Radio: Send {
 }
 
 /// TX half -- owned exclusively by the TX thread.
+///
+/// `transmit` and `transmit_at` accept final SDR-rate complex samples.
+/// Pulse shaping and any multi-carrier composition happen upstream in the
+/// BTS waveform pipeline.
 pub trait RadioTx: Send {
     fn tick_rate(&self) -> u64;
     fn get_hardware_time(&self) -> Result<u64, Error>;
@@ -113,7 +117,10 @@ impl RadioTx for Box<dyn RadioTx> {
     }
 }
 
-pub(crate) const TX_SAMPLE_RATE: usize = SR1_CHIP_RATE_HZ as usize * 4;
+// Default 8× chip rate (9.8304 Msps). The live TX sample rate is selected
+// from radio config and carried through `BtsRuntimeSettings`; this constant is
+// only the project default and a convenience for tests/tools.
+pub(crate) const TX_SAMPLE_RATE: usize = SR1_CHIP_RATE_HZ as usize * 8;
 pub(crate) const FILE_OUTPUT_TARGET_PEAK: f32 = 0.90;
 const FILE_OUTPUT_HARD_CLIP_PEAK: f32 = 1.0;
 const PHASE_EQUALIZER_ALPHA: f64 = 1.36;
@@ -208,37 +215,256 @@ pub fn cdma2000_pulse_shape_finite(
         .collect()
 }
 
-pub struct TxPulseShaper {
-    interpolate: usize,
-    baseband_filter: ComplexFir32,
+/// Number of samples between NCO resyncs. Between resyncs the mixing phasor
+/// advances by one complex multiply per sample; on resync it is recomputed
+/// from the exact f64 phase accumulator, bounding magnitude and phase drift.
+const PHASOR_NCO_RESYNC_SAMPLES: u32 = 1024;
+
+/// Numerically-controlled oscillator that mixes a complex stream by a fixed
+/// frequency offset using a phasor recurrence (one complex multiply per
+/// sample) instead of a per-sample sine/cosine. The phasor is periodically
+/// resynced from an exact f64 phase accumulator so rounding cannot drift.
+pub struct PhasorNco {
+    phase_rad: f64,
+    phase_step_rad: f64,
+    rotor: Complex32,
+    rotor_step: Complex32,
+    samples_since_resync: u32,
+    active: bool,
 }
 
-impl TxPulseShaper {
-    pub fn new() -> Self {
-        let interpolate = TX_SAMPLE_RATE / SR1_CHIP_RATE_HZ as usize;
-        let taps = cdma2000_baseband_filter_taps_f64();
-        debug!("TX baseband filter taps: {}", taps.len());
-
-        // Use the FIR's built-in polyphase interpolation: it splits the 48
-        // taps into 4 sub-filters of 12 taps each, computing only non-zero
-        // contributions. 4× fewer MACs and no zero-insert allocation.
-        TxPulseShaper {
-            interpolate,
-            baseband_filter: ComplexFir32::with_interpolate(&taps, interpolate),
+impl PhasorNco {
+    /// Build an NCO advancing `phase_step_rad` per sample. A zero step makes
+    /// the NCO a pass-through.
+    pub fn new(phase_step_rad: f64) -> Self {
+        Self {
+            phase_rad: 0.0,
+            phase_step_rad,
+            rotor: Complex32::new(1.0, 0.0),
+            rotor_step: Complex32::new(phase_step_rad.cos() as f32, phase_step_rad.sin() as f32),
+            samples_since_resync: 0,
+            active: phase_step_rad != 0.0,
         }
     }
 
-    pub fn shape(&mut self, samples: &[Complex32]) -> Vec<Complex32> {
-        // Feed chip-rate samples directly; the polyphase FIR handles
-        // the 4× interpolation internally.
-        // The polyphase FIR matches the previous interpolation convention:
-        // output is multiplied by interpolate, so compensate to match the
-        // zero-insert path's unity gain.
-        let scale = 1.0 / self.interpolate as f32;
-        let mut out = self.baseband_filter.process_block(samples);
-        for sample in &mut out {
-            *sample *= scale;
+    /// Build an NCO seeded at `start_phase_rad`; a nonzero start phase with a
+    /// zero step still applies its constant rotation.
+    pub fn with_start_phase(start_phase_rad: f64, phase_step_rad: f64) -> Self {
+        Self {
+            phase_rad: start_phase_rad,
+            phase_step_rad,
+            rotor: Complex32::new(start_phase_rad.cos() as f32, start_phase_rad.sin() as f32),
+            rotor_step: Complex32::new(phase_step_rad.cos() as f32, phase_step_rad.sin() as f32),
+            samples_since_resync: 0,
+            active: phase_step_rad != 0.0 || start_phase_rad != 0.0,
         }
+    }
+
+    /// Build an NCO for a frequency offset in Hz at the given sample rate. A
+    /// positive offset mixes the spectrum up; negate the offset to mix down.
+    pub fn from_offset_hz(offset_hz: i64, sample_rate_hz: usize) -> Self {
+        let step = if offset_hz == 0 || sample_rate_hz == 0 {
+            0.0
+        } else {
+            2.0 * std::f64::consts::PI * offset_hz as f64 / sample_rate_hz as f64
+        };
+        Self::new(step)
+    }
+
+    /// Whether this NCO applies any rotation (false for a zero offset).
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// Mix one sample by the current phasor and advance one step.
+    #[inline]
+    pub fn mix(&mut self, sample: Complex32) -> Complex32 {
+        if !self.active {
+            return sample;
+        }
+        let out = sample * self.rotor;
+        self.rotor *= self.rotor_step;
+        self.phase_rad += self.phase_step_rad;
+        self.samples_since_resync += 1;
+        if self.samples_since_resync >= PHASOR_NCO_RESYNC_SAMPLES {
+            self.phase_rad = self.phase_rad.rem_euclid(2.0 * std::f64::consts::PI);
+            self.rotor = Complex32::new(self.phase_rad.cos() as f32, self.phase_rad.sin() as f32);
+            self.samples_since_resync = 0;
+        }
+        out
+    }
+
+    /// Mix a block of samples in place.
+    pub fn rotate_in_place(&mut self, samples: &mut [Complex32]) {
+        if !self.active {
+            return;
+        }
+        let mut idx = 0usize;
+        while idx < samples.len() {
+            let until_resync = PHASOR_NCO_RESYNC_SAMPLES
+                .saturating_sub(self.samples_since_resync)
+                .max(1) as usize;
+            let end = (idx + until_resync).min(samples.len());
+            let mut rotor = self.rotor;
+            let rotor_step = self.rotor_step;
+            for sample in &mut samples[idx..end] {
+                *sample *= rotor;
+                rotor *= rotor_step;
+            }
+            let advanced = (end - idx) as u32;
+            self.rotor = rotor;
+            self.phase_rad += self.phase_step_rad * f64::from(advanced);
+            self.samples_since_resync += advanced;
+            if self.samples_since_resync >= PHASOR_NCO_RESYNC_SAMPLES {
+                self.phase_rad = self.phase_rad.rem_euclid(2.0 * std::f64::consts::PI);
+                self.rotor =
+                    Complex32::new(self.phase_rad.cos() as f32, self.phase_rad.sin() as f32);
+                self.samples_since_resync = 0;
+            }
+            idx = end;
+        }
+    }
+}
+
+/// Taps in the half-band-style lowpass used to interpolate the 4x-shaped
+/// baseband by a further factor of two. A 23-tap Hamming-windowed sinc at
+/// fc = fs/4 clears > 50 dB across the wide guard band between the occupied 1x
+/// band (<= 740 kHz) and the 2x interpolation image (>= ~4.2 MHz at 8x).
+const INTERP2_LP_TAPS: usize = 23;
+
+/// Hamming-windowed sinc lowpass with cutoff at a quarter of the (doubled)
+/// output rate, for 2x interpolation.
+fn interp2_lowpass_taps() -> Vec<f64> {
+    use std::f64::consts::PI;
+    let n = INTERP2_LP_TAPS;
+    let center = (n - 1) as f64 / 2.0;
+    let fc = 0.25_f64; // cycles/sample at the interpolated (2x) rate
+    (0..n)
+        .map(|i| {
+            let x = i as f64 - center;
+            let sinc = if x.abs() < 1e-9 {
+                2.0 * fc
+            } else {
+                (2.0 * PI * fc * x).sin() / (PI * x)
+            };
+            let hamming = 0.54 - 0.46 * (2.0 * PI * i as f64 / (n - 1) as f64).cos();
+            sinc * hamming
+        })
+        .collect()
+}
+
+/// Mean magnitude over the steady-state tail of a response (skips warmup).
+fn tail_mean_mag(samples: &[Complex32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let tail = &samples[samples.len() / 2..];
+    tail.iter().map(|s| s.norm()).sum::<f32>() / tail.len() as f32
+}
+
+/// Picks a final scale so the staged shaper's passband (DC) amplitude matches
+/// the single-stage `interpolate-by-N` reference exactly, leaving TX power and
+/// downstream gains unchanged.
+fn calibrate_pulse_shaper_scale(
+    spec: &[f64],
+    lp: &[f64],
+    interpolate: usize,
+    extra_stages: usize,
+) -> f32 {
+    let dc = vec![Complex32::new(1.0, 0.0); 96];
+    let legacy_gain = {
+        let mut legacy = ComplexFir32::with_interpolate(spec, interpolate);
+        tail_mean_mag(&legacy.process_block(&dc)) / interpolate as f32
+    };
+    let cascade_gain = {
+        let mut stage1 = PolyphaseComplexFir32::with_interpolate(spec, 4);
+        let mut buf = stage1.process_block(&dc);
+        for _ in 0..extra_stages {
+            let mut up = PolyphaseComplexFir32::with_interpolate(lp, 2);
+            buf = up.process_block(&buf);
+        }
+        tail_mean_mag(&buf)
+    };
+    if cascade_gain <= f32::EPSILON {
+        return 1.0 / interpolate as f32;
+    }
+    legacy_gain / cascade_gain
+}
+
+pub struct TxPulseShaper {
+    /// chip -> 4x: the cdma2000 spec baseband pulse shape (correct at 4x).
+    stage1: PolyphaseComplexFir32,
+    /// each 2x: 4x -> 8x -> ... half-band-style interpolation that suppresses
+    /// the image a single-stage `interpolate-by-N` path leaves in band.
+    upsamplers: Vec<PolyphaseComplexFir32>,
+    scale: f32,
+    scratch_a: Vec<Complex32>,
+    scratch_b: Vec<Complex32>,
+}
+
+impl TxPulseShaper {
+    pub fn new(sample_rate_hz: usize) -> Result<Self, Error> {
+        let chip_rate = SR1_CHIP_RATE_HZ as usize;
+        if sample_rate_hz < chip_rate * 4 || sample_rate_hz % chip_rate != 0 {
+            return Err(format!(
+                "TX pulse shaper sample_rate_hz={sample_rate_hz} must be an integer multiple of chip rate {chip_rate} and at least 4x ({})",
+                chip_rate * 4
+            )
+            .into());
+        }
+        let interpolate = sample_rate_hz / chip_rate;
+        let extra = interpolate / 4;
+        if interpolate % 4 != 0 || !extra.is_power_of_two() {
+            return Err(format!(
+                "TX pulse shaper interpolate={interpolate} must be 4x times a power of two (4x, 8x, 16x)"
+            )
+            .into());
+        }
+        let extra_stages = extra.trailing_zeros() as usize;
+
+        // The cdma2000 baseband filter is the spec interpolate-by-4 pulse shape.
+        // Applying it directly at a higher rate widens the passband ~2x and
+        // leaves the first interpolation image (at the chip rate) unsuppressed.
+        // Shape at 4x where the filter is correct, then reach the target rate
+        // with half-band-style 2x stages that suppress each new image.
+        let spec = cdma2000_baseband_filter_taps_f64();
+        let lp = interp2_lowpass_taps();
+        debug!(
+            "TX baseband shaper: spec_taps={} lp_taps={} interpolate={} (4x + {} half-band stage(s)) sample_rate_hz={}",
+            spec.len(),
+            lp.len(),
+            interpolate,
+            extra_stages,
+            sample_rate_hz
+        );
+
+        Ok(TxPulseShaper {
+            stage1: PolyphaseComplexFir32::with_interpolate(&spec, 4),
+            upsamplers: (0..extra_stages)
+                .map(|_| PolyphaseComplexFir32::with_interpolate(&lp, 2))
+                .collect(),
+            scale: calibrate_pulse_shaper_scale(&spec, &lp, interpolate, extra_stages),
+            scratch_a: Vec::new(),
+            scratch_b: Vec::new(),
+        })
+    }
+
+    /// Alloc-free [`shape`](Self::shape) writing into a caller buffer.
+    pub fn shape_into(&mut self, samples: &[Complex32], out: &mut Vec<Complex32>) {
+        self.stage1.process_block_into(samples, &mut self.scratch_a);
+        for up in &mut self.upsamplers {
+            up.process_block_into(&self.scratch_a, &mut self.scratch_b);
+            std::mem::swap(&mut self.scratch_a, &mut self.scratch_b);
+        }
+        out.clear();
+        out.reserve(self.scratch_a.len());
+        out.extend(self.scratch_a.iter().map(|sample| sample * self.scale));
+    }
+
+    pub fn shape(&mut self, samples: &[Complex32]) -> Vec<Complex32> {
+        let mut out = Vec::new();
+        self.shape_into(samples, &mut out);
         out
     }
 }
@@ -248,6 +474,10 @@ pub struct NoopRadio {
     tx_enabled: bool,
     next_tx_deadline: Option<Instant>,
     clock_start: Instant,
+    /// When set, `split()` yields a dummy RX half paced at this rate that
+    /// feeds zero-valued samples into the reverse pipeline. Enabled by
+    /// `setup_rx`, used to exercise the EV-DO reverse chain without hardware.
+    rx_sample_rate: Option<usize>,
 }
 
 impl NoopRadio {
@@ -257,6 +487,7 @@ impl NoopRadio {
             tx_enabled: false,
             next_tx_deadline: None,
             clock_start: Instant::now(),
+            rx_sample_rate: None,
         }
     }
 }
@@ -279,6 +510,19 @@ impl Radio for NoopRadio {
         Ok(())
     }
 
+    fn setup_rx(
+        &mut self,
+        _channel: usize,
+        _antenna: &str,
+        _frequency_hz: f64,
+        sample_rate_hz: f64,
+        _bandwidth_hz: f64,
+        _gain_db: Option<f64>,
+    ) -> Result<(), Error> {
+        self.rx_sample_rate = Some((sample_rate_hz as usize).max(1));
+        Ok(())
+    }
+
     fn split(self: Box<Self>) -> Result<(Box<dyn RadioTx>, Option<Box<dyn RadioRx>>), Error> {
         let tx = NoopTxHalf {
             tx_sample_rate: self.tx_sample_rate,
@@ -286,7 +530,14 @@ impl Radio for NoopRadio {
             next_tx_deadline: self.next_tx_deadline,
             clock_start: self.clock_start,
         };
-        Ok((Box::new(tx), None))
+        let rx = self.rx_sample_rate.map(|rate| {
+            Box::new(NoopRxHalf {
+                sample_rate: rate,
+                next_rx_deadline: None,
+                samples_emitted: 0,
+            }) as Box<dyn RadioRx>
+        });
+        Ok((Box::new(tx), rx))
     }
 }
 
@@ -298,19 +549,13 @@ struct NoopTxHalf {
 }
 
 impl NoopTxHalf {
-    fn simulate_tx_timing(&mut self, sample_count: usize) {
+    fn simulate_tx_timing_samples(&mut self, sample_count: usize) {
         if !self.tx_enabled || sample_count == 0 || self.tx_sample_rate == 0 {
             return;
         }
 
-        let effective_tx_samples =
-            sample_count.saturating_mul(self.tx_sample_rate) / SR1_CHIP_RATE_HZ as usize;
-        if effective_tx_samples == 0 {
-            return;
-        }
-
-        let tx_duration_ns = (effective_tx_samples as u128).saturating_mul(1_000_000_000u128)
-            / self.tx_sample_rate as u128;
+        let tx_duration_ns =
+            (sample_count as u128).saturating_mul(1_000_000_000u128) / self.tx_sample_rate as u128;
         let tx_duration = Duration::from_nanos(tx_duration_ns.min(u64::MAX as u128) as u64);
 
         let deadline = self.next_tx_deadline.unwrap_or_else(Instant::now);
@@ -332,12 +577,12 @@ impl RadioTx for NoopTxHalf {
     }
 
     fn transmit(&mut self, samples: &[Complex32]) -> Result<(), Error> {
-        self.simulate_tx_timing(samples.len());
+        self.simulate_tx_timing_samples(samples.len());
         Ok(())
     }
 
     fn transmit_at(&mut self, samples: &[Complex32], _tick: Option<u64>) -> Result<(), Error> {
-        self.simulate_tx_timing(samples.len());
+        self.simulate_tx_timing_samples(samples.len());
         Ok(())
     }
 
@@ -354,12 +599,89 @@ impl RadioTx for NoopTxHalf {
     }
 }
 
+/// Dummy RX half for the null radio. Paces a sample stream in real time at the
+/// configured rate so the reverse pipeline runs at a realistic cadence without
+/// hardware, and reports a contiguous hardware-time stamp so the correlators
+/// never see a per-block sample discontinuity.
+///
+/// It feeds silence — the FFT pilot search short-circuits on zero energy, so the
+/// correlators stay cheap.
+struct NoopRxHalf {
+    sample_rate: usize,
+    next_rx_deadline: Option<Instant>,
+    /// Monotonic count of samples delivered, used to derive a contiguous
+    /// hardware-time stamp.
+    samples_emitted: u64,
+}
+
+impl NoopRxHalf {
+    /// Hardware-time stamp (ns) for the next sample to be delivered. Uses ceil
+    /// division so the pipeline's `time_ticks -> absolute_sample` floor maps it
+    /// back to exactly `samples_emitted` (tick rate is 1 GHz; sample rate is
+    /// well under 1 GHz), keeping the stream contiguous.
+    #[inline]
+    fn contiguous_time_ticks(&self) -> u64 {
+        let sr = self.sample_rate.max(1) as u128;
+        ((self.samples_emitted as u128 * 1_000_000_000u128 + (sr - 1)) / sr) as u64
+    }
+}
+
+impl RadioRx for NoopRxHalf {
+    fn tick_rate(&self) -> u64 {
+        1_000_000_000
+    }
+
+    fn get_hardware_time(&self) -> Result<u64, Error> {
+        Ok(self.contiguous_time_ticks())
+    }
+
+    fn rx_read(&mut self, buf: &mut [Complex32], _timeout_us: i64) -> Result<RxReadResult, Error> {
+        // Pace the read so the batch is delivered no faster than real time at
+        // the configured sample rate, preventing the reader thread from
+        // spinning on a zero-latency source.
+        let batch_ns =
+            (buf.len() as u128).saturating_mul(1_000_000_000u128) / self.sample_rate.max(1) as u128;
+        let batch_duration = Duration::from_nanos(batch_ns.min(u64::MAX as u128) as u64);
+        let deadline = self.next_rx_deadline.unwrap_or_else(Instant::now);
+        let now = Instant::now();
+        if deadline > now {
+            thread::sleep(deadline.duration_since(now));
+        }
+        self.next_rx_deadline = Some(deadline.max(now) + batch_duration);
+
+        // Silence: the FFT pilot search short-circuits on zero energy.
+        for sample in buf.iter_mut() {
+            *sample = Complex32::new(0.0, 0.0);
+        }
+
+        // Contiguous hardware time derived from the running sample count, so the
+        // pipeline maps this batch to exactly the next absolute sample and the
+        // correlators never reset on a phantom discontinuity.
+        let time_ticks = self.contiguous_time_ticks();
+        self.samples_emitted = self.samples_emitted.saturating_add(buf.len() as u64);
+        Ok(RxReadResult {
+            samples_read: buf.len(),
+            time_ticks,
+            overflow: false,
+        })
+    }
+
+    fn rx_activate(&mut self, _time_ticks: Option<u64>) -> Result<(), Error> {
+        self.next_rx_deadline = Some(Instant::now());
+        Ok(())
+    }
+
+    fn rx_deactivate(&mut self) -> Result<(), Error> {
+        self.next_rx_deadline = None;
+        Ok(())
+    }
+}
+
 pub struct FileOutputRadio<W>
 where
     W: Write + Seek,
 {
     sink: WavWriter<W>,
-    tx_shaper: TxPulseShaper,
     clock_start: Instant,
 }
 
@@ -367,18 +689,17 @@ impl<W> FileOutputRadio<W>
 where
     W: Write + Seek,
 {
-    pub fn new(writer: W) -> Result<FileOutputRadio<W>, Error> {
+    pub fn new(writer: W, sample_rate_hz: usize) -> Result<FileOutputRadio<W>, Error> {
         Ok(FileOutputRadio {
             sink: WavWriter::new(
                 writer,
                 hound::WavSpec {
                     channels: 2,
-                    sample_rate: TX_SAMPLE_RATE as u32,
+                    sample_rate: sample_rate_hz as u32,
                     bits_per_sample: 16,
                     sample_format: hound::SampleFormat::Int,
                 },
             )?,
-            tx_shaper: TxPulseShaper::new(),
             clock_start: Instant::now(),
         })
     }
@@ -407,7 +728,6 @@ where
     fn split(self: Box<Self>) -> Result<(Box<dyn RadioTx>, Option<Box<dyn RadioRx>>), Error> {
         let tx = FileOutputTxHalf {
             sink: self.sink,
-            tx_shaper: self.tx_shaper,
             clock_start: self.clock_start,
         };
         Ok((Box::new(tx), None))
@@ -416,7 +736,6 @@ where
 
 struct FileOutputTxHalf<W: Write + Seek + Send> {
     sink: WavWriter<W>,
-    tx_shaper: TxPulseShaper,
     clock_start: Instant,
 }
 
@@ -433,8 +752,20 @@ where
     }
 
     fn transmit(&mut self, samples: &[Complex32]) -> Result<(), Error> {
-        let shaped = self.tx_shaper.shape(samples);
-        for (idx, sample) in shaped.iter().enumerate() {
+        self.write_samples(samples)
+    }
+
+    fn enable_transmit(&mut self, _enable: bool) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+impl<W> FileOutputTxHalf<W>
+where
+    W: Write + Seek + Send,
+{
+    fn write_samples(&mut self, samples: &[Complex32]) -> Result<(), Error> {
+        for (idx, sample) in samples.iter().enumerate() {
             // Keep deterministic fixed scaling for WAV output. Any overflow is a TX bug.
             let re = sample.re * FILE_OUTPUT_TARGET_PEAK;
             let im = sample.im * FILE_OUTPUT_TARGET_PEAK;
@@ -457,17 +788,137 @@ where
         self.sink.flush()?;
         Ok(())
     }
-
-    fn enable_transmit(&mut self, _enable: bool) -> Result<(), Error> {
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TX_SAMPLE_RATE, cdma2000_baseband_filter_taps_f64};
+    use super::{
+        PhasorNco, TX_SAMPLE_RATE, TxPulseShaper, calibrate_pulse_shaper_scale,
+        cdma2000_baseband_filter_taps_f64, fir::ComplexFir32, interp2_lowpass_taps,
+    };
     use num_complex::Complex32;
     use std::f64::consts::PI;
+
+    #[test]
+    fn phasor_nco_tracks_exact_phase_across_resync() {
+        let (offset, rate) = (123_400i64, 1_228_800usize);
+        let mut nco = PhasorNco::from_offset_hz(offset, rate);
+        assert!(nco.is_active());
+        let step = 2.0 * PI * offset as f64 / rate as f64;
+        let mut max_err = 0.0f32;
+        // Run past several resync boundaries.
+        for n in 0..5000usize {
+            let got = nco.mix(Complex32::new(1.0, 0.0));
+            let phase = step * n as f64;
+            let want = Complex32::new(phase.cos() as f32, phase.sin() as f32);
+            max_err = max_err.max((got - want).norm());
+        }
+        assert!(max_err < 1e-3, "phasor drifted from exact NCO: {max_err}");
+    }
+
+    #[test]
+    fn phasor_nco_with_start_phase_tracks_exact_phase() {
+        let start = 0.3f64;
+        let step = -2.0 * PI * 87_650.0 / 1_228_800.0;
+        let mut nco = PhasorNco::with_start_phase(start, step);
+        assert!(nco.is_active());
+        let mut max_err = 0.0f32;
+        for n in 0..5000usize {
+            let got = nco.mix(Complex32::new(1.0, 0.0));
+            let phase = start + step * n as f64;
+            let want = Complex32::new(phase.cos() as f32, phase.sin() as f32);
+            max_err = max_err.max((got - want).norm());
+        }
+        assert!(max_err < 1e-3, "phasor drifted from exact NCO: {max_err}");
+
+        // A zero step with a nonzero start is a constant rotation, not a
+        // pass-through.
+        let mut constant = PhasorNco::with_start_phase(PI / 2.0, 0.0);
+        assert!(constant.is_active());
+        let got = constant.mix(Complex32::new(1.0, 0.0));
+        assert!((got - Complex32::new(0.0, 1.0)).norm() < 1e-6);
+    }
+
+    #[test]
+    fn tx_pulse_shaper_matches_legacy_cascade() {
+        let spec = cdma2000_baseband_filter_taps_f64();
+        let lp = interp2_lowpass_taps();
+        let interpolate = TX_SAMPLE_RATE as usize / super::SR1_CHIP_RATE_HZ as usize;
+        let extra_stages = (interpolate / 4).trailing_zeros() as usize;
+        let scale = calibrate_pulse_shaper_scale(&spec, &lp, interpolate, extra_stages);
+
+        let chips: Vec<Complex32> = (0..256)
+            .map(|n| {
+                Complex32::new(
+                    (n as f32 * 0.113).sin() * 1.5,
+                    (n as f32 * 0.071).cos() * 0.8,
+                )
+            })
+            .collect();
+
+        let mut shaper = TxPulseShaper::new(TX_SAMPLE_RATE as usize).unwrap();
+        let got = shaper.shape(&chips);
+
+        let mut stage1 = ComplexFir32::with_interpolate(&spec, 4);
+        let mut want = stage1.process_block(&chips);
+        for _ in 0..extra_stages {
+            let mut up = ComplexFir32::with_interpolate(&lp, 2);
+            want = up.process_block(&want);
+        }
+        for sample in &mut want {
+            *sample *= scale;
+        }
+
+        assert_eq!(got.len(), want.len());
+        for (idx, (got, want)) in got.iter().zip(&want).enumerate() {
+            let err = (got - want).norm();
+            assert!(
+                err <= 1e-5 * (1.0 + want.norm()),
+                "sample {idx}: got {got}, want {want}, err {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn phasor_nco_zero_offset_is_passthrough() {
+        let mut nco = PhasorNco::from_offset_hz(0, 1_228_800);
+        assert!(!nco.is_active());
+        let s = Complex32::new(0.3, -0.7);
+        assert_eq!(nco.mix(s), s);
+    }
+
+    #[test]
+    fn complex_fir_matches_naive_convolution_across_calls() {
+        let taps = cdma2000_baseband_filter_taps_f64();
+        let mut fir = ComplexFir32::new(&taps);
+        let input: Vec<Complex32> = (0..400)
+            .map(|i| Complex32::new((0.03 * i as f32).sin(), (0.05 * i as f32 + 0.2).cos()))
+            .collect();
+        // Feed in two chunks to exercise cross-call delay-line continuity.
+        let mut got = Vec::new();
+        for chunk in [&input[..173], &input[173..]] {
+            for &s in chunk {
+                got.push(fir.process_sample(s));
+            }
+        }
+        for (m, want) in input.iter().enumerate().map(|(m, _)| {
+            let mut acc = num::complex::Complex::<f64>::new(0.0, 0.0);
+            for (i, &tap) in taps.iter().enumerate() {
+                if m >= i {
+                    acc.re += input[m - i].re as f64 * tap;
+                    acc.im += input[m - i].im as f64 * tap;
+                }
+            }
+            (m, Complex32::new(acc.re as f32, acc.im as f32))
+        }) {
+            assert!(
+                (got[m] - want).norm() < 1e-4,
+                "sample {m}: {:?} vs {:?}",
+                got[m],
+                want
+            );
+        }
+    }
 
     fn magnitude_at_hz(taps: &[f64], hz: f64, sample_rate: f64) -> f64 {
         let w = 2.0 * PI * hz / sample_rate;
@@ -483,8 +934,6 @@ mod tests {
 
     #[test]
     fn test_sr1_baseband_filter_frequency_limits() {
-        let taps = cdma2000_baseband_filter_taps_f64();
-        let fs = TX_SAMPLE_RATE as f64;
         let fp = 590_000.0_f64;
         let fstop = 740_000.0_f64;
         let passband_db = 1.5_f64;
@@ -494,35 +943,46 @@ mod tests {
         // a small quantization margin while keeping stopband strict.
         let passband_quantization_margin_db = 0.5_f64;
 
-        let dc = magnitude_at_hz(&taps, 0.0, fs);
-        let mut passband_max_db = f64::NEG_INFINITY;
-        let mut passband_min_db = f64::INFINITY;
-        let mut stopband_max_db = f64::NEG_INFINITY;
+        // Validate both the HRPD-only 4x rate and the composite 8x rate. This
+        // checks the spectrum that actually goes on the air via the complete
+        // shaper impulse response, not the raw coefficients at the wrong rate.
+        for sample_rate in [super::SR1_CHIP_RATE_HZ as usize * 4, TX_SAMPLE_RATE] {
+            let fs = sample_rate as f64;
+            let mut chips = vec![Complex32::new(1.0, 0.0)];
+            chips.resize(64, Complex32::new(0.0, 0.0));
+            let mut shaper = TxPulseShaper::new(sample_rate).expect("tx pulse shaper");
+            let taps: Vec<f64> = shaper.shape(&chips).iter().map(|s| s.re as f64).collect();
 
-        let bins = 16_384usize;
-        for i in 0..=bins {
-            let f = (i as f64 / bins as f64) * (fs / 2.0);
-            let mag = magnitude_at_hz(&taps, f, fs);
-            let db = 20.0 * (mag / dc).max(1e-12).log10();
-            if f <= fp {
-                passband_max_db = passband_max_db.max(db);
-                passband_min_db = passband_min_db.min(db);
+            let dc = magnitude_at_hz(&taps, 0.0, fs);
+            let mut passband_max_db = f64::NEG_INFINITY;
+            let mut passband_min_db = f64::INFINITY;
+            let mut stopband_max_db = f64::NEG_INFINITY;
+
+            let bins = 16_384usize;
+            for i in 0..=bins {
+                let f = (i as f64 / bins as f64) * (fs / 2.0);
+                let mag = magnitude_at_hz(&taps, f, fs);
+                let db = 20.0 * (mag / dc).max(1e-12).log10();
+                if f <= fp {
+                    passband_max_db = passband_max_db.max(db);
+                    passband_min_db = passband_min_db.min(db);
+                }
+                if f >= fstop {
+                    stopband_max_db = stopband_max_db.max(db);
+                }
             }
-            if f >= fstop {
-                stopband_max_db = stopband_max_db.max(db);
-            }
+
+            assert!(
+                passband_max_db <= passband_db
+                    && passband_min_db >= -(passband_db + passband_quantization_margin_db),
+                "sample_rate={sample_rate}: passband outside +{passband_db} dB / -{} dB: min={passband_min_db:.3} dB max={passband_max_db:.3} dB",
+                passband_db + passband_quantization_margin_db
+            );
+            assert!(
+                stopband_max_db <= stopband_db,
+                "sample_rate={sample_rate}: stopband above {stopband_db} dB: max={stopband_max_db:.3} dB"
+            );
         }
-
-        assert!(
-            passband_max_db <= passband_db
-                && passband_min_db >= -(passband_db + passband_quantization_margin_db),
-            "passband outside +{passband_db} dB / -{} dB: min={passband_min_db:.3} dB max={passband_max_db:.3} dB",
-            passband_db + passband_quantization_margin_db
-        );
-        assert!(
-            stopband_max_db <= stopband_db,
-            "stopband above {stopband_db} dB: max={stopband_max_db:.3} dB"
-        );
     }
 
     #[test]

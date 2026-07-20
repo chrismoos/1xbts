@@ -13,17 +13,30 @@ service PacketService {
   rpc GetSessionStatus(GetSessionStatusRequest) returns (GetSessionStatusResponse);
   // Lists known packet sessions.
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
-  // Looks up one active packet session by its assigned mobile (peer) IP.
-  // Used by the edge MSISDN resolver in fou-nat to attribute inbound HTTP
-  // requests to a subscriber. Returns the session summary, or an unset
-  // `session` field when no active session has that peer_ip.
+  // Looks up one active packet session by its assigned mobile (peer) IP, for
+  // attributing inbound traffic to a subscriber. Returns the session summary,
+  // or an unset `session` field when no active session has that peer_ip.
   rpc GetSessionByIp(GetSessionByIpRequest) returns (GetSessionByIpResponse);
   // Enables or disables per-session packet trace capture.
   rpc SetSessionCapture(SetSessionCaptureRequest) returns (SetSessionCaptureResponse);
   // Enables or disables F-SCH downlink frame generation on a running session.
-  // Called by the BSC after a successful F-SCH allocation (active=true) and
-  // during teardown / SCH release (active=false).
+  // Set active=true after an F-SCH allocation and active=false during
+  // teardown / SCH release.
   rpc SetSchActive(SetSchActiveRequest) returns (SetSchActiveResponse);
+}
+
+// Radio access technology for a packet session.
+enum AccessTechnology {
+  ACCESS_TECHNOLOGY_UNSPECIFIED = 0;
+  ACCESS_TECHNOLOGY_CDMA_1X = 1;
+  ACCESS_TECHNOLOGY_HRPD = 2;
+}
+
+// Origin of the HRPD A11 MN ID used for bearer registration.
+enum HrpdMnIdSource {
+  HRPD_MN_ID_SOURCE_UNSPECIFIED = 0;
+  HRPD_MN_ID_SOURCE_A11 = 1;
+  HRPD_MN_ID_SOURCE_DERIVED_HARDWARE = 2;
 }
 
 // One RLP traffic frame moving between the radio stack and packet engine.
@@ -56,6 +69,15 @@ message OpenSessionRequest {
   string phone_number = 7;
   // Assigned forward traffic-channel Walsh code.
   uint32 traffic_walsh_code = 8;
+  // Mobile MEID when available as subscriber/equipment metadata.
+  string meid = 9;
+  // HRPD A11 MN ID used for bearer registration. This may be an IMSI-format
+  // value derived for A11 and must not be displayed as a subscriber IMSI.
+  string hrpd_mn_id = 10;
+  // Origin of hrpd_mn_id.
+  HrpdMnIdSource hrpd_mn_id_source = 11;
+  // Authoritative subscriber IMSI when resolved by HLR/A12/roaming data.
+  string subscriber_imsi = 12;
 }
 
 // Response returned after packet session state is opened.
@@ -167,6 +189,21 @@ message PacketSessionInfo {
   string lcp_state = 26;
   string ipcp_state = 27;
   bool capture_enabled = 28;
+  // Radio access technology for this packet session.
+  AccessTechnology access_technology = 29;
+  // IMSI associated with the packet session when known.
+  string imsi = 30;
+  // ESN associated with the packet session when known.
+  uint32 esn = 31;
+  // Mobile MEID when available.
+  string meid = 32;
+  // HRPD A11 MN ID used for bearer registration. This is not necessarily a
+  // subscriber IMSI.
+  string hrpd_mn_id = 33;
+  // Origin of hrpd_mn_id.
+  HrpdMnIdSource hrpd_mn_id_source = 34;
+  // Authoritative subscriber IMSI when resolved.
+  string subscriber_imsi = 35;
 }
 
 // One trace event emitted by PPP, RLP, IP transport, or capture code.

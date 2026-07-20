@@ -28,6 +28,10 @@ pub struct SessionBoundInfo {
     pub subscriber_id: Option<String>,
     pub imsi: Option<String>,
     pub esn: Option<u32>,
+    pub meid: Option<String>,
+    pub hrpd_mn_id: Option<String>,
+    pub hrpd_mn_id_source: Option<String>,
+    pub subscriber_imsi: Option<String>,
     pub peer_ip: Ipv4Addr,
     pub our_ip: Ipv4Addr,
 }
@@ -39,6 +43,10 @@ pub struct SessionUnboundInfo {
     pub subscriber_id: Option<String>,
     pub imsi: Option<String>,
     pub esn: Option<u32>,
+    pub meid: Option<String>,
+    pub hrpd_mn_id: Option<String>,
+    pub hrpd_mn_id_source: Option<String>,
+    pub subscriber_imsi: Option<String>,
     pub peer_ip: Ipv4Addr,
     pub reason: UnbindReason,
 }

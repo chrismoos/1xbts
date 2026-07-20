@@ -1,5 +1,6 @@
 import { getBtsManagementClient } from "@/lib/grpc/client";
 import { Card, Stat } from "@/components/card";
+import { EvdoCarrierCard } from "@/components/evdo-carrier-card";
 
 export const dynamic = "force-dynamic";
 
@@ -41,6 +42,8 @@ export default async function ConfigPage() {
             <Stat label="TX Backoff" value={String(config.txDigitalBackoff)} />
             <Stat label="Block Size" value={`${config.blockSizeChips} chips`} />
           </Card>
+
+          <EvdoCarrierCard evdo={config.evdo} />
 
           <Card title="Pilot Channel">
             {config.pilot && (

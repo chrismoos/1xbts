@@ -6,10 +6,16 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](Cargo.toml)
 
-1xBTS is an experimental CDMA2000 1x base station and core-network stack
-implemented primarily in Rust. It includes BTS, BSC, MSC, HLR, SMSC, packet
-data, voice, SDR radio backends, and a web dashboard for development and
-operation.
+1xBTS is an experimental CDMA2000 1x and HRPD (1xEV-DO) radio-access and
+core-network stack implemented primarily in Rust. It includes BTS, BSC, HRPD
+AN, MSC, HLR, SMSC, packet data, voice, SDR radio backends, and a web dashboard
+for development and operation.
+
+> **New: EV-DO is here.** Initial HRPD support provides end-to-end packet data
+> for EV-DO Rev 0 and Rev A devices, including the air interface, AN
+> session/access/traffic handling, the A8/A9/A10/A11 packet path, 1x
+> coordination, and dashboard visibility. Run 1x and EV-DO on adjacent
+> carriers from one SDR, or run an HRPD-only carrier.
 
 This project is intended for research, interoperability testing, and lab use.
 Operate RF hardware only where you are authorized to transmit. You have been warned.
@@ -27,12 +33,14 @@ a way to revive old CDMA2000 devices. I started this project to change that.
 ## Status
 
 1xBTS is under active development. The current stack can run as a
-network-in-a-box process for local integration, or split BTS/BSC operation over
-the included Abis transport. Support varies by handset, radio backend, channel
-configuration, and service option.
+network-in-a-box process for local integration, or as separate network-node
+processes. The 1x BTS and BSC can also run split over the included Abis
+transport. Support varies by handset, radio backend, channel configuration, and
+service option.
 
-Currently many things are working (SMS, Voice, Packet Data) and while they work
-there is still much work to be done for production hardening. It still is a lot of fun
+SMS, voice, and packet data are working on 1x. Initial EV-DO Rev 0 and Rev A
+packet-data support is also working, but remains new and experimental. There is
+still much work to be done for production hardening. It is still a lot of fun,
 though.
 
 ## Architecture
@@ -49,15 +57,19 @@ Full documentation lives at [1xbts.org/docs](https://1xbts.org/docs).
 
 ### Network Nodes
 
-The stack implements the full 3GPP2 1x reference architecture, with each node
-running as its own process and communicating over standard reference points:
+The stack implements the 3GPP2 1x and HRPD reference paths, with each node able
+to run as its own process and communicate over standard reference points:
 
-- **BTS** (`cdma-bts`) - air-interface PHY/MAC, SDR-driven radio.
-- **BSC** (`cdma-bsc`) - radio resource management; speaks Abis to the BTS.
+- **BTS** (`cdma-bts`) - 1x and HRPD air-interface PHY/MAC, driven by an SDR.
+- **BSC** (`cdma-bsc`) - 1x radio resource management; speaks Abis to the BTS
+  and A21 to the HRPD AN for hybrid-terminal coordination.
+- **AN** (`cdma-an`) - HRPD sessions, UATI assignment, access and traffic
+  handling; speaks A8/A9 to the PCF and A21 to the BSC.
 - **MSC** (`cdma-msc`) - circuit-switched core; speaks A1 to the BSC.
 - **HLR** (`cdma-hlr`) - subscriber database (PostgreSQL-backed).
 - **SMSC** (`cdma-smsc`) - short message service center.
-- **PCF** (`cdma-pcf`) - packet control function; A8/A9 to BSC, A10/A11 to PDSN.
+- **PCF** (`cdma-pcf`) - packet control function; HRPD A8/A9 to the AN and
+  A10/A11 to the PDSN.
 - **PDSN** (`cdma-pdsn`) - packet data serving node, FoU/TUN packet path.
 - **voice-gw** (`cdma-voice-gw`) - SIP gateway for outbound voice calls (PSTN origination). See [voice gateway setup](https://1xbts.org/docs/guides/voice-gateway/) for trunk + STUN configuration.
 - **NIB** (`cdma-nib`) - network-in-a-box launcher that runs the full stack in one process.
@@ -143,6 +155,25 @@ cargo run --release -p cdma-nib --no-default-features --features bladerf-backend
     --radio-config config/radio_bladerf_micro2.json
 ```
 
+EV-DO is disabled by default. The checked-in BTS configuration already contains
+an example HRPD channel and sector definition; enable it without modifying the
+base file by creating `config/bts.local.json`:
+
+```json
+{
+  "evdo": {
+    "enabled": true
+  }
+}
+```
+
+The default `composite` mode places the 1x and EV-DO carriers in one SDR
+passband and advertises the HRPD neighbor on 1x. The BTS derives the required
+sample rate and bandwidth from the two configured channels. To transmit only
+the EV-DO carrier, also set `"mode": "hrpd_only"`. Review the channel, SectorID,
+subnet mask, color code, gain, and your SDR's available bandwidth before
+transmitting.
+
 Default service ports are listed in `docs/PORTS.md`. If port 3000 is already in
 use, set `ONEXBTS_WEB_PORT`, for example `ONEXBTS_WEB_PORT=3001 docker compose up 1xbts-web`.
 Use `--build` after pulling repo updates so Compose rebuilds images that copy
@@ -176,6 +207,7 @@ Run focused tests while developing:
 ```sh
 cargo test -p cdma-bts
 cargo test -p cdma-bsc
+cargo test -p cdma-an
 ```
 
 ### Web Dashboard

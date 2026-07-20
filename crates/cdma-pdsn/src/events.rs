@@ -31,7 +31,11 @@ impl PdsnLifecycleSink {
 
 impl SessionLifecycleSink for PdsnLifecycleSink {
     fn on_bound(&self, info: SessionBoundInfo) {
-        let identity = build_identity(info.imsi.as_deref(), info.esn);
+        let identity = build_identity(
+            info.subscriber_imsi.as_deref().or(info.imsi.as_deref()),
+            info.esn,
+            info.meid.as_deref(),
+        );
         let subscriber = build_subscriber(info.subscriber_id.as_deref());
         let body = pdsn_network_event::Event::Bound(PacketSessionBound {
             session_id: info.session_id,
@@ -47,7 +51,11 @@ impl SessionLifecycleSink for PdsnLifecycleSink {
     }
 
     fn on_unbound(&self, info: SessionUnboundInfo) {
-        let identity = build_identity(info.imsi.as_deref(), info.esn);
+        let identity = build_identity(
+            info.subscriber_imsi.as_deref().or(info.imsi.as_deref()),
+            info.esn,
+            info.meid.as_deref(),
+        );
         let subscriber = build_subscriber(info.subscriber_id.as_deref());
         let reason = match info.reason {
             UnbindReason::UplinkClosed => PacketSessionUnbindReason::UplinkClosed,
@@ -62,16 +70,21 @@ impl SessionLifecycleSink for PdsnLifecycleSink {
     }
 }
 
-fn build_identity(imsi: Option<&str>, esn: Option<u32>) -> Option<MobileIdentity> {
+fn build_identity(
+    imsi: Option<&str>,
+    esn: Option<u32>,
+    meid: Option<&str>,
+) -> Option<MobileIdentity> {
     let imsi = imsi.unwrap_or("");
     let esn = esn.unwrap_or(0);
-    if imsi.is_empty() && esn == 0 {
+    let meid = meid.unwrap_or("");
+    if imsi.is_empty() && esn == 0 && meid.is_empty() {
         return None;
     }
     Some(MobileIdentity {
         imsi: imsi.to_string(),
         esn,
-        meid: String::new(),
+        meid: meid.to_string(),
     })
 }
 

@@ -7,7 +7,7 @@ use limesuite::{Device, RxStream, StreamMeta, TxStream};
 use log::{debug, info};
 use num_complex::Complex32;
 
-use super::{Radio, RadioRx, RadioTx, RxReadResult, TX_SAMPLE_RATE, TxPulseShaper};
+use super::{Radio, RadioRx, RadioTx, RxReadResult};
 
 /// Default stream FIFO size in samples.
 const DEFAULT_FIFO_SIZE: u32 = 1024 * 1024;
@@ -53,7 +53,6 @@ pub struct LimeRadio {
     channel: usize,
     sample_rate: u64,
     oversample: usize,
-    tx_shaper: TxPulseShaper,
     tx_lo_offset_hz: f64,
     tx_sample_rate_hz: f64,
     tx_nco_phase_rad: f64,
@@ -170,9 +169,8 @@ impl LimeRadio {
             channel,
             sample_rate: sample_rate_hz as u64,
             oversample,
-            tx_shaper: TxPulseShaper::new(),
             tx_lo_offset_hz: 0.0,
-            tx_sample_rate_hz: TX_SAMPLE_RATE as f64,
+            tx_sample_rate_hz: sample_rate_hz as f64,
             tx_nco_phase_rad: 0.0,
             tx_stream: Some(tx_stream),
             rx_stream: None,
@@ -359,7 +357,6 @@ impl Radio for LimeRadio {
             _device: device.clone(),
             tx_stream: UnsafeCell::new(tx_stream),
             sample_rate: self.sample_rate,
-            tx_shaper: self.tx_shaper,
             tx_lo_offset_hz: self.tx_lo_offset_hz,
             tx_sample_rate_hz: self.tx_sample_rate_hz,
             tx_nco_phase_rad: self.tx_nco_phase_rad,
@@ -390,7 +387,6 @@ struct LimeTxHalf {
     _device: Arc<Device>,
     tx_stream: UnsafeCell<TxStream>,
     sample_rate: u64,
-    tx_shaper: TxPulseShaper,
     tx_lo_offset_hz: f64,
     tx_sample_rate_hz: f64,
     tx_nco_phase_rad: f64,
@@ -434,12 +430,12 @@ impl RadioTx for LimeTxHalf {
     }
 
     fn transmit_at(&mut self, samples: &[Complex32], tick: Option<u64>) -> Result<(), Error> {
-        let mut shaped = self.tx_shaper.shape(samples);
+        let mut samples = samples.to_vec();
         LimeRadio::apply_tx_lo_offset(
             self.tx_lo_offset_hz,
             self.tx_sample_rate_hz,
             &mut self.tx_nco_phase_rad,
-            &mut shaped,
+            &mut samples,
         );
         let meta = StreamMeta {
             timestamp: tick.unwrap_or(0),
@@ -447,7 +443,7 @@ impl RadioTx for LimeTxHalf {
             flush_partial_packet: false,
         };
         self.tx_stream_mut()
-            .send(&shaped, &meta, 1000)
+            .send(&samples, &meta, 1000)
             .map_err(|e| Error::from(format!("Lime: TX send: {}", e)))?;
         self.start_of_burst = false;
         self.tx_send_count += 1;

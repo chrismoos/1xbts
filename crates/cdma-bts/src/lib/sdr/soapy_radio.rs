@@ -3,13 +3,12 @@ use log::{debug, info};
 use num_complex::Complex32;
 use soapysdr::{Direction, RxStream, TxStream};
 
-use super::{Radio, RadioRx, RadioTx, RxReadResult, TX_SAMPLE_RATE, TxPulseShaper};
+use super::{Radio, RadioRx, RadioTx, RxReadResult, TX_SAMPLE_RATE};
 
 pub struct SoapySdrRadio {
     device: soapysdr::Device,
     channel: usize,
     stream: TxStream<num_complex::Complex<f32>>,
-    tx_shaper: TxPulseShaper,
     tx_lo_offset_hz: f64,
     tx_sample_rate_hz: f64,
     tx_nco_phase_rad: f64,
@@ -40,7 +39,6 @@ impl SoapySdrRadio {
             device,
             channel,
             stream,
-            tx_shaper: TxPulseShaper::new(),
             tx_lo_offset_hz: 0.0,
             tx_sample_rate_hz: TX_SAMPLE_RATE as f64,
             tx_nco_phase_rad: 0.0,
@@ -147,7 +145,6 @@ impl Radio for SoapySdrRadio {
         let tx = SoapyTxHalf {
             device: device.clone(),
             stream: self.stream,
-            tx_shaper: self.tx_shaper,
             tx_lo_offset_hz: self.tx_lo_offset_hz,
             tx_sample_rate_hz: self.tx_sample_rate_hz,
             tx_nco_phase_rad: self.tx_nco_phase_rad,
@@ -165,7 +162,6 @@ impl Radio for SoapySdrRadio {
 pub struct SoapyTxHalf {
     device: std::sync::Arc<soapysdr::Device>,
     stream: TxStream<Complex32>,
-    tx_shaper: TxPulseShaper,
     tx_lo_offset_hz: f64,
     tx_sample_rate_hz: f64,
     tx_nco_phase_rad: f64,
@@ -206,17 +202,14 @@ impl RadioTx for SoapyTxHalf {
     }
 
     fn transmit(&mut self, samples: &[Complex32]) -> Result<(), Error> {
-        let mut shaped = self.tx_shaper.shape(samples);
-        self.apply_tx_lo_offset(&mut shaped);
-        self.stream.write_all(&[&shaped], None, false, 1_000_000)?;
-        Ok(())
+        self.transmit_at(samples, None)
     }
 
     fn transmit_at(&mut self, samples: &[Complex32], tick: Option<u64>) -> Result<(), Error> {
-        let mut shaped = self.tx_shaper.shape(samples);
-        self.apply_tx_lo_offset(&mut shaped);
+        let mut samples = samples.to_vec();
+        self.apply_tx_lo_offset(&mut samples);
         self.stream
-            .write_all(&[&shaped], tick.map(|t| t as i64), false, 1_000_000)?;
+            .write_all(&[&samples], tick.map(|t| t as i64), false, 1_000_000)?;
         Ok(())
     }
 

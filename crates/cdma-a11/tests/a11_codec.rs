@@ -1,11 +1,40 @@
 use cdma_a11::{
-    AuthenticationExtension, AuthenticationExtensionType, CapabilitiesInfo,
-    CapabilitiesInfoAcknowledge, Error, Extension, Message, Nvse, PcfEnabledFeatureNvse,
-    PdsnEnabledFeatureNvse, RawExtension, RegistrationAcknowledge, RegistrationReply,
-    RegistrationRequest, RegistrationUpdate, SessionParameterNvse, SessionSpecificExtension,
-    SessionUpdate, SessionUpdateAcknowledge, UnknownNvse, UnverifiedDecodeReason,
-    decode_unverified, decode_verified, encode,
+    A11SecurityAssociation, A11SecurityConfig, A11TransportConfig, AuthenticationExtension,
+    AuthenticationExtensionType, CapabilitiesInfo, CapabilitiesInfoAcknowledge, Error, Extension,
+    Message, Nvse, PcfEnabledFeatureNvse, PdsnEnabledFeatureNvse, RawExtension,
+    RegistrationAcknowledge, RegistrationReply, RegistrationRequest, RegistrationUpdate,
+    SessionParameterNvse, SessionSpecificExtension, SessionUpdate, SessionUpdateAcknowledge,
+    UnknownNvse, UnverifiedDecodeReason, decode_unverified, decode_verified, encode,
 };
+
+#[test]
+fn a11_transport_config_allows_unprivileged_ports() {
+    let cfg = A11TransportConfig::new(
+        "127.0.0.1:17044".parse().unwrap(),
+        "127.0.0.1:17045".parse().unwrap(),
+    );
+    cfg.validate("a11").unwrap();
+}
+
+#[test]
+fn a11_transport_config_rejects_ambiguous_endpoints() {
+    let same = A11TransportConfig::new(
+        "127.0.0.1:17044".parse().unwrap(),
+        "127.0.0.1:17044".parse().unwrap(),
+    );
+    assert!(same.validate("a11").unwrap_err().contains("must differ"));
+
+    let unspecified = A11TransportConfig::new(
+        "0.0.0.0:17044".parse().unwrap(),
+        "127.0.0.1:17045".parse().unwrap(),
+    );
+    assert!(
+        unspecified
+            .validate("a11")
+            .unwrap_err()
+            .contains("bind_addr")
+    );
+}
 
 fn session() -> SessionSpecificExtension {
     SessionSpecificExtension {
@@ -47,6 +76,65 @@ fn sample_registration_request() -> Message {
             mobile_home_authentication_extension(),
         )],
     })
+}
+
+fn test_security() -> A11SecurityAssociation {
+    A11SecurityAssociation::from_config(&A11SecurityConfig {
+        spi: 0x1234,
+        shared_secret_hex: "737065632d6131312d736563726574".to_string(),
+    })
+    .unwrap()
+}
+
+#[test]
+fn security_association_signs_and_verifies_registration_request() {
+    let security = test_security();
+    let mut message = sample_registration_request();
+
+    security.sign_message(&mut message).unwrap();
+    let encoded = encode(&message).unwrap();
+    let verified = decode_verified(&encoded, &security).unwrap();
+
+    assert_eq!(verified.message(), &message);
+    let Message::RegistrationRequest(request) = &message else {
+        panic!("expected registration request");
+    };
+    let Some(Extension::Authentication(auth)) = request.extensions.last() else {
+        panic!("expected authentication extension");
+    };
+    assert_eq!(auth.security_parameter_index, security.spi());
+    assert_ne!(auth.authenticator, vec![0; 16]);
+}
+
+#[test]
+fn security_association_rejects_wrong_secret() {
+    let security = test_security();
+    let wrong_security = A11SecurityAssociation::from_config(&A11SecurityConfig {
+        spi: security.spi(),
+        shared_secret_hex: "77726f6e672d736563726574".to_string(),
+    })
+    .unwrap();
+    let mut message = sample_registration_request();
+    security.sign_message(&mut message).unwrap();
+    let encoded = encode(&message).unwrap();
+
+    assert!(matches!(
+        decode_verified(&encoded, &wrong_security).unwrap_err(),
+        Error::AuthenticationRejected {
+            context: "a11.authentication",
+            reason: "bad authenticator",
+        }
+    ));
+}
+
+#[test]
+fn security_config_rejects_reserved_spi() {
+    let cfg = A11SecurityConfig {
+        spi: 1,
+        shared_secret_hex: "aa".to_string(),
+    };
+
+    assert!(cfg.validate("a11_security").unwrap_err().contains("255"));
 }
 
 #[test]

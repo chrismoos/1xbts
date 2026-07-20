@@ -4,6 +4,7 @@ use crate::phy::coding::convolutional::{
 };
 use crate::phy::coding::long_code::LongCodeGenerator;
 use crate::phy::walsh::WalshDecoder;
+use crate::receiver::hrpd::access::{ACCESS_PACKET_CHIPS, HRPD_DEFAULT_ACCESS_PREAMBLE_FRAMES};
 
 use super::gardner_timing_recovery::GardnerTimingConfig;
 use super::rake_access_searcher;
@@ -19,10 +20,14 @@ use super::{
     SyncChannelProcessor, TrafficChannelProcessor, Unrepeater, ViterbiDecoderProcessor,
     WalshPilotCombiner,
 };
+use super::{HrpdAccessFrameFftConfig, HrpdAccessFrameRakeCorrelator};
 use super::{generic_rake_receiver, pn_lc_correlator};
 
 const REVERSE_ACCESS_ACTIVE_FINGER_DELAY_SUPPRESSION: bool = true;
 const REVERSE_ACCESS_ACTIVE_FINGER_DELAY_SUPPRESS_SAMPLES: i32 = 0;
+/// Reverse-access finger budget, fixed to the value the access capture
+/// regression suite exercises.
+const REVERSE_ACCESS_MAX_FINGERS: usize = 10;
 
 /// Settings for building a reverse traffic channel receiver pipeline.
 pub struct ReverseTrafficSettings {
@@ -44,6 +49,40 @@ pub struct ReverseTrafficSettings {
     /// Per C.S0002-E §2.1.3.12.7: when true and rate is 1500 bps (RC3),
     /// the mobile only transmits R-FCH on PCGs {2,3,6,7,10,11,14,15}.
     pub rev_fch_gating_mode: bool,
+}
+
+/// Settings for an HRPD Reverse Access Channel receiver.
+pub struct HrpdReverseAccessSettings {
+    pub oversample: usize,
+    pub access_cycle_number: u8,
+    pub sector_id_lsb: u32,
+    pub color_code: u8,
+    pub reanchor_origin: bool,
+    pub snr_threshold: Option<f32>,
+    pub finger_pool_size: usize,
+    /// AccessParameters `PreambleLength` (in frames) the reverse-access finger
+    /// despreads the capsule at.
+    pub preamble_frames: usize,
+    /// Also hypothesize the Enhanced Access Channel MAC 19.2/38.4 kbps
+    /// capsule packet sizes. Enable only when the sector broadcasts an
+    /// enhanced AccessParameters with `SectorAccessMaxRate` above 9.6 kbps.
+    pub enhanced_access_rates: bool,
+}
+
+impl Default for HrpdReverseAccessSettings {
+    fn default() -> Self {
+        Self {
+            oversample: 4,
+            access_cycle_number: 0,
+            sector_id_lsb: 0,
+            color_code: 26,
+            reanchor_origin: false,
+            snr_threshold: None,
+            finger_pool_size: 8,
+            preamble_frames: HRPD_DEFAULT_ACCESS_PREAMBLE_FRAMES,
+            enhanced_access_rates: false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -172,11 +211,6 @@ pub fn access_channel_chain() -> Vec<PipelineProcessorShared> {
 /// Uses the `PnLcCorrelator + GenericRakeReceiver` frontend and the chip-rate
 /// preamble/Walsh/frame alignment chain (4x oversampled).
 pub fn reverse_access_chain(settings: ReverseAccessSettings) -> Vec<PipelineProcessorShared> {
-    let max_fingers = std::env::var("CDMA_REVERSE_ACCESS_MAX_FINGERS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(10);
-
     let correlator = pn_lc_correlator::PnLcCorrelator::new(
         pn_lc_correlator::PnLcConfig::default_4x()
             .with_snr_threshold(20.0)
@@ -212,15 +246,46 @@ pub fn reverse_access_chain(settings: ReverseAccessSettings) -> Vec<PipelineProc
 
     vec![
         Box::new(PulseMatchedFilterProcessor::new()),
-        // Access captures can present many overlapping fractional timing
-        // hypotheses before pruning; keep production aligned with the
-        // regression path instead of relying on test-only max-finger overrides.
         Box::new(
             generic_rake_receiver::GenericRakeReceiver::new(correlator)
-                .with_max_fingers(max_fingers)
+                .with_max_fingers(REVERSE_ACCESS_MAX_FINGERS)
                 .with_finger_pool_size(settings.finger_pool_size),
         ),
     ]
+}
+
+/// Build the production HRPD Reverse Access Channel receiver.
+///
+/// HRPD reverse access has an explicit pilot-only preamble before the access
+/// data packet.  Use that spec-defined preamble to train the access receiver
+/// directly instead of spawning PN/LC rake fingers on low-SNR candidates.
+pub fn hrpd_reverse_access_chain(
+    settings: HrpdReverseAccessSettings,
+) -> Vec<PipelineProcessorShared> {
+    let correlator = HrpdAccessFrameRakeCorrelator::new(HrpdAccessFrameFftConfig {
+        oversample: settings.oversample,
+        access_cycle_number: settings.access_cycle_number,
+        sector_id_lsb: settings.sector_id_lsb,
+        color_code: settings.color_code,
+        preamble_frames: settings.preamble_frames,
+        snr_threshold: settings.snr_threshold.unwrap_or(11.0),
+        decode: crate::receiver::hrpd::access::HrpdAccessDecodeConfig {
+            enhanced_rates: settings.enhanced_access_rates,
+        },
+        ..HrpdAccessFrameFftConfig::default()
+    });
+    vec![Box::new(
+        generic_rake_receiver::GenericRakeReceiver::new(correlator)
+            .with_max_fingers(32)
+            .with_finger_pool_size(settings.finger_pool_size)
+            .with_prune_policy(Box::new(generic_rake_receiver::DefaultPrunePolicy {
+                // A freshly spawned finger still waits on the rest of the
+                // capsule streaming in. Give it the full 4-frame window.
+                max_idle_chips: 4 * ACCESS_PACKET_CHIPS as u64,
+                max_validated_idle_chips: ACCESS_PACKET_CHIPS as u64,
+                ..generic_rake_receiver::DefaultPrunePolicy::default()
+            })),
+    )]
 }
 
 pub(crate) fn reverse_traffic_prune_policy() -> generic_rake_receiver::DefaultPrunePolicy {

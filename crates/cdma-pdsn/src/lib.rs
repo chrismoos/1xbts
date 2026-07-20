@@ -1,17 +1,19 @@
 //! `cdma-pdsn` — PDSN node crate.
 //!
-//! Initial scope (WS-0 PR1): node configuration only (carries the legacy
-//! `PacketConfig` fields previously living under `cdma-bsc::config::packet`).
-//! A11 signaling, A10 GRE bearer, IP allocation, and TUN/host I/O land in
-//! WS-3 / WS-4.
+//! PDSN node configuration, A11 signaling, and the A10 GRE bearer with IP
+//! allocation for packet-data sessions.
 
+pub mod a10_runtime;
 pub mod a11_agent;
+pub mod a11_service;
 pub mod config;
 pub mod events;
 pub mod session;
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
+pub use a10_runtime::{HrpdPdsnA10Runtime, spawn_hrpd_pdsn_a10_runtime};
+pub use a11_service::{PacketServiceHrpdA10Adapter, spawn_hrpd_pdsn_a11_service};
 pub use config::{PacketTransportConfig, PdsnNodeConfig};
 pub use session::{
     IpPool, PdsnError, PdsnEvent, PdsnSession, PdsnSessionManager, PdsnSessionPhase,

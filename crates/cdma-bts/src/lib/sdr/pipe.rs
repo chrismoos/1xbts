@@ -1,13 +1,17 @@
-use std::sync::mpsc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+    mpsc,
+};
 use std::time::Instant;
 
-use cdma_common::error::Error;
+use cdma_common::{consts::SR1_CHIP_RATE_HZ, error::Error};
 use num_complex::Complex32;
 
-use super::{FILE_OUTPUT_TARGET_PEAK, Radio, RadioTx, TX_SAMPLE_RATE, TxPulseShaper};
+use super::{FILE_OUTPUT_TARGET_PEAK, Radio, RadioTx, TX_SAMPLE_RATE};
 use crate::bts::rx::{self, InjectedRxBlock, InjectedRxReceiver};
 
-/// A block of pulse-shaped TX output samples.
+/// A block of final SDR-rate TX output samples.
 pub struct TxOutputBlock {
     pub samples: Vec<Complex32>,
     pub tick: Option<u64>,
@@ -15,12 +19,12 @@ pub struct TxOutputBlock {
 }
 
 /// In-memory Radio implementation for testing.
-/// Pulse-shapes TX and makes samples available via RadioPipeHandle.
+/// Makes final SDR-rate TX samples available via RadioPipeHandle.
 /// Also carries an InjectedRxReceiver for the BTS to consume.
 pub struct RadioPipe {
-    tx_shaper: TxPulseShaper,
     tx_output: mpsc::SyncSender<TxOutputBlock>,
     injected_rx: Option<InjectedRxReceiver>,
+    tx_sample_rate_hz: Arc<AtomicUsize>,
     clock_start: Instant,
 }
 
@@ -28,23 +32,26 @@ pub struct RadioPipe {
 pub struct RadioPipeHandle {
     tx_output_rx: mpsc::Receiver<TxOutputBlock>,
     injected_rx_tx: Option<rx::InjectedRxSender>,
+    tx_sample_rate_hz: Arc<AtomicUsize>,
 }
 
 impl RadioPipe {
     pub fn new(tx_buffer_depth: usize) -> (RadioPipe, RadioPipeHandle) {
         let (tx_out_tx, tx_out_rx) = mpsc::sync_channel(tx_buffer_depth);
         let (injected_tx, injected_rx) = rx::injected_rx_channel(32);
+        let tx_sample_rate_hz = Arc::new(AtomicUsize::new(TX_SAMPLE_RATE));
 
         let pipe = RadioPipe {
-            tx_shaper: TxPulseShaper::new(),
             tx_output: tx_out_tx,
             injected_rx: Some(injected_rx),
+            tx_sample_rate_hz: tx_sample_rate_hz.clone(),
             clock_start: Instant::now(),
         };
 
         let handle = RadioPipeHandle {
             tx_output_rx: tx_out_rx,
             injected_rx_tx: Some(injected_tx),
+            tx_sample_rate_hz,
         };
 
         (pipe, handle)
@@ -65,7 +72,8 @@ impl Radio for RadioPipe {
     fn set_tx_frequency(&mut self, _: usize) -> Result<(), Error> {
         Ok(())
     }
-    fn set_tx_sample_rate(&mut self, _: usize) -> Result<(), Error> {
+    fn set_tx_sample_rate(&mut self, sample_rate: usize) -> Result<(), Error> {
+        self.tx_sample_rate_hz.store(sample_rate, Ordering::Relaxed);
         Ok(())
     }
     fn set_tx_bandwidth(&mut self, _: usize) -> Result<(), Error> {
@@ -76,8 +84,8 @@ impl Radio for RadioPipe {
         self: Box<Self>,
     ) -> Result<(Box<dyn RadioTx>, Option<Box<dyn super::RadioRx>>), Error> {
         let tx = PipeTxHalf {
-            tx_shaper: self.tx_shaper,
             tx_output: self.tx_output,
+            tx_sample_rate_hz: self.tx_sample_rate_hz,
             clock_start: self.clock_start,
         };
         Ok((Box::new(tx), None))
@@ -85,8 +93,8 @@ impl Radio for RadioPipe {
 }
 
 struct PipeTxHalf {
-    tx_shaper: TxPulseShaper,
     tx_output: mpsc::SyncSender<TxOutputBlock>,
+    tx_sample_rate_hz: Arc<AtomicUsize>,
     clock_start: Instant,
 }
 
@@ -100,21 +108,25 @@ impl RadioTx for PipeTxHalf {
     }
 
     fn transmit(&mut self, samples: &[Complex32]) -> Result<(), Error> {
-        let shaped = self.tx_shaper.shape(samples);
-        let _ = self.tx_output.try_send(TxOutputBlock {
-            samples: shaped,
-            tick: None,
-            chip_count: samples.len(),
-        });
-        Ok(())
+        self.transmit_at(samples, None)
     }
 
     fn transmit_at(&mut self, samples: &[Complex32], tick: Option<u64>) -> Result<(), Error> {
-        let shaped = self.tx_shaper.shape(samples);
+        let sample_rate_hz = self.tx_sample_rate_hz.load(Ordering::Relaxed);
+        let chip_rate_hz = SR1_CHIP_RATE_HZ as usize;
+        let oversample = if sample_rate_hz >= chip_rate_hz && sample_rate_hz % chip_rate_hz == 0 {
+            sample_rate_hz / chip_rate_hz
+        } else {
+            0
+        };
         let _ = self.tx_output.try_send(TxOutputBlock {
-            samples: shaped,
+            samples: samples.to_vec(),
             tick,
-            chip_count: samples.len(),
+            chip_count: if oversample > 0 {
+                samples.len() / oversample
+            } else {
+                0
+            },
         });
         Ok(())
     }
@@ -125,7 +137,7 @@ impl RadioTx for PipeTxHalf {
 }
 
 impl RadioPipeHandle {
-    /// Read the next pulse-shaped TX output block. Blocks until available.
+    /// Read the next final SDR-rate TX output block. Blocks until available.
     pub fn recv_tx(&self) -> Option<TxOutputBlock> {
         self.tx_output_rx.recv().ok()
     }
@@ -165,11 +177,12 @@ impl RadioPipeHandle {
         writer: W,
     ) -> Result<(), Error> {
         let samples = self.drain_tx_samples();
+        let sample_rate_hz = self.tx_sample_rate_hz.load(Ordering::Relaxed);
         let mut wav = hound::WavWriter::new(
             writer,
             hound::WavSpec {
                 channels: 2,
-                sample_rate: TX_SAMPLE_RATE as u32,
+                sample_rate: sample_rate_hz as u32,
                 bits_per_sample: 16,
                 sample_format: hound::SampleFormat::Int,
             },

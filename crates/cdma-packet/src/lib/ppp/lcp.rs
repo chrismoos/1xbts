@@ -18,7 +18,7 @@ const CONFIGURE_REQUEST: u8 = 1;
 const CONFIGURE_ACK: u8 = 2;
 const CONFIGURE_NAK: u8 = 3;
 const CONFIGURE_REJECT: u8 = 4;
-const TERMINATE_REQUEST: u8 = 5;
+pub const TERMINATE_REQUEST: u8 = 5;
 const TERMINATE_ACK: u8 = 6;
 const CODE_REJECT: u8 = 7;
 const ECHO_REQUEST: u8 = 9;
@@ -30,15 +30,41 @@ const CODE_REJECT_MAX_DATA: usize = 1400;
 
 /// PPP restart timer in packet-session ticks. Packet sessions tick every 20 ms,
 /// so this retransmits pending Configure-Requests once per second.
-const CONFIGURE_RESTART_TICKS: u16 = 50;
-const MAX_CONFIGURE_RESTARTS: u32 = 10;
+pub(crate) const CONFIGURE_RESTART_TICKS: u16 = 50;
+const DEFAULT_MAX_CONFIGURE_RESTARTS: u32 = 10;
+const DEFAULT_LOCAL_MAGIC_NUMBER: u32 = 0x1B75_0001;
+const DEFAULT_REQUESTED_RX_ACCM: u32 = 0x0000_0000;
 
 // LCP option types.
 const OPT_MRU: u8 = 1;
 const OPT_ACCM: u8 = 2;
+const OPT_AUTH_PROTOCOL: u8 = 3;
 const OPT_MAGIC_NUMBER: u8 = 5;
 const OPT_PFC: u8 = 7;
 const OPT_ACFC: u8 = 8;
+
+/// Options this implementation negotiates. Options a peer Configure-Nak
+/// appends beyond this set are not adopted into our Configure-Request.
+const SUPPORTED_OPTIONS: [u8; 5] = [OPT_MRU, OPT_ACCM, OPT_MAGIC_NUMBER, OPT_PFC, OPT_ACFC];
+
+/// Per-session Magic-Number. RFC 1661 §6.4 wants the magic chosen "in the
+/// most random manner possible" so a looped-back link is detectable (our own
+/// request coming back would carry our own magic). Clock entropy is enough
+/// for that purpose; zero is avoided because a zero magic means
+/// "not negotiated" (§5.8).
+fn session_magic() -> u32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let entropy = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() ^ (d.as_secs() as u32))
+        .unwrap_or(0);
+    let magic = DEFAULT_LOCAL_MAGIC_NUMBER ^ entropy;
+    if magic == 0 {
+        DEFAULT_LOCAL_MAGIC_NUMBER
+    } else {
+        magic
+    }
+}
 
 /// Negotiated PPP framing options per direction.
 ///
@@ -57,10 +83,10 @@ pub struct NegotiatedOptions {
     /// Set when we ACK their ACFC option.
     pub peer_sends_acfc: bool,
     /// We may send compressed protocol fields to the peer.
-    /// Set when the peer ACKs our PFC option (currently we don't request PFC).
+    /// Set when the peer ACKs our PFC option.
     pub we_send_pfc: bool,
     /// We may send compressed address/control to the peer.
-    /// Set when the peer ACKs our ACFC option (currently we don't request ACFC).
+    /// Set when the peer ACKs our ACFC option.
     pub we_send_acfc: bool,
     /// ACCM we use when sending to the peer.
     /// This is the value the peer requested (and we ACKed) in their Configure-Request.
@@ -199,6 +225,10 @@ pub struct LcpSession {
     log_context: Option<String>,
     next_id: u8,
     our_mru: u16,
+    our_magic: u32,
+    /// True once the peer has ACKed a Configure-Request of ours that carried
+    /// OPT_MAGIC_NUMBER; until then echoes transmit magic 0 (RFC 1661 §5.8).
+    magic_negotiated: bool,
     peer_acked: bool,
     we_acked: bool,
     last_request_id: Option<u8>,
@@ -206,6 +236,7 @@ pub struct LcpSession {
     last_acked_peer_request_data: Vec<u8>,
     restart_ticks_remaining: u16,
     configure_restarts: u32,
+    max_configure_restarts: u32,
     configure_failed: bool,
     /// Negotiated options — valid once LCP is Opened.
     pub negotiated: NegotiatedOptions,
@@ -226,6 +257,8 @@ impl LcpSession {
             log_context: None,
             next_id: 1,
             our_mru: 1500,
+            our_magic: session_magic(),
+            magic_negotiated: false,
             peer_acked: false,
             we_acked: false,
             last_request_id: None,
@@ -233,6 +266,7 @@ impl LcpSession {
             last_acked_peer_request_data: Vec::new(),
             restart_ticks_remaining: 0,
             configure_restarts: 0,
+            max_configure_restarts: DEFAULT_MAX_CONFIGURE_RESTARTS,
             configure_failed: false,
             negotiated: NegotiatedOptions::default(),
             echo_pending_id: None,
@@ -244,6 +278,10 @@ impl LcpSession {
         self.log_context = Some(context);
     }
 
+    pub fn set_max_configure_restarts(&mut self, restarts: u32) {
+        self.max_configure_restarts = restarts.max(1);
+    }
+
     fn log_prefix(&self, label: &str) -> String {
         match self.log_context.as_deref() {
             Some(context) => format!("{}[{}]", label, context),
@@ -253,10 +291,28 @@ impl LcpSession {
 
     /// Build our Configure-Request options.
     fn our_request_options(&self) -> Vec<LcpOption> {
-        vec![LcpOption {
-            opt_type: OPT_MRU,
-            data: vec![(self.our_mru >> 8) as u8, (self.our_mru & 0xFF) as u8],
-        }]
+        vec![
+            LcpOption {
+                opt_type: OPT_MRU,
+                data: vec![(self.our_mru >> 8) as u8, (self.our_mru & 0xFF) as u8],
+            },
+            LcpOption {
+                opt_type: OPT_ACCM,
+                data: DEFAULT_REQUESTED_RX_ACCM.to_be_bytes().to_vec(),
+            },
+            LcpOption {
+                opt_type: OPT_MAGIC_NUMBER,
+                data: self.our_magic.to_be_bytes().to_vec(),
+            },
+            LcpOption {
+                opt_type: OPT_PFC,
+                data: vec![],
+            },
+            LcpOption {
+                opt_type: OPT_ACFC,
+                data: vec![],
+            },
+        ]
     }
 
     /// Generate our initial Configure-Request. Call once to start negotiation.
@@ -288,10 +344,10 @@ impl LcpSession {
 
     /// Advance the Configure-Request restart timer and retransmit if needed.
     pub fn maybe_retransmit_configure_request(&mut self) -> Option<PppPacket> {
-        if self.state == LcpState::Closed
-            || self.state == LcpState::Opened
-            || self.state == LcpState::AckReceived
-        {
+        // RFC 1661 keeps the restart timer running in Ack-Rcvd (TO+ event),
+        // so a peer that ACKed us but never sent its own Configure-Request
+        // keeps seeing our retransmits.
+        if self.state == LcpState::Closed || self.state == LcpState::Opened {
             return None;
         }
         let id = self.last_request_id?;
@@ -301,7 +357,7 @@ impl LcpSession {
         }
 
         self.configure_restarts = self.configure_restarts.saturating_add(1);
-        if self.configure_restarts > MAX_CONFIGURE_RESTARTS {
+        if self.configure_restarts > self.max_configure_restarts {
             log::warn!(
                 "{}: Configure-Request failed after {} retransmits",
                 self.log_prefix("LCP"),
@@ -393,6 +449,7 @@ impl LcpSession {
                     );
                     self.peer_acked = false;
                     self.we_acked = false;
+                    self.magic_negotiated = false;
                     self.last_request_id = None;
                     self.last_request_data.clear();
                     self.restart_ticks_remaining = 0;
@@ -407,6 +464,7 @@ impl LcpSession {
                 // Evaluate each peer option: Ack, Nak, or Reject.
                 let opts = parse_options(&lcp.data);
                 let mut ack_opts = Vec::new();
+                let mut nak_opts = Vec::new();
                 let mut reject_opts = Vec::new();
 
                 for opt in &opts {
@@ -422,8 +480,32 @@ impl LcpSession {
                             ack_opts.push(opt.clone());
                         }
                         OPT_MAGIC_NUMBER => {
-                            // Accept magic number for loop detection.
-                            ack_opts.push(opt.clone());
+                            // RFC 1661 §6.4: a peer request carrying OUR magic
+                            // means the link may be looped back — Configure-Nak
+                            // with a different magic instead of ACKing our own
+                            // value back to ourselves.
+                            if opt.data.len() == 4
+                                && u32::from_be_bytes([
+                                    opt.data[0],
+                                    opt.data[1],
+                                    opt.data[2],
+                                    opt.data[3],
+                                ]) == self.our_magic
+                            {
+                                log::warn!(
+                                    "{}: peer Configure-Request magic 0x{:08x} equals ours, possible loopback",
+                                    self.log_prefix("LCP RX"),
+                                    self.our_magic,
+                                );
+                                nak_opts.push(LcpOption {
+                                    opt_type: OPT_MAGIC_NUMBER,
+                                    data: (self.our_magic.rotate_left(13) ^ 0x5A5A_5A5A)
+                                        .to_be_bytes()
+                                        .to_vec(),
+                                });
+                            } else {
+                                ack_opts.push(opt.clone());
+                            }
                         }
                         OPT_PFC => {
                             // Peer wants to send us compressed protocol fields.
@@ -464,6 +546,20 @@ impl LcpSession {
                     );
                     responses.push(reject.to_ppp());
                     // Don't set we_acked — peer must retry without rejected options.
+                } else if !nak_opts.is_empty() {
+                    let nak = LcpPacket {
+                        code: CONFIGURE_NAK,
+                        identifier: lcp.identifier,
+                        data: serialize_options(&nak_opts),
+                    };
+                    log::info!(
+                        "{}: Configure-Nak id={} opts=[{}]",
+                        self.log_prefix("LCP TX"),
+                        lcp.identifier,
+                        format_lcp_options(&nak.data)
+                    );
+                    responses.push(nak.to_ppp());
+                    // Don't set we_acked — peer must retry with usable values.
                 } else {
                     // All options acceptable — send Configure-Ack.
                     let ack = LcpPacket {
@@ -525,8 +621,11 @@ impl LcpSession {
                     lcp.identifier,
                     format_lcp_options(&lcp.data)
                 );
+                self.apply_peer_ack_to_our_options(&parse_options(&lcp.data));
                 self.peer_acked = true;
-                self.restart_ticks_remaining = 0;
+                // Restart (not stop) the timer: in Ack-Rcvd the request keeps
+                // retransmitting until the peer's Configure-Request arrives.
+                self.restart_ticks_remaining = CONFIGURE_RESTART_TICKS;
                 self.update_state();
             }
             CONFIGURE_NAK => {
@@ -546,8 +645,19 @@ impl LcpSession {
                     format_lcp_options(&lcp.data)
                 );
                 // Peer is suggesting different values. Parse their suggestions and
-                // resend Configure-Request with their preferred values.
-                let opts = parse_options(&lcp.data);
+                // resend Configure-Request while preserving options not mentioned
+                // by the NAK.
+                let opts = apply_nak_options(&self.last_request_data, &lcp.data);
+                for opt in &opts {
+                    if opt.opt_type == OPT_MAGIC_NUMBER && opt.data.len() == 4 {
+                        self.our_magic = u32::from_be_bytes([
+                            opt.data[0],
+                            opt.data[1],
+                            opt.data[2],
+                            opt.data[3],
+                        ]);
+                    }
+                }
                 let new_data = serialize_options(&opts);
                 self.peer_acked = false;
                 responses.push(self.send_configure_request(new_data));
@@ -573,9 +683,9 @@ impl LcpSession {
                 let rejected = parse_options(&lcp.data);
                 let rejected_types: Vec<u8> = rejected.iter().map(|o| o.opt_type).collect();
 
-                // Rebuild our request without rejected options.
+                // Rebuild our pending request without rejected options.
                 let kept: Vec<LcpOption> = self
-                    .our_request_options()
+                    .last_request_options()
                     .into_iter()
                     .filter(|o| !rejected_types.contains(&o.opt_type))
                     .collect();
@@ -590,8 +700,10 @@ impl LcpSession {
                     self.log_prefix("LCP RX"),
                     lcp.identifier
                 );
-                // Reply with Echo-Reply, same identifier, our magic number (0) + their data.
-                let mut reply_data = vec![0x00, 0x00, 0x00, 0x00]; // magic number = 0
+                // Reply with Echo-Reply, same identifier, our magic + their
+                // data. RFC 1661 §5.8: the magic is zero until the option has
+                // been successfully negotiated, our negotiated value after.
+                let mut reply_data = self.echo_magic().to_be_bytes().to_vec();
                 if lcp.data.len() > 4 {
                     reply_data.extend_from_slice(&lcp.data[4..]);
                 }
@@ -640,6 +752,7 @@ impl LcpSession {
                 self.state = LcpState::Closed;
                 self.peer_acked = false;
                 self.we_acked = false;
+                self.magic_negotiated = false;
                 self.last_request_id = None;
                 self.last_request_data.clear();
                 self.last_acked_peer_request_data.clear();
@@ -753,8 +866,9 @@ impl LcpSession {
         let pkt = LcpPacket {
             code: ECHO_REQUEST,
             identifier: id,
-            // Magic number = 0 (4 bytes, per RFC 1661 §5.8).
-            data: vec![0x00, 0x00, 0x00, 0x00],
+            // RFC 1661 §5.8: zero until Magic-Number is negotiated, then the
+            // negotiated value.
+            data: self.echo_magic().to_be_bytes().to_vec(),
         };
         log::debug!("{}: Echo-Request id={}", self.log_prefix("LCP TX"), id);
         Some(pkt.to_ppp())
@@ -777,6 +891,13 @@ impl LcpSession {
     /// Returns true once the peer has ACKed our Configure-Request.
     pub fn peer_acked_our_request(&self) -> bool {
         self.peer_acked
+    }
+
+    /// Option bytes of our pending Configure-Request (what a peer
+    /// Configure-Ack must echo). Test support for simulating the peer.
+    #[cfg(test)]
+    pub(crate) fn pending_request_data(&self) -> Vec<u8> {
+        self.last_request_data.clone()
     }
 
     /// Force LCP to Opened state.  Used when upper-layer traffic (IPCP/IP)
@@ -803,6 +924,72 @@ impl LcpSession {
         self.next_id = self.next_id.wrapping_add(1);
         id
     }
+
+    fn last_request_options(&self) -> Vec<LcpOption> {
+        // Rebuild from the pending request only: falling back to the full
+        // option set would resurrect Configure-Rejected options into the next
+        // Configure-Request, which RFC 1661 §5.4 forbids.
+        parse_options(&self.last_request_data)
+    }
+
+    /// Magic value for Echo-Request/Echo-Reply per RFC 1661 §5.8.
+    fn echo_magic(&self) -> u32 {
+        if self.magic_negotiated {
+            self.our_magic
+        } else {
+            0
+        }
+    }
+
+    fn apply_peer_ack_to_our_options(&mut self, opts: &[LcpOption]) {
+        self.negotiated.rx_accm = 0xFFFF_FFFF;
+        self.negotiated.we_send_pfc = false;
+        self.negotiated.we_send_acfc = false;
+
+        for opt in opts {
+            match opt.opt_type {
+                OPT_ACCM if opt.data.len() == 4 => {
+                    self.negotiated.rx_accm =
+                        u32::from_be_bytes([opt.data[0], opt.data[1], opt.data[2], opt.data[3]]);
+                }
+                OPT_MAGIC_NUMBER if opt.data.len() == 4 => {
+                    // The Ack handler already verified the data is
+                    // byte-identical to our request, so the value is ours;
+                    // the ACK makes it the negotiated magic.
+                    self.magic_negotiated = true;
+                }
+                OPT_PFC => {
+                    self.negotiated.we_send_pfc = true;
+                }
+                OPT_ACFC => {
+                    self.negotiated.we_send_acfc = true;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn apply_nak_options(current_data: &[u8], nak_data: &[u8]) -> Vec<LcpOption> {
+    let mut opts = parse_options(current_data);
+    for suggested in parse_options(nak_data) {
+        match opts
+            .iter_mut()
+            .find(|opt| opt.opt_type == suggested.opt_type)
+        {
+            Some(existing) => *existing = suggested,
+            None => {
+                // RFC 1661 §5.3 lets the peer append options it wants us to
+                // start negotiating, but only adopt ones we implement —
+                // echoing e.g. an appended Auth-Protocol back in our request
+                // would wedge negotiation on an option we cannot honor.
+                if SUPPORTED_OPTIONS.contains(&suggested.opt_type) {
+                    opts.push(suggested);
+                }
+            }
+        }
+    }
+    opts
 }
 
 /// Format LCP options for logging.
@@ -811,21 +998,21 @@ fn format_lcp_options(data: &[u8]) -> String {
     opts.iter()
         .map(|o| {
             let name = match o.opt_type {
-                1 => "MRU",
-                2 => "ACCM",
-                3 => "AuthProto",
-                5 => "MagicNumber",
-                7 => "ProtocolFieldCompression",
-                8 => "AddressControlFieldCompression",
+                OPT_MRU => "MRU",
+                OPT_ACCM => "ACCM",
+                OPT_AUTH_PROTOCOL => "AuthProto",
+                OPT_MAGIC_NUMBER => "MagicNumber",
+                OPT_PFC => "ProtocolFieldCompression",
+                OPT_ACFC => "AddressControlFieldCompression",
                 _ => "Unknown",
             };
-            if o.opt_type == 1 && o.data.len() == 2 {
+            if o.opt_type == OPT_MRU && o.data.len() == 2 {
                 let mru = ((o.data[0] as u16) << 8) | o.data[1] as u16;
                 format!("{}={}", name, mru)
-            } else if o.opt_type == 2 && o.data.len() == 4 {
+            } else if o.opt_type == OPT_ACCM && o.data.len() == 4 {
                 let accm = u32::from_be_bytes([o.data[0], o.data[1], o.data[2], o.data[3]]);
                 format!("{}=0x{:08x}", name, accm)
-            } else if o.opt_type == 5 && o.data.len() == 4 {
+            } else if o.opt_type == OPT_MAGIC_NUMBER && o.data.len() == 4 {
                 let magic = u32::from_be_bytes([o.data[0], o.data[1], o.data[2], o.data[3]]);
                 format!("{}=0x{:08x}", name, magic)
             } else {
@@ -843,15 +1030,6 @@ mod tests {
     fn make_configure_request(id: u8, options: &[LcpOption]) -> PppPacket {
         let lcp = LcpPacket {
             code: CONFIGURE_REQUEST,
-            identifier: id,
-            data: serialize_options(options),
-        };
-        lcp.to_ppp()
-    }
-
-    fn make_configure_ack(id: u8, options: &[LcpOption]) -> PppPacket {
-        let lcp = LcpPacket {
-            code: CONFIGURE_ACK,
             identifier: id,
             data: serialize_options(options),
         };
@@ -897,7 +1075,7 @@ mod tests {
         let mut session = LcpSession::new();
         assert_eq!(session.state, LcpState::Closed);
 
-        // Step 1: BS sends Configure-Request (MRU=1500).
+        // Step 1: BS sends Configure-Request.
         let our_req = session.start();
         assert_eq!(session.state, LcpState::RequestSent);
         assert_eq!(our_req.protocol, LCP_PROTOCOL);
@@ -921,13 +1099,12 @@ mod tests {
         assert_eq!(session.state, LcpState::AckSent);
 
         // Step 3: Mobile acks our Configure-Request.
-        let mobile_ack = make_configure_ack(
-            parsed.identifier,
-            &[LcpOption {
-                opt_type: OPT_MRU,
-                data: vec![0x05, 0xDC],
-            }],
-        );
+        let mobile_ack = LcpPacket {
+            code: CONFIGURE_ACK,
+            identifier: parsed.identifier,
+            data: parsed.data,
+        }
+        .to_ppp();
         let responses = session.receive(&mobile_ack);
         assert!(responses.is_empty());
         assert_eq!(session.state, LcpState::Opened);
@@ -978,7 +1155,7 @@ mod tests {
         let mut session = LcpSession::new();
         session.start();
 
-        for _ in 0..MAX_CONFIGURE_RESTARTS {
+        for _ in 0..DEFAULT_MAX_CONFIGURE_RESTARTS {
             for _ in 0..CONFIGURE_RESTART_TICKS {
                 assert!(session.maybe_retransmit_configure_request().is_none());
             }
@@ -1017,6 +1194,24 @@ mod tests {
     }
 
     #[test]
+    fn configure_ack_records_options_from_our_request() {
+        let mut session = LcpSession::new();
+        let first = session.start();
+        let first_lcp = LcpPacket::parse(&first.payload).unwrap();
+
+        let ack = LcpPacket {
+            code: CONFIGURE_ACK,
+            identifier: first_lcp.identifier,
+            data: first_lcp.data,
+        };
+        assert!(session.receive(&ack.to_ppp()).is_empty());
+        assert_eq!(session.state, LcpState::AckReceived);
+        assert_eq!(session.negotiated.rx_accm, DEFAULT_REQUESTED_RX_ACCM);
+        assert!(session.negotiated.we_send_pfc);
+        assert!(session.negotiated.we_send_acfc);
+    }
+
+    #[test]
     fn negotiates_accm_pfc_acfc() {
         let mut session = LcpSession::new();
         session.start();
@@ -1048,7 +1243,8 @@ mod tests {
         assert_eq!(session.negotiated.tx_accm, 0x00000000);
         assert!(session.negotiated.peer_sends_pfc);
         assert!(session.negotiated.peer_sends_acfc);
-        // We didn't request PFC/ACFC, so we can't send them.
+        // The peer has not ACKed our request yet, so we cannot send compressed
+        // fields even though we can now receive them.
         assert!(!session.negotiated.we_send_pfc);
         assert!(!session.negotiated.we_send_acfc);
     }
@@ -1104,11 +1300,17 @@ mod tests {
         assert_eq!(responses.len(), 1);
         let retry = LcpPacket::parse(&responses[0].payload).unwrap();
         assert_eq!(retry.code, CONFIGURE_REQUEST);
-        // Should contain the NAK'd value.
+        // Should contain the NAK'd value while preserving the other options
+        // from the original request.
         let opts = parse_options(&retry.data);
-        assert_eq!(opts.len(), 1);
-        assert_eq!(opts[0].opt_type, OPT_MRU);
-        assert_eq!(opts[0].data, vec![0x02, 0x40]);
+        assert!(
+            opts.iter()
+                .any(|opt| opt.opt_type == OPT_MRU && opt.data == vec![0x02, 0x40])
+        );
+        assert!(opts.iter().any(|opt| opt.opt_type == OPT_ACCM));
+        assert!(opts.iter().any(|opt| opt.opt_type == OPT_MAGIC_NUMBER));
+        assert!(opts.iter().any(|opt| opt.opt_type == OPT_PFC));
+        assert!(opts.iter().any(|opt| opt.opt_type == OPT_ACFC));
     }
 
     #[test]
@@ -1129,9 +1331,13 @@ mod tests {
         assert_eq!(responses.len(), 1);
         let retry = LcpPacket::parse(&responses[0].payload).unwrap();
         assert_eq!(retry.code, CONFIGURE_REQUEST);
-        // MRU should be gone.
+        // MRU should be gone; the rest of our request remains pending.
         let opts = parse_options(&retry.data);
-        assert!(opts.is_empty());
+        assert!(!opts.iter().any(|opt| opt.opt_type == OPT_MRU));
+        assert!(opts.iter().any(|opt| opt.opt_type == OPT_ACCM));
+        assert!(opts.iter().any(|opt| opt.opt_type == OPT_MAGIC_NUMBER));
+        assert!(opts.iter().any(|opt| opt.opt_type == OPT_PFC));
+        assert!(opts.iter().any(|opt| opt.opt_type == OPT_ACFC));
     }
 
     #[test]

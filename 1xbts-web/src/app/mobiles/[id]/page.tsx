@@ -10,10 +10,18 @@ import { TimeSeriesChart, type Series } from "@/components/time-series-chart";
 import { esnManufacturer } from "@/lib/esn-manufacturer";
 import {
   AccessDetail,
+  HrpdAccessDetail,
+  HrpdSessionDetail,
+  HrpdTrafficDetail,
   PagingDetail,
   TrafficDetail,
   formatAccessSummary,
   formatAccessChannel,
+  formatHrpdAccessSummary,
+  formatHrpdSessionSummary,
+  formatHrpdTrafficSummary,
+  hrpdDirectionClass,
+  hrpdDirectionLabel,
   shouldHideAccessEvent,
   formatPagingSummary,
   formatTrafficChannel,
@@ -25,9 +33,16 @@ import {
   fingerprintTrafficEvent,
 } from "@/lib/event-fingerprint";
 import { useEventStream } from "@/lib/use-event-stream";
+import { hrpdTimestampNsToUs } from "@/lib/hrpd-correlation";
 import { type LogEntry, makeLogEntryId, makeSortKey, sortLogEntries, formatTime } from "@/lib/message-log";
 import { formatEsn, formatMeid } from "@/lib/format";
+import { isSyntheticPacketMobileAddress } from "@/lib/mobile-directory";
 import type { AccessEvent, PagingEvent, TrafficEvent } from "@/lib/proto/bsc/v1/service";
+import type {
+  HrpdAccessEvent,
+  HrpdSessionEvent,
+  HrpdTrafficEvent,
+} from "@/lib/proto/events/v1/an";
 import type { SubscriberIdentity } from "@/lib/proto/hlr/v1/service";
 
 interface MobileInfo {
@@ -103,8 +118,15 @@ interface PacketSessionInfo {
   mobileAddress: string;
   subscriberId: string;
   phoneNumber: string;
+  imsi: string;
+  meid: string;
+  hrpdMnId: string;
+  hrpdMnIdSource: string;
+  subscriberImsi: string;
+  esn: number;
   trafficWalshCode: number;
   captureEnabled: boolean;
+  accessTechnology: string;
 }
 
 interface SubscriberDetail {
@@ -199,6 +221,25 @@ function accessMatchesMobile(event: AccessEvent, mobile: MobileInfo): boolean {
   if (mobile.esn != null && event.esn === mobile.esn) return true;
   if (event.address && event.address === mobile.address) return true;
   if (event.trafficWalshCode != null && mobile.trafficWalshCode === event.trafficWalshCode) return true;
+  return false;
+}
+
+function hrpdTimestampUs(event: HrpdSessionEvent | HrpdAccessEvent | HrpdTrafficEvent): number {
+  return hrpdTimestampNsToUs(event.timestampNs);
+}
+
+function hrpdMatchesMobile(
+  event: HrpdSessionEvent | HrpdAccessEvent | HrpdTrafficEvent,
+  mobile: MobileInfo,
+): boolean {
+  const enriched = event as typeof event & {
+    identity?: { imsi?: string; esn?: number; meid?: string };
+    subscriber?: { subscriberId?: string };
+  };
+  if (mobile.subscriberId && enriched.subscriber?.subscriberId === mobile.subscriberId) return true;
+  if (mobile.imsi && enriched.identity?.imsi === mobile.imsi) return true;
+  if (mobile.esn != null && enriched.identity?.esn === mobile.esn) return true;
+  if (mobile.meid && enriched.identity?.meid?.toLowerCase() === mobile.meid.toLowerCase()) return true;
   return false;
 }
 
@@ -450,6 +491,60 @@ export default function MobileDetailPage({
     }
   }, [addMessage, mobile]));
 
+  useEventStream("hrpd-session", useCallback((data: string) => {
+    if (!mobile) return;
+    const event: HrpdSessionEvent = JSON.parse(data);
+    if (!hrpdMatchesMobile(event, mobile)) return;
+    const ts = hrpdTimestampUs(event);
+    const sequence = (event as HrpdSessionEvent & { sequence?: string | number }).sequence ?? ts;
+    addMessage({
+      kind: "hrpd",
+      stream: "session",
+      id: makeLogEntryId("hrpd", ts),
+      ts,
+      identity: `hrpd:session:${event.uati}:${event.reason}:${sequence}`,
+      sortKey: `hrpd:session:${event.uati}:${sequence}`,
+      event,
+      seenCount: 1,
+    });
+  }, [addMessage, mobile]));
+
+  useEventStream("hrpd-access", useCallback((data: string) => {
+    if (!mobile) return;
+    const event: HrpdAccessEvent = JSON.parse(data);
+    if (!hrpdMatchesMobile(event, mobile)) return;
+    const ts = hrpdTimestampUs(event);
+    const sequence = (event as HrpdAccessEvent & { sequence?: string | number }).sequence ?? ts;
+    addMessage({
+      kind: "hrpd",
+      stream: "access",
+      id: makeLogEntryId("hrpd", ts),
+      ts,
+      identity: `hrpd:access:${event.uati}:${event.accessSignature}:${event.reason}:${sequence}`,
+      sortKey: `hrpd:access:${event.uati}:${sequence}`,
+      event,
+      seenCount: 1,
+    });
+  }, [addMessage, mobile]));
+
+  useEventStream("hrpd-traffic", useCallback((data: string) => {
+    if (!mobile) return;
+    const event: HrpdTrafficEvent = JSON.parse(data);
+    if (!hrpdMatchesMobile(event, mobile)) return;
+    const ts = hrpdTimestampUs(event);
+    const sequence = (event as HrpdTrafficEvent & { sequence?: string | number }).sequence ?? ts;
+    addMessage({
+      kind: "hrpd",
+      stream: "traffic",
+      id: makeLogEntryId("hrpd", ts),
+      ts,
+      identity: `hrpd:traffic:${event.uati}:${event.reason}:${event.macIndex}:${event.direction}:${sequence}`,
+      sortKey: `hrpd:traffic:${event.uati}:${sequence}`,
+      event,
+      seenCount: 1,
+    });
+  }, [addMessage, mobile]));
+
   const sendSms = async () => {
     if (!smsText.trim()) return;
     setSmsSending(true);
@@ -666,7 +761,18 @@ export default function MobileDetailPage({
   const mobilePacketSessions = packetSessions.filter((session) => {
     if (session.phase === "closed") return false;
     if (mobile.subscriberId && session.subscriberId === mobile.subscriberId) return true;
-    if (session.mobileAddress && session.mobileAddress === mobile.address) return true;
+    if (mobile.imsi && (session.subscriberImsi === mobile.imsi || session.imsi === mobile.imsi)) {
+      return true;
+    }
+    if (mobile.esn != null && session.esn === mobile.esn) return true;
+    if (mobile.meid && session.meid === mobile.meid) return true;
+    if (
+      session.mobileAddress &&
+      !isSyntheticPacketMobileAddress(session.mobileAddress) &&
+      session.mobileAddress === mobile.address
+    ) {
+      return true;
+    }
     return false;
   });
 
@@ -931,8 +1037,12 @@ export default function MobileDetailPage({
                       {session.sessionId}
                     </Link>
                     <div className="text-xs text-muted">
-                      SO{session.serviceOption}
-                      {session.trafficWalshCode ? ` · W${session.trafficWalshCode}` : ""}
+                      {session.accessTechnology || "1x"} · SO{session.serviceOption}
+                      {session.trafficWalshCode
+                        ? session.accessTechnology === "HRPD"
+                          ? ` · key ${session.trafficWalshCode}`
+                          : ` · W${session.trafficWalshCode}`
+                        : ""}
                       {session.captureEnabled ? " · capture enabled" : ""}
                     </div>
                   </div>
@@ -1368,7 +1478,7 @@ export default function MobileDetailPage({
                     >
                       <div className="flex-1 min-w-0 flex items-center gap-2">
                         <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
-                        <span className="text-accent-blue font-mono text-xs w-6 shrink-0">TX</span>
+                        <span className="text-accent-blue font-mono text-xs w-12 shrink-0">1x TX</span>
                         <span className="text-dimmed text-xs shrink-0">F-PCH</span>
                         <span className="text-primary shrink-0">{typeName}</span>
                         {entry.seenCount > 1 && (
@@ -1410,7 +1520,7 @@ export default function MobileDetailPage({
                     >
                       <div className="flex-1 min-w-0 flex items-center gap-2">
                         <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
-                        <span className="text-accent-cyan font-mono text-xs w-6 shrink-0">TX</span>
+                        <span className="text-accent-cyan font-mono text-xs w-12 shrink-0">1x TX</span>
                         <span className="text-dimmed text-xs shrink-0">{formatTrafficChannel(entry.event)}</span>
                         <span className="text-primary shrink-0">{typeName}</span>
                         {entry.seenCount > 1 && (
@@ -1437,6 +1547,52 @@ export default function MobileDetailPage({
                     )}
                   </div>
                 );
+              } else if (entry.kind === "hrpd") {
+                let typeName: string;
+                let summary: string;
+                let detail;
+                if (entry.stream === "session") {
+                  typeName = "HRPD Session";
+                  summary = formatHrpdSessionSummary(entry.event);
+                  detail = <HrpdSessionDetail event={entry.event} />;
+                } else if (entry.stream === "access") {
+                  typeName = "HRPD Access";
+                  summary = formatHrpdAccessSummary(entry.event);
+                  detail = <HrpdAccessDetail event={entry.event} />;
+                } else {
+                  typeName = "HRPD Traffic";
+                  summary = formatHrpdTrafficSummary(entry.event);
+                  detail = <HrpdTrafficDetail event={entry.event} />;
+                }
+                return (
+                  <div
+                    key={entry.id}
+                    className="border-b border-border-subtle py-1.5 px-2 -mx-2 rounded"
+                  >
+                    <div
+                      className="flex items-center gap-2 text-sm cursor-pointer hover:bg-hover rounded"
+                      onClick={() => toggleExpand(entry.id)}
+                    >
+                      <div className="flex-1 min-w-0 flex items-center gap-2">
+                        <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
+                        <span className={`${"direction" in entry.event ? hrpdDirectionClass(entry.event.direction) : hrpdDirectionClass()} font-mono text-xs w-16 shrink-0`}>
+                          {"direction" in entry.event ? hrpdDirectionLabel(entry.event.direction) : "EVDO"}
+                        </span>
+                        <span className="text-primary shrink-0">{typeName}</span>
+                        {entry.seenCount > 1 && (
+                          <span className="text-muted text-xs shrink-0">x{entry.seenCount}</span>
+                        )}
+                        <span className="text-muted text-xs truncate">{summary}</span>
+                      </div>
+                      <div className="shrink-0 flex items-center gap-1">
+                        <span className="text-dimmed text-xs">{isExpanded ? "▾" : "▸"}</span>
+                      </div>
+                    </div>
+                    {isExpanded && (
+                      <div className="mt-1.5 ml-8 pb-1">{detail}</div>
+                    )}
+                  </div>
+                );
               } else {
                 const ev = entry.event;
                 return (
@@ -1450,7 +1606,7 @@ export default function MobileDetailPage({
                     >
                       <div className="flex-1 min-w-0 flex items-center gap-2">
                         <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
-                        <span className="text-accent-green font-mono text-xs w-6 shrink-0">RX</span>
+                        <span className="text-accent-green font-mono text-xs w-12 shrink-0">1x RX</span>
                         <span className="text-dimmed text-xs shrink-0">{formatAccessChannel(ev)}</span>
                         <span className="text-primary shrink-0">{ev.msgTypeName}</span>
                         {entry.seenCount > 1 && (

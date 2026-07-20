@@ -297,6 +297,12 @@ pub struct BscNodeConfig {
     /// across all BSC instances. Defaults to "bsc".
     #[serde(default = "default_node_id")]
     pub node_id: String,
+    /// Optional HRPD AN A21 endpoint. When set the BSC opens an A21 client
+    /// connection on startup, maintains a HybridIdentityCache from inbound
+    /// IdentityBinding / IdentityRelease messages, and consults it from the
+    /// paging path to divert HRPD-attached MTs into A21 CrossPageRequest.
+    #[serde(default)]
+    pub an_a21_addr: Option<SocketAddr>,
 }
 
 fn default_node_id() -> String {
@@ -319,6 +325,7 @@ impl Default for BscNodeConfig {
             bearer: BscBearerConfig::default(),
             voice_bearer_bind_ip: default_voice_bearer_bind_ip(),
             node_id: default_node_id(),
+            an_a21_addr: None,
         }
     }
 }
@@ -351,8 +358,7 @@ fn default_iq_capture_dir() -> PathBuf {
 
 /// mTLS configuration for the management plane. When `None` on
 /// `ManagementConfig`, the management server is plaintext and accepts any
-/// client. See `docs/architecture-update/07-management-and-web-touchpoints.md`
-/// "Auth Model".
+/// client.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MtlsConfig {
     /// Path to the PEM-encoded server certificate.
@@ -373,7 +379,7 @@ pub struct ManagementConfig {
     /// Operator/UI gRPC listen address.
     pub grpc_listen_addr: SocketAddr,
     /// Optional mTLS configuration. `None` (default) = plaintext server,
-    /// accept any client. Required from WS-6 multi-host onward.
+    /// accept any client. Required for multi-host deployments.
     #[serde(default)]
     pub mtls: Option<MtlsConfig>,
     /// Enable the tokio-console gRPC endpoint for async task introspection.

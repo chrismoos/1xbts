@@ -967,6 +967,34 @@ mod tests {
     }
 
     #[test]
+    fn test_pd01_capture_decodes_short_mobile_station_reject_order() {
+        let hex = "42751a7501161666431c00d9cf7c001e0fb052f000";
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex"))
+            .collect();
+        let mut bits = Bitstream::new_bytes(&bytes);
+        bits.drain(162..bits.len()); // Packed log hex has six display-padding bits.
+
+        let pdu = ReverseAccessPdu::decode(&bits).expect("decode captured PDU");
+        let summary = pdu.summary();
+        let ReverseAccessPdu::Pd01PRev6(pdu) = pdu else {
+            panic!("expected P_REV 6 wrapper");
+        };
+
+        assert_eq!(pdu.sdu_plus_padding_raw.len(), 31);
+        assert!(!summary.contains("sdu_decode_error"), "{summary}");
+        assert!(
+            summary.contains("ORDQ=0x05 (message type or order code not understood)"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("REJECTED_TYPE=0x2F (Alternative Technologies Information Message)"),
+            "{summary}"
+        );
+    }
+
+    #[test]
     fn test_reverse_access_pdu_rejects_reserved_pd() {
         let mut bits = Bitstream::new();
         bits.write_u8(0xC0, 8);

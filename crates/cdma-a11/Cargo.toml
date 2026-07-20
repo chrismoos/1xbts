@@ -9,6 +9,8 @@ homepage.workspace = true
 description = "A11 packet-data signaling support for the 1xBTS packet core."
 
 [dependencies]
+md-5 = "0.10"
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["net"] }
 
 [lib]

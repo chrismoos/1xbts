@@ -1,8 +1,7 @@
 //! PCF-owned packet-data session state.
 //!
-//! This module is the Track C extraction target for packet anchoring that was
-//! previously coupled to the BSC. It deliberately owns the A8 bearer binding and
-//! A11 forwarding queue while leaving the BSC-facing side as A9 signaling only.
+//! Owns packet anchoring — the A8 bearer binding and A11 forwarding queue —
+//! while leaving the BSC-facing side as A9 signaling only.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::{Display, Formatter};
@@ -169,6 +168,63 @@ impl PcfSessionManager {
             .map(PcfEvent::A9Applied)
     }
 
+    /// Retargets the PCF's A9 procedure state after accepting a fresh
+    /// `SetupA8` for an already-connected A8 traffic identifier.
+    pub fn retarget_connected_a9(
+        &mut self,
+        setup: &cdma_a9::SetupA8Message,
+        connect: &cdma_a9::ConnectA8Message,
+    ) -> std::result::Result<PcfEvent, cdma_a9::Error> {
+        self.a9_engine
+            .retarget_connected_a8(setup, connect)
+            .map(PcfEvent::A9Applied)
+    }
+
+    /// Retargets the PCF's A9 procedure state from an existing A8 traffic
+    /// identifier to a fresh `SetupA8`/`ConnectA8` exchange.
+    pub fn retarget_connected_a9_from(
+        &mut self,
+        existing_traffic_id: &cdma_a9::A8TrafficId,
+        setup: &cdma_a9::SetupA8Message,
+        connect: &cdma_a9::ConnectA8Message,
+    ) -> std::result::Result<PcfEvent, cdma_a9::Error> {
+        self.a9_engine
+            .retarget_connected_a8_from(existing_traffic_id, setup, connect)
+            .map(PcfEvent::A9Applied)
+    }
+
+    /// Finds an existing PCF session for a normalized A9 mobile identity.
+    pub fn session_id_by_mobile_identity(&self, mobile_identity: &[u8]) -> Option<PcfSessionId> {
+        self.sessions
+            .values()
+            .find(|session| session.mobile_identity.as_deref() == Some(mobile_identity))
+            .map(|session| session.id)
+    }
+
+    /// Retargets an already-connected same-mobile A8 procedure to a fresh A8
+    /// traffic identifier. This keeps duplicate SetupA8 recovery inside PCF
+    /// state instead of letting the UDP service guess identity policy.
+    pub fn retarget_same_mobile_connected_a9_from(
+        &mut self,
+        id: PcfSessionId,
+        existing_traffic_id: &cdma_a9::A8TrafficId,
+        mobile_identity: &[u8],
+        setup: &cdma_a9::SetupA8Message,
+        connect: &cdma_a9::ConnectA8Message,
+    ) -> std::result::Result<PcfEvent, cdma_a9::Error> {
+        let session = self
+            .sessions
+            .get(&id)
+            .ok_or(cdma_a9::Error::UnknownSession)?;
+        if session.mobile_identity.as_deref() != Some(mobile_identity) {
+            return Err(cdma_a9::Error::InvalidProcedureState {
+                message_type: cdma_a9::MessageType::SetupA8,
+                state: "duplicate SetupA8 mobile identity does not match PCF session",
+            });
+        }
+        self.retarget_connected_a9_from(existing_traffic_id, setup, connect)
+    }
+
     /// Starts a PCF-owned session after accepting A9 setup from the BSC.
     pub fn create_from_a9(&mut self, mobile_identity: Option<Vec<u8>>) -> Result<PcfEvent> {
         self.next_session_id = self.next_session_id.wrapping_add(1);
@@ -279,13 +335,22 @@ impl PcfSessionManager {
     }
 
     /// Marks a session active after the PDSN accepts A11 registration.
+    ///
+    /// A positive-lifetime A11 Registration Request is also used as a refresh
+    /// for an already-active HRPD packet session. That refresh is important
+    /// after an AT-requested PPP teardown: the PCF may still own the A8/A9
+    /// session while the PDSN has removed its A10 packet task, so the next
+    /// traffic-channel retarget must be able to complete A11 registration again.
     pub fn complete_a11_registration(
         &mut self,
         id: PcfSessionId,
         key: cdma_a11::SessionKey,
     ) -> Result<PcfEvent> {
         let session = self.session_mut(id)?;
-        if !matches!(session.phase, PcfSessionPhase::A11RegistrationPending) {
+        if !matches!(
+            session.phase,
+            PcfSessionPhase::A11RegistrationPending | PcfSessionPhase::Active
+        ) {
             return Err(PcfError::InvalidSessionPhase {
                 id,
                 phase: session.phase,
@@ -421,6 +486,46 @@ impl PcfSessionManager {
 mod tests {
     use super::*;
 
+    fn setup_message(con_ref: u8, key: u32) -> cdma_a9::SetupA8Message {
+        cdma_a9::SetupA8Message {
+            call_connection_reference: Some(cdma_a9::CallConnectionReference::new(
+                0x0102, 0x0304, 0x05060708,
+            )),
+            correlation_id: Some(cdma_a9::CorrelationId([9, 10, 11, 12])),
+            imsi: Some("123456789012345".into()),
+            esn: Some(0x01020304),
+            meid: None,
+            con_ref: cdma_a9::ConRef(con_ref),
+            quality_of_service_parameters: None,
+            bsc_id: cdma_a9::BscId(vec![0xaa, 0xbb]),
+            a8_traffic_id: cdma_a9::A8TrafficId::gre_ppp(key, [192, 0, 2, 10]),
+            service_option: cdma_a9::ServiceOptionValue::HIGH_RATE_PACKET_DATA,
+            a9_indicators: cdma_a9::A9Indicators {
+                packet_boundary_supported: false,
+                gre_segmentation_supported: false,
+                sdb_supported: false,
+                ccpd_mode: false,
+                data_ready: true,
+                handoff: false,
+            },
+            user_zone_id: None,
+        }
+    }
+
+    fn connect_response(setup: &cdma_a9::SetupA8Message) -> cdma_a9::ConnectA8Message {
+        cdma_a9::ConnectA8Message {
+            call_connection_reference: setup.call_connection_reference,
+            correlation_id: setup.correlation_id,
+            imsi: setup.imsi.clone(),
+            esn: setup.esn,
+            meid: None,
+            con_ref: setup.con_ref,
+            a8_traffic_id: setup.a8_traffic_id.clone(),
+            cause: cdma_a9::CauseValue(0x13),
+            pdsn_ip_address: None,
+        }
+    }
+
     #[test]
     fn a9_setup_timeout_removes_session() {
         let mut mgr = PcfSessionManager::new();
@@ -484,6 +589,92 @@ mod tests {
             }
         ));
         assert_eq!(mgr.session(id).unwrap().phase, PcfSessionPhase::Releasing);
+    }
+
+    #[test]
+    fn a11_registration_refresh_keeps_active_session() {
+        let mut mgr = PcfSessionManager::new();
+        let ev = mgr.create_from_a9(None).unwrap();
+        let id = match ev {
+            PcfEvent::SessionCreated { id } => id,
+            _ => panic!("unexpected event"),
+        };
+        mgr.bind_a8_bearer(
+            id,
+            cdma_a8::BearerSession::new(
+                1,
+                cdma_a8::BearerEndpoint::new([10, 0, 0, 1], [10, 0, 0, 2]),
+            ),
+        )
+        .unwrap();
+        let key = cdma_a11::SessionKey {
+            pcf_session_id: 1,
+            mn_session_reference_id: 100,
+        };
+        mgr.complete_a11_registration(id, key).unwrap();
+
+        let refreshed_key = cdma_a11::SessionKey {
+            pcf_session_id: 1,
+            mn_session_reference_id: 101,
+        };
+        let event = mgr.complete_a11_registration(id, refreshed_key).unwrap();
+
+        assert_eq!(
+            event,
+            PcfEvent::A11RegistrationCompleted {
+                id,
+                key: refreshed_key
+            }
+        );
+        let session = mgr.session(id).unwrap();
+        assert_eq!(session.phase, PcfSessionPhase::Active);
+        assert_eq!(session.a11_session_key, Some(refreshed_key));
+    }
+
+    #[test]
+    fn duplicate_mobile_retarget_requires_matching_pcf_identity() {
+        let mut mgr = PcfSessionManager::new();
+        let identity = vec![0x11, 0x22, 0x33];
+        let setup = setup_message(0x10, 0x0102_0304);
+        let connect = connect_response(&setup);
+        mgr.apply_inbound_a9(cdma_a9::ProcedureMessage::SetupA8(setup.clone()))
+            .unwrap();
+        let id = match mgr.create_from_a9(Some(identity.clone())).unwrap() {
+            PcfEvent::SessionCreated { id } => id,
+            event => panic!("unexpected event {event:?}"),
+        };
+        mgr.apply_outbound_a9(cdma_a9::ProcedureMessage::ConnectA8(connect))
+            .unwrap();
+
+        assert_eq!(mgr.session_id_by_mobile_identity(&identity), Some(id));
+
+        let retarget_setup = setup_message(0x11, 0x0102_0305);
+        let retarget_connect = connect_response(&retarget_setup);
+        mgr.retarget_same_mobile_connected_a9_from(
+            id,
+            &setup.a8_traffic_id,
+            &identity,
+            &retarget_setup,
+            &retarget_connect,
+        )
+        .unwrap();
+
+        let err = mgr
+            .retarget_same_mobile_connected_a9_from(
+                id,
+                &retarget_setup.a8_traffic_id,
+                &[0xff],
+                &setup,
+                &connect_response(&setup),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            cdma_a9::Error::InvalidProcedureState {
+                message_type: cdma_a9::MessageType::SetupA8,
+                ..
+            }
+        ));
     }
 
     #[test]

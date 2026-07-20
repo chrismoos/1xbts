@@ -9,6 +9,7 @@ import "events/v1/pcf.proto";
 import "events/v1/hlr.proto";
 import "events/v1/smsc.proto";
 import "events/v1/bts.proto";
+import "events/v1/an.proto";
 
 // Aggregated event bus. Every component publishes events here as a gRPC
 // client; every consumer subscribes to ListenEvents.
@@ -34,6 +35,7 @@ enum EventSource {
   EVENT_SOURCE_HLR  = 6;
   EVENT_SOURCE_SMSC = 7;
   EVENT_SOURCE_NIB  = 8;
+  EVENT_SOURCE_AN   = 9;
 }
 
 // Radio-layer identifiers known at the producer site. Producers fill in
@@ -79,7 +81,7 @@ message NetworkEvent {
   EventSource source = 2;
   // Monotonic per-server sequence; the bus assigns this before fan-out.
   // Producers leave it zero on Publish.
-  uint64 sequence = 3;
+  uint64 sequence = 3 [jstype = JS_STRING];
   // Free-form producer identity (e.g. "pdsn-0") for multi-instance setups.
   string producer_instance = 4;
   // The mobile this event pertains to. Either or both of `identity` and
@@ -97,6 +99,7 @@ message NetworkEvent {
     HlrNetworkEvent  hlr  = 14;
     SmscNetworkEvent smsc = 15;
     BtsNetworkEvent  bts  = 16;
+    AnNetworkEvent   an   = 17;
   }
 }
 
@@ -105,7 +108,7 @@ message PublishRequest {
 }
 
 message PublishAck {
-  uint64 assigned_sequence = 1;
+  uint64 assigned_sequence = 1 [jstype = JS_STRING];
 }
 
 message ListenEventsRequest {

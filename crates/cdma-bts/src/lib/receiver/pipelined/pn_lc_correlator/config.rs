@@ -1,3 +1,4 @@
+use super::super::ShortCodeReferenceKind;
 use super::super::gardner_timing_recovery::GardnerTimingConfig;
 
 /// Tuning parameters for [`PnLcCorrelator`].
@@ -67,6 +68,16 @@ pub struct PnLcConfig {
     /// coarse FFT PN reference for both stages.
     pub split_pn_reference: bool,
 
+    /// Short-code PN family used by the PN/LC reference. 1x reverse paths use
+    /// legacy cdma2000; HRPD reverse access uses the access-terminal common
+    /// short-code PN sequences.
+    pub short_code_reference: ShortCodeReferenceKind,
+
+    /// HPSK signal convention for complex samples. Existing 1x RC3 paths use
+    /// the conjugated `I-jQ` convention; HRPD reverse access captures use
+    /// ordinary `I+jQ` IQ samples.
+    pub hpsk_signal_conjugated: bool,
+
     /// Re-anchor the absolute sample origin on every block using the
     /// hardware-timestamp-derived `absolute_sample_start` tag.
     ///
@@ -84,6 +95,14 @@ pub struct PnLcConfig {
     /// h_I(n) = (-1)^LC[2n] (even chips), h_Q(n) = (-1)^LC[2n+1] (odd chips).
     /// Set to 2 for RC3+ HPSK; leave at 1 for IS-95/RC1/RC2.
     pub lc_decimation: usize,
+
+    /// Optional long-code reload period in chips. HRPD reverse channels
+    /// reload the long-code generator at the start of every short-code
+    /// period; 1x leaves this unset and uses the ordinary long sequence.
+    pub lc_period_chips: Option<usize>,
+
+    /// Initial long-code state used when `lc_period_chips` is set.
+    pub lc_period_initial_state: u64,
 
     /// When true, skip the expensive FFT search once a hard-validated finger
     /// exists. The search resumes automatically if the finger is lost.
@@ -209,8 +228,12 @@ impl PnLcConfig {
             chip_block_size: 256,
             search_interval_windows: 16,
             split_pn_reference: true,
+            short_code_reference: ShortCodeReferenceKind::Cdma2000,
+            hpsk_signal_conjugated: true,
             reanchor_origin: false,
             lc_decimation: 1,
+            lc_period_chips: None,
+            lc_period_initial_state: 1u64 << 41,
             suppress_search_when_locked: false,
             suppress_active_finger_delay_overlap: false,
             active_finger_delay_suppress_samples: 0,
@@ -326,6 +349,12 @@ impl PnLcConfig {
         self
     }
 
+    pub fn with_lc_period(mut self, period_chips: usize, initial_state: u64) -> Self {
+        self.lc_period_chips = Some(period_chips.max(1));
+        self.lc_period_initial_state = initial_state;
+        self
+    }
+
     /// When true, skip FFT search once a hard-validated finger exists.
     /// Use for traffic channels; leave false for access channels.
     pub fn with_suppress_search_when_locked(mut self, suppress: bool) -> Self {
@@ -385,6 +414,16 @@ impl PnLcConfig {
 
     pub fn with_split_pn_reference(mut self, split_pn_reference: bool) -> Self {
         self.split_pn_reference = split_pn_reference;
+        self
+    }
+
+    pub fn with_short_code_reference(mut self, kind: ShortCodeReferenceKind) -> Self {
+        self.short_code_reference = kind;
+        self
+    }
+
+    pub fn with_hpsk_signal_conjugated(mut self, conjugated: bool) -> Self {
+        self.hpsk_signal_conjugated = conjugated;
         self
     }
 }

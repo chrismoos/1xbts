@@ -187,7 +187,8 @@ impl CfoTracker {
     /// every chip by the conjugate of the normalized pilot direction,
     /// aligning pilot→real and traffic→imaginary.
     ///
-    /// Call this AFTER `derotate_chips` on each output block.
+    /// Reference equalization exercised by the tracker's tests to characterize
+    /// pilot alignment; not wired into the production despread path.
     #[cfg(test)]
     pub fn correct_channel_phase(chips: &mut [Complex32]) {
         let pilot: Complex32 = chips.iter().copied().sum();

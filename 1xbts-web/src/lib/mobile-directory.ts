@@ -14,6 +14,19 @@ export interface MobileDirectoryEntry {
   trafficWalshCode?: number;
 }
 
+export interface PacketSessionDirectoryFields {
+  accessTechnology?: string;
+  mobileAddress?: string;
+  subscriberId?: string;
+  imsi?: string;
+  meid?: string;
+  hrpdMnId?: string;
+  hrpdMnIdSource?: string;
+  subscriberImsi?: string;
+  esn?: number;
+  trafficWalshCode?: number;
+}
+
 /// Polls `/api/mobiles` periodically and returns the latest snapshot.
 /// Polling is shared per component instance; for many consumers consider
 /// hoisting to a shared store later.
@@ -96,6 +109,48 @@ export function mobileForEvent(
     ("walshCode" in event ? event.walshCode : undefined);
   if (typeof walsh === "number") {
     const m = mobiles.find((m) => m.trafficWalshCode === walsh);
+    if (m) return m;
+  }
+
+  return undefined;
+}
+
+export function isSyntheticPacketMobileAddress(address?: string): boolean {
+  return Boolean(
+    address &&
+      (address.startsWith("hrpd-uati-session:") || address.startsWith("uati:")),
+  );
+}
+
+export function mobileForPacketSession(
+  session: PacketSessionDirectoryFields,
+  mobiles: MobileDirectoryEntry[],
+): MobileDirectoryEntry | undefined {
+  if (mobiles.length === 0) return undefined;
+
+  if (session.subscriberId) {
+    const m = mobiles.find((mobile) => mobile.subscriberId === session.subscriberId);
+    if (m) return m;
+  }
+  const subscriberImsi = session.subscriberImsi || session.imsi;
+  if (subscriberImsi) {
+    const m = mobiles.find((mobile) => mobile.imsi === subscriberImsi);
+    if (m) return m;
+  }
+  if (session.esn != null && session.esn !== 0) {
+    const m = mobiles.find((mobile) => mobile.esn === session.esn);
+    if (m) return m;
+  }
+  if (session.meid) {
+    const m = mobiles.find((mobile) => mobile.meid === session.meid);
+    if (m) return m;
+  }
+  if (session.mobileAddress && !isSyntheticPacketMobileAddress(session.mobileAddress)) {
+    const m = mobiles.find((mobile) => mobile.address === session.mobileAddress);
+    if (m) return m;
+  }
+  if (session.accessTechnology !== "HRPD" && session.trafficWalshCode != null) {
+    const m = mobiles.find((mobile) => mobile.trafficWalshCode === session.trafficWalshCode);
     if (m) return m;
   }
 

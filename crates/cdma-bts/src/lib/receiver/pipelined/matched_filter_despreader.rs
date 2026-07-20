@@ -57,23 +57,8 @@ pub struct MatchedFilterDespreader {
 }
 
 impl MatchedFilterDespreader {
-    fn env_truthy(name: &str) -> bool {
-        std::env::var(name)
-            .ok()
-            .map(|v| {
-                let s = v.trim().to_ascii_lowercase();
-                s == "1" || s == "true" || s == "yes" || s == "on"
-            })
-            .unwrap_or(false)
-    }
-
     pub fn new(sample_rate: u32) -> Self {
         let oversample = (sample_rate / 1_228_800).max(1) as usize;
-        let decimation_mode = if Self::env_truthy("CDMA_MFD_AVG_DECIMATE") {
-            DecimationMode::Average
-        } else {
-            DecimationMode::PhasePick
-        };
         Self {
             oversample,
             pn_period_samples: 32768 * oversample,
@@ -84,7 +69,7 @@ impl MatchedFilterDespreader {
             phase_alpha: 0.01,
             decimation_clock: 0,
             fixed_timing_phase: None,
-            decimation_mode,
+            decimation_mode: DecimationMode::PhasePick,
             swap_iq: false,
             use_conj_pn: false,
             avg_accum: Complex32::new(0.0, 0.0),
@@ -97,7 +82,7 @@ impl MatchedFilterDespreader {
             frame_chip_alignment: 64,
             frame_aligned: false,
             pn_epoch_chip: None,
-            dump_wav_path: std::env::var("CDMA_MFD_DUMP_WAV").ok(),
+            dump_wav_path: None,
             dump_writer: None,
         }
     }
@@ -115,7 +100,6 @@ impl MatchedFilterDespreader {
     /// Enable or disable oversample averaging decimation.
     ///
     /// Default is disabled (adaptive phase-pick).
-    /// Can also be toggled at runtime via `CDMA_MFD_AVG_DECIMATE=1`.
     pub fn with_average_decimation(mut self, enabled: bool) -> Self {
         self.decimation_mode = if enabled {
             DecimationMode::Average

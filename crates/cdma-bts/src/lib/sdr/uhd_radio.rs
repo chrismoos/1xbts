@@ -8,12 +8,26 @@ use uhd::{
     TransmitMetadata, TransmitStreamer, TuneRequest, Usrp,
 };
 
-use super::{Radio, RadioRx, RadioTx, RxReadResult, TX_SAMPLE_RATE, TxPulseShaper};
+use super::{Radio, RadioRx, RadioTx, RxReadResult};
 
 use cdma_common::consts::SR1_CHIP_RATE_HZ;
 
-/// Default master clock rate: 49.152 MHz = 10 ticks per TX sample, 40 ticks per chip.
-const DEFAULT_MASTER_CLOCK_RATE: u64 = 49_152_000;
+/// Default master clock rate: 39.3216 MHz = 4 ticks per 8× TX sample, 32 ticks per chip.
+const DEFAULT_MASTER_CLOCK_RATE: u64 = 39_321_600;
+
+fn set_default_uhd_env(key: &str, value: &str) {
+    if std::env::var_os(key).is_none() {
+        // The UHD backend is initialized before the radio worker threads are
+        // spawned. Set defaults here so the live run command does not need
+        // shell-level UHD environment overrides.
+        unsafe { std::env::set_var(key, value) };
+    }
+}
+
+fn apply_uhd_log_defaults() {
+    set_default_uhd_env("UHD_LOG_FASTPATH_DISABLE", "1");
+    set_default_uhd_env("UHD_LOG_CONSOLE_LEVEL", "warning");
+}
 
 /// Convert a u64 tick count at `tick_rate` Hz into a UHD `TimeSpec`.
 fn ticks_to_timespec(ticks: u64, tick_rate: u64) -> TimeSpec {
@@ -35,11 +49,41 @@ fn timespec_to_ticks(ts: &TimeSpec, tick_rate: u64) -> u64 {
     (ticks_full + ticks_frac) as u64
 }
 
+fn log_tx_tick_alignment(master_clock_rate: u64, tx_sample_rate_hz: usize) {
+    if tx_sample_rate_hz == 0 {
+        log::warn!("UHD: TX sample rate is zero; tick alignment cannot be checked");
+        return;
+    }
+    let sample_rate = tx_sample_rate_hz as u64;
+    let ticks_per_sample = master_clock_rate / sample_rate;
+    let sample_remainder = master_clock_rate % sample_rate;
+    let chip_remainder = master_clock_rate % SR1_CHIP_RATE_HZ;
+    if sample_remainder != 0 || chip_remainder != 0 {
+        log::warn!(
+            "UHD: master_clock_rate {} is not aligned to TX sample rate {} \
+             (sample remainder={}) or chip rate {} (chip remainder={}). \
+             Timed TX may have sub-tick jitter.",
+            master_clock_rate,
+            tx_sample_rate_hz,
+            sample_remainder,
+            SR1_CHIP_RATE_HZ,
+            chip_remainder,
+        );
+    } else {
+        info!(
+            "UHD: tick alignment: {}/{}={} ticks/sample, {} ticks/chip",
+            master_clock_rate,
+            tx_sample_rate_hz,
+            ticks_per_sample,
+            master_clock_rate / SR1_CHIP_RATE_HZ,
+        );
+    }
+}
+
 pub struct UhdRadio {
     usrp: Usrp,
     channel: usize,
     master_clock_rate: u64,
-    tx_shaper: TxPulseShaper,
     tx_lo_offset_hz: f64,
     tx_streamer: Option<TransmitStreamer<Complex32>>,
     rx_streamer: Option<ReceiveStreamer<Complex32>>,
@@ -52,7 +96,9 @@ impl UhdRadio {
         tx_antenna: &str,
         tx_gain_db: f64,
         master_clock_rate: Option<u64>,
+        tx_sample_rate_hz: usize,
     ) -> Result<UhdRadio, Error> {
+        apply_uhd_log_defaults();
         let mut usrp = Usrp::open(device_args)
             .map_err(|e| Error::from(format!("UHD: failed to open device: {}", e)))?;
 
@@ -71,26 +117,7 @@ impl UhdRadio {
             mcr, actual_mcr
         );
 
-        // Validate tick alignment.
-        let ticks_per_sample = mcr / TX_SAMPLE_RATE as u64;
-        let remainder = mcr % TX_SAMPLE_RATE as u64;
-        if remainder != 0 {
-            log::warn!(
-                "UHD: master_clock_rate {} is NOT an integer multiple of TX sample rate {} \
-                 (remainder={}). Tick alignment will have sub-tick jitter.",
-                mcr,
-                TX_SAMPLE_RATE,
-                remainder,
-            );
-        } else {
-            info!(
-                "UHD: tick alignment: {}/{}={} ticks/sample, {} ticks/chip",
-                mcr,
-                TX_SAMPLE_RATE,
-                ticks_per_sample,
-                mcr / SR1_CHIP_RATE_HZ,
-            );
-        }
+        log_tx_tick_alignment(mcr, tx_sample_rate_hz);
 
         usrp.set_tx_antenna(tx_antenna, channel)
             .map_err(|e| Error::from(format!("UHD: set TX antenna: {}", e)))?;
@@ -103,18 +130,22 @@ impl UhdRadio {
             mb_name, channel, tx_antenna, tx_gain_db
         );
 
-        // Set TX sample rate and create TX streamer.
-        usrp.set_tx_sample_rate(TX_SAMPLE_RATE as f64, channel)
+        // Set TX sample rate and create the primary TX streamer on the
+        // requested channel. An empty UHD channel list means channel 0, so
+        // always pass the explicit list here.
+        usrp.set_tx_sample_rate(tx_sample_rate_hz as f64, channel)
             .map_err(|e| Error::from(format!("UHD: set TX sample rate: {}", e)))?;
+        let primary_stream_args = StreamArgs::<Complex32>::builder()
+            .channels(vec![channel])
+            .build();
         let tx_streamer = usrp
-            .get_tx_stream(&StreamArgs::<Complex32>::new("sc16"))
+            .get_tx_stream(&primary_stream_args)
             .map_err(|e| Error::from(format!("UHD: create TX stream: {}", e)))?;
 
         Ok(UhdRadio {
             usrp,
             channel,
             master_clock_rate: mcr,
-            tx_shaper: TxPulseShaper::new(),
             tx_lo_offset_hz: 0.0,
             tx_streamer: Some(tx_streamer),
             rx_streamer: None,
@@ -168,6 +199,7 @@ impl Radio for UhdRadio {
         self.usrp
             .set_tx_sample_rate(sample_rate as f64, self.channel)
             .map_err(|e| Error::from(format!("UHD: set TX rate: {}", e)))?;
+        log_tx_tick_alignment(self.master_clock_rate, sample_rate);
         Ok(())
     }
 
@@ -230,7 +262,6 @@ impl Radio for UhdRadio {
                 .tx_streamer
                 .ok_or_else(|| Error::from("UHD: TX streamer not initialized"))?,
             master_clock_rate: self.master_clock_rate,
-            tx_shaper: self.tx_shaper,
             start_of_burst: true,
         };
         let rx = self.rx_streamer.map(|s| -> Box<dyn RadioRx> {
@@ -252,7 +283,6 @@ struct UhdTxHalf {
     usrp: Arc<Usrp>,
     tx_streamer: TransmitStreamer<Complex32>,
     master_clock_rate: u64,
-    tx_shaper: TxPulseShaper,
     start_of_burst: bool,
 }
 
@@ -282,25 +312,9 @@ impl RadioTx for UhdTxHalf {
     }
 
     fn transmit_at(&mut self, samples: &[Complex32], tick: Option<u64>) -> Result<(), Error> {
-        let shaped = self.tx_shaper.shape(samples);
         // No software NCO rotation — UHD handles LO offset in hardware
         // via TuneRequest::with_frequency_lo() in set_tx_frequency().
-
-        let metadata = match tick {
-            Some(t) => {
-                let ts = ticks_to_timespec(t, self.master_clock_rate);
-                TransmitMetadata::with_time(ts.seconds, ts.fraction, self.start_of_burst, false)
-                    .map_err(|e| Error::from(format!("UHD: TX metadata: {}", e)))?
-            }
-            None => TransmitMetadata::new()
-                .map_err(|e| Error::from(format!("UHD: TX metadata: {}", e)))?,
-        };
-
-        self.tx_streamer
-            .send_with_metadata(&mut [&shaped], &metadata, 1.0)
-            .map_err(|e| Error::from(format!("UHD: TX send: {}", e)))?;
-        self.start_of_burst = false;
-        Ok(())
+        self.send_samples(samples, tick)
     }
 
     fn enable_transmit(&mut self, enable: bool) -> Result<(), Error> {
@@ -318,6 +332,26 @@ impl RadioTx for UhdTxHalf {
             let _ = self.tx_streamer.send_with_metadata(&mut [empty], &eob, 0.1);
             self.start_of_burst = false;
         }
+        Ok(())
+    }
+}
+
+impl UhdTxHalf {
+    fn send_samples(&mut self, samples: &[Complex32], tick: Option<u64>) -> Result<(), Error> {
+        let metadata = match tick {
+            Some(t) => {
+                let ts = ticks_to_timespec(t, self.master_clock_rate);
+                TransmitMetadata::with_time(ts.seconds, ts.fraction, self.start_of_burst, false)
+                    .map_err(|e| Error::from(format!("UHD: TX metadata: {}", e)))?
+            }
+            None => TransmitMetadata::new()
+                .map_err(|e| Error::from(format!("UHD: TX metadata: {}", e)))?,
+        };
+
+        self.tx_streamer
+            .send_with_metadata(&mut [samples], &metadata, 1.0)
+            .map_err(|e| Error::from(format!("UHD: TX send: {}", e)))?;
+        self.start_of_burst = false;
         Ok(())
     }
 }
@@ -352,6 +386,16 @@ impl RadioRx for UhdRxHalf {
             .receive(&mut [buf], timeout_s, false)
             .map_err(|e| Error::from(format!("UHD: RX recv: {}", e)))?;
 
+        // UHD overflow metadata can carry the timestamp at which reception
+        // resumes. Preserve it so the shared RX reader can measure and fill
+        // the hardware-side gap instead of discovering it after carrier
+        // slicing.
+        let time_ticks = md
+            .time_spec()
+            .map_err(|e| Error::from(format!("UHD: RX metadata: {}", e)))?
+            .map(|ts| timespec_to_ticks(&ts, self.master_clock_rate))
+            .unwrap_or(0);
+
         // Check for errors in the metadata.
         if let Some(err) = md
             .last_error()
@@ -369,7 +413,7 @@ impl RadioRx for UhdRxHalf {
                 ReceiveErrorKind::Overflow => {
                     return Ok(RxReadResult {
                         samples_read: md.samples(),
-                        time_ticks: 0,
+                        time_ticks,
                         overflow: true,
                     });
                 }
@@ -378,12 +422,6 @@ impl RadioRx for UhdRxHalf {
                 }
             }
         }
-
-        let time_ticks = md
-            .time_spec()
-            .map_err(|e| Error::from(format!("UHD: RX metadata: {}", e)))?
-            .map(|ts| timespec_to_ticks(&ts, self.master_clock_rate))
-            .unwrap_or(0);
 
         Ok(RxReadResult {
             samples_read: md.samples(),

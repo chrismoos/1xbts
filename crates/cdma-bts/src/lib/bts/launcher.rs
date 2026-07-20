@@ -21,13 +21,136 @@ use crate::{
 
 use super::{
     Bts, BtsHandle, BtsNodeConfig, Config, OverheadParameters, PagingChannelSettings, RadioConfig,
-    RxSettings, TrafficResourceController,
+    ReverseRxTarget, RxSettings, TrafficResourceController,
     abis_agent::{AbisAgent, AbisAgentConfig, AbisAgentEvent},
     paging_supplier::{PagingRetryConfig, PagingSupplierState, build_bts_paging_supplier},
 };
 
 pub struct RadioBuildOptions {
     pub null_radio: bool,
+    pub configure_rx: bool,
+    pub tx_sample_rate_hz: usize,
+    pub rx_sample_rate_hz: usize,
+    pub rx_bandwidth_hz: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReverseRxPlan {
+    pub configure_rx: bool,
+    pub target: ReverseRxTarget,
+    pub one_x_enabled: bool,
+    pub center_frequency_hz: usize,
+    pub sample_rate_hz: usize,
+    pub bandwidth_hz: usize,
+    pub one_x_reverse_frequency_hz: usize,
+    pub one_x_rx_shift_hz: i64,
+    pub hrpd_reverse_frequency_hz: Option<usize>,
+    pub hrpd_rx_shift_hz: Option<i64>,
+    pub required_bandwidth_hz: Option<usize>,
+}
+
+pub fn resolve_reverse_rx_plan(bts_config: &BtsNodeConfig) -> Result<ReverseRxPlan, Error> {
+    let one_x_reverse_frequency_hz = bts_config.channel.uplink_hz() as usize;
+    let sample_rate_hz = bts_config.rf.rx_sample_rate_hz;
+    let bandwidth_hz = bts_config.rf.rx_bandwidth_hz;
+    // The null radio is treated as RX-capable: it supplies a dummy RX half so
+    // the reverse pipeline runs end to end against silence (no hardware).
+    let radio_has_rx = matches!(
+        bts_config.radio,
+        RadioConfig::Soapy { .. }
+            | RadioConfig::Uhd { .. }
+            | RadioConfig::Lime { .. }
+            | RadioConfig::BladeRf { .. }
+            | RadioConfig::Noop
+    );
+    let resolved_target = if !bts_config.evdo.enabled {
+        ReverseRxTarget::OneX
+    } else {
+        match bts_config.evdo.tx_mode() {
+            super::evdo::EvdoTxMode::AdjacentComposite => ReverseRxTarget::Composite,
+            super::evdo::EvdoTxMode::HrpdOnly => ReverseRxTarget::Hrpd,
+        }
+    };
+    let one_x_enabled = resolved_target != ReverseRxTarget::Hrpd;
+    let configure_rx = radio_has_rx;
+    let mut plan = ReverseRxPlan {
+        configure_rx,
+        target: ReverseRxTarget::OneX,
+        one_x_enabled,
+        center_frequency_hz: one_x_reverse_frequency_hz,
+        sample_rate_hz,
+        bandwidth_hz,
+        one_x_reverse_frequency_hz,
+        one_x_rx_shift_hz: 0,
+        hrpd_reverse_frequency_hz: None,
+        hrpd_rx_shift_hz: None,
+        required_bandwidth_hz: None,
+    };
+    if !configure_rx || !bts_config.evdo.enabled {
+        return Ok(plan);
+    }
+
+    let Some(evdo) = super::evdo::resolve_evdo_config(
+        &bts_config.evdo,
+        bts_config.pilot_offset,
+        bts_config.channel,
+        bts_config.runtime.tx_sample_rate_hz,
+        bts_config.runtime.tx_bandwidth_hz,
+    )?
+    else {
+        return Ok(plan);
+    };
+
+    if resolved_target == ReverseRxTarget::Hrpd {
+        let hrpd_reverse_frequency_hz = evdo.evdo_reverse_frequency_hz;
+        plan.target = ReverseRxTarget::Hrpd;
+        plan.center_frequency_hz = hrpd_reverse_frequency_hz;
+        plan.one_x_rx_shift_hz =
+            one_x_reverse_frequency_hz as i64 - hrpd_reverse_frequency_hz as i64;
+        plan.hrpd_reverse_frequency_hz = Some(hrpd_reverse_frequency_hz);
+        plan.hrpd_rx_shift_hz = Some(0);
+        return Ok(plan);
+    }
+
+    if resolved_target != ReverseRxTarget::Composite {
+        return Ok(plan);
+    }
+
+    let hrpd_reverse_frequency_hz = evdo.evdo_reverse_frequency_hz;
+    let carrier_separation_hz = one_x_reverse_frequency_hz.abs_diff(hrpd_reverse_frequency_hz);
+    let required_bandwidth_hz =
+        carrier_separation_hz + (super::evdo::SR1_OCCUPIED_HALF_BW_HZ.max(0) as usize * 2);
+    if sample_rate_hz < required_bandwidth_hz {
+        return Err(format!(
+            "rx: EV-DO reverse composite requires rx_sample_rate_hz >= {} to capture 1x reverse {} Hz and HRPD reverse {} Hz (separation={} Hz, occupied half-BW={} Hz); configured rx_sample_rate_hz={}",
+            required_bandwidth_hz,
+            one_x_reverse_frequency_hz,
+            hrpd_reverse_frequency_hz,
+            carrier_separation_hz,
+            super::evdo::SR1_OCCUPIED_HALF_BW_HZ,
+            sample_rate_hz,
+        )
+        .into());
+    }
+    if bandwidth_hz < required_bandwidth_hz {
+        return Err(format!(
+            "rx: EV-DO reverse composite requires rx_bandwidth_hz >= {} to capture 1x reverse {} Hz and HRPD reverse {} Hz; configured rx_bandwidth_hz={}",
+            required_bandwidth_hz,
+            one_x_reverse_frequency_hz,
+            hrpd_reverse_frequency_hz,
+            bandwidth_hz,
+        )
+        .into());
+    }
+
+    let center_frequency_hz = (one_x_reverse_frequency_hz + hrpd_reverse_frequency_hz) / 2;
+    plan.target = ReverseRxTarget::Composite;
+    plan.center_frequency_hz = center_frequency_hz;
+    plan.one_x_rx_shift_hz = one_x_reverse_frequency_hz as i64 - center_frequency_hz as i64;
+    plan.hrpd_reverse_frequency_hz = Some(hrpd_reverse_frequency_hz);
+    plan.hrpd_rx_shift_hz = Some(hrpd_reverse_frequency_hz as i64 - center_frequency_hz as i64);
+    plan.required_bandwidth_hz = Some(required_bandwidth_hz);
+    Ok(plan)
 }
 
 pub fn build_radio_from_config(
@@ -36,14 +159,46 @@ pub fn build_radio_from_config(
     options: RadioBuildOptions,
 ) -> Result<Box<dyn Radio>, Error> {
     if options.null_radio {
-        info!("Using null radio (TX dropped, no RX)");
-        return Ok(Box::new(NoopRadio::new()));
+        let mut radio = NoopRadio::new();
+        if options.configure_rx {
+            let rate = options.rx_sample_rate_hz;
+            let bandwidth = options.rx_bandwidth_hz;
+            radio.setup_rx(
+                0,
+                "",
+                rx_freq_hz as f64,
+                rate as f64,
+                bandwidth as f64,
+                None,
+            )?;
+            info!("Using null radio (TX dropped, dummy RX paced at {rate} Hz feeding silence)");
+        } else {
+            info!("Using null radio (TX dropped, no RX)");
+        }
+        return Ok(Box::new(radio));
     }
     match radio_config {
-        RadioConfig::FileOutput { path } => {
-            Ok(Box::new(FileOutputRadio::new(fs::File::create(path)?)?))
+        RadioConfig::FileOutput { path } => Ok(Box::new(FileOutputRadio::new(
+            fs::File::create(path)?,
+            options.tx_sample_rate_hz,
+        )?)),
+        RadioConfig::Noop => {
+            let mut radio = NoopRadio::new();
+            if options.configure_rx {
+                let rate = options.rx_sample_rate_hz;
+                let bandwidth = options.rx_bandwidth_hz;
+                radio.setup_rx(
+                    0,
+                    "",
+                    rx_freq_hz as f64,
+                    rate as f64,
+                    bandwidth as f64,
+                    None,
+                )?;
+                info!("Using noop radio (TX dropped, dummy RX paced at {rate} Hz feeding silence)");
+            }
+            Ok(Box::new(radio))
         }
-        RadioConfig::Noop => Ok(Box::new(NoopRadio::new())),
         #[cfg(feature = "soapy-backend")]
         RadioConfig::Soapy {
             device,
@@ -52,28 +207,30 @@ pub fn build_radio_from_config(
             rx_antenna,
             tx_gain_db,
             rx_gain_db,
-            rx_sample_rate_hz,
-            rx_bandwidth_hz,
             ..
         } => {
             let mut radio = SoapySdrRadio::new(device, *channel, antenna, *tx_gain_db)?;
 
-            let rx_ant = rx_antenna.as_deref().unwrap_or("LNAW");
-            let freq_hz = rx_freq_hz as f64;
-            let sample_rate_hz = *rx_sample_rate_hz as f64;
-            let bandwidth_hz = rx_bandwidth_hz.unwrap_or(*rx_sample_rate_hz) as f64;
-            radio.setup_rx(
-                *channel,
-                rx_ant,
-                freq_hz,
-                sample_rate_hz,
-                bandwidth_hz,
-                *rx_gain_db,
-            )?;
-            info!(
-                "rx: configured on shared device antenna={} freq={} rate={} bw={} gain={:?}",
-                rx_ant, freq_hz, sample_rate_hz, bandwidth_hz, rx_gain_db
-            );
+            if options.configure_rx {
+                let rx_ant = rx_antenna.as_deref().unwrap_or("LNAW");
+                let freq_hz = rx_freq_hz as f64;
+                let sample_rate_hz = options.rx_sample_rate_hz as f64;
+                let bandwidth_hz = options.rx_bandwidth_hz as f64;
+                radio.setup_rx(
+                    *channel,
+                    rx_ant,
+                    freq_hz,
+                    sample_rate_hz,
+                    bandwidth_hz,
+                    *rx_gain_db,
+                )?;
+                info!(
+                    "rx: configured on shared device antenna={} freq={} rate={} bw={} gain={:?}",
+                    rx_ant, freq_hz, sample_rate_hz, bandwidth_hz, rx_gain_db
+                );
+            } else {
+                info!("rx: 1x reverse RX disabled by HRPD-only configuration");
+            }
 
             Ok(Box::new(radio))
         }
@@ -92,8 +249,6 @@ pub fn build_radio_from_config(
             time_source,
             rx_antenna,
             rx_gain_db,
-            rx_sample_rate_hz,
-            rx_bandwidth_hz,
             ..
         } => {
             let mut radio = crate::sdr::UhdRadio::new(
@@ -102,6 +257,7 @@ pub fn build_radio_from_config(
                 antenna,
                 *tx_gain_db,
                 Some(*master_clock_rate),
+                options.tx_sample_rate_hz,
             )?;
             if let Some(src) = clock_source {
                 radio.set_clock_source(src)?;
@@ -109,22 +265,26 @@ pub fn build_radio_from_config(
             if let Some(src) = time_source {
                 radio.set_time_source(src)?;
             }
-            let rx_ant = rx_antenna.as_deref().unwrap_or("RX2");
-            let freq_hz = rx_freq_hz as f64;
-            let sample_rate_hz = *rx_sample_rate_hz as f64;
-            let bandwidth_hz = rx_bandwidth_hz.unwrap_or(*rx_sample_rate_hz) as f64;
-            radio.setup_rx(
-                *channel,
-                rx_ant,
-                freq_hz,
-                sample_rate_hz,
-                bandwidth_hz,
-                *rx_gain_db,
-            )?;
-            info!(
-                "rx: configured UHD RX antenna={} freq={} rate={} bw={} gain={:?}",
-                rx_ant, freq_hz, sample_rate_hz, bandwidth_hz, rx_gain_db
-            );
+            if options.configure_rx {
+                let rx_ant = rx_antenna.as_deref().unwrap_or("RX2");
+                let freq_hz = rx_freq_hz as f64;
+                let sample_rate_hz = options.rx_sample_rate_hz as f64;
+                let bandwidth_hz = options.rx_bandwidth_hz as f64;
+                radio.setup_rx(
+                    *channel,
+                    rx_ant,
+                    freq_hz,
+                    sample_rate_hz,
+                    bandwidth_hz,
+                    *rx_gain_db,
+                )?;
+                info!(
+                    "rx: configured UHD RX antenna={} freq={} rate={} bw={} gain={:?}",
+                    rx_ant, freq_hz, sample_rate_hz, bandwidth_hz, rx_gain_db
+                );
+            } else {
+                info!("rx: 1x reverse RX disabled by HRPD-only configuration");
+            }
             Ok(Box::new(radio))
         }
         #[cfg(not(feature = "uhd-backend"))]
@@ -139,8 +299,6 @@ pub fn build_radio_from_config(
             tx_gain_db,
             rx_antenna,
             rx_gain_db,
-            rx_sample_rate_hz,
-            rx_bandwidth_hz,
             oversample,
             tx_lo_offset_hz,
             tx_fifo_size,
@@ -153,7 +311,7 @@ pub fn build_radio_from_config(
                 *channel,
                 tx_antenna,
                 *tx_gain_db,
-                *rx_sample_rate_hz,
+                options.tx_sample_rate_hz,
                 oversample.unwrap_or(0),
                 *tx_fifo_size,
                 *rx_fifo_size,
@@ -162,23 +320,27 @@ pub fn build_radio_from_config(
             if let Some(offset) = tx_lo_offset_hz {
                 radio.set_tx_lo_offset(*offset)?;
             }
-            let rx_ant = rx_antenna.as_deref().unwrap_or("LNAW");
-            radio.setup_rx(
-                *channel,
-                rx_ant,
-                rx_freq_hz as f64,
-                *rx_sample_rate_hz as f64,
-                rx_bandwidth_hz.unwrap_or(*rx_sample_rate_hz) as f64,
-                rx_gain_db.map(|g| g as f64),
-            )?;
-            info!(
-                "rx: configured LimeSDR RX antenna={} freq={} rate={} bw={} gain={:?}",
-                rx_ant,
-                rx_freq_hz,
-                rx_sample_rate_hz,
-                rx_bandwidth_hz.unwrap_or(*rx_sample_rate_hz),
-                rx_gain_db
-            );
+            if options.configure_rx {
+                let rx_ant = rx_antenna.as_deref().unwrap_or("LNAW");
+                radio.setup_rx(
+                    *channel,
+                    rx_ant,
+                    rx_freq_hz as f64,
+                    options.rx_sample_rate_hz as f64,
+                    options.rx_bandwidth_hz as f64,
+                    rx_gain_db.map(|g| g as f64),
+                )?;
+                info!(
+                    "rx: configured LimeSDR RX antenna={} freq={} rate={} bw={} gain={:?}",
+                    rx_ant,
+                    rx_freq_hz,
+                    options.rx_sample_rate_hz,
+                    options.rx_bandwidth_hz,
+                    rx_gain_db
+                );
+            } else {
+                info!("rx: 1x reverse RX disabled by HRPD-only configuration");
+            }
             Ok(Box::new(radio))
         }
         #[cfg(not(feature = "lime-backend"))]
@@ -194,8 +356,6 @@ pub fn build_radio_from_config(
             rx_antenna,
             tx_gain_db,
             rx_gain_db,
-            rx_sample_rate_hz,
-            rx_bandwidth_hz,
             tx_lo_offset_hz,
             num_buffers,
             buffer_size,
@@ -207,7 +367,7 @@ pub fn build_radio_from_config(
                 device,
                 *channel,
                 *tx_gain_db,
-                *rx_sample_rate_hz as u32,
+                options.tx_sample_rate_hz as u32,
                 fpga_path.as_deref(),
                 tx_antenna.as_deref(),
                 *num_buffers,
@@ -218,22 +378,26 @@ pub fn build_radio_from_config(
             if let Some(offset) = tx_lo_offset_hz {
                 radio.set_tx_lo_offset(*offset)?;
             }
-            let rx_ant = rx_antenna.as_deref().unwrap_or("");
-            let freq_hz = rx_freq_hz as f64;
-            let sample_rate_hz = *rx_sample_rate_hz as f64;
-            let bandwidth_hz = rx_bandwidth_hz.unwrap_or(*rx_sample_rate_hz) as f64;
-            radio.setup_rx(
-                *channel as usize,
-                rx_ant,
-                freq_hz,
-                sample_rate_hz,
-                bandwidth_hz,
-                rx_gain_db.map(|g| g as f64),
-            )?;
-            info!(
-                "rx: configured bladeRF RX antenna='{}' freq={} rate={} bw={} gain={:?}",
-                rx_ant, freq_hz, sample_rate_hz, bandwidth_hz, rx_gain_db
-            );
+            if options.configure_rx {
+                let rx_ant = rx_antenna.as_deref().unwrap_or("");
+                let freq_hz = rx_freq_hz as f64;
+                let sample_rate_hz = options.rx_sample_rate_hz as f64;
+                let bandwidth_hz = options.rx_bandwidth_hz as f64;
+                radio.setup_rx(
+                    *channel as usize,
+                    rx_ant,
+                    freq_hz,
+                    sample_rate_hz,
+                    bandwidth_hz,
+                    rx_gain_db.map(|g| g as f64),
+                )?;
+                info!(
+                    "rx: configured bladeRF RX antenna='{}' freq={} rate={} bw={} gain={:?}",
+                    rx_ant, freq_hz, sample_rate_hz, bandwidth_hz, rx_gain_db
+                );
+            } else {
+                info!("rx: 1x reverse RX disabled by HRPD-only configuration");
+            }
             Ok(Box::new(radio))
         }
         #[cfg(not(feature = "bladerf-backend"))]
@@ -266,23 +430,30 @@ pub fn build_bts_launch_parts(
     mut bts_config: BtsNodeConfig,
     radio: Box<dyn Radio>,
     options: BtsLaunchOptions,
-) -> BtsLaunchParts {
+) -> Result<BtsLaunchParts, Error> {
     bts_config.runtime.overhead.auth_mode = bts_config.overhead.auth_mode;
     bts_config.runtime.overhead.p_rev_in_use = bts_config.overhead.p_rev;
 
-    let rx_sample_rate = bts_config.radio.rx_sample_rate_hz();
-    let has_rx = matches!(
-        bts_config.radio,
-        RadioConfig::Soapy { .. }
-            | RadioConfig::Uhd { .. }
-            | RadioConfig::Lime { .. }
-            | RadioConfig::BladeRf { .. }
-    );
+    let reverse_rx_plan = resolve_reverse_rx_plan(&bts_config)?;
+    let hrpd_rx_overhead = if bts_config.evdo.enabled {
+        Some(bts_config.evdo.overhead.resolve()?)
+    } else {
+        None
+    };
+    let has_rx = reverse_rx_plan.configure_rx;
     let (reverse_bearer_tx, reverse_bearer_rx) = channel();
     let (traffic_ack_seq_tx, traffic_ack_seq_rx) = mpsc::channel::<(u8, u8)>(256);
     let rx = if has_rx {
         Some(RxSettings {
-            sample_rate_hz: rx_sample_rate,
+            sample_rate_hz: reverse_rx_plan.sample_rate_hz,
+            rx_center_frequency_hz: Some(reverse_rx_plan.center_frequency_hz),
+            one_x_enabled: reverse_rx_plan.one_x_enabled,
+            one_x_reverse_frequency_hz: reverse_rx_plan
+                .one_x_enabled
+                .then_some(reverse_rx_plan.one_x_reverse_frequency_hz),
+            one_x_rx_shift_hz: reverse_rx_plan.one_x_rx_shift_hz,
+            hrpd_reverse_frequency_hz: reverse_rx_plan.hrpd_reverse_frequency_hz,
+            hrpd_rx_shift_hz: reverse_rx_plan.hrpd_rx_shift_hz,
             auth_mode: bts_config.overhead.auth_mode,
             p_rev_in_use: bts_config.overhead.p_rev,
             capture_iq_wav: None,
@@ -300,12 +471,30 @@ pub fn build_bts_launch_parts(
             chip_rate_hz: bts_config.runtime.chip_rate_hz,
             absolute_chip_start: 0,
             hardware_start_time_ns: 0,
-            tick_rate: bts_config.radio.tick_rate(),
+            tick_rate: bts_config.radio.tick_rate(bts_config.rf.rx_sample_rate_hz),
             access_event_tx: None,
-            reverse_bearer_tx: Some(reverse_bearer_tx),
+            hrpd_access_event_tx: None,
+            hrpd_traffic_event_tx: None,
+            hrpd_access_cycle_number: 0,
+            hrpd_access_sector_id_lsb: hrpd_rx_overhead
+                .as_ref()
+                .map(|o| o.sector_id24())
+                .unwrap_or(0),
+            hrpd_access_color_code: hrpd_rx_overhead.as_ref().map(|o| o.color_code).unwrap_or(0),
+            hrpd_access_preamble_frames: hrpd_rx_overhead
+                .as_ref()
+                .map(|o| o.access_preamble_frames())
+                .unwrap_or(crate::receiver::hrpd::access::HRPD_DEFAULT_ACCESS_PREAMBLE_FRAMES),
+            hrpd_access_enhanced_rates: hrpd_rx_overhead
+                .as_ref()
+                .map(|o| o.enhanced_access_rates())
+                .unwrap_or(false),
+            reverse_bearer_tx: reverse_rx_plan.one_x_enabled.then_some(reverse_bearer_tx),
             rx_metrics_tx: None,
             reanchor_origin: true,
             traffic_rx_pool: None,
+            hrpd_traffic_rx_queue: None,
+            hrpd_harq_bus: None,
             traffic_channels: None,
             power_control: None,
             traffic_rx_removals: None,
@@ -332,7 +521,7 @@ pub fn build_bts_launch_parts(
                 .uplink
                 .reverse_access_finger_pool_size,
             global_finger_pool_size: bts_config.runtime.uplink.global_finger_pool_size,
-            traffic_ack_seq_tx: Some(traffic_ack_seq_tx),
+            traffic_ack_seq_tx: reverse_rx_plan.one_x_enabled.then_some(traffic_ack_seq_tx),
             rx_measurements: None,
         })
     } else {
@@ -346,11 +535,10 @@ pub fn build_bts_launch_parts(
 
     let channel_plan = bts_config.channel;
     let tx_override = bts_config.runtime.tx_freq_hz_override;
-    let rx_override = bts_config.radio.rx_freq_hz_override();
     let tx_center_frequency_hz = tx_override.unwrap_or_else(|| channel_plan.downlink_hz() as usize);
-    let rx_center_frequency_hz = rx_override.unwrap_or_else(|| channel_plan.uplink_hz() as usize);
+    let rx_center_frequency_hz = reverse_rx_plan.center_frequency_hz;
     info!(
-        "channel plan: band_class={} subclass={} cdma_channel={} tx={:.4} MHz ({} Hz) rx={:.4} MHz ({} Hz) tx_override={} rx_override={}",
+        "channel plan: band_class={} subclass={} cdma_channel={} tx={:.4} MHz ({} Hz) rx_center={:.4} MHz ({} Hz) tx_override={}",
         channel_plan.band_class.as_str(),
         channel_plan.band_subclass,
         channel_plan.cdma_channel,
@@ -361,10 +549,30 @@ pub fn build_bts_launch_parts(
         tx_override
             .map(|hz| format!("{hz}"))
             .unwrap_or_else(|| "none".into()),
-        rx_override
-            .map(|hz| format!("{hz}"))
-            .unwrap_or_else(|| "none".into()),
     );
+    if let Some(hrpd_reverse_frequency_hz) = reverse_rx_plan.hrpd_reverse_frequency_hz {
+        match reverse_rx_plan.target {
+            ReverseRxTarget::Hrpd => info!(
+                "rx: EV-DO reverse direct HRPD center {:.4} MHz; HRPD reverse {:.4} MHz shift {:+.3} kHz; 1x RX disabled; rate {:.4} MHz bw {:.4} MHz",
+                reverse_rx_plan.center_frequency_hz as f64 / 1_000_000.0,
+                hrpd_reverse_frequency_hz as f64 / 1_000_000.0,
+                reverse_rx_plan.hrpd_rx_shift_hz.unwrap_or(0) as f64 / 1_000.0,
+                reverse_rx_plan.sample_rate_hz as f64 / 1_000_000.0,
+                reverse_rx_plan.bandwidth_hz as f64 / 1_000_000.0,
+            ),
+            _ => info!(
+                "rx: EV-DO reverse composite center {:.4} MHz; 1x reverse {:.4} MHz shift {:+.3} kHz; HRPD reverse {:.4} MHz shift {:+.3} kHz; rate {:.4} MHz bw {:.4} MHz required {:.4} MHz",
+                reverse_rx_plan.center_frequency_hz as f64 / 1_000_000.0,
+                reverse_rx_plan.one_x_reverse_frequency_hz as f64 / 1_000_000.0,
+                reverse_rx_plan.one_x_rx_shift_hz as f64 / 1_000.0,
+                hrpd_reverse_frequency_hz as f64 / 1_000_000.0,
+                reverse_rx_plan.hrpd_rx_shift_hz.unwrap_or(0) as f64 / 1_000.0,
+                reverse_rx_plan.sample_rate_hz as f64 / 1_000_000.0,
+                reverse_rx_plan.bandwidth_hz as f64 / 1_000_000.0,
+                reverse_rx_plan.required_bandwidth_hz.unwrap_or(0) as f64 / 1_000_000.0,
+            ),
+        }
+    }
     let derived_cdma_freq = channel_plan.cdma_freq_field();
     let derived_band_class = channel_plan.band_class.field_value();
     if bts_config.overhead.cdma_freq.is_none() {
@@ -381,6 +589,31 @@ pub fn build_bts_launch_parts(
         .overhead
         .ext_cdma_freq
         .unwrap_or(derived_cdma_freq);
+    let evdo_config = super::evdo::resolve_evdo_config(
+        &bts_config.evdo,
+        bts_config.pilot_offset,
+        bts_config.channel,
+        bts_config.runtime.tx_sample_rate_hz,
+        bts_config.runtime.tx_bandwidth_hz,
+    )?;
+    if let Some(evdo) = &evdo_config {
+        match evdo.tx_mode {
+            super::evdo::EvdoTxMode::AdjacentComposite => info!(
+                "EV-DO TX mode: single-RF composite; composite center {:.04} MHz, 1x shift {:+.03} kHz, HRPD shift {:+.03} kHz",
+                evdo.composite_center_frequency_hz as f64 / 1_000_000.0,
+                evdo.one_x_shift_hz as f64 / 1_000.0,
+                evdo.evdo_shift_hz as f64 / 1_000.0,
+            ),
+            super::evdo::EvdoTxMode::HrpdOnly => info!(
+                "EV-DO TX mode: HRPD-only (unsupported/untested); HRPD bc{} ch{} {:.04} MHz, reverse {:.04} MHz; 1x TX/RX disabled",
+                evdo.evdo_band_class,
+                evdo.evdo_channel,
+                evdo.evdo_frequency_hz as f64 / 1_000_000.0,
+                evdo.evdo_reverse_frequency_hz as f64 / 1_000_000.0,
+            ),
+        }
+    }
+    let _ = cdma_freq; // legacy CDMA_FREQ field still used in overhead encoding
     let paging_settings = bts_config.runtime.downlink.paging.clone();
     let mac_layer_for_bts = mac_layer.clone();
     let rx_power_adj = bts_config.radio.rx_power_adj();
@@ -415,6 +648,7 @@ pub fn build_bts_launch_parts(
             timezone: bts_config.timezone.clone(),
             overhead: bts_config.overhead.clone(),
             rx,
+            evdo: evdo_config.clone(),
         },
         bts_config.runtime.clone(),
     );
@@ -449,6 +683,7 @@ pub fn build_bts_launch_parts(
         overhead.clone(),
         paging_settings.clone(),
         bts_config.pilot_offset,
+        evdo_config.as_ref().and_then(|evdo| evdo.advertisement()),
         paging_state.clone(),
     );
     lac_layer.set_paging_supplier(paging_supplier);
@@ -461,7 +696,7 @@ pub fn build_bts_launch_parts(
         handle.traffic_rx_removals.clone(),
     ));
 
-    BtsLaunchParts {
+    Ok(BtsLaunchParts {
         bts,
         handle,
         resource_controller,
@@ -473,7 +708,7 @@ pub fn build_bts_launch_parts(
         pch_transmit_tx,
         overhead,
         paging_settings,
-    }
+    })
 }
 
 pub struct LocalAbisEndpointConfig {
@@ -742,6 +977,11 @@ pub async fn spawn_configured_local_abis_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn fixture_path(relative: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
+    }
 
     #[test]
     fn bts_launch_parts_build_from_default_config() {
@@ -754,8 +994,92 @@ mod tests {
                 paging_ack_timeout_ms: 100,
                 paging_max_retries: 0,
             },
-        );
+        )
+        .expect("default launch parts should build");
         assert_eq!(parts.overhead.cdma_freq, Some(384));
         assert_eq!(parts.paging_settings.paging_channel_number, 1);
+    }
+
+    #[test]
+    fn hrpd_only_mode_infers_direct_hrpd_uplink_capture() {
+        let mut bts = BtsNodeConfig::default();
+        bts.radio = RadioConfig::Noop;
+        bts.channel.cdma_channel = 777;
+        bts.evdo.enabled = true;
+        bts.evdo.channel = Some(630);
+        bts.evdo.mode = super::super::evdo::EvdoMode::HrpdOnly;
+        bts.evdo.overhead.sector_id = Some(super::super::evdo::HrpdSectorId::new([0; 16]));
+        bts.evdo.overhead.subnet_mask = Some(26);
+        bts.evdo.overhead.color_code = Some(26);
+        bts.rf = crate::bts::config::BtsRfProfile::derive(bts.channel, &bts.evdo)
+            .expect("derive HRPD-only RF profile");
+        bts.runtime.tx_sample_rate_hz = bts.rf.tx_sample_rate_hz;
+        bts.runtime.tx_bandwidth_hz = bts.rf.tx_bandwidth_hz;
+
+        let plan = resolve_reverse_rx_plan(&bts).expect("resolve reverse RX plan");
+        assert!(plan.configure_rx);
+        assert_eq!(plan.target, ReverseRxTarget::Hrpd);
+        assert!(!plan.one_x_enabled);
+        assert_eq!(plan.center_frequency_hz, 843_900_000);
+        assert_eq!(plan.one_x_reverse_frequency_hz, 848_310_000);
+        assert_eq!(plan.one_x_rx_shift_hz, 4_410_000);
+        assert_eq!(plan.hrpd_reverse_frequency_hz, Some(843_900_000));
+        assert_eq!(plan.hrpd_rx_shift_hz, Some(0));
+        assert_eq!(plan.sample_rate_hz, 4_915_200);
+        assert_eq!(plan.bandwidth_hz, 1_500_000);
+        assert_eq!(plan.required_bandwidth_hz, None);
+
+        let parts = build_bts_launch_parts(
+            bts,
+            Box::new(NoopRadio::new()),
+            BtsLaunchOptions {
+                paging_ack_timeout_ms: 100,
+                paging_max_retries: 0,
+            },
+        )
+        .expect("build HRPD-only launch parts");
+        let rx = parts.bts.config.rx.as_ref().expect("HRPD RX settings");
+        assert_eq!(rx.one_x_reverse_frequency_hz, None);
+        assert_eq!(rx.hrpd_reverse_frequency_hz, Some(843_900_000));
+        assert!(rx.reverse_bearer_tx.is_none());
+        assert!(rx.traffic_ack_seq_tx.is_none());
+    }
+
+    #[test]
+    fn reverse_rx_plan_centers_explicit_composite_uplink_capture() {
+        // EV-DO ships disabled by default; this test covers the composite plan.
+        let bts = BtsNodeConfig::load_evdo_enabled_for_test(&fixture_path("../../config/bts.json"))
+            .expect("load BTS config");
+
+        let plan = resolve_reverse_rx_plan(&bts).expect("resolve reverse RX plan");
+        assert!(plan.configure_rx);
+        assert_eq!(plan.target, ReverseRxTarget::Composite);
+        assert_eq!(plan.center_frequency_hz, 846_105_000);
+        assert_eq!(plan.one_x_reverse_frequency_hz, 848_310_000);
+        assert_eq!(plan.one_x_rx_shift_hz, 2_205_000);
+        assert_eq!(plan.hrpd_reverse_frequency_hz, Some(843_900_000));
+        assert_eq!(plan.hrpd_rx_shift_hz, Some(-2_205_000));
+        assert_eq!(plan.sample_rate_hz, 9_830_400);
+        assert_eq!(plan.bandwidth_hz, 5_890_000);
+        assert_eq!(plan.required_bandwidth_hz, Some(5_890_000));
+    }
+
+    #[test]
+    fn default_null_radio_resolves_composite_evdo_reverse_plan() {
+        // With no radio configured, bts.json falls back to the null radio,
+        // which is treated as RX-capable so the EV-DO reverse composite
+        // pipeline runs against the dummy RX without hardware. EV-DO ships
+        // disabled by default, so load it enabled for the composite plan.
+        let bts = BtsNodeConfig::load_evdo_enabled_for_test(&fixture_path("../../config/bts.json"))
+            .expect("load BTS config");
+        assert!(matches!(bts.radio, RadioConfig::Noop));
+
+        let plan = resolve_reverse_rx_plan(&bts).expect("resolve reverse RX plan");
+        assert!(plan.configure_rx);
+        assert_eq!(plan.target, ReverseRxTarget::Composite);
+        assert_eq!(plan.hrpd_reverse_frequency_hz, Some(843_900_000));
+        assert_eq!(plan.sample_rate_hz, 9_830_400);
+        assert_eq!(plan.bandwidth_hz, 5_890_000);
+        assert_eq!(plan.required_bandwidth_hz, Some(5_890_000));
     }
 }

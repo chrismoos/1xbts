@@ -5,9 +5,7 @@ use std::collections::HashMap;
 use crate::{
     CapabilitiesInfo, CapabilitiesInfoAcknowledge, Error, Message, RegistrationAcknowledge,
     RegistrationReply, RegistrationRequest, RegistrationUpdate, Result, SessionSpecificExtension,
-    SessionUpdate, SessionUpdateAcknowledge, VerifiedMessage, validate_acknowledge,
-    validate_capabilities_info, validate_capabilities_info_ack, validate_reply, validate_request,
-    validate_session_update, validate_session_update_acknowledge, validate_update,
+    SessionUpdate, SessionUpdateAcknowledge, VerifiedMessage,
 };
 
 /// Applies a message as seen by the local node.
@@ -340,7 +338,7 @@ impl SessionProcedureTable {
         now_seconds: u64,
         message: &RegistrationRequest,
     ) -> Result<ProcedureEvent> {
-        validate_request(message)?;
+        message.validate()?;
         let key = SessionKey::from_session(&message.session);
         match self.sessions.get_mut(&key) {
             None => {
@@ -402,7 +400,7 @@ impl SessionProcedureTable {
         now_seconds: u64,
         message: &RegistrationReply,
     ) -> Result<ProcedureEvent> {
-        validate_reply(message)?;
+        message.validate()?;
         let key = SessionKey::from_session(&message.session);
         let Some(record) = self.sessions.get_mut(&key) else {
             return Err(Error::ProcedureViolation {
@@ -480,7 +478,7 @@ impl SessionProcedureTable {
         now_seconds: u64,
         message: &RegistrationUpdate,
     ) -> Result<ProcedureEvent> {
-        validate_update(message)?;
+        message.validate()?;
         let key = SessionKey::from_session(&message.session);
         let Some(record) = self.sessions.get_mut(&key) else {
             return Err(Error::ProcedureViolation {
@@ -528,7 +526,7 @@ impl SessionProcedureTable {
         &mut self,
         message: &RegistrationAcknowledge,
     ) -> Result<ProcedureEvent> {
-        validate_acknowledge(message)?;
+        message.validate()?;
         let key = SessionKey::from_session(&message.session);
         let Some(record) = self.sessions.get_mut(&key) else {
             return Err(Error::ProcedureViolation {
@@ -584,7 +582,7 @@ impl SessionProcedureTable {
         now_seconds: u64,
         message: &SessionUpdate,
     ) -> Result<ProcedureEvent> {
-        validate_session_update(message)?;
+        message.validate()?;
         let key = SessionKey::from_session(&message.session);
         let Some(record) = self.sessions.get_mut(&key) else {
             return Err(Error::ProcedureViolation {
@@ -627,7 +625,7 @@ impl SessionProcedureTable {
         now_seconds: u64,
         message: &SessionUpdate,
     ) -> Result<ProcedureEvent> {
-        validate_session_update(message)?;
+        message.validate()?;
         let key = SessionKey::from_session(&message.session);
         let Some(record) = self.sessions.get_mut(&key) else {
             return Err(Error::ProcedureViolation {
@@ -669,7 +667,7 @@ impl SessionProcedureTable {
         &mut self,
         message: &SessionUpdateAcknowledge,
     ) -> Result<ProcedureEvent> {
-        validate_session_update_acknowledge(message)?;
+        message.validate()?;
         let key = SessionKey::from_session(&message.session);
         let Some(record) = self.sessions.get_mut(&key) else {
             return Err(Error::ProcedureViolation {
@@ -719,7 +717,7 @@ impl SessionProcedureTable {
         &mut self,
         message: &SessionUpdateAcknowledge,
     ) -> Result<ProcedureEvent> {
-        validate_session_update_acknowledge(message)?;
+        message.validate()?;
         let key = SessionKey::from_session(&message.session);
         let Some(record) = self.sessions.get_mut(&key) else {
             return Err(Error::ProcedureViolation {
@@ -770,7 +768,7 @@ impl SessionProcedureTable {
         now_seconds: u64,
         message: &CapabilitiesInfo,
     ) -> Result<ProcedureEvent> {
-        validate_capabilities_info(message)?;
+        message.validate()?;
         if self.outbound_capabilities.is_some() {
             return Err(Error::ProcedureViolation {
                 context: "capabilities info",
@@ -792,7 +790,7 @@ impl SessionProcedureTable {
         now_seconds: u64,
         message: &CapabilitiesInfo,
     ) -> Result<ProcedureEvent> {
-        validate_capabilities_info(message)?;
+        message.validate()?;
         if self.inbound_capabilities.is_some() {
             return Err(Error::ProcedureViolation {
                 context: "capabilities info",
@@ -813,7 +811,7 @@ impl SessionProcedureTable {
         &mut self,
         message: &CapabilitiesInfoAcknowledge,
     ) -> Result<ProcedureEvent> {
-        validate_capabilities_info_ack(message)?;
+        message.validate()?;
         let Some(pending) = self.outbound_capabilities.take() else {
             return Ok(ProcedureEvent::IgnoredCapabilitiesInfoAcknowledge {
                 identification: message.identification,
@@ -836,7 +834,7 @@ impl SessionProcedureTable {
         &mut self,
         message: &CapabilitiesInfoAcknowledge,
     ) -> Result<ProcedureEvent> {
-        validate_capabilities_info_ack(message)?;
+        message.validate()?;
         let Some(pending) = self.inbound_capabilities.take() else {
             return Err(Error::ProcedureViolation {
                 context: "capabilities info acknowledge",

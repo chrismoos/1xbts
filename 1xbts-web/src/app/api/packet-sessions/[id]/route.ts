@@ -1,4 +1,5 @@
 import { getPcfManagementClient, waitForBscReady } from "@/lib/grpc/client";
+import { packetSessionToJson } from "@/lib/grpc/packet-session-json";
 
 export const dynamic = "force-dynamic";
 
@@ -17,7 +18,16 @@ export async function GET(
       { sessionId: id },
       { signal: abort.signal }
     );
-    return Response.json(result);
+    const summary = result.session?.summary;
+    return Response.json({
+      ...result,
+      session: result.session
+        ? {
+            ...result.session,
+            summary: summary ? packetSessionToJson(summary) : summary,
+          }
+        : result.session,
+    });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "unknown error";
     const status = msg.toLowerCase().includes("not found") ? 404 : 502;

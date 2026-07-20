@@ -12,7 +12,10 @@ use crate::lac::paging_messages::{
 use crate::lac::{DataRequest, Layer2Lac, MessageControlStatusBlock, PagingSupplierFn};
 use crate::mac::types::ChannelType;
 
-use super::settings::{OverheadParameters, PagingChannelSettings, build_scheduled_message};
+use super::{
+    evdo::Evdo1xAdvertisement,
+    settings::{OverheadParameters, PagingChannelSettings, build_scheduled_message},
+};
 
 const PENDING_PAGE_RECORD_ASSIGNED_SLOT_ATTEMPTS: u16 = 4;
 const PENDING_PAGE_RECORD_FAILURE_GUARD_MS: u64 = 10_000;
@@ -594,17 +597,27 @@ pub fn build_bts_paging_supplier(
     overhead: OverheadParameters,
     paging: PagingChannelSettings,
     pilot_offset: usize,
+    evdo_advertisement: Option<Evdo1xAdvertisement>,
     state: Arc<Mutex<PagingSupplierState>>,
 ) -> PagingSupplierFn {
     let chip_rate_hz = 1_228_800u64; // SR1
 
-    let overhead_schedule: Vec<PagingMessageKind> = paging
+    let mut overhead_schedule: Vec<PagingMessageKind> = paging
         .message_defaults
         .schedule
         .iter()
         .copied()
         .filter(|k| *k != PagingMessageKind::GeneralPage)
+        .filter(|k| {
+            evdo_advertisement.is_some()
+                || *k != PagingMessageKind::AlternativeTechnologiesInformation
+        })
         .collect();
+    if evdo_advertisement.is_some()
+        && !overhead_schedule.contains(&PagingMessageKind::AlternativeTechnologiesInformation)
+    {
+        overhead_schedule.push(PagingMessageKind::AlternativeTechnologiesInformation);
+    }
 
     let mut current_slot_num: Option<u16> = None;
     let mut gpm_sent_this_slot = false;
@@ -774,7 +787,8 @@ pub fn build_bts_paging_supplier(
         }
         let kind = overhead_schedule[overhead_index % overhead_schedule.len()];
         overhead_index += 1;
-        let message = build_scheduled_message(kind, pilot_offset, &overhead, &paging);
+        let message =
+            build_scheduled_message(kind, pilot_offset, &overhead, &paging, evdo_advertisement);
         trace!(
             "BTS paging supplier: {:?} (overhead_index={}, slot_num={})",
             kind, overhead_index, slot_num

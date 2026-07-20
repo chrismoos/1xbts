@@ -9,6 +9,7 @@ pub mod diagnostics;
 pub mod error;
 pub mod events;
 pub mod formatting;
+pub mod hrpd;
 pub mod lac;
 pub mod mac;
 pub mod metrics;

@@ -1,10 +1,21 @@
 //! Internal linear-feedback shift register helpers for CDMA short-code generation.
 
-/// Feedback taps for the forward-link short-code I sequence.
+/// Feedback taps for the 1x SR1 forward short-code I sequence
+/// (C.S0002-E §2.1.3.1.17.1). Also the HRPD reverse access-terminal common PN
+/// (C.S0024-200-C §1.3.1.3.8.1).
 pub(crate) const PN_I_TAPS: u64 = 0b100001011100010;
 
-/// Feedback taps for the forward-link short-code Q sequence.
+/// Feedback taps for the 1x SR1 forward short-code Q sequence
+/// (C.S0002-E §2.1.3.1.17.1).
 pub(crate) const PN_Q_TAPS: u64 = 0b100111100011100;
+
+/// Feedback taps for the HRPD forward pilot PN I sequence
+/// (C.S0024-200-C §1.4.1.3.4): the reciprocal (time-reversed) form of [`PN_I_TAPS`].
+pub(crate) const HRPD_FORWARD_PN_I_TAPS: u64 = 0b101000111010000;
+
+/// Feedback taps for the HRPD forward pilot PN Q sequence
+/// (C.S0024-200-C §1.4.1.3.4): the reciprocal of [`PN_Q_TAPS`].
+pub(crate) const HRPD_FORWARD_PN_Q_TAPS: u64 = 0b100111000111100;
 
 /// 15-stage Galois LFSR used to synthesize CDMA short-code chips.
 #[derive(Clone, Copy, Debug)]

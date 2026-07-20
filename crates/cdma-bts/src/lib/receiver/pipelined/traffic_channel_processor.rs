@@ -462,7 +462,7 @@ impl PipelineProcessor for TrafficChannelProcessor {
                 .copied()
                 .map(ReverseMux1SignalingLayout::from_tag);
 
-            debug!(
+            log::trace!(
                 "traffic_channel_processor: decoded frame walsh={} chip={} bits={} info_bits={} fqi_bits={} preamble={} fqi_valid={} tail_valid={}",
                 self.walsh_code,
                 frame_chip,
@@ -481,9 +481,11 @@ impl PipelineProcessor for TrafficChannelProcessor {
                 self.suffix_reader.reset();
                 self.prefix_reader.reset();
                 self.locked_layout = None;
-                debug!(
+                log::trace!(
                     "traffic_preamble_frame: walsh={} chip={} preamble_frames={}",
-                    self.walsh_code, frame_chip, self.preamble_frames,
+                    self.walsh_code,
+                    frame_chip,
+                    self.preamble_frames,
                 );
                 if self.preamble_event_sent {
                     return Vec::new();
@@ -493,9 +495,12 @@ impl PipelineProcessor for TrafficChannelProcessor {
             }
 
             if !tail_valid || (fqi_bits > 0 && !fqi_valid) {
-                debug!(
+                log::trace!(
                     "traffic_frame_phy_fail: walsh={} chip={} fqi_valid={} tail_valid={}",
-                    self.walsh_code, frame_chip, fqi_valid, tail_valid,
+                    self.walsh_code,
+                    frame_chip,
+                    fqi_valid,
+                    tail_valid,
                 );
                 let mut status =
                     self.emit_traffic_phy_status(frame_chip, block.chip_start, &bits, &block.tags);
@@ -636,9 +641,11 @@ impl PipelineProcessor for TrafficChannelProcessor {
                 self.suffix_reader.reset();
                 self.prefix_reader.reset();
                 self.locked_layout = None;
-                debug!(
+                log::trace!(
                     "traffic_preamble_frame: walsh={} chip={} preamble_frames={}",
-                    self.walsh_code, frame_chip, self.preamble_frames,
+                    self.walsh_code,
+                    frame_chip,
+                    self.preamble_frames,
                 );
                 if !self.preamble_event_sent {
                     self.preamble_event_sent = true;

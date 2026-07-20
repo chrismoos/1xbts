@@ -16,6 +16,11 @@ bladerf-backend = ["cdma-bts/bladerf-backend", "cdma-bsc/bladerf-backend"]
 soapy-backend = ["cdma-bts/soapy-backend", "cdma-bsc/soapy-backend"]
 
 [dependencies]
+cdma-a8 = { path = "../cdma-a8" }
+cdma-a9 = { path = "../cdma-a9" }
+cdma-a10 = { path = "../cdma-a10" }
+cdma-a11 = { path = "../cdma-a11" }
+cdma-an = { path = "../cdma-an" }
 cdma-bts = { path = "../cdma-bts", default-features = false }
 cdma-bsc = { path = "../cdma-bsc", default-features = false }
 cdma-common = { path = "../cdma-common" }

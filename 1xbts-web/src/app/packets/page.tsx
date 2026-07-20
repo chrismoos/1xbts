@@ -3,6 +3,11 @@
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Card } from "@/components/card";
+import {
+  mobileForPacketSession,
+  mobileLabel,
+  useMobileDirectory,
+} from "@/lib/mobile-directory";
 import { serviceOptionName } from "@/lib/service-option";
 
 interface PacketSessionInfo {
@@ -26,11 +31,18 @@ interface PacketSessionInfo {
   mobileAddress: string;
   subscriberId: string;
   phoneNumber: string;
+  imsi: string;
+  meid: string;
+  hrpdMnId: string;
+  hrpdMnIdSource: string;
+  subscriberImsi: string;
+  esn: number;
   trafficWalshCode: number;
   rlpState: string;
   lcpState: string;
   ipcpState: string;
   captureEnabled: boolean;
+  accessTechnology: string;
 }
 
 function formatBytes(bytes: number): string {
@@ -108,6 +120,7 @@ export default function PacketsPage() {
   const [sessions, setSessions] = useState<PacketSessionInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const mobiles = useMobileDirectory();
 
   const fetchSessions = useCallback(async () => {
     try {
@@ -168,7 +181,7 @@ export default function PacketsPage() {
         </Card>
         <Card title="Negotiating">
           <p className="text-2xl font-mono text-accent-blue">{negotiatingCount}</p>
-          <p className="mt-1 text-xs text-muted">RLP, LCP, or IPCP in progress</p>
+          <p className="mt-1 text-xs text-muted">Bearer, LCP, or IPCP in progress</p>
         </Card>
         <Card title="Captured">
           <p className="text-2xl font-mono text-accent-cyan">{captureCount}</p>
@@ -176,7 +189,7 @@ export default function PacketsPage() {
         </Card>
         <Card title="Stalled">
           <p className="text-2xl font-mono text-accent-red">{stalledCount}</p>
-          <p className="mt-1 text-xs text-muted">RLP sync sessions lingering &gt;10s</p>
+          <p className="mt-1 text-xs text-muted">Bearer setup lingering &gt;10s</p>
         </Card>
       </div>
 
@@ -198,9 +211,10 @@ export default function PacketsPage() {
                 <tr className="text-xs text-muted">
                   <th className="text-left py-1">Session</th>
                   <th className="text-left py-1">Mobile</th>
+                  <th className="text-left py-1">Access</th>
                   <th className="text-left py-1">Phase</th>
                   <th className="text-left py-1">Health</th>
-                  <th className="text-left py-1">RLP / PPP</th>
+                  <th className="text-left py-1">Bearer / PPP</th>
                   <th className="text-left py-1">Last Activity</th>
                   <th className="text-left py-1">Bearer</th>
                   <th className="text-right py-1">Traffic</th>
@@ -209,6 +223,10 @@ export default function PacketsPage() {
               <tbody>
                 {sortedSessions.map((session) => {
                   const health = healthForSession(session);
+                  const mobile = mobileForPacketSession(session, mobiles);
+                  const label = mobile ? mobileLabel(mobile) : null;
+                  const isHrpd = session.accessTechnology === "HRPD";
+                  const subscriberImsi = session.subscriberImsi || session.imsi;
                   return (
                     <tr
                       key={session.sessionId}
@@ -228,12 +246,18 @@ export default function PacketsPage() {
                       <td className="py-2 align-top">
                         {session.mobileAddress ? (
                           <div className="space-y-1">
-                            <Link
-                              href={`/mobiles/${encodeURIComponent(session.mobileAddress)}`}
-                              className="font-mono text-xs text-accent-cyan hover:text-accent-cyan"
-                            >
-                              {session.phoneNumber || session.mobileAddress}
-                            </Link>
+                            {mobile && label ? (
+                              <Link
+                                href={`/mobiles/${encodeURIComponent(mobile.address)}`}
+                                className="font-mono text-xs text-accent-cyan hover:text-accent-cyan"
+                              >
+                                {label.value}
+                              </Link>
+                            ) : (
+                              <div className="font-mono text-xs text-secondary">
+                                {session.phoneNumber || session.mobileAddress}
+                              </div>
+                            )}
                             <div className="text-[11px] text-muted font-mono">
                               {session.mobileAddress}
                             </div>
@@ -242,10 +266,26 @@ export default function PacketsPage() {
                                 {session.subscriberId.slice(0, 8)}...{session.subscriberId.slice(-8)}
                               </div>
                             )}
+                            {subscriberImsi && (
+                              <div className="text-[11px] text-dimmed font-mono">
+                                Subscriber IMSI {subscriberImsi}
+                              </div>
+                            )}
+                            {session.hrpdMnId && (
+                              <div className="text-[11px] text-dimmed font-mono">
+                                HRPD MN ID {session.hrpdMnId}
+                                {session.hrpdMnIdSource ? ` (${session.hrpdMnIdSource})` : ""}
+                              </div>
+                            )}
                           </div>
                         ) : (
                           <span className="text-xs text-dimmed">-</span>
                         )}
+                      </td>
+                      <td className="py-2 align-top">
+                        <span className="rounded bg-surface-raised px-2 py-0.5 text-xs text-primary">
+                          {session.accessTechnology || "1x"}
+                        </span>
                       </td>
                       <td className="py-2 align-top">
                         <span className="rounded bg-surface-raised px-2 py-0.5 text-xs text-primary">
@@ -262,7 +302,7 @@ export default function PacketsPage() {
                       </td>
                       <td className="py-2 align-top">
                         <div className="text-xs text-secondary">
-                          RLP {formatStateLabel(session.rlpState)}
+                          {isHrpd ? "A10" : "RLP"} {formatStateLabel(session.rlpState)}
                         </div>
                         <div className="text-[11px] text-muted">
                           LCP {formatStateLabel(session.lcpState)} / IPCP {formatStateLabel(session.ipcpState)}
@@ -279,7 +319,11 @@ export default function PacketsPage() {
                       <td className="py-2 align-top">
                         <div className="text-xs text-secondary">
                           {serviceOptionName(session.serviceOption)}
-                          {session.trafficWalshCode ? ` · W${session.trafficWalshCode}` : ""}
+                          {session.trafficWalshCode
+                            ? session.accessTechnology === "HRPD"
+                              ? ` · key ${session.trafficWalshCode}`
+                              : ` · W${session.trafficWalshCode}`
+                            : ""}
                         </div>
                         <div className="text-[11px] text-muted font-mono">
                           {session.peerIp || "-"} / {session.ourIp || "-"}

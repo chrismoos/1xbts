@@ -25,6 +25,22 @@ import { formatNumberPlan, formatNumberType } from "@/lib/number-format";
 import { teleserviceKind, teleserviceName } from "@/lib/teleservice";
 import { parseMNotificationInd } from "@/lib/wap-push";
 import { WapBody } from "@/components/wap-body";
+import {
+  formatHrpdFullUati,
+  hrpdTimestampNsToMs,
+  uatiHex,
+} from "@/lib/hrpd-correlation";
+import {
+  HrpdDirection,
+  HrpdTrafficReason,
+  type HrpdAccessEvent,
+  type HrpdDecodedMessage,
+  type HrpdSessionEvent,
+  type HrpdTrafficEvent,
+  hrpdAccessReasonToJSON,
+  hrpdSessionReasonToJSON,
+  hrpdTrafficReasonToJSON,
+} from "@/lib/proto/events/v1/an";
 export { shouldHideAccessEvent } from "@/lib/access-event-filter";
 
 function smsSummary(
@@ -54,8 +70,13 @@ function formatOptBool(value?: boolean): string | null {
   return value == null ? null : formatBool(value);
 }
 
-function formatHex(value: number, width = 2): string {
-  return `0x${(value >>> 0).toString(16).toUpperCase().padStart(width, "0")}`;
+function formatHex(value: number | string, width = 2): string {
+  try {
+    const normalized = typeof value === "string" ? BigInt(value) : BigInt(value >>> 0);
+    return `0x${normalized.toString(16).toUpperCase().padStart(width, "0")}`;
+  } catch {
+    return `0x${String(value).padStart(width, "0")}`;
+  }
 }
 
 function FieldGrid({ children }: { children: ReactNode }) {
@@ -888,6 +909,192 @@ export function TrafficDetail({ event }: { event: TrafficEvent }) {
       {event.pduSummary && <div>PDU: {event.pduSummary}</div>}
       {event.sduHex && <div className="font-mono break-all text-muted">SDU_HEX: {event.sduHex}</div>}
       {event.pduHex && <div className="font-mono break-all text-muted">PDU_HEX: {event.pduHex}</div>}
+    </div>
+  );
+}
+
+// ----- HRPD detail components ---------------------------------------------
+
+function formatUati(uati: number): string {
+  return uatiHex(uati);
+}
+
+function formatTimestamp(ns: number | string): string {
+  const ms = hrpdTimestampNsToMs(ns);
+  return ms == null ? "-" : new Date(ms).toISOString();
+}
+
+function bytesHex(b: Uint8Array | undefined): string {
+  const bytes = normalizeBytes(b);
+  if (bytes.length === 0) return "-";
+  return bytes
+    .map((x) => x.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function normalizeBytes(value: Uint8Array | number[] | Record<string, number> | string | undefined): number[] {
+  if (!value) return [];
+  if (typeof value === "string") {
+    try {
+      return Array.from(atob(value), (char) => char.charCodeAt(0));
+    } catch {
+      return [];
+    }
+  }
+  if (value instanceof Uint8Array || Array.isArray(value)) {
+    return Array.from(value);
+  }
+  return Object.keys(value)
+    .sort((a, b) => Number(a) - Number(b))
+    .map((key) => value[key])
+    .filter((byte) => Number.isFinite(byte));
+}
+
+function payloadLength(payload: Uint8Array | undefined, explicitLength?: number): number {
+  if (explicitLength != null && explicitLength > 0) return explicitLength;
+  return normalizeBytes(payload).length;
+}
+
+export function hrpdDirectionLabel(direction: HrpdDirection): "EVDO TX" | "EVDO RX" | "EVDO" {
+  if (direction === HrpdDirection.HRPD_DIRECTION_TX) return "EVDO TX";
+  if (direction === HrpdDirection.HRPD_DIRECTION_RX) return "EVDO RX";
+  return "EVDO";
+}
+
+export function hrpdDirectionClass(direction?: HrpdDirection): string {
+  if (direction === HrpdDirection.HRPD_DIRECTION_TX) return "text-accent-cyan";
+  if (direction === HrpdDirection.HRPD_DIRECTION_RX) return "text-accent-green";
+  return "text-accent-purple";
+}
+
+function primaryDecoded(messages: HrpdDecodedMessage[]): HrpdDecodedMessage | undefined {
+  return messages.find((m) => m.typeName || m.summary);
+}
+
+export function formatHrpdSessionSummary(event: HrpdSessionEvent): string {
+  const canonical = formatHrpdFullUati(event.fullUati);
+  return `HRPD Session uati=${canonical ?? formatUati(event.uati)} ${hrpdSessionReasonToJSON(event.reason)} color=${event.colorCode}`;
+}
+
+export function formatHrpdAccessSummary(event: HrpdAccessEvent): string {
+  const decoded = primaryDecoded(event.decodedMessages);
+  if (decoded?.summary) return decoded.summary;
+  return `HRPD Access sig=${event.accessSignature} ${hrpdAccessReasonToJSON(event.reason)} color=${event.colorCode} (${payloadLength(event.payload, event.payloadLengthBytes)}B)`;
+}
+
+export function formatHrpdTrafficSummary(event: HrpdTrafficEvent): string {
+  const decoded = primaryDecoded(event.decodedMessages);
+  if (decoded?.summary) return decoded.summary;
+  const canonical = formatHrpdFullUati(event.fullUati);
+  const identity = canonical
+    ? `uati=${canonical} receive_ati=${formatUati(event.receiveAti || event.uati)}`
+    : `receive_ati=${formatUati(event.receiveAti || event.uati)}`;
+  if (
+    event.reason ===
+    HrpdTrafficReason.HRPD_TRAFFIC_REASON_REVERSE_PILOT_SNR_UPDATED
+  ) {
+    return `ReversePilotSNR ${identity} mac=${event.macIndex} snr=${(
+      event.reversePilotSnrDbTenths / 10
+    ).toFixed(1)}dB drc=${event.drcValue}`;
+  }
+  return `HRPD Traffic ${identity} mac=${event.macIndex} drc=${event.drcValue} ${hrpdTrafficReasonToJSON(event.reason)}`;
+}
+
+export function HrpdSessionDetail({ event }: { event: HrpdSessionEvent }) {
+  const canonical = formatHrpdFullUati(event.fullUati);
+  return (
+    <FieldGrid>
+      <Field label="Timestamp" value={formatTimestamp(event.timestampNs)} />
+      <Field label="UATI" value={canonical} />
+      <Field label="Session Key" value={formatUati(event.uati)} />
+      <Field label="Reason" value={hrpdSessionReasonToJSON(event.reason)} />
+      <Field label="Color Code" value={event.colorCode} />
+      <Field label="Air-Link Mgmt Subtype" value={event.airLinkManagementSubtype} />
+      <Field label="Session Mgmt Subtype" value={event.sessionManagementSubtype} />
+      <Field label="Address Mgmt Subtype" value={event.addressManagementSubtype} />
+      <Field label="Connection Layer Subtype" value={event.connectionLayerSubtype} />
+      <Field label="Security Subtype" value={event.securitySubtype} />
+      <Field label="MAC Subtype" value={event.macSubtype} />
+      <Field label="PHY Subtype" value={event.physicalLayerSubtype} />
+    </FieldGrid>
+  );
+}
+
+export function HrpdAccessDetail({ event }: { event: HrpdAccessEvent }) {
+  const length = payloadLength(event.payload, event.payloadLengthBytes);
+  const canonical = formatHrpdFullUati(event.fullUati);
+  return (
+    <div className="space-y-1">
+      <FieldGrid>
+        <Field label="Timestamp" value={formatTimestamp(event.timestampNs)} />
+        <Field label="Direction" value={hrpdDirectionLabel(event.direction)} />
+        <Field label="UATI" value={canonical} />
+        <Field label="Associated Key" value={event.uati ? formatUati(event.uati) : null} />
+        <Field label="Receive ATI" value={event.receiveAti ? formatUati(event.receiveAti) : null} />
+        <Field label="Access Signature" value={formatHex(event.accessSignature, 8)} />
+        <Field label="Reason" value={hrpdAccessReasonToJSON(event.reason)} />
+        <Field label="Color Code" value={event.colorCode} />
+        <Field label="Payload Length" value={`${length} bytes`} />
+      </FieldGrid>
+      {event.decodedMessages.length > 0 && <HrpdDecodedMessages messages={event.decodedMessages} />}
+      {length > 0 && (
+        <div className="font-mono break-all text-muted text-xs">
+          PAYLOAD: {bytesHex(event.payload)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function HrpdTrafficDetail({ event }: { event: HrpdTrafficEvent }) {
+  const length = payloadLength(event.payload, event.payloadLengthBytes);
+  const canonical = formatHrpdFullUati(event.fullUati);
+  return (
+    <div className="space-y-1">
+      <FieldGrid>
+        <Field label="Timestamp" value={formatTimestamp(event.timestampNs)} />
+        <Field label="Direction" value={hrpdDirectionLabel(event.direction)} />
+        <Field label="UATI" value={canonical} />
+        <Field label="Receive ATI" value={formatUati(event.receiveAti || event.uati)} />
+        <Field label="Reason" value={hrpdTrafficReasonToJSON(event.reason)} />
+        <Field label="MAC Index" value={event.macIndex} />
+        <Field label="DRC Value" value={event.drcValue} />
+        <Field label="Payload Length" value={`${length} bytes`} />
+      </FieldGrid>
+      {event.decodedMessages.length > 0 && <HrpdDecodedMessages messages={event.decodedMessages} />}
+      {length > 0 && (
+        <div className="font-mono break-all text-muted text-xs">
+          PAYLOAD: {bytesHex(event.payload)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function HrpdDecodedMessages({ messages }: { messages: HrpdDecodedMessage[] }) {
+  return (
+    <div className="text-xs text-muted space-y-1">
+      {messages.map((message, index) => {
+        const len = payloadLength(message.payload);
+        return (
+          <div key={index} className="pl-2 border-l border-border-input">
+            <div className="text-secondary font-medium">
+              {message.typeName || `Message ${index + 1}`}
+            </div>
+            <FieldGrid>
+              <Field label="Summary" value={message.summary || null} />
+              <Field label="Protocol" value={message.protocolType ? formatHex(message.protocolType) : null} />
+              <Field label="Message ID" value={message.messageId ? formatHex(message.messageId) : null} />
+              <Field label="Payload" value={`${len} bytes`} />
+            </FieldGrid>
+            {len > 0 && (
+              <div className="font-mono break-all text-muted">
+                DECODED_PAYLOAD: {bytesHex(message.payload)}
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }

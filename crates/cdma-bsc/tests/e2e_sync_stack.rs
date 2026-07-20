@@ -51,8 +51,8 @@ use cdma_bts::{
         sync::SyncChannelMessage,
     },
     sdr::{
-        Radio, RadioPipe, RadioPipeHandle, RadioTx, cdma2000_baseband_filter_taps_f64,
-        fir::ComplexFir32,
+        Radio, RadioPipe, RadioPipeHandle, RadioTx, TxPulseShaper,
+        cdma2000_baseband_filter_taps_f64, fir::ComplexFir32,
     },
 };
 use cdma_msc::{StaticVoicePolicy, VoiceConfig};
@@ -169,7 +169,7 @@ fn resolve_stock_config_dir() -> PathBuf {
 }
 
 /// Test-only convenience: load the stock BTS + BSC node configs from a
-/// well-known config directory and apply WS-0 cross-node validation.
+/// well-known config directory and apply cross-node validation.
 fn load_stock_bts_bsc_configs() -> (BtsNodeConfig, BscNodeConfig) {
     let dir = resolve_stock_config_dir();
     let bts = BtsNodeConfig::load_from_path(&dir.join(config::BTS_CONFIG_FILENAME))
@@ -214,9 +214,7 @@ fn resolve_workspace_test_wav_path(env_var: &str, file_name: &str) -> PathBuf {
     panic!("could not find {file_name} in known test fixture locations");
 }
 
-/// Radio implementation that captures chip-rate samples in memory without pulse shaping.
-/// This allows testing the full digital pipeline (conv encode → interleave → scramble →
-/// Walsh spread → PN spread) without the analog concerns of pulse shaping and WAV I/O.
+/// Radio implementation that captures final SDR-rate samples in memory.
 struct BufferRadio {
     samples: Arc<Mutex<Vec<Complex32>>>,
     clock_start: Instant,
@@ -2085,6 +2083,7 @@ async fn generate_bts_buffer_samples(
             timezone: cdma_common::timezone::TimezoneConfig::default(),
             overhead: direct_bts_overhead(384, 0),
             rx: None,
+            evdo: None,
         },
         runtime,
     );
@@ -3568,6 +3567,7 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
         direct_bts_overhead(cdma_freq, ext_cdma_freq),
         bts_config.runtime.downlink.paging.clone(),
         bts_config.pilot_offset,
+        None,
         bts_paging_state.clone(),
     );
     lac_layer.set_paging_supplier(bts_paging_supplier);
@@ -3608,6 +3608,7 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
             timezone: cdma_common::timezone::TimezoneConfig::default(),
             overhead: direct_bts_overhead(cdma_freq, ext_cdma_freq),
             rx: None,
+            evdo: None,
         },
         runtime,
     );
@@ -3943,6 +3944,7 @@ async fn run_sync_overhead_window_case(
         direct_bts_overhead(cdma_freq, ext_cdma_freq),
         bts_config.runtime.downlink.paging.clone(),
         bts_config.pilot_offset,
+        None,
         bts_paging_state.clone(),
     );
     lac_layer.set_paging_supplier(bts_paging_supplier);
@@ -3980,6 +3982,7 @@ async fn run_sync_overhead_window_case(
             timezone: cdma_common::timezone::TimezoneConfig::default(),
             overhead: direct_bts_overhead(cdma_freq, ext_cdma_freq),
             rx: None,
+            evdo: None,
         },
         bts_config.runtime.clone(),
     );
@@ -4301,12 +4304,15 @@ fn test_e2e_pilot_only_wav_output() -> Result<(), Error> {
         ForwardPilotChannel::new(),
     );
 
-    let radio = cdma_bts::sdr::FileOutputRadio::new(File::create(&wav_path)?)?;
+    let radio = cdma_bts::sdr::FileOutputRadio::new(
+        File::create(&wav_path)?,
+        cdma_common::consts::SR1_CHIP_RATE_HZ as usize * 4,
+    )?;
     let (mut radio_tx, _) = Box::new(radio).split().expect("FileOutputRadio split");
 
     // 80ms superframe worth of chip-rate pilot samples.
-    // Scale down to avoid hard clip in FileOutputRadio after pulse shaping
-    // (single-channel pilot overshoots ~1.3x after RRC filter).
+    // Scale down before pulse shaping to avoid hard clip in FileOutputRadio
+    // (single-channel pilot overshoots ~1.3x after the transmit filter).
     let chips_per_superframe = 98_304usize;
     let gain = 0.5;
     let pilot_chips: Vec<Complex32> = pilot_only
@@ -4314,7 +4320,9 @@ fn test_e2e_pilot_only_wav_output() -> Result<(), Error> {
         .into_iter()
         .map(|s| Complex32::new(s.re * gain, s.im * gain))
         .collect();
-    radio_tx.transmit(&pilot_chips)?;
+    let mut shaper = TxPulseShaper::new(cdma_common::consts::SR1_CHIP_RATE_HZ as usize * 4)?;
+    let pilot_samples = shaper.shape(&pilot_chips);
+    radio_tx.transmit(&pilot_samples)?;
     drop(radio_tx);
 
     let reader = hound::WavReader::open(&wav_path)?;
@@ -4485,7 +4493,10 @@ async fn test_e2e_sync_stack_generated_samples() -> Result<(), Error> {
     if let Some(parent) = wav_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let radio = cdma_bts::sdr::FileOutputRadio::new(File::create(&wav_path)?)?;
+    let radio = cdma_bts::sdr::FileOutputRadio::new(
+        File::create(&wav_path)?,
+        cdma_common::consts::SR1_CHIP_RATE_HZ as usize * 4,
+    )?;
     let (bts, _bts_handle) = Bts::new(
         Box::new(radio),
         bts::Config {
@@ -4517,6 +4528,7 @@ async fn test_e2e_sync_stack_generated_samples() -> Result<(), Error> {
             timezone: cdma_common::timezone::TimezoneConfig::default(),
             overhead: direct_bts_overhead(384, 0),
             rx: None,
+            evdo: None,
         },
     );
     bts.run_for_blocks(24_000).await?;
@@ -5764,6 +5776,7 @@ async fn test_e2e_page_retry_does_not_disrupt_overhead() -> Result<(), Error> {
             timezone: cdma_common::timezone::TimezoneConfig::default(),
             overhead: direct_bts_overhead(384, 0),
             rx: None,
+            evdo: None,
         },
         bts::BtsRuntimeSettings::default(),
     );
@@ -7688,7 +7701,10 @@ async fn run_traffic_channel_e2e(
     if let Some(parent) = wav_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let radio = cdma_bts::sdr::FileOutputRadio::new(File::create(&wav_path)?)?;
+    let radio = cdma_bts::sdr::FileOutputRadio::new(
+        File::create(&wav_path)?,
+        cdma_common::consts::SR1_CHIP_RATE_HZ as usize * 4,
+    )?;
 
     let (bts, bts_handle) = Bts::new_with_settings(
         Box::new(radio),
@@ -7721,6 +7737,7 @@ async fn run_traffic_channel_e2e(
             timezone: cdma_common::timezone::TimezoneConfig::default(),
             overhead: direct_bts_overhead(384, 0),
             rx: None,
+            evdo: None,
         },
         bts::BtsRuntimeSettings::default(),
     );
@@ -8024,6 +8041,12 @@ async fn test_e2e_rc1_reverse_preamble_triggers_crc_valid_bs_ack_order() -> Resu
             overhead: direct_bts_overhead(384, 0),
             rx: Some(bts::RxSettings {
                 sample_rate_hz: 1_228_800 * 4,
+                rx_center_frequency_hz: None,
+                one_x_enabled: true,
+                one_x_reverse_frequency_hz: None,
+                one_x_rx_shift_hz: 0,
+                hrpd_reverse_frequency_hz: None,
+                hrpd_rx_shift_hz: None,
                 auth_mode: 0,
                 p_rev_in_use: 6,
                 capture_iq_wav: None,
@@ -8037,10 +8060,20 @@ async fn test_e2e_rc1_reverse_preamble_triggers_crc_valid_bs_ack_order() -> Resu
                 hardware_start_time_ns: 0,
                 tick_rate: 1_000_000_000,
                 access_event_tx: None,
+                hrpd_access_event_tx: None,
+                hrpd_traffic_event_tx: None,
+                hrpd_access_cycle_number: 0,
+                hrpd_access_sector_id_lsb: 0,
+                hrpd_access_color_code: 26,
+                hrpd_access_preamble_frames:
+                    cdma_bts::receiver::hrpd::access::HRPD_DEFAULT_ACCESS_PREAMBLE_FRAMES,
+                hrpd_access_enhanced_rates: false,
                 reverse_bearer_tx: None,
                 rx_metrics_tx: None,
                 reanchor_origin: true,
                 traffic_rx_pool: None,
+                hrpd_traffic_rx_queue: None,
+                hrpd_harq_bus: None,
                 traffic_channels: None,
                 power_control: None,
                 traffic_rx_removals: None,
@@ -8055,6 +8088,7 @@ async fn test_e2e_rc1_reverse_preamble_triggers_crc_valid_bs_ack_order() -> Resu
                 traffic_ack_seq_tx: None,
                 rx_measurements: None,
             }),
+            evdo: None,
         },
         bts::BtsRuntimeSettings::default(),
     );
@@ -8064,13 +8098,19 @@ async fn test_e2e_rc1_reverse_preamble_triggers_crc_valid_bs_ack_order() -> Resu
         rx_metrics: _,
         config: _,
         access_events,
+        hrpd_access_events: _,
+        hrpd_traffic_events: _,
         commands: _,
+        hrpd_forward_signaling: _,
+        hrpd_traffic_assignments: _,
+        hrpd_forward_traffic: _,
         traffic_channels,
         walsh_allocator,
         traffic_rx_pool,
         traffic_rx_removals,
         power_control: _,
         rx_measurements: _,
+        ..
     } = bts_handle;
 
     let mut bsc = Bsc::new(BscConfig {

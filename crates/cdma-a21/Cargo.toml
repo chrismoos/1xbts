@@ -1,0 +1,21 @@
+[package]
+name = "cdma-a21"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "A21 reference-point wire protocol for 1x BSC ↔ HRPD AN coordination (hybrid AT cross-paging)."
+
+[dependencies]
+tokio = { version = "1", features = ["net", "io-util", "sync", "macros", "rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "io-util", "sync", "macros", "rt", "rt-multi-thread", "time"] }
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

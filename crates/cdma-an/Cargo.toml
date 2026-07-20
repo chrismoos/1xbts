@@ -1,0 +1,47 @@
+[package]
+name = "cdma-an"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "HRPD (1xEV-DO) Access Network: session, UATI, connection, and stream layers."
+
+[dependencies]
+cdma-a8 = { path = "../cdma-a8" }
+cdma-a9 = { path = "../cdma-a9" }
+cdma-a21 = { path = "../cdma-a21" }
+cdma-common = { path = "../cdma-common" }
+cdma-events = { path = "../cdma-events" }
+cdma-hlr = { path = "../cdma-hlr" }
+cdma-packet = { path = "../cdma-packet" }
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+getrandom = "0.2"
+num-bigint = "0.4"
+serde = { version = "1", features = ["derive"] }
+sha1 = "0.10"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["full", "tracing"] }
+tonic = "0.13"
+prost = "0.13"
+
+[build-dependencies]
+tonic-build = "0.13"
+
+[dev-dependencies]
+uuid = "1"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "cdma-an"
+path = "src/main.rs"
+
+[lints]
+workspace = true

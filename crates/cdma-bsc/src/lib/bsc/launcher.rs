@@ -75,6 +75,7 @@ pub struct BscLaunchInputs {
     pub channel: cdma_common::band_class::ChannelPlan,
     pub tx_center_frequency_hz: usize,
     pub rx_center_frequency_hz: usize,
+    pub evdo: Option<cdma_bts::bts::evdo::ResolvedEvdoConfig>,
     pub overhead: OverheadParameters,
     pub timezone: cdma_common::timezone::TimezoneConfig,
     pub paging: PagingChannelSettings,
@@ -106,6 +107,11 @@ pub struct BscLaunchInputs {
     pub voice_bearer_bind_ip: Ipv4Addr,
     /// Stable node identifier for this BSC. Must be unique across all BSC instances.
     pub node_id: String,
+    /// Optional HRPD AN A21 endpoint. When `Some`, the launcher spawns an
+    /// `A21ClientLoop` and installs the resulting identity cache + send
+    /// channel into `Bsc::set_hrpd_coord` so the paging path can divert
+    /// HRPD-attached MTs into A21 CrossPageRequest.
+    pub an_a21_addr: Option<std::net::SocketAddr>,
 }
 
 pub struct BscLaunchParts {
@@ -130,6 +136,7 @@ pub fn build_bsc_launch_parts(inputs: BscLaunchInputs) -> BscLaunchParts {
         channel: inputs.channel,
         tx_center_frequency_hz: inputs.tx_center_frequency_hz,
         rx_center_frequency_hz: inputs.rx_center_frequency_hz,
+        evdo: inputs.evdo.clone(),
         overhead: inputs.overhead.clone(),
         timezone: inputs.timezone.clone(),
         pilot_offset: inputs.pilot_offset,
@@ -151,7 +158,7 @@ pub fn build_bsc_launch_parts(inputs: BscLaunchInputs) -> BscLaunchParts {
         node_id: inputs.node_id.clone(),
     });
 
-    let bsc = Bsc::new(Config {
+    let mut bsc = Bsc::new(Config {
         pilot_offset: inputs.pilot_offset,
         overhead: inputs.overhead,
         paging: inputs.paging,
@@ -182,6 +189,45 @@ pub fn build_bsc_launch_parts(inputs: BscLaunchInputs) -> BscLaunchParts {
         bts_paging_state: None,
         node_id: inputs.node_id.clone(),
     });
+
+    // If an HRPD AN A21 address is configured, spawn an A21ClientLoop and
+    // install the cache+send sink into the Bsc so the paging path can divert
+    // HRPD-attached MTs into A21 CrossPageRequest.
+    if let Some(an_addr) = inputs.an_a21_addr {
+        let (a21_send_tx, mut a21_send_rx) =
+            tokio::sync::mpsc::unbounded_channel::<cdma_a21::A21Message>();
+        let cache = cdma_a21::HybridIdentityCache::new();
+        {
+            let cache = cache.clone();
+            tokio::spawn(async move {
+                match cdma_a21::A21ClientLoop::connect(an_addr).await {
+                    Ok(loop_) => {
+                        // The loop already maintains its own cache; mirror
+                        // its snapshot into the BSC's cache so the call path
+                        // can query synchronously.
+                        let loop_cache = loop_.cache();
+                        // Drain outbound queue, forwarding to the AN.
+                        while let Some(msg) = a21_send_rx.recv().await {
+                            // Sync cache snapshot from the loop on every send
+                            // — lightweight and keeps stale entries low when
+                            // the loop receives new bindings between sends.
+                            for c in loop_cache.snapshot() {
+                                cache.bind(c);
+                            }
+                            if let Err(e) = loop_.send(&msg).await {
+                                log::warn!("BSC: A21 send to AN failed: {e}");
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("BSC: failed to connect to HRPD AN A21 at {an_addr}: {e}");
+                    }
+                }
+            });
+        }
+        bsc.set_hrpd_coord(crate::bsc::hrpd_coord::HrpdCoord::new(cache, a21_send_tx));
+    }
 
     BscLaunchParts { bsc, state }
 }

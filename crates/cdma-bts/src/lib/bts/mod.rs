@@ -2,7 +2,9 @@ pub mod abis_agent;
 pub mod bearer_agent;
 pub mod bearer_transport_service;
 pub mod config;
+pub mod evdo;
 pub mod handle;
+pub mod hrpd;
 pub mod launcher;
 pub mod metrics_service;
 pub mod paging_service;
@@ -10,13 +12,17 @@ pub mod paging_supplier;
 pub mod power_control;
 pub mod power_control_service;
 pub mod resource_controller;
+pub mod reverse_power_predictor;
 pub mod rx;
 pub mod settings;
 pub mod synthesis_service;
 pub mod traffic_lac;
 pub mod traffic_setup_service;
 pub use bearer_transport_service::BearerTransportService;
-pub use config::{BtsAbisTimers, BtsNodeConfig, RadioConfig, load_radio_from_path};
+pub use config::{
+    BtsAbisTimers, BtsNodeConfig, RadioConfig, ReverseRxTarget, load_radio_from_path,
+};
+pub use evdo::{EvdoConfig, ResolvedEvdoConfig};
 pub use handle::*;
 pub use launcher::*;
 pub use metrics_service::MetricsService;
@@ -35,7 +41,11 @@ mod timing;
 
 use std::{sync::Arc, sync::atomic::AtomicBool, thread, time::Instant};
 
-use cdma_common::{consts::SR1_CHIPS_320MS, error::Error, time};
+use cdma_common::{
+    consts::{SR1_CHIP_RATE_HZ, SR1_CHIPS_320MS},
+    error::Error,
+    time,
+};
 use log::{debug, info, trace};
 use num::complex::Complex32;
 use tokio::sync::mpsc;
@@ -47,11 +57,32 @@ use crate::{
     },
     mac,
     receiver::sync::SyncChannelMessage,
-    sdr::{Radio, RadioRx, RadioTx, pipe::RadioPipe},
+    sdr::{Radio, RadioRx, RadioTx, TxPulseShaper, pipe::RadioPipe},
 };
 
 pub use timing::TxRxAnchor;
 
+/// Forward MAC RPC fallback for installed traffic channels before the reverse
+/// receiver has published slot-specific measurements. Per C.S0024-200-C
+/// §1.3.1.2.4.2/§1.3.1.4, RPC bit '0' commands the AT up and bit '1'
+/// commands it down. With no reliable measurement yet, treat the reverse link
+/// as below target and command up; measured per-slot RPC bits override this
+/// fallback through the HARQ bus once the reverse pilot is decoded.
+fn hrpd_rpc_mode() -> (bool, bool, &'static str) {
+    // When the closed-loop reverse power controller has a scheduled bit for a
+    // slot it always wins (see `rpc_bit_for_slot`). This is only the fallback
+    // for slots with no scheduled bit — during acquisition or a loss-of-lock
+    // gap. Alternate up/down (net-neutral hold) instead of commanding a steady
+    // up, so a gap does not ramp the AT to full reverse power.
+    (false, true, "alternating-hold")
+}
+
+// Preserve the HRPD branch amplitude used by the adjacent composer so the
+// standalone path cannot bypass its full-scale headroom.
+fn hrpd_only_tx_scale(evdo_gain: f32, tx_digital_backoff: f32) -> f32 {
+    let gain = evdo_gain.max(0.0);
+    tx_digital_backoff * gain / (1.0 + gain)
+}
 /// Attempt to set the calling thread to real-time priority.
 /// Logs a warning on failure but does not panic. The BTS can still
 /// run at normal priority, just with higher jitter risk.
@@ -191,6 +222,8 @@ pub struct Config {
     pub overhead: settings::OverheadParameters,
     /// Optional reverse-link RX configuration.
     pub rx: Option<RxSettings>,
+    /// Resolved adjacent EV-DO/HRPD carrier configuration.
+    pub evdo: Option<evdo::ResolvedEvdoConfig>,
 }
 
 /// Forward-link BTS runtime and associated control-plane endpoints.
@@ -198,14 +231,31 @@ pub struct Bts {
     config: Config,
     radio: Option<Box<dyn Radio>>,
     runtime: BtsRuntimeSettings,
+    evdo: Option<evdo::ResolvedEvdoConfig>,
     injected_rx: Option<rx::InjectedRxReceiver>,
     metrics: MetricsService,
     commands_rx: Option<mpsc::Receiver<BtsCommand>>,
+    hrpd_access_event_tx:
+        tokio::sync::mpsc::UnboundedSender<cdma_common::hrpd::air::HrpdAccessIndication>,
+    hrpd_traffic_event_tx:
+        tokio::sync::mpsc::UnboundedSender<cdma_common::hrpd::air::HrpdTrafficEvent>,
+    hrpd_forward_signaling_rx:
+        tokio::sync::mpsc::UnboundedReceiver<cdma_common::hrpd::air::HrpdForwardSignalingRequest>,
+    hrpd_traffic_assignment_rx:
+        tokio::sync::mpsc::UnboundedReceiver<cdma_common::hrpd::air::HrpdTrafficAssignmentRequest>,
+    hrpd_traffic_release_rx:
+        tokio::sync::mpsc::UnboundedReceiver<cdma_common::hrpd::air::HrpdTrafficReleaseRequest>,
+    hrpd_forward_traffic_rx:
+        tokio::sync::mpsc::UnboundedReceiver<crate::bts::hrpd::scheduler::ForwardTrafficPacket>,
     traffic_channels: TrafficChannelPool,
     traffic_rx_pool: TrafficRxPool,
+    hrpd_traffic_rx_queue: HrpdTrafficRxQueue,
     traffic_rx_removals: TrafficRxRemovals,
     power_control: BtsPowerControlRegistry,
     rx_measurements: settings::RxMeasurementStore,
+    /// Shared H-ARQ event bus between the HRPD forward scheduler (synth
+    /// thread) and per-MAC reverse traffic RX workers.
+    hrpd_harq_bus: std::sync::Arc<crate::bts::hrpd::HarqBus>,
 }
 
 type PilotWalshChannel = WalshChannelWrapper<ForwardPilotChannel>;
@@ -300,18 +350,28 @@ impl Bts {
             senders.rx_metrics,
             senders.access_event_tx,
         );
+        let evdo = config.evdo.clone();
         let bts = Bts {
             config,
             radio: Some(radio),
             runtime,
+            evdo,
             injected_rx,
             metrics,
             commands_rx: Some(senders.commands_rx),
+            hrpd_access_event_tx: senders.hrpd_access_event_tx,
+            hrpd_traffic_event_tx: senders.hrpd_traffic_event_tx,
+            hrpd_forward_signaling_rx: senders.hrpd_forward_signaling_rx,
+            hrpd_traffic_assignment_rx: senders.hrpd_traffic_assignment_rx,
+            hrpd_traffic_release_rx: senders.hrpd_traffic_release_rx,
+            hrpd_forward_traffic_rx: senders.hrpd_forward_traffic_rx,
             traffic_channels: senders.traffic_channels,
             traffic_rx_pool: senders.traffic_rx_pool,
+            hrpd_traffic_rx_queue: senders.hrpd_traffic_rx_queue,
             traffic_rx_removals: senders.traffic_rx_removals,
             power_control: senders.power_control,
             rx_measurements: senders.rx_measurements,
+            hrpd_harq_bus: std::sync::Arc::new(crate::bts::hrpd::HarqBus::new()),
         };
         (bts, handle)
     }
@@ -324,15 +384,60 @@ impl Bts {
         radio.set_tx_bandwidth(self.runtime.tx_bandwidth_hz)?;
         radio.set_tx_sample_rate(self.runtime.tx_sample_rate_hz)?;
         radio.set_tx_lo_offset_hz(self.runtime.tx_lo_offset_hz)?;
-        radio.set_tx_frequency(self.config.tx_center_frequency_hz)?;
+        let tx_center_frequency_hz = self
+            .evdo
+            .as_ref()
+            .map(|evdo| {
+                if evdo.uses_hrpd_only() {
+                    evdo.evdo_frequency_hz
+                } else {
+                    evdo.composite_center_frequency_hz
+                }
+            })
+            .unwrap_or(self.config.tx_center_frequency_hz);
+        radio.set_tx_frequency(tx_center_frequency_hz)?;
 
         info!(
             "Set TX center frequency to {:.04}Mhz (LO offset {:+.03}kHz), sample rate {:.04}Mhz, spreading rate {:?}",
-            self.config.tx_center_frequency_hz as f64 / 1_000_000.0,
+            tx_center_frequency_hz as f64 / 1_000_000.0,
             self.runtime.tx_lo_offset_hz as f64 / 1_000.0,
             self.runtime.tx_sample_rate_hz as f64 / 1_000_000.0,
             self.runtime.spreading_rate,
         );
+        if let Some(evdo) = &self.evdo {
+            if evdo.uses_hrpd_only() {
+                info!(
+                    "EV-DO HRPD-only: bc{} ch{} TX {:.04}MHz reverse-access {:.04}MHz pilot_pn={}; 1x TX/RX disabled; tx_bw {:.03}MHz HRPD gain {:.3} digital_backoff {:.3} effective_scale {:.3}",
+                    evdo.evdo_band_class,
+                    evdo.evdo_channel,
+                    evdo.evdo_frequency_hz as f64 / 1_000_000.0,
+                    evdo.evdo_reverse_frequency_hz as f64 / 1_000_000.0,
+                    evdo.pilot_pn,
+                    self.runtime.tx_bandwidth_hz as f64 / 1_000_000.0,
+                    evdo.gain,
+                    self.runtime.tx_digital_backoff,
+                    hrpd_only_tx_scale(evdo.gain, self.runtime.tx_digital_backoff),
+                );
+            } else {
+                info!(
+                    "EV-DO single-RF composite: center {:.04}MHz; 1x bc{} ch{} {:.04}MHz shift {:+.03}kHz; HRPD bc{} ch{} {:.04}MHz shift {:+.03}kHz reverse-access {:.04}MHz pilot_pn={}; tx_bw {:.03}MHz gain {:.3} (HRPD:1x ratio); ATIM advertise={}",
+                    evdo.composite_center_frequency_hz as f64 / 1_000_000.0,
+                    evdo.one_x_band_class,
+                    evdo.one_x_channel,
+                    evdo.one_x_frequency_hz as f64 / 1_000_000.0,
+                    evdo.one_x_shift_hz as f64 / 1_000.0,
+                    evdo.evdo_band_class,
+                    evdo.evdo_channel,
+                    evdo.evdo_frequency_hz as f64 / 1_000_000.0,
+                    evdo.evdo_shift_hz as f64 / 1_000.0,
+                    evdo.evdo_reverse_frequency_hz as f64 / 1_000_000.0,
+                    evdo.pilot_pn,
+                    self.runtime.tx_bandwidth_hz as f64 / 1_000_000.0,
+                    evdo.gain,
+                    evdo.advertise_on_1x,
+                );
+            }
+        }
         Ok(())
     }
 
@@ -356,19 +461,23 @@ impl Bts {
             .expect("failed to spawn RX thread")
     }
 
-    /// Threshold in microseconds: log a warning when a single TX batch exceeds this.
-    const TX_SLOW_THRESHOLD_US: u64 = 2_000;
     const TX_BLOCK_SLOW_GEN_THRESHOLD_US: u64 = 500;
     const TX_BATCH_GEN_WARN_NUMERATOR: u64 = 4;
     const TX_BATCH_GEN_WARN_DENOMINATOR: u64 = 5;
+    /// Fraction of the batch playout duration a single timed write may consume
+    /// before it is worth warning about. Fixed thresholds over-report once the
+    /// internal SDR write batch is longer than the original 2.5 ms default.
+    const TX_SLOW_THRESHOLD_NUM: u64 = 4;
+    const TX_SLOW_THRESHOLD_DEN: u64 = 5;
 
-    fn flush_tx_batch(
+    fn flush_tx_samples_batch(
         radio_tx: &mut dyn RadioTx,
         state: &mut TxLoopState,
-        tx_batch: &[Complex32],
+        tx_samples: &[Complex32],
         batch_tx_tick: u64,
+        source_chips: usize,
     ) -> Result<(), Error> {
-        if tx_batch.is_empty() {
+        if tx_samples.is_empty() {
             return Ok(());
         }
 
@@ -379,7 +488,7 @@ impl Bts {
         };
 
         let tx_start = Instant::now();
-        radio_tx.transmit_at(tx_batch, Some(batch_tx_tick))?;
+        radio_tx.transmit_at(tx_samples, Some(batch_tx_tick))?;
         let tx_us = tx_start.elapsed().as_micros() as u64;
         state.tx_time_sum_us += tx_us;
         state.tx_time_max_us = state.tx_time_max_us.max(tx_us);
@@ -393,23 +502,30 @@ impl Bts {
                 0
             };
             trace!(
-                "tx_batch_debug: batch #{} tick={} hw={} margin={} late={} tx_us={} chips={}",
+                "tx_batch_debug: batch #{} tick={} hw={} margin={} late={} tx_us={} chips={} samples={}",
                 state.tx_batches,
                 batch_tx_tick,
                 hw,
                 margin,
                 late,
                 tx_us,
-                tx_batch.len(),
+                source_chips,
+                tx_samples.len(),
             );
         }
 
-        if tx_us > Self::TX_SLOW_THRESHOLD_US {
+        let batch_air_us =
+            (source_chips as u64).saturating_mul(1_000_000) / u64::from(SR1_CHIP_RATE_HZ);
+        let slow_threshold_us =
+            batch_air_us.saturating_mul(Self::TX_SLOW_THRESHOLD_NUM) / Self::TX_SLOW_THRESHOLD_DEN;
+        if tx_us > slow_threshold_us {
             log::warn!(
-                "tx_slow_batch: transmit_at took {}us (batch #{}, {} chips)",
+                "tx_slow_batch: transmit_at took {}us (threshold={}us batch #{}, {} chips, {} samples)",
                 tx_us,
+                slow_threshold_us,
                 state.tx_batches,
-                tx_batch.len(),
+                source_chips,
+                tx_samples.len(),
             );
         }
         Ok(())
@@ -422,6 +538,7 @@ impl Bts {
         let radio = self.radio.take().expect("radio consumed before split");
         let (mut radio_tx, mut radio_rx) = radio.split()?;
 
+        let one_x_enabled = !self.evdo.as_ref().is_some_and(|cfg| cfg.uses_hrpd_only());
         let (pch, fsch, fpch) = downlink::build_channels(&self.config, &self.runtime)?;
         let pilot_offset_chips = timing::pilot_offset_chips(self.config.pilot_offset);
 
@@ -513,17 +630,24 @@ impl Bts {
             self.injected_rx.take(),
         ) {
             (Some(mut rx_settings), Some(commands_rx), Some(rx), _) => {
+                rx_settings.one_x_enabled = one_x_enabled;
                 rx_settings.absolute_chip_start = 0;
                 rx_settings.hardware_start_time_ns = 0;
                 rx_settings.tick_rate = tick_rate;
                 rx_settings.rx_metrics_tx = Some(self.metrics.rx_metrics_sender());
-                rx_settings.access_event_tx = Some(self.metrics.access_event_sender());
-                rx_settings.traffic_rx_pool = Some(self.traffic_rx_pool.clone());
-                rx_settings.traffic_rx_removals = Some(self.traffic_rx_removals.clone());
-                rx_settings.traffic_channels = Some(self.traffic_channels.clone());
-                rx_settings.power_control = Some(self.power_control.clone());
+                rx_settings.hrpd_access_event_tx = Some(self.hrpd_access_event_tx.clone());
+                rx_settings.hrpd_traffic_event_tx = Some(self.hrpd_traffic_event_tx.clone());
+                rx_settings.hrpd_traffic_rx_queue = Some(self.hrpd_traffic_rx_queue.clone());
+                rx_settings.hrpd_harq_bus = Some(self.hrpd_harq_bus.clone());
+                if one_x_enabled {
+                    rx_settings.access_event_tx = Some(self.metrics.access_event_sender());
+                    rx_settings.traffic_rx_pool = Some(self.traffic_rx_pool.clone());
+                    rx_settings.traffic_rx_removals = Some(self.traffic_rx_removals.clone());
+                    rx_settings.traffic_channels = Some(self.traffic_channels.clone());
+                    rx_settings.power_control = Some(self.power_control.clone());
+                    rx_settings.rx_measurements = Some(self.rx_measurements.clone());
+                }
                 rx_settings.tx_rx_anchor = Some(tx_rx_anchor.clone());
-                rx_settings.rx_measurements = Some(self.rx_measurements.clone());
                 Some(Self::spawn_rx_thread(
                     rx_settings,
                     commands_rx,
@@ -532,17 +656,24 @@ impl Bts {
                 ))
             }
             (Some(mut rx_settings), Some(commands_rx), None, Some(injected_rx)) => {
+                rx_settings.one_x_enabled = one_x_enabled;
                 rx_settings.absolute_chip_start = state.hardware_start_chip;
                 rx_settings.hardware_start_time_ns = state.hardware_start_tick;
                 rx_settings.tick_rate = tick_rate;
                 rx_settings.rx_metrics_tx = Some(self.metrics.rx_metrics_sender());
-                rx_settings.access_event_tx = Some(self.metrics.access_event_sender());
-                rx_settings.traffic_rx_pool = Some(self.traffic_rx_pool.clone());
-                rx_settings.traffic_rx_removals = Some(self.traffic_rx_removals.clone());
-                rx_settings.traffic_channels = Some(self.traffic_channels.clone());
-                rx_settings.power_control = Some(self.power_control.clone());
+                rx_settings.hrpd_access_event_tx = Some(self.hrpd_access_event_tx.clone());
+                rx_settings.hrpd_traffic_event_tx = Some(self.hrpd_traffic_event_tx.clone());
+                rx_settings.hrpd_traffic_rx_queue = Some(self.hrpd_traffic_rx_queue.clone());
+                rx_settings.hrpd_harq_bus = Some(self.hrpd_harq_bus.clone());
+                if one_x_enabled {
+                    rx_settings.access_event_tx = Some(self.metrics.access_event_sender());
+                    rx_settings.traffic_rx_pool = Some(self.traffic_rx_pool.clone());
+                    rx_settings.traffic_rx_removals = Some(self.traffic_rx_removals.clone());
+                    rx_settings.traffic_channels = Some(self.traffic_channels.clone());
+                    rx_settings.power_control = Some(self.power_control.clone());
+                    rx_settings.rx_measurements = Some(self.rx_measurements.clone());
+                }
                 rx_settings.tx_rx_anchor = None;
-                rx_settings.rx_measurements = Some(self.rx_measurements.clone());
                 let injected_shutdown = shutdown.clone();
                 Some(
                     thread::Builder::new()
@@ -593,10 +724,12 @@ impl Bts {
             );
 
             tx_rx_anchor.publish(state.hardware_start_tick, state.hardware_start_chip);
-            info!(
-                "bts: TX→RX anchor published: tick={} chip={}",
-                state.hardware_start_tick, state.hardware_start_chip
-            );
+            if one_x_enabled {
+                info!(
+                    "bts: TX→RX anchor published: tick={} chip={}",
+                    state.hardware_start_tick, state.hardware_start_chip
+                );
+            }
         }
 
         let mut spreader = synth::aligned_spreader(
@@ -604,6 +737,61 @@ impl Bts {
             self.runtime.short_code_length_chips,
             chip_cursor,
         );
+        let mut evdo_idle = self.evdo.as_ref().map(|cfg| {
+            let mut m = evdo::HrpdForwardSlotModulator::new(
+                self.config.pilot_offset,
+                self.runtime.short_code_length_chips,
+            );
+            // Install the explicit HRPD sector identity plus the 1x partner
+            // neighbor advert. SyncMessage.SystemTime is overwritten live at
+            // every cycle boundary inside maybe_advance_slot.
+            let one_x_partner = cfg.transmits_one_x().then_some((
+                cfg.one_x_band_class,
+                cfg.one_x_channel,
+                cfg.pilot_pn,
+            ));
+            m.install_sector_overheads(
+                cfg.pilot_pn,
+                one_x_partner,
+                cfg.evdo_band_class,
+                cfg.evdo_channel,
+                cfg.overhead,
+            );
+            m.set_harq_bus(self.hrpd_harq_bus.clone());
+            log::info!(
+                "HRPD forward link armed: ColorCode={} SectorID24=0x{:06X} SubnetMask=/{} HRPDch={} (bc{}) 1xPartner=bc{}/ch{} pilot_pn={}; overhead schedule: Sync+Access every 3 cycles (~1.28s), Quick every 3 cycles, Sector/ReverseRate every 4 cycles",
+                cfg.overhead.color_code,
+                cfg.overhead.sector_id24(),
+                cfg.overhead.subnet_mask,
+                cfg.evdo_channel,
+                cfg.evdo_band_class,
+                cfg.one_x_band_class,
+                cfg.one_x_channel,
+                cfg.pilot_pn,
+            );
+            m
+        });
+        let mut hrpd_active_macs: Vec<crate::bts::hrpd::ActiveMac> = Vec::new();
+        let evdo_hrpd_only = self.evdo.as_ref().is_some_and(|cfg| cfg.uses_hrpd_only());
+        let mut evdo_composer = if let Some(cfg) = self
+            .evdo
+            .as_ref()
+            .filter(|cfg| cfg.uses_adjacent_composite())
+        {
+            Some(evdo::AdjacentCarrierComposer::new(
+                cfg,
+                self.runtime.tx_sample_rate_hz,
+                self.runtime.tx_digital_backoff,
+            )?)
+        } else {
+            None
+        };
+        let mut one_x_shaper = TxPulseShaper::new(self.runtime.tx_sample_rate_hz)?;
+        let mut hrpd_shaper = if evdo_hrpd_only {
+            Some(TxPulseShaper::new(self.runtime.tx_sample_rate_hz)?)
+        } else {
+            None
+        };
         fpch.channel.advance_lc_to_chip(chip_cursor);
 
         radio_tx.enable_transmit_at(true, Some(state.hardware_start_tick))?;
@@ -615,7 +803,24 @@ impl Bts {
 
         let mut synth_block = vec![Complex32::default(); state.block_size as usize];
         let mut tx_batch = vec![Complex32::default(); state.tx_batch_chips as usize];
+        let mut evdo_tx_batch = self
+            .evdo
+            .as_ref()
+            .map(|_| vec![Complex32::default(); state.tx_batch_chips as usize]);
+        let mut tx_shape_buf: Vec<Complex32> = Vec::new();
         let blocks_per_batch = (state.tx_batch_chips / state.block_size) as usize;
+        // Periodic TX cost breakdown (this thread only, no shared state).
+        // gen covers the whole per-batch synthesis (1x + EVDO), evdo just the
+        // EVDO modulator portion, shape the pulse-shaping/compositing stage.
+        let mut tx_stat_batches = 0u64;
+        let mut tx_stat_air_chips = 0u64;
+        let mut tx_stat_gen_us = 0u64;
+        let mut tx_stat_gen_max_us = 0u64;
+        let mut tx_stat_evdo_us = 0u64;
+        let mut tx_stat_evdo_max_us = 0u64;
+        let mut tx_stat_shape_us = 0u64;
+        let mut tx_stat_shape_max_us = 0u64;
+        const TX_STAT_WINDOW_CHIPS: u64 = 5 * 1_228_800;
         let heartbeat_interval = (state.chip_rate / state.block_size) as usize;
         let mut sent_blocks = 0usize;
 
@@ -670,7 +875,7 @@ impl Bts {
                 let sync_total_ms = state.sync_time_sum_us / 1000;
                 let paging_total_ms = state.paging_time_sum_us / 1000;
                 let synth_total_ms = state.synth_time_sum_us / 1000;
-                debug!(
+                trace!(
                     "transmit t20={} wall={}ms blocks={} tx_batches={} gen={}ms(avg={}us max={}us) sync={}ms paging={}ms synth={}ms[pilot={}ms fsch={}ms fpch={}ms spread={}ms] tx={}ms(avg={}us max={}us) rt={:.1}x pace_margin={}us",
                     t20,
                     wall_ms,
@@ -692,7 +897,7 @@ impl Bts {
                     rt_ratio,
                     pacer.margin_us()
                 );
-                debug!(
+                trace!(
                     "tx_hardware_heartbeat: hw_tick={} chip={} rel_chip={} t20={}",
                     tx_hardware_tick, chip_cursor, tx_rel_chips, t20
                 );
@@ -740,91 +945,210 @@ impl Bts {
                 let block_chip = chip_cursor + (block_idx as u64) * state.block_size;
                 let frame_system_time = time::system_time_from_chips(block_chip, state.chip_rate);
                 let boundaries = timing::frame_boundaries(&state, block_chip);
-
-                downlink::send_availability_indications(
-                    &self.config,
-                    &self.runtime,
-                    boundaries.sync_frame_boundary,
-                    frame_system_time,
-                    block_chip,
-                )?;
-
-                if boundaries.sync_frame_boundary {
-                    let t = Instant::now();
-                    downlink::handle_sync_frame(
-                        &self.config,
-                        &self.runtime,
-                        &mut state,
-                        &fsch,
-                        block_chip,
-                    )?;
-                    state.sync_time_sum_us += t.elapsed().as_micros() as u64;
-                }
-
-                if boundaries.paging_frame_boundary && boundaries.paging_enabled {
-                    let t = Instant::now();
-                    let hw_tick = timing::hardware_tick_at_chip(&state, block_chip, tick_rate);
-                    downlink::handle_paging_frame(
-                        &self.config,
-                        &self.runtime,
-                        &mut state,
-                        &fpch,
-                        block_chip,
-                        hw_tick,
-                    )?;
-                    let next_frame_chip = block_chip.saturating_add(state.paging_frame_chips);
-                    let next_frame_system_time =
-                        time::system_time_from_chips(next_frame_chip, state.chip_rate);
-                    downlink::send_paging_frame_availability(
-                        &self.config,
-                        &self.runtime,
-                        &state,
-                        next_frame_system_time,
-                        next_frame_chip,
-                    )?;
-                    state.paging_time_sum_us += t.elapsed().as_micros() as u64;
-                }
-
-                let prev_synth_pilot_us = state.synth_pilot_us;
-                let prev_synth_fsch_us = state.synth_fsch_us;
-                let prev_synth_fpch_us = state.synth_fpch_us;
-                let prev_synth_ftch_us = state.synth_ftch_us;
-                let prev_synth_spread_us = state.synth_spread_us;
-                let block_gen_start = Instant::now();
-                synth::synthesize_block(
-                    &self.runtime,
-                    &mut state,
-                    gen_start,
-                    &pch,
-                    &fsch,
-                    &fpch,
-                    &mut spreader,
-                    &mut synth_block,
-                    bs,
-                    frame_system_time,
-                    block_chip,
-                )?;
-                let block_gen_us = block_gen_start.elapsed().as_micros() as u64;
-                if block_gen_us > Self::TX_BLOCK_SLOW_GEN_THRESHOLD_US {
-                    log::debug!(
-                        "tx_slow_gen: {}us (block #{}, chip={}) pilot={}us sync={}us paging={}us ftch={}us [snap={}us tc_n={} tc_sum={}us tc_max={}us] spread={}us",
-                        block_gen_us,
-                        state.synth_blocks,
-                        block_chip,
-                        state.synth_pilot_us.saturating_sub(prev_synth_pilot_us),
-                        state.synth_fsch_us.saturating_sub(prev_synth_fsch_us),
-                        state.synth_fpch_us.saturating_sub(prev_synth_fpch_us),
-                        state.synth_ftch_us.saturating_sub(prev_synth_ftch_us),
-                        state.last_snap_us,
-                        state.last_tc_n,
-                        state.last_tc_sum_us,
-                        state.last_tc_max_us,
-                        state.synth_spread_us.saturating_sub(prev_synth_spread_us),
-                    );
-                }
-
                 let offset = block_idx * bs;
-                tx_batch[offset..offset + bs].copy_from_slice(&synth_block[..bs]);
+
+                if one_x_enabled {
+                    downlink::send_availability_indications(
+                        &self.config,
+                        &self.runtime,
+                        boundaries.sync_frame_boundary,
+                        frame_system_time,
+                        block_chip,
+                    )?;
+
+                    if boundaries.sync_frame_boundary {
+                        let t = Instant::now();
+                        downlink::handle_sync_frame(
+                            &self.config,
+                            &self.runtime,
+                            &mut state,
+                            &fsch,
+                            block_chip,
+                        )?;
+                        state.sync_time_sum_us += t.elapsed().as_micros() as u64;
+                    }
+
+                    if boundaries.paging_frame_boundary && boundaries.paging_enabled {
+                        let t = Instant::now();
+                        let hw_tick = timing::hardware_tick_at_chip(&state, block_chip, tick_rate);
+                        downlink::handle_paging_frame(
+                            &self.config,
+                            &self.runtime,
+                            &mut state,
+                            &fpch,
+                            block_chip,
+                            hw_tick,
+                        )?;
+                        let next_frame_chip = block_chip.saturating_add(state.paging_frame_chips);
+                        let next_frame_system_time =
+                            time::system_time_from_chips(next_frame_chip, state.chip_rate);
+                        downlink::send_paging_frame_availability(
+                            &self.config,
+                            &self.runtime,
+                            &state,
+                            next_frame_system_time,
+                            next_frame_chip,
+                        )?;
+                        state.paging_time_sum_us += t.elapsed().as_micros() as u64;
+                    }
+
+                    let prev_synth_pilot_us = state.synth_pilot_us;
+                    let prev_synth_fsch_us = state.synth_fsch_us;
+                    let prev_synth_fpch_us = state.synth_fpch_us;
+                    let prev_synth_ftch_us = state.synth_ftch_us;
+                    let prev_synth_spread_us = state.synth_spread_us;
+                    let block_gen_start = Instant::now();
+                    synth::synthesize_block(
+                        &self.runtime,
+                        &mut state,
+                        gen_start,
+                        &pch,
+                        &fsch,
+                        &fpch,
+                        &mut spreader,
+                        &mut synth_block,
+                        bs,
+                        frame_system_time,
+                        block_chip,
+                    )?;
+                    let block_gen_us = block_gen_start.elapsed().as_micros() as u64;
+                    if block_gen_us > Self::TX_BLOCK_SLOW_GEN_THRESHOLD_US {
+                        log::debug!(
+                            "tx_slow_gen: {}us (block #{}, chip={}) pilot={}us sync={}us paging={}us ftch={}us [snap={}us tc_n={} tc_sum={}us tc_max={}us] spread={}us",
+                            block_gen_us,
+                            state.synth_blocks,
+                            block_chip,
+                            state.synth_pilot_us.saturating_sub(prev_synth_pilot_us),
+                            state.synth_fsch_us.saturating_sub(prev_synth_fsch_us),
+                            state.synth_fpch_us.saturating_sub(prev_synth_fpch_us),
+                            state.synth_ftch_us.saturating_sub(prev_synth_ftch_us),
+                            state.last_snap_us,
+                            state.last_tc_n,
+                            state.last_tc_sum_us,
+                            state.last_tc_max_us,
+                            state.synth_spread_us.saturating_sub(prev_synth_spread_us),
+                        );
+                    }
+                    tx_batch[offset..offset + bs].copy_from_slice(&synth_block[..bs]);
+                }
+                let evdo_gen_start = Instant::now();
+                if let (Some(evdo_idle), Some(evdo_tx_batch)) =
+                    (evdo_idle.as_mut(), evdo_tx_batch.as_mut())
+                {
+                    while let Ok(release) = self.hrpd_traffic_release_rx.try_recv() {
+                        info!(
+                            "HRPD traffic release: uati=0x{:08x} mac_index={}",
+                            release.uati, release.mac_index
+                        );
+                        let (queued, active, emissions, feedback) =
+                            evdo_idle.purge_traffic_mac(release.mac_index);
+                        info!(
+                            "HRPD traffic release: purged mac_index={} queued={} active={} harq_emissions={} harq_feedback={}",
+                            release.mac_index, queued, active, emissions, feedback
+                        );
+                        hrpd_active_macs.retain(|active| active.mac_index != release.mac_index);
+                        evdo_idle.set_active_macs(hrpd_active_macs.clone());
+                        // Queue the RX-side worker teardown. The RX loop drains
+                        // commands in FIFO order, so a release that follows a
+                        // not-yet-drained assignment for the same UATI tears the
+                        // worker down right after it spawns — no shared-Vec
+                        // retain, and no mutex on the synth thread.
+                        if self
+                            .hrpd_traffic_rx_queue
+                            .push(HrpdTrafficRxCommand::Release(release))
+                            .is_err()
+                        {
+                            log::error!("HRPD reverse traffic command queue full; dropped release");
+                        }
+                    }
+                    while let Ok(request) = self.hrpd_traffic_assignment_rx.try_recv() {
+                        if !(5..64).contains(&request.mac_index) {
+                            log::warn!(
+                                "HRPD traffic assignment ignored: invalid mac_index={} uati=0x{:08x}",
+                                request.mac_index,
+                                request.uati
+                            );
+                            continue;
+                        }
+                        let (rpc_bit, rpc_alternating, rpc_mode) = hrpd_rpc_mode();
+                        info!(
+                            "HRPD traffic assignment install: uati=0x{:08x} mac_index={} physical_subtype=0x{:04x} rtc_mac_subtype=0x{:04x} reverse_rate_limit={}bps rpc={} drc_lock={} reverse_lcm_i=0x{:016x} reverse_lcm_q=0x{:016x}",
+                            request.uati,
+                            request.mac_index,
+                            request.physical_layer_subtype,
+                            request.reverse_traffic_mac_subtype,
+                            request.reverse_rate_limit_bps,
+                            rpc_mode,
+                            request.drc_lock,
+                            request.reverse_long_code_mask_i,
+                            request.reverse_long_code_mask_q
+                        );
+                        match hrpd_active_macs
+                            .iter_mut()
+                            .find(|active| active.mac_index == request.mac_index)
+                        {
+                            Some(active) => {
+                                active.rpc = rpc_bit;
+                                active.rpc_alternating = rpc_alternating;
+                                active.drclock = request.drc_lock;
+                                active.frame_offset = request.frame_offset & 0x0f;
+                                active.physical_layer_subtype = request.physical_layer_subtype;
+                            }
+                            None => hrpd_active_macs.push(crate::bts::hrpd::ActiveMac {
+                                mac_index: request.mac_index,
+                                rpc: rpc_bit,
+                                rpc_alternating,
+                                drclock: request.drc_lock,
+                                frame_offset: request.frame_offset & 0x0f,
+                                physical_layer_subtype: request.physical_layer_subtype,
+                            }),
+                        }
+                        evdo_idle.set_active_macs(hrpd_active_macs.clone());
+                        let mac_index = request.mac_index;
+                        if self
+                            .hrpd_traffic_rx_queue
+                            .push(HrpdTrafficRxCommand::Assign(request))
+                            .is_err()
+                        {
+                            log::error!(
+                                "HRPD reverse traffic command queue full; dropped assignment for mac_index={mac_index}"
+                            );
+                        }
+                    }
+                    while let Ok(request) = self.hrpd_forward_signaling_rx.try_recv() {
+                        info!(
+                            "HRPD forward signaling enqueue: channel={:?} protocol=0x{:02x} target={:?} payload_octets={}",
+                            request.channel,
+                            request.protocol_type,
+                            request.target_ati,
+                            request.payload.len(),
+                        );
+                        evdo_idle.enqueue_forward_signaling(request);
+                    }
+                    while let Ok(packet) = self.hrpd_forward_traffic_rx.try_recv() {
+                        if !hrpd_active_macs
+                            .iter()
+                            .any(|active| active.mac_index == packet.mac_index)
+                        {
+                            log::warn!(
+                                "HRPD forward traffic drop: inactive mac_index={} payload_bits={}",
+                                packet.mac_index,
+                                packet.payload.len()
+                            );
+                            continue;
+                        }
+                        debug!(
+                            "HRPD forward traffic enqueue: mac_index={} payload_bits={}",
+                            packet.mac_index,
+                            packet.payload.len()
+                        );
+                        evdo_idle.enqueue_traffic(packet);
+                    }
+                    evdo_idle.next_block_into(block_chip, &mut evdo_tx_batch[offset..offset + bs]);
+                    let evdo_block_us = evdo_gen_start.elapsed().as_micros() as u64;
+                    tx_stat_evdo_us += evdo_block_us;
+                    tx_stat_evdo_max_us = tx_stat_evdo_max_us.max(evdo_block_us);
+                }
             }
 
             let batch_gen_us = gen_start.elapsed().as_micros() as u64;
@@ -849,7 +1173,83 @@ impl Bts {
                 );
             }
 
-            Self::flush_tx_batch(&mut *radio_tx, &mut state, &tx_batch, batch_playout_tick)?;
+            let batch_shape_us;
+            if let (Some(hrpd_shaper), Some(evdo_cfg), Some(evdo_tx_batch)) = (
+                hrpd_shaper.as_mut(),
+                self.evdo.as_ref().filter(|cfg| cfg.uses_hrpd_only()),
+                evdo_tx_batch.as_ref(),
+            ) {
+                let shape_start = Instant::now();
+                hrpd_shaper.shape_into(evdo_tx_batch, &mut tx_shape_buf);
+                let hrpd_scale = hrpd_only_tx_scale(evdo_cfg.gain, self.runtime.tx_digital_backoff);
+                if (hrpd_scale - 1.0).abs() > f32::EPSILON {
+                    for sample in &mut tx_shape_buf {
+                        *sample *= hrpd_scale;
+                    }
+                }
+                batch_shape_us = shape_start.elapsed().as_micros() as u64;
+                Self::flush_tx_samples_batch(
+                    &mut *radio_tx,
+                    &mut state,
+                    &tx_shape_buf,
+                    batch_playout_tick,
+                    evdo_tx_batch.len(),
+                )?;
+            } else if let (Some(composer), Some(evdo_tx_batch)) =
+                (evdo_composer.as_mut(), evdo_tx_batch.as_ref())
+            {
+                let shape_start = Instant::now();
+                composer.compose_into(&tx_batch, evdo_tx_batch, &mut tx_shape_buf);
+                batch_shape_us = shape_start.elapsed().as_micros() as u64;
+                Self::flush_tx_samples_batch(
+                    &mut *radio_tx,
+                    &mut state,
+                    &tx_shape_buf,
+                    batch_playout_tick,
+                    tx_batch.len(),
+                )?;
+            } else {
+                let shape_start = Instant::now();
+                one_x_shaper.shape_into(&tx_batch, &mut tx_shape_buf);
+                batch_shape_us = shape_start.elapsed().as_micros() as u64;
+                Self::flush_tx_samples_batch(
+                    &mut *radio_tx,
+                    &mut state,
+                    &tx_shape_buf,
+                    batch_playout_tick,
+                    tx_batch.len(),
+                )?;
+            }
+
+            tx_stat_batches += 1;
+            tx_stat_air_chips += state.tx_batch_chips;
+            tx_stat_gen_us += batch_gen_us;
+            tx_stat_gen_max_us = tx_stat_gen_max_us.max(batch_gen_us);
+            tx_stat_shape_us += batch_shape_us;
+            tx_stat_shape_max_us = tx_stat_shape_max_us.max(batch_shape_us);
+            if tx_stat_air_chips >= TX_STAT_WINDOW_CHIPS {
+                let air_us = tx_stat_air_chips * 1000 / 1229;
+                let busy_us = tx_stat_gen_us + tx_stat_shape_us;
+                info!(
+                    "tx_stats: batches={} gen_avg={}us gen_max={}us evdo_avg={}us evdo_max={}us shape_avg={}us shape_max={}us rt_load_pct={:.1}",
+                    tx_stat_batches,
+                    tx_stat_gen_us / tx_stat_batches.max(1),
+                    tx_stat_gen_max_us,
+                    tx_stat_evdo_us / tx_stat_batches.max(1),
+                    tx_stat_evdo_max_us,
+                    tx_stat_shape_us / tx_stat_batches.max(1),
+                    tx_stat_shape_max_us,
+                    100.0 * busy_us as f64 / air_us.max(1) as f64,
+                );
+                tx_stat_batches = 0;
+                tx_stat_air_chips = 0;
+                tx_stat_gen_us = 0;
+                tx_stat_gen_max_us = 0;
+                tx_stat_evdo_us = 0;
+                tx_stat_evdo_max_us = 0;
+                tx_stat_shape_us = 0;
+                tx_stat_shape_max_us = 0;
+            }
 
             chip_cursor += state.tx_batch_chips;
             sent_blocks += blocks_per_batch;
@@ -927,5 +1327,34 @@ impl Bts {
     ) -> (Bts, BtsHandle) {
         let injected_rx = radio.take_injected_rx();
         Self::build(Box::new(radio), config, runtime, injected_rx)
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hrpd_only_tx_scale_applies_configured_backoff() {
+        assert_eq!(hrpd_only_tx_scale(1.0, 0.5), 0.25);
+        assert!((hrpd_only_tx_scale(0.75, 0.4) - 0.171_428_58).abs() < 1e-6);
+        assert_eq!(hrpd_only_tx_scale(-1.0, 0.5), 0.0);
+    }
+
+    #[test]
+    fn hrpd_only_idle_waveform_stays_below_full_scale_after_backoff() {
+        let mut modulator = evdo::HrpdForwardSlotModulator::new(0, 32_768);
+        let chips = modulator.next_block(0, 32_768);
+        let mut shaper = TxPulseShaper::new(SR1_CHIP_RATE_HZ as usize * 4).unwrap();
+        let samples = shaper.shape(&chips);
+        let unscaled_peak = samples
+            .iter()
+            .map(|sample| sample.norm())
+            .fold(0.0, f32::max);
+        let scaled_peak = unscaled_peak * hrpd_only_tx_scale(1.0, 0.5);
+
+        assert!(
+            scaled_peak <= 1.0,
+            "backed-off HRPD-only peak exceeds full scale: raw={unscaled_peak:.3} scaled={scaled_peak:.3}"
+        );
     }
 }

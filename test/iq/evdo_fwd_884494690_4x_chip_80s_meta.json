@@ -1,0 +1,13 @@
+{
+  "source": "local-capture-884000000Hz.wav",
+  "start_seconds": 80.0,
+  "duration_seconds": 2.0,
+  "source_sample_rate_hz": 20000000,
+  "target_sample_rate_hz": 4915200,
+  "carrier_hz": 884494690.0,
+  "source_center_hz": 884000000.0,
+  "tuning_offset_hz": 494690.0,
+  "samples_per_chip": 4,
+  "complex_samples": 9830400,
+  "normalization_scale": 1177.514659816888
+}

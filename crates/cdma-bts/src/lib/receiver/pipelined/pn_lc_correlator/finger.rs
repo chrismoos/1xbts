@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock};
 
-use log::{debug, info, trace};
+use log::{info, trace};
 use num_complex::Complex32;
 
 use crate::phy::coding::long_code::LongCodeGenerator;
@@ -109,6 +109,12 @@ pub struct PnLcFinger {
 
     /// LC generator seeded at the finger's first TX chip.
     lc_gen: LongCodeGenerator,
+    /// Optional explicit Q LC generator for HRPD-style HPSK where UQ has its
+    /// own mask. When absent, legacy RC3 behavior derives Q from delayed I.
+    q_lc_gen: Option<LongCodeGenerator>,
+    /// Optional chip period at which LC generators are reloaded.
+    lc_period_chips: Option<usize>,
+    lc_period_initial_state: u64,
     /// Absolute TX chip corresponding to the next LC chip to be consumed.
     pub(crate) lc_chip_counter: usize,
     /// Sub-chain is only fed chips at or after this TX chip (frame alignment).
@@ -135,6 +141,9 @@ pub struct PnLcFinger {
     pub(super) hpsk_chip_count: usize,
     /// Decimated PN_Q × LC_Q value from the even chip of each pair.
     hpsk_dec_q: f32,
+    /// True for legacy/conjugated HPSK sample convention (`I-jQ`), false for
+    /// ordinary IQ samples (`I+jQ`) as used by HRPD reverse access captures.
+    hpsk_signal_conjugated: bool,
 
     // CFO tracking
     prev_pilot: Option<Complex32>,
@@ -147,12 +156,6 @@ pub struct PnLcFinger {
     /// Reverse access CFO tracker (256-chip Walsh-symbol observations,
     /// coherence-gated coasting during data).
     access_cfo: Option<cfo_tracker::CfoTracker>,
-    /// Diagnostic: accumulate raw and derotated chips for per-PCG pilot
-    /// phase logging during despread_block.
-    rc3_diag_raw_accum: Complex32,
-    rc3_diag_derot_accum: Complex32,
-    rc3_diag_chip_count: usize,
-    rc3_diag_pcg_count: usize,
     /// CFO pilot observation: accumulate ONLY 16-chip EPL pilot sums
     /// (Walsh-0 coherent) for feeding to the CfoTracker. Completely
     /// separate from the diagnostic accumulators.
@@ -647,6 +650,7 @@ impl PnLcFinger {
             despread_phase,
             center_offset,
             lc_gen,
+            None,
             lc_chip_counter,
             chain_start_chip,
             chip_block_size,
@@ -661,6 +665,9 @@ impl PnLcFinger {
             timing_mu_samples,
             output_oversampled_chips,
             integrate_and_dump,
+            None,
+            1u64 << 41,
+            true,
             GardnerTimingConfig::disabled(),
         )
     }
@@ -674,6 +681,7 @@ impl PnLcFinger {
         despread_phase: usize,
         center_offset: usize,
         lc_gen: LongCodeGenerator,
+        q_lc_gen: Option<LongCodeGenerator>,
         lc_chip_counter: usize,
         chain_start_chip: usize,
         chip_block_size: usize,
@@ -688,6 +696,9 @@ impl PnLcFinger {
         timing_mu_samples: f32,
         output_oversampled_chips: bool,
         integrate_and_dump: bool,
+        lc_period_chips: Option<usize>,
+        lc_period_initial_state: u64,
+        hpsk_signal_conjugated: bool,
         gardner_timing: GardnerTimingConfig,
     ) -> Self {
         // Fold `center_offset` into the stored cursor: `despread_phase`
@@ -714,6 +725,9 @@ impl PnLcFinger {
                 timing_mu_samples,
             ),
             lc_gen,
+            q_lc_gen,
+            lc_period_chips,
+            lc_period_initial_state,
             lc_chip_counter,
             chain_start_chip,
             sample_buffer: VecDeque::new(),
@@ -723,8 +737,9 @@ impl PnLcFinger {
             current_chip_enabled: false,
             lc_decimation: lc_decimation.max(1),
             hpsk_prev_lc: 1.0,
-            hpsk_chip_count: 0,
+            hpsk_chip_count: lc_chip_counter,
             hpsk_dec_q: 1.0,
+            hpsk_signal_conjugated,
             prev_pilot: None,
             cfo_rad_per_chip: initial_cfo_rad_per_chip,
             cfo_phase: 0.0,
@@ -742,10 +757,6 @@ impl PnLcFinger {
             } else {
                 None
             },
-            rc3_diag_raw_accum: Complex32::new(0.0, 0.0),
-            rc3_diag_derot_accum: Complex32::new(0.0, 0.0),
-            rc3_diag_chip_count: 0,
-            rc3_diag_pcg_count: 0,
             rc3_cfo_pilot_accum: Complex32::new(0.0, 0.0),
             rc3_cfo_pilot_chips: 0,
             sample_rate_hz: 0.0,
@@ -873,6 +884,14 @@ impl PnLcFinger {
     /// Only read for HPSK (lc_decimation >= 2); RC1 ignores it.
     fn advance_lc_for_new_chip(&mut self, pn_at_chip_start: Complex32) {
         let chip_tx = self.lc_chip_counter;
+        if let Some(period) = self.lc_period_chips
+            && chip_tx % period == 0
+        {
+            self.lc_gen.set_state(self.lc_period_initial_state);
+            if let Some(q_lc) = self.q_lc_gen.as_mut() {
+                q_lc.set_state(self.lc_period_initial_state);
+            }
+        }
         if self.lc_decimation >= 2 {
             // HPSK (RC3+ reverse link): composite PN×LC despreading.
             let lc_i: f32 = if self.lc_gen.next_chip() == 1 {
@@ -891,14 +910,26 @@ impl PnLcFinger {
             };
             // Q long code decimation: at even chips, compute and store the
             // (PN_Q × LC_Q) value. At odd chips, reuse the stored value.
-            if self.hpsk_chip_count % 2 == 0 {
+            if let Some(q_lc_gen) = self.q_lc_gen.as_mut() {
+                let lc_q: f32 = if q_lc_gen.next_chip() == 1 { -1.0 } else { 1.0 };
+                if self.hpsk_chip_count % 2 == 0 {
+                    self.hpsk_dec_q = pn_q * lc_q;
+                }
+            } else if self.hpsk_chip_count % 2 == 0 {
                 self.hpsk_dec_q = pn_q * self.hpsk_prev_lc;
             }
-            let cross = w12 * pn_i * pn_q * self.hpsk_dec_q;
-            let re = lc_i * (1.0 - cross) * 0.5;
-            let im = lc_i * (w12 * self.hpsk_dec_q + pn_i * pn_q) * 0.5;
+            let e = w12 * self.hpsk_dec_q;
+            let ab = pn_i * pn_q;
+            let cross = ab * e;
+            let (re, im) = if self.hpsk_signal_conjugated {
+                (lc_i * (1.0 - cross) * 0.5, lc_i * (e + ab) * 0.5)
+            } else {
+                (lc_i * (1.0 + cross) * 0.5, lc_i * (ab - e) * 0.5)
+            };
             self.current_lc_conj = Complex32::new(re, im);
-            self.hpsk_prev_lc = lc_i;
+            if self.q_lc_gen.is_none() {
+                self.hpsk_prev_lc = lc_i;
+            }
             self.hpsk_chip_count += 1;
         } else {
             let bit = self.lc_gen.next_chip();
@@ -1036,21 +1067,6 @@ impl PnLcFinger {
             let despread = self.despread_chip_prompt(samples, idx, val, pn);
             self.advance_lc_for_new_chip(pn);
 
-            if self.lc_decimation >= 2 {
-                let chip_offset = self.hpsk_chip_count.wrapping_sub(self.chain_start_chip + 1);
-                if chip_offset < 5 || (chip_offset >= 322 && chip_offset <= 328) {
-                    trace!(
-                        "HPSK finger chip[{}] offset={} lc_gen_state=0x{:010X} lc_conj=({:.3},{:.3}) despread_phase={}",
-                        self.hpsk_chip_count.saturating_sub(1),
-                        chip_offset,
-                        self.lc_gen.state(),
-                        self.current_lc_conj.re,
-                        self.current_lc_conj.im,
-                        self.despread_phase,
-                    );
-                }
-            }
-
             let epl_active =
                 self.epl_enabled && self.current_chip_enabled && self.base.is_hard_validated();
 
@@ -1058,21 +1074,6 @@ impl PnLcFinger {
                 let out = despread * self.current_lc_conj;
                 let chip_tx = self.lc_chip_counter.saturating_sub(1);
                 let mut pcg_measurement_prompt_chip = out;
-                if self.lc_decimation >= 2 {
-                    let chip_offset = self.lc_chip_counter.wrapping_sub(self.chain_start_chip + 1);
-                    if chip_offset < 5 || (chip_offset >= 318 && chip_offset <= 326) {
-                        trace!(
-                            "HPSK output[{}] despread=({:.3},{:.3}) lc_conj=({:.3},{:.3}) out=({:.3},{:.3})",
-                            chip_offset,
-                            despread.re,
-                            despread.im,
-                            self.current_lc_conj.re,
-                            self.current_lc_conj.im,
-                            out.re,
-                            out.im
-                        );
-                    }
-                }
                 if self.output_oversampled_chips && self.oversample > 1 {
                     let center = self.center_offset % self.oversample;
                     let chip_start_idx = idx - center as f32;
@@ -1097,44 +1098,6 @@ impl PnLcFinger {
                         cfo.derotate_chips(&mut slice, 1);
                         self.sample_buffer.push_back(slice[0]);
                         pcg_measurement_prompt_chip = slice[0];
-
-                        // Diagnostic: accumulate raw and derotated chips.
-                        self.rc3_diag_raw_accum += out;
-                        self.rc3_diag_derot_accum += slice[0];
-                        self.rc3_diag_chip_count += 1;
-                        if self.rc3_diag_chip_count >= 1536 {
-                            let raw_phase = self
-                                .rc3_diag_raw_accum
-                                .im
-                                .atan2(self.rc3_diag_raw_accum.re)
-                                .to_degrees();
-                            let raw_norm = self.rc3_diag_raw_accum.norm();
-                            let derot_phase = self
-                                .rc3_diag_derot_accum
-                                .im
-                                .atan2(self.rc3_diag_derot_accum.re)
-                                .to_degrees();
-                            let derot_norm = self.rc3_diag_derot_accum.norm();
-                            let cfo_hz = cfo.cfo_rad_per_chip() as f64 * 1_228_800.0
-                                / (2.0 * std::f64::consts::PI);
-                            if self.rc3_diag_pcg_count < 40 || self.rc3_diag_pcg_count % 800 == 0 {
-                                debug!(
-                                    "RC3_CFO_DIAG finger={} pcg={} | raw: phase={:.1}° norm={:.1} | derot: phase={:.1}° norm={:.1} | cfo={:.1}Hz warmup={}",
-                                    self.base.id,
-                                    self.rc3_diag_pcg_count,
-                                    raw_phase,
-                                    raw_norm,
-                                    derot_phase,
-                                    derot_norm,
-                                    cfo_hz,
-                                    cfo.in_warmup(),
-                                );
-                            }
-                            self.rc3_diag_raw_accum = Complex32::new(0.0, 0.0);
-                            self.rc3_diag_derot_accum = Complex32::new(0.0, 0.0);
-                            self.rc3_diag_chip_count = 0;
-                            self.rc3_diag_pcg_count += 1;
-                        }
                     } else {
                         self.sample_buffer.push_back(out);
                     }
@@ -1482,7 +1445,7 @@ impl PnLcFinger {
             );
             self.epl_last_log_pilot_ec_io_db = Some(pilot_ec_io_db);
 
-            debug!(
+            trace!(
                 "EPL_TRACK[finger={}] sec#{} windows={} N={} chips={} mode=pilot | \
                  env: E={:.3e} P={:.3e} L={:.3e} (E-L)/P={:+.4} | \
                  env_win: E={:.3e} P={:.3e} L={:.3e} (E-L)/P={:+.4} | \
@@ -1530,7 +1493,7 @@ impl PnLcFinger {
             let coh_norm = self.epl_coh4_pwr_prompt.max(1e-12);
             let coh_disc = (self.epl_coh4_pwr_early - self.epl_coh4_pwr_late) / coh_norm;
 
-            debug!(
+            trace!(
                 "EPL_TRACK[finger={}] sec#{} windows={} N={} chips={} mode=coh4 | \
                  env: E={:.3e} P={:.3e} L={:.3e} (E-L)/P={:+.4} | \
                  env_win: E={:.3e} P={:.3e} L={:.3e} (E-L)/P={:+.4} | \
@@ -1601,7 +1564,8 @@ impl PnLcFinger {
         }
 
         let total_len = n_blocks * block_len;
-        let first_abs_chip = self.chain_start_chip + self.chain_chips_output;
+        let buffered_chips = self.sample_buffer.len() / output_oversample;
+        let first_abs_chip = self.lc_chip_counter.saturating_sub(buffered_chips);
         let mut all_samples = Vec::with_capacity(total_len);
 
         // Process in chip_block_size windows for CFO correction + pilot
@@ -1997,7 +1961,7 @@ impl RakeFinger for PnLcFinger {
             let d_ms = self.despread_ns as f64 / 1e6;
             let c_ms = self.drain_ns as f64 / 1e6;
             let total = d_ms + c_ms;
-            debug!(
+            trace!(
                 "  [finger {} blk={}] despread: {:.1}ms ({:.1}%) | sub-chain: {:.1}ms ({:.1}%)",
                 self.base.id,
                 self.finger_block_count,
@@ -2064,7 +2028,7 @@ impl RakeFinger for PnLcFinger {
         let c_ms = self.drain_ns as f64 / 1e6;
         let total = d_ms + c_ms;
         let high_e_syms = self.high_energy_chip_count / 256;
-        debug!(
+        trace!(
             "    finger {} breakdown ({} blocks, high_energy_chips={} ~{} syms): despread {:.1}ms ({:.1}%) | sub-chain {:.1}ms ({:.1}%)",
             self.base.id,
             self.finger_block_count,
@@ -2092,7 +2056,7 @@ impl RakeFinger for PnLcFinger {
                 } else {
                     0.0
                 };
-                debug!("      [{si}] {name:<50} {ms:>8.1}ms  {pct:>5.1}%");
+                trace!("      [{si}] {name:<50} {ms:>8.1}ms  {pct:>5.1}%");
             }
         }
     }

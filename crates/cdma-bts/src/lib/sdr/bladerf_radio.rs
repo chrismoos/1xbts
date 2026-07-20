@@ -8,7 +8,7 @@ use cdma_common::error::Error;
 use log::{debug, info, warn};
 use num_complex::Complex32;
 
-use super::{Radio, RadioRx, RadioTx, RxReadResult, TX_SAMPLE_RATE, TxPulseShaper};
+use super::{Radio, RadioRx, RadioTx, RxReadResult};
 
 /// BLADERF_FORMAT_SC16_Q11_META — enables hardware timestamps in stream metadata.
 const FORMAT_SC16_Q11_META: u32 = 2;
@@ -50,7 +50,6 @@ pub struct BladeRfRadio {
     device: Device,
     channel: u32,
     sample_rate: u32,
-    tx_shaper: TxPulseShaper,
     tx_lo_offset_hz: f64,
     tx_sample_rate_hz: f64,
     tx_nco_phase_rad: f64,
@@ -155,9 +154,8 @@ impl BladeRfRadio {
             device,
             channel,
             sample_rate: actual_rate,
-            tx_shaper: TxPulseShaper::new(),
             tx_lo_offset_hz: 0.0,
-            tx_sample_rate_hz: TX_SAMPLE_RATE as f64,
+            tx_sample_rate_hz: actual_rate as f64,
             tx_nco_phase_rad: 0.0,
             rx_configured: false,
             num_buffers: nb,
@@ -341,7 +339,6 @@ impl Radio for BladeRfRadio {
             tx_sync,
             channel: self.channel,
             sample_rate: self.sample_rate,
-            tx_shaper: self.tx_shaper,
             tx_lo_offset_hz: self.tx_lo_offset_hz,
             tx_sample_rate_hz: self.tx_sample_rate_hz,
             tx_nco_phase_rad: self.tx_nco_phase_rad,
@@ -383,7 +380,6 @@ struct BladeRfTxHalf {
     tx_sync: TxSync,
     channel: u32,
     sample_rate: u32,
-    tx_shaper: TxPulseShaper,
     tx_lo_offset_hz: f64,
     tx_sample_rate_hz: f64,
     tx_nco_phase_rad: f64,
@@ -412,46 +408,24 @@ impl RadioTx for BladeRfTxHalf {
     }
 
     fn transmit(&mut self, samples: &[Complex32]) -> Result<(), Error> {
-        let mut shaped = self.tx_shaper.shape(samples);
+        self.transmit_at(samples, None)
+    }
+
+    fn transmit_at(&mut self, samples: &[Complex32], tick: Option<u64>) -> Result<(), Error> {
+        let mut samples = samples.to_vec();
         BladeRfRadio::apply_tx_lo_offset(
             self.tx_lo_offset_hz,
             self.tx_sample_rate_hz,
             &mut self.tx_nco_phase_rad,
-            &mut shaped,
+            &mut samples,
         );
+        let sc16: Vec<Sc16Q11> = samples
+            .iter()
+            .map(|s| Sc16Q11::from_complex32(*s))
+            .collect();
 
-        let sc16: Vec<Sc16Q11> = shaped.iter().map(|s| Sc16Q11::from_complex32(*s)).collect();
-        let mut flags = META_FLAG_TX_NOW;
-        if !self.burst_active {
-            flags |= META_FLAG_TX_BURST_START;
-            self.burst_active = true;
-        }
-        let mut meta = StreamMeta {
-            flags,
-            ..Default::default()
-        };
-        self.tx_sync
-            .send(&sc16, Some(&mut meta), self.stream_timeout_ms)
-            .map_err(|e| Error::from(format!("bladeRF: TX send: {}", e)))?;
-        if meta.status & META_STATUS_UNDERRUN != 0 {
-            warn!("bladeRF: TX underrun detected");
-        }
-        Ok(())
-    }
-
-    fn transmit_at(&mut self, samples: &[Complex32], tick: Option<u64>) -> Result<(), Error> {
         match tick {
             Some(ts) => {
-                let mut shaped = self.tx_shaper.shape(samples);
-                BladeRfRadio::apply_tx_lo_offset(
-                    self.tx_lo_offset_hz,
-                    self.tx_sample_rate_hz,
-                    &mut self.tx_nco_phase_rad,
-                    &mut shaped,
-                );
-
-                let sc16: Vec<Sc16Q11> =
-                    shaped.iter().map(|s| Sc16Q11::from_complex32(*s)).collect();
                 let mut meta = if !self.burst_active {
                     // First send: set the starting timestamp and begin burst.
                     // Subsequent sends stream continuously without per-buffer
@@ -482,7 +456,24 @@ impl RadioTx for BladeRfTxHalf {
                 }
                 Ok(())
             }
-            None => self.transmit(samples),
+            None => {
+                let mut flags = META_FLAG_TX_NOW;
+                if !self.burst_active {
+                    flags |= META_FLAG_TX_BURST_START;
+                    self.burst_active = true;
+                }
+                let mut meta = StreamMeta {
+                    flags,
+                    ..Default::default()
+                };
+                self.tx_sync
+                    .send(&sc16, Some(&mut meta), self.stream_timeout_ms)
+                    .map_err(|e| Error::from(format!("bladeRF: TX send: {}", e)))?;
+                if meta.status & META_STATUS_UNDERRUN != 0 {
+                    warn!("bladeRF: TX underrun detected");
+                }
+                Ok(())
+            }
         }
     }
 

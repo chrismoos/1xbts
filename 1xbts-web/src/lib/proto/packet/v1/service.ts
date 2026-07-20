@@ -10,6 +10,86 @@ import type { CallContext, CallOptions } from "nice-grpc-common";
 
 export const protobufPackage = "packet.v1";
 
+/** Radio access technology for a packet session. */
+export enum AccessTechnology {
+  ACCESS_TECHNOLOGY_UNSPECIFIED = 0,
+  ACCESS_TECHNOLOGY_CDMA_1X = 1,
+  ACCESS_TECHNOLOGY_HRPD = 2,
+  UNRECOGNIZED = -1,
+}
+
+export function accessTechnologyFromJSON(object: any): AccessTechnology {
+  switch (object) {
+    case 0:
+    case "ACCESS_TECHNOLOGY_UNSPECIFIED":
+      return AccessTechnology.ACCESS_TECHNOLOGY_UNSPECIFIED;
+    case 1:
+    case "ACCESS_TECHNOLOGY_CDMA_1X":
+      return AccessTechnology.ACCESS_TECHNOLOGY_CDMA_1X;
+    case 2:
+    case "ACCESS_TECHNOLOGY_HRPD":
+      return AccessTechnology.ACCESS_TECHNOLOGY_HRPD;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return AccessTechnology.UNRECOGNIZED;
+  }
+}
+
+export function accessTechnologyToJSON(object: AccessTechnology): string {
+  switch (object) {
+    case AccessTechnology.ACCESS_TECHNOLOGY_UNSPECIFIED:
+      return "ACCESS_TECHNOLOGY_UNSPECIFIED";
+    case AccessTechnology.ACCESS_TECHNOLOGY_CDMA_1X:
+      return "ACCESS_TECHNOLOGY_CDMA_1X";
+    case AccessTechnology.ACCESS_TECHNOLOGY_HRPD:
+      return "ACCESS_TECHNOLOGY_HRPD";
+    case AccessTechnology.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
+/** Origin of the HRPD A11 MN ID used for bearer registration. */
+export enum HrpdMnIdSource {
+  HRPD_MN_ID_SOURCE_UNSPECIFIED = 0,
+  HRPD_MN_ID_SOURCE_A11 = 1,
+  HRPD_MN_ID_SOURCE_DERIVED_HARDWARE = 2,
+  UNRECOGNIZED = -1,
+}
+
+export function hrpdMnIdSourceFromJSON(object: any): HrpdMnIdSource {
+  switch (object) {
+    case 0:
+    case "HRPD_MN_ID_SOURCE_UNSPECIFIED":
+      return HrpdMnIdSource.HRPD_MN_ID_SOURCE_UNSPECIFIED;
+    case 1:
+    case "HRPD_MN_ID_SOURCE_A11":
+      return HrpdMnIdSource.HRPD_MN_ID_SOURCE_A11;
+    case 2:
+    case "HRPD_MN_ID_SOURCE_DERIVED_HARDWARE":
+      return HrpdMnIdSource.HRPD_MN_ID_SOURCE_DERIVED_HARDWARE;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return HrpdMnIdSource.UNRECOGNIZED;
+  }
+}
+
+export function hrpdMnIdSourceToJSON(object: HrpdMnIdSource): string {
+  switch (object) {
+    case HrpdMnIdSource.HRPD_MN_ID_SOURCE_UNSPECIFIED:
+      return "HRPD_MN_ID_SOURCE_UNSPECIFIED";
+    case HrpdMnIdSource.HRPD_MN_ID_SOURCE_A11:
+      return "HRPD_MN_ID_SOURCE_A11";
+    case HrpdMnIdSource.HRPD_MN_ID_SOURCE_DERIVED_HARDWARE:
+      return "HRPD_MN_ID_SOURCE_DERIVED_HARDWARE";
+    case HrpdMnIdSource.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
 /** One RLP traffic frame moving between the radio stack and packet engine. */
 export interface SessionFrame {
   /** Packet session identifier. */
@@ -40,6 +120,17 @@ export interface OpenSessionRequest {
   phoneNumber: string;
   /** Assigned forward traffic-channel Walsh code. */
   trafficWalshCode: number;
+  /** Mobile MEID when available as subscriber/equipment metadata. */
+  meid: string;
+  /**
+   * HRPD A11 MN ID used for bearer registration. This may be an IMSI-format
+   * value derived for A11 and must not be displayed as a subscriber IMSI.
+   */
+  hrpdMnId: string;
+  /** Origin of hrpd_mn_id. */
+  hrpdMnIdSource: HrpdMnIdSource;
+  /** Authoritative subscriber IMSI when resolved by HLR/A12/roaming data. */
+  subscriberImsi: string;
 }
 
 /** Response returned after packet session state is opened. */
@@ -156,6 +247,23 @@ export interface PacketSessionInfo {
   lcpState: string;
   ipcpState: string;
   captureEnabled: boolean;
+  /** Radio access technology for this packet session. */
+  accessTechnology: AccessTechnology;
+  /** IMSI associated with the packet session when known. */
+  imsi: string;
+  /** ESN associated with the packet session when known. */
+  esn: number;
+  /** Mobile MEID when available. */
+  meid: string;
+  /**
+   * HRPD A11 MN ID used for bearer registration. This is not necessarily a
+   * subscriber IMSI.
+   */
+  hrpdMnId: string;
+  /** Origin of hrpd_mn_id. */
+  hrpdMnIdSource: HrpdMnIdSource;
+  /** Authoritative subscriber IMSI when resolved. */
+  subscriberImsi: string;
 }
 
 /** One trace event emitted by PPP, RLP, IP transport, or capture code. */
@@ -324,6 +432,10 @@ function createBaseOpenSessionRequest(): OpenSessionRequest {
     subscriberId: "",
     phoneNumber: "",
     trafficWalshCode: 0,
+    meid: "",
+    hrpdMnId: "",
+    hrpdMnIdSource: 0,
+    subscriberImsi: "",
   };
 }
 
@@ -352,6 +464,18 @@ export const OpenSessionRequest: MessageFns<OpenSessionRequest> = {
     }
     if (message.trafficWalshCode !== 0) {
       writer.uint32(64).uint32(message.trafficWalshCode);
+    }
+    if (message.meid !== "") {
+      writer.uint32(74).string(message.meid);
+    }
+    if (message.hrpdMnId !== "") {
+      writer.uint32(82).string(message.hrpdMnId);
+    }
+    if (message.hrpdMnIdSource !== 0) {
+      writer.uint32(88).int32(message.hrpdMnIdSource);
+    }
+    if (message.subscriberImsi !== "") {
+      writer.uint32(98).string(message.subscriberImsi);
     }
     return writer;
   },
@@ -427,6 +551,38 @@ export const OpenSessionRequest: MessageFns<OpenSessionRequest> = {
           message.trafficWalshCode = reader.uint32();
           continue;
         }
+        case 9: {
+          if (tag !== 74) {
+            break;
+          }
+
+          message.meid = reader.string();
+          continue;
+        }
+        case 10: {
+          if (tag !== 82) {
+            break;
+          }
+
+          message.hrpdMnId = reader.string();
+          continue;
+        }
+        case 11: {
+          if (tag !== 88) {
+            break;
+          }
+
+          message.hrpdMnIdSource = reader.int32() as any;
+          continue;
+        }
+        case 12: {
+          if (tag !== 98) {
+            break;
+          }
+
+          message.subscriberImsi = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -470,6 +626,22 @@ export const OpenSessionRequest: MessageFns<OpenSessionRequest> = {
         : isSet(object.traffic_walsh_code)
         ? globalThis.Number(object.traffic_walsh_code)
         : 0,
+      meid: isSet(object.meid) ? globalThis.String(object.meid) : "",
+      hrpdMnId: isSet(object.hrpdMnId)
+        ? globalThis.String(object.hrpdMnId)
+        : isSet(object.hrpd_mn_id)
+        ? globalThis.String(object.hrpd_mn_id)
+        : "",
+      hrpdMnIdSource: isSet(object.hrpdMnIdSource)
+        ? hrpdMnIdSourceFromJSON(object.hrpdMnIdSource)
+        : isSet(object.hrpd_mn_id_source)
+        ? hrpdMnIdSourceFromJSON(object.hrpd_mn_id_source)
+        : 0,
+      subscriberImsi: isSet(object.subscriberImsi)
+        ? globalThis.String(object.subscriberImsi)
+        : isSet(object.subscriber_imsi)
+        ? globalThis.String(object.subscriber_imsi)
+        : "",
     };
   },
 
@@ -499,6 +671,18 @@ export const OpenSessionRequest: MessageFns<OpenSessionRequest> = {
     if (message.trafficWalshCode !== 0) {
       obj.trafficWalshCode = Math.round(message.trafficWalshCode);
     }
+    if (message.meid !== "") {
+      obj.meid = message.meid;
+    }
+    if (message.hrpdMnId !== "") {
+      obj.hrpdMnId = message.hrpdMnId;
+    }
+    if (message.hrpdMnIdSource !== 0) {
+      obj.hrpdMnIdSource = hrpdMnIdSourceToJSON(message.hrpdMnIdSource);
+    }
+    if (message.subscriberImsi !== "") {
+      obj.subscriberImsi = message.subscriberImsi;
+    }
     return obj;
   },
 
@@ -515,6 +699,10 @@ export const OpenSessionRequest: MessageFns<OpenSessionRequest> = {
     message.subscriberId = object.subscriberId ?? "";
     message.phoneNumber = object.phoneNumber ?? "";
     message.trafficWalshCode = object.trafficWalshCode ?? 0;
+    message.meid = object.meid ?? "";
+    message.hrpdMnId = object.hrpdMnId ?? "";
+    message.hrpdMnIdSource = object.hrpdMnIdSource ?? 0;
+    message.subscriberImsi = object.subscriberImsi ?? "";
     return message;
   },
 };
@@ -1353,6 +1541,13 @@ function createBasePacketSessionInfo(): PacketSessionInfo {
     lcpState: "",
     ipcpState: "",
     captureEnabled: false,
+    accessTechnology: 0,
+    imsi: "",
+    esn: 0,
+    meid: "",
+    hrpdMnId: "",
+    hrpdMnIdSource: 0,
+    subscriberImsi: "",
   };
 }
 
@@ -1432,6 +1627,27 @@ export const PacketSessionInfo: MessageFns<PacketSessionInfo> = {
     }
     if (message.captureEnabled !== false) {
       writer.uint32(224).bool(message.captureEnabled);
+    }
+    if (message.accessTechnology !== 0) {
+      writer.uint32(232).int32(message.accessTechnology);
+    }
+    if (message.imsi !== "") {
+      writer.uint32(242).string(message.imsi);
+    }
+    if (message.esn !== 0) {
+      writer.uint32(248).uint32(message.esn);
+    }
+    if (message.meid !== "") {
+      writer.uint32(258).string(message.meid);
+    }
+    if (message.hrpdMnId !== "") {
+      writer.uint32(266).string(message.hrpdMnId);
+    }
+    if (message.hrpdMnIdSource !== 0) {
+      writer.uint32(272).int32(message.hrpdMnIdSource);
+    }
+    if (message.subscriberImsi !== "") {
+      writer.uint32(282).string(message.subscriberImsi);
     }
     return writer;
   },
@@ -1643,6 +1859,62 @@ export const PacketSessionInfo: MessageFns<PacketSessionInfo> = {
           message.captureEnabled = reader.bool();
           continue;
         }
+        case 29: {
+          if (tag !== 232) {
+            break;
+          }
+
+          message.accessTechnology = reader.int32() as any;
+          continue;
+        }
+        case 30: {
+          if (tag !== 242) {
+            break;
+          }
+
+          message.imsi = reader.string();
+          continue;
+        }
+        case 31: {
+          if (tag !== 248) {
+            break;
+          }
+
+          message.esn = reader.uint32();
+          continue;
+        }
+        case 32: {
+          if (tag !== 258) {
+            break;
+          }
+
+          message.meid = reader.string();
+          continue;
+        }
+        case 33: {
+          if (tag !== 266) {
+            break;
+          }
+
+          message.hrpdMnId = reader.string();
+          continue;
+        }
+        case 34: {
+          if (tag !== 272) {
+            break;
+          }
+
+          message.hrpdMnIdSource = reader.int32() as any;
+          continue;
+        }
+        case 35: {
+          if (tag !== 282) {
+            break;
+          }
+
+          message.subscriberImsi = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1775,6 +2047,29 @@ export const PacketSessionInfo: MessageFns<PacketSessionInfo> = {
         : isSet(object.capture_enabled)
         ? globalThis.Boolean(object.capture_enabled)
         : false,
+      accessTechnology: isSet(object.accessTechnology)
+        ? accessTechnologyFromJSON(object.accessTechnology)
+        : isSet(object.access_technology)
+        ? accessTechnologyFromJSON(object.access_technology)
+        : 0,
+      imsi: isSet(object.imsi) ? globalThis.String(object.imsi) : "",
+      esn: isSet(object.esn) ? globalThis.Number(object.esn) : 0,
+      meid: isSet(object.meid) ? globalThis.String(object.meid) : "",
+      hrpdMnId: isSet(object.hrpdMnId)
+        ? globalThis.String(object.hrpdMnId)
+        : isSet(object.hrpd_mn_id)
+        ? globalThis.String(object.hrpd_mn_id)
+        : "",
+      hrpdMnIdSource: isSet(object.hrpdMnIdSource)
+        ? hrpdMnIdSourceFromJSON(object.hrpdMnIdSource)
+        : isSet(object.hrpd_mn_id_source)
+        ? hrpdMnIdSourceFromJSON(object.hrpd_mn_id_source)
+        : 0,
+      subscriberImsi: isSet(object.subscriberImsi)
+        ? globalThis.String(object.subscriberImsi)
+        : isSet(object.subscriber_imsi)
+        ? globalThis.String(object.subscriber_imsi)
+        : "",
     };
   },
 
@@ -1855,6 +2150,27 @@ export const PacketSessionInfo: MessageFns<PacketSessionInfo> = {
     if (message.captureEnabled !== false) {
       obj.captureEnabled = message.captureEnabled;
     }
+    if (message.accessTechnology !== 0) {
+      obj.accessTechnology = accessTechnologyToJSON(message.accessTechnology);
+    }
+    if (message.imsi !== "") {
+      obj.imsi = message.imsi;
+    }
+    if (message.esn !== 0) {
+      obj.esn = Math.round(message.esn);
+    }
+    if (message.meid !== "") {
+      obj.meid = message.meid;
+    }
+    if (message.hrpdMnId !== "") {
+      obj.hrpdMnId = message.hrpdMnId;
+    }
+    if (message.hrpdMnIdSource !== 0) {
+      obj.hrpdMnIdSource = hrpdMnIdSourceToJSON(message.hrpdMnIdSource);
+    }
+    if (message.subscriberImsi !== "") {
+      obj.subscriberImsi = message.subscriberImsi;
+    }
     return obj;
   },
 
@@ -1888,6 +2204,13 @@ export const PacketSessionInfo: MessageFns<PacketSessionInfo> = {
     message.lcpState = object.lcpState ?? "";
     message.ipcpState = object.ipcpState ?? "";
     message.captureEnabled = object.captureEnabled ?? false;
+    message.accessTechnology = object.accessTechnology ?? 0;
+    message.imsi = object.imsi ?? "";
+    message.esn = object.esn ?? 0;
+    message.meid = object.meid ?? "";
+    message.hrpdMnId = object.hrpdMnId ?? "";
+    message.hrpdMnIdSource = object.hrpdMnIdSource ?? 0;
+    message.subscriberImsi = object.subscriberImsi ?? "";
     return message;
   },
 };
@@ -2282,10 +2605,9 @@ export const PacketServiceDefinition = {
       options: {},
     },
     /**
-     * Looks up one active packet session by its assigned mobile (peer) IP.
-     * Used by the edge MSISDN resolver in fou-nat to attribute inbound HTTP
-     * requests to a subscriber. Returns the session summary, or an unset
-     * `session` field when no active session has that peer_ip.
+     * Looks up one active packet session by its assigned mobile (peer) IP, for
+     * attributing inbound traffic to a subscriber. Returns the session summary,
+     * or an unset `session` field when no active session has that peer_ip.
      */
     getSessionByIp: {
       name: "GetSessionByIp",
@@ -2306,8 +2628,8 @@ export const PacketServiceDefinition = {
     },
     /**
      * Enables or disables F-SCH downlink frame generation on a running session.
-     * Called by the BSC after a successful F-SCH allocation (active=true) and
-     * during teardown / SCH release (active=false).
+     * Set active=true after an F-SCH allocation and active=false during
+     * teardown / SCH release.
      */
     setSchActive: {
       name: "SetSchActive",
@@ -2347,10 +2669,9 @@ export interface PacketServiceImplementation<CallContextExt = {}> {
     context: CallContext & CallContextExt,
   ): Promise<DeepPartial<ListSessionsResponse>>;
   /**
-   * Looks up one active packet session by its assigned mobile (peer) IP.
-   * Used by the edge MSISDN resolver in fou-nat to attribute inbound HTTP
-   * requests to a subscriber. Returns the session summary, or an unset
-   * `session` field when no active session has that peer_ip.
+   * Looks up one active packet session by its assigned mobile (peer) IP, for
+   * attributing inbound traffic to a subscriber. Returns the session summary,
+   * or an unset `session` field when no active session has that peer_ip.
    */
   getSessionByIp(
     request: GetSessionByIpRequest,
@@ -2363,8 +2684,8 @@ export interface PacketServiceImplementation<CallContextExt = {}> {
   ): Promise<DeepPartial<SetSessionCaptureResponse>>;
   /**
    * Enables or disables F-SCH downlink frame generation on a running session.
-   * Called by the BSC after a successful F-SCH allocation (active=true) and
-   * during teardown / SCH release (active=false).
+   * Set active=true after an F-SCH allocation and active=false during
+   * teardown / SCH release.
    */
   setSchActive(
     request: SetSchActiveRequest,
@@ -2399,10 +2720,9 @@ export interface PacketServiceClient<CallOptionsExt = {}> {
     options?: CallOptions & CallOptionsExt,
   ): Promise<ListSessionsResponse>;
   /**
-   * Looks up one active packet session by its assigned mobile (peer) IP.
-   * Used by the edge MSISDN resolver in fou-nat to attribute inbound HTTP
-   * requests to a subscriber. Returns the session summary, or an unset
-   * `session` field when no active session has that peer_ip.
+   * Looks up one active packet session by its assigned mobile (peer) IP, for
+   * attributing inbound traffic to a subscriber. Returns the session summary,
+   * or an unset `session` field when no active session has that peer_ip.
    */
   getSessionByIp(
     request: DeepPartial<GetSessionByIpRequest>,
@@ -2415,8 +2735,8 @@ export interface PacketServiceClient<CallOptionsExt = {}> {
   ): Promise<SetSessionCaptureResponse>;
   /**
    * Enables or disables F-SCH downlink frame generation on a running session.
-   * Called by the BSC after a successful F-SCH allocation (active=true) and
-   * during teardown / SCH release (active=false).
+   * Set active=true after an F-SCH allocation and active=false during
+   * teardown / SCH release.
    */
   setSchActive(
     request: DeepPartial<SetSchActiveRequest>,

@@ -472,6 +472,7 @@ pub enum PagingMessageKind {
     ExtendedSystemParameters,
     GeneralPage,
     Order,
+    AlternativeTechnologiesInformation,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1026,8 +1027,17 @@ pub struct SystemParametersMessage {
     pub crrm_msg_ind: bool,
     /// Count of the optional-overhead-message flag bits that follow
     /// (AP_PILOT_INFO, AP_IDT, AP_ID_TEXT, GEN_OVHD_INF_IND, FD_CHAN_LST_IND,
-    /// ATIM_IND) plus their reserved tail. Encoder asserts 0.
+    /// ATIM_IND) plus their reserved tail.
     pub num_opt_msg_bits: u8,
+    pub ap_pilot_info: bool,
+    pub ap_idt: bool,
+    pub ap_id_text: bool,
+    pub gen_ovhd_inf_ind: bool,
+    pub fd_chan_lst_ind: bool,
+    pub atim_ind: bool,
+    pub appim_period_index: u8,
+    pub gen_ovhd_cycle_index: u8,
+    pub atim_cycle_index: u8,
     pub add_loc_info_incl: bool,
 }
 
@@ -5396,11 +5406,77 @@ impl SystemParametersMessage {
         }
         bs.write_u8(self.neg_slot_cycle_index_sup as u8, 1);
         bs.write_u8(self.crrm_msg_ind as u8, 1);
-        assert_eq!(
-            self.num_opt_msg_bits, 0,
-            "SPM optional overhead message bits not yet implemented"
+        assert!(
+            self.num_opt_msg_bits <= 15,
+            "SPM NUM_OPT_MSG_BITS must fit in 4 bits"
+        );
+        assert!(
+            self.num_opt_msg_bits >= 1 || !self.ap_pilot_info,
+            "SPM AP_PILOT_INFO requires NUM_OPT_MSG_BITS >= 1"
+        );
+        assert!(
+            self.num_opt_msg_bits >= 2 || !self.ap_idt,
+            "SPM AP_IDT requires NUM_OPT_MSG_BITS >= 2"
+        );
+        assert!(
+            self.num_opt_msg_bits >= 3 || !self.ap_id_text,
+            "SPM AP_ID_TEXT requires NUM_OPT_MSG_BITS >= 3"
+        );
+        assert!(
+            self.num_opt_msg_bits >= 4 || !self.gen_ovhd_inf_ind,
+            "SPM GEN_OVHD_INF_IND requires NUM_OPT_MSG_BITS >= 4"
+        );
+        assert!(
+            self.num_opt_msg_bits >= 5 || !self.fd_chan_lst_ind,
+            "SPM FD_CHAN_LST_IND requires NUM_OPT_MSG_BITS >= 5"
+        );
+        assert!(
+            self.num_opt_msg_bits >= 6 || !self.atim_ind,
+            "SPM ATIM_IND requires NUM_OPT_MSG_BITS >= 6"
         );
         bs.write_u8(self.num_opt_msg_bits, 4);
+        if self.num_opt_msg_bits >= 1 {
+            bs.write_u8(self.ap_pilot_info as u8, 1);
+        }
+        if self.num_opt_msg_bits >= 2 {
+            bs.write_u8(self.ap_idt as u8, 1);
+        }
+        if self.num_opt_msg_bits >= 3 {
+            bs.write_u8(self.ap_id_text as u8, 1);
+        }
+        if self.num_opt_msg_bits >= 4 {
+            bs.write_u8(self.gen_ovhd_inf_ind as u8, 1);
+        }
+        if self.num_opt_msg_bits >= 5 {
+            bs.write_u8(self.fd_chan_lst_ind as u8, 1);
+        }
+        if self.num_opt_msg_bits >= 6 {
+            bs.write_u8(self.atim_ind as u8, 1);
+        }
+        for _ in 6..self.num_opt_msg_bits {
+            bs.write_u8(0, 1);
+        }
+        if self.ap_pilot_info {
+            assert!(
+                self.appim_period_index <= 0b101,
+                "SPM APPIM_PERIOD_INDEX must be in 0..=5"
+            );
+            bs.write_u8(self.appim_period_index, 3);
+        }
+        if self.gen_ovhd_inf_ind {
+            assert!(
+                self.gen_ovhd_cycle_index <= 0b101,
+                "SPM GEN_OVHD_CYCLE_INDEX must be in 0..=5"
+            );
+            bs.write_u8(self.gen_ovhd_cycle_index, 3);
+        }
+        if self.atim_ind {
+            assert!(
+                self.atim_cycle_index <= 0b101,
+                "SPM ATIM_CYCLE_INDEX must be in 0..=5"
+            );
+            bs.write_u8(self.atim_cycle_index, 3);
+        }
         bs.write_u8(self.add_loc_info_incl as u8, 1);
         assert!(
             !self.add_loc_info_incl,
@@ -5469,11 +5545,30 @@ impl SystemParametersMessage {
         } else {
             bs.read_bits(4)? as u8
         };
-        if num_opt_msg_bits != 0 {
-            return Err(
-                "SPM NUM_OPT_MSG_BITS != 0 (optional overhead messages not implemented)".into(),
-            );
+        let ap_pilot_info = num_opt_msg_bits >= 1 && bs.read_bits(1)? != 0;
+        let ap_idt = num_opt_msg_bits >= 2 && bs.read_bits(1)? != 0;
+        let ap_id_text = num_opt_msg_bits >= 3 && bs.read_bits(1)? != 0;
+        let gen_ovhd_inf_ind = num_opt_msg_bits >= 4 && bs.read_bits(1)? != 0;
+        let fd_chan_lst_ind = num_opt_msg_bits >= 5 && bs.read_bits(1)? != 0;
+        let atim_ind = num_opt_msg_bits >= 6 && bs.read_bits(1)? != 0;
+        if num_opt_msg_bits > 6 {
+            for _ in 6..num_opt_msg_bits {
+                if bs.read_bits(1)? != 0 {
+                    return Err("SPM optional overhead reserved bits must be zero".into());
+                }
+            }
         }
+        let appim_period_index = if ap_pilot_info {
+            bs.read_bits(3)? as u8
+        } else {
+            0
+        };
+        let gen_ovhd_cycle_index = if gen_ovhd_inf_ind {
+            bs.read_bits(3)? as u8
+        } else {
+            0
+        };
+        let atim_cycle_index = if atim_ind { bs.read_bits(3)? as u8 } else { 0 };
         let add_loc_info_incl = !bs.is_empty() && bs.read_bits(1)? != 0;
         if add_loc_info_incl {
             return Err(
@@ -5531,6 +5626,15 @@ impl SystemParametersMessage {
             neg_slot_cycle_index_sup,
             crrm_msg_ind,
             num_opt_msg_bits,
+            ap_pilot_info,
+            ap_idt,
+            ap_id_text,
+            gen_ovhd_inf_ind,
+            fd_chan_lst_ind,
+            atim_ind,
+            appim_period_index,
+            gen_ovhd_cycle_index,
+            atim_cycle_index,
             add_loc_info_incl,
         })
     }
@@ -13879,9 +13983,9 @@ impl ServiceConnectParams {
         bs.write_u8(0, 1); // DCCH_CC_INCL = 0
         if let Some(ref sch) = self.for_sch_config {
             Self::validate_for_sch_config(sch);
-            // FOR_SCH_CC block per C.S0005-E §3.7.5.7. Phase 1 sends a single
-            // F-SCH (NUM_FOR_SCH=1) with the SCH_CC_Type-specific subrecord
-            // formatted per §3.7.5.7.1 (16 bits / 2 octets).
+            // FOR_SCH_CC block per C.S0005-E §3.7.5.7. This build sends a
+            // single F-SCH (NUM_FOR_SCH=1) with the SCH_CC_Type-specific
+            // subrecord formatted per §3.7.5.7.1 (16 bits / 2 octets).
             bs.write_u8(1, 1); // FOR_SCH_CC_INCL = 1
             bs.write_u8(1, 2); // NUM_FOR_SCH = 1 (spec forbids '00' when INCL=1)
             // Per-SCH 3-field record: FOR_SCH_ID + FOR_SCH_MUX + SCH_CC_Type-specific
@@ -13891,7 +13995,7 @@ impl ServiceConnectParams {
             bs.write_u8(2, 4); // SCH_REC_LEN = 2 (record length in octets, includes this field)
             bs.write_u8(sch.rc, 5); // SCH_RC
             bs.write_u8(sch.coding, 1); // CODING (0 = convolutional)
-            bs.write_u8(0, 1); // FRAME_40_USED = 0 (Phase 1: 20 ms frames only)
+            bs.write_u8(0, 1); // FRAME_40_USED = 0 (20 ms frames only)
             bs.write_u8(0, 1); // FRAME_80_USED = 0
             bs.write_u8(sch.rate, 4); // MAX_RATE
         } else {
@@ -14183,8 +14287,8 @@ fn write_general_page_record(bs: &mut Bitstream, record: &GeneralPageRecord) {
 /// Parameters for the ESCAM (sent on F-TCH to assign/release F-SCH).
 ///
 /// Per C.S0005-E §3.7.3.3.2.37 — this encodes the complete message structure.
-/// Many optional sections (reverse SCH, 3X, BCMC) are hardcoded to "not included"
-/// for Phase 1 (forward SCH only, no soft handoff).
+/// Many optional sections (reverse SCH, 3X, BCMC) are hardcoded to "not included":
+/// this build sends only forward SCH, with no soft handoff.
 #[derive(Clone, Debug)]
 pub struct EscamParams {
     /// START_TIME_UNIT (3 bits): time unit for start times.
@@ -14283,8 +14387,8 @@ impl EscamParams {
 
     /// Encode the ESCAM as a `Bitstream` SDU per C.S0005-E §3.7.3.3.2.37.
     ///
-    /// Encodes the complete message structure. Sections not needed for
-    /// Phase 1 (reverse SCH, 3X, BCMC, soft handoff) are set to "not included".
+    /// Encodes the complete message structure. Unused sections (reverse SCH,
+    /// 3X, BCMC, soft handoff) are set to "not included".
     pub fn to_ftch_sdu(&self) -> Bitstream {
         self.validate();
         let mut bs = Bitstream::new();
@@ -18301,6 +18405,15 @@ mod forward_overhead_decode_tests {
                 neg_slot_cycle_index_sup: false,
                 crrm_msg_ind: false,
                 num_opt_msg_bits: 0,
+                ap_pilot_info: false,
+                ap_idt: false,
+                ap_id_text: false,
+                gen_ovhd_inf_ind: false,
+                fd_chan_lst_ind: false,
+                atim_ind: false,
+                appim_period_index: 0,
+                gen_ovhd_cycle_index: 0,
+                atim_cycle_index: 0,
                 add_loc_info_incl: false,
             },
         ));
@@ -18373,7 +18486,16 @@ mod forward_overhead_decode_tests {
                 t_tdrop_range: 0b1010,
                 neg_slot_cycle_index_sup: true,
                 crrm_msg_ind: true,
-                num_opt_msg_bits: 0,
+                num_opt_msg_bits: 6,
+                ap_pilot_info: false,
+                ap_idt: false,
+                ap_id_text: false,
+                gen_ovhd_inf_ind: false,
+                fd_chan_lst_ind: false,
+                atim_ind: true,
+                appim_period_index: 0,
+                gen_ovhd_cycle_index: 0,
+                atim_cycle_index: 0,
                 add_loc_info_incl: false,
             },
         ));
@@ -18383,6 +18505,11 @@ mod forward_overhead_decode_tests {
                 assert_eq!(m.t_tdrop_range, 0b1010);
                 assert!(m.neg_slot_cycle_index_sup);
                 assert!(m.crrm_msg_ind);
+                assert_eq!(m.num_opt_msg_bits, 6);
+                assert!(!m.ap_pilot_info);
+                assert!(!m.fd_chan_lst_ind);
+                assert!(m.atim_ind);
+                assert_eq!(m.atim_cycle_index, 0);
             }
             _ => panic!("unexpected decoded message"),
         }

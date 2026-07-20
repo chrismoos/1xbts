@@ -2,6 +2,10 @@
 
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
+use std::net::SocketAddr;
+
+use md5::{Digest, Md5};
+use serde::{Deserialize, Serialize};
 
 pub mod procedure;
 pub mod transport;
@@ -15,6 +19,123 @@ pub use transport::{UdpEndpoint, UdpFrame, VerifiedUdpFrame};
 const THREEGPP2_VENDOR_ID: u32 = 0x0000_159f;
 const PROTOCOL_TYPE_UNSTRUCTURED_BYTE_STREAM: u16 = 0x8881;
 const SESSION_SPECIFIC_MSID_TYPE_IMSI: u16 = 0x0006;
+const A11_RESERVED_SPI_MAX: u32 = 0x00ff;
+const A11_AUTHENTICATOR_BYTES: usize = 16;
+
+/// A11 authentication policy carried next to A11 transport config.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct A11SecurityConfig {
+    /// Security Parameter Index for the PCF/PDSN A11 security association.
+    ///
+    /// A.S0017 reserves SPI values 0..=255.
+    pub spi: u32,
+    /// Shared secret bytes as hexadecimal. Both A11 peers must use the same
+    /// value; this is the PCF/PDSN association secret, not an AT credential.
+    pub shared_secret_hex: String,
+}
+
+impl A11SecurityConfig {
+    pub fn validate(&self, label: &str) -> std::result::Result<(), String> {
+        if self.spi <= A11_RESERVED_SPI_MAX {
+            return Err(format!("{label}.spi must be greater than 255"));
+        }
+        let secret = decode_hex_secret(&self.shared_secret_hex)
+            .map_err(|err| format!("{label}.shared_secret_hex: {err}"))?;
+        if secret.is_empty() {
+            return Err(format!("{label}.shared_secret_hex must not be empty"));
+        }
+        Ok(())
+    }
+}
+
+/// A concrete A11 security association for keyed-MD5 authentication.
+#[derive(Clone, Debug)]
+pub struct A11SecurityAssociation {
+    spi: u32,
+    shared_secret: Vec<u8>,
+}
+
+impl A11SecurityAssociation {
+    pub fn from_config(config: &A11SecurityConfig) -> std::result::Result<Self, String> {
+        config.validate("a11_security")?;
+        Ok(Self {
+            spi: config.spi,
+            shared_secret: decode_hex_secret(&config.shared_secret_hex)?,
+        })
+    }
+
+    pub fn spi(&self) -> u32 {
+        self.spi
+    }
+
+    /// Returns a zeroed authentication extension suitable as a signing placeholder.
+    pub fn placeholder_authentication(
+        &self,
+        extension_type: AuthenticationExtensionType,
+    ) -> AuthenticationExtension {
+        AuthenticationExtension {
+            extension_type,
+            security_parameter_index: self.spi,
+            authenticator: vec![0; A11_AUTHENTICATOR_BYTES],
+        }
+    }
+
+    /// Signs `message` in place using the A.S0017 keyed-MD5 prefix/suffix form.
+    pub fn sign_message(&self, message: &mut Message) -> Result<()> {
+        let extension_type = required_authentication_type_for_message(message);
+        set_message_authentication(message, self.placeholder_authentication(extension_type))?;
+        let zeroed_wire = encode(message)?;
+        let authenticator = self.compute_authenticator(&zeroed_wire);
+        set_message_authentication(
+            message,
+            AuthenticationExtension {
+                extension_type,
+                security_parameter_index: self.spi,
+                authenticator,
+            },
+        )
+    }
+
+    fn compute_authenticator(&self, zeroed_wire: &[u8]) -> Vec<u8> {
+        let mut md5 = Md5::new();
+        md5.update(&self.shared_secret);
+        md5.update(zeroed_wire);
+        md5.update(&self.shared_secret);
+        md5.finalize().to_vec()
+    }
+}
+
+/// Native UDP/IP endpoint configuration for A11 signaling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct A11TransportConfig {
+    /// Local UDP socket used by this node's A11 endpoint.
+    pub bind_addr: SocketAddr,
+    /// Peer UDP socket. Production deployments normally use destination port
+    /// 699; an unprivileged loopback port works for local single-host testing.
+    pub peer_addr: SocketAddr,
+}
+
+impl A11TransportConfig {
+    pub const fn new(bind_addr: SocketAddr, peer_addr: SocketAddr) -> Self {
+        Self {
+            bind_addr,
+            peer_addr,
+        }
+    }
+
+    pub fn validate(&self, label: &str) -> std::result::Result<(), String> {
+        if self.bind_addr.ip().is_unspecified() {
+            return Err(format!("{label}: bind_addr must not use an unspecified IP"));
+        }
+        if self.peer_addr.ip().is_unspecified() {
+            return Err(format!("{label}: peer_addr must not use an unspecified IP"));
+        }
+        if self.bind_addr == self.peer_addr {
+            return Err(format!("{label}: bind_addr and peer_addr must differ"));
+        }
+        Ok(())
+    }
+}
 
 /// Errors returned by the A11 codec helpers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -890,6 +1011,39 @@ where
     }
 }
 
+impl AuthenticationVerifier for A11SecurityAssociation {
+    fn verify_authentication(
+        &self,
+        _wire_bytes: &[u8],
+        message: &Message,
+        authentication: &AuthenticationExtension,
+    ) -> Result<()> {
+        if authentication.security_parameter_index != self.spi {
+            return Err(Error::AuthenticationRejected {
+                context: "a11.authentication",
+                reason: "unexpected security parameter index",
+            });
+        }
+        let mut zeroed = message.clone();
+        set_message_authentication(
+            &mut zeroed,
+            AuthenticationExtension {
+                extension_type: authentication.extension_type,
+                security_parameter_index: authentication.security_parameter_index,
+                authenticator: vec![0; A11_AUTHENTICATOR_BYTES],
+            },
+        )?;
+        let expected = self.compute_authenticator(&encode(&zeroed)?);
+        if !constant_time_eq(&expected, &authentication.authenticator) {
+            return Err(Error::AuthenticationRejected {
+                context: "a11.authentication",
+                reason: "bad authenticator",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// A decoded A11 message whose required authenticator has been accepted by a verifier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedMessage {
@@ -960,6 +1114,140 @@ pub fn decode_unverified(input: &[u8], _reason: UnverifiedDecodeReason) -> Resul
     decode_message(input)
 }
 
+fn decode_hex_secret(input: &str) -> std::result::Result<Vec<u8>, String> {
+    let hex = input.trim();
+    if hex.len() % 2 != 0 {
+        return Err("hex string must contain an even number of digits".to_string());
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let bytes = hex.as_bytes();
+    for idx in (0..bytes.len()).step_by(2) {
+        let high =
+            hex_nibble(bytes[idx]).ok_or_else(|| format!("invalid hex digit at offset {idx}"))?;
+        let low = hex_nibble(bytes[idx + 1])
+            .ok_or_else(|| format!("invalid hex digit at offset {}", idx + 1))?;
+        out.push((high << 4) | low);
+    }
+    Ok(out)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+fn required_authentication_type_for_message(message: &Message) -> AuthenticationExtensionType {
+    match message {
+        Message::RegistrationRequest(_) | Message::RegistrationReply(_) => {
+            AuthenticationExtensionType::MobileHome
+        }
+        Message::RegistrationUpdate(_)
+        | Message::RegistrationAcknowledge(_)
+        | Message::SessionUpdate(_)
+        | Message::SessionUpdateAcknowledge(_)
+        | Message::CapabilitiesInfo(_)
+        | Message::CapabilitiesInfoAcknowledge(_) => {
+            AuthenticationExtensionType::RegistrationUpdate
+        }
+    }
+}
+
+fn set_message_authentication(
+    message: &mut Message,
+    authentication: AuthenticationExtension,
+) -> Result<()> {
+    match message {
+        Message::RegistrationRequest(message) => set_extension_authentication(
+            &mut message.extensions,
+            authentication,
+            "registration request.extensions",
+        ),
+        Message::RegistrationReply(message) => set_extension_authentication(
+            &mut message.extensions,
+            authentication,
+            "registration reply.extensions",
+        ),
+        Message::RegistrationUpdate(message) => {
+            message.authentication_extension = authentication;
+            Ok(())
+        }
+        Message::RegistrationAcknowledge(message) => {
+            message.authentication_extension = authentication;
+            Ok(())
+        }
+        Message::SessionUpdate(message) => {
+            message.authentication_extension = authentication;
+            Ok(())
+        }
+        Message::SessionUpdateAcknowledge(message) => {
+            message.authentication_extension = authentication;
+            Ok(())
+        }
+        Message::CapabilitiesInfo(message) => {
+            message.authentication_extension = authentication;
+            Ok(())
+        }
+        Message::CapabilitiesInfoAcknowledge(message) => {
+            message.authentication_extension = authentication;
+            Ok(())
+        }
+    }
+}
+
+fn set_extension_authentication(
+    extensions: &mut Vec<Extension>,
+    authentication: AuthenticationExtension,
+    context: &'static str,
+) -> Result<()> {
+    let mut replaced = false;
+    for extension in extensions.iter_mut() {
+        if let Extension::Authentication(existing) = extension
+            && existing.extension_type == authentication.extension_type
+        {
+            if replaced {
+                return Err(Error::DuplicateExtension {
+                    extension_type: authentication.extension_type as u8,
+                });
+            }
+            *existing = authentication.clone();
+            replaced = true;
+        }
+    }
+    if replaced {
+        Ok(())
+    } else {
+        if extensions.iter().any(|extension| {
+            matches!(
+                extension,
+                Extension::Authentication(existing)
+                    if existing.extension_type != authentication.extension_type
+            )
+        }) {
+            return Err(Error::InvalidValue {
+                context,
+                reason: "unexpected authentication extension type",
+            });
+        }
+        extensions.push(Extension::Authentication(authentication));
+        Ok(())
+    }
+}
+
 fn decode_message(input: &[u8]) -> Result<Message> {
     let Some((&message_type, _)) = input.split_first() else {
         return Err(Error::EmptyMessage);
@@ -987,7 +1275,7 @@ fn decode_message(input: &[u8]) -> Result<Message> {
 }
 
 fn encode_request(message_type: MessageType, message: &RegistrationRequest) -> Result<Vec<u8>> {
-    validate_request(message)?;
+    message.validate()?;
     let mut out = vec![message_type as u8, message.flags];
     out.extend_from_slice(&message.lifetime.to_be_bytes());
     out.extend_from_slice(&message.home_address);
@@ -1002,7 +1290,7 @@ fn encode_request(message_type: MessageType, message: &RegistrationRequest) -> R
 }
 
 fn encode_reply(message_type: MessageType, message: &RegistrationReply) -> Result<Vec<u8>> {
-    validate_reply(message)?;
+    message.validate()?;
     let mut out = vec![message_type as u8, message.code];
     out.extend_from_slice(&message.lifetime.to_be_bytes());
     out.extend_from_slice(&message.home_address);
@@ -1016,7 +1304,7 @@ fn encode_reply(message_type: MessageType, message: &RegistrationReply) -> Resul
 }
 
 fn encode_update(message_type: MessageType, message: &RegistrationUpdate) -> Result<Vec<u8>> {
-    validate_update(message)?;
+    message.validate()?;
     let mut out = vec![message_type as u8];
     out.extend_from_slice(&message.reserved);
     out.extend_from_slice(&message.home_address);
@@ -1034,7 +1322,7 @@ fn encode_acknowledge(
     message_type: MessageType,
     message: &RegistrationAcknowledge,
 ) -> Result<Vec<u8>> {
-    validate_acknowledge(message)?;
+    message.validate()?;
     let mut out = vec![message_type as u8];
     out.extend_from_slice(&message.reserved);
     out.push(message.status);
@@ -1047,7 +1335,7 @@ fn encode_acknowledge(
 }
 
 fn encode_session_update(message_type: MessageType, message: &SessionUpdate) -> Result<Vec<u8>> {
-    validate_session_update(message)?;
+    message.validate()?;
     let mut out = vec![message_type as u8];
     out.extend_from_slice(&message.reserved);
     out.extend_from_slice(&message.home_address);
@@ -1065,7 +1353,7 @@ fn encode_session_update_acknowledge(
     message_type: MessageType,
     message: &SessionUpdateAcknowledge,
 ) -> Result<Vec<u8>> {
-    validate_session_update_acknowledge(message)?;
+    message.validate()?;
     let mut out = vec![message_type as u8];
     out.extend_from_slice(&message.reserved);
     out.push(message.status);
@@ -1081,7 +1369,7 @@ fn encode_capabilities_info(
     message_type: MessageType,
     message: &CapabilitiesInfo,
 ) -> Result<Vec<u8>> {
-    validate_capabilities_info(message)?;
+    message.validate()?;
     let mut out = vec![message_type as u8];
     out.extend_from_slice(&message.reserved);
     out.extend_from_slice(&message.home_address);
@@ -1099,7 +1387,7 @@ fn encode_capabilities_info_ack(
     message_type: MessageType,
     message: &CapabilitiesInfoAcknowledge,
 ) -> Result<Vec<u8>> {
-    validate_capabilities_info_ack(message)?;
+    message.validate()?;
     let mut out = vec![message_type as u8];
     out.extend_from_slice(&message.reserved);
     out.extend_from_slice(&message.home_address);
@@ -1132,7 +1420,7 @@ fn decode_request(input: &[u8]) -> Result<RegistrationRequest> {
         session,
         extensions: collect_extensions(&input[24 + used..])?,
     };
-    validate_request(&message)?;
+    message.validate()?;
     Ok(message)
 }
 
@@ -1155,7 +1443,7 @@ fn decode_reply(input: &[u8]) -> Result<RegistrationReply> {
         session,
         extensions: collect_extensions(&input[20 + used..])?,
     };
-    validate_reply(&message)?;
+    message.validate()?;
     Ok(message)
 }
 
@@ -1183,7 +1471,7 @@ fn decode_update(input: &[u8]) -> Result<RegistrationUpdate> {
         nvses,
         authentication_extension,
     };
-    validate_update(&message)?;
+    message.validate()?;
     Ok(message)
 }
 
@@ -1210,7 +1498,7 @@ fn decode_acknowledge(input: &[u8]) -> Result<RegistrationAcknowledge> {
             "registration acknowledge",
         )?,
     };
-    validate_acknowledge(&message)?;
+    message.validate()?;
     Ok(message)
 }
 
@@ -1238,7 +1526,7 @@ fn decode_session_update(input: &[u8]) -> Result<SessionUpdate> {
         nvses,
         authentication_extension,
     };
-    validate_session_update(&message)?;
+    message.validate()?;
     Ok(message)
 }
 
@@ -1265,7 +1553,7 @@ fn decode_session_update_acknowledge(input: &[u8]) -> Result<SessionUpdateAcknow
             "session update acknowledge",
         )?,
     };
-    validate_session_update_acknowledge(&message)?;
+    message.validate()?;
     Ok(message)
 }
 
@@ -1292,7 +1580,7 @@ fn decode_capabilities_info(input: &[u8]) -> Result<CapabilitiesInfo> {
         nvses,
         authentication_extension,
     };
-    validate_capabilities_info(&message)?;
+    message.validate()?;
     Ok(message)
 }
 
@@ -1318,7 +1606,7 @@ fn decode_capabilities_info_ack(input: &[u8]) -> Result<CapabilitiesInfoAcknowle
         nvses,
         authentication_extension,
     };
-    validate_capabilities_info_ack(&message)?;
+    message.validate()?;
     Ok(message)
 }
 
@@ -1449,199 +1737,207 @@ fn decode_nvse_sequence_with_auth(
     })
 }
 
-pub(crate) fn validate_request(message: &RegistrationRequest) -> Result<()> {
-    validate_session(&message.session)?;
-    if !matches!(message.flags, 0x0a | 0x8a) {
-        return Err(Error::InvalidValue {
-            context: "registration request.flags",
-            reason: "flags must encode one of the A.S0017 request flag patterns",
-        });
+impl RegistrationRequest {
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_session(&self.session)?;
+        if !matches!(self.flags, 0x0a | 0x8a) {
+            return Err(Error::InvalidValue {
+                context: "registration request.flags",
+                reason: "flags must encode one of the A.S0017 request flag patterns",
+            });
+        }
+        if self.lifetime == u16::MAX {
+            return Err(Error::InvalidValue {
+                context: "registration request.lifetime",
+                reason: "lifetime must not be 0xffff",
+            });
+        }
+        validate_home_address_zero(self.home_address, "registration request.home_address")?;
+        validate_extensions(&self.extensions, MessageType::RegistrationRequest)?;
+        require_authentication_extension(
+            &self.extensions,
+            AuthenticationExtensionType::MobileHome,
+            "registration request.extensions",
+        )?;
+        validate_identification_non_zero(self.identification)?;
+        Ok(())
     }
-    if message.lifetime == u16::MAX {
-        return Err(Error::InvalidValue {
-            context: "registration request.lifetime",
-            reason: "lifetime must not be 0xffff",
-        });
+}
+
+impl RegistrationReply {
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_session(&self.session)?;
+        validate_registration_reply_code(self.code)?;
+        if self.lifetime == u16::MAX {
+            return Err(Error::InvalidValue {
+                context: "registration reply.lifetime",
+                reason: "lifetime must not be 0xffff",
+            });
+        }
+        validate_home_address_zero(self.home_address, "registration reply.home_address")?;
+        validate_extensions(&self.extensions, MessageType::RegistrationReply)?;
+        require_authentication_extension(
+            &self.extensions,
+            AuthenticationExtensionType::MobileHome,
+            "registration reply.extensions",
+        )?;
+        validate_identification_non_zero(self.identification)?;
+        Ok(())
     }
-    validate_home_address_zero(message.home_address, "registration request.home_address")?;
-    validate_extensions(&message.extensions, MessageType::RegistrationRequest)?;
-    require_authentication_extension(
-        &message.extensions,
-        AuthenticationExtensionType::MobileHome,
-        "registration request.extensions",
-    )?;
-    validate_identification_non_zero(message.identification)?;
-    Ok(())
 }
 
-pub(crate) fn validate_reply(message: &RegistrationReply) -> Result<()> {
-    validate_session(&message.session)?;
-    validate_registration_reply_code(message.code)?;
-    if message.lifetime == u16::MAX {
-        return Err(Error::InvalidValue {
-            context: "registration reply.lifetime",
-            reason: "lifetime must not be 0xffff",
-        });
+impl RegistrationUpdate {
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_session(&self.session)?;
+        validate_reserved_3(
+            self.reserved,
+            "registration update.reserved",
+            "reserved octets must be zero",
+        )?;
+        validate_home_address_zero(self.home_address, "registration update.home_address")?;
+        validate_nvse_list(&self.nvses, MessageType::RegistrationUpdate)?;
+        validate_authentication_extension(
+            &self.authentication_extension,
+            AuthenticationExtensionType::RegistrationUpdate,
+            "registration update.authentication_extension",
+        )?;
+        validate_identification_non_zero(self.identification)?;
+        Ok(())
     }
-    validate_home_address_zero(message.home_address, "registration reply.home_address")?;
-    validate_extensions(&message.extensions, MessageType::RegistrationReply)?;
-    require_authentication_extension(
-        &message.extensions,
-        AuthenticationExtensionType::MobileHome,
-        "registration reply.extensions",
-    )?;
-    validate_identification_non_zero(message.identification)?;
-    Ok(())
 }
 
-pub(crate) fn validate_update(message: &RegistrationUpdate) -> Result<()> {
-    validate_session(&message.session)?;
-    validate_reserved_3(
-        message.reserved,
-        "registration update.reserved",
-        "reserved octets must be zero",
-    )?;
-    validate_home_address_zero(message.home_address, "registration update.home_address")?;
-    validate_nvse_list(&message.nvses, MessageType::RegistrationUpdate)?;
-    validate_authentication_extension(
-        &message.authentication_extension,
-        AuthenticationExtensionType::RegistrationUpdate,
-        "registration update.authentication_extension",
-    )?;
-    validate_identification_non_zero(message.identification)?;
-    Ok(())
-}
-
-pub(crate) fn validate_acknowledge(message: &RegistrationAcknowledge) -> Result<()> {
-    validate_session(&message.session)?;
-    validate_reserved_2(
-        message.reserved,
-        "registration acknowledge.reserved",
-        "reserved octets must be zero",
-    )?;
-    validate_update_status(message.status, false, "registration acknowledge.status")?;
-    validate_home_address_zero(
-        message.home_address,
-        "registration acknowledge.home_address",
-    )?;
-    validate_authentication_extension(
-        &message.authentication_extension,
-        AuthenticationExtensionType::RegistrationUpdate,
-        "registration acknowledge.authentication_extension",
-    )?;
-    validate_identification_non_zero(message.identification)?;
-    Ok(())
-}
-
-pub(crate) fn validate_session_update(message: &SessionUpdate) -> Result<()> {
-    validate_session(&message.session)?;
-    validate_reserved_3(
-        message.reserved,
-        "session update.reserved",
-        "reserved octets must be zero",
-    )?;
-    validate_home_address_zero(message.home_address, "session update.home_address")?;
-    validate_nvse_list(&message.nvses, MessageType::SessionUpdate)?;
-    if !message.nvses.iter().any(|nvse| {
-        matches!(
-            nvse,
-            Nvse::AnchorPPAddress(_) | Nvse::SessionParameter(_) | Nvse::Unknown(_)
-        )
-    }) {
-        return Err(Error::InvalidValue {
-            context: "session update.nvses",
-            reason: "session update must carry session-parameter or anchor-P-P NVSE content",
-        });
+impl RegistrationAcknowledge {
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_session(&self.session)?;
+        validate_reserved_2(
+            self.reserved,
+            "registration acknowledge.reserved",
+            "reserved octets must be zero",
+        )?;
+        validate_update_status(self.status, false, "registration acknowledge.status")?;
+        validate_home_address_zero(self.home_address, "registration acknowledge.home_address")?;
+        validate_authentication_extension(
+            &self.authentication_extension,
+            AuthenticationExtensionType::RegistrationUpdate,
+            "registration acknowledge.authentication_extension",
+        )?;
+        validate_identification_non_zero(self.identification)?;
+        Ok(())
     }
-    validate_authentication_extension(
-        &message.authentication_extension,
-        AuthenticationExtensionType::RegistrationUpdate,
-        "session update.authentication_extension",
-    )?;
-    validate_identification_non_zero(message.identification)?;
-    Ok(())
 }
 
-pub(crate) fn validate_session_update_acknowledge(
-    message: &SessionUpdateAcknowledge,
-) -> Result<()> {
-    validate_session(&message.session)?;
-    validate_reserved_2(
-        message.reserved,
-        "session update acknowledge.reserved",
-        "reserved octets must be zero",
-    )?;
-    validate_update_status(message.status, true, "session update acknowledge.status")?;
-    validate_home_address_zero(
-        message.home_address,
-        "session update acknowledge.home_address",
-    )?;
-    validate_authentication_extension(
-        &message.authentication_extension,
-        AuthenticationExtensionType::RegistrationUpdate,
-        "session update acknowledge.authentication_extension",
-    )?;
-    validate_identification_non_zero(message.identification)?;
-    Ok(())
-}
-
-pub(crate) fn validate_capabilities_info(message: &CapabilitiesInfo) -> Result<()> {
-    validate_reserved_3(
-        message.reserved,
-        "capabilities info.reserved",
-        "reserved octets must be zero",
-    )?;
-    validate_home_address_zero(message.home_address, "capabilities info.home_address")?;
-    validate_nvse_list(&message.nvses, MessageType::CapabilitiesInfo)?;
-    if !message.nvses.iter().any(|nvse| {
-        matches!(
-            nvse,
-            Nvse::PdsnEnabledFeature(_) | Nvse::PcfEnabledFeature(_) | Nvse::Unknown(_)
-        )
-    }) {
-        return Err(Error::InvalidValue {
-            context: "capabilities info.nvses",
-            reason: "capabilities info must include feature NVSE content",
-        });
+impl SessionUpdate {
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_session(&self.session)?;
+        validate_reserved_3(
+            self.reserved,
+            "session update.reserved",
+            "reserved octets must be zero",
+        )?;
+        validate_home_address_zero(self.home_address, "session update.home_address")?;
+        validate_nvse_list(&self.nvses, MessageType::SessionUpdate)?;
+        if !self.nvses.iter().any(|nvse| {
+            matches!(
+                nvse,
+                Nvse::AnchorPPAddress(_) | Nvse::SessionParameter(_) | Nvse::Unknown(_)
+            )
+        }) {
+            return Err(Error::InvalidValue {
+                context: "session update.nvses",
+                reason: "session update must carry session-parameter or anchor-P-P NVSE content",
+            });
+        }
+        validate_authentication_extension(
+            &self.authentication_extension,
+            AuthenticationExtensionType::RegistrationUpdate,
+            "session update.authentication_extension",
+        )?;
+        validate_identification_non_zero(self.identification)?;
+        Ok(())
     }
-    validate_authentication_extension(
-        &message.authentication_extension,
-        AuthenticationExtensionType::RegistrationUpdate,
-        "capabilities info.authentication_extension",
-    )?;
-    validate_identification_non_zero(message.identification)?;
-    Ok(())
 }
 
-pub(crate) fn validate_capabilities_info_ack(message: &CapabilitiesInfoAcknowledge) -> Result<()> {
-    validate_reserved_3(
-        message.reserved,
-        "capabilities info acknowledge.reserved",
-        "reserved octets must be zero",
-    )?;
-    validate_home_address_zero(
-        message.home_address,
-        "capabilities info acknowledge.home_address",
-    )?;
-    validate_nvse_list(&message.nvses, MessageType::CapabilitiesInfoAcknowledge)?;
-    if !message.nvses.iter().any(|nvse| {
-        matches!(
-            nvse,
-            Nvse::PdsnEnabledFeature(_) | Nvse::PcfEnabledFeature(_) | Nvse::Unknown(_)
-        )
-    }) {
-        return Err(Error::InvalidValue {
-            context: "capabilities info acknowledge.nvses",
-            reason: "capabilities info acknowledge must include feature NVSE content",
-        });
+impl SessionUpdateAcknowledge {
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_session(&self.session)?;
+        validate_reserved_2(
+            self.reserved,
+            "session update acknowledge.reserved",
+            "reserved octets must be zero",
+        )?;
+        validate_update_status(self.status, true, "session update acknowledge.status")?;
+        validate_home_address_zero(self.home_address, "session update acknowledge.home_address")?;
+        validate_authentication_extension(
+            &self.authentication_extension,
+            AuthenticationExtensionType::RegistrationUpdate,
+            "session update acknowledge.authentication_extension",
+        )?;
+        validate_identification_non_zero(self.identification)?;
+        Ok(())
     }
-    validate_authentication_extension(
-        &message.authentication_extension,
-        AuthenticationExtensionType::RegistrationUpdate,
-        "capabilities info acknowledge.authentication_extension",
-    )?;
-    validate_identification_non_zero(message.identification)?;
-    Ok(())
+}
+
+impl CapabilitiesInfo {
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_reserved_3(
+            self.reserved,
+            "capabilities info.reserved",
+            "reserved octets must be zero",
+        )?;
+        validate_home_address_zero(self.home_address, "capabilities info.home_address")?;
+        validate_nvse_list(&self.nvses, MessageType::CapabilitiesInfo)?;
+        if !self.nvses.iter().any(|nvse| {
+            matches!(
+                nvse,
+                Nvse::PdsnEnabledFeature(_) | Nvse::PcfEnabledFeature(_) | Nvse::Unknown(_)
+            )
+        }) {
+            return Err(Error::InvalidValue {
+                context: "capabilities info.nvses",
+                reason: "capabilities info must include feature NVSE content",
+            });
+        }
+        validate_authentication_extension(
+            &self.authentication_extension,
+            AuthenticationExtensionType::RegistrationUpdate,
+            "capabilities info.authentication_extension",
+        )?;
+        validate_identification_non_zero(self.identification)?;
+        Ok(())
+    }
+}
+
+impl CapabilitiesInfoAcknowledge {
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_reserved_3(
+            self.reserved,
+            "capabilities info acknowledge.reserved",
+            "reserved octets must be zero",
+        )?;
+        validate_home_address_zero(
+            self.home_address,
+            "capabilities info acknowledge.home_address",
+        )?;
+        validate_nvse_list(&self.nvses, MessageType::CapabilitiesInfoAcknowledge)?;
+        if !self.nvses.iter().any(|nvse| {
+            matches!(
+                nvse,
+                Nvse::PdsnEnabledFeature(_) | Nvse::PcfEnabledFeature(_) | Nvse::Unknown(_)
+            )
+        }) {
+            return Err(Error::InvalidValue {
+                context: "capabilities info acknowledge.nvses",
+                reason: "capabilities info acknowledge must include feature NVSE content",
+            });
+        }
+        validate_authentication_extension(
+            &self.authentication_extension,
+            AuthenticationExtensionType::RegistrationUpdate,
+            "capabilities info acknowledge.authentication_extension",
+        )?;
+        validate_identification_non_zero(self.identification)?;
+        Ok(())
+    }
 }
 
 fn validate_extensions(extensions: &[Extension], message_type: MessageType) -> Result<()> {

@@ -2,9 +2,23 @@
   "channel": {
     "band_class": "bc0",
     "band_subclass": 0,
-    "cdma_channel": 384
+    "cdma_channel": 777
   },
   "pilot_offset": 0,
+  "evdo": {
+    "enabled": false,
+    "channel": 630,
+    "advertise_on_1x": true,
+    "gain": 1.0,
+    "mode": "composite",
+    "overhead": {
+      "sector_id": "00800580000000000000000000000000",
+      "subnet_mask": 26,
+      "color_code": 26,
+      "sector_signature": 1,
+      "access_signature": 1
+    }
+  },
   "overhead": {
     "sid": 22,
     "nid": 65535,
@@ -33,8 +47,6 @@
     "spreading_rate": "sr1",
     "orthogonal_code_length": 64,
     "chip_rate_hz": 1228800,
-    "tx_sample_rate_hz": 4915200,
-    "tx_bandwidth_hz": 3000000,
     "tx_lo_offset_hz": 200000,
     "tx_digital_backoff": 0.5,
     "block_size_chips": 512,

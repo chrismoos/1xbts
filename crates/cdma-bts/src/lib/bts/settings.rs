@@ -1,3 +1,11 @@
+//! BTS runtime and PHY channel settings.
+//!
+//! In-memory settings the TX synth and RX path operate on: per-channel PHY
+//! configuration (pilot/sync/paging/overhead, downlink/uplink), interleaver and
+//! spreading parameters, and `RxSettings`. Distinct from the operator-facing
+//! `BtsNodeConfig` in `super::config`, which is the `config/bts.json` node
+//! configuration loaded and resolved into these runtime settings.
+
 use std::{
     collections::HashMap, path::PathBuf, sync::Arc, sync::Mutex as StdMutex, sync::mpsc as std_mpsc,
 };
@@ -7,18 +15,23 @@ use cdma_common::error::Error;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 
-use super::handle::TrafficChannelPool;
+use super::handle::{HrpdTrafficRxQueue, TrafficChannelPool};
 use super::handle::{RxMetrics, TrafficRxPool, TrafficRxRemovals};
 use super::{BtsPowerControlRegistry, TxRxAnchor};
 
 use crate::{
     lac::paging_messages::{
-        AccessParametersMessage, CdmaChannelListMessage, ExtendedSystemParametersMessage,
-        GeneralPageMessage, NeighborListMessage, OrderMessage, PagingChannelMessage,
-        PagingMessageDefaults, PagingMessageKind, SystemParametersMessage,
+        AccessParametersMessage, AlternativeHrpdNeighborRecord,
+        AlternativeHrpdNeighborSubnetColorCode, AlternativeHrpdRadioInterface,
+        AlternativeTechnologiesInformationMessage, AlternativeTechnologyRadioInterfaceRecord,
+        CdmaChannelListMessage, ExtendedSystemParametersMessage, GeneralPageMessage,
+        NeighborListMessage, OrderMessage, PagingChannelMessage, PagingMessageDefaults,
+        PagingMessageKind, SystemParametersMessage,
     },
     phy::coding::block_interleaver::{InterleaverParams, SR1_PARAMS_128, SR1_PARAMS_384},
 };
+
+use super::evdo::Evdo1xAdvertisement;
 
 use cdma_common::consts::SR1_CHIP_RATE_HZ;
 const SR1_SHORT_CODE_LENGTH_CHIPS: usize = 32_768;
@@ -219,14 +232,16 @@ impl Default for OverheadSettings {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BtsRuntimeSettings {
     pub spreading_rate: SpreadingRate,
     pub orthogonal_code_length: usize,
     pub chip_rate_hz: usize,
+    #[serde(skip)]
     pub tx_sample_rate_hz: usize,
+    #[serde(skip)]
     pub tx_bandwidth_hz: usize,
-    /// Lab override; `None` → derive from `BtsNodeConfig.channel`.
+    /// TX-frequency override; `None` → derive from `BtsNodeConfig.channel`.
     #[serde(default)]
     pub tx_freq_hz_override: Option<usize>,
     /// Hardware TX LO offset in Hz. The SDR is tuned to
@@ -260,7 +275,7 @@ impl Default for BtsRuntimeSettings {
             orthogonal_code_length: SR1_WALSH_LENGTH,
             chip_rate_hz: SR1_CHIP_RATE_HZ as usize,
             tx_sample_rate_hz: SR1_CHIP_RATE_HZ as usize * 4,
-            tx_bandwidth_hz: 3_000_000,
+            tx_bandwidth_hz: 1_500_000,
             tx_freq_hz_override: None,
             tx_lo_offset_hz: 0,
             tx_digital_backoff: 0.15,
@@ -384,6 +399,7 @@ impl BtsRuntimeSettings {
 }
 
 pub use cdma_common::events::AccessChannelEvent;
+use cdma_common::hrpd::air::{HrpdAccessIndication, HrpdTrafficEvent};
 
 pub use cdma_common::metrics::{RxMeasurement, RxMeasurementKey};
 
@@ -393,6 +409,13 @@ pub type RxMeasurementStore = Arc<StdMutex<HashMap<RxMeasurementKey, RxMeasureme
 #[derive(Clone)]
 pub struct RxSettings {
     pub sample_rate_hz: usize,
+    pub rx_center_frequency_hz: Option<usize>,
+    /// Internal mode-derived gate for all 1x reverse-link processing.
+    pub one_x_enabled: bool,
+    pub one_x_reverse_frequency_hz: Option<usize>,
+    pub one_x_rx_shift_hz: i64,
+    pub hrpd_reverse_frequency_hz: Option<usize>,
+    pub hrpd_rx_shift_hz: Option<i64>,
     /// Serving AUTH_MODE for exact decode of reverse access-channel tails.
     pub auth_mode: u8,
     /// Serving P_REV_IN_USE for exact decode of reverse access-channel tails.
@@ -409,6 +432,24 @@ pub struct RxSettings {
     pub tick_rate: u64,
     /// Optional channel for surfacing decoded access events to the BSC.
     pub access_event_tx: Option<mpsc::UnboundedSender<AccessChannelEvent>>,
+    /// Optional channel for sending decoded HRPD access events to the AN.
+    pub hrpd_access_event_tx: Option<mpsc::UnboundedSender<HrpdAccessIndication>>,
+    /// Optional channel for sending decoded HRPD traffic events to the AN.
+    pub hrpd_traffic_event_tx: Option<mpsc::UnboundedSender<HrpdTrafficEvent>>,
+    /// HRPD Access Channel cycle used to derive the reverse access long-code mask.
+    pub hrpd_access_cycle_number: u8,
+    /// Least-significant 24 bits of the HRPD SectorID used in the reverse access long-code mask.
+    pub hrpd_access_sector_id_lsb: u32,
+    /// HRPD ColorCode used in QuickConfig and the reverse access long-code mask.
+    pub hrpd_access_color_code: u8,
+    /// AccessParameters `PreambleLength` (in frames) the reverse-access RX
+    /// finger despreads the capsule at. Sourced from the broadcast
+    /// AccessParameters, defaulting to the spec value.
+    pub hrpd_access_preamble_frames: usize,
+    /// Enables 19.2/38.4 kbps HRPD access capsule decode hypotheses. Mirrors
+    /// the broadcast AccessParameters: set when the sector advertises an
+    /// enhanced `SectorAccessMaxRate` above 9.6 kbps. Default false (Rev 0).
+    pub hrpd_access_enhanced_rates: bool,
     /// Optional datagram sender for reverse traffic frames carried on the Abis UDP bearer.
     pub reverse_bearer_tx: Option<std_mpsc::Sender<UdpBearerDatagram>>,
     /// Optional channel for publishing RX pipeline metrics to the BtsHandle.
@@ -419,6 +460,15 @@ pub struct RxSettings {
     /// Shared pool of active reverse traffic channel receivers.
     /// The BSC populates this dynamically; the RX loop feeds IQ to each receiver.
     pub traffic_rx_pool: Option<TrafficRxPool>,
+    /// Lock-free HRPD reverse traffic worker lifecycle command queue, drained
+    /// by the RX loop to spawn and stop per-UATI workers.
+    pub hrpd_traffic_rx_queue: Option<HrpdTrafficRxQueue>,
+    /// Shared HRPD H-ARQ event bus between the forward scheduler (on the
+    /// BTS synth thread) and the per-MAC reverse traffic RX workers.
+    /// Optional; when `None`, the RX workers fall back to gated-mask ACK
+    /// decoding and the scheduler runs the no-feedback `unknown_retx`
+    /// fallback exclusively.
+    pub hrpd_harq_bus: Option<std::sync::Arc<crate::bts::hrpd::HarqBus>>,
     /// Shared pool of active forward traffic channels, used by BTS-local
     /// reverse power control to schedule PCBs on the TX timeline.
     pub traffic_channels: Option<TrafficChannelPool>,
@@ -459,16 +509,45 @@ pub struct RxSettings {
 
 pub use cdma_common::overhead::OverheadParameters;
 
+fn build_evdo_atim(
+    pilot_offset: usize,
+    overhead: &OverheadParameters,
+    evdo: Evdo1xAdvertisement,
+) -> PagingChannelMessage {
+    PagingChannelMessage::AlternativeTechnologiesInformation(
+        AlternativeTechnologiesInformationMessage {
+            pilot_pn: pilot_offset as u16,
+            config_msg_seq: overhead.config_seq,
+            radio_interfaces: vec![AlternativeTechnologyRadioInterfaceRecord::hrpd(
+                &AlternativeHrpdRadioInterface {
+                    subnet_color_code: Some(evdo.hrpd_color_code),
+                    neighbors: vec![AlternativeHrpdNeighborRecord {
+                        nghbr_pn: evdo.hrpd_pn,
+                        freq_same_as_prev: false,
+                        nghbr_band: Some(evdo.hrpd_band_class),
+                        nghbr_freq: Some(evdo.hrpd_channel),
+                        pn_association_ind: true,
+                        data_association_ind: true,
+                        subnet_color_code: AlternativeHrpdNeighborSubnetColorCode::SameAsCommon,
+                    }],
+                },
+            )],
+        },
+    )
+}
+
 /// Build an overhead or GPM paging channel message from parameters.
 pub fn build_scheduled_message(
     kind: PagingMessageKind,
     pilot_offset: usize,
     overhead: &OverheadParameters,
     paging: &PagingChannelSettings,
+    evdo_advertisement: Option<Evdo1xAdvertisement>,
 ) -> PagingChannelMessage {
     match kind {
         PagingMessageKind::SystemParameters => {
             let defaults = &paging.message_defaults.system_parameters;
+            let advertises_atim = evdo_advertisement.is_some();
             PagingChannelMessage::SystemParameters(SystemParametersMessage {
                 pilot_pn: pilot_offset as u16,
                 config_msg_seq: overhead.config_seq,
@@ -520,7 +599,16 @@ pub fn build_scheduled_message(
                 t_tdrop_range: 0,
                 neg_slot_cycle_index_sup: false,
                 crrm_msg_ind: false,
-                num_opt_msg_bits: 0,
+                num_opt_msg_bits: if advertises_atim { 6 } else { 0 },
+                ap_pilot_info: false,
+                ap_idt: false,
+                ap_id_text: false,
+                gen_ovhd_inf_ind: false,
+                fd_chan_lst_ind: false,
+                atim_ind: advertises_atim,
+                appim_period_index: 0,
+                gen_ovhd_cycle_index: 0,
+                atim_cycle_index: 0,
                 add_loc_info_incl: false,
             })
         }
@@ -675,5 +763,106 @@ pub fn build_scheduled_message(
                 order_specific_fields: Vec::new(),
             })
         }
+        PagingMessageKind::AlternativeTechnologiesInformation => build_evdo_atim(
+            pilot_offset,
+            overhead,
+            evdo_advertisement
+                .expect("ATIM schedule entry requires a resolved EV-DO advertisement"),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn evdo_advertisement() -> Evdo1xAdvertisement {
+        Evdo1xAdvertisement {
+            hrpd_pn: 0,
+            hrpd_band_class: 0,
+            hrpd_channel: 425,
+            hrpd_color_code: 26,
+        }
+    }
+
+    #[test]
+    fn system_parameters_sets_atim_indicator_when_evdo_is_advertised() {
+        let mut overhead = OverheadParameters::default();
+        overhead.config_seq = 5;
+        let message = build_scheduled_message(
+            PagingMessageKind::SystemParameters,
+            0,
+            &overhead,
+            &PagingChannelSettings::default(),
+            Some(evdo_advertisement()),
+        );
+
+        let PagingChannelMessage::SystemParameters(spm) = message else {
+            panic!("expected SPM");
+        };
+        assert_eq!(spm.config_msg_seq, 5);
+        assert_eq!(spm.num_opt_msg_bits, 6);
+        assert!(!spm.ap_pilot_info);
+        assert!(!spm.ap_idt);
+        assert!(!spm.ap_id_text);
+        assert!(!spm.gen_ovhd_inf_ind);
+        assert!(!spm.fd_chan_lst_ind);
+        assert!(spm.atim_ind);
+        assert_eq!(spm.atim_cycle_index, 0);
+    }
+
+    #[test]
+    fn evdo_atim_advertises_hrpd_frequency_pn_and_color_code() {
+        let mut overhead = OverheadParameters::default();
+        overhead.config_seq = 5;
+        let message = build_scheduled_message(
+            PagingMessageKind::AlternativeTechnologiesInformation,
+            0,
+            &overhead,
+            &PagingChannelSettings::default(),
+            Some(evdo_advertisement()),
+        );
+
+        let PagingChannelMessage::AlternativeTechnologiesInformation(atim) = message else {
+            panic!("expected ATIM");
+        };
+        assert_eq!(atim.pilot_pn, 0);
+        assert_eq!(atim.config_msg_seq, 5);
+        assert_eq!(atim.radio_interfaces.len(), 1);
+        let sdu = atim.to_sdu();
+        assert_eq!(sdu.len(), 97);
+        assert_eq!(
+            sdu.to_packed_bytes(),
+            vec![
+                0x00, 0x0a, 0x24, 0x04, 0x0c, 0x68, 0x02, 0x30, 0x00, 0x06, 0xa7, 0x40, 0x00,
+            ]
+        );
+        match &atim.radio_interfaces[0] {
+            AlternativeTechnologyRadioInterfaceRecord::Hrpd { fields } => {
+                assert_eq!(
+                    fields,
+                    &vec![0x18, 0xD0, 0x04, 0x60, 0x00, 0x0D, 0x4E, 0x80]
+                );
+            }
+            _ => panic!("expected HRPD radio-interface record"),
+        }
+
+        let hrpd = atim.radio_interfaces[0]
+            .hrpd_fields()
+            .expect("ATIM HRPD radio-interface should decode")
+            .expect("ATIM should contain HRPD fields");
+        assert_eq!(hrpd.subnet_color_code, Some(26));
+        assert_eq!(hrpd.neighbors.len(), 1);
+        let neighbor = &hrpd.neighbors[0];
+        assert_eq!(neighbor.nghbr_pn, 0);
+        assert!(!neighbor.freq_same_as_prev);
+        assert_eq!(neighbor.nghbr_band, Some(0));
+        assert_eq!(neighbor.nghbr_freq, Some(425));
+        assert!(neighbor.pn_association_ind);
+        assert!(neighbor.data_association_ind);
+        assert_eq!(
+            neighbor.subnet_color_code,
+            AlternativeHrpdNeighborSubnetColorCode::SameAsCommon
+        );
     }
 }

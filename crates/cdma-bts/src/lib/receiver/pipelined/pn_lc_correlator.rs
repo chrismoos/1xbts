@@ -45,7 +45,8 @@ use rustfft::{Fft, FftPlanner};
 
 use crate::phy::coding::long_code::LongCodeGenerator;
 use crate::receiver::pipelined::{
-    PipelineProcessorShared, SampleBlock, build_fft_search_pn_samples, build_oqpsk_pn_samples,
+    PipelineProcessorShared, SampleBlock, build_fft_search_pn_samples_with_kind,
+    build_oqpsk_pn_samples_with_kind,
 };
 
 use super::generic_rake_receiver::Correlator;
@@ -92,6 +93,9 @@ pub struct PnLcCorrelator {
     /// incrementally across searches.
     search_lc_gen: LongCodeGenerator,
     search_lc_next_chip: usize,
+    /// Optional explicit Q long-code generator template for HPSK channels
+    /// whose Q mask is not simply recovered from the previous I-code chip.
+    q_lc_template: Option<LongCodeGenerator>,
 
     fft_fwd: Arc<dyn Fft<f32>>,
     fft_inv: Arc<dyn Fft<f32>>,
@@ -142,9 +146,6 @@ pub struct PnLcCorrelator {
     /// been hard-validated so there is no need to keep searching).
     search_paused: bool,
 
-    timing_score_diag: bool,
-    diag_top_bins: bool,
-
     reacquire_signal_lost_chips: u64,
     reacquire_crc_miss_count: u64,
     reacquire_idle_chips: u64,
@@ -166,18 +167,18 @@ impl PnLcCorrelator {
         let os = cfg.oversample;
         let phase_period = 32768 * os;
         let pn_fft_seq: Arc<Vec<Complex32>> = Arc::new(
-            build_fft_search_pn_samples(phase_period, os)
+            build_fft_search_pn_samples_with_kind(phase_period, os, cfg.short_code_reference)
                 .into_iter()
                 .map(|s| Complex32::new(s.re, -s.im))
                 .collect(),
         );
         let pn_despread_seq: Arc<Vec<Complex32>> = Arc::new(if cfg.split_pn_reference {
-            build_oqpsk_pn_samples(phase_period, os)
+            build_oqpsk_pn_samples_with_kind(phase_period, os, cfg.short_code_reference)
                 .into_iter()
                 .map(|s| Complex32::new(s.re, -s.im))
                 .collect()
         } else {
-            build_fft_search_pn_samples(phase_period, os)
+            build_fft_search_pn_samples_with_kind(phase_period, os, cfg.short_code_reference)
                 .into_iter()
                 .map(|s| Complex32::new(s.re, -s.im))
                 .collect()
@@ -233,9 +234,6 @@ impl PnLcCorrelator {
             vec![vec![Complex32::new(0.0, 0.0); window_len]; search_cfo_hypotheses.len()];
         let search_lc_signs_capacity = cfg.coherent_chips + 2 * cfg.lc_half_span as usize + 2;
 
-        let diag_top_bins = std::env::var_os("CDMA_PNLC_DIAG_TOP_BINS").is_some();
-        let timing_score_diag = std::env::var_os("CDMA_PNLC_TIMING_SCORE_DIAG").is_some();
-
         Self {
             cfg,
             pn_fft_seq,
@@ -244,6 +242,7 @@ impl PnLcCorrelator {
             search_lc_gen: lc_template.clone(),
             search_lc_next_chip: 0,
             lc_template,
+            q_lc_template: None,
             fft_fwd,
             fft_inv,
             fft_scratch: vec![Complex32::new(0.0, 0.0); scratch_len],
@@ -271,12 +270,18 @@ impl PnLcCorrelator {
             next_finger_id: 1,
             sample_rate_hz: 0.0,
             search_paused: false,
-            timing_score_diag,
-            diag_top_bins,
             reacquire_signal_lost_chips: DEFAULT_REACQUIRE_SIGNAL_LOST_CHIPS,
             reacquire_crc_miss_count: DEFAULT_REACQUIRE_CRC_MISS_COUNT,
             reacquire_idle_chips: DEFAULT_REACQUIRE_IDLE_CHIPS,
         }
+    }
+
+    /// Set an explicit Q long-code template for HPSK composite spreading.
+    /// Leave unset for legacy 1x RC3 behavior where the Q branch is modeled
+    /// from the I-code delay already used by existing traffic tests.
+    pub fn with_q_lc_template(mut self, q_lc_template: LongCodeGenerator) -> Self {
+        self.q_lc_template = Some(q_lc_template);
+        self
     }
 
     // ------------------------------------------------------------------
@@ -295,6 +300,85 @@ impl PnLcCorrelator {
     fn abs_chip_at(&self, sample_offset: usize) -> usize {
         let abs = self.absolute_origin_sample.unwrap_or(0);
         (abs + sample_offset).saturating_sub(self.cfg.composite_filter_delay) / self.cfg.oversample
+    }
+
+    fn seed_lc_from_template(
+        &self,
+        template: &LongCodeGenerator,
+        abs_chip: usize,
+    ) -> LongCodeGenerator {
+        let mut lc = template.clone();
+        let advance = if let Some(period) = self.cfg.lc_period_chips {
+            lc.set_state(self.cfg.lc_period_initial_state);
+            abs_chip % period
+        } else {
+            abs_chip
+        };
+        lc.advance_chips(advance);
+        lc
+    }
+
+    fn seed_i_lc(&self, abs_chip: usize) -> LongCodeGenerator {
+        self.seed_lc_from_template(&self.lc_template, abs_chip)
+    }
+
+    fn seed_q_lc(&self, abs_chip: usize) -> LongCodeGenerator {
+        let template = self.q_lc_template.as_ref().unwrap_or(&self.lc_template);
+        self.seed_lc_from_template(template, abs_chip)
+    }
+
+    fn lc_signs_from_template(
+        &self,
+        template: &LongCodeGenerator,
+        abs_chip_start: usize,
+        count: usize,
+    ) -> Vec<f32> {
+        let Some(period) = self.cfg.lc_period_chips else {
+            let mut lc = self.seed_lc_from_template(template, abs_chip_start);
+            return (0..count)
+                .map(|_| if lc.next_chip() == 1 { -1.0 } else { 1.0 })
+                .collect();
+        };
+
+        let mut out = Vec::with_capacity(count);
+        let mut produced = 0usize;
+        while produced < count {
+            let abs_chip = abs_chip_start + produced;
+            let phase = abs_chip % period;
+            let run = (period - phase).min(count - produced);
+            let mut lc = template.clone();
+            lc.set_state(self.cfg.lc_period_initial_state);
+            lc.advance_chips(phase);
+            for _ in 0..run {
+                out.push(if lc.next_chip() == 1 { -1.0 } else { 1.0 });
+            }
+            produced += run;
+        }
+        out
+    }
+
+    fn i_lc_signs_from(&self, abs_chip_start: usize, count: usize) -> Vec<f32> {
+        self.lc_signs_from_template(&self.lc_template, abs_chip_start, count)
+    }
+
+    fn q_lc_signs_from(&self, abs_chip_start: usize, count: usize) -> Vec<f32> {
+        if let Some(template) = self.q_lc_template.as_ref() {
+            return self.lc_signs_from_template(template, abs_chip_start, count);
+        }
+
+        // Legacy 1x RC3 HPSK has no independent Q-mask in this correlator.
+        // Match the mainline behavior: the Q branch uses the previous I long
+        // code chip, with an all-zero/+1 boundary before chip 0.
+        if count == 0 {
+            return Vec::new();
+        }
+        if abs_chip_start == 0 {
+            let mut signs = Vec::with_capacity(count);
+            signs.push(1.0);
+            signs.extend(self.lc_signs_from_template(&self.lc_template, 0, count - 1));
+            return signs;
+        }
+        self.lc_signs_from_template(&self.lc_template, abs_chip_start - 1, count)
     }
 
     /// Reset correlator state that cannot safely span a hardware-sample
@@ -477,7 +561,7 @@ impl PnLcCorrelator {
         let hpsk = lc_dec >= 2;
         let lc_start = (expected_abs_chip as i64 - half as i64).max(0) as usize;
         let lc_total = (2 * half as usize) + n + 1;
-        let mut lc = self.lc_template.clone();
+        let mut lc = self.seed_i_lc(lc_start);
 
         if hpsk {
             // HPSK (RC3+): generate complex LC conjugate values per 2.1.3.1.17.
@@ -492,7 +576,6 @@ impl PnLcCorrelator {
             // where Q-LC = I-LC delayed 1 chip, decimated by 2).
             //
             // To despread, we apply the conjugate: conj(h_I + j·h_Q).
-            lc.advance_chips(lc_start * 2);
             let lc_complex: Vec<Complex32> = (0..lc_total)
                 .enumerate()
                 .map(|(n, _)| {
@@ -512,7 +595,6 @@ impl PnLcCorrelator {
         }
 
         // IS-95/RC1/RC2: real-valued LC signs at full chip rate.
-        lc.advance_chips(lc_start);
         let lc_signs: Vec<f32> = (0..lc_total)
             .map(|_| if lc.next_chip() == 1 { -1.0 } else { 1.0 })
             .collect();
@@ -743,17 +825,12 @@ impl PnLcCorrelator {
             .map(|k| -self.pn_fft_seq[(base_phase + k * os) % pp].im)
             .collect();
 
-        // Pre-generate LC at chip rate with 1 leading chip for Q delay.
+        // Pre-generate LC at chip rate over the whole hypothesis span.
         let n_lc = (2 * half + 1) as usize;
-        let lc_total = n_lc + n_chips - 1;
         let lc_global_start = (expected_abs_chip as i64 - half as i64).max(0) as usize;
-        let lc_gen_start = lc_global_start.saturating_sub(1);
-        let lc_offset = lc_global_start - lc_gen_start;
-        let mut lc_gen = self.lc_template.clone();
-        lc_gen.advance_chips(lc_gen_start);
-        let lc_chips: Vec<f32> = (0..(lc_total + 2))
-            .map(|_| if lc_gen.next_chip() == 1 { -1.0 } else { 1.0 })
-            .collect();
+        let lc_total = n_lc + n_chips + 1;
+        let lc_i_chips = self.i_lc_signs_from(lc_global_start, lc_total);
+        let lc_q_chips = self.q_lc_signs_from(lc_global_start, lc_total);
 
         let lc_base_offset = (expected_abs_chip as i64 - half as i64) - lc_global_start as i64;
 
@@ -784,8 +861,7 @@ impl PnLcCorrelator {
 
                 // Build composite reference for this chip.
                 let pn_i = pn_i_chips[k];
-                let lc_i_idx = lc_offset + slice_start + k;
-                let lc_i = lc_chips[lc_i_idx];
+                let lc_i = lc_i_chips[slice_start + k];
                 let s_i = pn_i * lc_i;
 
                 // W12 and decimation based on absolute chip index.
@@ -800,17 +876,19 @@ impl PnLcCorrelator {
                         as usize;
                     -self.pn_fft_seq[phase].im
                 };
-                let lc_q_dec_idx = lc_offset as isize + slice_start as isize + even_k;
-                let lc_q_dec = if lc_q_dec_idx > 0 {
-                    lc_chips[lc_q_dec_idx as usize - 1]
-                } else {
-                    1.0
-                };
+                let lc_q_dec_idx = slice_start as isize + even_k;
+                let lc_q_dec = lc_q_chips[lc_q_dec_idx.max(0) as usize];
                 let dec_q = pn_q_dec * lc_q_dec;
                 let s_q = w12 * s_i * dec_q;
 
-                // Despread: signal × conj(composite) = signal × (s_I + j·s_Q)
-                let ref_conj = Complex32::new(s_i, s_q);
+                // Despread: signal × conj(composite). Existing 1x HPSK paths
+                // use the conjugated `I-jQ` sample convention; HRPD reverse
+                // access captures use ordinary `I+jQ` IQ samples.
+                let ref_conj = if self.cfg.hpsk_signal_conjugated {
+                    Complex32::new(s_i, s_q)
+                } else {
+                    Complex32::new(s_i, -s_q)
+                };
                 let d = sig * ref_conj;
 
                 abs_sum += d.re.abs() + d.im.abs();
@@ -996,7 +1074,6 @@ impl PnLcCorrelator {
         let mut detections = Vec::new();
         let mut keep = Vec::new();
         let pending = std::mem::take(&mut self.pending_candidates);
-        let timing_score_diag = self.timing_score_diag;
 
         for mut cand in pending {
             let aligned_delay = cand.delay_samples;
@@ -1122,21 +1199,6 @@ impl PnLcCorrelator {
                                 est_cfo = refine_cfo;
                             }
                         }
-                    }
-                    if timing_score_diag {
-                        info!(
-                            "PnLcTimingScore: cand={} delay={} ref={:?} timing_mu={:+.3} lc_phase={} valid={} ratio={:.3} coh={:.4} nc_coh={:.4} cfo={:.6}",
-                            cand.id,
-                            aligned_delay,
-                            pn_reference_kind,
-                            timing_mu,
-                            best_phase,
-                            valid,
-                            ratio,
-                            coh_norm,
-                            nc_coh_norm,
-                            est_cfo,
-                        );
                     }
                     match best_result {
                         Some((_, _, _, _, _, _, best_valid, _)) if best_valid && !valid => {}
@@ -1291,11 +1353,8 @@ impl PnLcCorrelator {
                         id
                     };
 
-                    let mut lc_gen = self.lc_template.clone();
-                    // For HPSK (lc_dec≥2): LC runs at chip rate — advance by tx_chip.
-                    // The old code advanced by tx_chip*lc_dec (2× rate), which was wrong.
-                    // For IS-95 (lc_dec=1): unchanged (1 LC bit per chip).
-                    lc_gen.advance_chips(tx_chip);
+                    let lc_gen = self.seed_i_lc(tx_chip);
+                    let q_lc_gen = self.q_lc_template.as_ref().map(|_| self.seed_q_lc(tx_chip));
 
                     let finger_pn_reference = match finger_pn_kind {
                         PnReferenceKind::Plain => Arc::clone(&self.pn_fft_seq),
@@ -1342,6 +1401,7 @@ impl PnLcCorrelator {
                         despread_phase,
                         center_offset,
                         lc_gen,
+                        q_lc_gen,
                         tx_chip,
                         tx_chip,
                         self.cfg.chip_block_size,
@@ -1356,6 +1416,9 @@ impl PnLcCorrelator {
                         timing_mu_samples,
                         self.cfg.output_oversampled_chips,
                         self.cfg.integrate_and_dump,
+                        self.cfg.lc_period_chips,
+                        self.cfg.lc_period_initial_state,
+                        self.cfg.hpsk_signal_conjugated,
                         self.cfg.gardner_timing,
                     );
                     // Seed HPSK state: need LC(tx_chip - 1) for the Q delay.
@@ -1363,11 +1426,12 @@ impl PnLcCorrelator {
                     // the start of every chip iter (including the first),
                     // which reads these fields to compute chip tx_chip's
                     // composite LC value.
-                    if lc_dec >= 2 && tx_chip > 0 {
-                        let mut prev_gen = self.lc_template.clone();
-                        prev_gen.advance_chips(tx_chip - 1);
+                    if lc_dec >= 2 && tx_chip > 0 && self.q_lc_template.is_none() {
+                        let mut prev_gen = self.seed_i_lc(tx_chip - 1);
                         finger.hpsk_prev_lc = if prev_gen.next_chip() == 1 { -1.0 } else { 1.0 };
                         // Seed W12 parity from the absolute chip index.
+                        finger.hpsk_chip_count = tx_chip;
+                    } else if lc_dec >= 2 {
                         finger.hpsk_chip_count = tx_chip;
                     }
                     if finger_start_sample < block_sample_offset {
@@ -1519,15 +1583,6 @@ impl PnLcCorrelator {
         let lc_dec = self.cfg.lc_decimation.max(1);
         let hpsk = lc_dec >= 2;
 
-        // Diagnostic: track top-10 bins across all (delay, lc_phase) for burst analysis.
-        let diag_enabled = self.diag_top_bins;
-        // (power, signed_delay, lc_phase)
-        let mut diag_top: Vec<(f32, i32, i32)> = if diag_enabled {
-            Vec::with_capacity(16)
-        } else {
-            Vec::new()
-        };
-
         // Pre-compute PN conjugate values at chip centers (reused across all LC hypotheses).
         let pn_chips: Vec<Complex32> = (0..n_chips)
             .map(|k| self.pn_fft_seq[(base_phase + k * os) % pp])
@@ -1538,13 +1593,17 @@ impl PnLcCorrelator {
         let lc_total_chips = n_lc + n_chips - 1;
         let lc_global_start = (expected_chip as i64 - half as i64).max(0) as usize;
 
-        // --- HPSK: chip-rate LC + separate PN_I/PN_Q arrays ---
-        let hpsk_lc_gen_start = if hpsk {
-            lc_global_start.saturating_sub(1)
+        // --- HPSK: chip-rate I/Q long codes + separate PN_I/PN_Q arrays ---
+        let hpsk_lc_i: Vec<f32> = if hpsk {
+            self.i_lc_signs_from(lc_global_start, lc_total_chips + 2)
         } else {
-            lc_global_start
+            vec![]
         };
-        let hpsk_lc_offset = lc_global_start - hpsk_lc_gen_start;
+        let hpsk_lc_q: Vec<f32> = if hpsk {
+            self.q_lc_signs_from(lc_global_start, lc_total_chips + 2)
+        } else {
+            vec![]
+        };
 
         let hpsk_pn_i: Vec<f32> = if hpsk {
             (0..n_chips)
@@ -1561,17 +1620,9 @@ impl PnLcCorrelator {
             vec![]
         };
 
-        let lc_sign_start = if hpsk {
-            hpsk_lc_gen_start
-        } else {
-            lc_global_start
-        };
-        let lc_sign_count = if hpsk {
-            lc_total_chips + 2
-        } else {
-            lc_total_chips
-        };
-        self.fill_search_lc_signs(lc_sign_start, lc_sign_count);
+        if !hpsk {
+            self.fill_search_lc_signs(lc_global_start, lc_total_chips);
+        }
 
         let lc_signs_base_offset = (expected_chip as i64 - half as i64) - lc_global_start as i64;
 
@@ -1588,7 +1639,7 @@ impl PnLcCorrelator {
                 //
                 // Signal model (complex baseband, I − jQ convention):
                 //   s_I(n) = PN_I(n) × LC(n)
-                //   s_Q(n) = W12(n) × s_I(n) × Decim₂[PN_Q × LC(n−1)]
+                //   s_Q(n) = W12(n) × s_I(n) × Decim₂[PN_Q × UQ(n)]
                 //
                 // W12 and decimation pair boundaries are based on absolute chip
                 // indices (aligned to the PN/frame epoch), NOT window-relative k.
@@ -1600,8 +1651,7 @@ impl PnLcCorrelator {
                     let pn_i = hpsk_pn_i[k];
 
                     // I branch: LC at chip rate
-                    let lc_i_idx = hpsk_lc_offset + slice_start + k;
-                    let lc_i = self.search_lc_signs[lc_i_idx];
+                    let lc_i = hpsk_lc_i[slice_start + k];
                     let s_i = pn_i * lc_i;
 
                     // Absolute chip index determines W12 parity and pair boundaries.
@@ -1612,7 +1662,6 @@ impl PnLcCorrelator {
 
                     // Q branch: decimated PN_Q × LC_Q from even chip of pair.
                     // Pairs are (0,1),(2,3),... in absolute chip indices.
-                    // LC_Q(n) = LC(n−1) (I long code delayed 1 chip).
                     let abs_even = abs_chip & !1; // pair start (round down to even)
                     let even_k = abs_even as isize - abs_chip_base as isize; // index in window
                     let pn_q_dec = if even_k >= 0 && (even_k as usize) < n_chips {
@@ -1624,18 +1673,20 @@ impl PnLcCorrelator {
                             .rem_euclid(pp as isize) as usize;
                         -self.pn_fft_seq[phase].im
                     };
-                    let lc_q_dec_idx = hpsk_lc_offset as isize + slice_start as isize + even_k;
-                    let lc_q_dec = if lc_q_dec_idx > 0 {
-                        self.search_lc_signs[lc_q_dec_idx as usize - 1]
-                    } else {
-                        1.0
-                    };
+                    let lc_q_dec_idx = slice_start as isize + even_k;
+                    let lc_q_dec = hpsk_lc_q[lc_q_dec_idx.max(0) as usize];
                     let dec_q = pn_q_dec * lc_q_dec;
 
                     let s_q = w12 * s_i * dec_q;
 
-                    // Matched-filter reference: s_I − j·s_Q
-                    self.search_ref_buf[k * os] = Complex32::new(s_i, -s_q);
+                    self.search_ref_buf[k * os] = if self.cfg.hpsk_signal_conjugated {
+                        // Matched-filter reference for legacy conjugated
+                        // sample convention: s_I − j·s_Q.
+                        Complex32::new(s_i, -s_q)
+                    } else {
+                        // HRPD reverse captures are ordinary IQ: s_I + j·s_Q.
+                        Complex32::new(s_i, s_q)
+                    };
                 }
             } else {
                 // IS-95: real LC sign × PN (original path, unchanged)
@@ -1700,14 +1751,6 @@ impl PnLcCorrelator {
                         lc0_peak_power = power;
                         lc0_peak_delay = signed_d;
                     }
-                    if diag_enabled {
-                        let min_pwr = diag_top.last().map(|t| t.0).unwrap_or(0.0);
-                        if diag_top.len() < 10 || power > min_pwr {
-                            diag_top.push((power, signed_d, lc_phase));
-                            diag_top.sort_by(|a, b| b.0.total_cmp(&a.0));
-                            diag_top.truncate(10);
-                        }
-                    }
                 }
             } else {
                 // --- Fully coherent path with CFO hypothesis grid ---
@@ -1751,14 +1794,6 @@ impl PnLcCorrelator {
                         if lc_phase == 0 && power > lc0_peak_power {
                             lc0_peak_power = power;
                             lc0_peak_delay = signed_d;
-                        }
-                        if diag_enabled {
-                            let min_pwr = diag_top.last().map(|t| t.0).unwrap_or(0.0);
-                            if diag_top.len() < 10 || power > min_pwr {
-                                diag_top.push((power, signed_d, lc_phase));
-                                diag_top.sort_by(|a, b| b.0.total_cmp(&a.0));
-                                diag_top.truncate(10);
-                            }
                         }
                     }
                 }
@@ -1810,27 +1845,6 @@ impl PnLcCorrelator {
             lc0_peak_delay,
             lc0_snr,
         );
-
-        if diag_enabled && !diag_top.is_empty() {
-            let top_str: Vec<String> = diag_top
-                .iter()
-                .map(|(pwr, d, lc)| {
-                    format!(
-                        "(d={} lc={} pwr={:.3e} snr={:.1}x)",
-                        d,
-                        lc,
-                        pwr,
-                        pwr / noise_power
-                    )
-                })
-                .collect();
-            trace!(
-                "PnLcCorrelator: DIAG window={} top-{}: [{}]",
-                self.window_counter,
-                diag_top.len(),
-                top_str.join(", "),
-            );
-        }
 
         // Gate: SNR (matched-filter coherence) + LC phase uniqueness.
         //
@@ -1988,8 +2002,7 @@ impl Correlator for PnLcCorrelator {
             // When suppress_search_when_locked is enabled (traffic channels),
             // skip the expensive FFT search once a hard-validated finger exists.
             // The search resumes automatically if the finger is pruned.
-            let search_suppressed = self.cfg.suppress_search_when_locked
-                && self.active_fingers.iter().any(|f| f.hard_validated);
+            let search_suppressed = self.search_suppressed();
             if self.window_counter % self.cfg.search_interval_windows == 0
                 && self.window_counter > 0
                 && !search_suppressed
@@ -2020,7 +2033,10 @@ impl Correlator for PnLcCorrelator {
     }
 
     fn search_suppressed(&self) -> bool {
-        self.cfg.suppress_search_when_locked && self.active_fingers.iter().any(|f| f.hard_validated)
+        self.cfg.suppress_search_when_locked
+            && self.active_fingers.iter().any(|finger| {
+                finger.hard_validated && finger.signal_lost_chips < self.reacquire_signal_lost_chips
+            })
     }
 
     fn notify_finger_state(
@@ -2127,6 +2143,42 @@ mod tests {
     /// Helper: create a no-op chain builder (empty sub-chain).
     fn noop_chain_builder() -> Box<dyn Fn() -> Vec<PipelineProcessorShared> + Send> {
         Box::new(|| Vec::new())
+    }
+
+    fn lc_signs_from(mut lc: LongCodeGenerator, abs_chip_start: usize, count: usize) -> Vec<f32> {
+        lc.advance_chips(abs_chip_start);
+        (0..count)
+            .map(|_| if lc.next_chip() == 1 { -1.0 } else { 1.0 })
+            .collect()
+    }
+
+    #[test]
+    fn q_lc_signs_default_to_legacy_delayed_i_long_code() {
+        let i_lc = LongCodeGenerator::new_traffic_channel(0x1234_5678);
+        let correlator =
+            PnLcCorrelator::new(PnLcConfig::default_4x(), i_lc.clone(), noop_chain_builder());
+
+        let mut expected_at_zero = vec![1.0];
+        expected_at_zero.extend(lc_signs_from(i_lc.clone(), 0, 5));
+        assert_eq!(correlator.q_lc_signs_from(0, 6), expected_at_zero);
+
+        assert_eq!(
+            correlator.q_lc_signs_from(128, 8),
+            lc_signs_from(i_lc, 127, 8)
+        );
+    }
+
+    #[test]
+    fn q_lc_signs_use_explicit_q_template_without_delay() {
+        let i_lc = LongCodeGenerator::new_traffic_channel(0x1234_5678);
+        let q_lc = LongCodeGenerator::new_traffic_channel(0x8765_4321);
+        let correlator = PnLcCorrelator::new(PnLcConfig::default_4x(), i_lc, noop_chain_builder())
+            .with_q_lc_template(q_lc.clone());
+
+        assert_eq!(
+            correlator.q_lc_signs_from(128, 8),
+            lc_signs_from(q_lc, 128, 8)
+        );
     }
 
     // =====================================================================
@@ -2773,6 +2825,29 @@ mod tests {
         });
 
         assert!(!correlator.has_overlapping_active_finger(654));
+    }
+
+    #[test]
+    fn validated_finger_signal_loss_resumes_suppressed_search() {
+        let cfg = PnLcConfig::default_4x().with_suppress_search_when_locked(true);
+        let lc = LongCodeGenerator::new_access_channel_with_state(0, 0, 0, 0, 1u64 << 41);
+        let mut correlator = PnLcCorrelator::new(cfg, lc, noop_chain_builder());
+        correlator.active_fingers.push(ActiveFingerState {
+            id: 1,
+            delay_samples: 654,
+            hard_validated: true,
+            idle_chips: 0,
+            signal_lost_chips: 0,
+            crc_miss_count: 0,
+            post_walsh_no_event_ms: 0,
+        });
+
+        assert!(correlator.search_suppressed());
+
+        correlator.active_fingers[0].signal_lost_chips = correlator.reacquire_signal_lost_chips;
+
+        assert!(!correlator.search_suppressed());
+        assert!(correlator.can_reacquire_over_active(654));
     }
 
     #[test]

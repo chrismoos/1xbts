@@ -1,5 +1,5 @@
 use cdma_common::bits::Bitstream;
-use log::{debug, info};
+use log::{debug, info, trace};
 use num_complex::Complex32;
 
 use crate::receiver::access::{AccessFrame, AccessFrameReader};
@@ -216,7 +216,7 @@ impl PipelineProcessor for AccessChannelProcessor {
                 self.preamble_frames = self.preamble_frames.saturating_add(1);
                 self.reader.reset();
                 let hex = bits_to_hex(&frame_bits);
-                debug!(
+                trace!(
                     "access_preamble_frame: chip={} preamble_frames={} hex={}",
                     frame_chip, self.preamble_frames, hex,
                 );

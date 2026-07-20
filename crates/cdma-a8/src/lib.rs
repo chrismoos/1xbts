@@ -13,7 +13,10 @@
 
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+
+use serde::{Deserialize, Serialize};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 /// Errors returned by the A8 GRE codec and bearer helpers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +45,12 @@ pub enum Error {
     TransitionInProgress { session_id: u32 },
     /// The received packet source/destination tuple did not match the installed session binding.
     EndpointMismatch { session_id: u32 },
+    /// The configured outer transport cannot carry packets for this operation.
+    InvalidTransportConfig(String),
+    /// UDP transport failed while sending or receiving an exact GRE packet.
+    UdpTransport(String),
+    /// Raw IP protocol 47 (native GRE) transport failed while sending or receiving a packet.
+    RawTransport(String),
 }
 
 /// Result type used by the `cdma-a8` crate.
@@ -54,6 +63,432 @@ impl Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// Outer delivery mode for exact keyed-GRE A8/A10 bearer packets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BearerTransportMode {
+    /// Send exact GRE packets over IP protocol 47.
+    #[default]
+    RawGre,
+    /// Send the same exact GRE packet bytes as the payload of a UDP datagram.
+    UdpEncapsulatedGre,
+}
+
+/// Configures how A8/A10 bearer packets are delivered outside the GRE codec.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BearerTransportConfig {
+    /// Outer delivery mode. The GRE packet format is identical in every mode.
+    pub mode: BearerTransportMode,
+    /// Local UDP socket for `udp_encapsulated_gre`.
+    pub udp_bind_addr: Option<SocketAddr>,
+    /// Peer UDP socket for `udp_encapsulated_gre`.
+    pub udp_peer_addr: Option<SocketAddr>,
+}
+
+impl BearerTransportConfig {
+    /// Production transport: exact GRE packets over IP protocol 47.
+    pub const fn raw_gre() -> Self {
+        Self {
+            mode: BearerTransportMode::RawGre,
+            udp_bind_addr: None,
+            udp_peer_addr: None,
+        }
+    }
+
+    /// UDP-encapsulated transport: exact GRE packets carried as UDP payloads.
+    pub const fn udp_encapsulated_gre(bind: SocketAddr, peer: SocketAddr) -> Self {
+        Self {
+            mode: BearerTransportMode::UdpEncapsulatedGre,
+            udp_bind_addr: Some(bind),
+            udp_peer_addr: Some(peer),
+        }
+    }
+
+    /// Validates the outer transport without inspecting any session keys.
+    pub fn validate(&self, label: &str) -> std::result::Result<(), String> {
+        match self.mode {
+            BearerTransportMode::RawGre => {
+                if self.udp_bind_addr.is_some() || self.udp_peer_addr.is_some() {
+                    return Err(format!(
+                        "{label}: raw_gre must not set udp_bind_addr or udp_peer_addr"
+                    ));
+                }
+                Ok(())
+            }
+            BearerTransportMode::UdpEncapsulatedGre => {
+                if self.udp_bind_addr.is_none() {
+                    return Err(format!(
+                        "{label}: udp_encapsulated_gre requires udp_bind_addr"
+                    ));
+                }
+                if self.udp_peer_addr.is_none() {
+                    return Err(format!(
+                        "{label}: udp_encapsulated_gre requires udp_peer_addr"
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// UDP endpoint carrying exact GRE packet bytes.
+pub struct UdpGreEndpoint {
+    socket: UdpSocket,
+    peer_addr: SocketAddr,
+}
+
+/// Tokio UDP endpoint carrying exact GRE packet bytes.
+pub struct TokioUdpGreEndpoint {
+    socket: tokio::net::UdpSocket,
+    peer_addr: SocketAddr,
+}
+
+impl UdpGreEndpoint {
+    /// Builds an endpoint from an already-bound UDP socket.
+    pub fn from_socket(socket: UdpSocket, peer_addr: SocketAddr) -> Self {
+        Self { socket, peer_addr }
+    }
+
+    /// Binds a UDP endpoint from a `udp_encapsulated_gre` transport config.
+    pub fn bind(config: BearerTransportConfig, label: &str) -> Result<Self> {
+        config
+            .validate(label)
+            .map_err(Error::InvalidTransportConfig)?;
+        if config.mode != BearerTransportMode::UdpEncapsulatedGre {
+            return Err(Error::InvalidTransportConfig(format!(
+                "{label}: UdpGreEndpoint requires udp_encapsulated_gre"
+            )));
+        }
+        let bind_addr = config
+            .udp_bind_addr
+            .ok_or_else(|| Error::InvalidTransportConfig(format!("{label}: missing bind addr")))?;
+        let peer_addr = config
+            .udp_peer_addr
+            .ok_or_else(|| Error::InvalidTransportConfig(format!("{label}: missing peer addr")))?;
+        let socket = UdpSocket::bind(bind_addr)
+            .map_err(|e| Error::UdpTransport(format!("{label}: bind {bind_addr}: {e}")))?;
+        Ok(Self { socket, peer_addr })
+    }
+
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    pub fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        self.socket.set_read_timeout(timeout)
+    }
+
+    pub fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        self.socket.set_nonblocking(nonblocking)
+    }
+
+    /// Converts this endpoint to a readiness-driven Tokio UDP endpoint.
+    pub fn into_tokio(self) -> std::io::Result<TokioUdpGreEndpoint> {
+        self.socket.set_nonblocking(true)?;
+        Ok(TokioUdpGreEndpoint {
+            socket: tokio::net::UdpSocket::from_std(self.socket)?,
+            peer_addr: self.peer_addr,
+        })
+    }
+
+    /// Sends one already-encoded GRE packet as a UDP payload.
+    pub fn send_wire_packet(&self, wire_bytes: &[u8]) -> Result<usize> {
+        self.socket
+            .send_to(wire_bytes, self.peer_addr)
+            .map_err(|e| Error::UdpTransport(format!("send exact GRE UDP payload: {e}")))
+    }
+
+    /// Encodes and sends one GRE packet as a UDP payload.
+    pub fn send_gre_packet(&self, packet: &GrePacket) -> Result<usize> {
+        let wire_bytes = packet.encode()?;
+        self.send_wire_packet(&wire_bytes)
+    }
+
+    /// Receives one UDP payload and parses it as an exact GRE packet.
+    pub fn recv_gre_packet(&self, buf: &mut [u8]) -> Result<(GrePacket, SocketAddr)> {
+        let (len, from) = self
+            .socket
+            .recv_from(buf)
+            .map_err(|e| Error::UdpTransport(format!("receive exact GRE UDP payload: {e}")))?;
+        let packet = GrePacket::decode(&buf[..len])?;
+        Ok((packet, from))
+    }
+}
+
+impl TokioUdpGreEndpoint {
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    /// Waits until the socket may have at least one inbound datagram.
+    pub async fn readable(&self) -> std::io::Result<()> {
+        self.socket.readable().await
+    }
+
+    /// Sends one already-encoded GRE packet as a UDP payload.
+    pub async fn send_wire_packet(&self, wire_bytes: &[u8]) -> Result<usize> {
+        self.socket
+            .send_to(wire_bytes, self.peer_addr)
+            .await
+            .map_err(|e| Error::UdpTransport(format!("send exact GRE UDP payload: {e}")))
+    }
+
+    /// Encodes and sends one GRE packet as a UDP payload.
+    pub async fn send_gre_packet(&self, packet: &GrePacket) -> Result<usize> {
+        let wire_bytes = packet.encode()?;
+        self.send_wire_packet(&wire_bytes).await
+    }
+
+    /// Tries to receive one UDP payload without blocking.
+    pub fn try_recv_gre_packet(&self, buf: &mut [u8]) -> Result<(GrePacket, SocketAddr)> {
+        let (len, from) = self
+            .socket
+            .try_recv_from(buf)
+            .map_err(|e| Error::UdpTransport(format!("receive exact GRE UDP payload: {e}")))?;
+        let packet = GrePacket::decode(&buf[..len])?;
+        Ok((packet, from))
+    }
+
+    /// Receives one UDP payload and parses it as an exact GRE packet.
+    pub async fn recv_gre_packet(&self, buf: &mut [u8]) -> Result<(GrePacket, SocketAddr)> {
+        let (len, from) = self
+            .socket
+            .recv_from(buf)
+            .await
+            .map_err(|e| Error::UdpTransport(format!("receive exact GRE UDP payload: {e}")))?;
+        let packet = GrePacket::decode(&buf[..len])?;
+        Ok((packet, from))
+    }
+}
+
+/// IANA IP protocol number for GRE.
+const IP_PROTOCOL_GRE: i32 = 47;
+
+/// Native GRE endpoint over a raw IP protocol 47 socket.
+///
+/// Unlike [`UdpGreEndpoint`], the GRE packet rides directly as the payload of an IP
+/// packet with protocol 47 — no UDP wrapper. The kernel prepends the outer IP header
+/// on send, so binding to the local address sets the source and lets the receive path
+/// filter inbound frames by source address. This needs `CAP_NET_RAW` (Linux) or root.
+#[derive(Debug)]
+pub struct RawGreEndpoint {
+    socket: Socket,
+    remote_ip: IpAddr,
+}
+
+impl RawGreEndpoint {
+    /// Binds a native GRE endpoint from a `raw_gre` transport config and bearer endpoint.
+    ///
+    /// The config carries no addresses for raw GRE, so the local and remote IPs come from
+    /// `endpoint`. Returns a capability-naming error when the process lacks `CAP_NET_RAW`.
+    pub fn bind(
+        config: &BearerTransportConfig,
+        endpoint: BearerEndpoint,
+        label: &str,
+    ) -> Result<Self> {
+        config
+            .validate(label)
+            .map_err(Error::InvalidTransportConfig)?;
+        if config.mode != BearerTransportMode::RawGre {
+            return Err(Error::InvalidTransportConfig(format!(
+                "{label}: RawGreEndpoint requires raw_gre"
+            )));
+        }
+        let domain = match endpoint.local_ip {
+            IpAddr::V4(_) => Domain::IPV4,
+            IpAddr::V6(_) => Domain::IPV6,
+        };
+        let socket = Socket::new(domain, Type::RAW, Some(Protocol::from(IP_PROTOCOL_GRE)))
+            .map_err(|e| Self::map_socket_error(label, "create raw GRE socket", &e))?;
+        let bind_addr = SocketAddr::new(endpoint.local_ip, 0);
+        socket
+            .bind(&bind_addr.into())
+            .map_err(|e| Self::map_socket_error(label, "bind raw GRE socket", &e))?;
+        Ok(Self {
+            socket,
+            remote_ip: endpoint.remote_ip,
+        })
+    }
+
+    /// Names the missing capability when a raw-socket operation fails on permissions.
+    fn map_socket_error(label: &str, op: &str, err: &std::io::Error) -> Error {
+        if matches!(
+            err.raw_os_error(),
+            Some(code) if code == libc_eperm() || code == libc_eacces()
+        ) {
+            return Error::RawTransport(format!(
+                "{label}: {op}: permission denied (raw IP protocol 47 needs CAP_NET_RAW or root): {err}"
+            ));
+        }
+        Error::RawTransport(format!("{label}: {op}: {err}"))
+    }
+
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        let remote_ip = self.remote_ip;
+        self.socket.local_addr().map(|addr| {
+            addr.as_socket()
+                .unwrap_or_else(|| SocketAddr::new(remote_ip, 0))
+        })
+    }
+
+    pub fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        self.socket.set_read_timeout(timeout)
+    }
+
+    pub fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        self.socket.set_nonblocking(nonblocking)
+    }
+
+    /// Sends one already-encoded GRE packet over the raw IP protocol 47 socket.
+    ///
+    /// The kernel prepends the outer IP header (proto 47, dst = remote_ip). The port in
+    /// the destination address is ignored for a raw socket.
+    pub fn send_wire_packet(&self, wire_bytes: &[u8]) -> Result<usize> {
+        let dest = SockAddr::from(SocketAddr::new(self.remote_ip, 0));
+        self.socket
+            .send_to(wire_bytes, &dest)
+            .map_err(|e| Error::RawTransport(format!("send native GRE packet: {e}")))
+    }
+
+    /// Encodes and sends one GRE packet over the raw IP protocol 47 socket.
+    pub fn send_gre_packet(&self, packet: &GrePacket) -> Result<usize> {
+        let wire_bytes = packet.encode()?;
+        self.send_wire_packet(&wire_bytes)
+    }
+
+    /// Receives one native GRE packet, strips the outer IP header, and parses the GRE bytes.
+    ///
+    /// Frames whose source address differs from the bound peer are dropped (reported as
+    /// `EndpointMismatch`) so a single raw socket only delivers the configured bearer's traffic.
+    pub fn recv_gre_packet(&self, buf: &mut [u8]) -> Result<(GrePacket, IpAddr)> {
+        // socket2 receives into `MaybeUninit<u8>`. A `&mut [u8]` is already initialized
+        // and shares `u8`'s layout, so reborrowing it as uninit memory is sound, and we
+        // only read back the bytes the kernel reports as written.
+        let uninit = unsafe {
+            std::slice::from_raw_parts_mut(
+                buf.as_mut_ptr() as *mut std::mem::MaybeUninit<u8>,
+                buf.len(),
+            )
+        };
+        let (len, from) = self
+            .socket
+            .recv_from(uninit)
+            .map_err(|e| Error::RawTransport(format!("receive native GRE packet: {e}")))?;
+        let source_ip = from
+            .as_socket()
+            .map(|addr| addr.ip())
+            .unwrap_or(self.remote_ip);
+        if source_ip != self.remote_ip {
+            return Err(Error::EndpointMismatch { session_id: 0 });
+        }
+        let gre_bytes = strip_inbound_ip_header(self.remote_ip, &buf[..len])?;
+        let packet = GrePacket::decode(gre_bytes)?;
+        Ok((packet, source_ip))
+    }
+}
+
+/// Strips the outer IP header from a raw-socket receive buffer, returning the GRE bytes.
+///
+/// On an IPv4 raw socket Linux delivers the full inbound IP packet, so the leading IPv4
+/// header (length = IHL * 4) precedes the GRE bytes. On an IPv6 raw socket there is no
+/// leading header to strip — the kernel delivers the payload directly.
+fn strip_inbound_ip_header(family_ip: IpAddr, frame: &[u8]) -> Result<&[u8]> {
+    match family_ip {
+        IpAddr::V6(_) => Ok(frame),
+        IpAddr::V4(_) => {
+            const IPV4_IHL_MASK: u8 = 0x0f;
+            const IPV4_IHL_WORD_BYTES: usize = 4;
+            if frame.is_empty() {
+                return Err(Error::Truncated {
+                    needed: 1,
+                    actual: 0,
+                });
+            }
+            let header_len = ((frame[0] & IPV4_IHL_MASK) as usize) * IPV4_IHL_WORD_BYTES;
+            if frame.len() < header_len {
+                return Err(Error::Truncated {
+                    needed: header_len,
+                    actual: frame.len(),
+                });
+            }
+            Ok(&frame[header_len..])
+        }
+    }
+}
+
+/// `EPERM` raw OS error code (no `CAP_NET_RAW`).
+const fn libc_eperm() -> i32 {
+    1
+}
+
+/// `EACCES` raw OS error code (no `CAP_NET_RAW`).
+const fn libc_eacces() -> i32 {
+    13
+}
+
+/// Outer transport endpoint for A8/A10 bearer GRE packets, selected by config mode.
+pub enum GreBearerEndpoint {
+    /// UDP-encapsulated GRE (FOU-style, no root required).
+    Udp(UdpGreEndpoint),
+    /// Native GRE over raw IP protocol 47 (requires `CAP_NET_RAW`).
+    Raw(RawGreEndpoint),
+}
+
+impl GreBearerEndpoint {
+    /// Binds the bearer transport selected by `config.mode`.
+    ///
+    /// `endpoint` supplies the local/remote IPs the raw socket needs; the UDP path uses the
+    /// `udp_bind_addr`/`udp_peer_addr` from the config and ignores `endpoint`.
+    pub fn bind(
+        config: &BearerTransportConfig,
+        endpoint: BearerEndpoint,
+        label: &str,
+    ) -> Result<Self> {
+        match config.mode {
+            BearerTransportMode::UdpEncapsulatedGre => {
+                UdpGreEndpoint::bind(*config, label).map(GreBearerEndpoint::Udp)
+            }
+            BearerTransportMode::RawGre => {
+                RawGreEndpoint::bind(config, endpoint, label).map(GreBearerEndpoint::Raw)
+            }
+        }
+    }
+
+    pub fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        match self {
+            GreBearerEndpoint::Udp(udp) => udp.set_read_timeout(timeout),
+            GreBearerEndpoint::Raw(raw) => raw.set_read_timeout(timeout),
+        }
+    }
+
+    pub fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        match self {
+            GreBearerEndpoint::Udp(udp) => udp.set_nonblocking(nonblocking),
+            GreBearerEndpoint::Raw(raw) => raw.set_nonblocking(nonblocking),
+        }
+    }
+
+    /// Sends one already-encoded GRE packet over the selected transport.
+    pub fn send_wire_packet(&self, wire_bytes: &[u8]) -> Result<usize> {
+        match self {
+            GreBearerEndpoint::Udp(udp) => udp.send_wire_packet(wire_bytes),
+            GreBearerEndpoint::Raw(raw) => raw.send_wire_packet(wire_bytes),
+        }
+    }
+
+    /// Receives one GRE packet over the selected transport, normalized to the source `IpAddr`.
+    pub fn recv_gre_packet(&self, buf: &mut [u8]) -> Result<(GrePacket, IpAddr)> {
+        match self {
+            GreBearerEndpoint::Udp(udp) => udp
+                .recv_gre_packet(buf)
+                .map(|(packet, from)| (packet, from.ip())),
+            GreBearerEndpoint::Raw(raw) => raw.recv_gre_packet(buf),
+        }
+    }
+}
 
 /// Supported GRE protocol types for A8/A10 bearer traffic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +590,20 @@ impl Default for BearerProfile {
     fn default() -> Self {
         Self::standard_packet_data()
     }
+}
+
+/// Configuration for the AN-side A9 client that establishes an A8 bearer with
+/// the PCF. Produced by the PCF service setup and consumed by the AN A9 client.
+#[derive(Clone, Copy, Debug)]
+pub struct HrpdA9ClientConfig {
+    /// PCF A9 signaling address the client sends SetupA8/ReleaseA8 to.
+    pub pcf_addr: SocketAddr,
+    /// PCF-side A8 bearer IPv4, used to build the A8 traffic id.
+    pub a8_peer_ipv4: [u8; 4],
+    /// AN-side A8 bearer transport binding.
+    pub an_a8_bearer: BearerTransportConfig,
+    /// AN-side A8 bearer endpoint.
+    pub an_a8_endpoint: BearerEndpoint,
 }
 
 /// GRE/IP endpoint binding for an A8 bearer session.
@@ -781,7 +1230,7 @@ impl BearerTable {
     pub fn remove_session_if_present(&mut self, session_id: u32) -> Option<BearerSession> {
         let removed = self.sessions.remove(&session_id).map(|entry| {
             self.inbound_key_index
-                .remove(&entry.session.inbound_session_key);
+                .retain(|_, indexed_session_id| *indexed_session_id != session_id);
             entry.session
         });
         if removed.is_some() {
@@ -789,6 +1238,33 @@ impl BearerTable {
             self.stats.active_sessions = self.sessions.len() as u64;
         }
         removed
+    }
+
+    /// Accepts an additional inbound GRE key for an already-installed session.
+    ///
+    /// A dormant HRPD packet session can be rebound to a fresh air-interface
+    /// UATI while the upstream peer continues to send A8/A10 downlink with the
+    /// previous GRE key until its control-plane update catches up. Keep that
+    /// old key as an inbound alias so the downlink is delivered to the current
+    /// session instead of being dropped during the reopen window.
+    pub fn add_inbound_key_alias(
+        &mut self,
+        session_id: u32,
+        inbound_session_key: u32,
+    ) -> Result<()> {
+        if !self.sessions.contains_key(&session_id) {
+            return Err(Error::UnknownSession(session_id));
+        }
+        if let Some(existing_session_id) = self.inbound_key_index.get(&inbound_session_key).copied()
+        {
+            if existing_session_id == session_id {
+                return Ok(());
+            }
+            return Err(Error::DuplicateInboundSessionKey(inbound_session_key));
+        }
+        self.inbound_key_index
+            .insert(inbound_session_key, session_id);
+        Ok(())
     }
 
     /// Returns the registered session, if present.
@@ -990,5 +1466,103 @@ impl BearerTable {
             return Err(Error::DuplicateInboundSessionKey(inbound_session_key));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    fn loopback_endpoint() -> BearerEndpoint {
+        BearerEndpoint::new([127, 0, 0, 1], [127, 0, 0, 1])
+    }
+
+    #[test]
+    fn dispatch_selects_udp_for_udp_encapsulated_mode() {
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let peer: SocketAddr = "127.0.0.1:55555".parse().unwrap();
+        let config = BearerTransportConfig::udp_encapsulated_gre(bind, peer);
+        let endpoint = GreBearerEndpoint::bind(&config, loopback_endpoint(), "test.udp")
+            .expect("udp bind should succeed without elevated capability");
+        assert!(matches!(endpoint, GreBearerEndpoint::Udp(_)));
+    }
+
+    #[test]
+    fn dispatch_selects_raw_for_raw_gre_mode() {
+        let config = BearerTransportConfig::raw_gre();
+        // A raw IPPROTO_GRE socket needs CAP_NET_RAW. On a host without it the bind must
+        // fail with a capability-naming error rather than silently selecting another mode.
+        match GreBearerEndpoint::bind(&config, loopback_endpoint(), "test.raw") {
+            Ok(GreBearerEndpoint::Raw(_)) => {}
+            Ok(GreBearerEndpoint::Udp(_)) => {
+                panic!("raw_gre must not select the UDP transport")
+            }
+            Err(Error::RawTransport(msg)) => {
+                assert!(
+                    msg.contains("CAP_NET_RAW"),
+                    "raw bind failure must name the missing capability, got: {msg}"
+                );
+            }
+            Err(other) => panic!("unexpected raw bind error: {other}"),
+        }
+    }
+
+    #[test]
+    fn raw_gre_rejects_udp_addresses() {
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let peer: SocketAddr = "127.0.0.1:55555".parse().unwrap();
+        let mut config = BearerTransportConfig::udp_encapsulated_gre(bind, peer);
+        config.mode = BearerTransportMode::RawGre;
+        let err = RawGreEndpoint::bind(&config, loopback_endpoint(), "test.raw")
+            .expect_err("raw_gre must reject udp_bind_addr/udp_peer_addr");
+        assert!(matches!(err, Error::InvalidTransportConfig(_)));
+    }
+
+    #[test]
+    fn ipv4_header_strip_recovers_gre_bytes() {
+        let gre = GrePacket::octet_stream(0xDEAD_BEEF, Some(7), vec![1, 2, 3, 4]);
+        let gre_bytes = gre.encode().unwrap();
+
+        // Minimal IPv4 header: version 4, IHL 5 (20 bytes). Only the first byte's IHL
+        // nibble drives the strip length, so the remaining header bytes are arbitrary.
+        let mut frame = vec![0u8; 20];
+        frame[0] = 0x45;
+        frame.extend_from_slice(&gre_bytes);
+
+        let recovered = strip_inbound_ip_header(IpAddr::V4(Ipv4Addr::LOCALHOST), &frame).unwrap();
+        assert_eq!(recovered, gre_bytes.as_slice());
+        let decoded = GrePacket::decode(recovered).unwrap();
+        assert_eq!(decoded, gre);
+    }
+
+    #[test]
+    fn ipv4_header_strip_with_options_uses_ihl() {
+        let gre_bytes = GrePacket::octet_stream(1, None, vec![9, 9])
+            .encode()
+            .unwrap();
+        // IHL 6 -> 24-byte header (one 4-byte options word).
+        let mut frame = vec![0u8; 24];
+        frame[0] = 0x46;
+        frame.extend_from_slice(&gre_bytes);
+
+        let recovered = strip_inbound_ip_header(IpAddr::V4(Ipv4Addr::LOCALHOST), &frame).unwrap();
+        assert_eq!(recovered, gre_bytes.as_slice());
+    }
+
+    #[test]
+    fn ipv4_header_strip_rejects_truncated_frame() {
+        // Claims a 20-byte header but only 3 bytes are present.
+        let frame = [0x45u8, 0x00, 0x00];
+        let err = strip_inbound_ip_header(IpAddr::V4(Ipv4Addr::LOCALHOST), &frame)
+            .expect_err("truncated");
+        assert!(matches!(err, Error::Truncated { .. }));
+    }
+
+    #[test]
+    fn ipv6_header_strip_is_identity() {
+        let gre_bytes = GrePacket::octet_stream(2, None, vec![5]).encode().unwrap();
+        let recovered =
+            strip_inbound_ip_header(IpAddr::V6(Ipv6Addr::LOCALHOST), &gre_bytes).unwrap();
+        assert_eq!(recovered, gre_bytes.as_slice());
     }
 }

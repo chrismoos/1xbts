@@ -108,6 +108,7 @@ export default function MobilesPage() {
               <tbody>
                 {mobiles.map((ms, i) => {
                   const id = encodeURIComponent(ms.address);
+                  const isHrpd = ms.state.startsWith("HRPD");
                   return (
                     <tr key={i} className="border-t border-border hover:bg-hover">
                       <td className="py-2 text-secondary font-mono text-xs">
@@ -166,7 +167,7 @@ export default function MobilesPage() {
                       <td className="py-2 font-mono text-xs text-secondary">
                         {ms.trafficWalshCode != null ? (
                           <span>
-                            W{ms.trafficWalshCode}
+                            {isHrpd ? `A10 ${ms.trafficWalshCode}` : `W${ms.trafficWalshCode}`}
                             {ms.trafficServiceOption != null && (
                               <span className="text-muted ml-1">
                                 SO{ms.trafficServiceOption}

@@ -170,6 +170,9 @@ impl ServiceOptionValue {
 pub struct CauseValue(pub u8);
 
 impl CauseValue {
+    /// ConnectA8 success cause: the A8 connection is established (IOS A9).
+    pub const A8_CONNECTION_COMPLETE: Self = Self(0x13);
+
     /// Encodes the cause payload.
     pub const fn encode(self) -> [u8; 1] {
         [self.0]
@@ -2377,9 +2380,27 @@ fn unexpected<T>(message_type: MessageType, element_id: ElementId) -> Result<T> 
     })
 }
 
+const CAUSE_A8_CONNECTION_COMPLETE: u8 = CauseValue::A8_CONNECTION_COMPLETE.0;
+const CAUSE_A8_SESSION_ALREADY_ACTIVE: u8 = 0x20;
+const CAUSE_A8_PDSN_RELOCATION: u8 = 0x32;
+const CAUSE_A8_REGISTRATION_ACCEPTED: u8 = 0x79;
+const CAUSE_A8_REGISTRATION_ACCEPTED_NO_COMMIT: u8 = 0x7a;
+const CAUSE_RELEASE_NORMAL: u8 = 0x10;
+const CAUSE_RELEASE_PCF_NORMAL: u8 = 0x14;
+const CAUSE_RELEASE_SESSION_ALREADY_CLOSED: u8 = 0x20;
+const CAUSE_RELEASE_PPP_SESSION_CLOSED_BY_MS: u8 = 0x77;
+const CAUSE_BS_SERVICE_ACCEPTED: u8 = 0x08;
+const CAUSE_BS_SERVICE_REJECTED: u8 = 0x11;
+const CAUSE_VERSION_ACCEPTED: u8 = 0x07;
+const CAUSE_VERSION_ALREADY_CURRENT: u8 = 0x20;
+
 fn ensure_connect_cause(cause: CauseValue) -> Result<()> {
     match cause.0 {
-        0x13 | 0x20 | 0x32 | 0x79 | 0x7a => Ok(()),
+        CAUSE_A8_CONNECTION_COMPLETE
+        | CAUSE_A8_SESSION_ALREADY_ACTIVE
+        | CAUSE_A8_PDSN_RELOCATION
+        | CAUSE_A8_REGISTRATION_ACCEPTED
+        | CAUSE_A8_REGISTRATION_ACCEPTED_NO_COMMIT => Ok(()),
         _ => Err(Error::InvalidValue {
             context: "ConnectA8.cause",
             value: cause.0 as u32,
@@ -2389,7 +2410,10 @@ fn ensure_connect_cause(cause: CauseValue) -> Result<()> {
 
 fn ensure_release_cause(cause: CauseValue, context: &'static str) -> Result<()> {
     match cause.0 {
-        0x10 | 0x14 | 0x20 => Ok(()),
+        CAUSE_RELEASE_NORMAL
+        | CAUSE_RELEASE_PCF_NORMAL
+        | CAUSE_RELEASE_SESSION_ALREADY_CLOSED
+        | CAUSE_RELEASE_PPP_SESSION_CLOSED_BY_MS => Ok(()),
         _ => Err(Error::InvalidValue {
             context,
             value: cause.0 as u32,
@@ -2399,7 +2423,7 @@ fn ensure_release_cause(cause: CauseValue, context: &'static str) -> Result<()> 
 
 fn ensure_bs_service_response_cause(cause: CauseValue) -> Result<()> {
     match cause.0 {
-        0x08 | 0x11 => Ok(()),
+        CAUSE_BS_SERVICE_ACCEPTED | CAUSE_BS_SERVICE_REJECTED => Ok(()),
         _ => Err(Error::InvalidValue {
             context: "BsServiceResponse.cause",
             value: cause.0 as u32,
@@ -2409,7 +2433,7 @@ fn ensure_bs_service_response_cause(cause: CauseValue) -> Result<()> {
 
 fn ensure_version_info_cause(cause: CauseValue) -> Result<()> {
     match cause.0 {
-        0x07 | 0x20 => Ok(()),
+        CAUSE_VERSION_ACCEPTED | CAUSE_VERSION_ALREADY_CURRENT => Ok(()),
         _ => Err(Error::InvalidValue {
             context: "VersionInfo.cause",
             value: cause.0 as u32,
@@ -2516,4 +2540,44 @@ fn decode_imsi(first: u8, rest: &[u8]) -> Result<MobileIdentity> {
         digits.push(char::from(b'0' + high));
     }
     Ok(MobileIdentity::Imsi(digits))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a8_release_messages_accept_ppp_session_closed_by_ms_cause() {
+        let disconnect = DisconnectA8Message {
+            call_connection_reference: None,
+            correlation_id: Some(CorrelationId([1, 2, 3, 4])),
+            imsi: Some("310009176936269".to_string()),
+            esn: None,
+            meid: None,
+            con_ref: ConRef(5),
+            a8_traffic_id: A8TrafficId::gre_ppp(0x1a05_8001, [127, 0, 0, 1]),
+            cause: CauseValue(CAUSE_RELEASE_PPP_SESSION_CLOSED_BY_MS),
+        };
+        let decoded = DisconnectA8Message::decode(&disconnect.encode().unwrap()).unwrap();
+        assert_eq!(
+            decoded.cause,
+            CauseValue(CAUSE_RELEASE_PPP_SESSION_CLOSED_BY_MS)
+        );
+
+        let release = ReleaseA8Message {
+            call_connection_reference: None,
+            correlation_id: Some(CorrelationId([1, 2, 3, 4])),
+            imsi: Some("310009176936269".to_string()),
+            esn: None,
+            meid: None,
+            con_ref: ConRef(5),
+            a8_traffic_id: A8TrafficId::gre_ppp(0x1a05_8001, [127, 0, 0, 1]),
+            cause: CauseValue(CAUSE_RELEASE_PPP_SESSION_CLOSED_BY_MS),
+        };
+        let decoded = ReleaseA8Message::decode(&release.encode().unwrap()).unwrap();
+        assert_eq!(
+            decoded.cause,
+            CauseValue(CAUSE_RELEASE_PPP_SESSION_CLOSED_BY_MS)
+        );
+    }
 }

@@ -713,7 +713,7 @@ pub struct NoFieldAccessMessage {
 /// Reverse Order Message (r-csch). C.S0005-E 2.7.1.3.2.2.
 /// On the access channel the message carries ORDER (6 bits) +
 /// ADD_RECORD_LEN (3 bits) + order-specific fields (8 × ADD_RECORD_LEN).
-/// Note: ORDQ is only present in r-dsch messages, not r-csch.
+/// ORDQ, when required by the order, is the first order-specific octet.
 #[derive(Debug, Clone)]
 pub struct OrderMessage {
     pub header: AccessMessageHeader,
@@ -878,11 +878,12 @@ impl OrderMessage {
             if self.order_specific.len() > consumed {
                 let packed = self.order_specific[consumed];
                 tag = Some(packed >> 4);
-                if packed & 0x0f != 0 {
-                    rejected_pdu_type = Some((packed >> 2) & 0x03);
-                }
+                rejected_pdu_type = Some((packed >> 2) & 0x03);
                 consumed += 1;
             }
+        } else if self.header.pd != 0 && self.order_specific.len() > consumed {
+            rejected_pdu_type = Some(self.order_specific[consumed] >> 6);
+            consumed += 1;
         }
 
         Some(MobileStationRejectOrderDetail {
@@ -1001,18 +1002,24 @@ impl OrderMessage {
                 .ok_or("Mobile Station Reject missing TAG")?;
             tag = Some(packed >> 4);
             let pdu_and_reserved = packed & 0x0f;
-            if pdu_and_reserved != 0 {
-                if pdu_and_reserved & 0x03 != 0 {
-                    return Err("Mobile Station Reject RESERVED_2 bits must be zero".to_string());
-                }
-                let pdu_type = (pdu_and_reserved >> 2) & 0x03;
-                if pdu_type > 0b01 {
-                    return Err(format!(
-                        "Mobile Station Reject REJECTED_PDU_TYPE {pdu_type:#04b} is reserved"
-                    ));
-                }
-                rejected_pdu_type = Some(pdu_type);
+            if pdu_and_reserved & 0x03 != 0 {
+                return Err("Mobile Station Reject RESERVED_2 bits must be zero".to_string());
             }
+            let pdu_type = (pdu_and_reserved >> 2) & 0x03;
+            validate_rejected_pdu_type(pdu_type)?;
+            rejected_pdu_type = Some(pdu_type);
+            consumed += 1;
+        } else if self.header.pd != 0 {
+            let packed = *self
+                .order_specific
+                .get(consumed)
+                .ok_or("Mobile Station Reject missing REJECTED_PDU_TYPE")?;
+            if packed & 0x3f != 0 {
+                return Err("Mobile Station Reject RESERVED_2 bits must be zero".to_string());
+            }
+            let pdu_type = packed >> 6;
+            validate_rejected_pdu_type(pdu_type)?;
+            rejected_pdu_type = Some(pdu_type);
             consumed += 1;
         }
 
@@ -1420,6 +1427,16 @@ fn is_mobile_station_reject_ordq(ordq: u8) -> bool {
         ordq,
         0x01..=0x0d | 0x0e | 0x10..=0x13 | 0x14..=0x16 | 0x18..=0x20
     )
+}
+
+fn validate_rejected_pdu_type(pdu_type: u8) -> Result<(), String> {
+    if pdu_type <= 0b01 {
+        Ok(())
+    } else {
+        Err(format!(
+            "Mobile Station Reject REJECTED_PDU_TYPE {pdu_type:#04b} is reserved"
+        ))
+    }
 }
 
 fn reverse_order_name(order: u8) -> &'static str {
@@ -6321,7 +6338,20 @@ fn decode_order(header: AccessMessageHeader, bs: &mut Bitstream) -> Result<Acces
     let add_record_len = read(bs, 3, "ADD_RECORD_LEN")? as u8;
     let mut order_specific = Vec::with_capacity(add_record_len as usize);
     for idx in 0..add_record_len {
-        order_specific.push(read(bs, 8, &format!("ORDFIELD[{idx}]"))? as u8);
+        if bs.len() >= 8 {
+            order_specific.push(read(bs, 8, &format!("ORDFIELD[{idx}]"))? as u8);
+        } else if let Some(last_octet) = recover_mobile_station_reject_reserved_tail(
+            &header,
+            order,
+            add_record_len,
+            idx,
+            &order_specific,
+            bs,
+        ) {
+            order_specific.push(last_octet);
+        } else {
+            return Err(format!("EOF reading ORDFIELD[{idx}] (8 bits)"));
+        }
     }
     Ok(AccessMessage::Order(OrderMessage {
         header,
@@ -6330,6 +6360,51 @@ fn decode_order(header: AccessMessageHeader, bs: &mut Bitstream) -> Result<Acces
         order_specific,
         remaining_bits: bs.len(),
     }))
+}
+
+/// Some P_REV 6 handsets omit part of the final zero RESERVED_2 field from a
+/// basic Mobile Station Reject Order. Recover only when all meaningful bits,
+/// including REJECTED_PDU_TYPE, are present and every transmitted reserved bit
+/// is zero. C.S0005-E 2.7.3.4 defines this record as three octets.
+fn recover_mobile_station_reject_reserved_tail(
+    header: &AccessMessageHeader,
+    order: u8,
+    add_record_len: u8,
+    field_index: u8,
+    order_specific: &[u8],
+    bs: &mut Bitstream,
+) -> Option<u8> {
+    if header.pd == 0
+        || order != 0b011111
+        || add_record_len != 3
+        || field_index != 2
+        || order_specific.len() != 2
+        || bs.len() < 2
+        || bs.len() >= 8
+    {
+        return None;
+    }
+
+    let ordq = order_specific[0];
+    let rejected_type = order_specific[1];
+    let rejected_order_type = MessageId::Order.wire_type(WireChannel::ForwardCommon)?;
+    let rejected_record_type =
+        MessageId::FeatureNotification.wire_type(WireChannel::ForwardCommon)?;
+    if rejected_type == rejected_order_type
+        || rejected_type == rejected_record_type
+        || matches!(ordq, 0x10..=0x13)
+    {
+        return None;
+    }
+
+    let available = bs.len();
+    let mut tail = bs.clone();
+    let pdu_type = tail.read_bits(2).ok()? as u8;
+    if pdu_type > 0b01 || tail.bits().iter().any(|bit| *bit != 0) {
+        return None;
+    }
+    let value = bs.read_bits(available).ok()? as u8;
+    Some(value << (8 - available))
 }
 
 fn decode_data_burst(
@@ -11508,6 +11583,57 @@ mod tests {
             "ORDQ=0x04 (message field not in valid range), REJECTED_TYPE=0x15 (Extended Channel Assignment Message), trailing=[00]",
             msg.order_detail(WireChannel::ForwardCommon)
         );
+    }
+
+    #[test]
+    fn test_access_message_decoder_recovers_short_p_rev6_reject_reserved_tail() {
+        let header = AccessMessageHeader {
+            pd: 1,
+            message_id: MessageId::Order,
+        };
+        let rejected_type = MessageId::AlternativeTechnologiesInformation
+            .wire_type(WireChannel::ForwardCommon)
+            .expect("ATIM f-csch wire type");
+        let mut bits = Bitstream::new();
+        bits.write_u8(0b011111, 6);
+        bits.write_u8(3, 3);
+        bits.write_u8(0x05, 8);
+        bits.write_u8(rejected_type, 8);
+        bits.write_u8(0, 6); // REJECTED_PDU_TYPE=00 plus four of six RESERVED_2 bits.
+
+        let msg =
+            AccessMessage::decode_sdu(header, &bits).expect("recover omitted zero RESERVED_2 tail");
+        let AccessMessage::Order(msg) = msg else {
+            panic!("expected order message");
+        };
+
+        assert_eq!(msg.order_specific, vec![0x05, rejected_type, 0x00]);
+        assert_eq!(msg.remaining_bits, 0);
+        let detail = msg
+            .parse_mobile_station_reject_order_strict(WireChannel::ForwardCommon)
+            .expect("parse recovered reject detail");
+        assert_eq!(detail.ordq, 0x05);
+        assert_eq!(detail.rejected_type, rejected_type);
+        assert_eq!(detail.rejected_pdu_type, Some(0));
+        assert!(detail.trailing_bytes.is_empty());
+    }
+
+    #[test]
+    fn test_access_message_decoder_does_not_recover_invalid_reject_pdu_type() {
+        let header = AccessMessageHeader {
+            pd: 1,
+            message_id: MessageId::Order,
+        };
+        let mut bits = Bitstream::new();
+        bits.write_u8(0b011111, 6);
+        bits.write_u8(3, 3);
+        bits.write_u8(0x05, 8);
+        bits.write_u8(0x2f, 8);
+        bits.write_u8(0b10_0000, 6);
+
+        let err = AccessMessage::decode_sdu(header, &bits).unwrap_err();
+
+        assert_eq!(err, "EOF reading ORDFIELD[2] (8 bits)");
     }
 
     #[test]

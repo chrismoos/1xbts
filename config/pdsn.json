@@ -1,5 +1,18 @@
 {
   "packet_grpc_listen_addr": "127.0.0.1:17021",
+  "a10_bearer": {
+    "mode": "udp_encapsulated_gre",
+    "udp_bind_addr": "127.0.0.1:17043",
+    "udp_peer_addr": "127.0.0.1:17042"
+  },
+  "a11": {
+    "bind_addr": "127.0.0.1:17045",
+    "peer_addr": "127.0.0.1:17044"
+  },
+  "a11_security": {
+    "spi": 256,
+    "shared_secret_hex": "31786274732d6131312d7368617265642d736563726574"
+  },
   "ppp_session_timeout_secs": 1800,
   "packet": {
     "transport": "fou_tcp",

@@ -51,7 +51,7 @@ use std::{
     time::Instant,
 };
 
-use log::{debug, info};
+use log::{debug, info, trace};
 
 use crate::receiver::pipelined::{
     PipelineProcessor, PipelineProcessorShared, SampleBlock, VecEmitter, flush_sub_chain,
@@ -95,6 +95,15 @@ pub trait RakeFinger: Send {
 
     /// `true` once hard validation (e.g. CRC-clean frame) has been observed.
     fn is_hard_validated(&self) -> bool;
+
+    /// `true` once the finger has soft-validated (e.g. acquired a coherent
+    /// pilot) even if it has not yet hard-validated. Prune policies use this to
+    /// give a connection-scoped finger a longer idle grace once it is tracking,
+    /// so a rough patch does not force a full re-acquisition. Defaults to hard
+    /// validation for fingers without a distinct soft stage.
+    fn is_soft_validated(&self) -> bool {
+        self.is_hard_validated()
+    }
 
     /// A short human-readable description of this finger's signal parameters.
     ///
@@ -142,6 +151,12 @@ pub trait RakeFinger: Send {
     /// signal-loss threshold.  Returns 0 by default (no tracking).
     fn signal_lost_chips(&self) -> u64 {
         0
+    }
+
+    /// `true` when the finger has detected a terminal signal loss and should
+    /// be retired immediately, independent of generic idle/CRC policy.
+    fn should_retire(&self) -> bool {
+        false
     }
 
     /// Print internal timing breakdown (optional).
@@ -765,7 +780,6 @@ pub struct GenericRakeReceiver<C: Correlator> {
     recent_access_burst_order: VecDeque<AccessBurstKey>,
     /// Thread pool for parallel finger feeding.
     finger_pool: FingerFeedPool<C::Finger>,
-    emit_timing_trace: bool,
 }
 
 impl<C: Correlator> GenericRakeReceiver<C> {
@@ -788,7 +802,6 @@ impl<C: Correlator> GenericRakeReceiver<C> {
             last_report_fingers_ns: 0,
             recent_access_burst_order: VecDeque::new(),
             finger_pool: FingerFeedPool::new(Self::DEFAULT_FINGER_POOL_SIZE),
-            emit_timing_trace: std::env::var_os("CDMA_ACCESS_TIMING_TRACE").is_some(),
         }
     }
 
@@ -832,13 +845,7 @@ impl<C: Correlator> GenericRakeReceiver<C> {
     /// Fingers are deduplicated by `id()`.  When `max_fingers` is reached,
     /// excess detections in this block are discarded (the correlator will
     /// re-detect them in a later block once a slot opens).
-    fn spawn_fingers(
-        &mut self,
-        detections: Vec<(C::Finger, Vec<PipelineProcessorShared>)>,
-    ) -> Vec<SampleBlock> {
-        let emit_timing_trace = self.emit_timing_trace;
-        let mut timing_events = Vec::new();
-
+    fn spawn_fingers(&mut self, detections: Vec<(C::Finger, Vec<PipelineProcessorShared>)>) {
         for (finger, chain) in detections {
             if self.fingers.len() >= self.max_fingers {
                 debug!(
@@ -872,16 +879,6 @@ impl<C: Correlator> GenericRakeReceiver<C> {
                     desc,
                 );
             }
-            if emit_timing_trace {
-                let spawn_chip = finger.spawn_chip_start().unwrap_or(0);
-                let mut block = SampleBlock::new(Vec::new(), spawn_chip as usize);
-                block.tags.insert("rake_finger_spawn_event", 1);
-                block.tags.insert("finger_id", finger.id() as i64);
-                if let Some(chip) = finger.spawn_chip_start() {
-                    block.tags.insert("absolute_chip_start", chip as i64);
-                }
-                timing_events.push(block);
-            }
             self.fingers.push(ActiveFinger {
                 finger,
                 chain,
@@ -892,8 +889,6 @@ impl<C: Correlator> GenericRakeReceiver<C> {
                 notified_validated: false,
             });
         }
-
-        timing_events
     }
 
     // ------------------------------------------------------------------
@@ -902,17 +897,28 @@ impl<C: Correlator> GenericRakeReceiver<C> {
 
     /// Push `block` through every active finger in parallel and collect output.
     ///
-    /// Finger ownership round-trips through the pool: main thread transfers
-    /// all fingers to workers via a crossbeam MPMC channel, workers process
-    /// and send results back via mpsc, then fingers are restored in their
+    /// Fingers are sent to worker threads, processed, then restored in their
     /// original order.
-    fn feed_fingers(&mut self, block: &SampleBlock) -> Vec<SampleBlock> {
+    fn feed_fingers(&mut self, block: SampleBlock) -> Vec<SampleBlock> {
         let n = self.fingers.len();
         if n == 0 {
             return Vec::new();
         }
+        if n == 1 {
+            let mut active = self
+                .fingers
+                .pop()
+                .expect("single active finger disappeared");
+            let t = Instant::now();
+            let outputs = active.finger.process(&block, &mut active.chain);
+            let elapsed = t.elapsed().as_nanos() as u64;
+            active.process_ns = active.process_ns.saturating_add(elapsed);
+            active.process_calls = active.process_calls.saturating_add(1);
+            self.fingers.push(active);
+            return outputs;
+        }
 
-        let block = Arc::new(block.clone());
+        let block = Arc::new(block);
         let fingers = std::mem::take(&mut self.fingers);
 
         for (idx, finger) in fingers.into_iter().enumerate() {
@@ -1088,7 +1094,8 @@ impl<C: Correlator> GenericRakeReceiver<C> {
         let mut removed_ids = Vec::new();
 
         for af in self.fingers.drain(..) {
-            let should_drop = self.prune_policy.should_prune(&af.finger);
+            let should_drop =
+                af.finger.should_retire() || self.prune_policy.should_prune(&af.finger);
             if should_drop {
                 info!(
                     "GenericRakeReceiver: pruning finger {} (idle_blocks={}, idle_chips={}, validated={}, crc_misses={}, post_walsh_no_event_chips={}, post_walsh_no_event_ms={}, post_walsh_misses={}, signal_lost_chips={})",
@@ -1594,13 +1601,13 @@ impl<C: Correlator> PipelineProcessor for GenericRakeReceiver<C> {
         let mut out = Vec::new();
         if validated_count < self.max_fingers {
             let detections = self.correlator.correlate(&block);
-            out.extend(self.spawn_fingers(detections));
+            self.spawn_fingers(detections);
         }
         let correlator_ns = t0.elapsed().as_nanos() as u64;
 
         // 2. Feed every active finger and collect output.
         let t1 = std::time::Instant::now();
-        let finger_out = self.feed_fingers(&block);
+        let finger_out = self.feed_fingers(block);
         let finger_out = self.suppress_duplicate_access_events(finger_out);
         let finger_out = self.suppress_previously_emitted_access_events(finger_out);
         out.extend(finger_out);
@@ -1689,7 +1696,7 @@ impl<C: Correlator> PipelineProcessor for GenericRakeReceiver<C> {
             } else {
                 0.0
             };
-            debug!(
+            trace!(
                 "[RAKE blk={}] correlator: {:.1}ms ({:.1}%) | fingers({}):{:.1}ms ({:.1}%) | total: {:.1}ms",
                 self.block_count,
                 corr_ms,
@@ -1713,7 +1720,7 @@ impl<C: Correlator> PipelineProcessor for GenericRakeReceiver<C> {
             let corr_ms = interval_corr_ns as f64 / 1e6;
             let fing_ms = interval_fingers_ns as f64 / 1e6;
             let total_ms = interval_total_ns as f64 / 1e6;
-            debug!(
+            trace!(
                 "GenericRakeReceiver periodic: blocks={} active_fingers={} correlator={:.1}ms ({:.1}%) fingers={:.1}ms ({:.1}%) total={:.1}ms",
                 interval_blocks,
                 self.fingers.len(),
@@ -1742,7 +1749,7 @@ impl<C: Correlator> PipelineProcessor for GenericRakeReceiver<C> {
                 } else {
                     0.0
                 };
-                debug!(
+                trace!(
                     "GenericRakeReceiver finger: id={} interval={:.1}ms calls={} avg={:.1}us validated={} idle_chips={} crc_misses={} post_walsh_ms={}",
                     af.finger.id(),
                     delta_ms,
@@ -1754,7 +1761,7 @@ impl<C: Correlator> PipelineProcessor for GenericRakeReceiver<C> {
                     af.finger.post_walsh_no_event_ms(),
                 );
                 for line in af.finger.timing_report_lines() {
-                    debug!("{}", line);
+                    trace!("{}", line);
                 }
                 af.last_report_process_ns = af.process_ns;
                 af.last_report_process_calls = af.process_calls;
@@ -1773,11 +1780,11 @@ impl<C: Correlator> PipelineProcessor for GenericRakeReceiver<C> {
         let total_ms = (self.correlator_ns + self.fingers_ns) as f64 / 1e6;
         let corr_ms = self.correlator_ns as f64 / 1e6;
         let fing_ms = self.fingers_ns as f64 / 1e6;
-        debug!(
+        trace!(
             "\n=== GenericRakeReceiver Timing Report ({} blocks) ===",
             self.block_count
         );
-        debug!(
+        trace!(
             "  correlator (search):  {:.1}ms ({:.1}%)",
             corr_ms,
             if total_ms > 0.0 {
@@ -1786,7 +1793,7 @@ impl<C: Correlator> PipelineProcessor for GenericRakeReceiver<C> {
                 0.0
             }
         );
-        debug!(
+        trace!(
             "  finger processing:    {:.1}ms ({:.1}%)",
             fing_ms,
             if total_ms > 0.0 {
@@ -1795,14 +1802,14 @@ impl<C: Correlator> PipelineProcessor for GenericRakeReceiver<C> {
                 0.0
             }
         );
-        debug!("  total:                {:.1}ms", total_ms);
+        trace!("  total:                {:.1}ms", total_ms);
         for af in &self.fingers {
             let avg_us = if af.process_calls > 0 {
                 af.process_ns as f64 / af.process_calls as f64 / 1e3
             } else {
                 0.0
             };
-            debug!(
+            trace!(
                 "  finger {:>3}: {:.1}ms total, {} calls, {:.1}us/call, validated={}",
                 af.finger.id(),
                 af.process_ns as f64 / 1e6,
@@ -1815,7 +1822,7 @@ impl<C: Correlator> PipelineProcessor for GenericRakeReceiver<C> {
                 let m = stage.metrics();
                 if !m.is_empty() {
                     let pairs: Vec<String> = m.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                    debug!("      {} metrics: {}", stage.name(), pairs.join(" "));
+                    trace!("      {} metrics: {}", stage.name(), pairs.join(" "));
                 }
             }
         }

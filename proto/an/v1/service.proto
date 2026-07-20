@@ -1,0 +1,492 @@
+syntax = "proto3";
+package an.v1;
+
+import "events/v1/an.proto";
+
+// HRPD (1xEV-DO Rev 0) Access Network service.
+//
+// Exposes read-only views into per-AT session state, UATI allocation, and
+// related bookkeeping owned by the AN process. Mirrors the Rust types in
+// `cdma-an` (session.rs, subnet.rs).
+service AnService {
+  // List currently tracked sessions (optionally filtered).
+  rpc GetSessions(GetSessionsRequest) returns (GetSessionsResponse);
+  // Fetch one session by UATI.
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
+  // Inspect the current UATI allocation pool for a subnet.
+  rpc GetUatiAllocation(GetUatiAllocationRequest) returns (GetUatiAllocationResponse);
+  // Returns recently buffered session and traffic events for a UATI, oldest
+  // first, so a fresh session view can load history before streaming live.
+  rpc GetSessionEvents(GetSessionEventsRequest) returns (GetSessionEventsResponse);
+  // Consumes one decoded HRPD reverse Access MAC capsule and returns any
+  // AN-originated forward Default Signaling to queue on the HRPD Forward
+  // Control Channel.
+  rpc HandleAccessIndication(HrpdAccessIndication) returns (HrpdAccessOutcome);
+  // Consumes one decoded HRPD reverse Traffic Channel event and returns any
+  // AN-authorized A8 user-plane payloads for the PCF bearer.
+  rpc HandleTrafficEvent(HrpdTrafficEvent) returns (HrpdTrafficOutcome);
+}
+
+// Per C.S0024-400 §7 session state.
+enum SessionState {
+  SESSION_STATE_UNSPECIFIED = 0;
+  SESSION_STATE_CLOSED = 1;
+  SESSION_STATE_AMP_SETUP = 2;
+  SESSION_STATE_OPEN = 3;
+  SESSION_STATE_CLOSING = 4;
+}
+
+// Session Close reason. Values equal the wire CloseReason so unlisted reserved
+// codes pass through as the raw integer.
+enum HrpdSessionCloseReason {
+  HRPD_SESSION_CLOSE_REASON_NORMAL_CLOSE = 0;
+  HRPD_SESSION_CLOSE_REASON_CLOSE_REPLY = 1;
+  HRPD_SESSION_CLOSE_REASON_PROTOCOL_ERROR = 2;
+  HRPD_SESSION_CLOSE_REASON_PROTOCOL_CONFIGURATION_FAILURE = 3;
+  HRPD_SESSION_CLOSE_REASON_PROTOCOL_NEGOTIATION_ERROR = 4;
+  HRPD_SESSION_CLOSE_REASON_SESSION_CONFIGURATION_FAILURE = 5;
+  HRPD_SESSION_CLOSE_REASON_SESSION_LOST = 6;
+  HRPD_SESSION_CLOSE_REASON_SESSION_UNREACHABLE = 7;
+  HRPD_SESSION_CLOSE_REASON_ALL_SESSION_RESOURCES_BUSY = 8;
+}
+
+// Connection Close reason. Values equal the wire CloseReason so unlisted
+// reserved codes pass through as the raw integer.
+enum HrpdConnectionCloseReason {
+  HRPD_CONNECTION_CLOSE_REASON_NORMAL_CLOSE = 0;
+  HRPD_CONNECTION_CLOSE_REASON_CLOSE_REPLY = 1;
+  HRPD_CONNECTION_CLOSE_REASON_CONNECTION_ERROR = 2;
+  HRPD_CONNECTION_CLOSE_REASON_ONE_X_TRANSITION = 3;
+  HRPD_CONNECTION_CLOSE_REASON_NORMAL_CLOSE_NONZERO_SUSPEND = 4;
+  HRPD_CONNECTION_CLOSE_REASON_NORMAL_CLOSE_ZERO_SUSPEND = 5;
+}
+
+// Per-AT session record (mirrors `cdma_an::session::Session`).
+message Session {
+  // Unicast Access Terminal Identifier assigned to this AT.
+  uint32 uati = 1;
+  // Sector color code that scopes the UATI.
+  uint32 color_code = 2;
+  // Current session state.
+  SessionState state = 3;
+  // Negotiated protocol subtypes (compact summary).
+  NegotiatedProtocols protocols = 4;
+  // Most recent HardwareIDResponse associated with this session, when known.
+  HrpdHardwareIdResponse hardware_id_response = 5;
+  // Canonical 128-bit UATI assigned to this AT.
+  events.v1.HrpdUati full_uati = 6;
+}
+
+// Negotiated protocol subtypes for an open session.
+message NegotiatedProtocols {
+  uint32 air_link_management = 1;
+  uint32 session_management = 2;
+  uint32 address_management = 3;
+  uint32 connection_layer = 4;
+  uint32 security = 5;
+  uint32 mac = 6;
+  uint32 physical_layer = 7;
+}
+
+// --- Request/Response Messages ---
+
+message GetSessionsRequest {
+  // Optional: filter by state. Unspecified means no filter.
+  SessionState state_filter = 1;
+}
+
+message GetSessionsResponse {
+  repeated Session sessions = 1;
+}
+
+message GetSessionRequest {
+  uint32 uati = 1;
+}
+
+message GetSessionResponse {
+  Session session = 1;
+}
+
+message GetUatiAllocationRequest {
+  // Sector subnet (color code) whose allocation to inspect.
+  uint32 color_code = 1;
+}
+
+message GetUatiAllocationResponse {
+  uint32 color_code = 1;
+  // Total assignable UATIs in the subnet.
+  uint32 capacity = 2;
+  // UATIs currently assigned to sessions.
+  uint32 in_use = 3;
+  // UATIs currently free for assignment.
+  uint32 available = 4;
+}
+
+message GetSessionEventsRequest {
+  uint32 uati = 1;
+  // Max records to return, most recent kept. 0 = all buffered.
+  uint32 limit = 2;
+}
+
+// One buffered AN event in receive order. `received_ms` is the AN's
+// receive-time stamp (epoch milliseconds) for display; the live/bus event
+// payload is unmodified.
+message AnEventRecord {
+  uint64 received_ms = 1;
+  oneof event {
+    events.v1.HrpdSessionEvent session = 2;
+    events.v1.HrpdTrafficEvent traffic = 3;
+    events.v1.HrpdAccessEvent access = 4;
+  }
+}
+
+message GetSessionEventsResponse {
+  repeated AnEventRecord records = 1;
+}
+
+// --- HRPD Air-Interface Event Boundary ---
+
+enum AccessTerminalIdentifierType {
+  ACCESS_TERMINAL_IDENTIFIER_TYPE_UNSPECIFIED = 0;
+  ACCESS_TERMINAL_IDENTIFIER_TYPE_BATI = 1;
+  ACCESS_TERMINAL_IDENTIFIER_TYPE_RESERVED = 2;
+  ACCESS_TERMINAL_IDENTIFIER_TYPE_UATI = 3;
+  ACCESS_TERMINAL_IDENTIFIER_TYPE_RATI = 4;
+}
+
+message AccessTerminalIdentifier {
+  AccessTerminalIdentifierType ati_type = 1;
+  uint32 value = 2;
+}
+
+message HrpdAccessIndication {
+  uint64 absolute_chip = 1 [jstype = JS_STRING];
+  uint32 color_code = 2;
+  uint32 sector_pilot_pn = 3;
+  uint32 session_configuration_token = 4;
+  AccessTerminalIdentifier ati = 5;
+  bool security_layer_format = 6;
+  bool connection_layer_format = 7;
+  bytes security_payload = 8;
+  repeated HrpdAccessMessage messages = 9;
+}
+
+message HrpdAccessMessage {
+  oneof message {
+    HrpdRouteUpdate route_update = 1;
+    HrpdUatiRequest uati_request = 2;
+    HrpdUatiComplete uati_complete = 3;
+    HrpdConnectionRequest connection_request = 4;
+    HrpdKeepAlive keep_alive = 5;
+    HrpdHardwareIdResponse hardware_id_response = 6;
+    HrpdTrafficChannelComplete traffic_channel_complete = 7;
+    HrpdSessionClose session_close = 8;
+    HrpdConnectionClose connection_close = 9;
+    HrpdDefaultPacketXonRequest default_packet_xon_request = 10;
+    HrpdDefaultPacketXoffRequest default_packet_xoff_request = 11;
+    HrpdDefaultPacketDataReadyAck default_packet_data_ready_ack = 12;
+    HrpdUnknownAccessMessage unknown = 15;
+  }
+}
+
+message HrpdRouteUpdate {
+  uint32 message_sequence = 1;
+  uint32 reference_pilot_pn = 2;
+  uint32 reference_pilot_strength = 3;
+  bool reference_keep = 4;
+  uint32 num_pilots = 5;
+  optional sint32 at_total_pilot_transmission = 6;
+  optional uint32 reference_pilot_channel = 7;
+  bool reserved_zero = 8;
+}
+
+message HrpdUatiRequest {
+  uint32 transaction_id = 1;
+}
+
+message HrpdUatiComplete {
+  uint32 message_sequence = 1;
+  bytes upper_old_uati = 2;
+  bool reserved_zero = 3;
+}
+
+message HrpdConnectionRequest {
+  uint32 transaction_id = 1;
+  uint32 request_reason = 2;
+  bool reserved_zero = 3;
+}
+
+message HrpdTrafficChannelComplete {
+  uint32 message_sequence = 1;
+}
+
+message HrpdSessionClose {
+  HrpdSessionCloseReason close_reason = 1;
+  bytes more_info = 2;
+}
+
+message HrpdConnectionClose {
+  HrpdConnectionCloseReason close_reason = 1;
+  bool suspend_enable = 2;
+  optional uint64 suspend_time = 3 [jstype = JS_STRING];
+  bool reserved_zero = 4;
+}
+
+message HrpdHardwareIdResponse {
+  uint32 transaction_id = 1;
+  uint32 hardware_id_type = 2;
+  bytes hardware_id_value = 3;
+}
+
+message HrpdKeepAlive {}
+
+message HrpdDefaultPacketXonRequest {}
+
+message HrpdDefaultPacketXoffRequest {}
+
+message HrpdDefaultPacketDataReadyAck {
+  uint32 transaction_id = 1;
+}
+
+message HrpdUnknownAccessMessage {
+  uint32 protocol_type = 1;
+  optional uint32 message_id = 2;
+  bytes payload = 3;
+}
+
+enum HrpdForwardChannel {
+  HRPD_FORWARD_CHANNEL_UNSPECIFIED = 0;
+  HRPD_FORWARD_CHANNEL_SYNCHRONOUS_CONTROL = 1;
+  HRPD_FORWARD_CHANNEL_ASYNCHRONOUS_CONTROL = 2;
+  HRPD_FORWARD_CHANNEL_FORWARD_TRAFFIC = 3;
+}
+
+message HrpdForwardSignalingRequest {
+  optional uint32 uati = 1;
+  AccessTerminalIdentifier target_ati = 2;
+  uint32 protocol_type = 3;
+  bytes payload = 4;
+  HrpdForwardChannel channel = 5;
+  optional uint32 reliable_sequence = 6;
+  optional uint32 synchronous_control_cycle_modulus = 7;
+  optional uint32 synchronous_control_cycle_residue = 8;
+}
+
+message HrpdTrafficAssignmentRequest {
+  // Assigned session UATI. This keys session configuration, identity, and A9
+  // setup state; it is distinct from the receive-form traffic UATI below.
+  uint32 session_uati = 10;
+  uint32 uati = 1;
+  events.v1.HrpdUati full_uati = 13;
+  uint32 receive_ati = 14;
+  uint32 mac_index = 2;
+  uint32 reverse_rate_limit_bps = 3;
+  uint64 reverse_long_code_mask_i = 4 [jstype = JS_STRING];
+  uint64 reverse_long_code_mask_q = 5 [jstype = JS_STRING];
+  bool drc_lock = 6;
+  // Negotiated Physical Layer protocol subtype in use for this connection.
+  uint32 physical_layer_subtype = 11;
+  // Negotiated Reverse Traffic Channel MAC protocol subtype in use for this
+  // connection. This selects the reverse MAC trailer and rate-control rules.
+  uint32 reverse_traffic_mac_subtype = 12;
+  // AT's DRC inner Walsh cover index from the TCA's first pilot
+  // (C.S0024-0 v4.0 §6.7.4.3). 3-bit field on the air, transported as
+  // uint32.
+  uint32 drc_cover = 7;
+  // AT's DRC integration window in slots (1, 2, 4, or 8), already
+  // decoded from the TCA's 2-bit DRCLength wire code per §6.7.4.3.
+  uint32 drc_length = 8;
+  // TCA FrameOffset in slots. Reverse traffic physical-layer frames start
+  // where (T - FrameOffset) mod 16 = 0.
+  uint32 frame_offset = 9;
+}
+
+// Stops the BTS reverse traffic receiver and removes the forward MAC
+// channel for a traffic assignment whose session closed or was replaced.
+message HrpdTrafficReleaseRequest {
+  uint32 uati = 1;
+  events.v1.HrpdUati full_uati = 3;
+  uint32 receive_ati = 4;
+  uint32 mac_index = 2;
+}
+
+message HrpdForwardTrafficPacket {
+  reserved 3, 5;
+  reserved "drc_index", "allow_drc_override";
+
+  uint32 uati = 1;
+  events.v1.HrpdUati full_uati = 8;
+  uint32 receive_ati = 9;
+  uint32 mac_index = 2;
+  // One unpacked physical-layer bit per byte, value 0 or 1.
+  bytes payload_bits = 4;
+  // Session-negotiated Physical Layer protocol subtype used to encode this
+  // packet. Zero is the default/subtype-0 physical layer used before commit.
+  uint32 physical_layer_subtype = 6;
+  // Session-negotiated Forward Traffic Channel MAC protocol subtype. This
+  // selects the FTC MAC packet/FCS layout independently of the Physical Layer.
+  uint32 forward_traffic_mac_subtype = 7;
+  // True when this packet contains an RLP retransmission and therefore has
+  // priority over first-transmission application traffic.
+  bool high_priority = 10;
+}
+
+message HrpdAccessOutcome {
+  repeated HrpdForwardSignalingRequest forward_signaling = 1;
+  uint32 route_update_count = 2;
+  uint32 uati_complete_count = 3;
+  uint32 connection_request_count = 4;
+  bool connection_requested = 5;
+  bool keepalive_seen = 6;
+  uint32 unknown_message_count = 7;
+  repeated HrpdTrafficAssignmentRequest traffic_assignments = 8;
+  uint32 hardware_id_response_count = 9;
+  repeated HrpdForwardTrafficPacket forward_traffic = 10;
+  repeated HrpdTrafficReleaseRequest traffic_releases = 11;
+  repeated uint32 session_closed_uatis = 12;
+}
+
+message HrpdTrafficEvent {
+  oneof event {
+    HrpdReversePilotEvent reverse_pilot = 1;
+    HrpdDrcEvent drc = 2;
+    HrpdAckEvent ack = 3;
+    HrpdStream0SignalingEvent stream0_signaling = 4;
+    HrpdStream1PacketEvent stream1_packet = 5;
+    HrpdReversePilotLostEvent reverse_pilot_lost = 6;
+  }
+}
+
+message HrpdReversePilotEvent {
+  uint32 uati = 1;
+  events.v1.HrpdUati full_uati = 5;
+  uint32 receive_ati = 6;
+  uint32 mac_index = 2;
+  uint64 absolute_chip = 3 [jstype = JS_STRING];
+  sint32 snr_db_tenths = 4;
+}
+
+message HrpdReversePilotLostEvent {
+  uint32 uati = 1;
+  events.v1.HrpdUati full_uati = 8;
+  uint32 receive_ati = 9;
+  uint32 mac_index = 2;
+  uint64 last_good_chip = 3 [jstype = JS_STRING];
+  uint64 lost_at_chip = 4 [jstype = JS_STRING];
+  uint64 lost_chips = 5 [jstype = JS_STRING];
+  sint32 last_snr_db_tenths = 6;
+  uint32 last_coherence_x1000 = 7;
+}
+
+message HrpdDrcEvent {
+  uint32 uati = 1;
+  events.v1.HrpdUati full_uati = 5;
+  uint32 receive_ati = 6;
+  uint32 mac_index = 2;
+  uint64 slot = 3 [jstype = JS_STRING];
+  uint32 drc_index = 4;
+}
+
+message HrpdAckEvent {
+  uint32 uati = 1;
+  events.v1.HrpdUati full_uati = 5;
+  uint32 receive_ati = 6;
+  uint32 mac_index = 2;
+  uint64 slot = 3 [jstype = JS_STRING];
+  bool ack = 4;
+}
+
+message HrpdStream0SignalingEvent {
+  uint32 uati = 1;
+  events.v1.HrpdUati full_uati = 3;
+  uint32 receive_ati = 4;
+  bytes payload = 2;
+}
+
+message HrpdStream1PacketEvent {
+  uint32 uati = 1;
+  events.v1.HrpdUati full_uati = 3;
+  uint32 receive_ati = 4;
+  bytes payload = 2;
+  uint32 sequence = 5;
+}
+
+message HrpdA8UplinkPacket {
+  uint32 uati = 1;
+  events.v1.HrpdUati full_uati = 3;
+  uint32 receive_ati = 4;
+  bytes payload = 2;
+}
+
+message HrpdDefaultPacketDataReadyAckEvent {
+  uint32 uati = 1;
+  events.v1.HrpdUati full_uati = 3;
+  uint32 receive_ati = 4;
+  uint32 transaction_id = 2;
+}
+
+message HrpdDefaultPacketStreamConfiguration {
+  uint32 uati = 1;
+  events.v1.HrpdUati full_uati = 5;
+  uint32 receive_ati = 6;
+  uint32 stream_id = 2;
+  uint32 protocol_type = 3;
+  uint32 application_subtype = 4;
+}
+
+message HrpdDefaultPacketRlpNakRequest {
+  uint32 first_erased = 1;
+  uint32 window_len = 2;
+}
+
+message HrpdDefaultPacketRlpNakEvent {
+  uint32 uati = 1;
+  events.v1.HrpdUati full_uati = 3;
+  uint32 receive_ati = 4;
+  repeated HrpdDefaultPacketRlpNakRequest requests = 2;
+}
+
+message HrpdTrafficOutcome {
+  uint32 accepted_event_count = 1;
+  uint32 dropped_event_count = 2;
+  uint32 unknown_session_count = 3;
+  uint32 reverse_pilot_count = 4;
+  uint32 drc_count = 5;
+  uint32 ack_count = 6;
+  uint32 stream0_signaling_count = 7;
+  repeated HrpdA8UplinkPacket a8_uplink = 8;
+  repeated HrpdForwardTrafficPacket forward_traffic = 9;
+  repeated HrpdTrafficHardwareIdResponse hardware_id_responses = 10;
+  repeated uint32 session_configuration_complete_uatis = 11;
+  repeated uint32 default_packet_flow_open_uatis = 12;
+  repeated uint32 default_packet_flow_closed_uatis = 13;
+  repeated uint32 traffic_channel_open_uatis = 14;
+  repeated uint32 traffic_channel_closed_uatis = 15;
+  repeated HrpdTrafficReleaseRequest traffic_releases = 16;
+  repeated HrpdDefaultPacketDataReadyAckEvent default_packet_data_ready_acks = 17;
+  repeated uint32 default_packet_rlp_reset_uatis = 18;
+  repeated uint32 session_closed_uatis = 19;
+  repeated HrpdDefaultPacketStreamConfiguration default_packet_stream_configurations = 20;
+  repeated HrpdForwardSignalingRequest forward_signaling = 21;
+  repeated uint32 session_configuration_pending_uatis = 22;
+  repeated HrpdSessionConfigurationCompleteEvent session_configuration_complete_events = 23;
+  repeated HrpdDefaultPacketRlpNakEvent default_packet_rlp_naks = 24;
+}
+
+message HrpdTrafficHardwareIdResponse {
+  uint32 uati = 1;
+  events.v1.HrpdUati full_uati = 3;
+  uint32 receive_ati = 4;
+  HrpdHardwareIdResponse hardware_id_response = 2;
+}
+
+message HrpdSessionConfigurationCompleteEvent {
+  uint32 uati = 1;
+  events.v1.HrpdUati full_uati = 7;
+  uint32 receive_ati = 8;
+  uint32 physical_layer_subtype = 2;
+  uint32 forward_traffic_mac_subtype = 3;
+  bool idle_preferred_control_channel_cycle_enabled = 4;
+  uint32 idle_preferred_control_channel_cycle = 5;
+  uint32 idle_page_period_cycles = 6;
+}

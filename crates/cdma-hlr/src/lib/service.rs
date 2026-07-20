@@ -41,7 +41,7 @@ pub async fn spawn_configured_hlr_service(
     let repo = PostgresHlrRepository::connect_from_config(&config).await?;
     tokio::spawn(async move {
         if let Err(error) = run_grpc_server(addr, Arc::new(repo)).await {
-            eprintln!("HLR gRPC server error: {error}");
+            log::error!("HLR gRPC server error: {error}");
         }
     });
     Ok(addr)
@@ -160,6 +160,25 @@ fn parse_identity_key(
         identity.meid.as_deref(),
     )
     .map_err(Status::invalid_argument)
+}
+
+fn parse_hardware_identity_key(
+    identity: Option<proto::HardwareIdentityKey>,
+) -> Result<(Option<u32>, Option<String>), Status> {
+    let identity = identity.ok_or_else(|| Status::invalid_argument("identity is required"))?;
+    if identity.esn.is_none() && identity.meid.is_none() {
+        return Err(Status::invalid_argument(
+            "hardware identity requires ESN or MEID",
+        ));
+    }
+    let meid = identity
+        .meid
+        .map(|meid| {
+            model::normalize_meid(&meid)
+                .map_err(|e| Status::invalid_argument(format!("invalid MEID: {e}")))
+        })
+        .transpose()?;
+    Ok((identity.esn, meid))
 }
 
 fn validate_phone_number(phone_number: &str) -> Result<(), Status> {
@@ -391,16 +410,11 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         request: Request<proto::ResolveSubscriberByHardwareIdentityRequest>,
     ) -> Result<Response<proto::ResolveSubscriberByHardwareIdentityResponse>, Status> {
         let req = request.into_inner();
-        if req.esn.is_none() && req.meid.is_none() {
-            return Err(Status::invalid_argument(
-                "at least one of esn or meid is required",
-            ));
-        }
-        validate_optional_meid(req.meid.as_deref())?;
+        let (esn, meid) = parse_hardware_identity_key(req.identity)?;
 
         let resolved = self
             .repo
-            .resolve_by_hardware_identity(req.esn, req.meid.as_deref())
+            .resolve_by_hardware_identity(esn, meid.as_deref())
             .await
             .map_err(|e| {
                 log::error!("HLR: {e}");
@@ -1391,8 +1405,10 @@ mod tests {
         let resp = svc
             .resolve_subscriber_by_hardware_identity(Request::new(
                 proto::ResolveSubscriberByHardwareIdentityRequest {
-                    esn: None,
-                    meid: None,
+                    identity: Some(proto::HardwareIdentityKey {
+                        esn: None,
+                        meid: None,
+                    }),
                 },
             ))
             .await;
@@ -1406,8 +1422,10 @@ mod tests {
         let resp = svc
             .resolve_subscriber_by_hardware_identity(Request::new(
                 proto::ResolveSubscriberByHardwareIdentityRequest {
-                    esn: None,
-                    meid: Some("not-hex".to_string()),
+                    identity: Some(proto::HardwareIdentityKey {
+                        esn: None,
+                        meid: Some("not-hex".to_string()),
+                    }),
                 },
             ))
             .await;
@@ -1459,8 +1477,10 @@ mod tests {
         let resp = svc
             .resolve_subscriber_by_hardware_identity(Request::new(
                 proto::ResolveSubscriberByHardwareIdentityRequest {
-                    esn: Some(0x1234_5678),
-                    meid: None,
+                    identity: Some(proto::HardwareIdentityKey {
+                        esn: Some(0x1234_5678),
+                        meid: None,
+                    }),
                 },
             ))
             .await
@@ -1485,8 +1505,10 @@ mod tests {
         let resp = svc
             .resolve_subscriber_by_hardware_identity(Request::new(
                 proto::ResolveSubscriberByHardwareIdentityRequest {
-                    esn: None,
-                    meid: Some("A000000123ABCD".to_string()),
+                    identity: Some(proto::HardwareIdentityKey {
+                        esn: None,
+                        meid: Some("A000000123ABCD".to_string()),
+                    }),
                 },
             ))
             .await
@@ -1497,6 +1519,6 @@ mod tests {
             subscriber.subscriber_id.to_string()
         );
         let call = stub.last_call.lock().unwrap().clone().unwrap();
-        assert_eq!(call, (None, Some("A000000123ABCD".to_string())));
+        assert_eq!(call, (None, Some("a000000123abcd".to_string())));
     }
 }

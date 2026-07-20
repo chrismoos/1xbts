@@ -1,11 +1,19 @@
 import type { AccessEvent, PagingEvent, TrafficEvent } from "@/lib/proto/bsc/v1/service";
+import type {
+  HrpdAccessEvent,
+  HrpdSessionEvent,
+  HrpdTrafficEvent,
+} from "@/lib/proto/events/v1/an";
 
 export type LogEntry =
   | { kind: "tx"; stream: "paging"; id: string; ts: number; identity: string; sortKey: string; event: PagingEvent; seenCount: number }
   | { kind: "tx"; stream: "traffic"; id: string; ts: number; identity: string; sortKey: string; event: TrafficEvent; seenCount: number }
-  | { kind: "rx"; id: string; ts: number; identity: string; sortKey: string; event: AccessEvent; seenCount: number };
+  | { kind: "rx"; id: string; ts: number; identity: string; sortKey: string; event: AccessEvent; seenCount: number }
+  | { kind: "hrpd"; stream: "session"; id: string; ts: number; identity: string; sortKey: string; event: HrpdSessionEvent; seenCount: number }
+  | { kind: "hrpd"; stream: "access"; id: string; ts: number; identity: string; sortKey: string; event: HrpdAccessEvent; seenCount: number }
+  | { kind: "hrpd"; stream: "traffic"; id: string; ts: number; identity: string; sortKey: string; event: HrpdTrafficEvent; seenCount: number };
 
-export function makeLogEntryId(kind: "tx" | "rx", ts: number): string {
+export function makeLogEntryId(kind: "tx" | "rx" | "hrpd", ts: number): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return `${kind}-${ts}-${crypto.randomUUID()}`;
   }

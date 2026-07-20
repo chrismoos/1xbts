@@ -73,11 +73,16 @@ async fn live_session_bind_and_unbind_land_on_the_bus() {
             "session-test".to_string(),
             33,
             SessionMetadata {
+                access_technology: "1x".to_string(),
                 mobile_address: "10.0.0.99".to_string(),
                 subscriber_id: Some("sub-7".to_string()),
                 phone_number: "+15558675309".to_string(),
                 imsi: Some("310170123456789".to_string()),
                 esn: Some(0xDEAD_BEEF),
+                meid: None,
+                hrpd_mn_id: None,
+                hrpd_mn_id_source: None,
+                subscriber_imsi: None,
                 traffic_walsh_code: 12,
             },
         )
@@ -173,11 +178,16 @@ async fn unprovisioned_mobile_emits_identity_only() {
             "session-roam".to_string(),
             33,
             SessionMetadata {
+                access_technology: "1x".to_string(),
                 mobile_address: "10.0.0.50".to_string(),
                 subscriber_id: None, // unprovisioned — no HLR record
                 phone_number: String::new(),
                 imsi: Some("310170555555555".to_string()),
                 esn: Some(0xCAFE_BABE),
+                meid: None,
+                hrpd_mn_id: None,
+                hrpd_mn_id_source: None,
+                subscriber_imsi: None,
                 traffic_walsh_code: 14,
             },
         )

@@ -22,7 +22,7 @@ const (
 	defaultAddr           = ":5656"
 	defaultSize           = 64 * 1024
 	defaultNoScriptDLSize = 128 * 1024
-	maxSize               = 2 * 1024 * 1024
+	maxSize               = 8 * 1024 * 1024
 )
 
 var sizes = []int{
@@ -36,6 +36,8 @@ var sizes = []int{
 	512 * 1024,
 	1024 * 1024,
 	2 * 1024 * 1024,
+	4 * 1024 * 1024,
+	8 * 1024 * 1024,
 }
 
 type server struct {

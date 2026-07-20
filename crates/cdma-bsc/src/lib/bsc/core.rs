@@ -157,6 +157,10 @@ pub struct Bsc {
     /// walsh, so a single-slot tracker is sufficient.
     pub(crate) pending_otasp_dbm:
         std::collections::HashMap<u8, super::traffic_signaling::PendingOtaspDbm>,
+    /// Optional A21 coordination handle into the HRPD AN. When `Some`, the
+    /// paging path queries the identity cache before sending a 1x F-PCH page
+    /// and emits an A21 CrossPageRequest instead for HRPD-attached ATs.
+    pub(crate) hrpd_coord: Option<super::hrpd_coord::HrpdCoord>,
 }
 
 impl Bsc {
@@ -196,6 +200,13 @@ impl Bsc {
             pending_sms_escalations: std::collections::HashMap::new(),
             pending_sms_queue: std::collections::HashMap::new(),
             pending_otasp_dbm: std::collections::HashMap::new(),
+            hrpd_coord: None,
         }
+    }
+
+    /// Install (or replace) the HRPD coordination handle. Wires the A21
+    /// identity cache + send sink that the SMS paging path consults.
+    pub fn set_hrpd_coord(&mut self, coord: super::hrpd_coord::HrpdCoord) {
+        self.hrpd_coord = Some(coord);
     }
 }

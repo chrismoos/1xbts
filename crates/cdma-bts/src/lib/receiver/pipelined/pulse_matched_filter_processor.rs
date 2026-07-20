@@ -3,6 +3,8 @@ use crate::sdr::{cdma2000_baseband_filter_taps_f64, fir::SymmetricComplexFir32};
 use super::{PipelineProcessor, SampleBlock};
 
 /// Applies the CDMA2000 baseband matched filter to incoming complex samples.
+/// A single complex FIR loads each (symmetric) tap once to filter both I and Q,
+/// instead of running two real filters and re-zipping their outputs.
 pub struct PulseMatchedFilterProcessor {
     matched: SymmetricComplexFir32,
 }

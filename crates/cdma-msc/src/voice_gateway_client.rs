@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use log::{info, warn};
+use log::{info, trace, warn};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
@@ -18,7 +18,6 @@ use crate::media_gateway::{
 };
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
-
 #[derive(Clone)]
 pub struct VoiceGatewayClient {
     command_tx: mpsc::UnboundedSender<VoiceGatewayCommand>,
@@ -283,16 +282,30 @@ async fn run_voice_gateway_client(
     ready_tx: watch::Sender<bool>,
     handles: Arc<Mutex<HashMap<CallHandle, GatewayCallState>>>,
 ) {
+    let mut warned_unavailable = false;
     loop {
         ready_tx.send_replace(false);
         while command_rx.try_recv().is_ok() {}
 
         match connect_and_run(&config, &mut command_rx, &event_tx, &ready_tx, &handles).await {
-            Ok(()) => warn!("MSC: voice gateway stream ended"),
-            Err(err) => warn!(
-                "MSC: voice gateway connection to {} unavailable: {}",
-                config.endpoint, err
-            ),
+            Ok(()) => {
+                warned_unavailable = false;
+                warn!("MSC: voice gateway stream ended");
+            }
+            Err(err) => {
+                if !warned_unavailable {
+                    warned_unavailable = true;
+                    warn!(
+                        "MSC: voice gateway connection to {} unavailable: {}",
+                        config.endpoint, err
+                    );
+                } else {
+                    trace!(
+                        "MSC: voice gateway connection to {} unavailable: {}",
+                        config.endpoint, err
+                    );
+                }
+            }
         }
 
         ready_tx.send_replace(false);

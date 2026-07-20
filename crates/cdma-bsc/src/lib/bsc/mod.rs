@@ -8,6 +8,7 @@ pub(crate) mod access;
 pub(crate) mod core;
 #[allow(dead_code)]
 pub(crate) mod events;
+pub mod hrpd_coord;
 #[allow(dead_code)]
 pub mod launcher;
 #[allow(dead_code)]

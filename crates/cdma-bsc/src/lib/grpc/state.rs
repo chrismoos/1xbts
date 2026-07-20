@@ -25,6 +25,8 @@ pub struct BscState {
     pub channel: cdma_common::band_class::ChannelPlan,
     pub tx_center_frequency_hz: usize,
     pub rx_center_frequency_hz: usize,
+    /// Resolved EV-DO (HRPD) carrier, when EV-DO is enabled.
+    pub evdo: Option<cdma_bts::bts::evdo::ResolvedEvdoConfig>,
     pub overhead: OverheadParameters,
     pub timezone: cdma_common::timezone::TimezoneConfig,
     pub pilot_offset: usize,

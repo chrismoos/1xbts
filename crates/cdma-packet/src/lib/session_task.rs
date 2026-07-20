@@ -21,6 +21,7 @@ use crate::ppp::ipcp::IpcpConfig;
 /// strings to `None`.
 #[derive(Debug, Clone, Default)]
 pub struct SessionMetadata {
+    pub access_technology: String,
     pub mobile_address: String,
     pub subscriber_id: Option<String>,
     pub phone_number: String,
@@ -28,6 +29,14 @@ pub struct SessionMetadata {
     pub imsi: Option<String>,
     /// ESN of the handset, if known at session-open time.
     pub esn: Option<u32>,
+    /// MEID of the handset, if known at session-open time.
+    pub meid: Option<String>,
+    /// HRPD A11 MN ID used to register the A10 bearer. This can be an
+    /// IMSI-format fallback and is not necessarily a subscriber IMSI.
+    pub hrpd_mn_id: Option<String>,
+    pub hrpd_mn_id_source: Option<String>,
+    /// Authoritative subscriber IMSI, if separately resolved.
+    pub subscriber_imsi: Option<String>,
     pub traffic_walsh_code: u32,
 }
 
@@ -51,6 +60,12 @@ pub struct SessionStatus {
     pub mobile_address: String,
     pub subscriber_id: String,
     pub phone_number: String,
+    pub imsi: String,
+    pub esn: u32,
+    pub meid: String,
+    pub hrpd_mn_id: String,
+    pub hrpd_mn_id_source: String,
+    pub subscriber_imsi: String,
     pub traffic_walsh_code: u32,
     pub rlp_state: String,
     pub lcp_state: String,
@@ -65,6 +80,7 @@ pub struct SessionStatus {
     pub last_tx_control_repeats: u64,
     pub recent_ppp_events: VecDeque<PacketTraceEvent>,
     pub capture_events: VecDeque<PacketTraceEvent>,
+    pub access_technology: String,
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +165,16 @@ impl PppSessionStore {
         );
     }
 
+    pub fn remove(&self, identity_key: &str) -> Option<PppSessionCacheExpired> {
+        let cached = self.sessions.lock().unwrap().remove(identity_key)?;
+        Some(PppSessionCacheExpired {
+            identity_key: identity_key.to_string(),
+            allocation_key: cached.allocation_key,
+            peer_ip: cached.state.ipcp.config.peer_ip,
+            idle_for: cached.last_activity_at.elapsed(),
+        })
+    }
+
     pub fn reap_expired(&self, timeout: Duration) -> Vec<PppSessionCacheExpired> {
         let mut sessions = self.sessions.lock().unwrap();
         let expired_keys = sessions
@@ -178,6 +204,11 @@ impl SessionStatus {
         Self {
             phase: "rlp_sync".into(),
             service_option,
+            access_technology: if metadata.access_technology.is_empty() {
+                "1x".to_string()
+            } else {
+                metadata.access_technology.clone()
+            },
             peer_ip: String::new(),
             our_ip: String::new(),
             tun_device: String::new(),
@@ -199,6 +230,12 @@ impl SessionStatus {
             // vs Some matters.
             subscriber_id: metadata.subscriber_id.unwrap_or_default(),
             phone_number: metadata.phone_number,
+            imsi: metadata.imsi.unwrap_or_default(),
+            esn: metadata.esn.unwrap_or_default(),
+            meid: metadata.meid.unwrap_or_default(),
+            hrpd_mn_id: metadata.hrpd_mn_id.unwrap_or_default(),
+            hrpd_mn_id_source: metadata.hrpd_mn_id_source.unwrap_or_default(),
+            subscriber_imsi: metadata.subscriber_imsi.unwrap_or_default(),
             traffic_walsh_code: metadata.traffic_walsh_code,
             rlp_state: "sync".into(),
             lcp_state: "closed".into(),
@@ -496,6 +533,10 @@ pub async fn run_session(
             subscriber_id: metadata.subscriber_id.clone(),
             imsi: metadata.imsi.clone(),
             esn: metadata.esn,
+            meid: metadata.meid.clone(),
+            hrpd_mn_id: metadata.hrpd_mn_id.clone(),
+            hrpd_mn_id_source: metadata.hrpd_mn_id_source.clone(),
+            subscriber_imsi: metadata.subscriber_imsi.clone(),
             peer_ip: bind_peer_ip,
             our_ip: bind_our_ip,
         });
@@ -765,6 +806,10 @@ pub async fn run_session(
             subscriber_id: metadata.subscriber_id.clone(),
             imsi: metadata.imsi.clone(),
             esn: metadata.esn,
+            meid: metadata.meid.clone(),
+            hrpd_mn_id: metadata.hrpd_mn_id.clone(),
+            hrpd_mn_id_source: metadata.hrpd_mn_id_source.clone(),
+            subscriber_imsi: metadata.subscriber_imsi.clone(),
             peer_ip: bind_peer_ip,
             reason: crate::session_lifecycle::UnbindReason::UplinkClosed,
         });
@@ -791,6 +836,14 @@ fn session_allocation_key(
 }
 
 pub fn ppp_identity_key(metadata: &SessionMetadata) -> Option<String> {
+    if metadata.access_technology == "HRPD"
+        && let Some(mn_id) = metadata
+            .hrpd_mn_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+    {
+        return Some(format!("hrpd-mn-id:{mn_id}"));
+    }
     match (metadata.imsi.as_deref(), metadata.esn) {
         (Some(imsi), Some(esn)) => Some(format!("imsi:{}:esn:{:08x}", imsi, esn)),
         (Some(imsi), None) => Some(format!("imsi:{}", imsi)),
@@ -1287,6 +1340,20 @@ mod tests {
     }
 
     #[test]
+    fn hrpd_ppp_identity_uses_mn_id_without_claiming_imsi() {
+        let metadata = SessionMetadata {
+            access_technology: "HRPD".to_string(),
+            hrpd_mn_id: Some("310556898017332".to_string()),
+            imsi: None,
+            ..SessionMetadata::default()
+        };
+        assert_eq!(
+            ppp_identity_key(&metadata).as_deref(),
+            Some("hrpd-mn-id:310556898017332")
+        );
+    }
+
+    #[test]
     fn ppp_session_store_hits_and_expires_by_last_activity() {
         let store = PppSessionStore::new();
         store.store(
@@ -1349,6 +1416,29 @@ mod tests {
         ));
         assert!(matches!(
             store.lookup("imsi:test:esn:00000002", Duration::from_secs(30)),
+            PppSessionCacheLookup::Miss
+        ));
+    }
+
+    #[test]
+    fn ppp_session_store_removes_explicitly_invalidated_session() {
+        let store = PppSessionStore::new();
+        store.store(
+            "imsi:test:esn:00000001".to_string(),
+            "device:imsi:test:esn:00000001".to_string(),
+            ppp_state(Ipv4Addr::new(10, 55, 0, 7)),
+            Instant::now(),
+        );
+
+        let removed = store
+            .remove("imsi:test:esn:00000001")
+            .expect("cache entry should be removed");
+        assert_eq!(removed.identity_key, "imsi:test:esn:00000001");
+        assert_eq!(removed.allocation_key, "device:imsi:test:esn:00000001");
+        assert_eq!(removed.peer_ip, Ipv4Addr::new(10, 55, 0, 7));
+        assert!(store.remove("imsi:test:esn:00000001").is_none());
+        assert!(matches!(
+            store.lookup("imsi:test:esn:00000001", Duration::from_secs(30)),
             PppSessionCacheLookup::Miss
         ));
     }

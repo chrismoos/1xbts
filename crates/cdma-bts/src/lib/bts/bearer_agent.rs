@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver as StdReceiver;
 use std::thread;
 
-use log::{debug, warn};
+use log::warn;
 
 use cdma_abis::bearer::{FrameContent, TrafficFrame};
 use cdma_abis::bearer_transport::BearerTransport;
@@ -54,7 +54,7 @@ pub fn spawn_bts_bearer_agent(
                 thread::sleep(std::time::Duration::from_millis(1));
                 continue;
             }
-            debug!(
+            log::trace!(
                 "BTS bearer agent: received {} forward datagram(s)",
                 datagrams.len()
             );
@@ -72,9 +72,11 @@ pub fn spawn_bts_bearer_agent(
                         continue;
                     }
                 };
-                debug!(
+                log::trace!(
                     "BTS bearer agent: delivering walsh={} signaling={} family={:?}",
-                    walsh_code, is_signaling, datagram.channel_family
+                    walsh_code,
+                    is_signaling,
+                    datagram.channel_family
                 );
                 if let Err(e) = deliver_forward_frame(&controller, walsh_code, frame, is_signaling)
                 {
@@ -118,7 +120,7 @@ pub fn deliver_forward_frame(
                             TrafficRate::Full.info_bits(),
                         );
                         ch.channel.send_signaling_bits(bits);
-                        debug!(
+                        log::trace!(
                             "BTS bearer: queued signaling frame walsh={} len={} queue_len={}",
                             walsh_code,
                             info_len,
@@ -138,7 +140,7 @@ pub fn deliver_forward_frame(
                             TrafficRate::Full.info_bits(),
                         );
                         ch.channel.send_signaling_bits(bits);
-                        debug!(
+                        log::trace!(
                             "BTS bearer: queued signaling frame walsh={} len={} queue_len={}",
                             walsh_code,
                             info_len,

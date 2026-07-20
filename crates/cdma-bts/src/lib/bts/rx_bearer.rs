@@ -5,7 +5,7 @@ use cdma_abis::{
     bearer::{ChannelFamily, Direction, FrameContent, ReverseFchDcchFrame, TrafficFrame},
     udp_bearer::UdpBearerDatagram,
 };
-use log::{debug, info, warn};
+use log::{info, warn};
 
 use super::super::AccessChannelEvent;
 use super::REVERSE_BEARER_SEQ;
@@ -99,7 +99,7 @@ pub(super) fn emit_reverse_primary_bearer(
             payload,
         })
         .is_ok();
-    debug!(
+    log::trace!(
         "emit_reverse_primary_bearer: walsh={} rate={} bits={} sent={}",
         walsh_code,
         rate_bps,

@@ -1,11 +1,12 @@
 use std::{
+    f64::consts::PI,
     fs,
     io::BufWriter,
     path::PathBuf,
     sync::Arc,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::mpsc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use cdma_abis::{
@@ -16,24 +17,33 @@ use cdma_common::{
     bits::Bitstream,
     diagnostics::{power_control_verbose_enabled_for_walsh, power_control_verbose_summary_every},
     error::Error,
+    hrpd::air::{HrpdAccessIndication, HrpdTrafficAssignmentRequest, HrpdTrafficEvent},
     paging::{imsi_11_12_to_digits, imsi_s_to_digits_checked, mcc_to_digits},
     time,
 };
+use crossbeam_channel;
 use hound::{SampleFormat, WavSpec, WavWriter};
 use log::{debug, info, trace, warn};
 use num::complex::Complex32;
 use serde::Serialize;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
+use crate::bts::handle::HrpdTrafficRxCommand;
 use crate::lac::message_types::MessageId;
+use crate::phy::{coding::long_code::LongCodeGenerator, spread::HrpdAccessTerminalPnSequence};
+use crate::receiver::hrpd::long_code::HRPD_LONG_CODE_INITIAL_STATE;
+use crate::receiver::hrpd::reverse_spread::hrpd_reverse_pilot_reference_from_signs;
 use crate::receiver::{
     access_layer3::{AccessMessage, AccessMessageHeader, RdschPdu, access_message_type_name},
     access_pdu::ReverseAccessPdu,
+    hrpd::access::{AccessFrameLayout, HrpdAccessSignalingMessage, parse_access_mac_capsule},
     pipelined::{
-        PipelineEmitter, PipelineProcessorShared, ReverseAccessSettings, SampleBlock, VecEmitter,
-        flush_sub_chain, reverse_access_chain, run_sub_chain,
+        HrpdReverseAccessSettings, PipelineEmitter, PipelineProcessorShared, ReverseAccessSettings,
+        SampleBlock, VecEmitter, flush_sub_chain, hrpd_reverse_access_chain, reverse_access_chain,
+        run_sub_chain,
     },
 };
+use crate::sdr::{PhasorNco, fir::SymmetricComplexFir32};
 
 use super::{
     AccessChannelEvent, BtsCommand, BtsPowerControlRegistry, IqCaptureControlResult,
@@ -60,6 +70,55 @@ fn next_access_event_id() -> String {
         "access-{:016x}",
         ACCESS_EVENT_SEQ.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+fn build_hrpd_access_indication(
+    blk: &SampleBlock,
+    color_code: u8,
+    sector_pilot_pn: u16,
+) -> Option<HrpdAccessIndication> {
+    if blk.tags.get("hrpd_access_event") != Some(&1)
+        || blk.tags.get("hrpd_access_mac_fragment_valid") != Some(&1)
+        || blk.tags.get("hrpd_access_mac_single_fragment_fcs_valid") != Some(&1)
+    {
+        return None;
+    }
+    let bits: Vec<u8> = blk
+        .samples
+        .iter()
+        .map(|sample| u8::from(sample.re >= 0.5))
+        .collect();
+    let layout = AccessFrameLayout::for_packet_bits(bits.len())?;
+    let info_bits = bits.get(..layout.body_bits)?;
+    let capsule = parse_access_mac_capsule(info_bits)?;
+    let absolute_chip = blk
+        .tags
+        .get("absolute_chip_start")
+        .and_then(|chip| u64::try_from(*chip).ok())
+        .unwrap_or(blk.chip_start as u64);
+    if capsule.messages.is_empty() {
+        warn!(
+            "rx_hrpd_access_empty_capsule: chip={} summary={} security_payload={} format_b_trace={}",
+            absolute_chip,
+            capsule.summary(),
+            capsule.security_payload_hex(),
+            capsule.format_b_parse_trace()
+        );
+    } else if capsule.security_layer_format
+        || capsule
+            .messages
+            .iter()
+            .any(|packet| matches!(packet.message, HrpdAccessSignalingMessage::SessionClose(_)))
+    {
+        info!(
+            "rx_hrpd_access_capsule: chip={} summary={} security_payload={} format_b_trace={}",
+            absolute_chip,
+            capsule.summary(),
+            capsule.security_payload_hex(),
+            capsule.format_b_parse_trace()
+        );
+    }
+    Some(capsule.to_air_indication(absolute_chip, color_code, sector_pilot_pn))
 }
 
 fn reverse_frame_content_from_rate_bps(rate_bps: u32) -> FrameContent {
@@ -151,7 +210,7 @@ fn emit_reverse_primary_bearer(
             payload,
         })
         .is_ok();
-    debug!(
+    log::trace!(
         "emit_reverse_primary_bearer: walsh={} rate={} bits={} sent={}",
         walsh_code,
         rate_bps,
@@ -245,6 +304,22 @@ struct TrafficRxBlock {
     enqueue_time: std::time::Instant,
 }
 
+/// HRPD carrier-sliced IQ block sent from the main RX loop to the access worker.
+struct HrpdAccessRxBlock {
+    block: CarrierSliceBlock,
+    enqueue_time: Instant,
+}
+
+/// HRPD carrier-sliced IQ block sent from the main RX loop to traffic workers.
+#[derive(Clone)]
+struct HrpdTrafficRxBlock {
+    samples: Vec<Complex32>,
+    absolute_sample_start: u64,
+    sample_rate_hz: usize,
+    rx_read_completed_at: Instant,
+    enqueue_time: Instant,
+}
+
 /// Handle to a running traffic RX thread.
 struct TrafficRxThread {
     walsh_code: u8,
@@ -252,12 +327,50 @@ struct TrafficRxThread {
     shutdown: Arc<AtomicBool>,
 }
 
+/// Handle to the HRPD reverse access worker.
+struct HrpdAccessRxThread {
+    tx: mpsc::Sender<HrpdAccessRxBlock>,
+}
+
+/// Handle to a running HRPD reverse traffic worker.
+struct HrpdTrafficRxThread {
+    uati: u32,
+    mac_index: u8,
+    tx: crossbeam_channel::Sender<HrpdTrafficRxBlock>,
+}
+
 const PCG_CHIPS: usize = 1536;
-const WAV_CAPTURE_PEAK: f32 = 0.95;
+const HRPD_SLOT_CHIPS: usize = 2048;
+const HRPD_TRAFFIC_MAX_INTERPOLATED_GAP_SLOTS: usize = 8;
+#[allow(dead_code)]
+const HRPD_TRAFFIC_FRAME_CHIPS: usize = HRPD_SLOT_CHIPS * 16;
+
+/// `rx_sample_delay` is calibrated at the single-carrier 4× chip rate.
+const RX_SAMPLE_DELAY_CALIBRATION_OVERSAMPLE: i64 = 4;
 
 fn rx_target_batch_samples(sample_rate_hz: usize, chip_rate_hz: usize, batch_pcgs: usize) -> usize {
     let oversample = (sample_rate_hz / chip_rate_hz.max(1)).max(1);
     oversample.saturating_mul(PCG_CHIPS * batch_pcgs.max(1))
+}
+
+fn effective_rx_target_batch_samples(
+    sample_rate_hz: usize,
+    chip_rate_hz: usize,
+    batch_pcgs: usize,
+    hrpd_enabled: bool,
+) -> usize {
+    let configured = rx_target_batch_samples(sample_rate_hz, chip_rate_hz, batch_pcgs);
+    if !hrpd_enabled {
+        return configured;
+    }
+
+    let oversample = (sample_rate_hz / chip_rate_hz.max(1)).max(1);
+    let hrpd_slot_samples = oversample.saturating_mul(HRPD_SLOT_CHIPS);
+    configured.min(hrpd_slot_samples.max(1))
+}
+
+fn scaled_rx_sample_delay(rx_sample_delay: i64, rx_oversample: usize) -> i64 {
+    rx_sample_delay * rx_oversample as i64 / RX_SAMPLE_DELAY_CALIBRATION_OVERSAMPLE
 }
 
 fn spawn_traffic_rx_thread(
@@ -325,6 +438,626 @@ fn spawn_traffic_rx_thread(
     }
 }
 
+fn spawn_hrpd_access_rx_thread(
+    mut processors: Vec<PipelineProcessorShared>,
+    mut stage_timings: Vec<StageTiming>,
+    color_code: u8,
+    sector_pilot_pn: u16,
+    event_tx: Option<tokio_mpsc::UnboundedSender<HrpdAccessIndication>>,
+    shutdown: Arc<AtomicBool>,
+) -> HrpdAccessRxThread {
+    // Access-burst timing must stay contiguous; dropping IQ in the middle of
+    // a burst corrupts the preamble/capsule relationship.
+    let (iq_tx, iq_rx) = mpsc::channel::<HrpdAccessRxBlock>();
+    std::thread::Builder::new()
+        .name("hrpd-access-rx".to_string())
+        .spawn(move || {
+            let mut blocks_processed = 0u64;
+            let mut total_us = 0u64;
+            let mut max_us = 0u64;
+            while !shutdown.load(Ordering::Relaxed) {
+                let blk = match iq_rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                    Ok(blk) => blk,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                let queue_delay_us = blk.enqueue_time.elapsed().as_micros() as u64;
+                let hrpd_block = blk.block;
+                let mut block = SampleBlock::new(hrpd_block.samples, hrpd_block.relative_sample_start)
+                    .with_sample_rate_hz(hrpd_block.sample_rate_hz as f64);
+                block
+                    .tags
+                    .insert("absolute_chip_start", hrpd_block.absolute_chip_start as i64);
+                block.tags.insert(
+                    "absolute_sample_start",
+                    hrpd_block.absolute_sample_start as i64,
+                );
+
+                let iter_start = Instant::now();
+                let mut emitter = VecEmitter::new();
+                let mut outputs =
+                    run_sub_chain_timed(&mut processors, block, &mut stage_timings, &mut emitter);
+                outputs.extend(emitter.blocks);
+                let elapsed_us = iter_start.elapsed().as_micros() as u64;
+                blocks_processed = blocks_processed.saturating_add(1);
+                total_us = total_us.saturating_add(elapsed_us);
+                max_us = max_us.max(elapsed_us);
+                emit_hrpd_access_outputs(outputs, color_code, sector_pilot_pn, &event_tx);
+
+                if elapsed_us > 100_000 {
+                    warn!(
+                        "rx_hrpd_access_worker_slow: block_us={} queue_us={} blocks={} avg_us={} max_us={}",
+                        elapsed_us,
+                        queue_delay_us,
+                        blocks_processed,
+                        total_us / blocks_processed.max(1),
+                        max_us,
+                    );
+                }
+            }
+
+            let mut emitter = VecEmitter::new();
+            let mut outputs = flush_sub_chain(&mut processors, &mut emitter);
+            outputs.extend(emitter.blocks);
+            emit_hrpd_access_outputs(outputs, color_code, sector_pilot_pn, &event_tx);
+            info!("rx: HRPD reverse access worker stopped");
+        })
+        .expect("failed to spawn HRPD access RX thread");
+
+    HrpdAccessRxThread { tx: iq_tx }
+}
+
+fn spawn_hrpd_traffic_rx_thread(
+    oversample: usize,
+    assignment: HrpdTrafficAssignmentRequest,
+    event_tx: Option<tokio_mpsc::UnboundedSender<HrpdTrafficEvent>>,
+    harq_bus: Option<Arc<crate::bts::hrpd::HarqBus>>,
+    shutdown: Arc<AtomicBool>,
+) -> HrpdTrafficRxThread {
+    use crate::receiver::hrpd::reverse_traffic_rake::HrpdReverseTrafficCorrelator;
+    use crate::receiver::pipelined::generic_rake_receiver::GenericRakeReceiver;
+    use crate::receiver::pipelined::{RxSampleTimeAnchor, VecEmitter, run_sub_chain};
+
+    // Reverse traffic is timeline-sensitive. Once the AT has a traffic
+    // assignment, DRC/ACK/RRI/data are all decoded against continuous slot
+    // timing, so dropping IQ to keep the mailbox fresh creates false chip
+    // discontinuities. Keep the handoff lossless and report backlog through
+    // queue_age_us diagnostics instead.
+    let (iq_tx, iq_rx) = crossbeam_channel::unbounded::<HrpdTrafficRxBlock>();
+    let uati = assignment.uati;
+    let mac_index = assignment.mac_index;
+    let reverse_pilot_acquired = Arc::new(AtomicBool::new(false));
+    let correlator = HrpdReverseTrafficCorrelator::new(
+        assignment.clone(),
+        oversample,
+        event_tx,
+        harq_bus,
+        reverse_pilot_acquired.clone(),
+    );
+    // One AT per worker → at most one active finger. The correlator already
+    // suppresses additional spawns while a finger is active, but the rake's
+    // explicit cap is the defensive belt to that suspenders.
+    let rake: PipelineProcessorShared = Box::new(
+        GenericRakeReceiver::new(correlator)
+            .with_prune_policy(Box::new(HrpdTrafficPrunePolicy))
+            .with_max_fingers(1),
+    );
+    let mut processors: Vec<PipelineProcessorShared> = vec![rake];
+
+    std::thread::Builder::new()
+        .name(format!("hrpd-traffic-rx-mac{}", mac_index))
+        .spawn(move || {
+            info!(
+                "rx_hrpd_traffic[m{}]: rake worker started uati=0x{:08x} physical_subtype=0x{:04x} rtc_mac_subtype=0x{:04x} lcm_i=0x{:016x} lcm_q=0x{:016x} drc_cover={} drc_length={}",
+                mac_index,
+                uati,
+                assignment.physical_layer_subtype,
+                assignment.reverse_traffic_mac_subtype,
+                assignment.reverse_long_code_mask_i,
+                assignment.reverse_long_code_mask_q,
+                assignment.drc_cover,
+                assignment.drc_length,
+            );
+            let mut queue_age_samples = 0u64;
+            let mut queue_age_total_us = 0u64;
+            let mut queue_age_max_us = 0u64;
+            let mut timing_samples = 0u64;
+            let mut rake_total_us = 0u64;
+            let mut rake_max_us = 0u64;
+            let mut discontinuity_count = 0u64;
+            let mut continuity_state = TrafficContinuityState::new(true);
+            continuity_state.enabled = true;
+            while !shutdown.load(Ordering::Relaxed) {
+                // DRC only governs the next DRCLength slots, so avoid RX
+                // batching that delays scheduler-facing DRC publication.
+                let blk = match iq_rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(blk) => blk,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                };
+                let queue_us = blk.enqueue_time.elapsed().as_micros() as u64;
+                queue_age_samples = queue_age_samples.saturating_add(1);
+                queue_age_total_us = queue_age_total_us.saturating_add(queue_us);
+                queue_age_max_us = queue_age_max_us.max(queue_us);
+                let raw_absolute_sample_start = blk.absolute_sample_start;
+                let raw_samples_len = blk.samples.len();
+                let max_interpolated_gap_samples = oversample
+                    .max(1)
+                    .saturating_mul(HRPD_SLOT_CHIPS)
+                    .saturating_mul(HRPD_TRAFFIC_MAX_INTERPOLATED_GAP_SLOTS);
+                let expected_abs = continuity_state
+                    .expected_absolute_sample_start
+                    .unwrap_or(raw_absolute_sample_start);
+                let delta_samples = raw_absolute_sample_start as i128 - expected_abs as i128;
+                let gap_reset = continuity_state
+                    .expected_absolute_sample_start
+                    .is_some_and(|expected| {
+                        raw_absolute_sample_start > expected
+                            && (raw_absolute_sample_start - expected) as usize
+                                > max_interpolated_gap_samples
+                    });
+                let continuity = reconcile_traffic_stream_continuity_with_max_insert(
+                    blk.samples,
+                    raw_absolute_sample_start,
+                    continuity_state.expected_absolute_sample_start,
+                    continuity_state.last_tail_sample,
+                    Some(max_interpolated_gap_samples),
+                );
+                if gap_reset {
+                    discontinuity_count = discontinuity_count.saturating_add(1);
+                    let gap_samples = raw_absolute_sample_start.saturating_sub(expected_abs);
+                    warn!(
+                        "rx_hrpd_traffic[m{}]: local_rx_discontinuity reset raw_abs_start={} expected_abs_start={} delta_samples={} delta_chips={:.2} max_insert={} raw_samples={} output_samples={} queue_age_us={} queue_avg_us={} queue_max_us={} discontinuities={}",
+                        mac_index,
+                        raw_absolute_sample_start,
+                        expected_abs,
+                        delta_samples,
+                        delta_samples as f64 / oversample.max(1) as f64,
+                        max_interpolated_gap_samples,
+                        raw_samples_len,
+                        continuity.samples.len(),
+                        queue_us,
+                        queue_age_total_us / queue_age_samples.max(1),
+                        queue_age_max_us,
+                        discontinuity_count,
+                    );
+                    debug!(
+                        "rx_hrpd_traffic[m{}]: skipped HRPD traffic gap samples={} chips={:.2}",
+                        mac_index,
+                        gap_samples,
+                        gap_samples as f64 / oversample.max(1) as f64,
+                    );
+                } else if continuity.inserted_samples > 0 || continuity.dropped_samples > 0 {
+                    discontinuity_count = discontinuity_count.saturating_add(1);
+                    warn!(
+                        "rx_hrpd_traffic[m{}]: local_rx_discontinuity corrected raw_abs_start={} expected_abs_start={} delta_samples={} delta_chips={:.2} inserted={} dropped={} raw_samples={} output_samples={} queue_age_us={} queue_avg_us={} queue_max_us={} discontinuities={}",
+                        mac_index,
+                        raw_absolute_sample_start,
+                        expected_abs,
+                        delta_samples,
+                        delta_samples as f64 / oversample.max(1) as f64,
+                        continuity.inserted_samples,
+                        continuity.dropped_samples,
+                        raw_samples_len,
+                        continuity.samples.len(),
+                        queue_us,
+                        queue_age_total_us / queue_age_samples.max(1),
+                        queue_age_max_us,
+                        discontinuity_count,
+                    );
+                }
+                let absolute_sample_start = continuity.absolute_sample_start;
+                let absolute_chip_start = absolute_sample_start / oversample.max(1) as u64;
+                let samples = continuity.samples;
+                let block_samples = samples.len();
+                let represented_us =
+                    ((block_samples as f64 * 1_000_000.0) / blk.sample_rate_hz.max(1) as f64)
+                        .round() as u64;
+                if samples.is_empty() {
+                    continue;
+                }
+                continuity_state.expected_absolute_sample_start =
+                    Some(absolute_sample_start.saturating_add(block_samples as u64));
+                continuity_state.last_tail_sample = samples.last().copied();
+                // Build the SampleBlock with `chip_start` = absolute chip
+                // index. The finger and correlator both compute their
+                // absolute sample positions from the explicit tag below.
+                let mut block = SampleBlock::new(samples, absolute_chip_start as usize)
+                    .with_sample_rate_hz(blk.sample_rate_hz as f64);
+                block
+                    .tags
+                    .insert("absolute_sample_start", absolute_sample_start as i64);
+                block.rx_sample_time = Some(RxSampleTimeAnchor {
+                    absolute_sample_end: absolute_sample_start.saturating_add(block_samples as u64),
+                    received_at: blk.rx_read_completed_at,
+                });
+                let mut emitter = VecEmitter::new();
+                // The rake's output blocks carry diagnostic tags but are
+                // not consumed downstream — HrpdTrafficEvent goes out via
+                // the data processor's tokio channel directly.
+                let rake_start = Instant::now();
+                let _outputs = run_sub_chain(&mut processors, block, &mut emitter);
+                let rake_us = rake_start.elapsed().as_micros() as u64;
+                timing_samples = timing_samples.saturating_add(1);
+                rake_total_us = rake_total_us.saturating_add(rake_us);
+                rake_max_us = rake_max_us.max(rake_us);
+                let slow_rake = rake_us > represented_us.saturating_mul(2).max(10_000);
+                if queue_us > 250_000 || slow_rake || timing_samples % 400 == 0 {
+                    log::trace!(
+                        "rx_hrpd_traffic[m{}]: worker_timing queue_age_us={} queue_avg={} queue_max={} coalesced={} samples={} iq_us={} rake_us={} rake_avg={} rake_max={} blocks={}",
+                        mac_index,
+                        queue_us,
+                        queue_age_total_us / queue_age_samples.max(1),
+                        queue_age_max_us,
+                        1,
+                        block_samples,
+                        represented_us,
+                        rake_us,
+                        rake_total_us / timing_samples.max(1),
+                        rake_max_us,
+                        timing_samples,
+                    );
+                }
+            }
+            info!(
+                "rx_hrpd_traffic[m{}]: rake worker stopped uati=0x{:08x}",
+                mac_index, uati
+            );
+        })
+        .expect("failed to spawn HRPD traffic RX thread");
+
+    HrpdTrafficRxThread {
+        uati,
+        mac_index,
+        tx: iq_tx,
+    }
+}
+
+fn send_hrpd_traffic_rx_block(thread: &HrpdTrafficRxThread, block: HrpdTrafficRxBlock) -> bool {
+    match thread.tx.send(block) {
+        Ok(()) => true,
+        Err(_) => {
+            warn!(
+                "rx: HRPD traffic RX thread exited uati=0x{:08x} mac={}",
+                thread.uati, thread.mac_index
+            );
+            false
+        }
+    }
+}
+
+struct HrpdTrafficPrunePolicy;
+
+/// Idle grace for a finger that has validated its reverse pilot (connection is
+/// established). 3 s of silence before teardown, so a rough patch does not force
+/// a re-acquisition and the closed-loop power-control gap that comes with it.
+const HRPD_TRAFFIC_VALIDATED_IDLE_GRACE_CHIPS: u64 = 3 * HRPD_CHIP_RATE_HZ;
+/// Idle grace before any validation: enough for the assignment/RTCAck window,
+/// but short enough that a false FFT hit does not pin the single-finger worker.
+const HRPD_TRAFFIC_UNVALIDATED_IDLE_GRACE_CHIPS: u64 = HRPD_CHIP_RATE_HZ;
+const HRPD_CHIP_RATE_HZ: u64 = 1_228_800;
+
+impl crate::receiver::pipelined::generic_rake_receiver::PrunePolicy for HrpdTrafficPrunePolicy {
+    fn should_prune(
+        &self,
+        finger: &dyn crate::receiver::pipelined::generic_rake_receiver::RakeFinger,
+    ) -> bool {
+        // Reverse traffic is connection-scoped: once the pilot validates, the
+        // finger stays up while coherent PHY frames keep arriving. The generic
+        // access/1x policy is burst-scoped and can retire a healthy HRPD
+        // traffic finger just because no data CRC or ACK event arrived. Use the
+        // long grace as soon as the pilot soft-validates — not only after a
+        // CRC-clean (hard) frame — because tearing down a tracking finger opens
+        // a reverse-power-control gap.
+        if finger.is_soft_validated() {
+            return finger.idle_chips() > HRPD_TRAFFIC_VALIDATED_IDLE_GRACE_CHIPS;
+        }
+        finger.idle_chips() > HRPD_TRAFFIC_UNVALIDATED_IDLE_GRACE_CHIPS
+    }
+}
+
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct HrpdTrafficPilotMetric {
+    frame_start_chip: u64,
+    chip_offset: i32,
+    coherence: f32,
+    snr_db: f32,
+    sample_delay: i32,
+    sample_delay_fraction: f32,
+    pilot_phase: Complex32,
+    i_mask: u64,
+    q_mask: u64,
+    q_sign: f32,
+    q_pair_phase: u64,
+    mask_label: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+struct HrpdTrafficMaskCandidate {
+    i_mask: u64,
+    q_mask: u64,
+    q_sign: f32,
+    q_pair_phase: u64,
+    label: &'static str,
+}
+
+#[allow(dead_code)]
+fn hrpd_reverse_traffic_pilot_metric_at_offset(
+    samples: &[Complex32],
+    absolute_sample_start: u64,
+    oversample: usize,
+    nominal_frame_start_chip: u64,
+    chip_offset: i32,
+    mask: HrpdTrafficMaskCandidate,
+    pilot_chip_step: usize,
+) -> Option<HrpdTrafficPilotMetric> {
+    let frame_start_chip = if chip_offset.is_negative() {
+        nominal_frame_start_chip.checked_sub(chip_offset.unsigned_abs() as u64)?
+    } else {
+        nominal_frame_start_chip.checked_add(chip_offset as u64)?
+    };
+    let start_sample = frame_start_chip.checked_mul(oversample as u64)?;
+    if start_sample < absolute_sample_start {
+        return None;
+    }
+    let base_start = (start_sample - absolute_sample_start) as usize;
+    let pn = hrpd_reverse_terminal_pn_signs(frame_start_chip, HRPD_TRAFFIC_FRAME_CHIPS);
+    let lc_i =
+        hrpd_long_code_signs_at_phase(mask.i_mask, frame_start_chip, HRPD_TRAFFIC_FRAME_CHIPS);
+    let lc_q =
+        hrpd_long_code_signs_at_phase(mask.q_mask, frame_start_chip, HRPD_TRAFFIC_FRAME_CHIPS);
+
+    let mut best: Option<HrpdTrafficPilotMetric> = None;
+    // Access acquisition on the same channelizer has landed near +52 samples
+    // in live composite captures. Keep the traffic search bounded, but cover
+    // that observed RX filter/group-delay range; chip-offset refinement still
+    // accounts for the spec FrameOffset/slot boundary.
+    for sample_delay in -32..=80 {
+        for sample_delay_fraction in [0.0f32, -0.75, 0.75] {
+            let mut coherent = Complex32::new(0.0, 0.0);
+            let mut slot_coherent = [Complex32::new(0.0, 0.0); 16];
+            let mut count = 0usize;
+            for chip in (0..HRPD_TRAFFIC_FRAME_CHIPS).step_by(pilot_chip_step.max(1)) {
+                // RRI replaces the pilot over the first 256 chips of each slot.
+                // Skip that TDM region so the metric scores only unmodulated
+                // Pilot Channel chips on W0^16.
+                if chip % 2048 < 256 {
+                    continue;
+                }
+                let sample = match sample_chip_at_delay(
+                    samples,
+                    base_start,
+                    oversample,
+                    chip,
+                    sample_delay,
+                    sample_delay_fraction,
+                ) {
+                    Some(sample) => sample,
+                    None => continue,
+                };
+                let ref_chip = hrpd_reverse_traffic_pilot_reference(
+                    frame_start_chip + chip as u64,
+                    chip,
+                    &pn,
+                    &lc_i,
+                    &lc_q,
+                    mask,
+                );
+                let v = sample * ref_chip.conj();
+                coherent += v;
+                slot_coherent[(chip / HRPD_SLOT_CHIPS).min(15)] += v;
+                count += 1;
+            }
+            if count == 0 {
+                continue;
+            }
+            let slot_phase = slot_coherent.map(|sum| {
+                if sum.norm_sqr() > 0.0 {
+                    sum / sum.norm()
+                } else {
+                    Complex32::new(1.0, 0.0)
+                }
+            });
+            let mut slot_projected = [0.0f32; 16];
+            let mut abs_sum = 0.0f32;
+            let mut power_sum = 0.0f32;
+            let mut projected_count = 0usize;
+            for chip in (0..HRPD_TRAFFIC_FRAME_CHIPS).step_by(pilot_chip_step.max(1)) {
+                if chip % 2048 < 256 {
+                    continue;
+                }
+                let sample = match sample_chip_at_delay(
+                    samples,
+                    base_start,
+                    oversample,
+                    chip,
+                    sample_delay,
+                    sample_delay_fraction,
+                ) {
+                    Some(sample) => sample,
+                    None => continue,
+                };
+                let ref_chip = hrpd_reverse_traffic_pilot_reference(
+                    frame_start_chip + chip as u64,
+                    chip,
+                    &pn,
+                    &lc_i,
+                    &lc_q,
+                    mask,
+                );
+                let v = sample * ref_chip.conj();
+                let slot = (chip / HRPD_SLOT_CHIPS).min(15);
+                let projected = (v * slot_phase[slot].conj()).re;
+                slot_projected[slot] += projected;
+                abs_sum += projected.abs();
+                power_sum += projected * projected;
+                projected_count += 1;
+            }
+            if projected_count == 0
+                || abs_sum.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
+            {
+                continue;
+            }
+            // Reverse traffic can carry residual AT/BTS CFO over the 26.7 ms
+            // frame.  Score acquisition noncoherently per slot after PN/LC
+            // despread; this preserves the spec pilot structure while avoiding
+            // a false miss from phase rotation across the full frame.
+            let noncoherent = slot_projected.iter().map(|sum| sum.abs()).sum::<f32>();
+            let coherence = noncoherent / abs_sum;
+            let mean_power = power_sum / projected_count as f32;
+            let coherent_power =
+                (noncoherent * noncoherent) / (projected_count * projected_count) as f32;
+            let noise_power = (mean_power - coherent_power).max(1.0e-12);
+            let snr_db = 10.0 * (coherent_power / noise_power).max(1.0e-12).log10();
+            let metric = HrpdTrafficPilotMetric {
+                frame_start_chip,
+                chip_offset,
+                coherence,
+                snr_db,
+                sample_delay,
+                sample_delay_fraction,
+                pilot_phase: if coherent.norm_sqr() > 0.0 {
+                    coherent / coherent.norm()
+                } else {
+                    Complex32::new(1.0, 0.0)
+                },
+                i_mask: mask.i_mask,
+                q_mask: mask.q_mask,
+                q_sign: mask.q_sign,
+                q_pair_phase: mask.q_pair_phase,
+                mask_label: mask.label,
+            };
+            if best.as_ref().is_none_or(|best| {
+                metric.coherence > best.coherence
+                    || (metric.coherence == best.coherence && metric.snr_db > best.snr_db)
+            }) {
+                best = Some(metric);
+            }
+        }
+    }
+    best
+}
+
+#[allow(dead_code)]
+fn sample_chip_at_delay(
+    samples: &[Complex32],
+    base_start: usize,
+    oversample: usize,
+    chip: usize,
+    sample_delay: i32,
+    sample_delay_fraction: f32,
+) -> Option<Complex32> {
+    let sample_pos = base_start as f32
+        + chip as f32 * oversample.max(1) as f32
+        + sample_delay as f32
+        + sample_delay_fraction;
+    if !sample_pos.is_finite() || sample_pos < 0.0 {
+        return None;
+    }
+    let lo = sample_pos.floor() as usize;
+    let frac = sample_pos - lo as f32;
+    if lo + 1 >= samples.len() {
+        return None;
+    }
+    Some(samples[lo] * (1.0 - frac) + samples[lo + 1] * frac)
+}
+
+#[allow(dead_code)]
+fn hrpd_reverse_composite_reference(
+    abs_chip: u64,
+    chip: usize,
+    pn: &[(f32, f32)],
+    lc_i: &[f32],
+    lc_q: &[f32],
+    mask: HrpdTrafficMaskCandidate,
+) -> Complex32 {
+    let pair_chip = if (abs_chip & 1) == (mask.q_pair_phase & 1) {
+        chip
+    } else {
+        chip.saturating_sub(1)
+    };
+    hrpd_reverse_pilot_reference_from_signs(
+        abs_chip & 0x7fff,
+        pn[chip].0,
+        pn[pair_chip].1,
+        lc_i[chip],
+        lc_q[pair_chip],
+        mask.q_sign,
+        mask.q_pair_phase,
+    )
+}
+
+#[allow(dead_code)]
+fn hrpd_reverse_traffic_pilot_reference(
+    abs_chip: u64,
+    chip: usize,
+    pn: &[(f32, f32)],
+    lc_i: &[f32],
+    lc_q: &[f32],
+    mask: HrpdTrafficMaskCandidate,
+) -> Complex32 {
+    hrpd_reverse_composite_reference(abs_chip, chip, pn, lc_i, lc_q, mask)
+}
+
+#[allow(dead_code)]
+fn hrpd_reverse_terminal_pn_signs(start_chip: u64, len: usize) -> Vec<(f32, f32)> {
+    let mut pn = HrpdAccessTerminalPnSequence::new(0, 32768);
+    pn.advance_chips(start_chip % 32768);
+    (0..len)
+        .map(|_| {
+            let v = pn.generate_iq();
+            (v.re, v.im)
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+fn hrpd_long_code_signs_at_phase(mask: u64, start_chip: u64, len: usize) -> Vec<f32> {
+    let mut lc = LongCodeGenerator::new(mask);
+    lc.set_state(HRPD_LONG_CODE_INITIAL_STATE);
+    let mut phase = (start_chip % 32768) as usize;
+    lc.advance_chips(phase);
+    let mut out = Vec::with_capacity(len);
+    for idx in 0..len {
+        if idx > 0 && phase == 0 {
+            lc.set_state(HRPD_LONG_CODE_INITIAL_STATE);
+        }
+        out.push(if lc.next_chip() == 1 { -1.0 } else { 1.0 });
+        phase = (phase + 1) & 0x7fff;
+    }
+    out
+}
+
+fn emit_hrpd_access_outputs(
+    outputs: Vec<SampleBlock>,
+    color_code: u8,
+    sector_pilot_pn: u16,
+    event_tx: &Option<tokio_mpsc::UnboundedSender<HrpdAccessIndication>>,
+) {
+    for blk in outputs {
+        if let Some(indication) = build_hrpd_access_indication(&blk, color_code, sector_pilot_pn) {
+            let message_summary = indication
+                .messages
+                .iter()
+                .map(|message| format!("{message:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            info!(
+                "rx_hrpd_access_event: chip={} ati={:?} messages={} [{}]",
+                indication.absolute_chip,
+                indication.ati,
+                indication.messages.len(),
+                message_summary
+            );
+            if let Some(tx) = event_tx {
+                let _ = tx.send(indication);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct StageTiming {
     name: &'static str,
@@ -336,6 +1069,12 @@ struct StageTiming {
 pub(super) struct RxRuntime {
     config: RxSettings,
     processors: Vec<PipelineProcessorShared>,
+    one_x_rx_slice: Option<RxCarrierSlice>,
+    hrpd_processors: Option<Vec<PipelineProcessorShared>>,
+    hrpd_rx_slice: Option<RxCarrierSlice>,
+    hrpd_access_thread: Option<HrpdAccessRxThread>,
+    hrpd_traffic_threads: Vec<HrpdTrafficRxThread>,
+    pipeline_oversample: usize,
     capture_writer: Option<WavWriter<BufWriter<std::fs::File>>>,
     capture_target_samples: Option<usize>,
     captured_samples: usize,
@@ -358,10 +1097,286 @@ pub(super) struct RxRuntime {
     timing_total_us: u64,
     timing_total_max_us: u64,
     stage_timings: Vec<StageTiming>,
+    hrpd_stage_timings: Vec<StageTiming>,
+    last_pipeline_lag_warn: Option<Instant>,
+    last_pipeline_lag_warn_deficit_ms: u64,
     /// Deferred capture stop: the StopCapture command sets this so the
     /// capture continues until the next RX buffer is written, preventing
     /// truncation of samples already buffered in the reader channel.
     pending_capture_stop: Option<oneshot::Sender<Result<IqCaptureControlResult, String>>>,
+    /// Continuity tracking for the capture stream. The receiver workers
+    /// reconcile hardware stream gaps (USB overruns) by inserting or
+    /// dropping samples against the hardware timestamps; the capture must
+    /// apply the same correction or every sample after a gap sits at the
+    /// wrong offset in the WAV and a replay decodes nothing there.
+    capture_expected_abs_sample: Option<u64>,
+    capture_last_tail: Option<Complex32>,
+}
+
+#[derive(Debug, Clone)]
+struct CarrierSliceBlock {
+    samples: Vec<Complex32>,
+    relative_sample_start: usize,
+    absolute_sample_start: u64,
+    absolute_chip_start: u64,
+    sample_rate_hz: usize,
+}
+
+/// Extracts one carrier from the composite reverse stream: mixes it to
+/// baseband, anti-alias filters, and decimates to 4x chip rate. Mixing,
+/// filtering, and decimation run in a single fused pass over the input — the
+/// filter computes a tap dot-product only at the kept (decimated) output
+/// positions, and the mixer is a phasor recurrence ([`PhasorNco`]) rather than
+/// a per-sample sine/cosine.
+struct RxCarrierSlice {
+    nco: PhasorNco,
+    decimation: usize,
+    output_sample_rate_hz: usize,
+    output_oversample: usize,
+    /// Anti-alias filter applied before decimation. `None` when decimation <= 1
+    /// (the slice is then a pure mixer pass-through).
+    anti_alias: Option<SymmetricComplexFir32>,
+}
+
+impl RxCarrierSlice {
+    fn new(
+        carrier_shift_hz: i64,
+        sample_rate_hz: usize,
+        chip_rate_hz: usize,
+    ) -> Result<Self, Error> {
+        let input_oversample = sample_rate_hz / chip_rate_hz.max(1);
+        if sample_rate_hz != input_oversample.saturating_mul(chip_rate_hz) {
+            return Err(format!(
+                "rx: sample_rate_hz={} must be an integer multiple of chip_rate_hz={}",
+                sample_rate_hz, chip_rate_hz
+            )
+            .into());
+        }
+        if input_oversample < 4 || input_oversample % 4 != 0 {
+            return Err(format!(
+                "rx: sample_rate_hz={} gives oversample={}x; carrier slicing expects a multiple of 4x chip rate",
+                sample_rate_hz, input_oversample
+            )
+            .into());
+        }
+        let decimation = (input_oversample / 4).max(1);
+        let output_sample_rate_hz = sample_rate_hz / decimation;
+        let output_oversample = output_sample_rate_hz / chip_rate_hz.max(1);
+        // Mix down to baseband: negate the carrier shift.
+        let phase_step_rad = if carrier_shift_hz == 0 || sample_rate_hz == 0 {
+            0.0
+        } else {
+            -2.0 * PI * carrier_shift_hz as f64 / sample_rate_hz as f64
+        };
+        let anti_alias = (decimation > 1).then(|| {
+            SymmetricComplexFir32::new(&carrier_slice_anti_alias_taps(
+                decimation,
+                sample_rate_hz,
+                chip_rate_hz,
+            ))
+        });
+        Ok(Self {
+            nco: PhasorNco::new(phase_step_rad),
+            decimation,
+            output_sample_rate_hz,
+            output_oversample,
+            anti_alias,
+        })
+    }
+
+    fn process(
+        &mut self,
+        mut samples: Vec<Complex32>,
+        raw_relative_sample_start: usize,
+        raw_absolute_sample_start: u64,
+    ) -> CarrierSliceBlock {
+        self.process_in_place(
+            &mut samples,
+            raw_relative_sample_start,
+            raw_absolute_sample_start,
+        )
+    }
+
+    fn process_in_place(
+        &mut self,
+        samples: &mut [Complex32],
+        raw_relative_sample_start: usize,
+        raw_absolute_sample_start: u64,
+    ) -> CarrierSliceBlock {
+        let oversample = self.output_oversample.max(1) as u64;
+        let output_sample_rate_hz = self.output_sample_rate_hz;
+
+        // Pass-through path: no decimation, so no anti-alias filter. Apply only
+        // the NCO mix (a no-op for a zero shift).
+        let Some(fir) = self.anti_alias.as_mut() else {
+            self.nco.rotate_in_place(samples);
+            return CarrierSliceBlock {
+                samples: samples.to_vec(),
+                relative_sample_start: raw_relative_sample_start,
+                absolute_sample_start: raw_absolute_sample_start,
+                absolute_chip_start: raw_absolute_sample_start / oversample,
+                sample_rate_hz: output_sample_rate_hz,
+            };
+        };
+
+        // Fused mix + anti-alias filter + decimate. A kept output is emitted at
+        // absolute sample positions that are multiples of the decimation
+        // factor; only those positions pay for the tap dot-product.
+        let nco = &mut self.nco;
+        let d = self.decimation as u64;
+        let first_idx = ((d - raw_absolute_sample_start % d) % d) as usize;
+        let mut out =
+            Vec::with_capacity(samples.len().saturating_sub(first_idx).div_ceil(d as usize));
+        for (m, sample) in samples.iter().copied().enumerate() {
+            let mixed = nco.mix(sample);
+            let emit = (raw_absolute_sample_start + m as u64) % d == 0;
+            if let Some(filtered) = fir.process_sample_if(mixed, emit) {
+                out.push(filtered);
+            }
+        }
+
+        let absolute_sample_start = (raw_absolute_sample_start + first_idx as u64) / d;
+        let relative_sample_start = (raw_relative_sample_start + first_idx) / self.decimation;
+        CarrierSliceBlock {
+            samples: out,
+            relative_sample_start,
+            absolute_sample_start,
+            absolute_chip_start: absolute_sample_start / oversample,
+            sample_rate_hz: output_sample_rate_hz,
+        }
+    }
+
+    fn process_pair(
+        one_x: &mut Self,
+        hrpd: &mut Self,
+        samples: Vec<Complex32>,
+        raw_relative_sample_start: usize,
+        raw_absolute_sample_start: u64,
+    ) -> (CarrierSliceBlock, CarrierSliceBlock) {
+        if one_x.decimation != hrpd.decimation
+            || one_x.output_oversample != hrpd.output_oversample
+            || one_x.output_sample_rate_hz != hrpd.output_sample_rate_hz
+        {
+            let hrpd_block = hrpd.process(
+                samples.clone(),
+                raw_relative_sample_start,
+                raw_absolute_sample_start,
+            );
+            let one_x_block = one_x.process(
+                samples,
+                raw_relative_sample_start,
+                raw_absolute_sample_start,
+            );
+            return (one_x_block, hrpd_block);
+        }
+
+        let Some(one_x_fir) = one_x.anti_alias.as_mut() else {
+            let mut one_x_samples = samples.clone();
+            one_x.nco.rotate_in_place(&mut one_x_samples);
+            let hrpd_block = hrpd.process(
+                samples,
+                raw_relative_sample_start,
+                raw_absolute_sample_start,
+            );
+            let oversample = one_x.output_oversample.max(1) as u64;
+            let one_x_block = CarrierSliceBlock {
+                samples: one_x_samples,
+                relative_sample_start: raw_relative_sample_start,
+                absolute_sample_start: raw_absolute_sample_start,
+                absolute_chip_start: raw_absolute_sample_start / oversample,
+                sample_rate_hz: one_x.output_sample_rate_hz,
+            };
+            return (one_x_block, hrpd_block);
+        };
+        let Some(hrpd_fir) = hrpd.anti_alias.as_mut() else {
+            let mut hrpd_samples = samples.clone();
+            hrpd.nco.rotate_in_place(&mut hrpd_samples);
+            let one_x_block = one_x.process(
+                samples,
+                raw_relative_sample_start,
+                raw_absolute_sample_start,
+            );
+            let oversample = hrpd.output_oversample.max(1) as u64;
+            let hrpd_block = CarrierSliceBlock {
+                samples: hrpd_samples,
+                relative_sample_start: raw_relative_sample_start,
+                absolute_sample_start: raw_absolute_sample_start,
+                absolute_chip_start: raw_absolute_sample_start / oversample,
+                sample_rate_hz: hrpd.output_sample_rate_hz,
+            };
+            return (one_x_block, hrpd_block);
+        };
+
+        let d = one_x.decimation as u64;
+        let first_idx = ((d - raw_absolute_sample_start % d) % d) as usize;
+        let out_capacity = samples.len().saturating_sub(first_idx).div_ceil(d as usize);
+        let mut one_x_out = Vec::with_capacity(out_capacity);
+        let mut hrpd_out = Vec::with_capacity(out_capacity);
+        for (m, sample) in samples.into_iter().enumerate() {
+            let emit = (raw_absolute_sample_start + m as u64) % d == 0;
+            let one_x_mixed = one_x.nco.mix(sample);
+            if let Some(filtered) = one_x_fir.process_sample_if(one_x_mixed, emit) {
+                one_x_out.push(filtered);
+            }
+            let hrpd_mixed = hrpd.nco.mix(sample);
+            if let Some(filtered) = hrpd_fir.process_sample_if(hrpd_mixed, emit) {
+                hrpd_out.push(filtered);
+            }
+        }
+
+        let absolute_sample_start = (raw_absolute_sample_start + first_idx as u64) / d;
+        let relative_sample_start = (raw_relative_sample_start + first_idx) / one_x.decimation;
+        let absolute_chip_start = absolute_sample_start / one_x.output_oversample.max(1) as u64;
+        (
+            CarrierSliceBlock {
+                samples: one_x_out,
+                relative_sample_start,
+                absolute_sample_start,
+                absolute_chip_start,
+                sample_rate_hz: one_x.output_sample_rate_hz,
+            },
+            CarrierSliceBlock {
+                samples: hrpd_out,
+                relative_sample_start,
+                absolute_sample_start,
+                absolute_chip_start,
+                sample_rate_hz: hrpd.output_sample_rate_hz,
+            },
+        )
+    }
+}
+
+fn carrier_slice_anti_alias_taps(
+    decimation: usize,
+    sample_rate_hz: usize,
+    chip_rate_hz: usize,
+) -> Vec<f64> {
+    let taps = 63usize;
+    let center = (taps - 1) as f64 / 2.0;
+    let nyquist = sample_rate_hz as f64 / 2.0;
+    let alias_cutoff = sample_rate_hz as f64 / (2.0 * decimation as f64) * 0.82;
+    let occupied_cutoff = chip_rate_hz as f64 * 1.25;
+    let cutoff_hz = alias_cutoff.min(occupied_cutoff).min(nyquist * 0.95);
+    let fc = cutoff_hz / sample_rate_hz as f64;
+    let mut out = Vec::with_capacity(taps);
+    for n in 0..taps {
+        let x = n as f64 - center;
+        let sinc = if x.abs() < f64::EPSILON {
+            2.0 * fc
+        } else {
+            (2.0 * PI * fc * x).sin() / (PI * x)
+        };
+        let window = 0.42 - 0.5 * (2.0 * PI * n as f64 / (taps - 1) as f64).cos()
+            + 0.08 * (4.0 * PI * n as f64 / (taps - 1) as f64).cos();
+        out.push(sinc * window);
+    }
+    let gain: f64 = out.iter().sum();
+    if gain.abs() > f64::EPSILON {
+        for tap in &mut out {
+            *tap /= gain;
+        }
+    }
+    out
 }
 
 use rx_capture::{ActiveCapture, PendingCaptureStart};
@@ -398,6 +1413,22 @@ fn reconcile_traffic_stream_continuity(
     expected_absolute_sample_start: Option<u64>,
     previous_tail_sample: Option<Complex32>,
 ) -> TrafficContinuityBlock {
+    reconcile_traffic_stream_continuity_with_max_insert(
+        raw_samples,
+        raw_absolute_sample_start,
+        expected_absolute_sample_start,
+        previous_tail_sample,
+        None,
+    )
+}
+
+fn reconcile_traffic_stream_continuity_with_max_insert(
+    raw_samples: Vec<Complex32>,
+    raw_absolute_sample_start: u64,
+    expected_absolute_sample_start: Option<u64>,
+    previous_tail_sample: Option<Complex32>,
+    max_insert_samples: Option<usize>,
+) -> TrafficContinuityBlock {
     let Some(expected_start) = expected_absolute_sample_start else {
         return TrafficContinuityBlock {
             samples: raw_samples,
@@ -409,6 +1440,16 @@ fn reconcile_traffic_stream_continuity(
 
     if raw_absolute_sample_start > expected_start {
         let gap = (raw_absolute_sample_start - expected_start) as usize;
+        if let Some(max_insert) = max_insert_samples {
+            if gap > max_insert {
+                return TrafficContinuityBlock {
+                    samples: raw_samples,
+                    absolute_sample_start: raw_absolute_sample_start,
+                    inserted_samples: 0,
+                    dropped_samples: 0,
+                };
+            }
+        }
         let Some(previous_tail) = previous_tail_sample else {
             return TrafficContinuityBlock {
                 samples: raw_samples,
@@ -466,6 +1507,11 @@ struct CaptureMetadataFile {
     wav_path: String,
     sample_rate_hz: usize,
     chip_rate_hz: usize,
+    rx_center_frequency_hz: Option<usize>,
+    one_x_reverse_frequency_hz: Option<usize>,
+    one_x_rx_shift_hz: i64,
+    hrpd_reverse_frequency_hz: Option<usize>,
+    hrpd_rx_shift_hz: Option<i64>,
     first_absolute_chip_start: u64,
     first_absolute_sample_start: u64,
     first_sample_system_time_rfc3339: String,
@@ -479,9 +1525,14 @@ pub(super) fn open_rx_runtime(rx: RxSettings) -> Result<RxRuntime, Error> {
         info!("rx: startup IQ capture disabled; use gRPC start/stop capture controls");
     }
     info!(
-        "rx: sample_rate_hz={} chip_rate_hz={} capture=<ui-driven> hw_start_ns={:?} absolute_chip_start={:?} rx_sample_delay={}",
+        "rx: sample_rate_hz={} chip_rate_hz={} center_freq_hz={:?} 1x_reverse_hz={:?} 1x_shift_hz={:+} hrpd_reverse_hz={:?} hrpd_shift_hz={:?} capture=<ui-driven> hw_start_ns={:?} absolute_chip_start={:?} rx_sample_delay={}",
         rx.sample_rate_hz,
         rx.chip_rate_hz,
+        rx.rx_center_frequency_hz,
+        rx.one_x_reverse_frequency_hz,
+        rx.one_x_rx_shift_hz,
+        rx.hrpd_reverse_frequency_hz,
+        rx.hrpd_rx_shift_hz,
         rx.hardware_start_time_ns,
         rx.absolute_chip_start,
         rx.rx_sample_delay,
@@ -493,30 +1544,28 @@ pub(super) fn open_rx_runtime(rx: RxSettings) -> Result<RxRuntime, Error> {
         hardware_start_time_ns, rx.absolute_chip_start
     );
     let oversample = rx.sample_rate_hz / rx.chip_rate_hz;
+    let one_x_rx_slice = rx
+        .one_x_enabled
+        .then(|| RxCarrierSlice::new(rx.one_x_rx_shift_hz, rx.sample_rate_hz, rx.chip_rate_hz))
+        .transpose()?;
     let absolute_chip_origin = rx.absolute_chip_start;
     let absolute_sample_origin = absolute_chip_origin.saturating_mul(oversample as u64);
     let capture_writer = None;
     let capture_target_samples = None;
-    let processors = reverse_access_chain(ReverseAccessSettings {
-        oversample,
-        access_channel_number: rx.access_channel_number,
-        paging_channel_number: rx.paging_channel_number,
-        base_id: rx.base_id,
-        pilot_pn: rx.pilot_pn,
-        long_code_state: 1u64 << 41,
-        rake_fast_path: false,
-        fixed_finger_phase: None,
-        reanchor_origin: rx.reanchor_origin,
-        finger_pool_size: rx.reverse_access_finger_pool_size,
-    });
-    info!(
-        "rx: stream already active from prime (oversample={} absolute_chip_origin={} absolute_sample_origin={})",
-        oversample, absolute_chip_origin, absolute_sample_origin
-    );
-
-    Ok(RxRuntime {
-        config: rx,
-        stage_timings: processors
+    let (processors, stage_timings) = if let Some(slice) = one_x_rx_slice.as_ref() {
+        let processors = reverse_access_chain(ReverseAccessSettings {
+            oversample: slice.output_oversample,
+            access_channel_number: rx.access_channel_number,
+            paging_channel_number: rx.paging_channel_number,
+            base_id: rx.base_id,
+            pilot_pn: rx.pilot_pn,
+            long_code_state: 1u64 << 41,
+            rake_fast_path: false,
+            fixed_finger_phase: None,
+            reanchor_origin: rx.reanchor_origin,
+            finger_pool_size: rx.reverse_access_finger_pool_size,
+        });
+        let timings = processors
             .iter()
             .map(|p| StageTiming {
                 name: p.name(),
@@ -524,8 +1573,77 @@ pub(super) fn open_rx_runtime(rx: RxSettings) -> Result<RxRuntime, Error> {
                 calls: 0,
                 max_us: 0,
             })
-            .collect(),
+            .collect();
+        (processors, timings)
+    } else {
+        info!("rx: 1x carrier slice, access correlator, and traffic chains disabled");
+        (Vec::new(), Vec::new())
+    };
+    let (hrpd_rx_slice, hrpd_processors, hrpd_stage_timings) = if let (
+        Some(_hrpd_reverse_hz),
+        Some(hrpd_shift_hz),
+    ) =
+        (rx.hrpd_reverse_frequency_hz, rx.hrpd_rx_shift_hz)
+    {
+        let slice = RxCarrierSlice::new(hrpd_shift_hz, rx.sample_rate_hz, rx.chip_rate_hz)?;
+        let processors = hrpd_reverse_access_chain(HrpdReverseAccessSettings {
+            oversample: slice.output_oversample,
+            access_cycle_number: rx.hrpd_access_cycle_number,
+            sector_id_lsb: rx.hrpd_access_sector_id_lsb,
+            color_code: rx.hrpd_access_color_code,
+            reanchor_origin: rx.reanchor_origin,
+            snr_threshold: None,
+            finger_pool_size: rx.reverse_access_finger_pool_size,
+            preamble_frames: rx.hrpd_access_preamble_frames,
+            enhanced_access_rates: rx.hrpd_access_enhanced_rates,
+        });
+        let timings = processors
+            .iter()
+            .map(|p| StageTiming {
+                name: p.name(),
+                total_us: 0,
+                calls: 0,
+                max_us: 0,
+            })
+            .collect();
+        info!(
+            "rx: HRPD reverse access FFT frame correlator pipeline enabled shift_hz={:+} oversample={} sector_id_lsb=0x{:06x} color_code={} access_cycle={}",
+            hrpd_shift_hz,
+            slice.output_oversample,
+            rx.hrpd_access_sector_id_lsb & 0x00ff_ffff,
+            rx.hrpd_access_color_code,
+            rx.hrpd_access_cycle_number
+        );
+        (Some(slice), Some(processors), timings)
+    } else {
+        (None, None, Vec::new())
+    };
+    let active_rx_slice = one_x_rx_slice
+        .as_ref()
+        .or(hrpd_rx_slice.as_ref())
+        .ok_or_else(|| Error::from("rx: no reverse carrier slice configured"))?;
+    let pipeline_sample_rate_hz = active_rx_slice.output_sample_rate_hz;
+    let pipeline_oversample = active_rx_slice.output_oversample;
+    info!(
+        "rx: stream already active from prime (raw_oversample={} pipeline_oversample={} slice_decimation={} pipeline_sample_rate_hz={} absolute_chip_origin={} absolute_sample_origin={})",
+        oversample,
+        pipeline_oversample,
+        active_rx_slice.decimation,
+        pipeline_sample_rate_hz,
+        absolute_chip_origin,
+        absolute_sample_origin
+    );
+
+    Ok(RxRuntime {
+        config: rx,
+        stage_timings,
         processors,
+        one_x_rx_slice,
+        hrpd_processors,
+        hrpd_rx_slice,
+        hrpd_access_thread: None,
+        hrpd_traffic_threads: Vec::new(),
+        pipeline_oversample,
         capture_writer,
         capture_target_samples,
         captured_samples: 0,
@@ -547,8 +1665,28 @@ pub(super) fn open_rx_runtime(rx: RxSettings) -> Result<RxRuntime, Error> {
         timing_pipeline_us: 0,
         timing_total_us: 0,
         timing_total_max_us: 0,
+        hrpd_stage_timings,
+        last_pipeline_lag_warn: None,
+        last_pipeline_lag_warn_deficit_ms: 0,
         pending_capture_stop: None,
+        capture_expected_abs_sample: None,
+        capture_last_tail: None,
     })
+}
+
+fn start_hrpd_access_worker(runtime: &mut RxRuntime, shutdown: Arc<AtomicBool>) {
+    let Some(processors) = runtime.hrpd_processors.take() else {
+        return;
+    };
+    let stage_timings = std::mem::take(&mut runtime.hrpd_stage_timings);
+    runtime.hrpd_access_thread = Some(spawn_hrpd_access_rx_thread(
+        processors,
+        stage_timings,
+        runtime.config.hrpd_access_color_code,
+        runtime.config.pilot_pn,
+        runtime.config.hrpd_access_event_tx.clone(),
+        shutdown,
+    ));
 }
 
 /// Message sent from the reader thread to the processing thread.
@@ -585,6 +1723,11 @@ fn write_capture_metadata(runtime: &RxRuntime, active: &ActiveCapture) -> Result
         wav_path: active.wav_path.display().to_string(),
         sample_rate_hz: runtime.config.sample_rate_hz,
         chip_rate_hz: runtime.config.chip_rate_hz,
+        rx_center_frequency_hz: runtime.config.rx_center_frequency_hz,
+        one_x_reverse_frequency_hz: runtime.config.one_x_reverse_frequency_hz,
+        one_x_rx_shift_hz: runtime.config.one_x_rx_shift_hz,
+        hrpd_reverse_frequency_hz: runtime.config.hrpd_reverse_frequency_hz,
+        hrpd_rx_shift_hz: runtime.config.hrpd_rx_shift_hz,
         first_absolute_chip_start: active.first_absolute_chip_start,
         first_absolute_sample_start: active.first_absolute_sample_start,
         first_sample_system_time_rfc3339: active.first_sample_system_time.to_rfc3339(),
@@ -757,18 +1900,26 @@ pub(super) fn run_rx_loop(
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Error> {
     let mut runtime = open_rx_runtime(rx)?;
+    start_hrpd_access_worker(&mut runtime, shutdown.clone());
     let bearer_bts_id = runtime.config.base_id as u32;
     let bearer_cell_id: u32 = 1;
-    let target_batch_samples = rx_target_batch_samples(
+    let configured_batch_samples = rx_target_batch_samples(
         runtime.config.sample_rate_hz,
         runtime.config.chip_rate_hz,
         runtime.config.rx_batch_pcgs,
     );
+    let hrpd_enabled = runtime.hrpd_rx_slice.is_some();
+    let target_batch_samples = effective_rx_target_batch_samples(
+        runtime.config.sample_rate_hz,
+        runtime.config.chip_rate_hz,
+        runtime.config.rx_batch_pcgs,
+        hrpd_enabled,
+    );
     let target_batch_ms =
         target_batch_samples as f64 * 1000.0 / runtime.config.sample_rate_hz.max(1) as f64;
     info!(
-        "rx: live SDR target_batch_samples={} target_batch_ms={:.3}",
-        target_batch_samples, target_batch_ms
+        "rx: live SDR target_batch_samples={} target_batch_ms={:.3} configured_batch_samples={} hrpd_enabled={}",
+        target_batch_samples, target_batch_ms, configured_batch_samples, hrpd_enabled
     );
 
     // Drain samples while waiting for TX to publish its timing anchor.
@@ -871,60 +2022,72 @@ pub(super) fn run_rx_loop(
             let mut last_read = Instant::now();
             let mut read_count: u64 = 0;
             let mut max_gap_us: u64 = 0;
+            let mut max_receive_us: u64 = 0;
             let mut last_end_ticks: Option<u64> = None;
             let mut overflow_count: u64 = 0;
             while !shutdown_reader.load(Ordering::Relaxed) {
                 let since_last = last_read.elapsed();
+                let receive_start = Instant::now();
                 let result = radio_rx.rx_read(&mut buffer, 250_000)?;
+                let receive_us = receive_start.elapsed().as_micros() as u64;
+                max_receive_us = max_receive_us.max(receive_us);
                 last_read = Instant::now();
                 if result.overflow {
                     overflow_count += 1;
                     let gap_us = since_last.as_micros() as u64;
-                    if let Some(prev_end) = last_end_ticks {
-                        let gap_ticks = result.time_ticks.saturating_sub(prev_end);
-                        let gap_samples = (gap_ticks as u128 * sample_rate_hz as u128
-                            / tick_rate.max(1) as u128)
-                            as usize;
-                        if gap_samples > 2 {
-                            log::warn!(
-                                "rx: SDR overflow #{} — zero-filling {} samples \
-                                 ({:.3} ms). read_count={} gap_since_last_read={}us \
-                                 max_gap={}us",
-                                overflow_count,
-                                gap_samples,
-                                gap_samples as f64 * 1000.0 / sample_rate_hz.max(1) as f64,
-                                read_count,
-                                gap_us,
-                                max_gap_us,
-                            );
-                            let fill = vec![Complex32::new(0.0, 0.0); gap_samples];
-                            if tx
-                                .send(RxReaderMessage {
-                                    samples: fill,
-                                    time_ns: prev_end,
-                                    n: gap_samples,
-                                    enqueue_time: Instant::now(),
-                                    absolute_sample_start_override: None,
-                                })
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                    } else {
-                        log::warn!(
-                            "rx: SDR overflow #{} on first read — \
-                             cannot zero-fill (no prior timestamp). \
-                             read_count={} gap_since_last_read={}us",
-                            overflow_count,
-                            read_count,
-                            gap_us,
-                        );
-                    }
+                    log::warn!(
+                        "rx: SDR overflow #{} metadata_samples={} metadata_time_ticks={} \
+                         read_count={} gap_since_last_read={}us max_gap={}us \
+                         receive={}us max_receive={}us",
+                        overflow_count,
+                        result.samples_read,
+                        result.time_ticks,
+                        read_count,
+                        gap_us,
+                        max_gap_us,
+                        receive_us,
+                        max_receive_us,
+                    );
                 }
                 let n = result.samples_read;
                 if n == 0 {
                     continue;
+                }
+                if let Some(prev_end) = last_end_ticks {
+                    let gap_ticks = result.time_ticks.saturating_sub(prev_end);
+                    let gap_samples = (gap_ticks as u128 * sample_rate_hz as u128
+                        / tick_rate.max(1) as u128) as usize;
+                    if gap_samples > 2 {
+                        log::warn!(
+                            "rx: SDR timestamp gap after_overflows={} zero_filling_samples={} \
+                             gap_ms={:.3} previous_end_ticks={} current_start_ticks={} \
+                             read_count={} gap_since_last_read={}us max_gap={}us \
+                             receive={}us max_receive={}us",
+                            overflow_count,
+                            gap_samples,
+                            gap_samples as f64 * 1000.0 / sample_rate_hz.max(1) as f64,
+                            prev_end,
+                            result.time_ticks,
+                            read_count,
+                            since_last.as_micros(),
+                            max_gap_us,
+                            receive_us,
+                            max_receive_us,
+                        );
+                        let fill = vec![Complex32::new(0.0, 0.0); gap_samples];
+                        if tx
+                            .send(RxReaderMessage {
+                                samples: fill,
+                                time_ns: prev_end,
+                                n: gap_samples,
+                                enqueue_time: Instant::now(),
+                                absolute_sample_start_override: None,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                 }
                 read_count += 1;
                 let gap_us = since_last.as_micros() as u64;
@@ -984,6 +2147,7 @@ fn process_rx_message(
     let oversample = (runtime.config.sample_rate_hz / runtime.config.chip_rate_hz).max(1);
     let iter_start = Instant::now();
     let reader_queue_us = msg.enqueue_time.elapsed().as_micros() as u64;
+    let rx_read_completed_at = msg.enqueue_time;
     let n = msg.n;
 
     // Compute absolute sample position from this buffer's hardware timestamp.
@@ -996,10 +2160,11 @@ fn process_rx_message(
         (delta_ns as u128) * runtime.config.sample_rate_hz as u128
             / runtime.config.tick_rate as u128
     };
-    // Subtract the calibrated RX pipeline delay so a received sample is
-    // labeled with the absolute sample number at which it was transmitted.
-    let elapsed_samples =
-        raw_elapsed_samples.saturating_sub(runtime.config.rx_sample_delay as u128) as u64;
+    // Subtract the calibrated RX pipeline delay, scaled from its 4×-chip basis
+    // to the derived RX rate, so a received sample is labeled with the absolute
+    // sample number at which it was transmitted.
+    let scaled_delay = scaled_rx_sample_delay(runtime.config.rx_sample_delay, oversample);
+    let elapsed_samples = raw_elapsed_samples.saturating_sub(scaled_delay as u128) as u64;
     let absolute_sample_start = msg.absolute_sample_start_override.unwrap_or_else(|| {
         runtime
             .absolute_sample_origin
@@ -1022,52 +2187,173 @@ fn process_rx_message(
 
     // Write capture after chip position is known so deferred WAV creation
     // can use the real first-sample chip for the filename.
+    let raw_samples = msg.samples;
     let capture_start = Instant::now();
-    maybe_write_capture(runtime, &msg.samples)?;
+    maybe_write_capture(runtime, &raw_samples)?;
     let capture_us = capture_start.elapsed().as_micros() as u64;
 
-    let relative_sample_start = runtime.next_sample_index;
-
-    // Clone samples for traffic RX threads if any are active or pending.
-    let has_traffic = !traffic_threads.is_empty()
-        || runtime
-            .config
-            .traffic_rx_pool
-            .as_ref()
-            .is_some_and(|p| !p.lock().is_empty());
-    let traffic_block_msg = if has_traffic {
-        Some(TrafficRxBlock {
-            samples: msg.samples.clone(),
-            relative_sample_start,
-            absolute_chip_start,
-            absolute_sample_start,
-            sample_rate_hz: runtime.config.sample_rate_hz,
-            hw_time_ns: msg.time_ns,
-            enqueue_time: std::time::Instant::now(),
-        })
-    } else {
-        None
+    let raw_relative_sample_start = runtime.next_sample_index;
+    if let Some(ref queue) = runtime.config.hrpd_traffic_rx_queue {
+        // Drain the synth thread's lock-free command stream in FIFO order so
+        // assign/release ordering for a reused MAC index is preserved.
+        while let Some(command) = queue.pop() {
+            match command {
+                HrpdTrafficRxCommand::Release(release) => {
+                    runtime.hrpd_traffic_threads.retain(|thread| {
+                        let matches =
+                            thread.uati == release.uati && thread.mac_index == release.mac_index;
+                        if matches {
+                            info!(
+                                "rx: stopping HRPD reverse traffic receiver uati=0x{:08x} mac={} (released)",
+                                thread.uati, thread.mac_index
+                            );
+                        }
+                        !matches
+                    });
+                }
+                HrpdTrafficRxCommand::Assign(assignment) => {
+                    if runtime
+                        .hrpd_traffic_threads
+                        .iter()
+                        .any(|t| t.uati == assignment.uati && t.mac_index == assignment.mac_index)
+                    {
+                        continue;
+                    }
+                    let Some(hrpd_slice) = runtime.hrpd_rx_slice.as_ref() else {
+                        warn!(
+                            "rx: HRPD traffic assignment ignored without HRPD reverse RX slice uati=0x{:08x} mac={}",
+                            assignment.uati, assignment.mac_index
+                        );
+                        continue;
+                    };
+                    info!(
+                        "rx: starting HRPD reverse traffic receiver uati=0x{:08x} mac={} shift_hz={:+}",
+                        assignment.uati,
+                        assignment.mac_index,
+                        runtime.config.hrpd_rx_shift_hz.unwrap_or(0)
+                    );
+                    let thread = spawn_hrpd_traffic_rx_thread(
+                        hrpd_slice.output_oversample.max(1),
+                        assignment,
+                        runtime.config.hrpd_traffic_event_tx.clone(),
+                        runtime.config.hrpd_harq_bus.clone(),
+                        Arc::new(AtomicBool::new(false)),
+                    );
+                    // No history replay: the worker spawns before the TCA airs,
+                    // so pre-spawn IQ cannot contain the AT's reverse pilot. The
+                    // worker starts at the next live block and the stream stays
+                    // contiguous from there.
+                    runtime.hrpd_traffic_threads.push(thread);
+                }
+            }
+        }
+    }
+    let (one_x_block, hrpd_block) = match (
+        runtime.one_x_rx_slice.as_mut(),
+        runtime.hrpd_rx_slice.as_mut(),
+    ) {
+        (Some(one_x_slice), Some(hrpd_slice)) => {
+            let (one_x_block, hrpd_block) = RxCarrierSlice::process_pair(
+                one_x_slice,
+                hrpd_slice,
+                raw_samples,
+                raw_relative_sample_start,
+                absolute_sample_start,
+            );
+            (Some(one_x_block), Some(hrpd_block))
+        }
+        (Some(one_x_slice), None) => (
+            Some(one_x_slice.process(
+                raw_samples,
+                raw_relative_sample_start,
+                absolute_sample_start,
+            )),
+            None,
+        ),
+        (None, Some(hrpd_slice)) => (
+            None,
+            Some(hrpd_slice.process(
+                raw_samples,
+                raw_relative_sample_start,
+                absolute_sample_start,
+            )),
+        ),
+        (None, None) => return Err("rx: no reverse carrier slice configured".into()),
     };
 
-    let mut block = SampleBlock::new(msg.samples, relative_sample_start)
-        .with_sample_rate_hz(runtime.config.sample_rate_hz as f64);
-    block
-        .tags
-        .insert("absolute_chip_start", absolute_chip_start as i64);
-    block
-        .tags
-        .insert("absolute_sample_start", absolute_sample_start as i64);
-    runtime.next_sample_index = relative_sample_start.saturating_add(n);
+    // Keep the HRPD Access Channel correlator fed even while a reverse traffic
+    // assignment has pilot lock; all HRPD consumers share this one sliced block.
+    if let Some(hrpd_block) = hrpd_block.as_ref() {
+        if let Some(thread) = runtime.hrpd_access_thread.as_ref() {
+            let _ = thread.tx.send(HrpdAccessRxBlock {
+                block: hrpd_block.clone(),
+                enqueue_time: Instant::now(),
+            });
+        }
+        runtime.hrpd_traffic_threads.retain(|thread| {
+            send_hrpd_traffic_rx_block(
+                thread,
+                HrpdTrafficRxBlock {
+                    samples: hrpd_block.samples.clone(),
+                    absolute_sample_start: hrpd_block.absolute_sample_start,
+                    sample_rate_hz: hrpd_block.sample_rate_hz,
+                    rx_read_completed_at,
+                    enqueue_time: Instant::now(),
+                },
+            )
+        });
+    } else {
+        runtime.hrpd_traffic_threads.clear();
+    }
+
+    // Clone samples for traffic RX threads if any are active or pending.
+    let has_traffic = one_x_block.is_some()
+        && (!traffic_threads.is_empty()
+            || runtime
+                .config
+                .traffic_rx_pool
+                .as_ref()
+                .is_some_and(|p| !p.lock().is_empty()));
+    let traffic_block_msg =
+        one_x_block
+            .as_ref()
+            .filter(|_| has_traffic)
+            .map(|block| TrafficRxBlock {
+                samples: block.samples.clone(),
+                relative_sample_start: block.relative_sample_start,
+                absolute_chip_start: block.absolute_chip_start,
+                absolute_sample_start: block.absolute_sample_start,
+                sample_rate_hz: block.sample_rate_hz,
+                hw_time_ns: msg.time_ns,
+                enqueue_time: std::time::Instant::now(),
+            });
+
+    runtime.next_sample_index = raw_relative_sample_start.saturating_add(n);
 
     let pipeline_start = Instant::now();
-    let mut access_emitter = VecEmitter::new();
-    let mut outputs = run_sub_chain_timed(
-        &mut runtime.processors,
-        block,
-        &mut runtime.stage_timings,
-        &mut access_emitter,
-    );
-    outputs.extend(access_emitter.blocks);
+    let outputs = if let Some(one_x_block) = one_x_block {
+        let mut block = SampleBlock::new(one_x_block.samples, one_x_block.relative_sample_start)
+            .with_sample_rate_hz(one_x_block.sample_rate_hz as f64);
+        block.tags.insert(
+            "absolute_chip_start",
+            one_x_block.absolute_chip_start as i64,
+        );
+        block.tags.insert(
+            "absolute_sample_start",
+            one_x_block.absolute_sample_start as i64,
+        );
+        let mut access_emitter = VecEmitter::new();
+        let mut outputs = run_sub_chain_timed(
+            &mut runtime.processors,
+            block,
+            &mut runtime.stage_timings,
+            &mut access_emitter,
+        );
+        outputs.extend(access_emitter.blocks);
+        outputs
+    } else {
+        Vec::new()
+    };
     let pipeline_us = pipeline_start.elapsed().as_micros() as u64;
     for blk in outputs {
         if blk.tags.get("access_preamble_detected") == Some(&1) {
@@ -1165,7 +2451,9 @@ fn process_rx_message(
     // Remove traffic channel RX threads that the BSC has torn down.
     // Signal shutdown first so the thread exits even if its channel is full,
     // then drop the sender to unblock any recv().
-    if let Some(ref removals) = runtime.config.traffic_rx_removals {
+    if runtime.one_x_rx_slice.is_some()
+        && let Some(ref removals) = runtime.config.traffic_rx_removals
+    {
         let mut codes = removals.lock();
         for walsh_code in codes.drain(..) {
             let before = traffic_threads.len();
@@ -1182,7 +2470,9 @@ fn process_rx_message(
     }
 
     // Check for new traffic channel RX requests from the BSC.
-    if let Some(ref pool) = runtime.config.traffic_rx_pool {
+    if runtime.one_x_rx_slice.is_some()
+        && let Some(ref pool) = runtime.config.traffic_rx_pool
+    {
         let mut requests = pool.lock();
         for req in requests.drain(..) {
             let use_rc3 = req.assigned_rev_rc >= 3;
@@ -1193,7 +2483,7 @@ fn process_rx_message(
                 if use_rc3 { "RC3" } else { "RC1" }
             );
             traffic_threads.push(spawn_traffic_rx_thread(
-                oversample,
+                runtime.pipeline_oversample,
                 req.walsh_code,
                 req.esn,
                 req.preamble_num_pcgs,
@@ -1250,20 +2540,29 @@ fn process_rx_message(
         / runtime.config.sample_rate_hz.max(1) as u128) as u64;
     if runtime.timing_total_us > cumulative_budget_us {
         let deficit_ms = (runtime.timing_total_us - cumulative_budget_us) / 1000;
-        let top_stage = runtime
-            .stage_timings
-            .iter()
-            .max_by_key(|s| s.total_us)
-            .map(|s| format!("{}:{}ms", s.name, s.total_us / 1000))
-            .unwrap_or_else(|| "n/a".to_string());
-        warn!(
-            "rx_pipeline_falling_behind: deficit={}ms pipeline={}us this_block={}us avg_rt={:.2}x top_stage={}",
-            deficit_ms,
-            pipeline_us,
-            total_us,
-            cumulative_budget_us as f64 / runtime.timing_total_us.max(1) as f64,
-            top_stage,
-        );
+        let should_warn = runtime
+            .last_pipeline_lag_warn
+            .is_none_or(|last| last.elapsed() >= Duration::from_millis(500))
+            || deficit_ms >= runtime.last_pipeline_lag_warn_deficit_ms.saturating_add(25);
+        if should_warn {
+            let top_stage = runtime
+                .stage_timings
+                .iter()
+                .chain(runtime.hrpd_stage_timings.iter())
+                .max_by_key(|s| s.total_us)
+                .map(|s| format!("{}:{}ms", s.name, s.total_us / 1000))
+                .unwrap_or_else(|| "n/a".to_string());
+            warn!(
+                "rx_pipeline_falling_behind: deficit={}ms pipeline={}us this_block={}us avg_rt={:.2}x top_stage={}",
+                deficit_ms,
+                pipeline_us,
+                total_us,
+                cumulative_budget_us as f64 / runtime.timing_total_us.max(1) as f64,
+                top_stage,
+            );
+            runtime.last_pipeline_lag_warn = Some(Instant::now());
+            runtime.last_pipeline_lag_warn_deficit_ms = deficit_ms;
+        }
     }
 
     let interval_elapsed = runtime.timing_interval_start.elapsed();
@@ -1277,7 +2576,7 @@ fn process_rx_message(
         } else {
             f64::INFINITY
         };
-        debug!(
+        log::trace!(
             "rx_hardware_heartbeat: hw_time_ns={} absolute_chip_start={} t20={} abs_sample_start={}",
             runtime.last_hardware_time_ns,
             runtime.last_absolute_chip_start,
@@ -1287,7 +2586,7 @@ fn process_rx_message(
             )),
             runtime.last_absolute_sample_start
         );
-        debug!(
+        log::trace!(
             "rx_timing: wall={}ms reads={} samples={} capture={}ms pipeline={}ms total={}ms(avg={}us max={}us) rt={:.2}x",
             wall_ms,
             runtime.timing_reads,
@@ -1300,7 +2599,7 @@ fn process_rx_message(
             interval_rt
         );
         if !runtime.stage_timings.is_empty() {
-            debug!(
+            log::trace!(
                 "rx_pipeline_budget: sample_budget={}ms pipeline_actual={}ms",
                 sample_budget_us / 1000,
                 runtime.timing_pipeline_us / 1000,
@@ -1322,7 +2621,7 @@ fn process_rx_message(
                 } else {
                     f64::INFINITY
                 };
-                debug!(
+                log::trace!(
                     "rx_pipeline_stage: stg={} name={} actual={}ms budget={}ms avg={}us max={}us pct_pipeline={:.1}% pct_budget={:.1}% rt={:.2}x",
                     idx,
                     stage.name,
@@ -1383,7 +2682,14 @@ fn process_rx_message(
         runtime.timing_pipeline_us = 0;
         runtime.timing_total_us = 0;
         runtime.timing_total_max_us = 0;
+        runtime.last_pipeline_lag_warn = None;
+        runtime.last_pipeline_lag_warn_deficit_ms = 0;
         for stage in &mut runtime.stage_timings {
+            stage.total_us = 0;
+            stage.calls = 0;
+            stage.max_us = 0;
+        }
+        for stage in &mut runtime.hrpd_stage_timings {
             stage.total_us = 0;
             stage.calls = 0;
             stage.max_us = 0;
@@ -1435,6 +2741,7 @@ pub(super) fn run_injected_rx_loop(
 ) -> Result<(), Error> {
     let oversample = (rx.sample_rate_hz / rx.chip_rate_hz).max(1) as u64;
     let mut runtime = open_rx_runtime(rx)?;
+    start_hrpd_access_worker(&mut runtime, shutdown.clone());
     let bearer_bts_id = runtime.config.base_id as u32;
     let bearer_cell_id: u32 = 1;
     let mut traffic_threads: Vec<TrafficRxThread> = Vec::new();
@@ -2330,12 +3637,40 @@ fn maybe_write_capture(runtime: &mut RxRuntime, samples: &[Complex32]) -> Result
             runtime.capture_writer = Some(writer);
             runtime.active_capture = Some(active.clone());
             runtime.captured_samples = 0;
+            runtime.capture_expected_abs_sample = None;
+            runtime.capture_last_tail = None;
             write_capture_metadata(runtime, &active)?;
             respond_pending_capture_start(runtime, &active, pending);
         }
     }
     if runtime.capture_writer.is_none() {
         return Ok(());
+    }
+    // Reconcile hardware stream gaps against the absolute sample timeline
+    // before writing, exactly as the receiver workers do, so a WAV sample's
+    // position always equals its absolute sample index minus the anchor. A
+    // capture written from the raw buffers silently loses every gap and all
+    // signal after it lands early in the file.
+    let continuity = reconcile_traffic_stream_continuity(
+        samples.to_vec(),
+        runtime.last_absolute_sample_start,
+        runtime.capture_expected_abs_sample,
+        runtime.capture_last_tail,
+    );
+    if continuity.inserted_samples > 0 || continuity.dropped_samples > 0 {
+        warn!(
+            "rx: capture stream discontinuity corrected raw_abs_start={} expected_abs_start={:?} inserted={} dropped={}",
+            runtime.last_absolute_sample_start,
+            runtime.capture_expected_abs_sample,
+            continuity.inserted_samples,
+            continuity.dropped_samples,
+        );
+    }
+    let samples = continuity.samples.as_slice();
+    runtime.capture_expected_abs_sample =
+        Some(continuity.absolute_sample_start + samples.len() as u64);
+    if let Some(tail) = samples.last() {
+        runtime.capture_last_tail = Some(*tail);
     }
     let remaining = runtime
         .capture_target_samples
@@ -3301,15 +4636,6 @@ pub fn decode_access_message_from_pdu(
     }
 }
 
-#[allow(dead_code)]
-fn extract_access_rc_preferences(msg: &AccessMessage) -> (Option<u8>, Option<u8>, Option<bool>) {
-    match msg {
-        AccessMessage::Origination(m) => (m.for_rc_pref, m.rev_rc_pref, m.rev_fch_gating_req),
-        AccessMessage::PageResponse(m) => (m.for_rc_pref, m.rev_rc_pref, m.rev_fch_gating_req),
-        _ => (None, None, None),
-    }
-}
-
 /// Extract IMSI_M_S1 (24 bits) and IMSI_M_S2 (10 bits) from a 34-bit IMSI_S value.
 /// Per C.S0005-E 2.3.1: IMSI_S = IMSI_S2(10 upper) || IMSI_S1(24 lower).
 fn split_imsi_s(imsi_s: u64) -> (u32, u16) {
@@ -3691,29 +5017,158 @@ fn write_capture_block(
     wav: &mut WavWriter<BufWriter<std::fs::File>>,
     samples: &[Complex32],
 ) -> Result<(), Error> {
+    // The SDR delivers normalized IQ in [-1.0, 1.0], which maps straight onto
+    // the full 16-bit range.
     for sample in samples {
-        let re = (sample.re * WAV_CAPTURE_PEAK).clamp(-1.0, 1.0);
-        let im = (sample.im * WAV_CAPTURE_PEAK).clamp(-1.0, 1.0);
-        wav.write_sample((re * i16::MAX as f32) as i16)?;
-        wav.write_sample((im * i16::MAX as f32) as i16)?;
+        let re = (sample.re.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+        let im = (sample.im.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+        wav.write_sample(re)?;
+        wav.write_sample(im)?;
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use super::rx_events::extract_access_rc_preferences;
     use super::{
-        build_access_event, build_traffic_event, build_traffic_voice_event,
-        extract_access_rc_preferences, extract_addressing_fields, extract_imsi_from_class_fields,
-        reconcile_traffic_stream_continuity, reverse_frame_content_from_rate_bps,
+        HRPD_SLOT_CHIPS, HRPD_TRAFFIC_FRAME_CHIPS, HRPD_TRAFFIC_MAX_INTERPOLATED_GAP_SLOTS,
+        HrpdTrafficMaskCandidate, PCG_CHIPS, RxCarrierSlice, StageTiming, build_access_event,
+        build_hrpd_access_indication, build_traffic_event, build_traffic_voice_event,
+        carrier_slice_anti_alias_taps, effective_rx_target_batch_samples,
+        extract_addressing_fields, extract_imsi_from_class_fields,
+        hrpd_reverse_traffic_pilot_metric_at_offset, reconcile_traffic_stream_continuity,
+        reconcile_traffic_stream_continuity_with_max_insert, reverse_frame_content_from_rate_bps,
+        run_sub_chain_timed, scaled_rx_sample_delay,
     };
+    use crate::bts::evdo::{EvdoMode, HrpdSectorId};
+    use crate::bts::launcher::{BtsLaunchOptions, build_bts_launch_parts};
+    use crate::bts::{BtsNodeConfig, RadioConfig};
     use crate::lac::message_types::{MessageId, WireChannel};
     use crate::receiver::access_layer3::AccessMessage;
     use crate::receiver::access_pdu::RcschAddressingFields;
-    use crate::receiver::pipelined::SampleBlock;
+    use crate::receiver::hrpd::reverse_spread::{
+        HrpdReversePilotReferenceConfig, hrpd_reverse_pilot_reference_chips,
+    };
+    use crate::receiver::pipelined::{
+        HrpdReverseAccessSettings, SampleBlock, hrpd_reverse_access_chain,
+    };
+    use crate::sdr::NoopRadio;
     use cdma_common::bits::Bitstream;
+    use cdma_common::hrpd::air::default_reverse_traffic_long_code_masks;
     use num_complex::Complex32;
     use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    #[test]
+    fn scaled_rx_sample_delay_scales_from_4x_basis() {
+        assert_eq!(scaled_rx_sample_delay(100, 4), 100);
+        assert_eq!(scaled_rx_sample_delay(100, 8), 200);
+        assert_eq!(scaled_rx_sample_delay(100, 16), 400);
+        assert_eq!(scaled_rx_sample_delay(-40, 8), -80);
+    }
+
+    #[test]
+    fn hrpd_rx_batch_is_capped_to_one_slot() {
+        let sample_rate_hz = 4 * 1_228_800usize;
+        let chip_rate_hz = 1_228_800usize;
+        assert_eq!(
+            effective_rx_target_batch_samples(sample_rate_hz, chip_rate_hz, 2, true),
+            4 * HRPD_SLOT_CHIPS
+        );
+        assert_eq!(
+            effective_rx_target_batch_samples(sample_rate_hz, chip_rate_hz, 2, false),
+            4 * 2 * PCG_CHIPS
+        );
+    }
+
+    #[test]
+    fn hrpd_only_runtime_omits_one_x_receiver_pipeline() {
+        let mut bts = BtsNodeConfig::default();
+        bts.radio = RadioConfig::Noop;
+        bts.channel.cdma_channel = 777;
+        bts.evdo.enabled = true;
+        bts.evdo.channel = Some(630);
+        bts.evdo.mode = EvdoMode::HrpdOnly;
+        bts.evdo.overhead.sector_id = Some(HrpdSectorId::new([0; 16]));
+        bts.evdo.overhead.subnet_mask = Some(26);
+        bts.evdo.overhead.color_code = Some(26);
+        bts.rf = crate::bts::config::BtsRfProfile::derive(bts.channel, &bts.evdo)
+            .expect("derive HRPD-only RF profile");
+        bts.runtime.tx_sample_rate_hz = bts.rf.tx_sample_rate_hz;
+        bts.runtime.tx_bandwidth_hz = bts.rf.tx_bandwidth_hz;
+
+        let mut parts = build_bts_launch_parts(
+            bts,
+            Box::new(NoopRadio::new()),
+            BtsLaunchOptions {
+                paging_ack_timeout_ms: 100,
+                paging_max_retries: 0,
+            },
+        )
+        .expect("build HRPD-only launch parts");
+        let rx = parts.bts.config.rx.take().expect("HRPD RX settings");
+        let runtime = super::open_rx_runtime(rx).expect("open HRPD-only RX runtime");
+
+        assert!(runtime.one_x_rx_slice.is_none());
+        assert!(runtime.processors.is_empty());
+        assert!(runtime.stage_timings.is_empty());
+        assert!(runtime.hrpd_rx_slice.is_some());
+        assert!(runtime.hrpd_processors.is_some());
+    }
+
+    #[test]
+    fn synthetic_hrpd_reverse_traffic_pilot_metric_locks_spec_reference() {
+        let oversample = 4usize;
+        let frame_start_chip = 0x1abc0000u64;
+        let frame_start_chip =
+            frame_start_chip - (frame_start_chip % HRPD_TRAFFIC_FRAME_CHIPS as u64);
+        let uati = 0x1a058001;
+        let (i_mask, q_mask) = default_reverse_traffic_long_code_masks(uati);
+        let reference = hrpd_reverse_pilot_reference_chips(HrpdReversePilotReferenceConfig {
+            start_chip: frame_start_chip,
+            len: HRPD_TRAFFIC_FRAME_CHIPS,
+            i_mask,
+            q_mask,
+            reference_chip_offset: 0,
+            pn_phase_offset_chips: 0,
+            lc_phase_offset_chips: 0,
+            q_sign: -1.0,
+            q_pair_phase: 0,
+        });
+        let mut samples = Vec::with_capacity(reference.len() * oversample);
+        for chip in reference {
+            samples.extend(std::iter::repeat_n(chip, oversample));
+        }
+        let metric = hrpd_reverse_traffic_pilot_metric_at_offset(
+            &samples,
+            frame_start_chip * oversample as u64,
+            oversample,
+            frame_start_chip,
+            0,
+            HrpdTrafficMaskCandidate {
+                i_mask,
+                q_mask,
+                q_sign: -1.0,
+                q_pair_phase: 0,
+                label: "synthetic",
+            },
+            16,
+        )
+        .expect("synthetic metric");
+        assert!(
+            metric.coherence > 0.99,
+            "coherence={} snr_db={}",
+            metric.coherence,
+            metric.snr_db
+        );
+        assert!(
+            metric.snr_db > 40.0,
+            "coherence={} snr_db={}",
+            metric.coherence,
+            metric.snr_db
+        );
+    }
 
     #[test]
     fn reverse_frame_content_maps_rc3_subrates() {
@@ -3746,6 +5201,120 @@ mod tests {
             reverse_frame_content_from_rate_bps(1200),
             REVERSE_FRAME_CONTENT_EIGHTH_RATE
         );
+    }
+
+    #[test]
+    fn rx_carrier_slice_decimates_8x_to_4x_and_retags_samples() {
+        let mut slice =
+            RxCarrierSlice::new(2_205_000, 9_830_400, 1_228_800).expect("8x carrier slice builds");
+        assert_eq!(slice.decimation, 2);
+        assert_eq!(slice.output_sample_rate_hz, 4_915_200);
+        assert_eq!(slice.output_oversample, 4);
+
+        let raw_abs = 7_198_559_219_644_671u64;
+        let samples = vec![Complex32::new(1.0, 0.0); 32];
+        let out = slice.process(samples, 101, raw_abs);
+        assert_eq!(out.sample_rate_hz, 4_915_200);
+        assert_eq!(out.absolute_sample_start, (raw_abs + 1) / 2);
+        assert_eq!(out.relative_sample_start, 51);
+        assert_eq!(out.absolute_chip_start, out.absolute_sample_start / 4);
+        assert_eq!(out.samples.len(), 16);
+    }
+
+    /// Independent reference for the carrier slice: exact per-sample mix,
+    /// full-rate convolution, then decimate aligned to the absolute grid.
+    /// Mirrors the pre-fusion algorithm so the fused implementation can be
+    /// checked for equivalence.
+    fn carrier_slice_reference(
+        carrier_shift_hz: i64,
+        sample_rate_hz: usize,
+        chip_rate_hz: usize,
+        history: &[Complex32],
+        block: &[Complex32],
+        raw_absolute_sample_start: u64,
+    ) -> Vec<Complex32> {
+        let input_oversample = sample_rate_hz / chip_rate_hz.max(1);
+        let decimation = (input_oversample / 4).max(1);
+        let phase_step = if carrier_shift_hz == 0 {
+            0.0
+        } else {
+            -2.0 * std::f64::consts::PI * carrier_shift_hz as f64 / sample_rate_hz as f64
+        };
+        let taps = (decimation > 1)
+            .then(|| carrier_slice_anti_alias_taps(decimation, sample_rate_hz, chip_rate_hz));
+        // Mix the whole stream (history precedes the block) with an exact NCO.
+        let total = history.len() + block.len();
+        let mut mixed = Vec::with_capacity(total);
+        let mut phase = 0.0f64;
+        for s in history.iter().chain(block.iter()) {
+            let rot = Complex32::new(phase.cos() as f32, phase.sin() as f32);
+            mixed.push(*s * rot);
+            phase += phase_step;
+        }
+        // Convolve at full rate (causal, symmetric taps).
+        let filtered: Vec<Complex32> = if let Some(taps) = &taps {
+            (0..total)
+                .map(|m| {
+                    let mut acc = num::complex::Complex::<f64>::new(0.0, 0.0);
+                    for (i, &tap) in taps.iter().enumerate() {
+                        if m >= i {
+                            let s = mixed[m - i];
+                            acc.re += s.re as f64 * tap;
+                            acc.im += s.im as f64 * tap;
+                        }
+                    }
+                    Complex32::new(acc.re as f32, acc.im as f32)
+                })
+                .collect()
+        } else {
+            mixed
+        };
+        // Keep block positions whose absolute index is a multiple of decimation.
+        let block_start = history.len();
+        let d = decimation as u64;
+        let first_idx = ((d - raw_absolute_sample_start % d) % d) as usize;
+        (first_idx..block.len())
+            .step_by(decimation)
+            .map(|m| filtered[block_start + m])
+            .collect()
+    }
+
+    #[test]
+    fn rx_carrier_slice_matches_reference_with_shift_and_decimation() {
+        let (shift, rate, chip) = (2_205_000i64, 9_830_400usize, 1_228_800usize);
+        let mut slice = RxCarrierSlice::new(shift, rate, chip).expect("slice builds");
+        // Drive several contiguous blocks so filter/NCO continuity is exercised.
+        let raw_abs0 = 7_198_559_219_644_670u64;
+        let mut history: Vec<Complex32> = Vec::new();
+        let mut max_err = 0.0f32;
+        for blk in 0..6u64 {
+            let len = 1000usize + (blk as usize) * 37;
+            let block: Vec<Complex32> = (0..len)
+                .map(|i| {
+                    let t = (history.len() + i) as f32;
+                    Complex32::new((0.013 * t).sin(), (0.019 * t + 0.4).cos())
+                })
+                .collect();
+            let raw_abs = raw_abs0 + history.len() as u64;
+            let expected = carrier_slice_reference(shift, rate, chip, &history, &block, raw_abs);
+            let got = slice.process(block.clone(), 0, raw_abs);
+            assert_eq!(got.samples.len(), expected.len(), "block {blk} length");
+            for (a, b) in got.samples.iter().zip(expected.iter()) {
+                max_err = max_err.max((a - b).norm());
+            }
+            history.extend(block);
+        }
+        assert!(
+            max_err < 1e-3,
+            "fused slice diverged from reference: {max_err}"
+        );
+    }
+
+    #[test]
+    fn carrier_slice_filter_has_unity_dc_gain() {
+        let taps = carrier_slice_anti_alias_taps(2, 9_830_400, 1_228_800);
+        let gain: f64 = taps.iter().sum();
+        assert!((gain - 1.0).abs() < 1e-9, "gain={gain}");
     }
 
     fn class1_imsi_bits(imsi_addr_num: u8, mcc: u16, imsi_11_12: u8, imsi_s: u64) -> Bitstream {
@@ -3873,6 +5442,7 @@ mod tests {
             chip_start: 12345,
             samples,
             sample_rate_hz: 0.0,
+            rx_sample_time: None,
             tags: [
                 ("traffic_crc_valid", 1),
                 ("traffic_walsh_code", 10),
@@ -4017,6 +5587,7 @@ mod tests {
             chip_start: 54321,
             samples,
             sample_rate_hz: 0.0,
+            rx_sample_time: None,
             tags: [
                 ("traffic_phy_frame", 1),
                 ("traffic_walsh_code", 11),
@@ -4069,6 +5640,44 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_traffic_stream_continuity_gap_limit_resets_large_gap() {
+        let raw_samples = vec![Complex32::new(3.0, -3.0), Complex32::new(4.0, -4.0)];
+        let out = reconcile_traffic_stream_continuity_with_max_insert(
+            raw_samples.clone(),
+            110,
+            Some(106),
+            Some(Complex32::new(1.0, -1.0)),
+            Some(2),
+        );
+
+        assert_eq!(out.absolute_sample_start, 110);
+        assert_eq!(out.inserted_samples, 0);
+        assert_eq!(out.dropped_samples, 0);
+        assert_eq!(out.samples, raw_samples);
+    }
+
+    #[test]
+    fn reconcile_traffic_stream_continuity_corrects_live_sized_hrpd_gap() {
+        let oversample = 4usize;
+        let gap_samples = oversample * HRPD_SLOT_CHIPS * 4 + oversample * 8;
+        let max_insert_samples =
+            oversample * HRPD_SLOT_CHIPS * HRPD_TRAFFIC_MAX_INTERPOLATED_GAP_SLOTS;
+        let raw_samples = vec![Complex32::new(3.0, -3.0), Complex32::new(4.0, -4.0)];
+        let out = reconcile_traffic_stream_continuity_with_max_insert(
+            raw_samples,
+            1_000 + gap_samples as u64,
+            Some(1_000),
+            Some(Complex32::new(1.0, -1.0)),
+            Some(max_insert_samples),
+        );
+
+        assert_eq!(out.absolute_sample_start, 1_000);
+        assert_eq!(out.inserted_samples, gap_samples);
+        assert_eq!(out.dropped_samples, 0);
+        assert_eq!(out.samples.len(), gap_samples + 2);
+    }
+
+    #[test]
     fn reconcile_traffic_stream_continuity_trims_overlapping_prefix() {
         let out = reconcile_traffic_stream_continuity(
             vec![
@@ -4089,5 +5698,766 @@ mod tests {
             out.samples,
             vec![Complex32::new(12.0, 0.0), Complex32::new(13.0, 0.0)]
         );
+    }
+
+    #[derive(Default)]
+    struct HrpdTrafficCaptureFixture {
+        label: &'static str,
+        wav_path: PathBuf,
+        sample_rate_hz: usize,
+        chip_rate_hz: usize,
+        first_absolute_sample_start: u64,
+        start_sample_offset: usize,
+        hrpd_rx_shift_hz: i64,
+        expected_uati: u32,
+        mac_index: u8,
+        min_drc_events: usize,
+        physical_layer_subtype: u16,
+        reverse_traffic_mac_subtype: u16,
+        /// Exact decoded reverse Stream 0 / Stream 1 event counts, when the
+        /// capture has a locked baseline (None skips the assertion).
+        expected_stream0_events: Option<usize>,
+        expected_stream1_events: Option<usize>,
+        /// Payloads that must appear among the decoded Stream 0 events
+        /// (exact match) and Stream 1 events (prefix match).
+        expected_stream0_payloads: &'static [&'static [u8]],
+        expected_stream1_payload_prefixes: &'static [&'static [u8]],
+    }
+
+    struct HrpdAccessCaptureFixture {
+        label: &'static str,
+        wav_path: PathBuf,
+        sample_rate_hz: usize,
+        chip_rate_hz: usize,
+        first_absolute_sample_start: u64,
+        hrpd_rx_shift_hz: i64,
+        expected_packet_chips: &'static [u64],
+        expected_message_counts: &'static [usize],
+    }
+
+    fn drive_hrpd_access_worker_capture(fixture: HrpdAccessCaptureFixture) {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        assert_eq!(
+            fixture.expected_packet_chips.len(),
+            fixture.expected_message_counts.len()
+        );
+        let mut reader = hound::WavReader::open(&fixture.wav_path)
+            .unwrap_or_else(|e| panic!("failed to open {}: {e}", fixture.wav_path.display()));
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 2);
+        assert_eq!(spec.sample_rate as usize, fixture.sample_rate_hz);
+        assert_eq!(spec.bits_per_sample, 16);
+        assert_eq!(spec.sample_format, hound::SampleFormat::Int);
+
+        let mut slice = RxCarrierSlice::new(
+            fixture.hrpd_rx_shift_hz,
+            fixture.sample_rate_hz,
+            fixture.chip_rate_hz,
+        )
+        .expect("RxCarrierSlice for HRPD access capture");
+        let mut processors = hrpd_reverse_access_chain(HrpdReverseAccessSettings {
+            oversample: slice.output_oversample,
+            access_cycle_number: 0,
+            sector_id_lsb: 0,
+            color_code: 26,
+            reanchor_origin: true,
+            snr_threshold: None,
+            finger_pool_size: 8,
+            preamble_frames: crate::receiver::hrpd::access::HRPD_DEFAULT_ACCESS_PREAMBLE_FRAMES,
+            enhanced_access_rates: false,
+        });
+        let stage_timings = processors
+            .iter()
+            .map(|processor| StageTiming {
+                name: processor.name(),
+                total_us: 0,
+                calls: 0,
+                max_us: 0,
+            })
+            .collect::<Vec<_>>();
+        let mut stage_timings = stage_timings;
+
+        const SAMPLES_PER_BLOCK: usize = 98_304; // 10 ms at 9.8304 Msps.
+        let mut samples_iter = reader.samples::<i16>();
+        let mut raw_relative_sample_start = 0usize;
+        let mut raw_absolute_sample_start = fixture.first_absolute_sample_start;
+        let mut events = Vec::new();
+        let mut total_samples_pushed = 0usize;
+
+        loop {
+            let mut block: Vec<Complex32> = Vec::with_capacity(SAMPLES_PER_BLOCK);
+            for _ in 0..SAMPLES_PER_BLOCK {
+                let Some(i) = samples_iter.next() else { break };
+                let Some(q) = samples_iter.next() else { break };
+                let i = i.unwrap_or(0) as f32 / i16::MAX as f32;
+                let q = q.unwrap_or(0) as f32 / i16::MAX as f32;
+                block.push(Complex32::new(i, q));
+            }
+            if block.is_empty() {
+                break;
+            }
+            let len = block.len();
+            let hrpd_block =
+                slice.process(block, raw_relative_sample_start, raw_absolute_sample_start);
+            let mut sample_block =
+                SampleBlock::new(hrpd_block.samples, hrpd_block.relative_sample_start)
+                    .with_sample_rate_hz(hrpd_block.sample_rate_hz as f64);
+            sample_block
+                .tags
+                .insert("absolute_chip_start", hrpd_block.absolute_chip_start as i64);
+            sample_block.tags.insert(
+                "absolute_sample_start",
+                hrpd_block.absolute_sample_start as i64,
+            );
+            let mut emitter = crate::receiver::pipelined::VecEmitter::new();
+            let mut outputs = run_sub_chain_timed(
+                &mut processors,
+                sample_block,
+                &mut stage_timings,
+                &mut emitter,
+            );
+            outputs.extend(emitter.blocks);
+            for output in outputs {
+                if let Some(indication) = build_hrpd_access_indication(&output, 26, 0) {
+                    events.push(indication);
+                }
+            }
+            raw_relative_sample_start = raw_relative_sample_start.saturating_add(len);
+            raw_absolute_sample_start = raw_absolute_sample_start.saturating_add(len as u64);
+            total_samples_pushed = total_samples_pushed.saturating_add(len);
+        }
+
+        let chips = events
+            .iter()
+            .map(|event| event.absolute_chip)
+            .collect::<Vec<_>>();
+        let message_counts = events
+            .iter()
+            .map(|event| event.messages.len())
+            .collect::<Vec<_>>();
+        eprintln!(
+            "HRPD {} access: streamed {} samples decoded={} chips={:?} message_counts={:?}",
+            fixture.label,
+            total_samples_pushed,
+            events.len(),
+            chips,
+            message_counts
+        );
+        assert_eq!(
+            chips, fixture.expected_packet_chips,
+            "decoded HRPD access burst chips did not match capture"
+        );
+        assert_eq!(
+            message_counts, fixture.expected_message_counts,
+            "decoded HRPD access message counts did not match capture"
+        );
+    }
+
+    fn drive_hrpd_reverse_traffic_worker_capture(fixture: HrpdTrafficCaptureFixture) {
+        let _ = env_logger::builder().is_test(true).try_init();
+        use cdma_common::hrpd::air::{HrpdTrafficAssignmentRequest, HrpdTrafficEvent};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        use tokio::sync::mpsc as tokio_mpsc;
+
+        let mut reader = hound::WavReader::open(&fixture.wav_path)
+            .unwrap_or_else(|e| panic!("failed to open {}: {e}", fixture.wav_path.display()));
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 2);
+        assert_eq!(spec.sample_rate as usize, fixture.sample_rate_hz);
+        assert_eq!(spec.bits_per_sample, 16);
+        assert_eq!(spec.sample_format, hound::SampleFormat::Int);
+
+        let (reverse_long_code_mask_i, reverse_long_code_mask_q) =
+            default_reverse_traffic_long_code_masks(fixture.expected_uati);
+        let assignment = HrpdTrafficAssignmentRequest {
+            session_uati: fixture.expected_uati,
+            uati: fixture.expected_uati,
+            mac_index: fixture.mac_index,
+            reverse_rate_limit_bps: 153_600,
+            reverse_long_code_mask_i,
+            reverse_long_code_mask_q,
+            drc_lock: true,
+            physical_layer_subtype: fixture.physical_layer_subtype,
+            reverse_traffic_mac_subtype: fixture.reverse_traffic_mac_subtype,
+            frame_offset: 0,
+            drc_cover: 0,
+            drc_length: 1,
+        };
+
+        let mut slice = RxCarrierSlice::new(
+            fixture.hrpd_rx_shift_hz,
+            fixture.sample_rate_hz,
+            fixture.chip_rate_hz,
+        )
+        .expect("RxCarrierSlice for HRPD reverse capture");
+        let (event_tx, mut event_rx) = tokio_mpsc::unbounded_channel::<HrpdTrafficEvent>();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        // Feed the worker a real HARQ bus so the per-slot reverse power-control
+        // loop runs against real IQ and emits its `rpc_control` diagnostics.
+        let harq_bus = Arc::new(crate::bts::hrpd::HarqBus::new());
+        let thread = super::spawn_hrpd_traffic_rx_thread(
+            slice.output_oversample.max(1),
+            assignment.clone(),
+            Some(event_tx),
+            Some(harq_bus.clone()),
+            shutdown.clone(),
+        );
+
+        // Stream WAV in ~85 ms blocks (the same order of magnitude the live
+        // BTS main RX loop hands the worker on real hardware) so the worker
+        // processes incrementally rather than against one giant buffer.
+        const SAMPLES_PER_BLOCK: usize = 1 << 18; // 262144 samples ≈ 53 ms
+        let mut samples_iter = reader.samples::<i16>();
+        for _ in 0..fixture.start_sample_offset {
+            let _ = samples_iter.next();
+            let _ = samples_iter.next();
+        }
+        let mut raw_relative_sample_start: usize = fixture.start_sample_offset;
+        let mut raw_absolute_sample_start: u64 = fixture
+            .first_absolute_sample_start
+            .saturating_add(fixture.start_sample_offset as u64);
+        let mut pilot_events: Vec<(u64, i16)> = Vec::new();
+        let mut all_events: Vec<HrpdTrafficEvent> = Vec::new();
+        let mut last_event_check = Instant::now();
+        let stream_start = Instant::now();
+        let mut total_samples_pushed: usize = 0;
+
+        loop {
+            let mut block: Vec<Complex32> = Vec::with_capacity(SAMPLES_PER_BLOCK);
+            for _ in 0..SAMPLES_PER_BLOCK {
+                let Some(i) = samples_iter.next() else { break };
+                let Some(q) = samples_iter.next() else { break };
+                let i = i.unwrap_or(0) as f32 / i16::MAX as f32;
+                let q = q.unwrap_or(0) as f32 / i16::MAX as f32;
+                block.push(Complex32::new(i, q));
+            }
+            if block.is_empty() {
+                break;
+            }
+            let len = block.len();
+            let hrpd_block =
+                slice.process(block, raw_relative_sample_start, raw_absolute_sample_start);
+            let blk = super::HrpdTrafficRxBlock {
+                samples: hrpd_block.samples,
+                absolute_sample_start: hrpd_block.absolute_sample_start,
+                sample_rate_hz: hrpd_block.sample_rate_hz,
+                rx_read_completed_at: Instant::now(),
+                enqueue_time: Instant::now(),
+            };
+            if thread.tx.send(blk).is_err() {
+                panic!("HRPD traffic worker channel disconnected");
+            }
+            raw_relative_sample_start = raw_relative_sample_start.saturating_add(len);
+            raw_absolute_sample_start += len as u64;
+            total_samples_pushed += len;
+
+            // Drain whatever events have already arrived so we can short-
+            // circuit once pilot is acquired.
+            if last_event_check.elapsed() >= Duration::from_millis(50) {
+                last_event_check = Instant::now();
+                while let Ok(event) = event_rx.try_recv() {
+                    if let HrpdTrafficEvent::ReversePilot {
+                        absolute_chip,
+                        snr_db_tenths,
+                        ..
+                    } = event
+                    {
+                        pilot_events.push((absolute_chip, snr_db_tenths));
+                    }
+                    all_events.push(event);
+                }
+            }
+        }
+
+        // Real-time processing ratio. The worker is lossless and is the
+        // processing bottleneck, so the wall time from the first enqueue until
+        // its mailbox fully drains is how long it took to process the entire
+        // capture. Compare against the capture's own airtime. The capture is
+        // pushed faster than realtime, so a backlog builds during the push and
+        // this measures how fast the worker chews through it.
+        let backlog_at_push_done = thread.tx.len();
+        let process_drain_deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            // Keep the event mailbox bounded while we wait for the worker.
+            while let Ok(event) = event_rx.try_recv() {
+                if let HrpdTrafficEvent::ReversePilot {
+                    absolute_chip,
+                    snr_db_tenths,
+                    ..
+                } = event
+                {
+                    pilot_events.push((absolute_chip, snr_db_tenths));
+                }
+                all_events.push(event);
+            }
+            if thread.tx.is_empty() {
+                // Let the final coalesced batch finish before declaring done.
+                std::thread::sleep(Duration::from_millis(50));
+                if thread.tx.is_empty() {
+                    break;
+                }
+            }
+            if Instant::now() >= process_drain_deadline {
+                eprintln!(
+                    "HRPD {}: WARNING worker did not drain within 180s (backlog={})",
+                    fixture.label,
+                    thread.tx.len()
+                );
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let processing_wall = stream_start.elapsed();
+        let capture_airtime_s = total_samples_pushed as f64 / fixture.sample_rate_hz as f64;
+        let rt_ratio = capture_airtime_s / processing_wall.as_secs_f64().max(1e-9);
+        eprintln!(
+            "HRPD {}: REAL-TIME RATIO capture_airtime={:.3}s processing_wall={:.3}s rt_ratio={:.2}x (>1 = faster than realtime) backlog_at_push_done={} blocks",
+            fixture.label,
+            capture_airtime_s,
+            processing_wall.as_secs_f64(),
+            rt_ratio,
+            backlog_at_push_done,
+        );
+        // A single reverse-traffic worker must stay well ahead of realtime to
+        // leave headroom for concurrent connections. Observed 2.5x-7x across
+        // these captures; a drop below 2x is a throughput regression.
+        assert!(
+            rt_ratio >= 2.0,
+            "HRPD {}: reverse-traffic RX below the 2x realtime floor (rt_ratio={rt_ratio:.2}x, airtime={capture_airtime_s:.3}s wall={:.3}s)",
+            fixture.label,
+            processing_wall.as_secs_f64(),
+        );
+
+        // Let the unbounded worker mailbox drain until the receiver has
+        // proved traffic-pilot lock and is decoding continuous reverse DRC.
+        // The capture is pushed faster than realtime in this test; production
+        // SDR input arrives incrementally.
+        let drain_deadline = Instant::now() + Duration::from_secs(25);
+        loop {
+            while let Ok(event) = event_rx.try_recv() {
+                if let HrpdTrafficEvent::ReversePilot {
+                    absolute_chip,
+                    snr_db_tenths,
+                    ..
+                } = event
+                {
+                    pilot_events.push((absolute_chip, snr_db_tenths));
+                }
+                all_events.push(event);
+            }
+            let drc_events = all_events
+                .iter()
+                .filter(|event| matches!(event, HrpdTrafficEvent::Drc { .. }))
+                .count();
+            if !pilot_events.is_empty() && drc_events >= fixture.min_drc_events {
+                break;
+            }
+            if Instant::now() >= drain_deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        shutdown.store(true, Ordering::Relaxed);
+
+        eprintln!(
+            "HRPD {}: streamed {} samples in {:.1}s, pilot_events={}",
+            fixture.label,
+            total_samples_pushed,
+            stream_start.elapsed().as_secs_f64(),
+            pilot_events.len()
+        );
+        for (chip, snr) in &pilot_events {
+            eprintln!(
+                "  ReversePilot chip={chip} snr={:.1} dB",
+                *snr as f32 / 10.0
+            );
+        }
+        let mut pilot_count = 0usize;
+        let mut drc_count = 0usize;
+        let mut ack_count = 0usize;
+        let mut stream0_count = 0usize;
+        let mut stream1_count = 0usize;
+        for ev in &all_events {
+            match ev {
+                HrpdTrafficEvent::ReversePilot { .. } => pilot_count += 1,
+                HrpdTrafficEvent::ReversePilotLost { .. } => {}
+                HrpdTrafficEvent::Drc { .. } => drc_count += 1,
+                HrpdTrafficEvent::Ack { .. } => ack_count += 1,
+                HrpdTrafficEvent::Stream0Signaling { .. } => stream0_count += 1,
+                HrpdTrafficEvent::Stream1Packet { .. } => stream1_count += 1,
+            }
+        }
+        eprintln!(
+            "HRPD {}: total events: pilot={pilot_count} drc={drc_count} ack={ack_count} stream0={stream0_count} stream1={stream1_count}",
+            fixture.label
+        );
+        let mut stream0_payloads: Vec<&[u8]> = Vec::new();
+        let mut stream1_payloads: Vec<&[u8]> = Vec::new();
+        for ev in &all_events {
+            match ev {
+                HrpdTrafficEvent::Stream0Signaling { payload, .. } => {
+                    eprintln!(
+                        "  stream0 len={} {:02x?}",
+                        payload.len(),
+                        &payload[..payload.len().min(16)]
+                    );
+                    stream0_payloads.push(payload);
+                }
+                HrpdTrafficEvent::Stream1Packet { payload, .. } => {
+                    eprintln!(
+                        "  stream1 len={} {:02x?}",
+                        payload.len(),
+                        &payload[..payload.len().min(16)]
+                    );
+                    stream1_payloads.push(payload);
+                }
+                _ => {}
+            }
+        }
+        if let Some(expected) = fixture.expected_stream0_events {
+            assert_eq!(
+                stream0_count, expected,
+                "{}: decoded Stream 0 signaling event count changed",
+                fixture.label
+            );
+        }
+        if let Some(expected) = fixture.expected_stream1_events {
+            assert_eq!(
+                stream1_count, expected,
+                "{}: decoded Stream 1 packet event count changed",
+                fixture.label
+            );
+        }
+        for expected in fixture.expected_stream0_payloads {
+            assert!(
+                stream0_payloads.iter().any(|p| p == expected),
+                "{}: expected Stream 0 payload {expected:02x?} not decoded",
+                fixture.label
+            );
+        }
+        for prefix in fixture.expected_stream1_payload_prefixes {
+            assert!(
+                stream1_payloads.iter().any(|p| p.starts_with(prefix)),
+                "{}: expected Stream 1 payload prefix {prefix:02x?} not decoded",
+                fixture.label
+            );
+        }
+        // DRC histogram across the whole capture. The post-RPC capture shows
+        // the AT requesting DRC 0x3 (153.6 kbps) almost exclusively, with a
+        // handful of garbage decodes during early frames before pilot is
+        // fully locked.
+        let mut drc_hist = [0usize; 16];
+        for ev in &all_events {
+            if let HrpdTrafficEvent::Drc { drc_index, .. } = ev {
+                if (*drc_index as usize) < drc_hist.len() {
+                    drc_hist[*drc_index as usize] += 1;
+                }
+            }
+        }
+        for (idx, count) in drc_hist.iter().enumerate() {
+            if *count > 0 {
+                eprintln!("  drc_index=0x{idx:x} count={count}");
+            }
+        }
+
+        if let Some(metrics_handle) =
+            crate::receiver::hrpd::reverse_correlator_base::get_metrics_handle("hrpd_traffic")
+        {
+            let metrics = metrics_handle.lock().expect("metrics mutex");
+            eprintln!(
+                "HRPD {}: metrics per_block={}us append={}us fft={}us(n={}) spawn={}us(n={})",
+                fixture.label,
+                metrics.per_block_avg_us(),
+                metrics.append_block_avg_us(),
+                metrics.fft_scan_avg_us(),
+                metrics.fft_scan_calls,
+                metrics.spawn_finger_avg_us(),
+                metrics.spawn_finger_calls,
+            );
+            let total = metrics.searcher_total_ns().max(1);
+            let pct = |ns: u64| ns.saturating_mul(100) / total;
+            eprintln!(
+                "HRPD {}: fft_stages(scan_n={}) ref_setup={}us({}%,miss={}) signal_fft={}us({}%) ifft_mult={}us({}%) peak_find={}us({}%)",
+                fixture.label,
+                metrics.searcher_scan_window_calls,
+                metrics.ref_setup_avg_us(),
+                pct(metrics.searcher_ref_setup_ns),
+                metrics.searcher_ref_setup_calls,
+                metrics.signal_fft_avg_us(),
+                pct(metrics.searcher_signal_fft_ns),
+                metrics.ifft_mult_avg_us(),
+                pct(metrics.searcher_ifft_mult_ns),
+                metrics.peak_find_avg_us(),
+                pct(metrics.searcher_peak_find_ns),
+            );
+        }
+
+        assert!(
+            !pilot_events.is_empty(),
+            "expected at least one HrpdTrafficEvent::ReversePilot for UATI 0x{:08x} in {}",
+            fixture.expected_uati,
+            fixture.label
+        );
+        // ReversePilot is emitted by the traffic finger only after the FFT
+        // hit is verified by a coherent, spec-derived pilot despread. The
+        // event SNR field is a coarse diagnostic and is not used as the lock
+        // gate for this capture.
+
+        // Lock in the traffic correlator's accumulated timing counters as a
+        // regression guard. Budgets at ~2x measured. If the worker has been
+        // running long enough to register the metrics handle (it always
+        // should be by this point), assert the per-section budgets.
+        if let Some(metrics_handle) =
+            crate::receiver::hrpd::reverse_correlator_base::get_metrics_handle("hrpd_traffic")
+        {
+            let metrics = metrics_handle.lock().expect("metrics mutex");
+            let per_block_us = metrics.per_block_avg_us();
+            let fft_scan_us = metrics.fft_scan_avg_us();
+            let spawn_us = metrics.spawn_finger_avg_us();
+            let append_us = metrics.append_block_avg_us();
+            eprintln!(
+                "HRPD {} correlator timing: per_block_avg={}us append_avg={}us fft_scan_avg={}us(n={}) spawn_avg={}us(n={})",
+                fixture.label,
+                per_block_us,
+                append_us,
+                fft_scan_us,
+                metrics.fft_scan_calls,
+                spawn_us,
+                metrics.spawn_finger_calls,
+            );
+            assert!(
+                per_block_us < 200_000,
+                "hrpd_traffic per_block_avg too slow: {per_block_us}us (budget 200000us)",
+            );
+            assert!(
+                fft_scan_us < 200_000,
+                "hrpd_traffic fft_scan_avg too slow: {fft_scan_us}us (budget 200000us)",
+            );
+            assert!(
+                spawn_us < 500_000,
+                "hrpd_traffic spawn_finger_avg too slow: {spawn_us}us (budget 500000us)",
+            );
+        }
+    }
+
+    /// Replay the full composite IQ capture through the HRPD reverse-access
+    /// pipeline and assert every valid access retry in the WAV is recovered.
+    #[test]
+    fn capture_hrpd_reverse_access_1801219902363798_recovers_all_bursts() {
+        let wav_path: PathBuf = [
+            env!("CARGO_MANIFEST_DIR"),
+            "..",
+            "..",
+            "test",
+            "capture",
+            "1801219902363798.wav",
+        ]
+        .iter()
+        .collect();
+        // The live log only showed the packets that reached the access worker
+        // while no reverse traffic pilot was locked. Replaying the full WAV
+        // shows all valid access retries present in the capture.
+        drive_hrpd_access_worker_capture(HrpdAccessCaptureFixture {
+            label: "1801219902363798-access",
+            wav_path,
+            sample_rate_hz: 9_830_400,
+            chip_rate_hz: 1_228_800,
+            first_absolute_sample_start: 14_409_759_218_910_385,
+            hrpd_rx_shift_hz: -2_205_000,
+            expected_packet_chips: &[
+                1_801_219_906_797_568,
+                1_801_219_907_256_320,
+                1_801_219_907_584_000,
+                1_801_219_910_336_512,
+                1_801_219_910_926_336,
+                1_801_219_911_516_160,
+                1_801_219_912_007_680,
+                1_801_219_912_564_736,
+                1_801_219_913_121_792,
+                1_801_219_913_711_616,
+                1_801_219_914_203_136,
+                1_801_219_914_694_656,
+                1_801_219_915_153_408,
+                1_801_219_915_677_696,
+                1_801_219_916_136_448,
+                1_801_219_919_773_696,
+                1_801_219_920_199_680,
+                1_801_219_920_658_432,
+            ],
+            expected_message_counts: &[2, 2, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 2, 2, 2],
+        });
+    }
+
+    /// Rev A packet-data session capture `1803459647969769.wav` (UATI
+    /// 0x1a1e58d5): recover the reverse HRPD access bursts present in the WAV
+    /// before decoding the subtype-2 traffic frames. Metadata sidecar
+    /// `1803459647969769.json`.
+    #[test]
+    fn capture_hrpd_reverse_access_reva_traffic_session() {
+        let wav_path: PathBuf = [
+            env!("CARGO_MANIFEST_DIR"),
+            "..",
+            "..",
+            "test",
+            "capture",
+            "1803459647969769.wav",
+        ]
+        .iter()
+        .collect();
+        drive_hrpd_access_worker_capture(HrpdAccessCaptureFixture {
+            label: "1803459647969769-reva-access",
+            wav_path,
+            sample_rate_hz: 9_830_400,
+            chip_rate_hz: 1_228_800,
+            first_absolute_sample_start: 14_427_677_183_758_154,
+            hrpd_rx_shift_hz: -2_205_000,
+            // The ConnectionRequest access probe that opens the Rev A traffic
+            // connection is the only access burst inside this capture window;
+            // the earlier session-setup probes predate the capture start.
+            expected_packet_chips: &[1_803_459_652_747_264],
+            expected_message_counts: &[2],
+        });
+    }
+
+    /// Rev A packet-data session `1803459647969769.wav` (UATI 0x1a1e58d5),
+    /// subtype-2 physical layer / RTC MAC subtype 3, MAC=6. The reverse pilot
+    /// acquired at chip 1803459652911104 (~39.5M samples in) with mask q-/p1;
+    /// `start_sample_offset` skips the earlier subtype-0 (MAC=5) connection on
+    /// the same UATI/long code so the worker locks the Rev A connection.
+    #[test]
+    fn capture_hrpd_reverse_traffic_reva_traffic_session() {
+        let wav_path: PathBuf = [
+            env!("CARGO_MANIFEST_DIR"),
+            "..",
+            "..",
+            "test",
+            "capture",
+            "1803459647969769.wav",
+        ]
+        .iter()
+        .collect();
+        drive_hrpd_reverse_traffic_worker_capture(HrpdTrafficCaptureFixture {
+            label: "1803459647969769-reva-traffic",
+            wav_path,
+            sample_rate_hz: 9_830_400,
+            chip_rate_hz: 1_228_800,
+            first_absolute_sample_start: 14_427_677_183_758_154,
+            start_sample_offset: 39_000_000,
+            hrpd_rx_shift_hz: -2_205_000,
+            expected_uati: 0x1a1e_58d5,
+            mac_index: 6,
+            min_drc_events: 200,
+            physical_layer_subtype: 2,
+            reverse_traffic_mac_subtype: 3,
+            // Locked baseline for the fixed subtype-2 RRI: 50 signaling and
+            // 37 data-stream packets decode from this session, including the
+            // AT's TrafficChannelComplete, a RouteUpdate, and the PPP LCP
+            // Configure-Request train.
+            expected_stream0_events: Some(50),
+            expected_stream1_events: Some(37),
+            expected_stream0_payloads: &[
+                // SLP-D reliable, Route Update (0x0e), TrafficChannelComplete.
+                &[0x01, 0x88, 0x0e, 0x02, 0x00],
+                // SLP-D reliable, Route Update (0x0e), RouteUpdate message.
+                &[0x01, 0x09, 0x0e, 0x00, 0x01, 0x00, 0x01, 0x00],
+            ],
+            expected_stream1_payload_prefixes: &[
+                // HDLC flag + PPP LCP (0xc021) Configure-Request.
+                &[0x7e, 0xff, 0x7d, 0x23, 0xc0, 0x21],
+            ],
+        });
+    }
+
+    #[test]
+    fn capture_hrpd_reverse_traffic_1800274243299352() {
+        let wav_path: PathBuf = [
+            env!("CARGO_MANIFEST_DIR"),
+            "..",
+            "..",
+            "test",
+            "capture",
+            "1800274243299352.wav",
+        ]
+        .iter()
+        .collect();
+        drive_hrpd_reverse_traffic_worker_capture(HrpdTrafficCaptureFixture {
+            label: "1800274243299352",
+            wav_path: wav_path.clone(),
+            sample_rate_hz: 9_830_400,
+            chip_rate_hz: 1_228_800,
+            first_absolute_sample_start: 14_402_193_946_394_817,
+            start_sample_offset: 0,
+            hrpd_rx_shift_hz: -2_205_000,
+            expected_uati: 0x1a05_8001,
+            mac_index: 5,
+            min_drc_events: 2,
+            physical_layer_subtype: 0,
+            reverse_traffic_mac_subtype: 0,
+            ..Default::default()
+        });
+        drive_hrpd_reverse_traffic_worker_capture(HrpdTrafficCaptureFixture {
+            label: "1800274243299352-second-assignment-window",
+            wav_path,
+            sample_rate_hz: 9_830_400,
+            chip_rate_hz: 1_228_800,
+            first_absolute_sample_start: 14_402_193_946_394_817,
+            start_sample_offset: 10_000_000,
+            hrpd_rx_shift_hz: -2_205_000,
+            expected_uati: 0x1a05_8001,
+            mac_index: 5,
+            min_drc_events: 2,
+            physical_layer_subtype: 0,
+            reverse_traffic_mac_subtype: 0,
+            ..Default::default()
+        });
+    }
+
+    /// 2026-06-10 bring-up capture with three consecutive reverse traffic
+    /// sessions (MAC 5/6/7) at very high RX level (~95% full scale, ~2% of
+    /// samples at the limiter ceiling). The live run detected the reverse
+    /// pilot via FFT each frame but every finger stayed below the per-frame
+    /// coherence validation gate and pruned unvalidated.
+    #[test]
+    fn capture_hrpd_reverse_traffic_1800354308350520() {
+        let wav_path: PathBuf = [
+            env!("CARGO_MANIFEST_DIR"),
+            "..",
+            "..",
+            "test",
+            "capture",
+            "1800354308350520.wav",
+        ]
+        .iter()
+        .collect();
+        // Session windows (offsets from capture start at 13:08:06.87):
+        //   MAC 5 / UATI 0x1a058001: ~2.9 s .. 9.3 s
+        //   MAC 6 / UATI 0x1a058002: ~9.3 s .. 12.8 s
+        //   MAC 7 / UATI 0x1a058003: ~12.8 s .. 19.0 s
+        for (label, uati, mac_index, start_seconds) in [
+            ("1800354308350520-m5", 0x1a05_8001u32, 5u8, 2.5f64),
+            ("1800354308350520-m6", 0x1a05_8002, 6, 9.4),
+            ("1800354308350520-m7", 0x1a05_8003, 7, 12.9),
+        ] {
+            let start_sample_offset = (start_seconds * 9_830_400.0) as usize;
+            drive_hrpd_reverse_traffic_worker_capture(HrpdTrafficCaptureFixture {
+                label,
+                wav_path: wav_path.clone(),
+                sample_rate_hz: 9_830_400,
+                chip_rate_hz: 1_228_800,
+                first_absolute_sample_start: 14_402_834_466_804_165,
+                start_sample_offset,
+                hrpd_rx_shift_hz: -2_205_000,
+                expected_uati: uati,
+                mac_index,
+                min_drc_events: 1,
+                physical_layer_subtype: 0,
+                reverse_traffic_mac_subtype: 0,
+                ..Default::default()
+            });
+        }
     }
 }

@@ -22,7 +22,7 @@ use cdma_common::channel::TrafficRate;
 use cdma_common::events::AccessChannelEvent;
 use cdma_common::lac::message_types::MessageId;
 use cdma_common::{bits::Bitstream, error::Error};
-use log::{debug, info, warn};
+use log::{debug, info, trace, warn};
 use tokio::sync::mpsc::error::TrySendError;
 use uuid::Uuid;
 
@@ -247,7 +247,7 @@ impl Bsc {
                         fch,
                         frame.tx_frame_number,
                     ) {
-                        debug!(
+                        log::trace!(
                             "BSC: reverse bearer primary walsh={} rate={:?} bits={}",
                             walsh_code,
                             event.traffic_primary_rate_bps,
@@ -271,7 +271,7 @@ impl Bsc {
                             self.handle_access_event(event).await;
                         }
                         None => {
-                            debug!(
+                            log::trace!(
                                 "BSC: reverse bearer walsh={} frame_content=0x{:02X} rate={:?} bits={} produced no R-DSCH PDU",
                                 walsh_code,
                                 fch.frame_content.value(),
@@ -283,7 +283,7 @@ impl Bsc {
                 } else {
                     self.route_reverse_bearer_packet_primary(walsh_code, fch)
                         .await;
-                    debug!(
+                    log::trace!(
                         "BSC: reverse bearer voice/data walsh={} frame_content=0x{:02X} bits={}",
                         walsh_code,
                         fch.frame_content.value(),
@@ -329,7 +329,7 @@ impl Bsc {
         };
         match uplink_tx.try_send(frame) {
             Ok(()) => {
-                debug!(
+                trace!(
                     "BSC: reverse bearer packet primary walsh={} rate={} bits={}",
                     walsh_code, primary_rate_bps, num_bits
                 );

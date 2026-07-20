@@ -1202,7 +1202,18 @@ impl Bsc {
             return self.send_paging_message(self.build_system_parameters_message());
         }
 
-        let kind = self.paging.next_default_message_kind(schedule);
+        // This path has no resolved EV-DO advertisement, so it cannot build a
+        // real ATIM (the BTS overhead builder emits one when configured). Skip
+        // ATIM slots and advance to the next scheduled message rather than
+        // broadcast a duplicate SPM. Bounded by the schedule length so an
+        // all-ATIM schedule still falls back to an SPM instead of looping.
+        let mut kind = self.paging.next_default_message_kind(schedule);
+        for _ in 1..schedule.len() {
+            if kind != PagingMessageKind::AlternativeTechnologiesInformation {
+                break;
+            }
+            kind = self.paging.next_default_message_kind(schedule);
+        }
 
         let message = match kind {
             PagingMessageKind::SystemParameters => self.build_system_parameters_message(),
@@ -1214,6 +1225,10 @@ impl Bsc {
             }
             PagingMessageKind::GeneralPage => self.build_general_page_message(),
             PagingMessageKind::Order => self.build_order_message(),
+            PagingMessageKind::AlternativeTechnologiesInformation => {
+                // Reached only for an all-ATIM schedule with no advertisement.
+                self.build_system_parameters_message()
+            }
         };
 
         self.send_paging_message(message)
@@ -1225,6 +1240,7 @@ impl Bsc {
             self.config.pilot_offset,
             &self.config.overhead,
             &self.config.paging,
+            None,
         )
     }
 
@@ -1234,6 +1250,7 @@ impl Bsc {
             self.config.pilot_offset,
             &self.config.overhead,
             &self.config.paging,
+            None,
         )
     }
 
@@ -1274,6 +1291,7 @@ impl Bsc {
             self.config.pilot_offset,
             &self.config.overhead,
             &self.config.paging,
+            None,
         )
     }
 
@@ -1283,6 +1301,7 @@ impl Bsc {
             self.config.pilot_offset,
             &self.config.overhead,
             &self.config.paging,
+            None,
         )
     }
 
@@ -1292,6 +1311,7 @@ impl Bsc {
             self.config.pilot_offset,
             &self.config.overhead,
             &self.config.paging,
+            None,
         )
     }
 
@@ -1301,6 +1321,7 @@ impl Bsc {
             self.config.pilot_offset,
             &self.config.overhead,
             &self.config.paging,
+            None,
         )
     }
 
@@ -1310,6 +1331,7 @@ impl Bsc {
             self.config.pilot_offset,
             &self.config.overhead,
             &self.config.paging,
+            None,
         )
     }
 

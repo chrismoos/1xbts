@@ -34,7 +34,7 @@ impl WalshPilotCombiner {
             buffer_sample_rate_hz: 0.0,
             absolute_chip_modulus: None,
             initial_chip_discard: 0,
-            dump_wav_path: std::env::var("CDMA_WPC_DUMP_WAV").ok(),
+            dump_wav_path: None,
             dump_writer: None,
         }
     }

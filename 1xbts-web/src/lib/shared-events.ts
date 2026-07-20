@@ -112,7 +112,15 @@ export class SharedEventSource {
       }
     });
 
-    const eventTypes = ["radio-metrics", "paging", "traffic", "access"];
+    const eventTypes = [
+      "radio-metrics",
+      "paging",
+      "traffic",
+      "access",
+      "hrpd-session",
+      "hrpd-access",
+      "hrpd-traffic",
+    ];
     for (const eventType of eventTypes) {
       this.es.addEventListener(eventType, (e) => {
         // Dispatch locally

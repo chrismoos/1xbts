@@ -21,6 +21,7 @@ cdma-abis = { path = "../cdma-abis" }
 cdma-a8 = { path = "../cdma-a8" }
 cdma-a10 = { path = "../cdma-a10" }
 cdma-a11 = { path = "../cdma-a11" }
+cdma-a21 = { path = "../cdma-a21" }
 cdma-common = { path = "../cdma-common"}
 cdma-bts = { path = "../cdma-bts", default-features = false }
 cdma-ios = { path = "../cdma-ios" }

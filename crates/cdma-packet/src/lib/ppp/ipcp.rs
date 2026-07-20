@@ -30,7 +30,7 @@ const CODE_REJECT: u8 = 7;
 /// PPP restart timer in packet-session ticks. Packet sessions tick every 20 ms,
 /// so this retransmits pending Configure-Requests once per second.
 const CONFIGURE_RESTART_TICKS: u16 = 50;
-const MAX_CONFIGURE_RESTARTS: u32 = 10;
+const DEFAULT_MAX_CONFIGURE_RESTARTS: u32 = 10;
 /// RFC 1661 §4.6 Max-Failure: after this many NAKs for an option without an
 /// intervening ACK, convert to Reject (or drop if it was an appended suggestion).
 const MAX_FAILURE: u32 = 5;
@@ -212,6 +212,7 @@ pub struct IpcpSession {
     last_acked_peer_request_data: Vec<u8>,
     restart_ticks_remaining: u16,
     configure_restarts: u32,
+    max_configure_restarts: u32,
     configure_failed: bool,
     /// RFC 1661 §4.6 Max-Failure: NAKs sent per option since last ACK.
     consecutive_naks_sent: BTreeMap<u8, u32>,
@@ -237,6 +238,7 @@ impl IpcpSession {
             last_acked_peer_request_data: Vec::new(),
             restart_ticks_remaining: 0,
             configure_restarts: 0,
+            max_configure_restarts: DEFAULT_MAX_CONFIGURE_RESTARTS,
             configure_failed: false,
             consecutive_naks_sent: BTreeMap::new(),
             request_local_ip: true,
@@ -249,6 +251,10 @@ impl IpcpSession {
 
     pub fn set_log_context(&mut self, context: String) {
         self.log_context = Some(context);
+    }
+
+    pub fn set_max_configure_restarts(&mut self, restarts: u32) {
+        self.max_configure_restarts = restarts.max(1);
     }
 
     fn log_prefix(&self, label: &str) -> String {
@@ -317,7 +323,7 @@ impl IpcpSession {
         }
 
         self.configure_restarts = self.configure_restarts.saturating_add(1);
-        if self.configure_restarts > MAX_CONFIGURE_RESTARTS {
+        if self.configure_restarts > self.max_configure_restarts {
             log::warn!(
                 "{}: Configure-Request failed after {} retransmits",
                 self.log_prefix("IPCP"),
@@ -460,21 +466,34 @@ impl IpcpSession {
                     }
                 }
 
-                // RFC 1661 §5.3: append our IP-Address suggestion when the peer
-                // didn't list it, bounded by Max-Failure.
+                // HRPD Simple IP still has an assigned peer address even when
+                // the peer omits the IP-Address option. Bound repeated NAKs per
+                // RFC 1661 Max-Failure instead of wedging IPCP on DNS-only asks.
                 let peer_sent_ip = opts.iter().any(|o| o.opt_type == OPT_IP_ADDRESS);
-                if !peer_sent_ip
+                let keep_suggesting_missing_peer_ip = !peer_sent_ip
                     && !self.config.mobile_ip.enabled
-                    && self.nak_count(OPT_IP_ADDRESS) < MAX_FAILURE
-                {
+                    && self.nak_count(OPT_IP_ADDRESS) < MAX_FAILURE;
+                if keep_suggesting_missing_peer_ip {
                     appended.push(IpcpOption {
                         opt_type: OPT_IP_ADDRESS,
                         data: ip_to_bytes(self.config.peer_ip),
                     });
+                } else if !peer_sent_ip
+                    && !self.config.mobile_ip.enabled
+                    && self.nak_count(OPT_IP_ADDRESS) >= MAX_FAILURE
+                {
+                    log::info!(
+                        "{}: Max-Failure hit for omitted IP-Address option, accepting peer request with assigned peer={}",
+                        self.log_prefix("IPCP"),
+                        self.config.peer_ip
+                    );
                 }
 
                 // RFC 1661 §4.6: at Max-Failure, peer-sent NAKs convert to Reject.
                 peer_naks.retain(|opt| {
+                    if opt.opt_type == OPT_IP_ADDRESS && !self.config.mobile_ip.enabled {
+                        return true;
+                    }
                     if self.nak_count(opt.opt_type) >= MAX_FAILURE {
                         log::info!(
                             "{}: Max-Failure hit for option type={}, converting to Configure-Reject",
@@ -1140,10 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn omitted_peer_ip_accepts_after_max_failure() {
-        // RFC 1661 §4.6 Max-Failure: after MAX_FAILURE NAKs appending the
-        // IP-Address option (peer kept omitting it), we stop appending
-        // and ACK whatever the peer sent.
+    fn simple_ip_omitted_peer_ip_opens_after_max_failure() {
         let mut session = IpcpSession::new(IpcpConfig::default());
         session.start();
 
@@ -1188,11 +1204,13 @@ mod tests {
         let ack = IpcpPacket::parse(&responses[0].payload).unwrap();
         assert_eq!(ack.code, CONFIGURE_ACK);
         assert_eq!(ack.data, mobile_req_data);
+        assert!(!session.peer_ip_address_negotiated());
 
-        // ACK clears the counter per RFC §4.6.
-        assert_eq!(session.omitted_peer_ip_naks(), 0);
         assert_eq!(session.peer_ip(), Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(session.state, IpcpState::AckSent);
+        ack_last_request(&mut session);
+        assert_eq!(session.state, IpcpState::Opened);
+        assert_eq!(session.peer_ip(), Ipv4Addr::new(10, 0, 0, 2));
     }
 
     #[test]
@@ -1514,7 +1532,7 @@ mod tests {
         let mut session = IpcpSession::new(IpcpConfig::default());
         session.start();
 
-        for _ in 0..MAX_CONFIGURE_RESTARTS {
+        for _ in 0..DEFAULT_MAX_CONFIGURE_RESTARTS {
             for _ in 0..CONFIGURE_RESTART_TICKS {
                 assert!(session.maybe_retransmit_configure_request().is_none());
             }
@@ -1565,7 +1583,7 @@ mod tests {
     }
 
     #[test]
-    fn max_failure_converts_peer_ip_nak_to_reject() {
+    fn max_failure_converts_optional_peer_option_nak_to_reject() {
         // RFC 1661 §4.6: after MAX_FAILURE Configure-Naks for a
         // peer-requested option without an intervening Configure-Ack, the
         // option must be Configure-Rejected on the next round.
@@ -1576,10 +1594,16 @@ mod tests {
             let mobile_req = IpcpPacket {
                 code: CONFIGURE_REQUEST,
                 identifier: id as u8,
-                data: serialize_options(&[IpcpOption {
-                    opt_type: OPT_IP_ADDRESS,
-                    data: vec![10, 0, 0, 99], // not our peer_ip
-                }]),
+                data: serialize_options(&[
+                    IpcpOption {
+                        opt_type: OPT_IP_ADDRESS,
+                        data: vec![10, 0, 0, 2],
+                    },
+                    IpcpOption {
+                        opt_type: OPT_PRIMARY_DNS,
+                        data: vec![10, 0, 0, 99],
+                    },
+                ]),
             };
             let responses = session.receive(&mobile_req.to_ppp());
             assert_eq!(responses.len(), 1);
@@ -1587,14 +1611,20 @@ mod tests {
             assert_eq!(resp.code, CONFIGURE_NAK);
         }
 
-        // MAX_FAILURE+1: peer still proposes the same bad IP — we Reject.
+        // MAX_FAILURE+1: peer still proposes the same bad DNS — we Reject it.
         let mobile_req = IpcpPacket {
             code: CONFIGURE_REQUEST,
             identifier: (MAX_FAILURE + 1) as u8,
-            data: serialize_options(&[IpcpOption {
-                opt_type: OPT_IP_ADDRESS,
-                data: vec![10, 0, 0, 99],
-            }]),
+            data: serialize_options(&[
+                IpcpOption {
+                    opt_type: OPT_IP_ADDRESS,
+                    data: vec![10, 0, 0, 2],
+                },
+                IpcpOption {
+                    opt_type: OPT_PRIMARY_DNS,
+                    data: vec![10, 0, 0, 99],
+                },
+            ]),
         };
         let responses = session.receive(&mobile_req.to_ppp());
         assert_eq!(responses.len(), 1);
@@ -1602,7 +1632,7 @@ mod tests {
         assert_eq!(resp.code, CONFIGURE_REJECT);
         let reject_opts = parse_options(&resp.data);
         assert_eq!(reject_opts.len(), 1);
-        assert_eq!(reject_opts[0].opt_type, OPT_IP_ADDRESS);
+        assert_eq!(reject_opts[0].opt_type, OPT_PRIMARY_DNS);
         // The Rejected option echoes the peer's original value (RFC §5.4).
         assert_eq!(
             bytes_to_ip(&reject_opts[0].data),

@@ -17,7 +17,8 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 pub use cdma_a8::{
-    BearerProfile, Error, GrePacket, GreProtocolType, RebindMode, Result, SequencingMode,
+    BearerProfile, BearerTransportConfig, BearerTransportMode, Error, GrePacket, GreProtocolType,
+    RebindMode, Result, SequencingMode,
 };
 
 /// A10 bearer endpoint binding between the PCF and PDSN.

@@ -15,6 +15,7 @@ mod deinterleaver_processor;
 mod gardner_timing_recovery;
 pub mod generic_rake_receiver;
 mod hard_viterbi_decoder_r13_processor;
+pub mod hrpd_access_frame_correlator;
 mod long_code_descrambler;
 mod matched_filter_despreader;
 mod matched_filter_tracker;
@@ -61,6 +62,10 @@ pub use gardner_timing_recovery::{GardnerTimingConfig, GardnerTimingRecovery};
 pub use hard_viterbi_decoder_r13_processor::{
     HardViterbiDecoderR13Processor, HardViterbiDecoderR14Processor,
 };
+pub use hrpd_access_frame_correlator::{
+    HrpdAccessFrameCorrelator, HrpdAccessFrameFftConfig, HrpdAccessFrameFftHit,
+    HrpdAccessFrameRakeCorrelator,
+};
 pub use long_code_descrambler::LongCodeDescrambler;
 pub use matched_filter_despreader::MatchedFilterDespreader;
 pub use matched_filter_tracker::MatchedFilterTracker;
@@ -99,12 +104,13 @@ pub use walsh_pilot_combiner::WalshPilotCombiner;
 // Re-exports from extracted sub-modules
 use cdma_common::consts::SR1_CHIP_RATE_HZ;
 pub use chain_factories::*;
-pub use pn_helpers::chips_per_sample;
+pub use pn_helpers::{ShortCodeReferenceKind, chips_per_sample};
 pub(crate) use pn_helpers::{
-    build_fft_search_pn_samples, build_matched_pn_reference, build_oqpsk_pn_samples,
+    build_fft_search_pn_samples, build_fft_search_pn_samples_with_kind, build_matched_pn_reference,
+    build_oqpsk_pn_samples, build_oqpsk_pn_samples_with_kind,
 };
 pub use runner::{PipelinedReceiver, flush_sub_chain, run_sub_chain};
-pub use sample_block::SampleBlock;
+pub use sample_block::{RxSampleTimeAnchor, SampleBlock};
 
 #[cfg(test)]
 pub(crate) use rc3_bpsk_despread::Rc3BpskDespread;
@@ -235,12 +241,15 @@ pub trait PipelineProcessor: Send {
 #[cfg(test)]
 mod tests {
     use std::env;
+    use std::f64::consts::PI;
     use std::ffi::OsStr;
     use std::path::{Component, Path, PathBuf};
 
     use env_logger::Env;
     use num_complex::Complex32;
+    use serde::Deserialize;
 
+    use super::HrpdReverseAccessSettings;
     use super::{
         AccessChannelProcessor, AcquisitionFftProcessor, DeinterleaverProcessor,
         LongCodeDescrambler, MatchedFilterDespreader, MobileStation, PagingChannelProcessor,
@@ -249,7 +258,7 @@ mod tests {
         ReverseAccessOrthogonalDemodProcessor, ReverseAccessSettings, SampleBlock,
         SoftViterbiDecoderProcessor, SyncChannelProcessor, Unrepeater, WalshDecoderProcessor,
         WalshPilotCombiner, access_channel_chain, build_fft_search_pn_samples,
-        build_oqpsk_pn_samples, reverse_access_chain,
+        build_oqpsk_pn_samples, hrpd_reverse_access_chain,
     };
     use crate::lac::crc30;
     use crate::phy::coding::long_code::LongCodeGenerator;
@@ -260,14 +269,16 @@ mod tests {
         },
     };
     use crate::phy::walsh::{WalshDecoder, WalshGenerator};
+    use crate::receiver::hrpd::access::{
+        ACCESS_CHIP_RATE, ACCESS_PACKET_CHIPS, AccessFrameLayout, AccessPhyDecodeAttempt,
+        decode_access_phy_chips_attempt, parse_access_mac_capsule, validate_access_mac_fragment,
+    };
     use crate::receiver::paging::PagingChannelRate;
-    use crate::receiver::pipelined::PeakSampleDecimator;
     use crate::receiver::pipelined::decimator_processor::DecimatorProcessor;
-    use crate::receiver::pipelined::matched_filter_tracker::MatchedFilterTracker;
     use crate::receiver::pipelined::mobile_station::PagingRate;
     use crate::receiver::pipelined::rake_receiver::RakeReceiver;
     use crate::receiver::{access_layer3::AccessMessage, layer3::PagingMessage};
-    use crate::sdr::cdma2000_baseband_filter_taps_f64;
+    use crate::sdr::fir::ComplexFir32;
     use cdma_common::bits::Bitstream;
 
     fn workspace_fixture_path(relative: impl AsRef<Path>) -> PathBuf {
@@ -302,6 +313,31 @@ mod tests {
 
     fn test_capture_path(file_name: &str) -> PathBuf {
         workspace_fixture_path(Path::new("test").join("capture").join(file_name))
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct IqCaptureMetadata {
+        sample_rate_hz: usize,
+        chip_rate_hz: usize,
+        rx_center_frequency_hz: Option<usize>,
+        one_x_reverse_frequency_hz: Option<usize>,
+        one_x_rx_shift_hz: Option<i64>,
+        hrpd_reverse_frequency_hz: Option<usize>,
+        hrpd_rx_shift_hz: Option<i64>,
+        first_absolute_sample_start: u64,
+    }
+
+    #[allow(dead_code)]
+    fn test_capture_metadata(file_name: &str) -> IqCaptureMetadata {
+        let path = test_capture_path(file_name);
+        test_capture_metadata_from_path(&path)
+    }
+
+    fn test_capture_metadata_from_path(path: &Path) -> IqCaptureMetadata {
+        let raw = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+        serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("failed to parse {}: {e}", path.display()))
     }
 
     fn init_test_logger() {
@@ -396,139 +432,7 @@ mod tests {
         );
     }
 
-    #[derive(Clone, Copy, Debug)]
-    enum TestDownlinkDecimatorMode {
-        Sum,
-        Peak,
-        FixedPhase(usize),
-    }
-
-    impl TestDownlinkDecimatorMode {
-        fn from_env() -> Self {
-            let Ok(raw) = env::var("CDMA_TEST_DECIMATOR_MODE") else {
-                return if env::var("CDMA_TEST_WAV").is_ok() {
-                    Self::FixedPhase(3)
-                } else {
-                    Self::Sum
-                };
-            };
-            let normalized = raw.trim().to_ascii_lowercase();
-            if normalized.is_empty() || normalized == "sum" {
-                return Self::Sum;
-            }
-            if normalized == "peak" {
-                return Self::Peak;
-            }
-            if let Some(phase) = normalized.strip_prefix("fixed:") {
-                if let Ok(phase) = phase.parse::<usize>() {
-                    return Self::FixedPhase(phase);
-                }
-            }
-            if let Some(phase) = normalized.strip_prefix("phase") {
-                if let Ok(phase) = phase.parse::<usize>() {
-                    return Self::FixedPhase(phase);
-                }
-            }
-            Self::Sum
-        }
-
-        fn label(self) -> String {
-            match self {
-                Self::Sum => "sum".to_string(),
-                Self::Peak => "peak".to_string(),
-                Self::FixedPhase(phase) => format!("fixed:{phase}"),
-            }
-        }
-    }
-
-    struct FixedPhaseDecimator {
-        rate: usize,
-        phase: usize,
-    }
-
-    impl FixedPhaseDecimator {
-        fn new(rate: usize, phase: usize) -> Self {
-            Self {
-                rate: rate.max(1),
-                phase,
-            }
-        }
-    }
-
-    impl PipelineProcessor for FixedPhaseDecimator {
-        fn process_block(&mut self, block: SampleBlock) -> Vec<SampleBlock> {
-            if self.rate <= 1 {
-                return vec![block];
-            }
-            assert_eq!(block.len() % self.rate, 0);
-            let phase = self.phase.min(self.rate - 1);
-            let samples = block
-                .samples
-                .chunks_exact(self.rate)
-                .map(|chunk| chunk[phase])
-                .collect::<Vec<_>>();
-            vec![
-                SampleBlock::new(samples, block.chip_start / self.rate)
-                    .with_sample_rate_hz(block.sample_rate_hz / self.rate as f64)
-                    .with_tags(block.tags),
-            ]
-        }
-
-        fn name(&self) -> &'static str {
-            "FixedPhaseDecimator"
-        }
-    }
-
-    fn test_pn_align_extra_drop_samples() -> usize {
-        env::var("CDMA_TEST_PN_ALIGN_DROP_SAMPLES")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(0)
-    }
-
-    fn test_rake_reference_filter_passes() -> usize {
-        env::var("CDMA_TEST_RAKE_REFERENCE_FILTER_PASSES")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(1)
-    }
-
-    fn test_rake_despread_phase_offset_override() -> Option<usize> {
-        env::var("CDMA_TEST_RAKE_DESPREAD_PHASE_OFFSET")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-    }
-
-    fn test_rake_despread_phase_offset(
-        decimator_mode: TestDownlinkDecimatorMode,
-        reference_filter_passes: usize,
-    ) -> Option<usize> {
-        if let Some(offset) = test_rake_despread_phase_offset_override() {
-            return Some(offset);
-        }
-        if env::var("CDMA_TEST_WAV").is_ok()
-            && reference_filter_passes > 0
-            && let TestDownlinkDecimatorMode::FixedPhase(phase) = decimator_mode
-        {
-            let per_pass_group_delay = cdma2000_baseband_filter_taps_f64().len() / 2;
-            return Some(
-                per_pass_group_delay
-                    .saturating_mul(reference_filter_passes)
-                    .saturating_add(phase),
-            );
-        }
-        None
-    }
-
     fn open_baseband_downlink_4x_reader() -> hound::WavReader<std::io::BufReader<std::fs::File>> {
-        if let Ok(path) = std::env::var("CDMA_TEST_WAV") {
-            if Path::new(&path).exists() {
-                return hound::WavReader::open(&path)
-                    .unwrap_or_else(|e| panic!("failed to open {path}: {e}"));
-            }
-            panic!("CDMA_TEST_WAV path does not exist: {path}");
-        }
-
         let path = test_capture_path("baseband_downlink_4x.wav");
         if path.exists() {
             return hound::WavReader::open(&path)
@@ -536,22 +440,6 @@ mod tests {
         }
 
         panic!("could not find baseband_downlink_4x.wav in known locations");
-    }
-
-    fn open_uplink_wav_reader_from_env()
-    -> Option<hound::WavReader<std::io::BufReader<std::fs::File>>> {
-        let Ok(path) = std::env::var("CDMA_TEST_WAV") else {
-            eprintln!("CDMA_TEST_WAV not set; skipping uplink WAV test");
-            return None;
-        };
-        if !Path::new(&path).exists() {
-            eprintln!("CDMA_TEST_WAV path does not exist; skipping: {path}");
-            return None;
-        }
-        Some(
-            hound::WavReader::open(&path)
-                .unwrap_or_else(|e| panic!("failed to open uplink wav {path}: {e}")),
-        )
     }
 
     fn read_iq_wav(
@@ -567,6 +455,398 @@ mod tests {
             .map(|a| Complex32::new(a[0] as f32 / i16::MAX as f32, a[1] as f32 / i16::MAX as f32))
             .collect::<Vec<_>>();
         (sample_rate, iq_samples)
+    }
+
+    fn test_carrier_slice_anti_alias_taps(
+        decimation: usize,
+        sample_rate_hz: usize,
+        chip_rate_hz: usize,
+    ) -> Vec<f64> {
+        let taps = 63usize;
+        let center = (taps - 1) as f64 / 2.0;
+        let nyquist = sample_rate_hz as f64 / 2.0;
+        let alias_cutoff = sample_rate_hz as f64 / (2.0 * decimation as f64) * 0.82;
+        let occupied_cutoff = chip_rate_hz as f64 * 1.25;
+        let cutoff_hz = alias_cutoff.min(occupied_cutoff).min(nyquist * 0.95);
+        let fc = cutoff_hz / sample_rate_hz as f64;
+        let mut out = Vec::with_capacity(taps);
+        for n in 0..taps {
+            let x = n as f64 - center;
+            let sinc = if x.abs() < f64::EPSILON {
+                2.0 * fc
+            } else {
+                (2.0 * PI * fc * x).sin() / (PI * x)
+            };
+            let window = 0.42 - 0.5 * (2.0 * PI * n as f64 / (taps - 1) as f64).cos()
+                + 0.08 * (4.0 * PI * n as f64 / (taps - 1) as f64).cos();
+            out.push(sinc * window);
+        }
+        let gain: f64 = out.iter().sum();
+        if gain.abs() > f64::EPSILON {
+            for tap in &mut out {
+                *tap /= gain;
+            }
+        }
+        out
+    }
+
+    fn push_filtered_decimated_chunk(
+        filter: &mut ComplexFir32,
+        i_vals: &[f32],
+        q_vals: &[f32],
+        raw_chunk_start: u64,
+        raw_abs_start: u64,
+        decimation: usize,
+        out: &mut Vec<Complex32>,
+    ) {
+        let chunk = i_vals
+            .iter()
+            .zip(q_vals)
+            .map(|(&re, &im)| Complex32::new(re, im))
+            .collect::<Vec<_>>();
+        let filtered = filter.process_block(&chunk);
+        for (idx, sample) in filtered.into_iter().enumerate() {
+            let raw_idx = raw_chunk_start + idx as u64;
+            if (raw_abs_start + raw_idx) % decimation as u64 == 0 {
+                out.push(sample);
+            }
+        }
+    }
+
+    fn read_shifted_capture_to_4x_with_shift(
+        wav_path: &Path,
+        metadata: &IqCaptureMetadata,
+        carrier_shift_hz: i64,
+    ) -> (u32, Vec<Complex32>, u64) {
+        let mut reader = hound::WavReader::open(wav_path)
+            .unwrap_or_else(|e| panic!("failed to open {}: {e}", wav_path.display()));
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 2, "capture WAV must be stereo IQ");
+        assert_eq!(
+            spec.sample_rate as usize, metadata.sample_rate_hz,
+            "capture WAV sample rate must match sidecar metadata"
+        );
+        assert_eq!(
+            metadata.sample_rate_hz % metadata.chip_rate_hz,
+            0,
+            "capture rate must be an integer chip-rate multiple"
+        );
+
+        let input_oversample = metadata.sample_rate_hz / metadata.chip_rate_hz;
+        assert!(
+            input_oversample >= 4 && input_oversample % 4 == 0,
+            "capture oversample must be a multiple of 4x, got {input_oversample}x"
+        );
+        let decimation = input_oversample / 4;
+        let output_sample_rate_hz = metadata.sample_rate_hz / decimation;
+        let output_oversample = output_sample_rate_hz / metadata.chip_rate_hz;
+        assert_eq!(output_oversample, 4);
+
+        let phase_step = -2.0 * PI * carrier_shift_hz as f64 / metadata.sample_rate_hz as f64;
+        let taps = test_carrier_slice_anti_alias_taps(
+            decimation,
+            metadata.sample_rate_hz,
+            metadata.chip_rate_hz,
+        );
+        let mut filter = ComplexFir32::new(&taps);
+
+        let first_idx = if decimation <= 1 {
+            0
+        } else {
+            let rem = metadata.first_absolute_sample_start % decimation as u64;
+            ((decimation as u64 - rem) % decimation as u64) as usize
+        };
+        let output_absolute_sample_start =
+            (metadata.first_absolute_sample_start + first_idx as u64) / decimation as u64;
+
+        let expected_output_len = reader.duration() as usize / spec.channels as usize / decimation;
+        let mut out = Vec::with_capacity(expected_output_len);
+        let mut i_vals = Vec::with_capacity(65_536);
+        let mut q_vals = Vec::with_capacity(65_536);
+        let mut phase = 0.0f64;
+        let mut raw_sample_idx = 0u64;
+        let mut raw_chunk_start = 0u64;
+        let mut samples = reader.samples::<i16>();
+
+        loop {
+            let i = match samples.next() {
+                Some(Ok(v)) => v,
+                Some(Err(e)) => panic!("failed to read I sample from {}: {e}", wav_path.display()),
+                None => break,
+            };
+            let q = match samples.next() {
+                Some(Ok(v)) => v,
+                Some(Err(e)) => panic!("failed to read Q sample from {}: {e}", wav_path.display()),
+                None => panic!("capture WAV {} ended mid-IQ pair", wav_path.display()),
+            };
+
+            let sample = Complex32::new(i as f32 / i16::MAX as f32, q as f32 / i16::MAX as f32);
+            let rot = Complex32::new(phase.cos() as f32, phase.sin() as f32);
+            let shifted = sample * rot;
+            i_vals.push(shifted.re);
+            q_vals.push(shifted.im);
+
+            phase += phase_step;
+            if phase > PI || phase < -PI {
+                phase = (phase + PI).rem_euclid(2.0 * PI) - PI;
+            }
+            raw_sample_idx += 1;
+
+            if i_vals.len() == i_vals.capacity() {
+                push_filtered_decimated_chunk(
+                    &mut filter,
+                    &i_vals,
+                    &q_vals,
+                    raw_chunk_start,
+                    metadata.first_absolute_sample_start,
+                    decimation,
+                    &mut out,
+                );
+                raw_chunk_start = raw_sample_idx;
+                i_vals.clear();
+                q_vals.clear();
+            }
+        }
+
+        if !i_vals.is_empty() {
+            push_filtered_decimated_chunk(
+                &mut filter,
+                &i_vals,
+                &q_vals,
+                raw_chunk_start,
+                metadata.first_absolute_sample_start,
+                decimation,
+                &mut out,
+            );
+        }
+
+        (
+            output_sample_rate_hz as u32,
+            out,
+            output_absolute_sample_start,
+        )
+    }
+
+    fn hrpd_slot_aligned_samples(
+        samples: &[Complex32],
+        first_chip: u64,
+        oversample: usize,
+    ) -> (&[Complex32], u64, usize) {
+        let offset_chips = (2048 - (first_chip % 2048)) % 2048;
+        let offset_samples = offset_chips as usize * oversample;
+        if offset_samples >= samples.len() {
+            (&[], first_chip + offset_chips, offset_samples)
+        } else {
+            (
+                &samples[offset_samples..],
+                first_chip + offset_chips,
+                offset_samples,
+            )
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct HrpdSlotPowerRun {
+        start_slot: usize,
+        end_slot: usize,
+        start_chip: u64,
+        end_chip: u64,
+        peak_db: f32,
+    }
+
+    fn hrpd_slot_power_runs_at_threshold(
+        samples: &[Complex32],
+        first_chip: u64,
+        oversample: usize,
+        threshold_db: f32,
+    ) -> Vec<HrpdSlotPowerRun> {
+        let slot_samples = 2048 * oversample;
+        let (slot_aligned_samples, aligned_first_chip, _) =
+            hrpd_slot_aligned_samples(samples, first_chip, oversample);
+        let powers = slot_aligned_samples
+            .chunks_exact(slot_samples)
+            .enumerate()
+            .map(|(slot_idx, slot)| {
+                let pwr = slot.iter().map(|s| s.norm_sqr()).sum::<f32>() / slot.len() as f32;
+                (slot_idx, pwr)
+            })
+            .collect::<Vec<_>>();
+        if powers.is_empty() {
+            return Vec::new();
+        }
+        let mut sorted = powers.iter().map(|(_, pwr)| *pwr).collect::<Vec<_>>();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let median = sorted[sorted.len() / 2].max(1.0e-12);
+
+        let mut runs = Vec::new();
+        let mut run_start: Option<usize> = None;
+        let mut run_peak = f32::NEG_INFINITY;
+        for (slot_idx, pwr) in powers
+            .iter()
+            .copied()
+            .chain(std::iter::once((powers.len(), 0.0)))
+        {
+            let rel_db = 10.0 * (pwr / median).max(1.0e-12).log10();
+            if rel_db >= threshold_db {
+                run_start.get_or_insert(slot_idx);
+                run_peak = run_peak.max(rel_db);
+                continue;
+            }
+            if let Some(start_slot) = run_start.take() {
+                let end_slot = slot_idx;
+                let start_chip = aligned_first_chip + start_slot as u64 * 2048;
+                let end_chip = aligned_first_chip + end_slot as u64 * 2048;
+                runs.push(HrpdSlotPowerRun {
+                    start_slot,
+                    end_slot,
+                    start_chip,
+                    end_chip,
+                    peak_db: run_peak,
+                });
+                run_peak = f32::NEG_INFINITY;
+            }
+        }
+        runs
+    }
+
+    fn hrpd_blind_preamble_lag_coherence(
+        samples: &[Complex32],
+        absolute_sample_start: u64,
+        oversample: usize,
+        preamble_start_chip: i64,
+        sample_delay: i32,
+        sample_delay_fraction: f32,
+    ) -> Option<(f32, f32)> {
+        let stride = 64usize;
+        let mut dot = Complex32::new(0.0, 0.0);
+        let mut pow_a = 0.0f32;
+        let mut pow_b = 0.0f32;
+        for k in (0..ACCESS_PACKET_CHIPS).step_by(stride) {
+            let a = sample_chip_interp(
+                samples,
+                absolute_sample_start,
+                oversample,
+                preamble_start_chip + k as i64,
+                sample_delay,
+                sample_delay_fraction,
+            )?;
+            let b = sample_chip_interp(
+                samples,
+                absolute_sample_start,
+                oversample,
+                preamble_start_chip + ACCESS_PACKET_CHIPS as i64 + k as i64,
+                sample_delay,
+                sample_delay_fraction,
+            )?;
+            dot += a.conj() * b;
+            pow_a += a.norm_sqr();
+            pow_b += b.norm_sqr();
+        }
+        let coherence = dot.norm() / (pow_a * pow_b).sqrt().max(1.0e-12);
+        Some((coherence, dot.arg()))
+    }
+
+    fn pack_bits_to_bytes(bits: &[u8]) -> Vec<u8> {
+        bits.chunks(8)
+            .map(|chunk| chunk.iter().fold(0u8, |acc, &bit| (acc << 1) | (bit & 1)))
+            .collect()
+    }
+
+    fn interp_complex_linear(samples: &[Complex32], idx: f64) -> Option<Complex32> {
+        if idx < 0.0 {
+            return None;
+        }
+        let i0 = idx.floor() as usize;
+        let i1 = i0 + 1;
+        if i1 >= samples.len() {
+            return None;
+        }
+        let frac = (idx - i0 as f64) as f32;
+        Some(samples[i0] * (1.0 - frac) + samples[i1] * frac)
+    }
+
+    fn sample_chip_interp(
+        samples: &[Complex32],
+        absolute_sample_start: u64,
+        oversample: usize,
+        chip: i64,
+        sample_delay: i32,
+        sample_delay_fraction: f32,
+    ) -> Option<Complex32> {
+        let sample_abs = chip as f64 * oversample as f64
+            + f64::from(sample_delay)
+            + f64::from(sample_delay_fraction);
+        let sample_idx = sample_abs - absolute_sample_start as f64;
+        interp_complex_linear(samples, sample_idx)
+    }
+
+    fn complex_phase(phase: f32) -> Complex32 {
+        Complex32::new(phase.cos(), phase.sin())
+    }
+
+    fn blind_hrpd_access_attempt_from_preamble(
+        samples: &[Complex32],
+        absolute_sample_start: u64,
+        oversample: usize,
+        preamble_start_chip: i64,
+        sample_delay: i32,
+        sample_delay_fraction: f32,
+        preamble_frames: usize,
+        packet_frame: usize,
+        phase_step: f32,
+    ) -> Option<(Vec<Complex32>, AccessPhyDecodeAttempt)> {
+        let frame_chips = ACCESS_PACKET_CHIPS;
+        let mut periods = Vec::with_capacity(preamble_frames);
+        for frame in 0..preamble_frames {
+            let frame_start = preamble_start_chip + (frame * frame_chips) as i64;
+            let mut period = Vec::with_capacity(frame_chips);
+            for k in 0..frame_chips {
+                period.push(sample_chip_interp(
+                    samples,
+                    absolute_sample_start,
+                    oversample,
+                    frame_start + k as i64,
+                    sample_delay,
+                    sample_delay_fraction,
+                )?);
+            }
+            periods.push(period);
+        }
+
+        let mut reference = vec![Complex32::new(0.0, 0.0); frame_chips];
+        for (frame, period) in periods.iter().enumerate() {
+            let correction = complex_phase(-phase_step * frame as f32);
+            for (acc, sample) in reference.iter_mut().zip(period) {
+                *acc += *sample * correction;
+            }
+        }
+        let scale = 1.0 / preamble_frames.max(1) as f32;
+        for value in &mut reference {
+            *value *= scale;
+        }
+        let mean_ref_power =
+            reference.iter().map(|v| v.norm_sqr()).sum::<f32>() / frame_chips as f32;
+        let inverse_floor = (mean_ref_power * 0.02).max(1.0e-10);
+
+        let data_start =
+            preamble_start_chip + ((preamble_frames + packet_frame) * frame_chips) as i64;
+        let packet_phase_correction =
+            complex_phase(-phase_step * (preamble_frames + packet_frame) as f32);
+        let mut chips = Vec::with_capacity(frame_chips);
+        for (k, reference_chip) in reference.iter().enumerate() {
+            let sample = sample_chip_interp(
+                samples,
+                absolute_sample_start,
+                oversample,
+                data_start + k as i64,
+                sample_delay,
+                sample_delay_fraction,
+            )?;
+            let denom = reference_chip.norm_sqr().max(inverse_floor);
+            chips.push(sample * reference_chip.conj() * (1.0 / denom) * packet_phase_correction);
+        }
+
+        decode_access_phy_chips_attempt(&chips).map(|attempt| (chips, attempt))
     }
 
     fn event_block_payload_bits(blk: &super::SampleBlock) -> Vec<u8> {
@@ -684,7 +964,7 @@ mod tests {
             .map(|a| Complex32::new(a[0] as f32 / i16::MAX as f32, a[1] as f32 / i16::MAX as f32))
             .collect::<Vec<_>>();
 
-        let mut receiver = PipelinedReceiver::new(iq_samples.into_iter())
+        let mut receiver = PipelinedReceiver::new(iq_samples.clone().into_iter())
             .with_input_sample_rate_hz(sample_rate as f64)
             .with_trace_files("analysis/pipeline_stage_wavs/pilot_basic");
         let chain: Vec<PipelineProcessorShared> = vec![
@@ -729,131 +1009,6 @@ mod tests {
             max_abs > 1e-4,
             "expected non-trivial pilot extraction amplitude, got {max_abs}"
         );
-    }
-
-    /// Superseded by capture_pipelined_integration_extracts_pilot_from_baseband_downlink_4x
-    /// and e2e_sync_stack tests which use GenericRakeReceiver.
-    #[ignore]
-    #[test]
-    fn test_pipelined_integration_parses_sync_message_with_mobile_station_processor() {
-        let mut reader = open_baseband_downlink_4x_reader();
-        let sample_rate = reader.spec().sample_rate;
-        let samples = reader
-            .samples::<i16>()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let iq_samples = samples
-            .chunks_exact(2)
-            .map(|a| Complex32::new(a[0] as f32 / i16::MAX as f32, a[1] as f32 / i16::MAX as f32))
-            .collect::<Vec<_>>();
-
-        for conj_pn in [false] {
-            for swap_pair in [false] {
-                for conv_invert in [false] {
-                    eprintln!(
-                        "=== trying conj_pn={} swap_pair={} conv_invert={} ===",
-                        conj_pn, swap_pair, conv_invert
-                    );
-                    let mut receiver = PipelinedReceiver::new(iq_samples.clone().into_iter())
-                        .with_input_sample_rate_hz(sample_rate as f64)
-                        .with_trace_files(format!(
-                            "analysis/pipeline_stage_wavs/sync_basic_conv{}",
-                            conv_invert as u8
-                        ));
-                    let chain: Vec<PipelineProcessorShared> = vec![
-                        Box::new(PulseMatchedFilterProcessor::new()),
-                        /*Box::new(
-                            AcquisitionFftProcessor::new_with_window_chips(sample_rate, 32768, 4)
-                                //.with_noncoherent_segment_chips(1024)
-                                .with_snr_threshold_db(9.0),
-                        ),
-                        Box::new(
-                            MatchedFilterDespreader::new(sample_rate)
-                                .with_frame_chip_alignment(32768)
-                                .with_conjugate_pn(conj_pn),
-                        ),*/
-                        Box::new(MatchedFilterTracker::new(4)),
-                        Box::new(PnAlignProcessor::new(4).with_reset_on_tag("upstream_lock_lost")),
-                        Box::new(DecimatorProcessor::new(4)),
-                        //Box::new(SlidingCorrelatorProcessor::new(sample_rate)),
-                        Box::new(WalshPilotCombiner::new(
-                            WalshDecoder::new::<64>(32),
-                            WalshDecoder::new::<64>(0),
-                        )),
-                        //Box::new(WalshDecoderProcessor::new(WalshDecoder::new::<64>(32))),
-                        Box::new(Unrepeater::new(4)),
-                        Box::new(
-                            DeinterleaverProcessor::new(
-                                BitReversalInterleaver::new(block_interleaver::SR1_PARAMS_128),
-                                2,
-                            )
-                            .with_offset_search((0..128).collect(), 12, 1)
-                            .with_offset_search_warmup(16)
-                            .with_offset_search_batch_size(4)
-                            .with_offset_search_confirm_passes(1)
-                            .with_reset_on_tag("upstream_lock_lost"),
-                        ),
-                        Box::new(SoftViterbiDecoderProcessor::new(
-                            SoftViterbiDecoder::new(get_1_2_k9_encoder()),
-                            swap_pair,
-                            conv_invert,
-                        )),
-                        Box::new(
-                            SyncChannelProcessor::new().with_reset_on_tag("upstream_lock_lost"),
-                        ),
-                    ];
-
-                    let out_rx = receiver.add_pipeline(chain);
-                    receiver.run_pipeline().unwrap();
-
-                    let mut events = 0usize;
-                    let mut saw_sync_type = false;
-                    let mut saw_pilot_pn = false;
-                    let mut saw_sys_time = false;
-                    for blocks in out_rx {
-                        for blk in blocks {
-                            if blk.tags.get("ms_sync_event") == Some(&1) {
-                                events += 1;
-                                eprintln!(
-                                    "=== SYNC MESSAGE #{} ===\n  pilot_pn={:?} sys_time={:?} sid={:?} nid={:?} msg_type={:?}",
-                                    events,
-                                    blk.tags.get("sync_pilot_pn"),
-                                    blk.tags.get("sync_sys_time"),
-                                    blk.tags.get("sync_sid"),
-                                    blk.tags.get("sync_nid"),
-                                    blk.tags.get("sync_msg_type"),
-                                );
-                            }
-                            if blk.tags.get("sync_msg_type") == Some(&1) {
-                                saw_sync_type = true;
-                            }
-                            if blk.tags.contains_key("sync_pilot_pn") {
-                                saw_pilot_pn = true;
-                            }
-                            if blk.tags.contains_key("sync_sys_time") {
-                                saw_sys_time = true;
-                            }
-                        }
-                    }
-
-                    eprintln!("total sync events: {}", events);
-
-                    if events > 0 {
-                        eprintln!(
-                            ">>> SYNC DECODED with conj_pn={} swap_pair={} conv_invert={}",
-                            conj_pn, swap_pair, conv_invert
-                        );
-                        assert!(saw_sync_type, "expected sync_msg_type=1 in parsed event");
-                        assert!(saw_pilot_pn, "expected parsed sync_pilot_pn field");
-                        assert!(saw_sys_time, "expected parsed sync_sys_time field");
-
-                        return;
-                    }
-                }
-            }
-        }
-
-        panic!("expected at least one parsed sync message event");
     }
 
     /// Analyze autocorrelation sidelobes: raw PN vs matched-filtered PN
@@ -1048,122 +1203,6 @@ mod tests {
         cross_corr(&pn_filtered, "Filtered PN");
     }
 
-    /// Superseded by capture_pipelined_integration_extracts_pilot_from_baseband_downlink_4x
-    /// and e2e_sync_stack tests which use GenericRakeReceiver.
-    #[ignore]
-    #[test]
-    fn test_rake_receiver_parses_sync_message() {
-        let mut reader = open_baseband_downlink_4x_reader();
-        let sample_rate = reader.spec().sample_rate;
-        let samples = reader
-            .samples::<i16>()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let iq_samples = samples
-            .chunks_exact(2)
-            .map(|a| Complex32::new(a[0] as f32 / i16::MAX as f32, a[1] as f32 / i16::MAX as f32))
-            .collect::<Vec<_>>();
-
-        let swap_pair = false;
-        let conv_invert = false;
-        let decimator_mode = TestDownlinkDecimatorMode::from_env();
-        let pn_align_extra_drop_samples = test_pn_align_extra_drop_samples();
-        let rake_reference_filter_passes = test_rake_reference_filter_passes();
-        let rake_despread_phase_offset =
-            test_rake_despread_phase_offset(decimator_mode, rake_reference_filter_passes);
-        let use_raw_rake_despreading = rake_despread_phase_offset.is_some();
-
-        eprintln!(
-            "MobileStation test config: decimator={} pn_align_extra_drop_samples={} rake_reference_filter_passes={} rake_despread_phase_offset={:?} use_raw_rake_despreading={}",
-            decimator_mode.label(),
-            pn_align_extra_drop_samples,
-            rake_reference_filter_passes,
-            rake_despread_phase_offset,
-            use_raw_rake_despreading,
-        );
-
-        let mut receiver = PipelinedReceiver::new(iq_samples.into_iter())
-            .with_input_sample_rate_hz(sample_rate as f64);
-
-        let mut rake = RakeReceiver::new_with_reference_filter_passes(
-            4,
-            Box::new(move || -> Vec<PipelineProcessorShared> {
-                let decimator: PipelineProcessorShared = match decimator_mode {
-                    TestDownlinkDecimatorMode::Sum => Box::new(DecimatorProcessor::new(4)),
-                    TestDownlinkDecimatorMode::Peak => Box::new(PeakSampleDecimator::new(4)),
-                    TestDownlinkDecimatorMode::FixedPhase(phase) => {
-                        Box::new(FixedPhaseDecimator::new(4, phase))
-                    }
-                };
-                vec![
-                    Box::new(
-                        PnAlignProcessor::new(4)
-                            .with_additional_drop_samples(pn_align_extra_drop_samples),
-                    ),
-                    decimator,
-                    Box::new(WalshPilotCombiner::new(
-                        WalshDecoder::new::<64>(32),
-                        WalshDecoder::new::<64>(0),
-                    )),
-                    Box::new(Unrepeater::new(4)),
-                    Box::new(
-                        DeinterleaverProcessor::new(
-                            BitReversalInterleaver::new(block_interleaver::SR1_PARAMS_128),
-                            2,
-                        )
-                        .with_offset_search((0..128).collect(), 12, 1)
-                        .with_offset_search_warmup(16)
-                        .with_offset_search_batch_size(4)
-                        .with_offset_search_confirm_passes(1),
-                    ),
-                    Box::new(SoftViterbiDecoderProcessor::new(
-                        SoftViterbiDecoder::new(get_1_2_k9_encoder()),
-                        swap_pair,
-                        conv_invert,
-                    )),
-                    Box::new(SyncChannelProcessor::new()),
-                ]
-            }),
-            rake_reference_filter_passes,
-        );
-        if let Some(offset) = rake_despread_phase_offset {
-            rake = rake.with_despread_phase_offset_override(offset);
-        }
-        rake = rake.with_raw_pn_despreading(use_raw_rake_despreading);
-
-        let chain: Vec<PipelineProcessorShared> =
-            vec![Box::new(PulseMatchedFilterProcessor::new()), Box::new(rake)];
-
-        let out_rx = receiver.add_pipeline(chain);
-        receiver.run_pipeline().unwrap();
-
-        let mut events = 0usize;
-        let mut saw_sync_type = false;
-        let mut saw_pilot_pn = false;
-        for blocks in out_rx {
-            for blk in blocks {
-                if blk.tags.get("ms_sync_event") == Some(&1) {
-                    events += 1;
-                    eprintln!("RAKE sync event: {:?}", blk.tags);
-                }
-                if blk.tags.get("sync_msg_type") == Some(&1) {
-                    saw_sync_type = true;
-                }
-                if blk.tags.contains_key("sync_pilot_pn") {
-                    saw_pilot_pn = true;
-                }
-            }
-        }
-
-        eprintln!("RAKE receiver: {} sync events", events);
-        assert!(
-            events > 0,
-            "expected at least one parsed sync message from RAKE receiver"
-        );
-        assert!(saw_sync_type, "expected sync_msg_type=1");
-        assert!(saw_pilot_pn, "expected sync_pilot_pn field");
-    }
-
     #[test]
     #[ignore = "needs re-evaluation on cdma-ms branch; MobileStation+rake integration will be addressed there"]
     fn test_mobile_station_with_rake_receiver() {
@@ -1181,41 +1220,16 @@ mod tests {
 
         let swap_pair = false;
         let conv_invert = false;
-        let decimator_mode = TestDownlinkDecimatorMode::from_env();
-        let pn_align_extra_drop_samples = test_pn_align_extra_drop_samples();
-        let rake_reference_filter_passes = test_rake_reference_filter_passes();
-        let rake_despread_phase_offset =
-            test_rake_despread_phase_offset(decimator_mode, rake_reference_filter_passes);
-        let use_raw_rake_despreading = rake_despread_phase_offset.is_some();
-
-        eprintln!(
-            "MobileStation test config: decimator={} pn_align_extra_drop_samples={} rake_reference_filter_passes={} rake_despread_phase_offset={:?} use_raw_rake_despreading={}",
-            decimator_mode.label(),
-            pn_align_extra_drop_samples,
-            rake_reference_filter_passes,
-            rake_despread_phase_offset,
-            use_raw_rake_despreading,
-        );
 
         let mut receiver = PipelinedReceiver::new(iq_samples.into_iter())
             .with_input_sample_rate_hz(sample_rate as f64);
 
-        let mut rake = RakeReceiver::new_with_reference_filter_passes(
+        let rake = RakeReceiver::new_with_reference_filter_passes(
             4,
             Box::new(move || -> Vec<PipelineProcessorShared> {
-                let decimator: PipelineProcessorShared = match decimator_mode {
-                    TestDownlinkDecimatorMode::Sum => Box::new(DecimatorProcessor::new(4)),
-                    TestDownlinkDecimatorMode::Peak => Box::new(PeakSampleDecimator::new(4)),
-                    TestDownlinkDecimatorMode::FixedPhase(phase) => {
-                        Box::new(FixedPhaseDecimator::new(4, phase))
-                    }
-                };
                 vec![
-                    Box::new(
-                        PnAlignProcessor::new(4)
-                            .with_additional_drop_samples(pn_align_extra_drop_samples),
-                    ),
-                    decimator,
+                    Box::new(PnAlignProcessor::new(4)),
+                    Box::new(DecimatorProcessor::new(4)),
                     Box::new(MobileStation::new(
                         // Sync sub-chain
                         vec![
@@ -1300,12 +1314,8 @@ mod tests {
                     )),
                 ]
             }),
-            rake_reference_filter_passes,
+            1,
         );
-        if let Some(offset) = rake_despread_phase_offset {
-            rake = rake.with_despread_phase_offset_override(offset);
-        }
-        rake = rake.with_raw_pn_despreading(use_raw_rake_despreading);
 
         let chain: Vec<PipelineProcessorShared> =
             vec![Box::new(PulseMatchedFilterProcessor::new()), Box::new(rake)];
@@ -1373,98 +1383,6 @@ mod tests {
     }
 
     #[test]
-    fn capture_access_channel_with_rake_receiver_from_wav() {
-        init_test_logger();
-        let Some(reader) = open_uplink_wav_reader_from_env() else {
-            return;
-        };
-        let (sample_rate, iq_samples) = read_iq_wav(reader);
-        eprintln!(
-            "RAKE uplink WAV test: sample_rate={} iq_samples={}",
-            sample_rate,
-            iq_samples.len()
-        );
-
-        let mut receiver = PipelinedReceiver::new(iq_samples.into_iter())
-            .with_input_sample_rate_hz(sample_rate as f64)
-            .with_trace_files("analysis/pipeline_stage_wavs/uplink_access_rake");
-        let out_rx = receiver.add_pipeline(reverse_access_chain(ReverseAccessSettings::default()));
-        receiver.run_pipeline().unwrap();
-
-        let mut access_events = 0usize;
-        let mut crc_valid_events = 0usize;
-        let mut crc_invalid_events = 0usize;
-        let mut payload_events = 0usize;
-        let mut total_output_blocks = 0usize;
-
-        for blocks in out_rx {
-            eprintln!("RAKE uplink batch: {} output blocks", blocks.len());
-            total_output_blocks += blocks.len();
-            for blk in blocks {
-                if blk.tags.get("access_event") != Some(&1) {
-                    continue;
-                }
-                access_events += 1;
-                let crc_valid = blk.tags.get("access_crc_valid") == Some(&1);
-                if crc_valid {
-                    crc_valid_events += 1;
-                } else {
-                    crc_invalid_events += 1;
-                }
-
-                let payload_bits = event_block_payload_bits(&blk);
-                if !payload_bits.is_empty() {
-                    payload_events += 1;
-                }
-
-                if !crc_valid {
-                    continue;
-                }
-
-                let payload_hex = payload_bits
-                    .chunks(8)
-                    .map(|chunk| {
-                        let byte = chunk.iter().fold(0u8, |acc, &b| (acc << 1) | (b & 1))
-                            << (8usize.saturating_sub(chunk.len()));
-                        format!("{:02x}", byte)
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-
-                eprintln!(
-                    "RAKE uplink access #{}: crc_valid={:?} frame_quality={:?} preamble_frames={:?} msg_type={:?} payload_bits={} hex=[{}]",
-                    access_events,
-                    blk.tags.get("access_crc_valid"),
-                    blk.tags.get("access_frame_quality"),
-                    blk.tags.get("access_preamble_frames"),
-                    blk.tags.get("access_msg_type"),
-                    payload_bits.len(),
-                    payload_hex
-                );
-
-                match AccessMessage::decode(&Bitstream::new_init(&payload_bits)) {
-                    Ok(msg) => msg.print(),
-                    Err(err) => eprintln!("Access layer3 decode error: {}", err),
-                }
-            }
-        }
-
-        eprintln!(
-            "RAKE uplink access summary: output_blocks={} access_events={} crc_valid={} crc_invalid={} payload_events={}",
-            total_output_blocks,
-            access_events,
-            crc_valid_events,
-            crc_invalid_events,
-            payload_events
-        );
-
-        assert!(
-            payload_events > 0,
-            "expected at least one access payload from uplink WAV"
-        );
-    }
-
-    #[test]
     fn capture_uplink_access_probe_finger_acquisition_full_chain() {
         init_test_logger();
 
@@ -1479,46 +1397,12 @@ mod tests {
 
         // Lock the current deduped decode count for this capture. A narrower
         // same-burst dedupe window keeps 32-chip re-emits collapsed while
-        // preserving distinct repeated bursts that were previously merged.
+        // preserving distinct repeated bursts that a wider window would merge.
         assert_eq!(
             stats.crc_valid_data_frame_count, 12,
             "expected exactly 12 deduped CRC-valid registration frames from the long-lived current capture, got {}",
             stats.crc_valid_data_frame_count
         );
-    }
-
-    #[derive(Debug, Clone)]
-    struct FingerSpawnTiming {
-        finger_id: i64,
-        chip: u64,
-        wall_ms: f64,
-    }
-
-    #[derive(Debug, Clone)]
-    struct DecodedPreambleTiming {
-        finger_id: i64,
-        chip: u64,
-        wall_ms: f64,
-        preamble_frames: i64,
-    }
-
-    #[derive(Debug, Clone)]
-    struct AccessEventTiming {
-        event_index: usize,
-        finger_id: i64,
-        chip: u64,
-        wall_ms: f64,
-        crc_valid: bool,
-        msg_type: Option<i64>,
-        preamble_frames: Option<i64>,
-        spawn_chip: Option<u64>,
-        spawn_wall_ms: Option<f64>,
-        spawn_to_event_wall_ms: Option<f64>,
-        spawn_to_event_signal_ms: Option<f64>,
-        decoded_preamble_chip: Option<u64>,
-        decoded_preamble_wall_ms: Option<f64>,
-        decoded_preamble_to_event_wall_ms: Option<f64>,
-        decoded_preamble_to_event_signal_ms: Option<f64>,
     }
 
     #[derive(Debug, Default, Clone)]
@@ -1532,40 +1416,6 @@ mod tests {
         decode_wall_ms: f64,
         realtime_speedup_x: f64,
         max_batch_wall_ms: f64,
-        finger_spawn_timings: Vec<FingerSpawnTiming>,
-        decoded_preamble_timings: Vec<DecodedPreambleTiming>,
-        access_event_timings: Vec<AccessEventTiming>,
-    }
-
-    fn block_absolute_chip(block: &SampleBlock) -> Option<u64> {
-        let chip = block
-            .tags
-            .get("absolute_chip_start")
-            .copied()
-            .unwrap_or(block.chip_start as i64);
-        u64::try_from(chip).ok()
-    }
-
-    fn chip_delta_ms(start_chip: u64, end_chip: u64) -> f64 {
-        end_chip.saturating_sub(start_chip) as f64 * 1000.0 / 1_228_800.0
-    }
-
-    fn summarize_optional_ms(values: impl Iterator<Item = Option<f64>>) -> Option<(f64, f64, f64)> {
-        let mut count = 0usize;
-        let mut sum = 0.0f64;
-        let mut min = f64::INFINITY;
-        let mut max = f64::NEG_INFINITY;
-        for value in values.flatten() {
-            count += 1;
-            sum += value;
-            min = min.min(value);
-            max = max.max(value);
-        }
-        if count == 0 {
-            None
-        } else {
-            Some((min, sum / count as f64, max))
-        }
     }
 
     fn run_uplink_access_probe_full_chain_capture(
@@ -1646,50 +1496,16 @@ mod tests {
             .with_absolute_sample_start(chip_start * oversample as u64);
         let out_rx = receiver.add_pipeline(pipeline);
         let decode_started = std::time::Instant::now();
-        let trace_timing = std::env::var_os("CDMA_ACCESS_TIMING_TRACE").is_some();
-        let collector_started = decode_started;
         let label_owned = label.to_string();
         let collector = std::thread::spawn(move || {
             let mut stats = UplinkAccessProbeCaptureStats::default();
             for blocks in out_rx {
-                let wall_ms = collector_started.elapsed().as_secs_f64() * 1000.0;
                 stats.total_blocks += blocks.len();
                 for blk in &blocks {
-                    if blk.tags.get("rake_finger_spawn_event") == Some(&1) {
-                        if trace_timing {
-                            if let (Some(&finger_id), Some(chip)) =
-                                (blk.tags.get("finger_id"), block_absolute_chip(blk))
-                            {
-                                stats.finger_spawn_timings.push(FingerSpawnTiming {
-                                    finger_id,
-                                    chip,
-                                    wall_ms,
-                                });
-                            }
-                        }
-                        continue;
-                    }
-
                     if blk.tags.get("access_preamble_detected") == Some(&1)
                         && blk.tags.contains_key("access_preamble_frames")
                     {
                         stats.preamble_count += 1;
-                        if trace_timing {
-                            if let (Some(&finger_id), Some(chip)) =
-                                (blk.tags.get("finger_id"), block_absolute_chip(blk))
-                            {
-                                stats.decoded_preamble_timings.push(DecodedPreambleTiming {
-                                    finger_id,
-                                    chip,
-                                    wall_ms,
-                                    preamble_frames: blk
-                                        .tags
-                                        .get("access_preamble_frames")
-                                        .copied()
-                                        .unwrap_or(0),
-                                });
-                            }
-                        }
                     }
                     if blk.tags.get("access_event") == Some(&1) {
                         stats.data_frame_count += 1;
@@ -1699,66 +1515,6 @@ mod tests {
                         } else {
                             stats.crc_invalid_data_frame_count += 1;
                         }
-                        let finger_id = blk.tags.get("finger_id").copied().unwrap_or(-1);
-                        let event_chip = block_absolute_chip(blk).unwrap_or(blk.chip_start as u64);
-                        let msg_type = blk.tags.get("access_msg_type").copied();
-                        let preamble_frames = blk.tags.get("access_preamble_frames").copied();
-
-                        if trace_timing {
-                            let spawn = stats.finger_spawn_timings.iter().rev().find(|timing| {
-                                timing.finger_id == finger_id && timing.chip <= event_chip
-                            });
-                            let decoded_preamble =
-                                stats.decoded_preamble_timings.iter().rev().find(|timing| {
-                                    timing.finger_id == finger_id && timing.chip <= event_chip
-                                });
-
-                            let event_timing = AccessEventTiming {
-                                event_index: stats.data_frame_count,
-                                finger_id,
-                                chip: event_chip,
-                                wall_ms,
-                                crc_valid,
-                                msg_type,
-                                preamble_frames,
-                                spawn_chip: spawn.map(|timing| timing.chip),
-                                spawn_wall_ms: spawn.map(|timing| timing.wall_ms),
-                                spawn_to_event_wall_ms: spawn
-                                    .map(|timing| wall_ms - timing.wall_ms),
-                                spawn_to_event_signal_ms: spawn
-                                    .map(|timing| chip_delta_ms(timing.chip, event_chip)),
-                                decoded_preamble_chip: decoded_preamble.map(|timing| timing.chip),
-                                decoded_preamble_wall_ms: decoded_preamble
-                                    .map(|timing| timing.wall_ms),
-                                decoded_preamble_to_event_wall_ms: decoded_preamble
-                                    .map(|timing| wall_ms - timing.wall_ms),
-                                decoded_preamble_to_event_signal_ms: decoded_preamble
-                                    .map(|timing| chip_delta_ms(timing.chip, event_chip)),
-                            };
-                            if crc_valid {
-                                eprintln!(
-                                    "  {} timing valid event #{}: finger={} event_chip={} event_wall_ms={:.3} msg_type={:?} preamble_frames={:?} spawn_chip={:?} spawn_wall_ms={:?} spawn_to_event_wall_ms={:?} spawn_to_event_signal_ms={:?} decoded_preamble_chip={:?} decoded_preamble_wall_ms={:?} decoded_preamble_frames={:?} decoded_preamble_to_event_wall_ms={:?} decoded_preamble_to_event_signal_ms={:?}",
-                                    label_owned,
-                                    event_timing.event_index,
-                                    event_timing.finger_id,
-                                    event_timing.chip,
-                                    event_timing.wall_ms,
-                                    event_timing.msg_type,
-                                    event_timing.preamble_frames,
-                                    event_timing.spawn_chip,
-                                    event_timing.spawn_wall_ms,
-                                    event_timing.spawn_to_event_wall_ms,
-                                    event_timing.spawn_to_event_signal_ms,
-                                    event_timing.decoded_preamble_chip,
-                                    event_timing.decoded_preamble_wall_ms,
-                                    decoded_preamble.map(|timing| timing.preamble_frames),
-                                    event_timing.decoded_preamble_to_event_wall_ms,
-                                    event_timing.decoded_preamble_to_event_signal_ms,
-                                );
-                            }
-                            stats.access_event_timings.push(event_timing);
-                        }
-
                         eprintln!(
                             "  {} data frame #{}: chip={:?} finger={:?} crc={:?} msg_len={:?} payload_bits={:?} pd={:?} msg_type={:?}",
                             label_owned,
@@ -1805,45 +1561,6 @@ mod tests {
             stats.max_batch_wall_ms,
         );
 
-        if trace_timing {
-            let valid_events = stats
-                .access_event_timings
-                .iter()
-                .filter(|timing| timing.crc_valid)
-                .collect::<Vec<_>>();
-            let spawn_wall = summarize_optional_ms(
-                valid_events
-                    .iter()
-                    .map(|timing| timing.spawn_to_event_wall_ms),
-            );
-            let spawn_signal = summarize_optional_ms(
-                valid_events
-                    .iter()
-                    .map(|timing| timing.spawn_to_event_signal_ms),
-            );
-            let decoded_wall = summarize_optional_ms(
-                valid_events
-                    .iter()
-                    .map(|timing| timing.decoded_preamble_to_event_wall_ms),
-            );
-            let decoded_signal = summarize_optional_ms(
-                valid_events
-                    .iter()
-                    .map(|timing| timing.decoded_preamble_to_event_signal_ms),
-            );
-            eprintln!(
-                "{label} timing summary: finger_spawns={} decoded_preambles={} access_events={} crc_valid={} spawn_to_event_wall_ms={:?} spawn_to_event_signal_ms={:?} decoded_preamble_to_event_wall_ms={:?} decoded_preamble_to_event_signal_ms={:?}",
-                stats.finger_spawn_timings.len(),
-                stats.decoded_preamble_timings.len(),
-                stats.access_event_timings.len(),
-                valid_events.len(),
-                spawn_wall,
-                spawn_signal,
-                decoded_wall,
-                decoded_signal,
-            );
-        }
-
         Some(stats)
     }
 
@@ -1872,8 +1589,8 @@ mod tests {
     ) {
         let min_speedup = capture_timing_min_speedup(min_speedup);
         // These thresholds are deliberately loose. They are intended to catch
-        // algorithmic regressions like falling back to the old 96-offset
-        // Viterbi/CRC sweep, not normal scheduler or logging noise.
+        // algorithmic regressions such as a full 96-offset Viterbi/CRC sweep,
+        // not normal scheduler or logging noise.
         assert!(
             realtime_speedup_x >= min_speedup,
             "{label}: decode timing regression: realtime_speedup_x={:.2}, expected >= {:.2}; \
@@ -1892,6 +1609,940 @@ mod tests {
         } else {
             local_min_speedup
         }
+    }
+
+    #[derive(Debug)]
+    struct HrpdAccessCaptureEventSummary {
+        packet_start: i64,
+        phy_crc_valid: bool,
+        mac_fragment_valid: bool,
+        single_fragment_fcs_valid: bool,
+        mac_length_octets: Option<i64>,
+        info_hex: String,
+        decoded: String,
+    }
+
+    fn collect_hrpd_access_capture_events(
+        out_rx: std::sync::mpsc::Receiver<Vec<SampleBlock>>,
+    ) -> Vec<HrpdAccessCaptureEventSummary> {
+        let mut events = Vec::new();
+        for blocks in out_rx {
+            for blk in blocks {
+                if blk.tags.get("hrpd_access_event") != Some(&1) {
+                    continue;
+                }
+                let phy_crc_valid = blk.tags.get("access_crc_valid") == Some(&1);
+                let mac_fragment_valid = blk.tags.get("hrpd_access_reserved_zero") == Some(&1)
+                    && blk.tags.get("hrpd_access_mac_fragment_valid") == Some(&1);
+                let single_fragment_fcs_valid =
+                    blk.tags.get("hrpd_access_mac_single_fragment_fcs_valid") == Some(&1);
+                let bit_vec: Vec<u8> = blk.samples.iter().map(|s| u8::from(s.re >= 0.5)).collect();
+                let body_bits = AccessFrameLayout::for_packet_bits(bit_vec.len())
+                    .map(|layout| layout.body_bits)
+                    .unwrap_or(bit_vec.len());
+                let decoded = parse_access_mac_capsule(&bit_vec[..body_bits])
+                    .map(|capsule| capsule.summary())
+                    .unwrap_or_else(|| "unparsed".to_string());
+                let info_hex = pack_bits_to_bytes(&bit_vec[..body_bits])
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<Vec<_>>()
+                    .join("");
+                events.push(HrpdAccessCaptureEventSummary {
+                    packet_start: blk.tags.get("absolute_chip_start").copied().unwrap_or(-1),
+                    phy_crc_valid,
+                    mac_fragment_valid,
+                    single_fragment_fcs_valid,
+                    mac_length_octets: blk.tags.get("hrpd_access_mac_length_octets").copied(),
+                    info_hex,
+                    decoded,
+                });
+            }
+        }
+        events
+    }
+
+    fn decode_hrpd_access_run_by_preamble_sweep(
+        samples: &[Complex32],
+        absolute_sample_start: u64,
+        oversample: usize,
+        run: &HrpdSlotPowerRun,
+    ) -> Option<HrpdAccessCaptureEventSummary> {
+        let slot_offsets = [1i64, 2, 3, 4, 5, 6, 7, 8, 0, -1, -2];
+        let sample_delays = [-24, -20, -16, -12, -8, -4, 0, -28, -32, 4];
+        let fractions = [0.0f32, -0.75, 0.75];
+        for slot_offset in slot_offsets {
+            let preamble_start_chip = run.start_chip as i64 + slot_offset * 2048;
+            if preamble_start_chip < 0 {
+                continue;
+            }
+            for sample_delay in sample_delays {
+                for &sample_delay_fraction in &fractions {
+                    let Some((coherence, phase_step)) = hrpd_blind_preamble_lag_coherence(
+                        samples,
+                        absolute_sample_start,
+                        oversample,
+                        preamble_start_chip,
+                        sample_delay,
+                        sample_delay_fraction,
+                    ) else {
+                        continue;
+                    };
+                    if coherence < 0.90 {
+                        continue;
+                    }
+                    let mut phase_steps = vec![phase_step, 0.0f32];
+                    phase_steps.dedup_by(|a, b| (*a - *b).abs() < 1.0e-4);
+                    for phase_step in phase_steps {
+                        let Some((_chips, attempt)) = blind_hrpd_access_attempt_from_preamble(
+                            samples,
+                            absolute_sample_start,
+                            oversample,
+                            preamble_start_chip,
+                            sample_delay,
+                            sample_delay_fraction,
+                            3,
+                            0,
+                            phase_step,
+                        ) else {
+                            continue;
+                        };
+                        if attempt.fcs_bit_errors != 0 || attempt.tail_ones != 0 {
+                            continue;
+                        }
+                        let mac_check = validate_access_mac_fragment(&attempt.info_bits);
+                        if !mac_check.valid || !mac_check.single_fragment_fcs_valid {
+                            continue;
+                        }
+                        let decoded = parse_access_mac_capsule(&attempt.info_bits)
+                            .map(|capsule| capsule.summary())
+                            .unwrap_or_else(|| "unparsed".to_string());
+                        let info_hex = pack_bits_to_bytes(&attempt.info_bits)
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<Vec<_>>()
+                            .join("");
+                        let packet_start = preamble_start_chip + (3 * ACCESS_PACKET_CHIPS) as i64;
+                        eprintln!(
+                            "HRPD run sweep decode: run_slots=[{}, {}) run_chip={} packet_start={} preamble_start={} sample_delay={}{:+.2} coherence={:.3} phase_step={:+.5} msg_id=0x{:02x} mac_len={:?} decoded={}",
+                            run.start_slot,
+                            run.end_slot,
+                            run.start_chip,
+                            packet_start,
+                            preamble_start_chip,
+                            sample_delay,
+                            sample_delay_fraction,
+                            coherence,
+                            phase_step,
+                            attempt.message_id,
+                            mac_check.length_octets,
+                            decoded,
+                        );
+                        return Some(HrpdAccessCaptureEventSummary {
+                            packet_start,
+                            phy_crc_valid: true,
+                            mac_fragment_valid: mac_check.valid,
+                            single_fragment_fcs_valid: mac_check.single_fragment_fcs_valid,
+                            mac_length_octets: mac_check.length_octets.map(|v| v as i64),
+                            info_hex,
+                            decoded,
+                        });
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn capture_hrpd_reverse_access_bursts_1799955224163772_centered() {
+        init_test_logger();
+        let metadata_path = test_capture_path("1799955224163772.json");
+        let wav_path = test_capture_path("1799955224163772.wav");
+        let metadata = test_capture_metadata_from_path(&metadata_path);
+        assert_eq!(metadata.sample_rate_hz, 9_830_400);
+        assert_eq!(metadata.chip_rate_hz, 1_228_800);
+        assert!(
+            wav_path.exists(),
+            "missing HRPD reverse access capture {}",
+            wav_path.display()
+        );
+
+        let reader = hound::WavReader::open(&wav_path)
+            .unwrap_or_else(|e| panic!("failed to open {}: {e}", wav_path.display()));
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 2, "capture WAV must be stereo IQ");
+        assert_eq!(
+            spec.sample_rate as usize, metadata.sample_rate_hz,
+            "capture WAV sample rate must match sidecar sample-rate metadata"
+        );
+        let (sample_rate, iq_samples) = read_iq_wav(reader);
+        let oversample = (sample_rate as usize) / ACCESS_CHIP_RATE as usize;
+        assert_eq!(oversample, 8, "centered capture should be 8x chip rate");
+        let absolute_sample_start = metadata.first_absolute_sample_start;
+        let chip_start = absolute_sample_start / oversample as u64;
+        eprintln!(
+            "HRPD 1799955224163772 centered live-chain input: sample_rate={} oversample={} samples={} abs_sample_start={} chip_start={} chip_mod_frame={}",
+            sample_rate,
+            oversample,
+            iq_samples.len(),
+            absolute_sample_start,
+            chip_start,
+            chip_start % 32768,
+        );
+        let pipeline = hrpd_reverse_access_chain(HrpdReverseAccessSettings {
+            oversample,
+            ..HrpdReverseAccessSettings::default()
+        });
+        let total_samples = iq_samples.len();
+        let mut receiver = PipelinedReceiver::new(iq_samples.into_iter())
+            .with_batch_size(32768)
+            .with_input_sample_rate_hz(sample_rate as f64)
+            .with_absolute_sample_start(absolute_sample_start);
+        let out_rx = receiver.add_pipeline(pipeline);
+        let pipeline_start = std::time::Instant::now();
+        receiver.run_pipeline().unwrap();
+        let pipeline_elapsed = pipeline_start.elapsed();
+        let capture_seconds = total_samples as f64 / sample_rate as f64;
+        let multiplier = capture_seconds / pipeline_elapsed.as_secs_f64();
+        eprintln!(
+            "HRPD 1799955224163772 receiver pipeline timing: capture={:.2}s pipeline={:.2}s real_time={:.2}x",
+            capture_seconds,
+            pipeline_elapsed.as_secs_f64(),
+            multiplier,
+        );
+        if let Some(metrics_handle) =
+            crate::receiver::hrpd::reverse_correlator_base::get_metrics_handle("hrpd_access")
+            && let Ok(m) = metrics_handle.lock()
+        {
+            let total_ms = pipeline_elapsed.as_millis() as u64;
+            let fft_ms = m.fft_scan_ns / 1_000_000;
+            let spawn_ms = m.spawn_finger_ns / 1_000_000;
+            let ref_ms = m.searcher_ref_setup_ns / 1_000_000;
+            let sig_ms = m.searcher_signal_fft_ns / 1_000_000;
+            let ifft_ms = m.searcher_ifft_mult_ns / 1_000_000;
+            let peak_ms = m.searcher_peak_find_ns / 1_000_000;
+            let pct = |x| 100.0 * x as f64 / total_ms.max(1) as f64;
+            eprintln!(
+                "HRPD 1799955224163772 HEAT total_pipeline={total_ms}ms fft={fft_ms}ms({:.1}%) [ref={ref_ms}ms({:.1}%) sigfft={sig_ms}ms({:.1}%) ifft={ifft_ms}ms({:.1}%) peak={peak_ms}ms({:.1}%) windows={}] spawn={spawn_ms}ms({:.1}%) [calls={}]",
+                pct(fft_ms),
+                pct(ref_ms),
+                pct(sig_ms),
+                pct(ifft_ms),
+                pct(peak_ms),
+                m.searcher_ref_setup_calls,
+                pct(spawn_ms),
+                m.spawn_finger_calls,
+            );
+        }
+
+        let mut event_count = 0usize;
+        let mut phy_crc_valid_count = 0usize;
+        let mut mac_fragment_valid_count = 0usize;
+        let mut single_fragment_fcs_valid_count = 0usize;
+        let mut parsed_events = Vec::new();
+        for blocks in out_rx {
+            for blk in blocks {
+                if blk.tags.get("hrpd_access_event") != Some(&1) {
+                    continue;
+                }
+                event_count += 1;
+                let phy_crc_valid = blk.tags.get("access_crc_valid") == Some(&1);
+                let mac_fragment_valid = blk.tags.get("hrpd_access_reserved_zero") == Some(&1)
+                    && blk.tags.get("hrpd_access_mac_fragment_valid") == Some(&1);
+                let single_fragment_fcs_valid =
+                    blk.tags.get("hrpd_access_mac_single_fragment_fcs_valid") == Some(&1);
+                phy_crc_valid_count += usize::from(phy_crc_valid);
+                mac_fragment_valid_count += usize::from(mac_fragment_valid);
+                single_fragment_fcs_valid_count += usize::from(single_fragment_fcs_valid);
+
+                let bit_vec: Vec<u8> = blk.samples.iter().map(|s| u8::from(s.re >= 0.5)).collect();
+                let body_bits = AccessFrameLayout::for_packet_bits(bit_vec.len())
+                    .map(|layout| layout.body_bits)
+                    .unwrap_or(bit_vec.len());
+                let summary = parse_access_mac_capsule(&bit_vec[..body_bits])
+                    .map(|capsule| capsule.summary())
+                    .unwrap_or_else(|| "unparsed".to_string());
+                let info_hex = pack_bits_to_bytes(&bit_vec[..body_bits])
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<Vec<_>>()
+                    .join("");
+                eprintln!(
+                    "HRPD 1799955224163772 event #{}: chip={} phy_crc_valid={} mac_fragment_valid={} single_fragment_fcs_valid={} msg_len={:?} info_hex={} decoded={}",
+                    event_count,
+                    blk.tags.get("absolute_chip_start").copied().unwrap_or(-1),
+                    phy_crc_valid,
+                    mac_fragment_valid,
+                    single_fragment_fcs_valid,
+                    blk.tags.get("hrpd_access_mac_length_octets"),
+                    info_hex,
+                    summary,
+                );
+                parsed_events.push(summary);
+            }
+        }
+        eprintln!(
+            "HRPD 1799955224163772 live-chain CRC counts: events={} phy_crc_valid={} mac_fragment_valid={} single_fragment_fcs_valid={} parsed_events={:?}",
+            event_count,
+            phy_crc_valid_count,
+            mac_fragment_valid_count,
+            single_fragment_fcs_valid_count,
+            parsed_events,
+        );
+    }
+
+    /// Rev A access reprobe capture with reverse traffic present. The AT
+    /// completes UATI assignment, then reprobes its ConnectionRequest because
+    /// setup never ACKs; the later reprobes gate their reverse transmission
+    /// 3-on/1-off (one dead slot per subframe). Exercises the production
+    /// FFT-rake chain end to end — gating-robust acquisition, dead-slot
+    /// erasure, and CRC-authoritative capsule validation recover every probe.
+    #[test]
+    fn capture_hrpd_reverse_access_bursts_1802828173947282() {
+        init_test_logger();
+        let metadata_path = test_capture_path("1802828173947282.json");
+        let wav_path = test_capture_path("1802828173947282.wav");
+        let metadata = test_capture_metadata_from_path(&metadata_path);
+        let hrpd_shift_hz = metadata
+            .hrpd_rx_shift_hz
+            .expect("capture sidecar must include hrpd_rx_shift_hz");
+        let (sample_rate, mut iq_samples, absolute_sample_start) =
+            read_shifted_capture_to_4x_with_shift(&wav_path, &metadata, hrpd_shift_hz);
+        let oversample = (sample_rate as usize) / ACCESS_CHIP_RATE as usize;
+        assert_eq!(oversample, 4, "shifted HRPD slice should be 4x chip rate");
+        // This capture was recorded before the writer reconciled RX stream
+        // gaps: the session log shows one 31645-sample gap (4x domain) at
+        // absolute sample 7211312721087393 that the receiver patched but the
+        // WAV lost. Re-insert it so the replay timeline matches the live one.
+        const GAP_ABS_SAMPLE: u64 = 7_211_312_721_087_393;
+        const GAP_SAMPLES: usize = 31_645;
+        let gap_index = (GAP_ABS_SAMPLE - absolute_sample_start) as usize;
+        iq_samples.splice(
+            gap_index..gap_index,
+            std::iter::repeat_n(Complex32::new(0.0, 0.0), GAP_SAMPLES),
+        );
+
+        let pipeline = hrpd_reverse_access_chain(HrpdReverseAccessSettings {
+            oversample,
+            reanchor_origin: true,
+            ..HrpdReverseAccessSettings::default()
+        });
+        let mut receiver = PipelinedReceiver::new(iq_samples.into_iter())
+            .with_batch_size(32768)
+            .with_input_sample_rate_hz(sample_rate as f64)
+            .with_absolute_sample_start(absolute_sample_start);
+        let out_rx = receiver.add_pipeline(pipeline);
+        receiver.run_pipeline().unwrap();
+        let events = collect_hrpd_access_capture_events(out_rx);
+        let fcs_valid = events
+            .iter()
+            .filter(|event| event.single_fragment_fcs_valid)
+            .collect::<Vec<_>>();
+        for (idx, event) in events.iter().enumerate() {
+            eprintln!(
+                "HRPD 1802828173947282 event #{}: chip={} fcs_valid={} decoded={}",
+                idx + 1,
+                event.packet_start,
+                event.single_fragment_fcs_valid,
+                event.decoded,
+            );
+        }
+        // Five initial probes (UATIRequest, then ConnectionRequest 0x41..0x43)
+        // plus twelve gated ConnectionRequest 0x44 reprobes = 17 CRC-valid
+        // capsules. The gated reprobes only decode because acquisition scores
+        // them on their live slots, the dead slots are erased before decode,
+        // and the MAC FCS (not the header ProbeNumber field, §10.5.6.2.1,
+        // which increments across the probe ladder) decides capsule validity.
+        assert_eq!(
+            fcs_valid.len(),
+            17,
+            "expected all 17 access probes (5 initial + 12 gated reprobes) to decode"
+        );
+        let gated_reprobes = fcs_valid
+            .iter()
+            .filter(|event| event.decoded.contains("ConnectionRequest(transaction=0x44"))
+            .count();
+        assert_eq!(
+            gated_reprobes, 12,
+            "expected 12 gated ConnectionRequest 0x44 reprobes"
+        );
+    }
+
+    #[test]
+    fn capture_hrpd_reverse_access_bursts_1799956520441591() {
+        init_test_logger();
+        let metadata_path = test_capture_path("1799956520441591.json");
+        let wav_path = test_capture_path("1799956520441591.wav");
+        let metadata = test_capture_metadata_from_path(&metadata_path);
+        assert_eq!(metadata.sample_rate_hz, 9_830_400);
+        assert_eq!(metadata.chip_rate_hz, 1_228_800);
+        assert_eq!(metadata.rx_center_frequency_hz, Some(846_105_000));
+        assert_eq!(metadata.one_x_reverse_frequency_hz, Some(848_310_000));
+        assert_eq!(metadata.one_x_rx_shift_hz, Some(2_205_000));
+        assert_eq!(metadata.hrpd_reverse_frequency_hz, Some(843_900_000));
+        assert_eq!(metadata.hrpd_rx_shift_hz, Some(-2_205_000));
+        assert!(
+            wav_path.exists(),
+            "missing HRPD reverse access capture {}",
+            wav_path.display()
+        );
+
+        let hrpd_shift_hz = metadata
+            .hrpd_rx_shift_hz
+            .expect("capture sidecar must include hrpd_rx_shift_hz");
+        let (sample_rate, iq_samples, absolute_sample_start) =
+            read_shifted_capture_to_4x_with_shift(&wav_path, &metadata, hrpd_shift_hz);
+        let oversample = (sample_rate as usize) / ACCESS_CHIP_RATE as usize;
+        assert_eq!(oversample, 4, "shifted HRPD slice should be 4x chip rate");
+        let chip_start = absolute_sample_start / oversample as u64;
+        eprintln!(
+            "HRPD 1799956520441591 shifted access capture: raw_rate={} shifted_rate={} samples={} abs_sample_start={} chip_start={} chip_mod_frame={} shift_hz={}",
+            metadata.sample_rate_hz,
+            sample_rate,
+            iq_samples.len(),
+            absolute_sample_start,
+            chip_start,
+            chip_start % 32768,
+            hrpd_shift_hz,
+        );
+        let runs = hrpd_slot_power_runs_at_threshold(&iq_samples, chip_start, oversample, 2.0);
+        for (idx, run) in runs.iter().enumerate() {
+            eprintln!(
+                "HRPD 1799956520441591 energy run #{}: slots=[{}, {}) chips=[{}, {}) slot_count={} peak={:+.2}dB",
+                idx + 1,
+                run.start_slot,
+                run.end_slot,
+                run.start_chip,
+                run.end_chip,
+                run.end_slot - run.start_slot,
+                run.peak_db,
+            );
+        }
+        assert_eq!(
+            runs.len(),
+            18,
+            "expected 18 high-energy HRPD access burst runs"
+        );
+        let sweep_events = runs
+            .iter()
+            .map(|run| {
+                decode_hrpd_access_run_by_preamble_sweep(
+                    &iq_samples,
+                    absolute_sample_start,
+                    oversample,
+                    run,
+                )
+            })
+            .collect::<Option<Vec<_>>>()
+            .expect("every high-energy HRPD access burst should have a valid preamble decode");
+        assert_eq!(
+            sweep_events.len(),
+            18,
+            "expected all 18 HRPD access bursts to decode by preamble sweep"
+        );
+        assert!(
+            sweep_events.iter().all(|event| {
+                event.single_fragment_fcs_valid
+                    && event.decoded.contains("RouteUpdate")
+                    && event.decoded.contains("UATIRequest")
+                    && event.decoded.contains("ati=Rati/0xb9f1bf69")
+            }),
+            "unexpected preamble-sweep HRPD access events: {:?}",
+            sweep_events
+        );
+
+        let pipeline = hrpd_reverse_access_chain(HrpdReverseAccessSettings {
+            oversample,
+            ..HrpdReverseAccessSettings::default()
+        });
+        let total_samples = iq_samples.len();
+        let mut receiver = PipelinedReceiver::new(iq_samples.into_iter())
+            .with_batch_size(32768)
+            .with_input_sample_rate_hz(sample_rate as f64)
+            .with_absolute_sample_start(absolute_sample_start);
+        let out_rx = receiver.add_pipeline(pipeline);
+        let pipeline_start = std::time::Instant::now();
+        receiver.run_pipeline().unwrap();
+        let pipeline_elapsed = pipeline_start.elapsed();
+        let capture_seconds = total_samples as f64 / sample_rate as f64;
+        let multiplier = capture_seconds / pipeline_elapsed.as_secs_f64();
+        eprintln!(
+            "HRPD 1799956520441591 receiver pipeline timing: capture={:.2}s pipeline={:.2}s real_time={:.2}x",
+            capture_seconds,
+            pipeline_elapsed.as_secs_f64(),
+            multiplier,
+        );
+        if let Some(metrics_handle) =
+            crate::receiver::hrpd::reverse_correlator_base::get_metrics_handle("hrpd_access")
+            && let Ok(m) = metrics_handle.lock()
+        {
+            let total_ms = pipeline_elapsed.as_millis() as u64;
+            let fft_ms = m.fft_scan_ns / 1_000_000;
+            let spawn_ms = m.spawn_finger_ns / 1_000_000;
+            let ref_ms = m.searcher_ref_setup_ns / 1_000_000;
+            let sig_ms = m.searcher_signal_fft_ns / 1_000_000;
+            let ifft_ms = m.searcher_ifft_mult_ns / 1_000_000;
+            let peak_ms = m.searcher_peak_find_ns / 1_000_000;
+            let pct = |x| 100.0 * x as f64 / total_ms.max(1) as f64;
+            eprintln!(
+                "HRPD 1799956520441591 HEAT total_pipeline={total_ms}ms fft={fft_ms}ms({:.1}%) [ref={ref_ms}ms({:.1}%) sigfft={sig_ms}ms({:.1}%) ifft={ifft_ms}ms({:.1}%) peak={peak_ms}ms({:.1}%) windows={}] spawn={spawn_ms}ms({:.1}%) [calls={}]",
+                pct(fft_ms),
+                pct(ref_ms),
+                pct(sig_ms),
+                pct(ifft_ms),
+                pct(peak_ms),
+                m.searcher_ref_setup_calls,
+                pct(spawn_ms),
+                m.spawn_finger_calls,
+            );
+        }
+
+        let events = collect_hrpd_access_capture_events(out_rx);
+        let fcs_valid = events
+            .iter()
+            .filter(|event| event.single_fragment_fcs_valid)
+            .collect::<Vec<_>>();
+        for (idx, event) in events.iter().enumerate() {
+            eprintln!(
+                "HRPD 1799956520441591 event #{}: chip={} phy_crc_valid={} mac_fragment_valid={} single_fragment_fcs_valid={} msg_len={:?} info_hex={} decoded={}",
+                idx + 1,
+                event.packet_start,
+                event.phy_crc_valid,
+                event.mac_fragment_valid,
+                event.single_fragment_fcs_valid,
+                event.mac_length_octets,
+                event.info_hex,
+                event.decoded,
+            );
+        }
+        eprintln!(
+            "HRPD 1799956520441591 shifted access summary: streaming_events={} streaming_fcs_valid={} sweep_fcs_valid={} decoded={:?}",
+            events.len(),
+            fcs_valid.len(),
+            sweep_events.len(),
+            fcs_valid
+                .iter()
+                .map(|event| &event.decoded)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            fcs_valid.len(),
+            18,
+            "expected the FFT-rake HRPD access receiver to recover all 18 downstream packets: {:?}",
+            events
+        );
+        assert!(
+            fcs_valid.iter().all(|event| {
+                event.decoded.contains("RouteUpdate")
+                    && event.decoded.contains("UATIRequest")
+                    && event.decoded.contains("ati=Rati/0xb9f1bf69")
+            }),
+            "unexpected FFT-rake decoded HRPD access events: {:?}",
+            fcs_valid
+        );
+    }
+
+    #[test]
+    fn capture_hrpd_reverse_access_bursts_1800354308350520() {
+        init_test_logger();
+        let metadata_path = test_capture_path("1800354308350520.json");
+        let wav_path = test_capture_path("1800354308350520.wav");
+        let metadata = test_capture_metadata_from_path(&metadata_path);
+        assert_eq!(metadata.sample_rate_hz, 9_830_400);
+        assert_eq!(metadata.hrpd_rx_shift_hz, Some(-2_205_000));
+        assert!(
+            wav_path.exists(),
+            "missing HRPD reverse access capture {}",
+            wav_path.display()
+        );
+        let hrpd_shift_hz = metadata.hrpd_rx_shift_hz.expect("sidecar shift");
+        let (sample_rate, iq_samples, absolute_sample_start) =
+            read_shifted_capture_to_4x_with_shift(&wav_path, &metadata, hrpd_shift_hz);
+        let oversample = (sample_rate as usize) / ACCESS_CHIP_RATE as usize;
+        let chip_start = absolute_sample_start / oversample as u64;
+        let runs = hrpd_slot_power_runs_at_threshold(&iq_samples, chip_start, oversample, 2.0);
+        for (idx, run) in runs.iter().enumerate() {
+            eprintln!(
+                "HRPD 1800354308350520 energy run #{}: slots=[{}, {}) chips=[{}, {}) slot_count={} peak={:+.2}dB",
+                idx + 1,
+                run.start_slot,
+                run.end_slot,
+                run.start_chip,
+                run.end_chip,
+                run.end_slot - run.start_slot,
+                run.peak_db,
+            );
+        }
+        let burst_count = runs.len();
+
+        let pipeline = hrpd_reverse_access_chain(HrpdReverseAccessSettings {
+            oversample,
+            ..HrpdReverseAccessSettings::default()
+        });
+        let total_samples = iq_samples.len();
+        let mut receiver = PipelinedReceiver::new(iq_samples.into_iter())
+            .with_batch_size(32768)
+            .with_input_sample_rate_hz(sample_rate as f64)
+            .with_absolute_sample_start(absolute_sample_start);
+        let out_rx = receiver.add_pipeline(pipeline);
+        let pipeline_start = std::time::Instant::now();
+        receiver.run_pipeline().unwrap();
+        let pipeline_elapsed = pipeline_start.elapsed();
+        eprintln!(
+            "HRPD 1800354308350520 receiver pipeline timing: capture={:.2}s pipeline={:.2}s real_time={:.2}x",
+            total_samples as f64 / sample_rate as f64,
+            pipeline_elapsed.as_secs_f64(),
+            (total_samples as f64 / sample_rate as f64) / pipeline_elapsed.as_secs_f64(),
+        );
+
+        let events = collect_hrpd_access_capture_events(out_rx);
+        let fcs_valid = events
+            .iter()
+            .filter(|event| event.single_fragment_fcs_valid)
+            .collect::<Vec<_>>();
+        for (idx, event) in events.iter().enumerate() {
+            eprintln!(
+                "HRPD 1800354308350520 event #{}: chip={} fcs_valid={} msg_len={:?} decoded={}",
+                idx + 1,
+                event.packet_start,
+                event.single_fragment_fcs_valid,
+                event.mac_length_octets,
+                event.decoded,
+            );
+        }
+        eprintln!(
+            "HRPD 1800354308350520 summary: energy_bursts={} streaming_events={} fcs_valid={}",
+            burst_count,
+            events.len(),
+            fcs_valid.len(),
+        );
+        // 20 energy runs = 16 access bursts + 3 multi-second reverse traffic
+        // sessions (886 slots each at ~+38 dB) + one 4-slot blip that is not
+        // an access burst. All 16 access bursts decode, including two
+        // 59-octet three-fragment capsules carrying UATIComplete +
+        // ConnectionRequest + HardwareIDResponse.
+        assert_eq!(
+            burst_count, 20,
+            "expected 20 high-energy runs (16 access + 3 traffic + 1 blip)"
+        );
+        assert_eq!(
+            fcs_valid.len(),
+            16,
+            "expected the live HRPD access receiver chain to decode all 16 access bursts"
+        );
+        let session_close = fcs_valid
+            .iter()
+            .filter(|event| event.decoded.contains("SessionClose"))
+            .count();
+        assert_eq!(session_close, 1, "final burst carries the SessionClose");
+    }
+
+    #[test]
+    fn capture_hrpd_reverse_access_bursts_1800347049472645() {
+        init_test_logger();
+        let metadata_path = test_capture_path("1800347049472645.json");
+        let wav_path = test_capture_path("1800347049472645.wav");
+        let metadata = test_capture_metadata_from_path(&metadata_path);
+        assert_eq!(metadata.sample_rate_hz, 9_830_400);
+        assert_eq!(metadata.chip_rate_hz, 1_228_800);
+        assert_eq!(metadata.hrpd_rx_shift_hz, Some(-2_205_000));
+        assert!(
+            wav_path.exists(),
+            "missing HRPD reverse access capture {}",
+            wav_path.display()
+        );
+
+        let hrpd_shift_hz = metadata
+            .hrpd_rx_shift_hz
+            .expect("capture sidecar must include hrpd_rx_shift_hz");
+        let (sample_rate, iq_samples, absolute_sample_start) =
+            read_shifted_capture_to_4x_with_shift(&wav_path, &metadata, hrpd_shift_hz);
+        let oversample = (sample_rate as usize) / ACCESS_CHIP_RATE as usize;
+        assert_eq!(oversample, 4, "shifted HRPD slice should be 4x chip rate");
+        let chip_start = absolute_sample_start / oversample as u64;
+        eprintln!(
+            "HRPD 1800347049472645 shifted access capture: shifted_rate={} samples={} chip_start={} chip_mod_frame={}",
+            sample_rate,
+            iq_samples.len(),
+            chip_start,
+            chip_start % 32768,
+        );
+        let runs = hrpd_slot_power_runs_at_threshold(&iq_samples, chip_start, oversample, 2.0);
+        for (idx, run) in runs.iter().enumerate() {
+            eprintln!(
+                "HRPD 1800347049472645 energy run #{}: slots=[{}, {}) chips=[{}, {}) slot_count={} peak={:+.2}dB",
+                idx + 1,
+                run.start_slot,
+                run.end_slot,
+                run.start_chip,
+                run.end_chip,
+                run.end_slot - run.start_slot,
+                run.peak_db,
+            );
+        }
+        let burst_count = runs.len();
+
+        let pipeline = hrpd_reverse_access_chain(HrpdReverseAccessSettings {
+            oversample,
+            ..HrpdReverseAccessSettings::default()
+        });
+        let total_samples = iq_samples.len();
+        let mut receiver = PipelinedReceiver::new(iq_samples.into_iter())
+            .with_batch_size(32768)
+            .with_input_sample_rate_hz(sample_rate as f64)
+            .with_absolute_sample_start(absolute_sample_start);
+        let out_rx = receiver.add_pipeline(pipeline);
+        let pipeline_start = std::time::Instant::now();
+        receiver.run_pipeline().unwrap();
+        let pipeline_elapsed = pipeline_start.elapsed();
+        let capture_seconds = total_samples as f64 / sample_rate as f64;
+        eprintln!(
+            "HRPD 1800347049472645 receiver pipeline timing: capture={:.2}s pipeline={:.2}s real_time={:.2}x",
+            capture_seconds,
+            pipeline_elapsed.as_secs_f64(),
+            capture_seconds / pipeline_elapsed.as_secs_f64(),
+        );
+
+        let events = collect_hrpd_access_capture_events(out_rx);
+        let fcs_valid = events
+            .iter()
+            .filter(|event| event.single_fragment_fcs_valid)
+            .collect::<Vec<_>>();
+        for (idx, event) in events.iter().enumerate() {
+            eprintln!(
+                "HRPD 1800347049472645 event #{}: chip={} phy_crc_valid={} mac_fragment_valid={} single_fragment_fcs_valid={} msg_len={:?} info_hex={} decoded={}",
+                idx + 1,
+                event.packet_start,
+                event.phy_crc_valid,
+                event.mac_fragment_valid,
+                event.single_fragment_fcs_valid,
+                event.mac_length_octets,
+                event.info_hex,
+                event.decoded,
+            );
+        }
+        eprintln!(
+            "HRPD 1800347049472645 summary: energy_bursts={} streaming_events={} fcs_valid={}",
+            burst_count,
+            events.len(),
+            fcs_valid.len(),
+        );
+        assert_eq!(
+            burst_count, 19,
+            "expected 19 high-energy HRPD access burst runs"
+        );
+        // All 19 high-energy bursts decode. Burst #5 (chips ~1800347055063040)
+        // steps its carrier/gain mid-probe, so its three preamble frames are
+        // not full copies of each other; per-slot non-coherent combining
+        // scores it on the live slots that do match instead of on a
+        // whole-frame coherent sum, which recovers the capsule the earlier
+        // full-frame metric missed.
+        assert_eq!(
+            fcs_valid.len(),
+            19,
+            "expected the live HRPD access receiver chain to decode all 19 bursts"
+        );
+        let uati_requests = fcs_valid
+            .iter()
+            .filter(|event| event.decoded.contains("UATIRequest"))
+            .count();
+        let uati_completes = fcs_valid
+            .iter()
+            .filter(|event| {
+                event.decoded.contains("UATIComplete")
+                    && event.decoded.contains("ConnectionRequest")
+                    && event.decoded.contains("ati=Uati/0x1a058001")
+            })
+            .count();
+        assert_eq!(uati_requests, 1, "one initial UATIRequest probe");
+        assert_eq!(
+            uati_completes, 18,
+            "eighteen multi-fragment UATIComplete + ConnectionRequest retries on the assigned UATI"
+        );
+    }
+
+    #[test]
+    fn capture_hrpd_reverse_access_1800067761628706() {
+        init_test_logger();
+        let metadata_path = test_capture_path("1800067761628706.json");
+        let wav_path = test_capture_path("1800067761628706.wav");
+        let metadata = test_capture_metadata_from_path(&metadata_path);
+        assert_eq!(metadata.sample_rate_hz, 9_830_400);
+        assert_eq!(metadata.chip_rate_hz, 1_228_800);
+        assert_eq!(metadata.rx_center_frequency_hz, Some(846_105_000));
+        assert_eq!(metadata.one_x_reverse_frequency_hz, Some(848_310_000));
+        assert_eq!(metadata.one_x_rx_shift_hz, Some(2_205_000));
+        assert_eq!(metadata.hrpd_reverse_frequency_hz, Some(843_900_000));
+        assert_eq!(metadata.hrpd_rx_shift_hz, Some(-2_205_000));
+        assert!(
+            wav_path.exists(),
+            "missing HRPD reverse access capture {}",
+            wav_path.display()
+        );
+
+        let hrpd_shift_hz = metadata
+            .hrpd_rx_shift_hz
+            .expect("capture sidecar must include hrpd_rx_shift_hz");
+        let (sample_rate, iq_samples, absolute_sample_start) =
+            read_shifted_capture_to_4x_with_shift(&wav_path, &metadata, hrpd_shift_hz);
+        let oversample = (sample_rate as usize) / ACCESS_CHIP_RATE as usize;
+        assert_eq!(oversample, 4, "shifted HRPD slice should be 4x chip rate");
+        let chip_start = absolute_sample_start / oversample as u64;
+        eprintln!(
+            "HRPD 1800067761628706 shifted access capture: raw_rate={} shifted_rate={} samples={} abs_sample_start={} chip_start={} chip_mod_frame={} shift_hz={}",
+            metadata.sample_rate_hz,
+            sample_rate,
+            iq_samples.len(),
+            absolute_sample_start,
+            chip_start,
+            chip_start % 32768,
+            hrpd_shift_hz,
+        );
+        let runs = hrpd_slot_power_runs_at_threshold(&iq_samples, chip_start, oversample, 2.0);
+        for (idx, run) in runs.iter().enumerate() {
+            eprintln!(
+                "HRPD 1800067761628706 energy run #{}: slots=[{}, {}) chips=[{}, {}) slot_count={} peak={:+.2}dB",
+                idx + 1,
+                run.start_slot,
+                run.end_slot,
+                run.start_chip,
+                run.end_chip,
+                run.end_slot - run.start_slot,
+                run.peak_db,
+            );
+        }
+
+        let pipeline = hrpd_reverse_access_chain(HrpdReverseAccessSettings {
+            oversample,
+            ..HrpdReverseAccessSettings::default()
+        });
+        let total_samples = iq_samples.len();
+        let mut receiver = PipelinedReceiver::new(iq_samples.into_iter())
+            .with_batch_size(32768)
+            .with_input_sample_rate_hz(sample_rate as f64)
+            .with_absolute_sample_start(absolute_sample_start);
+        let out_rx = receiver.add_pipeline(pipeline);
+        let pipeline_start = std::time::Instant::now();
+        receiver.run_pipeline().unwrap();
+        let pipeline_elapsed = pipeline_start.elapsed();
+        let capture_seconds = total_samples as f64 / sample_rate as f64;
+        let multiplier = capture_seconds / pipeline_elapsed.as_secs_f64();
+        eprintln!(
+            "HRPD 1800067761628706 receiver pipeline timing: capture={:.2}s pipeline={:.2}s real_time={:.2}x",
+            capture_seconds,
+            pipeline_elapsed.as_secs_f64(),
+            multiplier,
+        );
+
+        let events = collect_hrpd_access_capture_events(out_rx);
+        let fcs_valid = events
+            .iter()
+            .filter(|event| event.single_fragment_fcs_valid)
+            .collect::<Vec<_>>();
+        for (idx, event) in events.iter().enumerate() {
+            eprintln!(
+                "HRPD 1800067761628706 event #{}: chip={} phy_crc_valid={} mac_fragment_valid={} single_fragment_fcs_valid={} msg_len={:?} info_hex={} decoded={}",
+                idx + 1,
+                event.packet_start,
+                event.phy_crc_valid,
+                event.mac_fragment_valid,
+                event.single_fragment_fcs_valid,
+                event.mac_length_octets,
+                event.info_hex,
+                event.decoded,
+            );
+        }
+        eprintln!(
+            "HRPD 1800067761628706 shifted access summary: streaming_events={} streaming_fcs_valid={} decoded={:?}",
+            events.len(),
+            fcs_valid.len(),
+            fcs_valid
+                .iter()
+                .map(|event| &event.decoded)
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            fcs_valid.iter().any(|event| {
+                event.packet_start == 1_800_067_776_610_304
+                    && event.decoded.contains("RouteUpdate")
+                    && event.decoded.contains("ConnectionRequest")
+                    && event.decoded.contains("ati=Uati/0x1a058001")
+            }),
+            "expected the logged UATI ConnectionRequest access packet to decode: {:?}",
+            fcs_valid
+        );
+
+        // Pull the shared correlator's accumulated timing counters and lock
+        // them in as a regression guard. Budgets are set at ~2x the measured
+        // values on the development machine to keep CI noise from flapping
+        // while still catching genuine regressions.
+        let metrics_handle =
+            crate::receiver::hrpd::reverse_correlator_base::get_metrics_handle("hrpd_access")
+                .expect("hrpd_access correlator metrics should be registered");
+        let metrics = metrics_handle.lock().expect("metrics mutex");
+        let per_block_us = metrics.per_block_avg_us();
+        let fft_scan_us = metrics.fft_scan_avg_us();
+        let spawn_us = metrics.spawn_finger_avg_us();
+        let append_us = metrics.append_block_avg_us();
+        eprintln!(
+            "HRPD 1800067761628706 correlator timing: per_block_avg={}us append_avg={}us fft_scan_avg={}us(n={}) spawn_avg={}us(n={})",
+            per_block_us,
+            append_us,
+            fft_scan_us,
+            metrics.fft_scan_calls,
+            spawn_us,
+            metrics.spawn_finger_calls,
+        );
+        // Total time per section across the whole run, so the heat
+        // breakdown is meaningful regardless of call-rate differences.
+        let total_pipeline_ms = pipeline_elapsed.as_millis() as u64;
+        let fft_total_ms = metrics.fft_scan_ns / 1_000_000;
+        let spawn_total_ms = metrics.spawn_finger_ns / 1_000_000;
+        let ref_setup_ms = metrics.searcher_ref_setup_ns / 1_000_000;
+        let sig_fft_ms = metrics.searcher_signal_fft_ns / 1_000_000;
+        let ifft_mult_ms = metrics.searcher_ifft_mult_ns / 1_000_000;
+        let peak_find_ms = metrics.searcher_peak_find_ns / 1_000_000;
+        eprintln!(
+            "HRPD 1800067761628706 HEAT total_pipeline={total_ms}ms\n\
+             \tfft_scan_top_hits={fft_ms}ms ({fft_pct:.1}%)\n\
+             \t\tref_setup={r_ms}ms ({r_pct:.1}%) [{r_calls} windows]\n\
+             \t\tsignal_fft={s_ms}ms ({s_pct:.1}%)\n\
+             \t\tifft+mult={i_ms}ms ({i_pct:.1}%)\n\
+             \t\tpeak_find={p_ms}ms ({p_pct:.1}%)\n\
+             \tspawn_finger={spawn_ms}ms ({spawn_pct:.1}%) [{spawn_calls} calls]",
+            total_ms = total_pipeline_ms,
+            fft_ms = fft_total_ms,
+            fft_pct = 100.0 * fft_total_ms as f64 / total_pipeline_ms.max(1) as f64,
+            r_ms = ref_setup_ms,
+            r_pct = 100.0 * ref_setup_ms as f64 / total_pipeline_ms.max(1) as f64,
+            r_calls = metrics.searcher_ref_setup_calls,
+            s_ms = sig_fft_ms,
+            s_pct = 100.0 * sig_fft_ms as f64 / total_pipeline_ms.max(1) as f64,
+            i_ms = ifft_mult_ms,
+            i_pct = 100.0 * ifft_mult_ms as f64 / total_pipeline_ms.max(1) as f64,
+            p_ms = peak_find_ms,
+            p_pct = 100.0 * peak_find_ms as f64 / total_pipeline_ms.max(1) as f64,
+            spawn_ms = spawn_total_ms,
+            spawn_pct = 100.0 * spawn_total_ms as f64 / total_pipeline_ms.max(1) as f64,
+            spawn_calls = metrics.spawn_finger_calls,
+        );
+        // Budgets reflect the multi-tier non-coherent primary searcher:
+        // ~400us per_block, ~6000us per primary scan, and 1-2 spawn calls
+        // per capture. The surviving spawn does the full timing search and
+        // is expensive per-call but rare. Budgets give ~2× CI headroom.
+        assert!(
+            per_block_us < 10_000,
+            "hrpd_access per_block_avg too slow: {per_block_us}us (budget 10000us)",
+        );
+        assert!(
+            fft_scan_us < 25_000,
+            "hrpd_access fft_scan_avg too slow: {fft_scan_us}us (budget 25000us)",
+        );
+        assert!(
+            spawn_us < 60_000,
+            "hrpd_access spawn_finger_avg too slow: {spawn_us}us (budget 60000us)",
+        );
     }
 
     const RC1_RATE_COUNT_PER_BUCKET_TOLERANCE: usize = 3;
@@ -1951,8 +2602,8 @@ mod tests {
 
         // Lock the current deduped decode count for this reproducer under the
         // production reverse-access chain. An offline high-energy envelope pass
-        // on the raw WAV shows 13 real burst regions here; the old 24-frame
-        // baseline was inflated by cross-finger duplicate emits.
+        // on the raw WAV shows 13 real burst regions here; a higher count would
+        // indicate cross-finger duplicate emits.
         assert_eq!(
             default_stats.crc_valid_data_frame_count, 13,
             "expected WAV 3 reproducer to produce exactly 13 deduped CRC-valid access frames, got {}",
@@ -4250,30 +4901,6 @@ mod tests {
             .collect()
     }
 
-    fn best_chip_shift_correlation(
-        reference: &[Complex32],
-        candidate: &[Complex32],
-        max_shift_chips: usize,
-    ) -> (usize, f32) {
-        let mut best_shift = 0usize;
-        let mut best_corr = 0.0f32;
-        for shift in 0..=max_shift_chips {
-            let overlap = reference.len().min(candidate.len().saturating_sub(shift));
-            if overlap == 0 {
-                continue;
-            }
-            let corr = normalized_correlation_magnitude(
-                &reference[..overlap],
-                &candidate[shift..shift + overlap],
-            );
-            if corr > best_corr {
-                best_corr = corr;
-                best_shift = shift;
-            }
-        }
-        (best_shift, best_corr)
-    }
-
     fn build_rust_reverse_rc3_golden_despread_framewise() -> RustRc3GoldenDespreadFramewise {
         let plan = reverse_rc3_golden_plan();
         let frames = plan
@@ -4564,21 +5191,6 @@ mod tests {
         chips
     }
 
-    fn shift_chips_left(mut chips: Vec<Complex32>, shift: usize) -> Vec<Complex32> {
-        if shift == 0 || chips.is_empty() {
-            return chips;
-        }
-        if shift >= chips.len() {
-            return vec![Complex32::new(0.0, 0.0); chips.len()];
-        }
-        let len = chips.len();
-        chips.copy_within(shift.., 0);
-        for sample in &mut chips[len - shift..] {
-            *sample = Complex32::new(0.0, 0.0);
-        }
-        chips
-    }
-
     fn slice_shifted_frame_chips(
         raw_chips: &[Complex32],
         frame_idx: usize,
@@ -4717,174 +5329,6 @@ mod tests {
         );
 
         result
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    struct Rc3HpskVariant {
-        negate_pn_q: bool,
-        use_prev_lc_for_q: bool,
-        negate_output_q: bool,
-        invert_w12: bool,
-        warmup_chips: usize,
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    enum Rc3TrafficCombineVariant {
-        PilotITrafficQPos,
-        PilotITrafficQNeg,
-        PilotQPosTrafficI,
-        PilotQNegTrafficI,
-    }
-
-    fn raw_iq_corr(a: &[Complex32], b: &[Complex32]) -> f32 {
-        if a.is_empty() || b.is_empty() {
-            return 0.0;
-        }
-        let mut dot = Complex32::new(0.0, 0.0);
-        let mut a_energy = 0.0f32;
-        let mut b_energy = 0.0f32;
-        for (&sa, &sb) in a.iter().zip(b.iter()) {
-            dot += sa * sb.conj();
-            a_energy += sa.norm_sqr();
-            b_energy += sb.norm_sqr();
-        }
-        if a_energy <= 0.0 || b_energy <= 0.0 {
-            0.0
-        } else {
-            dot.norm() / (a_energy.sqrt() * b_energy.sqrt())
-        }
-    }
-
-    fn build_reverse_rc3_frame_samples_variant(
-        frame: &GoldenRc3Frame,
-        esn: u32,
-        long_code_state: u64,
-        oversample: usize,
-        variant: Rc3HpskVariant,
-        combine_variant: Rc3TrafficCombineVariant,
-    ) -> Vec<Complex32> {
-        let encoded_symbols = match frame {
-            GoldenRc3Frame::PilotOnly => None,
-            GoldenRc3Frame::Traffic { rate, info_bits } => {
-                Some(encode_reverse_rc3_fch_symbols(info_bits, *rate))
-            }
-        };
-        build_reverse_rc3_samples_from_encoded_symbols(
-            encoded_symbols.as_deref(),
-            esn,
-            long_code_state,
-            oversample,
-            variant,
-            combine_variant,
-        )
-    }
-
-    fn build_reverse_rc3_samples_from_encoded_symbols(
-        encoded_symbols: Option<&[f32]>,
-        esn: u32,
-        long_code_state: u64,
-        oversample: usize,
-        variant: Rc3HpskVariant,
-        combine_variant: Rc3TrafficCombineVariant,
-    ) -> Vec<Complex32> {
-        const FRAME_CHIPS: usize = 24_576;
-        const CHIPS_PER_SYMBOL: usize = 16;
-
-        let total_samples = FRAME_CHIPS * oversample;
-        let pn_samples = build_fft_search_pn_samples(
-            total_samples + variant.warmup_chips * oversample,
-            oversample,
-        );
-        let walsh_cover = WalshGenerator::generate_matrix::<16>()[4];
-        let mut lc_gen = LongCodeGenerator::new_traffic_channel_with_state(esn, long_code_state);
-        let mut prev_lc = 1.0f32;
-        let mut iq_samples = Vec::with_capacity(total_samples);
-
-        for chip_idx in 0..variant.warmup_chips {
-            let sample_idx = chip_idx * oversample;
-            let pn = pn_samples[sample_idx];
-            let _pn_i = pn.re;
-            let _pn_q = if variant.negate_pn_q { -pn.im } else { pn.im };
-            let lc_i = if lc_gen.next_chip() == 1 { -1.0 } else { 1.0 };
-            prev_lc = lc_i;
-        }
-
-        for chip_idx in 0..FRAME_CHIPS {
-            let sample_idx = (chip_idx + variant.warmup_chips) * oversample;
-            let pn = pn_samples[sample_idx];
-            let pn_i = pn.re;
-            let pn_q = if variant.negate_pn_q { -pn.im } else { pn.im };
-            let lc_i = if lc_gen.next_chip() == 1 { -1.0 } else { 1.0 };
-            let w12 = if (chip_idx % 2 == 0) ^ variant.invert_w12 {
-                1.0
-            } else {
-                -1.0
-            };
-            let lc_q = if variant.use_prev_lc_for_q {
-                prev_lc
-            } else {
-                lc_i
-            };
-            let s_i = pn_i * lc_i;
-            let s_q = w12 * s_i * pn_q * lc_q;
-            prev_lc = lc_i;
-
-            let spread_ref = if variant.negate_output_q {
-                Complex32::new(s_i, -s_q)
-            } else {
-                Complex32::new(s_i, s_q)
-            };
-            let desired_chip = match encoded_symbols {
-                None => Complex32::new(1.0, 0.0),
-                Some(symbols) => {
-                    let symbol_idx = chip_idx / CHIPS_PER_SYMBOL;
-                    let walsh_chip = walsh_cover[chip_idx % CHIPS_PER_SYMBOL] as f32;
-                    let traffic = symbols[symbol_idx] * walsh_chip;
-                    match combine_variant {
-                        Rc3TrafficCombineVariant::PilotITrafficQPos => Complex32::new(1.0, traffic),
-                        Rc3TrafficCombineVariant::PilotITrafficQNeg => {
-                            Complex32::new(1.0, -traffic)
-                        }
-                        Rc3TrafficCombineVariant::PilotQPosTrafficI => Complex32::new(traffic, 1.0),
-                        Rc3TrafficCombineVariant::PilotQNegTrafficI => {
-                            Complex32::new(traffic, -1.0)
-                        }
-                    }
-                }
-            };
-            let tx_chip = desired_chip * spread_ref;
-            iq_samples.extend(std::iter::repeat_n(tx_chip, oversample));
-        }
-
-        let peak = iq_samples
-            .iter()
-            .map(|s| s.re.abs().max(s.im.abs()))
-            .fold(0.0f32, f32::max);
-        if peak > 1e-9 {
-            let scale = 0.9 / peak;
-            for sample in &mut iq_samples {
-                *sample *= scale;
-            }
-        }
-        iq_samples
-    }
-
-    fn normalized_correlation_magnitude(a: &[Complex32], b: &[Complex32]) -> f32 {
-        if a.is_empty() || b.is_empty() {
-            return 0.0;
-        }
-        let mut dot = Complex32::new(0.0, 0.0);
-        let mut a_energy = 0.0f32;
-        let mut b_energy = 0.0f32;
-        for (&sa, &sb) in a.iter().zip(b.iter()) {
-            dot += sa * sb.conj();
-            a_energy += sa.norm_sqr();
-            b_energy += sb.norm_sqr();
-        }
-        if a_energy <= 0.0 || b_energy <= 0.0 {
-            return 0.0;
-        }
-        dot.norm() / (a_energy.sqrt() * b_energy.sqrt())
     }
 
     fn rc3_pcg_batch_size(sample_rate: usize) -> usize {
@@ -5626,25 +6070,10 @@ mod tests {
         let reader = hound::WavReader::open(&wav_path)
             .unwrap_or_else(|e| panic!("failed to open {}: {e}", wav_path.display()));
         let (sample_rate, mut iq_samples) = read_iq_wav(reader);
-        let esn: u32 = esn_override
-            .or_else(|| {
-                std::env::var("CDMA_TRAFFIC_ESN").ok().and_then(|s| {
-                    let trimmed = s.trim_start_matches("0x").trim_start_matches("0X");
-                    u32::from_str_radix(trimmed, 16)
-                        .ok()
-                        .or_else(|| s.parse().ok())
-                })
-            })
-            .unwrap_or(0x4CDC1D09);
+        let esn: u32 = esn_override.unwrap_or(0x4CDC1D09);
         let oversample = (sample_rate as usize) / 1228800;
-        let sample_start: usize = std::env::var("CDMA_TRAFFIC_SAMPLE_START")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(default_sample_start);
-        let sample_len: Option<usize> = std::env::var("CDMA_TRAFFIC_SAMPLE_LEN")
-            .ok()
-            .and_then(|s| s.parse().ok());
-        let sample_len = sample_len.or(default_sample_len);
+        let sample_start: usize = default_sample_start;
+        let sample_len: Option<usize> = default_sample_len;
         if sample_start > 0 || sample_len.is_some() {
             let end = sample_len
                 .map(|len| sample_start.saturating_add(len))
@@ -5655,18 +6084,7 @@ mod tests {
         let absolute_sample_start = chip_start
             .saturating_mul(oversample as u64)
             .saturating_add(sample_start as u64);
-        let walsh_codes: Vec<u8> = walsh_override
-            .or_else(|| {
-                std::env::var("CDMA_TRAFFIC_WALSH")
-                    .ok()
-                    .map(|s| {
-                        s.split(',')
-                            .filter_map(|part| part.trim().parse::<u8>().ok())
-                            .collect::<Vec<_>>()
-                    })
-                    .filter(|codes| !codes.is_empty())
-            })
-            .unwrap_or_else(|| vec![10u8]);
+        let walsh_codes: Vec<u8> = walsh_override.unwrap_or_else(|| vec![10u8]);
 
         let rc = 1u8;
 
@@ -5680,10 +6098,7 @@ mod tests {
         );
 
         for &walsh_code in &walsh_codes {
-            let verbose_phy_limit: usize = std::env::var("CDMA_TRAFFIC_VERBOSE_PHY_LIMIT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(32);
+            let verbose_phy_limit: usize = 32;
             eprintln!(
                 "\n============================================================\ntraffic decode: RC1-ESN walsh={} chip_start={}",
                 walsh_code, chip_start,
@@ -5969,360 +6384,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_diag_matlab_reverse_rc3_hpsk_variant() {
-        if env::var("CDMA_MATLAB_RC3_HPSK_VARIANT_DIAG").is_err() {
-            return;
-        }
-        let wav_path = test_iq_path("rev_rc3_traffic.wav");
-        let reader = hound::WavReader::open(&wav_path)
-            .unwrap_or_else(|e| panic!("failed to open {}: {e}", wav_path.display()));
-        let (sample_rate, iq_samples) = read_iq_wav(reader);
-        let samples_per_frame =
-            (REVERSE_RC3_GOLDEN_FRAME_CHIPS as usize) * (sample_rate as usize / 1_228_800);
-        let matlab_frame0 = &iq_samples[..samples_per_frame];
-        let matlab_frame10 = &iq_samples[10 * samples_per_frame..11 * samples_per_frame];
-
-        let plan = reverse_rc3_golden_plan();
-        let frame10_state = (0..10).fold(1u64 << 41, |state, _| {
-            advance_reverse_rc3_traffic_long_code_state(
-                state,
-                REVERSE_RC3_GOLDEN_FRAME_CHIPS as usize,
-            )
-        });
-
-        let mut best: Option<(Rc3HpskVariant, f32, f32, f32)> = None;
-        for &negate_pn_q in &[false, true] {
-            for &use_prev_lc_for_q in &[false, true] {
-                for &negate_output_q in &[false, true] {
-                    for &invert_w12 in &[false, true] {
-                        for warmup_chips in 0..=2 {
-                            let variant = Rc3HpskVariant {
-                                negate_pn_q,
-                                use_prev_lc_for_q,
-                                negate_output_q,
-                                invert_w12,
-                                warmup_chips,
-                            };
-                            let local_frame0 = build_reverse_rc3_frame_samples_variant(
-                                &GoldenRc3Frame::PilotOnly,
-                                REVERSE_RC3_GOLDEN_ESN,
-                                1u64 << 41,
-                                sample_rate as usize / 1_228_800,
-                                variant,
-                                Rc3TrafficCombineVariant::PilotITrafficQPos,
-                            );
-                            let local_frame10 = build_reverse_rc3_frame_samples_variant(
-                                &plan.schedule[10],
-                                REVERSE_RC3_GOLDEN_ESN,
-                                frame10_state,
-                                sample_rate as usize / 1_228_800,
-                                variant,
-                                Rc3TrafficCombineVariant::PilotITrafficQPos,
-                            );
-                            let corr0 = raw_iq_corr(&local_frame0, matlab_frame0);
-                            let corr10 = raw_iq_corr(&local_frame10, matlab_frame10);
-                            let score = corr0 + corr10;
-                            if best
-                                .as_ref()
-                                .is_none_or(|(_, best_score, _, _)| score > *best_score)
-                            {
-                                best = Some((variant, score, corr0, corr10));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        eprintln!("best MATLAB RC3 HPSK variant: {:?}", best);
-    }
-
-    #[test]
-    fn test_diag_matlab_reverse_rc3_traffic_combine_variant() {
-        if env::var("CDMA_MATLAB_RC3_COMBINE_VARIANT_DIAG").is_err() {
-            return;
-        }
-        let wav_path = test_iq_path("rev_rc3_traffic.wav");
-        let reader = hound::WavReader::open(&wav_path)
-            .unwrap_or_else(|e| panic!("failed to open {}: {e}", wav_path.display()));
-        let (sample_rate, iq_samples) = read_iq_wav(reader);
-        let samples_per_frame =
-            (REVERSE_RC3_GOLDEN_FRAME_CHIPS as usize) * (sample_rate as usize / 1_228_800);
-        let matlab_frame10 = &iq_samples[10 * samples_per_frame..11 * samples_per_frame];
-
-        let plan = reverse_rc3_golden_plan();
-        let frame10_state = (0..10).fold(1u64 << 41, |state, _| {
-            advance_reverse_rc3_traffic_long_code_state(
-                state,
-                REVERSE_RC3_GOLDEN_FRAME_CHIPS as usize,
-            )
-        });
-        let spread_variant = Rc3HpskVariant {
-            negate_pn_q: false,
-            use_prev_lc_for_q: true,
-            negate_output_q: false,
-            invert_w12: false,
-            warmup_chips: 1,
-        };
-
-        let mut best: Option<(Rc3TrafficCombineVariant, f32)> = None;
-        for combine_variant in [
-            Rc3TrafficCombineVariant::PilotITrafficQPos,
-            Rc3TrafficCombineVariant::PilotITrafficQNeg,
-            Rc3TrafficCombineVariant::PilotQPosTrafficI,
-            Rc3TrafficCombineVariant::PilotQNegTrafficI,
-        ] {
-            let local_frame10 = build_reverse_rc3_frame_samples_variant(
-                &plan.schedule[10],
-                REVERSE_RC3_GOLDEN_ESN,
-                frame10_state,
-                sample_rate as usize / 1_228_800,
-                spread_variant,
-                combine_variant,
-            );
-            let corr10 = raw_iq_corr(&local_frame10, matlab_frame10);
-            if best
-                .as_ref()
-                .is_none_or(|(_, best_corr)| corr10 > *best_corr)
-            {
-                best = Some((combine_variant, corr10));
-            }
-        }
-        eprintln!("best MATLAB RC3 traffic combine variant: {:?}", best);
-    }
-
-    #[test]
-    fn test_diag_matlab_reverse_rc3_datasource_semantics() {
-        if env::var("CDMA_MATLAB_RC3_DATASOURCE_DIAG").is_err() {
-            return;
-        }
-        let wav_path = test_iq_path("rev_rc3_traffic.wav");
-        let reader = hound::WavReader::open(&wav_path)
-            .unwrap_or_else(|e| panic!("failed to open {}: {e}", wav_path.display()));
-        let (sample_rate, iq_samples) = read_iq_wav(reader);
-        let pilot_wav_path = test_iq_path("rev_rc3_traffic_pilot_only.wav");
-        let pilot_reader = hound::WavReader::open(&pilot_wav_path)
-            .unwrap_or_else(|e| panic!("failed to open {}: {e}", pilot_wav_path.display()));
-        let (pilot_sample_rate, pilot_iq_samples) = read_iq_wav(pilot_reader);
-        assert_eq!(pilot_sample_rate, sample_rate);
-        let samples_per_frame =
-            (REVERSE_RC3_GOLDEN_FRAME_CHIPS as usize) * (sample_rate as usize / 1_228_800);
-
-        let plan = reverse_rc3_golden_plan();
-        let oversample = sample_rate as usize / 1_228_800;
-        for (idx, frame) in plan.schedule.iter().enumerate() {
-            let start = idx * samples_per_frame;
-            let end = start + samples_per_frame;
-            let matlab_chips = derive_reverse_rc3_despread_chips_from_pilot_reference(
-                &iq_samples[start..end],
-                &pilot_iq_samples[start..end],
-                oversample,
-            );
-            match frame {
-                GoldenRc3Frame::PilotOnly => {
-                    eprintln!(
-                        "MATLAB RC3 datasource frame#{idx:02} pilot-only avg_mag={:.4}",
-                        matlab_chips.iter().map(|c| c.norm()).sum::<f32>()
-                            / matlab_chips.len() as f32
-                    );
-                }
-                GoldenRc3Frame::Traffic { rate, info_bits } => {
-                    let expected_info = build_reverse_rc3_despread_chips(frame);
-                    let frame_bits = build_reverse_rc3_frame_bits(info_bits, *rate);
-                    let frame_symbols =
-                        encode_reverse_rc3_fch_frame_bits_to_symbols(&frame_bits, *rate);
-                    let expected_frame =
-                        build_reverse_rc3_despread_chips_from_symbols(&frame_symbols);
-                    let (info_shift, info_corr) =
-                        best_chip_shift_correlation(&expected_info, &matlab_chips, 16);
-                    let (frame_shift, frame_corr) =
-                        best_chip_shift_correlation(&expected_frame, &matlab_chips, 16);
-                    eprintln!(
-                        "MATLAB RC3 datasource frame#{idx:02} rate={} info_bits(shift={}, corr={:.4}) frame_bits(shift={}, corr={:.4})",
-                        rate.rate_bps(),
-                        info_shift,
-                        info_corr,
-                        frame_shift,
-                        frame_corr,
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_diag_matlab_reverse_rc3_prespread_frame10() {
-        if env::var("CDMA_MATLAB_RC3_PRESPREAD_DIAG").is_err() {
-            return;
-        }
-        let wav_path = test_iq_path("rev_rc3_traffic.wav");
-        let reader = hound::WavReader::open(&wav_path)
-            .unwrap_or_else(|e| panic!("failed to open {}: {e}", wav_path.display()));
-        let (sample_rate, iq_samples) = read_iq_wav(reader);
-        let samples_per_frame =
-            (REVERSE_RC3_GOLDEN_FRAME_CHIPS as usize) * (sample_rate as usize / 1_228_800);
-        let oversample = sample_rate as usize / 1_228_800;
-        let matlab_frame10 = &iq_samples[10 * samples_per_frame..11 * samples_per_frame];
-
-        let frame10_state = (0..10).fold(1u64 << 41, |state, _| {
-            advance_reverse_rc3_traffic_long_code_state(
-                state,
-                REVERSE_RC3_GOLDEN_FRAME_CHIPS as usize,
-            )
-        });
-        let plan = reverse_rc3_golden_plan();
-        let spread_variant = Rc3HpskVariant {
-            negate_pn_q: false,
-            use_prev_lc_for_q: true,
-            negate_output_q: false,
-            invert_w12: false,
-            warmup_chips: 1,
-        };
-        let local_pilot = build_reverse_rc3_frame_samples_variant(
-            &GoldenRc3Frame::PilotOnly,
-            REVERSE_RC3_GOLDEN_ESN,
-            frame10_state,
-            oversample,
-            spread_variant,
-            Rc3TrafficCombineVariant::PilotITrafficQPos,
-        );
-        let local_frame10 = build_reverse_rc3_frame_samples_variant(
-            &plan.schedule[10],
-            REVERSE_RC3_GOLDEN_ESN,
-            frame10_state,
-            oversample,
-            spread_variant,
-            Rc3TrafficCombineVariant::PilotITrafficQPos,
-        );
-
-        let mut matlab_desired = Vec::new();
-        let mut local_desired = Vec::new();
-        for chip_idx in 0..24 {
-            let sample_idx = chip_idx * oversample;
-            let pilot = local_pilot[sample_idx];
-            let rx = matlab_frame10[sample_idx];
-            matlab_desired.push(rx * pilot.conj() / pilot.norm_sqr());
-            let local_rx = local_frame10[sample_idx];
-            local_desired.push(local_rx * pilot.conj() / pilot.norm_sqr());
-        }
-        eprintln!(
-            "MATLAB RC3 frame10 estimated desired chips: {:?}",
-            matlab_desired
-                .iter()
-                .map(|c| (format!("{:.3}", c.re), format!("{:.3}", c.im)))
-                .collect::<Vec<_>>()
-        );
-        eprintln!(
-            "local RC3 frame10 estimated desired chips: {:?}",
-            local_desired
-                .iter()
-                .map(|c| (format!("{:.3}", c.re), format!("{:.3}", c.im)))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn test_diag_matlab_reverse_rc3_lower_rate_decoded_bits() {
-        if env::var("CDMA_MATLAB_RC3_LOWER_RATE_BITS_DIAG").is_err() {
-            return;
-        }
-
-        let wav_path = test_iq_path("rev_rc3_traffic.wav");
-        let pilot_wav_path = test_iq_path("rev_rc3_traffic_pilot_only.wav");
-        let reader = hound::WavReader::open(&wav_path)
-            .unwrap_or_else(|e| panic!("failed to open {}: {e}", wav_path.display()));
-        let pilot_reader = hound::WavReader::open(&pilot_wav_path)
-            .unwrap_or_else(|e| panic!("failed to open {}: {e}", pilot_wav_path.display()));
-        let (sample_rate, iq_samples) = read_iq_wav(reader);
-        let (pilot_sample_rate, pilot_iq_samples) = read_iq_wav(pilot_reader);
-        assert_eq!(pilot_sample_rate, sample_rate);
-
-        let plan = reverse_rc3_golden_plan();
-        let oversample = sample_rate as usize / 1_228_800;
-        let chips_per_frame = REVERSE_RC3_GOLDEN_FRAME_CHIPS as usize;
-        let raw_matlab_chips = derive_reverse_rc3_despread_chips_from_pilot_reference(
-            &iq_samples,
-            &pilot_iq_samples,
-            oversample,
-        );
-        let all_matlab_chips = shift_chips_left(
-            raw_matlab_chips.clone(),
-            REVERSE_RC3_GOLDEN_MATLAB_CHIP_SHIFT,
-        );
-
-        for (idx, frame) in plan.schedule.iter().enumerate() {
-            let GoldenRc3Frame::Traffic { rate, info_bits } = frame else {
-                continue;
-            };
-            let start = idx * chips_per_frame;
-            let end = start + chips_per_frame;
-            let outputs = run_rc3_reverse_traffic_despread_frame_outputs(
-                all_matlab_chips[start..end].to_vec(),
-                REVERSE_RC3_GOLDEN_WALSH,
-            );
-            let decoded_blocks = outputs
-                .into_iter()
-                .filter(|blk| blk.tags.get("traffic_phy_valid") == Some(&1))
-                .collect::<Vec<_>>();
-            if decoded_blocks.is_empty() {
-                eprintln!(
-                    "MATLAB RC3 decoded bits frame#{idx:02} rate={} no phy-valid decode",
-                    rate.rate_bps()
-                );
-                let mut successful_shifts = Vec::new();
-                for shift in 0..=8usize {
-                    let shifted = shift_chips_left(raw_matlab_chips.clone(), shift);
-                    let outputs = run_rc3_reverse_traffic_despread_frame_outputs(
-                        shifted[start..end].to_vec(),
-                        REVERSE_RC3_GOLDEN_WALSH,
-                    );
-                    let valid_rates = outputs
-                        .into_iter()
-                        .filter(|blk| blk.tags.get("traffic_phy_valid") == Some(&1))
-                        .filter_map(|blk| blk.tags.get("traffic_rate_bps").copied())
-                        .collect::<Vec<_>>();
-                    if !valid_rates.is_empty() {
-                        successful_shifts.push((shift, valid_rates));
-                    }
-                }
-                eprintln!(
-                    "MATLAB RC3 decoded bits frame#{idx:02} alternate_shifts={successful_shifts:?}"
-                );
-                continue;
-            }
-
-            let expected_frame_bits = build_reverse_rc3_frame_bits(info_bits, *rate);
-            for (block_idx, blk) in decoded_blocks.iter().enumerate() {
-                let bits = blk
-                    .samples
-                    .iter()
-                    .map(|s| s.re.round().clamp(0.0, 1.0) as u8)
-                    .collect::<Vec<_>>();
-                let overlap = bits.len().min(expected_frame_bits.len());
-                let mismatches = bits[..overlap]
-                    .iter()
-                    .zip(expected_frame_bits[..overlap].iter())
-                    .filter(|(a, b)| a != b)
-                    .count();
-                eprintln!(
-                    "MATLAB RC3 decoded bits frame#{idx:02} rate={} block#{block_idx} overlap={} mismatches={} decoded_prefix={} expected_prefix={}",
-                    rate.rate_bps(),
-                    overlap,
-                    mismatches,
-                    bits.iter()
-                        .take(32)
-                        .map(|b| char::from(b'0' + *b))
-                        .collect::<String>(),
-                    expected_frame_bits
-                        .iter()
-                        .take(32)
-                        .map(|b| char::from(b'0' + *b))
-                        .collect::<String>(),
-                );
-            }
-        }
-    }
-
     fn run_rc1_reverse_traffic_channel_decode_wav_test(
         wav_path: std::path::PathBuf,
         chip_start: u64,
@@ -6349,13 +6410,8 @@ mod tests {
     #[test]
     fn capture_rc1_reverse_traffic_channel_decode_wav() {
         init_test_logger();
-        let wav_path = std::env::var("CDMA_TRAFFIC_WAV")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| test_capture_path("1792143302208325.wav"));
-        let chip_start = std::env::var("CDMA_TRAFFIC_CHIP_START")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1792143302208325);
+        let wav_path = test_capture_path("1792143302208325.wav");
+        let chip_start = 1792143302208325;
         // WAV 1792143302208325: a single 9600 bps signaling burst
         // (the r-dsch MS Ack Order) with the remaining call time
         // decoded as null-traffic sub-rate frames. The spec-aligned
@@ -6437,7 +6493,7 @@ mod tests {
     /// **Lock-step with `rlgain_adj` in `paging_messages.rs`**: if it changes,
     /// update `PROD_RLGAIN_ADJ_QUARTERS` below and re-run before adjusting setpoints.
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic FER-vs-pilot-SINR calibration sweep; run explicitly when tuning setpoints"]
     fn rc3_pilot_sinr_at_1pct_fer_calibration() {
         init_test_logger();
 

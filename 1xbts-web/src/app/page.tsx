@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { Card, Stat } from "@/components/card";
+import { HrpdSummaryCard } from "@/components/hrpd-summary-card";
 import { serviceOptionName } from "@/lib/service-option";
 import { smsStateColor } from "@/lib/sms-state";
 import { useEventStream } from "@/lib/use-event-stream";
@@ -75,6 +76,7 @@ interface PacketSession {
   ourIp: string;
   mobileAddress: string;
   phoneNumber: string;
+  accessTechnology: string;
   captureEnabled: boolean;
   uplinkFrames: number;
   downlinkFrames: number;
@@ -298,6 +300,7 @@ export default function DashboardPage() {
 
       {/* Middle row: Channels + Mobiles + SMSC + Packet Data */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        <HrpdSummaryCard />
         <Card title="Channels">
           {channelData ? (
             <>
@@ -435,7 +438,7 @@ export default function DashboardPage() {
                     {s.phoneNumber || s.mobileAddress || s.peerIp || "-"}
                   </span>
                   <span className="text-muted ml-auto">
-                    {s.serviceOption === 33 ? "SO33" : `SO${s.serviceOption}`}
+                    {s.accessTechnology || "1x"} {s.serviceOption === 33 ? "SO33" : `SO${s.serviceOption}`}
                   </span>
                 </div>
               ))}

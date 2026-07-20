@@ -3,7 +3,16 @@ import {
   getMscManagementClient,
   waitForBscReady,
 } from "@/lib/grpc/client";
+import { getEventBusClient } from "@/lib/grpc/events-bus-client";
 import { shouldHideAccessEvent } from "@/lib/access-event-filter";
+import { EventSource } from "@/lib/proto/events/v1/service";
+import { HrpdTrafficReason, HrpdUati } from "@/lib/proto/events/v1/an";
+import type {
+  HrpdAccessEvent,
+  HrpdDecodedMessage,
+  HrpdSessionEvent,
+  HrpdTrafficEvent,
+} from "@/lib/proto/events/v1/an";
 
 export const dynamic = "force-dynamic";
 
@@ -12,6 +21,75 @@ const STREAM_RETRY_BASE_MS = 1000;
 const STREAM_RETRY_MAX_MS = 5000;
 const STREAM_READY_TIMEOUT_MS = 1500;
 const KEEPALIVE_MS = 15000;
+
+function compactHrpdDecodedMessage(message: HrpdDecodedMessage) {
+  return {
+    typeName: message.typeName,
+    summary: message.summary,
+    protocolType: message.protocolType,
+    messageId: message.messageId,
+    payloadLengthBytes: message.payload?.length ?? 0,
+  };
+}
+
+function isNoisyHrpdDecodedMessage(message: HrpdDecodedMessage) {
+  return message.typeName === "Ack" || message.typeName === "DefaultPacketRlpNak";
+}
+
+function compactHrpdSessionEvent(event: HrpdSessionEvent) {
+  return {
+    ...event,
+    fullUati: event.fullUati ? HrpdUati.toJSON(event.fullUati) : undefined,
+  };
+}
+
+function compactHrpdAccessEvent(event: HrpdAccessEvent) {
+  return {
+    timestampNs: event.timestampNs,
+    accessSignature: event.accessSignature,
+    reason: event.reason,
+    colorCode: event.colorCode,
+    direction: event.direction,
+    decodedMessages: event.decodedMessages.map(compactHrpdDecodedMessage),
+    payloadLengthBytes: event.payloadLengthBytes || event.payload?.length || 0,
+    uati: event.uati,
+    fullUati: event.fullUati ? HrpdUati.toJSON(event.fullUati) : undefined,
+    receiveAti: event.receiveAti,
+  };
+}
+
+function compactHrpdTrafficEvent(event: HrpdTrafficEvent) {
+  return {
+    timestampNs: event.timestampNs,
+    uati: event.uati,
+    reason: event.reason,
+    macIndex: event.macIndex,
+    drcValue: event.drcValue,
+    reversePilotSnrDbTenths: event.reversePilotSnrDbTenths,
+    direction: event.direction,
+    decodedMessages: event.decodedMessages
+      .filter((message) => !isNoisyHrpdDecodedMessage(message))
+      .map(compactHrpdDecodedMessage),
+    payloadLengthBytes: event.payloadLengthBytes || event.payload?.length || 0,
+    fullUati: event.fullUati ? HrpdUati.toJSON(event.fullUati) : undefined,
+    receiveAti: event.receiveAti,
+  };
+}
+
+function shouldForwardHrpdTrafficEvent(event: HrpdTrafficEvent) {
+  if (event.reason === HrpdTrafficReason.HRPD_TRAFFIC_REASON_ACK_RECEIVED) {
+    return false;
+  }
+  const hasVisibleMessage = event.decodedMessages.some(
+    (message) => !isNoisyHrpdDecodedMessage(message)
+  );
+  return (
+    hasVisibleMessage ||
+    event.reason === HrpdTrafficReason.HRPD_TRAFFIC_REASON_DRC_UPDATED ||
+    event.reason === HrpdTrafficReason.HRPD_TRAFFIC_REASON_REVERSE_PILOT_SNR_UPDATED ||
+    event.reason === HrpdTrafficReason.HRPD_TRAFFIC_REASON_CONNECTION_CLOSE
+  );
+}
 
 /**
  * Unified SSE endpoint that multiplexes radio-metrics, paging-events,
@@ -194,6 +272,78 @@ export async function GET(request: Request) {
         }
       };
 
+      // HRPD/AN events arrive on the aggregated event bus rather than the BSC
+      // facade. Re-emit the typed session/access/traffic arms as named SSE
+      // events, carrying the bus-resolved subscriber/identity for the UI.
+      const runEventBusStream = async () => {
+        let retryMs = STREAM_RETRY_BASE_MS;
+        while (!abort.signal.aborted) {
+          try {
+            const client = getEventBusClient();
+            for await (const value of client.listenEvents(
+              { sourceFilter: [EventSource.EVENT_SOURCE_AN] },
+              { signal: abort.signal }
+            )) {
+              if (abort.signal.aborted) {
+                break;
+              }
+              const an = value.an;
+              if (!an) {
+                continue;
+              }
+              const enrich = {
+                subscriber: value.subscriber,
+                identity: value.identity,
+                sequence: value.sequence,
+              };
+              if (an.session) {
+                retryMs = STREAM_RETRY_BASE_MS;
+                send(
+                  `event: hrpd-session\ndata: ${JSON.stringify({
+                    ...compactHrpdSessionEvent(an.session),
+                    ...enrich,
+                  })}\n\n`
+                );
+              } else if (an.access) {
+                retryMs = STREAM_RETRY_BASE_MS;
+                send(
+                  `event: hrpd-access\ndata: ${JSON.stringify({
+                    ...compactHrpdAccessEvent(an.access),
+                    ...enrich,
+                  })}\n\n`
+                );
+              } else if (an.traffic) {
+                if (!shouldForwardHrpdTrafficEvent(an.traffic)) {
+                  continue;
+                }
+                retryMs = STREAM_RETRY_BASE_MS;
+                send(
+                  `event: hrpd-traffic\ndata: ${JSON.stringify({
+                    ...compactHrpdTrafficEvent(an.traffic),
+                    ...enrich,
+                  })}\n\n`
+                );
+              }
+            }
+            if (abort.signal.aborted) {
+              break;
+            }
+            console.log("[events] event bus stream ended");
+          } catch (err) {
+            if (abort.signal.aborted) {
+              break;
+            }
+            const msg = err instanceof Error ? err.message : "unknown";
+            console.log(`[events] event bus error: ${msg}`);
+          }
+          if (abort.signal.aborted) {
+            break;
+          }
+          await sleep(retryMs);
+          retryMs = Math.min(retryMs * 2, STREAM_RETRY_MAX_MS);
+        }
+      };
+
       send(`retry: ${SSE_RETRY_MS}\n\n`);
       send('event: connection\ndata: {"connected":false}\n\n');
 
@@ -202,7 +352,11 @@ export async function GET(request: Request) {
       }, KEEPALIVE_MS);
 
       try {
-        await Promise.all([runFacadeStream(), runOtaspStream()]);
+        await Promise.all([
+          runFacadeStream(),
+          runOtaspStream(),
+          runEventBusStream(),
+        ]);
       } finally {
         clearInterval(keepalive);
         console.log("[events] management facade stream stopped");

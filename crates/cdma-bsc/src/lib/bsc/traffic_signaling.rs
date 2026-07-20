@@ -1,8 +1,5 @@
 //! Forward traffic-channel signaling: ARQ, retries, teardown, and
 //! L3 frame transmission.
-//!
-//! WS-0 PR3 sibling module per
-//! `docs/architecture-update/09-pr3-method-map.md`.
 
 use std::time::Instant;
 
@@ -1150,7 +1147,7 @@ impl Bsc {
                 .unwrap_or((None, false, None));
 
             if is_packet_data {
-                debug!(
+                log::trace!(
                     "BSC: packet primary frame walsh={} ignored from local event path; bearer poller owns packet ingress",
                     walsh_code
                 );

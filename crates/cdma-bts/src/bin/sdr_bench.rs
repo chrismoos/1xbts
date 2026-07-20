@@ -297,7 +297,8 @@ impl PilotSignalGenerator {
         use cdma_bts::phy::spread::{PnSequence, Spreader};
         PilotSignalGenerator {
             spreader: Spreader::new(PnSequence::new(0, 32768)),
-            shaper: cdma_bts::sdr::TxPulseShaper::new(),
+            shaper: cdma_bts::sdr::TxPulseShaper::new(SR1_CHIP_RATE_HZ as usize * 8)
+                .expect("default TX sample rate should be chip aligned"),
         }
     }
 

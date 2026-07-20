@@ -47,17 +47,28 @@ func TestTextPayloadExactSizeAndFormSafe(t *testing.T) {
 
 func TestSizeOptionsIncludeLargeHRPDRuns(t *testing.T) {
 	opts := sizeOptions()
-	var hasOneMiB, hasTwoMiB bool
+	var hasOneMiB, hasTwoMiB, hasFourMiB, hasEightMiB bool
 	for _, opt := range opts {
 		switch opt.Bytes {
 		case 1024 * 1024:
 			hasOneMiB = true
 		case 2 * 1024 * 1024:
 			hasTwoMiB = true
+		case 4 * 1024 * 1024:
+			hasFourMiB = true
+		case 8 * 1024 * 1024:
+			hasEightMiB = true
 		}
 	}
-	if !hasOneMiB || !hasTwoMiB {
-		t.Fatalf("size options missing large HRPD runs: 1MiB=%v 2MiB=%v opts=%v", hasOneMiB, hasTwoMiB, opts)
+	if !hasOneMiB || !hasTwoMiB || !hasFourMiB || !hasEightMiB {
+		t.Fatalf(
+			"size options missing large HRPD runs: 1MiB=%v 2MiB=%v 4MiB=%v 8MiB=%v opts=%v",
+			hasOneMiB,
+			hasTwoMiB,
+			hasFourMiB,
+			hasEightMiB,
+			opts,
+		)
 	}
 }
 

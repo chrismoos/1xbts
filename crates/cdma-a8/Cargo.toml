@@ -8,6 +8,14 @@ repository.workspace = true
 homepage.workspace = true
 description = "A8 packet-data bearer support for the 1xBTS packet core."
 
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+socket2 = { version = "0.5", features = ["all"] }
+tokio = { version = "1", features = ["net"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "time"] }
+
 [lib]
 path = "src/lib.rs"
 

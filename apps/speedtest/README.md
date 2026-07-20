@@ -33,7 +33,8 @@ gateway resolver.
 ## Modes
 
 - JavaScript mode uses old-style JavaScript only: `Date`, `Image`, forms, and a
-  hidden iframe.
+  hidden iframe. The 4 MiB and 8 MiB choices are long enough to measure
+  steady-state HRPD throughput after TCP slow start.
 - No-JavaScript mode is exposed through `<noscript>` and uses plain links and
   forms. Its download test streams hidden payload bytes before an iframe result
   callback, so timing waits for the browser to parse past the payload instead of

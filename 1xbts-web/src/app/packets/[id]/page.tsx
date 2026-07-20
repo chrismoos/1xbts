@@ -3,6 +3,11 @@
 import Link from "next/link";
 import { use, useCallback, useEffect, useState } from "react";
 import { Card, Stat } from "@/components/card";
+import {
+  mobileForPacketSession,
+  mobileLabel,
+  useMobileDirectory,
+} from "@/lib/mobile-directory";
 
 interface PacketSessionInfo {
   sessionId: string;
@@ -25,11 +30,18 @@ interface PacketSessionInfo {
   mobileAddress: string;
   subscriberId: string;
   phoneNumber: string;
+  imsi: string;
+  meid: string;
+  hrpdMnId: string;
+  hrpdMnIdSource: string;
+  subscriberImsi: string;
+  esn: number;
   trafficWalshCode: number;
   rlpState: string;
   lcpState: string;
   ipcpState: string;
   captureEnabled: boolean;
+  accessTechnology: string;
 }
 
 interface PacketTraceEvent {
@@ -193,6 +205,7 @@ export default function PacketSessionDetailPage({
   const [error, setError] = useState<string | null>(null);
   const [captureBusy, setCaptureBusy] = useState(false);
   const [activeTab, setActiveTab] = useState<"overview" | "rlp" | "ppp" | "capture">("overview");
+  const mobiles = useMobileDirectory();
 
   const fetchDetail = useCallback(async () => {
     try {
@@ -242,6 +255,10 @@ export default function PacketSessionDetailPage({
   );
 
   const summary = detail?.summary;
+  const mobile = summary ? mobileForPacketSession(summary, mobiles) : undefined;
+  const mobileLinkLabel = mobile ? mobileLabel(mobile) : undefined;
+  const isHrpd = summary?.accessTechnology === "HRPD";
+  const subscriberImsi = summary?.subscriberImsi || summary?.imsi || "";
 
   if (loading) {
     return (
@@ -270,13 +287,19 @@ export default function PacketSessionDetailPage({
         <Link href="/packets" className="text-sm text-muted hover:text-primary">
           &larr; Packets
         </Link>
-        {summary.mobileAddress && (
+        {mobile && mobileLinkLabel ? (
           <Link
-            href={`/mobiles/${encodeURIComponent(summary.mobileAddress)}`}
+            href={`/mobiles/${encodeURIComponent(mobile.address)}`}
             className="text-sm text-accent-cyan hover:text-accent-cyan"
           >
-            MS {summary.phoneNumber || summary.mobileAddress}
+            MS {mobileLinkLabel.value}
           </Link>
+        ) : summary.mobileAddress ? (
+          <span className="text-sm text-muted">
+            MS {summary.phoneNumber || summary.mobileAddress}
+          </span>
+        ) : (
+          null
         )}
       </div>
 
@@ -284,7 +307,7 @@ export default function PacketSessionDetailPage({
         <div>
           <h1 className="font-mono text-lg font-bold text-primary">{summary.sessionId}</h1>
           <div className="mt-1 text-sm text-muted">
-            {serviceOptionName(summary.serviceOption)} · {formatPhase(summary.phase)} · age {formatAge(summary.createdAtMs)}
+            {summary.accessTechnology || "1x"} · {serviceOptionName(summary.serviceOption)} · {formatPhase(summary.phase)} · age {formatAge(summary.createdAtMs)}
           </div>
         </div>
         <button
@@ -312,7 +335,17 @@ export default function PacketSessionDetailPage({
           <Stat label="Phase Changed" value={formatTimestamp(summary.lastPhaseChangeAtMs)} mono />
         </Card>
         <Card title="Bearer">
-          <Stat label="Walsh" value={summary.trafficWalshCode ? `W${summary.trafficWalshCode}` : "-"} mono />
+          <Stat
+            label={summary.accessTechnology === "HRPD" ? "A10 Key" : "Walsh"}
+            value={
+              summary.trafficWalshCode
+                ? summary.accessTechnology === "HRPD"
+                  ? String(summary.trafficWalshCode)
+                  : `W${summary.trafficWalshCode}`
+                : "-"
+            }
+            mono
+          />
           <Stat label="Mobile IP" value={summary.peerIp || "-"} mono />
           <Stat label="Gateway IP" value={summary.ourIp || "-"} mono />
           <Stat label="TUN" value={summary.tunDevice || "-"} mono />
@@ -324,16 +357,31 @@ export default function PacketSessionDetailPage({
           <Stat label="DL Frames" value={summary.downlinkFrames.toLocaleString()} mono />
         </Card>
         <Card title="Subscriber">
+          {mobile && mobileLinkLabel && (
+            <div className="flex justify-between py-0.5">
+              <span className="text-muted text-sm">Mobile</span>
+              <Link
+                href={`/mobiles/${encodeURIComponent(mobile.address)}`}
+                className="text-secondary text-sm font-mono hover:text-accent-cyan"
+              >
+                {mobileLinkLabel.value}
+              </Link>
+            </div>
+          )}
           <Stat label="Address" value={summary.mobileAddress || "-"} mono />
           <Stat label="Phone" value={summary.phoneNumber || "-"} mono />
+          <Stat label="Subscriber IMSI" value={subscriberImsi || "-"} mono />
           <Stat label="Subscriber" value={summary.subscriberId || "-"} mono />
-          <Stat label="Capture" value={summary.captureEnabled ? "Enabled" : "Disabled"} />
+          <Stat label="ESN" value={summary.esn ? `0x${summary.esn.toString(16).toUpperCase().padStart(8, "0")}` : "-"} mono />
+          <Stat label="MEID" value={summary.meid || "-"} mono />
+          <Stat label="HRPD MN ID" value={summary.hrpdMnId || "-"} mono />
+          <Stat label="MN ID Source" value={summary.hrpdMnIdSource || "-"} mono />
         </Card>
       </div>
 
       <div className="flex flex-wrap gap-2">
         <TabButton active={activeTab === "overview"} label="Overview" onClick={() => setActiveTab("overview")} />
-        <TabButton active={activeTab === "rlp"} label="RLP" onClick={() => setActiveTab("rlp")} />
+        <TabButton active={activeTab === "rlp"} label={isHrpd ? "Bearer" : "RLP"} onClick={() => setActiveTab("rlp")} />
         <TabButton active={activeTab === "ppp"} label="PPP" onClick={() => setActiveTab("ppp")} />
         <TabButton active={activeTab === "capture"} label="Capture" onClick={() => setActiveTab("capture")} />
       </div>
@@ -341,8 +389,9 @@ export default function PacketSessionDetailPage({
       {activeTab === "overview" && (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           <Card title="State">
+            <Stat label="Access" value={summary.accessTechnology || "1x"} />
             <Stat label="Phase" value={formatPhase(summary.phase)} />
-            <Stat label="RLP" value={formatStateLabel(summary.rlpState)} />
+            <Stat label={isHrpd ? "A10" : "RLP"} value={formatStateLabel(summary.rlpState)} />
             <Stat label="LCP" value={formatStateLabel(summary.lcpState)} />
             <Stat label="IPCP" value={formatStateLabel(summary.ipcpState)} />
           </Card>
@@ -357,8 +406,8 @@ export default function PacketSessionDetailPage({
 
       {activeTab === "rlp" && (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          <Card title="Handshake">
-            <Stat label="RLP State" value={formatStateLabel(summary.rlpState)} />
+          <Card title={isHrpd ? "Bearer State" : "Handshake"}>
+            <Stat label={isHrpd ? "A10 State" : "RLP State"} value={formatStateLabel(summary.rlpState)} />
             <Stat label="Last RX Control" value={detail.lastRxControl || "-"} mono />
             <Stat label="Last TX Control" value={detail.lastTxControl || "-"} mono />
             <Stat label="RX Repeats" value={String(detail.lastRxControlRepeats || 0)} mono />

@@ -681,6 +681,15 @@ export interface MobileIdentityKey {
   meid?: string | undefined;
 }
 
+/** Manufacturer hardware identity observed from HRPD HardwareIDResponse. */
+export interface HardwareIdentityKey {
+  esn?:
+    | number
+    | undefined;
+  /** 14 hex digits */
+  meid?: string | undefined;
+}
+
 /** Current serving-node registration state for one subscriber. */
 export interface RegistrationBinding {
   subscriberId: string;
@@ -831,20 +840,11 @@ export interface ResolveSubscriberByIdentityResponse {
   primaryIdentity?: SubscriberIdentity | undefined;
 }
 
-/**
- * Resolves a subscriber by ESN and/or MEID alone, without requiring an
- * IMSI — for cases where the MS hasn't been programmed with an
- * MIN/IMSI yet but is identified on the air by hardware ID.
- */
+/** Resolves an ESN and/or MEID hardware identity to a provisioned subscriber. */
 export interface ResolveSubscriberByHardwareIdentityRequest {
-  esn?:
-    | number
-    | undefined;
-  /** 14 hex digits */
-  meid?: string | undefined;
+  identity: HardwareIdentityKey | undefined;
 }
 
-/** Resolved subscriber and current registration binding, if any. */
 export interface ResolveSubscriberByHardwareIdentityResponse {
   subscriber?: Subscriber | undefined;
   binding?: RegistrationBinding | undefined;
@@ -2081,6 +2081,82 @@ export const MobileIdentityKey: MessageFns<MobileIdentityKey> = {
   fromPartial(object: DeepPartial<MobileIdentityKey>): MobileIdentityKey {
     const message = createBaseMobileIdentityKey();
     message.imsi = object.imsi ?? undefined;
+    message.esn = object.esn ?? undefined;
+    message.meid = object.meid ?? undefined;
+    return message;
+  },
+};
+
+function createBaseHardwareIdentityKey(): HardwareIdentityKey {
+  return { esn: undefined, meid: undefined };
+}
+
+export const HardwareIdentityKey: MessageFns<HardwareIdentityKey> = {
+  encode(message: HardwareIdentityKey, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.esn !== undefined) {
+      writer.uint32(8).uint32(message.esn);
+    }
+    if (message.meid !== undefined) {
+      writer.uint32(18).string(message.meid);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): HardwareIdentityKey {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseHardwareIdentityKey();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.esn = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.meid = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): HardwareIdentityKey {
+    return {
+      esn: isSet(object.esn) ? globalThis.Number(object.esn) : undefined,
+      meid: isSet(object.meid) ? globalThis.String(object.meid) : undefined,
+    };
+  },
+
+  toJSON(message: HardwareIdentityKey): unknown {
+    const obj: any = {};
+    if (message.esn !== undefined) {
+      obj.esn = Math.round(message.esn);
+    }
+    if (message.meid !== undefined) {
+      obj.meid = message.meid;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<HardwareIdentityKey>): HardwareIdentityKey {
+    return HardwareIdentityKey.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<HardwareIdentityKey>): HardwareIdentityKey {
+    const message = createBaseHardwareIdentityKey();
     message.esn = object.esn ?? undefined;
     message.meid = object.meid ?? undefined;
     return message;
@@ -3889,16 +3965,13 @@ export const ResolveSubscriberByIdentityResponse: MessageFns<ResolveSubscriberBy
 };
 
 function createBaseResolveSubscriberByHardwareIdentityRequest(): ResolveSubscriberByHardwareIdentityRequest {
-  return { esn: undefined, meid: undefined };
+  return { identity: undefined };
 }
 
 export const ResolveSubscriberByHardwareIdentityRequest: MessageFns<ResolveSubscriberByHardwareIdentityRequest> = {
   encode(message: ResolveSubscriberByHardwareIdentityRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.esn !== undefined) {
-      writer.uint32(8).uint32(message.esn);
-    }
-    if (message.meid !== undefined) {
-      writer.uint32(18).string(message.meid);
+    if (message.identity !== undefined) {
+      HardwareIdentityKey.encode(message.identity, writer.uint32(10).fork()).join();
     }
     return writer;
   },
@@ -3911,19 +3984,11 @@ export const ResolveSubscriberByHardwareIdentityRequest: MessageFns<ResolveSubsc
       const tag = reader.uint32();
       switch (tag >>> 3) {
         case 1: {
-          if (tag !== 8) {
+          if (tag !== 10) {
             break;
           }
 
-          message.esn = reader.uint32();
-          continue;
-        }
-        case 2: {
-          if (tag !== 18) {
-            break;
-          }
-
-          message.meid = reader.string();
+          message.identity = HardwareIdentityKey.decode(reader, reader.uint32());
           continue;
         }
       }
@@ -3936,19 +4001,13 @@ export const ResolveSubscriberByHardwareIdentityRequest: MessageFns<ResolveSubsc
   },
 
   fromJSON(object: any): ResolveSubscriberByHardwareIdentityRequest {
-    return {
-      esn: isSet(object.esn) ? globalThis.Number(object.esn) : undefined,
-      meid: isSet(object.meid) ? globalThis.String(object.meid) : undefined,
-    };
+    return { identity: isSet(object.identity) ? HardwareIdentityKey.fromJSON(object.identity) : undefined };
   },
 
   toJSON(message: ResolveSubscriberByHardwareIdentityRequest): unknown {
     const obj: any = {};
-    if (message.esn !== undefined) {
-      obj.esn = Math.round(message.esn);
-    }
-    if (message.meid !== undefined) {
-      obj.meid = message.meid;
+    if (message.identity !== undefined) {
+      obj.identity = HardwareIdentityKey.toJSON(message.identity);
     }
     return obj;
   },
@@ -3960,8 +4019,9 @@ export const ResolveSubscriberByHardwareIdentityRequest: MessageFns<ResolveSubsc
     object: DeepPartial<ResolveSubscriberByHardwareIdentityRequest>,
   ): ResolveSubscriberByHardwareIdentityRequest {
     const message = createBaseResolveSubscriberByHardwareIdentityRequest();
-    message.esn = object.esn ?? undefined;
-    message.meid = object.meid ?? undefined;
+    message.identity = (object.identity !== undefined && object.identity !== null)
+      ? HardwareIdentityKey.fromPartial(object.identity)
+      : undefined;
     return message;
   },
 };
@@ -12652,7 +12712,7 @@ export const HlrServiceDefinition = {
       responseStream: false,
       options: {},
     },
-    /** Resolves a subscriber by ESN and/or MEID alone (no IMSI required). */
+    /** Resolves a hardware identity observed from HRPD to subscriber state. */
     resolveSubscriberByHardwareIdentity: {
       name: "ResolveSubscriberByHardwareIdentity",
       requestType: ResolveSubscriberByHardwareIdentityRequest as typeof ResolveSubscriberByHardwareIdentityRequest,
@@ -12909,7 +12969,7 @@ export interface HlrServiceImplementation<CallContextExt = {}> {
     request: ResolveSubscriberByIdentityRequest,
     context: CallContext & CallContextExt,
   ): Promise<DeepPartial<ResolveSubscriberByIdentityResponse>>;
-  /** Resolves a subscriber by ESN and/or MEID alone (no IMSI required). */
+  /** Resolves a hardware identity observed from HRPD to subscriber state. */
   resolveSubscriberByHardwareIdentity(
     request: ResolveSubscriberByHardwareIdentityRequest,
     context: CallContext & CallContextExt,
@@ -13055,7 +13115,7 @@ export interface HlrServiceClient<CallOptionsExt = {}> {
     request: DeepPartial<ResolveSubscriberByIdentityRequest>,
     options?: CallOptions & CallOptionsExt,
   ): Promise<ResolveSubscriberByIdentityResponse>;
-  /** Resolves a subscriber by ESN and/or MEID alone (no IMSI required). */
+  /** Resolves a hardware identity observed from HRPD to subscriber state. */
   resolveSubscriberByHardwareIdentity(
     request: DeepPartial<ResolveSubscriberByHardwareIdentityRequest>,
     options?: CallOptions & CallOptionsExt,

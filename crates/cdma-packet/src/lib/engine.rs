@@ -17,7 +17,7 @@ use crate::capture::{self, Direction as CaptureDirection};
 use crate::mobile_ip::{MobileIpPacketResult, MobileIpSession};
 use crate::ppp::framing::{self, HdlcDeframer, PppPacket};
 use crate::ppp::ipcp::{IPCP_PROTOCOL, IpcpConfig, IpcpOpenState, IpcpSession};
-use crate::ppp::lcp::{LCP_PROTOCOL, LcpOpenState, LcpSession, LcpState};
+use crate::ppp::lcp::{LCP_PROTOCOL, LcpOpenState, LcpSession, LcpState, TERMINATE_REQUEST};
 use crate::ppp::vj::{PPP_IP_PROTOCOL, PPP_VJ_COMPRESSED_TCP, PPP_VJ_UNCOMPRESSED_TCP, VjState};
 use crate::rlp::{self as rlp_codec, RlpFrame};
 use crate::rlp_session::{RlpOutput, RlpSession, RlpState};
@@ -25,6 +25,9 @@ use crate::rlp3_frames::MuxOption;
 use crate::rlp3_session::{FrameRate, Rlp3Config, Rlp3Session, Rlp3State, RlpEvent};
 use cdma_common::consts::SERVICE_OPTION_HIGH_RATE_PACKET_DATA;
 use cdma_common::crc::crc16_sch;
+use cdma_common::hrpd::traffic::{
+    DEFAULT_PACKET_RLP_SEQUENCE_BITS, default_packet_rlp_packet_bits,
+};
 use cdma_common::sch::{DEFAULT_RC3_F_SCH_RATE_BPS, Rc3FschProfile};
 
 /// Session phase — tracks the overall negotiation progress.
@@ -113,6 +116,20 @@ trait RlpBackend: Send {
     /// emitted; byte-stream payload remains queued for SCH.
     fn next_frame_bits(&mut self, allow_payload: bool) -> (Vec<u8>, u32);
 
+    /// Generate a downlink frame only when a complete bearer chunk is ready.
+    /// Frame-timed RLP backends do not distinguish partial bearer chunks.
+    fn next_full_frame_bits(&mut self, allow_payload: bool) -> (Vec<u8>, u32) {
+        self.next_frame_bits(allow_payload)
+    }
+
+    /// Maximum number of downlink frames that may be emitted from one
+    /// `PacketSession::tick`. Legacy 1x RLP paths are frame-timed; HRPD A10
+    /// Unstructured Byte Stream is a bearer octet stream and can burst queued
+    /// chunks without applying a 1x air-interface timing rule.
+    fn max_downlink_frames_per_tick(&self) -> usize {
+        1
+    }
+
     /// Generate a supplemental channel frame with `info_bits` usable bits.
     /// Returns (bits, rate_bps) or None if SCH is unavailable.
     /// Default: no SCH support.
@@ -134,6 +151,190 @@ trait RlpBackend: Send {
     /// Returns the number of queued upper-layer bytes awaiting transmission.
     fn tx_queue_len(&self) -> usize {
         0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HRPD A8/A10 Unstructured Byte Stream backend.
+// ---------------------------------------------------------------------------
+
+const A10_UNSTRUCTURED_BYTE_STREAM_MAX_OCTETS: usize = 1024;
+const A10_UNSTRUCTURED_BYTE_STREAM_MAX_CHUNKS_PER_TICK: usize = 16;
+
+struct UnstructuredByteStreamBackend {
+    tx_queue: VecDeque<u8>,
+    last_rx_control: String,
+    last_tx_control: String,
+}
+
+impl UnstructuredByteStreamBackend {
+    fn new() -> Self {
+        Self {
+            tx_queue: VecDeque::new(),
+            last_rx_control: String::new(),
+            last_tx_control: String::new(),
+        }
+    }
+}
+
+impl RlpBackend for UnstructuredByteStreamBackend {
+    fn receive_frame_bits(&mut self, octets: &[u8], _rate_bps: u32) -> Option<Vec<u8>> {
+        if octets.is_empty() {
+            return None;
+        }
+        self.last_rx_control = format!("A10 UnstructuredByteStream octets={}", octets.len());
+        Some(octets.to_vec())
+    }
+
+    fn enqueue_data(&mut self, data: &[u8]) {
+        self.tx_queue.extend(data.iter().copied());
+    }
+
+    fn next_frame_bits(&mut self, allow_payload: bool) -> (Vec<u8>, u32) {
+        if !allow_payload || self.tx_queue.is_empty() {
+            return (Vec::new(), 0);
+        }
+        let take = self
+            .tx_queue
+            .len()
+            .min(A10_UNSTRUCTURED_BYTE_STREAM_MAX_OCTETS);
+        let mut octets = Vec::with_capacity(take);
+        for _ in 0..take {
+            if let Some(byte) = self.tx_queue.pop_front() {
+                octets.push(byte);
+            }
+        }
+        self.last_tx_control = format!("A10 UnstructuredByteStream octets={take}");
+        (octets, 0)
+    }
+
+    fn next_full_frame_bits(&mut self, allow_payload: bool) -> (Vec<u8>, u32) {
+        if !allow_payload || self.tx_queue.len() < A10_UNSTRUCTURED_BYTE_STREAM_MAX_OCTETS {
+            return (Vec::new(), 0);
+        }
+        self.next_frame_bits(allow_payload)
+    }
+
+    fn max_downlink_frames_per_tick(&self) -> usize {
+        A10_UNSTRUCTURED_BYTE_STREAM_MAX_CHUNKS_PER_TICK
+    }
+
+    fn is_data_transfer(&self) -> bool {
+        true
+    }
+
+    fn telemetry(&self) -> RlpTelemetry {
+        RlpTelemetry {
+            state: "A10 Unstructured Byte Stream".to_string(),
+            last_rx_control: self.last_rx_control.clone(),
+            last_tx_control: self.last_tx_control.clone(),
+            last_rx_control_repeats: u64::from(!self.last_rx_control.is_empty()),
+            last_tx_control_repeats: u64::from(!self.last_tx_control.is_empty()),
+            last_uplink_rate_bps: 0,
+            last_downlink_rate_bps: 0,
+        }
+    }
+
+    fn tx_queue_len(&self) -> usize {
+        self.tx_queue.len()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HRPD Default Packet Application RLP backend.
+//
+// This is the AN/BTS air-side wrapper used between Stream 1 and the HRPD
+// Physical Layer. It is not the A8/A10 bearer format; A8/A10 use the
+// `UnstructuredByteStreamBackend` above.
+// ---------------------------------------------------------------------------
+
+const HRPD_DEFAULT_PACKET_MAX_OCTETS_1024_FTC: usize = 121;
+
+struct HrpdDefaultPacketBackend {
+    tx_queue: VecDeque<u8>,
+    tx_seq: u32,
+    rx_last_seq: Option<u32>,
+    last_rx_control: String,
+    last_tx_control: String,
+}
+
+impl HrpdDefaultPacketBackend {
+    fn new() -> Self {
+        Self {
+            tx_queue: VecDeque::new(),
+            tx_seq: 0,
+            rx_last_seq: None,
+            last_rx_control: String::new(),
+            last_tx_control: String::new(),
+        }
+    }
+}
+
+impl RlpBackend for HrpdDefaultPacketBackend {
+    fn receive_frame_bits(&mut self, bits: &[u8], _rate_bps: u32) -> Option<Vec<u8>> {
+        if bits.len() < DEFAULT_PACKET_RLP_SEQUENCE_BITS
+            || (bits.len() - DEFAULT_PACKET_RLP_SEQUENCE_BITS) % 8 != 0
+        {
+            return None;
+        }
+        let seq = bits[..DEFAULT_PACKET_RLP_SEQUENCE_BITS]
+            .iter()
+            .fold(0u32, |acc, &bit| (acc << 1) | u32::from(bit & 1));
+        self.rx_last_seq = Some(seq);
+        self.last_rx_control = format!("HRPD DefaultPacket seq={seq} bits={}", bits.len());
+        let mut octets = Vec::with_capacity((bits.len() - DEFAULT_PACKET_RLP_SEQUENCE_BITS) / 8);
+        for chunk in bits[DEFAULT_PACKET_RLP_SEQUENCE_BITS..].chunks_exact(8) {
+            octets.push(chunk.iter().fold(0u8, |acc, &bit| (acc << 1) | (bit & 1)));
+        }
+        if octets.is_empty() {
+            None
+        } else {
+            Some(octets)
+        }
+    }
+
+    fn enqueue_data(&mut self, data: &[u8]) {
+        self.tx_queue.extend(data.iter().copied());
+    }
+
+    fn next_frame_bits(&mut self, allow_payload: bool) -> (Vec<u8>, u32) {
+        if !allow_payload || self.tx_queue.is_empty() {
+            return (Vec::new(), 0);
+        }
+        let take = self
+            .tx_queue
+            .len()
+            .min(HRPD_DEFAULT_PACKET_MAX_OCTETS_1024_FTC);
+        let mut octets = Vec::with_capacity(take);
+        for _ in 0..take {
+            if let Some(byte) = self.tx_queue.pop_front() {
+                octets.push(byte);
+            }
+        }
+        let bits = default_packet_rlp_packet_bits(self.tx_seq, &octets);
+        self.last_tx_control = format!("HRPD DefaultPacket seq={} octets={}", self.tx_seq, take);
+        self.tx_seq = (self.tx_seq + 1) & ((1 << DEFAULT_PACKET_RLP_SEQUENCE_BITS) - 1);
+        (bits, 0)
+    }
+
+    fn is_data_transfer(&self) -> bool {
+        true
+    }
+
+    fn telemetry(&self) -> RlpTelemetry {
+        RlpTelemetry {
+            state: "HRPD Default Packet".to_string(),
+            last_rx_control: self.last_rx_control.clone(),
+            last_tx_control: self.last_tx_control.clone(),
+            last_rx_control_repeats: u64::from(!self.last_rx_control.is_empty()),
+            last_tx_control_repeats: u64::from(!self.last_tx_control.is_empty()),
+            last_uplink_rate_bps: 0,
+            last_downlink_rate_bps: 0,
+        }
+    }
+
+    fn tx_queue_len(&self) -> usize {
+        self.tx_queue.len()
     }
 }
 
@@ -827,6 +1028,9 @@ pub struct PacketSession {
     phase: SessionPhase,
     /// Pending PPP packets to send on downlink (queued during a single tick).
     ppp_tx_queue: Vec<PppPacket>,
+    /// Host-originated IP packets waiting for PPP control negotiation to finish.
+    pending_downlink_ip: VecDeque<Vec<u8>>,
+    pending_downlink_ip_octets: usize,
     /// Whether we've sent our LCP Configure-Request.
     lcp_started: bool,
     /// Whether we've sent our IPCP Configure-Request.
@@ -848,10 +1052,26 @@ pub struct PacketSession {
     pending_ppp_resume: Option<PppSessionState>,
     /// Set whenever PPP control or IP payload crosses this engine.
     ppp_activity_since_last_check: bool,
+    /// Set when the peer explicitly sends LCP Terminate-Request.
+    peer_requested_lcp_terminate: bool,
+    /// Some HRPD A10 byte-stream peers complete only one side of LCP, then wait
+    /// for IPCP. This is scoped away from legacy 1x PPP.
+    lcp_open_after_one_sided_ack: bool,
 }
 
 /// Max RlpSync ticks (20 ms each) before giving up. 500 = 10 s.
 const RLP_SYNC_MAX_TICKS: u32 = 500;
+/// HRPD A10 byte-stream PPP can begin while the AT is in the HRPD closed
+/// connection state. The first PPP frames then drive DefaultPacket DataReady
+/// paging, UATI refresh, and traffic re-open before the AT can answer LCP/IPCP.
+/// Keep the RFC-style default Max-Configure for other sessions, but give this
+/// dormant-reactivation path a one-minute negotiation budget.
+const HRPD_A10_PPP_MAX_CONFIGURE_RESTARTS: u32 = 60;
+/// Retransmits of our LCP Configure-Request (with the peer's ACK already in
+/// hand) before an A10 peer is treated as one-sided and LCP is forced open.
+const LCP_ONE_SIDED_ACK_MIN_RETRANSMITS: u32 = 2;
+const PENDING_DOWNLINK_IP_MAX_PACKETS: usize = 256;
+const PENDING_DOWNLINK_IP_MAX_OCTETS: usize = 256 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct PppSessionState {
@@ -896,6 +1116,8 @@ impl PacketSession {
             log_context: None,
             phase: SessionPhase::RlpSync,
             ppp_tx_queue: Vec::new(),
+            pending_downlink_ip: VecDeque::new(),
+            pending_downlink_ip_octets: 0,
             lcp_started: false,
             ipcp_started: false,
             recent_ppp_events: VecDeque::new(),
@@ -906,7 +1128,91 @@ impl PacketSession {
             rlp_sync_ticks: 0,
             pending_ppp_resume: ppp_resume,
             ppp_activity_since_last_check: false,
+            peer_requested_lcp_terminate: false,
+            lcp_open_after_one_sided_ack: false,
         }
+    }
+
+    pub fn new_hrpd_default_packet(
+        service_option: u32,
+        ipcp_config: IpcpConfig,
+        ppp_resume: Option<PppSessionState>,
+    ) -> Self {
+        log::debug!(
+            "PacketSession: using HRPD Default Packet RLP for SO {}",
+            service_option
+        );
+        let mobile_ip = ppp_resume
+            .as_ref()
+            .map(|state| state.mobile_ip.as_ref().clone())
+            .unwrap_or_else(|| MobileIpSession::new(ipcp_config.mobile_ip.clone()));
+        Self {
+            rlp: Box::new(HrpdDefaultPacketBackend::new()),
+            deframer: HdlcDeframer::new(),
+            lcp: LcpSession::new(),
+            ipcp: IpcpSession::new(ipcp_config),
+            mobile_ip,
+            vj: VjState::default(),
+            log_context: None,
+            phase: SessionPhase::RlpSync,
+            ppp_tx_queue: Vec::new(),
+            pending_downlink_ip: VecDeque::new(),
+            pending_downlink_ip_octets: 0,
+            lcp_started: false,
+            ipcp_started: false,
+            recent_ppp_events: VecDeque::new(),
+            sch_active: false,
+            sch_info_bits: Rc3FschProfile::default_19k2().info_bits,
+            sch_rate_bps: DEFAULT_RC3_F_SCH_RATE_BPS,
+            sch_data_ready: false,
+            rlp_sync_ticks: 0,
+            pending_ppp_resume: ppp_resume,
+            ppp_activity_since_last_check: false,
+            peer_requested_lcp_terminate: false,
+            lcp_open_after_one_sided_ack: false,
+        }
+    }
+
+    pub fn new_a10_unstructured_byte_stream(
+        service_option: u32,
+        ipcp_config: IpcpConfig,
+        ppp_resume: Option<PppSessionState>,
+    ) -> Self {
+        log::debug!(
+            "PacketSession: using A10 Unstructured Byte Stream for SO {}",
+            service_option
+        );
+        let mobile_ip = ppp_resume
+            .as_ref()
+            .map(|state| state.mobile_ip.as_ref().clone())
+            .unwrap_or_else(|| MobileIpSession::new(ipcp_config.mobile_ip.clone()));
+        let mut session = Self {
+            rlp: Box::new(UnstructuredByteStreamBackend::new()),
+            deframer: HdlcDeframer::new(),
+            lcp: LcpSession::new(),
+            ipcp: IpcpSession::new(ipcp_config),
+            mobile_ip,
+            vj: VjState::default(),
+            log_context: None,
+            phase: SessionPhase::RlpSync,
+            ppp_tx_queue: Vec::new(),
+            pending_downlink_ip: VecDeque::new(),
+            pending_downlink_ip_octets: 0,
+            lcp_started: false,
+            ipcp_started: false,
+            recent_ppp_events: VecDeque::new(),
+            sch_active: false,
+            sch_info_bits: Rc3FschProfile::default_19k2().info_bits,
+            sch_rate_bps: DEFAULT_RC3_F_SCH_RATE_BPS,
+            sch_data_ready: false,
+            rlp_sync_ticks: 0,
+            pending_ppp_resume: ppp_resume,
+            ppp_activity_since_last_check: false,
+            peer_requested_lcp_terminate: false,
+            lcp_open_after_one_sided_ack: true,
+        };
+        session.set_ppp_max_configure_restarts(HRPD_A10_PPP_MAX_CONFIGURE_RESTARTS);
+        session
     }
 
     /// Enable or disable supplemental channel frame generation.
@@ -963,6 +1269,11 @@ impl PacketSession {
         self.log_context = Some(context);
     }
 
+    fn set_ppp_max_configure_restarts(&mut self, restarts: u32) {
+        self.lcp.set_max_configure_restarts(restarts);
+        self.ipcp.set_max_configure_restarts(restarts);
+    }
+
     fn log_prefix(&self, label: &str) -> String {
         match self.log_context.as_deref() {
             Some(context) => format!("{}[{}]", label, context),
@@ -994,14 +1305,84 @@ impl PacketSession {
     }
 
     /// Inject an IP packet from the network/TUN side for delivery to the mobile.
-    /// Only valid when phase is Active.
+    /// Queues while PPP control is negotiating; emits only after IPCP is open.
     pub fn send_ip_packet(&mut self, ip_packet: &[u8]) {
-        if self.phase != SessionPhase::Active {
-            return;
+        match self.phase {
+            SessionPhase::Active => self.enqueue_downlink_ip_packet(ip_packet),
+            SessionPhase::Closed => {
+                log::debug!(
+                    "{}: dropping downlink IP packet len={} in closed session",
+                    self.log_prefix("IP egress"),
+                    ip_packet.len()
+                );
+            }
+            _ => self.queue_pending_downlink_ip(ip_packet),
         }
+    }
+
+    fn enqueue_downlink_ip_packet(&mut self, ip_packet: &[u8]) {
         self.ppp_activity_since_last_check = true;
         let ppp = self.vj.compress_ip_packet(ip_packet);
         self.ppp_tx_queue.push(ppp);
+    }
+
+    fn queue_pending_downlink_ip(&mut self, ip_packet: &[u8]) {
+        if self.pending_downlink_ip.is_empty() {
+            log::debug!(
+                "{}: queueing downlink IP while phase={:?}",
+                self.log_prefix("IP egress"),
+                self.phase
+            );
+        }
+        self.pending_downlink_ip_octets += ip_packet.len();
+        self.pending_downlink_ip.push_back(ip_packet.to_vec());
+
+        let mut evicted_packets = 0usize;
+        let mut evicted_octets = 0usize;
+        while self.pending_downlink_ip.len() > PENDING_DOWNLINK_IP_MAX_PACKETS
+            || self.pending_downlink_ip_octets > PENDING_DOWNLINK_IP_MAX_OCTETS
+        {
+            let Some(evicted) = self.pending_downlink_ip.pop_front() else {
+                break;
+            };
+            evicted_packets += 1;
+            evicted_octets += evicted.len();
+            self.pending_downlink_ip_octets = self
+                .pending_downlink_ip_octets
+                .saturating_sub(evicted.len());
+        }
+
+        if evicted_packets > 0 {
+            log::warn!(
+                "{}: evicted queued downlink IP packets={} octets={} remaining_packets={} remaining_octets={}",
+                self.log_prefix("IP egress"),
+                evicted_packets,
+                evicted_octets,
+                self.pending_downlink_ip.len(),
+                self.pending_downlink_ip_octets
+            );
+        }
+    }
+
+    fn flush_pending_downlink_ip(&mut self) {
+        if self.pending_downlink_ip.is_empty() {
+            return;
+        }
+        let packets = self.pending_downlink_ip.len();
+        let octets = self.pending_downlink_ip_octets;
+        while let Some(ip_packet) = self.pending_downlink_ip.pop_front() {
+            self.pending_downlink_ip_octets = self
+                .pending_downlink_ip_octets
+                .saturating_sub(ip_packet.len());
+            self.enqueue_downlink_ip_packet(&ip_packet);
+        }
+        debug_assert_eq!(self.pending_downlink_ip_octets, 0);
+        log::info!(
+            "{}: flushed queued downlink IP packets={} octets={}",
+            self.log_prefix("IP egress"),
+            packets,
+            octets
+        );
     }
 
     pub fn snapshot_ppp_state(&self) -> Option<PppSessionState> {
@@ -1019,6 +1400,99 @@ impl PacketSession {
         active
     }
 
+    pub fn take_peer_requested_lcp_terminate(&mut self) -> bool {
+        let requested = self.peer_requested_lcp_terminate;
+        self.peer_requested_lcp_terminate = false;
+        requested
+    }
+
+    /// Ingest an A10 Unstructured Byte Stream chunk without advancing the
+    /// 20 ms packet-session clock. A10 chunks are bearer transport fragments,
+    /// not air-interface frames, so their arrival rate must not drive PPP
+    /// restart timers or impose a one-chunk-per-tick receive limit.
+    pub fn ingest_a10_byte_stream(&mut self, octets: &[u8]) -> Vec<SessionAction> {
+        let mut actions = Vec::new();
+        self.process_uplink(Some((octets, 0)), &mut actions);
+        actions
+    }
+
+    /// Frame queued downlink PPP and emit complete A10 chunks without advancing
+    /// protocol timers. A partial byte-stream tail remains queued for the next
+    /// arrival or the regular tick, which bounds latency while preserving A10
+    /// datagram packing efficiency.
+    ///
+    /// HRPD A10 callers use this when an IP packet arrives so the 20 ms
+    /// protocol clock does not impose a burst cadence on the bearer.
+    pub fn emit_full_pending_downlink(&mut self) -> Vec<SessionAction> {
+        let mut actions = Vec::new();
+        self.append_pending_downlink_actions(&mut actions, false);
+        actions
+    }
+
+    fn append_pending_downlink_actions(
+        &mut self,
+        actions: &mut Vec<SessionAction>,
+        flush_partial: bool,
+    ) {
+        let frame_opts = if self.lcp.is_open() {
+            framing::FrameOptions {
+                tx_accm: self.lcp.negotiated.tx_accm,
+                acfc: self.lcp.negotiated.we_send_acfc,
+                pfc: self.lcp.negotiated.we_send_pfc,
+            }
+        } else {
+            framing::FrameOptions::default()
+        };
+        let ppp_queue: Vec<PppPacket> = self.ppp_tx_queue.drain(..).collect();
+        for ppp in &ppp_queue {
+            self.ppp_activity_since_last_check = true;
+            self.record_ppp_event("downlink", ppp);
+            log::trace!("{}: {}", self.log_prefix("PPP TX"), format_ppp_packet(ppp));
+            let txq_before = self.rlp.tx_queue_len();
+            capture::write_ppp_packet(CaptureDirection::Downlink, ppp, &frame_opts);
+            let hdlc_bytes = framing::frame_with_options(ppp, &frame_opts);
+            let hdlc_len = hdlc_bytes.len();
+            self.rlp.enqueue_data(&hdlc_bytes);
+            let txq_after = self.rlp.tx_queue_len();
+            log::trace!(
+                "{}: {} hdlc_len={} rlp_txq_before={} rlp_txq_after={}",
+                self.log_prefix("PPP TX enqueue"),
+                format_ppp_packet(ppp),
+                hdlc_len,
+                txq_before,
+                txq_after
+            );
+        }
+
+        let sch_data_path =
+            self.sch_active && self.phase == SessionPhase::Active && self.sch_data_ready;
+        let allow_fch_payload = !sch_data_path;
+        let max_downlink_frames = self.rlp.max_downlink_frames_per_tick().max(1);
+        for _ in 0..max_downlink_frames {
+            let (bits, rate_bps) = if flush_partial {
+                self.rlp.next_frame_bits(allow_fch_payload)
+            } else {
+                self.rlp.next_full_frame_bits(allow_fch_payload)
+            };
+            if bits.is_empty() {
+                break;
+            }
+            actions.push(SessionAction::SendFrame { bits, rate_bps });
+        }
+
+        if self.sch_active && self.phase == SessionPhase::Active && self.sch_data_ready {
+            if let Some((sch_bits, sch_rate)) = self
+                .rlp
+                .next_sch_frame_bits(self.sch_info_bits, self.sch_rate_bps)
+            {
+                actions.push(SessionAction::SendSchFrame {
+                    bits: sch_bits,
+                    rate_bps: sch_rate,
+                });
+            }
+        }
+    }
+
     /// Process one frame period (20ms tick).
     ///
     /// `uplink`: raw primary traffic bits + rate_bps from the mobile this period,
@@ -1027,42 +1501,8 @@ impl PacketSession {
     /// Returns a list of actions for the caller to perform.
     pub fn tick(&mut self, uplink: Option<(&[u8], u32)>) -> Vec<SessionAction> {
         let mut actions = Vec::new();
+        self.process_uplink(uplink, &mut actions);
 
-        // --- Uplink: process received frame through the RLP backend ---
-        let delivery = if let Some((bits, rate_bps)) = uplink {
-            self.rlp.receive_frame_bits(bits, rate_bps)
-        } else {
-            self.rlp.receive_frame_bits(&[], 0)
-        };
-
-        // Check if RLP just entered DataTransfer (phase transition RlpSync → Lcp).
-        if self.phase == SessionPhase::RlpSync && self.rlp.is_data_transfer() {
-            if let Some(ppp_state) = self.pending_ppp_resume.take() {
-                self.lcp.restore_open_state(ppp_state.lcp);
-                self.ipcp.restore_open_state(ppp_state.ipcp);
-                self.mobile_ip = *ppp_state.mobile_ip;
-                self.vj = ppp_state.vj;
-                self.lcp_started = true;
-                self.ipcp_started = true;
-                self.phase = SessionPhase::Active;
-                self.ppp_activity_since_last_check = true;
-                log::info!(
-                    "{}: link established, resumed open PPP session peer={} gateway={}",
-                    self.log_prefix("RLP"),
-                    self.ipcp.peer_ip(),
-                    self.ipcp.our_ip()
-                );
-            } else {
-                log::debug!(
-                    "{}: link established, entering LCP phase",
-                    self.log_prefix("RLP")
-                );
-                self.phase = SessionPhase::Lcp;
-            }
-            self.rlp_sync_ticks = 0;
-        }
-
-        // Bound RlpSync: close the session if the MS never engages RLP3.
         if self.phase == SessionPhase::RlpSync {
             self.rlp_sync_ticks = self.rlp_sync_ticks.saturating_add(1);
             if self.rlp_sync_ticks == RLP_SYNC_MAX_TICKS {
@@ -1079,27 +1519,6 @@ impl PacketSession {
             }
         } else {
             self.rlp_sync_ticks = 0;
-        }
-
-        // Feed any delivered bytes into the PPP deframer.
-        if let Some(data) = delivery {
-            log::debug!(
-                "{}: delivered {} bytes to PPP deframer",
-                self.log_prefix("RLP"),
-                data.len()
-            );
-            let ppp_packets = self.deframer.feed(&data);
-            for ppp in ppp_packets {
-                self.ppp_activity_since_last_check = true;
-                capture::write_ppp_packet(
-                    CaptureDirection::Uplink,
-                    &ppp,
-                    &self.uplink_capture_frame_options(&ppp),
-                );
-                self.record_ppp_event("uplink", &ppp);
-                log::debug!("{}: {}", self.log_prefix("PPP RX"), format_ppp_packet(&ppp));
-                self.process_uplink_ppp(&ppp, &mut actions);
-            }
         }
 
         // --- Send our initial requests when entering new phases ---
@@ -1123,6 +1542,7 @@ impl PacketSession {
         {
             self.ppp_tx_queue.push(req);
         }
+        self.maybe_open_lcp_after_one_sided_ack();
         if self.phase == SessionPhase::Lcp && self.lcp.configure_failed() {
             actions.push(SessionAction::CloseSession {
                 reason: format!(
@@ -1146,59 +1566,7 @@ impl PacketSession {
             });
         }
 
-        // --- Downlink: convert queued PPP packets to RLP byte stream ---
-        // Build TX framing options from LCP negotiation.
-        let frame_opts = if self.lcp.is_open() {
-            framing::FrameOptions {
-                tx_accm: self.lcp.negotiated.tx_accm,
-                acfc: self.lcp.negotiated.we_send_acfc,
-                pfc: self.lcp.negotiated.we_send_pfc,
-            }
-        } else {
-            framing::FrameOptions::default()
-        };
-        let ppp_queue: Vec<PppPacket> = self.ppp_tx_queue.drain(..).collect();
-        for ppp in &ppp_queue {
-            self.ppp_activity_since_last_check = true;
-            self.record_ppp_event("downlink", ppp);
-            log::debug!("{}: {}", self.log_prefix("PPP TX"), format_ppp_packet(ppp));
-            let txq_before = self.rlp.tx_queue_len();
-            capture::write_ppp_packet(CaptureDirection::Downlink, ppp, &frame_opts);
-            let hdlc_bytes = framing::frame_with_options(ppp, &frame_opts);
-            let hdlc_len = hdlc_bytes.len();
-            self.rlp.enqueue_data(&hdlc_bytes);
-            let txq_after = self.rlp.tx_queue_len();
-            log::debug!(
-                "{}: {} hdlc_len={} rlp_txq_before={} rlp_txq_after={}",
-                self.log_prefix("PPP TX enqueue"),
-                format_ppp_packet(ppp),
-                hdlc_len,
-                txq_before,
-                txq_after
-            );
-        }
-
-        // --- Get next downlink FCH frame ---
-        let sch_data_path =
-            self.sch_active && self.phase == SessionPhase::Active && self.sch_data_ready;
-        let allow_fch_payload = !sch_data_path;
-        let (bits, rate_bps) = self.rlp.next_frame_bits(allow_fch_payload);
-        if !bits.is_empty() {
-            actions.push(SessionAction::SendFrame { bits, rate_bps });
-        }
-
-        // --- Get next downlink SCH frame (if active) ---
-        if self.sch_active && self.phase == SessionPhase::Active && self.sch_data_ready {
-            if let Some((sch_bits, sch_rate)) = self
-                .rlp
-                .next_sch_frame_bits(self.sch_info_bits, self.sch_rate_bps)
-            {
-                actions.push(SessionAction::SendSchFrame {
-                    bits: sch_bits,
-                    rate_bps: sch_rate,
-                });
-            }
-        }
+        self.append_pending_downlink_actions(&mut actions, true);
 
         actions
     }
@@ -1228,6 +1596,8 @@ impl PacketSession {
 
     pub fn close(&mut self) {
         self.phase = SessionPhase::Closed;
+        self.pending_downlink_ip.clear();
+        self.pending_downlink_ip_octets = 0;
     }
 
     pub fn telemetry(&self) -> PacketSessionTelemetry {
@@ -1253,13 +1623,74 @@ impl PacketSession {
     // Internal
     // -----------------------------------------------------------------------
 
+    fn process_uplink(&mut self, uplink: Option<(&[u8], u32)>, actions: &mut Vec<SessionAction>) {
+        let delivery = if let Some((bits, rate_bps)) = uplink {
+            self.rlp.receive_frame_bits(bits, rate_bps)
+        } else {
+            self.rlp.receive_frame_bits(&[], 0)
+        };
+
+        // Check if RLP just entered DataTransfer (phase transition RlpSync → Lcp).
+        if self.phase == SessionPhase::RlpSync && self.rlp.is_data_transfer() {
+            if let Some(ppp_state) = self.pending_ppp_resume.take() {
+                self.lcp.restore_open_state(ppp_state.lcp);
+                self.ipcp.restore_open_state(ppp_state.ipcp);
+                self.mobile_ip = *ppp_state.mobile_ip;
+                self.vj = ppp_state.vj;
+                self.lcp_started = true;
+                self.ipcp_started = true;
+                self.phase = SessionPhase::Active;
+                self.ppp_activity_since_last_check = true;
+                self.flush_pending_downlink_ip();
+                log::info!(
+                    "{}: link established, resumed open PPP session peer={} gateway={}",
+                    self.log_prefix("RLP"),
+                    self.ipcp.peer_ip(),
+                    self.ipcp.our_ip()
+                );
+            } else {
+                log::debug!(
+                    "{}: link established, entering LCP phase",
+                    self.log_prefix("RLP")
+                );
+                self.phase = SessionPhase::Lcp;
+            }
+            self.rlp_sync_ticks = 0;
+        }
+
+        let Some(data) = delivery else {
+            return;
+        };
+        log::trace!(
+            "{}: delivered {} bytes to PPP deframer",
+            self.log_prefix("RLP"),
+            data.len()
+        );
+        let ppp_packets = self.deframer.feed(&data);
+        for ppp in ppp_packets {
+            self.ppp_activity_since_last_check = true;
+            capture::write_ppp_packet(
+                CaptureDirection::Uplink,
+                &ppp,
+                &self.uplink_capture_frame_options(&ppp),
+            );
+            self.record_ppp_event("uplink", &ppp);
+            log::trace!("{}: {}", self.log_prefix("PPP RX"), format_ppp_packet(&ppp));
+            self.process_uplink_ppp(&ppp, actions);
+        }
+    }
+
     fn process_uplink_ppp(&mut self, ppp: &PppPacket, actions: &mut Vec<SessionAction>) {
         match ppp.protocol {
             LCP_PROTOCOL => {
                 let was_open = self.lcp.is_open();
+                let peer_terminated = ppp.payload.first().copied() == Some(TERMINATE_REQUEST);
                 let responses = self.lcp.receive(ppp);
                 for resp in responses {
                     self.ppp_tx_queue.push(resp);
+                }
+                if peer_terminated {
+                    self.peer_requested_lcp_terminate = true;
                 }
 
                 // Peer restarted LCP while we were in IPCP or Active. RFC
@@ -1334,6 +1765,33 @@ impl PacketSession {
                 );
             }
         }
+    }
+
+    fn maybe_open_lcp_after_one_sided_ack(&mut self) {
+        if !self.lcp_open_after_one_sided_ack
+            || self.phase != SessionPhase::Lcp
+            || self.lcp.is_open()
+        {
+            return;
+        }
+        // Only treat the peer as one-sided once it has ACKed our
+        // Configure-Request yet ignored repeated retransmits of it without
+        // ever sending its own. A peer that skips its Configure-Request but
+        // moves on to IPCP is handled by the IPCP-triggered force open.
+        if !self.lcp.peer_acked_our_request()
+            || self.lcp.configure_restarts() < LCP_ONE_SIDED_ACK_MIN_RETRANSMITS
+        {
+            return;
+        }
+
+        log::info!(
+            "{}: peer ACKed our Configure-Request but sent none after {} retransmits; \
+             forcing open for A10 and entering IPCP",
+            self.log_prefix("LCP"),
+            self.lcp.configure_restarts()
+        );
+        self.lcp.force_open();
+        self.phase = SessionPhase::Ipcp;
     }
 
     fn deliver_uplink_ip_packet(&mut self, ip_packet: &[u8], actions: &mut Vec<SessionAction>) {
@@ -1414,6 +1872,7 @@ impl PacketSession {
                 self.ipcp.reassign_peer_ip(binding.home_address);
                 self.phase = SessionPhase::Active;
                 self.ppp_activity_since_last_check = true;
+                self.flush_pending_downlink_ip();
                 log::info!(
                     "{}: MIP4 registration accepted, active peer={} home_agent={} lifetime={}",
                     self.log_prefix("PacketSession"),
@@ -1449,6 +1908,7 @@ impl PacketSession {
         }
 
         self.phase = SessionPhase::Active;
+        self.flush_pending_downlink_ip();
         log::info!(
             "{}: active peer={} gateway={}",
             self.log_prefix("PacketSession"),
@@ -2377,6 +2837,13 @@ mod tests {
         lcp.to_ppp()
     }
 
+    /// Option bytes of the session's pending LCP Configure-Request. The
+    /// Magic-Number is per-session, so a simulated peer Configure-Ack must
+    /// echo the live request rather than a fixed byte string.
+    fn our_lcp_request_data(session: &PacketSession) -> Vec<u8> {
+        session.lcp.pending_request_data()
+    }
+
     /// Build IPCP Configure-Request from mobile (requesting 0.0.0.0).
     fn mobile_ipcp_request_zero(id: u8) -> PppPacket {
         let ipcp = ipcp::IpcpPacket {
@@ -2408,6 +2875,11 @@ mod tests {
             ],
         };
         ipcp.to_ppp()
+    }
+
+    fn feed_a10_ppp(session: &mut PacketSession, packet: &PppPacket) -> Vec<SessionAction> {
+        let hdlc = framing::frame(packet);
+        session.tick(Some((&hdlc, 0)))
     }
 
     fn mobile_ipcp_request_ip_with_vj(id: u8, ip: Ipv4Addr) -> PppPacket {
@@ -2547,6 +3019,396 @@ mod tests {
         all_actions
     }
 
+    fn hrpd_rlp_seq(bits: &[u8]) -> u32 {
+        bits[..DEFAULT_PACKET_RLP_SEQUENCE_BITS]
+            .iter()
+            .fold(0u32, |acc, bit| (acc << 1) | u32::from(bit & 1))
+    }
+
+    #[test]
+    fn a10_unstructured_byte_stream_session_starts_lcp_before_uplink() {
+        let mut session = PacketSession::new_a10_unstructured_byte_stream(
+            u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+            IpcpConfig::default(),
+            None,
+        );
+        assert_eq!(session.phase(), SessionPhase::RlpSync);
+
+        let actions = session.tick(None);
+        assert_eq!(session.phase(), SessionPhase::Lcp);
+        let octets = actions
+            .iter()
+            .find_map(|action| match action {
+                SessionAction::SendFrame { bits, rate_bps } => Some((bits, *rate_bps)),
+                _ => None,
+            })
+            .expect("A10 byte-stream session should originate LCP before uplink");
+        assert_eq!(octets.1, 0);
+        assert!(octets.0.starts_with(&[0x7e]));
+        assert!(octets.0.ends_with(&[0x7e]));
+        assert_ne!(
+            octets.0.len() % 8,
+            6,
+            "A10 carries octets, not HRPD RLP bits"
+        );
+    }
+
+    #[test]
+    fn a10_unstructured_byte_stream_backend_preserves_octets() {
+        let payload = [0x7e, 0xff, 0x03, 0xc0, 0x21, 0x7e];
+        let mut backend = UnstructuredByteStreamBackend::new();
+
+        let delivered = backend
+            .receive_frame_bits(&payload, 0)
+            .expect("non-empty byte-stream payload should deliver octets");
+
+        assert_eq!(delivered, payload);
+        assert_eq!(
+            backend.last_rx_control,
+            "A10 UnstructuredByteStream octets=6"
+        );
+    }
+
+    #[test]
+    fn a10_uplink_burst_is_ingested_without_packet_session_ticks() {
+        let mut session = PacketSession::new_a10_unstructured_byte_stream(
+            u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+            IpcpConfig::default(),
+            None,
+        );
+        session.phase = SessionPhase::Active;
+        let ip_packet = mobile_ipv4_packet(Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(8, 8, 8, 8));
+        let hdlc = framing::frame(&PppPacket {
+            protocol: PPP_IP_PROTOCOL,
+            payload: ip_packet.clone(),
+        });
+
+        let delivered = (0..256)
+            .flat_map(|_| session.ingest_a10_byte_stream(&hdlc))
+            .filter(|action| {
+                matches!(action, SessionAction::DeliverIpPacket(packet) if packet == &ip_packet)
+            })
+            .count();
+
+        assert_eq!(delivered, 256);
+        assert_eq!(session.telemetry().lcp_configure_restarts, 0);
+    }
+
+    #[test]
+    fn a10_lcp_peer_ack_without_peer_request_advances_to_ipcp_after_retransmits() {
+        let mut session = PacketSession::new_a10_unstructured_byte_stream(
+            u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+            IpcpConfig::default(),
+            None,
+        );
+        session.tick(None);
+
+        let peer_ack = mobile_lcp_configure_ack(1, our_lcp_request_data(&session));
+        feed_a10_ppp(&mut session, &peer_ack);
+
+        assert_eq!(
+            session.phase(),
+            SessionPhase::Lcp,
+            "a one-sided peer ACK alone must not force LCP open"
+        );
+
+        // Drive the restart timer through one retransmit of our
+        // Configure-Request: still not enough evidence of a stuck peer.
+        let mut actions = Vec::new();
+        for _ in 0..=lcp::CONFIGURE_RESTART_TICKS {
+            actions.extend(session.tick(None));
+        }
+        assert_eq!(
+            session.phase(),
+            SessionPhase::Lcp,
+            "one retransmit is not yet evidence of a stuck peer"
+        );
+
+        // Second retransmit with the peer ACK in hand forces LCP open.
+        for _ in 0..=lcp::CONFIGURE_RESTART_TICKS {
+            actions.extend(session.tick(None));
+            if session.phase() == SessionPhase::Ipcp {
+                break;
+            }
+        }
+        actions.extend(session.tick(None));
+        assert_eq!(session.phase(), SessionPhase::Ipcp);
+
+        let mut deframer = framing::HdlcDeframer::new();
+        let downlink_ppp = actions
+            .iter()
+            .filter_map(|action| match action {
+                SessionAction::SendFrame { bits, .. } => Some(bits.as_slice()),
+                _ => None,
+            })
+            .flat_map(|bits| deframer.feed(bits))
+            .collect::<Vec<_>>();
+
+        assert!(
+            downlink_ppp
+                .iter()
+                .any(|ppp| ppp.protocol == IPCP_PROTOCOL && ppp.payload.first() == Some(&1)),
+            "A10 should send IPCP once the one-sided peer ACK is confirmed by retransmits"
+        );
+    }
+
+    #[test]
+    fn a10_lcp_peer_request_without_peer_ack_waits_for_peer_ipcp() {
+        let mut session = PacketSession::new_a10_unstructured_byte_stream(
+            u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+            IpcpConfig::default(),
+            None,
+        );
+        session.tick(None);
+
+        let peer_request = mobile_lcp_configure_request(139);
+        let actions = feed_a10_ppp(&mut session, &peer_request);
+
+        assert_eq!(
+            session.phase(),
+            SessionPhase::Lcp,
+            "ACKing the peer request without a peer ACK of ours must not open LCP"
+        );
+
+        let mut deframer = framing::HdlcDeframer::new();
+        let downlink_ppp = actions
+            .iter()
+            .filter_map(|action| match action {
+                SessionAction::SendFrame { bits, .. } => Some(bits.as_slice()),
+                _ => None,
+            })
+            .flat_map(|bits| deframer.feed(bits))
+            .collect::<Vec<_>>();
+        assert!(
+            downlink_ppp
+                .iter()
+                .any(|ppp| ppp.protocol == LCP_PROTOCOL && ppp.payload.first() == Some(&2)),
+            "A10 should ACK the peer LCP request"
+        );
+        assert!(
+            !downlink_ppp.iter().any(|ppp| ppp.protocol == IPCP_PROTOCOL),
+            "A10 must not start IPCP on the one-sided LCP exchange alone"
+        );
+
+        // The peer proceeding to IPCP on its own is the force-open evidence.
+        feed_a10_ppp(&mut session, &mobile_ipcp_request_zero(1));
+        assert_eq!(session.phase(), SessionPhase::Ipcp);
+    }
+
+    #[test]
+    fn a10_simple_ip_dns_only_peer_request_opens_active_after_max_failure() {
+        let mut session = PacketSession::new_a10_unstructured_byte_stream(
+            u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+            IpcpConfig::default(),
+            None,
+        );
+        session.tick(None);
+
+        let our_lcp_data = our_lcp_request_data(&session);
+        feed_a10_ppp(&mut session, &mobile_lcp_configure_request(1));
+        feed_a10_ppp(&mut session, &mobile_lcp_configure_ack(1, our_lcp_data));
+        assert_eq!(session.phase(), SessionPhase::Ipcp);
+
+        feed_a10_ppp(
+            &mut session,
+            &mobile_ipcp_ack(1, our_default_ipcp_request_data()),
+        );
+        assert_eq!(session.phase(), SessionPhase::Ipcp);
+
+        for id in 1..=5 {
+            feed_a10_ppp(
+                &mut session,
+                &mobile_ipcp_request_dns_only(id, Ipv4Addr::new(10, 55, 0, 1)),
+            );
+            assert_eq!(session.phase(), SessionPhase::Ipcp);
+        }
+
+        feed_a10_ppp(
+            &mut session,
+            &mobile_ipcp_request_dns_only(6, Ipv4Addr::new(10, 55, 0, 1)),
+        );
+
+        assert_eq!(session.phase(), SessionPhase::Active);
+        assert_eq!(session.peer_ip(), Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(session.our_ip(), Ipv4Addr::new(10, 0, 0, 1));
+    }
+
+    #[test]
+    fn a10_peer_lcp_terminate_sets_one_shot_signal() {
+        let mut session = PacketSession::new_a10_unstructured_byte_stream(
+            u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+            IpcpConfig::default(),
+            None,
+        );
+        session.tick(None);
+
+        let terminate = lcp::LcpPacket {
+            code: lcp::TERMINATE_REQUEST,
+            identifier: 7,
+            data: vec![],
+        }
+        .to_ppp();
+        let hdlc = framing::frame(&terminate);
+        let actions = session.tick(Some((&hdlc, 0)));
+
+        assert!(session.take_peer_requested_lcp_terminate());
+        assert!(!session.take_peer_requested_lcp_terminate());
+
+        let mut deframer = framing::HdlcDeframer::new();
+        let downlink_ppp = actions
+            .iter()
+            .filter_map(|action| match action {
+                SessionAction::SendFrame { bits, .. } => Some(bits.as_slice()),
+                _ => None,
+            })
+            .flat_map(|bits| deframer.feed(bits))
+            .collect::<Vec<_>>();
+        assert!(
+            downlink_ppp
+                .iter()
+                .any(|ppp| ppp.protocol == LCP_PROTOCOL && ppp.payload.first() == Some(&6)),
+            "LCP Terminate-Request must still be acknowledged before HRPD task teardown"
+        );
+    }
+
+    #[test]
+    fn a10_unstructured_byte_stream_tick_drains_backlog_in_multiple_chunks() {
+        let mut session = PacketSession::new_a10_unstructured_byte_stream(
+            u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+            IpcpConfig::default(),
+            None,
+        );
+        session.phase = SessionPhase::Active;
+        session.rlp.enqueue_data(&vec![0xaa; 2500]);
+
+        let actions = session.tick(None);
+        let frames = actions
+            .iter()
+            .filter_map(|action| match action {
+                SessionAction::SendFrame { bits, rate_bps } => Some((bits.len(), *rate_bps)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(frames, vec![(1024, 0), (1024, 0), (452, 0)]);
+        assert_eq!(session.rlp.tx_queue_len(), 0);
+    }
+
+    #[test]
+    fn a10_unstructured_byte_stream_coalesces_partial_arrival_chunks() {
+        let mut session = PacketSession::new_a10_unstructured_byte_stream(
+            u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+            IpcpConfig::default(),
+            None,
+        );
+        session.phase = SessionPhase::Active;
+        session.rlp_sync_ticks = 17;
+        let ip_packet = vec![0x45; 700];
+
+        session.send_ip_packet(&ip_packet);
+        let first_actions = session.emit_full_pending_downlink();
+        assert!(first_actions.is_empty());
+        assert_eq!(session.rlp_sync_ticks, 17);
+
+        session.send_ip_packet(&ip_packet);
+        let actions = session.emit_full_pending_downlink();
+
+        assert_eq!(session.rlp_sync_ticks, 17);
+        assert_eq!(actions.len(), 1);
+        assert!(session.rlp.tx_queue_len() < A10_UNSTRUCTURED_BYTE_STREAM_MAX_OCTETS);
+        let mut deframer = framing::HdlcDeframer::new();
+        let mut packets = actions
+            .iter()
+            .filter_map(|action| match action {
+                SessionAction::SendFrame { bits, rate_bps } => {
+                    assert_eq!(*rate_bps, 0);
+                    assert!(bits.len() <= A10_UNSTRUCTURED_BYTE_STREAM_MAX_OCTETS);
+                    Some(bits.as_slice())
+                }
+                _ => None,
+            })
+            .flat_map(|octets| deframer.feed(octets))
+            .collect::<Vec<_>>();
+        assert_eq!(packets.len(), 1);
+
+        let flush_actions = session.tick(None);
+        packets.extend(
+            flush_actions
+                .iter()
+                .filter_map(|action| match action {
+                    SessionAction::SendFrame { bits, .. } => Some(bits.as_slice()),
+                    _ => None,
+                })
+                .flat_map(|octets| deframer.feed(octets)),
+        );
+        assert_eq!(packets.len(), 2);
+        assert!(
+            packets
+                .iter()
+                .all(|packet| packet.protocol == PPP_IP_PROTOCOL && packet.payload == ip_packet)
+        );
+    }
+
+    #[test]
+    fn hrpd_default_packet_session_emits_lcp_without_rlp_sync() {
+        let mut session = PacketSession::new_hrpd_default_packet(
+            u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+            IpcpConfig::default(),
+            None,
+        );
+        assert_eq!(session.phase(), SessionPhase::RlpSync);
+
+        let actions = session.tick(None);
+
+        assert_eq!(session.phase(), SessionPhase::Lcp);
+        let frame = actions
+            .iter()
+            .find_map(|action| match action {
+                SessionAction::SendFrame { bits, rate_bps } => Some((bits, *rate_bps)),
+                _ => None,
+            })
+            .expect("HRPD Default Packet session should send LCP as first downlink RLP packet");
+        assert_eq!(frame.1, 0);
+        assert_eq!(frame.0.len() % 8, 6);
+        assert_eq!(hrpd_rlp_seq(frame.0), 0);
+        assert!(frame.0.len() > DEFAULT_PACKET_RLP_SEQUENCE_BITS);
+    }
+
+    #[test]
+    fn hrpd_default_packet_backend_extracts_uplink_octets() {
+        let payload = [0x7e, 0xff, 0x03, 0xc0, 0x21, 0x7e];
+        let bits = default_packet_rlp_packet_bits(3, &payload);
+        let mut backend = HrpdDefaultPacketBackend::new();
+
+        let delivered = backend
+            .receive_frame_bits(&bits, 0)
+            .expect("valid HRPD RLP packet should deliver octets");
+
+        assert_eq!(delivered, payload);
+        assert_eq!(backend.rx_last_seq, Some(3));
+        assert_eq!(backend.last_rx_control, "HRPD DefaultPacket seq=3 bits=70");
+    }
+
+    #[test]
+    fn hrpd_default_packet_backend_fragments_for_1024_bit_forward_traffic() {
+        let mut backend = HrpdDefaultPacketBackend::new();
+        backend.enqueue_data(&[0xaa; 200]);
+
+        let (first, first_rate) = backend.next_frame_bits(true);
+        let (second, second_rate) = backend.next_frame_bits(true);
+
+        assert_eq!(first_rate, 0);
+        assert_eq!(second_rate, 0);
+        assert_eq!(
+            first.len(),
+            DEFAULT_PACKET_RLP_SEQUENCE_BITS + HRPD_DEFAULT_PACKET_MAX_OCTETS_1024_FTC * 8
+        );
+        assert_eq!(second.len(), DEFAULT_PACKET_RLP_SEQUENCE_BITS + 79 * 8);
+        assert_eq!(hrpd_rlp_seq(&first), 0);
+        assert_eq!(hrpd_rlp_seq(&second), 1);
+        assert_eq!(backend.tx_queue_len(), 0);
+    }
+
     #[test]
     fn session_starts_in_rlp_sync() {
         let session =
@@ -2629,8 +3491,8 @@ mod tests {
                 .any(|a| matches!(a, SessionAction::SendFrame { .. }))
         );
 
-        // Mobile acks our Configure-Request (ID=1, MRU option).
-        let mobile_lcp_ack = mobile_lcp_configure_ack(1, vec![1, 4, 0x05, 0xDC]);
+        // Mobile acks our Configure-Request.
+        let mobile_lcp_ack = mobile_lcp_configure_ack(1, our_lcp_request_data(&session));
         feed_ppp_via_rlp(&mut session, &mobile_lcp_ack, &mut seq);
 
         assert_eq!(session.phase(), SessionPhase::Ipcp);
@@ -2669,9 +3531,10 @@ mod tests {
 
         let mut seq: u8 = 0;
         feed_ppp_via_rlp(&mut session, &mobile_lcp_configure_request(1), &mut seq);
+        let our_lcp_data = our_lcp_request_data(&session);
         feed_ppp_via_rlp(
             &mut session,
-            &mobile_lcp_configure_ack(1, vec![1, 4, 0x05, 0xDC]),
+            &mobile_lcp_configure_ack(1, our_lcp_data),
             &mut seq,
         );
         assert_eq!(session.phase(), SessionPhase::Ipcp);
@@ -2734,9 +3597,10 @@ mod tests {
 
         let mut seq: u8 = 0;
         feed_ppp_via_rlp(&mut session, &mobile_lcp_configure_request(1), &mut seq);
+        let our_lcp_data = our_lcp_request_data(&session);
         feed_ppp_via_rlp(
             &mut session,
-            &mobile_lcp_configure_ack(1, vec![1, 4, 0x05, 0xDC]),
+            &mobile_lcp_configure_ack(1, our_lcp_data),
             &mut seq,
         );
         feed_ppp_via_rlp(
@@ -2852,9 +3716,36 @@ mod tests {
         );
         assert_eq!(session.phase(), SessionPhase::Lcp);
 
-        let mobile_lcp_ack = mobile_lcp_configure_ack(2, vec![1, 4, 0x05, 0xDC]);
+        let mobile_lcp_ack = mobile_lcp_configure_ack(2, our_lcp_request_data(&session));
         feed_ppp_via_rlp(&mut session, &mobile_lcp_ack, &mut seq);
         assert_eq!(session.phase(), SessionPhase::Ipcp);
+
+        let ip_packet = vec![
+            0x45, 0x00, 0x00, 0x1C, 0x00, 0x01, 0x00, 0x00, 0x40, 0x01, 0x00, 0x00, 0x0A, 0x00,
+            0x00, 0x01, 0x0A, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01,
+        ];
+        session.send_ip_packet(&ip_packet);
+        assert_eq!(session.pending_downlink_ip.len(), 1);
+
+        feed_ppp_via_rlp(
+            &mut session,
+            &mobile_ipcp_request_ip(3, Ipv4Addr::new(10, 0, 0, 2)),
+            &mut seq,
+        );
+        let actions = feed_ppp_via_rlp(
+            &mut session,
+            &mobile_ipcp_ack(1, our_default_ipcp_request_data()),
+            &mut seq,
+        );
+
+        assert_eq!(session.phase(), SessionPhase::Active);
+        assert!(session.pending_downlink_ip.is_empty());
+        assert!(
+            actions.iter().any(
+                |a| matches!(a, SessionAction::SendFrame { rate_bps, .. } if *rate_bps > 1200)
+            ),
+            "downlink queued during LCP restart should flush after IPCP reopens"
+        );
     }
 
     #[test]
@@ -2893,9 +3784,10 @@ mod tests {
         // Drive PPP through LCP + IPCP to Active via the real handshake.
         let mut seq: u8 = 0;
         feed_ppp_via_rlp(&mut session, &mobile_lcp_configure_request(1), &mut seq);
+        let our_lcp_data = our_lcp_request_data(&session);
         feed_ppp_via_rlp(
             &mut session,
-            &mobile_lcp_configure_ack(1, vec![1, 4, 0x05, 0xDC]),
+            &mobile_lcp_configure_ack(1, our_lcp_data),
             &mut seq,
         );
         feed_ppp_via_rlp(&mut session, &mobile_ipcp_request_zero(1), &mut seq);
@@ -3005,9 +3897,10 @@ mod tests {
         let mut seq = 0;
 
         feed_ppp_via_rlp(&mut session, &mobile_lcp_configure_request(1), &mut seq);
+        let our_lcp_data = our_lcp_request_data(&session);
         feed_ppp_via_rlp(
             &mut session,
-            &mobile_lcp_configure_ack(1, vec![1, 4, 0x05, 0xDC]),
+            &mobile_lcp_configure_ack(1, our_lcp_data),
             &mut seq,
         );
         feed_ppp_via_rlp(
@@ -3050,7 +3943,7 @@ mod tests {
         complete_rlp_handshake(&mut session);
 
         let mut seq = 0;
-        let mobile_lcp_ack = mobile_lcp_configure_ack(1, vec![1, 4, 0x05, 0xDC]);
+        let mobile_lcp_ack = mobile_lcp_configure_ack(1, our_lcp_request_data(&session));
         feed_ppp_via_rlp(&mut session, &mobile_lcp_ack, &mut seq);
         assert_eq!(session.phase(), SessionPhase::Lcp);
 
@@ -3077,9 +3970,10 @@ mod tests {
 
         let mut seq = 0;
         feed_ppp_via_rlp(&mut session, &mobile_lcp_configure_request(1), &mut seq);
+        let our_lcp_data = our_lcp_request_data(&session);
         feed_ppp_via_rlp(
             &mut session,
-            &mobile_lcp_configure_ack(1, vec![1, 4, 0x05, 0xDC]),
+            &mobile_lcp_configure_ack(1, our_lcp_data),
             &mut seq,
         );
         assert_eq!(session.phase(), SessionPhase::Ipcp);
@@ -3137,28 +4031,84 @@ mod tests {
     }
 
     #[test]
-    fn send_ip_packet_ignored_before_active() {
+    fn send_ip_packet_queued_before_active_and_flushed_after_ipcp_open() {
         let mut session =
             PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), IpcpConfig::default());
         complete_rlp_handshake(&mut session);
         assert_eq!(session.phase(), SessionPhase::Lcp);
 
-        // Try to send IP — should be silently ignored.
-        session.send_ip_packet(&[0x45, 0x00]);
-        let actions = session.tick(None);
+        let ip_packet = vec![
+            0x45, 0x00, 0x00, 0x1C, 0x00, 0x01, 0x00, 0x00, 0x40, 0x01, 0x00, 0x00, 0x0A, 0x00,
+            0x00, 0x01, 0x0A, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01,
+        ];
+        session.send_ip_packet(&ip_packet);
+        assert_eq!(session.pending_downlink_ip.len(), 1);
+        assert_eq!(session.pending_downlink_ip_octets, ip_packet.len());
 
-        // Only RLP frame actions, no IP delivery.
-        for action in &actions {
-            assert!(matches!(action, SessionAction::SendFrame { .. }));
+        let mut seq: u8 = 0;
+        feed_ppp_via_rlp(&mut session, &mobile_lcp_configure_request(1), &mut seq);
+        let our_lcp_data = our_lcp_request_data(&session);
+        feed_ppp_via_rlp(
+            &mut session,
+            &mobile_lcp_configure_ack(1, our_lcp_data),
+            &mut seq,
+        );
+        feed_ppp_via_rlp(&mut session, &mobile_ipcp_request_zero(1), &mut seq);
+        feed_ppp_via_rlp(
+            &mut session,
+            &mobile_ipcp_request_ip(2, Ipv4Addr::new(10, 0, 0, 2)),
+            &mut seq,
+        );
+        let actions = feed_ppp_via_rlp(
+            &mut session,
+            &mobile_ipcp_ack(1, our_default_ipcp_request_data()),
+            &mut seq,
+        );
+
+        assert_eq!(session.phase(), SessionPhase::Active);
+        assert!(session.pending_downlink_ip.is_empty());
+        assert_eq!(session.pending_downlink_ip_octets, 0);
+        assert!(
+            actions.iter().any(
+                |a| matches!(a, SessionAction::SendFrame { rate_bps, .. } if *rate_bps > 1200)
+            ),
+            "queued downlink IP should be emitted once IPCP opens"
+        );
+    }
+
+    #[test]
+    fn pending_downlink_ip_queue_is_bounded() {
+        let mut session =
+            PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), IpcpConfig::default());
+        complete_rlp_handshake(&mut session);
+
+        for i in 0..300usize {
+            let packet = vec![i as u8; 1000];
+            session.send_ip_packet(&packet);
         }
+
+        assert_eq!(
+            session.pending_downlink_ip.len(),
+            PENDING_DOWNLINK_IP_MAX_PACKETS
+        );
+        assert_eq!(
+            session.pending_downlink_ip_octets,
+            PENDING_DOWNLINK_IP_MAX_PACKETS * 1000
+        );
+        assert_eq!(session.pending_downlink_ip.front().unwrap()[0], 44);
     }
 
     #[test]
     fn close_session() {
         let mut session =
             PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), IpcpConfig::default());
+        complete_rlp_handshake(&mut session);
+        session.send_ip_packet(&[0x45, 0x00]);
+        assert_eq!(session.pending_downlink_ip.len(), 1);
         session.close();
         assert_eq!(session.phase(), SessionPhase::Closed);
+        assert!(session.pending_downlink_ip.is_empty());
+        assert_eq!(session.pending_downlink_ip_octets, 0);
     }
 
     // -----------------------------------------------------------------------
@@ -3182,7 +4132,7 @@ mod tests {
         let mobile_lcp_req = mobile_lcp_configure_request(1);
         feed_ppp_via_rlp(session, &mobile_lcp_req, &mut seq);
 
-        let mobile_lcp_ack = mobile_lcp_configure_ack(1, vec![1, 4, 0x05, 0xDC]);
+        let mobile_lcp_ack = mobile_lcp_configure_ack(1, our_lcp_request_data(&session));
         feed_ppp_via_rlp(session, &mobile_lcp_ack, &mut seq);
 
         assert_eq!(session.phase(), SessionPhase::Ipcp);

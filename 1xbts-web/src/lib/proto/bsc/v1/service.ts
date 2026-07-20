@@ -11,6 +11,55 @@ import { Empty } from "../../google/protobuf/empty";
 
 export const protobufPackage = "bsc.v1";
 
+/** How the EV-DO carrier shares RF with the 1x carrier. */
+export enum EvdoTxMode {
+  EVDO_TX_MODE_UNSPECIFIED = 0,
+  /** EVDO_TX_MODE_ADJACENT_COMPOSITE - EV-DO and 1x summed onto one carrier with the combined spectrum centered. */
+  EVDO_TX_MODE_ADJACENT_COMPOSITE = 1,
+  /** EVDO_TX_MODE_DUAL_RF - EV-DO and 1x on separate RF chains. */
+  EVDO_TX_MODE_DUAL_RF = 2,
+  /** EVDO_TX_MODE_HRPD_ONLY - EV-DO carrier only (no 1x transmit). */
+  EVDO_TX_MODE_HRPD_ONLY = 3,
+  UNRECOGNIZED = -1,
+}
+
+export function evdoTxModeFromJSON(object: any): EvdoTxMode {
+  switch (object) {
+    case 0:
+    case "EVDO_TX_MODE_UNSPECIFIED":
+      return EvdoTxMode.EVDO_TX_MODE_UNSPECIFIED;
+    case 1:
+    case "EVDO_TX_MODE_ADJACENT_COMPOSITE":
+      return EvdoTxMode.EVDO_TX_MODE_ADJACENT_COMPOSITE;
+    case 2:
+    case "EVDO_TX_MODE_DUAL_RF":
+      return EvdoTxMode.EVDO_TX_MODE_DUAL_RF;
+    case 3:
+    case "EVDO_TX_MODE_HRPD_ONLY":
+      return EvdoTxMode.EVDO_TX_MODE_HRPD_ONLY;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return EvdoTxMode.UNRECOGNIZED;
+  }
+}
+
+export function evdoTxModeToJSON(object: EvdoTxMode): string {
+  switch (object) {
+    case EvdoTxMode.EVDO_TX_MODE_UNSPECIFIED:
+      return "EVDO_TX_MODE_UNSPECIFIED";
+    case EvdoTxMode.EVDO_TX_MODE_ADJACENT_COMPOSITE:
+      return "EVDO_TX_MODE_ADJACENT_COMPOSITE";
+    case EvdoTxMode.EVDO_TX_MODE_DUAL_RF:
+      return "EVDO_TX_MODE_DUAL_RF";
+    case EvdoTxMode.EVDO_TX_MODE_HRPD_ONLY:
+      return "EVDO_TX_MODE_HRPD_ONLY";
+    case EvdoTxMode.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
 /** Current serving-cell status and identity. */
 export interface SystemStatus {
   running: boolean;
@@ -688,7 +737,32 @@ export interface BtsConfig {
   paging: PagingConfig | undefined;
   overhead: OverheadConfig | undefined;
   timezone: TimezoneConfig | undefined;
-  timezoneStatus: TimezoneStatus | undefined;
+  timezoneStatus:
+    | TimezoneStatus
+    | undefined;
+  /** EV-DO (HRPD) carrier, present only when EV-DO is enabled. */
+  evdo: EvdoCarrierConfig | undefined;
+}
+
+/** Resolved EV-DO (HRPD) carrier configuration. */
+export interface EvdoCarrierConfig {
+  channel: number;
+  /** CDMA2000 band class number for the EV-DO carrier. */
+  bandClass: number;
+  /** Resolved EV-DO downlink/uplink center frequencies in Hz. */
+  frequencyHz: number;
+  reverseFrequencyHz: number;
+  /** Center of the combined spectrum in composite mode (Hz). */
+  compositeCenterFrequencyHz: number;
+  mode: EvdoTxMode;
+  /** EV-DO TX gain relative to 1x (linear amplitude ratio). */
+  gain: number;
+  /** Whether the 1x carrier advertises this EV-DO neighbor. */
+  advertiseOn1x: boolean;
+  /** 128-bit HRPD sector ID as 32 hex digits. */
+  sectorId: string;
+  colorCode: number;
+  subnetMask: number;
 }
 
 /** Pilot channel configuration. */
@@ -11096,6 +11170,7 @@ function createBaseBtsConfig(): BtsConfig {
     overhead: undefined,
     timezone: undefined,
     timezoneStatus: undefined,
+    evdo: undefined,
   };
 }
 
@@ -11154,6 +11229,9 @@ export const BtsConfig: MessageFns<BtsConfig> = {
     }
     if (message.timezoneStatus !== undefined) {
       TimezoneStatus.encode(message.timezoneStatus, writer.uint32(178).fork()).join();
+    }
+    if (message.evdo !== undefined) {
+      EvdoCarrierConfig.encode(message.evdo, writer.uint32(322).fork()).join();
     }
     return writer;
   },
@@ -11309,6 +11387,14 @@ export const BtsConfig: MessageFns<BtsConfig> = {
           message.timezoneStatus = TimezoneStatus.decode(reader, reader.uint32());
           continue;
         }
+        case 40: {
+          if (tag !== 322) {
+            break;
+          }
+
+          message.evdo = EvdoCarrierConfig.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -11390,6 +11476,7 @@ export const BtsConfig: MessageFns<BtsConfig> = {
         : isSet(object.timezone_status)
         ? TimezoneStatus.fromJSON(object.timezone_status)
         : undefined,
+      evdo: isSet(object.evdo) ? EvdoCarrierConfig.fromJSON(object.evdo) : undefined,
     };
   },
 
@@ -11449,6 +11536,9 @@ export const BtsConfig: MessageFns<BtsConfig> = {
     if (message.timezoneStatus !== undefined) {
       obj.timezoneStatus = TimezoneStatus.toJSON(message.timezoneStatus);
     }
+    if (message.evdo !== undefined) {
+      obj.evdo = EvdoCarrierConfig.toJSON(message.evdo);
+    }
     return obj;
   },
 
@@ -11487,6 +11577,273 @@ export const BtsConfig: MessageFns<BtsConfig> = {
     message.timezoneStatus = (object.timezoneStatus !== undefined && object.timezoneStatus !== null)
       ? TimezoneStatus.fromPartial(object.timezoneStatus)
       : undefined;
+    message.evdo = (object.evdo !== undefined && object.evdo !== null)
+      ? EvdoCarrierConfig.fromPartial(object.evdo)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseEvdoCarrierConfig(): EvdoCarrierConfig {
+  return {
+    channel: 0,
+    bandClass: 0,
+    frequencyHz: 0,
+    reverseFrequencyHz: 0,
+    compositeCenterFrequencyHz: 0,
+    mode: 0,
+    gain: 0,
+    advertiseOn1x: false,
+    sectorId: "",
+    colorCode: 0,
+    subnetMask: 0,
+  };
+}
+
+export const EvdoCarrierConfig: MessageFns<EvdoCarrierConfig> = {
+  encode(message: EvdoCarrierConfig, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.channel !== 0) {
+      writer.uint32(8).uint32(message.channel);
+    }
+    if (message.bandClass !== 0) {
+      writer.uint32(16).uint32(message.bandClass);
+    }
+    if (message.frequencyHz !== 0) {
+      writer.uint32(24).uint64(message.frequencyHz);
+    }
+    if (message.reverseFrequencyHz !== 0) {
+      writer.uint32(32).uint64(message.reverseFrequencyHz);
+    }
+    if (message.compositeCenterFrequencyHz !== 0) {
+      writer.uint32(40).uint64(message.compositeCenterFrequencyHz);
+    }
+    if (message.mode !== 0) {
+      writer.uint32(48).int32(message.mode);
+    }
+    if (message.gain !== 0) {
+      writer.uint32(61).float(message.gain);
+    }
+    if (message.advertiseOn1x !== false) {
+      writer.uint32(64).bool(message.advertiseOn1x);
+    }
+    if (message.sectorId !== "") {
+      writer.uint32(74).string(message.sectorId);
+    }
+    if (message.colorCode !== 0) {
+      writer.uint32(80).uint32(message.colorCode);
+    }
+    if (message.subnetMask !== 0) {
+      writer.uint32(88).uint32(message.subnetMask);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): EvdoCarrierConfig {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseEvdoCarrierConfig();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.channel = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.bandClass = reader.uint32();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.frequencyHz = longToNumber(reader.uint64());
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.reverseFrequencyHz = longToNumber(reader.uint64());
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.compositeCenterFrequencyHz = longToNumber(reader.uint64());
+          continue;
+        }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.mode = reader.int32() as any;
+          continue;
+        }
+        case 7: {
+          if (tag !== 61) {
+            break;
+          }
+
+          message.gain = reader.float();
+          continue;
+        }
+        case 8: {
+          if (tag !== 64) {
+            break;
+          }
+
+          message.advertiseOn1x = reader.bool();
+          continue;
+        }
+        case 9: {
+          if (tag !== 74) {
+            break;
+          }
+
+          message.sectorId = reader.string();
+          continue;
+        }
+        case 10: {
+          if (tag !== 80) {
+            break;
+          }
+
+          message.colorCode = reader.uint32();
+          continue;
+        }
+        case 11: {
+          if (tag !== 88) {
+            break;
+          }
+
+          message.subnetMask = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): EvdoCarrierConfig {
+    return {
+      channel: isSet(object.channel) ? globalThis.Number(object.channel) : 0,
+      bandClass: isSet(object.bandClass)
+        ? globalThis.Number(object.bandClass)
+        : isSet(object.band_class)
+        ? globalThis.Number(object.band_class)
+        : 0,
+      frequencyHz: isSet(object.frequencyHz)
+        ? globalThis.Number(object.frequencyHz)
+        : isSet(object.frequency_hz)
+        ? globalThis.Number(object.frequency_hz)
+        : 0,
+      reverseFrequencyHz: isSet(object.reverseFrequencyHz)
+        ? globalThis.Number(object.reverseFrequencyHz)
+        : isSet(object.reverse_frequency_hz)
+        ? globalThis.Number(object.reverse_frequency_hz)
+        : 0,
+      compositeCenterFrequencyHz: isSet(object.compositeCenterFrequencyHz)
+        ? globalThis.Number(object.compositeCenterFrequencyHz)
+        : isSet(object.composite_center_frequency_hz)
+        ? globalThis.Number(object.composite_center_frequency_hz)
+        : 0,
+      mode: isSet(object.mode) ? evdoTxModeFromJSON(object.mode) : 0,
+      gain: isSet(object.gain) ? globalThis.Number(object.gain) : 0,
+      advertiseOn1x: isSet(object.advertiseOn1x)
+        ? globalThis.Boolean(object.advertiseOn1x)
+        : isSet(object.advertise_on_1x)
+        ? globalThis.Boolean(object.advertise_on_1x)
+        : false,
+      sectorId: isSet(object.sectorId)
+        ? globalThis.String(object.sectorId)
+        : isSet(object.sector_id)
+        ? globalThis.String(object.sector_id)
+        : "",
+      colorCode: isSet(object.colorCode)
+        ? globalThis.Number(object.colorCode)
+        : isSet(object.color_code)
+        ? globalThis.Number(object.color_code)
+        : 0,
+      subnetMask: isSet(object.subnetMask)
+        ? globalThis.Number(object.subnetMask)
+        : isSet(object.subnet_mask)
+        ? globalThis.Number(object.subnet_mask)
+        : 0,
+    };
+  },
+
+  toJSON(message: EvdoCarrierConfig): unknown {
+    const obj: any = {};
+    if (message.channel !== 0) {
+      obj.channel = Math.round(message.channel);
+    }
+    if (message.bandClass !== 0) {
+      obj.bandClass = Math.round(message.bandClass);
+    }
+    if (message.frequencyHz !== 0) {
+      obj.frequencyHz = Math.round(message.frequencyHz);
+    }
+    if (message.reverseFrequencyHz !== 0) {
+      obj.reverseFrequencyHz = Math.round(message.reverseFrequencyHz);
+    }
+    if (message.compositeCenterFrequencyHz !== 0) {
+      obj.compositeCenterFrequencyHz = Math.round(message.compositeCenterFrequencyHz);
+    }
+    if (message.mode !== 0) {
+      obj.mode = evdoTxModeToJSON(message.mode);
+    }
+    if (message.gain !== 0) {
+      obj.gain = message.gain;
+    }
+    if (message.advertiseOn1x !== false) {
+      obj.advertiseOn1x = message.advertiseOn1x;
+    }
+    if (message.sectorId !== "") {
+      obj.sectorId = message.sectorId;
+    }
+    if (message.colorCode !== 0) {
+      obj.colorCode = Math.round(message.colorCode);
+    }
+    if (message.subnetMask !== 0) {
+      obj.subnetMask = Math.round(message.subnetMask);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<EvdoCarrierConfig>): EvdoCarrierConfig {
+    return EvdoCarrierConfig.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<EvdoCarrierConfig>): EvdoCarrierConfig {
+    const message = createBaseEvdoCarrierConfig();
+    message.channel = object.channel ?? 0;
+    message.bandClass = object.bandClass ?? 0;
+    message.frequencyHz = object.frequencyHz ?? 0;
+    message.reverseFrequencyHz = object.reverseFrequencyHz ?? 0;
+    message.compositeCenterFrequencyHz = object.compositeCenterFrequencyHz ?? 0;
+    message.mode = object.mode ?? 0;
+    message.gain = object.gain ?? 0;
+    message.advertiseOn1x = object.advertiseOn1x ?? false;
+    message.sectorId = object.sectorId ?? "";
+    message.colorCode = object.colorCode ?? 0;
+    message.subnetMask = object.subnetMask ?? 0;
     return message;
   },
 };
@@ -15353,7 +15710,10 @@ export const ChannelList: MessageFns<ChannelList> = {
   },
 };
 
-/** BSC/BTS management service used by local tools and the web UI. */
+/**
+ * Management and telemetry service for the BSC/BTS: serving-cell status,
+ * channel and power configuration, and live network events.
+ */
 export type BscServiceDefinition = typeof BscServiceDefinition;
 export const BscServiceDefinition = {
   name: "BscService",

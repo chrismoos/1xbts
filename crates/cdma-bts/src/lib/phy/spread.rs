@@ -2,13 +2,37 @@
 
 use num::complex::Complex32;
 
-use crate::phy::lfsr::{GaloisLfsr, PN_I_TAPS, PN_Q_TAPS};
+use crate::phy::lfsr::{
+    GaloisLfsr, HRPD_FORWARD_PN_I_TAPS, HRPD_FORWARD_PN_Q_TAPS, PN_I_TAPS, PN_Q_TAPS,
+};
 
 /// Forward-link short-code generator for the I/Q pilot PN sequences.
 ///
 /// This generator emits the standard 15-bit short code with the inserted
 /// zero chip at the epoch boundary.
 pub struct PnSequence {
+    inner: ShortCodePnSequence,
+}
+
+/// HRPD forward-link pilot PN sequence generator (C.S0024-200-C §1.4.1.3.4).
+///
+/// Uses the reciprocal of the 1x short code (see `HRPD_FORWARD_PN_I_TAPS`), with
+/// zero offset at the start of the inserted zero run. Not interchangeable with
+/// [`PnSequence`] — the two emit time-reversed chip streams.
+pub struct HrpdForwardPnSequence {
+    inner: ShortCodePnSequence,
+}
+
+/// HRPD access-terminal common short-code PN sequence generator.
+///
+/// Reverse HRPD access uses the access-terminal common short-code PI/PQ
+/// polynomials and aligns the zero-offset epoch to the `1` following the
+/// inserted 15-zero run.
+pub struct HrpdAccessTerminalPnSequence {
+    inner: ShortCodePnSequence,
+}
+
+struct ShortCodePnSequence {
     lfsr_i: PnLfsr,
     lfsr_q: PnLfsr,
 
@@ -28,45 +52,133 @@ impl PnSequence {
 
     /// Create a zero-offset PN generator that repeats each chip `repeat + 1` times.
     ///
-    /// The forward-link offset argument is currently restricted to the zero-offset epoch.
     pub fn new_repeat(offset: usize, length: usize, repeat: usize) -> PnSequence {
+        PnSequence {
+            inner: ShortCodePnSequence::new_repeat(
+                offset,
+                length,
+                repeat,
+                PN_I_TAPS,
+                PN_Q_TAPS,
+                PnEpoch::AfterInsertedZeroRun,
+            ),
+        }
+    }
+
+    /// Return the next raw `(I, Q)` PN chip pair as bits.
+    pub fn generate(&mut self) -> (u8, u8) {
+        self.inner.generate()
+    }
+
+    /// Return the next PN chip pair mapped onto the complex alphabet `{+1, -1}`.
+    pub fn generate_iq(&mut self) -> Complex32 {
+        self.inner.generate_iq()
+    }
+
+    /// Advance the short-code generator by `chips` chip intervals.
+    ///
+    /// This is intended for startup alignment to an absolute CDMA chip clock.
+    /// Uses period modulo so very large chip counts are cheap.
+    pub fn advance_chips(&mut self, chips: u64) {
+        self.inner.advance_chips(chips);
+    }
+}
+
+impl HrpdForwardPnSequence {
+    /// Create a zero-offset HRPD forward PN generator that emits one chip per call.
+    pub fn new(offset: usize, length: usize) -> HrpdForwardPnSequence {
+        Self::new_repeat(offset, length, 0)
+    }
+
+    /// Create a zero-offset HRPD forward PN generator that repeats each chip `repeat + 1` times.
+    pub fn new_repeat(offset: usize, length: usize, repeat: usize) -> HrpdForwardPnSequence {
+        HrpdForwardPnSequence {
+            inner: ShortCodePnSequence::new_repeat(
+                offset,
+                length,
+                repeat,
+                HRPD_FORWARD_PN_I_TAPS,
+                HRPD_FORWARD_PN_Q_TAPS,
+                PnEpoch::StartOfInsertedZeroRun,
+            ),
+        }
+    }
+
+    /// Return the next raw `(I, Q)` PN chip pair as bits.
+    pub fn generate(&mut self) -> (u8, u8) {
+        self.inner.generate()
+    }
+
+    /// Return the next PN chip pair mapped onto the complex alphabet `{+1, -1}`.
+    pub fn generate_iq(&mut self) -> Complex32 {
+        self.inner.generate_iq()
+    }
+
+    /// Advance the short-code generator by `chips` chip intervals.
+    pub fn advance_chips(&mut self, chips: u64) {
+        self.inner.advance_chips(chips);
+    }
+}
+
+impl HrpdAccessTerminalPnSequence {
+    /// Create a zero-offset HRPD access-terminal PN generator that emits one
+    /// chip per call.
+    pub fn new(offset: usize, length: usize) -> HrpdAccessTerminalPnSequence {
+        Self::new_repeat(offset, length, 0)
+    }
+
+    /// Create a zero-offset HRPD access-terminal PN generator that repeats
+    /// each chip `repeat + 1` times.
+    pub fn new_repeat(offset: usize, length: usize, repeat: usize) -> HrpdAccessTerminalPnSequence {
+        HrpdAccessTerminalPnSequence {
+            inner: ShortCodePnSequence::new_repeat(
+                offset,
+                length,
+                repeat,
+                PN_I_TAPS,
+                PN_Q_TAPS,
+                PnEpoch::AfterInsertedZeroRun,
+            ),
+        }
+    }
+
+    /// Return the next raw `(I, Q)` PN chip pair as bits.
+    pub fn generate(&mut self) -> (u8, u8) {
+        self.inner.generate()
+    }
+
+    /// Return the next PN chip pair mapped onto the complex alphabet `{+1, -1}`.
+    pub fn generate_iq(&mut self) -> Complex32 {
+        self.inner.generate_iq()
+    }
+
+    /// Advance the short-code generator by `chips` chip intervals.
+    pub fn advance_chips(&mut self, chips: u64) {
+        self.inner.advance_chips(chips);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PnEpoch {
+    AfterInsertedZeroRun,
+    StartOfInsertedZeroRun,
+}
+
+impl ShortCodePnSequence {
+    fn new_repeat(
+        offset: usize,
+        length: usize,
+        repeat: usize,
+        i_taps: u64,
+        q_taps: u64,
+        epoch: PnEpoch,
+    ) -> ShortCodePnSequence {
         assert!(offset <= 511);
         assert!(length > 0);
-        let mut lfsr_i = PnLfsr::new(GaloisLfsr::new((1 << 15) - 1, PN_I_TAPS));
-        let mut lfsr_q = PnLfsr::new(GaloisLfsr::new((1 << 15) - 1, PN_Q_TAPS));
+        let lfsr_i = epoch_pn_lfsr(i_taps, epoch);
+        let lfsr_q = epoch_pn_lfsr(q_taps, epoch);
 
-        // Align both short-code generators to the mandated epoch immediately
-        // after the inserted 15-zero run.
-        assert!(offset == 0);
-        // Advance to the CDMA short-code epoch immediately after the 15-zero run.
-        let mut zeros = 0;
-        loop {
-            let res = lfsr_i.next();
-            if res == 0 {
-                zeros += 1;
-            } else {
-                zeros = 0;
-            }
-            if zeros == 15 {
-                break;
-            }
-        }
-
-        // Advance to the CDMA short-code epoch immediately after the 15-zero run.
-        let mut zeros = 0;
-        loop {
-            let res = lfsr_q.next();
-            if res == 0 {
-                zeros += 1;
-            } else {
-                zeros = 0;
-            }
-            if zeros == 15 {
-                break;
-            }
-        }
-
-        PnSequence {
+        let mut sequence = ShortCodePnSequence {
             lfsr_i,
             lfsr_q,
             repeat_index: 0,
@@ -74,11 +186,17 @@ impl PnSequence {
             last_i: 0,
             last_q: 0,
             period_chips: length as u64,
+        };
+        let repeat_factor = (repeat as u64) + 1;
+        let period = length as u64 * repeat_factor;
+        let lag = (offset as u64 * 64 * repeat_factor) % period;
+        if lag != 0 {
+            sequence.advance_chips(period - lag);
         }
+        sequence
     }
 
-    /// Return the next raw `(I, Q)` PN chip pair as bits.
-    pub fn generate(&mut self) -> (u8, u8) {
+    fn generate(&mut self) -> (u8, u8) {
         if self.repeat_index == 0 {
             self.last_i = self.lfsr_i.next();
             self.last_q = self.lfsr_q.next();
@@ -92,8 +210,7 @@ impl PnSequence {
         (self.last_i, self.last_q)
     }
 
-    /// Return the next PN chip pair mapped onto the complex alphabet `{+1, -1}`.
-    pub fn generate_iq(&mut self) -> Complex32 {
+    fn generate_iq(&mut self) -> Complex32 {
         let val = self.generate();
         Complex32::new(
             if val.0 == 0 { 1.0 } else { -1.0 },
@@ -101,11 +218,7 @@ impl PnSequence {
         )
     }
 
-    /// Advance the short-code generator by `chips` chip intervals.
-    ///
-    /// This is intended for startup alignment to an absolute CDMA chip clock.
-    /// Uses period modulo so very large chip counts are cheap.
-    pub fn advance_chips(&mut self, chips: u64) {
+    fn advance_chips(&mut self, chips: u64) {
         let repeat_factor = (self.num_repeats as u64) + 1;
         let period = self.period_chips * repeat_factor;
         let steps = chips % period;
@@ -141,16 +254,85 @@ impl PnLfsr {
     }
 }
 
+fn epoch_pn_lfsr(taps: u64, epoch: PnEpoch) -> PnLfsr {
+    let mut probe = PnLfsr::new(GaloisLfsr::new((1 << 15) - 1, taps));
+    let mut zeros = 0usize;
+    let mut zero_run_start = None;
+    let mut zero_run_end = None;
+    for idx in 0..32_768 {
+        let bit = probe.next();
+        if bit == 0 {
+            zeros += 1;
+            if zeros == 15 {
+                zero_run_start = Some(idx + 1 - 15);
+                zero_run_end = Some(idx + 1);
+                break;
+            }
+        } else {
+            zeros = 0;
+        }
+    }
+
+    let mut lfsr = PnLfsr::new(GaloisLfsr::new((1 << 15) - 1, taps));
+    let advance = match epoch {
+        PnEpoch::AfterInsertedZeroRun => {
+            zero_run_end.expect("PN sequence must contain inserted 15-zero run")
+        }
+        PnEpoch::StartOfInsertedZeroRun => {
+            zero_run_start.expect("PN sequence must contain inserted 15-zero run")
+        }
+    };
+    for _ in 0..advance {
+        let _ = lfsr.next();
+    }
+    lfsr
+}
+
+pub trait PnChipSource {
+    fn generate_iq(&mut self) -> Complex32;
+    fn advance_chips(&mut self, chips: u64);
+}
+
+impl PnChipSource for PnSequence {
+    fn generate_iq(&mut self) -> Complex32 {
+        PnSequence::generate_iq(self)
+    }
+
+    fn advance_chips(&mut self, chips: u64) {
+        PnSequence::advance_chips(self, chips);
+    }
+}
+
+impl PnChipSource for HrpdForwardPnSequence {
+    fn generate_iq(&mut self) -> Complex32 {
+        HrpdForwardPnSequence::generate_iq(self)
+    }
+
+    fn advance_chips(&mut self, chips: u64) {
+        HrpdForwardPnSequence::advance_chips(self, chips);
+    }
+}
+
+impl PnChipSource for HrpdAccessTerminalPnSequence {
+    fn generate_iq(&mut self) -> Complex32 {
+        HrpdAccessTerminalPnSequence::generate_iq(self)
+    }
+
+    fn advance_chips(&mut self, chips: u64) {
+        HrpdAccessTerminalPnSequence::advance_chips(self, chips);
+    }
+}
+
 /// Applies forward-link complex spreading with the configured short-code PN sequence.
 ///
 /// Each call advances the underlying PN generator by one chip interval.
-pub struct Spreader {
-    pn_sequence: PnSequence,
+pub struct Spreader<P = PnSequence> {
+    pn_sequence: P,
 }
 
-impl Spreader {
+impl<P: PnChipSource> Spreader<P> {
     /// Create a spreader over the supplied PN sequence.
-    pub fn new(pn_sequence: PnSequence) -> Spreader {
+    pub fn new(pn_sequence: P) -> Spreader<P> {
         Spreader { pn_sequence }
     }
 
@@ -182,11 +364,16 @@ impl Spreader {
     pub fn align_to_chip(&mut self, chip: u64) {
         self.pn_sequence.advance_chips(chip);
     }
+
+    /// Advance relative to the current short-code PN phase.
+    pub fn advance_chips(&mut self, chips: u64) {
+        self.pn_sequence.advance_chips(chips);
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::PnSequence;
+    use super::{HrpdAccessTerminalPnSequence, HrpdForwardPnSequence, PnSequence};
 
     #[test]
     pub fn test_pn_repeat() {
@@ -237,6 +424,111 @@ mod tests {
         );
 
         assert_eq!(sequence, sequence1);
+    }
+
+    #[test]
+    pub fn test_hrpd_forward_pn_pilot_matches_spec_epoch_and_recursions() {
+        let mut pn_seq = HrpdForwardPnSequence::new(0, 32768);
+        let sequence = (0..32768).map(|_| pn_seq.generate()).collect::<Vec<_>>();
+        let sequence_i_string = sequence
+            .iter()
+            .map(|x| format!("{}", x.0))
+            .collect::<Vec<_>>()
+            .join("");
+        let sequence_q_string = sequence
+            .iter()
+            .map(|x| format!("{}", x.1))
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!("0000000000000001", &sequence_i_string[0..16]);
+        assert_eq!("0000000000000001", &sequence_q_string[0..16]);
+        assert_eq!("1", &sequence_i_string[32767..32768]);
+        assert_eq!("1", &sequence_q_string[32767..32768]);
+
+        let sequence_i = strip_inserted_zero(sequence.iter().map(|x| x.0).collect::<Vec<_>>());
+        let sequence_q = strip_inserted_zero(sequence.iter().map(|x| x.1).collect::<Vec<_>>());
+
+        assert_forward_recursion(&sequence_i, &[15, 13, 9, 8, 7, 5]);
+        assert_forward_recursion(&sequence_q, &[15, 12, 11, 10, 6, 5, 4, 3]);
+    }
+
+    #[test]
+    pub fn test_pn_offset_lags_zero_offset_sequence() {
+        let mut zero = PnSequence::new(0, 32768);
+        let zero_sequence = (0..32768).map(|_| zero.generate()).collect::<Vec<_>>();
+        let mut offset_one = PnSequence::new(1, 32768);
+        let offset_one_sequence = (0..128).map(|_| offset_one.generate()).collect::<Vec<_>>();
+
+        assert_eq!(&zero_sequence[32704..32768], &offset_one_sequence[0..64]);
+        assert_eq!(&zero_sequence[0..64], &offset_one_sequence[64..128]);
+    }
+
+    #[test]
+    pub fn test_hrpd_forward_pn_offset_lags_zero_offset_sequence() {
+        let mut zero = HrpdForwardPnSequence::new(0, 32768);
+        let zero_sequence = (0..32768).map(|_| zero.generate()).collect::<Vec<_>>();
+        let mut offset_one = HrpdForwardPnSequence::new(1, 32768);
+        let offset_one_sequence = (0..128).map(|_| offset_one.generate()).collect::<Vec<_>>();
+
+        assert_eq!(&zero_sequence[32704..32768], &offset_one_sequence[0..64]);
+        assert_eq!(&zero_sequence[0..64], &offset_one_sequence[64..128]);
+    }
+
+    #[test]
+    pub fn test_hrpd_access_terminal_pn_epoch_is_after_inserted_zero_run() {
+        let mut pn_seq = HrpdAccessTerminalPnSequence::new(0, 32768);
+        let sequence = (0..32768).map(|_| pn_seq.generate()).collect::<Vec<_>>();
+        let sequence_i_string = sequence
+            .iter()
+            .map(|x| format!("{}", x.0))
+            .collect::<Vec<_>>()
+            .join("");
+        let sequence_q_string = sequence
+            .iter()
+            .map(|x| format!("{}", x.1))
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert_eq!("1", &sequence_i_string[0..1]);
+        assert_eq!("1", &sequence_q_string[0..1]);
+        assert_eq!(
+            1,
+            sequence_i_string
+                .match_indices("000000000000000")
+                .collect::<Vec<_>>()
+                .len(),
+        );
+        assert_eq!(
+            1,
+            sequence_q_string
+                .match_indices("000000000000000")
+                .collect::<Vec<_>>()
+                .len(),
+        );
+    }
+
+    fn strip_inserted_zero(mut sequence: Vec<u8>) -> Vec<u8> {
+        let mut zeros = 0usize;
+        for idx in 0..sequence.len() {
+            if sequence[idx] == 0 {
+                zeros += 1;
+                if zeros == 15 {
+                    sequence.remove(idx);
+                    return sequence;
+                }
+            } else {
+                zeros = 0;
+            }
+        }
+        panic!("PN sequence did not contain the inserted zero");
+    }
+
+    fn assert_forward_recursion(sequence: &[u8], lags: &[usize]) {
+        assert_eq!(32_767, sequence.len());
+        for n in 15..sequence.len() {
+            let expected = lags.iter().fold(0u8, |acc, lag| acc ^ sequence[n - lag]);
+            assert_eq!(expected, sequence[n], "recursion mismatch at chip {n}");
+        }
     }
 
     /// Analyze the difference between our PN spreading convention and the

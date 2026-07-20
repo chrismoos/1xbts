@@ -1,15 +1,15 @@
 //! PDSN node configuration (loaded from `config/pdsn.json`).
 //!
-//! Currently a thin home for the legacy packet-data transport fields
-//! (`tun` vs `fou`) previously living under `cdma-bsc::config::packet`.
-//! These will be replaced when the A10 GRE bearer lands; FOU is legacy
-//! per `docs/architecture-update/02-code-migration-map.md`.
+//! Holds the packet-data transport fields (`tun` vs `fou`). FOU is the
+//! no-root transport backend; TUN is the standard path.
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
     path::Path,
 };
 
+use cdma_a10::BearerTransportConfig;
+use cdma_a11::{A11SecurityConfig, A11TransportConfig};
 use cdma_packet::mobile_ip::{MobileIpAuthMode, MobileIpConfig};
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +19,24 @@ const MIN_ENABLED_MOBILE_IP_LIFETIME_SECS: u16 = 1;
 
 fn default_ppp_session_timeout_secs() -> u64 {
     DEFAULT_PPP_SESSION_TIMEOUT_SECS
+}
+
+fn socket_addr(s: &str) -> SocketAddr {
+    s.parse().expect("static socket address should parse")
+}
+
+fn default_a10_bearer() -> BearerTransportConfig {
+    BearerTransportConfig::udp_encapsulated_gre(
+        socket_addr("127.0.0.1:17043"),
+        socket_addr("127.0.0.1:17042"),
+    )
+}
+
+fn default_a11() -> A11TransportConfig {
+    A11TransportConfig::new(
+        socket_addr("127.0.0.1:17045"),
+        socket_addr("127.0.0.1:17044"),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -121,11 +139,9 @@ impl PacketMobileIpConfig {
     }
 }
 
-/// Legacy packet-data transport configuration carried by `PdsnNodeConfig`.
+/// Packet-data transport configuration carried by `PdsnNodeConfig`.
 ///
-/// FOU is the legacy/no-root path; TUN is the standard path. Both are
-/// scheduled for replacement by the A10 GRE bearer per
-/// `docs/architecture-update/02-code-migration-map.md`.
+/// FOU is the no-root path; TUN is the standard path.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PacketTransportConfig {
@@ -205,13 +221,19 @@ impl PacketTransportConfig {
 
 /// PDSN node configuration (loaded from `config/pdsn.json`).
 ///
-/// Currently a thin wrapper around the legacy `PacketTransportConfig`. A11
-/// signaling, A10 GRE bearer, IP allocation, and TUN/host I/O fields land
-/// in WS-3 / WS-4.
+/// Wraps the packet-data transport configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PdsnNodeConfig {
     /// Packet gRPC listen address for packet service RPCs.
     pub packet_grpc_listen_addr: SocketAddr,
+    /// A10 bearer delivery toward the PCF.
+    #[serde(default = "default_a10_bearer")]
+    pub a10_bearer: BearerTransportConfig,
+    /// A11 signaling endpoint toward the PCF.
+    #[serde(default = "default_a11")]
+    pub a11: A11TransportConfig,
+    /// A11 PCF/PDSN security association.
+    pub a11_security: A11SecurityConfig,
     /// Legacy packet-data transport (TUN or FOU). Will be superseded by
     /// the A10 GRE bearer.
     #[serde(default)]
@@ -231,6 +253,9 @@ impl PdsnNodeConfig {
         if self.ppp_session_timeout_secs == 0 {
             return Err("pdsn.ppp_session_timeout_secs must be greater than zero".to_string());
         }
+        self.a10_bearer.validate("pdsn.a10_bearer")?;
+        self.a11.validate("pdsn.a11")?;
+        self.a11_security.validate("pdsn.a11_security")?;
         self.packet.validate()?;
         if self.packet.mobile_ip.enabled
             && u64::from(self.packet.mobile_ip.registration_lifetime_secs)
@@ -256,9 +281,38 @@ impl PdsnNodeConfig {
 mod tests {
     use super::*;
 
+    const TEST_A11_SHARED_SECRET_HEX: &str = "31786274732d6131312d7368617265642d736563726574";
+
+    fn test_a11_security_config() -> A11SecurityConfig {
+        // Test fixture only. Live PDSN configs must carry a11_security explicitly.
+        A11SecurityConfig {
+            spi: 256,
+            shared_secret_hex: TEST_A11_SHARED_SECRET_HEX.to_string(),
+        }
+    }
+
+    fn test_config_from_json(json: &str) -> PdsnNodeConfig {
+        let mut value: serde_json::Value = serde_json::from_str(json).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("a11_security".to_string(), test_a11_security_value());
+        serde_json::from_value(value).expect("config should deserialize")
+    }
+
+    fn test_a11_security_value() -> serde_json::Value {
+        serde_json::json!({
+            "spi": 256,
+            "shared_secret_hex": TEST_A11_SHARED_SECRET_HEX
+        })
+    }
+
     fn test_config() -> PdsnNodeConfig {
         PdsnNodeConfig {
             packet_grpc_listen_addr: "127.0.0.1:17021".parse().unwrap(),
+            a10_bearer: default_a10_bearer(),
+            a11: default_a11(),
+            a11_security: test_a11_security_config(),
             packet: PacketTransportConfig::default(),
             ppp_session_timeout_secs: DEFAULT_PPP_SESSION_TIMEOUT_SECS,
             events_endpoint: None,
@@ -280,6 +334,11 @@ mod tests {
             cfg.ppp_session_timeout_secs,
             DEFAULT_PPP_SESSION_TIMEOUT_SECS
         );
+        assert_eq!(
+            cfg.a10_bearer.udp_bind_addr,
+            Some("127.0.0.1:17043".parse().unwrap())
+        );
+        assert_eq!(cfg.a11.peer_addr, "127.0.0.1:17044".parse().unwrap());
     }
 
     #[test]
@@ -319,7 +378,7 @@ mod tests {
 
     #[test]
     fn custom_dns_values_deserialize() {
-        let cfg: PdsnNodeConfig = serde_json::from_str(
+        let cfg = test_config_from_json(
             r#"{
                 "packet_grpc_listen_addr": "127.0.0.1:17021",
                 "packet": {
@@ -329,23 +388,48 @@ mod tests {
                     "secondary_dns": "8.8.4.4"
                 }
             }"#,
-        )
-        .expect("config should deserialize");
+        );
         assert_eq!(cfg.packet.primary_dns, Ipv4Addr::new(8, 8, 8, 8));
         assert_eq!(cfg.packet.secondary_dns, Ipv4Addr::new(8, 8, 4, 4));
         cfg.validate().expect("custom DNS config should validate");
     }
 
     #[test]
+    fn raw_gre_a10_and_custom_a11_deserialize() {
+        let cfg = test_config_from_json(
+            r#"{
+                "packet_grpc_listen_addr": "127.0.0.1:17021",
+                "a10_bearer": { "mode": "raw_gre" },
+                "a11": {
+                    "bind_addr": "127.0.0.1:6992",
+                    "peer_addr": "127.0.0.1:6991"
+                },
+                "packet": { "transport": "fou_tcp", "fou_remote": "127.0.0.1:17012" }
+            }"#,
+        );
+        cfg.validate()
+            .expect("raw GRE A10 with unprivileged A11 should validate");
+        assert!(cfg.a10_bearer.udp_bind_addr.is_none());
+        assert_eq!(cfg.a11.bind_addr, "127.0.0.1:6992".parse().unwrap());
+    }
+
+    #[test]
+    fn invalid_a10_bearer_config_is_rejected() {
+        let mut cfg = test_config();
+        cfg.packet.transport = "fou_tcp".to_string();
+        cfg.a10_bearer.udp_peer_addr = None;
+        assert!(cfg.validate().unwrap_err().contains("pdsn.a10_bearer"));
+    }
+
+    #[test]
     fn ppp_session_timeout_deserializes() {
-        let cfg: PdsnNodeConfig = serde_json::from_str(
+        let cfg = test_config_from_json(
             r#"{
                 "packet_grpc_listen_addr": "127.0.0.1:17021",
                 "ppp_session_timeout_secs": 900,
                 "packet": { "transport": "fou_tcp", "fou_remote": "127.0.0.1:17012" }
             }"#,
-        )
-        .expect("config should deserialize");
+        );
         assert_eq!(cfg.ppp_session_timeout_secs, 900);
         cfg.validate().expect("timeout config should validate");
     }
@@ -362,7 +446,7 @@ mod tests {
 
     #[test]
     fn mobile_ip_config_deserializes() {
-        let cfg: PdsnNodeConfig = serde_json::from_str(
+        let cfg = test_config_from_json(
             r#"{
                 "packet_grpc_listen_addr": "127.0.0.1:17021",
                 "packet": {
@@ -379,8 +463,7 @@ mod tests {
                     }
                 }
             }"#,
-        )
-        .expect("config should deserialize");
+        );
         cfg.validate().expect("mobile IP config should validate");
         assert!(cfg.packet.mobile_ip.enabled);
         assert_eq!(cfg.packet.mobile_ip.advertisement_count, 2);
@@ -403,11 +486,26 @@ mod tests {
         let err = serde_json::from_str::<PdsnNodeConfig>(
             r#"{
                 "packet_grpc_listen_addr": "127.0.0.1:17021",
+                "a11_security": {
+                    "spi": 256,
+                    "shared_secret_hex": "31786274732d6131312d7368617265642d736563726574"
+                },
                 "packet": { "primary_dns": "not-an-ip" }
             }"#,
         )
         .expect_err("invalid DNS address should fail JSON config parsing");
         assert!(err.to_string().contains("not-an-ip") || err.to_string().contains("IPv4"));
+    }
+
+    #[test]
+    fn a11_security_is_required() {
+        let err = serde_json::from_str::<PdsnNodeConfig>(
+            r#"{
+                "packet_grpc_listen_addr": "127.0.0.1:17021"
+            }"#,
+        )
+        .expect_err("A11 security should be explicit in config");
+        assert!(err.to_string().contains("a11_security"));
     }
 
     #[test]

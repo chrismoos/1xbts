@@ -81,6 +81,12 @@ message MobileIdentityKey {
   optional string meid = 3;  // 14 hex digits
 }
 
+// Manufacturer hardware identity observed from HRPD HardwareIDResponse.
+message HardwareIdentityKey {
+  optional uint32 esn = 1;
+  optional string meid = 2;  // 14 hex digits
+}
+
 // Current serving-node registration state for one subscriber.
 message RegistrationBinding {
   string subscriber_id = 1;
@@ -214,15 +220,11 @@ message ResolveSubscriberByIdentityResponse {
   optional SubscriberIdentity primary_identity = 3;
 }
 
-// Resolves a subscriber by ESN and/or MEID alone, without requiring an
-// IMSI — for cases where the MS hasn't been programmed with an
-// MIN/IMSI yet but is identified on the air by hardware ID.
+// Resolves an ESN and/or MEID hardware identity to a provisioned subscriber.
 message ResolveSubscriberByHardwareIdentityRequest {
-  optional uint32 esn = 1;
-  optional string meid = 2;  // 14 hex digits
+  HardwareIdentityKey identity = 1;
 }
 
-// Resolved subscriber and current registration binding, if any.
 message ResolveSubscriberByHardwareIdentityResponse {
   optional Subscriber subscriber = 1;
   optional RegistrationBinding binding = 2;
@@ -364,7 +366,7 @@ service HlrService {
   rpc GetSubscriber(GetSubscriberRequest) returns (GetSubscriberResponse);
   // Resolves a complete mobile identity to subscriber state.
   rpc ResolveSubscriberByIdentity(ResolveSubscriberByIdentityRequest) returns (ResolveSubscriberByIdentityResponse);
-  // Resolves a subscriber by ESN and/or MEID alone (no IMSI required).
+  // Resolves a hardware identity observed from HRPD to subscriber state.
   rpc ResolveSubscriberByHardwareIdentity(ResolveSubscriberByHardwareIdentityRequest) returns (ResolveSubscriberByHardwareIdentityResponse);
   // Updates the serving-node registration binding for a subscriber.
   rpc UpsertRegistrationBinding(UpsertRegistrationBindingRequest) returns (UpsertRegistrationBindingResponse);
