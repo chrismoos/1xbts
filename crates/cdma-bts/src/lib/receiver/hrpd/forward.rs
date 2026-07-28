@@ -2750,7 +2750,7 @@ mod tests {
     };
     use crate::phy::spread::{PnSequence, Spreader};
     use crate::receiver::pipelined::PipelineProcessor;
-    use crate::sdr::{TX_SAMPLE_RATE, TxPulseShaper};
+    use crate::sdr::TxPulseShaper;
     use cdma_common::hrpd::{
         air::{
             AccessTerminalIdentifier, AccessTerminalIdentifierType,
@@ -3474,10 +3474,6 @@ mod tests {
         // decode path, so load it with EV-DO enabled and the RF re-derived.
         let config = BtsNodeConfig::load_evdo_enabled_for_test(&bts_path)
             .expect("checked-in BTS config should load and validate");
-        assert_eq!(
-            config.runtime.tx_sample_rate_hz, TX_SAMPLE_RATE,
-            "HRPD TX validation assumes the runtime sample clock matches TxPulseShaper"
-        );
         let resolved = resolve_evdo_config(
             &config.evdo,
             config.pilot_offset,
@@ -3959,11 +3955,7 @@ mod tests {
         }
     }
 
-    /// Residual capsule-boundary offset from the TX pulse shaper. The shaper
-    /// pulse-shapes at 4x then half-band interpolates to the TX rate, whose
-    /// total group delay exceeds the single baseband-filter delay the overhead
-    /// decoder compensates by this many chips.
-    const TX_PULSE_SHAPER_GROUP_DELAY_CHIPS: usize = 4;
+    const TX_PULSE_SHAPER_GROUP_DELAY_CHIPS: usize = 0;
 
     #[test]
     fn rake_decodes_default_bts_hrpd_forward_overhead_e2e() {

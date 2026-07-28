@@ -1053,14 +1053,14 @@ mod tests {
         let plan = resolve_reverse_rx_plan(&bts).expect("resolve reverse RX plan");
         assert!(plan.configure_rx);
         assert_eq!(plan.target, ReverseRxTarget::Composite);
-        assert_eq!(plan.center_frequency_hz, 846_105_000);
-        assert_eq!(plan.one_x_reverse_frequency_hz, 848_310_000);
-        assert_eq!(plan.one_x_rx_shift_hz, 2_205_000);
+        assert_eq!(plan.center_frequency_hz, 844_815_000);
+        assert_eq!(plan.one_x_reverse_frequency_hz, 845_730_000);
+        assert_eq!(plan.one_x_rx_shift_hz, 915_000);
         assert_eq!(plan.hrpd_reverse_frequency_hz, Some(843_900_000));
-        assert_eq!(plan.hrpd_rx_shift_hz, Some(-2_205_000));
-        assert_eq!(plan.sample_rate_hz, 9_830_400);
-        assert_eq!(plan.bandwidth_hz, 5_890_000);
-        assert_eq!(plan.required_bandwidth_hz, Some(5_890_000));
+        assert_eq!(plan.hrpd_rx_shift_hz, Some(-915_000));
+        assert_eq!(plan.sample_rate_hz, 4_915_200);
+        assert_eq!(plan.bandwidth_hz, 3_310_000);
+        assert_eq!(plan.required_bandwidth_hz, Some(3_310_000));
     }
 
     #[test]
@@ -1077,8 +1077,8 @@ mod tests {
         assert!(plan.configure_rx);
         assert_eq!(plan.target, ReverseRxTarget::Composite);
         assert_eq!(plan.hrpd_reverse_frequency_hz, Some(843_900_000));
-        assert_eq!(plan.sample_rate_hz, 9_830_400);
-        assert_eq!(plan.bandwidth_hz, 5_890_000);
-        assert_eq!(plan.required_bandwidth_hz, Some(5_890_000));
+        assert_eq!(plan.sample_rate_hz, 4_915_200);
+        assert_eq!(plan.bandwidth_hz, 3_310_000);
+        assert_eq!(plan.required_bandwidth_hz, Some(3_310_000));
     }
 }

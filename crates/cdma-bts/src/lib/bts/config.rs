@@ -776,16 +776,16 @@ mod tests {
         use cdma_common::band_class::BandClass;
         assert_eq!(cfg.channel.band_class, BandClass::Bc0);
         assert_eq!(cfg.channel.band_subclass, 0);
-        assert_eq!(cfg.channel.cdma_channel, 777);
-        assert_eq!(cfg.channel.downlink_hz(), 893_310_000);
-        assert_eq!(cfg.channel.uplink_hz(), 848_310_000);
+        assert_eq!(cfg.channel.cdma_channel, 691);
+        assert_eq!(cfg.channel.downlink_hz(), 890_730_000);
+        assert_eq!(cfg.channel.uplink_hz(), 845_730_000);
         assert!(cfg.runtime.tx_freq_hz_override.is_none());
         assert_eq!(cfg.evdo.channel, Some(630));
         assert_eq!(cfg.evdo.tx_mode(), evdo::EvdoTxMode::AdjacentComposite);
-        assert_eq!(cfg.runtime.tx_sample_rate_hz, 9_830_400);
-        assert_eq!(cfg.runtime.tx_bandwidth_hz, 5_890_000);
-        assert_eq!(cfg.rf.rx_sample_rate_hz, 9_830_400);
-        assert_eq!(cfg.rf.rx_bandwidth_hz, 5_890_000);
+        assert_eq!(cfg.runtime.tx_sample_rate_hz, 4_915_200);
+        assert_eq!(cfg.runtime.tx_bandwidth_hz, 3_310_000);
+        assert_eq!(cfg.rf.rx_sample_rate_hz, 4_915_200);
+        assert_eq!(cfg.rf.rx_bandwidth_hz, 3_310_000);
         let resolved = evdo::resolve_evdo_config(
             &cfg.evdo,
             cfg.pilot_offset,
@@ -795,14 +795,14 @@ mod tests {
         )
         .expect("resolve evdo")
         .expect("evdo enabled");
-        assert_eq!(resolved.one_x_channel, 777);
-        assert_eq!(resolved.one_x_frequency_hz, 893_310_000);
+        assert_eq!(resolved.one_x_channel, 691);
+        assert_eq!(resolved.one_x_frequency_hz, 890_730_000);
         assert_eq!(resolved.evdo_channel, 630);
         assert_eq!(resolved.evdo_frequency_hz, 888_900_000);
         assert_eq!(resolved.evdo_reverse_frequency_hz, 843_900_000);
-        assert_eq!(resolved.composite_center_frequency_hz, 891_105_000);
-        assert_eq!(resolved.one_x_shift_hz, 2_205_000);
-        assert_eq!(resolved.evdo_shift_hz, -2_205_000);
+        assert_eq!(resolved.composite_center_frequency_hz, 889_815_000);
+        assert_eq!(resolved.one_x_shift_hz, 915_000);
+        assert_eq!(resolved.evdo_shift_hz, -915_000);
         assert_eq!(
             cfg.evdo
                 .overhead
