@@ -3624,7 +3624,7 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
     });
 
     // 16k * 512-chip blocks = 8,192,000 chips ~= 6.7 s of airtime.
-    bts.run_for_blocks(16_000).await?;
+    bts.run_for_blocks_realtime(16_000).await?;
     drop(_bts_handle);
 
     let _ = lac_worker.join().unwrap();
@@ -3995,7 +3995,7 @@ async fn run_sync_overhead_window_case(
         all
     });
 
-    bts.run_for_blocks(blocks).await?;
+    bts.run_for_blocks_realtime(blocks).await?;
     drop(_bts_handle);
 
     let _ = lac_worker.join().unwrap();

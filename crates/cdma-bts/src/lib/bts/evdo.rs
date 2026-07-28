@@ -2081,11 +2081,11 @@ mod modulator_tests {
             TRAFFIC_ASSIGNMENT_REPEAT_OFFSETS_SLOTS.len()
         );
 
-        let first_repeat_slot = TRAFFIC_ASSIGNMENT_REPEAT_OFFSETS_SLOTS[0];
+        let first_available_async_slot = hrpd_control_packet_slot_span();
         let _ = block(
             &mut m,
             SLOT_CHIPS * 8,
-            (SLOT_CHIPS * (first_repeat_slot - 8 + 8)) as usize,
+            (SLOT_CHIPS * (first_available_async_slot - 8 + 1)) as usize,
         );
         assert_eq!(m.pending_signaling.len(), 0);
         assert_eq!(

@@ -765,13 +765,11 @@ mod tests {
             .join("../../config/bts.json")
             .canonicalize()
             .expect("canonicalize");
-        // The shipped config ships EV-DO off; pin that, then load it with EV-DO
-        // enabled for the composite-resolution assertions below.
+        let shipped: BtsNodeConfigFile =
+            serde_json::from_slice(&fs::read(&path).expect("read config/bts.json"))
+                .expect("parse config/bts.json");
         assert!(
-            !BtsNodeConfig::load_from_path(&path)
-                .expect("load config/bts.json")
-                .evdo
-                .enabled,
+            !shipped.evdo.enabled,
             "shipped config should default EV-DO off"
         );
         let cfg = BtsNodeConfig::load_evdo_enabled_for_test(&path).expect("load config/bts.json");

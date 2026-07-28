@@ -531,7 +531,11 @@ impl Bts {
         Ok(())
     }
 
-    fn run_loop(mut self, max_blocks: Option<usize>) -> Result<(), Error> {
+    fn run_loop(
+        mut self,
+        max_blocks: Option<usize>,
+        pace_to_hardware_time: bool,
+    ) -> Result<(), Error> {
         self.runtime.validate()?;
         self.configure_radio()?;
 
@@ -840,7 +844,7 @@ impl Bts {
             }
 
             let batch_playout_tick = timing::batch_playout_tick(&state, chip_cursor, tick_rate);
-            if max_blocks.is_none() && self.runtime.max_tx_lookahead_ms > 0 {
+            if pace_to_hardware_time && self.runtime.max_tx_lookahead_ms > 0 {
                 pacer.wait_until_within_tx_lookahead(
                     batch_playout_tick,
                     wall_anchor_tick,
@@ -1294,7 +1298,7 @@ impl Bts {
             .name("bts-tx".into())
             .spawn(move || {
                 set_thread_priority("bts-tx", true);
-                let result = self.run_loop(None);
+                let result = self.run_loop(None, true);
                 let _ = tx.send(result);
             })
             .map_err(|e| Error::from(format!("failed to spawn TX thread: {}", e)))?;
@@ -1309,7 +1313,22 @@ impl Bts {
             .name("bts-tx".into())
             .spawn(move || {
                 set_thread_priority("bts-tx", true);
-                let result = self.run_loop(Some(blocks));
+                let result = self.run_loop(Some(blocks), false);
+                let _ = tx.send(result);
+            })
+            .map_err(|e| Error::from(format!("failed to spawn TX thread: {}", e)))?;
+        rx.await
+            .map_err(|_| Error::from("BTS TX thread panicked"))?
+    }
+
+    /// Run a bounded BTS TX loop with hardware-time pacing.
+    pub async fn run_for_blocks_realtime(self, blocks: usize) -> Result<(), Error> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        thread::Builder::new()
+            .name("bts-tx".into())
+            .spawn(move || {
+                set_thread_priority("bts-tx", true);
+                let result = self.run_loop(Some(blocks), true);
                 let _ = tx.send(result);
             })
             .map_err(|e| Error::from(format!("failed to spawn TX thread: {}", e)))?;
