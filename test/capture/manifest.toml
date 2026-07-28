@@ -1,5 +1,5 @@
-version = "capture-ci-6648d1b"
-archive_name = "capture-ci-6648d1b.tar.zst"
-archive_url = "https://ci.1xbts.org/captures/capture-ci-6648d1b.tar.zst"
-archive_sha256 = "11aa5e29a14ef75dd59e4e14adf4a9e71ce9348b964e8f2afc402a7c6c4955ab"
-archive_size = 5221288841
+version = "capture-ci-00d88b8e"
+archive_name = "capture-ci-00d88b8e.tar.zst"
+archive_url = "https://ci.1xbts.org/captures/capture-ci-00d88b8e.tar.zst"
+archive_sha256 = "2dde8edb5e1b59a86366e72f4f3f2c2970c675da5848e224f2a0bb55bfc78234"
+archive_size = 8489315704
