@@ -99,10 +99,7 @@ unsafe fn symmetric_complex_accumulate_sse(
     head: usize,
     last: usize,
 ) -> Complex32 {
-    use std::arch::x86_64::{
-        _mm_add_ps, _mm_add_ss, _mm_cvtss_f32, _mm_loadu_ps, _mm_movehl_ps, _mm_mul_ps,
-        _mm_setzero_ps, _mm_shuffle_ps,
-    };
+    use std::arch::x86_64::{_mm_add_ps, _mm_loadu_ps, _mm_mul_ps, _mm_setzero_ps, _mm_shuffle_ps};
 
     let chunks = taps.len() / 4;
     let mut acc_re = _mm_setzero_ps();
@@ -120,8 +117,8 @@ unsafe fn symmetric_complex_accumulate_sse(
         acc_im = _mm_add_ps(acc_im, _mm_mul_ps(coeff, _mm_add_ps(front_im, back_im)));
     }
 
-    let mut re = hsum_f32x4_sse(acc_re);
-    let mut im = hsum_f32x4_sse(acc_im);
+    let mut re = unsafe { hsum_f32x4_sse(acc_re) };
+    let mut im = unsafe { hsum_f32x4_sse(acc_im) };
 
     for i in (chunks * 4)..taps.len() {
         unsafe {
@@ -353,8 +350,8 @@ unsafe fn dot_re_im_sse(taps: &[f32], re: &[f32], im: &[f32]) -> (f32, f32) {
         acc_re = _mm_add_ps(acc_re, _mm_mul_ps(coeff, lane_re));
         acc_im = _mm_add_ps(acc_im, _mm_mul_ps(coeff, lane_im));
     }
-    let mut sum_re = hsum_f32x4_sse(acc_re);
-    let mut sum_im = hsum_f32x4_sse(acc_im);
+    let mut sum_re = unsafe { hsum_f32x4_sse(acc_re) };
+    let mut sum_im = unsafe { hsum_f32x4_sse(acc_im) };
     for i in (chunks * 4)..taps.len() {
         unsafe {
             let coeff = *taps.get_unchecked(i);
