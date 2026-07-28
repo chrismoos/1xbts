@@ -118,8 +118,7 @@ pub fn resolve_reverse_rx_plan(bts_config: &BtsNodeConfig) -> Result<ReverseRxPl
 
     let hrpd_reverse_frequency_hz = evdo.evdo_reverse_frequency_hz;
     let carrier_separation_hz = one_x_reverse_frequency_hz.abs_diff(hrpd_reverse_frequency_hz);
-    let required_bandwidth_hz =
-        carrier_separation_hz + (super::evdo::SR1_OCCUPIED_HALF_BW_HZ.max(0) as usize * 2);
+    let required_bandwidth_hz = carrier_separation_hz + super::evdo::SR1_OCCUPIED_BANDWIDTH_HZ;
     if sample_rate_hz < required_bandwidth_hz {
         return Err(format!(
             "rx: EV-DO reverse composite requires rx_sample_rate_hz >= {} to capture 1x reverse {} Hz and HRPD reverse {} Hz (separation={} Hz, occupied half-BW={} Hz); configured rx_sample_rate_hz={}",

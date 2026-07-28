@@ -404,7 +404,7 @@ impl BtsRfProfile {
 }
 
 fn required_composite_bandwidth_hz(one_x_hz: usize, hrpd_hz: usize) -> usize {
-    one_x_hz.abs_diff(hrpd_hz) + (evdo::SR1_OCCUPIED_HALF_BW_HZ as usize * 2)
+    one_x_hz.abs_diff(hrpd_hz) + evdo::SR1_OCCUPIED_BANDWIDTH_HZ
 }
 
 /// BTS-owned Abis timers per A.S0003-A §8 Table 8-1.
@@ -974,6 +974,77 @@ mod tests {
         let err = BtsNodeConfig::load_from_path(&config_path).expect_err("expected config error");
         assert!(
             err.to_string().contains("16x sample-rate cap"),
+            "unexpected error: {err}"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn loads_non_overlapping_composite_evdo_carriers() {
+        let dir = temp_test_dir("evdo-composite-non-overlapping-carriers");
+        let config_path = dir.join("bts.json");
+
+        fs::write(
+            &config_path,
+            r#"{
+  "channel": {
+    "band_class": "bc0",
+    "band_subclass": 0,
+    "cdma_channel": 110
+  },
+  "radio": { "kind": "noop" },
+  "evdo": {
+    "enabled": true,
+    "channel": 160,
+    "overhead": {
+      "sector_id": "00800580000000000000000000000000",
+      "subnet_mask": 26,
+      "color_code": 26
+    }
+  }
+}
+"#,
+        )
+        .expect("write bts config");
+
+        let cfg = BtsNodeConfig::load_from_path(&config_path).expect("load config");
+        assert_eq!(cfg.runtime.tx_sample_rate_hz, 4_915_200);
+        assert_eq!(cfg.runtime.tx_bandwidth_hz, 2_980_000);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn rejects_overlapping_composite_evdo_carriers() {
+        let dir = temp_test_dir("evdo-composite-overlapping-carriers");
+        let config_path = dir.join("bts.json");
+
+        fs::write(
+            &config_path,
+            r#"{
+  "channel": {
+    "band_class": "bc0",
+    "band_subclass": 0,
+    "cdma_channel": 157
+  },
+  "radio": { "kind": "noop" },
+  "evdo": {
+    "enabled": true,
+    "channel": 160,
+    "overhead": {
+      "sector_id": "00800580000000000000000000000000",
+      "subnet_mask": 26,
+      "color_code": 26
+    }
+  }
+}
+"#,
+        )
+        .expect("write bts config");
+
+        let err = BtsNodeConfig::load_from_path(&config_path).expect_err("expected config error");
+        assert!(
+            err.to_string()
+                .contains("evdo.channel must be at least 1480000 Hz from bts.channel"),
             "unexpected error: {err}"
         );
         fs::remove_dir_all(dir).ok();

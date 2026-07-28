@@ -2,7 +2,7 @@
   "channel": {
     "band_class": "bc0",
     "band_subclass": 0,
-    "cdma_channel": 777
+    "cdma_channel": 691
   },
   "pilot_offset": 0,
   "evdo": {

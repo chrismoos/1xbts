@@ -37,9 +37,7 @@ use cdma_common::hrpd::messages::{
 /// Conservative occupied half-bandwidth for one SR1 CDMA/HRPD carrier. Used
 /// only to validate whether two synthesized carriers fit in one RF bandwidth.
 pub const SR1_OCCUPIED_HALF_BW_HZ: i64 = 740_000;
-/// Guardrail for single-RF composite 1x + EV-DO operation. This is an SDR
-/// tuning minimum, not an HRPD air-interface constant.
-const MIN_SINGLE_RF_COMPOSITE_TX_BANDWIDTH_HZ: usize = 5_000_000;
+pub const SR1_OCCUPIED_BANDWIDTH_HZ: usize = SR1_OCCUPIED_HALF_BW_HZ as usize * 2;
 /// Maximum span, in slots, for an in-flight Control packet at the selected
 /// Forward Control Channel rate.
 fn hrpd_control_packet_slot_span() -> u64 {
@@ -613,9 +611,15 @@ pub fn resolve_evdo_config(
     let (composite_center_frequency_hz, one_x_shift_hz, evdo_shift_hz) = match tx_mode {
         EvdoTxMode::AdjacentComposite => {
             let carrier_separation_hz = one_x_frequency_hz.abs_diff(evdo_frequency_hz);
-            let required_tx_bandwidth_hz = (carrier_separation_hz
-                + (SR1_OCCUPIED_HALF_BW_HZ as usize * 2))
-                .max(MIN_SINGLE_RF_COMPOSITE_TX_BANDWIDTH_HZ);
+            if carrier_separation_hz < SR1_OCCUPIED_BANDWIDTH_HZ {
+                return Err(format!(
+                    "evdo.channel must be at least {} Hz from bts.channel in composite mode \
+                     to avoid carrier overlap (current separation={} Hz)",
+                    SR1_OCCUPIED_BANDWIDTH_HZ, carrier_separation_hz
+                )
+                .into());
+            }
+            let required_tx_bandwidth_hz = carrier_separation_hz + SR1_OCCUPIED_BANDWIDTH_HZ;
             if tx_bandwidth_hz < required_tx_bandwidth_hz {
                 return Err(format!(
                     "evdo requires tx_bandwidth_hz >= {} for single-RF composite mode \

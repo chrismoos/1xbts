@@ -1,5 +1,6 @@
 # HEAD 
 
+- EV-DO composite mode now accepts adjacent 1x and HRPD carriers when their occupied bandwidths do not overlap.
 - Added initial EV-DO (HRPD) support. Rev 0 and Rev A devices are supported.
 - Fixed `*228` failed PRL decode for Extended PRLs that responded to a
   non-Extended PRL Dimensions request.
