@@ -6023,12 +6023,16 @@ mod tests {
             rt_ratio,
             backlog_at_push_done,
         );
-        // This normally exceeds 2.0x, but requiring that on shared CI runners
-        // is too aggressive.
-        const MIN_REALTIME_RATIO: f64 = 1.25;
+        const MIN_REALTIME_RATIO: f64 = 5.0;
+        const CI_MIN_REALTIME_RATIO: f64 = 4.0;
+        let min_realtime_ratio = if std::env::var_os("CI").is_some() {
+            CI_MIN_REALTIME_RATIO
+        } else {
+            MIN_REALTIME_RATIO
+        };
         assert!(
-            rt_ratio >= MIN_REALTIME_RATIO,
-            "HRPD {}: reverse-traffic RX below the {MIN_REALTIME_RATIO:.2}x realtime floor (rt_ratio={rt_ratio:.2}x, airtime={capture_airtime_s:.3}s wall={:.3}s)",
+            rt_ratio >= min_realtime_ratio,
+            "HRPD {}: reverse-traffic RX below the {min_realtime_ratio:.2}x realtime floor (rt_ratio={rt_ratio:.2}x, airtime={capture_airtime_s:.3}s wall={:.3}s)",
             fixture.label,
             processing_wall.as_secs_f64(),
         );
@@ -6356,11 +6360,11 @@ mod tests {
             physical_layer_subtype: 2,
             reverse_traffic_mac_subtype: 3,
             // Locked baseline for the fixed subtype-2 RRI: 50 signaling and
-            // 37 data-stream packets decode from this session, including the
+            // 38 data-stream packets decode from this session, including the
             // AT's TrafficChannelComplete, a RouteUpdate, and the PPP LCP
             // Configure-Request train.
             expected_stream0_events: Some(50),
-            expected_stream1_events: Some(37),
+            expected_stream1_events: Some(38),
             expected_stream0_payloads: &[
                 // SLP-D reliable, Route Update (0x0e), TrafficChannelComplete.
                 &[0x01, 0x88, 0x0e, 0x02, 0x00],

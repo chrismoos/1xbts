@@ -77,16 +77,8 @@ const HRPD_SUBFRAME_PHASE_DIAG_REPORTS_MAX: u32 = 48;
 const HRPD_SUBFRAME_RRI_MIN_MARGIN: f32 = 0.25;
 const HRPD_SUBFRAME_RRI_MIN_MARGIN_NORM: f32 = 0.06;
 const HRPD_SUBFRAME_SUMMARY_WINDOW_SLOTS: u64 = 2400;
-// When a sub-frame's pilot coherence is below this, re-search the despread
-// `sample_delay` around the tracked value: a high-T2P data burst drifts the
-// RPC-tracked timing off the eye, and the W0 pilot coherence (orthogonal to
-// the data) recovers the correct delay.
-const HRPD_SUBFRAME_TIMING_RELOCK_COHERENCE: f32 = 0.9;
-const HRPD_SUBFRAME_TIMING_SEARCH_SAMPLES: i32 = 2;
-const HRPD_SUBFRAME_TIMING_SEARCH_FRACTIONS: &[f32] = &[-0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75];
-/// A stale finger must not pin the single-finger rake throughout a normal
-/// inter-RAT tune-away. Retire it after sustained loss so the assignment can
-/// return to full FFT acquisition without declaring the traffic channel lost.
+/// A stale finger must not pin the single-finger rake after sustained failure
+/// to reacquire. Retire it so the assignment can return to full FFT acquisition.
 const HRPD_REVERSE_TRAFFIC_REACQUIRE_TIMEOUT_CHIPS: u64 = HRPD_CHIP_RATE_HZ / 2;
 const HRPD_REVERSE_TRAFFIC_PILOT_LOSS_TIMEOUT_CHIPS: u64 = 5 * HRPD_CHIP_RATE_HZ;
 const HRPD_REVERSE_TRAFFIC_PILOT_REPORT_INTERVAL_CHIPS: u64 = HRPD_CHIP_RATE_HZ;
@@ -200,14 +192,13 @@ const HRPD_TIMING_TRACK_REPORTS_MAX: u32 = 8;
 // so do not run them on every low-coherence frame/slot. Keeping the IQ timeline
 // contiguous matters more than spending all CPU on repeated no-lock searches.
 const HRPD_TIMING_TRACK_LOST_INTERVAL_FRAMES: u32 = 4;
-// RPC decisions happen before a full 16-slot frame is available, so the slot
-// metric needs its own cheap timing check. Otherwise a drifting sample delay
-// makes the power loop correct receiver timing error as if it were AT power.
-const HRPD_RPC_TIMING_TRACK_INTERVAL_SLOTS: u32 = 8;
-const HRPD_RPC_TIMING_TRACK_LOST_INTERVAL_SLOTS: u32 = 16;
-const HRPD_RPC_TIMING_TRACK_MIN_SNR_IMPROVEMENT_DB: f32 = 2.0;
 const HRPD_RPC_TIMING_TRACK_REPORTS_MAX: u32 = 12;
 const HRPD_RPC_CLEAN_DIAG_MIN_COHERENCE: f32 = 0.90;
+const HRPD_TIMING_REACQUIRE_MIN_COHERENCE: f32 = 0.90;
+const HRPD_TIMING_REACQUIRE_UNRELIABLE_SLOTS: u8 = 4;
+const HRPD_TIMING_REACQUIRE_CONFIRM_SLOTS: u8 = 2;
+const HRPD_TIMING_REACQUIRE_SEARCH_INITIAL_SLOTS: u32 = 16;
+const HRPD_TIMING_REACQUIRE_SEARCH_MAX_SLOTS: u32 = 128;
 
 mod fast_drc;
 
@@ -792,9 +783,13 @@ pub struct HrpdReverseTrafficFinger {
     frames_since_timing_refine: u32,
     frames_since_lost_timing_refine: u32,
     timing_refine_reports: u32,
-    rpc_slots_since_timing_refine: u32,
-    rpc_slots_since_lost_timing_refine: u32,
     rpc_timing_refine_reports: u32,
+    timing_state: HrpdTrafficTimingState,
+    timing_unreliable_slots: u8,
+    timing_reacquire_confirm_slots: u8,
+    timing_reacquire_search_wait_slots: u32,
+    timing_reacquire_search_interval_slots: u32,
+    timing_last_pilot_reliable: bool,
     /// Per-slot reverse power-control loop (predictor + HRPD RPC decision).
     rpc: HrpdRpcController,
     /// Low-latency DRC publisher. The frame-rate DRC processor still fills
@@ -851,6 +846,12 @@ pub struct HrpdReverseTrafficFinger {
     next_drc_window_chip: u64,
     spawn_chip: u64,
     last_block_processed_chips: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HrpdTrafficTimingState {
+    Tracking,
+    Reacquiring,
 }
 
 #[derive(Debug, Default)]
@@ -956,9 +957,13 @@ impl HrpdReverseTrafficFinger {
             frames_since_timing_refine: 0,
             frames_since_lost_timing_refine: HRPD_TIMING_TRACK_LOST_INTERVAL_FRAMES,
             timing_refine_reports: 0,
-            rpc_slots_since_timing_refine: 0,
-            rpc_slots_since_lost_timing_refine: HRPD_RPC_TIMING_TRACK_LOST_INTERVAL_SLOTS,
             rpc_timing_refine_reports: 0,
+            timing_state: HrpdTrafficTimingState::Tracking,
+            timing_unreliable_slots: 0,
+            timing_reacquire_confirm_slots: 0,
+            timing_reacquire_search_wait_slots: 0,
+            timing_reacquire_search_interval_slots: HRPD_TIMING_REACQUIRE_SEARCH_INITIAL_SLOTS,
+            timing_last_pilot_reliable: true,
             rpc: HrpdRpcController::new(),
             fast_drc_decoder: DrcDecoder::new(drc_cover),
             fast_drc_candidate_slot: None,
@@ -1423,40 +1428,7 @@ impl HrpdReverseTrafficFinger {
                 self.maybe_report_subframe_stats(start_slot);
                 continue;
             };
-            let mut moments = pilot_moments_from_subtype2_slot_regions(&chips, 4);
-            // Reverse data runs at high T2P, so a data sub-frame collapses the
-            // per-slot pilot metric the RPC loop tracks timing with, drifting
-            // the despread `sample_delay` off the eye — the sub-frame then reads
-            // as low-coherence and the data never decodes. The W0 pilot is Walsh
-            // orthogonal to the Data Channel, so its coherence over the whole
-            // 4-slot sub-frame still peaks at the correct timing: re-lock the
-            // delay here and carry it forward so tracking follows the burst.
-            if moments.coherence < HRPD_SUBFRAME_TIMING_RELOCK_COHERENCE {
-                for dd in -HRPD_SUBFRAME_TIMING_SEARCH_SAMPLES..=HRPD_SUBFRAME_TIMING_SEARCH_SAMPLES
-                {
-                    for &ff in HRPD_SUBFRAME_TIMING_SEARCH_FRACTIONS {
-                        let d = sample_delay + dd;
-                        if let Some(cand) = despread_chips_with_reference(
-                            &self.buffer,
-                            buf_abs,
-                            oversample as usize,
-                            start_chip,
-                            d,
-                            ff,
-                            Complex32::new(1.0, 0.0),
-                            &self.ref_conj[ref_range.clone()],
-                        ) {
-                            let cand_moments = pilot_moments_from_subtype2_slot_regions(&cand, 4);
-                            if cand_moments.coherence > moments.coherence {
-                                moments = cand_moments;
-                                chips = cand;
-                                self.next_params.sample_delay = d;
-                                self.next_params.sample_delay_fraction = ff;
-                            }
-                        }
-                    }
-                }
-            }
+            let moments = pilot_moments_from_subtype2_slot_regions(&chips, 4);
             if moments.coherence < HRPD_REVERSE_TRAFFIC_PILOT_MIN_COHERENCE {
                 self.subframe_stats.total = self.subframe_stats.total.saturating_add(1);
                 self.subframe_stats.low_coherence =
@@ -1990,29 +1962,6 @@ impl HrpdReverseTrafficFinger {
         best
     }
 
-    fn rpc_timing_refinement_radius(&mut self, current_coherence: f32) -> Option<f32> {
-        if current_coherence < HRPD_REVERSE_TRAFFIC_PILOT_MIN_COHERENCE {
-            self.rpc_slots_since_timing_refine = 0;
-            self.rpc_slots_since_lost_timing_refine =
-                self.rpc_slots_since_lost_timing_refine.saturating_add(1);
-            if self.rpc_slots_since_lost_timing_refine >= HRPD_RPC_TIMING_TRACK_LOST_INTERVAL_SLOTS
-            {
-                self.rpc_slots_since_lost_timing_refine = 0;
-                return Some(HRPD_TIMING_TRACK_LOST_RADIUS_SAMPLES);
-            }
-            return None;
-        }
-
-        self.rpc_slots_since_lost_timing_refine = HRPD_RPC_TIMING_TRACK_LOST_INTERVAL_SLOTS;
-        self.rpc_slots_since_timing_refine = self.rpc_slots_since_timing_refine.saturating_add(1);
-        if self.rpc_slots_since_timing_refine >= HRPD_RPC_TIMING_TRACK_INTERVAL_SLOTS {
-            self.rpc_slots_since_timing_refine = 0;
-            Some(HRPD_TIMING_TRACK_NORMAL_RADIUS_SAMPLES)
-        } else {
-            None
-        }
-    }
-
     fn timing_refinement_radius(&mut self, current_coherence: f32) -> Option<f32> {
         if current_coherence < HRPD_REVERSE_TRAFFIC_PILOT_MIN_COHERENCE {
             self.frames_since_timing_refine = 0;
@@ -2033,6 +1982,90 @@ impl HrpdReverseTrafficFinger {
         } else {
             None
         }
+    }
+
+    fn update_timing_state(
+        &mut self,
+        measured_slot: u64,
+        moments: PilotMoments,
+        raw_power_dbfs: f32,
+    ) -> bool {
+        let pilot_reliable =
+            moments.snr_db.is_finite() && moments.coherence >= HRPD_TIMING_REACQUIRE_MIN_COHERENCE;
+        self.timing_last_pilot_reliable = pilot_reliable;
+
+        if self.timing_state == HrpdTrafficTimingState::Tracking {
+            if pilot_reliable {
+                self.timing_unreliable_slots = 0;
+            } else {
+                self.timing_unreliable_slots = self
+                    .timing_unreliable_slots
+                    .saturating_add(1)
+                    .min(HRPD_TIMING_REACQUIRE_UNRELIABLE_SLOTS);
+            }
+            if self.timing_unreliable_slots >= HRPD_TIMING_REACQUIRE_UNRELIABLE_SLOTS {
+                info!(
+                    "rx_hrpd_traffic[m{}]: timing_reacquiring uati=0x{:08x} slot={} delay={}+{:+.2} coherence={:.3} raw={:.1}dBFS raw_ref={:.1}dBFS",
+                    self.config.mac_index,
+                    self.config.uati,
+                    measured_slot,
+                    self.next_params.sample_delay,
+                    self.next_params.sample_delay_fraction,
+                    moments.coherence,
+                    raw_power_dbfs,
+                    self.rpc.quiet_reliable_raw_power_dbfs,
+                );
+                self.timing_state = HrpdTrafficTimingState::Reacquiring;
+                self.timing_unreliable_slots = 0;
+                self.timing_reacquire_confirm_slots = 0;
+                self.timing_reacquire_search_wait_slots =
+                    u32::from(HRPD_TIMING_REACQUIRE_UNRELIABLE_SLOTS);
+                self.timing_reacquire_search_interval_slots =
+                    HRPD_TIMING_REACQUIRE_SEARCH_INITIAL_SLOTS;
+            }
+        }
+
+        if self.timing_state == HrpdTrafficTimingState::Reacquiring {
+            if pilot_reliable {
+                self.timing_reacquire_confirm_slots = self
+                    .timing_reacquire_confirm_slots
+                    .saturating_add(1)
+                    .min(HRPD_TIMING_REACQUIRE_CONFIRM_SLOTS);
+            } else {
+                self.timing_reacquire_confirm_slots = 0;
+            }
+            if self.timing_reacquire_confirm_slots >= HRPD_TIMING_REACQUIRE_CONFIRM_SLOTS {
+                self.timing_state = HrpdTrafficTimingState::Tracking;
+                self.timing_reacquire_confirm_slots = 0;
+                info!(
+                    "rx_hrpd_traffic[m{}]: timing_reacquired uati=0x{:08x} slot={} delay={}+{:+.2} coherence={:.3} raw={:.1}dBFS raw_ref={:.1}dBFS",
+                    self.config.mac_index,
+                    self.config.uati,
+                    measured_slot,
+                    self.next_params.sample_delay,
+                    self.next_params.sample_delay_fraction,
+                    moments.coherence,
+                    raw_power_dbfs,
+                    self.rpc.quiet_reliable_raw_power_dbfs,
+                );
+                return false;
+            }
+        }
+
+        if self.timing_state != HrpdTrafficTimingState::Reacquiring || pilot_reliable {
+            return false;
+        }
+        self.timing_reacquire_search_wait_slots =
+            self.timing_reacquire_search_wait_slots.saturating_add(1);
+        if self.timing_reacquire_search_wait_slots < self.timing_reacquire_search_interval_slots {
+            return false;
+        }
+        self.timing_reacquire_search_wait_slots = 0;
+        self.timing_reacquire_search_interval_slots = self
+            .timing_reacquire_search_interval_slots
+            .saturating_mul(2)
+            .min(HRPD_TIMING_REACQUIRE_SEARCH_MAX_SLOTS);
+        true
     }
 
     fn maybe_emit_reverse_pilot_lost(&mut self, moments: PilotMoments) {
@@ -2294,7 +2327,24 @@ impl HrpdReverseTrafficFinger {
                 return;
             };
             let mut moments = pilot_moments_from_slot(&despread);
-            if let Some(radius_samples) = self.rpc_timing_refinement_radius(moments.coherence) {
+            let region_base = (region_start_sample - buf_abs as i64).max(0) as usize;
+            let region_samples = (pilot_region_len * oversample as usize)
+                .min(self.buffer.len().saturating_sub(region_base));
+            let raw_power_dbfs = if region_samples > 0 {
+                let power = self.buffer[region_base..region_base + region_samples]
+                    .iter()
+                    .map(|s| s.norm_sqr() as f64)
+                    .sum::<f64>()
+                    / region_samples as f64;
+                10.0 * (power.max(1.0e-12).log10() as f32)
+            } else {
+                f32::NAN
+            };
+            let measured_slot = slot_chip / HRPD_SLOT_CHIPS as u64;
+            self.rpc.observe_raw_power(raw_power_dbfs);
+            let reacquire_search_due =
+                self.update_timing_state(measured_slot, moments, raw_power_dbfs);
+            if reacquire_search_due {
                 let ref_slice = &self.ref_conj[ref_range.clone()];
                 let best = self.best_rpc_slot_timing_candidate(
                     &self.buffer,
@@ -2302,35 +2352,25 @@ impl HrpdReverseTrafficFinger {
                     oversample as usize,
                     region_start_chip,
                     ref_slice,
-                    radius_samples,
+                    HRPD_TIMING_TRACK_LOST_RADIUS_SAMPLES,
                 );
                 if let Some(best) = best {
                     let current_delay = self.next_params.sample_delay;
                     let current_fraction = self.next_params.sample_delay_fraction;
                     let delay_changed = current_delay != best.sample_delay
                         || (current_fraction - best.sample_delay_fraction).abs() > 1.0e-3;
-                    let current_locked =
-                        moments.coherence >= HRPD_REVERSE_TRAFFIC_PILOT_MIN_COHERENCE;
-                    let best_locked =
-                        best.moments.coherence >= HRPD_REVERSE_TRAFFIC_PILOT_MIN_COHERENCE;
-                    let recovered_lock = !current_locked
-                        && best.moments.coherence >= HRPD_TIMING_TRACK_RELOCK_MIN_COHERENCE
-                        && best.moments.snr_db >= HRPD_TIMING_TRACK_RELOCK_MIN_SNR_DB;
-                    let coherence_improved = best.moments.coherence
-                        >= moments.coherence + HRPD_TIMING_TRACK_MIN_IMPROVEMENT;
-                    let snr_improved = best.moments.coherence + 0.02 >= moments.coherence
-                        && best.moments.snr_db
-                            >= moments.snr_db + HRPD_RPC_TIMING_TRACK_MIN_SNR_IMPROVEMENT_DB;
-                    let apply_candidate = if current_locked {
-                        best_locked && (coherence_improved || snr_improved)
-                    } else {
-                        recovered_lock
-                    };
+                    let recovered_lock = best.moments.coherence
+                        >= HRPD_TIMING_REACQUIRE_MIN_COHERENCE
+                        && best.moments.snr_db >= HRPD_TIMING_TRACK_RELOCK_MIN_SNR_DB
+                        && best.moments.coherence
+                            >= moments.coherence + HRPD_TIMING_TRACK_MIN_IMPROVEMENT;
 
-                    if delay_changed && apply_candidate {
+                    if delay_changed && recovered_lock {
                         self.next_params.sample_delay = best.sample_delay;
                         self.next_params.sample_delay_fraction = best.sample_delay_fraction;
                         self.frames_since_timing_refine = 0;
+                        self.timing_reacquire_confirm_slots = 1;
+                        self.timing_last_pilot_reliable = true;
                         if self.rpc_timing_refine_reports < HRPD_RPC_TIMING_TRACK_REPORTS_MAX {
                             self.rpc_timing_refine_reports += 1;
                             debug!(
@@ -2346,13 +2386,11 @@ impl HrpdReverseTrafficFinger {
                                 best.moments.coherence,
                                 moments.snr_db,
                                 best.moments.snr_db,
-                                radius_samples,
+                                HRPD_TIMING_TRACK_LOST_RADIUS_SAMPLES,
                             );
                         }
                         moments = best.moments;
-                    } else if !current_locked
-                        && self.rpc_timing_refine_reports < HRPD_RPC_TIMING_TRACK_REPORTS_MAX
-                    {
+                    } else if self.rpc_timing_refine_reports < HRPD_RPC_TIMING_TRACK_REPORTS_MAX {
                         self.rpc_timing_refine_reports += 1;
                         debug!(
                             "rx_hrpd_traffic[m{}]: rpc_timing_search_no_relock uati=0x{:08x} measured_slot={} current_delay={}+{:+.2} current_coh={:.3} current_snr={:.2}dB best_delay={}+{:+.2} best_coh={:.3} best_snr={:.2}dB radius={:.1}",
@@ -2367,28 +2405,11 @@ impl HrpdReverseTrafficFinger {
                             best.sample_delay_fraction,
                             best.moments.coherence,
                             best.moments.snr_db,
-                            radius_samples,
+                            HRPD_TIMING_TRACK_LOST_RADIUS_SAMPLES,
                         );
                     }
                 }
             }
-            // Raw reverse power over the same region (dBFS-style reference).
-            // It feeds only the ADC safety limiter and diagnostics; despread
-            // full-complex pilot SINR remains the quality-loop authority.
-            let region_base = (region_start_sample - buf_abs as i64).max(0) as usize;
-            let region_samples = (pilot_region_len * oversample as usize)
-                .min(self.buffer.len().saturating_sub(region_base));
-            let raw_power_dbfs = if region_samples > 0 {
-                let power = self.buffer[region_base..region_base + region_samples]
-                    .iter()
-                    .map(|s| s.norm_sqr() as f64)
-                    .sum::<f64>()
-                    / region_samples as f64;
-                10.0 * (power.max(1.0e-12).log10() as f32)
-            } else {
-                f32::NAN
-            };
-            self.rpc.observe_raw_power(raw_power_dbfs);
             let level = self.rpc.ingest_with_amplitude_step(
                 moments.rc3_sinr_db,
                 moments.coherence,
@@ -2398,7 +2419,6 @@ impl HrpdReverseTrafficFinger {
                 self.rpc.observe_reliable_raw_power(raw_power_dbfs);
             }
 
-            let measured_slot = slot_chip / HRPD_SLOT_CHIPS as u64;
             let scheduled_slot = measured_slot + HRPD_RPC_TX_LEAD_SLOTS;
             self.update_rpc_reliability_trace(
                 level.is_some(),
@@ -2846,7 +2866,10 @@ impl RakeFinger for HrpdReverseTrafficFinger {
             // historical worker uses the same per-frame approach; if a future
             // diff finds value in a one-pole smoother, this is the place.
             let mut moments = pilot_moments_from_despread(&despread);
-            if let Some(radius_samples) = self.timing_refinement_radius(moments.coherence) {
+            if self.timing_state == HrpdTrafficTimingState::Tracking
+                && self.timing_last_pilot_reliable
+                && let Some(radius_samples) = self.timing_refinement_radius(moments.coherence)
+            {
                 let best = self.best_timing_candidate(
                     &self.buffer,
                     abs_sample,
