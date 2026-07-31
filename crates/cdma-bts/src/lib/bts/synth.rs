@@ -80,6 +80,7 @@ fn snapshot_traffic_channels_into(
 
 pub(super) fn synthesize_block(
     runtime: &BtsRuntimeSettings,
+    tx_scale: f32,
     state: &mut TxLoopState,
     gen_start: Instant,
     pch: &PilotWalshChannel,
@@ -168,10 +169,7 @@ pub(super) fn synthesize_block(
             im += tc_samples[x].im * tc_gain;
         }
 
-        let combined = Complex32::new(
-            re * inv_gain_sum * runtime.tx_digital_backoff,
-            im * inv_gain_sum * runtime.tx_digital_backoff,
-        );
+        let combined = Complex32::new(re * inv_gain_sum * tx_scale, im * inv_gain_sum * tx_scale);
         synth_block[x] = spreader.spread(&combined);
     }
     state.synth_spread_us += t0.elapsed().as_micros() as u64;

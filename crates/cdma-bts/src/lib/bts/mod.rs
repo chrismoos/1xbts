@@ -83,6 +83,15 @@ fn hrpd_only_tx_scale(evdo_gain: f32, tx_digital_backoff: f32) -> f32 {
     let gain = evdo_gain.max(0.0);
     tx_digital_backoff * gain / (1.0 + gain)
 }
+
+fn one_x_synth_scale(tx_digital_backoff: f32, adjacent_composite: bool) -> f32 {
+    if adjacent_composite {
+        1.0
+    } else {
+        tx_digital_backoff
+    }
+}
+
 /// Attempt to set the calling thread to real-time priority.
 /// Logs a warning on failure but does not panic. The BTS can still
 /// run at normal priority, just with higher jitter risk.
@@ -790,6 +799,8 @@ impl Bts {
         } else {
             None
         };
+        let one_x_input_scale =
+            one_x_synth_scale(self.runtime.tx_digital_backoff, evdo_composer.is_some());
         let mut one_x_shaper = TxPulseShaper::new(self.runtime.tx_sample_rate_hz)?;
         let mut hrpd_shaper = if evdo_hrpd_only {
             Some(TxPulseShaper::new(self.runtime.tx_sample_rate_hz)?)
@@ -1004,6 +1015,7 @@ impl Bts {
                     let block_gen_start = Instant::now();
                     synth::synthesize_block(
                         &self.runtime,
+                        one_x_input_scale,
                         &mut state,
                         gen_start,
                         &pch,
@@ -1357,6 +1369,12 @@ mod tests {
         assert_eq!(hrpd_only_tx_scale(1.0, 0.5), 0.25);
         assert!((hrpd_only_tx_scale(0.75, 0.4) - 0.171_428_58).abs() < 1e-6);
         assert_eq!(hrpd_only_tx_scale(-1.0, 0.5), 0.0);
+    }
+
+    #[test]
+    fn adjacent_composite_defers_one_x_backoff_to_composer() {
+        assert_eq!(one_x_synth_scale(0.45, true), 1.0);
+        assert_eq!(one_x_synth_scale(0.45, false), 0.45);
     }
 
     #[test]

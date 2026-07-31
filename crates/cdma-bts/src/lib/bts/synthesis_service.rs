@@ -48,6 +48,7 @@ impl SynthesisService {
     ) -> Result<(), Error> {
         super::synth::synthesize_block(
             runtime,
+            runtime.tx_digital_backoff,
             state,
             gen_start,
             pch,

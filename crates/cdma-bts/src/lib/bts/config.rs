@@ -784,6 +784,7 @@ mod tests {
         assert_eq!(cfg.evdo.tx_mode(), evdo::EvdoTxMode::AdjacentComposite);
         assert_eq!(cfg.runtime.tx_sample_rate_hz, 4_915_200);
         assert_eq!(cfg.runtime.tx_bandwidth_hz, 3_310_000);
+        assert_eq!(cfg.runtime.tx_digital_backoff, 0.45);
         assert_eq!(cfg.rf.rx_sample_rate_hz, 4_915_200);
         assert_eq!(cfg.rf.rx_bandwidth_hz, 3_310_000);
         let resolved = evdo::resolve_evdo_config(

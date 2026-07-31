@@ -48,7 +48,7 @@
     "orthogonal_code_length": 64,
     "chip_rate_hz": 1228800,
     "tx_lo_offset_hz": 200000,
-    "tx_digital_backoff": 0.5,
+    "tx_digital_backoff": 0.45,
     "block_size_chips": 512,
     "tx_batch_chips": 6144,
     "short_code_length_chips": 32768,
