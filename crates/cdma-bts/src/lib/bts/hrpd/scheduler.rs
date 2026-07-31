@@ -15,13 +15,14 @@
 //! once per slot to build the forward waveform.
 
 use num_complex::Complex32;
-use std::sync::Arc;
+use std::ops::Deref;
+use std::sync::{Arc, OnceLock};
 
 use crate::bts::hrpd::harq_bus::{HarqBus, HarqEmissionEvent};
 use crate::phy::hrpd::interleaver::forward_channel_interleave;
 use crate::phy::hrpd::rates::{ForwardRate, HrpdModulation, by_drc};
 use crate::phy::hrpd::scrambler::HrpdForwardScrambler;
-use crate::phy::hrpd::turbo::HrpdTurboEncoder;
+use crate::phy::hrpd::turbo::{HrpdTurboBlock, HrpdTurboEncoder};
 use crate::receiver::hrpd::ack_decoder::ACK_FORWARD_TO_REVERSE_SLOT_OFFSET;
 use cdma_common::diagnostics::hrpd_harq_verbose;
 use cdma_common::hrpd::messages::DEFAULT_REVERSE_TRAFFIC_CHANNEL_MAC_PROTOCOL_TYPE;
@@ -43,9 +44,12 @@ use cdma_common::hrpd::traffic::{
 
 mod forward_codec;
 use forward_codec::{
-    DefaultSignalingPacket, default_signaling_packet, forward_format_b_session_packets,
-    rebuild_or_split_format_b_ftc_payloads, reliable_rtc_ack_sequence_number,
+    DefaultSignalingPacket, default_signaling_packet_from_session_packets,
+    forward_format_b_session_packets, rebuild_or_split_format_b_session_packets,
+    reliable_rtc_ack_sequence_number,
 };
+#[cfg(test)]
+use forward_codec::{default_signaling_packet, rebuild_or_split_format_b_ftc_payloads};
 
 /// Total Data-region chips per HRPD forward slot (2 × 400 chips × 2 half-slots
 /// edges, see `phy::hrpd::slot`).
@@ -108,6 +112,107 @@ pub struct ForwardTrafficPacket {
     pub payload: Vec<u8>,
 }
 
+/// DRC-independent packet metadata prepared before the real-time TX queue.
+///
+/// The physical payload remains unchanged. Parsing and turbo coding it once
+/// here lets the TX scheduler prioritize, coalesce, and transmit the common
+/// same-size case without redoing physical CRC, session, or turbo work.
+#[derive(Debug, Clone)]
+pub struct PreparedForwardTrafficPacket {
+    packet: ForwardTrafficPacket,
+    session_packets: Option<Arc<[Vec<u8>]>>,
+    default_signaling: Option<DefaultSignalingPacket>,
+    rtc_ack_sequence_number: Option<u8>,
+    priority_ranges: Option<String>,
+    turbo_codewords: Option<PreparedTurboCodewords>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedTurboCodewords {
+    rate_one_third: Arc<[u8]>,
+    rate_one_fifth: Option<Arc<[u8]>>,
+}
+
+impl PreparedForwardTrafficPacket {
+    /// Parse and turbo-code a forward packet on its producer's thread.
+    pub fn new(packet: ForwardTrafficPacket) -> Self {
+        let session_packets = forward_format_b_session_packets(&packet.payload);
+        Self::from_parts(packet, session_packets, true)
+    }
+
+    fn from_parts(
+        packet: ForwardTrafficPacket,
+        session_packets: Option<Vec<Vec<u8>>>,
+        prepare_turbo: bool,
+    ) -> Self {
+        let default_signaling = session_packets
+            .as_deref()
+            .and_then(default_signaling_packet_from_session_packets);
+        let rtc_ack_sequence_number = session_packets
+            .as_deref()
+            .and_then(rtc_ack_sequence_number_from_session_packets);
+        let priority_ranges = packet.high_priority.then(|| {
+            session_packets
+                .as_deref()
+                .map(format_default_packet_rlp_ranges_from_session_packets)
+                .unwrap_or_else(|| "unparsed".to_string())
+        });
+        let turbo_codewords = prepare_turbo
+            .then(|| prepare_turbo_codewords(&packet))
+            .flatten();
+        Self {
+            packet,
+            session_packets: session_packets.map(Arc::from),
+            default_signaling,
+            rtc_ack_sequence_number,
+            priority_ranges,
+            turbo_codewords,
+        }
+    }
+
+    fn replace_payload(&mut self, payload: Vec<u8>) {
+        self.packet.payload = payload;
+        self.turbo_codewords = None;
+    }
+
+    fn repacked(&self, payload: Vec<u8>, session_packets: Vec<Vec<u8>>) -> Self {
+        Self::from_parts(
+            ForwardTrafficPacket {
+                mac_index: self.packet.mac_index,
+                physical_layer_subtype: self.packet.physical_layer_subtype,
+                forward_traffic_mac_subtype: self.packet.forward_traffic_mac_subtype,
+                high_priority: self.packet.high_priority,
+                payload,
+            },
+            Some(session_packets),
+            false,
+        )
+    }
+
+    fn turbo_codeword(&self, numerator: u8, denominator: u8) -> Option<&[u8]> {
+        let codewords = self.turbo_codewords.as_ref()?;
+        match (numerator, denominator) {
+            (1, 3) => Some(&codewords.rate_one_third),
+            (1, 5) => codewords.rate_one_fifth.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+impl From<ForwardTrafficPacket> for PreparedForwardTrafficPacket {
+    fn from(packet: ForwardTrafficPacket) -> Self {
+        Self::new(packet)
+    }
+}
+
+impl Deref for PreparedForwardTrafficPacket {
+    type Target = ForwardTrafficPacket;
+
+    fn deref(&self) -> &Self::Target {
+        &self.packet
+    }
+}
+
 /// AT response to a transmitted subpacket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HarqResponse {
@@ -145,6 +250,7 @@ pub struct ForwardSlotOutput {
 struct HarqState {
     packet_id: u64,
     packet: ForwardTrafficPacket,
+    rtc_ack_sequence_number: Option<u8>,
     /// Pre-computed TDM Data-region chips for the whole physical-layer
     /// packet: MACIndex-coded preamble followed by encoded data symbols.
     packet_chips: Vec<Complex32>,
@@ -183,7 +289,7 @@ impl HarqState {
 /// per-MAC-index 4-interlace H-ARQ.
 #[derive(Debug)]
 pub struct HrpdForwardScheduler {
-    queue: Vec<ForwardTrafficPacket>,
+    queue: Vec<PreparedForwardTrafficPacket>,
     /// In-flight packets. One-slot rates may have several completed packets
     /// waiting for ACK feedback for the same MAC index; multi-slot packets
     /// still keep exact 4-slot continuation timing through `pick_active`.
@@ -246,7 +352,12 @@ impl HrpdForwardScheduler {
     }
 
     pub fn enqueue(&mut self, pkt: ForwardTrafficPacket) {
-        if let Some(sequence_number) = rtc_ack_sequence_number(&pkt.payload)
+        self.enqueue_prepared(pkt.into());
+    }
+
+    /// Enqueue a packet already parsed and turbo-coded by its producer.
+    pub fn enqueue_prepared(&mut self, pkt: PreparedForwardTrafficPacket) {
+        if let Some(sequence_number) = pkt.rtc_ack_sequence_number
             && self.has_pending_rtc_ack(pkt.mac_index, sequence_number)
         {
             log::info!(
@@ -257,7 +368,7 @@ impl HrpdForwardScheduler {
             return;
         }
 
-        if let Some(queued_signaling) = default_signaling_packet(&pkt.payload)
+        if let Some(queued_signaling) = pkt.default_signaling.as_ref()
             && !is_default_packet_data_payload(&queued_signaling)
         {
             // Stream-0 control, especially subtype-3 RTCMAC Grant refreshes,
@@ -266,11 +377,15 @@ impl HrpdForwardScheduler {
             let insert_at = self
                 .queue
                 .iter()
-                .position(|queued| default_signaling_packet(&queued.payload).is_none())
+                .position(|queued| queued.default_signaling.is_none())
                 .unwrap_or(self.queue.len());
             if is_rtc_mac_grant_signaling(&queued_signaling)
                 && let Some(stale) = self.queue[..insert_at].iter_mut().find(|queued| {
-                    queued.mac_index == pkt.mac_index && is_rtc_mac_grant(&queued.payload)
+                    queued.mac_index == pkt.mac_index
+                        && queued
+                            .default_signaling
+                            .as_ref()
+                            .is_some_and(is_rtc_mac_grant_signaling)
                 })
             {
                 *stale = pkt;
@@ -284,14 +399,12 @@ impl HrpdForwardScheduler {
             let insert_at = self
                 .queue
                 .iter()
-                .position(|queued| {
-                    default_signaling_packet(&queued.payload).is_none() && !queued.high_priority
-                })
+                .position(|queued| queued.default_signaling.is_none() && !queued.high_priority)
                 .unwrap_or(self.queue.len());
             log::debug!(
                 "rx_hrpd_traffic[m{}]: enqueueing priority DefaultPacket RLP repair ranges=[{}] insert_at={} queued_before={}",
                 pkt.mac_index,
-                format_default_packet_rlp_ranges(&pkt.payload),
+                pkt.priority_ranges.as_deref().unwrap_or("unparsed"),
                 insert_at,
                 self.queue.len(),
             );
@@ -303,11 +416,10 @@ impl HrpdForwardScheduler {
 
     fn has_pending_rtc_ack(&self, mac_index: u8, sequence_number: u8) -> bool {
         self.queue.iter().any(|queued| {
-            queued.mac_index == mac_index
-                && rtc_ack_sequence_number(&queued.payload) == Some(sequence_number)
+            queued.mac_index == mac_index && queued.rtc_ack_sequence_number == Some(sequence_number)
         }) || self.active.iter().any(|active| {
             active.packet.mac_index == mac_index
-                && rtc_ack_sequence_number(&active.packet.payload) == Some(sequence_number)
+                && active.rtc_ack_sequence_number == Some(sequence_number)
         })
     }
 
@@ -638,7 +750,7 @@ impl HrpdForwardScheduler {
                 i += 1;
                 continue;
             }
-            let rtc_ack_seq = rtc_ack_sequence_number(&pkt.payload);
+            let rtc_ack_seq = pkt.rtc_ack_sequence_number;
             if at_rate.payload_bits as usize != pkt.payload.len() {
                 if let Some(sequence_number) = rtc_ack_seq {
                     match default_reverse_traffic_mac_rtc_ack_ftc_payload_bits_for_mac_subtype(
@@ -647,7 +759,7 @@ impl HrpdForwardScheduler {
                         pkt.forward_traffic_mac_subtype,
                     ) {
                         Ok(payload) => {
-                            pkt.payload = payload;
+                            pkt.replace_payload(payload);
                         }
                         Err(err) => {
                             log::warn!(
@@ -660,7 +772,7 @@ impl HrpdForwardScheduler {
                             continue;
                         }
                     }
-                } else if let Some(signaling) = default_signaling_packet(&pkt.payload) {
+                } else if let Some(signaling) = pkt.default_signaling.as_ref() {
                     let rebuilt = default_signaling_ftc_payload_bits_with_ack_for_mac_subtype(
                         at_rate.payload_bits as usize,
                         signaling.protocol_type,
@@ -681,7 +793,7 @@ impl HrpdForwardScheduler {
                                 signaling.ack_sequence_number,
                                 at_rate.payload_bits
                             );
-                            pkt.payload = payload;
+                            pkt.replace_payload(payload);
                         }
                         Err(err) => {
                             log::warn!(
@@ -694,11 +806,15 @@ impl HrpdForwardScheduler {
                             continue;
                         }
                     }
-                } else if let Some(mut payloads) = rebuild_or_split_format_b_ftc_payloads(
-                    &pkt.payload,
-                    at_rate.payload_bits as usize,
-                    pkt.forward_traffic_mac_subtype,
-                ) {
+                } else if let Some(mut payloads) =
+                    pkt.session_packets.as_deref().and_then(|session_packets| {
+                        rebuild_or_split_format_b_session_packets(
+                            session_packets,
+                            at_rate.payload_bits as usize,
+                            pkt.forward_traffic_mac_subtype,
+                        )
+                    })
+                {
                     if payloads.len() > 1 {
                         log::trace!(
                             "rx_hrpd_traffic[m{}]: split Format-B FTC payload for governing drc=0x{:x} payload_bits={} packets={}",
@@ -715,10 +831,15 @@ impl HrpdForwardScheduler {
                             at_rate.payload_bits
                         );
                     }
-                    pkt.payload = payloads.remove(0);
-                    for (offset, payload) in payloads.into_iter().enumerate() {
-                        let mut remainder = pkt.clone();
-                        remainder.payload = payload;
+                    let repacked = payloads
+                        .drain(..)
+                        .map(|(payload, session_packets)| pkt.repacked(payload, session_packets))
+                        .collect::<Vec<_>>();
+                    let mut repacked = repacked.into_iter();
+                    pkt = repacked
+                        .next()
+                        .expect("Format-B repacking always returns at least one payload");
+                    for (offset, remainder) in repacked.enumerate() {
                         self.queue.insert(i + offset, remainder);
                     }
                 } else {
@@ -734,11 +855,9 @@ impl HrpdForwardScheduler {
             }
             let packet_id = self.next_packet_id;
             self.next_packet_id = self.next_packet_id.wrapping_add(1).max(1);
-            let scheduled_rtc_ack_seq = rtc_ack_sequence_number(&pkt.payload);
-            let scheduled_signaling = default_signaling_packet(&pkt.payload);
-            let scheduled_priority_ranges = pkt
-                .high_priority
-                .then(|| format_default_packet_rlp_ranges(&pkt.payload));
+            let scheduled_rtc_ack_seq = pkt.rtc_ack_sequence_number;
+            let scheduled_signaling = pkt.default_signaling.clone();
+            let scheduled_priority_ranges = pkt.priority_ranges.clone();
             if let Some(state) = build_harq_state(pkt, at_rate, packet_id) {
                 if let Some(ranges) = scheduled_priority_ranges {
                     log::debug!(
@@ -1024,10 +1143,15 @@ fn is_default_packet_data_payload(signaling: &DefaultSignalingPacket) -> bool {
         && signaling.ack_sequence_number.is_none()
 }
 
+#[cfg(test)]
 fn format_default_packet_rlp_ranges(payload: &[u8]) -> String {
     let Some(session_packets) = forward_format_b_session_packets(payload) else {
         return "unparsed".to_string();
     };
+    format_default_packet_rlp_ranges_from_session_packets(&session_packets)
+}
+
+fn format_default_packet_rlp_ranges_from_session_packets(session_packets: &[Vec<u8>]) -> String {
     let ranges = session_packets
         .iter()
         .filter_map(|packet| parse_stream_layer_packet_bytes(packet).ok())
@@ -1103,14 +1227,14 @@ fn governing_drc_slot(start_slot: u64, frame_offset: u64, drc_length: u64) -> u6
         .saturating_sub((start_slot.saturating_sub(frame_offset)) % drc_length)
 }
 
-fn rtc_ack_sequence_number(payload: &[u8]) -> Option<u8> {
-    let session_packets = forward_format_b_session_packets(payload)?;
+fn rtc_ack_sequence_number_from_session_packets(session_packets: &[Vec<u8>]) -> Option<u8> {
     let packet = session_packets
         .iter()
         .find(|packet| packet.len() == 4 && reliable_rtc_ack_sequence_number(packet).is_some())?;
     reliable_rtc_ack_sequence_number(packet)
 }
 
+#[cfg(test)]
 fn is_rtc_mac_grant(payload: &[u8]) -> bool {
     default_signaling_packet(payload)
         .as_ref()
@@ -1167,7 +1291,7 @@ fn implemented_forward_rate_by_drc(
 }
 
 fn build_harq_state(
-    pkt: ForwardTrafficPacket,
+    pkt: PreparedForwardTrafficPacket,
     rate: ForwardRate,
     packet_id: u64,
 ) -> Option<HarqState> {
@@ -1188,8 +1312,11 @@ fn build_harq_state(
     if pkt.payload.len() != rate.payload_bits as usize {
         return None;
     }
-    let encoder = HrpdTurboEncoder::new(rate.payload_bits)?;
-    let mut coded = encoder.encode(&pkt.payload, rate.code_rate_num, rate.code_rate_den);
+    let encoder = cached_turbo_encoder(rate.payload_bits)?;
+    let mut coded = pkt
+        .turbo_codeword(rate.code_rate_num, rate.code_rate_den)
+        .map(<[u8]>::to_vec)
+        .unwrap_or_else(|| encoder.encode(&pkt.payload, rate.code_rate_num, rate.code_rate_den));
 
     // C.S0024-0 v4.0 §9.3.1.3.2.3.3/4: scramble the turbo encoder output
     // first, then perform the forward Traffic channel symbol reordering and
@@ -1209,9 +1336,11 @@ fn build_harq_state(
     // decoded ACK is the only legal interruption, and SLP handles loss).
     let subpacket_count = 1u8;
 
+    let rtc_ack_sequence_number = pkt.rtc_ack_sequence_number;
     Some(HarqState {
         packet_id,
-        packet: pkt,
+        packet: pkt.packet,
+        rtc_ack_sequence_number,
         packet_chips,
         subpacket_count,
         current_subpacket: 0,
@@ -1221,6 +1350,31 @@ fn build_harq_state(
         first_tx_slot: None,
         slot_in_subpacket: 0,
         rate,
+    })
+}
+
+fn cached_turbo_encoder(payload_bits: u32) -> Option<&'static HrpdTurboEncoder> {
+    static ENCODERS: OnceLock<Vec<HrpdTurboEncoder>> = OnceLock::new();
+    ENCODERS
+        .get_or_init(|| {
+            HrpdTurboBlock::ALL
+                .iter()
+                .filter_map(|block| HrpdTurboEncoder::new(block.payload_bits))
+                .collect()
+        })
+        .iter()
+        .find(|encoder| encoder.block().payload_bits == payload_bits)
+}
+
+fn prepare_turbo_codewords(packet: &ForwardTrafficPacket) -> Option<PreparedTurboCodewords> {
+    let payload_bits = u32::try_from(packet.payload.len()).ok()?;
+    let encoder = cached_turbo_encoder(payload_bits)?;
+    let raw = encoder.encode_raw(&packet.payload);
+    let rate_one_third = Arc::from(encoder.rate_match(&raw, 1, 3));
+    let rate_one_fifth = (payload_bits == 1_024).then(|| Arc::from(encoder.rate_match(&raw, 1, 5)));
+    Some(PreparedTurboCodewords {
+        rate_one_third,
+        rate_one_fifth,
     })
 }
 
@@ -1549,6 +1703,31 @@ mod tests {
         assert_eq!(out.channel, SlotKind::Traffic { active_mac: 5 });
         assert_eq!(out.data_chips.len(), DATA_CHIPS_PER_SLOT);
         assert_eq!(out.mac_bits.len(), MAC_BITS_PER_SLOT);
+    }
+
+    #[test]
+    fn producer_preparation_caches_supported_turbo_rates() {
+        let packet = ForwardTrafficPacket {
+            mac_index: 5,
+            physical_layer_subtype: 0,
+            forward_traffic_mac_subtype: 0,
+            high_priority: false,
+            payload: dummy_payload(1024),
+        };
+        let encoder = HrpdTurboEncoder::new(1024).unwrap();
+        let expected_one_third = encoder.encode(&packet.payload, 1, 3);
+        let expected_one_fifth = encoder.encode(&packet.payload, 1, 5);
+
+        let prepared = PreparedForwardTrafficPacket::new(packet);
+
+        assert_eq!(
+            prepared.turbo_codeword(1, 3),
+            Some(expected_one_third.as_slice())
+        );
+        assert_eq!(
+            prepared.turbo_codeword(1, 5),
+            Some(expected_one_fifth.as_slice())
+        );
     }
 
     #[test]

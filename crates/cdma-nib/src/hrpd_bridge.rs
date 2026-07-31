@@ -470,11 +470,14 @@ impl HrpdStream1BridgeTiming {
 async fn relay_an_forward_traffic_to_bts(
     mut an_rx: tokio::sync::mpsc::UnboundedReceiver<HrpdAnForwardTrafficPacket>,
     bts_tx: tokio::sync::mpsc::UnboundedSender<
-        cdma_bts::bts::hrpd::scheduler::ForwardTrafficPacket,
+        cdma_bts::bts::hrpd::scheduler::PreparedForwardTrafficPacket,
     >,
 ) {
     while let Some(packet) = an_rx.recv().await {
-        if bts_tx.send(forward_traffic_from_an_packet(packet)).is_err() {
+        if bts_tx
+            .send(forward_traffic_from_an_packet(packet).into())
+            .is_err()
+        {
             warn!("HRPD AN bridge: BTS forward-traffic queue closed");
             break;
         }
@@ -493,7 +496,7 @@ pub fn spawn_hrpd_air_bridge(
     >,
     traffic_release_tx: tokio::sync::mpsc::UnboundedSender<hrpd_air::HrpdTrafficReleaseRequest>,
     forward_traffic_tx: tokio::sync::mpsc::UnboundedSender<
-        cdma_bts::bts::hrpd::scheduler::ForwardTrafficPacket,
+        cdma_bts::bts::hrpd::scheduler::PreparedForwardTrafficPacket,
     >,
     a9_config: Option<HrpdA9ClientConfig>,
     hlr_repo: Option<Arc<dyn cdma_hlr::repository::HlrRepository>>,
@@ -618,7 +621,7 @@ async fn hrpd_an_traffic_event_task(
     traffic_a8_runtime: Option<HrpdAnA8Runtime>,
     traffic_forward_tx: tokio::sync::mpsc::UnboundedSender<hrpd_air::HrpdForwardSignalingRequest>,
     traffic_forward_traffic_tx: tokio::sync::mpsc::UnboundedSender<
-        cdma_bts::bts::hrpd::scheduler::ForwardTrafficPacket,
+        cdma_bts::bts::hrpd::scheduler::PreparedForwardTrafficPacket,
     >,
     traffic_release_tx_for_traffic: tokio::sync::mpsc::UnboundedSender<
         hrpd_air::HrpdTrafficReleaseRequest,
@@ -1086,7 +1089,7 @@ async fn hrpd_an_traffic_event_task(
             }
             match forward_traffic_from_proto(packet) {
                 Ok(packet) => {
-                    if traffic_forward_traffic_tx.send(packet).is_err() {
+                    if traffic_forward_traffic_tx.send(packet.into()).is_err() {
                         warn!(
                             "HRPD AN bridge: forward traffic channel closed while handling traffic event"
                         );
@@ -1323,7 +1326,7 @@ async fn hrpd_an_access_task(
     >,
     traffic_release_tx: tokio::sync::mpsc::UnboundedSender<hrpd_air::HrpdTrafficReleaseRequest>,
     forward_traffic_tx: tokio::sync::mpsc::UnboundedSender<
-        cdma_bts::bts::hrpd::scheduler::ForwardTrafficPacket,
+        cdma_bts::bts::hrpd::scheduler::PreparedForwardTrafficPacket,
     >,
     a9_config: Option<HrpdA9ClientConfig>,
     hlr_repo: Option<Arc<dyn cdma_hlr::repository::HlrRepository>>,
@@ -1562,7 +1565,7 @@ async fn hrpd_an_access_task(
         for packet in response.forward_traffic {
             match forward_traffic_from_proto(packet) {
                 Ok(packet) => {
-                    if forward_traffic_tx.send(packet).is_err() {
+                    if forward_traffic_tx.send(packet.into()).is_err() {
                         warn!("HRPD AN bridge: BTS forward-traffic queue closed");
                         return;
                     }

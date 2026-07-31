@@ -92,6 +92,14 @@ fn one_x_synth_scale(tx_digital_backoff: f32, adjacent_composite: bool) -> f32 {
     }
 }
 
+fn hrpd_forward_ingress_budget(tx_batch_chips: u64) -> usize {
+    // A forward packet can start at most once per HRPD slot. Admitting no more
+    // than one batch's maximum starts bounds control-plane work on the
+    // real-time TX thread while excess packets remain on the ingress queue.
+    let packet_starts = tx_batch_chips.div_ceil(crate::phy::hrpd::slot::SLOT_CHIPS);
+    usize::try_from(packet_starts).unwrap_or(usize::MAX)
+}
+
 /// Attempt to set the calling thread to real-time priority.
 /// Logs a warning on failure but does not panic. The BTS can still
 /// run at normal priority, just with higher jitter risk.
@@ -254,8 +262,9 @@ pub struct Bts {
         tokio::sync::mpsc::UnboundedReceiver<cdma_common::hrpd::air::HrpdTrafficAssignmentRequest>,
     hrpd_traffic_release_rx:
         tokio::sync::mpsc::UnboundedReceiver<cdma_common::hrpd::air::HrpdTrafficReleaseRequest>,
-    hrpd_forward_traffic_rx:
-        tokio::sync::mpsc::UnboundedReceiver<crate::bts::hrpd::scheduler::ForwardTrafficPacket>,
+    hrpd_forward_traffic_rx: tokio::sync::mpsc::UnboundedReceiver<
+        crate::bts::hrpd::scheduler::PreparedForwardTrafficPacket,
+    >,
     traffic_channels: TrafficChannelPool,
     traffic_rx_pool: TrafficRxPool,
     hrpd_traffic_rx_queue: HrpdTrafficRxQueue,
@@ -833,6 +842,8 @@ impl Bts {
         let mut tx_stat_gen_max_us = 0u64;
         let mut tx_stat_evdo_us = 0u64;
         let mut tx_stat_evdo_max_us = 0u64;
+        let mut tx_stat_hrpd_ingress = 0u64;
+        let mut tx_stat_hrpd_backlog_max = 0usize;
         let mut tx_stat_shape_us = 0u64;
         let mut tx_stat_shape_max_us = 0u64;
         const TX_STAT_WINDOW_CHIPS: u64 = 5 * 1_228_800;
@@ -954,6 +965,10 @@ impl Bts {
                 }
             }
 
+            let mut hrpd_forward_ingress_remaining = evdo_idle
+                .as_ref()
+                .map(|_| hrpd_forward_ingress_budget(state.tx_batch_chips))
+                .unwrap_or(0);
             let gen_start = Instant::now();
             let bs = state.block_size as usize;
             for block_idx in 0..blocks_per_batch {
@@ -1141,7 +1156,12 @@ impl Bts {
                         );
                         evdo_idle.enqueue_forward_signaling(request);
                     }
-                    while let Ok(packet) = self.hrpd_forward_traffic_rx.try_recv() {
+                    while hrpd_forward_ingress_remaining > 0 {
+                        let Ok(packet) = self.hrpd_forward_traffic_rx.try_recv() else {
+                            break;
+                        };
+                        hrpd_forward_ingress_remaining -= 1;
+                        tx_stat_hrpd_ingress += 1;
                         if !hrpd_active_macs
                             .iter()
                             .any(|active| active.mac_index == packet.mac_index)
@@ -1158,7 +1178,7 @@ impl Bts {
                             packet.mac_index,
                             packet.payload.len()
                         );
-                        evdo_idle.enqueue_traffic(packet);
+                        evdo_idle.enqueue_prepared_traffic(packet);
                     }
                     evdo_idle.next_block_into(block_chip, &mut evdo_tx_batch[offset..offset + bs]);
                     let evdo_block_us = evdo_gen_start.elapsed().as_micros() as u64;
@@ -1243,16 +1263,20 @@ impl Bts {
             tx_stat_gen_max_us = tx_stat_gen_max_us.max(batch_gen_us);
             tx_stat_shape_us += batch_shape_us;
             tx_stat_shape_max_us = tx_stat_shape_max_us.max(batch_shape_us);
+            tx_stat_hrpd_backlog_max =
+                tx_stat_hrpd_backlog_max.max(self.hrpd_forward_traffic_rx.len());
             if tx_stat_air_chips >= TX_STAT_WINDOW_CHIPS {
                 let air_us = tx_stat_air_chips * 1000 / 1229;
                 let busy_us = tx_stat_gen_us + tx_stat_shape_us;
                 info!(
-                    "tx_stats: batches={} gen_avg={}us gen_max={}us evdo_avg={}us evdo_max={}us shape_avg={}us shape_max={}us rt_load_pct={:.1}",
+                    "tx_stats: batches={} gen_avg={}us gen_max={}us evdo_avg={}us evdo_max={}us hrpd_ingress={} hrpd_backlog_max={} shape_avg={}us shape_max={}us rt_load_pct={:.1}",
                     tx_stat_batches,
                     tx_stat_gen_us / tx_stat_batches.max(1),
                     tx_stat_gen_max_us,
                     tx_stat_evdo_us / tx_stat_batches.max(1),
                     tx_stat_evdo_max_us,
+                    tx_stat_hrpd_ingress,
+                    tx_stat_hrpd_backlog_max,
                     tx_stat_shape_us / tx_stat_batches.max(1),
                     tx_stat_shape_max_us,
                     100.0 * busy_us as f64 / air_us.max(1) as f64,
@@ -1263,6 +1287,8 @@ impl Bts {
                 tx_stat_gen_max_us = 0;
                 tx_stat_evdo_us = 0;
                 tx_stat_evdo_max_us = 0;
+                tx_stat_hrpd_ingress = 0;
+                tx_stat_hrpd_backlog_max = 0;
                 tx_stat_shape_us = 0;
                 tx_stat_shape_max_us = 0;
             }
@@ -1375,6 +1401,12 @@ mod tests {
     fn adjacent_composite_defers_one_x_backoff_to_composer() {
         assert_eq!(one_x_synth_scale(0.45, true), 1.0);
         assert_eq!(one_x_synth_scale(0.45, false), 0.45);
+    }
+
+    #[test]
+    fn hrpd_forward_ingress_is_bounded_to_available_batch_slots() {
+        assert_eq!(hrpd_forward_ingress_budget(6_144), 3);
+        assert_eq!(hrpd_forward_ingress_budget(3_072), 2);
     }
 
     #[test]

@@ -15,8 +15,15 @@ pub(super) struct DefaultSignalingPacket {
     pub(super) in_configuration: bool,
 }
 
+#[cfg(test)]
 pub(super) fn default_signaling_packet(payload: &[u8]) -> Option<DefaultSignalingPacket> {
     let session_packets = forward_format_b_session_packets(payload)?;
+    default_signaling_packet_from_session_packets(&session_packets)
+}
+
+pub(super) fn default_signaling_packet_from_session_packets(
+    session_packets: &[Vec<u8>],
+) -> Option<DefaultSignalingPacket> {
     session_packets
         .iter()
         .find_map(|packet| parse_default_signaling_packet(packet))
@@ -133,12 +140,26 @@ fn forward_mac_format_b_session_packets(
     parse_connection_format_b_packets(&payload[mac_start..trailer]).ok()
 }
 
+#[cfg(test)]
 pub(super) fn rebuild_or_split_format_b_ftc_payloads(
     payload: &[u8],
     physical_packet_bits: usize,
     forward_traffic_mac_subtype: u16,
 ) -> Option<Vec<Vec<u8>>> {
     let session_packets = forward_format_b_session_packets(payload)?;
+    rebuild_or_split_format_b_session_packets(
+        &session_packets,
+        physical_packet_bits,
+        forward_traffic_mac_subtype,
+    )
+    .map(|parts| parts.into_iter().map(|(payload, _)| payload).collect())
+}
+
+pub(super) fn rebuild_or_split_format_b_session_packets(
+    session_packets: &[Vec<u8>],
+    physical_packet_bits: usize,
+    forward_traffic_mac_subtype: u16,
+) -> Option<Vec<(Vec<u8>, Vec<Vec<u8>>)>> {
     forward_traffic_security_capacity_bits_for_mac_subtype(
         physical_packet_bits,
         forward_traffic_mac_subtype,
@@ -148,11 +169,11 @@ pub(super) fn rebuild_or_split_format_b_ftc_payloads(
         physical_packet_bits,
         forward_traffic_mac_subtype,
     ) {
-        return Some(vec![payload]);
+        return Some(vec![(payload, session_packets.to_vec())]);
     }
 
     let mut out = Vec::new();
-    let mut remaining = session_packets.as_slice();
+    let mut remaining = session_packets;
     while !remaining.is_empty() {
         let mut rebuilt = None;
         for count in (1..=remaining.len()).rev() {
@@ -166,7 +187,7 @@ pub(super) fn rebuild_or_split_format_b_ftc_payloads(
             }
         }
         let (count, payload) = rebuilt?;
-        out.push(payload);
+        out.push((payload, remaining[..count].to_vec()));
         remaining = &remaining[count..];
     }
     (!out.is_empty()).then_some(out)

@@ -36,7 +36,7 @@ use crate::{
 };
 
 use super::{AccessChannelEvent, BtsPowerControlRegistry, BtsRuntimeSettings};
-use crate::bts::hrpd::scheduler::ForwardTrafficPacket;
+use crate::bts::hrpd::scheduler::PreparedForwardTrafficPacket;
 
 /// Metrics snapshot from the TX loop, published every ~1 second.
 #[derive(Debug, Clone, Default)]
@@ -546,8 +546,8 @@ pub struct BtsHandle {
     pub hrpd_traffic_assignments: mpsc::UnboundedSender<HrpdTrafficAssignmentRequest>,
     /// Queue AN-originated HRPD traffic releases (session closed/replaced).
     pub hrpd_traffic_releases: mpsc::UnboundedSender<HrpdTrafficReleaseRequest>,
-    /// Queue AN-originated HRPD Forward Traffic Channel physical packets.
-    pub hrpd_forward_traffic: mpsc::UnboundedSender<ForwardTrafficPacket>,
+    /// Queue producer-prepared HRPD Forward Traffic Channel physical packets.
+    pub hrpd_forward_traffic: mpsc::UnboundedSender<PreparedForwardTrafficPacket>,
     /// Shared pool of active forward traffic channels.
     pub traffic_channels: TrafficChannelPool,
     /// BTS-local reverse power-control state keyed by traffic Walsh code.
@@ -906,7 +906,7 @@ pub(crate) struct BtsHandleSenders {
     pub hrpd_forward_signaling_rx: mpsc::UnboundedReceiver<HrpdForwardSignalingRequest>,
     pub hrpd_traffic_assignment_rx: mpsc::UnboundedReceiver<HrpdTrafficAssignmentRequest>,
     pub hrpd_traffic_release_rx: mpsc::UnboundedReceiver<HrpdTrafficReleaseRequest>,
-    pub hrpd_forward_traffic_rx: mpsc::UnboundedReceiver<ForwardTrafficPacket>,
+    pub hrpd_forward_traffic_rx: mpsc::UnboundedReceiver<PreparedForwardTrafficPacket>,
     pub commands_rx: mpsc::Receiver<BtsCommand>,
     /// Shared reference to the traffic channel pool (same Arc as BtsHandle).
     pub traffic_channels: TrafficChannelPool,

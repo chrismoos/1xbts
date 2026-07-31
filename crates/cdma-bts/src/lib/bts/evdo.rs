@@ -1041,6 +1041,15 @@ impl HrpdForwardSlotModulator {
         self.scheduler.enqueue(packet);
     }
 
+    /// Enqueue a packet whose DRC-independent framing was parsed before it
+    /// reached the real-time TX thread.
+    pub fn enqueue_prepared_traffic(
+        &mut self,
+        packet: crate::bts::hrpd::scheduler::PreparedForwardTrafficPacket,
+    ) {
+        self.scheduler.enqueue_prepared(packet);
+    }
+
     /// Purge queued/active forward traffic and H-ARQ bus state for a released
     /// MAC index.
     pub fn purge_traffic_mac(&mut self, mac_index: u8) -> (usize, usize, usize, usize) {
