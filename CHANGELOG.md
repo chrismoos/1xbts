@@ -1,5 +1,6 @@
 # HEAD 
 
+- Reduced EV-DO reverse access receiver CPU usage.
 - Improved EV-DO reverse traffic recovery after brief signal loss while reducing receiver CPU usage.
 - Reduced BTS RX thread usage for active 1x and EV-DO traffic.
 - Increased and balanced 1x transmit power in adjacent 1x/EV-DO composite mode.

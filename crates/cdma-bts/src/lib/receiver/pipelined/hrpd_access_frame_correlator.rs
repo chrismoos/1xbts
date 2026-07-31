@@ -1,11 +1,11 @@
 //! HRPD reverse access full-frame FFT preamble correlator.
 //!
 //! This is the production acquisition path for HRPD reverse access.  It
-//! builds one spec-derived access preamble PHY frame, leaves the
-//! remainder of the FFT window at zero, and uses the peak to spawn a burst-local
-//! finger.  The finger uses the acquired preamble only for burst timing, then
-//! despreads the packet with the spec-derived access PN/LC sequence before
-//! feeding chip-rate packet chips to the normal downstream packet processor.
+//! correlates one spec-derived access preamble PHY frame over its circular
+//! delay range and uses the peak to spawn a burst-local finger. The finger uses
+//! the acquired preamble only for burst timing, then despreads the packet with
+//! the spec-derived access PN/LC sequence before feeding chip-rate packet chips
+//! to the normal downstream packet processor.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -62,7 +62,7 @@ impl Default for HrpdAccessFrameFftConfig {
     fn default() -> Self {
         Self {
             oversample: 4,
-            search_window_frames: 4,
+            search_window_frames: 1,
             search_step_frames: 1,
             access_cycle_number: 0,
             derive_access_cycle_number_from_window: true,

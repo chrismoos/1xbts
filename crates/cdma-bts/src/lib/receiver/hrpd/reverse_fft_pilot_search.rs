@@ -36,7 +36,7 @@ pub struct HrpdReverseFftPilotSearcherStats {
     pub signal_fft_ns: u64,
     /// Pointwise multiply + IFFT.
     pub ifft_mult_ns: u64,
-    /// Linear peak find + top-N selection.
+    /// Delay-range peak find + top-N selection.
     pub peak_find_ns: u64,
     /// Number of `scan_window` invocations.
     pub scan_window_calls: u64,
@@ -183,7 +183,13 @@ impl HrpdReverseFftPilotSearcher {
         let window_samples = frame_samples * cfg.search_window_frames;
         let fft_len = window_samples.next_power_of_two();
         let step_samples = frame_samples * cfg.search_step_frames;
-        let valid_delay_samples = window_samples.saturating_sub(frame_samples);
+        // A one-frame window uses circular correlation because the reverse
+        // pilot reference repeats every frame.
+        let valid_delay_samples = if window_samples == frame_samples {
+            frame_samples.saturating_sub(1)
+        } else {
+            window_samples.saturating_sub(frame_samples)
+        };
 
         let mut planner = FftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(fft_len);
@@ -574,6 +580,36 @@ mod tests {
             best.preamble_start_chip,
             (preamble_offset_samples / oversample) as u64
         );
+    }
+
+    #[test]
+    fn single_frame_search_finds_wrapped_delay() {
+        let frame_chips = 128;
+        let oversample = 4;
+        let cfg = HrpdReverseFftPilotSearchConfig {
+            oversample,
+            frame_chips,
+            search_window_frames: 1,
+            search_step_frames: 1,
+            snr_threshold: 10.0,
+            max_hits_per_window: 4,
+            hit_suppression_chips: 32,
+        };
+        let mut searcher = HrpdReverseFftPilotSearcher::new(cfg);
+        let reference = FixedBpskReference::new(frame_chips, 0x1234_5678);
+        let delay_samples = frame_chips * oversample - 17;
+        let mut signal = vec![Complex32::new(0.0, 0.0); searcher.window_samples()];
+        let signal_len = signal.len();
+        for (chip_idx, chip) in reference.chips.iter().enumerate() {
+            for sample_offset in 0..oversample {
+                let idx = (delay_samples + chip_idx * oversample + sample_offset) % signal_len;
+                signal[idx] = *chip;
+            }
+        }
+
+        let hits = searcher.scan_top_hits(&signal, 0, 4, &reference);
+        assert!(!hits.is_empty(), "expected a wrapped single-frame hit");
+        assert_eq!(hits[0].delay_samples, delay_samples);
     }
 
     #[test]

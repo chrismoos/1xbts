@@ -2434,6 +2434,18 @@ mod tests {
             pipeline_elapsed.as_secs_f64(),
             multiplier,
         );
+        let min_multiplier = if std::env::var_os("CI").is_some() {
+            HRPD_ACCESS_CI_MIN_REALTIME_SPEEDUP
+        } else {
+            HRPD_ACCESS_MIN_REALTIME_SPEEDUP
+        };
+        assert!(
+            multiplier >= min_multiplier,
+            "HRPD reverse access below the {min_multiplier:.1}x realtime floor: \
+             speedup={multiplier:.2}x capture={capture_seconds:.2}s \
+             pipeline={:.2}s",
+            pipeline_elapsed.as_secs_f64(),
+        );
 
         let events = collect_hrpd_access_capture_events(out_rx);
         let fcs_valid = events
@@ -2473,10 +2485,7 @@ mod tests {
             fcs_valid
         );
 
-        // Pull the shared correlator's accumulated timing counters and lock
-        // them in as a regression guard. Budgets are set at ~2x the measured
-        // values on the development machine to keep CI noise from flapping
-        // while still catching genuine regressions.
+        // Guard the production search stages against algorithmic CPU regressions.
         let metrics_handle =
             crate::receiver::hrpd::reverse_correlator_base::get_metrics_handle("hrpd_access")
                 .expect("hrpd_access correlator metrics should be registered");
@@ -2527,10 +2536,8 @@ mod tests {
             spawn_pct = 100.0 * spawn_total_ms as f64 / total_pipeline_ms.max(1) as f64,
             spawn_calls = metrics.spawn_finger_calls,
         );
-        // Budgets reflect the multi-tier non-coherent primary searcher:
-        // ~400us per_block, ~6000us per primary scan, and 1-2 spawn calls
-        // per capture. The surviving spawn does the full timing search and
-        // is expensive per-call but rare. Budgets give ~2× CI headroom.
+        // These per-stage ceilings leave scheduler headroom while catching
+        // unexpectedly expensive search or timing refinement.
         assert!(
             per_block_us < 10_000,
             "hrpd_access per_block_avg too slow: {per_block_us}us (budget 10000us)",
@@ -2548,6 +2555,8 @@ mod tests {
     const RC1_RATE_COUNT_PER_BUCKET_TOLERANCE: usize = 3;
     const RC1_RATE_COUNT_TOTAL_DRIFT_TOLERANCE: usize = 6;
     const CAPTURE_CI_MIN_REALTIME_SPEEDUP: f64 = 1.25;
+    const HRPD_ACCESS_MIN_REALTIME_SPEEDUP: f64 = 18.0;
+    const HRPD_ACCESS_CI_MIN_REALTIME_SPEEDUP: f64 = 12.0;
 
     fn assert_rc1_rate_counts_with_small_drift(
         actual: &std::collections::BTreeMap<i64, usize>,
