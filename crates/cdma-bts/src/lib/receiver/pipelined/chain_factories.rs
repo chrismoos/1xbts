@@ -49,6 +49,8 @@ pub struct ReverseTrafficSettings {
     /// Per C.S0002-E §2.1.3.12.7: when true and rate is 1500 bps (RC3),
     /// the mobile only transmits R-FCH on PCGs {2,3,6,7,10,11,14,15}.
     pub rev_fch_gating_mode: bool,
+    /// Maximum RAKE finger workers. A value of one processes inline.
+    pub finger_pool_size: usize,
 }
 
 /// Settings for an HRPD Reverse Access Channel receiver.
@@ -373,6 +375,7 @@ pub fn reverse_traffic_chain(settings: ReverseTrafficSettings) -> Vec<PipelinePr
         Box::new(PulseMatchedFilterProcessor::new()),
         Box::new(
             generic_rake_receiver::GenericRakeReceiver::new(correlator)
+                .with_finger_pool_size(settings.finger_pool_size)
                 .with_prune_policy(Box::new(reverse_traffic_prune_policy())),
         ),
     ]
@@ -451,6 +454,7 @@ pub fn reverse_traffic_chain_rc3(settings: ReverseTrafficSettings) -> Vec<Pipeli
         Box::new(
             generic_rake_receiver::GenericRakeReceiver::new(correlator)
                 .with_max_fingers(1)
+                .with_finger_pool_size(settings.finger_pool_size)
                 .with_prune_policy(Box::new(reverse_traffic_prune_policy())),
         ),
     ]

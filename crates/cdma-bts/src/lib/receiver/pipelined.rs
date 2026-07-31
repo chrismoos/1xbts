@@ -4110,6 +4110,7 @@ mod tests {
             preamble_num_pcgs: None,
             epl_pilot: true,
             rev_fch_gating_mode: false,
+            finger_pool_size: 1,
         });
 
         let mut receiver = PipelinedReceiver::new(iq_samples.into_iter())
@@ -4208,6 +4209,7 @@ mod tests {
             preamble_num_pcgs: None,
             epl_pilot: true,
             rev_fch_gating_mode: false,
+            finger_pool_size: 1,
         });
 
         let mut receiver = PipelinedReceiver::new(iq_samples.into_iter())
@@ -5375,6 +5377,7 @@ mod tests {
             preamble_num_pcgs,
             epl_pilot: true,
             rev_fch_gating_mode: false,
+            finger_pool_size: 1,
         });
 
         let mut receiver = PipelinedReceiver::new(iq_samples.into_iter())
@@ -6113,6 +6116,7 @@ mod tests {
                 preamble_num_pcgs: None,
                 epl_pilot: false,
                 rev_fch_gating_mode: false,
+                finger_pool_size: 1,
             });
 
             let wav_duration_secs = iq_samples.len() as f64 / sample_rate as f64;

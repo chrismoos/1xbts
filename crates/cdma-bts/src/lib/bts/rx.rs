@@ -380,6 +380,7 @@ fn spawn_traffic_rx_thread(
     preamble_num_pcgs: Option<usize>,
     use_rc3: bool,
     rev_fch_gating_mode: bool,
+    finger_pool_size: usize,
     traffic_rx_continuity: bool,
     event_tx: Option<tokio_mpsc::UnboundedSender<AccessChannelEvent>>,
     reverse_bearer_tx: Option<mpsc::Sender<UdpBearerDatagram>>,
@@ -399,6 +400,7 @@ fn spawn_traffic_rx_thread(
         preamble_num_pcgs,
         epl_pilot: use_rc3,
         rev_fch_gating_mode,
+        finger_pool_size,
     };
     let (iq_tx, iq_rx) = mpsc::channel::<TrafficRxBlock>();
     let thread_shutdown = Arc::new(AtomicBool::new(false));
@@ -534,13 +536,12 @@ fn spawn_hrpd_traffic_rx_thread(
         harq_bus,
         reverse_pilot_acquired.clone(),
     );
-    // One AT per worker → at most one active finger. The correlator already
-    // suppresses additional spawns while a finger is active, but the rake's
-    // explicit cap is the defensive belt to that suspenders.
+    // Each HRPD traffic RX thread uses one finger until multipath combining is supported.
     let rake: PipelineProcessorShared = Box::new(
         GenericRakeReceiver::new(correlator)
             .with_prune_policy(Box::new(HrpdTrafficPrunePolicy))
-            .with_max_fingers(1),
+            .with_max_fingers(1)
+            .with_finger_pool_size(1),
     );
     let mut processors: Vec<PipelineProcessorShared> = vec![rake];
 
@@ -2489,6 +2490,7 @@ fn process_rx_message(
                 req.preamble_num_pcgs,
                 use_rc3,
                 req.rev_fch_gating_mode,
+                runtime.config.global_finger_pool_size,
                 runtime.config.traffic_rx_continuity,
                 runtime.config.access_event_tx.clone(),
                 runtime.config.reverse_bearer_tx.clone(),

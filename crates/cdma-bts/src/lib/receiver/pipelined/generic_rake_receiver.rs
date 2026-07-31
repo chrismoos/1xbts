@@ -778,8 +778,8 @@ pub struct GenericRakeReceiver<C: Correlator> {
     /// Recently emitted access bursts so the same decoded burst is forwarded
     /// only once even if multiple fingers or re-emit paths produce it.
     recent_access_burst_order: VecDeque<AccessBurstKey>,
-    /// Thread pool for parallel finger feeding.
-    finger_pool: FingerFeedPool<C::Finger>,
+    finger_pool: Option<FingerFeedPool<C::Finger>>,
+    finger_pool_size: usize,
 }
 
 impl<C: Correlator> GenericRakeReceiver<C> {
@@ -801,7 +801,8 @@ impl<C: Correlator> GenericRakeReceiver<C> {
             last_report_correlator_ns: 0,
             last_report_fingers_ns: 0,
             recent_access_burst_order: VecDeque::new(),
-            finger_pool: FingerFeedPool::new(Self::DEFAULT_FINGER_POOL_SIZE),
+            finger_pool: None,
+            finger_pool_size: Self::DEFAULT_FINGER_POOL_SIZE,
         }
     }
 
@@ -817,12 +818,16 @@ impl<C: Correlator> GenericRakeReceiver<C> {
     /// opens via pruning.
     pub fn with_max_fingers(mut self, n: usize) -> Self {
         self.max_fingers = n;
+        self.finger_pool_size = self.finger_pool_size.min(n);
+        self.finger_pool = None;
         self
     }
 
-    /// Set the finger-feed thread pool size.  Default is 8.
+    /// Set the maximum finger worker count. The count is capped by
+    /// `max_fingers`; values below two process inline.
     pub fn with_finger_pool_size(mut self, n: usize) -> Self {
-        self.finger_pool = FingerFeedPool::new(n);
+        self.finger_pool_size = n.min(self.max_fingers);
+        self.finger_pool = None;
         self
     }
 
@@ -918,12 +923,28 @@ impl<C: Correlator> GenericRakeReceiver<C> {
             return outputs;
         }
 
+        // One worker cannot add parallelism, so process inline.
+        if self.finger_pool_size <= 1 {
+            let mut all_outputs = Vec::new();
+            for active in &mut self.fingers {
+                let t = Instant::now();
+                let outputs = active.finger.process(&block, &mut active.chain);
+                let elapsed = t.elapsed().as_nanos() as u64;
+                active.process_ns = active.process_ns.saturating_add(elapsed);
+                active.process_calls = active.process_calls.saturating_add(1);
+                all_outputs.extend(outputs);
+            }
+            return all_outputs;
+        }
+
+        let pool = self
+            .finger_pool
+            .get_or_insert_with(|| FingerFeedPool::new(self.finger_pool_size));
         let block = Arc::new(block);
         let fingers = std::mem::take(&mut self.fingers);
 
         for (idx, finger) in fingers.into_iter().enumerate() {
-            self.finger_pool
-                .work_tx
+            pool.work_tx
                 .send(FingerWorkItem {
                     idx,
                     finger,
@@ -936,8 +957,7 @@ impl<C: Correlator> GenericRakeReceiver<C> {
         let mut all_outputs = Vec::new();
 
         for _ in 0..n {
-            let r = self
-                .finger_pool
+            let r = pool
                 .result_rx
                 .recv()
                 .expect("finger-pool worker threads died unexpectedly");
@@ -1358,6 +1378,44 @@ mod tests {
         }
     }
 
+    fn mock_receiver_with_fingers(count: usize) -> GenericRakeReceiver<MockCorrelator> {
+        let detections = (0..count)
+            .map(|id| (MockFinger::new(id as u64, vec![Vec::new()]), Vec::new()))
+            .collect();
+        GenericRakeReceiver::new(MockCorrelator {
+            detections,
+            removed_ids: Vec::new(),
+            search_suppressed: false,
+        })
+    }
+
+    #[test]
+    fn finger_pool_is_capped_by_max_fingers_and_created_lazily() {
+        let mut receiver = mock_receiver_with_fingers(3)
+            .with_max_fingers(3)
+            .with_finger_pool_size(8);
+
+        assert_eq!(3, receiver.finger_pool_size);
+        assert!(receiver.finger_pool.is_none());
+
+        receiver.process_block(SampleBlock::new(Vec::new(), 0));
+
+        assert_eq!(3, receiver.finger_count());
+        assert_eq!(3, receiver.finger_pool.as_ref().unwrap().workers.len());
+    }
+
+    #[test]
+    fn one_worker_configuration_processes_inline_without_spawning_pool() {
+        let mut receiver = mock_receiver_with_fingers(3)
+            .with_max_fingers(3)
+            .with_finger_pool_size(1);
+
+        receiver.process_block(SampleBlock::new(Vec::new(), 0));
+
+        assert_eq!(3, receiver.finger_count());
+        assert!(receiver.finger_pool.is_none());
+    }
+
     fn access_event_block(
         finger_id: i64,
         chip_start: usize,
@@ -1551,18 +1609,38 @@ mod tests {
     #[test]
     fn traffic_mode_keeps_only_one_validated_finger_after_lock() {
         let first = MockFinger::new(3, vec![Vec::new()]);
-        let second = MockFinger::new(7, vec![Vec::new()]);
+        let second = MockFinger::new(7, vec![Vec::new(), Vec::new()]);
         let mut receiver = GenericRakeReceiver::new(MockCorrelator {
             detections: vec![(first, Vec::new()), (second, Vec::new())],
             removed_ids: Vec::new(),
-            search_suppressed: true,
+            search_suppressed: false,
         });
 
+        receiver.process_block(SampleBlock::new(Vec::new(), 0));
+        receiver.correlator.search_suppressed = true;
         let out = receiver.process_block(SampleBlock::new(Vec::new(), 0));
 
         assert!(out.is_empty());
         assert_eq!(1, receiver.finger_count());
         assert_eq!(vec![7], receiver.correlator.removed_ids);
+    }
+
+    #[test]
+    fn suppressed_search_does_not_run_correlator_below_finger_capacity() {
+        let first = MockFinger::new(3, vec![Vec::new(), Vec::new()]);
+        let mut receiver = GenericRakeReceiver::new(MockCorrelator {
+            detections: vec![(first, Vec::new())],
+            removed_ids: Vec::new(),
+            search_suppressed: false,
+        });
+
+        receiver.process_block(SampleBlock::new(Vec::new(), 0));
+        receiver.correlator.detections = vec![(MockFinger::new(7, vec![]), Vec::new())];
+        receiver.correlator.search_suppressed = true;
+        receiver.process_block(SampleBlock::new(Vec::new(), 0));
+
+        assert_eq!(1, receiver.finger_count());
+        assert_eq!(1, receiver.correlator.detections.len());
     }
 }
 
@@ -1589,9 +1667,7 @@ impl<C: Correlator> PipelineProcessor for GenericRakeReceiver<C> {
         // aged out does not block a fresh detection for one extra input block.
         self.prune_fingers();
 
-        // 1. Run the correlator — may return new (finger, chain) pairs.
-        //    Skip entirely when we already have max_fingers validated fingers;
-        //    the search + candidate verification + replay is wasted work.
+        // Traffic correlators suppress acquisition while their selected finger remains viable.
         let t0 = std::time::Instant::now();
         let validated_count = self
             .fingers
@@ -1599,7 +1675,7 @@ impl<C: Correlator> PipelineProcessor for GenericRakeReceiver<C> {
             .filter(|af| af.notified_validated)
             .count();
         let mut out = Vec::new();
-        if validated_count < self.max_fingers {
+        if validated_count < self.max_fingers && !self.correlator.search_suppressed() {
             let detections = self.correlator.correlate(&block);
             self.spawn_fingers(detections);
         }

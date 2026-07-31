@@ -1,5 +1,6 @@
 # HEAD 
 
+- Reduced BTS RX thread usage for active 1x and EV-DO traffic.
 - Increased and balanced 1x transmit power in adjacent 1x/EV-DO composite mode.
 - Fixed rejection of EV-DO composite adjacent carriers whose transition bands overlap.
 - EV-DO composite mode now accepts adjacent 1x and HRPD carriers when their occupied bandwidths do not overlap.

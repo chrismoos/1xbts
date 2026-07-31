@@ -1700,6 +1700,7 @@ mod reverse_power_control_tests {
             preamble_num_pcgs: None,
             epl_pilot: true,
             rev_fch_gating_mode: false,
+            finger_pool_size: 1,
         });
 
         let mut receiver = PipelinedReceiver::new(iq_samples.into_iter())
