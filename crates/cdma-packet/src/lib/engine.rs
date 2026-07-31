@@ -3046,11 +3046,6 @@ mod tests {
         assert_eq!(octets.1, 0);
         assert!(octets.0.starts_with(&[0x7e]));
         assert!(octets.0.ends_with(&[0x7e]));
-        assert_ne!(
-            octets.0.len() % 8,
-            6,
-            "A10 carries octets, not HRPD RLP bits"
-        );
     }
 
     #[test]

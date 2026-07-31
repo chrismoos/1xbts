@@ -34,8 +34,12 @@ use cdma_common::hrpd::messages::{
     SyncMessage,
 };
 
+/// SR1 passband edge specified by C.S0002/C.S0024. Carriers may have
+/// overlapping transition bands, but their passbands must not overlap.
+pub const SR1_PASSBAND_HALF_BW_HZ: i64 = 590_000;
+pub const SR1_MIN_CARRIER_SEPARATION_HZ: usize = SR1_PASSBAND_HALF_BW_HZ as usize * 2;
 /// Conservative occupied half-bandwidth for one SR1 CDMA/HRPD carrier. Used
-/// only to validate whether two synthesized carriers fit in one RF bandwidth.
+/// to derive the total RF bandwidth and validate complex-Nyquist containment.
 pub const SR1_OCCUPIED_HALF_BW_HZ: i64 = 740_000;
 pub const SR1_OCCUPIED_BANDWIDTH_HZ: usize = SR1_OCCUPIED_HALF_BW_HZ as usize * 2;
 /// Maximum span, in slots, for an in-flight Control packet at the selected
@@ -611,11 +615,11 @@ pub fn resolve_evdo_config(
     let (composite_center_frequency_hz, one_x_shift_hz, evdo_shift_hz) = match tx_mode {
         EvdoTxMode::AdjacentComposite => {
             let carrier_separation_hz = one_x_frequency_hz.abs_diff(evdo_frequency_hz);
-            if carrier_separation_hz < SR1_OCCUPIED_BANDWIDTH_HZ {
+            if carrier_separation_hz < SR1_MIN_CARRIER_SEPARATION_HZ {
                 return Err(format!(
                     "evdo.channel must be at least {} Hz from bts.channel in composite mode \
-                     to avoid carrier overlap (current separation={} Hz)",
-                    SR1_OCCUPIED_BANDWIDTH_HZ, carrier_separation_hz
+                     to avoid passband overlap (current separation={} Hz)",
+                    SR1_MIN_CARRIER_SEPARATION_HZ, carrier_separation_hz
                 )
                 .into());
             }

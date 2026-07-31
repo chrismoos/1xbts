@@ -1014,6 +1014,54 @@ mod tests {
     }
 
     #[test]
+    fn loads_adjacent_bc1_composite_evdo_carriers() {
+        let dir = temp_test_dir("evdo-composite-adjacent-bc1-carriers");
+        let config_path = dir.join("bts.json");
+
+        fs::write(
+            &config_path,
+            r#"{
+  "channel": {
+    "band_class": "bc1",
+    "band_subclass": 0,
+    "cdma_channel": 775
+  },
+  "radio": { "kind": "noop" },
+  "evdo": {
+    "enabled": true,
+    "channel": 750,
+    "overhead": {
+      "sector_id": "00800580000000000000000000000000",
+      "subnet_mask": 26,
+      "color_code": 26
+    }
+  }
+}
+"#,
+        )
+        .expect("write bts config");
+
+        let cfg = BtsNodeConfig::load_from_path(&config_path).expect("load config");
+        assert_eq!(cfg.runtime.tx_sample_rate_hz, 4_915_200);
+        assert_eq!(cfg.runtime.tx_bandwidth_hz, 2_730_000);
+
+        let resolved = evdo::resolve_evdo_config(
+            &cfg.evdo,
+            cfg.pilot_offset,
+            cfg.channel,
+            cfg.runtime.tx_sample_rate_hz,
+            cfg.runtime.tx_bandwidth_hz,
+        )
+        .expect("resolve adjacent BC1 carriers")
+        .expect("EV-DO enabled");
+        assert_eq!(resolved.one_x_frequency_hz, 1_968_750_000);
+        assert_eq!(resolved.evdo_frequency_hz, 1_967_500_000);
+        assert_eq!(resolved.one_x_shift_hz, 625_000);
+        assert_eq!(resolved.evdo_shift_hz, -625_000);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn rejects_overlapping_composite_evdo_carriers() {
         let dir = temp_test_dir("evdo-composite-overlapping-carriers");
         let config_path = dir.join("bts.json");
@@ -1044,7 +1092,7 @@ mod tests {
         let err = BtsNodeConfig::load_from_path(&config_path).expect_err("expected config error");
         assert!(
             err.to_string()
-                .contains("evdo.channel must be at least 1480000 Hz from bts.channel"),
+                .contains("evdo.channel must be at least 1180000 Hz from bts.channel"),
             "unexpected error: {err}"
         );
         fs::remove_dir_all(dir).ok();
