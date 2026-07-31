@@ -302,27 +302,117 @@ impl PhasorNco {
         }
         let mut idx = 0usize;
         while idx < samples.len() {
-            let until_resync = PHASOR_NCO_RESYNC_SAMPLES
-                .saturating_sub(self.samples_since_resync)
-                .max(1) as usize;
-            let end = (idx + until_resync).min(samples.len());
+            let end = idx + self.rotation_chunk_len(samples.len() - idx);
             let mut rotor = self.rotor;
             let rotor_step = self.rotor_step;
             for sample in &mut samples[idx..end] {
                 *sample *= rotor;
                 rotor *= rotor_step;
             }
-            let advanced = (end - idx) as u32;
-            self.rotor = rotor;
-            self.phase_rad += self.phase_step_rad * f64::from(advanced);
-            self.samples_since_resync += advanced;
-            if self.samples_since_resync >= PHASOR_NCO_RESYNC_SAMPLES {
-                self.phase_rad = self.phase_rad.rem_euclid(2.0 * std::f64::consts::PI);
-                self.rotor =
-                    Complex32::new(self.phase_rad.cos() as f32, self.phase_rad.sin() as f32);
-                self.samples_since_resync = 0;
-            }
+            self.finish_rotation_chunk(rotor, (end - idx) as u32);
             idx = end;
+        }
+    }
+
+    /// Rotate two streams with independent NCOs, then gain and sum them into
+    /// `out`. Both NCOs stop at every resynchronization boundary, preserving
+    /// the same phase state as separate [`rotate_in_place`](Self::rotate_in_place)
+    /// calls while touching the full-rate sample buffers only once.
+    pub(crate) fn rotate_sum_into(
+        &mut self,
+        left: &[Complex32],
+        right_nco: &mut Self,
+        right: &[Complex32],
+        right_gain: f32,
+        output_scale: f32,
+        out: &mut Vec<Complex32>,
+    ) {
+        assert_eq!(left.len(), right.len());
+        out.clear();
+        out.reserve(left.len());
+
+        let mut idx = 0usize;
+        while idx < left.len() {
+            let remaining = left.len() - idx;
+            let chunk_len = self
+                .rotation_chunk_len(remaining)
+                .min(right_nco.rotation_chunk_len(remaining));
+            let end = idx + chunk_len;
+            let mut left_rotor = self.rotor;
+            let mut right_rotor = right_nco.rotor;
+            let left_step = self.rotor_step;
+            let right_step = right_nco.rotor_step;
+
+            match (self.active, right_nco.active) {
+                (true, true) => {
+                    for (&left_sample, &right_sample) in left[idx..end].iter().zip(&right[idx..end])
+                    {
+                        out.push(
+                            (left_sample * left_rotor + right_sample * right_rotor * right_gain)
+                                * output_scale,
+                        );
+                        left_rotor *= left_step;
+                        right_rotor *= right_step;
+                    }
+                }
+                (true, false) => {
+                    for (&left_sample, &right_sample) in left[idx..end].iter().zip(&right[idx..end])
+                    {
+                        out.push(
+                            (left_sample * left_rotor + right_sample * right_gain) * output_scale,
+                        );
+                        left_rotor *= left_step;
+                    }
+                }
+                (false, true) => {
+                    for (&left_sample, &right_sample) in left[idx..end].iter().zip(&right[idx..end])
+                    {
+                        out.push(
+                            (left_sample + right_sample * right_rotor * right_gain) * output_scale,
+                        );
+                        right_rotor *= right_step;
+                    }
+                }
+                (false, false) => {
+                    out.extend(left[idx..end].iter().zip(&right[idx..end]).map(
+                        |(&left_sample, &right_sample)| {
+                            (left_sample + right_sample * right_gain) * output_scale
+                        },
+                    ));
+                }
+            }
+
+            let advanced = chunk_len as u32;
+            self.finish_rotation_chunk(left_rotor, advanced);
+            right_nco.finish_rotation_chunk(right_rotor, advanced);
+            idx = end;
+        }
+    }
+
+    #[inline]
+    fn rotation_chunk_len(&self, remaining: usize) -> usize {
+        if !self.active {
+            return remaining;
+        }
+        remaining.min(
+            PHASOR_NCO_RESYNC_SAMPLES
+                .saturating_sub(self.samples_since_resync)
+                .max(1) as usize,
+        )
+    }
+
+    #[inline]
+    fn finish_rotation_chunk(&mut self, rotor: Complex32, advanced: u32) {
+        if !self.active {
+            return;
+        }
+        self.rotor = rotor;
+        self.phase_rad += self.phase_step_rad * f64::from(advanced);
+        self.samples_since_resync += advanced;
+        if self.samples_since_resync >= PHASOR_NCO_RESYNC_SAMPLES {
+            self.phase_rad = self.phase_rad.rem_euclid(2.0 * std::f64::consts::PI);
+            self.rotor = Complex32::new(self.phase_rad.cos() as f32, self.phase_rad.sin() as f32);
+            self.samples_since_resync = 0;
         }
     }
 }
@@ -837,6 +927,52 @@ mod tests {
         assert!(constant.is_active());
         let got = constant.mix(Complex32::new(1.0, 0.0));
         assert!((got - Complex32::new(0.0, 1.0)).norm() < 1e-6);
+    }
+
+    #[test]
+    fn phasor_nco_fused_rotate_sum_matches_separate_passes() {
+        let left = (0..5000)
+            .map(|n| Complex32::new((n as f32 * 0.017).sin(), (n as f32 * 0.031).cos()))
+            .collect::<Vec<_>>();
+        let right = (0..5000)
+            .map(|n| Complex32::new((n as f32 * 0.043).cos(), (n as f32 * 0.029).sin()))
+            .collect::<Vec<_>>();
+
+        for (left_offset, right_offset) in
+            [(123_400, -617_000), (0, -617_000), (123_400, 0), (0, 0)]
+        {
+            let mut separate_left = PhasorNco::from_offset_hz(left_offset, 4_915_200);
+            let mut separate_right = PhasorNco::from_offset_hz(right_offset, 4_915_200);
+            let mut fused_left = PhasorNco::from_offset_hz(left_offset, 4_915_200);
+            let mut fused_right = PhasorNco::from_offset_hz(right_offset, 4_915_200);
+            let mut got = Vec::new();
+            for _ in 0..17 {
+                separate_right.mix(Complex32::new(0.0, 0.0));
+                fused_right.mix(Complex32::new(0.0, 0.0));
+            }
+
+            for range in [0..733, 733..2167, 2167..5000] {
+                let mut expected_left = left[range.clone()].to_vec();
+                let mut expected_right = right[range.clone()].to_vec();
+                separate_left.rotate_in_place(&mut expected_left);
+                separate_right.rotate_in_place(&mut expected_right);
+                let expected = expected_left
+                    .iter()
+                    .zip(&expected_right)
+                    .map(|(&left_sample, &right_sample)| (left_sample + right_sample * 0.37) * 0.23)
+                    .collect::<Vec<_>>();
+
+                fused_left.rotate_sum_into(
+                    &left[range.clone()],
+                    &mut fused_right,
+                    &right[range],
+                    0.37,
+                    0.23,
+                    &mut got,
+                );
+                assert_eq!(got, expected);
+            }
+        }
     }
 
     #[test]

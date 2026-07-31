@@ -1522,8 +1522,6 @@ impl AdjacentCarrierComposer {
         self.one_x_shaper
             .shape_into(one_x_chips, &mut self.one_x_buf);
         self.evdo_shaper.shape_into(evdo_chips, &mut self.evdo_buf);
-        self.one_x_rotator.rotate_in_place(&mut self.one_x_buf);
-        self.evdo_rotator.rotate_in_place(&mut self.evdo_buf);
         // `evdo_gain` is the linear amplitude ratio HRPD : 1x at the chip
         // output. `composite_scale` keeps the summed peak bounded when both
         // carriers are at full scale. `tx_digital_backoff` is applied to BOTH
@@ -1531,15 +1529,13 @@ impl AdjacentCarrierComposer {
         // to 1x.
         let g = self.evdo_gain.max(0.0);
         let composite_scale = self.tx_digital_backoff / (1.0 + g);
-        out.clear();
-        out.reserve(self.one_x_buf.len());
-        out.extend(
-            self.one_x_buf
-                .iter()
-                .zip(&self.evdo_buf)
-                .map(|(one_x_sample, evdo_sample)| {
-                    (one_x_sample + evdo_sample * g) * composite_scale
-                }),
+        self.one_x_rotator.rotate_sum_into(
+            &self.one_x_buf,
+            &mut self.evdo_rotator,
+            &self.evdo_buf,
+            g,
+            composite_scale,
+            out,
         );
     }
 
