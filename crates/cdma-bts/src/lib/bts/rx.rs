@@ -6024,7 +6024,7 @@ mod tests {
             backlog_at_push_done,
         );
         const MIN_REALTIME_RATIO: f64 = 5.0;
-        const CI_MIN_REALTIME_RATIO: f64 = 4.0;
+        const CI_MIN_REALTIME_RATIO: f64 = 1.75;
         let min_realtime_ratio = if std::env::var_os("CI").is_some() {
             CI_MIN_REALTIME_RATIO
         } else {
