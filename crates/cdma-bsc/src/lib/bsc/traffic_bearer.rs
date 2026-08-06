@@ -11,10 +11,11 @@ use cdma_abis::bearer::{
     ReverseFchDcchFrame, TrafficFrame as AbisTrafficFrame,
 };
 use cdma_bts::receiver::{
-    access::DedicatedFrameReader,
+    access::{AccessFrame, DedicatedFrameReader},
     pipelined::{
         ReverseMux1SignalingLayout, extract_reverse_mux1_full_rate_signaling_block,
-        parse_reverse_mux1_full_rate_format,
+        extract_reverse_mux2_signaling_block, parse_reverse_mux1_full_rate_format,
+        parse_reverse_mux2_format,
     },
 };
 use cdma_common::access::RdschPdu;
@@ -22,6 +23,7 @@ use cdma_common::channel::TrafficRate;
 use cdma_common::events::AccessChannelEvent;
 use cdma_common::lac::message_types::MessageId;
 use cdma_common::{bits::Bitstream, error::Error};
+use cdma_voice::{SAMPLES_PER_FRAME, VoiceCodec, VoiceEncoder};
 use log::{debug, info, trace, warn};
 use tokio::sync::mpsc::error::TrySendError;
 use uuid::Uuid;
@@ -37,6 +39,10 @@ fn encode_forward_bearer_rate(for_rc: u8, rate: TrafficRate) -> FrameContent {
         (1, TrafficRate::Half) => FrameContent::FchRc1_4800,
         (1, TrafficRate::Quarter) => FrameContent::FchRc1_2400,
         (1, TrafficRate::Eighth) => FrameContent::FchRc1_1200,
+        (2, TrafficRate::Full) => FrameContent::FchRc2_14400,
+        (2, TrafficRate::Half) => FrameContent::FchRc2_7200,
+        (2, TrafficRate::Quarter) => FrameContent::FchRc2_3600,
+        (2, TrafficRate::Eighth) => FrameContent::FchRc2_1800,
         (_, TrafficRate::Full) => FrameContent::FchRc3_9600,
         (_, TrafficRate::Half) => FrameContent::FchRc3_4800,
         (_, TrafficRate::Quarter) => FrameContent::FchRc3_2700,
@@ -136,6 +142,8 @@ pub(crate) struct ReverseBearerMuxReaders {
 pub(crate) struct TrafficBearerService {
     pub(crate) next_tx_frame_number: u32,
     pub(crate) reverse_mux_readers: std::collections::HashMap<u8, ReverseBearerMuxReaders>,
+    pub(crate) reverse_voice_silence_encoders:
+        std::collections::HashMap<u8, std::sync::Mutex<(VoiceCodec, VoiceEncoder)>>,
 }
 
 impl TrafficBearerService {
@@ -157,6 +165,57 @@ impl Default for ReverseBearerMuxReaders {
 }
 
 impl Bsc {
+    fn is_reverse_mux2_frame(frame_content: FrameContent) -> bool {
+        matches!(
+            frame_content,
+            FrameContent::FchRc2_14400
+                | FrameContent::FchRc2_7200
+                | FrameContent::FchRc2_3600
+                | FrameContent::FchRc2_1800
+        )
+    }
+
+    fn decode_reverse_mux2_bearer_frame(
+        readers: &mut ReverseBearerMuxReaders,
+        walsh_code: u8,
+        frame_content: FrameContent,
+        info: &[u8],
+    ) -> Option<AccessFrame> {
+        let format = parse_reverse_mux2_format(info)?;
+        debug!(
+            "BSC: reverse bearer MUX2 walsh={} frame_content=0x{:02X} mux_header=0x{:X} header_bits={} primary_bits={} signaling_bits={}",
+            walsh_code,
+            frame_content.value(),
+            format.mux_header,
+            format.header_bits,
+            format.primary_bits,
+            format.signaling_bits,
+        );
+        let signaling = extract_reverse_mux2_signaling_block(info)?;
+        let mut bits = Bitstream::new_init(&signaling.bits);
+        let frame = match readers.suffix_reader.process(&mut bits) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => return None,
+            Err(e) => {
+                warn!(
+                    "BSC: reverse bearer MUX2/SAR decode failed walsh={}: {}",
+                    walsh_code, e
+                );
+                return None;
+            }
+        };
+        if !frame.crc_valid {
+            debug!(
+                "BSC: reverse bearer R-DSCH CRC invalid walsh={} mux=2 msg_len={}",
+                walsh_code, frame.msg_length_octets
+            );
+            return None;
+        }
+        readers.prefix_reader.reset();
+        readers.locked_layout = Some(ReverseMux1SignalingLayout::Suffix);
+        Some(frame)
+    }
+
     pub(super) fn send_forward_fch_signaling_bits(
         &mut self,
         walsh_code: u8,
@@ -283,6 +342,12 @@ impl Bsc {
                 } else {
                     self.route_reverse_bearer_packet_primary(walsh_code, fch)
                         .await;
+                    if let Err(error) = self.relay_reverse_silence_to_msc(walsh_code) {
+                        debug!(
+                            "BSC: bad reverse frame on walsh={} had no silence substitution: {}",
+                            walsh_code, error
+                        );
+                    }
                     log::trace!(
                         "BSC: reverse bearer voice/data walsh={} frame_content=0x{:02X} bits={}",
                         walsh_code,
@@ -292,6 +357,61 @@ impl Bsc {
                 }
             }
         }
+    }
+
+    pub(crate) fn relay_reverse_silence_to_msc(&mut self, walsh_code: u8) -> Result<(), String> {
+        if !self.reverse_voice_media_enabled(walsh_code) {
+            return Err("reverse MSC voice media is not active".to_string());
+        }
+        let Some(bearer) = self.config.msc_voice_bearer.clone() else {
+            return Err("MSC voice bearer is not configured".to_string());
+        };
+        let Some((circuit_id, service_option)) =
+            self.mobiles.get_traffic_channel(walsh_code).and_then(|tc| {
+                let service_option = super::traffic_forward::voice_service_option_for_channel(tc)?;
+                Some((tc.msc_circuit_id?, service_option))
+            })
+        else {
+            return Err("traffic channel has no MSC voice circuit".to_string());
+        };
+        let Some(codec) = VoiceCodec::from_service_option(service_option) else {
+            return Err(format!("service option {} is not voice", service_option));
+        };
+
+        let encoder_state = match self
+            .traffic_bearer
+            .reverse_voice_silence_encoders
+            .entry(walsh_code)
+        {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let encoder = VoiceEncoder::new(codec)?;
+                entry.insert(std::sync::Mutex::new((codec, encoder)))
+            }
+        };
+        let encoder_state = encoder_state
+            .get_mut()
+            .map_err(|_| "reverse silence encoder state is poisoned".to_string())?;
+        if encoder_state.0 != codec {
+            let encoder = VoiceEncoder::new(codec)?;
+            *encoder_state = (codec, encoder);
+        }
+
+        let silence = [0i16; SAMPLES_PER_FRAME];
+        let (rate, payload) = encoder_state.1.encode(&silence)?;
+        let frame = cdma_ios::VoiceBearerFrame {
+            circuit_id,
+            rate_bps: codec.rate_bps(rate),
+            payload,
+        };
+        bearer
+            .try_send_frame(&frame)
+            .map_err(|error| format!("MSC circuit_id={} send failed: {}", circuit_id, error))?;
+        debug!(
+            "BSC: replaced bad reverse voice frame with silence walsh={} circuit_id={}",
+            walsh_code, circuit_id
+        );
+        Ok(())
     }
 
     pub(crate) async fn route_reverse_bearer_packet_primary(
@@ -376,6 +496,23 @@ impl Bsc {
         }
 
         let info = &fch.reverse_link_information[..expected_info_bits];
+        if Self::is_reverse_mux2_frame(fch.frame_content) {
+            let format = parse_reverse_mux2_format(info)?;
+            if format.primary_bits == 0 {
+                return None;
+            }
+            let primary_rate_bps = match format.primary_bits {
+                266 => 14_400,
+                124 => 7_200,
+                54 => 3_600,
+                20 => 1_800,
+                _ => return None,
+            };
+            let primary_start = format.header_bits;
+            let primary_end = primary_start + format.primary_bits;
+            return Some((info[primary_start..primary_end].to_vec(), primary_rate_bps));
+        }
+
         match fch.frame_content.rate_bps()? {
             9600 => {
                 let format = parse_reverse_mux1_full_rate_format(info)?;
@@ -507,6 +644,25 @@ impl Bsc {
         }
 
         let info = &fch.reverse_link_information[..expected_info_bits];
+        let readers = self
+            .traffic_bearer
+            .reverse_mux_readers
+            .entry(walsh_code)
+            .or_default();
+        if Self::is_reverse_mux2_frame(fch.frame_content) {
+            let frame = Self::decode_reverse_mux2_bearer_frame(
+                readers,
+                walsh_code,
+                fch.frame_content,
+                info,
+            )?;
+            return Self::bearer_reverse_signaling_to_event(
+                walsh_code,
+                frame.data.bits(),
+                tx_frame_number,
+            );
+        }
+
         let format = parse_reverse_mux1_full_rate_format(info)?;
         debug!(
             "BSC: reverse bearer MUX1 walsh={} frame_content=0x{:02X} mux_header=0b{:04b} primary_bits={} signaling_bits={}",
@@ -520,11 +676,6 @@ impl Bsc {
             return None;
         }
 
-        let readers = self
-            .traffic_bearer
-            .reverse_mux_readers
-            .entry(walsh_code)
-            .or_default();
         let layouts_to_try = match readers.locked_layout {
             Some(ReverseMux1SignalingLayout::Prefix) => [
                 ReverseMux1SignalingLayout::Prefix,
@@ -774,6 +925,23 @@ impl Bsc {
 mod tests {
     use super::*;
 
+    fn reverse_fch(frame_content: FrameContent, information: Vec<u8>) -> ReverseFchDcchFrame {
+        ReverseFchDcchFrame {
+            channel_family: ChannelFamily::Fch,
+            soft_handoff_leg: 0,
+            fsn: 0,
+            fqi: true,
+            reverse_link_quality: 0,
+            scaling: 0,
+            packet_arrival_time_error: 0,
+            frame_content,
+            fpc_s: 0,
+            eib: false,
+            reverse_link_information: information,
+            message_crc: 0,
+        }
+    }
+
     #[test]
     fn rc1_forward_bearer_rates_use_rc1_frame_content() {
         assert_eq!(
@@ -792,6 +960,107 @@ mod tests {
             encode_forward_bearer_rate(1, TrafficRate::Eighth),
             FrameContent::FchRc1_1200
         );
+    }
+
+    #[test]
+    fn rc2_forward_bearer_rates_use_rc2_frame_content() {
+        assert_eq!(
+            encode_forward_bearer_rate(2, TrafficRate::Full),
+            FrameContent::FchRc2_14400
+        );
+        assert_eq!(
+            encode_forward_bearer_rate(2, TrafficRate::Half),
+            FrameContent::FchRc2_7200
+        );
+        assert_eq!(
+            encode_forward_bearer_rate(2, TrafficRate::Quarter),
+            FrameContent::FchRc2_3600
+        );
+        assert_eq!(
+            encode_forward_bearer_rate(2, TrafficRate::Eighth),
+            FrameContent::FchRc2_1800
+        );
+    }
+
+    #[test]
+    fn rc2_reverse_bearer_extracts_primary_at_all_rates() {
+        let cases = [
+            (FrameContent::FchRc2_14400, vec![0], 266, 14_400),
+            (FrameContent::FchRc2_7200, vec![0], 124, 7_200),
+            (FrameContent::FchRc2_3600, vec![0], 54, 3_600),
+            (FrameContent::FchRc2_1800, vec![0], 20, 1_800),
+        ];
+
+        for (frame_content, header, primary_bits, primary_rate_bps) in cases {
+            let mut information = header;
+            information.extend(std::iter::repeat_n(1, primary_bits));
+            information.resize(frame_content.information_bits(), 0);
+            let fch = reverse_fch(frame_content, information);
+
+            let (primary, rate) =
+                Bsc::extract_reverse_bearer_primary_bits(&fch).expect("RC2 primary traffic");
+            assert_eq!(primary, vec![1; primary_bits]);
+            assert_eq!(rate, primary_rate_bps);
+        }
+    }
+
+    #[test]
+    fn extracted_voice_primary_keeps_leading_codec_bit_when_packed_for_a2p() {
+        let cases = [
+            (FrameContent::FchRc3_9600, 171usize, 9_600),
+            (FrameContent::FchRc2_14400, 266, 14_400),
+            (FrameContent::FchRc2_7200, 124, 7_200),
+            (FrameContent::FchRc2_3600, 54, 3_600),
+            (FrameContent::FchRc2_1800, 20, 1_800),
+        ];
+
+        for (frame_content, primary_bits, primary_rate_bps) in cases {
+            let primary = (0..primary_bits)
+                .map(|index| u8::from(index % 3 == 1))
+                .collect::<Vec<_>>();
+            assert_eq!(primary[0], 0);
+
+            let mut information = vec![0];
+            information.extend_from_slice(&primary);
+            information.resize(frame_content.information_bits(), 0);
+            let fch = reverse_fch(frame_content, information);
+
+            let (extracted, rate) =
+                Bsc::extract_reverse_bearer_primary_bits(&fch).expect("primary traffic");
+            assert_eq!(extracted, primary);
+            assert_eq!(rate, primary_rate_bps);
+
+            let packed =
+                crate::voice_bearer_bits::pack_voice_bits_for_bearer(&extracted, rate).unwrap();
+            assert_eq!(
+                cdma_voice::unpack_voice_bits(&packed, primary_bits),
+                primary
+            );
+        }
+    }
+
+    #[test]
+    fn rc2_half_rate_reverse_bearer_reassembles_signaling() {
+        let mut pdu = Bitstream::new();
+        pdu.write_u8(0x01, 8);
+        let full_rate_frames = cdma_bts::lac::sar_fragment_ftch_pdu_dsch_rc2(&pdu);
+        let full_rate_bits = full_rate_frames[0].bits();
+
+        let mut half_rate_bits = vec![1, 0, 0, 0];
+        half_rate_bits.extend(std::iter::repeat_n(0, 54));
+        half_rate_bits.extend_from_slice(&full_rate_bits[5..5 + 67]);
+
+        let mut readers = ReverseBearerMuxReaders::default();
+        let frame = Bsc::decode_reverse_mux2_bearer_frame(
+            &mut readers,
+            12,
+            FrameContent::FchRc2_7200,
+            &half_rate_bits,
+        )
+        .expect("half-rate R-DSCH frame");
+
+        assert!(frame.crc_valid);
+        assert_eq!(frame.data.bits(), pdu.bits());
     }
 
     #[test]

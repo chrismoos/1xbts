@@ -695,7 +695,13 @@ export interface PagingChannelAssignment {
   grantedMode?: number | undefined;
   assignModeName: string;
   defaultConfigName: string;
-  directChAssignInd?: boolean | undefined;
+  directChAssignInd?:
+    | boolean
+    | undefined;
+  /**
+   * Effective forward and reverse RC. Explicit in ECAM; resolved from the
+   * supported CAM assignment form when CAM carries no explicit RC fields.
+   */
   forRc?: number | undefined;
   revRc?: number | undefined;
   fpcSubchanGain?: number | undefined;
@@ -1103,14 +1109,14 @@ export interface TrafficChannelPower {
   /**
    * Per-PCG pilot Ec/Nt estimates (dB) used by the inner-loop power
    * control. For RC3 this comes from R-PICH scatter (rate-independent,
-   * every PCG). For RC1 this equals the data Eb/Nt from FHT peak/noise
+   * every PCG). For RC1/RC2 this equals the data Eb/Nt from FHT peak/noise
    * (active PCGs only). Separate from `last_pcg_snr_db` which carries
    * the per-frame data Eb/Nt snapshot.
    */
   lastPcgPilotEcNtDb: number[];
   /**
-   * Reverse radio configuration (1 = RC1, 3 = RC3, etc.). Lets the UI
-   * choose appropriate labels and metric interpretation.
+   * Reverse radio configuration. Lets the UI choose appropriate labels
+   * and metric interpretation.
    */
   reverseRadioConfig: number;
   /**
@@ -1120,6 +1126,8 @@ export interface TrafficChannelPower {
    * 5-minute buffer (~600 entries).
    */
   powerHistory: PowerControlSample[];
+  /** Forward radio configuration assigned to the traffic channel. */
+  forwardRadioConfig: number;
 }
 
 /**
@@ -14579,6 +14587,7 @@ function createBaseTrafficChannelPower(): TrafficChannelPower {
     lastPcgPilotEcNtDb: [],
     reverseRadioConfig: 0,
     powerHistory: [],
+    forwardRadioConfig: 0,
   };
 }
 
@@ -14650,6 +14659,9 @@ export const TrafficChannelPower: MessageFns<TrafficChannelPower> = {
     }
     for (const v of message.powerHistory) {
       PowerControlSample.encode(v!, writer.uint32(154).fork()).join();
+    }
+    if (message.forwardRadioConfig !== 0) {
+      writer.uint32(160).uint32(message.forwardRadioConfig);
     }
     return writer;
   },
@@ -14863,6 +14875,14 @@ export const TrafficChannelPower: MessageFns<TrafficChannelPower> = {
           message.powerHistory.push(PowerControlSample.decode(reader, reader.uint32()));
           continue;
         }
+        case 20: {
+          if (tag !== 160) {
+            break;
+          }
+
+          message.forwardRadioConfig = reader.uint32();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -14969,6 +14989,11 @@ export const TrafficChannelPower: MessageFns<TrafficChannelPower> = {
         : globalThis.Array.isArray(object?.power_history)
         ? object.power_history.map((e: any) => PowerControlSample.fromJSON(e))
         : [],
+      forwardRadioConfig: isSet(object.forwardRadioConfig)
+        ? globalThis.Number(object.forwardRadioConfig)
+        : isSet(object.forward_radio_config)
+        ? globalThis.Number(object.forward_radio_config)
+        : 0,
     };
   },
 
@@ -15031,6 +15056,9 @@ export const TrafficChannelPower: MessageFns<TrafficChannelPower> = {
     if (message.powerHistory?.length) {
       obj.powerHistory = message.powerHistory.map((e) => PowerControlSample.toJSON(e));
     }
+    if (message.forwardRadioConfig !== 0) {
+      obj.forwardRadioConfig = Math.round(message.forwardRadioConfig);
+    }
     return obj;
   },
 
@@ -15058,6 +15086,7 @@ export const TrafficChannelPower: MessageFns<TrafficChannelPower> = {
     message.lastPcgPilotEcNtDb = object.lastPcgPilotEcNtDb?.map((e) => e) || [];
     message.reverseRadioConfig = object.reverseRadioConfig ?? 0;
     message.powerHistory = object.powerHistory?.map((e) => PowerControlSample.fromPartial(e)) || [];
+    message.forwardRadioConfig = object.forwardRadioConfig ?? 0;
     return message;
   },
 };

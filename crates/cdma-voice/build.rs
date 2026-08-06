@@ -243,6 +243,216 @@ fn main() {
     bw_build.file(csrc.join("evrcbw.cc"));
     bw_build.compile("evrcbw");
 
+    // QCELP-13K (TIA/ANSI-733) reference codec
+    let qcelp = csrc.join("qcelp13k");
+    let mut qc = cc::Build::new();
+    qc.include(qcelp.join("code"))
+        .include(&qcelp)
+        .include(&csrc)
+        .warnings(false)
+        .flag_if_supported("-Wno-implicit-function-declaration")
+        .flag_if_supported("-Wno-implicit-int")
+        .flag_if_supported("-Wno-incompatible-pointer-types")
+        .flag_if_supported("-Wno-int-conversion")
+        .flag_if_supported("-Wno-deprecated-non-prototype")
+        .flag_if_supported("-Wno-unused-variable")
+        .flag_if_supported("-Wno-unused-but-set-variable")
+        .flag_if_supported("-Wno-sometimes-uninitialized")
+        .flag_if_supported("-Wno-parentheses")
+        .flag_if_supported("-Wno-dangling-else")
+        .flag_if_supported("-Wno-sign-compare")
+        .flag_if_supported("-Wno-absolute-value")
+        .flag_if_supported("-Wno-unsequenced");
+
+    // Rename QCELP-13K functions that collide with EVRC's exported
+    // symbols. The catalogue lives in csrc/qcelp13k/MODIFICATIONS.txt.
+    for (symbol, prefixed) in [
+        ("durbin", "qcelp_durbin"),
+        ("filter", "qcelp_filter"),
+        ("lpc2lsp", "qcelp_lpc2lsp"),
+        ("lsp2lpc", "qcelp_lsp2lpc"),
+        ("convolve", "qcelp_convolve"),
+        ("hammsinc", "qcelp_hammsinc"),
+        ("front_end_filter", "qcelp_front_end_filter"),
+        ("getbit", "qcelp_getbit"),
+        ("initialize_pole_filter", "qcelp_initialize_pole_filter"),
+        ("initialize_zero_filter", "qcelp_initialize_zero_filter"),
+        (
+            "initialize_pole_1_tap_filter",
+            "qcelp_initialize_pole_1_tap_filter",
+        ),
+        ("free_pole_filter", "qcelp_free_pole_filter"),
+        ("free_zero_filter", "qcelp_free_zero_filter"),
+        ("agc", "qcelp_agc"),
+        ("compute_lpc", "qcelp_compute_lpc"),
+        ("compute_pitch", "qcelp_compute_pitch"),
+        ("encoder", "qcelp_encoder"),
+        ("decoder", "qcelp_decoder"),
+        ("pack_frame", "qcelp_pack_frame"),
+        ("unpack_frame", "qcelp_unpack_frame"),
+        ("putbit", "qcelp_putbit"),
+        ("truefalse", "qcelp_truefalse"),
+        ("log_10", "qcelp_log_10"),
+        ("round_flt", "qcelp_round_flt"),
+        ("compute_autocorr", "qcelp_compute_autocorr"),
+        ("HAMMINGwindow", "qcelp_HAMMINGwindow"),
+        ("band_energy_fcn", "qcelp_band_energy_fcn"),
+        (
+            "initialize_encoder_and_decoder",
+            "qcelp_initialize_encoder_and_decoder",
+        ),
+        ("initialize_decoder", "qcelp_initialize_decoder"),
+        ("free_encoder_and_decoder", "qcelp_free_encoder_and_decoder"),
+    ] {
+        qc.define(symbol, prefixed);
+    }
+
+    let qcelp_code_sources = [
+        // No glob: every TU is enumerated.
+        "cb.c",
+        "cb_tabs.c",
+        "coderate.c",
+        "decode.c",
+        "encode.c",
+        "filter.c",
+        "frontfil.c",
+        "hammtab.c",
+        "init.c",
+        "log_10.c",
+        "lpc.c",
+        "lsp.c",
+        "modetabs.c",
+        "pack.c",
+        "pitch.c",
+        "postfilt.c",
+        "quantabs.c",
+        "quantize.c",
+        "ratedec.c",
+        "snr.c",
+        "target.c",
+        // SKIPPED, per MODIFICATIONS.txt:
+        //   celp13k.c   (CLI main; we drive encoder()/decoder() directly)
+        //   fer_sim.c   (frame-erasure simulator; not used)
+        //   io.c        (raw-file I/O for CLI)
+        //   rate_dos.c  (duplicates ratedec.c symbols)
+        //   ratedec_dos.c (duplicates ratedec.c symbols)
+    ];
+    for src in &qcelp_code_sources {
+        qc.file(qcelp.join("code").join(src));
+    }
+    qc.file(csrc.join("qcelp13k.c"));
+    qc.compile("qcelp13k");
+
+    // TIA-96 / IS-96A Service Option 1 reference codec
+    let tia96 = csrc.join("tia96");
+    let mut tia = cc::Build::new();
+    tia.include(tia96.join("code"))
+        .include(&tia96)
+        .include(&csrc)
+        .define("INTTYPE", "int")
+        .warnings(false)
+        .flag_if_supported("-std=gnu89")
+        .flag_if_supported("-ffp-contract=off")
+        .flag_if_supported("-Wno-implicit-function-declaration")
+        .flag_if_supported("-Wno-implicit-int")
+        .flag_if_supported("-Wno-deprecated-non-prototype")
+        .flag_if_supported("-Wno-unused-variable")
+        .flag_if_supported("-Wno-unused-but-set-variable")
+        .flag_if_supported("-Wno-parentheses")
+        .flag_if_supported("-Wno-sign-compare");
+
+    for symbol in [
+        "compute_cb",
+        "decoder",
+        "run_decoder",
+        "agc",
+        "encoder",
+        "initialize_pole_filter",
+        "initialize_pole_1_tap_filter",
+        "initialize_zero_filter",
+        "initialize_pole_zero_filter",
+        "do_pole_filter",
+        "do_pole_filter_1_tap",
+        "do_zero_filter",
+        "do_pole_zero_filter",
+        "get_impulse_response_pole",
+        "get_zero_input_response_pole",
+        "get_zero_input_response_pole_1_tap",
+        "initialize_encoder_and_decoder",
+        "compute_lpc",
+        "hamming_window",
+        "compute_autocorr",
+        "interp_lpcs",
+        "lpc2lsp",
+        "lsp2lpc",
+        "lpc2pq",
+        "pq2lpc",
+        "pq2lsp",
+        "lsp2pq",
+        "convolve_odd",
+        "convolve",
+        "rsearch",
+        "lsp_poly_eval",
+        "pack_lsp",
+        "pack_pitch",
+        "pack_cb",
+        "pack_frame",
+        "unpack_cb",
+        "unpack_frame",
+        "clear_packet_params",
+        "compute_pcb",
+        "check_pcb",
+        "cycle_pcb",
+        "putbit",
+        "getbit",
+        "truefalse",
+        "compute_pitch",
+        "initial_recursive_conv",
+        "recursive_conv",
+        "dc_block",
+        "lin_quant",
+        "lin_unquant",
+        "quantize_lsp",
+        "unquantize_lsp",
+        "check_lsp_stab",
+        "quantize_b_and_lag",
+        "unquantize_b_and_lag",
+        "quantize_b",
+        "unquantize_b",
+        "quantize_i",
+        "unquantize_i",
+        "quantize_G",
+        "unquantize_G",
+        "update_Gpred",
+        "select_rate",
+        "compute_formant_residual",
+        "update_form_resid_mems",
+        "create_pitch_target",
+        "create_cb_target",
+    ] {
+        tia.define(symbol, format!("tia96_ref_{symbol}").as_str());
+    }
+
+    for src in [
+        "cb.c",
+        "decode.c",
+        "encode.c",
+        "filter.c",
+        "init.c",
+        "lpc.c",
+        "lsp.c",
+        "pack.c",
+        "pitch.c",
+        "prepro.c",
+        "quantize.c",
+        "ratedec.c",
+        "target.c",
+    ] {
+        tia.file(tia96.join("code").join(src));
+    }
+    tia.file(csrc.join("tia96.c"));
+    tia.compile("tia96");
+
     // Rerun if any C source or header changes
     println!("cargo:rerun-if-changed=csrc/");
 }

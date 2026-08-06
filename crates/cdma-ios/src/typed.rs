@@ -1517,6 +1517,9 @@ impl ServiceOption {
     /// SO70: EVRC-WB.
     pub const EVRC_WB: Self = Self(70);
 
+    /// SO32768: QCELP-13K.
+    pub const QCELP_13K: Self = Self(32768);
+
     /// Encodes the service-option payload.
     pub const fn encode(self) -> [u8; 2] {
         self.0.to_be_bytes()
@@ -1631,15 +1634,17 @@ pub struct A2pBearerFormatParams {
 }
 
 impl A2pBearerFormatParams {
-    /// Canonical entry list for a voice call carrying EVRC plus RFC 4733
-    /// telephone-event for DTMF (A.S0014-D Table 4.2.90-3 IDs 3 and 7).
-    pub fn evrc_with_telephone_event(evrc_pt: u8, telephone_event_pt: u8) -> Self {
+    pub fn voice_with_telephone_event(
+        format: crate::voice_bearer::VoiceBearerFormat,
+        voice_pt: u8,
+        telephone_event_pt: u8,
+    ) -> Self {
         Self {
             formats: vec![
                 BearerFormatEntry {
                     bearer_format_tag_type: 1,
-                    bearer_format_id: crate::voice_bearer::bearer_format_id::EVRC,
-                    rtp_payload_type: evrc_pt,
+                    bearer_format_id: format.bearer_format_id(),
+                    rtp_payload_type: voice_pt,
                     bearer_addr: None,
                 },
                 BearerFormatEntry {
@@ -1650,6 +1655,35 @@ impl A2pBearerFormatParams {
                 },
             ],
         }
+    }
+
+    pub fn for_service_option_with_telephone_event(
+        service_option: ServiceOption,
+        voice_pt: u8,
+        telephone_event_pt: u8,
+    ) -> Option<Self> {
+        let format = match service_option {
+            ServiceOption::EVRC_A => crate::voice_bearer::VoiceBearerFormat::Evrc,
+            ServiceOption::EVRC_B => crate::voice_bearer::VoiceBearerFormat::EvrcB,
+            ServiceOption::EVRC_WB => crate::voice_bearer::VoiceBearerFormat::EvrcWb,
+            ServiceOption::QCELP_13K => crate::voice_bearer::VoiceBearerFormat::Vocoder13k,
+            _ => return None,
+        };
+        Some(Self::voice_with_telephone_event(
+            format,
+            voice_pt,
+            telephone_event_pt,
+        ))
+    }
+
+    /// Canonical entry list for a voice call carrying EVRC plus RFC 4733
+    /// telephone-event for DTMF (A.S0014-D Table 4.2.90-3 IDs 3 and 7).
+    pub fn evrc_with_telephone_event(evrc_pt: u8, telephone_event_pt: u8) -> Self {
+        Self::voice_with_telephone_event(
+            crate::voice_bearer::VoiceBearerFormat::Evrc,
+            evrc_pt,
+            telephone_event_pt,
+        )
     }
 
     /// PT for the first telephone-event entry, if present.
@@ -1666,6 +1700,16 @@ impl A2pBearerFormatParams {
             .iter()
             .find(|f| f.bearer_format_id == crate::voice_bearer::bearer_format_id::EVRC)
             .map(|f| f.rtp_payload_type)
+    }
+
+    pub fn voice_payload_type(&self) -> Option<crate::voice_bearer::VoiceBearerPayloadType> {
+        self.formats.iter().find_map(|entry| {
+            crate::voice_bearer::VoiceBearerFormat::from_bearer_format_id(entry.bearer_format_id)
+                .map(|format| crate::voice_bearer::VoiceBearerPayloadType {
+                    format,
+                    payload_type: entry.rtp_payload_type,
+                })
+        })
     }
 
     /// Encodes per §4.2.90.

@@ -693,6 +693,20 @@ impl Rc1TrafficFrameAligner {
         Some(10.0 * linear_mean.max(1e-9).log10())
     }
 
+    fn pcg_mobile_power_dbfs_at_offset(&self, chip_offset: usize) -> Option<f32> {
+        if self.chip_buf.len() < chip_offset + PCG_CHIPS {
+            return None;
+        }
+        let energies = (0..RC1_SYMBOLS_PER_PCG)
+            .map(|symbol| {
+                let start = chip_offset + symbol * PN_CHIPS_PER_SYMBOL;
+                let end = start + PN_CHIPS_PER_SYMBOL;
+                Self::demodulate_symbol_with_energies(&self.chip_buf[start..end]).1
+            })
+            .collect::<Vec<_>>();
+        Some(super::walsh64_mobile_power_dbfs(energies.iter()))
+    }
+
     fn pcg_snr_db_for_frame(&self, chip_phase: usize) -> Option<Vec<f32>> {
         if self.chip_buf.len() < chip_phase + RC1_SYMBOLS_PER_FRAME * PN_CHIPS_PER_SYMBOL {
             return None;
@@ -795,6 +809,9 @@ impl Rc1TrafficFrameAligner {
             let Some(eb_nt_db) = self.pcg_eb_nt_db_at_offset(chip_offset) else {
                 break;
             };
+            let Some(mobile_power_dbfs) = self.pcg_mobile_power_dbfs_at_offset(chip_offset) else {
+                break;
+            };
             let measurement_abs_chip = base_abs_chip.saturating_add(chip_offset as u64);
             let age_chips = self
                 .last_processing_absolute_chip_end
@@ -807,6 +824,10 @@ impl Rc1TrafficFrameAligner {
             tags.insert(
                 "traffic_measurement_age_chips",
                 i64::try_from(age_chips).unwrap_or(i64::MAX),
+            );
+            tags.insert(
+                "traffic_pcg_mobile_power_mdbfs",
+                (mobile_power_dbfs * 1000.0) as i64,
             );
 
             let mut block = SampleBlock::new(Vec::new(), self.chip_start + chip_offset)
@@ -1863,6 +1884,7 @@ mod tests {
         );
         for block in out {
             assert_eq!(block.tags.get("traffic_pcg_measurement"), Some(&1));
+            assert!(block.tags.contains_key("traffic_pcg_mobile_power_mdbfs"));
             assert_eq!(block.pcg_signal_snr_db.as_ref().map(Vec::len), Some(1));
 
             let measurement_abs_chip = *block.tags.get("absolute_chip_start").unwrap() as u64;

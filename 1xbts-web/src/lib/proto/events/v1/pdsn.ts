@@ -31,6 +31,8 @@ export enum ServiceOption {
   SERVICE_OPTION_EVRC_B = 68,
   /** SERVICE_OPTION_SMS_EXT - SO70 — extended SMS encoding. */
   SERVICE_OPTION_SMS_EXT = 70,
+  /** SERVICE_OPTION_QCELP_13K - SO32768 — 13 kbps QCELP voice. */
+  SERVICE_OPTION_QCELP_13K = 32768,
   UNRECOGNIZED = -1,
 }
 
@@ -60,6 +62,9 @@ export function serviceOptionFromJSON(object: any): ServiceOption {
     case 70:
     case "SERVICE_OPTION_SMS_EXT":
       return ServiceOption.SERVICE_OPTION_SMS_EXT;
+    case 32768:
+    case "SERVICE_OPTION_QCELP_13K":
+      return ServiceOption.SERVICE_OPTION_QCELP_13K;
     case -1:
     case "UNRECOGNIZED":
     default:
@@ -85,6 +90,8 @@ export function serviceOptionToJSON(object: ServiceOption): string {
       return "SERVICE_OPTION_EVRC_B";
     case ServiceOption.SERVICE_OPTION_SMS_EXT:
       return "SERVICE_OPTION_SMS_EXT";
+    case ServiceOption.SERVICE_OPTION_QCELP_13K:
+      return "SERVICE_OPTION_QCELP_13K";
     case ServiceOption.UNRECOGNIZED:
     default:
       return "UNRECOGNIZED";

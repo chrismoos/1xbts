@@ -2,8 +2,8 @@
 //!
 //! Carries circuit-switched voice frames between the MSC media plane and the
 //! BSC radio-access bearer relay using RTP over UDP/IP per 3GPP2 A.S0014-D.
-//! Payload format: EVRC header-full mode per RFC 3558 (Bearer Format ID 3,
-//! Table 4.2.90-3).
+//! The per-circuit Bearer Format-Specific Parameters select the RTP codec
+//! payload defined for that circuit.
 //!
 //! Each voice circuit gets its own UDP socket pair, with bearer parameters
 //! (IP address and UDP port) exchanged via A2p Bearer Session-Level Parameters
@@ -15,7 +15,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Mutex;
 
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// Bearer Format IDs from A.S0014-D Table 4.2.90-3.
 pub mod bearer_format_id {
@@ -35,9 +35,11 @@ pub mod bearer_format_id {
     pub const EVRCNW0: u8 = 0xD;
 }
 
-/// Default dynamic PT for EVRC. The actual PT is negotiated per call via the
-/// BearerFormatEntry IE (A.S0014-D §4.2.90); this is the historical fallback.
-pub const EVRC_RTP_PAYLOAD_TYPE: u8 = 96;
+/// Default dynamic PT for the negotiated voice format.
+pub const VOICE_RTP_PAYLOAD_TYPE: u8 = 96;
+
+/// Compatibility alias for callers that name the EVRC default explicitly.
+pub const EVRC_RTP_PAYLOAD_TYPE: u8 = VOICE_RTP_PAYLOAD_TYPE;
 
 /// Default dynamic PT for telephone-event. Negotiated per call; see EVRC.
 pub const TELEPHONE_EVENT_RTP_PAYLOAD_TYPE: u8 = 101;
@@ -48,6 +50,88 @@ const TIMESTAMP_INCREMENT: u32 = 160;
 pub const RFC4733_END_REPEAT_COUNT: usize = 3;
 
 const RTP_HEADER_LEN: usize = 12;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceBearerFormat {
+    Vocoder13k,
+    Evrc,
+    EvrcB,
+    EvrcWb,
+}
+
+impl VoiceBearerFormat {
+    pub fn bearer_format_id(self) -> u8 {
+        match self {
+            Self::Vocoder13k => bearer_format_id::VOCODER_13K,
+            Self::Evrc => bearer_format_id::EVRC,
+            Self::EvrcB => bearer_format_id::EVRCB,
+            Self::EvrcWb => bearer_format_id::EVRCWB,
+        }
+    }
+
+    pub fn from_bearer_format_id(id: u8) -> Option<Self> {
+        match id {
+            bearer_format_id::VOCODER_13K => Some(Self::Vocoder13k),
+            bearer_format_id::EVRC => Some(Self::Evrc),
+            bearer_format_id::EVRCB => Some(Self::EvrcB),
+            bearer_format_id::EVRCWB => Some(Self::EvrcWb),
+            _ => None,
+        }
+    }
+
+    fn frame_type(self, rate_bps: u32) -> Option<EvrcFrameType> {
+        match self {
+            Self::Vocoder13k => match rate_bps {
+                14_400 => Some(EvrcFrameType::Full),
+                7_200 => Some(EvrcFrameType::Half),
+                3_600 => Some(EvrcFrameType::Quarter),
+                1_800 => Some(EvrcFrameType::Eighth),
+                0 => Some(EvrcFrameType::Blank),
+                _ => None,
+            },
+            Self::Evrc | Self::EvrcB | Self::EvrcWb => match rate_bps {
+                9_600 => Some(EvrcFrameType::Full),
+                4_800 => Some(EvrcFrameType::Half),
+                2_400 | 2_700 => Some(EvrcFrameType::Quarter),
+                1_200 | 1_500 => Some(EvrcFrameType::Eighth),
+                0 => Some(EvrcFrameType::Blank),
+                _ => None,
+            },
+        }
+    }
+
+    fn rate_bps(self, frame_type: EvrcFrameType) -> u32 {
+        match self {
+            Self::Vocoder13k => match frame_type {
+                EvrcFrameType::Full => 14_400,
+                EvrcFrameType::Half => 7_200,
+                EvrcFrameType::Quarter => 3_600,
+                EvrcFrameType::Eighth => 1_800,
+                EvrcFrameType::Erasure | EvrcFrameType::Blank => 0,
+            },
+            Self::Evrc | Self::EvrcB | Self::EvrcWb => frame_type.to_rate_bps(),
+        }
+    }
+
+    fn payload_bytes(self, frame_type: EvrcFrameType) -> usize {
+        match self {
+            Self::Vocoder13k => match frame_type {
+                EvrcFrameType::Full => 34,
+                EvrcFrameType::Half => 16,
+                EvrcFrameType::Quarter => 7,
+                EvrcFrameType::Eighth => 3,
+                EvrcFrameType::Erasure | EvrcFrameType::Blank => 0,
+            },
+            Self::Evrc | Self::EvrcB | Self::EvrcWb => match frame_type {
+                EvrcFrameType::Full => 22,
+                EvrcFrameType::Half => 10,
+                EvrcFrameType::Quarter => 5,
+                EvrcFrameType::Eighth => 2,
+                EvrcFrameType::Erasure | EvrcFrameType::Blank => 0,
+            },
+        }
+    }
+}
 
 /// RFC 3558 §4, Table 1: EVRC frame type codes used in the ToC entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,40 +252,54 @@ impl Default for RtpSendState {
 
 /// A decoded A2p voice bearer frame.
 ///
-/// On the wire this is an RTP packet with EVRC header-full payload (RFC 3558).
-/// The `circuit_id` identifies which per-circuit RTP session this frame belongs
-/// to. `rate_bps` maps to the RFC 3558 Table of Contents frame type.
+/// The `circuit_id` identifies the per-circuit RTP session. The negotiated
+/// [`VoiceBearerFormat`] determines the RTP payload header and rate mapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VoiceBearerFrame {
     /// Circuit identity assigned in the A1 AssignmentRequest.
     pub circuit_id: u16,
-    /// Vocoder frame rate in bits per second (9600, 4800, 2400, 1200, or 0).
+    /// Vocoder frame rate in bits per second.
     pub rate_bps: u32,
-    /// Raw EVRC codec payload bytes (no MuxPDU header).
+    /// Packed codec payload bytes without the RTP codec header.
     pub payload: Vec<u8>,
 }
 
 impl VoiceBearerFrame {
     /// Encodes as an RTP packet with EVRC header-full payload (RFC 3558 §5.2).
     #[must_use = "encoding produces a new buffer; the result should not be discarded"]
-    pub fn encode_rtp(&self, seq: u16, timestamp: u32, ssrc: u32) -> Vec<u8> {
-        let ft = EvrcFrameType::from_rate_bps(self.rate_bps);
-        let toc = ft as u8;
+    pub fn encode_rtp(&self, seq: u16, timestamp: u32, ssrc: u32) -> Option<Vec<u8>> {
+        self.encode_rtp_with_format(
+            VoiceBearerFormat::Evrc,
+            EVRC_RTP_PAYLOAD_TYPE,
+            seq,
+            timestamp,
+            ssrc,
+        )
+    }
 
-        let mut buf = Vec::with_capacity(RTP_HEADER_LEN + 1 + self.payload.len());
-
-        // V=2, P=0, X=0, CC=0
-        buf.push(0x80);
-        // M=0, PT
-        buf.push(EVRC_RTP_PAYLOAD_TYPE);
-        buf.extend_from_slice(&seq.to_be_bytes());
-        buf.extend_from_slice(&timestamp.to_be_bytes());
-        buf.extend_from_slice(&ssrc.to_be_bytes());
-        // RFC 3558 ToC entry (bits 7-4 reserved, bits 3-0 = frame type)
-        buf.push(toc);
-        buf.extend_from_slice(&self.payload);
-
-        buf
+    pub fn encode_rtp_with_format(
+        &self,
+        format: VoiceBearerFormat,
+        payload_type: u8,
+        seq: u16,
+        timestamp: u32,
+        ssrc: u32,
+    ) -> Option<Vec<u8>> {
+        let frame_type = format.frame_type(self.rate_bps)?;
+        if self.payload.len() != format.payload_bytes(frame_type) {
+            return None;
+        }
+        let mut body = Vec::with_capacity(1 + self.payload.len());
+        body.push(frame_type as u8);
+        body.extend_from_slice(&self.payload);
+        Some(encode_rtp_packet(
+            payload_type,
+            false,
+            seq,
+            timestamp,
+            ssrc,
+            &body,
+        ))
     }
 
     /// Decodes an RTP/EVRC header-full datagram into a voice bearer frame.
@@ -209,6 +307,14 @@ impl VoiceBearerFrame {
     /// The `circuit_id` is set by the caller from the per-circuit session
     /// context (not from the RTP header).
     pub fn decode_rtp(buf: &[u8], circuit_id: u16) -> Option<Self> {
+        Self::decode_rtp_with_format(buf, circuit_id, VoiceBearerFormat::Evrc)
+    }
+
+    pub fn decode_rtp_with_format(
+        buf: &[u8],
+        circuit_id: u16,
+        format: VoiceBearerFormat,
+    ) -> Option<Self> {
         if buf.len() < RTP_HEADER_LEN + 1 {
             return None;
         }
@@ -219,13 +325,22 @@ impl VoiceBearerFrame {
         let toc = buf[RTP_HEADER_LEN];
         let ft = EvrcFrameType::from_u8(toc & 0x0F)?;
         let payload = buf[RTP_HEADER_LEN + 1..].to_vec();
+        if payload.len() != format.payload_bytes(ft) {
+            return None;
+        }
 
         Some(Self {
             circuit_id,
-            rate_bps: ft.to_rate_bps(),
+            rate_bps: format.rate_bps(ft),
             payload,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoiceBearerPayloadType {
+    pub format: VoiceBearerFormat,
+    pub payload_type: u8,
 }
 
 /// Per-circuit RTP payload types negotiated via the BearerFormatEntry IE
@@ -233,14 +348,17 @@ impl VoiceBearerFrame {
 /// circuit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BearerPayloadTypes {
-    pub evrc: u8,
+    pub voice: VoiceBearerPayloadType,
     pub telephone_event: Option<u8>,
 }
 
 impl Default for BearerPayloadTypes {
     fn default() -> Self {
         Self {
-            evrc: EVRC_RTP_PAYLOAD_TYPE,
+            voice: VoiceBearerPayloadType {
+                format: VoiceBearerFormat::Evrc,
+                payload_type: EVRC_RTP_PAYLOAD_TYPE,
+            },
             telephone_event: None,
         }
     }
@@ -248,6 +366,7 @@ impl Default for BearerPayloadTypes {
 
 struct CircuitBearerSession {
     socket: std::sync::Arc<UdpSocket>,
+    _cancel_tx: oneshot::Sender<()>,
     remote_addr: Option<SocketAddr>,
     send_state: RtpSendState,
     /// RFC 4733 §2.5.1.2 holds the RTP timestamp constant across every
@@ -338,9 +457,11 @@ impl VoiceBearerManager {
         let local_addr = socket.local_addr()?;
         let socket = std::sync::Arc::new(socket);
         let payload_types = std::sync::Arc::new(Mutex::new(BearerPayloadTypes::default()));
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
 
         let session = CircuitBearerSession {
             socket: socket.clone(),
+            _cancel_tx: cancel_tx,
             remote_addr,
             send_state: RtpSendState::new(),
             dtmf_event_timestamp: None,
@@ -356,7 +477,14 @@ impl VoiceBearerManager {
         let tx = self.frame_tx.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 1500];
-            while let Ok((len, _src)) = socket.recv_from(&mut buf).await {
+            loop {
+                let received = tokio::select! {
+                    _ = &mut cancel_rx => break,
+                    received = socket.recv_from(&mut buf) => received,
+                };
+                let Ok((len, _src)) = received else {
+                    break;
+                };
                 let datagram = &buf[..len];
                 if datagram.len() < RTP_HEADER_LEN + 1 || (datagram[0] >> 6) != 2 {
                     continue;
@@ -377,8 +505,9 @@ impl VoiceBearerManager {
                             })
                         },
                     )
-                } else if pt == pts.evrc {
-                    VoiceBearerFrame::decode_rtp(datagram, circuit_id).map(BearerEvent::Voice)
+                } else if pt == pts.voice.payload_type {
+                    VoiceBearerFrame::decode_rtp_with_format(datagram, circuit_id, pts.voice.format)
+                        .map(BearerEvent::Voice)
                 } else {
                     None
                 };
@@ -420,6 +549,20 @@ impl VoiceBearerManager {
         circuits.remove(&circuit_id);
     }
 
+    /// Closes a circuit only when it still refers to the specified local socket.
+    pub fn close_circuit_owned_by(&self, circuit_id: u16, local_addr: SocketAddr) -> bool {
+        let mut circuits = self.circuits.lock().unwrap();
+        if circuits
+            .get(&circuit_id)
+            .is_some_and(|session| session.socket.local_addr().ok() == Some(local_addr))
+        {
+            circuits.remove(&circuit_id);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Returns a voice frame (EVRC) or a DTMF event (telephone-event), each
     /// matched against the per-circuit negotiated PT.
     pub async fn recv(&self) -> Option<BearerEvent> {
@@ -443,7 +586,24 @@ impl VoiceBearerManager {
                 )
             })?;
             let (seq, ts) = session.send_state.advance();
-            let encoded = frame.encode_rtp(seq, ts, session.ssrc);
+            let payload_types = *session.payload_types.lock().unwrap();
+            let encoded = frame
+                .encode_rtp_with_format(
+                    payload_types.voice.format,
+                    payload_types.voice.payload_type,
+                    seq,
+                    ts,
+                    session.ssrc,
+                )
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "rate {} is invalid for {:?}",
+                            frame.rate_bps, payload_types.voice.format
+                        ),
+                    )
+                })?;
             (session.socket.clone(), remote, encoded)
         };
         socket.send_to(&encoded, remote).await?;
@@ -557,7 +717,24 @@ impl VoiceBearerManager {
             )
         })?;
         let (seq, ts) = session.send_state.advance();
-        let encoded = frame.encode_rtp(seq, ts, session.ssrc);
+        let payload_types = *session.payload_types.lock().unwrap();
+        let encoded = frame
+            .encode_rtp_with_format(
+                payload_types.voice.format,
+                payload_types.voice.payload_type,
+                seq,
+                ts,
+                session.ssrc,
+            )
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "rate {} is invalid for {:?}",
+                        frame.rate_bps, payload_types.voice.format
+                    ),
+                )
+            })?;
         session.socket.try_send_to(&encoded, remote)?;
         Ok(())
     }
@@ -579,7 +756,9 @@ mod tests {
             rate_bps: 9600,
             payload: vec![0xAA; 22],
         };
-        let encoded = frame.encode_rtp(100, 16000, 0x12345678);
+        let encoded = frame
+            .encode_rtp(100, 16000, 0x12345678)
+            .expect("valid EVRC frame");
         let decoded = VoiceBearerFrame::decode_rtp(&encoded, 42).unwrap();
         assert_eq!(frame.circuit_id, decoded.circuit_id);
         assert_eq!(frame.rate_bps, decoded.rate_bps);
@@ -593,7 +772,9 @@ mod tests {
             rate_bps: 4800,
             payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
         };
-        let encoded = frame.encode_rtp(0x1234, 0x56789ABC, 0xDEADBEEF);
+        let encoded = frame
+            .encode_rtp(0x1234, 0x56789ABC, 0xDEADBEEF)
+            .expect("valid EVRC frame");
 
         // V=2, P=0, X=0, CC=0
         assert_eq!(encoded[0], 0x80);
@@ -613,18 +794,88 @@ mod tests {
 
     #[test]
     fn all_evrc_rates() {
-        for (rate_bps, expected_ft) in [(9600u32, 4u8), (4800, 3), (2400, 2), (1200, 1), (0, 0)] {
+        for (rate_bps, payload_bytes, expected_ft) in [
+            (9600u32, 22usize, 4u8),
+            (4800, 10, 3),
+            (2400, 5, 2),
+            (1200, 2, 1),
+            (0, 0, 0),
+        ] {
             let frame = VoiceBearerFrame {
                 circuit_id: 1,
                 rate_bps,
-                payload: vec![],
+                payload: vec![0; payload_bytes],
             };
-            let encoded = frame.encode_rtp(0, 0, 0);
+            let encoded = frame.encode_rtp(0, 0, 0).expect("valid EVRC frame");
             assert_eq!(encoded[12] & 0x0F, expected_ft, "rate_bps={}", rate_bps);
 
             let decoded = VoiceBearerFrame::decode_rtp(&encoded, 1).unwrap();
             assert_eq!(decoded.rate_bps, rate_bps);
         }
+    }
+
+    #[test]
+    fn encode_rtp_rejects_invalid_payload_length() {
+        let frame = VoiceBearerFrame {
+            circuit_id: 1,
+            rate_bps: 9600,
+            payload: vec![0; 10],
+        };
+        assert!(frame.encode_rtp(0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn all_qcelp_13k_rates_roundtrip() {
+        for (rate_bps, payload_bytes, expected_type) in [
+            (14_400u32, 34usize, 4u8),
+            (7_200, 16, 3),
+            (3_600, 7, 2),
+            (1_800, 3, 1),
+        ] {
+            let frame = VoiceBearerFrame {
+                circuit_id: 9,
+                rate_bps,
+                payload: vec![0x5a; payload_bytes],
+            };
+            let encoded = frame
+                .encode_rtp_with_format(
+                    VoiceBearerFormat::Vocoder13k,
+                    VOICE_RTP_PAYLOAD_TYPE,
+                    7,
+                    160,
+                    11,
+                )
+                .expect("valid QCELP rate");
+            assert_eq!(encoded[12], expected_type);
+            let decoded = VoiceBearerFrame::decode_rtp_with_format(
+                &encoded,
+                frame.circuit_id,
+                VoiceBearerFormat::Vocoder13k,
+            )
+            .expect("decode QCELP RTP");
+            assert_eq!(decoded, frame);
+        }
+    }
+
+    #[test]
+    fn qcelp_service_option_selects_standard_vocoder_13k_bearer_format() {
+        let params = crate::A2pBearerFormatParams::for_service_option_with_telephone_event(
+            crate::ServiceOption::QCELP_13K,
+            VOICE_RTP_PAYLOAD_TYPE,
+            TELEPHONE_EVENT_RTP_PAYLOAD_TYPE,
+        )
+        .expect("QCELP A2p format");
+        assert_eq!(
+            params.voice_payload_type(),
+            Some(VoiceBearerPayloadType {
+                format: VoiceBearerFormat::Vocoder13k,
+                payload_type: VOICE_RTP_PAYLOAD_TYPE,
+            })
+        );
+        assert_eq!(
+            params.formats[0].bearer_format_id,
+            bearer_format_id::VOCODER_13K
+        );
     }
 
     #[test]
@@ -805,7 +1056,10 @@ mod tests {
         let b_local = mgr_b.open_circuit(circuit_id, Some(a_local)).await.unwrap();
         mgr_a.set_circuit_remote(circuit_id, b_local);
         let pts = BearerPayloadTypes {
-            evrc: EVRC_RTP_PAYLOAD_TYPE,
+            voice: VoiceBearerPayloadType {
+                format: VoiceBearerFormat::Evrc,
+                payload_type: EVRC_RTP_PAYLOAD_TYPE,
+            },
             telephone_event: Some(TELEPHONE_EVENT_RTP_PAYLOAD_TYPE),
         };
         mgr_a.set_circuit_payload_types(circuit_id, pts);
@@ -852,5 +1106,63 @@ mod tests {
             payload: vec![],
         };
         assert!(mgr.try_send_frame(&frame).is_err());
+    }
+
+    #[tokio::test]
+    async fn stale_owner_cannot_close_reused_circuit() {
+        let mgr = VoiceBearerManager::new(Ipv4Addr::LOCALHOST);
+        let circuit_id: u16 = 10;
+        let stale_local_addr = mgr.open_circuit(circuit_id, None).await.unwrap();
+        let current_local_addr = mgr.open_circuit(circuit_id, None).await.unwrap();
+
+        assert_ne!(stale_local_addr, current_local_addr);
+        assert!(!mgr.close_circuit_owned_by(circuit_id, stale_local_addr));
+
+        let frame = VoiceBearerFrame {
+            circuit_id,
+            rate_bps: 9600,
+            payload: vec![],
+        };
+        assert_eq!(
+            mgr.try_send_frame(&frame).unwrap_err().kind(),
+            io::ErrorKind::NotConnected
+        );
+
+        assert!(mgr.close_circuit_owned_by(circuit_id, current_local_addr));
+        assert_eq!(
+            mgr.try_send_frame(&frame).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_preserves_qcelp_13k_rate_and_payload() {
+        let mgr_a = VoiceBearerManager::new(Ipv4Addr::LOCALHOST);
+        let mgr_b = VoiceBearerManager::new(Ipv4Addr::LOCALHOST);
+        let circuit_id = 17;
+        let a_local = mgr_a.open_circuit(circuit_id, None).await.unwrap();
+        let b_local = mgr_b.open_circuit(circuit_id, Some(a_local)).await.unwrap();
+        mgr_a.set_circuit_remote(circuit_id, b_local);
+        let payload_types = BearerPayloadTypes {
+            voice: VoiceBearerPayloadType {
+                format: VoiceBearerFormat::Vocoder13k,
+                payload_type: VOICE_RTP_PAYLOAD_TYPE,
+            },
+            telephone_event: None,
+        };
+        mgr_a.set_circuit_payload_types(circuit_id, payload_types);
+        mgr_b.set_circuit_payload_types(circuit_id, payload_types);
+
+        let frame = VoiceBearerFrame {
+            circuit_id,
+            rate_bps: 14_400,
+            payload: vec![0x6d; 34],
+        };
+        mgr_a.send_frame(&frame).await.unwrap();
+        let received = match mgr_b.recv().await.unwrap() {
+            BearerEvent::Voice(frame) => frame,
+            BearerEvent::Dtmf(_) => panic!("expected voice frame"),
+        };
+        assert_eq!(received, frame);
     }
 }

@@ -1,0 +1,212 @@
+/**********************************************************************/
+/* QCELP Variable Rate Speech Codec - Simulation of TIA IS96-A,service */
+/*     option one for TIA IS95, North American Wideband CDMA Digital  */
+/*     Cellular Telephony.                                            */
+/*                                                                    */
+/* (C) Copyright 1993, QUALCOMM Incorporated                          */
+/* QUALCOMM Incorporated                                              */
+/* 10555 Sorrento Valley Road                                         */
+/* San Diego, CA 92121                                                */
+/*                                                                    */
+/* Note:  Reproduction and use of this software for the design and    */
+/*     development of North American Wideband CDMA Digital            */
+/*     Cellular Telephony Standards is authorized by                  */
+/*     QUALCOMM Incorporated.  QUALCOMM Incorporated does not         */
+/*     authorize the use of this software for any other purpose.      */
+/*                                                                    */
+/*     The availability of this software does not provide any license */
+/*     by implication, estoppel, or otherwise under any patent rights */
+/*     of QUALCOMM Incorporated or others covering any use of the     */
+/*     contents herein.                                               */
+/*                                                                    */
+/*     Any copies of this software or derivative works must include   */
+/*     this and all other proprietary notices.                        */
+/**********************************************************************/
+
+Version History
+---------------
+2.02 - Fixed a minor bug in the rate decision.  Previously, the lowest of
+       the "high background noise" thresholds used the incorrect coefficients,
+       which caused the threshold to be computed incorrectly.
+
+       Fixed a minor bug in the LPC to LSP conversion.  Previously, the final
+       linear interpolation was done incorrectly, causing a slight error.
+
+2.01 - Changed minor bug in CB gain quantization.  Previously, if the
+       average of the previous 2 CB gains, in dB, was negative, the
+       floor function was not computed correctly.
+
+2.00 - Inserted non-differential LSP quantization to improve the
+       performance during frame erasures. (This is IS96-A).
+
+1.02 - Changed sample io so if the input file has Nx160 samples, the
+       encoder will process N frames (rather than N-1).
+
+----------------------------------------------------------------------
+
+This is a C simulation of the TIA IS-96-A speech codec for use with the
+TIA IS-95 North American Wideband CDMA Digital Cellular Telephony
+Standard.
+
+Compiling the Simulation
+------------------------
+
+The simulation was originally written for compilation on Sun Sparcstations,
+using the traditional "make" utility.  Typing "make" on a Sparcstation
+should compile the various modules and create the executable "qcelp" which
+runs the main simulation.  On other platforms, some modification of the
+makefile may be needed, or compilation using other methods may be
+required.
+
+Running the Coder
+-----------------
+
+Once compiled, a brief usage statement can be seen by entering "qcelp"
+with no command line arguments.  The coder options and command line
+arguments are described in more detail below.
+
+File Types
+----------
+
+First a note about the types of files used by this simulation.  Speech
+files contain 16 bit "byte-swapped" samples (low byte first).  The samples
+are first divided by 4.0 to create an overall maximum value of
+2^14.  After decoding, the samples are multiplied by 4.0 to restore
+the original level to the output files. The 2^14 value is slightly
+above the maximum mu-law value assumed in the IS-96-A specification, but
+the simulation performs acceptably with this
+slightly larger dynamic range.  As with any digital speech system,
+optimal performance will be achieved when the speech energy is ~20db
+below the maximum dynamic range, which makes clipping of the samples
+a rare occurrance.  Because of this, best results will be achieved if
+the input speech files are approximately 3 bits below the maximum
+16 bit dynamic range.
+
+The byte-swapping and division/multiplication by 4.0 is done in the
+"read_samples" and "write_samples" routines in the file "io.c".  This
+file can be modified to accomodate different file formats.  However,
+whatever the file format, the samples used by the coder should have
+a maximum value near 2^14.
+
+Packet files are files containing packed frames of speech data.  For each
+frame of speech, the file contains 12 byte-swapped, 16 bit words: 1 word
+containing the data rate, followed by 11 words containing the packed
+speech data (packed in accordance with the packing tables specified in
+IS-96-A).  The value for each data rate is:
+
+Value in Packet File        "Rate"       Data Bits per Frame
+------------------------------------------------------------
+  4 = 0x0004                   1                171
+  3 = 0x0003                  1/2                80
+  2 = 0x0002                  1/4                40
+  1 = 0x0001                  1/8                16
+  0 = 0x0000                 Blank                0
+ 15 = 0x000f           Full Rate Probable       171
+ 14 = 0x000e                Erasure               0
+
+Unused bits are set to 0. For example, in a Rate 1/8 frame, the packet
+file will contain the word 0x0100 (byte-swapped "0x0001") corresponding
+to Rate 1/8, followed by one 16 bit word corresponding to the 16 data bits
+for the Rate 1/8 frame (in byte-swapped form), followed by ten 16 bit
+words containing all 0 bits.
+
+Command Line Options
+--------------------
+
+ -i infn  : required :	contains the name of the input speech file,
+			or the name of the input packet file if only
+			decoding is being performed (see the -d option below).
+
+ -o outfn : required :	contains the name of the output speech file name,
+			or the name of the output packet file if only
+			encoding is being performed (see the -e option below).
+
+ -d			only perform the decoding function.  the input
+			file must contain packets of compressed data.
+
+ -e			only perform the encoding function.  the output
+			file will contain packets of compressed data.
+
+			If neither the -d or the -e options are invoked,
+			the coder performs both the encoding and decoding
+			functions by default.
+
+ -h max			sets the maximum allowable data rate to "max", using
+			the codes for the rates described in the table
+			above (Rate 1 = 4, etc).
+
+ -l min			sets the minimum allowable data rate to "min", using
+			the codes for the rates described in the table
+			above (Rate 1 = 4, etc).
+
+			If neither the -h or -l options are invoked,
+			the coder allows the data rate to vary between
+			Rate 1 and Rate 1/8 using the rate decision algorithm
+			described in the IS-96-A specification.
+			In addition, if max != min, the data rate varies
+			between "max" and "min" using the same rate decision
+			algorithm, where the data rate is set to "max" if
+			the selected data rate is >= "max", and the data rate
+			is set to "min" if the selected data rate is
+			<= "min".  See the "select_rate" routine in the
+			file "ratedec.c" for more information.
+
+ -f frames		stop processing the speech after "frames" 160 samples
+			frames of speech. (Note: the frame counter starts
+			at 0, not 1)
+
+			If the -f option is not invoked, the coder processes
+			all of the speech until the end of the input file
+			is reached.
+
+ -p flag 		If flag is set to 0, the postfilter is disabled.
+
+			If the -p option is not invoked, the postfilter is
+			enabled during decoding.
+
+ -s sigfn		Read signaling data from the file "sigfn". This
+			option allows rates to be determined on a frame
+			by frame basis.  The file "sigfn" takes the form
+
+frame_num_1	max_rate_1	min_rate_1
+frame_num_2	max_rate_2	min_rate_2
+...
+
+			This causes frame number "frame_num_1" to have
+			a maximum allowable rate of "max_rate_1" and a
+			minimum allowable rate of "min_rate_1".  (Note:
+			the first frame is frame 0, not frame 1.)  The same
+			holds for frame_num_2, and any frames beyond that
+			(Note: the frame_num parameters must be in INCREASING
+			order.).  For example, to process the input file
+			"input.spch", put the output speech in "output.spch",
+			with the 10th frame forced to "blank" and the 15th
+			frame forced to be between Rate 1/2 and Rate 1/8,
+			the following could be run.
+
+qcelp -i input.spch -o output.spch -s signal.data
+
+			where the file "signal.data" contains
+
+10	0	0
+15	3	1
+
+			In this case, every frame except for frame numbers
+			10 and 15 will have the rate selected as normal.
+
+			If the -s option is not invoked, the rate for every
+			frame will be selected as normal.
+
+
+Verifying the Simulation
+------------------------
+
+To ensure that the simulation is working properly, several files are included
+to verify the performance of the coder.  The file "m01v0000.raw" is an
+unprocessed speech file.  The file "m01v0000.pkt" is a packet file, obtained
+by running "qcelp -i m01v0000.raw -o m01v0000.pkt -e".  The file
+"m01v0000.mstr.raw" is the speech file, processed by the qcelp algorithm,
+obtained by running "qcelp -i m01v0000.pkt -o m01v0000.mstr.raw -d".
+Once the simulation is compiled, this file should be processed as
+described above, and the resulting packet file and processed speech file
+should exactly match the files included with this software.

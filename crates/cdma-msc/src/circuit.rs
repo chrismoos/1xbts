@@ -74,6 +74,7 @@ pub(crate) struct CircuitService {
     /// Per-call retry counter for MT-leg AssignmentFailure-driven re-pages.
     /// Reset on successful AssignmentComplete or call cleanup.
     pub(crate) mt_assignment_failure_retries: HashMap<CallId, u8>,
+    voice_transcoders: HashMap<(u16, u16), std::sync::Mutex<cdma_voice::VoiceTranscoder>>,
 }
 
 impl CircuitService {
@@ -87,7 +88,46 @@ impl CircuitService {
             deferred_paging_requests: HashMap::new(),
             paging_requests: HashMap::new(),
             mt_assignment_failure_retries: HashMap::new(),
+            voice_transcoders: HashMap::new(),
         }
+    }
+
+    pub(crate) fn bridge_voice_frame(
+        &mut self,
+        source_circuit_id: u16,
+        target_circuit_id: u16,
+        source_codec: cdma_voice::VoiceCodec,
+        target_codec: cdma_voice::VoiceCodec,
+        frame: cdma_ios::VoiceBearerFrame,
+    ) -> Result<cdma_ios::VoiceBearerFrame, String> {
+        if source_codec == target_codec {
+            return Ok(cdma_ios::VoiceBearerFrame {
+                circuit_id: target_circuit_id,
+                rate_bps: frame.rate_bps,
+                payload: frame.payload,
+            });
+        }
+        let transcoder = match self
+            .voice_transcoders
+            .entry((source_circuit_id, target_circuit_id))
+        {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(std::sync::Mutex::new(cdma_voice::VoiceTranscoder::new(
+                    source_codec,
+                    target_codec,
+                )?))
+            }
+        };
+        let transcoded = transcoder
+            .get_mut()
+            .map_err(|_| "voice transcoder state is poisoned".to_string())?
+            .transcode(frame.rate_bps, &frame.payload)?;
+        Ok(cdma_ios::VoiceBearerFrame {
+            circuit_id: target_circuit_id,
+            rate_bps: transcoded.rate_bps,
+            payload: transcoded.payload,
+        })
     }
 
     pub(crate) fn bump_assignment_failure_retry(&mut self, call_id: CallId) -> u8 {
@@ -280,6 +320,8 @@ impl CircuitService {
         {
             peer.peer_circuit_id = None;
         }
+        self.voice_transcoders
+            .retain(|(source, target), _| *source != circuit_id && *target != circuit_id);
         Some((leg_role, circuit_id))
     }
 
@@ -304,6 +346,9 @@ impl CircuitService {
             .filter(|(_, s)| s.call_id == call_id)
             .map(|(&cid, _)| cid)
             .collect();
+        self.voice_transcoders.retain(|(source, target), _| {
+            !circuit_ids.contains(source) && !circuit_ids.contains(target)
+        });
         for cid in &circuit_ids {
             if let Some(bearer) = voice_bearer {
                 bearer.close_circuit(*cid);
@@ -311,5 +356,72 @@ impl CircuitService {
             self.circuits.remove(cid);
         }
         circuit_ids
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tone_frame() -> [i16; cdma_voice::SAMPLES_PER_FRAME] {
+        let mut pcm = [0i16; cdma_voice::SAMPLES_PER_FRAME];
+        for (index, sample) in pcm.iter_mut().enumerate() {
+            let angle = 2.0 * std::f64::consts::PI * 600.0 * index as f64 / 8_000.0;
+            *sample = (angle.sin() * 9_000.0) as i16;
+        }
+        pcm
+    }
+
+    #[test]
+    fn bridge_transcodes_evrc_to_qcelp_for_peer_circuit() {
+        let mut encoder =
+            cdma_voice::VoiceEncoder::new(cdma_voice::VoiceCodec::EvrcA).expect("EVRC encoder");
+        let (rate, payload) = encoder.encode(&tone_frame()).expect("encode EVRC");
+        let input = cdma_ios::VoiceBearerFrame {
+            circuit_id: 4,
+            rate_bps: cdma_voice::VoiceCodec::EvrcA.rate_bps(rate),
+            payload,
+        };
+        let mut circuits = CircuitService::new();
+        let output = circuits
+            .bridge_voice_frame(
+                4,
+                5,
+                cdma_voice::VoiceCodec::EvrcA,
+                cdma_voice::VoiceCodec::Qcelp13k,
+                input,
+            )
+            .expect("transcode M2M frame");
+
+        assert_eq!(output.circuit_id, 5);
+        let output_rate = cdma_voice::VoiceCodec::Qcelp13k
+            .rate_from_bps(output.rate_bps)
+            .expect("QCELP rate");
+        assert_eq!(
+            output.payload.len(),
+            cdma_voice::VoiceCodec::Qcelp13k.packet_data_bytes(output_rate)
+        );
+    }
+
+    #[test]
+    fn bridge_leaves_matching_codecs_encoded_once() {
+        let input = cdma_ios::VoiceBearerFrame {
+            circuit_id: 4,
+            rate_bps: 4_800,
+            payload: vec![0x5a; 10],
+        };
+        let mut circuits = CircuitService::new();
+        let output = circuits
+            .bridge_voice_frame(
+                4,
+                5,
+                cdma_voice::VoiceCodec::EvrcA,
+                cdma_voice::VoiceCodec::EvrcA,
+                input.clone(),
+            )
+            .expect("bridge matching codecs");
+        assert_eq!(output.circuit_id, 5);
+        assert_eq!(output.rate_bps, input.rate_bps);
+        assert_eq!(output.payload, input.payload);
     }
 }

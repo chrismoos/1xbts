@@ -147,6 +147,7 @@ pub(crate) fn traffic_channel_power_snapshot(
             .map(|&raw| ForwardPowerControlState::pilot_strength_raw_to_ec_io_db(raw))
             .collect(),
         last_pcg_pilot_ec_nt_db: tc.power_control.last_pcg_pilot_ec_nt_db,
+        forward_radio_config: tc.for_rc as u32,
         reverse_radio_config: tc.rev_rc as u32,
         power_history: tc.power_control.power_history.iter().cloned().collect(),
     }
@@ -230,8 +231,8 @@ pub(crate) struct TrafficChannelInfo {
     pub(crate) msc_bearer_local_addr: Option<SocketAddr>,
     /// Current A1 clear/teardown progression for this radio leg.
     pub(crate) a1_clear_state: A1ClearState,
-    /// Last time any activity occurred on this channel (RX message received,
-    /// TX frame sent, signaling exchanged). Used for inactivity-based teardown.
+    /// Last time CRC-validated reverse traffic was received on this channel.
+    /// Used for reverse-link-loss teardown.
     pub(crate) last_activity_at: Instant,
     /// Recent primary-traffic payloads received on this traffic channel.
     pub(crate) recent_primary_frames: VecDeque<PrimaryTrafficFrame>,
@@ -422,18 +423,8 @@ impl TrafficChannelInfo {
         )
     }
 
-    pub(crate) fn latest_activity_for_idle_check(
-        &self,
-        last_bts_enqueue_at: Option<Instant>,
-    ) -> Instant {
-        if self.is_negotiating() {
-            return self.last_activity_at;
-        }
-
-        self.last_forward_enqueue_at
-            .or(last_bts_enqueue_at)
-            .filter(|tx_at| *tx_at > self.last_activity_at)
-            .unwrap_or(self.last_activity_at)
+    pub(crate) fn latest_activity_for_idle_check(&self) -> Instant {
+        self.last_activity_at
     }
 
     pub(crate) fn traffic_lifecycle_action(
@@ -576,14 +567,14 @@ impl TrafficChannelInfo {
                 self.channel_state.label(),
                 next.label(),
             );
-        } else {
-            debug!(
-                "traffic_channel: walsh={} {} -> {}",
-                self.walsh_code,
-                self.channel_state.label(),
-                next.label(),
-            );
+            return;
         }
+        debug!(
+            "traffic_channel: walsh={} {} -> {}",
+            self.walsh_code,
+            self.channel_state.label(),
+            next.label(),
+        );
         self.channel_state = next;
     }
 

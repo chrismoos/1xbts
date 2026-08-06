@@ -1225,6 +1225,38 @@ impl BtsControlClient for NetworkBtsControlClient {
         })
     }
 
+    async fn allocate_rc2_traffic(
+        &self,
+        _lc_generator: LongCodeGenerator,
+        _initial_lc_chip: u64,
+        esn: u32,
+    ) -> Option<BtsTrafficChannelHandle> {
+        let ccr = {
+            let mut guard = self.inner.lock().await;
+            self.allocate_ccr(&mut guard)
+        };
+        // RC2 (IS-95B Rate Set 2 — QCELP-13K) shares the RC1 PHY scaffolding
+        // and carries no F-SCH.
+        let result = self.send_bts_setup(ccr, esn, false).await?;
+        {
+            let mut guard = self.inner.lock().await;
+            guard.walsh_to_ccr.insert(result.walsh_code, ccr);
+        }
+        if self.local_controller.is_some() {
+            self.send_ecam_commit(result.walsh_code, 2, 2);
+            self.wait_for_commit(result.walsh_code).await;
+        }
+        Some(BtsTrafficChannelHandle {
+            walsh_code: result.walsh_code,
+            bearer_id: result.walsh_code as u32,
+            for_rc: 2,
+            rev_rc: 2,
+            rc_label: "RC2",
+            power_control_delay_pcgs: 8,
+            sch_walsh_code: None,
+        })
+    }
+
     async fn allocate_rc3_traffic(
         &self,
         _lc_generator: LongCodeGenerator,

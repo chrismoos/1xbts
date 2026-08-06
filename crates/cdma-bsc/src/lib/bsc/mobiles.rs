@@ -444,8 +444,10 @@ impl MobileStation {
         {
             let tc = self.traffic_channel.take();
             if let Some(tc_ref) = &tc {
-                if let (Some(cid), Some(bearer)) = (tc_ref.msc_circuit_id, bearer) {
-                    bearer.close_circuit(cid);
+                if let (Some(cid), Some(local_addr), Some(bearer)) =
+                    (tc_ref.msc_circuit_id, tc_ref.msc_bearer_local_addr, bearer)
+                {
+                    bearer.close_circuit_owned_by(cid, local_addr);
                 }
             }
             tc
@@ -849,14 +851,7 @@ impl MobileRegistry {
         }
     }
 
-    pub(crate) fn stale_traffic_channels<F>(
-        &self,
-        timeout: Duration,
-        mut last_bts_enqueue_at: F,
-    ) -> Vec<StaleTrafficChannel>
-    where
-        F: FnMut(u8) -> Option<Instant>,
-    {
+    pub(crate) fn stale_traffic_channels(&self, timeout: Duration) -> Vec<StaleTrafficChannel> {
         self.entries
             .iter()
             .filter_map(|ms| {
@@ -864,7 +859,7 @@ impl MobileRegistry {
                 if tc.is_releasing() {
                     return None;
                 }
-                let latest = tc.latest_activity_for_idle_check(last_bts_enqueue_at(tc.walsh_code));
+                let latest = tc.latest_activity_for_idle_check();
                 if latest.elapsed() <= timeout {
                     return None;
                 }

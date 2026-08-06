@@ -110,6 +110,14 @@ pub trait BtsControlClient: Send + Sync {
         esn: u32,
     ) -> Option<BtsTrafficChannelHandle>;
 
+    /// Allocate an RC2 forward traffic channel.
+    async fn allocate_rc2_traffic(
+        &self,
+        lc_generator: LongCodeGenerator,
+        initial_lc_chip: u64,
+        esn: u32,
+    ) -> Option<BtsTrafficChannelHandle>;
+
     /// Allocate an RC3 forward traffic channel.
     ///
     /// `include_sch` is legacy; packet F-SCH is allocated later via Abis Burst.

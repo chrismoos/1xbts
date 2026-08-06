@@ -22,6 +22,7 @@ use crate::{
         Channel, PcgPcbFallbackMode, PcgPcbScheduler, WalshChannel, WalshChannelWrapper,
         f_sch_rc3::{ForwardSupplementalChannelRc3, SchConfigRc3, interleaver_params},
         ftch::{self, ForwardTrafficChannel},
+        ftch_rc2::{ConfigRc2, ForwardTrafficChannelRc2},
         ftch_rc3::{self, ForwardTrafficChannelRc3},
     },
     phy::coding::{
@@ -141,6 +142,9 @@ pub enum BtsCommand {
 /// Type alias for a Walsh-wrapped forward traffic channel (RC1).
 pub type TrafficWalshChannel = WalshChannelWrapper<ForwardTrafficChannel<9, 2>>;
 
+/// Type alias for a Walsh-wrapped RC2 forward traffic channel.
+pub type TrafficWalshChannelRc2 = WalshChannelWrapper<ForwardTrafficChannelRc2>;
+
 /// Type alias for a Walsh-wrapped RC3 forward traffic channel.
 pub type TrafficWalshChannelRc3 = WalshChannelWrapper<ForwardTrafficChannelRc3>;
 
@@ -153,6 +157,7 @@ pub type SchWalshChannelRc3 = WalshChannelWrapper<ForwardSupplementalChannelRc3>
 #[derive(Clone)]
 pub enum TrafficChannelWrapper {
     Rc1(TrafficWalshChannel),
+    Rc2(TrafficWalshChannelRc2),
     Rc3(TrafficWalshChannelRc3),
     SchRc3(SchWalshChannelRc3),
 }
@@ -163,6 +168,7 @@ impl TrafficChannelWrapper {
     pub fn advance_lc_to_chip(&self, chip: u64) {
         match self {
             TrafficChannelWrapper::Rc1(ch) => ch.channel.advance_lc_to_chip(chip),
+            TrafficChannelWrapper::Rc2(ch) => ch.channel.advance_lc_to_chip(chip),
             TrafficChannelWrapper::Rc3(ch) => ch.channel.advance_lc_to_chip(chip),
             TrafficChannelWrapper::SchRc3(ch) => ch.channel.advance_lc_to_chip(chip),
         }
@@ -172,6 +178,7 @@ impl TrafficChannelWrapper {
     pub fn send_signaling_bits(&self, bits: Vec<u8>) {
         match self {
             TrafficChannelWrapper::Rc1(ch) => ch.channel.send_signaling_bits(bits),
+            TrafficChannelWrapper::Rc2(ch) => ch.channel.send_signaling_bits(bits),
             TrafficChannelWrapper::Rc3(ch) => ch.channel.send_signaling_bits(bits),
             TrafficChannelWrapper::SchRc3(_) => {}
         }
@@ -182,6 +189,7 @@ impl TrafficChannelWrapper {
     pub fn prefill_silence(&self, n: usize) {
         match self {
             TrafficChannelWrapper::Rc1(ch) => ch.prefill_silence(n),
+            TrafficChannelWrapper::Rc2(ch) => ch.prefill_silence(n),
             TrafficChannelWrapper::Rc3(ch) => ch.prefill_silence(n),
             TrafficChannelWrapper::SchRc3(ch) => ch.prefill_silence(n),
         }
@@ -190,6 +198,7 @@ impl TrafficChannelWrapper {
     pub fn queue_len(&self) -> usize {
         match self {
             TrafficChannelWrapper::Rc1(ch) => ch.channel.queue_len(),
+            TrafficChannelWrapper::Rc2(ch) => ch.channel.queue_len(),
             TrafficChannelWrapper::Rc3(ch) => ch.channel.queue_len(),
             TrafficChannelWrapper::SchRc3(ch) => ch.channel.queue_len(),
         }
@@ -198,6 +207,7 @@ impl TrafficChannelWrapper {
     pub fn last_enqueue_at(&self) -> Option<std::time::Instant> {
         match self {
             TrafficChannelWrapper::Rc1(ch) => ch.channel.last_enqueue_at(),
+            TrafficChannelWrapper::Rc2(ch) => ch.channel.last_enqueue_at(),
             TrafficChannelWrapper::Rc3(ch) => ch.channel.last_enqueue_at(),
             TrafficChannelWrapper::SchRc3(_ch) => None,
         }
@@ -213,6 +223,10 @@ impl TrafficChannelWrapper {
     ) -> bool {
         match self {
             TrafficChannelWrapper::Rc1(ch) => {
+                ch.next_block_into(out, num_samples, system_time);
+                true
+            }
+            TrafficChannelWrapper::Rc2(ch) => {
                 ch.next_block_into(out, num_samples, system_time);
                 true
             }
@@ -235,6 +249,7 @@ impl Channel for TrafficChannelWrapper {
     ) -> Vec<num::complex::Complex32> {
         match self {
             TrafficChannelWrapper::Rc1(ch) => ch.next_block(num_samples, system_time),
+            TrafficChannelWrapper::Rc2(ch) => ch.next_block(num_samples, system_time),
             TrafficChannelWrapper::Rc3(ch) => ch.next_block(num_samples, system_time),
             TrafficChannelWrapper::SchRc3(ch) => ch.next_block(num_samples, system_time),
         }
@@ -248,6 +263,7 @@ impl Channel for TrafficChannelWrapper {
     ) {
         match self {
             TrafficChannelWrapper::Rc1(ch) => ch.next_block_into(out, num_samples, system_time),
+            TrafficChannelWrapper::Rc2(ch) => ch.next_block_into(out, num_samples, system_time),
             TrafficChannelWrapper::Rc3(ch) => ch.next_block_into(out, num_samples, system_time),
             TrafficChannelWrapper::SchRc3(ch) => ch.next_block_into(out, num_samples, system_time),
         }
@@ -450,7 +466,8 @@ impl TxPool {
 }
 
 pub use cdma_common::traffic::{
-    RC1_TRAFFIC_INITIAL_GAIN_LINEAR, RC3_TRAFFIC_INITIAL_GAIN_LINEAR, TrafficRxRequest,
+    RC1_TRAFFIC_INITIAL_GAIN_LINEAR, RC2_TRAFFIC_INITIAL_GAIN_LINEAR,
+    RC3_TRAFFIC_INITIAL_GAIN_LINEAR, TrafficRxRequest,
 };
 
 /// Lifecycle command for an HRPD reverse traffic receiver worker.
@@ -627,6 +644,7 @@ impl BtsHandle {
     /// Remove a traffic channel by Walsh code and free it.
     pub fn remove_traffic_channel(&self, walsh_code: u8) {
         deallocate_traffic_channel(&self.walsh_allocator, &self.traffic_channels, walsh_code);
+        self.power_control.remove(walsh_code);
     }
 }
 
@@ -837,6 +855,85 @@ pub fn commit_traffic_channel_rc3(
         walsh_code,
         TrafficChannelWrapper::Rc3(ftch),
         RC3_TRAFFIC_INITIAL_GAIN_LINEAR,
+    ));
+
+    channel_ref
+}
+
+/// Allocate an RC2 forward traffic channel.
+pub fn allocate_traffic_channel_rc2(
+    walsh_allocator: &Arc<Mutex<WalshAllocator>>,
+    traffic_channels: &TrafficChannelPool,
+    lc_generator: LongCodeGenerator,
+    _initial_lc_chip: u64,
+    fpc_subchan_gain: u8,
+) -> Option<(u8, TrafficWalshChannelRc2)> {
+    let walsh_code = walsh_allocator.lock().allocate()?;
+    let fpc_subchan_gain_linear = fpc_subchan_gain_to_linear(fpc_subchan_gain);
+
+    let ftch = WalshChannel::new(
+        WalshGenerator::new::<64>(walsh_code as usize, 1),
+        ForwardTrafficChannelRc2::new(ConfigRc2 {
+            long_code_generator: lc_generator,
+            lc_chip_cursor: 0,
+            pcb_scheduler: PcgPcbScheduler::new_named_with_fallback(
+                0,
+                walsh_code,
+                format!("rc2-w{}", walsh_code),
+                PcgPcbFallbackMode::UpBeforeFirstThenHold,
+            ),
+            fpc_subchan_gain_linear,
+            previous_pcg_pc_start: 0,
+        }),
+    );
+
+    // LC alignment is deferred — the TX loop will align on first use.
+
+    let channel_ref = ftch.clone();
+
+    traffic_channels.add(TrafficChannelSlot::new(
+        walsh_code,
+        TrafficChannelWrapper::Rc2(ftch),
+        RC2_TRAFFIC_INITIAL_GAIN_LINEAR,
+    ));
+
+    Some((walsh_code, channel_ref))
+}
+
+/// Commit a pre-reserved walsh code as an RC2 forward traffic channel.
+///
+/// Unlike `allocate_traffic_channel_rc2`, the walsh code has already been
+/// reserved via `WalshAllocator::allocate()`. This only builds the
+/// channel object and pushes it to the pool.
+pub fn commit_traffic_channel_rc2(
+    traffic_channels: &TrafficChannelPool,
+    walsh_code: u8,
+    lc_generator: LongCodeGenerator,
+    fpc_subchan_gain: u8,
+) -> TrafficWalshChannelRc2 {
+    let fpc_subchan_gain_linear = fpc_subchan_gain_to_linear(fpc_subchan_gain);
+    let ftch = WalshChannel::new(
+        WalshGenerator::new::<64>(walsh_code as usize, 1),
+        ForwardTrafficChannelRc2::new(ConfigRc2 {
+            long_code_generator: lc_generator,
+            lc_chip_cursor: 0,
+            pcb_scheduler: PcgPcbScheduler::new_named_with_fallback(
+                0,
+                walsh_code,
+                format!("rc2-w{}", walsh_code),
+                PcgPcbFallbackMode::UpBeforeFirstThenHold,
+            ),
+            fpc_subchan_gain_linear,
+            previous_pcg_pc_start: 0,
+        }),
+    );
+
+    let channel_ref = ftch.clone();
+
+    traffic_channels.add(TrafficChannelSlot::new(
+        walsh_code,
+        TrafficChannelWrapper::Rc2(ftch),
+        RC2_TRAFFIC_INITIAL_GAIN_LINEAR,
     ));
 
     channel_ref

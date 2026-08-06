@@ -12,7 +12,13 @@ use cdma_common::consts::{SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_P
 use cdma_common::events::AccessChannelEvent;
 use cdma_common::lac::{
     message_types::{MessageId, WireChannel},
-    paging_messages::{GeneralPageRecord, MsAddress, PagingChannelMessage},
+    paging_messages::{
+        CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC, CHANNEL_ASSIGN_MODE_TRAFFIC,
+        CHANNEL_DEFAULT_CONFIG_EXPLICIT_RCS, CHANNEL_DEFAULT_CONFIG_RC1_RC1,
+        CHANNEL_DEFAULT_CONFIG_RC1_RC2, CHANNEL_DEFAULT_CONFIG_RC2_RC1,
+        CHANNEL_DEFAULT_CONFIG_RC2_RC2, ChannelAssignmentGrantedMode, ChannelAssignmentMessage,
+        GeneralPageRecord, MsAddress, PagingChannelMessage,
+    },
 };
 use log::info;
 use tokio::sync::oneshot;
@@ -187,6 +193,7 @@ fn to_proto_traffic_channel_power(tp: &TrafficChannelPowerSnapshot) -> proto::Tr
             .last_pcg_pilot_ec_nt_db
             .map(|arr| arr.to_vec())
             .unwrap_or_default(),
+        forward_radio_config: tp.forward_radio_config,
         reverse_radio_config: tp.reverse_radio_config,
         power_history: tp
             .power_history
@@ -234,21 +241,9 @@ fn to_proto_bts_reverse_power(
             .map(|s| s.forward_pilot_ec_io_db.clone())
             .unwrap_or_default(),
         last_pcg_pilot_ec_nt_db: snapshot.last_pcg_pilot_ec_nt_db.to_vec(),
+        forward_radio_config: bsc_snapshot.map_or(0, |s| s.forward_radio_config),
         reverse_radio_config: bsc_snapshot.map_or(0, |s| s.reverse_radio_config),
-        power_history: bsc_snapshot
-            .map(|s| {
-                s.power_history
-                    .iter()
-                    .map(|e| proto::PowerControlSample {
-                        timestamp_ms: e.timestamp_ms,
-                        measured_eb_nt_db: e.measured_mean_db,
-                        target_eb_nt_db: e.target_db,
-                        forward_gain_db: e.forward_gain_db,
-                        fer_pct: e.fer_pct,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
+        power_history: Vec::new(),
     }
 }
 
@@ -1132,17 +1127,18 @@ fn to_proto_paging_event(ev: &PagingEvent) -> proto::PagingEvent {
         PagingChannelMessage::FlexDuplexCdmaChannelList(_) => None,
         PagingChannelMessage::BroadcastServiceParameters(_) => None,
         PagingChannelMessage::ChannelAssignment(m) => {
+            let effective_rcs = cam_effective_radio_config(m);
             let assign_mode_name = match m.assign_mode {
-                0b000 => "IS-95 Traffic",
-                0b100 => "Extended Traffic (IS-2000)",
+                CHANNEL_ASSIGN_MODE_TRAFFIC => "IS-95 Traffic",
+                CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC => "Extended Traffic (IS-2000)",
                 _ => "Unknown",
             };
             let default_config_name = match m.default_config {
-                Some(0b000) => "RC1/RC1",
-                Some(0b001) => "RC2/RC2",
-                Some(0b010) => "RC3/RC3",
-                Some(0b011) => "RC4/RC3",
-                Some(0b100) => "Explicit FOR_RC/REV_RC",
+                Some(CHANNEL_DEFAULT_CONFIG_RC1_RC1) => "RC1/RC1",
+                Some(CHANNEL_DEFAULT_CONFIG_RC2_RC2) => "RC2/RC2",
+                Some(CHANNEL_DEFAULT_CONFIG_RC1_RC2) => "RC1/RC2",
+                Some(CHANNEL_DEFAULT_CONFIG_RC2_RC1) => "RC2/RC1",
+                Some(CHANNEL_DEFAULT_CONFIG_EXPLICIT_RCS) => "Explicit FOR_RC/REV_RC",
                 _ => "",
             };
             Some(proto::paging_event::Body::ChannelAssignment(
@@ -1160,8 +1156,8 @@ fn to_proto_paging_event(ev: &PagingEvent) -> proto::PagingEvent {
                     assign_mode_name: assign_mode_name.to_string(),
                     default_config_name: default_config_name.to_string(),
                     direct_ch_assign_ind: None,
-                    for_rc: None,
-                    rev_rc: None,
+                    for_rc: effective_rcs.map(|(for_rc, _)| u32::from(for_rc)),
+                    rev_rc: effective_rcs.map(|(_, rev_rc)| u32::from(rev_rc)),
                     fpc_subchan_gain: None,
                     rlgain_adj: None,
                     ch_ind: None,
@@ -1196,7 +1192,7 @@ fn to_proto_paging_event(ev: &PagingEvent) -> proto::PagingEvent {
                 default_config: Some(m.default_config as u32),
                 granted_mode: Some(m.granted_mode as u32),
                 assign_mode_name: "ECAM".to_string(),
-                default_config_name: if m.default_config == 0b100 {
+                default_config_name: if m.default_config == CHANNEL_DEFAULT_CONFIG_EXPLICIT_RCS {
                     "Explicit FOR_RC/REV_RC".to_string()
                 } else {
                     "".to_string()
@@ -1236,6 +1232,32 @@ fn to_proto_paging_event(ev: &PagingEvent) -> proto::PagingEvent {
         timestamp_us: ev.timestamp_us,
         event_id: ev.event_id.clone(),
         body,
+    }
+}
+
+fn cam_effective_radio_config(cam: &ChannelAssignmentMessage) -> Option<(u8, u8)> {
+    const DEFAULT_CONFIGURATION: u8 = ChannelAssignmentGrantedMode::DefaultConfiguration as u8;
+    const REQUESTED_SERVICE: u8 = ChannelAssignmentGrantedMode::RequestedService as u8;
+    match (cam.assign_mode, cam.granted_mode, cam.default_config) {
+        (CHANNEL_ASSIGN_MODE_TRAFFIC, _, _) => Some((1, 1)),
+        (
+            CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC,
+            Some(DEFAULT_CONFIGURATION),
+            Some(CHANNEL_DEFAULT_CONFIG_RC1_RC1),
+        ) => Some((1, 1)),
+        (
+            CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC,
+            Some(DEFAULT_CONFIGURATION),
+            Some(CHANNEL_DEFAULT_CONFIG_RC2_RC2),
+        ) => Some((2, 2)),
+        // The supported requested-service CAM is the P_REV 3 QCELP 13K
+        // assignment. DEFAULT_CONFIG remains the RC1 fallback.
+        (
+            CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC,
+            Some(REQUESTED_SERVICE),
+            Some(CHANNEL_DEFAULT_CONFIG_RC1_RC1),
+        ) => Some((2, 2)),
+        _ => None,
     }
 }
 
@@ -2395,6 +2417,90 @@ fn to_management_packet_session_detail(
             .into_iter()
             .map(to_management_packet_trace_event)
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cdma_common::lac::paging_messages::ChannelAssignmentGrantedMode;
+
+    #[test]
+    fn bts_reverse_power_does_not_mix_bsc_measurement_history() {
+        let snapshot = BtsPowerControlSnapshot {
+            walsh_code: 11,
+            target_eb_nt_db: 8.0,
+            effective_target_eb_nt_db: 8.0,
+            manual_target_override_db: None,
+            last_pcg_pilot_ec_nt_db: [7.5; 16],
+            last_pcbs: [1; 16],
+            fer_pct: 0.0,
+            frames_total: 100,
+            frames_crc_error: 0,
+            last_brake_offset_db: 0.0,
+        };
+        let bsc_snapshot = TrafficChannelPowerSnapshot {
+            target_eb_nt_db: 8.0,
+            effective_target_eb_nt_db: 8.0,
+            manual_target_override_db: None,
+            last_pcg_snr_db: None,
+            last_active_pcg_mask: None,
+            last_pcbs: [1; 16],
+            reverse_pilot_ec_io_db: None,
+            fer_pct: 0.0,
+            frames_total: 100,
+            frames_crc_error: 0,
+            forward_gain_offset_db: 0.0,
+            forward_last_fer_pct: None,
+            forward_last_pmrm_errors: 0,
+            forward_last_pmrm_frames: 0,
+            forward_pmrm_count: 0,
+            forward_pilot_ec_io_db: Vec::new(),
+            last_pcg_pilot_ec_nt_db: Some([1.0; 16]),
+            forward_radio_config: 2,
+            reverse_radio_config: 2,
+            power_history: vec![crate::power_control::PowerControlHistoryEntry {
+                timestamp_ms: 1,
+                measured_mean_db: 1.0,
+                target_db: 8.0,
+                forward_gain_db: 0.0,
+                fer_pct: 0.0,
+            }],
+        };
+
+        let proto = to_proto_bts_reverse_power(&snapshot, Some(&bsc_snapshot));
+
+        assert_eq!(proto.last_pcg_pilot_ec_nt_db, vec![7.5; 16]);
+        assert!(proto.power_history.is_empty());
+    }
+
+    #[test]
+    fn requested_service_cam_reports_effective_rc2_and_preserves_rc1_fallback() {
+        let cam = ChannelAssignmentMessage::new_extended_traffic_assignment(
+            11,
+            0,
+            CHANNEL_DEFAULT_CONFIG_RC1_RC1,
+            ChannelAssignmentGrantedMode::RequestedService,
+            false,
+        );
+
+        assert_eq!(cam.default_config, Some(CHANNEL_DEFAULT_CONFIG_RC1_RC1));
+        assert_eq!(cam_effective_radio_config(&cam), Some((2, 2)));
+    }
+
+    #[test]
+    fn default_configuration_cam_reports_selected_pair() {
+        let rc1 = ChannelAssignmentMessage::new_traffic_assignment(10, 0);
+        assert_eq!(cam_effective_radio_config(&rc1), Some((1, 1)));
+
+        let rc2 = ChannelAssignmentMessage::new_extended_traffic_assignment(
+            11,
+            0,
+            CHANNEL_DEFAULT_CONFIG_RC2_RC2,
+            ChannelAssignmentGrantedMode::DefaultConfiguration,
+            false,
+        );
+        assert_eq!(cam_effective_radio_config(&rc2), Some((2, 2)));
     }
 }
 

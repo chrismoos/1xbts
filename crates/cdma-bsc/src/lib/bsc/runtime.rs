@@ -224,26 +224,34 @@ impl Bsc {
         }
     }
 
-    async fn teardown_stale_traffic_channels(&mut self, traffic_timeout: Duration) {
-        let bts_client_for_stale_check = self.config.bts_client.clone();
-        let stale_entries = self
-            .mobiles
-            .stale_traffic_channels(traffic_timeout, |walsh_code| {
-                bts_client_for_stale_check
-                    .as_ref()
-                    .and_then(|client| client.last_traffic_enqueue_at(walsh_code))
-            });
+    pub(crate) async fn teardown_stale_traffic_channels(&mut self, traffic_timeout: Duration) {
+        let stale_entries = self.mobiles.stale_traffic_channels(traffic_timeout);
 
         for stale in stale_entries.into_iter().rev() {
             warn!(
-                "BSC: traffic channel walsh={} inactive for {}s (channel_state={:?}), tearing down",
+                "BSC: traffic channel walsh={} inactive for {}s (channel_state={:?}), releasing",
                 stale.walsh_code, stale.inactive_secs, stale.channel_state_label
             );
             if let (Some(call_id), A1ClearState::Idle) = (stale.a1_call_id, stale.a1_clear_state) {
                 self.a1.send_clear_request(call_id, 0);
+                self.mobiles.update_tc(stale.walsh_code, |_, tc| {
+                    tc.mark_a1_clear_request_sent();
+                });
             }
-            self.teardown_traffic_channel(stale.walsh_code).await;
-            self.on_voice_leg_released(stale.voice_session_id, stale.voice_leg_role);
+            if let Err(e) =
+                self.send_traffic_release_order(stale.walsh_code, super::DEFAULT_TRAFFIC_ACK_SEQ)
+            {
+                warn!(
+                    "BSC: failed to send Release Order on stale F-TCH walsh={}: {}; tearing down immediately",
+                    stale.walsh_code, e
+                );
+                self.teardown_traffic_channel(stale.walsh_code).await;
+                self.on_voice_leg_released(stale.voice_session_id, stale.voice_leg_role);
+                continue;
+            }
+            self.mobiles.update_tc(stale.walsh_code, |_, tc| {
+                tc.mark_releasing();
+            });
         }
     }
 

@@ -33,6 +33,8 @@ use super::traffic_lac::{TrafficArqConfig, TrafficChannelArqState, TrafficLacEve
 use crate::bts::AccessChannelEvent;
 use crate::lac::message_types::{MessageId, WireChannel};
 use crate::lac::paging_messages::{
+    CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC, CHANNEL_ASSIGN_MODE_TRAFFIC,
+    CHANNEL_DEFAULT_CONFIG_RC1_RC1, CHANNEL_DEFAULT_CONFIG_RC2_RC2, ChannelAssignmentGrantedMode,
     ChannelAssignmentMessage, ExtendedChannelAssignmentMessage, GeneralPageMessage, MsAddress,
     MsPageAddress,
 };
@@ -58,6 +60,31 @@ fn profile_from_sch_rate_index(index: u8) -> Option<Rc3FschProfile> {
         0x3 => Rc3FschProfile::from_rate_bps(76_800),
         0x4 => Rc3FschProfile::from_rate_bps(153_600),
         _ => None,
+    }
+}
+
+pub(super) fn cam_radio_config(cam: &ChannelAssignmentMessage) -> Result<(u8, u8), String> {
+    match (cam.assign_mode, cam.granted_mode) {
+        (CHANNEL_ASSIGN_MODE_TRAFFIC, _) => Ok((1, 1)),
+        (CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC, Some(mode))
+            if mode == ChannelAssignmentGrantedMode::DefaultConfiguration as u8 =>
+        {
+            match cam.default_config {
+                Some(CHANNEL_DEFAULT_CONFIG_RC1_RC1) => Ok((1, 1)),
+                Some(CHANNEL_DEFAULT_CONFIG_RC2_RC2) => Ok((2, 2)),
+                other => Err(format!("unsupported CAM DEFAULT_CONFIG={other:?}")),
+            }
+        }
+        (CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC, Some(mode))
+            if mode == ChannelAssignmentGrantedMode::RequestedService as u8
+                && cam.default_config == Some(CHANNEL_DEFAULT_CONFIG_RC1_RC1) =>
+        {
+            Ok((2, 2))
+        }
+        _ => Err(format!(
+            "unsupported CAM ASSIGN_MODE=0b{:03b} GRANTED_MODE={:?}",
+            cam.assign_mode, cam.granted_mode
+        )),
     }
 }
 
@@ -973,14 +1000,14 @@ impl AbisAgent {
                         return true;
                     }
                 };
-                if cam.assign_mode != 0b000 {
-                    warn!(
-                        "abis_agent: CAM assign_mode=0b{:03b} is not a legacy RC1 commit",
-                        cam.assign_mode
-                    );
-                    return true;
-                }
-                (cam.code_chan, 1, 1, 0, false, "CAM")
+                let (for_rc, rev_rc) = match cam_radio_config(&cam) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        warn!("abis_agent: {e}");
+                        return true;
+                    }
+                };
+                (cam.code_chan, for_rc, rev_rc, 0, false, "CAM")
             } else if aim.message_type == ecam_wire {
                 let mut bs = Bitstream::new_bytes(&aim.message);
                 let ecam = match ExtendedChannelAssignmentMessage::from_sdu(&mut bs) {
@@ -1005,14 +1032,6 @@ impl AbisAgent {
             } else {
                 return false;
             };
-
-        if kind == "CAM" && (for_rc, rev_rc) != (1, 1) {
-            warn!(
-                "abis_agent: CAM commit for walsh={} is limited to RC1/RC1, got RC{}/{}",
-                walsh_code, for_rc, rev_rc
-            );
-            return true;
-        }
 
         info!(
             "abis_agent: {} decoded walsh={} for_rc={} rev_rc={} fpc_subchan_gain={}",
@@ -1039,12 +1058,19 @@ impl AbisAgent {
             return true;
         };
 
-        if for_rc >= 3 {
-            self.controller
-                .commit_rc3_traffic(walsh_code, lc_gen, fpc_subchan_gain);
-        } else {
-            self.controller
-                .commit_rc1_traffic(walsh_code, lc_gen, fpc_subchan_gain);
+        match for_rc {
+            r if r >= 3 => {
+                self.controller
+                    .commit_rc3_traffic(walsh_code, lc_gen, fpc_subchan_gain);
+            }
+            2 => {
+                self.controller
+                    .commit_rc2_traffic(walsh_code, lc_gen, fpc_subchan_gain);
+            }
+            _ => {
+                self.controller
+                    .commit_rc1_traffic(walsh_code, lc_gen, fpc_subchan_gain);
+            }
         }
 
         let rx_request = super::handle::TrafficRxRequest {
@@ -1278,6 +1304,21 @@ mod tests {
             },
             mscid: 0x001234,
         }
+    }
+
+    #[test]
+    fn cam_radio_config_distinguishes_legacy_rc1_and_requested_service_rc2() {
+        let rc1 = ChannelAssignmentMessage::new_traffic_assignment(32, 0);
+        assert_eq!(cam_radio_config(&rc1), Ok((1, 1)));
+
+        let rc2 = ChannelAssignmentMessage::new_extended_traffic_assignment(
+            33,
+            0,
+            CHANNEL_DEFAULT_CONFIG_RC1_RC1,
+            crate::lac::paging_messages::ChannelAssignmentGrantedMode::RequestedService,
+            false,
+        );
+        assert_eq!(cam_radio_config(&rc2), Ok((2, 2)));
     }
 
     fn minimal_access_event(imsi: &str, msg_seq: u8) -> AccessChannelEvent {

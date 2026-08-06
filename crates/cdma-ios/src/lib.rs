@@ -179,8 +179,8 @@ pub use typed::{
     UserZoneUpdateMessage,
 };
 pub use voice_bearer::{
-    BearerEvent, BearerPayloadTypes, DtmfBearerEvent, RtpSendState, VoiceBearerFrame,
-    VoiceBearerManager,
+    BearerEvent, BearerPayloadTypes, DtmfBearerEvent, RtpSendState, VoiceBearerFormat,
+    VoiceBearerFrame, VoiceBearerManager, VoiceBearerPayloadType,
 };
 
 /// Supported A1 message types used for dispatch.

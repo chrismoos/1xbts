@@ -479,6 +479,7 @@ dependencies = [
  "bladerf",
  "cdma-abis",
  "cdma-common",
+ "cdma-voice",
  "chrono",
  "clap",
  "crossbeam-channel",

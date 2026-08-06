@@ -1,5 +1,6 @@
 # HEAD 
 
+- Added support for RC2, QCELP 13K, and QCELP 8K voice. Fixes #16.
 - Fixed 1x downlink power drops while an assigned F-SCH is idle.
 - Improved EV-DO downlink stability under changing signal conditions.
 - Added additional air-interface diagnostics and logging.

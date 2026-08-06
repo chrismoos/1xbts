@@ -1,0 +1,206 @@
+QCELP-13K vendored source -- list of modifications applied on top of the
+upstream archive `qc13_tia_50_ansi733_20040315-025/` (2004-03-15).
+
+Goal: every byte of mutable codec state lives in a per-instance struct
+reachable through the FFI handle. No process-wide writable globals.
+Read-only tables stay shared (safe for concurrent reads).
+
+Files NOT vendored (skipped from upstream)
+------------------------------------------
+- code/celp13k.c        Standalone CLI driver with main(); we drive
+                        encoder()/decoder() directly from the FFI wrapper.
+- code/*.bat            Windows batch test runners.
+- code/*.dbg, code/*.2, code/*.log10, code/*.nodbg, code/FILTER.2
+                        Debug / reference-output artifacts.
+- dsp_fx/libdsp40.a     Prebuilt static archive.
+- dsp_fx/makefile       Upstream make rules.
+- fxptlibs/             Only used if dsp_fx is compiled.
+- tty/                  TTY-over-QCELP; out of scope for v1.
+- test/                 PCM/packet reference vectors; not bundled.
+- top-level makefile, .doc archive.
+
+Files vendored but NOT compiled
+-------------------------------
+The following files are vendored on disk (so the tree exactly mirrors the
+upstream code/ archive minus the explicit skips above) but are NOT added
+to build.rs. Reasons documented inline.
+
+- code/celp13k.c    -- already absent (CLI main()).
+- code/fer_sim.c    -- Frame-erasure simulator; depends on file I/O and
+                       a Markov transition probability file. The encoder
+                       and decoder still reference `trans_fname` via
+                       `extern` declarations, but the wrapper supplies a
+                       NULL definition so the FER path stays disabled.
+- code/rate_dos.c   -- Alternate rate-decision implementation that
+                       duplicates symbols from ratedec.c (compute_features,
+                       band_energy_fcn, update_hist_cnt, adjust_rate_down,
+                       adjust_rate_up, select_mode1, select_mode2). Pick one.
+- code/ratedec_dos.c -- Same: duplicates ratedec.c's symbols. Pick one.
+- code/io.c         -- Raw-PCM/raw-packet file I/O helpers; only the CLI
+                       main() needs them.
+- dsp_fx/*.c        -- The QCELP-13K reference is pure float and does not
+                       include any dsp_fx headers; nothing in code/ links
+                       against this directory. Vendored for completeness.
+
+The active rate decoder is code/ratedec.c. Should rate_dos.c / ratedec_dos.c
+be needed in the future, only one of the three may be compiled at once.
+
+De-globalisation
+----------------
+Audit performed on code/*.c and dsp_fx/*.c for file-scope mutable state.
+The QCELP-13K reference is already well-factored: codec state already
+lives in `struct ENCODER_MEM` / `DECODER_MEM` / `CONTROL` (declared in
+code/celp.h and code/coder.h) and is threaded explicitly through every
+function. The audit findings and fixes:
+
+1. code/pitch.c lines 60-64:
+     static int FRL_RANGE[FR_LAG_SEGMENTS+1] = {...};
+     static int FRL_RES[FR_LAG_SEGMENTS]     = {...};
+     static int FRAC[NUMMODES]               = {...};
+   All three are read-only; promoted to `static const int`.
+
+2. code/decode.c lines 65-66:
+     static float ERA_LSP_DEC[4] = {...};
+     static float ERA_B_SAT[4]   = {...};
+   Both are read-only; promoted to `static const float`.
+
+3. code/decode.c line 67:
+     int erasure_count = 0;
+   Moved into DECODER_MEM and initialized by initialize_decoder().
+
+4. code/encode.c line 71 (function-local static):
+     static int hysteresis = 0;
+   Moved into ENCODER_MEM as `int hysteresis;` (initialised in
+   initialize_encoder_and_decoder()).
+
+5. code/ratedec.c line 439 (file-scope mutable):
+     int last_solid_voiced = 0;
+   Moved into ENCODER_MEM as `int last_solid_voiced;` (initialised
+   in initialize_encoder_and_decoder()).
+
+6. code/coderate.c (read-only tables):
+     int   hangover[TLEVELS]
+     float dis_coef[5]
+     float THRESH_SNR[FREQBANDS][TLEVELS][2]
+     float LOWEST_LEVEL[FREQBANDS]
+     float rate_filt[FREQBANDS][FILTERORDER]
+     float decimate_filter[DEC_ORDER]
+     float unv_filter[FIR_UNV_LEN]
+   All read-only; matching `extern` declarations in coderate.h
+   updated to `extern const`, and the definitions in coderate.c
+   updated to `const`. Initialiser values unchanged.
+
+7. code/hammtab.c:
+     int HAMMING_TAB[80] = {...};
+   Read-only; updated to `const int HAMMING_TAB[]`. The single use
+   site (lpc.c line 276 `extern int HAMMING_TAB[]`) also updated.
+
+8. code/modetabs.c:
+     int PITCHSF[NUMMODES], CBSF[NUMMODES], NUMCB[NUMMODES];
+   Read-only; updated to `const int`. `extern int` declarations
+   in coder.h updated to `extern const int`.
+
+9. code/quantabs.c:
+     float MING[NUMMODES], MAXG[NUMMODES], GPRED_COEFF[GORDER],
+           LSP_DPCM_DECAY[NUMMODES],
+           MIN_DELTA_LSP[NUMMODES][LPCORDER],
+           MAX_DELTA_LSP[NUMMODES][LPCORDER];
+     int G_QUANT_TYPE[NUMMODES], NUMBER_OF_G_LEVELS[NUMMODES],
+         RELNUMBER_OF_G_LEVELS[NUMMODES], QG8[4], FG[73],
+         LSP_QTYPE[NUMMODES], NUM_LSP_QLEVELS[NUMMODES][LPCORDER];
+     float GA[73], LSPVQSIZE[5];
+     float LSPVQ{0..4}[][2];
+   Almost all read-only; promoted to `const`. The five `LSPVQ*` tables
+   AND the two cb_tabs.c tables (CODEBOOK_HALF, CODEBOOK) are the only
+   true exception: `initialize_static_codebooks()` quantises them in
+   place. The wrapper calls that function through `pthread_once()`.
+   Per-instance initialization never writes shared tables.
+
+10. code/pack.h line 56:
+     static int NUMBITS[NUMMODES] = {...};
+    Read-only; promoted to `static const int`.
+
+11. code/lpc.c line 240:
+     int order;
+    Located inside an `#if 0 ... #endif` (commented-out k_to_lpc()).
+    Left as-is; not compiled.
+
+12. code/quantize.c line 468:
+     int qcode_min_lag;
+    K&R-style parameter declaration of unquantize_min_lag(), not a
+    file-scope variable. Left as-is.
+
+13. dsp_fx/basic_op.c lines 125-126:
+     int giOverflow, giOldOverflow;
+    Process-wide overflow flags. Not compiled (dsp_fx is not used by
+    the QCELP-13K reference).
+
+14. TTY-related extern declarations referenced by code/encode.c and
+    code/decode.c but defined only in the (skipped) tty/ subtree:
+     - char *trans_fname
+     - int   tty_option
+     - int   tty_enc_flag
+     - int   tty_enc_char, tty_enc_header, tty_enc_baud_rate
+     - int   tty_debug_flag
+    Provided as thread-local zero values with stubs in qcelp13k.c.
+    `tty_option` remains zero, so all TTY branches stay disabled.
+
+15. code/fer_sim.c provides `trans_fname` and `fer_sim_seed`. Since we
+    do not compile fer_sim.c, the wrapper supplies replacement
+    definitions: `trans_fname = NULL` and a no-op `fer_sim()` stub.
+    `decode.c:336` gates the fer_sim() call on `trans_fname != NULL`,
+    so the stub path is never reached with our definitions.
+
+Symbol-collision renames with evrcc / evrc_b_wb
+-----------------------------------------------
+The QCELP-13K compilation unit defines several functions with names
+that collide with the EVRC reference code already linked into
+libcdma-voice. Resolved via `cc::Build::define(name, "qcelp_<name>")`
+preprocessor renames at compile time (same trick as evrc_b_wb).
+
+Renamed symbols (QCELP-13K side; EVRC keeps the bare name):
+  - durbin                  -> qcelp_durbin
+  - filter                  -> qcelp_filter
+  - lpc2lsp                 -> qcelp_lpc2lsp
+  - lsp2lpc                 -> qcelp_lsp2lpc
+  - convolve                -> qcelp_convolve
+  - hammsinc                -> qcelp_hammsinc
+  - front_end_filter        -> qcelp_front_end_filter
+  - getbit                  -> qcelp_getbit
+  - initialize_pole_filter  -> qcelp_initialize_pole_filter
+  - initialize_zero_filter  -> qcelp_initialize_zero_filter
+  - band_energy_fcn         -> qcelp_band_energy_fcn
+
+The exact list is the union of (a) function names that both codecs
+export and (b) any extra collisions reported by the linker; the
+authoritative list lives in `crates/cdma-voice/build.rs`. Keep this
+catalogue in sync if entries are added or removed.
+
+Public C API exported by csrc/qcelp13k.{c,h}
+--------------------------------------------
+  void* qcelp13k_encoder_init(int max_rate, int min_rate);
+  void  qcelp13k_encoder_uninit(void* ctx);
+  int   qcelp13k_encoder_encode_to_packet(void*, const int16_t*, size_t,
+                                          uint8_t*, size_t);
+  void* qcelp13k_decoder_init(void);
+  void  qcelp13k_decoder_uninit(void* ctx);
+  int   qcelp13k_decoder_decode_from_packet(void*, const uint8_t*, size_t,
+                                            int16_t*, size_t);
+
+Wire packet format (used between qcelp13k.c and src/qcelp13k.rs):
+  byte 0 : rate (mode) in {1 = Eighth, 2 = Quarter, 3 = Half, 4 = Full}
+  bytes 1..N : NUMBITS[mode] bits of TIA-733 frame data, MSB-first,
+               zero-padded to a whole number of bytes:
+                 Full    : 34 bytes (266 + 6 reserved)
+                 Half    : 16 bytes (124 + 4 reserved)
+                 Quarter :  7 bytes ( 54 + 2 reserved)
+                 Eighth  :  3 bytes ( 20 + 4 reserved)
+
+Post-vendor changes
+-------------------
+- CRC10 helper (poly 0x3D9, init 0x3FF) was lifted from local copies in
+  crates/cdma-bts/src/lib/channels/ftch_rc2.rs and
+  crates/cdma-bts/src/lib/receiver/pipelined/rc2_traffic_frame_aligner.rs
+  into crates/cdma-common/src/crc.rs alongside crc6/crc8/crc12. Both RC2
+  modules now import the shared helper. CDMA reference: C.S0002-E
+  §3.1.3.1.4.1.3.

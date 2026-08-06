@@ -54,7 +54,13 @@ pub struct PreencodedRingtone {
     pub duration_ms: u32,
 }
 
-const ALL_CODECS: [VoiceCodec; 3] = [VoiceCodec::EvrcA, VoiceCodec::EvrcB, VoiceCodec::EvrcWb];
+const ALL_CODECS: [VoiceCodec; 5] = [
+    VoiceCodec::Tia96,
+    VoiceCodec::EvrcA,
+    VoiceCodec::EvrcB,
+    VoiceCodec::EvrcWb,
+    VoiceCodec::Qcelp13k,
+];
 
 /// Preencode the WAV into every supported codec. `max_encoded_bytes_per_codec`
 /// is the maximum allowed serialized blob size per codec; encoding stops with
@@ -225,7 +231,7 @@ mod tests {
         let samples = vec![0i16; 800];
         let bytes = make_wav(8000, 1, &samples);
         let out = preencode_wav_all_codecs(&bytes, 256 * 1024).expect("preencode");
-        assert_eq!(out.len(), 3);
+        assert_eq!(out.len(), ALL_CODECS.len());
         // 800 samples = 5 frames; 200 ms of silence at 8 kHz = 1600 samples = 10 frames.
         let expected_frames = 5 + 10;
         for r in &out {

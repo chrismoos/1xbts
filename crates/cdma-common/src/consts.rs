@@ -1,5 +1,11 @@
 //! Shared CDMA2000 SR1 physical-layer constants.
 
+/// SO0: service option rejection in a Page Response or Service Option Response.
+pub const SERVICE_OPTION_REJECTED: u16 = 0;
+
+/// SO1: default Basic Variable Rate Voice Service.
+pub const SERVICE_OPTION_BASIC_VOICE: u16 = 1;
+
 /// SO3: EVRC-A / IS-127 narrowband.
 pub const SERVICE_OPTION_EVRC_A: u16 = 3;
 
@@ -21,10 +27,7 @@ pub const SERVICE_OPTION_EVRC_B: u16 = 68;
 /// SO70: EVRC-WB.
 pub const SERVICE_OPTION_EVRC_WB: u16 = 70;
 
-/// SO32768: QCELP-13k voice (C.S0020). The SO number itself sits in the
-/// manufacturer-defined range (≥ 32768 per C.S0005-E Annex E). The BSC
-/// accepts these and renegotiates the traffic channel to EVRC-A (SO 3)
-/// on the F-TCH.
+/// SO32768: Qualcomm QCELP-13K variable-rate speech.
 pub const SERVICE_OPTION_QCELP13: u16 = 32768;
 
 /// Data Burst Message BURST_TYPE for SMS (TIA-637).

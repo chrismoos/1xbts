@@ -355,6 +355,21 @@ int evrc_decoder_decode_from_packet(void* c,const uint8_t* packet,size_t packet_
 	return parser.frame_count * SPEECH_FRAME_SAMPLES * sizeof(int16_t);
 }
 
+int evrc_decoder_decode_erasure(void* c,int16_t* speech,size_t speech_max_samples) {
+	EvrcDecoderContext* context = (EvrcDecoderContext*)c;
+	int16_t bits_frame[11];
+	EvrcNativeContext *previous;
+
+	if( context == NULL || speech == NULL || speech_max_samples < SPEECH_FRAME_SAMPLES )
+		return EVRC_CODEC_ERROR;
+
+	memset(bits_frame,0,sizeof(bits_frame));
+	previous = evrc_set_current_context(&context->native);
+	decode(bits_frame, 0x0e, /*post_filter*/ 0, speech);
+	evrc_set_current_context(previous);
+	return SPEECH_FRAME_SAMPLES * sizeof(int16_t);
+}
+
 
 
 /*

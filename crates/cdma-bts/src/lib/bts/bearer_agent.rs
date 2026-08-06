@@ -9,13 +9,14 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver as StdReceiver;
 use std::thread;
 
-use log::warn;
+use log::{debug, warn};
 
 use cdma_abis::bearer::{FrameContent, TrafficFrame};
 use cdma_abis::bearer_transport::BearerTransport;
 use cdma_abis::udp_bearer::UdpBearerDatagram;
 
 use crate::channels::ftch::{TrafficFrame as Rc1TrafficFrame, TrafficRate};
+use crate::channels::ftch_rc2::{Rc2Rate, TrafficFrameRc2};
 use crate::channels::ftch_rc3::TrafficFrameRc3;
 
 use super::{TrafficChannelWrapper, TrafficResourceService};
@@ -110,10 +111,10 @@ pub fn deliver_forward_frame(
 
     match frame {
         TrafficFrame::ForwardFchDcch(payload) => {
-            let rate = decode_frame_content_rate(payload.frame_content)?;
             let info_len = payload.forward_link_information.len();
             match &channel {
                 TrafficChannelWrapper::Rc1(ch) => {
+                    let rate = decode_frame_content_rate(payload.frame_content)?;
                     if is_signaling {
                         let bits = unpack_bytes_to_bits(
                             &payload.forward_link_information,
@@ -134,6 +135,7 @@ pub fn deliver_forward_frame(
                     }
                 }
                 TrafficChannelWrapper::Rc3(ch) => {
+                    let rate = decode_frame_content_rate(payload.frame_content)?;
                     if is_signaling {
                         let bits = unpack_bytes_to_bits(
                             &payload.forward_link_information,
@@ -150,6 +152,27 @@ pub fn deliver_forward_frame(
                         ch.channel.send_frame(TrafficFrameRc3 {
                             data: payload.forward_link_information,
                             rate,
+                        });
+                    }
+                }
+                TrafficChannelWrapper::Rc2(ch) => {
+                    let rc2_rate = decode_frame_content_rc2_rate(payload.frame_content)?;
+                    if is_signaling {
+                        let bits = unpack_bytes_to_bits(
+                            &payload.forward_link_information,
+                            Rc2Rate::Full.info_bits(),
+                        );
+                        ch.channel.send_signaling_bits(bits);
+                        debug!(
+                            "BTS bearer: queued RC2 signaling frame walsh={} len={} queue_len={}",
+                            walsh_code,
+                            info_len,
+                            ch.channel.queue_len()
+                        );
+                    } else {
+                        ch.channel.send_frame(TrafficFrameRc2 {
+                            data: payload.forward_link_information,
+                            rate: rc2_rate,
                         });
                     }
                 }
@@ -182,5 +205,96 @@ fn decode_frame_content_rate(frame_content: FrameContent) -> Result<TrafficRate,
             "unsupported bearer frame_content rate 0x{:02X}",
             other.value()
         )),
+    }
+}
+
+/// Map a bearer frame tag to an RC2 rate.
+fn decode_frame_content_rc2_rate(frame_content: FrameContent) -> Result<Rc2Rate, String> {
+    match frame_content {
+        FrameContent::FchRc2_14400 => Ok(Rc2Rate::Full),
+        FrameContent::FchRc2_7200 => Ok(Rc2Rate::Half),
+        FrameContent::FchRc2_3600 => Ok(Rc2Rate::Quarter),
+        FrameContent::FchRc2_1800 => Ok(Rc2Rate::Eighth),
+        other => Err(format!(
+            "unsupported RC2 bearer frame_content rate 0x{:02X}",
+            other.value()
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bts::TrafficResourceService;
+    use cdma_abis::bearer::{ChannelFamily, ForwardFchDcchFrame};
+    use cdma_common::phy::long_code::LongCodeGenerator;
+
+    fn rc2_traffic_frame(frame_content: FrameContent, info_bytes: Vec<u8>) -> TrafficFrame {
+        TrafficFrame::ForwardFchDcch(ForwardFchDcchFrame {
+            channel_family: ChannelFamily::Fch,
+            fpc_slc: 1,
+            fsn: 0,
+            fpc_gr: 0,
+            rpc_olt: 0,
+            frame_content,
+            forward_link_information: info_bytes,
+            message_crc: 0,
+        })
+    }
+
+    #[test]
+    fn rc2_bearer_frames_enqueue_on_forward_traffic_channel() {
+        let controller = Arc::new(TrafficResourceService::new());
+        let (walsh_code, channel_ref) = controller
+            .allocate_rc2_traffic(LongCodeGenerator::new_traffic_channel(0), 0, 0)
+            .expect("rc2 allocation");
+
+        let rates = [
+            (FrameContent::FchRc2_14400, Rc2Rate::Full),
+            (FrameContent::FchRc2_7200, Rc2Rate::Half),
+            (FrameContent::FchRc2_3600, Rc2Rate::Quarter),
+            (FrameContent::FchRc2_1800, Rc2Rate::Eighth),
+        ];
+
+        for (i, (fc, rate)) in rates.iter().enumerate() {
+            let info_bits = rate.info_bits();
+            let payload = vec![1; info_bits];
+            let frame = rc2_traffic_frame(*fc, payload);
+            deliver_forward_frame(&controller, walsh_code, frame, false)
+                .expect("rc2 traffic dispatch");
+            assert_eq!(channel_ref.channel.queue_len(), i + 1);
+        }
+    }
+
+    #[test]
+    fn rc2_bearer_signaling_routes_to_signaling_queue() {
+        let controller = Arc::new(TrafficResourceService::new());
+        let (walsh_code, channel_ref) = controller
+            .allocate_rc2_traffic(LongCodeGenerator::new_traffic_channel(0), 0, 0)
+            .expect("rc2 allocation");
+
+        let frame = rc2_traffic_frame(FrameContent::FchRc2_14400, vec![0xFF_u8; 34]);
+        deliver_forward_frame(&controller, walsh_code, frame, true)
+            .expect("rc2 signaling dispatch");
+
+        assert_eq!(channel_ref.channel.queue_len(), 1);
+        assert!(channel_ref.channel.last_enqueue_at().is_some());
+    }
+
+    #[test]
+    fn rc2_bearer_rejects_non_rc2_frame_content() {
+        let controller = Arc::new(TrafficResourceService::new());
+        let (walsh_code, _channel_ref) = controller
+            .allocate_rc2_traffic(LongCodeGenerator::new_traffic_channel(0), 0, 0)
+            .expect("rc2 allocation");
+
+        let frame = rc2_traffic_frame(FrameContent::FchRc3_9600, vec![0u8; 22]);
+        let err = deliver_forward_frame(&controller, walsh_code, frame, false)
+            .expect_err("rc3 frame content on rc2 channel must fail");
+        assert!(
+            err.contains("unsupported RC2 bearer frame_content"),
+            "{}",
+            err
+        );
     }
 }

@@ -26,9 +26,11 @@ const HLR_RINGTONE_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::fr
 
 fn voice_codec_str(codec: cdma_voice::VoiceCodec) -> &'static str {
     match codec {
+        cdma_voice::VoiceCodec::Tia96 => "tia96",
         cdma_voice::VoiceCodec::EvrcA => "evrc_a",
         cdma_voice::VoiceCodec::EvrcB => "evrc_b",
         cdma_voice::VoiceCodec::EvrcWb => "evrc_wb",
+        cdma_voice::VoiceCodec::Qcelp13k => "qcelp_13k",
     }
 }
 
@@ -172,12 +174,19 @@ impl MediaService {
                     break;
                 }
                 let frame = source.next_frame();
+                let payload = frame.packet_data(codec);
                 let bearer_frame = VoiceBearerFrame {
                     circuit_id,
-                    rate_bps: voice_rate_bps(frame.rate),
-                    payload: frame.bits,
+                    rate_bps: codec.rate_bps(frame.rate),
+                    payload,
                 };
-                let _ = bearer_ref.try_send_frame(&bearer_frame);
+                if let Err(error) = bearer_ref.send_frame(&bearer_frame).await {
+                    warn!(
+                        "MSC: ringback bearer send failed for call_id={} circuit_id={}: {}",
+                        call_id.0, circuit_id, error
+                    );
+                    break;
+                }
             }
             info!(
                 "MSC: stopped ringback feeder for call_id={} circuit_id={}",
@@ -333,12 +342,16 @@ impl MediaService {
                 let Some(frame) = player.next_frame() else {
                     break;
                 };
+                let payload = frame.packet_data(codec);
                 let bearer_frame = VoiceBearerFrame {
                     circuit_id,
-                    rate_bps: voice_rate_bps(frame.rate),
-                    payload: frame.bits,
+                    rate_bps: codec.rate_bps(frame.rate),
+                    payload,
                 };
-                let _ = bearer_ref.try_send_frame(&bearer_frame);
+                if let Err(error) = bearer_ref.send_frame(&bearer_frame).await {
+                    warn!("MSC: WAV bearer send failed for circuit_id={circuit_id}: {error}");
+                    break;
+                }
             }
             info!("MSC: stopped WAV feeder for circuit_id={circuit_id}");
         });
@@ -423,7 +436,7 @@ impl MediaService {
                 let frame = source.next_frame();
                 let payload = crate::media_gateway::VocoderFrame {
                     payload: frame.bits,
-                    rate_bps: voice_rate_bps(frame.rate),
+                    rate_bps: codec.rate_bps(frame.rate),
                 };
                 if let Err(error) = gateway.forward_payload(handle, payload).await {
                     debug!("MSC: inbound ringback forward failed: {error}; stopping feeder");
@@ -507,11 +520,81 @@ async fn load_custom_ringtone(
     }
 }
 
-pub(crate) fn voice_rate_bps(rate: cdma_voice::VoiceRate) -> u32 {
-    match rate {
-        cdma_voice::VoiceRate::Full => 9600,
-        cdma_voice::VoiceRate::Half => 4800,
-        cdma_voice::VoiceRate::Quarter => 2400,
-        cdma_voice::VoiceRate::Eighth => 1200,
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::circuit::CircuitSession;
+    use cdma_ios::{
+        BearerEvent, BearerPayloadTypes, VoiceBearerFormat, VoiceBearerPayloadType,
+        voice_bearer::VOICE_RTP_PAYLOAD_TYPE,
+    };
+    use std::net::Ipv4Addr;
+
+    #[tokio::test]
+    async fn qcelp_wav_feeder_delivers_rate_set_two_frames() {
+        let circuit_id = 41;
+        let msc_bearer = Arc::new(VoiceBearerManager::new(Ipv4Addr::LOCALHOST));
+        let bsc_bearer = VoiceBearerManager::new(Ipv4Addr::LOCALHOST);
+        let msc_local = msc_bearer.open_circuit(circuit_id, None).await.unwrap();
+        let bsc_local = bsc_bearer
+            .open_circuit(circuit_id, Some(msc_local))
+            .await
+            .unwrap();
+        msc_bearer.set_circuit_remote(circuit_id, bsc_local);
+
+        let payload_types = BearerPayloadTypes {
+            voice: VoiceBearerPayloadType {
+                format: VoiceBearerFormat::Vocoder13k,
+                payload_type: VOICE_RTP_PAYLOAD_TYPE,
+            },
+            telephone_event: None,
+        };
+        msc_bearer.set_circuit_payload_types(circuit_id, payload_types);
+        bsc_bearer.set_circuit_payload_types(circuit_id, payload_types);
+
+        let call_id = CallId(55);
+        let audio_file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/sample-sound.wav")
+            .to_string_lossy()
+            .into_owned();
+        let mut circuits = CircuitService::new();
+        circuits.insert_circuit_session(
+            circuit_id,
+            CircuitSession {
+                call_id,
+                audio_file: Some(audio_file),
+                service_option: cdma_voice::SERVICE_OPTION_QCELP_13K,
+                leg_role: MscVoiceLeg::Primary,
+                peer_circuit_id: None,
+                bearer_remote_ready: true,
+                media_gateway_handle: None,
+                called_number: None,
+            },
+        );
+
+        let mut media = MediaService::new();
+        media.start_media_for_call(call_id, &circuits, Some(&msc_bearer));
+
+        let frame = match tokio::time::timeout(std::time::Duration::from_secs(1), bsc_bearer.recv())
+            .await
+            .expect("QCELP WAV bearer timeout")
+            .expect("QCELP WAV bearer event")
+        {
+            BearerEvent::Voice(frame) => frame,
+            BearerEvent::Dtmf(_) => panic!("expected voice"),
+        };
+        let rate = cdma_voice::VoiceCodec::Qcelp13k
+            .rate_from_bps(frame.rate_bps)
+            .expect("QCELP Rate Set 2 rate");
+        assert_eq!(
+            frame.payload.len(),
+            cdma_voice::VoiceCodec::Qcelp13k.packet_data_bytes(rate)
+        );
+        cdma_voice::qcelp13k::Qcelp13kDecoder::new()
+            .unwrap()
+            .decode(rate, &frame.payload)
+            .expect("decode QCELP WAV frame");
+
+        media.cleanup_call(call_id, &[circuit_id]);
     }
 }

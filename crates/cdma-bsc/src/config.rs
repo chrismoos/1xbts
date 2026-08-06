@@ -64,7 +64,7 @@ pub struct TrafficAssignmentConfig {
     pub preferred_pairs: Vec<RcPairConfig>,
     /// Tear down a traffic channel after this many seconds of inactivity
     /// (no RX messages received). Applies to all traffic channels including
-    /// voice calls stuck in setup. Default: 30 seconds.
+    /// voice calls stuck in setup. Default: 15 seconds.
     #[serde(default = "default_traffic_idle_timeout_s")]
     pub idle_timeout_s: u64,
     /// Tear down a traffic channel if the MS does not acknowledge the BS Ack
@@ -94,9 +94,13 @@ pub struct TrafficAssignmentConfig {
 impl Default for TrafficAssignmentConfig {
     fn default() -> Self {
         Self {
-            supported_for_rcs: vec![1, 3],
-            supported_rev_rcs: vec![1, 3],
-            preferred_pairs: vec![RcPairConfig::new(1, 1), RcPairConfig::new(3, 3)],
+            supported_for_rcs: vec![1, 2, 3],
+            supported_rev_rcs: vec![1, 2, 3],
+            preferred_pairs: vec![
+                RcPairConfig::new(1, 1),
+                RcPairConfig::new(2, 2),
+                RcPairConfig::new(3, 3),
+            ],
             idle_timeout_s: default_traffic_idle_timeout_s(),
             ms_ack_timeout_ms: default_ms_ack_timeout_ms(),
             packet_service_connect_timeout_ms: default_packet_service_connect_timeout_ms(),
@@ -112,7 +116,7 @@ fn default_f_sch_rate_bps() -> u32 {
 }
 
 fn default_traffic_idle_timeout_s() -> u64 {
-    30
+    15
 }
 
 fn default_ms_ack_timeout_ms() -> u64 {
@@ -411,9 +415,9 @@ fn validate_traffic_assignment(cfg: &TrafficAssignmentConfig) -> Result<(), Erro
     }
 
     for &rc in &cfg.supported_for_rcs {
-        if !matches!(rc, 1 | 3) {
+        if !matches!(rc, 1 | 2 | 3) {
             return Err(format!(
-                "bsc.traffic_assignment.supported_for_rcs contains unsupported RC {}; only 1 and 3 are currently implemented",
+                "bsc.traffic_assignment.supported_for_rcs contains unsupported RC {}; only 1, 2, and 3 are currently implemented",
                 rc
             )
             .into());
@@ -421,9 +425,9 @@ fn validate_traffic_assignment(cfg: &TrafficAssignmentConfig) -> Result<(), Erro
     }
 
     for &rc in &cfg.supported_rev_rcs {
-        if !matches!(rc, 1 | 3) {
+        if !matches!(rc, 1 | 2 | 3) {
             return Err(format!(
-                "bsc.traffic_assignment.supported_rev_rcs contains unsupported RC {}; only 1 and 3 are currently implemented",
+                "bsc.traffic_assignment.supported_rev_rcs contains unsupported RC {}; only 1, 2, and 3 are currently implemented",
                 rc
             )
             .into());
@@ -431,9 +435,9 @@ fn validate_traffic_assignment(cfg: &TrafficAssignmentConfig) -> Result<(), Erro
     }
 
     for pair in &cfg.preferred_pairs {
-        if !matches!((pair.for_rc, pair.rev_rc), (1, 1) | (3, 3)) {
+        if !matches!((pair.for_rc, pair.rev_rc), (1, 1) | (2, 2) | (3, 3)) {
             return Err(format!(
-                "bsc.traffic_assignment.preferred_pairs contains unsupported pair ({}, {}); only (1,1) and (3,3) are currently implemented",
+                "bsc.traffic_assignment.preferred_pairs contains unsupported pair ({}, {}); only (1,1), (2,2), and (3,3) are currently implemented",
                 pair.for_rc, pair.rev_rc
             )
             .into());
@@ -441,10 +445,11 @@ fn validate_traffic_assignment(cfg: &TrafficAssignmentConfig) -> Result<(), Erro
     }
 
     let supports_rc1 = cfg.supported_for_rcs.contains(&1) && cfg.supported_rev_rcs.contains(&1);
+    let supports_rc2 = cfg.supported_for_rcs.contains(&2) && cfg.supported_rev_rcs.contains(&2);
     let supports_rc3 = cfg.supported_for_rcs.contains(&3) && cfg.supported_rev_rcs.contains(&3);
-    if !supports_rc1 && !supports_rc3 {
+    if !supports_rc1 && !supports_rc2 && !supports_rc3 {
         return Err(
-            "bsc.traffic_assignment must allow at least one implemented RC pair: (1,1) or (3,3)"
+            "bsc.traffic_assignment must allow at least one implemented RC pair: (1,1), (2,2), or (3,3)"
                 .into(),
         );
     }
@@ -565,6 +570,17 @@ mod tests {
             serde_json::from_str(r#"{ "abis": { "remote_addr": "127.0.0.1:5604" } }"#)
                 .expect("deserialize bsc config");
         assert_eq!(cfg.abis.remote_addr, "127.0.0.1:5604".parse().unwrap());
+    }
+
+    #[test]
+    fn shipped_bsc_config_admits_rc2() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/bsc.json");
+        let cfg: BscNodeConfig =
+            serde_json::from_slice(&std::fs::read(path).expect("read config/bsc.json"))
+                .expect("parse config/bsc.json");
+        assert!(cfg.traffic_assignment.supported_for_rcs.contains(&2));
+        assert!(cfg.traffic_assignment.supported_rev_rcs.contains(&2));
+        validate_traffic_assignment(&cfg.traffic_assignment).expect("valid traffic policy");
     }
 
     #[test]

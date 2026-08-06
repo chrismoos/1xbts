@@ -5,6 +5,7 @@ use tokio::net::TcpListener;
 
 use cdma_abis::bearer::{ChannelFamily, ForwardFchDcchFrame, FrameContent, TrafficFrame};
 use cdma_abis::control::typed::CellId;
+use cdma_abis::control::{BtsSetupMessage, MessageType, encode};
 use cdma_abis::transport::{TransportEvent, accept};
 use cdma_bts::bts::TrafficResourceService;
 use cdma_bts::bts::abis_agent::{AbisAgent, AbisAgentConfig};
@@ -15,7 +16,11 @@ use cdma_abis::control::typed::{
 };
 use cdma_bsc::abis_edge::network::{NetworkBtsControlClient, NetworkClientConfig};
 use cdma_bsc::abis_edge::{BearerFrame, BtsControlClient, ForwardBearerQueue};
-use cdma_bts::lac::paging_messages::ExtendedChannelAssignmentMessage;
+use cdma_bts::lac::paging_messages::{
+    CHANNEL_DEFAULT_CONFIG_RC1_RC1, ChannelAssignmentGrantedMode, ChannelAssignmentMessage,
+    ExtendedChannelAssignmentMessage,
+};
+use cdma_common::lac::message_types::{MessageId, WireChannel};
 
 fn agent_config() -> AbisAgentConfig {
     AbisAgentConfig {
@@ -53,6 +58,7 @@ struct AbisTestHarness {
     client: Option<NetworkBtsControlClient>,
     server_handle: tokio::task::JoinHandle<AbisAgent>,
     controller: Arc<TrafficResourceService>,
+    setup_service_options: Arc<std::sync::Mutex<Vec<Option<u16>>>>,
 }
 
 impl AbisTestHarness {
@@ -67,6 +73,8 @@ impl AbisTestHarness {
             .reserve_system_channels(0, 1, 32);
 
         let controller_clone = controller.clone();
+        let setup_service_options = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_setup_service_options = setup_service_options.clone();
         let server_handle = tokio::spawn(async move {
             let (sender, mut events_rx) = accept(&listener).await.unwrap();
             let mut agent = AbisAgent::new(agent_config(), controller_clone);
@@ -74,6 +82,13 @@ impl AbisTestHarness {
             while let Some(event) = events_rx.recv().await {
                 match event {
                     TransportEvent::Message(msg) => {
+                        if msg.message_type == MessageType::BtsSetup {
+                            let setup = BtsSetupMessage::decode(&encode(&msg).unwrap()).unwrap();
+                            server_setup_service_options
+                                .lock()
+                                .unwrap()
+                                .push(setup.service_option.map(|so| so.0));
+                        }
                         let (responses, _events) = agent.handle_message(&msg);
                         for resp in responses {
                             let _ = sender.send(&resp).await;
@@ -94,6 +109,7 @@ impl AbisTestHarness {
             client: Some(client),
             server_handle,
             controller,
+            setup_service_options,
         }
     }
 
@@ -136,6 +152,47 @@ async fn abis_tcp_setup_allocates_walsh() {
     send_ecam_commit(harness.client(), handle.walsh_code);
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(controller.traffic_channels_pool().len(), 1);
+
+    let agent = harness.shutdown().await;
+    assert_eq!(agent.active_session_count(), 1);
+}
+
+#[tokio::test]
+async fn abis_tcp_qcelp_setup_commits_rc2_from_requested_service_cam() {
+    let harness = AbisTestHarness::new().await;
+
+    let handle = harness
+        .client()
+        .allocate_rc2_traffic(
+            LongCodeGenerator::new_traffic_channel(0x13_0000),
+            0,
+            0x13_0000,
+        )
+        .await
+        .expect("RC2 allocation should succeed");
+    assert!(harness.controller.traffic_channels_pool().is_empty());
+    assert_eq!(
+        *harness.setup_service_options.lock().unwrap(),
+        vec![None],
+        "RC2 setup must not add a service-option IE"
+    );
+
+    send_qcelp_cam_commit(harness.client(), handle.walsh_code);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let slot = harness
+        .controller
+        .traffic_channels_pool()
+        .lookup(handle.walsh_code)
+        .expect("CAM should commit the traffic channel");
+    assert!(matches!(
+        slot.channel,
+        cdma_bts::bts::TrafficChannelWrapper::Rc2(_)
+    ));
+    assert_eq!(
+        harness.controller.traffic_rx_pool().lock()[0].assigned_rev_rc,
+        2
+    );
 
     let agent = harness.shutdown().await;
     assert_eq!(agent.active_session_count(), 1);
@@ -300,12 +357,42 @@ fn send_ecam_commit(client: &dyn BtsControlClient, walsh_code: u8) {
     client.send_pch_message(pch).unwrap();
 }
 
+fn send_qcelp_cam_commit(client: &dyn BtsControlClient, walsh_code: u8) {
+    let cam = ChannelAssignmentMessage::new_extended_traffic_assignment(
+        walsh_code,
+        0,
+        CHANNEL_DEFAULT_CONFIG_RC1_RC1,
+        ChannelAssignmentGrantedMode::RequestedService,
+        false,
+    );
+    let sdu = cam.to_sdu();
+    let sdu_bytes: Vec<u8> = sdu
+        .bits()
+        .chunks(8)
+        .map(|chunk| chunk.iter().fold(0u8, |acc, &b| (acc << 1) | b))
+        .collect();
+    let wire_type = MessageId::ChannelAssignment
+        .wire_type(WireChannel::ForwardCommon)
+        .unwrap();
+    let aim = AirInterfaceMessagePayload::new(wire_type, sdu_bytes).unwrap();
+    let pch = PchMessageTransferMessage {
+        correlation_id: None,
+        mobile_identities: vec![MobileIdentity::Esn(0)],
+        cell_identifier_list: None,
+        air_interface_message: Some(aim),
+        layer2_ack_request_results: None,
+        abis_ack_notify: None,
+    };
+    client.send_pch_message(pch).unwrap();
+}
+
 fn harness_queue_len(controller: &Arc<TrafficResourceService>, walsh_code: u8) -> Option<usize> {
     controller
         .traffic_channels_pool()
         .lookup(walsh_code)
         .map(|slot| match &slot.channel {
             cdma_bts::bts::TrafficChannelWrapper::Rc1(ch) => ch.channel.queue_len(),
+            cdma_bts::bts::TrafficChannelWrapper::Rc2(ch) => ch.channel.queue_len(),
             cdma_bts::bts::TrafficChannelWrapper::Rc3(ch) => ch.channel.queue_len(),
             cdma_bts::bts::TrafficChannelWrapper::SchRc3(ch) => ch.channel.queue_len(),
         })

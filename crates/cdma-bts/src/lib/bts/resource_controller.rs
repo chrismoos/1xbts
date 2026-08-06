@@ -19,11 +19,13 @@ use parking_lot::Mutex;
 
 use super::handle::{
     SchWalshChannelRc3, TrafficChannelPool, TrafficRxPool, TrafficRxRemovals, TrafficRxRequest,
-    TrafficWalshChannel, TrafficWalshChannelRc3, WalshAllocator, allocate_sch_rc3,
-    allocate_traffic_channel, allocate_traffic_channel_rc3, commit_traffic_channel,
+    TrafficWalshChannel, TrafficWalshChannelRc2, TrafficWalshChannelRc3, WalshAllocator,
+    allocate_sch_rc3, allocate_traffic_channel, allocate_traffic_channel_rc2,
+    allocate_traffic_channel_rc3, commit_traffic_channel, commit_traffic_channel_rc2,
     commit_traffic_channel_rc3, deallocate_sch, deallocate_traffic_channel,
     set_traffic_channel_gain,
 };
+use super::power_control::BtsPowerControlRegistry;
 use crate::phy::coding::long_code::LongCodeGenerator;
 
 /// BTS-owned façade over the traffic-channel resource pools.
@@ -38,6 +40,7 @@ pub struct TrafficResourceService {
     traffic_channels: TrafficChannelPool,
     traffic_rx_pool: TrafficRxPool,
     traffic_rx_removals: TrafficRxRemovals,
+    power_control: BtsPowerControlRegistry,
 }
 
 impl TrafficResourceService {
@@ -48,12 +51,14 @@ impl TrafficResourceService {
         traffic_channels: TrafficChannelPool,
         traffic_rx_pool: TrafficRxPool,
         traffic_rx_removals: TrafficRxRemovals,
+        power_control: BtsPowerControlRegistry,
     ) -> Self {
         Self {
             walsh_allocator,
             traffic_channels,
             traffic_rx_pool,
             traffic_rx_removals,
+            power_control,
         }
     }
 
@@ -65,6 +70,7 @@ impl TrafficResourceService {
             traffic_channels: Arc::new(super::handle::ChannelRegistry::new()),
             traffic_rx_pool: Arc::new(Mutex::new(Vec::new())),
             traffic_rx_removals: Arc::new(Mutex::new(Vec::new())),
+            power_control: BtsPowerControlRegistry::default(),
         }
     }
 
@@ -87,6 +93,22 @@ impl TrafficResourceService {
         fpc_subchan_gain: u8,
     ) -> TrafficWalshChannel {
         commit_traffic_channel(
+            &self.traffic_channels,
+            walsh_code,
+            lc_generator,
+            fpc_subchan_gain,
+        )
+    }
+
+    /// Commit a previously-reserved walsh code as an RC2 forward traffic
+    /// channel. Returns a clone of the live channel object.
+    pub fn commit_rc2_traffic(
+        &self,
+        walsh_code: u8,
+        lc_generator: LongCodeGenerator,
+        fpc_subchan_gain: u8,
+    ) -> TrafficWalshChannelRc2 {
+        commit_traffic_channel_rc2(
             &self.traffic_channels,
             walsh_code,
             lc_generator,
@@ -121,6 +143,23 @@ impl TrafficResourceService {
         fpc_subchan_gain: u8,
     ) -> Option<(u8, TrafficWalshChannel)> {
         allocate_traffic_channel(
+            &self.walsh_allocator,
+            &self.traffic_channels,
+            lc_generator,
+            initial_lc_chip,
+            fpc_subchan_gain,
+        )
+    }
+
+    /// Allocate an RC2 forward traffic channel (IS-95B Rate Set 2 —
+    /// QCELP-13K). Same migration note as `allocate_rc1_traffic`.
+    pub fn allocate_rc2_traffic(
+        &self,
+        lc_generator: LongCodeGenerator,
+        initial_lc_chip: u64,
+        fpc_subchan_gain: u8,
+    ) -> Option<(u8, TrafficWalshChannelRc2)> {
+        allocate_traffic_channel_rc2(
             &self.walsh_allocator,
             &self.traffic_channels,
             lc_generator,
@@ -169,6 +208,7 @@ impl TrafficResourceService {
     /// Deallocate a forward traffic channel by Walsh code.
     pub fn deallocate_traffic(&self, walsh_code: u8) {
         deallocate_traffic_channel(&self.walsh_allocator, &self.traffic_channels, walsh_code);
+        self.power_control.remove(walsh_code);
     }
 
     /// Deallocate an F-SCH by W(32) code.
@@ -241,3 +281,19 @@ impl Default for TrafficResourceService {
 
 /// Backward-compatible alias for external crates that still reference the old name.
 pub type TrafficResourceController = TrafficResourceService;
+
+#[cfg(test)]
+mod tests {
+    use super::TrafficResourceService;
+
+    #[test]
+    fn traffic_deallocation_removes_power_control_state() {
+        let service = TrafficResourceService::new();
+        service.power_control.set_target(12, 0.0, false);
+        assert!(service.power_control.snapshot(12).is_some());
+
+        service.deallocate_traffic(12);
+
+        assert!(service.power_control.snapshot(12).is_none());
+    }
+}

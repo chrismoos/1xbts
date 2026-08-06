@@ -1421,6 +1421,7 @@ impl PnLcCorrelator {
                         self.cfg.hpsk_signal_conjugated,
                         self.cfg.gardner_timing,
                     );
+                    finger.set_nonpilot_cfo_tracking(self.cfg.nonpilot_cfo_tracking);
                     // Seed HPSK state: need LC(tx_chip - 1) for the Q delay.
                     // The despread loop calls `advance_lc_for_new_chip` at
                     // the start of every chip iter (including the first),
@@ -3491,6 +3492,59 @@ mod tests {
                 b.im
             );
         }
+    }
+
+    #[test]
+    fn finger_raw_power_tracks_each_emitted_input_window() {
+        let oversample = 4usize;
+        let phase_period = 32768 * oversample;
+        let pn_conj = build_pn_conj(phase_period, oversample);
+        let mut lc_tx = LongCodeGenerator::new_access_channel_with_state(0, 1, 1, 0, 1u64 << 41);
+        let signal = generate_tx_signal(&pn_conj, &mut lc_tx, 0, 512, oversample);
+        let lc_rx = LongCodeGenerator::new_access_channel_with_state(0, 1, 1, 0, 1u64 << 41);
+        let mut finger = PnLcFinger::new(
+            1,
+            pn_conj,
+            phase_period,
+            oversample,
+            0,
+            0,
+            lc_rx,
+            0,
+            0,
+            256,
+            0,
+            0.0,
+            0.0,
+            1,
+            false,
+            false,
+            false,
+            false,
+            0.0,
+            false,
+            false,
+        );
+        let mut chain = Vec::new();
+        let samples_per_window = 256 * oversample;
+        let first = SampleBlock::new(signal[..samples_per_window].to_vec(), 0)
+            .with_sample_rate_hz(4.0 * 1_228_800.0);
+        let second = SampleBlock::new(
+            signal[samples_per_window..]
+                .iter()
+                .map(|sample| sample * 0.1)
+                .collect(),
+            samples_per_window,
+        )
+        .with_sample_rate_hz(4.0 * 1_228_800.0);
+
+        let first_power_mdb = finger.process(&first, &mut chain)[0].tags["finger_raw_power_mdb"];
+        let second_power_mdb = finger.process(&second, &mut chain)[0].tags["finger_raw_power_mdb"];
+
+        assert!(
+            (19_990..=20_010).contains(&(first_power_mdb - second_power_mdb)),
+            "expected each output to report its own input window: first={first_power_mdb} second={second_power_mdb}"
+        );
     }
 
     // =====================================================================

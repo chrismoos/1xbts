@@ -27,14 +27,35 @@ use super::traffic_bearer::send_forward_fch_bits_with_bearer_client;
 use super::{Bsc, MsState, VOICE_TRAFFIC_CON_REF, VOICE_TRAFFIC_SR_ID, VoiceLegRole};
 
 const FSCH_ESCAM_START_DELAY_FRAMES: u64 = 12;
+const MULTIPLEX_OPTION_RATE_SET_1: u16 = 0x0001;
+const MULTIPLEX_OPTION_RATE_SET_2: u16 = 0x0002;
 // C.S0017-0-2.10 RLP Type 3 BLOB:
 // type=1, version=3, RTT=0 (perform SYNC), INIT_VAR=1, NAK rounds 3/3, one NAK per round.
 const SO33_RLP3_SYNC_BLOB: [u8; 5] = [0x2c, 0x2d, 0x92, 0x49, 0x20];
+
+fn default_mux_option_for_rc(rc: u8) -> Result<u16, Error> {
+    match rc {
+        1 | 3 => Ok(MULTIPLEX_OPTION_RATE_SET_1),
+        2 => Ok(MULTIPLEX_OPTION_RATE_SET_2),
+        _ => Err(format!("no default multiplex option for unsupported RC{}", rc).into()),
+    }
+}
 
 pub(crate) fn fsch_escam_start_time_mod32() -> u8 {
     let start = cdma_common::time::system_time_now()
         + chrono::Duration::milliseconds((FSCH_ESCAM_START_DELAY_FRAMES * 20) as i64);
     (cdma_common::time::system_time_20ms_frames(start) % 32) as u8
+}
+
+fn fragment_forward_traffic_signaling(
+    pdu: &cdma_common::bits::Bitstream,
+    for_rc: u8,
+) -> Vec<cdma_common::bits::Bitstream> {
+    if for_rc == 2 {
+        bts_lac::sar_fragment_ftch_pdu_dsch_rc2(pdu)
+    } else {
+        bts_lac::sar_fragment_ftch_pdu_dsch(pdu)
+    }
 }
 
 /// Result of `send_forward_signaling_paging_or_traffic`.
@@ -151,7 +172,7 @@ impl Bsc {
             None => return Err("mobile has no existing traffic channel".into()),
         }
 
-        self.send_service_request(walsh_code, 0b111)?;
+        self.send_service_request(walsh_code, super::DEFAULT_TRAFFIC_ACK_SEQ)?;
         self.mobiles.update_tc(walsh_code, |_, tc| {
             tc.mark_waiting_service_response();
         });
@@ -361,7 +382,8 @@ impl Bsc {
             Vec::new()
         };
 
-        let mux_option: u16 = 0x0001;
+        let for_mux_option = default_mux_option_for_rc(for_rc)?;
+        let rev_mux_option = default_mux_option_for_rc(rev_rc)?;
 
         let for_sch_config = self.fsch_for_service_connect(walsh_code);
         let non_neg = Some(if for_rc >= 3 {
@@ -377,8 +399,8 @@ impl Bsc {
         let params = ServiceConnectParams {
             serv_con_seq,
             use_old_serv_config: 0,
-            for_mux_option: mux_option,
-            rev_mux_option: mux_option,
+            for_mux_option,
+            rev_mux_option,
             for_rates: 0xF0,
             rev_rates: 0xF0,
             sync_id: None,
@@ -439,14 +461,15 @@ impl Bsc {
         let serv_req_seq = self.traffic_signaling.next_serv_con_seq();
         let connections = self.traffic_service_connections(walsh_code)?;
 
-        let mux_option: u16 = 0x0001;
+        let for_mux_option = default_mux_option_for_rc(for_rc)?;
+        let rev_mux_option = default_mux_option_for_rc(rev_rc)?;
 
         let params = ServiceRequestParams {
             serv_req_seq,
             req_purpose: 0b0010,
             service_config: Some(ServiceRequestConfig {
-                for_mux_option: mux_option,
-                rev_mux_option: mux_option,
+                for_mux_option,
+                rev_mux_option,
                 for_rates: 0xF0,
                 rev_rates: 0xF0,
                 connections,
@@ -547,7 +570,7 @@ impl Bsc {
             .ok_or("no traffic channel assigned")?;
 
         let pdu = bts_lac::assemble_f_dsch_pdu(wire_msg_type, &sdu, ack_seq, msg_seq, ack_req);
-        let mux_frames = bts_lac::sar_fragment_ftch_pdu_dsch(&pdu);
+        let mux_frames = fragment_forward_traffic_signaling(&pdu, tc_for_rc);
 
         info!(
             "BSC: send_traffic_signaling walsh={} msg_id={} msg_seq={} ack_seq={} ack_req={} sdu_bits={} mux_frames={} addr={} (via bearer FCH Fwd)",
@@ -625,5 +648,38 @@ impl Bsc {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rc2_traffic_signaling_uses_muxpdu_type_two() {
+        let mut pdu = cdma_common::bits::Bitstream::new();
+        pdu.write_u8(0x01, 8);
+        let frames = fragment_forward_traffic_signaling(&pdu, 2);
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].len(), 267);
+        assert_eq!(&frames[0].bits()[..5], &[1, 0, 0, 1, 1]);
+    }
+
+    #[test]
+    fn service_configuration_uses_the_mux_option_for_its_radio_configuration() {
+        assert_eq!(
+            default_mux_option_for_rc(1).unwrap(),
+            MULTIPLEX_OPTION_RATE_SET_1
+        );
+        assert_eq!(
+            default_mux_option_for_rc(2).unwrap(),
+            MULTIPLEX_OPTION_RATE_SET_2
+        );
+        assert_eq!(
+            default_mux_option_for_rc(3).unwrap(),
+            MULTIPLEX_OPTION_RATE_SET_1
+        );
+        assert!(default_mux_option_for_rc(0).is_err());
     }
 }

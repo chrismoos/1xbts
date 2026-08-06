@@ -23,8 +23,7 @@ use uuid::Uuid;
 
 use crate::addressing::{format_ms_address, is_packet_data_so, select_imsi_class0_forward_address};
 use cdma_common::consts::{
-    SERVICE_OPTION_EVRC_A, SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_QCELP13,
-    SR1_CHIP_RATE_HZ,
+    SERVICE_OPTION_BASIC_VOICE, SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SR1_CHIP_RATE_HZ,
 };
 
 use super::{
@@ -189,7 +188,7 @@ impl AccessTx {
         tx_deadline: Option<cdma_common::time::CdmaSystemTime>,
     ) -> Result<(), Error> {
         let order_msg = OrderMessage {
-            order: 0b010101,
+            order: super::RELEASE_ORDER_CODE,
             ordq: 0,
             order_specific_fields: Vec::new(),
         };
@@ -227,7 +226,7 @@ impl AccessTx {
             addr,
             ack_msg_seq,
             true,
-            0b010101,
+            super::RELEASE_ORDER_CODE,
             0b00000010,
             "Release Order (requested service option rejected)",
             requested_tx_time,
@@ -841,7 +840,7 @@ impl AccessService {
         let requested_so = if origination_digits == "#777" || origination_digits == "777" {
             Some(SERVICE_OPTION_HIGH_RATE_PACKET_DATA)
         } else {
-            event.service_option
+            Some(event.service_option.unwrap_or(SERVICE_OPTION_BASIC_VOICE))
         };
 
         if let Some(so) = requested_so {
@@ -929,7 +928,7 @@ impl AccessService {
 
         // Voice service options - assign traffic channel for voice call.
         'assign_voice_traffic: {
-            let so = match event.service_option {
+            let so = match requested_so {
                 Some(so) => so,
                 None => break 'assign_voice_traffic,
             };
@@ -954,15 +953,7 @@ impl AccessService {
                 return;
             }
 
-            // Whitelisted-SO originations are set up internally as SO 3 and
-            // renegotiated on the F-TCH; the original SO rides through as
-            // origination_service_option to drive that mismatch.
-            let renegotiate_from_so = is_voice_so_renegotiate_to_evrc(so).then_some(so);
-            let target_so = if renegotiate_from_so.is_some() {
-                SERVICE_OPTION_EVRC_A
-            } else {
-                so
-            };
+            let (target_so, renegotiate_from_so) = (so, None);
             if !is_voice_origination_service_option(target_so) {
                 break 'assign_voice_traffic;
             }
@@ -975,15 +966,6 @@ impl AccessService {
                 .decoded_origination(event)
                 .map(|msg| bsc.format_origination_digits(msg))
                 .unwrap_or_default();
-
-            if let Some(orig_so) = renegotiate_from_so {
-                info!(
-                    "BSC: accepting Origination SO{} from {} — will renegotiate to SO{} on F-TCH",
-                    orig_so,
-                    format_ms_address(&fwd_address),
-                    target_so
-                );
-            }
 
             let session_id =
                 bsc.start_msc_controlled_mo_session(&fwd_address, target_so, digits.clone());
@@ -1000,7 +982,7 @@ impl AccessService {
                 .send_complete_layer3_for_origination(
                     &fwd_address,
                     event,
-                    target_so,
+                    so,
                     called_number,
                     PendingA1AssignmentKind::Voice {
                         session_id,
@@ -1041,8 +1023,8 @@ impl AccessService {
 fn is_supported_origination_service_option(so: u16) -> bool {
     is_sms_traffic_service_option(so)
         || is_packet_data_so(so)
+        || so == SERVICE_OPTION_BASIC_VOICE
         || is_voice_origination_service_option(so)
-        || is_voice_so_renegotiate_to_evrc(so)
 }
 
 fn is_sms_traffic_service_option(so: u16) -> bool {
@@ -1050,16 +1032,7 @@ fn is_sms_traffic_service_option(so: u16) -> bool {
 }
 
 fn is_voice_origination_service_option(so: u16) -> bool {
-    VoiceCodec::from_service_option(so).is_some()
-}
-
-/// Whitelist of voice service options the BSC accepts but renegotiates to
-/// EVRC-A (SO 3) on the F-TCH. Phones that originate with one of these get
-/// an EVRC-A traffic channel and a Service Option Request Order proposing
-/// SO 3 once the F-TCH is up; the MS either accepts (call proceeds as SO 3)
-/// or rejects (we release).
-fn is_voice_so_renegotiate_to_evrc(so: u16) -> bool {
-    so == SERVICE_OPTION_QCELP13
+    so == SERVICE_OPTION_BASIC_VOICE || VoiceCodec::from_service_option(so).is_some()
 }
 
 impl Bsc {

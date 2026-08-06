@@ -41,6 +41,41 @@ pub fn lsq_intercept_and_slope_at_newest(samples: &VecDeque<f32>) -> (f32, f32) 
     (intercept_at_newest, slope)
 }
 
+/// Least-squares line fit over `(absolute time, value)` samples. Returns the
+/// fitted value at the newest sample and the slope per unit of absolute time.
+/// Duplicate timestamps are permitted; if all timestamps are equal the slope
+/// is zero.
+pub fn lsq_intercept_and_slope_at_newest_timed(samples: &VecDeque<(u64, f32)>) -> (f32, f32) {
+    let Some(&(newest_t, _)) = samples.back() else {
+        return (f32::NAN, 0.0);
+    };
+    if samples.len() == 1 {
+        return (samples[0].1, 0.0);
+    }
+
+    // Express time relative to the newest sample. Reverse-link absolute PCG
+    // counters can run for months, and converting the full u64 to f32 would
+    // discard the small differences used by the fit.
+    let n = samples.len() as f64;
+    let t_mean = samples
+        .iter()
+        .map(|&(t, _)| t as i128 - newest_t as i128)
+        .map(|dt| dt as f64)
+        .sum::<f64>()
+        / n;
+    let y_mean = samples.iter().map(|&(_, y)| y as f64).sum::<f64>() / n;
+    let mut num = 0.0_f64;
+    let mut den = 0.0_f64;
+    for &(t, y) in samples {
+        let dt = (t as i128 - newest_t as i128) as f64 - t_mean;
+        num += dt * (y as f64 - y_mean);
+        den += dt * dt;
+    }
+    let slope = if den > 0.0 { num / den } else { 0.0 };
+    let intercept_at_newest = y_mean - slope * t_mean;
+    (intercept_at_newest as f32, slope as f32)
+}
+
 /// Extrapolate `lead` steps past the newest sample along `slope`, clamped to
 /// `±clamp_db` around `intercept_at_now` so a noisy slope cannot launch the
 /// prediction arbitrarily far.
@@ -113,6 +148,32 @@ mod tests {
         let (intercept, slope) = lsq_intercept_and_slope_at_newest(&samples);
         assert!((slope - 0.3).abs() < 1e-4, "slope {slope}");
         assert!((intercept - 2.2).abs() < 1e-4, "intercept {intercept}");
+    }
+
+    #[test]
+    fn timed_lsq_uses_actual_sample_spacing() {
+        let samples: VecDeque<(u64, f32)> = [(100, -10.0), (108, -9.2), (116, -8.4)]
+            .into_iter()
+            .collect();
+        let (intercept, slope) = lsq_intercept_and_slope_at_newest_timed(&samples);
+        assert!((slope - 0.1).abs() < 1e-5, "slope {slope}");
+        assert!((intercept - -8.4).abs() < 1e-5, "intercept {intercept}");
+    }
+
+    #[test]
+    fn timed_lsq_preserves_precision_at_large_absolute_pcg() {
+        let base = 10_000_000_000_u64;
+        let samples: VecDeque<(u64, f32)> = [
+            (base, 1.0),
+            (base + 1, 1.25),
+            (base + 2, 1.5),
+            (base + 3, 1.75),
+        ]
+        .into_iter()
+        .collect();
+        let (intercept, slope) = lsq_intercept_and_slope_at_newest_timed(&samples);
+        assert!((slope - 0.25).abs() < 1e-6, "slope {slope}");
+        assert!((intercept - 1.75).abs() < 1e-6, "intercept {intercept}");
     }
 
     #[test]

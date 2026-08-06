@@ -807,7 +807,7 @@ pub(super) fn build_traffic_pcg_measurement_event(
         snr_db: blk.tags.get("finger_snr_mdb").map(|v| *v as f32 / 1000.0),
         signal_power_db: blk
             .tags
-            .get("finger_signal_power_mdb")
+            .get("traffic_pcg_mobile_power_mdbfs")
             .map(|v| *v as f32 / 1000.0),
         reverse_pilot_ec_io_db: reverse_pilot_ec_io_db_from_tags(blk),
         raw_power_db: blk

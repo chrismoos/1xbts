@@ -87,7 +87,7 @@ pub(crate) fn mark_reverse_regular_msg_seq_received(
     msg_seq_rcvd: &mut [bool; 8],
     msg_seq: u8,
 ) -> bool {
-    let seq = (msg_seq & 0b111) as usize;
+    let seq = (msg_seq & super::TRAFFIC_MSG_SEQ_MASK) as usize;
     if msg_seq_rcvd[seq] {
         return true;
     }
@@ -481,25 +481,7 @@ impl Bsc {
         };
         let activity_now = Instant::now();
 
-        // Update inactivity timer only on CRC-validated RX activity.
-        // Signaling events (Orders, Data Bursts, etc.) already pass CRC in
-        // the L3 decode path.  For PHY voice/packet frames, only full-rate
-        // (9600) and half-rate (4800) carry FQI (CRC); quarter-rate (2400)
-        // and eighth-rate (1200) are validated by tail bits alone, which
-        // easily false-positive on noise when the mobile has gone silent.
-        // Treating those as activity would prevent the idle timeout from
-        // ever firing.
-        let phy_activity_valid = event
-            .traffic_phy_valid
-            .unwrap_or(!event.is_traffic_phy_status);
-        let is_crc_activity = event.message_id != MessageId::GeneralExtension
-            || event.is_preamble_only
-            || (phy_activity_valid
-                && event
-                    .traffic_primary_rate_bps
-                    .map(|r| r >= 4800)
-                    .unwrap_or(false));
-        if is_crc_activity {
+        if traffic_event_proves_reverse_activity(event) {
             self.record_mobile_activity(&addr, event, activity_now);
             self.mobiles.update_tc(walsh_code, |_, tc| {
                 tc.last_activity_at = activity_now;
@@ -545,7 +527,7 @@ impl Bsc {
             // The MS has T4m (10s) to receive this; we send it promptly on preamble detect.
             // Per C.S0004-E 3.2.2.1.1.2, if no r-dsch PDU has yet been
             // acknowledged since f-dsch acquisition/reset, ACK_SEQ is all ones.
-            let ack_seq = 0b111;
+            let ack_seq = super::DEFAULT_TRAFFIC_ACK_SEQ;
             let order_msg = OrderMessage {
                 order: 0b010000,
                 ordq: 0,
@@ -685,8 +667,8 @@ impl Bsc {
                             // SC already sent or service already negotiated — no-op
                         }
                     }
-                } else if order == 0b010101 {
-                    // r-dsch: Release Order (0b010101, ORDQ=0x00 normal release)
+                } else if order == super::RELEASE_ORDER_CODE {
+                    // r-dsch Release Order with ORDQ=0x00 requests normal release.
                     info!(
                         "BSC: received MS Release Order on R-TCH walsh={} for {}, tearing down",
                         walsh_code,
@@ -1134,34 +1116,58 @@ impl Bsc {
             event.traffic_voice_bits.as_ref(),
             event.traffic_voice_rate_bps,
         ) {
-            let (session_id, is_packet_data, msc_circuit_id) = self
+            let frame_quality_valid = event
+                .traffic_fqi_valid
+                .or(event.traffic_phy_valid)
+                .unwrap_or(true);
+            let (is_packet_data, msc_circuit_id) = self
                 .mobiles
                 .get_traffic_channel(walsh_code)
-                .map(|tc| {
-                    (
-                        tc.voice_session_id,
-                        is_packet_data_so(tc.service_option),
-                        tc.msc_circuit_id,
-                    )
-                })
-                .unwrap_or((None, false, None));
+                .map(|tc| (is_packet_data_so(tc.service_option), tc.msc_circuit_id))
+                .unwrap_or((false, None));
+            let reverse_media_enabled = self.reverse_voice_media_enabled(walsh_code);
 
             if is_packet_data {
                 log::trace!(
                     "BSC: packet primary frame walsh={} ignored from local event path; bearer poller owns packet ingress",
                     walsh_code
                 );
-            } else if self.is_voice_session_msc_media_controlled(session_id)
+            } else if !frame_quality_valid {
+                debug!(
+                    "BSC: dropping bad reverse voice frame from local event path walsh={}; bearer poller owns silence substitution",
+                    walsh_code
+                );
+            } else if reverse_media_enabled
                 && self.relay_reverse_frame_to_msc(&addr, bits, rate_bps)
             {
                 // Frame relayed to MSC via voice bearer — MSC handles routing.
-            } else if self.is_voice_session_msc_media_controlled(session_id) {
+            } else if reverse_media_enabled {
                 let circuit_id = msc_circuit_id.unwrap_or_default();
                 debug!(
                     "BSC: dropping MSC-controlled reverse voice frame walsh={} circuit_id={} because MSC bearer relay is unavailable",
                     walsh_code, circuit_id
                 );
             }
+        }
+    }
+}
+
+fn traffic_event_proves_reverse_activity(event: &AccessChannelEvent) -> bool {
+    if event.message_id != MessageId::GeneralExtension || event.is_preamble_only {
+        return true;
+    }
+
+    match event.traffic_fqi_bits {
+        Some(0) => false,
+        Some(_) => {
+            event.traffic_phy_valid == Some(true)
+                && event.traffic_fqi_valid == Some(true)
+                && event.traffic_tail_valid == Some(true)
+        }
+        None => {
+            // Reverse Abis bearer frames have already been gated on the
+            // bearer FQI bit, but do not carry the air-interface FQI length.
+            event.traffic_phy_valid == Some(true) && event.traffic_fqi_valid == Some(true)
         }
     }
 }

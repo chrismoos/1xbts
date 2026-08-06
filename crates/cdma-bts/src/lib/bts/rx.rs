@@ -128,6 +128,10 @@ fn reverse_frame_content_from_rate_bps(rate_bps: u32) -> FrameContent {
         REVERSE_FRAME_CONTENT_HALF_RATE, REVERSE_FRAME_CONTENT_QUARTER_RATE,
     };
     match rate_bps {
+        14_400 => FrameContent::FchRc2_14400,
+        7_200 => FrameContent::FchRc2_7200,
+        3_600 => FrameContent::FchRc2_3600,
+        1_800 => FrameContent::FchRc2_1800,
         9600 => REVERSE_FRAME_CONTENT_FULL_RATE,
         4800 => REVERSE_FRAME_CONTENT_HALF_RATE,
         2700 | 2400 => REVERSE_FRAME_CONTENT_QUARTER_RATE,
@@ -464,12 +468,17 @@ fn scaled_rx_sample_delay(rx_sample_delay: i64, rx_oversample: usize) -> i64 {
     rx_sample_delay * rx_oversample as i64 / RX_SAMPLE_DELAY_CALIBRATION_OVERSAMPLE
 }
 
+// The reader materializes hardware gaps as samples, so delivered sample count owns continuity.
+fn continuous_rx_absolute_sample_start(timestamp_start: u64, expected_start: Option<u64>) -> u64 {
+    expected_start.unwrap_or(timestamp_start)
+}
+
 fn spawn_traffic_rx_thread(
     oversample: usize,
     walsh_code: u8,
     esn: u32,
     preamble_num_pcgs: Option<usize>,
-    use_rc3: bool,
+    assigned_rev_rc: u8,
     rev_fch_gating_mode: bool,
     finger_pool_size: usize,
     traffic_rx_continuity: bool,
@@ -490,7 +499,7 @@ fn spawn_traffic_rx_thread(
         reanchor_origin: true,
         snr_threshold: None,
         preamble_num_pcgs,
-        epl_pilot: use_rc3,
+        epl_pilot: assigned_rev_rc >= 3,
         rev_fch_gating_mode,
         finger_pool_size,
     };
@@ -507,10 +516,10 @@ fn spawn_traffic_rx_thread(
     std::thread::Builder::new()
         .name(format!("traffic-rx-w{}", walsh_code))
         .spawn(move || {
-            let processors = if use_rc3 {
-                crate::receiver::pipelined::reverse_traffic_chain_rc3(settings)
-            } else {
-                crate::receiver::pipelined::reverse_traffic_chain(settings)
+            let processors = match assigned_rev_rc {
+                3.. => crate::receiver::pipelined::reverse_traffic_chain_rc3(settings),
+                2 => crate::receiver::pipelined::reverse_traffic_chain_rc2(settings),
+                _ => crate::receiver::pipelined::reverse_traffic_chain(settings),
             };
             run_traffic_rx_thread(
                 walsh_code,
@@ -1199,6 +1208,7 @@ pub(super) struct RxRuntime {
     pending_capture_start: Option<PendingCaptureStart>,
     active_capture: Option<ActiveCapture>,
     next_sample_index: usize,
+    expected_absolute_sample_start: Option<u64>,
     absolute_sample_origin: u64,
     hardware_start_time_ns: u64,
     last_hardware_time_ns: u64,
@@ -1769,6 +1779,7 @@ pub(super) fn open_rx_runtime(rx: RxSettings) -> Result<RxRuntime, Error> {
         pending_capture_start: None,
         active_capture: None,
         next_sample_index: 0,
+        expected_absolute_sample_start: None,
         absolute_sample_origin,
         hardware_start_time_ns,
         last_hardware_time_ns: hardware_start_time_ns,
@@ -2283,8 +2294,6 @@ fn process_rx_message(
     let n = msg.n;
 
     // Compute absolute sample position from this buffer's hardware timestamp.
-    // Every buffer is independently positioned using the shared anchor:
-    //   absolute_sample = origin + ((buffer_hw_time - anchor_hw_time) * sample_rate / 1e9)
     let delta_ns = msg.time_ns.saturating_sub(runtime.hardware_start_time_ns);
     let raw_elapsed_samples = if delta_ns == 0 {
         0u128
@@ -2297,10 +2306,25 @@ fn process_rx_message(
     // sample number at which it was transmitted.
     let scaled_delay = scaled_rx_sample_delay(runtime.config.rx_sample_delay, oversample);
     let elapsed_samples = raw_elapsed_samples.saturating_sub(scaled_delay as u128) as u64;
+    let timestamp_absolute_sample_start = runtime
+        .absolute_sample_origin
+        .saturating_add(elapsed_samples);
+    if msg.absolute_sample_start_override.is_none()
+        && let Some(expected) = runtime.expected_absolute_sample_start
+        && expected != timestamp_absolute_sample_start
+    {
+        debug!(
+            "rx: normalized hardware timestamp raw_abs_start={} expected_abs_start={} delta_samples={}",
+            timestamp_absolute_sample_start,
+            expected,
+            timestamp_absolute_sample_start as i128 - expected as i128,
+        );
+    }
     let absolute_sample_start = msg.absolute_sample_start_override.unwrap_or_else(|| {
-        runtime
-            .absolute_sample_origin
-            .saturating_add(elapsed_samples)
+        continuous_rx_absolute_sample_start(
+            timestamp_absolute_sample_start,
+            runtime.expected_absolute_sample_start,
+        )
     });
     if runtime.next_sample_index == 0 {
         info!(
@@ -2316,6 +2340,7 @@ fn process_rx_message(
     runtime.last_hardware_time_ns = msg.time_ns;
     runtime.last_absolute_sample_start = absolute_sample_start;
     runtime.last_absolute_chip_start = absolute_chip_start;
+    runtime.expected_absolute_sample_start = Some(absolute_sample_start.saturating_add(n as u64));
 
     // Write capture after chip position is known so deferred WAV creation
     // can use the real first-sample chip for the filename.
@@ -2613,19 +2638,21 @@ fn process_rx_message(
     {
         let mut requests = pool.lock();
         for req in requests.drain(..) {
-            let use_rc3 = req.assigned_rev_rc >= 3;
+            let rc_label = match req.assigned_rev_rc {
+                3.. => "RC3",
+                2 => "RC2",
+                _ => "RC1",
+            };
             info!(
                 "rx: starting reverse traffic channel receiver walsh={} esn=0x{:08X} rc={}",
-                req.walsh_code,
-                req.esn,
-                if use_rc3 { "RC3" } else { "RC1" }
+                req.walsh_code, req.esn, rc_label,
             );
             traffic_threads.push(spawn_traffic_rx_thread(
                 runtime.pipeline_oversample,
                 req.walsh_code,
                 req.esn,
                 req.preamble_num_pcgs,
-                use_rc3,
+                req.assigned_rev_rc,
                 req.rev_fch_gating_mode,
                 runtime.config.global_finger_pool_size,
                 runtime.config.traffic_rx_continuity,
@@ -3213,7 +3240,7 @@ impl PowerControlRxCounterWindow {
         let max_age_pcgs = self.window_max_age_chips as f64 / 1536.0;
         let raw_power_summary = if self.window_raw_power_count > 0 {
             format!(
-                " raw_power_avg_dbfs={:.2} (min={:.2} max={:.2} last={:.2}) filt={}",
+                " limiter_power_avg_dbfs={:.2} (min={:.2} max={:.2} last={:.2}) filt={}",
                 self.window_raw_power_sum_db / self.window_raw_power_count as f64,
                 self.window_raw_power_min_db,
                 self.window_raw_power_max_db,
@@ -3223,10 +3250,10 @@ impl PowerControlRxCounterWindow {
                     .unwrap_or_else(|| "none".to_string()),
             )
         } else {
-            " raw_power=none".to_string()
+            " limiter_power=none".to_string()
         };
         info!(
-            "rx_traffic[w{}]: [power counters] total_meas={} window_meas={} {}{}{}{}{}{}{} clamp_down={} age_avg_pcgs={:.2} age_max_pcgs={:.2} over_1pcg={} last_abs_pcg={}",
+            "rx_traffic[w{}]: [power counters] total_meas={} window_meas={} {}{}{}{}{}{}{} limiter_clamp_down={} age_avg_pcgs={:.2} age_max_pcgs={:.2} over_1pcg={} last_abs_pcg={}",
             walsh_code,
             self.total_measurements,
             self.window_measurements,
@@ -3318,7 +3345,6 @@ fn run_traffic_rx_thread(
         ..PowerControlRxCounterWindow::default()
     };
     let mut continuity_state = TrafficContinuityState::new(continuity_configured);
-
     let mut emit_outputs = |outputs: Vec<SampleBlock>,
                             hw_time_ns: u64,
                             processing_absolute_chip_end: u64|
@@ -3455,6 +3481,7 @@ fn run_traffic_rx_thread(
                             tx_abs_pcg,
                             eb_nt_db,
                             event.raw_power_db,
+                            event.signal_power_db,
                         ) {
                             tick_raw_power = tick.raw_power_db;
                             tick_filtered_raw_power = tick.filtered_raw_power_db;
@@ -3482,7 +3509,7 @@ fn run_traffic_rx_thread(
                             legacy_ec_io_db,
                             raw_sinr_db,
                             smoothing_window_len,
-                            tick_raw_power.or(event.raw_power_db),
+                            tick_raw_power.or(event.signal_power_db),
                             tick_filtered_raw_power,
                             raw_power_clamp_active,
                             tick_pcb,
@@ -3648,7 +3675,6 @@ fn run_traffic_rx_thread(
                 || out_blk.tags.get("traffic_phy_status") == Some(&1)
                 || out_blk.tags.get("traffic_phy_frame") == Some(&1)
         });
-
         // Collect per-measurement latency breakdown before emit_outputs consumes them.
         for out_blk in &outputs {
             if out_blk.tags.get("traffic_pcg_measurement") == Some(&1) {
@@ -4709,7 +4735,7 @@ fn build_traffic_pcg_measurement_event(
         snr_db: blk.tags.get("finger_snr_mdb").map(|v| *v as f32 / 1000.0),
         signal_power_db: blk
             .tags
-            .get("finger_signal_power_mdb")
+            .get("traffic_pcg_mobile_power_mdbfs")
             .map(|v| *v as f32 / 1000.0),
         reverse_pilot_ec_io_db: reverse_pilot_ec_io_db_from_tags(blk),
         raw_power_db: blk
@@ -5205,16 +5231,19 @@ fn write_capture_block(
 
 #[cfg(test)]
 mod tests {
+    use cdma_abis::bearer::FrameContent;
+
     use super::rx_events::extract_access_rc_preferences;
     use super::{
         HRPD_SLOT_CHIPS, HRPD_TRAFFIC_FRAME_CHIPS, HRPD_TRAFFIC_MAX_INTERPOLATED_GAP_SLOTS,
         HrpdTrafficMaskCandidate, PCG_CHIPS, RxCarrierSlice, RxQueueRegistry, StageTiming,
         build_access_event, build_hrpd_access_indication, build_traffic_event,
         build_traffic_voice_event, carrier_slice_anti_alias_taps,
-        effective_rx_target_batch_samples, extract_addressing_fields,
-        extract_imsi_from_class_fields, hrpd_reverse_traffic_pilot_metric_at_offset,
-        reconcile_traffic_stream_continuity, reconcile_traffic_stream_continuity_with_max_insert,
-        reverse_frame_content_from_rate_bps, run_sub_chain_timed, scaled_rx_sample_delay,
+        continuous_rx_absolute_sample_start, effective_rx_target_batch_samples,
+        extract_addressing_fields, extract_imsi_from_class_fields,
+        hrpd_reverse_traffic_pilot_metric_at_offset, reconcile_traffic_stream_continuity,
+        reconcile_traffic_stream_continuity_with_max_insert, reverse_frame_content_from_rate_bps,
+        run_sub_chain_timed, scaled_rx_sample_delay,
     };
     use crate::bts::evdo::{EvdoMode, HrpdSectorId};
     use crate::bts::launcher::{BtsLaunchOptions, build_bts_launch_parts};
@@ -5257,6 +5286,51 @@ mod tests {
         assert_eq!(scaled_rx_sample_delay(100, 8), 200);
         assert_eq!(scaled_rx_sample_delay(100, 16), 400);
         assert_eq!(scaled_rx_sample_delay(-40, 8), -80);
+    }
+
+    #[test]
+    fn rx_hardware_timestamp_does_not_shift_contiguous_carrier_stream() {
+        for sample_rate_hz in [4_915_200, 9_830_400] {
+            let mut slice =
+                RxCarrierSlice::new(2_205_000, sample_rate_hz, 1_228_800).expect("carrier slice");
+            let raw_start = 7_222_847_769_395_395u64;
+            let block_len = 24_576usize;
+            let first = slice.process(vec![Complex32::new(1.0, 0.0); block_len], 0, raw_start);
+            let expected_raw_start = raw_start + block_len as u64;
+            let normalized_raw_start = continuous_rx_absolute_sample_start(
+                expected_raw_start - 3,
+                Some(expected_raw_start),
+            );
+            let second = slice.process(
+                vec![Complex32::new(1.0, 0.0); block_len],
+                block_len,
+                normalized_raw_start,
+            );
+
+            assert_eq!(
+                second.absolute_sample_start,
+                first.absolute_sample_start + first.samples.len() as u64
+            );
+            assert_eq!(
+                second.relative_sample_start,
+                first.relative_sample_start + first.samples.len()
+            );
+            assert_eq!(
+                second.samples.len(),
+                block_len * 4 * 1_228_800 / sample_rate_hz
+            );
+            assert_eq!(
+                continuous_rx_absolute_sample_start(
+                    expected_raw_start - 3,
+                    Some(expected_raw_start)
+                ),
+                expected_raw_start
+            );
+            assert_eq!(
+                continuous_rx_absolute_sample_start(expected_raw_start - 100, None),
+                expected_raw_start - 100
+            );
+        }
     }
 
     #[test]
@@ -5362,12 +5436,28 @@ mod tests {
     }
 
     #[test]
-    fn reverse_frame_content_maps_rc3_subrates() {
+    fn reverse_frame_content_maps_rc2_and_rc3_rates() {
         use cdma_abis::bearer::{
             REVERSE_FRAME_CONTENT_EIGHTH_RATE, REVERSE_FRAME_CONTENT_FULL_RATE,
             REVERSE_FRAME_CONTENT_HALF_RATE, REVERSE_FRAME_CONTENT_QUARTER_RATE,
         };
 
+        assert_eq!(
+            reverse_frame_content_from_rate_bps(14_400),
+            FrameContent::FchRc2_14400
+        );
+        assert_eq!(
+            reverse_frame_content_from_rate_bps(7_200),
+            FrameContent::FchRc2_7200
+        );
+        assert_eq!(
+            reverse_frame_content_from_rate_bps(3_600),
+            FrameContent::FchRc2_3600
+        );
+        assert_eq!(
+            reverse_frame_content_from_rate_bps(1_800),
+            FrameContent::FchRc2_1800
+        );
         assert_eq!(
             reverse_frame_content_from_rate_bps(9600),
             REVERSE_FRAME_CONTENT_FULL_RATE

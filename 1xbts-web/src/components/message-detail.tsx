@@ -340,8 +340,8 @@ function ChannelAssignmentDetail({ message }: { message: PagingChannelAssignment
               : null
           }
         />
-        <Field label="FOR_RC" value={message.forRc} />
-        <Field label="REV_RC" value={message.revRc} />
+        <Field label="EFFECTIVE_FOR_RC" value={message.forRc} />
+        <Field label="EFFECTIVE_REV_RC" value={message.revRc} />
         <Field label="FPC_SUBCHAN_GAIN" value={message.fpcSubchanGain} />
         <Field label="RLGAIN_ADJ" value={message.rlgainAdj} />
         <Field

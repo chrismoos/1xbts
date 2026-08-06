@@ -16,7 +16,7 @@ use log::{info, warn};
 use uuid::Uuid;
 
 use crate::addressing::format_ms_address;
-use crate::voice_bearer_bits::{mux_voice_bits_for_air, normalize_air_voice_bits};
+use crate::voice_bearer_bits::{mux_voice_bits_for_air, pack_voice_bits_for_bearer};
 
 use super::{
     A1ClearState, Bsc, DEFAULT_PAGE_TIMEOUT_MS, MsState, PendingVoicePage, VoicePollAction,
@@ -97,10 +97,21 @@ pub(crate) struct PendingAssignmentFailure {
     pub(crate) queued_at: Instant,
 }
 
+pub(crate) struct DeferredVoicePage {
+    pub(crate) fwd_address: MsAddress,
+    pub(crate) session_id: Uuid,
+    pub(crate) service_option: u16,
+    pub(crate) leg_role: VoiceLegRole,
+    pub(crate) a1_tag: Option<cdma_ios::Tag>,
+    pub(crate) a1_call_id: Option<u64>,
+    pub(crate) imsi: Option<String>,
+}
+
 pub(crate) struct VoiceService {
     pub(crate) sessions: Vec<VoiceCallSession>,
     pub(crate) next_call_connection_ref: u32,
     pub(crate) next_mo_call_id: u64,
+    pub(crate) deferred_page_after_release: Option<DeferredVoicePage>,
 }
 
 impl Default for VoiceService {
@@ -109,6 +120,7 @@ impl Default for VoiceService {
             sessions: Vec::new(),
             next_call_connection_ref: 1,
             next_mo_call_id: 0x1_0000_0000,
+            deferred_page_after_release: None,
         }
     }
 }
@@ -152,14 +164,33 @@ impl VoiceService {
             call_connection_reference: ccr,
         }
     }
+
+    pub(crate) fn take_deferred_page_for_a1_call(
+        &mut self,
+        call_id: u64,
+    ) -> Option<DeferredVoicePage> {
+        self.deferred_page_after_release
+            .as_ref()
+            .is_some_and(|pending| pending.a1_call_id == Some(call_id))
+            .then(|| self.deferred_page_after_release.take())
+            .flatten()
+    }
 }
 
 pub(crate) fn traffic_rate_from_bps(rate_bps: u32) -> Option<TrafficRate> {
     match rate_bps {
-        9600 => Some(TrafficRate::Full),
-        4800 => Some(TrafficRate::Half),
-        2400 | 2700 => Some(TrafficRate::Quarter),
-        1200 | 1500 => Some(TrafficRate::Eighth),
+        // RS1 (RC1 / RC3 voice): 9600/4800/2400/1200, with RC3 emitting
+        // 2700/1500 for the sub-rate tiers.
+        9_600 => Some(TrafficRate::Full),
+        4_800 => Some(TrafficRate::Half),
+        2_400 | 2_700 => Some(TrafficRate::Quarter),
+        1_200 | 1_500 => Some(TrafficRate::Eighth),
+        // RS2 (RC2 / RC5): 14400/7200/3600/1800. Used by QCELP-13K
+        // (SO 32768) over RC2.
+        14_400 => Some(TrafficRate::Full),
+        7_200 => Some(TrafficRate::Half),
+        3_600 => Some(TrafficRate::Quarter),
+        1_800 => Some(TrafficRate::Eighth),
         _ => None,
     }
 }
@@ -238,7 +269,8 @@ impl Bsc {
             "BSC: releasing walsh={} for MT assignment-failure signal ({})",
             walsh_code, reason
         );
-        if let Err(e) = self.send_traffic_release_order(walsh_code, 0b111) {
+        if let Err(e) = self.send_traffic_release_order(walsh_code, super::DEFAULT_TRAFFIC_ACK_SEQ)
+        {
             warn!(
                 "BSC: failed to send Release Order on walsh={} during {}: {}",
                 walsh_code, reason, e
@@ -286,7 +318,7 @@ impl Bsc {
             .get_by_session_leg(session_id, peer_role)
             .map(|ms| ms.fwd_address.clone());
         if let Some(addr) = peer_addr {
-            self.begin_voice_release(&addr, 0b111, "peer leg released");
+            self.begin_voice_release(&addr, super::DEFAULT_TRAFFIC_ACK_SEQ, "peer leg released");
         }
 
         if !self.mobiles.has_voice_session(session_id) {
@@ -433,7 +465,11 @@ impl Bsc {
                         "BSC: unbridged local voice leg on walsh={}, sending Release Order",
                         voice_walsh
                     );
-                    self.begin_voice_release(&fwd_address, 0b111, "unbridged local voice leg");
+                    self.begin_voice_release(
+                        &fwd_address,
+                        super::DEFAULT_TRAFFIC_ACK_SEQ,
+                        "unbridged local voice leg",
+                    );
                 }
                 VoicePollAction::Teardown { reason, timeout_ms } => {
                     warn!(
@@ -542,6 +578,18 @@ impl Bsc {
             );
             return;
         };
+        if self
+            .mobiles
+            .get_traffic_channel(walsh_code)
+            .is_some_and(|tc| tc.is_releasing())
+        {
+            log::debug!(
+                "BSC: dropping MSC bearer frame circuit_id={} walsh={} while releasing",
+                frame.circuit_id,
+                walsh_code
+            );
+            return;
+        }
         let voice_connected = self
             .mobiles
             .get(&fwd_address)
@@ -694,11 +742,13 @@ impl Bsc {
         else {
             return false;
         };
-        let normalized = normalize_air_voice_bits(bits, rate_bps);
+        let Some(payload) = pack_voice_bits_for_bearer(bits, rate_bps) else {
+            return false;
+        };
         let frame = cdma_ios::VoiceBearerFrame {
             circuit_id,
             rate_bps,
-            payload: normalized,
+            payload,
         };
         match bearer.try_send_frame(&frame) {
             Ok(_) => true,
@@ -718,6 +768,15 @@ impl Bsc {
             return false;
         };
         self.mobiles.has_msc_media_for_session(session_id)
+    }
+
+    pub(crate) fn reverse_voice_media_enabled(&self, walsh_code: u8) -> bool {
+        let Some(tc) = self.mobiles.get_traffic_channel(walsh_code) else {
+            return false;
+        };
+        !tc.is_releasing()
+            && tc.msc_circuit_id.is_some()
+            && self.is_voice_session_msc_media_controlled(tc.voice_session_id)
     }
 
     pub(crate) fn send_standard_alert(
@@ -832,12 +891,25 @@ impl Bsc {
         a1_call_id: Option<u64>,
         imsi: Option<String>,
     ) {
+        if a1_call_id.is_some()
+            && self
+                .voice
+                .deferred_page_after_release
+                .as_ref()
+                .is_some_and(|pending| pending.a1_call_id == a1_call_id)
+        {
+            info!(
+                "BSC: ignoring duplicate Paging Request while legacy traffic release is pending call_id={:?}",
+                a1_call_id
+            );
+            return;
+        }
         let session_id = Uuid::new_v4();
-        let (subscriber_id, has_tc) = self
+        let (subscriber_id, has_tc, legacy_traffic) = self
             .mobiles
             .get(fwd_address)
-            .map(|ms| (ms.subscriber_id, ms.has_traffic_channel()))
-            .unwrap_or((None, false));
+            .map(|ms| (ms.subscriber_id, ms.has_traffic_channel(), ms.mob_p_rev < 6))
+            .unwrap_or((None, false, false));
         info!(
             "BSC: initiating MSC-controlled MT voice call session={} subscriber={:?}",
             session_id, subscriber_id,
@@ -853,6 +925,35 @@ impl Bsc {
             called_number: None,
         });
         if has_tc {
+            if legacy_traffic {
+                if self.voice.deferred_page_after_release.is_some() {
+                    warn!(
+                        "BSC: cannot defer MT voice page for legacy mobile; another release-before-page is pending"
+                    );
+                    self.voice
+                        .retain_sessions(|session| session.id != session_id);
+                    return;
+                }
+                self.voice.deferred_page_after_release = Some(DeferredVoicePage {
+                    fwd_address: fwd_address.clone(),
+                    session_id,
+                    service_option,
+                    leg_role: VoiceLegRole::Callee,
+                    a1_tag,
+                    a1_call_id,
+                    imsi,
+                });
+                info!(
+                    "BSC: releasing pre-IS-2000 traffic channel before MT page for session={}",
+                    session_id
+                );
+                self.begin_voice_release(
+                    fwd_address,
+                    super::DEFAULT_TRAFFIC_ACK_SEQ,
+                    "pre-IS-2000 release before MT page",
+                );
+                return;
+            }
             if let Some(call_id) = a1_call_id {
                 if self.send_existing_traffic_paging_response(
                     call_id,
@@ -908,6 +1009,29 @@ impl Bsc {
             a1_tag,
             a1_call_id,
             imsi,
+        );
+    }
+
+    pub(crate) fn resume_voice_page_after_release(&mut self, fwd_address: &MsAddress) {
+        let Some(pending) = self
+            .voice
+            .deferred_page_after_release
+            .take_if(|pending| pending.fwd_address == *fwd_address)
+        else {
+            return;
+        };
+        info!(
+            "BSC: traffic release complete; paging pre-IS-2000 mobile for session={}",
+            pending.session_id
+        );
+        self.queue_voice_page_for_mobile(
+            &pending.fwd_address,
+            pending.session_id,
+            pending.service_option,
+            pending.leg_role,
+            pending.a1_tag,
+            pending.a1_call_id,
+            pending.imsi,
         );
     }
 
@@ -996,7 +1120,36 @@ async fn emit_bdtmfm_digit(
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_e164_digits;
+    use super::{sanitize_e164_digits, traffic_rate_from_bps};
+    use cdma_common::channel::TrafficRate;
+
+    #[test]
+    fn traffic_rate_from_bps_maps_rs1_rates() {
+        assert_eq!(traffic_rate_from_bps(9_600), Some(TrafficRate::Full));
+        assert_eq!(traffic_rate_from_bps(4_800), Some(TrafficRate::Half));
+        assert_eq!(traffic_rate_from_bps(2_400), Some(TrafficRate::Quarter));
+        assert_eq!(traffic_rate_from_bps(2_700), Some(TrafficRate::Quarter));
+        assert_eq!(traffic_rate_from_bps(1_200), Some(TrafficRate::Eighth));
+        assert_eq!(traffic_rate_from_bps(1_500), Some(TrafficRate::Eighth));
+    }
+
+    #[test]
+    fn traffic_rate_from_bps_maps_rs2_rates_for_qcelp_over_rc2() {
+        // Without these arms a QCELP-13K voice bearer frame (14400 bps Full)
+        // would silently drop at handle_forward_bearer_frame: the BSC could
+        // never deliver QCELP audio to the BTS RC2 forward channel.
+        assert_eq!(traffic_rate_from_bps(14_400), Some(TrafficRate::Full));
+        assert_eq!(traffic_rate_from_bps(7_200), Some(TrafficRate::Half));
+        assert_eq!(traffic_rate_from_bps(3_600), Some(TrafficRate::Quarter));
+        assert_eq!(traffic_rate_from_bps(1_800), Some(TrafficRate::Eighth));
+    }
+
+    #[test]
+    fn traffic_rate_from_bps_rejects_unknown_rates() {
+        assert_eq!(traffic_rate_from_bps(0), None);
+        assert_eq!(traffic_rate_from_bps(6_000), None);
+        assert_eq!(traffic_rate_from_bps(38_400), None);
+    }
 
     #[test]
     fn sanitize_strips_non_digits() {

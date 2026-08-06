@@ -652,6 +652,8 @@ message PagingChannelAssignment {
   string assign_mode_name = 11;
   string default_config_name = 12;
   optional bool direct_ch_assign_ind = 13;
+  // Effective forward and reverse RC. Explicit in ECAM; resolved from the
+  // supported CAM assignment form when CAM carries no explicit RC fields.
   optional uint32 for_rc = 14;
   optional uint32 rev_rc = 15;
   optional uint32 fpc_subchan_gain = 16;
@@ -1008,18 +1010,20 @@ message TrafficChannelPower {
   repeated float forward_pilot_ec_io_db = 12;
   // Per-PCG pilot Ec/Nt estimates (dB) used by the inner-loop power
   // control. For RC3 this comes from R-PICH scatter (rate-independent,
-  // every PCG). For RC1 this equals the data Eb/Nt from FHT peak/noise
+  // every PCG). For RC1/RC2 this equals the data Eb/Nt from FHT peak/noise
   // (active PCGs only). Separate from `last_pcg_snr_db` which carries
   // the per-frame data Eb/Nt snapshot.
   repeated float last_pcg_pilot_ec_nt_db = 17;
-  // Reverse radio configuration (1 = RC1, 3 = RC3, etc.). Lets the UI
-  // choose appropriate labels and metric interpretation.
+  // Reverse radio configuration. Lets the UI choose appropriate labels
+  // and metric interpretation.
   uint32 reverse_radio_config = 18;
   // Time-series history of 500ms-windowed power control measurements.
   // Each entry is the mean over a 500ms (400 PCG) window, providing
   // ~2 Hz granularity for the UI chart. The BSC maintains a rolling
   // 5-minute buffer (~600 entries).
   repeated PowerControlSample power_history = 19;
+  // Forward radio configuration assigned to the traffic channel.
+  uint32 forward_radio_config = 20;
 }
 
 // Single 500ms-windowed power control measurement for the time-series

@@ -13,6 +13,20 @@ pub fn crc6(data: &[u8]) -> u8 {
     register
 }
 
+/// CRC-6 for RC2 F-FCH: g(x) = x^6 + x^2 + x + 1 (poly 0x07, init 0x3F).
+pub fn crc6_rc2(data: &[u8]) -> u8 {
+    let poly: u8 = 0x07;
+    let mut register: u8 = 0x3F;
+    for &bit in data {
+        let feedback = ((register >> 5) & 1) ^ (bit & 1);
+        register = (register << 1) & 0x3F;
+        if feedback == 1 {
+            register ^= poly;
+        }
+    }
+    register
+}
+
 /// CRC-8: g(x) = x^8 + x^7 + x^4 + x^3 + x + 1 (poly 0x9B, init 0xFF).
 /// Per C.S0002-E 3.1.3.1.4.1.4. Used for half-rate frames.
 pub fn crc8(data: &[u8]) -> u8 {
@@ -21,6 +35,21 @@ pub fn crc8(data: &[u8]) -> u8 {
     for &bit in data {
         let feedback = ((register >> 7) & 1) ^ (bit & 1);
         register <<= 1;
+        if feedback == 1 {
+            register ^= poly;
+        }
+    }
+    register
+}
+
+/// CRC-10: g(x) = x^10 + x^9 + x^8 + x^7 + x^6 + x^4 + x^3 + 1 (poly 0x3D9, init 0x3FF).
+/// Per C.S0002-E 3.1.3.1.4.1.3. Used for the 7200 bps frame quality indicator on RC2 forward.
+pub fn crc10(data: &[u8]) -> u16 {
+    let poly: u16 = 0x3D9;
+    let mut register: u16 = 0x3FF;
+    for &bit in data {
+        let feedback = ((register >> 9) & 1) ^ (bit as u16 & 1);
+        register = (register << 1) & 0x3FF;
         if feedback == 1 {
             register ^= poly;
         }

@@ -23,7 +23,7 @@ fn default_service_connect_timeout_ms() -> u64 {
 }
 
 fn default_supported_voice_service_options() -> Vec<u16> {
-    vec![3, 68, 70]
+    vec![3, 68, 70, 32768]
 }
 
 fn default_voice_gateway_endpoint() -> String {
@@ -642,6 +642,15 @@ mod tests {
         let cfg = test_config();
         assert_eq!(cfg.a1_listen_addr, "127.0.0.1:17013".parse().unwrap());
         assert!(!cfg.voice.gateway.enabled);
+    }
+
+    #[test]
+    fn shipped_msc_config_prefers_qcelp13() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/msc.json");
+        let cfg: MscNodeConfig =
+            serde_json::from_slice(&std::fs::read(path).expect("read config/msc.json"))
+                .expect("parse config/msc.json");
+        assert_eq!(cfg.voice.default_mobile_terminated_service_option(), 32768);
     }
 
     #[test]

@@ -1,4 +1,7 @@
-use cdma_common::consts::{SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_PACKET_DATA};
+use cdma_common::consts::{
+    SERVICE_OPTION_BASIC_VOICE, SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_PACKET_DATA,
+    SERVICE_OPTION_QCELP13,
+};
 use cdma_common::lac::paging_messages::{self as paging_messages, MsAddress, MsPageAddress};
 use log::{info, warn};
 
@@ -64,7 +67,7 @@ pub(crate) fn select_initial_traffic_rcs(
         }
     };
     let allowed_by_policy = |pair: (u8, u8)| {
-        matches!(pair, (1, 1) | (3, 3))
+        matches!(pair, (1, 1) | (2, 2) | (3, 3))
             && policy.supported_for_rcs.contains(&pair.0)
             && policy.supported_rev_rcs.contains(&pair.1)
     };
@@ -88,7 +91,7 @@ pub(crate) fn select_initial_traffic_rcs(
         }
     }
 
-    for pair in [(1, 1), (3, 3)] {
+    for pair in [(1, 1), (2, 2), (3, 3)] {
         if allowed_by_policy(pair) && supported_by_mobile(pair) {
             return Some(pair);
         }
@@ -123,6 +126,53 @@ pub(crate) fn select_initial_traffic_rcs(
         mob_p_rev,
     );
     None
+}
+
+/// Service-option-aware wrapper around [`select_initial_traffic_rcs`].
+///
+/// SO1 uses the legacy RC1 configuration. QCELP-13K requires RC2 in both
+/// directions.
+pub(crate) fn select_initial_traffic_rcs_for_so(
+    policy: &TrafficAssignmentConfig,
+    for_rcs: &[u8],
+    rev_rcs: &[u8],
+    for_pref: Option<u8>,
+    rev_pref: Option<u8>,
+    mob_p_rev: u8,
+    service_option: Option<u16>,
+) -> Option<(u8, u8)> {
+    if service_option == Some(SERVICE_OPTION_BASIC_VOICE) {
+        if policy.supported_for_rcs.contains(&1) && policy.supported_rev_rcs.contains(&1) {
+            return Some((1, 1));
+        }
+        warn!(
+            "BSC: basic voice (SO1) requested but RC1 is disabled by policy (for={:?} rev={:?})",
+            policy.supported_for_rcs, policy.supported_rev_rcs,
+        );
+        return None;
+    }
+    if service_option == Some(SERVICE_OPTION_QCELP13) {
+        let admits_rc2_policy =
+            policy.supported_for_rcs.contains(&2) && policy.supported_rev_rcs.contains(&2);
+        let admits_rc2_mobile = mob_p_rev >= 3
+            && (mob_p_rev < 6
+                || ((for_rcs.is_empty() || for_rcs.contains(&2))
+                    && (rev_rcs.is_empty() || rev_rcs.contains(&2))));
+        if admits_rc2_policy && admits_rc2_mobile {
+            return Some((2, 2));
+        }
+        warn!(
+            "BSC: QCELP-13K (SO {}) requested but RC2 not admissible (policy for={:?} rev={:?} mobile for={:?} rev={:?} mob_p_rev={})",
+            SERVICE_OPTION_QCELP13,
+            policy.supported_for_rcs,
+            policy.supported_rev_rcs,
+            for_rcs,
+            rev_rcs,
+            mob_p_rev,
+        );
+        return None;
+    }
+    select_initial_traffic_rcs(policy, for_rcs, rev_rcs, for_pref, rev_pref, mob_p_rev)
 }
 
 /// Resolve IMSI class-0 forward-link address from access event fields.
@@ -626,6 +676,72 @@ mod tests {
         let policy = rc3_only_policy();
         let result = select_initial_traffic_rcs(&policy, &[], &[], None, None, 3);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn qcelp_p_rev3_selects_rc2_despite_legacy_capability_vectors() {
+        let result = select_initial_traffic_rcs_for_so(
+            &default_policy(),
+            &[1],
+            &[1],
+            None,
+            None,
+            3,
+            Some(SERVICE_OPTION_QCELP13),
+        );
+        assert_eq!(result, Some((2, 2)));
+    }
+
+    #[test]
+    fn basic_voice_selects_rc1_even_for_is2000_mobile() {
+        let result = select_initial_traffic_rcs_for_so(
+            &default_policy(),
+            &[2, 3],
+            &[2, 3],
+            Some(3),
+            Some(3),
+            6,
+            Some(SERVICE_OPTION_BASIC_VOICE),
+        );
+        assert_eq!(result, Some((1, 1)));
+    }
+
+    #[test]
+    fn qcelp_rejects_policy_without_rc2() {
+        let result = select_initial_traffic_rcs_for_so(
+            &rc1_only_policy(),
+            &[1],
+            &[1],
+            None,
+            None,
+            3,
+            Some(SERVICE_OPTION_QCELP13),
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn qcelp_p_rev6_honors_explicit_rc2_capability() {
+        let supported = select_initial_traffic_rcs_for_so(
+            &default_policy(),
+            &[1, 2],
+            &[1, 2],
+            None,
+            None,
+            6,
+            Some(SERVICE_OPTION_QCELP13),
+        );
+        let unsupported = select_initial_traffic_rcs_for_so(
+            &default_policy(),
+            &[1],
+            &[1],
+            None,
+            None,
+            6,
+            Some(SERVICE_OPTION_QCELP13),
+        );
+        assert_eq!(supported, Some((2, 2)));
+        assert!(unsupported.is_none());
     }
 
     #[test]

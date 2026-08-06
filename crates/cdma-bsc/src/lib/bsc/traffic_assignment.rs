@@ -7,12 +7,16 @@
 //! WS-0 PR3 sibling module per
 //! `docs/architecture-update/09-pr3-method-map.md`.
 
-use cdma_common::consts::{SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_SMS};
+use cdma_common::consts::{
+    SERVICE_OPTION_BASIC_VOICE, SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_SMS,
+};
 use cdma_common::error::Error;
 use cdma_common::events::AccessChannelEvent;
 use cdma_common::lac::message_types::MessageId;
 use cdma_common::lac::paging_messages::{
-    ChannelAssignmentMessage, ExtendedChannelAssignmentMessage, MsAddress, PagingChannelMessage,
+    CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC, CHANNEL_DEFAULT_CONFIG_RC1_RC1,
+    CHANNEL_DEFAULT_CONFIG_RC2_RC2, ChannelAssignmentGrantedMode, ChannelAssignmentMessage,
+    ExtendedChannelAssignmentMessage, MsAddress, PagingChannelMessage,
 };
 use cdma_common::overhead::OverheadParameters;
 use cdma_common::phy::long_code::LongCodeGenerator;
@@ -21,7 +25,10 @@ use log::info;
 use uuid::Uuid;
 
 use crate::abis_edge::BtsTrafficChannelHandle;
-use crate::addressing::{format_ms_address, is_packet_data_so, select_initial_traffic_rcs};
+use crate::addressing::{
+    format_ms_address, is_packet_data_so, select_initial_traffic_rcs,
+    select_initial_traffic_rcs_for_so,
+};
 
 use super::{
     Bsc, MobileRegistryService, MsState, ServiceNegotiationMode, TrafficChannelInfo,
@@ -31,6 +38,8 @@ use super::{
 
 #[derive(Default)]
 pub(crate) struct TrafficAssignmentService;
+
+const EXTENDED_CAM_MIN_P_REV: u8 = 3;
 
 impl TrafficAssignmentService {
     pub(crate) fn assign_channel_to_mobile(
@@ -70,8 +79,14 @@ impl TrafficAssignmentService {
         (walsh_code, assigned_rcs)
     }
 
-    pub(crate) fn service_negotiation_mode_for_mob_p_rev(mob_p_rev: u8) -> ServiceNegotiationMode {
-        if mob_p_rev >= 6 {
+    pub(crate) fn service_negotiation_mode(
+        mob_p_rev: u8,
+        assigned_rcs: (u8, u8),
+        service_option: u16,
+    ) -> ServiceNegotiationMode {
+        if service_option == SERVICE_OPTION_BASIC_VOICE {
+            ServiceNegotiationMode::ServiceOptionNegotiation
+        } else if mob_p_rev >= 6 || assigned_rcs == (2, 2) {
             ServiceNegotiationMode::ServiceNegotiation
         } else {
             ServiceNegotiationMode::ServiceOptionNegotiation
@@ -147,13 +162,14 @@ impl Bsc {
 
         let selected_rcs = {
             let ms = self.mobiles.get(fwd_address).expect("mobile exists");
-            select_initial_traffic_rcs(
+            select_initial_traffic_rcs_for_so(
                 &self.config.traffic_assignment,
                 &ms.for_supported_rcs,
                 &ms.rev_supported_rcs,
                 ms.for_preferred_rc,
                 ms.rev_preferred_rc,
                 ms.mob_p_rev,
+                event.service_option,
             )
         };
         let Some(selected_rcs) = selected_rcs else {
@@ -168,17 +184,31 @@ impl Bsc {
             );
             return false;
         };
-        let use_rc3 = selected_rcs == (3, 3);
 
         // F-SCH is only for SO33 packet data.
-        let alloc_result = if use_rc3 {
-            bts_client
-                .allocate_rc3_traffic(traffic_lc.clone(), 0, 12, esn, false)
-                .await
-        } else {
-            bts_client
-                .allocate_rc1_traffic(traffic_lc.clone(), 0, esn)
-                .await
+        let alloc_result = match selected_rcs {
+            (3, 3) => {
+                bts_client
+                    .allocate_rc3_traffic(traffic_lc.clone(), 0, 12, esn, false)
+                    .await
+            }
+            (2, 2) => {
+                bts_client
+                    .allocate_rc2_traffic(traffic_lc.clone(), 0, esn)
+                    .await
+            }
+            (1, 1) => {
+                bts_client
+                    .allocate_rc1_traffic(traffic_lc.clone(), 0, esn)
+                    .await
+            }
+            other => {
+                log::warn!(
+                    "BSC: selected RC pair {:?} is not implemented; falling back to BS Ack",
+                    other
+                );
+                return false;
+            }
         };
 
         let Some(handle) = alloc_result else {
@@ -189,7 +219,7 @@ impl Bsc {
         let walsh_code = handle.walsh_code;
         info!(
             "BSC: allocated {} traffic channel walsh={} for {} (SO6 SMS)",
-            if use_rc3 { "RC3" } else { "RC1" },
+            handle.rc_label,
             walsh_code,
             format_ms_address(fwd_address)
         );
@@ -481,13 +511,14 @@ impl Bsc {
 
         let selected_rcs = {
             let ms = self.mobiles.get(fwd_address).expect("mobile exists");
-            select_initial_traffic_rcs(
+            select_initial_traffic_rcs_for_so(
                 &self.config.traffic_assignment,
                 &ms.for_supported_rcs,
                 &ms.rev_supported_rcs,
                 ms.for_preferred_rc,
                 ms.rev_preferred_rc,
                 ms.mob_p_rev,
+                Some(so),
             )
         };
         let Some(selected_rcs) = selected_rcs else {
@@ -502,18 +533,32 @@ impl Bsc {
             );
             return false;
         };
-        let use_rc3 = selected_rcs == (3, 3);
         // Keep traffic setup FCH-only. F-SCH is allocated separately through the
         // rate-aware Abis Burst Request path after the packet service is up.
         let include_sch = false;
-        let alloc_result = if use_rc3 {
-            bts_client
-                .allocate_rc3_traffic(traffic_lc.clone(), 0, 12, esn, include_sch)
-                .await
-        } else {
-            bts_client
-                .allocate_rc1_traffic(traffic_lc.clone(), 0, esn)
-                .await
+        let alloc_result = match selected_rcs {
+            (3, 3) => {
+                bts_client
+                    .allocate_rc3_traffic(traffic_lc.clone(), 0, 12, esn, include_sch)
+                    .await
+            }
+            (2, 2) => {
+                bts_client
+                    .allocate_rc2_traffic(traffic_lc.clone(), 0, esn)
+                    .await
+            }
+            (1, 1) => {
+                bts_client
+                    .allocate_rc1_traffic(traffic_lc.clone(), 0, esn)
+                    .await
+            }
+            other => {
+                log::warn!(
+                    "BSC: selected RC pair {:?} is not implemented for packet data; falling back to BS Ack",
+                    other
+                );
+                return false;
+            }
         };
 
         let Some(handle) = alloc_result else {
@@ -535,7 +580,7 @@ impl Bsc {
         }
         info!(
             "BSC: allocated {} traffic channel walsh={} for {} (SO{} packet data)",
-            if use_rc3 { "RC3" } else { "RC1" },
+            handle.rc_label,
             walsh_code,
             format_ms_address(fwd_address),
             so
@@ -658,26 +703,41 @@ impl Bsc {
                 .mobiles
                 .get(fwd_address)
                 .ok_or_else(|| "mobile no longer registered".to_string())?;
-            select_initial_traffic_rcs(
+            select_initial_traffic_rcs_for_so(
                 &self.config.traffic_assignment,
                 &ms.for_supported_rcs,
                 &ms.rev_supported_rcs,
                 ms.for_preferred_rc,
                 ms.rev_preferred_rc,
                 ms.mob_p_rev,
+                Some(service_option),
             )
         }
         .ok_or_else(|| "no configured traffic RC pair matches mobile capabilities".to_string())?;
-        let use_rc3 = selected_rcs == (3, 3);
         // F-SCH is only for SO33 packet data.
-        let alloc_result = if use_rc3 {
-            bts_client
-                .allocate_rc3_traffic(traffic_lc.clone(), 0, 12, esn, false)
-                .await
-        } else {
-            bts_client
-                .allocate_rc1_traffic(traffic_lc.clone(), 0, esn)
-                .await
+        let alloc_result = match selected_rcs {
+            (3, 3) => {
+                bts_client
+                    .allocate_rc3_traffic(traffic_lc.clone(), 0, 12, esn, false)
+                    .await
+            }
+            (2, 2) => {
+                bts_client
+                    .allocate_rc2_traffic(traffic_lc.clone(), 0, esn)
+                    .await
+            }
+            (1, 1) => {
+                bts_client
+                    .allocate_rc1_traffic(traffic_lc.clone(), 0, esn)
+                    .await
+            }
+            other => {
+                return Err(format!(
+                    "selected RC pair {:?} is not implemented for voice traffic",
+                    other
+                )
+                .into());
+            }
         };
         let handle = alloc_result
             .ok_or_else(|| "no Walsh codes available for voice traffic channel".to_string())?;
@@ -766,9 +826,24 @@ impl TrafficAssignmentService {
         _requested_tx_time: Option<cdma_common::time::CdmaSystemTime>,
         _tx_deadline: Option<cdma_common::time::CdmaSystemTime>,
     ) -> Result<(), Error> {
-        let (mob_p_rev, for_rcs, rev_rcs, for_pref, rev_pref, ms_gating_req) = mobiles
+        let (
+            mob_p_rev,
+            for_rcs,
+            rev_rcs,
+            for_pref,
+            rev_pref,
+            ms_gating_req,
+            needs_service_negotiation,
+            legacy_so1_assignment,
+        ) = mobiles
             .get(addr)
             .map(|ms| {
+                let needs_service_negotiation = ms
+                    .find_traffic_channel_by_walsh(walsh_code)
+                    .is_some_and(|tc| {
+                        tc.origination_service_option
+                            .is_some_and(|orig_so| orig_so != tc.service_option)
+                    });
                 (
                     ms.mob_p_rev,
                     ms.for_supported_rcs.clone(),
@@ -776,11 +851,15 @@ impl TrafficAssignmentService {
                     ms.for_preferred_rc,
                     ms.rev_preferred_rc,
                     ms.rev_fch_gating_req,
+                    needs_service_negotiation,
+                    ms.find_traffic_channel_by_walsh(walsh_code)
+                        .is_some_and(|tc| tc.service_option == SERVICE_OPTION_BASIC_VOICE),
                 )
             })
-            .unwrap_or((1, Vec::new(), Vec::new(), None, None, false));
+            .unwrap_or((1, Vec::new(), Vec::new(), None, None, false, false, false));
 
-        let (message, msg_id, assign_mode, code_chan) = if mob_p_rev >= 6 {
+        let (message, msg_id, assign_mode, code_chan) = if mob_p_rev >= 6 && !legacy_so1_assignment
+        {
             let (for_rc, rev_rc) = match assigned_rcs.or_else(|| {
                 select_initial_traffic_rcs(
                     traffic_config,
@@ -832,7 +911,7 @@ impl TrafficAssignmentService {
             (
                 PagingChannelMessage::ExtendedChannelAssignment(ecam),
                 MessageId::ExtChannelAssignment,
-                0b100,
+                CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC,
                 walsh_code,
             )
         } else {
@@ -850,33 +929,56 @@ impl TrafficAssignmentService {
                 .ok_or_else(|| {
                     "no configured RC pair available for legacy CAM assignment".to_string()
                 })?;
-            if (for_rc, rev_rc) != (1, 1) {
+            if !matches!((for_rc, rev_rc), (1, 1) | (2, 2)) {
                 return Err(format!(
-                    "legacy CAM ASSIGN_MODE=000 only supports implemented RC1/RC1 path, selected RC{}/{}",
+                    "legacy CAM cannot represent selected RC{}/{}",
                     for_rc, rev_rc
                 )
                 .into());
             }
-            info!(
-                "BSC: legacy mobile (mob_p_rev={}), using CAM ASSIGN_MODE=000 serv_neg={}",
-                mob_p_rev,
-                ServiceNegotiationMode::ServiceOptionNegotiation.label()
-            );
-            let cam = ChannelAssignmentMessage::new_traffic_assignment(walsh_code, 0);
+            let cam = match (for_rc, rev_rc) {
+                (2, 2) if mob_p_rev >= EXTENDED_CAM_MIN_P_REV => {
+                    let (default_config, granted_mode) = if needs_service_negotiation {
+                        (
+                            CHANNEL_DEFAULT_CONFIG_RC2_RC2,
+                            ChannelAssignmentGrantedMode::DefaultConfiguration,
+                        )
+                    } else {
+                        (
+                            CHANNEL_DEFAULT_CONFIG_RC1_RC1,
+                            ChannelAssignmentGrantedMode::RequestedService,
+                        )
+                    };
+                    ChannelAssignmentMessage::new_extended_traffic_assignment(
+                        walsh_code,
+                        0,
+                        default_config,
+                        granted_mode,
+                        false,
+                    )
+                }
+                (2, 2) => {
+                    return Err("RC2 CAM requires mobile P_REV >= 3".into());
+                }
+                (1, 1) => ChannelAssignmentMessage::new_traffic_assignment(walsh_code, 0),
+                _ => unreachable!("legacy CAM RC pair validated above"),
+            };
+            let assign_mode = cam.assign_mode;
             (
                 PagingChannelMessage::ChannelAssignment(cam),
                 MessageId::ChannelAssignment,
-                0b000,
+                assign_mode,
                 walsh_code,
             )
         };
 
         let sdu = message.to_sdu();
 
-        access_tx.send_directed_fpch(addr, msg_id, message, sdu, true)?;
+        let ack_req = msg_id != MessageId::ChannelAssignment;
+        access_tx.send_directed_fpch(addr, msg_id, message, sdu, ack_req)?;
 
         info!(
-            "BSC: sending {} (assign_mode=0b{:03b}, walsh={}, ack_seq={})",
+            "BSC: sending {} (assign_mode=0b{:03b}, walsh={}, ack_seq={}, ack_req={})",
             if msg_id == MessageId::ExtChannelAssignment {
                 "Extended Channel Assignment Message"
             } else {
@@ -885,6 +987,7 @@ impl TrafficAssignmentService {
             assign_mode,
             code_chan,
             ack_msg_seq,
+            ack_req,
         );
         Ok(())
     }
@@ -902,11 +1005,16 @@ impl Bsc {
         leg_role: Option<VoiceLegRole>,
         a1_call_id: Option<u64>,
     ) -> (u8, (u8, u8)) {
+        let assigned_rcs = (handle.for_rc, handle.rev_rc);
         let service_negotiation_mode = self
             .mobiles
             .get(fwd_address)
             .map(|ms| {
-                TrafficAssignmentService::service_negotiation_mode_for_mob_p_rev(ms.mob_p_rev)
+                TrafficAssignmentService::service_negotiation_mode(
+                    ms.mob_p_rev,
+                    assigned_rcs,
+                    service_option,
+                )
             })
             .unwrap_or(ServiceNegotiationMode::ServiceOptionNegotiation);
         self.traffic_assignment.assign_channel_to_mobile(

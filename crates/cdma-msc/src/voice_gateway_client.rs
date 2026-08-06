@@ -548,21 +548,23 @@ fn convert_gateway_frame(
     frame: proto::GatewayVoiceFrame,
     handles: &Arc<Mutex<HashMap<CallHandle, GatewayCallState>>>,
 ) -> Option<MediaGatewayEvent> {
-    let rate_bps = match proto::VoiceFrameRate::try_from(frame.rate).ok()? {
-        proto::VoiceFrameRate::Full => 9600,
-        proto::VoiceFrameRate::Half => 4800,
-        proto::VoiceFrameRate::Quarter => 2400,
-        proto::VoiceFrameRate::Eighth => 1200,
+    let service_option = u16::try_from(frame.service_option).ok()?;
+    let codec = cdma_voice::VoiceCodec::from_service_option(service_option)?;
+    let rate = match proto::VoiceFrameRate::try_from(frame.rate).ok()? {
+        proto::VoiceFrameRate::Full => cdma_voice::VoiceRate::Full,
+        proto::VoiceFrameRate::Half => cdma_voice::VoiceRate::Half,
+        proto::VoiceFrameRate::Quarter => cdma_voice::VoiceRate::Quarter,
+        proto::VoiceFrameRate::Eighth => cdma_voice::VoiceRate::Eighth,
         proto::VoiceFrameRate::Unspecified => return None,
     };
     Some(MediaGatewayEvent::MediaFrame {
         handle: handle_for_session(handles, &frame.session_id)?,
         payload: VocoderFrame {
             payload: frame.bits,
-            rate_bps,
+            rate_bps: codec.rate_bps(rate),
         },
         sequence: frame.sequence,
-        service_option: u16::try_from(frame.service_option).unwrap_or(0),
+        service_option,
     })
 }
 
@@ -603,5 +605,49 @@ fn release_cause_from_i32(reason: i32) -> ReleaseCause {
         }
         proto::ReleaseReason::SetupFailed => ReleaseCause::SetupFailed,
         _ => ReleaseCause::RemoteReleased,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gateway_qcelp_rate_uses_rate_set_two_bps() {
+        let handle = CallHandle(8);
+        let handles = Arc::new(Mutex::new(HashMap::from([(
+            handle,
+            GatewayCallState {
+                session_id: "qcelp".to_string(),
+                service_option: cdma_voice::SERVICE_OPTION_QCELP_13K,
+                next_sequence: 0,
+            },
+        )])));
+        let event = convert_gateway_frame(
+            proto::GatewayVoiceFrame {
+                session_id: "qcelp".to_string(),
+                bits: vec![0; 266],
+                num_bits: 266,
+                rate: proto::VoiceFrameRate::Full as i32,
+                sequence: 3,
+                service_option: u32::from(cdma_voice::SERVICE_OPTION_QCELP_13K),
+            },
+            &handles,
+        )
+        .expect("QCELP gateway frame");
+        match event {
+            MediaGatewayEvent::MediaFrame {
+                handle: event_handle,
+                payload,
+                service_option,
+                ..
+            } => {
+                assert_eq!(event_handle, handle);
+                assert_eq!(payload.rate_bps, 14_400);
+                assert_eq!(payload.payload.len(), 266);
+                assert_eq!(service_option, cdma_voice::SERVICE_OPTION_QCELP_13K);
+            }
+            _ => panic!("expected media frame"),
+        }
     }
 }

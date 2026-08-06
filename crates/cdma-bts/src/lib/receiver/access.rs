@@ -80,7 +80,7 @@ impl AccessFrameReader {
 
 /// Reassembled reverse dedicated signaling (r-dsch) regular PDU.
 ///
-/// Input is one RC1/RC3 traffic-channel information fragment per 20 ms frame:
+/// Input is one RC1/RC2/RC3 traffic-channel information fragment per 20 ms frame:
 /// SOM(1) + fragment bits.
 /// The encapsulated regular PDU uses:
 /// - MSG_LENGTH (8 bits, in octets)

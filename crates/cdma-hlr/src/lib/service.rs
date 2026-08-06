@@ -1161,7 +1161,10 @@ fn map_repo_error(e: String) -> Status {
 }
 
 fn is_valid_codec_name(name: &str) -> bool {
-    matches!(name, "evrc_a" | "evrc_b" | "evrc_wb")
+    matches!(
+        name,
+        "tia96" | "evrc_a" | "evrc_b" | "evrc_wb" | "qcelp_13k"
+    )
 }
 
 #[cfg(test)]
@@ -1176,6 +1179,14 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Mutex;
     use tonic::Code;
+
+    #[test]
+    fn accepts_every_preencoded_ringtone_codec() {
+        for codec in ["tia96", "evrc_a", "evrc_b", "evrc_wb", "qcelp_13k"] {
+            assert!(is_valid_codec_name(codec));
+        }
+        assert!(!is_valid_codec_name("unknown"));
+    }
 
     #[derive(Default)]
     struct StubRepo {

@@ -5,6 +5,7 @@ import Link from "next/link";
 import { Card } from "@/components/card";
 import { esnManufacturer } from "@/lib/esn-manufacturer";
 import { formatEsn, formatMeid, formatTimeMs as formatTime } from "@/lib/format";
+import { radioConfigPairName } from "@/lib/radio-config";
 
 interface MobileInfo {
   address: string;
@@ -29,6 +30,10 @@ interface MobileInfo {
   subscriberId?: string;
   trafficWalshCode?: number;
   trafficServiceOption?: number;
+  trafficPower?: {
+    forwardRadioConfig: number;
+    reverseRadioConfig: number;
+  };
 }
 
 function qualityColor(pct: number): string {
@@ -171,6 +176,17 @@ export default function MobilesPage() {
                             {ms.trafficServiceOption != null && (
                               <span className="text-muted ml-1">
                                 SO{ms.trafficServiceOption}
+                              </span>
+                            )}
+                            {radioConfigPairName(
+                              ms.trafficPower?.forwardRadioConfig,
+                              ms.trafficPower?.reverseRadioConfig,
+                            ) && (
+                              <span className="text-secondary ml-1">
+                                {radioConfigPairName(
+                                  ms.trafficPower?.forwardRadioConfig,
+                                  ms.trafficPower?.reverseRadioConfig,
+                                )}
                               </span>
                             )}
                           </span>

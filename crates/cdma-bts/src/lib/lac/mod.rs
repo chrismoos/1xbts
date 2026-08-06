@@ -1525,6 +1525,24 @@ pub fn assemble_f_dsch_pdu(
 /// ready to be sent as a full-rate traffic frame. Frames are ordered — the
 /// first has SOM=1, subsequent frames have SOM=0.
 pub fn sar_fragment_ftch_pdu_dsch(pdu: &Bitstream) -> Vec<Bitstream> {
+    sar_fragment_ftch_pdu_dsch_for_rate_set(pdu, FtchMuxRateSet::One)
+}
+
+/// Fragment an f-dsch PDU into one or more 267-bit MuxPDU Type 2 frames.
+pub fn sar_fragment_ftch_pdu_dsch_rc2(pdu: &Bitstream) -> Vec<Bitstream> {
+    sar_fragment_ftch_pdu_dsch_for_rate_set(pdu, FtchMuxRateSet::Two)
+}
+
+#[derive(Clone, Copy)]
+enum FtchMuxRateSet {
+    One,
+    Two,
+}
+
+fn sar_fragment_ftch_pdu_dsch_for_rate_set(
+    pdu: &Bitstream,
+    rate_set: FtchMuxRateSet,
+) -> Vec<Bitstream> {
     // MSG_LENGTH = ceil((8 + pdu_bits + 16) / 8)
     let total_bits = 8 + pdu.len() + 16;
     let msg_length_octets = total_bits.div_ceil(8) as u8;
@@ -1538,9 +1556,15 @@ pub fn sar_fragment_ftch_pdu_dsch(pdu: &Bitstream) -> Vec<Bitstream> {
     crc_scope.extend(pdu);
     sar_data.write_u32(crc16_fdsch(&crc_scope) as u32, 16);
 
-    const SIGNALING_BITS: usize = 168; // Per frame
-    const SAR_DATA_PER_FRAME: usize = SIGNALING_BITS - 1; // 167 bits (after SOM)
-    const FTCH_FULL_RATE_INFO_BITS: usize = 172;
+    const MUX1_SIGNALING_BITS: usize = 168;
+    const MUX1_INFO_BITS: usize = 172;
+    const MUX2_SIGNALING_BITS: usize = 262;
+    const MUX2_INFO_BITS: usize = 267;
+    let (signaling_bits, info_bits) = match rate_set {
+        FtchMuxRateSet::One => (MUX1_SIGNALING_BITS, MUX1_INFO_BITS),
+        FtchMuxRateSet::Two => (MUX2_SIGNALING_BITS, MUX2_INFO_BITS),
+    };
+    let sar_data_per_frame = signaling_bits - 1;
 
     let mut frames = Vec::new();
     let sar_bits = sar_data.bits().to_vec();
@@ -1549,27 +1573,30 @@ pub fn sar_fragment_ftch_pdu_dsch(pdu: &Bitstream) -> Vec<Bitstream> {
 
     while offset < sar_bits.len() {
         let remaining = sar_bits.len() - offset;
-        let chunk_len = remaining.min(SAR_DATA_PER_FRAME);
+        let chunk_len = remaining.min(sar_data_per_frame);
 
-        // Signaling block: SOM(1) + SAR data chunk + zero-pad to 168 bits
+        // Signaling block: SOM + SAR data chunk + padding.
         let mut signaling = Bitstream::new();
         signaling.write_u8(if is_first { 1 } else { 0 }, 1); // SOM
         for i in 0..chunk_len {
             signaling.write_u8(sar_bits[offset + i], 1);
         }
-        // Zero-pad to 168 signaling bits
-        if signaling.len() < SIGNALING_BITS {
-            let pad = SIGNALING_BITS - signaling.len();
+        if signaling.len() < signaling_bits {
+            let pad = signaling_bits - signaling.len();
             signaling.write_u8(0, pad);
         }
 
-        // MuxPDU Type 1 blank-and-burst header: MM=1, TT=0, TM=11
         let mut mux_pdu = Bitstream::new();
-        mux_pdu.write_u8(1, 1); // MM = 1
-        mux_pdu.write_u8(0, 1); // TT = 0
-        mux_pdu.write_u8(0b11, 2); // TM = 11
+        mux_pdu.write_u8(1, 1);
+        match rate_set {
+            FtchMuxRateSet::One => {
+                mux_pdu.write_u8(0, 1);
+                mux_pdu.write_u8(0b11, 2);
+            }
+            FtchMuxRateSet::Two => mux_pdu.write_u8(0b0011, 4),
+        }
         mux_pdu.extend(&signaling);
-        debug_assert_eq!(mux_pdu.len(), FTCH_FULL_RATE_INFO_BITS);
+        debug_assert_eq!(mux_pdu.len(), info_bits);
 
         frames.push(mux_pdu);
         offset += chunk_len;
@@ -1978,7 +2005,7 @@ mod tests {
         DirectedSduRequest, FPCH_HALF_FRAME_CHIPS, FPCH_HALF_FRAME_PAYLOAD_BITS_9600,
         FPCH_SLOT_CHIPS, Layer2Lac, MsgSeqTracker, T4M_DURATION, crc16_fdsch, crc30,
         sar_encapsulate_ftch_pdu_dsch, sar_encapsulate_pdu, sar_fragment_ftch_pdu_dsch,
-        utility_assemble_f_csch, utility_assemble_f_dsch,
+        sar_fragment_ftch_pdu_dsch_rc2, utility_assemble_f_csch, utility_assemble_f_dsch,
     };
 
     #[test]
@@ -2051,6 +2078,13 @@ mod tests {
         let pdu = utility_assemble_f_dsch(&data_request);
         // PDU = MSG_TYPE(8) + ACK_SEQ(3) + MSG_SEQ(3) + ACK_REQ(1) + ENCRYPTION(2) + SDU(16) + PAD(7) = 40 bits
         assert_eq!(pdu.len(), 40, "PDU length");
+
+        let rc2_frames = sar_fragment_ftch_pdu_dsch_rc2(&pdu);
+        assert_eq!(rc2_frames.len(), 1);
+        let rc2_bits = rc2_frames[0].bits();
+        assert_eq!(rc2_bits.len(), 267);
+        assert_eq!(&rc2_bits[..5], &[1, 0, 0, 1, 1]);
+        assert_eq!(rc2_bits[5], 1);
 
         // Encapsulate with SAR + MuxPDU framing
         let encapsulated = sar_encapsulate_ftch_pdu_dsch(data_request, pdu);

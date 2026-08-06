@@ -93,6 +93,10 @@ pub mod v1 {
 pub use cdma_bts::bts::build_scheduled_message;
 pub use cdma_common::overhead::OverheadParameters;
 
+pub(crate) const DEFAULT_TRAFFIC_ACK_SEQ: u8 = 0b111;
+pub(crate) const RELEASE_ORDER_CODE: u8 = 0b010101;
+pub(crate) const TRAFFIC_MSG_SEQ_MASK: u8 = 0b111;
+
 // build_scheduled_message is now in cdma-bts/src/lib/bts/settings.rs
 // and re-exported via `cdma_bts::bts::build_scheduled_message`.
 

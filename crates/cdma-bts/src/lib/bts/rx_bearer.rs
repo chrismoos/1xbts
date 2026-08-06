@@ -16,6 +16,10 @@ pub(super) fn reverse_frame_content_from_rate_bps(rate_bps: u32) -> FrameContent
         REVERSE_FRAME_CONTENT_HALF_RATE, REVERSE_FRAME_CONTENT_QUARTER_RATE,
     };
     match rate_bps {
+        14_400 => FrameContent::FchRc2_14400,
+        7_200 => FrameContent::FchRc2_7200,
+        3_600 => FrameContent::FchRc2_3600,
+        1_800 => FrameContent::FchRc2_1800,
         9600 => REVERSE_FRAME_CONTENT_FULL_RATE,
         4800 => REVERSE_FRAME_CONTENT_HALF_RATE,
         2700 | 2400 => REVERSE_FRAME_CONTENT_QUARTER_RATE,

@@ -5,12 +5,30 @@
 
 use std::collections::HashMap;
 
+use cdma_common::consts::{SERVICE_OPTION_EVRC_A, SERVICE_OPTION_QCELP13};
 use log::{info, warn};
 
 use crate::runtime::select_pageable_imsi;
 
 use crate::call_control::CallId;
 use crate::circuit::CircuitService;
+
+const IS2000_MIN_P_REV: u32 = 6;
+
+pub(crate) fn select_mt_voice_service_option(
+    mob_p_rev: Option<u32>,
+    supported_service_options: &[u16],
+    default_voice_service_option: u16,
+) -> u16 {
+    let preferred = match mob_p_rev {
+        Some(p_rev) if p_rev >= IS2000_MIN_P_REV => Some(SERVICE_OPTION_EVRC_A),
+        Some(_) => Some(SERVICE_OPTION_QCELP13),
+        None => None,
+    };
+    preferred
+        .filter(|service_option| supported_service_options.contains(service_option))
+        .unwrap_or(default_voice_service_option)
+}
 
 /// Routing decision for an MO call's called-party number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,7 +95,8 @@ impl MoCallService {
         &mut self,
         call_id: CallId,
         called_number: &str,
-        service_option: u16,
+        supported_service_options: &[u16],
+        default_voice_service_option: u16,
         hlr_repo: &dyn cdma_hlr::repository::HlrRepository,
         circuits: &mut CircuitService,
     ) -> MoSubscriberRoute {
@@ -133,6 +152,11 @@ impl MoCallService {
             );
             return MoSubscriberRoute::Rejected;
         };
+        let service_option = select_mt_voice_service_option(
+            binding.mob_p_rev,
+            supported_service_options,
+            default_voice_service_option,
+        );
 
         let paging_request = cdma_ios::PagingRequestMessage {
             mobile_identity_imsi: cdma_ios::MobileIdentity::Imsi(imsi.to_string()),
@@ -151,8 +175,8 @@ impl MoCallService {
             .deferred_paging_requests
             .insert(call_id, paging_request);
         info!(
-            "MSC: deferring MO M2M PagingRequest call_id={} subscriber={} called_number='{}' until primary leg AssignmentComplete",
-            call_id.0, subscriber_id, called_number
+            "MSC: deferring MO M2M PagingRequest call_id={} subscriber={} called_number='{}' callee_p_rev={:?} SO{} until primary leg AssignmentComplete",
+            call_id.0, subscriber_id, called_number, binding.mob_p_rev, service_option
         );
         MoSubscriberRoute::Paged
     }
@@ -161,5 +185,56 @@ impl MoCallService {
     pub(crate) fn cleanup_call(&mut self, call_id: CallId) {
         self.mo_calling_numbers.remove(&call_id);
         self.pending_sip_routes.remove(&call_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_mt_voice_service_option;
+    use cdma_common::consts::{SERVICE_OPTION_EVRC_A, SERVICE_OPTION_QCELP13};
+
+    #[test]
+    fn mt_voice_service_option_follows_registered_protocol_revision() {
+        let supported = [SERVICE_OPTION_QCELP13, SERVICE_OPTION_EVRC_A];
+        assert_eq!(
+            select_mt_voice_service_option(Some(3), &supported, SERVICE_OPTION_QCELP13),
+            SERVICE_OPTION_QCELP13
+        );
+        assert_eq!(
+            select_mt_voice_service_option(Some(5), &supported, SERVICE_OPTION_QCELP13),
+            SERVICE_OPTION_QCELP13
+        );
+        assert_eq!(
+            select_mt_voice_service_option(Some(6), &supported, SERVICE_OPTION_QCELP13),
+            SERVICE_OPTION_EVRC_A
+        );
+        assert_eq!(
+            select_mt_voice_service_option(Some(9), &supported, SERVICE_OPTION_QCELP13),
+            SERVICE_OPTION_EVRC_A
+        );
+        assert_eq!(
+            select_mt_voice_service_option(None, &supported, SERVICE_OPTION_QCELP13),
+            SERVICE_OPTION_QCELP13
+        );
+    }
+
+    #[test]
+    fn mt_voice_service_option_never_bypasses_policy() {
+        assert_eq!(
+            select_mt_voice_service_option(
+                Some(3),
+                &[SERVICE_OPTION_EVRC_A],
+                SERVICE_OPTION_EVRC_A,
+            ),
+            SERVICE_OPTION_EVRC_A
+        );
+        assert_eq!(
+            select_mt_voice_service_option(
+                Some(9),
+                &[SERVICE_OPTION_QCELP13],
+                SERVICE_OPTION_QCELP13,
+            ),
+            SERVICE_OPTION_QCELP13
+        );
     }
 }

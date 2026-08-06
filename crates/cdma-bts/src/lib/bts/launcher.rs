@@ -699,6 +699,7 @@ pub fn build_bts_launch_parts(
         handle.traffic_channels.clone(),
         handle.traffic_rx_pool.clone(),
         handle.traffic_rx_removals.clone(),
+        handle.power_control.clone(),
     ));
 
     Ok(BtsLaunchParts {

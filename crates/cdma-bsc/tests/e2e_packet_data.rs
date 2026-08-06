@@ -1409,6 +1409,7 @@ async fn test_e2e_so7_packet_data_full_negotiation() {
                 traffic_channels.clone(),
                 traffic_rx_pool.clone(),
                 traffic_rx_removals.clone(),
+                cdma_bts::bts::BtsPowerControlRegistry::default(),
             )),
             AbisAgentConfig {
                 pilot_pn: 0,
@@ -2044,6 +2045,7 @@ async fn test_e2e_so7_packet_data_phy_bidirectional() {
                 traffic_channels.clone(),
                 traffic_rx_pool.clone(),
                 traffic_rx_removals.clone(),
+                cdma_bts::bts::BtsPowerControlRegistry::default(),
             )),
             AbisAgentConfig {
                 pilot_pn: 0,
@@ -2784,6 +2786,7 @@ async fn test_e2e_so7_rc3_reverse_preamble_queues_bs_ack() {
                 traffic_channels.clone(),
                 traffic_rx_pool.clone(),
                 traffic_rx_removals.clone(),
+                cdma_bts::bts::BtsPowerControlRegistry::default(),
             )),
             AbisAgentConfig {
                 pilot_pn: 0,
@@ -3994,6 +3997,7 @@ async fn test_e2e_so6_sms_data_burst_phy_bidirectional() {
                 traffic_channels.clone(),
                 traffic_rx_pool.clone(),
                 traffic_rx_removals.clone(),
+                cdma_bts::bts::BtsPowerControlRegistry::default(),
             )),
             AbisAgentConfig {
                 pilot_pn: 0,

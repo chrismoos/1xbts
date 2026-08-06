@@ -1,3 +1,4 @@
+use cdma_common::consts::SERVICE_OPTION_BASIC_VOICE;
 use cdma_common::error::Error;
 use cdma_common::events::AccessChannelEvent;
 use tokio::sync::mpsc;
@@ -7,8 +8,7 @@ use crate::a1_edge::{EncodedA1Message, MscClient};
 use super::{Bsc, SmsRequest};
 
 /// Loopback MSC client for integration tests. Accepts `CompleteLayer3Information`
-/// from the BSC and synthesises an `AssignmentRequest` reply with the same
-/// service option, so origination flows that require an MSC peer can run.
+/// from the BSC and synthesises an `AssignmentRequest` reply.
 pub struct AutoAssignmentMscClient {
     inbound_tx: mpsc::Sender<EncodedA1Message>,
     inbound_rx: tokio::sync::Mutex<mpsc::Receiver<EncodedA1Message>>,
@@ -35,7 +35,7 @@ impl MscClient for AutoAssignmentMscClient {
     async fn send_a1(&self, message: EncodedA1Message) -> Result<(), cdma_ios::A1TransportError> {
         if message.message_type() == cdma_ios::MessageType::CompleteLayer3Information {
             let call_id = message.call_id();
-            let service_option = message
+            let requested_service_option = message
                 .decode()
                 .ok()
                 .and_then(|decoded| {
@@ -43,7 +43,8 @@ impl MscClient for AutoAssignmentMscClient {
                 })
                 .and_then(|cli3| cli3.layer3_information.decode_cm_service_request().ok())
                 .and_then(|request| request.service_option)
-                .unwrap_or(cdma_ios::ServiceOption::EVRC_A);
+                .unwrap_or(cdma_ios::ServiceOption(SERVICE_OPTION_BASIC_VOICE));
+            let service_option = requested_service_option;
             let assignment = cdma_ios::AssignmentRequestMessage {
                 channel_type: cdma_ios::ChannelType {
                     speech_or_data_indicator: 0x01,

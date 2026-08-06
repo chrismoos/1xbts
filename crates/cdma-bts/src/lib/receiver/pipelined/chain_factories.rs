@@ -9,6 +9,7 @@ use crate::receiver::hrpd::access::{ACCESS_PACKET_CHIPS, HRPD_DEFAULT_ACCESS_PRE
 use super::gardner_timing_recovery::GardnerTimingConfig;
 use super::rake_access_searcher;
 use super::rc1_reverse_traffic_decoder::Rc1ReverseTrafficDecoder;
+use super::rc2_traffic_frame_aligner::Rc2TrafficFrameAligner;
 use super::rc3_bpsk_despread;
 use super::rc3_frame_aligner;
 use super::rc3_pilot_detector;
@@ -381,6 +382,45 @@ pub fn reverse_traffic_chain(settings: ReverseTrafficSettings) -> Vec<PipelinePr
     ]
 }
 
+/// Build an RC2 reverse traffic channel sub-chain.
+pub fn traffic_channel_chain_rc2(esn: u32, walsh_code: u8) -> Vec<PipelineProcessorShared> {
+    vec![
+        Box::new(Rc2TrafficFrameAligner::new(esn)),
+        Box::new(TrafficChannelProcessor::new(walsh_code)),
+    ]
+}
+
+/// Build the RC2 reverse traffic receiver chain.
+pub fn reverse_traffic_chain_rc2(settings: ReverseTrafficSettings) -> Vec<PipelineProcessorShared> {
+    let walsh_code = settings.walsh_code;
+
+    let snr_threshold = settings.snr_threshold.unwrap_or(20.0);
+    let correlator = pn_lc_correlator::PnLcCorrelator::new(
+        pn_lc_correlator::PnLcConfig::default_4x()
+            .with_snr_threshold(snr_threshold)
+            .with_lc_half_span(4)
+            .with_preamble_hits_required(3)
+            .with_search_interval_windows(32)
+            .with_split_pn_reference(true)
+            .with_reanchor_origin(settings.reanchor_origin)
+            .with_suppress_search_when_locked(true)
+            .with_fractional_timing_recovery(true)
+            .with_epl_tracking(true)
+            .with_epl_slew(false)
+            .with_nonpilot_cfo_tracking(false),
+        LongCodeGenerator::new_traffic_channel(settings.esn),
+        Box::new(move || traffic_channel_chain_rc2(settings.esn, walsh_code)),
+    );
+
+    vec![
+        Box::new(PulseMatchedFilterProcessor::new()),
+        Box::new(
+            generic_rake_receiver::GenericRakeReceiver::new(correlator)
+                .with_prune_policy(Box::new(reverse_traffic_prune_policy())),
+        ),
+    ]
+}
+
 /// Build an RC3 traffic channel sub-chain (TrafficChannelProcessor only).
 ///
 /// The Rc3FrameAligner already performs deinterleaving, de-repetition, and
@@ -480,4 +520,17 @@ pub fn reverse_access_chain_rake(settings: ReverseAccessSettings) -> Vec<Pipelin
         Box::new(PulseMatchedFilterProcessor::new()),
         Box::new(searcher),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn traffic_channel_chain_rc2_ends_in_rc2_frame_aligner() {
+        let chain = traffic_channel_chain_rc2(0, 10);
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].name(), "Rc2TrafficFrameAligner");
+        assert_eq!(chain[1].name(), "TrafficChannelProcessor");
+    }
 }

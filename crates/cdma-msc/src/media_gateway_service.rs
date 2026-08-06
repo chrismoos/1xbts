@@ -378,11 +378,39 @@ impl MediaGatewayService {
                     );
                     return;
                 }
+                let Some(codec) =
+                    cdma_voice::VoiceCodec::from_service_option(session.service_option)
+                else {
+                    warn!(
+                        "MSC: dropping gateway media for unsupported service option {}",
+                        session.service_option
+                    );
+                    return;
+                };
+                let Some(rate) = codec.rate_from_bps(payload.rate_bps) else {
+                    warn!(
+                        "MSC: dropping gateway media rate {} for {:?}",
+                        payload.rate_bps, codec
+                    );
+                    return;
+                };
+                let expected_bits = codec.primary_traffic_bits(rate);
+                if payload.payload.len() != expected_bits {
+                    warn!(
+                        "MSC: dropping gateway media with {} bits, expected {} for {:?} {:?}",
+                        payload.payload.len(),
+                        expected_bits,
+                        codec,
+                        rate
+                    );
+                    return;
+                }
+                let packed_payload = cdma_voice::pack_voice_bits(&payload.payload, expected_bits);
                 send_forward_bearer_frame(
                     &VoiceBearerFrame {
                         circuit_id,
                         rate_bps: payload.rate_bps,
-                        payload: payload.payload,
+                        payload: packed_payload,
                     },
                     voice_bearer,
                 )

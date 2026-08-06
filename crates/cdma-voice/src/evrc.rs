@@ -35,6 +35,11 @@ unsafe extern "C" {
         speech: *mut i16,
         speech_max_samples: usize,
     ) -> i32;
+    fn evrc_decoder_decode_erasure(
+        c: *mut c_void,
+        speech: *mut i16,
+        speech_max_samples: usize,
+    ) -> i32;
 }
 
 // ---------------------------------------------------------------------------
@@ -62,7 +67,6 @@ fn data_size_to_rate(data_bytes: usize) -> Option<VoiceRate> {
     match data_bytes {
         22 => Some(VoiceRate::Full),
         10 => Some(VoiceRate::Half),
-        5 => Some(VoiceRate::Quarter),
         2 => Some(VoiceRate::Eighth),
         _ => None,
     }
@@ -174,7 +178,7 @@ impl EvrcDecoder {
 
     /// Decode a single EVRC packet frame into 160 PCM samples.
     ///
-    /// `packet_data` should be the raw EVRC frame data (22, 10, 5, or 2 bytes)
+    /// `packet_data` should be the raw EVRC frame data (22, 10, or 2 bytes)
     /// as produced by [`EvrcEncoder::encode`].  The rate is inferred from the
     /// data length.
     pub fn decode(&mut self, packet_data: &[u8]) -> Result<[i16; FRAME_SAMPLES], String> {
@@ -186,10 +190,10 @@ impl EvrcDecoder {
         //   byte 1: 2-bit rate in top bits
         //   bytes 2..: frame data
         let packet_rate = match rate {
-            VoiceRate::Full => 3u8,    // EVRC8K_RATE_FULL
-            VoiceRate::Half => 2u8,    // EVRC8K_RATE_HALF
-            VoiceRate::Quarter => 1u8, // EVRC8K_RATE_CUSTOM
-            VoiceRate::Eighth => 0u8,  // EVRC8K_RATE_EIGHT
+            VoiceRate::Full => 3u8, // EVRC8K_RATE_FULL
+            VoiceRate::Half => 2u8, // EVRC8K_RATE_HALF
+            VoiceRate::Quarter => unreachable!("EVRC-A has no quarter-rate speech packet"),
+            VoiceRate::Eighth => 0u8, // EVRC8K_RATE_EIGHT
         };
 
         let mut packet = Vec::with_capacity(2 + packet_data.len());
@@ -213,6 +217,16 @@ impl EvrcDecoder {
             return Err(format!("evrc_decoder_decode_from_packet returned {}", ret));
         }
 
+        Ok(speech)
+    }
+
+    pub fn decode_erasure(&mut self) -> Result<[i16; FRAME_SAMPLES], String> {
+        let mut speech = [0i16; FRAME_SAMPLES];
+        let ret =
+            unsafe { evrc_decoder_decode_erasure(self.handle, speech.as_mut_ptr(), FRAME_SAMPLES) };
+        if ret <= 0 {
+            return Err(format!("evrc_decoder_decode_erasure returned {}", ret));
+        }
         Ok(speech)
     }
 }
@@ -285,6 +299,12 @@ mod tests {
         // should not be all zeros for a tone input.
         let energy: i64 = decoded.iter().map(|&s| (s as i64) * (s as i64)).sum();
         assert!(energy > 0, "decoded output should have non-zero energy");
+    }
+
+    #[test]
+    fn decoder_accepts_explicit_erasure() {
+        let mut decoder = EvrcDecoder::new().expect("decoder init");
+        decoder.decode_erasure().expect("decode erasure");
     }
 
     #[test]

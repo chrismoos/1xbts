@@ -561,6 +561,12 @@ impl Rc1ReverseTrafficDecoder {
             .collect()
     }
 
+    fn pcg_mobile_power_dbfs(&self, pcg: usize) -> f32 {
+        let start = pcg * RC1_SYMBOLS_PER_PCG;
+        let end = start + RC1_SYMBOLS_PER_PCG;
+        super::walsh64_mobile_power_dbfs(self.symbol_energies[start..end].iter())
+    }
+
     /// Emit per-PCG Eb/Nt measurements incrementally as each 1.25ms PCG
     /// completes (6 symbols buffered). Called after every symbol so the
     /// measurement reaches the BSC within ~1 PCG of real-time, matching
@@ -610,6 +616,7 @@ impl Rc1ReverseTrafficDecoder {
                 frame_abs_pcg * PCG_CHIPS as u64 + pcg_in_frame as u64 * PCG_CHIPS as u64;
             let age_chips = processing_end.saturating_sub(measurement_abs_chip);
             let eb_nt_db = self.pcg_eb_nt_db(pcg_in_frame);
+            let mobile_power_dbfs = self.pcg_mobile_power_dbfs(pcg_in_frame);
 
             let mut block = SampleBlock::new(Vec::new(), measurement_abs_chip as usize)
                 .with_sample_rate_hz(self.sample_rate_hz);
@@ -621,6 +628,10 @@ impl Rc1ReverseTrafficDecoder {
             block
                 .tags
                 .insert("traffic_measurement_age_chips", age_chips as i64);
+            block.tags.insert(
+                "traffic_pcg_mobile_power_mdbfs",
+                (mobile_power_dbfs * 1000.0) as i64,
+            );
             block.pcg_signal_snr_db = Some(vec![eb_nt_db]);
             out.push(block);
         }
@@ -973,5 +984,32 @@ mod tests {
         assert!(block.samples.is_empty());
         assert_eq!(block.pcg_signal_snr_db.as_ref().map(Vec::len), Some(16));
         assert_eq!(block.active_pcg_mask, Some([true; SR1_PCGS_PER_FRAME]));
+    }
+
+    #[test]
+    fn production_rc1_pcg_measurement_includes_mobile_power() {
+        let mut decoder = Rc1ReverseTrafficDecoder::new(0x1234_5678);
+        decoder.state = DecoderState::Locked;
+        decoder.frame_chip_start = 0;
+        decoder.sample_rate_hz = 1_228_800.0;
+        decoder.last_processing_absolute_chip_end = Some(PCG_CHIPS as u64);
+        decoder.next_measurement_abs_pcg = Some(0);
+        decoder.pcg_measurement_rate = Some(Rc1TrafficRate::Full);
+        decoder.symbol_energies = (0..RC1_SYMBOLS_PER_PCG)
+            .map(|_| {
+                let mut energies = [1.0; RC1_WALSH_CHIPS_PER_SYMBOL];
+                energies[17] = 10_000.0;
+                energies
+            })
+            .collect();
+
+        let measurements = decoder.emit_pcg_measurements();
+
+        assert_eq!(measurements.len(), 1);
+        assert!(
+            measurements[0]
+                .tags
+                .contains_key("traffic_pcg_mobile_power_mdbfs")
+        );
     }
 }

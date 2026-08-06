@@ -7773,6 +7773,7 @@ async fn run_traffic_channel_e2e(
                 bts_handle.traffic_channels.clone(),
                 bts_handle.traffic_rx_pool.clone(),
                 bts_handle.traffic_rx_removals.clone(),
+                bts_handle.power_control.clone(),
             )),
             AbisAgentConfig {
                 pilot_pn: 0,
@@ -8144,6 +8145,7 @@ async fn test_e2e_rc1_reverse_preamble_triggers_crc_valid_bs_ack_order() -> Resu
                 traffic_channels.clone(),
                 traffic_rx_pool.clone(),
                 traffic_rx_removals.clone(),
+                cdma_bts::bts::BtsPowerControlRegistry::default(),
             )),
             AbisAgentConfig {
                 pilot_pn: 0,

@@ -32,6 +32,7 @@ mod rc1_reverse_traffic_decoder;
 mod rc1_traffic_frame_aligner;
 mod rc1_traffic_multi_rate_decoder;
 mod rc1_traffic_walsh_synchronizer;
+mod rc2_traffic_frame_aligner;
 mod rc3_bpsk_despread;
 mod rc3_frame_aligner;
 mod rc3_pilot_detector;
@@ -80,6 +81,7 @@ pub use rake_receiver::RakeReceiver;
 pub use rc1_traffic_frame_aligner::Rc1TrafficFrameAligner;
 pub use rc1_traffic_multi_rate_decoder::Rc1TrafficMultiRateDecoder;
 pub use rc1_traffic_walsh_synchronizer::Rc1TrafficWalshSynchronizer;
+pub use rc2_traffic_frame_aligner::Rc2TrafficFrameAligner;
 pub use reverse_access_decoder::ReverseAccessDecoder;
 pub use reverse_access_frame_aligner::ReverseAccessFrameAligner;
 pub use reverse_access_lc_descrambler::ReverseAccessLcDescrambler;
@@ -94,7 +96,10 @@ pub use sync_channel_processor::SyncChannelProcessor;
 pub use traffic_channel_processor::TrafficChannelProcessor;
 pub use traffic_channel_processor::{
     ReverseMux1FullRateFormat, ReverseMux1SignalingBlock, ReverseMux1SignalingLayout,
-    extract_reverse_mux1_full_rate_signaling_block, parse_reverse_mux1_full_rate_format,
+    ReverseMux2Format, ReverseMux2FullRateFormat, ReverseMux2SignalingBlock,
+    extract_reverse_mux1_full_rate_signaling_block, extract_reverse_mux2_full_rate_signaling_block,
+    extract_reverse_mux2_signaling_block, parse_reverse_mux1_full_rate_format,
+    parse_reverse_mux2_format, parse_reverse_mux2_full_rate_format,
 };
 pub use unrepeater::Unrepeater;
 pub use viterbi_decoder_processor::ViterbiDecoderProcessor;
@@ -111,6 +116,7 @@ pub(crate) use pn_helpers::{
 };
 pub use runner::{PipelinedReceiver, flush_sub_chain, run_sub_chain};
 pub use sample_block::{RxSampleTimeAnchor, SampleBlock};
+use std::sync::OnceLock;
 
 #[cfg(test)]
 pub(crate) use rc3_bpsk_despread::Rc3BpskDespread;
@@ -134,6 +140,75 @@ pub(crate) fn raw_to_soft(raw: f32, inv_peak: f32) -> f32 {
 
 /// CDMA2000 chip rate in chips per second.
 pub const CDMA_CHIP_RATE: f64 = SR1_CHIP_RATE_HZ as f64;
+
+fn rx_matched_filter_power_gain_db() -> f32 {
+    static GAIN_DB: OnceLock<f32> = OnceLock::new();
+    *GAIN_DB.get_or_init(|| {
+        let gain: f64 = crate::sdr::cdma2000_baseband_filter_taps_f64()
+            .iter()
+            .map(|tap| tap * tap)
+            .sum();
+        (10.0 * gain.log10()) as f32
+    })
+}
+
+fn adc_referenced_power_dbfs(mean_power: f64) -> f32 {
+    10.0 * mean_power.max(1e-15).log10() as f32 - rx_matched_filter_power_gain_db()
+}
+
+fn mobile_power_dbfs_from_despread_chip_power(despread_chip_power: f64) -> f32 {
+    // Remove the I/Q PN gain.
+    adc_referenced_power_dbfs(despread_chip_power / 2.0)
+}
+
+fn walsh64_mobile_power_dbfs<'a>(symbols: impl IntoIterator<Item = &'a [f32; 64]>) -> f32 {
+    const CHIPS_PER_SYMBOL: f64 = 256.0;
+    let mut desired_correlation_power = 0.0_f64;
+    let mut count = 0_usize;
+    for energies in symbols {
+        let peak = energies.iter().copied().fold(0.0_f32, f32::max) as f64;
+        let total = energies.iter().map(|energy| *energy as f64).sum::<f64>();
+        let interference = ((total - peak) / 63.0).max(0.0);
+        desired_correlation_power += (peak - interference).max(0.0);
+        count += 1;
+    }
+    if count == 0 {
+        return f32::NAN;
+    }
+    let chip_power =
+        desired_correlation_power / count as f64 / (CHIPS_PER_SYMBOL * CHIPS_PER_SYMBOL);
+    mobile_power_dbfs_from_despread_chip_power(chip_power)
+}
+
+fn rc3_mobile_power_dbfs(
+    pilot_norm_sq: f64,
+    pilot_sym_power_sum: f64,
+    pilot_symbols: usize,
+    traffic_power_sum: f64,
+    traffic_symbols: usize,
+) -> f32 {
+    const WALSH_LENGTH: f64 = 16.0;
+    const PILOT_DUTY_CYCLE: f64 = 0.75;
+    if pilot_symbols == 0 || traffic_symbols == 0 {
+        return f32::NAN;
+    }
+    let pilot_n = pilot_symbols as f64;
+    let correlation_noise_power = if pilot_symbols > 1 {
+        ((pilot_sym_power_sum - pilot_norm_sq / pilot_n) / (pilot_n - 1.0)).max(0.0)
+    } else {
+        0.0
+    };
+    let pilot_signal_power = if pilot_symbols > 1 {
+        ((pilot_norm_sq - pilot_sym_power_sum) / (pilot_n * (pilot_n - 1.0))).max(0.0)
+    } else {
+        pilot_norm_sq
+    };
+    let traffic_signal_power =
+        (traffic_power_sum / traffic_symbols as f64 - correlation_noise_power).max(0.0);
+    let despread_chip_power = (PILOT_DUTY_CYCLE * pilot_signal_power + traffic_signal_power)
+        / (WALSH_LENGTH * WALSH_LENGTH);
+    mobile_power_dbfs_from_despread_chip_power(despread_chip_power)
+}
 
 // ---------------------------------------------------------------------------
 // Pipeline trait and runner
@@ -258,7 +333,8 @@ mod tests {
         ReverseAccessOrthogonalDemodProcessor, ReverseAccessSettings, SampleBlock,
         SoftViterbiDecoderProcessor, SyncChannelProcessor, Unrepeater, WalshDecoderProcessor,
         WalshPilotCombiner, access_channel_chain, build_fft_search_pn_samples,
-        build_oqpsk_pn_samples, hrpd_reverse_access_chain,
+        build_oqpsk_pn_samples, hrpd_reverse_access_chain, rc3_mobile_power_dbfs,
+        rx_matched_filter_power_gain_db, walsh64_mobile_power_dbfs,
     };
     use crate::lac::crc30;
     use crate::phy::coding::long_code::LongCodeGenerator;
@@ -273,6 +349,57 @@ mod tests {
         ACCESS_CHIP_RATE, ACCESS_PACKET_CHIPS, AccessFrameLayout, AccessPhyDecodeAttempt,
         decode_access_phy_chips_attempt, parse_access_mac_capsule, validate_access_mac_fragment,
     };
+
+    #[test]
+    fn walsh_mobile_power_is_adc_referenced_and_interference_invariant() {
+        let filter_gain = 10f32.powf(rx_matched_filter_power_gain_db() / 10.0);
+        let wanted_adc_power = 0.01_f32;
+        let wanted_correlation_power = wanted_adc_power * filter_gain * 2.0 * 256.0 * 256.0;
+        let make_symbols = |interference: f32| {
+            (0..6)
+                .map(|_| {
+                    let mut energies = [interference; 64];
+                    energies[17] += wanted_correlation_power;
+                    energies
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let quiet = make_symbols(1.0);
+        let loaded = make_symbols(10_000.0);
+        let quiet_dbfs = walsh64_mobile_power_dbfs(quiet.iter());
+        let loaded_dbfs = walsh64_mobile_power_dbfs(loaded.iter());
+
+        assert!((quiet_dbfs + 20.0).abs() < 0.001, "{quiet_dbfs}");
+        assert!((loaded_dbfs - quiet_dbfs).abs() < 0.001, "{loaded_dbfs}");
+    }
+
+    #[test]
+    fn rc3_mobile_power_combines_isolated_pilot_and_fch_energy() {
+        const PILOT_SYMBOLS: usize = 72;
+        const TRAFFIC_SYMBOLS: usize = 96;
+        let filter_gain = 10f64.powf(rx_matched_filter_power_gain_db() as f64 / 10.0);
+        let pilot_adc_power = 0.002_f64;
+        let traffic_adc_power = 0.004_f64;
+        let pilot_corr = pilot_adc_power * filter_gain * 2.0 * 16.0 * 16.0;
+        let traffic_corr = traffic_adc_power * filter_gain * 2.0 * 16.0 * 16.0;
+        let estimate = |noise: f64| {
+            let n = PILOT_SYMBOLS as f64;
+            rc3_mobile_power_dbfs(
+                n * n * pilot_corr + n * noise,
+                n * (pilot_corr + noise),
+                PILOT_SYMBOLS,
+                TRAFFIC_SYMBOLS as f64 * (traffic_corr + noise),
+                TRAFFIC_SYMBOLS,
+            )
+        };
+        let expected = 10.0 * (0.75 * pilot_adc_power + traffic_adc_power).log10() as f32;
+        let quiet = estimate(0.0);
+        let loaded = estimate(traffic_corr * 20.0);
+
+        assert!((quiet - expected).abs() < 0.001, "{quiet} vs {expected}");
+        assert!((loaded - quiet).abs() < 0.02, "{loaded} vs {quiet}");
+    }
     use crate::receiver::paging::PagingChannelRate;
     use crate::receiver::pipelined::decimator_processor::DecimatorProcessor;
     use crate::receiver::pipelined::mobile_station::PagingRate;
@@ -324,6 +451,7 @@ mod tests {
         one_x_rx_shift_hz: Option<i64>,
         hrpd_reverse_frequency_hz: Option<usize>,
         hrpd_rx_shift_hz: Option<i64>,
+        first_absolute_chip_start: u64,
         first_absolute_sample_start: u64,
     }
 
@@ -6253,6 +6381,7 @@ mod tests {
             let mut fqi_checked_valid = 0usize;
             let mut fqi_checked_total = 0usize;
             let mut pcg_measurement_count = 0usize;
+            let mut mobile_power_measurement_count = 0usize;
             let mut pcg_measurement_age_sum_chips = 0u128;
             let mut pcg_measurement_age_max_chips = 0u64;
             let mut pcg_measurement_phases: std::collections::BTreeMap<u64, usize> =
@@ -6262,6 +6391,8 @@ mod tests {
                 for blk in &blocks {
                     if blk.tags.get("traffic_pcg_measurement") == Some(&1) {
                         pcg_measurement_count += 1;
+                        mobile_power_measurement_count +=
+                            blk.tags.contains_key("traffic_pcg_mobile_power_mdbfs") as usize;
                         let age_chips = blk
                             .tags
                             .get("traffic_measurement_age_chips")
@@ -6419,7 +6550,7 @@ mod tests {
             }
 
             eprintln!(
-                "[RC1-ESN walsh={}] summary: blocks={} preambles={} phy_frames={} crc_valid_phy={} fqi_checked={}/{} rates={:?} traffic_frames={} crc_valid={} full_rate_with_signaling={} mux_headers={:?} signaling_bits={:?} pcg_measurements={} pcg_age_avg_chips={:.1} pcg_age_max_chips={} pcg_phases={:?}",
+                "[RC1-ESN walsh={}] summary: blocks={} preambles={} phy_frames={} crc_valid_phy={} fqi_checked={}/{} rates={:?} traffic_frames={} crc_valid={} full_rate_with_signaling={} mux_headers={:?} signaling_bits={:?} pcg_measurements={} mobile_power_measurements={} pcg_age_avg_chips={:.1} pcg_age_max_chips={} pcg_phases={:?}",
                 walsh_code,
                 total_blocks,
                 preamble_count,
@@ -6434,6 +6565,7 @@ mod tests {
                 mux_header_counts,
                 signaling_bits_counts,
                 pcg_measurement_count,
+                mobile_power_measurement_count,
                 if pcg_measurement_count > 0 {
                     pcg_measurement_age_sum_chips as f64 / pcg_measurement_count as f64
                 } else {
@@ -6441,6 +6573,11 @@ mod tests {
                 },
                 pcg_measurement_age_max_chips,
                 pcg_measurement_phases,
+            );
+
+            assert_eq!(
+                mobile_power_measurement_count, pcg_measurement_count,
+                "every RC1 PCG measurement must carry per-mobile power"
             );
 
             // The frame aligner must find at least one CRC-valid signaling frame.
@@ -6508,6 +6645,149 @@ mod tests {
             Some(2.0),
             expected_rate_counts,
             expected_crc_valid_full_rate_signaling_frames,
+        );
+    }
+
+    #[test]
+    fn capture_rc2_reverse_traffic_1805718149755304() {
+        init_test_logger();
+        let wav_path = test_capture_path("1805718149755304.wav");
+        let metadata = test_capture_metadata("1805718149755304.json");
+        let mut reader = hound::WavReader::open(&wav_path)
+            .unwrap_or_else(|e| panic!("failed to open {}: {e}", wav_path.display()));
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 2);
+        assert_eq!(spec.sample_rate as usize, metadata.sample_rate_hz);
+        let mut wav_samples = reader.samples::<i16>();
+        let iq_stream = std::iter::from_fn(move || {
+            let i = wav_samples
+                .next()?
+                .unwrap_or_else(|e| panic!("failed to read I sample: {e}"));
+            let q = wav_samples
+                .next()
+                .expect("capture ended mid-IQ pair")
+                .unwrap_or_else(|e| panic!("failed to read Q sample: {e}"));
+            Some(Complex32::new(
+                i as f32 / i16::MAX as f32,
+                q as f32 / i16::MAX as f32,
+            ))
+        });
+
+        let oversample = metadata.sample_rate_hz / metadata.chip_rate_hz;
+        let pipeline = super::reverse_traffic_chain_rc2(super::ReverseTrafficSettings {
+            oversample,
+            walsh_code: 12,
+            esn: 0xC9A4_539E,
+            reanchor_origin: true,
+            snr_threshold: None,
+            preamble_num_pcgs: None,
+            epl_pilot: false,
+            rev_fch_gating_mode: false,
+            finger_pool_size: 1,
+        });
+        let mut receiver = PipelinedReceiver::new(iq_stream)
+            .with_batch_size(32_768)
+            .with_input_sample_rate_hz(metadata.sample_rate_hz as f64)
+            .with_absolute_sample_start(metadata.first_absolute_sample_start);
+        let output = receiver.add_pipeline(pipeline);
+        let started = std::time::Instant::now();
+        receiver.run_pipeline().expect("run RC2 capture pipeline");
+
+        let mut preambles = 0usize;
+        let mut traffic_locked = false;
+        let mut frames = 0usize;
+        let mut valid_frames = 0usize;
+        let mut invalid_run = 0usize;
+        let mut max_invalid_run = 0usize;
+        let mut buckets = vec![(0usize, 0usize); 8];
+        let mut rate_counts = std::collections::BTreeMap::<i64, usize>::new();
+        let mut metric_sum = 0.0f64;
+        let mut metric_count = 0usize;
+        let mut mobile_power_sum = 0.0f64;
+        let mut mobile_power_count = 0usize;
+        let mut composite_power_sum = 0.0f64;
+        let mut composite_power_count = 0usize;
+        for blocks in output {
+            for block in blocks {
+                if block.tags.get("traffic_preamble_detected") == Some(&1) {
+                    preambles += 1;
+                    traffic_locked = true;
+                }
+                if let Some(power_mdbfs) = block.tags.get("traffic_pcg_mobile_power_mdbfs") {
+                    mobile_power_sum += *power_mdbfs as f64 / 1000.0;
+                    mobile_power_count += 1;
+                }
+                if block.tags.get("traffic_pcg_measurement") == Some(&1)
+                    && let Some(power_mdbfs) = block.tags.get("finger_raw_power_mdb")
+                {
+                    composite_power_sum += *power_mdbfs as f64 / 1000.0;
+                    composite_power_count += 1;
+                }
+                if block.tags.get("traffic_phy_frame") != Some(&1)
+                    && block.tags.get("traffic_phy_status") != Some(&1)
+                {
+                    continue;
+                }
+                if !traffic_locked {
+                    continue;
+                }
+                frames += 1;
+                let valid = block.tags.get("traffic_phy_valid") == Some(&1);
+                if valid {
+                    valid_frames += 1;
+                    invalid_run = 0;
+                    if let Some(rate) = block.tags.get("traffic_rate_bps").copied() {
+                        *rate_counts.entry(rate).or_default() += 1;
+                    }
+                } else {
+                    invalid_run += 1;
+                    max_invalid_run = max_invalid_run.max(invalid_run);
+                }
+                if let Some(abs_chip) = block
+                    .tags
+                    .get("absolute_chip_start")
+                    .copied()
+                    .and_then(|chip| u64::try_from(chip).ok())
+                {
+                    let elapsed_chips = abs_chip.saturating_sub(metadata.first_absolute_chip_start);
+                    let bucket = (elapsed_chips / (5 * metadata.chip_rate_hz) as u64) as usize;
+                    if let Some((bucket_frames, bucket_valid)) = buckets.get_mut(bucket) {
+                        *bucket_frames += 1;
+                        *bucket_valid += valid as usize;
+                    }
+                }
+                if let Some(metrics) = &block.pcg_signal_snr_db {
+                    for &metric in metrics {
+                        if metric.is_finite() {
+                            metric_sum += metric as f64;
+                            metric_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        eprintln!(
+            "RC2 capture: preambles={preambles} frames={frames} valid={valid_frames} FER={:.2}% max_invalid_run={max_invalid_run} rates={rate_counts:?} metric_avg={:.2}dB mobile_power_avg={:.2}dBFS mobile_power_n={mobile_power_count} composite_power_avg={:.2}dBFS composite_power_n={composite_power_count} buckets={buckets:?} processing={:.2}s",
+            100.0 * (frames - valid_frames) as f64 / frames.max(1) as f64,
+            metric_sum / metric_count.max(1) as f64,
+            mobile_power_sum / mobile_power_count.max(1) as f64,
+            composite_power_sum / composite_power_count.max(1) as f64,
+            started.elapsed().as_secs_f64(),
+        );
+        assert_eq!(preambles, 1);
+        assert!(frames >= 1_750, "decoded only {frames} RC2 frames");
+        assert!(
+            valid_frames >= 1_680,
+            "only {valid_frames} frames passed FQI"
+        );
+        assert!(
+            max_invalid_run <= 16,
+            "lost RC2 recovery for {max_invalid_run} consecutive frames"
+        );
+        assert!(
+            mobile_power_count >= 100,
+            "only {mobile_power_count} per-mobile power measurements"
         );
     }
 

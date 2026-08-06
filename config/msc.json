@@ -19,7 +19,7 @@
     "media_ringback_type": "nanp",
     "answer_delay_ms": 3000,
     "release_timeout_ms": 5000,
-    "supported_service_options": [3, 17, 68, 73]
+    "supported_service_options": [32768, 3, 17, 68, 73]
   },
   "welcome_sms": {
     "enabled": true,

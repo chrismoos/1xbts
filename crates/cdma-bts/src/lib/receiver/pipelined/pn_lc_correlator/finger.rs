@@ -1,12 +1,8 @@
 use std::collections::VecDeque;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use log::{info, trace};
 use num_complex::Complex32;
-
-use crate::phy::coding::long_code::LongCodeGenerator;
-use crate::receiver::pipelined::{PipelineProcessorShared, SampleBlock};
-use crate::sdr::cdma2000_baseband_filter_taps_f64;
 
 use super::super::cfo_tracker;
 use super::super::gardner_timing_recovery::{
@@ -14,6 +10,8 @@ use super::super::gardner_timing_recovery::{
 };
 use super::super::generic_rake_receiver::{BaseFinger, FingerProgress, RakeFinger};
 use super::interpolation::{interp_complex_clamped, interp_complex_contiguous};
+use crate::phy::coding::long_code::LongCodeGenerator;
+use crate::receiver::pipelined::{PipelineProcessorShared, SampleBlock};
 
 // With Gardner enabled we keep only one neighbor beside the verified prompt to
 // avoid doubling slow false-finger work. Captures with very strong correlation
@@ -21,19 +19,6 @@ use super::interpolation::{interp_complex_clamped, interp_complex_contiguous};
 // captures need the early side that preserved the existing v60s decode count.
 pub(super) const ADAPTIVE_FINGER_TIMING_LATE_SNR_THRESHOLD: f32 = 200.0;
 
-/// Power gain (in dB) introduced by the RX matched filter
-/// (`PulseMatchedFilterProcessor`, which uses the same CDMA2000 baseband
-/// filter taps as TX). Reported `raw_power_db` is measured *after* the
-/// matched filter, so this gain is subtracted to refer the result back to
-/// the ADC input (dBFS).
-pub(super) fn rx_matched_filter_power_gain_db() -> f32 {
-    static GAIN_DB: OnceLock<f32> = OnceLock::new();
-    *GAIN_DB.get_or_init(|| {
-        let taps = cdma2000_baseband_filter_taps_f64();
-        let g: f64 = taps.iter().map(|t| t * t).sum();
-        (10.0 * g.log10()) as f32
-    })
-}
 pub(super) const DEFAULT_REACQUIRE_SIGNAL_LOST_CHIPS: u64 = 6_144;
 pub(super) const DEFAULT_REACQUIRE_CRC_MISS_COUNT: u64 = 8;
 // Repeated access probes often expose the same delay every 80 ms. Waiting
@@ -156,6 +141,7 @@ pub struct PnLcFinger {
     /// Reverse access CFO tracker (256-chip Walsh-symbol observations,
     /// coherence-gated coasting during data).
     access_cfo: Option<cfo_tracker::CfoTracker>,
+    nonpilot_cfo_tracking: bool,
     /// CFO pilot observation: accumulate ONLY 16-chip EPL pilot sums
     /// (Walsh-0 coherent) for feeding to the CfoTracker. Completely
     /// separate from the diagnostic accumulators.
@@ -181,10 +167,14 @@ pub struct PnLcFinger {
     /// RC3 closed-loop power-control measurement state. Accumulates one
     /// pilot symbol SINR estimate per 1.25 ms PCG directly at the finger.
     rc3_pcg_measurement_abs_chip_start: Option<u64>,
+    rc3_pcg_measurement_raw_input_power: f64,
     rc3_pcg_measurement_prompt_chip_power: f64,
     rc3_pcg_measurement_pilot_run_prompt: Complex32,
     rc3_pcg_measurement_pilot_prompt_power: f64,
     rc3_pcg_measurement_pilot_chip_idx: usize,
+    rc3_pcg_measurement_traffic_run_prompt: Complex32,
+    rc3_pcg_measurement_traffic_prompt_power: f64,
+    rc3_pcg_measurement_traffic_chip_idx: usize,
     rc3_pcg_measurement_chip_count: usize,
     /// Coherent sum of 16-chip pilot symbols within the current PCG.
     rc3_pcg_measurement_pilot_coherent_sum: Complex32,
@@ -447,6 +437,10 @@ const RC3_PILOT_SYMBOLS_PER_PCG: usize = RC3_PILOT_CHIPS_PER_PCG / RC3_PILOT_SYM
 const RC3_PCG_SMOOTH_WINDOW: usize = 8;
 
 impl PnLcFinger {
+    pub(super) fn set_nonpilot_cfo_tracking(&mut self, enable: bool) {
+        self.nonpilot_cfo_tracking = enable;
+    }
+
     /// Per-PCG pilot symbol SINR (dB) from on-axis vs. off-axis decomposition
     /// of despread pilot symbols. Chosen over Ec/Io because Ec/Io saturates
     /// with Tx power; pilot symbol SINR scales 1:1 in the noise-limited regime.
@@ -476,10 +470,14 @@ impl PnLcFinger {
 
     fn reset_rc3_pcg_measurement(&mut self) {
         self.rc3_pcg_measurement_abs_chip_start = None;
+        self.rc3_pcg_measurement_raw_input_power = 0.0;
         self.rc3_pcg_measurement_prompt_chip_power = 0.0;
         self.rc3_pcg_measurement_pilot_run_prompt = Complex32::new(0.0, 0.0);
         self.rc3_pcg_measurement_pilot_prompt_power = 0.0;
         self.rc3_pcg_measurement_pilot_chip_idx = 0;
+        self.rc3_pcg_measurement_traffic_run_prompt = Complex32::new(0.0, 0.0);
+        self.rc3_pcg_measurement_traffic_prompt_power = 0.0;
+        self.rc3_pcg_measurement_traffic_chip_idx = 0;
         self.rc3_pcg_measurement_chip_count = 0;
         self.rc3_pcg_measurement_pilot_coherent_sum = Complex32::new(0.0, 0.0);
         self.rc3_pcg_measurement_pilot_symbol_count = 0;
@@ -491,13 +489,19 @@ impl PnLcFinger {
             return;
         };
         let hard_validated = self.base.is_hard_validated();
-        let raw_power_dbfs = 10.0
-            * ((self.rc3_pcg_measurement_prompt_chip_power / RC3_PCG_CHIPS as f64)
-                .max(1e-15)
-                .log10() as f32);
+        let raw_power_dbfs = super::super::adc_referenced_power_dbfs(
+            self.rc3_pcg_measurement_raw_input_power / RC3_PCG_CHIPS as f64,
+        );
         let pilot_norm_sq = self.rc3_pcg_measurement_pilot_coherent_sum.norm_sqr() as f64;
         let n_symbols_this_pcg = self.rc3_pcg_measurement_pilot_symbol_count;
         let pilot_prompt_power_this_pcg = self.rc3_pcg_measurement_pilot_prompt_power;
+        let mobile_power_dbfs = super::super::rc3_mobile_power_dbfs(
+            pilot_norm_sq,
+            pilot_prompt_power_this_pcg,
+            n_symbols_this_pcg,
+            self.rc3_pcg_measurement_traffic_prompt_power,
+            RC3_PCG_CHIPS / RC3_PILOT_SYMBOL_CHIPS,
+        );
         let (raw_sinr_db, sinr_db, ec_io_db, smoothing_window_len) = if hard_validated {
             let raw_sinr_db = Self::pilot_sym_sinr_db_from_metrics(
                 pilot_norm_sq,
@@ -557,6 +561,10 @@ impl PnLcFinger {
             "traffic_pcg_raw_power_mdb",
             (raw_power_dbfs * 1000.0) as i64,
         );
+        block.tags.insert(
+            "traffic_pcg_mobile_power_mdbfs",
+            (mobile_power_dbfs * 1000.0) as i64,
+        );
         if let Some(ec_io_db) = ec_io_db {
             block
                 .tags
@@ -580,7 +588,12 @@ impl PnLcFinger {
         self.reset_rc3_pcg_measurement();
     }
 
-    fn update_rc3_pcg_measurement(&mut self, chip_tx: usize, prompt_chip: Complex32) {
+    fn update_rc3_pcg_measurement(
+        &mut self,
+        chip_tx: usize,
+        raw_input_chip: Complex32,
+        prompt_chip: Complex32,
+    ) {
         if !self.current_chip_enabled {
             self.reset_rc3_pcg_measurement();
             // Lock loss → smoothing window is no longer meaningful.
@@ -595,8 +608,21 @@ impl PnLcFinger {
             self.rc3_pcg_measurement_abs_chip_start = Some(chip_tx as u64);
         }
 
+        self.rc3_pcg_measurement_raw_input_power += raw_input_chip.norm_sqr() as f64;
         self.rc3_pcg_measurement_prompt_chip_power += prompt_chip.norm_sqr() as f64;
         let pcg_chip_offset = self.rc3_pcg_measurement_chip_count % RC3_PCG_CHIPS;
+        const WALSH_4_16: [f32; 16] = [
+            1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0,
+        ];
+        self.rc3_pcg_measurement_traffic_run_prompt +=
+            prompt_chip * WALSH_4_16[pcg_chip_offset % WALSH_4_16.len()];
+        self.rc3_pcg_measurement_traffic_chip_idx += 1;
+        if self.rc3_pcg_measurement_traffic_chip_idx == WALSH_4_16.len() {
+            self.rc3_pcg_measurement_traffic_prompt_power +=
+                self.rc3_pcg_measurement_traffic_run_prompt.norm_sqr() as f64;
+            self.rc3_pcg_measurement_traffic_run_prompt = Complex32::new(0.0, 0.0);
+            self.rc3_pcg_measurement_traffic_chip_idx = 0;
+        }
         if pcg_chip_offset < RC3_PILOT_CHIPS_PER_PCG {
             self.rc3_pcg_measurement_pilot_run_prompt += prompt_chip;
             self.rc3_pcg_measurement_pilot_chip_idx += 1;
@@ -757,6 +783,7 @@ impl PnLcFinger {
             } else {
                 None
             },
+            nonpilot_cfo_tracking: true,
             rc3_cfo_pilot_accum: Complex32::new(0.0, 0.0),
             rc3_cfo_pilot_chips: 0,
             sample_rate_hz: 0.0,
@@ -766,10 +793,14 @@ impl PnLcFinger {
             high_energy_chip_count: 0,
             pending_output: Vec::new(),
             rc3_pcg_measurement_abs_chip_start: None,
+            rc3_pcg_measurement_raw_input_power: 0.0,
             rc3_pcg_measurement_prompt_chip_power: 0.0,
             rc3_pcg_measurement_pilot_run_prompt: Complex32::new(0.0, 0.0),
             rc3_pcg_measurement_pilot_prompt_power: 0.0,
             rc3_pcg_measurement_pilot_chip_idx: 0,
+            rc3_pcg_measurement_traffic_run_prompt: Complex32::new(0.0, 0.0),
+            rc3_pcg_measurement_traffic_prompt_power: 0.0,
+            rc3_pcg_measurement_traffic_chip_idx: 0,
             rc3_pcg_measurement_chip_count: 0,
             rc3_pcg_measurement_pilot_coherent_sum: Complex32::new(0.0, 0.0),
             rc3_pcg_measurement_pilot_symbol_count: 0,
@@ -973,8 +1004,7 @@ impl PnLcFinger {
         let len = samples.len();
         let len_f = len as f32;
 
-        // Accumulate raw input power for every received sample (used
-        // by Rx Power reporting; doesn't depend on chip alignment).
+        // Accumulate raw input power until the next emitted block.
         for &val in samples {
             self.raw_input_power_accum += val.norm_sqr() as f64;
         }
@@ -1104,7 +1134,7 @@ impl PnLcFinger {
                 }
 
                 if self.epl_pilot_mode {
-                    self.update_rc3_pcg_measurement(chip_tx, pcg_measurement_prompt_chip);
+                    self.update_rc3_pcg_measurement(chip_tx, val, pcg_measurement_prompt_chip);
                 }
 
                 if epl_active {
@@ -1731,7 +1761,7 @@ impl PnLcFinger {
                 if pilot_coh_norm >= ACCESS_CFO_COH_GATE {
                     cfo.observe_pilot(pilot, block_len_chips);
                 }
-            } else if self.rc3_cfo.is_none() {
+            } else if self.rc3_cfo.is_none() && self.nonpilot_cfo_tracking {
                 let cfo_gate = 0.05f32;
                 const CFO_COH_REFERENCE: f32 = 0.25;
                 const CFO_MAX_LOOP_GAIN: f32 = 0.1;
@@ -1808,10 +1838,11 @@ impl PnLcFinger {
         // the matched-filter output.
         if self.raw_input_power_count > 0 {
             let raw_mean = (self.raw_input_power_accum / self.raw_input_power_count as f64) as f32;
-            let raw_power_db =
-                10.0 * raw_mean.max(1e-15_f32).log10() - rx_matched_filter_power_gain_db();
+            let raw_power_db = super::super::adc_referenced_power_dbfs(raw_mean as f64);
             blk.tags
                 .insert("finger_raw_power_mdb", (raw_power_db * 1000.0) as i64);
+            self.raw_input_power_accum = 0.0;
+            self.raw_input_power_count = 0;
         }
         // CFO tracker output (radians per chip). Tag in micro-radians so the
         // i64 tag map preserves enough precision for sub-Hz resolution at the
@@ -2105,5 +2136,18 @@ impl PnLcFinger {
     /// Expose the chip-rate buffer for test inspection.
     pub(super) fn chip_buffer_as_slice(&self) -> Vec<Complex32> {
         self.sample_buffer.iter().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod raw_power_tests {
+    use crate::receiver::pipelined::{adc_referenced_power_dbfs, rx_matched_filter_power_gain_db};
+
+    #[test]
+    fn adc_power_reference_removes_matched_filter_gain() {
+        let filter_gain = 10f64.powf(rx_matched_filter_power_gain_db() as f64 / 10.0);
+
+        assert!(adc_referenced_power_dbfs(filter_gain).abs() < 1e-4);
+        assert!((adc_referenced_power_dbfs(filter_gain * 0.5) + 3.0103).abs() < 1e-3);
     }
 }

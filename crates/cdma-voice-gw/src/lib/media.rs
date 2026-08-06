@@ -5,9 +5,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cdma_voice::evrc::{EvrcDecoder, EvrcEncoder};
-use cdma_voice::evrc_b_wb::{EvrcBDecoder, EvrcBEncoder, EvrcWbDecoder, EvrcWbEncoder};
-use cdma_voice::{VoiceCodec, VoiceRate};
+use cdma_voice::evrc::EvrcEncoder;
+use cdma_voice::evrc_b_wb::{EvrcBEncoder, EvrcWbEncoder};
+use cdma_voice::qcelp13k::Qcelp13kEncoder;
+use cdma_voice::tia96::Tia96Encoder;
+use cdma_voice::{VoiceCodec, VoiceDecoder, VoiceRate};
 use tokio::net::{UdpSocket, lookup_host};
 use tokio::sync::broadcast;
 use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
@@ -49,45 +51,34 @@ impl G711Codec {
     }
 }
 
-enum GatewayVoiceDecoder {
-    EvrcA(EvrcDecoder),
-    EvrcB(EvrcBDecoder),
-    EvrcWb(EvrcWbDecoder),
-}
+struct GatewayVoiceDecoder(VoiceDecoder);
 
 impl GatewayVoiceDecoder {
     fn new(codec: VoiceCodec) -> Result<Self, String> {
-        match codec {
-            VoiceCodec::EvrcA => EvrcDecoder::new()
-                .map(Self::EvrcA)
-                .map_err(|err| format!("EVRC-A decoder init: {err}")),
-            VoiceCodec::EvrcB => EvrcBDecoder::new()
-                .map(Self::EvrcB)
-                .map_err(|err| format!("EVRC-B decoder init: {err}")),
-            VoiceCodec::EvrcWb => EvrcWbDecoder::new()
-                .map(Self::EvrcWb)
-                .map_err(|err| format!("EVRC-WB decoder init: {err}")),
-        }
+        VoiceDecoder::new(codec)
+            .map(Self)
+            .map_err(|err| format!("{codec:?} decoder init: {err}"))
     }
 
     fn decode(&mut self, rate: VoiceRate, packet: &[u8]) -> Result<[i16; 160], String> {
-        match self {
-            Self::EvrcA(decoder) => decoder.decode(packet),
-            Self::EvrcB(decoder) => decoder.decode(rate, packet),
-            Self::EvrcWb(decoder) => decoder.decode_to_8k(rate, packet),
-        }
+        self.0.decode(rate, packet)
     }
 }
 
 enum GatewayVoiceEncoder {
+    Tia96(Tia96Encoder),
     EvrcA(EvrcEncoder),
     EvrcB(EvrcBEncoder),
     EvrcWb(EvrcWbEncoder),
+    Qcelp13k(Qcelp13kEncoder),
 }
 
 impl GatewayVoiceEncoder {
     fn new(codec: VoiceCodec) -> Result<Self, String> {
         match codec {
+            VoiceCodec::Tia96 => Tia96Encoder::new()
+                .map(Self::Tia96)
+                .map_err(|err| format!("TIA-96 encoder init: {err}")),
             VoiceCodec::EvrcA => EvrcEncoder::new()
                 .map(Self::EvrcA)
                 .map_err(|err| format!("EVRC-A encoder init: {err}")),
@@ -97,14 +88,19 @@ impl GatewayVoiceEncoder {
             VoiceCodec::EvrcWb => EvrcWbEncoder::new()
                 .map(Self::EvrcWb)
                 .map_err(|err| format!("EVRC-WB encoder init: {err}")),
+            VoiceCodec::Qcelp13k => Qcelp13kEncoder::new()
+                .map(Self::Qcelp13k)
+                .map_err(|err| format!("QCELP-13K encoder init: {err}")),
         }
     }
 
     fn encode(&mut self, pcm: &[i16; 160]) -> Result<(VoiceRate, Vec<u8>), String> {
         match self {
+            Self::Tia96(encoder) => encoder.encode(pcm),
             Self::EvrcA(encoder) => encoder.encode(pcm),
             Self::EvrcB(encoder) => encoder.encode(pcm),
             Self::EvrcWb(encoder) => encoder.encode_8k_input(pcm),
+            Self::Qcelp13k(encoder) => encoder.encode(pcm),
         }
     }
 }
@@ -374,22 +370,23 @@ impl RtpMediaSession {
                 self.voice_codec.service_option()
             );
         }
-        let voice_rate = voice_rate_for_rate_bps(rate_bps)?;
-        let evrc_packet = evrc_bits_to_packet_bytes(bits, rate_bps)?;
+        let voice_rate = voice_rate_for_rate_bps(self.voice_codec, rate_bps)?;
+        let codec_packet = voice_bits_to_packet_bytes(self.voice_codec, bits, rate_bps)?;
         let (pcm, sent_silence) = {
             let mut decoder = self.decoder.lock();
-            match decoder.decode(voice_rate, &evrc_packet) {
+            match decoder.decode(voice_rate, &codec_packet) {
                 Ok(pcm) => (pcm, false),
                 Err(err) => {
                     let failures = self.evrc_decode_failures.fetch_add(1, Ordering::Relaxed) + 1;
                     if self.log_media_frames || should_log_media_counter(failures) {
                         log::warn!(
-                            "VoiceGW EVRC decode failed; sending RTP silence session={} failures={} rate_bps={} bits={} packet_bytes={}: {}",
+                            "VoiceGW voice decode failed; sending RTP silence session={} codec={:?} failures={} rate_bps={} bits={} packet_bytes={}: {}",
                             self.session_id,
+                            self.voice_codec,
                             failures,
                             rate_bps,
                             bits.len(),
-                            evrc_packet.len(),
+                            codec_packet.len(),
                             err
                         );
                     }
@@ -633,9 +630,9 @@ impl RtpMediaSession {
             let mut encoder = self.encoder.lock();
             encoder
                 .encode(&frame)
-                .map_err(|err| format!("EVRC encode failed: {err}"))?
+                .map_err(|err| format!("voice encode failed: {err}"))?
         };
-        let bits = evrc_packet_bytes_to_bits(&packet_data, rate);
+        let bits = voice_packet_bytes_to_bits(self.voice_codec, &packet_data, rate);
         Ok(DecodedVoiceFrame {
             rtp_sequence: parsed.sequence,
             bits,
@@ -669,9 +666,9 @@ impl RtpMediaSession {
             let mut encoder = self.encoder.lock();
             encoder
                 .encode(&frame)
-                .map_err(|err| format!("EVRC silence encode failed: {err}"))?
+                .map_err(|err| format!("voice silence encode failed: {err}"))?
         };
-        let bits = evrc_packet_bytes_to_bits(&packet_data, rate);
+        let bits = voice_packet_bytes_to_bits(self.voice_codec, &packet_data, rate);
         self.gateway_silence_frames.fetch_add(1, Ordering::Relaxed);
         self.publish_decoded_frame(DecodedVoiceFrame {
             rtp_sequence: 0,
@@ -925,21 +922,34 @@ fn should_log_media_counter(count: u64) -> bool {
     count <= 5 || count % 250 == 0
 }
 
-pub fn evrc_bits_to_packet_bytes(bits: &[u8], rate_bps: u32) -> Result<Vec<u8>, String> {
-    let Some(shape) = evrc_payload_shape_for_rate_bps(rate_bps) else {
-        return Err(format!("unsupported EVRC rate_bps {rate_bps}"));
+/// Pack a stream of air-interface info bits (one element per bit, value 0/1)
+/// into the encoded payload byte layout expected by the codec at this rate.
+///
+/// EVRC variants use RS1 rates (9600/4800/2400/1200) and pack 171/80/40/16
+/// info bits into 22/10/5/2 bytes. QCELP-13K uses RS2 (14400/7200/3600/1800)
+/// and packs 266/124/54/20 info bits into 34/16/7/3 bytes. Trailing
+/// per-codec padding bits are left zero.
+pub fn voice_bits_to_packet_bytes(
+    codec: VoiceCodec,
+    bits: &[u8],
+    rate_bps: u32,
+) -> Result<Vec<u8>, String> {
+    let Some(rate) = codec.rate_from_bps(rate_bps) else {
+        return Err(format!("unsupported {:?} rate_bps {rate_bps}", codec));
     };
-    let expected_bits = shape.traffic_bits;
+    let expected_bits = codec.primary_traffic_bits(rate);
+    let data_bytes = codec.packet_data_bytes(rate);
     if bits.len() < expected_bits {
         return Err(format!(
-            "EVRC frame has {} bits, expected at least {} for {}bps",
+            "{:?} frame has {} bits, expected at least {} for {}bps",
+            codec,
             bits.len(),
             expected_bits,
             rate_bps
         ));
     }
 
-    let mut out = vec![0u8; shape.data_bytes];
+    let mut out = vec![0u8; data_bytes];
     for (idx, bit) in bits.iter().take(expected_bits).enumerate() {
         if bit & 1 != 0 {
             out[idx / 8] |= 1 << (7 - (idx % 8));
@@ -948,52 +958,18 @@ pub fn evrc_bits_to_packet_bytes(bits: &[u8], rate_bps: u32) -> Result<Vec<u8>, 
     Ok(out)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct EvrcPayloadShape {
-    traffic_bits: usize,
-    data_bytes: usize,
+fn voice_rate_for_rate_bps(codec: VoiceCodec, rate_bps: u32) -> Result<VoiceRate, String> {
+    codec
+        .rate_from_bps(rate_bps)
+        .ok_or_else(|| format!("unsupported {:?} rate_bps {rate_bps}", codec))
 }
 
-fn evrc_payload_shape_for_rate_bps(rate_bps: u32) -> Option<EvrcPayloadShape> {
-    let shape = match rate_bps {
-        9600 => EvrcPayloadShape {
-            traffic_bits: 171,
-            data_bytes: 22,
-        },
-        4800 => EvrcPayloadShape {
-            traffic_bits: 80,
-            data_bytes: 10,
-        },
-        // RC1 names this EVRC quarter-rate payload 2400 bps. RC3 names the
-        // same 40 primary traffic bits 2700 bps because its FQI/tail framing
-        // differs before the BSC strips framing for the gateway.
-        2400 | 2700 => EvrcPayloadShape {
-            traffic_bits: 40,
-            data_bytes: 5,
-        },
-        // Same for eighth rate: EVRC carries 16 primary traffic bits, while
-        // RC3 reports the over-the-air frame rate as 1500 bps.
-        1200 | 1500 => EvrcPayloadShape {
-            traffic_bits: 16,
-            data_bytes: 2,
-        },
-        _ => return None,
-    };
-    Some(shape)
-}
-
-fn voice_rate_for_rate_bps(rate_bps: u32) -> Result<VoiceRate, String> {
-    match rate_bps {
-        9600 => Ok(VoiceRate::Full),
-        4800 => Ok(VoiceRate::Half),
-        2400 | 2700 => Ok(VoiceRate::Quarter),
-        1200 | 1500 => Ok(VoiceRate::Eighth),
-        _ => Err(format!("unsupported EVRC rate_bps {rate_bps}")),
-    }
-}
-
-pub fn evrc_packet_bytes_to_bits(packet: &[u8], rate: VoiceRate) -> Vec<u8> {
-    let traffic_bits = rate.primary_traffic_bits();
+/// Unpack an encoded codec payload into one-bit-per-byte form. The output
+/// length is the codec's primary traffic-bit count at this rate. Trailing
+/// padding bits in the packet (e.g. the 6-bit pad on QCELP-13K full rate)
+/// are discarded.
+pub fn voice_packet_bytes_to_bits(codec: VoiceCodec, packet: &[u8], rate: VoiceRate) -> Vec<u8> {
+    let traffic_bits = codec.primary_traffic_bits(rate);
     let mut bits = Vec::with_capacity(traffic_bits);
     for byte in packet {
         for bit_idx in (0..8).rev() {
@@ -1147,6 +1123,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gateway_tia96_codec_roundtrip() {
+        let mut encoder = GatewayVoiceEncoder::new(VoiceCodec::Tia96).expect("encoder");
+        let mut decoder = GatewayVoiceDecoder::new(VoiceCodec::Tia96).expect("decoder");
+        for frame in 0..8 {
+            let pcm = std::array::from_fn(|sample| (frame * 251 + sample * 997) as i16);
+            let (rate, packet) = encoder.encode(&pcm).expect("encode");
+            assert_eq!(decoder.decode(rate, &packet).expect("decode").len(), 160);
+        }
+    }
+
+    #[test]
+    fn gateway_evrc_a_quarter_rate_uses_erasure_concealment() {
+        let mut decoder = GatewayVoiceDecoder::new(VoiceCodec::EvrcA).expect("decoder");
+        assert_eq!(
+            decoder
+                .decode(VoiceRate::Quarter, &[0x5a; 5])
+                .expect("decode erasure")
+                .len(),
+            160
+        );
+    }
+
+    #[test]
     fn parses_sdp_rtp_endpoint() {
         let sdp = b"v=0\r\nc=IN IP4 192.0.2.10\r\nm=audio 49170 RTP/AVP 0 8\r\n";
         let endpoint = parse_sdp_rtp_endpoint(sdp).unwrap();
@@ -1215,7 +1214,7 @@ mod tests {
         let mut bits = vec![0u8; 171];
         bits[0] = 1;
         bits[8] = 1;
-        let packet = evrc_bits_to_packet_bytes(&bits, 9600).unwrap();
+        let packet = voice_bits_to_packet_bytes(VoiceCodec::EvrcA, &bits, 9600).unwrap();
         assert_eq!(packet.len(), 22);
         assert_eq!(packet[0], 0x80);
         assert_eq!(packet[1], 0x80);
@@ -1226,7 +1225,8 @@ mod tests {
         let mut quarter_bits = vec![0u8; 40];
         quarter_bits[0] = 1;
         quarter_bits[39] = 1;
-        let quarter_packet = evrc_bits_to_packet_bytes(&quarter_bits, 2700).unwrap();
+        let quarter_packet =
+            voice_bits_to_packet_bytes(VoiceCodec::EvrcA, &quarter_bits, 2700).unwrap();
         assert_eq!(quarter_packet.len(), 5);
         assert_eq!(quarter_packet[0], 0x80);
         assert_eq!(quarter_packet[4], 0x01);
@@ -1234,17 +1234,68 @@ mod tests {
         let mut eighth_bits = vec![0u8; 16];
         eighth_bits[0] = 1;
         eighth_bits[15] = 1;
-        let eighth_packet = evrc_bits_to_packet_bytes(&eighth_bits, 1500).unwrap();
+        let eighth_packet =
+            voice_bits_to_packet_bytes(VoiceCodec::EvrcA, &eighth_bits, 1500).unwrap();
         assert_eq!(eighth_packet.len(), 2);
         assert_eq!(eighth_packet, [0x80, 0x01]);
     }
 
     #[test]
     fn unpacks_evrc_payload_bytes_to_rate_bits() {
-        let bits = evrc_packet_bytes_to_bits(&[0x80, 0x01], VoiceRate::Eighth);
+        let bits = voice_packet_bytes_to_bits(VoiceCodec::EvrcA, &[0x80, 0x01], VoiceRate::Eighth);
         assert_eq!(bits.len(), 16);
         assert_eq!(bits[0], 1);
         assert_eq!(bits[15], 1);
+    }
+
+    #[test]
+    fn packs_qcelp_full_rate_bits_to_34_bytes() {
+        // QCELP-13K Full = 266 info bits packed MSB into 34 bytes
+        // (6-bit trailing pad). Bits 0/8/265 set to 1 verify start, second-
+        // byte boundary, and the final used bit.
+        let mut bits = vec![0u8; 266];
+        bits[0] = 1;
+        bits[8] = 1;
+        bits[265] = 1;
+        let packet = voice_bits_to_packet_bytes(VoiceCodec::Qcelp13k, &bits, 14_400).unwrap();
+        assert_eq!(packet.len(), 34);
+        assert_eq!(packet[0], 0x80);
+        assert_eq!(packet[1], 0x80);
+        // Bit 265 is byte 33 bit position 7 - (265 % 8) = 7-1 = 6 -> 0x40
+        assert_eq!(packet[33], 0x40);
+    }
+
+    #[test]
+    fn packs_qcelp_sub_rates_to_codec_byte_counts() {
+        let half =
+            voice_bits_to_packet_bytes(VoiceCodec::Qcelp13k, &vec![0u8; 124], 7_200).unwrap();
+        assert_eq!(half.len(), 16);
+        let quarter =
+            voice_bits_to_packet_bytes(VoiceCodec::Qcelp13k, &vec![0u8; 54], 3_600).unwrap();
+        assert_eq!(quarter.len(), 7);
+        let eighth =
+            voice_bits_to_packet_bytes(VoiceCodec::Qcelp13k, &vec![0u8; 20], 1_800).unwrap();
+        assert_eq!(eighth.len(), 3);
+    }
+
+    #[test]
+    fn unpacks_qcelp_full_rate_packet_to_266_info_bits() {
+        // 34-byte packet: byte 0 = 0x80 sets bit 0; byte 33 = 0x40 sets bit
+        // 265. The 6-bit padding region (bits 266..272) must be discarded.
+        let mut packet = vec![0u8; 34];
+        packet[0] = 0x80;
+        packet[33] = 0x40;
+        let bits = voice_packet_bytes_to_bits(VoiceCodec::Qcelp13k, &packet, VoiceRate::Full);
+        assert_eq!(bits.len(), 266);
+        assert_eq!(bits[0], 1);
+        assert_eq!(bits[265], 1);
+    }
+
+    #[test]
+    fn rejects_unsupported_rate_for_codec() {
+        // QCELP-13K does not carry RS1 rates and vice versa.
+        assert!(voice_bits_to_packet_bytes(VoiceCodec::Qcelp13k, &vec![0u8; 171], 9_600).is_err());
+        assert!(voice_bits_to_packet_bytes(VoiceCodec::EvrcA, &vec![0u8; 266], 14_400).is_err());
     }
 
     #[test]

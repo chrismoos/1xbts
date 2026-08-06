@@ -55,6 +55,25 @@ pub struct ReverseMux1SignalingBlock {
     pub bits: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReverseMux2Format {
+    pub mux_header: u8,
+    pub header_bits: usize,
+    pub primary_bits: usize,
+    pub signaling_bits: usize,
+}
+
+pub type ReverseMux2FullRateFormat = ReverseMux2Format;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReverseMux2SignalingBlock {
+    pub mux_header: u8,
+    pub header_bits: usize,
+    pub primary_bits: usize,
+    pub signaling_bits: usize,
+    pub bits: Vec<u8>,
+}
+
 pub fn parse_reverse_mux1_full_rate_format(info_bits: &[u8]) -> Option<ReverseMux1FullRateFormat> {
     if info_bits.len() < RC1_FRAME_CONFIG.info_bits {
         return None;
@@ -117,6 +136,93 @@ pub fn extract_reverse_mux1_full_rate_signaling_block(
         signaling_bits: format.signaling_bits,
         bits,
     })
+}
+
+pub fn parse_reverse_mux2_format(info_bits: &[u8]) -> Option<ReverseMux2Format> {
+    let (header_bits, mixed_mode_primary_bits) = match info_bits.len() {
+        267 => (5, 266),
+        125 => (4, 124),
+        55 => (3, 54),
+        21 => (1, 20),
+        _ => return None,
+    };
+
+    if info_bits[0] == 0 {
+        return Some(ReverseMux2Format {
+            mux_header: 0,
+            header_bits: 1,
+            primary_bits: mixed_mode_primary_bits,
+            signaling_bits: 0,
+        });
+    }
+
+    let mux_header = info_bits[..header_bits]
+        .iter()
+        .fold(0u8, |value, bit| (value << 1) | (bit & 1));
+    let (primary_bits, signaling_bits) = match (info_bits.len(), mux_header) {
+        (267, 0b10000) => (124, 138),
+        (267, 0b10001) => (54, 208),
+        (267, 0b10010) => (20, 242),
+        (267, 0b10011) => (0, 262),
+        (267, 0b10100) => (124, 0),
+        (267, 0b10101) => (54, 0),
+        (267, 0b10110) => (20, 0),
+        (267, 0b10111) => (0, 0),
+        (267, 0b11000) => (20, 222),
+        (125, 0b1000) => (54, 67),
+        (125, 0b1001) => (20, 101),
+        (125, 0b1010) => (0, 121),
+        (125, 0b1011) => (54, 0),
+        (125, 0b1100) => (20, 0),
+        (125, 0b1101) => (0, 0),
+        (125, 0b1110) => (20, 81),
+        (55, 0b100) => (20, 32),
+        (55, 0b101) => (0, 52),
+        (55, 0b110) => (20, 0),
+        (55, 0b111) => (0, 0),
+        (21, 0b1) => (0, 0),
+        _ => return None,
+    };
+
+    Some(ReverseMux2Format {
+        mux_header,
+        header_bits,
+        primary_bits,
+        signaling_bits,
+    })
+}
+
+pub fn extract_reverse_mux2_signaling_block(info_bits: &[u8]) -> Option<ReverseMux2SignalingBlock> {
+    let format = parse_reverse_mux2_format(info_bits)?;
+    if format.signaling_bits == 0 {
+        return None;
+    }
+
+    let start = format.header_bits + format.primary_bits;
+    let bits = info_bits[start..start + format.signaling_bits].to_vec();
+    Some(ReverseMux2SignalingBlock {
+        mux_header: format.mux_header,
+        header_bits: format.header_bits,
+        primary_bits: format.primary_bits,
+        signaling_bits: format.signaling_bits,
+        bits,
+    })
+}
+
+pub fn parse_reverse_mux2_full_rate_format(info_bits: &[u8]) -> Option<ReverseMux2FullRateFormat> {
+    if info_bits.len() != 267 {
+        return None;
+    }
+    parse_reverse_mux2_format(info_bits)
+}
+
+pub fn extract_reverse_mux2_full_rate_signaling_block(
+    info_bits: &[u8],
+) -> Option<ReverseMux2SignalingBlock> {
+    if info_bits.len() != 267 {
+        return None;
+    }
+    extract_reverse_mux2_signaling_block(info_bits)
 }
 
 /// Configuration for a traffic channel frame structure.
@@ -213,6 +319,7 @@ impl TrafficChannelProcessor {
             "finger_pilot_ec_io_mdb",
             "traffic_ml_tail_match",
             "traffic_phy_valid",
+            "traffic_radio_config",
             "traffic_rate_bps",
             "traffic_info_bits",
             "traffic_fqi_bits",
@@ -461,6 +568,7 @@ impl PipelineProcessor for TrafficChannelProcessor {
                 .get("traffic_mux_signaling_layout")
                 .copied()
                 .map(ReverseMux1SignalingLayout::from_tag);
+            let radio_config = block.tags.get("traffic_radio_config").copied();
 
             log::trace!(
                 "traffic_channel_processor: decoded frame walsh={} chip={} bits={} info_bits={} fqi_bits={} preamble={} fqi_valid={} tail_valid={}",
@@ -523,6 +631,71 @@ impl PipelineProcessor for TrafficChannelProcessor {
                     bits.len(),
                     info_bits,
                 );
+                return out;
+            }
+
+            if radio_config == Some(2) {
+                let Some(signaling_block) =
+                    extract_reverse_mux2_signaling_block(&bits[..info_bits])
+                else {
+                    return out;
+                };
+                debug!(
+                    "traffic_mux2_candidate: walsh={} chip={} mux_header=0x{:X} header_bits={} primary_bits={} signaling_bits={}",
+                    self.walsh_code,
+                    frame_chip,
+                    signaling_block.mux_header,
+                    signaling_block.header_bits,
+                    signaling_block.primary_bits,
+                    signaling_block.signaling_bits,
+                );
+                let mut info_bs = Bitstream::new_init(&signaling_block.bits);
+                if let Ok(Some(frame)) = self.suffix_reader.process(&mut info_bs) {
+                    info!(
+                        "traffic_frame: walsh={} chip={} crc={} mux=2 mux_header=0x{:X} header_bits={} signaling_bits={} msg_len={} payload_bits={} preamble_frames={}",
+                        self.walsh_code,
+                        frame_chip,
+                        if frame.crc_valid { "VALID" } else { "INVALID" },
+                        signaling_block.mux_header,
+                        signaling_block.header_bits,
+                        signaling_block.signaling_bits,
+                        frame.msg_length_octets,
+                        frame.data.len(),
+                        self.preamble_frames,
+                    );
+                    if frame.crc_valid {
+                        self.locked_layout = Some(ReverseMux1SignalingLayout::Suffix);
+                        self.prefix_reader.reset();
+                        let mut event = self.emit_traffic_event(
+                            frame_chip,
+                            block.chip_start,
+                            frame,
+                            &block.tags,
+                        );
+                        event.pcg_signal_snr_db = block.pcg_signal_snr_db.clone();
+                        event.active_pcg_mask = block.active_pcg_mask;
+                        event.tags.insert(
+                            "traffic_mux_signaling_layout",
+                            ReverseMux1SignalingLayout::Suffix.tag_value(),
+                        );
+                        event
+                            .tags
+                            .insert("traffic_mux_header", signaling_block.mux_header as i64);
+                        event.tags.insert(
+                            "traffic_mux_header_bits",
+                            signaling_block.header_bits as i64,
+                        );
+                        event.tags.insert(
+                            "traffic_mux_primary_bits",
+                            signaling_block.primary_bits as i64,
+                        );
+                        event.tags.insert(
+                            "traffic_mux_signaling_bits",
+                            signaling_block.signaling_bits as i64,
+                        );
+                        out.push(event);
+                    }
+                }
                 return out;
             }
 
@@ -821,6 +994,122 @@ mod tests {
         .expect("signaling block");
         assert_eq!(signaling.bits.len(), 168);
         assert_eq!(signaling.bits, info_bits[4..172].to_vec());
+    }
+
+    #[test]
+    fn reverse_mux2_signaling_only_extracts_262_bits() {
+        let mut info_bits = vec![0u8; 267];
+        info_bits[..5].copy_from_slice(&[1, 0, 0, 1, 1]);
+        for (idx, bit) in info_bits[5..].iter_mut().enumerate() {
+            *bit = (idx & 1) as u8;
+        }
+
+        let format = parse_reverse_mux2_full_rate_format(&info_bits).expect("format");
+        assert_eq!(format.mux_header, 0b10011);
+        assert_eq!(format.primary_bits, 0);
+        assert_eq!(format.signaling_bits, 262);
+
+        let signaling =
+            extract_reverse_mux2_full_rate_signaling_block(&info_bits).expect("signaling block");
+        assert_eq!(signaling.bits, info_bits[5..267].to_vec());
+    }
+
+    #[test]
+    fn reverse_mux2_formats_cover_all_rc2_rates() {
+        let cases = [
+            (267, "0", 266, 0),
+            (267, "10000", 124, 138),
+            (267, "10001", 54, 208),
+            (267, "10010", 20, 242),
+            (267, "10011", 0, 262),
+            (267, "10100", 124, 0),
+            (267, "10101", 54, 0),
+            (267, "10110", 20, 0),
+            (267, "10111", 0, 0),
+            (267, "11000", 20, 222),
+            (125, "0", 124, 0),
+            (125, "1000", 54, 67),
+            (125, "1001", 20, 101),
+            (125, "1010", 0, 121),
+            (125, "1011", 54, 0),
+            (125, "1100", 20, 0),
+            (125, "1101", 0, 0),
+            (125, "1110", 20, 81),
+            (55, "0", 54, 0),
+            (55, "100", 20, 32),
+            (55, "101", 0, 52),
+            (55, "110", 20, 0),
+            (55, "111", 0, 0),
+            (21, "0", 20, 0),
+            (21, "1", 0, 0),
+        ];
+
+        for (info_len, header, primary_bits, signaling_bits) in cases {
+            let header: Vec<u8> = header.bytes().map(|bit| bit - b'0').collect();
+            let mut info = vec![0; info_len];
+            info[..header.len()].copy_from_slice(&header);
+
+            let format = parse_reverse_mux2_format(&info).expect("valid MuxPDU Type 2 format");
+            assert_eq!(format.header_bits, header.len());
+            assert_eq!(format.primary_bits, primary_bits);
+            assert_eq!(format.signaling_bits, signaling_bits);
+
+            let extracted = extract_reverse_mux2_signaling_block(&info);
+            assert_eq!(extracted.is_some(), signaling_bits > 0);
+            if let Some(extracted) = extracted {
+                assert_eq!(extracted.bits.len(), signaling_bits);
+            }
+        }
+    }
+
+    #[test]
+    fn rc2_half_rate_dim_and_burst_emits_traffic_event() {
+        let mut pdu = Bitstream::new();
+        pdu.write_u8(0x01, 8);
+        let full_rate_frames = crate::lac::sar_fragment_ftch_pdu_dsch_rc2(&pdu);
+        assert_eq!(full_rate_frames.len(), 1);
+        let full_rate_bits = full_rate_frames[0].bits();
+
+        let mut half_rate_bits = vec![1, 0, 0, 0];
+        half_rate_bits.extend(std::iter::repeat_n(0, 54));
+        half_rate_bits.extend_from_slice(&full_rate_bits[5..5 + 67]);
+        assert_eq!(half_rate_bits.len(), 125);
+
+        let samples = half_rate_bits
+            .into_iter()
+            .map(|bit| Complex32::new(bit as f32, 0.0))
+            .collect();
+        let mut block = SampleBlock::new(samples, 12_288).with_sample_rate_hz(9_600.0);
+        block.tags.insert("traffic_decoded_frame", 1);
+        block.tags.insert("traffic_radio_config", 2);
+        block.tags.insert("traffic_rate_bps", 7_200);
+        block.tags.insert("traffic_info_bits", 125);
+        block.tags.insert("traffic_fqi_bits", 10);
+        block.tags.insert("traffic_tail_bits", 8);
+        block.tags.insert("traffic_fqi_valid", 1);
+        block.tags.insert("traffic_tail_valid", 1);
+
+        let mut processor = TrafficChannelProcessor::new(8);
+        let out = processor.process_block(block);
+
+        assert_eq!(out.len(), 2);
+        let event = out
+            .iter()
+            .find(|block| block.tags.get("traffic_event") == Some(&1))
+            .expect("reassembled traffic event");
+        assert_eq!(event.tags.get("traffic_radio_config"), Some(&2));
+        assert_eq!(event.tags.get("traffic_mux_header"), Some(&0b1000));
+        assert_eq!(event.tags.get("traffic_mux_header_bits"), Some(&4));
+        assert_eq!(event.tags.get("traffic_mux_primary_bits"), Some(&54));
+        assert_eq!(event.tags.get("traffic_mux_signaling_bits"), Some(&67));
+        assert_eq!(
+            event
+                .samples
+                .iter()
+                .map(|sample| sample.re as u8)
+                .collect::<Vec<_>>(),
+            pdu.bits()
+        );
     }
 
     #[test]

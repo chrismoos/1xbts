@@ -4,6 +4,7 @@ import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { Card, Stat } from "@/components/card";
 import { HrpdSummaryCard } from "@/components/hrpd-summary-card";
+import { radioConfigPairName } from "@/lib/radio-config";
 import { serviceOptionName } from "@/lib/service-option";
 import { smsStateColor } from "@/lib/sms-state";
 import { useEventStream } from "@/lib/use-event-stream";
@@ -53,6 +54,10 @@ interface ChannelEntry {
   direction: string;
   serviceOption?: number;
   mobile?: { address: string; state: string; phoneNumber?: string };
+  trafficPower?: {
+    forwardRadioConfig: number;
+    reverseRadioConfig: number;
+  };
 }
 
 interface ChannelsResponse {
@@ -315,6 +320,17 @@ export default function DashboardPage() {
                   {trafficChannels.map((ch, i) => (
                     <div key={i} className="flex items-center gap-2 text-xs">
                       <span className="font-mono text-primary">W{ch.walshCode}</span>
+                      {radioConfigPairName(
+                        ch.trafficPower?.forwardRadioConfig,
+                        ch.trafficPower?.reverseRadioConfig,
+                      ) && (
+                        <span className="font-mono text-secondary">
+                          {radioConfigPairName(
+                            ch.trafficPower?.forwardRadioConfig,
+                            ch.trafficPower?.reverseRadioConfig,
+                          )}
+                        </span>
+                      )}
                       {ch.serviceOption != null && (
                         <span className="text-muted">{serviceOptionName(ch.serviceOption)}</span>
                       )}

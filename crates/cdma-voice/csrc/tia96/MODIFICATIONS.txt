@@ -1,0 +1,24 @@
+The files in code/ are the Qualcomm IS-96A v2.02 floating-point reference
+codec. The original copyright and permitted-use notice is retained in every
+source file and in code/README.
+
+Imported archive SHA-256:
+71e8fa5ab3897db9587faae53fcfbfbbf9117d846a8f3ccb69dd45c9c0ea2dfe
+
+Local changes:
+
+- The unrelated DSP1610 makefile, linker file, CLI, file-I/O layer, temporary
+  duplicate sources, and SourceSafe metadata are not included.
+- CRLF line endings were normalized.
+- INTTYPE is defined as int by build.rs, matching the reference simulation.
+- filter.c includes stdlib.h so allocation functions have pointer-safe
+  declarations on 64-bit hosts.
+- Read-only lookup tables are const, preventing process-wide mutation.
+- recursive_conv() returns zero on both paths, avoiding the original bare
+  return from an implicit-int function. Its callers ignore the result.
+- Public reference symbols are prefixed at compile time to avoid collisions
+  with the other voice codecs linked into cdma-voice.
+- tia96.c owns and frees all encoder/decoder state per instance and adapts the
+  reference packet words to MSB-first air-interface payload bytes.
+- tia96.c preserves the reference encoder's 60-sample analysis history and
+  pre-processes its initial history before encoding the first speech frame.

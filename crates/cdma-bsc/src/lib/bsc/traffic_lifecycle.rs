@@ -62,7 +62,8 @@ impl Bsc {
             format_ms_address(&addr),
             reason
         );
-        if let Err(e) = self.send_traffic_release_order(walsh_code, 0b111) {
+        if let Err(e) = self.send_traffic_release_order(walsh_code, super::DEFAULT_TRAFFIC_ACK_SEQ)
+        {
             warn!(
                 "BSC: failed to send packet Release Order on walsh={} during {}: {}",
                 walsh_code, reason, e
@@ -142,6 +143,9 @@ impl Bsc {
             return;
         };
         let packet_session_id = self.packet.detach_session(&mut tc);
+        self.traffic_bearer
+            .reverse_voice_silence_encoders
+            .remove(&walsh_code);
 
         if let Some(session_id) = packet_session_id {
             self.close_packet_session(walsh_code, &session_id).await;
@@ -192,18 +196,19 @@ impl Bsc {
         self.publish_mobiles();
 
         self.fire_pending_a1_failure_after_release(&addr);
+        self.resume_voice_page_after_release(&addr);
     }
 
     /// Send a Release Order on the forward traffic channel.
     ///
-    /// ORDER=0b010101 (21 = Release) per C.S0004-E Table 3.7.2.3.2.1-3.
+    /// Uses the Release Order code from C.S0004-E Table 3.7.2.3.2.1-3.
     pub(crate) fn send_traffic_release_order(
         &mut self,
         walsh_code: u8,
         ack_seq: u8,
     ) -> Result<(), Error> {
         let order_msg = OrderMessage {
-            order: 0b010101, // Release Order
+            order: super::RELEASE_ORDER_CODE,
             ordq: 0,
             order_specific_fields: Vec::new(),
         };

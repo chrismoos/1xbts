@@ -3806,13 +3806,23 @@ pub struct ChannelAssignmentMessage {
     /// GRANTED_MODE: 2 bits (ASSIGN_MODE=100 only).
     /// 0b00 = use DEFAULT_CONFIG values.
     pub granted_mode: Option<u8>,
-    /// PLCM_TYPE_INCL: 1 bit (ASSIGN_MODE=100 only).
-    /// 1 = PLCM type and possibly PLCM_39 included.
     pub plcm_type_incl: Option<bool>,
-    /// PLCM_TYPE: 4 bits (only if PLCM_TYPE_INCL=1).
-    /// 0000 = ESN-based (no PLCM_39 needed).
     pub plcm_type: Option<u8>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChannelAssignmentGrantedMode {
+    DefaultConfiguration = 0b00,
+    RequestedService = 0b10,
+}
+
+pub const CHANNEL_ASSIGN_MODE_TRAFFIC: u8 = 0b000;
+pub const CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC: u8 = 0b100;
+pub const CHANNEL_DEFAULT_CONFIG_RC1_RC1: u8 = 0b000;
+pub const CHANNEL_DEFAULT_CONFIG_RC2_RC2: u8 = 0b001;
+pub const CHANNEL_DEFAULT_CONFIG_RC1_RC2: u8 = 0b010;
+pub const CHANNEL_DEFAULT_CONFIG_RC2_RC1: u8 = 0b011;
+pub const CHANNEL_DEFAULT_CONFIG_EXPLICIT_RCS: u8 = 0b100;
 
 impl ChannelAssignmentMessage {
     /// Create a simple same-frequency traffic channel assignment.
@@ -3821,7 +3831,7 @@ impl ChannelAssignmentMessage {
     /// support RC3+, use `new_extended_traffic_assignment()` instead.
     pub fn new_traffic_assignment(walsh_code: u8, frame_offset: u8) -> Self {
         Self {
-            assign_mode: 0b000,
+            assign_mode: CHANNEL_ASSIGN_MODE_TRAFFIC,
             freq_incl: false,
             code_chan: walsh_code,
             frame_offset,
@@ -3836,34 +3846,27 @@ impl ChannelAssignmentMessage {
         }
     }
 
-    /// Create an Extended Traffic Channel Assignment (ASSIGN_MODE=100) for IS-2000 mobiles.
-    ///
-    /// Required for mobiles with p_rev >= 6 that only support RC3+.
-    /// Uses DEFAULT_CONFIG to select the radio configuration:
-    /// - `default_config=0b000` → RC1/RC1 (MuxOpt1, 9600 bps)
-    /// - `default_config=0b001` → RC2/RC2 (MuxOpt2, 14400 bps)
-    ///
-    /// Note: DEFAULT_CONFIG=0b100 (explicit FOR_RC/REV_RC) requires the Extended
-    /// Channel Assignment Message (ECAM, 3.7.2.3.2.21) which is a separate message
-    /// type. The basic paging channel CAM does not carry FOR_RC/REV_RC fields.
+    /// Create an ASSIGN_MODE=100 Channel Assignment.
     pub fn new_extended_traffic_assignment(
         walsh_code: u8,
         frame_offset: u8,
         default_config: u8,
+        granted_mode: ChannelAssignmentGrantedMode,
+        bypass_alert_answer: bool,
     ) -> Self {
         Self {
-            assign_mode: 0b100,
+            assign_mode: CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC,
             freq_incl: false,
             code_chan: walsh_code,
             frame_offset,
             encrypt_mode: 0b00,
             band_class: None,
             cdma_freq: None,
-            bypass_alert_answer: Some(true), // bypass alert/answer (direct to conversation for SMS)
+            bypass_alert_answer: Some(bypass_alert_answer),
             default_config: Some(default_config),
-            granted_mode: Some(0b00), // use DEFAULT_CONFIG values
-            plcm_type_incl: Some(true),
-            plcm_type: Some(0), // 0000 = ESN-based
+            granted_mode: Some(granted_mode as u8),
+            plcm_type_incl: None,
+            plcm_type: None,
         }
     }
 
@@ -3872,11 +3875,15 @@ impl ChannelAssignmentMessage {
             self.encrypt_mode, 0,
             "CAM encoder currently supports only ENCRYPT_MODE=00"
         );
+        assert!(matches!(
+            self.assign_mode,
+            CHANNEL_ASSIGN_MODE_TRAFFIC | CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC
+        ));
+        assert!((1..=63).contains(&self.code_chan));
         let mut bs = Bitstream::new();
         let mut record = Bitstream::new();
         bs.write_u8(self.assign_mode, 3);
-        if self.assign_mode == 0b000 {
-            // ASSIGN_MODE=000: Traffic channel assignment (IS-95 / Band Class 0)
+        if self.assign_mode == CHANNEL_ASSIGN_MODE_TRAFFIC {
             record.write_u8(self.freq_incl as u8, 1);
             record.write_u8(self.code_chan, 8);
             if self.freq_incl {
@@ -3885,28 +3892,23 @@ impl ChannelAssignmentMessage {
             record.write_u8(self.frame_offset, 4);
             record.write_u8(self.encrypt_mode, 2);
             record.write_u8(0, 1); // C_SIG_ENCRYPT_MODE_INCL
-        } else if self.assign_mode == 0b100 {
-            // ASSIGN_MODE=100: Extended Traffic Channel Assignment (IS-2000)
-            // Per C.S0005-E 3.7.2.3.2.8:
-            //   FREQ_INCL(1), RESERVED(3), BYPASS_ALERT_ANSWER(1),
-            //   DEFAULT_CONFIG(3), GRANTED_MODE(2), CODE_CHAN(8),
-            //   FRAME_OFFSET(4), ENCRYPT_MODE(2),
-            //   [BAND_CLASS(5), CDMA_FREQ(11) if FREQ_INCL=1],
-            //   [encryption fields if ENCRYPT_MODE != 00],
-            //   RESERVED (pad to octet boundary)
-            record.write_u8(self.freq_incl as u8, 1); // FREQ_INCL
-            record.write_u8(0b000, 3); // RESERVED
-            record.write_u8(self.bypass_alert_answer.unwrap_or(true) as u8, 1); // BYPASS_ALERT_ANSWER
-            record.write_u8(self.default_config.unwrap_or(0b000), 3); // DEFAULT_CONFIG
-            record.write_u8(self.granted_mode.unwrap_or(0b00), 2); // GRANTED_MODE
-            record.write_u8(self.code_chan, 8); // CODE_CHAN
-            record.write_u8(self.frame_offset, 4); // FRAME_OFFSET
-            record.write_u8(self.encrypt_mode, 2); // ENCRYPT_MODE
+        } else if self.assign_mode == CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC {
+            let default_config = self.default_config.unwrap_or(0);
+            let granted_mode = self.granted_mode.unwrap_or(0);
+            assert!(default_config <= 0b011);
+            assert!(granted_mode <= 0b10);
+            record.write_u8(self.freq_incl as u8, 1);
+            record.write_u8(0, 3);
+            record.write_u8(self.bypass_alert_answer.unwrap_or(false) as u8, 1);
+            record.write_u8(default_config, 3);
+            record.write_u8(granted_mode, 2);
+            record.write_u8(self.code_chan, 8);
+            record.write_u8(self.frame_offset, 4);
+            record.write_u8(self.encrypt_mode, 2);
             if self.freq_incl {
                 record.write_u8(self.band_class.unwrap_or(0), 5);
                 record.write_u32(self.cdma_freq.unwrap_or(0) as u32, 11);
             }
-            record.write_u8(0, 1); // C_SIG_ENCRYPT_MODE_INCL
         }
         let remainder = record.len() % 8;
         if remainder != 0 {
@@ -3937,7 +3939,7 @@ impl ChannelAssignmentMessage {
         }
         let mut record = bs.drain(0..record_bits);
         let r = |bs: &mut Bitstream, n| bs.read_bits(n).map_err(|e| format!("CAM: {e}"));
-        if assign_mode == 0b000 {
+        if assign_mode == CHANNEL_ASSIGN_MODE_TRAFFIC {
             let freq_incl = r(&mut record, 1)? != 0;
             let code_chan = r(&mut record, 8)? as u8;
             let cdma_freq = if freq_incl {
@@ -3971,7 +3973,7 @@ impl ChannelAssignmentMessage {
                 plcm_type_incl: None,
                 plcm_type: None,
             })
-        } else if assign_mode == 0b100 {
+        } else if assign_mode == CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC {
             let freq_incl = r(&mut record, 1)? != 0;
             let _reserved = r(&mut record, 3)?;
             let bypass_alert_answer = r(&mut record, 1)? != 0;
@@ -3993,10 +3995,6 @@ impl ChannelAssignmentMessage {
             }
             if matches!(encrypt_mode, 0b10 | 0b11) {
                 let _enc_key_size = r(&mut record, 3)?;
-            }
-            let c_sig_encrypt_mode_incl = r(&mut record, 1)? != 0;
-            if c_sig_encrypt_mode_incl {
-                let _c_sig_encrypt_mode = r(&mut record, 3)?;
             }
             Ok(Self {
                 assign_mode,
@@ -4070,31 +4068,33 @@ mod channel_assignment_tests {
 
     #[test]
     fn cam_assign_mode_100_uses_add_record_len_and_no_plcm_fields() {
-        let cam = ChannelAssignmentMessage::new_extended_traffic_assignment(12, 4, 0b000);
+        let cam = ChannelAssignmentMessage::new_extended_traffic_assignment(
+            12,
+            4,
+            CHANNEL_DEFAULT_CONFIG_RC1_RC1,
+            ChannelAssignmentGrantedMode::RequestedService,
+            false,
+        );
         let mut sdu = cam.to_sdu();
 
-        assert_eq!(sdu.len(), 38);
+        assert_eq!(sdu.len(), 30);
         assert_eq!(sdu.read_bits(3).unwrap(), 0b100);
-        assert_eq!(sdu.read_bits(3).unwrap(), 4); // ADD_RECORD_LEN
+        assert_eq!(sdu.read_bits(3).unwrap(), 3); // ADD_RECORD_LEN
         assert_eq!(sdu.read_bits(1).unwrap(), 0); // FREQ_INCL
         assert_eq!(sdu.read_bits(3).unwrap(), 0); // RESERVED
-        assert_eq!(sdu.read_bits(1).unwrap(), 1); // BYPASS_ALERT_ANSWER
+        assert_eq!(sdu.read_bits(1).unwrap(), 0); // BYPASS_ALERT_ANSWER
         assert_eq!(sdu.read_bits(3).unwrap(), 0); // DEFAULT_CONFIG
-        assert_eq!(sdu.read_bits(2).unwrap(), 0); // GRANTED_MODE
+        assert_eq!(sdu.read_bits(2).unwrap(), 0b10); // GRANTED_MODE
         assert_eq!(sdu.read_bits(8).unwrap(), 12); // CODE_CHAN
         assert_eq!(sdu.read_bits(4).unwrap(), 4); // FRAME_OFFSET
         assert_eq!(sdu.read_bits(2).unwrap(), 0); // ENCRYPT_MODE
-        assert_eq!(sdu.read_bits(1).unwrap(), 0); // C_SIG_ENCRYPT_MODE_INCL
-        assert_eq!(sdu.read_bits(7).unwrap(), 0); // RESERVED padding
-
         let mut decode_sdu = cam.to_sdu();
         let decoded = ChannelAssignmentMessage::from_sdu(&mut decode_sdu).unwrap();
         assert_eq!(decoded.assign_mode, 0b100);
         assert_eq!(decoded.code_chan, 12);
         assert_eq!(decoded.frame_offset, 4);
         assert_eq!(decoded.default_config, Some(0));
-        assert_eq!(decoded.granted_mode, Some(0));
-        assert_eq!(decoded.plcm_type_incl, None);
+        assert_eq!(decoded.granted_mode, Some(0b10));
     }
 }
 
@@ -4185,11 +4185,11 @@ impl ExtendedChannelAssignmentMessage {
     /// DEFAULT_CONFIG entry.
     fn default_config_for_rcs(for_rc: u8, rev_rc: u8) -> u8 {
         match (for_rc, rev_rc) {
-            (1, 1) => 0b000,
-            (2, 2) => 0b001,
-            (1, 2) => 0b010,
-            (2, 1) => 0b011,
-            _ => 0b100, // explicit RC from FOR_RC/REV_RC
+            (1, 1) => CHANNEL_DEFAULT_CONFIG_RC1_RC1,
+            (2, 2) => CHANNEL_DEFAULT_CONFIG_RC2_RC2,
+            (1, 2) => CHANNEL_DEFAULT_CONFIG_RC1_RC2,
+            (2, 1) => CHANNEL_DEFAULT_CONFIG_RC2_RC1,
+            _ => CHANNEL_DEFAULT_CONFIG_EXPLICIT_RCS,
         }
     }
 
@@ -4202,7 +4202,7 @@ impl ExtendedChannelAssignmentMessage {
         early_rl_transmit_ind: bool,
     ) -> Self {
         Self {
-            assign_mode: 0b100,
+            assign_mode: CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC,
             direct_ch_assign_ind: false,
             raw_additional_record_fields: None,
             freq_incl: false,
@@ -4211,7 +4211,7 @@ impl ExtendedChannelAssignmentMessage {
             bypass_alert_answer: false,
             // GRANTED_MODE=10: use FOR_RC/REV_RC fields, derive mux option
             // from RC per Table 3.7.2.3.2.21-3. Matches working Anritsu trace.
-            granted_mode: 0b10,
+            granted_mode: ChannelAssignmentGrantedMode::RequestedService as u8,
             sr_id_restore: None,
             sr_id_restore_bitmap: None,
             default_config: Self::default_config_for_rcs(for_rc, rev_rc),

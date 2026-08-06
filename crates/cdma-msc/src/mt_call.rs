@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use log::{info, warn};
 
+use cdma_common::consts::SERVICE_OPTION_REJECTED;
 use cdma_common::lac::paging_messages::CallingPartyNumberRecord;
 use cdma_hlr::repository::HlrRepository;
 use cdma_ios::{EncodedA1Message, MsInformationRecord, MsInformationRecords, VoiceBearerManager};
@@ -25,6 +26,20 @@ pub(crate) struct MtCallService {
     /// Caller-ID digits per active MT call. Outlives `mt_plans`; read at
     /// AssignmentComplete to build the AWI calling-party record.
     pub(crate) caller_numbers: HashMap<CallId, String>,
+}
+
+fn resolve_assignment_service_option(
+    response_service_option: Option<u16>,
+    requested_service_option: Option<u16>,
+    default_voice_service_option: u16,
+) -> u16 {
+    if response_service_option == Some(SERVICE_OPTION_REJECTED) {
+        default_voice_service_option
+    } else {
+        response_service_option
+            .or(requested_service_option)
+            .unwrap_or(default_voice_service_option)
+    }
 }
 
 impl MtCallService {
@@ -68,11 +83,31 @@ impl MtCallService {
             self.caller_numbers.insert(call_id, digits.clone());
         }
         let audio_file = mt_plan.as_ref().and_then(|p| p.audio_file.clone());
-        let service_option = mt_plan
-            .as_ref()
-            .map(|p| p.service_option)
-            .or(response.service_option.map(|so| so.0))
-            .unwrap_or(default_voice_service_option);
+        let requested_service_option =
+            mt_plan
+                .as_ref()
+                .map(|plan| plan.service_option)
+                .or_else(|| {
+                    circuits
+                        .paging_requests
+                        .get(&call_id)
+                        .and_then(|request| request.service_option)
+                        .map(|service_option| service_option.0)
+                });
+        let response_service_option = response
+            .service_option
+            .map(|service_option| service_option.0);
+        if response_service_option == Some(SERVICE_OPTION_REJECTED) {
+            info!(
+                "MSC: mobile rejected paged SO{:?} for call_id={}; selecting alternative SO{}",
+                requested_service_option, call_id.0, default_voice_service_option
+            );
+        }
+        let service_option = resolve_assignment_service_option(
+            response_service_option,
+            requested_service_option,
+            default_voice_service_option,
+        );
 
         let circuit_id = cic.to_packed();
         circuits.insert_circuit_session(
@@ -120,10 +155,17 @@ impl MtCallService {
         };
 
         let a2p_bearer_format_params = a2p_bearer_session_params.as_ref().map(|_| {
-            cdma_ios::A2pBearerFormatParams::evrc_with_telephone_event(
-                cdma_ios::voice_bearer::EVRC_RTP_PAYLOAD_TYPE,
+            cdma_ios::A2pBearerFormatParams::for_service_option_with_telephone_event(
+                cdma_ios::ServiceOption(service_option),
+                cdma_ios::voice_bearer::VOICE_RTP_PAYLOAD_TYPE,
                 cdma_ios::voice_bearer::TELEPHONE_EVENT_RTP_PAYLOAD_TYPE,
             )
+            .unwrap_or_else(|| {
+                cdma_ios::A2pBearerFormatParams::evrc_with_telephone_event(
+                    cdma_ios::voice_bearer::EVRC_RTP_PAYLOAD_TYPE,
+                    cdma_ios::voice_bearer::TELEPHONE_EVENT_RTP_PAYLOAD_TYPE,
+                )
+            })
         });
         if let (Some(bearer), Some(format_params)) =
             (voice_bearer, a2p_bearer_format_params.as_ref())
@@ -131,9 +173,12 @@ impl MtCallService {
             bearer.set_circuit_payload_types(
                 circuit_id,
                 cdma_ios::BearerPayloadTypes {
-                    evrc: format_params
-                        .evrc_pt()
-                        .unwrap_or(cdma_ios::voice_bearer::EVRC_RTP_PAYLOAD_TYPE),
+                    voice: format_params.voice_payload_type().unwrap_or(
+                        cdma_ios::VoiceBearerPayloadType {
+                            format: cdma_ios::VoiceBearerFormat::Evrc,
+                            payload_type: cdma_ios::voice_bearer::EVRC_RTP_PAYLOAD_TYPE,
+                        },
+                    ),
                     telephone_event: format_params.telephone_event_pt(),
                 },
             );
@@ -148,7 +193,7 @@ impl MtCallService {
             },
             circuit_identity_code: cic,
             encryption_information: None,
-            service_option: response.service_option,
+            service_option: Some(cdma_ios::ServiceOption(service_option)),
             signals: Vec::new(),
             ms_information_records,
             priority: None,
@@ -214,6 +259,38 @@ impl MtCallService {
                 error
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_assignment_service_option;
+    use cdma_common::consts::{
+        SERVICE_OPTION_EVRC_A, SERVICE_OPTION_QCELP13, SERVICE_OPTION_REJECTED,
+    };
+
+    #[test]
+    fn rejected_paged_service_option_selects_configured_alternative() {
+        assert_eq!(
+            resolve_assignment_service_option(
+                Some(SERVICE_OPTION_REJECTED),
+                Some(SERVICE_OPTION_EVRC_A),
+                SERVICE_OPTION_QCELP13,
+            ),
+            SERVICE_OPTION_QCELP13
+        );
+    }
+
+    #[test]
+    fn mobile_alternative_overrides_paged_service_option() {
+        assert_eq!(
+            resolve_assignment_service_option(
+                Some(SERVICE_OPTION_QCELP13),
+                Some(SERVICE_OPTION_EVRC_A),
+                SERVICE_OPTION_EVRC_A,
+            ),
+            SERVICE_OPTION_QCELP13
+        );
     }
 }
 

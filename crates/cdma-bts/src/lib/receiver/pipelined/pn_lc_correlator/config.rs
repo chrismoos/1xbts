@@ -154,6 +154,12 @@ pub struct PnLcConfig {
     /// Set true for reverse access fingers; false for traffic.
     pub access_cfo: bool,
 
+    /// Update CFO from the legacy non-pilot block-coherence estimator.
+    ///
+    /// This is unsuitable for gated RC1/RC2 traffic because most blocks can
+    /// contain no transmission and 64-ary traffic is not a pilot.
+    pub nonpilot_cfo_tracking: bool,
+
     /// Refine the integer FFT delay to a fractional sample position during
     /// candidate verification, then use interpolation in each spawned finger.
     ///
@@ -241,6 +247,7 @@ impl PnLcConfig {
             enable_epl_slew: false,
             epl_pilot: false,
             access_cfo: false,
+            nonpilot_cfo_tracking: true,
             fractional_timing_recovery: false,
             fractional_timing_half_samples: 0.5,
             fractional_timing_step_samples: 0.125,
@@ -336,6 +343,11 @@ impl PnLcConfig {
 
     pub fn with_access_cfo(mut self, enable: bool) -> Self {
         self.access_cfo = enable;
+        self
+    }
+
+    pub fn with_nonpilot_cfo_tracking(mut self, enable: bool) -> Self {
+        self.nonpilot_cfo_tracking = enable;
         self
     }
 

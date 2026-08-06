@@ -8,7 +8,7 @@
   "clock_source": null,
   "time_source": null,
   "rx_antenna": "RX2",
-  "rx_gain_db": 45.0,
+  "rx_gain_db": 30.0,
   "rx_reference_dbm": null,
   "rx_power_adj": 0.0,
   "rx_sample_delay": 50,

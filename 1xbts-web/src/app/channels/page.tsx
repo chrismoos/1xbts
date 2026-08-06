@@ -3,6 +3,8 @@
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { Card } from "@/components/card";
+import { radioConfigPairName } from "@/lib/radio-config";
+import { serviceOptionName } from "@/lib/service-option";
 
 interface ChannelMobile {
   address: string;
@@ -21,6 +23,7 @@ interface TrafficChannelPower {
   effectiveTargetEbNtDb: number;
   manualTargetOverrideDb?: number;
   reversePilotEcIoDb?: number;
+  forwardRadioConfig: number;
   reverseRadioConfig: number;
 }
 
@@ -64,21 +67,6 @@ function qualityColor(pct: number): string {
   if (pct >= 90) return "text-accent-green";
   if (pct >= 75) return "text-accent-amber";
   return "text-accent-red";
-}
-
-function serviceOptionName(so: number): string {
-  switch (so) {
-    case 1: return "Voice (IS-96A)";
-    case 2: return "Loopback";
-    case 3: return "Voice (EVRC)";
-    case 6: return "SMS";
-    case 7: return "Data (Async)";
-    case 32: return "Voice (13k)";
-    case 33: return "Data (IS-707)";
-    case 68: return "Voice (EVRC-B)";
-    case 73: return "Voice (EVRC-NW)";
-    default: return `SO ${so}`;
-  }
 }
 
 function channelName(ch: Channel): string {
@@ -286,6 +274,10 @@ function ChannelTable({
               ch.trafficPower != null;
             const isRc3 = ch.trafficPower?.reverseRadioConfig === 3;
             const reversePowerMetric = isRc3 ? "Pilot SINR" : "Eb/Nt";
+            const radioConfigs = radioConfigPairName(
+              ch.trafficPower?.forwardRadioConfig,
+              ch.trafficPower?.reverseRadioConfig,
+            );
             const draftValue =
               canControlPower && ch.walshCode != null
                 ? powerDrafts[ch.walshCode] ??
@@ -330,8 +322,12 @@ function ChannelTable({
                       {ch.dataRateBps ? `${ch.dataRateBps} bps` : ""}
                     </span>
                   )}
-                  {ch.channelType === "traffic" && ch.serviceOption != null && (
-                    <span>{serviceOptionName(ch.serviceOption)}</span>
+                  {ch.channelType === "traffic" && (
+                    <span>
+                      {[radioConfigs, ch.serviceOption != null ? serviceOptionName(ch.serviceOption) : null]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </span>
                   )}
                 </td>
                 <td className="py-2 text-xs">

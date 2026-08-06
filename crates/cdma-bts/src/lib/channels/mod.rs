@@ -2,6 +2,7 @@ pub mod f_sch_rc3;
 pub mod fpch;
 pub mod fsch;
 pub mod ftch;
+pub mod ftch_rc2;
 pub mod ftch_rc3;
 pub mod pilot;
 pub mod rtch;

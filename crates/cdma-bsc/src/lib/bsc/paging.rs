@@ -862,7 +862,11 @@ impl Bsc {
                     .get_by_session_leg(pending.session_id, VoiceLegRole::Caller)
                     .map(|ms| ms.fwd_address.clone());
                 if let Some(addr) = caller_addr {
-                    self.begin_voice_release(&addr, 0b111, "voice page failure");
+                    self.begin_voice_release(
+                        &addr,
+                        super::DEFAULT_TRAFFIC_ACK_SEQ,
+                        "voice page failure",
+                    );
                 }
                 // A.S0014 cause 0x6E = "Paging response not received".
                 if let Some(call_id) = pending.a1_call_id {
@@ -973,7 +977,11 @@ impl Bsc {
                     .get_by_session_leg(pending.session_id, VoiceLegRole::Caller)
                     .map(|ms| ms.fwd_address.clone());
                 if let Some(addr) = caller_addr {
-                    self.begin_voice_release(&addr, 0b111, "voice page timeout");
+                    self.begin_voice_release(
+                        &addr,
+                        super::DEFAULT_TRAFFIC_ACK_SEQ,
+                        "voice page timeout",
+                    );
                 }
                 // A.S0014 cause 0x6E = "Paging response not received".
                 if let Some(call_id) = pending.a1_call_id {

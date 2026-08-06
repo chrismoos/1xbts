@@ -68,12 +68,14 @@ pub struct TrafficChannelPowerSnapshot {
     /// fields via `-raw/2.0`. Empty if no PMRM received or the mobile
     /// reported 0 pilots.
     pub forward_pilot_ec_io_db: Vec<f32>,
-    /// Per-PCG pilot Ec/Nt (RC3) or data Eb/Nt (RC1) used by the
+    /// Per-PCG pilot Ec/Nt (RC3) or data Eb/Nt (RC1/RC2) used by the
     /// inner-loop power control. Updated live by per-PCG measurements.
     /// Separate from `last_pcg_snr_db` which carries the per-frame
     /// data Eb/Nt snapshot only.
     pub last_pcg_pilot_ec_nt_db: Option<[f32; 16]>,
-    /// Reverse radio configuration (1 = RC1, 3 = RC3, etc.).
+    /// Forward radio configuration assigned to the traffic channel.
+    pub forward_radio_config: u32,
+    /// Reverse radio configuration assigned to the traffic channel.
     pub reverse_radio_config: u32,
     /// Time-series history of 500ms-windowed power control measurements
     /// for the UI chart.

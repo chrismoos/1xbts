@@ -24,7 +24,7 @@ use super::handle::TrafficRxRequest;
 use super::resource_controller::TrafficResourceController;
 use super::traffic_lac::{TrafficArqConfig, TrafficChannelArqState, TrafficLacEvent};
 use crate::lac::message_types::{MessageId, WireChannel};
-use crate::lac::paging_messages::ExtendedChannelAssignmentMessage;
+use crate::lac::paging_messages::{ChannelAssignmentMessage, ExtendedChannelAssignmentMessage};
 use crate::phy::coding::long_code::LongCodeGenerator;
 use cdma_common::bits::Bitstream;
 
@@ -348,31 +348,58 @@ impl TrafficSetupService {
         aim: &cdma_abis::control::typed::AirInterfaceMessagePayload,
         events: &mut Vec<AbisAgentEvent>,
     ) -> bool {
+        let cam_wire = MessageId::ChannelAssignment
+            .wire_type(WireChannel::ForwardCommon)
+            .unwrap();
         let ecam_wire = MessageId::ExtChannelAssignment
             .wire_type(WireChannel::ForwardCommon)
             .unwrap();
-        if aim.message_type != ecam_wire {
-            return false;
-        }
-
-        let mut bs = Bitstream::new_bytes(&aim.message);
-        let ecam = match ExtendedChannelAssignmentMessage::from_sdu(&mut bs) {
-            Ok(e) => e,
-            Err(e) => {
-                warn!("traffic_setup: ECAM decode failed: {e}");
-                return true;
-            }
-        };
-
-        let ecam_walsh = ecam.pilots.first().map(|p| p.code_chan_fch as u8);
-        let Some(walsh_code) = ecam_walsh else {
-            warn!("traffic_setup: ECAM has no pilot records");
-            return true;
-        };
+        let (walsh_code, for_rc, rev_rc, fpc_subchan_gain, rev_fch_gating_mode, kind) =
+            if aim.message_type == cam_wire {
+                let mut bs = Bitstream::new_bytes(&aim.message);
+                let cam = match ChannelAssignmentMessage::from_sdu(&mut bs) {
+                    Ok(cam) => cam,
+                    Err(e) => {
+                        warn!("traffic_setup: CAM decode failed: {e}");
+                        return true;
+                    }
+                };
+                let (for_rc, rev_rc) = match super::abis_agent::cam_radio_config(&cam) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        warn!("traffic_setup: {e}");
+                        return true;
+                    }
+                };
+                (cam.code_chan, for_rc, rev_rc, 0, false, "CAM")
+            } else if aim.message_type == ecam_wire {
+                let mut bs = Bitstream::new_bytes(&aim.message);
+                let ecam = match ExtendedChannelAssignmentMessage::from_sdu(&mut bs) {
+                    Ok(ecam) => ecam,
+                    Err(e) => {
+                        warn!("traffic_setup: ECAM decode failed: {e}");
+                        return true;
+                    }
+                };
+                let Some(walsh_code) = ecam.pilots.first().map(|p| p.code_chan_fch as u8) else {
+                    warn!("traffic_setup: ECAM has no pilot records");
+                    return true;
+                };
+                (
+                    walsh_code,
+                    ecam.for_rc,
+                    ecam.rev_rc,
+                    ecam.fpc_subchan_gain,
+                    ecam.rev_fch_gating_mode,
+                    "ECAM",
+                )
+            } else {
+                return false;
+            };
 
         info!(
-            "traffic_setup: ECAM decoded walsh={} for_rc={} rev_rc={} fpc_subchan_gain={}",
-            walsh_code, ecam.for_rc, ecam.rev_rc, ecam.fpc_subchan_gain
+            "traffic_setup: {} decoded walsh={} for_rc={} rev_rc={} fpc_subchan_gain={}",
+            kind, walsh_code, for_rc, rev_rc, fpc_subchan_gain
         );
 
         let Some((_ccr, session)) = self
@@ -395,22 +422,27 @@ impl TrafficSetupService {
             return true;
         };
 
-        let is_rc3 = ecam.for_rc >= 3;
-        if is_rc3 {
-            self.controller
-                .commit_rc3_traffic(walsh_code, lc_gen, ecam.fpc_subchan_gain);
-        } else {
-            self.controller
-                .commit_rc1_traffic(walsh_code, lc_gen, ecam.fpc_subchan_gain);
+        match for_rc {
+            r if r >= 3 => {
+                self.controller
+                    .commit_rc3_traffic(walsh_code, lc_gen, fpc_subchan_gain);
+            }
+            2 => {
+                self.controller
+                    .commit_rc2_traffic(walsh_code, lc_gen, fpc_subchan_gain);
+            }
+            _ => {
+                self.controller
+                    .commit_rc1_traffic(walsh_code, lc_gen, fpc_subchan_gain);
+            }
         }
 
-        let assigned_rev_rc = ecam.rev_rc;
         let rx_request = TrafficRxRequest {
             walsh_code,
             esn: session.esn,
-            assigned_rev_rc,
+            assigned_rev_rc: rev_rc,
             preamble_num_pcgs: None,
-            rev_fch_gating_mode: ecam.rev_fch_gating_mode,
+            rev_fch_gating_mode,
         };
         self.controller.install_rx_request(rx_request);
         session.committed = true;
@@ -422,7 +454,7 @@ impl TrafficSetupService {
         let ccr = *_ccr;
         info!(
             "traffic_setup: committed traffic channel walsh={} RC{}/{} for CCR {:?}",
-            walsh_code, ecam.for_rc, ecam.rev_rc, ccr
+            walsh_code, for_rc, rev_rc, ccr
         );
 
         events.push(AbisAgentEvent::TrafficConnected { ccr, walsh_code });

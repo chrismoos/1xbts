@@ -39,6 +39,8 @@ enum ServiceOption {
   SERVICE_OPTION_EVRC_B = 68;
   // SO70 — extended SMS encoding.
   SERVICE_OPTION_SMS_EXT = 70;
+  // SO32768 — 13 kbps QCELP voice.
+  SERVICE_OPTION_QCELP_13K = 32768;
 }
 
 // A packet-data session has been torn down: the IP is released.

@@ -37,6 +37,8 @@ import { hrpdTimestampNsToUs } from "@/lib/hrpd-correlation";
 import { type LogEntry, makeLogEntryId, makeSortKey, sortLogEntries, formatTime } from "@/lib/message-log";
 import { formatEsn, formatMeid } from "@/lib/format";
 import { isSyntheticPacketMobileAddress } from "@/lib/mobile-directory";
+import { radioConfigName, radioConfigPairName } from "@/lib/radio-config";
+import { serviceOptionName } from "@/lib/service-option";
 import type { AccessEvent, PagingEvent, TrafficEvent } from "@/lib/proto/bsc/v1/service";
 import type {
   HrpdAccessEvent,
@@ -78,6 +80,7 @@ interface MobileInfo {
     forwardPmrmCount: number;
     forwardPilotEcIoDb?: number[];
     lastPcgPilotEcNtDb: number[];
+    forwardRadioConfig: number;
     reverseRadioConfig: number;
     powerHistory?: {
       timestampMs: number;
@@ -138,17 +141,19 @@ const MAX_MESSAGES = 200;
 
 function countActivePcgs(pcgSnrDb: number[], activePcgMask?: boolean[]): number {
   if (activePcgMask && activePcgMask.length === pcgSnrDb.length) {
-    return activePcgMask.filter(Boolean).length;
+    return activePcgMask.filter((active, index) => active && Number.isFinite(pcgSnrDb[index])).length;
   }
-  if (pcgSnrDb.length === 0) return 0;
-  const max = Math.max(...pcgSnrDb);
-  return pcgSnrDb.filter((v) => v >= max - 10).length;
+  const finite = pcgSnrDb.filter((value) => Number.isFinite(value));
+  if (finite.length === 0) return 0;
+  const max = Math.max(...finite);
+  return finite.filter((value) => value >= max - 10).length;
 }
 
 function getGatedCutoffDb(pcgSnrDb: number[], activePcgMask?: boolean[]): number | null {
   if (activePcgMask && activePcgMask.length === pcgSnrDb.length) return null;
-  if (pcgSnrDb.length === 0) return null;
-  return Math.max(...pcgSnrDb) - 10;
+  const finite = pcgSnrDb.filter((value) => Number.isFinite(value));
+  if (finite.length === 0) return null;
+  return Math.max(...finite) - 10;
 }
 
 function getFrameMetricPcgIndices(
@@ -156,11 +161,17 @@ function getFrameMetricPcgIndices(
   activePcgMask?: boolean[],
 ): number[] {
   if (pcgSnrDb.length === 0) return [];
-  const fallbackCutoff = Math.max(...pcgSnrDb) - 10;
+  const finite = pcgSnrDb.filter((value) => Number.isFinite(value));
+  if (finite.length === 0) return [];
+  const fallbackCutoff = Math.max(...finite) - 10;
   const candidateIndices =
     activePcgMask && activePcgMask.length === pcgSnrDb.length
-      ? activePcgMask.flatMap((active, index) => (active ? [index] : []))
-      : pcgSnrDb.flatMap((db, index) => (db >= fallbackCutoff ? [index] : []));
+      ? activePcgMask.flatMap((active, index) =>
+          active && Number.isFinite(pcgSnrDb[index]) ? [index] : [],
+        )
+      : pcgSnrDb.flatMap((db, index) =>
+          Number.isFinite(db) && db >= fallbackCutoff ? [index] : [],
+        );
   if (candidateIndices.length === 0) return [];
   const max = candidateIndices
     .map((index) => pcgSnrDb[index])
@@ -183,6 +194,7 @@ function isActivePcg(
   gatedCutoff: number | null,
   activePcgMask?: boolean[],
 ): boolean {
+  if (!Number.isFinite(db)) return false;
   if (activePcgMask && index < activePcgMask.length) {
     return activePcgMask[index];
   }
@@ -311,7 +323,7 @@ export default function MobileDetailPage({
         h.target.push(ms.trafficPower.effectiveTargetEbNtDb);
         const pilotPcg = ms.trafficPower.lastPcgPilotEcNtDb ?? [];
         const pcg = pilotPcg.length > 0 ? pilotPcg : (ms.trafficPower.lastPcgSnrDb ?? []);
-        const valid = pcg.filter((v) => isFinite(v));
+        const valid = pcg.filter((value) => Number.isFinite(value));
         h.measured.push(valid.length > 0 ? valid.reduce((a, b) => a + b, 0) / valid.length : NaN);
         h.forwardGain.push(ms.trafficPower.forwardGainOffsetDb);
         h.fer.push(ms.trafficPower.ferPct);
@@ -715,8 +727,14 @@ export default function MobileDetailPage({
   const provisionedMeid = primarySubscriberIdentity?.meid ? formatMeid(primarySubscriberIdentity.meid) : null;
   const canCreateSubscriber = !mobile.subscriberId && Boolean(mobile.imsi) && (mobile.esn != null || Boolean(mobile.meid));
   const trafficPower = mobile.trafficPower;
-  const isRc3 = (trafficPower?.reverseRadioConfig ?? 0) === 3;
-  // Inner-loop metric: pilot SINR (RC3) or Eb/Nt (RC1); falls back to frame snapshot.
+  const forwardRcName = radioConfigName(trafficPower?.forwardRadioConfig);
+  const reverseRcName = radioConfigName(trafficPower?.reverseRadioConfig);
+  const radioConfigPair = radioConfigPairName(
+    trafficPower?.forwardRadioConfig,
+    trafficPower?.reverseRadioConfig,
+  );
+  const isRc3 = trafficPower?.reverseRadioConfig === 3;
+  // Inner-loop metric: pilot SINR (RC3) or Eb/Nt (RC1/RC2); falls back to frame snapshot.
   const pilotArr = trafficPower?.lastPcgPilotEcNtDb ?? [];
   const innerLoopPcgDb =
     pilotArr.length > 0
@@ -1089,15 +1107,16 @@ export default function MobileDetailPage({
                   <div className="text-[11px] uppercase tracking-wide text-muted">Service Option</div>
                   <div className="mt-1 font-mono text-sm text-primary">
                     {mobile.trafficServiceOption != null
-                      ? `SO${mobile.trafficServiceOption}${
-                          mobile.trafficServiceOption === 6 ? " (SMS)" :
-                          mobile.trafficServiceOption === 3 ? " (EVRC)" :
-                          mobile.trafficServiceOption === 17 ? " (EVRC)" :
-                          mobile.trafficServiceOption === 68 ? " (EVRC-B)" :
-                          mobile.trafficServiceOption === 73 ? " (EVRC-NW)" : ""
-                        }`
+                      ? serviceOptionName(mobile.trafficServiceOption)
                       : "Unknown"}
                   </div>
+                </div>
+                <div className="rounded-md border border-border bg-surface px-3 py-2">
+                  <div className="text-[11px] uppercase tracking-wide text-muted">Radio Configuration</div>
+                  <div className="mt-1 font-mono text-sm text-primary">
+                    {radioConfigPair ?? "Unknown"}
+                  </div>
+                  <div className="text-[11px] text-muted">forward / reverse</div>
                 </div>
                 <div className="rounded-md border border-border bg-surface px-3 py-2">
                   <div className="text-[11px] uppercase tracking-wide text-muted">Channel State</div>
@@ -1125,7 +1144,7 @@ export default function MobileDetailPage({
                 return (
                   <section className="rounded-lg border border-border bg-surface p-4 mb-4">
                     <div className="mb-3">
-                      <div className="text-sm font-medium text-primary">Power Control — Live {isRc3 ? "(RC3)" : "(RC1)"}</div>
+                      <div className="text-sm font-medium text-primary">Power Control — Live {radioConfigPair ? `(${radioConfigPair})` : ""}</div>
                       <div className="text-xs text-muted">
                         {Math.round((h.timestamps[h.timestamps.length - 1] - h.timestamps[0]) / 1000)}s window · 100ms granularity · Target (dashed) vs Measured {metricLabel} · Forward gain offset
                       </div>
@@ -1155,7 +1174,9 @@ export default function MobileDetailPage({
               <div className="grid gap-4 xl:grid-cols-2">
                 <section className="rounded-lg border border-border bg-surface p-4">
                   <div className="mb-4">
-                    <div className="text-sm font-medium text-primary">Reverse Power Control {isRc3 ? "(RC3 — Pilot SINR)" : "(RC1 — Data Eb/Nt)"}</div>
+                    <div className="text-sm font-medium text-primary">
+                      Reverse Power Control ({reverseRcName ?? "Unknown RC"} — {isRc3 ? "Pilot SINR" : "Data Eb/Nt"})
+                    </div>
                     <div className="text-xs text-muted">
                       Closed-loop reverse traffic measurements, live per-PCG PCB scheduling, and bad-frame accounting.
                     </div>
@@ -1372,8 +1393,8 @@ export default function MobileDetailPage({
                                 )}
                               </div>
                             </div>
-                            <div className="mt-1 font-mono text-sm">{db != null && isFinite(db) ? `${db.toFixed(2)} dB` : "---"}</div>
-                            {isRc3 && active && frameDb != null && isFinite(frameDb) && (
+                            <div className="mt-1 font-mono text-sm">{db != null && Number.isFinite(db) ? `${db.toFixed(2)} dB` : "---"}</div>
+                            {isRc3 && active && frameDb != null && Number.isFinite(frameDb) && (
                               <div className="mt-0.5 font-mono text-[10px] text-muted" title="Per-frame data Eb/Nt from decoded traffic">
                                 Eb/Nt {frameDb.toFixed(1)}
                               </div>
@@ -1387,7 +1408,9 @@ export default function MobileDetailPage({
 
                 <section className="rounded-lg border border-border bg-surface p-4">
                   <div className="mb-4">
-                    <div className="text-sm font-medium text-primary">Forward Power Control</div>
+                    <div className="text-sm font-medium text-primary">
+                      Forward Power Control {forwardRcName ? `(${forwardRcName})` : ""}
+                    </div>
                     <div className="text-xs text-muted">
                       PMRM-reported forward FER and the current F-FCH gain walk for this channel.
                     </div>

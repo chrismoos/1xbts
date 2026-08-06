@@ -17,9 +17,8 @@ pub(crate) enum PendingA1AssignmentKind {
     Voice {
         session_id: uuid::Uuid,
         leg_role: VoiceLegRole,
-        /// Original Origination SO when the access path remapped the call
-        /// to a different internal SO. Carried onto the traffic channel as
-        /// `origination_service_option` to drive F-TCH SO renegotiation.
+        /// Air-interface SO proposal used to determine whether traffic-channel
+        /// service negotiation must request a different SO.
         renegotiate_from_so: Option<u16>,
     },
     SmsTraffic,
@@ -235,7 +234,7 @@ impl Bsc {
                 .and_then(|s| s.calling_party_record.clone())
         });
 
-        // ack_seq 0b111 is the documented default for air-interface AWIM.
+        // AWIM uses the default traffic ACK sequence when no reverse message is acknowledged.
         let (send_result, mode, log_label) = match leg_role {
             Some(VoiceLegRole::Callee) => {
                 // Fall back to the AssignmentRequest-stashed record for senders
@@ -246,13 +245,17 @@ impl Bsc {
                     .and_then(extract_calling_party_number_record)
                     .or(stashed_calling_party);
                 (
-                    self.send_standard_alert(walsh_code, 0b111, calling_party),
+                    self.send_standard_alert(
+                        walsh_code,
+                        super::DEFAULT_TRAFFIC_ACK_SEQ,
+                        calling_party,
+                    ),
                     VoiceAlertMode::WaitForConnectOrder,
                     "standard alert",
                 )
             }
             _ => (
-                self.send_alert_with_info(walsh_code, 0b111, None),
+                self.send_alert_with_info(walsh_code, super::DEFAULT_TRAFFIC_ACK_SEQ, None),
                 VoiceAlertMode::WaitForPeerAnswer,
                 "ringback",
             ),
@@ -330,7 +333,11 @@ impl Bsc {
             alert_pitch: signal.alert_pitch,
             signal: signal.signal_value,
         };
-        if let Err(error) = self.send_alert_with_info_signal(walsh_code, 0b111, signal_info) {
+        if let Err(error) = self.send_alert_with_info_signal(
+            walsh_code,
+            super::DEFAULT_TRAFFIC_ACK_SEQ,
+            signal_info,
+        ) {
             warn!(
                 "BSC: failed to forward MSC Progress signal to MS on walsh={}: {}",
                 walsh_code, error
@@ -455,10 +462,17 @@ impl A1Service {
                 udp_port: addr.port(),
             });
         let a2p_bearer_format_params = a2p_bearer_session_params.as_ref().map(|_| {
-            cdma_ios::A2pBearerFormatParams::evrc_with_telephone_event(
-                cdma_ios::voice_bearer::EVRC_RTP_PAYLOAD_TYPE,
+            cdma_ios::A2pBearerFormatParams::for_service_option_with_telephone_event(
+                cdma_ios::ServiceOption(service_option),
+                cdma_ios::voice_bearer::VOICE_RTP_PAYLOAD_TYPE,
                 cdma_ios::voice_bearer::TELEPHONE_EVENT_RTP_PAYLOAD_TYPE,
             )
+            .unwrap_or_else(|| {
+                cdma_ios::A2pBearerFormatParams::evrc_with_telephone_event(
+                    cdma_ios::voice_bearer::EVRC_RTP_PAYLOAD_TYPE,
+                    cdma_ios::voice_bearer::TELEPHONE_EVENT_RTP_PAYLOAD_TYPE,
+                )
+            })
         });
         let assignment_complete = cdma_ios::AssignmentCompleteMessage {
             channel_number: cdma_ios::ChannelNumber(walsh_code as u16),
@@ -699,6 +713,9 @@ impl Bsc {
             is2000_mobile_capabilities: None,
             cdma_serving_one_way_delay: None,
         };
+        let response_service_option = paging_response
+            .service_option
+            .map(|service_option| service_option.0);
         let encoded = match paging_response.encode() {
             Ok(payload) => EncodedA1Message::from_message_for_call(
                 &cdma_ios::Message::new(cdma_ios::MessageType::PagingResponse, payload),
@@ -727,7 +744,7 @@ impl Bsc {
                 kind: PendingA1AssignmentKind::Voice {
                     session_id: pending.session_id,
                     leg_role: pending.leg_role,
-                    renegotiate_from_so: None,
+                    renegotiate_from_so: response_service_option,
                 },
                 bind_existing_traffic: false,
             },
@@ -1108,6 +1125,13 @@ impl Bsc {
             return;
         }
 
+        if let Some(pending) = self.voice.take_deferred_page_for_a1_call(call_id) {
+            self.voice
+                .retain_sessions(|session| session.id != pending.session_id);
+            self.a1.send_clear_complete(call_id, false);
+            return;
+        }
+
         let Some((fwd_address, walsh_code)) = self.mobiles.locate_a1_call(call_id) else {
             info!(
                 "BSC: A1 Clear Command for call_id={} arrived after local teardown; sending Clear Complete",
@@ -1127,7 +1151,11 @@ impl Bsc {
         };
 
         if !already_releasing {
-            self.begin_voice_release(&fwd_address, 0b111, "A1 Clear Command");
+            self.begin_voice_release(
+                &fwd_address,
+                super::DEFAULT_TRAFFIC_ACK_SEQ,
+                "A1 Clear Command",
+            );
         }
     }
 
@@ -1299,9 +1327,12 @@ fn apply_negotiated_bearer_payload_types(
     bearer.set_circuit_payload_types(
         circuit_id,
         cdma_ios::BearerPayloadTypes {
-            evrc: params
-                .evrc_pt()
-                .unwrap_or(cdma_ios::voice_bearer::EVRC_RTP_PAYLOAD_TYPE),
+            voice: params
+                .voice_payload_type()
+                .unwrap_or(cdma_ios::VoiceBearerPayloadType {
+                    format: cdma_ios::VoiceBearerFormat::Evrc,
+                    payload_type: cdma_ios::voice_bearer::EVRC_RTP_PAYLOAD_TYPE,
+                }),
             telephone_event: params.telephone_event_pt(),
         },
     );
@@ -1564,7 +1595,9 @@ mod tests {
     };
     use crate::a1_edge::{EncodedA1Message, InProcessMscClient};
     use crate::bsc::tests::test_bsc_with_active_traffic_channel;
-    use crate::bsc::{PendingA1Assignment, PendingA1AssignmentKind, VoiceLegRole};
+    use crate::bsc::{
+        DEFAULT_TRAFFIC_ACK_SEQ, PendingA1Assignment, PendingA1AssignmentKind, VoiceLegRole,
+    };
     use cdma_common::access::{
         AccessMessage, AccessMessageHeader, OriginationMessage, PageResponseMessage,
     };
@@ -2101,7 +2134,7 @@ mod tests {
         tc.mark_voice_connected(false);
 
         let test_addr = bsc.mobiles[0].fwd_address.clone();
-        bsc.begin_voice_release(&test_addr, 0b111, "test release");
+        bsc.begin_voice_release(&test_addr, DEFAULT_TRAFFIC_ACK_SEQ, "test release");
 
         let outbound = endpoint.recv_from_bsc().await.unwrap();
         assert_eq!(outbound.message_type(), cdma_ios::MessageType::ClearRequest);
@@ -2143,7 +2176,7 @@ mod tests {
         tc.mark_voice_connected(false);
 
         let test_addr = bsc.mobiles[0].fwd_address.clone();
-        bsc.begin_voice_release(&test_addr, 0b111, "test release");
+        bsc.begin_voice_release(&test_addr, DEFAULT_TRAFFIC_ACK_SEQ, "test release");
         let first = endpoint.recv_from_bsc().await.unwrap();
         assert_eq!(first.message_type(), cdma_ios::MessageType::ClearRequest);
 

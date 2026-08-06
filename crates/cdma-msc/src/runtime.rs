@@ -14,8 +14,8 @@ use std::time::Duration;
 use log::{debug, info, warn};
 
 use cdma_common::consts::{
-    SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_OTASP, SERVICE_OPTION_PACKET_DATA,
-    SERVICE_OPTION_SMS,
+    SERVICE_OPTION_BASIC_VOICE, SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_OTASP,
+    SERVICE_OPTION_PACKET_DATA, SERVICE_OPTION_SMS,
 };
 use cdma_hlr::model::{RegistrationBinding, SubscriberIdentity};
 use cdma_ios::{A1TransportError, EncodedA1Message, VoiceBearerFrame, VoiceBearerManager};
@@ -34,7 +34,7 @@ use crate::media_gateway_service::{
     MediaGatewayService, gateway_clear_cause, send_forward_bearer_frame,
     send_gateway_clear_command, stop_media_for_call,
 };
-use crate::mo_call::{MoCallService, MoSubscriberRoute};
+use crate::mo_call::{MoCallService, MoSubscriberRoute, select_mt_voice_service_option};
 use crate::mt_call::MtCallService;
 
 /// Trait abstracting the A1 transport endpoint (MSC side).
@@ -76,6 +76,10 @@ fn is_non_voice_a1_service_option(so: u16) -> bool {
     is_sms_traffic_service_option(so)
         || is_packet_data_service_option(so)
         || is_otasp_service_option(so)
+}
+
+fn resolve_mo_service_option(requested: u16) -> u16 {
+    requested
 }
 
 impl PagePurpose {
@@ -143,6 +147,8 @@ pub struct MscRuntimeConfig {
     pub smsc_repo: Option<Arc<dyn cdma_smsc::repository::SmscRepository>>,
     /// Default service option for MT voice calls.
     pub default_voice_service_option: u16,
+    /// Voice service options permitted by MSC policy.
+    pub supported_voice_service_options: Vec<u16>,
     /// Optional WAV file used for MSC-owned local playback/fallback paths.
     pub wav_file: Option<String>,
     /// Whether gateway setup failures may fall back to local WAV before answer.
@@ -193,6 +199,7 @@ impl MscRuntimeConfig {
             hlr_repo,
             smsc_repo: None,
             default_voice_service_option: config.voice.default_mobile_terminated_service_option(),
+            supported_voice_service_options: config.voice.supported_service_options.clone(),
             wav_file: config.voice.wav_file.clone(),
             gateway_fallback_to_wav: config.voice.gateway.fallback_to_wav,
             local_answer_delay_ms: config.voice.answer_delay_ms,
@@ -628,6 +635,11 @@ impl MscRuntime {
         self.media_gw
             .register_active_subscriber(subscriber_id, call_id);
         let tag = cdma_ios::Tag(call_id.0 as u32);
+        let service_option = select_mt_voice_service_option(
+            binding.mob_p_rev,
+            &self.config.supported_voice_service_options,
+            self.config.default_voice_service_option,
+        );
         let paging_request = cdma_ios::PagingRequestMessage {
             mobile_identity_imsi: cdma_ios::MobileIdentity::Imsi(imsi.to_string()),
             tag: Some(tag),
@@ -635,9 +647,7 @@ impl MscRuntime {
             slot_cycle_index: binding
                 .slot_cycle_index
                 .map(|value| cdma_ios::SlotCycleIndex(value as u8)),
-            service_option: Some(cdma_ios::ServiceOption(
-                self.config.default_voice_service_option,
-            )),
+            service_option: Some(cdma_ios::ServiceOption(service_option)),
             is2000_mobile_capabilities: None,
         };
         if let Err(e) = self.controller.apply_from_msc(
@@ -654,7 +664,7 @@ impl MscRuntime {
                 imsi: imsi.to_string(),
                 audio_file,
                 caller_number,
-                service_option: self.config.default_voice_service_option,
+                service_option,
             },
         );
         self.circuits
@@ -1202,11 +1212,15 @@ impl MscRuntime {
                     };
 
                 let cm_service_request = decode_cm_service_request(&cli3.layer3_information);
-                let service_option = cm_service_request
+                let requested_service_option = cm_service_request
                     .as_ref()
                     .and_then(|request| request.service_option)
                     .map(|service_option| service_option.0)
-                    .unwrap_or(3);
+                    .unwrap_or(SERVICE_OPTION_BASIC_VOICE);
+                let service_option = resolve_mo_service_option(requested_service_option);
+                if requested_service_option == SERVICE_OPTION_BASIC_VOICE {
+                    info!("MSC: default SO1 Origination; preserving legacy service option");
+                }
                 let called_number = cm_service_request
                     .as_ref()
                     .and_then(cm_service_request_called_number);
@@ -1378,7 +1392,8 @@ impl MscRuntime {
                         .send_mo_mobile_to_mobile_page(
                             call_id,
                             called_number,
-                            service_option,
+                            &self.config.supported_voice_service_options,
+                            self.config.default_voice_service_option,
                             self.config.hlr_repo.as_ref(),
                             &mut self.circuits,
                         )
@@ -1466,9 +1481,10 @@ impl MscRuntime {
                         None
                     };
 
-                let a2p_bearer_format_params = a2p_bearer_session_params.as_ref().map(|_| {
-                    cdma_ios::A2pBearerFormatParams::evrc_with_telephone_event(
-                        cdma_ios::voice_bearer::EVRC_RTP_PAYLOAD_TYPE,
+                let a2p_bearer_format_params = a2p_bearer_session_params.as_ref().and_then(|_| {
+                    cdma_ios::A2pBearerFormatParams::for_service_option_with_telephone_event(
+                        cdma_ios::ServiceOption(service_option),
+                        cdma_ios::voice_bearer::VOICE_RTP_PAYLOAD_TYPE,
                         cdma_ios::voice_bearer::TELEPHONE_EVENT_RTP_PAYLOAD_TYPE,
                     )
                 });
@@ -1479,9 +1495,12 @@ impl MscRuntime {
                     bearer.set_circuit_payload_types(
                         circuit_id,
                         cdma_ios::BearerPayloadTypes {
-                            evrc: format_params
-                                .evrc_pt()
-                                .unwrap_or(cdma_ios::voice_bearer::EVRC_RTP_PAYLOAD_TYPE),
+                            voice: format_params.voice_payload_type().unwrap_or(
+                                cdma_ios::VoiceBearerPayloadType {
+                                    format: cdma_ios::VoiceBearerFormat::Evrc,
+                                    payload_type: cdma_ios::voice_bearer::EVRC_RTP_PAYLOAD_TYPE,
+                                },
+                            ),
                             telephone_event: format_params.telephone_event_pt(),
                         },
                     );
@@ -1591,7 +1610,7 @@ impl MscRuntime {
     }
 
     async fn handle_reverse_bearer_frame(&mut self, frame: VoiceBearerFrame) {
-        let Some((call_id, peer_circuit_id, media_gateway_handle)) = self
+        let Some((call_id, peer_circuit_id, media_gateway_handle, service_option)) = self
             .circuits
             .circuits
             .get(&frame.circuit_id)
@@ -1600,6 +1619,7 @@ impl MscRuntime {
                     session.call_id,
                     session.peer_circuit_id,
                     session.media_gateway_handle,
+                    session.service_option,
                 )
             })
         else {
@@ -1611,12 +1631,27 @@ impl MscRuntime {
         };
 
         if let Some(peer_cid) = peer_circuit_id {
-            let peer_ready = self
+            if self.controller.state(call_id) != Some(cdma_ios::CallControlState::Connected) {
+                log::trace!(
+                    "MSC: dropping pre-connect bearer frame call_id={} from_circuit_id={} to_circuit_id={}",
+                    call_id.0,
+                    frame.circuit_id,
+                    peer_cid
+                );
+                return;
+            }
+            let peer = self
                 .circuits
                 .circuits
                 .get(&peer_cid)
-                .map(|peer| peer.bearer_remote_ready)
-                .unwrap_or(false);
+                .map(|peer| (peer.bearer_remote_ready, peer.service_option));
+            let Some((peer_ready, peer_service_option)) = peer else {
+                warn!(
+                    "MSC: dropping bearer frame call_id={} from_circuit_id={} because peer circuit_id={} is missing",
+                    call_id.0, frame.circuit_id, peer_cid
+                );
+                return;
+            };
             if !peer_ready {
                 log::trace!(
                     "MSC: dropping bearer frame call_id={} from_circuit_id={} to_circuit_id={} until peer bearer remote is known",
@@ -1626,16 +1661,47 @@ impl MscRuntime {
                 );
                 return;
             }
-            let bridged_frame = VoiceBearerFrame {
-                circuit_id: peer_cid,
-                rate_bps: frame.rate_bps,
-                payload: frame.payload,
+            let Some(source_codec) = cdma_voice::VoiceCodec::from_service_option(service_option)
+            else {
+                warn!(
+                    "MSC: dropping bearer frame for unsupported source service option {}",
+                    service_option
+                );
+                return;
+            };
+            let Some(target_codec) =
+                cdma_voice::VoiceCodec::from_service_option(peer_service_option)
+            else {
+                warn!(
+                    "MSC: dropping bearer frame for unsupported target service option {}",
+                    peer_service_option
+                );
+                return;
+            };
+            let source_circuit_id = frame.circuit_id;
+            let bridged_frame = match self.circuits.bridge_voice_frame(
+                source_circuit_id,
+                peer_cid,
+                source_codec,
+                target_codec,
+                frame,
+            ) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    warn!(
+                        "MSC: voice transcode failed call_id={} from_circuit_id={} to_circuit_id={} {:?}->{:?}: {}",
+                        call_id.0, source_circuit_id, peer_cid, source_codec, target_codec, error
+                    );
+                    return;
+                }
             };
             debug!(
-                "MSC: bridging bearer frame call_id={} from_circuit_id={} to_circuit_id={} rate={} len={}",
+                "MSC: bridging bearer frame call_id={} from_circuit_id={} to_circuit_id={} {:?}->{:?} rate={} len={}",
                 call_id.0,
-                frame.circuit_id,
+                source_circuit_id,
                 peer_cid,
+                source_codec,
+                target_codec,
                 bridged_frame.rate_bps,
                 bridged_frame.payload.len()
             );
@@ -1664,14 +1730,24 @@ impl MscRuntime {
         {
             let rate_bps = frame.rate_bps;
             let len = frame.payload.len();
+            let Some(codec) = cdma_voice::VoiceCodec::from_service_option(service_option) else {
+                warn!(
+                    "MSC: dropping bearer frame for unsupported service option {}",
+                    service_option
+                );
+                return;
+            };
+            let Some(rate) = codec.rate_from_bps(rate_bps) else {
+                warn!(
+                    "MSC: dropping bearer frame rate {} for {:?}",
+                    rate_bps, codec
+                );
+                return;
+            };
+            let payload =
+                cdma_voice::unpack_voice_bits(&frame.payload, codec.primary_traffic_bits(rate));
             if let Err(error) = media_gateway
-                .forward_payload(
-                    handle,
-                    VocoderFrame {
-                        payload: frame.payload,
-                        rate_bps,
-                    },
-                )
+                .forward_payload(handle, VocoderFrame { payload, rate_bps })
                 .await
             {
                 warn!(
@@ -1721,6 +1797,23 @@ impl MscRuntime {
         let abandoned = self
             .circuits
             .cancel_pending_assignment_leg(call_id, self.config.voice_bearer.as_ref());
+        let failed_leg = abandoned
+            .map(|(leg, _)| leg)
+            .unwrap_or(MscVoiceLeg::Primary);
+        if failed_leg == MscVoiceLeg::Primary
+            && self
+                .controller
+                .snapshot(call_id)
+                .is_some_and(|snapshot| snapshot.direction == CallDirection::MobileOriginated)
+        {
+            info!(
+                "MSC: A1 rx AssignmentFailure call_id={} abandoned MO primary leg; clearing call",
+                call_id.0
+            );
+            self.circuits.reset_assignment_failure_retries(call_id);
+            self.send_clear_command(a1, call_id).await;
+            return;
+        }
         let attempts = self.circuits.bump_assignment_failure_retry(call_id);
         info!(
             "MSC: A1 rx AssignmentFailure call_id={} (attempt {}/{}); abandoned leg={:?}",
@@ -1738,9 +1831,6 @@ impl MscRuntime {
             self.send_clear_command(a1, call_id).await;
             return;
         }
-        let failed_leg = abandoned
-            .map(|(leg, _)| leg)
-            .unwrap_or(MscVoiceLeg::Primary);
         self.reissue_paging_request(a1, call_id, failed_leg).await;
     }
 
@@ -1853,11 +1943,20 @@ impl MscRuntime {
         }
     }
 
-    async fn send_clear_command(&self, a1: &dyn MscA1Endpoint, call_id: CallId) {
+    async fn send_clear_command(&mut self, a1: &dyn MscA1Endpoint, call_id: CallId) {
         let clear_command = cdma_ios::ClearCommandMessage {
             cause: cdma_ios::Cause(0x16),
             cause_layer3: None,
         };
+        if let Err(error) = self.controller.apply_from_msc(
+            call_id,
+            &cdma_ios::ProcedureMessage::ClearCommand(clear_command.clone()),
+        ) {
+            debug!(
+                "MSC: ClearCommand state transition skipped for call_id={}: {}",
+                call_id.0, error
+            );
+        }
         let payload = match clear_command.encode() {
             Ok(payload) => payload,
             Err(error) => {
@@ -2525,20 +2624,32 @@ mod tests {
 
     struct StubHlrRepo;
 
+    #[test]
+    fn default_so1_origination_preserves_legacy_service_option() {
+        assert_eq!(resolve_mo_service_option(SERVICE_OPTION_BASIC_VOICE), 1);
+        assert_eq!(resolve_mo_service_option(32768), 32768);
+    }
+
     /// HLR stub that resolves a single phone number to a Registered subscriber
     /// with one primary IMSI, used to drive the MO M2M paging path.
     struct M2mHlrRepo {
         phone_number: &'static str,
         subscriber_id: uuid::Uuid,
         imsi: &'static str,
+        mob_p_rev: u32,
     }
 
     impl M2mHlrRepo {
         fn new() -> Self {
+            Self::with_p_rev(6)
+        }
+
+        fn with_p_rev(mob_p_rev: u32) -> Self {
             Self {
                 phone_number: "5559876543",
                 subscriber_id: uuid::Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888),
                 imsi: "111111111111111",
+                mob_p_rev,
             }
         }
     }
@@ -2980,7 +3091,7 @@ mod tests {
                     imsi: Some(self.imsi.to_string()),
                     esn: None,
                     meid: None,
-                    mob_p_rev: Some(6),
+                    mob_p_rev: Some(self.mob_p_rev),
                     pgslot: Some(0),
                     slot_cycle_index: Some(2),
                     last_msg_seq: None,
@@ -3390,6 +3501,7 @@ mod tests {
             welcome_sms: None,
             sms_retry: crate::config::SmsRetryConfig::default(),
             default_voice_service_option: 3,
+            supported_voice_service_options: vec![3],
             wav_file: None,
             gateway_fallback_to_wav: true,
             local_answer_delay_ms: 10_000,
@@ -3510,6 +3622,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_paged_evrc_assigns_configured_qcelp13k() {
+        use cdma_common::consts::{SERVICE_OPTION_QCELP13, SERVICE_OPTION_REJECTED};
+
+        let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
+        let mut runtime = MscRuntime::new(MscRuntimeConfig {
+            hlr_repo: Arc::new(StubHlrRepo),
+            smsc_repo: None,
+            welcome_sms: None,
+            sms_retry: crate::config::SmsRetryConfig::default(),
+            default_voice_service_option: SERVICE_OPTION_QCELP13,
+            supported_voice_service_options: vec![SERVICE_OPTION_QCELP13],
+            wav_file: None,
+            gateway_fallback_to_wav: true,
+            local_answer_delay_ms: 10_000,
+            media_ringback_enabled: false,
+            media_ringback_type: MediaRingbackType::Nanp,
+            sip_ringback_disable: false,
+            inbound_sip_msc_ringback: false,
+            generate_ringback: true,
+            send_tones_alert: false,
+            page_retry_cooldown_ms: 1000,
+            page_retry_max_duration_ms: 60_000,
+            failure_tone_duration_ms: 0,
+            voice_bearer: None,
+            media_gateway: None,
+            otasp: None,
+            bts_overhead: None,
+        });
+        let call_id = runtime.controller.create_call(
+            CallDirection::MobileTerminated,
+            Some(MobileIdentity::Imsi("12345678901".to_string())),
+        );
+        let page = paging_request();
+        runtime
+            .controller
+            .apply_from_msc(call_id, &ProcedureMessage::PagingRequest(page.clone()))
+            .unwrap();
+        runtime.circuits.paging_requests.insert(call_id, page);
+
+        let mut response = paging_response();
+        response.service_option = Some(ServiceOption(SERVICE_OPTION_REJECTED));
+        runtime
+            .handle_bsc_a1_message(
+                &endpoint,
+                EncodedA1Message::from_message_for_call(
+                    &cdma_ios::Message::new(
+                        cdma_ios::MessageType::PagingResponse,
+                        response.encode().unwrap(),
+                    ),
+                    Some(call_id.0),
+                ),
+            )
+            .await;
+
+        let outbound = timeout(Duration::from_millis(50), client.poll_a1())
+            .await
+            .expect("rejected page should produce an Assignment Request")
+            .expect("Assignment Request should be available");
+        let decoded = outbound.decode().unwrap();
+        let assignment = AssignmentRequestMessage::decode(&decoded.payload).unwrap();
+        assert_eq!(
+            assignment.service_option,
+            Some(ServiceOption(SERVICE_OPTION_QCELP13))
+        );
+        assert_eq!(
+            runtime.circuits.circuits[&assignment.circuit_identity_code.to_packed()].service_option,
+            SERVICE_OPTION_QCELP13
+        );
+    }
+
+    #[tokio::test]
     async fn secondary_paging_response_waits_for_active_assignment_complete() {
         let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
         let mut runtime = MscRuntime::new(MscRuntimeConfig {
@@ -3518,6 +3701,7 @@ mod tests {
             welcome_sms: None,
             sms_retry: crate::config::SmsRetryConfig::default(),
             default_voice_service_option: 3,
+            supported_voice_service_options: vec![3],
             wav_file: None,
             gateway_fallback_to_wav: true,
             local_answer_delay_ms: 10_000,
@@ -3669,6 +3853,7 @@ mod tests {
             welcome_sms: None,
             sms_retry: crate::config::SmsRetryConfig::default(),
             default_voice_service_option: 3,
+            supported_voice_service_options: vec![3],
             wav_file: None,
             gateway_fallback_to_wav: true,
             local_answer_delay_ms: 10_000,
@@ -3847,6 +4032,7 @@ mod tests {
             welcome_sms: None,
             sms_retry: crate::config::SmsRetryConfig::default(),
             default_voice_service_option: 3,
+            supported_voice_service_options: vec![3],
             wav_file: None,
             gateway_fallback_to_wav: true,
             local_answer_delay_ms: 10_000,
@@ -4061,6 +4247,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn mo_m2m_page_selects_qcelp13_for_registered_is95_callee() {
+        let hlr = M2mHlrRepo::with_p_rev(3);
+        let mut mo_call = MoCallService::new();
+        let mut circuits = CircuitService::new();
+        let call_id = CallId(4241);
+
+        assert_eq!(
+            mo_call
+                .send_mo_mobile_to_mobile_page(
+                    call_id,
+                    hlr.phone_number,
+                    &[cdma_common::consts::SERVICE_OPTION_QCELP13],
+                    cdma_common::consts::SERVICE_OPTION_QCELP13,
+                    &hlr,
+                    &mut circuits,
+                )
+                .await,
+            MoSubscriberRoute::Paged
+        );
+        assert_eq!(
+            circuits.deferred_paging_requests[&call_id].service_option,
+            Some(ServiceOption(cdma_common::consts::SERVICE_OPTION_QCELP13))
+        );
+    }
+
     /// MO M2M scenario: the secondary-leg PagingRequest must NOT be sent to
     /// the BSC until the primary (MO) leg's AssignmentComplete arrives.
     /// This prevents the callee from page-responding before the caller is on
@@ -4076,6 +4288,7 @@ mod tests {
             welcome_sms: None,
             sms_retry: crate::config::SmsRetryConfig::default(),
             default_voice_service_option: 3,
+            supported_voice_service_options: vec![3],
             wav_file: None,
             gateway_fallback_to_wav: true,
             local_answer_delay_ms: 10_000,
@@ -4176,6 +4389,12 @@ mod tests {
             cdma_ios::MessageType::PagingRequest
         );
         assert_eq!(paging_request.call_id(), Some(call_id));
+        let paging_request_body =
+            PagingRequestMessage::decode(&paging_request.decode().unwrap().payload).unwrap();
+        assert_eq!(
+            paging_request_body.service_option,
+            Some(ServiceOption(cdma_common::consts::SERVICE_OPTION_EVRC_A))
+        );
         assert!(
             !runtime
                 .circuits
@@ -4183,9 +4402,139 @@ mod tests {
                 .contains_key(&CallId(call_id)),
             "deferred entry should be cleared after flush"
         );
-        // Sanity: the assignment circuit id the MSC chose for the MO leg is
-        // tracked in circuits and matches what the BSC would AssignmentComplete.
-        let _ = assignment_circuit_id; // value retained for future assertions
+        assert_eq!(
+            runtime.circuits.circuits[&assignment_circuit_id.unwrap()].leg_role,
+            MscVoiceLeg::Primary
+        );
+
+        let page_response = EncodedA1Message::from_message_for_call(
+            &cdma_ios::Message::new(
+                cdma_ios::MessageType::PagingResponse,
+                paging_response().encode().unwrap(),
+            ),
+            Some(call_id),
+        );
+        runtime
+            .handle_bsc_a1_message(&endpoint, page_response)
+            .await;
+        let secondary_assignment = timeout(Duration::from_millis(50), client.poll_a1())
+            .await
+            .expect("callee PageResponse should produce AssignmentRequest")
+            .expect("A1 channel should remain open");
+        assert_eq!(
+            secondary_assignment.message_type(),
+            cdma_ios::MessageType::AssignmentRequest
+        );
+        assert_eq!(
+            runtime
+                .circuits
+                .active_assignment_legs
+                .get(&CallId(call_id)),
+            Some(&MscVoiceLeg::Secondary)
+        );
+
+        let secondary_complete = EncodedA1Message::from_message_for_call(
+            &cdma_ios::Message::new(
+                cdma_ios::MessageType::AssignmentComplete,
+                AssignmentCompleteMessage {
+                    channel_number: ChannelNumber(0x4322),
+                    encryption_information: None,
+                    service_option: Some(ServiceOption(0x0003)),
+                    a2p_bearer_session_params: None,
+                    a2p_bearer_format_params: None,
+                }
+                .encode()
+                .unwrap(),
+            ),
+            Some(call_id),
+        );
+        runtime
+            .handle_bsc_a1_message(&endpoint, secondary_complete)
+            .await;
+        let alert = timeout(Duration::from_millis(50), client.poll_a1())
+            .await
+            .expect("callee AssignmentComplete should produce AlertWithInformation")
+            .expect("A1 channel should remain open");
+        assert_eq!(
+            alert.message_type(),
+            cdma_ios::MessageType::AlertWithInformation
+        );
+    }
+
+    #[tokio::test]
+    async fn mo_primary_assignment_failure_clears_without_paging_callee() {
+        let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(8);
+        let mut runtime = MscRuntime::new(MscRuntimeConfig {
+            hlr_repo: Arc::new(M2mHlrRepo::new()),
+            smsc_repo: None,
+            welcome_sms: None,
+            sms_retry: crate::config::SmsRetryConfig::default(),
+            default_voice_service_option: 3,
+            supported_voice_service_options: vec![3],
+            wav_file: None,
+            gateway_fallback_to_wav: true,
+            local_answer_delay_ms: 10_000,
+            media_ringback_enabled: false,
+            media_ringback_type: MediaRingbackType::Nanp,
+            sip_ringback_disable: false,
+            inbound_sip_msc_ringback: false,
+            generate_ringback: true,
+            send_tones_alert: false,
+            page_retry_cooldown_ms: 1000,
+            page_retry_max_duration_ms: 60_000,
+            failure_tone_duration_ms: 0,
+            voice_bearer: None,
+            media_gateway: None,
+            otasp: None,
+            bts_overhead: None,
+        });
+        let call_id = 4243;
+        let cli3 = cm_service_request_cli3(Some(vec![0x81, 0x55, 0x95, 0x78, 0x56, 0x34]));
+        runtime
+            .handle_bsc_a1_message(
+                &endpoint,
+                EncodedA1Message::from_message_for_call(
+                    &cdma_ios::Message::new(
+                        cdma_ios::MessageType::CompleteLayer3Information,
+                        cli3.encode().unwrap(),
+                    ),
+                    Some(call_id),
+                ),
+            )
+            .await;
+
+        loop {
+            match timeout(Duration::from_millis(20), client.poll_a1()).await {
+                Ok(Some(message))
+                    if message.message_type() == cdma_ios::MessageType::AssignmentRequest =>
+                {
+                    break;
+                }
+                Ok(Some(message)) => {
+                    assert_ne!(message.message_type(), cdma_ios::MessageType::PagingRequest);
+                }
+                _ => panic!("MO setup did not produce AssignmentRequest"),
+            }
+        }
+
+        runtime
+            .handle_bsc_a1_message(&endpoint, assignment_failure_msg(call_id))
+            .await;
+        let clear = timeout(Duration::from_millis(50), client.poll_a1())
+            .await
+            .expect("MO primary AssignmentFailure should produce ClearCommand")
+            .expect("A1 channel should remain open");
+        assert_eq!(clear.message_type(), cdma_ios::MessageType::ClearCommand);
+        assert_eq!(
+            runtime.controller.state(CallId(call_id)),
+            Some(cdma_ios::CallControlState::Clearing)
+        );
+        assert!(
+            timeout(Duration::from_millis(20), client.poll_a1())
+                .await
+                .is_err(),
+            "the callee must not be paged after the MO primary assignment fails"
+        );
     }
 
     /// If the call is torn down before the MO leg's AssignmentComplete
@@ -4201,6 +4550,7 @@ mod tests {
             welcome_sms: None,
             sms_retry: crate::config::SmsRetryConfig::default(),
             default_voice_service_option: 3,
+            supported_voice_service_options: vec![3],
             wav_file: None,
             gateway_fallback_to_wav: true,
             local_answer_delay_ms: 10_000,
@@ -4268,6 +4618,7 @@ mod tests {
             welcome_sms: None,
             sms_retry: crate::config::SmsRetryConfig::default(),
             default_voice_service_option: 3,
+            supported_voice_service_options: vec![3],
             wav_file: Some("sample-sound.wav".to_string()),
             gateway_fallback_to_wav: true,
             local_answer_delay_ms: 10_000,
@@ -4340,6 +4691,7 @@ mod tests {
             welcome_sms: None,
             sms_retry: crate::config::SmsRetryConfig::default(),
             default_voice_service_option: 3,
+            supported_voice_service_options: vec![3],
             wav_file: None,
             gateway_fallback_to_wav: false,
             local_answer_delay_ms: 10_000,
@@ -4421,6 +4773,7 @@ mod tests {
             welcome_sms: None,
             sms_retry: crate::config::SmsRetryConfig::default(),
             default_voice_service_option: 3,
+            supported_voice_service_options: vec![3],
             wav_file: None,
             gateway_fallback_to_wav: true,
             local_answer_delay_ms: 10_000,
@@ -4459,11 +4812,15 @@ mod tests {
             },
         );
 
+        let gateway_bits = (0..171)
+            .map(|index| (index % 5 == 0) as u8)
+            .collect::<Vec<_>>();
+        let bearer_payload = cdma_voice::pack_voice_bits(&gateway_bits, gateway_bits.len());
         runtime
             .handle_reverse_bearer_frame(VoiceBearerFrame {
                 circuit_id: 23,
                 rate_bps: 9600,
-                payload: vec![1, 2, 3, 4],
+                payload: bearer_payload,
             })
             .await;
 
@@ -4473,10 +4830,206 @@ mod tests {
         assert_eq!(
             forwarded[0].1,
             VocoderFrame {
-                payload: vec![1, 2, 3, 4],
+                payload: gateway_bits,
                 rate_bps: 9600,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn m2m_bearer_transcodes_evrc_and_qcelp_in_both_directions() {
+        let msc_bearer = Arc::new(VoiceBearerManager::new(std::net::Ipv4Addr::LOCALHOST));
+        let bsc_bearer = VoiceBearerManager::new(std::net::Ipv4Addr::LOCALHOST);
+        for (circuit_id, format) in [
+            (4, cdma_ios::VoiceBearerFormat::Evrc),
+            (5, cdma_ios::VoiceBearerFormat::Vocoder13k),
+        ] {
+            let msc_local = msc_bearer.open_circuit(circuit_id, None).await.unwrap();
+            let bsc_local = bsc_bearer
+                .open_circuit(circuit_id, Some(msc_local))
+                .await
+                .unwrap();
+            msc_bearer.set_circuit_remote(circuit_id, bsc_local);
+            let payload_types = cdma_ios::BearerPayloadTypes {
+                voice: cdma_ios::VoiceBearerPayloadType {
+                    format,
+                    payload_type: cdma_ios::voice_bearer::VOICE_RTP_PAYLOAD_TYPE,
+                },
+                telephone_event: None,
+            };
+            msc_bearer.set_circuit_payload_types(circuit_id, payload_types);
+            bsc_bearer.set_circuit_payload_types(circuit_id, payload_types);
+        }
+
+        let mut runtime = MscRuntime::new(MscRuntimeConfig {
+            hlr_repo: Arc::new(StubHlrRepo),
+            smsc_repo: None,
+            welcome_sms: None,
+            sms_retry: crate::config::SmsRetryConfig::default(),
+            default_voice_service_option: 3,
+            supported_voice_service_options: vec![3],
+            wav_file: None,
+            gateway_fallback_to_wav: true,
+            local_answer_delay_ms: 10_000,
+            media_ringback_enabled: false,
+            media_ringback_type: MediaRingbackType::Nanp,
+            sip_ringback_disable: false,
+            inbound_sip_msc_ringback: false,
+            generate_ringback: true,
+            send_tones_alert: false,
+            page_retry_cooldown_ms: 1_000,
+            page_retry_max_duration_ms: 60_000,
+            failure_tone_duration_ms: 0,
+            voice_bearer: Some(msc_bearer),
+            media_gateway: None,
+            otasp: None,
+            bts_overhead: None,
+        });
+        let call_id = runtime.controller.create_call_with_id(
+            CallId(91),
+            CallDirection::MobileTerminated,
+            Some(MobileIdentity::Imsi("12345678901".to_string())),
+        );
+        for (circuit_id, service_option, leg_role) in [
+            (4, 3, MscVoiceLeg::Primary),
+            (5, 32768, MscVoiceLeg::Secondary),
+        ] {
+            runtime.circuits.insert_circuit_session(
+                circuit_id,
+                CircuitSession {
+                    call_id,
+                    audio_file: None,
+                    service_option,
+                    leg_role,
+                    peer_circuit_id: None,
+                    bearer_remote_ready: true,
+                    media_gateway_handle: None,
+                    called_number: None,
+                },
+            );
+        }
+
+        let mut pcm = [0i16; cdma_voice::SAMPLES_PER_FRAME];
+        for (index, sample) in pcm.iter_mut().enumerate() {
+            let angle = 2.0 * std::f64::consts::PI * 500.0 * index as f64 / 8_000.0;
+            *sample = (angle.sin() * 8_000.0) as i16;
+        }
+
+        let mut evrc_encoder =
+            cdma_voice::VoiceEncoder::new(cdma_voice::VoiceCodec::EvrcA).unwrap();
+        let (evrc_rate, evrc_payload) = evrc_encoder.encode(&pcm).unwrap();
+        let evrc_frame = VoiceBearerFrame {
+            circuit_id: 4,
+            rate_bps: cdma_voice::VoiceCodec::EvrcA.rate_bps(evrc_rate),
+            payload: evrc_payload,
+        };
+        runtime
+            .handle_reverse_bearer_frame(evrc_frame.clone())
+            .await;
+        assert!(
+            timeout(Duration::from_millis(30), bsc_bearer.recv())
+                .await
+                .is_err(),
+            "pre-connect mobile-to-mobile media must not be queued"
+        );
+
+        runtime
+            .controller
+            .apply_from_msc(call_id, &ProcedureMessage::PagingRequest(paging_request()))
+            .unwrap();
+        runtime
+            .controller
+            .apply_from_bsc(
+                call_id,
+                &ProcedureMessage::PagingResponse(paging_response()),
+            )
+            .unwrap();
+        runtime
+            .controller
+            .apply_from_msc(
+                call_id,
+                &ProcedureMessage::AssignmentRequest(AssignmentRequestMessage {
+                    channel_type: ChannelType {
+                        speech_or_data_indicator: 0x01,
+                        channel_rate_and_type: 0x08,
+                        coding: 0x05,
+                    },
+                    circuit_identity_code: CircuitIdentityCode {
+                        pcm_multiplexer: 0x0123,
+                        timeslot: 0x1a,
+                    },
+                    encryption_information: None,
+                    service_option: Some(ServiceOption(0x0003)),
+                    signals: Vec::new(),
+                    ms_information_records: None,
+                    priority: None,
+                    paca_timestamp: None,
+                    quality_of_service_parameters: None,
+                    a2p_bearer_session_params: None,
+                    a2p_bearer_format_params: None,
+                }),
+            )
+            .unwrap();
+        runtime
+            .controller
+            .apply_from_bsc(
+                call_id,
+                &ProcedureMessage::AssignmentComplete(AssignmentCompleteMessage {
+                    channel_number: ChannelNumber(0x1122),
+                    encryption_information: None,
+                    service_option: Some(ServiceOption(0x0003)),
+                    a2p_bearer_session_params: None,
+                    a2p_bearer_format_params: None,
+                }),
+            )
+            .unwrap();
+        runtime
+            .controller
+            .apply_from_bsc(call_id, &ProcedureMessage::Connect(ConnectMessage))
+            .unwrap();
+        runtime.handle_reverse_bearer_frame(evrc_frame).await;
+        let to_qcelp =
+            match tokio::time::timeout(std::time::Duration::from_secs(1), bsc_bearer.recv())
+                .await
+                .expect("QCELP bearer timeout")
+                .expect("QCELP bearer event")
+            {
+                cdma_ios::BearerEvent::Voice(frame) => frame,
+                cdma_ios::BearerEvent::Dtmf(_) => panic!("expected voice"),
+            };
+        assert_eq!(to_qcelp.circuit_id, 5);
+        let qcelp_rate = cdma_voice::VoiceCodec::Qcelp13k
+            .rate_from_bps(to_qcelp.rate_bps)
+            .expect("QCELP rate");
+        cdma_voice::qcelp13k::Qcelp13kDecoder::new()
+            .unwrap()
+            .decode(qcelp_rate, &to_qcelp.payload)
+            .expect("decode transcoded QCELP");
+
+        let mut qcelp_encoder =
+            cdma_voice::VoiceEncoder::new(cdma_voice::VoiceCodec::Qcelp13k).unwrap();
+        let (qcelp_rate, qcelp_payload) = qcelp_encoder.encode(&pcm).unwrap();
+        runtime
+            .handle_reverse_bearer_frame(VoiceBearerFrame {
+                circuit_id: 5,
+                rate_bps: cdma_voice::VoiceCodec::Qcelp13k.rate_bps(qcelp_rate),
+                payload: qcelp_payload,
+            })
+            .await;
+        let to_evrc =
+            match tokio::time::timeout(std::time::Duration::from_secs(1), bsc_bearer.recv())
+                .await
+                .expect("EVRC bearer timeout")
+                .expect("EVRC bearer event")
+            {
+                cdma_ios::BearerEvent::Voice(frame) => frame,
+                cdma_ios::BearerEvent::Dtmf(_) => panic!("expected voice"),
+            };
+        assert_eq!(to_evrc.circuit_id, 4);
+        cdma_voice::evrc::EvrcDecoder::new()
+            .unwrap()
+            .decode(&to_evrc.payload)
+            .expect("decode transcoded EVRC");
     }
 
     #[test]
@@ -4487,6 +5040,7 @@ mod tests {
             welcome_sms: None,
             sms_retry: crate::config::SmsRetryConfig::default(),
             default_voice_service_option: 3,
+            supported_voice_service_options: vec![3],
             wav_file: None,
             gateway_fallback_to_wav: true,
             local_answer_delay_ms: 10_000,
@@ -4537,6 +5091,7 @@ mod tests {
             welcome_sms: None,
             sms_retry: crate::config::SmsRetryConfig::default(),
             default_voice_service_option: 3,
+            supported_voice_service_options: vec![3],
             wav_file: None,
             gateway_fallback_to_wav: false,
             local_answer_delay_ms: 10_000,

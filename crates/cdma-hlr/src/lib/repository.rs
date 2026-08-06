@@ -1224,9 +1224,11 @@ const RINGTONE_MAX_BYTES_PER_CODEC: usize = 256 * 1024;
 
 fn voice_codec_to_str(codec: cdma_voice::VoiceCodec) -> &'static str {
     match codec {
+        cdma_voice::VoiceCodec::Tia96 => "tia96",
         cdma_voice::VoiceCodec::EvrcA => "evrc_a",
         cdma_voice::VoiceCodec::EvrcB => "evrc_b",
         cdma_voice::VoiceCodec::EvrcWb => "evrc_wb",
+        cdma_voice::VoiceCodec::Qcelp13k => "qcelp_13k",
     }
 }
 
@@ -2009,7 +2011,7 @@ impl HlrRepository for PostgresHlrRepository {
         if wav_bytes.is_empty() {
             return Err("set_ringtone: wav_bytes is empty".to_string());
         }
-        // Preencode is CPU-bound (WAV decode + resample + 3× EVRC encode); run
+        // Preencoding is CPU-bound; run
         // on a blocking thread so we don't stall the tokio worker.
         let preencoded = tokio::task::spawn_blocking(move || {
             cdma_voice::ringtone_preencode::preencode_wav_all_codecs(

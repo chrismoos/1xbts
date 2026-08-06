@@ -45,5 +45,8 @@ crossbeam-channel = "0.5"
 crossbeam-queue = "0.3"
 cdma-abis = { path = "../cdma-abis" }
 
+[dev-dependencies]
+cdma-voice = { path = "../cdma-voice" }
+
 [lints]
 workspace = true
