@@ -1344,19 +1344,25 @@ fn timing_candidates_near_fft_hit(
     });
     coarse.truncate(48);
 
+    // Reuse the spec reference across delay variants for the same frame start.
+    let mut references = HashMap::<i64, Vec<Complex32>>::new();
     let mut all = Vec::new();
     for coarse in coarse {
-        let acn = derived_access_cycle_number_for_chip(coarse.preamble_start_chip as u64);
-        let reference = hrpd_access_preamble_chips(
-            coarse.preamble_start_chip as u64,
-            acn,
-            sector_id_lsb,
-            color_code,
-            reference_chip_offset,
-            q_pair_phase,
-            q_sign,
-            ACCESS_PACKET_CHIPS,
-        );
+        let reference = references
+            .entry(coarse.preamble_start_chip)
+            .or_insert_with(|| {
+                let acn = derived_access_cycle_number_for_chip(coarse.preamble_start_chip as u64);
+                hrpd_access_preamble_chips(
+                    coarse.preamble_start_chip as u64,
+                    acn,
+                    sector_id_lsb,
+                    color_code,
+                    reference_chip_offset,
+                    q_pair_phase,
+                    q_sign,
+                    ACCESS_PACKET_CHIPS,
+                )
+            });
         for sample_delay in [
             coarse.sample_delay - 4,
             coarse.sample_delay,
@@ -1383,7 +1389,7 @@ fn timing_candidates_near_fft_hit(
                     coarse.preamble_start_chip,
                     sample_delay,
                     sample_delay_fraction,
-                    &reference,
+                    reference,
                 )
                 .unwrap_or(0.0);
                 if spec_coherence < ACCESS_PREAMBLE_MIN_SPEC_COHERENCE {
