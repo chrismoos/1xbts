@@ -296,13 +296,15 @@ impl Bsc {
         let profile = Rc3FschProfile::from_rate_bps(self.config.traffic_assignment.f_sch_rate_bps)
             .unwrap_or_else(Rc3FschProfile::default_19k2);
         let bts_client = self.config.bts_client.clone()?;
+        // The Abis reservation and ESCAM must carry the same modulo-32 start boundary.
+        let start_time_mod32 = fsch_escam_start_time_mod32();
         let request = ForwardBurstRadioInfo {
             coding_indicator: profile.coding_indicator,
             qof_mask: 0,
             forward_code_channel_index: 0,
             pilot_pn_code: self.config.pilot_offset as u16,
             forward_supplemental_channel_rate: profile.num_bits_idx,
-            forward_supplemental_channel_start_time: fsch_escam_start_time_mod32(),
+            forward_supplemental_channel_start_time: start_time_mod32,
             start_time_unit: 0,
             forward_supplemental_channel_duration: 0x0f,
         };
@@ -311,7 +313,7 @@ impl Bsc {
             .await?;
         let sch_code = committed.forward_code_channel_index as u8;
 
-        if let Err(e) = self.send_escam_for_fsch(walsh_code, sch_code, profile) {
+        if let Err(e) = self.send_escam_for_fsch(walsh_code, sch_code, profile, start_time_mod32) {
             warn!(
                 "BSC: F-SCH allocated (code={}) on walsh={} but ESCAM send failed: {}; \
                  releasing SCH",

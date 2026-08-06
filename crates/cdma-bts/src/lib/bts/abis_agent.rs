@@ -607,10 +607,13 @@ impl AbisAgent {
         } else {
             let lc_gen = LongCodeGenerator::new_traffic_channel(session.esn);
             let sch_gain_linear = profile.nominal_gain_linear();
-            match self
-                .controller
-                .allocate_rc3_sch(lc_gen, sch_gain_linear, profile)
-            {
+            match self.controller.allocate_rc3_sch(
+                lc_gen,
+                sch_gain_linear,
+                profile,
+                request_info.start_time_unit,
+                request_info.forward_supplemental_channel_start_time,
+            ) {
                 Some((code, _ch)) => {
                     session.sch_walsh_code = Some(code);
                     info!(

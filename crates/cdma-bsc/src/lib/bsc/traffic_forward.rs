@@ -237,8 +237,8 @@ impl Bsc {
         walsh_code: u8,
         sch_code: u8,
         profile: Rc3FschProfile,
+        for_sch_start_time: u8,
     ) -> Result<(), Error> {
-        let for_sch_start_time = fsch_escam_start_time_mod32();
         let params = EscamParams {
             start_time_unit: 0,
             for_sch_id: 0,

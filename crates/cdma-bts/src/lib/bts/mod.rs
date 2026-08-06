@@ -210,7 +210,7 @@ pub(crate) struct TxLoopState {
     pub(super) scratch_sync: Vec<num::complex::Complex32>,
     pub(super) scratch_paging: Vec<num::complex::Complex32>,
     pub(super) scratch_tc_snapshot: Vec<(f32, handle::TrafficChannelWrapper)>,
-    pub(super) scratch_tc_blocks: Vec<(f32, Vec<num::complex::Complex32>)>,
+    pub(super) scratch_tc_blocks: Vec<(f32, bool, Vec<num::complex::Complex32>)>,
     /// Last per-block FTCH timing breakdown.
     pub(super) last_snap_us: u64,
     pub(super) last_tc_n: usize,

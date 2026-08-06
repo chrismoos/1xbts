@@ -202,6 +202,29 @@ impl TrafficChannelWrapper {
             TrafficChannelWrapper::SchRc3(_ch) => None,
         }
     }
+
+    /// Generates a block and reports whether it contains a physical transmission.
+    /// F-SCH reports false during pre-start silence and Null/DTX.
+    pub fn next_block_into_with_activity(
+        &self,
+        out: &mut Vec<num::complex::Complex32>,
+        num_samples: usize,
+        system_time: CdmaSystemTime,
+    ) -> bool {
+        match self {
+            TrafficChannelWrapper::Rc1(ch) => {
+                ch.next_block_into(out, num_samples, system_time);
+                true
+            }
+            TrafficChannelWrapper::Rc3(ch) => {
+                ch.next_block_into(out, num_samples, system_time);
+                true
+            }
+            TrafficChannelWrapper::SchRc3(ch) => {
+                ch.next_block_into_with_activity(out, num_samples, system_time)
+            }
+        }
+    }
 }
 
 impl Channel for TrafficChannelWrapper {
@@ -830,6 +853,8 @@ pub fn allocate_sch_rc3(
     lc_generator: LongCodeGenerator,
     sch_gain_linear: f32,
     profile: Rc3FschProfile,
+    start_time_unit: u8,
+    start_time_mod32: u8,
 ) -> Option<(u8, SchWalshChannelRc3)> {
     let sch_code = walsh_allocator.lock().allocate_sch(profile.walsh_len)?;
 
@@ -856,6 +881,11 @@ pub fn allocate_sch_rc3(
             prev_frame_last_chip: 0,
             frame_pcg_index: 0,
             disable_lc_scrambling: false,
+            assignment_start: Some((
+                start_time_unit,
+                start_time_mod32 % crate::channels::f_sch_rc3::SCH_START_TIME_MODULUS,
+            )),
+            assignment_started: false,
         }),
     );
 

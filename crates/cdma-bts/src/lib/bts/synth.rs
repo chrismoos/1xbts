@@ -15,6 +15,13 @@ use super::{
 
 use cdma_common::consts::SR1_CHIPS_PER_FRAME;
 
+fn active_traffic_gain_sum(blocks: &[(f32, bool, Vec<Complex32>)]) -> f32 {
+    blocks
+        .iter()
+        .filter_map(|(gain, active, _)| active.then_some(*gain))
+        .sum()
+}
+
 pub(super) fn aligned_spreader(
     pilot_offset: usize,
     short_code_length_chips: usize,
@@ -119,7 +126,7 @@ pub(super) fn synthesize_block(
     );
     let snap_us = snap_start.elapsed().as_micros() as u64;
     while state.scratch_tc_blocks.len() < state.scratch_tc_snapshot.len() {
-        state.scratch_tc_blocks.push((0.0, Vec::new()));
+        state.scratch_tc_blocks.push((0.0, false, Vec::new()));
     }
     state
         .scratch_tc_blocks
@@ -127,11 +134,11 @@ pub(super) fn synthesize_block(
     let mut tc_sum_us = 0u64;
     let mut tc_max_us = 0u64;
     for (i, (gain, ch)) in state.scratch_tc_snapshot.iter().enumerate() {
-        let (g_slot, buf) = &mut state.scratch_tc_blocks[i];
+        let (g_slot, active_slot, buf) = &mut state.scratch_tc_blocks[i];
         *g_slot = *gain;
         buf.clear();
         let tc_start = Instant::now();
-        ch.next_block_into(buf, block_size, frame_system_time);
+        *active_slot = ch.next_block_into_with_activity(buf, block_size, frame_system_time);
         let dt = tc_start.elapsed().as_micros() as u64;
         tc_sum_us += dt;
         if dt > tc_max_us {
@@ -147,7 +154,7 @@ pub(super) fn synthesize_block(
     let pilot_gain = runtime.downlink.pilot.gain;
     let sync_gain = runtime.downlink.sync.gain;
     let paging_gain = runtime.downlink.paging.gain;
-    let tc_gain_sum: f32 = state.scratch_tc_blocks.iter().map(|(g, _)| *g).sum();
+    let tc_gain_sum = active_traffic_gain_sum(&state.scratch_tc_blocks);
     let inv_gain_sum = 1.0 / (pilot_gain + sync_gain + paging_gain + tc_gain_sum);
 
     let pilot_block = &state.scratch_pilot;
@@ -164,7 +171,10 @@ pub(super) fn synthesize_block(
             + sync_block[x].im * sync_gain
             + paging_block[x].im * paging_gain;
 
-        for (tc_gain, tc_samples) in tc_blocks {
+        for (tc_gain, active, tc_samples) in tc_blocks {
+            if !active {
+                continue;
+            }
             re += tc_samples[x].re * tc_gain;
             im += tc_samples[x].im * tc_gain;
         }
@@ -181,4 +191,29 @@ pub(super) fn synthesize_block(
     state.gen_time_max_us = state.gen_time_max_us.max(gen_us);
     state.synth_blocks += 1;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dtx_channel_does_not_consume_composite_gain() {
+        let blocks = vec![
+            (0.5, true, vec![Complex32::new(1.0, 0.0)]),
+            (1.998, false, vec![Complex32::new(0.0, 0.0)]),
+        ];
+
+        assert!((active_traffic_gain_sum(&blocks) - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn transmitting_sch_consumes_composite_gain() {
+        let blocks = vec![
+            (0.5, true, vec![Complex32::new(1.0, 0.0)]),
+            (1.998, true, vec![Complex32::new(1.0, 1.0)]),
+        ];
+
+        assert!((active_traffic_gain_sum(&blocks) - 2.498).abs() < 1e-6);
+    }
 }

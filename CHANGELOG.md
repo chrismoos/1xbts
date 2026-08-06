@@ -1,5 +1,6 @@
 # HEAD 
 
+- Fixed 1x downlink power drops while an assigned F-SCH is idle.
 - Improved EV-DO downlink stability under changing signal conditions.
 - Added additional air-interface diagnostics and logging.
 - Added real-time scheduling priorities across radio I/O threads.

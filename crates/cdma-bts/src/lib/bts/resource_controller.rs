@@ -152,6 +152,8 @@ impl TrafficResourceService {
         lc_generator: LongCodeGenerator,
         sch_gain_linear: f32,
         profile: cdma_common::sch::Rc3FschProfile,
+        start_time_unit: u8,
+        start_time_mod32: u8,
     ) -> Option<(u8, SchWalshChannelRc3)> {
         allocate_sch_rc3(
             &self.walsh_allocator,
@@ -159,6 +161,8 @@ impl TrafficResourceService {
             lc_generator,
             sch_gain_linear,
             profile,
+            start_time_unit,
+            start_time_mod32,
         )
     }
 

@@ -43,6 +43,7 @@ const LONG_CODE_PERIOD: u64 = (1u64 << 42) - 1;
 
 /// Chips per PCG on Spreading Rate 1.
 const PCG_CHIPS: usize = 1536;
+pub(crate) const SCH_START_TIME_MODULUS: u8 = 32;
 
 pub fn interleaver_params(profile: Rc3FschProfile) -> InterleaverParams {
     match profile.rate_bps {
@@ -62,6 +63,7 @@ struct PreparedSchFrame {
 
 struct SchTxState {
     symbol_buffer: VecDeque<Complex32>,
+    symbol_buffer_active: bool,
     pcg_scratch: Vec<Complex32>,
     prepared_frame: Option<PreparedSchFrame>,
 }
@@ -78,6 +80,9 @@ pub struct SchConfigRc3 {
     pub prev_frame_last_chip: u8,
     pub frame_pcg_index: usize,
     pub disable_lc_scrambling: bool,
+    /// ESCAM `(START_TIME_UNIT, FOR_SCH_START_TIME)` fields; `None` starts immediately.
+    pub assignment_start: Option<(u8, u8)>,
+    pub assignment_started: bool,
 }
 
 /// SCH frame prep state.
@@ -137,6 +142,7 @@ impl ForwardSupplementalChannelRc3 {
             config: Mutex::new(config),
             tx_state: Mutex::new(SchTxState {
                 symbol_buffer: VecDeque::new(),
+                symbol_buffer_active: false,
                 pcg_scratch: Vec::new(),
                 prepared_frame: None,
             }),
@@ -159,6 +165,8 @@ impl ForwardSupplementalChannelRc3 {
             prev_frame_last_chip: 0,
             frame_pcg_index: 0,
             disable_lc_scrambling: false,
+            assignment_start: None,
+            assignment_started: true,
         })
     }
 
@@ -249,20 +257,45 @@ impl ForwardSupplementalChannelRc3 {
         ));
     }
 
+    fn assignment_start_reached(config: &SchConfigRc3, system_time: CdmaSystemTime) -> bool {
+        let Some((start_time_unit, start_time_mod32)) = config.assignment_start else {
+            return true;
+        };
+        let unit_frames = u64::from(start_time_unit) + 1;
+        let time_units = cdma_common::time::system_time_20ms_frames(system_time) / unit_frames;
+        time_units % u64::from(SCH_START_TIME_MODULUS) == u64::from(start_time_mod32)
+    }
+
     fn emit_next_pcg_into(
         &self,
         config: &mut SchConfigRc3,
         tx_state: &mut SchTxState,
         out: &mut Vec<Complex32>,
-    ) {
+        system_time: CdmaSystemTime,
+    ) -> bool {
+        if !config.assignment_started {
+            if config.frame_pcg_index == 0 && Self::assignment_start_reached(config, system_time) {
+                config.assignment_started = true;
+                log::info!(
+                    "tx_fsch_rc3: assignment started at t20={} start_time_unit={} start_mod32={}",
+                    cdma_common::time::system_time_20ms_frames(system_time),
+                    config.assignment_start.map(|v| v.0).unwrap_or(0),
+                    config.assignment_start.map(|v| v.1).unwrap_or(0),
+                );
+            } else {
+                Self::emit_dtx_pcg_into(config, out);
+                return false;
+            }
+        }
+
         if tx_state.prepared_frame.is_none() {
             if config.frame_pcg_index != 0 {
                 Self::emit_dtx_pcg_into(config, out);
-                return;
+                return false;
             }
             let Some(mut prepared) = self.pop_next_frame() else {
                 Self::emit_dtx_pcg_into(config, out);
-                return;
+                return false;
             };
             prepared.frame_start_chip = config.lc_chip_cursor;
             tx_state.prepared_frame = Some(prepared);
@@ -322,6 +355,52 @@ impl ForwardSupplementalChannelRc3 {
             );
             tx_state.prepared_frame = None;
         }
+        true
+    }
+
+    /// Generates F-SCH symbols and reports whether the block contains a transmitted frame.
+    /// Activity comes from frame state rather than generated IQ values.
+    pub fn next_block_into_with_activity(
+        &self,
+        out: &mut Vec<Complex32>,
+        num_samples: usize,
+        system_time: CdmaSystemTime,
+    ) -> bool {
+        let mut config = self.config.lock();
+        let mut tx_state = self.tx_state.lock();
+        let target_len = out.len() + num_samples;
+        let mut active = false;
+        out.reserve(num_samples);
+
+        while out.len() < target_len {
+            if let Some(sample) = tx_state.symbol_buffer.pop_front() {
+                out.push(sample);
+                active |= tx_state.symbol_buffer_active;
+                continue;
+            }
+
+            let pcg_samples = config.profile.symbols_per_pcg() / 2;
+            if target_len - out.len() >= pcg_samples {
+                active |= self.emit_next_pcg_into(&mut config, &mut tx_state, out, system_time);
+                continue;
+            }
+
+            let mut scratch = std::mem::take(&mut tx_state.pcg_scratch);
+            scratch.clear();
+            let pcg_active =
+                self.emit_next_pcg_into(&mut config, &mut tx_state, &mut scratch, system_time);
+
+            let needed = target_len - out.len();
+            out.extend(scratch.iter().take(needed).copied());
+            active |= pcg_active && needed != 0;
+            tx_state
+                .symbol_buffer
+                .extend(scratch.iter().skip(needed).copied());
+            tx_state.symbol_buffer_active = pcg_active;
+            tx_state.pcg_scratch = scratch;
+        }
+
+        active
     }
 }
 
@@ -338,34 +417,7 @@ impl Channel for ForwardSupplementalChannelRc3 {
         num_samples: usize,
         _system_time: CdmaSystemTime,
     ) {
-        let mut config = self.config.lock();
-        let mut tx_state = self.tx_state.lock();
-        let target_len = out.len() + num_samples;
-        out.reserve(num_samples);
-
-        while out.len() < target_len {
-            if let Some(sample) = tx_state.symbol_buffer.pop_front() {
-                out.push(sample);
-                continue;
-            }
-
-            let pcg_samples = config.profile.symbols_per_pcg() / 2;
-            if target_len - out.len() >= pcg_samples {
-                self.emit_next_pcg_into(&mut config, &mut tx_state, out);
-                continue;
-            }
-
-            let mut scratch = std::mem::take(&mut tx_state.pcg_scratch);
-            scratch.clear();
-            self.emit_next_pcg_into(&mut config, &mut tx_state, &mut scratch);
-
-            let needed = target_len - out.len();
-            out.extend(scratch.iter().take(needed).copied());
-            tx_state
-                .symbol_buffer
-                .extend(scratch.iter().skip(needed).copied());
-            tx_state.pcg_scratch = scratch;
-        }
+        let _ = self.next_block_into_with_activity(out, num_samples, _system_time);
     }
 }
 
@@ -402,6 +454,8 @@ mod tests {
             prev_frame_last_chip: 0,
             frame_pcg_index: 0,
             disable_lc_scrambling: false,
+            assignment_start: None,
+            assignment_started: true,
         });
         sch.send_frame(vec![1u8; profile.info_bits]);
 
@@ -420,6 +474,82 @@ mod tests {
         let symbols = sch.next(CdmaSystemTime::default());
         assert_eq!(symbols.len(), profile.qpsk_symbols());
         assert!(symbols.iter().all(|s| s.re == 0.0 && s.im == 0.0));
+    }
+
+    #[test]
+    fn sch_activity_tracks_crc_bearing_frames() {
+        let sch = ForwardSupplementalChannelRc3::new_default(0xAABBCCDD);
+        let profile = Rc3FschProfile::default_19k2();
+        let mut symbols = Vec::new();
+
+        assert!(!sch.next_block_into_with_activity(
+            &mut symbols,
+            profile.qpsk_symbols(),
+            CdmaSystemTime::default(),
+        ));
+        assert!(symbols.iter().all(|s| s.re == 0.0 && s.im == 0.0));
+
+        sch.send_frame(vec![1u8; profile.info_bits]);
+        symbols.clear();
+        assert!(sch.next_block_into_with_activity(
+            &mut symbols,
+            profile.qpsk_symbols(),
+            CdmaSystemTime::default(),
+        ));
+        assert!(symbols.iter().any(|s| s.re != 0.0 || s.im != 0.0));
+    }
+
+    #[test]
+    fn sch_queued_frame_waits_for_explicit_assignment_start() {
+        let sch = ForwardSupplementalChannelRc3::new_default(0xAABBCCDD);
+        let profile = Rc3FschProfile::default_19k2();
+        {
+            let mut config = sch.config.lock();
+            config.assignment_start = Some((0, 5));
+            config.assignment_started = false;
+        }
+        sch.send_frame(vec![1u8; profile.info_bits]);
+
+        let frame_time =
+            |frame: u64| cdma_common::time::system_time_from_chips(frame * 24_576, 1_228_800);
+        let mut symbols = Vec::new();
+        assert!(!sch.next_block_into_with_activity(
+            &mut symbols,
+            profile.qpsk_symbols(),
+            frame_time(4),
+        ));
+        assert_eq!(sch.queue_len(), 1, "pre-start frame must remain queued");
+
+        symbols.clear();
+        assert!(sch.next_block_into_with_activity(
+            &mut symbols,
+            profile.qpsk_symbols(),
+            frame_time(5),
+        ));
+        assert_eq!(sch.queue_len(), 0);
+        assert!(symbols.iter().any(|s| s.re != 0.0 || s.im != 0.0));
+    }
+
+    #[test]
+    fn walsh_wrapper_preserves_sch_activity_metadata() {
+        let profile = Rc3FschProfile::default_19k2();
+        let walsh = crate::channels::WalshChannel::new(
+            crate::phy::walsh::WalshGenerator::new::<32>(2, 1),
+            ForwardSupplementalChannelRc3::new_default(0xAABBCCDD),
+        );
+        let mut chips = Vec::new();
+
+        assert!(!walsh.next_block_into_with_activity(
+            &mut chips,
+            24_576,
+            CdmaSystemTime::default(),
+        ));
+
+        walsh.channel.send_frame(vec![1u8; profile.info_bits]);
+        chips.clear();
+        assert!(
+            walsh.next_block_into_with_activity(&mut chips, 24_576, CdmaSystemTime::default(),)
+        );
     }
 
     #[test]

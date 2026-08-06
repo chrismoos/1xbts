@@ -456,7 +456,49 @@ where
 struct WalshState {
     walsh: WalshGenerator,
     buffer: VecDeque<Complex32>,
+    activity_segments: VecDeque<WalshActivitySegment>,
     symbol_scratch: Vec<Complex32>,
+}
+
+struct WalshActivitySegment {
+    remaining: usize,
+    active: bool,
+}
+
+impl WalshState {
+    fn push_activity(&mut self, count: usize, active: bool) {
+        if count == 0 {
+            return;
+        }
+        if let Some(last) = self.activity_segments.back_mut()
+            && last.active == active
+        {
+            last.remaining += count;
+            return;
+        }
+        self.activity_segments.push_back(WalshActivitySegment {
+            remaining: count,
+            active,
+        });
+    }
+
+    fn consume_activity(&mut self, mut count: usize) -> bool {
+        let mut active = false;
+        while count != 0 {
+            let segment = self
+                .activity_segments
+                .front_mut()
+                .expect("Walsh activity must track buffered chips");
+            let consumed = count.min(segment.remaining);
+            active |= segment.active;
+            segment.remaining -= consumed;
+            count -= consumed;
+            if segment.remaining == 0 {
+                self.activity_segments.pop_front();
+            }
+        }
+        active
+    }
 }
 
 impl<T> WalshChannel<T>
@@ -469,6 +511,7 @@ where
             state: Mutex::new(WalshState {
                 walsh,
                 buffer: VecDeque::new(),
+                activity_segments: VecDeque::new(),
                 symbol_scratch: Vec::new(),
             }),
         })
@@ -485,6 +528,7 @@ where
         for _ in 0..n {
             state.buffer.push_back(Complex32::new(0.0, 0.0));
         }
+        state.push_activity(n, false);
     }
 }
 
@@ -513,6 +557,7 @@ where
             state.symbol_scratch.clear();
             self.channel
                 .next_block_into(&mut state.symbol_scratch, symbols_needed, system_time);
+            let generated_chips = state.symbol_scratch.len() * chips_per_symbol;
             for sample in &state.symbol_scratch {
                 for _ in 0..state.walsh.repetition() {
                     for c in state.walsh.code() {
@@ -523,12 +568,58 @@ where
                     }
                 }
             }
+            // Other traffic channels transmit continuously.
+            state.push_activity(generated_chips, true);
             debug_assert!(state.buffer.len() >= num_samples);
         }
         out.reserve(num_samples);
         for _ in 0..num_samples {
             out.push(state.buffer.pop_front().unwrap());
         }
+        let _ = state.consume_activity(num_samples);
+    }
+}
+
+impl WalshChannel<crate::channels::f_sch_rc3::ForwardSupplementalChannelRc3> {
+    /// Walsh-spreads F-SCH symbols while preserving frame activity metadata.
+    pub fn next_block_into_with_activity(
+        &self,
+        out: &mut Vec<Complex32>,
+        num_samples: usize,
+        system_time: CdmaSystemTime,
+    ) -> bool {
+        let mut state = self.state.lock();
+        if state.buffer.len() < num_samples {
+            let chips_per_symbol = state.walsh.chips_per_symbol();
+            let deficit = num_samples - state.buffer.len();
+            let symbols_needed = deficit.div_ceil(chips_per_symbol);
+            let state = &mut *state;
+            state.symbol_scratch.clear();
+            let symbols_active = self.channel.next_block_into_with_activity(
+                &mut state.symbol_scratch,
+                symbols_needed,
+                system_time,
+            );
+            let generated_chips = state.symbol_scratch.len() * chips_per_symbol;
+            for sample in &state.symbol_scratch {
+                for _ in 0..state.walsh.repetition() {
+                    for c in state.walsh.code() {
+                        state.buffer.push_back(Complex32::new(
+                            *c as f32 * sample.re,
+                            *c as f32 * sample.im,
+                        ));
+                    }
+                }
+            }
+            state.push_activity(generated_chips, symbols_active);
+            debug_assert!(state.buffer.len() >= num_samples);
+        }
+
+        out.reserve(num_samples);
+        for _ in 0..num_samples {
+            out.push(state.buffer.pop_front().unwrap());
+        }
+        state.consume_activity(num_samples)
     }
 }
 
