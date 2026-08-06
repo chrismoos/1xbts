@@ -57,7 +57,10 @@ impl HrpdReverseTrafficFinger {
             );
             self.fast_drc_stats.window_attempts =
                 self.fast_drc_stats.window_attempts.saturating_add(1);
-            if let Some(symbol) = self.fast_drc_decoder.decode(&despread, drc_length) {
+            if let Some(symbol) = self
+                .fast_drc_decoder
+                .decode_pilot_derotated(&despread, drc_length)
+            {
                 self.publish_confirmed_drc(completion_slot, symbol, true);
             } else {
                 self.fast_drc_stats.window_none = self.fast_drc_stats.window_none.saturating_add(1);
@@ -133,7 +136,7 @@ impl HrpdReverseTrafficFinger {
             );
             self.fast_drc_stats.repetition_attempts =
                 self.fast_drc_stats.repetition_attempts.saturating_add(1);
-            if let Some(symbol) = self.fast_drc_decoder.decode(&despread, 1) {
+            if let Some(symbol) = self.fast_drc_decoder.decode_pilot_derotated(&despread, 1) {
                 self.publish_repeated_drc(completion_slot, symbol);
             } else {
                 self.fast_drc_stats.repetition_none =

@@ -177,6 +177,25 @@ impl DrcDecoder {
     /// {1,2,4,8}, or if the best-hypothesis peak does not exceed
     /// `threshold * mean` (treated as "no decodable DRC symbol present").
     pub fn decode(&self, chips: &[Complex32], drc_length: u8) -> Option<DrcSymbol> {
+        self.decode_inner(chips, drc_length, false)
+    }
+
+    /// Decode after removing the residual W0 pilot phase independently from
+    /// each repeated codeword.
+    pub(crate) fn decode_pilot_derotated(
+        &self,
+        chips: &[Complex32],
+        drc_length: u8,
+    ) -> Option<DrcSymbol> {
+        self.decode_inner(chips, drc_length, true)
+    }
+
+    fn decode_inner(
+        &self,
+        chips: &[Complex32],
+        drc_length: u8,
+        pilot_derotate: bool,
+    ) -> Option<DrcSymbol> {
         if !matches!(drc_length, 1 | 2 | 4 | 8) {
             return None;
         }
@@ -202,6 +221,22 @@ impl DrcDecoder {
         let total_codewords = (drc_length as usize) * DRC_CODEWORDS_PER_SLOT;
         for cw_idx in 0..total_codewords {
             let cw_start = cw_idx * DRC_CHIPS_PER_CODEWORD;
+            let codeword_derotation = if pilot_derotate {
+                // The DRC Walsh channels sum to zero over a codeword, leaving
+                // W0 as the local phase reference.
+                let pilot = chips[cw_start..cw_start + DRC_CHIPS_PER_CODEWORD]
+                    .iter()
+                    .copied()
+                    .sum::<Complex32>();
+                let norm = pilot.norm();
+                if norm > f32::EPSILON {
+                    pilot.conj() / norm
+                } else {
+                    Complex32::new(1.0, 0.0)
+                }
+            } else {
+                Complex32::new(1.0, 0.0)
+            };
             for bit_idx in 0..DRC_CODEWORD_BITS {
                 // Outer despread: produce DRC_INNER_WALSH_LEN soft Walsh chips
                 // for this bit position.
@@ -214,7 +249,7 @@ impl DrcDecoder {
                 }
                 // Inner despread: correlate against W_DRCCover^8. Take the Q
                 // component (DRC is on the Q arm per §9.2.1.3.1).
-                let inner_out = inner.process_symbol(&walsh_chips);
+                let inner_out = inner.process_symbol(&walsh_chips) * codeword_derotation;
                 soft_bits[bit_idx] += inner_out.im;
             }
         }
@@ -384,6 +419,28 @@ mod tests {
             let sym = dec.decode(&chips, len).expect("decode");
             assert_eq!(sym.value, 0xC, "drc_length {len}: mismatch");
         }
+    }
+
+    #[test]
+    fn pilot_derotation_combines_codewords_with_different_phase() {
+        let cover = 1;
+        let value = 0xE;
+        let dec = DrcDecoder::new(cover);
+        let mut chips = encode_drc(value, cover, 1);
+
+        for (codeword, chunk) in chips.chunks_mut(DRC_CHIPS_PER_CODEWORD).enumerate() {
+            let rotation = if codeword == 0 {
+                Complex32::new(1.0, 0.0)
+            } else {
+                Complex32::new(-1.0, 0.0)
+            };
+            for chip in chunk {
+                *chip = (*chip + Complex32::new(0.25, 0.0)) * rotation;
+            }
+        }
+
+        assert!(dec.decode(&chips, 1).is_none());
+        assert_eq!(dec.decode_pilot_derotated(&chips, 1).unwrap().value, value);
     }
 
     #[test]

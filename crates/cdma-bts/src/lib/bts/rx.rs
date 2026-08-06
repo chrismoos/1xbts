@@ -5903,6 +5903,9 @@ mod tests {
         expected_uati: u32,
         mac_index: u8,
         min_drc_events: usize,
+        min_unique_drc_windows: usize,
+        drc_cover: Option<u8>,
+        drc_length: Option<u8>,
         physical_layer_subtype: u16,
         reverse_traffic_mac_subtype: u16,
         /// Exact decoded reverse Stream 0 / Stream 1 event counts, when the
@@ -6074,8 +6077,8 @@ mod tests {
             physical_layer_subtype: fixture.physical_layer_subtype,
             reverse_traffic_mac_subtype: fixture.reverse_traffic_mac_subtype,
             frame_offset: 0,
-            drc_cover: 0,
-            drc_length: 1,
+            drc_cover: fixture.drc_cover.unwrap_or(0),
+            drc_length: fixture.drc_length.unwrap_or(1),
         };
 
         let mut slice = RxCarrierSlice::new(
@@ -6275,6 +6278,7 @@ mod tests {
         }
         let mut pilot_count = 0usize;
         let mut drc_count = 0usize;
+        let mut drc_slots = std::collections::BTreeSet::new();
         let mut ack_count = 0usize;
         let mut stream0_count = 0usize;
         let mut stream1_count = 0usize;
@@ -6282,34 +6286,28 @@ mod tests {
             match ev {
                 HrpdTrafficEvent::ReversePilot { .. } => pilot_count += 1,
                 HrpdTrafficEvent::ReversePilotLost { .. } => {}
-                HrpdTrafficEvent::Drc { .. } => drc_count += 1,
+                HrpdTrafficEvent::Drc { slot, .. } => {
+                    drc_count += 1;
+                    drc_slots.insert(*slot);
+                }
                 HrpdTrafficEvent::Ack { .. } => ack_count += 1,
                 HrpdTrafficEvent::Stream0Signaling { .. } => stream0_count += 1,
                 HrpdTrafficEvent::Stream1Packet { .. } => stream1_count += 1,
             }
         }
         eprintln!(
-            "HRPD {}: total events: pilot={pilot_count} drc={drc_count} ack={ack_count} stream0={stream0_count} stream1={stream1_count}",
-            fixture.label
+            "HRPD {}: total events: pilot={pilot_count} drc={drc_count} unique_drc={} ack={ack_count} stream0={stream0_count} stream1={stream1_count}",
+            fixture.label,
+            drc_slots.len(),
         );
         let mut stream0_payloads: Vec<&[u8]> = Vec::new();
         let mut stream1_payloads: Vec<&[u8]> = Vec::new();
         for ev in &all_events {
             match ev {
                 HrpdTrafficEvent::Stream0Signaling { payload, .. } => {
-                    eprintln!(
-                        "  stream0 len={} {:02x?}",
-                        payload.len(),
-                        &payload[..payload.len().min(16)]
-                    );
                     stream0_payloads.push(payload);
                 }
                 HrpdTrafficEvent::Stream1Packet { payload, .. } => {
-                    eprintln!(
-                        "  stream1 len={} {:02x?}",
-                        payload.len(),
-                        &payload[..payload.len().min(16)]
-                    );
                     stream1_payloads.push(payload);
                 }
                 _ => {}
@@ -6329,6 +6327,19 @@ mod tests {
                 fixture.label
             );
         }
+        assert!(
+            drc_count >= fixture.min_drc_events,
+            "{}: decoded DRC event count fell below {} (decoded={drc_count})",
+            fixture.label,
+            fixture.min_drc_events,
+        );
+        assert!(
+            drc_slots.len() >= fixture.min_unique_drc_windows,
+            "{}: decoded unique DRC windows fell below {} (decoded={})",
+            fixture.label,
+            fixture.min_unique_drc_windows,
+            drc_slots.len(),
+        );
         for expected in fixture.expected_stream0_payloads {
             assert!(
                 stream0_payloads.iter().any(|p| p == expected),
@@ -6548,6 +6559,9 @@ mod tests {
             expected_uati: 0x1a1e_58d5,
             mac_index: 6,
             min_drc_events: 200,
+            min_unique_drc_windows: 0,
+            drc_cover: None,
+            drc_length: None,
             physical_layer_subtype: 2,
             reverse_traffic_mac_subtype: 3,
             // Locked baseline for the fixed subtype-2 RRI: 50 signaling and
@@ -6565,6 +6579,47 @@ mod tests {
             expected_stream1_payload_prefixes: &[
                 // HDLC flag + PPP LCP (0xc021) Configure-Request.
                 &[0x7e, 0xff, 0x7d, 0x23, 0xc0, 0x21],
+            ],
+        });
+    }
+
+    #[test]
+    fn capture_hrpd_reverse_traffic_1806148344446687() {
+        let wav_path: PathBuf = [
+            env!("CARGO_MANIFEST_DIR"),
+            "..",
+            "..",
+            "test",
+            "capture",
+            "1806148344446687.wav",
+        ]
+        .iter()
+        .collect();
+        drive_hrpd_reverse_traffic_worker_capture(HrpdTrafficCaptureFixture {
+            label: "1806148344446687-reva-traffic",
+            wav_path,
+            sample_rate_hz: 4_915_200,
+            chip_rate_hz: 1_228_800,
+            first_absolute_sample_start: 7_224_593_377_786_749,
+            start_sample_offset: 35_000_000,
+            hrpd_rx_shift_hz: -915_000,
+            expected_uati: 0x1a0a_e0ec,
+            mac_index: 6,
+            min_drc_events: 590,
+            min_unique_drc_windows: 248,
+            drc_cover: Some(1),
+            drc_length: Some(8),
+            physical_layer_subtype: 2,
+            reverse_traffic_mac_subtype: 3,
+            expected_stream0_events: Some(11),
+            expected_stream1_events: Some(371),
+            expected_stream0_payloads: &[
+                &[0x01, 0x88, 0x0e, 0x02, 0x00],
+                &[0x01, 0x09, 0x0e, 0x00, 0x06, 0x00, 0x01, 0x00],
+            ],
+            expected_stream1_payload_prefixes: &[
+                &[0x7e, 0xff, 0x7d, 0x23, 0xc0, 0x21],
+                &[0x7e, 0x21, 0x45, 0x00],
             ],
         });
     }

@@ -1,5 +1,6 @@
 # HEAD 
 
+- Improved EV-DO downlink stability under changing signal conditions.
 - Added additional air-interface diagnostics and logging.
 - Added real-time scheduling priorities across radio I/O threads.
 - Reduced EV-DO forward traffic TX stalls by preparing packet coding before
