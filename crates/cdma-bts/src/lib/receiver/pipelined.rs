@@ -1969,6 +1969,103 @@ mod tests {
         );
     }
 
+    /// Regression for noisy HRPD reverse-access bursts.
+    #[test]
+    fn capture_hrpd_reverse_access_bursts_1806111468045380() {
+        init_test_logger();
+        let metadata_path = test_capture_path("1806111468045380.json");
+        let wav_path = test_capture_path("1806111468045380.wav");
+        let metadata = test_capture_metadata_from_path(&metadata_path);
+        assert_eq!(metadata.sample_rate_hz, 4_915_200);
+        assert_eq!(metadata.chip_rate_hz, ACCESS_CHIP_RATE as usize);
+        assert_eq!(metadata.hrpd_reverse_frequency_hz, Some(843_900_000));
+        assert_eq!(metadata.hrpd_rx_shift_hz, Some(-915_000));
+
+        let hrpd_shift_hz = metadata.hrpd_rx_shift_hz.expect("sidecar HRPD shift");
+        let (sample_rate, iq_samples, absolute_sample_start) =
+            read_shifted_capture_to_4x_with_shift(&wav_path, &metadata, hrpd_shift_hz);
+        let oversample = (sample_rate as usize) / ACCESS_CHIP_RATE as usize;
+        assert_eq!(oversample, 4, "shifted HRPD slice should be 4x chip rate");
+
+        let pipeline = hrpd_reverse_access_chain(HrpdReverseAccessSettings {
+            oversample,
+            sector_id_lsb: 0,
+            color_code: 26,
+            preamble_frames: 3,
+            ..HrpdReverseAccessSettings::default()
+        });
+        let total_samples = iq_samples.len();
+        let mut receiver = PipelinedReceiver::new(iq_samples.into_iter())
+            .with_batch_size(32768)
+            .with_input_sample_rate_hz(sample_rate as f64)
+            .with_absolute_sample_start(absolute_sample_start);
+        let out_rx = receiver.add_pipeline(pipeline);
+        let pipeline_start = std::time::Instant::now();
+        receiver.run_pipeline().unwrap();
+        let pipeline_elapsed = pipeline_start.elapsed();
+        let events = collect_hrpd_access_capture_events(out_rx);
+        let fcs_valid = events
+            .iter()
+            .filter(|event| event.single_fragment_fcs_valid)
+            .collect::<Vec<_>>();
+        for (idx, event) in events.iter().enumerate() {
+            eprintln!(
+                "HRPD 1806111468045380 event #{}: chip={} phy_crc_valid={} mac_fragment_valid={} single_fragment_fcs_valid={} msg_len={:?} info_hex={} decoded={}",
+                idx + 1,
+                event.packet_start,
+                event.phy_crc_valid,
+                event.mac_fragment_valid,
+                event.single_fragment_fcs_valid,
+                event.mac_length_octets,
+                event.info_hex,
+                event.decoded,
+            );
+        }
+        eprintln!(
+            "HRPD 1806111468045380 summary: streaming_events={} fcs_valid={} capture={:.2}s pipeline={:.2}s real_time={:.2}x",
+            events.len(),
+            fcs_valid.len(),
+            total_samples as f64 / sample_rate as f64,
+            pipeline_elapsed.as_secs_f64(),
+            (total_samples as f64 / sample_rate as f64) / pipeline_elapsed.as_secs_f64(),
+        );
+        let packet_starts = fcs_valid
+            .iter()
+            .map(|event| event.packet_start as u64)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            packet_starts,
+            vec![
+                1_806_111_473_139_712,
+                1_806_111_473_598_464,
+                1_806_111_474_024_448,
+                1_806_111_474_483_200,
+                1_806_111_474_974_720,
+                1_806_111_475_466_240,
+                1_806_111_476_056_064,
+                1_806_111_476_514_816,
+                1_806_111_477_530_624,
+                1_806_111_478_022_144,
+                1_806_111_478_480_896,
+                1_806_111_479_103_488,
+                1_806_111_479_660_544,
+                1_806_111_480_086_528,
+                1_806_111_481_069_568,
+                1_806_111_481_528_320,
+            ],
+            "expected all 16 CRC-valid HRPD reverse-access reprobes"
+        );
+        assert!(
+            fcs_valid.iter().all(|event| {
+                event.decoded.contains("ati=Uati/0x1a680b39")
+                    && event.decoded.contains("RouteUpdate")
+                    && event.decoded.contains("ConnectionRequest(transaction=0x45")
+            }),
+            "unexpected HRPD reverse-access contents: {:?}",
+            fcs_valid,
+        );
+    }
+
     #[test]
     fn capture_hrpd_reverse_access_bursts_1799956520441591() {
         init_test_logger();

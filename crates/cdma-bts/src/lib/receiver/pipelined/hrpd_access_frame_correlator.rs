@@ -32,6 +32,9 @@ use crate::receiver::hrpd::reverse_spread::{
 use crate::receiver::pipelined::generic_rake_receiver::{BaseFinger, Correlator, RakeFinger};
 use crate::receiver::pipelined::{PipelineProcessorShared, SampleBlock};
 
+const ACCESS_PREAMBLE_MIN_LAG_COHERENCE: f32 = 0.40;
+const ACCESS_PREAMBLE_MIN_SPEC_COHERENCE: f32 = 0.35;
+
 #[derive(Clone, Debug)]
 pub struct HrpdAccessFrameFftConfig {
     pub oversample: usize,
@@ -391,9 +394,7 @@ impl HrpdReverseFingerSpawnStrategy for HrpdAccessFrameSpawnStrategy {
         if probe_end_sample > buffer_abs_signed + buffer.len() as i64 {
             return SpawnOutcome::Defer;
         }
-        // 2. Noise gate: preamble lag coherence separates noise (~0.1) from
-        //    preamble (0.95+) cheaply. The 0.80 gate sits below the sweep's
-        //    0.88 coarse gate to leave margin.
+        // 2. Noise gate.
         let mut pregate_coherence = 0.0f32;
         for frame_back in 0..=1i64 {
             let start_chip = aligned_start_chip - frame_back * ACCESS_PACKET_CHIPS as i64;
@@ -408,7 +409,7 @@ impl HrpdReverseFingerSpawnStrategy for HrpdAccessFrameSpawnStrategy {
                 pregate_coherence = pregate_coherence.max(coherence);
             }
         }
-        if pregate_coherence < 0.80 {
+        if pregate_coherence < ACCESS_PREAMBLE_MIN_LAG_COHERENCE {
             log::trace!(
                 "HRPD access frame FFT rake: noise-gated hit snr={:.1}x aligned_start_chip={} pregate_lag_coh={:.3}",
                 hit.snr,
@@ -430,7 +431,10 @@ impl HrpdReverseFingerSpawnStrategy for HrpdAccessFrameSpawnStrategy {
         );
         let Some(timing) = timings
             .iter()
-            .find(|candidate| candidate.lag_coherence >= 0.90 && candidate.spec_coherence >= 0.80)
+            .find(|candidate| {
+                candidate.lag_coherence >= ACCESS_PREAMBLE_MIN_LAG_COHERENCE
+                    && candidate.spec_coherence >= ACCESS_PREAMBLE_MIN_SPEC_COHERENCE
+            })
             .cloned()
         else {
             let best = timings.iter().max_by(|a, b| {
@@ -447,7 +451,7 @@ impl HrpdReverseFingerSpawnStrategy for HrpdAccessFrameSpawnStrategy {
             );
             // Frame-periodic but not our preamble: a foreign signal.
             // Suppress further hits for a couple of frames.
-            if pregate_coherence >= 0.80 {
+            if pregate_coherence >= ACCESS_PREAMBLE_MIN_LAG_COHERENCE {
                 self.foreign_signal_until_chip =
                     aligned_start_chip + (2 * ACCESS_PACKET_CHIPS) as i64;
             }
@@ -1302,7 +1306,7 @@ fn timing_candidates_near_fft_hit(
                 ) else {
                     continue;
                 };
-                if lag_coherence >= 0.88 {
+                if lag_coherence >= ACCESS_PREAMBLE_MIN_LAG_COHERENCE {
                     coarse.push(HrpdAccessPreambleTiming {
                         preamble_start_chip: start_chip,
                         sample_delay,
@@ -1352,7 +1356,7 @@ fn timing_candidates_near_fft_hit(
                 ) else {
                     continue;
                 };
-                if lag_coherence < 0.90 {
+                if lag_coherence < ACCESS_PREAMBLE_MIN_LAG_COHERENCE {
                     continue;
                 }
                 let spec_coherence = preamble_spec_coherence_with_reference(
@@ -1365,7 +1369,7 @@ fn timing_candidates_near_fft_hit(
                     &reference,
                 )
                 .unwrap_or(0.0);
-                if spec_coherence < 0.80 {
+                if spec_coherence < ACCESS_PREAMBLE_MIN_SPEC_COHERENCE {
                     continue;
                 }
                 all.push(HrpdAccessPreambleTiming {
