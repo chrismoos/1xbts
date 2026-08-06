@@ -233,6 +233,56 @@ impl Default for OverheadSettings {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct RealtimeSettings {
+    /// Request real-time scheduling for radio and baseband threads.
+    pub enabled: bool,
+    /// Linux SCHED_FIFO priority for the TX thread.
+    pub tx_priority: i32,
+    /// Linux SCHED_FIFO priority for the RX thread.
+    pub rx_priority: i32,
+    /// Linux SCHED_FIFO priority used while radio drivers create workers.
+    pub driver_priority: i32,
+    /// Optional Linux CPU index for the TX thread.
+    pub tx_cpu: Option<usize>,
+    /// Optional Linux CPU index for the RX thread.
+    pub rx_cpu: Option<usize>,
+    /// Optional Linux CPU index inherited by radio-driver workers.
+    pub driver_cpu: Option<usize>,
+}
+
+impl Default for RealtimeSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tx_priority: 80,
+            rx_priority: 75,
+            driver_priority: 70,
+            tx_cpu: None,
+            rx_cpu: None,
+            driver_cpu: None,
+        }
+    }
+}
+
+impl RealtimeSettings {
+    fn validate(&self) -> Result<(), Error> {
+        if self.enabled {
+            for (name, priority) in [
+                ("tx_priority", self.tx_priority),
+                ("rx_priority", self.rx_priority),
+                ("driver_priority", self.driver_priority),
+            ] {
+                if !(1..=99).contains(&priority) {
+                    return Err(format!("runtime.realtime.{name} must be in 1..=99").into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct BtsRuntimeSettings {
     pub spreading_rate: SpreadingRate,
     pub orthogonal_code_length: usize,
@@ -266,6 +316,7 @@ pub struct BtsRuntimeSettings {
     /// made close to real-time so that BSC-enqueued PDUs are picked up
     /// promptly.  Set to 0 to disable the cap (old behaviour).
     pub max_tx_lookahead_ms: u32,
+    pub realtime: RealtimeSettings,
 }
 
 impl Default for BtsRuntimeSettings {
@@ -286,12 +337,14 @@ impl Default for BtsRuntimeSettings {
             uplink: UplinkSettings::default(),
             overhead: OverheadSettings::default(),
             max_tx_lookahead_ms: 5,
+            realtime: RealtimeSettings::default(),
         }
     }
 }
 
 impl BtsRuntimeSettings {
     pub fn validate(&self) -> Result<(), Error> {
+        self.realtime.validate()?;
         if self.spreading_rate != SpreadingRate::Sr1 {
             return Err("only spreading_rate=sr1 is currently implemented".into());
         }
@@ -783,6 +836,16 @@ mod tests {
             hrpd_channel: 425,
             hrpd_color_code: 26,
         }
+    }
+
+    #[test]
+    fn realtime_priorities_must_be_valid_when_enabled() {
+        let mut runtime = BtsRuntimeSettings::default();
+        runtime.realtime.tx_priority = 0;
+        assert!(runtime.validate().is_err());
+
+        runtime.realtime.enabled = false;
+        assert!(runtime.validate().is_ok());
     }
 
     #[test]

@@ -3,9 +3,9 @@ use std::{
     fs,
     io::BufWriter,
     path::PathBuf,
-    sync::Arc,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::mpsc,
+    sync::{Arc, Weak},
     time::{Duration, Instant},
 };
 
@@ -48,7 +48,7 @@ use crate::sdr::{PhasorNco, fir::SymmetricComplexFir32};
 use super::{
     AccessChannelEvent, BtsCommand, BtsPowerControlRegistry, IqCaptureControlResult,
     IqCaptureStatus, RxSettings,
-    handle::{RxMetrics, StageMetrics, TrafficChannelPool},
+    handle::{RxMetrics, RxQueueMetrics, StageMetrics, TrafficChannelPool},
     power_control::PCG_PREDICTION_LEAD_PCGS,
     settings,
 };
@@ -65,6 +65,7 @@ mod rx_events;
 
 static ACCESS_EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
 static REVERSE_BEARER_SEQ: AtomicU64 = AtomicU64::new(1);
+const RX_QUEUE_WARN_THRESHOLD_US: u64 = 20_000;
 fn next_access_event_id() -> String {
     format!(
         "access-{:016x}",
@@ -304,6 +305,93 @@ struct TrafficRxBlock {
     enqueue_time: std::time::Instant,
 }
 
+struct RxQueueCounters {
+    name: String,
+    sample_rate_hz: u64,
+    queued_samples: AtomicU64,
+    max_queued_samples: AtomicU64,
+    max_residency_us: AtomicU64,
+}
+
+#[derive(Clone)]
+struct RxQueueTracker(Arc<RxQueueCounters>);
+
+impl RxQueueTracker {
+    fn enqueue(&self, samples: usize) {
+        let queued = self
+            .0
+            .queued_samples
+            .fetch_add(samples as u64, Ordering::Relaxed)
+            .saturating_add(samples as u64);
+        self.0
+            .max_queued_samples
+            .fetch_max(queued, Ordering::Relaxed);
+    }
+
+    fn dequeue(&self, samples: usize, enqueue_time: Instant) {
+        let samples = samples as u64;
+        let _ =
+            self.0
+                .queued_samples
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
+                    Some(queued.saturating_sub(samples))
+                });
+        self.0
+            .max_residency_us
+            .fetch_max(enqueue_time.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+
+    fn rollback(&self, samples: usize) {
+        let _ =
+            self.0
+                .queued_samples
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
+                    Some(queued.saturating_sub(samples as u64))
+                });
+    }
+}
+
+#[derive(Clone, Default)]
+struct RxQueueRegistry(Arc<parking_lot::Mutex<Vec<Weak<RxQueueCounters>>>>);
+
+impl RxQueueRegistry {
+    fn register(&self, name: impl Into<String>, sample_rate_hz: usize) -> RxQueueTracker {
+        let tracker = RxQueueTracker(Arc::new(RxQueueCounters {
+            name: name.into(),
+            sample_rate_hz: sample_rate_hz.max(1) as u64,
+            queued_samples: AtomicU64::new(0),
+            max_queued_samples: AtomicU64::new(0),
+            max_residency_us: AtomicU64::new(0),
+        }));
+        self.0.lock().push(Arc::downgrade(&tracker.0));
+        tracker
+    }
+
+    fn snapshot(&self) -> Vec<RxQueueMetrics> {
+        let mut queues = self.0.lock();
+        let mut snapshots = Vec::with_capacity(queues.len());
+        queues.retain(|weak| {
+            let Some(queue) = weak.upgrade() else {
+                return false;
+            };
+            let queued_samples = queue.queued_samples.load(Ordering::Relaxed);
+            let max_queued_samples = queue
+                .max_queued_samples
+                .swap(queued_samples, Ordering::Relaxed)
+                .max(queued_samples);
+            snapshots.push(RxQueueMetrics {
+                name: queue.name.clone(),
+                queued_samples,
+                queued_airtime_us: queued_samples.saturating_mul(1_000_000) / queue.sample_rate_hz,
+                max_queued_samples,
+                max_residency_us: queue.max_residency_us.swap(0, Ordering::Relaxed),
+            });
+            true
+        });
+        snapshots
+    }
+}
+
 /// HRPD carrier-sliced IQ block sent from the main RX loop to the access worker.
 struct HrpdAccessRxBlock {
     block: CarrierSliceBlock,
@@ -325,11 +413,13 @@ struct TrafficRxThread {
     walsh_code: u8,
     tx: mpsc::Sender<TrafficRxBlock>,
     shutdown: Arc<AtomicBool>,
+    queue: RxQueueTracker,
 }
 
 /// Handle to the HRPD reverse access worker.
 struct HrpdAccessRxThread {
     tx: mpsc::Sender<HrpdAccessRxBlock>,
+    queue: RxQueueTracker,
 }
 
 /// Handle to a running HRPD reverse traffic worker.
@@ -337,6 +427,7 @@ struct HrpdTrafficRxThread {
     uati: u32,
     mac_index: u8,
     tx: crossbeam_channel::Sender<HrpdTrafficRxBlock>,
+    queue: RxQueueTracker,
 }
 
 const PCG_CHIPS: usize = 1536;
@@ -390,6 +481,7 @@ fn spawn_traffic_rx_thread(
     traffic_ack_seq_tx: Option<tokio_mpsc::Sender<(u8, u8)>>,
     bearer_bts_id: u32,
     bearer_cell_id: u32,
+    queue_registry: &RxQueueRegistry,
 ) -> TrafficRxThread {
     let settings = crate::receiver::pipelined::ReverseTrafficSettings {
         oversample,
@@ -403,6 +495,11 @@ fn spawn_traffic_rx_thread(
         finger_pool_size,
     };
     let (iq_tx, iq_rx) = mpsc::channel::<TrafficRxBlock>();
+    let queue = queue_registry.register(
+        format!("main-to-1x-traffic-w{walsh_code}"),
+        chip_rate_hz.saturating_mul(oversample),
+    );
+    let worker_queue = queue.clone();
     let thread_shutdown = Arc::new(AtomicBool::new(false));
     let thread_shutdown_clone = thread_shutdown.clone();
     let continuity_configured = traffic_rx_continuity;
@@ -429,6 +526,7 @@ fn spawn_traffic_rx_thread(
                 traffic_ack_seq_tx,
                 bearer_bts_id,
                 bearer_cell_id,
+                worker_queue,
             );
         })
         .expect("failed to spawn traffic RX thread");
@@ -437,6 +535,7 @@ fn spawn_traffic_rx_thread(
         walsh_code,
         tx: iq_tx,
         shutdown: thread_shutdown,
+        queue,
     }
 }
 
@@ -447,10 +546,14 @@ fn spawn_hrpd_access_rx_thread(
     sector_pilot_pn: u16,
     event_tx: Option<tokio_mpsc::UnboundedSender<HrpdAccessIndication>>,
     shutdown: Arc<AtomicBool>,
+    sample_rate_hz: usize,
+    queue_registry: &RxQueueRegistry,
 ) -> HrpdAccessRxThread {
     // Access-burst timing must stay contiguous; dropping IQ in the middle of
     // a burst corrupts the preamble/capsule relationship.
     let (iq_tx, iq_rx) = mpsc::channel::<HrpdAccessRxBlock>();
+    let queue = queue_registry.register("main-to-hrpd-access", sample_rate_hz);
+    let worker_queue = queue.clone();
     std::thread::Builder::new()
         .name("hrpd-access-rx".to_string())
         .spawn(move || {
@@ -463,6 +566,7 @@ fn spawn_hrpd_access_rx_thread(
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 };
+                worker_queue.dequeue(blk.block.samples.len(), blk.enqueue_time);
                 let queue_delay_us = blk.enqueue_time.elapsed().as_micros() as u64;
                 let hrpd_block = blk.block;
                 let mut block = SampleBlock::new(hrpd_block.samples, hrpd_block.relative_sample_start)
@@ -506,7 +610,7 @@ fn spawn_hrpd_access_rx_thread(
         })
         .expect("failed to spawn HRPD access RX thread");
 
-    HrpdAccessRxThread { tx: iq_tx }
+    HrpdAccessRxThread { tx: iq_tx, queue }
 }
 
 fn spawn_hrpd_traffic_rx_thread(
@@ -515,6 +619,7 @@ fn spawn_hrpd_traffic_rx_thread(
     event_tx: Option<tokio_mpsc::UnboundedSender<HrpdTrafficEvent>>,
     harq_bus: Option<Arc<crate::bts::hrpd::HarqBus>>,
     shutdown: Arc<AtomicBool>,
+    queue_registry: &RxQueueRegistry,
 ) -> HrpdTrafficRxThread {
     use crate::receiver::hrpd::reverse_traffic_rake::HrpdReverseTrafficCorrelator;
     use crate::receiver::pipelined::generic_rake_receiver::GenericRakeReceiver;
@@ -528,6 +633,11 @@ fn spawn_hrpd_traffic_rx_thread(
     let (iq_tx, iq_rx) = crossbeam_channel::unbounded::<HrpdTrafficRxBlock>();
     let uati = assignment.uati;
     let mac_index = assignment.mac_index;
+    let queue = queue_registry.register(
+        format!("main-to-hrpd-traffic-mac{mac_index}"),
+        oversample.saturating_mul(HRPD_CHIP_RATE_HZ as usize),
+    );
+    let worker_queue = queue.clone();
     let reverse_pilot_acquired = Arc::new(AtomicBool::new(false));
     let correlator = HrpdReverseTrafficCorrelator::new(
         assignment.clone(),
@@ -576,6 +686,7 @@ fn spawn_hrpd_traffic_rx_thread(
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                 };
+                worker_queue.dequeue(blk.samples.len(), blk.enqueue_time);
                 let queue_us = blk.enqueue_time.elapsed().as_micros() as u64;
                 queue_age_samples = queue_age_samples.saturating_add(1);
                 queue_age_total_us = queue_age_total_us.saturating_add(queue_us);
@@ -711,13 +822,17 @@ fn spawn_hrpd_traffic_rx_thread(
         uati,
         mac_index,
         tx: iq_tx,
+        queue,
     }
 }
 
 fn send_hrpd_traffic_rx_block(thread: &HrpdTrafficRxThread, block: HrpdTrafficRxBlock) -> bool {
+    let samples = block.samples.len();
+    thread.queue.enqueue(samples);
     match thread.tx.send(block) {
         Ok(()) => true,
         Err(_) => {
+            thread.queue.rollback(samples);
             warn!(
                 "rx: HRPD traffic RX thread exited uati=0x{:08x} mac={}",
                 thread.uati, thread.mac_index
@@ -1075,6 +1190,7 @@ pub(super) struct RxRuntime {
     hrpd_rx_slice: Option<RxCarrierSlice>,
     hrpd_access_thread: Option<HrpdAccessRxThread>,
     hrpd_traffic_threads: Vec<HrpdTrafficRxThread>,
+    queue_registry: RxQueueRegistry,
     pipeline_oversample: usize,
     capture_writer: Option<WavWriter<BufWriter<std::fs::File>>>,
     capture_target_samples: Option<usize>,
@@ -1644,6 +1760,7 @@ pub(super) fn open_rx_runtime(rx: RxSettings) -> Result<RxRuntime, Error> {
         hrpd_rx_slice,
         hrpd_access_thread: None,
         hrpd_traffic_threads: Vec::new(),
+        queue_registry: RxQueueRegistry::default(),
         pipeline_oversample,
         capture_writer,
         capture_target_samples,
@@ -1687,6 +1804,11 @@ fn start_hrpd_access_worker(runtime: &mut RxRuntime, shutdown: Arc<AtomicBool>) 
         runtime.config.pilot_pn,
         runtime.config.hrpd_access_event_tx.clone(),
         shutdown,
+        runtime
+            .config
+            .chip_rate_hz
+            .saturating_mul(runtime.pipeline_oversample),
+        &runtime.queue_registry,
     ));
 }
 
@@ -2005,6 +2127,10 @@ pub(super) fn run_rx_loop(
     // thread drains as fast as it can; if it falls behind, the queue grows in
     // memory (preferable to losing samples).
     let (tx, rx_chan) = mpsc::channel::<RxReaderMessage>();
+    let reader_queue = runtime
+        .queue_registry
+        .register("sdr-reader-to-main", runtime.config.sample_rate_hz);
+    let reader_queue_tx = reader_queue.clone();
 
     let shutdown_reader = shutdown.clone();
     let sample_rate_hz = runtime.config.sample_rate_hz;
@@ -2076,6 +2202,7 @@ pub(super) fn run_rx_loop(
                             max_receive_us,
                         );
                         let fill = vec![Complex32::new(0.0, 0.0); gap_samples];
+                        reader_queue_tx.enqueue(gap_samples);
                         if tx
                             .send(RxReaderMessage {
                                 samples: fill,
@@ -2086,6 +2213,7 @@ pub(super) fn run_rx_loop(
                             })
                             .is_err()
                         {
+                            reader_queue_tx.rollback(gap_samples);
                             break;
                         }
                     }
@@ -2098,6 +2226,7 @@ pub(super) fn run_rx_loop(
 
                 let time_ns = result.time_ticks;
                 let samples = buffer[..n].to_vec();
+                reader_queue_tx.enqueue(n);
                 if tx
                     .send(RxReaderMessage {
                         samples,
@@ -2108,6 +2237,7 @@ pub(super) fn run_rx_loop(
                     })
                     .is_err()
                 {
+                    reader_queue_tx.rollback(n);
                     break; // processing thread gone
                 }
             }
@@ -2120,6 +2250,7 @@ pub(super) fn run_rx_loop(
             &mut commands_rx,
             &rx_chan,
             &shutdown,
+            &reader_queue,
             bearer_bts_id,
             bearer_cell_id,
         );
@@ -2239,6 +2370,7 @@ fn process_rx_message(
                         runtime.config.hrpd_traffic_event_tx.clone(),
                         runtime.config.hrpd_harq_bus.clone(),
                         Arc::new(AtomicBool::new(false)),
+                        &runtime.queue_registry,
                     );
                     // No history replay: the worker spawns before the TCA airs,
                     // so pre-spawn IQ cannot contain the AT's reverse pilot. The
@@ -2286,10 +2418,15 @@ fn process_rx_message(
     // assignment has pilot lock; all HRPD consumers share this one sliced block.
     if let Some(hrpd_block) = hrpd_block.as_ref() {
         if let Some(thread) = runtime.hrpd_access_thread.as_ref() {
-            let _ = thread.tx.send(HrpdAccessRxBlock {
+            let block = HrpdAccessRxBlock {
                 block: hrpd_block.clone(),
                 enqueue_time: Instant::now(),
-            });
+            };
+            let samples = block.block.samples.len();
+            thread.queue.enqueue(samples);
+            if thread.tx.send(block).is_err() {
+                thread.queue.rollback(samples);
+            }
         }
         runtime.hrpd_traffic_threads.retain(|thread| {
             send_hrpd_traffic_rx_block(
@@ -2500,6 +2637,7 @@ fn process_rx_message(
                 runtime.config.traffic_ack_seq_tx.clone(),
                 bearer_bts_id,
                 bearer_cell_id,
+                &runtime.queue_registry,
             ));
         }
     }
@@ -2507,7 +2645,7 @@ fn process_rx_message(
     // Broadcast IQ to all active traffic RX threads.
     if let Some(blk) = traffic_block_msg {
         traffic_threads.retain(|t| {
-            match t.tx.send(TrafficRxBlock {
+            let block = TrafficRxBlock {
                 samples: blk.samples.clone(),
                 relative_sample_start: blk.relative_sample_start,
                 absolute_chip_start: blk.absolute_chip_start,
@@ -2515,9 +2653,13 @@ fn process_rx_message(
                 sample_rate_hz: blk.sample_rate_hz,
                 hw_time_ns: blk.hw_time_ns,
                 enqueue_time: std::time::Instant::now(),
-            }) {
+            };
+            let samples = block.samples.len();
+            t.queue.enqueue(samples);
+            match t.tx.send(block) {
                 Ok(()) => true,
                 Err(mpsc::SendError(_)) => {
+                    t.queue.rollback(samples);
                     warn!("rx: traffic RX thread walsh={} exited", t.walsh_code);
                     false
                 }
@@ -2637,6 +2779,32 @@ fn process_rx_message(
                 );
             }
         }
+        let queue_metrics = runtime.queue_registry.snapshot();
+        let mut unhealthy_queue_count = 0usize;
+        let mut worst_queue = None;
+        for queue in &queue_metrics {
+            let severity = queue.queued_airtime_us.max(queue.max_residency_us);
+            if severity >= RX_QUEUE_WARN_THRESHOLD_US {
+                unhealthy_queue_count += 1;
+                if worst_queue
+                    .as_ref()
+                    .is_none_or(|(_, worst_severity)| severity > *worst_severity)
+                {
+                    worst_queue = Some((queue, severity));
+                }
+            }
+        }
+        if let Some((queue, _)) = worst_queue {
+            warn!(
+                "rx_queue_backlog: unhealthy_queues={} worst_queue={} queued_airtime_us={} queued_samples={} high_water_samples={} max_residency_us={}",
+                unhealthy_queue_count,
+                queue.name,
+                queue.queued_airtime_us,
+                queue.queued_samples,
+                queue.max_queued_samples,
+                queue.max_residency_us,
+            );
+        }
         if let Some(ref rx_metrics_tx) = runtime.config.rx_metrics_tx {
             let cumulative_budget_us = ((runtime.timing_samples as u128) * 1_000_000u128
                 / runtime.config.sample_rate_hz.max(1) as u128)
@@ -2673,6 +2841,7 @@ fn process_rx_message(
                     })
                     .collect(),
                 deficit_ms: deficit,
+                queues: queue_metrics,
             });
         }
         runtime.timing_interval_start = Instant::now();
@@ -2705,6 +2874,7 @@ fn process_rx_from_channel(
     commands_rx: &mut tokio_mpsc::Receiver<BtsCommand>,
     rx_chan: &mpsc::Receiver<RxReaderMessage>,
     shutdown: &AtomicBool,
+    reader_queue: &RxQueueTracker,
     bearer_bts_id: u32,
     bearer_cell_id: u32,
 ) -> Result<(), Error> {
@@ -2723,6 +2893,7 @@ fn process_rx_from_channel(
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        reader_queue.dequeue(msg.n, msg.enqueue_time);
         process_rx_message(
             runtime,
             &mut traffic_threads,
@@ -3119,6 +3290,7 @@ fn run_traffic_rx_thread(
     traffic_ack_seq_tx: Option<tokio::sync::mpsc::Sender<(u8, u8)>>,
     bearer_bts_id: u32,
     bearer_cell_id: u32,
+    queue: RxQueueTracker,
 ) {
     info!(
         "rx_traffic[w{}]: thread started traffic_rx_continuity={}",
@@ -3392,6 +3564,7 @@ fn run_traffic_rx_thread(
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        queue.dequeue(blk.samples.len(), blk.enqueue_time);
         let queue_delay_us = blk.enqueue_time.elapsed().as_micros() as u64;
         latency_queue_us_sum = latency_queue_us_sum.saturating_add(queue_delay_us);
         latency_queue_us_max = latency_queue_us_max.max(queue_delay_us);
@@ -5035,13 +5208,13 @@ mod tests {
     use super::rx_events::extract_access_rc_preferences;
     use super::{
         HRPD_SLOT_CHIPS, HRPD_TRAFFIC_FRAME_CHIPS, HRPD_TRAFFIC_MAX_INTERPOLATED_GAP_SLOTS,
-        HrpdTrafficMaskCandidate, PCG_CHIPS, RxCarrierSlice, StageTiming, build_access_event,
-        build_hrpd_access_indication, build_traffic_event, build_traffic_voice_event,
-        carrier_slice_anti_alias_taps, effective_rx_target_batch_samples,
-        extract_addressing_fields, extract_imsi_from_class_fields,
-        hrpd_reverse_traffic_pilot_metric_at_offset, reconcile_traffic_stream_continuity,
-        reconcile_traffic_stream_continuity_with_max_insert, reverse_frame_content_from_rate_bps,
-        run_sub_chain_timed, scaled_rx_sample_delay,
+        HrpdTrafficMaskCandidate, PCG_CHIPS, RxCarrierSlice, RxQueueRegistry, StageTiming,
+        build_access_event, build_hrpd_access_indication, build_traffic_event,
+        build_traffic_voice_event, carrier_slice_anti_alias_taps,
+        effective_rx_target_batch_samples, extract_addressing_fields,
+        extract_imsi_from_class_fields, hrpd_reverse_traffic_pilot_metric_at_offset,
+        reconcile_traffic_stream_continuity, reconcile_traffic_stream_continuity_with_max_insert,
+        reverse_frame_content_from_rate_bps, run_sub_chain_timed, scaled_rx_sample_delay,
     };
     use crate::bts::evdo::{EvdoMode, HrpdSectorId};
     use crate::bts::launcher::{BtsLaunchOptions, build_bts_launch_parts};
@@ -5052,6 +5225,22 @@ mod tests {
     use crate::receiver::hrpd::reverse_spread::{
         HrpdReversePilotReferenceConfig, hrpd_reverse_pilot_reference_chips,
     };
+
+    #[test]
+    fn rx_queue_registry_reports_sample_airtime_and_high_water_mark() {
+        let registry = RxQueueRegistry::default();
+        let queue = registry.register("test", 1_000_000);
+        queue.enqueue(2_000);
+        queue.enqueue(1_000);
+        queue.dequeue(2_000, std::time::Instant::now());
+
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].name, "test");
+        assert_eq!(snapshot[0].queued_samples, 1_000);
+        assert_eq!(snapshot[0].queued_airtime_us, 1_000);
+        assert_eq!(snapshot[0].max_queued_samples, 3_000);
+    }
     use crate::receiver::pipelined::{
         HrpdReverseAccessSettings, SampleBlock, hrpd_reverse_access_chain,
     };
@@ -5900,12 +6089,14 @@ mod tests {
         // Feed the worker a real HARQ bus so the per-slot reverse power-control
         // loop runs against real IQ and emits its `rpc_control` diagnostics.
         let harq_bus = Arc::new(crate::bts::hrpd::HarqBus::new());
+        let queue_registry = RxQueueRegistry::default();
         let thread = super::spawn_hrpd_traffic_rx_thread(
             slice.output_oversample.max(1),
             assignment.clone(),
             Some(event_tx),
             Some(harq_bus.clone()),
             shutdown.clone(),
+            &queue_registry,
         );
 
         // Stream WAV in ~85 ms blocks (the same order of magnitude the live

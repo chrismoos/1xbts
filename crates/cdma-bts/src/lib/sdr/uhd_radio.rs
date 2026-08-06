@@ -8,12 +8,35 @@ use uhd::{
     TransmitMetadata, TransmitStreamer, TuneRequest, Usrp,
 };
 
-use super::{Radio, RadioRx, RadioTx, RxReadResult};
+use super::{Radio, RadioRx, RadioTx, RxReadResult, TxRadioHealth};
 
 use cdma_common::consts::SR1_CHIP_RATE_HZ;
 
 /// Default master clock rate: 39.3216 MHz = 4 ticks per 8× TX sample, 32 ticks per chip.
 const DEFAULT_MASTER_CLOCK_RATE: u64 = 39_321_600;
+
+fn record_async_tx_event(health: &mut TxRadioHealth, code: u32) {
+    const BURST_ACK: u32 = 0x01;
+    const UNDERFLOW: u32 = 0x02;
+    const SEQUENCE_ERROR: u32 = 0x04;
+    const TIME_ERROR: u32 = 0x08;
+    const UNDERFLOW_IN_PACKET: u32 = 0x10;
+    const SEQUENCE_ERROR_IN_BURST: u32 = 0x20;
+    const USER_PAYLOAD: u32 = 0x40;
+    const KNOWN: u32 = BURST_ACK
+        | UNDERFLOW
+        | SEQUENCE_ERROR
+        | TIME_ERROR
+        | UNDERFLOW_IN_PACKET
+        | SEQUENCE_ERROR_IN_BURST
+        | USER_PAYLOAD;
+
+    health.burst_acks += u64::from(code & BURST_ACK != 0);
+    health.underflows += u64::from(code & (UNDERFLOW | UNDERFLOW_IN_PACKET) != 0);
+    health.sequence_errors += u64::from(code & (SEQUENCE_ERROR | SEQUENCE_ERROR_IN_BURST) != 0);
+    health.late_packets += u64::from(code & TIME_ERROR != 0);
+    health.unknown_events += u64::from(code & (USER_PAYLOAD | !KNOWN) != 0);
+}
 
 fn set_default_uhd_env(key: &str, value: &str) {
     if std::env::var_os(key).is_none() {
@@ -263,6 +286,7 @@ impl Radio for UhdRadio {
                 .ok_or_else(|| Error::from("UHD: TX streamer not initialized"))?,
             master_clock_rate: self.master_clock_rate,
             start_of_burst: true,
+            health: TxRadioHealth::default(),
         };
         let rx = self.rx_streamer.map(|s| -> Box<dyn RadioRx> {
             Box::new(UhdRxHalf {
@@ -284,6 +308,7 @@ struct UhdTxHalf {
     tx_streamer: TransmitStreamer<Complex32>,
     master_clock_rate: u64,
     start_of_burst: bool,
+    health: TxRadioHealth,
 }
 
 impl RadioTx for UhdTxHalf {
@@ -311,6 +336,17 @@ impl RadioTx for UhdTxHalf {
         self.transmit_at(samples, None)
     }
 
+    fn prepare_transmit(&mut self, _max_samples: usize) -> Result<(), Error> {
+        if let Some(event) = self
+            .tx_streamer
+            .recv_async_msg(0.0)
+            .map_err(|e| Error::from(format!("UHD: prepare TX async metadata: {e}")))?
+        {
+            record_async_tx_event(&mut self.health, event.code);
+        }
+        Ok(())
+    }
+
     fn transmit_at(&mut self, samples: &[Complex32], tick: Option<u64>) -> Result<(), Error> {
         // No software NCO rotation — UHD handles LO offset in hardware
         // via TuneRequest::with_frequency_lo() in set_tx_frequency().
@@ -333,6 +369,22 @@ impl RadioTx for UhdTxHalf {
             self.start_of_burst = false;
         }
         Ok(())
+    }
+
+    fn tx_health(&mut self) -> Result<TxRadioHealth, Error> {
+        // Keep event collection on the stream owner and cap each nonblocking
+        // drain so diagnostics cannot delay a timed write indefinitely.
+        for _ in 0..256 {
+            let Some(event) = self
+                .tx_streamer
+                .recv_async_msg(0.0)
+                .map_err(|e| Error::from(format!("UHD: TX async metadata: {e}")))?
+            else {
+                break;
+            };
+            record_async_tx_event(&mut self.health, event.code);
+        }
+        Ok(self.health)
     }
 }
 
@@ -448,5 +500,23 @@ impl RadioRx for UhdRxHalf {
             })
             .map_err(|e| Error::from(format!("UHD: RX deactivate: {}", e)))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TxRadioHealth, record_async_tx_event};
+
+    #[test]
+    fn async_tx_events_are_classified_without_double_counting_variants() {
+        let mut health = TxRadioHealth::default();
+        record_async_tx_event(&mut health, 0x10);
+        record_async_tx_event(&mut health, 0x08 | 0x20);
+        record_async_tx_event(&mut health, 0x40);
+
+        assert_eq!(health.underflows, 1);
+        assert_eq!(health.late_packets, 1);
+        assert_eq!(health.sequence_errors, 1);
+        assert_eq!(health.unknown_events, 1);
     }
 }

@@ -1,5 +1,7 @@
 # HEAD 
 
+- Added additional air-interface diagnostics and logging.
+- Added real-time scheduling priorities across radio I/O threads.
 - Reduced EV-DO forward traffic TX stalls by preparing packet coding before
   enqueue and bounding per-batch queue intake.
 - Reduced EV-DO reverse access receiver CPU usage.

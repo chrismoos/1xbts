@@ -39,6 +39,16 @@ pub struct RxReadResult {
     pub overflow: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TxRadioHealth {
+    pub underflows: u64,
+    pub late_packets: u64,
+    pub sequence_errors: u64,
+    pub burst_acks: u64,
+    pub dropped_packets: u64,
+    pub unknown_events: u64,
+}
+
 /// Configuration trait -- used during setup, consumed by split().
 pub trait Radio: Send {
     fn tick_rate(&self) -> u64;
@@ -75,12 +85,18 @@ pub trait RadioTx: Send {
         Ok(())
     }
     fn transmit(&mut self, samples: &[Complex32]) -> Result<(), Error>;
+    fn prepare_transmit(&mut self, _max_samples: usize) -> Result<(), Error> {
+        Ok(())
+    }
     fn transmit_at(&mut self, samples: &[Complex32], _tick: Option<u64>) -> Result<(), Error> {
         self.transmit(samples)
     }
     fn enable_transmit(&mut self, enable: bool) -> Result<(), Error>;
     fn enable_transmit_at(&mut self, enable: bool, _tick: Option<u64>) -> Result<(), Error> {
         self.enable_transmit(enable)
+    }
+    fn tx_health(&mut self) -> Result<TxRadioHealth, Error> {
+        Ok(TxRadioHealth::default())
     }
 }
 
@@ -106,6 +122,9 @@ impl RadioTx for Box<dyn RadioTx> {
     fn transmit(&mut self, samples: &[Complex32]) -> Result<(), Error> {
         (**self).transmit(samples)
     }
+    fn prepare_transmit(&mut self, max_samples: usize) -> Result<(), Error> {
+        (**self).prepare_transmit(max_samples)
+    }
     fn transmit_at(&mut self, samples: &[Complex32], tick: Option<u64>) -> Result<(), Error> {
         (**self).transmit_at(samples, tick)
     }
@@ -114,6 +133,9 @@ impl RadioTx for Box<dyn RadioTx> {
     }
     fn enable_transmit_at(&mut self, enable: bool, tick: Option<u64>) -> Result<(), Error> {
         (**self).enable_transmit_at(enable, tick)
+    }
+    fn tx_health(&mut self) -> Result<TxRadioHealth, Error> {
+        (**self).tx_health()
     }
 }
 

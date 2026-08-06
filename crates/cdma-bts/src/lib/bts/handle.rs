@@ -33,6 +33,7 @@ use crate::{
         long_code::LongCodeGenerator,
     },
     phy::walsh::WalshGenerator,
+    sdr::TxRadioHealth,
 };
 
 use super::{AccessChannelEvent, BtsPowerControlRegistry, BtsRuntimeSettings};
@@ -49,12 +50,21 @@ pub struct TxMetrics {
     pub gen_max_us: u64,
     pub tx_avg_us: u64,
     pub tx_max_us: u64,
+    pub pulse_avg_us: u64,
+    pub pulse_max_us: u64,
+    pub hw_margin_min_us: i64,
+    pub hw_margin_avg_us: i64,
+    pub hw_margin_max_us: i64,
+    pub late_batches: u64,
+    pub radio_health: TxRadioHealth,
+    pub finalized_queue_airtime_us: u64,
     pub synth_pilot_us: u64,
     pub synth_sync_us: u64,
     pub synth_paging_us: u64,
     pub synth_spread_us: u64,
     pub sync_fragments_sent: u64,
     pub paging_fragments_sent: u64,
+    pub realtime_degraded_events: u64,
 }
 
 /// Metrics snapshot from the RX pipeline, published every ~1 second.
@@ -69,6 +79,16 @@ pub struct RxMetrics {
     pub total_max_us: u64,
     pub stages: Vec<StageMetrics>,
     pub deficit_ms: Option<f64>,
+    pub queues: Vec<RxQueueMetrics>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RxQueueMetrics {
+    pub name: String,
+    pub queued_samples: u64,
+    pub queued_airtime_us: u64,
+    pub max_queued_samples: u64,
+    pub max_residency_us: u64,
 }
 
 /// Per-stage breakdown within the RX pipeline.

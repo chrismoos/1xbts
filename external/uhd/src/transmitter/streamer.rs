@@ -4,6 +4,7 @@ use std::ptr;
 
 use crate::{
     error::{check_status, Error},
+    transmitter::async_metadata::{AsyncMetadata, TransmitAsyncEvent},
     utils::check_equal_buffer_lengths,
     TransmitMetadata,
 };
@@ -22,6 +23,7 @@ pub struct TransmitStreamer<I> {
     /// Invariant: If this is not empty, its length is equal to the value returned by
     /// self.num_channels().
     buffer_pointers: Vec<*const c_void>,
+    async_metadata: Option<AsyncMetadata>,
     /// Item type phantom data
     item_phantom: PhantomData<I>,
 }
@@ -34,6 +36,7 @@ impl<I> TransmitStreamer<I> {
         TransmitStreamer {
             handle: ptr::null_mut(),
             buffer_pointers: Vec::new(),
+            async_metadata: None,
             item_phantom: PhantomData,
         }
     }
@@ -158,6 +161,31 @@ impl<I> TransmitStreamer<I> {
             )
         })?;
         Ok(samples_transmitted)
+    }
+
+    /// Receive one queued asynchronous TX event. A zero timeout is nonblocking.
+    pub fn recv_async_msg(&mut self, timeout: f64) -> Result<Option<TransmitAsyncEvent>, Error> {
+        if self.async_metadata.is_none() {
+            self.async_metadata = Some(AsyncMetadata::new()?);
+        }
+        let metadata = self
+            .async_metadata
+            .as_mut()
+            .expect("async metadata initialized above");
+        let mut valid = false;
+        check_status(unsafe {
+            uhd_sys::uhd_tx_streamer_recv_async_msg(
+                self.handle,
+                metadata.handle_mut(),
+                timeout,
+                &mut valid,
+            )
+        })?;
+        if valid {
+            Ok(Some(metadata.event()?))
+        } else {
+            Ok(None)
+        }
     }
 }
 

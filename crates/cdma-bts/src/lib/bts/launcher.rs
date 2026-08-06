@@ -21,7 +21,7 @@ use crate::{
 
 use super::{
     Bts, BtsHandle, BtsNodeConfig, Config, OverheadParameters, PagingChannelSettings, RadioConfig,
-    ReverseRxTarget, RxSettings, TrafficResourceController,
+    RealtimeSettings, ReverseRxTarget, RxSettings, TrafficResourceController,
     abis_agent::{AbisAgent, AbisAgentConfig, AbisAgentEvent},
     paging_supplier::{PagingRetryConfig, PagingSupplierState, build_bts_paging_supplier},
 };
@@ -32,6 +32,7 @@ pub struct RadioBuildOptions {
     pub tx_sample_rate_hz: usize,
     pub rx_sample_rate_hz: usize,
     pub rx_bandwidth_hz: usize,
+    pub realtime: RealtimeSettings,
 }
 
 #[derive(Clone, Debug)]
@@ -157,6 +158,11 @@ pub fn build_radio_from_config(
     rx_freq_hz: usize,
     options: RadioBuildOptions,
 ) -> Result<Box<dyn Radio>, Error> {
+    // Native radio libraries may create streaming workers during device and
+    // streamer setup. Let UHD, libbladeRF, and LimeSuite inherit the requested
+    // scheduling class, then restore the launcher thread before returning.
+    let _driver_priority =
+        super::realtime::DriverPriorityGuard::enter("radio-driver-init", &options.realtime);
     if options.null_radio {
         let mut radio = NoopRadio::new();
         if options.configure_rx {

@@ -33,6 +33,24 @@ message TxMetrics {
   uint64 synth_spread_us = 12;
   uint64 sync_fragments_sent = 13;
   uint64 paging_fragments_sent = 14;
+  sint64 hw_margin_min_us = 15;
+  sint64 hw_margin_avg_us = 16;
+  sint64 hw_margin_max_us = 17;
+  uint64 late_batches = 18;
+  TxRadioHealth radio_health = 19;
+  uint64 realtime_degraded_events = 20;
+  uint64 pulse_avg_us = 21;
+  uint64 pulse_max_us = 22;
+  uint64 finalized_queue_airtime_us = 23;
+}
+
+message TxRadioHealth {
+  uint64 underflows = 1;
+  uint64 late_packets = 2;
+  uint64 sequence_errors = 3;
+  uint64 burst_acks = 4;
+  uint64 dropped_packets = 5;
+  uint64 unknown_events = 6;
 }
 
 // ─── RX Metrics ─────────────────────────────────────────────────
@@ -57,6 +75,15 @@ message RxMetrics {
   uint64 total_max_us = 7;
   repeated StageMetrics stages = 8;
   optional double deficit_ms = 9;
+  repeated RxQueueMetrics queues = 10;
+}
+
+message RxQueueMetrics {
+  string name = 1;
+  uint64 queued_samples = 2;
+  uint64 queued_airtime_us = 3;
+  uint64 max_queued_samples = 4;
+  uint64 max_residency_us = 5;
 }
 
 // Combined radio, receiver, transmitter, and bearer metrics.

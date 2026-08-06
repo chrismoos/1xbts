@@ -11,6 +11,7 @@ pub mod paging_service;
 pub mod paging_supplier;
 pub mod power_control;
 pub mod power_control_service;
+pub(crate) mod realtime;
 pub mod resource_controller;
 pub mod reverse_power_predictor;
 pub mod rx;
@@ -46,7 +47,7 @@ use cdma_common::{
     error::Error,
     time,
 };
-use log::{debug, info, trace};
+use log::{debug, info, trace, warn};
 use num::complex::Complex32;
 use tokio::sync::mpsc;
 
@@ -57,7 +58,7 @@ use crate::{
     },
     mac,
     receiver::sync::SyncChannelMessage,
-    sdr::{Radio, RadioRx, RadioTx, TxPulseShaper, pipe::RadioPipe},
+    sdr::{Radio, RadioRx, RadioTx, TxPulseShaper, TxRadioHealth, pipe::RadioPipe},
 };
 
 pub use timing::TxRxAnchor;
@@ -98,122 +99,6 @@ fn hrpd_forward_ingress_budget(tx_batch_chips: u64) -> usize {
     // real-time TX thread while excess packets remain on the ingress queue.
     let packet_starts = tx_batch_chips.div_ceil(crate::phy::hrpd::slot::SLOT_CHIPS);
     usize::try_from(packet_starts).unwrap_or(usize::MAX)
-}
-
-/// Attempt to set the calling thread to real-time priority.
-/// Logs a warning on failure but does not panic. The BTS can still
-/// run at normal priority, just with higher jitter risk.
-fn set_thread_priority(label: &str, hard_rt: bool) {
-    #[cfg(target_os = "macos")]
-    {
-        if hard_rt {
-            #[repr(C)]
-            struct ThreadTimeConstraintPolicy {
-                period: u32,
-                computation: u32,
-                constraint: u32,
-                preemptible: i32,
-            }
-            #[repr(C)]
-            struct MachTimebaseInfo {
-                numer: u32,
-                denom: u32,
-            }
-            unsafe extern "C" {
-                fn mach_thread_self() -> u32;
-                fn thread_policy_set(
-                    thread: u32,
-                    flavor: u32,
-                    policy_info: *const ThreadTimeConstraintPolicy,
-                    count: u32,
-                ) -> i32;
-                fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
-            }
-            const THREAD_TIME_CONSTRAINT_POLICY: u32 = 2;
-            const THREAD_TIME_CONSTRAINT_POLICY_COUNT: u32 = 4;
-
-            let mut timebase = MachTimebaseInfo { numer: 0, denom: 0 };
-            unsafe { mach_timebase_info(&mut timebase) };
-            let ns_to_abs = |ns: u64| -> u32 {
-                ((ns as u128 * timebase.denom as u128) / timebase.numer as u128) as u32
-            };
-
-            let policy = ThreadTimeConstraintPolicy {
-                period: ns_to_abs(1_250_000),
-                computation: ns_to_abs(800_000),
-                constraint: ns_to_abs(1_200_000),
-                preemptible: 1,
-            };
-            let ret = unsafe {
-                thread_policy_set(
-                    mach_thread_self(),
-                    THREAD_TIME_CONSTRAINT_POLICY,
-                    &policy,
-                    THREAD_TIME_CONSTRAINT_POLICY_COUNT,
-                )
-            };
-            if ret != 0 {
-                log::warn!(
-                    "{}: THREAD_TIME_CONSTRAINT_POLICY failed (ret={}), falling back to QoS",
-                    label,
-                    ret
-                );
-            } else {
-                log::info!(
-                    "{}: set to THREAD_TIME_CONSTRAINT_POLICY (period=1.25ms computation=0.8ms constraint=1.2ms)",
-                    label
-                );
-                return;
-            }
-        }
-
-        use std::os::raw::c_int;
-        unsafe extern "C" {
-            fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: c_int) -> c_int;
-        }
-        let ret = unsafe { pthread_set_qos_class_self_np(0x21, 0) };
-        if ret != 0 {
-            log::warn!("{}: failed to set QoS class (ret={})", label, ret);
-        } else {
-            log::info!("{}: set to QOS_CLASS_USER_INTERACTIVE", label);
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::raw::c_int;
-        #[repr(C)]
-        struct SchedParam {
-            sched_priority: c_int,
-        }
-        unsafe extern "C" {
-            fn pthread_setschedparam(
-                thread: libc::pthread_t,
-                policy: c_int,
-                param: *const SchedParam,
-            ) -> c_int;
-            fn pthread_self() -> libc::pthread_t;
-        }
-        if hard_rt {
-            const SCHED_FIFO: c_int = 1;
-            let param = SchedParam { sched_priority: 50 };
-            let ret = unsafe { pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) };
-            if ret != 0 {
-                log::warn!(
-                    "{}: failed to set SCHED_FIFO priority (ret={}, try running as root)",
-                    label,
-                    ret
-                );
-            } else {
-                log::info!("{}: set to SCHED_FIFO priority 50", label);
-            }
-        } else {
-            log::info!("{}: using default scheduling (soft real-time)", label);
-        }
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        log::info!("{}: real-time priority not supported on this OS", label);
-    }
 }
 
 /// Static BTS wiring and protocol dependencies.
@@ -310,6 +195,14 @@ pub(crate) struct TxLoopState {
     synth_spread_us: u64,
     tx_time_sum_us: u64,
     tx_time_max_us: u64,
+    pulse_time_sum_us: u64,
+    pulse_time_max_us: u64,
+    hw_margin_min_us: i64,
+    hw_margin_max_us: i64,
+    hw_margin_sum_us: i64,
+    hw_margin_samples: u64,
+    late_batches: u64,
+    last_radio_health: TxRadioHealth,
     synth_blocks: usize,
     tx_batches: usize,
     interval_start: Instant,
@@ -461,6 +354,7 @@ impl Bts {
 
     fn spawn_rx_thread(
         rx_settings: RxSettings,
+        realtime_settings: RealtimeSettings,
         commands_rx: mpsc::Receiver<BtsCommand>,
         mut radio_rx: Box<dyn RadioRx>,
         shutdown: Arc<AtomicBool>,
@@ -468,6 +362,7 @@ impl Bts {
         thread::Builder::new()
             .name("bts-rx".into())
             .spawn(move || {
+                realtime::apply_rx(&realtime_settings);
                 let shutdown_flag = shutdown.clone();
                 let result = rx::run_rx_loop(rx_settings, commands_rx, &mut *radio_rx, shutdown);
                 match &result {
@@ -499,7 +394,8 @@ impl Bts {
             return Ok(());
         }
 
-        let hw_before = if state.tx_batches < 10 {
+        const MARGIN_SAMPLE_INTERVAL: usize = 16;
+        let hw_before = if state.tx_batches % MARGIN_SAMPLE_INTERVAL == 0 {
             radio_tx.get_hardware_time().ok()
         } else {
             None
@@ -513,19 +409,20 @@ impl Bts {
         state.tx_batches += 1;
 
         if let Some(hw) = hw_before {
-            let margin = batch_tx_tick.saturating_sub(hw);
-            let late = if hw > batch_tx_tick {
-                hw - batch_tx_tick
-            } else {
-                0
-            };
+            let tick_rate = radio_tx.tick_rate().max(1);
+            let margin_ticks = i128::from(batch_tx_tick) - i128::from(hw);
+            let margin_us = (margin_ticks * 1_000_000 / i128::from(tick_rate)) as i64;
+            state.hw_margin_min_us = state.hw_margin_min_us.min(margin_us);
+            state.hw_margin_max_us = state.hw_margin_max_us.max(margin_us);
+            state.hw_margin_sum_us = state.hw_margin_sum_us.saturating_add(margin_us);
+            state.hw_margin_samples += 1;
+            state.late_batches += u64::from(margin_us < 0);
             trace!(
-                "tx_batch_debug: batch #{} tick={} hw={} margin={} late={} tx_us={} chips={} samples={}",
+                "tx_batch_debug: batch #{} tick={} hw={} margin_us={} tx_us={} chips={} samples={}",
                 state.tx_batches,
                 batch_tx_tick,
                 hw,
-                margin,
-                late,
+                margin_us,
                 tx_us,
                 source_chips,
                 tx_samples.len(),
@@ -558,7 +455,18 @@ impl Bts {
         self.configure_radio()?;
 
         let radio = self.radio.take().expect("radio consumed before split");
-        let (mut radio_tx, mut radio_rx) = radio.split()?;
+        let (mut radio_tx, mut radio_rx) = {
+            let _driver_priority =
+                realtime::DriverPriorityGuard::enter("radio-stream-init", &self.runtime.realtime);
+            radio.split()?
+        };
+        let max_tx_samples = self
+            .runtime
+            .tx_batch_chips
+            .saturating_mul(self.runtime.tx_sample_rate_hz)
+            / self.runtime.chip_rate_hz.max(1)
+            + 256;
+        radio_tx.prepare_transmit(max_tx_samples)?;
 
         let one_x_enabled = !self.evdo.as_ref().is_some_and(|cfg| cfg.uses_hrpd_only());
         let (pch, fsch, fpch) = downlink::build_channels(&self.config, &self.runtime)?;
@@ -594,12 +502,20 @@ impl Bts {
             synth_spread_us: 0,
             tx_time_sum_us: 0,
             tx_time_max_us: 0,
+            pulse_time_sum_us: 0,
+            pulse_time_max_us: 0,
+            hw_margin_min_us: i64::MAX,
+            hw_margin_max_us: i64::MIN,
+            hw_margin_sum_us: 0,
+            hw_margin_samples: 0,
+            late_batches: 0,
+            last_radio_health: TxRadioHealth::default(),
             synth_blocks: 0,
             tx_batches: 0,
             interval_start: Instant::now(),
-            scratch_pilot: Vec::new(),
-            scratch_sync: Vec::new(),
-            scratch_paging: Vec::new(),
+            scratch_pilot: vec![Complex32::default(); self.runtime.block_size_chips],
+            scratch_sync: vec![Complex32::default(); self.runtime.block_size_chips],
+            scratch_paging: vec![Complex32::default(); self.runtime.block_size_chips],
             scratch_tc_snapshot: Vec::new(),
             scratch_tc_blocks: Vec::new(),
             tx_pool: handle::TxPool::new(self.traffic_channels.tx_cmd_queue()),
@@ -637,6 +553,7 @@ impl Bts {
         );
 
         let shutdown = Arc::new(AtomicBool::new(false));
+        let realtime_settings = self.runtime.realtime.clone();
         {
             let flag = shutdown.clone();
             let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, flag.clone());
@@ -672,6 +589,7 @@ impl Bts {
                 rx_settings.tx_rx_anchor = Some(tx_rx_anchor.clone());
                 Some(Self::spawn_rx_thread(
                     rx_settings,
+                    realtime_settings.clone(),
                     commands_rx,
                     rx,
                     shutdown.clone(),
@@ -697,10 +615,12 @@ impl Bts {
                 }
                 rx_settings.tx_rx_anchor = None;
                 let injected_shutdown = shutdown.clone();
+                let injected_realtime = realtime_settings.clone();
                 Some(
                     thread::Builder::new()
                         .name("bts-rx-injected".into())
                         .spawn(move || {
+                            realtime::apply_rx(&injected_realtime);
                             let shutdown_flag = injected_shutdown.clone();
                             let result = rx::run_injected_rx_loop(
                                 rx_settings,
@@ -831,7 +751,20 @@ impl Bts {
             .evdo
             .as_ref()
             .map(|_| vec![Complex32::default(); state.tx_batch_chips as usize]);
-        let mut tx_shape_buf: Vec<Complex32> = Vec::new();
+        let shaped_batch_samples = state.tx_batch_chips as usize * self.runtime.tx_sample_rate_hz
+            / self.runtime.chip_rate_hz
+            + 128;
+        let mut tx_shape_buf = vec![Complex32::default(); shaped_batch_samples];
+        realtime::prefault_complex(&mut state.scratch_pilot);
+        realtime::prefault_complex(&mut state.scratch_sync);
+        realtime::prefault_complex(&mut state.scratch_paging);
+        realtime::prefault_complex(&mut synth_block);
+        realtime::prefault_complex(&mut tx_batch);
+        if let Some(batch) = evdo_tx_batch.as_mut() {
+            realtime::prefault_complex(batch);
+        }
+        realtime::prefault_complex(&mut tx_shape_buf);
+        tx_shape_buf.clear();
         let blocks_per_batch = (state.tx_batch_chips / state.block_size) as usize;
         // Periodic TX cost breakdown (this thread only, no shared state).
         // gen covers the whole per-batch synthesis (1x + EVDO), evdo just the
@@ -891,6 +824,7 @@ impl Bts {
                 let tx_n = state.tx_batches.max(1) as u64;
                 let avg_gen_us = state.gen_time_sum_us / synth_n;
                 let avg_tx_us = state.tx_time_sum_us / tx_n;
+                let avg_pulse_us = state.pulse_time_sum_us / tx_n;
                 let gen_total_ms = state.gen_time_sum_us / 1000;
                 let tx_total_ms = state.tx_time_sum_us / 1000;
                 let rt_ratio = if state.gen_time_sum_us > 0 {
@@ -901,6 +835,69 @@ impl Bts {
                 let sync_total_ms = state.sync_time_sum_us / 1000;
                 let paging_total_ms = state.paging_time_sum_us / 1000;
                 let synth_total_ms = state.synth_time_sum_us / 1000;
+                let hw_margin_avg_us = state
+                    .hw_margin_sum_us
+                    .checked_div(state.hw_margin_samples as i64)
+                    .unwrap_or_default();
+                let hw_margin_min_us = if state.hw_margin_samples == 0 {
+                    0
+                } else {
+                    state.hw_margin_min_us
+                };
+                let hw_margin_max_us = if state.hw_margin_samples == 0 {
+                    0
+                } else {
+                    state.hw_margin_max_us
+                };
+                if state.late_batches > 0 {
+                    warn!(
+                        "tx_deadline_missed: sampled_late={} worst_margin_us={} avg_margin_us={} best_margin_us={}",
+                        state.late_batches, hw_margin_min_us, hw_margin_avg_us, hw_margin_max_us,
+                    );
+                }
+                let radio_health = match radio_tx.tx_health() {
+                    Ok(health) => {
+                        let previous = state.last_radio_health;
+                        let new_underflows = health.underflows.saturating_sub(previous.underflows);
+                        let new_late_packets =
+                            health.late_packets.saturating_sub(previous.late_packets);
+                        let new_sequence_errors = health
+                            .sequence_errors
+                            .saturating_sub(previous.sequence_errors);
+                        let new_dropped_packets = health
+                            .dropped_packets
+                            .saturating_sub(previous.dropped_packets);
+                        let new_unknown_events = health
+                            .unknown_events
+                            .saturating_sub(previous.unknown_events);
+                        if new_underflows > 0
+                            || new_late_packets > 0
+                            || new_sequence_errors > 0
+                            || new_dropped_packets > 0
+                            || new_unknown_events > 0
+                        {
+                            warn!(
+                                "tx_radio_health: new_underflows={} new_late_packets={} new_sequence_errors={} new_dropped_packets={} new_unknown_events={} totals[underflows={} late_packets={} sequence_errors={} dropped_packets={} unknown_events={}]",
+                                new_underflows,
+                                new_late_packets,
+                                new_sequence_errors,
+                                new_dropped_packets,
+                                new_unknown_events,
+                                health.underflows,
+                                health.late_packets,
+                                health.sequence_errors,
+                                health.dropped_packets,
+                                health.unknown_events,
+                            );
+                        }
+                        state.last_radio_health = health;
+                        health
+                    }
+                    Err(err) => {
+                        warn!("tx_health: radio status unavailable: {err}");
+                        state.last_radio_health
+                    }
+                };
                 trace!(
                     "transmit t20={} wall={}ms blocks={} tx_batches={} gen={}ms(avg={}us max={}us) sync={}ms paging={}ms synth={}ms[pilot={}ms fsch={}ms fpch={}ms spread={}ms] tx={}ms(avg={}us max={}us) rt={:.1}x pace_margin={}us",
                     t20,
@@ -927,6 +924,22 @@ impl Bts {
                     "tx_hardware_heartbeat: hw_tick={} chip={} rel_chip={} t20={}",
                     tx_hardware_tick, chip_cursor, tx_rel_chips, t20
                 );
+                trace!(
+                    "tx_deadline_health: margin_us[min={} avg={} max={}] sampled_late={} pulse_us[avg={} max={}] radio[underflow={} late={} sequence={} dropped={} ack={} unknown={}] rt_degraded={}",
+                    hw_margin_min_us,
+                    hw_margin_avg_us,
+                    hw_margin_max_us,
+                    state.late_batches,
+                    avg_pulse_us,
+                    state.pulse_time_max_us,
+                    radio_health.underflows,
+                    radio_health.late_packets,
+                    radio_health.sequence_errors,
+                    radio_health.dropped_packets,
+                    radio_health.burst_acks,
+                    radio_health.unknown_events,
+                    realtime::degraded_events(),
+                );
                 self.metrics.publish_tx_metrics(TxMetrics {
                     timestamp_ns: tx_hardware_tick,
                     chip_cursor,
@@ -936,12 +949,21 @@ impl Bts {
                     gen_max_us: state.gen_time_max_us,
                     tx_avg_us: avg_tx_us,
                     tx_max_us: state.tx_time_max_us,
+                    pulse_avg_us: avg_pulse_us,
+                    pulse_max_us: state.pulse_time_max_us,
+                    hw_margin_min_us,
+                    hw_margin_avg_us,
+                    hw_margin_max_us,
+                    late_batches: state.late_batches,
+                    radio_health,
+                    finalized_queue_airtime_us: 0,
                     synth_pilot_us: state.synth_pilot_us,
                     synth_sync_us: state.synth_fsch_us,
                     synth_paging_us: state.synth_fpch_us,
                     synth_spread_us: state.synth_spread_us,
                     sync_fragments_sent: state.sync_sent_fragments as u64,
                     paging_fragments_sent: state.paging_sent_fragments as u64,
+                    realtime_degraded_events: realtime::degraded_events(),
                 });
                 state.gen_time_sum_us = 0;
                 state.gen_time_max_us = 0;
@@ -955,6 +977,13 @@ impl Bts {
                 state.synth_spread_us = 0;
                 state.tx_time_sum_us = 0;
                 state.tx_time_max_us = 0;
+                state.pulse_time_sum_us = 0;
+                state.pulse_time_max_us = 0;
+                state.hw_margin_min_us = i64::MAX;
+                state.hw_margin_max_us = i64::MIN;
+                state.hw_margin_sum_us = 0;
+                state.hw_margin_samples = 0;
+                state.late_batches = 0;
                 state.synth_blocks = 0;
                 state.tx_batches = 0;
                 state.interval_start = Instant::now();
@@ -1263,6 +1292,8 @@ impl Bts {
             tx_stat_gen_max_us = tx_stat_gen_max_us.max(batch_gen_us);
             tx_stat_shape_us += batch_shape_us;
             tx_stat_shape_max_us = tx_stat_shape_max_us.max(batch_shape_us);
+            state.pulse_time_sum_us = state.pulse_time_sum_us.saturating_add(batch_shape_us);
+            state.pulse_time_max_us = state.pulse_time_max_us.max(batch_shape_us);
             tx_stat_hrpd_backlog_max =
                 tx_stat_hrpd_backlog_max.max(self.hrpd_forward_traffic_rx.len());
             if tx_stat_air_chips >= TX_STAT_WINDOW_CHIPS {
@@ -1335,7 +1366,7 @@ impl Bts {
         thread::Builder::new()
             .name("bts-tx".into())
             .spawn(move || {
-                set_thread_priority("bts-tx", true);
+                realtime::apply_tx(&self.runtime.realtime);
                 let result = self.run_loop(None, true);
                 let _ = tx.send(result);
             })
@@ -1350,7 +1381,7 @@ impl Bts {
         thread::Builder::new()
             .name("bts-tx".into())
             .spawn(move || {
-                set_thread_priority("bts-tx", true);
+                realtime::apply_tx(&self.runtime.realtime);
                 let result = self.run_loop(Some(blocks), false);
                 let _ = tx.send(result);
             })
@@ -1365,7 +1396,7 @@ impl Bts {
         thread::Builder::new()
             .name("bts-tx".into())
             .spawn(move || {
-                set_thread_priority("bts-tx", true);
+                realtime::apply_tx(&self.runtime.realtime);
                 let result = self.run_loop(Some(blocks), true);
                 let _ = tx.send(result);
             })

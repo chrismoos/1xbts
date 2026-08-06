@@ -232,7 +232,16 @@
       "require_cclm": true,
       "require_espm": true
     },
-    "max_tx_lookahead_ms": 3
+    "max_tx_lookahead_ms": 3,
+    "realtime": {
+      "enabled": true,
+      "tx_priority": 80,
+      "rx_priority": 75,
+      "driver_priority": 70,
+      "tx_cpu": null,
+      "rx_cpu": null,
+      "driver_cpu": null
+    }
   },
   "abis": {
     "bind_addr": "127.0.0.1:5604"

@@ -7,7 +7,7 @@ use limesuite::{Device, RxStream, StreamMeta, TxStream};
 use log::{debug, info};
 use num_complex::Complex32;
 
-use super::{Radio, RadioRx, RadioTx, RxReadResult};
+use super::{Radio, RadioRx, RadioTx, RxReadResult, TxRadioHealth};
 
 /// Default stream FIFO size in samples.
 const DEFAULT_FIFO_SIZE: u32 = 1024 * 1024;
@@ -58,6 +58,7 @@ pub struct LimeRadio {
     tx_nco_phase_rad: f64,
     tx_stream: Option<TxStream>,
     rx_stream: Option<RxStream>,
+    tx_fifo_size: u32,
     rx_fifo_size: u32,
     throughput_vs_latency: f32,
 }
@@ -174,6 +175,7 @@ impl LimeRadio {
             tx_nco_phase_rad: 0.0,
             tx_stream: Some(tx_stream),
             rx_stream: None,
+            tx_fifo_size: tx_fifo,
             rx_fifo_size: rx_fifo_size.unwrap_or(DEFAULT_FIFO_SIZE),
             throughput_vs_latency: tvl,
         })
@@ -362,8 +364,10 @@ impl Radio for LimeRadio {
             tx_nco_phase_rad: self.tx_nco_phase_rad,
             start_of_burst: true,
             shared_clock: shared_clock.clone(),
-            tx_send_count: 0,
             last_underrun: 0,
+            last_dropped_packets: 0,
+            tx_scratch: Vec::with_capacity(self.tx_fifo_size as usize),
+            health: TxRadioHealth::default(),
         };
         let rx = self.rx_stream.take().map(|s| -> Box<dyn RadioRx> {
             Box::new(LimeRxHalf {
@@ -393,10 +397,11 @@ struct LimeTxHalf {
     start_of_burst: bool,
     /// Shared clock updated by the RX half from FPGA timestamps.
     shared_clock: Arc<AtomicU64>,
-    /// Counter for periodic stream status logging.
-    tx_send_count: u64,
     /// Last reported underrun count (to detect new underruns).
     last_underrun: u32,
+    last_dropped_packets: u32,
+    tx_scratch: Vec<Complex32>,
+    health: TxRadioHealth,
 }
 
 // Safety: LimeTxHalf is only accessed from the TX thread.
@@ -429,13 +434,20 @@ impl RadioTx for LimeTxHalf {
         self.transmit_at(samples, None)
     }
 
+    fn prepare_transmit(&mut self, max_samples: usize) -> Result<(), Error> {
+        self.tx_scratch.resize(max_samples, Complex32::default());
+        self.tx_scratch.clear();
+        Ok(())
+    }
+
     fn transmit_at(&mut self, samples: &[Complex32], tick: Option<u64>) -> Result<(), Error> {
-        let mut samples = samples.to_vec();
+        self.tx_scratch.clear();
+        self.tx_scratch.extend_from_slice(samples);
         LimeRadio::apply_tx_lo_offset(
             self.tx_lo_offset_hz,
             self.tx_sample_rate_hz,
             &mut self.tx_nco_phase_rad,
-            &mut samples,
+            &mut self.tx_scratch,
         );
         let meta = StreamMeta {
             timestamp: tick.unwrap_or(0),
@@ -443,35 +455,9 @@ impl RadioTx for LimeTxHalf {
             flush_partial_packet: false,
         };
         self.tx_stream_mut()
-            .send(&samples, &meta, 1000)
+            .send(&self.tx_scratch, &meta, 1000)
             .map_err(|e| Error::from(format!("Lime: TX send: {}", e)))?;
         self.start_of_burst = false;
-        self.tx_send_count += 1;
-
-        // Periodic stream health check (~every 1 second at 800 sends/s).
-        if self.tx_send_count % 800 == 0 {
-            if let Ok(st) = self.tx_stream_mut().status() {
-                let new_underruns = st.underrun.saturating_sub(self.last_underrun);
-                if new_underruns > 0 || st.dropped_packets > 0 {
-                    log::warn!(
-                        "Lime TX stream: underrun={} (+{}) dropped={} fifo={}/{}",
-                        st.underrun,
-                        new_underruns,
-                        st.dropped_packets,
-                        st.fifo_filled,
-                        st.fifo_size,
-                    );
-                } else {
-                    log::debug!(
-                        "Lime TX stream: ok underrun={} fifo={}/{}",
-                        st.underrun,
-                        st.fifo_filled,
-                        st.fifo_size,
-                    );
-                }
-                self.last_underrun = st.underrun;
-            }
-        }
         Ok(())
     }
 
@@ -499,6 +485,33 @@ impl RadioTx for LimeTxHalf {
             self.start_of_burst = false;
         }
         Ok(())
+    }
+
+    fn tx_health(&mut self) -> Result<TxRadioHealth, Error> {
+        let status = self
+            .tx_stream_mut()
+            .status()
+            .map_err(|e| Error::from(format!("Lime: TX stream status: {e}")))?;
+        let new_underruns = status.underrun.saturating_sub(self.last_underrun);
+        let new_dropped = status
+            .dropped_packets
+            .saturating_sub(self.last_dropped_packets);
+        self.health.underflows += u64::from(new_underruns);
+        self.health.dropped_packets += u64::from(new_dropped);
+        if new_underruns > 0 || new_dropped > 0 {
+            log::warn!(
+                "Lime TX stream: underrun={} (+{}) dropped={} (+{}) fifo={}/{}",
+                status.underrun,
+                new_underruns,
+                status.dropped_packets,
+                new_dropped,
+                status.fifo_filled,
+                status.fifo_size,
+            );
+        }
+        self.last_underrun = status.underrun;
+        self.last_dropped_packets = status.dropped_packets;
+        Ok(self.health)
     }
 }
 

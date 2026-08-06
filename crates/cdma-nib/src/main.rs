@@ -262,6 +262,7 @@ async fn main() -> Result<(), Error> {
             tx_sample_rate_hz: bts_config.runtime.tx_sample_rate_hz,
             rx_sample_rate_hz: reverse_rx_plan.sample_rate_hz,
             rx_bandwidth_hz: reverse_rx_plan.bandwidth_hz,
+            realtime: bts_config.runtime.realtime.clone(),
         },
     )?;
     let bts_parts = build_bts_launch_parts(

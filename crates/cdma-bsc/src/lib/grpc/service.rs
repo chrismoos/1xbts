@@ -279,12 +279,28 @@ fn to_proto_tx_metrics(m: &BtsTxMetrics) -> proto::TxMetrics {
         gen_max_us: m.gen_max_us,
         tx_avg_us: m.tx_avg_us,
         tx_max_us: m.tx_max_us,
+        pulse_avg_us: m.pulse_avg_us,
+        pulse_max_us: m.pulse_max_us,
         synth_pilot_us: m.synth_pilot_us,
         synth_sync_us: m.synth_sync_us,
         synth_paging_us: m.synth_paging_us,
         synth_spread_us: m.synth_spread_us,
         sync_fragments_sent: m.sync_fragments_sent,
         paging_fragments_sent: m.paging_fragments_sent,
+        hw_margin_min_us: m.hw_margin_min_us,
+        hw_margin_avg_us: m.hw_margin_avg_us,
+        hw_margin_max_us: m.hw_margin_max_us,
+        late_batches: m.late_batches,
+        radio_health: Some(proto::TxRadioHealth {
+            underflows: m.radio_health.underflows,
+            late_packets: m.radio_health.late_packets,
+            sequence_errors: m.radio_health.sequence_errors,
+            burst_acks: m.radio_health.burst_acks,
+            dropped_packets: m.radio_health.dropped_packets,
+            unknown_events: m.radio_health.unknown_events,
+        }),
+        realtime_degraded_events: m.realtime_degraded_events,
+        finalized_queue_airtime_us: m.finalized_queue_airtime_us,
     }
 }
 
@@ -309,6 +325,17 @@ fn to_proto_rx_metrics(m: &BtsRxMetrics) -> proto::RxMetrics {
             })
             .collect(),
         deficit_ms: m.deficit_ms,
+        queues: m
+            .queues
+            .iter()
+            .map(|q| proto::RxQueueMetrics {
+                name: q.name.clone(),
+                queued_samples: q.queued_samples,
+                queued_airtime_us: q.queued_airtime_us,
+                max_queued_samples: q.max_queued_samples,
+                max_residency_us: q.max_residency_us,
+            })
+            .collect(),
     }
 }
 

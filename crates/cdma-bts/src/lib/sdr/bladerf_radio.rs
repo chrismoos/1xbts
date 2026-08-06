@@ -8,7 +8,7 @@ use cdma_common::error::Error;
 use log::{debug, info, warn};
 use num_complex::Complex32;
 
-use super::{Radio, RadioRx, RadioTx, RxReadResult};
+use super::{Radio, RadioRx, RadioTx, RxReadResult, TxRadioHealth};
 
 /// BLADERF_FORMAT_SC16_Q11_META — enables hardware timestamps in stream metadata.
 const FORMAT_SC16_Q11_META: u32 = 2;
@@ -346,6 +346,9 @@ impl Radio for BladeRfRadio {
             stream_timeout_ms: self.stream_timeout_ms,
             burst_active: false,
             module_enabled: true,
+            tx_scratch: Vec::with_capacity(self.buffer_size as usize),
+            sc16_scratch: Vec::with_capacity(self.buffer_size as usize),
+            health: TxRadioHealth::default(),
         };
 
         let rx = if self.rx_configured {
@@ -387,6 +390,9 @@ struct BladeRfTxHalf {
     stream_timeout_ms: u32,
     burst_active: bool,
     module_enabled: bool,
+    tx_scratch: Vec<Complex32>,
+    sc16_scratch: Vec<Sc16Q11>,
+    health: TxRadioHealth,
 }
 
 unsafe impl Send for BladeRfTxHalf {}
@@ -411,18 +417,27 @@ impl RadioTx for BladeRfTxHalf {
         self.transmit_at(samples, None)
     }
 
+    fn prepare_transmit(&mut self, max_samples: usize) -> Result<(), Error> {
+        self.tx_scratch.resize(max_samples, Complex32::default());
+        self.sc16_scratch
+            .resize(max_samples, Sc16Q11 { i: 0, q: 0 });
+        self.tx_scratch.clear();
+        self.sc16_scratch.clear();
+        Ok(())
+    }
+
     fn transmit_at(&mut self, samples: &[Complex32], tick: Option<u64>) -> Result<(), Error> {
-        let mut samples = samples.to_vec();
+        self.tx_scratch.clear();
+        self.tx_scratch.extend_from_slice(samples);
         BladeRfRadio::apply_tx_lo_offset(
             self.tx_lo_offset_hz,
             self.tx_sample_rate_hz,
             &mut self.tx_nco_phase_rad,
-            &mut samples,
+            &mut self.tx_scratch,
         );
-        let sc16: Vec<Sc16Q11> = samples
-            .iter()
-            .map(|s| Sc16Q11::from_complex32(*s))
-            .collect();
+        self.sc16_scratch.clear();
+        self.sc16_scratch
+            .extend(self.tx_scratch.iter().map(|s| Sc16Q11::from_complex32(*s)));
 
         match tick {
             Some(ts) => {
@@ -441,10 +456,11 @@ impl RadioTx for BladeRfTxHalf {
                 };
                 match self
                     .tx_sync
-                    .send(&sc16, Some(&mut meta), self.stream_timeout_ms)
+                    .send(&self.sc16_scratch, Some(&mut meta), self.stream_timeout_ms)
                 {
                     Ok(()) => {}
                     Err(e) if e.to_string().contains("in the past") => {
+                        self.health.late_packets += 1;
                         warn!("bladeRF: TX late @{}: {}", ts, e);
                     }
                     Err(e) => {
@@ -452,6 +468,7 @@ impl RadioTx for BladeRfTxHalf {
                     }
                 }
                 if meta.status & META_STATUS_UNDERRUN != 0 {
+                    self.health.underflows += 1;
                     warn!("bladeRF: TX underrun detected");
                 }
                 Ok(())
@@ -467,9 +484,10 @@ impl RadioTx for BladeRfTxHalf {
                     ..Default::default()
                 };
                 self.tx_sync
-                    .send(&sc16, Some(&mut meta), self.stream_timeout_ms)
+                    .send(&self.sc16_scratch, Some(&mut meta), self.stream_timeout_ms)
                     .map_err(|e| Error::from(format!("bladeRF: TX send: {}", e)))?;
                 if meta.status & META_STATUS_UNDERRUN != 0 {
+                    self.health.underflows += 1;
                     warn!("bladeRF: TX underrun detected");
                 }
                 Ok(())
@@ -511,6 +529,10 @@ impl RadioTx for BladeRfTxHalf {
 
     fn enable_transmit_at(&mut self, enable: bool, _tick: Option<u64>) -> Result<(), Error> {
         self.enable_transmit(enable)
+    }
+
+    fn tx_health(&mut self) -> Result<TxRadioHealth, Error> {
+        Ok(self.health)
     }
 }
 
