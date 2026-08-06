@@ -216,7 +216,8 @@ int qcelp13k_encoder_encode_to_packet(void *c,
     /* Load the 160 fresh samples into the back of in_speech[]. */
     const size_t HEAD = LPCSIZE - FSIZE + LPCOFFSET; /* 60 */
     for (i = 0; i < FSIZE; ++i) {
-        ctx->in_speech[HEAD + i] = (float)speech[i];
+        /* Convert 16-bit PCM to the reference codec's 14-bit scale. */
+        ctx->in_speech[HEAD + i] = (float)speech[i] / 4.0f;
     }
 
     memset(&frame_packet, 0, sizeof(frame_packet));
@@ -359,9 +360,9 @@ int qcelp13k_decoder_decode_from_packet(void *c,
 
     decoder(out_speech, &frame_packet, &ctx->control, &ctx->d_mem);
 
-    /* Convert float -> int16 with saturation. */
+    /* Restore 16-bit PCM scale with saturation. */
     for (i = 0; i < FSIZE; ++i) {
-        float s = out_speech[i];
+        float s = out_speech[i] * 4.0f;
         if (s > 32767.0f) s = 32767.0f;
         else if (s < -32768.0f) s = -32768.0f;
         speech[i] = (int16_t)s;
