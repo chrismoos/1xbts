@@ -28,8 +28,9 @@ const META_FLAG_TX_UPDATE_TIMESTAMP: u32 = 8;
 /// BLADERF_META_FLAG_RX_NOW — return samples immediately, ignore timestamp.
 const META_FLAG_RX_NOW: u32 = 0x8000_0000;
 
-/// BLADERF_META_STATUS_OVERRUN — RX overrun occurred.
-const META_STATUS_OVERRUN: u32 = 1;
+/// libbladeRF uses bit 0 for both a software-detected RX overrun and a
+/// hardware condition reported through RX metadata.
+const META_STATUS_RX_FAULT: u32 = 1;
 
 /// BLADERF_META_STATUS_UNDERRUN — TX underrun occurred.
 const META_STATUS_UNDERRUN: u32 = 2;
@@ -565,6 +566,25 @@ struct BladeRfRxHalf {
     module_enabled: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct BladeRfRxStatus {
+    overflow: bool,
+    hardware_status: bool,
+}
+
+fn classify_rx_status(
+    metadata_status: u32,
+    samples_read: usize,
+    requested_samples: usize,
+) -> BladeRfRxStatus {
+    let fault = metadata_status & META_STATUS_RX_FAULT != 0;
+    let overflow = fault && samples_read < requested_samples;
+    BladeRfRxStatus {
+        overflow,
+        hardware_status: fault && !overflow,
+    }
+}
+
 unsafe impl Send for BladeRfRxHalf {}
 
 impl RadioRx for BladeRfRxHalf {
@@ -599,11 +619,21 @@ impl RadioRx for BladeRfRxHalf {
 
                 let end_ts = meta.timestamp + n as u64;
                 self.shared_clock.store(end_ts, Ordering::Relaxed);
+                let status = classify_rx_status(meta.status, n, buf.len());
+                if status.hardware_status {
+                    log::trace!(
+                        "bladeRF: metadata status bit 0 set on full RX read; \
+                         samples={} timestamp={} raw_status={:#010x}",
+                        n,
+                        meta.timestamp,
+                        meta.status,
+                    );
+                }
 
                 Ok(RxReadResult {
                     samples_read: n,
                     time_ticks: meta.timestamp,
-                    overflow: (meta.status & META_STATUS_OVERRUN) != 0,
+                    overflow: status.overflow,
                 })
             }
             Err(e) => Err(Error::from(format!("bladeRF: RX recv: {}", e))),
@@ -628,6 +658,35 @@ impl RadioRx for BladeRfRxHalf {
             self.module_enabled = false;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{META_STATUS_RX_FAULT, classify_rx_status};
+
+    #[test]
+    fn full_rx_read_with_fault_bit_is_hardware_status() {
+        let status = classify_rx_status(META_STATUS_RX_FAULT, 12_288, 12_288);
+
+        assert!(!status.overflow);
+        assert!(status.hardware_status);
+    }
+
+    #[test]
+    fn short_rx_read_with_fault_bit_is_overflow() {
+        let status = classify_rx_status(META_STATUS_RX_FAULT, 8_188, 12_288);
+
+        assert!(status.overflow);
+        assert!(!status.hardware_status);
+    }
+
+    #[test]
+    fn full_rx_read_without_fault_bit_is_clean() {
+        let status = classify_rx_status(0, 12_288, 12_288);
+
+        assert!(!status.overflow);
+        assert!(!status.hardware_status);
     }
 }
 
