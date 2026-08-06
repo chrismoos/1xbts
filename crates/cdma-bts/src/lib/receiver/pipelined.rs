@@ -2720,11 +2720,12 @@ mod tests {
         let spawn_us = metrics.spawn_finger_avg_us();
         let append_us = metrics.append_block_avg_us();
         eprintln!(
-            "HRPD 1800067761628706 correlator timing: per_block_avg={}us append_avg={}us fft_scan_avg={}us(n={}) spawn_avg={}us(n={})",
+            "HRPD 1800067761628706 correlator timing: per_block_avg={}us append_avg={}us fft_scan_avg={}us(visits={} searches={}) spawn_avg={}us(n={})",
             per_block_us,
             append_us,
             fft_scan_us,
             metrics.fft_scan_calls,
+            metrics.searcher_scan_window_calls,
             spawn_us,
             metrics.spawn_finger_calls,
         );
@@ -2774,6 +2775,12 @@ mod tests {
         assert!(
             spawn_us < 60_000,
             "hrpd_access spawn_finger_avg too slow: {spawn_us}us (budget 60000us)",
+        );
+        assert!(
+            metrics.searcher_scan_window_calls.saturating_mul(2) < metrics.fft_scan_calls,
+            "deferred access hits should reuse their FFT result: visits={} searches={}",
+            metrics.fft_scan_calls,
+            metrics.searcher_scan_window_calls,
         );
     }
 

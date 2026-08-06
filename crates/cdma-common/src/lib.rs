@@ -4,6 +4,7 @@ pub mod bits;
 pub mod channel;
 pub mod config_load;
 pub mod consts;
+pub mod contiguous_ring_buffer;
 pub mod crc;
 pub mod diagnostics;
 pub mod error;

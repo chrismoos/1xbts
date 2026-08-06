@@ -22,9 +22,9 @@
 //! after one retry" rule (the strategy owns that decision via its internal
 //! state).
 //!
-//! All buffer trimming is owned by the strategy via `trim_buffer_after_scan`
-//! so each channel can choose its own retention policy without leaking into
-//! the shared shell.
+//! The strategy chooses how much history to retain after a scan. The base
+//! applies that policy to a shared contiguous ring buffer and rebases every
+//! buffer-relative cursor together.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -32,6 +32,8 @@ use std::time::Instant;
 
 use log::{debug, trace};
 use num_complex::Complex32;
+
+use cdma_common::contiguous_ring_buffer::ContiguousRingBuffer;
 
 use crate::receiver::hrpd::reverse_fft_pilot_search::{
     HrpdReverseFftPilotHit, HrpdReverseFftPilotSearchConfig, HrpdReverseFftPilotSearcher,
@@ -179,17 +181,14 @@ pub trait HrpdReverseFingerSpawnStrategy: Send {
         hit: &HrpdReverseFftPilotHit,
     ) -> SpawnOutcome<Self::Finger>;
 
-    /// Called after a window scan and any spawn attempts, before the buffer
-    /// is reused for the next scan. The strategy may choose to drop already
-    /// scanned samples here. The default keeps the entire buffer.
-    fn trim_buffer_after_scan(
-        &mut self,
-        _buffer: &mut Vec<Complex32>,
-        _buffer_abs_sample: &mut u64,
-        _next_scan_offset: &mut usize,
-        _window_samples: usize,
-    ) {
-    }
+    /// Number of samples to discard after a window scan and any spawn
+    /// attempts. The shared base applies the trim and rebases all offsets.
+    fn buffer_trim_count_after_scan(
+        &self,
+        buffer_len: usize,
+        next_scan_offset: usize,
+        window_samples: usize,
+    ) -> usize;
 
     /// Primary search hook. Default delegates to the FFT searcher; strategies
     /// may override to use an alternative searcher (e.g. multi-tier non-
@@ -242,7 +241,7 @@ pub trait HrpdReverseFingerSpawnStrategy: Send {
 pub struct HrpdReverseCorrelatorBase<S: HrpdReverseFingerSpawnStrategy> {
     strategy: S,
     searcher: HrpdReverseFftPilotSearcher,
-    buffer: Vec<Complex32>,
+    buffer: ContiguousRingBuffer<Complex32>,
     buffer_abs_sample: Option<u64>,
     next_scan_offset: usize,
     /// Hits left over from a deferred window. Revisits reuse these instead
@@ -263,7 +262,7 @@ impl<S: HrpdReverseFingerSpawnStrategy> HrpdReverseCorrelatorBase<S> {
         Self {
             strategy,
             searcher,
-            buffer: Vec::new(),
+            buffer: ContiguousRingBuffer::new(),
             buffer_abs_sample: None,
             next_scan_offset: 0,
             deferred_hits: None,
@@ -357,7 +356,8 @@ impl<S: HrpdReverseFingerSpawnStrategy> HrpdReverseCorrelatorBase<S> {
                 Some(hits) => hits,
                 None => self.strategy.primary_scan_window(
                     &mut self.searcher,
-                    &self.buffer[self.next_scan_offset..self.next_scan_offset + window_samples],
+                    &self.buffer.as_slice()
+                        [self.next_scan_offset..self.next_scan_offset + window_samples],
                     window_abs,
                 ),
             };
@@ -370,9 +370,9 @@ impl<S: HrpdReverseFingerSpawnStrategy> HrpdReverseCorrelatorBase<S> {
                     continue;
                 }
                 let t = Instant::now();
-                let outcome = self
-                    .strategy
-                    .spawn_finger(&self.buffer, buffer_abs_sample, hit);
+                let outcome =
+                    self.strategy
+                        .spawn_finger(self.buffer.as_slice(), buffer_abs_sample, hit);
                 spawn_ns += t.elapsed().as_nanos() as u64;
                 spawn_calls += 1;
                 match outcome {
@@ -411,12 +411,19 @@ impl<S: HrpdReverseFingerSpawnStrategy> HrpdReverseCorrelatorBase<S> {
         // room the spawn strategy needs for sub-chip refinement (sample-
         // delay search reaches back ~32 samples before the FFT-detected
         // frame start), and would defer-loop indefinitely.
-        self.strategy.trim_buffer_after_scan(
-            &mut self.buffer,
-            &mut buffer_abs_sample,
-            &mut self.next_scan_offset,
-            window_samples,
-        );
+        let drop = self
+            .strategy
+            .buffer_trim_count_after_scan(self.buffer.len(), self.next_scan_offset, window_samples)
+            .min(self.buffer.len())
+            .min(self.next_scan_offset);
+        if drop > 0 {
+            self.buffer.discard_front(drop);
+            buffer_abs_sample = buffer_abs_sample.saturating_add(drop as u64);
+            self.next_scan_offset -= drop;
+            if let Some((offset, _)) = &mut self.deferred_hits {
+                *offset = offset.saturating_sub(drop);
+            }
+        }
         self.buffer_abs_sample = Some(buffer_abs_sample);
 
         // Commit timing counters under one lock acquisition. Also snapshot

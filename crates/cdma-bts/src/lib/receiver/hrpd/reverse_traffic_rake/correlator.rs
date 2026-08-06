@@ -803,13 +803,12 @@ impl HrpdReverseFingerSpawnStrategy for HrpdReverseTrafficSpawnStrategy {
         SpawnOutcome::Spawn(finger, chain)
     }
 
-    fn trim_buffer_after_scan(
-        &mut self,
-        buffer: &mut Vec<Complex32>,
-        buffer_abs_sample: &mut u64,
-        next_scan_offset: &mut usize,
+    fn buffer_trim_count_after_scan(
+        &self,
+        buffer_len: usize,
+        next_scan_offset: usize,
         window_samples: usize,
-    ) {
+    ) -> usize {
         // Keep the buffer bounded but leave head-room behind
         // `next_scan_offset` so sub-chip refinement (which reaches back up
         // to `REFINE_SAMPLE_DELAY_RANGE` samples behind the FFT-detected
@@ -819,11 +818,10 @@ impl HrpdReverseFingerSpawnStrategy for HrpdReverseTrafficSpawnStrategy {
         // window's start.
         let head_room = (REFINE_SAMPLE_DELAY_RANGE as usize) * 2 + 16;
         let keep_high_water = window_samples * 4;
-        if buffer.len() > keep_high_water && *next_scan_offset > head_room {
-            let drop = (*next_scan_offset - head_room).min(buffer.len());
-            buffer.drain(..drop);
-            *buffer_abs_sample = buffer_abs_sample.saturating_add(drop as u64);
-            *next_scan_offset = next_scan_offset.saturating_sub(drop);
+        if buffer_len > keep_high_water && next_scan_offset > head_room {
+            (next_scan_offset - head_room).min(buffer_len)
+        } else {
+            0
         }
     }
 

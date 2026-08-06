@@ -530,6 +530,23 @@ impl HrpdReverseFingerSpawnStrategy for HrpdAccessFrameSpawnStrategy {
         )
     }
 
+    fn buffer_trim_count_after_scan(
+        &self,
+        buffer_len: usize,
+        next_scan_offset: usize,
+        window_samples: usize,
+    ) -> usize {
+        // Keep enough history for the previous-frame timing probes.
+        let oversample = self.cfg.oversample.max(1);
+        let head_room = (2 * ACCESS_PACKET_CHIPS + 2048) * oversample + 128;
+        let keep_high_water = window_samples * 6;
+        if buffer_len > keep_high_water && next_scan_offset > head_room {
+            (next_scan_offset - head_room).min(buffer_len)
+        } else {
+            0
+        }
+    }
+
     fn notify_hard_validated(&mut self, finger_id: u64) {
         if let Some(state) = self
             .active_fingers
