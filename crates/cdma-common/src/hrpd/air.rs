@@ -323,11 +323,10 @@ impl HrpdTrafficChannelAssignment {
             // window, giving the AN the widest spec-defined packet-start
             // interval after each completed DRC.
             drc_length: 3,
-            // C.S0024-0 §6.6.6.2: reverse MAC channel gains are assigned by
-            // the AN. Use a strong DRC within the mandated supported range
-            // so the BTS can make rate decisions from a stable DRC stream.
-            drc_channel_gain_half_db: 12, // +6 dB, valid DRC range is -9..+6 dB.
-            ack_channel_gain_half_db: 0,  // 0 dB, valid ACK range is -3..+6 dB.
+            // C.S0024-0 §6.6.6.2 expresses both gains relative to the
+            // Reverse Traffic Pilot Channel in units of 0.5 dB.
+            drc_channel_gain_half_db: 0, // 0 dB, valid DRC range is -9..+6 dB.
+            ack_channel_gain_half_db: 6, // +3 dB, valid ACK range is -3..+6 dB.
             pilots: vec![HrpdTrafficPilotAssignment {
                 pilot_pn,
                 softer_handoff: false,
@@ -967,18 +966,18 @@ mod tests {
         assert_eq!(bytes[0], HrpdTrafficChannelAssignment::MESSAGE_ID);
         assert_eq!(bytes[1], 3);
         assert_eq!(bytes.len(), 11);
-        // Encodes DRCLength=8 slots, DRCChannelGain=+6 dB,
-        // AckChannelGain=0 dB, and DRCCover=1 (sector cover; 0 is null).
+        // Encodes DRCLength=8 slots, DRCChannelGain=0 dB,
+        // AckChannelGain=+3 dB, and DRCCover=1 (sector cover; 0 is null).
         assert_eq!(
             bytes,
             vec![
-                0x01, 0x03, 0x80, 0x01, 0x3b, 0x06, 0x60, 0x02, 0x00, 0x0a, 0x40
+                0x01, 0x03, 0x80, 0x01, 0x3b, 0x06, 0x00, 0xc2, 0x00, 0x0a, 0x40
             ]
         );
         assert_eq!(
             msg.encode_subtype0_route_update_with_rev_a_tail(),
             vec![
-                0x01, 0x03, 0x80, 0x01, 0x3b, 0x06, 0x60, 0x02, 0x00, 0x0a, 0x41, 0x20, 0x00
+                0x01, 0x03, 0x80, 0x01, 0x3b, 0x06, 0x00, 0xc2, 0x00, 0x0a, 0x41, 0x20, 0x00
             ]
         );
         assert_eq!(msg.encode_subtype1_route_update().len(), 21);

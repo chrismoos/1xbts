@@ -22,7 +22,7 @@ use cdma_common::hrpd::air::{
     HrpdTrafficAssignmentRequest, HrpdTrafficEvent, default_reverse_traffic_long_code_masks,
 };
 
-use crate::bts::hrpd::HarqBus;
+use crate::bts::hrpd::{HarqBus, HrpdPowerControlHandle};
 use crate::receiver::hrpd::reverse_correlator_base::{
     HrpdReverseCorrelatorBase, HrpdReverseFingerSpawnStrategy, SpawnOutcome,
 };
@@ -120,6 +120,7 @@ struct HrpdReverseTrafficSpawnStrategy {
     oversample: usize,
     event_tx: Option<tokio_mpsc::UnboundedSender<HrpdTrafficEvent>>,
     harq_bus: Option<Arc<HarqBus>>,
+    power_control: Option<HrpdPowerControlHandle>,
     reverse_pilot_acquired: Arc<AtomicBool>,
     reference: HrpdReverseTrafficPilotReference,
     mask_candidates: Vec<HrpdTrafficMaskCandidate>,
@@ -267,6 +268,7 @@ impl HrpdReverseTrafficCorrelator {
         oversample: usize,
         event_tx: Option<tokio_mpsc::UnboundedSender<HrpdTrafficEvent>>,
         harq_bus: Option<Arc<HarqBus>>,
+        power_control: Option<HrpdPowerControlHandle>,
         reverse_pilot_acquired: Arc<AtomicBool>,
     ) -> Self {
         let mut mask_candidates = Vec::with_capacity(2);
@@ -293,6 +295,7 @@ impl HrpdReverseTrafficCorrelator {
             oversample,
             event_tx,
             harq_bus,
+            power_control,
             reverse_pilot_acquired,
             reference,
             mask_candidates,
@@ -458,6 +461,7 @@ impl HrpdReverseTrafficSpawnStrategy {
             oversample: self.oversample,
             event_tx: self.event_tx.clone(),
             harq_bus: self.harq_bus.clone(),
+            power_control: self.power_control.clone(),
             reverse_pilot_acquired: Some(self.reverse_pilot_acquired.clone()),
             worker_spawned_at: self.spawned_at,
         };
@@ -481,7 +485,10 @@ impl HrpdReverseTrafficSpawnStrategy {
                 self.event_tx.clone(),
                 self.harq_bus.clone(),
             )),
-            Box::new(HrpdReverseTrafficDataProcessor::new(self.event_tx.clone())),
+            Box::new(HrpdReverseTrafficDataProcessor::new_with_power_control(
+                self.event_tx.clone(),
+                self.power_control.clone(),
+            )),
         ];
         (finger, chain)
     }

@@ -627,6 +627,7 @@ fn spawn_hrpd_traffic_rx_thread(
     assignment: HrpdTrafficAssignmentRequest,
     event_tx: Option<tokio_mpsc::UnboundedSender<HrpdTrafficEvent>>,
     harq_bus: Option<Arc<crate::bts::hrpd::HarqBus>>,
+    power_control: Option<crate::bts::hrpd::HrpdPowerControlHandle>,
     shutdown: Arc<AtomicBool>,
     queue_registry: &RxQueueRegistry,
 ) -> HrpdTrafficRxThread {
@@ -653,6 +654,7 @@ fn spawn_hrpd_traffic_rx_thread(
         oversample,
         event_tx,
         harq_bus,
+        power_control,
         reverse_pilot_acquired.clone(),
     );
     // Each HRPD traffic RX thread uses one finger until multipath combining is supported.
@@ -2356,6 +2358,9 @@ fn process_rx_message(
         while let Some(command) = queue.pop() {
             match command {
                 HrpdTrafficRxCommand::Release(release) => {
+                    if let Some(power_control) = &runtime.config.hrpd_power_control {
+                        power_control.release(release.uati, release.mac_index);
+                    }
                     runtime.hrpd_traffic_threads.retain(|thread| {
                         let matches =
                             thread.uati == release.uati && thread.mac_index == release.mac_index;
@@ -2376,6 +2381,19 @@ fn process_rx_message(
                     {
                         continue;
                     }
+                    runtime.hrpd_traffic_threads.retain(|thread| {
+                        let replaced = thread.mac_index == assignment.mac_index;
+                        if replaced {
+                            if let Some(power_control) = &runtime.config.hrpd_power_control {
+                                power_control.release(thread.uati, thread.mac_index);
+                            }
+                            info!(
+                                "rx: stopping HRPD reverse traffic receiver uati=0x{:08x} mac={} (assignment replaced)",
+                                thread.uati, thread.mac_index
+                            );
+                        }
+                        !replaced
+                    });
                     let Some(hrpd_slice) = runtime.hrpd_rx_slice.as_ref() else {
                         warn!(
                             "rx: HRPD traffic assignment ignored without HRPD reverse RX slice uati=0x{:08x} mac={}",
@@ -2389,11 +2407,16 @@ fn process_rx_message(
                         assignment.mac_index,
                         runtime.config.hrpd_rx_shift_hz.unwrap_or(0)
                     );
+                    let power_control =
+                        runtime.config.hrpd_power_control.as_ref().map(|registry| {
+                            registry.install(assignment.uati, assignment.mac_index)
+                        });
                     let thread = spawn_hrpd_traffic_rx_thread(
                         hrpd_slice.output_oversample.max(1),
                         assignment,
                         runtime.config.hrpd_traffic_event_tx.clone(),
                         runtime.config.hrpd_harq_bus.clone(),
+                        power_control,
                         Arc::new(AtomicBool::new(false)),
                         &runtime.queue_registry,
                     );
@@ -5278,7 +5301,7 @@ mod tests {
     use cdma_common::hrpd::air::default_reverse_traffic_long_code_masks;
     use num_complex::Complex32;
     use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn scaled_rx_sample_delay_scales_from_4x_basis() {
@@ -6019,6 +6042,15 @@ mod tests {
         expected_message_counts: &'static [usize],
     }
 
+    fn hrpd_capture_path(file_name: &str) -> PathBuf {
+        let relative = Path::new("test").join("capture").join(file_name);
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .map(|ancestor| ancestor.join(&relative))
+            .find(|candidate| candidate.exists())
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join(relative))
+    }
+
     fn drive_hrpd_access_worker_capture(fixture: HrpdAccessCaptureFixture) {
         let _ = env_logger::builder().is_test(true).try_init();
 
@@ -6182,12 +6214,15 @@ mod tests {
         // Feed the worker a real HARQ bus so the per-slot reverse power-control
         // loop runs against real IQ and emits its `rpc_control` diagnostics.
         let harq_bus = Arc::new(crate::bts::hrpd::HarqBus::new());
+        let power_control = crate::bts::hrpd::HrpdPowerControlRegistry::default()
+            .install(assignment.uati, assignment.mac_index);
         let queue_registry = RxQueueRegistry::default();
         let thread = super::spawn_hrpd_traffic_rx_thread(
             slice.output_oversample.max(1),
             assignment.clone(),
             Some(event_tx),
             Some(harq_bus.clone()),
+            Some(power_control),
             shutdown.clone(),
             &queue_registry,
         );
@@ -6546,16 +6581,7 @@ mod tests {
     /// pipeline and assert every valid access retry in the WAV is recovered.
     #[test]
     fn capture_hrpd_reverse_access_1801219902363798_recovers_all_bursts() {
-        let wav_path: PathBuf = [
-            env!("CARGO_MANIFEST_DIR"),
-            "..",
-            "..",
-            "test",
-            "capture",
-            "1801219902363798.wav",
-        ]
-        .iter()
-        .collect();
+        let wav_path = hrpd_capture_path("1801219902363798.wav");
         // The live log only showed the packets that reached the access worker
         // while no reverse traffic pilot was locked. Replaying the full WAV
         // shows all valid access retries present in the capture.
@@ -6596,16 +6622,7 @@ mod tests {
     /// `1803459647969769.json`.
     #[test]
     fn capture_hrpd_reverse_access_reva_traffic_session() {
-        let wav_path: PathBuf = [
-            env!("CARGO_MANIFEST_DIR"),
-            "..",
-            "..",
-            "test",
-            "capture",
-            "1803459647969769.wav",
-        ]
-        .iter()
-        .collect();
+        let wav_path = hrpd_capture_path("1803459647969769.wav");
         drive_hrpd_access_worker_capture(HrpdAccessCaptureFixture {
             label: "1803459647969769-reva-access",
             wav_path,
@@ -6628,16 +6645,7 @@ mod tests {
     /// the same UATI/long code so the worker locks the Rev A connection.
     #[test]
     fn capture_hrpd_reverse_traffic_reva_traffic_session() {
-        let wav_path: PathBuf = [
-            env!("CARGO_MANIFEST_DIR"),
-            "..",
-            "..",
-            "test",
-            "capture",
-            "1803459647969769.wav",
-        ]
-        .iter()
-        .collect();
+        let wav_path = hrpd_capture_path("1803459647969769.wav");
         drive_hrpd_reverse_traffic_worker_capture(HrpdTrafficCaptureFixture {
             label: "1803459647969769-reva-traffic",
             wav_path,
@@ -6675,16 +6683,7 @@ mod tests {
 
     #[test]
     fn capture_hrpd_reverse_traffic_1806148344446687() {
-        let wav_path: PathBuf = [
-            env!("CARGO_MANIFEST_DIR"),
-            "..",
-            "..",
-            "test",
-            "capture",
-            "1806148344446687.wav",
-        ]
-        .iter()
-        .collect();
+        let wav_path = hrpd_capture_path("1806148344446687.wav");
         drive_hrpd_reverse_traffic_worker_capture(HrpdTrafficCaptureFixture {
             label: "1806148344446687-reva-traffic",
             wav_path,
@@ -6716,16 +6715,7 @@ mod tests {
 
     #[test]
     fn capture_hrpd_reverse_traffic_1800274243299352() {
-        let wav_path: PathBuf = [
-            env!("CARGO_MANIFEST_DIR"),
-            "..",
-            "..",
-            "test",
-            "capture",
-            "1800274243299352.wav",
-        ]
-        .iter()
-        .collect();
+        let wav_path = hrpd_capture_path("1800274243299352.wav");
         drive_hrpd_reverse_traffic_worker_capture(HrpdTrafficCaptureFixture {
             label: "1800274243299352",
             wav_path: wav_path.clone(),
@@ -6765,16 +6755,7 @@ mod tests {
     /// coherence validation gate and pruned unvalidated.
     #[test]
     fn capture_hrpd_reverse_traffic_1800354308350520() {
-        let wav_path: PathBuf = [
-            env!("CARGO_MANIFEST_DIR"),
-            "..",
-            "..",
-            "test",
-            "capture",
-            "1800354308350520.wav",
-        ]
-        .iter()
-        .collect();
+        let wav_path = hrpd_capture_path("1800354308350520.wav");
         // Session windows (offsets from capture start at 13:08:06.87):
         //   MAC 5 / UATI 0x1a058001: ~2.9 s .. 9.3 s
         //   MAC 6 / UATI 0x1a058002: ~9.3 s .. 12.8 s

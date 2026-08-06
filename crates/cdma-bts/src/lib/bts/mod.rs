@@ -159,6 +159,7 @@ pub struct Bts {
     /// Shared H-ARQ event bus between the HRPD forward scheduler (synth
     /// thread) and per-MAC reverse traffic RX workers.
     hrpd_harq_bus: std::sync::Arc<crate::bts::hrpd::HarqBus>,
+    hrpd_power_control: crate::bts::hrpd::HrpdPowerControlRegistry,
 }
 
 type PilotWalshChannel = WalshChannelWrapper<ForwardPilotChannel>;
@@ -283,6 +284,7 @@ impl Bts {
             power_control: senders.power_control,
             rx_measurements: senders.rx_measurements,
             hrpd_harq_bus: senders.hrpd_harq_bus,
+            hrpd_power_control: crate::bts::hrpd::HrpdPowerControlRegistry::default(),
         };
         (bts, handle)
     }
@@ -578,6 +580,7 @@ impl Bts {
                 rx_settings.hrpd_traffic_event_tx = Some(self.hrpd_traffic_event_tx.clone());
                 rx_settings.hrpd_traffic_rx_queue = Some(self.hrpd_traffic_rx_queue.clone());
                 rx_settings.hrpd_harq_bus = Some(self.hrpd_harq_bus.clone());
+                rx_settings.hrpd_power_control = Some(self.hrpd_power_control.clone());
                 if one_x_enabled {
                     rx_settings.access_event_tx = Some(self.metrics.access_event_sender());
                     rx_settings.traffic_rx_pool = Some(self.traffic_rx_pool.clone());
@@ -605,6 +608,7 @@ impl Bts {
                 rx_settings.hrpd_traffic_event_tx = Some(self.hrpd_traffic_event_tx.clone());
                 rx_settings.hrpd_traffic_rx_queue = Some(self.hrpd_traffic_rx_queue.clone());
                 rx_settings.hrpd_harq_bus = Some(self.hrpd_harq_bus.clone());
+                rx_settings.hrpd_power_control = Some(self.hrpd_power_control.clone());
                 if one_x_enabled {
                     rx_settings.access_event_tx = Some(self.metrics.access_event_sender());
                     rx_settings.traffic_rx_pool = Some(self.traffic_rx_pool.clone());

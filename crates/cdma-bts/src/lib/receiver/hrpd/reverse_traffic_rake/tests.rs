@@ -325,6 +325,7 @@ fn finger_emits_pilot_locked_block_for_pilot_only_frame() {
         oversample: 1,
         event_tx: None,
         harq_bus: None,
+        power_control: None,
         reverse_pilot_acquired: None,
         worker_spawned_at: std::time::Instant::now(),
     };
@@ -391,6 +392,7 @@ fn finger_refines_stale_sample_delay_before_declaring_pilot_lost() {
         oversample: 1,
         event_tx: None,
         harq_bus: None,
+        power_control: None,
         reverse_pilot_acquired: None,
         worker_spawned_at: std::time::Instant::now(),
     };
@@ -453,6 +455,7 @@ fn rpc_slot_timing_refines_before_power_decision() {
         oversample: 1,
         event_tx: None,
         harq_bus: Some(bus.clone()),
+        power_control: None,
         reverse_pilot_acquired: None,
         worker_spawned_at: std::time::Instant::now(),
     };
@@ -523,6 +526,7 @@ fn rpc_slot_timing_does_not_chase_unlocked_noise() {
         oversample: 1,
         event_tx: None,
         harq_bus: Some(bus),
+        power_control: None,
         reverse_pilot_acquired: None,
         worker_spawned_at: std::time::Instant::now(),
     };
@@ -593,6 +597,7 @@ fn finger_reports_reverse_pilot_lost_after_timeout() {
         oversample: 1,
         event_tx: Some(tx),
         harq_bus: None,
+        power_control: None,
         reverse_pilot_acquired: Some(acquired.clone()),
         worker_spawned_at: std::time::Instant::now(),
     };
@@ -704,6 +709,7 @@ fn finger_reports_reverse_pilot_telemetry_while_locked() {
         oversample: 1,
         event_tx: Some(tx),
         harq_bus: None,
+        power_control: None,
         reverse_pilot_acquired: None,
         worker_spawned_at: std::time::Instant::now(),
     };
@@ -1459,20 +1465,41 @@ fn data_processor_passes_block_through_and_does_not_panic_on_noise() {
 }
 
 #[test]
-fn reverse_fer_counts_good_and_erased_but_excludes_pilot_only() {
+fn reverse_per_counts_good_and_erased_but_excludes_pilot_only() {
     let mut proc = HrpdReverseTrafficDataProcessor::new(None);
     // Good frames: any decode CRC-clean.
-    proc.test_record_reverse_fer(true, true);
-    proc.test_record_reverse_fer(true, false);
+    proc.test_record_reverse_per(true, true);
+    proc.test_record_reverse_per(true, false);
     // Erased: data on the Q arm but nothing decoded.
-    proc.test_record_reverse_fer(false, true);
-    // Pilot-only: no data transmitted, excluded from FER entirely.
-    proc.test_record_reverse_fer(false, false);
-    proc.test_record_reverse_fer(false, false);
+    proc.test_record_reverse_per(false, true);
+    // Pilot-only: no data transmitted, excluded from PER entirely.
+    proc.test_record_reverse_per(false, false);
+    proc.test_record_reverse_per(false, false);
 
-    let (ok, erased) = proc.fer_totals();
+    let (ok, erased) = proc.per_totals();
     assert_eq!(ok, 2, "both CRC-clean frames count as good");
     assert_eq!(erased, 1, "only the data-present miss is an erasure");
+}
+
+#[test]
+fn reverse_rev0_per_drives_outer_loop_once_per_packet() {
+    let registry = crate::bts::hrpd::HrpdPowerControlRegistry::default();
+    let handle = registry.install(0x0102_0304, 5);
+    let mut proc =
+        HrpdReverseTrafficDataProcessor::new_with_power_control(None, Some(handle.clone()));
+
+    proc.test_record_reverse_per(false, false);
+    assert_eq!(handle.target_db(), 10.0, "pilot-only frame is excluded");
+
+    for _ in 0..10 {
+        proc.test_record_reverse_per(true, true);
+    }
+    let warmed_target = handle.target_db();
+    proc.test_record_reverse_per(false, true);
+    assert_eq!(handle.target_db(), warmed_target + 0.25);
+    let snapshot = handle.snapshot().expect("active assignment");
+    assert_eq!(snapshot.packets_total, 11);
+    assert_eq!(snapshot.packets_erased, 1);
 }
 
 // -- Reverse power-control loop tests ----------------------------------------
@@ -1606,35 +1633,33 @@ fn rpc_lost_pilot_without_raw_evidence_holds_neutral() {
 }
 
 #[test]
-fn rpc_saturating_input_commands_down_for_reliable_and_lost_metrics() {
-    // Raw input genuinely near ADC full scale (above the clip/hot-limit knee)
-    // commands DOWN whether or not the SINR metric is reliable.
+fn rpc_mobile_over_ceiling_commands_down_for_reliable_and_lost_metrics() {
     let saturating = -1.0;
     let mut rpc = HrpdRpcController::new();
     for _ in 0..24 {
-        rpc.observe_raw_power(saturating);
+        rpc.observe_mobile_power(saturating);
     }
 
     let weak_level = rpc.ingest(RPC_TEST_TARGET_DB - 10.0, 1.0);
     assert_eq!(
-        rpc.emit_with_raw_power(weak_level, saturating),
+        rpc.emit_with_mobile_power(weak_level, saturating),
         1,
-        "saturating input commands DOWN over a reliable under-target metric"
+        "mobile power above the ceiling commands DOWN over an under-target metric"
     );
 
     let mut up = 0usize;
     let mut down = 0usize;
     for _ in 0..24 {
-        rpc.observe_raw_power(saturating);
+        rpc.observe_mobile_power(saturating);
         let lost = rpc.ingest(f32::NAN, 0.0);
-        match rpc.emit_with_raw_power(lost, saturating) {
+        match rpc.emit_with_mobile_power(lost, saturating) {
             0 => up += 1,
             _ => down += 1,
         }
     }
     assert!(
         down == 24 && up == 0,
-        "saturating input commands DOWN even while the SINR metric is lost: up={up} down={down}"
+        "mobile power above the ceiling commands DOWN with a lost metric: up={up} down={down}"
     );
 }
 
@@ -1645,16 +1670,15 @@ fn rpc_lost_pilot_holds_neutral_after_near_target_lock() {
     // Establish a reliable near-target history.
     for _ in 0..8 {
         let locked = rpc.ingest(RPC_TEST_TARGET_DB, 1.0);
-        let _ = rpc.emit_with_raw_power(locked, -62.0);
+        let _ = rpc.emit_with_mobile_power(locked, -62.0);
     }
 
-    // Raw energy cannot distinguish an AT fade from DTX or tracking loss. Hold
-    // neutral until a reliable W0 quality measurement returns.
+    // Pilot power cannot distinguish an AT fade from DTX or tracking loss.
     let mut up = 0usize;
     let mut down = 0usize;
     for _ in 0..24 {
         let lost = rpc.ingest(f32::NAN, 0.0);
-        match rpc.emit_with_raw_power(lost, -31.0) {
+        match rpc.emit_with_mobile_power(lost, -31.0) {
             0 => up += 1,
             _ => down += 1,
         }
@@ -1666,23 +1690,21 @@ fn rpc_lost_pilot_holds_neutral_after_near_target_lock() {
 }
 
 #[test]
-fn rpc_reliable_metric_remains_quality_authority_below_adc_brake() {
+fn rpc_reliable_metric_remains_authority_below_mobile_brake() {
     let mut rpc = HrpdRpcController::new();
 
-    // Seed the raw diagnostic with a quiet reliable observation.
+    // Seed the controller with quiet assigned-mobile power.
     for _ in 0..8 {
         let locked = rpc.ingest(RPC_TEST_TARGET_DB, 1.0);
-        let _ = rpc.emit_with_raw_power(locked, -64.0);
+        let _ = rpc.emit_with_mobile_power(locked, -64.0);
     }
 
-    // A raw level above that observation is not by itself an ADC safety
-    // condition. Below the brake threshold, reliable pilot quality owns the
-    // control decision.
+    // Below the brake threshold, reliable pilot quality owns the decision.
     let mut up = 0usize;
     let mut down = 0usize;
     for _ in 0..16 {
         let locked = rpc.ingest(RPC_TEST_TARGET_DB - 2.0, 1.0);
-        match rpc.emit_with_raw_power(locked, -56.0) {
+        match rpc.emit_with_mobile_power(locked, -56.0) {
             0 => up += 1,
             _ => down += 1,
         }
@@ -1690,19 +1712,19 @@ fn rpc_reliable_metric_remains_quality_authority_below_adc_brake() {
 
     assert!(
         up > down,
-        "reliable under-target metric should net UP despite relative raw rise: up={up} down={down}"
+        "reliable under-target metric should net UP below the mobile brake: up={up} down={down}"
     );
 }
 
 #[test]
-fn rpc_safe_raw_does_not_lower_reliable_effective_target() {
+fn rpc_safe_mobile_power_does_not_lower_reliable_effective_target() {
     let mut rpc = HrpdRpcController::new();
 
     let mut up = 0usize;
     let mut down = 0usize;
     for _ in 0..32 {
         let locked = rpc.ingest(RPC_TEST_TARGET_DB - 1.0, 1.0);
-        match rpc.emit_with_raw_power(locked, -30.0) {
+        match rpc.emit_with_mobile_power(locked, -50.0) {
             0 => up += 1,
             _ => down += 1,
         }
@@ -1710,39 +1732,36 @@ fn rpc_safe_raw_does_not_lower_reliable_effective_target() {
 
     assert!(
         up > down,
-        "safe raw input must not lower the target while the pilot metric is below target: up={up} down={down}"
+        "safe mobile power must not lower the target while the pilot metric is below target: up={up} down={down}"
     );
 }
 
 #[test]
-fn rpc_hot_but_not_clipping_raw_does_not_override_under_target_reliable_metric() {
-    // A single loud slot below the brake threshold leaves the decision with
-    // the reliable quality metric.
+fn rpc_total_raw_power_does_not_override_per_mobile_control() {
     let mut rpc = HrpdRpcController::new();
+    rpc.observe_raw_power(-1.0);
 
     let locked = rpc.ingest(RPC_TEST_TARGET_DB - 5.0, 1.0);
     assert_eq!(
-        rpc.emit_with_raw_power(locked, -14.0),
+        rpc.emit_with_mobile_power(locked, -55.0),
         0,
-        "hot-but-not-clipping raw is not an override while W0 is reliable and under target"
+        "carrier-wide raw power must not override safe assigned-mobile power"
     );
 }
 
 #[test]
-fn rpc_safe_cold_raw_does_not_override_under_target_metric() {
-    // Raw input far below the ADC brake threshold is not a power-control
-    // target. A reliable under-target pilot metric still nets UP.
-    let cold_raw = -48.0;
+fn rpc_safe_cold_mobile_power_does_not_override_under_target_metric() {
+    let cold_mobile = -48.0;
     let mut rpc = HrpdRpcController::new();
     for _ in 0..24 {
-        rpc.observe_raw_power(cold_raw);
+        rpc.observe_mobile_power(cold_mobile);
     }
 
     let mut up = 0usize;
     let mut down = 0usize;
     for _ in 0..8 {
         let locked = rpc.ingest(RPC_TEST_TARGET_DB - 4.0, 1.0);
-        match rpc.emit_with_raw_power(locked, cold_raw) {
+        match rpc.emit_with_mobile_power(locked, cold_mobile) {
             0 => up += 1,
             _ => down += 1,
         }
@@ -1750,7 +1769,7 @@ fn rpc_safe_cold_raw_does_not_override_under_target_metric() {
 
     assert!(
         up > down,
-        "safe cold raw leaves an under-target quality metric in control: up={up} down={down}"
+        "safe cold mobile power leaves the quality metric in control: up={up} down={down}"
     );
     assert!(
         down > 0,
@@ -1759,21 +1778,20 @@ fn rpc_safe_cold_raw_does_not_override_under_target_metric() {
 }
 
 #[test]
-fn rpc_lost_pilot_holds_with_raw_energy_present() {
+fn rpc_lost_pilot_holds_with_mobile_energy_present() {
     let mut rpc = HrpdRpcController::new();
 
-    // Once quality is unmeasurable, raw energy alone cannot justify an UP or
-    // DOWN trend. Hold neutral until the pilot metric returns.
+    // Once quality is unmeasurable, power alone cannot justify a trend.
     for _ in 0..8 {
         let locked = rpc.ingest(RPC_TEST_TARGET_DB, 1.0);
-        let _ = rpc.emit_with_raw_power(locked, -62.0);
+        let _ = rpc.emit_with_mobile_power(locked, -62.0);
     }
 
     let mut up = 0usize;
     let mut down = 0usize;
     for _ in 0..24 {
         let lost = rpc.ingest(f32::NAN, 0.0);
-        match rpc.emit_with_raw_power(lost, -58.0) {
+        match rpc.emit_with_mobile_power(lost, -58.0) {
             0 => up += 1,
             _ => down += 1,
         }
@@ -1782,7 +1800,7 @@ fn rpc_lost_pilot_holds_with_raw_energy_present() {
     let diff = up.abs_diff(down);
     assert!(
         diff <= 1,
-        "lost metric with raw energy present should hold neutral: up={up} down={down}"
+        "lost metric with mobile energy present should hold neutral: up={up} down={down}"
     );
 }
 
@@ -1790,18 +1808,17 @@ fn rpc_lost_pilot_holds_with_raw_energy_present() {
 fn rpc_lost_under_target_pilot_holds_without_blind_recovery() {
     let mut rpc = HrpdRpcController::new();
 
-    // Regression for the ramp-into-clipping failure: a stale under-target
-    // prediction must not accumulate blind UP commands through a DTX gap.
+    // A stale under-target prediction must not accumulate blind UP commands.
     for _ in 0..8 {
         let locked = rpc.ingest(RPC_TEST_TARGET_DB - 6.0, 1.0);
-        let _ = rpc.emit_with_raw_power(locked, -62.0);
+        let _ = rpc.emit_with_mobile_power(locked, -62.0);
     }
 
     let mut up = 0usize;
     let mut down = 0usize;
     for _ in 0..16 {
         let lost = rpc.ingest(f32::NAN, 0.0);
-        match rpc.emit_with_raw_power(lost, -54.0) {
+        match rpc.emit_with_mobile_power(lost, -54.0) {
             0 => up += 1,
             _ => down += 1,
         }
@@ -1819,16 +1836,17 @@ fn rpc_lost_pilot_with_loud_raw_holds() {
 
     for _ in 0..8 {
         let locked = rpc.ingest(RPC_TEST_TARGET_DB - 6.0, 1.0);
-        let _ = rpc.emit_with_raw_power(locked, -62.0);
+        let _ = rpc.emit_with_mobile_power(locked, -62.0);
     }
 
-    // Even loud raw input does not provide pilot quality. It stays below the
-    // ADC brake threshold here, so loss still holds net-neutral.
+    rpc.observe_raw_power(-1.0);
+    // Even loud carrier-wide input does not identify this AT's power. A lost
+    // metric with safe mobile power remains net-neutral.
     let mut up = 0usize;
     let mut down = 0usize;
     for _ in 0..16 {
         let lost = rpc.ingest(f32::NAN, 0.0);
-        match rpc.emit_with_raw_power(lost, -14.0) {
+        match rpc.emit_with_mobile_power(lost, -55.0) {
             0 => up += 1,
             _ => down += 1,
         }
@@ -1841,21 +1859,21 @@ fn rpc_lost_pilot_with_loud_raw_holds() {
 }
 
 #[test]
-fn rpc_lost_pilot_holds_after_healthy_lock_while_raw_remains_present() {
+fn rpc_lost_pilot_holds_after_healthy_lock_while_power_remains_present() {
     let mut rpc = HrpdRpcController::new();
 
     // The last reliable slots were above target. If the metric then goes
-    // unreliable, neither the stale prediction nor raw input may ramp the AT.
+    // unreliable, neither the stale prediction nor power may ramp the AT.
     for _ in 0..8 {
         let locked = rpc.ingest(RPC_TEST_TARGET_DB + 4.0, 1.0);
-        let _ = rpc.emit_with_raw_power(locked, -56.0);
+        let _ = rpc.emit_with_mobile_power(locked, -56.0);
     }
 
     let mut up = 0usize;
     let mut down = 0usize;
     for _ in 0..16 {
         let lost = rpc.ingest(f32::NAN, 0.0);
-        match rpc.emit_with_raw_power(lost, -56.0) {
+        match rpc.emit_with_mobile_power(lost, -56.0) {
             0 => up += 1,
             _ => down += 1,
         }
@@ -1863,27 +1881,26 @@ fn rpc_lost_pilot_holds_after_healthy_lock_while_raw_remains_present() {
 
     assert!(
         up.abs_diff(down) <= 1,
-        "a healthy-then-lost pilot with raw energy present holds neutral: up={up} down={down}"
+        "a healthy-then-lost pilot with power present holds neutral: up={up} down={down}"
     );
 }
 
 #[test]
-fn rpc_lost_pilot_holds_when_raw_faded() {
+fn rpc_lost_pilot_holds_when_mobile_power_fades() {
     let mut rpc = HrpdRpcController::new();
 
-    // Last reliable lock was weak. Even if raw input then drops, the loss is
-    // indistinguishable from subtype-3 DTX, which does not
-    // respond to RPC during the silent interval.
+    // A mobile-power drop is indistinguishable from subtype-3 DTX while pilot
+    // quality is unavailable.
     for _ in 0..8 {
         let locked = rpc.ingest(RPC_TEST_TARGET_DB - 6.0, 1.0);
-        let _ = rpc.emit_with_raw_power(locked, -62.0);
+        let _ = rpc.emit_with_mobile_power(locked, -62.0);
     }
 
     let mut up = 0usize;
     let mut down = 0usize;
     for _ in 0..8 {
         let lost = rpc.ingest(f32::NAN, 0.0);
-        match rpc.emit_with_raw_power(lost, -68.0) {
+        match rpc.emit_with_mobile_power(lost, -68.0) {
             0 => up += 1,
             _ => down += 1,
         }
@@ -1891,7 +1908,7 @@ fn rpc_lost_pilot_holds_when_raw_faded() {
 
     assert!(
         up.abs_diff(down) <= 1,
-        "lost metric plus faded raw should hold neutral: up={up} down={down}"
+        "lost metric plus faded mobile power should hold neutral: up={up} down={down}"
     );
 }
 
@@ -1921,6 +1938,7 @@ fn rpc_per_slot_despread_aligns_on_non_frame_aligned_lock() {
         oversample: 1,
         event_tx: None,
         harq_bus: Some(bus.clone()),
+        power_control: None,
         reverse_pilot_acquired: None,
         worker_spawned_at: std::time::Instant::now(),
     };
@@ -2063,6 +2081,7 @@ fn run_subtype3_subframe_packet(q_invert_data: bool) {
         oversample: 1,
         event_tx: Some(event_tx),
         harq_bus: Some(bus.clone()),
+        power_control: None,
         reverse_pilot_acquired: None,
         worker_spawned_at: std::time::Instant::now(),
     };

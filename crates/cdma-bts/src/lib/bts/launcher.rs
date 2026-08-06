@@ -500,6 +500,7 @@ pub fn build_bts_launch_parts(
             traffic_rx_pool: None,
             hrpd_traffic_rx_queue: None,
             hrpd_harq_bus: None,
+            hrpd_power_control: None,
             traffic_channels: None,
             power_control: None,
             traffic_rx_removals: None,

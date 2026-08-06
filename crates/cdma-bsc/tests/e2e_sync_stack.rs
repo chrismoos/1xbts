@@ -8075,6 +8075,7 @@ async fn test_e2e_rc1_reverse_preamble_triggers_crc_valid_bs_ack_order() -> Resu
                 traffic_rx_pool: None,
                 hrpd_traffic_rx_queue: None,
                 hrpd_harq_bus: None,
+                hrpd_power_control: None,
                 traffic_channels: None,
                 power_control: None,
                 traffic_rx_removals: None,

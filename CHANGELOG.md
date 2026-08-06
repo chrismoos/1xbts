@@ -1,5 +1,6 @@
 # HEAD 
 
+- Improve EV-DO reverse power control.
 - Reduced CPU usage across the BTS receiver, transmitter, and packet service.
 - Added support for RC2, QCELP 13K, and QCELP 8K voice. Fixes #16.
 - Fixed 1x downlink power drops while an assigned F-SCH is idle.

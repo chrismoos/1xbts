@@ -6,6 +6,9 @@ use std::time::Instant;
 
 use tokio::sync::mpsc as tokio_mpsc;
 
+use crate::bts::hrpd::{
+    HrpdPacketExclusion, HrpdPacketObservation, HrpdPacketOutcome, HrpdPowerControlHandle,
+};
 use crate::receiver::hrpd::data_decoder::{
     ReverseDataDecoder, ReverseDataRate, traffic_events_from_mac_packet_for_reverse_mac_subtype,
 };
@@ -16,24 +19,26 @@ use cdma_common::hrpd::traffic::REVERSE_TRAFFIC_MAC_SUBTYPE3;
 use super::despread::{HRPD_SLOT_CHIPS, HRPD_TRAFFIC_SLOTS_PER_FRAME};
 use super::finger::{
     TAG_FRAME_OFFSET, TAG_FRAME_START_CHIP, TAG_MAC_INDEX, TAG_PHYSICAL_LAYER_SUBTYPE,
-    TAG_PILOT_COHERENCE_X1000, TAG_PILOT_SNR_DB_TENTHS, TAG_Q_SIGN_X1000,
-    TAG_REVERSE_TRAFFIC_MAC_SUBTYPE, TAG_UATI,
+    TAG_PILOT_COHERENCE_X1000, TAG_PILOT_SNR_DB_TENTHS, TAG_POWER_CONTROL_MOBILE_POWER_LIMITED,
+    TAG_POWER_CONTROL_RECEIVER_REACQUIRING, TAG_Q_SIGN_X1000, TAG_REVERSE_TRAFFIC_MAC_SUBTYPE,
+    TAG_UATI,
 };
 use super::rri_processor::{TAG_RRI_MARGIN_DB_TENTHS, TAG_RRI_RATE_BPS};
 
 pub struct HrpdReverseTrafficDataProcessor {
     event_tx: Option<tokio_mpsc::UnboundedSender<HrpdTrafficEvent>>,
+    power_control: Option<HrpdPowerControlHandle>,
     frames_seen: u64,
     q_polarity_locked: bool,
-    // Reverse frame-error-rate accounting. A frame counts as good when any
+    // Reverse packet-error-rate accounting. A packet counts as good when any
     // rate/polarity decodes CRC-clean, and as erased when the Q arm carries
     // data (`data_arm_present`) but no candidate decodes. Pilot-only frames
     // carry no data and are excluded. Window counters reset on each log; total
     // counters are cumulative for the connection.
-    fer_window_ok: u32,
-    fer_window_erased: u32,
-    fer_total_ok: u64,
-    fer_total_erased: u64,
+    per_window_ok: u32,
+    per_window_erased: u32,
+    per_total_ok: u64,
+    per_total_erased: u64,
     timing_report_start: Instant,
     decode_attempts: u64,
     decode_total_us: u64,
@@ -46,9 +51,9 @@ const DATA_ARM_PRESENT_DB: f32 = -6.0;
 // frame timing/phase estimate is not reliable enough for useful FCS decoding.
 // Keep setup permissive before lock; skip only established traffic during loss.
 const DATA_DECODE_MIN_COHERENCE_AFTER_Q_LOCK: f32 = 0.35;
-/// Number of data-bearing reverse frames between reverse-FER log lines (~1.7 s
+/// Number of data-bearing reverse packets between reverse-PER log lines (~1.7 s
 /// at the 26.67 ms reverse frame period).
-const FER_LOG_WINDOW_FRAMES: u32 = 64;
+const PER_LOG_WINDOW_PACKETS: u32 = 64;
 const REVERSE_DATA_DECODE_RATES: [ReverseDataRate; 5] = [
     ReverseDataRate::Kbps9_6,
     ReverseDataRate::Kbps19_2,
@@ -59,14 +64,22 @@ const REVERSE_DATA_DECODE_RATES: [ReverseDataRate; 5] = [
 
 impl HrpdReverseTrafficDataProcessor {
     pub fn new(event_tx: Option<tokio_mpsc::UnboundedSender<HrpdTrafficEvent>>) -> Self {
+        Self::new_with_power_control(event_tx, None)
+    }
+
+    pub fn new_with_power_control(
+        event_tx: Option<tokio_mpsc::UnboundedSender<HrpdTrafficEvent>>,
+        power_control: Option<HrpdPowerControlHandle>,
+    ) -> Self {
         Self {
             event_tx,
+            power_control,
             frames_seen: 0,
             q_polarity_locked: false,
-            fer_window_ok: 0,
-            fer_window_erased: 0,
-            fer_total_ok: 0,
-            fer_total_erased: 0,
+            per_window_ok: 0,
+            per_window_erased: 0,
+            per_total_ok: 0,
+            per_total_erased: 0,
             timing_report_start: Instant::now(),
             decode_attempts: 0,
             decode_total_us: 0,
@@ -75,16 +88,16 @@ impl HrpdReverseTrafficDataProcessor {
         }
     }
 
-    /// Cumulative `(crc_ok, erased)` reverse-frame counts for the connection.
+    /// Cumulative `(crc_ok, erased)` reverse-packet counts for the connection.
     #[cfg(test)]
-    pub(super) fn fer_totals(&self) -> (u64, u64) {
-        (self.fer_total_ok, self.fer_total_erased)
+    pub(super) fn per_totals(&self) -> (u64, u64) {
+        (self.per_total_ok, self.per_total_erased)
     }
 
-    /// Test seam: drive one frame through the reverse-FER accounting.
+    /// Test seam: drive one packet through the reverse-PER accounting.
     #[cfg(test)]
-    pub(super) fn test_record_reverse_fer(&mut self, crc_ok: bool, data_present: bool) {
-        self.record_reverse_fer(0, 0, crc_ok, data_present, 1.0, 0.0);
+    pub(super) fn test_record_reverse_per(&mut self, crc_ok: bool, data_present: bool) {
+        self.record_reverse_per(0, 0, crc_ok, data_present, None, 1.0, 0.0);
     }
 
     fn record_decode_timing(&mut self, elapsed_us: u64) {
@@ -115,45 +128,64 @@ impl HrpdReverseTrafficDataProcessor {
         self.decode_skipped = 0;
     }
 
-    /// Account one processed reverse frame toward the reverse FER and emit a
-    /// rolling summary every `FER_LOG_WINDOW_FRAMES` data-bearing frames.
-    fn record_reverse_fer(
+    /// Account one processed reverse packet toward the reverse PER and emit a
+    /// rolling summary every `PER_LOG_WINDOW_PACKETS` data-bearing packets.
+    fn record_reverse_per(
         &mut self,
         mac_index: u8,
         uati: u32,
         crc_ok: bool,
         data_present: bool,
+        exclusion: Option<HrpdPacketExclusion>,
         pilot_coh: f32,
         pilot_snr_db: f32,
     ) {
-        if crc_ok {
-            self.fer_window_ok = self.fer_window_ok.saturating_add(1);
-            self.fer_total_ok = self.fer_total_ok.saturating_add(1);
-        } else if data_present {
-            self.fer_window_erased = self.fer_window_erased.saturating_add(1);
-            self.fer_total_erased = self.fer_total_erased.saturating_add(1);
-        } else {
-            // Pilot-only frame, no reverse data transmitted; not part of FER.
+        if (crc_ok || data_present)
+            && let Some(reason) = exclusion
+        {
+            if let Some(power_control) = &self.power_control {
+                let _ = power_control.report(HrpdPacketObservation::rev0(
+                    HrpdPacketOutcome::Excluded(reason),
+                ));
+            }
             return;
         }
-        let window = self.fer_window_ok + self.fer_window_erased;
-        if window >= FER_LOG_WINDOW_FRAMES {
-            let total = self.fer_total_ok + self.fer_total_erased;
+        if crc_ok {
+            self.per_window_ok = self.per_window_ok.saturating_add(1);
+            self.per_total_ok = self.per_total_ok.saturating_add(1);
+            if let Some(power_control) = &self.power_control {
+                let _ =
+                    power_control.report(HrpdPacketObservation::rev0(HrpdPacketOutcome::Success));
+            }
+        } else if data_present {
+            self.per_window_erased = self.per_window_erased.saturating_add(1);
+            self.per_total_erased = self.per_total_erased.saturating_add(1);
+            if let Some(power_control) = &self.power_control {
+                let _ =
+                    power_control.report(HrpdPacketObservation::rev0(HrpdPacketOutcome::Erasure));
+            }
+        } else {
+            // Pilot-only frame, no reverse data transmitted; not part of PER.
+            return;
+        }
+        let window = self.per_window_ok + self.per_window_erased;
+        if window >= PER_LOG_WINDOW_PACKETS {
+            let total = self.per_total_ok + self.per_total_erased;
             log::info!(
-                "rx_hrpd_traffic[m{}]: reverse_fer uati=0x{:08x} window_fer={:.1}% ({}/{}) total_fer={:.1}% ({}/{}) pilot_coh={:.3} pilot_snr={:.1}dB",
+                "rx_hrpd_traffic[m{}]: reverse_per uati=0x{:08x} window_per={:.1}% ({}/{}) total_per={:.1}% ({}/{}) pilot_coh={:.3} pilot_snr={:.1}dB",
                 mac_index,
                 uati,
-                100.0 * f64::from(self.fer_window_erased) / f64::from(window.max(1)),
-                self.fer_window_erased,
+                100.0 * f64::from(self.per_window_erased) / f64::from(window.max(1)),
+                self.per_window_erased,
                 window,
-                100.0 * self.fer_total_erased as f64 / (total.max(1)) as f64,
-                self.fer_total_erased,
+                100.0 * self.per_total_erased as f64 / (total.max(1)) as f64,
+                self.per_total_erased,
                 total,
                 pilot_coh,
                 pilot_snr_db,
             );
-            self.fer_window_ok = 0;
-            self.fer_window_erased = 0;
+            self.per_window_ok = 0;
+            self.per_window_erased = 0;
         }
     }
 }
@@ -374,6 +406,21 @@ impl PipelineProcessor for HrpdReverseTrafficDataProcessor {
             .copied()
             .map(|v| if v < 0 { -1.0 } else { 1.0 })
             .unwrap_or(1.0);
+        let power_control_exclusion = if block
+            .tags
+            .get(TAG_POWER_CONTROL_MOBILE_POWER_LIMITED)
+            .is_some_and(|value| *value != 0)
+        {
+            Some(HrpdPacketExclusion::MobilePowerLimited)
+        } else if block
+            .tags
+            .get(TAG_POWER_CONTROL_RECEIVER_REACQUIRING)
+            .is_some_and(|value| *value != 0)
+        {
+            Some(HrpdPacketExclusion::ReceiverReacquiring)
+        } else {
+            None
+        };
 
         if uses_subtype3_subframe_decoder(physical_layer_subtype, reverse_traffic_mac_subtype) {
             if self.frames_seen <= 8 || self.frames_seen % 64 == 0 {
@@ -391,7 +438,15 @@ impl PipelineProcessor for HrpdReverseTrafficDataProcessor {
         let data_arm_present = pilot_locked && data_arm_db > DATA_ARM_PRESENT_DB;
         if self.q_polarity_locked && pilot_coh < DATA_DECODE_MIN_COHERENCE_AFTER_Q_LOCK {
             self.decode_skipped = self.decode_skipped.saturating_add(1);
-            self.record_reverse_fer(mac_index, uati, false, false, pilot_coh, pilot_snr_db);
+            self.record_reverse_per(
+                mac_index,
+                uati,
+                false,
+                false,
+                power_control_exclusion,
+                pilot_coh,
+                pilot_snr_db,
+            );
             self.maybe_report_decode_timing(mac_index, uati);
             return vec![block];
         }
@@ -417,11 +472,12 @@ impl PipelineProcessor for HrpdReverseTrafficDataProcessor {
         let candidate_rates =
             reverse_data_decode_candidate_rates(rri_rate, physical_layer_subtype, data_arm_present);
         if candidate_rates.is_empty() {
-            self.record_reverse_fer(
+            self.record_reverse_per(
                 mac_index,
                 uati,
                 false,
                 data_arm_present,
+                power_control_exclusion,
                 pilot_coh,
                 pilot_snr_db,
             );
@@ -460,11 +516,12 @@ impl PipelineProcessor for HrpdReverseTrafficDataProcessor {
                 self.record_decode_timing(decode_start.elapsed().as_micros() as u64);
                 fcs_results.push((candidate_rate, *polarity_label, frame.crc_ok));
                 if frame.crc_ok {
-                    self.record_reverse_fer(
+                    self.record_reverse_per(
                         mac_index,
                         uati,
                         true,
                         data_arm_present,
+                        power_control_exclusion,
                         pilot_coh,
                         pilot_snr_db,
                     );
@@ -537,13 +594,14 @@ impl PipelineProcessor for HrpdReverseTrafficDataProcessor {
                 }
             }
         }
-        // No candidate decoded this frame: account it toward reverse FER
+        // No candidate decoded this frame: account it toward reverse PER
         // (erased if the Q arm carried data, otherwise pilot-only/excluded).
-        self.record_reverse_fer(
+        self.record_reverse_per(
             mac_index,
             uati,
             false,
             data_arm_present,
+            power_control_exclusion,
             pilot_coh,
             pilot_snr_db,
         );

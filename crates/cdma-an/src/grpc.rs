@@ -1840,7 +1840,7 @@ mod tests {
         assert_eq!(message.type_name, "TrafficChannelAssignment");
         assert_eq!(
             message.summary,
-            "TrafficChannelAssignment seq=3 pilots=1 pilot_pn=0 mac=7 drc_cover=1 channel=0/0/630 frame_offset=0 drc_len=3 drc_gain=+6.0dB ack_gain=+0.0dB"
+            "TrafficChannelAssignment seq=3 pilots=1 pilot_pn=0 mac=7 drc_cover=1 channel=0/0/630 frame_offset=0 drc_len=3 drc_gain=+0.0dB ack_gain=+3.0dB"
         );
         assert_eq!(
             message.protocol_type,

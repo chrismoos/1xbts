@@ -522,6 +522,8 @@ pub struct RxSettings {
     /// decoding and the scheduler runs the no-feedback `unknown_retx`
     /// fallback exclusively.
     pub hrpd_harq_bus: Option<std::sync::Arc<crate::bts::hrpd::HarqBus>>,
+    /// Assignment-scoped HRPD reverse-packet outer-loop power control.
+    pub hrpd_power_control: Option<crate::bts::hrpd::HrpdPowerControlRegistry>,
     /// Shared pool of active forward traffic channels, used by BTS-local
     /// reverse power control to schedule PCBs on the TX timeline.
     pub traffic_channels: Option<TrafficChannelPool>,

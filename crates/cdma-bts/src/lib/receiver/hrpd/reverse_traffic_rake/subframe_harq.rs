@@ -10,6 +10,7 @@
 
 use num::complex::Complex32;
 
+use crate::bts::hrpd::HrpdTransmissionMode;
 use crate::bts::hrpd::harq_bus::ArqLevel;
 use crate::phy::hrpd::turbo_decoder::HrpdTurboDecoder;
 use cdma_common::hrpd::traffic::physical_crc24;
@@ -38,11 +39,13 @@ const PACKET_TAIL_BITS: usize = 6;
 struct PacketState {
     format: &'static Subtype2DataFormat,
     harq: Vec<f32>,
+    first_subpacket_start_slot: u64,
     last_subpacket_start_slot: u64,
     last_subpacket_id: u8,
     subpackets_accumulated: u8,
     decoded_payload: Option<Vec<u8>>,
     delivered: bool,
+    terminal_reported: bool,
 }
 
 /// ARQ levels to schedule for one TX slot.
@@ -70,6 +73,27 @@ pub struct SubframeOutcome {
     pub turbo_iterations: u8,
     pub llr_mean_abs: f32,
     pub mother_mean_abs: f32,
+    pub terminal_packets: Vec<TerminalPacketOutcome>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalPacketDisposition {
+    Decoded {
+        transmission_mode: HrpdTransmissionMode,
+    },
+    Exhausted,
+    Abandoned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalPacketOutcome {
+    pub disposition: TerminalPacketDisposition,
+    pub payload_bits: u32,
+    pub first_subpacket_start_slot: u64,
+    pub interlace: u8,
+    pub subpackets_accumulated: u8,
+    /// One-based subpacket number. Present only for a successful late/early decode.
+    pub decoded_subpacket: Option<u8>,
 }
 
 #[derive(Clone)]
@@ -114,9 +138,16 @@ impl SubframeHarq {
         let slot_of_interlace = &mut self.interlaces[usize::from(interlace)];
 
         if is_rri_subtype2_null(rri) {
-            // Null RRI: the interlace is idle. An undecoded in-flight packet
-            // is abandoned (the AT moved on).
-            *slot_of_interlace = None;
+            if let Some(state) = slot_of_interlace.take()
+                && !state.terminal_reported
+            {
+                outcome.terminal_packets.push(terminal_packet(
+                    &state,
+                    interlace,
+                    TerminalPacketDisposition::Abandoned,
+                    None,
+                ));
+            }
             return outcome;
         }
         let Some(format) = Subtype2DataFormat::for_payload_bits(rri.payload_bits as usize) else {
@@ -138,14 +169,26 @@ impl SubframeHarq {
             }
         };
         if starts_new_packet {
+            if let Some(state) = slot_of_interlace.take()
+                && !state.terminal_reported
+            {
+                outcome.terminal_packets.push(terminal_packet(
+                    &state,
+                    interlace,
+                    TerminalPacketDisposition::Abandoned,
+                    None,
+                ));
+            }
             *slot_of_interlace = Some(PacketState {
                 format,
                 harq: format.new_harq_buffer(),
+                first_subpacket_start_slot: start_slot,
                 last_subpacket_start_slot: start_slot,
                 last_subpacket_id: rri.subpacket_id,
                 subpackets_accumulated: 0,
                 decoded_payload: None,
                 delivered: false,
+                terminal_reported: false,
             });
         }
         let state = slot_of_interlace.as_mut().expect("state just ensured");
@@ -176,6 +219,22 @@ impl SubframeHarq {
         if outcome.decoded && !state.delivered {
             state.delivered = true;
             outcome.delivered = state.decoded_payload.clone();
+        }
+        if outcome.decoded && !state.terminal_reported {
+            if let Some(transmission_mode) = state
+                .decoded_payload
+                .as_ref()
+                .and_then(|payload| payload.last())
+                .map(|mode| HrpdTransmissionMode::from_low_latency(mode & 1 != 0))
+            {
+                state.terminal_reported = true;
+                outcome.terminal_packets.push(terminal_packet(
+                    state,
+                    interlace,
+                    TerminalPacketDisposition::Decoded { transmission_mode },
+                    Some(rri.subpacket_id.saturating_add(1)),
+                ));
+            }
         }
 
         let final_subpacket = rri.subpacket_id as usize + 1 >= MAX_SUBPACKETS;
@@ -216,10 +275,33 @@ impl SubframeHarq {
             );
         }
         if final_subpacket && !outcome.decoded {
+            state.terminal_reported = true;
+            outcome.terminal_packets.push(terminal_packet(
+                state,
+                interlace,
+                TerminalPacketDisposition::Exhausted,
+                None,
+            ));
             // Packet exhausted its sub-packets; free the interlace.
             *slot_of_interlace = None;
         }
         outcome
+    }
+}
+
+fn terminal_packet(
+    state: &PacketState,
+    interlace: u8,
+    disposition: TerminalPacketDisposition,
+    decoded_subpacket: Option<u8>,
+) -> TerminalPacketOutcome {
+    TerminalPacketOutcome {
+        disposition,
+        payload_bits: state.format.payload_bits as u32,
+        first_subpacket_start_slot: state.first_subpacket_start_slot,
+        interlace,
+        subpackets_accumulated: state.subpackets_accumulated,
+        decoded_subpacket,
     }
 }
 
@@ -324,15 +406,25 @@ mod tests {
             .collect()
     }
 
-    fn build_packet_bits(payload_bits: usize, seed: u32) -> Vec<u8> {
+    fn build_packet_bits_with_mode(
+        payload_bits: usize,
+        seed: u32,
+        transmission_mode: HrpdTransmissionMode,
+    ) -> Vec<u8> {
         let mac_bits = payload_bits - PACKET_FCS_BITS - PACKET_TAIL_BITS;
         let mut bits = lcg_bits(mac_bits, seed);
+        *bits.last_mut().expect("MAC trailer") =
+            u8::from(transmission_mode == HrpdTransmissionMode::LowLatency);
         let fcs = physical_crc24(&bits);
         for i in (0..PACKET_FCS_BITS).rev() {
             bits.push(((fcs >> i) & 1) as u8);
         }
         bits.extend(std::iter::repeat_n(0u8, PACKET_TAIL_BITS));
         bits
+    }
+
+    fn build_packet_bits(payload_bits: usize, seed: u32) -> Vec<u8> {
+        build_packet_bits_with_mode(payload_bits, seed, HrpdTransmissionMode::HighCapacity)
     }
 
     fn tx_subframe_symbols(
@@ -392,6 +484,19 @@ mod tests {
         assert_eq!(outcome.turbo_iterations, 1);
         let mac_end = packet.len() - PACKET_FCS_BITS - PACKET_TAIL_BITS;
         assert_eq!(outcome.delivered.as_deref(), Some(&packet[..mac_end]));
+        assert_eq!(
+            outcome.terminal_packets,
+            vec![TerminalPacketOutcome {
+                disposition: TerminalPacketDisposition::Decoded {
+                    transmission_mode: HrpdTransmissionMode::HighCapacity,
+                },
+                payload_bits: 1024,
+                first_subpacket_start_slot: start_slot,
+                interlace: 0,
+                subpackets_accumulated: 1,
+                decoded_subpacket: Some(1),
+            }]
+        );
         // H-ARQ ACK slots m..m+2 with m = start + 8, minus the RPC slot
         // ((slot − 0) mod 4 == 3 → slot 131 excluded).
         let acked: Vec<u64> = outcome.arq.iter().map(|d| d.slot).collect();
@@ -409,12 +514,17 @@ mod tests {
         let again = harq.ingest_subframe(start_slot + 12, 0, &detection(1024, 1), &w24b, &w12b);
         assert!(again.decoded);
         assert!(again.delivered.is_none(), "payload delivered exactly once");
+        assert!(
+            again.terminal_packets.is_empty(),
+            "terminal outcome emitted exactly once"
+        );
     }
 
     #[test]
     fn max_payload_decodes_first_subpacket_in_one_iteration() {
         let format = Subtype2DataFormat::for_payload_bits(12_288).expect("format");
-        let packet = build_packet_bits(12_288, 0xA5A5_1228);
+        let packet =
+            build_packet_bits_with_mode(12_288, 0xA5A5_1228, HrpdTransmissionMode::LowLatency);
         let start_slot = 120u64;
         let (w24, w12) = tx_subframe_symbols(format, &packet, 0, 0);
 
@@ -424,6 +534,15 @@ mod tests {
 
         assert!(outcome.decoded);
         assert_eq!(outcome.turbo_iterations, 1);
+        assert!(matches!(
+            outcome.terminal_packets.as_slice(),
+            [TerminalPacketOutcome {
+                disposition: TerminalPacketDisposition::Decoded {
+                    transmission_mode: HrpdTransmissionMode::LowLatency
+                },
+                ..
+            }]
+        ));
         eprintln!(
             "12288-bit first-subpacket decode elapsed_us={}",
             started.elapsed().as_micros()
@@ -444,6 +563,7 @@ mod tests {
             let outcome = harq.ingest_subframe(base, 0, &detection(1024, sp), &w24, &w12);
             assert!(!outcome.decoded);
             if sp < 3 {
+                assert!(outcome.terminal_packets.is_empty());
                 assert!(
                     outcome
                         .arq
@@ -468,6 +588,17 @@ mod tests {
                         (170, ArqLevel::Off, ArqLevel::Minus),
                     ],
                     "L-ARQ NAK is at packet start +44 and P-ARQ NAK at +48"
+                );
+                assert_eq!(
+                    outcome.terminal_packets,
+                    vec![TerminalPacketOutcome {
+                        disposition: TerminalPacketDisposition::Exhausted,
+                        payload_bits: 1024,
+                        first_subpacket_start_slot: 120,
+                        interlace: 0,
+                        subpackets_accumulated: 4,
+                        decoded_subpacket: None,
+                    }]
                 );
             }
         }
@@ -512,6 +643,29 @@ mod tests {
         let (late_w24, late_w12) = tx_subframe_symbols(format, &packet1, 1, 0);
         let late = harq.ingest_subframe(252, 0, &detection(1024, 1), &late_w24, &late_w12);
         assert_eq!(late.subpacket_id, 1);
+        assert_eq!(
+            late.terminal_packets,
+            vec![
+                TerminalPacketOutcome {
+                    disposition: TerminalPacketDisposition::Abandoned,
+                    payload_bits: 1024,
+                    first_subpacket_start_slot: 120,
+                    interlace: 0,
+                    subpackets_accumulated: 1,
+                    decoded_subpacket: None,
+                },
+                TerminalPacketOutcome {
+                    disposition: TerminalPacketDisposition::Decoded {
+                        transmission_mode: HrpdTransmissionMode::HighCapacity,
+                    },
+                    payload_bits: 1024,
+                    first_subpacket_start_slot: 252,
+                    interlace: 0,
+                    subpackets_accumulated: 1,
+                    decoded_subpacket: Some(2),
+                },
+            ]
+        );
 
         let state = harq.interlaces[0]
             .as_ref()
@@ -533,6 +687,17 @@ mod tests {
         assert!(!first.decoded);
         let null = harq.ingest_subframe(132, 0, &detection(0, 0), &[], &[]);
         assert!(!null.decoded && null.arq.is_empty());
+        assert_eq!(
+            null.terminal_packets,
+            vec![TerminalPacketOutcome {
+                disposition: TerminalPacketDisposition::Abandoned,
+                payload_bits: 1024,
+                first_subpacket_start_slot: 120,
+                interlace: 0,
+                subpackets_accumulated: 1,
+                decoded_subpacket: None,
+            }]
+        );
         // A fresh packet on the same interlace decodes from scratch.
         let (w24b, w12b) = tx_subframe_symbols(format, &packet, 0, 0);
         let fresh = harq.ingest_subframe(144, 0, &detection(1024, 0), &w24b, &w12b);
