@@ -400,11 +400,8 @@ impl HrpdReverseFingerSpawnStrategy for HrpdAccessFrameSpawnStrategy {
             let start_chip = aligned_start_chip - frame_back * ACCESS_PACKET_CHIPS as i64;
             if let Some((coherence, _)) = preamble_lag_coherence(
                 buffer,
-                buffer_abs_signed,
-                self.cfg.oversample,
+                ChipGeometry::new(buffer_abs_signed, self.cfg.oversample),
                 start_chip,
-                0,
-                0.0,
             ) {
                 pregate_coherence = pregate_coherence.max(coherence);
             }
@@ -741,11 +738,9 @@ impl HrpdAccessFrameFinger {
             for mode in HrpdAccessPacketDespreadMode::ALL {
                 let Some(mut chips) = extract_spec_despread_access_packet_chips(
                     &self.buffer,
-                    buffer_abs_sample,
-                    self.oversample,
+                    ChipGeometry::new(buffer_abs_sample, self.oversample)
+                        .at_delay(timing.sample_delay, timing.sample_delay_fraction),
                     timing.preamble_start_chip,
-                    timing.sample_delay,
-                    timing.sample_delay_fraction,
                     self.preamble_frames,
                     derived_access_cycle_number_for_chip(timing.preamble_start_chip as u64),
                     self.sector_id_lsb,
@@ -805,11 +800,9 @@ impl HrpdAccessFrameFinger {
                     for fragment_idx in 1..required_fragments {
                         let Some(mut fragment_chips) = extract_spec_despread_access_packet_chips(
                             &self.buffer,
-                            buffer_abs_sample,
-                            self.oversample,
+                            ChipGeometry::new(buffer_abs_sample, self.oversample)
+                                .at_delay(timing.sample_delay, timing.sample_delay_fraction),
                             timing.preamble_start_chip,
-                            timing.sample_delay,
-                            timing.sample_delay_fraction,
                             self.preamble_frames + fragment_idx,
                             derived_access_cycle_number_for_chip(timing.preamble_start_chip as u64),
                             self.sector_id_lsb,
@@ -1302,6 +1295,7 @@ fn timing_candidates_near_fft_hit(
         -24, -28, -20, -32, -16, -36, -12, -40, -8, -4, 0, 4, 8, 12, 16, 20, 24, 32, 40, 48, 56,
         64, 72, 84, 96, 108, 120,
     ];
+    let grid = ChipGeometry::new(absolute_sample_start, oversample);
     let mut coarse = Vec::new();
     // Narrowed search space (2×3×27 = 162 candidates): frame_back=1 catches
     // an IFFT peak that rounded into the next frame, and ±1 slot covers the
@@ -1313,14 +1307,9 @@ fn timing_candidates_near_fft_hit(
                 continue;
             }
             for sample_delay in sample_delays {
-                let Some((lag_coherence, phase_step)) = preamble_lag_coherence(
-                    samples,
-                    absolute_sample_start,
-                    oversample,
-                    start_chip,
-                    sample_delay,
-                    0.0,
-                ) else {
+                let Some((lag_coherence, phase_step)) =
+                    preamble_lag_coherence(samples, grid.at_delay(sample_delay, 0.0), start_chip)
+                else {
                     continue;
                 };
                 if lag_coherence >= ACCESS_PREAMBLE_MIN_LAG_COHERENCE {
@@ -1369,14 +1358,10 @@ fn timing_candidates_near_fft_hit(
             coarse.sample_delay + 4,
         ] {
             for sample_delay_fraction in [0.0f32, -0.75, 0.75] {
-                let Some((lag_coherence, phase_step)) = preamble_lag_coherence(
-                    samples,
-                    absolute_sample_start,
-                    oversample,
-                    coarse.preamble_start_chip,
-                    sample_delay,
-                    sample_delay_fraction,
-                ) else {
+                let geometry = grid.at_delay(sample_delay, sample_delay_fraction);
+                let Some((lag_coherence, phase_step)) =
+                    preamble_lag_coherence(samples, geometry, coarse.preamble_start_chip)
+                else {
                     continue;
                 };
                 if lag_coherence < ACCESS_PREAMBLE_MIN_LAG_COHERENCE {
@@ -1384,11 +1369,8 @@ fn timing_candidates_near_fft_hit(
                 }
                 let spec_coherence = preamble_spec_coherence_with_reference(
                     samples,
-                    absolute_sample_start,
-                    oversample,
+                    geometry,
                     coarse.preamble_start_chip,
-                    sample_delay,
-                    sample_delay_fraction,
                     reference,
                 )
                 .unwrap_or(0.0);
@@ -1507,11 +1489,8 @@ fn erase_gated_slots(chips: &mut [Complex32]) {
 /// slots otherwise dilute the metric, is scored on its live slots).
 fn preamble_lag_coherence(
     samples: &[Complex32],
-    absolute_sample_start: i64,
-    oversample: usize,
+    geometry: ChipGeometry,
     preamble_start_chip: i64,
-    sample_delay: i32,
-    sample_delay_fraction: f32,
 ) -> Option<(f32, f32)> {
     let stride = 64usize;
     let mut dot01 = [Complex32::new(0.0, 0.0); ACCESS_FRAME_SLOTS];
@@ -1520,32 +1499,18 @@ fn preamble_lag_coherence(
     let mut pow0 = [0.0f32; ACCESS_FRAME_SLOTS];
     let mut pow1 = [0.0f32; ACCESS_FRAME_SLOTS];
     let mut pow2 = [0.0f32; ACCESS_FRAME_SLOTS];
+    let last_k = (ACCESS_PACKET_CHIPS - 1) / stride * stride;
+    let frame_samples = (ACCESS_PACKET_CHIPS * geometry.oversample) as i64;
+    let last_chip = preamble_start_chip + (2 * ACCESS_PACKET_CHIPS + last_k) as i64;
+    let scan = geometry.scan(samples, preamble_start_chip, last_chip, stride)?;
+
+    let mut index = scan.index;
     for k in (0..ACCESS_PACKET_CHIPS).step_by(stride) {
         let slot = (k / HRPD_SLOT_CHIPS).min(ACCESS_FRAME_SLOTS - 1);
-        let a = sample_chip_interp(
-            samples,
-            absolute_sample_start,
-            oversample,
-            preamble_start_chip + k as i64,
-            sample_delay,
-            sample_delay_fraction,
-        )?;
-        let b = sample_chip_interp(
-            samples,
-            absolute_sample_start,
-            oversample,
-            preamble_start_chip + ACCESS_PACKET_CHIPS as i64 + k as i64,
-            sample_delay,
-            sample_delay_fraction,
-        )?;
-        let c = sample_chip_interp(
-            samples,
-            absolute_sample_start,
-            oversample,
-            preamble_start_chip + (2 * ACCESS_PACKET_CHIPS) as i64 + k as i64,
-            sample_delay,
-            sample_delay_fraction,
-        )?;
+        let a = scan.interp(samples, index);
+        let b = scan.interp(samples, index + frame_samples);
+        let c = scan.interp(samples, index + 2 * frame_samples);
+        index += scan.step;
         dot01[slot] += a.conj() * b;
         dot02[slot] += a.conj() * c;
         dot12[slot] += b.conj() * c;
@@ -1579,25 +1544,28 @@ fn preamble_lag_coherence(
 
 fn preamble_spec_coherence_with_reference(
     samples: &[Complex32],
-    absolute_sample_start: i64,
-    oversample: usize,
+    geometry: ChipGeometry,
     preamble_start_chip: i64,
-    sample_delay: i32,
-    sample_delay_fraction: f32,
     reference: &[Complex32],
 ) -> Option<f32> {
+    const SPEC_COHERENCE_STRIDE: usize = 16;
     let mut coherent = [Complex32::new(0.0, 0.0); ACCESS_FRAME_SLOTS];
     let mut abs_sum = [0.0f32; ACCESS_FRAME_SLOTS];
-    for k in (0..ACCESS_PACKET_CHIPS).step_by(16) {
+
+    let last_k = (ACCESS_PACKET_CHIPS - 1) / SPEC_COHERENCE_STRIDE * SPEC_COHERENCE_STRIDE;
+    let last_chip = preamble_start_chip + last_k as i64;
+    let scan = geometry.scan(
+        samples,
+        preamble_start_chip,
+        last_chip,
+        SPEC_COHERENCE_STRIDE,
+    )?;
+
+    let mut index = scan.index;
+    for k in (0..ACCESS_PACKET_CHIPS).step_by(SPEC_COHERENCE_STRIDE) {
         let slot = (k / HRPD_SLOT_CHIPS).min(ACCESS_FRAME_SLOTS - 1);
-        let sample = sample_chip_interp(
-            samples,
-            absolute_sample_start,
-            oversample,
-            preamble_start_chip + k as i64,
-            sample_delay,
-            sample_delay_fraction,
-        )?;
+        let sample = scan.interp(samples, index);
+        index += scan.step;
         let v = sample * reference[k].conj();
         coherent[slot] += v;
         abs_sum[slot] += v.norm();
@@ -1638,11 +1606,8 @@ fn access_packet_samples_available(
 #[allow(clippy::too_many_arguments)]
 fn extract_spec_despread_access_packet_chips(
     samples: &[Complex32],
-    absolute_sample_start: i64,
-    oversample: usize,
+    geometry: ChipGeometry,
     preamble_start_chip: i64,
-    sample_delay: i32,
-    sample_delay_fraction: f32,
     preamble_frames: usize,
     access_cycle_number: u8,
     sector_id_lsb: u32,
@@ -1679,17 +1644,14 @@ fn extract_spec_despread_access_packet_chips(
     });
 
     let packet_phase_correction = complex_phase(-phase_step * preamble_frames as f32);
+    let last_chip = packet_start + (ACCESS_PACKET_CHIPS - 1) as i64;
+    let scan = geometry.scan(samples, packet_start, last_chip, 1)?;
+
+    let mut index = scan.index;
     let mut chips = Vec::with_capacity(ACCESS_PACKET_CHIPS);
     for k in 0..ACCESS_PACKET_CHIPS {
-        let chip = packet_start + k as i64;
-        let sample = sample_chip_interp(
-            samples,
-            absolute_sample_start,
-            oversample,
-            chip,
-            sample_delay,
-            sample_delay_fraction,
-        )?;
+        let sample = scan.interp(samples, index);
+        index += scan.step;
         let despread = match mode {
             HrpdAccessPacketDespreadMode::Composite => sample * reference[k].conj(),
         };
@@ -1702,34 +1664,92 @@ fn complex_phase(phase: f32) -> Complex32 {
     Complex32::new(phase.cos(), phase.sin())
 }
 
-fn sample_chip_interp(
-    samples: &[Complex32],
+/// Chip-to-sample mapping shared by every position in one scan.
+#[derive(Clone, Copy)]
+struct ChipGeometry {
     absolute_sample_start: i64,
     oversample: usize,
-    chip: i64,
     sample_delay: i32,
     sample_delay_fraction: f32,
-) -> Option<Complex32> {
-    let sample_abs = chip as f64 * oversample as f64
-        + f64::from(sample_delay)
-        + f64::from(sample_delay_fraction);
-    let sample_idx = sample_abs - absolute_sample_start as f64;
-    interp_complex_linear(samples, sample_idx)
 }
 
-fn interp_complex_linear(samples: &[Complex32], idx: f64) -> Option<Complex32> {
-    if !idx.is_finite() || idx < 0.0 {
-        return None;
+impl ChipGeometry {
+    fn new(absolute_sample_start: i64, oversample: usize) -> Self {
+        Self {
+            absolute_sample_start,
+            oversample,
+            sample_delay: 0,
+            sample_delay_fraction: 0.0,
+        }
     }
-    let lo = idx.floor() as usize;
-    let frac = (idx - lo as f64) as f32;
-    if lo + 1 >= samples.len() {
-        return None;
+
+    fn at_delay(self, sample_delay: i32, sample_delay_fraction: f32) -> Self {
+        Self {
+            sample_delay,
+            sample_delay_fraction,
+            ..self
+        }
     }
-    let a = samples[lo];
-    let b = samples[lo + 1];
-    Some(Complex32::new(
-        a.re + (b.re - a.re) * frac,
-        a.im + (b.im - a.im) * frac,
-    ))
+
+    fn position(&self, chip: i64) -> Option<(i64, f32)> {
+        let sample_abs = chip as f64 * self.oversample as f64
+            + f64::from(self.sample_delay)
+            + f64::from(self.sample_delay_fraction);
+        let idx = sample_abs - self.absolute_sample_start as f64;
+        if !idx.is_finite() || idx < 0.0 {
+            return None;
+        }
+        let floor = idx.floor();
+        Some((floor as i64, (idx - floor) as f32))
+    }
+
+    /// Resolve the scan covering chips `first..=last`, visited `stride` chips
+    /// at a time.
+    fn scan(
+        &self,
+        samples: &[Complex32],
+        first: i64,
+        last: i64,
+        stride: usize,
+    ) -> Option<ChipScan> {
+        let (index, fraction) = self.position(first)?;
+        let (last_index, last_fraction) = self.position(last)?;
+        if last_fraction != fraction
+            || last_index != index + (last - first) * self.oversample as i64
+        {
+            return None;
+        }
+        // The scan is monotonic, so the last chip covers every earlier one.
+        if (last_index as usize) + 1 >= samples.len() {
+            return None;
+        }
+        Some(ChipScan {
+            index,
+            fraction,
+            step: (stride * self.oversample) as i64,
+        })
+    }
+}
+
+/// One sample index, fraction, and stride covering a whole chip scan. Only
+/// valid when both endpoints agree on the fraction — at live-capture chip
+/// counts an f64 position cannot hold one, and it rounds to a whole sample.
+#[derive(Clone, Copy)]
+struct ChipScan {
+    index: i64,
+    fraction: f32,
+    step: i64,
+}
+
+impl ChipScan {
+    #[inline]
+    fn interp(&self, samples: &[Complex32], index: i64) -> Complex32 {
+        let lo = index as usize;
+        let a = samples[lo];
+        let b = samples[lo + 1];
+        Complex32::new(
+            a.re + (b.re - a.re) * self.fraction,
+            a.im + (b.im - a.im) * self.fraction,
+        )
+    }
 }

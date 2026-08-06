@@ -282,7 +282,7 @@ impl Bts {
             traffic_rx_removals: senders.traffic_rx_removals,
             power_control: senders.power_control,
             rx_measurements: senders.rx_measurements,
-            hrpd_harq_bus: std::sync::Arc::new(crate::bts::hrpd::HarqBus::new()),
+            hrpd_harq_bus: senders.hrpd_harq_bus,
         };
         (bts, handle)
     }

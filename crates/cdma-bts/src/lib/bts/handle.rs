@@ -38,7 +38,10 @@ use crate::{
 };
 
 use super::{AccessChannelEvent, BtsPowerControlRegistry, BtsRuntimeSettings};
-use crate::bts::hrpd::scheduler::PreparedForwardTrafficPacket;
+use crate::bts::hrpd::harq_bus::HarqBus;
+use crate::bts::hrpd::scheduler::{
+    ForwardTrafficPreparer, ForwardTrafficSender, PreparedForwardTrafficPacket,
+};
 
 /// Metrics snapshot from the TX loop, published every ~1 second.
 #[derive(Debug, Clone, Default)]
@@ -606,8 +609,8 @@ pub struct BtsHandle {
     pub hrpd_traffic_assignments: mpsc::UnboundedSender<HrpdTrafficAssignmentRequest>,
     /// Queue AN-originated HRPD traffic releases (session closed/replaced).
     pub hrpd_traffic_releases: mpsc::UnboundedSender<HrpdTrafficReleaseRequest>,
-    /// Queue producer-prepared HRPD Forward Traffic Channel physical packets.
-    pub hrpd_forward_traffic: mpsc::UnboundedSender<PreparedForwardTrafficPacket>,
+    /// Queue HRPD Forward Traffic Channel physical packets for the forward MAC.
+    pub hrpd_forward_traffic: ForwardTrafficSender,
     /// Shared pool of active forward traffic channels.
     pub traffic_channels: TrafficChannelPool,
     /// BTS-local reverse power-control state keyed by traffic Walsh code.
@@ -1068,6 +1071,8 @@ pub(crate) struct BtsHandleSenders {
     pub power_control: BtsPowerControlRegistry,
     /// Shared access-channel signal quality store, written by BTS RX.
     pub rx_measurements: super::settings::RxMeasurementStore,
+    /// Shared H-ARQ bus (same Arc the handle's forward-traffic preparer holds).
+    pub hrpd_harq_bus: Arc<HarqBus>,
 }
 
 /// Create a matched pair of (senders for BTS internals, handle for BSC).
@@ -1091,6 +1096,8 @@ pub(crate) fn create_handle(config: Arc<BtsRuntimeSettings>) -> (BtsHandleSender
     let power_control = BtsPowerControlRegistry::default();
     let rx_measurements: super::settings::RxMeasurementStore =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    let hrpd_harq_bus: Arc<HarqBus> = Arc::new(HarqBus::new());
 
     let mut walsh_alloc = WalshAllocator::new();
     walsh_alloc.reserve_system_channels(
@@ -1116,6 +1123,7 @@ pub(crate) fn create_handle(config: Arc<BtsRuntimeSettings>) -> (BtsHandleSender
         traffic_rx_removals: traffic_rx_removals.clone(),
         power_control: power_control.clone(),
         rx_measurements: rx_measurements.clone(),
+        hrpd_harq_bus: hrpd_harq_bus.clone(),
     };
 
     let handle = BtsHandle {
@@ -1129,7 +1137,10 @@ pub(crate) fn create_handle(config: Arc<BtsRuntimeSettings>) -> (BtsHandleSender
         hrpd_forward_signaling: hrpd_forward_tx,
         hrpd_traffic_assignments: hrpd_traffic_tx,
         hrpd_traffic_releases: hrpd_traffic_release_tx,
-        hrpd_forward_traffic: hrpd_forward_traffic_tx,
+        hrpd_forward_traffic: ForwardTrafficSender::new(
+            hrpd_forward_traffic_tx,
+            ForwardTrafficPreparer::new(hrpd_harq_bus),
+        ),
         traffic_channels,
         power_control,
         walsh_allocator: Arc::new(Mutex::new(walsh_alloc)),

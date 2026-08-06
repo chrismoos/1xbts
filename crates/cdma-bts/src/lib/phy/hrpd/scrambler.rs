@@ -117,14 +117,18 @@ impl HrpdForwardScrambler {
     ///
     /// Bit 7 of the returned byte is the first bit produced by
     /// [`next_bit`]; this matches a typical big-endian packed-bit buffer.
+    ///
+    /// Feedback shifted in at bit 0 does not reach the bit-13 tap until the
+    /// 14th clock, so up to 14 steps read only the current state and collapse
+    /// into one word operation.
     pub fn next_byte(&mut self) -> u8 {
-        let mut b = 0u8;
-        for i in (0..8).rev() {
-            if self.next_bit() {
-                b |= 1 << i;
-            }
-        }
-        b
+        const STEPS: u32 = 8;
+        let state = self.state;
+        let out = (state >> (Self::WIDTH - STEPS)) as u8;
+        let feedback = ((state >> (Self::WIDTH - STEPS)) ^ (state >> (Self::WIDTH - 3 - STEPS)))
+            & ((1 << STEPS) - 1);
+        self.state = ((state << STEPS) | feedback) & ((1 << Self::WIDTH) - 1);
+        out
     }
 
     /// XOR the scrambling sequence onto a packed-bit buffer, MSB-first
@@ -141,7 +145,14 @@ impl HrpdForwardScrambler {
     /// `bits` must contain one bit per byte (`0` or `1`). This is the form
     /// used by the HRPD channel-interleaver and QPSK mapper in this crate.
     pub fn apply_bits(&mut self, bits: &mut [u8]) {
-        for bit in bits {
+        let mut chunks = bits.chunks_exact_mut(8);
+        for chunk in &mut chunks {
+            let byte = self.next_byte();
+            for (i, bit) in chunk.iter_mut().enumerate() {
+                *bit = (*bit & 1) ^ ((byte >> (7 - i)) & 1);
+            }
+        }
+        for bit in chunks.into_remainder() {
             *bit = (*bit & 1) ^ (self.next_bit() as u8);
         }
     }
@@ -220,6 +231,42 @@ mod tests {
             }
         }
         assert_eq!(period, HrpdForwardScrambler::PERIOD);
+    }
+
+    #[test]
+    fn next_byte_matches_eight_next_bit_steps() {
+        for seed in [0x1_ffffu32, 0x1, 0x1_5555, 0x0_aaaa, 0x1_0001] {
+            let mut bulk = HrpdForwardScrambler::with_initial_state(seed);
+            let mut serial = HrpdForwardScrambler::with_initial_state(seed);
+            for _ in 0..4_096 {
+                let mut expected = 0u8;
+                for i in (0..8).rev() {
+                    if serial.next_bit() {
+                        expected |= 1 << i;
+                    }
+                }
+                assert_eq!(bulk.next_byte(), expected, "seed 0x{seed:x}");
+                assert_eq!(bulk.state, serial.state, "seed 0x{seed:x}");
+            }
+        }
+    }
+
+    #[test]
+    fn apply_bits_matches_per_bit_scrambling_at_any_length() {
+        for len in [0usize, 1, 7, 8, 9, 63, 64, 1_024, 1_030] {
+            let original: Vec<u8> = (0..len).map(|i| (i % 2) as u8).collect();
+
+            let mut bulk = original.clone();
+            HrpdForwardScrambler::new_forward(0x2a, 0b0110).apply_bits(&mut bulk);
+
+            let mut serial = original.clone();
+            let mut s = HrpdForwardScrambler::new_forward(0x2a, 0b0110);
+            for bit in &mut serial {
+                *bit = (*bit & 1) ^ (s.next_bit() as u8);
+            }
+
+            assert_eq!(bulk, serial, "len {len}");
+        }
     }
 
     /// XOR-apply is involutive: scrambling twice with the same seed

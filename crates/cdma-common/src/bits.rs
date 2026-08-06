@@ -19,23 +19,13 @@ impl Bitstream {
     }
 
     pub fn new_bytes(bytes: &[u8]) -> Bitstream {
-        Bitstream {
-            bits: bytes
-                .iter()
-                .flat_map(|b| {
-                    vec![
-                        (b >> 7) & 1,
-                        (b >> 6) & 1,
-                        (b >> 5) & 1,
-                        (b >> 4) & 1,
-                        (b >> 3) & 1,
-                        (b >> 2) & 1,
-                        (b >> 1) & 1,
-                        b & 1,
-                    ]
-                })
-                .collect(),
+        let mut bits = Vec::with_capacity(bytes.len() * 8);
+        for byte in bytes {
+            for shift in (0..8).rev() {
+                bits.push((byte >> shift) & 1);
+            }
         }
+        Bitstream { bits }
     }
 
     pub fn write_u64(&mut self, val: u64, bits: usize) {

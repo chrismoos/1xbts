@@ -238,6 +238,35 @@ pub fn despread_chips_with_reference(
     }
     let base_start = (start_sample - absolute_sample_start) as usize;
     let mut chips = Vec::with_capacity(ref_conj.len());
+
+    if let Some(walk) = ChipWalk::resolve(
+        samples.len(),
+        base_start,
+        oversample,
+        ref_conj.len(),
+        sample_delay,
+        sample_delay_fraction,
+    ) {
+        let step = walk.step;
+        let frac = walk.fraction;
+        let mut lo = walk.first_index;
+        if frac == 0.0 {
+            for &reference in ref_conj {
+                chips.push(samples[lo] * reference * phase_correction);
+                lo += step;
+            }
+        } else {
+            for &reference in ref_conj {
+                let a = samples[lo];
+                let b = samples[lo + 1];
+                let sample = a * (1.0 - frac) + b * frac;
+                chips.push(sample * reference * phase_correction);
+                lo += step;
+            }
+        }
+        return Some(chips);
+    }
+
     for (chip, &reference) in ref_conj.iter().enumerate() {
         let sample = sample_chip_at_delay(
             samples,
@@ -250,6 +279,59 @@ pub fn despread_chips_with_reference(
         chips.push(sample * reference * phase_correction);
     }
     Some(chips)
+}
+
+/// A despread span resolved to a constant sample stride and interpolation
+/// fraction, so the loop needs no per-chip position math or bounds test.
+///
+/// [`resolve`](Self::resolve) returns `None` when the walk would not reproduce
+/// [`sample_chip_at_delay`] exactly, and the caller falls back to it.
+struct ChipWalk {
+    first_index: usize,
+    step: usize,
+    fraction: f32,
+}
+
+impl ChipWalk {
+    fn resolve(
+        samples_len: usize,
+        base_start: usize,
+        oversample: usize,
+        chips: usize,
+        sample_delay: i32,
+        sample_delay_fraction: f32,
+    ) -> Option<Self> {
+        if chips == 0 {
+            return None;
+        }
+        let step = oversample.max(1);
+        let base = base_start as i64 + i64::from(sample_delay);
+        let position =
+            |chip: usize| -> f32 { (base + (chip * step) as i64) as f32 + sample_delay_fraction };
+
+        let first = position(0);
+        let last = position(chips - 1);
+        if !first.is_finite() || !last.is_finite() || first < 0.0 {
+            return None;
+        }
+        let first_index = first.floor() as usize;
+        let last_index = last.floor() as usize;
+        if last_index + 1 >= samples_len {
+            return None;
+        }
+
+        let fraction = first - first_index as f32;
+        // Endpoints that agree pin every chip between them; they disagree once
+        // the span crosses an f32 exponent and the positions round differently.
+        if last_index != first_index + (chips - 1) * step || last - last_index as f32 != fraction {
+            return None;
+        }
+        Some(Self {
+            first_index,
+            step,
+            fraction,
+        })
+    }
 }
 
 /// Per-frame pilot phase + coherence estimate produced by accumulating across

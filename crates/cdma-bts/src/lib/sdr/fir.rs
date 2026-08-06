@@ -615,6 +615,9 @@ pub struct SymmetricComplexFir32 {
     delay_im: Vec<f32>,
     head: usize,
     delay_len: usize,
+    /// Overlap-save scratch reused across `process_block_into` calls.
+    block_re: Vec<f32>,
+    block_im: Vec<f32>,
 }
 
 impl SymmetricComplexFir32 {
@@ -641,6 +644,8 @@ impl SymmetricComplexFir32 {
             delay_im: vec![0.0; delay_len * 2],
             head: 1 % delay_len,
             delay_len,
+            block_re: Vec::new(),
+            block_im: Vec::new(),
         }
     }
 
@@ -662,11 +667,66 @@ impl SymmetricComplexFir32 {
         out
     }
 
+    /// Overlap-save block filter: laying the history and the block out
+    /// contiguously avoids driving every input sample through the delay ring.
+    ///
+    /// Output matches [`process_sample`] bit for bit — the same tap pairs are
+    /// summed, only the two addends swap sides.
     pub fn process_block_into(&mut self, input: &[Complex32], out: &mut Vec<Complex32>) {
         out.clear();
         out.reserve(input.len());
-        for &sample in input {
-            out.push(self.process_sample(sample));
+        if input.is_empty() {
+            return;
+        }
+
+        self.stage_block(input);
+        let half = self.half_taps.len();
+        for oldest in 0..input.len() {
+            let mut value = symmetric_complex_accumulate(
+                &self.half_taps,
+                &self.block_re,
+                &self.block_im,
+                oldest,
+                oldest + self.delay_len - 1,
+            );
+            if let Some(coeff) = self.center_tap {
+                value.re += self.block_re[oldest + half] * coeff;
+                value.im += self.block_im[oldest + half] * coeff;
+            }
+            out.push(value);
+        }
+        self.reload_ring();
+    }
+
+    /// Stage the retained history followed by `input`, oldest sample first.
+    fn stage_block(&mut self, input: &[Complex32]) {
+        let history = self.delay_len - 1;
+        self.block_re.clear();
+        self.block_im.clear();
+        self.block_re.reserve(history + input.len());
+        self.block_im.reserve(history + input.len());
+        for lag in (0..history).rev() {
+            self.block_re.push(self.delay_re[self.head + lag]);
+            self.block_im.push(self.delay_im[self.head + lag]);
+        }
+        for sample in input {
+            self.block_re.push(sample.re);
+            self.block_im.push(sample.im);
+        }
+    }
+
+    /// Refill the ring from the staged tail so the per-sample API picks up
+    /// where the block ended.
+    fn reload_ring(&mut self) {
+        let newest = self.block_re.len() - 1;
+        self.head = 0;
+        for lag in 0..self.delay_len {
+            let re = self.block_re[newest - lag];
+            let im = self.block_im[newest - lag];
+            self.delay_re[lag] = re;
+            self.delay_re[lag + self.delay_len] = re;
+            self.delay_im[lag] = im;
+            self.delay_im[lag + self.delay_len] = im;
         }
     }
 
@@ -722,6 +782,61 @@ mod tests {
 
         assert_eq!(all, pieces);
         assert_eq!(all, vec![0.25, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn symmetric_block_path_matches_per_sample_path_exactly() {
+        let even: Vec<f64> = (0..48)
+            .map(|i| {
+                let x = (i as f64 - 23.5) / 8.0;
+                (-x * x).exp() * (1.0 + 0.1 * x.cos())
+            })
+            .collect();
+        let odd: Vec<f64> = (0..49)
+            .map(|i| {
+                let x = (i as f64 - 24.0) / 8.0;
+                (-x * x).exp()
+            })
+            .collect();
+
+        let samples: Vec<Complex32> = (0..500)
+            .map(|i| {
+                let t = i as f32;
+                Complex32::new((t * 0.37).sin() * 1.7, (t * 0.11).cos() - 0.25)
+            })
+            .collect();
+
+        for taps in [even, odd] {
+            for split in [1usize, 7, 47, 48, 64, 250] {
+                let mut per_sample = SymmetricComplexFir32::new(&taps);
+                let expected: Vec<Complex32> = samples
+                    .iter()
+                    .map(|&s| per_sample.process_sample(s))
+                    .collect();
+
+                let mut blocked = SymmetricComplexFir32::new(&taps);
+                let mut actual = Vec::new();
+                for chunk in samples.chunks(split) {
+                    actual.extend(blocked.process_block(chunk));
+                }
+
+                assert_eq!(actual, expected, "taps={} split={split}", taps.len());
+
+                // The ring must also be left in a state the per-sample API can
+                // continue from.
+                let tail = [Complex32::new(0.5, -0.5), Complex32::new(-1.25, 2.0)];
+                let expected_tail: Vec<Complex32> =
+                    tail.iter().map(|&s| per_sample.process_sample(s)).collect();
+                let actual_tail: Vec<Complex32> =
+                    tail.iter().map(|&s| blocked.process_sample(s)).collect();
+                assert_eq!(
+                    actual_tail,
+                    expected_tail,
+                    "taps={} split={split}",
+                    taps.len()
+                );
+            }
+        }
     }
 
     #[test]

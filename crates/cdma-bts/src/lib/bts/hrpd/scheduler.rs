@@ -125,12 +125,90 @@ pub struct PreparedForwardTrafficPacket {
     rtc_ack_sequence_number: Option<u8>,
     priority_ranges: Option<String>,
     turbo_codewords: Option<PreparedTurboCodewords>,
+    prepared_chips: Option<PreparedPacketChips>,
 }
 
 #[derive(Debug, Clone)]
 struct PreparedTurboCodewords {
     rate_one_third: Arc<[u8]>,
     rate_one_fifth: Option<Arc<[u8]>>,
+}
+
+/// Chips modulated for one candidate rate, usable only if the scheduler binds
+/// that same rate at the packet's start slot.
+#[derive(Debug, Clone)]
+struct PreparedPacketChips {
+    rate: ForwardRate,
+    chips: Vec<Complex32>,
+}
+
+/// Producer-side entry point for HRPD forward-traffic packets. Sending routes
+/// through the preparer so encoding cannot land on the TX synthesis thread.
+#[derive(Clone)]
+pub struct ForwardTrafficSender {
+    tx: tokio::sync::mpsc::UnboundedSender<PreparedForwardTrafficPacket>,
+    preparer: ForwardTrafficPreparer,
+}
+
+impl ForwardTrafficSender {
+    pub fn new(
+        tx: tokio::sync::mpsc::UnboundedSender<PreparedForwardTrafficPacket>,
+        preparer: ForwardTrafficPreparer,
+    ) -> Self {
+        Self { tx, preparer }
+    }
+
+    /// Prepare `packet` and queue it.
+    pub fn send(&self, packet: ForwardTrafficPacket) -> Result<(), ForwardTrafficQueueClosed> {
+        self.tx
+            .send(self.preparer.prepare(packet))
+            .map_err(|_| ForwardTrafficQueueClosed)
+    }
+}
+
+/// The BTS dropped the forward-traffic receiver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForwardTrafficQueueClosed;
+
+impl std::fmt::Display for ForwardTrafficQueueClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HRPD forward-traffic queue closed")
+    }
+}
+
+impl std::error::Error for ForwardTrafficQueueClosed {}
+
+/// Builds [`PreparedForwardTrafficPacket`]s on the producer's thread.
+///
+/// Modulation needs a rate, which is only bound at the packet's start slot, so
+/// this speculates on the rate the AT is currently requesting; a mismatch there
+/// costs a rebuild in the scheduler.
+#[derive(Clone)]
+pub struct ForwardTrafficPreparer {
+    harq_bus: Arc<HarqBus>,
+}
+
+impl ForwardTrafficPreparer {
+    pub fn new(harq_bus: Arc<HarqBus>) -> Self {
+        Self { harq_bus }
+    }
+
+    pub fn prepare(&self, packet: ForwardTrafficPacket) -> PreparedForwardTrafficPacket {
+        let mut prepared = PreparedForwardTrafficPacket::new(packet);
+        let rate = self
+            .harq_bus
+            .current_drc_record(prepared.packet.mac_index)
+            .and_then(|(_, drc)| {
+                implemented_forward_rate_by_drc(drc, prepared.packet.forward_traffic_mac_subtype)
+            });
+        if let Some(rate) = rate
+            && rate.payload_bits as usize == prepared.packet.payload.len()
+            && let Some(chips) = build_packet_chips(&prepared, rate)
+        {
+            prepared.prepared_chips = Some(PreparedPacketChips { rate, chips });
+        }
+        prepared
+    }
 }
 
 impl PreparedForwardTrafficPacket {
@@ -167,12 +245,20 @@ impl PreparedForwardTrafficPacket {
             rtc_ack_sequence_number,
             priority_ranges,
             turbo_codewords,
+            prepared_chips: None,
         }
     }
 
     fn replace_payload(&mut self, payload: Vec<u8>) {
         self.packet.payload = payload;
         self.turbo_codewords = None;
+        self.prepared_chips = None;
+    }
+
+    /// Chips prepared off the TX thread, if they were built for `rate`.
+    fn chips_for_rate(&mut self, rate: ForwardRate) -> Option<Vec<Complex32>> {
+        let prepared = self.prepared_chips.take()?;
+        (prepared.rate == rate).then_some(prepared.chips)
     }
 
     fn repacked(&self, payload: Vec<u8>, session_packets: Vec<Vec<u8>>) -> Self {
@@ -1290,6 +1376,35 @@ fn implemented_forward_rate_by_drc(
     }
 }
 
+/// Turbo-code, scramble, interleave, and modulate one physical-layer packet.
+fn build_packet_chips(
+    pkt: &PreparedForwardTrafficPacket,
+    rate: ForwardRate,
+) -> Option<Vec<Complex32>> {
+    let encoder = cached_turbo_encoder(rate.payload_bits)?;
+    let mut coded = pkt
+        .turbo_codeword(rate.code_rate_num, rate.code_rate_den)
+        .map(<[u8]>::to_vec)
+        .unwrap_or_else(|| encoder.encode(&pkt.payload, rate.code_rate_num, rate.code_rate_den));
+
+    // C.S0024-0 v4.0 §9.3.1.3.2.3.3/4: scramble the turbo encoder output
+    // first, then perform the forward Traffic channel symbol reordering and
+    // permutation. Reversing these steps changes the bit seen by the QPSK
+    // mapper and makes the packet undecodable by an AT.
+    let mut scrambler = forward_traffic_scrambler(pkt.physical_layer_subtype, pkt.mac_index, rate);
+    scrambler.apply_bits(&mut coded);
+
+    let bits = forward_channel_interleave(rate.payload_bits as usize, rate.code_rate_den, &coded);
+
+    let data_chips = build_packet_data_chips(&bits, rate);
+    Some(build_packet_tdm_chips(
+        pkt.mac_index,
+        pkt.physical_layer_subtype,
+        rate,
+        &data_chips,
+    ))
+}
+
 fn build_harq_state(
     pkt: PreparedForwardTrafficPacket,
     rate: ForwardRate,
@@ -1312,24 +1427,11 @@ fn build_harq_state(
     if pkt.payload.len() != rate.payload_bits as usize {
         return None;
     }
-    let encoder = cached_turbo_encoder(rate.payload_bits)?;
-    let mut coded = pkt
-        .turbo_codeword(rate.code_rate_num, rate.code_rate_den)
-        .map(<[u8]>::to_vec)
-        .unwrap_or_else(|| encoder.encode(&pkt.payload, rate.code_rate_num, rate.code_rate_den));
-
-    // C.S0024-0 v4.0 §9.3.1.3.2.3.3/4: scramble the turbo encoder output
-    // first, then perform the forward Traffic channel symbol reordering and
-    // permutation. Reversing these steps changes the bit seen by the QPSK
-    // mapper and makes the packet undecodable by an AT.
-    let mut scrambler = forward_traffic_scrambler(pkt.physical_layer_subtype, pkt.mac_index, rate);
-    scrambler.apply_bits(&mut coded);
-
-    let bits = forward_channel_interleave(rate.payload_bits as usize, rate.code_rate_den, &coded);
-
-    let data_chips = build_packet_data_chips(&bits, rate);
-    let packet_chips =
-        build_packet_tdm_chips(pkt.mac_index, pkt.physical_layer_subtype, rate, &data_chips);
+    let mut pkt = pkt;
+    let packet_chips = match pkt.chips_for_rate(rate) {
+        Some(chips) => chips,
+        None => build_packet_chips(&pkt, rate)?,
+    };
 
     // One transmission unit per packet: Rev 0 transmits every slot of the
     // physical packet back-to-back on its interlace (early termination on a

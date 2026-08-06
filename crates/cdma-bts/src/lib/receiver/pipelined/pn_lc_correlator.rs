@@ -1729,30 +1729,18 @@ impl PnLcCorrelator {
                 }
 
                 // Scan the noncoherent power surface for this LC phase.
-                for d in 0..seg_len {
-                    let power = self.search_nc_power[d];
+                let mut lc_peak = lc_peak_power[lc_idx];
+                let mut lc_peak_delay_signed = lc_peak_delay[lc_idx];
+                for (d, &power) in self.search_nc_power[..seg_len].iter().enumerate() {
                     total_power += power as f64;
-                    total_count += 1;
-                    let local_d = if d > seg_len / 2 {
-                        d as i32 - seg_len as i32
-                    } else {
-                        d as i32
-                    };
-                    let signed_d = local_d;
-                    if power > lc_peak_power[lc_idx] {
-                        lc_peak_power[lc_idx] = power;
-                        lc_peak_delay[lc_idx] = signed_d;
-                    }
-                    if power > best_power {
-                        best_power = power;
-                        best_delay = signed_d;
-                        best_lc_phase = lc_phase;
-                    }
-                    if lc_phase == 0 && power > lc0_peak_power {
-                        lc0_peak_power = power;
-                        lc0_peak_delay = signed_d;
+                    if power > lc_peak {
+                        lc_peak = power;
+                        lc_peak_delay_signed = signed_delay_bin(d, seg_len);
                     }
                 }
+                total_count += seg_len;
+                lc_peak_power[lc_idx] = lc_peak;
+                lc_peak_delay[lc_idx] = lc_peak_delay_signed;
             } else {
                 // --- Fully coherent path with CFO hypothesis grid ---
                 // FFT the reference in-place; cross-correlate with each pre-rotated
@@ -1762,6 +1750,8 @@ impl PnLcCorrelator {
                     &mut self.fft_scratch,
                 );
 
+                let mut lc_peak = lc_peak_power[lc_idx];
+                let mut lc_peak_delay_signed = lc_peak_delay[lc_idx];
                 for cfo_sig_fft in &self.search_cfo_signal_ffts[..self.search_cfo_hypotheses.len()]
                 {
                     for i in 0..window_len {
@@ -1774,30 +1764,32 @@ impl PnLcCorrelator {
                         &mut self.fft_scratch,
                     );
 
-                    for d in 0..window_len {
-                        let power = self.search_result_buf[d].norm_sqr() * norm;
+                    for (d, sample) in self.search_result_buf[..window_len].iter().enumerate() {
+                        let power = sample.norm_sqr() * norm;
                         total_power += power as f64;
-                        total_count += 1;
-                        let signed_d = if d > window_len / 2 {
-                            d as i32 - window_len as i32
-                        } else {
-                            d as i32
-                        };
-                        if power > lc_peak_power[lc_idx] {
-                            lc_peak_power[lc_idx] = power;
-                            lc_peak_delay[lc_idx] = signed_d;
-                        }
-                        if power > best_power {
-                            best_power = power;
-                            best_delay = signed_d;
-                            best_lc_phase = lc_phase;
-                        }
-                        if lc_phase == 0 && power > lc0_peak_power {
-                            lc0_peak_power = power;
-                            lc0_peak_delay = signed_d;
+                        if power > lc_peak {
+                            lc_peak = power;
+                            lc_peak_delay_signed = signed_delay_bin(d, window_len);
                         }
                     }
+                    total_count += window_len;
                 }
+                lc_peak_power[lc_idx] = lc_peak;
+                lc_peak_delay[lc_idx] = lc_peak_delay_signed;
+            }
+
+            // Both are maxima over the bins this phase just scanned, so fold
+            // once here instead of testing every bin. Strict `>` keeps the
+            // first-wins tie-break: earliest bin, then earliest phase.
+            let lc_peak = lc_peak_power[lc_idx];
+            if lc_peak > best_power {
+                best_power = lc_peak;
+                best_delay = lc_peak_delay[lc_idx];
+                best_lc_phase = lc_phase;
+            }
+            if lc_phase == 0 {
+                lc0_peak_power = lc_peak;
+                lc0_peak_delay = lc_peak_delay[lc_idx];
             }
         }
 
@@ -2072,6 +2064,17 @@ impl Correlator for PnLcCorrelator {
 
 fn modulo(x: i32, m: i32) -> i32 {
     ((x % m) + m) % m
+}
+
+/// Map an IFFT output bin to a signed delay: bins past the midpoint wrap to
+/// negative delays.
+#[inline]
+fn signed_delay_bin(bin: usize, len: usize) -> i32 {
+    if bin > len / 2 {
+        bin as i32 - len as i32
+    } else {
+        bin as i32
+    }
 }
 
 fn align_up_to_residue(x: usize, residue: usize, modulus: usize) -> usize {

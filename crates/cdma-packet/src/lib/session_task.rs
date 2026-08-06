@@ -1022,6 +1022,10 @@ fn record_ip_capture(
     packet: &[u8],
     detail_prefix: &str,
 ) {
+    let mut s = status.lock().unwrap();
+    if !s.capture_enabled {
+        return;
+    }
     let event = PacketTraceEvent {
         timestamp_ms: now_ms(),
         layer: "ip".to_string(),
@@ -1030,7 +1034,6 @@ fn record_ip_capture(
         detail: format!("{} len={}", detail_prefix, packet.len()),
         payload_hex: bytes_to_hex(packet),
     };
-    let mut s = status.lock().unwrap();
     s.push_capture_event(event);
 }
 

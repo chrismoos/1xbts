@@ -2586,10 +2586,13 @@ fn format_ipcp_state(state: crate::ppp::ipcp::IpcpState) -> String {
 }
 
 pub(crate) fn bytes_to_hex(data: &[u8]) -> String {
-    data.iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<Vec<_>>()
-        .join("")
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(data.len() * 2);
+    for byte in data {
+        out.push(DIGITS[usize::from(byte >> 4)] as char);
+        out.push(DIGITS[usize::from(byte & 0x0f)] as char);
+    }
+    out
 }
 
 pub(crate) fn now_ms() -> u64 {
