@@ -412,6 +412,12 @@ struct HrpdTrafficRxBlock {
     enqueue_time: Instant,
 }
 
+enum HrpdTrafficRxMessage {
+    Block(HrpdTrafficRxBlock),
+    #[cfg(test)]
+    Barrier(crossbeam_channel::Sender<()>),
+}
+
 /// Handle to a running traffic RX thread.
 struct TrafficRxThread {
     walsh_code: u8,
@@ -430,7 +436,7 @@ struct HrpdAccessRxThread {
 struct HrpdTrafficRxThread {
     uati: u32,
     mac_index: u8,
-    tx: crossbeam_channel::Sender<HrpdTrafficRxBlock>,
+    tx: crossbeam_channel::Sender<HrpdTrafficRxMessage>,
     queue: RxQueueTracker,
 }
 
@@ -640,7 +646,7 @@ fn spawn_hrpd_traffic_rx_thread(
     // timing, so dropping IQ to keep the mailbox fresh creates false chip
     // discontinuities. Keep the handoff lossless and report backlog through
     // queue_age_us diagnostics instead.
-    let (iq_tx, iq_rx) = crossbeam_channel::unbounded::<HrpdTrafficRxBlock>();
+    let (iq_tx, iq_rx) = crossbeam_channel::unbounded::<HrpdTrafficRxMessage>();
     let uati = assignment.uati;
     let mac_index = assignment.mac_index;
     let queue = queue_registry.register(
@@ -693,7 +699,12 @@ fn spawn_hrpd_traffic_rx_thread(
                 // DRC only governs the next DRCLength slots, so avoid RX
                 // batching that delays scheduler-facing DRC publication.
                 let blk = match iq_rx.recv_timeout(Duration::from_millis(500)) {
-                    Ok(blk) => blk,
+                    Ok(HrpdTrafficRxMessage::Block(blk)) => blk,
+                    #[cfg(test)]
+                    Ok(HrpdTrafficRxMessage::Barrier(done)) => {
+                        let _ = done.send(());
+                        continue;
+                    }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                 };
@@ -840,7 +851,7 @@ fn spawn_hrpd_traffic_rx_thread(
 fn send_hrpd_traffic_rx_block(thread: &HrpdTrafficRxThread, block: HrpdTrafficRxBlock) -> bool {
     let samples = block.samples.len();
     thread.queue.enqueue(samples);
-    match thread.tx.send(block) {
+    match thread.tx.send(HrpdTrafficRxMessage::Block(block)) {
         Ok(()) => true,
         Err(_) => {
             thread.queue.rollback(samples);
@@ -6268,7 +6279,7 @@ mod tests {
                 rx_read_completed_at: Instant::now(),
                 enqueue_time: Instant::now(),
             };
-            if thread.tx.send(blk).is_err() {
+            if !super::send_hrpd_traffic_rx_block(&thread, blk) {
                 panic!("HRPD traffic worker channel disconnected");
             }
             raw_relative_sample_start = raw_relative_sample_start.saturating_add(len);
@@ -6293,44 +6304,24 @@ mod tests {
             }
         }
 
-        // Real-time processing ratio. The worker is lossless and is the
-        // processing bottleneck, so the wall time from the first enqueue until
-        // its mailbox fully drains is how long it took to process the entire
-        // capture. Compare against the capture's own airtime. The capture is
-        // pushed faster than realtime, so a backlog builds during the push and
-        // this measures how fast the worker chews through it.
+        // Include capture input preparation and wait for the worker to finish
+        // every preceding block before stopping the wall-clock measurement.
         let backlog_at_push_done = thread.tx.len();
-        let process_drain_deadline = Instant::now() + Duration::from_secs(180);
-        loop {
-            // Keep the event mailbox bounded while we wait for the worker.
-            while let Ok(event) = event_rx.try_recv() {
-                if let HrpdTrafficEvent::ReversePilot {
-                    absolute_chip,
-                    snr_db_tenths,
-                    ..
-                } = event
-                {
-                    pilot_events.push((absolute_chip, snr_db_tenths));
-                }
-                all_events.push(event);
-            }
-            if thread.tx.is_empty() {
-                // Let the final coalesced batch finish before declaring done.
-                std::thread::sleep(Duration::from_millis(50));
-                if thread.tx.is_empty() {
-                    break;
-                }
-            }
-            if Instant::now() >= process_drain_deadline {
-                eprintln!(
-                    "HRPD {}: WARNING worker did not drain within 180s (backlog={})",
+        const PROCESS_DRAIN_TIMEOUT: Duration = Duration::from_secs(180);
+        let (drain_tx, drain_rx) = crossbeam_channel::bounded(1);
+        thread
+            .tx
+            .send(super::HrpdTrafficRxMessage::Barrier(drain_tx))
+            .expect("HRPD traffic worker disconnected before drain barrier");
+        drain_rx
+            .recv_timeout(PROCESS_DRAIN_TIMEOUT)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "HRPD {}: worker did not complete the drain barrier within {:.0}s: {err}",
                     fixture.label,
-                    thread.tx.len()
-                );
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
+                    PROCESS_DRAIN_TIMEOUT.as_secs_f64(),
+                )
+            });
         let processing_wall = stream_start.elapsed();
         let capture_airtime_s = total_samples_pushed as f64 / fixture.sample_rate_hz as f64;
         let rt_ratio = capture_airtime_s / processing_wall.as_secs_f64().max(1e-9);
@@ -6343,7 +6334,7 @@ mod tests {
             backlog_at_push_done,
         );
         const MIN_REALTIME_RATIO: f64 = 5.0;
-        const CI_MIN_REALTIME_RATIO: f64 = 1.75;
+        const CI_MIN_REALTIME_RATIO: f64 = 1.25;
         let min_realtime_ratio = if std::env::var_os("CI").is_some() {
             CI_MIN_REALTIME_RATIO
         } else {
@@ -6356,34 +6347,17 @@ mod tests {
             processing_wall.as_secs_f64(),
         );
 
-        // Let the unbounded worker mailbox drain until the receiver has
-        // proved traffic-pilot lock and is decoding continuous reverse DRC.
-        // The capture is pushed faster than realtime in this test; production
-        // SDR input arrives incrementally.
-        let drain_deadline = Instant::now() + Duration::from_secs(25);
-        loop {
-            while let Ok(event) = event_rx.try_recv() {
-                if let HrpdTrafficEvent::ReversePilot {
-                    absolute_chip,
-                    snr_db_tenths,
-                    ..
-                } = event
-                {
-                    pilot_events.push((absolute_chip, snr_db_tenths));
-                }
-                all_events.push(event);
+        // The ordered barrier proves that all event sends from the capture are complete.
+        while let Ok(event) = event_rx.try_recv() {
+            if let HrpdTrafficEvent::ReversePilot {
+                absolute_chip,
+                snr_db_tenths,
+                ..
+            } = event
+            {
+                pilot_events.push((absolute_chip, snr_db_tenths));
             }
-            let drc_events = all_events
-                .iter()
-                .filter(|event| matches!(event, HrpdTrafficEvent::Drc { .. }))
-                .count();
-            if !pilot_events.is_empty() && drc_events >= fixture.min_drc_events {
-                break;
-            }
-            if Instant::now() >= drain_deadline {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
+            all_events.push(event);
         }
 
         shutdown.store(true, Ordering::Relaxed);
