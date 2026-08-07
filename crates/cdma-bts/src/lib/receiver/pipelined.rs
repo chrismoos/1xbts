@@ -2172,16 +2172,18 @@ mod tests {
                 1_806_111_475_466_240,
                 1_806_111_476_056_064,
                 1_806_111_476_514_816,
+                1_806_111_477_006_336,
                 1_806_111_477_530_624,
                 1_806_111_478_022_144,
                 1_806_111_478_480_896,
                 1_806_111_479_103_488,
                 1_806_111_479_660_544,
                 1_806_111_480_086_528,
+                1_806_111_480_545_280,
                 1_806_111_481_069_568,
                 1_806_111_481_528_320,
             ],
-            "expected all 16 CRC-valid HRPD reverse-access reprobes"
+            "expected all 18 CRC-valid HRPD reverse-access reprobes"
         );
         assert!(
             fcs_valid.iter().all(|event| {
@@ -2192,6 +2194,92 @@ mod tests {
             "unexpected HRPD reverse-access contents: {:?}",
             fcs_valid,
         );
+    }
+
+    /// Regression for preambles that pass reference coherence but fail frame-lag coherence.
+    #[test]
+    #[ignore = "local-only WAV capture regression; run explicitly when tuning HRPD access acquisition"]
+    fn capture_hrpd_reverse_access_bursts_1806468726006555() {
+        init_test_logger();
+        let metadata_path = test_capture_path("1806468726006555.json");
+        let wav_path = test_capture_path("1806468726006555.wav");
+        let metadata = test_capture_metadata_from_path(&metadata_path);
+        assert_eq!(metadata.sample_rate_hz, 4_915_200);
+        assert_eq!(metadata.chip_rate_hz, ACCESS_CHIP_RATE as usize);
+        assert_eq!(metadata.hrpd_reverse_frequency_hz, Some(843_900_000));
+        assert_eq!(metadata.hrpd_rx_shift_hz, Some(-915_000));
+
+        let hrpd_shift_hz = metadata.hrpd_rx_shift_hz.expect("sidecar HRPD shift");
+        let (sample_rate, iq_samples, absolute_sample_start) =
+            read_shifted_capture_to_4x_with_shift(&wav_path, &metadata, hrpd_shift_hz);
+        let oversample = (sample_rate as usize) / ACCESS_CHIP_RATE as usize;
+        assert_eq!(oversample, 4, "shifted HRPD slice should be 4x chip rate");
+
+        let pipeline = hrpd_reverse_access_chain(HrpdReverseAccessSettings {
+            oversample,
+            sector_id_lsb: 0,
+            color_code: 26,
+            preamble_frames: 3,
+            ..HrpdReverseAccessSettings::default()
+        });
+        let mut receiver = PipelinedReceiver::new(iq_samples.into_iter())
+            .with_batch_size(32768)
+            .with_input_sample_rate_hz(sample_rate as f64)
+            .with_absolute_sample_start(absolute_sample_start);
+        let out_rx = receiver.add_pipeline(pipeline);
+        receiver.run_pipeline().unwrap();
+        let events = collect_hrpd_access_capture_events(out_rx);
+        let fcs_valid = events
+            .iter()
+            .filter(|event| event.single_fragment_fcs_valid)
+            .collect::<Vec<_>>();
+        for (idx, event) in events.iter().enumerate() {
+            eprintln!(
+                "HRPD 1806468726006555 event #{}: chip={} phy_crc_valid={} mac_fragment_valid={} single_fragment_fcs_valid={} decoded={}",
+                idx + 1,
+                event.packet_start,
+                event.phy_crc_valid,
+                event.mac_fragment_valid,
+                event.single_fragment_fcs_valid,
+                event.decoded,
+            );
+        }
+
+        assert!(
+            fcs_valid.len() >= 10,
+            "expected at least 10 CRC/FCS-valid access probes, got {}",
+            fcs_valid.len(),
+        );
+        assert!(
+            fcs_valid.iter().all(|event| {
+                event.decoded.contains("ati=Rati/0x07a38b0d")
+                    && event.decoded.contains("RouteUpdate")
+                    && event.decoded.contains("UATIRequest(transaction=0x05")
+            }),
+            "unexpected HRPD reverse-access contents: {:?}",
+            fcs_valid,
+        );
+        let packet_starts = fcs_valid
+            .iter()
+            .map(|event| event.packet_start as u64)
+            .collect::<Vec<_>>();
+        for expected in [
+            1_806_468_732_321_792,
+            1_806_468_733_140_992,
+            1_806_468_733_534_208,
+            1_806_468_733_960_192,
+            1_806_468_734_943_232,
+            1_806_468_735_598_592,
+            1_806_468_735_991_808,
+            1_806_468_736_385_024,
+            1_806_468_736_811_008,
+            1_806_468_737_695_744,
+        ] {
+            assert!(
+                packet_starts.contains(&expected),
+                "missing expected CRC-valid probe at chip {expected}; got {packet_starts:?}",
+            );
+        }
     }
 
     #[test]

@@ -34,6 +34,9 @@ use crate::receiver::pipelined::{PipelineProcessorShared, SampleBlock};
 
 const ACCESS_PREAMBLE_MIN_LAG_COHERENCE: f32 = 0.40;
 const ACCESS_PREAMBLE_MIN_SPEC_COHERENCE: f32 = 0.35;
+const ACCESS_PREAMBLE_MIN_SPARSE_REFERENCE_COHERENCE: f32 = 0.29;
+const ACCESS_PREAMBLE_REFERENCE_GATE_STRIDE: usize = 64;
+const ACCESS_PREAMBLE_REFERENCE_GATE_MAX_DELAY_SAMPLES: i64 = 128;
 
 #[derive(Clone, Debug)]
 pub struct HrpdAccessFrameFftConfig {
@@ -207,6 +210,8 @@ struct HrpdAccessFrameSpawnStrategy {
     /// passes this chip, so a long traffic session doesn't re-run the sweep
     /// on every window.
     foreign_signal_until_chip: i64,
+    /// Cache sparse pilot references because many FFT windows probe the same access-cycle phase.
+    sparse_reference_cache: HashMap<u64, Vec<Complex32>>,
 }
 
 #[derive(Clone, Debug)]
@@ -276,6 +281,7 @@ impl HrpdAccessFrameRakeCorrelator {
             emitted_packet_starts: VecDeque::new(),
             active_fingers: Vec::new(),
             foreign_signal_until_chip: 0,
+            sparse_reference_cache: HashMap::new(),
         };
         Self {
             base: HrpdReverseCorrelatorBase::new(strategy, "hrpd_access"),
@@ -284,6 +290,59 @@ impl HrpdAccessFrameRakeCorrelator {
 }
 
 impl HrpdAccessFrameSpawnStrategy {
+    fn sparse_reference_gate(
+        &mut self,
+        samples: &[Complex32],
+        absolute_sample_start: i64,
+        aligned_start_chip: i64,
+        hit: &HrpdReverseFftPilotHit,
+    ) -> Option<(f32, i64, i32)> {
+        let mut best: Option<(f32, i64, i32)> = None;
+        for frame_back in 0..=1i64 {
+            let start_chip = aligned_start_chip - frame_back * ACCESS_PACKET_CHIPS as i64;
+            if start_chip < 0 {
+                continue;
+            }
+            let sample_delay = hit.preamble_start_sample as i64
+                - start_chip.saturating_mul(self.cfg.oversample as i64);
+            if sample_delay.abs() > ACCESS_PREAMBLE_REFERENCE_GATE_MAX_DELAY_SAMPLES {
+                continue;
+            }
+            let acn = self
+                .reference
+                .access_cycle_number_for_chip(start_chip as u64);
+            let key = ((acn as u64) << 32) | (start_chip as u64 % ACCESS_PACKET_CHIPS as u64);
+            let reference = self.sparse_reference_cache.entry(key).or_insert_with(|| {
+                hrpd_access_preamble_chips(
+                    start_chip as u64,
+                    acn,
+                    self.cfg.sector_id_lsb,
+                    self.cfg.color_code,
+                    self.cfg.reference_chip_offset,
+                    self.cfg.q_pair_phase,
+                    self.cfg.q_sign,
+                    ACCESS_PACKET_CHIPS,
+                )
+                .into_iter()
+                .step_by(ACCESS_PREAMBLE_REFERENCE_GATE_STRIDE)
+                .collect()
+            });
+            let Some(coherence) = preamble_sparse_reference_coherence(
+                samples,
+                ChipGeometry::new(absolute_sample_start, self.cfg.oversample)
+                    .at_delay(sample_delay as i32, 0.0),
+                start_chip,
+                reference,
+            ) else {
+                continue;
+            };
+            if best.is_none_or(|(prior, _, _)| coherence > prior) {
+                best = Some((coherence, start_chip, sample_delay as i32));
+            }
+        }
+        best
+    }
+
     fn is_duplicate_packet(&self, packet_start_chip: i64) -> bool {
         const DUP_CHIPS: i64 = ACCESS_PACKET_CHIPS as i64;
         self.emitted_packet_starts
@@ -406,14 +465,36 @@ impl HrpdReverseFingerSpawnStrategy for HrpdAccessFrameSpawnStrategy {
                 pregate_coherence = pregate_coherence.max(coherence);
             }
         }
-        if pregate_coherence < ACCESS_PREAMBLE_MIN_LAG_COHERENCE {
+        let reference_gate = if pregate_coherence < ACCESS_PREAMBLE_MIN_LAG_COHERENCE {
+            self.sparse_reference_gate(buffer, buffer_abs_signed, aligned_start_chip, hit)
+        } else {
+            None
+        };
+        let reference_gate_coherence = reference_gate.map(|(coherence, _, _)| coherence);
+        let reference_gate_passed = reference_gate_coherence
+            .is_some_and(|coherence| coherence >= ACCESS_PREAMBLE_MIN_SPARSE_REFERENCE_COHERENCE);
+        if pregate_coherence < ACCESS_PREAMBLE_MIN_LAG_COHERENCE && !reference_gate_passed {
             log::trace!(
-                "HRPD access frame FFT rake: noise-gated hit snr={:.1}x aligned_start_chip={} pregate_lag_coh={:.3}",
+                "HRPD access frame FFT rake: noise-gated hit snr={:.1}x aligned_start_chip={} pregate_lag_coh={:.3} pregate_ref_coh={:.3}",
                 hit.snr,
                 aligned_start_chip,
                 pregate_coherence,
+                reference_gate_coherence.unwrap_or(0.0),
             );
             return SpawnOutcome::Skip;
+        }
+        if let Some((reference_coherence, reference_start_chip, sample_delay)) = reference_gate
+            && reference_gate_passed
+        {
+            log::trace!(
+                "HRPD access frame FFT rake: reference-gated hit snr={:.1}x aligned_start_chip={} reference_start_chip={} sample_delay={} pregate_lag_coh={:.3} pregate_ref_coh={:.3}",
+                hit.snr,
+                aligned_start_chip,
+                reference_start_chip,
+                sample_delay,
+                pregate_coherence,
+                reference_coherence,
+            );
         }
         let timings = timing_candidates_near_fft_hit(
             buffer,
@@ -425,11 +506,13 @@ impl HrpdReverseFingerSpawnStrategy for HrpdAccessFrameSpawnStrategy {
             self.cfg.reference_chip_offset,
             self.cfg.q_pair_phase,
             self.cfg.q_sign,
+            reference_gate_passed,
         );
         let Some(timing) = timings
             .iter()
             .find(|candidate| {
-                candidate.lag_coherence >= ACCESS_PREAMBLE_MIN_LAG_COHERENCE
+                (candidate.lag_coherence >= ACCESS_PREAMBLE_MIN_LAG_COHERENCE
+                    || reference_gate_passed)
                     && candidate.spec_coherence >= ACCESS_PREAMBLE_MIN_SPEC_COHERENCE
             })
             .cloned()
@@ -1289,6 +1372,7 @@ fn timing_candidates_near_fft_hit(
     reference_chip_offset: i32,
     q_pair_phase: u64,
     q_sign: f32,
+    allow_reference_only: bool,
 ) -> Vec<HrpdAccessPreambleTiming> {
     let frame = ACCESS_PACKET_CHIPS as i64;
     let sample_delays = [
@@ -1312,7 +1396,7 @@ fn timing_candidates_near_fft_hit(
                 else {
                     continue;
                 };
-                if lag_coherence >= ACCESS_PREAMBLE_MIN_LAG_COHERENCE {
+                if lag_coherence >= ACCESS_PREAMBLE_MIN_LAG_COHERENCE || allow_reference_only {
                     coarse.push(HrpdAccessPreambleTiming {
                         preamble_start_chip: start_chip,
                         sample_delay,
@@ -1364,7 +1448,7 @@ fn timing_candidates_near_fft_hit(
                 else {
                     continue;
                 };
-                if lag_coherence < ACCESS_PREAMBLE_MIN_LAG_COHERENCE {
+                if lag_coherence < ACCESS_PREAMBLE_MIN_LAG_COHERENCE && !allow_reference_only {
                     continue;
                 }
                 let spec_coherence = preamble_spec_coherence_with_reference(
@@ -1481,6 +1565,53 @@ fn erase_gated_slots(chips: &mut [Complex32]) {
             *c = Complex32::new(0.0, 0.0);
         }
     }
+}
+
+/// Score each frame against a sparse pilot reference to avoid correlating two noisy frames.
+fn preamble_sparse_reference_coherence(
+    samples: &[Complex32],
+    geometry: ChipGeometry,
+    preamble_start_chip: i64,
+    sparse_reference: &[Complex32],
+) -> Option<f32> {
+    let stride = ACCESS_PREAMBLE_REFERENCE_GATE_STRIDE;
+    let expected_reference_len = ACCESS_PACKET_CHIPS.div_ceil(stride);
+    if sparse_reference.len() != expected_reference_len {
+        return None;
+    }
+
+    let mut coherent =
+        [[Complex32::new(0.0, 0.0); ACCESS_FRAME_SLOTS]; HRPD_DEFAULT_ACCESS_PREAMBLE_FRAMES];
+    let mut abs_sum = [[0.0f32; ACCESS_FRAME_SLOTS]; HRPD_DEFAULT_ACCESS_PREAMBLE_FRAMES];
+    let last_k = (ACCESS_PACKET_CHIPS - 1) / stride * stride;
+    let frame_samples = (ACCESS_PACKET_CHIPS * geometry.oversample) as i64;
+    let last_chip = preamble_start_chip
+        + ((HRPD_DEFAULT_ACCESS_PREAMBLE_FRAMES - 1) * ACCESS_PACKET_CHIPS + last_k) as i64;
+    let scan = geometry.scan(samples, preamble_start_chip, last_chip, stride)?;
+
+    let mut index = scan.index;
+    for (sparse_idx, k) in (0..ACCESS_PACKET_CHIPS).step_by(stride).enumerate() {
+        let slot = (k / HRPD_SLOT_CHIPS).min(ACCESS_FRAME_SLOTS - 1);
+        let reference = sparse_reference[sparse_idx].conj();
+        for frame in 0..HRPD_DEFAULT_ACCESS_PREAMBLE_FRAMES {
+            let sample = scan.interp(samples, index + frame as i64 * frame_samples);
+            let value = sample * reference;
+            coherent[frame][slot] += value;
+            abs_sum[frame][slot] += value.norm();
+        }
+        index += scan.step;
+    }
+
+    let mut minimum = f32::INFINITY;
+    for frame in 0..HRPD_DEFAULT_ACCESS_PREAMBLE_FRAMES {
+        let numerator: f32 = coherent[frame].iter().map(|value| value.norm()).sum();
+        let denominator: f32 = abs_sum[frame].iter().sum();
+        if !(denominator > 0.0 && numerator.is_finite() && denominator.is_finite()) {
+            return None;
+        }
+        minimum = minimum.min(numerator / denominator);
+    }
+    minimum.is_finite().then_some(minimum)
 }
 
 /// Frame-to-frame preamble self-similarity, robust to 3-on/1-off reverse

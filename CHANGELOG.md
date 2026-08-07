@@ -1,5 +1,6 @@
 # HEAD 
 
+- Improved EV-DO reverse access decoding for weak uplink preambles.
 - Fix issue with low throughput on some EV-DO devices (~capped around 200kbps).
 - Improve EV-DO reverse power control.
 - Reduced CPU usage across the BTS receiver, transmitter, and packet service.
