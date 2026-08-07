@@ -465,10 +465,7 @@ mod tests {
         let c2 = corr(&symbol, &probe_2);
         let c4 = corr(&symbol, &probe_4);
         assert!(c2.abs() > 10.0 * c4.abs().max(1e-3));
-        assert!(
-            c2 < 0.0,
-            "default RA must advertise Unloaded (-1), got {c2}"
-        );
+        assert!(c2 > 0.0, "default RA must advertise not busy (0), got {c2}");
     }
 
     #[test]
