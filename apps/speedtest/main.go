@@ -44,12 +44,14 @@ type server struct {
 	downloadPayload []byte
 	uploadPayload   []byte
 	signingKey      []byte
+	arrivals        *arrivalCache
 }
 
 type pageData struct {
 	Sizes                 []sizeOption
 	DefaultSize           int
 	DefaultNoScriptDLSize int
+	Switcher              template.HTML
 }
 
 type sizeOption struct {
@@ -72,9 +74,14 @@ func main() {
 		downloadPayload: makeGIFPayload(maxSize),
 		uploadPayload:   makeTextPayload(maxSize),
 		signingKey:      makeSigningKey(),
+		arrivals:        newArrivalCache(),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.index)
+	mux.HandleFunc("/l/dl", s.legacyDownloadEntry)
+	mux.HandleFunc("/l/dlr", s.legacyDownloadResult)
+	mux.HandleFunc("/l/ul", s.legacyUploadForm)
+	mux.HandleFunc("/l/ulr", s.legacyUploadResult)
 	mux.HandleFunc("/warmup.gif", s.warmupGIF)
 	mux.HandleFunc("/download.bin", s.downloadBin)
 	mux.HandleFunc("/download-html", s.downloadStart)
@@ -100,8 +107,19 @@ func (s *server) index(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	mode := applyMode(w, r)
+	if mode == modeLegacy {
+		s.legacyIndex(w, r, mode)
+		return
+	}
 	setHTMLHeaders(w)
-	if err := indexTemplate.Execute(w, pageData{Sizes: sizeOptions(), DefaultSize: defaultSize, DefaultNoScriptDLSize: defaultNoScriptDLSize}); err != nil {
+	data := pageData{
+		Sizes:                 sizeOptions(),
+		DefaultSize:           defaultSize,
+		DefaultNoScriptDLSize: defaultNoScriptDLSize,
+		Switcher:              template.HTML(modeSwitcherHTML(modeFull)),
+	}
+	if err := indexTemplate.Execute(w, data); err != nil {
 		log.Printf("render index: %v", err)
 	}
 }
@@ -398,8 +416,10 @@ func setHTMLHeaders(w http.ResponseWriter) {
 	w.Header().Set("Content-Language", "en")
 }
 
+// no-transform tells intermediaries not to compress the payload, which would
+// report bytes that never crossed the air.
 func setNoStore(w http.ResponseWriter) {
-	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0, no-transform")
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Expires", "0")
 }
@@ -497,6 +517,9 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
 <style>` + pageCSS + `</style>
 </head>
 <body>
+<script type="text/javascript">
+if (!document.getElementById || !window.Image) { location.href = "/?ui=legacy"; }
+</script>
 <div class="shell">
 <table class="box" cellspacing="0" cellpadding="0">
 ` + brandBarHTML + `
@@ -533,6 +556,7 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
 <div class="panel">
 <p class="mode">No JavaScript mode</p>
 <p class="hint">These tests use plain links and forms. Download uses a browser callback.</p>
+<p class="hint">For server-timed runs that need no scripting at all, use <a href="/?ui=legacy">Legacy HTML</a> mode.</p>
 <form action="/download-start" method="get">
 <p><input type="hidden" name="bytes" value="{{.DefaultNoScriptDLSize}}"><input class="btn" type="submit" value="Download"></p>
 </form>
@@ -556,6 +580,7 @@ Upload sizes:
 <iframe name="uploadFrame" id="uploadFrame" title="upload target" style="display:none"></iframe>
 
 <p class="foot">Application-layer throughput. Disable proxies/compression for best results.</p>
+{{.Switcher}}
 </td></tr>
 </table>
 </div>

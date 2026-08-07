@@ -32,15 +32,25 @@ gateway resolver.
 
 ## Modes
 
-- JavaScript mode uses old-style JavaScript only: `Date`, `Image`, forms, and a
-  hidden iframe. The 4 MiB and 8 MiB choices are long enough to measure
-  steady-state HRPD throughput after TCP slow start.
-- No-JavaScript mode is exposed through `<noscript>` and uses plain links and
-  forms. Its download test streams hidden payload bytes before an iframe result
-  callback, so timing waits for the browser to parse past the payload instead of
-  relying on server flush timing.
+- **Full** (default) times the transfer in the browser. Sizes up to 8 MiB.
+- **Legacy HTML** is timed by the server and needs no scripting, for browsers
+  such as Internet Explorer Mobile on Windows Mobile 5. Downloads run up to
+  8 MiB and uploads up to 1 MiB, defaulting to 256 KiB down and 128 KiB up.
+
+The mode comes from `?ui=full|legacy`, else a stored choice, else the user
+agent. Every page has a switcher, and `?ui=auto` clears the stored choice.
 
 Upload and download are separate tests and should be run one at a time.
+
+## Legacy timing
+
+The server records a start time in the page's continuation URL, hides the
+payload in an HTML comment, and puts the continuation last so the page can only
+advance after the final byte. The elapsed time is the difference between that
+start and the callback request. Upload is timed directly from the request body.
+
+Both figures include one round trip, so they read low, and more so as the link
+gets faster. This mode is for a rough number on a slow link, not a precise one.
 
 ## Notes
 
@@ -48,10 +58,10 @@ The result is application-layer throughput between the device browser and this
 server. Proxies, compression, TCP buffering, and radio scheduling can all affect
 the numbers, especially on very slow links.
 
-No-JavaScript download results include the callback request latency. The default
-no-JavaScript download size is larger than the JavaScript default to make that
-latency a smaller part of the measurement.
+The `<noscript>` fallback inside the full page includes the callback request
+latency, and uses a larger default download size to dilute it.
 
-Available test sizes range from 4 KiB through 2 MiB. The defaults are chosen
-for roughly sub-150 kbps links: 64 KiB for JavaScript mode and 128 KiB for the
-no-JavaScript download fallback.
+Sizes run from 4 KiB up. The full page defaults to 64 KiB, or 128 KiB in its
+no-JavaScript fallback, chosen for roughly sub-150 kbps links. Legacy uploads
+stop at 1 MiB because the payload rides in hidden form inputs, which the
+browsers that mode targets cannot carry in bulk.

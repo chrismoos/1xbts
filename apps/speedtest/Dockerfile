@@ -5,7 +5,7 @@ ARG TARGETARCH
 
 WORKDIR /src
 COPY go.mod ./
-COPY main.go main_test.go ./
+COPY *.go ./
 RUN go test ./...
 RUN test -n "${TARGETOS}" && test -n "${TARGETARCH}" && CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/speedtest .
 

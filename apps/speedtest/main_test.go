@@ -15,6 +15,7 @@ func testServer() *server {
 		downloadPayload: makeGIFPayload(maxSize),
 		uploadPayload:   makeTextPayload(maxSize),
 		signingKey:      []byte("test-signing-key"),
+		arrivals:        newArrivalCache(),
 	}
 }
 
@@ -236,5 +237,25 @@ func TestFormatKbps(t *testing.T) {
 	got := formatKbps(1000, time.Second)
 	if got != "8.0" {
 		t.Fatalf("formatKbps = %q, want 8.0", got)
+	}
+}
+
+func TestResponsesForbidIntermediaryCompression(t *testing.T) {
+	s := testServer()
+	req := httptest.NewRequest(http.MethodGet, "/l/dl?ui=legacy&bytes=4096", nil)
+	req.Header.Set("Accept-Encoding", "gzip, deflate")
+	rec := httptest.NewRecorder()
+
+	s.legacyDownloadEntry(rec, req)
+
+	res := rec.Result()
+	if enc := res.Header.Get("Content-Encoding"); enc != "" {
+		t.Fatalf("Content-Encoding = %q, want none: a compressed payload reports bytes that never crossed the air", enc)
+	}
+	if !strings.Contains(res.Header.Get("Cache-Control"), "no-transform") {
+		t.Fatalf("Cache-Control = %q, want no-transform", res.Header.Get("Cache-Control"))
+	}
+	if res.Header.Get("Content-Length") != "4096" {
+		t.Fatalf("Content-Length = %q, want 4096", res.Header.Get("Content-Length"))
 	}
 }
