@@ -1,5 +1,6 @@
 # HEAD 
 
+- Fix issue with low throughput on some EV-DO devices (~capped around 200kbps).
 - Improve EV-DO reverse power control.
 - Reduced CPU usage across the BTS receiver, transmitter, and packet service.
 - Added support for RC2, QCELP 13K, and QCELP 8K voice. Fixes #16.
