@@ -683,6 +683,13 @@ impl Bts {
             self.runtime.short_code_length_chips,
             chip_cursor,
         );
+        let initial_hrpd_timezone = self.evdo.as_ref().map(|_| {
+            downlink::resolve_timezone_cached(
+                &mut state,
+                &self.config.timezone,
+                &self.config.overhead,
+            )
+        });
         let mut evdo_idle = self.evdo.as_ref().map(|cfg| {
             let mut m = evdo::HrpdForwardSlotModulator::new(
                 self.config.pilot_offset,
@@ -703,6 +710,8 @@ impl Bts {
                 cfg.evdo_channel,
                 cfg.overhead,
             );
+            let timezone = initial_hrpd_timezone.expect("HRPD timezone resolved");
+            m.install_sector_time(timezone.lp_sec, timezone.local_time_offset_minutes);
             m.set_harq_bus(self.hrpd_harq_bus.clone());
             log::info!(
                 "HRPD forward link armed: ColorCode={} SectorID24=0x{:06X} SubnetMask=/{} HRPDch={} (bc{}) 1xPartner=bc{}/ch{} pilot_pn={}; overhead schedule: Sync+Access every 3 cycles (~1.28s), Quick every 3 cycles, Sector/ReverseRate every 4 cycles",
@@ -714,6 +723,11 @@ impl Bts {
                 cfg.one_x_band_class,
                 cfg.one_x_channel,
                 cfg.pilot_pn,
+            );
+            log::info!(
+                "HRPD sector time: LeapSeconds={} LocalTimeOffset={}min",
+                timezone.lp_sec,
+                timezone.local_time_offset_minutes,
             );
             m
         });
@@ -818,6 +832,21 @@ impl Bts {
                 && sent_blocks % heartbeat_interval < blocks_per_batch
                 && sent_blocks > 0
             {
+                if let Some(evdo_idle) = evdo_idle.as_mut() {
+                    let timezone = downlink::resolve_timezone_cached(
+                        &mut state,
+                        &self.config.timezone,
+                        &self.config.overhead,
+                    );
+                    if evdo_idle
+                        .update_sector_time(timezone.lp_sec, timezone.local_time_offset_minutes)
+                    {
+                        info!(
+                            "HRPD sector time updated: LeapSeconds={} LocalTimeOffset={}min",
+                            timezone.lp_sec, timezone.local_time_offset_minutes,
+                        );
+                    }
+                }
                 let frame_system_time = time::system_time_from_chips(chip_cursor, state.chip_rate);
                 let tx_rel_chips = chip_cursor.saturating_sub(state.hardware_start_chip);
                 let tx_hardware_tick =

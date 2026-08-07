@@ -1193,6 +1193,8 @@ mod tests {
         sp.sector_signature = 0x1234;
         sp.latitude = -1;
         sp.longitude = 2;
+        sp.leap_seconds = 18;
+        sp.local_time_offset = -420;
         let bytes = sp.encode();
         let mut r = BitReader::new(&bytes);
         assert_eq!(r.read(8), SECTOR_PARAMETERS_MESSAGE_ID as u64);
@@ -1207,6 +1209,9 @@ mod tests {
         assert_eq!(r.read(22), (1u64 << 22) - 1);
         // longitude (23-bit two's complement of 2).
         assert_eq!(r.read(23), 2);
+        assert_eq!(r.read(11), 0); // route update radius
+        assert_eq!(r.read(8), 18); // leap seconds
+        assert_eq!(r.read(11), 0x65C); // -420 minutes in 11-bit two's complement
     }
 
     #[test]

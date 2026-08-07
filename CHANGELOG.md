@@ -1,5 +1,6 @@
 # HEAD 
 
+- Fixed EV-DO devices switching to UTC after acquiring the HRPD carrier.
 - Improved EV-DO reverse access decoding for weak uplink preambles.
 - Fix issue with low throughput on some EV-DO devices (~capped around 200kbps).
 - Improve EV-DO reverse power control.

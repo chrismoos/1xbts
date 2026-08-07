@@ -831,6 +831,34 @@ impl HrpdForwardSlotModulator {
         self.last_cycle_loaded = None;
     }
 
+    /// Set the initial HRPD local-time fields before overhead transmission.
+    pub fn install_sector_time(&mut self, leap_seconds: u8, local_time_offset: i16) {
+        if let Some(sector) = self.sector_params.as_mut() {
+            sector.leap_seconds = leap_seconds;
+            sector.local_time_offset = local_time_offset;
+            self.last_cycle_loaded = None;
+        }
+    }
+
+    /// Refresh HRPD local-time fields and invalidate the advertised signature.
+    pub fn update_sector_time(&mut self, leap_seconds: u8, local_time_offset: i16) -> bool {
+        let Some(sector) = self.sector_params.as_mut() else {
+            return false;
+        };
+        if sector.leap_seconds == leap_seconds && sector.local_time_offset == local_time_offset {
+            return false;
+        }
+
+        sector.leap_seconds = leap_seconds;
+        sector.local_time_offset = local_time_offset;
+        sector.sector_signature = sector.sector_signature.wrapping_add(1);
+        if let Some(quick) = self.quick_config.as_mut() {
+            quick.sector_signature = sector.sector_signature;
+        }
+        self.last_cycle_loaded = None;
+        true
+    }
+
     /// One-shot installer for the current explicit HRPD overhead values and
     /// optional 1x partner neighbor advert.
     pub fn install_sector_overheads(
@@ -1665,6 +1693,35 @@ mod modulator_tests {
             sector.neighbors.is_empty(),
             "HRPD-only sector should not advertise a nonexistent 1x partner"
         );
+    }
+
+    #[test]
+    fn sector_time_updates_invalidate_the_sector_signature() {
+        let overhead = HrpdOverheadConfig {
+            sector_id: Some(HrpdSectorId::new([0u8; 16])),
+            subnet_mask: Some(26),
+            color_code: Some(26),
+            sector_signature: 0x1234,
+            ..HrpdOverheadConfig::default()
+        }
+        .resolve()
+        .expect("resolve overhead");
+        let mut m = HrpdForwardSlotModulator::new(0, 32_768);
+        m.install_sector_overheads(0, None, 0, 37, overhead);
+        m.install_sector_time(18, -420);
+
+        let sector = m.sector_params.as_ref().expect("sector params installed");
+        assert_eq!(sector.leap_seconds, 18);
+        assert_eq!(sector.local_time_offset, -420);
+        assert_eq!(sector.sector_signature, 0x1234);
+        assert!(!m.update_sector_time(18, -420));
+        assert!(m.update_sector_time(18, -480));
+
+        let sector = m.sector_params.as_ref().expect("sector params installed");
+        let quick = m.quick_config.as_ref().expect("quick config installed");
+        assert_eq!(sector.local_time_offset, -480);
+        assert_eq!(sector.sector_signature, 0x1235);
+        assert_eq!(quick.sector_signature, sector.sector_signature);
     }
 
     #[test]

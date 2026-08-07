@@ -206,7 +206,7 @@ pub(super) fn handle_paging_frame(
 /// frame would call `chrono::Utc::now()` plus `chrono-tz` lookups on the hot
 /// path. One second is well below the 80 ms PDU boundary at which a DST
 /// transition could shift the broadcast value mid-PDU.
-fn resolve_timezone_cached(
+pub(super) fn resolve_timezone_cached(
     state: &mut TxLoopState,
     cfg: &cdma_common::timezone::TimezoneConfig,
     overhead: &cdma_common::overhead::OverheadParameters,

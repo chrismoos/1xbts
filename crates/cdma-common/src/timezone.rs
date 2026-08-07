@@ -1,6 +1,5 @@
-//! Resolve `LTM_OFF` / `DAYLT` / `LP_SEC` for the Sync Channel Message from
-//! one of three sources: the static overhead config, the host's IANA zone,
-//! or a user-specified IANA zone string.
+//! Resolve local-time and leap-second overhead from the static config, the
+//! host's IANA zone, or a user-specified IANA zone string.
 //!
 //! `LTM_OFF` is a 6-bit two's complement value in **half-hours** (per
 //! C.S0005 §3.7.2.3.2.21); the range `[-32, 31]` covers `[-16h, +15.5h]`,
@@ -94,6 +93,7 @@ pub struct ResolvedTimezone {
     pub ltm_off: i8,
     pub daylt: u8,
     pub lp_sec: u8,
+    pub local_time_offset_minutes: i16,
 }
 
 /// Errors raised while validating or resolving a `TimezoneConfig`.
@@ -163,16 +163,18 @@ pub fn resolve(
             ltm_off: overhead.ltm_off,
             daylt: overhead.daylt,
             lp_sec,
+            local_time_offset_minutes: i16::from(overhead.ltm_off) * 30,
         },
         TimezoneSource::System => {
             // validate() guarantees host IANA db is available; treat
             // post-boot loss of tzdata as unrecoverable.
-            let (ltm_off, daylt) = resolve_system(now_utc)
+            let (ltm_off, daylt, local_time_offset_minutes) = resolve_system(now_utc)
                 .expect("System tz lookup failed after validate() succeeded");
             ResolvedTimezone {
                 ltm_off,
                 daylt,
                 lp_sec,
+                local_time_offset_minutes,
             }
         }
         TimezoneSource::User { tz } => {
@@ -181,24 +183,25 @@ pub fn resolve(
             let zone: Tz = tz
                 .parse()
                 .unwrap_or_else(|_| panic!("invalid IANA timezone {tz:?} reached resolve()"));
-            let (ltm_off, daylt) = resolve_zone(zone, now_utc);
+            let (ltm_off, daylt, local_time_offset_minutes) = resolve_zone(zone, now_utc);
             ResolvedTimezone {
                 ltm_off,
                 daylt,
                 lp_sec,
+                local_time_offset_minutes,
             }
         }
     }
 }
 
-fn resolve_system(now_utc: DateTime<Utc>) -> Result<(i8, u8), TimezoneError> {
+fn resolve_system(now_utc: DateTime<Utc>) -> Result<(i8, u8, i16), TimezoneError> {
     let name = iana_time_zone::get_timezone()
         .map_err(|e| TimezoneError::SystemUnavailable(e.to_string()))?;
     let zone: Tz = name.parse().map_err(|_| TimezoneError::InvalidIana(name))?;
     Ok(resolve_zone(zone, now_utc))
 }
 
-fn resolve_zone(zone: Tz, now_utc: DateTime<Utc>) -> (i8, u8) {
+fn resolve_zone(zone: Tz, now_utc: DateTime<Utc>) -> (i8, u8, i16) {
     let local = zone.from_utc_datetime(&now_utc.naive_utc());
     let offset = local.offset();
     let total_secs = offset.fix().local_minus_utc();
@@ -206,7 +209,13 @@ fn resolve_zone(zone: Tz, now_utc: DateTime<Utc>) -> (i8, u8) {
     (
         half_hours_clamped(total_secs),
         if dst_secs != 0 { 1 } else { 0 },
+        minutes_clamped(total_secs),
     )
+}
+
+fn minutes_clamped(secs: i32) -> i16 {
+    let minutes = (secs as f64 / 60.0).round() as i32;
+    minutes.clamp(-1024, 1023) as i16
 }
 
 /// Convert a UTC offset in seconds to LTM_OFF half-hours, rounded to
@@ -251,7 +260,8 @@ mod tests {
             ResolvedTimezone {
                 ltm_off: -14,
                 daylt: 0,
-                lp_sec: 7
+                lp_sec: 7,
+                local_time_offset_minutes: -420,
             }
         );
     }
@@ -268,6 +278,7 @@ mod tests {
         // PST = UTC-8 = -16 half-hours, no DST.
         assert_eq!(r.ltm_off, -16);
         assert_eq!(r.daylt, 0);
+        assert_eq!(r.local_time_offset_minutes, -480);
     }
 
     #[test]
@@ -282,6 +293,7 @@ mod tests {
         // PDT = UTC-7 = -14 half-hours, DST active.
         assert_eq!(r.ltm_off, -14);
         assert_eq!(r.daylt, 1);
+        assert_eq!(r.local_time_offset_minutes, -420);
     }
 
     #[test]
@@ -297,9 +309,23 @@ mod tests {
         let r_jan = resolve(&cfg, &oh, at("2026-01-15T12:00:00Z"));
         assert_eq!(r_jan.ltm_off, 22);
         assert_eq!(r_jan.daylt, 1);
+        assert_eq!(r_jan.local_time_offset_minutes, 660);
         let r_jul = resolve(&cfg, &oh, at("2026-07-15T12:00:00Z"));
         assert_eq!(r_jul.ltm_off, 20);
         assert_eq!(r_jul.daylt, 0);
+        assert_eq!(r_jul.local_time_offset_minutes, 600);
+    }
+
+    #[test]
+    fn hrpd_offset_preserves_whole_minutes() {
+        let cfg = TimezoneConfig {
+            source: TimezoneSource::User {
+                tz: "Asia/Kathmandu".into(),
+            },
+        };
+        let r = resolve(&cfg, &overhead_with(0, 0, 18), at("2026-07-15T12:00:00Z"));
+        assert_eq!(r.ltm_off, 12);
+        assert_eq!(r.local_time_offset_minutes, 345);
     }
 
     #[test]

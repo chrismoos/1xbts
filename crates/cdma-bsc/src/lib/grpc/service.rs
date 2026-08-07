@@ -1383,7 +1383,7 @@ fn to_proto_config(
             ltm_off: resolved.ltm_off as i32,
             daylt: resolved.daylt as u32,
             lp_sec: resolved.lp_sec as u32,
-            utc_offset_seconds: (resolved.ltm_off as i32) * 1800,
+            utc_offset_seconds: i32::from(resolved.local_time_offset_minutes) * 60,
         }),
         evdo: evdo.map(to_proto_evdo),
     }
