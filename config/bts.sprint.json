@@ -1,0 +1,25 @@
+{
+  "evdo": {
+    "enabled": true,
+    "channel": 75,
+    "advertise_on_1x": true,
+    "gain": 1.0,
+    "mode": "composite",
+    "overhead": {
+      "sector_id": "00840AC0000000000000000000000000",
+      "subnet_mask": 26,
+      "color_code": 26,
+      "sector_signature": 1,
+      "access_signature": 1
+    }
+  },
+  "channel": {
+    "band_class": "bc1",
+    "band_subclass": 0,
+    "cdma_channel": 50
+  },
+  "overhead": {
+    "sid": 4107,
+    "nid": 65535
+  }
+}

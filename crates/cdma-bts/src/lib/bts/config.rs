@@ -587,21 +587,37 @@ impl BtsNodeConfig {
     /// `load_from_path_with_radio_override` to apply an external radio config
     /// before validation.
     pub fn load_from_path(path: &Path) -> Result<Self, Error> {
-        Self::load_from_path_inner(path, None)
+        Self::load_from_path_inner(path, None, None)
     }
 
     pub fn load_from_path_with_radio_override(
         path: &Path,
         radio_override: RadioConfig,
     ) -> Result<Self, Error> {
-        Self::load_from_path_inner(path, Some(radio_override))
+        Self::load_from_path_inner(path, None, Some(radio_override))
+    }
+
+    /// Load a base BTS config, then apply an optional named-profile config and
+    /// optional CLI radio override. Each JSON path includes its sibling local
+    /// override before the next layer is applied.
+    pub fn load_from_path_with_overrides(
+        path: &Path,
+        profile_path: Option<&Path>,
+        radio_override: Option<RadioConfig>,
+    ) -> Result<Self, Error> {
+        Self::load_from_path_inner(path, profile_path, radio_override)
     }
 
     fn load_from_path_inner(
         path: &Path,
+        profile_path: Option<&Path>,
         radio_override: Option<RadioConfig>,
     ) -> Result<Self, Error> {
-        let merged = cdma_common::config_load::load_json_with_local_override(path)?;
+        let mut merged = cdma_common::config_load::load_json_with_local_override(path)?;
+        if let Some(profile_path) = profile_path {
+            let profile = cdma_common::config_load::load_json_with_local_override(profile_path)?;
+            cdma_common::config_load::merge_json(&mut merged, profile);
+        }
         let source: BtsNodeConfigFile = serde_json::from_value(merged)?;
         Self::from_file_config(source, radio_override)
     }
@@ -749,6 +765,74 @@ mod tests {
             }
             other => panic!("expected soapy radio, got {other:?}"),
         }
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn bts_profile_overrides_generic_local_config_and_uses_profile_local_config() {
+        let dir = temp_test_dir("profile-precedence");
+        let config_path = dir.join("bts.json");
+        let local_path = dir.join("bts.local.json");
+        let profile_path = dir.join("bts.sprint.json");
+        let profile_local_path = dir.join("bts.sprint.local.json");
+
+        fs::write(
+            &config_path,
+            r#"{
+  "pilot_offset": 1,
+  "evdo": { "enabled": false },
+  "overhead": { "sid": 1, "nid": 1 }
+}"#,
+        )
+        .expect("write base config");
+        fs::write(
+            &local_path,
+            r#"{
+  "pilot_offset": 2,
+  "overhead": { "nid": 2 }
+}"#,
+        )
+        .expect("write generic local config");
+        fs::write(
+            &profile_path,
+            r#"{
+  "pilot_offset": 3,
+  "overhead": { "sid": 3 }
+}"#,
+        )
+        .expect("write profile config");
+        fs::write(&profile_local_path, r#"{ "pilot_offset": 4 }"#)
+            .expect("write profile local config");
+
+        let config =
+            BtsNodeConfig::load_from_path_with_overrides(&config_path, Some(&profile_path), None)
+                .expect("load config with profile");
+
+        assert_eq!(config.pilot_offset, 4);
+        assert_eq!(config.overhead.sid, 3);
+        assert_eq!(config.overhead.nid, 2);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn loads_shipped_sprint_profile() {
+        let dir = temp_test_dir("shipped-sprint-profile");
+        let config_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config");
+        let config_path = dir.join("bts.json");
+        let profile_path = dir.join("bts.sprint.json");
+        fs::copy(config_dir.join("bts.json"), &config_path).expect("copy base config");
+        fs::copy(config_dir.join("bts.sprint.json"), &profile_path).expect("copy Sprint profile");
+
+        let config =
+            BtsNodeConfig::load_from_path_with_overrides(&config_path, Some(&profile_path), None)
+                .expect("load shipped Sprint profile");
+
+        use cdma_common::band_class::BandClass;
+        assert_eq!(config.channel.band_class, BandClass::Bc1);
+        assert_eq!(config.channel.cdma_channel, 50);
+        assert_eq!(config.overhead.sid, 4107);
+        assert!(config.evdo.enabled);
+        assert_eq!(config.evdo.channel, Some(75));
         fs::remove_dir_all(dir).ok();
     }
 

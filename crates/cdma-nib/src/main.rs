@@ -1,4 +1,9 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, thread};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+    thread,
+};
 
 use cdma_an::HrpdDerivedImsiConfig;
 use cdma_bsc::{
@@ -72,6 +77,10 @@ struct Cli {
     #[arg(long, value_name = "CONFIG")]
     bts_config: Option<PathBuf>,
 
+    /// Named BTS profile applied after the base config and its local override.
+    #[arg(long, value_name = "PROFILE")]
+    bts_profile: Option<String>,
+
     /// Use a null radio that drops all TX samples and provides no RX.
     #[arg(long)]
     null_radio: bool,
@@ -94,6 +103,20 @@ fn resolve_config_dir(cli: &Cli) -> PathBuf {
         return PathBuf::from(dir);
     }
     PathBuf::from(config::DEFAULT_CONFIG_DIR)
+}
+
+fn resolve_bts_profile_path(config_dir: &Path, profile: &str) -> Result<PathBuf, Error> {
+    if profile.is_empty()
+        || !profile
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(format!(
+            "invalid BTS profile {profile:?}; use lowercase letters, digits, and hyphens"
+        )
+        .into());
+    }
+    Ok(config_dir.join(format!("bts.{profile}.json")))
 }
 
 fn effective_log_filter() -> String {
@@ -183,14 +206,21 @@ async fn main() -> Result<(), Error> {
         .bts_config
         .clone()
         .unwrap_or_else(|| config_dir.join(config::BTS_CONFIG_FILENAME));
-    let bts_config = if let Some(radio_config_path) = &cli.radio_config {
-        BtsNodeConfig::load_from_path_with_radio_override(
-            &bts_config_path,
-            load_radio_from_path(radio_config_path)?,
-        )?
-    } else {
-        BtsNodeConfig::load_from_path(&bts_config_path)?
-    };
+    let bts_profile_path = cli
+        .bts_profile
+        .as_deref()
+        .map(|profile| resolve_bts_profile_path(&config_dir, profile))
+        .transpose()?;
+    let radio_override = cli
+        .radio_config
+        .as_deref()
+        .map(load_radio_from_path)
+        .transpose()?;
+    let bts_config = BtsNodeConfig::load_from_path_with_overrides(
+        &bts_config_path,
+        bts_profile_path.as_deref(),
+        radio_override,
+    )?;
     let bsc_config = BscNodeConfig::load_from_path(&config_dir.join(config::BSC_CONFIG_FILENAME))?;
     let msc_config =
         cdma_msc::MscNodeConfig::load_from_path(&config_dir.join(config::MSC_CONFIG_FILENAME))
@@ -231,6 +261,9 @@ async fn main() -> Result<(), Error> {
     info!("Loading per-node configs from {}", config_dir.display());
     if let Some(path) = &cli.bts_config {
         info!("BTS config overridden from {}", path.display());
+    }
+    if let (Some(profile), Some(path)) = (&cli.bts_profile, &bts_profile_path) {
+        info!("BTS profile {profile} applied from {}", path.display());
     }
     if cli.radio_config.is_some() {
         info!("Radio config overridden from CLI");
@@ -634,5 +667,29 @@ mod tests {
         assert!(filter.contains("cdma_bts::receiver=trace"));
         assert!(filter.contains("cdma_an=debug"));
         assert!(!filter.split(',').any(|directive| directive == "debug"));
+    }
+
+    #[test]
+    fn cli_accepts_named_bts_profile() {
+        let cli = Cli::try_parse_from(["cdma-nib", "--bts-profile", "sprint"])
+            .expect("parse BTS profile");
+
+        assert_eq!(cli.bts_profile.as_deref(), Some("sprint"));
+    }
+
+    #[test]
+    fn bts_profile_path_uses_config_directory() {
+        let path = resolve_bts_profile_path(Path::new("site-config"), "sprint")
+            .expect("resolve BTS profile");
+
+        assert_eq!(path, Path::new("site-config/bts.sprint.json"));
+    }
+
+    #[test]
+    fn bts_profile_name_rejects_paths() {
+        let error = resolve_bts_profile_path(Path::new("config"), "../sprint")
+            .expect_err("reject profile path");
+
+        assert!(error.to_string().contains("invalid BTS profile"));
     }
 }

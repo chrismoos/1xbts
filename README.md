@@ -186,6 +186,11 @@ To customize a config without editing the checked-in defaults, drop a sibling
 `<name>.local.json` next to it (e.g. `config/bts.local.json`). The loader
 deep-merges the local file on top of the base before validation. `*.local.json`
 is gitignored. See the [Configuration guide](https://1xbts.org/docs/getting-started/configuration/#local-overrides).
+
+The stock BTS configuration uses Verizon settings. To try Sprint, add
+`--bts-profile sprint`. See [Carrier Profiles](https://1xbts.org/docs/carrier-profiles/overview/)
+for available profiles and local overrides.
+
 Packet-data DNS advertised to mobiles is configured in `config/pdsn.json` under
 `packet.primary_dns` and `packet.secondary_dns`; the checked-in defaults point to
 the FOU gateway resolver so `speed` and `speed.local.1xbts.org` resolve locally.
