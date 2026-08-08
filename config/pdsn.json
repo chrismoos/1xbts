@@ -24,13 +24,16 @@
     "secondary_dns": "10.55.0.1",
     "enable_vj_compression_default": false,
     "mobile_ip": {
-      "enabled": false,
+      "enabled": true,
       "fa_address": "10.55.0.1",
       "home_agent_address": "10.55.0.1",
       "advertisement_count": 3,
       "advertisement_lifetime_secs": 9000,
       "registration_lifetime_secs": 1200,
-      "auth_mode": "insecure",
+      "auth_mode": "mn_ha",
+      "mn_ha_spi": 1234,
+      "mn_ha_secret_base64": "c2VjcmV0",
+      "allow_unverified_mn_aaa": true,
       "home_address_pool": null
     }
   },

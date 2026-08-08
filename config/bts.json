@@ -193,6 +193,10 @@
             "pilot_inc": 4,
             "neighbors": []
           },
+          "extended_neighbor_list": {
+            "pilot_inc": 4,
+            "neighbors": []
+          },
           "cdma_channel_list": {
             "channels": []
           },

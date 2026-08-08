@@ -1,5 +1,8 @@
-# HEAD 
+# HEAD
 
+- Mobile IPv4 replies now provide DNS settings.
+- Added authenticated Mobile IPv4 registration for carrier profiles.
+- Improved Band Class 1 (i.e. Sprint).
 - Fixed EV-DO devices switching to UTC after acquiring the HRPD carrier.
 - Improved EV-DO reverse access decoding for weak uplink preambles.
 - Fix issue with low throughput on some EV-DO devices (~capped around 200kbps).

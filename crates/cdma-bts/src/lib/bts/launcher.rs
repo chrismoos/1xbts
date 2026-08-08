@@ -620,7 +620,21 @@ pub fn build_bts_launch_parts(
         }
     }
     let _ = cdma_freq; // legacy CDMA_FREQ field still used in overhead encoding
-    let paging_settings = bts_config.runtime.downlink.paging.clone();
+    let mut paging_settings = bts_config.runtime.downlink.paging.clone();
+    super::settings::resolve_band_specific_paging(&mut paging_settings, channel_plan.band_class)?;
+    info!(
+        "paging overhead: band_class={} BASE_CLASS={} EXT_NGHBR_LST={} schedule={:?}",
+        channel_plan.band_class.field_value(),
+        paging_settings
+            .message_defaults
+            .system_parameters
+            .base_class,
+        paging_settings
+            .message_defaults
+            .system_parameters
+            .ext_nghbr_lst,
+        paging_settings.message_defaults.schedule,
+    );
     let mac_layer_for_bts = mac_layer.clone();
     let rx_power_adj = bts_config.radio.rx_power_adj();
     let (bts, handle) = Bts::new_with_settings(

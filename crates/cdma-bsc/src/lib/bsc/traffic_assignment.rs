@@ -41,6 +41,10 @@ pub(crate) struct TrafficAssignmentService;
 
 const EXTENDED_CAM_MIN_P_REV: u8 = 3;
 
+fn should_use_ecam(mob_p_rev: u8, legacy_so1_assignment: bool, band_class: u8) -> bool {
+    mob_p_rev >= 6 && (!legacy_so1_assignment || band_class != 0)
+}
+
 impl TrafficAssignmentService {
     pub(crate) fn assign_channel_to_mobile(
         &self,
@@ -83,8 +87,12 @@ impl TrafficAssignmentService {
         mob_p_rev: u8,
         assigned_rcs: (u8, u8),
         service_option: u16,
+        band_class: u8,
     ) -> ServiceNegotiationMode {
-        if service_option == SERVICE_OPTION_BASIC_VOICE {
+        if band_class != 0 {
+            // C.S0005-E requires service negotiation for every non-BC0 band.
+            ServiceNegotiationMode::ServiceNegotiation
+        } else if service_option == SERVICE_OPTION_BASIC_VOICE {
             ServiceNegotiationMode::ServiceOptionNegotiation
         } else if mob_p_rev >= 6 || assigned_rcs == (2, 2) {
             ServiceNegotiationMode::ServiceNegotiation
@@ -858,8 +866,13 @@ impl TrafficAssignmentService {
             })
             .unwrap_or((1, Vec::new(), Vec::new(), None, None, false, false, false));
 
-        let (message, msg_id, assign_mode, code_chan) = if mob_p_rev >= 6 && !legacy_so1_assignment
-        {
+        let serving_band_class = overhead.band_class.unwrap_or(0);
+        let is_bc0 = serving_band_class == 0;
+        let (message, msg_id, assign_mode, code_chan) = if should_use_ecam(
+            mob_p_rev,
+            legacy_so1_assignment,
+            serving_band_class,
+        ) {
             let (for_rc, rev_rc) = match assigned_rcs.or_else(|| {
                 select_initial_traffic_rcs(
                     traffic_config,
@@ -960,6 +973,13 @@ impl TrafficAssignmentService {
                 (2, 2) => {
                     return Err("RC2 CAM requires mobile P_REV >= 3".into());
                 }
+                (1, 1) if !is_bc0 => ChannelAssignmentMessage::new_extended_traffic_assignment(
+                    walsh_code,
+                    0,
+                    CHANNEL_DEFAULT_CONFIG_RC1_RC1,
+                    ChannelAssignmentGrantedMode::RequestedService,
+                    false,
+                ),
                 (1, 1) => ChannelAssignmentMessage::new_traffic_assignment(walsh_code, 0),
                 _ => unreachable!("legacy CAM RC pair validated above"),
             };
@@ -993,6 +1013,30 @@ impl TrafficAssignmentService {
     }
 }
 
+#[cfg(test)]
+mod band_class_tests {
+    use super::*;
+
+    #[test]
+    fn bc1_never_forces_modern_so1_mobile_onto_bc0_legacy_cam() {
+        assert!(should_use_ecam(6, true, 1));
+        assert!(!should_use_ecam(6, true, 0));
+    }
+
+    #[test]
+    fn bc1_always_uses_service_negotiation() {
+        assert_eq!(
+            TrafficAssignmentService::service_negotiation_mode(
+                3,
+                (1, 1),
+                SERVICE_OPTION_BASIC_VOICE,
+                1,
+            ),
+            ServiceNegotiationMode::ServiceNegotiation
+        );
+    }
+}
+
 impl Bsc {
     pub(super) fn assign_traffic_channel_to_mobile(
         &mut self,
@@ -1014,6 +1058,7 @@ impl Bsc {
                     ms.mob_p_rev,
                     assigned_rcs,
                     service_option,
+                    self.config.overhead.band_class.unwrap_or(0),
                 )
             })
             .unwrap_or(ServiceNegotiationMode::ServiceOptionNegotiation);

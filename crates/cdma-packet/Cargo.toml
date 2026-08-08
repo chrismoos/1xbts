@@ -18,6 +18,7 @@ tokio-stream = "0.1"
 uuid = { version = "1", features = ["v4"] }
 socket2 = "0.5"
 cdma-common = { path = "../cdma-common" }
+md-5 = "0.10"
 
 [build-dependencies]
 tonic-build = "0.13"

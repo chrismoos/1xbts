@@ -603,6 +603,13 @@ impl BtsNodeConfig {
     ) -> Result<Self, Error> {
         let merged = cdma_common::config_load::load_json_with_local_override(path)?;
         let source: BtsNodeConfigFile = serde_json::from_value(merged)?;
+        Self::from_file_config(source, radio_override)
+    }
+
+    fn from_file_config(
+        source: BtsNodeConfigFile,
+        radio_override: Option<RadioConfig>,
+    ) -> Result<Self, Error> {
         let radio = match (radio_override, source.radio) {
             (Some(radio), _) => radio,
             (None, Some(radio)) => radio,
@@ -640,7 +647,9 @@ impl BtsNodeConfig {
     /// `evdo.enabled` alone would leave the narrower single-carrier rates).
     #[cfg(test)]
     pub(crate) fn load_evdo_enabled_for_test(path: &Path) -> Result<Self, Error> {
-        let mut config = Self::load_from_path(path)?;
+        // Checked-in fixture tests must not inherit local operator overrides.
+        let source: BtsNodeConfigFile = serde_json::from_slice(&std::fs::read(path)?)?;
+        let mut config = Self::from_file_config(source, None)?;
         config.evdo.enabled = true;
         config.apply_derived_rf_profile()?;
         config.validate()?;

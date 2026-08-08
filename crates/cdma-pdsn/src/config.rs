@@ -8,14 +8,16 @@ use std::{
     path::Path,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use cdma_a10::BearerTransportConfig;
 use cdma_a11::{A11SecurityConfig, A11TransportConfig};
-use cdma_packet::mobile_ip::{MobileIpAuthMode, MobileIpConfig};
+use cdma_packet::mobile_ip::{MobileIpAuthMode, MobileIpConfig, MobileIpSecurityAssociation};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_PPP_SESSION_TIMEOUT_SECS: u64 = 30 * 60;
 const MIN_ENABLED_MOBILE_IP_ADVERTISEMENT_COUNT: u8 = 1;
 const MIN_ENABLED_MOBILE_IP_LIFETIME_SECS: u16 = 1;
+const MAX_RESERVED_MOBILE_IP_SPI: u32 = 255;
 
 fn default_ppp_session_timeout_secs() -> u64 {
     DEFAULT_PPP_SESSION_TIMEOUT_SECS
@@ -43,6 +45,7 @@ fn default_a11() -> A11TransportConfig {
 #[serde(rename_all = "snake_case")]
 pub enum PacketMobileIpAuthMode {
     Insecure,
+    MnHa,
 }
 
 impl Default for PacketMobileIpAuthMode {
@@ -51,7 +54,7 @@ impl Default for PacketMobileIpAuthMode {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PacketMobileIpConfig {
     /// Enables local Mobile IPv4 Foreign Agent registration after IPCP.
@@ -66,10 +69,44 @@ pub struct PacketMobileIpConfig {
     pub advertisement_lifetime_secs: u16,
     /// Maximum lifetime accepted for Mobile IPv4 registrations.
     pub registration_lifetime_secs: u16,
-    /// Local and/or testing auth mode. Only `insecure` is currently implemented.
+    /// Registration authentication policy.
     pub auth_mode: PacketMobileIpAuthMode,
+    /// SPI selecting the MN-HA security association.
+    pub mn_ha_spi: Option<u32>,
+    /// Binary MN-HA shared secret encoded as base64.
+    pub mn_ha_secret_base64: Option<String>,
+    /// Accept MN-AAA credentials without an external AAA verification result.
+    pub allow_unverified_mn_aaa: bool,
     /// Optional CIDR for the home-address pool. Defaults to the packet `/24`.
     pub home_address_pool: Option<String>,
+}
+
+impl std::fmt::Debug for PacketMobileIpConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PacketMobileIpConfig")
+            .field("enabled", &self.enabled)
+            .field("fa_address", &self.fa_address)
+            .field("home_agent_address", &self.home_agent_address)
+            .field("advertisement_count", &self.advertisement_count)
+            .field(
+                "advertisement_lifetime_secs",
+                &self.advertisement_lifetime_secs,
+            )
+            .field(
+                "registration_lifetime_secs",
+                &self.registration_lifetime_secs,
+            )
+            .field("auth_mode", &self.auth_mode)
+            .field("mn_ha_spi", &self.mn_ha_spi)
+            .field(
+                "mn_ha_secret_base64",
+                &self.mn_ha_secret_base64.as_ref().map(|_| "<redacted>"),
+            )
+            .field("allow_unverified_mn_aaa", &self.allow_unverified_mn_aaa)
+            .field("home_address_pool", &self.home_address_pool)
+            .finish()
+    }
 }
 
 impl Default for PacketMobileIpConfig {
@@ -83,6 +120,9 @@ impl Default for PacketMobileIpConfig {
             advertisement_lifetime_secs: defaults.advertisement_lifetime_secs,
             registration_lifetime_secs: defaults.registration_lifetime_secs,
             auth_mode: PacketMobileIpAuthMode::default(),
+            mn_ha_spi: None,
+            mn_ha_secret_base64: None,
+            allow_unverified_mn_aaa: false,
             home_address_pool: None,
         }
     }
@@ -108,6 +148,30 @@ impl PacketMobileIpConfig {
         if self.home_agent_address.is_unspecified() {
             return Err("pdsn.packet.mobile_ip.home_agent_address must not be 0.0.0.0".to_string());
         }
+        match self.auth_mode {
+            PacketMobileIpAuthMode::Insecure => {
+                if self.mn_ha_spi.is_some() || self.mn_ha_secret_base64.is_some() {
+                    return Err(
+                        "pdsn.packet.mobile_ip MN-HA credentials require auth_mode = \"mn_ha\""
+                            .to_string(),
+                    );
+                }
+                if self.allow_unverified_mn_aaa {
+                    return Err("pdsn.packet.mobile_ip.allow_unverified_mn_aaa requires auth_mode = \"mn_ha\"".to_string());
+                }
+            }
+            PacketMobileIpAuthMode::MnHa => {
+                let spi = self.mn_ha_spi.ok_or(
+                    "pdsn.packet.mobile_ip.mn_ha_spi is required when auth_mode = \"mn_ha\"",
+                )?;
+                if spi <= MAX_RESERVED_MOBILE_IP_SPI {
+                    return Err(
+                        "pdsn.packet.mobile_ip.mn_ha_spi must be greater than 255".to_string()
+                    );
+                }
+                self.decode_mn_ha_secret()?;
+            }
+        }
         if let Some(pool) = self.home_address_pool.as_deref() {
             let expected = format!(
                 "{}.{}.{}.0/24",
@@ -124,18 +188,52 @@ impl PacketMobileIpConfig {
         Ok(())
     }
 
-    pub fn to_packet_config(&self) -> MobileIpConfig {
-        MobileIpConfig {
+    pub fn to_packet_config(
+        &self,
+        primary_dns: Ipv4Addr,
+        secondary_dns: Ipv4Addr,
+    ) -> Result<MobileIpConfig, String> {
+        let mn_ha_security = match self.auth_mode {
+            PacketMobileIpAuthMode::Insecure => None,
+            PacketMobileIpAuthMode::MnHa => Some(Box::new(MobileIpSecurityAssociation::new(
+                self.mn_ha_spi.ok_or(
+                    "pdsn.packet.mobile_ip.mn_ha_spi is required when auth_mode = \"mn_ha\"",
+                )?,
+                self.decode_mn_ha_secret()?,
+            ))),
+        };
+        Ok(MobileIpConfig {
             enabled: self.enabled,
             fa_address: self.fa_address,
             home_agent_address: self.home_agent_address,
             advertisement_count: self.advertisement_count,
             advertisement_lifetime_secs: self.advertisement_lifetime_secs,
             registration_lifetime_secs: self.registration_lifetime_secs,
+            primary_dns,
+            secondary_dns,
             auth_mode: match self.auth_mode {
                 PacketMobileIpAuthMode::Insecure => MobileIpAuthMode::Insecure,
+                PacketMobileIpAuthMode::MnHa => MobileIpAuthMode::MnHa,
             },
+            mn_ha_security,
+            allow_unverified_mn_aaa: self.allow_unverified_mn_aaa,
+        })
+    }
+
+    fn decode_mn_ha_secret(&self) -> Result<Vec<u8>, String> {
+        let encoded = self.mn_ha_secret_base64.as_deref().ok_or(
+            "pdsn.packet.mobile_ip.mn_ha_secret_base64 is required when auth_mode = \"mn_ha\"",
+        )?;
+        let secret = BASE64_STANDARD.decode(encoded).map_err(|error| {
+            format!("pdsn.packet.mobile_ip.mn_ha_secret_base64 is invalid base64: {error}")
+        })?;
+        if secret.is_empty() {
+            return Err(
+                "pdsn.packet.mobile_ip.mn_ha_secret_base64 must not decode to an empty value"
+                    .to_string(),
+            );
         }
+        Ok(secret)
     }
 }
 
@@ -458,7 +556,10 @@ mod tests {
                         "home_agent_address": "10.55.0.1",
                         "advertisement_count": 2,
                         "registration_lifetime_secs": 600,
-                        "auth_mode": "insecure",
+                        "auth_mode": "mn_ha",
+                        "mn_ha_spi": 1234,
+                        "mn_ha_secret_base64": "c2VjcmV0",
+                        "allow_unverified_mn_aaa": true,
                         "home_address_pool": "10.55.0.0/24"
                     }
                 }
@@ -467,6 +568,30 @@ mod tests {
         cfg.validate().expect("mobile IP config should validate");
         assert!(cfg.packet.mobile_ip.enabled);
         assert_eq!(cfg.packet.mobile_ip.advertisement_count, 2);
+        let packet_config = cfg
+            .packet
+            .mobile_ip
+            .to_packet_config(cfg.packet.primary_dns, cfg.packet.secondary_dns)
+            .expect("MN-HA config should convert");
+        assert_eq!(packet_config.auth_mode, MobileIpAuthMode::MnHa);
+        assert_eq!(packet_config.primary_dns, cfg.packet.primary_dns);
+        assert_eq!(packet_config.secondary_dns, cfg.packet.secondary_dns);
+        assert_eq!(packet_config.mn_ha_security.unwrap().spi, 1234);
+        assert!(packet_config.allow_unverified_mn_aaa);
+    }
+
+    #[test]
+    fn mobile_ip_mn_ha_secret_must_be_valid_base64() {
+        let mut cfg = test_config();
+        cfg.packet.transport = "fou_tcp".to_string();
+        cfg.packet.mobile_ip.enabled = true;
+        cfg.packet.mobile_ip.auth_mode = PacketMobileIpAuthMode::MnHa;
+        cfg.packet.mobile_ip.mn_ha_spi = Some(1234);
+        cfg.packet.mobile_ip.mn_ha_secret_base64 = Some("not base64!".to_string());
+        let error = cfg
+            .validate()
+            .expect_err("invalid MN-HA secret should be rejected");
+        assert!(error.contains("mn_ha_secret_base64"));
     }
 
     #[test]

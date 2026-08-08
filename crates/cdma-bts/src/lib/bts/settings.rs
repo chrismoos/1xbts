@@ -11,6 +11,7 @@ use std::{
 };
 
 use cdma_abis::udp_bearer::UdpBearerDatagram;
+use cdma_common::band_class::BandClass;
 use cdma_common::error::Error;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
@@ -24,9 +25,9 @@ use crate::{
         AccessParametersMessage, AlternativeHrpdNeighborRecord,
         AlternativeHrpdNeighborSubnetColorCode, AlternativeHrpdRadioInterface,
         AlternativeTechnologiesInformationMessage, AlternativeTechnologyRadioInterfaceRecord,
-        CdmaChannelListMessage, ExtendedSystemParametersMessage, GeneralPageMessage,
-        NeighborListMessage, OrderMessage, PagingChannelMessage, PagingMessageDefaults,
-        PagingMessageKind, SystemParametersMessage,
+        CdmaChannelListMessage, ExtendedNeighborListMessage, ExtendedSystemParametersMessage,
+        GeneralPageMessage, NeighborListMessage, OrderMessage, PagingChannelMessage,
+        PagingMessageDefaults, PagingMessageKind, SystemParametersMessage,
     },
     phy::coding::block_interleaver::{InterleaverParams, SR1_PARAMS_128, SR1_PARAMS_384},
 };
@@ -447,8 +448,103 @@ impl BtsRuntimeSettings {
             .message_defaults
             .extended_system_parameters
             .validate()?;
+        validate_extended_neighbor_list(
+            &self.downlink.paging.message_defaults.extended_neighbor_list,
+        )?;
         Ok(())
     }
+}
+
+fn validate_extended_neighbor_list(
+    defaults: &cdma_common::lac::paging_messages::ExtendedNeighborListDefaults,
+) -> Result<(), Error> {
+    if !(1..=15).contains(&defaults.pilot_inc) {
+        return Err("extended_neighbor_list.pilot_inc must be in 1..=15".into());
+    }
+    if defaults.neighbors.len() > 40 {
+        return Err("extended_neighbor_list must not contain more than 40 neighbors".into());
+    }
+    for (index, neighbor) in defaults.neighbors.iter().enumerate() {
+        if neighbor.nghbr_config > 0b011 {
+            return Err(format!(
+                "extended_neighbor_list.neighbors[{index}].nghbr_config must be in 0..=3"
+            )
+            .into());
+        }
+        if neighbor.nghbr_pn > 0x01ff {
+            return Err(format!(
+                "extended_neighbor_list.neighbors[{index}].nghbr_pn must fit in 9 bits"
+            )
+            .into());
+        }
+        if neighbor.search_priority > 0b11 {
+            return Err(format!(
+                "extended_neighbor_list.neighbors[{index}].search_priority must be in 0..=3"
+            )
+            .into());
+        }
+        match (neighbor.nghbr_band, neighbor.nghbr_freq) {
+            (Some(band), Some(freq)) => {
+                if band > 0x1f {
+                    return Err(format!(
+                        "extended_neighbor_list.neighbors[{index}].nghbr_band must fit in 5 bits"
+                    )
+                    .into());
+                }
+                if freq > 0x07ff {
+                    return Err(format!(
+                        "extended_neighbor_list.neighbors[{index}].nghbr_freq must fit in 11 bits"
+                    )
+                    .into());
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(format!(
+                    "extended_neighbor_list.neighbors[{index}] must provide both nghbr_band and nghbr_freq, or neither"
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the Paging Channel overhead family and SPM indicators from the
+/// actual serving band. C.S0005-E uses NLM only for BC0 and ENLM for other
+/// band classes; BC1/BC4 additionally require BASE_CLASS=0001.
+pub fn resolve_band_specific_paging(
+    paging: &mut PagingChannelSettings,
+    band_class: BandClass,
+) -> Result<(), Error> {
+    let defaults = &mut paging.message_defaults;
+    defaults.system_parameters.base_class =
+        u8::from(matches!(band_class, BandClass::Bc1 | BandClass::Bc4));
+
+    let uses_extended_neighbors = band_class != BandClass::Bc0;
+    defaults.system_parameters.ext_nghbr_lst = uses_extended_neighbors;
+
+    let mut resolved = Vec::with_capacity(defaults.schedule.len() + 1);
+    for kind in defaults.schedule.iter().copied() {
+        let kind = match (uses_extended_neighbors, kind) {
+            (true, PagingMessageKind::NeighborList) => PagingMessageKind::ExtendedNeighborList,
+            (false, PagingMessageKind::ExtendedNeighborList) => PagingMessageKind::NeighborList,
+            _ => kind,
+        };
+        if !resolved.contains(&kind) {
+            resolved.push(kind);
+        }
+    }
+    let required = if uses_extended_neighbors {
+        PagingMessageKind::ExtendedNeighborList
+    } else {
+        PagingMessageKind::NeighborList
+    };
+    if !resolved.contains(&required) {
+        resolved.push(required);
+    }
+    defaults.schedule = resolved;
+    validate_extended_neighbor_list(&defaults.extended_neighbor_list)
 }
 
 pub use cdma_common::events::AccessChannelEvent;
@@ -715,6 +811,15 @@ pub fn build_scheduled_message(
                 neighbors: defaults.neighbors.clone(),
             })
         }
+        PagingMessageKind::ExtendedNeighborList => {
+            let defaults = &paging.message_defaults.extended_neighbor_list;
+            PagingChannelMessage::ExtendedNeighborList(ExtendedNeighborListMessage {
+                pilot_pn: pilot_offset as u16,
+                config_msg_seq: overhead.config_seq,
+                pilot_inc: defaults.pilot_inc,
+                neighbors: defaults.neighbors.clone(),
+            })
+        }
         PagingMessageKind::CdmaChannelList => {
             let defaults = &paging.message_defaults.cdma_channel_list;
             // Default to the operating channel when no explicit list.
@@ -848,6 +953,76 @@ mod tests {
 
         runtime.realtime.enabled = false;
         assert!(runtime.validate().is_ok());
+    }
+
+    #[test]
+    fn bc1_resolves_required_extended_neighbor_overhead() {
+        let mut paging = PagingChannelSettings::default();
+        resolve_band_specific_paging(&mut paging, BandClass::Bc1).unwrap();
+
+        let defaults = &paging.message_defaults;
+        assert_eq!(defaults.system_parameters.base_class, 1);
+        assert!(defaults.system_parameters.ext_nghbr_lst);
+        assert!(
+            defaults
+                .schedule
+                .contains(&PagingMessageKind::ExtendedNeighborList)
+        );
+        assert!(!defaults.schedule.contains(&PagingMessageKind::NeighborList));
+    }
+
+    #[test]
+    fn bc0_resolves_legacy_neighbor_overhead() {
+        let mut paging = PagingChannelSettings::default();
+        paging
+            .message_defaults
+            .schedule
+            .push(PagingMessageKind::ExtendedNeighborList);
+        resolve_band_specific_paging(&mut paging, BandClass::Bc0).unwrap();
+
+        let defaults = &paging.message_defaults;
+        assert_eq!(defaults.system_parameters.base_class, 0);
+        assert!(!defaults.system_parameters.ext_nghbr_lst);
+        assert!(defaults.schedule.contains(&PagingMessageKind::NeighborList));
+        assert!(
+            !defaults
+                .schedule
+                .contains(&PagingMessageKind::ExtendedNeighborList)
+        );
+    }
+
+    #[test]
+    fn empty_extended_neighbor_list_is_scheduled_and_decodable() {
+        let mut paging = PagingChannelSettings::default();
+        resolve_band_specific_paging(&mut paging, BandClass::Bc1).unwrap();
+        let mut overhead = OverheadParameters::default();
+        overhead.config_seq = 5;
+
+        let message = build_scheduled_message(
+            PagingMessageKind::ExtendedNeighborList,
+            0,
+            &overhead,
+            &paging,
+            None,
+        );
+        let mut sdu = message.to_sdu();
+        let decoded = ExtendedNeighborListMessage::from_sdu(&mut sdu).unwrap();
+        assert_eq!(decoded.pilot_pn, 0);
+        assert_eq!(decoded.config_msg_seq, 5);
+        assert_eq!(decoded.pilot_inc, 4);
+        assert!(decoded.neighbors.is_empty());
+    }
+
+    #[test]
+    fn extended_neighbor_list_validation_rejects_invalid_configuration() {
+        let mut runtime = BtsRuntimeSettings::default();
+        runtime
+            .downlink
+            .paging
+            .message_defaults
+            .extended_neighbor_list
+            .pilot_inc = 0;
+        assert!(runtime.validate().is_err());
     }
 
     #[test]

@@ -15,6 +15,7 @@ cdma-common = { path = "../cdma-common" }
 cdma-a11 = { path = "../cdma-a11" }
 cdma-events = { path = "../cdma-events" }
 cdma-packet = { path = "../cdma-packet" }
+base64 = "0.22"
 prost-types = "0.13"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }

@@ -639,6 +639,7 @@ dependencies = [
  "cdma-common",
  "libc",
  "log",
+ "md-5",
  "prost",
  "socket2 0.5.10",
  "tokio",
@@ -667,6 +668,7 @@ dependencies = [
 name = "cdma-pdsn"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "cdma-a10",
  "cdma-a11",
  "cdma-a8",

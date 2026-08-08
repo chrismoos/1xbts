@@ -1227,6 +1227,7 @@ impl Bsc {
             PagingMessageKind::SystemParameters => self.build_system_parameters_message(),
             PagingMessageKind::AccessParameters => self.build_access_parameters_message(),
             PagingMessageKind::NeighborList => self.build_neighbor_list_message(),
+            PagingMessageKind::ExtendedNeighborList => self.build_extended_neighbor_list_message(),
             PagingMessageKind::CdmaChannelList => self.build_cdma_channel_list_message(),
             PagingMessageKind::ExtendedSystemParameters => {
                 self.build_extended_system_parameters_message()
@@ -1267,10 +1268,11 @@ impl Bsc {
     /// so an operator can sanity-check that the broadcast values
     /// produce a reasonable initial transmit power for their RF setup.
     ///
-    /// The mobile's open-loop formula (Band Class 0, IS-95 / IS-2000):
+    /// The mobile's open-loop formula (IS-95 / IS-2000):
     ///
     /// ```text
-    /// Tx_dBm = -Rx_dBm - 73 + NOM_PWR + INIT_PWR + (n-1)*PWR_STEP
+    /// Tx_dBm = -Rx_dBm + band offset + NOM_PWR
+    ///          - 16*NOM_PWR_EXT + INIT_PWR + (n-1)*PWR_STEP
     /// ```
     ///
     /// where Rx is the total received power at the mobile (dominated by
@@ -1278,24 +1280,45 @@ impl Bsc {
     /// number (1..NUM_STEP).
     pub(crate) fn log_open_loop_power_init(&self) {
         let d = &self.config.paging.message_defaults.access_parameters;
-        let base_offset = i32::from(d.nom_pwr) + i32::from(d.init_pwr);
+        // C.S0057-F Table 2.3.1-1: these bands use -76 dB for an SR1
+        // Access Channel; the remaining implemented bands use -73 dB.
+        let band_class = self.config.overhead.band_class.unwrap_or(0);
+        let open_loop_offset = if matches!(band_class, 1 | 4 | 6 | 8 | 13 | 14 | 15 | 16 | 20) {
+            76
+        } else {
+            73
+        };
+        let base_offset =
+            i32::from(d.nom_pwr) - 16 * i32::from(d.nom_pwr_ext) + i32::from(d.init_pwr);
         let max_ramp = i32::from(d.pwr_step) * i32::from(d.num_step.saturating_sub(1));
         info!(
-            "BSC: open-loop reverse TX init: NOM_PWR={} dB INIT_PWR={} dB \
+            "BSC: open-loop reverse TX init: band_class={} NOM_PWR={} dB NOM_PWR_EXT={} INIT_PWR={} dB \
              → Tx = -Rx - {} dBm (probe 1); ramp +{} dB/probe over {} probes \
              (final probe Tx = -Rx - {} dBm)",
+            band_class,
             d.nom_pwr,
+            d.nom_pwr_ext,
             d.init_pwr,
-            73 - base_offset,
+            open_loop_offset - base_offset,
             d.pwr_step,
             d.num_step,
-            73 - base_offset - max_ramp,
+            open_loop_offset - base_offset - max_ramp,
         );
     }
 
     pub(crate) fn build_neighbor_list_message(&self) -> PagingChannelMessage {
         build_scheduled_message(
             PagingMessageKind::NeighborList,
+            self.config.pilot_offset,
+            &self.config.overhead,
+            &self.config.paging,
+            None,
+        )
+    }
+
+    pub(crate) fn build_extended_neighbor_list_message(&self) -> PagingChannelMessage {
+        build_scheduled_message(
+            PagingMessageKind::ExtendedNeighborList,
             self.config.pilot_offset,
             &self.config.overhead,
             &self.config.paging,

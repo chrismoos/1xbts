@@ -40,7 +40,9 @@ pub fn build_packet_service_with_sink(
             cfg.packet.primary_dns,
             cfg.packet.secondary_dns,
             cfg.packet.enable_vj_compression_default,
-            cfg.packet.mobile_ip.to_packet_config(),
+            cfg.packet
+                .mobile_ip
+                .to_packet_config(cfg.packet.primary_dns, cfg.packet.secondary_dns)?,
         ),
     );
     let fou_tunnel = match &transport_config {

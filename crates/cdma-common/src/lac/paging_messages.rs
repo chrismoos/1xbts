@@ -468,6 +468,7 @@ pub enum PagingMessageKind {
     SystemParameters,
     AccessParameters,
     NeighborList,
+    ExtendedNeighborList,
     CdmaChannelList,
     ExtendedSystemParameters,
     GeneralPage,
@@ -482,6 +483,7 @@ pub struct PagingMessageDefaults {
     pub system_parameters: SystemParametersDefaults,
     pub access_parameters: AccessParametersDefaults,
     pub neighbor_list: NeighborListDefaults,
+    pub extended_neighbor_list: ExtendedNeighborListDefaults,
     pub cdma_channel_list: CdmaChannelListDefaults,
     pub extended_system_parameters: ExtendedSystemParametersDefaults,
     pub general_page: GeneralPageDefaults,
@@ -505,6 +507,7 @@ impl Default for PagingMessageDefaults {
             system_parameters: SystemParametersDefaults::default(),
             access_parameters: AccessParametersDefaults::default(),
             neighbor_list: NeighborListDefaults::default(),
+            extended_neighbor_list: ExtendedNeighborListDefaults::default(),
             cdma_channel_list: CdmaChannelListDefaults::default(),
             extended_system_parameters: ExtendedSystemParametersDefaults::default(),
             general_page: GeneralPageDefaults::default(),
@@ -595,8 +598,8 @@ impl Default for SystemParametersDefaults {
 #[serde(default)]
 pub struct AccessParametersDefaults {
     pub acc_chan: u8,
-    /// NOM_PWR open-loop offset in dB. Wire is 4-bit signed (-8..+7 dB,
-    /// Band Class 0). See `AccessParametersMessage::nom_pwr` for the full
+    /// NOM_PWR open-loop offset in dB. Wire is 4-bit signed (-8..+7 dB).
+    /// See `AccessParametersMessage::nom_pwr` for the full
     /// open-loop reverse TX power formula.
     pub nom_pwr: i8,
     /// INIT_PWR open-loop offset in dB. Wire is 5-bit signed (-16..+15 dB).
@@ -708,6 +711,24 @@ impl Default for AcctServiceOptionGroupRecord {
 pub struct NeighborListDefaults {
     pub pilot_inc: u8,
     pub neighbors: Vec<u16>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExtendedNeighborListDefaults {
+    pub pilot_inc: u8,
+    pub neighbors: Vec<ExtendedNeighborRecord>,
+}
+
+impl Default for ExtendedNeighborListDefaults {
+    fn default() -> Self {
+        Self {
+            // ENLM PILOT_INC=0 is invalid. Four is a conventional value and
+            // matches the existing operator configuration.
+            pilot_inc: 4,
+            neighbors: Vec::new(),
+        }
+    }
 }
 
 impl Default for NeighborListDefaults {
@@ -1046,11 +1067,12 @@ pub struct AccessParametersMessage {
     pub pilot_pn: u16,
     pub acc_msg_seq: u8,
     pub acc_chan: u8,
-    /// NOM_PWR open-loop offset in dB. Wire is 4-bit signed (-8..+7 dB
-    /// for Band Class 0). The mobile uses this in its open-loop reverse
+    /// NOM_PWR open-loop offset in dB. Wire is 4-bit signed (-8..+7 dB).
+    /// The mobile uses this in its open-loop reverse
     /// TX power formula:
     ///
-    ///   Tx_dBm = -Rx_dBm - 73 + NOM_PWR + INIT_PWR + (n-1)*PWR_STEP
+    ///   Tx_dBm = -Rx_dBm + band offset + NOM_PWR - 16*NOM_PWR_EXT
+    ///            + INIT_PWR + (n-1)*PWR_STEP
     ///
     /// where `n` is the access probe number (1..NUM_STEP).
     pub nom_pwr: i8,
@@ -2601,7 +2623,8 @@ pub struct FeatureNotificationMessage {
     pub records: Vec<InformationRecord>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExtendedNeighborRecord {
     pub nghbr_config: u8,
     pub nghbr_pn: u16,
