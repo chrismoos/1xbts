@@ -66,13 +66,20 @@ mod wire {
     pub(super) const BITS_ACQ_INDEX: usize = 9;
     pub(super) const BITS_ROAM_IND: usize = 8;
 
-    // TSB-58 roaming indicator named values (subset; everything else is
-    // returned verbatim via [`super::RoamingIndicator::Other`]).
-    pub(super) const ROAM_IND_ON_HOME: u8 = 0;
-    pub(super) const ROAM_IND_ROAMING: u8 = 1;
-    pub(super) const ROAM_IND_INTERNATIONAL: u8 = 2;
-    pub(super) const ROAM_IND_LTE: u8 = 3;
-    pub(super) const ROAM_IND_FLASHING: u8 = 4;
+    // C.R1001 roaming indicator values referenced by C.S0016-D.
+    pub(super) const ROAM_IND_INDICATOR_ON: u8 = 0;
+    pub(super) const ROAM_IND_INDICATOR_OFF: u8 = 1;
+    pub(super) const ROAM_IND_INDICATOR_FLASHING: u8 = 2;
+    pub(super) const ROAM_IND_OUT_OF_NEIGHBORHOOD: u8 = 3;
+    pub(super) const ROAM_IND_OUT_OF_BUILDING: u8 = 4;
+    pub(super) const ROAM_IND_PREFERRED_SYSTEM: u8 = 5;
+    pub(super) const ROAM_IND_AVAILABLE_SYSTEM: u8 = 6;
+    pub(super) const ROAM_IND_ALLIANCE_PARTNER: u8 = 7;
+    pub(super) const ROAM_IND_PREMIUM_PARTNER: u8 = 8;
+    pub(super) const ROAM_IND_FULL_SERVICE: u8 = 9;
+    pub(super) const ROAM_IND_PARTIAL_SERVICE: u8 = 10;
+    pub(super) const ROAM_IND_BANNER_ON: u8 = 11;
+    pub(super) const ROAM_IND_BANNER_OFF: u8 = 12;
 }
 
 use wire::*;
@@ -87,7 +94,7 @@ pub struct ClassicPrl {
     pub pr_list_id: u16,
     pub pref_only: bool,
     /// Roaming indicator the MS should display when on a system not in
-    /// SYS_TABLE. Decoded into [`RoamingIndicator`] (TSB-58 values).
+    /// SYS_TABLE. Decoded into [`RoamingIndicator`] (C.R1001 values).
     pub def_roam_ind: RoamingIndicator,
     pub acquisition_records: Vec<AcquisitionRecord>,
     pub system_records: Vec<SystemRecord>,
@@ -685,45 +692,63 @@ pub enum Priority {
     EquallyDesirable,
 }
 
-/// Roaming indicator. Values from TSB-58 (the registry referenced by
-/// C.S0016-D for the `ROAM_IND` / `DEF_ROAM_IND` fields). Unknown
+/// Roaming indicator. Values from C.R1001 (the registry referenced by
+/// C.S0016-D for the `ROAM_IND` / `DEF_ROAM_IND` fields). Reserved
 /// numerics are preserved verbatim via [`RoamingIndicator::Other`] so
 /// operator displays can still show the raw value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoamingIndicator {
-    /// `0` — on home system.
-    OnHome,
-    /// `1` — standard roaming (analog or non-preferred CDMA).
-    Roaming,
-    /// `2` — international roaming.
-    InternationalRoaming,
-    /// `3` — LTE.
-    Lte,
-    /// `4` — flashing roaming indicator (call indicator).
-    Flashing,
-    /// `5` to `63` — TSB-58 reserved.
+    IndicatorOn,
+    IndicatorOff,
+    IndicatorFlashing,
+    OutOfNeighborhood,
+    OutOfBuilding,
+    PreferredSystem,
+    AvailableSystem,
+    AlliancePartner,
+    PremiumPartner,
+    FullService,
+    PartialService,
+    BannerOn,
+    BannerOff,
     Other(u8),
 }
 
 impl RoamingIndicator {
     pub fn from_u8(v: u8) -> Self {
         match v {
-            ROAM_IND_ON_HOME => Self::OnHome,
-            ROAM_IND_ROAMING => Self::Roaming,
-            ROAM_IND_INTERNATIONAL => Self::InternationalRoaming,
-            ROAM_IND_LTE => Self::Lte,
-            ROAM_IND_FLASHING => Self::Flashing,
+            ROAM_IND_INDICATOR_ON => Self::IndicatorOn,
+            ROAM_IND_INDICATOR_OFF => Self::IndicatorOff,
+            ROAM_IND_INDICATOR_FLASHING => Self::IndicatorFlashing,
+            ROAM_IND_OUT_OF_NEIGHBORHOOD => Self::OutOfNeighborhood,
+            ROAM_IND_OUT_OF_BUILDING => Self::OutOfBuilding,
+            ROAM_IND_PREFERRED_SYSTEM => Self::PreferredSystem,
+            ROAM_IND_AVAILABLE_SYSTEM => Self::AvailableSystem,
+            ROAM_IND_ALLIANCE_PARTNER => Self::AlliancePartner,
+            ROAM_IND_PREMIUM_PARTNER => Self::PremiumPartner,
+            ROAM_IND_FULL_SERVICE => Self::FullService,
+            ROAM_IND_PARTIAL_SERVICE => Self::PartialService,
+            ROAM_IND_BANNER_ON => Self::BannerOn,
+            ROAM_IND_BANNER_OFF => Self::BannerOff,
             other => Self::Other(other),
         }
     }
 
     pub fn raw(self) -> u8 {
         match self {
-            Self::OnHome => ROAM_IND_ON_HOME,
-            Self::Roaming => ROAM_IND_ROAMING,
-            Self::InternationalRoaming => ROAM_IND_INTERNATIONAL,
-            Self::Lte => ROAM_IND_LTE,
-            Self::Flashing => ROAM_IND_FLASHING,
+            Self::IndicatorOn => ROAM_IND_INDICATOR_ON,
+            Self::IndicatorOff => ROAM_IND_INDICATOR_OFF,
+            Self::IndicatorFlashing => ROAM_IND_INDICATOR_FLASHING,
+            Self::OutOfNeighborhood => ROAM_IND_OUT_OF_NEIGHBORHOOD,
+            Self::OutOfBuilding => ROAM_IND_OUT_OF_BUILDING,
+            Self::PreferredSystem => ROAM_IND_PREFERRED_SYSTEM,
+            Self::AvailableSystem => ROAM_IND_AVAILABLE_SYSTEM,
+            Self::AlliancePartner => ROAM_IND_ALLIANCE_PARTNER,
+            Self::PremiumPartner => ROAM_IND_PREMIUM_PARTNER,
+            Self::FullService => ROAM_IND_FULL_SERVICE,
+            Self::PartialService => ROAM_IND_PARTIAL_SERVICE,
+            Self::BannerOn => ROAM_IND_BANNER_ON,
+            Self::BannerOff => ROAM_IND_BANNER_OFF,
             Self::Other(v) => v,
         }
     }
@@ -777,7 +802,7 @@ mod tests {
         bs.write_u32(0, 16); // PR_LIST_SIZE — patched below
         bs.write_u32(0xCAFE, 16); // PR_LIST_ID
         bs.write_u8(0, 1); // PREF_ONLY = false
-        bs.write_u8(0, 8); // DEF_ROAM_IND = OnHome
+        bs.write_u8(0, 8); // DEF_ROAM_IND = indicator on
         bs.write_u32(2, 9); // NUM_ACQ_RECS
         bs.write_u32(2, 14); // NUM_SYS_RECS
         // ACQ #0: Cellular CDMA Standard, A/B = either, primary or secondary.
@@ -790,7 +815,7 @@ mod tests {
         bs.write_u8(0b000, 3); // Block A
         bs.write_u8(0b001, 3); // Block B
         // SYS #0: SID=22, NID=65535 (single nid wildcard), pref=true,
-        // priority=more desirable, acq=0, roam=OnHome.
+        // priority=more desirable, acq=0, roaming indicator on.
         bs.write_u32(22, 15);
         bs.write_u8(0b01, 2); // SingleNid
         bs.write_u32(65535, 16);
@@ -798,7 +823,7 @@ mod tests {
         bs.write_u8(0, 1); // GEO = first record, must be 0
         bs.write_u8(1, 1); // PRI = more desirable
         bs.write_u32(0, 9); // ACQ_INDEX
-        bs.write_u8(0, 8); // ROAM_IND = OnHome
+        bs.write_u8(0, 8); // ROAM_IND = indicator on
         // SYS #1: SID wildcard, negative.
         bs.write_u32(0, 15);
         bs.write_u8(0b00, 2); // AnyNid
@@ -847,7 +872,7 @@ mod tests {
         assert_eq!(prl.system_records[0].acq_index, 0);
         assert_eq!(
             prl.system_records[0].roaming_indicator,
-            Some(RoamingIndicator::OnHome)
+            Some(RoamingIndicator::IndicatorOn)
         );
         assert_eq!(prl.system_records[1].sid, 0);
         assert_eq!(prl.system_records[1].nid_incl, NidInclusion::AnyNid);
@@ -865,6 +890,39 @@ mod tests {
         let mut input = b"123456789".to_vec();
         input.extend_from_slice(&[0, 0]);
         assert_eq!(compute_prl_crc(&input), 0xD64E);
+    }
+
+    #[test]
+    fn roaming_indicator_assignments_match_registry() {
+        let assignments = [
+            (ROAM_IND_INDICATOR_ON, RoamingIndicator::IndicatorOn),
+            (ROAM_IND_INDICATOR_OFF, RoamingIndicator::IndicatorOff),
+            (
+                ROAM_IND_INDICATOR_FLASHING,
+                RoamingIndicator::IndicatorFlashing,
+            ),
+            (
+                ROAM_IND_OUT_OF_NEIGHBORHOOD,
+                RoamingIndicator::OutOfNeighborhood,
+            ),
+            (ROAM_IND_OUT_OF_BUILDING, RoamingIndicator::OutOfBuilding),
+            (ROAM_IND_PREFERRED_SYSTEM, RoamingIndicator::PreferredSystem),
+            (ROAM_IND_AVAILABLE_SYSTEM, RoamingIndicator::AvailableSystem),
+            (ROAM_IND_ALLIANCE_PARTNER, RoamingIndicator::AlliancePartner),
+            (ROAM_IND_PREMIUM_PARTNER, RoamingIndicator::PremiumPartner),
+            (ROAM_IND_FULL_SERVICE, RoamingIndicator::FullService),
+            (ROAM_IND_PARTIAL_SERVICE, RoamingIndicator::PartialService),
+            (ROAM_IND_BANNER_ON, RoamingIndicator::BannerOn),
+            (ROAM_IND_BANNER_OFF, RoamingIndicator::BannerOff),
+        ];
+
+        for (raw, expected) in assignments {
+            assert_eq!(RoamingIndicator::from_u8(raw), expected);
+            assert_eq!(expected.raw(), raw);
+        }
+        for raw in [13, 64, u8::MAX] {
+            assert_eq!(RoamingIndicator::from_u8(raw), RoamingIndicator::Other(raw));
+        }
     }
 
     /// Append RESERVED bits to octet-align, patch PR_LIST_SIZE, append CRC.
@@ -891,7 +949,7 @@ mod tests {
         bs.write_u32(0, 16); // PR_LIST_SIZE — patched
         bs.write_u32(0xE001, 16); // PR_LIST_ID
         bs.write_u8(0, 1); // PREF_ONLY = false
-        bs.write_u8(1, 8); // DEF_ROAM_IND = Roaming (off-list)
+        bs.write_u8(1, 8); // DEF_ROAM_IND = indicator off
         bs.write_u32(1, 9); // NUM_ACQ_RECS = 1
         bs.write_u32(6, 14); // NUM_SYS_RECS = 6
         // ACQ #0: Cellular CDMA Standard, Either A/B, Primary-or-Secondary.
@@ -908,7 +966,7 @@ mod tests {
             bs.write_u8(geo, 1);
             bs.write_u8(more, 1); // PRI: 1=MORE, 0=EQUAL
             bs.write_u32(0, 9); // ACQ_INDEX = 0
-            bs.write_u8(0, 8); // ROAM_IND = OnHome
+            bs.write_u8(0, 8); // ROAM_IND = indicator on
         };
         // Index 0: SID=1, NID=1, PREF, MORE, NEW geo
         preferred(&mut bs, 1, 1, 0, 1);
@@ -927,7 +985,7 @@ mod tests {
         let prl = decode(&bytes).unwrap();
         assert!(prl.crc_ok());
         assert_eq!(prl.pr_list_id, 0xE001);
-        assert_eq!(prl.def_roam_ind, RoamingIndicator::Roaming);
+        assert_eq!(prl.def_roam_ind, RoamingIndicator::IndicatorOff);
         assert_eq!(prl.acquisition_records.len(), 1);
         assert_eq!(prl.system_records.len(), 6);
 
@@ -1008,7 +1066,7 @@ mod tests {
         bs.write_u8(0, 1); // geo
         bs.write_u8(0, 1); // PRI = EquallyDesirable
         bs.write_u32(8, 9); // ACQ_INDEX = 8 (last record)
-        bs.write_u8(2, 8); // ROAM_IND = International
+        bs.write_u8(2, 8); // ROAM_IND = indicator flashing
 
         let bytes = finalize_prl(bs);
         let prl = decode(&bytes).unwrap();
@@ -1062,7 +1120,7 @@ mod tests {
         assert_eq!(s.acq_index, 8);
         assert_eq!(
             s.roaming_indicator,
-            Some(RoamingIndicator::InternationalRoaming)
+            Some(RoamingIndicator::IndicatorFlashing)
         );
     }
 

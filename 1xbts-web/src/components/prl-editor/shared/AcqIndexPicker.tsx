@@ -5,8 +5,9 @@ import {
 } from "@/lib/proto/hlr/v1/service";
 import { EditorMode } from "../state";
 import { ErrorMap } from "../validation";
-import { acqRowSummary } from "../acq-label";
+import { acqDetailSummary, acqRowSummary } from "../acq-label";
 import { AcqRowEditor } from "../acq/AcqRowEditor";
+import { SearchableSelect } from "./SearchableSelect";
 
 export function AcqIndexPicker({
   value,
@@ -36,29 +37,29 @@ export function AcqIndexPicker({
   return (
     <div className="col-span-full">
       <div className="flex items-end gap-2">
-        <label className="block flex-1">
+        <div className="block flex-1">
           <span className="text-muted text-[11px]">ACQ_INDEX</span>
-          <select
-            className={`mt-1 w-full bg-bg border rounded px-2 py-1 font-mono text-xs ${
-              error ? "border-accent-red" : "border-border"
-            }`}
-            value={value}
-            onChange={(e) => onChange(Number(e.target.value))}
-          >
-            {acqRecords.length === 0 ? (
-              <option value={0}>No ACQ rows yet</option>
-            ) : (
-              acqRecords.map((rec, i) => (
-                <option key={i} value={i}>
-                  {acqRowSummary(i, rec, mode)}
-                </option>
-              ))
-            )}
-          </select>
+          <SearchableSelect
+            className="mt-1"
+            value={String(value)}
+            options={
+              acqRecords.length === 0
+                ? [{ value: "0", label: "No ACQ rows yet" }]
+                : acqRecords.map((record, index) => ({
+                    value: String(index),
+                    label: acqRowSummary(index, record, mode),
+                    searchText: `${acqDetailSummary(record)} ${JSON.stringify(record)}`,
+                  }))
+            }
+            onChange={(next) => onChange(Number(next))}
+            placeholder="Search acquisition records…"
+            ariaLabel="ACQ_INDEX"
+            invalid={Boolean(error)}
+          />
           {error && (
             <span className="text-accent-red text-[10px]">{error}</span>
           )}
-        </label>
+        </div>
         <button
           type="button"
           onClick={() => setShowDetails((v) => !v)}

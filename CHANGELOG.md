@@ -1,5 +1,6 @@
 # HEAD
 
+- Improved PRL management interface (UI filters, running system generation, pre-save diff, and more).
 - Added a Sprint BTS profile selectable with `--bts-profile sprint`.
 - Mobile IPv4 replies now provide DNS settings.
 - Added authenticated Mobile IPv4 registration for carrier profiles.

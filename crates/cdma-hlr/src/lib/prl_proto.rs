@@ -739,11 +739,19 @@ fn proto_to_mccmnc(
 fn roam_to_proto(r: prl::RoamingIndicator) -> proto::PrlRoamingIndicator {
     use proto::PrlRoamingIndicatorKind as K;
     let kind = match r {
-        prl::RoamingIndicator::OnHome => K::OnHome,
-        prl::RoamingIndicator::Roaming => K::Roaming,
-        prl::RoamingIndicator::InternationalRoaming => K::International,
-        prl::RoamingIndicator::Lte => K::Lte,
-        prl::RoamingIndicator::Flashing => K::Flashing,
+        prl::RoamingIndicator::IndicatorOn => K::IndicatorOn,
+        prl::RoamingIndicator::IndicatorOff => K::IndicatorOff,
+        prl::RoamingIndicator::IndicatorFlashing => K::IndicatorFlashing,
+        prl::RoamingIndicator::OutOfNeighborhood => K::OutOfNeighborhood,
+        prl::RoamingIndicator::OutOfBuilding => K::OutOfBuilding,
+        prl::RoamingIndicator::PreferredSystem => K::PreferredSystem,
+        prl::RoamingIndicator::AvailableSystem => K::AvailableSystem,
+        prl::RoamingIndicator::AlliancePartner => K::AlliancePartner,
+        prl::RoamingIndicator::PremiumPartner => K::PremiumPartner,
+        prl::RoamingIndicator::FullService => K::FullService,
+        prl::RoamingIndicator::PartialService => K::PartialService,
+        prl::RoamingIndicator::BannerOn => K::BannerOn,
+        prl::RoamingIndicator::BannerOff => K::BannerOff,
         prl::RoamingIndicator::Other(_) => K::Other,
     };
     proto::PrlRoamingIndicator {
@@ -755,7 +763,7 @@ fn roam_to_proto(r: prl::RoamingIndicator) -> proto::PrlRoamingIndicator {
 fn proto_to_roam(p: Option<&proto::PrlRoamingIndicator>) -> prl::RoamingIndicator {
     match p {
         Some(p) => prl::RoamingIndicator::from_u8(p.raw as u8),
-        None => prl::RoamingIndicator::OnHome,
+        None => prl::RoamingIndicator::IndicatorOff,
     }
 }
 

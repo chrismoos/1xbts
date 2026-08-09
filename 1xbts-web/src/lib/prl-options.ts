@@ -65,11 +65,19 @@ export const EXT_SYS_TYPE_OPTIONS: PrlOption<PrlExtSysRecordType>[] = [
 ];
 
 export const ROAM_KIND_OPTIONS: PrlOption<PrlRoamingIndicatorKind>[] = [
-  { value: PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_ON_HOME, label: "On Home (0)" },
-  { value: PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_ROAMING, label: "Roaming (1)" },
-  { value: PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_INTERNATIONAL, label: "International (2)" },
-  { value: PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_LTE, label: "LTE (3)" },
-  { value: PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_FLASHING, label: "Flashing (4)" },
+  { value: PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_INDICATOR_ON, label: "Roaming (0)" },
+  { value: PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_INDICATOR_OFF, label: "Home (1)" },
+  { value: PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_INDICATOR_FLASHING, label: "Roaming (Flashing) (2)" },
+  { value: PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_OUT_OF_NEIGHBORHOOD, label: "Out of Neighborhood (3)" },
+  { value: PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_OUT_OF_BUILDING, label: "Out of Building (4)" },
+  { value: PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_PREFERRED_SYSTEM, label: "Roaming - Preferred System (5)" },
+  { value: PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_AVAILABLE_SYSTEM, label: "Roaming - Available System (6)" },
+  { value: PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_ALLIANCE_PARTNER, label: "Roaming - Alliance Partner (7)" },
+  { value: PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_PREMIUM_PARTNER, label: "Roaming - Premium Partner (8)" },
+  { value: PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_FULL_SERVICE, label: "Roaming - Full Service Functionality (9)" },
+  { value: PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_PARTIAL_SERVICE, label: "Roaming - Partial Service Functionality (10)" },
+  { value: PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_BANNER_ON, label: "Roaming Banner On (11)" },
+  { value: PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_BANNER_OFF, label: "Roaming Banner Off (12)" },
   { value: PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_OTHER, label: "Other (raw byte)" },
 ];
 
@@ -86,32 +94,40 @@ export const MCC_MNC_SUBTYPE_OPTIONS: MccMncSubtypeOption[] = [
 ];
 
 export const CLASSIC_ACQ_TYPE_OPTIONS: PrlOption<number>[] = [
-  { value: 0x01, label: "Cellular Analog (0001)" },
-  { value: 0x02, label: "Cellular CDMA Standard (0010)" },
-  { value: 0x03, label: "Cellular CDMA Custom (0011)" },
-  { value: 0x04, label: "Cellular CDMA Preferred (0100)" },
-  { value: 0x05, label: "PCS CDMA Using Blocks (0101)" },
-  { value: 0x06, label: "PCS CDMA Using Channels (0110)" },
-  { value: 0x07, label: "JTACS Standard (0111)" },
-  { value: 0x08, label: "JTACS Custom (1000)" },
-  { value: 0x09, label: "2 GHz Band Class 6 (1001)" },
+  { value: 0x01, label: "Cellular analog" },
+  { value: 0x02, label: "Cellular CDMA — standard" },
+  { value: 0x03, label: "Cellular CDMA — channels" },
+  { value: 0x04, label: "Cellular CDMA — preferred" },
+  { value: 0x05, label: "PCS — blocks" },
+  { value: 0x06, label: "PCS — channels" },
+  { value: 0x07, label: "JTACS — standard" },
+  { value: 0x08, label: "JTACS — channels" },
+  { value: 0x09, label: "Band class 6 — channels" },
 ];
 
 export const EXTENDED_ACQ_TYPE_OPTIONS: PrlOption<number>[] = [
   ...CLASSIC_ACQ_TYPE_OPTIONS,
-  { value: 0x0a, label: "Generic 1x / IS-95 (00001010)" },
-  { value: 0x0b, label: "Generic HRPD (00001011)" },
-  { value: 0x0f, label: "UMB Common Acquisition Table (00001111)" },
-  { value: 0x10, label: "Generic UMB (00010000)" },
+  { value: 0x0a, label: "Generic 1x" },
+  { value: 0x0b, label: "HRPD" },
+  { value: 0x0f, label: "UMB acquisition table" },
+  { value: 0x10, label: "UMB" },
 ];
 
 export function formatRoamingIndicator(raw: number): string {
   switch (raw) {
-    case 0: return "On Home (0)";
-    case 1: return "Roaming (1)";
-    case 2: return "International (2)";
-    case 3: return "LTE (3)";
-    case 4: return "Flashing (4)";
-    default: return `Branded (${raw})`;
+    case 0: return "Roaming (0)";
+    case 1: return "Home (1)";
+    case 2: return "Roaming (Flashing) (2)";
+    case 3: return "Out of Neighborhood (3)";
+    case 4: return "Out of Building (4)";
+    case 5: return "Roaming - Preferred System (5)";
+    case 6: return "Roaming - Available System (6)";
+    case 7: return "Roaming - Alliance Partner (7)";
+    case 8: return "Roaming - Premium Partner (8)";
+    case 9: return "Roaming - Full Service Functionality (9)";
+    case 10: return "Roaming - Partial Service Functionality (10)";
+    case 11: return "Roaming Banner On (11)";
+    case 12: return "Roaming Banner Off (12)";
+    default: return `Reserved (${raw})`;
   }
 }

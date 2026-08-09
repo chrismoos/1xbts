@@ -253,11 +253,19 @@ fn proto_prl_decoded_extended(
 fn proto_roam(r: RoamingIndicator) -> events_proto::OtaspPrlRoamingIndicator {
     use events_proto::OtaspPrlRoamingIndicatorKind as K;
     let kind = match r {
-        RoamingIndicator::OnHome => K::OnHome,
-        RoamingIndicator::Roaming => K::Roaming,
-        RoamingIndicator::InternationalRoaming => K::International,
-        RoamingIndicator::Lte => K::Lte,
-        RoamingIndicator::Flashing => K::Flashing,
+        RoamingIndicator::IndicatorOn => K::IndicatorOn,
+        RoamingIndicator::IndicatorOff => K::IndicatorOff,
+        RoamingIndicator::IndicatorFlashing => K::IndicatorFlashing,
+        RoamingIndicator::OutOfNeighborhood => K::OutOfNeighborhood,
+        RoamingIndicator::OutOfBuilding => K::OutOfBuilding,
+        RoamingIndicator::PreferredSystem => K::PreferredSystem,
+        RoamingIndicator::AvailableSystem => K::AvailableSystem,
+        RoamingIndicator::AlliancePartner => K::AlliancePartner,
+        RoamingIndicator::PremiumPartner => K::PremiumPartner,
+        RoamingIndicator::FullService => K::FullService,
+        RoamingIndicator::PartialService => K::PartialService,
+        RoamingIndicator::BannerOn => K::BannerOn,
+        RoamingIndicator::BannerOff => K::BannerOff,
         RoamingIndicator::Other(_) => K::Other,
     };
     events_proto::OtaspPrlRoamingIndicator {

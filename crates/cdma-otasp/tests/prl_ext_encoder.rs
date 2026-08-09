@@ -34,7 +34,7 @@ fn empty_prl(
         pr_list_id: 0xC0DE,
         cur_sspr_p_rev: 0x03,
         pref_only: false,
-        def_roam_ind: RoamingIndicator::OnHome,
+        def_roam_ind: RoamingIndicator::IndicatorOn,
         acquisition_records,
         common_subnet_records,
         system_records,
@@ -77,7 +77,7 @@ fn sys_cdma2000_minimal(acq_index: u16) -> ExtSystemRecord {
             sid: 22,
             nid: None,
         },
-        roaming_indicator: Some(RoamingIndicator::OnHome),
+        roaming_indicator: Some(RoamingIndicator::IndicatorOn),
         association: None,
     }
 }
@@ -234,7 +234,7 @@ fn sys_mccmnc(length_octets: u8, subtype: MccMncSubtype) -> ExtSystemRecord {
         priority: Priority::MoreDesirable,
         acq_index: 0,
         system_id: ExtSystemId::MccMnc(subtype),
-        roaming_indicator: Some(RoamingIndicator::Roaming),
+        roaming_indicator: Some(RoamingIndicator::IndicatorOff),
         association: None,
     }
 }
@@ -383,7 +383,7 @@ fn hrpd_with_association_round_trip() {
                 subnet_lsb: vec![0xAB],
                 subnet_common_offset: None,
             },
-            roaming_indicator: Some(RoamingIndicator::OnHome),
+            roaming_indicator: Some(RoamingIndicator::IndicatorOn),
             association: Some(ExtSystemAssociation {
                 association_tag: 7,
                 pn_association: true,

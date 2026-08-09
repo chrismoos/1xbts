@@ -242,7 +242,7 @@ export function emptyCommonSubnet(): PrlCommonSubnetRecord {
 
 export function defaultRoamingIndicator(): PrlRoamingIndicator {
   return {
-    raw: 0,
-    kind: PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_ON_HOME,
+    raw: 1,
+    kind: PrlRoamingIndicatorKind.PRL_ROAMING_INDICATOR_KIND_INDICATOR_OFF,
   };
 }

@@ -3,6 +3,7 @@
 import { Fragment } from "react";
 import { Card, Stat } from "@/components/card";
 import { formatTimeMs as formatTime } from "@/lib/format";
+import { formatRoamingIndicator } from "@/lib/prl-options";
 import {
   blockIdLabel,
   featureIdLabel,
@@ -295,14 +296,8 @@ function priorityLabel(v: string | number | undefined): string {
 
 function roamingLabel(r: PrlRoamingJson | undefined): string {
   if (!r) return "—";
-  const k = r.kind;
   const raw = r.raw ?? 0;
-  if (endsWith(k, "ON_HOME") || k === 1) return `On home (${raw})`;
-  if (endsWith(k, "INTERNATIONAL") || k === 3) return `International roaming (${raw})`;
-  if (endsWith(k, "ROAMING") || k === 2) return `Roaming (${raw})`;
-  if (endsWith(k, "LTE") || k === 4) return `LTE (${raw})`;
-  if (endsWith(k, "FLASHING") || k === 5) return `Flashing (${raw})`;
-  return `Other (${raw})`;
+  return formatRoamingIndicator(raw);
 }
 
 function acqRowLabel(rec: PrlAcqRecordJson): { title: string; detail: string } {

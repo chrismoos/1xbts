@@ -24,6 +24,9 @@ export type EditorMode = "classic" | "extended";
 export interface EditorState {
   loaded: PrlDecoded;
   draft: PrlDecoded;
+  loadedAcqIds: string[];
+  loadedSysIds: string[];
+  loadedSubnetIds: string[];
   acqIds: string[];
   sysIds: string[];
   subnetIds: string[];
@@ -33,7 +36,7 @@ export type EditorAction =
   | { type: "load"; payload: PrlDecoded }
   | { type: "patchClassic"; mutator: (draft: PrlClassicBody) => void }
   | { type: "patchExtended"; mutator: (draft: PrlExtendedBody) => void }
-  | { type: "addAcq"; record: PrlAcqRecord | PrlExtAcqRecord }
+  | { type: "addAcq"; record: PrlAcqRecord | PrlExtAcqRecord; id: string }
   | { type: "removeAcq"; index: number }
   | { type: "reorderAcq"; from: number; to: number }
   | {
@@ -41,7 +44,7 @@ export type EditorAction =
       index: number;
       mutator: (draft: PrlAcqRecord | PrlExtAcqRecord) => void;
     }
-  | { type: "addSys"; record: PrlSysRecord | PrlExtSysRecord }
+  | { type: "addSys"; record: PrlSysRecord | PrlExtSysRecord; id: string }
   | { type: "removeSys"; index: number }
   | { type: "reorderSys"; from: number; to: number }
   | {
@@ -49,7 +52,7 @@ export type EditorAction =
       index: number;
       mutator: (draft: PrlSysRecord | PrlExtSysRecord) => void;
     }
-  | { type: "addSubnet"; record: PrlCommonSubnetRecord }
+  | { type: "addSubnet"; record: PrlCommonSubnetRecord; id: string }
   | { type: "removeSubnet"; index: number }
   | { type: "reorderSubnet"; from: number; to: number }
   | {
@@ -66,12 +69,18 @@ export function initialState(loaded: PrlDecoded): EditorState {
   const acqCount = acqRecordsOf(loaded).length;
   const sysCount = sysRecordsOf(loaded).length;
   const subnetCount = subnetRecordsOf(loaded).length;
+  const acqIds = makeIds(acqCount);
+  const sysIds = makeIds(sysCount);
+  const subnetIds = makeIds(subnetCount);
   return {
     loaded,
     draft: structuredClone(loaded),
-    acqIds: makeIds(acqCount),
-    sysIds: makeIds(sysCount),
-    subnetIds: makeIds(subnetCount),
+    loadedAcqIds: [...acqIds],
+    loadedSysIds: [...sysIds],
+    loadedSubnetIds: [...subnetIds],
+    acqIds,
+    sysIds,
+    subnetIds,
   };
 }
 
@@ -116,7 +125,7 @@ export function reducer(state: EditorState, action: EditorAction): EditorState {
     case "addAcq":
       return produce(state, (s) => {
         acqArrayMut(s.draft).push(action.record);
-        s.acqIds.push(uuid());
+        s.acqIds.push(action.id);
       });
 
     case "removeAcq":
@@ -152,7 +161,7 @@ export function reducer(state: EditorState, action: EditorAction): EditorState {
     case "addSys":
       return produce(state, (s) => {
         sysArrayMut(s.draft).push(action.record);
-        s.sysIds.push(uuid());
+        s.sysIds.push(action.id);
       });
 
     case "removeSys":
@@ -180,7 +189,7 @@ export function reducer(state: EditorState, action: EditorAction): EditorState {
         const arr = subnetArrayMut(s.draft);
         if (arr) {
           arr.push(action.record);
-          s.subnetIds.push(uuid());
+          s.subnetIds.push(action.id);
         }
       });
 

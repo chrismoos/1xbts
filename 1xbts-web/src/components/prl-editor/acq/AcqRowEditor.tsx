@@ -24,7 +24,6 @@ import { UmbCommonTableEditor } from "./UmbCommonTable";
 import { GenericUmbEditor } from "./GenericUmb";
 
 export function AcqRowEditor({
-  mode: _mode,
   record,
   onPatch,
   errors,

@@ -83,11 +83,19 @@ fn acq_brief(b: &AcquisitionBody) -> String {
 }
 fn roam(r: RoamingIndicator) -> String {
     match r {
-        RoamingIndicator::OnHome => "home".into(),
-        RoamingIndicator::Roaming => "roam".into(),
-        RoamingIndicator::InternationalRoaming => "intl".into(),
-        RoamingIndicator::Lte => "LTE".into(),
-        RoamingIndicator::Flashing => "flash".into(),
+        RoamingIndicator::IndicatorOn => "indicator-on".into(),
+        RoamingIndicator::IndicatorOff => "indicator-off/home".into(),
+        RoamingIndicator::IndicatorFlashing => "indicator-flashing".into(),
+        RoamingIndicator::OutOfNeighborhood => "out-of-neighborhood".into(),
+        RoamingIndicator::OutOfBuilding => "out-of-building".into(),
+        RoamingIndicator::PreferredSystem => "preferred-system".into(),
+        RoamingIndicator::AvailableSystem => "available-system".into(),
+        RoamingIndicator::AlliancePartner => "alliance-partner".into(),
+        RoamingIndicator::PremiumPartner => "premium-partner".into(),
+        RoamingIndicator::FullService => "full-service".into(),
+        RoamingIndicator::PartialService => "partial-service".into(),
+        RoamingIndicator::BannerOn => "banner-on".into(),
+        RoamingIndicator::BannerOff => "banner-off".into(),
         RoamingIndicator::Other(v) => format!("#{}", v),
     }
 }

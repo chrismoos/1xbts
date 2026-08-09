@@ -11,6 +11,7 @@ import { RoamingIndicatorSelect } from "../shared/RoamingIndicatorSelect";
 import { ErrorMap } from "../validation";
 import { EditorMode } from "../state";
 import { AcqPickerContext } from "./SysRowEditor";
+import { defaultRoamingIndicator } from "../builders";
 
 export function ExtHrpdEditor({
   record,
@@ -138,10 +139,12 @@ export function ExtHrpdEditor({
 
       <RoamingIndicatorSelect
         label="ROAM_IND"
-        value={record.roamingIndicator?.raw ?? 0}
+        value={record.roamingIndicator?.raw ?? 1}
         onChange={(v) =>
           onPatch((d) => {
-            if (!d.roamingIndicator) d.roamingIndicator = { raw: 0, kind: 0 };
+            if (!d.roamingIndicator) {
+              d.roamingIndicator = defaultRoamingIndicator();
+            }
             d.roamingIndicator.raw = v;
           })
         }

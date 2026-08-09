@@ -7,6 +7,7 @@ import { ReactNode } from "react";
 import {
   DndContext,
   DragEndEvent,
+  KeyboardSensor,
   PointerSensor,
   useSensor,
   useSensors,
@@ -15,22 +16,33 @@ import {
 import {
   SortableContext,
   arrayMove,
+  sortableKeyboardCoordinates,
   verticalListSortingStrategy,
   useSortable,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 
+export interface SortableDragHandleProps {
+  listeners: ReturnType<typeof useSortable>["listeners"];
+  attributes: ReturnType<typeof useSortable>["attributes"];
+  setActivatorNodeRef: ReturnType<typeof useSortable>["setActivatorNodeRef"];
+  isDragging: boolean;
+}
+
 export function SortableList({
   ids,
   onReorder,
   children,
+  disabled = false,
 }: {
   ids: string[];
   onReorder: (from: number, to: number) => void;
   children: ReactNode;
+  disabled?: boolean;
 }) {
   const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 4 } })
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   );
 
   const handleEnd = (e: DragEndEvent) => {
@@ -44,7 +56,7 @@ export function SortableList({
 
   return (
     <DndContext
-      sensors={sensors}
+      sensors={disabled ? [] : sensors}
       collisionDetection={closestCenter}
       onDragEnd={handleEnd}
     >
@@ -58,14 +70,11 @@ export function SortableList({
 export function SortableRow({
   id,
   children,
+  disabled = false,
 }: {
   id: string;
-  children: (drag: {
-    listeners: ReturnType<typeof useSortable>["listeners"];
-    attributes: ReturnType<typeof useSortable>["attributes"];
-    setActivatorNodeRef: ReturnType<typeof useSortable>["setActivatorNodeRef"];
-    isDragging: boolean;
-  }) => ReactNode;
+  children: (drag: SortableDragHandleProps) => ReactNode;
+  disabled?: boolean;
 }) {
   const {
     attributes,
@@ -75,7 +84,7 @@ export function SortableRow({
     transform,
     transition,
     isDragging,
-  } = useSortable({ id });
+  } = useSortable({ id, disabled });
 
   return (
     <div
@@ -97,19 +106,23 @@ export function DragHandle({
   listeners,
   attributes,
   setActivatorNodeRef,
+  disabled = false,
 }: {
   listeners: ReturnType<typeof useSortable>["listeners"];
   attributes: ReturnType<typeof useSortable>["attributes"];
   setActivatorNodeRef: ReturnType<typeof useSortable>["setActivatorNodeRef"];
+  disabled?: boolean;
 }) {
   return (
     <button
       ref={setActivatorNodeRef}
       type="button"
-      className="text-dimmed hover:text-muted px-1 cursor-grab active:cursor-grabbing select-none"
-      title="Drag to reorder"
-      {...attributes}
-      {...listeners}
+      disabled={disabled}
+      className="px-1 text-dimmed cursor-grab hover:text-muted active:cursor-grabbing disabled:cursor-not-allowed disabled:opacity-30 select-none"
+      title={disabled ? "Use PRL order to drag records" : "Drag to reorder"}
+      {...(disabled ? {} : attributes)}
+      {...(disabled ? {} : listeners)}
+      onClick={(event) => event.stopPropagation()}
     >
       ⋮⋮
     </button>
