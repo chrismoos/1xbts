@@ -168,8 +168,10 @@ pub struct IpcpConfig {
     pub primary_dns: Ipv4Addr,
     /// Secondary DNS server.
     pub secondary_dns: Ipv4Addr,
-    /// Whether our IPCP Configure-Request should ask the peer to send us VJ.
-    pub request_vj: bool,
+    /// Whether the PDSN asks the mobile to compress uplink TCP/IP headers.
+    pub enable_uplink_vj_compression: bool,
+    /// Whether the PDSN accepts mobile requests to compress downlink TCP/IP headers.
+    pub enable_downlink_vj_compression: bool,
     /// Mobile IPv4 service behavior after IPCP opens without a peer address.
     pub mobile_ip: MobileIpConfig,
 }
@@ -192,7 +194,8 @@ impl Default for IpcpConfig {
             peer_ip: Ipv4Addr::new(10, 0, 0, 2),
             primary_dns: Ipv4Addr::new(10, 55, 0, 1),
             secondary_dns: Ipv4Addr::new(10, 55, 0, 1),
-            request_vj: false,
+            enable_uplink_vj_compression: false,
+            enable_downlink_vj_compression: false,
             mobile_ip: MobileIpConfig::default(),
         }
     }
@@ -225,7 +228,7 @@ pub struct IpcpSession {
 
 impl IpcpSession {
     pub fn new(config: IpcpConfig) -> Self {
-        let request_vj = config.request_vj;
+        let request_vj = config.enable_uplink_vj_compression;
         Self {
             state: IpcpState::Closed,
             config,
@@ -410,7 +413,7 @@ impl IpcpSession {
                     self.restart_ticks_remaining = 0;
                     self.consecutive_naks_sent.clear();
                     self.request_local_ip = true;
-                    self.request_vj = self.config.request_vj;
+                    self.request_vj = self.config.enable_uplink_vj_compression;
                     self.requested_vj = VjCompressionOptions::default();
                     self.peer_vj = None;
                     self.local_vj = None;
@@ -453,7 +456,9 @@ impl IpcpSession {
                             }
                         }
                         IPCP_OPT_IP_COMPRESSION => {
-                            if VjCompressionOptions::from_ipcp_data(&opt.data).is_none() {
+                            if !self.config.enable_downlink_vj_compression
+                                || VjCompressionOptions::from_ipcp_data(&opt.data).is_none()
+                            {
                                 rejects.push(opt.clone());
                             }
                         }
@@ -716,7 +721,7 @@ impl IpcpSession {
                 self.configure_failed = false;
                 self.consecutive_naks_sent.clear();
                 self.request_local_ip = true;
-                self.request_vj = self.config.request_vj;
+                self.request_vj = self.config.enable_uplink_vj_compression;
                 self.requested_vj = VjCompressionOptions::default();
                 self.peer_vj = None;
                 self.local_vj = None;
@@ -821,7 +826,7 @@ impl IpcpSession {
         self.configure_failed = false;
         self.consecutive_naks_sent.clear();
         self.request_local_ip = true;
-        self.request_vj = self.config.request_vj;
+        self.request_vj = self.config.enable_uplink_vj_compression;
         self.requested_vj = VjCompressionOptions::default();
         self.peer_vj = None;
         self.local_vj = None;
@@ -953,9 +958,16 @@ fn format_ipcp_options(data: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    fn local_vj_config() -> IpcpConfig {
+    fn uplink_vj_config() -> IpcpConfig {
         IpcpConfig {
-            request_vj: true,
+            enable_uplink_vj_compression: true,
+            ..IpcpConfig::default()
+        }
+    }
+
+    fn downlink_vj_config() -> IpcpConfig {
+        IpcpConfig {
+            enable_downlink_vj_compression: true,
             ..IpcpConfig::default()
         }
     }
@@ -1333,7 +1345,7 @@ mod tests {
 
     #[test]
     fn peer_vj_ip_compression_option_is_acked() {
-        let mut session = IpcpSession::new(IpcpConfig::default());
+        let mut session = IpcpSession::new(downlink_vj_config());
         session.start();
 
         let mobile_req_data = serialize_options(&[
@@ -1366,8 +1378,36 @@ mod tests {
     }
 
     #[test]
-    fn malformed_or_unsupported_peer_vj_option_is_rejected() {
+    fn peer_vj_ip_compression_option_is_rejected_when_disabled() {
         let mut session = IpcpSession::new(IpcpConfig::default());
+        session.start();
+
+        let vj_option = IpcpOption {
+            opt_type: IPCP_OPT_IP_COMPRESSION,
+            data: VjCompressionOptions::default().to_ipcp_data().to_vec(),
+        };
+        let mobile_req = IpcpPacket {
+            code: CONFIGURE_REQUEST,
+            identifier: 9,
+            data: serialize_options(&[
+                IpcpOption {
+                    opt_type: OPT_IP_ADDRESS,
+                    data: vec![10, 0, 0, 2],
+                },
+                vj_option.clone(),
+            ]),
+        };
+        let responses = session.receive(&mobile_req.to_ppp());
+        assert_eq!(responses.len(), 1);
+        let reject = IpcpPacket::parse(&responses[0].payload).unwrap();
+        assert_eq!(reject.code, CONFIGURE_REJECT);
+        assert_eq!(parse_options(&reject.data), vec![vj_option]);
+        assert_eq!(session.peer_vj_options(), None);
+    }
+
+    #[test]
+    fn malformed_or_unsupported_peer_vj_option_is_rejected() {
+        let mut session = IpcpSession::new(downlink_vj_config());
         session.start();
 
         for (identifier, data) in [
@@ -1414,7 +1454,7 @@ mod tests {
 
     #[test]
     fn local_vj_request_includes_vj_and_peer_reject_disables_it() {
-        let mut session = IpcpSession::new(local_vj_config());
+        let mut session = IpcpSession::new(uplink_vj_config());
         let our_req = session.start();
         let our_ipcp = IpcpPacket::parse(&our_req.payload).unwrap();
         let opts = parse_options(&our_ipcp.data);
@@ -1445,7 +1485,7 @@ mod tests {
 
     #[test]
     fn peer_nak_of_local_vj_option_is_adopted_when_supported() {
-        let mut session = IpcpSession::new(local_vj_config());
+        let mut session = IpcpSession::new(uplink_vj_config());
         let our_req = session.start();
         let our_ipcp = IpcpPacket::parse(&our_req.payload).unwrap();
         let suggested = VjCompressionOptions {
@@ -1484,7 +1524,7 @@ mod tests {
 
     #[test]
     fn configure_reject_removes_our_ip_option() {
-        let mut session = IpcpSession::new(local_vj_config());
+        let mut session = IpcpSession::new(uplink_vj_config());
         let our_req = session.start();
         let our_ipcp = IpcpPacket::parse(&our_req.payload).unwrap();
 

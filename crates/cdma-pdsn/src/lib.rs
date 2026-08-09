@@ -39,7 +39,8 @@ pub fn build_packet_service_with_sink(
             cfg.packet.gateway_ip,
             cfg.packet.primary_dns,
             cfg.packet.secondary_dns,
-            cfg.packet.enable_vj_compression_default,
+            cfg.packet.enable_uplink_vj_compression,
+            cfg.packet.enable_downlink_vj_compression,
             cfg.packet
                 .mobile_ip
                 .to_packet_config(cfg.packet.primary_dns, cfg.packet.secondary_dns)?,

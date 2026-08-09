@@ -67,7 +67,8 @@ struct SubnetIpAllocatorInner {
     /// DNS servers to include in IPCP config.
     primary_dns: Ipv4Addr,
     secondary_dns: Ipv4Addr,
-    request_vj: bool,
+    enable_uplink_vj_compression: bool,
+    enable_downlink_vj_compression: bool,
     mobile_ip: MobileIpConfig,
 }
 
@@ -79,26 +80,28 @@ impl SubnetIpAllocator {
     /// # Panics
     /// Panics if the gateway's last octet is not `1`.
     pub fn new(gateway: Ipv4Addr, primary_dns: Ipv4Addr, secondary_dns: Ipv4Addr) -> Self {
-        Self::new_with_vj_compression_default(gateway, primary_dns, secondary_dns, false)
+        Self::new_with_vj_compression(gateway, primary_dns, secondary_dns, false, false)
     }
 
-    /// Create a pool allocator and set whether local IPCP requests advertise VJ by default.
+    /// Create a pool allocator and configure VJ compression by link direction.
     ///
     /// `gateway` must end in `.1`; mobile addresses are `.2`–`.254`.
     ///
     /// # Panics
     /// Panics if the gateway's last octet is not `1`.
-    pub fn new_with_vj_compression_default(
+    pub fn new_with_vj_compression(
         gateway: Ipv4Addr,
         primary_dns: Ipv4Addr,
         secondary_dns: Ipv4Addr,
-        request_vj: bool,
+        enable_uplink_vj_compression: bool,
+        enable_downlink_vj_compression: bool,
     ) -> Self {
         Self::new_with_packet_options(
             gateway,
             primary_dns,
             secondary_dns,
-            request_vj,
+            enable_uplink_vj_compression,
+            enable_downlink_vj_compression,
             MobileIpConfig::default(),
         )
     }
@@ -113,7 +116,8 @@ impl SubnetIpAllocator {
         gateway: Ipv4Addr,
         primary_dns: Ipv4Addr,
         secondary_dns: Ipv4Addr,
-        request_vj: bool,
+        enable_uplink_vj_compression: bool,
+        enable_downlink_vj_compression: bool,
         mobile_ip: MobileIpConfig,
     ) -> Self {
         let octets = gateway.octets();
@@ -131,7 +135,8 @@ impl SubnetIpAllocator {
                 release_grace: DEFAULT_RELEASE_GRACE,
                 primary_dns,
                 secondary_dns,
-                request_vj,
+                enable_uplink_vj_compression,
+                enable_downlink_vj_compression,
                 mobile_ip,
             }),
         }
@@ -172,7 +177,8 @@ impl IpAllocator for SubnetIpAllocator {
                 peer_ip: Ipv4Addr::new(p[0], p[1], p[2], host),
                 primary_dns: inner.primary_dns,
                 secondary_dns: inner.secondary_dns,
-                request_vj: inner.request_vj,
+                enable_uplink_vj_compression: inner.enable_uplink_vj_compression,
+                enable_downlink_vj_compression: inner.enable_downlink_vj_compression,
                 mobile_ip: inner.mobile_ip.clone(),
             });
         }
@@ -197,7 +203,8 @@ impl IpAllocator for SubnetIpAllocator {
             peer_ip: Ipv4Addr::new(p[0], p[1], p[2], host),
             primary_dns: inner.primary_dns,
             secondary_dns: inner.secondary_dns,
-            request_vj: inner.request_vj,
+            enable_uplink_vj_compression: inner.enable_uplink_vj_compression,
+            enable_downlink_vj_compression: inner.enable_downlink_vj_compression,
             mobile_ip: inner.mobile_ip.clone(),
         })
     }
@@ -295,7 +302,8 @@ impl SubnetIpAllocatorInner {
             peer_ip: Ipv4Addr::new(p[0], p[1], p[2], host),
             primary_dns: self.primary_dns,
             secondary_dns: self.secondary_dns,
-            request_vj: self.request_vj,
+            enable_uplink_vj_compression: self.enable_uplink_vj_compression,
+            enable_downlink_vj_compression: self.enable_downlink_vj_compression,
             mobile_ip: self.mobile_ip.clone(),
         }
     }
@@ -358,16 +366,18 @@ mod tests {
     }
 
     #[test]
-    fn allocation_preserves_vj_request_default() {
-        let alloc = SubnetIpAllocator::new_with_vj_compression_default(
+    fn allocation_preserves_directional_vj_settings() {
+        let alloc = SubnetIpAllocator::new_with_vj_compression(
             Ipv4Addr::new(10, 55, 0, 1),
             Ipv4Addr::new(10, 55, 0, 1),
             Ipv4Addr::new(10, 55, 0, 1),
             true,
+            true,
         );
 
         let cfg = alloc.allocate("s1").unwrap();
-        assert!(cfg.request_vj);
+        assert!(cfg.enable_uplink_vj_compression);
+        assert!(cfg.enable_downlink_vj_compression);
     }
 
     #[test]

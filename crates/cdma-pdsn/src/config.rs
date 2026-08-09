@@ -263,8 +263,10 @@ pub struct PacketTransportConfig {
     pub primary_dns: Ipv4Addr,
     /// Secondary DNS server advertised to mobiles via IPCP.
     pub secondary_dns: Ipv4Addr,
-    /// Whether PDSN-originated IPCP Configure-Requests advertise VJ compression.
-    pub enable_vj_compression_default: bool,
+    /// Whether the PDSN asks mobiles to compress uplink TCP/IP headers.
+    pub enable_uplink_vj_compression: bool,
+    /// Whether the PDSN accepts mobile requests to compress downlink TCP/IP headers.
+    pub enable_downlink_vj_compression: bool,
     /// Mobile IPv4 Foreign Agent behavior after IPCP opens without a peer IP.
     pub mobile_ip: PacketMobileIpConfig,
 }
@@ -279,7 +281,8 @@ impl Default for PacketTransportConfig {
             gateway_ip: Ipv4Addr::new(10, 55, 0, 1),
             primary_dns: Ipv4Addr::new(10, 55, 0, 1),
             secondary_dns: Ipv4Addr::new(10, 55, 0, 1),
-            enable_vj_compression_default: false,
+            enable_uplink_vj_compression: false,
+            enable_downlink_vj_compression: false,
             mobile_ip: PacketMobileIpConfig::default(),
         }
     }
@@ -425,7 +428,8 @@ mod tests {
         assert_eq!(cfg.packet.gateway_ip, Ipv4Addr::new(10, 55, 0, 1));
         assert_eq!(cfg.packet.primary_dns, Ipv4Addr::new(10, 55, 0, 1));
         assert_eq!(cfg.packet.secondary_dns, Ipv4Addr::new(10, 55, 0, 1));
-        assert!(!cfg.packet.enable_vj_compression_default);
+        assert!(!cfg.packet.enable_uplink_vj_compression);
+        assert!(!cfg.packet.enable_downlink_vj_compression);
         assert!(!cfg.packet.mobile_ip.enabled);
         assert_eq!(cfg.packet.mobile_ip.registration_lifetime_secs, 1200);
         assert_eq!(

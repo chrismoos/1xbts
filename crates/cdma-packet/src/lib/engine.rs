@@ -2919,9 +2919,16 @@ mod tests {
         ]
     }
 
-    fn ipcp_config_with_local_vj() -> IpcpConfig {
+    fn ipcp_config_with_uplink_vj() -> IpcpConfig {
         IpcpConfig {
-            request_vj: true,
+            enable_uplink_vj_compression: true,
+            ..IpcpConfig::default()
+        }
+    }
+
+    fn ipcp_config_with_downlink_vj() -> IpcpConfig {
+        IpcpConfig {
+            enable_downlink_vj_compression: true,
             ..IpcpConfig::default()
         }
     }
@@ -3849,7 +3856,7 @@ mod tests {
     fn vj_uplink_tcp_packets_are_restored_and_delivered() {
         let mut session = PacketSession::new(
             u32::from(SERVICE_OPTION_PACKET_DATA),
-            ipcp_config_with_local_vj(),
+            ipcp_config_with_uplink_vj(),
         );
         let mut seq = drive_to_active_with_our_ipcp_data(&mut session, our_vj_ipcp_request_data());
 
@@ -3889,8 +3896,10 @@ mod tests {
 
     #[test]
     fn vj_downlink_tcp_packets_are_compressed_when_peer_negotiates_vj() {
-        let mut session =
-            PacketSession::new(u32::from(SERVICE_OPTION_PACKET_DATA), IpcpConfig::default());
+        let mut session = PacketSession::new(
+            u32::from(SERVICE_OPTION_PACKET_DATA),
+            ipcp_config_with_downlink_vj(),
+        );
         complete_rlp_handshake(&mut session);
         let mut seq = 0;
 
