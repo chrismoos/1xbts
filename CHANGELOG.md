@@ -1,5 +1,6 @@
 # HEAD
 
+- Fixed builds with GCC 15 and newer.
 - Added separate uplink and downlink VJ compression settings.
   Config migration: `packet.enable_vj_compression_default` -> `packet.enable_uplink_vj_compression`, `packet.enable_downlink_vj_compression`.
 - Improved PRL management interface (UI filters, running system generation, pre-save diff, and more).

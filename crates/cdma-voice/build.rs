@@ -250,6 +250,8 @@ fn main() {
         .include(&qcelp)
         .include(&csrc)
         .warnings(false)
+        // The reference source relies on pre-C23 unprototyped declarations.
+        .flag_if_supported("-std=gnu17")
         .flag_if_supported("-Wno-implicit-function-declaration")
         .flag_if_supported("-Wno-implicit-int")
         .flag_if_supported("-Wno-incompatible-pointer-types")
