@@ -1024,6 +1024,11 @@ message TrafficChannelPower {
   repeated PowerControlSample power_history = 19;
   // Forward radio configuration assigned to the traffic channel.
   uint32 forward_radio_config = 20;
+  // Mean inner-loop measurement over the most recent complete one-second
+  // absolute-PCG window. For gated RC3 this is active-PCG pilot SINR.
+  optional float measured_inner_loop_1s_db = 21;
+  // Wall-clock timestamp when measured_inner_loop_1s_db was completed.
+  optional uint64 measured_inner_loop_1s_timestamp_ms = 22;
 }
 
 // Single 500ms-windowed power control measurement for the time-series

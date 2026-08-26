@@ -26,6 +26,7 @@ use super::{generic_rake_receiver, pn_lc_correlator};
 
 const REVERSE_ACCESS_ACTIVE_FINGER_DELAY_SUPPRESSION: bool = true;
 const REVERSE_ACCESS_ACTIVE_FINGER_DELAY_SUPPRESS_SAMPLES: i32 = 0;
+const RC1_TRAFFIC_PREAMBLE_COH_NORM_MIN: f32 = 0.15;
 /// Reverse-access finger budget, fixed to the value the access capture
 /// regression suite exercises.
 const REVERSE_ACCESS_MAX_FINGERS: usize = 10;
@@ -350,24 +351,26 @@ pub fn reverse_traffic_chain(settings: ReverseTrafficSettings) -> Vec<PipelinePr
         pn_lc_correlator::PnLcConfig::default_4x()
             .with_snr_threshold(snr_threshold)
             .with_lc_half_span(4)
-            // Traffic channels are much less forgiving of a false early lock than
-            // access probes. With the shared default set to 1 hit for wide-delay
-            // access capture work, RC1 traffic WAV regressions regressed to
-            // "preamble acquired, no frames decoded". Keep traffic on the older
-            // 3-hit gate until traffic and access use separate tuned defaults.
+            // RC1's preamble measures 0.15-0.22 at valid traffic timing.
+            .with_preamble_coh_norm_min(RC1_TRAFFIC_PREAMBLE_COH_NORM_MIN)
+            // Rejects early locks that report a preamble but decode nothing.
             .with_preamble_hits_required(3)
             .with_search_interval_windows(32)
             .with_split_pn_reference(true)
             .with_reanchor_origin(settings.reanchor_origin)
             .with_suppress_search_when_locked(true)
-            // Early/prompt/late chip-timing instrumentation + active
-            // sub-chip timing slew. The slew closed loop uses the
-            // 4-chip coherent discriminator to nudge `despread_phase`
-            // by ±1 sub-sample when the finger drifts. Prints one
-            // `EPL_TRACK` log line per finger per ~1 s and one
-            // `EPL_SLEW` line per fire.
-            .with_epl_tracking(true)
-            .with_epl_slew(true),
+            // Gated transmission and FER bursts must not start a competing
+            // finger, so suppression outlasts a low-energy gap.
+            .with_retained_search_suppression(true)
+            // Gated E/P/L energy is not a stable steering reference.
+            .with_epl_tracking(false)
+            .with_epl_slew(false)
+            // Path delay steps by whole chips during a call, which a
+            // quarter-chip early/late gate cannot see.
+            .with_delay_tracking(true)
+            // RC1 has no pilot, so this keeps the prompt centered as the
+            // sample clocks drift apart.
+            .with_nonpilot_cfo_tracking(true),
         LongCodeGenerator::new_traffic_channel(settings.esn),
         Box::new(move || traffic_channel_chain(settings.esn, walsh_code, expected_preamble_frames)),
     );
@@ -461,9 +464,12 @@ pub fn reverse_traffic_chain_rc3(settings: ReverseTrafficSettings) -> Vec<Pipeli
             .with_reanchor_origin(settings.reanchor_origin)
             .with_lc_decimation(2) // HPSK: c_long = c_I + j*c_Q
             .with_suppress_search_when_locked(true)
+            // FER bursts must not start a competing finger.
+            .with_retained_search_suppression(true)
             .with_epl_pilot(settings.epl_pilot)
-            //.with_epl_slew(settings.epl_pilot),
-            .with_epl_slew(false),
+            .with_rc3_pilot_gating_mode(rev_fch_gating_mode)
+            // Without slewing, clock drift moves the despreader off the pilot.
+            .with_epl_slew(settings.epl_pilot),
         LongCodeGenerator::new_traffic_channel(settings.esn),
         Box::new(move || {
             let pilot_detector = match preamble_pcgs {
@@ -493,6 +499,8 @@ pub fn reverse_traffic_chain_rc3(settings: ReverseTrafficSettings) -> Vec<Pipeli
         Box::new(PulseMatchedFilterProcessor::new()),
         Box::new(
             generic_rake_receiver::GenericRakeReceiver::new(correlator)
+                // One decoder per bearer, so speculative fingers cannot enter
+                // FER and signaling accounting.
                 .with_max_fingers(1)
                 .with_finger_pool_size(settings.finger_pool_size)
                 .with_prune_policy(Box::new(reverse_traffic_prune_policy())),

@@ -77,9 +77,8 @@ pub struct TrafficAssignmentConfig {
     /// use the MSC voice policy's `service_connect_timeout_ms` instead.
     #[serde(default = "default_packet_service_connect_timeout_ms")]
     pub packet_service_connect_timeout_ms: u64,
-    /// Per C.S0002-E §2.1.3.12.7: when true and RC3 rate is 1500 bps,
-    /// the mobile only transmits R-FCH on PCGs {2,3,6,7,10,11,14,15}.
-    /// Sent in the ECAM as REV_FCH_GATING_MODE. Default: false (no gating).
+    /// Enable reverse-FCH gating when the assigned RC supports it and the
+    /// mobile requests it. Disabled assignments use the 800 bps FPC cadence.
     #[serde(default)]
     pub rev_fch_gating_mode: bool,
     /// Enable F-SCH for eligible SO33 RC3 packet calls. Disabled calls stay
@@ -556,6 +555,14 @@ mod tests {
         cfg.f_sch_rate_bps = 9_600;
 
         validate_traffic_assignment(&cfg).expect("disabled F-SCH ignores rate field");
+    }
+
+    #[test]
+    fn reverse_fch_gating_is_supported_with_dynamic_fpc_cadence() {
+        let mut cfg = TrafficAssignmentConfig::default();
+        cfg.rev_fch_gating_mode = true;
+
+        validate_traffic_assignment(&cfg).expect("RC3 gated FPC cadence is supported");
     }
 
     #[test]

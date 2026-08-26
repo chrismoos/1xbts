@@ -7,25 +7,21 @@
 
 use num_complex::Complex32;
 
-/// Per-observation IIR gain (steady state).
-///
-/// Fed ~100 observations/s (12288-chip windows, one per 8 PCGs = 10ms).
-/// bandwidth ≈ 0.08 × 100 / 2 ≈ 4 Hz — tracks LO drift smoothly.
-const GAIN_STEADY: f32 = 0.08;
+const ACCESS_GAIN_STEADY: f32 = 0.08;
 
-/// Warmup gain — fast convergence from acquisition estimate.
-///   bandwidth ≈ 0.40 × 100 / 2 ≈ 20 Hz
+/// ~1 Hz loop. Wider turns pilot phase noise into a carrier random walk.
+const RC3_GAIN_STEADY: f32 = 0.02;
+
 const GAIN_WARMUP: f32 = 0.40;
 
-/// Number of observations before switching from warmup to steady state.
-/// At ~100 updates/s, 20 updates ≈ 200 ms.
+/// About 25 ms at the RC3 warmup rate of one observation per PCG.
 const WARMUP_SYMBOLS: usize = 20;
 
-/// Minimum pilot power (norm_sqr of the coherent sum) to accept an
-/// observation. The accumulator receives ONLY Walsh-0 pilot sums (no
-/// traffic contamination), so even modest pilot levels produce usable
-/// phase measurements. Gate just above the noise floor.
+/// Just above the noise floor.
 const PILOT_QUALITY_GATE: f32 = 1.0;
+
+/// A bigger one-observation jump is a wrong Walsh decision, not the oscillator.
+const RC1_MAX_CFO_JUMP_HZ: f32 = 100.0;
 
 /// Diagnostic snapshot of CFO residual statistics.
 #[derive(Debug, Clone, Copy, Default)]
@@ -42,7 +38,7 @@ pub struct CfoResidualStats {
 
 /// Pilot-based reverse-link CFO tracker.
 ///
-/// Feed coherent pilot sums via [`CfoTracker::observe_pilot`], then call
+/// Provide coherent pilot sums via [`CfoTracker::observe_pilot`], then call
 /// [`CfoTracker::derotate_chips`] on each chip block before downstream
 /// channel processing.
 pub struct CfoTracker {
@@ -50,6 +46,10 @@ pub struct CfoTracker {
     cfo_rad_per_chip: f32,
     /// Accumulated derotation phase (wraps at 2π).
     cfo_phase: f32,
+
+    /// RC3 measures received phase, access measures its own correction. Opposite
+    /// derotation signs.
+    rc3_traffic: bool,
 
     /// Previous 16-chip pilot prompt sum for inter-symbol phase delta.
     prev_pilot: Option<Complex32>,
@@ -70,6 +70,7 @@ impl CfoTracker {
         Self {
             cfo_rad_per_chip: initial_cfo_rad_per_chip,
             cfo_phase: 0.0,
+            rc3_traffic: false,
             prev_pilot: None,
             total_updates,
             diag_signed_sum: 0.0,
@@ -82,7 +83,25 @@ impl CfoTracker {
 
     /// Create a tracker seeded with an RC3 reverse traffic acquisition CFO estimate.
     pub(crate) fn new_rc3_traffic(initial_cfo_rad_per_chip: f32) -> Self {
-        Self::new(initial_cfo_rad_per_chip, 0)
+        // Observations one PCG apart alias modulo 2*pi/1536. Mobiles are locked
+        // to the forward link, so take the principal alias.
+        let mut tracker = Self::new(Self::rc3_principal_alias(initial_cfo_rad_per_chip), 0);
+        tracker.rc3_traffic = true;
+        tracker
+    }
+
+    pub(crate) fn rc3_principal_alias(initial_cfo_rad_per_chip: f32) -> f32 {
+        const PCG_CHIPS: f32 = 1536.0;
+        let phase_per_pcg = initial_cfo_rad_per_chip * PCG_CHIPS;
+        let principal_phase = (phase_per_pcg + std::f32::consts::PI)
+            .rem_euclid(2.0 * std::f32::consts::PI)
+            - std::f32::consts::PI;
+        principal_phase / PCG_CHIPS
+    }
+
+    /// Drop the phase baseline. The next vector starts a new one, no CFO update.
+    pub(crate) fn clear_pilot_baseline(&mut self) {
+        self.prev_pilot = None;
     }
 
     /// Reverse access: starts in steady-state (no warmup) because the
@@ -91,6 +110,13 @@ impl CfoTracker {
     /// Fed 256-chip Walsh-aligned block sums, coherence-gated coasting.
     pub fn new_reverse_access(initial_cfo_rad_per_chip: f32) -> Self {
         Self::new(initial_cfo_rad_per_chip, WARMUP_SYMBOLS)
+    }
+
+    /// Create an RC1 traffic tracker seeded by preamble acquisition.
+    pub(crate) fn new_rc1_traffic(initial_cfo_rad_per_chip: f32) -> Self {
+        let mut tracker = Self::new(initial_cfo_rad_per_chip, WARMUP_SYMBOLS);
+        tracker.rc3_traffic = true;
+        tracker
     }
 
     /// Current CFO estimate (radians per chip).
@@ -111,18 +137,20 @@ impl CfoTracker {
     fn gain(&self) -> f32 {
         if self.in_warmup() {
             GAIN_WARMUP
+        } else if self.rc3_traffic {
+            RC3_GAIN_STEADY
         } else {
-            GAIN_STEADY
+            ACCESS_GAIN_STEADY
         }
     }
 
-    /// Feed a 16-chip Walsh-0 pilot sum.
+    /// Observe a 16-chip Walsh-0 pilot sum.
     #[cfg(test)]
     pub fn observe_pilot_symbol(&mut self, pilot_sum: Complex32) {
         self.observe_pilot(pilot_sum, 16);
     }
 
-    /// Feed a coherent pilot sum with explicit chip count.
+    /// Observe a coherent pilot sum with explicit chip count.
     pub fn observe_pilot(&mut self, pilot_sum: Complex32, n_chips: usize) {
         // Quality gate: skip if the pilot sum is too weak (noise-dominated).
         let pilot_power = pilot_sum.norm_sqr();
@@ -162,18 +190,75 @@ impl CfoTracker {
         self.prev_pilot = Some(pilot_sum);
     }
 
-    /// Apply chip-rate CFO derotation to a contiguous slice of samples.
-    ///
-    /// Each sample is multiplied by `e^{j·cfo_phase}` and the phase
-    /// accumulator advances by `cfo_rad_per_chip / oversample` per sample.
+    /// Observe summed `pilot[k] * conj(pilot[k-1])` terms `n_chips` apart. Cuts
+    /// noise without lengthening the baseline, so the CFO range is unchanged.
+    pub(crate) fn observe_pilot_cross_sum(&mut self, cross_sum: Complex32, n_chips: usize) {
+        if n_chips == 0 || cross_sum.norm_sqr() <= 1e-12 {
+            return;
+        }
+        let measured_cfo = cross_sum.im.atan2(cross_sum.re) / n_chips as f32;
+        let gain = self.gain();
+        self.cfo_rad_per_chip = (1.0 - gain) * self.cfo_rad_per_chip + gain * measured_cfo;
+        self.total_updates += 1;
+
+        let residual_hz = measured_cfo as f64 * 1_228_800.0 / (2.0 * std::f64::consts::PI);
+        let abs_res = residual_hz.abs();
+        self.diag_signed_sum += residual_hz;
+        self.diag_abs_sum += abs_res;
+        self.diag_sq_sum += residual_hz * residual_hz;
+        self.diag_max = self.diag_max.max(abs_res as f32);
+        self.diag_count += 1;
+    }
+
+    /// Observe an averaged cross-product of adjacent decision-directed RC1 Walsh
+    /// symbol vectors.
+    pub(crate) fn observe_rc1_walsh_cross_sum(&mut self, cross_sum: Complex32) -> bool {
+        const SYMBOL_CHIPS: f32 = 256.0;
+        if cross_sum.norm_sqr() <= 1e-12 {
+            return false;
+        }
+
+        let principal = cross_sum.im.atan2(cross_sum.re) / SYMBOL_CHIPS;
+        let alias_period = 2.0 * std::f32::consts::PI / SYMBOL_CHIPS;
+        let alias = ((self.cfo_rad_per_chip - principal) / alias_period).round();
+        let measured_cfo = principal + alias * alias_period;
+        let innovation_hz =
+            (measured_cfo - self.cfo_rad_per_chip) * 1_228_800.0 / (2.0 * std::f32::consts::PI);
+        if !innovation_hz.is_finite() || innovation_hz.abs() > RC1_MAX_CFO_JUMP_HZ {
+            return false;
+        }
+
+        let gain = self.gain();
+        self.cfo_rad_per_chip = (1.0 - gain) * self.cfo_rad_per_chip + gain * measured_cfo;
+        self.total_updates += 1;
+
+        let measured_hz = measured_cfo as f64 * 1_228_800.0 / (2.0 * std::f64::consts::PI);
+        let abs_hz = measured_hz.abs();
+        self.diag_signed_sum += measured_hz;
+        self.diag_abs_sum += abs_hz;
+        self.diag_sq_sum += measured_hz * measured_hz;
+        self.diag_max = self.diag_max.max(abs_hz as f32);
+        self.diag_count += 1;
+        true
+    }
+
+    /// Chip-rate CFO derotation. RC3 corrects with `e^{-j·cfo_phase}`, reverse
+    /// access with the opposite sign.
     pub fn derotate_chips(&mut self, chips: &mut [Complex32], oversample: usize) {
         let cfo_step = self.cfo_rad_per_chip / oversample.max(1) as f32;
         for chip in chips.iter_mut() {
             let (sin_p, cos_p) = self.cfo_phase.sin_cos();
-            *chip = Complex32::new(
-                chip.re * cos_p - chip.im * sin_p,
-                chip.re * sin_p + chip.im * cos_p,
-            );
+            *chip = if self.rc3_traffic {
+                Complex32::new(
+                    chip.re * cos_p + chip.im * sin_p,
+                    chip.im * cos_p - chip.re * sin_p,
+                )
+            } else {
+                Complex32::new(
+                    chip.re * cos_p - chip.im * sin_p,
+                    chip.re * sin_p + chip.im * cos_p,
+                )
+            };
             self.cfo_phase += cfo_step;
         }
         self.cfo_phase %= 2.0 * std::f32::consts::PI;
@@ -314,6 +399,57 @@ mod tests {
     }
 
     #[test]
+    fn rc3_pcg_warmup_recovers_a_bad_reacquisition_seed() {
+        let hz_to_rad_per_chip = 2.0 * std::f32::consts::PI / 1_228_800.0;
+        let true_cfo = 4.0 * hz_to_rad_per_chip;
+        let mut tracker = CfoTracker::new_rc3_traffic(-386.0 * hz_to_rad_per_chip);
+
+        // One pilot vector per PCG, as the RC3 warmup path observes it.
+        for pcg in 0..=WARMUP_SYMBOLS {
+            let phase = true_cfo * (pcg * 1536) as f32;
+            tracker.observe_pilot(Complex32::new(phase.cos(), phase.sin()) * 100.0, 1536);
+        }
+
+        let tracked_hz = tracker.cfo_rad_per_chip() / hz_to_rad_per_chip;
+        assert!(
+            (tracked_hz - 4.0).abs() < 0.1,
+            "short-baseline warmup should recover 4 Hz from a -386 Hz seed, got {tracked_hz} Hz"
+        );
+        assert!(!tracker.in_warmup());
+
+        // Steady state: eight averaged phase differences must hold the same CFO.
+        let pcg_phase = true_cfo * 1536.0;
+        let cross_sum = Complex32::new(pcg_phase.cos(), pcg_phase.sin()) * 8.0;
+        for _ in 1..100 {
+            tracker.observe_pilot_cross_sum(cross_sum, 1536);
+        }
+        let steady_hz = tracker.cfo_rad_per_chip() / hz_to_rad_per_chip;
+        assert!(
+            (steady_hz - 4.0).abs() < 0.1,
+            "eight-PCG steady loop should hold 4 Hz, got {steady_hz} Hz"
+        );
+    }
+
+    #[test]
+    fn adjacent_pcg_cross_average_does_not_alias_350_hz() {
+        let hz_to_rad_per_chip = 2.0 * std::f32::consts::PI / 1_228_800.0;
+        let true_cfo = 350.0 * hz_to_rad_per_chip;
+        let pcg_phase = true_cfo * 1536.0;
+        let one_cross = Complex32::new(pcg_phase.cos(), pcg_phase.sin());
+        let mut tracker = CfoTracker::new_rc3_traffic(0.0);
+
+        for _ in 0..100 {
+            tracker.observe_pilot_cross_sum(one_cross * 8.0, 1536);
+        }
+
+        let tracked_hz = tracker.cfo_rad_per_chip() / hz_to_rad_per_chip;
+        assert!(
+            (tracked_hz - 350.0).abs() < 0.1,
+            "adjacent-PCG averaging should retain 350 Hz, got {tracked_hz} Hz"
+        );
+    }
+
+    #[test]
     fn derotation_removes_phase_ramp() {
         let true_cfo = 500.0 * 2.0 * std::f32::consts::PI / 1_228_800.0;
         let mut tracker = CfoTracker::new(true_cfo, 0);
@@ -345,6 +481,36 @@ mod tests {
     }
 
     #[test]
+    fn observed_phase_advance_and_derotation_use_opposite_signs() {
+        let true_cfo = 275.0 * 2.0 * std::f32::consts::PI / 1_228_800.0;
+        let mut tracker = CfoTracker::new_rc3_traffic(0.0);
+        for pcg in 0..80 {
+            let phase = true_cfo * (pcg * 1536) as f32;
+            tracker.observe_pilot(Complex32::new(phase.cos(), phase.sin()) * 100.0, 1536);
+        }
+        assert!(
+            (tracker.cfo_rad_per_chip() - true_cfo).abs() < 1e-6,
+            "pilot observation must retain the received phase-advance sign"
+        );
+
+        let mut chips: Vec<Complex32> = (0..1536)
+            .map(|chip| {
+                let phase = true_cfo * chip as f32;
+                Complex32::new(phase.cos(), phase.sin())
+            })
+            .collect();
+        tracker.derotate_chips(&mut chips, 1);
+        let max_phase_error = chips
+            .iter()
+            .map(|chip| chip.im.atan2(chip.re).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_phase_error < 0.01,
+            "CFO learned from the pilot must remove the same phase ramp: {max_phase_error:.4} rad"
+        );
+    }
+
+    #[test]
     fn warmup_transitions_to_steady() {
         let mut tracker = CfoTracker::new(0.0, 0);
         assert!(tracker.in_warmup());
@@ -357,6 +523,23 @@ mod tests {
             !tracker.in_warmup(),
             "tracker should exit warmup after {} symbols",
             WARMUP_SYMBOLS
+        );
+    }
+
+    #[test]
+    fn steady_loop_rejects_implausible_single_observation_jump() {
+        let hz_to_rad_per_chip = 2.0 * std::f32::consts::PI / 1_228_800.0;
+        let mut tracker = CfoTracker::new_rc3_traffic(5.0 * hz_to_rad_per_chip);
+        tracker.total_updates = WARMUP_SYMBOLS;
+
+        // A noise-dominated weak pilot can throw a single +100 Hz observation.
+        // It must not move the estimate.
+        let noisy_cross = Complex32::from_polar(1.0, 100.0 * hz_to_rad_per_chip * 1536.0);
+        tracker.observe_pilot_cross_sum(noisy_cross, 1536);
+        let resulting_hz = tracker.cfo_rad_per_chip() / hz_to_rad_per_chip;
+        assert!(
+            resulting_hz <= 7.0,
+            "steady tracker followed a nonphysical phase jump: {resulting_hz:.2} Hz"
         );
     }
 

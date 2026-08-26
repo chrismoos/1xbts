@@ -167,7 +167,7 @@ export function parseMNotificationInd(bytes: Uint8Array): ParsedNotification | n
   if (bytes.length === 0) return null;
   const inner = stripWspPush(stripWdpFraming(bytes));
 
-  let result: ParsedNotification = {};
+  const result: ParsedNotification = {};
   const r = new Reader(inner);
 
   // MMS PDUs start with header sequence; X-Mms-Message-Type comes

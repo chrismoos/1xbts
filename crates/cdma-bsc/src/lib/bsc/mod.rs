@@ -84,6 +84,9 @@ pub(crate) use voice::{
     PendingAssignmentFailure, VoiceAlertMode, VoiceLegRole, VoiceService, VoiceSessionKind,
 };
 
+/// A.S0014 Clear Request cause for a page that could not be completed.
+pub(crate) const A1_CLEAR_CAUSE_PAGING_RESPONSE_NOT_RECEIVED: u8 = 0x6E;
+
 /// Re-export the generated `bsc.v1` protobuf API at the path tonic-build uses
 /// for cross-package references from the management protos.
 pub mod v1 {
@@ -94,7 +97,11 @@ pub use cdma_bts::bts::build_scheduled_message;
 pub use cdma_common::overhead::OverheadParameters;
 
 pub(crate) const DEFAULT_TRAFFIC_ACK_SEQ: u8 = 0b111;
+/// Shared code for forward and reverse acknowledgment orders.
+pub(crate) const ACKNOWLEDGMENT_ORDER_CODE: u8 = 0b010000;
 pub(crate) const RELEASE_ORDER_CODE: u8 = 0b010101;
+/// Release Order qualifier for a rejected requested service option.
+pub(crate) const RELEASE_ORDER_SERVICE_OPTION_REJECTED_QUALIFIER: u8 = 0b00000010;
 pub(crate) const TRAFFIC_MSG_SEQ_MASK: u8 = 0b111;
 
 // build_scheduled_message is now in cdma-bts/src/lib/bts/settings.rs

@@ -137,6 +137,8 @@ pub struct PnLcCorrelator {
 
     /// Active finger ids and their detected delays (for deduplication).
     active_fingers: Vec<ActiveFingerState>,
+    /// Set when the sample-to-chip origin moved under surviving fingers.
+    timing_reanchored: bool,
     pending_candidates: Vec<PendingCandidate>,
     next_finger_id: u64,
 
@@ -266,6 +268,7 @@ impl PnLcCorrelator {
             window_counter: 0,
             absolute_origin_sample: None,
             active_fingers: Vec::new(),
+            timing_reanchored: false,
             pending_candidates: Vec::new(),
             next_finger_id: 1,
             sample_rate_hz: 0.0,
@@ -973,27 +976,34 @@ impl PnLcCorrelator {
         let suppress = self.cfg.active_finger_delay_suppress_samples;
         self.active_fingers.iter().any(|f| {
             let delta = (f.delay_samples - delay_samples).abs();
-            delta == 0 || (!f.hard_validated && delta <= suppress)
+            let overlaps = delta == 0 || (!f.hard_validated && delta <= suppress);
+            overlaps && !self.active_finger_allows_reacquisition(f)
         })
     }
 
+    fn active_finger_allows_reacquisition(&self, finger: &ActiveFingerState) -> bool {
+        finger.idle_chips >= self.reacquire_idle_chips
+            || finger.signal_lost_chips >= self.reacquire_signal_lost_chips
+            || (finger.hard_validated && finger.crc_miss_count >= self.reacquire_crc_miss_count)
+    }
+
     fn can_reacquire_over_active(&self, delay_samples: i32) -> bool {
+        if self.cfg.retain_search_suppression_after_validation
+            && self
+                .active_fingers
+                .iter()
+                .any(|finger| finger.hard_validated)
+        {
+            return false;
+        }
         let overlapping_active = self.overlapping_active_fingers(delay_samples);
         if overlapping_active.is_empty() {
             return true;
         }
 
-        let reacquire_signal_lost_chips = self.reacquire_signal_lost_chips;
-        let reacquire_crc_miss_count = self.reacquire_crc_miss_count;
-        let reacquire_idle_chips = self.reacquire_idle_chips;
-        overlapping_active.iter().all(|f| {
-            // Allow reacquisition if the finger is idle long enough, regardless
-            // of validation status.  Unvalidated fingers that never decoded
-            // should not block subsequent bursts at the same delay.
-            f.idle_chips >= reacquire_idle_chips
-                || f.signal_lost_chips >= reacquire_signal_lost_chips
-                || (f.hard_validated && f.crc_miss_count >= reacquire_crc_miss_count)
-        })
+        overlapping_active
+            .iter()
+            .all(|finger| self.active_finger_allows_reacquisition(finger))
     }
 
     fn upsert_candidate(&mut self, delay_samples: i32, lc_phase_hint: i32, snr: f32) {
@@ -1077,7 +1087,9 @@ impl PnLcCorrelator {
 
         for mut cand in pending {
             let aligned_delay = cand.delay_samples;
-            if !self.can_reacquire_over_active(aligned_delay) {
+            if !self.can_reacquire_over_active(aligned_delay)
+                || self.has_overlapping_active_finger(aligned_delay)
+            {
                 keep.push(cand);
                 continue;
             }
@@ -1267,6 +1279,21 @@ impl PnLcCorrelator {
                     est_cfo,
                     cand.preamble_hits
                 );
+            } else {
+                trace!(
+                    "PnLcCorrelator: candidate verification miss id={} delay={} lc_phase={} timing_mu={:+.3} ratio={:.2}/{:.2} coh={:.3}/{:.3} nc_coh={:.3} cfo={:.6} attempt={}",
+                    cand.id,
+                    aligned_delay,
+                    best_phase,
+                    timing_mu,
+                    ratio,
+                    self.cfg.lc_best_over_second_min,
+                    coh_norm,
+                    self.cfg.preamble_coh_norm_min,
+                    nc_coh_norm,
+                    est_cfo,
+                    cand.attempts,
+                );
             }
 
             if cand.preamble_hits >= self.cfg.preamble_hits_required {
@@ -1337,14 +1364,6 @@ impl PnLcCorrelator {
                 let timing_total = timing_offsets.len();
 
                 for (timing_idx, timing_mu_samples) in timing_offsets.into_iter().enumerate() {
-                    if self.has_overlapping_active_finger(aligned_delay) {
-                        trace!(
-                            "PnLcCorrelator: suppressing finger spawn at delay={} within active-finger threshold={}",
-                            aligned_delay, self.cfg.active_finger_delay_suppress_samples
-                        );
-                        continue;
-                    }
-
                     let finger_id = if timing_idx == 0 {
                         cand.id
                     } else {
@@ -1422,6 +1441,8 @@ impl PnLcCorrelator {
                         self.cfg.gardner_timing,
                     );
                     finger.set_nonpilot_cfo_tracking(self.cfg.nonpilot_cfo_tracking);
+                    finger.set_delay_tracking_enabled(self.cfg.delay_tracking);
+                    finger.set_rc3_pilot_gating_mode(self.cfg.rc3_pilot_gating_mode);
                     // Seed HPSK state: need LC(tx_chip - 1) for the Q delay.
                     // The despread loop calls `advance_lc_for_new_chip` at
                     // the start of every chip iter (including the first),
@@ -1906,6 +1927,10 @@ impl PnLcCorrelator {
 // ---------------------------------------------------------------------------
 
 impl Correlator for PnLcCorrelator {
+    fn take_timing_reanchored(&mut self) -> bool {
+        std::mem::take(&mut self.timing_reanchored)
+    }
+
     type Finger = PnLcFinger;
 
     fn correlate(
@@ -1961,6 +1986,8 @@ impl Correlator for PnLcCorrelator {
                             self.absolute_origin_sample = Some(new_origin);
                         } else if delta.abs() > 4 {
                             self.absolute_origin_sample = Some(new_origin);
+                            // Surviving fingers now hold a stale origin.
+                            self.timing_reanchored = true;
                         }
                     } else {
                         self.absolute_origin_sample = Some(new_origin);
@@ -2018,6 +2045,12 @@ impl Correlator for PnLcCorrelator {
         detections
     }
 
+    fn advance_suppressed(&mut self, block: &SampleBlock) {
+        debug_assert!(self.search_suppressed());
+        let detections = self.correlate(block);
+        debug_assert!(detections.is_empty());
+    }
+
     fn notify_hard_validated(&mut self, finger_id: u64) {
         if let Some(active) = self.active_fingers.iter_mut().find(|f| f.id == finger_id) {
             active.hard_validated = true;
@@ -2028,7 +2061,9 @@ impl Correlator for PnLcCorrelator {
     fn search_suppressed(&self) -> bool {
         self.cfg.suppress_search_when_locked
             && self.active_fingers.iter().any(|finger| {
-                finger.hard_validated && finger.signal_lost_chips < self.reacquire_signal_lost_chips
+                finger.hard_validated
+                    && (self.cfg.retain_search_suppression_after_validation
+                        || finger.signal_lost_chips < self.reacquire_signal_lost_chips)
             })
     }
 
@@ -2102,6 +2137,7 @@ mod tests {
 
     use super::{ActiveFingerState, PendingCandidate, PnLcConfig, PnLcCorrelator, PnLcFinger};
     use crate::phy::coding::long_code::LongCodeGenerator;
+    use crate::receiver::pipelined::gardner_timing_recovery::GardnerTimingConfig;
     use crate::receiver::pipelined::generic_rake_receiver::{Correlator, RakeFinger};
     use crate::receiver::pipelined::{
         PipelineProcessorShared, SampleBlock, build_fft_search_pn_samples,
@@ -2832,6 +2868,36 @@ mod tests {
     }
 
     #[test]
+    fn stale_unvalidated_finger_allows_same_delay_replacement() {
+        let cfg = PnLcConfig::default_4x().with_active_finger_delay_suppression(true, 0);
+        let lc = LongCodeGenerator::new_access_channel_with_state(0, 0, 0, 0, 1u64 << 41);
+        let mut correlator = PnLcCorrelator::new(cfg, lc, noop_chain_builder());
+        correlator.active_fingers.push(ActiveFingerState {
+            id: 1,
+            delay_samples: 654,
+            hard_validated: false,
+            idle_chips: correlator.reacquire_idle_chips,
+            signal_lost_chips: 0,
+            crc_miss_count: 0,
+            post_walsh_no_event_ms: 0,
+        });
+
+        assert!(correlator.can_reacquire_over_active(654));
+        assert!(!correlator.has_overlapping_active_finger(654));
+
+        correlator.active_fingers.push(ActiveFingerState {
+            id: 2,
+            delay_samples: 654,
+            hard_validated: false,
+            idle_chips: 0,
+            signal_lost_chips: 0,
+            crc_miss_count: 0,
+            post_walsh_no_event_ms: 0,
+        });
+        assert!(correlator.has_overlapping_active_finger(654));
+    }
+
+    #[test]
     fn validated_finger_signal_loss_resumes_suppressed_search() {
         let cfg = PnLcConfig::default_4x().with_suppress_search_when_locked(true);
         let lc = LongCodeGenerator::new_access_channel_with_state(0, 0, 0, 0, 1u64 << 41);
@@ -2852,6 +2918,27 @@ mod tests {
 
         assert!(!correlator.search_suppressed());
         assert!(correlator.can_reacquire_over_active(654));
+    }
+
+    #[test]
+    fn rc3_retained_lock_does_not_reacquire_after_signal_loss_counter() {
+        let cfg = PnLcConfig::default_4x()
+            .with_suppress_search_when_locked(true)
+            .with_retained_search_suppression(true);
+        let lc = LongCodeGenerator::new_traffic_channel(0x1234_5678);
+        let mut correlator = PnLcCorrelator::new(cfg, lc, noop_chain_builder());
+        correlator.active_fingers.push(ActiveFingerState {
+            id: 1,
+            delay_samples: 654,
+            hard_validated: true,
+            idle_chips: 0,
+            signal_lost_chips: correlator.reacquire_signal_lost_chips,
+            crc_miss_count: 0,
+            post_walsh_no_event_ms: 0,
+        });
+
+        assert!(correlator.search_suppressed());
+        assert!(!correlator.can_reacquire_over_active(654));
     }
 
     #[test]
@@ -2901,6 +2988,64 @@ mod tests {
         assert_eq!(correlator.buffer.len(), 40);
         assert_eq!(correlator.recent_samples.len(), 24);
         assert_eq!(correlator.pending_candidates.len(), 1);
+        assert_eq!(correlator.active_fingers.len(), 1);
+    }
+
+    #[test]
+    fn suppressed_search_keeps_absolute_stream_time_current() {
+        let mut cfg = PnLcConfig::default_4x().with_suppress_search_when_locked(true);
+        cfg.reanchor_origin = true;
+        let window_len = cfg.coherent_chips * cfg.oversample;
+        let lc = LongCodeGenerator::new_traffic_channel(0x1234_5678);
+        let mut correlator = PnLcCorrelator::new(cfg, lc, noop_chain_builder());
+        let absolute_origin = 1_000usize;
+
+        let mut first = SampleBlock::new(vec![Complex32::new(0.0, 0.0); window_len], 0)
+            .with_sample_rate_hz(4.0 * 1_228_800.0);
+        first
+            .tags
+            .insert("absolute_sample_start", absolute_origin as i64);
+        assert!(correlator.correlate(&first).is_empty());
+
+        correlator.active_fingers.push(ActiveFingerState {
+            id: 9,
+            delay_samples: 8,
+            hard_validated: true,
+            idle_chips: 0,
+            signal_lost_chips: 0,
+            crc_miss_count: 0,
+            post_walsh_no_event_ms: 0,
+        });
+        assert!(correlator.search_suppressed());
+
+        for block_index in 1..=3 {
+            let mut block = SampleBlock::new(
+                vec![Complex32::new(0.0, 0.0); window_len],
+                block_index * window_len,
+            )
+            .with_sample_rate_hz(4.0 * 1_228_800.0);
+            block.tags.insert(
+                "absolute_sample_start",
+                (absolute_origin + block_index * window_len) as i64,
+            );
+            correlator.advance_suppressed(&block);
+        }
+
+        assert_eq!(correlator.absolute_origin_sample, Some(absolute_origin));
+        assert_eq!(correlator.samples_consumed, 4 * window_len);
+        assert_eq!(correlator.active_fingers.len(), 1);
+
+        correlator.active_fingers[0].signal_lost_chips = correlator.reacquire_signal_lost_chips;
+        assert!(!correlator.search_suppressed());
+        let mut resumed =
+            SampleBlock::new(vec![Complex32::new(0.0, 0.0); window_len], 4 * window_len)
+                .with_sample_rate_hz(4.0 * 1_228_800.0);
+        resumed.tags.insert(
+            "absolute_sample_start",
+            (absolute_origin + 4 * window_len) as i64,
+        );
+        assert!(correlator.correlate(&resumed).is_empty());
+        assert_eq!(correlator.absolute_origin_sample, Some(absolute_origin));
         assert_eq!(correlator.active_fingers.len(), 1);
     }
 
@@ -3786,6 +3931,10 @@ mod tests {
         cfg.composite_filter_delay = composite_delay;
         cfg.snr_threshold = 20.0; // high threshold — only the real signal should pass
         cfg.search_interval_windows = 1; // search every window
+        cfg = cfg
+            .with_finger_timing_adaptive_search(0.5, 0.5)
+            .with_active_finger_delay_suppression(true, 0)
+            .with_gardner_timing(GardnerTimingConfig::reverse_access_4x());
         let max_replay_chips = cfg.replay_preamble_symbols * cfg.chip_block_size + 2; // small margin
 
         let mut correlator = PnLcCorrelator::new(cfg, lc_template, noop_chain_builder());
@@ -3796,6 +3945,7 @@ mod tests {
         // Feed in blocks of 2048 samples
         let block_size = 2048usize;
         let mut all_detections = Vec::new();
+        let mut first_detection_count = None;
 
         for (i, chunk) in rx_signal.chunks(block_size).enumerate() {
             let mut block = SampleBlock::new(chunk.to_vec(), i * block_size)
@@ -3806,6 +3956,9 @@ mod tests {
                     .insert("absolute_sample_start", abs_sample_start as i64);
             }
             let detections = correlator.correlate(&block);
+            if !detections.is_empty() && first_detection_count.is_none() {
+                first_detection_count = Some(detections.len());
+            }
             for (finger, _chain) in &detections {
                 eprintln!(
                     "  detection: finger id={} despread_phase={} next_prompt_offset={} \
@@ -3825,6 +3978,7 @@ mod tests {
             !all_detections.is_empty(),
             "correlator should detect the pulse-shaped signal"
         );
+        assert_eq!(first_detection_count, Some(2));
 
         // Verify the detected finger was found at lc_phase ≈ 0.
         // chain_start_chip = tx_chip (the absolute LC chip at finger start).

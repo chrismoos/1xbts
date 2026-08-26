@@ -1,5 +1,9 @@
 use parking_lot::Mutex;
 use std::collections::VecDeque;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+};
 
 pub(crate) use cdma_common::crc::crc16_sch as crc16;
 use cdma_common::crc::{crc6, crc8, crc12};
@@ -15,8 +19,8 @@ use crate::{
     },
 };
 
-use super::{Channel, PcgPcbSchedulerHandle};
-use cdma_common::consts::SR1_PCGS_PER_FRAME;
+use super::Channel;
+use cdma_common::consts::{RC3_GATED_REV_PWR_CNTL_DELAY, SR1_PCGS_PER_FRAME};
 
 /// Forward traffic channel frame for RC3.
 /// Re-uses TrafficRate from ftch (same rate set, different encoding).
@@ -50,6 +54,125 @@ const PC_PUNCTURE_SYMBOLS: usize = 4;
 const LC_DECIMATION: usize = 32;
 const LONG_CODE_PERIOD: u64 = (1u64 << 42) - 1;
 const PCG_CHIPS: usize = SYMBOLS_PER_PCG * LC_DECIMATION;
+const RC3_PCB_TIMELINE_SLOTS: usize = 64;
+const EMPTY_ABS_PCG: u64 = u64::MAX;
+const NO_EMITTED_PCG: u64 = 0;
+
+pub type Rc3PcgPcbSchedulerHandle = Arc<Rc3PcgPcbScheduler>;
+
+#[derive(Debug)]
+struct Rc3PcgPcbTimelineSlot {
+    abs_pcg: AtomicU64,
+    bit: AtomicU8,
+}
+
+impl Rc3PcgPcbTimelineSlot {
+    fn new() -> Self {
+        Self {
+            abs_pcg: AtomicU64::new(EMPTY_ABS_PCG),
+            bit: AtomicU8::new(0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Rc3PcgPcbSchedulerSnapshot {
+    pub published: u64,
+    pub scheduled_emits: u64,
+    pub fallback_emits: u64,
+    pub late_schedules: u64,
+    pub last_emitted_abs_pcg: Option<u64>,
+}
+
+/// Fixed future-PCG timeline shared by RX and TX without putting a shared
+/// mutex in the TX synthesis path.
+#[derive(Debug)]
+pub struct Rc3PcgPcbScheduler {
+    slots: [Rc3PcgPcbTimelineSlot; RC3_PCB_TIMELINE_SLOTS],
+    rev_pwr_cntl_delay: u8,
+    last_emitted_abs_pcg_plus_one: AtomicU64,
+    published: AtomicU64,
+    scheduled_emits: AtomicU64,
+    fallback_emits: AtomicU64,
+    late_schedules: AtomicU64,
+}
+
+impl Rc3PcgPcbScheduler {
+    pub fn new(rev_pwr_cntl_delay: u8) -> Rc3PcgPcbSchedulerHandle {
+        Arc::new(Self {
+            slots: std::array::from_fn(|_| Rc3PcgPcbTimelineSlot::new()),
+            rev_pwr_cntl_delay,
+            last_emitted_abs_pcg_plus_one: AtomicU64::new(NO_EMITTED_PCG),
+            published: AtomicU64::new(0),
+            scheduled_emits: AtomicU64::new(0),
+            fallback_emits: AtomicU64::new(0),
+            late_schedules: AtomicU64::new(0),
+        })
+    }
+
+    pub fn schedule(&self, abs_pcg: u64, bit: u8) -> bool {
+        let last_emitted_plus_one = self.last_emitted_abs_pcg_plus_one.load(Ordering::Acquire);
+        if last_emitted_plus_one != NO_EMITTED_PCG && abs_pcg < last_emitted_plus_one {
+            self.late_schedules.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+
+        let slot_index = (abs_pcg % RC3_PCB_TIMELINE_SLOTS as u64) as usize;
+        let slot = &self.slots[slot_index];
+        slot.bit.store(bit & 1, Ordering::Relaxed);
+        slot.abs_pcg.store(abs_pcg, Ordering::Release);
+        self.published.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    fn read(&self, abs_pcg: u64) -> u8 {
+        self.last_emitted_abs_pcg_plus_one
+            .fetch_max(abs_pcg.saturating_add(1), Ordering::Release);
+        let slot_index = (abs_pcg % RC3_PCB_TIMELINE_SLOTS as u64) as usize;
+        let slot = &self.slots[slot_index];
+        if slot.abs_pcg.load(Ordering::Acquire) == abs_pcg {
+            self.scheduled_emits.fetch_add(1, Ordering::Relaxed);
+            slot.bit.load(Ordering::Relaxed) & 1
+        } else {
+            self.fallback_emits.fetch_add(1, Ordering::Relaxed);
+            gated_power_control_slot_ordinal(abs_pcg, self.rev_pwr_cntl_delay)
+                .map(|ordinal| ordinal as u8 & 1)
+                .unwrap_or(abs_pcg as u8 & 1)
+        }
+    }
+
+    pub fn snapshot(&self) -> Rc3PcgPcbSchedulerSnapshot {
+        let last_emitted_plus_one = self.last_emitted_abs_pcg_plus_one.load(Ordering::Acquire);
+        Rc3PcgPcbSchedulerSnapshot {
+            published: self.published.load(Ordering::Relaxed),
+            scheduled_emits: self.scheduled_emits.load(Ordering::Relaxed),
+            fallback_emits: self.fallback_emits.load(Ordering::Relaxed),
+            late_schedules: self.late_schedules.load(Ordering::Relaxed),
+            last_emitted_abs_pcg: (last_emitted_plus_one != NO_EMITTED_PCG)
+                .then(|| last_emitted_plus_one - 1),
+        }
+    }
+}
+
+pub(crate) fn gated_power_control_slot_is_valid(abs_pcg: u64, rev_pwr_cntl_delay: u8) -> bool {
+    let feedback_offset = (u64::from(rev_pwr_cntl_delay) + 2) % 4;
+    let source_phase = (abs_pcg % 4 + 4 - feedback_offset) % 4;
+    source_phase >= 2
+}
+
+pub(crate) fn gated_power_control_slot_ordinal(
+    abs_pcg: u64,
+    rev_pwr_cntl_delay: u8,
+) -> Option<u64> {
+    if !gated_power_control_slot_is_valid(abs_pcg, rev_pwr_cntl_delay) {
+        return None;
+    }
+    let phase = abs_pcg % 4;
+    let valid_phases_before = (0..phase)
+        .filter(|candidate| gated_power_control_slot_is_valid(*candidate, rev_pwr_cntl_delay))
+        .count() as u64;
+    Some(abs_pcg / 4 * 2 + valid_phases_before)
+}
 
 struct PreparedFrameRc3 {
     interleaved: Vec<u8>,
@@ -99,7 +222,11 @@ pub struct ConfigRc3 {
     /// the puncture position.
     pub puncture_lc: LongCodeGenerator,
     pub lc_chip_cursor: u64,
-    pub pcb_scheduler: PcgPcbSchedulerHandle,
+    /// Power-control puncture position selected by the final decimated
+    /// long-code bits of the preceding PCG. Figure 3.1.3.1.12-3 places the
+    /// selector bits immediately before the current PCG boundary.
+    pub previous_pcg_pc_start: usize,
+    pub pcb_scheduler: Rc3PcgPcbSchedulerHandle,
     /// FPC subchannel gain as a linear amplitude ratio relative to data
     /// symbols. Per C.S0005-E, FPC_SUBCHAN_GAIN is in units of 0.25 dB
     /// relative to full-rate F-FCH. E.g. value 12 → 3.0 dB → 1.413×.
@@ -144,7 +271,11 @@ pub struct ForwardTrafficChannelRc3 {
     last_enqueue_at: Mutex<Option<std::time::Instant>>,
     /// Power-control bit scheduler. Stored outside `config` so
     /// `schedule_power_control_bit` never contends with `next_block`.
-    pcb_scheduler: PcgPcbSchedulerHandle,
+    pcb_scheduler: Rc3PcgPcbSchedulerHandle,
+    /// Whether the assigned mobile uses eighth-rate R-FCH gating.
+    /// REV_PWR_CNTL_DELAY=3 places the valid forward FPC slots in PCGs
+    /// 0,3,4,7,8,11,12,15 of each frame.
+    rev_fch_gating_mode: AtomicBool,
 }
 
 struct QueueDiagState {
@@ -261,6 +392,7 @@ impl ForwardTrafficChannelRc3 {
             }),
             last_enqueue_at: Mutex::new(None),
             pcb_scheduler,
+            rev_fch_gating_mode: AtomicBool::new(false),
         }
     }
 
@@ -345,14 +477,43 @@ impl ForwardTrafficChannelRc3 {
 
     /// Schedule a single power-control bit for an absolute PCG index.
     /// Uses the struct-level `pcb_scheduler` — never touches `config`.
-    pub fn schedule_power_control_bit(&self, abs_pcg: u64, bit: u8) {
-        self.pcb_scheduler.lock().schedule(abs_pcg, bit);
+    pub fn schedule_power_control_bit(&self, abs_pcg: u64, bit: u8) -> bool {
+        self.pcb_scheduler.schedule(abs_pcg, bit)
+    }
+
+    pub fn set_rev_fch_gating_mode(&self, enabled: bool) {
+        self.rev_fch_gating_mode.store(enabled, Ordering::Release);
+    }
+
+    pub fn rev_fch_gating_mode(&self) -> bool {
+        self.rev_fch_gating_mode.load(Ordering::Acquire)
+    }
+
+    /// C.S0002-E §§2.1.2.3.2 and 3.1.3.1.12: eighth-rate R-FCH gating is
+    /// "gating other than Reverse Pilot Channel gating." The advertised
+    /// delay shifts the valid FPC slots relative to gated-on reverse PCGs.
+    pub fn power_control_slot_is_valid(&self, abs_pcg: u64) -> bool {
+        !self.rev_fch_gating_mode()
+            || gated_power_control_slot_is_valid(abs_pcg, RC3_GATED_REV_PWR_CNTL_DELAY)
+    }
+
+    pub fn power_control_slot_ordinal(&self, abs_pcg: u64) -> Option<u64> {
+        if self.rev_fch_gating_mode() {
+            gated_power_control_slot_ordinal(abs_pcg, RC3_GATED_REV_PWR_CNTL_DELAY)
+        } else {
+            Some(abs_pcg)
+        }
     }
 
     pub fn schedule_power_control_burst(&self, start_abs_pcg: u64, pcgs: u64, bit: u8) {
-        self.pcb_scheduler
-            .lock()
-            .schedule_burst(start_abs_pcg, pcgs, bit);
+        for offset in 0..pcgs {
+            self.pcb_scheduler
+                .schedule(start_abs_pcg.saturating_add(offset), bit);
+        }
+    }
+
+    pub fn power_control_scheduler_snapshot(&self) -> Rc3PcgPcbSchedulerSnapshot {
+        self.pcb_scheduler.snapshot()
     }
 
     /// Seed both long-code generators for this channel at the given CDMA
@@ -375,10 +536,39 @@ impl ForwardTrafficChannelRc3 {
         probe.advance_chips(probe_delta as usize);
         config.prev_frame_last_chip = probe.next_chip();
 
+        // The current PCG's puncture position is selected by the last four
+        // decimator outputs from the preceding PCG (C.S0002-E Figure
+        // 3.1.3.1.12-3), not by bits from the PCG being punctured. Seed that
+        // carry when a newly-created channel joins the live absolute-chip
+        // timeline.
+        if chip >= PCG_CHIPS as u64 {
+            let previous_pcg_delta = chip
+                .saturating_sub(PCG_CHIPS as u64)
+                .saturating_sub(config.lc_chip_cursor);
+            let mut previous_pcg_lc = config.puncture_lc.clone();
+            previous_pcg_lc.advance_chips(previous_pcg_delta as usize);
+            config.previous_pcg_pc_start = Self::pc_start_from_pcg_lc(&mut previous_pcg_lc);
+        }
+
         let delta = chip.saturating_sub(config.lc_chip_cursor);
         config.scrambling_lc.advance_chips(delta as usize);
         config.puncture_lc.advance_chips(delta as usize);
         config.lc_chip_cursor = chip;
+    }
+
+    fn pc_start_from_pcg_lc(long_code_generator: &mut LongCodeGenerator) -> usize {
+        let mut pcg_bits = [0u8; SYMBOLS_PER_PCG];
+        for bit in &mut pcg_bits {
+            *bit = long_code_generator.next_chip();
+            for _ in 0..(LC_DECIMATION - 1) {
+                long_code_generator.next_chip();
+            }
+        }
+        let b3 = pcg_bits[47] as usize;
+        let b2 = pcg_bits[46] as usize;
+        let b1 = pcg_bits[45] as usize;
+        let b0 = pcg_bits[44] as usize;
+        ((b3 << 3) | (b2 << 2) | (b1 << 1) | b0) * 2
     }
 
     fn pop_next_frame(&self) -> Option<PreparedFrameRc3> {
@@ -500,20 +690,18 @@ impl ForwardTrafficChannelRc3 {
         let end = start + SYMBOLS_PER_PCG;
 
         let abs_pcg = config.lc_chip_cursor / PCG_CHIPS as u64;
-        let pcb = self.pcb_scheduler.lock().read(abs_pcg);
+        // In Reverse FCH gating mode the forward power-control subchannel
+        // does not exist in the invalid PCGs. Merely leaving those PCGs
+        // unscheduled is insufficient: the scheduler fallback is still a
+        // logical PCB and puncturing it into F-FCH would put an unintended
+        // command on the air. Keep the underlying scrambled F-FCH symbols
+        // intact when this PCG is outside the gated subchannel cadence.
+        let pcb = self
+            .power_control_slot_is_valid(abs_pcg)
+            .then(|| self.pcb_scheduler.read(abs_pcg));
 
-        let mut pcg_bits = [0u8; SYMBOLS_PER_PCG];
-        for bit in pcg_bits.iter_mut() {
-            *bit = config.puncture_lc.next_chip();
-            for _ in 0..(LC_DECIMATION - 1) {
-                config.puncture_lc.next_chip();
-            }
-        }
-        let b3 = pcg_bits[47] as usize;
-        let b2 = pcg_bits[46] as usize;
-        let b1 = pcg_bits[45] as usize;
-        let b0 = pcg_bits[44] as usize;
-        let pc_start = ((b3 << 3) | (b2 << 2) | (b1 << 1) | b0) * 2;
+        let current_pc_start = Self::pc_start_from_pcg_lc(&mut config.puncture_lc);
+        let pc_start = config.previous_pcg_pc_start;
 
         let mut previous_chip = config.prev_frame_last_chip;
         let mut mapped = [0.0f32; SYMBOLS_PER_PCG];
@@ -534,10 +722,11 @@ impl ForwardTrafficChannelRc3 {
                 } else {
                     pair[lane] ^ lc_scr
                 };
-                let is_pc =
-                    symbol_in_pcg >= pc_start && symbol_in_pcg < pc_start + PC_PUNCTURE_SYMBOLS;
+                let is_pc = pcb.is_some()
+                    && symbol_in_pcg >= pc_start
+                    && symbol_in_pcg < pc_start + PC_PUNCTURE_SYMBOLS;
                 mapped[symbol_in_pcg] = if is_pc {
-                    let sign = if pcb == 0 { 1.0f32 } else { -1.0f32 };
+                    let sign = if pcb == Some(0) { 1.0f32 } else { -1.0f32 };
                     sign * config.fpc_subchan_gain_linear
                 } else if scrambled == 0 {
                     1.0f32
@@ -555,6 +744,7 @@ impl ForwardTrafficChannelRc3 {
 
         config.prev_frame_last_chip = previous_chip;
         config.lc_chip_cursor = config.lc_chip_cursor.saturating_add(PCG_CHIPS as u64);
+        config.previous_pcg_pc_start = current_pc_start;
         prepared.next_pcg += 1;
         if prepared.next_pcg == SR1_PCGS_PER_FRAME {
             trace!(
@@ -616,11 +806,135 @@ mod tests {
             scrambling_lc: LongCodeGenerator::new_traffic_channel(0xDEADBEEF),
             puncture_lc: LongCodeGenerator::new_traffic_channel(0xDEADBEEF),
             lc_chip_cursor: 0,
-            pcb_scheduler: crate::channels::PcgPcbScheduler::new(0),
+            previous_pcg_pc_start: 0,
+            pcb_scheduler: Rc3PcgPcbScheduler::new(RC3_GATED_REV_PWR_CNTL_DELAY),
             fpc_subchan_gain_linear: 1.0,
             prev_frame_last_chip: 0,
             disable_lc_scrambling: false,
         })
+    }
+
+    #[test]
+    fn gated_fpc_subchannel_uses_advertised_delay() {
+        let ch = make_channel();
+        assert!((0..16).all(|pcg| ch.power_control_slot_is_valid(pcg)));
+
+        ch.set_rev_fch_gating_mode(true);
+        for pcg in 0..16 {
+            assert_eq!(
+                ch.power_control_slot_is_valid(pcg),
+                matches!(pcg % 4, 0 | 3),
+                "gated FPC validity at PCG {pcg}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_gated_fpc_ordinal_is_the_absolute_pcg() {
+        let ch = make_channel();
+        for abs_pcg in 0..16 {
+            assert_eq!(ch.power_control_slot_ordinal(abs_pcg), Some(abs_pcg));
+        }
+
+        ch.set_rev_fch_gating_mode(true);
+        for abs_pcg in 0..16 {
+            assert_eq!(
+                ch.power_control_slot_ordinal(abs_pcg),
+                gated_power_control_slot_ordinal(abs_pcg, RC3_GATED_REV_PWR_CNTL_DELAY)
+            );
+        }
+    }
+
+    #[test]
+    fn gated_fpc_phases_follow_all_rev_power_control_delay_values() {
+        let expected = [[0, 1], [1, 2], [2, 3], [0, 3]];
+        for (delay, expected_phases) in expected.into_iter().enumerate() {
+            let actual = (0..4)
+                .filter(|pcg| gated_power_control_slot_is_valid(*pcg, delay as u8))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected_phases, "REV_PWR_CNTL_DELAY={delay}");
+        }
+    }
+
+    #[test]
+    fn gated_fpc_ordinal_counts_only_valid_slots() {
+        let ordinals = (0..16)
+            .filter_map(|pcg| {
+                gated_power_control_slot_ordinal(pcg, RC3_GATED_REV_PWR_CNTL_DELAY)
+                    .map(|ordinal| (pcg, ordinal))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordinals,
+            vec![
+                (0, 0),
+                (3, 1),
+                (4, 2),
+                (7, 3),
+                (8, 4),
+                (11, 5),
+                (12, 6),
+                (15, 7)
+            ]
+        );
+    }
+
+    #[test]
+    fn nine_pcg_lead_maps_only_gated_on_measurements_to_valid_fpc_slots() {
+        for measured_abs_pcg in 0..16 {
+            assert_eq!(
+                gated_power_control_slot_is_valid(
+                    measured_abs_pcg + 9,
+                    RC3_GATED_REV_PWR_CNTL_DELAY,
+                ),
+                measured_abs_pcg % 4 >= 2,
+                "measured PCG {measured_abs_pcg}",
+            );
+        }
+    }
+
+    #[test]
+    fn rc3_atomic_pcb_timeline_emits_scheduled_bits_and_balanced_fallback() {
+        let scheduler = Rc3PcgPcbScheduler::new(RC3_GATED_REV_PWR_CNTL_DELAY);
+        assert!(scheduler.schedule(3, 0));
+        assert_eq!(scheduler.read(3), 0);
+        assert_eq!(scheduler.read(4), 0);
+        assert_eq!(scheduler.read(7), 1);
+        assert!(!scheduler.schedule(7, 0));
+
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.published, 1);
+        assert_eq!(snapshot.scheduled_emits, 1);
+        assert_eq!(snapshot.fallback_emits, 2);
+        assert_eq!(snapshot.late_schedules, 1);
+        assert_eq!(snapshot.last_emitted_abs_pcg, Some(7));
+    }
+
+    #[test]
+    fn gated_fpc_subchannel_punctures_only_valid_delay_three_pcgs() {
+        let ch = make_channel();
+        ch.config.lock().fpc_subchan_gain_linear = 7.0;
+        ch.set_rev_fch_gating_mode(true);
+
+        let frame = ch.next(CdmaSystemTime::default());
+        let qpsk_symbols_per_pcg = OUTPUT_SYMBOLS_PER_FRAME / SR1_PCGS_PER_FRAME;
+        for pcg in 0..SR1_PCGS_PER_FRAME {
+            let pcg_symbols = &frame[pcg * qpsk_symbols_per_pcg..(pcg + 1) * qpsk_symbols_per_pcg];
+            let punctured_components = pcg_symbols
+                .iter()
+                .flat_map(|symbol| [symbol.re, symbol.im])
+                .filter(|component| (component.abs() - 7.0).abs() < 1e-6)
+                .count();
+            assert_eq!(
+                punctured_components,
+                if matches!(pcg % 4, 0 | 3) {
+                    PC_PUNCTURE_SYMBOLS
+                } else {
+                    0
+                },
+                "gated FPC puncture count in PCG {pcg}"
+            );
+        }
     }
 
     #[test]
@@ -801,7 +1115,8 @@ mod tests {
             scrambling_lc: LongCodeGenerator::new_traffic_channel(esn),
             puncture_lc: LongCodeGenerator::new_traffic_channel(esn),
             lc_chip_cursor: 0,
-            pcb_scheduler: crate::channels::PcgPcbScheduler::new(0),
+            previous_pcg_pc_start: 0,
+            pcb_scheduler: Rc3PcgPcbScheduler::new(RC3_GATED_REV_PWR_CNTL_DELAY),
             fpc_subchan_gain_linear: 1.0,
             prev_frame_last_chip: 0,
             disable_lc_scrambling: false,
@@ -843,7 +1158,7 @@ mod tests {
         const CHIPS_PER_FRAME: u64 = (MOD_SYMBOLS_PER_FRAME * LC_DECIMATION) as u64;
         let lc_pos = frame_boundary + (null_frames as u64) * CHIPS_PER_FRAME;
 
-        // Walk the scrambling LC exactly the same way the TX does under
+        // Advance the scrambling LC exactly as the TX does under
         // the "odd/Q uses raw previous chip" interpretation.
         let mut scr_probe = LongCodeGenerator::new_traffic_channel(esn);
         let previous_chip_start = if lc_pos == 0 {
@@ -865,24 +1180,16 @@ mod tests {
             }
         }
 
-        // Walk the puncture LC with the decimator pattern: one output per
-        // mod symbol, skipping 31 chips between outputs.
+        // Advance the puncture LC with the decimator pattern. The final four
+        // outputs of the preceding PCG select the current PCG's puncture
+        // position (C.S0002-E Figure 3.1.3.1.12-3).
         let mut pun_probe = LongCodeGenerator::new_traffic_channel(esn);
-        pun_probe.advance_chips(lc_pos as usize);
+        pun_probe.advance_chips((lc_pos - PCG_CHIPS as u64) as usize);
+        let mut previous_pc_start = ForwardTrafficChannelRc3::pc_start_from_pcg_lc(&mut pun_probe);
         let mut pc_positions = [0usize; SR1_PCGS_PER_FRAME];
         for pcg in 0..SR1_PCGS_PER_FRAME {
-            let mut pcg_bits = [0u8; SYMBOLS_PER_PCG];
-            for bit in pcg_bits.iter_mut() {
-                *bit = pun_probe.next_chip();
-                for _ in 0..(LC_DECIMATION - 1) {
-                    pun_probe.next_chip();
-                }
-            }
-            let b3 = pcg_bits[47] as usize;
-            let b2 = pcg_bits[46] as usize;
-            let b1 = pcg_bits[45] as usize;
-            let b0 = pcg_bits[44] as usize;
-            pc_positions[pcg] = ((b3 << 3) | (b2 << 2) | (b1 << 1) | b0) * 2;
+            pc_positions[pcg] = previous_pc_start;
+            previous_pc_start = ForwardTrafficChannelRc3::pc_start_from_pcg_lc(&mut pun_probe);
         }
 
         let descrambled = soft_symbols
@@ -1155,7 +1462,8 @@ mod tests {
             scrambling_lc: LongCodeGenerator::new_traffic_channel(esn),
             puncture_lc: LongCodeGenerator::new_traffic_channel(esn),
             lc_chip_cursor: 0,
-            pcb_scheduler: crate::channels::PcgPcbScheduler::new(0),
+            previous_pcg_pc_start: 0,
+            pcb_scheduler: Rc3PcgPcbScheduler::new(RC3_GATED_REV_PWR_CNTL_DELAY),
             fpc_subchan_gain_linear: 1.0, // unity gain so PC syms are ±1
             prev_frame_last_chip: 0,
             disable_lc_scrambling: false,
@@ -1228,28 +1536,19 @@ mod tests {
             }
         }
 
-        // PC positions from puncture LC (same seed, same walk)
+        // PC positions from the preceding PCG's puncture-LC outputs.
         let mut pun_lc = LongCodeGenerator::new_traffic_channel(esn);
-        pun_lc.advance_chips(start_chip as usize);
+        pun_lc.advance_chips((start_chip - PCG_CHIPS as u64) as usize);
+        let mut previous_pc_start = ForwardTrafficChannelRc3::pc_start_from_pcg_lc(&mut pun_lc);
         let mut pc_positions = [0usize; SR1_PCGS_PER_FRAME];
         for pcg in 0..SR1_PCGS_PER_FRAME {
-            let mut pcg_bits = [0u8; SYMBOLS_PER_PCG];
-            for bit in pcg_bits.iter_mut() {
-                *bit = pun_lc.next_chip();
-                for _ in 0..(LC_DECIMATION - 1) {
-                    pun_lc.next_chip();
-                }
-            }
-            let b3 = pcg_bits[47] as usize;
-            let b2 = pcg_bits[46] as usize;
-            let b1 = pcg_bits[45] as usize;
-            let b0 = pcg_bits[44] as usize;
-            pc_positions[pcg] = ((b3 << 3) | (b2 << 2) | (b1 << 1) | b0) * 2;
+            pc_positions[pcg] = previous_pc_start;
+            previous_pc_start = ForwardTrafficChannelRc3::pc_start_from_pcg_lc(&mut pun_lc);
         }
 
         // The channel does not schedule explicit PCB values in this test, so
-        // the shared scheduler falls back to constant UP (0) on every PCG.
-        let pc_bits: [u8; 16] = [0; 16];
+        // the shared scheduler emits its balanced fallback sequence.
+        let pc_bits: [u8; 16] = std::array::from_fn(|pcg| pcg as u8 & 1);
 
         // Step 7: Scramble + PC puncture + signal-point map
         let mut expected_mapped = Vec::with_capacity(MOD_SYMBOLS_PER_FRAME);

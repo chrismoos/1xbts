@@ -3841,6 +3841,7 @@ pub enum ChannelAssignmentGrantedMode {
 
 pub const CHANNEL_ASSIGN_MODE_TRAFFIC: u8 = 0b000;
 pub const CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC: u8 = 0b100;
+const RC1_RC2_INITIAL_TRAFFIC_GAIN_ADJ_DB: i8 = 3;
 pub const CHANNEL_DEFAULT_CONFIG_RC1_RC1: u8 = 0b000;
 pub const CHANNEL_DEFAULT_CONFIG_RC2_RC2: u8 = 0b001;
 pub const CHANNEL_DEFAULT_CONFIG_RC1_RC2: u8 = 0b010;
@@ -4246,11 +4247,13 @@ impl ExtendedChannelAssignmentMessage {
             enc_key_size: None,
             // FPC values matched to working Anritsu MD8470A trace (RecNo 50).
             fpc_subchan_gain: 12,
-            // R-FCH traffic-to-pilot gain adjustment, signed 4-bit two's
-            // complement in 0.25 dB units. **LOCK-STEP** with the inner-loop
-            // SINR setpoint in power_control.rs (calibrated via
-            // `rc3_pilot_sinr_at_1pct_fer_calibration`). Re-run before changing.
-            rlgain_adj: 0,
+            // RC1/RC2 need enough margin to transition from a low-power
+            // access probe into closed-loop traffic power control.
+            rlgain_adj: if matches!(rev_rc, 1 | 2) {
+                RC1_RC2_INITIAL_TRAFFIC_GAIN_ADJ_DB
+            } else {
+                0
+            },
             ch_ind: 0b01,
             raw_ch_record_fields: None,
             fpc_fch_init_setpt: 0x20, // 32 (4.0 dB)
@@ -4452,7 +4455,7 @@ impl ExtendedChannelAssignmentMessage {
                 "default_config=0b{:03b} for_rc={} rev_rc={} frame_offset={} encrypt_mode=0b{:02b} ",
                 "fpc_subchan_gain={} rlgain_adj={} ch_ind=0b{:02b} ch_record_len_octets={} ",
                 "fpc_fch_init_setpt=0x{:02X} fpc_fch_fer=0b{:05b} fpc_fch_min_setpt=0x{:02X} ",
-                "fpc_fch_max_setpt=0x{:02X} rev_fch_gating_mode={} plcm_type_incl={} plcm_type={} early_rl_transmit_ind={} ",
+                "fpc_fch_max_setpt=0x{:02X} rev_fch_gating_mode={} rev_pwr_cntl_delay={:?} plcm_type_incl={} plcm_type={} early_rl_transmit_ind={} ",
                 "tx_pwr_limit={:?} pilots=[{}]"
             ),
             self.assign_mode,
@@ -4476,6 +4479,7 @@ impl ExtendedChannelAssignmentMessage {
             self.fpc_fch_min_setpt,
             self.fpc_fch_max_setpt,
             self.rev_fch_gating_mode,
+            self.rev_pwr_cntl_delay,
             self.plcm_type_incl,
             self.plcm_type,
             self.early_rl_transmit_ind,
@@ -19172,6 +19176,20 @@ mod escam_tests {
         assert_eq!(decoded.rtc_nom_pwr, Some(-3));
         assert_eq!(decoded.tx_pwr_limit, Some(45));
         assert_eq!(decoded.to_sdu().bits(), encoded.bits());
+    }
+
+    #[test]
+    fn ecam_raises_rc1_rc2_initial_traffic_power_only() {
+        for rev_rc in [1, 2] {
+            let ecam = ExtendedChannelAssignmentMessage::new_f_fch_r_fch_assignment(
+                0, 10, 0, rev_rc, rev_rc, false,
+            );
+            assert_eq!(ecam.rlgain_adj, RC1_RC2_INITIAL_TRAFFIC_GAIN_ADJ_DB);
+        }
+
+        let rc3 =
+            ExtendedChannelAssignmentMessage::new_f_fch_r_fch_assignment(0, 10, 0, 3, 3, false);
+        assert_eq!(rc3.rlgain_adj, 0);
     }
 
     #[test]

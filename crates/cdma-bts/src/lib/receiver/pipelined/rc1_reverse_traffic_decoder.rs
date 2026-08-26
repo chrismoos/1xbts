@@ -8,7 +8,7 @@ use super::{PipelineProcessor, SampleBlock, raw_to_soft};
 use crate::phy::coding::block_interleaver::{
     Rc12ReverseTrafficInterleaver, Rc12ReverseTrafficRate,
 };
-use crate::phy::coding::convolutional::get_1_3_k9_soft_viterbi_decoder;
+use crate::phy::coding::convolutional::with_1_3_k9_soft_viterbi_decoder;
 use crate::phy::coding::long_code::LongCodeGenerator;
 use crate::phy::walsh::WalshGenerator;
 use crate::receiver::pipelined::traffic_channel_processor::{
@@ -25,6 +25,13 @@ const SOFT_BITS_PER_FRAME: usize = RC1_SYMBOLS_PER_FRAME * RC1_SOFT_BITS_PER_SYM
 const SOFT_BITS_PER_PCG: usize = RC1_SYMBOLS_PER_PCG * RC1_SOFT_BITS_PER_SYMBOL;
 const PCG_CHIPS: usize = RC1_SYMBOLS_PER_PCG * PN_CHIPS_PER_SYMBOL;
 const PREAMBLE_NULL_FRAME_THRESHOLD: usize = 16;
+
+/// Averages the gated interference estimate over about half a second.
+const GATED_NOISE_ALPHA: f32 = 1.0 / 32.0;
+
+/// A full-rate frame leaves no silent group to measure, so the estimate can go
+/// unrefreshed. Stop trusting it after this many frames.
+const GATED_NOISE_MAX_STALE_FRAMES: usize = 50;
 const RATE_HISTORY_LEN: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +50,16 @@ enum Rc1TrafficRate {
 
 impl Rc1TrafficRate {
     const SEARCH_ORDER: [Self; 4] = [Self::Full, Self::Half, Self::Quarter, Self::Eighth];
+
+    /// Position of this rate in `SEARCH_ORDER`, used to index per-rate arrays.
+    const fn index(self) -> usize {
+        match self {
+            Self::Full => 0,
+            Self::Half => 1,
+            Self::Quarter => 2,
+            Self::Eighth => 3,
+        }
+    }
 
     const fn to_interleaver_rate(self) -> Rc12ReverseTrafficRate {
         match self {
@@ -151,6 +168,11 @@ impl FrameValidation {
     }
 }
 
+/// Rate hypotheses for one frame, decoded on first use. A hypothesis depends
+/// only on the soft bits, chip start and ESN, so the preamble check and the
+/// rate search share one decode per rate.
+type RateHypotheses = [Option<DecodedTrafficFrame>; 4];
+
 #[derive(Clone, Debug)]
 struct DecodedTrafficFrame {
     rate: Rc1TrafficRate,
@@ -200,12 +222,16 @@ pub struct Rc1ReverseTrafficDecoder {
 
     // PCG measurement tracking
     next_measurement_abs_pcg: Option<u64>,
-    pcg_measurement_rate: Option<Rc1TrafficRate>,
     last_processing_absolute_chip_end: Option<u64>,
 
     // Propagated tags from upstream blocks
     tags: HashMap<&'static str, i64>,
     sample_rate_hz: f64,
+
+    /// Mean per-bin energy from groups the mobile did not transmit, and its
+    /// age in frames.
+    gated_noise_per_bin: Option<f32>,
+    frames_since_gated_noise: usize,
 
     // Metrics
     symbols_decoded: u64,
@@ -230,10 +256,11 @@ impl Rc1ReverseTrafficDecoder {
             rate_history: [Rc1TrafficRate::Full; RATE_HISTORY_LEN],
             rate_history_count: 0,
             next_measurement_abs_pcg: None,
-            pcg_measurement_rate: None,
             last_processing_absolute_chip_end: None,
             tags: HashMap::new(),
             sample_rate_hz: 0.0,
+            gated_noise_per_bin: None,
+            frames_since_gated_noise: usize::MAX,
             symbols_decoded: 0,
             frames_decoded: 0,
         }
@@ -319,14 +346,23 @@ impl Rc1ReverseTrafficDecoder {
                 ]
             })
             .collect::<Vec<_>>();
-        let mut decoder = get_1_3_k9_soft_viterbi_decoder();
-        let bits = decoder.decode_block_from_state(&inputs, 0);
-        let ml_best_state = decoder.ml_best_terminal_state() as u8;
-        (bits, ml_best_state)
+        with_1_3_k9_soft_viterbi_decoder(|decoder| {
+            let bits = decoder.decode_block_from_state(&inputs, 0);
+            (bits, decoder.ml_best_terminal_state() as u8)
+        })
     }
 
     fn decode_frame_soft(&self, frame_soft: &[f32], rate: Rc1TrafficRate) -> DecodedTrafficFrame {
         self.decode_frame_soft_at(frame_soft, rate, self.frame_chip_start)
+    }
+
+    fn hypothesis<'h>(
+        &self,
+        cache: &'h mut RateHypotheses,
+        frame_soft: &[f32],
+        rate: Rc1TrafficRate,
+    ) -> &'h DecodedTrafficFrame {
+        cache[rate.index()].get_or_insert_with(|| self.decode_frame_soft(frame_soft, rate))
     }
 
     fn decode_frame_soft_at(
@@ -367,30 +403,10 @@ impl Rc1ReverseTrafficDecoder {
         let window = &self.rate_history[..self.rate_history_count.min(RATE_HISTORY_LEN)];
         let mut counts = [0u32; 4];
         for &r in window {
-            let idx = match r {
-                Rc1TrafficRate::Full => 0,
-                Rc1TrafficRate::Half => 1,
-                Rc1TrafficRate::Quarter => 2,
-                Rc1TrafficRate::Eighth => 3,
-            };
-            counts[idx] += 1;
+            counts[r.index()] += 1;
         }
         let mut order = Rc1TrafficRate::SEARCH_ORDER;
-        order.sort_by(|a, b| {
-            let ai = match a {
-                Rc1TrafficRate::Full => 0,
-                Rc1TrafficRate::Half => 1,
-                Rc1TrafficRate::Quarter => 2,
-                Rc1TrafficRate::Eighth => 3,
-            };
-            let bi = match b {
-                Rc1TrafficRate::Full => 0,
-                Rc1TrafficRate::Half => 1,
-                Rc1TrafficRate::Quarter => 2,
-                Rc1TrafficRate::Eighth => 3,
-            };
-            counts[bi].cmp(&counts[ai])
-        });
+        order.sort_by(|a, b| counts[b.index()].cmp(&counts[a.index()]));
         order
     }
 
@@ -414,7 +430,11 @@ impl Rc1ReverseTrafficDecoder {
         score
     }
 
-    fn choose_best_rate(&self, frame_soft: &[f32]) -> Option<DecodedTrafficFrame> {
+    fn choose_best_rate(
+        &self,
+        cache: &mut RateHypotheses,
+        frame_soft: &[f32],
+    ) -> Option<DecodedTrafficFrame> {
         let adaptive_order = self.adaptive_search_order();
 
         // CRC-bearing rates are authoritative when they pass FQI.
@@ -422,31 +442,31 @@ impl Rc1ReverseTrafficDecoder {
             if rate.fqi_bits() == 0 {
                 continue;
             }
-            let decoded = self.decode_frame_soft(frame_soft, rate);
+            let decoded = self.hypothesis(cache, frame_soft, rate);
             if decoded.validation.phy_valid {
-                return Some(decoded);
+                return Some(decoded.clone());
             }
         }
 
         // No-FQI rates must both be tried before choosing. Tail bits alone are
         // too weak at low power; require the Viterbi terminal state expected by
         // the all-zero encoder tail before the frame can count as decoded.
-        let mut best: Option<(usize, DecodedTrafficFrame)> = None;
+        let mut best: Option<(usize, Rc1TrafficRate)> = None;
         for rate in [Rc1TrafficRate::Quarter, Rc1TrafficRate::Eighth] {
-            let decoded = self.decode_frame_soft(frame_soft, rate);
-            if !Self::no_fqi_candidate_acceptable(&decoded) {
+            let decoded = self.hypothesis(cache, frame_soft, rate);
+            if !Self::no_fqi_candidate_acceptable(decoded) {
                 continue;
             }
-            let score = self.score_no_fqi_candidate(&decoded);
+            let score = self.score_no_fqi_candidate(decoded);
             let replace = best
                 .as_ref()
                 .map(|(best_score, _)| score > *best_score)
                 .unwrap_or(true);
             if replace {
-                best = Some((score, decoded));
+                best = Some((score, rate));
             }
         }
-        best.map(|(_, decoded)| decoded)
+        best.and_then(|(_, rate)| cache[rate.index()].take())
     }
 
     fn no_fqi_candidate_acceptable(decoded: &DecodedTrafficFrame) -> bool {
@@ -530,6 +550,47 @@ impl Rc1ReverseTrafficDecoder {
     // Per-PCG Eb/Nt computation
     // ---------------------------------------------------------------
 
+    /// Refresh the interference estimate from the power control groups this
+    /// frame's rate did not transmit.
+    ///
+    /// The non-peak bins of a transmitted group carry the mobile's own
+    /// multipath, so an estimate taken there rises with its power and the ratio
+    /// against it barely moves. A silent group carries only everything else.
+    fn update_gated_noise_estimate(&mut self, rate: Rc1TrafficRate) {
+        let active = self.exact_active_pcgs_for_rate(rate, self.frame_chip_start);
+        let mut energy = 0.0f64;
+        let mut bins = 0usize;
+        for (pcg, transmitted) in active.iter().copied().enumerate() {
+            if transmitted {
+                continue;
+            }
+            let start = pcg * RC1_SYMBOLS_PER_PCG;
+            let end = (start + RC1_SYMBOLS_PER_PCG).min(self.symbol_energies.len());
+            for symbol in self.symbol_energies.get(start..end).unwrap_or_default() {
+                energy += symbol.iter().map(|bin| *bin as f64).sum::<f64>();
+                bins += RC1_WALSH_CHIPS_PER_SYMBOL;
+            }
+        }
+        self.frames_since_gated_noise = self.frames_since_gated_noise.saturating_add(1);
+        if bins == 0 {
+            return;
+        }
+        let per_bin = (energy / bins as f64) as f32;
+        self.gated_noise_per_bin = Some(match self.gated_noise_per_bin {
+            Some(previous) => previous + GATED_NOISE_ALPHA * (per_bin - previous),
+            None => per_bin,
+        });
+        self.frames_since_gated_noise = 0;
+    }
+
+    /// Interference per Walsh bin, measured while the mobile was silent, or
+    /// `None` when no recent frame offered a silent group to measure.
+    fn gated_noise(&self) -> Option<f32> {
+        self.gated_noise_per_bin
+            .filter(|_| self.frames_since_gated_noise <= GATED_NOISE_MAX_STALE_FRAMES)
+            .filter(|noise| *noise > 0.0)
+    }
+
     fn pcg_eb_nt_db(&self, pcg_idx: usize) -> f32 {
         let sym_start = pcg_idx * RC1_SYMBOLS_PER_PCG;
         if sym_start >= self.symbol_energies.len() {
@@ -540,6 +601,7 @@ impl Rc1ReverseTrafficDecoder {
         if n == 0 {
             return -30.0;
         }
+        let gated_noise = self.gated_noise();
         let mut linear_eb_nt = 0.0f32;
         for sym_idx in sym_start..sym_end {
             let energies = &self.symbol_energies[sym_idx];
@@ -547,7 +609,9 @@ impl Rc1ReverseTrafficDecoder {
             let total: f32 = energies.iter().sum();
             let noise_sum = (total - peak).max(0.0);
             let denom = (RC1_WALSH_CHIPS_PER_SYMBOL - 1) as f32;
-            let noise_mean = (noise_sum / denom).max(1e-12);
+            // Fall back to the transmitted group's own non-peak bins only while
+            // no silent-group measurement is available.
+            let noise_mean = gated_noise.unwrap_or((noise_sum / denom).max(1e-12));
             let es_nt = (peak / noise_mean - 1.0).max(0.0);
             linear_eb_nt += (es_nt * 0.5).max(1e-9);
         }
@@ -564,13 +628,12 @@ impl Rc1ReverseTrafficDecoder {
     fn pcg_mobile_power_dbfs(&self, pcg: usize) -> f32 {
         let start = pcg * RC1_SYMBOLS_PER_PCG;
         let end = start + RC1_SYMBOLS_PER_PCG;
-        super::walsh64_mobile_power_dbfs(self.symbol_energies[start..end].iter())
+        super::rc1_walsh64_mobile_power_dbfs(self.symbol_energies[start..end].iter())
     }
 
     /// Emit per-PCG Eb/Nt measurements incrementally as each 1.25ms PCG
     /// completes (6 symbols buffered). Called after every symbol so the
-    /// measurement reaches the BSC within ~1 PCG of real-time, matching
-    /// the RC3 path and keeping `power_control_delay_pcgs=2` viable.
+    /// measurement reaches the controller within ~1 PCG of real time.
     fn emit_pcg_measurements(&mut self) -> Vec<SampleBlock> {
         if self.state != DecoderState::Locked {
             return Vec::new();
@@ -598,9 +661,11 @@ impl Rc1ReverseTrafficDecoder {
             return Vec::new();
         }
 
-        // Active PCG mask depends on rate; cache per frame.
-        let rate = self.pcg_measurement_rate.unwrap_or(Rc1TrafficRate::Full);
-        let active_mask = self.exact_active_pcgs_for_rate(rate, self.frame_chip_start);
+        // The current frame's rate is unknown until all 20 ms have arrived.
+        // Eighth-rate positions are nested in every higher-rate mask, so they
+        // are the only PCGs guaranteed to contain a transmission in real time.
+        let active_mask =
+            self.exact_active_pcgs_for_rate(Rc1TrafficRate::Eighth, self.frame_chip_start);
 
         let mut out = Vec::new();
         while next_pcg < available_end_pcg {
@@ -649,6 +714,8 @@ impl Rc1ReverseTrafficDecoder {
         }
 
         let mut out = Vec::new();
+        let frame_soft = self.frame_soft.clone();
+        let mut cache = RateHypotheses::default();
 
         // Preamble tracking: count consecutive null frames for preamble event.
         if self.state == DecoderState::Preamble {
@@ -659,10 +726,11 @@ impl Rc1ReverseTrafficDecoder {
             ]
             .iter()
             .any(|&rate| {
-                let decoded = self.decode_frame_soft(&self.frame_soft, rate);
-                decoded.validation.tail_valid
+                self.hypothesis(&mut cache, &frame_soft, rate)
+                    .validation
+                    .tail_valid
             }) || {
-                let decoded = self.decode_frame_soft(&self.frame_soft, Rc1TrafficRate::Full);
+                let decoded = self.hypothesis(&mut cache, &frame_soft, Rc1TrafficRate::Full);
                 decoded.validation.tail_valid && decoded.bits.iter().all(|bit| *bit == 0)
             };
 
@@ -702,20 +770,26 @@ impl Rc1ReverseTrafficDecoder {
 
         // Always decode and emit the frame (even during preamble), so we
         // don't miss signaling frames that overlap with the preamble window.
-        out.extend(self.handle_locked_frame());
+        out.extend(self.handle_locked_frame(&mut cache, &frame_soft));
         out
     }
 
-    fn handle_locked_frame(&mut self) -> Vec<SampleBlock> {
-        let frame_soft = self.frame_soft.clone();
-        let Some(decoded) = self.choose_best_rate(&frame_soft) else {
+    fn handle_locked_frame(
+        &mut self,
+        cache: &mut RateHypotheses,
+        frame_soft: &[f32],
+    ) -> Vec<SampleBlock> {
+        let Some(decoded) = self.choose_best_rate(cache, frame_soft) else {
             return vec![self.build_failed_locked_frame()];
         };
 
         self.frames_decoded += 1;
         self.record_rate(decoded.rate);
         if decoded.validation.phy_valid {
-            self.pcg_measurement_rate = Some(decoded.rate);
+            // A misread rate would mark transmitted groups silent and fold the
+            // mobile's own energy into the interference estimate, so only a
+            // frame that checked out is allowed to move it.
+            self.update_gated_noise_estimate(decoded.rate);
         }
 
         let is_preamble =
@@ -992,10 +1066,9 @@ mod tests {
         decoder.state = DecoderState::Locked;
         decoder.frame_chip_start = 0;
         decoder.sample_rate_hz = 1_228_800.0;
-        decoder.last_processing_absolute_chip_end = Some(PCG_CHIPS as u64);
+        decoder.last_processing_absolute_chip_end = Some((SR1_PCGS_PER_FRAME * PCG_CHIPS) as u64);
         decoder.next_measurement_abs_pcg = Some(0);
-        decoder.pcg_measurement_rate = Some(Rc1TrafficRate::Full);
-        decoder.symbol_energies = (0..RC1_SYMBOLS_PER_PCG)
+        decoder.symbol_energies = (0..RC1_SYMBOLS_PER_FRAME)
             .map(|_| {
                 let mut energies = [1.0; RC1_WALSH_CHIPS_PER_SYMBOL];
                 energies[17] = 10_000.0;
@@ -1005,11 +1078,11 @@ mod tests {
 
         let measurements = decoder.emit_pcg_measurements();
 
-        assert_eq!(measurements.len(), 1);
-        assert!(
-            measurements[0]
+        assert_eq!(measurements.len(), 2);
+        assert!(measurements.iter().all(|measurement| {
+            measurement
                 .tags
                 .contains_key("traffic_pcg_mobile_power_mdbfs")
-        );
+        }));
     }
 }

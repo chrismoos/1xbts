@@ -45,6 +45,20 @@ pub const SR1_CHIPS_PER_FRAME: u64 = 24_576;
 /// Power-control groups per 20 ms frame (20 ms / 1.25 ms).
 pub const SR1_PCGS_PER_FRAME: usize = 16;
 
+/// REV_PWR_CNTL_DELAY advertised for gated RC3 reverse power control.
+/// A value of 3 places feedback five PCGs after the start of the gated-on
+/// reverse PCG, making a nine-PCG software scheduling lead land on a valid
+/// forward power-control subchannel slot.
+pub const RC3_GATED_REV_PWR_CNTL_DELAY: u8 = 3;
+
+const REVERSE_FCH_GATING_MIN_RC: u8 = 3;
+const REVERSE_FCH_GATING_MAX_RC: u8 = 6;
+
+/// Return whether the reverse radio configuration supports FCH gating.
+pub const fn reverse_fch_gating_supported(rev_rc: u8) -> bool {
+    rev_rc >= REVERSE_FCH_GATING_MIN_RC && rev_rc <= REVERSE_FCH_GATING_MAX_RC
+}
+
 /// Chips in one 80 ms paging slot (SR1_CHIP_RATE_HZ × 0.080).
 pub const SR1_CHIPS_PER_80MS: u64 = 98_304;
 

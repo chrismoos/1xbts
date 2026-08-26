@@ -26,8 +26,8 @@ use crate::abis_edge::PchTransferAckEvent;
 use crate::addressing::format_ms_address;
 
 use super::{
-    Bsc, MsState, PAGE_RETRY_GUARD_MS, SmsAckKey, SmsRequest, VoiceLegRole,
-    build_scheduled_message, next_bsc_event_id, next_pch_correlation_id,
+    A1_CLEAR_CAUSE_PAGING_RESPONSE_NOT_RECEIVED, Bsc, MsState, PAGE_RETRY_GUARD_MS, SmsAckKey,
+    SmsRequest, VoiceLegRole, build_scheduled_message, next_bsc_event_id, next_pch_correlation_id,
 };
 
 pub(crate) fn mobile_identity_for_ms_address(
@@ -416,7 +416,7 @@ fn build_general_page_record(
 #[derive(Default)]
 pub(crate) struct PagingState {
     pending_page: Option<PendingPage>,
-    pending_voice_page: Option<PendingVoicePage>,
+    pending_voice_pages: Vec<PendingVoicePage>,
 }
 
 #[derive(Default)]
@@ -467,7 +467,7 @@ impl DerefMut for PagingService {
 
 impl PagingState {
     pub(crate) fn has_pending_page(&self) -> bool {
-        self.pending_page.is_some() || self.pending_voice_page.is_some()
+        self.pending_page.is_some() || !self.pending_voice_pages.is_empty()
     }
 
     pub(crate) fn has_pending_sms_page(&self) -> bool {
@@ -482,7 +482,18 @@ impl PagingState {
     }
 
     pub(crate) fn has_pending_voice_page(&self) -> bool {
-        self.pending_voice_page.is_some()
+        !self.pending_voice_pages.is_empty()
+    }
+
+    pub(crate) fn pending_voice_page_for_address(&self, addr: &MsAddress) -> bool {
+        self.pending_voice_pages
+            .iter()
+            .any(|pending| pending.fwd_address == *addr)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_voice_page_count(&self) -> usize {
+        self.pending_voice_pages.len()
     }
 
     pub(crate) fn next_retry_at(&self) -> Option<tokio::time::Instant> {
@@ -494,9 +505,10 @@ impl PagingState {
             self.pending_page
                 .as_ref()
                 .map(|p| timeout_deadline(p.started_at, p.timeout)),
-            self.pending_voice_page
-                .as_ref()
-                .map(|p| timeout_deadline(p.started_at, p.timeout)),
+            self.pending_voice_pages
+                .iter()
+                .map(|p| timeout_deadline(p.started_at, p.timeout))
+                .min(),
         ) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
@@ -510,7 +522,7 @@ impl PagingState {
     }
 
     pub(crate) fn queue_voice_page(&mut self, pending: PendingVoicePage) {
-        self.pending_voice_page = Some(pending);
+        self.pending_voice_pages.push(pending);
     }
 
     pub(crate) fn record_sms_page_sent(
@@ -530,12 +542,17 @@ impl PagingState {
 
     pub(crate) fn record_voice_page_sent(
         &mut self,
+        fwd_address: &MsAddress,
         target_chip: Option<u64>,
         next_retry_at: tokio::time::Instant,
         page_msg_seq: u8,
         page_correlation_id: Option<u32>,
     ) {
-        if let Some(pending) = self.pending_voice_page.as_mut() {
+        if let Some(pending) = self
+            .pending_voice_pages
+            .iter_mut()
+            .find(|pending| pending.fwd_address == *fwd_address)
+        {
             pending.last_target_chip = target_chip;
             pending.next_retry_at = next_retry_at;
             pending.page_msg_seq = Some(page_msg_seq);
@@ -556,10 +573,15 @@ impl PagingState {
 
     pub(crate) fn record_voice_retry_scheduled(
         &mut self,
+        fwd_address: &MsAddress,
         target_chip: Option<u64>,
         next_retry_at: tokio::time::Instant,
     ) {
-        if let Some(pending) = self.pending_voice_page.as_mut() {
+        if let Some(pending) = self
+            .pending_voice_pages
+            .iter_mut()
+            .find(|pending| pending.fwd_address == *fwd_address)
+        {
             pending.last_target_chip = target_chip;
             pending.next_retry_at = next_retry_at;
         }
@@ -574,7 +596,17 @@ impl PagingState {
     }
 
     pub(crate) fn take_voice_page(&mut self) -> Option<PendingVoicePage> {
-        self.pending_voice_page.take()
+        (!self.pending_voice_pages.is_empty()).then(|| self.pending_voice_pages.remove(0))
+    }
+
+    pub(crate) fn take_voice_page_for_address(
+        &mut self,
+        fwd_address: &MsAddress,
+    ) -> Option<PendingVoicePage> {
+        self.pending_voice_pages
+            .iter()
+            .position(|pending| pending.fwd_address == *fwd_address)
+            .map(|index| self.pending_voice_pages.remove(index))
     }
 
     pub(crate) fn pending_sms_page_correlation_matches(&self, correlation_id: u32) -> bool {
@@ -584,9 +616,9 @@ impl PagingState {
     }
 
     pub(crate) fn pending_voice_page_correlation_matches(&self, correlation_id: u32) -> bool {
-        self.pending_voice_page
-            .as_ref()
-            .is_some_and(|pending| pending.page_correlation_id == Some(correlation_id))
+        self.pending_voice_pages
+            .iter()
+            .any(|pending| pending.page_correlation_id == Some(correlation_id))
     }
 
     pub(crate) fn take_sms_page_by_correlation(
@@ -602,9 +634,10 @@ impl PagingState {
         &mut self,
         correlation_id: u32,
     ) -> Option<PendingVoicePage> {
-        self.pending_voice_page_correlation_matches(correlation_id)
-            .then(|| self.pending_voice_page.take())
-            .flatten()
+        self.pending_voice_pages
+            .iter()
+            .position(|pending| pending.page_correlation_id == Some(correlation_id))
+            .map(|index| self.pending_voice_pages.remove(index))
     }
 
     pub(crate) fn cancel_sms_page(&mut self) {
@@ -612,7 +645,7 @@ impl PagingState {
     }
 
     pub(crate) fn cancel_voice_page(&mut self) {
-        self.pending_voice_page = None;
+        self.pending_voice_pages.clear();
     }
 
     pub(crate) fn take_timed_out_sms_page(&mut self) -> Option<PendingPage> {
@@ -624,11 +657,10 @@ impl PagingState {
     }
 
     pub(crate) fn take_timed_out_voice_page(&mut self) -> Option<PendingVoicePage> {
-        self.pending_voice_page
-            .as_ref()
-            .is_some_and(|pending| pending.started_at.elapsed() >= pending.timeout)
-            .then(|| self.pending_voice_page.take())
-            .flatten()
+        self.pending_voice_pages
+            .iter()
+            .position(|pending| pending.started_at.elapsed() >= pending.timeout)
+            .map(|index| self.pending_voice_pages.remove(index))
     }
 
     pub(crate) fn prepare_sms_retry(&mut self) -> Option<SmsPageRetry> {
@@ -646,7 +678,10 @@ impl PagingState {
     }
 
     pub(crate) fn prepare_voice_retry(&mut self) -> Option<VoicePageRetry> {
-        let pending = self.pending_voice_page.as_mut()?;
+        let pending = self
+            .pending_voice_pages
+            .iter_mut()
+            .min_by_key(|pending| pending.next_retry_at)?;
         pending.retry_count += 1;
         Some(VoicePageRetry {
             page_address: pending.page_address.clone(),
@@ -676,11 +711,10 @@ impl PagingState {
     }
 
     pub(crate) fn take_voice_page_for_a1_call(&mut self, call_id: u64) -> Option<PendingVoicePage> {
-        self.pending_voice_page
-            .as_ref()
-            .is_some_and(|pending| pending.a1_call_id == Some(call_id))
-            .then(|| self.pending_voice_page.take())
-            .flatten()
+        self.pending_voice_pages
+            .iter()
+            .position(|pending| pending.a1_call_id == Some(call_id))
+            .map(|index| self.pending_voice_pages.remove(index))
     }
 
     pub(crate) fn take_voice_page_for_a1_call_or_session(
@@ -688,13 +722,12 @@ impl PagingState {
         call_id: u64,
         session_id: Uuid,
     ) -> Option<PendingVoicePage> {
-        self.pending_voice_page
-            .as_ref()
-            .is_some_and(|pending| {
+        self.pending_voice_pages
+            .iter()
+            .position(|pending| {
                 pending.a1_call_id == Some(call_id) || pending.session_id == session_id
             })
-            .then(|| self.pending_voice_page.take())
-            .flatten()
+            .map(|index| self.pending_voice_pages.remove(index))
     }
 }
 
@@ -772,6 +805,17 @@ impl Bsc {
 
         let key = SmsAckKey::PchCorrelation(correlation_id);
         if ack.bts_l2_termination == Some(true) {
+            if let Some((addr, walsh_code)) =
+                self.mobiles.acknowledge_assignment_delivery(correlation_id)
+            {
+                info!(
+                    "BSC: ECAM L2 acknowledgment received for {} walsh={} correlation_id={}, restarting traffic transition timeout",
+                    format_ms_address(&addr),
+                    walsh_code,
+                    correlation_id,
+                );
+                return;
+            }
             if self
                 .paging
                 .pending_sms_page_correlation_matches(correlation_id)
@@ -824,6 +868,20 @@ impl Bsc {
         }
 
         if let Some(cause) = ack.cause {
+            if let Some((addr, walsh_code)) = self
+                .mobiles
+                .pending_assignment_for_correlation(correlation_id)
+            {
+                warn!(
+                    "BSC: ECAM L2 delivery failed for {} walsh={} correlation_id={} cause=0x{:02X}, tearing down",
+                    format_ms_address(&addr),
+                    walsh_code,
+                    correlation_id,
+                    cause,
+                );
+                self.teardown_traffic_channel(walsh_code).await;
+                return;
+            }
             if let Some(pending) = self.paging.take_sms_page_by_correlation(correlation_id) {
                 self.clear_pending_page_records_for(&pending.page_address);
                 warn!(
@@ -868,9 +926,9 @@ impl Bsc {
                         "voice page failure",
                     );
                 }
-                // A.S0014 cause 0x6E = "Paging response not received".
                 if let Some(call_id) = pending.a1_call_id {
-                    self.a1.send_clear_request(call_id, 0x6E);
+                    self.a1
+                        .send_clear_request(call_id, A1_CLEAR_CAUSE_PAGING_RESPONSE_NOT_RECEIVED);
                 }
                 self.voice
                     .retain_sessions(|session| session.id != pending.session_id);
@@ -983,9 +1041,9 @@ impl Bsc {
                         "voice page timeout",
                     );
                 }
-                // A.S0014 cause 0x6E = "Paging response not received".
                 if let Some(call_id) = pending.a1_call_id {
-                    self.a1.send_clear_request(call_id, 0x6E);
+                    self.a1
+                        .send_clear_request(call_id, A1_CLEAR_CAUSE_PAGING_RESPONSE_NOT_RECEIVED);
                 }
                 self.voice
                     .retain_sessions(|session| session.id != pending.session_id);

@@ -5,6 +5,7 @@ pub mod ftch;
 pub mod ftch_rc2;
 pub mod ftch_rc3;
 pub mod pilot;
+pub(crate) mod rc12_power_control;
 pub mod rtch;
 
 use std::{collections::BTreeMap, collections::VecDeque, sync::Arc};
@@ -252,7 +253,7 @@ impl PcgPcbScheduler {
         }))
     }
 
-    pub fn schedule(&mut self, abs_pcg: u64, bit: u8) {
+    pub fn schedule(&mut self, abs_pcg: u64, bit: u8) -> bool {
         let last_read_abs_pcg = self.last_read_abs_pcg;
         self.scheduled.insert(abs_pcg, bit & 1);
         self.trim_before(abs_pcg.saturating_sub(64));
@@ -268,6 +269,7 @@ impl PcgPcbScheduler {
         {
             counters.record_schedule_late(last_read_abs_pcg.saturating_sub(abs_pcg));
         }
+        last_read_abs_pcg.is_none_or(|last_read| abs_pcg > last_read)
     }
 
     pub fn schedule_burst(&mut self, start_abs_pcg: u64, pcgs: u64, bit: u8) {

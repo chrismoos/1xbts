@@ -15,11 +15,12 @@ use cdma_common::overhead::OverheadParameters;
 use log::{info, warn};
 use uuid::Uuid;
 
-use crate::addressing::format_ms_address;
+use crate::addressing::{format_ms_address, is_packet_data_so};
 use crate::voice_bearer_bits::{mux_voice_bits_for_air, pack_voice_bits_for_bearer};
 
 use super::{
-    A1ClearState, Bsc, DEFAULT_PAGE_TIMEOUT_MS, MsState, PendingVoicePage, VoicePollAction,
+    A1_CLEAR_CAUSE_PAGING_RESPONSE_NOT_RECEIVED, A1ClearState, Bsc, DEFAULT_PAGE_TIMEOUT_MS,
+    MsState, PendingVoicePage, VoicePollAction,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,7 +112,7 @@ pub(crate) struct VoiceService {
     pub(crate) sessions: Vec<VoiceCallSession>,
     pub(crate) next_call_connection_ref: u32,
     pub(crate) next_mo_call_id: u64,
-    pub(crate) deferred_page_after_release: Option<DeferredVoicePage>,
+    pub(crate) deferred_pages_after_release: Vec<DeferredVoicePage>,
 }
 
 impl Default for VoiceService {
@@ -120,7 +121,7 @@ impl Default for VoiceService {
             sessions: Vec::new(),
             next_call_connection_ref: 1,
             next_mo_call_id: 0x1_0000_0000,
-            deferred_page_after_release: None,
+            deferred_pages_after_release: Vec::new(),
         }
     }
 }
@@ -169,11 +170,16 @@ impl VoiceService {
         &mut self,
         call_id: u64,
     ) -> Option<DeferredVoicePage> {
-        self.deferred_page_after_release
-            .as_ref()
-            .is_some_and(|pending| pending.a1_call_id == Some(call_id))
-            .then(|| self.deferred_page_after_release.take())
-            .flatten()
+        self.deferred_pages_after_release
+            .iter()
+            .position(|pending| pending.a1_call_id == Some(call_id))
+            .map(|index| self.deferred_pages_after_release.remove(index))
+    }
+
+    pub(crate) fn has_deferred_page_for_address(&self, fwd_address: &MsAddress) -> bool {
+        self.deferred_pages_after_release
+            .iter()
+            .any(|pending| pending.fwd_address == *fwd_address)
     }
 }
 
@@ -818,8 +824,19 @@ impl Bsc {
         a1_call_id: Option<u64>,
         imsi: Option<String>,
     ) {
-        if self.paging.has_pending_page() {
-            warn!("BSC: page already in progress — cannot queue voice page");
+        if self.paging.pending_voice_page_for_address(fwd_address)
+            || self.paging.pending_sms_page_for_address(fwd_address)
+        {
+            warn!(
+                "BSC: page already in progress for {} — cannot queue voice page",
+                format_ms_address(fwd_address)
+            );
+            if let Some(call_id) = a1_call_id {
+                self.a1
+                    .send_clear_request(call_id, A1_CLEAR_CAUSE_PAGING_RESPONSE_NOT_RECEIVED);
+            }
+            self.voice
+                .retain_sessions(|session| session.id != session_id);
             return;
         }
         // Page-from-unregistered IMSI falls back to SCI=0 (non-slotted: MS
@@ -844,7 +861,7 @@ impl Bsc {
         self.paging.queue_voice_page(PendingVoicePage {
             session_id,
             page_address: page_address.clone(),
-            fwd_address,
+            fwd_address: fwd_address.clone(),
             pgslot,
             slot_cycle_index,
             started_at: Instant::now(),
@@ -873,6 +890,7 @@ impl Bsc {
                 let next_retry_at =
                     self.compute_next_retry_at(pgslot, slot_cycle_index, target_chip);
                 self.paging.record_voice_page_sent(
+                    &fwd_address,
                     target_chip,
                     next_retry_at,
                     page_seq,
@@ -894,9 +912,9 @@ impl Bsc {
         if a1_call_id.is_some()
             && self
                 .voice
-                .deferred_page_after_release
-                .as_ref()
-                .is_some_and(|pending| pending.a1_call_id == a1_call_id)
+                .deferred_pages_after_release
+                .iter()
+                .any(|pending| pending.a1_call_id == a1_call_id)
         {
             info!(
                 "BSC: ignoring duplicate Paging Request while legacy traffic release is pending call_id={:?}",
@@ -905,11 +923,23 @@ impl Bsc {
             return;
         }
         let session_id = Uuid::new_v4();
-        let (subscriber_id, has_tc, legacy_traffic) = self
+        let (subscriber_id, traffic_context, legacy_traffic) = self
             .mobiles
             .get(fwd_address)
-            .map(|ms| (ms.subscriber_id, ms.has_traffic_channel(), ms.mob_p_rev < 6))
-            .unwrap_or((None, false, false));
+            .map(|ms| {
+                (
+                    ms.subscriber_id,
+                    ms.traffic_channel().map(|tc| {
+                        (
+                            is_packet_data_so(tc.service_option),
+                            tc.channel_state.is_service_negotiated(),
+                            tc.is_releasing(),
+                        )
+                    }),
+                    ms.mob_p_rev < 6,
+                )
+            })
+            .unwrap_or((None, None, false));
         info!(
             "BSC: initiating MSC-controlled MT voice call session={} subscriber={:?}",
             session_id, subscriber_id,
@@ -924,34 +954,40 @@ impl Bsc {
             calling_party_record: None,
             called_number: None,
         });
-        if has_tc {
-            if legacy_traffic {
-                if self.voice.deferred_page_after_release.is_some() {
+        if let Some((packet_traffic, service_negotiated, already_releasing)) = traffic_context {
+            let release_before_page = legacy_traffic || (packet_traffic && !service_negotiated);
+            if release_before_page {
+                if self.voice.has_deferred_page_for_address(fwd_address) {
                     warn!(
-                        "BSC: cannot defer MT voice page for legacy mobile; another release-before-page is pending"
+                        "BSC: cannot defer MT voice page for {}; another release-before-page is pending",
+                        format_ms_address(fwd_address)
                     );
                     self.voice
                         .retain_sessions(|session| session.id != session_id);
                     return;
                 }
-                self.voice.deferred_page_after_release = Some(DeferredVoicePage {
-                    fwd_address: fwd_address.clone(),
-                    session_id,
-                    service_option,
-                    leg_role: VoiceLegRole::Callee,
-                    a1_tag,
-                    a1_call_id,
-                    imsi,
-                });
+                self.voice
+                    .deferred_pages_after_release
+                    .push(DeferredVoicePage {
+                        fwd_address: fwd_address.clone(),
+                        session_id,
+                        service_option,
+                        leg_role: VoiceLegRole::Callee,
+                        a1_tag,
+                        a1_call_id,
+                        imsi,
+                    });
                 info!(
-                    "BSC: releasing pre-IS-2000 traffic channel before MT page for session={}",
-                    session_id
+                    "BSC: releasing unusable traffic channel before MT page for session={} legacy={} packet={} negotiated={}",
+                    session_id, legacy_traffic, packet_traffic, service_negotiated
                 );
-                self.begin_voice_release(
-                    fwd_address,
-                    super::DEFAULT_TRAFFIC_ACK_SEQ,
-                    "pre-IS-2000 release before MT page",
-                );
+                if !already_releasing {
+                    self.begin_voice_release(
+                        fwd_address,
+                        super::DEFAULT_TRAFFIC_ACK_SEQ,
+                        "release before MT page",
+                    );
+                }
                 return;
             }
             if let Some(call_id) = a1_call_id {
@@ -1013,13 +1049,15 @@ impl Bsc {
     }
 
     pub(crate) fn resume_voice_page_after_release(&mut self, fwd_address: &MsAddress) {
-        let Some(pending) = self
+        let Some(index) = self
             .voice
-            .deferred_page_after_release
-            .take_if(|pending| pending.fwd_address == *fwd_address)
+            .deferred_pages_after_release
+            .iter()
+            .position(|pending| pending.fwd_address == *fwd_address)
         else {
             return;
         };
+        let pending = self.voice.deferred_pages_after_release.remove(index);
         info!(
             "BSC: traffic release complete; paging pre-IS-2000 mobile for session={}",
             pending.session_id

@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use log::{info, trace};
+use log::{info, trace, warn};
 use num_complex::Complex32;
 
 use super::super::cfo_tracker;
@@ -11,6 +11,7 @@ use super::super::gardner_timing_recovery::{
 use super::super::generic_rake_receiver::{BaseFinger, FingerProgress, RakeFinger};
 use super::interpolation::{interp_complex_clamped, interp_complex_contiguous};
 use crate::phy::coding::long_code::LongCodeGenerator;
+use crate::phy::walsh::WalshGenerator;
 use crate::receiver::pipelined::{PipelineProcessorShared, SampleBlock};
 
 // With Gardner enabled we keep only one neighbor beside the verified prompt to
@@ -60,25 +61,17 @@ pub struct PnLcFinger {
     oversample: usize,
     center_offset: usize,
 
-    /// PN cursor pointing at the next prompt's sample-rate index into
-    /// `pn_seq`. Initialized at finger creation to the punctual cursor
-    /// (`acquisition despread_phase + center_offset`) and advances by
-    /// `oversample` per processed chip — never per sample. Sub-chip
-    /// slews from the EPL loop mutate this by ±1.
+    /// PN/LC sample-rate cursor for the next prompt. Advances by `oversample`
+    /// per chip and is independent of received-sample timing corrections.
     pub(crate) despread_phase: usize,
-    /// The acquisition-time value of `despread_phase`, frozen at finger
-    /// creation. Only used as the `pilot_phase` metadata tag on output
-    /// blocks, downsampled to chip index. Never read for runtime logic.
+    /// Initial `despread_phase`, used only for the output `pilot_phase` tag.
     acquisition_phase: usize,
-    /// Offset (in input samples) into the next received block where the
-    /// next prompt sample lives. Replaces the old
-    /// `samples_to_skip + center_offset + partial_sample_count` triple.
-    /// On finger creation it is set to `samples_to_skip + center_offset`
-    /// (the offset of the first prompt within the first block). After
-    /// each `despread_block` call it carries any leftover sample count
-    /// to the next block. Always satisfies `next_prompt_offset <
-    /// oversample` once we're past the initial skip.
+    /// Received-sample offset of the next prompt; residual offsets carry
+    /// across input blocks.
     pub(crate) next_prompt_offset: f32,
+    /// Last sample from the preceding input block. Fractional timing can move
+    /// the next prompt slightly before the current block boundary.
+    previous_input_sample: Option<Complex32>,
     /// Fractional prompt position in input samples selected during candidate
     /// verification. 0.0 preserves the legacy integer 4x-grid behavior.
     timing_mu_samples: f32,
@@ -131,22 +124,46 @@ pub struct PnLcFinger {
     hpsk_signal_conjugated: bool,
 
     // CFO tracking
-    prev_pilot: Option<Complex32>,
     cfo_rad_per_chip: f32,
     cfo_phase: f32,
     /// RC3 pilot CFO tracker.  When present, this is the sole CFO source;
     /// the legacy 256-chip tracker is disabled and `cfo_rad_per_chip` /
     /// `cfo_phase` are synced from the tracker for diagnostic use only.
     rc3_cfo: Option<cfo_tracker::CfoTracker>,
+    /// Whether eighth-rate reverse pilot gating is active for this bearer.
+    rc3_pilot_gating_mode: bool,
     /// Reverse access CFO tracker (256-chip Walsh-symbol observations,
     /// coherence-gated coasting during data).
     access_cfo: Option<cfo_tracker::CfoTracker>,
-    nonpilot_cfo_tracking: bool,
+    /// RC1 carrier tracker driven by decision-directed 64-ary Walsh symbols.
+    rc1_cfo: Option<cfo_tracker::CfoTracker>,
+    rc1_cfo_walsh_chips: [Complex32; 64],
+    rc1_cfo_walsh_chip_sum: Complex32,
+    rc1_cfo_pn_chip_count: usize,
+    rc1_cfo_walsh_chip_count: usize,
+    rc1_cfo_prev_symbol: Option<Complex32>,
+    rc1_cfo_cross_sum: Complex32,
+    rc1_cfo_cross_magnitude_sum: f32,
+    rc1_cfo_cross_count: usize,
+    rc1_cfo_last_coherence: f32,
+    rc1_cfo_accepted_windows: u64,
+    rc1_cfo_rejected_windows: u64,
     /// CFO pilot observation: accumulate ONLY 16-chip EPL pilot sums
     /// (Walsh-0 coherent) for feeding to the CfoTracker. Completely
     /// separate from the diagnostic accumulators.
     rc3_cfo_pilot_accum: Complex32,
     rc3_cfo_pilot_chips: usize,
+    /// Absolute PCG owning the current pilot accumulator.  Keeping this
+    /// explicit prevents a finger that starts mid-PCG from combining pieces
+    /// of two different PCGs into one phase vector.
+    rc3_cfo_pilot_abs_pcg: Option<usize>,
+    /// Previous complete-PCG pilot vector used for the short-baseline CFO
+    /// phase difference.
+    rc3_cfo_prev_pcg_pilot: Option<Complex32>,
+    /// Circular average of adjacent-PCG pilot cross-products. Eight terms
+    /// provide steady-state noise averaging without reducing capture range.
+    rc3_cfo_pcg_cross_accum: Complex32,
+    rc3_cfo_pcg_cross_count: usize,
 
     /// Propagated from the input block for sub-chain SampleBlock metadata.
     sample_rate_hz: f64,
@@ -180,9 +197,9 @@ pub struct PnLcFinger {
     rc3_pcg_measurement_pilot_coherent_sum: Complex32,
     /// Number of 16-chip pilot symbols accumulated in the current PCG.
     rc3_pcg_measurement_pilot_symbol_count: usize,
-    /// Sliding window of per-PCG pilot moment tuples `(|Σ pilot_sym|²,
-    /// Σ |pilot_sym|², n_symbols)` over the last RC3_PCG_SMOOTH_WINDOW PCGs.
-    rc3_pcg_measurement_smoothing_window: VecDeque<(f64, f64, usize)>,
+    /// Per-PCG power moments over eight PCGs. Pilot SINR and the mobile-power
+    /// metric both come from this window. One PCG is too noisy to drive PCBs.
+    rc3_pcg_measurement_smoothing_window: VecDeque<(f64, f64, usize, f64, usize)>,
 
     // Raw (pre-despread) input power accumulator for Rx Power reporting
     raw_input_power_accum: f64,
@@ -195,12 +212,7 @@ pub struct PnLcFinger {
     /// Per sub-chain stage: (accumulated_ns, name)
     sub_chain_ns: Vec<(u64, &'static str)>,
 
-    // ----- Early/prompt/late chip-timing instrumentation (measurement only) -----
-    //
-    // Pure measurement: never moves `despread_phase`, never affects the
-    // sub-chain output, never feeds back into anything. Activates when the
-    // owning correlator has `cfg.enable_epl_tracking == true` AND the
-    // finger has been hard-validated downstream.
+    // ----- Early/prompt/late chip-timing tracking -----
     //
     // Two metrics are accumulated in parallel at three sub-chip offsets
     // (early = -0.25 chip, prompt = 0 = chip center, late = +0.25 chip):
@@ -249,6 +261,50 @@ pub struct PnLcFinger {
     epl_coh4_run_late: Complex32,
     /// Position within the current 4-chip group (0..4).
     epl_coh4_chip_idx: usize,
+    // Delay-power profile: where the correlation peak sits, so the prompt can
+    // follow it.
+    /// Per-hypothesis running sum over the 4 PN chips of one Walsh chip.
+    delay_profile_run: [Complex32; DELAY_PROFILE_TAPS],
+    /// Per-hypothesis buffer of the 64 Walsh chips of one symbol.
+    delay_profile_walsh: [[Complex32; RC1_WALSH_CHIPS]; DELAY_PROFILE_TAPS],
+    /// Per-hypothesis coherent power for the PCG under judgement.
+    delay_profile_pcg: [f64; DELAY_PROFILE_TAPS],
+    /// Closed-loop delay tracking: repositions the prompt onto the delay that
+    /// actually carries the correlation peak.
+    delay_track_enabled: bool,
+    /// Per-hypothesis coherent power for the current tracking decision.
+    delay_track_acc: [f64; DELAY_PROFILE_TAPS],
+    /// Transmitted PCGs accumulated into `delay_track_acc` so far.
+    delay_track_pcgs: usize,
+    /// Whole chips the prompt has been moved over this finger's life.
+    delay_track_total_chips: isize,
+    /// Prompt shift the tracker has asked for, owned separately from the EPL
+    /// slew so the two actuators cannot silently overwrite each other.
+    delay_slew_pending: Option<f32>,
+    /// Admitted PCGs since the last reposition, for the settling interval.
+    delay_track_pcgs_since_move: usize,
+    /// Frame the PCG quota is being counted against, and how many PCGs of that
+    /// frame have already been fed to the profile.
+    delay_track_frame: usize,
+    delay_track_frame_pcgs: usize,
+    /// Whether the PCG in progress has been counted against the frame quota.
+    delay_track_pcg_counted: bool,
+    /// Prompt envelope power and chip count for the PCG the delay tracker is
+    /// judging, plus its own idle-floor estimate. Kept separate from the EPL
+    /// accumulators so tracking does not depend on that instrumentation.
+    delay_gate_env_prompt: f64,
+    delay_gate_chips: usize,
+    delay_gate_floor: f64,
+    delay_gate_on_pcgs: u64,
+    delay_gate_off_pcgs: u64,
+    /// Fast envelope estimate used to skip profile correlation while the mobile
+    /// is silent. A gated channel transmits a small fraction of its chips, and
+    /// correlating 9 hypotheses through the rest is pure waste.
+    delay_burst_env: f64,
+    /// Chips of the symbol under construction that were inside a burst. Only a
+    /// symbol wholly inside one contributes, so a burst edge cannot enter a
+    /// partially-filled symbol whose peak would be noise.
+    delay_symbol_on_chips: usize,
     /// Per-tap 4-chip coherent squared-magnitude accumulator for the
     /// CURRENT rollup window (resets every `EPL_WINDOW_CHIPS` chips).
     /// Used by the slew loop to compute a per-window discriminator.
@@ -316,22 +372,31 @@ pub struct PnLcFinger {
     // ----- EPL active slew (closed-loop sub-chip timing correction) -----
     /// Enable flag, copied from correlator cfg.
     epl_slew_enabled: bool,
-    /// IIR-smoothed coh4 (E-L)/P discriminator value.
+    /// Pilot or frame-integrated RC1 timing discriminator IIR.
     epl_slew_iir: f64,
-    /// Fractional sub-sample accumulator in [-1, +1]. When it crosses
-    /// ±1, a one-sub-sample slew fires and the accumulator decreases
-    /// by ±1.
+    /// Initial RC1 discriminator bias at the acquired path timing.
+    epl_rc1_bias: Option<f64>,
+    /// RC1 E/P/L power accumulated across one exact 20 ms traffic frame.
+    epl_rc1_frame_early: f64,
+    epl_rc1_frame_prompt: f64,
+    epl_rc1_frame_late: f64,
+    epl_rc1_frame_windows: u8,
+    /// Fractional timing-error accumulator.
     epl_slew_frac: f64,
-    /// Lifetime count of slew events (forward - backward).
-    epl_slew_total: i64,
+    /// Lifetime received-sample correction (forward - backward).
+    epl_slew_total: f64,
     /// Windows since the last slew fired (rate limiter).
     epl_slew_windows_since: u64,
     /// Total windows processed since finger validation (warmup guard).
     epl_slew_windows_total: u64,
     /// Pending slew applied at the start of the next despread loop
     /// iteration. `None` = no slew pending. Signed to allow forward
-    /// (+1) and backward (-1).
-    epl_slew_pending: Option<i32>,
+    /// (positive) and backward (negative).
+    epl_slew_pending: Option<f32>,
+    epl_nonpilot_phy_frames: u64,
+    epl_nonpilot_phy_invalid: u64,
+    epl_nonpilot_fer_bits: u64,
+    epl_nonpilot_fer_frames: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -355,6 +420,57 @@ pub(super) enum PnReferenceKind {
     Oqpsk,
 }
 
+const DELAY_GATE_PCG_CHIPS: usize = 1536;
+
+/// Wide enough to see a delay that has walked whole chips. An early/late gate
+/// spans a quarter chip and reads zero either side of that.
+const DELAY_PROFILE_HALF_CHIPS: usize = 4;
+
+const DELAY_PROFILE_TAPS: usize = 2 * DELAY_PROFILE_HALF_CHIPS + 1;
+
+/// Each hypothesis demodulates the way the decoder does. A 4-chip coherent
+/// window has almost no contrast at RC1 chip-level Ec/Nt.
+const RC1_WALSH_CHIPS: usize = 64;
+const RC1_PN_CHIPS_PER_WALSH_CHIP: usize = 4;
+const RC1_SYMBOL_CHIPS: usize = RC1_WALSH_CHIPS * RC1_PN_CHIPS_PER_WALSH_CHIP;
+
+/// Decaying average rather than accumulate-and-reset, which would keep deciding
+/// on pre-move data for the rest of each block.
+const DELAY_TRACK_ALPHA: f64 = 1.0 / 8.0;
+
+/// A move renames every hypothesis, so the average has to refill before the
+/// profile is trusted again.
+const DELAY_TRACK_WARMUP_PCGS: usize = 8;
+
+/// 2 dB. A whole-chip reposition onto noise is destructive.
+const DELAY_TRACK_MARGIN: f64 = 1.6;
+
+/// Capping the profile at two PCGs a frame pins tracking cost at its 1/8-rate
+/// value instead of letting it swing with the traffic rate: +5% of receive time
+/// against +25% ungated.
+const DELAY_TRACK_PCGS_PER_FRAME: usize = 2;
+
+const DELAY_TRACK_PCGS_PER_FRAME_TOTAL: usize = 16;
+
+/// The argmax oscillates while two paths sit within a decibel of each other, so
+/// a move is followed by a settling period rather than chasing the flicker.
+const DELAY_TRACK_MIN_PCGS_BETWEEN_MOVES: usize = 16;
+
+/// Past this the finger has lost what it acquired and should be pruned rather
+/// than slewed further. Tracking follows a path, it does not hunt for one.
+const DELAY_TRACK_MAX_TOTAL_CHIPS: isize = 24;
+
+/// A burst runs 1536 chips, so a 64-chip time constant settles well inside one.
+const DELAY_BURST_ENV_ALPHA: f64 = 1.0 / 64.0;
+
+/// 6 dB above the idle floor counts as transmitting, against 9-19 dB of
+/// contrast between a transmitted PCG and a gated-off one.
+const DELAY_GATE_ON_FACTOR: f64 = 4.0;
+
+/// Small enough that a burst barely moves the idle floor, large enough to track
+/// a genuine noise-floor rise.
+const DELAY_GATE_FLOOR_LEAK: f64 = 0.001;
+
 /// Number of chips accumulated into one EPL rollup window.
 /// At 4096 chips × ~814 ns/chip ≈ 3.3 ms = 16 Walsh symbols worth.
 const EPL_WINDOW_CHIPS: usize = 4096;
@@ -363,49 +479,50 @@ const EPL_WINDOW_CHIPS: usize = 4096;
 /// 1.2288 M chips ≈ 1 s of signal time at the nominal chip rate.
 const EPL_LOG_CHIP_INTERVAL: u64 = 1_228_800;
 
-/// Number of EPL rollup windows to wait (after hard-validation) before
-/// enabling active slew corrections. Gives the discriminator IIR time
-/// to settle before it starts moving the needle.
-const EPL_SLEW_WARMUP_WINDOWS: u64 = 100;
+const EPL_SLEW_WARMUP_WINDOWS: u64 = 3000;
+
+const EPL_SLEW_DEAD_ZONE: f64 = 0.015;
+
+const EPL_SLEW_ALPHA: f64 = 0.02;
+
+/// RC1 loop gain per 20 ms frame discriminator.
+const EPL_SLEW_LOOP_GAIN: f64 = 0.20;
+
+const EPL_RC1_SLEW_TRIGGER: f64 = 1.0;
 
 /// Pilot-mode warmup: longer because the 16-chip pilot discriminator
 /// has higher per-window variance from multipath asymmetry.
 const EPL_SLEW_WARMUP_WINDOWS_PILOT: u64 = 500;
-
-/// Magnitude of the (E-L)/P discriminator below which no slew is
-/// applied. Suppresses noise-driven slews when the finger is already
-/// aligned.
-const EPL_SLEW_DEAD_ZONE: f64 = 0.15;
 
 /// Pilot-mode dead-zone: wider because the 16-chip pilot discriminator
 /// IIR settles to ±0.15–0.25 even when well-aligned, due to multipath
 /// asymmetry. Real clock drift pushes well past 0.25.
 const EPL_SLEW_DEAD_ZONE_PILOT: f64 = 0.25;
 
-/// IIR smoothing factor for the discriminator. A value of 0.2
-/// means each new window replaces 20% of the smoothed value.
-const EPL_SLEW_ALPHA: f64 = 0.20;
-
 /// Pilot-mode IIR alpha: more smoothing to dampen per-window variance.
 const EPL_SLEW_ALPHA_PILOT: f64 = 0.05;
-
-/// Loop gain: fraction of (sub-sample) integrated per window. 0.05
-/// means a persistent 1.0 discriminator drives 0.05 sub-sample per
-/// window toward the fractional accumulator; 20 windows to cross the
-/// ±1 threshold and fire a slew.
-const EPL_SLEW_LOOP_GAIN: f64 = 0.05;
 
 /// Pilot-mode loop gain: lower to prevent transient spikes from
 /// accumulating enough to fire.
 const EPL_SLEW_LOOP_GAIN_PILOT: f64 = 0.01;
 
-/// Minimum number of EPL windows between consecutive slews. Prevents
-/// runaway at high loop gain.
-const EPL_SLEW_MIN_WINDOWS_BETWEEN: u64 = 50;
-
 /// Pilot-mode min-between: wider spacing since clock drift is slow
 /// (ppm-level) and the pilot discriminator is noisier per-window.
 const EPL_SLEW_MIN_WINDOWS_BETWEEN_PILOT: u64 = 300;
+
+const EPL_SLEW_MIN_WINDOWS_BETWEEN: u64 = 900;
+
+/// EPL actuator step in ADC samples. At the normal 4× chip-rate input this is
+/// 1/16 chip. The prompt interpolator supports fractional sample positions, so
+/// using its resolution avoids a decode-disrupting whole-sample timing jump.
+const EPL_SLEW_STEP_SAMPLES: f32 = 0.25;
+
+/// Six 4096-chip windows are exactly one 20 ms RC1 traffic frame.
+const EPL_RC1_WINDOWS_PER_FRAME: u8 = 6;
+
+const EPL_NONPILOT_FER_WINDOW_FRAMES: u8 = 50;
+const EPL_NONPILOT_FER_WINDOW_MASK: u64 = (1u64 << EPL_NONPILOT_FER_WINDOW_FRAMES) - 1;
+const EPL_RC1_MAX_INVALID_FRAMES_FOR_SLEW: u32 = 5;
 
 /// Pilot CFO tracker sub-window size (steady state).
 /// 128 symbols × 16 chips = 2048 chips ≈ 1.7 ms.
@@ -437,8 +554,24 @@ const RC3_PILOT_SYMBOLS_PER_PCG: usize = RC3_PILOT_CHIPS_PER_PCG / RC3_PILOT_SYM
 const RC3_PCG_SMOOTH_WINDOW: usize = 8;
 
 impl PnLcFinger {
-    pub(super) fn set_nonpilot_cfo_tracking(&mut self, enable: bool) {
-        self.nonpilot_cfo_tracking = enable;
+    #[cfg(test)]
+    pub(crate) fn test_tick_and_validate(&mut self, output: &[SampleBlock], processed_chips: u64) {
+        self.base.tick_and_validate(output, processed_chips);
+    }
+
+    pub(crate) fn set_delay_tracking_enabled(&mut self, enable: bool) {
+        self.delay_track_enabled = enable;
+    }
+
+    pub(crate) fn set_nonpilot_cfo_tracking(&mut self, enable: bool) {
+        if self.rc3_cfo.is_none() && self.access_cfo.is_none() {
+            self.rc1_cfo =
+                enable.then(|| cfo_tracker::CfoTracker::new_rc1_traffic(self.cfo_rad_per_chip));
+        }
+    }
+
+    pub(super) fn set_rc3_pilot_gating_mode(&mut self, enable: bool) {
+        self.rc3_pilot_gating_mode = enable;
     }
 
     /// Per-PCG pilot symbol SINR (dB) from on-axis vs. off-axis decomposition
@@ -468,6 +601,31 @@ impl PnLcFinger {
         10.0 * (linear as f32).log10()
     }
 
+    /// Unbiased reverse-pilot Ec/Io from same-PCG coherent moments.
+    ///
+    /// For N independent L-chip pilot sums, A=|Σp|² and P=Σ|p|².
+    /// (A-P)/(N(N-1)L²) removes the coherent numerator's own noise term and
+    /// estimates desired pilot energy per chip. Io is the total prompt power
+    /// per chip over the complete 1,536-chip PCG.
+    fn true_pilot_ec_io_db_from_metrics(
+        pilot_norm_sq: f64,
+        pilot_prompt_power: f64,
+        n_symbols: usize,
+        prompt_chip_power: f64,
+    ) -> Option<f32> {
+        if n_symbols < 2 || prompt_chip_power <= 1e-12 {
+            return None;
+        }
+        let n = n_symbols as f64;
+        let l = RC3_PILOT_SYMBOL_CHIPS as f64;
+        let pilot_ec = (pilot_norm_sq - pilot_prompt_power) / (n * (n - 1.0) * l * l);
+        let io = prompt_chip_power / RC3_PCG_CHIPS as f64;
+        if pilot_ec <= 0.0 || io <= 0.0 {
+            return None;
+        }
+        Some(10.0 * (pilot_ec / io).log10() as f32)
+    }
+
     fn reset_rc3_pcg_measurement(&mut self) {
         self.rc3_pcg_measurement_abs_chip_start = None;
         self.rc3_pcg_measurement_raw_input_power = 0.0;
@@ -495,14 +653,28 @@ impl PnLcFinger {
         let pilot_norm_sq = self.rc3_pcg_measurement_pilot_coherent_sum.norm_sqr() as f64;
         let n_symbols_this_pcg = self.rc3_pcg_measurement_pilot_symbol_count;
         let pilot_prompt_power_this_pcg = self.rc3_pcg_measurement_pilot_prompt_power;
-        let mobile_power_dbfs = super::super::rc3_mobile_power_dbfs(
+        let traffic_symbols_this_pcg = RC3_PCG_CHIPS / RC3_PILOT_SYMBOL_CHIPS;
+        let instant_mobile_power_dbfs = super::super::rc3_mobile_power_dbfs(
             pilot_norm_sq,
             pilot_prompt_power_this_pcg,
             n_symbols_this_pcg,
             self.rc3_pcg_measurement_traffic_prompt_power,
-            RC3_PCG_CHIPS / RC3_PILOT_SYMBOL_CHIPS,
+            traffic_symbols_this_pcg,
         );
-        let (raw_sinr_db, sinr_db, ec_io_db, smoothing_window_len) = if hard_validated {
+        let instant_pilot_power_dbfs = super::super::rc3_pilot_power_dbfs(
+            pilot_norm_sq,
+            pilot_prompt_power_this_pcg,
+            n_symbols_this_pcg,
+        );
+        let (
+            raw_sinr_db,
+            sinr_db,
+            mobile_power_dbfs,
+            pilot_power_dbfs,
+            true_ec_io_db,
+            legacy_ec_io_db,
+            smoothing_window_len,
+        ) = if hard_validated {
             let raw_sinr_db = Self::pilot_sym_sinr_db_from_metrics(
                 pilot_norm_sq,
                 pilot_prompt_power_this_pcg,
@@ -515,25 +687,48 @@ impl PnLcFinger {
                 pilot_norm_sq,
                 pilot_prompt_power_this_pcg,
                 n_symbols_this_pcg,
+                self.rc3_pcg_measurement_traffic_prompt_power,
+                traffic_symbols_this_pcg,
             ));
             // K factor cancels in the ratio: pass per-PCG N below (not K*N),
             // or SINR is mis-reported by 10·log10(K) dB low.
             let mut window_norm_sq = 0.0_f64;
             let mut window_prompt_pwr = 0.0_f64;
+            let mut window_traffic_pwr = 0.0_f64;
             let mut window_pcgs = 0_usize;
-            for &(ns, pp, _) in &self.rc3_pcg_measurement_smoothing_window {
+            for &(ns, pp, _, tp, _) in &self.rc3_pcg_measurement_smoothing_window {
                 window_norm_sq += ns;
                 window_prompt_pwr += pp;
+                window_traffic_pwr += tp;
                 window_pcgs += 1;
             }
             let avg_norm_sq = window_norm_sq / window_pcgs.max(1) as f64;
             let avg_prompt_pwr = window_prompt_pwr / window_pcgs.max(1) as f64;
+            let avg_traffic_pwr = window_traffic_pwr / window_pcgs.max(1) as f64;
             (
                 Some(raw_sinr_db),
                 Self::pilot_sym_sinr_db_from_metrics(
                     avg_norm_sq,
                     avg_prompt_pwr,
                     RC3_PILOT_SYMBOLS_PER_PCG,
+                ),
+                super::super::rc3_mobile_power_dbfs(
+                    avg_norm_sq,
+                    avg_prompt_pwr,
+                    RC3_PILOT_SYMBOLS_PER_PCG,
+                    avg_traffic_pwr,
+                    traffic_symbols_this_pcg,
+                ),
+                super::super::rc3_pilot_power_dbfs(
+                    avg_norm_sq,
+                    avg_prompt_pwr,
+                    RC3_PILOT_SYMBOLS_PER_PCG,
+                ),
+                Self::true_pilot_ec_io_db_from_metrics(
+                    pilot_norm_sq,
+                    self.rc3_pcg_measurement_pilot_prompt_power,
+                    n_symbols_this_pcg,
+                    self.rc3_pcg_measurement_prompt_chip_power,
                 ),
                 Some(Self::pilot_ec_io_db_from_prompt_power(
                     self.rc3_pcg_measurement_pilot_prompt_power,
@@ -543,7 +738,19 @@ impl PnLcFinger {
             )
         } else {
             self.rc3_pcg_measurement_smoothing_window.clear();
-            (None, f32::NAN, None, 0)
+            (
+                None,
+                f32::NAN,
+                instant_mobile_power_dbfs,
+                super::super::rc3_pilot_power_dbfs(
+                    pilot_norm_sq,
+                    pilot_prompt_power_this_pcg,
+                    n_symbols_this_pcg,
+                ),
+                None,
+                None,
+                0,
+            )
         };
         let chip_rate_hz = if self.oversample > 0 {
             self.sample_rate_hz / self.oversample as f64
@@ -565,10 +772,39 @@ impl PnLcFinger {
             "traffic_pcg_mobile_power_mdbfs",
             (mobile_power_dbfs * 1000.0) as i64,
         );
-        if let Some(ec_io_db) = ec_io_db {
-            block
-                .tags
-                .insert("traffic_pcg_pilot_ec_io_mdb", (ec_io_db * 1000.0) as i64);
+        block.tags.insert(
+            "traffic_pcg_mobile_power_instant_mdbfs",
+            (instant_mobile_power_dbfs * 1000.0) as i64,
+        );
+        if instant_pilot_power_dbfs.is_finite() {
+            block.tags.insert(
+                "traffic_pcg_pilot_power_instant_mdbfs",
+                (instant_pilot_power_dbfs * 1000.0) as i64,
+            );
+        }
+        // A noise-subtracted pilot estimate is intentionally NaN when the
+        // coherent term is not measurable.  Never cast that NaN to an integer:
+        // Rust maps it to zero, which looks like a 0 dBFS (extremely hot)
+        // mobile and makes closed-loop power control command the mobile down
+        // precisely when its pilot has disappeared.  Absence of the tag keeps
+        // the observation invalid so the controller can hold its predictor.
+        if pilot_power_dbfs.is_finite() {
+            block.tags.insert(
+                "traffic_pcg_pilot_power_mdbfs",
+                (pilot_power_dbfs * 1000.0) as i64,
+            );
+        }
+        if let Some(ec_io_db) = true_ec_io_db {
+            block.tags.insert(
+                "traffic_pcg_pilot_ec_io_true_mdb",
+                (ec_io_db * 1000.0) as i64,
+            );
+        }
+        if let Some(ec_io_db) = legacy_ec_io_db {
+            block.tags.insert(
+                "traffic_pcg_pilot_ec_io_legacy_mdb",
+                (ec_io_db * 1000.0) as i64,
+            );
         }
         if let Some(raw_sinr_db) = raw_sinr_db {
             block.tags.insert(
@@ -645,7 +881,7 @@ impl PnLcFinger {
 
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn new(
+    pub(crate) fn new(
         id: u64,
         pn_seq: Arc<Vec<Complex32>>,
         phase_period: usize,
@@ -734,6 +970,11 @@ impl PnLcFinger {
         // still passes the old-convention `(despread_phase,
         // center_offset)` pair for backward compatibility.
         let prompt_phase = (despread_phase + center_offset) % phase_period;
+        let effective_initial_cfo = if epl_pilot {
+            cfo_tracker::CfoTracker::rc3_principal_alias(initial_cfo_rad_per_chip)
+        } else {
+            initial_cfo_rad_per_chip
+        };
         Self {
             base: BaseFinger::new(id),
             pn_seq,
@@ -743,6 +984,7 @@ impl PnLcFinger {
             despread_phase: prompt_phase,
             acquisition_phase: prompt_phase,
             next_prompt_offset: samples_to_skip as f32 + center_offset as f32 + timing_mu_samples,
+            previous_input_sample: None,
             timing_mu_samples,
             output_oversampled_chips,
             integrate_and_dump,
@@ -766,16 +1008,16 @@ impl PnLcFinger {
             hpsk_chip_count: lc_chip_counter,
             hpsk_dec_q: 1.0,
             hpsk_signal_conjugated,
-            prev_pilot: None,
-            cfo_rad_per_chip: initial_cfo_rad_per_chip,
+            cfo_rad_per_chip: effective_initial_cfo,
             cfo_phase: 0.0,
             rc3_cfo: if epl_pilot {
                 Some(cfo_tracker::CfoTracker::new_rc3_traffic(
-                    initial_cfo_rad_per_chip,
+                    effective_initial_cfo,
                 ))
             } else {
                 None
             },
+            rc3_pilot_gating_mode: false,
             access_cfo: if access_cfo {
                 Some(cfo_tracker::CfoTracker::new_reverse_access(
                     initial_cfo_rad_per_chip,
@@ -783,9 +1025,24 @@ impl PnLcFinger {
             } else {
                 None
             },
-            nonpilot_cfo_tracking: true,
+            rc1_cfo: None,
+            rc1_cfo_walsh_chips: [Complex32::new(0.0, 0.0); 64],
+            rc1_cfo_walsh_chip_sum: Complex32::new(0.0, 0.0),
+            rc1_cfo_pn_chip_count: 0,
+            rc1_cfo_walsh_chip_count: 0,
+            rc1_cfo_prev_symbol: None,
+            rc1_cfo_cross_sum: Complex32::new(0.0, 0.0),
+            rc1_cfo_cross_magnitude_sum: 0.0,
+            rc1_cfo_cross_count: 0,
+            rc1_cfo_last_coherence: 0.0,
+            rc1_cfo_accepted_windows: 0,
+            rc1_cfo_rejected_windows: 0,
             rc3_cfo_pilot_accum: Complex32::new(0.0, 0.0),
             rc3_cfo_pilot_chips: 0,
+            rc3_cfo_pilot_abs_pcg: None,
+            rc3_cfo_prev_pcg_pilot: None,
+            rc3_cfo_pcg_cross_accum: Complex32::new(0.0, 0.0),
+            rc3_cfo_pcg_cross_count: 0,
             sample_rate_hz: 0.0,
             detection_snr,
             peak_energy: 0.0,
@@ -829,6 +1086,25 @@ impl PnLcFinger {
             epl_coh4_run_prompt: Complex32::new(0.0, 0.0),
             epl_coh4_run_late: Complex32::new(0.0, 0.0),
             epl_coh4_chip_idx: 0,
+            delay_profile_run: [Complex32::new(0.0, 0.0); DELAY_PROFILE_TAPS],
+            delay_profile_walsh: [[Complex32::new(0.0, 0.0); RC1_WALSH_CHIPS]; DELAY_PROFILE_TAPS],
+            delay_profile_pcg: [0.0; DELAY_PROFILE_TAPS],
+            delay_track_enabled: false,
+            delay_track_acc: [0.0; DELAY_PROFILE_TAPS],
+            delay_track_pcgs: 0,
+            delay_track_total_chips: 0,
+            delay_slew_pending: None,
+            delay_track_pcgs_since_move: DELAY_TRACK_MIN_PCGS_BETWEEN_MOVES,
+            delay_track_frame: usize::MAX,
+            delay_track_frame_pcgs: 0,
+            delay_track_pcg_counted: false,
+            delay_gate_env_prompt: 0.0,
+            delay_gate_chips: 0,
+            delay_gate_floor: 0.0,
+            delay_gate_on_pcgs: 0,
+            delay_gate_off_pcgs: 0,
+            delay_burst_env: 0.0,
+            delay_symbol_on_chips: 0,
             epl_window_coh4_pwr_early: 0.0,
             epl_window_coh4_pwr_prompt: 0.0,
             epl_window_coh4_pwr_late: 0.0,
@@ -863,11 +1139,20 @@ impl PnLcFinger {
             epl_last_log_pilot_ec_io_db: None,
             epl_slew_enabled: enable_epl_slew && enable_epl_tracking,
             epl_slew_iir: 0.0,
+            epl_rc1_bias: None,
+            epl_rc1_frame_early: 0.0,
+            epl_rc1_frame_prompt: 0.0,
+            epl_rc1_frame_late: 0.0,
+            epl_rc1_frame_windows: 0,
             epl_slew_frac: 0.0,
-            epl_slew_total: 0,
+            epl_slew_total: 0.0,
             epl_slew_windows_since: 0,
             epl_slew_windows_total: 0,
             epl_slew_pending: None,
+            epl_nonpilot_phy_frames: 0,
+            epl_nonpilot_phy_invalid: 0,
+            epl_nonpilot_fer_bits: 0,
+            epl_nonpilot_fer_frames: 0,
         }
     }
 
@@ -903,6 +1188,25 @@ impl PnLcFinger {
             prompt_pn * prompt_val
         } else {
             acc
+        }
+    }
+
+    fn interp_input(&self, samples: &[Complex32], t: f32) -> Option<Complex32> {
+        if t >= 0.0 {
+            return interp_complex_contiguous(samples, t);
+        }
+        if t < -1.0 || samples.is_empty() {
+            return None;
+        }
+
+        let previous = self.previous_input_sample?;
+        let mu = t + 1.0;
+        Some(previous + (samples[0] - previous) * mu)
+    }
+
+    fn remember_input_tail(&mut self, samples: &[Complex32]) {
+        if let Some(&last) = samples.last() {
+            self.previous_input_sample = Some(last);
         }
     }
 
@@ -993,11 +1297,8 @@ impl PnLcFinger {
     ///
     /// ## Slewing
     ///
-    /// EPL slewing bumps `despread_phase` by ±1 (PN slides one
-    /// sub-sample) and the corresponding `next_prompt_offset` by ±1
-    /// (the prompt input sample shifts in lockstep). Both shifts move
-    /// the despreading reference together so PN and LC framing stay
-    /// locked.
+    /// EPL slewing moves only received-sample time. Its PN/LC chip-time
+    /// reference remains fixed.
     pub(crate) fn despread_block(&mut self, samples: &[Complex32]) {
         let os = self.oversample;
         let pp = self.phase_period;
@@ -1014,7 +1315,11 @@ impl PnLcFinger {
         // slightly-early `timing_mu` at the first replay sample. That prompt is
         // before the available input block, so skip that chip while keeping PN
         // and LC cursors in lockstep.
-        while self.next_prompt_offset < 0.0 {
+        while self.next_prompt_offset < 0.0
+            && self
+                .interp_input(samples, self.next_prompt_offset)
+                .is_none()
+        {
             let pn = self.pn_seq[self.despread_phase];
             self.advance_lc_for_new_chip(pn);
             self.despread_phase = (self.despread_phase + os) % pp;
@@ -1025,33 +1330,39 @@ impl PnLcFinger {
         // decrement the offset and return — no chips to process.
         if self.next_prompt_offset >= len_f {
             self.next_prompt_offset -= len_f;
+            self.remember_input_tail(samples);
             return;
         }
 
         let mut idx = self.next_prompt_offset;
         while idx < len_f {
-            // Apply any pending EPL slew BEFORE reading PN / advancing
-            // LC, so PN and chip framing stay locked to the new
-            // reference position. A ±1 slew shifts both the PN cursor
-            // and the prompt input sample by one sub-sample. If the
-            // slew would push the prompt past the end of this block,
-            // clamp and carry leftover into the next block.
+            // Delay tracking owns its own prompt shift. Both actuators move
+            // received-sample time the same way, but keeping them in separate
+            // slots means neither can silently discard the other's request.
+            if let Some(shift) = self.delay_slew_pending.take() {
+                let old_idx = idx;
+                idx += shift;
+                info!(
+                    "DELAY_SLEW[finger={}] shift={:+.2}sample idx={:.3}->{:.3} total={:+} chip",
+                    self.base.id, shift, old_idx, idx, self.delay_track_total_chips,
+                );
+                if idx >= len_f {
+                    self.next_prompt_offset = idx - len_f;
+                    self.remember_input_tail(samples);
+                    return;
+                }
+            }
+
+            // Apply any pending EPL slew before reading the prompt sample.
+            // Timing moves received-sample time relative to a fixed PN/LC
+            // reference.
             if let Some(slew) = self.epl_slew_pending.take() {
                 let old_dp = self.despread_phase;
                 let old_idx = idx;
-                if slew >= 0 {
-                    let delta = slew as usize;
-                    self.despread_phase = (self.despread_phase + delta) % pp;
-                    idx += delta as f32;
-                } else {
-                    let delta = (-slew) as usize;
-                    // Backward slew: wrap through phase_period if needed.
-                    self.despread_phase = (self.despread_phase + pp - delta) % pp;
-                    idx = (idx - delta as f32).max(0.0);
-                }
+                idx += slew;
                 info!(
-                    "EPL_SLEW[finger={}] direction={:+} despread_phase={}->{} \
-                     idx={}->{} total={}",
+                    "EPL_SLEW[finger={}] direction={:+.2}sample despread_phase={}->{} \
+                     idx={:.3}->{:.3} total={:+.2}sample",
                     self.base.id,
                     slew,
                     old_dp,
@@ -1064,12 +1375,13 @@ impl PnLcFinger {
                     // Slew pushed the prompt out of the current block;
                     // carry the shortfall to the next call.
                     self.next_prompt_offset = idx - len_f;
+                    self.remember_input_tail(samples);
                     return;
                 }
             }
 
             // Per-chip iteration: this iter is a prompt by construction.
-            let Some(val) = interp_complex_contiguous(samples, idx) else {
+            let Some(val) = self.interp_input(samples, idx) else {
                 break;
             };
             let mut gardner_adjust = GardnerTimingAdjustment::default();
@@ -1078,7 +1390,7 @@ impl PnLcFinger {
                 .gardner_timing
                 .as_ref()
                 .filter(|gardner| gardner.is_tracking_active() && gardner.needs_midpoint())
-                .and_then(|_| interp_complex_contiguous(samples, idx - os as f32 * 0.5));
+                .and_then(|_| self.interp_input(samples, idx - os as f32 * 0.5));
             if let Some(gardner) = self.gardner_timing.as_mut() {
                 if gardner.is_tracking_active() {
                     gardner_adjust = gardner.observe(val, gardner_mid);
@@ -1099,10 +1411,39 @@ impl PnLcFinger {
 
             let epl_active =
                 self.epl_enabled && self.current_chip_enabled && self.base.is_hard_validated();
+            // Delay tracking stands on its own: it must run on production
+            // configurations that leave the EPL instrumentation switched off.
+            let delay_active = self.delay_track_enabled
+                && self.current_chip_enabled
+                && self.base.is_hard_validated();
 
             if self.current_chip_enabled {
                 let out = despread * self.current_lc_conj;
                 let chip_tx = self.lc_chip_counter.saturating_sub(1);
+                if delay_active {
+                    let power = out.norm_sqr() as f64;
+                    self.delay_gate_env_prompt += power;
+                    self.delay_gate_chips += 1;
+                    self.delay_burst_env += DELAY_BURST_ENV_ALPHA * (power - self.delay_burst_env);
+                    if chip_tx % RC1_SYMBOL_CHIPS == 0 {
+                        self.delay_symbol_on_chips = 0;
+                    }
+                    if chip_tx % DELAY_GATE_PCG_CHIPS == 0 {
+                        self.delay_track_start_pcg(chip_tx);
+                    }
+                    // Correlating the hypotheses is the expensive part, so do it
+                    // only while the mobile is transmitting, and only for this
+                    // frame's quota of PCGs.
+                    if self.delay_burst_env > DELAY_GATE_ON_FACTOR * self.delay_gate_floor
+                        && self.delay_track_frame_quota_available()
+                    {
+                        self.delay_symbol_on_chips += 1;
+                        self.accumulate_delay_profile_chip(samples, idx, chip_tx);
+                    }
+                    if (chip_tx + 1) % DELAY_GATE_PCG_CHIPS == 0 {
+                        self.delay_commit_gated_pcg();
+                    }
+                }
                 let mut pcg_measurement_prompt_chip = out;
                 if self.output_oversampled_chips && self.oversample > 1 {
                     let center = self.center_offset % self.oversample;
@@ -1141,19 +1482,27 @@ impl PnLcFinger {
                     // Envelope (non-coherent) — always accumulated.
                     self.epl_window_env_prompt += out.norm_sqr() as f64;
 
-                    // Compute early/late despread values (shared by both modes).
-                    let out_e = if idx >= 1.0 {
-                        let val_e = interp_complex_contiguous(samples, idx - 1.0).unwrap_or(val);
-                        let pn_e = self.pn_seq[(self.despread_phase + pp - 1) % pp];
+                    // RC3 measures adjacent received-sample hypotheses against
+                    // the same HPSK PN/LC reference. RC1 measures them against
+                    // adjacent PN phases instead, because it has no pilot to
+                    // hold a common reference against.
+                    let out_e = self.interp_input(samples, idx - 1.0).map(|val_e| {
+                        let pn_e = if self.epl_pilot_mode {
+                            pn
+                        } else {
+                            self.pn_seq[(self.despread_phase + pp - 1) % pp]
+                        };
                         let e = pn_e * val_e * self.current_lc_conj;
                         self.epl_window_env_early += e.norm_sqr() as f64;
-                        Some(e)
-                    } else {
-                        None
-                    };
+                        e
+                    });
                     let out_l = if idx + 1.0 < len_f {
                         let val_l = interp_complex_contiguous(samples, idx + 1.0).unwrap_or(val);
-                        let pn_l = self.pn_seq[(self.despread_phase + 1) % pp];
+                        let pn_l = if self.epl_pilot_mode {
+                            pn
+                        } else {
+                            self.pn_seq[(self.despread_phase + 1) % pp]
+                        };
                         let l = pn_l * val_l * self.current_lc_conj;
                         self.epl_window_env_late += l.norm_sqr() as f64;
                         Some(l)
@@ -1189,6 +1538,21 @@ impl PnLcFinger {
                 }
             }
 
+            if gardner_adjust.integer_slew_samples != 0
+                && let Some(gardner) = self.gardner_timing.as_ref()
+            {
+                info!(
+                    "GARDNER_SLEW[finger={}] direction={:+}sample offset={:+.3}sample error={:+.4} updates={} skipped={} chip_tx={}",
+                    self.base.id,
+                    gardner_adjust.integer_slew_samples,
+                    gardner.offset_samples(),
+                    gardner_adjust.error,
+                    gardner.updates(),
+                    gardner.skipped(),
+                    self.lc_chip_counter,
+                );
+            }
+
             let phase_step = os as i32 + gardner_adjust.integer_slew_samples;
             if phase_step >= 0 {
                 self.despread_phase = (self.despread_phase + phase_step as usize) % pp;
@@ -1200,6 +1564,7 @@ impl PnLcFinger {
 
         // Carry leftover offset into the next block.
         self.next_prompt_offset = idx - len_f;
+        self.remember_input_tail(samples);
     }
 
     /// Called once per completed chip when EPL tracking is active. Advances
@@ -1220,15 +1585,53 @@ impl PnLcFinger {
                     self.epl_window_pilot_pwr_late += self.epl_pilot_run_late.norm_sqr() as f64;
                 }
 
-                // Pilot CFO tracking: accumulate 16-chip pilot sums over
-                // 8 PCGs (12288 chips) for a high-SNR phase measurement.
-                // Shorter windows (e.g. 1 PCG) widen the unambiguous range but
-                // produce noise-dominated observations that degrade tracking.
-                if is_pilot_symbol && let Some(ref mut cfo) = self.rc3_cfo {
+                // One pilot vector per PCG. Warmup updates every PCG, steady
+                // state averages eight cross products first.
+                if is_pilot_symbol && self.rc3_cfo.is_some() {
+                    let abs_pcg = symbol_start / RC3_PCG_CHIPS;
+                    if self.rc3_cfo_pilot_abs_pcg != Some(abs_pcg) {
+                        // Discard an incomplete vector left by a mid-PCG
+                        // finger start, which has no well-defined phase center.
+                        self.rc3_cfo_pilot_abs_pcg = Some(abs_pcg);
+                        self.rc3_cfo_pilot_accum = Complex32::new(0.0, 0.0);
+                        self.rc3_cfo_pilot_chips = 0;
+                    }
                     self.rc3_cfo_pilot_accum += prompt;
                     self.rc3_cfo_pilot_chips += 16;
-                    if self.rc3_cfo_pilot_chips >= 8 * RC3_PILOT_CHIPS_PER_PCG {
-                        cfo.observe_pilot(self.rc3_cfo_pilot_accum, self.rc3_cfo_pilot_chips);
+                    if self.rc3_cfo_pilot_chips >= RC3_PILOT_CHIPS_PER_PCG {
+                        let pcg_pilot = self.rc3_cfo_pilot_accum;
+                        let transmitted = !self.rc3_pilot_gating_mode || abs_pcg % 4 >= 2;
+                        if transmitted {
+                            let warmup = self.rc3_cfo.as_ref().is_some_and(|cfo| cfo.in_warmup());
+                            if warmup {
+                                if let Some(ref mut cfo) = self.rc3_cfo {
+                                    cfo.observe_pilot(pcg_pilot, RC3_PCG_CHIPS);
+                                }
+                            } else if let Some(previous) = self.rc3_cfo_prev_pcg_pilot {
+                                self.rc3_cfo_pcg_cross_accum +=
+                                    pcg_pilot * Complex32::new(previous.re, -previous.im);
+                                self.rc3_cfo_pcg_cross_count += 1;
+                                if self.rc3_cfo_pcg_cross_count >= 8 {
+                                    if let Some(ref mut cfo) = self.rc3_cfo {
+                                        cfo.observe_pilot_cross_sum(
+                                            self.rc3_cfo_pcg_cross_accum,
+                                            RC3_PCG_CHIPS,
+                                        );
+                                    }
+                                    self.rc3_cfo_pcg_cross_accum = Complex32::new(0.0, 0.0);
+                                    self.rc3_cfo_pcg_cross_count = 0;
+                                }
+                            }
+                            self.rc3_cfo_prev_pcg_pilot = Some(pcg_pilot);
+                        } else {
+                            // Do not let the next active phase compare against
+                            // either receiver noise or an active vector three
+                            // PCGs old while still dividing by one-PCG time.
+                            if let Some(ref mut cfo) = self.rc3_cfo {
+                                cfo.clear_pilot_baseline();
+                            }
+                            self.rc3_cfo_prev_pcg_pilot = None;
+                        }
                         self.rc3_cfo_pilot_accum = Complex32::new(0.0, 0.0);
                         self.rc3_cfo_pilot_chips = 0;
                     }
@@ -1346,16 +1749,284 @@ impl PnLcFinger {
         }
     }
 
-    /// Evaluate the closed-loop EPL slew controller using the just-
-    /// finished rollup window's coh4 power values. Updates the IIR,
-    /// fractional accumulator, and sets `epl_slew_pending` if a ±1
-    /// sub-sample slew is warranted. Applied at the start of the next
-    /// despread iteration.
+    fn observe_rc1_cfo_chips(&mut self, chips: &[Complex32], first_abs_chip: usize) {
+        const CHIPS_PER_WALSH_CHIP: usize = 4;
+        const CHIPS_PER_SYMBOL: usize = 256;
+        const CROSS_PRODUCTS_PER_UPDATE: usize = 32;
+        const MIN_PEAK_TO_REST: f32 = 4.0;
+        const MIN_CIRCULAR_COHERENCE: f32 = 0.85;
+
+        if self.rc1_cfo.is_none() {
+            return;
+        }
+
+        for (offset, &chip) in chips.iter().enumerate() {
+            let abs_chip = first_abs_chip.saturating_add(offset);
+            if abs_chip % CHIPS_PER_SYMBOL == 0 {
+                self.rc1_cfo_walsh_chips.fill(Complex32::new(0.0, 0.0));
+                self.rc1_cfo_walsh_chip_sum = Complex32::new(0.0, 0.0);
+                self.rc1_cfo_pn_chip_count = 0;
+                self.rc1_cfo_walsh_chip_count = 0;
+            }
+            self.rc1_cfo_walsh_chip_sum += chip;
+            self.rc1_cfo_pn_chip_count += 1;
+
+            if abs_chip % CHIPS_PER_WALSH_CHIP != CHIPS_PER_WALSH_CHIP - 1 {
+                continue;
+            }
+            if self.rc1_cfo_pn_chip_count == CHIPS_PER_WALSH_CHIP
+                && self.rc1_cfo_walsh_chip_count < self.rc1_cfo_walsh_chips.len()
+            {
+                self.rc1_cfo_walsh_chips[self.rc1_cfo_walsh_chip_count] =
+                    self.rc1_cfo_walsh_chip_sum;
+                self.rc1_cfo_walsh_chip_count += 1;
+            }
+            self.rc1_cfo_walsh_chip_sum = Complex32::new(0.0, 0.0);
+            self.rc1_cfo_pn_chip_count = 0;
+
+            if abs_chip % CHIPS_PER_SYMBOL != CHIPS_PER_SYMBOL - 1
+                || self.rc1_cfo_walsh_chip_count != self.rc1_cfo_walsh_chips.len()
+            {
+                continue;
+            }
+
+            WalshGenerator::fwht_fixed(&mut self.rc1_cfo_walsh_chips);
+            let (peak_index, peak_power) = self
+                .rc1_cfo_walsh_chips
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (index, value.norm_sqr()))
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .expect("64 Walsh bins");
+            let total_power = self
+                .rc1_cfo_walsh_chips
+                .iter()
+                .map(|value| value.norm_sqr())
+                .sum::<f32>();
+            let mean_rest = ((total_power - peak_power)
+                / (self.rc1_cfo_walsh_chips.len() - 1) as f32)
+                .max(1e-12);
+            let symbol = self.rc1_cfo_walsh_chips[peak_index];
+
+            if peak_power / mean_rest >= MIN_PEAK_TO_REST {
+                if let Some(previous) = self.rc1_cfo_prev_symbol {
+                    let cross = symbol * previous.conj();
+                    self.rc1_cfo_cross_sum += cross;
+                    self.rc1_cfo_cross_magnitude_sum += cross.norm();
+                    self.rc1_cfo_cross_count += 1;
+                }
+                self.rc1_cfo_prev_symbol = Some(symbol);
+            } else {
+                self.rc1_cfo_prev_symbol = None;
+            }
+
+            if self.rc1_cfo_cross_count < CROSS_PRODUCTS_PER_UPDATE {
+                continue;
+            }
+
+            let coherence = if self.rc1_cfo_cross_magnitude_sum > 1e-12 {
+                self.rc1_cfo_cross_sum.norm() / self.rc1_cfo_cross_magnitude_sum
+            } else {
+                0.0
+            };
+            self.rc1_cfo_last_coherence = coherence;
+            if coherence >= MIN_CIRCULAR_COHERENCE {
+                if self
+                    .rc1_cfo
+                    .as_mut()
+                    .is_some_and(|cfo| cfo.observe_rc1_walsh_cross_sum(self.rc1_cfo_cross_sum))
+                {
+                    self.rc1_cfo_accepted_windows += 1;
+                } else {
+                    self.rc1_cfo_rejected_windows += 1;
+                }
+            } else {
+                self.rc1_cfo_rejected_windows += 1;
+            }
+            self.rc1_cfo_cross_sum = Complex32::new(0.0, 0.0);
+            self.rc1_cfo_cross_magnitude_sum = 0.0;
+            self.rc1_cfo_cross_count = 0;
+        }
+    }
+
+    /// Despread this chip at every delay hypothesis.
+    ///
+    /// A hypothesis moves the arrival time only. Shifting the PN and long code
+    /// with it would leave the alignment unchanged and every tap identical.
+    fn accumulate_delay_profile_chip(&mut self, samples: &[Complex32], idx: f32, chip_tx: usize) {
+        let os = self.oversample as isize;
+        let pn = self.pn_seq[self.despread_phase];
+        let lc_conj = self.current_lc_conj;
+        for tap in 0..DELAY_PROFILE_TAPS {
+            let chip_shift = tap as isize - DELAY_PROFILE_HALF_CHIPS as isize;
+            let Some(val) = self.interp_input(samples, idx + (chip_shift * os) as f32) else {
+                continue;
+            };
+            self.delay_profile_run[tap] += pn * val * lc_conj;
+        }
+
+        let sub_chip = chip_tx % RC1_PN_CHIPS_PER_WALSH_CHIP;
+        if sub_chip != RC1_PN_CHIPS_PER_WALSH_CHIP - 1 {
+            return;
+        }
+        let walsh_chip = (chip_tx % RC1_SYMBOL_CHIPS) / RC1_PN_CHIPS_PER_WALSH_CHIP;
+        for tap in 0..DELAY_PROFILE_TAPS {
+            self.delay_profile_walsh[tap][walsh_chip] = self.delay_profile_run[tap];
+            self.delay_profile_run[tap] = Complex32::new(0.0, 0.0);
+        }
+        if walsh_chip != RC1_WALSH_CHIPS - 1 {
+            return;
+        }
+        // A symbol only partly inside a burst has a noise peak, so drop it.
+        if self.delay_symbol_on_chips < RC1_SYMBOL_CHIPS {
+            self.delay_profile_run = [Complex32::new(0.0, 0.0); DELAY_PROFILE_TAPS];
+            self.delay_profile_walsh =
+                [[Complex32::new(0.0, 0.0); RC1_WALSH_CHIPS]; DELAY_PROFILE_TAPS];
+            return;
+        }
+        for tap in 0..DELAY_PROFILE_TAPS {
+            let bins = &mut self.delay_profile_walsh[tap];
+            WalshGenerator::fwht_fixed(bins);
+            let peak = bins.iter().map(|bin| bin.norm_sqr()).fold(0.0f32, f32::max);
+            self.delay_profile_pcg[tap] += peak as f64;
+            bins.fill(Complex32::new(0.0, 0.0));
+        }
+    }
+
+    /// Open a new PCG for the delay tracker, rolling the per-frame quota over
+    /// when the frame changes.
+    fn delay_track_start_pcg(&mut self, chip_tx: usize) {
+        let frame = chip_tx / (DELAY_GATE_PCG_CHIPS * DELAY_TRACK_PCGS_PER_FRAME_TOTAL);
+        if frame != self.delay_track_frame {
+            self.delay_track_frame = frame;
+            self.delay_track_frame_pcgs = 0;
+        }
+        self.delay_track_pcg_counted = false;
+    }
+
+    /// Whether this PCG may be fed to the profile, consuming a frame quota slot
+    /// the first time the PCG is admitted.
+    fn delay_track_frame_quota_available(&mut self) -> bool {
+        if self.delay_track_pcg_counted {
+            return true;
+        }
+        if self.delay_track_frame_pcgs >= DELAY_TRACK_PCGS_PER_FRAME {
+            return false;
+        }
+        self.delay_track_frame_pcgs += 1;
+        self.delay_track_pcg_counted = true;
+        true
+    }
+
+    /// Drop the accumulated profile. Called when the sample origin moves, which
+    /// leaves it referring to a timing reference that is gone.
+    pub(crate) fn reset_delay_tracking(&mut self) {
+        self.delay_track_acc = [0.0; DELAY_PROFILE_TAPS];
+        self.delay_profile_pcg = [0.0; DELAY_PROFILE_TAPS];
+        self.delay_profile_run = [Complex32::new(0.0, 0.0); DELAY_PROFILE_TAPS];
+        self.delay_profile_walsh =
+            [[Complex32::new(0.0, 0.0); RC1_WALSH_CHIPS]; DELAY_PROFILE_TAPS];
+        self.delay_track_pcgs = 0;
+        self.delay_symbol_on_chips = 0;
+        self.delay_slew_pending = None;
+    }
+
+    /// Fold one PCG into the tracking decision, if the mobile transmitted during
+    /// it. Silence contributes equally to every hypothesis and hides the peak.
+    fn delay_commit_gated_pcg(&mut self) {
+        let chips = self.delay_gate_chips;
+        if chips == 0 {
+            return;
+        }
+        let per_chip_prompt = self.delay_gate_env_prompt / chips as f64;
+        if self.delay_gate_floor <= 0.0 || per_chip_prompt < self.delay_gate_floor {
+            self.delay_gate_floor = per_chip_prompt;
+        } else {
+            self.delay_gate_floor +=
+                DELAY_GATE_FLOOR_LEAK * (per_chip_prompt - self.delay_gate_floor);
+        }
+
+        if per_chip_prompt > DELAY_GATE_ON_FACTOR * self.delay_gate_floor {
+            self.delay_gate_on_pcgs += 1;
+            for tap in 0..DELAY_PROFILE_TAPS {
+                self.delay_track_acc[tap] +=
+                    DELAY_TRACK_ALPHA * (self.delay_profile_pcg[tap] - self.delay_track_acc[tap]);
+            }
+            self.delay_track_pcgs += 1;
+            self.delay_track_pcgs_since_move = self.delay_track_pcgs_since_move.saturating_add(1);
+            if self.delay_track_enabled && self.delay_track_pcgs >= DELAY_TRACK_WARMUP_PCGS {
+                self.delay_track_decide();
+            }
+        } else {
+            self.delay_gate_off_pcgs += 1;
+        }
+
+        self.delay_profile_pcg = [0.0; DELAY_PROFILE_TAPS];
+        self.delay_gate_env_prompt = 0.0;
+        self.delay_gate_chips = 0;
+    }
+
+    /// Reposition the prompt onto the delay carrying the peak. Path delay steps
+    /// by whole chips during a call, and an early/late gate spanning a quarter
+    /// chip reads zero error for a peak a chip away.
+    fn delay_track_decide(&mut self) {
+        if self.delay_track_pcgs_since_move < DELAY_TRACK_MIN_PCGS_BETWEEN_MOVES {
+            return;
+        }
+        let (best_tap, best) = self
+            .delay_track_acc
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(tap, power)| (tap, *power))
+            .expect("profile taps");
+        let prompt = self.delay_track_acc[DELAY_PROFILE_HALF_CHIPS];
+        let chip_shift = best_tap as isize - DELAY_PROFILE_HALF_CHIPS as isize;
+
+        if chip_shift == 0 || best <= prompt * DELAY_TRACK_MARGIN {
+            return;
+        }
+
+        let total = self.delay_track_total_chips + chip_shift;
+        if total.abs() > DELAY_TRACK_MAX_TOTAL_CHIPS {
+            // This far from where it acquired, the finger no longer holds what
+            // it locked onto. Leave it to the prune policy.
+            warn!(
+                "DELAY_TRACK[finger={}] refusing reposition={:+} chip: total {:+} chip \
+                 would exceed the {} chip excursion limit",
+                self.base.id, chip_shift, total, DELAY_TRACK_MAX_TOTAL_CHIPS,
+            );
+            self.delay_track_acc = [0.0; DELAY_PROFILE_TAPS];
+            self.delay_track_pcgs = 0;
+            return;
+        }
+
+        // Only received-sample time moves. The PN and long code cursors keep
+        // their chip time, which makes this a delay change and not a chip slip.
+        self.delay_slew_pending = Some((chip_shift * self.oversample as isize) as f32);
+        self.delay_track_total_chips = total;
+        info!(
+            "DELAY_TRACK[finger={}] chip_tx={} reposition={:+} chip \
+             peak_over_prompt={:+.2}dB total={:+} chip pcgs={}",
+            self.base.id,
+            self.lc_chip_counter,
+            chip_shift,
+            10.0 * (best / prompt.max(1e-12)).max(1e-12).log10(),
+            self.delay_track_total_chips,
+            self.delay_track_pcgs,
+        );
+        // The move renames every hypothesis, so refill before deciding again.
+        self.delay_track_acc = [0.0; DELAY_PROFILE_TAPS];
+        self.delay_track_pcgs = 0;
+        self.delay_track_pcgs_since_move = 0;
+    }
+
     fn epl_run_slew_loop(&mut self) {
         self.epl_slew_windows_total += 1;
         self.epl_slew_windows_since += 1;
 
-        // Select the discriminator source based on mode.
+        // RC1 is gated, so sum exactly one 20 ms frame before normalizing or
+        // gated noise dominates the discriminator. Pilot updates per window.
         let (pe, pp, pl) = if self.epl_pilot_mode {
             (
                 self.epl_window_pilot_pwr_early,
@@ -1363,87 +2034,125 @@ impl PnLcFinger {
                 self.epl_window_pilot_pwr_late,
             )
         } else {
-            (
-                self.epl_window_coh4_pwr_early,
-                self.epl_window_coh4_pwr_prompt,
-                self.epl_window_coh4_pwr_late,
-            )
+            self.epl_rc1_frame_early += self.epl_window_coh4_pwr_early;
+            self.epl_rc1_frame_prompt += self.epl_window_coh4_pwr_prompt;
+            self.epl_rc1_frame_late += self.epl_window_coh4_pwr_late;
+            self.epl_rc1_frame_windows += 1;
+            if self.epl_rc1_frame_windows < EPL_RC1_WINDOWS_PER_FRAME {
+                return;
+            }
+
+            let frame = (
+                self.epl_rc1_frame_early,
+                self.epl_rc1_frame_prompt,
+                self.epl_rc1_frame_late,
+            );
+            self.epl_rc1_frame_early = 0.0;
+            self.epl_rc1_frame_prompt = 0.0;
+            self.epl_rc1_frame_late = 0.0;
+            self.epl_rc1_frame_windows = 0;
+            frame
         };
         if pp <= 1e-12 {
             return;
         }
-        let disc = (pe - pl) / pp;
+        if !self.epl_pilot_mode
+            && self.epl_nonpilot_fer_frames == EPL_NONPILOT_FER_WINDOW_FRAMES
+            && self.epl_nonpilot_fer_bits.count_ones() > EPL_RC1_MAX_INVALID_FRAMES_FOR_SLEW
+        {
+            return;
+        }
 
-        // Select mode-appropriate loop constants.
+        let disc = (pe - pl) / pp;
         let alpha = if self.epl_pilot_mode {
             EPL_SLEW_ALPHA_PILOT
         } else {
             EPL_SLEW_ALPHA
         };
+        self.epl_slew_iir = (1.0 - alpha) * self.epl_slew_iir + alpha * disc;
         let warmup = if self.epl_pilot_mode {
             EPL_SLEW_WARMUP_WINDOWS_PILOT
         } else {
             EPL_SLEW_WARMUP_WINDOWS
         };
-        let gain = if self.epl_pilot_mode {
-            EPL_SLEW_LOOP_GAIN_PILOT
-        } else {
-            EPL_SLEW_LOOP_GAIN
-        };
-        let min_between = if self.epl_pilot_mode {
-            EPL_SLEW_MIN_WINDOWS_BETWEEN_PILOT
-        } else {
-            EPL_SLEW_MIN_WINDOWS_BETWEEN
-        };
-
-        // IIR smoothing. Positive disc ⇒ early > late ⇒ signal arrives
-        // earlier than the prompt ⇒ receiver should slew BACKWARD (−1,
-        // move the reference earlier in PN so the prompt reads a
-        // slightly earlier sample). So the slew direction is
-        // −sign(disc).
-        self.epl_slew_iir = (1.0 - alpha) * self.epl_slew_iir + alpha * disc;
-
-        // Warmup: accumulate IIR but don't integrate into frac yet.
         if self.epl_slew_windows_total < warmup {
             return;
         }
-
-        // Dead-zone: suppress noise-driven slews near zero.
+        let timing_error = if self.epl_pilot_mode {
+            self.epl_slew_iir
+        } else {
+            let bias = self.epl_rc1_bias.get_or_insert(self.epl_slew_iir);
+            self.epl_slew_iir - *bias
+        };
         let dead_zone = if self.epl_pilot_mode {
             EPL_SLEW_DEAD_ZONE_PILOT
         } else {
             EPL_SLEW_DEAD_ZONE
         };
-        let effective = if self.epl_slew_iir.abs() < dead_zone {
+        let effective = if timing_error.abs() < dead_zone {
             0.0
         } else {
-            self.epl_slew_iir
+            timing_error
         };
-
-        // Integrate. Signed intentionally: forward slew should bump
-        // despread_phase by +1 ⇒ PN reads shift forward in time. If
-        // the signal is LATE (pl > pe ⇒ disc < 0), we want the
-        // receiver to also move LATER (forward slew, +1). So the
-        // direction of the integration matches −disc.
-        self.epl_slew_frac += -gain * effective;
-
-        // Rate limiter: don't fire slews closer together than the
-        // min-windows-between guard.
+        let loop_gain = if self.epl_pilot_mode {
+            EPL_SLEW_LOOP_GAIN_PILOT
+        } else {
+            EPL_SLEW_LOOP_GAIN
+        };
+        self.epl_slew_frac = (self.epl_slew_frac - loop_gain * effective).clamp(-1.0, 1.0);
+        let min_between = if self.epl_pilot_mode {
+            EPL_SLEW_MIN_WINDOWS_BETWEEN_PILOT
+        } else {
+            EPL_SLEW_MIN_WINDOWS_BETWEEN
+        };
         if self.epl_slew_windows_since < min_between {
             return;
         }
 
-        // Check threshold: fire at most one sub-sample slew per window.
-        if self.epl_slew_frac >= 1.0 {
-            self.epl_slew_pending = Some(1);
-            self.epl_slew_frac -= 1.0;
-            self.epl_slew_total += 1;
+        let positive_allowed = !self.epl_pilot_mode || pl > pp;
+        let negative_allowed = !self.epl_pilot_mode || pe > pp;
+        let trigger = if self.epl_pilot_mode {
+            1.0
+        } else {
+            EPL_RC1_SLEW_TRIGGER
+        };
+        if self.epl_slew_frac >= trigger && positive_allowed {
+            self.epl_slew_pending = Some(EPL_SLEW_STEP_SAMPLES);
+            self.epl_slew_frac = 0.0;
+            self.epl_slew_total += EPL_SLEW_STEP_SAMPLES as f64;
             self.epl_slew_windows_since = 0;
-        } else if self.epl_slew_frac <= -1.0 {
-            self.epl_slew_pending = Some(-1);
-            self.epl_slew_frac += 1.0;
-            self.epl_slew_total -= 1;
+        } else if self.epl_slew_frac <= -trigger && negative_allowed {
+            self.epl_slew_pending = Some(-EPL_SLEW_STEP_SAMPLES);
+            self.epl_slew_frac = 0.0;
+            self.epl_slew_total -= EPL_SLEW_STEP_SAMPLES as f64;
             self.epl_slew_windows_since = 0;
+        }
+    }
+
+    fn epl_observe_nonpilot_phy(&mut self, output: &[SampleBlock]) {
+        if !self.epl_slew_enabled || self.epl_pilot_mode {
+            return;
+        }
+        for block in output {
+            if block.tags.get("traffic_phy_frame") != Some(&1)
+                && block.tags.get("traffic_phy_status") != Some(&1)
+            {
+                continue;
+            }
+            let Some(&phy_valid) = block.tags.get("traffic_phy_valid") else {
+                continue;
+            };
+            self.epl_nonpilot_phy_frames = self.epl_nonpilot_phy_frames.saturating_add(1);
+            let invalid = phy_valid != 1;
+            if invalid {
+                self.epl_nonpilot_phy_invalid = self.epl_nonpilot_phy_invalid.saturating_add(1);
+            }
+            self.epl_nonpilot_fer_bits = ((self.epl_nonpilot_fer_bits << 1) | u64::from(invalid))
+                & EPL_NONPILOT_FER_WINDOW_MASK;
+            self.epl_nonpilot_fer_frames = self
+                .epl_nonpilot_fer_frames
+                .saturating_add(1)
+                .min(EPL_NONPILOT_FER_WINDOW_FRAMES);
         }
     }
 
@@ -1473,15 +2182,19 @@ impl PnLcFinger {
                 self.epl_pilot_pwr_prompt,
                 self.epl_env_prompt,
             );
+            let cfo_hz = self.cfo_rad_per_chip as f64 * 1_228_800.0 / (2.0 * std::f64::consts::PI);
             self.epl_last_log_pilot_ec_io_db = Some(pilot_ec_io_db);
 
-            trace!(
+            // Pilot timing is part of the live RC3 tracking loop.  Keep its
+            // one-line-per-second state visible at the normal log level so a
+            // field run shows the discriminator and applied slews directly.
+            info!(
                 "EPL_TRACK[finger={}] sec#{} windows={} N={} chips={} mode=pilot | \
                  env: E={:.3e} P={:.3e} L={:.3e} (E-L)/P={:+.4} | \
                  env_win: E={:.3e} P={:.3e} L={:.3e} (E-L)/P={:+.4} | \
                  pilot_win: E={:.3e} P={:.3e} L={:.3e} (E-L)/P={:+.4} Ec/Io={:+.2}dB | \
                  pilot: E={:.3e} P={:.3e} L={:.3e} (E-L)/P={:+.4} Ec/Io={:+.2}dB | \
-                 slew: iir={:+.4} frac={:+.4} total={} since={}",
+                 slew: iir={:+.4} frac={:+.4} total={} since={} | cfo={:+.2}Hz",
                 self.base.id,
                 self.epl_log_seq,
                 self.epl_windows_in_log,
@@ -1509,6 +2222,7 @@ impl PnLcFinger {
                 self.epl_slew_frac,
                 self.epl_slew_total,
                 self.epl_slew_windows_since,
+                cfo_hz,
             );
 
             self.epl_pilot_pwr_early = 0.0;
@@ -1522,14 +2236,19 @@ impl PnLcFinger {
 
             let coh_norm = self.epl_coh4_pwr_prompt.max(1e-12);
             let coh_disc = (self.epl_coh4_pwr_early - self.epl_coh4_pwr_late) / coh_norm;
+            let cfo_hz = self.cfo_rad_per_chip as f64 * 1_228_800.0 / (2.0 * std::f64::consts::PI);
+            let recent_frames = u64::from(self.epl_nonpilot_fer_frames);
+            let recent_invalid = u64::from(self.epl_nonpilot_fer_bits.count_ones());
 
-            trace!(
+            info!(
                 "EPL_TRACK[finger={}] sec#{} windows={} N={} chips={} mode=coh4 | \
                  env: E={:.3e} P={:.3e} L={:.3e} (E-L)/P={:+.4} | \
                  env_win: E={:.3e} P={:.3e} L={:.3e} (E-L)/P={:+.4} | \
                  coh4_win: E={:.3e} P={:.3e} L={:.3e} (E-L)/P={:+.4} | \
                  coh4: E={:.3e} P={:.3e} L={:.3e} (E-L)/P={:+.4} | \
-                 slew: iir={:+.4} frac={:+.4} total={} since={}",
+                 slew: iir={:+.4} bias={:+.4} delta={:+.4} frac={:+.4} total={} since={} | \
+                 cfo={:+.2}Hz cfo_coh={:.3} accepted={} rejected={} \
+                 phy_invalid={}/{} recent_invalid={}/{}",
                 self.base.id,
                 self.epl_log_seq,
                 self.epl_windows_in_log,
@@ -1552,14 +2271,26 @@ impl PnLcFinger {
                 self.epl_coh4_pwr_late,
                 coh_disc,
                 self.epl_slew_iir,
+                self.epl_rc1_bias.unwrap_or(self.epl_slew_iir),
+                self.epl_slew_iir - self.epl_rc1_bias.unwrap_or(self.epl_slew_iir),
                 self.epl_slew_frac,
                 self.epl_slew_total,
                 self.epl_slew_windows_since,
+                cfo_hz,
+                self.rc1_cfo_last_coherence,
+                self.rc1_cfo_accepted_windows,
+                self.rc1_cfo_rejected_windows,
+                self.epl_nonpilot_phy_invalid,
+                self.epl_nonpilot_phy_frames,
+                recent_invalid,
+                recent_frames,
             );
 
             self.epl_coh4_pwr_early = 0.0;
             self.epl_coh4_pwr_prompt = 0.0;
             self.epl_coh4_pwr_late = 0.0;
+            self.epl_nonpilot_phy_frames = 0;
+            self.epl_nonpilot_phy_invalid = 0;
         }
 
         // Reset shared log-level accumulators for the next log interval.
@@ -1600,7 +2331,7 @@ impl PnLcFinger {
 
         // Process in chip_block_size windows for CFO correction + pilot
         // estimation, but collect all corrected samples into one buffer.
-        for _ in 0..n_blocks {
+        for block_idx in 0..n_blocks {
             let raw: Vec<Complex32> = self.sample_buffer.drain(..block_len).collect();
 
             let window_start = all_samples.len();
@@ -1616,8 +2347,28 @@ impl PnLcFinger {
                 all_samples.extend_from_slice(&buf);
                 self.cfo_rad_per_chip = cfo.cfo_rad_per_chip();
                 self.cfo_phase = cfo.cfo_phase();
+            } else if self.rc1_cfo.is_some() {
+                let block_first_abs_chip =
+                    first_abs_chip.saturating_add(block_idx.saturating_mul(block_len_chips));
+                if output_oversample > 1 {
+                    let prompt_phase = self.center_offset.min(output_oversample - 1);
+                    let prompt_samples = raw
+                        .chunks_exact(output_oversample)
+                        .map(|chip| chip[prompt_phase])
+                        .collect::<Vec<_>>();
+                    self.observe_rc1_cfo_chips(&prompt_samples, block_first_abs_chip);
+                } else {
+                    self.observe_rc1_cfo_chips(&raw, block_first_abs_chip);
+                }
+
+                let mut buf = raw;
+                let cfo = self.rc1_cfo.as_mut().expect("RC1 CFO tracker present");
+                cfo.derotate_chips(&mut buf, output_oversample);
+                all_samples.extend_from_slice(&buf);
+                self.cfo_rad_per_chip = cfo.cfo_rad_per_chip();
+                self.cfo_phase = cfo.cfo_phase();
             } else {
-                // RC1: inline derotation using the legacy CFO state.
+                // Non-pilot traffic retains the acquisition CFO correction.
                 let cfo_step = self.cfo_rad_per_chip / output_oversample as f32;
                 for &s in &raw {
                     let (sin_p, cos_p) = self.cfo_phase.sin_cos();
@@ -1695,6 +2446,9 @@ impl PnLcFinger {
                     if let Some(ref mut cfo) = self.rc3_cfo {
                         let s = cfo.take_residual_stats();
                         (s.rms_hz, s.mean_hz, s.max_hz, s.count)
+                    } else if let Some(ref mut cfo) = self.rc1_cfo {
+                        let s = cfo.take_residual_stats();
+                        (s.rms_hz, s.mean_hz, s.max_hz, s.count)
                     } else if self.cfo_residual_count > 0 {
                         let n = self.cfo_residual_count as f64;
                         let mean = self.cfo_residual_abs_sum / n;
@@ -1729,55 +2483,13 @@ impl PnLcFinger {
             } else {
                 0.0
             };
-            // CFO tracking uses a two-part policy:
-            //
-            // 1. Hard gate at 0.05 — blocks below this are noise-
-            //    dominated (theoretical noise floor at 1024-chip blocks
-            //    is 1/sqrt(1024) ≈ 0.031), so updating from them only
-            //    injects random phase into the CFO state. We skip the
-            //    update entirely but KEEP prev_pilot so a short dip
-            //    doesn't force a bootstrap-restart when coherence
-            //    recovers.
-            //
-            // 2. Magnitude-weighted loop gain above the gate — a fixed
-            //    0.1 gain treats a pilot_coh of 0.06 the same as 0.30,
-            //    so a weak noisy block moves the CFO as much as a
-            //    strong clean one. We scale the gain by pilot_coh_norm
-            //    normalized to 0.25, clamped to 1.0: a 0.25+ block
-            //    updates at the full 0.1 rate, a 0.10 block at 0.04,
-            //    a 0.05 block at 0.02. This lets weak-but-signal blocks
-            //    contribute proportionally instead of either being
-            //    rejected entirely (old 0.25 hard gate — caused 42 s
-            //    lock-loss runaway when chip timing drift dropped coh
-            //    below 0.25 permanently) or dominating the estimate
-            //    with noise (previous 0.05 gate with fixed 0.1 gain —
-            //    CFO swung ±0.004 rad/chip and calls died in ~13 s).
-            // CFO tracking dispatch:
-            // - RC3 traffic: fed from EPL pilot path (epl_finalize_chip)
-            // - Access: fed here from 256-chip block sums, coherence-gated
-            // - RC1: legacy 256-chip tracker
+            // Access uses its separate Walsh-0 tracker. RC3 is fed by the
+            // reverse pilot path.
             if let Some(ref mut cfo) = self.access_cfo {
                 const ACCESS_CFO_COH_GATE: f32 = 0.12;
                 if pilot_coh_norm >= ACCESS_CFO_COH_GATE {
                     cfo.observe_pilot(pilot, block_len_chips);
                 }
-            } else if self.rc3_cfo.is_none() && self.nonpilot_cfo_tracking {
-                let cfo_gate = 0.05f32;
-                const CFO_COH_REFERENCE: f32 = 0.25;
-                const CFO_MAX_LOOP_GAIN: f32 = 0.1;
-                if pilot_coh_norm >= cfo_gate {
-                    if let Some(prev) = self.prev_pilot {
-                        let cross = pilot * Complex32::new(prev.re, -prev.im);
-                        let delta = cross.im.atan2(cross.re);
-                        let update = delta / self.chip_block_size as f32;
-                        let trust = (pilot_coh_norm / CFO_COH_REFERENCE).min(1.0);
-                        let loop_gain = CFO_MAX_LOOP_GAIN * trust;
-                        self.cfo_rad_per_chip =
-                            (1.0 - loop_gain) * self.cfo_rad_per_chip + loop_gain * update;
-                    }
-                    self.prev_pilot = Some(pilot);
-                }
-                // else: intentionally keep prev_pilot — do not clear.
             }
 
             self.chain_chips_output += block_len_chips;
@@ -1938,6 +2650,10 @@ impl PnLcFinger {
 }
 
 impl RakeFinger for PnLcFinger {
+    fn reset_timing_measurements(&mut self) {
+        self.reset_delay_tracking();
+    }
+
     fn id(&self) -> u64 {
         self.base.id
     }
@@ -1982,6 +2698,7 @@ impl RakeFinger for PnLcFinger {
 
         let t1 = std::time::Instant::now();
         let live = self.drain_to_chain(chain);
+        self.epl_observe_nonpilot_phy(&live);
         let drain_ns = t1.elapsed().as_nanos() as u64;
 
         self.despread_ns += despread_ns;
@@ -2141,7 +2858,48 @@ impl PnLcFinger {
 
 #[cfg(test)]
 mod raw_power_tests {
-    use crate::receiver::pipelined::{adc_referenced_power_dbfs, rx_matched_filter_power_gain_db};
+    use std::sync::Arc;
+
+    use num_complex::Complex32;
+
+    use super::{
+        EPL_NONPILOT_FER_WINDOW_FRAMES, EPL_RC1_WINDOWS_PER_FRAME, EPL_SLEW_MIN_WINDOWS_BETWEEN,
+        EPL_SLEW_STEP_SAMPLES, EPL_SLEW_WARMUP_WINDOWS, PnLcFinger, RC3_PILOT_SYMBOL_CHIPS,
+        RC3_PILOT_SYMBOLS_PER_PCG,
+    };
+    use crate::phy::coding::long_code::LongCodeGenerator;
+    use crate::receiver::pipelined::{
+        SampleBlock, adc_referenced_power_dbfs, rx_matched_filter_power_gain_db,
+    };
+
+    fn test_nonpilot_finger() -> PnLcFinger {
+        let phase_period = 64;
+        let pn = Arc::new(vec![Complex32::new(1.0, 0.0); phase_period]);
+        let lc = LongCodeGenerator::new_access_channel_with_state(0, 0, 0, 0, 1u64 << 41);
+        PnLcFinger::new(
+            1,
+            pn,
+            phase_period,
+            4,
+            0,
+            0,
+            lc,
+            0,
+            0,
+            64,
+            0,
+            0.0,
+            0.0,
+            1,
+            true,
+            true,
+            false,
+            false,
+            0.0,
+            false,
+            false,
+        )
+    }
 
     #[test]
     fn adc_power_reference_removes_matched_filter_gain() {
@@ -2149,5 +2907,201 @@ mod raw_power_tests {
 
         assert!(adc_referenced_power_dbfs(filter_gain).abs() < 1e-4);
         assert!((adc_referenced_power_dbfs(filter_gain * 0.5) + 3.0103).abs() < 1e-3);
+    }
+
+    #[test]
+    fn true_pilot_ec_io_removes_coherent_self_noise_term() {
+        let n = RC3_PILOT_SYMBOLS_PER_PCG as f64;
+        let l = RC3_PILOT_SYMBOL_CHIPS as f64;
+        let pilot_norm_sq = (n * l).powi(2);
+        let pilot_prompt_power = n * l * l;
+        let prompt_chip_power = 1536.0;
+
+        let measured = PnLcFinger::true_pilot_ec_io_db_from_metrics(
+            pilot_norm_sq,
+            pilot_prompt_power,
+            RC3_PILOT_SYMBOLS_PER_PCG,
+            prompt_chip_power,
+        )
+        .expect("clean pilot must produce Ec/Io");
+        assert!(
+            measured.abs() < 1e-5,
+            "unit pilot over unit Io should be 0 dB, got {measured}"
+        );
+
+        assert!(
+            PnLcFinger::true_pilot_ec_io_db_from_metrics(
+                pilot_prompt_power,
+                pilot_prompt_power,
+                RC3_PILOT_SYMBOLS_PER_PCG,
+                prompt_chip_power,
+            )
+            .is_none(),
+            "A=P contains no positive unbiased coherent pilot estimate"
+        );
+    }
+
+    #[test]
+    fn epl_slew_moves_sample_prompt_without_moving_pn_lc_reference() {
+        let oversample = 4;
+        let phase_period = 64;
+        let center_offset = 2;
+        let pn = Arc::new(vec![Complex32::new(1.0, 0.0); phase_period]);
+        let lc = LongCodeGenerator::new_access_channel_with_state(0, 0, 0, 0, 1u64 << 41);
+        let mut finger = PnLcFinger::new(
+            1,
+            pn,
+            phase_period,
+            oversample,
+            0,
+            center_offset,
+            lc,
+            0,
+            0,
+            64,
+            0,
+            0.0,
+            0.0,
+            2,
+            true,
+            true,
+            true,
+            false,
+            0.0,
+            false,
+            false,
+        );
+
+        // The initial prompt is input sample 2 and PN phase 2. A fractional
+        // EPL correction selects 2.25, but PN/LC must remain at phase 2.
+        finger.epl_slew_pending = Some(EPL_SLEW_STEP_SAMPLES);
+        finger.despread_block(&vec![Complex32::new(1.0, 0.0); 16]);
+
+        assert_eq!(finger.despread_phase, center_offset + 4 * oversample);
+        assert_eq!(finger.lc_chip_counter, 4);
+        assert!((finger.next_prompt_offset - 2.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn nonpilot_epl_slew_interpolates_across_block_boundary() {
+        let oversample = 4;
+        let phase_period = 64;
+        let pn = Arc::new(vec![Complex32::new(1.0, 0.0); phase_period]);
+        let lc = LongCodeGenerator::new_access_channel_with_state(0, 0, 0, 0, 1u64 << 41);
+        let mut finger = PnLcFinger::new(
+            1,
+            pn,
+            phase_period,
+            oversample,
+            0,
+            0,
+            lc,
+            0,
+            0,
+            64,
+            0,
+            0.0,
+            0.0,
+            1,
+            true,
+            true,
+            false,
+            false,
+            0.0,
+            false,
+            false,
+        );
+
+        finger.despread_block(&vec![Complex32::new(1.0, 0.0); 16]);
+        assert_eq!(finger.lc_chip_counter, 4);
+        finger.sample_buffer.clear();
+
+        finger.epl_slew_pending = Some(-EPL_SLEW_STEP_SAMPLES);
+        finger.despread_block(&vec![Complex32::new(1.0, 0.0); 16]);
+
+        assert_eq!(finger.lc_chip_counter, 9);
+        assert_eq!(finger.despread_phase, 9 * oversample);
+        assert_eq!(finger.sample_buffer.len(), 5);
+        assert!((finger.next_prompt_offset - 3.75).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn rc1_epl_integrates_gated_energy_over_a_traffic_frame() {
+        let mut finger = test_nonpilot_finger();
+        finger.epl_slew_windows_total = EPL_SLEW_WARMUP_WINDOWS;
+        finger.epl_slew_windows_since = EPL_SLEW_MIN_WINDOWS_BETWEEN;
+
+        for _ in 0..EPL_RC1_WINDOWS_PER_FRAME {
+            finger.epl_window_coh4_pwr_early = 1.0;
+            finger.epl_window_coh4_pwr_prompt = 1.0;
+            finger.epl_window_coh4_pwr_late = 1.0;
+            finger.epl_run_slew_loop();
+        }
+        assert_eq!(finger.epl_rc1_bias, Some(0.0));
+
+        // Model an eighth-rate frame: one useful interval consistently says
+        // the signal is late, followed by five gated noise intervals.
+        for _ in 0..80 {
+            for window in 0..EPL_RC1_WINDOWS_PER_FRAME {
+                if window == 0 {
+                    finger.epl_window_coh4_pwr_early = 0.85;
+                    finger.epl_window_coh4_pwr_prompt = 1.00;
+                    finger.epl_window_coh4_pwr_late = 1.10;
+                } else {
+                    finger.epl_window_coh4_pwr_early = 0.01;
+                    finger.epl_window_coh4_pwr_prompt = 0.01;
+                    finger.epl_window_coh4_pwr_late = 0.01;
+                }
+                finger.epl_run_slew_loop();
+            }
+            if finger.epl_slew_pending.is_some() {
+                break;
+            }
+        }
+
+        assert_eq!(finger.epl_slew_pending, Some(EPL_SLEW_STEP_SAMPLES));
+        assert_eq!(finger.epl_slew_total, EPL_SLEW_STEP_SAMPLES as f64);
+    }
+
+    #[test]
+    fn rc1_epl_fer_ignores_unclassified_phy_status_events() {
+        let mut finger = test_nonpilot_finger();
+        let mut status = SampleBlock::new(Vec::new(), 0);
+        status.tags.insert("traffic_phy_status", 1);
+        let mut invalid = SampleBlock::new(Vec::new(), 0);
+        invalid.tags.insert("traffic_phy_status", 1);
+        invalid.tags.insert("traffic_phy_valid", 0);
+        let mut valid = SampleBlock::new(Vec::new(), 0);
+        valid.tags.insert("traffic_phy_frame", 1);
+        valid.tags.insert("traffic_phy_valid", 1);
+
+        finger.epl_observe_nonpilot_phy(&[status, invalid, valid]);
+
+        assert_eq!(finger.epl_nonpilot_phy_frames, 2);
+        assert_eq!(finger.epl_nonpilot_phy_invalid, 1);
+        assert_eq!(finger.epl_nonpilot_fer_frames, 2);
+        assert_eq!(finger.epl_nonpilot_fer_bits, 0b10);
+    }
+
+    #[test]
+    fn rc1_epl_freezes_when_recent_fer_exceeds_ten_percent() {
+        let mut finger = test_nonpilot_finger();
+        finger.epl_slew_windows_total = EPL_SLEW_WARMUP_WINDOWS;
+        finger.epl_slew_windows_since = EPL_SLEW_MIN_WINDOWS_BETWEEN;
+        finger.epl_rc1_bias = Some(0.0);
+        finger.epl_slew_frac = 0.75;
+        finger.epl_nonpilot_fer_frames = EPL_NONPILOT_FER_WINDOW_FRAMES;
+        finger.epl_nonpilot_fer_bits = 0b11_1111;
+
+        for _ in 0..EPL_RC1_WINDOWS_PER_FRAME {
+            finger.epl_window_coh4_pwr_early = 2.0;
+            finger.epl_window_coh4_pwr_prompt = 1.0;
+            finger.epl_window_coh4_pwr_late = 0.5;
+            finger.epl_run_slew_loop();
+        }
+
+        assert_eq!(finger.epl_slew_frac, 0.75);
+        assert_eq!(finger.epl_slew_pending, None);
+        assert_eq!(finger.epl_slew_total, 0.0);
     }
 }

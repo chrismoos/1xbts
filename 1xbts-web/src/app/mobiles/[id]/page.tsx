@@ -82,6 +82,8 @@ interface MobileInfo {
     lastPcgPilotEcNtDb: number[];
     forwardRadioConfig: number;
     reverseRadioConfig: number;
+    measuredInnerLoop1sDb?: number;
+    measuredInnerLoop1sTimestampMs?: number;
     powerHistory?: {
       timestampMs: number;
       measuredEbNtDb: number;
@@ -309,14 +311,39 @@ export default function MobileDetailPage({
     }
     if (ms.trafficPower) {
       const serverHistory = ms.trafficPower.powerHistory ?? [];
-      if (serverHistory.length > 0) {
+      const oneSecondMean = ms.trafficPower.measuredInnerLoop1sDb;
+      const oneSecondTimestamp = ms.trafficPower.measuredInnerLoop1sTimestampMs;
+      if (
+        Number.isFinite(oneSecondMean) &&
+        oneSecondTimestamp != null &&
+        oneSecondTimestamp > 0
+      ) {
+        const h = powerHistoryRef.current;
+        const latestTimestamp = h.timestamps[h.timestamps.length - 1];
+        if (latestTimestamp == null || oneSecondTimestamp > latestTimestamp) {
+          h.timestamps.push(oneSecondTimestamp);
+          h.target.push(ms.trafficPower.effectiveTargetEbNtDb);
+          h.measured.push(oneSecondMean as number);
+          h.forwardGain.push(ms.trafficPower.forwardGainOffsetDb);
+          h.fer.push(ms.trafficPower.ferPct);
+          const max = 60;
+          if (h.timestamps.length > max) {
+            const excess = h.timestamps.length - max;
+            h.timestamps.splice(0, excess);
+            h.target.splice(0, excess);
+            h.measured.splice(0, excess);
+            h.forwardGain.splice(0, excess);
+            h.fer.splice(0, excess);
+          }
+        }
+      } else if (serverHistory.length > 0) {
         const h = powerHistoryRef.current;
         h.timestamps = serverHistory.map((s) => Number(s.timestampMs));
         h.target = serverHistory.map((s) => s.targetEbNtDb);
         h.measured = serverHistory.map((s) => s.measuredEbNtDb);
         h.forwardGain = serverHistory.map((s) => s.forwardGainDb);
         h.fer = serverHistory.map((s) => s.ferPct);
-      } else {
+      } else if (ms.trafficPower.reverseRadioConfig !== 3) {
         const h = powerHistoryRef.current;
         const now = Date.now();
         h.timestamps.push(now);
@@ -1146,7 +1173,7 @@ export default function MobileDetailPage({
                     <div className="mb-3">
                       <div className="text-sm font-medium text-primary">Power Control — Live {radioConfigPair ? `(${radioConfigPair})` : ""}</div>
                       <div className="text-xs text-muted">
-                        {Math.round((h.timestamps[h.timestamps.length - 1] - h.timestamps[0]) / 1000)}s window · 100ms granularity · Target (dashed) vs Measured {metricLabel} · Forward gain offset
+                        {Math.round((h.timestamps[h.timestamps.length - 1] - h.timestamps[0]) / 1000)}s window · {isRc3 ? "completed 1s averages" : "live samples"} · Target (dashed) vs Measured {metricLabel} · Forward gain offset
                       </div>
                     </div>
                     <div>

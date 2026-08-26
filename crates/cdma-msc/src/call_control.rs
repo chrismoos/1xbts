@@ -113,8 +113,13 @@ impl MscCallController {
         direction: CallDirection,
         mobile_identity: Option<MobileIdentity>,
     ) -> CallId {
-        let id = CallId(self.next_call_id);
-        self.next_call_id = self.next_call_id.wrapping_add(1);
+        let id = loop {
+            let candidate = CallId(self.next_call_id);
+            self.next_call_id = self.next_call_id.wrapping_add(1);
+            if !self.calls.contains_key(&candidate) {
+                break candidate;
+            }
+        };
         self.insert_call(id, direction, mobile_identity);
         id
     }
@@ -126,9 +131,6 @@ impl MscCallController {
         direction: CallDirection,
         mobile_identity: Option<MobileIdentity>,
     ) -> CallId {
-        if id.0 >= self.next_call_id {
-            self.next_call_id = id.0.wrapping_add(1);
-        }
         self.insert_call(id, direction, mobile_identity);
         id
     }
@@ -361,6 +363,30 @@ mod tests {
             a2p_bearer_session_params: None,
             a2p_bearer_format_params: None,
         }
+    }
+
+    #[test]
+    fn externally_supplied_call_id_does_not_advance_msc_allocator() {
+        let mut controller = MscCallController::new();
+        let bsc_call_id = CallId(0x1_0000_0000);
+        controller.create_call_with_id(bsc_call_id, CallDirection::MobileOriginated, None);
+
+        let mt_call_id = controller.create_call(CallDirection::MobileTerminated, None);
+
+        assert_eq!(mt_call_id, CallId(1));
+        assert!(controller.snapshot(bsc_call_id).is_some());
+        assert!(controller.snapshot(mt_call_id).is_some());
+    }
+
+    #[test]
+    fn msc_allocator_skips_an_occupied_external_call_id() {
+        let mut controller = MscCallController::new();
+        controller.create_call_with_id(CallId(1), CallDirection::MobileOriginated, None);
+
+        let mt_call_id = controller.create_call(CallDirection::MobileTerminated, None);
+
+        assert_eq!(mt_call_id, CallId(2));
+        assert_eq!(controller.active_call_count(), 2);
     }
 
     #[test]

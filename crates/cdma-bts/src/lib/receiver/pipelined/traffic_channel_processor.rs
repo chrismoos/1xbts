@@ -317,6 +317,8 @@ impl TrafficChannelProcessor {
             "finger_signal_power_mdb",
             "finger_raw_power_mdb",
             "finger_pilot_ec_io_mdb",
+            "traffic_pcg_pilot_ec_io_true_mdb",
+            "traffic_pcg_pilot_ec_io_legacy_mdb",
             "traffic_ml_tail_match",
             "traffic_phy_valid",
             "traffic_radio_config",
@@ -1117,6 +1119,8 @@ mod tests {
         let mut out = SampleBlock::new(Vec::new(), 0);
         let mut upstream_tags = std::collections::HashMap::new();
         upstream_tags.insert("finger_pilot_ec_io_mdb", -12050);
+        upstream_tags.insert("traffic_pcg_pilot_ec_io_true_mdb", -18750);
+        upstream_tags.insert("traffic_pcg_pilot_ec_io_legacy_mdb", -12900);
         upstream_tags.insert("finger_snr_mdb", 12345);
         upstream_tags.insert("traffic_phy_valid", 1);
         upstream_tags.insert("traffic_fqi_bits", 6);
@@ -1126,6 +1130,14 @@ mod tests {
         TrafficChannelProcessor::copy_context_tags(&mut out, &upstream_tags);
 
         assert_eq!(out.tags.get("finger_pilot_ec_io_mdb"), Some(&-12050));
+        assert_eq!(
+            out.tags.get("traffic_pcg_pilot_ec_io_true_mdb"),
+            Some(&-18750)
+        );
+        assert_eq!(
+            out.tags.get("traffic_pcg_pilot_ec_io_legacy_mdb"),
+            Some(&-12900)
+        );
         assert_eq!(out.tags.get("finger_snr_mdb"), Some(&12345));
         assert_eq!(out.tags.get("traffic_phy_valid"), Some(&1));
         assert_eq!(out.tags.get("traffic_fqi_bits"), Some(&6));

@@ -93,6 +93,10 @@ pub trait RakeFinger: Send {
     /// result, plus any locally buffered output.
     fn flush(&mut self, chain: &mut Vec<PipelineProcessorShared>) -> Vec<SampleBlock>;
 
+    /// Discard timing measurements that were made against a sample-to-chip
+    /// origin which has since moved.
+    fn reset_timing_measurements(&mut self) {}
+
     /// `true` once hard validation (e.g. CRC-clean frame) has been observed.
     fn is_hard_validated(&self) -> bool;
 
@@ -254,12 +258,25 @@ impl FingerProgress {
             if saw_access_preamble_activity {
                 self.saw_access_preamble_activity = true;
             }
+            let rc3_traffic_phy_activity = saw_traffic_phy_activity
+                && blk.tags.get("traffic_radio_config").copied() == Some(3);
+            let traffic_phy_valid = rc3_traffic_phy_activity
+                && blk.tags.get("traffic_fqi_valid").copied() == Some(1)
+                && blk
+                    .tags
+                    .get("traffic_tail_valid")
+                    .copied()
+                    .is_none_or(|valid| valid != 0);
+            let traffic_phy_invalid = rc3_traffic_phy_activity
+                && (blk.tags.get("traffic_fqi_valid").copied() == Some(0)
+                    || blk.tags.get("traffic_tail_valid").copied() == Some(0));
             let crc_valid = blk.tags.get("access_crc_valid").copied().unwrap_or(0) != 0
                 || blk.tags.get("traffic_crc_valid").copied().unwrap_or(0) != 0
-                || blk.tags.get("finger_crc_valid").copied().unwrap_or(0) != 0;
+                || blk.tags.get("finger_crc_valid").copied().unwrap_or(0) != 0
+                || traffic_phy_valid;
             if crc_valid {
                 self.saw_crc_valid = true;
-            } else if saw_completed_event {
+            } else if saw_completed_event || traffic_phy_invalid {
                 self.crc_misses = self.crc_misses.saturating_add(1);
             }
             if blk.tags.get("access_walsh_locked").copied().unwrap_or(0) != 0
@@ -438,6 +455,12 @@ pub trait Correlator: Send {
         block: &SampleBlock,
     ) -> Vec<(Self::Finger, Vec<PipelineProcessorShared>)>;
 
+    /// Advance stream-relative state while acquisition search is suppressed.
+    ///
+    /// Correlators that derive absolute timing from accumulated samples must
+    /// consume these blocks even when they intentionally skip the search.
+    fn advance_suppressed(&mut self, _block: &SampleBlock) {}
+
     /// Notify the correlator that a finger has been hard-validated (e.g.
     /// CRC-clean frame received).  Implementations may use this to pause
     /// or reduce search activity.
@@ -470,6 +493,16 @@ pub trait Correlator: Send {
     /// Notify the correlator that a finger was retired so any duplicate
     /// suppression tied to that finger can be released.
     fn notify_finger_removed(&mut self, _finger_id: u64) {}
+
+    /// Report, and clear, whether the sample-to-chip origin was re-anchored
+    /// while consuming the last block.
+    ///
+    /// Surviving fingers keep despreading across such a jump, but anything they
+    /// had measured about received-sample timing refers to the old origin, so
+    /// the rake tells them to discard it.
+    fn take_timing_reanchored(&mut self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -516,6 +549,8 @@ pub struct DefaultPrunePolicy {
     pub max_signal_lost_chips: u64,
 }
 
+const UNVALIDATED_FINGER_IDLE_CHIPS: u64 = 614_400;
+
 impl Default for DefaultPrunePolicy {
     fn default() -> Self {
         let max_crc_miss_count = 256u64;
@@ -527,7 +562,7 @@ impl Default for DefaultPrunePolicy {
             // Unvalidated fingers should not linger for multiple seconds once
             // a probe has faded. Give them about 500 ms of signal time to
             // finish acquisition before retiring them.
-            max_idle_chips: 1_843_200,
+            max_idle_chips: UNVALIDATED_FINGER_IDLE_CHIPS,
             // After a validated reverse-access burst goes quiet, retire the
             // finger after about two seconds of signal time so stale fingers
             // do not linger for tens of seconds waiting on CRC-miss pruning.
@@ -1675,11 +1710,21 @@ impl<C: Correlator> PipelineProcessor for GenericRakeReceiver<C> {
             .filter(|af| af.notified_validated)
             .count();
         let mut out = Vec::new();
-        if validated_count < self.max_fingers && !self.correlator.search_suppressed() {
+        if self.correlator.search_suppressed() {
+            self.correlator.advance_suppressed(&block);
+        } else if validated_count < self.max_fingers {
             let detections = self.correlator.correlate(&block);
             self.spawn_fingers(detections);
         }
         let correlator_ns = t0.elapsed().as_nanos() as u64;
+
+        // 1b. Surviving fingers measured their timing against an origin that
+        // just moved, so retire it before they act on it.
+        if self.correlator.take_timing_reanchored() {
+            for af in &mut self.fingers {
+                af.finger.reset_timing_measurements();
+            }
+        }
 
         // 2. Feed every active finger and collect output.
         let t1 = std::time::Instant::now();

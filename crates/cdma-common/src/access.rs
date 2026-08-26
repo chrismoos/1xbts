@@ -1591,21 +1591,35 @@ pub struct PowerMeasurementReportMessage {
     pub sch_errors_detected: Option<u16>,
 }
 
+/// Accept the base station's proposed service configuration.
+pub const SERVICE_REQUEST_PURPOSE_ACCEPT: u8 = 0b0000;
+/// Reject the base station's proposed service configuration.
+pub const SERVICE_REQUEST_PURPOSE_REJECT: u8 = 0b0001;
+/// Propose a service configuration to the base station.
+pub const SERVICE_REQUEST_PURPOSE_PROPOSE: u8 = 0b0010;
+
 /// Reverse Service Request Message (SRQM). C.S0005-E 2.7.2.3.2.12.
 #[derive(Debug, Clone)]
 pub struct ServiceRequestMessage {
     pub serv_req_seq: u8,
     pub req_purpose: u8,
-    /// Service Configuration record, present when req_purpose == 0b0010 (propose).
+    /// Service Configuration record, present for `SERVICE_REQUEST_PURPOSE_PROPOSE`.
     pub service_config: Option<ServiceConfigRecord>,
 }
+
+/// Accept the base station's service request.
+pub const SERVICE_RESPONSE_PURPOSE_ACCEPT: u8 = 0b0000;
+/// Reject the base station's service request.
+pub const SERVICE_RESPONSE_PURPOSE_REJECT: u8 = 0b0001;
+/// Counter-propose a service configuration to the base station.
+pub const SERVICE_RESPONSE_PURPOSE_COUNTER_PROPOSE: u8 = 0b0010;
 
 /// Reverse Service Response Message (SRPM). C.S0005-E 2.7.2.3.2.13.
 #[derive(Debug, Clone)]
 pub struct ServiceResponseMessage {
     pub serv_req_seq: u8,
     pub resp_purpose: u8,
-    /// Service Configuration record, present when resp_purpose == 0b0010 (counter-propose).
+    /// Service Configuration record, present for `SERVICE_RESPONSE_PURPOSE_COUNTER_PROPOSE`.
     pub service_config: Option<ServiceConfigRecord>,
 }
 
@@ -9543,6 +9557,33 @@ mod tests {
     }
 
     #[test]
+    fn test_rdsch_service_request_decodes_mobile_supplemental_channel_proposal() {
+        let payload = Bitstream::new_bytes(&[
+            0x0c, 0x22, 0x02, 0x13, 0x1e, 0x00, 0x01, 0x00, 0x01, 0xf0, 0xf0, 0x01, 0x0c, 0x00,
+            0x00, 0x21, 0x11, 0x06, 0xa5, 0xdb, 0x6c, 0xa6, 0x53, 0x00, 0x86, 0x35, 0x02, 0x48,
+            0x48, 0x70, 0x28, 0x12, 0x42, 0x43, 0x80,
+        ]);
+
+        let pdu = RdschPdu::decode(&payload).expect("decode captured reverse SRQM");
+        let AccessMessage::ServiceRequest(decoded) = pdu.l3 else {
+            panic!("expected reverse SRQM");
+        };
+        let config = decoded.service_config.expect("service configuration");
+        let connection = config.connection_records.first().expect("SO33 connection");
+
+        assert_eq!(decoded.req_purpose, 0b0010);
+        assert_eq!(connection.service_option, 33);
+        assert_eq!(
+            connection.rlp_blob.as_deref(),
+            Some(&[0x2e, 0xdb, 0x65, 0x32, 0x98][..])
+        );
+        assert_eq!(config.for_fch_rc, Some(3));
+        assert_eq!(config.rev_fch_rc, Some(3));
+        assert!(config.for_sch_cc_incl);
+        assert!(config.rev_sch_cc_incl);
+    }
+
+    #[test]
     fn test_fdsch_service_request_propose_uses_forward_service_config_record_type() {
         let raw = super::encode_service_config_record(&minimal_service_config())
             .expect("encode service config");
@@ -13291,8 +13332,14 @@ fn decode_service_config_record(bs: &mut Bitstream) -> Result<ServiceConfigRecor
     }
 
     let for_sch_cc_incl = read(bs, 1, "FOR_SCH_CC_INCL")? != 0;
+    if for_sch_cc_incl {
+        skip_supplemental_channel_configs(bs, "FOR")?;
+    }
+
     let rev_sch_cc_incl = read(bs, 1, "REV_SCH_CC_INCL")? != 0;
-    let _reserved = read(bs, 1, "RESERVED")?;
+    if rev_sch_cc_incl {
+        skip_supplemental_channel_configs(bs, "REV")?;
+    }
 
     Ok(ServiceConfigRecord {
         for_mux_option,
@@ -13308,6 +13355,36 @@ fn decode_service_config_record(bs: &mut Bitstream) -> Result<ServiceConfigRecor
         for_sch_cc_incl,
         rev_sch_cc_incl,
     })
+}
+
+fn skip_supplemental_channel_configs(bs: &mut Bitstream, direction: &str) -> Result<(), String> {
+    let count = read(bs, 2, &format!("NUM_{direction}_SCH"))? as usize;
+    if count == 0 {
+        return Err(format!(
+            "NUM_{direction}_SCH must be nonzero when {direction}_SCH_CC_INCL is set"
+        ));
+    }
+
+    for _ in 0..count {
+        let _sch_id = read(bs, 2, &format!("{direction}_SCH_ID"))?;
+        let _sch_mux = read(bs, 16, &format!("{direction}_SCH_MUX"))?;
+        let record_len = read(bs, 4, "SCH_REC_LEN")? as usize;
+        if record_len < 2 {
+            return Err(format!(
+                "{direction} SCH_REC_LEN must include the 16-bit channel configuration"
+            ));
+        }
+        let _sch_rc = read(bs, 5, "SCH_RC")?;
+        let _coding = read(bs, 1, "CODING")?;
+        let _frame_40_used = read(bs, 1, "FRAME_40_USED")?;
+        let _frame_80_used = read(bs, 1, "FRAME_80_USED")?;
+        let _max_rate = read(bs, 4, "MAX_RATE")?;
+        for _ in 0..(record_len * 8 - 16) {
+            let _extension = read(bs, 1, "SCH_CC_EXTENSION")?;
+        }
+    }
+
+    Ok(())
 }
 
 fn decode_service_config_record_with_len(

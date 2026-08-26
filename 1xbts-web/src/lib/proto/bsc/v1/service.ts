@@ -1128,6 +1128,15 @@ export interface TrafficChannelPower {
   powerHistory: PowerControlSample[];
   /** Forward radio configuration assigned to the traffic channel. */
   forwardRadioConfig: number;
+  /**
+   * Mean inner-loop measurement over the most recent complete one-second
+   * absolute-PCG window. For gated RC3 this is active-PCG pilot SINR.
+   */
+  measuredInnerLoop1sDb?:
+    | number
+    | undefined;
+  /** Wall-clock timestamp when measured_inner_loop_1s_db was completed. */
+  measuredInnerLoop1sTimestampMs?: number | undefined;
 }
 
 /**
@@ -14588,6 +14597,8 @@ function createBaseTrafficChannelPower(): TrafficChannelPower {
     reverseRadioConfig: 0,
     powerHistory: [],
     forwardRadioConfig: 0,
+    measuredInnerLoop1sDb: undefined,
+    measuredInnerLoop1sTimestampMs: undefined,
   };
 }
 
@@ -14662,6 +14673,12 @@ export const TrafficChannelPower: MessageFns<TrafficChannelPower> = {
     }
     if (message.forwardRadioConfig !== 0) {
       writer.uint32(160).uint32(message.forwardRadioConfig);
+    }
+    if (message.measuredInnerLoop1sDb !== undefined) {
+      writer.uint32(173).float(message.measuredInnerLoop1sDb);
+    }
+    if (message.measuredInnerLoop1sTimestampMs !== undefined) {
+      writer.uint32(176).uint64(message.measuredInnerLoop1sTimestampMs);
     }
     return writer;
   },
@@ -14883,6 +14900,22 @@ export const TrafficChannelPower: MessageFns<TrafficChannelPower> = {
           message.forwardRadioConfig = reader.uint32();
           continue;
         }
+        case 21: {
+          if (tag !== 173) {
+            break;
+          }
+
+          message.measuredInnerLoop1sDb = reader.float();
+          continue;
+        }
+        case 22: {
+          if (tag !== 176) {
+            break;
+          }
+
+          message.measuredInnerLoop1sTimestampMs = longToNumber(reader.uint64());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -14994,6 +15027,16 @@ export const TrafficChannelPower: MessageFns<TrafficChannelPower> = {
         : isSet(object.forward_radio_config)
         ? globalThis.Number(object.forward_radio_config)
         : 0,
+      measuredInnerLoop1sDb: isSet(object.measuredInnerLoop1sDb)
+        ? globalThis.Number(object.measuredInnerLoop1sDb)
+        : isSet(object.measured_inner_loop_1s_db)
+        ? globalThis.Number(object.measured_inner_loop_1s_db)
+        : undefined,
+      measuredInnerLoop1sTimestampMs: isSet(object.measuredInnerLoop1sTimestampMs)
+        ? globalThis.Number(object.measuredInnerLoop1sTimestampMs)
+        : isSet(object.measured_inner_loop_1s_timestamp_ms)
+        ? globalThis.Number(object.measured_inner_loop_1s_timestamp_ms)
+        : undefined,
     };
   },
 
@@ -15059,6 +15102,12 @@ export const TrafficChannelPower: MessageFns<TrafficChannelPower> = {
     if (message.forwardRadioConfig !== 0) {
       obj.forwardRadioConfig = Math.round(message.forwardRadioConfig);
     }
+    if (message.measuredInnerLoop1sDb !== undefined) {
+      obj.measuredInnerLoop1sDb = message.measuredInnerLoop1sDb;
+    }
+    if (message.measuredInnerLoop1sTimestampMs !== undefined) {
+      obj.measuredInnerLoop1sTimestampMs = Math.round(message.measuredInnerLoop1sTimestampMs);
+    }
     return obj;
   },
 
@@ -15087,6 +15136,8 @@ export const TrafficChannelPower: MessageFns<TrafficChannelPower> = {
     message.reverseRadioConfig = object.reverseRadioConfig ?? 0;
     message.powerHistory = object.powerHistory?.map((e) => PowerControlSample.fromPartial(e)) || [];
     message.forwardRadioConfig = object.forwardRadioConfig ?? 0;
+    message.measuredInnerLoop1sDb = object.measuredInnerLoop1sDb ?? undefined;
+    message.measuredInnerLoop1sTimestampMs = object.measuredInnerLoop1sTimestampMs ?? undefined;
     return message;
   },
 };

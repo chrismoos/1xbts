@@ -10,7 +10,10 @@ use tokio::spawn;
 use crate::a1_edge::EncodedA1Message;
 use crate::addressing::{format_ms_address, is_packet_data_so};
 
-use super::{Bsc, MobileRegistryService, VoiceAlertMode, VoiceLegRole, VoiceSessionKind};
+use super::{
+    A1_CLEAR_CAUSE_PAGING_RESPONSE_NOT_RECEIVED, Bsc, MobileRegistryService, VoiceAlertMode,
+    VoiceLegRole, VoiceSessionKind,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PendingA1AssignmentKind {
@@ -1206,11 +1209,14 @@ impl Bsc {
                 // falls back to slot_cycle_index=0 when the registry is empty.
                 let Some(addr) = synthesize_fwd_address_from_imsi(&imsi) else {
                     warn!(
-                        "BSC: A1 Paging Request IMSI {} could not be parsed; replying ClearRequest(0x6E)",
-                        imsi
+                        "BSC: A1 Paging Request IMSI {} could not be parsed; replying ClearRequest(cause=0x{:02X})",
+                        imsi, A1_CLEAR_CAUSE_PAGING_RESPONSE_NOT_RECEIVED,
                     );
                     if let Some(call_id) = call_id {
-                        self.a1.send_clear_request(call_id, 0x6E);
+                        self.a1.send_clear_request(
+                            call_id,
+                            A1_CLEAR_CAUSE_PAGING_RESPONSE_NOT_RECEIVED,
+                        );
                     }
                     return;
                 };

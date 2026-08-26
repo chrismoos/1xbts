@@ -2,8 +2,8 @@ use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
 use cdma_bts::channels::{
-    Channel, PcgPcbScheduler, WalshChannel,
-    ftch_rc3::{ConfigRc3, ForwardTrafficChannelRc3},
+    Channel, WalshChannel,
+    ftch_rc3::{ConfigRc3, ForwardTrafficChannelRc3, Rc3PcgPcbScheduler},
     pilot::ForwardPilotChannel,
 };
 use cdma_bts::phy::coding::block_interleaver::{
@@ -16,6 +16,7 @@ use cdma_bts::phy::spread::Spreader;
 use cdma_bts::phy::walsh::WalshGenerator;
 use cdma_bts::receiver::access_layer3::{FdschMessage, FdschPdu};
 use cdma_common::bits::Bitstream;
+use cdma_common::consts::RC3_GATED_REV_PWR_CNTL_DELAY;
 use cdma_common::error::Error;
 use cdma_common::time::CdmaSystemTime;
 use hound::{WavReader, WavSpec, WavWriter};
@@ -245,7 +246,8 @@ fn local_generated_ffch_rc3_bs_ack_pc_on_chips(skip_lc_scrambling: bool) -> Vec<
             scrambling_lc: traffic_lc_with_state(DEFAULT_LONG_CODE_MASK, DEFAULT_LONG_CODE_STATE),
             puncture_lc: traffic_lc_with_state(DEFAULT_LONG_CODE_MASK, DEFAULT_LONG_CODE_STATE),
             lc_chip_cursor: 0,
-            pcb_scheduler: PcgPcbScheduler::new(0),
+            previous_pcg_pc_start: 0,
+            pcb_scheduler: Rc3PcgPcbScheduler::new(RC3_GATED_REV_PWR_CNTL_DELAY),
             fpc_subchan_gain_linear: 1.0,
             prev_frame_last_chip: 0,
             disable_lc_scrambling: skip_lc_scrambling,
@@ -609,6 +611,24 @@ fn rc3_pc_positions(
         pc_positions[pcg] = ((b3 << 3) | (b2 << 2) | (b1 << 1) | b0) * 2;
     }
     pc_positions
+}
+
+fn rc3_pipeline_pc_positions(
+    lc_mask: u64,
+    lc_initial_state: u64,
+    frame_chip_start: u64,
+) -> [usize; PCGS_PER_FRAME] {
+    let current = rc3_pc_positions(lc_mask, lc_initial_state, frame_chip_start);
+    let mut pipelined = [0usize; PCGS_PER_FRAME];
+    if frame_chip_start >= (SYMBOLS_PER_PCG * LC_DECIMATION) as u64 {
+        pipelined[0] = rc3_pc_positions(
+            lc_mask,
+            lc_initial_state,
+            frame_chip_start - (SYMBOLS_PER_PCG * LC_DECIMATION) as u64,
+        )[0];
+    }
+    pipelined[1..].copy_from_slice(&current[..PCGS_PER_FRAME - 1]);
+    pipelined
 }
 
 fn rc3_scalar_lc_descramble(
@@ -1301,7 +1321,8 @@ fn local_tx_rc3_qpsk(info_bits: &[u8]) -> Vec<Complex32> {
         scrambling_lc: traffic_lc_with_state(DEFAULT_LONG_CODE_MASK, DEFAULT_LONG_CODE_STATE),
         puncture_lc: traffic_lc_with_state(DEFAULT_LONG_CODE_MASK, DEFAULT_LONG_CODE_STATE),
         lc_chip_cursor: 0,
-        pcb_scheduler: PcgPcbScheduler::new(0),
+        previous_pcg_pc_start: 0,
+        pcb_scheduler: Rc3PcgPcbScheduler::new(RC3_GATED_REV_PWR_CNTL_DELAY),
         fpc_subchan_gain_linear: 1.0,
         prev_frame_last_chip: 0,
         disable_lc_scrambling: false,
@@ -1371,7 +1392,7 @@ fn manual_tx_rc3_mod_symbols(
         }
     }
 
-    let pc_positions = rc3_pc_positions(
+    let pc_positions = rc3_pipeline_pc_positions(
         DEFAULT_LONG_CODE_MASK,
         DEFAULT_LONG_CODE_STATE,
         lc_chip_start,
@@ -3730,9 +3751,10 @@ fn capture_local_generated_ffch_rc3_bs_ack_pc_on_bruteforce_pcg_shift() -> Resul
     );
 
     assert_eq!(
-        shift, 0,
-        "expected local PCB positions to use the current PCG selector"
+        shift, 1,
+        "expected local PCB positions to use the preceding PCG selector"
     );
+    assert!(rotate_right, "expected a one-PCG right rotation");
     assert_eq!(matches, PCGS_PER_FRAME, "expected exact local PCB recovery");
     assert_eq!(observed, expected, "expected recovered local PCB bits");
 

@@ -9,6 +9,7 @@ use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use cdma_common::{
+    consts::RC3_GATED_REV_PWR_CNTL_DELAY,
     hrpd::air::{
         HrpdAccessIndication, HrpdForwardSignalingRequest, HrpdTrafficAssignmentRequest,
         HrpdTrafficEvent, HrpdTrafficReleaseRequest,
@@ -23,7 +24,7 @@ use crate::{
         f_sch_rc3::{ForwardSupplementalChannelRc3, SchConfigRc3, interleaver_params},
         ftch::{self, ForwardTrafficChannel},
         ftch_rc2::{ConfigRc2, ForwardTrafficChannelRc2},
-        ftch_rc3::{self, ForwardTrafficChannelRc3},
+        ftch_rc3::{self, ForwardTrafficChannelRc3, Rc3PcgPcbScheduler},
     },
     phy::coding::{
         block_interleaver::{
@@ -676,7 +677,7 @@ pub fn allocate_traffic_channel(
                 0,
                 walsh_code,
                 format!("rc1-w{}", walsh_code),
-                PcgPcbFallbackMode::UpBeforeFirstThenHold,
+                PcgPcbFallbackMode::AlternatingHold,
             ),
             fpc_subchan_gain_linear,
             previous_pcg_pc_start: 0,
@@ -750,12 +751,8 @@ pub fn allocate_traffic_channel_rc3(
             scrambling_lc,
             puncture_lc,
             lc_chip_cursor: 0,
-            pcb_scheduler: PcgPcbScheduler::new_named_with_fallback(
-                0,
-                walsh_code,
-                format!("rc3-w{}", walsh_code),
-                PcgPcbFallbackMode::UpBeforeFirstThenHold,
-            ),
+            previous_pcg_pc_start: 0,
+            pcb_scheduler: Rc3PcgPcbScheduler::new(RC3_GATED_REV_PWR_CNTL_DELAY),
             fpc_subchan_gain_linear,
             prev_frame_last_chip: 0,
             disable_lc_scrambling: false,
@@ -798,7 +795,7 @@ pub fn commit_traffic_channel(
                 0,
                 walsh_code,
                 format!("rc1-w{}", walsh_code),
-                PcgPcbFallbackMode::UpBeforeFirstThenHold,
+                PcgPcbFallbackMode::AlternatingHold,
             ),
             fpc_subchan_gain_linear,
             previous_pcg_pc_start: 0,
@@ -840,12 +837,8 @@ pub fn commit_traffic_channel_rc3(
             scrambling_lc,
             puncture_lc,
             lc_chip_cursor: 0,
-            pcb_scheduler: PcgPcbScheduler::new_named_with_fallback(
-                0,
-                walsh_code,
-                format!("rc3-w{}", walsh_code),
-                PcgPcbFallbackMode::UpBeforeFirstThenHold,
-            ),
+            previous_pcg_pc_start: 0,
+            pcb_scheduler: Rc3PcgPcbScheduler::new(RC3_GATED_REV_PWR_CNTL_DELAY),
             fpc_subchan_gain_linear,
             prev_frame_last_chip: 0,
             disable_lc_scrambling: false,

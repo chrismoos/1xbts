@@ -206,6 +206,8 @@ fn to_proto_traffic_channel_power(tp: &TrafficChannelPowerSnapshot) -> proto::Tr
                 fer_pct: e.fer_pct,
             })
             .collect(),
+        measured_inner_loop_1s_db: None,
+        measured_inner_loop_1s_timestamp_ms: None,
     }
 }
 
@@ -244,6 +246,12 @@ fn to_proto_bts_reverse_power(
         forward_radio_config: bsc_snapshot.map_or(0, |s| s.forward_radio_config),
         reverse_radio_config: bsc_snapshot.map_or(0, |s| s.reverse_radio_config),
         power_history: Vec::new(),
+        measured_inner_loop_1s_db: snapshot
+            .measured_inner_loop_1s
+            .map(|measurement| measurement.mean_db),
+        measured_inner_loop_1s_timestamp_ms: snapshot
+            .measured_inner_loop_1s
+            .map(|measurement| measurement.timestamp_ms),
     }
 }
 
@@ -2437,7 +2445,12 @@ mod tests {
             fer_pct: 0.0,
             frames_total: 100,
             frames_crc_error: 0,
-            last_brake_offset_db: 0.0,
+            measured_inner_loop_1s: Some(
+                cdma_bts::bts::power_control::BtsPowerControlOneSecondMeasurement {
+                    timestamp_ms: 1_234,
+                    mean_db: 0.25,
+                },
+            ),
         };
         let bsc_snapshot = TrafficChannelPowerSnapshot {
             target_eb_nt_db: 8.0,
@@ -2472,6 +2485,8 @@ mod tests {
 
         assert_eq!(proto.last_pcg_pilot_ec_nt_db, vec![7.5; 16]);
         assert!(proto.power_history.is_empty());
+        assert_eq!(proto.measured_inner_loop_1s_db, Some(0.25));
+        assert_eq!(proto.measured_inner_loop_1s_timestamp_ms, Some(1_234));
     }
 
     #[test]

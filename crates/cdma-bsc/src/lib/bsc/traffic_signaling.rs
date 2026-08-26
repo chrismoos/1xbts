@@ -3,7 +3,11 @@
 
 use std::time::Instant;
 
-use cdma_common::access::AccessMessage;
+use cdma_common::access::{
+    AccessMessage, SERVICE_REQUEST_PURPOSE_ACCEPT, SERVICE_REQUEST_PURPOSE_PROPOSE,
+    SERVICE_REQUEST_PURPOSE_REJECT, SERVICE_RESPONSE_PURPOSE_ACCEPT,
+    SERVICE_RESPONSE_PURPOSE_COUNTER_PROPOSE, SERVICE_RESPONSE_PURPOSE_REJECT,
+};
 use cdma_common::error::Error;
 use cdma_common::events::AccessChannelEvent;
 use cdma_common::formatting::reverse_order_name;
@@ -609,6 +613,7 @@ impl Bsc {
         // traffic channel uses MSG_SEQ. The mobile maintains separate
         // counters for assured (ack_req=1) vs unassured (ack_req=0) PDUs
         // per 3.2.2.1.2.2, so we track them in separate arrays.
+        let mut reverse_pdu_duplicate = false;
         if let Some(msg_seq) = event.msg_seq {
             if !event.is_preamble_only {
                 let is_duplicate = self
@@ -622,6 +627,7 @@ impl Bsc {
                         mark_reverse_regular_msg_seq_received(arr, msg_seq)
                     })
                     .unwrap_or(false);
+                reverse_pdu_duplicate = is_duplicate;
                 if is_duplicate
                     && event.ack_req
                     && event.message_id != MessageId::ServiceConnectCompletion
@@ -670,18 +676,11 @@ impl Bsc {
                 } else if order == super::RELEASE_ORDER_CODE {
                     // r-dsch Release Order with ORDQ=0x00 requests normal release.
                     info!(
-                        "BSC: received MS Release Order on R-TCH walsh={} for {}, tearing down",
+                        "BSC: received MS Release Order on R-TCH walsh={} for {}, holding radio resources for {}ms",
                         walsh_code,
                         format_ms_address(&addr),
+                        super::traffic_channel::TRAFFIC_RELEASE_GUARD.as_millis(),
                     );
-                    let session_id = self
-                        .mobiles
-                        .get_traffic_channel(walsh_code)
-                        .and_then(|tc| tc.voice_session_id);
-                    let leg_role = self
-                        .mobiles
-                        .get_traffic_channel(walsh_code)
-                        .and_then(|tc| tc.voice_leg_role);
                     let (a1_call_id, a1_clear_state) = self
                         .mobiles
                         .get_traffic_channel(walsh_code)
@@ -689,9 +688,24 @@ impl Bsc {
                         .unwrap_or((None, A1ClearState::Idle));
                     if let (Some(call_id), A1ClearState::Idle) = (a1_call_id, a1_clear_state) {
                         self.a1.send_clear_request(call_id, 0);
+                        self.mobiles.update_tc(walsh_code, |_, tc| {
+                            tc.mark_a1_clear_request_sent();
+                        });
                     }
-                    self.teardown_traffic_channel(walsh_code).await;
-                    self.on_voice_leg_released(session_id, leg_role);
+                    if !reverse_pdu_duplicate {
+                        if let Err(e) = self
+                            .send_traffic_release_order(walsh_code, super::DEFAULT_TRAFFIC_ACK_SEQ)
+                        {
+                            warn!(
+                                "BSC: failed to send Release Order in response to MS release on walsh={}: {}",
+                                walsh_code, e
+                            );
+                        }
+                        self.mobiles.update_tc(walsh_code, |_, tc| {
+                            tc.refresh_release_guard();
+                        });
+                        self.publish_mobiles();
+                    }
                 } else if order == reverse_order_code::CONNECT {
                     // MS→BS only. User answered an MT call.
                     info!(
@@ -892,6 +906,133 @@ impl Bsc {
                     walsh_code
                 );
             }
+        } else if event.message_id == MessageId::ServiceRequest {
+            let Some(AccessMessage::ServiceRequest(request)) = event.decoded_l3.as_ref() else {
+                warn!(
+                    "BSC: Service Request on R-TCH walsh={} missing decoded L3",
+                    walsh_code
+                );
+                return;
+            };
+            let ack_seq = event.msg_seq.unwrap_or(0);
+            info!(
+                "BSC: received Service Request on R-TCH walsh={} req_purpose=0b{:04b} serv_req_seq={}",
+                walsh_code, request.req_purpose, request.serv_req_seq
+            );
+
+            match request.req_purpose {
+                SERVICE_REQUEST_PURPOSE_ACCEPT => {
+                    let waiting = self
+                        .mobiles
+                        .get_traffic_channel(walsh_code)
+                        .is_some_and(|tc| tc.is_waiting_service_response());
+                    if !waiting {
+                        info!(
+                            "BSC: Service Request accept in unexpected state on walsh={}, ignoring",
+                            walsh_code
+                        );
+                    } else if let Err(e) = self.send_service_connect(walsh_code, ack_seq) {
+                        warn!(
+                            "BSC: failed to send Service Connect after mobile accepted counter-proposal on walsh={}: {}",
+                            walsh_code, e
+                        );
+                    } else if let Some(tc) = self.mobiles.get_traffic_channel_mut(walsh_code) {
+                        tc.mark_service_connecting();
+                    }
+                }
+                SERVICE_REQUEST_PURPOSE_REJECT => {
+                    warn!(
+                        "BSC: mobile rejected service configuration on walsh={}",
+                        walsh_code
+                    );
+                    if !self.release_tch_and_signal_assignment_failure(
+                        walsh_code,
+                        &addr,
+                        "Service Request reject",
+                    ) {
+                        self.teardown_traffic_channel(walsh_code).await;
+                    }
+                }
+                SERVICE_REQUEST_PURPOSE_PROPOSE => {
+                    let already_countered = self
+                        .mobiles
+                        .get_traffic_channel(walsh_code)
+                        .is_some_and(|tc| tc.is_waiting_service_response());
+                    if already_countered {
+                        warn!(
+                            "BSC: mobile counter-proposal remains incompatible on walsh={}, rejecting service negotiation",
+                            walsh_code
+                        );
+                        if let Err(e) = self.send_service_response_reject(
+                            walsh_code,
+                            ack_seq,
+                            request.serv_req_seq,
+                        ) {
+                            warn!(
+                                "BSC: failed to send Service Response reject on walsh={}: {}",
+                                walsh_code, e
+                            );
+                        }
+                        self.begin_packet_tch_release(
+                            walsh_code,
+                            "service counter-proposal remained incompatible",
+                        );
+                        return;
+                    }
+
+                    let proposed = request.service_config.as_ref();
+                    let assigned = self
+                        .mobiles
+                        .get_traffic_channel(walsh_code)
+                        .map(|tc| (tc.service_option, tc.for_rc, tc.rev_rc));
+                    let proposal_matches = proposed.zip(assigned).is_some_and(|(cfg, assigned)| {
+                        let (service_option, for_rc, rev_rc) = assigned;
+                        cfg.fch_cc_incl
+                            && cfg.for_fch_rc == Some(for_rc)
+                            && cfg.rev_fch_rc == Some(rev_rc)
+                            && !cfg.dcch_cc_incl
+                            && !cfg.for_sch_cc_incl
+                            && !cfg.rev_sch_cc_incl
+                            && cfg.connection_records.iter().any(|connection| {
+                                connection.service_option == service_option
+                                    && connection.for_traffic != 0
+                                    && connection.rev_traffic != 0
+                            })
+                    });
+
+                    if proposal_matches {
+                        info!(
+                            "BSC: accepting mobile service proposal on walsh={} with Service Connect",
+                            walsh_code
+                        );
+                        if let Err(e) = self.send_service_connect(walsh_code, ack_seq) {
+                            warn!(
+                                "BSC: failed to accept mobile service proposal on walsh={}: {}",
+                                walsh_code, e
+                            );
+                        } else if let Some(tc) = self.mobiles.get_traffic_channel_mut(walsh_code) {
+                            tc.mark_service_connecting();
+                        }
+                    } else if let Err(e) = self.send_service_response_counter_proposal(
+                        walsh_code,
+                        ack_seq,
+                        request.serv_req_seq,
+                    ) {
+                        warn!(
+                            "BSC: failed to counter-propose assigned service configuration on walsh={}: {}",
+                            walsh_code, e
+                        );
+                    } else if let Some(tc) = self.mobiles.get_traffic_channel_mut(walsh_code) {
+                        tc.mark_waiting_service_response();
+                    }
+                }
+                _ => {
+                    warn!(
+                        "BSC: reserved REQ_PURPOSE 0b{:04b} on walsh={}, ignoring",
+                        request.req_purpose, walsh_code
+                    );
+                }
+            }
         } else if event.message_id == MessageId::ServiceResponse {
             // Service Response — MS accepts/rejects/counter-proposes our Service Request
             let resp_purpose = event
@@ -919,7 +1060,7 @@ impl Bsc {
             if waiting_service_response {
                 let ack_seq = event.msg_seq.unwrap_or(0);
                 match resp_purpose {
-                    0b0000 => {
+                    SERVICE_RESPONSE_PURPOSE_ACCEPT => {
                         // Accept — mobile agreed to our proposed SO. Send Service Connect.
                         info!(
                             "BSC: mobile accepted Service Request on walsh={}, sending Service Connect",
@@ -934,7 +1075,7 @@ impl Bsc {
                             tc.mark_service_connecting();
                         }
                     }
-                    0b0001 => {
+                    SERVICE_RESPONSE_PURPOSE_REJECT => {
                         warn!(
                             "BSC: mobile rejected Service Request on walsh={}",
                             walsh_code
@@ -947,7 +1088,7 @@ impl Bsc {
                             self.teardown_traffic_channel(walsh_code).await;
                         }
                     }
-                    0b0010 => {
+                    SERVICE_RESPONSE_PURPOSE_COUNTER_PROPOSE => {
                         // Counter-propose: accept packet data or an implemented voice codec.
                         let proposed_so = event.decoded_l3.as_ref().and_then(|l3| match l3 {
                             AccessMessage::ServiceResponse(m) => m

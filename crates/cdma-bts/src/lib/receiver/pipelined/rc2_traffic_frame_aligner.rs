@@ -24,7 +24,7 @@ use super::{PipelineProcessor, SampleBlock, raw_to_soft};
 use crate::phy::coding::block_interleaver::{
     Rc12ReverseTrafficInterleaver, Rc12ReverseTrafficRate,
 };
-use crate::phy::coding::convolutional::{SoftViterbiDecoder, get_1_2_k9_encoder};
+use crate::phy::coding::convolutional::with_1_2_k9_soft_viterbi_decoder;
 use crate::phy::coding::long_code::LongCodeGenerator;
 use crate::phy::walsh::WalshGenerator;
 
@@ -414,8 +414,8 @@ impl Rc2TrafficFrameAligner {
                 raw_to_soft(chunk[1], inv_peak),
             ]);
         }
-        let mut decoder: SoftViterbiDecoder<9, 2> = SoftViterbiDecoder::new(get_1_2_k9_encoder());
-        let mut bits = decoder.decode_block_from_state(&inputs, 0);
+        let mut bits =
+            with_1_2_k9_soft_viterbi_decoder(|decoder| decoder.decode_block_from_state(&inputs, 0));
         bits.truncate(total_input_bits);
         bits
     }

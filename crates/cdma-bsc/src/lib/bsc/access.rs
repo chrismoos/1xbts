@@ -29,6 +29,7 @@ use cdma_common::consts::{
 use super::{
     AccessRegistrationUpdate, Bsc, MobileStation, PendingA1AssignmentKind, PendingPage,
     VoiceLegRole, mark_reverse_regular_msg_seq_received, next_pch_correlation_id,
+    traffic_signaling::reverse_order_code,
 };
 
 /// Result of an async HLR subscriber lookup, sent back to the BSC run loop.
@@ -173,7 +174,7 @@ impl AccessTx {
             addr,
             ack_msg_seq,
             false,
-            0b010000,
+            super::ACKNOWLEDGMENT_ORDER_CODE,
             0,
             "Base Station Acknowledgment Order",
             requested_tx_time,
@@ -227,7 +228,7 @@ impl AccessTx {
             ack_msg_seq,
             true,
             super::RELEASE_ORDER_CODE,
-            0b00000010,
+            super::RELEASE_ORDER_SERVICE_OPTION_REJECTED_QUALIFIER,
             "Release Order (requested service option rejected)",
             requested_tx_time,
             tx_deadline,
@@ -389,11 +390,15 @@ impl AccessService {
 
         match event.message_id {
             MessageId::Registration => {
+                let registered_addr = bsc.extract_fwd_address(&event);
                 self.handle_registration(bsc, &event);
+                if let Some(addr) = registered_addr {
+                    bsc.teardown_traffic_on_idle_registration(&addr).await;
+                }
                 bsc.publish_mobiles();
             }
             MessageId::Order => {
-                self.handle_order(bsc, &event);
+                self.handle_order(bsc, &event).await;
             }
             MessageId::DataBurst => {
                 self.handle_data_burst(bsc, &event);
@@ -557,7 +562,7 @@ impl AccessService {
         bsc.try_deliver_pending_sms_from_access(event, &fwd_address, "Registration");
     }
 
-    pub(crate) fn handle_order(&mut self, bsc: &mut Bsc, event: &AccessChannelEvent) {
+    pub(crate) async fn handle_order(&mut self, bsc: &mut Bsc, event: &AccessChannelEvent) {
         let fwd_address = match bsc.extract_fwd_address(event) {
             Some(addr) => addr,
             None => return,
@@ -572,8 +577,7 @@ impl AccessService {
             event.msg_seq,
         );
 
-        const MS_ACK_ORDER: u8 = 0b010000;
-        if event.order_code == Some(MS_ACK_ORDER) {
+        if event.order_code == Some(super::ACKNOWLEDGMENT_ORDER_CODE) {
             let last_msg_seq = event.msg_seq.unwrap_or(0);
             if event.ack_req {
                 if let Err(e) = bsc.access_tx.send_bs_ack_order(
@@ -588,6 +592,29 @@ impl AccessService {
             return;
         }
 
+        let rejected_assignment = (event.order_code
+            == Some(reverse_order_code::MOBILE_STATION_REJECT))
+        .then(|| {
+            event.decoded_l3.as_ref().and_then(|message| match message {
+                AccessMessage::Order(order) => order.parse_mobile_station_reject_order(
+                    cdma_common::lac::message_types::WireChannel::ForwardCommon,
+                ),
+                _ => None,
+            })
+        })
+        .flatten()
+        .filter(|detail| {
+            [
+                MessageId::ChannelAssignment,
+                MessageId::ExtChannelAssignment,
+            ]
+            .into_iter()
+            .filter_map(|message_id| {
+                message_id.wire_type(cdma_common::lac::message_types::WireChannel::ForwardCommon)
+            })
+            .any(|wire_type| wire_type == detail.rejected_type)
+        });
+
         // Other access-channel Orders have no Layer 3 response here, but
         // still need L2 acknowledgment when the mobile requested one.
         if event.ack_req {
@@ -600,6 +627,33 @@ impl AccessService {
             ) {
                 warn!("BSC: failed to send BS Ack for order: {}", e);
             }
+        }
+
+        if let Some(detail) = rejected_assignment {
+            let pending_walsh = bsc
+                .mobiles
+                .get(&fwd_address)
+                .and_then(|mobile| mobile.pending_traffic_assignment())
+                .map(|channel| channel.walsh_code);
+            if let Some(walsh_code) = pending_walsh {
+                warn!(
+                    "BSC: MS rejected traffic assignment on access channel for {} (REJECTED_TYPE=0x{:02x} ORDQ=0x{:02x}), tearing down walsh={}",
+                    format_ms_address(&fwd_address),
+                    detail.rejected_type,
+                    detail.ordq,
+                    walsh_code,
+                );
+                bsc.teardown_traffic_channel(walsh_code).await;
+            } else {
+                info!(
+                    "BSC: MS rejected traffic assignment on access channel for {} without a pending traffic channel",
+                    format_ms_address(&fwd_address),
+                );
+            }
+            return;
+        }
+
+        if event.ack_req {
             return;
         }
 
@@ -706,7 +760,16 @@ impl AccessService {
         // If there's a pending page, take it and continue the corresponding flow.
         // Otherwise, if the MS requested an ACK, send a standalone BS Ack Order
         // so the MS stops retransmitting.
-        if let Some(pending) = bsc.paging.take_sms_page() {
+        let pending_sms = fwd_address
+            .as_ref()
+            .and_then(|addr| bsc.paging.take_matching_sms_page_for_access(addr))
+            .or_else(|| {
+                fwd_address
+                    .is_none()
+                    .then(|| bsc.paging.take_sms_page())
+                    .flatten()
+            });
+        if let Some(pending) = pending_sms {
             info!(
                 "BSC: page response received after {} retries ({:.0}ms elapsed) — delivering SMS",
                 pending.retry_count,
@@ -730,7 +793,16 @@ impl AccessService {
             // The directed Data Burst requested L2 acknowledgment. Keep the
             // MS in PageResponseReceived until BTS reports the DBM result,
             // then send the Release Order from handle_pch_transfer_ack.
-        } else if let Some(pending) = bsc.paging.take_voice_page() {
+        } else if let Some(pending) = fwd_address
+            .as_ref()
+            .and_then(|addr| bsc.paging.take_voice_page_for_address(addr))
+            .or_else(|| {
+                fwd_address
+                    .is_none()
+                    .then(|| bsc.paging.take_voice_page())
+                    .flatten()
+            })
+        {
             bsc.clear_pending_page_records_for(&pending.page_address);
             info!(
                 "BSC: page response received after {} retries ({:.0}ms elapsed) — assigning voice traffic",
@@ -844,6 +916,32 @@ impl AccessService {
         };
 
         if let Some(so) = requested_so {
+            if is_packet_data_so(so)
+                && (bsc.paging.pending_voice_page_for_address(&fwd_address)
+                    || bsc.voice.has_deferred_page_for_address(&fwd_address)
+                    || bsc
+                        .mobiles
+                        .get(&fwd_address)
+                        .and_then(|ms| ms.traffic_channel())
+                        .is_some_and(|tc| tc.voice_session_id.is_some()))
+            {
+                info!(
+                    "BSC: rejecting packet origination from {} while MT voice setup has priority",
+                    format_ms_address(&fwd_address)
+                );
+                if let Err(e) = bsc.access_tx.send_service_option_rejected_release(
+                    &fwd_address,
+                    last_msg_seq,
+                    access_response_tx_time(event),
+                    bsc.access_ack_deadline(event),
+                ) {
+                    warn!(
+                        "BSC: failed to reject packet origination during MT voice setup: {}",
+                        e
+                    );
+                }
+                return;
+            }
             let a1_kind = if is_sms_traffic_service_option(so) {
                 if bsc
                     .mobiles
@@ -1036,6 +1134,39 @@ fn is_voice_origination_service_option(so: u16) -> bool {
 }
 
 impl Bsc {
+    async fn teardown_traffic_on_idle_registration(&mut self, addr: &MsAddress) {
+        let Some((walsh_code, call_id, clear_state, voice_session_id, voice_leg_role)) = self
+            .mobiles
+            .get(addr)
+            .and_then(|mobile| mobile.traffic_channel())
+            .map(|traffic| {
+                (
+                    traffic.walsh_code,
+                    traffic.a1_call_id,
+                    traffic.a1_clear_state,
+                    traffic.voice_session_id,
+                    traffic.voice_leg_role,
+                )
+            })
+        else {
+            return;
+        };
+
+        warn!(
+            "BSC: explicit registration from {} while walsh={} is active, removing stale traffic session",
+            format_ms_address(addr),
+            walsh_code,
+        );
+        if let (Some(call_id), super::A1ClearState::Idle) = (call_id, clear_state) {
+            self.a1.send_clear_request(call_id, 0);
+            self.mobiles.update_tc(walsh_code, |_, traffic| {
+                traffic.mark_a1_clear_request_sent();
+            });
+        }
+        self.teardown_traffic_channel(walsh_code).await;
+        self.on_voice_leg_released(voice_session_id, voice_leg_role);
+    }
+
     pub(crate) fn enrich_uplink_event(&self, mut event: AccessChannelEvent) -> AccessChannelEvent {
         let matched_mobile = if let Some(walsh_code) = event.traffic_walsh_code {
             self.mobiles.get_by_walsh(walsh_code)

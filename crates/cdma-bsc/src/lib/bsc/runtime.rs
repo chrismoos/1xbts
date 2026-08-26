@@ -131,11 +131,14 @@ impl Bsc {
         &self,
         ms_ack_timeout: Duration,
     ) -> Option<tokio::time::Instant> {
+        let assignment_delivery_timeout =
+            Duration::from_millis(self.config.paging_retry.ack_timeout_ms) + ms_ack_timeout;
         self.mobiles
             .iter()
             .filter_map(|ms| {
-                ms.traffic_channel()
-                    .and_then(|tc| tc.next_traffic_lifecycle_deadline(ms_ack_timeout))
+                ms.traffic_channel().and_then(|tc| {
+                    tc.next_traffic_lifecycle_deadline(ms_ack_timeout, assignment_delivery_timeout)
+                })
             })
             .min()
             .map(tokio::time::Instant::from_std)
@@ -143,12 +146,15 @@ impl Bsc {
 
     pub(crate) async fn poll_traffic_channel_lifecycle(&mut self, ms_ack_timeout: Duration) {
         let now = Instant::now();
+        let assignment_delivery_timeout =
+            Duration::from_millis(self.config.paging_retry.ack_timeout_ms) + ms_ack_timeout;
         let actions: Vec<_> = self
             .mobiles
             .iter()
             .filter_map(|ms| {
                 let tc = ms.traffic_channel()?;
-                match tc.traffic_lifecycle_action(ms_ack_timeout, now) {
+                match tc.traffic_lifecycle_action(ms_ack_timeout, assignment_delivery_timeout, now)
+                {
                     TrafficChannelAction::Teardown { reason, timeout_ms } => Some((
                         tc.walsh_code,
                         tc.voice_session_id,

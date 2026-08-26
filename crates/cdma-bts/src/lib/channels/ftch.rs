@@ -14,7 +14,10 @@ use crate::{
     },
 };
 
-use super::{Channel, PcgPcbSchedulerHandle};
+use super::{
+    Channel, PcgPcbSchedulerHandle,
+    rc12_power_control::{Rc12PowerControlCadence, Rc12PowerControlSlot},
+};
 pub use cdma_common::channel::TrafficRate;
 use cdma_common::consts::SR1_PCGS_PER_FRAME;
 
@@ -112,6 +115,7 @@ struct PrepEngine<const EK: usize, const ER: usize> {
 
 pub struct ForwardTrafficChannel<const EK: usize, const ER: usize> {
     config: Mutex<Config<EK, ER>>,
+    power_control_cadence: Rc12PowerControlCadence,
     tx_state: Mutex<TxState>,
     prep: Mutex<PrepEngine<EK, ER>>,
     frames: Mutex<VecDeque<PreparedFrame>>,
@@ -139,12 +143,15 @@ struct NullFrameState {
 impl<const EK: usize, const ER: usize> ForwardTrafficChannel<EK, ER> {
     pub fn new(config: Config<EK, ER>) -> Self {
         let pcb_scheduler = config.pcb_scheduler.clone();
+        let power_control_cadence =
+            Rc12PowerControlCadence::new(config.long_code_generator.clone());
         let prep = PrepEngine {
             encoder: config.encoder,
             interleaver: config.interleaver.clone(),
         };
         ForwardTrafficChannel {
             config: Mutex::new(config),
+            power_control_cadence,
             tx_state: Mutex::new(TxState {
                 symbol_buffer: VecDeque::new(),
                 prepared_frame: None,
@@ -240,14 +247,33 @@ impl<const EK: usize, const ER: usize> ForwardTrafficChannel<EK, ER> {
     }
 
     /// Schedule a single power-control bit for an absolute PCG index.
-    pub fn schedule_power_control_bit(&self, abs_pcg: u64, bit: u8) {
-        self.pcb_scheduler.lock().schedule(abs_pcg, bit);
+    pub fn schedule_power_control_bit(&self, abs_pcg: u64, bit: u8) -> bool {
+        self.pcb_scheduler.lock().schedule(abs_pcg, bit)
     }
 
     pub fn schedule_power_control_burst(&self, start_abs_pcg: u64, pcgs: u64, bit: u8) {
         self.pcb_scheduler
             .lock()
             .schedule_burst(start_abs_pcg, pcgs, bit);
+    }
+
+    pub(crate) fn power_control_slots(
+        &self,
+        start_abs_pcg: u64,
+        count: u64,
+    ) -> Vec<Rc12PowerControlSlot> {
+        self.power_control_cadence
+            .power_control_slots(start_abs_pcg, count)
+    }
+
+    pub(crate) fn guaranteed_power_control_ordinal(&self, measured_abs_pcg: u64) -> Option<u64> {
+        self.power_control_cadence
+            .guaranteed_ordinal_for_measurement(measured_abs_pcg)
+    }
+
+    pub(crate) fn power_control_abs_pcg_for_guaranteed_ordinal(&self, ordinal: u64) -> u64 {
+        self.power_control_cadence
+            .pcb_abs_pcg_for_guaranteed_ordinal(ordinal)
     }
 
     /// Advance the internal long code generator to the given absolute chip

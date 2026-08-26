@@ -1,117 +1,93 @@
 //! Reverse-link closed-loop power control.
 //!
-//! RC3 inner loop controls on per-PCG pilot symbol SINR. Setpoints are
-//! lock-step with `rlgain_adj` in `paging_messages.rs` — re-run
-//! `rc3_pilot_sinr_at_1pct_fer_calibration` before changing either.
+//! RC1, RC2, and RC3 use absolute-PCG measurements without filtering or
+//! prediction. Rate-gated channels schedule only PCBs guaranteed to be seen by
+//! the mobile and use balanced commands between direct control opportunities.
 
 use std::{collections::HashMap, collections::VecDeque, sync::Arc};
 
 use parking_lot::Mutex;
 
 use super::handle::{TrafficChannelPool, TrafficChannelWrapper};
-use crate::channels::ftch_rc2::Rc2PowerControlSlot;
+use crate::channels::ftch_rc3::Rc3PcgPcbSchedulerSnapshot;
 
-const RC1_INITIAL_TARGET_DB: f32 = 10.0;
-const RC1_AUTO_MIN_DB: f32 = 8.0;
-const RC1_AUTO_MAX_DB: f32 = 12.0;
+// Keep the RC1 target fixed to prevent multi-mobile noise-floor escalation.
+const RC1_INITIAL_TARGET_DB: f32 = 13.0;
+const RC1_AUTO_MIN_DB: f32 = 13.0;
+const RC1_AUTO_MAX_DB: f32 = 13.0;
 const RC1_MANUAL_MIN_DB: f32 = 0.0;
 const RC1_MANUAL_MAX_DB: f32 = 40.0;
-const RC3_INITIAL_TARGET_DB: f32 = -5.5;
-const RC3_AUTO_MIN_DB: f32 = -5.5;
-const RC3_AUTO_MAX_DB: f32 = -1.5;
+const RC2_INITIAL_TARGET_DB: f32 = 10.0;
+const RC2_AUTO_MIN_DB: f32 = 8.0;
+const RC2_AUTO_MAX_DB: f32 = 12.0;
+const RC2_MANUAL_MIN_DB: f32 = 0.0;
+const RC2_MANUAL_MAX_DB: f32 = 40.0;
+const RC3_INITIAL_TARGET_DB: f32 = 0.0;
+const DIRECT_THREE_STEP_ERROR_DB: f32 = 3.0;
+const DIRECT_FIVE_STEP_ERROR_DB: f32 = 5.0;
+const RC3_AUTO_MIN_DB: f32 = -2.0;
+const RC3_AUTO_MAX_DB: f32 = 2.0;
 const RC3_MANUAL_MIN_DB: f32 = -40.0;
 const RC3_MANUAL_MAX_DB: f32 = 40.0;
-const PCG_METRIC_FILTER_ALPHA: f32 = 0.05;
-const PCG_HOLD_BAND_DB: f32 = 0.25;
-const PCG_RESPONSE_GAIN_DB_PER_DB: f32 = 0.6;
-const PCG_DESIRED_STEP_CLAMP_DB: f32 = 1.0;
-const PCG_RESIDUAL_CLAMP_DB: f32 = 1.0;
-const RAW_POWER_FILTER_ALPHA: f32 = 0.05;
-const BRAKE_RAW_POWER_ATTACK_ALPHA: f32 = 1.0 / 40.0;
-const BRAKE_RAW_POWER_RELEASE_ALPHA: f32 = 1.0 / 16.0;
 const FER_WINDOW: usize = 50;
-const OUTER_LOOP_MIN_VALID_FRAMES: u64 = 10;
-const TARGET_FER_PCT: f32 = 1.0;
+const RC1_RC2_OUTER_LOOP_MIN_VALID_FRAMES: u64 = 10;
+const RC3_OUTER_LOOP_MIN_VALID_FRAMES: u64 = 50;
+const RC1_RC2_TARGET_FER_PCT: f32 = 1.0;
+const RC3_TARGET_FER_PCT: f32 = 0.5;
 const TARGET_STEP_UP_DB: f32 = 0.25;
 const TARGET_UNDERPOWER_ERROR_STEP_UP_DB: f32 = 0.5;
 const TARGET_OVERPOWER_ERROR_STEP_DOWN_DB: f32 = 0.25;
 const TARGET_OVERPOWER_CLEAN_STEP_DOWN_DB: f32 = 0.1;
-const ADAPTIVE_FLOOR_TRIGGER_BAND_DB: f32 = 0.25;
-const ADAPTIVE_FLOOR_STEP_UP_DB: f32 = 0.1;
-const ADAPTIVE_FLOOR_DECAY_FRAMES: u64 = 250;
-const ADAPTIVE_FLOOR_DECAY_STEP_DB: f32 = 0.1;
-const METRIC_HISTORY_LEN: usize = 24;
-pub(super) const PCG_PREDICTION_LEAD_PCGS: u32 = 12;
-const RC1_PCB_SPECULATIVE_FILL_PCGS: u64 = 16;
-const RC2_PCB_SPECULATIVE_FILL_PCGS: u64 = RC1_PCB_SPECULATIVE_FILL_PCGS;
-const PCG_PREDICTION_CLAMP_DB: f32 = 1.0;
-const RC3_DELTA_SIGMA_PARAMS: super::reverse_power_predictor::DeltaSigmaParams =
-    super::reverse_power_predictor::DeltaSigmaParams {
-        hold_band_db: PCG_HOLD_BAND_DB,
-        response_gain_db_per_db: PCG_RESPONSE_GAIN_DB_PER_DB,
-        desired_step_clamp_db: PCG_DESIRED_STEP_CLAMP_DB,
-        residual_clamp_db: PCG_RESIDUAL_CLAMP_DB,
-    };
-const BRAKE_BEGIN_DBFS: f32 = -12.0;
-const BRAKE_FULL_DBFS: f32 = -2.0;
-const BRAKE_MAX_OFFSET_DB: f32 = 8.0;
+pub(super) const DIRECT_CONTROL_MIN_LEAD_PCGS: u64 = 9;
+#[cfg(test)]
+const RC3_DIRECT_CONTROL_LEAD_PCGS: u64 = DIRECT_CONTROL_MIN_LEAD_PCGS;
+const DIRECT_HOLD_PCBS: u64 = 8;
+const DIRECT_EPOCH_PCBS: u64 = DIRECT_HOLD_PCBS + 1;
+const DIRECT_MAX_MEASUREMENT_AGE_PCGS: u64 = 2;
+#[cfg(test)]
+const RC3_DIRECT_HOLD_PCBS: u64 = DIRECT_HOLD_PCBS;
+#[cfg(test)]
+const RC3_DIRECT_EPOCH_PCBS: u64 = DIRECT_EPOCH_PCBS;
+#[cfg(test)]
+const RC3_DIRECT_MAX_MEASUREMENT_AGE_PCGS: u64 = DIRECT_MAX_MEASUREMENT_AGE_PCGS;
+// The command goes on the third PCG the mobile is certain to transmit in, not a
+// fixed number of PCGs later, because the randomizer moves which ones those are.
+// That works out to 19-33 PCGs of lead, always past the nine-PCG publication floor.
+const RC12_DIRECT_DELAY_GUARANTEED_SLOTS: u64 = 3;
+const RC12_NEUTRAL_LOOKAHEAD_PCGS: u64 = 16;
+const RC3_RELEASE_NEUTRAL_FILL_PCGS: u64 = 16;
+const SR1_CHIPS_PER_PCG: u64 = 1_536;
+const SR1_PCGS_PER_SECOND: u64 = 800;
 const CLIP_BEGIN_DBFS: f32 = -8.0;
-const PCG_CLIP_COOLDOWN_PCGS: u8 = 32;
 const PCG_RAW_HOT_LIMIT_DBFS: f32 = -8.0;
-const PCG_RAW_HOT_RELEASE_DBFS: f32 = -10.0;
-const RC1_BRAKE_BEGIN_DBFS: f32 = -6.0;
-const RC1_BRAKE_FULL_DBFS: f32 = 0.0;
-const RC1_BRAKE_MAX_OFFSET_DB: f32 = 3.0;
 const RC1_CLIP_BEGIN_DBFS: f32 = -2.0;
-const RC1_PCG_CLIP_COOLDOWN_PCGS: u8 = 8;
 const RC1_PCG_RAW_HOT_LIMIT_DBFS: f32 = -2.0;
-const RC1_PCG_RAW_HOT_RELEASE_DBFS: f32 = -4.0;
-const RC2_BRAKE_BEGIN_DBFS: f32 = -44.0;
-const RC2_BRAKE_FULL_DBFS: f32 = -38.0;
-const RC2_BRAKE_MAX_OFFSET_DB: f32 = 1.0;
 const RC2_PCG_RAW_HOT_LIMIT_DBFS: f32 = -38.0;
-const RC2_PCG_RAW_HOT_RELEASE_DBFS: f32 = -42.0;
 const OUTER_LOOP_OVERPOWER_CLIP_PCGS: usize = 4;
+const RC1_OUTER_LOOP_OVERPOWER_CLIP_PCGS: usize = 1;
 const RC2_OUTER_LOOP_OVERPOWER_HOT_PCGS: usize = 1;
 const OUTER_LOOP_UNDERPOWER_ERROR_DB: f32 = 4.0;
-const OUTER_LOOP_UNDERPOWER_MIN_UP_PCBS: usize = 12;
 const OUTER_LOOP_UNDERPOWER_MAX_RAW_DBFS: f32 = -20.0;
-const OUTER_LOOP_UNDERPOWER_MAX_BRAKE_DB: f32 = 2.0;
 const OUTER_LOOP_MIN_FRAME_OBSERVATION_PCGS: usize = 8;
-const RC2_OUTER_LOOP_MIN_FRAME_OBSERVATION_PCGS: usize = 2;
-const OUTER_LOOP_CELL_SETTLING_FRAMES: u64 = 0;
-const OUTER_LOOP_TRANSIENT_RECOVERY_FRAMES: u64 = 0;
-
-fn plan_rc2_pcbs(
-    slots: &[Rc2PowerControlSlot],
-    requested_bit: u8,
-    mobile_brake_active: bool,
-) -> Vec<u8> {
-    if mobile_brake_active {
-        return vec![1; slots.len()];
-    }
-    let mut driven = false;
-    slots
-        .iter()
-        .map(|slot| {
-            if !driven && slot.guaranteed_valid && slot.hold_bit != requested_bit {
-                driven = true;
-                requested_bit
-            } else {
-                slot.hold_bit
-            }
-        })
-        .collect()
-}
+const RC12_OUTER_LOOP_MIN_FRAME_OBSERVATION_PCGS: usize = 2;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BtsPowerControlTick {
     pub pcb: u8,
+    /// Whether this PCG carries the forward power-control subchannel.
+    pub command_slot_valid: bool,
     pub target_db: f32,
     pub control_metric_db: f32,
     pub raw_power_db: Option<f32>,
-    pub filtered_raw_power_db: Option<f32>,
     pub raw_power_clamp_active: bool,
+    pub control_epoch: bool,
+    pub measurement_used: bool,
+    pub control_steps: u8,
+    pub safety_down: bool,
+    pub valid_ordinal: Option<u64>,
+    pub measurement_abs_pcg: Option<u64>,
+    pub schedule_accepted: bool,
+    pub rc3_scheduler: Option<Rc3PcgPcbSchedulerSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -125,7 +101,22 @@ pub struct BtsPowerControlSnapshot {
     pub fer_pct: f32,
     pub frames_total: u64,
     pub frames_crc_error: u64,
-    pub last_brake_offset_db: f32,
+    pub measured_inner_loop_1s: Option<BtsPowerControlOneSecondMeasurement>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BtsPowerControlOneSecondMeasurement {
+    pub timestamp_ms: u64,
+    pub mean_db: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OneSecondMetricWindow {
+    bucket_index: u64,
+    last_abs_pcg: u64,
+    covers_complete_second: bool,
+    sum_db: f64,
+    count: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -136,58 +127,30 @@ struct BtsReversePowerSetpoint {
 
 #[derive(Debug, Clone, Copy)]
 struct RawPowerLimiterProfile {
-    brake_begin_dbfs: f32,
-    brake_full_dbfs: f32,
-    brake_max_offset_db: f32,
     clip_begin_dbfs: Option<f32>,
-    clip_cooldown_pcgs: u8,
     hot_limit_dbfs: f32,
-    hot_release_dbfs: f32,
-    soft_brake_uses_instant: bool,
-    hard_limit_uses_filtered: bool,
     thresholds_follow_rx_power_adj: bool,
     overpowered_pcgs: usize,
 }
 
 impl RawPowerLimiterProfile {
     const RC3: Self = Self {
-        brake_begin_dbfs: BRAKE_BEGIN_DBFS,
-        brake_full_dbfs: BRAKE_FULL_DBFS,
-        brake_max_offset_db: BRAKE_MAX_OFFSET_DB,
         clip_begin_dbfs: Some(CLIP_BEGIN_DBFS),
-        clip_cooldown_pcgs: PCG_CLIP_COOLDOWN_PCGS,
         hot_limit_dbfs: PCG_RAW_HOT_LIMIT_DBFS,
-        hot_release_dbfs: PCG_RAW_HOT_RELEASE_DBFS,
-        soft_brake_uses_instant: true,
-        hard_limit_uses_filtered: false,
         thresholds_follow_rx_power_adj: true,
         overpowered_pcgs: OUTER_LOOP_OVERPOWER_CLIP_PCGS,
     };
 
     const RC1: Self = Self {
-        brake_begin_dbfs: RC1_BRAKE_BEGIN_DBFS,
-        brake_full_dbfs: RC1_BRAKE_FULL_DBFS,
-        brake_max_offset_db: RC1_BRAKE_MAX_OFFSET_DB,
         clip_begin_dbfs: Some(RC1_CLIP_BEGIN_DBFS),
-        clip_cooldown_pcgs: RC1_PCG_CLIP_COOLDOWN_PCGS,
         hot_limit_dbfs: RC1_PCG_RAW_HOT_LIMIT_DBFS,
-        hot_release_dbfs: RC1_PCG_RAW_HOT_RELEASE_DBFS,
-        soft_brake_uses_instant: true,
-        hard_limit_uses_filtered: false,
         thresholds_follow_rx_power_adj: true,
-        overpowered_pcgs: OUTER_LOOP_OVERPOWER_CLIP_PCGS,
+        overpowered_pcgs: RC1_OUTER_LOOP_OVERPOWER_CLIP_PCGS,
     };
 
     const RC2: Self = Self {
-        brake_begin_dbfs: RC2_BRAKE_BEGIN_DBFS,
-        brake_full_dbfs: RC2_BRAKE_FULL_DBFS,
-        brake_max_offset_db: RC2_BRAKE_MAX_OFFSET_DB,
         clip_begin_dbfs: None,
-        clip_cooldown_pcgs: 0,
         hot_limit_dbfs: RC2_PCG_RAW_HOT_LIMIT_DBFS,
-        hot_release_dbfs: RC2_PCG_RAW_HOT_RELEASE_DBFS,
-        soft_brake_uses_instant: false,
-        hard_limit_uses_filtered: true,
         thresholds_follow_rx_power_adj: false,
         overpowered_pcgs: RC2_OUTER_LOOP_OVERPOWER_HOT_PCGS,
     };
@@ -219,462 +182,605 @@ impl ReverseTrafficRadioConfig {
             Self::Rc1 | Self::Rc3 => raw_power_db,
         }
     }
+
+    const fn control_metric_name(self) -> &'static str {
+        match self {
+            Self::Rc1 | Self::Rc2 => "eb_nt_db",
+            Self::Rc3 => "pilot_sinr_db",
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bts::handle::{
+        ChannelRegistry, WalshAllocator, allocate_traffic_channel, allocate_traffic_channel_rc2,
+    };
+    use crate::channels::ftch_rc3::gated_power_control_slot_ordinal;
+    use crate::phy::coding::long_code::LongCodeGenerator;
+    use cdma_common::consts::RC3_GATED_REV_PWR_CNTL_DELAY;
 
     #[test]
-    fn rc2_plan_drives_one_guaranteed_slot_and_preserves_neutral_slots() {
-        let slots = [
-            Rc2PowerControlSlot {
-                guaranteed_valid: true,
-                hold_bit: 0,
-            },
-            Rc2PowerControlSlot {
-                guaranteed_valid: false,
-                hold_bit: 1,
-            },
-            Rc2PowerControlSlot {
-                guaranteed_valid: true,
-                hold_bit: 1,
-            },
-            Rc2PowerControlSlot {
-                guaranteed_valid: false,
-                hold_bit: 0,
-            },
-        ];
+    fn production_rc3_state_adapts_after_one_second_warmup() {
+        let mut state = BtsReversePowerControlState::new_rc3();
+        assert_eq!(state.effective_target_db(), RC3_INITIAL_TARGET_DB);
+        assert_eq!(state.held_setpoint_db, None);
+        assert_eq!(state.auto_min_db, -2.0);
+        assert_eq!(state.auto_max_db, 2.0);
+        assert_eq!(state.target_fer_pct(), 0.5);
 
-        assert_eq!(plan_rc2_pcbs(&slots, 0, false), vec![0, 1, 0, 0]);
-        assert_eq!(plan_rc2_pcbs(&slots, 1, false), vec![1, 1, 1, 0]);
-        assert_eq!(plan_rc2_pcbs(&slots, 0, true), vec![1, 1, 1, 1]);
-    }
+        for pcg in 0..16 {
+            let _ = state.tick_rc3_direct(
+                pcg,
+                RC3_INITIAL_TARGET_DB,
+                Some(-30.0),
+                Some(pcg + RC3_DIRECT_CONTROL_LEAD_PCGS),
+            );
+        }
+        let snapshot = state.outer_loop_tick(10, false);
+        assert_eq!(snapshot.effective_target_eb_nt_db, RC3_INITIAL_TARGET_DB);
 
-    fn rc3_state_without_startup_seed() -> BtsReversePowerControlState {
-        BtsReversePowerControlState::with_params(
-            RC3_INITIAL_TARGET_DB,
-            RC3_AUTO_MIN_DB,
-            RC3_AUTO_MAX_DB,
-            RC3_MANUAL_MIN_DB,
-            RC3_MANUAL_MAX_DB,
-        )
-    }
+        for _ in 0..49 {
+            let snapshot = state.outer_loop_tick(10, true);
+            assert_eq!(snapshot.effective_target_eb_nt_db, RC3_INITIAL_TARGET_DB);
+        }
+        let snapshot = state.outer_loop_tick(10, true);
 
-    #[test]
-    fn raw_power_filter_updates_after_first_pcg() {
-        let mut state = rc3_state_without_startup_seed();
-
-        let first = state.tick_single_pcg(10, 100, -20.0, Some(-20.0), 0);
-        assert_eq!(first.filtered_raw_power_db, Some(-20.0));
-        assert!(!first.raw_power_clamp_active);
-
-        let second = state.tick_single_pcg(10, 101, -20.0, Some(-30.0), 0);
-        assert!(second.filtered_raw_power_db.is_some_and(|db| db < -20.0));
-        assert!(!second.raw_power_clamp_active);
-    }
-
-    #[test]
-    fn mobile_power_brake_engages_below_ceiling() {
-        let mut state = rc3_state_without_startup_seed();
-        let tick = state.tick_single_pcg(
-            10,
-            100,
-            -20.0,
-            Some((BRAKE_BEGIN_DBFS + PCG_RAW_HOT_LIMIT_DBFS) * 0.5),
-            0,
+        assert!(
+            (snapshot.effective_target_eb_nt_db
+                - (RC3_INITIAL_TARGET_DB - state.target_step_down_db()))
+            .abs()
+                < f32::EPSILON
         );
-        assert!(state.last_brake_offset_db > 0.0);
-        assert!(!tick.raw_power_clamp_active);
+    }
+
+    fn epoch_target_pcgs() -> Vec<u64> {
+        let first = (RC3_DIRECT_CONTROL_LEAD_PCGS..256)
+            .find(|abs_pcg| {
+                gated_power_control_slot_ordinal(*abs_pcg, RC3_GATED_REV_PWR_CNTL_DELAY)
+                    .is_some_and(|ordinal| ordinal % RC3_DIRECT_EPOCH_PCBS == 0)
+            })
+            .expect("direct epoch starts in the search range");
+        (first..256)
+            .filter(|abs_pcg| {
+                gated_power_control_slot_ordinal(*abs_pcg, RC3_GATED_REV_PWR_CNTL_DELAY).is_some()
+            })
+            .take(RC3_DIRECT_EPOCH_PCBS as usize)
+            .collect()
+    }
+
+    fn gated_ordinal(tx_abs_pcg: u64) -> Option<u64> {
+        gated_power_control_slot_ordinal(tx_abs_pcg, RC3_GATED_REV_PWR_CNTL_DELAY)
+    }
+
+    #[test]
+    fn rc3_epoch_emits_eight_balanced_holds_then_one_control() {
+        let mut state = BtsReversePowerControlState::new_rc3();
+        let target_pcgs = epoch_target_pcgs();
+        assert_eq!(target_pcgs.len(), RC3_DIRECT_EPOCH_PCBS as usize);
+
+        let mut ticks = Vec::new();
+        for &tx_abs_pcg in &target_pcgs {
+            let measured_abs_pcg = tx_abs_pcg - RC3_DIRECT_CONTROL_LEAD_PCGS;
+            assert!(measured_abs_pcg % 4 >= 2);
+            ticks.push(state.tick_rc3_direct(
+                measured_abs_pcg,
+                RC3_INITIAL_TARGET_DB + 2.0,
+                Some(-30.0),
+                gated_ordinal(tx_abs_pcg),
+            ));
+        }
+
+        let hold_bits: Vec<u8> = ticks[..RC3_DIRECT_HOLD_PCBS as usize]
+            .iter()
+            .map(|tick| tick.pcb)
+            .collect();
+        assert_eq!(
+            hold_bits,
+            (0..RC3_DIRECT_HOLD_PCBS)
+                .map(|offset| offset as u8 & 1)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            ticks[..RC3_DIRECT_HOLD_PCBS as usize]
+                .iter()
+                .all(|tick| !tick.control_epoch && !tick.measurement_used)
+        );
+
+        let control = ticks.last().expect("control tick exists");
+        assert!(control.control_epoch);
+        assert!(control.measurement_used);
+        assert_eq!(control.control_steps, 1);
+        assert_eq!(control.pcb, 1);
+        assert_eq!(control.target_db, RC3_INITIAL_TARGET_DB);
+    }
+
+    #[test]
+    fn rc3_non_gated_epoch_schedules_every_pcg_with_eight_holds_then_control() {
+        let mut state = BtsReversePowerControlState::new_rc3();
+        let first_ordinal = 900;
+        let ticks: Vec<_> = (first_ordinal..first_ordinal + RC3_DIRECT_EPOCH_PCBS)
+            .map(|tx_abs_pcg| {
+                state.tick_rc3_direct(
+                    tx_abs_pcg - RC3_DIRECT_CONTROL_LEAD_PCGS,
+                    RC3_INITIAL_TARGET_DB + 2.0,
+                    Some(-30.0),
+                    Some(tx_abs_pcg),
+                )
+            })
+            .collect();
+
+        assert!(ticks.iter().all(|tick| tick.command_slot_valid));
+        assert_eq!(
+            ticks[..RC3_DIRECT_HOLD_PCBS as usize]
+                .iter()
+                .map(|tick| tick.pcb)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 0, 1, 0, 1, 0, 1]
+        );
+        assert!(
+            ticks[..RC3_DIRECT_HOLD_PCBS as usize]
+                .iter()
+                .all(|tick| !tick.control_epoch && !tick.measurement_used)
+        );
+        let control = ticks.last().expect("control tick exists");
+        assert!(control.control_epoch);
+        assert!(control.measurement_used);
+        assert_eq!(control.pcb, 1);
+    }
+
+    #[test]
+    fn rc3_snapshot_reports_only_a_complete_one_second_mean() {
+        let mut state = BtsReversePowerControlState::new_rc3();
+        let metric_for = |abs_pcg: u64| {
+            if abs_pcg % 4 >= 2 { 2.5 } else { f32::NAN }
+        };
+
+        for abs_pcg in 400..=800 {
+            state.tick_rc3_direct(
+                abs_pcg,
+                metric_for(abs_pcg),
+                Some(-30.0),
+                gated_ordinal(abs_pcg + RC3_DIRECT_CONTROL_LEAD_PCGS),
+            );
+        }
+        assert!(state.snapshot(10).measured_inner_loop_1s.is_none());
+
+        for abs_pcg in 801..=1_600 {
+            state.tick_rc3_direct(
+                abs_pcg,
+                metric_for(abs_pcg),
+                Some(-30.0),
+                gated_ordinal(abs_pcg + RC3_DIRECT_CONTROL_LEAD_PCGS),
+            );
+            if abs_pcg == 1_000 {
+                state.tick_rc3_direct(
+                    abs_pcg,
+                    100.0,
+                    Some(-30.0),
+                    gated_ordinal(abs_pcg + RC3_DIRECT_CONTROL_LEAD_PCGS),
+                );
+            }
+        }
+        let measurement = state
+            .snapshot(10)
+            .measured_inner_loop_1s
+            .expect("complete one-second measurement exists");
+        assert_eq!(measurement.mean_db, 2.5);
+        assert!(measurement.timestamp_ms > 0);
+    }
+
+    #[test]
+    fn rc3_control_uses_pilot_sinr_and_missing_measurement_holds() {
+        let target_pcgs = epoch_target_pcgs();
+        let tx_abs_pcg = *target_pcgs.last().expect("control PCG exists");
+        let measured_abs_pcg = tx_abs_pcg - RC3_DIRECT_CONTROL_LEAD_PCGS;
+
+        let mut up_state = BtsReversePowerControlState::new_rc3();
+        let up = up_state.tick_rc3_direct(
+            measured_abs_pcg,
+            RC3_INITIAL_TARGET_DB - 2.0,
+            Some(-30.0),
+            gated_ordinal(tx_abs_pcg),
+        );
+        assert!(up.measurement_used);
+        assert_eq!(up.control_steps, 1);
+        assert_eq!(up.pcb, 0);
+        assert_eq!(up.target_db, RC3_INITIAL_TARGET_DB);
+
+        let mut down_state = BtsReversePowerControlState::new_rc3();
+        let down = down_state.tick_rc3_direct(
+            measured_abs_pcg,
+            RC3_INITIAL_TARGET_DB + 2.0,
+            Some(-30.0),
+            gated_ordinal(tx_abs_pcg),
+        );
+        assert!(down.measurement_used);
+        assert_eq!(down.control_steps, 1);
+        assert_eq!(down.pcb, 1);
+
+        let mut missing_state = BtsReversePowerControlState::new_rc3();
+        let missing = missing_state.tick_rc3_direct(
+            measured_abs_pcg,
+            f32::NAN,
+            Some(-30.0),
+            gated_ordinal(tx_abs_pcg),
+        );
+        assert!(missing.control_epoch);
+        assert!(!missing.measurement_used);
+        assert_eq!(missing.control_steps, 0);
+        assert_eq!(
+            missing.pcb,
+            (gated_power_control_slot_ordinal(tx_abs_pcg, RC3_GATED_REV_PWR_CNTL_DELAY)
+                .expect("missing control has a valid ordinal")
+                % RC3_DIRECT_EPOCH_PCBS) as u8
+                & 1
+        );
+    }
+
+    #[test]
+    fn rc1_control_uses_fixed_despread_power_target() {
+        let mut state = BtsReversePowerControlState::new_rc1();
+        let tick = state.tick_direct(100, RC1_INITIAL_TARGET_DB - 1.0, Some(-20.0), Some(8));
+
+        assert!(tick.control_epoch);
+        assert!(tick.measurement_used);
+        assert_eq!(tick.target_db, RC1_INITIAL_TARGET_DB);
+        assert_eq!(tick.pcb, 0);
+
+        let snapshot = state.outer_loop_tick(10, false);
+        assert_eq!(snapshot.effective_target_eb_nt_db, RC1_INITIAL_TARGET_DB);
+    }
+
+    #[test]
+    fn rc1_control_keeps_large_errors_to_one_step() {
+        let mut state = BtsReversePowerControlState::new_rc1();
+        let tick = state.tick_direct(100, RC1_INITIAL_TARGET_DB - 10.0, Some(-20.0), Some(8));
+
+        assert!(tick.measurement_used);
+        assert_eq!(tick.control_steps, 1);
+        assert_eq!(tick.pcb, 0);
+    }
+
+    #[test]
+    fn rc2_control_uses_eb_nt_target() {
+        let mut state = BtsReversePowerControlState::new_rc2();
+        let tick = state.tick_direct(100, RC2_INITIAL_TARGET_DB - 1.0, Some(-50.0), Some(8));
+
+        assert!(tick.control_epoch);
+        assert!(tick.measurement_used);
+        assert_eq!(tick.target_db, RC2_INITIAL_TARGET_DB);
+        assert_eq!(tick.pcb, 0);
+    }
+
+    #[test]
+    fn rc1_and_rc2_schedule_each_guaranteed_measurement_once() {
+        let long_code = LongCodeGenerator::new_traffic_channel(0xDEAD_BEEF);
+
+        let rc1_channels = Arc::new(ChannelRegistry::new());
+        let rc1_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
+        let (rc1_walsh, rc1_channel) =
+            allocate_traffic_channel(&rc1_allocator, &rc1_channels, long_code.clone(), 0, 0)
+                .expect("RC1 traffic channel");
+        let rc1_measured_abs_pcg = (0..16)
+            .find(|pcg| {
+                rc1_channel
+                    .channel
+                    .guaranteed_power_control_ordinal(*pcg)
+                    .is_some()
+            })
+            .expect("RC1 guaranteed measurement");
+        let rc1_tick = BtsPowerControlRegistry::default()
+            .tick_and_schedule(
+                &rc1_channels,
+                rc1_walsh,
+                rc1_measured_abs_pcg,
+                rc1_measured_abs_pcg + DIRECT_CONTROL_MIN_LEAD_PCGS,
+                RC1_INITIAL_TARGET_DB,
+                Some(-20.0),
+                Some(-58.0),
+                None,
+            )
+            .expect("RC1 direct tick");
+        assert!(rc1_tick.schedule_accepted);
+        assert_eq!(rc1_tick.control_metric_db, RC1_INITIAL_TARGET_DB);
+        assert_eq!(rc1_tick.target_db, RC1_INITIAL_TARGET_DB);
+        assert_eq!(
+            rc1_tick.valid_ordinal,
+            rc1_channel
+                .channel
+                .guaranteed_power_control_ordinal(rc1_measured_abs_pcg)
+                .map(|ordinal| ordinal + RC12_DIRECT_DELAY_GUARANTEED_SLOTS)
+        );
+
+        let rc2_channels = Arc::new(ChannelRegistry::new());
+        let rc2_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
+        let (rc2_walsh, rc2_channel) =
+            allocate_traffic_channel_rc2(&rc2_allocator, &rc2_channels, long_code, 0, 0)
+                .expect("RC2 traffic channel");
+        let rc2_measured_abs_pcg = (0..16)
+            .find(|pcg| {
+                rc2_channel
+                    .channel
+                    .guaranteed_power_control_ordinal(*pcg)
+                    .is_some()
+            })
+            .expect("RC2 guaranteed measurement");
+        let rc2_tick = BtsPowerControlRegistry::default()
+            .tick_and_schedule(
+                &rc2_channels,
+                rc2_walsh,
+                rc2_measured_abs_pcg,
+                rc2_measured_abs_pcg + DIRECT_CONTROL_MIN_LEAD_PCGS,
+                RC2_INITIAL_TARGET_DB,
+                None,
+                Some(-50.0),
+                None,
+            )
+            .expect("RC2 direct tick");
+        assert!(rc2_tick.schedule_accepted);
+        assert_eq!(
+            rc2_tick.valid_ordinal,
+            rc2_channel
+                .channel
+                .guaranteed_power_control_ordinal(rc2_measured_abs_pcg)
+                .map(|ordinal| ordinal + RC12_DIRECT_DELAY_GUARANTEED_SLOTS)
+        );
+    }
+
+    #[test]
+    fn rc2_power_ceiling_forces_down_without_filtering() {
+        let mut state = BtsReversePowerControlState::new_rc2();
+        let tick = state.tick_direct(
+            100,
+            RC2_INITIAL_TARGET_DB - 10.0,
+            Some(RC2_PCG_RAW_HOT_LIMIT_DBFS + 0.1),
+            Some(0),
+        );
+
+        assert!(tick.safety_down);
+        assert_eq!(tick.pcb, 1);
+    }
+
+    #[test]
+    fn rc3_release_hold_freezes_outer_loop_and_alternates_neutral_pcbs() {
+        let mut state = BtsReversePowerControlState::new_rc3();
+        for pcg in 0..16 {
+            let _ = state.tick_rc3_direct(
+                pcg,
+                RC3_INITIAL_TARGET_DB,
+                Some(-30.0),
+                Some(pcg + RC3_DIRECT_CONTROL_LEAD_PCGS),
+            );
+        }
+        let before = state.outer_loop_tick(10, true);
+        state.enter_release_hold();
+
+        let ticks = (0..8)
+            .map(|ordinal| state.tick_rc3_release_hold(100 + ordinal, Some(ordinal)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ticks.iter().map(|tick| tick.pcb).collect::<Vec<_>>(),
+            vec![0, 1, 0, 1, 0, 1, 0, 1]
+        );
+        assert!(ticks.iter().all(|tick| {
+            tick.command_slot_valid
+                && !tick.control_epoch
+                && !tick.measurement_used
+                && tick.control_steps == 0
+                && !tick.raw_power_clamp_active
+        }));
+
+        let after = state.outer_loop_tick(10, false);
+        assert_eq!(after.frames_total, before.frames_total);
+        assert_eq!(after.frames_crc_error, before.frames_crc_error);
+        assert_eq!(after.fer_pct, before.fer_pct);
+        assert_eq!(
+            after.effective_target_eb_nt_db,
+            before.effective_target_eb_nt_db
+        );
+    }
+
+    #[test]
+    fn rc3_control_uses_recent_valid_pilot_when_current_pcg_is_gated_off() {
+        let tx_abs_pcg = 908;
+        let measured_abs_pcg = tx_abs_pcg - RC3_DIRECT_CONTROL_LEAD_PCGS;
+        let mut state = BtsReversePowerControlState::new_rc3();
+
+        let _ = state.tick_rc3_direct(
+            measured_abs_pcg - 2,
+            RC3_INITIAL_TARGET_DB + 2.0,
+            Some(-30.0),
+            Some(tx_abs_pcg - 2),
+        );
+        let control =
+            state.tick_rc3_direct(measured_abs_pcg, f32::NAN, Some(-30.0), Some(tx_abs_pcg));
+
+        assert!(control.control_epoch);
+        assert!(control.measurement_used);
+        assert_eq!(control.measurement_abs_pcg, Some(measured_abs_pcg - 2));
+        assert_eq!(control.control_metric_db, RC3_INITIAL_TARGET_DB + 2.0);
+        assert_eq!(control.pcb, 1);
+    }
+
+    #[test]
+    fn rc3_control_rejects_stale_cached_pilot() {
+        let tx_abs_pcg = 908;
+        let measured_abs_pcg = tx_abs_pcg - RC3_DIRECT_CONTROL_LEAD_PCGS;
+        let mut state = BtsReversePowerControlState::new_rc3();
+
+        let _ = state.tick_rc3_direct(
+            measured_abs_pcg - RC3_DIRECT_MAX_MEASUREMENT_AGE_PCGS - 1,
+            RC3_INITIAL_TARGET_DB + 2.0,
+            Some(-30.0),
+            Some(tx_abs_pcg - RC3_DIRECT_MAX_MEASUREMENT_AGE_PCGS - 1),
+        );
+        let control =
+            state.tick_rc3_direct(measured_abs_pcg, f32::NAN, Some(-30.0), Some(tx_abs_pcg));
+
+        assert!(control.control_epoch);
+        assert!(!control.measurement_used);
+        assert_eq!(control.measurement_abs_pcg, None);
+    }
+
+    #[test]
+    fn rc3_large_error_encodes_five_net_steps_in_the_next_epoch() {
+        let mut state = BtsReversePowerControlState::new_rc3();
+        let first_epoch = epoch_target_pcgs();
+        let control_tx_abs_pcg = *first_epoch.last().expect("control PCG exists");
+        let mut control = None;
+        for &tx_abs_pcg in &first_epoch {
+            control = Some(state.tick_rc3_direct(
+                tx_abs_pcg - RC3_DIRECT_CONTROL_LEAD_PCGS,
+                RC3_INITIAL_TARGET_DB + 10.0,
+                Some(-30.0),
+                gated_ordinal(tx_abs_pcg),
+            ));
+        }
+        let control = control.expect("control tick exists");
+        assert!(control.control_epoch);
+        assert_eq!(control.control_steps, 5);
+
+        let following_valid_pcgs = ((control_tx_abs_pcg + 1)..(control_tx_abs_pcg + 64))
+            .filter(|abs_pcg| {
+                gated_power_control_slot_ordinal(*abs_pcg, RC3_GATED_REV_PWR_CNTL_DELAY).is_some()
+            })
+            .take(RC3_DIRECT_HOLD_PCBS as usize);
+        let mut interval_bits = vec![control.pcb];
+        for tx_abs_pcg in following_valid_pcgs {
+            interval_bits.push(
+                state
+                    .tick_rc3_direct(
+                        tx_abs_pcg - RC3_DIRECT_CONTROL_LEAD_PCGS,
+                        RC3_INITIAL_TARGET_DB + 10.0,
+                        Some(-30.0),
+                        gated_ordinal(tx_abs_pcg),
+                    )
+                    .pcb,
+            );
+        }
+        assert_eq!(interval_bits, vec![1, 1, 1, 1, 1, 0, 1, 0, 1]);
+        assert_eq!(
+            interval_bits
+                .iter()
+                .map(|bit| if *bit == 0 { 1 } else { -1 })
+                .sum::<i32>(),
+            -5,
+        );
+    }
+
+    #[test]
+    fn rc3_recovery_strength_tracks_instantaneous_error() {
+        let tx_abs_pcg = *epoch_target_pcgs().last().expect("control PCG exists");
+        let measured_abs_pcg = tx_abs_pcg - RC3_DIRECT_CONTROL_LEAD_PCGS;
+        for (offset_db, expected_steps, expected_pcb) in
+            [(-2.0, 1, 0), (-4.0, 3, 0), (-6.0, 5, 0), (6.0, 5, 1)]
+        {
+            let mut state = BtsReversePowerControlState::new_rc3();
+            let tick = state.tick_rc3_direct(
+                measured_abs_pcg,
+                RC3_INITIAL_TARGET_DB + offset_db,
+                Some(-30.0),
+                gated_ordinal(tx_abs_pcg),
+            );
+            assert!(tick.measurement_used);
+            assert_eq!(tick.control_steps, expected_steps);
+            assert_eq!(tick.pcb, expected_pcb);
+        }
+    }
+
+    #[test]
+    fn rc3_recovery_burst_stays_on_absolute_pcb_ordinals() {
+        let mut state = BtsReversePowerControlState::new_rc3();
+        let control_tx_abs_pcg = *epoch_target_pcgs().last().expect("control PCG exists");
+        let control = state.tick_rc3_direct(
+            control_tx_abs_pcg - RC3_DIRECT_CONTROL_LEAD_PCGS,
+            RC3_INITIAL_TARGET_DB + 10.0,
+            Some(-30.0),
+            gated_ordinal(control_tx_abs_pcg),
+        );
+        assert_eq!(control.control_steps, 5);
+
+        let following_valid_pcgs: Vec<u64> = ((control_tx_abs_pcg + 1)..(control_tx_abs_pcg + 64))
+            .filter(|abs_pcg| {
+                gated_power_control_slot_ordinal(*abs_pcg, RC3_GATED_REV_PWR_CNTL_DELAY).is_some()
+            })
+            .take(6)
+            .collect();
+        let fourth_command = following_valid_pcgs[2];
+        let after_burst = following_valid_pcgs[4];
+
+        let recovered_after_gap = state.tick_rc3_direct(
+            fourth_command - RC3_DIRECT_CONTROL_LEAD_PCGS,
+            RC3_INITIAL_TARGET_DB + 10.0,
+            Some(-30.0),
+            gated_ordinal(fourth_command),
+        );
+        assert_eq!(recovered_after_gap.pcb, 1);
+
+        let hold_after_gap = state.tick_rc3_direct(
+            after_burst - RC3_DIRECT_CONTROL_LEAD_PCGS,
+            RC3_INITIAL_TARGET_DB + 10.0,
+            Some(-30.0),
+            gated_ordinal(after_burst),
+        );
+        assert_eq!(hold_after_gap.pcb, 0);
+    }
+
+    #[test]
+    fn rc3_wideband_clip_safety_overrides_hold() {
+        let tx_abs_pcg = epoch_target_pcgs()[0];
+        let measured_abs_pcg = tx_abs_pcg - RC3_DIRECT_CONTROL_LEAD_PCGS;
+        let mut state = BtsReversePowerControlState::new_rc3();
+        let tick = state.tick_rc3_direct(
+            measured_abs_pcg,
+            RC3_INITIAL_TARGET_DB - 10.0,
+            Some(CLIP_BEGIN_DBFS + 0.1),
+            gated_ordinal(tx_abs_pcg),
+        );
+
+        assert!(!tick.control_epoch);
+        assert!(tick.safety_down);
+        assert!(!tick.measurement_used);
+        assert_eq!(tick.pcb, 1);
+    }
+
+    #[test]
+    fn control_pcg_admission_rejects_duplicate_and_replayed_history() {
+        let mut state = BtsReversePowerControlState::new_rc3();
+
+        assert!(state.admit_control_abs_pcg(10_000));
+        assert!(!state.admit_control_abs_pcg(10_000));
+        assert!(!state.admit_control_abs_pcg(9_999));
+        assert!(state.admit_control_abs_pcg(10_001));
     }
 
     #[test]
     fn mobile_power_ceiling_forces_down_at_startup() {
         let mut state = BtsReversePowerControlState::new_rc3();
-        let tick = state.tick_single_pcg(10, 100, -30.0, Some(PCG_RAW_HOT_LIMIT_DBFS + 0.1), 0);
+        let tick = state.tick_rc3_direct(100, -30.0, Some(CLIP_BEGIN_DBFS + 0.1), Some(109));
         assert_eq!(tick.pcb, 1);
         assert!(tick.raw_power_clamp_active);
     }
 
     #[test]
     fn outer_loop_ignores_frames_before_pcg_observations_for_lifetime_fer() {
-        let mut state = rc3_state_without_startup_seed();
+        let mut state = BtsReversePowerControlState::new_rc3();
 
         for _ in 0..10 {
-            let snap = state.outer_loop_tick(10, false, None);
+            let snap = state.outer_loop_tick(10, false);
             assert_eq!(snap.frames_total, 0);
             assert_eq!(snap.frames_crc_error, 0);
             assert_eq!(snap.fer_pct, 0.0);
         }
 
         for pcg in 0..16 {
-            let _ = state.tick_single_pcg(10, pcg, -6.0, Some(-24.0), 0);
+            let _ = state.tick_rc3_direct(pcg, -6.0, Some(-24.0), Some(pcg + 9));
         }
-        let snap = state.outer_loop_tick(10, false, None);
+        let snap = state.outer_loop_tick(10, false);
         assert_eq!(snap.frames_total, 1);
         assert_eq!(snap.frames_crc_error, 1);
-    }
-
-    fn rc3_state_for_predictor() -> BtsReversePowerControlState {
-        BtsReversePowerControlState::with_params(
-            RC3_INITIAL_TARGET_DB,
-            RC3_AUTO_MIN_DB,
-            RC3_AUTO_MAX_DB,
-            RC3_MANUAL_MIN_DB,
-            RC3_MANUAL_MAX_DB,
-        )
-    }
-
-    fn lsq_from_samples(samples: &[f32]) -> (f32, f32) {
-        let mut q = VecDeque::with_capacity(samples.len());
-        for &s in samples {
-            q.push_back(s);
-        }
-        BtsReversePowerControlState::lsq_intercept_and_slope_at_newest(&q)
-    }
-
-    #[test]
-    fn lsq_returns_zero_slope_and_mean_when_flat() {
-        let samples = vec![-12.5_f32; METRIC_HISTORY_LEN];
-        let (intercept, slope) = lsq_from_samples(&samples);
-        assert!((intercept - -12.5).abs() < 1e-4);
-        assert!(slope.abs() < 1e-6);
-    }
-
-    #[test]
-    fn lsq_recovers_known_slope_and_intercept_at_now() {
-        let samples: Vec<f32> = (0..METRIC_HISTORY_LEN as i32)
-            .map(|t| 0.3 * t as f32 + 2.0)
-            .collect();
-        let (intercept, slope) = lsq_from_samples(&samples);
-        let expected_intercept_at_newest = 2.0 + 0.3 * (METRIC_HISTORY_LEN as f32 - 1.0);
-        assert!(
-            (intercept - expected_intercept_at_newest).abs() < 1e-3,
-            "intercept_at_now: got {intercept}, expected {expected_intercept_at_newest}",
-        );
-        assert!(
-            (slope - 0.3).abs() < 1e-4,
-            "slope: got {slope}, expected 0.3"
-        );
-    }
-
-    #[test]
-    fn prediction_matches_level_in_steady_state() {
-        let mut state = rc3_state_for_predictor();
-        let level = -12.0_f32;
-        for pcg in 0..(METRIC_HISTORY_LEN as u64 * 2) {
-            let _ = state.tick_single_pcg(10, pcg, level, None, PCG_PREDICTION_LEAD_PCGS);
-        }
-        assert!(state.last_slope_db_per_pcg.abs() < 1e-4);
-        let pred = state.last_predicted_metric_db.unwrap();
-        assert!(
-            (pred - level).abs() < 1e-3,
-            "steady-state prediction should match level: pred={pred} level={level}",
-        );
-    }
-
-    #[test]
-    fn prediction_anticipates_downward_trend() {
-        let mut state = rc3_state_for_predictor();
-        for pcg in 0..(METRIC_HISTORY_LEN as u64 * 2) {
-            let m = -10.0 - 0.1 * pcg as f32;
-            let _ = state.tick_single_pcg(10, pcg, m, None, PCG_PREDICTION_LEAD_PCGS);
-        }
-        assert!(
-            (state.last_slope_db_per_pcg - -0.1).abs() < 1e-3,
-            "slope should be ~-0.1: got {}",
-            state.last_slope_db_per_pcg,
-        );
-        // Prediction should lead the LSQ intercept downward.
-        let (intercept, _) =
-            BtsReversePowerControlState::lsq_intercept_and_slope_at_newest(&state.metric_history);
-        let pred = state.last_predicted_metric_db.unwrap();
-        assert!(
-            pred < intercept,
-            "downward trend → predicted < intercept: pred={pred} intercept={intercept}",
-        );
-    }
-
-    #[test]
-    fn prediction_anticipates_upward_trend() {
-        let mut state = rc3_state_for_predictor();
-        for pcg in 0..(METRIC_HISTORY_LEN as u64 * 2) {
-            let m = -15.0 + 0.1 * pcg as f32;
-            let _ = state.tick_single_pcg(10, pcg, m, None, PCG_PREDICTION_LEAD_PCGS);
-        }
-        assert!((state.last_slope_db_per_pcg - 0.1).abs() < 1e-3);
-        let (intercept, _) =
-            BtsReversePowerControlState::lsq_intercept_and_slope_at_newest(&state.metric_history);
-        let pred = state.last_predicted_metric_db.unwrap();
-        assert!(
-            pred > intercept,
-            "upward trend → predicted > intercept: pred={pred} intercept={intercept}",
-        );
-    }
-
-    #[test]
-    fn prediction_clamp_bounds_extrapolation() {
-        let mut state = rc3_state_for_predictor();
-        for pcg in 0..(METRIC_HISTORY_LEN as u64) {
-            let m = -10.0 - pcg as f32;
-            let _ = state.tick_single_pcg(10, pcg, m, None, PCG_PREDICTION_LEAD_PCGS);
-        }
-        let (intercept, _) =
-            BtsReversePowerControlState::lsq_intercept_and_slope_at_newest(&state.metric_history);
-        let pred = state.last_predicted_metric_db.unwrap();
-        let delta = (pred - intercept).abs();
-        assert!(
-            delta <= PCG_PREDICTION_CLAMP_DB + 1e-6,
-            "clamp should bound prediction excursion: delta={delta} clamp={PCG_PREDICTION_CLAMP_DB}",
-        );
-    }
-
-    #[test]
-    fn held_metric_uses_last_prediction() {
-        let mut state = rc3_state_for_predictor();
-        for pcg in 0..(METRIC_HISTORY_LEN as u64) {
-            let _ = state.tick_single_pcg(10, pcg, -12.0, None, PCG_PREDICTION_LEAD_PCGS);
-        }
-        let last_pred = state.last_predicted_metric_db.unwrap();
-        let tick = state.tick_single_pcg(
-            10,
-            METRIC_HISTORY_LEN as u64,
-            f32::NAN,
-            None,
-            PCG_PREDICTION_LEAD_PCGS,
-        );
-        assert!(
-            (tick.control_metric_db - last_pred).abs() < 1e-6,
-            "held branch should re-use last_predicted: control={} last={}",
-            tick.control_metric_db,
-            last_pred,
-        );
-    }
-
-    #[test]
-    fn brake_offset_zero_below_begin() {
-        assert_eq!(
-            BtsReversePowerControlState::brake_offset_db(BRAKE_BEGIN_DBFS - 5.0),
-            0.0
-        );
-        assert_eq!(
-            BtsReversePowerControlState::brake_offset_db(BRAKE_BEGIN_DBFS),
-            0.0
-        );
-    }
-
-    #[test]
-    fn brake_offset_ramps_linearly_through_zone() {
-        let midpoint = (BRAKE_BEGIN_DBFS + BRAKE_FULL_DBFS) * 0.5;
-        let got = BtsReversePowerControlState::brake_offset_db(midpoint);
-        let expected = BRAKE_MAX_OFFSET_DB * 0.5;
-        assert!(
-            (got - expected).abs() < 1e-4,
-            "midpoint brake: got {got}, expected {expected}",
-        );
-    }
-
-    #[test]
-    fn brake_offset_saturates_above_full() {
-        assert_eq!(
-            BtsReversePowerControlState::brake_offset_db(BRAKE_FULL_DBFS + 10.0),
-            BRAKE_MAX_OFFSET_DB
-        );
-    }
-
-    #[test]
-    fn brake_converts_up_to_down_when_filt_hot() {
-        let mut state = rc3_state_for_predictor();
-        state.brake_filtered_raw_power_db = Some(BRAKE_FULL_DBFS);
-        let mut up = 0;
-        let mut down = 0;
-        for pcg in 0..200u64 {
-            let tick = state.tick_single_pcg(10, pcg, -10.0, None, 0);
-            if tick.pcb == 0 {
-                up += 1;
-            } else {
-                down += 1;
-            }
-        }
-        assert!(
-            down > up,
-            "hot filt should brake UP→DOWN: up={up} down={down}",
-        );
-    }
-
-    #[test]
-    fn brake_is_inert_when_filt_cold() {
-        let mut state = rc3_state_for_predictor();
-        state.brake_filtered_raw_power_db = Some(BRAKE_BEGIN_DBFS - 5.0);
-        let mut up = 0;
-        let mut down = 0;
-        for pcg in 0..200u64 {
-            let tick = state.tick_single_pcg(10, pcg, -14.0, None, 0);
-            if tick.pcb == 0 {
-                up += 1;
-            } else {
-                down += 1;
-            }
-        }
-        assert!(
-            up > down,
-            "cold filt should not engage brake: up={up} down={down}",
-        );
-        assert_eq!(state.last_brake_offset_db, 0.0);
-    }
-
-    #[test]
-    fn raw_power_guard_releases_when_underpowered_and_rx_power_cold() {
-        let mut state = rc3_state_for_predictor();
-        state.brake_filtered_raw_power_db = Some(OUTER_LOOP_UNDERPOWER_MAX_RAW_DBFS - 5.0);
-
-        let tick = state.tick_single_pcg(
-            10,
-            100,
-            -14.0,
-            Some(OUTER_LOOP_UNDERPOWER_MAX_RAW_DBFS - 5.0),
-            0,
-        );
-
-        assert_eq!(tick.pcb, 0);
-        assert!(!tick.raw_power_clamp_active);
-    }
-
-    #[test]
-    fn raw_power_hot_limiter_holds_until_raw_release_threshold() {
-        let mut state = rc3_state_for_predictor();
-
-        let hot = state.tick_single_pcg(10, 100, -14.0, Some(PCG_RAW_HOT_LIMIT_DBFS), 0);
-        assert_eq!(hot.pcb, 1);
-        assert!(hot.raw_power_clamp_active);
-
-        let held = state.tick_single_pcg(10, 101, -14.0, Some(PCG_RAW_HOT_RELEASE_DBFS + 0.5), 0);
-        assert_eq!(held.pcb, 1);
-        assert!(held.raw_power_clamp_active);
-
-        let released =
-            state.tick_single_pcg(10, 102, -14.0, Some(PCG_RAW_HOT_RELEASE_DBFS - 0.5), 0);
-
-        assert_eq!(released.pcb, 0);
-        assert!(!released.raw_power_clamp_active);
-    }
-
-    #[test]
-    fn raw_only_measurement_commands_up_until_hot_limit() {
-        let mut state = rc3_state_for_predictor();
-
-        let cold = state.tick_single_pcg(10, 101, f32::NAN, Some(PCG_RAW_HOT_LIMIT_DBFS - 2.0), 0);
-        assert_eq!(cold.pcb, 0);
-        assert!(!cold.raw_power_clamp_active);
-
-        let hot = state.tick_single_pcg(10, 102, f32::NAN, Some(PCG_RAW_HOT_LIMIT_DBFS + 0.1), 0);
-        assert_eq!(hot.pcb, 1);
-        assert!(hot.raw_power_clamp_active);
-    }
-
-    #[test]
-    fn raw_power_hot_limit_overrides_underpowered_metric() {
-        let mut state = rc3_state_for_predictor();
-
-        let tick = state.tick_single_pcg(10, 100, -14.0, Some(PCG_RAW_HOT_LIMIT_DBFS + 0.1), 0);
-
-        assert_eq!(tick.pcb, 1);
-        assert!(tick.raw_power_clamp_active);
-    }
-
-    #[test]
-    fn mobile_power_ceiling_wins_over_bad_frame_state() {
-        let mut state = rc3_state_for_predictor();
-        state.last_fer_pct = 10.0;
-
-        let tick = state.tick_single_pcg(10, 100, -14.0, Some(PCG_RAW_HOT_LIMIT_DBFS + 0.1), 0);
-
-        assert_eq!(tick.pcb, 1);
-        assert!(tick.raw_power_clamp_active);
-    }
-
-    #[test]
-    fn hot_mobile_braking_does_not_block_weak_mobile_up() {
-        let mut hot = rc3_state_for_predictor();
-        let mut weak = rc3_state_for_predictor();
-
-        let hot_tick = hot.tick_single_pcg(10, 100, -14.0, Some(PCG_RAW_HOT_LIMIT_DBFS + 1.0), 0);
-        let weak_tick =
-            weak.tick_single_pcg(11, 100, -14.0, Some(PCG_RAW_HOT_RELEASE_DBFS - 8.0), 0);
-
-        assert_eq!(hot_tick.pcb, 1);
-        assert!(hot_tick.raw_power_clamp_active);
-        assert_eq!(weak_tick.pcb, 0);
-        assert!(!weak_tick.raw_power_clamp_active);
-    }
-
-    #[test]
-    fn rx_power_adj_moves_rc3_raw_power_ceiling() {
-        let mut state = rc3_state_for_predictor();
-        state.set_rx_power_adj_dbfs(3.0);
-
-        let below_adjusted_ceiling =
-            state.tick_single_pcg(10, 100, -14.0, Some(PCG_RAW_HOT_LIMIT_DBFS + 2.9), 0);
-        assert!(!below_adjusted_ceiling.raw_power_clamp_active);
-
-        let at_ceiling =
-            state.tick_single_pcg(10, 101, -14.0, Some(PCG_RAW_HOT_LIMIT_DBFS + 3.0), 0);
-        assert_eq!(at_ceiling.pcb, 1);
-        assert!(at_ceiling.raw_power_clamp_active);
-    }
-
-    #[test]
-    fn rc1_and_rc3_profiles_preserve_main_limiter_settings() {
-        assert_eq!(RawPowerLimiterProfile::RC3.brake_begin_dbfs, -12.0);
-        assert_eq!(RawPowerLimiterProfile::RC3.brake_full_dbfs, -2.0);
-        assert_eq!(RawPowerLimiterProfile::RC3.clip_begin_dbfs, Some(-8.0));
-        assert_eq!(RawPowerLimiterProfile::RC3.clip_cooldown_pcgs, 32);
-        assert_eq!(RawPowerLimiterProfile::RC3.hot_limit_dbfs, -8.0);
-        assert_eq!(RawPowerLimiterProfile::RC3.hot_release_dbfs, -10.0);
-
-        assert_eq!(RawPowerLimiterProfile::RC1.brake_begin_dbfs, -6.0);
-        assert_eq!(RawPowerLimiterProfile::RC1.brake_full_dbfs, 0.0);
-        assert_eq!(RawPowerLimiterProfile::RC1.brake_max_offset_db, 3.0);
-        assert_eq!(RawPowerLimiterProfile::RC1.clip_begin_dbfs, Some(-2.0));
-        assert_eq!(RawPowerLimiterProfile::RC1.clip_cooldown_pcgs, 8);
-        assert_eq!(RawPowerLimiterProfile::RC1.hot_limit_dbfs, -2.0);
-        assert_eq!(RawPowerLimiterProfile::RC1.hot_release_dbfs, -4.0);
-    }
-
-    #[test]
-    fn rc1_and_rc3_limiter_sequences_match_main() {
-        for (mut state, brake_input, expected_brake, clip_input, cooldown) in [
-            (
-                BtsReversePowerControlState::new_rc3(),
-                -11.0,
-                0.8,
-                -7.9,
-                PCG_CLIP_COOLDOWN_PCGS,
-            ),
-            (
-                BtsReversePowerControlState::new_rc1(),
-                -4.0,
-                1.0,
-                -1.9,
-                RC1_PCG_CLIP_COOLDOWN_PCGS,
-            ),
-        ] {
-            let brake = state.tick_single_pcg(10, 0, -20.0, Some(brake_input), 0);
-            assert!((state.last_brake_offset_db - expected_brake).abs() < 1e-4);
-            assert!(!brake.raw_power_clamp_active);
-
-            let clipped = state.tick_single_pcg(10, 1, -20.0, Some(clip_input), 0);
-            assert!(clipped.raw_power_clamp_active);
-            assert_eq!(state.clip_cooldown_pcgs, cooldown);
-
-            for pcg in 0..cooldown {
-                let held = state.tick_single_pcg(10, 2 + u64::from(pcg), -20.0, Some(-30.0), 0);
-                assert!(held.raw_power_clamp_active);
-            }
-            let released =
-                state.tick_single_pcg(10, 2 + u64::from(cooldown), -20.0, Some(-30.0), 0);
-            assert!(!released.raw_power_clamp_active);
-        }
     }
 
     #[test]
@@ -696,60 +802,42 @@ mod tests {
     }
 
     #[test]
-    fn rc2_mobile_power_brake_and_ceiling_use_rc2_profile() {
-        let mut state = BtsReversePowerControlState::new_rc2();
-        state.set_rx_power_adj_dbfs(12.0);
-
-        let begin = state.tick_single_pcg(10, 100, 0.0, Some(RC2_BRAKE_BEGIN_DBFS), 0);
-        assert_eq!(state.last_brake_offset_db, 0.0);
-        assert!(!begin.raw_power_clamp_active);
-
-        let midpoint_dbfs = (RC2_BRAKE_BEGIN_DBFS + RC2_BRAKE_FULL_DBFS) * 0.5;
-        state.brake_filtered_raw_power_db = Some(midpoint_dbfs);
-        let midpoint = state.tick_single_pcg(10, 101, 0.0, Some(midpoint_dbfs), 0);
-        assert!((state.last_brake_offset_db - 0.5).abs() < 1e-4);
-        assert!(!midpoint.raw_power_clamp_active);
-
-        state.filtered_raw_power_db = Some(RC2_PCG_RAW_HOT_LIMIT_DBFS);
-        let ceiling = state.tick_single_pcg(10, 102, 0.0, Some(RC2_PCG_RAW_HOT_LIMIT_DBFS), 0);
-        assert_eq!(ceiling.pcb, 1);
-        assert!(ceiling.raw_power_clamp_active);
-
-        let held = state.tick_single_pcg(10, 103, 0.0, Some(-40.0), 0);
-        assert!(held.raw_power_clamp_active);
-
-        state.filtered_raw_power_db = Some(RC2_PCG_RAW_HOT_RELEASE_DBFS);
-        let released = state.tick_single_pcg(10, 104, 0.0, Some(-43.0), 0);
-        assert!(!released.raw_power_clamp_active);
-    }
-
-    #[test]
-    fn rc2_soft_brake_ignores_one_pcg_power_peak() {
-        let mut state = BtsReversePowerControlState::new_rc2();
-        state.brake_filtered_raw_power_db = Some(RC2_BRAKE_BEGIN_DBFS - 2.0);
-
-        let tick = state.tick_single_pcg(10, 100, 10.0, Some(-40.0), 0);
-
-        assert_eq!(state.last_brake_offset_db, 0.0);
-        assert!(!tick.raw_power_clamp_active);
-    }
-
-    #[test]
     fn rc2_observations_expire_at_the_next_frame() {
         let mut state = BtsReversePowerControlState::new_rc2();
-        let _ = state.tick_single_pcg(10, 14, 10.0, Some(RC2_PCG_RAW_HOT_LIMIT_DBFS), 0);
-        let _ = state.tick_single_pcg(10, 15, 10.0, Some(-45.0), 0);
+        let _ = state.tick_direct(14, 10.0, Some(RC2_PCG_RAW_HOT_LIMIT_DBFS + 0.1), Some(0));
+        let _ = state.tick_direct(15, 10.0, Some(-45.0), Some(1));
         assert!(state.recent_frame_overpowered());
-        let _ = state.outer_loop_tick(10, true, None);
+        let _ = state.outer_loop_tick(10, true);
 
-        let _ = state.tick_single_pcg(10, 16, 10.0, Some(-45.0), 0);
-        let _ = state.tick_single_pcg(10, 17, 10.0, Some(-45.0), 0);
-        state.age_rc2_observations();
+        let _ = state.tick_direct(16, 10.0, Some(-45.0), Some(2));
+        let _ = state.tick_direct(17, 10.0, Some(-45.0), Some(3));
+        state.age_rc12_observations();
 
         assert!(!state.last_pcg_raw_power_db[14].is_finite());
         assert!(!state.last_pcg_raw_power_db[15].is_finite());
         assert_eq!(state.recent_overpowered_pcgs(), 0);
         assert!(state.has_frame_observations());
+    }
+
+    #[test]
+    fn rc1_outer_loop_accepts_two_guaranteed_pcg_observations() {
+        let mut state = BtsReversePowerControlState::new_rc1();
+        let _ = state.tick_direct(2, 10.0, Some(-20.0), Some(0));
+        let _ = state.tick_direct(10, 10.0, Some(-20.0), Some(1));
+
+        let snapshot = state.outer_loop_tick(10, true);
+
+        assert_eq!(snapshot.frames_total, 1);
+        assert_eq!(snapshot.frames_crc_error, 0);
+    }
+
+    #[test]
+    fn rc1_outer_loop_detects_one_clipped_guaranteed_pcg() {
+        let mut state = BtsReversePowerControlState::new_rc1();
+        let _ = state.tick_direct(2, 10.0, Some(RC1_PCG_RAW_HOT_LIMIT_DBFS + 0.1), Some(0));
+        let _ = state.tick_direct(10, 10.0, Some(-20.0), Some(1));
+
+        assert!(state.recent_frame_overpowered());
     }
 
     #[test]
@@ -765,7 +853,7 @@ mod tests {
             assert!(reset);
             state.target_db = RC3_AUTO_MAX_DB;
             state.total_frames = 123;
-            state.metric_history.push_back(7.0);
+            state.last_valid_metric_db = Some(7.0);
         }
 
         let (state, reset) = BtsPowerControlRegistry::state_for_radio_config(
@@ -776,11 +864,11 @@ mod tests {
         );
         assert!(reset);
         assert_eq!(state.radio_config, ReverseTrafficRadioConfig::Rc2);
-        assert_eq!(state.target_db, RC1_INITIAL_TARGET_DB);
-        assert_eq!(state.auto_min_db, RC1_AUTO_MIN_DB);
-        assert_eq!(state.auto_max_db, RC1_AUTO_MAX_DB);
+        assert_eq!(state.target_db, RC2_INITIAL_TARGET_DB);
+        assert_eq!(state.auto_min_db, RC2_AUTO_MIN_DB);
+        assert_eq!(state.auto_max_db, RC2_AUTO_MAX_DB);
         assert_eq!(state.total_frames, 0);
-        assert!(state.metric_history.is_empty());
+        assert!(state.last_valid_metric_db.is_none());
     }
 
     #[test]
@@ -807,38 +895,53 @@ struct BtsReversePowerControlState {
     manual_min_db: f32,
     manual_max_db: f32,
     held_setpoint_db: Option<f32>,
-    filtered_metric_db: Option<f32>,
-    filtered_raw_power_db: Option<f32>,
-    brake_filtered_raw_power_db: Option<f32>,
-    residual_db: f32,
+    /// A command worth more than one step is sent as the same bit repeated over
+    /// consecutive transmitted PCGs, since each carries only one step. The bit,
+    /// where the repeat started, and how many PCGs it runs for.
+    burst_bit: u8,
+    burst_start_ordinal: Option<u64>,
+    burst_steps: u8,
+    /// Most recent finite control metric and the PCG it came from. A decision
+    /// may use it while it is no older than `DIRECT_MAX_MEASUREMENT_AGE_PCGS`.
+    last_valid_metric_db: Option<f32>,
+    last_valid_metric_abs_pcg: Option<u64>,
+    release_hold: bool,
     last_pcg_pilot_db: [f32; 16],
     last_pcg_control_metric_db: [f32; 16],
     last_pcg_raw_power_db: [f32; 16],
-    last_pcg_brake_offset_db: [f32; 16],
     last_pcg_overpowered: [bool; 16],
+    last_pcg_raw_clamp_active: [bool; 16],
+    last_pcg_command_slot_valid: [bool; 16],
+    last_pcg_abs_pcg: [u64; 16],
+    /// Last absolute PCG admitted to the controller. Replayed measurements must
+    /// not advance it twice.
+    last_control_abs_pcg: Option<u64>,
     last_pcg_observation_epoch: [Option<u64>; 16],
     observation_epoch: u64,
     last_pcbs: [u8; 16],
     crc_window: VecDeque<bool>,
     total_frames: u64,
-    total_valid_frames: u64,
     target_adaptation_valid_frames: u64,
     total_crc_errors: u64,
     last_fer_pct: f32,
-    adaptive_auto_floor_db: Option<f32>,
-    adaptive_floor_clean_frames: u64,
-    metric_history: VecDeque<f32>,
-    last_predicted_metric_db: Option<f32>,
-    last_slope_db_per_pcg: f32,
-    last_brake_offset_db: f32,
-    clip_cooldown_pcgs: u8,
-    raw_hot_limiter_active: bool,
-    transient_recovery_frames_remaining: u64,
     rx_power_adj_dbfs: f32,
     raw_power_profile: RawPowerLimiterProfile,
+    one_second_metric_window: Option<OneSecondMetricWindow>,
+    measured_inner_loop_1s: Option<BtsPowerControlOneSecondMeasurement>,
 }
 
 impl BtsReversePowerControlState {
+    fn admit_control_abs_pcg(&mut self, abs_pcg: u64) -> bool {
+        if self
+            .last_control_abs_pcg
+            .is_some_and(|last| abs_pcg <= last)
+        {
+            return false;
+        }
+        self.last_control_abs_pcg = Some(abs_pcg);
+        true
+    }
+
     fn new_rc1() -> Self {
         Self::with_params_and_profile(
             ReverseTrafficRadioConfig::Rc1,
@@ -854,11 +957,11 @@ impl BtsReversePowerControlState {
     fn new_rc2() -> Self {
         Self::with_params_and_profile(
             ReverseTrafficRadioConfig::Rc2,
-            RC1_INITIAL_TARGET_DB,
-            RC1_AUTO_MIN_DB,
-            RC1_AUTO_MAX_DB,
-            RC1_MANUAL_MIN_DB,
-            RC1_MANUAL_MAX_DB,
+            RC2_INITIAL_TARGET_DB,
+            RC2_AUTO_MIN_DB,
+            RC2_AUTO_MAX_DB,
+            RC2_MANUAL_MIN_DB,
+            RC2_MANUAL_MAX_DB,
             RawPowerLimiterProfile::RC2,
         )
     }
@@ -871,25 +974,6 @@ impl BtsReversePowerControlState {
             RC3_AUTO_MAX_DB,
             RC3_MANUAL_MIN_DB,
             RC3_MANUAL_MAX_DB,
-            RawPowerLimiterProfile::RC3,
-        )
-    }
-
-    #[cfg(test)]
-    fn with_params(
-        target_db: f32,
-        auto_min_db: f32,
-        auto_max_db: f32,
-        manual_min_db: f32,
-        manual_max_db: f32,
-    ) -> Self {
-        Self::with_params_and_profile(
-            ReverseTrafficRadioConfig::Rc3,
-            target_db,
-            auto_min_db,
-            auto_max_db,
-            manual_min_db,
-            manual_max_db,
             RawPowerLimiterProfile::RC3,
         )
     }
@@ -911,35 +995,32 @@ impl BtsReversePowerControlState {
             manual_min_db,
             manual_max_db,
             held_setpoint_db: None,
-            filtered_metric_db: None,
-            filtered_raw_power_db: None,
-            brake_filtered_raw_power_db: None,
-            residual_db: 0.0,
+            burst_bit: 0,
+            burst_start_ordinal: None,
+            burst_steps: 0,
+            last_valid_metric_db: None,
+            last_valid_metric_abs_pcg: None,
+            release_hold: false,
             last_pcg_pilot_db: [f32::NAN; 16],
             last_pcg_control_metric_db: [f32::NAN; 16],
             last_pcg_raw_power_db: [f32::NAN; 16],
-            last_pcg_brake_offset_db: [0.0; 16],
             last_pcg_overpowered: [false; 16],
+            last_pcg_raw_clamp_active: [false; 16],
+            last_pcg_command_slot_valid: [false; 16],
+            last_pcg_abs_pcg: [0; 16],
+            last_control_abs_pcg: None,
             last_pcg_observation_epoch: [None; 16],
             observation_epoch: 0,
             last_pcbs: [0; 16],
             crc_window: VecDeque::with_capacity(FER_WINDOW),
             total_frames: 0,
-            total_valid_frames: 0,
             target_adaptation_valid_frames: 0,
             total_crc_errors: 0,
             last_fer_pct: 0.0,
-            adaptive_auto_floor_db: None,
-            adaptive_floor_clean_frames: 0,
-            metric_history: VecDeque::with_capacity(METRIC_HISTORY_LEN),
-            last_predicted_metric_db: None,
-            last_slope_db_per_pcg: 0.0,
-            last_brake_offset_db: 0.0,
-            clip_cooldown_pcgs: 0,
-            raw_hot_limiter_active: false,
-            transient_recovery_frames_remaining: 0,
             rx_power_adj_dbfs: 0.0,
             raw_power_profile,
+            one_second_metric_window: None,
+            measured_inner_loop_1s: None,
         }
     }
 
@@ -957,49 +1038,112 @@ impl BtsReversePowerControlState {
         };
         self.target_db = clamped;
         self.held_setpoint_db = setpoint.held.then_some(clamped);
-        self.filtered_metric_db = None;
-        self.filtered_raw_power_db = None;
-        self.brake_filtered_raw_power_db = None;
-        self.residual_db = 0.0;
         self.last_pcg_pilot_db = [f32::NAN; 16];
         self.last_pcg_control_metric_db = [f32::NAN; 16];
         self.last_pcg_raw_power_db = [f32::NAN; 16];
-        self.last_pcg_brake_offset_db = [0.0; 16];
         self.last_pcg_overpowered = [false; 16];
+        self.last_pcg_raw_clamp_active = [false; 16];
+        self.last_pcg_command_slot_valid = [false; 16];
+        self.last_pcg_abs_pcg = [0; 16];
+        self.last_control_abs_pcg = None;
+        self.last_valid_metric_db = None;
+        self.last_valid_metric_abs_pcg = None;
         self.last_pcg_observation_epoch = [None; 16];
         self.observation_epoch = 0;
         self.last_pcbs = [0; 16];
-        self.metric_history.clear();
-        self.last_predicted_metric_db = None;
-        self.last_slope_db_per_pcg = 0.0;
-        self.last_brake_offset_db = 0.0;
-        self.clip_cooldown_pcgs = 0;
-        self.raw_hot_limiter_active = false;
-        self.transient_recovery_frames_remaining = 0;
     }
 
     fn effective_target_db(&self) -> f32 {
         self.held_setpoint_db.unwrap_or(self.target_db)
     }
 
-    fn effective_auto_min_db(&self) -> f32 {
-        self.adaptive_auto_floor_db
-            .unwrap_or(self.auto_min_db)
-            .clamp(self.auto_min_db, self.auto_max_db)
+    fn enter_release_hold(&mut self) {
+        self.release_hold = true;
+        self.burst_start_ordinal = None;
+        self.burst_steps = 0;
+        self.last_valid_metric_db = None;
+        self.last_valid_metric_abs_pcg = None;
     }
 
-    fn target_step_down_db() -> f32 {
-        let fer_frac = TARGET_FER_PCT / 100.0;
+    fn record_one_second_metric(&mut self, abs_pcg: u64, metric_db: f32) {
+        let bucket_index = abs_pcg / SR1_PCGS_PER_SECOND;
+        if self
+            .one_second_metric_window
+            .is_some_and(|window| window.bucket_index != bucket_index)
+        {
+            let completed = self
+                .one_second_metric_window
+                .take()
+                .expect("one-second metric window exists");
+            let bucket_end = completed
+                .bucket_index
+                .saturating_add(1)
+                .saturating_mul(SR1_PCGS_PER_SECOND)
+                .saturating_sub(1);
+            if completed.covers_complete_second
+                && completed.last_abs_pcg == bucket_end
+                && completed.count > 0
+            {
+                let timestamp_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                self.measured_inner_loop_1s = Some(BtsPowerControlOneSecondMeasurement {
+                    timestamp_ms,
+                    mean_db: (completed.sum_db / f64::from(completed.count)) as f32,
+                });
+            }
+        }
+
+        let bucket_start = bucket_index.saturating_mul(SR1_PCGS_PER_SECOND);
+        let mut record_sample = false;
+        let window = self.one_second_metric_window.get_or_insert_with(|| {
+            record_sample = true;
+            OneSecondMetricWindow {
+                bucket_index,
+                last_abs_pcg: abs_pcg,
+                covers_complete_second: abs_pcg == bucket_start,
+                sum_db: 0.0,
+                count: 0,
+            }
+        });
+        if window.last_abs_pcg != abs_pcg {
+            window.covers_complete_second &= window.last_abs_pcg.saturating_add(1) == abs_pcg;
+            window.last_abs_pcg = abs_pcg;
+            record_sample = true;
+        }
+        if record_sample && metric_db.is_finite() {
+            window.sum_db += f64::from(metric_db);
+            window.count = window.count.saturating_add(1);
+        }
+    }
+
+    fn outer_loop_min_valid_frames(&self) -> u64 {
+        if self.radio_config == ReverseTrafficRadioConfig::Rc3 {
+            RC3_OUTER_LOOP_MIN_VALID_FRAMES
+        } else {
+            RC1_RC2_OUTER_LOOP_MIN_VALID_FRAMES
+        }
+    }
+
+    fn target_fer_pct(&self) -> f32 {
+        if self.radio_config == ReverseTrafficRadioConfig::Rc3 {
+            RC3_TARGET_FER_PCT
+        } else {
+            RC1_RC2_TARGET_FER_PCT
+        }
+    }
+
+    fn target_step_down_db(&self) -> f32 {
+        let fer_frac = self.target_fer_pct() / 100.0;
         TARGET_STEP_UP_DB * fer_frac / (1.0 - fer_frac)
     }
 
-    fn outer_loop_tick(
-        &mut self,
-        walsh_code: u8,
-        crc_valid: bool,
-        cell_settling_frames_remaining: Option<u64>,
-    ) -> BtsPowerControlSnapshot {
-        self.age_rc2_observations();
+    fn outer_loop_tick(&mut self, walsh_code: u8, crc_valid: bool) -> BtsPowerControlSnapshot {
+        if self.release_hold {
+            return self.snapshot(walsh_code);
+        }
+        self.age_rc12_observations();
         let has_frame_observations = self.has_frame_observations();
         let frame_overpowered = has_frame_observations && self.recent_frame_overpowered();
         let frame_underpowered =
@@ -1019,9 +1163,13 @@ impl BtsReversePowerControlState {
             return self.finish_outer_loop(walsh_code);
         }
 
-        if crc_valid {
-            self.total_valid_frames = self.total_valid_frames.saturating_add(1);
-        } else {
+        if self.radio_config == ReverseTrafficRadioConfig::Rc3
+            && cdma_common::diagnostics::power_control_verbose_per_pcg_enabled_for_walsh(walsh_code)
+        {
+            self.log_batched_pcg_trace(walsh_code);
+        }
+
+        if !crc_valid {
             self.total_crc_errors = self.total_crc_errors.saturating_add(1);
         }
         self.total_frames = self.total_frames.saturating_add(1);
@@ -1038,97 +1186,32 @@ impl BtsReversePowerControlState {
             self.target_adaptation_valid_frames =
                 self.target_adaptation_valid_frames.saturating_add(1);
         }
+        let target_adaptation_ready =
+            self.target_adaptation_valid_frames >= self.outer_loop_min_valid_frames();
 
-        if self.held_setpoint_db.is_none() && cell_settling_frames_remaining.is_none() {
+        if self.held_setpoint_db.is_none()
+            && (self.radio_config != ReverseTrafficRadioConfig::Rc3 || target_adaptation_ready)
+        {
             if crc_valid {
-                if self.target_adaptation_valid_frames >= OUTER_LOOP_MIN_VALID_FRAMES {
-                    self.adaptive_floor_clean_frames =
-                        self.adaptive_floor_clean_frames.saturating_add(1);
-                    if self.adaptive_floor_clean_frames >= ADAPTIVE_FLOOR_DECAY_FRAMES {
-                        self.adaptive_floor_clean_frames = 0;
-                        if let Some(floor) = self.adaptive_auto_floor_db {
-                            let decayed =
-                                (floor - ADAPTIVE_FLOOR_DECAY_STEP_DB).max(self.auto_min_db);
-                            self.adaptive_auto_floor_db =
-                                (decayed > self.auto_min_db).then_some(decayed);
-                        }
-                    }
+                if target_adaptation_ready {
                     let step_down_db = if frame_overpowered {
                         TARGET_OVERPOWER_CLEAN_STEP_DOWN_DB
                     } else {
-                        Self::target_step_down_db()
+                        self.target_step_down_db()
                     };
-                    self.target_db =
-                        (self.target_db - step_down_db).max(self.effective_auto_min_db());
+                    self.target_db = (self.target_db - step_down_db).max(self.auto_min_db);
                 }
             } else {
-                self.adaptive_floor_clean_frames = 0;
                 if frame_overpowered {
-                    self.relax_adaptive_floor(TARGET_OVERPOWER_ERROR_STEP_DOWN_DB);
                     self.target_db = (self.target_db - TARGET_OVERPOWER_ERROR_STEP_DOWN_DB)
-                        .max(self.effective_auto_min_db());
+                        .max(self.auto_min_db);
                 } else if frame_underpowered {
                     self.target_db = (self.target_db + TARGET_UNDERPOWER_ERROR_STEP_UP_DB)
-                        .clamp(self.effective_auto_min_db(), self.auto_max_db);
-                } else if self.target_adaptation_valid_frames >= OUTER_LOOP_MIN_VALID_FRAMES {
-                    let step_up_db = if self.target_db
-                        <= self.effective_auto_min_db() + ADAPTIVE_FLOOR_TRIGGER_BAND_DB
-                    {
-                        let learned = (self.target_db + ADAPTIVE_FLOOR_STEP_UP_DB)
-                            .clamp(self.auto_min_db, self.auto_max_db);
-                        self.adaptive_auto_floor_db =
-                            (learned > self.auto_min_db).then_some(learned);
-                        ADAPTIVE_FLOOR_STEP_UP_DB
-                    } else {
-                        TARGET_STEP_UP_DB
-                    };
-                    self.target_db = (self.target_db + step_up_db)
-                        .clamp(self.effective_auto_min_db(), self.auto_max_db);
+                        .clamp(self.auto_min_db, self.auto_max_db);
+                } else if target_adaptation_ready {
+                    self.target_db = (self.target_db + TARGET_STEP_UP_DB)
+                        .clamp(self.auto_min_db, self.auto_max_db);
                 }
-            }
-        }
-
-        if !crc_valid && frame_overpowered {
-            self.residual_db = -PCG_RESIDUAL_CLAMP_DB;
-            self.metric_history.clear();
-            self.last_predicted_metric_db = None;
-            self.filtered_metric_db = None;
-            self.transient_recovery_frames_remaining = OUTER_LOOP_TRANSIENT_RECOVERY_FRAMES;
-        }
-        let transient_recovery_remaining = if self.transient_recovery_frames_remaining > 0 {
-            let remaining = self.transient_recovery_frames_remaining;
-            self.transient_recovery_frames_remaining =
-                self.transient_recovery_frames_remaining.saturating_sub(1);
-            Some(remaining)
-        } else {
-            None
-        };
-        if let Some(remaining) = cell_settling_frames_remaining {
-            if cdma_common::diagnostics::power_control_verbose_enabled_for_walsh(walsh_code) {
-                log::info!(
-                    "power_frame[w{}]: crc={} counted=cell_settling remaining={} frame={} fer={:.2}% target={:.2} opwr={}",
-                    walsh_code,
-                    crc_valid as u8,
-                    remaining,
-                    self.total_frames,
-                    self.last_fer_pct,
-                    self.effective_target_db(),
-                    frame_overpowered as u8,
-                );
-            }
-            return self.finish_outer_loop(walsh_code);
-        }
-
-        if let Some(remaining) = transient_recovery_remaining {
-            if cdma_common::diagnostics::power_control_verbose_enabled_for_walsh(walsh_code) {
-                log::info!(
-                    "power_frame[w{}]: crc={} counted=transient_recovery remaining={} target={:.2} opwr={}",
-                    walsh_code,
-                    crc_valid as u8,
-                    remaining,
-                    self.effective_target_db(),
-                    frame_overpowered as u8,
-                );
             }
         }
 
@@ -1141,21 +1224,14 @@ impl BtsReversePowerControlState {
 
     fn finish_outer_loop(&mut self, walsh_code: u8) -> BtsPowerControlSnapshot {
         let snapshot = self.snapshot(walsh_code);
-        if self.radio_config == ReverseTrafficRadioConfig::Rc2 {
+        if self.radio_config != ReverseTrafficRadioConfig::Rc3 {
             self.observation_epoch = self.observation_epoch.saturating_add(1);
         }
         snapshot
     }
 
-    fn relax_adaptive_floor(&mut self, step_down_db: f32) {
-        if let Some(floor) = self.adaptive_auto_floor_db {
-            let decayed = (floor - step_down_db).max(self.auto_min_db);
-            self.adaptive_auto_floor_db = (decayed > self.auto_min_db).then_some(decayed);
-        }
-    }
-
-    fn age_rc2_observations(&mut self) {
-        if self.radio_config != ReverseTrafficRadioConfig::Rc2 {
+    fn age_rc12_observations(&mut self) {
+        if self.radio_config == ReverseTrafficRadioConfig::Rc3 {
             return;
         }
         for slot in 0..self.last_pcg_observation_epoch.len() {
@@ -1165,8 +1241,10 @@ impl BtsReversePowerControlState {
             self.last_pcg_pilot_db[slot] = f32::NAN;
             self.last_pcg_control_metric_db[slot] = f32::NAN;
             self.last_pcg_raw_power_db[slot] = f32::NAN;
-            self.last_pcg_brake_offset_db[slot] = 0.0;
             self.last_pcg_overpowered[slot] = false;
+            self.last_pcg_raw_clamp_active[slot] = false;
+            self.last_pcg_command_slot_valid[slot] = false;
+            self.last_pcg_abs_pcg[slot] = 0;
             self.last_pcg_observation_epoch[slot] = None;
         }
     }
@@ -1185,8 +1263,8 @@ impl BtsReversePowerControlState {
         let control_count = Self::finite_stats(&self.last_pcg_control_metric_db)
             .map(|(_, _, _, count)| count)
             .unwrap_or(0);
-        let minimum = if self.radio_config == ReverseTrafficRadioConfig::Rc2 {
-            RC2_OUTER_LOOP_MIN_FRAME_OBSERVATION_PCGS
+        let minimum = if self.radio_config != ReverseTrafficRadioConfig::Rc3 {
+            RC12_OUTER_LOOP_MIN_FRAME_OBSERVATION_PCGS
         } else {
             OUTER_LOOP_MIN_FRAME_OBSERVATION_PCGS
         };
@@ -1212,29 +1290,17 @@ impl BtsReversePowerControlState {
         {
             return false;
         }
-        if Self::finite_stats(&self.last_pcg_brake_offset_db)
-            .map(|(avg, _, _, _)| avg >= OUTER_LOOP_UNDERPOWER_MAX_BRAKE_DB)
-            .unwrap_or(false)
-        {
-            return false;
-        }
-        let pcb_up = self
-            .last_pcbs
-            .iter()
-            .zip(self.last_pcg_observation_epoch)
-            .filter(|(pcb, observed_epoch)| {
-                **pcb == 0
-                    && (self.radio_config != ReverseTrafficRadioConfig::Rc2
-                        || observed_epoch.is_some())
-            })
-            .count();
-        let minimum_up_pcbs = if self.radio_config == ReverseTrafficRadioConfig::Rc2 {
-            self.last_pcg_observation_epoch.iter().flatten().count()
-        } else {
-            OUTER_LOOP_UNDERPOWER_MIN_UP_PCBS
-        };
-        if pcb_up < minimum_up_pcbs {
-            return false;
+        if self.radio_config != ReverseTrafficRadioConfig::Rc3 {
+            let pcb_up = self
+                .last_pcbs
+                .iter()
+                .zip(self.last_pcg_observation_epoch)
+                .filter(|(pcb, observed_epoch)| **pcb == 0 && observed_epoch.is_some())
+                .count();
+            let minimum_up_pcbs = self.last_pcg_observation_epoch.iter().flatten().count();
+            if pcb_up < minimum_up_pcbs {
+                return false;
+            }
         }
         let Some((control_avg, _, _, _)) = Self::finite_stats(&self.last_pcg_control_metric_db)
         else {
@@ -1261,22 +1327,32 @@ impl BtsReversePowerControlState {
     }
 
     fn log_frame_correlation(&self, walsh_code: u8, crc_valid: bool) {
-        if crc_valid && self.last_fer_pct < TARGET_FER_PCT {
+        if crc_valid && self.last_fer_pct < self.target_fer_pct() {
             return;
         }
         let metric = Self::finite_stats(&self.last_pcg_pilot_db);
         let control = Self::finite_stats(&self.last_pcg_control_metric_db);
         let raw = Self::finite_stats(&self.last_pcg_raw_power_db);
-        let brake = Self::finite_stats(&self.last_pcg_brake_offset_db);
         let hot_pcgs = self.recent_overpowered_pcgs();
         let overpowered = self.recent_frame_overpowered();
         let pcb_up = self.last_pcbs.iter().filter(|&&pcb| pcb == 0).count();
+        let valid_pcb_up = self
+            .last_pcbs
+            .iter()
+            .zip(self.last_pcg_command_slot_valid)
+            .filter(|(pcb, valid)| *valid && **pcb == 0)
+            .count();
+        let valid_pcb_count = self
+            .last_pcg_command_slot_valid
+            .iter()
+            .filter(|valid| **valid)
+            .count();
         let target = self.effective_target_db();
         let control_error = control
             .map(|(avg, _, _, _)| target - avg)
             .unwrap_or(f32::NAN);
         log::info!(
-            "power_frame[w{}]: crc={} frame={} fer={:.2}% target={:.2} opwr={} err_avg={:+.2} metric={} control={} limiter_power={} hot_pcgs={}/16 brake={} pcb_up={}/16",
+            "power_frame[w{}]: crc={} frame={} fer={:.2}% target={:.2} opwr={} err_avg={:+.2} metric={} control={} limiter_power={} hot_pcgs={}/16 pcb_up={}/16 valid_pcb_up={}/{}",
             walsh_code,
             crc_valid as u8,
             self.total_frames,
@@ -1288,9 +1364,63 @@ impl BtsReversePowerControlState {
             Self::format_stats(control),
             Self::format_stats(raw),
             hot_pcgs,
-            Self::format_stats(brake),
             pcb_up,
+            valid_pcb_up,
+            valid_pcb_count,
         );
+    }
+
+    /// One record per reverse frame rather than sixteen on the per-PCG path.
+    /// Every PCG value is still carried, indexed by absolute PCG modulo 16.
+    fn log_batched_pcg_trace(&self, walsh_code: u8) {
+        let first_abs_pcg = self
+            .last_pcg_abs_pcg
+            .iter()
+            .copied()
+            .filter(|abs_pcg| *abs_pcg != 0)
+            .min()
+            .unwrap_or(0);
+        let last_abs_pcg = self.last_pcg_abs_pcg.iter().copied().max().unwrap_or(0);
+        log::info!(
+            "power_pcgs[w{}]: abs_pcg={}..{} metric={} control={} limiter_power={} pcb={} clamp={} scheduled={}",
+            walsh_code,
+            first_abs_pcg,
+            last_abs_pcg,
+            Self::format_pcg_db(&self.last_pcg_pilot_db),
+            Self::format_pcg_db(&self.last_pcg_control_metric_db),
+            Self::format_pcg_db(&self.last_pcg_raw_power_db),
+            Self::format_pcg_bits(&self.last_pcbs),
+            Self::format_pcg_bools(&self.last_pcg_raw_clamp_active),
+            Self::format_pcg_bools(&self.last_pcg_command_slot_valid),
+        );
+    }
+
+    fn format_pcg_db(values: &[f32; 16]) -> String {
+        values
+            .iter()
+            .map(|value| {
+                if value.is_finite() {
+                    format!("{value:.2}")
+                } else {
+                    "nan".to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn format_pcg_bits(values: &[u8; 16]) -> String {
+        values
+            .iter()
+            .map(|value| char::from(b'0' + (*value).min(1)))
+            .collect()
+    }
+
+    fn format_pcg_bools(values: &[bool; 16]) -> String {
+        values
+            .iter()
+            .map(|value| if *value { '1' } else { '0' })
+            .collect()
     }
 
     fn format_stats(stats: Option<(f32, f32, f32, usize)>) -> String {
@@ -1312,242 +1442,173 @@ impl BtsReversePowerControlState {
             fer_pct: self.last_fer_pct,
             frames_total: self.total_frames,
             frames_crc_error: self.total_crc_errors,
-            last_brake_offset_db: self.last_brake_offset_db,
+            measured_inner_loop_1s: self.measured_inner_loop_1s,
         }
     }
 
-    fn fallback_pcb_for_abs_pcg(abs_pcg: u64) -> u8 {
-        (abs_pcg as u8) & 1
-    }
-
-    /// dB to subtract from the PCB error to brake UP commands at high Rx power.
-    #[cfg(test)]
-    fn brake_offset_db_with_adj(filtered_raw_power_db: f32, rx_power_adj_dbfs: f32) -> f32 {
-        Self::brake_offset_db_with_profile(
-            filtered_raw_power_db,
-            rx_power_adj_dbfs,
-            RawPowerLimiterProfile::RC3,
-        )
-    }
-
-    fn brake_offset_db_with_profile(
-        filtered_raw_power_db: f32,
-        rx_power_adj_dbfs: f32,
-        profile: RawPowerLimiterProfile,
-    ) -> f32 {
-        let threshold_adjustment = if profile.thresholds_follow_rx_power_adj {
-            rx_power_adj_dbfs
-        } else {
-            0.0
-        };
-        let begin_dbfs = profile.brake_begin_dbfs + threshold_adjustment;
-        let full_dbfs = profile.brake_full_dbfs + threshold_adjustment;
-        if !filtered_raw_power_db.is_finite() || filtered_raw_power_db <= begin_dbfs {
-            return 0.0;
-        }
-        let span = full_dbfs - begin_dbfs;
-        let frac = ((filtered_raw_power_db - begin_dbfs) / span).clamp(0.0, 1.0);
-        profile.brake_max_offset_db * frac
-    }
-
-    #[cfg(test)]
-    fn brake_offset_db(filtered_raw_power_db: f32) -> f32 {
-        Self::brake_offset_db_with_adj(filtered_raw_power_db, 0.0)
-    }
-
-    fn brake_input_raw_power_db(
-        filtered_raw_power_db: Option<f32>,
-        instant_raw_power_db: Option<f32>,
-    ) -> Option<f32> {
-        match (filtered_raw_power_db, instant_raw_power_db) {
-            (Some(filtered), Some(instant)) => Some(filtered.max(instant)),
-            (Some(filtered), None) => Some(filtered),
-            (None, Some(instant)) => Some(instant),
-            (None, None) => None,
-        }
-    }
-
-    fn lsq_intercept_and_slope_at_newest(samples: &VecDeque<f32>) -> (f32, f32) {
-        super::reverse_power_predictor::lsq_intercept_and_slope_at_newest(samples)
-    }
-
-    fn tick_single_pcg(
+    fn tick_direct(
         &mut self,
-        walsh_code: u8,
-        abs_pcg: u64,
+        measured_abs_pcg: u64,
         metric_db: f32,
         raw_power_db: Option<f32>,
-        lead_pcgs: u32,
+        valid_ordinal: Option<u64>,
     ) -> BtsPowerControlTick {
-        let slot = (abs_pcg % 16) as usize;
-        self.last_pcg_observation_epoch[slot] = Some(self.observation_epoch);
-
-        let raw_power_db = raw_power_db.filter(|db| db.is_finite());
-        if let Some(raw_power_db) = raw_power_db {
-            self.last_pcg_raw_power_db[slot] = raw_power_db;
-            let filtered = match self.filtered_raw_power_db {
-                Some(prev) => prev + RAW_POWER_FILTER_ALPHA * (raw_power_db - prev),
-                None => raw_power_db,
-            };
-            self.filtered_raw_power_db = Some(filtered);
-            let brake_filtered = match self.brake_filtered_raw_power_db {
-                Some(prev) => {
-                    let alpha = if raw_power_db > prev {
-                        BRAKE_RAW_POWER_ATTACK_ALPHA
-                    } else {
-                        BRAKE_RAW_POWER_RELEASE_ALPHA
-                    };
-                    prev + alpha * (raw_power_db - prev)
-                }
-                None => raw_power_db,
-            };
-            self.brake_filtered_raw_power_db = Some(brake_filtered);
+        self.record_one_second_metric(measured_abs_pcg, metric_db);
+        if metric_db.is_finite() {
+            self.last_valid_metric_db = Some(metric_db);
+            self.last_valid_metric_abs_pcg = Some(measured_abs_pcg);
         }
-
-        let hard_limit_power_db = if self.raw_power_profile.hard_limit_uses_filtered {
-            self.filtered_raw_power_db
-        } else {
-            raw_power_db
-        };
-        let over_hot_limit = hard_limit_power_db
-            .map(|db| db >= self.adjusted_dbfs(self.raw_power_profile.hot_limit_dbfs))
-            .unwrap_or(false);
-        let is_clipping = self
+        let slot = (measured_abs_pcg % 16) as usize;
+        self.last_pcg_observation_epoch[slot] = Some(self.observation_epoch);
+        let raw_power_db = raw_power_db.filter(|db| db.is_finite());
+        let target_db = self.effective_target_db();
+        let command_slot_valid = valid_ordinal.is_some();
+        let control_epoch =
+            valid_ordinal.is_some_and(|ordinal| ordinal % DIRECT_EPOCH_PCBS == DIRECT_HOLD_PCBS);
+        let hold_bit = valid_ordinal
+            .map(|ordinal| (ordinal % DIRECT_EPOCH_PCBS) as u8 & 1)
+            .unwrap_or(measured_abs_pcg as u8 & 1);
+        let safety_threshold_dbfs = self
             .raw_power_profile
             .clip_begin_dbfs
-            .and_then(|threshold| raw_power_db.map(|db| db > self.adjusted_dbfs(threshold)))
+            .unwrap_or(self.raw_power_profile.hot_limit_dbfs);
+        let safety_down = raw_power_db
+            .map(|db| db > self.adjusted_dbfs(safety_threshold_dbfs))
             .unwrap_or(false);
-        let clip_guard_active = if is_clipping {
-            self.clip_cooldown_pcgs = self.raw_power_profile.clip_cooldown_pcgs;
-            true
-        } else if self.clip_cooldown_pcgs > 0 {
-            self.clip_cooldown_pcgs = self.clip_cooldown_pcgs.saturating_sub(1);
-            true
+        let measurement_abs_pcg = self.last_valid_metric_abs_pcg.filter(|source_abs_pcg| {
+            measured_abs_pcg.saturating_sub(*source_abs_pcg) <= DIRECT_MAX_MEASUREMENT_AGE_PCGS
+        });
+        let aged_metric_db = measurement_abs_pcg
+            .and(self.last_valid_metric_db)
+            .unwrap_or(f32::NAN);
+        let measurement_used = control_epoch && aged_metric_db.is_finite() && !safety_down;
+        let control_steps: u8 = if measurement_used {
+            let error_db = (target_db - aged_metric_db).abs();
+            if self.radio_config == ReverseTrafficRadioConfig::Rc1 {
+                1
+            } else if error_db >= DIRECT_FIVE_STEP_ERROR_DB {
+                5
+            } else if error_db >= DIRECT_THREE_STEP_ERROR_DB {
+                3
+            } else {
+                1
+            }
         } else {
-            false
+            0
         };
-        self.last_pcg_overpowered[slot] = if self.radio_config == ReverseTrafficRadioConfig::Rc2 {
-            over_hot_limit
+        let continued_burst = valid_ordinal
+            .zip(self.burst_start_ordinal)
+            .and_then(|(ordinal, control_ordinal)| ordinal.checked_sub(control_ordinal))
+            .is_some_and(|offset| offset > 0 && offset < u64::from(self.burst_steps));
+        let pcb = if safety_down {
+            self.burst_start_ordinal = None;
+            self.burst_steps = 0;
+            1
+        } else if measurement_used {
+            let pcb = u8::from(aged_metric_db >= target_db);
+            self.burst_bit = pcb;
+            self.burst_start_ordinal = valid_ordinal;
+            self.burst_steps = control_steps;
+            pcb
+        } else if control_epoch {
+            self.burst_start_ordinal = None;
+            self.burst_steps = 0;
+            hold_bit
+        } else if continued_burst {
+            self.burst_bit
         } else {
-            is_clipping
+            if valid_ordinal.is_some() {
+                self.burst_start_ordinal = None;
+                self.burst_steps = 0;
+            }
+            hold_bit
         };
-        let measurement_valid = metric_db.is_finite() && !is_clipping;
-        if measurement_valid {
+
+        if metric_db.is_finite() {
             self.last_pcg_pilot_db[slot] = metric_db;
         }
-
-        let effective_target_db = self.effective_target_db();
-        let brake_input = if self.raw_power_profile.soft_brake_uses_instant {
-            Self::brake_input_raw_power_db(self.brake_filtered_raw_power_db, raw_power_db)
-        } else {
-            self.brake_filtered_raw_power_db
-        };
-        let brake = brake_input
-            .map(|db| {
-                Self::brake_offset_db_with_profile(
-                    db,
-                    self.rx_power_adj_dbfs,
-                    self.raw_power_profile,
-                )
-            })
-            .unwrap_or(0.0);
-        self.last_brake_offset_db = brake;
-        let hard_release_power_db = if self.raw_power_profile.hard_limit_uses_filtered {
-            self.filtered_raw_power_db
-        } else {
-            raw_power_db
-        };
-        if over_hot_limit || is_clipping {
-            self.raw_hot_limiter_active = true;
-        } else if hard_release_power_db
-            .map(|db| db <= self.adjusted_dbfs(self.raw_power_profile.hot_release_dbfs))
-            .unwrap_or(false)
-        {
-            self.raw_hot_limiter_active = false;
+        if let Some(raw_power_db) = raw_power_db {
+            self.last_pcg_raw_power_db[slot] = raw_power_db;
         }
-        let raw_hot_limiter_active = self.raw_hot_limiter_active;
-        let (pcb, control_metric_db) = if measurement_valid {
-            // Diagnostic EMA for the per-PCG log line — does not feed the loop.
-            let filtered_metric_db = match self.filtered_metric_db {
-                Some(prev) => prev + PCG_METRIC_FILTER_ALPHA * (metric_db - prev),
-                None => metric_db,
-            };
-            self.filtered_metric_db = Some(filtered_metric_db);
-
-            if self.metric_history.len() == METRIC_HISTORY_LEN {
-                self.metric_history.pop_front();
-            }
-            self.metric_history.push_back(metric_db);
-
-            let (intercept_at_now, slope) =
-                Self::lsq_intercept_and_slope_at_newest(&self.metric_history);
-            self.last_slope_db_per_pcg = slope;
-            let predicted_metric_db = super::reverse_power_predictor::predict_ahead_clamped(
-                intercept_at_now,
-                slope,
-                lead_pcgs as f32,
-                PCG_PREDICTION_CLAMP_DB,
-            );
-            self.last_predicted_metric_db = Some(predicted_metric_db);
-
-            (
-                self.quantize_pcb(effective_target_db - predicted_metric_db - brake),
-                predicted_metric_db,
-            )
-        } else if let Some(held_metric) = self.last_predicted_metric_db {
-            (
-                self.quantize_pcb(effective_target_db - held_metric - brake),
-                held_metric,
-            )
-        } else if raw_power_db.is_some() {
-            // Bootstrap with UP before metric lock.
-            (0, f32::NAN)
-        } else {
-            (Self::fallback_pcb_for_abs_pcg(abs_pcg), f32::NAN)
-        };
-
-        // Raw-power limiting overrides metric control.
-        let raw_power_clamp_active = is_clipping || clip_guard_active || raw_hot_limiter_active;
-        let pcb = if raw_power_clamp_active { 1 } else { pcb };
-
-        self.last_pcg_control_metric_db[slot] = control_metric_db;
-        self.last_pcg_brake_offset_db[slot] = self.last_brake_offset_db;
-
-        if cdma_common::diagnostics::power_control_verbose_per_pcg_enabled_for_walsh(walsh_code) {
-            log::info!(
-                "pcg[w{}] abs_pcg={} limiter_power={:?} brake_filt={:?} hot={} clamp={} metric_db={:.2} pred={:.2} target={:.2} brake={:.2} residual={:+.2} pcb={}",
-                walsh_code,
-                abs_pcg,
-                raw_power_db,
-                self.brake_filtered_raw_power_db,
-                raw_hot_limiter_active as u8,
-                raw_power_clamp_active as u8,
-                metric_db,
-                control_metric_db,
-                effective_target_db,
-                self.last_brake_offset_db,
-                self.residual_db,
-                pcb,
-            );
-        }
-
+        self.last_pcg_control_metric_db[slot] = metric_db;
+        self.last_pcg_overpowered[slot] = safety_down;
+        self.last_pcg_raw_clamp_active[slot] = safety_down;
+        self.last_pcg_command_slot_valid[slot] = command_slot_valid;
+        self.last_pcg_abs_pcg[slot] = measured_abs_pcg;
         self.last_pcbs[slot] = pcb;
+        let measurement_abs_pcg = if measurement_used {
+            measurement_abs_pcg
+        } else {
+            None
+        };
+
         BtsPowerControlTick {
             pcb,
-            target_db: effective_target_db,
-            control_metric_db,
+            command_slot_valid,
+            target_db,
+            control_metric_db: if control_epoch {
+                aged_metric_db
+            } else {
+                metric_db
+            },
             raw_power_db,
-            filtered_raw_power_db: self.filtered_raw_power_db,
-            raw_power_clamp_active,
+            raw_power_clamp_active: safety_down,
+            control_epoch,
+            measurement_used,
+            control_steps,
+            safety_down,
+            valid_ordinal,
+            measurement_abs_pcg,
+            schedule_accepted: false,
+            rc3_scheduler: None,
         }
     }
 
-    fn quantize_pcb(&mut self, filtered_error_db: f32) -> u8 {
-        super::reverse_power_predictor::delta_sigma_pcb_step(
-            &mut self.residual_db,
-            filtered_error_db,
-            &RC3_DELTA_SIGMA_PARAMS,
-        )
+    #[cfg(test)]
+    fn tick_rc3_direct(
+        &mut self,
+        measured_abs_pcg: u64,
+        metric_db: f32,
+        raw_power_db: Option<f32>,
+        valid_ordinal: Option<u64>,
+    ) -> BtsPowerControlTick {
+        self.tick_direct(measured_abs_pcg, metric_db, raw_power_db, valid_ordinal)
+    }
+
+    fn tick_rc3_release_hold(
+        &mut self,
+        measured_abs_pcg: u64,
+        valid_ordinal: Option<u64>,
+    ) -> BtsPowerControlTick {
+        let slot = (measured_abs_pcg % 16) as usize;
+        let pcb = valid_ordinal
+            .map(|ordinal| ordinal as u8 & 1)
+            .unwrap_or(measured_abs_pcg as u8 & 1);
+        self.last_pcg_pilot_db[slot] = f32::NAN;
+        self.last_pcg_control_metric_db[slot] = f32::NAN;
+        self.last_pcg_raw_power_db[slot] = f32::NAN;
+        self.last_pcg_overpowered[slot] = false;
+        self.last_pcg_raw_clamp_active[slot] = false;
+        self.last_pcg_command_slot_valid[slot] = valid_ordinal.is_some();
+        self.last_pcg_abs_pcg[slot] = measured_abs_pcg;
+        self.last_pcbs[slot] = pcb;
+
+        BtsPowerControlTick {
+            pcb,
+            command_slot_valid: valid_ordinal.is_some(),
+            target_db: self.effective_target_db(),
+            control_metric_db: f32::NAN,
+            raw_power_db: None,
+            raw_power_clamp_active: false,
+            control_epoch: false,
+            measurement_used: false,
+            control_steps: 0,
+            safety_down: false,
+            valid_ordinal,
+            measurement_abs_pcg: None,
+            schedule_accepted: false,
+            rc3_scheduler: None,
+        }
     }
 }
 
@@ -1558,7 +1619,6 @@ mod sinr_tests;
 #[derive(Clone)]
 pub struct BtsPowerControlRegistry {
     states: Arc<Mutex<HashMap<u8, BtsReversePowerControlState>>>,
-    cell_settling_frames_remaining: Arc<Mutex<u64>>,
     rx_power_adj_dbfs: Arc<Mutex<f32>>,
 }
 
@@ -1566,7 +1626,6 @@ impl Default for BtsPowerControlRegistry {
     fn default() -> Self {
         Self {
             states: Arc::default(),
-            cell_settling_frames_remaining: Arc::default(),
             rx_power_adj_dbfs: Arc::default(),
         }
     }
@@ -1653,16 +1712,9 @@ impl BtsPowerControlRegistry {
             .unwrap_or(ReverseTrafficRadioConfig::Rc3);
         let rx_power_adj_dbfs = self.rx_power_adj_dbfs();
         let mut states = self.states.lock();
-        let (state, reset_state) =
+        let (state, _) =
             Self::state_for_radio_config(&mut states, walsh_code, radio_config, rx_power_adj_dbfs);
-        if reset_state && radio_config == ReverseTrafficRadioConfig::Rc3 {
-            self.start_cell_settling(walsh_code);
-        }
-        let cell_settling_frames_remaining = state
-            .has_frame_observations()
-            .then(|| self.take_cell_settling_frame())
-            .flatten();
-        state.outer_loop_tick(walsh_code, frame_valid, cell_settling_frames_remaining)
+        state.outer_loop_tick(walsh_code, frame_valid)
     }
 
     pub fn snapshot(&self, walsh_code: u8) -> Option<BtsPowerControlSnapshot> {
@@ -1684,6 +1736,64 @@ impl BtsPowerControlRegistry {
         self.states.lock().remove(&walsh_code);
     }
 
+    pub fn enter_rc3_release_hold(
+        &self,
+        traffic_channels: &TrafficChannelPool,
+        walsh_code: u8,
+    ) -> bool {
+        let Some(slot) = traffic_channels.lookup(walsh_code) else {
+            return false;
+        };
+        let TrafficChannelWrapper::Rc3(channel) = &slot.channel else {
+            return false;
+        };
+
+        let snapshot = {
+            let rx_power_adj_dbfs = self.rx_power_adj_dbfs();
+            let mut states = self.states.lock();
+            let (state, _) = Self::state_for_radio_config(
+                &mut states,
+                walsh_code,
+                ReverseTrafficRadioConfig::Rc3,
+                rx_power_adj_dbfs,
+            );
+            state.enter_release_hold();
+            state.snapshot(walsh_code)
+        };
+
+        let scheduler_before = channel.channel.power_control_scheduler_snapshot();
+        let mut neutral_start_abs_pcg = None;
+        let mut neutral_scheduled = 0_u64;
+        if let Some(last_emitted_abs_pcg) = scheduler_before.last_emitted_abs_pcg {
+            let start_abs_pcg = last_emitted_abs_pcg.saturating_add(1);
+            neutral_start_abs_pcg = Some(start_abs_pcg);
+            for abs_pcg in
+                start_abs_pcg..start_abs_pcg.saturating_add(RC3_RELEASE_NEUTRAL_FILL_PCGS)
+            {
+                let Some(ordinal) = channel.channel.power_control_slot_ordinal(abs_pcg) else {
+                    continue;
+                };
+                if channel
+                    .channel
+                    .schedule_power_control_bit(abs_pcg, ordinal as u8 & 1)
+                {
+                    neutral_scheduled = neutral_scheduled.saturating_add(1);
+                }
+            }
+        }
+        log::info!(
+            "power_release_hold[w{}]: target={:.2} fer={:.2}% frames={}/{}err neutral_start_abs_pcg={:?} neutral_scheduled={}",
+            walsh_code,
+            snapshot.effective_target_eb_nt_db,
+            snapshot.fer_pct,
+            snapshot.frames_total,
+            snapshot.frames_crc_error,
+            neutral_start_abs_pcg,
+            neutral_scheduled,
+        );
+        true
+    }
+
     pub fn tick_and_schedule(
         &self,
         traffic_channels: &TrafficChannelPool,
@@ -1693,78 +1803,208 @@ impl BtsPowerControlRegistry {
         metric_db: f32,
         raw_power_db: Option<f32>,
         mobile_power_db: Option<f32>,
+        despread_pilot_power_dbfs: Option<f32>,
     ) -> Option<BtsPowerControlTick> {
         let slot = traffic_channels.lookup(walsh_code)?;
         let radio_config = ReverseTrafficRadioConfig::from_channel(&slot.channel);
-        let tick = {
+        let requested_tx_abs_pcg = tx_abs_pcg;
+        let control_metric_db = metric_db;
+        let (tx_abs_pcg, valid_ordinal) = match &slot.channel {
+            TrafficChannelWrapper::Rc1(ch) => {
+                let source_ordinal = ch
+                    .channel
+                    .guaranteed_power_control_ordinal(measured_abs_pcg)?;
+                let target_ordinal =
+                    source_ordinal.saturating_add(RC12_DIRECT_DELAY_GUARANTEED_SLOTS);
+                let target_abs_pcg = ch
+                    .channel
+                    .power_control_abs_pcg_for_guaranteed_ordinal(target_ordinal);
+                debug_assert!(target_abs_pcg >= requested_tx_abs_pcg);
+                (target_abs_pcg, Some(target_ordinal))
+            }
+            TrafficChannelWrapper::Rc2(ch) => {
+                let source_ordinal = ch
+                    .channel
+                    .guaranteed_power_control_ordinal(measured_abs_pcg)?;
+                let target_ordinal =
+                    source_ordinal.saturating_add(RC12_DIRECT_DELAY_GUARANTEED_SLOTS);
+                let target_abs_pcg = ch
+                    .channel
+                    .power_control_abs_pcg_for_guaranteed_ordinal(target_ordinal);
+                debug_assert!(target_abs_pcg >= requested_tx_abs_pcg);
+                (target_abs_pcg, Some(target_ordinal))
+            }
+            TrafficChannelWrapper::Rc3(ch) => (
+                tx_abs_pcg,
+                ch.channel.power_control_slot_ordinal(tx_abs_pcg),
+            ),
+            TrafficChannelWrapper::SchRc3(_) => return None,
+        };
+        let mut tick = {
             let rx_power_adj_dbfs = self.rx_power_adj_dbfs();
             let mut states = self.states.lock();
-            let (state, reset_state) = Self::state_for_radio_config(
+            let (state, _) = Self::state_for_radio_config(
                 &mut states,
                 walsh_code,
                 radio_config,
                 rx_power_adj_dbfs,
             );
-            if reset_state && radio_config == ReverseTrafficRadioConfig::Rc3 {
-                self.start_cell_settling(walsh_code);
+            // One command decision per absolute PCG. Replayed or duplicated
+            // measurements must not advance controller state again.
+            if !state.admit_control_abs_pcg(measured_abs_pcg) {
+                return None;
             }
-            let lead_pcgs = tx_abs_pcg
-                .saturating_sub(measured_abs_pcg)
-                .min(PCG_PREDICTION_LEAD_PCGS as u64) as u32;
-            state.tick_single_pcg(
-                walsh_code,
-                measured_abs_pcg,
-                metric_db,
-                radio_config.limiter_power_db(raw_power_db, mobile_power_db),
-                lead_pcgs,
-            )
+            if state.release_hold {
+                state.tick_rc3_release_hold(measured_abs_pcg, valid_ordinal)
+            } else {
+                state.tick_direct(
+                    measured_abs_pcg,
+                    control_metric_db,
+                    radio_config.limiter_power_db(raw_power_db, mobile_power_db),
+                    valid_ordinal,
+                )
+            }
         };
 
         match &slot.channel {
             TrafficChannelWrapper::Rc1(ch) => {
-                ch.channel.schedule_power_control_burst(
-                    tx_abs_pcg,
-                    RC1_PCB_SPECULATIVE_FILL_PCGS,
-                    tick.pcb,
-                );
-            }
-            TrafficChannelWrapper::Rc2(ch) => {
-                let slots = ch
+                let neutral_count = tx_abs_pcg
+                    .saturating_add(RC12_NEUTRAL_LOOKAHEAD_PCGS)
+                    .saturating_sub(requested_tx_abs_pcg);
+                for (offset, neutral) in ch
                     .channel
-                    .power_control_slots(tx_abs_pcg, RC2_PCB_SPECULATIVE_FILL_PCGS);
-                for (offset, bit) in plan_rc2_pcbs(&slots, tick.pcb, tick.raw_power_clamp_active)
+                    .power_control_slots(requested_tx_abs_pcg, neutral_count)
                     .into_iter()
                     .enumerate()
                 {
-                    ch.channel
-                        .schedule_power_control_bit(tx_abs_pcg + offset as u64, bit);
+                    if !neutral.guaranteed_valid() {
+                        ch.channel.schedule_power_control_bit(
+                            requested_tx_abs_pcg + offset as u64,
+                            neutral.hold_bit,
+                        );
+                    }
                 }
+                tick.schedule_accepted =
+                    ch.channel.schedule_power_control_bit(tx_abs_pcg, tick.pcb);
+            }
+            TrafficChannelWrapper::Rc2(ch) => {
+                let neutral_count = tx_abs_pcg
+                    .saturating_add(RC12_NEUTRAL_LOOKAHEAD_PCGS)
+                    .saturating_sub(requested_tx_abs_pcg);
+                for (offset, neutral) in ch
+                    .channel
+                    .power_control_slots(requested_tx_abs_pcg, neutral_count)
+                    .into_iter()
+                    .enumerate()
+                {
+                    if !neutral.guaranteed_valid() {
+                        ch.channel.schedule_power_control_bit(
+                            requested_tx_abs_pcg + offset as u64,
+                            neutral.hold_bit,
+                        );
+                    }
+                }
+                tick.schedule_accepted =
+                    ch.channel.schedule_power_control_bit(tx_abs_pcg, tick.pcb);
             }
             TrafficChannelWrapper::Rc3(ch) => {
-                ch.channel.schedule_power_control_bit(tx_abs_pcg, tick.pcb)
+                if ch.channel.power_control_slot_is_valid(tx_abs_pcg) {
+                    tick.schedule_accepted =
+                        ch.channel.schedule_power_control_bit(tx_abs_pcg, tick.pcb);
+                }
+                tick.rc3_scheduler = Some(ch.channel.power_control_scheduler_snapshot());
             }
-            TrafficChannelWrapper::SchRc3(_) => return None,
+            TrafficChannelWrapper::SchRc3(_) => unreachable!(),
         }
-        Some(tick)
-    }
-
-    fn start_cell_settling(&self, walsh_code: u8) {
-        *self.cell_settling_frames_remaining.lock() = OUTER_LOOP_CELL_SETTLING_FRAMES;
-        if cdma_common::diagnostics::power_control_verbose_enabled_for_walsh(walsh_code) {
+        if radio_config == ReverseTrafficRadioConfig::Rc3
+            && (tick.control_epoch || tick.safety_down)
+            && cdma_common::diagnostics::power_control_verbose_enabled_for_walsh(walsh_code)
+        {
+            let kind = if tick.safety_down {
+                "safety_down"
+            } else if tick.measurement_used {
+                "control"
+            } else {
+                "skipped_control"
+            };
+            let schedule_result = if tick.schedule_accepted {
+                "accepted"
+            } else {
+                "late_or_invalid"
+            };
+            let scheduler = tick.rc3_scheduler.unwrap_or_default();
+            let schedule_headroom_pcgs = scheduler
+                .last_emitted_abs_pcg
+                .map(|last_emitted| tx_abs_pcg.saturating_sub(last_emitted));
+            let control_measurement_age_pcgs = tick
+                .measurement_abs_pcg
+                .map(|source_abs_pcg| measured_abs_pcg.saturating_sub(source_abs_pcg));
             log::info!(
-                "bts_power_control[w{}]: cell settling for {} reverse frames",
+                "rc3_control[w{}]: measured_abs_pcg={} measured_abs_chip={} raw_pilot_sinr_db={:.2} control_pilot_sinr_db={:.2} control_measurement_abs_pcg={:?} control_measurement_age_pcgs={:?} despread_pilot_power_dbfs={:.2} pilot_sinr_target_db={:.2} kind={} control_steps={} pcb={} direction={} tx_abs_pcg={} tx_abs_chip={} lead_pcgs={} valid_pcb_ordinal={:?} schedule={} schedule_headroom_pcgs={:?} tx_last_emitted_abs_pcg={:?} scheduler_published={} tx_scheduled_emits={} tx_fallback_emits={} late_schedules={}",
                 walsh_code,
-                OUTER_LOOP_CELL_SETTLING_FRAMES,
+                measured_abs_pcg,
+                measured_abs_pcg.saturating_mul(SR1_CHIPS_PER_PCG),
+                metric_db,
+                tick.control_metric_db,
+                tick.measurement_abs_pcg,
+                control_measurement_age_pcgs,
+                despread_pilot_power_dbfs.unwrap_or(f32::NAN),
+                tick.target_db,
+                kind,
+                tick.control_steps,
+                tick.pcb,
+                if tick.pcb == 0 { "UP" } else { "DOWN" },
+                tx_abs_pcg,
+                tx_abs_pcg.saturating_mul(SR1_CHIPS_PER_PCG),
+                tx_abs_pcg.saturating_sub(measured_abs_pcg),
+                tick.valid_ordinal,
+                schedule_result,
+                schedule_headroom_pcgs,
+                scheduler.last_emitted_abs_pcg,
+                scheduler.published,
+                scheduler.scheduled_emits,
+                scheduler.fallback_emits,
+                scheduler.late_schedules,
             );
         }
-    }
-
-    fn take_cell_settling_frame(&self) -> Option<u64> {
-        let mut remaining = self.cell_settling_frames_remaining.lock();
-        if *remaining == 0 {
-            return None;
+        if radio_config != ReverseTrafficRadioConfig::Rc3
+            && (tick.control_epoch || tick.safety_down)
+            && cdma_common::diagnostics::power_control_verbose_enabled_for_walsh(walsh_code)
+        {
+            let kind = if tick.safety_down {
+                "safety_down"
+            } else if tick.measurement_used {
+                "control"
+            } else {
+                "skipped_control"
+            };
+            log::info!(
+                "rc12_control[{:?} w{}]: measured_abs_pcg={} measured_abs_chip={} control_source={} measured_eb_nt_db={:.2} measured_mobile_power_dbfs={:.2} control_metric_db={:.2} target_db={:.2} kind={} control_steps={} pcb={} direction={} requested_tx_abs_pcg={} tx_abs_pcg={} tx_abs_chip={} lead_pcgs={} valid_pcb_ordinal={:?} schedule={}",
+                radio_config,
+                walsh_code,
+                measured_abs_pcg,
+                measured_abs_pcg.saturating_mul(SR1_CHIPS_PER_PCG),
+                radio_config.control_metric_name(),
+                metric_db,
+                mobile_power_db.unwrap_or(f32::NAN),
+                tick.control_metric_db,
+                tick.target_db,
+                kind,
+                tick.control_steps,
+                tick.pcb,
+                if tick.pcb == 0 { "UP" } else { "DOWN" },
+                requested_tx_abs_pcg,
+                tx_abs_pcg,
+                tx_abs_pcg.saturating_mul(SR1_CHIPS_PER_PCG),
+                tx_abs_pcg.saturating_sub(measured_abs_pcg),
+                tick.valid_ordinal,
+                if tick.schedule_accepted {
+                    "accepted"
+                } else {
+                    "late_or_invalid"
+                },
+            );
         }
-        *remaining = (*remaining).saturating_sub(1);
-        Some(*remaining)
+        Some(tick)
     }
 }

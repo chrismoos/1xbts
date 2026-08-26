@@ -30,6 +30,7 @@
 //! -  6-bit: shared `cdma_common::crc::crc6_rc2` (1800 bps).
 
 use cdma_common::crc::{crc6_rc2, crc8, crc10, crc12};
+#[cfg(test)]
 use cdma_common::phy::data_burst_randomizer::{
     RC12_CHIPS_PER_PCG, RC12_PCGS_PER_FRAME, Rc12ReverseRate, active_pcgs as rc12_active_pcgs,
 };
@@ -39,7 +40,10 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use super::{Channel, PcgPcbSchedulerHandle};
+use super::{
+    Channel, PcgPcbSchedulerHandle,
+    rc12_power_control::{Rc12PowerControlCadence, Rc12PowerControlSlot},
+};
 use crate::phy::coding::block_interleaver::{BitReversalInterleaver, SR1_PARAMS_384};
 use crate::phy::coding::convolutional::{Encoder, get_1_2_k9_encoder};
 use crate::phy::coding::long_code::LongCodeGenerator;
@@ -304,7 +308,7 @@ pub struct TrafficFrameRc2 {
 /// BPSK signal-point map / I/Q-zero output convention as the RC1 F-FCH.
 pub struct ForwardTrafficChannelRc2 {
     config: Mutex<ConfigRc2>,
-    reverse_long_code_origin: LongCodeGenerator,
+    power_control_cadence: Rc12PowerControlCadence,
     tx_state: Mutex<TxStateRc2>,
     framer: Mutex<Rc2Framer>,
     null_frame: PreparedFrameRc2,
@@ -314,21 +318,16 @@ pub struct ForwardTrafficChannelRc2 {
     pcb_scheduler: PcgPcbSchedulerHandle,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Rc2PowerControlSlot {
-    pub guaranteed_valid: bool,
-    pub hold_bit: u8,
-}
-
 impl ForwardTrafficChannelRc2 {
     pub fn new(config: ConfigRc2) -> Self {
         let pcb_scheduler = config.pcb_scheduler.clone();
-        let reverse_long_code_origin = config.long_code_generator.clone();
+        let power_control_cadence =
+            Rc12PowerControlCadence::new(config.long_code_generator.clone());
         let mut framer = Rc2Framer::new();
         let null_frame = Self::build_null_frame(&mut framer);
         Self {
             config: Mutex::new(config),
-            reverse_long_code_origin,
+            power_control_cadence,
             tx_state: Mutex::new(TxStateRc2 {
                 symbol_buffer: VecDeque::new(),
                 prepared_frame: None,
@@ -342,74 +341,23 @@ impl ForwardTrafficChannelRc2 {
         }
     }
 
-    fn source_frame_power_control_slots(
-        &self,
-        frame_start_abs_pcg: u64,
-    ) -> [Rc2PowerControlSlot; RC12_PCGS_PER_FRAME] {
-        let frame_chip_start = frame_start_abs_pcg * RC12_CHIPS_PER_PCG;
-        let half = rc12_active_pcgs(
-            &self.reverse_long_code_origin,
-            frame_chip_start,
-            Rc12ReverseRate::Half,
-        );
-        let quarter = rc12_active_pcgs(
-            &self.reverse_long_code_origin,
-            frame_chip_start,
-            Rc12ReverseRate::Quarter,
-        );
-        let eighth = rc12_active_pcgs(
-            &self.reverse_long_code_origin,
-            frame_chip_start,
-            Rc12ReverseRate::Eighth,
-        );
-        let mut tier_ordinals = [0u8; 4];
-        std::array::from_fn(|pcg| {
-            let tier = if eighth[pcg] {
-                0
-            } else if quarter[pcg] {
-                1
-            } else if half[pcg] {
-                2
-            } else {
-                3
-            };
-            let hold_bit = tier_ordinals[tier] & 1;
-            tier_ordinals[tier] += 1;
-            Rc2PowerControlSlot {
-                guaranteed_valid: tier == 0,
-                hold_bit,
-            }
-        })
-    }
-
     pub(crate) fn power_control_slots(
         &self,
         start_abs_pcg: u64,
         count: u64,
-    ) -> Vec<Rc2PowerControlSlot> {
-        let mut cached_frame = None;
-        let mut cached_slots = [Rc2PowerControlSlot {
-            guaranteed_valid: false,
-            hold_bit: 0,
-        }; RC12_PCGS_PER_FRAME];
-        (0..count)
-            .map(|offset| {
-                let pcb_abs_pcg = start_abs_pcg + offset;
-                let Some(source_abs_pcg) = pcb_abs_pcg.checked_sub(2) else {
-                    return Rc2PowerControlSlot {
-                        guaranteed_valid: false,
-                        hold_bit: (pcb_abs_pcg & 1) as u8,
-                    };
-                };
-                let frame_start_abs_pcg =
-                    source_abs_pcg / RC12_PCGS_PER_FRAME as u64 * RC12_PCGS_PER_FRAME as u64;
-                if cached_frame != Some(frame_start_abs_pcg) {
-                    cached_slots = self.source_frame_power_control_slots(frame_start_abs_pcg);
-                    cached_frame = Some(frame_start_abs_pcg);
-                }
-                cached_slots[(source_abs_pcg % RC12_PCGS_PER_FRAME as u64) as usize]
-            })
-            .collect()
+    ) -> Vec<Rc12PowerControlSlot> {
+        self.power_control_cadence
+            .power_control_slots(start_abs_pcg, count)
+    }
+
+    pub(crate) fn guaranteed_power_control_ordinal(&self, measured_abs_pcg: u64) -> Option<u64> {
+        self.power_control_cadence
+            .guaranteed_ordinal_for_measurement(measured_abs_pcg)
+    }
+
+    pub(crate) fn power_control_abs_pcg_for_guaranteed_ordinal(&self, ordinal: u64) -> u64 {
+        self.power_control_cadence
+            .pcb_abs_pcg_for_guaranteed_ordinal(ordinal)
     }
 
     fn prepare(
@@ -466,8 +414,8 @@ impl ForwardTrafficChannelRc2 {
         sig + data
     }
 
-    pub fn schedule_power_control_bit(&self, abs_pcg: u64, bit: u8) {
-        self.pcb_scheduler.lock().schedule(abs_pcg, bit);
+    pub fn schedule_power_control_bit(&self, abs_pcg: u64, bit: u8) -> bool {
+        self.pcb_scheduler.lock().schedule(abs_pcg, bit)
     }
 
     pub fn schedule_power_control_burst(&self, start_abs_pcg: u64, pcgs: u64, bit: u8) {
@@ -887,11 +835,15 @@ mod tests {
     fn rc2_power_control_slots_follow_two_pcg_validity_delay() {
         let ch = make_channel();
         let slots = ch.power_control_slots(2, RC12_PCGS_PER_FRAME as u64);
-        let eighth = rc12_active_pcgs(&ch.reverse_long_code_origin, 0, Rc12ReverseRate::Eighth);
+        let reverse_long_code_origin = LongCodeGenerator::new_traffic_channel(0xDEADBEEF);
+        let eighth = rc12_active_pcgs(&reverse_long_code_origin, 0, Rc12ReverseRate::Eighth);
 
-        assert_eq!(slots.iter().filter(|slot| slot.guaranteed_valid).count(), 2);
+        assert_eq!(
+            slots.iter().filter(|slot| slot.guaranteed_valid()).count(),
+            2
+        );
         for pcg in 0..RC12_PCGS_PER_FRAME {
-            assert_eq!(slots[pcg].guaranteed_valid, eighth[pcg]);
+            assert_eq!(slots[pcg].guaranteed_valid(), eighth[pcg]);
         }
     }
 
@@ -908,7 +860,7 @@ mod tests {
                 Rc12ReverseRate::Eighth,
             ] {
                 let active = rc12_active_pcgs(
-                    &ch.reverse_long_code_origin,
+                    &LongCodeGenerator::new_traffic_channel(0xDEADBEEF),
                     frame_start_abs_pcg * RC12_CHIPS_PER_PCG,
                     rate,
                 );

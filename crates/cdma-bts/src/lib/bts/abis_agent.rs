@@ -41,6 +41,7 @@ use crate::lac::paging_messages::{
 use crate::phy::coding::long_code::LongCodeGenerator;
 use crate::receiver::access_layer3::AccessMessage;
 use cdma_common::bits::Bitstream;
+use cdma_common::consts::reverse_fch_gating_supported;
 use cdma_common::sch::Rc3FschProfile;
 
 pub(crate) fn abis_message_from_typed(bytes: &[u8]) -> Option<AbisMessage> {
@@ -1060,8 +1061,12 @@ impl AbisAgent {
 
         match for_rc {
             r if r >= 3 => {
-                self.controller
-                    .commit_rc3_traffic(walsh_code, lc_gen, fpc_subchan_gain);
+                let channel =
+                    self.controller
+                        .commit_rc3_traffic(walsh_code, lc_gen, fpc_subchan_gain);
+                channel.channel.set_rev_fch_gating_mode(
+                    rev_fch_gating_mode && reverse_fch_gating_supported(rev_rc),
+                );
             }
             2 => {
                 self.controller
@@ -1078,7 +1083,7 @@ impl AbisAgent {
             esn: session.esn,
             assigned_rev_rc: rev_rc,
             preamble_num_pcgs: None,
-            rev_fch_gating_mode: rev_fch_gating_mode && (3..=6).contains(&rev_rc),
+            rev_fch_gating_mode: rev_fch_gating_mode && reverse_fch_gating_supported(rev_rc),
         };
         self.controller.install_rx_request(rx_request);
         session.committed = true;

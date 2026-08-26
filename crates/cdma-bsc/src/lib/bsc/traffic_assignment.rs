@@ -1,14 +1,8 @@
-//! Traffic-channel assignment paths for the BSC.
-//!
-//! Allocation of forward traffic channels (RC1 / RC3 / SCH), Channel
-//! Assignment / Extended Channel Assignment message construction, and
-//! manual power-override entrypoints. The natural home for the
-//! Abis-Connect / Connect-Ack / Status state machines as WS-1 lands.
-//! WS-0 PR3 sibling module per
-//! `docs/architecture-update/09-pr3-method-map.md`.
+//! BSC traffic-channel allocation, assignment, and power overrides.
 
 use cdma_common::consts::{
-    SERVICE_OPTION_BASIC_VOICE, SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_SMS,
+    RC3_GATED_REV_PWR_CNTL_DELAY, SERVICE_OPTION_BASIC_VOICE, SERVICE_OPTION_HIGH_RATE_PACKET_DATA,
+    SERVICE_OPTION_SMS, reverse_fch_gating_supported,
 };
 use cdma_common::error::Error;
 use cdma_common::events::AccessChannelEvent;
@@ -43,6 +37,10 @@ const EXTENDED_CAM_MIN_P_REV: u8 = 3;
 
 fn should_use_ecam(mob_p_rev: u8, legacy_so1_assignment: bool, band_class: u8) -> bool {
     mob_p_rev >= 6 && (!legacy_so1_assignment || band_class != 0)
+}
+
+fn reverse_fch_gating_enabled(configured: bool, mobile_requested: bool, rev_rc: u8) -> bool {
+    configured && mobile_requested && reverse_fch_gating_supported(rev_rc)
 }
 
 impl TrafficAssignmentService {
@@ -103,6 +101,12 @@ impl TrafficAssignmentService {
 }
 
 impl Bsc {
+    fn track_assignment_delivery(&mut self, walsh_code: u8, correlation_id: Option<u32>) {
+        self.mobiles.update_tc(walsh_code, |_, tc| {
+            tc.track_assignment_delivery(correlation_id);
+        });
+    }
+
     pub(crate) async fn try_assign_access_sms_traffic(
         &mut self,
         fwd_address: &MsAddress,
@@ -146,10 +150,11 @@ impl Bsc {
                 super::access::access_response_tx_time(event),
                 ack_deadline,
             ) {
-                Ok(()) => {
+                Ok(correlation_id) => {
                     self.mobiles.update(fwd_address, |ms| {
                         ms.mark_traffic_channel_assigned(walsh_code);
                     });
+                    self.track_assignment_delivery(walsh_code, correlation_id);
                 }
                 Err(e) => {
                     log::warn!(
@@ -255,7 +260,7 @@ impl Bsc {
             None,
         );
 
-        let ms_gating = self
+        let ms_gating_requested = self
             .mobiles
             .get(fwd_address)
             .map(|ms| ms.rev_fch_gating_req)
@@ -266,12 +271,16 @@ impl Bsc {
                 esn,
                 assigned_rev_rc: assigned_rcs.1,
                 preamble_num_pcgs: None,
-                rev_fch_gating_mode: ms_gating && (3..=6).contains(&assigned_rcs.1),
+                rev_fch_gating_mode: reverse_fch_gating_enabled(
+                    self.config.traffic_assignment.rev_fch_gating_mode,
+                    ms_gating_requested,
+                    assigned_rcs.1,
+                ),
             })
             .await;
         info!("BSC: requested reverse traffic RX for walsh={}", walsh_code);
 
-        if let Err(e) = self.traffic_assignment.send_channel_assignment(
+        let assignment = self.traffic_assignment.send_channel_assignment(
             &self.mobiles,
             &self.access_tx,
             self.config.pilot_offset,
@@ -283,7 +292,11 @@ impl Bsc {
             Some(assigned_rcs),
             super::access::access_response_tx_time(event),
             ack_deadline,
-        ) {
+        );
+        if let Ok(correlation_id) = &assignment {
+            self.track_assignment_delivery(walsh_code, *correlation_id);
+        }
+        if let Err(e) = assignment {
             log::warn!(
                 "BSC: failed to send Channel Assignment for {}: {}",
                 format_ms_address(fwd_address),
@@ -404,7 +417,7 @@ impl Bsc {
             None,
         );
 
-        let ms_gating = self
+        let ms_gating_requested = self
             .mobiles
             .get(&fwd_address)
             .map(|ms| ms.rev_fch_gating_req)
@@ -415,13 +428,17 @@ impl Bsc {
                 esn,
                 assigned_rev_rc: assigned_rcs.1,
                 preamble_num_pcgs: None,
-                rev_fch_gating_mode: ms_gating && (3..=6).contains(&assigned_rcs.1),
+                rev_fch_gating_mode: reverse_fch_gating_enabled(
+                    self.config.traffic_assignment.rev_fch_gating_mode,
+                    ms_gating_requested,
+                    assigned_rcs.1,
+                ),
             })
             .await;
 
         // ack_msg_seq is just for logging; BTS stamps real ARQ values per
         // address. We don't have an access event in this MT path, so pass 0.
-        if let Err(e) = self.traffic_assignment.send_channel_assignment(
+        let assignment = self.traffic_assignment.send_channel_assignment(
             &self.mobiles,
             &self.access_tx,
             self.config.pilot_offset,
@@ -433,7 +450,11 @@ impl Bsc {
             Some(assigned_rcs),
             None,
             None,
-        ) {
+        );
+        if let Ok(correlation_id) = &assignment {
+            self.track_assignment_delivery(walsh_code, *correlation_id);
+        }
+        if let Err(e) = assignment {
             log::warn!(
                 "BSC: oversize escalation: failed to send Channel Assignment for {}: {}",
                 format_ms_address(&fwd_address),
@@ -617,7 +638,7 @@ impl Bsc {
             a1_call_id,
         );
 
-        let ms_gating = self
+        let ms_gating_requested = self
             .mobiles
             .get(fwd_address)
             .map(|ms| ms.rev_fch_gating_req)
@@ -628,7 +649,11 @@ impl Bsc {
                 esn,
                 assigned_rev_rc: assigned_rcs.1,
                 preamble_num_pcgs: None,
-                rev_fch_gating_mode: ms_gating && (3..=6).contains(&assigned_rcs.1),
+                rev_fch_gating_mode: reverse_fch_gating_enabled(
+                    self.config.traffic_assignment.rev_fch_gating_mode,
+                    ms_gating_requested,
+                    assigned_rcs.1,
+                ),
             })
             .await;
         info!(
@@ -636,7 +661,7 @@ impl Bsc {
             walsh_code
         );
 
-        if let Err(e) = self.traffic_assignment.send_channel_assignment(
+        let assignment = self.traffic_assignment.send_channel_assignment(
             &self.mobiles,
             &self.access_tx,
             self.config.pilot_offset,
@@ -648,7 +673,11 @@ impl Bsc {
             Some(assigned_rcs),
             super::access::access_response_tx_time(event),
             ack_deadline,
-        ) {
+        );
+        if let Ok(correlation_id) = &assignment {
+            self.track_assignment_delivery(walsh_code, *correlation_id);
+        }
+        if let Err(e) = assignment {
             log::warn!(
                 "BSC: failed to send packet-data Channel Assignment for {}: {}",
                 format_ms_address(fwd_address),
@@ -760,7 +789,7 @@ impl Bsc {
             a1_call_id,
         );
 
-        let ms_gating = self
+        let ms_gating_requested = self
             .mobiles
             .get(fwd_address)
             .map(|ms| ms.rev_fch_gating_req)
@@ -771,11 +800,15 @@ impl Bsc {
                 esn,
                 assigned_rev_rc: assigned_rcs.1,
                 preamble_num_pcgs: None,
-                rev_fch_gating_mode: ms_gating && (3..=6).contains(&assigned_rcs.1),
+                rev_fch_gating_mode: reverse_fch_gating_enabled(
+                    self.config.traffic_assignment.rev_fch_gating_mode,
+                    ms_gating_requested,
+                    assigned_rcs.1,
+                ),
             })
             .await;
 
-        if let Err(e) = self.traffic_assignment.send_channel_assignment(
+        let assignment = self.traffic_assignment.send_channel_assignment(
             &self.mobiles,
             &self.access_tx,
             self.config.pilot_offset,
@@ -787,7 +820,11 @@ impl Bsc {
             Some(assigned_rcs),
             requested_tx_time,
             tx_deadline,
-        ) {
+        );
+        if let Ok(correlation_id) = &assignment {
+            self.track_assignment_delivery(walsh_code, *correlation_id);
+        }
+        if let Err(e) = assignment {
             let bearer = self.config.msc_voice_bearer.clone();
             self.mobiles.update(fwd_address, |ms| {
                 ms.set_state(MsState::Registered);
@@ -833,7 +870,7 @@ impl TrafficAssignmentService {
         assigned_rcs: Option<(u8, u8)>,
         _requested_tx_time: Option<cdma_common::time::CdmaSystemTime>,
         _tx_deadline: Option<cdma_common::time::CdmaSystemTime>,
-    ) -> Result<(), Error> {
+    ) -> Result<Option<u32>, Error> {
         let (
             mob_p_rev,
             for_rcs,
@@ -911,7 +948,20 @@ impl TrafficAssignmentService {
                 rev_rc,
                 early_rl,
             );
-            ecam.rev_fch_gating_mode = ms_gating_req && (3..=6).contains(&rev_rc);
+            // The configured capability decides, and the mobile's request only
+            // narrows it. Letting the request decide puts capable handsets on
+            // the gated FPC cadence against a receiver that is not gating.
+            ecam.rev_fch_gating_mode = reverse_fch_gating_enabled(
+                traffic_config.rev_fch_gating_mode,
+                ms_gating_req,
+                rev_rc,
+            );
+            // C.S0005-E requires the assignment to carry REV_PWR_CNTL_DELAY
+            // when reverse FCH gating is enabled and overhead does not supply
+            // it. The BTS uses the same value to select valid FPC slots.
+            ecam.rev_pwr_cntl_delay = ecam
+                .rev_fch_gating_mode
+                .then_some(RC3_GATED_REV_PWR_CNTL_DELAY);
             ecam.freq_incl = true;
             ecam.band_class = overhead.band_class;
             ecam.cdma_freq = overhead.cdma_freq;
@@ -995,7 +1045,7 @@ impl TrafficAssignmentService {
         let sdu = message.to_sdu();
 
         let ack_req = msg_id != MessageId::ChannelAssignment;
-        access_tx.send_directed_fpch(addr, msg_id, message, sdu, ack_req)?;
+        let correlation_id = access_tx.send_directed_fpch(addr, msg_id, message, sdu, ack_req)?;
 
         info!(
             "BSC: sending {} (assign_mode=0b{:03b}, walsh={}, ack_seq={}, ack_req={})",
@@ -1009,7 +1059,7 @@ impl TrafficAssignmentService {
             ack_msg_seq,
             ack_req,
         );
-        Ok(())
+        Ok(ack_req.then_some(correlation_id))
     }
 }
 
@@ -1034,6 +1084,14 @@ mod band_class_tests {
             ),
             ServiceNegotiationMode::ServiceNegotiation
         );
+    }
+
+    #[test]
+    fn reverse_fch_gating_requires_bts_config_mobile_request_and_supported_rc() {
+        assert!(reverse_fch_gating_enabled(true, true, 3));
+        assert!(!reverse_fch_gating_enabled(false, true, 3));
+        assert!(!reverse_fch_gating_enabled(true, false, 3));
+        assert!(!reverse_fch_gating_enabled(true, true, 2));
     }
 }
 

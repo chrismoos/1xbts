@@ -1,6 +1,10 @@
 //! Forward traffic-channel signaling builders and bearer enqueue.
 
 use cdma_bts::lac as bts_lac;
+use cdma_common::access::{
+    AccessMessage, SERVICE_REQUEST_PURPOSE_PROPOSE, SERVICE_RESPONSE_PURPOSE_COUNTER_PROPOSE,
+    SERVICE_RESPONSE_PURPOSE_REJECT, ServiceConfigRecord, ServiceResponseMessage,
+};
 use cdma_common::channel::TrafficRate;
 use cdma_common::consts::SERVICE_OPTION_HIGH_RATE_PACKET_DATA;
 use cdma_common::error::Error;
@@ -444,7 +448,7 @@ impl Bsc {
     ///
     /// Used to propose a new service configuration when the BSC's assigned SO
     /// differs from the mobile's origination SO.
-    /// Per C.S0005-E 3.7.3.3.2.18: REQ_PURPOSE=0010 (propose).
+    /// Uses the propose request purpose from C.S0005-E 3.7.3.3.2.18.
     pub(crate) fn send_service_request(
         &mut self,
         walsh_code: u8,
@@ -466,7 +470,7 @@ impl Bsc {
 
         let params = ServiceRequestParams {
             serv_req_seq,
-            req_purpose: 0b0010,
+            req_purpose: SERVICE_REQUEST_PURPOSE_PROPOSE,
             service_config: Some(ServiceRequestConfig {
                 for_mux_option,
                 rev_mux_option,
@@ -495,6 +499,106 @@ impl Bsc {
             None,
             None,
             Some(params),
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn send_service_response_counter_proposal(
+        &mut self,
+        walsh_code: u8,
+        ack_seq: u8,
+        serv_req_seq: u8,
+    ) -> Result<(), Error> {
+        let (for_rc, rev_rc) = self
+            .mobiles
+            .get_traffic_channel(walsh_code)
+            .map(|tc| (tc.for_rc, tc.rev_rc))
+            .ok_or("no traffic channel for Service Response")?;
+        let connection_records = self
+            .traffic_service_connections(walsh_code)?
+            .into_iter()
+            .map(
+                |connection| cdma_common::access::ServiceConnectConnectionRecord {
+                    con_ref: connection.con_ref,
+                    service_option: connection.service_option,
+                    for_traffic: connection.for_traffic,
+                    rev_traffic: connection.rev_traffic,
+                    ui_encrypt_mode: connection.ui_encrypt_mode,
+                    sr_id: connection.sr_id,
+                    rlp_info_incl: connection.rlp_info_incl,
+                    rlp_blob: connection.rlp_blob,
+                    qos_parms: connection.qos_parms,
+                },
+            )
+            .collect();
+        let config = ServiceConfigRecord {
+            for_mux_option: default_mux_option_for_rc(for_rc)?,
+            rev_mux_option: default_mux_option_for_rc(rev_rc)?,
+            for_rates: 0xf0,
+            rev_rates: 0xf0,
+            connection_records,
+            fch_cc_incl: true,
+            fch_frame_size: Some(0),
+            for_fch_rc: Some(for_rc),
+            rev_fch_rc: Some(rev_rc),
+            dcch_cc_incl: false,
+            for_sch_cc_incl: false,
+            rev_sch_cc_incl: false,
+        };
+        let response = ServiceResponseMessage {
+            serv_req_seq,
+            resp_purpose: SERVICE_RESPONSE_PURPOSE_COUNTER_PROPOSE,
+            service_config: Some(config),
+        };
+        let sdu = AccessMessage::ServiceResponse(response).to_sdu()?;
+
+        info!(
+            "BSC: counter-proposing FCH-only RC{}/{} service configuration on walsh={} serv_req_seq={}",
+            for_rc, rev_rc, walsh_code, serv_req_seq
+        );
+
+        self.send_traffic_signaling(
+            walsh_code,
+            sdu,
+            MessageId::ServiceResponse,
+            ack_seq,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn send_service_response_reject(
+        &mut self,
+        walsh_code: u8,
+        ack_seq: u8,
+        serv_req_seq: u8,
+    ) -> Result<(), Error> {
+        let response = ServiceResponseMessage {
+            serv_req_seq,
+            resp_purpose: SERVICE_RESPONSE_PURPOSE_REJECT,
+            service_config: None,
+        };
+        let sdu = AccessMessage::ServiceResponse(response).to_sdu()?;
+
+        info!(
+            "BSC: rejecting unsupported mobile service proposal on walsh={} serv_req_seq={}",
+            walsh_code, serv_req_seq
+        );
+
+        self.send_traffic_signaling(
+            walsh_code,
+            sdu,
+            MessageId::ServiceResponse,
+            ack_seq,
+            true,
+            None,
+            None,
+            None,
             None,
             None,
         )

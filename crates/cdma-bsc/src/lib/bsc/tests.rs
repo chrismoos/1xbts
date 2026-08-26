@@ -24,7 +24,7 @@ use crate::abis_edge::BtsControlClient;
 use crate::abis_edge::PchTransferAckEvent;
 use crate::abis_edge::network::{NetworkBtsControlClient, NetworkClientConfig};
 use crate::addressing::{select_imsi_class0_forward_address, select_initial_traffic_rcs};
-use cdma_abis::control::typed::CellId;
+use cdma_abis::control::typed::{CellId, pch_message_transfer_ack_cause::OAMP_INTERVENTION};
 use cdma_bts::bts::abis_agent::AbisAgentConfig;
 use cdma_bts::bts::{
     ChannelRegistry, TrafficChannelPool, TrafficResourceController, TrafficRxPool,
@@ -32,14 +32,15 @@ use cdma_bts::bts::{
 };
 use cdma_bts::lac as bts_lac;
 use cdma_common::access::{
-    AccessMessage, AccessMessageHeader, OriginationMessage, ServiceConfigRecord,
+    AccessMessage, AccessMessageHeader, OriginationMessage,
+    SERVICE_RESPONSE_PURPOSE_COUNTER_PROPOSE, SERVICE_RESPONSE_PURPOSE_REJECT, ServiceConfigRecord,
     ServiceConnectConnectionRecord, ServiceResponseMessage,
 };
 use cdma_common::bits::Bitstream;
 use cdma_common::events::AccessChannelEvent;
 use cdma_common::formatting::format_dtmf_digits;
 use cdma_common::lac;
-use cdma_common::lac::message_types::MessageId;
+use cdma_common::lac::message_types::{MessageId, WireChannel};
 use cdma_hlr::model::{
     RegistrationBinding, RegistrationState, Subscriber, SubscriberIdentity, SubscriberStatus,
 };
@@ -936,6 +937,64 @@ async fn a1_paging_request_processes_independently_of_prior_assignment_request()
 }
 
 #[tokio::test]
+async fn concurrent_mt_voice_pages_are_tracked_per_mobile() {
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
+    let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
+    let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
+    let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
+    let bts_client = test_capturing_bts_client(
+        walsh_allocator,
+        traffic_channels,
+        traffic_rx_pool,
+        traffic_rx_removals,
+    );
+
+    let mut bsc = test_bsc_with_max_slot_cycle_index(2);
+    bsc.config.bts_client = Some(bts_client.clone() as Arc<dyn BtsControlClient>);
+    bsc.access_tx = AccessTx::new(Some(bts_client as Arc<dyn BtsControlClient>));
+
+    let first_addr = MsAddress::ImsiS {
+        imsi_m_s1: 7_137_215,
+        imsi_m_s2: 512,
+    };
+    let second_addr = MsAddress::ImsiS {
+        imsi_m_s1: 7_137_216,
+        imsi_m_s2: 512,
+    };
+    for (addr, esn, pgslot) in [
+        (first_addr.clone(), 0xCAFE_BABE, 101),
+        (second_addr.clone(), 0xCAFE_BABF, 102),
+    ] {
+        bsc.mobiles.push(MobileStation::new_for_test(
+            addr,
+            Some(esn),
+            None,
+            6,
+            MsState::Registered,
+            2,
+            Some(pgslot),
+        ));
+    }
+
+    bsc.start_bs_voice_call_for_mobile(&first_addr, SERVICE_OPTION_EVRC_A, None, Some(101), None);
+    bsc.start_bs_voice_call_for_mobile(&second_addr, SERVICE_OPTION_EVRC_A, None, Some(102), None);
+
+    assert_eq!(bsc.paging.pending_voice_page_count(), 2);
+    let first = bsc
+        .paging
+        .take_voice_page_for_address(&first_addr)
+        .expect("first mobile should retain its pending voice page");
+    assert_eq!(first.a1_call_id, Some(101));
+    assert_eq!(bsc.paging.pending_voice_page_count(), 1);
+    let second = bsc
+        .paging
+        .take_voice_page_for_address(&second_addr)
+        .expect("second mobile should retain its pending voice page");
+    assert_eq!(second.a1_call_id, Some(102));
+    assert!(!bsc.paging.has_pending_voice_page());
+}
+
+#[tokio::test]
 async fn mt_voice_on_existing_so33_uses_traffic_service_negotiation() {
     let (mut bsc, mut traffic_rx, walsh_code) =
         test_bsc_with_active_traffic_channel(SERVICE_OPTION_HIGH_RATE_PACKET_DATA).await;
@@ -985,6 +1044,117 @@ async fn mt_voice_on_existing_so33_uses_traffic_service_negotiation() {
     assert_eq!(cfg.connections[0].sr_id, 2);
 }
 
+#[tokio::test]
+async fn mt_voice_on_incomplete_so33_releases_before_paging() {
+    let (mut bsc, mut traffic_rx, walsh_code) =
+        test_bsc_with_active_traffic_channel(SERVICE_OPTION_HIGH_RATE_PACKET_DATA).await;
+    bsc.mobiles[0].subscriber_id = Some(Uuid::new_v4());
+    bsc.mobiles[0].phone_number = Some("5551234567".to_string());
+    bsc.mobiles[0]
+        .find_traffic_channel_by_walsh_mut(walsh_code)
+        .expect("traffic channel should exist")
+        .mark_waiting_service_response();
+    while traffic_rx.try_recv().is_ok() {}
+
+    let addr = bsc.mobiles[0].fwd_address.clone();
+    bsc.start_bs_voice_call_for_mobile(&addr, SERVICE_OPTION_EVRC_A, None, Some(103), None);
+
+    assert!(!bsc.paging.has_pending_voice_page());
+    assert_eq!(bsc.voice.deferred_pages_after_release.len(), 1);
+    assert!(
+        bsc.mobiles[0]
+            .traffic_channel()
+            .is_some_and(TrafficChannelInfo::is_releasing)
+    );
+    let events = std::iter::from_fn(|| traffic_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(events.iter().any(|event| {
+        event
+            .order
+            .as_ref()
+            .is_some_and(|order| order.order == RELEASE_ORDER_CODE)
+    }));
+    assert!(events.iter().all(|event| event.service_request.is_none()));
+
+    complete_traffic_release_guard(&mut bsc, walsh_code).await;
+
+    assert!(bsc.mobiles[0].traffic_channel().is_none());
+    assert!(bsc.voice.deferred_pages_after_release.is_empty());
+    assert!(bsc.paging.pending_voice_page_for_address(&addr));
+}
+
+#[tokio::test]
+async fn pending_mt_voice_page_rejects_packet_reorigination() {
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
+    let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
+    let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
+    let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
+    let bts_client = test_capturing_bts_client(
+        walsh_allocator,
+        traffic_channels,
+        traffic_rx_pool,
+        traffic_rx_removals,
+    );
+    let mut bsc = test_bsc_with_max_slot_cycle_index(2);
+    bsc.config.bts_client = Some(bts_client.clone() as Arc<dyn BtsControlClient>);
+    bsc.access_tx = AccessTx::new(Some(bts_client.clone() as Arc<dyn BtsControlClient>));
+
+    bsc.inject_access_event(test_registration_event_with_esn(0x1234_5678, 1))
+        .await;
+    let addr = bsc.mobiles[0].fwd_address.clone();
+    bsc.start_bs_voice_call_for_mobile(&addr, SERVICE_OPTION_EVRC_A, None, Some(104), None);
+    assert!(bsc.paging.pending_voice_page_for_address(&addr));
+
+    let mut origination = test_registration_event_with_esn(0x1234_5678, 2);
+    origination.message_id = MessageId::Origination;
+    origination.msg_type_name = "Origination Message".to_string();
+    origination.service_option = Some(SERVICE_OPTION_HIGH_RATE_PACKET_DATA);
+    bsc.inject_access_event(origination).await;
+
+    assert!(bsc.mobiles[0].traffic_channel().is_none());
+    assert!(bsc.paging.pending_voice_page_for_address(&addr));
+    let forward_order_type = MessageId::Order
+        .wire_type(WireChannel::ForwardCommon)
+        .expect("Order Message has a forward common-channel type");
+    let rejected = bts_client
+        .pch_messages
+        .lock()
+        .iter()
+        .filter_map(|message| message.air_interface_message.as_ref())
+        .filter(|message| message.message_type == forward_order_type)
+        .filter_map(|message| {
+            let mut bits = Bitstream::new_bytes(&message.message);
+            lac::paging_messages::OrderMessage::from_sdu(&mut bits).ok()
+        })
+        .any(|order| {
+            order.order == RELEASE_ORDER_CODE
+                && order.ordq == RELEASE_ORDER_SERVICE_OPTION_REJECTED_QUALIFIER
+        });
+    assert!(rejected, "packet reorigination should receive a rejection");
+}
+
+#[tokio::test]
+async fn active_mt_voice_call_rejects_packet_reorigination() {
+    let (mut bsc, _traffic_rx, walsh_code) = test_bsc_with_active_traffic_channel(3).await;
+    let session_id = Uuid::new_v4();
+    bsc.mobiles[0]
+        .find_traffic_channel_by_walsh_mut(walsh_code)
+        .expect("traffic channel should exist")
+        .voice_session_id = Some(session_id);
+
+    let mut origination = test_registration_event_with_esn(0x1234_5678, 2);
+    origination.message_id = MessageId::Origination;
+    origination.msg_type_name = "Origination Message".to_string();
+    origination.service_option = Some(SERVICE_OPTION_HIGH_RATE_PACKET_DATA);
+    bsc.inject_access_event(origination).await;
+
+    let traffic = bsc.mobiles[0]
+        .traffic_channel()
+        .expect("voice traffic channel should remain allocated");
+    assert_eq!(traffic.walsh_code, walsh_code);
+    assert_eq!(traffic.voice_session_id, Some(session_id));
+    assert!(!bsc.paging.has_pending_voice_page());
+}
+
 /// Build a reverse Service Response carrying a counter-propose with the
 /// given SO. Suitable for `bsc.inject_access_event(...)` against a TCH
 /// currently in `WaitingServiceResponse`.
@@ -1002,7 +1172,7 @@ fn test_service_response_counter_propose(
     event.traffic_walsh_code = Some(walsh_code);
     event.decoded_l3 = Some(AccessMessage::ServiceResponse(ServiceResponseMessage {
         serv_req_seq,
-        resp_purpose: 0b0010, // counter-propose
+        resp_purpose: SERVICE_RESPONSE_PURPOSE_COUNTER_PROPOSE,
         service_config: Some(ServiceConfigRecord {
             for_mux_option: 1,
             rev_mux_option: 1,
@@ -1041,7 +1211,7 @@ fn test_service_response_reject(walsh_code: u8, serv_req_seq: u8) -> AccessChann
     event.traffic_walsh_code = Some(walsh_code);
     event.decoded_l3 = Some(AccessMessage::ServiceResponse(ServiceResponseMessage {
         serv_req_seq,
-        resp_purpose: 0b0001, // reject
+        resp_purpose: SERVICE_RESPONSE_PURPOSE_REJECT,
         service_config: None,
     }));
     event
@@ -1051,11 +1221,25 @@ fn test_ms_release_order(walsh_code: u8) -> AccessChannelEvent {
     let mut event = test_access_event();
     event.message_id = MessageId::Order;
     event.msg_type_name = "Order Message".to_string();
-    event.msg_seq = Some(1);
+    event.msg_seq = Some(6);
     event.ack_req = false;
     event.traffic_walsh_code = Some(walsh_code);
     event.order_code = Some(RELEASE_ORDER_CODE);
     event
+}
+
+async fn complete_traffic_release_guard(bsc: &mut Bsc, walsh_code: u8) {
+    let tc = bsc
+        .mobiles
+        .get_traffic_channel_mut(walsh_code)
+        .expect("traffic channel should remain during the release guard");
+    tc.channel_state = ChannelState::Releasing {
+        release_guard_started_at: Instant::now()
+            - traffic_channel::TRAFFIC_RELEASE_GUARD
+            - Duration::from_millis(1),
+    };
+    bsc.poll_traffic_channel_lifecycle(Duration::from_secs(5))
+        .await;
 }
 
 /// Wait briefly for a captured A1 message from the BSC and decode its type.
@@ -1110,7 +1294,7 @@ async fn mt_voice_on_pre_is2000_traffic_releases_before_paging() {
         !bsc.paging.has_pending_voice_page(),
         "page must wait until the legacy traffic channel is released"
     );
-    assert!(bsc.voice.deferred_page_after_release.is_some());
+    assert_eq!(bsc.voice.deferred_pages_after_release.len(), 1);
     assert!(
         bsc.mobiles[0]
             .traffic_channel
@@ -1134,8 +1318,20 @@ async fn mt_voice_on_pre_is2000_traffic_releases_before_paging() {
     bsc.inject_access_event(test_ms_release_order(walsh_code))
         .await;
 
+    assert!(
+        bsc.mobiles[0]
+            .traffic_channel
+            .as_ref()
+            .is_some_and(TrafficChannelInfo::is_releasing),
+        "MS Release Order must keep the traffic channel through the radio guard"
+    );
+    assert_eq!(bsc.voice.deferred_pages_after_release.len(), 1);
+    assert!(!bsc.paging.has_pending_voice_page());
+
+    complete_traffic_release_guard(&mut bsc, walsh_code).await;
+
     assert!(bsc.mobiles[0].traffic_channel.is_none());
-    assert!(bsc.voice.deferred_page_after_release.is_none());
+    assert!(bsc.voice.deferred_pages_after_release.is_empty());
     assert!(
         bsc.paging.has_pending_voice_page(),
         "normal paging must start after traffic teardown"
@@ -1447,9 +1643,55 @@ async fn stale_traffic_channel_sends_release_order_before_teardown() {
     bsc.inject_access_event(test_ms_release_order(walsh_code))
         .await;
     assert!(
-        bsc.mobiles[0].traffic_channel.is_none(),
-        "MS Release Order must complete stale F-TCH teardown"
+        bsc.mobiles[0]
+            .traffic_channel
+            .as_ref()
+            .is_some_and(TrafficChannelInfo::is_releasing),
+        "MS Release Order must retain stale F-TCH resources through the guard"
     );
+
+    complete_traffic_release_guard(&mut bsc, walsh_code).await;
+    assert!(bsc.mobiles[0].traffic_channel.is_none());
+}
+
+#[tokio::test]
+async fn ms_initiated_release_sends_responses_and_holds_radio_resources() {
+    let (mut bsc, mut traffic_rx, walsh_code) =
+        test_bsc_with_active_traffic_channel(SERVICE_OPTION_QCELP13).await;
+    while traffic_rx.try_recv().is_ok() {}
+
+    let mut release = test_ms_release_order(walsh_code);
+    release.ack_req = true;
+    bsc.inject_access_event(release).await;
+
+    let orders = std::iter::from_fn(|| traffic_rx.try_recv().ok())
+        .filter_map(|event| event.order.map(|order| order.order))
+        .collect::<Vec<_>>();
+    assert!(
+        orders.contains(&ACKNOWLEDGMENT_ORDER_CODE),
+        "MS Release Order must be ACKed"
+    );
+    assert!(
+        orders.contains(&RELEASE_ORDER_CODE),
+        "MS-initiated release must receive a forward Release Order"
+    );
+    assert!(
+        bsc.mobiles[0]
+            .traffic_channel
+            .as_ref()
+            .is_some_and(TrafficChannelInfo::is_releasing),
+        "traffic resources must remain allocated during the release guard"
+    );
+
+    bsc.poll_traffic_channel_lifecycle(Duration::from_secs(5))
+        .await;
+    assert!(
+        bsc.mobiles[0].traffic_channel.is_some(),
+        "traffic resources must not be removed before the release guard expires"
+    );
+
+    complete_traffic_release_guard(&mut bsc, walsh_code).await;
+    assert!(bsc.mobiles[0].traffic_channel.is_none());
 }
 
 #[tokio::test]
@@ -1523,6 +1765,11 @@ async fn mt_voice_so15_counter_propose_releases_and_signals_failure() {
     bsc.inject_access_event(test_ms_release_order(walsh_code))
         .await;
 
+    assert!(bsc.mobiles[0].traffic_channel.is_some());
+    assert_eq!(bsc.pending_a1_failure_after_release.len(), 1);
+
+    complete_traffic_release_guard(&mut bsc, walsh_code).await;
+
     assert!(bsc.mobiles[0].traffic_channel.is_none());
     assert!(bsc.pending_a1_failure_after_release.is_empty());
 
@@ -1592,6 +1839,11 @@ async fn mt_voice_reject_releases_and_signals_failure() {
 
     bsc.inject_access_event(test_ms_release_order(walsh_code))
         .await;
+
+    assert!(bsc.mobiles[0].traffic_channel.is_some());
+    assert_eq!(bsc.pending_a1_failure_after_release.len(), 1);
+
+    complete_traffic_release_guard(&mut bsc, walsh_code).await;
 
     assert!(bsc.mobiles[0].traffic_channel.is_none());
     assert!(bsc.pending_a1_failure_after_release.is_empty());
@@ -1910,6 +2162,61 @@ async fn registration_marks_mobile_active_for_idle_eviction() {
         "fresh registration must survive the next eviction tick"
     );
     assert_eq!(bsc.mobiles.tracked_count(), 1);
+}
+
+#[tokio::test]
+async fn explicit_registration_removes_prior_traffic_channel() {
+    let (mut bsc, _traffic_rx, _walsh_code) =
+        test_bsc_with_active_traffic_channel(SERVICE_OPTION_QCELP13).await;
+
+    bsc.inject_access_event(test_registration_event_with_esn(0x1234_5678, 3))
+        .await;
+
+    assert!(bsc.mobiles[0].traffic_channel().is_none());
+    assert_eq!(bsc.mobiles[0].state, MsState::Registered);
+}
+
+#[tokio::test]
+async fn access_reject_of_ecam_removes_pending_traffic_channel() {
+    const MESSAGE_FIELD_OUT_OF_RANGE_ORDQ: u8 = 0x04;
+    const LAYER_3_PDU_TYPE: u8 = 0b00;
+
+    let (mut bsc, _traffic_rx, walsh_code) =
+        test_bsc_with_active_traffic_channel(SERVICE_OPTION_QCELP13).await;
+    bsc.mobiles[0].set_state(MsState::TrafficAssigning);
+    bsc.mobiles[0]
+        .find_traffic_channel_by_walsh_mut(walsh_code)
+        .expect("traffic channel should exist")
+        .channel_state = ChannelState::Assigned {
+        assigned_at: Instant::now(),
+    };
+
+    let mut reject = test_registration_event_with_esn(0x1234_5678, 6);
+    reject.message_id = MessageId::Order;
+    reject.msg_type_name = "Order Message".to_string();
+    reject.order_code = Some(traffic_signaling::reverse_order_code::MOBILE_STATION_REJECT);
+    let rejected_type = MessageId::ExtChannelAssignment
+        .wire_type(WireChannel::ForwardCommon)
+        .expect("Extended Channel Assignment has a forward common-channel type");
+    reject.decoded_l3 = Some(AccessMessage::Order(cdma_common::access::OrderMessage {
+        header: AccessMessageHeader {
+            pd: 1,
+            message_id: MessageId::Order,
+        },
+        order: traffic_signaling::reverse_order_code::MOBILE_STATION_REJECT,
+        add_record_len: 3,
+        order_specific: vec![
+            MESSAGE_FIELD_OUT_OF_RANGE_ORDQ,
+            rejected_type,
+            LAYER_3_PDU_TYPE,
+        ],
+        remaining_bits: 0,
+    }));
+
+    bsc.inject_access_event(reject).await;
+
+    assert!(bsc.mobiles[0].traffic_channel().is_none());
+    assert_eq!(bsc.mobiles[0].state, MsState::Registered);
 }
 
 #[tokio::test]
@@ -3217,6 +3524,7 @@ async fn assigned_timeout_tears_down_packet_traffic_channel() {
     tc.channel_state = ChannelState::Assigned {
         assigned_at: Instant::now() - Duration::from_millis(5001),
     };
+    tc.assignment_correlation_id = None;
 
     bsc.poll_traffic_channel_lifecycle(Duration::from_millis(5000))
         .await;
@@ -3236,6 +3544,7 @@ async fn assigned_lifecycle_does_not_teardown_before_timeout() {
     tc.channel_state = ChannelState::Assigned {
         assigned_at: Instant::now() - Duration::from_millis(4999),
     };
+    tc.assignment_correlation_id = None;
 
     bsc.poll_traffic_channel_lifecycle(Duration::from_millis(5000))
         .await;
@@ -3244,6 +3553,86 @@ async fn assigned_lifecycle_does_not_teardown_before_timeout() {
         bsc.mobiles[0].traffic_channel.is_some(),
         "traffic channel should remain before assignment timeout"
     );
+}
+
+#[tokio::test]
+async fn ecam_l2_ack_restarts_traffic_transition_timeout() {
+    const ASSIGNMENT_CORRELATION_ID: u32 = 77;
+    let (mut bsc, _traffic_rx, _walsh_code) =
+        test_bsc_with_active_traffic_channel(SERVICE_OPTION_HIGH_RATE_PACKET_DATA).await;
+
+    let before_ack = Instant::now();
+    let tc = bsc.mobiles[0].traffic_channel.as_mut().unwrap();
+    tc.channel_state = ChannelState::Assigned {
+        assigned_at: before_ack - Duration::from_millis(4900),
+    };
+    tc.assignment_correlation_id = Some(ASSIGNMENT_CORRELATION_ID);
+
+    bsc.handle_pch_transfer_ack(PchTransferAckEvent {
+        correlation_id: Some(ASSIGNMENT_CORRELATION_ID),
+        cause: None,
+        bts_l2_termination: Some(true),
+    })
+    .await;
+
+    let tc = bsc.mobiles[0].traffic_channel.as_ref().unwrap();
+    assert_eq!(tc.assignment_correlation_id, None);
+    match tc.channel_state {
+        ChannelState::Assigned { assigned_at } => assert!(assigned_at >= before_ack),
+        _ => panic!("expected Assigned state"),
+    }
+
+    bsc.poll_traffic_channel_lifecycle(Duration::from_millis(5000))
+        .await;
+    assert!(bsc.mobiles[0].traffic_channel.is_some());
+}
+
+#[tokio::test]
+async fn pending_ecam_delivery_outlives_traffic_transition_timeout() {
+    const ASSIGNMENT_CORRELATION_ID: u32 = 78;
+    let (mut bsc, _traffic_rx, _walsh_code) =
+        test_bsc_with_active_traffic_channel(SERVICE_OPTION_HIGH_RATE_PACKET_DATA).await;
+    bsc.config.paging_retry.ack_timeout_ms = 15_000;
+
+    let tc = bsc.mobiles[0].traffic_channel.as_mut().unwrap();
+    tc.channel_state = ChannelState::Assigned {
+        assigned_at: Instant::now() - Duration::from_millis(5001),
+    };
+    tc.assignment_correlation_id = Some(ASSIGNMENT_CORRELATION_ID);
+
+    bsc.poll_traffic_channel_lifecycle(Duration::from_millis(5000))
+        .await;
+    assert!(bsc.mobiles[0].traffic_channel.is_some());
+
+    let tc = bsc.mobiles[0].traffic_channel.as_mut().unwrap();
+    tc.channel_state = ChannelState::Assigned {
+        assigned_at: Instant::now() - Duration::from_millis(20_001),
+    };
+    bsc.poll_traffic_channel_lifecycle(Duration::from_millis(5000))
+        .await;
+    assert!(bsc.mobiles[0].traffic_channel.is_none());
+}
+
+#[tokio::test]
+async fn ecam_l2_delivery_failure_tears_down_pending_assignment() {
+    const ASSIGNMENT_CORRELATION_ID: u32 = 79;
+    let (mut bsc, _traffic_rx, _walsh_code) =
+        test_bsc_with_active_traffic_channel(SERVICE_OPTION_HIGH_RATE_PACKET_DATA).await;
+
+    let tc = bsc.mobiles[0].traffic_channel.as_mut().unwrap();
+    tc.channel_state = ChannelState::Assigned {
+        assigned_at: Instant::now(),
+    };
+    tc.assignment_correlation_id = Some(ASSIGNMENT_CORRELATION_ID);
+
+    bsc.handle_pch_transfer_ack(PchTransferAckEvent {
+        correlation_id: Some(ASSIGNMENT_CORRELATION_ID),
+        cause: Some(OAMP_INTERVENTION),
+        bts_l2_termination: None,
+    })
+    .await;
+
+    assert!(bsc.mobiles[0].traffic_channel.is_none());
 }
 
 #[tokio::test]
@@ -3303,21 +3692,28 @@ async fn waiting_ms_ack_lifecycle_does_not_teardown_before_timeout() {
 }
 
 #[tokio::test]
-async fn traffic_release_timeout_tears_down_packet_traffic_channel() {
-    let (mut bsc, _traffic_rx, _walsh_code) =
+async fn traffic_release_guard_preserves_then_tears_down_packet_traffic_channel() {
+    let (mut bsc, _traffic_rx, walsh_code) =
         test_bsc_with_active_traffic_channel(SERVICE_OPTION_HIGH_RATE_PACKET_DATA).await;
 
     let tc = bsc.mobiles[0].traffic_channel.as_mut().unwrap();
     tc.channel_state = ChannelState::Releasing {
-        release_sent_at: Instant::now() - Duration::from_millis(5001),
+        release_guard_started_at: Instant::now()
+            - (traffic_channel::TRAFFIC_RELEASE_GUARD - Duration::from_millis(50)),
     };
 
     bsc.poll_traffic_channel_lifecycle(Duration::from_millis(5000))
         .await;
+    assert!(
+        bsc.mobiles[0].traffic_channel.is_some(),
+        "packet traffic channel must remain before the release guard expires"
+    );
+
+    complete_traffic_release_guard(&mut bsc, walsh_code).await;
 
     assert!(
         bsc.mobiles[0].traffic_channel.is_none(),
-        "packet traffic channel should be torn down after release timeout"
+        "packet traffic channel should be torn down after the release guard"
     );
 }
 
@@ -5358,13 +5754,18 @@ async fn closed_packet_session_sends_release_before_traffic_teardown() {
         .await;
 
     assert!(
-        bsc.mobiles[0].traffic_channel.is_none(),
-        "MS Release Order should tear down the radio traffic channel"
+        bsc.mobiles[0].traffic_channel.is_some(),
+        "MS Release Order should retain the radio traffic channel through the guard"
     );
     assert!(
-        traffic_rx_removals.lock().contains(&walsh_code),
-        "BSC should request BTS RX removal after MS release"
+        !traffic_rx_removals.lock().contains(&walsh_code),
+        "BSC should retain BTS RX during the release guard"
     );
+
+    complete_traffic_release_guard(&mut bsc, walsh_code).await;
+
+    assert!(bsc.mobiles[0].traffic_channel.is_none());
+    assert!(traffic_rx_removals.lock().contains(&walsh_code));
 }
 
 #[test]

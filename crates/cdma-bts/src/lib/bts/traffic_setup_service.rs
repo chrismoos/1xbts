@@ -27,6 +27,7 @@ use crate::lac::message_types::{MessageId, WireChannel};
 use crate::lac::paging_messages::{ChannelAssignmentMessage, ExtendedChannelAssignmentMessage};
 use crate::phy::coding::long_code::LongCodeGenerator;
 use cdma_common::bits::Bitstream;
+use cdma_common::consts::reverse_fch_gating_supported;
 
 use super::abis_agent::abis_message_from_typed;
 
@@ -424,8 +425,12 @@ impl TrafficSetupService {
 
         match for_rc {
             r if r >= 3 => {
-                self.controller
-                    .commit_rc3_traffic(walsh_code, lc_gen, fpc_subchan_gain);
+                let channel =
+                    self.controller
+                        .commit_rc3_traffic(walsh_code, lc_gen, fpc_subchan_gain);
+                channel.channel.set_rev_fch_gating_mode(
+                    rev_fch_gating_mode && reverse_fch_gating_supported(rev_rc),
+                );
             }
             2 => {
                 self.controller

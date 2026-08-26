@@ -828,6 +828,32 @@ impl MobileRegistry {
         None
     }
 
+    pub(crate) fn acknowledge_assignment_delivery(
+        &mut self,
+        correlation_id: u32,
+    ) -> Option<(MsAddress, u8)> {
+        for ms in self.entries.iter_mut() {
+            let Some(tc) = ms.traffic_channel.as_mut() else {
+                continue;
+            };
+            if tc.acknowledge_assignment_delivery(correlation_id) {
+                return Some((ms.fwd_address.clone(), tc.walsh_code));
+            }
+        }
+        None
+    }
+
+    pub(crate) fn pending_assignment_for_correlation(
+        &self,
+        correlation_id: u32,
+    ) -> Option<(MsAddress, u8)> {
+        self.entries.iter().find_map(|ms| {
+            let tc = ms.traffic_channel.as_ref()?;
+            (tc.is_assigned() && tc.assignment_correlation_id == Some(correlation_id))
+                .then(|| (ms.fwd_address.clone(), tc.walsh_code))
+        })
+    }
+
     /// Iterate every mobile that currently has an active voice traffic
     /// channel, calling `f(&mut ms, walsh)` for each. The borrow is scoped
     /// per-iteration; no caller-held idx, no slice escape.

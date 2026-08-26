@@ -75,7 +75,7 @@ pub use mobile_station_processor::MobileStationProcessor;
 pub use paging_channel_processor::PagingChannelProcessor;
 pub use peak_sample_decimator::PeakSampleDecimator;
 pub use pn_align_processor::PnAlignProcessor;
-pub use pulse_matched_filter_processor::PulseMatchedFilterProcessor;
+pub use pulse_matched_filter_processor::{PULSE_MATCHED_FILTERED_TAG, PulseMatchedFilterProcessor};
 pub use rake_access_searcher::RakeAccessSearcher;
 pub use rake_receiver::RakeReceiver;
 pub use rc1_traffic_frame_aligner::Rc1TrafficFrameAligner;
@@ -161,7 +161,12 @@ fn mobile_power_dbfs_from_despread_chip_power(despread_chip_power: f64) -> f32 {
     adc_referenced_power_dbfs(despread_chip_power / 2.0)
 }
 
-fn walsh64_mobile_power_dbfs<'a>(symbols: impl IntoIterator<Item = &'a [f32; 64]>) -> f32 {
+const WALSH64_NOISE_MAX_EXPECTATION: f64 = 4.743_891;
+
+fn walsh64_mobile_power_dbfs_with_noise_factor<'a>(
+    symbols: impl IntoIterator<Item = &'a [f32; 64]>,
+    noise_factor: f64,
+) -> f32 {
     const CHIPS_PER_SYMBOL: f64 = 256.0;
     let mut desired_correlation_power = 0.0_f64;
     let mut count = 0_usize;
@@ -169,7 +174,7 @@ fn walsh64_mobile_power_dbfs<'a>(symbols: impl IntoIterator<Item = &'a [f32; 64]
         let peak = energies.iter().copied().fold(0.0_f32, f32::max) as f64;
         let total = energies.iter().map(|energy| *energy as f64).sum::<f64>();
         let interference = ((total - peak) / 63.0).max(0.0);
-        desired_correlation_power += (peak - interference).max(0.0);
+        desired_correlation_power += (peak - noise_factor * interference).max(0.0);
         count += 1;
     }
     if count == 0 {
@@ -178,6 +183,14 @@ fn walsh64_mobile_power_dbfs<'a>(symbols: impl IntoIterator<Item = &'a [f32; 64]
     let chip_power =
         desired_correlation_power / count as f64 / (CHIPS_PER_SYMBOL * CHIPS_PER_SYMBOL);
     mobile_power_dbfs_from_despread_chip_power(chip_power)
+}
+
+fn walsh64_mobile_power_dbfs<'a>(symbols: impl IntoIterator<Item = &'a [f32; 64]>) -> f32 {
+    walsh64_mobile_power_dbfs_with_noise_factor(symbols, 1.0)
+}
+
+fn rc1_walsh64_mobile_power_dbfs<'a>(symbols: impl IntoIterator<Item = &'a [f32; 64]>) -> f32 {
+    walsh64_mobile_power_dbfs_with_noise_factor(symbols, WALSH64_NOISE_MAX_EXPECTATION)
 }
 
 fn rc3_mobile_power_dbfs(
@@ -208,6 +221,23 @@ fn rc3_mobile_power_dbfs(
     let despread_chip_power = (PILOT_DUTY_CYCLE * pilot_signal_power + traffic_signal_power)
         / (WALSH_LENGTH * WALSH_LENGTH);
     mobile_power_dbfs_from_despread_chip_power(despread_chip_power)
+}
+
+/// Received power of the active RC3 pilot axis, referred back to the ADC.
+///
+/// Excludes R-FCH, unlike `rc3_mobile_power_dbfs`. R-FCH energy moves with rate
+/// and gating, so only the continuous pilot is a stable per-mobile observable.
+fn rc3_pilot_power_dbfs(pilot_norm_sq: f64, pilot_sym_power_sum: f64, pilot_symbols: usize) -> f32 {
+    const WALSH_LENGTH: f64 = 16.0;
+    if pilot_symbols < 2 {
+        return f32::NAN;
+    }
+    let n = pilot_symbols as f64;
+    let pilot_signal_power = (pilot_norm_sq - pilot_sym_power_sum) / (n * (n - 1.0));
+    if pilot_signal_power <= 0.0 {
+        return f32::NAN;
+    }
+    mobile_power_dbfs_from_despread_chip_power(pilot_signal_power / (WALSH_LENGTH * WALSH_LENGTH))
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +349,7 @@ mod tests {
     use std::f64::consts::PI;
     use std::ffi::OsStr;
     use std::path::{Component, Path, PathBuf};
+    use std::sync::Arc;
 
     use env_logger::Env;
     use num_complex::Complex32;
@@ -333,8 +364,8 @@ mod tests {
         ReverseAccessOrthogonalDemodProcessor, ReverseAccessSettings, SampleBlock,
         SoftViterbiDecoderProcessor, SyncChannelProcessor, Unrepeater, WalshDecoderProcessor,
         WalshPilotCombiner, access_channel_chain, build_fft_search_pn_samples,
-        build_oqpsk_pn_samples, hrpd_reverse_access_chain, rc3_mobile_power_dbfs,
-        rx_matched_filter_power_gain_db, walsh64_mobile_power_dbfs,
+        build_oqpsk_pn_samples, hrpd_reverse_access_chain, rc1_walsh64_mobile_power_dbfs,
+        rc3_mobile_power_dbfs, rx_matched_filter_power_gain_db, walsh64_mobile_power_dbfs,
     };
     use crate::lac::crc30;
     use crate::phy::coding::long_code::LongCodeGenerator;
@@ -375,6 +406,22 @@ mod tests {
     }
 
     #[test]
+    fn rc1_walsh_power_rejects_the_expected_largest_noise_bin() {
+        let mut noise_peak = [1.0_f32; 64];
+        noise_peak[17] = 4.75;
+        let mut strong_signal = [1.0_f32; 64];
+        strong_signal[17] = 100.0;
+
+        let legacy_noise = walsh64_mobile_power_dbfs([&noise_peak]);
+        let corrected_noise = rc1_walsh64_mobile_power_dbfs([&noise_peak]);
+        let legacy_signal = walsh64_mobile_power_dbfs([&strong_signal]);
+        let corrected_signal = rc1_walsh64_mobile_power_dbfs([&strong_signal]);
+
+        assert!(corrected_noise < legacy_noise - 20.0);
+        assert!((corrected_signal - legacy_signal).abs() < 0.25);
+    }
+
+    #[test]
     fn rc3_mobile_power_combines_isolated_pilot_and_fch_energy() {
         const PILOT_SYMBOLS: usize = 72;
         const TRAFFIC_SYMBOLS: usize = 96;
@@ -402,7 +449,9 @@ mod tests {
     }
     use crate::receiver::paging::PagingChannelRate;
     use crate::receiver::pipelined::decimator_processor::DecimatorProcessor;
+    use crate::receiver::pipelined::generic_rake_receiver::RakeFinger;
     use crate::receiver::pipelined::mobile_station::PagingRate;
+    use crate::receiver::pipelined::pn_lc_correlator::PnLcFinger;
     use crate::receiver::pipelined::rake_receiver::RakeReceiver;
     use crate::receiver::{access_layer3::AccessMessage, layer3::PagingMessage};
     use crate::sdr::fir::ComplexFir32;
@@ -6969,6 +7018,311 @@ mod tests {
             Some(vec![10]),
             None,
             None,
+        );
+    }
+
+    /// Target baseline: 1,397 valid frames with a longest invalid run of six.
+    /// The test remains ignored until the receiver meets both thresholds.
+    #[test]
+    #[ignore]
+    fn capture_rc1_reverse_traffic_1807279274616745() {
+        const ESN: u32 = 0x8085_7E58;
+        const WALSH_CODE: u8 = 12;
+        const SEED_CHIP_OFFSET: i64 = -18;
+        const PN_CURSOR_RESIDUE_SAMPLES: usize = 2;
+        const INITIAL_CFO_RAD_PER_CHIP: f32 = -0.000_145_070;
+        const DETECTION_SNR: f32 = 225.1;
+
+        init_test_logger();
+        let wav_path = test_capture_path("1807279274616745.wav");
+        let metadata = test_capture_metadata("1807279274616745.json");
+        let reader = hound::WavReader::open(&wav_path)
+            .unwrap_or_else(|e| panic!("failed to open {}: {e}", wav_path.display()));
+        let (sample_rate, iq_samples) = read_iq_wav(reader);
+        let oversample = metadata.sample_rate_hz / metadata.chip_rate_hz;
+        let phase_period = 32_768 * oversample;
+        struct SeededFinger {
+            finger: PnLcFinger,
+            chain: Vec<PipelineProcessorShared>,
+            oversample: usize,
+        }
+
+        impl PipelineProcessor for SeededFinger {
+            fn process_block(&mut self, block: SampleBlock) -> Vec<SampleBlock> {
+                let processed_chips = (block.samples.len() / self.oversample) as u64;
+                let output = self.finger.process(&block, &mut self.chain);
+                self.finger.test_tick_and_validate(&output, processed_chips);
+                output
+            }
+
+            fn flush(&mut self) -> Vec<SampleBlock> {
+                self.finger.flush(&mut self.chain)
+            }
+        }
+
+        // This capture starts mid-call, so seed the finger at its known live
+        // PN/LC state and let the production traffic chain validate it.
+        let pn_reference = Arc::new(
+            build_fft_search_pn_samples(phase_period, oversample)
+                .into_iter()
+                .map(|sample| Complex32::new(sample.re, -sample.im))
+                .collect(),
+        );
+        let tx_chip = (metadata.first_absolute_chip_start as i64 + SEED_CHIP_OFFSET) as usize;
+        let mut long_code = LongCodeGenerator::new_traffic_channel(ESN);
+        long_code.advance_chips(tx_chip);
+        let prompt_phase = (tx_chip * oversample + PN_CURSOR_RESIDUE_SAMPLES) % phase_period;
+        let mut finger = PnLcFinger::new(
+            2,
+            pn_reference,
+            phase_period,
+            oversample,
+            prompt_phase,
+            0,
+            long_code,
+            tx_chip,
+            tx_chip,
+            256,
+            0,
+            DETECTION_SNR,
+            INITIAL_CFO_RAD_PER_CHIP,
+            1,
+            true,
+            true,
+            false,
+            false,
+            0.0,
+            false,
+            false,
+        );
+        finger.set_nonpilot_cfo_tracking(false);
+        let pipeline: Vec<PipelineProcessorShared> = vec![
+            Box::new(PulseMatchedFilterProcessor::new()),
+            Box::new(SeededFinger {
+                finger,
+                chain: super::traffic_channel_chain(ESN, WALSH_CODE, 1),
+                oversample,
+            }),
+        ];
+        let mut receiver = PipelinedReceiver::new(iq_samples.into_iter())
+            .with_batch_size(32_768)
+            .with_input_sample_rate_hz(sample_rate as f64)
+            .with_absolute_sample_start(metadata.first_absolute_sample_start);
+        let output = receiver.add_pipeline(pipeline);
+        receiver.run_pipeline().expect("run seeded RC1 capture");
+
+        let mut frames = 0usize;
+        let mut valid_frames = 0usize;
+        let mut invalid_run = 0usize;
+        let mut max_invalid_run = 0usize;
+        for blocks in output {
+            for block in blocks {
+                if block.tags.get("traffic_phy_frame") != Some(&1)
+                    && block.tags.get("traffic_phy_status") != Some(&1)
+                {
+                    continue;
+                }
+                frames += 1;
+                if block.tags.get("traffic_phy_valid") == Some(&1) {
+                    valid_frames += 1;
+                    invalid_run = 0;
+                } else {
+                    invalid_run += 1;
+                    max_invalid_run = max_invalid_run.max(invalid_run);
+                }
+            }
+        }
+        eprintln!(
+            "RC1 failed-session capture: frames={frames} valid={valid_frames} max_invalid_run={max_invalid_run}"
+        );
+        assert_eq!(frames, 1_587);
+        assert_eq!(valid_frames, 1_397);
+        assert_eq!(max_invalid_run, 6);
+    }
+
+    /// Outcome of one RC1 reverse traffic decode over a capture.
+    #[derive(Debug, Default, Clone)]
+    struct Rc1DecodeStats {
+        frames: usize,
+        valid_frames: usize,
+        max_invalid_run: usize,
+        /// One decoded line per CRC-valid r-dsch signaling message.
+        signaling: Vec<String>,
+        mean_pcg_eb_nt_db: f32,
+    }
+
+    fn collect_rc1_stats(output: std::sync::mpsc::Receiver<Vec<SampleBlock>>) -> Rc1DecodeStats {
+        let mut stats = Rc1DecodeStats::default();
+        let mut invalid_run = 0usize;
+        let mut eb_nt_sum = 0.0f64;
+        let mut eb_nt_count = 0usize;
+        for blocks in output {
+            for block in blocks {
+                if block.tags.get("traffic_pcg_measurement") == Some(&1)
+                    && let Some(eb_nt) = block.pcg_signal_snr_db.as_ref().and_then(|v| v.first())
+                    && eb_nt.is_finite()
+                {
+                    eb_nt_sum += *eb_nt as f64;
+                    eb_nt_count += 1;
+                }
+                if block.tags.get("traffic_event") == Some(&1)
+                    && block.tags.get("traffic_crc_valid") == Some(&1)
+                {
+                    let bits: Vec<u8> = block.samples.iter().map(|s| (s.re > 0.5) as u8).collect();
+                    let bs = cdma_common::bits::Bitstream::new_init(&bits);
+                    stats.signaling.push(
+                        match crate::receiver::access_layer3::RdschPdu::decode(&bs) {
+                            Ok(pdu) => pdu.summary(),
+                            Err(e) => format!("decode_error={e}"),
+                        },
+                    );
+                }
+                if block.tags.get("traffic_phy_frame") != Some(&1)
+                    && block.tags.get("traffic_phy_status") != Some(&1)
+                {
+                    continue;
+                }
+                stats.frames += 1;
+                if block.tags.get("traffic_phy_valid") == Some(&1) {
+                    stats.valid_frames += 1;
+                    invalid_run = 0;
+                } else {
+                    invalid_run += 1;
+                    stats.max_invalid_run = stats.max_invalid_run.max(invalid_run);
+                }
+            }
+        }
+        stats.mean_pcg_eb_nt_db = if eb_nt_count > 0 {
+            (eb_nt_sum / eb_nt_count as f64) as f32
+        } else {
+            f32::NAN
+        };
+        stats
+    }
+
+    /// The path moves two chips at t=5.7 s, past what an early/late gate sees.
+    /// Both halves share one finger, so only the tracking loop differs.
+    #[test]
+    fn capture_rc1_reverse_traffic_delay_tracking() {
+        const ESN: u32 = 0x8085_7E58;
+        const WALSH_CODE: u8 = 10;
+
+        init_test_logger();
+        let wav_path = test_capture_path("1807524592937218.wav");
+        if !wav_path.exists() {
+            eprintln!(
+                "skipping RC1 delay tracking capture: {} not found",
+                wav_path.display()
+            );
+            return;
+        }
+        let metadata = test_capture_metadata("1807524592937218.json");
+        let reader = hound::WavReader::open(&wav_path)
+            .unwrap_or_else(|e| panic!("failed to open {}: {e}", wav_path.display()));
+        let (sample_rate, iq_samples) = read_iq_wav(reader);
+
+        let run = |delay_tracking: bool, samples: Vec<Complex32>| {
+            let correlator = super::pn_lc_correlator::PnLcCorrelator::new(
+                super::pn_lc_correlator::PnLcConfig::default_4x()
+                    // Open only the acquisition gates: the capture begins
+                    // part-way through a call, where the production preamble
+                    // thresholds never fire.
+                    .with_snr_threshold(3.0)
+                    .with_preamble_coh_norm_min(0.0)
+                    .with_preamble_hits_required(1)
+                    .with_lc_half_span(4)
+                    .with_search_interval_windows(32)
+                    .with_split_pn_reference(true)
+                    .with_reanchor_origin(true)
+                    // One finger carries the call, so what is measured is the
+                    // tracking loop and not re-acquisition.
+                    .with_suppress_search_when_locked(true)
+                    .with_retained_search_suppression(true)
+                    .with_epl_tracking(false)
+                    .with_epl_slew(false)
+                    .with_delay_tracking(delay_tracking)
+                    .with_nonpilot_cfo_tracking(true),
+                LongCodeGenerator::new_traffic_channel(ESN),
+                Box::new(move || super::traffic_channel_chain(ESN, WALSH_CODE, 1)),
+            );
+            let pipeline: Vec<PipelineProcessorShared> = vec![
+                Box::new(PulseMatchedFilterProcessor::new()),
+                Box::new(
+                    super::generic_rake_receiver::GenericRakeReceiver::new(correlator)
+                        .with_finger_pool_size(1),
+                ),
+            ];
+            let mut receiver = PipelinedReceiver::new(samples.into_iter())
+                .with_batch_size(32_768)
+                .with_input_sample_rate_hz(sample_rate as f64)
+                .with_absolute_sample_start(metadata.first_absolute_sample_start);
+            let output = receiver.add_pipeline(pipeline);
+            receiver
+                .run_pipeline()
+                .expect("run RC1 delay tracking capture");
+            collect_rc1_stats(output)
+        };
+
+        let tracked = run(true, iq_samples.clone());
+        let untracked = run(false, iq_samples);
+
+        for (label, stats) in [("tracking on", &tracked), ("tracking off", &untracked)] {
+            eprintln!(
+                "{label:>12}: frames={} valid={} max_invalid_run={} signaling={} eb_nt={:.2}dB",
+                stats.frames,
+                stats.valid_frames,
+                stats.max_invalid_run,
+                stats.signaling.len(),
+                stats.mean_pcg_eb_nt_db,
+            );
+            for message in &stats.signaling {
+                eprintln!("              {message}");
+            }
+        }
+
+        // The mobile sends a Power Measurement Report every 2.42 s. Following
+        // the delay recovers the whole sequence from one finger. Standing still
+        // loses most of the reports sent after the handover.
+        assert_eq!(
+            tracked.signaling.len(),
+            6,
+            "expected the full PMRM sequence with delay tracking"
+        );
+        assert!(
+            untracked.signaling.len() <= 4,
+            "delay tracking should recover signaling the off-peak finger loses, \
+             but untracked already decoded {}",
+            untracked.signaling.len(),
+        );
+
+        // Frame validity and per-PCG Eb/Nt both collapse when the finger is
+        // left two chips off the peak for the rest of the call.
+        assert!(
+            tracked.valid_frames >= 700,
+            "only {} of {} frames valid with delay tracking",
+            tracked.valid_frames,
+            tracked.frames,
+        );
+        assert!(
+            untracked.valid_frames <= 560,
+            "untracked run decoded {} frames; the off-peak finger should lose many",
+            untracked.valid_frames,
+        );
+        assert!(
+            tracked.max_invalid_run <= 3,
+            "longest run of invalid frames with tracking was {}",
+            tracked.max_invalid_run,
+        );
+        assert!(
+            tracked.mean_pcg_eb_nt_db >= 9.5,
+            "mean per-PCG Eb/Nt with tracking was {:.2} dB",
+            tracked.mean_pcg_eb_nt_db,
+        );
+        assert!(
+            tracked.mean_pcg_eb_nt_db - untracked.mean_pcg_eb_nt_db >= 3.0,
+            "expected tracking to recover several dB of Eb/Nt, got {:.2} against {:.2}",
+            tracked.mean_pcg_eb_nt_db,
+            untracked.mean_pcg_eb_nt_db,
         );
     }
 

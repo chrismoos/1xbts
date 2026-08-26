@@ -704,7 +704,7 @@ impl Rc1TrafficFrameAligner {
                 Self::demodulate_symbol_with_energies(&self.chip_buf[start..end]).1
             })
             .collect::<Vec<_>>();
-        Some(super::walsh64_mobile_power_dbfs(energies.iter()))
+        Some(super::rc1_walsh64_mobile_power_dbfs(energies.iter()))
     }
 
     fn pcg_snr_db_for_frame(&self, chip_phase: usize) -> Option<Vec<f32>> {

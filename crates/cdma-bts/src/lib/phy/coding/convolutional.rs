@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 /// Inline Hamming distance for small fixed-size arrays (N=2,3,4).
 #[inline(always)]
 fn branch_hamming<const N: usize>(a: &[u8; N], b: &[u8; N]) -> u32 {
@@ -459,8 +461,11 @@ pub struct SoftViterbiDecoder<const K: usize, const N: usize> {
     path_metrics: Vec<f64>,
     next_metrics: Vec<f64>,
     branch_next: Vec<[u16; 2]>,
-    /// Expected parity bits for each (state, input_bit) as floats (0.0 or 1.0).
-    branch_out: Vec<[[f32; N]; 2]>,
+    /// Branch-metric table index. All states share only `1 << N` expected
+    /// tuples between them.
+    branch_pattern: Vec<[u8; 2]>,
+    /// Squared error per expected tuple for the current symbol.
+    pattern_metrics: Vec<f64>,
     tb: TrellisTraceback,
 }
 
@@ -474,28 +479,31 @@ impl<const K: usize, const N: usize> SoftViterbiDecoder<K, N> {
         path_metrics[0] = 0.0;
 
         let mut branch_next = vec![[0u16; 2]; num_states];
-        let mut branch_out = vec![[[0.0f32; N]; 2]; num_states];
+        let mut branch_pattern = vec![[0u8; 2]; num_states];
 
         for state in 0..num_states {
             for input_bit in 0..=1u8 {
                 let window = (state as u32) | ((input_bit as u32) << (K - 1));
                 let hard = encode_from_window(window, &encoder.generators);
-                let mut soft = [0.0f32; N];
+                let mut pattern = 0usize;
                 for i in 0..N {
-                    soft[i] = hard[i] as f32;
+                    pattern |= ((hard[i] & 1) as usize) << i;
                 }
-                branch_out[state][input_bit as usize] = soft;
+                branch_pattern[state][input_bit as usize] = pattern as u8;
                 let next_state = ((state >> 1) | ((input_bit as usize) << (K - 2))) as u16;
                 branch_next[state][input_bit as usize] = next_state;
             }
         }
+
+        assert!(N <= 8, "the branch-metric table indexes patterns in a u8");
 
         SoftViterbiDecoder {
             num_states,
             path_metrics,
             next_metrics: vec![Self::INF_METRIC; num_states],
             branch_next,
-            branch_out,
+            branch_pattern,
+            pattern_metrics: vec![0.0; 1usize << N],
             tb: TrellisTraceback::new(num_states, 5 * K),
         }
     }
@@ -527,6 +535,7 @@ impl<const K: usize, const N: usize> SoftViterbiDecoder<K, N> {
         self.tb.prepare_block(inputs.len());
 
         for input in inputs {
+            self.fill_pattern_metrics(input);
             self.next_metrics.fill(Self::INF_METRIC);
             self.tb.scratch_prev_state.fill(0);
             self.tb.scratch_bit.fill(0);
@@ -539,7 +548,8 @@ impl<const K: usize, const N: usize> SoftViterbiDecoder<K, N> {
 
                 for input_bit in 0..=1usize {
                     let next_state = self.branch_next[prev_state][input_bit] as usize;
-                    let bm = Self::branch_metric(&self.branch_out[prev_state][input_bit], input);
+                    let bm =
+                        self.pattern_metrics[self.branch_pattern[prev_state][input_bit] as usize];
                     let cand = prev_metric + bm;
                     if cand < self.next_metrics[next_state] {
                         self.next_metrics[next_state] = cand;
@@ -562,20 +572,24 @@ impl<const K: usize, const N: usize> SoftViterbiDecoder<K, N> {
         self.best_state()
     }
 
-    /// Squared Euclidean distance branch metric: Σ(expected_i - received_i)²
+    /// Bit `i` of a pattern index is the expected value of parity `i`.
     #[inline]
-    fn branch_metric(expected: &[f32; N], received: &[f32; N]) -> f64 {
-        let mut sum = 0.0f64;
-        for i in 0..N {
-            let d = (expected[i] - received[i]) as f64;
-            sum += d * d;
+    fn fill_pattern_metrics(&mut self, received: &[f32; N]) {
+        for (pattern, metric) in self.pattern_metrics.iter_mut().enumerate() {
+            let mut sum = 0.0f64;
+            for (i, received_i) in received.iter().enumerate() {
+                let expected = ((pattern >> i) & 1) as f32;
+                let d = (expected - *received_i) as f64;
+                sum += d * d;
+            }
+            *metric = sum;
         }
-        sum
     }
 
     /// Process one symbol of N soft values (each in ~0.0..1.0 range).
     /// Returns a decoded bit once traceback depth is reached.
     pub fn process(&mut self, input: &[f32; N]) -> Option<u8> {
+        self.fill_pattern_metrics(input);
         self.next_metrics.fill(Self::INF_METRIC);
         self.tb.scratch_prev_state.fill(0);
         self.tb.scratch_bit.fill(0);
@@ -588,7 +602,7 @@ impl<const K: usize, const N: usize> SoftViterbiDecoder<K, N> {
 
             for input_bit in 0..=1usize {
                 let next_state = self.branch_next[prev_state][input_bit] as usize;
-                let bm = Self::branch_metric(&self.branch_out[prev_state][input_bit], input);
+                let bm = self.pattern_metrics[self.branch_pattern[prev_state][input_bit] as usize];
                 let cand = prev_metric + bm;
                 if cand < self.next_metrics[next_state] {
                     self.next_metrics[next_state] = cand;
@@ -616,6 +630,42 @@ impl<const K: usize, const N: usize> SoftViterbiDecoder<K, N> {
 
 pub fn get_1_3_k9_soft_viterbi_decoder() -> SoftViterbiDecoder<9, 3> {
     SoftViterbiDecoder::new(get_1_3_k9_encoder())
+}
+
+pub fn get_1_2_k9_soft_viterbi_decoder() -> SoftViterbiDecoder<9, 2> {
+    SoftViterbiDecoder::new(get_1_2_k9_encoder())
+}
+
+thread_local! {
+    static R12_K9_SOFT_DECODER: RefCell<SoftViterbiDecoder<9, 2>> =
+        RefCell::new(get_1_2_k9_soft_viterbi_decoder());
+    static R13_K9_SOFT_DECODER: RefCell<SoftViterbiDecoder<9, 3>> =
+        RefCell::new(get_1_3_k9_soft_viterbi_decoder());
+    static R14_K9_SOFT_DECODER: RefCell<SoftViterbiDecoder<9, 4>> =
+        RefCell::new(get_1_4_k9_soft_viterbi_decoder());
+}
+
+/// Rate-1/2 K=9 counterpart of [`with_1_3_k9_soft_viterbi_decoder`].
+pub fn with_1_2_k9_soft_viterbi_decoder<R>(
+    f: impl FnOnce(&mut SoftViterbiDecoder<9, 2>) -> R,
+) -> R {
+    R12_K9_SOFT_DECODER.with(|decoder| f(&mut decoder.borrow_mut()))
+}
+
+/// Rate-1/4 K=9 counterpart of [`with_1_3_k9_soft_viterbi_decoder`].
+pub fn with_1_4_k9_soft_viterbi_decoder<R>(
+    f: impl FnOnce(&mut SoftViterbiDecoder<9, 4>) -> R,
+) -> R {
+    R14_K9_SOFT_DECODER.with(|decoder| f(&mut decoder.borrow_mut()))
+}
+
+/// Reusable rate-1/3 K=9 soft decoder, since building one fills a 256-state
+/// trellis. `decode_block_from_state` clears the trellis on entry, so nothing
+/// carries between borrows. `f` must not borrow the decoder again.
+pub fn with_1_3_k9_soft_viterbi_decoder<R>(
+    f: impl FnOnce(&mut SoftViterbiDecoder<9, 3>) -> R,
+) -> R {
+    R13_K9_SOFT_DECODER.with(|decoder| f(&mut decoder.borrow_mut()))
 }
 
 #[cfg(test)]

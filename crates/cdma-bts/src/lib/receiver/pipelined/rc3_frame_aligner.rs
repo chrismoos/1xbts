@@ -8,7 +8,7 @@ use num_complex::Complex32;
 
 use super::{PipelineProcessor, SampleBlock, raw_to_soft};
 use crate::phy::coding::block_interleaver::{BitReversalInterleaver, SR1_PARAMS_1536};
-use crate::phy::coding::convolutional::get_1_4_k9_soft_viterbi_decoder;
+use crate::phy::coding::convolutional::with_1_4_k9_soft_viterbi_decoder;
 use crate::receiver::pipelined::traffic_channel_processor::parse_reverse_mux1_full_rate_format;
 use cdma_common::consts::SR1_PCGS_PER_FRAME;
 
@@ -488,7 +488,6 @@ impl Rc3FrameAligner {
     fn decode_soft_bits(collapsed: &[f32]) -> (Vec<u8>, u8) {
         let peak = collapsed.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
         let inv_peak = if peak > 1e-12 { 1.0 / peak } else { 1.0 };
-        let mut viterbi = get_1_4_k9_soft_viterbi_decoder();
         let inputs: Vec<[f32; 4]> = collapsed
             .chunks_exact(4)
             .map(|chunk| {
@@ -500,8 +499,10 @@ impl Rc3FrameAligner {
                 ]
             })
             .collect();
-        let bits = viterbi.decode_block_from_state(&inputs, 0);
-        let ml_best_state = viterbi.ml_best_terminal_state() as u8;
+        let (bits, ml_best_state) = with_1_4_k9_soft_viterbi_decoder(|viterbi| {
+            let bits = viterbi.decode_block_from_state(&inputs, 0);
+            (bits, viterbi.ml_best_terminal_state() as u8)
+        });
         (bits, ml_best_state)
     }
 
@@ -510,6 +511,22 @@ impl Rc3FrameAligner {
         // would need a 384-symbol interleaver (not yet implemented).
         let interleaver = BitReversalInterleaver::new(SR1_PARAMS_1536);
         interleaver.decode_soft(soft)
+    }
+
+    /// Erase symbols from PCGs an RC3 gated eighth-rate frame never carries.
+    /// Must run before deinterleaving, which scatters each PCG across the
+    /// symbol stream.
+    fn erase_gated_eighth_off_pcgs(soft: &[f32]) -> Vec<f32> {
+        let mut erased = soft.to_vec();
+        for (pcg, active) in EIGHTH_RATE_GATED_PCGS.iter().copied().enumerate() {
+            if !active {
+                let start = pcg * SYMBOLS_PER_PCG;
+                let end = (start + SYMBOLS_PER_PCG).min(erased.len());
+                let start = start.min(erased.len());
+                erased[start..end].fill(0.0);
+            }
+        }
+        erased
     }
 
     fn decode_frame_from_deinterleaved(
@@ -600,6 +617,7 @@ impl Rc3FrameAligner {
     fn decode_with_rate_priority(
         &self,
         deinterleaved: &[f32],
+        gated_eighth_deinterleaved: Option<&[f32]>,
         locked_rate: Option<Rc3TrafficRate>,
     ) -> DecodedFrame {
         let priority = Self::build_rate_priority(locked_rate);
@@ -607,7 +625,12 @@ impl Rc3FrameAligner {
         let mut first_decoded: Option<DecodedFrame> = None;
         let mut best_tail_valid: Option<DecodedFrame> = None;
         for rate in priority {
-            let decoded = Self::decode_frame_from_deinterleaved(deinterleaved, rate);
+            let rate_soft = if rate == Rc3TrafficRate::Eighth {
+                gated_eighth_deinterleaved.unwrap_or(deinterleaved)
+            } else {
+                deinterleaved
+            };
+            let decoded = Self::decode_frame_from_deinterleaved(rate_soft, rate);
             if first_decoded.is_none() {
                 first_decoded = Some(decoded.clone());
             }
@@ -723,59 +746,67 @@ impl Rc3FrameAligner {
                 (axis, Self::project_symbols(&raw_symbols, axis))
             };
             let estimated_deinterleaved = Self::deinterleave_frame_soft(&estimated_soft);
+            let estimated_gated_eighth_deinterleaved = self.rev_fch_gating_mode.then(|| {
+                Self::deinterleave_frame_soft(&Self::erase_gated_eighth_off_pcgs(&estimated_soft))
+            });
             let (pcg_soft, pcg_axis_phase) = if self.pilot_coherent {
                 (raw_symbols.iter().map(|s| s.re).collect::<Vec<f32>>(), 0.0)
             } else {
                 Self::project_symbols_per_pcg(&raw_symbols, prev_axis_phase)
             };
             let pcg_deinterleaved = Self::deinterleave_frame_soft(&pcg_soft);
+            let pcg_gated_eighth_deinterleaved = self.rev_fch_gating_mode.then(|| {
+                Self::deinterleave_frame_soft(&Self::erase_gated_eighth_off_pcgs(&pcg_soft))
+            });
 
             // RC3 frame decode is intentionally simple: estimate one whole-frame
             // axis first, always trying full rate before any locked/subrate
             // hypothesis so reverse signaling cannot be starved by an earlier
             // low-rate PHY-valid decode. If that misses CRC, retry using the
             // per-PCG adaptive axis with the same rate order.
-            let estimated_decoded =
-                self.decode_with_rate_priority(&estimated_deinterleaved, self.locked_rate);
-            let pcg_decoded = (!estimated_decoded.validation.phy_valid)
-                .then(|| self.decode_with_rate_priority(&pcg_deinterleaved, self.locked_rate));
+            let estimated_decoded = self.decode_with_rate_priority(
+                &estimated_deinterleaved,
+                estimated_gated_eighth_deinterleaved.as_deref(),
+                self.locked_rate,
+            );
+            let pcg_decoded = (!estimated_decoded.validation.phy_valid).then(|| {
+                self.decode_with_rate_priority(
+                    &pcg_deinterleaved,
+                    pcg_gated_eighth_deinterleaved.as_deref(),
+                    self.locked_rate,
+                )
+            });
             let pcg_phy_valid = pcg_decoded
                 .as_ref()
                 .is_some_and(|decoded| decoded.validation.phy_valid);
-            let (decoded, selected_deinterleaved, recovered_axis_phase, selected_source) =
+            let (decoded, recovered_axis_phase, selected_source) =
                 if estimated_decoded.validation.phy_valid {
-                    (
-                        estimated_decoded,
-                        &estimated_deinterleaved,
-                        estimated_axis_phase,
-                        "whole",
-                    )
+                    (estimated_decoded, estimated_axis_phase, "whole")
                 } else if pcg_phy_valid {
                     (
                         pcg_decoded
                             .clone()
                             .expect("pcg decode should exist when phy_valid is true"),
-                        &pcg_deinterleaved,
                         pcg_axis_phase,
                         "pcg",
                     )
                 } else if estimated_decoded.validation.tail_valid {
-                    (
-                        estimated_decoded,
-                        &estimated_deinterleaved,
-                        estimated_axis_phase,
-                        "whole",
-                    )
+                    (estimated_decoded, estimated_axis_phase, "whole")
                 } else if let Some(decoded) = pcg_decoded {
-                    (decoded, &pcg_deinterleaved, pcg_axis_phase, "pcg")
+                    (decoded, pcg_axis_phase, "pcg")
                 } else {
-                    (
-                        estimated_decoded,
-                        &estimated_deinterleaved,
-                        estimated_axis_phase,
-                        "whole",
-                    )
+                    (estimated_decoded, estimated_axis_phase, "whole")
                 };
+            let selected_deinterleaved = match (selected_source, decoded.rate) {
+                ("whole", Rc3TrafficRate::Eighth) => estimated_gated_eighth_deinterleaved
+                    .as_deref()
+                    .unwrap_or(&estimated_deinterleaved),
+                ("pcg", Rc3TrafficRate::Eighth) => pcg_gated_eighth_deinterleaved
+                    .as_deref()
+                    .unwrap_or(&pcg_deinterleaved),
+                ("pcg", _) => &pcg_deinterleaved,
+                _ => &estimated_deinterleaved,
+            };
             // Decode the frame. Unlike the old searcher we never "lose
             // lock" — we always trust the 20ms boundary derived from
             // system time. If a frame fails CRC at every rate, we emit
@@ -997,7 +1028,8 @@ impl PipelineProcessor for Rc3FrameAligner {
 #[cfg(test)]
 mod tests {
     use super::{
-        DecodedFrame, FRAME_SYMBOLS_20MS, FrameValidation, Rc3FrameAligner, Rc3TrafficRate,
+        DecodedFrame, EIGHTH_RATE_GATED_PCGS, FRAME_SYMBOLS_20MS, FrameValidation, Rc3FrameAligner,
+        Rc3TrafficRate, SYMBOLS_PER_PCG,
     };
     use cdma_common::crc::{crc6, crc8, crc12};
 
@@ -1306,6 +1338,92 @@ mod tests {
             .into_iter()
             .map(|bit| if bit == 0 { 1.0 } else { -1.0 })
             .collect()
+    }
+
+    fn encode_eighth_rate_frame(info_bits: &[u8]) -> (Vec<u8>, Vec<f32>) {
+        use crate::phy::coding::block_interleaver::{BitReversalInterleaver, SR1_PARAMS_1536};
+        use crate::phy::coding::convolutional::get_1_4_k9_encoder;
+
+        let rate = Rc3TrafficRate::Eighth;
+        let mut frame = valid_rate_frame(rate);
+        for (dst, src) in frame[..rate.info_bits()]
+            .iter_mut()
+            .zip(info_bits.iter().copied())
+        {
+            *dst = src;
+        }
+        let crc = crc6(&frame[..rate.info_bits()]);
+        for bit_idx in 0..rate.fqi_bits() {
+            frame[rate.info_bits() + bit_idx] =
+                ((crc >> (rate.fqi_bits() - 1 - bit_idx)) & 1) as u8;
+        }
+
+        let mut encoder = get_1_4_k9_encoder();
+        let mut code_symbols = Vec::with_capacity(frame.len() * 4);
+        for &bit in &frame {
+            code_symbols.extend_from_slice(&encoder.encode(bit));
+        }
+        let repeated: Vec<u8> = code_symbols
+            .iter()
+            .flat_map(|&symbol| std::iter::repeat_n(symbol, rate.repetition_factor()))
+            .collect();
+        let punctured: Vec<u8> = (0..FRAME_SYMBOLS_20MS)
+            .map(|k| repeated[(k * repeated.len()) / FRAME_SYMBOLS_20MS])
+            .collect();
+        let mut interleaver = BitReversalInterleaver::new(SR1_PARAMS_1536);
+        let interleaved = interleaver
+            .encode(&punctured)
+            .into_iter()
+            .map(|bit| if bit == 0 { 1.0 } else { -1.0 })
+            .collect();
+        (frame, interleaved)
+    }
+
+    #[test]
+    fn gated_eighth_rate_erases_off_pcg_noise_before_decode() {
+        let info: Vec<u8> = (0..16).map(|idx| ((idx * 7 + 3) & 1) as u8).collect();
+        let (expected_frame, encoded) = encode_eighth_rate_frame(&info);
+        let mut received = encoded
+            .iter()
+            .map(|symbol| symbol * 8.0)
+            .collect::<Vec<_>>();
+
+        // Off PCGs contain no mobile waveform. Use strong deterministic
+        // interference there to ensure treating it as evidence corrupts the
+        // convolutional-code combines.
+        for (pcg, active) in EIGHTH_RATE_GATED_PCGS.iter().copied().enumerate() {
+            if !active {
+                let start = pcg * SYMBOLS_PER_PCG;
+                let end = start + SYMBOLS_PER_PCG;
+                for (idx, soft) in received[start..end].iter_mut().enumerate() {
+                    *soft = if (idx * 13 + pcg) & 1 == 0 {
+                        60.0
+                    } else {
+                        -60.0
+                    };
+                }
+            }
+        }
+
+        let untreated = Rc3FrameAligner::decode_frame_from_deinterleaved(
+            &Rc3FrameAligner::deinterleave_frame_soft(&received),
+            Rc3TrafficRate::Eighth,
+        );
+        let erased = Rc3FrameAligner::erase_gated_eighth_off_pcgs(&received);
+        let corrected = Rc3FrameAligner::decode_frame_from_deinterleaved(
+            &Rc3FrameAligner::deinterleave_frame_soft(&erased),
+            Rc3TrafficRate::Eighth,
+        );
+
+        assert!(
+            !untreated.validation.phy_valid,
+            "strong off-PCG interference should demonstrate the old failure mode"
+        );
+        assert!(corrected.validation.phy_valid);
+        assert_eq!(
+            &corrected.bits[..Rc3TrafficRate::Eighth.frame_bits()],
+            expected_frame.as_slice()
+        );
     }
 
     /// Simulate post-Walsh(16) symbols at a given chip-level SNR.

@@ -38,18 +38,18 @@ use crate::receiver::{
     access_pdu::ReverseAccessPdu,
     hrpd::access::{AccessFrameLayout, HrpdAccessSignalingMessage, parse_access_mac_capsule},
     pipelined::{
-        HrpdReverseAccessSettings, PipelineEmitter, PipelineProcessorShared, ReverseAccessSettings,
-        SampleBlock, VecEmitter, flush_sub_chain, hrpd_reverse_access_chain, reverse_access_chain,
-        run_sub_chain,
+        HrpdReverseAccessSettings, PULSE_MATCHED_FILTERED_TAG, PipelineEmitter,
+        PipelineProcessorShared, ReverseAccessSettings, SampleBlock, VecEmitter, flush_sub_chain,
+        hrpd_reverse_access_chain, reverse_access_chain, run_sub_chain,
     },
 };
-use crate::sdr::{PhasorNco, fir::SymmetricComplexFir32};
+use crate::sdr::{PhasorNco, cdma2000_baseband_filter_taps_f64, fir::SymmetricComplexFir32};
 
 use super::{
     AccessChannelEvent, BtsCommand, BtsPowerControlRegistry, IqCaptureControlResult,
     IqCaptureStatus, RxSettings,
     handle::{RxMetrics, RxQueueMetrics, StageMetrics, TrafficChannelPool},
-    power_control::PCG_PREDICTION_LEAD_PCGS,
+    power_control::DIRECT_CONTROL_MIN_LEAD_PCGS,
     settings,
 };
 
@@ -66,6 +66,7 @@ mod rx_events;
 static ACCESS_EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
 static REVERSE_BEARER_SEQ: AtomicU64 = AtomicU64::new(1);
 const RX_QUEUE_WARN_THRESHOLD_US: u64 = 20_000;
+const RELEASE_ORDER_CODE: u8 = 0b010101;
 fn next_access_event_id() -> String {
     format!(
         "access-{:016x}",
@@ -442,6 +443,7 @@ struct HrpdTrafficRxThread {
 
 const PCG_CHIPS: usize = 1536;
 const HRPD_SLOT_CHIPS: usize = 2048;
+const RX_TARGET_BATCH_MAX_CHIPS: usize = HRPD_SLOT_CHIPS;
 const HRPD_TRAFFIC_MAX_INTERPOLATED_GAP_SLOTS: usize = 8;
 #[allow(dead_code)]
 const HRPD_TRAFFIC_FRAME_CHIPS: usize = HRPD_SLOT_CHIPS * 16;
@@ -458,16 +460,11 @@ fn effective_rx_target_batch_samples(
     sample_rate_hz: usize,
     chip_rate_hz: usize,
     batch_pcgs: usize,
-    hrpd_enabled: bool,
 ) -> usize {
     let configured = rx_target_batch_samples(sample_rate_hz, chip_rate_hz, batch_pcgs);
-    if !hrpd_enabled {
-        return configured;
-    }
-
     let oversample = (sample_rate_hz / chip_rate_hz.max(1)).max(1);
-    let hrpd_slot_samples = oversample.saturating_mul(HRPD_SLOT_CHIPS);
-    configured.min(hrpd_slot_samples.max(1))
+    let max_batch_samples = oversample.saturating_mul(RX_TARGET_BATCH_MAX_CHIPS);
+    configured.min(max_batch_samples.max(1))
 }
 
 fn scaled_rx_sample_delay(rx_sample_delay: i64, rx_oversample: usize) -> i64 {
@@ -536,6 +533,9 @@ fn spawn_traffic_rx_thread(
                 traffic_channels,
                 power_control,
                 chip_rate_hz,
+                assigned_rev_rc >= 3,
+                assigned_rev_rc <= 1,
+                rev_fch_gating_mode,
                 continuity_configured,
                 thread_shutdown_clone,
                 traffic_ack_seq_tx,
@@ -1208,6 +1208,11 @@ pub(super) struct RxRuntime {
     config: RxSettings,
     processors: Vec<PipelineProcessorShared>,
     one_x_rx_slice: Option<RxCarrierSlice>,
+    /// The 1x baseband matched filter, applied once per block ahead of the
+    /// access pipeline and the traffic broadcast. Every reverse chain on this
+    /// carrier opens with the same filter, so filtering here keeps the cost at
+    /// one pass instead of one per active traffic channel.
+    one_x_matched_filter: SymmetricComplexFir32,
     hrpd_processors: Option<Vec<PipelineProcessorShared>>,
     hrpd_rx_slice: Option<RxCarrierSlice>,
     hrpd_access_thread: Option<HrpdAccessRxThread>,
@@ -1779,6 +1784,7 @@ pub(super) fn open_rx_runtime(rx: RxSettings) -> Result<RxRuntime, Error> {
         stage_timings,
         processors,
         one_x_rx_slice,
+        one_x_matched_filter: SymmetricComplexFir32::new(&cdma2000_baseband_filter_taps_f64()),
         hrpd_processors,
         hrpd_rx_slice,
         hrpd_access_thread: None,
@@ -2060,7 +2066,6 @@ pub(super) fn run_rx_loop(
         runtime.config.sample_rate_hz,
         runtime.config.chip_rate_hz,
         runtime.config.rx_batch_pcgs,
-        hrpd_enabled,
     );
     let target_batch_ms =
         target_batch_samples as f64 * 1000.0 / runtime.config.sample_rate_hz.max(1) as f64;
@@ -2503,6 +2508,11 @@ fn process_rx_message(
         runtime.hrpd_traffic_threads.clear();
     }
 
+    let mut one_x_block = one_x_block;
+    if let Some(block) = one_x_block.as_mut() {
+        block.samples = runtime.one_x_matched_filter.process_block(&block.samples);
+    }
+
     // Clone samples for traffic RX threads if any are active or pending.
     let has_traffic = one_x_block.is_some()
         && (!traffic_threads.is_empty()
@@ -2539,6 +2549,7 @@ fn process_rx_message(
             "absolute_sample_start",
             one_x_block.absolute_sample_start as i64,
         );
+        block.tags.insert(PULSE_MATCHED_FILTERED_TAG, 1);
         let mut access_emitter = VecEmitter::new();
         let mut outputs = run_sub_chain_timed(
             &mut runtime.processors,
@@ -3041,19 +3052,303 @@ fn run_sub_chain_timed(
     blocks
 }
 
+const RC3_POWER_BUCKET_DURATIONS: [(u64, &str); 4] =
+    [(80, "100ms"), (800, "1s"), (1_600, "2s"), (3_200, "4s")];
+const RC3_GATING_PHASE_EMA_ALPHA: f32 = 0.5;
+const RC3_GATING_MIN_SAMPLES_PER_PHASE: u8 = 4;
+const RC3_GATING_ENTER_GAP_DB: f32 = 10.0;
+const RC3_GATING_EXIT_GAP_DB: f32 = 4.0;
+const RC3_GATING_ENTER_CYCLES: u8 = 2;
+const RC3_GATING_EXIT_CYCLES: u8 = 4;
+
+#[derive(Debug)]
+struct Rc3PilotAvailability {
+    configured_gated: bool,
+    observed_gated: bool,
+    phase_ema_db: [f32; 4],
+    phase_samples: [u8; 4],
+    enter_cycles: u8,
+    exit_cycles: u8,
+}
+
+impl Rc3PilotAvailability {
+    fn new(configured_gated: bool) -> Self {
+        Self {
+            configured_gated,
+            observed_gated: configured_gated,
+            phase_ema_db: [0.0; 4],
+            phase_samples: [0; 4],
+            enter_cycles: 0,
+            exit_cycles: 0,
+        }
+    }
+
+    fn pilot_is_gated(&self) -> bool {
+        self.configured_gated || self.observed_gated
+    }
+
+    fn observe(&mut self, walsh_code: u8, abs_pcg: u64, pilot_sinr_db: Option<f32>) -> bool {
+        let phase = (abs_pcg % 4) as usize;
+        if !self.configured_gated
+            && let Some(metric_db) = pilot_sinr_db.filter(|metric| metric.is_finite())
+        {
+            let samples = self.phase_samples[phase];
+            self.phase_ema_db[phase] = if samples == 0 {
+                metric_db
+            } else {
+                RC3_GATING_PHASE_EMA_ALPHA * metric_db
+                    + (1.0 - RC3_GATING_PHASE_EMA_ALPHA) * self.phase_ema_db[phase]
+            };
+            self.phase_samples[phase] = samples.saturating_add(1);
+
+            if phase == 3
+                && self
+                    .phase_samples
+                    .iter()
+                    .all(|count| *count >= RC3_GATING_MIN_SAMPLES_PER_PHASE)
+            {
+                let off_mean_db = (self.phase_ema_db[0] + self.phase_ema_db[1]) * 0.5;
+                let on_mean_db = (self.phase_ema_db[2] + self.phase_ema_db[3]) * 0.5;
+                let phase_gap_db = on_mean_db - off_mean_db;
+                if !self.observed_gated {
+                    self.enter_cycles = if phase_gap_db >= RC3_GATING_ENTER_GAP_DB {
+                        self.enter_cycles.saturating_add(1)
+                    } else {
+                        0
+                    };
+                    if self.enter_cycles >= RC3_GATING_ENTER_CYCLES {
+                        self.observed_gated = true;
+                        self.enter_cycles = 0;
+                        self.exit_cycles = 0;
+                        info!(
+                            "rc3_pilot_availability[w{}]: configured_gated=0 observed_gated=1 phase_gap_db={:.2} off_phase_mean_db={:.2} on_phase_mean_db={:.2}",
+                            walsh_code, phase_gap_db, off_mean_db, on_mean_db,
+                        );
+                    }
+                } else {
+                    self.exit_cycles = if phase_gap_db <= RC3_GATING_EXIT_GAP_DB {
+                        self.exit_cycles.saturating_add(1)
+                    } else {
+                        0
+                    };
+                    if self.exit_cycles >= RC3_GATING_EXIT_CYCLES {
+                        self.observed_gated = false;
+                        self.enter_cycles = 0;
+                        self.exit_cycles = 0;
+                        info!(
+                            "rc3_pilot_availability[w{}]: configured_gated=0 observed_gated=0 phase_gap_db={:.2} off_phase_mean_db={:.2} on_phase_mean_db={:.2}",
+                            walsh_code, phase_gap_db, off_mean_db, on_mean_db,
+                        );
+                    }
+                }
+            }
+        }
+
+        !self.pilot_is_gated() || phase >= 2
+    }
+}
+
+#[derive(Debug)]
+struct Rc3PowerMetricBucket {
+    duration_pcgs: u64,
+    label: &'static str,
+    gated: bool,
+    start_abs_pcg: Option<u64>,
+    sinr_sum_db: f64,
+    sinr_count: u64,
+    sinr_min_db: f32,
+    sinr_max_db: f32,
+    pilot_power_sum_dbfs: f64,
+    pilot_power_count: u64,
+    pilot_power_min_dbfs: f32,
+    pilot_power_max_dbfs: f32,
+}
+
+impl Rc3PowerMetricBucket {
+    fn new(duration_pcgs: u64, label: &'static str, gated: bool) -> Self {
+        Self {
+            duration_pcgs,
+            label,
+            gated,
+            start_abs_pcg: None,
+            sinr_sum_db: 0.0,
+            sinr_count: 0,
+            sinr_min_db: 0.0,
+            sinr_max_db: 0.0,
+            pilot_power_sum_dbfs: 0.0,
+            pilot_power_count: 0,
+            pilot_power_min_dbfs: 0.0,
+            pilot_power_max_dbfs: 0.0,
+        }
+    }
+
+    fn record(
+        &mut self,
+        walsh_code: u8,
+        abs_pcg: u64,
+        raw_pilot_sinr_db: Option<f32>,
+        despread_pilot_power_dbfs: Option<f32>,
+    ) {
+        let aligned_start = abs_pcg / self.duration_pcgs * self.duration_pcgs;
+        if self
+            .start_abs_pcg
+            .is_some_and(|start| aligned_start > start)
+        {
+            self.log(walsh_code, false);
+            self.reset(aligned_start);
+        } else if self.start_abs_pcg.is_none() {
+            self.reset(aligned_start);
+        }
+
+        if let Some(sinr) = raw_pilot_sinr_db.filter(|value| value.is_finite()) {
+            self.sinr_sum_db += sinr as f64;
+            self.sinr_count = self.sinr_count.saturating_add(1);
+            self.sinr_min_db = if self.sinr_count == 1 {
+                sinr
+            } else {
+                self.sinr_min_db.min(sinr)
+            };
+            self.sinr_max_db = if self.sinr_count == 1 {
+                sinr
+            } else {
+                self.sinr_max_db.max(sinr)
+            };
+        }
+        if let Some(power) = despread_pilot_power_dbfs.filter(|value| value.is_finite()) {
+            self.pilot_power_sum_dbfs += power as f64;
+            self.pilot_power_count = self.pilot_power_count.saturating_add(1);
+            self.pilot_power_min_dbfs = if self.pilot_power_count == 1 {
+                power
+            } else {
+                self.pilot_power_min_dbfs.min(power)
+            };
+            self.pilot_power_max_dbfs = if self.pilot_power_count == 1 {
+                power
+            } else {
+                self.pilot_power_max_dbfs.max(power)
+            };
+        }
+    }
+
+    fn log(&self, walsh_code: u8, partial: bool) {
+        let Some(start_abs_pcg) = self.start_abs_pcg else {
+            return;
+        };
+        if self.sinr_count == 0 && self.pilot_power_count == 0 {
+            return;
+        }
+        info!(
+            "rc3_power_bucket[w{}]: bucket={} partial={} abs_pcg={}..{} gated={} raw_pilot_sinr_avg_db={:.2} raw_pilot_sinr_min_db={:.2} raw_pilot_sinr_max_db={:.2} raw_pilot_sinr_span_db={:.2} sinr_n={} despread_pilot_power_avg_dbfs={:.2} despread_pilot_power_min_dbfs={:.2} despread_pilot_power_max_dbfs={:.2} despread_pilot_power_span_db={:.2} pilot_power_n={}",
+            walsh_code,
+            self.label,
+            u8::from(partial),
+            start_abs_pcg,
+            start_abs_pcg
+                .saturating_add(self.duration_pcgs)
+                .saturating_sub(1),
+            u8::from(self.gated),
+            if self.sinr_count > 0 {
+                self.sinr_sum_db / self.sinr_count as f64
+            } else {
+                f64::NAN
+            },
+            self.sinr_min_db,
+            self.sinr_max_db,
+            self.sinr_max_db - self.sinr_min_db,
+            self.sinr_count,
+            if self.pilot_power_count > 0 {
+                self.pilot_power_sum_dbfs / self.pilot_power_count as f64
+            } else {
+                f64::NAN
+            },
+            self.pilot_power_min_dbfs,
+            self.pilot_power_max_dbfs,
+            self.pilot_power_max_dbfs - self.pilot_power_min_dbfs,
+            self.pilot_power_count,
+        );
+    }
+
+    fn reset(&mut self, start_abs_pcg: u64) {
+        self.start_abs_pcg = Some(start_abs_pcg);
+        self.sinr_sum_db = 0.0;
+        self.sinr_count = 0;
+        self.sinr_min_db = 0.0;
+        self.sinr_max_db = 0.0;
+        self.pilot_power_sum_dbfs = 0.0;
+        self.pilot_power_count = 0;
+        self.pilot_power_min_dbfs = 0.0;
+        self.pilot_power_max_dbfs = 0.0;
+    }
+}
+
+#[derive(Debug)]
+struct Rc3PowerMetricBuckets {
+    buckets: [Rc3PowerMetricBucket; RC3_POWER_BUCKET_DURATIONS.len()],
+}
+
+impl Rc3PowerMetricBuckets {
+    fn new(gated: bool) -> Self {
+        Self {
+            buckets: std::array::from_fn(|index| {
+                let (duration_pcgs, label) = RC3_POWER_BUCKET_DURATIONS[index];
+                Rc3PowerMetricBucket::new(duration_pcgs, label, gated)
+            }),
+        }
+    }
+
+    fn record(
+        &mut self,
+        walsh_code: u8,
+        abs_pcg: u64,
+        raw_pilot_sinr_db: Option<f32>,
+        despread_pilot_power_dbfs: Option<f32>,
+    ) {
+        for bucket in &mut self.buckets {
+            bucket.record(
+                walsh_code,
+                abs_pcg,
+                raw_pilot_sinr_db,
+                despread_pilot_power_dbfs,
+            );
+        }
+    }
+
+    fn set_gated(&mut self, gated: bool) {
+        for bucket in &mut self.buckets {
+            bucket.gated = gated;
+        }
+    }
+
+    fn log_partial(&self, walsh_code: u8) {
+        for bucket in &self.buckets {
+            bucket.log(walsh_code, true);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct PowerControlRxCounterWindow {
     log_periodic: bool,
+    metric_is_pilot_sinr: bool,
+    control_metric_is_mobile_power_dbfs: bool,
     total_measurements: u64,
     window_measurements: u64,
-    /// Sum of pilot symbol SINR (dB) — the loop's control metric.
+    /// Sum of the radio-specific inner-loop metric in dB.
     window_metric_sum_db: f64,
-    /// Min/max of the per-PCG pilot SINR within the window.
+    /// Number of finite metric observations. Silent PCGs must not dilute the
+    /// reported mean.
+    window_metric_count: u64,
+    /// Min/max of the per-PCG metric within the window.
     window_metric_min_db: f32,
     window_metric_max_db: f32,
-    /// Sum/count of legacy Ec/Io for the diagnostic log line.
-    window_legacy_ec_io_sum_db: f64,
-    window_legacy_ec_io_count: u64,
+    /// Sum/count of unbiased true pilot Ec/Io for the diagnostic log line.
+    window_true_ec_io_sum_db: f64,
+    window_true_ec_io_count: u64,
+    /// Same-PCG coherent pilot power diagnostic, independent of the control metric.
+    window_pilot_power_sum_dbfs: f64,
+    window_pilot_power_count: u64,
+    window_pilot_power_min_dbfs: f32,
+    window_pilot_power_max_dbfs: f32,
     /// Raw (un-smoothed) per-PCG pilot SINR stats — diagnostic only.
     window_raw_sinr_sum_db: f64,
     window_raw_sinr_count: u64,
@@ -3066,65 +3361,108 @@ struct PowerControlRxCounterWindow {
     window_raw_power_min_db: f32,
     window_raw_power_max_db: f32,
     last_raw_power_db: Option<f32>,
-    last_filtered_raw_power_db: Option<f32>,
     window_raw_power_clamp_down: u64,
     /// PCB direction counts: PCB=0 is UP (raise MS Tx), PCB=1 is DOWN.
     window_pcb_up: u64,
     window_pcb_down: u64,
+    /// Direction counts restricted to bits actually transmitted in valid
+    /// forward power-control subchannel slots.
+    window_valid_pcb_up: u64,
+    window_valid_pcb_down: u64,
+    window_hold: u64,
+    window_control: u64,
+    window_skipped_control: u64,
+    window_safety_down: u64,
+    window_schedule_rejected: u64,
+    last_scheduler_published: u64,
+    last_scheduler_scheduled_emits: u64,
+    last_scheduler_fallback_emits: u64,
+    last_scheduler_late_schedules: u64,
     window_age_chips_sum: u64,
     window_max_age_chips: u64,
     window_over_1pcg: u64,
     last_abs_pcg: u64,
     /// Latest closed-loop snapshot fields (sampled once per record()).
     last_target_db: Option<f32>,
-    last_filtered_metric_db: Option<f32>,
+    last_control_metric_db: Option<f32>,
     last_fer_pct: Option<f32>,
     last_frames_total: u64,
     last_frames_crc_error: u64,
-    last_brake_offset_db: Option<f32>,
 }
 
 impl PowerControlRxCounterWindow {
+    fn record_frame_snapshot(
+        &mut self,
+        fer_pct: Option<f32>,
+        frames_total: u64,
+        frames_crc_error: u64,
+    ) {
+        if let Some(fer) = fer_pct.filter(|fer| fer.is_finite()) {
+            self.last_fer_pct = Some(fer);
+            self.last_frames_total = frames_total;
+            self.last_frames_crc_error = frames_crc_error;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn record(
         &mut self,
         abs_pcg: u64,
         metric_db: f32,
-        legacy_ec_io_db: Option<f32>,
+        true_ec_io_db: Option<f32>,
+        pilot_power_dbfs: Option<f32>,
         raw_sinr_db: Option<f32>,
         smoothing_window_len: Option<u32>,
         raw_power_db: Option<f32>,
-        filtered_raw_power_db: Option<f32>,
         raw_power_clamp_active: bool,
         pcb: Option<u8>,
+        command_slot_valid: bool,
+        valid_slot: bool,
+        control_epoch: bool,
+        measurement_used: bool,
+        safety_down: bool,
+        schedule_accepted: bool,
+        rc3_scheduler: Option<crate::channels::ftch_rc3::Rc3PcgPcbSchedulerSnapshot>,
         target_db: Option<f32>,
-        filtered_metric_db: Option<f32>,
+        control_metric_db: Option<f32>,
         fer_pct: Option<f32>,
         frames_total: u64,
         frames_crc_error: u64,
-        brake_offset_db: Option<f32>,
         age_chips: u64,
     ) -> bool {
         self.total_measurements = self.total_measurements.saturating_add(1);
         self.window_measurements = self.window_measurements.saturating_add(1);
         if metric_db.is_finite() {
             self.window_metric_sum_db += metric_db as f64;
-            self.window_metric_min_db =
-                if self.window_metric_min_db == 0.0 && self.window_measurements == 1 {
-                    metric_db
-                } else {
-                    self.window_metric_min_db.min(metric_db)
-                };
-            self.window_metric_max_db =
-                if self.window_metric_max_db == 0.0 && self.window_measurements == 1 {
-                    metric_db
-                } else {
-                    self.window_metric_max_db.max(metric_db)
-                };
+            self.window_metric_count = self.window_metric_count.saturating_add(1);
+            self.window_metric_min_db = if self.window_metric_count == 1 {
+                metric_db
+            } else {
+                self.window_metric_min_db.min(metric_db)
+            };
+            self.window_metric_max_db = if self.window_metric_count == 1 {
+                metric_db
+            } else {
+                self.window_metric_max_db.max(metric_db)
+            };
         }
-        if let Some(legacy_db) = legacy_ec_io_db.filter(|db| db.is_finite()) {
-            self.window_legacy_ec_io_sum_db += legacy_db as f64;
-            self.window_legacy_ec_io_count = self.window_legacy_ec_io_count.saturating_add(1);
+        if let Some(true_db) = true_ec_io_db.filter(|db| db.is_finite()) {
+            self.window_true_ec_io_sum_db += true_db as f64;
+            self.window_true_ec_io_count = self.window_true_ec_io_count.saturating_add(1);
+        }
+        if let Some(pilot_dbfs) = pilot_power_dbfs.filter(|db| db.is_finite()) {
+            self.window_pilot_power_sum_dbfs += pilot_dbfs as f64;
+            self.window_pilot_power_count = self.window_pilot_power_count.saturating_add(1);
+            self.window_pilot_power_min_dbfs = if self.window_pilot_power_count == 1 {
+                pilot_dbfs
+            } else {
+                self.window_pilot_power_min_dbfs.min(pilot_dbfs)
+            };
+            self.window_pilot_power_max_dbfs = if self.window_pilot_power_count == 1 {
+                pilot_dbfs
+            } else {
+                self.window_pilot_power_max_dbfs.max(pilot_dbfs)
+            };
         }
         if let Some(raw_db) = raw_sinr_db.filter(|db| db.is_finite()) {
             self.window_raw_sinr_sum_db += raw_db as f64;
@@ -3158,31 +3496,54 @@ impl PowerControlRxCounterWindow {
             };
             self.last_raw_power_db = Some(raw_power_db);
         }
-        if let Some(filtered_raw_power_db) = filtered_raw_power_db.filter(|db| db.is_finite()) {
-            self.last_filtered_raw_power_db = Some(filtered_raw_power_db);
-        }
         if raw_power_clamp_active {
             self.window_raw_power_clamp_down = self.window_raw_power_clamp_down.saturating_add(1);
         }
         match pcb {
-            Some(0) => self.window_pcb_up = self.window_pcb_up.saturating_add(1),
-            Some(1) => self.window_pcb_down = self.window_pcb_down.saturating_add(1),
+            Some(0) => {
+                self.window_pcb_up = self.window_pcb_up.saturating_add(1);
+                if command_slot_valid {
+                    self.window_valid_pcb_up = self.window_valid_pcb_up.saturating_add(1);
+                }
+            }
+            Some(1) => {
+                self.window_pcb_down = self.window_pcb_down.saturating_add(1);
+                if command_slot_valid {
+                    self.window_valid_pcb_down = self.window_valid_pcb_down.saturating_add(1);
+                }
+            }
             _ => {}
+        }
+        if valid_slot {
+            if control_epoch {
+                if measurement_used || safety_down {
+                    self.window_control = self.window_control.saturating_add(1);
+                } else {
+                    self.window_skipped_control = self.window_skipped_control.saturating_add(1);
+                }
+            } else {
+                self.window_hold = self.window_hold.saturating_add(1);
+            }
+            if !schedule_accepted {
+                self.window_schedule_rejected = self.window_schedule_rejected.saturating_add(1);
+            }
+        }
+        if safety_down {
+            self.window_safety_down = self.window_safety_down.saturating_add(1);
+        }
+        if let Some(scheduler) = rc3_scheduler {
+            self.last_scheduler_published = scheduler.published;
+            self.last_scheduler_scheduled_emits = scheduler.scheduled_emits;
+            self.last_scheduler_fallback_emits = scheduler.fallback_emits;
+            self.last_scheduler_late_schedules = scheduler.late_schedules;
         }
         if let Some(t) = target_db.filter(|db| db.is_finite()) {
             self.last_target_db = Some(t);
         }
-        if let Some(f) = filtered_metric_db.filter(|db| db.is_finite()) {
-            self.last_filtered_metric_db = Some(f);
+        if let Some(control) = control_metric_db.filter(|db| db.is_finite()) {
+            self.last_control_metric_db = Some(control);
         }
-        if let Some(fer) = fer_pct.filter(|f| f.is_finite()) {
-            self.last_fer_pct = Some(fer);
-        }
-        self.last_frames_total = frames_total;
-        self.last_frames_crc_error = frames_crc_error;
-        if let Some(brake) = brake_offset_db.filter(|b| b.is_finite()) {
-            self.last_brake_offset_db = Some(brake);
-        }
+        self.record_frame_snapshot(fer_pct, frames_total, frames_crc_error);
         self.window_age_chips_sum = self.window_age_chips_sum.saturating_add(age_chips);
         self.window_max_age_chips = self.window_max_age_chips.max(age_chips);
         if age_chips > 1536 {
@@ -3209,16 +3570,32 @@ impl PowerControlRxCounterWindow {
             return;
         }
         let n = self.window_measurements as f64;
-        let avg_metric_db = self.window_metric_sum_db / n;
-        let metric_summary = format!(
-            "pilot_sinr_avg={:.2} (min={:.2} max={:.2}) filt={}",
-            avg_metric_db,
-            self.window_metric_min_db,
-            self.window_metric_max_db,
-            self.last_filtered_metric_db
-                .map(|db| format!("{db:.2}"))
-                .unwrap_or_else(|| "none".to_string()),
-        );
+        let metric_name = if self.metric_is_pilot_sinr {
+            "pilot_sinr"
+        } else {
+            "eb_nt"
+        };
+        let control_summary = self
+            .last_control_metric_db
+            .map(|db| {
+                if self.control_metric_is_mobile_power_dbfs {
+                    format!("control_mobile_power_dbfs={db:.2}")
+                } else {
+                    format!("control={db:.2}")
+                }
+            })
+            .unwrap_or_else(|| "control=none".to_string());
+        let metric_summary = if self.window_metric_count > 0 {
+            format!(
+                "{metric_name}_avg={:.2} (min={:.2} max={:.2} n={}) {control_summary}",
+                self.window_metric_sum_db / self.window_metric_count as f64,
+                self.window_metric_min_db,
+                self.window_metric_max_db,
+                self.window_metric_count,
+            )
+        } else {
+            format!("{metric_name}=missing {control_summary}")
+        };
         let raw_sinr_summary = if self.window_raw_sinr_count > 0 {
             format!(
                 " raw_sinr_avg={:.2} (min={:.2} max={:.2}){}",
@@ -3232,31 +3609,60 @@ impl PowerControlRxCounterWindow {
         } else {
             String::new()
         };
-        let legacy_summary = if self.window_legacy_ec_io_count > 0 {
+        let true_ec_io_summary = if self.window_true_ec_io_count > 0 {
             format!(
-                " legacy_ec_io_avg={:.2}",
-                self.window_legacy_ec_io_sum_db / self.window_legacy_ec_io_count as f64
+                " true_ec_io_avg={:.2}",
+                self.window_true_ec_io_sum_db / self.window_true_ec_io_count as f64
             )
         } else {
-            " legacy_ec_io=missing".to_string()
+            " true_ec_io=missing".to_string()
+        };
+        let pilot_power_summary = if self.window_pilot_power_count > 0 {
+            let power_name = if self.control_metric_is_mobile_power_dbfs {
+                "mobile_power"
+            } else {
+                "pilot_power"
+            };
+            format!(
+                " {power_name}_avg_dbfs={:.2} (min={:.2} max={:.2})",
+                self.window_pilot_power_sum_dbfs / self.window_pilot_power_count as f64,
+                self.window_pilot_power_min_dbfs,
+                self.window_pilot_power_max_dbfs,
+            )
+        } else {
+            if self.control_metric_is_mobile_power_dbfs {
+                " mobile_power=missing".to_string()
+            } else {
+                " pilot_power=missing".to_string()
+            }
         };
         let target_summary = self
             .last_target_db
             .map(|t| {
-                let brake = self
-                    .last_brake_offset_db
-                    .map(|b| format!(" brake={b:.2}"))
-                    .unwrap_or_default();
-                format!(" target={t:.2}{brake}")
+                if self.control_metric_is_mobile_power_dbfs {
+                    format!(" mobile_power_target_dbfs={t:.2}")
+                } else if self.metric_is_pilot_sinr {
+                    format!(" pilot_sinr_target_db={t:.2}")
+                } else {
+                    format!(" eb_nt_target_db={t:.2}")
+                }
             })
             .unwrap_or_default();
         let pcb_total = self.window_pcb_up + self.window_pcb_down;
+        let valid_pcb_total = self.window_valid_pcb_up + self.window_valid_pcb_down;
         let pcb_summary = if pcb_total > 0 {
             format!(
-                " pcb_up={}/{} ({:.0}% UP)",
+                " pcb_up={}/{} ({:.0}% UP) valid_pcb_up={}/{} ({:.0}% UP)",
                 self.window_pcb_up,
                 pcb_total,
                 100.0 * self.window_pcb_up as f64 / pcb_total as f64,
+                self.window_valid_pcb_up,
+                valid_pcb_total,
+                if valid_pcb_total > 0 {
+                    100.0 * self.window_valid_pcb_up as f64 / valid_pcb_total as f64
+                } else {
+                    0.0
+                },
             )
         } else {
             String::new()
@@ -3270,34 +3676,51 @@ impl PowerControlRxCounterWindow {
                 )
             })
             .unwrap_or_default();
+        let epoch_summary = if self.window_hold + self.window_control + self.window_skipped_control
+            > 0
+        {
+            format!(
+                " hold={} control={} skipped={} safety_down={} schedule_rejected={} scheduler_published={} tx_scheduled={} tx_fallback={} late_schedules={}",
+                self.window_hold,
+                self.window_control,
+                self.window_skipped_control,
+                self.window_safety_down,
+                self.window_schedule_rejected,
+                self.last_scheduler_published,
+                self.last_scheduler_scheduled_emits,
+                self.last_scheduler_fallback_emits,
+                self.last_scheduler_late_schedules,
+            )
+        } else {
+            String::new()
+        };
         let avg_age_pcgs = self.window_age_chips_sum as f64 / n / 1536.0;
         let max_age_pcgs = self.window_max_age_chips as f64 / 1536.0;
         let raw_power_summary = if self.window_raw_power_count > 0 {
             format!(
-                " limiter_power_avg_dbfs={:.2} (min={:.2} max={:.2} last={:.2}) filt={}",
+                " limiter_power_avg_dbfs={:.2} (min={:.2} max={:.2} last={:.2})",
                 self.window_raw_power_sum_db / self.window_raw_power_count as f64,
                 self.window_raw_power_min_db,
                 self.window_raw_power_max_db,
                 self.last_raw_power_db.unwrap_or(f32::NAN),
-                self.last_filtered_raw_power_db
-                    .map(|db| format!("{db:.2}"))
-                    .unwrap_or_else(|| "none".to_string()),
             )
         } else {
             " limiter_power=none".to_string()
         };
         info!(
-            "rx_traffic[w{}]: [power counters] total_meas={} window_meas={} {}{}{}{}{}{}{} limiter_clamp_down={} age_avg_pcgs={:.2} age_max_pcgs={:.2} over_1pcg={} last_abs_pcg={}",
+            "rx_traffic[w{}]: [power counters] total_meas={} window_meas={} {}{}{}{}{}{}{}{}{} limiter_clamp_down={} age_avg_pcgs={:.2} age_max_pcgs={:.2} over_1pcg={} last_abs_pcg={}",
             walsh_code,
             self.total_measurements,
             self.window_measurements,
             metric_summary,
             raw_sinr_summary,
-            legacy_summary,
+            true_ec_io_summary,
+            pilot_power_summary,
             target_summary,
             pcb_summary,
             fer_summary,
             raw_power_summary,
+            epoch_summary,
             self.window_raw_power_clamp_down,
             avg_age_pcgs,
             max_age_pcgs,
@@ -3310,10 +3733,15 @@ impl PowerControlRxCounterWindow {
     fn reset_window(&mut self) {
         self.window_measurements = 0;
         self.window_metric_sum_db = 0.0;
+        self.window_metric_count = 0;
         self.window_metric_min_db = 0.0;
         self.window_metric_max_db = 0.0;
-        self.window_legacy_ec_io_sum_db = 0.0;
-        self.window_legacy_ec_io_count = 0;
+        self.window_true_ec_io_sum_db = 0.0;
+        self.window_true_ec_io_count = 0;
+        self.window_pilot_power_sum_dbfs = 0.0;
+        self.window_pilot_power_count = 0;
+        self.window_pilot_power_min_dbfs = 0.0;
+        self.window_pilot_power_max_dbfs = 0.0;
         self.window_raw_sinr_sum_db = 0.0;
         self.window_raw_sinr_count = 0;
         self.window_raw_sinr_min_db = 0.0;
@@ -3326,6 +3754,13 @@ impl PowerControlRxCounterWindow {
         self.window_raw_power_clamp_down = 0;
         self.window_pcb_up = 0;
         self.window_pcb_down = 0;
+        self.window_valid_pcb_up = 0;
+        self.window_valid_pcb_down = 0;
+        self.window_hold = 0;
+        self.window_control = 0;
+        self.window_skipped_control = 0;
+        self.window_safety_down = 0;
+        self.window_schedule_rejected = 0;
         self.window_age_chips_sum = 0;
         self.window_max_age_chips = 0;
         self.window_over_1pcg = 0;
@@ -3337,6 +3772,100 @@ impl PowerControlRxCounterWindow {
 /// Receives IQ blocks from the main RX thread, runs the traffic pipeline,
 /// and sends decoded events back to the BSC via `event_tx`. Tracks its own
 /// pipeline timing independently so falling-behind warnings are per-channel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrafficFerDecision {
+    Count,
+    IgnoreBeforePilot,
+    IgnoreBeforeFirstValid,
+    IgnoreAfterRelease,
+    Activated,
+}
+
+#[derive(Debug)]
+struct TrafficFerGate {
+    gate_rc3_startup: bool,
+    pilot_acquired: bool,
+    first_valid_seen: bool,
+    release_started: bool,
+    ignored_before_pilot: u64,
+    ignored_before_first_valid: u64,
+    ignored_after_release: u64,
+}
+
+impl TrafficFerGate {
+    fn new(is_rc3: bool) -> Self {
+        Self {
+            gate_rc3_startup: is_rc3,
+            pilot_acquired: !is_rc3,
+            first_valid_seen: !is_rc3,
+            release_started: false,
+            ignored_before_pilot: 0,
+            ignored_before_first_valid: 0,
+            ignored_after_release: 0,
+        }
+    }
+
+    fn pilot_acquired(&mut self) {
+        self.pilot_acquired = true;
+    }
+
+    fn start_release(&mut self) {
+        self.release_started = true;
+    }
+
+    fn release_started(&self) -> bool {
+        self.release_started
+    }
+
+    fn observe_phy_frame(&mut self, frame_valid: bool) -> TrafficFerDecision {
+        if self.release_started {
+            self.ignored_after_release = self.ignored_after_release.saturating_add(1);
+            return TrafficFerDecision::IgnoreAfterRelease;
+        }
+        if !self.gate_rc3_startup || self.first_valid_seen {
+            return TrafficFerDecision::Count;
+        }
+        if !self.pilot_acquired {
+            self.ignored_before_pilot = self.ignored_before_pilot.saturating_add(1);
+            return TrafficFerDecision::IgnoreBeforePilot;
+        }
+        if !frame_valid {
+            self.ignored_before_first_valid = self.ignored_before_first_valid.saturating_add(1);
+            return TrafficFerDecision::IgnoreBeforeFirstValid;
+        }
+
+        self.first_valid_seen = true;
+        TrafficFerDecision::Activated
+    }
+}
+
+fn update_traffic_fer(
+    gate: &mut TrafficFerGate,
+    power_control: Option<&BtsPowerControlRegistry>,
+    traffic_channels: Option<&TrafficChannelPool>,
+    walsh_code: u8,
+    frame_valid: bool,
+    absolute_chip_start: Option<u64>,
+) {
+    let decision = gate.observe_phy_frame(frame_valid);
+    if decision == TrafficFerDecision::Activated {
+        info!(
+            "rx_traffic[w{}]: FER counting enabled on first valid PHY frame abs_chip={} ignored_before_pilot={} ignored_after_pilot={}",
+            walsh_code,
+            absolute_chip_start.unwrap_or(0),
+            gate.ignored_before_pilot,
+            gate.ignored_before_first_valid,
+        );
+    }
+    if matches!(
+        decision,
+        TrafficFerDecision::Count | TrafficFerDecision::Activated
+    ) && let Some(power_control) = power_control
+    {
+        let _ = power_control.outer_loop_tick(traffic_channels, walsh_code, frame_valid);
+    }
+}
+
 fn run_traffic_rx_thread(
     walsh_code: u8,
     mut processors: Vec<PipelineProcessorShared>,
@@ -3346,6 +3875,9 @@ fn run_traffic_rx_thread(
     traffic_channels: Option<TrafficChannelPool>,
     power_control: Option<BtsPowerControlRegistry>,
     chip_rate_hz: usize,
+    is_rc3: bool,
+    is_rc1: bool,
+    rev_fch_gating_mode: bool,
     continuity_configured: bool,
     shutdown: Arc<AtomicBool>,
     traffic_ack_seq_tx: Option<tokio::sync::mpsc::Sender<(u8, u8)>>,
@@ -3374,11 +3906,18 @@ fn run_traffic_rx_thread(
     let mut latency_recomputed_chips_sum: u64 = 0;
     let mut latency_recomputed_chips_max: u64 = 0;
     let mut latency_measurement_count: u64 = 0;
+    let power_control_log_periodic = power_control_verbose_enabled_for_walsh(walsh_code);
     let mut power_control_counters = PowerControlRxCounterWindow {
-        log_periodic: power_control_verbose_enabled_for_walsh(walsh_code),
+        log_periodic: power_control_log_periodic,
+        metric_is_pilot_sinr: is_rc3,
+        control_metric_is_mobile_power_dbfs: is_rc1,
         ..PowerControlRxCounterWindow::default()
     };
+    let mut rc3_power_metric_buckets = Rc3PowerMetricBuckets::new(rev_fch_gating_mode);
+    let mut rc3_pilot_availability = Rc3PilotAvailability::new(rev_fch_gating_mode);
     let mut continuity_state = TrafficContinuityState::new(continuity_configured);
+    let mut traffic_preamble_forwarded = false;
+    let mut traffic_fer_gate = TrafficFerGate::new(is_rc3);
     let mut emit_outputs = |outputs: Vec<SampleBlock>,
                             hw_time_ns: u64,
                             processing_absolute_chip_end: u64|
@@ -3386,6 +3925,14 @@ fn run_traffic_rx_thread(
         let mut should_exit = false;
         for out_blk in outputs {
             if out_blk.tags.get("traffic_preamble_detected") == Some(&1) {
+                traffic_fer_gate.pilot_acquired();
+            }
+            if out_blk.tags.get("traffic_preamble_detected") == Some(&1)
+                && (!is_rc3 || !traffic_preamble_forwarded)
+            {
+                if is_rc3 {
+                    traffic_preamble_forwarded = true;
+                }
                 let preamble_pcgs = out_blk
                     .tags
                     .get("traffic_preamble_frames")
@@ -3441,12 +3988,22 @@ fn run_traffic_rx_thread(
             }
             if out_blk.tags.get("traffic_event") == Some(&1) {
                 if let Some(mut event) = build_traffic_event(&out_blk, chip_rate_hz, hw_time_ns) {
-                    let frame_valid = traffic_frame_validity(&event);
-                    if let Some(power_control) = power_control.as_ref() {
-                        let _ = power_control.outer_loop_tick(
-                            traffic_channels.as_ref(),
-                            walsh_code,
-                            frame_valid,
+                    if event.message_id == MessageId::Order
+                        && event.order_code == Some(RELEASE_ORDER_CODE)
+                        && !traffic_fer_gate.release_started()
+                    {
+                        traffic_fer_gate.start_release();
+                        let release_hold_started = is_rc3
+                            && power_control
+                                .as_ref()
+                                .zip(traffic_channels.as_ref())
+                                .is_some_and(|(power_control, traffic_channels)| {
+                                    power_control
+                                        .enter_rc3_release_hold(traffic_channels, walsh_code)
+                                });
+                        info!(
+                            "rx_traffic[w{}]: Reverse Release Order decoded, FER counting stopped rc3_neutral_pcb_hold={}",
+                            walsh_code, release_hold_started,
                         );
                     }
                     if let (Some(ack_seq), Some(ack_tx)) = (event.ack_seq, &traffic_ack_seq_tx) {
@@ -3471,43 +4028,101 @@ fn run_traffic_rx_thread(
                     hw_time_ns,
                     processing_absolute_chip_end,
                 ) {
-                    let eb_nt_db = event
-                        .pcg_signal_snr_db
-                        .as_ref()
-                        .and_then(|values| values.first())
-                        .copied()
-                        .unwrap_or(f32::NAN);
-                    let legacy_ec_io_db = event.reverse_pilot_ec_io_db.or_else(|| {
-                        out_blk
-                            .tags
-                            .get("traffic_pcg_pilot_ec_io_mdb")
-                            .map(|v| *v as f32 / 1000.0)
-                    });
+                    // Either the unbiased same-PCG estimate or absent.
+                    let true_ec_io_db = out_blk
+                        .tags
+                        .get("traffic_pcg_pilot_ec_io_true_mdb")
+                        .map(|v| *v as f32 / 1000.0);
+                    let legacy_ec_io_db = out_blk
+                        .tags
+                        .get("traffic_pcg_pilot_ec_io_legacy_mdb")
+                        .map(|v| *v as f32 / 1000.0);
                     let raw_sinr_db = out_blk
                         .tags
                         .get("traffic_pcg_pilot_sinr_raw_mdb")
                         .map(|v| *v as f32 / 1000.0);
+                    let pilot_power_db = out_blk
+                        .tags
+                        .get("traffic_pcg_pilot_power_mdbfs")
+                        .map(|v| *v as f32 / 1000.0);
+                    let instant_pilot_power_db = out_blk
+                        .tags
+                        .get("traffic_pcg_pilot_power_instant_mdbfs")
+                        .map(|v| *v as f32 / 1000.0);
+                    let measured_abs_pcg = event.absolute_chip_start.map(|chip| chip / 1536);
+                    let rc3_pilot_measurement_valid =
+                        if is_rc3 && !traffic_fer_gate.release_started() {
+                            measured_abs_pcg
+                                .map(|abs_pcg| {
+                                    rc3_pilot_availability.observe(walsh_code, abs_pcg, raw_sinr_db)
+                                })
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        };
+                    if is_rc3 {
+                        rc3_power_metric_buckets.set_gated(rc3_pilot_availability.pilot_is_gated());
+                    }
+                    // Some mobiles keep eighth-rate gating after an assignment
+                    // disables it. Either way phases 0 and 1 carry only noise.
+                    let eb_nt_db = if is_rc3 {
+                        if rc3_pilot_measurement_valid {
+                            raw_sinr_db.unwrap_or(f32::NAN)
+                        } else {
+                            f32::NAN
+                        }
+                    } else {
+                        event
+                            .pcg_signal_snr_db
+                            .as_ref()
+                            .and_then(|values| values.first())
+                            .copied()
+                            .unwrap_or(f32::NAN)
+                    };
+                    // Active gated PCGs only, so noise is not reported as pilot
+                    // power. The controller uses `eb_nt_db` above.
+                    let despread_pilot_power_dbfs = if !is_rc3 {
+                        event.signal_power_db
+                    } else if rc3_pilot_measurement_valid {
+                        instant_pilot_power_db
+                    } else {
+                        None
+                    };
+                    if power_control_log_periodic && is_rc3 && rc3_pilot_measurement_valid {
+                        rc3_power_metric_buckets.record(
+                            walsh_code,
+                            measured_abs_pcg.unwrap_or_default(),
+                            raw_sinr_db,
+                            instant_pilot_power_db,
+                        );
+                    }
                     let smoothing_window_len = out_blk
                         .tags
                         .get("traffic_pcg_smoothing_window")
                         .and_then(|v| u32::try_from(*v).ok());
                     let mut tick_raw_power = None;
-                    let mut tick_filtered_raw_power = None;
                     let mut raw_power_clamp_active = false;
                     let mut tick_pcb: Option<u8> = None;
+                    let mut tick_command_slot_valid = false;
+                    let mut tick_valid_slot = false;
+                    let mut tick_control_epoch = false;
+                    let mut tick_measurement_used = false;
+                    let mut tick_safety_down = false;
+                    let mut tick_schedule_accepted = false;
+                    let mut tick_rc3_scheduler = None;
                     let mut tick_target_db: Option<f32> = None;
-                    let mut tick_filtered_metric_db: Option<f32> = None;
+                    let mut tick_control_metric_db: Option<f32> = None;
                     let mut snapshot_fer_pct: Option<f32> = None;
                     let mut snapshot_frames_total: u64 = 0;
                     let mut snapshot_frames_crc_error: u64 = 0;
-                    let mut snapshot_brake_offset_db: Option<f32> = None;
                     if let (Some(power_control), Some(traffic_channels), Some(abs_chip)) = (
                         power_control.as_ref(),
                         traffic_channels.as_ref(),
                         event.absolute_chip_start,
                     ) {
                         let measured_abs_pcg = abs_chip / 1536;
-                        let tx_abs_pcg = measured_abs_pcg + PCG_PREDICTION_LEAD_PCGS as u64;
+                        let scheduling_lead_pcgs = DIRECT_CONTROL_MIN_LEAD_PCGS;
+                        let tx_abs_pcg = measured_abs_pcg + scheduling_lead_pcgs;
                         if let Some(tick) = power_control.tick_and_schedule(
                             traffic_channels,
                             walsh_code,
@@ -3515,23 +4130,47 @@ fn run_traffic_rx_thread(
                             tx_abs_pcg,
                             eb_nt_db,
                             event.raw_power_db,
-                            event.signal_power_db,
+                            despread_pilot_power_dbfs,
+                            despread_pilot_power_dbfs,
                         ) {
                             tick_raw_power = tick.raw_power_db;
-                            tick_filtered_raw_power = tick.filtered_raw_power_db;
                             raw_power_clamp_active = tick.raw_power_clamp_active;
                             tick_pcb = Some(tick.pcb);
+                            tick_command_slot_valid = tick.command_slot_valid;
+                            tick_valid_slot = tick.valid_ordinal.is_some();
+                            tick_control_epoch = tick.control_epoch;
+                            tick_measurement_used = tick.measurement_used;
+                            tick_safety_down = tick.safety_down;
+                            tick_schedule_accepted = tick.schedule_accepted;
+                            tick_rc3_scheduler = tick.rc3_scheduler;
                             tick_target_db = Some(tick.target_db);
-                            if tick.control_metric_db.is_finite() {
-                                tick_filtered_metric_db = Some(tick.control_metric_db);
+                            if !is_rc3 && tick.control_metric_db.is_finite() {
+                                tick_control_metric_db = Some(tick.control_metric_db);
                             }
                         }
                         if let Some(snap) = power_control.snapshot(walsh_code) {
                             snapshot_fer_pct = Some(snap.fer_pct);
                             snapshot_frames_total = snap.frames_total;
                             snapshot_frames_crc_error = snap.frames_crc_error;
-                            snapshot_brake_offset_db = Some(snap.last_brake_offset_db);
                         }
+                    }
+                    // Keep duplicate per-PCG diagnostics at TRACE to avoid
+                    // delaying timed forward-radio writes.
+                    if cdma_common::diagnostics::power_control_verbose_per_pcg_enabled_for_walsh(
+                        walsh_code,
+                    ) {
+                        trace!(
+                            "pcg_air[w{}] abs_pcg={} true_ec_io={:?} legacy_ec_io={:?} raw_sinr={:?} raw_power_dbfs={:?} mobile_power_dbfs={:?} pilot_power_dbfs={:?} pilot_power_instant_dbfs={:?}",
+                            walsh_code,
+                            event.absolute_chip_start.unwrap_or(0) / 1536,
+                            true_ec_io_db,
+                            legacy_ec_io_db,
+                            raw_sinr_db,
+                            event.raw_power_db,
+                            event.signal_power_db,
+                            pilot_power_db,
+                            instant_pilot_power_db,
+                        );
                     }
                     {
                         let counters = &mut power_control_counters;
@@ -3540,19 +4179,25 @@ fn run_traffic_rx_thread(
                         if counters.record(
                             abs_pcg,
                             eb_nt_db,
-                            legacy_ec_io_db,
+                            true_ec_io_db,
+                            despread_pilot_power_dbfs,
                             raw_sinr_db,
                             smoothing_window_len,
                             tick_raw_power.or(event.signal_power_db),
-                            tick_filtered_raw_power,
                             raw_power_clamp_active,
                             tick_pcb,
+                            tick_command_slot_valid,
+                            tick_valid_slot,
+                            tick_control_epoch,
+                            tick_measurement_used,
+                            tick_safety_down,
+                            tick_schedule_accepted,
+                            tick_rc3_scheduler,
                             tick_target_db,
-                            tick_filtered_metric_db,
+                            tick_control_metric_db,
                             snapshot_fer_pct,
                             snapshot_frames_total,
                             snapshot_frames_crc_error,
-                            snapshot_brake_offset_db,
                             age_chips,
                         ) {
                             counters.log_and_reset(walsh_code);
@@ -3568,13 +4213,14 @@ fn run_traffic_rx_thread(
                     build_traffic_phy_status_event(&out_blk, chip_rate_hz, hw_time_ns)
                 {
                     let frame_valid = traffic_frame_validity(&event);
-                    if let Some(power_control) = power_control.as_ref() {
-                        let _ = power_control.outer_loop_tick(
-                            traffic_channels.as_ref(),
-                            walsh_code,
-                            frame_valid,
-                        );
-                    }
+                    update_traffic_fer(
+                        &mut traffic_fer_gate,
+                        power_control.as_ref(),
+                        traffic_channels.as_ref(),
+                        walsh_code,
+                        frame_valid,
+                        event.absolute_chip_start,
+                    );
                     if let Some(ref tx) = event_tx {
                         let _ = tx.send(event);
                     }
@@ -3585,13 +4231,14 @@ fn run_traffic_rx_thread(
                     build_traffic_voice_event(&out_blk, chip_rate_hz, hw_time_ns)
                 {
                     let frame_valid = traffic_frame_validity(&event);
-                    if let Some(power_control) = power_control.as_ref() {
-                        let _ = power_control.outer_loop_tick(
-                            traffic_channels.as_ref(),
-                            walsh_code,
-                            frame_valid,
-                        );
-                    }
+                    update_traffic_fer(
+                        &mut traffic_fer_gate,
+                        power_control.as_ref(),
+                        traffic_channels.as_ref(),
+                        walsh_code,
+                        frame_valid,
+                        event.absolute_chip_start,
+                    );
                     event.traffic_primary_bearer_routed = emit_reverse_primary_bearer(
                         &reverse_bearer_tx,
                         &event,
@@ -3695,6 +4342,7 @@ fn run_traffic_rx_thread(
         block
             .tags
             .insert("absolute_sample_start", absolute_sample_start as i64);
+        block.tags.insert(PULSE_MATCHED_FILTERED_TAG, 1);
 
         let pipeline_start = Instant::now();
         let mut sub_emitter = VecEmitter::new();
@@ -3834,8 +4482,17 @@ fn run_traffic_rx_thread(
     let mut flushed = flush_sub_chain(&mut processors, &mut flush_emitter);
     flushed.extend(flush_emitter.blocks);
     emit_outputs(flushed, 0, last_processing_absolute_chip_end);
+    if traffic_fer_gate.ignored_after_release > 0 {
+        info!(
+            "rx_traffic[w{}]: ignored {} PHY frames after Reverse Release Order",
+            walsh_code, traffic_fer_gate.ignored_after_release,
+        );
+    }
     if power_control_counters.should_log_partial() {
         power_control_counters.log_and_reset(walsh_code);
+    }
+    if power_control_log_periodic && is_rc3 {
+        rc3_power_metric_buckets.log_partial(walsh_code);
     }
 
     info!("rx_traffic[w{}]: thread exiting", walsh_code);
@@ -4356,7 +5013,8 @@ fn build_traffic_event(
 
 fn reverse_pilot_ec_io_db_from_tags(blk: &SampleBlock) -> Option<f32> {
     blk.tags
-        .get("finger_pilot_ec_io_mdb")
+        .get("traffic_pcg_pilot_ec_io_true_mdb")
+        .or_else(|| blk.tags.get("finger_pilot_ec_io_mdb"))
         .map(|value| *value as f32 / 1000.0)
 }
 
@@ -5270,15 +5928,50 @@ mod tests {
     use super::rx_events::extract_access_rc_preferences;
     use super::{
         HRPD_SLOT_CHIPS, HRPD_TRAFFIC_FRAME_CHIPS, HRPD_TRAFFIC_MAX_INTERPOLATED_GAP_SLOTS,
-        HrpdTrafficMaskCandidate, PCG_CHIPS, RxCarrierSlice, RxQueueRegistry, StageTiming,
-        build_access_event, build_hrpd_access_indication, build_traffic_event,
-        build_traffic_voice_event, carrier_slice_anti_alias_taps,
-        continuous_rx_absolute_sample_start, effective_rx_target_batch_samples,
-        extract_addressing_fields, extract_imsi_from_class_fields,
-        hrpd_reverse_traffic_pilot_metric_at_offset, reconcile_traffic_stream_continuity,
-        reconcile_traffic_stream_continuity_with_max_insert, reverse_frame_content_from_rate_bps,
-        run_sub_chain_timed, scaled_rx_sample_delay,
+        HrpdTrafficMaskCandidate, PCG_CHIPS, Rc3PilotAvailability, RxCarrierSlice, RxQueueRegistry,
+        StageTiming, TrafficFerDecision, TrafficFerGate, build_access_event,
+        build_hrpd_access_indication, build_traffic_event, build_traffic_voice_event,
+        carrier_slice_anti_alias_taps, continuous_rx_absolute_sample_start,
+        effective_rx_target_batch_samples, extract_addressing_fields,
+        extract_imsi_from_class_fields, hrpd_reverse_traffic_pilot_metric_at_offset,
+        reconcile_traffic_stream_continuity, reconcile_traffic_stream_continuity_with_max_insert,
+        reverse_frame_content_from_rate_bps, run_sub_chain_timed, scaled_rx_sample_delay,
     };
+
+    #[test]
+    fn rc3_pilot_availability_detects_and_clears_unexpected_half_rate_gating() {
+        let mut availability = Rc3PilotAvailability::new(false);
+        let mut abs_pcg = 0_u64;
+
+        for _ in 0..8 {
+            for _ in 0..4 {
+                assert!(availability.observe(10, abs_pcg, Some(0.0)));
+                abs_pcg += 1;
+            }
+        }
+        assert!(!availability.pilot_is_gated());
+
+        for _ in 0..8 {
+            for phase in 0..4 {
+                let sinr_db = if phase < 2 { -20.0 } else { 2.0 };
+                let valid = availability.observe(10, abs_pcg, Some(sinr_db));
+                if availability.pilot_is_gated() {
+                    assert_eq!(valid, phase >= 2);
+                }
+                abs_pcg += 1;
+            }
+        }
+        assert!(availability.pilot_is_gated());
+        assert!(!availability.observe(10, abs_pcg, Some(-20.0)));
+
+        for _ in 0..12 {
+            for _ in 0..4 {
+                let _ = availability.observe(10, abs_pcg, Some(0.0));
+                abs_pcg += 1;
+            }
+        }
+        assert!(!availability.pilot_is_gated());
+    }
     use crate::bts::evdo::{EvdoMode, HrpdSectorId};
     use crate::bts::launcher::{BtsLaunchOptions, build_bts_launch_parts};
     use crate::bts::{BtsNodeConfig, RadioConfig};
@@ -5313,6 +6006,65 @@ mod tests {
     use num_complex::Complex32;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn rc3_fer_waits_for_pilot_and_first_valid_phy_frame() {
+        let mut gate = TrafficFerGate::new(true);
+
+        assert_eq!(
+            gate.observe_phy_frame(false),
+            TrafficFerDecision::IgnoreBeforePilot
+        );
+        assert_eq!(
+            gate.observe_phy_frame(true),
+            TrafficFerDecision::IgnoreBeforePilot
+        );
+
+        gate.pilot_acquired();
+        assert_eq!(
+            gate.observe_phy_frame(false),
+            TrafficFerDecision::IgnoreBeforeFirstValid
+        );
+        assert_eq!(gate.observe_phy_frame(true), TrafficFerDecision::Activated);
+        assert_eq!(gate.observe_phy_frame(false), TrafficFerDecision::Count);
+        assert_eq!(gate.ignored_before_pilot, 2);
+        assert_eq!(gate.ignored_before_first_valid, 1);
+
+        gate.start_release();
+        assert_eq!(
+            gate.observe_phy_frame(false),
+            TrafficFerDecision::IgnoreAfterRelease
+        );
+        assert_eq!(
+            gate.observe_phy_frame(true),
+            TrafficFerDecision::IgnoreAfterRelease
+        );
+        assert_eq!(gate.ignored_after_release, 2);
+    }
+
+    #[test]
+    fn non_rc3_fer_counts_from_first_phy_frame() {
+        let mut gate = TrafficFerGate::new(false);
+
+        assert_eq!(gate.observe_phy_frame(false), TrafficFerDecision::Count);
+        assert_eq!(gate.observe_phy_frame(true), TrafficFerDecision::Count);
+        gate.start_release();
+        assert_eq!(
+            gate.observe_phy_frame(false),
+            TrafficFerDecision::IgnoreAfterRelease
+        );
+    }
+
+    #[test]
+    fn power_counter_retains_frame_snapshot_after_registry_removal() {
+        let mut counters = super::PowerControlRxCounterWindow::default();
+        counters.record_frame_snapshot(Some(2.0), 1_234, 7);
+        counters.record_frame_snapshot(None, 0, 0);
+
+        assert_eq!(counters.last_fer_pct, Some(2.0));
+        assert_eq!(counters.last_frames_total, 1_234);
+        assert_eq!(counters.last_frames_crc_error, 7);
+    }
 
     #[test]
     fn scaled_rx_sample_delay_scales_from_4x_basis() {
@@ -5368,16 +6120,16 @@ mod tests {
     }
 
     #[test]
-    fn hrpd_rx_batch_is_capped_to_one_slot() {
+    fn rx_batch_is_capped_to_2048_chips() {
         let sample_rate_hz = 4 * 1_228_800usize;
         let chip_rate_hz = 1_228_800usize;
         assert_eq!(
-            effective_rx_target_batch_samples(sample_rate_hz, chip_rate_hz, 2, true),
+            effective_rx_target_batch_samples(sample_rate_hz, chip_rate_hz, 2),
             4 * HRPD_SLOT_CHIPS
         );
         assert_eq!(
-            effective_rx_target_batch_samples(sample_rate_hz, chip_rate_hz, 2, false),
-            4 * 2 * PCG_CHIPS
+            effective_rx_target_batch_samples(sample_rate_hz, chip_rate_hz, 1),
+            4 * PCG_CHIPS
         );
     }
 

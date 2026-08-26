@@ -81,6 +81,7 @@ impl PowerControlService {
         metric_db: f32,
         raw_power_db: Option<f32>,
         mobile_power_db: Option<f32>,
+        despread_pilot_power_dbfs: Option<f32>,
     ) -> Option<BtsPowerControlTick> {
         self.registry.tick_and_schedule(
             traffic_channels,
@@ -90,6 +91,7 @@ impl PowerControlService {
             metric_db,
             raw_power_db,
             mobile_power_db,
+            despread_pilot_power_dbfs,
         )
     }
 }

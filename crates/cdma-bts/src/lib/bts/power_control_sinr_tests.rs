@@ -1,10 +1,8 @@
 //! Characterization tests for the per-PCG pilot-symbol SINR metric:
-//! linearity vs Tx amplitude, response to interference, fading, CFO,
-//! and PCB up/down behavior, asserted against [`predicted_pilot_sym_sinr_db`].
+//! linearity vs Tx amplitude, response to interference, fading, and CFO.
 
 use num_complex::Complex32;
 
-use super::*;
 use crate::phy::walsh::WalshGenerator;
 use crate::receiver::pipelined::{PipelineProcessor, Rc3BpskDespread, SampleBlock};
 
@@ -570,127 +568,4 @@ fn scenario_04b_large_cfo_diagnostic() {
             m - baseline_mean
         );
     }
-}
-
-// ---------------------------------------------------------------------------
-// PCB UP/DOWN behavior — drive the existing quantize_pcb against the
-// proposed metric to verify the loop responds correctly.
-// ---------------------------------------------------------------------------
-
-fn build_state_seeded_at(setpoint_db: f32) -> BtsReversePowerControlState {
-    let mut state = BtsReversePowerControlState::with_params(
-        setpoint_db,
-        RC3_AUTO_MIN_DB,
-        RC3_AUTO_MAX_DB,
-        RC3_MANUAL_MIN_DB,
-        RC3_MANUAL_MAX_DB,
-    );
-    // Seed the IIR and residual to "at setpoint" so up/down decisions
-    // are driven entirely by the test perturbations, not by startup
-    // transients.
-    for pcg in 0..32u64 {
-        let _ = state.tick_single_pcg(4, pcg, setpoint_db, None, 0);
-    }
-    state
-}
-
-/// 12. Around-setpoint dithering: a synthetic SINR stream that steps
-///     ±1 dB every 10 PCGs. The PCB sequence must follow the sign of
-///     the disturbance with at most a small lag, and a flat input must
-///     stay inside the hold band (no PCB ping-pong).
-#[test]
-fn scenario_12_pcb_tracks_disturbance() {
-    let setpoint = -12.0_f32;
-    let mut state = build_state_seeded_at(setpoint);
-
-    // Flat input at exactly setpoint: residual should not wander into
-    // sustained UP or DOWN trains.
-    let mut up = 0;
-    let mut down = 0;
-    for pcg in 100..200u64 {
-        let tick = state.tick_single_pcg(4, pcg, setpoint, None, 0);
-        if tick.pcb == 0 {
-            up += 1;
-        } else {
-            down += 1;
-        }
-    }
-    eprintln!("  flat-input UP={} DOWN={}", up, down);
-    assert!(
-        (up as i32 - down as i32).abs() <= 5,
-        "flat input must not bias PCB stream: UP={} DOWN={}",
-        up,
-        down,
-    );
-
-    // Step UP: metric drops 1 dB below setpoint → SINR shortfall →
-    // PCB should be predominantly UP (0).
-    let mut state = build_state_seeded_at(setpoint);
-    let mut up = 0;
-    let mut down = 0;
-    for pcg in 100..130u64 {
-        let tick = state.tick_single_pcg(4, pcg, setpoint - 1.0, None, 0);
-        if tick.pcb == 0 {
-            up += 1;
-        } else {
-            down += 1;
-        }
-    }
-    eprintln!("  step-down (SINR<-setpoint) UP={} DOWN={}", up, down);
-    assert!(
-        up > down + 5,
-        "metric below setpoint must produce a UP-biased PCB stream",
-    );
-
-    // Step DOWN: metric rises 1 dB above setpoint → SINR excess →
-    // PCB should be predominantly DOWN (1).
-    let mut state = build_state_seeded_at(setpoint);
-    let mut up = 0;
-    let mut down = 0;
-    for pcg in 100..130u64 {
-        let tick = state.tick_single_pcg(4, pcg, setpoint + 1.0, None, 0);
-        if tick.pcb == 0 {
-            up += 1;
-        } else {
-            down += 1;
-        }
-    }
-    eprintln!("  step-up (SINR>setpoint) UP={} DOWN={}", up, down);
-    assert!(
-        down > up + 5,
-        "metric above setpoint must produce a DOWN-biased PCB stream",
-    );
-}
-
-/// 13. Wind-up / rail-limited: target SINR drops 10 dB and stays
-///     there. The loop should emit a long UP train. This characterizes
-///     how many PCGs of useless UP commands the loop currently issues
-///     before any outer-loop guard could intervene — a Phase 2 input
-///     for the wind-up cap.
-#[test]
-fn scenario_13_wind_up_rail_limited() {
-    let setpoint = -12.0_f32;
-    let mut state = build_state_seeded_at(setpoint);
-    let mut up_run = 0usize;
-    let mut max_up_run = 0usize;
-    let degraded = setpoint - 10.0;
-    for pcg in 100..300u64 {
-        let tick = state.tick_single_pcg(4, pcg, degraded, None, 0);
-        if tick.pcb == 0 {
-            up_run += 1;
-            max_up_run = max_up_run.max(up_run);
-        } else {
-            up_run = 0;
-        }
-    }
-    eprintln!(
-        "  wind-up scenario: max consecutive UP run = {} PCGs ({:.1} ms)",
-        max_up_run,
-        max_up_run as f32 * 1.25
-    );
-    assert!(
-        max_up_run > 50,
-        "10 dB SINR shortfall should produce a sustained UP train; got max run {}",
-        max_up_run,
-    );
 }

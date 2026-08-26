@@ -28,7 +28,10 @@ use cdma_bts::bts::abis_agent::AbisAgentConfig;
 use cdma_bts::bts::rx::InjectedRxBlock;
 use cdma_bts::bts::{self, AccessChannelEvent, TrafficResourceService};
 use cdma_bts::channels::ftch::TrafficRate;
-use cdma_bts::channels::ftch_rc3::{ConfigRc3, ForwardTrafficChannelRc3, TrafficFrameRc3};
+use cdma_bts::channels::ftch_rc3::{
+    ConfigRc3, ForwardTrafficChannelRc3, Rc3PcgPcbScheduler, Rc3PcgPcbSchedulerHandle,
+    TrafficFrameRc3,
+};
 use cdma_bts::channels::rtch::ReverseTrafficChannelEncoder;
 use cdma_bts::lac;
 use cdma_bts::lac::message_types::MessageId;
@@ -47,7 +50,9 @@ use cdma_bts::sdr::pipe::RadioPipe;
 use cdma_bts::sdr::{cdma2000_baseband_filter_taps_f64, fir::ComplexFir32};
 
 use cdma_common::bits::Bitstream;
-use cdma_common::consts::{SERVICE_OPTION_PACKET_DATA, SERVICE_OPTION_SMS};
+use cdma_common::consts::{
+    RC3_GATED_REV_PWR_CNTL_DELAY, SERVICE_OPTION_PACKET_DATA, SERVICE_OPTION_SMS,
+};
 use cdma_common::error::Error;
 
 use cdma_packet::grpc::PacketServiceImpl;
@@ -85,17 +90,15 @@ fn scheduled_pcb_bits(
     frame_chip_start: u64,
     bits: [u8; PCGS_PER_FRAME],
     frames: usize,
-) -> cdma_bts::channels::PcgPcbSchedulerHandle {
-    let scheduler = cdma_bts::channels::PcgPcbScheduler::new(0);
+) -> Rc3PcgPcbSchedulerHandle {
+    let scheduler = Rc3PcgPcbScheduler::new(RC3_GATED_REV_PWR_CNTL_DELAY);
     let abs_pcg_start = frame_chip_start / PCG_CHIPS;
-    let mut state = scheduler.lock();
     for frame in 0..frames {
         let frame_base = abs_pcg_start + (frame as u64 * PCGS_PER_FRAME as u64);
         for (pcg, bit) in bits.iter().copied().enumerate() {
-            state.schedule(frame_base + pcg as u64, bit);
+            scheduler.schedule(frame_base + pcg as u64, bit);
         }
     }
-    drop(state);
     scheduler
 }
 
@@ -475,6 +478,7 @@ fn build_expected_bs_ack_ftch_symbols_rc3(
         scrambling_lc: LongCodeGenerator::new_traffic_channel(esn),
         puncture_lc: LongCodeGenerator::new_traffic_channel(esn),
         lc_chip_cursor: 0,
+        previous_pcg_pc_start: 0,
         pcb_scheduler: scheduled_pcb_bits(absolute_chip_start, [0; 16], 1),
         fpc_subchan_gain_linear: 1.0,
         prev_frame_last_chip: 0,
@@ -503,6 +507,7 @@ fn build_synthesized_forward_rc3_bs_ack_iq_samples(
         scrambling_lc: LongCodeGenerator::new_traffic_channel(esn),
         puncture_lc: LongCodeGenerator::new_traffic_channel(esn),
         lc_chip_cursor: 0,
+        previous_pcg_pc_start: 0,
         pcb_scheduler: scheduled_pcb_bits(absolute_chip_start, [0; 16], total_frames),
         fpc_subchan_gain_linear: 1.0,
         prev_frame_last_chip: 0,

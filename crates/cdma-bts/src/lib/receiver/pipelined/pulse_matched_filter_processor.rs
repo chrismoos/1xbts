@@ -2,9 +2,13 @@ use crate::sdr::{cdma2000_baseband_filter_taps_f64, fir::SymmetricComplexFir32};
 
 use super::{PipelineProcessor, SampleBlock};
 
-/// Applies the CDMA2000 baseband matched filter to incoming complex samples.
-/// A single complex FIR loads each (symmetric) tap once to filter both I and Q,
-/// instead of running two real filters and re-zipping their outputs.
+/// Marks samples that already carry the baseband matched filter. Every reverse
+/// chain on the 1x carrier opens with the same taps, so the RX thread filters
+/// once and the per-chain stage passes the block through.
+pub const PULSE_MATCHED_FILTERED_TAG: &str = "pulse_matched_filtered";
+
+/// Applies the CDMA2000 baseband matched filter. One complex FIR loads each
+/// symmetric tap once for both I and Q.
 pub struct PulseMatchedFilterProcessor {
     matched: SymmetricComplexFir32,
 }
@@ -20,11 +24,15 @@ impl PulseMatchedFilterProcessor {
 
 impl PipelineProcessor for PulseMatchedFilterProcessor {
     fn process_block(&mut self, block: SampleBlock) -> Vec<SampleBlock> {
+        if block.tags.contains_key(PULSE_MATCHED_FILTERED_TAG) {
+            return vec![block];
+        }
         let filtered = self.matched.process_block(&block.samples);
 
         let mut out =
             SampleBlock::new(filtered, block.chip_start).with_sample_rate_hz(block.sample_rate_hz);
         out.tags = block.tags;
+        out.tags.insert(PULSE_MATCHED_FILTERED_TAG, 1);
         vec![out]
     }
 }

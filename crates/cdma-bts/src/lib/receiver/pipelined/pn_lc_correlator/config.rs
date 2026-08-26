@@ -69,8 +69,8 @@ pub struct PnLcConfig {
     pub split_pn_reference: bool,
 
     /// Short-code PN family used by the PN/LC reference. 1x reverse paths use
-    /// legacy cdma2000; HRPD reverse access uses the access-terminal common
-    /// short-code PN sequences.
+    /// the cdma2000 sequences. HRPD reverse access uses the access-terminal
+    /// common short-code PN sequences.
     pub short_code_reference: ShortCodeReferenceKind,
 
     /// HPSK signal convention for complex samples. Existing 1x RC3 paths use
@@ -110,6 +110,11 @@ pub struct PnLcConfig {
     /// Leave false for access channels that must detect new probes continuously.
     pub suppress_search_when_locked: bool,
 
+    /// Keep search suppressed for the lifetime of an RC3 hard-validated
+    /// finger. RC1 and RC2 instead release suppression once the finger has been
+    /// without signal for `reacquire_signal_lost_chips`.
+    pub retain_search_suppression_after_validation: bool,
+
     /// When true, do not spawn a new finger if an existing active finger's
     /// acquisition delay is within `active_finger_delay_suppress_samples`.
     ///
@@ -130,17 +135,9 @@ pub struct PnLcConfig {
     /// access channel and RC3 traffic.
     pub enable_epl_tracking: bool,
 
-    /// Enable ACTIVE sub-chip timing correction using the EPL
-    /// discriminator. Requires `enable_epl_tracking == true`.
-    ///
-    /// When set, the 4-chip coherent (PN+LC aware) discriminator
-    /// `(E-L)/P` is smoothed via an IIR filter, integrated into a
-    /// fractional sub-chip accumulator, and whenever the accumulator
-    /// crosses ±1 the finger slews its `despread_phase` and
-    /// `next_prompt_offset` by one sub-sample (bidirectional). A
-    /// dead-zone suppresses noise-driven slews and a minimum spacing
-    /// between slews prevents runaway. Warmup period delays the first
-    /// slew until enough windows have accumulated.
+    /// Active sub-chip timing correction from the EPL discriminator. Requires
+    /// `enable_epl_tracking`. RC3 pilot mode slews the prompt against a fixed
+    /// PN/LC reference. Non-pilot modes slew both together.
     pub enable_epl_slew: bool,
 
     /// Use pilot-coherent 16-chip Walsh 0 accumulation for the EPL
@@ -149,16 +146,25 @@ pub struct PnLcConfig {
     /// is an always-on ungated pilot.
     pub epl_pilot: bool,
 
+    /// Reverse pilot is transmitted only in PCG phases 2 and 3 of each
+    /// four-PCG group.  CFO tracking must ignore the two silent PCGs and must
+    /// not form a phase delta across that gap.
+    pub rc3_pilot_gating_mode: bool,
+
     /// Enable the access-channel CFO tracker: locks during preamble
     /// (Walsh 0 coherent), coasts during data (noncoherent).
     /// Set true for reverse access fingers; false for traffic.
     pub access_cfo: bool,
 
-    /// Update CFO from the legacy non-pilot block-coherence estimator.
+    /// Update CFO from the non-pilot block-coherence estimator.
     ///
     /// This is unsuitable for gated RC1/RC2 traffic because most blocks can
     /// contain no transmission and 64-ary traffic is not a pilot.
     pub nonpilot_cfo_tracking: bool,
+
+    /// Track the delay of the path a finger rides, repositioning its prompt
+    /// onto the correlation peak as that delay moves during a call.
+    pub delay_tracking: bool,
 
     /// Refine the integer FFT delay to a fractional sample position during
     /// candidate verification, then use interpolation in each spawned finger.
@@ -241,13 +247,16 @@ impl PnLcConfig {
             lc_period_chips: None,
             lc_period_initial_state: 1u64 << 41,
             suppress_search_when_locked: false,
+            retain_search_suppression_after_validation: false,
             suppress_active_finger_delay_overlap: false,
             active_finger_delay_suppress_samples: 0,
             enable_epl_tracking: false,
             enable_epl_slew: false,
             epl_pilot: false,
+            rc3_pilot_gating_mode: false,
             access_cfo: false,
             nonpilot_cfo_tracking: true,
+            delay_tracking: false,
             fractional_timing_recovery: false,
             fractional_timing_half_samples: 0.5,
             fractional_timing_step_samples: 0.125,
@@ -341,6 +350,11 @@ impl PnLcConfig {
         self
     }
 
+    pub fn with_rc3_pilot_gating_mode(mut self, enable: bool) -> Self {
+        self.rc3_pilot_gating_mode = enable;
+        self
+    }
+
     pub fn with_access_cfo(mut self, enable: bool) -> Self {
         self.access_cfo = enable;
         self
@@ -348,6 +362,11 @@ impl PnLcConfig {
 
     pub fn with_nonpilot_cfo_tracking(mut self, enable: bool) -> Self {
         self.nonpilot_cfo_tracking = enable;
+        self
+    }
+
+    pub fn with_delay_tracking(mut self, enable: bool) -> Self {
+        self.delay_tracking = enable;
         self
     }
 
@@ -371,6 +390,11 @@ impl PnLcConfig {
     /// Use for traffic channels; leave false for access channels.
     pub fn with_suppress_search_when_locked(mut self, suppress: bool) -> Self {
         self.suppress_search_when_locked = suppress;
+        self
+    }
+
+    pub fn with_retained_search_suppression(mut self, retain: bool) -> Self {
+        self.retain_search_suppression_after_validation = retain;
         self
     }
 

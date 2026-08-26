@@ -80,7 +80,9 @@ pub fn power_control_verbose_summary_every() -> u64 {
 }
 
 /// Per-PCG verbose logging in the BTS reverse power-control loop.
-/// Set `CDMA_POWER_CONTROL_VERBOSE_PER_PCG=1` to log every tick.
+/// Set `CDMA_POWER_CONTROL_VERBOSE_PER_PCG=1` to log every tick. RC3 retains
+/// the values in a compact frame-batched record to keep formatting and I/O
+/// off its 800 Hz receive/control hot path.
 pub fn power_control_verbose_per_pcg() -> bool {
     static CONFIG: OnceLock<bool> = OnceLock::new();
     *CONFIG.get_or_init(|| env_bool_or("CDMA_POWER_CONTROL_VERBOSE_PER_PCG", false))
