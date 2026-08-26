@@ -609,7 +609,8 @@ export default function SubscriberDetailPage({
                 className="w-full glass-input font-mono"
               >
                 <option value={33}>SO 33 — High-Rate Packet (IS-707)</option>
-                <option value={7}>SO 7 — Async Data</option>
+                <option value={12}>SO 12 — Asynchronous Data</option>
+                <option value={7}>SO 7 — Packet Data</option>
               </select>
             </div>
             <button

@@ -14,8 +14,8 @@ use std::time::Duration;
 use log::{debug, info, warn};
 
 use cdma_common::consts::{
-    SERVICE_OPTION_BASIC_VOICE, SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_OTASP,
-    SERVICE_OPTION_PACKET_DATA, SERVICE_OPTION_SMS,
+    SERVICE_OPTION_ASYNC_DATA, SERVICE_OPTION_BASIC_VOICE, SERVICE_OPTION_HIGH_RATE_PACKET_DATA,
+    SERVICE_OPTION_OTASP, SERVICE_OPTION_PACKET_DATA, SERVICE_OPTION_SMS,
 };
 use cdma_hlr::model::{RegistrationBinding, SubscriberIdentity};
 use cdma_ios::{A1TransportError, EncodedA1Message, VoiceBearerFrame, VoiceBearerManager};
@@ -64,7 +64,9 @@ fn is_sms_traffic_service_option(so: u16) -> bool {
 fn is_packet_data_service_option(so: u16) -> bool {
     matches!(
         so,
-        SERVICE_OPTION_PACKET_DATA | SERVICE_OPTION_HIGH_RATE_PACKET_DATA
+        SERVICE_OPTION_PACKET_DATA
+            | SERVICE_OPTION_ASYNC_DATA
+            | SERVICE_OPTION_HIGH_RATE_PACKET_DATA
     )
 }
 
@@ -2628,6 +2630,12 @@ mod tests {
     fn default_so1_origination_preserves_legacy_service_option() {
         assert_eq!(resolve_mo_service_option(SERVICE_OPTION_BASIC_VOICE), 1);
         assert_eq!(resolve_mo_service_option(32768), 32768);
+    }
+
+    #[test]
+    fn so12_is_non_voice_packet_transport() {
+        assert!(is_packet_data_service_option(SERVICE_OPTION_ASYNC_DATA));
+        assert!(is_non_voice_a1_service_option(SERVICE_OPTION_ASYNC_DATA));
     }
 
     /// HLR stub that resolves a single phone number to a Registered subscriber

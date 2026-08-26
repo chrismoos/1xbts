@@ -1,0 +1,15 @@
+[package]
+name = "cdma-modem"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Interworking Function (IWF) modem emulation for the CDMA async data service (SO 12) per TIA/EIA/IS-707-A.3."
+
+[dependencies]
+log = "0.4"
+
+[lints]
+workspace = true

@@ -1,6 +1,6 @@
 use cdma_common::consts::{
-    SERVICE_OPTION_BASIC_VOICE, SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_PACKET_DATA,
-    SERVICE_OPTION_QCELP13,
+    SERVICE_OPTION_ASYNC_DATA, SERVICE_OPTION_BASIC_VOICE, SERVICE_OPTION_HIGH_RATE_PACKET_DATA,
+    SERVICE_OPTION_PACKET_DATA, SERVICE_OPTION_QCELP13,
 };
 use cdma_common::lac::paging_messages::{self as paging_messages, MsAddress, MsPageAddress};
 use log::{info, warn};
@@ -10,8 +10,29 @@ use crate::config::TrafficAssignmentConfig;
 pub(crate) fn is_packet_data_so(so: u16) -> bool {
     matches!(
         so,
-        SERVICE_OPTION_PACKET_DATA | SERVICE_OPTION_HIGH_RATE_PACKET_DATA
+        SERVICE_OPTION_PACKET_DATA
+            | SERVICE_OPTION_ASYNC_DATA
+            | SERVICE_OPTION_HIGH_RATE_PACKET_DATA
     )
+}
+
+pub(crate) fn packet_data_service_option_for_origination(
+    digits: &str,
+    requested_service_option: Option<u16>,
+    mob_p_rev: u8,
+) -> u16 {
+    let requested = requested_service_option.unwrap_or(SERVICE_OPTION_BASIC_VOICE);
+    if digits != "#777" && digits != "777" {
+        return requested;
+    }
+    if is_packet_data_so(requested) {
+        return requested;
+    }
+    if mob_p_rev < 6 {
+        SERVICE_OPTION_PACKET_DATA
+    } else {
+        SERVICE_OPTION_HIGH_RATE_PACKET_DATA
+    }
 }
 
 /// F-SCH eligibility predicate.
@@ -130,8 +151,8 @@ pub(crate) fn select_initial_traffic_rcs(
 
 /// Service-option-aware wrapper around [`select_initial_traffic_rcs`].
 ///
-/// SO1 uses the legacy RC1 configuration. QCELP-13K requires RC2 in both
-/// directions.
+/// SO1 uses the legacy RC1 configuration. SO12 and QCELP-13K require RC2 in
+/// both directions.
 pub(crate) fn select_initial_traffic_rcs_for_so(
     policy: &TrafficAssignmentConfig,
     for_rcs: &[u8],
@@ -151,7 +172,10 @@ pub(crate) fn select_initial_traffic_rcs_for_so(
         );
         return None;
     }
-    if service_option == Some(SERVICE_OPTION_QCELP13) {
+    if matches!(
+        service_option,
+        Some(SERVICE_OPTION_ASYNC_DATA | SERVICE_OPTION_QCELP13)
+    ) {
         let admits_rc2_policy =
             policy.supported_for_rcs.contains(&2) && policy.supported_rev_rcs.contains(&2);
         let admits_rc2_mobile = mob_p_rev >= 3
@@ -162,8 +186,8 @@ pub(crate) fn select_initial_traffic_rcs_for_so(
             return Some((2, 2));
         }
         warn!(
-            "BSC: QCELP-13K (SO {}) requested but RC2 not admissible (policy for={:?} rev={:?} mobile for={:?} rev={:?} mob_p_rev={})",
-            SERVICE_OPTION_QCELP13,
+            "BSC: Rate Set 2 service SO{} requested but RC2 not admissible (policy for={:?} rev={:?} mobile for={:?} rev={:?} mob_p_rev={})",
+            service_option.unwrap_or_default(),
             policy.supported_for_rcs,
             policy.supported_rev_rcs,
             for_rcs,
@@ -314,8 +338,9 @@ mod tests {
     // ---- is_packet_data_so ----
 
     #[test]
-    fn packet_data_so_7_and_33() {
+    fn data_service_options_are_classified_for_packet_transport() {
         assert!(is_packet_data_so(7));
+        assert!(is_packet_data_so(12));
         assert!(is_packet_data_so(33));
     }
 
@@ -326,6 +351,38 @@ mod tests {
         assert!(!is_packet_data_so(6));
         assert!(!is_packet_data_so(32));
         assert!(!is_packet_data_so(34));
+    }
+
+    #[test]
+    fn packet_data_dialing_preserves_the_mobile_data_service_option() {
+        assert_eq!(
+            packet_data_service_option_for_origination("#777", Some(SERVICE_OPTION_ASYNC_DATA), 3),
+            SERVICE_OPTION_ASYNC_DATA
+        );
+        assert_eq!(
+            packet_data_service_option_for_origination("777", Some(SERVICE_OPTION_PACKET_DATA), 3),
+            SERVICE_OPTION_PACKET_DATA
+        );
+        assert_eq!(
+            packet_data_service_option_for_origination(
+                "#777",
+                Some(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+                6
+            ),
+            SERVICE_OPTION_HIGH_RATE_PACKET_DATA
+        );
+    }
+
+    #[test]
+    fn packet_data_dialing_uses_generation_appropriate_fallback() {
+        assert_eq!(
+            packet_data_service_option_for_origination("#777", Some(SERVICE_OPTION_BASIC_VOICE), 3),
+            SERVICE_OPTION_PACKET_DATA
+        );
+        assert_eq!(
+            packet_data_service_option_for_origination("#777", None, 6),
+            SERVICE_OPTION_HIGH_RATE_PACKET_DATA
+        );
     }
 
     // ---- format_ms_address / parse_sms_target_address round-trips ----
@@ -688,6 +745,20 @@ mod tests {
             None,
             3,
             Some(SERVICE_OPTION_QCELP13),
+        );
+        assert_eq!(result, Some((2, 2)));
+    }
+
+    #[test]
+    fn async_data_p_rev3_selects_rc2_despite_legacy_capability_vectors() {
+        let result = select_initial_traffic_rcs_for_so(
+            &default_policy(),
+            &[1],
+            &[1],
+            None,
+            None,
+            3,
+            Some(SERVICE_OPTION_ASYNC_DATA),
         );
         assert_eq!(result, Some((2, 2)));
     }

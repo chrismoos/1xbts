@@ -385,16 +385,35 @@ impl Bsc {
                 tc.mark_active();
             }
         } else {
-            let is_packet_data = self
-                .mobiles
-                .get_traffic_channel(walsh_code)
-                .map_or(false, |tc| is_packet_data_so(tc.service_option));
+            let (is_packet_data, a1_call_id, should_send_assignment_complete, service_option) =
+                self.mobiles
+                    .get_traffic_channel(walsh_code)
+                    .map(|tc| {
+                        (
+                            is_packet_data_so(tc.service_option),
+                            tc.a1_call_id,
+                            tc.is_service_connecting() || tc.is_waiting_ms_ack(),
+                            tc.service_option,
+                        )
+                    })
+                    .unwrap_or((false, None, false, 0));
             if is_packet_data {
                 info!(
                     "BSC: packet-data service accepted on walsh={} for {} after {}",
                     walsh_code,
                     format_ms_address(addr),
                     trigger
+                );
+            }
+            if is_packet_data
+                && should_send_assignment_complete
+                && let Some(call_id) = a1_call_id
+            {
+                self.a1.send_assignment_complete(
+                    &self.mobiles,
+                    call_id,
+                    walsh_code,
+                    service_option,
                 );
             }
             if let Some(tc) = self.mobiles.get_traffic_channel_mut(walsh_code) {

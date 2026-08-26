@@ -7,9 +7,9 @@ use crate::config::{PagingRetryConfig, TrafficAssignmentConfig, TrafficRetryConf
 use cdma_abis::bearer::{ChannelFamily, FrameContent, ReverseFchDcchFrame};
 use cdma_bts::bts::PagingChannelSettings;
 use cdma_common::consts::{
-    SERVICE_OPTION_BASIC_VOICE, SERVICE_OPTION_EVRC_A, SERVICE_OPTION_HIGH_RATE_PACKET_DATA,
-    SERVICE_OPTION_PACKET_DATA, SERVICE_OPTION_QCELP13, SERVICE_OPTION_REJECTED,
-    SERVICE_OPTION_SMS,
+    SERVICE_OPTION_ASYNC_DATA, SERVICE_OPTION_BASIC_VOICE, SERVICE_OPTION_EVRC_A,
+    SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_PACKET_DATA, SERVICE_OPTION_QCELP13,
+    SERVICE_OPTION_REJECTED, SERVICE_OPTION_SMS,
 };
 use cdma_common::error::Error;
 use cdma_common::lac::paging_messages::MsAddress;
@@ -4679,6 +4679,87 @@ async fn packet_data_origination_assigns_non_voice_traffic_channel() {
     assert!(matches!(tc.channel_state, ChannelState::Assigned { .. }));
     assert!(tc.recent_primary_frames.is_empty());
     assert_eq!(traffic_rx_pool.lock().len(), 1);
+}
+
+#[tokio::test]
+async fn so12_p_rev3_origination_assigns_rc2_packet_traffic() {
+    use std::sync::{Arc, mpsc::channel};
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
+    let walsh_allocator = Arc::new(Mutex::new(WalshAllocator::new()));
+    let traffic_rx_pool = Arc::new(Mutex::new(Vec::new()));
+    let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
+    let bts_client = test_capturing_bts_client(
+        walsh_allocator,
+        traffic_channels,
+        traffic_rx_pool.clone(),
+        traffic_rx_removals,
+    );
+
+    let mut bsc = Bsc::new(Config {
+        pilot_offset: 0,
+        overhead: OverheadParameters::default(),
+        paging: PagingChannelSettings::default(),
+        traffic_assignment: TrafficAssignmentConfig::default(),
+        access_event_rx: None,
+        access_event_broadcast: None,
+        sms_request_rx: None,
+        sms_request_tx: None,
+        data_request_rx: None,
+        data_request_tx: None,
+        power_override_request_rx: None,
+        power_override_request_tx: None,
+        mobiles_tx: None,
+        paging_broadcast: None,
+        traffic_broadcast: None,
+        rx_reference_dbm: None,
+        hlr_repo: None,
+        msc_client: test_msc_client(),
+        bts_client: Some(bts_client.clone() as Arc<dyn BtsControlClient>),
+        traffic_retry: TrafficRetryConfig::default(),
+        paging_retry: PagingRetryConfig::default(),
+        voice_policy: test_voice_policy(),
+        pcf_client: None,
+        mobile_idle_timeout_s: 0,
+        bts_paging_state: None,
+        node_id: "bsc-test".to_string(),
+        msc_voice_bearer: None,
+    });
+
+    let mut origination = test_access_event();
+    origination.message_id = MessageId::Origination;
+    origination.msg_type_name = "Origination Message".to_string();
+    origination.msg_seq = Some(2);
+    origination.ack_req = true;
+    origination.esn = Some(0xb3d5_f586);
+    origination.imsi_m_s1 = Some(0x0091_989e);
+    origination.imsi_m_s2 = Some(0x0326);
+    origination.imsi_class = Some(0);
+    origination.imsi_mcc = Some(310);
+    origination.imsi_11_12 = Some(99);
+    origination.mob_p_rev = Some(3);
+    origination.slot_cycle_index = Some(2);
+    origination.scm = Some(0x6a);
+    origination.service_option = Some(SERVICE_OPTION_ASYNC_DATA);
+    origination.for_supported_rcs = vec![1];
+    origination.rev_supported_rcs = vec![1];
+
+    bsc.inject_access_event(origination).await;
+
+    let tc = bsc.mobiles[0]
+        .traffic_channel
+        .as_ref()
+        .expect("SO12 traffic channel should be assigned");
+    assert_eq!(tc.service_option, SERVICE_OPTION_ASYNC_DATA);
+    assert_eq!((tc.for_rc, tc.rev_rc), (2, 2));
+    assert_eq!(
+        tc.service_negotiation_mode,
+        ServiceNegotiationMode::ServiceNegotiation
+    );
+    assert_eq!(traffic_rx_pool.lock()[0].assigned_rev_rc, 2);
+    assert_eq!(
+        pch_message_types(&bts_client),
+        vec![MessageId::Order, MessageId::ChannelAssignment]
+    );
 }
 
 #[tokio::test]

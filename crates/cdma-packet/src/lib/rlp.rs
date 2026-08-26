@@ -1,9 +1,6 @@
 //! RLP Type 1 frame codec per IS-707-A.2 (TIA/EIA/IS-707-A Chapter 2).
 //!
-//! Supports Multiplex Option 1 primary traffic frame sizes:
-//!   Rate 1:   171 bits
-//!   Rate 1/2:  80 bits
-//!   Rate 1/8:  16 bits
+//! Supports Multiplex Options 1 and 2 primary traffic frame sizes.
 //!
 //! Frame types:
 //!   - Control (SYNC, SYNC/ACK, ACK, NAK) per 4.3.1
@@ -15,21 +12,74 @@
 /// Traffic channel rate for an RLP frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RlpRate {
-    /// 9600 bps, 171 primary bits (Multiplex Option 1)
     Full,
-    /// 4800 bps, 80 primary bits (Multiplex Option 1)
     Half,
-    /// 1200 bps, 16 primary bits (Multiplex Option 1)
+    Quarter,
     Eighth,
 }
 
-impl RlpRate {
-    /// Number of primary traffic bits for this rate under Multiplex Option 1.
-    pub fn primary_bits(self) -> usize {
+/// Traffic-channel multiplex option: `One` = Rate Set 1, `Two` = Rate Set 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RlpMuxOption {
+    One,
+    Two,
+}
+
+impl RlpMuxOption {
+    pub const fn rate_from_bps(self, rate_bps: u32) -> Option<RlpRate> {
+        match (self, rate_bps) {
+            (Self::One, 9_600) | (Self::Two, 14_400) => Some(RlpRate::Full),
+            (Self::One, 4_800) | (Self::Two, 7_200) => Some(RlpRate::Half),
+            (Self::Two, 3_600) => Some(RlpRate::Quarter),
+            (Self::One, 1_200) | (Self::Two, 1_800) => Some(RlpRate::Eighth),
+            _ => None,
+        }
+    }
+
+    pub const fn rate_bps(self, rate: RlpRate) -> u32 {
+        match (self, rate) {
+            (Self::One, RlpRate::Full) => 9_600,
+            (Self::One, RlpRate::Half) => 4_800,
+            (Self::One, RlpRate::Quarter) => 2_400,
+            (Self::One, RlpRate::Eighth) => 1_200,
+            (Self::Two, RlpRate::Full) => 14_400,
+            (Self::Two, RlpRate::Half) => 7_200,
+            (Self::Two, RlpRate::Quarter) => 3_600,
+            (Self::Two, RlpRate::Eighth) => 1_800,
+        }
+    }
+
+    pub fn primary_bits(self, rate: RlpRate) -> usize {
+        match (self, rate) {
+            (Self::One, RlpRate::Full) => 171,
+            (Self::One, RlpRate::Half) => 80,
+            (Self::One, RlpRate::Quarter) => 40,
+            (Self::One, RlpRate::Eighth) => 16,
+            (Self::Two, RlpRate::Full) => 266,
+            (Self::Two, RlpRate::Half) => 124,
+            (Self::Two, RlpRate::Quarter) => 54,
+            (Self::Two, RlpRate::Eighth) => 20,
+        }
+    }
+
+    pub(crate) fn full_information_bits(self) -> usize {
         match self {
-            RlpRate::Full => 171,
-            RlpRate::Half => 80,
-            RlpRate::Eighth => 16,
+            Self::One => 168,
+            Self::Two => 264,
+        }
+    }
+
+    pub const fn format_b_octets(self) -> usize {
+        match self {
+            Self::One => 20,
+            Self::Two => 32,
+        }
+    }
+
+    pub const fn full_format_a_octets(self) -> usize {
+        match self {
+            Self::One => 19,
+            Self::Two => 31,
         }
     }
 }
@@ -106,10 +156,9 @@ pub enum RlpFrame {
         data: Vec<u8>,
     },
     /// Format B data frame (full rate only, max throughput).
-    /// Always carries exactly 20 octets for MuxOpt 1.
     DataFormatB {
         seq: u8,
-        /// Always 20 octets for Multiplex Option 1.
+        /// Exactly 20 octets for Multiplex Option 1 or 32 for Option 2.
         data: Vec<u8>,
     },
     /// Segmented data frame (retransmissions only).
@@ -134,6 +183,8 @@ pub enum RlpEncodeError {
     },
     /// Rate 1 Format B is defined as exactly 20 octets for Mux Option 1.
     FormatBRequiresTwentyOctets { len: usize },
+    /// Rate 1 Format B is defined as exactly 32 octets for Mux Option 2.
+    FormatBRequiresThirtyTwoOctets { len: usize },
     /// Format B is only valid for Rate 1 frames.
     FormatBRequiresFullRate { rate: RlpRate },
     /// This frame type is not valid at Rate 1/8 for Mux Option 1.
@@ -158,11 +209,14 @@ impl std::fmt::Display for RlpEncodeError {
             RlpEncodeError::FormatBRequiresTwentyOctets { len } => {
                 write!(f, "RLP Format B requires exactly 20 octets, got {len}")
             }
+            RlpEncodeError::FormatBRequiresThirtyTwoOctets { len } => {
+                write!(f, "RLP Format B requires exactly 32 octets, got {len}")
+            }
             RlpEncodeError::FormatBRequiresFullRate { rate } => {
                 write!(f, "RLP Format B is only valid at full rate, got {rate:?}")
             }
             RlpEncodeError::EighthRateDataCarrier => {
-                write!(f, "Mux Option 1 Rate 1/8 RLP frames are idle-only")
+                write!(f, "Rate 1/8 RLP frames are idle-only")
             }
             RlpEncodeError::SegmentedDataRequiresNonZeroLen => {
                 write!(f, "RLP segmented data frames require non-zero LEN")
@@ -198,20 +252,27 @@ impl RlpFrame {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Encoding
-// ---------------------------------------------------------------------------
 
 /// Encode an RLP frame into a bit vector at the given rate.
 ///
-/// Returns a `Vec<u8>` of individual bit values (0 or 1), length = rate.primary_bits().
+/// This compatibility entry point uses Multiplex Option 1.
 pub fn encode_frame(frame: &RlpFrame, rate: RlpRate) -> Result<Vec<u8>, RlpEncodeError> {
-    let total_bits = rate.primary_bits();
+    encode_frame_for_mux(frame, rate, RlpMuxOption::One)
+}
+
+/// Encode an RLP frame for the selected multiplex option.
+pub fn encode_frame_for_mux(
+    frame: &RlpFrame,
+    rate: RlpRate,
+    mux_option: RlpMuxOption,
+) -> Result<Vec<u8>, RlpEncodeError> {
+    let total_bits = mux_option.primary_bits(rate);
     let mut bits = vec![0u8; total_bits];
 
     match (frame, rate) {
         (RlpFrame::Idle { seq }, RlpRate::Eighth) => {
-            // 4.3.3: SEQ(8) + FCS(8) = 16 bits
+            // SEQ(8) + FCS(8), followed by four padding bits for Mux Option 2.
             let fcs = nordstrom_robinson_fcs(*seq);
             put_bits(&mut bits, 0, *seq, 8);
             put_bits(&mut bits, 8, fcs, 8);
@@ -219,7 +280,7 @@ pub fn encode_frame(frame: &RlpFrame, rate: RlpRate) -> Result<Vec<u8>, RlpEncod
 
         (RlpFrame::Idle { seq }, _) => {
             // Higher-rate idle: encode as unsegmented data with LEN=0.
-            encode_data_format_a(&mut bits, rate, *seq, &[])?;
+            encode_data_format_a(&mut bits, rate, mux_option, *seq, &[])?;
         }
 
         (
@@ -232,33 +293,34 @@ pub fn encode_frame(frame: &RlpFrame, rate: RlpRate) -> Result<Vec<u8>, RlpEncod
             },
             rate,
         ) => {
-            // Build the 168-bit information field for Format A, then wrap.
+            // Build the information field for Format A, then wrap it.
             // Control frame: SEQ(8) + CTL(6) + ENCRYPTION_MODE(2) + FIRST(8) + LAST(8) + FCS(16)
             // = 48 bits, rest padded with zeros.
-            let mut info = vec![0u8; 168];
+            let information_bits = mux_option.full_information_bits();
+            let mut info = vec![0u8; information_bits];
             put_bits(&mut info, 0, *seq, 8);
             put_bits(&mut info, 8, control_type.ctl_bits(), 6);
             put_bits(&mut info, 14, *encryption_mode, 2);
             put_bits(&mut info, 16, *first, 8);
             put_bits(&mut info, 24, *last, 8);
-            // FCS-16 covers SEQ + CTL + ENCRYPTION_MODE + FIRST + LAST = bits 0..32
-            let fcs = crc16_rlp(&info[0..32]);
-            put_bits(&mut info, 32, (fcs >> 8) as u8, 8);
-            put_bits(&mut info, 40, (fcs & 0xFF) as u8, 8);
+            // FCS-16 covers SEQ + CTL + ENCRYPTION_MODE + FIRST + LAST = bits 0..32,
+            // transmitted low-octet first (RFC 1662).
+            let fcs = fcs16_rfc1662(&info[0..32]);
+            put_bits(&mut info, 32, (fcs & 0xFF) as u8, 8);
+            put_bits(&mut info, 40, (fcs >> 8) as u8, 8);
             // bits 48..168 are already zero (padding)
 
             match rate {
                 RlpRate::Full => {
-                    // Format A: Information(168) + TYPE(3='001') = 171
-                    bits[..168].copy_from_slice(&info);
-                    put_bits(&mut bits, 168, 0b001, 3);
+                    bits[..information_bits].copy_from_slice(&info);
+                    match mux_option {
+                        RlpMuxOption::One => put_bits(&mut bits, information_bits, 0b001, 3),
+                        RlpMuxOption::Two => put_bits(&mut bits, information_bits, 0b01, 2),
+                    }
                 }
-                RlpRate::Half => {
-                    // Control frames at half rate: the frame format per 4.3.1 applies
-                    // directly (no TYPE field). 80 bits available.
-                    // SEQ(8) + CTL(6) + ENCRYPTION_MODE(2) + FIRST(8) + LAST(8) + FCS(16) = 48
-                    // + 32 bits padding = 80
-                    bits[..80].copy_from_slice(&info[..80]);
+                RlpRate::Half | RlpRate::Quarter => {
+                    let frame_bits = bits.len();
+                    bits.copy_from_slice(&info[..frame_bits]);
                 }
                 RlpRate::Eighth => {
                     return Err(RlpEncodeError::EighthRateDataCarrier);
@@ -267,19 +329,30 @@ pub fn encode_frame(frame: &RlpFrame, rate: RlpRate) -> Result<Vec<u8>, RlpEncod
         }
 
         (RlpFrame::Data { seq, data }, rate) => {
-            encode_data_format_a(&mut bits, rate, *seq, data)?;
+            encode_data_format_a(&mut bits, rate, mux_option, *seq, data)?;
         }
 
         (RlpFrame::DataFormatB { seq, data }, RlpRate::Full) => {
-            if data.len() != 20 {
-                return Err(RlpEncodeError::FormatBRequiresTwentyOctets { len: data.len() });
+            let required_octets = mux_option.format_b_octets();
+            if data.len() != required_octets {
+                return Err(match mux_option {
+                    RlpMuxOption::One => {
+                        RlpEncodeError::FormatBRequiresTwentyOctets { len: data.len() }
+                    }
+                    RlpMuxOption::Two => {
+                        RlpEncodeError::FormatBRequiresThirtyTwoOctets { len: data.len() }
+                    }
+                });
             }
-            // 4.3.2.3.2: SEQ(8) + Data(160) + TYPE(3='010') = 171 bits
             put_bits(&mut bits, 0, *seq, 8);
             for (i, byte) in data.iter().enumerate() {
                 put_bits(&mut bits, 8 + i * 8, *byte, 8);
             }
-            put_bits(&mut bits, 168, 0b010, 3);
+            let information_bits = mux_option.full_information_bits();
+            match mux_option {
+                RlpMuxOption::One => put_bits(&mut bits, information_bits, 0b010, 3),
+                RlpMuxOption::Two => put_bits(&mut bits, information_bits, 0b10, 2),
+            }
         }
 
         (RlpFrame::DataFormatB { .. }, rate) => {
@@ -294,7 +367,7 @@ pub fn encode_frame(frame: &RlpFrame, rate: RlpRate) -> Result<Vec<u8>, RlpEncod
             },
             rate,
         ) => {
-            encode_segmented(&mut bits, rate, *seq, *segment_type, data)?;
+            encode_segmented(&mut bits, rate, mux_option, *seq, *segment_type, data)?;
         }
     }
 
@@ -304,18 +377,18 @@ pub fn encode_frame(frame: &RlpFrame, rate: RlpRate) -> Result<Vec<u8>, RlpEncod
 fn encode_data_format_a(
     bits: &mut [u8],
     rate: RlpRate,
+    mux_option: RlpMuxOption,
     seq: u8,
     data: &[u8],
 ) -> Result<(), RlpEncodeError> {
     match rate {
         RlpRate::Full => {
-            // Format A: Information(168) + TYPE(3='001') = 171
-            // Information = unsegmented data frame: SEQ(8) + CTL(1='0') + LEN(7) + Data(8*LEN) + padding
-            if data.len() > 19 {
+            let max_len = max_len_for_rate(rate, mux_option);
+            if data.len() > max_len {
                 return Err(RlpEncodeError::DataTooLong {
                     rate,
                     len: data.len(),
-                    max_len: 19,
+                    max_len,
                 });
             }
             let len = data.len() as u8;
@@ -326,16 +399,19 @@ fn encode_data_format_a(
                 put_bits(bits, 16 + i * 8, *byte, 8);
             }
             // padding already zero
-            put_bits(bits, 168, 0b001, 3); // TYPE
+            let information_bits = mux_option.full_information_bits();
+            match mux_option {
+                RlpMuxOption::One => put_bits(bits, information_bits, 0b001, 3),
+                RlpMuxOption::Two => put_bits(bits, information_bits, 0b01, 2),
+            }
         }
-        RlpRate::Half => {
-            // 80 bits, no TYPE field. Unsegmented data frame directly.
-            // SEQ(8) + CTL(1='0') + LEN(7) + Data(8*LEN) + padding = 80 bits
-            if data.len() > 8 {
+        RlpRate::Half | RlpRate::Quarter => {
+            let max_len = max_len_for_rate(rate, mux_option);
+            if data.len() > max_len {
                 return Err(RlpEncodeError::DataTooLong {
                     rate,
                     len: data.len(),
-                    max_len: 8,
+                    max_len,
                 });
             }
             let len = data.len() as u8;
@@ -356,6 +432,7 @@ fn encode_data_format_a(
 fn encode_segmented(
     bits: &mut [u8],
     rate: RlpRate,
+    mux_option: RlpMuxOption,
     seq: u8,
     seg_type: SegmentType,
     data: &[u8],
@@ -370,7 +447,6 @@ fn encode_segmented(
 
     let offset = match rate {
         RlpRate::Full => {
-            // Wrap in Format A: Information(168) + TYPE(3='001')
             put_bits(bits, 0, seq, 8);
             put_bits(bits, 8, ctl, 4);
             if seg_type != SegmentType::IntersegmentFill {
@@ -396,10 +472,14 @@ fn encode_segmented(
                     max_len: 0,
                 });
             }
-            put_bits(bits, 168, 0b001, 3);
+            let information_bits = mux_option.full_information_bits();
+            match mux_option {
+                RlpMuxOption::One => put_bits(bits, information_bits, 0b001, 3),
+                RlpMuxOption::Two => put_bits(bits, information_bits, 0b01, 2),
+            }
             return Ok(());
         }
-        RlpRate::Half => {
+        RlpRate::Half | RlpRate::Quarter => {
             put_bits(bits, 0, seq, 8);
             put_bits(bits, 8, ctl, 4);
             12
@@ -408,7 +488,7 @@ fn encode_segmented(
     };
 
     if seg_type != SegmentType::IntersegmentFill {
-        let max_len = max_len_for_rate_segmented(rate);
+        let max_len = max_len_for_rate_segmented(rate, mux_option);
         let max_len = max_len.min(15);
         if data.is_empty() {
             return Err(RlpEncodeError::SegmentedDataRequiresNonZeroLen);
@@ -435,23 +515,30 @@ fn encode_segmented(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // Decoding
-// ---------------------------------------------------------------------------
 
 /// Decode an RLP frame from a bit vector at the given rate.
 ///
 /// `bits` must contain individual bit values (0 or 1).
 /// Returns `None` if the frame is invalid.
 pub fn decode_frame(bits: &[u8], rate: RlpRate) -> Option<RlpFrame> {
-    if bits.len() < rate.primary_bits() {
+    decode_frame_for_mux(bits, rate, RlpMuxOption::One)
+}
+
+/// Decode an RLP frame for the selected multiplex option.
+pub fn decode_frame_for_mux(
+    bits: &[u8],
+    rate: RlpRate,
+    mux_option: RlpMuxOption,
+) -> Option<RlpFrame> {
+    if bits.len() < mux_option.primary_bits(rate) {
         return None;
     }
 
     match rate {
         RlpRate::Eighth => decode_idle(bits),
-        RlpRate::Half => decode_non_full_rate(bits, rate),
-        RlpRate::Full => decode_full_rate(bits),
+        RlpRate::Half | RlpRate::Quarter => decode_non_full_rate(bits, rate, mux_option),
+        RlpRate::Full => decode_full_rate(bits, mux_option),
     }
 }
 
@@ -466,8 +553,7 @@ fn decode_idle(bits: &[u8]) -> Option<RlpFrame> {
     Some(RlpFrame::Idle { seq })
 }
 
-fn decode_non_full_rate(bits: &[u8], rate: RlpRate) -> Option<RlpFrame> {
-    // Half rate (80 bits): no TYPE field.
+fn decode_non_full_rate(bits: &[u8], rate: RlpRate, mux_option: RlpMuxOption) -> Option<RlpFrame> {
     // Check MSB of bit 8 to distinguish control (CTL MSB='1') from data (CTL='0').
     let seq = get_bits(bits, 0, 8) as u8;
     let ctl_msb = bits[8];
@@ -475,7 +561,7 @@ fn decode_non_full_rate(bits: &[u8], rate: RlpRate) -> Option<RlpFrame> {
     if ctl_msb == 0 {
         // Unsegmented data: CTL(1='0') + LEN(7) + Data
         let len = get_bits(bits, 9, 7) as usize;
-        let max_len = max_len_for_rate(rate);
+        let max_len = max_len_for_rate(rate, mux_option);
         if len > max_len {
             return None;
         }
@@ -501,10 +587,11 @@ fn decode_non_full_rate(bits: &[u8], rate: RlpRate) -> Option<RlpFrame> {
             let encryption_mode = get_bits(bits, 14, 2) as u8;
             let first = get_bits(bits, 16, 8) as u8;
             let last = get_bits(bits, 24, 8) as u8;
-            let fcs_hi = get_bits(bits, 32, 8) as u8;
-            let fcs_lo = get_bits(bits, 40, 8) as u8;
+            // FCS is transmitted low-octet first (RFC 1662).
+            let fcs_lo = get_bits(bits, 32, 8) as u8;
+            let fcs_hi = get_bits(bits, 40, 8) as u8;
             let received_fcs = ((fcs_hi as u16) << 8) | fcs_lo as u16;
-            let computed_fcs = crc16_rlp(&bits[0..32]);
+            let computed_fcs = fcs16_rfc1662(&bits[0..32]);
             if received_fcs != computed_fcs {
                 return None;
             }
@@ -536,7 +623,7 @@ fn decode_non_full_rate(bits: &[u8], rate: RlpRate) -> Option<RlpFrame> {
             if len == 0 {
                 return None; // segmented frames shall not have LEN=0
             }
-            let max_len = max_len_for_rate_segmented(rate);
+            let max_len = max_len_for_rate_segmented(rate, mux_option);
             if len > max_len {
                 return None;
             }
@@ -553,19 +640,19 @@ fn decode_non_full_rate(bits: &[u8], rate: RlpRate) -> Option<RlpFrame> {
     }
 }
 
-fn decode_full_rate(bits: &[u8]) -> Option<RlpFrame> {
-    // 171 bits. Last 3 bits = TYPE field (4.3.2.3).
-    let frame_type = get_bits(bits, 168, 3) as u8;
+fn decode_full_rate(bits: &[u8], mux_option: RlpMuxOption) -> Option<RlpFrame> {
+    let information_bits = mux_option.full_information_bits();
+    let (type_bits, format_a_type, format_b_type) = match mux_option {
+        RlpMuxOption::One => (3, 0b001, 0b010),
+        RlpMuxOption::Two => (2, 0b01, 0b10),
+    };
+    let frame_type = get_bits(bits, information_bits, type_bits) as u8;
     match frame_type {
-        0b001 => {
-            // Format A: Information(168) contains control or data frame.
-            decode_non_full_rate(bits, RlpRate::Full)
-        }
-        0b010 => {
-            // Format B: SEQ(8) + Data(160=20 octets) + TYPE(3)
+        value if value == format_a_type => decode_non_full_rate(bits, RlpRate::Full, mux_option),
+        value if value == format_b_type => {
             let seq = get_bits(bits, 0, 8) as u8;
-            let mut data = vec![0u8; 20];
-            for i in 0..20 {
+            let mut data = vec![0u8; mux_option.format_b_octets()];
+            for i in 0..data.len() {
                 data[i] = get_bits(bits, 8 + i * 8, 8) as u8;
             }
             Some(RlpFrame::DataFormatB { seq, data })
@@ -574,39 +661,40 @@ fn decode_full_rate(bits: &[u8]) -> Option<RlpFrame> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Max data lengths per Table 4.3.2.1-1
-// ---------------------------------------------------------------------------
 
-/// Maximum data length (LEN) for unsegmented data frames per rate (MuxOpt 1 primary).
-fn max_len_for_rate(rate: RlpRate) -> usize {
-    match rate {
-        RlpRate::Full => 19, // Format A
-        RlpRate::Half => 8,
-        RlpRate::Eighth => 0, // idle only
+/// Maximum data length (LEN) for unsegmented data frames.
+fn max_len_for_rate(rate: RlpRate, mux_option: RlpMuxOption) -> usize {
+    match (mux_option, rate) {
+        (RlpMuxOption::One, RlpRate::Full) => 19,
+        (RlpMuxOption::One, RlpRate::Half) => 8,
+        (RlpMuxOption::One, RlpRate::Quarter | RlpRate::Eighth) => 0,
+        (RlpMuxOption::Two, RlpRate::Full) => 31,
+        (RlpMuxOption::Two, RlpRate::Half) => 13,
+        (RlpMuxOption::Two, RlpRate::Quarter) => 4,
+        (RlpMuxOption::Two, RlpRate::Eighth) => 0,
     }
 }
 
 /// Maximum data length for segmented frames.
-fn max_len_for_rate_segmented(rate: RlpRate) -> usize {
-    // Segmented frames use 4-bit LEN, max 15, but also constrained by frame size.
-    // At half rate: (80 - 8 - 4 - 4) / 8 = 8 octets max
-    match rate {
-        RlpRate::Full => 15, // in the 168-bit info field: (168 - 8 - 4 - 4) / 8 = 19, but LEN is 4 bits so max 15
-        RlpRate::Half => 8,
-        RlpRate::Eighth => 0,
+fn max_len_for_rate_segmented(rate: RlpRate, mux_option: RlpMuxOption) -> usize {
+    match (mux_option, rate) {
+        (_, RlpRate::Full) => 15,
+        (RlpMuxOption::One, RlpRate::Half) => 8,
+        (RlpMuxOption::One, RlpRate::Quarter | RlpRate::Eighth) => 0,
+        (RlpMuxOption::Two, RlpRate::Half) => 13,
+        (RlpMuxOption::Two, RlpRate::Quarter) => 4,
+        (RlpMuxOption::Two, RlpRate::Eighth) => 0,
     }
 }
 
-// ---------------------------------------------------------------------------
 // CRC-16 per RFC 1662 (used for control frame FCS)
-// ---------------------------------------------------------------------------
 
 /// Compute the 16-bit FCS per RFC 1662 over a slice of individual bits (0/1 values).
 ///
 /// Polynomial: x^16 + x^12 + x^5 + 1 (0x8408 reflected).
 /// Initial value: 0xFFFF. Final XOR: 0xFFFF.
-fn crc16_rlp(bits: &[u8]) -> u16 {
+pub(crate) fn crc16_rlp(bits: &[u8]) -> u16 {
     let mut crc: u16 = 0xFFFF;
     for &bit in bits {
         let b = (bit & 1) as u16;
@@ -619,9 +707,33 @@ fn crc16_rlp(bits: &[u8]) -> u16 {
     crc ^ 0xFFFF
 }
 
-// ---------------------------------------------------------------------------
+/// RLP control-frame FCS-16 per RFC 1662, as real mobiles compute it.
+///
+/// The covered field bits are grouped into octets (MSB-first, as laid out in
+/// the frame), and each octet is processed least-significant-bit first with the
+/// reflected 0x8408 polynomial, then the result is complemented. The 16-bit
+/// value is transmitted low-octet first (RFC 1662 §3.1). This differs from a
+/// straight MSB-first bit CRC, which does not match on-air control frames.
+pub(crate) fn fcs16_rfc1662(bits: &[u8]) -> u16 {
+    let mut fcs: u16 = 0xFFFF;
+    for octet in bits.chunks(8) {
+        let mut byte = 0u8;
+        for (i, &b) in octet.iter().enumerate() {
+            byte |= (b & 1) << (7 - i);
+        }
+        fcs ^= byte as u16;
+        for _ in 0..8 {
+            if fcs & 1 != 0 {
+                fcs = (fcs >> 1) ^ 0x8408;
+            } else {
+                fcs >>= 1;
+            }
+        }
+    }
+    !fcs
+}
+
 // Nordstrom-Robinson FCS for idle frames (Table 4.3.3-1)
-// ---------------------------------------------------------------------------
 
 /// Modified Nordstrom-Robinson code lookup table (Table 4.3.3-1 in IS-707-A.2).
 ///
@@ -664,12 +776,10 @@ pub fn nordstrom_robinson_fcs(seq: u8) -> u8 {
     (NORDSTROM_ROBINSON_TABLE[index] & 0xFF) as u8
 }
 
-// ---------------------------------------------------------------------------
 // Bit manipulation helpers
-// ---------------------------------------------------------------------------
 
 /// Extract `n` bits from a bit array starting at `offset`, MSB first.
-fn get_bits(bits: &[u8], offset: usize, n: usize) -> u32 {
+pub(crate) fn get_bits(bits: &[u8], offset: usize, n: usize) -> u32 {
     let mut val: u32 = 0;
     for i in 0..n {
         val = (val << 1) | (bits[offset + i] as u32 & 1);
@@ -678,15 +788,13 @@ fn get_bits(bits: &[u8], offset: usize, n: usize) -> u32 {
 }
 
 /// Put `n` bits of `val` into a bit array starting at `offset`, MSB first.
-fn put_bits(bits: &mut [u8], offset: usize, val: u8, n: usize) {
+pub(crate) fn put_bits(bits: &mut [u8], offset: usize, val: u8, n: usize) {
     for i in 0..n {
         bits[offset + i] = (val >> (n - 1 - i)) & 1;
     }
 }
 
-// ---------------------------------------------------------------------------
 // Constructor helpers for common frames
-// ---------------------------------------------------------------------------
 
 /// Create a SYNC control frame.
 pub fn sync_frame(seq: u8) -> RlpFrame {
@@ -753,9 +861,7 @@ pub fn idle_frame(seq: u8) -> RlpFrame {
     RlpFrame::Idle { seq }
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -885,6 +991,52 @@ mod tests {
         let bits = encode_frame(&frame, RlpRate::Full).unwrap();
         assert_eq!(bits.len(), 171);
         let decoded = decode_frame(&bits, RlpRate::Full).unwrap();
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn mux_option_two_idle_round_trip() {
+        let frame = idle_frame(42);
+        let bits = encode_frame_for_mux(&frame, RlpRate::Eighth, RlpMuxOption::Two).unwrap();
+        assert_eq!(bits.len(), 20);
+        assert_eq!(&bits[16..], &[0, 0, 0, 0]);
+        let decoded = decode_frame_for_mux(&bits, RlpRate::Eighth, RlpMuxOption::Two).unwrap();
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn mux_option_two_format_a_round_trips_all_data_rates() {
+        for (rate, octets, bits_len) in [
+            (RlpRate::Full, 31, 266),
+            (RlpRate::Half, 13, 124),
+            (RlpRate::Quarter, 4, 54),
+        ] {
+            let data: Vec<u8> = (0..octets).map(|value| value as u8).collect();
+            let frame = data_frame(91, &data);
+            let bits = encode_frame_for_mux(&frame, rate, RlpMuxOption::Two).unwrap();
+            assert_eq!(bits.len(), bits_len);
+            let decoded = decode_frame_for_mux(&bits, rate, RlpMuxOption::Two).unwrap();
+            assert_eq!(decoded, frame);
+        }
+    }
+
+    #[test]
+    fn mux_option_two_format_b_round_trip() {
+        let data: Vec<u8> = (0..32).collect();
+        let frame = data_format_b_frame(77, &data);
+        let bits = encode_frame_for_mux(&frame, RlpRate::Full, RlpMuxOption::Two).unwrap();
+        assert_eq!(bits.len(), 266);
+        assert_eq!(&bits[264..], &[1, 0]);
+        let decoded = decode_frame_for_mux(&bits, RlpRate::Full, RlpMuxOption::Two).unwrap();
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn mux_option_two_control_frame_round_trip() {
+        let frame = sync_frame(0);
+        let bits = encode_frame_for_mux(&frame, RlpRate::Full, RlpMuxOption::Two).unwrap();
+        assert_eq!(&bits[264..], &[0, 1]);
+        let decoded = decode_frame_for_mux(&bits, RlpRate::Full, RlpMuxOption::Two).unwrap();
         assert_eq!(decoded, frame);
     }
 
@@ -1019,5 +1171,46 @@ mod tests {
         let bits = encode_frame(&frame, RlpRate::Full).unwrap();
         let type_val = get_bits(&bits, 168, 3);
         assert_eq!(type_val, 0b010);
+    }
+
+    #[test]
+    fn decodes_real_mobile_type1_sync_half_rate() {
+        // Exact reverse SYNC captured from a live SO 12 handset (ESN F274799A)
+        // as the 124-bit primary of a 7200-bps RC2 frame:
+        //   SEQ=0 CTL=110100(SYNC) EM=0 FIRST=0 LAST=0 FCS=0xd173 (low-octet first)
+        // The FCS is RFC 1662 FCS-16, which a straight MSB-first bit CRC misses.
+        let prefix = "000000001101000000000000000000001101000101110011";
+        let mut bits: Vec<u8> = prefix.bytes().map(|c| c - b'0').collect();
+        bits.resize(RlpMuxOption::Two.primary_bits(RlpRate::Half), 0);
+        let frame = decode_frame_for_mux(&bits, RlpRate::Half, RlpMuxOption::Two)
+            .expect("real mobile SYNC must decode");
+        assert!(matches!(
+            frame,
+            RlpFrame::Control {
+                control_type: ControlType::Sync,
+                seq: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn control_fcs_roundtrips_after_rfc1662_fix() {
+        for ct in [ControlType::Sync, ControlType::SyncAck, ControlType::Ack] {
+            let f = RlpFrame::Control {
+                seq: 0x42,
+                control_type: ct,
+                encryption_mode: 0,
+                first: 0,
+                last: 0,
+            };
+            for rate in [RlpRate::Full, RlpRate::Half] {
+                let bits = encode_frame_for_mux(&f, rate, RlpMuxOption::Two).unwrap();
+                assert_eq!(
+                    decode_frame_for_mux(&bits, rate, RlpMuxOption::Two),
+                    Some(f.clone())
+                );
+            }
+        }
     }
 }

@@ -985,7 +985,7 @@ export interface InitiateCallResponse {
 /** Requests a mobile-terminated packet-data call. */
 export interface InitiateDataCallRequest {
   subscriberId: string;
-  /** Service option: 33 = high-rate packet (IS-707), 7 = async data. */
+  /** Service option: 33 = high-rate packet, 12 = asynchronous data, 7 = packet data. */
   serviceOption: number;
 }
 
@@ -1053,7 +1053,6 @@ export interface Channel {
  * Closed-loop power control snapshot for an active traffic channel —
  * both reverse loop (BTS measures, sends PCBs) and forward loop (mobile
  * reports forward FER via PMRM, BSC walks F-FCH gain).
- * See docs/power-control.md for the algorithms and design notes.
  */
 export interface TrafficChannelPower {
   /**

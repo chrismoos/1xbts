@@ -5,7 +5,7 @@
 # matching `dockerfile:` directive.
 
 # ---------------------------------------------------------------------------
-# Stage 1: build the edge-resolver Rust binary from the workspace.
+# Stage 1: build the edge-resolver and hdtp-gw Rust binaries from the workspace.
 # ---------------------------------------------------------------------------
 FROM rust:1-bookworm AS resolver-build
 
@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p edge-resolver
+RUN cargo build --release -p edge-resolver -p hdtp-gw
 
 # ---------------------------------------------------------------------------
 # Stage 2: runtime image. Single container, edge-resolver supervised
@@ -38,6 +38,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=resolver-build /src/target/release/edge-resolver /usr/local/bin/edge-resolver
+COPY --from=resolver-build /src/target/release/hdtp-gw /usr/local/bin/hdtp-gw
 COPY docker/fou-nat/entrypoint.sh /usr/local/bin/fou-nat-entrypoint
 COPY docker/fou-nat/fou_tcp_relay.py /usr/local/bin/fou-tcp-relay
 RUN chmod +x /usr/local/bin/fou-nat-entrypoint

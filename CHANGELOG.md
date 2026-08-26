@@ -16,6 +16,8 @@
 - Fixed EV-DO devices switching to UTC after acquiring the HRPD carrier.
 - Improved EV-DO reverse access decoding for weak uplink preambles.
 - Fix issue with low throughput on some EV-DO devices (~capped around 200kbps).
+- Added an Openwave UP.Link gateway so UP.Browser handsets can browse the web over packet data. Set the proxy endpoints it claims with `HDTP_HIJACK_ENDPOINTS`.
+- Added IS-95 asynchronous data calls over Rate Set 2.
 - Improve EV-DO reverse power control.
 - Reduced CPU usage across the BTS receiver, transmitter, and packet service.
 - Added support for RC2, QCELP 13K, and QCELP 8K voice. Fixes #16.

@@ -1,8 +1,5 @@
 //! Access-channel ingress: registration, origination, page response,
 //! and order handling.
-//!
-//! WS-0 PR3 sibling module per
-//! `docs/architecture-update/09-pr3-method-map.md`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,10 +18,11 @@ use chrono::Duration as ChronoDuration;
 use log::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::addressing::{format_ms_address, is_packet_data_so, select_imsi_class0_forward_address};
-use cdma_common::consts::{
-    SERVICE_OPTION_BASIC_VOICE, SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SR1_CHIP_RATE_HZ,
+use crate::addressing::{
+    format_ms_address, is_packet_data_so, packet_data_service_option_for_origination,
+    select_imsi_class0_forward_address,
 };
+use cdma_common::consts::{SERVICE_OPTION_BASIC_VOICE, SR1_CHIP_RATE_HZ};
 
 use super::{
     AccessRegistrationUpdate, Bsc, MobileStation, PendingA1AssignmentKind, PendingPage,
@@ -909,11 +907,14 @@ impl AccessService {
             .decoded_origination(event)
             .and_then(|msg| msg.sr_id)
             .unwrap_or(1);
-        let requested_so = if origination_digits == "#777" || origination_digits == "777" {
-            Some(SERVICE_OPTION_HIGH_RATE_PACKET_DATA)
-        } else {
-            Some(event.service_option.unwrap_or(SERVICE_OPTION_BASIC_VOICE))
-        };
+        let requested_so = Some(packet_data_service_option_for_origination(
+            &origination_digits,
+            event.service_option,
+            bsc.mobiles
+                .get(&fwd_address)
+                .map(|ms| ms.mob_p_rev)
+                .unwrap_or_default(),
+        ));
 
         if let Some(so) = requested_so {
             if is_packet_data_so(so)

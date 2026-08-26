@@ -12,8 +12,11 @@ pub const SERVICE_OPTION_EVRC_A: u16 = 3;
 /// SO6: Short Message Services.
 pub const SERVICE_OPTION_SMS: u16 = 6;
 
-/// SO7: Packet data, async/fax data service.
+/// SO7: packet data bearer service using RLP Type 1 and Rate Set 1 by default.
 pub const SERVICE_OPTION_PACKET_DATA: u16 = 7;
+
+/// SO12: asynchronous data service using RLP Type 1 and Rate Set 2 by default.
+pub const SERVICE_OPTION_ASYNC_DATA: u16 = 12;
 
 /// SO18: OTASP (C.S0016-D §1.2).
 pub const SERVICE_OPTION_OTASP: u16 = 18;

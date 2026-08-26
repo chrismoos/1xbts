@@ -18,6 +18,14 @@ MMSC_HIJACK_HOSTS="${MMSC_HIJACK_HOSTS:-mms.vtext.com,mmsc.vtext.com,mms.myvzw.c
 
 EDGE_RESOLVER_BIND="${EDGE_RESOLVER_BIND:-127.0.0.1:8088}"
 MGMT_GRPC_ADDR="${MGMT_GRPC_ADDR:-host.docker.internal:17016}"
+
+# HDTP (Openwave UP.Link) gateway. A UP.Browser dials a fixed proxy IP over
+# UDP, so a DNAT (below) redirects those endpoints to the local gateway rather
+# than DNS. Endpoints are comma-separated IP:port pairs.
+HDTP_ENABLE="${HDTP_ENABLE:-1}"
+HDTP_GW_PORT="${HDTP_GW_PORT:-1905}"
+HDTP_HIJACK_ENDPOINTS="${HDTP_HIJACK_ENDPOINTS:-153.114.115.100:1905,153.114.116.100:1905}"
+HDTP_LOG="${HDTP_LOG:-info}"
 # Use docker's embedded DNS directly (not our captive Unbound, which
 # rewrites mmsc.<zone> to the tunnel gateway and would loop back here).
 MMSC_UPSTREAM="${MMSC_UPSTREAM:-http://mbuni}"
@@ -57,6 +65,23 @@ iptables -C FORWARD -o fou0 -d "$MOBILE_CIDR" -m conntrack --ctstate RELATED,EST
 # return traffic reaches the mobile via the same source IP it dialed.
 iptables -t nat -C POSTROUTING -s "$MOBILE_CIDR" -d "$MOBILE_CIDR" -j RETURN 2>/dev/null \
   || iptables -t nat -I POSTROUTING -s "$MOBILE_CIDR" -d "$MOBILE_CIDR" -j RETURN
+
+# HDTP hijack: DNAT each proxy endpoint on the tunnel to the local gateway
+# before the routing decision, so the datagram is delivered locally instead of
+# masqueraded out to the old proxy. Conntrack restores the reply source.
+if [ "$HDTP_ENABLE" = "1" ]; then
+    for ep in $(printf '%s\n' "$HDTP_HIJACK_ENDPOINTS" | tr ',' ' '); do
+        [ -n "$ep" ] || continue
+        hip="${ep%%:*}"
+        hport="${ep##*:}"
+        [ -n "$hip" ] && [ -n "$hport" ] || continue
+        iptables -t nat -C PREROUTING -i fou0 -p udp -d "$hip" --dport "$hport" \
+            -j DNAT --to-destination "${GATEWAY_IP}:${HDTP_GW_PORT}" 2>/dev/null \
+          || iptables -t nat -A PREROUTING -i fou0 -p udp -d "$hip" --dport "$hport" \
+            -j DNAT --to-destination "${GATEWAY_IP}:${HDTP_GW_PORT}"
+        echo "HDTP hijack ${hip}:${hport} -> ${GATEWAY_IP}:${HDTP_GW_PORT}"
+    done
+fi
 
 mkdir -p /run/nginx /var/log/nginx /etc/nginx/conf.d /etc/unbound
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
@@ -205,7 +230,9 @@ for upstream in $(printf '%s\n' "$UNBOUND_FORWARD_ADDRS" | tr ',' ' '); do
   printf '    forward-addr: %s\n' "$upstream" >>/etc/unbound/unbound.conf
 done
 
-echo "FOU NAT ready: fou_udp=127.0.0.1:${FOU_LISTEN_PORT} relay_tcp=0.0.0.0:${FOU_TCP_PORT} relay_udp_bind=127.0.0.1:${FOU_REMOTE_PORT} tunnel=fou0 ${TUNNEL_ADDR} nat=${MOBILE_CIDR} dns=${GATEWAY_IP}:53 http=${GATEWAY_IP}:80 speedtest=${SPEEDTEST_UPSTREAM} edge-resolver=${EDGE_RESOLVER_BIND} mgmt=${MGMT_GRPC_ADDR}"
+HDTP_STATUS="disabled"
+[ "$HDTP_ENABLE" = "1" ] && HDTP_STATUS="${GATEWAY_IP}:${HDTP_GW_PORT} hijack=[${HDTP_HIJACK_ENDPOINTS}]"
+echo "FOU NAT ready: fou_udp=127.0.0.1:${FOU_LISTEN_PORT} relay_tcp=0.0.0.0:${FOU_TCP_PORT} relay_udp_bind=127.0.0.1:${FOU_REMOTE_PORT} tunnel=fou0 ${TUNNEL_ADDR} nat=${MOBILE_CIDR} dns=${GATEWAY_IP}:53 http=${GATEWAY_IP}:80 speedtest=${SPEEDTEST_UPSTREAM} edge-resolver=${EDGE_RESOLVER_BIND} mgmt=${MGMT_GRPC_ADDR} hdtp-gw=${HDTP_STATUS}"
 
 unbound -d -c /etc/unbound/unbound.conf &
 unbound_pid=$!
@@ -220,6 +247,15 @@ resolver_pid=$!
 nginx -g 'daemon off;' &
 nginx_pid=$!
 
+# HDTP gateway. Binds the tunnel IP so the DNAT'd handset datagrams (and its
+# reply source) use the same address family as the rest of the tunnel.
+hdtp_pid=""
+if [ "$HDTP_ENABLE" = "1" ]; then
+    HDTP_BIND="${GATEWAY_IP}:${HDTP_GW_PORT}" RUST_LOG="$HDTP_LOG" \
+        /usr/local/bin/hdtp-gw &
+    hdtp_pid=$!
+fi
+
 /usr/local/bin/fou-tcp-relay \
   --tcp-port "$FOU_TCP_PORT" \
   --udp-bind-port "$FOU_REMOTE_PORT" \
@@ -227,10 +263,12 @@ nginx_pid=$!
   --udp-target-port "$FOU_LISTEN_PORT" &
 relay_pid=$!
 
-trap 'kill "$relay_pid" "$nginx_pid" "$resolver_pid" "$unbound_pid" 2>/dev/null || true; wait "$relay_pid" "$nginx_pid" "$resolver_pid" "$unbound_pid" 2>/dev/null || true' INT TERM EXIT
+# shellcheck disable=SC2086
+trap 'kill $relay_pid $nginx_pid $resolver_pid $unbound_pid $hdtp_pid 2>/dev/null || true; wait $relay_pid $nginx_pid $resolver_pid $unbound_pid $hdtp_pid 2>/dev/null || true' INT TERM EXIT
 
 while :; do
-  for pid in "$relay_pid" "$nginx_pid" "$resolver_pid" "$unbound_pid"; do
+  for pid in "$relay_pid" "$nginx_pid" "$resolver_pid" "$unbound_pid" "$hdtp_pid"; do
+    [ -n "$pid" ] || continue
     if ! kill -0 "$pid" 2>/dev/null; then
       exit 1
     fi

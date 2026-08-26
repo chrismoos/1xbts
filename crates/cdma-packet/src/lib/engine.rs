@@ -13,17 +13,21 @@ use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::async_nas::AsyncNas;
 use crate::capture::{self, Direction as CaptureDirection};
 use crate::mobile_ip::{MobileIpPacketResult, MobileIpSession};
+use crate::modem_endpoint::Tcp380Endpoint;
 use crate::ppp::framing::{self, HdlcDeframer, PppPacket};
 use crate::ppp::ipcp::{IPCP_PROTOCOL, IpcpConfig, IpcpOpenState, IpcpSession};
 use crate::ppp::lcp::{LCP_PROTOCOL, LcpOpenState, LcpSession, LcpState, TERMINATE_REQUEST};
 use crate::ppp::vj::{PPP_IP_PROTOCOL, PPP_VJ_COMPRESSED_TCP, PPP_VJ_UNCOMPRESSED_TCP, VjState};
-use crate::rlp::{self as rlp_codec, RlpFrame};
+use crate::rlp::{self as rlp_codec, RlpFrame, RlpMuxOption};
 use crate::rlp_session::{RlpOutput, RlpSession, RlpState};
+use crate::rlp2_frames::{self as rlp2_codec};
+use crate::rlp2_session::{Rlp2Session, Rlp2State};
 use crate::rlp3_frames::MuxOption;
 use crate::rlp3_session::{FrameRate, Rlp3Config, Rlp3Session, Rlp3State, RlpEvent};
-use cdma_common::consts::SERVICE_OPTION_HIGH_RATE_PACKET_DATA;
+use cdma_common::consts::{SERVICE_OPTION_ASYNC_DATA, SERVICE_OPTION_HIGH_RATE_PACKET_DATA};
 use cdma_common::crc::crc16_sch;
 use cdma_common::hrpd::traffic::{
     DEFAULT_PACKET_RLP_SEQUENCE_BITS, default_packet_rlp_packet_bits,
@@ -98,9 +102,7 @@ struct RlpTelemetry {
     last_downlink_rate_bps: u32,
 }
 
-// ---------------------------------------------------------------------------
 // RLP backend trait — abstracts over RLP Type 1 (SO 7) and Type 3 (SO 33).
-// ---------------------------------------------------------------------------
 
 trait RlpBackend: Send {
     /// Process an uplink frame (raw primary traffic bits + rate).
@@ -154,9 +156,7 @@ trait RlpBackend: Send {
     }
 }
 
-// ---------------------------------------------------------------------------
 // HRPD A8/A10 Unstructured Byte Stream backend.
-// ---------------------------------------------------------------------------
 
 const A10_UNSTRUCTURED_BYTE_STREAM_MAX_OCTETS: usize = 1024;
 const A10_UNSTRUCTURED_BYTE_STREAM_MAX_CHUNKS_PER_TICK: usize = 16;
@@ -240,13 +240,11 @@ impl RlpBackend for UnstructuredByteStreamBackend {
     }
 }
 
-// ---------------------------------------------------------------------------
 // HRPD Default Packet Application RLP backend.
 //
 // This is the AN/BTS air-side wrapper used between Stream 1 and the HRPD
 // Physical Layer. It is not the A8/A10 bearer format; A8/A10 use the
 // `UnstructuredByteStreamBackend` above.
-// ---------------------------------------------------------------------------
 
 const HRPD_DEFAULT_PACKET_MAX_OCTETS_1024_FTC: usize = 121;
 
@@ -338,12 +336,11 @@ impl RlpBackend for HrpdDefaultPacketBackend {
     }
 }
 
-// ---------------------------------------------------------------------------
 // RLP Type 1 backend (SO 7)
-// ---------------------------------------------------------------------------
 
 struct Rlp1Backend {
     session: RlpSession,
+    mux_option: RlpMuxOption,
     last_rx_control: String,
     last_tx_control: String,
     last_uplink_rate_bps: u32,
@@ -351,9 +348,10 @@ struct Rlp1Backend {
 }
 
 impl Rlp1Backend {
-    fn new() -> Self {
+    fn new(mux_option: RlpMuxOption) -> Self {
         Self {
             session: RlpSession::new(),
+            mux_option,
             last_rx_control: String::new(),
             last_tx_control: String::new(),
             last_uplink_rate_bps: 0,
@@ -367,13 +365,9 @@ impl RlpBackend for Rlp1Backend {
         if rate_bps > 0 {
             self.last_uplink_rate_bps = rate_bps;
         }
-        let rlp_rate = match rate_bps {
-            9600 => Some(crate::rlp::RlpRate::Full),
-            4800 => Some(crate::rlp::RlpRate::Half),
-            1200 => Some(crate::rlp::RlpRate::Eighth),
-            _ => None,
-        };
-        let decoded = rlp_rate.and_then(|rate| rlp_codec::decode_frame(bits, rate));
+        let rlp_rate = self.mux_option.rate_from_bps(rate_bps);
+        let decoded =
+            rlp_rate.and_then(|rate| rlp_codec::decode_frame_for_mux(bits, rate, self.mux_option));
         if let Some(ref frame) = decoded {
             if matches!(frame, RlpFrame::Control { .. }) {
                 self.last_rx_control = format_rlp_frame(frame);
@@ -391,31 +385,36 @@ impl RlpBackend for Rlp1Backend {
     }
 
     fn next_frame_bits(&mut self, _allow_payload: bool) -> (Vec<u8>, u32) {
-        match self.session.next_frame() {
+        match self.session.next_frame_for_mux(self.mux_option) {
             RlpOutput::SendFrame(frame) => {
                 if !frame.is_idle() && !is_rlp_handshake(&frame) {
                     log::debug!("RLP1 TX: {}", format_rlp_frame(&frame));
-                }
-                let rate_bps = if frame.is_idle() { 1200u32 } else { 9600 };
-                self.last_downlink_rate_bps = rate_bps;
-                if matches!(frame, RlpFrame::Control { .. }) {
-                    self.last_tx_control = format_rlp_frame(&frame);
                 }
                 let rlp_rate = if frame.is_idle() {
                     crate::rlp::RlpRate::Eighth
                 } else {
                     crate::rlp::RlpRate::Full
                 };
-                let bits = rlp_codec::encode_frame(&frame, rlp_rate)
+                let rate_bps = self.mux_option.rate_bps(rlp_rate);
+                self.last_downlink_rate_bps = rate_bps;
+                if matches!(frame, RlpFrame::Control { .. }) {
+                    self.last_tx_control = format_rlp_frame(&frame);
+                }
+                let bits = rlp_codec::encode_frame_for_mux(&frame, rlp_rate, self.mux_option)
                     .expect("RLP1 session produced a frame invalid for selected rate");
                 (bits, rate_bps)
             }
             RlpOutput::Nothing => {
                 // Shouldn't happen — RLP always produces a frame. Fallback to idle.
                 let idle = crate::rlp::idle_frame(0);
-                let bits = rlp_codec::encode_frame(&idle, crate::rlp::RlpRate::Eighth)
-                    .expect("RLP1 idle frame must encode at eighth rate");
-                (bits, 1200)
+                let bits = rlp_codec::encode_frame_for_mux(
+                    &idle,
+                    crate::rlp::RlpRate::Eighth,
+                    self.mux_option,
+                )
+                .expect("RLP1 idle frame must encode at eighth rate");
+                let rate_bps = self.mux_option.rate_bps(crate::rlp::RlpRate::Eighth);
+                (bits, rate_bps)
             }
         }
     }
@@ -441,9 +440,122 @@ impl RlpBackend for Rlp1Backend {
     }
 }
 
-// ---------------------------------------------------------------------------
+// RLP Type 2 backend (SO 12 async data, Rate Set 2)
+
+// Retained for peers that negotiate RLP Type 2; live IS-95B async handsets
+// use RLP Type 1, so the SO 12 selection currently builds `Rlp1Backend`.
+#[allow(dead_code)]
+struct Rlp2Backend {
+    session: Rlp2Session,
+    rx_frame_count: u64,
+    last_rx_control: String,
+    last_tx_control: String,
+    last_uplink_rate_bps: u32,
+    last_downlink_rate_bps: u32,
+}
+
+#[allow(dead_code)]
+impl Rlp2Backend {
+    fn new() -> Self {
+        Self {
+            session: Rlp2Session::new(),
+            rx_frame_count: 0,
+            last_rx_control: String::new(),
+            last_tx_control: String::new(),
+            last_uplink_rate_bps: 0,
+            last_downlink_rate_bps: 0,
+        }
+    }
+}
+
+impl RlpBackend for Rlp2Backend {
+    fn receive_frame_bits(&mut self, bits: &[u8], rate_bps: u32) -> Option<Vec<u8>> {
+        if rate_bps > 0 {
+            self.last_uplink_rate_bps = rate_bps;
+            if !bits.is_empty() {
+                capture::write_rlp_frame(CaptureDirection::Uplink, rate_bps, bits);
+            }
+        }
+        let rate = RlpMuxOption::Two.rate_from_bps(rate_bps);
+        let decoded =
+            rate.and_then(|r| rlp2_codec::decode_frame_for_mux(bits, r, RlpMuxOption::Two));
+        if let Some(ref frame) = decoded {
+            if frame.is_control() {
+                self.last_rx_control = format!("{frame:?}");
+            }
+            if !frame.is_idle() {
+                log::debug!("RLP2 RX: {frame:?}");
+            }
+        }
+        // Raw uplink diagnostic: the phone's reverse RLP frames decode as idle
+        // more often than not, so log the first frames (and periodically) with
+        // their bits and decode outcome to see what the mobile actually sends.
+        if rate_bps != 0 && !bits.is_empty() {
+            self.rx_frame_count += 1;
+            if self.rx_frame_count <= 16 || self.rx_frame_count % 50 == 0 {
+                let hex: String = bits
+                    .iter()
+                    .take(48)
+                    .map(|&b| if b != 0 { '1' } else { '0' })
+                    .collect();
+                log::debug!(
+                    "RLP2 UL[#{} rate={} len={}]: decoded={:?} bits={}{}",
+                    self.rx_frame_count,
+                    rate_bps,
+                    bits.len(),
+                    decoded,
+                    hex,
+                    if bits.len() > 48 { "..." } else { "" }
+                );
+            }
+        }
+        self.session.receive_frame(decoded.as_ref())
+    }
+
+    fn enqueue_data(&mut self, data: &[u8]) {
+        self.session.enqueue_data(data);
+    }
+
+    fn next_frame_bits(&mut self, _allow_payload: bool) -> (Vec<u8>, u32) {
+        let (frame, rate) = self.session.next_frame();
+        if frame.is_control() {
+            self.last_tx_control = format!("{frame:?}");
+        }
+        if !frame.is_idle() {
+            log::debug!("RLP2 TX: {frame:?}");
+        }
+        let bits = rlp2_codec::encode_frame_for_mux(&frame, rate, RlpMuxOption::Two)
+            .expect("RLP2 session produced a frame invalid for selected rate");
+        let rate_bps = RlpMuxOption::Two.rate_bps(rate);
+        self.last_downlink_rate_bps = rate_bps;
+        if !bits.is_empty() {
+            capture::write_rlp_frame(CaptureDirection::Downlink, rate_bps, &bits);
+        }
+        (bits, rate_bps)
+    }
+
+    fn is_data_transfer(&self) -> bool {
+        self.session.state() == Rlp2State::DataTransfer
+    }
+
+    fn telemetry(&self) -> RlpTelemetry {
+        RlpTelemetry {
+            state: format!("{:?}", self.session.state()),
+            last_rx_control: self.last_rx_control.clone(),
+            last_tx_control: self.last_tx_control.clone(),
+            last_rx_control_repeats: u64::from(!self.last_rx_control.is_empty()),
+            last_tx_control_repeats: u64::from(!self.last_tx_control.is_empty()),
+            last_uplink_rate_bps: self.last_uplink_rate_bps,
+            last_downlink_rate_bps: self.last_downlink_rate_bps,
+        }
+    }
+
+    fn tx_queue_len(&self) -> usize {
+        self.session.tx_queue_len()
+    }
+}
+
 // RLP Type 3 backend (SO 33)
-// ---------------------------------------------------------------------------
 
 struct Rlp3Backend {
     session: Rlp3Session,
@@ -873,9 +985,7 @@ impl RlpBackend for Rlp3Backend {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Packet data session engine.
-// ---------------------------------------------------------------------------
 
 const SCH_0X0809_DATA_BLOCK_BITS: usize = 170;
 const SCH_0X0921_DATA_BLOCK_BITS: usize = 346;
@@ -1057,6 +1167,17 @@ pub struct PacketSession {
     /// Some HRPD A10 byte-stream peers complete only one side of LCP, then wait
     /// for IPCP. This is scoped away from legacy 1x PPP.
     lcp_open_after_one_sided_ack: bool,
+    /// True for SO 12 async data sessions.
+    is_async_data: bool,
+    /// SO 12 emulated-modem TCP/380 endpoint plus the end-user PPP NAS.
+    async_modem: Option<AsyncModem>,
+}
+
+/// SO 12 async-data modem state: the TCP/380 modem-server endpoint and, once
+/// the call connects, the end-user PPP terminator (NAS).
+struct AsyncModem {
+    endpoint: Tcp380Endpoint,
+    nas: Option<AsyncNas>,
 }
 
 /// Max RlpSync ticks (20 ms each) before giving up. 500 = 10 s.
@@ -1098,9 +1219,19 @@ impl PacketSession {
                     mux_option: MuxOption::Odd, // 171-bit frames (MUX option 0x1, Rate Set 1)
                     ..Rlp3Config::default()
                 }))
+            } else if service_option == u32::from(SERVICE_OPTION_ASYNC_DATA) {
+                // SO 12 async data runs over Rate Set 2 (Mux Option 2). Live
+                // handsets use RLP Type 1 with the RS2 frame sizes, so decode
+                // with Mux Option 2. (RLP Type 2 exists in `rlp2_*` for peers
+                // that negotiate it, but IS-95B async phones speak Type 1.)
+                log::debug!(
+                    "PacketSession: using RLP Type 1 (RS2) for SO {}",
+                    service_option
+                );
+                Box::new(Rlp1Backend::new(RlpMuxOption::Two))
             } else {
                 log::debug!("PacketSession: using RLP Type 1 for SO {}", service_option);
-                Box::new(Rlp1Backend::new())
+                Box::new(Rlp1Backend::new(RlpMuxOption::One))
             };
         let mobile_ip = ppp_resume
             .as_ref()
@@ -1130,6 +1261,8 @@ impl PacketSession {
             ppp_activity_since_last_check: false,
             peer_requested_lcp_terminate: false,
             lcp_open_after_one_sided_ack: false,
+            is_async_data: service_option == u32::from(SERVICE_OPTION_ASYNC_DATA),
+            async_modem: None,
         }
     }
 
@@ -1170,6 +1303,8 @@ impl PacketSession {
             ppp_activity_since_last_check: false,
             peer_requested_lcp_terminate: false,
             lcp_open_after_one_sided_ack: false,
+            is_async_data: false,
+            async_modem: None,
         }
     }
 
@@ -1210,6 +1345,8 @@ impl PacketSession {
             ppp_activity_since_last_check: false,
             peer_requested_lcp_terminate: false,
             lcp_open_after_one_sided_ack: true,
+            is_async_data: false,
+            async_modem: None,
         };
         session.set_ppp_max_configure_restarts(HRPD_A10_PPP_MAX_CONFIGURE_RESTARTS);
         session
@@ -1307,6 +1444,12 @@ impl PacketSession {
     /// Inject an IP packet from the network/TUN side for delivery to the mobile.
     /// Queues while PPP control is negotiating; emits only after IPCP is open.
     pub fn send_ip_packet(&mut self, ip_packet: &[u8]) {
+        if self.phase == SessionPhase::Active
+            && self.is_async_data
+            && self.route_async_downlink(ip_packet)
+        {
+            return;
+        }
         match self.phase {
             SessionPhase::Active => self.enqueue_downlink_ip_packet(ip_packet),
             SessionPhase::Closed => {
@@ -1521,6 +1664,10 @@ impl PacketSession {
             self.rlp_sync_ticks = 0;
         }
 
+        if self.is_async_data {
+            self.tick_async_modem();
+        }
+
         // --- Send our initial requests when entering new phases ---
         if self.phase == SessionPhase::Lcp && !self.lcp_started {
             let req = self.lcp.start();
@@ -1619,9 +1766,7 @@ impl PacketSession {
         }
     }
 
-    // -----------------------------------------------------------------------
     // Internal
-    // -----------------------------------------------------------------------
 
     fn process_uplink(&mut self, uplink: Option<(&[u8], u32)>, actions: &mut Vec<SessionAction>) {
         let delivery = if let Some((bits, rate_bps)) = uplink {
@@ -1835,8 +1980,107 @@ impl PacketSession {
             );
             return;
         }
+        if self.is_async_data && self.drive_async_uplink(ip_packet, actions) {
+            self.ppp_activity_since_last_check = true;
+            return;
+        }
         actions.push(SessionAction::DeliverIpPacket(ip_packet.to_vec()));
         self.ppp_activity_since_last_check = true;
+    }
+
+    fn maybe_start_async_modem(&mut self) {
+        if self.is_async_data && self.async_modem.is_none() {
+            let endpoint = Tcp380Endpoint::new(self.ipcp.our_ip(), self.ipcp.peer_ip());
+            log::info!(
+                "{}: SO12 async modem server ready at {}:380 (mobile {})",
+                self.log_prefix("modem"),
+                self.ipcp.our_ip(),
+                self.ipcp.peer_ip()
+            );
+            self.async_modem = Some(AsyncModem {
+                endpoint,
+                nas: None,
+            });
+        }
+    }
+
+    /// Route an uplink IP packet through the SO 12 modem server. Returns true
+    /// when the packet was addressed to the modem server and consumed here.
+    fn drive_async_uplink(&mut self, ip_packet: &[u8], actions: &mut Vec<SessionAction>) -> bool {
+        let Some(mut m) = self.async_modem.take() else {
+            return false;
+        };
+        let out = m.endpoint.on_uplink_ip(ip_packet);
+        if !out.matched {
+            self.async_modem = Some(m);
+            return false;
+        }
+        for pkt in &out.downlink {
+            self.enqueue_downlink_ip_packet(pkt);
+        }
+        if out.dialed.is_some() && m.nas.is_none() {
+            let cfg = IpcpConfig {
+                our_ip: self.ipcp.our_ip(),
+                peer_ip: self.ipcp.peer_ip(),
+                ..IpcpConfig::default()
+            };
+            let mut nas = AsyncNas::new(cfg);
+            let cup = m.endpoint.carrier_up();
+            for pkt in &cup.downlink {
+                self.enqueue_downlink_ip_packet(pkt);
+            }
+            let start = nas.start();
+            for pkt in m.endpoint.send_online(&start) {
+                self.enqueue_downlink_ip_packet(&pkt);
+            }
+            m.nas = Some(nas);
+        }
+        if !out.user_data.is_empty()
+            && let Some(nas) = m.nas.as_mut()
+        {
+            let nas_out = nas.feed(&out.user_data);
+            for pkt in m.endpoint.send_online(&nas_out.to_mobile) {
+                self.enqueue_downlink_ip_packet(&pkt);
+            }
+            for ip in nas_out.to_network {
+                actions.push(SessionAction::DeliverIpPacket(ip));
+            }
+        }
+        self.async_modem = Some(m);
+        true
+    }
+
+    /// Route a network-originated downlink IP packet to the mobile through the
+    /// SO 12 modem's end-user NAS. Returns true when handled.
+    fn route_async_downlink(&mut self, ip_packet: &[u8]) -> bool {
+        let Some(mut m) = self.async_modem.take() else {
+            return false;
+        };
+        let handled = if let Some(nas) = m.nas.as_mut() {
+            let async_bytes = nas.send_ip(ip_packet);
+            for pkt in m.endpoint.send_online(&async_bytes) {
+                self.enqueue_downlink_ip_packet(&pkt);
+            }
+            !async_bytes.is_empty()
+        } else {
+            false
+        };
+        self.async_modem = Some(m);
+        handled
+    }
+
+    /// Drive the SO 12 NAS retransmission timers once per tick.
+    fn tick_async_modem(&mut self) {
+        let Some(mut m) = self.async_modem.take() else {
+            return;
+        };
+        if let Some(nas) = m.nas.as_mut() {
+            let bytes = nas.tick();
+            for pkt in m.endpoint.send_online(&bytes) {
+                self.enqueue_downlink_ip_packet(&pkt);
+            }
+        }
+        self.async_modem = Some(m);
     }
 
     fn handle_mobile_ip_packet(&mut self, ip_packet: &[u8]) -> bool {
@@ -1908,6 +2152,7 @@ impl PacketSession {
         }
 
         self.phase = SessionPhase::Active;
+        self.maybe_start_async_modem();
         self.flush_pending_downlink_ip();
         log::info!(
             "{}: active peer={} gateway={}",
@@ -2630,7 +2875,7 @@ mod tests {
     use crate::ppp::ipcp;
     use crate::ppp::lcp;
     use crate::rlp;
-    use cdma_common::consts::SERVICE_OPTION_PACKET_DATA;
+    use cdma_common::consts::{SERVICE_OPTION_ASYNC_DATA, SERVICE_OPTION_PACKET_DATA};
 
     const TEST_MIP_RRQ_TYPE: u8 = 1;
     const TEST_MIP_RRQ_FLAGS_NONE: u8 = 0;
@@ -3422,6 +3667,30 @@ mod tests {
     }
 
     #[test]
+    fn so12_starts_rlp1_sync_on_rate_set_two() {
+        let mut session =
+            PacketSession::new(u32::from(SERVICE_OPTION_ASYNC_DATA), IpcpConfig::default());
+        let actions = session.tick(None);
+        let (bits, rate_bps) = actions
+            .iter()
+            .find_map(|action| match action {
+                SessionAction::SendFrame { bits, rate_bps } => Some((bits, *rate_bps)),
+                _ => None,
+            })
+            .expect("SO12 RLP sync frame");
+        assert_eq!(rate_bps, 14_400);
+        assert_eq!(bits.len(), 266);
+        // SO 12 uses RLP Type 1 with Rate Set 2 sizes (what live handsets speak).
+        assert!(matches!(
+            rlp::decode_frame_for_mux(bits, rlp::RlpRate::Full, rlp::RlpMuxOption::Two),
+            Some(rlp::RlpFrame::Control {
+                control_type: rlp::ControlType::Sync,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn rlp_sync_timeout_closes_session_when_ms_never_engages() {
         // Simulate the w14 pathology: BTS RX delivers signaling but the
         // MS never sends RLP3 SYNC/ACK. After RLP_SYNC_MAX_TICKS ticks
@@ -4118,10 +4387,8 @@ mod tests {
         assert_eq!(session.pending_downlink_ip_octets, 0);
     }
 
-    // -----------------------------------------------------------------------
     // Helper: drive session all the way to Active phase.
     // Returns the next uplink RLP SEQ number for continued use.
-    // -----------------------------------------------------------------------
 
     fn drive_to_active(session: &mut PacketSession) -> u8 {
         drive_to_active_with_our_ipcp_data(session, our_default_ipcp_request_data())

@@ -7,6 +7,7 @@ export function serviceOptionName(so: number): string {
     case 3: return "EVRC";
     case 6: return "SMS";
     case 7: return "Data RC1 (SO7)";
+    case 12: return "Async Data RC2 (SO12)";
     case 17: return "EVRC";
     case 33: return "Data RC3 (SO33)";
     case 68: return "EVRC-B";

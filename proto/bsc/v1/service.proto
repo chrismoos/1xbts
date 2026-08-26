@@ -900,7 +900,7 @@ message InitiateCallResponse {
 // Requests a mobile-terminated packet-data call.
 message InitiateDataCallRequest {
   string subscriber_id = 1;
-  // Service option: 33 = high-rate packet (IS-707), 7 = async data.
+  // Service option: 33 = high-rate packet, 12 = asynchronous data, 7 = packet data.
   uint32 service_option = 2;
 }
 
@@ -955,7 +955,6 @@ message Channel {
 // Closed-loop power control snapshot for an active traffic channel —
 // both reverse loop (BTS measures, sends PCBs) and forward loop (mobile
 // reports forward FER via PMRM, BSC walks F-FCH gain).
-// See docs/power-control.md for the algorithms and design notes.
 message TrafficChannelPower {
   // ---- Reverse loop ------------------------------------------------
   // Outer-loop target Eb/Nt in dB. Calibrated against the FHT

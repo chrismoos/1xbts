@@ -1,0 +1,38 @@
+[package]
+name = "hdtp-gw"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Openwave UP.Link gateway: an HDTP server that terminates UP.Browser handset sessions over UDP and proxies them to the web, transcoding HTML to HDML. Spec PDFs vendored under docs/."
+
+[features]
+# Compiles in a seeded fallback session key for a handset whose default boot
+# uses a cached constant key with no key exchange. Off in release builds.
+test-harness = []
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "deflate"] }
+scraper = "0.20"
+ego-tree = "0.6"
+url = "2"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+chrono = "0.4"
+num-bigint = "0.4"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "hdtp-gw"
+path = "src/main.rs"
+
+[lints]
+workspace = true

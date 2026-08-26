@@ -71,6 +71,18 @@ services:
       # via the BSC's PdsnManagementService facade for the X-1xBTS-MSISDN
       # header it injects into MMSC traffic.
       MGMT_GRPC_ADDR: "${MGMT_GRPC_ADDR:-host.docker.internal:17016}"
+      # Openwave UP.Link (HDTP) gateway. Comma-separated IP:port endpoints the
+      # handset dials for its provisioned proxy are DNAT'd to the local gateway,
+      # which browses the web and returns HDML. Set HDTP_ENABLE=0 to disable.
+      HDTP_ENABLE: "${HDTP_ENABLE:-1}"
+      HDTP_HIJACK_ENDPOINTS: "${HDTP_HIJACK_ENDPOINTS:-153.114.115.100:1905,153.114.116.100:1905}"
+      # SessionReply shape, tunable on-air without rebuilding while the exact
+      # UP.Browser 3.1 form is pinned down. Layout: sugp | hdtp11 | both.
+      # Nonce (which SessionRequest bytes are the C-nonce): last | prev | both.
+      HDTP_REPLY_LAYOUT: "${HDTP_REPLY_LAYOUT:-hdtp11}"
+      HDTP_REPLY_NONCE: "${HDTP_REPLY_NONCE:-prev}"
+      # Content-Type for HDML replies: text/x-hdml | text/hdml | application/x-hdmlc.
+      HDTP_CONTENT_TYPE: "${HDTP_CONTENT_TYPE:-text/x-hdml}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped

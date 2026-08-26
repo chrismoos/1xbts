@@ -8,7 +8,9 @@ use cdma_bts::bts::{
     RxMetrics as BtsRxMetrics, TxMetrics as BtsTxMetrics,
 };
 use cdma_common::access::AccessMessage;
-use cdma_common::consts::{SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_PACKET_DATA};
+use cdma_common::consts::{
+    SERVICE_OPTION_ASYNC_DATA, SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_PACKET_DATA,
+};
 use cdma_common::events::AccessChannelEvent;
 use cdma_common::lac::{
     message_types::{MessageId, WireChannel},
@@ -1851,10 +1853,10 @@ impl BscService for BscServiceImpl {
         let req = request.into_inner();
         let subscriber_id = Uuid::parse_str(&req.subscriber_id)
             .map_err(|_| Status::invalid_argument("subscriber_id must be a valid UUID"))?;
-        let service_option = if req.service_option == u32::from(SERVICE_OPTION_PACKET_DATA) {
-            SERVICE_OPTION_PACKET_DATA
-        } else {
-            SERVICE_OPTION_HIGH_RATE_PACKET_DATA
+        let service_option = match req.service_option {
+            value if value == u32::from(SERVICE_OPTION_PACKET_DATA) => SERVICE_OPTION_PACKET_DATA,
+            value if value == u32::from(SERVICE_OPTION_ASYNC_DATA) => SERVICE_OPTION_ASYNC_DATA,
+            _ => SERVICE_OPTION_HIGH_RATE_PACKET_DATA,
         };
 
         self.state

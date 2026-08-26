@@ -6,7 +6,9 @@
 
 use cdma_abis::control::typed::ForwardBurstRadioInfo;
 use cdma_common::channel::TrafficRate;
-use cdma_common::consts::{SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_PACKET_DATA};
+use cdma_common::consts::{
+    SERVICE_OPTION_ASYNC_DATA, SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_PACKET_DATA,
+};
 use cdma_common::sch::Rc3FschProfile;
 use log::{debug, info, warn};
 use uuid::Uuid;
@@ -20,15 +22,30 @@ use super::traffic_bearer::{
 use super::traffic_forward::fsch_escam_start_time_mod32;
 use super::{Bsc, TrafficChannelInfo, VoiceLegRole};
 
-/// Request to initiate a BS-originated data call (SO 7 or SO 33) to a subscriber.
+/// Request to initiate a BS-originated data call to a subscriber.
 pub struct DataCallRequest {
     pub subscriber_id: Uuid,
-    /// Service option: 33 (high-rate packet) or 7 (async data). Defaults to 33.
+    /// Service option: 33 (high-rate packet), 12 (asynchronous data), or 7 (packet data).
     pub service_option: u16,
 }
 
 #[derive(Default)]
 pub(crate) struct PacketService;
+
+fn packet_fch_rate(rate_bps: u32) -> Option<TrafficRate> {
+    super::voice::traffic_rate_from_bps(rate_bps)
+}
+
+fn packet_primary_mux_bits(for_rc: u8, rate: TrafficRate, primary_bits: &[u8]) -> Vec<u8> {
+    if for_rc == 2 || rate == TrafficRate::Full {
+        let mut bits = Vec::with_capacity(primary_bits.len() + 1);
+        bits.push(0);
+        bits.extend_from_slice(primary_bits);
+        bits
+    } else {
+        primary_bits.to_vec()
+    }
+}
 
 impl PacketService {
     pub(crate) fn detach_session(&self, tc: &mut TrafficChannelInfo) -> Option<String> {
@@ -48,7 +65,7 @@ impl PacketService {
 impl Bsc {
     /// Initiate a BS-originated data call. Pages the mobile, and on
     /// page response assigns a traffic channel with the requested
-    /// packet-data SO (7 or 33). The packet session starts
+    /// packet-data service option. The packet session starts
     /// automatically when Service Connect completes.
     pub(crate) fn initiate_bs_data_call(&mut self, req: DataCallRequest) {
         if self.paging.has_pending_page() {
@@ -66,10 +83,10 @@ impl Bsc {
             );
             return;
         };
-        let service_option = if req.service_option == SERVICE_OPTION_PACKET_DATA {
-            SERVICE_OPTION_PACKET_DATA
-        } else {
-            SERVICE_OPTION_HIGH_RATE_PACKET_DATA
+        let service_option = match req.service_option {
+            SERVICE_OPTION_PACKET_DATA => SERVICE_OPTION_PACKET_DATA,
+            SERVICE_OPTION_ASYNC_DATA => SERVICE_OPTION_ASYNC_DATA,
+            _ => SERVICE_OPTION_HIGH_RATE_PACKET_DATA,
         };
         info!(
             "BSC: initiating BS-originated data call subscriber={} SO={}",
@@ -194,23 +211,14 @@ impl Bsc {
                     continue;
                 }
 
-                let rate = match frame.rate_bps {
-                    9600 => TrafficRate::Full,
-                    4800 => TrafficRate::Half,
-                    2700 | 2400 => TrafficRate::Quarter,
-                    1500 | 1200 => TrafficRate::Eighth,
-                    _ => TrafficRate::Eighth,
+                let Some(rate) = packet_fch_rate(frame.rate_bps) else {
+                    warn!(
+                        "BSC: dropping packet DL frame with unsupported FCH rate {}",
+                        frame.rate_bps
+                    );
+                    continue;
                 };
-                // MuxPDU Type 1: full-rate frames need MM=0 prepended
-                // (primary traffic only).
-                let mux_bits = if rate == TrafficRate::Full {
-                    let mut bits = Vec::with_capacity(172);
-                    bits.push(0u8);
-                    bits.extend_from_slice(&frame.bits);
-                    bits
-                } else {
-                    frame.bits
-                };
+                let mux_bits = packet_primary_mux_bits(for_rc, rate, &frame.bits);
                 dl_count += 1;
                 if dl_count <= 10 || dl_count % 250 == 0 {
                     let hex: String = mux_bits
@@ -408,6 +416,33 @@ impl Bsc {
         );
         if let Some(ref pcf_client) = self.config.pcf_client {
             pcf_client.close_packet_session(session_id).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_set_two_packet_rates_map_to_rc2_tiers() {
+        assert_eq!(packet_fch_rate(14_400), Some(TrafficRate::Full));
+        assert_eq!(packet_fch_rate(7_200), Some(TrafficRate::Half));
+        assert_eq!(packet_fch_rate(3_600), Some(TrafficRate::Quarter));
+        assert_eq!(packet_fch_rate(1_800), Some(TrafficRate::Eighth));
+    }
+
+    #[test]
+    fn rate_set_two_primary_frames_include_the_mux_header_at_every_rate() {
+        for (rate, primary_bits, mux_bits) in [
+            (TrafficRate::Full, 266, 267),
+            (TrafficRate::Half, 124, 125),
+            (TrafficRate::Quarter, 54, 55),
+            (TrafficRate::Eighth, 20, 21),
+        ] {
+            let frame = packet_primary_mux_bits(2, rate, &vec![1; primary_bits]);
+            assert_eq!(frame.len(), mux_bits);
+            assert_eq!(frame[0], 0);
         }
     }
 }

@@ -33,6 +33,8 @@ enum ServiceOption {
   SERVICE_OPTION_SMS = 6;
   // SO7 — packet data, RLP Type 1 (legacy).
   SERVICE_OPTION_PACKET_DATA_RC1 = 7;
+  // SO12 — asynchronous data, RLP Type 1 over Rate Set 2.
+  SERVICE_OPTION_ASYNC_DATA_RC2 = 12;
   // SO33 — packet data, RLP Type 3 (cdma2000).
   SERVICE_OPTION_PACKET_DATA_RC3 = 33;
   // SO68 — EVRC-B voice.

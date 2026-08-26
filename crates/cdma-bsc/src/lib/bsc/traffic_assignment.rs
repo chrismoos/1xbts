@@ -1,8 +1,8 @@
 //! BSC traffic-channel allocation, assignment, and power overrides.
 
 use cdma_common::consts::{
-    RC3_GATED_REV_PWR_CNTL_DELAY, SERVICE_OPTION_BASIC_VOICE, SERVICE_OPTION_HIGH_RATE_PACKET_DATA,
-    SERVICE_OPTION_SMS, reverse_fch_gating_supported,
+    RC3_GATED_REV_PWR_CNTL_DELAY, SERVICE_OPTION_BASIC_VOICE, SERVICE_OPTION_SMS,
+    reverse_fch_gating_supported,
 };
 use cdma_common::error::Error;
 use cdma_common::events::AccessChannelEvent;
@@ -20,8 +20,8 @@ use uuid::Uuid;
 
 use crate::abis_edge::BtsTrafficChannelHandle;
 use crate::addressing::{
-    format_ms_address, is_packet_data_so, select_initial_traffic_rcs,
-    select_initial_traffic_rcs_for_so,
+    format_ms_address, is_packet_data_so, packet_data_service_option_for_origination,
+    select_initial_traffic_rcs, select_initial_traffic_rcs_for_so,
 };
 
 use super::{
@@ -501,12 +501,16 @@ impl Bsc {
             .decoded_origination(event)
             .and_then(|msg| msg.sr_id)
             .unwrap_or(1);
-        let so = if digits == "#777" || digits == "777" {
-            info!("BSC: #777 dialed, defaulting packet data to SO33");
-            SERVICE_OPTION_HIGH_RATE_PACKET_DATA
-        } else {
-            event.service_option.unwrap_or(0)
-        };
+        let mob_p_rev = self
+            .mobiles
+            .get(fwd_address)
+            .map(|ms| ms.mob_p_rev)
+            .unwrap_or_default();
+        let so =
+            packet_data_service_option_for_origination(&digits, event.service_option, mob_p_rev);
+        if digits == "#777" || digits == "777" {
+            info!("BSC: packet-data dialing selected SO{}", so);
+        }
         if !is_packet_data_so(so) {
             return false;
         }

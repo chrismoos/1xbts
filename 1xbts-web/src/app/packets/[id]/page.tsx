@@ -122,6 +122,8 @@ function serviceOptionName(so: number): string {
   switch (so) {
     case 7:
       return "SO 7";
+    case 12:
+      return "SO 12";
     case 33:
       return "SO 33";
     default:

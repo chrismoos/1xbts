@@ -313,6 +313,10 @@ impl RlpSession {
     ///
     /// Should be called once per 20ms frame period.
     pub fn next_frame(&mut self) -> RlpOutput {
+        self.next_frame_for_mux(rlp::RlpMuxOption::One)
+    }
+
+    pub fn next_frame_for_mux(&mut self, mux_option: rlp::RlpMuxOption) -> RlpOutput {
         if self.state == RlpState::Uninitialized {
             self.initialize();
         }
@@ -335,18 +339,16 @@ impl RlpSession {
                 if self.handshake_frames_sent > self.round_trip_counter {
                     // Sent enough ACKs, transition to data transfer
                     self.enter_data_transfer();
-                    return self.build_data_frame();
+                    return self.build_data_frame(mux_option);
                 }
                 RlpOutput::SendFrame(rlp::ack_frame(self.v_s))
             }
 
-            RlpState::DataTransfer => self.build_data_frame(),
+            RlpState::DataTransfer => self.build_data_frame(mux_option),
         }
     }
 
-    // -----------------------------------------------------------------------
     // Internal helpers
-    // -----------------------------------------------------------------------
 
     fn enter_data_transfer(&mut self) {
         log::info!(
@@ -557,7 +559,7 @@ impl RlpSession {
     }
 
     /// Build the next data frame to send (or idle if no data queued).
-    fn build_data_frame(&mut self) -> RlpOutput {
+    fn build_data_frame(&mut self, mux_option: rlp::RlpMuxOption) -> RlpOutput {
         if let Some(frame) = self.pending_controls.pop_front() {
             return RlpOutput::SendFrame(frame);
         }
@@ -569,20 +571,18 @@ impl RlpSession {
             // Send idle frame at Rate 1/8
             RlpOutput::SendFrame(rlp::idle_frame(self.v_s))
         } else {
-            // Try to fill a full-rate frame.
-            // Format B gives 20 octets, Format A gives 19 octets.
-            // Use Format B when we have >= 20 octets for max throughput.
             let available = self.tx_queue.len();
+            let format_b_octets = mux_option.format_b_octets();
+            let format_a_octets = mux_option.full_format_a_octets();
 
-            if available >= 20 {
-                let data: Vec<u8> = self.tx_queue.drain(..20).collect();
+            if available >= format_b_octets {
+                let data: Vec<u8> = self.tx_queue.drain(..format_b_octets).collect();
                 let frame = rlp::data_format_b_frame(self.v_s, &data);
                 self.tx_history[self.v_s as usize] = Some(frame.clone());
                 self.v_s = self.v_s.wrapping_add(1);
                 RlpOutput::SendFrame(frame)
             } else if available > 8 {
-                // Use Format A at full rate (up to 19 octets)
-                let send_len = available.min(19);
+                let send_len = available.min(format_a_octets);
                 let data: Vec<u8> = self.tx_queue.drain(..send_len).collect();
                 let frame = rlp::data_frame(self.v_s, &data);
                 self.tx_history[self.v_s as usize] = Some(frame.clone());
@@ -603,9 +603,7 @@ impl RlpSession {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Sequence number comparison helpers (modulo 256 arithmetic per 3.1.2)
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, PartialEq, Eq)]
 enum SeqCmp {
@@ -658,9 +656,7 @@ fn is_sync_ack_frame(frame: &RlpFrame) -> bool {
     )
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1027,9 +1023,7 @@ mod tests {
         assert_eq!(seq_compare(0, 1), SeqCmp::Less);
     }
 
-    // -----------------------------------------------------------------------
     // Helper: create a session that's already in DataTransfer state
-    // -----------------------------------------------------------------------
 
     fn setup_connected_session() -> RlpSession {
         let mut session = RlpSession::new();
