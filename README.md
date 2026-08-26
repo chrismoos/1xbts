@@ -222,8 +222,9 @@ above. To run it directly:
 
 ```sh
 cd 1xbts-web
-npm install
-npm run dev
+npm install -g pnpm
+pnpm install
+pnpm dev
 ```
 
 ## Support

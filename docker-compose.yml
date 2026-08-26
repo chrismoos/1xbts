@@ -23,7 +23,7 @@ services:
     container_name: 1xbts-web
     network_mode: host
     working_dir: /app
-    command: sh -c "npm install && npm run dev -- --hostname 0.0.0.0"
+    command: sh -c "npm i -g pnpm@11.20.0 && pnpm install --store-dir /pnpm-store && pnpm dev --hostname 0.0.0.0"
     environment:
       MANAGEMENT_GRPC_ADDRESS: ${MANAGEMENT_GRPC_ADDRESS:-127.0.0.1:17016}
       MSC_GRPC_ADDRESS: ${MSC_GRPC_ADDRESS:-127.0.0.1:17017}
@@ -33,6 +33,7 @@ services:
     volumes:
       - ./1xbts-web:/app
       - 1xbts-web-node-modules:/app/node_modules
+      - 1xbts-web-pnpm-store:/pnpm-store
     restart: unless-stopped
 
   speedtest:
@@ -117,4 +118,5 @@ services:
 volumes:
   postgres-data:
   1xbts-web-node-modules:
+  1xbts-web-pnpm-store:
   mbuni-store:

@@ -58,15 +58,16 @@ you ran and let CI cover the full matrix.
 The web dashboard lives in `1xbts-web`:
 
 ```sh
-npm install
-npm run lint
-npm run build
+npm install -g pnpm
+pnpm install
+pnpm lint
+pnpm build
 ```
 
 Regenerate protobuf bindings after changing files under `proto`:
 
 ```sh
-npm run proto
+pnpm proto
 ```
 
 ## Pull Requests

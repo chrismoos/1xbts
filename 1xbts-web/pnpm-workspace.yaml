@@ -1,0 +1,6 @@
+# pnpm blocks a dependency's build scripts unless it is allowed here.
+allowBuilds:
+  grpc-tools: true
+  protobufjs: true
+  sharp: true
+  unrs-resolver: true
