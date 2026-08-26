@@ -41,3 +41,11 @@ export function formatTimeMs(ts: number): string {
   const ms = d.getMilliseconds().toString().padStart(3, "0");
   return `${Y}-${M}-${D} ${h}:${m}:${s}.${ms}`;
 }
+
+// Share of total forward power as a percentage with its dB equivalent,
+// e.g. "20.0% (−7.0 dB)".
+export function formatPowerFraction(fraction: number): string {
+  if (!(fraction > 0)) return "0% (off)";
+  const db = 10 * Math.log10(fraction);
+  return `${(fraction * 100).toFixed(1)}% (${db.toFixed(1)} dB)`;
+}

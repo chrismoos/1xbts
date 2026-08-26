@@ -475,33 +475,21 @@ fn tail_mean_mag(samples: &[Complex32]) -> f32 {
     tail.iter().map(|s| s.norm()).sum::<f32>() / tail.len() as f32
 }
 
-/// Picks a final scale so the staged shaper's passband (DC) amplitude matches
-/// the single-stage `interpolate-by-N` reference exactly, leaving TX power and
-/// downstream gains unchanged.
-fn calibrate_pulse_shaper_scale(
-    spec: &[f64],
-    lp: &[f64],
-    interpolate: usize,
-    extra_stages: usize,
-) -> f32 {
+/// Final scale for unity passband (DC) gain, so `tx_digital_backoff` sets
+/// the same output level at every TX sample rate.
+fn calibrate_pulse_shaper_scale(spec: &[f64], lp: &[f64], extra_stages: usize) -> f32 {
     let dc = vec![Complex32::new(1.0, 0.0); 96];
-    let legacy_gain = {
-        let mut legacy = ComplexFir32::with_interpolate(spec, interpolate);
-        tail_mean_mag(&legacy.process_block(&dc)) / interpolate as f32
-    };
-    let cascade_gain = {
-        let mut stage1 = PolyphaseComplexFir32::with_interpolate(spec, 4);
-        let mut buf = stage1.process_block(&dc);
-        for _ in 0..extra_stages {
-            let mut up = PolyphaseComplexFir32::with_interpolate(lp, 2);
-            buf = up.process_block(&buf);
-        }
-        tail_mean_mag(&buf)
-    };
-    if cascade_gain <= f32::EPSILON {
-        return 1.0 / interpolate as f32;
+    let mut stage1 = PolyphaseComplexFir32::with_interpolate(spec, 4);
+    let mut buf = stage1.process_block(&dc);
+    for _ in 0..extra_stages {
+        let mut up = PolyphaseComplexFir32::with_interpolate(lp, 2);
+        buf = up.process_block(&buf);
     }
-    legacy_gain / cascade_gain
+    let cascade_gain = tail_mean_mag(&buf);
+    if cascade_gain <= f32::EPSILON {
+        return 1.0;
+    }
+    1.0 / cascade_gain
 }
 
 pub struct TxPulseShaper {
@@ -556,7 +544,7 @@ impl TxPulseShaper {
             upsamplers: (0..extra_stages)
                 .map(|_| PolyphaseComplexFir32::with_interpolate(&lp, 2))
                 .collect(),
-            scale: calibrate_pulse_shaper_scale(&spec, &lp, interpolate, extra_stages),
+            scale: calibrate_pulse_shaper_scale(&spec, &lp, extra_stages),
             scratch_a: Vec::new(),
             scratch_b: Vec::new(),
         })
@@ -1003,7 +991,7 @@ mod tests {
         let lp = interp2_lowpass_taps();
         let interpolate = TX_SAMPLE_RATE as usize / super::SR1_CHIP_RATE_HZ as usize;
         let extra_stages = (interpolate / 4).trailing_zeros() as usize;
-        let scale = calibrate_pulse_shaper_scale(&spec, &lp, interpolate, extra_stages);
+        let scale = calibrate_pulse_shaper_scale(&spec, &lp, extra_stages);
 
         let chips: Vec<Complex32> = (0..256)
             .map(|n| {

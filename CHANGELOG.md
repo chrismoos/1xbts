@@ -1,5 +1,7 @@
 # HEAD
 
+- Forward channel power now follows the C.S0010 base station test model: pilot 20%, sync 4.7%, paging 18.8%, and 56.5% shared by active traffic channels. Pilot power stays constant as calls come and go.
+  Migration: in `config/bts.json` remove `downlink.{pilot,sync,paging}.gain`, or rename them to `power_fraction` with a share of total power (0..1). Optional `downlink.traffic.power_fraction` and `downlink.traffic.max_channel_power_fraction` set the traffic allotment.
 - Improved RC1/RC2/RC3 reverse power control and reduced frame errors, including with RC3 gating.
 - Improved paging coordination with multiple paged MS.
 - Improved traffic/MSC control handling.

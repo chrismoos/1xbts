@@ -5384,7 +5384,7 @@ fn test_existing_capture_cam_wav_with_production_receiver_pipeline() -> Result<(
 #[tokio::test]
 async fn test_e2e_paging_stack_generated_samples_low_sync_gain() -> Result<(), Error> {
     let mut runtime = bts::BtsRuntimeSettings::default();
-    runtime.downlink.sync.gain = 0.20;
+    runtime.downlink.sync.power_fraction = 0.02;
     let best = run_e2e_paging_stack_generated_samples_case(runtime).await?;
 
     assert!(
@@ -5426,7 +5426,7 @@ async fn test_e2e_paging_stack_pulse_shaped_generated_samples() -> Result<(), Er
 #[tokio::test]
 async fn test_e2e_paging_stack_pulse_shaped_generated_samples_no_sync() -> Result<(), Error> {
     let mut runtime = bts::BtsRuntimeSettings::default();
-    runtime.downlink.sync.gain = 0.0;
+    runtime.downlink.sync.power_fraction = 0.0;
 
     let best = run_e2e_paging_stack_pulse_shaped_case(
         PathBuf::from("test/generated/e2e_paging_stack_pulse_shaped_no_sync.wav"),
@@ -5494,7 +5494,7 @@ async fn test_e2e_paging_stack_tx_pulse_only_generated_samples() -> Result<(), E
 #[tokio::test]
 async fn test_e2e_paging_stack_pulse_shaped_with_acquisition() -> Result<(), Error> {
     let mut runtime = bts::BtsRuntimeSettings::default();
-    runtime.downlink.sync.gain = 0.0;
+    runtime.downlink.sync.power_fraction = 0.0;
     let stats = run_e2e_paging_stack_pulse_shaped_acquisition_case(
         PathBuf::from("test/generated/e2e_paging_stack_pulse_shaped_acq.wav"),
         runtime,
@@ -5523,7 +5523,7 @@ async fn test_e2e_paging_stack_pulse_shaped_with_acquisition() -> Result<(), Err
 #[tokio::test]
 async fn test_e2e_paging_stack_tx_pulse_only_with_acquisition() -> Result<(), Error> {
     let mut runtime = bts::BtsRuntimeSettings::default();
-    runtime.downlink.sync.gain = 0.0;
+    runtime.downlink.sync.power_fraction = 0.0;
     let stats = run_e2e_paging_stack_pulse_shaped_acquisition_case(
         PathBuf::from("test/generated/e2e_paging_stack_tx_pulse_only_acq.wav"),
         runtime,
@@ -5552,9 +5552,9 @@ async fn test_e2e_paging_stack_tx_pulse_only_with_acquisition() -> Result<(), Er
 #[tokio::test]
 async fn test_e2e_paging_stack_pulse_shaped_with_tracker() -> Result<(), Error> {
     let mut runtime = bts::BtsRuntimeSettings::default();
-    runtime.downlink.pilot.gain = 0.30;
-    runtime.downlink.sync.gain = 0.05;
-    runtime.downlink.paging.gain = 0.80;
+    runtime.downlink.pilot.power_fraction = 0.10;
+    runtime.downlink.sync.power_fraction = 0.01;
+    runtime.downlink.paging.power_fraction = 0.45;
     let stats = run_e2e_paging_stack_pulse_shaped_tracker_case(
         PathBuf::from("test/generated/e2e_paging_stack_pulse_shaped_tracker.wav"),
         runtime,
@@ -6787,11 +6787,17 @@ fn build_local_forward_rc1_composite_iq_samples(
     let paging_block = paging.next_block(total_chips, system_time);
     let traffic_block = traffic.next_block(total_chips, system_time);
 
-    let pilot_gain = runtime.downlink.pilot.gain;
-    let sync_gain = runtime.downlink.sync.gain;
-    let paging_gain = runtime.downlink.paging.gain;
-    let traffic_gain = cdma_bts::bts::RC1_TRAFFIC_INITIAL_GAIN_LINEAR;
-    let inv_gain_sum = 1.0 / (pilot_gain + sync_gain + paging_gain + traffic_gain);
+    let pilot_gain = runtime.downlink.pilot.power_fraction.sqrt();
+    let sync_gain = runtime.downlink.sync.power_fraction.sqrt();
+    let paging_gain = runtime.downlink.paging.power_fraction.sqrt();
+    // One active traffic channel at nominal weight takes the per-channel cap.
+    let traffic_gain = runtime
+        .downlink
+        .traffic
+        .power_fraction
+        .min(runtime.downlink.traffic.max_channel_power_fraction)
+        .sqrt()
+        * cdma_bts::bts::RC1_TRAFFIC_INITIAL_WEIGHT;
 
     let combined_walsh = (0..total_chips)
         .map(|idx| {
@@ -6803,7 +6809,7 @@ fn build_local_forward_rc1_composite_iq_samples(
                 + sync_block[idx].im * sync_gain
                 + paging_block[idx].im * paging_gain
                 + traffic_block[idx].im * traffic_gain;
-            Complex32::new(re * inv_gain_sum, im * inv_gain_sum)
+            Complex32::new(re, im)
         })
         .collect::<Vec<_>>();
 
@@ -6926,11 +6932,17 @@ fn build_local_forward_rc1_composite_iq_samples_with_lc_state(
     let paging_block = paging.next_block(total_chips, system_time);
     let traffic_block = traffic.next_block(total_chips, system_time);
 
-    let pilot_gain = runtime.downlink.pilot.gain;
-    let sync_gain = runtime.downlink.sync.gain;
-    let paging_gain = runtime.downlink.paging.gain;
-    let traffic_gain = cdma_bts::bts::RC1_TRAFFIC_INITIAL_GAIN_LINEAR;
-    let inv_gain_sum = 1.0 / (pilot_gain + sync_gain + paging_gain + traffic_gain);
+    let pilot_gain = runtime.downlink.pilot.power_fraction.sqrt();
+    let sync_gain = runtime.downlink.sync.power_fraction.sqrt();
+    let paging_gain = runtime.downlink.paging.power_fraction.sqrt();
+    // One active traffic channel at nominal weight takes the per-channel cap.
+    let traffic_gain = runtime
+        .downlink
+        .traffic
+        .power_fraction
+        .min(runtime.downlink.traffic.max_channel_power_fraction)
+        .sqrt()
+        * cdma_bts::bts::RC1_TRAFFIC_INITIAL_WEIGHT;
 
     let combined_walsh = (0..total_chips)
         .map(|idx| {
@@ -6942,7 +6954,7 @@ fn build_local_forward_rc1_composite_iq_samples_with_lc_state(
                 + sync_block[idx].im * sync_gain
                 + paging_block[idx].im * paging_gain
                 + traffic_block[idx].im * traffic_gain;
-            Complex32::new(re * inv_gain_sum, im * inv_gain_sum)
+            Complex32::new(re, im)
         })
         .collect::<Vec<_>>();
 

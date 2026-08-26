@@ -1,6 +1,6 @@
 //! Supplemental channel profile helpers shared across BSC, BTS, and packet code.
 
-use crate::traffic::RC3_TRAFFIC_INITIAL_GAIN_LINEAR;
+use crate::traffic::RC3_TRAFFIC_INITIAL_WEIGHT;
 
 const F_SCH_GAIN_OFFSET_DB: f32 = 3.0;
 
@@ -98,7 +98,7 @@ impl Rc3FschProfile {
     pub fn nominal_gain_linear(self) -> f32 {
         let rate_scale = (self.rate_bps as f32 / 19_200.0).sqrt();
         let gain_offset = 10.0_f32.powf(F_SCH_GAIN_OFFSET_DB / 20.0);
-        RC3_TRAFFIC_INITIAL_GAIN_LINEAR * rate_scale * gain_offset
+        RC3_TRAFFIC_INITIAL_WEIGHT * rate_scale * gain_offset
     }
 }
 

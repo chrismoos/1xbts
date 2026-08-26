@@ -470,8 +470,8 @@ impl TxPool {
 }
 
 pub use cdma_common::traffic::{
-    RC1_TRAFFIC_INITIAL_GAIN_LINEAR, RC2_TRAFFIC_INITIAL_GAIN_LINEAR,
-    RC3_TRAFFIC_INITIAL_GAIN_LINEAR, TrafficRxRequest,
+    RC1_TRAFFIC_INITIAL_WEIGHT, RC2_TRAFFIC_INITIAL_WEIGHT, RC3_TRAFFIC_INITIAL_WEIGHT,
+    TrafficRxRequest,
 };
 
 /// Lifecycle command for an HRPD reverse traffic receiver worker.
@@ -692,7 +692,7 @@ pub fn allocate_traffic_channel(
     traffic_channels.add(TrafficChannelSlot::new(
         walsh_code,
         TrafficChannelWrapper::Rc1(ftch),
-        RC1_TRAFFIC_INITIAL_GAIN_LINEAR,
+        RC1_TRAFFIC_INITIAL_WEIGHT,
     ));
 
     Some((walsh_code, channel_ref))
@@ -766,7 +766,7 @@ pub fn allocate_traffic_channel_rc3(
     traffic_channels.add(TrafficChannelSlot::new(
         walsh_code,
         TrafficChannelWrapper::Rc3(ftch),
-        RC3_TRAFFIC_INITIAL_GAIN_LINEAR,
+        RC3_TRAFFIC_INITIAL_WEIGHT,
     ));
 
     Some((walsh_code, channel_ref))
@@ -807,7 +807,7 @@ pub fn commit_traffic_channel(
     traffic_channels.add(TrafficChannelSlot::new(
         walsh_code,
         TrafficChannelWrapper::Rc1(ftch),
-        RC1_TRAFFIC_INITIAL_GAIN_LINEAR,
+        RC1_TRAFFIC_INITIAL_WEIGHT,
     ));
 
     channel_ref
@@ -850,7 +850,7 @@ pub fn commit_traffic_channel_rc3(
     traffic_channels.add(TrafficChannelSlot::new(
         walsh_code,
         TrafficChannelWrapper::Rc3(ftch),
-        RC3_TRAFFIC_INITIAL_GAIN_LINEAR,
+        RC3_TRAFFIC_INITIAL_WEIGHT,
     ));
 
     channel_ref
@@ -890,7 +890,7 @@ pub fn allocate_traffic_channel_rc2(
     traffic_channels.add(TrafficChannelSlot::new(
         walsh_code,
         TrafficChannelWrapper::Rc2(ftch),
-        RC2_TRAFFIC_INITIAL_GAIN_LINEAR,
+        RC2_TRAFFIC_INITIAL_WEIGHT,
     ));
 
     Some((walsh_code, channel_ref))
@@ -929,7 +929,7 @@ pub fn commit_traffic_channel_rc2(
     traffic_channels.add(TrafficChannelSlot::new(
         walsh_code,
         TrafficChannelWrapper::Rc2(ftch),
-        RC2_TRAFFIC_INITIAL_GAIN_LINEAR,
+        RC2_TRAFFIC_INITIAL_WEIGHT,
     ));
 
     channel_ref

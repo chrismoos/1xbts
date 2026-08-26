@@ -86,6 +86,24 @@ export interface TxMetrics {
   synthSpreadUs: number;
   syncFragmentsSent: number;
   pagingFragmentsSent: number;
+  hwMarginMinUs: number;
+  hwMarginAvgUs: number;
+  hwMarginMaxUs: number;
+  lateBatches: number;
+  radioHealth: TxRadioHealth | undefined;
+  realtimeDegradedEvents: number;
+  pulseAvgUs: number;
+  pulseMaxUs: number;
+  finalizedQueueAirtimeUs: number;
+}
+
+export interface TxRadioHealth {
+  underflows: number;
+  latePackets: number;
+  sequenceErrors: number;
+  burstAcks: number;
+  droppedPackets: number;
+  unknownEvents: number;
 }
 
 /** Timing metrics for one receiver pipeline stage. */
@@ -108,6 +126,15 @@ export interface RxMetrics {
   totalMaxUs: number;
   stages: StageMetrics[];
   deficitMs?: number | undefined;
+  queues: RxQueueMetrics[];
+}
+
+export interface RxQueueMetrics {
+  name: string;
+  queuedSamples: number;
+  queuedAirtimeUs: number;
+  maxQueuedSamples: number;
+  maxResidencyUs: number;
 }
 
 /** Combined radio, receiver, transmitter, and bearer metrics. */
@@ -774,14 +801,16 @@ export interface EvdoCarrierConfig {
 /** Pilot channel configuration. */
 export interface PilotConfig {
   walshCode: number;
-  gain: number;
+  /** Share of total forward power (0..1). */
+  powerFraction: number;
 }
 
 /** Sync channel configuration. */
 export interface SyncConfig {
   walshCode: number;
   dataRateBps: number;
-  gain: number;
+  /** Share of total forward power (0..1). */
+  powerFraction: number;
 }
 
 /** Paging channel configuration. */
@@ -789,7 +818,8 @@ export interface PagingConfig {
   walshCode: number;
   pagingChannelNumber: number;
   dataRateBps: number;
-  gain: number;
+  /** Share of total forward power (0..1). */
+  powerFraction: number;
 }
 
 /** Broadcast overhead parameters used to build paging-channel overhead messages. */
@@ -991,8 +1021,8 @@ export interface Channel {
   channelType: string;
   /** "forward" or "reverse" */
   direction: string;
-  /** Forward-link gain (pilot, sync, paging only) */
-  gain?:
+  /** Share of total forward power (pilot, sync, paging only) */
+  powerFraction?:
     | number
     | undefined;
   /** Data rate in bps (sync, paging, access) */
@@ -1372,6 +1402,15 @@ function createBaseTxMetrics(): TxMetrics {
     synthSpreadUs: 0,
     syncFragmentsSent: 0,
     pagingFragmentsSent: 0,
+    hwMarginMinUs: 0,
+    hwMarginAvgUs: 0,
+    hwMarginMaxUs: 0,
+    lateBatches: 0,
+    radioHealth: undefined,
+    realtimeDegradedEvents: 0,
+    pulseAvgUs: 0,
+    pulseMaxUs: 0,
+    finalizedQueueAirtimeUs: 0,
   };
 }
 
@@ -1418,6 +1457,33 @@ export const TxMetrics: MessageFns<TxMetrics> = {
     }
     if (message.pagingFragmentsSent !== 0) {
       writer.uint32(112).uint64(message.pagingFragmentsSent);
+    }
+    if (message.hwMarginMinUs !== 0) {
+      writer.uint32(120).sint64(message.hwMarginMinUs);
+    }
+    if (message.hwMarginAvgUs !== 0) {
+      writer.uint32(128).sint64(message.hwMarginAvgUs);
+    }
+    if (message.hwMarginMaxUs !== 0) {
+      writer.uint32(136).sint64(message.hwMarginMaxUs);
+    }
+    if (message.lateBatches !== 0) {
+      writer.uint32(144).uint64(message.lateBatches);
+    }
+    if (message.radioHealth !== undefined) {
+      TxRadioHealth.encode(message.radioHealth, writer.uint32(154).fork()).join();
+    }
+    if (message.realtimeDegradedEvents !== 0) {
+      writer.uint32(160).uint64(message.realtimeDegradedEvents);
+    }
+    if (message.pulseAvgUs !== 0) {
+      writer.uint32(168).uint64(message.pulseAvgUs);
+    }
+    if (message.pulseMaxUs !== 0) {
+      writer.uint32(176).uint64(message.pulseMaxUs);
+    }
+    if (message.finalizedQueueAirtimeUs !== 0) {
+      writer.uint32(184).uint64(message.finalizedQueueAirtimeUs);
     }
     return writer;
   },
@@ -1541,6 +1607,78 @@ export const TxMetrics: MessageFns<TxMetrics> = {
           message.pagingFragmentsSent = longToNumber(reader.uint64());
           continue;
         }
+        case 15: {
+          if (tag !== 120) {
+            break;
+          }
+
+          message.hwMarginMinUs = longToNumber(reader.sint64());
+          continue;
+        }
+        case 16: {
+          if (tag !== 128) {
+            break;
+          }
+
+          message.hwMarginAvgUs = longToNumber(reader.sint64());
+          continue;
+        }
+        case 17: {
+          if (tag !== 136) {
+            break;
+          }
+
+          message.hwMarginMaxUs = longToNumber(reader.sint64());
+          continue;
+        }
+        case 18: {
+          if (tag !== 144) {
+            break;
+          }
+
+          message.lateBatches = longToNumber(reader.uint64());
+          continue;
+        }
+        case 19: {
+          if (tag !== 154) {
+            break;
+          }
+
+          message.radioHealth = TxRadioHealth.decode(reader, reader.uint32());
+          continue;
+        }
+        case 20: {
+          if (tag !== 160) {
+            break;
+          }
+
+          message.realtimeDegradedEvents = longToNumber(reader.uint64());
+          continue;
+        }
+        case 21: {
+          if (tag !== 168) {
+            break;
+          }
+
+          message.pulseAvgUs = longToNumber(reader.uint64());
+          continue;
+        }
+        case 22: {
+          if (tag !== 176) {
+            break;
+          }
+
+          message.pulseMaxUs = longToNumber(reader.uint64());
+          continue;
+        }
+        case 23: {
+          if (tag !== 184) {
+            break;
+          }
+
+          message.finalizedQueueAirtimeUs = longToNumber(reader.uint64());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1622,6 +1760,51 @@ export const TxMetrics: MessageFns<TxMetrics> = {
         : isSet(object.paging_fragments_sent)
         ? globalThis.Number(object.paging_fragments_sent)
         : 0,
+      hwMarginMinUs: isSet(object.hwMarginMinUs)
+        ? globalThis.Number(object.hwMarginMinUs)
+        : isSet(object.hw_margin_min_us)
+        ? globalThis.Number(object.hw_margin_min_us)
+        : 0,
+      hwMarginAvgUs: isSet(object.hwMarginAvgUs)
+        ? globalThis.Number(object.hwMarginAvgUs)
+        : isSet(object.hw_margin_avg_us)
+        ? globalThis.Number(object.hw_margin_avg_us)
+        : 0,
+      hwMarginMaxUs: isSet(object.hwMarginMaxUs)
+        ? globalThis.Number(object.hwMarginMaxUs)
+        : isSet(object.hw_margin_max_us)
+        ? globalThis.Number(object.hw_margin_max_us)
+        : 0,
+      lateBatches: isSet(object.lateBatches)
+        ? globalThis.Number(object.lateBatches)
+        : isSet(object.late_batches)
+        ? globalThis.Number(object.late_batches)
+        : 0,
+      radioHealth: isSet(object.radioHealth)
+        ? TxRadioHealth.fromJSON(object.radioHealth)
+        : isSet(object.radio_health)
+        ? TxRadioHealth.fromJSON(object.radio_health)
+        : undefined,
+      realtimeDegradedEvents: isSet(object.realtimeDegradedEvents)
+        ? globalThis.Number(object.realtimeDegradedEvents)
+        : isSet(object.realtime_degraded_events)
+        ? globalThis.Number(object.realtime_degraded_events)
+        : 0,
+      pulseAvgUs: isSet(object.pulseAvgUs)
+        ? globalThis.Number(object.pulseAvgUs)
+        : isSet(object.pulse_avg_us)
+        ? globalThis.Number(object.pulse_avg_us)
+        : 0,
+      pulseMaxUs: isSet(object.pulseMaxUs)
+        ? globalThis.Number(object.pulseMaxUs)
+        : isSet(object.pulse_max_us)
+        ? globalThis.Number(object.pulse_max_us)
+        : 0,
+      finalizedQueueAirtimeUs: isSet(object.finalizedQueueAirtimeUs)
+        ? globalThis.Number(object.finalizedQueueAirtimeUs)
+        : isSet(object.finalized_queue_airtime_us)
+        ? globalThis.Number(object.finalized_queue_airtime_us)
+        : 0,
     };
   },
 
@@ -1669,6 +1852,33 @@ export const TxMetrics: MessageFns<TxMetrics> = {
     if (message.pagingFragmentsSent !== 0) {
       obj.pagingFragmentsSent = Math.round(message.pagingFragmentsSent);
     }
+    if (message.hwMarginMinUs !== 0) {
+      obj.hwMarginMinUs = Math.round(message.hwMarginMinUs);
+    }
+    if (message.hwMarginAvgUs !== 0) {
+      obj.hwMarginAvgUs = Math.round(message.hwMarginAvgUs);
+    }
+    if (message.hwMarginMaxUs !== 0) {
+      obj.hwMarginMaxUs = Math.round(message.hwMarginMaxUs);
+    }
+    if (message.lateBatches !== 0) {
+      obj.lateBatches = Math.round(message.lateBatches);
+    }
+    if (message.radioHealth !== undefined) {
+      obj.radioHealth = TxRadioHealth.toJSON(message.radioHealth);
+    }
+    if (message.realtimeDegradedEvents !== 0) {
+      obj.realtimeDegradedEvents = Math.round(message.realtimeDegradedEvents);
+    }
+    if (message.pulseAvgUs !== 0) {
+      obj.pulseAvgUs = Math.round(message.pulseAvgUs);
+    }
+    if (message.pulseMaxUs !== 0) {
+      obj.pulseMaxUs = Math.round(message.pulseMaxUs);
+    }
+    if (message.finalizedQueueAirtimeUs !== 0) {
+      obj.finalizedQueueAirtimeUs = Math.round(message.finalizedQueueAirtimeUs);
+    }
     return obj;
   },
 
@@ -1691,6 +1901,177 @@ export const TxMetrics: MessageFns<TxMetrics> = {
     message.synthSpreadUs = object.synthSpreadUs ?? 0;
     message.syncFragmentsSent = object.syncFragmentsSent ?? 0;
     message.pagingFragmentsSent = object.pagingFragmentsSent ?? 0;
+    message.hwMarginMinUs = object.hwMarginMinUs ?? 0;
+    message.hwMarginAvgUs = object.hwMarginAvgUs ?? 0;
+    message.hwMarginMaxUs = object.hwMarginMaxUs ?? 0;
+    message.lateBatches = object.lateBatches ?? 0;
+    message.radioHealth = (object.radioHealth !== undefined && object.radioHealth !== null)
+      ? TxRadioHealth.fromPartial(object.radioHealth)
+      : undefined;
+    message.realtimeDegradedEvents = object.realtimeDegradedEvents ?? 0;
+    message.pulseAvgUs = object.pulseAvgUs ?? 0;
+    message.pulseMaxUs = object.pulseMaxUs ?? 0;
+    message.finalizedQueueAirtimeUs = object.finalizedQueueAirtimeUs ?? 0;
+    return message;
+  },
+};
+
+function createBaseTxRadioHealth(): TxRadioHealth {
+  return { underflows: 0, latePackets: 0, sequenceErrors: 0, burstAcks: 0, droppedPackets: 0, unknownEvents: 0 };
+}
+
+export const TxRadioHealth: MessageFns<TxRadioHealth> = {
+  encode(message: TxRadioHealth, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.underflows !== 0) {
+      writer.uint32(8).uint64(message.underflows);
+    }
+    if (message.latePackets !== 0) {
+      writer.uint32(16).uint64(message.latePackets);
+    }
+    if (message.sequenceErrors !== 0) {
+      writer.uint32(24).uint64(message.sequenceErrors);
+    }
+    if (message.burstAcks !== 0) {
+      writer.uint32(32).uint64(message.burstAcks);
+    }
+    if (message.droppedPackets !== 0) {
+      writer.uint32(40).uint64(message.droppedPackets);
+    }
+    if (message.unknownEvents !== 0) {
+      writer.uint32(48).uint64(message.unknownEvents);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): TxRadioHealth {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseTxRadioHealth();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.underflows = longToNumber(reader.uint64());
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.latePackets = longToNumber(reader.uint64());
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.sequenceErrors = longToNumber(reader.uint64());
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.burstAcks = longToNumber(reader.uint64());
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.droppedPackets = longToNumber(reader.uint64());
+          continue;
+        }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.unknownEvents = longToNumber(reader.uint64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): TxRadioHealth {
+    return {
+      underflows: isSet(object.underflows) ? globalThis.Number(object.underflows) : 0,
+      latePackets: isSet(object.latePackets)
+        ? globalThis.Number(object.latePackets)
+        : isSet(object.late_packets)
+        ? globalThis.Number(object.late_packets)
+        : 0,
+      sequenceErrors: isSet(object.sequenceErrors)
+        ? globalThis.Number(object.sequenceErrors)
+        : isSet(object.sequence_errors)
+        ? globalThis.Number(object.sequence_errors)
+        : 0,
+      burstAcks: isSet(object.burstAcks)
+        ? globalThis.Number(object.burstAcks)
+        : isSet(object.burst_acks)
+        ? globalThis.Number(object.burst_acks)
+        : 0,
+      droppedPackets: isSet(object.droppedPackets)
+        ? globalThis.Number(object.droppedPackets)
+        : isSet(object.dropped_packets)
+        ? globalThis.Number(object.dropped_packets)
+        : 0,
+      unknownEvents: isSet(object.unknownEvents)
+        ? globalThis.Number(object.unknownEvents)
+        : isSet(object.unknown_events)
+        ? globalThis.Number(object.unknown_events)
+        : 0,
+    };
+  },
+
+  toJSON(message: TxRadioHealth): unknown {
+    const obj: any = {};
+    if (message.underflows !== 0) {
+      obj.underflows = Math.round(message.underflows);
+    }
+    if (message.latePackets !== 0) {
+      obj.latePackets = Math.round(message.latePackets);
+    }
+    if (message.sequenceErrors !== 0) {
+      obj.sequenceErrors = Math.round(message.sequenceErrors);
+    }
+    if (message.burstAcks !== 0) {
+      obj.burstAcks = Math.round(message.burstAcks);
+    }
+    if (message.droppedPackets !== 0) {
+      obj.droppedPackets = Math.round(message.droppedPackets);
+    }
+    if (message.unknownEvents !== 0) {
+      obj.unknownEvents = Math.round(message.unknownEvents);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<TxRadioHealth>): TxRadioHealth {
+    return TxRadioHealth.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<TxRadioHealth>): TxRadioHealth {
+    const message = createBaseTxRadioHealth();
+    message.underflows = object.underflows ?? 0;
+    message.latePackets = object.latePackets ?? 0;
+    message.sequenceErrors = object.sequenceErrors ?? 0;
+    message.burstAcks = object.burstAcks ?? 0;
+    message.droppedPackets = object.droppedPackets ?? 0;
+    message.unknownEvents = object.unknownEvents ?? 0;
     return message;
   },
 };
@@ -1842,6 +2223,7 @@ function createBaseRxMetrics(): RxMetrics {
     totalMaxUs: 0,
     stages: [],
     deficitMs: undefined,
+    queues: [],
   };
 }
 
@@ -1873,6 +2255,9 @@ export const RxMetrics: MessageFns<RxMetrics> = {
     }
     if (message.deficitMs !== undefined) {
       writer.uint32(73).double(message.deficitMs);
+    }
+    for (const v of message.queues) {
+      RxQueueMetrics.encode(v!, writer.uint32(82).fork()).join();
     }
     return writer;
   },
@@ -1956,6 +2341,14 @@ export const RxMetrics: MessageFns<RxMetrics> = {
           message.deficitMs = reader.double();
           continue;
         }
+        case 10: {
+          if (tag !== 82) {
+            break;
+          }
+
+          message.queues.push(RxQueueMetrics.decode(reader, reader.uint32()));
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -2002,6 +2395,9 @@ export const RxMetrics: MessageFns<RxMetrics> = {
         : isSet(object.deficit_ms)
         ? globalThis.Number(object.deficit_ms)
         : undefined,
+      queues: globalThis.Array.isArray(object?.queues)
+        ? object.queues.map((e: any) => RxQueueMetrics.fromJSON(e))
+        : [],
     };
   },
 
@@ -2034,6 +2430,9 @@ export const RxMetrics: MessageFns<RxMetrics> = {
     if (message.deficitMs !== undefined) {
       obj.deficitMs = message.deficitMs;
     }
+    if (message.queues?.length) {
+      obj.queues = message.queues.map((e) => RxQueueMetrics.toJSON(e));
+    }
     return obj;
   },
 
@@ -2051,6 +2450,147 @@ export const RxMetrics: MessageFns<RxMetrics> = {
     message.totalMaxUs = object.totalMaxUs ?? 0;
     message.stages = object.stages?.map((e) => StageMetrics.fromPartial(e)) || [];
     message.deficitMs = object.deficitMs ?? undefined;
+    message.queues = object.queues?.map((e) => RxQueueMetrics.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseRxQueueMetrics(): RxQueueMetrics {
+  return { name: "", queuedSamples: 0, queuedAirtimeUs: 0, maxQueuedSamples: 0, maxResidencyUs: 0 };
+}
+
+export const RxQueueMetrics: MessageFns<RxQueueMetrics> = {
+  encode(message: RxQueueMetrics, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.name !== "") {
+      writer.uint32(10).string(message.name);
+    }
+    if (message.queuedSamples !== 0) {
+      writer.uint32(16).uint64(message.queuedSamples);
+    }
+    if (message.queuedAirtimeUs !== 0) {
+      writer.uint32(24).uint64(message.queuedAirtimeUs);
+    }
+    if (message.maxQueuedSamples !== 0) {
+      writer.uint32(32).uint64(message.maxQueuedSamples);
+    }
+    if (message.maxResidencyUs !== 0) {
+      writer.uint32(40).uint64(message.maxResidencyUs);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): RxQueueMetrics {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseRxQueueMetrics();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.name = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.queuedSamples = longToNumber(reader.uint64());
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.queuedAirtimeUs = longToNumber(reader.uint64());
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.maxQueuedSamples = longToNumber(reader.uint64());
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.maxResidencyUs = longToNumber(reader.uint64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): RxQueueMetrics {
+    return {
+      name: isSet(object.name) ? globalThis.String(object.name) : "",
+      queuedSamples: isSet(object.queuedSamples)
+        ? globalThis.Number(object.queuedSamples)
+        : isSet(object.queued_samples)
+        ? globalThis.Number(object.queued_samples)
+        : 0,
+      queuedAirtimeUs: isSet(object.queuedAirtimeUs)
+        ? globalThis.Number(object.queuedAirtimeUs)
+        : isSet(object.queued_airtime_us)
+        ? globalThis.Number(object.queued_airtime_us)
+        : 0,
+      maxQueuedSamples: isSet(object.maxQueuedSamples)
+        ? globalThis.Number(object.maxQueuedSamples)
+        : isSet(object.max_queued_samples)
+        ? globalThis.Number(object.max_queued_samples)
+        : 0,
+      maxResidencyUs: isSet(object.maxResidencyUs)
+        ? globalThis.Number(object.maxResidencyUs)
+        : isSet(object.max_residency_us)
+        ? globalThis.Number(object.max_residency_us)
+        : 0,
+    };
+  },
+
+  toJSON(message: RxQueueMetrics): unknown {
+    const obj: any = {};
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
+    if (message.queuedSamples !== 0) {
+      obj.queuedSamples = Math.round(message.queuedSamples);
+    }
+    if (message.queuedAirtimeUs !== 0) {
+      obj.queuedAirtimeUs = Math.round(message.queuedAirtimeUs);
+    }
+    if (message.maxQueuedSamples !== 0) {
+      obj.maxQueuedSamples = Math.round(message.maxQueuedSamples);
+    }
+    if (message.maxResidencyUs !== 0) {
+      obj.maxResidencyUs = Math.round(message.maxResidencyUs);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<RxQueueMetrics>): RxQueueMetrics {
+    return RxQueueMetrics.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<RxQueueMetrics>): RxQueueMetrics {
+    const message = createBaseRxQueueMetrics();
+    message.name = object.name ?? "";
+    message.queuedSamples = object.queuedSamples ?? 0;
+    message.queuedAirtimeUs = object.queuedAirtimeUs ?? 0;
+    message.maxQueuedSamples = object.maxQueuedSamples ?? 0;
+    message.maxResidencyUs = object.maxResidencyUs ?? 0;
     return message;
   },
 };
@@ -11866,7 +12406,7 @@ export const EvdoCarrierConfig: MessageFns<EvdoCarrierConfig> = {
 };
 
 function createBasePilotConfig(): PilotConfig {
-  return { walshCode: 0, gain: 0 };
+  return { walshCode: 0, powerFraction: 0 };
 }
 
 export const PilotConfig: MessageFns<PilotConfig> = {
@@ -11874,8 +12414,8 @@ export const PilotConfig: MessageFns<PilotConfig> = {
     if (message.walshCode !== 0) {
       writer.uint32(8).uint32(message.walshCode);
     }
-    if (message.gain !== 0) {
-      writer.uint32(21).float(message.gain);
+    if (message.powerFraction !== 0) {
+      writer.uint32(21).float(message.powerFraction);
     }
     return writer;
   },
@@ -11900,7 +12440,7 @@ export const PilotConfig: MessageFns<PilotConfig> = {
             break;
           }
 
-          message.gain = reader.float();
+          message.powerFraction = reader.float();
           continue;
         }
       }
@@ -11919,7 +12459,11 @@ export const PilotConfig: MessageFns<PilotConfig> = {
         : isSet(object.walsh_code)
         ? globalThis.Number(object.walsh_code)
         : 0,
-      gain: isSet(object.gain) ? globalThis.Number(object.gain) : 0,
+      powerFraction: isSet(object.powerFraction)
+        ? globalThis.Number(object.powerFraction)
+        : isSet(object.power_fraction)
+        ? globalThis.Number(object.power_fraction)
+        : 0,
     };
   },
 
@@ -11928,8 +12472,8 @@ export const PilotConfig: MessageFns<PilotConfig> = {
     if (message.walshCode !== 0) {
       obj.walshCode = Math.round(message.walshCode);
     }
-    if (message.gain !== 0) {
-      obj.gain = message.gain;
+    if (message.powerFraction !== 0) {
+      obj.powerFraction = message.powerFraction;
     }
     return obj;
   },
@@ -11940,13 +12484,13 @@ export const PilotConfig: MessageFns<PilotConfig> = {
   fromPartial(object: DeepPartial<PilotConfig>): PilotConfig {
     const message = createBasePilotConfig();
     message.walshCode = object.walshCode ?? 0;
-    message.gain = object.gain ?? 0;
+    message.powerFraction = object.powerFraction ?? 0;
     return message;
   },
 };
 
 function createBaseSyncConfig(): SyncConfig {
-  return { walshCode: 0, dataRateBps: 0, gain: 0 };
+  return { walshCode: 0, dataRateBps: 0, powerFraction: 0 };
 }
 
 export const SyncConfig: MessageFns<SyncConfig> = {
@@ -11957,8 +12501,8 @@ export const SyncConfig: MessageFns<SyncConfig> = {
     if (message.dataRateBps !== 0) {
       writer.uint32(16).uint32(message.dataRateBps);
     }
-    if (message.gain !== 0) {
-      writer.uint32(29).float(message.gain);
+    if (message.powerFraction !== 0) {
+      writer.uint32(29).float(message.powerFraction);
     }
     return writer;
   },
@@ -11991,7 +12535,7 @@ export const SyncConfig: MessageFns<SyncConfig> = {
             break;
           }
 
-          message.gain = reader.float();
+          message.powerFraction = reader.float();
           continue;
         }
       }
@@ -12015,7 +12559,11 @@ export const SyncConfig: MessageFns<SyncConfig> = {
         : isSet(object.data_rate_bps)
         ? globalThis.Number(object.data_rate_bps)
         : 0,
-      gain: isSet(object.gain) ? globalThis.Number(object.gain) : 0,
+      powerFraction: isSet(object.powerFraction)
+        ? globalThis.Number(object.powerFraction)
+        : isSet(object.power_fraction)
+        ? globalThis.Number(object.power_fraction)
+        : 0,
     };
   },
 
@@ -12027,8 +12575,8 @@ export const SyncConfig: MessageFns<SyncConfig> = {
     if (message.dataRateBps !== 0) {
       obj.dataRateBps = Math.round(message.dataRateBps);
     }
-    if (message.gain !== 0) {
-      obj.gain = message.gain;
+    if (message.powerFraction !== 0) {
+      obj.powerFraction = message.powerFraction;
     }
     return obj;
   },
@@ -12040,13 +12588,13 @@ export const SyncConfig: MessageFns<SyncConfig> = {
     const message = createBaseSyncConfig();
     message.walshCode = object.walshCode ?? 0;
     message.dataRateBps = object.dataRateBps ?? 0;
-    message.gain = object.gain ?? 0;
+    message.powerFraction = object.powerFraction ?? 0;
     return message;
   },
 };
 
 function createBasePagingConfig(): PagingConfig {
-  return { walshCode: 0, pagingChannelNumber: 0, dataRateBps: 0, gain: 0 };
+  return { walshCode: 0, pagingChannelNumber: 0, dataRateBps: 0, powerFraction: 0 };
 }
 
 export const PagingConfig: MessageFns<PagingConfig> = {
@@ -12060,8 +12608,8 @@ export const PagingConfig: MessageFns<PagingConfig> = {
     if (message.dataRateBps !== 0) {
       writer.uint32(24).uint32(message.dataRateBps);
     }
-    if (message.gain !== 0) {
-      writer.uint32(37).float(message.gain);
+    if (message.powerFraction !== 0) {
+      writer.uint32(37).float(message.powerFraction);
     }
     return writer;
   },
@@ -12102,7 +12650,7 @@ export const PagingConfig: MessageFns<PagingConfig> = {
             break;
           }
 
-          message.gain = reader.float();
+          message.powerFraction = reader.float();
           continue;
         }
       }
@@ -12131,7 +12679,11 @@ export const PagingConfig: MessageFns<PagingConfig> = {
         : isSet(object.data_rate_bps)
         ? globalThis.Number(object.data_rate_bps)
         : 0,
-      gain: isSet(object.gain) ? globalThis.Number(object.gain) : 0,
+      powerFraction: isSet(object.powerFraction)
+        ? globalThis.Number(object.powerFraction)
+        : isSet(object.power_fraction)
+        ? globalThis.Number(object.power_fraction)
+        : 0,
     };
   },
 
@@ -12146,8 +12698,8 @@ export const PagingConfig: MessageFns<PagingConfig> = {
     if (message.dataRateBps !== 0) {
       obj.dataRateBps = Math.round(message.dataRateBps);
     }
-    if (message.gain !== 0) {
-      obj.gain = message.gain;
+    if (message.powerFraction !== 0) {
+      obj.powerFraction = message.powerFraction;
     }
     return obj;
   },
@@ -12160,7 +12712,7 @@ export const PagingConfig: MessageFns<PagingConfig> = {
     message.walshCode = object.walshCode ?? 0;
     message.pagingChannelNumber = object.pagingChannelNumber ?? 0;
     message.dataRateBps = object.dataRateBps ?? 0;
-    message.gain = object.gain ?? 0;
+    message.powerFraction = object.powerFraction ?? 0;
     return message;
   },
 };
@@ -14333,7 +14885,7 @@ function createBaseChannel(): Channel {
     walshCode: undefined,
     channelType: "",
     direction: "",
-    gain: undefined,
+    powerFraction: undefined,
     dataRateBps: undefined,
     pagingChannelNumber: undefined,
     accessChannelNumber: undefined,
@@ -14354,8 +14906,8 @@ export const Channel: MessageFns<Channel> = {
     if (message.direction !== "") {
       writer.uint32(26).string(message.direction);
     }
-    if (message.gain !== undefined) {
-      writer.uint32(37).float(message.gain);
+    if (message.powerFraction !== undefined) {
+      writer.uint32(37).float(message.powerFraction);
     }
     if (message.dataRateBps !== undefined) {
       writer.uint32(40).uint32(message.dataRateBps);
@@ -14414,7 +14966,7 @@ export const Channel: MessageFns<Channel> = {
             break;
           }
 
-          message.gain = reader.float();
+          message.powerFraction = reader.float();
           continue;
         }
         case 5: {
@@ -14487,7 +15039,11 @@ export const Channel: MessageFns<Channel> = {
         ? globalThis.String(object.channel_type)
         : "",
       direction: isSet(object.direction) ? globalThis.String(object.direction) : "",
-      gain: isSet(object.gain) ? globalThis.Number(object.gain) : undefined,
+      powerFraction: isSet(object.powerFraction)
+        ? globalThis.Number(object.powerFraction)
+        : isSet(object.power_fraction)
+        ? globalThis.Number(object.power_fraction)
+        : undefined,
       dataRateBps: isSet(object.dataRateBps)
         ? globalThis.Number(object.dataRateBps)
         : isSet(object.data_rate_bps)
@@ -14528,8 +15084,8 @@ export const Channel: MessageFns<Channel> = {
     if (message.direction !== "") {
       obj.direction = message.direction;
     }
-    if (message.gain !== undefined) {
-      obj.gain = message.gain;
+    if (message.powerFraction !== undefined) {
+      obj.powerFraction = message.powerFraction;
     }
     if (message.dataRateBps !== undefined) {
       obj.dataRateBps = Math.round(message.dataRateBps);
@@ -14560,7 +15116,7 @@ export const Channel: MessageFns<Channel> = {
     message.walshCode = object.walshCode ?? undefined;
     message.channelType = object.channelType ?? "";
     message.direction = object.direction ?? "";
-    message.gain = object.gain ?? undefined;
+    message.powerFraction = object.powerFraction ?? undefined;
     message.dataRateBps = object.dataRateBps ?? undefined;
     message.pagingChannelNumber = object.pagingChannelNumber ?? undefined;
     message.accessChannelNumber = object.accessChannelNumber ?? undefined;

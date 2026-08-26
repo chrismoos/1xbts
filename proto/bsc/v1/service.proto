@@ -740,14 +740,16 @@ message EvdoCarrierConfig {
 // Pilot channel configuration.
 message PilotConfig {
   uint32 walsh_code = 1;
-  float gain = 2;
+  // Share of total forward power (0..1).
+  float power_fraction = 2;
 }
 
 // Sync channel configuration.
 message SyncConfig {
   uint32 walsh_code = 1;
   uint32 data_rate_bps = 2;
-  float gain = 3;
+  // Share of total forward power (0..1).
+  float power_fraction = 3;
 }
 
 // Paging channel configuration.
@@ -755,7 +757,8 @@ message PagingConfig {
   uint32 walsh_code = 1;
   uint32 paging_channel_number = 2;
   uint32 data_rate_bps = 3;
-  float gain = 4;
+  // Share of total forward power (0..1).
+  float power_fraction = 4;
 }
 
 // Broadcast overhead parameters used to build paging-channel overhead messages.
@@ -933,8 +936,8 @@ message Channel {
   string channel_type = 2;
   // "forward" or "reverse"
   string direction = 3;
-  // Forward-link gain (pilot, sync, paging only)
-  optional float gain = 4;
+  // Share of total forward power (pilot, sync, paging only)
+  optional float power_fraction = 4;
   // Data rate in bps (sync, paging, access)
   optional uint32 data_rate_bps = 5;
   // Paging channel number (paging only)

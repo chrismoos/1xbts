@@ -1,5 +1,6 @@
 import { getBtsManagementClient } from "@/lib/grpc/client";
 import { Card, Stat } from "@/components/card";
+import { formatPowerFraction } from "@/lib/format";
 import { EvdoCarrierCard } from "@/components/evdo-carrier-card";
 
 export const dynamic = "force-dynamic";
@@ -49,7 +50,7 @@ export default async function ConfigPage() {
             {config.pilot && (
               <>
                 <Stat label="Walsh Code" value={String(config.pilot.walshCode)} />
-                <Stat label="Gain" value={config.pilot.gain.toFixed(4)} />
+                <Stat label="Power" value={formatPowerFraction(config.pilot.powerFraction)} />
               </>
             )}
           </Card>
@@ -59,7 +60,7 @@ export default async function ConfigPage() {
               <>
                 <Stat label="Walsh Code" value={String(config.sync.walshCode)} />
                 <Stat label="Data Rate" value={`${config.sync.dataRateBps} bps`} />
-                <Stat label="Gain" value={config.sync.gain.toFixed(4)} />
+                <Stat label="Power" value={formatPowerFraction(config.sync.powerFraction)} />
               </>
             )}
           </Card>
@@ -70,7 +71,7 @@ export default async function ConfigPage() {
                 <Stat label="Walsh Code" value={String(config.paging.walshCode)} />
                 <Stat label="Channel #" value={String(config.paging.pagingChannelNumber)} />
                 <Stat label="Data Rate" value={`${config.paging.dataRateBps} bps`} />
-                <Stat label="Gain" value={config.paging.gain.toFixed(4)} />
+                <Stat label="Power" value={formatPowerFraction(config.paging.powerFraction)} />
               </>
             )}
           </Card>

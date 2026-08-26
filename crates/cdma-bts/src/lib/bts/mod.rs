@@ -39,6 +39,8 @@ pub use traffic_setup_service::TrafficSetupService;
 mod downlink;
 mod synth;
 mod timing;
+#[cfg(test)]
+mod tx_headroom_tests;
 
 use std::{sync::Arc, sync::atomic::AtomicBool, thread, time::Instant};
 
@@ -78,11 +80,12 @@ fn hrpd_rpc_mode() -> (bool, bool, &'static str) {
     (false, true, "alternating-hold")
 }
 
-// Preserve the HRPD branch amplitude used by the adjacent composer so the
-// standalone path cannot bypass its full-scale headroom.
-fn hrpd_only_tx_scale(evdo_gain: f32, tx_digital_backoff: f32) -> f32 {
-    let gain = evdo_gain.max(0.0);
-    tx_digital_backoff * gain / (1.0 + gain)
+/// HRPD-only carriers run at 0.75 of the 1x backoff: 16QAM traffic has
+/// ~3 dB more PAPR than the loaded 1x composite (`tx_headroom_tests`).
+pub(crate) const HRPD_PAPR_HEADROOM: f32 = 0.75;
+
+fn hrpd_only_tx_scale(tx_digital_backoff: f32) -> f32 {
+    tx_digital_backoff * HRPD_PAPR_HEADROOM
 }
 
 fn one_x_synth_scale(tx_digital_backoff: f32, adjacent_composite: bool) -> f32 {
@@ -212,6 +215,7 @@ pub(crate) struct TxLoopState {
     pub(super) scratch_paging: Vec<num::complex::Complex32>,
     pub(super) scratch_tc_snapshot: Vec<(f32, handle::TrafficChannelWrapper)>,
     pub(super) scratch_tc_blocks: Vec<(f32, bool, Vec<num::complex::Complex32>)>,
+    pub(super) scratch_tc_amps: Vec<f32>,
     /// Last per-block FTCH timing breakdown.
     pub(super) last_snap_us: u64,
     pub(super) last_tc_n: usize,
@@ -317,6 +321,24 @@ impl Bts {
             self.runtime.tx_sample_rate_hz as f64 / 1_000_000.0,
             self.runtime.spreading_rate,
         );
+        let dl = &self.runtime.downlink;
+        let db = |fraction: f32| 10.0 * fraction.max(f32::MIN_POSITIVE).log10();
+        info!(
+            "forward power split: pilot {:.1}% ({:+.1} dB) sync {:.1}% ({:+.1} dB) paging {:.1}% ({:+.1} dB) traffic {:.1}% ({:+.1} dB, max {:.1}% per channel); composite {:+.1} dBFS before pulse shaping at tx_digital_backoff {:.2}",
+            dl.pilot.power_fraction * 100.0,
+            db(dl.pilot.power_fraction),
+            dl.sync.power_fraction * 100.0,
+            db(dl.sync.power_fraction),
+            dl.paging.power_fraction * 100.0,
+            db(dl.paging.power_fraction),
+            dl.traffic.power_fraction * 100.0,
+            db(dl.traffic.power_fraction),
+            dl.traffic.max_channel_power_fraction * 100.0,
+            db(dl.total_power_fraction()
+                * self.runtime.tx_digital_backoff
+                * self.runtime.tx_digital_backoff),
+            self.runtime.tx_digital_backoff,
+        );
         if let Some(evdo) = &self.evdo {
             if evdo.uses_hrpd_only() {
                 info!(
@@ -329,7 +351,7 @@ impl Bts {
                     self.runtime.tx_bandwidth_hz as f64 / 1_000_000.0,
                     evdo.gain,
                     self.runtime.tx_digital_backoff,
-                    hrpd_only_tx_scale(evdo.gain, self.runtime.tx_digital_backoff),
+                    hrpd_only_tx_scale(self.runtime.tx_digital_backoff),
                 );
             } else {
                 info!(
@@ -520,6 +542,7 @@ impl Bts {
             scratch_paging: vec![Complex32::default(); self.runtime.block_size_chips],
             scratch_tc_snapshot: Vec::new(),
             scratch_tc_blocks: Vec::new(),
+            scratch_tc_amps: Vec::new(),
             tx_pool: handle::TxPool::new(self.traffic_channels.tx_cmd_queue()),
             last_snap_us: 0,
             last_tc_n: 0,
@@ -1272,14 +1295,14 @@ impl Bts {
             }
 
             let batch_shape_us;
-            if let (Some(hrpd_shaper), Some(evdo_cfg), Some(evdo_tx_batch)) = (
+            if let (Some(hrpd_shaper), Some(_), Some(evdo_tx_batch)) = (
                 hrpd_shaper.as_mut(),
                 self.evdo.as_ref().filter(|cfg| cfg.uses_hrpd_only()),
                 evdo_tx_batch.as_ref(),
             ) {
                 let shape_start = Instant::now();
                 hrpd_shaper.shape_into(evdo_tx_batch, &mut tx_shape_buf);
-                let hrpd_scale = hrpd_only_tx_scale(evdo_cfg.gain, self.runtime.tx_digital_backoff);
+                let hrpd_scale = hrpd_only_tx_scale(self.runtime.tx_digital_backoff);
                 if (hrpd_scale - 1.0).abs() > f32::EPSILON {
                     for sample in &mut tx_shape_buf {
                         *sample *= hrpd_scale;
@@ -1456,9 +1479,8 @@ mod tests {
 
     #[test]
     fn hrpd_only_tx_scale_applies_configured_backoff() {
-        assert_eq!(hrpd_only_tx_scale(1.0, 0.5), 0.25);
-        assert!((hrpd_only_tx_scale(0.75, 0.4) - 0.171_428_58).abs() < 1e-6);
-        assert_eq!(hrpd_only_tx_scale(-1.0, 0.5), 0.0);
+        assert!((hrpd_only_tx_scale(0.4) - 0.3).abs() < 1e-6);
+        assert!((hrpd_only_tx_scale(0.2) - 0.15).abs() < 1e-6);
     }
 
     #[test]
@@ -1479,11 +1501,12 @@ mod tests {
         let chips = modulator.next_block(0, 32_768);
         let mut shaper = TxPulseShaper::new(SR1_CHIP_RATE_HZ as usize * 4).unwrap();
         let samples = shaper.shape(&chips);
+        // The DAC clips I and Q separately.
         let unscaled_peak = samples
             .iter()
-            .map(|sample| sample.norm())
+            .map(|sample| sample.re.abs().max(sample.im.abs()))
             .fold(0.0, f32::max);
-        let scaled_peak = unscaled_peak * hrpd_only_tx_scale(1.0, 0.5);
+        let scaled_peak = unscaled_peak * hrpd_only_tx_scale(0.3);
 
         assert!(
             scaled_peak <= 1.0,

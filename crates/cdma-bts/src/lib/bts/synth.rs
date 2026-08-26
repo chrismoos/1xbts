@@ -15,11 +15,49 @@ use super::{
 
 use cdma_common::consts::SR1_CHIPS_PER_FRAME;
 
-fn active_traffic_gain_sum(blocks: &[(f32, bool, Vec<Complex32>)]) -> f32 {
-    blocks
-        .iter()
-        .filter_map(|(gain, active, _)| active.then_some(*gain))
-        .sum()
+/// Per-channel amplitudes for the active traffic channels. Active channels
+/// split the allotment evenly (capped per channel), and forward power
+/// control scales each around its share. If boosts overflow the allotment,
+/// only the boosted channels are scaled back — unboosted channels and the
+/// overhead channels are untouched.
+pub(super) fn traffic_amplitudes(
+    traffic_fraction: f32,
+    max_channel_fraction: f32,
+    blocks: &[(f32, bool, Vec<Complex32>)],
+    out: &mut Vec<f32>,
+) {
+    out.clear();
+    let active = blocks.iter().filter(|(_, active, _)| *active).count();
+    if active == 0 || traffic_fraction <= 0.0 {
+        out.resize(blocks.len(), 0.0);
+        return;
+    }
+    let share = (traffic_fraction / active as f32).min(max_channel_fraction);
+    let mut total = 0.0f32;
+    let mut boosted_total = 0.0f32;
+    for (weight, active, _) in blocks {
+        let power = if *active {
+            share * weight * weight
+        } else {
+            0.0
+        };
+        total += power;
+        if *weight > 1.0 {
+            boosted_total += power;
+        }
+        out.push(power);
+    }
+    let boost_squeeze = if total > traffic_fraction && boosted_total > 0.0 {
+        (traffic_fraction - (total - boosted_total)) / boosted_total
+    } else {
+        1.0
+    };
+    for (power, (weight, _, _)) in out.iter_mut().zip(blocks) {
+        if *weight > 1.0 {
+            *power *= boost_squeeze;
+        }
+        *power = power.sqrt();
+    }
 }
 
 pub(super) fn aligned_spreader(
@@ -151,36 +189,45 @@ pub(super) fn synthesize_block(
     state.last_tc_sum_us = tc_sum_us;
     state.last_tc_max_us = tc_max_us;
 
-    let pilot_gain = runtime.downlink.pilot.gain;
-    let sync_gain = runtime.downlink.sync.gain;
-    let paging_gain = runtime.downlink.paging.gain;
-    let tc_gain_sum = active_traffic_gain_sum(&state.scratch_tc_blocks);
-    let inv_gain_sum = 1.0 / (pilot_gain + sync_gain + paging_gain + tc_gain_sum);
+    // Channel chips are unit amplitude and the Walsh covers are orthogonal,
+    // so a channel's power is its amplitude squared and the fractions add.
+    let pilot_amp = runtime.downlink.pilot.power_fraction.sqrt() * tx_scale;
+    let sync_amp = runtime.downlink.sync.power_fraction.sqrt() * tx_scale;
+    let paging_amp = runtime.downlink.paging.power_fraction.sqrt() * tx_scale;
+    traffic_amplitudes(
+        runtime.downlink.traffic.power_fraction,
+        runtime.downlink.traffic.max_channel_power_fraction,
+        &state.scratch_tc_blocks,
+        &mut state.scratch_tc_amps,
+    );
+    for amp in state.scratch_tc_amps.iter_mut() {
+        *amp *= tx_scale;
+    }
 
     let pilot_block = &state.scratch_pilot;
     let sync_block = &state.scratch_sync;
     let paging_block = &state.scratch_paging;
     let tc_blocks = &state.scratch_tc_blocks;
+    let tc_amps = &state.scratch_tc_amps;
 
     let t0 = Instant::now();
     for x in 0..block_size {
-        let mut re = pilot_block[x].re * pilot_gain
-            + sync_block[x].re * sync_gain
-            + paging_block[x].re * paging_gain;
-        let mut im = pilot_block[x].im * pilot_gain
-            + sync_block[x].im * sync_gain
-            + paging_block[x].im * paging_gain;
+        let mut re = pilot_block[x].re * pilot_amp
+            + sync_block[x].re * sync_amp
+            + paging_block[x].re * paging_amp;
+        let mut im = pilot_block[x].im * pilot_amp
+            + sync_block[x].im * sync_amp
+            + paging_block[x].im * paging_amp;
 
-        for (tc_gain, active, tc_samples) in tc_blocks {
+        for ((_, active, tc_samples), amp) in tc_blocks.iter().zip(tc_amps) {
             if !active {
                 continue;
             }
-            re += tc_samples[x].re * tc_gain;
-            im += tc_samples[x].im * tc_gain;
+            re += tc_samples[x].re * amp;
+            im += tc_samples[x].im * amp;
         }
 
-        let combined = Complex32::new(re * inv_gain_sum * tx_scale, im * inv_gain_sum * tx_scale);
-        synth_block[x] = spreader.spread(&combined);
+        synth_block[x] = spreader.spread(&Complex32::new(re, im));
     }
     state.synth_spread_us += t0.elapsed().as_micros() as u64;
 
@@ -197,23 +244,94 @@ pub(super) fn synthesize_block(
 mod tests {
     use super::*;
 
-    #[test]
-    fn dtx_channel_does_not_consume_composite_gain() {
-        let blocks = vec![
-            (0.5, true, vec![Complex32::new(1.0, 0.0)]),
-            (1.998, false, vec![Complex32::new(0.0, 0.0)]),
-        ];
+    fn block(weight: f32, active: bool) -> (f32, bool, Vec<Complex32>) {
+        (weight, active, vec![Complex32::new(1.0, 0.0)])
+    }
 
-        assert!((active_traffic_gain_sum(&blocks) - 0.5).abs() < f32::EPSILON);
+    fn powers(traffic: f32, cap: f32, blocks: &[(f32, bool, Vec<Complex32>)]) -> Vec<f32> {
+        let mut amps = Vec::new();
+        traffic_amplitudes(traffic, cap, blocks, &mut amps);
+        amps.iter().map(|a| a * a).collect()
     }
 
     #[test]
-    fn transmitting_sch_consumes_composite_gain() {
-        let blocks = vec![
-            (0.5, true, vec![Complex32::new(1.0, 0.0)]),
-            (1.998, true, vec![Complex32::new(1.0, 1.0)]),
-        ];
+    fn single_channel_is_capped_at_the_per_channel_limit() {
+        let p = powers(0.5647, 0.2, &[block(1.0, true)]);
+        assert!((p[0] - 0.2).abs() < 1e-6);
+    }
 
-        assert!((active_traffic_gain_sum(&blocks) - 2.498).abs() < 1e-6);
+    #[test]
+    fn active_channels_split_the_allotment_evenly() {
+        let blocks = [
+            block(1.0, true),
+            block(1.0, true),
+            block(1.0, true),
+            block(1.0, true),
+        ];
+        let p = powers(0.5647, 0.2, &blocks);
+        for v in &p {
+            assert!((v - 0.5647 / 4.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn dtx_channel_does_not_consume_the_allotment() {
+        let p = powers(0.5647, 0.2, &[block(1.0, true), block(1.998, false)]);
+        assert!((p[0] - 0.2).abs() < 1e-6);
+        assert_eq!(p[1], 0.0);
+    }
+
+    #[test]
+    fn power_control_weight_moves_a_channel_relative_to_its_share() {
+        let blocks = [
+            block(1.0, true),
+            block(0.5, true),
+            block(1.0, true),
+            block(1.0, true),
+        ];
+        let p = powers(0.5647, 0.2, &blocks);
+        let share = 0.5647 / 4.0;
+        assert!((p[0] - share).abs() < 1e-6);
+        assert!((p[1] - share * 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn boosted_channels_are_squeezed_back_into_the_allotment() {
+        let blocks = [
+            block(2.0, true),
+            block(2.0, true),
+            block(2.0, true),
+            block(2.0, true),
+        ];
+        let p = powers(0.5647, 0.2, &blocks);
+        let total: f32 = p.iter().sum();
+        assert!((total - 0.5647).abs() < 1e-5);
+        assert!((p[0] - 0.5647 / 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn overflowing_boost_does_not_shrink_unboosted_channels() {
+        let blocks = [
+            block(1.0, true),
+            block(1.0, true),
+            block(1.0, true),
+            block(2.0, true),
+        ];
+        let p = powers(0.5647, 0.2, &blocks);
+        let share = 0.5647 / 4.0;
+        for v in &p[..3] {
+            assert!((v - share).abs() < 1e-6);
+        }
+        // The boosted channel gets only what the allotment has left.
+        assert!((p[3] - share).abs() < 1e-6);
+        let total: f32 = p.iter().sum();
+        assert!(total <= 0.5647 + 1e-5);
+    }
+
+    #[test]
+    fn no_active_channels_yields_zero_amplitudes() {
+        let p = powers(0.5647, 0.2, &[block(1.0, false)]);
+        assert_eq!(p, vec![0.0]);
+        assert!(powers(0.5647, 0.2, &[]).is_empty());
     }
 }

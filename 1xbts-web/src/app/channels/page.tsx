@@ -4,6 +4,7 @@ import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { Card } from "@/components/card";
 import { radioConfigPairName } from "@/lib/radio-config";
+import { formatPowerFraction } from "@/lib/format";
 import { serviceOptionName } from "@/lib/service-option";
 
 interface ChannelMobile {
@@ -31,7 +32,7 @@ interface Channel {
   walshCode?: number;
   channelType: string;
   direction: string;
-  gain?: number;
+  powerFraction?: number;
   dataRateBps?: number;
   pagingChannelNumber?: number;
   accessChannelNumber?: number;
@@ -301,20 +302,20 @@ function ChannelTable({
                   </span>
                 </td>
                 <td className="py-2 text-xs text-muted">
-                  {ch.channelType === "pilot" && ch.gain != null && (
-                    <span>Gain {ch.gain.toFixed(2)}</span>
+                  {ch.channelType === "pilot" && ch.powerFraction != null && (
+                    <span>{formatPowerFraction(ch.powerFraction)}</span>
                   )}
                   {ch.channelType === "sync" && (
                     <span>
                       {ch.dataRateBps ? `${ch.dataRateBps} bps` : ""}
-                      {ch.gain != null && ` / Gain ${ch.gain.toFixed(2)}`}
+                      {ch.powerFraction != null && ` / ${formatPowerFraction(ch.powerFraction)}`}
                     </span>
                   )}
                   {ch.channelType === "paging" && (
                     <span>
                       PCH {ch.pagingChannelNumber}
                       {ch.dataRateBps ? ` / ${ch.dataRateBps} bps` : ""}
-                      {ch.gain != null && ` / Gain ${ch.gain.toFixed(2)}`}
+                      {ch.powerFraction != null && ` / ${formatPowerFraction(ch.powerFraction)}`}
                     </span>
                   )}
                   {ch.channelType === "access" && (

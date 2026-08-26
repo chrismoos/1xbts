@@ -18,11 +18,15 @@ pub struct TrafficRxRequest {
     pub rev_fch_gating_mode: bool,
 }
 
-/// Initial linear amplitude gain for an RC1 forward traffic channel.
-pub const RC1_TRAFFIC_INITIAL_GAIN_LINEAR: f32 = 0.838;
+/// Initial power-control weight for an RC1 forward traffic channel. A weight
+/// of 1.0 is the channel's nominal share of the traffic power allotment;
+/// forward power control scales the weight from there.
+pub const RC1_TRAFFIC_INITIAL_WEIGHT: f32 = 1.0;
 
-/// Initial linear amplitude gain for an RC2 forward traffic channel.
-pub const RC2_TRAFFIC_INITIAL_GAIN_LINEAR: f32 = RC1_TRAFFIC_INITIAL_GAIN_LINEAR;
+/// Initial power-control weight for an RC2 forward traffic channel.
+pub const RC2_TRAFFIC_INITIAL_WEIGHT: f32 = RC1_TRAFFIC_INITIAL_WEIGHT;
 
-/// Initial linear amplitude gain for an RC3 forward traffic channel.
-pub const RC3_TRAFFIC_INITIAL_GAIN_LINEAR: f32 = 0.5;
+/// Initial power-control weight for an RC3 forward traffic channel. RC3
+/// demodulates coherently against the pilot and needs about 4.5 dB less
+/// than RC1 for the same FER.
+pub const RC3_TRAFFIC_INITIAL_WEIGHT: f32 = 0.6;

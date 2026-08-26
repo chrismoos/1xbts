@@ -78,18 +78,28 @@ impl InterleaverSettings {
 #[serde(default)]
 pub struct PilotChannelSettings {
     pub walsh_code: usize,
-    pub gain: f32,
+    /// Share of total forward power carried by the pilot.
+    pub power_fraction: f32,
 }
 
 impl Default for PilotChannelSettings {
     fn default() -> Self {
         Self {
             walsh_code: 0,
-            // -7 dB => 10^(-7/20) ~= 0.4466836
-            gain: 0.4466836,
+            power_fraction: PILOT_POWER_FRACTION,
         }
     }
 }
+
+/// C.S0010-C Table 6.5.2-1 test-model power fractions.
+pub const PILOT_POWER_FRACTION: f32 = 0.2000;
+/// Rounding slack for the four-decimal table values, which sum to 1.0000.
+const POWER_FRACTION_SUM_TOLERANCE: f32 = 1e-3;
+pub const SYNC_POWER_FRACTION: f32 = 0.0471;
+pub const PAGING_POWER_FRACTION: f32 = 0.1882;
+pub const TRAFFIC_POWER_FRACTION: f32 = 0.5647;
+/// One traffic channel never takes more than the pilot's share.
+pub const TRAFFIC_MAX_CHANNEL_POWER_FRACTION: f32 = PILOT_POWER_FRACTION;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -99,7 +109,8 @@ pub struct SyncChannelSettings {
     pub data_rate_bps: usize,
     pub symbol_repeat: usize,
     pub interleaver: InterleaverSettings,
-    pub gain: f32,
+    /// Share of total forward power carried by the sync channel.
+    pub power_fraction: f32,
     pub availability_max_size_bits: usize,
 }
 
@@ -116,8 +127,7 @@ impl Default for SyncChannelSettings {
                 m: p.m,
                 j: p.j,
             },
-            // -13.3 dB => 10^(-13.3/20) ~= 0.21627898
-            gain: 0.21627898,
+            power_fraction: SYNC_POWER_FRACTION,
             availability_max_size_bits: 32,
         }
     }
@@ -130,7 +140,8 @@ pub struct PagingChannelSettings {
     pub paging_channel_number: u8,
     pub data_rate_bps: usize,
     pub interleaver: InterleaverSettings,
-    pub gain: f32,
+    /// Share of total forward power carried by the paging channel.
+    pub power_fraction: f32,
     pub availability_max_size_bits: usize,
     pub bypass_long_code: bool,
     pub force_zero_payload_bits: bool,
@@ -149,12 +160,29 @@ impl Default for PagingChannelSettings {
                 m: p.m,
                 j: p.j,
             },
-            // -7.3 dB => 10^(-7.3/20) ~= 0.43151583
-            gain: 0.43151583,
+            power_fraction: PAGING_POWER_FRACTION,
             availability_max_size_bits: 96,
             bypass_long_code: false,
             force_zero_payload_bits: false,
             message_defaults: PagingMessageDefaults::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TrafficPowerSettings {
+    /// Share of total forward power for all traffic channels together.
+    pub power_fraction: f32,
+    /// Upper bound on any single traffic channel's share of total power.
+    pub max_channel_power_fraction: f32,
+}
+
+impl Default for TrafficPowerSettings {
+    fn default() -> Self {
+        Self {
+            power_fraction: TRAFFIC_POWER_FRACTION,
+            max_channel_power_fraction: TRAFFIC_MAX_CHANNEL_POWER_FRACTION,
         }
     }
 }
@@ -165,6 +193,19 @@ pub struct DownlinkSettings {
     pub pilot: PilotChannelSettings,
     pub sync: SyncChannelSettings,
     pub paging: PagingChannelSettings,
+    pub traffic: TrafficPowerSettings,
+}
+
+impl DownlinkSettings {
+    /// Total power fraction committed to the configured channel types. The
+    /// composite RMS level relative to full scale is the square root of this
+    /// times `tx_digital_backoff`.
+    pub fn total_power_fraction(&self) -> f32 {
+        self.pilot.power_fraction
+            + self.sync.power_fraction
+            + self.paging.power_fraction
+            + self.traffic.power_fraction
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -434,14 +475,24 @@ impl BtsRuntimeSettings {
         if self.tx_digital_backoff <= 0.0 || self.tx_digital_backoff > 1.0 {
             return Err("tx_digital_backoff must be in (0, 1]".into());
         }
-        if self.downlink.pilot.gain < 0.0
-            || self.downlink.sync.gain < 0.0
-            || self.downlink.paging.gain < 0.0
+        let d = &self.downlink;
+        if d.pilot.power_fraction < 0.0
+            || d.sync.power_fraction < 0.0
+            || d.paging.power_fraction < 0.0
+            || d.traffic.power_fraction < 0.0
+            || d.traffic.max_channel_power_fraction < 0.0
         {
-            return Err("channel gains must be non-negative".into());
+            return Err("downlink power fractions must be non-negative".into());
         }
-        if (self.downlink.pilot.gain + self.downlink.sync.gain + self.downlink.paging.gain) <= 0.0 {
-            return Err("sum of channel gains must be > 0".into());
+        if d.pilot.power_fraction <= 0.0 {
+            return Err("downlink.pilot.power_fraction must be > 0".into());
+        }
+        if d.total_power_fraction() > 1.0 + POWER_FRACTION_SUM_TOLERANCE {
+            return Err(format!(
+                "downlink power fractions sum to {:.4}; they must not exceed 1.0",
+                d.total_power_fraction()
+            )
+            .into());
         }
         self.downlink
             .paging
@@ -1104,5 +1155,24 @@ mod tests {
             neighbor.subnet_color_code,
             AlternativeHrpdNeighborSubnetColorCode::SameAsCommon
         );
+    }
+
+    #[test]
+    fn downlink_power_fractions_default_to_the_test_model_and_sum_to_one() {
+        let s = BtsRuntimeSettings::default();
+        assert!((s.downlink.total_power_fraction() - 1.0).abs() < 1e-3);
+        assert!((s.downlink.pilot.power_fraction - 0.2).abs() < 1e-6);
+        s.validate().unwrap();
+    }
+
+    #[test]
+    fn downlink_power_fractions_over_one_are_rejected() {
+        let mut s = BtsRuntimeSettings::default();
+        s.downlink.traffic.power_fraction = 0.7;
+        assert!(s.validate().is_err());
+        s.downlink.traffic.power_fraction = 0.0;
+        s.validate().unwrap();
+        s.downlink.pilot.power_fraction = 0.0;
+        assert!(s.validate().is_err());
     }
 }

@@ -48,14 +48,13 @@
     "orthogonal_code_length": 64,
     "chip_rate_hz": 1228800,
     "tx_lo_offset_hz": 200000,
-    "tx_digital_backoff": 0.45,
+    "tx_digital_backoff": 0.3,
     "block_size_chips": 512,
     "tx_batch_chips": 6144,
     "short_code_length_chips": 32768,
     "downlink": {
       "pilot": {
-        "walsh_code": 0,
-        "gain": 1.0
+        "walsh_code": 0
       },
       "sync": {
         "walsh_code": 32,
@@ -67,7 +66,6 @@
           "m": 7,
           "j": 1
         },
-        "gain": 0.6,
         "availability_max_size_bits": 32
       },
       "paging": {
@@ -79,7 +77,6 @@
           "m": 6,
           "j": 6
         },
-        "gain": 0.8,
         "availability_max_size_bits": 96,
         "message_defaults": {
           "schedule": [

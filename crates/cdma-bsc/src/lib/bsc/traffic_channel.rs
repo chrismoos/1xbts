@@ -7,7 +7,7 @@ use std::{
 use log::{debug, warn};
 
 use cdma_abis::control::typed::CallConnectionReference;
-use cdma_common::traffic::{RC1_TRAFFIC_INITIAL_GAIN_LINEAR, RC3_TRAFFIC_INITIAL_GAIN_LINEAR};
+use cdma_common::traffic::{RC1_TRAFFIC_INITIAL_WEIGHT, RC3_TRAFFIC_INITIAL_WEIGHT};
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
@@ -321,9 +321,9 @@ impl TrafficChannelInfo {
                 PowerControlState::new_rc1()
             },
             forward_power_control: ForwardPowerControlState::new(if use_rc3 {
-                RC3_TRAFFIC_INITIAL_GAIN_LINEAR
+                RC3_TRAFFIC_INITIAL_WEIGHT
             } else {
-                RC1_TRAFFIC_INITIAL_GAIN_LINEAR
+                RC1_TRAFFIC_INITIAL_WEIGHT
             }),
             // Usually None at traffic setup; rate-specific F-SCH allocation is
             // recorded later after the Abis Burst request succeeds.
