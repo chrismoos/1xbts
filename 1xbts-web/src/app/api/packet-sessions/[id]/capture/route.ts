@@ -1,4 +1,4 @@
-import { getPdsnManagementClient, waitForBscReady } from "@/lib/grpc/client";
+import { getNetworkManagementClient, waitForManagementReady } from "@/lib/grpc/client";
 
 export const dynamic = "force-dynamic";
 
@@ -7,8 +7,8 @@ async function setCapture(
   enabled: boolean,
   signal: AbortSignal
 ) {
-  await waitForBscReady();
-  const client = getPdsnManagementClient();
+  await waitForManagementReady();
+  const client = getNetworkManagementClient();
   return client.setPacketTraceCapture({ sessionId: id, enabled }, { signal });
 }
 

@@ -34,17 +34,22 @@ pub async fn run_grpc_server(
     Server::builder().add_service(svc).serve(addr).await
 }
 
+/// Binds the HLR gRPC listener and serves it on a background task.
+///
+/// The returned handle resolves when the server stops, which for a bind
+/// failure is almost immediately. A caller that waits only on a shutdown
+/// signal and ignores it leaves the process up with a dead listener.
 pub async fn spawn_configured_hlr_service(
     config: crate::HlrNodeConfig,
-) -> Result<SocketAddr, String> {
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), String> {
     let addr = config.grpc_listen_addr;
     let repo = PostgresHlrRepository::connect_from_config(&config).await?;
-    tokio::spawn(async move {
+    let served = tokio::spawn(async move {
         if let Err(error) = run_grpc_server(addr, Arc::new(repo)).await {
             log::error!("HLR gRPC server error: {error}");
         }
     });
-    Ok(addr)
+    Ok((addr, served))
 }
 
 // ─── Conversion helpers ────────────────────────────────────────
@@ -108,7 +113,7 @@ fn identity_to_proto(i: &model::SubscriberIdentity) -> proto::SubscriberIdentity
 fn binding_to_proto(b: &model::RegistrationBinding) -> proto::RegistrationBinding {
     proto::RegistrationBinding {
         subscriber_id: b.subscriber_id.to_string(),
-        serving_node_id: b.serving_node_id.clone(),
+        serving_bs_id: b.serving_bs_id.clone(),
         state: b.state.as_str().to_string(),
         imsi: b.imsi.clone(),
         esn: b.esn,
@@ -448,7 +453,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
 
         let binding = model::RegistrationBinding {
             subscriber_id,
-            serving_node_id: req.serving_node_id,
+            serving_bs_id: req.serving_bs_id,
             state: model::RegistrationState::from_str(&req.state).map_err(|e| {
                 log::error!("HLR: {e}");
                 Status::internal("internal error")

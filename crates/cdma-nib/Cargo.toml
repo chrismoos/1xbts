@@ -6,40 +6,29 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "Network-in-a-box launcher for running integrated 1xBTS services."
+description = "Network-in-a-box launcher: builds every 1xBTS network element and runs each as a child process."
 
 [features]
 default = ["uhd-backend", "lime-backend", "bladerf-backend"]
-uhd-backend = ["cdma-bts/uhd-backend", "cdma-bsc/uhd-backend"]
-lime-backend = ["cdma-bts/lime-backend", "cdma-bsc/lime-backend"]
-bladerf-backend = ["cdma-bts/bladerf-backend", "cdma-bsc/bladerf-backend"]
-soapy-backend = ["cdma-bts/soapy-backend", "cdma-bsc/soapy-backend"]
+uhd-backend = ["cdma-bts/uhd-backend"]
+lime-backend = ["cdma-bts/lime-backend"]
+bladerf-backend = ["cdma-bts/bladerf-backend"]
+soapy-backend = ["cdma-bts/soapy-backend"]
 
 [dependencies]
-cdma-a8 = { path = "../cdma-a8" }
-cdma-a9 = { path = "../cdma-a9" }
-cdma-a10 = { path = "../cdma-a10" }
-cdma-a11 = { path = "../cdma-a11" }
-cdma-an = { path = "../cdma-an" }
 cdma-bts = { path = "../cdma-bts", default-features = false }
-cdma-bsc = { path = "../cdma-bsc", default-features = false }
 cdma-common = { path = "../cdma-common" }
+cdma-bsc = { path = "../cdma-bsc" }
 cdma-events = { path = "../cdma-events" }
 cdma-hlr = { path = "../cdma-hlr" }
 cdma-msc = { path = "../cdma-msc" }
 cdma-pcf = { path = "../cdma-pcf" }
-cdma-packet = { path = "../cdma-packet" }
 cdma-pdsn = { path = "../cdma-pdsn" }
 cdma-smsc = { path = "../cdma-smsc" }
 clap = { version = "4", features = ["derive"] }
-tonic = "0.13"
-console-subscriber = "0.4"
-env_logger = "0.11"
+libc = "0.2"
 log = "0.4"
-signal-hook = "0.3"
-tokio = { version = "1", features = ["full", "tracing"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "signal", "sync", "time"] }
 
 [lints]
 workspace = true

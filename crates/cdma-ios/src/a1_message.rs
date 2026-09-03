@@ -28,6 +28,13 @@ impl EncodedA1Message {
         }
     }
 
+    /// The same payload under a different transport call correlation, for
+    /// translating a call id at a boundary between two id spaces.
+    pub fn with_call_id(mut self, call_id: Option<u64>) -> Self {
+        self.call_id = call_id;
+        self
+    }
+
     /// Validates and wraps an already-encoded A1 payload.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, A1TransportError> {
         let message = crate::decode(&bytes).map_err(A1TransportError::Codec)?;

@@ -26,8 +26,8 @@ use crate::abis_edge::PchTransferAckEvent;
 use crate::addressing::format_ms_address;
 
 use super::{
-    A1_CLEAR_CAUSE_PAGING_RESPONSE_NOT_RECEIVED, Bsc, MsState, PAGE_RETRY_GUARD_MS, SmsAckKey,
-    SmsRequest, VoiceLegRole, build_scheduled_message, next_bsc_event_id, next_pch_correlation_id,
+    A1_CLEAR_CAUSE_PAGING_RESPONSE_NOT_RECEIVED, AccessCellId, Bsc, MsState, PAGE_RETRY_GUARD_MS,
+    SmsAckKey, SmsRequest, VoiceLegRole, next_bsc_event_id, next_pch_correlation_id,
 };
 
 pub(crate) fn mobile_identity_for_ms_address(
@@ -732,15 +732,22 @@ impl PagingState {
 }
 
 impl Bsc {
-    pub(crate) fn paging_slot_planner(&self) -> PagingSlotPlanner {
-        PagingSlotPlanner::new(self.config.overhead.max_slot_cycle_index)
+    /// Slot planner for `cell`, or for the sole enrolled cell when the page
+    /// is not bound to one.
+    pub(crate) fn paging_slot_planner_for(&self, cell: Option<AccessCellId>) -> PagingSlotPlanner {
+        PagingSlotPlanner::new(self.config.bts.params(cell).overhead.max_slot_cycle_index)
     }
 
     pub(crate) async fn drain_pch_transfer_acks(&mut self) {
-        let Some(bts_client) = self.config.bts_client.clone() else {
-            return;
-        };
-        for ack in bts_client.drain_pch_transfer_acks() {
+        let acks: Vec<PchTransferAckEvent> = self
+            .config
+            .bts
+            .in_service()
+            .iter()
+            .filter_map(|entry| entry.control())
+            .flat_map(|client| client.drain_pch_transfer_acks())
+            .collect();
+        for ack in acks {
             self.handle_pch_transfer_ack(ack).await;
         }
     }
@@ -805,7 +812,7 @@ impl Bsc {
 
         let key = SmsAckKey::PchCorrelation(correlation_id);
         if ack.bts_l2_termination == Some(true) {
-            if let Some((addr, walsh_code)) =
+            if let Some((addr, _cell, walsh_code)) =
                 self.mobiles.acknowledge_assignment_delivery(correlation_id)
             {
                 info!(
@@ -843,7 +850,11 @@ impl Bsc {
                         );
                         self.send_adds_page_ack_to_msc(&pending.addr, a1_tag, None, "success");
                     }
-                    if let Err(e) = self.access_tx.send_release_order(&pending.addr, None, None) {
+                    let cell = self.serving_cell(&pending.addr);
+                    if let Err(e) =
+                        self.access_tx
+                            .send_release_order(cell, &pending.addr, None, None)
+                    {
                         warn!(
                             "BSC: failed to send Release Order after SMS delivery ack for {}: {}",
                             format_ms_address(&pending.addr),
@@ -868,7 +879,7 @@ impl Bsc {
         }
 
         if let Some(cause) = ack.cause {
-            if let Some((addr, walsh_code)) = self
+            if let Some((addr, cell, walsh_code)) = self
                 .mobiles
                 .pending_assignment_for_correlation(correlation_id)
             {
@@ -879,7 +890,7 @@ impl Bsc {
                     correlation_id,
                     cause,
                 );
-                self.teardown_traffic_channel(walsh_code).await;
+                self.teardown_traffic_channel(cell, walsh_code).await;
                 return;
             }
             if let Some(pending) = self.paging.take_sms_page_by_correlation(correlation_id) {
@@ -985,33 +996,35 @@ impl Bsc {
     /// one. The returned wake time intentionally fires before the slot start so
     /// the GPM can be enqueued with a future requested_tx_time and still land
     /// in the intended slot even if the runtime wakes slightly late.
-    pub(crate) fn effective_slot_cycle_index(&self, slot_cycle_index: u8) -> u8 {
-        self.paging_slot_planner()
+    pub(crate) fn effective_slot_cycle_index(
+        &self,
+        cell: Option<AccessCellId>,
+        slot_cycle_index: u8,
+    ) -> u8 {
+        self.paging_slot_planner_for(cell)
             .effective_slot_cycle_index(slot_cycle_index)
     }
 
     pub(crate) fn assigned_paging_slot_chip(
         &self,
+        cell: Option<AccessCellId>,
         search_from: u64,
         pgslot: u16,
         slot_cycle_index: u8,
         chip_rate_hz: u64,
     ) -> u64 {
-        self.paging_slot_planner().assigned_paging_slot_chip(
-            search_from,
-            pgslot,
-            slot_cycle_index,
-            chip_rate_hz,
-        )
+        self.paging_slot_planner_for(cell)
+            .assigned_paging_slot_chip(search_from, pgslot, slot_cycle_index, chip_rate_hz)
     }
 
     pub(crate) fn compute_next_retry_at(
         &self,
+        cell: Option<AccessCellId>,
         pgslot: Option<u16>,
         slot_cycle_index: u8,
         last_target_chip: Option<u64>,
     ) -> tokio::time::Instant {
-        self.paging_slot_planner()
+        self.paging_slot_planner_for(cell)
             .next_retry_at(pgslot, slot_cycle_index, last_target_chip)
     }
 
@@ -1076,8 +1089,13 @@ impl Bsc {
         }
     }
 
+    /// Send a General Page Message. `cell` names the mobile's last serving
+    /// cell. `None` refuses the page with a warning, since the BSC has no
+    /// cell to build it from. The mobile becomes pageable again when it next
+    /// registers.
     pub(crate) fn send_general_page(
         &self,
+        cell: Option<AccessCellId>,
         page_addr: &MsPageAddress,
         pgslot: Option<u16>,
         slot_cycle_index: u8,
@@ -1090,13 +1108,9 @@ impl Bsc {
         // Current overhead for subclass selection at page-send time
         // (C.S0004-E 3.1.2.2.1.1.1.2: BS picks shortest format that
         // uniquely identifies the MS given current overhead).
-        let esp = &self
-            .config
-            .paging
-            .message_defaults
-            .extended_system_parameters;
-        let overhead_mcc = esp.mcc;
-        let overhead_imsi_11_12 = esp.imsi_11_12;
+        let cell_params = self.config.bts.params(cell);
+        let overhead_mcc = cell_params.mcc;
+        let overhead_imsi_11_12 = cell_params.imsi_11_12;
 
         let built_record = build_general_page_record(
             page_addr,
@@ -1125,16 +1139,18 @@ impl Bsc {
 
         info!("BSC: page record for {}: {:?}", purpose, record);
 
-        let page_correlation_id = self.send_gpm_via_abis(page_addr, record, purpose);
+        let page_correlation_id = self.send_gpm_via_abis(cell, page_addr, record, purpose);
 
         // Compute BSC-local retry scheduling: find the next assigned paging
         // slot so the retry timer can wake up before the next slot boundary.
         // The BTS independently derives slot timing from the IMSI in the record.
         let mut used_target_chip = None;
         if let Some(pg) = pgslot
-            && let Some(slot) =
-                self.paging_slot_planner()
-                    .scheduled_slot(pgslot, slot_cycle_index, after_chip)
+            && let Some(slot) = self.paging_slot_planner_for(cell).scheduled_slot(
+                pgslot,
+                slot_cycle_index,
+                after_chip,
+            )
         {
             info!(
                 "BSC: scheduling page record for PGSLOT={} sci={} effective_sci={} target_chip={} (in ~{}ms)",
@@ -1153,6 +1169,7 @@ impl Bsc {
     /// Send a General Page Message for voice call delivery.
     pub(crate) fn send_page_for_voice(
         &self,
+        cell: Option<AccessCellId>,
         page_addr: &MsPageAddress,
         pgslot: Option<u16>,
         slot_cycle_index: u8,
@@ -1161,6 +1178,7 @@ impl Bsc {
         override_msg_seq: Option<u8>,
     ) -> Result<(Option<u64>, u8, Option<u32>), Error> {
         self.send_general_page(
+            cell,
             page_addr,
             pgslot,
             slot_cycle_index,
@@ -1181,11 +1199,13 @@ impl Bsc {
         }
     }
 
-    /// Build a GPM containing a single page record and send it to the BTS
-    /// via Abis PchMessageTransfer. The BTS decodes the GPM, extracts the
-    /// record, and adds it to its paging supplier queue.
+    /// Build a GPM carrying `record` and hand it to the cells that should
+    /// broadcast it: the mobile's serving cell when it is known, otherwise
+    /// every in-service cell. Returns the correlation id stamped on the
+    /// transfer.
     fn send_gpm_via_abis(
         &self,
+        cell: Option<AccessCellId>,
         page_addr: &MsPageAddress,
         record: GeneralPageRecord,
         purpose: &str,
@@ -1195,9 +1215,10 @@ impl Bsc {
         };
         use cdma_common::lac::paging_messages::GeneralPageMessage;
 
+        let overhead = &self.config.bts.params(cell).overhead;
         let gpm = GeneralPageMessage {
-            config_msg_seq: self.config.overhead.config_seq,
-            acc_msg_seq: self.config.overhead.acc_config_seq,
+            config_msg_seq: overhead.config_seq,
+            acc_msg_seq: overhead.acc_config_seq,
             class_0_done: true,
             class_1_done: true,
             tmsi_done: true,
@@ -1223,6 +1244,8 @@ impl Bsc {
             }
         };
         let mobile_id = mobile_identity_for_page_address(page_addr);
+        // One id per page, and a page always names one cell, so exactly one
+        // ack comes back for it.
         let correlation_id = next_pch_correlation_id();
         let pch = PchMessageTransferMessage {
             correlation_id: Some(CorrelationId(correlation_id)),
@@ -1232,20 +1255,43 @@ impl Bsc {
             layer2_ack_request_results: None,
             abis_ack_notify: None,
         };
-        if let Some(ref bts_client) = self.config.bts_client {
-            if let Err(e) = bts_client.send_pch_message(pch) {
-                warn!("BSC: send GPM via Abis failed for {}: {}", purpose, e);
-                None
-            } else {
+        // A page needs a serving-cell binding. A mobile without one is
+        // refused until it next registers, which the MSC's absent-subscriber
+        // and SMS-queue paths handle.
+        let Some(entry) = cell.and_then(|cell| self.config.bts.get(cell)) else {
+            warn!(
+                "BSC: cannot page for {} — the mobile has no serving cell",
+                purpose
+            );
+            return None;
+        };
+        let Some(client) = entry.control() else {
+            warn!(
+                "BSC: cannot page for {} — serving cell {:?} has no Abis link",
+                purpose,
+                entry.cell()
+            );
+            return None;
+        };
+        match client.send_pch_message(pch) {
+            Ok(()) => {
                 info!(
-                    "BSC: sent GPM page record via Abis for {} correlation_id={}",
-                    purpose, correlation_id
+                    "BSC: sent GPM page record via Abis for {} cell={:?} correlation_id={}",
+                    purpose,
+                    entry.cell(),
+                    correlation_id
                 );
                 Some(correlation_id)
             }
-        } else {
-            warn!("BSC: no bts_client — cannot send GPM for {}", purpose);
-            None
+            Err(e) => {
+                warn!(
+                    "BSC: send GPM via Abis failed for {} on cell {:?}: {}",
+                    purpose,
+                    entry.cell(),
+                    e
+                );
+                None
+            }
         }
     }
 
@@ -1260,168 +1306,6 @@ impl Bsc {
         let dr = message.to_data_request();
         self.emit_paging_event(&message, &dr.mcsb);
         Ok(())
-    }
-
-    pub(crate) fn send_next_default_paging_message(&mut self) -> Result<(), Error> {
-        let schedule = &self.config.paging.message_defaults.schedule;
-        if schedule.is_empty() {
-            return self.send_paging_message(self.build_system_parameters_message());
-        }
-
-        // This path has no resolved EV-DO advertisement, so it cannot build a
-        // real ATIM (the BTS overhead builder emits one when configured). Skip
-        // ATIM slots and advance to the next scheduled message rather than
-        // broadcast a duplicate SPM. Bounded by the schedule length so an
-        // all-ATIM schedule still falls back to an SPM instead of looping.
-        let mut kind = self.paging.next_default_message_kind(schedule);
-        for _ in 1..schedule.len() {
-            if kind != PagingMessageKind::AlternativeTechnologiesInformation {
-                break;
-            }
-            kind = self.paging.next_default_message_kind(schedule);
-        }
-
-        let message = match kind {
-            PagingMessageKind::SystemParameters => self.build_system_parameters_message(),
-            PagingMessageKind::AccessParameters => self.build_access_parameters_message(),
-            PagingMessageKind::NeighborList => self.build_neighbor_list_message(),
-            PagingMessageKind::ExtendedNeighborList => self.build_extended_neighbor_list_message(),
-            PagingMessageKind::CdmaChannelList => self.build_cdma_channel_list_message(),
-            PagingMessageKind::ExtendedSystemParameters => {
-                self.build_extended_system_parameters_message()
-            }
-            PagingMessageKind::GeneralPage => self.build_general_page_message(),
-            PagingMessageKind::Order => self.build_order_message(),
-            PagingMessageKind::AlternativeTechnologiesInformation => {
-                // Reached only for an all-ATIM schedule with no advertisement.
-                self.build_system_parameters_message()
-            }
-        };
-
-        self.send_paging_message(message)
-    }
-
-    pub(crate) fn build_system_parameters_message(&self) -> PagingChannelMessage {
-        build_scheduled_message(
-            PagingMessageKind::SystemParameters,
-            self.config.pilot_offset,
-            &self.config.overhead,
-            &self.config.paging,
-            None,
-        )
-    }
-
-    pub(crate) fn build_access_parameters_message(&self) -> PagingChannelMessage {
-        build_scheduled_message(
-            PagingMessageKind::AccessParameters,
-            self.config.pilot_offset,
-            &self.config.overhead,
-            &self.config.paging,
-            None,
-        )
-    }
-
-    /// Print a one-time summary of the open-loop reverse TX power
-    /// parameters the mobile will see in the Access Parameters Message,
-    /// so an operator can sanity-check that the broadcast values
-    /// produce a reasonable initial transmit power for their RF setup.
-    ///
-    /// The mobile's open-loop formula (IS-95 / IS-2000):
-    ///
-    /// ```text
-    /// Tx_dBm = -Rx_dBm + band offset + NOM_PWR
-    ///          - 16*NOM_PWR_EXT + INIT_PWR + (n-1)*PWR_STEP
-    /// ```
-    ///
-    /// where Rx is the total received power at the mobile (dominated by
-    /// our forward pilot at short range), and `n` is the access probe
-    /// number (1..NUM_STEP).
-    pub(crate) fn log_open_loop_power_init(&self) {
-        let d = &self.config.paging.message_defaults.access_parameters;
-        // C.S0057-F Table 2.3.1-1: these bands use -76 dB for an SR1
-        // Access Channel; the remaining implemented bands use -73 dB.
-        let band_class = self.config.overhead.band_class.unwrap_or(0);
-        let open_loop_offset = if matches!(band_class, 1 | 4 | 6 | 8 | 13 | 14 | 15 | 16 | 20) {
-            76
-        } else {
-            73
-        };
-        let base_offset =
-            i32::from(d.nom_pwr) - 16 * i32::from(d.nom_pwr_ext) + i32::from(d.init_pwr);
-        let max_ramp = i32::from(d.pwr_step) * i32::from(d.num_step.saturating_sub(1));
-        info!(
-            "BSC: open-loop reverse TX init: band_class={} NOM_PWR={} dB NOM_PWR_EXT={} INIT_PWR={} dB \
-             → Tx = -Rx - {} dBm (probe 1); ramp +{} dB/probe over {} probes \
-             (final probe Tx = -Rx - {} dBm)",
-            band_class,
-            d.nom_pwr,
-            d.nom_pwr_ext,
-            d.init_pwr,
-            open_loop_offset - base_offset,
-            d.pwr_step,
-            d.num_step,
-            open_loop_offset - base_offset - max_ramp,
-        );
-    }
-
-    pub(crate) fn build_neighbor_list_message(&self) -> PagingChannelMessage {
-        build_scheduled_message(
-            PagingMessageKind::NeighborList,
-            self.config.pilot_offset,
-            &self.config.overhead,
-            &self.config.paging,
-            None,
-        )
-    }
-
-    pub(crate) fn build_extended_neighbor_list_message(&self) -> PagingChannelMessage {
-        build_scheduled_message(
-            PagingMessageKind::ExtendedNeighborList,
-            self.config.pilot_offset,
-            &self.config.overhead,
-            &self.config.paging,
-            None,
-        )
-    }
-
-    pub(crate) fn build_cdma_channel_list_message(&self) -> PagingChannelMessage {
-        build_scheduled_message(
-            PagingMessageKind::CdmaChannelList,
-            self.config.pilot_offset,
-            &self.config.overhead,
-            &self.config.paging,
-            None,
-        )
-    }
-
-    pub(crate) fn build_extended_system_parameters_message(&self) -> PagingChannelMessage {
-        build_scheduled_message(
-            PagingMessageKind::ExtendedSystemParameters,
-            self.config.pilot_offset,
-            &self.config.overhead,
-            &self.config.paging,
-            None,
-        )
-    }
-
-    pub(crate) fn build_general_page_message(&self) -> PagingChannelMessage {
-        build_scheduled_message(
-            PagingMessageKind::GeneralPage,
-            self.config.pilot_offset,
-            &self.config.overhead,
-            &self.config.paging,
-            None,
-        )
-    }
-
-    pub(crate) fn build_order_message(&self) -> PagingChannelMessage {
-        build_scheduled_message(
-            PagingMessageKind::Order,
-            self.config.pilot_offset,
-            &self.config.overhead,
-            &self.config.paging,
-            None,
-        )
     }
 
     pub(crate) fn current_message_kind_name(&self, message: &PagingChannelMessage) -> &'static str {

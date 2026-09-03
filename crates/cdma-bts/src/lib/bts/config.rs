@@ -5,7 +5,7 @@
 //! BTS-owned half of the Abis timers (A.S0003-A §8 Table 8-1). The in-memory
 //! runtime and PHY channel settings derived from it live in `super::settings`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use std::net::SocketAddr;
 
@@ -473,6 +473,97 @@ impl Default for BtsAbisConfig {
     }
 }
 
+/// Aggregated event bus the fused HRPD Access Network publishes to.
+const DEFAULT_EVENTS_ENDPOINT: &str = "http://127.0.0.1:17023";
+/// HLR the fused HRPD Access Network resolves subscriber identities against.
+const DEFAULT_HLR_ENDPOINT: &str = "http://127.0.0.1:17019";
+
+fn default_events_endpoint() -> Option<String> {
+    Some(DEFAULT_EVENTS_ENDPOINT.to_string())
+}
+
+fn default_hlr_endpoint() -> Option<String> {
+    Some(DEFAULT_HLR_ENDPOINT.to_string())
+}
+
+/// Wait for the MS acknowledgement of a paged SDU before the BTS reports an
+/// Abis L2 failure, in milliseconds.
+const DEFAULT_PAGING_ACK_TIMEOUT_MS: u64 = 15_000;
+/// Slot-aligned over-the-air retransmissions of an unacknowledged page.
+const DEFAULT_PAGING_MAX_RETRIES: u32 = 0;
+
+fn default_paging_ack_timeout_ms() -> u64 {
+    DEFAULT_PAGING_ACK_TIMEOUT_MS
+}
+
+fn default_paging_max_retries() -> u32 {
+    DEFAULT_PAGING_MAX_RETRIES
+}
+
+/// BTS-side paging channel retransmission budget. The BTS supplier owns GPM
+/// assembly, slot placement and page retry, so the timing lives with the
+/// element that performs it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BtsPagingRetryConfig {
+    /// How long to wait for an MS ACK before reporting Abis L2 failure.
+    #[serde(default = "default_paging_ack_timeout_ms")]
+    pub ack_timeout_ms: u64,
+    /// Maximum number of slot-aligned over-the-air retransmissions.
+    #[serde(default = "default_paging_max_retries")]
+    pub max_retries: u32,
+}
+
+impl Default for BtsPagingRetryConfig {
+    fn default() -> Self {
+        Self {
+            ack_timeout_ms: default_paging_ack_timeout_ms(),
+            max_retries: default_paging_max_retries(),
+        }
+    }
+}
+
+/// `overhead.page_chan` must name the same paging channel as
+/// `runtime.downlink.paging.paging_channel_number`. Both live in `bts.json`
+/// but in different sections, so startup double-checks them.
+pub fn validate_page_chan_alignment(
+    overhead_page_chan: u8,
+    bts_paging_channel_number: u8,
+) -> Result<(), Error> {
+    if overhead_page_chan != bts_paging_channel_number {
+        return Err(
+            "bts.overhead.page_chan must match bts.runtime.downlink.paging.paging_channel_number"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn default_bts_management_bind_addr() -> SocketAddr {
+    "127.0.0.1:17024"
+        .parse()
+        .expect("static BTS management address should parse")
+}
+
+/// Address the BTS listens on for the operations plane. A.S0003-A leaves OAM
+/// signaling for further study, so enrollment is gRPC rather than an Abis
+/// message type: the BSC fetches this cell's identity and radio parameters
+/// here before bringing up Abis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BtsManagementConfig {
+    /// Management and enrollment gRPC listener.
+    pub bind_addr: SocketAddr,
+}
+
+impl Default for BtsManagementConfig {
+    fn default() -> Self {
+        Self {
+            bind_addr: default_bts_management_bind_addr(),
+        }
+    }
+}
+
 /// BTS-side Abis bearer (UDP) addressing.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -512,6 +603,13 @@ pub struct BtsNodeConfig {
     pub rf: BtsRfProfile,
     /// Pilot PN offset (chips, in units of 64). Must be in `0..=511`.
     pub pilot_offset: usize,
+    /// Sector this BTS operates, paired with `overhead.base_id` to form the
+    /// cell identity it enrolls under and stamps on the Abis Cell Identifier
+    /// IE. Required.
+    pub sector: u8,
+    /// Directory IQ captures requested over the operations plane are written
+    /// to. Absent uses the built-in default.
+    pub iq_capture_dir: Option<PathBuf>,
     /// Optional adjacent EV-DO/HRPD carrier configuration.
     pub evdo: evdo::EvdoConfig,
     /// BTS PHY/MAC/LAC runtime settings (sample rates, downlink/uplink
@@ -529,15 +627,32 @@ pub struct BtsNodeConfig {
     pub timezone: cdma_common::timezone::TimezoneConfig,
     /// Abis bearer (UDP) addressing for traffic frames.
     pub bearer: BtsBearerConfig,
+    /// Operations-plane listener for enrollment and management.
+    #[serde(default)]
+    pub management: BtsManagementConfig,
+    /// Paging retransmission budget applied by the BTS paging supplier.
+    #[serde(default)]
+    pub paging_retry: BtsPagingRetryConfig,
+    /// Aggregated event bus the fused HRPD Access Network publishes session
+    /// events to. `null` stops the AN publishing.
+    #[serde(default = "default_events_endpoint")]
+    pub events_endpoint: Option<String>,
+    /// HLR the fused HRPD Access Network resolves subscriber identities
+    /// against. `null` leaves HRPD identities underived.
+    #[serde(default = "default_hlr_endpoint")]
+    pub hlr_endpoint: Option<String>,
 }
 
 impl Default for BtsNodeConfig {
     fn default() -> Self {
         Self {
+            management: BtsManagementConfig::default(),
             channel: ChannelPlan::default(),
             radio: RadioConfig::default(),
             rf: BtsRfProfile::default(),
             pilot_offset: 0,
+            sector: 0,
+            iq_capture_dir: None,
             evdo: evdo::EvdoConfig::default(),
             runtime: BtsRuntimeSettings::default(),
             abis_timers: BtsAbisTimers::default(),
@@ -545,6 +660,9 @@ impl Default for BtsNodeConfig {
             overhead: super::settings::OverheadParameters::default(),
             timezone: cdma_common::timezone::TimezoneConfig::default(),
             bearer: BtsBearerConfig::default(),
+            paging_retry: BtsPagingRetryConfig::default(),
+            events_endpoint: default_events_endpoint(),
+            hlr_endpoint: default_hlr_endpoint(),
         }
     }
 }
@@ -555,6 +673,8 @@ struct BtsNodeConfigFile {
     pub channel: ChannelPlan,
     pub radio: Option<RadioConfig>,
     pub pilot_offset: usize,
+    pub sector: u8,
+    pub iq_capture_dir: Option<PathBuf>,
     pub evdo: evdo::EvdoConfig,
     pub runtime: BtsRuntimeSettings,
     pub abis_timers: BtsAbisTimers,
@@ -562,14 +682,25 @@ struct BtsNodeConfigFile {
     pub overhead: super::settings::OverheadParameters,
     pub timezone: cdma_common::timezone::TimezoneConfig,
     pub bearer: BtsBearerConfig,
+    #[serde(default)]
+    pub management: BtsManagementConfig,
+    #[serde(default)]
+    pub paging_retry: BtsPagingRetryConfig,
+    #[serde(default = "default_events_endpoint")]
+    pub events_endpoint: Option<String>,
+    #[serde(default = "default_hlr_endpoint")]
+    pub hlr_endpoint: Option<String>,
 }
 
 impl Default for BtsNodeConfigFile {
     fn default() -> Self {
         Self {
+            management: BtsManagementConfig::default(),
             channel: ChannelPlan::default(),
             radio: None,
             pilot_offset: 0,
+            sector: 0,
+            iq_capture_dir: None,
             evdo: evdo::EvdoConfig::default(),
             runtime: BtsRuntimeSettings::default(),
             abis_timers: BtsAbisTimers::default(),
@@ -577,6 +708,9 @@ impl Default for BtsNodeConfigFile {
             overhead: super::settings::OverheadParameters::default(),
             timezone: cdma_common::timezone::TimezoneConfig::default(),
             bearer: BtsBearerConfig::default(),
+            paging_retry: BtsPagingRetryConfig::default(),
+            events_endpoint: default_events_endpoint(),
+            hlr_endpoint: default_hlr_endpoint(),
         }
     }
 }
@@ -632,10 +766,13 @@ impl BtsNodeConfig {
             (None, None) => RadioConfig::default(),
         };
         let mut config = BtsNodeConfig {
+            management: source.management,
             channel: source.channel,
             radio,
             rf: BtsRfProfile::default(),
             pilot_offset: source.pilot_offset,
+            sector: source.sector,
+            iq_capture_dir: source.iq_capture_dir,
             evdo: source.evdo,
             runtime: source.runtime,
             abis_timers: source.abis_timers,
@@ -643,6 +780,9 @@ impl BtsNodeConfig {
             overhead: source.overhead,
             timezone: source.timezone,
             bearer: source.bearer,
+            paging_retry: source.paging_retry,
+            events_endpoint: source.events_endpoint,
+            hlr_endpoint: source.hlr_endpoint,
         };
         config.apply_derived_rf_profile()?;
         config.validate()?;
@@ -672,12 +812,15 @@ impl BtsNodeConfig {
         Ok(config)
     }
 
-    /// Validate self-contained BTS invariants. Cross-node validation
-    /// (e.g. matching `page_chan` against the BSC's overhead config) is
-    /// done in bootstrap, not here.
+    /// Validate self-contained BTS invariants. Checks that span two
+    /// sections of the file, such as `validate_page_chan_alignment`, run at
+    /// node startup instead.
     pub fn validate(&self) -> Result<(), Error> {
         if self.pilot_offset > 511 {
             return Err("bts.pilot_offset must be in 0..=511".into());
+        }
+        if self.sector == 0 {
+            return Err("bts.sector is required and must be in 1..=255".into());
         }
         self.channel
             .validate()
@@ -749,7 +892,11 @@ mod tests {
         )
         .expect("write radio config");
 
-        fs::write(&config_path, r#"{ "evdo": { "enabled": false } }"#).expect("write bts config");
+        fs::write(
+            &config_path,
+            r#"{ "sector": 1, "evdo": { "enabled": false } }"#,
+        )
+        .expect("write bts config");
 
         let radio = load_radio_from_path(&radio_path).expect("load radio override");
         let config = BtsNodeConfig::load_from_path_with_radio_override(&config_path, radio)
@@ -779,6 +926,7 @@ mod tests {
         fs::write(
             &config_path,
             r#"{
+  "sector": 1,
   "pilot_offset": 1,
   "evdo": { "enabled": false },
   "overhead": { "sid": 1, "nid": 1 }
@@ -788,6 +936,7 @@ mod tests {
         fs::write(
             &local_path,
             r#"{
+  "sector": 1,
   "pilot_offset": 2,
   "overhead": { "nid": 2 }
 }"#,
@@ -796,6 +945,7 @@ mod tests {
         fs::write(
             &profile_path,
             r#"{
+  "sector": 1,
   "pilot_offset": 3,
   "overhead": { "sid": 3 }
 }"#,
@@ -917,6 +1067,7 @@ mod tests {
         fs::write(
             &config_path,
             r#"{
+  "sector": 1,
   "channel": {
     "band_class": "bc0",
     "band_subclass": 0,
@@ -976,6 +1127,7 @@ mod tests {
         fs::write(
             &config_path,
             r#"{
+  "sector": 1,
   "channel": {
     "band_class": "bc0",
     "band_subclass": 0,
@@ -1015,6 +1167,7 @@ mod tests {
         fs::write(
             &config_path,
             r#"{
+  "sector": 1,
   "radio": { "kind": "noop" },
   "evdo": {
     "enabled": true,
@@ -1045,6 +1198,7 @@ mod tests {
         fs::write(
             &config_path,
             r#"{
+  "sector": 1,
   "channel": {
     "band_class": "bc0",
     "band_subclass": 0,
@@ -1081,6 +1235,7 @@ mod tests {
         fs::write(
             &config_path,
             r#"{
+  "sector": 1,
   "channel": {
     "band_class": "bc0",
     "band_subclass": 0,
@@ -1115,6 +1270,7 @@ mod tests {
         fs::write(
             &config_path,
             r#"{
+  "sector": 1,
   "channel": {
     "band_class": "bc1",
     "band_subclass": 0,
@@ -1163,6 +1319,7 @@ mod tests {
         fs::write(
             &config_path,
             r#"{
+  "sector": 1,
   "channel": {
     "band_class": "bc0",
     "band_subclass": 0,
@@ -1200,6 +1357,7 @@ mod tests {
         fs::write(
             &config_path,
             r#"{
+  "sector": 1,
   "radio": { "kind": "noop" }
 }
 "#,
@@ -1216,7 +1374,7 @@ mod tests {
         use cdma_common::timezone::TimezoneSource;
         let dir = temp_test_dir("tz-default");
         let path = dir.join("bts.json");
-        fs::write(&path, r#"{ "radio": { "kind": "noop" } }"#).unwrap();
+        fs::write(&path, r#"{ "sector": 1, "radio": { "kind": "noop" } }"#).unwrap();
         let cfg = BtsNodeConfig::load_from_path(&path).expect("load");
         assert_eq!(cfg.timezone.source, TimezoneSource::Overhead);
         fs::remove_dir_all(dir).ok();
@@ -1230,6 +1388,7 @@ mod tests {
         fs::write(
             &path,
             r#"{
+  "sector": 1,
   "radio": { "kind": "noop" },
   "timezone": { "source": "user", "tz": "America/Los_Angeles" }
 }"#,
@@ -1252,6 +1411,7 @@ mod tests {
         fs::write(
             &path,
             r#"{
+  "sector": 1,
   "radio": { "kind": "noop" },
   "timezone": { "source": "user", "tz": "Mars/Olympus_Mons" }
 }"#,
@@ -1272,6 +1432,7 @@ mod tests {
         fs::write(
             &path,
             r#"{
+  "sector": 1,
   "radio": { "kind": "noop" },
   "timezone": { "source": "user" }
 }"#,
@@ -1293,6 +1454,7 @@ mod tests {
         fs::write(
             &config_path,
             r#"{
+  "sector": 1,
   "radio_config_path": "radio_limesdr.json"
 }
 "#,

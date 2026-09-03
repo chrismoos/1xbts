@@ -1,7 +1,7 @@
 import {
-  getManagementFacadeClient,
+  getNetworkManagementClient,
   getMscManagementClient,
-  waitForBscReady,
+  waitForManagementReady,
 } from "@/lib/grpc/client";
 import { getEventBusClient } from "@/lib/grpc/events-bus-client";
 import { shouldHideAccessEvent } from "@/lib/access-event-filter";
@@ -150,9 +150,9 @@ export async function GET(request: Request) {
         let retryMs = STREAM_RETRY_BASE_MS;
         while (!abort.signal.aborted) {
           try {
-            await waitForBscReady(STREAM_READY_TIMEOUT_MS);
-            console.log("[events] starting management facade stream");
-            const client = getManagementFacadeClient();
+            await waitForManagementReady(STREAM_READY_TIMEOUT_MS);
+            console.log("[events] starting network management event stream");
+            const client = getNetworkManagementClient();
             for await (const value of client.streamSystemEvents(
               {},
               { signal: abort.signal }
@@ -215,13 +215,13 @@ export async function GET(request: Request) {
             if (abort.signal.aborted) {
               break;
             }
-            console.log("[events] management facade stream ended");
+            console.log("[events] network management event stream ended");
           } catch (err) {
             if (abort.signal.aborted) {
               break;
             }
             const msg = err instanceof Error ? err.message : "unknown";
-            console.log(`[events] management facade error: ${msg}`);
+            console.log(`[events] network management event stream error: ${msg}`);
           }
 
           setBackendDisconnected();
@@ -359,7 +359,7 @@ export async function GET(request: Request) {
         ]);
       } finally {
         clearInterval(keepalive);
-        console.log("[events] management facade stream stopped");
+        console.log("[events] network management event stream stopped");
         try {
           controller.close();
         } catch {

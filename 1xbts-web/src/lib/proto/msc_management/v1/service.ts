@@ -7,6 +7,7 @@
 /* eslint-disable */
 import { BinaryReader, BinaryWriter } from "@bufbuild/protobuf/wire";
 import type { CallContext, CallOptions } from "nice-grpc-common";
+import { ServedCell } from "../../base_station/v1/service";
 import { InitiateCallRequest, InitiateCallResponse } from "../../bsc/v1/service";
 import { MscNetworkEvent } from "../../events/v1/msc";
 import { Empty } from "../../google/protobuf/empty";
@@ -53,6 +54,29 @@ export interface SendSmsRequest {
 export interface SendSmsResponse {
   accepted: boolean;
   message: string;
+}
+
+/**
+ * MSC management API for mobile-terminated voice, SMS, and call state.
+ * One base station as the MSC sees it.
+ */
+export interface BaseStationSummary {
+  /** Management endpoint the MSC enrolls the node through. */
+  managementEndpoint: string;
+  /** Empty until the node has enrolled at least once. */
+  nodeId: string;
+  /** A1 address the node reported, empty until enrolled. */
+  a1Addr: string;
+  /** Whether the MSC currently holds the node's A1 connection. */
+  attached: boolean;
+  cells: ServedCell[];
+  /** Why the node is not attached, when it is not. */
+  statusDetail?: string | undefined;
+}
+
+/** Every base station the MSC is configured to serve. */
+export interface BaseStationList {
+  nodes: BaseStationSummary[];
 }
 
 function createBaseCallList(): CallList {
@@ -383,12 +407,238 @@ export const SendSmsResponse: MessageFns<SendSmsResponse> = {
   },
 };
 
-/** MSC management API for mobile-terminated voice, SMS, and call state. */
+function createBaseBaseStationSummary(): BaseStationSummary {
+  return { managementEndpoint: "", nodeId: "", a1Addr: "", attached: false, cells: [], statusDetail: undefined };
+}
+
+export const BaseStationSummary: MessageFns<BaseStationSummary> = {
+  encode(message: BaseStationSummary, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.managementEndpoint !== "") {
+      writer.uint32(10).string(message.managementEndpoint);
+    }
+    if (message.nodeId !== "") {
+      writer.uint32(18).string(message.nodeId);
+    }
+    if (message.a1Addr !== "") {
+      writer.uint32(26).string(message.a1Addr);
+    }
+    if (message.attached !== false) {
+      writer.uint32(32).bool(message.attached);
+    }
+    for (const v of message.cells) {
+      ServedCell.encode(v!, writer.uint32(42).fork()).join();
+    }
+    if (message.statusDetail !== undefined) {
+      writer.uint32(50).string(message.statusDetail);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): BaseStationSummary {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseBaseStationSummary();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.managementEndpoint = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.nodeId = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.a1Addr = reader.string();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.attached = reader.bool();
+          continue;
+        }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          message.cells.push(ServedCell.decode(reader, reader.uint32()));
+          continue;
+        }
+        case 6: {
+          if (tag !== 50) {
+            break;
+          }
+
+          message.statusDetail = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): BaseStationSummary {
+    return {
+      managementEndpoint: isSet(object.managementEndpoint)
+        ? globalThis.String(object.managementEndpoint)
+        : isSet(object.management_endpoint)
+        ? globalThis.String(object.management_endpoint)
+        : "",
+      nodeId: isSet(object.nodeId)
+        ? globalThis.String(object.nodeId)
+        : isSet(object.node_id)
+        ? globalThis.String(object.node_id)
+        : "",
+      a1Addr: isSet(object.a1Addr)
+        ? globalThis.String(object.a1Addr)
+        : isSet(object.a1_addr)
+        ? globalThis.String(object.a1_addr)
+        : "",
+      attached: isSet(object.attached) ? globalThis.Boolean(object.attached) : false,
+      cells: globalThis.Array.isArray(object?.cells) ? object.cells.map((e: any) => ServedCell.fromJSON(e)) : [],
+      statusDetail: isSet(object.statusDetail)
+        ? globalThis.String(object.statusDetail)
+        : isSet(object.status_detail)
+        ? globalThis.String(object.status_detail)
+        : undefined,
+    };
+  },
+
+  toJSON(message: BaseStationSummary): unknown {
+    const obj: any = {};
+    if (message.managementEndpoint !== "") {
+      obj.managementEndpoint = message.managementEndpoint;
+    }
+    if (message.nodeId !== "") {
+      obj.nodeId = message.nodeId;
+    }
+    if (message.a1Addr !== "") {
+      obj.a1Addr = message.a1Addr;
+    }
+    if (message.attached !== false) {
+      obj.attached = message.attached;
+    }
+    if (message.cells?.length) {
+      obj.cells = message.cells.map((e) => ServedCell.toJSON(e));
+    }
+    if (message.statusDetail !== undefined) {
+      obj.statusDetail = message.statusDetail;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<BaseStationSummary>): BaseStationSummary {
+    return BaseStationSummary.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<BaseStationSummary>): BaseStationSummary {
+    const message = createBaseBaseStationSummary();
+    message.managementEndpoint = object.managementEndpoint ?? "";
+    message.nodeId = object.nodeId ?? "";
+    message.a1Addr = object.a1Addr ?? "";
+    message.attached = object.attached ?? false;
+    message.cells = object.cells?.map((e) => ServedCell.fromPartial(e)) || [];
+    message.statusDetail = object.statusDetail ?? undefined;
+    return message;
+  },
+};
+
+function createBaseBaseStationList(): BaseStationList {
+  return { nodes: [] };
+}
+
+export const BaseStationList: MessageFns<BaseStationList> = {
+  encode(message: BaseStationList, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.nodes) {
+      BaseStationSummary.encode(v!, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): BaseStationList {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseBaseStationList();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.nodes.push(BaseStationSummary.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): BaseStationList {
+    return {
+      nodes: globalThis.Array.isArray(object?.nodes)
+        ? object.nodes.map((e: any) => BaseStationSummary.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: BaseStationList): unknown {
+    const obj: any = {};
+    if (message.nodes?.length) {
+      obj.nodes = message.nodes.map((e) => BaseStationSummary.toJSON(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<BaseStationList>): BaseStationList {
+    return BaseStationList.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<BaseStationList>): BaseStationList {
+    const message = createBaseBaseStationList();
+    message.nodes = object.nodes?.map((e) => BaseStationSummary.fromPartial(e)) || [];
+    return message;
+  },
+};
+
 export type MscManagementServiceDefinition = typeof MscManagementServiceDefinition;
 export const MscManagementServiceDefinition = {
   name: "MscManagementService",
   fullName: "msc_management.v1.MscManagementService",
   methods: {
+    /** Lists the base stations the MSC serves, attached or not. */
+    listBaseStations: {
+      name: "ListBaseStations",
+      requestType: Empty as typeof Empty,
+      requestStream: false,
+      responseType: BaseStationList as typeof BaseStationList,
+      responseStream: false,
+      options: {},
+    },
     /** Initiates a mobile-terminated voice call through the BSC and voice gateway. */
     initiateCall: {
       name: "InitiateCall",
@@ -432,6 +682,8 @@ export const MscManagementServiceDefinition = {
 } as const;
 
 export interface MscManagementServiceImplementation<CallContextExt = {}> {
+  /** Lists the base stations the MSC serves, attached or not. */
+  listBaseStations(request: Empty, context: CallContext & CallContextExt): Promise<DeepPartial<BaseStationList>>;
   /** Initiates a mobile-terminated voice call through the BSC and voice gateway. */
   initiateCall(
     request: InitiateCallRequest,
@@ -452,6 +704,8 @@ export interface MscManagementServiceImplementation<CallContextExt = {}> {
 }
 
 export interface MscManagementServiceClient<CallOptionsExt = {}> {
+  /** Lists the base stations the MSC serves, attached or not. */
+  listBaseStations(request: DeepPartial<Empty>, options?: CallOptions & CallOptionsExt): Promise<BaseStationList>;
   /** Initiates a mobile-terminated voice call through the BSC and voice gateway. */
   initiateCall(
     request: DeepPartial<InitiateCallRequest>,

@@ -30,7 +30,7 @@ use cdma_otasp::param::nam_cdma::NamCdma;
 use cdma_otasp::param::nam_cdma_analog::NamCdmaAnalog;
 use cdma_otasp::param::verify_spc::VerifySpc;
 
-use crate::config::{BtsOverheadConfig, OtaspConfig};
+use crate::config::{HomeNetworkConfig, OtaspConfig};
 use crate::otasp::event::{
     BlockFeature, HardwareIdentity, OtaspEvent, PrlOutcome, PrlReadback, SessionOutcomeKind,
 };
@@ -199,7 +199,7 @@ struct PrlPushState {
 /// OTASP session driver. One per `*228` call.
 pub struct OtaspSession {
     cfg: OtaspConfig,
-    bts_overhead: BtsOverheadConfig,
+    home_network: HomeNetworkConfig,
     device: HardwareIdentity,
     feature_code: String,
     service_option: u16,
@@ -230,7 +230,7 @@ impl OtaspSession {
     /// Create a new session. Caller must immediately call [`start`].
     pub fn new(
         cfg: OtaspConfig,
-        bts_overhead: BtsOverheadConfig,
+        home_network: HomeNetworkConfig,
         device: HardwareIdentity,
         feature_code: String,
         service_option: u16,
@@ -282,7 +282,7 @@ impl OtaspSession {
         }
         Self {
             cfg,
-            bts_overhead,
+            home_network,
             device,
             feature_code,
             service_option,
@@ -1154,9 +1154,10 @@ impl OtaspSession {
             }
         };
         let readback = self.readback.clone().unwrap_or_default();
-        let nam = match assemble_nam(&hlr, &self.bts_overhead, &self.cfg, &readback) {
+        let nam = match assemble_nam(&hlr, &self.home_network, &self.cfg, &readback) {
             Ok(n) => n,
-            Err(_) => {
+            Err(e) => {
+                log::warn!("OTASP: NAM assembly failed, terminating session: {e}");
                 self.terminate(t, SessionOutcomeKind::ProtocolError);
                 return StepResult::Terminal(SessionOutcomeKind::ProtocolError);
             }
@@ -1267,9 +1268,10 @@ impl OtaspSession {
             }
         };
         let readback = self.readback.clone().unwrap_or_default();
-        let nam = match assemble_nam(&hlr, &self.bts_overhead, &self.cfg, &readback) {
+        let nam = match assemble_nam(&hlr, &self.home_network, &self.cfg, &readback) {
             Ok(n) => n,
-            Err(_) => {
+            Err(e) => {
+                log::warn!("OTASP: NAM assembly failed, terminating session: {e}");
                 self.terminate(t, SessionOutcomeKind::ProtocolError);
                 return StepResult::Terminal(SessionOutcomeKind::ProtocolError);
             }
@@ -2052,19 +2054,14 @@ mod tests {
                 tag_p_rev: 1,
             },
             nam_defaults: NamDefaultsConfig::default(),
+            home_network: overhead(),
             mms: crate::config::MmsConfig::default(),
             writes,
         }
     }
 
-    fn overhead() -> BtsOverheadConfig {
-        BtsOverheadConfig {
-            mcc: "310".to_string(),
-            imsi_11_12: "55".to_string(),
-            sid: 22,
-            nid: 1,
-            paging_channel_number: 1,
-        }
+    fn overhead() -> HomeNetworkConfig {
+        HomeNetworkConfig { sid: 22, nid: 1 }
     }
 
     fn hlr() -> ResolvedSubscriberInput {

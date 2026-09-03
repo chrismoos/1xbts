@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cdma_events::EventPublisher;
 use cdma_events::proto::{
-    AnNetworkEvent, EventSource, HrpdAccessEvent, HrpdSessionEvent, HrpdTrafficEvent,
+    AnNetworkEvent, CellId, EventSource, HrpdAccessEvent, HrpdSessionEvent, HrpdTrafficEvent,
     HrpdTrafficReason, MobileIdentity, NetworkEvent, an_network_event, network_event,
 };
 
@@ -64,6 +64,8 @@ pub enum RecentKind {
 pub struct AnEventSink {
     publisher: EventPublisher,
     color_code: u32,
+    /// Cell this AN serves, stamped on every event it publishes.
+    cell: CellId,
     telemetry: Mutex<HashMap<u32, AtTelemetry>>,
     history: Mutex<HashMap<u32, VecDeque<RecentRecord>>>,
     identities: Mutex<HashMap<u32, MobileIdentity>>,
@@ -71,10 +73,11 @@ pub struct AnEventSink {
 }
 
 impl AnEventSink {
-    pub fn new(publisher: EventPublisher, color_code: u32) -> Self {
+    pub fn new(publisher: EventPublisher, color_code: u32, cell: CellId) -> Self {
         Self {
             publisher,
             color_code,
+            cell,
             telemetry: Mutex::new(HashMap::new()),
             history: Mutex::new(HashMap::new()),
             identities: Mutex::new(HashMap::new()),
@@ -90,6 +93,7 @@ impl AnEventSink {
 
     pub fn session(&self, mut event: HrpdSessionEvent) {
         stamp_timestamp(&mut event.timestamp_ns);
+        event.cell = Some(self.cell);
         self.record_full_uati(event.uati, event.full_uati.clone());
         self.buffer(event.uati, RecentKind::Session(event.clone()));
         self.publish(an_network_event::Event::Session(event));
@@ -97,6 +101,7 @@ impl AnEventSink {
 
     pub fn access(&self, mut event: HrpdAccessEvent) {
         stamp_timestamp(&mut event.timestamp_ns);
+        event.cell = Some(self.cell);
         self.enrich_access_identity(&mut event);
         self.record_full_uati(event.uati, event.full_uati.clone());
         self.record_full_uati(event.receive_ati, event.full_uati.clone());
@@ -108,6 +113,7 @@ impl AnEventSink {
 
     pub fn traffic(&self, mut event: HrpdTrafficEvent) {
         stamp_timestamp(&mut event.timestamp_ns);
+        event.cell = Some(self.cell);
         self.enrich_traffic_identity(&mut event);
         self.record_full_uati(event.uati, event.full_uati.clone());
         self.record_full_uati(event.receive_ati, event.full_uati.clone());
@@ -205,6 +211,7 @@ impl AnEventSink {
             direction: cdma_events::proto::HrpdDirection::Rx as i32,
             decoded_messages: Vec::new(),
             payload_length_bytes: 0,
+            cell: None,
         });
     }
 
@@ -258,6 +265,7 @@ impl AnEventSink {
                 direction: cdma_events::proto::HrpdDirection::Rx as i32,
                 decoded_messages: Vec::new(),
                 payload_length_bytes: 0,
+                cell: None,
             });
         }
         if let Some((mac_index, drc_value, snr)) = changed_sample {
@@ -274,6 +282,7 @@ impl AnEventSink {
                 direction: cdma_events::proto::HrpdDirection::Rx as i32,
                 decoded_messages: Vec::new(),
                 payload_length_bytes: 0,
+                cell: None,
             });
         }
     }

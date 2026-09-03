@@ -19,6 +19,7 @@ pub mod paging;
 pub mod phy;
 pub mod sch;
 pub mod sms;
+pub mod startup;
 pub mod time;
 pub mod timezone;
 pub mod traffic;

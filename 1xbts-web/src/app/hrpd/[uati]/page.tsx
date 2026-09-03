@@ -39,6 +39,8 @@ import {
   isHrpdTelemetryTrafficEvent,
   uatiHex,
 } from "@/lib/hrpd-correlation";
+import { cellForColorCode, cellLabel, peerIdForCell } from "@/lib/cell";
+import { useBtsList } from "@/lib/use-bts-list";
 import {
   mobileForPacketSession,
   mobileLabel,
@@ -310,6 +312,12 @@ export default function HrpdSessionPage() {
       )
     : undefined;
   const canonicalUati = formatHrpdFullUati(session?.fullUati);
+  const { cells } = useBtsList();
+  const servingCell = cellForColorCode(
+    cells,
+    session?.fullUati?.colorCode ?? session?.colorCode,
+  );
+  const servingPeerId = peerIdForCell(cells, servingCell);
 
   const pushRow = useCallback((
     stream: TimelineRow["stream"],
@@ -425,6 +433,17 @@ export default function HrpdSessionPage() {
             <div className="text-muted">
               Color <span className="text-primary">{session.colorCode}</span>
             </div>
+            {servingPeerId && (
+              <div className="text-muted">
+                Cell{" "}
+                <Link
+                  href={`/bts/${encodeURIComponent(servingPeerId)}`}
+                  className="font-mono text-accent-cyan hover:underline"
+                >
+                  {cellLabel(servingCell)}
+                </Link>
+              </div>
+            )}
             {sessionHardwareId && (
               <div className="text-muted">
                 {sessionHardwareId.label}{" "}

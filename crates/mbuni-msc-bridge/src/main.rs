@@ -35,6 +35,12 @@ pub mod bsc {
     }
 }
 
+pub mod base_station {
+    pub mod v1 {
+        tonic::include_proto!("base_station.v1");
+    }
+}
+
 use msc_management::v1::SendSmsRequest;
 use msc_management::v1::msc_management_service_client::MscManagementServiceClient;
 
@@ -389,7 +395,7 @@ mod tests {
         MscManagementService, MscManagementServiceServer,
     };
     use msc_management::v1::{
-        CallList, SendSmsRequest as ProtoSendSmsRequest, SendSmsResponse,
+        BaseStationList, CallList, SendSmsRequest as ProtoSendSmsRequest, SendSmsResponse,
         send_sms_request::Destination,
     };
     use std::sync::Mutex;
@@ -423,6 +429,13 @@ mod tests {
         }
 
         async fn list_calls(&self, _: Request<()>) -> Result<Response<CallList>, Status> {
+            Err(Status::unimplemented(""))
+        }
+
+        async fn list_base_stations(
+            &self,
+            _: Request<()>,
+        ) -> Result<Response<BaseStationList>, Status> {
             Err(Status::unimplemented(""))
         }
 
@@ -469,6 +482,12 @@ mod tests {
                     request: Request<()>,
                 ) -> Result<Response<CallList>, Status> {
                     self.0.list_calls(request).await
+                }
+                async fn list_base_stations(
+                    &self,
+                    request: Request<()>,
+                ) -> Result<Response<BaseStationList>, Status> {
+                    self.0.list_base_stations(request).await
                 }
                 type StreamOtaspEventsStream = std::pin::Pin<
                     Box<

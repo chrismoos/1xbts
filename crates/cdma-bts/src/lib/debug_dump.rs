@@ -1,3 +1,5 @@
+//! SIGUSR1 stack dumps for diagnosing a stalled real-time loop.
+
 #[cfg(target_os = "macos")]
 pub fn install_stack_dump_on_sigusr1() {
     use std::process::Command;
@@ -28,7 +30,7 @@ pub fn install_stack_dump_on_sigusr1() {
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                let out_path = format!("/tmp/cdma-nib-sample-{pid}-{ts}.txt");
+                let out_path = format!("/tmp/cdma-bts-sample-{pid}-{ts}.txt");
                 info!("debug_dump: SIGUSR1 received, sampling pid={pid} → {out_path}");
 
                 let status = Command::new("/usr/bin/sample")
@@ -54,8 +56,7 @@ pub fn install_stack_dump_on_sigusr1() {
         .expect("spawn debug-stack-dump thread");
 }
 
-// On non-macOS platforms this is a no-op — SIGUSR1 stack dumps are not supported.
-// To add Linux support, replace with a nix::sys::signal::signal handler that iterates
-// all threads via /proc/self/task and prints backtraces.
+// SIGUSR1 stack dumps rely on the macOS `sample` tool, so every other
+// platform is a no-op.
 #[cfg(not(target_os = "macos"))]
 pub fn install_stack_dump_on_sigusr1() {}

@@ -21,7 +21,7 @@ use log::{debug, info, warn};
 use crate::addressing::{format_ms_address, is_packet_data_so};
 use crate::power_control::ForwardPowerControlState;
 
-use super::{A1ClearState, Bsc, MsState, ServiceNegotiationMode, VoiceLegRole};
+use super::{A1ClearState, AccessCellId, Bsc, MsState, ServiceNegotiationMode, VoiceLegRole};
 
 #[derive(Default)]
 pub(crate) struct TrafficSignalingService {
@@ -145,11 +145,12 @@ impl Bsc {
     /// AssignmentFailure is emitted at the end of `teardown_traffic_channel`.
     pub(crate) fn release_tch_and_signal_assignment_failure(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         fwd_address: &MsAddress,
         reason: &str,
     ) -> bool {
-        let Some(tc) = self.mobiles.get_traffic_channel(walsh_code) else {
+        let Some(tc) = self.mobiles.get_traffic_channel(cell, walsh_code) else {
             return false;
         };
         if tc.voice_service_option.is_none() {
@@ -168,7 +169,7 @@ impl Bsc {
             },
         ));
         // Strip voice add-on so teardown doesn't fire on_voice_leg_released.
-        self.mobiles.update_tc(walsh_code, |_, tc| {
+        self.mobiles.update_tc(cell, walsh_code, |_, tc| {
             tc.clear_voice_service_connection();
         });
         info!(
@@ -178,17 +179,18 @@ impl Bsc {
             reason,
             walsh_code,
         );
-        self.release_tch_for_assignment_failure(walsh_code, reason);
+        self.release_tch_for_assignment_failure(cell, walsh_code, reason);
         true
     }
 
     pub(crate) async fn advance_waiting_ms_ack(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         ack_seq: u8,
         trigger_msg_type: &str,
     ) {
-        let Some(ms) = self.mobiles.get_by_walsh(walsh_code) else {
+        let Some(ms) = self.mobiles.get_by_walsh(cell, walsh_code) else {
             return;
         };
         let waiting_ms_ack = ms
@@ -206,8 +208,10 @@ impl Bsc {
             format_ms_address(&addr)
         );
 
-        let Some((service_negotiation_mode, service_option, origination_service_option)) =
-            self.mobiles.get_traffic_channel(walsh_code).map(|tc| {
+        let Some((service_negotiation_mode, service_option, origination_service_option)) = self
+            .mobiles
+            .get_traffic_channel(cell, walsh_code)
+            .map(|tc| {
                 (
                     tc.service_negotiation_mode,
                     tc.service_option,
@@ -227,17 +231,20 @@ impl Bsc {
                     "BSC: SERV_NEG disabled on walsh={}: origination SO={:?} differs from assigned SO={}; sending Service Option Request Order proposing SO{}",
                     walsh_code, origination_service_option, service_option, service_option
                 );
-                if let Err(e) =
-                    self.send_service_option_request_order(walsh_code, ack_seq, service_option)
-                {
+                if let Err(e) = self.send_service_option_request_order(
+                    cell,
+                    walsh_code,
+                    ack_seq,
+                    service_option,
+                ) {
                     warn!(
                         "BSC: failed to send Service Option Request Order on walsh={}: {}",
                         walsh_code, e
                     );
-                    self.teardown_traffic_channel(walsh_code).await;
+                    self.teardown_traffic_channel(cell, walsh_code).await;
                     return;
                 }
-                self.mobiles.update_tc(walsh_code, |_, tc| {
+                self.mobiles.update_tc(cell, walsh_code, |_, tc| {
                     tc.mark_waiting_service_response();
                 });
             } else {
@@ -245,9 +252,12 @@ impl Bsc {
                     "BSC: SERV_NEG disabled on walsh={}; accepting SO{} with Service Option Response Order",
                     walsh_code, service_option
                 );
-                if let Err(e) =
-                    self.send_service_option_response_order(walsh_code, ack_seq, service_option)
-                {
+                if let Err(e) = self.send_service_option_response_order(
+                    cell,
+                    walsh_code,
+                    ack_seq,
+                    service_option,
+                ) {
                     warn!(
                         "BSC: failed to send Service Option Response Order on walsh={}: {}",
                         walsh_code, e
@@ -255,6 +265,7 @@ impl Bsc {
                     return;
                 }
                 self.complete_service_negotiation(
+                    cell,
                     walsh_code,
                     &addr,
                     "Service Option Response Order with SERV_NEG disabled",
@@ -262,23 +273,23 @@ impl Bsc {
                 .await;
             }
         } else if needs_negotiation {
-            if let Err(e) = self.send_service_request(walsh_code, ack_seq) {
+            if let Err(e) = self.send_service_request(cell, walsh_code, ack_seq) {
                 warn!(
                     "BSC: failed to send Service Request on walsh={}: {}",
                     walsh_code, e
                 );
             } else {
-                self.mobiles.update_tc(walsh_code, |_, tc| {
+                self.mobiles.update_tc(cell, walsh_code, |_, tc| {
                     tc.mark_waiting_service_response();
                 });
             }
-        } else if let Err(e) = self.send_service_connect(walsh_code, ack_seq) {
+        } else if let Err(e) = self.send_service_connect(cell, walsh_code, ack_seq) {
             warn!(
                 "BSC: failed to send Service Connect on walsh={}: {}",
                 walsh_code, e
             );
         } else {
-            self.mobiles.update_tc(walsh_code, |_, tc| {
+            self.mobiles.update_tc(cell, walsh_code, |_, tc| {
                 tc.mark_service_connecting();
             });
         }
@@ -286,6 +297,7 @@ impl Bsc {
 
     fn send_service_option_response_order(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         ack_seq: u8,
         service_option: u16,
@@ -298,6 +310,7 @@ impl Bsc {
         let sdu = order_msg.to_ftch_sdu();
 
         self.send_traffic_signaling(
+            cell,
             walsh_code,
             sdu,
             MessageId::Order,
@@ -316,6 +329,7 @@ impl Bsc {
     /// rejecting.
     fn send_service_option_request_order(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         ack_seq: u8,
         service_option: u16,
@@ -328,6 +342,7 @@ impl Bsc {
         let sdu = order_msg.to_ftch_sdu();
 
         self.send_traffic_signaling(
+            cell,
             walsh_code,
             sdu,
             MessageId::Order,
@@ -343,23 +358,24 @@ impl Bsc {
 
     async fn complete_service_negotiation(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         addr: &MsAddress,
         trigger: &str,
     ) {
         let is_voice = self
             .mobiles
-            .get_traffic_channel(walsh_code)
+            .get_traffic_channel(cell, walsh_code)
             .and_then(super::traffic_forward::voice_service_option_for_channel)
             .is_some();
         if is_voice {
-            let replaced_packet_session = self.replace_packet_service_with_voice(walsh_code);
+            let replaced_packet_session = self.replace_packet_service_with_voice(cell, walsh_code);
             if let Some(packet_session_id) = replaced_packet_session {
                 self.close_packet_session_background(walsh_code, packet_session_id);
             }
             let (a1_call_id, should_send_assignment_complete, voice_service_option) = self
                 .mobiles
-                .get_traffic_channel(walsh_code)
+                .get_traffic_channel(cell, walsh_code)
                 .map(|tc| {
                     (
                         tc.a1_call_id,
@@ -373,6 +389,7 @@ impl Bsc {
                 self.a1.send_assignment_complete(
                     &self.mobiles,
                     call_id,
+                    cell,
                     walsh_code,
                     voice_service_option,
                 );
@@ -381,13 +398,13 @@ impl Bsc {
                 "BSC: voice service negotiation complete on walsh={} after {}",
                 walsh_code, trigger
             );
-            if let Some(tc) = self.mobiles.get_traffic_channel_mut(walsh_code) {
+            if let Some(tc) = self.mobiles.get_traffic_channel_mut(cell, walsh_code) {
                 tc.mark_active();
             }
         } else {
             let (is_packet_data, a1_call_id, should_send_assignment_complete, service_option) =
                 self.mobiles
-                    .get_traffic_channel(walsh_code)
+                    .get_traffic_channel(cell, walsh_code)
                     .map(|tc| {
                         (
                             is_packet_data_so(tc.service_option),
@@ -412,30 +429,36 @@ impl Bsc {
                 self.a1.send_assignment_complete(
                     &self.mobiles,
                     call_id,
+                    cell,
                     walsh_code,
                     service_option,
                 );
             }
-            if let Some(tc) = self.mobiles.get_traffic_channel_mut(walsh_code) {
+            if let Some(tc) = self.mobiles.get_traffic_channel_mut(cell, walsh_code) {
                 tc.mark_active();
             }
             if is_packet_data {
-                self.start_packet_session_after_service_connect(walsh_code)
+                self.start_packet_session_after_service_connect(cell, walsh_code)
                     .await;
             }
             // SO6 escalation: an SMS was parked on this channel after the BTS
             // rejected the original F-PCH attempt with cause 0x71. Re-deliver
             // it now on F-DSCH.
-            self.dispatch_pending_sms_escalation(walsh_code, addr);
+            self.dispatch_pending_sms_escalation(cell, walsh_code, addr);
         }
     }
 
-    /// Take any SMS parked on `walsh_code` by the 0x71-escalation path and
-    /// re-send it on F-DSCH. The F-TCH ack tracker is installed by
+    /// Take any SMS parked on this traffic channel by the 0x71-escalation
+    /// path and re-send it on F-DSCH. The F-TCH ack tracker is installed by
     /// `send_sms_data_burst_auto` so the existing TrafficMsgSeq ack path
     /// relays success/failure to the MSC.
-    fn dispatch_pending_sms_escalation(&mut self, walsh_code: u8, addr: &MsAddress) {
-        let Some(parked) = self.pending_sms_escalations.remove(&walsh_code) else {
+    fn dispatch_pending_sms_escalation(
+        &mut self,
+        cell: AccessCellId,
+        walsh_code: u8,
+        addr: &MsAddress,
+    ) {
+        let Some(parked) = self.pending_sms_escalations.remove(&(cell, walsh_code)) else {
             return;
         };
         let Some(payload) = parked.escalation.clone() else {
@@ -481,11 +504,13 @@ impl Bsc {
     /// Handle an event from the reverse traffic channel.
     ///
     /// Traffic channel events arrive via the same `AccessChannelEvent` channel
-    /// but with `traffic_walsh_code` set. The BSC matches the Walsh code to a
-    /// mobile in `TrafficAssigning` or `TrafficActive` state and processes the
-    /// decoded LAC PDU (Data Burst for SMS, Order for signaling, etc.).
+    /// but with `traffic_walsh_code` set. The BSC matches `cell` and the Walsh
+    /// code to a mobile in `TrafficAssigning` or `TrafficActive` state and
+    /// processes the decoded LAC PDU (Data Burst for SMS, Order for signaling,
+    /// etc.).
     pub(crate) async fn handle_traffic_event(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         event: &AccessChannelEvent,
     ) {
@@ -495,7 +520,7 @@ impl Bsc {
         );
 
         // Find the mobile with this traffic channel
-        let Some(addr) = self.mobiles.address_by_walsh(walsh_code) else {
+        let Some(addr) = self.mobiles.address_by_walsh(cell, walsh_code) else {
             warn!(
                 "BSC: traffic event for unknown walsh={}, ignoring",
                 walsh_code
@@ -506,7 +531,7 @@ impl Bsc {
 
         if traffic_event_proves_reverse_activity(event) {
             self.record_mobile_activity(&addr, event, activity_now);
-            self.mobiles.update_tc(walsh_code, |_, tc| {
+            self.mobiles.update_tc(cell, walsh_code, |_, tc| {
                 tc.last_activity_at = activity_now;
             });
         }
@@ -515,7 +540,7 @@ impl Bsc {
         // per-PCG PCBs or reverse FER targets; management gRPC reads the BTS
         // power-control registry directly.
         if !event.is_preamble_only {
-            self.mobiles.update_tc(walsh_code, |_, tc| {
+            self.mobiles.update_tc(cell, walsh_code, |_, tc| {
                 if let Some(reverse_pilot_ec_io_db) = event.reverse_pilot_ec_io_db {
                     tc.power_control.reverse_pilot_ec_io_db = Some(reverse_pilot_ec_io_db);
                 }
@@ -537,7 +562,7 @@ impl Bsc {
         // before the mobile's preamble has been validated.
         let channel_is_assigned = self
             .mobiles
-            .get_traffic_channel(walsh_code)
+            .get_traffic_channel(cell, walsh_code)
             .is_some_and(|tc| tc.is_assigned());
         if event.is_preamble_only && channel_is_assigned {
             info!(
@@ -558,6 +583,7 @@ impl Bsc {
             };
             let sdu = order_msg.to_ftch_sdu();
             let bs_ack_sent = if let Err(e) = self.send_traffic_signaling(
+                cell,
                 walsh_code,
                 sdu,
                 MessageId::Order,
@@ -582,7 +608,7 @@ impl Bsc {
             self.mobiles.set_state(&addr, MsState::TrafficActive);
 
             if bs_ack_sent {
-                if let Some(tc) = self.mobiles.get_traffic_channel_mut(walsh_code) {
+                if let Some(tc) = self.mobiles.get_traffic_channel_mut(cell, walsh_code) {
                     tc.mark_waiting_ms_ack();
                 }
             }
@@ -603,10 +629,11 @@ impl Bsc {
             let bs_ack_acked = event.msg_seq.is_some()
                 && self
                     .mobiles
-                    .get_traffic_channel(walsh_code)
+                    .get_traffic_channel(cell, walsh_code)
                     .is_some_and(|tc| tc.is_waiting_ms_ack());
             if bs_ack_acked {
                 self.advance_waiting_ms_ack(
+                    cell,
                     walsh_code,
                     event.msg_seq.unwrap_or(0),
                     event.msg_type_name.as_str(),
@@ -620,7 +647,7 @@ impl Bsc {
         // message-specific ACK handler below.
         if event.ack_req && !event.is_preamble_only {
             let ack_seq = event.msg_seq.unwrap_or(0);
-            if let Err(e) = self.send_traffic_bs_ack(walsh_code, ack_seq) {
+            if let Err(e) = self.send_traffic_bs_ack(cell, walsh_code, ack_seq) {
                 warn!(
                     "BSC: failed to send BS Ack for {} on walsh={}: {}",
                     event.msg_type_name, walsh_code, e
@@ -637,7 +664,7 @@ impl Bsc {
             if !event.is_preamble_only {
                 let is_duplicate = self
                     .mobiles
-                    .update_tc(walsh_code, |_, tc| {
+                    .update_tc(cell, walsh_code, |_, tc| {
                         let arr = if event.ack_req {
                             &mut tc.reverse_regular_msg_seq_rcvd_ack
                         } else {
@@ -677,9 +704,10 @@ impl Bsc {
                     let ack_seq = event.msg_seq.unwrap_or(0);
 
                     // Dispatch based on the unified channel state machine.
-                    if let Some(tc) = self.mobiles.get_traffic_channel(walsh_code) {
+                    if let Some(tc) = self.mobiles.get_traffic_channel(cell, walsh_code) {
                         if tc.is_waiting_ms_ack() {
                             self.advance_waiting_ms_ack(
+                                cell,
                                 walsh_code,
                                 ack_seq,
                                 "Mobile Station Acknowledgment Order",
@@ -702,25 +730,27 @@ impl Bsc {
                     );
                     let (a1_call_id, a1_clear_state) = self
                         .mobiles
-                        .get_traffic_channel(walsh_code)
+                        .get_traffic_channel(cell, walsh_code)
                         .map(|tc| (tc.a1_call_id, tc.a1_clear_state))
                         .unwrap_or((None, A1ClearState::Idle));
                     if let (Some(call_id), A1ClearState::Idle) = (a1_call_id, a1_clear_state) {
                         self.a1.send_clear_request(call_id, 0);
-                        self.mobiles.update_tc(walsh_code, |_, tc| {
+                        self.mobiles.update_tc(cell, walsh_code, |_, tc| {
                             tc.mark_a1_clear_request_sent();
                         });
                     }
                     if !reverse_pdu_duplicate {
-                        if let Err(e) = self
-                            .send_traffic_release_order(walsh_code, super::DEFAULT_TRAFFIC_ACK_SEQ)
-                        {
+                        if let Err(e) = self.send_traffic_release_order(
+                            cell,
+                            walsh_code,
+                            super::DEFAULT_TRAFFIC_ACK_SEQ,
+                        ) {
                             warn!(
                                 "BSC: failed to send Release Order in response to MS release on walsh={}: {}",
                                 walsh_code, e
                             );
                         }
-                        self.mobiles.update_tc(walsh_code, |_, tc| {
+                        self.mobiles.update_tc(cell, walsh_code, |_, tc| {
                             tc.refresh_release_guard();
                         });
                         self.publish_mobiles();
@@ -735,7 +765,7 @@ impl Bsc {
                     let ack_seq = event.msg_seq.unwrap_or(0);
                     let (session_id, leg_role, a1_call_id) = self
                         .mobiles
-                        .get_traffic_channel(walsh_code)
+                        .get_traffic_channel(cell, walsh_code)
                         .map(|tc| (tc.voice_session_id, tc.voice_leg_role, tc.a1_call_id))
                         .unwrap_or((None, None, None));
                     match (session_id, leg_role) {
@@ -747,7 +777,8 @@ impl Bsc {
                             if let Some(call_id) = a1_call_id {
                                 self.a1.send_connect(call_id);
                             }
-                            if let Some(tc) = self.mobiles.get_traffic_channel_mut(walsh_code) {
+                            if let Some(tc) = self.mobiles.get_traffic_channel_mut(cell, walsh_code)
+                            {
                                 tc.mark_voice_connected(true);
                             }
                             if let Some(session) = self.voice.session_mut(session_id) {
@@ -778,7 +809,7 @@ impl Bsc {
                         walsh_code,
                         digit,
                     );
-                    self.emit_continuous_dtmf_order(walsh_code, digit, start);
+                    self.emit_continuous_dtmf_order(cell, walsh_code, digit, start);
                 } else if order == reverse_order_code::SERVICE_OPTION_RESPONSE {
                     // MS reply to our Service Option Request Order. Per
                     // C.S0005-E §2.6.4: SERVICE_OPTION matches our proposed
@@ -793,11 +824,11 @@ impl Bsc {
                     });
                     let waiting_service_response = self
                         .mobiles
-                        .get_traffic_channel(walsh_code)
+                        .get_traffic_channel(cell, walsh_code)
                         .is_some_and(|tc| tc.is_waiting_service_response());
                     let assigned_so = self
                         .mobiles
-                        .get_traffic_channel(walsh_code)
+                        .get_traffic_channel(cell, walsh_code)
                         .map(|tc| tc.service_option);
                     info!(
                         "BSC: received Service Option Response Order on R-TCH walsh={} SO={:?} (assigned SO={:?}, waiting={})",
@@ -811,6 +842,7 @@ impl Bsc {
                                     walsh_code, assigned
                                 );
                                 self.complete_service_negotiation(
+                                    cell,
                                     walsh_code,
                                     &addr,
                                     "Service Option Response Order accept",
@@ -823,11 +855,12 @@ impl Bsc {
                                     walsh_code, resp_so, assigned_so
                                 );
                                 if !self.release_tch_and_signal_assignment_failure(
+                                    cell,
                                     walsh_code,
                                     &addr,
                                     "Service Option Response Order reject",
                                 ) {
-                                    self.teardown_traffic_channel(walsh_code).await;
+                                    self.teardown_traffic_channel(cell, walsh_code).await;
                                 }
                             }
                         }
@@ -851,7 +884,7 @@ impl Bsc {
                     if let Some(ref detail) = detail
                         && let Some(dbm_wire_type) = dbm_wire_type
                         && detail.rejected_type == dbm_wire_type
-                        && let Some(pending) = self.pending_otasp_dbm.remove(&walsh_code)
+                        && let Some(pending) = self.pending_otasp_dbm.remove(&(cell, walsh_code))
                     {
                         info!(
                             "BSC: MS Reject Order on walsh={} for OTASP DBM (ORDQ=0x{:02x}) — sending AddsDeliverAck failure tag=0x{:08x}",
@@ -871,7 +904,7 @@ impl Bsc {
                     // Tear down the call.
                     let waiting_so_response = self
                         .mobiles
-                        .get_traffic_channel(walsh_code)
+                        .get_traffic_channel(cell, walsh_code)
                         .is_some_and(|tc| tc.is_waiting_service_response());
                     let so_neg_rejected = detail.as_ref().is_some_and(|d| {
                         matches!(
@@ -888,11 +921,12 @@ impl Bsc {
                             detail.as_ref().map(|d| d.ordq).unwrap_or(0)
                         );
                         if !self.release_tch_and_signal_assignment_failure(
+                            cell,
                             walsh_code,
                             &addr,
                             "MS Reject Order rejected SO negotiation",
                         ) {
-                            self.teardown_traffic_channel(walsh_code).await;
+                            self.teardown_traffic_channel(cell, walsh_code).await;
                         }
                     } else if !handled_otasp_reject {
                         info!(
@@ -918,7 +952,7 @@ impl Bsc {
                     msg.dtmf_on_length,
                     msg.dtmf_off_length,
                 );
-                self.play_bdtmfm_sequence(walsh_code, msg);
+                self.play_bdtmfm_sequence(cell, walsh_code, msg);
             } else {
                 warn!(
                     "BSC: BDTMFM on walsh={} missing decoded L3, ignoring",
@@ -943,19 +977,20 @@ impl Bsc {
                 SERVICE_REQUEST_PURPOSE_ACCEPT => {
                     let waiting = self
                         .mobiles
-                        .get_traffic_channel(walsh_code)
+                        .get_traffic_channel(cell, walsh_code)
                         .is_some_and(|tc| tc.is_waiting_service_response());
                     if !waiting {
                         info!(
                             "BSC: Service Request accept in unexpected state on walsh={}, ignoring",
                             walsh_code
                         );
-                    } else if let Err(e) = self.send_service_connect(walsh_code, ack_seq) {
+                    } else if let Err(e) = self.send_service_connect(cell, walsh_code, ack_seq) {
                         warn!(
                             "BSC: failed to send Service Connect after mobile accepted counter-proposal on walsh={}: {}",
                             walsh_code, e
                         );
-                    } else if let Some(tc) = self.mobiles.get_traffic_channel_mut(walsh_code) {
+                    } else if let Some(tc) = self.mobiles.get_traffic_channel_mut(cell, walsh_code)
+                    {
                         tc.mark_service_connecting();
                     }
                 }
@@ -965,17 +1000,18 @@ impl Bsc {
                         walsh_code
                     );
                     if !self.release_tch_and_signal_assignment_failure(
+                        cell,
                         walsh_code,
                         &addr,
                         "Service Request reject",
                     ) {
-                        self.teardown_traffic_channel(walsh_code).await;
+                        self.teardown_traffic_channel(cell, walsh_code).await;
                     }
                 }
                 SERVICE_REQUEST_PURPOSE_PROPOSE => {
                     let already_countered = self
                         .mobiles
-                        .get_traffic_channel(walsh_code)
+                        .get_traffic_channel(cell, walsh_code)
                         .is_some_and(|tc| tc.is_waiting_service_response());
                     if already_countered {
                         warn!(
@@ -983,6 +1019,7 @@ impl Bsc {
                             walsh_code
                         );
                         if let Err(e) = self.send_service_response_reject(
+                            cell,
                             walsh_code,
                             ack_seq,
                             request.serv_req_seq,
@@ -993,6 +1030,7 @@ impl Bsc {
                             );
                         }
                         self.begin_packet_tch_release(
+                            cell,
                             walsh_code,
                             "service counter-proposal remained incompatible",
                         );
@@ -1002,7 +1040,7 @@ impl Bsc {
                     let proposed = request.service_config.as_ref();
                     let assigned = self
                         .mobiles
-                        .get_traffic_channel(walsh_code)
+                        .get_traffic_channel(cell, walsh_code)
                         .map(|tc| (tc.service_option, tc.for_rc, tc.rev_rc));
                     let proposal_matches = proposed.zip(assigned).is_some_and(|(cfg, assigned)| {
                         let (service_option, for_rc, rev_rc) = assigned;
@@ -1024,15 +1062,18 @@ impl Bsc {
                             "BSC: accepting mobile service proposal on walsh={} with Service Connect",
                             walsh_code
                         );
-                        if let Err(e) = self.send_service_connect(walsh_code, ack_seq) {
+                        if let Err(e) = self.send_service_connect(cell, walsh_code, ack_seq) {
                             warn!(
                                 "BSC: failed to accept mobile service proposal on walsh={}: {}",
                                 walsh_code, e
                             );
-                        } else if let Some(tc) = self.mobiles.get_traffic_channel_mut(walsh_code) {
+                        } else if let Some(tc) =
+                            self.mobiles.get_traffic_channel_mut(cell, walsh_code)
+                        {
                             tc.mark_service_connecting();
                         }
                     } else if let Err(e) = self.send_service_response_counter_proposal(
+                        cell,
                         walsh_code,
                         ack_seq,
                         request.serv_req_seq,
@@ -1041,7 +1082,8 @@ impl Bsc {
                             "BSC: failed to counter-propose assigned service configuration on walsh={}: {}",
                             walsh_code, e
                         );
-                    } else if let Some(tc) = self.mobiles.get_traffic_channel_mut(walsh_code) {
+                    } else if let Some(tc) = self.mobiles.get_traffic_channel_mut(cell, walsh_code)
+                    {
                         tc.mark_waiting_service_response();
                     }
                 }
@@ -1073,7 +1115,7 @@ impl Bsc {
 
             let waiting_service_response = self
                 .mobiles
-                .get_traffic_channel(walsh_code)
+                .get_traffic_channel(cell, walsh_code)
                 .is_some_and(|tc| tc.is_waiting_service_response());
 
             if waiting_service_response {
@@ -1085,12 +1127,14 @@ impl Bsc {
                             "BSC: mobile accepted Service Request on walsh={}, sending Service Connect",
                             walsh_code
                         );
-                        if let Err(e) = self.send_service_connect(walsh_code, ack_seq) {
+                        if let Err(e) = self.send_service_connect(cell, walsh_code, ack_seq) {
                             warn!(
                                 "BSC: failed to send Service Connect on walsh={}: {}",
                                 walsh_code, e
                             );
-                        } else if let Some(tc) = self.mobiles.get_traffic_channel_mut(walsh_code) {
+                        } else if let Some(tc) =
+                            self.mobiles.get_traffic_channel_mut(cell, walsh_code)
+                        {
                             tc.mark_service_connecting();
                         }
                     }
@@ -1100,11 +1144,12 @@ impl Bsc {
                             walsh_code
                         );
                         if !self.release_tch_and_signal_assignment_failure(
+                            cell,
                             walsh_code,
                             &addr,
                             "Service Response reject",
                         ) {
-                            self.teardown_traffic_channel(walsh_code).await;
+                            self.teardown_traffic_channel(cell, walsh_code).await;
                         }
                     }
                     SERVICE_RESPONSE_PURPOSE_COUNTER_PROPOSE => {
@@ -1126,7 +1171,9 @@ impl Bsc {
                                     "BSC: accepting counter-propose on walsh={} SO={} — sending Service Connect",
                                     walsh_code, so
                                 );
-                                if let Some(tc) = self.mobiles.get_traffic_channel_mut(walsh_code) {
+                                if let Some(tc) =
+                                    self.mobiles.get_traffic_channel_mut(cell, walsh_code)
+                                {
                                     if VoiceCodec::from_service_option(so).is_some()
                                         && tc.voice_service_option.is_some()
                                     {
@@ -1135,14 +1182,15 @@ impl Bsc {
                                         tc.service_option = so;
                                     }
                                 }
-                                if let Err(e) = self.send_service_connect(walsh_code, ack_seq) {
+                                if let Err(e) = self.send_service_connect(cell, walsh_code, ack_seq)
+                                {
                                     warn!(
                                         "BSC: failed to send Service Connect after counter-propose on walsh={}: {}",
                                         walsh_code, e
                                     );
-                                    self.teardown_traffic_channel(walsh_code).await;
+                                    self.teardown_traffic_channel(cell, walsh_code).await;
                                 } else if let Some(tc) =
-                                    self.mobiles.get_traffic_channel_mut(walsh_code)
+                                    self.mobiles.get_traffic_channel_mut(cell, walsh_code)
                                 {
                                     tc.mark_service_connecting();
                                 }
@@ -1154,9 +1202,9 @@ impl Bsc {
                                 );
                                 let reason = format!("counter-propose SO={} unsupported", so);
                                 if !self.release_tch_and_signal_assignment_failure(
-                                    walsh_code, &addr, &reason,
+                                    cell, walsh_code, &addr, &reason,
                                 ) {
-                                    self.teardown_traffic_channel(walsh_code).await;
+                                    self.teardown_traffic_channel(cell, walsh_code).await;
                                 }
                             }
                             None => {
@@ -1164,7 +1212,7 @@ impl Bsc {
                                     "BSC: counter-propose on walsh={} had no service config record — tearing down",
                                     walsh_code
                                 );
-                                self.teardown_traffic_channel(walsh_code).await;
+                                self.teardown_traffic_channel(cell, walsh_code).await;
                             }
                         }
                     }
@@ -1178,7 +1226,7 @@ impl Bsc {
             } else {
                 let channel_state_label = self
                     .mobiles
-                    .get_traffic_channel(walsh_code)
+                    .get_traffic_channel(cell, walsh_code)
                     .map(|tc| tc.state_label());
                 info!(
                     "BSC: received Service Response in unexpected state {:?} on walsh={}, ignoring",
@@ -1193,8 +1241,13 @@ impl Bsc {
                 walsh_code, serv_con_seq
             );
 
-            self.complete_service_negotiation(walsh_code, &addr, "Service Connect Completion")
-                .await;
+            self.complete_service_negotiation(
+                cell,
+                walsh_code,
+                &addr,
+                "Service Connect Completion",
+            )
+            .await;
             // Issue-tracked: F-SCH setup should send ESCAM to activate the
             // supplemental channel after service negotiation. Disabled until
             // the ESCAM encoder is validated end-to-end with a handset.
@@ -1214,7 +1267,7 @@ impl Bsc {
                 let mut pmrm_state_updated = false;
                 let tick = self
                     .mobiles
-                    .update_tc(walsh_code, |_, tc| {
+                    .update_tc(cell, walsh_code, |_, tc| {
                         pmrm_state_updated = true;
                         tc.forward_power_control.outer_loop_tick(
                             m.errors_detected,
@@ -1228,7 +1281,7 @@ impl Bsc {
                     self.publish_mobiles();
                 }
                 if let Some(tick) = tick
-                    && let Some(bts_client) = self.config.bts_client.clone()
+                    && let Some(bts_client) = self.client_for_cell(cell)
                 {
                     let updated = bts_client
                         .set_traffic_gain(walsh_code, tick.new_gain_linear)
@@ -1271,7 +1324,7 @@ impl Bsc {
             }
         } else if event.message_id == MessageId::DataBurst {
             // Process traffic channel data burst (MO SMS)
-            self.handle_traffic_data_burst(walsh_code, event);
+            self.handle_traffic_data_burst(cell, walsh_code, event);
         } else if let (Some(bits), Some(rate_bps)) = (
             event.traffic_voice_bits.as_ref(),
             event.traffic_voice_rate_bps,
@@ -1282,10 +1335,10 @@ impl Bsc {
                 .unwrap_or(true);
             let (is_packet_data, msc_circuit_id) = self
                 .mobiles
-                .get_traffic_channel(walsh_code)
+                .get_traffic_channel(cell, walsh_code)
                 .map(|tc| (is_packet_data_so(tc.service_option), tc.msc_circuit_id))
                 .unwrap_or((false, None));
-            let reverse_media_enabled = self.reverse_voice_media_enabled(walsh_code);
+            let reverse_media_enabled = self.reverse_voice_media_enabled(cell, walsh_code);
 
             if is_packet_data {
                 log::trace!(

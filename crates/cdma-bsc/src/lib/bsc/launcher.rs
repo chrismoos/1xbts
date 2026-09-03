@@ -1,117 +1,50 @@
-use std::{net::Ipv4Addr, path::PathBuf, sync::Arc};
+use std::{net::Ipv4Addr, sync::Arc};
 
-use cdma_bts::bts::{
-    BtsCommand, BtsPowerControlRegistry, BtsRuntimeSettings, PagingChannelSettings,
-    PchTransmitEvent, RxMetrics, TxMetrics,
-};
 use cdma_common::events::AccessChannelEvent;
 use cdma_hlr::repository::HlrRepository;
-use cdma_msc::VoicePolicy;
 use cdma_smsc::repository::SmscRepository;
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::{
     a1_edge::MscClient,
-    abis_edge::{
-        BtsControlClient,
-        network::{NetworkBtsControlClient, NetworkClientConfig},
-    },
-    config::{BscNodeConfig, PagingRetryConfig, TrafficAssignmentConfig, TrafficRetryConfig},
+    config::{TrafficAssignmentConfig, TrafficRetryConfig},
     grpc::BscState,
     packet::PcfClient,
 };
 
 use super::{
-    Bsc, Config, DataCallRequest, MobileInfo, OverheadParameters, PagingEvent, SmsRequest,
-    TrafficEvent, TrafficPowerOverrideRequest,
+    Bsc, BtsRegistry, Config, DataCallRequest, MobileInfo, PagingEvent, SmsRequest, TrafficEvent,
+    TrafficPowerOverrideRequest,
 };
 
-pub async fn connect_configured_bts_client(
-    bsc_config: &BscNodeConfig,
-    bts_config: &cdma_bts::bts::BtsNodeConfig,
-) -> Result<
-    (
-        Arc<dyn BtsControlClient>,
-        mpsc::UnboundedReceiver<AccessChannelEvent>,
-    ),
-    String,
-> {
-    let bearer_config = cdma_abis::bearer_transport::BearerTransportConfig {
-        bind_addr: bsc_config.bearer.bind_addr,
-        remote_addr: bsc_config.bearer.remote_addr,
-        bts_id: bts_config.overhead.base_id as u32,
-        cell_id: 1,
-    };
-    let bearer = Arc::new(
-        cdma_abis::bearer_transport::BearerTransport::new(&bearer_config)
-            .map_err(|e| format!("failed to create BSC bearer transport: {e}"))?,
-    );
-    let net_config = NetworkClientConfig {
-        cell_id: cdma_abis::control::typed::CellId {
-            cell: bts_config.overhead.base_id,
-            sector: 0x01,
-        },
-        mscid: bts_config.overhead.sid as u32,
-        pilot_pn: bts_config.pilot_offset as u16,
-        auth_mode: bts_config.overhead.auth_mode,
-        p_rev_in_use: bts_config.overhead.p_rev,
-        market_id: bts_config.overhead.sid,
-        generating_entity_id: bts_config.overhead.base_id,
-    };
-    let (access_tx, access_rx) = mpsc::unbounded_channel();
-    let client = NetworkBtsControlClient::connect_with_bearer_and_access(
-        bsc_config.abis.remote_addr,
-        net_config,
-        bearer,
-        access_tx,
-    )
-    .await
-    .map_err(|e| format!("failed to connect to BTS Abis agent: {e}"))?;
-    Ok((Arc::new(client), access_rx))
-}
-
 pub struct BscLaunchInputs {
-    pub pilot_offset: usize,
-    pub channel: cdma_common::band_class::ChannelPlan,
-    pub tx_center_frequency_hz: usize,
-    pub rx_center_frequency_hz: usize,
-    pub evdo: Option<cdma_bts::bts::evdo::ResolvedEvdoConfig>,
-    pub overhead: OverheadParameters,
-    pub timezone: cdma_common::timezone::TimezoneConfig,
-    pub paging: PagingChannelSettings,
+    /// The BTSs this BSC serves, populated by the attach tasks.
+    pub bts: Arc<BtsRegistry>,
     pub traffic_assignment: TrafficAssignmentConfig,
     pub traffic_retry: TrafficRetryConfig,
-    pub paging_retry: PagingRetryConfig,
     pub mobile_idle_timeout_s: u64,
-    pub rx_reference_dbm: Option<f64>,
+    /// Access events from every attached cell. The matching sender is handed
+    /// to `spawn_bts_attach`.
     pub access_event_rx: mpsc::UnboundedReceiver<AccessChannelEvent>,
-    pub tx_metrics: watch::Receiver<TxMetrics>,
-    pub rx_metrics: watch::Receiver<RxMetrics>,
-    pub bts_config: Arc<BtsRuntimeSettings>,
-    pub bts_commands: mpsc::Sender<BtsCommand>,
-    pub bts_power_control: BtsPowerControlRegistry,
-    pub iq_capture_dir: PathBuf,
+    /// Cells whose Abis link dropped. The matching sender is handed to
+    /// `spawn_bts_attach`.
+    pub cell_detach_rx: mpsc::UnboundedReceiver<cdma_common::events::AccessCellId>,
     pub hlr_repo: Arc<dyn HlrRepository>,
-    /// SMSC repository — passed to BscState for gRPC history queries only.
-    /// The BSC itself no longer does SMSC state updates; MSC owns SMS coordination.
+    /// SMSC repository — read by the management layer for history queries.
+    /// The BSC itself does no SMSC state updates. The MSC owns SMS coordination.
     pub smsc_repo: Arc<dyn SmscRepository>,
     pub packet_endpoint: String,
-    pub bts_client: Arc<dyn BtsControlClient>,
+    /// Address the A1 listener accepts the MSC on, reported at enrollment.
+    pub a1_bind_addr: std::net::SocketAddr,
     pub msc_client: Arc<dyn MscClient>,
-    pub voice_policy: Arc<dyn VoicePolicy>,
+    pub voice_timeouts: crate::config::VoiceTimeoutConfig,
     pub pcf_client: Arc<dyn PcfClient>,
-    pub pch_transmit_tx: broadcast::Sender<PchTransmitEvent>,
     /// Local IP that voice bearer UDP sockets bind to.
     /// Use 127.0.0.1 for single-host deployments; set to the host's
     /// network-facing IP when BSC and voice gateway are on separate hosts.
     pub voice_bearer_bind_ip: Ipv4Addr,
     /// Stable node identifier for this BSC. Must be unique across all BSC instances.
     pub node_id: String,
-    /// Optional HRPD AN A21 endpoint. When `Some`, the launcher spawns an
-    /// `A21ClientLoop` and installs the resulting identity cache + send
-    /// channel into `Bsc::set_hrpd_coord` so the paging path can divert
-    /// HRPD-attached MTs into A21 CrossPageRequest.
-    pub an_a21_addr: Option<std::net::SocketAddr>,
 }
 
 pub struct BscLaunchParts {
@@ -130,40 +63,26 @@ pub fn build_bsc_launch_parts(inputs: BscLaunchInputs) -> BscLaunchParts {
     let (traffic_broadcast_tx, _) = broadcast::channel::<TrafficEvent>(256);
 
     let state = Arc::new(BscState {
-        tx_metrics: inputs.tx_metrics,
-        rx_metrics: inputs.rx_metrics,
-        bts_config: inputs.bts_config,
-        channel: inputs.channel,
-        tx_center_frequency_hz: inputs.tx_center_frequency_hz,
-        rx_center_frequency_hz: inputs.rx_center_frequency_hz,
-        evdo: inputs.evdo.clone(),
-        overhead: inputs.overhead.clone(),
-        timezone: inputs.timezone.clone(),
-        pilot_offset: inputs.pilot_offset,
+        bts: inputs.bts.clone(),
         access_broadcast: access_broadcast_tx.clone(),
         mobiles: mobiles_rx,
-        bts_commands: inputs.bts_commands,
-        bts_power_control: inputs.bts_power_control,
-        iq_capture_dir: inputs.iq_capture_dir,
         sms_request_tx: sms_request_tx.clone(),
         data_request_tx: data_request_tx.clone(),
         power_override_request_tx: power_override_request_tx.clone(),
         paging_broadcast: paging_broadcast_tx.clone(),
-        pch_transmit_broadcast: Some(inputs.pch_transmit_tx.clone()),
         traffic_broadcast: traffic_broadcast_tx.clone(),
         hlr_repo: inputs.hlr_repo.clone(),
         smsc_repo: inputs.smsc_repo.clone(),
         packet_endpoint: inputs.packet_endpoint.clone(),
-        bts_client: inputs.bts_client.clone(),
         node_id: inputs.node_id.clone(),
+        a1_bind_addr: inputs.a1_bind_addr,
     });
 
-    let mut bsc = Bsc::new(Config {
-        pilot_offset: inputs.pilot_offset,
-        overhead: inputs.overhead,
-        paging: inputs.paging,
+    let bsc = Bsc::new(Config {
+        bts: inputs.bts,
         traffic_assignment: inputs.traffic_assignment,
         access_event_rx: Some(inputs.access_event_rx),
+        cell_detach_rx: Some(inputs.cell_detach_rx),
         access_event_broadcast: Some(access_broadcast_tx),
         sms_request_rx: Some(sms_request_rx),
         sms_request_tx: Some(sms_request_tx),
@@ -174,13 +93,10 @@ pub fn build_bsc_launch_parts(inputs: BscLaunchInputs) -> BscLaunchParts {
         mobiles_tx: Some(mobiles_tx),
         paging_broadcast: Some(paging_broadcast_tx),
         traffic_broadcast: Some(traffic_broadcast_tx),
-        rx_reference_dbm: inputs.rx_reference_dbm,
         hlr_repo: Some(inputs.hlr_repo),
         msc_client: inputs.msc_client,
-        bts_client: Some(inputs.bts_client),
         traffic_retry: inputs.traffic_retry,
-        paging_retry: inputs.paging_retry,
-        voice_policy: inputs.voice_policy,
+        voice_timeouts: inputs.voice_timeouts,
         pcf_client: Some(inputs.pcf_client),
         mobile_idle_timeout_s: inputs.mobile_idle_timeout_s,
         msc_voice_bearer: Some(Arc::new(cdma_ios::VoiceBearerManager::new(
@@ -190,44 +106,8 @@ pub fn build_bsc_launch_parts(inputs: BscLaunchInputs) -> BscLaunchParts {
         node_id: inputs.node_id.clone(),
     });
 
-    // If an HRPD AN A21 address is configured, spawn an A21ClientLoop and
-    // install the cache+send sink into the Bsc so the paging path can divert
-    // HRPD-attached MTs into A21 CrossPageRequest.
-    if let Some(an_addr) = inputs.an_a21_addr {
-        let (a21_send_tx, mut a21_send_rx) =
-            tokio::sync::mpsc::unbounded_channel::<cdma_a21::A21Message>();
-        let cache = cdma_a21::HybridIdentityCache::new();
-        {
-            let cache = cache.clone();
-            tokio::spawn(async move {
-                match cdma_a21::A21ClientLoop::connect(an_addr).await {
-                    Ok(loop_) => {
-                        // The loop already maintains its own cache; mirror
-                        // its snapshot into the BSC's cache so the call path
-                        // can query synchronously.
-                        let loop_cache = loop_.cache();
-                        // Drain outbound queue, forwarding to the AN.
-                        while let Some(msg) = a21_send_rx.recv().await {
-                            // Sync cache snapshot from the loop on every send
-                            // — lightweight and keeps stale entries low when
-                            // the loop receives new bindings between sends.
-                            for c in loop_cache.snapshot() {
-                                cache.bind(c);
-                            }
-                            if let Err(e) = loop_.send(&msg).await {
-                                log::warn!("BSC: A21 send to AN failed: {e}");
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("BSC: failed to connect to HRPD AN A21 at {an_addr}: {e}");
-                    }
-                }
-            });
-        }
-        bsc.set_hrpd_coord(crate::bsc::hrpd_coord::HrpdCoord::new(cache, a21_send_tx));
-    }
+    // 1x/HRPD cross-paging is not implemented: no element serves A21. A
+    // dormant HRPD terminal is paged on 1x only.
 
     BscLaunchParts { bsc, state }
 }

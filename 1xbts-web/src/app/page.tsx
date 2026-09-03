@@ -4,6 +4,8 @@ import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { Card, Stat } from "@/components/card";
 import { HrpdSummaryCard } from "@/components/hrpd-summary-card";
+import { useBaseStations } from "@/lib/use-base-stations";
+import { cellLabel } from "@/lib/cell";
 import { radioConfigPairName } from "@/lib/radio-config";
 import { serviceOptionName } from "@/lib/service-option";
 import { smsStateColor } from "@/lib/sms-state";
@@ -21,15 +23,6 @@ import {
 import type { AccessEvent, PagingEvent, TrafficEvent } from "@/lib/proto/bsc/v1/service";
 
 // ─── Types ──────────────────────────────────────────────────────
-
-interface SystemStatus {
-  running: boolean;
-  sid: number;
-  nid: number;
-  baseId: number;
-  pilotPn: number;
-  regZone: number;
-}
 
 interface RadioMetrics {
   tx?: { rtRatio: number; blocksTransmitted: number; syncFragmentsSent: number; pagingFragmentsSent: number };
@@ -53,6 +46,7 @@ interface ChannelEntry {
   channelType: string;
   direction: string;
   serviceOption?: number;
+  cell?: { cell: number; sector: number };
   mobile?: { address: string; state: string; phoneNumber?: string };
   trafficPower?: {
     forwardRadioConfig: number;
@@ -90,9 +84,9 @@ interface PacketSession {
 }
 
 type RecentEvent =
-  | { kind: "paging"; ts: number; summary: string; channel: string }
-  | { kind: "traffic"; ts: number; summary: string; channel: string }
-  | { kind: "access"; ts: number; summary: string; channel: string };
+  | { kind: "paging"; ts: number; summary: string; channel: string; source?: string }
+  | { kind: "traffic"; ts: number; summary: string; channel: string; source?: string }
+  | { kind: "access"; ts: number; summary: string; channel: string; source?: string };
 
 // ─── Helpers ────────────────────────────────────────────────────
 
@@ -139,28 +133,33 @@ const MAX_RECENT = 8;
 // ─── Page ───────────────────────────────────────────────────────
 
 export default function DashboardPage() {
-  const [status, setStatus] = useState<SystemStatus | null>(null);
-  const [metrics, setMetrics] = useState<RadioMetrics | null>(null);
+  const { nodes } = useBaseStations();
+  const [metricsByCell, setMetricsByCell] = useState<Record<string, RadioMetrics>>({});
   const [mobiles, setMobiles] = useState<MobileInfo[]>([]);
   const [channelData, setChannelData] = useState<ChannelsResponse | null>(null);
   const [smsRecent, setSmsRecent] = useState<SmsSubmission[]>([]);
   const [packetSessions, setPacketSessions] = useState<PacketSession[]>([]);
   const [recentEvents, setRecentEvents] = useState<RecentEvent[]>([]);
 
+  const cells = nodes.flatMap((node) => node.cells);
+  const attachedBs = nodes.filter((node) => node.attached).length;
+  const inServiceCells = cells.filter((cell) => cell.inService).length;
 
-  // Fetch static system status once
-  useEffect(() => {
-    fetch("/api/system-status")
-      .then((r) => r.json())
-      .then((data) => { if (!data.error) setStatus(data); })
-      .catch(() => {});
-  }, []);
-
-  // Stream live radio metrics
+  // Stream live radio metrics, keyed by the cell that emitted them so the
+  // health rollup covers every cell rather than whichever reported last.
   useEventStream("radio-metrics", (data) => {
     const parsed = JSON.parse(data);
-    if (!parsed.error) setMetrics(parsed);
+    if (parsed.error) return;
+    const node = parsed.management?.sourceNodeId ?? "";
+    setMetricsByCell((prev) => ({ ...prev, [node]: parsed }));
   });
+
+  const cellMetrics = Object.values(metricsByCell);
+  const healthyCells = cellMetrics.filter(
+    (m) => (m.tx?.rtRatio ?? 0) >= 0.95 && (m.rx?.rtRatio ?? 0) >= 0.95,
+  ).length;
+  const worstTx = cellMetrics.reduce((lo, m) => Math.min(lo, m.tx?.rtRatio ?? Infinity), Infinity);
+  const worstRx = cellMetrics.reduce((lo, m) => Math.min(lo, m.rx?.rtRatio ?? Infinity), Infinity);
 
   // Poll mobiles, channels, sms
   const fetchAll = useCallback(async () => {
@@ -203,7 +202,8 @@ export default function DashboardPage() {
   }, []);
 
   useEventStream("paging", useCallback((data: string) => {
-    const ev: PagingEvent = JSON.parse(data);
+    const parsed = JSON.parse(data);
+    const ev: PagingEvent = parsed;
     const name = ev.header?.msgTypeName ?? "Paging";
     const detail = formatPagingSummary(ev);
     addRecent({
@@ -211,11 +211,13 @@ export default function DashboardPage() {
       ts: ev.timestampUs ? Math.floor(ev.timestampUs / 1000) : Date.now(),
       summary: detail ? `${name} - ${detail}` : name,
       channel: formatPagingChannel(ev),
+      source: parsed.management?.sourceNodeId,
     });
   }, [addRecent]));
 
   useEventStream("traffic", useCallback((data: string) => {
-    const ev: TrafficEvent = JSON.parse(data);
+    const parsed = JSON.parse(data);
+    const ev: TrafficEvent = parsed;
     const name = ev.header?.msgTypeName ?? "Traffic";
     const detail = formatTrafficSummary(ev);
     addRecent({
@@ -223,17 +225,20 @@ export default function DashboardPage() {
       ts: ev.timestampUs ? Math.floor(ev.timestampUs / 1000) : Date.now(),
       summary: detail ? `${name} - ${detail}` : name,
       channel: formatTrafficChannel(ev),
+      source: parsed.management?.sourceNodeId,
     });
   }, [addRecent]));
 
   useEventStream("access", useCallback((data: string) => {
-    const ev: AccessEvent = JSON.parse(data);
+    const parsed = JSON.parse(data);
+    const ev: AccessEvent = parsed;
     if (shouldHideAccessEvent(ev)) return;
     addRecent({
       kind: "access",
       ts: ev.timestampUs ? Math.floor(ev.timestampUs / 1000) : Date.now(),
       summary: `${formatAccessTypeName(ev)} ${formatAccessSummary(ev)}`,
       channel: formatAccessChannel(ev),
+      source: parsed.management?.sourceNodeId,
     });
   }, [addRecent]));
 
@@ -253,51 +258,46 @@ export default function DashboardPage() {
 
       {/* Top row: System + Radio */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <Card title="System Identity">
-          {status ? (
+        <Card title="Network">
+          {nodes.length > 0 ? (
             <>
-              <Stat label="Status" value={status.running ? "Running" : "Stopped"} />
-              <Stat label="SID / NID" value={`${status.sid} / ${status.nid}`} />
-              <Stat label="BASE_ID" value={String(status.baseId)} />
-              <Stat label="PILOT_PN" value={String(status.pilotPn)} />
-              <Stat label="REG_ZONE" value={String(status.regZone)} />
+              <Stat label="Base Stations" value={`${attachedBs}/${nodes.length} attached`} />
+              <Stat label="Cells" value={`${inServiceCells}/${cells.length} in service`} />
             </>
           ) : (
             <p className="text-dimmed text-sm">Unavailable</p>
           )}
+          <div className="mt-2 pt-2 border-t border-border">
+            <Link href="/base-stations" className="text-xs text-accent-green hover:text-accent-green">
+              Base stations &rarr;
+            </Link>
+          </div>
         </Card>
 
         <Card title="Radio Health">
-          {metrics ? (
+          {cellMetrics.length > 0 ? (
             <>
               <div className="flex items-center gap-2 mb-2">
                 <span className={`inline-block w-2 h-2 rounded-full ${
-                  (metrics.tx?.rtRatio ?? 0) >= 0.95 && (metrics.rx?.rtRatio ?? 0) >= 0.95
+                  healthyCells === cellMetrics.length
                     ? "bg-accent-green"
-                    : (metrics.tx?.rtRatio ?? 0) >= 0.8 && (metrics.rx?.rtRatio ?? 0) >= 0.8
+                    : worstTx >= 0.8 && worstRx >= 0.8
                       ? "bg-accent-amber"
                       : "bg-accent-red"
                 }`} />
                 <span className="text-xs text-muted">
-                  TX {(metrics.tx?.rtRatio ?? 0).toFixed(1)}x / RX {(metrics.rx?.rtRatio ?? 0).toFixed(1)}x real-time
+                  {healthyCells}/{cellMetrics.length} cells real-time
                 </span>
               </div>
-              {metrics.tx?.rtRatio != null && (
-                <Stat label="TX RT Ratio" value={`${metrics.tx.rtRatio.toFixed(3)}x`} mono />
-              )}
-              {metrics.rx?.rtRatio != null && (
-                <Stat label="RX RT Ratio" value={`${metrics.rx.rtRatio.toFixed(3)}x`} mono />
-              )}
-              {metrics.rx?.deficitMs != null && (
-                <Stat label="RX Deficit" value={`${metrics.rx.deficitMs.toFixed(1)} ms`} mono />
-              )}
+              <Stat label="Worst TX" value={Number.isFinite(worstTx) ? `${worstTx.toFixed(3)}x` : "-"} mono />
+              <Stat label="Worst RX" value={Number.isFinite(worstRx) ? `${worstRx.toFixed(3)}x` : "-"} mono />
             </>
           ) : (
             <p className="text-dimmed text-sm">No radio metrics</p>
           )}
           <div className="mt-2 pt-2 border-t border-border">
-            <Link href="/radio" className="text-xs text-accent-green hover:text-accent-green">
-              Detailed radio metrics &rarr;
+            <Link href="/bts" className="text-xs text-accent-green hover:text-accent-green">
+              Per-cell radio metrics &rarr;
             </Link>
           </div>
         </Card>
@@ -320,6 +320,9 @@ export default function DashboardPage() {
                   {trafficChannels.map((ch, i) => (
                     <div key={i} className="flex items-center gap-2 text-xs">
                       <span className="font-mono text-primary">W{ch.walshCode}</span>
+                      {ch.cell && (
+                        <span className="text-dimmed font-mono" title="cell">{cellLabel(ch.cell)}</span>
+                      )}
                       {radioConfigPairName(
                         ch.trafficPower?.forwardRadioConfig,
                         ch.trafficPower?.reverseRadioConfig,
@@ -483,6 +486,11 @@ export default function DashboardPage() {
                   {ev.kind === "access" ? "RX" : "TX"}
                 </span>
                 <span className="text-dimmed shrink-0">{ev.channel}</span>
+                {nodes.length > 1 && ev.source && (
+                  <span className="text-dimmed shrink-0 truncate max-w-[7rem] font-mono" title={ev.source}>
+                    {ev.source}
+                  </span>
+                )}
                 <span className="text-secondary truncate">{ev.summary}</span>
               </div>
             ))}

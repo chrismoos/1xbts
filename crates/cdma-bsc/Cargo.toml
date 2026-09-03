@@ -9,14 +9,10 @@ homepage.workspace = true
 description = "BSC, mobility, paging, SMS, traffic, packet-data, and management services for 1xBTS."
 
 [features]
-default = ["uhd-backend", "lime-backend", "bladerf-backend"]
-uhd-backend = ["cdma-bts/uhd-backend"]
-lime-backend = ["cdma-bts/lime-backend"]
-bladerf-backend = ["cdma-bts/bladerf-backend"]
-soapy-backend = ["cdma-bts/soapy-backend"]
 test-utils = []
 
 [dependencies]
+thiserror = "1"
 cdma-abis = { path = "../cdma-abis" }
 cdma-a8 = { path = "../cdma-a8" }
 cdma-a10 = { path = "../cdma-a10" }
@@ -47,6 +43,7 @@ cdma-pcf = { path = "../cdma-pcf" }
 cdma-pdsn = { path = "../cdma-pdsn" }
 cdma-smsc = { path = "../cdma-smsc" }
 cdma-voice = { path = "../cdma-voice" }
+clap = { version = "4", features = ["derive"] }
 uuid = "1"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres"] }
 parking_lot = "0.12"

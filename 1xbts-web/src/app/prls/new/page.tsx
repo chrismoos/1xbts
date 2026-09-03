@@ -11,6 +11,15 @@ import {
   type RunningSystemCarrierSelection,
 } from "@/lib/prl-empty";
 import { type BtsConfig, EvdoTxMode } from "@/lib/proto/bsc/v1/service";
+import {
+  attachStateLabel,
+  cellHref,
+  cellOptionValue,
+  cellToken,
+  parseCellOption,
+  shortBaseStation,
+} from "@/lib/cell";
+import { type CellEntry, useBtsList, usePinnedDefaultCell } from "@/lib/use-bts-list";
 
 function bytesToBase64(bytes: Uint8Array): string {
   let binary = "";
@@ -33,6 +42,7 @@ export default function NewPrlPage() {
   const [configLoading, setConfigLoading] = useState(true);
   const [configError, setConfigError] = useState<string | null>(null);
   const [configRequest, setConfigRequest] = useState(0);
+  const [pickedCell, setPickedCell] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const runningReady =
@@ -41,11 +51,25 @@ export default function NewPrlPage() {
       runningConfig !== null &&
       (selectedCarriers.oneX || selectedCarriers.hrpd));
 
+  const { cells, loading: cellsLoading } = useBtsList();
+  // A PRL is seeded from one cell's carriers, so the seed waits for the cell
+  // list and then names the cell (and its base station) rather than asking for
+  // an unnamed one.
+  const pinnedToken = usePinnedDefaultCell(cells);
+  const pinnedEntry = cells.find((c) => cellToken(c.cell) === pinnedToken);
+  const defaultValue = pinnedEntry
+    ? cellOptionValue(pinnedToken ?? "", pinnedEntry.baseStation)
+    : "";
+  const seedValue = pickedCell ?? defaultValue;
+  const { token: seedToken, baseStation: seedBaseStation } =
+    parseCellOption(seedValue);
+
   useEffect(() => {
+    if (cellsLoading) return;
     let cancelled = false;
     setConfigLoading(true);
     setConfigError(null);
-    fetch("/api/bts-config")
+    fetch(cellHref("/api/bts-config", seedToken, seedBaseStation))
       .then(async (response) => {
         const data = (await response.json()) as BtsConfig & { error?: string };
         if (!response.ok || data.error) {
@@ -71,7 +95,7 @@ export default function NewPrlPage() {
     return () => {
       cancelled = true;
     };
-  }, [configRequest]);
+  }, [cellsLoading, configRequest, seedToken, seedBaseStation]);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -188,10 +212,13 @@ export default function NewPrlPage() {
             <RunningSystemPicker
               config={runningConfig}
               selected={selectedCarriers}
-              loading={configLoading}
+              loading={configLoading || cellsLoading}
               error={configError}
               onChange={setSelectedCarriers}
               onRetry={() => setConfigRequest((request) => request + 1)}
+              cells={cells}
+              cell={seedValue}
+              onCellChange={setPickedCell}
             />
           )}
 
@@ -281,6 +308,9 @@ function RunningSystemPicker({
   error,
   onChange,
   onRetry,
+  cells,
+  cell,
+  onCellChange,
 }: {
   config: BtsConfig | null;
   selected: RunningSystemCarrierSelection;
@@ -288,7 +318,35 @@ function RunningSystemPicker({
   error: string | null;
   onChange: (selected: RunningSystemCarrierSelection) => void;
   onRetry: () => void;
+  cells: CellEntry[];
+  cell: string | null;
+  onCellChange: (cell: string) => void;
 }) {
+  const multiBs = new Set(cells.map((c) => c.baseStation)).size > 1;
+  const cellPicker = cells.length > 1 && (
+    <label className="mb-2 flex items-center gap-2">
+      <span className="text-muted">Seed from cell</span>
+      <select
+        value={cell ?? ""}
+        onChange={(event) => onCellChange(event.target.value)}
+        className="glass-input text-xs"
+      >
+        {cells.map((summary) => {
+          const token = cellToken(summary.cell) ?? "";
+          const prefix = multiBs ? `${shortBaseStation(summary.baseStation)} ` : "";
+          return (
+            <option
+              key={cellOptionValue(token, summary.baseStation)}
+              value={cellOptionValue(token, summary.baseStation)}
+            >
+              {`${prefix}${token} · ${attachStateLabel(summary.state)}`}
+            </option>
+          );
+        })}
+      </select>
+    </label>
+  );
+
   if (loading) {
     return (
       <div className="rounded border border-border bg-bg/40 px-3 py-3 text-muted">
@@ -299,6 +357,7 @@ function RunningSystemPicker({
   if (error || !config) {
     return (
       <div className="rounded border border-accent-red/40 bg-accent-red/5 px-3 py-3">
+        {cellPicker}
         <p className="text-accent-red">{error ?? "Running system unavailable."}</p>
         <button
           type="button"
@@ -315,6 +374,7 @@ function RunningSystemPicker({
   return (
     <fieldset className="rounded border border-border bg-bg/40 px-3 py-3">
       <legend className="px-1 text-muted">Include detected carriers</legend>
+      {cellPicker}
       <p className="mb-2 text-muted">
         The generated extended PRL opens in the editor before you publish it.
       </p>

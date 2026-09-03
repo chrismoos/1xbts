@@ -90,7 +90,7 @@ message HardwareIdentityKey {
 // Current serving-node registration state for one subscriber.
 message RegistrationBinding {
   string subscriber_id = 1;
-  string serving_node_id = 2;
+  string serving_bs_id = 2;
   string state = 3;  // "registered", "paged", "page_response_received", "stale"
   optional string imsi = 50;
   optional uint32 esn = 10;
@@ -234,7 +234,7 @@ message ResolveSubscriberByHardwareIdentityResponse {
 // Creates or updates the serving-node registration binding for a subscriber.
 message UpsertRegistrationBindingRequest {
   string subscriber_id = 1;
-  string serving_node_id = 2;
+  string serving_bs_id = 2;
   string state = 3;
   optional string imsi = 50;
   optional uint32 esn = 10;

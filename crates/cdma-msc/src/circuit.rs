@@ -5,8 +5,6 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::runtime::assignment_circuit_identity_code_with_offset;
-
 use cdma_ios::{ProcedureDirection, ProcedureEngine};
 
 use crate::call_control::CallId;
@@ -75,6 +73,18 @@ pub(crate) struct CircuitService {
     /// Reset on successful AssignmentComplete or call cleanup.
     pub(crate) mt_assignment_failure_retries: HashMap<CallId, u8>,
     voice_transcoders: HashMap<(u16, u16), std::sync::Mutex<cdma_voice::VoiceTranscoder>>,
+    /// Next circuit code to try. Codes are MSC-owned and unique among live
+    /// circuits, so two base stations never see the same CIC.
+    next_circuit_id: u16,
+}
+
+/// A packed 16-bit circuit code as the A1 Circuit Identity Code IE carries
+/// it: PCM multiplexer in the high 11 bits, timeslot in the low 5.
+pub(crate) fn circuit_identity_code_from_packed(packed: u16) -> cdma_ios::CircuitIdentityCode {
+    cdma_ios::CircuitIdentityCode {
+        pcm_multiplexer: (packed >> 5) & 0x07ff,
+        timeslot: (packed & 0x1f) as u8,
+    }
 }
 
 impl CircuitService {
@@ -89,6 +99,7 @@ impl CircuitService {
             paging_requests: HashMap::new(),
             mt_assignment_failure_retries: HashMap::new(),
             voice_transcoders: HashMap::new(),
+            next_circuit_id: 1,
         }
     }
 
@@ -166,16 +177,23 @@ impl CircuitService {
         self.active_assignment_legs.contains_key(&call_id)
     }
 
+    /// Allocates the circuit for a call's next leg: the lowest code after the
+    /// previous allocation that no live or pending circuit holds.
     pub(crate) fn assignment_circuit_identity_code_for_next_leg(
-        &self,
-        call_id: CallId,
+        &mut self,
     ) -> cdma_ios::CircuitIdentityCode {
-        let leg_offset = self
-            .circuits
-            .values()
-            .filter(|session| session.call_id == call_id)
-            .count() as u16;
-        assignment_circuit_identity_code_with_offset(call_id, leg_offset)
+        loop {
+            let packed = self.next_circuit_id;
+            self.next_circuit_id = self.next_circuit_id.wrapping_add(1).max(1);
+            let in_use = self.circuits.contains_key(&packed)
+                || self
+                    .pending_assignment_completes
+                    .values()
+                    .any(|pending| *pending == packed);
+            if !in_use {
+                return circuit_identity_code_from_packed(packed);
+            }
+        }
     }
 
     pub(crate) fn queue_assignment_complete_circuit(

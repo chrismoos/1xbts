@@ -5,7 +5,8 @@ import { usePathname } from "next/navigation";
 
 const links = [
   { href: "/", label: "Dashboard" },
-  { href: "/radio", label: "Radio" },
+  { href: "/bts", label: "Cells" },
+  { href: "/base-stations", label: "Base Stations" },
   { href: "/messages", label: "Messages" },
   { href: "/channels", label: "Channels" },
   { href: "/mobiles", label: "Mobiles" },
@@ -13,7 +14,6 @@ const links = [
   { href: "/prls", label: "PRLs" },
   { href: "/smsc", label: "SMSC" },
   { href: "/packets", label: "Packets" },
-  { href: "/config", label: "Config" },
 ];
 
 export function Nav() {

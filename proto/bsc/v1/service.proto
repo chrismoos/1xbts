@@ -153,6 +153,9 @@ message AccessEvent {
   // Decoded r-dsch summary for traffic channel events
   optional string rdsch_summary = 38;
   optional string rdsch_msg_type_name = 39;
+  // Cell that received this message, from the Abis Cell Identifier IE.
+  // Absent when the message reached the BSC without one.
+  optional CellId cell = 48;
 }
 
 // Registration Message fields decoded from the reverse access channel.
@@ -395,6 +398,9 @@ message PagingEvent {
     PagingDataBurst data_burst = 17;
     PagingChannelAssignment channel_assignment = 18;
   }
+  // Cell that transmitted the message. Absent for a message the BSC addressed
+  // to every in-service cell rather than to one of them.
+  optional CellId cell = 4;
 }
 
 // ─── Traffic Events (forward-link) ─────────────────────────────
@@ -423,6 +429,8 @@ message TrafficEvent {
   }
   // Voice call sub-state (e.g. "WaitingServiceConnect", "Alerting", "Connected", "Releasing")
   optional string voice_call_state = 24;
+  // Cell carrying the traffic channel the message went out on.
+  optional CellId cell = 13;
 }
 
 // One service-configuration connection record in a Service Connect message.
@@ -785,6 +793,17 @@ message OverheadConfig {
   // MIN to produce the 15-digit IMSI.
   string mcc_digits = 17;
   string imsi_11_12_digits = 18;
+  // Protocol revision broadcast as P_REV, and the minimum a mobile must
+  // support to be granted service.
+  uint32 p_rev = 19;
+  uint32 min_p_rev = 20;
+  // Broadcast overrides for CDMA_FREQ, EXT_CDMA_FREQ and BAND_CLASS. Absent
+  // means the value is derived from the operating channel plan. Set only when
+  // the broadcast value must differ, as in a handoff redirect to another
+  // carrier.
+  optional uint32 cdma_freq = 21;
+  optional uint32 ext_cdma_freq = 22;
+  optional uint32 band_class_override = 23;
 }
 
 // Configured timezone source for the broadcast LTM_OFF and DAYLT fields.
@@ -808,6 +827,14 @@ message TimezoneStatus {
 }
 
 // ─── Mobiles ────────────────────────────────────────────────────
+
+// Identifies one cell operated by a BTS.
+message CellId {
+  // Cell number broadcast as BASE_ID.
+  uint32 cell = 1;
+  // Sector within the cell.
+  uint32 sector = 2;
+}
 
 // Mobile/subscriber state currently known by the BSC.
 message MobileInfo {
@@ -851,6 +878,9 @@ message MobileInfo {
   optional uint32 traffic_service_option = 21;
   // Voice call sub-state (e.g. "Alerting", "Connected", "Releasing"; absent for non-voice)
   optional string voice_call_state = 22;
+  // Cell serving this mobile, bound from the Abis Cell Identifier on the
+  // access message that registered it. Absent until the mobile is bound.
+  optional CellId serving_cell = 28;
 }
 
 // List of mobiles currently tracked by the BSC.
@@ -950,6 +980,10 @@ message Channel {
   optional uint32 service_option = 9;
   // Closed-loop power control snapshot (traffic channels only).
   optional TrafficChannelPower traffic_power = 10;
+  // Cell operating the channel. Walsh codes come from a per-cell pool, so the
+  // code alone does not identify a channel across cells. Absent for a traffic
+  // channel whose mobile is not bound to a cell yet.
+  optional CellId cell = 11;
 }
 
 // Closed-loop power control snapshot for an active traffic channel —
@@ -1051,6 +1085,10 @@ message PowerControlSample {
 message SetTrafficChannelPowerOverrideRequest {
   // Active traffic channel Walsh code.
   uint32 walsh_code = 1;
+  // Cell carrying the channel. Each cell allocates Walsh codes from its own
+  // pool, so the code alone does not identify a channel. Absent resolves to
+  // the only enrolled cell.
+  optional CellId cell = 4;
 
   oneof action {
     // Pin the reverse inner-loop target to this Eb/Nt value in dB.
@@ -1083,10 +1121,21 @@ message ChannelMobile {
   optional float rx_level_dbfs = 9;
 }
 
-// List of configured and active channels.
+// Walsh code pool size for one cell. Each cell allocates from its own pool.
+message CellWalshCapacity {
+  CellId cell = 1;
+  uint32 total_walsh_codes = 2;
+}
+
+// List of configured and active channels, covering one cell when a BTS answers
+// and every enrolled cell when the BSC does.
 message ChannelList {
   repeated Channel channels = 1;
+  // Walsh code pool size summed over every cell in `cell_walsh_capacity`, so
+  // it counts the same code space the `channels` rows are drawn from.
   uint32 total_walsh_codes = 2;
+  // Per-cell pool size, one entry per cell covered by this list.
+  repeated CellWalshCapacity cell_walsh_capacity = 3;
 }
 
 // ─── Service ────────────────────────────────────────────────────

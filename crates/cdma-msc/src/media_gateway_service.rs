@@ -532,7 +532,7 @@ async fn send_progress_with_signal(
         call_id.0, signal.signal_value
     );
     if let Err(error) = a1
-        .send_to_bsc(EncodedA1Message::from_message_for_call(
+        .send(EncodedA1Message::from_message_for_call(
             &Message::new(MessageType::Progress, payload),
             Some(call_id.0),
         ))
@@ -592,7 +592,7 @@ pub(crate) async fn send_alert_with_information(
         call_id.0
     );
     if let Err(error) = a1
-        .send_to_bsc(EncodedA1Message::from_message_for_call(
+        .send(EncodedA1Message::from_message_for_call(
             &Message::new(MessageType::AlertWithInformation, payload),
             Some(call_id.0),
         ))
@@ -659,7 +659,7 @@ pub(crate) async fn send_gateway_clear_command(
         call_id.0
     );
     if let Err(error) = a1
-        .send_to_bsc(EncodedA1Message::from_message_for_call(
+        .send(EncodedA1Message::from_message_for_call(
             &cdma_ios::Message::new(cdma_ios::MessageType::ClearCommand, payload),
             Some(call_id.0),
         ))
@@ -759,12 +759,41 @@ mod tests {
 
     #[async_trait]
     impl MscA1Endpoint for CapturingA1 {
-        async fn recv_from_bsc(&self) -> Option<EncodedA1Message> {
+        async fn recv(&self) -> Option<crate::base_station::A1Event> {
             None
         }
-        async fn send_to_bsc(&self, message: EncodedA1Message) -> Result<(), A1TransportError> {
+        async fn send(&self, message: EncodedA1Message) -> Result<(), A1TransportError> {
             self.sent.lock().unwrap().push(message);
             Ok(())
+        }
+        async fn send_to_node(
+            &self,
+            _: &crate::base_station::BaseStationId,
+            message: EncodedA1Message,
+        ) -> Result<(), A1TransportError> {
+            self.sent.lock().unwrap().push(message);
+            Ok(())
+        }
+        fn bind_call(&self, _: CallId, _: &crate::base_station::BaseStationId) {}
+        fn release_call(&self, _: CallId) {}
+        fn node_for_call(&self, _: CallId) -> Option<crate::base_station::BaseStationId> {
+            None
+        }
+        fn is_attached(&self, _: &crate::base_station::BaseStationId) -> bool {
+            true
+        }
+        fn served_cell(
+            &self,
+            _: &crate::base_station::BaseStationId,
+            _: cdma_ios::CellId,
+        ) -> Option<crate::base_station::ServedCell> {
+            None
+        }
+        fn serving_imsi_prefix(
+            &self,
+            _: &crate::base_station::BaseStationId,
+        ) -> Option<(String, String)> {
+            None
         }
     }
 

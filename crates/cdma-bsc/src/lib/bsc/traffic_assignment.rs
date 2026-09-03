@@ -25,9 +25,9 @@ use crate::addressing::{
 };
 
 use super::{
-    Bsc, MobileRegistryService, MsState, ServiceNegotiationMode, TrafficChannelInfo,
-    TrafficPowerOverrideAction, TrafficPowerOverrideRequest, VoiceLegRole, VoiceService,
-    traffic_channel_power_snapshot,
+    AccessCellId, Bsc, BtsCellParams, MobileRegistryService, MsState, ServiceNegotiationMode,
+    TrafficChannelInfo, TrafficPowerOverrideAction, TrafficPowerOverrideRequest, VoiceLegRole,
+    VoiceService, traffic_channel_power_snapshot,
 };
 
 #[derive(Default)]
@@ -101,8 +101,13 @@ impl TrafficAssignmentService {
 }
 
 impl Bsc {
-    fn track_assignment_delivery(&mut self, walsh_code: u8, correlation_id: Option<u32>) {
-        self.mobiles.update_tc(walsh_code, |_, tc| {
+    fn track_assignment_delivery(
+        &mut self,
+        cell: AccessCellId,
+        walsh_code: u8,
+        correlation_id: Option<u32>,
+    ) {
+        self.mobiles.update_tc(cell, walsh_code, |_, tc| {
             tc.track_assignment_delivery(correlation_id);
         });
     }
@@ -117,7 +122,9 @@ impl Bsc {
             return false;
         }
 
-        let bts_client = self.config.bts_client.clone();
+        let cell_params = self.serving_params(fwd_address);
+        let cell = cell_params.cell;
+        let bts_client = self.serving_client(fwd_address);
         let ack_deadline = self.access_ack_deadline(event);
 
         let Some(ms) = self.mobiles.get(fwd_address) else {
@@ -140,8 +147,7 @@ impl Bsc {
             match self.traffic_assignment.send_channel_assignment(
                 &self.mobiles,
                 &self.access_tx,
-                self.config.pilot_offset,
-                &self.config.overhead,
+                &cell_params,
                 &self.config.traffic_assignment,
                 fwd_address,
                 last_msg_seq,
@@ -154,7 +160,7 @@ impl Bsc {
                     self.mobiles.update(fwd_address, |ms| {
                         ms.mark_traffic_channel_assigned(walsh_code);
                     });
-                    self.track_assignment_delivery(walsh_code, correlation_id);
+                    self.track_assignment_delivery(cell, walsh_code, correlation_id);
                 }
                 Err(e) => {
                     log::warn!(
@@ -240,13 +246,13 @@ impl Bsc {
         let old_walsh = self
             .mobiles
             .get(fwd_address)
-            .and_then(|ms| ms.current_traffic_walsh());
-        if let Some(old_walsh) = old_walsh {
+            .and_then(|ms| Some((ms.serving_cell?, ms.current_traffic_walsh()?)));
+        if let Some((old_cell, old_walsh)) = old_walsh {
             info!(
                 "BSC: tearing down existing traffic channel walsh={} before SO6 assignment",
                 old_walsh
             );
-            self.teardown_traffic_channel(old_walsh).await;
+            self.teardown_traffic_channel(old_cell, old_walsh).await;
         }
 
         let (walsh_code, assigned_rcs) = self.assign_traffic_channel_to_mobile(
@@ -283,8 +289,7 @@ impl Bsc {
         let assignment = self.traffic_assignment.send_channel_assignment(
             &self.mobiles,
             &self.access_tx,
-            self.config.pilot_offset,
-            &self.config.overhead,
+            &cell_params,
             &self.config.traffic_assignment,
             fwd_address,
             last_msg_seq,
@@ -294,7 +299,7 @@ impl Bsc {
             ack_deadline,
         );
         if let Ok(correlation_id) = &assignment {
-            self.track_assignment_delivery(walsh_code, *correlation_id);
+            self.track_assignment_delivery(cell, walsh_code, *correlation_id);
         }
         if let Err(e) = assignment {
             log::warn!(
@@ -357,8 +362,10 @@ impl Bsc {
             return false;
         }
 
-        let Some(bts_client) = self.config.bts_client.clone() else {
-            log::warn!("BSC: oversize escalation: no BTS client configured");
+        let cell_params = self.serving_params(&fwd_address);
+        let cell = cell_params.cell;
+        let Some(bts_client) = self.serving_client(&fwd_address) else {
+            log::warn!("BSC: oversize escalation: no in-service cell for the mobile");
             return false;
         };
         let esn = ms.esn.unwrap_or(0);
@@ -441,8 +448,7 @@ impl Bsc {
         let assignment = self.traffic_assignment.send_channel_assignment(
             &self.mobiles,
             &self.access_tx,
-            self.config.pilot_offset,
-            &self.config.overhead,
+            &cell_params,
             &self.config.traffic_assignment,
             &fwd_address,
             0,
@@ -452,7 +458,7 @@ impl Bsc {
             None,
         );
         if let Ok(correlation_id) = &assignment {
-            self.track_assignment_delivery(walsh_code, *correlation_id);
+            self.track_assignment_delivery(cell, walsh_code, *correlation_id);
         }
         if let Err(e) = assignment {
             log::warn!(
@@ -477,7 +483,8 @@ impl Bsc {
         // the F-TCH ack tracker with the real msg_seq.
         let pending = self.sms.pending_acks.remove(pos);
         let sms_id = pending.sms_id;
-        self.pending_sms_escalations.insert(walsh_code, pending);
+        self.pending_sms_escalations
+            .insert((cell, walsh_code), pending);
         log::info!(
             "BSC: oversize escalation: SMS {:?} parked on walsh={} pending Service Connect Completion",
             sms_id,
@@ -515,7 +522,9 @@ impl Bsc {
             return false;
         }
 
-        let bts_client = self.config.bts_client.clone();
+        let cell_params = self.serving_params(fwd_address);
+        let cell = cell_params.cell;
+        let bts_client = self.serving_client(fwd_address);
         let ack_deadline = self.access_ack_deadline(event);
 
         let Some(ms) = self.mobiles.get(fwd_address) else {
@@ -534,7 +543,7 @@ impl Bsc {
                 walsh_code,
                 format_ms_address(fwd_address)
             );
-            self.teardown_traffic_channel(walsh_code).await;
+            self.teardown_traffic_channel(cell, walsh_code).await;
         }
 
         let Some(bts_client) = bts_client.as_ref() else {
@@ -622,13 +631,13 @@ impl Bsc {
         let old_walsh = self
             .mobiles
             .get(fwd_address)
-            .and_then(|ms| ms.current_traffic_walsh());
-        if let Some(old_walsh) = old_walsh {
+            .and_then(|ms| Some((ms.serving_cell?, ms.current_traffic_walsh()?)));
+        if let Some((old_cell, old_walsh)) = old_walsh {
             info!(
                 "BSC: tearing down existing traffic channel walsh={} before packet data assignment",
                 old_walsh
             );
-            self.teardown_traffic_channel(old_walsh).await;
+            self.teardown_traffic_channel(old_cell, old_walsh).await;
         }
 
         let (walsh_code, assigned_rcs) = self.assign_traffic_channel_to_mobile(
@@ -668,8 +677,7 @@ impl Bsc {
         let assignment = self.traffic_assignment.send_channel_assignment(
             &self.mobiles,
             &self.access_tx,
-            self.config.pilot_offset,
-            &self.config.overhead,
+            &cell_params,
             &self.config.traffic_assignment,
             fwd_address,
             last_msg_seq,
@@ -679,7 +687,7 @@ impl Bsc {
             ack_deadline,
         );
         if let Ok(correlation_id) = &assignment {
-            self.track_assignment_delivery(walsh_code, *correlation_id);
+            self.track_assignment_delivery(cell, walsh_code, *correlation_id);
         }
         if let Err(e) = assignment {
             log::warn!(
@@ -716,23 +724,28 @@ impl Bsc {
         leg_role: Option<VoiceLegRole>,
         a1_call_id: Option<u64>,
     ) -> Result<(), Error> {
-        let bts_client = self.config.bts_client.clone();
+        let cell_params = self.serving_params(fwd_address);
+        let cell = cell_params.cell;
+        let bts_client = self.serving_client(fwd_address);
         let Some(esn) = self.mobiles.get(fwd_address).map(|ms| ms.esn.unwrap_or(0)) else {
             return Err("mobile no longer registered".into());
         };
         let traffic_lc = LongCodeGenerator::new_traffic_channel(esn);
 
         let old_walsh_and_voice = self.mobiles.get(fwd_address).and_then(|ms| {
-            ms.current_traffic_walsh()
-                .map(|w| (w, ms.traffic_voice_context()))
+            Some((
+                ms.serving_cell?,
+                ms.current_traffic_walsh()?,
+                ms.traffic_voice_context(),
+            ))
         });
-        if let Some((old_walsh, voice_ctx)) = old_walsh_and_voice {
+        if let Some((old_cell, old_walsh, voice_ctx)) = old_walsh_and_voice {
             info!(
                 "BSC: tearing down existing traffic channel walsh={} before new voice allocation",
                 old_walsh
             );
             let (old_session, old_leg) = voice_ctx.unwrap_or((None, None));
-            self.teardown_traffic_channel(old_walsh).await;
+            self.teardown_traffic_channel(old_cell, old_walsh).await;
             self.on_voice_leg_released(old_session, old_leg);
         }
 
@@ -815,8 +828,7 @@ impl Bsc {
         let assignment = self.traffic_assignment.send_channel_assignment(
             &self.mobiles,
             &self.access_tx,
-            self.config.pilot_offset,
-            &self.config.overhead,
+            &cell_params,
             &self.config.traffic_assignment,
             fwd_address,
             ack_msg_seq,
@@ -826,7 +838,7 @@ impl Bsc {
             tx_deadline,
         );
         if let Ok(correlation_id) = &assignment {
-            self.track_assignment_delivery(walsh_code, *correlation_id);
+            self.track_assignment_delivery(cell, walsh_code, *correlation_id);
         }
         if let Err(e) = assignment {
             let bearer = self.config.msc_voice_bearer.clone();
@@ -865,8 +877,7 @@ impl TrafficAssignmentService {
         &self,
         mobiles: &MobileRegistryService,
         access_tx: &super::AccessTx,
-        pilot_offset: usize,
-        overhead: &OverheadParameters,
+        cell_params: &BtsCellParams,
         traffic_config: &crate::config::TrafficAssignmentConfig,
         addr: &MsAddress,
         ack_msg_seq: u8,
@@ -875,6 +886,8 @@ impl TrafficAssignmentService {
         _requested_tx_time: Option<cdma_common::time::CdmaSystemTime>,
         _tx_deadline: Option<cdma_common::time::CdmaSystemTime>,
     ) -> Result<Option<u32>, Error> {
+        let pilot_offset = cell_params.pilot_offset;
+        let overhead = &cell_params.overhead;
         let (
             mob_p_rev,
             for_rcs,
@@ -1049,7 +1062,14 @@ impl TrafficAssignmentService {
         let sdu = message.to_sdu();
 
         let ack_req = msg_id != MessageId::ChannelAssignment;
-        let correlation_id = access_tx.send_directed_fpch(addr, msg_id, message, sdu, ack_req)?;
+        let correlation_id = access_tx.send_directed_fpch(
+            Some(cell_params.cell),
+            addr,
+            msg_id,
+            message,
+            sdu,
+            ack_req,
+        )?;
 
         info!(
             "BSC: sending {} (assign_mode=0b{:03b}, walsh={}, ack_seq={}, ack_req={})",
@@ -1112,6 +1132,7 @@ impl Bsc {
         a1_call_id: Option<u64>,
     ) -> (u8, (u8, u8)) {
         let assigned_rcs = (handle.for_rc, handle.rev_rc);
+        let cell_params = self.serving_params(fwd_address);
         let service_negotiation_mode = self
             .mobiles
             .get(fwd_address)
@@ -1120,21 +1141,21 @@ impl Bsc {
                     ms.mob_p_rev,
                     assigned_rcs,
                     service_option,
-                    self.config.overhead.band_class.unwrap_or(0),
+                    cell_params.overhead.band_class.unwrap_or(0),
                 )
             })
             .unwrap_or(ServiceNegotiationMode::ServiceOptionNegotiation);
         self.traffic_assignment.assign_channel_to_mobile(
             &mut self.mobiles,
             &mut self.voice,
-            &self.config.overhead,
+            &cell_params.overhead,
             fwd_address,
             handle,
             service_option,
             origination_service_option,
             service_ref_id,
             service_negotiation_mode,
-            vec![self.config.pilot_offset as u16],
+            vec![cell_params.pilot_offset as u16],
             session_id,
             leg_role,
             a1_call_id,
@@ -1149,6 +1170,7 @@ impl Bsc {
         req: TrafficPowerOverrideRequest,
     ) {
         let TrafficPowerOverrideRequest {
+            cell,
             walsh_code,
             action,
             response_tx,
@@ -1159,7 +1181,7 @@ impl Bsc {
         ));
         let mut should_publish = false;
 
-        if let Some(snapshot) = self.mobiles.update_tc(walsh_code, |_, tc| {
+        if let Some(snapshot) = self.mobiles.update_tc(cell, walsh_code, |_, tc| {
             match action {
                 TrafficPowerOverrideAction::SetTargetEbNtDb(requested_db) => {
                     let applied_db = tc.power_control.set_manual_target_override_db(requested_db);

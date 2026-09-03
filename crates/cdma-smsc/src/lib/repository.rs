@@ -112,6 +112,16 @@ impl GrpcSmscRepository {
         Self::connect(format!("http://{addr}")).await
     }
 
+    /// Build a repository over a lazy channel: the endpoint is only parsed
+    /// here and the TCP connection is established on the first RPC, so the
+    /// caller starts whether or not the SMSC is already listening.
+    pub fn connect_lazy(endpoint: &str) -> Result<Self, tonic::transport::Error> {
+        let channel = tonic::transport::Endpoint::from_shared(endpoint.to_string())?.connect_lazy();
+        Ok(Self {
+            client: proto::smsc_service_client::SmscServiceClient::new(channel),
+        })
+    }
+
     fn client(&self) -> proto::smsc_service_client::SmscServiceClient<tonic::transport::Channel> {
         self.client.clone()
     }

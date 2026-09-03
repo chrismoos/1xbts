@@ -25,9 +25,9 @@ use crate::addressing::{
 use cdma_common::consts::{SERVICE_OPTION_BASIC_VOICE, SR1_CHIP_RATE_HZ};
 
 use super::{
-    AccessRegistrationUpdate, Bsc, MobileStation, PendingA1AssignmentKind, PendingPage,
-    VoiceLegRole, mark_reverse_regular_msg_seq_received, next_pch_correlation_id,
-    traffic_signaling::reverse_order_code,
+    AccessCellId, AccessRegistrationUpdate, Bsc, BtsRegistry, MobileStation,
+    PendingA1AssignmentKind, PendingPage, VoiceLegRole, mark_reverse_regular_msg_seq_received,
+    next_pch_correlation_id, traffic_signaling::reverse_order_code,
 };
 
 /// Result of an async HLR subscriber lookup, sent back to the BSC run loop.
@@ -46,9 +46,11 @@ pub(crate) struct AccessService;
 /// is cleared before processing the next access PDU.
 pub(crate) const ACCESS_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Forward common-channel transmit side. Every send names the cell it is
+/// destined for. `None` resolves to the sole enrolled cell.
 #[derive(Clone)]
 pub(crate) struct AccessTx {
-    pub(crate) bts_client: Option<Arc<dyn crate::abis_edge::BtsControlClient>>,
+    pub(crate) bts: Arc<BtsRegistry>,
 }
 
 pub(crate) enum AccessDuplicateDecision {
@@ -57,12 +59,13 @@ pub(crate) enum AccessDuplicateDecision {
 }
 
 impl AccessTx {
-    pub(crate) fn new(bts_client: Option<Arc<dyn crate::abis_edge::BtsControlClient>>) -> Self {
-        Self { bts_client }
+    pub(crate) fn new(bts: Arc<BtsRegistry>) -> Self {
+        Self { bts }
     }
 
     pub(crate) fn send_directed_fpch(
         &self,
+        cell: Option<AccessCellId>,
         addr: &MsAddress,
         message_id: MessageId,
         _paging_message: PagingChannelMessage,
@@ -72,12 +75,13 @@ impl AccessTx {
         let wire_msg_type = message_id
             .wire_type(cdma_common::lac::message_types::WireChannel::ForwardCommon)
             .unwrap_or(0);
-        let correlation_id = self.send_pch_for_directed(addr, wire_msg_type, &sdu, ack_req);
+        let correlation_id = self.send_pch_for_directed(cell, addr, wire_msg_type, &sdu, ack_req);
         Ok(correlation_id)
     }
 
     fn send_pch_for_directed(
         &self,
+        cell: Option<AccessCellId>,
         addr: &MsAddress,
         wire_msg_type: u8,
         sdu: &cdma_common::bits::Bitstream,
@@ -103,16 +107,23 @@ impl AccessTx {
             },
             abis_ack_notify: if ack_req { Some(AbisAckNotify) } else { None },
         };
-        if let Some(ref bts_client) = self.bts_client {
-            if let Err(e) = bts_client.send_pch_message(pch) {
-                warn!("BSC: send_pch_message failed: {}", e);
+        match self.bts.control(cell) {
+            Some(bts_client) => {
+                if let Err(e) = bts_client.send_pch_message(pch) {
+                    warn!("BSC: send_pch_message failed: {}", e);
+                }
             }
+            None => warn!(
+                "BSC: no in-service cell for {:?} — dropping F-PCH message",
+                cell
+            ),
         }
         corr_id
     }
 
     pub(crate) fn send_order(
         &self,
+        cell: Option<AccessCellId>,
         addr: &MsAddress,
         ack_msg_seq: u8,
         ack_req: bool,
@@ -130,7 +141,7 @@ impl AccessTx {
         let paging_message = PagingChannelMessage::Order(order_msg.clone());
         let sdu = order_msg.to_sdu();
 
-        self.send_directed_fpch(addr, MessageId::Order, paging_message, sdu, ack_req)?;
+        self.send_directed_fpch(cell, addr, MessageId::Order, paging_message, sdu, ack_req)?;
 
         let req_tx_chip =
             requested_tx_time.map(|t| cdma_common::time::chips_since_epoch(t, 1_228_800));
@@ -144,12 +155,14 @@ impl AccessTx {
 
     pub(crate) fn send_registration_accepted(
         &self,
+        cell: Option<AccessCellId>,
         addr: &MsAddress,
         ack_msg_seq: u8,
         requested_tx_time: Option<cdma_common::time::CdmaSystemTime>,
         tx_deadline: Option<cdma_common::time::CdmaSystemTime>,
     ) -> Result<(), Error> {
         self.send_order(
+            cell,
             addr,
             ack_msg_seq,
             true,
@@ -163,12 +176,14 @@ impl AccessTx {
 
     pub(crate) fn send_bs_ack_order(
         &self,
+        cell: Option<AccessCellId>,
         addr: &MsAddress,
         ack_msg_seq: u8,
         requested_tx_time: Option<cdma_common::time::CdmaSystemTime>,
         tx_deadline: Option<cdma_common::time::CdmaSystemTime>,
     ) -> Result<(), Error> {
         self.send_order(
+            cell,
             addr,
             ack_msg_seq,
             false,
@@ -182,6 +197,7 @@ impl AccessTx {
 
     pub(crate) fn send_release_order(
         &self,
+        cell: Option<AccessCellId>,
         addr: &MsAddress,
         requested_tx_time: Option<cdma_common::time::CdmaSystemTime>,
         tx_deadline: Option<cdma_common::time::CdmaSystemTime>,
@@ -197,6 +213,7 @@ impl AccessTx {
         sdu.write_u8(order_msg.ordq, 8);
 
         let correlation_id = self.send_directed_fpch(
+            cell,
             addr,
             MessageId::Order,
             PagingChannelMessage::Order(order_msg),
@@ -216,12 +233,14 @@ impl AccessTx {
 
     pub(crate) fn send_service_option_rejected_release(
         &self,
+        cell: Option<AccessCellId>,
         addr: &MsAddress,
         ack_msg_seq: u8,
         requested_tx_time: Option<cdma_common::time::CdmaSystemTime>,
         tx_deadline: Option<cdma_common::time::CdmaSystemTime>,
     ) -> Result<(), Error> {
         self.send_order(
+            cell,
             addr,
             ack_msg_seq,
             true,
@@ -294,7 +313,14 @@ impl AccessService {
     pub(crate) async fn handle_access_event(&mut self, bsc: &mut Bsc, event: AccessChannelEvent) {
         // Traffic channel events are routed separately
         if let Some(walsh_code) = event.traffic_walsh_code {
-            bsc.handle_traffic_event(walsh_code, &event).await;
+            let Some(cell) = event.cell else {
+                warn!(
+                    "BSC: traffic event on walsh={} carries no cell identifier, ignoring",
+                    walsh_code
+                );
+                return;
+            };
+            bsc.handle_traffic_event(cell, walsh_code, &event).await;
             return;
         }
 
@@ -370,6 +396,7 @@ impl AccessService {
                     );
                     if event.ack_req {
                         if let Err(e) = bsc.access_tx.send_bs_ack_order(
+                            event.cell,
                             &addr,
                             msg_seq,
                             access_response_tx_time(&event),
@@ -460,17 +487,14 @@ impl AccessService {
         let slot_cycle_index = event.slot_cycle_index.unwrap_or(0);
         let pgslot = compute_pgslot_from_event(event);
 
-        let esp = &bsc
-            .config
-            .paging
-            .message_defaults
-            .extended_system_parameters;
-        let (imsi_mcc, imsi_11_12) = resolve_imsi_overhead(event, esp.mcc, esp.imsi_11_12);
+        let cell_params = bsc.config.bts.params(event.cell);
+        let (imsi_mcc, imsi_11_12) =
+            resolve_imsi_overhead(event, cell_params.mcc, cell_params.imsi_11_12);
         let activity_now = Instant::now();
         let last_heard_ms = event_last_heard_ms(event);
         let registration_imsi = bsc.derive_registration_imsi(event);
 
-        self.apply_registration(
+        let fwd_address = self.apply_registration(
             bsc,
             event,
             AccessRegistrationUpdate {
@@ -487,6 +511,10 @@ impl AccessService {
                 explicit_registration: false,
             },
         );
+
+        // Refresh the HLR binding on any access contact, since the traffic
+        // path never touches it.
+        bsc.resolve_subscriber_from_hlr(event, &fwd_address);
     }
 
     pub(crate) fn handle_registration(&mut self, bsc: &mut Bsc, event: &AccessChannelEvent) {
@@ -498,12 +526,9 @@ impl AccessService {
             }
         };
 
-        let esp = &bsc
-            .config
-            .paging
-            .message_defaults
-            .extended_system_parameters;
-        let (imsi_mcc, imsi_11_12) = resolve_imsi_overhead(event, esp.mcc, esp.imsi_11_12);
+        let cell_params = bsc.config.bts.params(event.cell);
+        let (imsi_mcc, imsi_11_12) =
+            resolve_imsi_overhead(event, cell_params.mcc, cell_params.imsi_11_12);
         let mob_p_rev = event.mob_p_rev.unwrap_or(6);
         let last_msg_seq = event.msg_seq.unwrap_or(0);
         let slot_cycle_index = event.slot_cycle_index.unwrap_or(0);
@@ -544,6 +569,7 @@ impl AccessService {
 
         // Send Registration Accepted Order with ARQ ack piggybacked
         if let Err(e) = bsc.access_tx.send_registration_accepted(
+            event.cell,
             &fwd_address,
             last_msg_seq,
             access_response_tx_time(event),
@@ -579,6 +605,7 @@ impl AccessService {
             let last_msg_seq = event.msg_seq.unwrap_or(0);
             if event.ack_req {
                 if let Err(e) = bsc.access_tx.send_bs_ack_order(
+                    event.cell,
                     &fwd_address,
                     last_msg_seq,
                     access_response_tx_time(event),
@@ -618,6 +645,7 @@ impl AccessService {
         if event.ack_req {
             let last_msg_seq = event.msg_seq.unwrap_or(0);
             if let Err(e) = bsc.access_tx.send_bs_ack_order(
+                event.cell,
                 &fwd_address,
                 last_msg_seq,
                 access_response_tx_time(event),
@@ -628,12 +656,13 @@ impl AccessService {
         }
 
         if let Some(detail) = rejected_assignment {
-            let pending_walsh = bsc
-                .mobiles
-                .get(&fwd_address)
-                .and_then(|mobile| mobile.pending_traffic_assignment())
-                .map(|channel| channel.walsh_code);
-            if let Some(walsh_code) = pending_walsh {
+            let pending_walsh = bsc.mobiles.get(&fwd_address).and_then(|mobile| {
+                Some((
+                    mobile.serving_cell?,
+                    mobile.pending_traffic_assignment()?.walsh_code,
+                ))
+            });
+            if let Some((cell, walsh_code)) = pending_walsh {
                 warn!(
                     "BSC: MS rejected traffic assignment on access channel for {} (REJECTED_TYPE=0x{:02x} ORDQ=0x{:02x}), tearing down walsh={}",
                     format_ms_address(&fwd_address),
@@ -641,7 +670,7 @@ impl AccessService {
                     detail.ordq,
                     walsh_code,
                 );
-                bsc.teardown_traffic_channel(walsh_code).await;
+                bsc.teardown_traffic_channel(cell, walsh_code).await;
             } else {
                 info!(
                     "BSC: MS rejected traffic assignment on access channel for {} without a pending traffic channel",
@@ -684,6 +713,7 @@ impl AccessService {
             if let Some(ref fwd_address) = bsc.extract_fwd_address(event) {
                 let ack_seq = event.msg_seq.unwrap_or(0);
                 if let Err(e) = bsc.access_tx.send_bs_ack_order(
+                    event.cell,
                     fwd_address,
                     ack_seq,
                     access_response_tx_time(event),
@@ -778,6 +808,7 @@ impl AccessService {
 
             if let Err(e) = bsc.sms.send_access_data_burst(
                 &bsc.access_tx,
+                event.cell,
                 &addr,
                 ack_msg_seq,
                 &pending.sms,
@@ -855,6 +886,7 @@ impl AccessService {
                     ack_msg_seq
                 );
                 if let Err(e) = bsc.access_tx.send_bs_ack_order(
+                    event.cell,
                     addr,
                     ack_msg_seq,
                     access_response_tx_time(event),
@@ -884,16 +916,6 @@ impl AccessService {
             format_ms_address(&fwd_address),
             event.service_option
         );
-
-        // Implicit registration: resolve HLR if phone_number not yet known
-        let needs_hlr = bsc
-            .mobiles
-            .get(&fwd_address)
-            .map(|ms| ms.phone_number.is_none())
-            .unwrap_or(true);
-        if needs_hlr {
-            bsc.resolve_subscriber_from_hlr(event, &fwd_address);
-        }
 
         // Update RC capabilities from the origination message (FCH capability record)
         bsc.mobiles
@@ -931,6 +953,7 @@ impl AccessService {
                     format_ms_address(&fwd_address)
                 );
                 if let Err(e) = bsc.access_tx.send_service_option_rejected_release(
+                    event.cell,
                     &fwd_address,
                     last_msg_seq,
                     access_response_tx_time(event),
@@ -982,6 +1005,7 @@ impl AccessService {
             };
             if let Some(a1_kind) = a1_kind {
                 if let Err(e) = bsc.access_tx.send_bs_ack_order(
+                    event.cell,
                     &fwd_address,
                     last_msg_seq,
                     access_response_tx_time(event),
@@ -1011,6 +1035,7 @@ impl AccessService {
                     format_ms_address(&fwd_address)
                 );
                 if let Err(e) = bsc.access_tx.send_service_option_rejected_release(
+                    event.cell,
                     &fwd_address,
                     last_msg_seq,
                     access_response_tx_time(event),
@@ -1039,6 +1064,7 @@ impl AccessService {
                     format_ms_address(&fwd_address)
                 );
                 if let Err(e) = bsc.access_tx.send_service_option_rejected_release(
+                    event.cell,
                     &fwd_address,
                     last_msg_seq,
                     access_response_tx_time(event),
@@ -1069,6 +1095,7 @@ impl AccessService {
             let session_id =
                 bsc.start_msc_controlled_mo_session(&fwd_address, target_so, digits.clone());
             if let Err(e) = bsc.access_tx.send_bs_ack_order(
+                event.cell,
                 &fwd_address,
                 last_msg_seq,
                 access_response_tx_time(event),
@@ -1102,6 +1129,7 @@ impl AccessService {
 
         // Default: send BS Ack Order for other unsupported service options
         if let Err(e) = bsc.access_tx.send_bs_ack_order(
+            event.cell,
             &fwd_address,
             last_msg_seq,
             access_response_tx_time(event),
@@ -1136,12 +1164,13 @@ fn is_voice_origination_service_option(so: u16) -> bool {
 
 impl Bsc {
     async fn teardown_traffic_on_idle_registration(&mut self, addr: &MsAddress) {
-        let Some((walsh_code, call_id, clear_state, voice_session_id, voice_leg_role)) = self
+        let Some((cell, walsh_code, call_id, clear_state, voice_session_id, voice_leg_role)) = self
             .mobiles
             .get(addr)
-            .and_then(|mobile| mobile.traffic_channel())
-            .map(|traffic| {
+            .and_then(|mobile| Some((mobile.serving_cell?, mobile.traffic_channel()?)))
+            .map(|(cell, traffic)| {
                 (
+                    cell,
                     traffic.walsh_code,
                     traffic.a1_call_id,
                     traffic.a1_clear_state,
@@ -1160,20 +1189,23 @@ impl Bsc {
         );
         if let (Some(call_id), super::A1ClearState::Idle) = (call_id, clear_state) {
             self.a1.send_clear_request(call_id, 0);
-            self.mobiles.update_tc(walsh_code, |_, traffic| {
+            self.mobiles.update_tc(cell, walsh_code, |_, traffic| {
                 traffic.mark_a1_clear_request_sent();
             });
         }
-        self.teardown_traffic_channel(walsh_code).await;
+        self.teardown_traffic_channel(cell, walsh_code).await;
         self.on_voice_leg_released(voice_session_id, voice_leg_role);
     }
 
     pub(crate) fn enrich_uplink_event(&self, mut event: AccessChannelEvent) -> AccessChannelEvent {
-        let matched_mobile = if let Some(walsh_code) = event.traffic_walsh_code {
-            self.mobiles.get_by_walsh(walsh_code)
-        } else {
-            self.extract_fwd_address(&event)
-                .and_then(|addr| self.mobiles.get(&addr))
+        let matched_mobile = match (event.traffic_walsh_code, event.cell) {
+            // A traffic event names its channel by Walsh code, which is only
+            // unique within the cell that allocated it.
+            (Some(walsh_code), Some(cell)) => self.mobiles.get_by_walsh(cell, walsh_code),
+            (Some(_), None) => None,
+            (None, _) => self
+                .extract_fwd_address(&event)
+                .and_then(|addr| self.mobiles.get(&addr)),
         };
 
         if let Some(ms) = matched_mobile {
@@ -1236,18 +1268,14 @@ impl Bsc {
     pub(crate) fn extract_fwd_address(&self, event: &AccessChannelEvent) -> Option<MsAddress> {
         if event.imsi_class == Some(0) {
             if let (Some(s1), Some(s2)) = (event.imsi_m_s1, event.imsi_m_s2) {
-                let defaults = &self
-                    .config
-                    .paging
-                    .message_defaults
-                    .extended_system_parameters;
+                let cell_params = self.config.bts.params(event.cell);
                 return Some(select_imsi_class0_forward_address(
                     s1,
                     s2,
                     event.imsi_mcc,
                     event.imsi_11_12,
-                    defaults.mcc,
-                    defaults.imsi_11_12,
+                    cell_params.mcc,
+                    cell_params.imsi_11_12,
                 ));
             }
             warn!("BSC: class-0 IMSI indicated but IMSI_S fields are missing for forward address");
@@ -1370,9 +1398,10 @@ impl Bsc {
             _ => None,
         });
         let a1_client = self.a1.msc_client.clone();
+        let serving_cell = self.serving_params(fwd_address).cell;
         let cell_id = cdma_ios::CellId {
-            cell: self.config.overhead.base_id,
-            sector: 0,
+            cell: serving_cell.cell,
+            sector: serving_cell.sector,
         };
         tokio::spawn(async move {
             let mobile_identity = registration_imsi
@@ -1496,12 +1525,8 @@ impl Bsc {
         let slot_cycle_index = event.slot_cycle_index.unwrap_or(0) as u32;
         let pgslot = compute_pgslot_from_event(event).map(|v| v as u32);
         let fwd_addr = fwd_address.clone();
-        let esp = &self
-            .config
-            .paging
-            .message_defaults
-            .extended_system_parameters;
-        let page_addr = extract_page_address(event, esp.mcc, esp.imsi_11_12);
+        let cell_params = self.config.bts.params(event.cell);
+        let page_addr = extract_page_address(event, cell_params.mcc, cell_params.imsi_11_12);
         let repo = hlr_repo.clone();
         let result_tx = self.hlr_result_tx.clone();
         let node_id = self.config.node_id.clone();
@@ -1531,7 +1556,7 @@ impl Bsc {
 
                     let binding = cdma_hlr::model::RegistrationBinding {
                         subscriber_id: sub_id,
-                        serving_node_id: node_id.clone(),
+                        serving_bs_id: node_id.clone(),
                         state: cdma_hlr::model::RegistrationState::Registered,
                         imsi: registration_imsi.clone(),
                         esn: binding_esn,
@@ -1611,6 +1636,7 @@ impl Bsc {
     pub(crate) fn restore_pending_page(&mut self, mut pending: PendingPage) {
         self.mobiles.mark_page_pending(&pending.fwd_address);
         pending.next_retry_at = self.compute_next_retry_at(
+            self.serving_cell(&pending.fwd_address),
             pending.pgslot,
             pending.slot_cycle_index,
             pending.last_target_chip,
@@ -1650,6 +1676,7 @@ impl Bsc {
         let ack_msg_seq = event.msg_seq.unwrap_or(0);
         if let Err(e) = self.sms.send_access_data_burst(
             &self.access_tx,
+            event.cell,
             fwd_address,
             ack_msg_seq,
             &pending.sms,

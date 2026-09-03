@@ -60,19 +60,16 @@ Full documentation lives at [1xbts.org/docs](https://1xbts.org/docs).
 The stack implements the 3GPP2 1x and HRPD reference paths, with each node able
 to run as its own process and communicate over standard reference points:
 
-- **BTS** (`cdma-bts`) - 1x and HRPD air-interface PHY/MAC, driven by an SDR.
-- **BSC** (`cdma-bsc`) - 1x radio resource management; speaks Abis to the BTS
-  and A21 to the HRPD AN for hybrid-terminal coordination.
-- **AN** (`cdma-an`) - HRPD sessions, UATI assignment, access and traffic
-  handling; speaks A8/A9 to the PCF and A21 to the BSC.
-- **MSC** (`cdma-msc`) - circuit-switched core; speaks A1 to the BSC.
+- **BTS** (`cdma-bts`) - 1x and HRPD air-interface PHY/MAC, driven by an SDR. Hosts the HRPD Access Network (sessions, UATI assignment, A8/A9 to the PCF) when EV-DO is enabled.
+- **BSC** (`cdma-bsc`) - 1x radio resource management for every enrolled BTS, speaking Abis to each.
+- **MSC** (`cdma-msc`) - circuit-switched core. Dials A1 to every base station it is configured with.
 - **HLR** (`cdma-hlr`) - subscriber database (PostgreSQL-backed).
 - **SMSC** (`cdma-smsc`) - short message service center.
 - **PCF** (`cdma-pcf`) - packet control function; HRPD A8/A9 to the AN and
   A10/A11 to the PDSN.
 - **PDSN** (`cdma-pdsn`) - packet data serving node, FoU/TUN packet path.
 - **voice-gw** (`cdma-voice-gw`) - SIP gateway for outbound voice calls (PSTN origination). See [voice gateway setup](https://1xbts.org/docs/guides/voice-gateway/) for trunk + STUN configuration.
-- **NIB** (`cdma-nib`) - network-in-a-box launcher that runs the full stack in one process.
+- **NIB** (`cdma-nib`) - network-in-a-box launcher that builds every network element and runs each as a child process.
 
 ## Prerequisites
 
@@ -212,7 +209,7 @@ Run focused tests while developing:
 ```sh
 cargo test -p cdma-bts
 cargo test -p cdma-bsc
-cargo test -p cdma-an
+cargo test -p cdma-msc
 ```
 
 ### Web Dashboard

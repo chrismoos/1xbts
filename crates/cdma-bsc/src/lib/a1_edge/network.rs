@@ -1,8 +1,13 @@
-//! TCP-backed [`MscClient`] that speaks A1 signaling over TCP transport.
+//! TCP-backed [`MscClient`] that serves A1 signaling to the MSC.
+//!
+//! The MSC initiates A1: it pulls this node's enrollment over gRPC, then
+//! dials the address the enrollment names. The BSC listens and accepts one
+//! MSC at a time, re-accepting after the MSC goes away so an MSC restart does
+//! not strand the cell.
 
 use std::net::SocketAddr;
 
-use log::warn;
+use log::{info, warn};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
@@ -11,159 +16,125 @@ use cdma_ios::{A1TransportError, EncodedA1Message};
 
 use super::MscClient;
 
-/// Network-backed A1 client connecting to an MSC over TCP.
+/// A1 endpoint owning the BSC's listening socket.
 pub struct NetworkMscClient {
-    sender: A1TransportSender,
-    events_rx: Mutex<tokio::sync::mpsc::Receiver<A1TransportEvent>>,
+    listener: TcpListener,
+    sender: Mutex<Option<A1TransportSender>>,
+    events_rx: Mutex<Option<tokio::sync::mpsc::Receiver<A1TransportEvent>>>,
 }
 
 impl NetworkMscClient {
-    /// Connects to an MSC A1 signaling endpoint.
-    pub async fn connect(addr: SocketAddr) -> Result<Self, std::io::Error> {
-        let (sender, events_rx) = cdma_ios::transport::connect(addr).await?;
+    /// Binds the A1 signaling socket. The MSC connection is accepted lazily,
+    /// on the first poll.
+    pub async fn bind(addr: SocketAddr) -> Result<Self, std::io::Error> {
+        let listener = TcpListener::bind(addr).await?;
         Ok(Self {
-            sender,
-            events_rx: Mutex::new(events_rx),
+            listener,
+            sender: Mutex::new(None),
+            events_rx: Mutex::new(None),
         })
     }
 
-    /// Connects with exponential backoff retry.
-    pub async fn connect_with_reconnect(addr: SocketAddr) -> Result<Self, std::io::Error> {
-        let (sender, events_rx) = cdma_ios::transport::connect_with_reconnect(addr).await?;
-        Ok(Self {
-            sender,
-            events_rx: Mutex::new(events_rx),
-        })
+    /// Returns the bound local address.
+    pub fn local_addr(&self) -> Result<SocketAddr, std::io::Error> {
+        self.listener.local_addr()
     }
 
-    /// Wraps an already-established transport pair.
-    pub fn from_transport(
-        sender: A1TransportSender,
-        events_rx: tokio::sync::mpsc::Receiver<A1TransportEvent>,
-    ) -> Self {
-        Self {
-            sender,
-            events_rx: Mutex::new(events_rx),
-        }
+    async fn drop_link(&self) {
+        *self.sender.lock().await = None;
     }
 }
 
 #[tonic::async_trait]
 impl MscClient for NetworkMscClient {
     async fn send_a1(&self, message: EncodedA1Message) -> Result<(), A1TransportError> {
-        self.sender.send(&message).await
+        let sender = self.sender.lock().await.clone();
+        match sender {
+            Some(sender) => sender.send(&message).await,
+            None => Err(A1TransportError::Closed),
+        }
     }
 
     async fn poll_a1(&self) -> Result<Option<EncodedA1Message>, A1TransportError> {
-        let mut rx = self.events_rx.lock().await;
-        match rx.recv().await {
-            Some(A1TransportEvent::Message(msg)) => Ok(Some(msg)),
-            Some(A1TransportEvent::Disconnected(e)) => {
-                warn!("A1 network client: peer disconnected: {e}");
-                Err(A1TransportError::Io(e))
-            }
-            None => Ok(None),
-        }
-    }
-}
-
-/// MSC-side A1 endpoint that accepts a BSC connection.
-pub struct MscA1Endpoint {
-    sender: A1TransportSender,
-    events_rx: Mutex<tokio::sync::mpsc::Receiver<A1TransportEvent>>,
-}
-
-impl MscA1Endpoint {
-    /// Accepts one BSC connection on the given listener.
-    pub async fn accept(listener: &TcpListener) -> Result<Self, std::io::Error> {
-        let (sender, events_rx) = cdma_ios::transport::accept(listener).await?;
-        Ok(Self {
-            sender,
-            events_rx: Mutex::new(events_rx),
-        })
-    }
-
-    /// Accepts with retry on transient errors.
-    pub async fn accept_with_retry(listener: &TcpListener) -> Result<Self, std::io::Error> {
-        let (sender, events_rx) = cdma_ios::transport::accept_with_retry(listener).await?;
-        Ok(Self {
-            sender,
-            events_rx: Mutex::new(events_rx),
-        })
-    }
-
-    /// Wraps an already-established transport pair.
-    pub fn from_transport(
-        sender: A1TransportSender,
-        events_rx: tokio::sync::mpsc::Receiver<A1TransportEvent>,
-    ) -> Self {
-        Self {
-            sender,
-            events_rx: Mutex::new(events_rx),
-        }
-    }
-
-    /// Receives one A1 message from the BSC.
-    pub async fn recv_from_bsc(&self) -> Option<EncodedA1Message> {
-        let mut rx = self.events_rx.lock().await;
+        let mut events_rx = self.events_rx.lock().await;
         loop {
+            if events_rx.is_none() {
+                // Backs off internally and never gives up, so the BSC waits
+                // here for the MSC rather than failing its run loop.
+                let (sender, rx) = cdma_ios::transport::accept_with_retry(&self.listener)
+                    .await
+                    .map_err(A1TransportError::Io)?;
+                info!("BSC accepted A1 signaling connection from MSC");
+                *self.sender.lock().await = Some(sender);
+                *events_rx = Some(rx);
+            }
+            let rx = events_rx.as_mut().expect("A1 link established above");
             match rx.recv().await {
-                Some(A1TransportEvent::Message(msg)) => return Some(msg),
-                Some(A1TransportEvent::Disconnected(e)) => {
-                    warn!("MSC A1 endpoint: BSC disconnected: {e}");
-                    return None;
+                Some(A1TransportEvent::Message(message)) => return Ok(Some(message)),
+                Some(A1TransportEvent::Disconnected(error)) => {
+                    warn!("BSC A1 endpoint: MSC disconnected: {error}, awaiting reconnect");
+                    *events_rx = None;
+                    self.drop_link().await;
                 }
-                None => return None,
+                None => {
+                    warn!("BSC A1 endpoint: transport closed, awaiting reconnect");
+                    *events_rx = None;
+                    self.drop_link().await;
+                }
             }
         }
-    }
-
-    /// Sends one A1 message toward the BSC.
-    pub async fn send_to_bsc(&self, message: EncodedA1Message) -> Result<(), A1TransportError> {
-        self.sender.send(&message).await
-    }
-}
-
-#[async_trait::async_trait]
-impl cdma_msc::MscA1Endpoint for MscA1Endpoint {
-    async fn recv_from_bsc(&self) -> Option<EncodedA1Message> {
-        self.recv_from_bsc().await
-    }
-
-    async fn send_to_bsc(&self, message: EncodedA1Message) -> Result<(), A1TransportError> {
-        self.send_to_bsc(message).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cdma_ios::{ConnectMessage, Message, MessageType};
 
     #[tokio::test]
-    async fn network_msc_client_round_trip() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    async fn accepts_the_msc_and_relays_both_ways() {
+        let client = NetworkMscClient::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = client.local_addr().unwrap();
+        let (msc_sender, mut msc_rx) = cdma_ios::transport::connect(addr).await.unwrap();
 
-        let accept_handle =
-            tokio::spawn(async move { MscA1Endpoint::accept(&listener).await.unwrap() });
-
-        let client = NetworkMscClient::connect(addr).await.unwrap();
-        let endpoint = accept_handle.await.unwrap();
-
-        let outbound = EncodedA1Message::from_message_for_call(
-            &Message::new(MessageType::Connect, ConnectMessage.encode().unwrap()),
-            Some(99),
+        let inbound = cdma_ios::EncodedA1Message::from_message(&cdma_ios::Message::new(
+            cdma_ios::MessageType::PagingRequest,
+            vec![1, 2, 3],
+        ));
+        msc_sender.send(&inbound).await.unwrap();
+        let received = client.poll_a1().await.unwrap().expect("message");
+        assert_eq!(
+            received.message_type(),
+            cdma_ios::MessageType::PagingRequest
         );
 
-        client.send_a1(outbound.clone()).await.unwrap();
-        let received = endpoint.recv_from_bsc().await.unwrap();
-        assert_eq!(received.message_type(), MessageType::Connect);
-        assert_eq!(received.call_id(), Some(99));
+        let outbound = cdma_ios::EncodedA1Message::from_message(&cdma_ios::Message::new(
+            cdma_ios::MessageType::CompleteLayer3Information,
+            vec![9],
+        ));
+        client.send_a1(outbound).await.unwrap();
+        match msc_rx.recv().await {
+            Some(A1TransportEvent::Message(message)) => assert_eq!(
+                message.message_type(),
+                cdma_ios::MessageType::CompleteLayer3Information
+            ),
+            other => panic!("expected a message, got {other:?}"),
+        }
+    }
 
-        endpoint.send_to_bsc(received).await.unwrap();
-        let echoed = client.poll_a1().await.unwrap().unwrap();
-        assert_eq!(echoed.message_type(), MessageType::Connect);
-        assert_eq!(echoed.call_id(), Some(99));
+    #[tokio::test]
+    async fn a_send_before_the_msc_connects_reports_closed() {
+        let client = NetworkMscClient::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let message = cdma_ios::EncodedA1Message::from_message(&cdma_ios::Message::new(
+            cdma_ios::MessageType::PagingRequest,
+            vec![],
+        ));
+        assert!(matches!(
+            client.send_a1(message).await,
+            Err(A1TransportError::Closed)
+        ));
     }
 }

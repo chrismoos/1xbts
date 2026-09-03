@@ -63,10 +63,10 @@ pub fn configured_a8_ipv4_pair(
 ) -> Result<([u8; 4], [u8; 4]), String> {
     let bind = bearer
         .udp_bind_addr
-        .ok_or_else(|| format!("{label} must use udp_encapsulated_gre in cdma-nib"))?;
+        .ok_or_else(|| format!("{label} must use udp_encapsulated_gre"))?;
     let peer = bearer
         .udp_peer_addr
-        .ok_or_else(|| format!("{label} must set udp_peer_addr in cdma-nib"))?;
+        .ok_or_else(|| format!("{label} must set udp_peer_addr"))?;
     Ok((
         socket_ipv4_octets(bind, &format!("{label}.udp_bind_addr"))?,
         socket_ipv4_octets(peer, &format!("{label}.udp_peer_addr"))?,

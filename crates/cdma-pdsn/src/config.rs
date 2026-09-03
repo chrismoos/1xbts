@@ -327,7 +327,9 @@ impl PacketTransportConfig {
 pub struct PdsnNodeConfig {
     /// Packet gRPC listen address for packet service RPCs.
     pub packet_grpc_listen_addr: SocketAddr,
-    /// A10 bearer delivery toward the PCF.
+    /// A10 bearer socket shared by every PCF. Each session's downlink returns
+    /// to the PCF that registered it, so `udp_peer_addr` is optional and only
+    /// supplies the PCF A10 port assumed before a session's first uplink packet.
     #[serde(default = "default_a10_bearer")]
     pub a10_bearer: BearerTransportConfig,
     /// A11 signaling endpoint toward the PCF.
@@ -354,7 +356,9 @@ impl PdsnNodeConfig {
         if self.ppp_session_timeout_secs == 0 {
             return Err("pdsn.ppp_session_timeout_secs must be greater than zero".to_string());
         }
-        self.a10_bearer.validate("pdsn.a10_bearer")?;
+        self.a10_bearer
+            .validate_multi_peer("pdsn.a10_bearer")
+            .map_err(|error| error.to_string())?;
         self.a11.validate("pdsn.a11")?;
         self.a11_security.validate("pdsn.a11_security")?;
         self.packet.validate()?;
@@ -519,8 +523,25 @@ mod tests {
     fn invalid_a10_bearer_config_is_rejected() {
         let mut cfg = test_config();
         cfg.packet.transport = "fou_tcp".to_string();
-        cfg.a10_bearer.udp_peer_addr = None;
+        cfg.a10_bearer.udp_bind_addr = None;
         assert!(cfg.validate().unwrap_err().contains("pdsn.a10_bearer"));
+    }
+
+    #[test]
+    fn a10_bearer_peer_addr_is_optional() {
+        let cfg = test_config_from_json(
+            r#"{
+                "packet_grpc_listen_addr": "127.0.0.1:17021",
+                "a10_bearer": {
+                    "mode": "udp_encapsulated_gre",
+                    "udp_bind_addr": "127.0.0.1:17043"
+                },
+                "packet": { "transport": "fou_tcp", "fou_remote": "127.0.0.1:17012" }
+            }"#,
+        );
+        cfg.validate()
+            .expect("A10 bearer without a default peer should validate");
+        assert!(cfg.a10_bearer.udp_peer_addr.is_none());
     }
 
     #[test]

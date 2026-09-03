@@ -1,8 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { Card } from "@/components/card";
+import { CellSelector } from "@/components/cell-selector";
 import { EvdoCarrierCard } from "@/components/evdo-carrier-card";
 import {
   GetSessionsResponse,
@@ -22,6 +24,12 @@ import {
   mobileLabel,
   useMobileDirectory,
 } from "@/lib/mobile-directory";
+import {
+  cellForColorCode,
+  cellLabel,
+  peerIdForCell,
+} from "@/lib/cell";
+import { useBtsList, usePinnedDefaultCell } from "@/lib/use-bts-list";
 
 interface SessionsResponse {
   sessions?: Session[];
@@ -49,6 +57,19 @@ function stateLabel(state: number): string {
   return sessionStateToJSON(state).replace(/^SESSION_STATE_/, "");
 }
 
+// Threads the cell and base-station scope through to an AN or config API route.
+function anHref(
+  path: string,
+  cell: string | null,
+  baseStation: string | null,
+): string {
+  const query = new URLSearchParams();
+  if (cell) query.set("cell", cell);
+  if (baseStation) query.set("baseStation", baseStation);
+  const suffix = query.toString();
+  return suffix ? `${path}?${suffix}` : path;
+}
+
 function negotiatedSummary(s: Session): string {
   const p = s.protocols;
   if (!p) return "—";
@@ -56,34 +77,59 @@ function negotiatedSummary(s: Session): string {
 }
 
 export default function HrpdPage() {
+  return (
+    <Suspense fallback={null}>
+      <HrpdSessionsView />
+    </Suspense>
+  );
+}
+
+function HrpdSessionsView() {
+  const searchParams = useSearchParams();
+  const requested = searchParams.get("cell");
+  const baseStation = searchParams.get("baseStation");
   const [sessions, setSessions] = useState<Session[]>([]);
   const [packetSessions, setPacketSessions] = useState<PacketSessionInfo[]>([]);
   const [allocation, setAllocation] = useState<GetUatiAllocationResponse | null>(
     null,
   );
   const [evdo, setEvdo] = useState<EvdoCarrierConfig | null>(null);
+  const [evdoReady, setEvdoReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const mobiles = useMobileDirectory();
+  const { cells, loading: cellsLoading } = useBtsList();
 
-  // Carrier config is static at runtime; fetch it once.
+  // The carrier belongs to one cell, so a URL without one waits for the cell
+  // list and then names the default rather than asking for an unnamed cell.
+  const pinnedDefault = usePinnedDefaultCell(cells);
+  const carrierCell = requested ?? pinnedDefault;
+  const carrierAddressed = requested !== null || !cellsLoading;
+
+  // Carrier config is static at runtime; fetch it once per cell.
   useEffect(() => {
+    if (!carrierAddressed) return;
     let cancelled = false;
-    fetch("/api/bts-config")
+    fetch(anHref("/api/bts-config", carrierCell, baseStation))
       .then((r) => r.json())
       .then((data: { evdo?: EvdoCarrierConfig; error?: string }) => {
         if (cancelled || data.error) return;
         setEvdo(data.evdo ?? null);
+        setEvdoReady(true);
       })
       .catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [carrierAddressed, carrierCell, baseStation]);
 
+  // The AN only answers for a cell with EV-DO enabled, so hold the poll until
+  // the carrier config confirms it. Polling a 1x-only cell only yields a
+  // connection error.
   useEffect(() => {
+    if (!evdo) return;
     let cancelled = false;
     const tick = () => {
-      fetch("/api/an-sessions")
+      fetch(anHref("/api/an-sessions", carrierCell, baseStation))
         .then((r) => r.json())
         .then((raw: SessionsResponse) => {
           if (cancelled) return;
@@ -98,7 +144,7 @@ export default function HrpdPage() {
         .catch((e) => {
           if (!cancelled) setError(String(e));
         });
-      fetch("/api/an-uati-allocation")
+      fetch(anHref("/api/an-uati-allocation", carrierCell, baseStation))
         .then((r) => r.json())
         .then((data: GetUatiAllocationResponse & { error?: string }) => {
           if (cancelled || data.error) return;
@@ -119,7 +165,7 @@ export default function HrpdPage() {
       cancelled = true;
       clearInterval(id);
     };
-  }, []);
+  }, [evdo, carrierCell, baseStation]);
 
   const usedPct =
     allocation && allocation.capacity > 0
@@ -129,11 +175,21 @@ export default function HrpdPage() {
   return (
     <div className="p-6 space-y-4">
       <h1 className="text-2xl font-semibold">HRPD Sessions</h1>
-      {error && <div className="text-accent-red text-sm">AN service: {error}</div>}
+      {evdo && error && (
+        <div className="text-accent-red text-sm">AN service: {error}</div>
+      )}
 
+      {/* The carrier is per cell. The sessions below come from the AN. */}
+      <CellSelector selected={carrierCell} />
       <EvdoCarrierCard evdo={evdo} />
 
-      {allocation && (
+      {evdoReady && !evdo && (
+        <Card title="Sessions">
+          <p className="text-sm text-muted">EV-DO not enabled on this cell.</p>
+        </Card>
+      )}
+
+      {evdo && allocation && (
         <Card title="UATI Allocation">
           <div className="space-y-2 text-sm">
             <div className="flex flex-wrap gap-x-6 gap-y-1 font-mono">
@@ -163,12 +219,14 @@ export default function HrpdPage() {
         </Card>
       )}
 
+      {evdo && (
       <Card title={`Sessions (${sessions.length})`}>
         <table className="w-full text-sm">
           <thead className="text-left text-muted">
             <tr>
               <th className="px-3 py-2">UATI</th>
               <th className="px-3 py-2">Color</th>
+              <th className="px-3 py-2">Cell</th>
               <th className="px-3 py-2">State</th>
               <th className="px-3 py-2">Packet Data</th>
               <th className="px-3 py-2">Negotiated</th>
@@ -177,7 +235,7 @@ export default function HrpdPage() {
           <tbody>
             {sessions.length === 0 && (
               <tr>
-                <td className="px-3 py-3 text-muted" colSpan={5}>
+                <td className="px-3 py-3 text-muted" colSpan={6}>
                   No sessions
                 </td>
               </tr>
@@ -189,6 +247,8 @@ export default function HrpdPage() {
               const mobile = packet ? mobileForPacketSession(packet, mobiles) : undefined;
               const label = mobile ? mobileLabel(mobile) : undefined;
               const canonicalUati = formatHrpdFullUati(s.fullUati);
+              const servingCell = cellForColorCode(cells, s.colorCode);
+              const servingPeerId = peerIdForCell(cells, servingCell);
               return (
                 <tr key={s.uati} className="border-t border-border hover:bg-hover">
                   <td className="px-3 py-2 font-mono">
@@ -203,6 +263,18 @@ export default function HrpdPage() {
                     )}
                   </td>
                   <td className="px-3 py-2">{s.colorCode}</td>
+                  <td className="px-3 py-2">
+                    {servingPeerId ? (
+                      <Link
+                        href={`/bts/${encodeURIComponent(servingPeerId)}`}
+                        className="font-mono text-accent-cyan hover:underline"
+                      >
+                        {cellLabel(servingCell)}
+                      </Link>
+                    ) : (
+                      <span className="text-muted">-</span>
+                    )}
+                  </td>
                   <td className="px-3 py-2">{stateLabel(s.state)}</td>
                   <td className="px-3 py-2 text-xs">
                     {packet ? (
@@ -237,6 +309,7 @@ export default function HrpdPage() {
           </tbody>
         </table>
       </Card>
+      )}
     </div>
   );
 }

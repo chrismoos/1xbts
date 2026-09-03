@@ -1,11 +1,16 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { Suspense, useEffect, useState, useCallback } from "react";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { Card } from "@/components/card";
+import { CellSelector } from "@/components/cell-selector";
+import { cellTitle, cellToken, shortBaseStation } from "@/lib/cell";
+import type { CellId } from "@/lib/proto/bsc/v1/service";
 import { radioConfigPairName } from "@/lib/radio-config";
 import { formatPowerFraction } from "@/lib/format";
 import { serviceOptionName } from "@/lib/service-option";
+import { useBtsList, usePinnedDefaultCell } from "@/lib/use-bts-list";
 
 interface ChannelMobile {
   address: string;
@@ -39,11 +44,18 @@ interface Channel {
   mobile?: ChannelMobile;
   serviceOption?: number;
   trafficPower?: TrafficChannelPower;
+  cell?: CellId;
+}
+
+interface CellWalshCapacity {
+  cell?: CellId;
+  totalWalshCodes: number;
 }
 
 interface ChannelListResponse {
   channels: Channel[];
   totalWalshCodes: number;
+  cellWalshCapacity?: CellWalshCapacity[];
   error?: string;
 }
 
@@ -81,6 +93,29 @@ function formatDb(value?: number): string {
 }
 
 export default function ChannelsPage() {
+  return (
+    <Suspense fallback={null}>
+      <ChannelsView />
+    </Suspense>
+  );
+}
+
+function ChannelsView() {
+  const params = useSearchParams();
+  const requested = params.get("cell");
+  const requestedBs = params.get("baseStation") ?? "";
+  const { cells } = useBtsList();
+  // Channels belong to a cell, so the page shows one cell at a time. Resolve
+  // the active cell (requested or the pinned default) and its base station.
+  const pinnedDefault = usePinnedDefaultCell(cells);
+  const activeToken = requested ?? pinnedDefault;
+  const activeCell =
+    cells.find(
+      (c) =>
+        cellToken(c.cell) === activeToken &&
+        (!requestedBs || c.baseStation === requestedBs),
+    ) ?? cells.find((c) => cellToken(c.cell) === activeToken);
+  const baseStation = requestedBs || activeCell?.baseStation || "";
   const [data, setData] = useState<ChannelListResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -90,7 +125,12 @@ export default function ChannelsPage() {
 
   const load = useCallback(async () => {
     try {
-      const res = await fetch("/api/channels");
+      // A base station in the URL scopes the list to its cells. Otherwise show
+      // every base station's channels.
+      const url = baseStation
+        ? `/api/channels?baseStation=${encodeURIComponent(baseStation)}`
+        : "/api/channels";
+      const res = await fetch(url);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
       if (json.error) throw new Error(json.error);
@@ -101,21 +141,31 @@ export default function ChannelsPage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [baseStation]);
 
   const updatePowerDraft = useCallback((walshCode: number, value: string) => {
     setPowerDrafts((prev) => ({ ...prev, [walshCode]: value }));
   }, []);
 
+  // A channel is addressed by (cell, walsh): every cell hands out the same
+  // codes from its own pool. A row without a cell goes out unaddressed, which
+  // the BSC resolves only while one cell is enrolled.
   const applyPowerOverride = useCallback(
-    async (walshCode: number, payload: { targetDb?: number; clear?: boolean }) => {
+    async (channel: Channel, payload: { targetDb?: number; clear?: boolean }) => {
+      const walshCode = channel.walshCode;
+      if (walshCode == null) return;
       setMutatingWalsh(walshCode);
       setMutationError(null);
       try {
         const res = await fetch("/api/channels/power-override", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ walshCode, ...payload }),
+          body: JSON.stringify({
+            walshCode,
+            ...(cellToken(channel.cell) ? { cell: cellToken(channel.cell) } : {}),
+            ...(baseStation ? { baseStation } : {}),
+            ...payload,
+          }),
         });
         const json = await res.json();
         if (!res.ok || !json.accepted) {
@@ -138,7 +188,7 @@ export default function ChannelsPage() {
         setMutatingWalsh((current) => (current === walshCode ? null : current));
       }
     },
-    [load]
+    [load, baseStation]
   );
 
   const handlePin = useCallback(
@@ -152,14 +202,14 @@ export default function ChannelsPage() {
         setMutationError(`invalid target for W${channel.walshCode}`);
         return;
       }
-      await applyPowerOverride(channel.walshCode, { targetDb });
+      await applyPowerOverride(channel, { targetDb });
     },
     [applyPowerOverride, powerDrafts]
   );
 
   const handleClear = useCallback(
-    async (walshCode: number) => {
-      await applyPowerOverride(walshCode, { clear: true });
+    async (channel: Channel) => {
+      await applyPowerOverride(channel, { clear: true });
     },
     [applyPowerOverride]
   );
@@ -170,22 +220,38 @@ export default function ChannelsPage() {
     return () => clearInterval(interval);
   }, [load]);
 
-  const channels = data?.channels ?? [];
+  // A row the BSC could not attribute to a cell stays visible under whichever
+  // cell is selected.
+  const cell = activeToken;
+  const channels = (data?.channels ?? []).filter(
+    (c) => cell == null || !c.cell || cellToken(c.cell) === cell,
+  );
   const fwdChannels = channels.filter((c) => c.direction === "forward");
   const revChannels = channels.filter((c) => c.direction === "reverse");
   const trafficCount = channels.filter((c) => c.channelType === "traffic").length;
   const overheadCount = fwdChannels.filter((c) => c.channelType !== "traffic").length;
+  const walshPool =
+    data?.cellWalshCapacity?.find((entry) => cellToken(entry.cell) === cell)
+      ?.totalWalshCodes ?? data?.totalWalshCodes;
 
   return (
     <div className="max-w-7xl mx-auto space-y-4">
-      <div className="flex items-center gap-4">
+      <div className="flex flex-wrap items-center gap-4">
         <h1 className="text-lg font-bold">Channels</h1>
+        {activeCell?.cell && (
+          <span className="text-sm text-muted font-mono">
+            {cellTitle(activeCell.cell)}
+            {new Set(cells.map((c) => c.baseStation)).size > 1 &&
+              ` · ${shortBaseStation(activeCell.baseStation)}`}
+          </span>
+        )}
+        <CellSelector selected={cell} />
         {data && (
           <div className="flex gap-3 text-xs text-muted">
             <span>{overheadCount} overhead</span>
             <span>{trafficCount} traffic</span>
             <span>{revChannels.length} reverse</span>
-            <span>{data.totalWalshCodes - overheadCount - trafficCount} idle walsh</span>
+            <span>{(walshPool ?? 0) - overheadCount - trafficCount} idle walsh</span>
           </div>
         )}
       </div>
@@ -247,7 +313,7 @@ function ChannelTable({
   mutatingWalsh: number | null;
   onPowerDraftChange: (walshCode: number, value: string) => void;
   onPin: (channel: Channel) => void;
-  onClear: (walshCode: number) => void;
+  onClear: (channel: Channel) => void;
 }) {
   return (
     <div className="overflow-x-auto">
@@ -408,7 +474,7 @@ function ChannelTable({
                       </button>
                       <button
                         type="button"
-                        onClick={() => onClear(ch.walshCode!)}
+                        onClick={() => onClear(ch)}
                         disabled={
                           mutatingWalsh === ch.walshCode ||
                           ch.trafficPower?.manualTargetOverrideDb == null

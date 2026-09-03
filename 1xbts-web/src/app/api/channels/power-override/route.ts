@@ -1,4 +1,5 @@
-import { getBscManagementClient, waitForBscReady } from "@/lib/grpc/client";
+import { getNetworkManagementClient, waitForManagementReady } from "@/lib/grpc/client";
+import { parseCellToken } from "@/lib/cell";
 
 export const dynamic = "force-dynamic";
 
@@ -6,6 +7,8 @@ interface PowerOverrideBody {
   walshCode?: number;
   targetDb?: number;
   clear?: boolean;
+  cell?: string;
+  baseStation?: string;
 }
 
 export async function POST(request: Request) {
@@ -31,12 +34,18 @@ export async function POST(request: Request) {
       );
     }
 
-    await waitForBscReady();
-    const client = getBscManagementClient();
+    await waitForManagementReady();
+    const client = getNetworkManagementClient();
+    // Walsh codes are allocated per cell, so the code alone does not name a
+    // channel once more than one cell is enrolled.
+    const cell = parseCellToken(body.cell);
     const result = await client.setTrafficChannelPowerOverride(
-      clear
-        ? { walshCode, clear: true }
-        : { walshCode, setTargetEbNtDb: targetDb },
+      {
+        selector: { baseStation: body.baseStation ?? "" },
+        request: clear
+          ? { walshCode, cell, clear: true }
+          : { walshCode, cell, setTargetEbNtDb: targetDb },
+      },
       { signal: abort.signal }
     );
 

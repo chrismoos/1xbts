@@ -4,6 +4,8 @@
 pub(crate) mod a1;
 #[allow(dead_code)]
 pub(crate) mod access;
+pub mod bts_attach;
+pub mod bts_registry;
 #[allow(dead_code)]
 pub(crate) mod core;
 #[allow(dead_code)]
@@ -13,6 +15,7 @@ pub mod hrpd_coord;
 pub mod launcher;
 #[allow(dead_code)]
 pub(crate) mod mobiles;
+pub mod node;
 #[allow(dead_code)]
 pub(crate) mod packet;
 #[allow(dead_code)]
@@ -44,11 +47,18 @@ pub(crate) mod voice;
 pub(crate) use a1::PendingA1Assignment;
 pub(crate) use a1::{A1ClearState, A1Service, PendingA1AssignmentKind};
 pub(crate) use access::{AccessService, AccessTx, HlrResolution};
-pub use core::{Bsc, Config};
-pub use launcher::{
-    BscLaunchInputs, BscLaunchParts, build_bsc_launch_parts, connect_configured_bts_client,
+pub use bts_attach::spawn_bts_attach;
+pub use bts_registry::{
+    AccessCellId, BtsAttachState, BtsCellParams, BtsCellSummary, BtsEntry, BtsOamClient,
+    BtsRegistry,
 };
+pub use core::{Bsc, Config};
+pub use launcher::{BscLaunchInputs, BscLaunchParts, build_bsc_launch_parts};
 pub use mobiles::MobileInfo;
+pub use node::{
+    BscNode, BscNodeOptions, connect_hlr_with_backoff, connect_smsc_with_backoff, run_node,
+    start_bsc_node,
+};
 pub use packet::DataCallRequest;
 pub use paging::{PagingEvent, pch_transmit_event_to_paging_event};
 pub use sms::SmsRequest;

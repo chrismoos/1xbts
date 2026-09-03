@@ -6,6 +6,8 @@ import { Card } from "@/components/card";
 import { esnManufacturer } from "@/lib/esn-manufacturer";
 import { formatEsn, formatMeid, formatTimeMs as formatTime } from "@/lib/format";
 import { radioConfigPairName } from "@/lib/radio-config";
+import { cellLabel, peerIdForCell } from "@/lib/cell";
+import { useBtsList } from "@/lib/use-bts-list";
 
 interface MobileInfo {
   address: string;
@@ -34,6 +36,7 @@ interface MobileInfo {
     forwardRadioConfig: number;
     reverseRadioConfig: number;
   };
+  servingCell?: { cell: number; sector: number };
 }
 
 function qualityColor(pct: number): string {
@@ -58,6 +61,7 @@ export default function MobilesPage() {
   const [mobiles, setMobiles] = useState<MobileInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const { cells } = useBtsList();
 
   const fetchMobiles = useCallback(async () => {
     try {
@@ -101,6 +105,7 @@ export default function MobilesPage() {
                   <th className="text-left py-1">Address</th>
                   <th className="text-left py-1">Subscriber</th>
                   <th className="text-left py-1">State</th>
+                  <th className="text-left py-1">Cell</th>
                   <th className="text-left py-1">Traffic</th>
                   <th className="text-right py-1">SNR (dB)</th>
                   <th className="text-right py-1">Rx Level</th>
@@ -114,6 +119,7 @@ export default function MobilesPage() {
                 {mobiles.map((ms, i) => {
                   const id = encodeURIComponent(ms.address);
                   const isHrpd = ms.state.startsWith("HRPD");
+                  const servingPeerId = peerIdForCell(cells, ms.servingCell);
                   return (
                     <tr key={i} className="border-t border-border hover:bg-hover">
                       <td className="py-2 text-secondary font-mono text-xs">
@@ -168,6 +174,18 @@ export default function MobilesPage() {
                         >
                           {ms.state}
                         </span>
+                      </td>
+                      <td className="py-2 font-mono text-xs">
+                        {servingPeerId ? (
+                          <Link
+                            href={`/bts/${encodeURIComponent(servingPeerId)}`}
+                            className="text-secondary hover:text-accent-green transition-colors"
+                          >
+                            {cellLabel(ms.servingCell)}
+                          </Link>
+                        ) : (
+                          <span className="text-dimmed">-</span>
+                        )}
                       </td>
                       <td className="py-2 font-mono text-xs text-secondary">
                         {ms.trafficWalshCode != null ? (

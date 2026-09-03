@@ -1,51 +1,36 @@
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
-use cdma_bts::bts::{
-    BtsCommand, BtsPowerControlRegistry, BtsRuntimeSettings, PchTransmitEvent,
-    RxMetrics as BtsRxMetrics, TxMetrics as BtsTxMetrics,
-};
 use cdma_common::events::AccessChannelEvent;
 use cdma_hlr::repository::HlrRepository;
 use cdma_smsc::repository::SmscRepository;
 use tokio::sync::{broadcast, mpsc, watch};
 
-use crate::abis_edge::BtsControlClient;
 use crate::bsc::{
-    DataCallRequest, MobileInfo, OverheadParameters, PagingEvent, SmsRequest, TrafficEvent,
+    BtsRegistry, DataCallRequest, MobileInfo, PagingEvent, SmsRequest, TrafficEvent,
     TrafficPowerOverrideRequest,
 };
 
 /// Shared state that the gRPC server reads from.
 ///
-/// Created in main.rs, shared between BSC and gRPC handlers via Arc.
+/// Radio state is not held here: each BTS serves `BtsManagementService` for
+/// the cell it operates, and the management service reaches it through the
+/// registry's per-cell OAM client.
 pub struct BscState {
-    pub tx_metrics: watch::Receiver<BtsTxMetrics>,
-    pub rx_metrics: watch::Receiver<BtsRxMetrics>,
-    pub bts_config: Arc<BtsRuntimeSettings>,
-    pub channel: cdma_common::band_class::ChannelPlan,
-    pub tx_center_frequency_hz: usize,
-    pub rx_center_frequency_hz: usize,
-    /// Resolved EV-DO (HRPD) carrier, when EV-DO is enabled.
-    pub evdo: Option<cdma_bts::bts::evdo::ResolvedEvdoConfig>,
-    pub overhead: OverheadParameters,
-    pub timezone: cdma_common::timezone::TimezoneConfig,
-    pub pilot_offset: usize,
+    /// Every BTS this BSC serves, keyed by cell.
+    pub bts: Arc<BtsRegistry>,
     pub access_broadcast: broadcast::Sender<AccessChannelEvent>,
     pub mobiles: watch::Receiver<Vec<MobileInfo>>,
-    pub bts_commands: mpsc::Sender<BtsCommand>,
-    pub bts_power_control: BtsPowerControlRegistry,
-    pub iq_capture_dir: PathBuf,
     pub sms_request_tx: mpsc::Sender<SmsRequest>,
     pub data_request_tx: mpsc::Sender<DataCallRequest>,
     pub power_override_request_tx: mpsc::Sender<TrafficPowerOverrideRequest>,
     pub paging_broadcast: broadcast::Sender<PagingEvent>,
-    pub pch_transmit_broadcast: Option<broadcast::Sender<PchTransmitEvent>>,
     pub traffic_broadcast: broadcast::Sender<TrafficEvent>,
     pub hlr_repo: Arc<dyn HlrRepository>,
     pub smsc_repo: Arc<dyn SmscRepository>,
     pub packet_endpoint: String,
-    pub bts_client: Arc<dyn BtsControlClient>,
     /// Stable node identifier for this BSC instance, used in HLR registrations
     /// and management events. Must be unique across all BSC instances.
     pub node_id: String,
+    /// Address the A1 listener accepts the MSC on, reported at enrollment.
+    pub a1_bind_addr: std::net::SocketAddr,
 }

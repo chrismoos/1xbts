@@ -741,7 +741,7 @@ export interface HardwareIdentityKey {
 /** Current serving-node registration state for one subscriber. */
 export interface RegistrationBinding {
   subscriberId: string;
-  servingNodeId: string;
+  servingBsId: string;
   /** "registered", "paged", "page_response_received", "stale" */
   state: string;
   imsi?: string | undefined;
@@ -902,7 +902,7 @@ export interface ResolveSubscriberByHardwareIdentityResponse {
 /** Creates or updates the serving-node registration binding for a subscriber. */
 export interface UpsertRegistrationBindingRequest {
   subscriberId: string;
-  servingNodeId: string;
+  servingBsId: string;
   state: string;
   imsi?: string | undefined;
   esn?: number | undefined;
@@ -2214,7 +2214,7 @@ export const HardwareIdentityKey: MessageFns<HardwareIdentityKey> = {
 function createBaseRegistrationBinding(): RegistrationBinding {
   return {
     subscriberId: "",
-    servingNodeId: "",
+    servingBsId: "",
     state: "",
     imsi: undefined,
     esn: undefined,
@@ -2234,8 +2234,8 @@ export const RegistrationBinding: MessageFns<RegistrationBinding> = {
     if (message.subscriberId !== "") {
       writer.uint32(10).string(message.subscriberId);
     }
-    if (message.servingNodeId !== "") {
-      writer.uint32(18).string(message.servingNodeId);
+    if (message.servingBsId !== "") {
+      writer.uint32(18).string(message.servingBsId);
     }
     if (message.state !== "") {
       writer.uint32(26).string(message.state);
@@ -2293,7 +2293,7 @@ export const RegistrationBinding: MessageFns<RegistrationBinding> = {
             break;
           }
 
-          message.servingNodeId = reader.string();
+          message.servingBsId = reader.string();
           continue;
         }
         case 3: {
@@ -2400,10 +2400,10 @@ export const RegistrationBinding: MessageFns<RegistrationBinding> = {
         : isSet(object.subscriber_id)
         ? globalThis.String(object.subscriber_id)
         : "",
-      servingNodeId: isSet(object.servingNodeId)
-        ? globalThis.String(object.servingNodeId)
-        : isSet(object.serving_node_id)
-        ? globalThis.String(object.serving_node_id)
+      servingBsId: isSet(object.servingBsId)
+        ? globalThis.String(object.servingBsId)
+        : isSet(object.serving_bs_id)
+        ? globalThis.String(object.serving_bs_id)
         : "",
       state: isSet(object.state) ? globalThis.String(object.state) : "",
       imsi: isSet(object.imsi) ? globalThis.String(object.imsi) : undefined,
@@ -2448,8 +2448,8 @@ export const RegistrationBinding: MessageFns<RegistrationBinding> = {
     if (message.subscriberId !== "") {
       obj.subscriberId = message.subscriberId;
     }
-    if (message.servingNodeId !== "") {
-      obj.servingNodeId = message.servingNodeId;
+    if (message.servingBsId !== "") {
+      obj.servingBsId = message.servingBsId;
     }
     if (message.state !== "") {
       obj.state = message.state;
@@ -2493,7 +2493,7 @@ export const RegistrationBinding: MessageFns<RegistrationBinding> = {
   fromPartial(object: DeepPartial<RegistrationBinding>): RegistrationBinding {
     const message = createBaseRegistrationBinding();
     message.subscriberId = object.subscriberId ?? "";
-    message.servingNodeId = object.servingNodeId ?? "";
+    message.servingBsId = object.servingBsId ?? "";
     message.state = object.state ?? "";
     message.imsi = object.imsi ?? undefined;
     message.esn = object.esn ?? undefined;
@@ -4184,7 +4184,7 @@ export const ResolveSubscriberByHardwareIdentityResponse: MessageFns<ResolveSubs
 function createBaseUpsertRegistrationBindingRequest(): UpsertRegistrationBindingRequest {
   return {
     subscriberId: "",
-    servingNodeId: "",
+    servingBsId: "",
     state: "",
     imsi: undefined,
     esn: undefined,
@@ -4201,8 +4201,8 @@ export const UpsertRegistrationBindingRequest: MessageFns<UpsertRegistrationBind
     if (message.subscriberId !== "") {
       writer.uint32(10).string(message.subscriberId);
     }
-    if (message.servingNodeId !== "") {
-      writer.uint32(18).string(message.servingNodeId);
+    if (message.servingBsId !== "") {
+      writer.uint32(18).string(message.servingBsId);
     }
     if (message.state !== "") {
       writer.uint32(26).string(message.state);
@@ -4251,7 +4251,7 @@ export const UpsertRegistrationBindingRequest: MessageFns<UpsertRegistrationBind
             break;
           }
 
-          message.servingNodeId = reader.string();
+          message.servingBsId = reader.string();
           continue;
         }
         case 3: {
@@ -4334,10 +4334,10 @@ export const UpsertRegistrationBindingRequest: MessageFns<UpsertRegistrationBind
         : isSet(object.subscriber_id)
         ? globalThis.String(object.subscriber_id)
         : "",
-      servingNodeId: isSet(object.servingNodeId)
-        ? globalThis.String(object.servingNodeId)
-        : isSet(object.serving_node_id)
-        ? globalThis.String(object.serving_node_id)
+      servingBsId: isSet(object.servingBsId)
+        ? globalThis.String(object.servingBsId)
+        : isSet(object.serving_bs_id)
+        ? globalThis.String(object.serving_bs_id)
         : "",
       state: isSet(object.state) ? globalThis.String(object.state) : "",
       imsi: isSet(object.imsi) ? globalThis.String(object.imsi) : undefined,
@@ -4367,8 +4367,8 @@ export const UpsertRegistrationBindingRequest: MessageFns<UpsertRegistrationBind
     if (message.subscriberId !== "") {
       obj.subscriberId = message.subscriberId;
     }
-    if (message.servingNodeId !== "") {
-      obj.servingNodeId = message.servingNodeId;
+    if (message.servingBsId !== "") {
+      obj.servingBsId = message.servingBsId;
     }
     if (message.state !== "") {
       obj.state = message.state;
@@ -4403,7 +4403,7 @@ export const UpsertRegistrationBindingRequest: MessageFns<UpsertRegistrationBind
   fromPartial(object: DeepPartial<UpsertRegistrationBindingRequest>): UpsertRegistrationBindingRequest {
     const message = createBaseUpsertRegistrationBindingRequest();
     message.subscriberId = object.subscriberId ?? "";
-    message.servingNodeId = object.servingNodeId ?? "";
+    message.servingBsId = object.servingBsId ?? "";
     message.state = object.state ?? "";
     message.imsi = object.imsi ?? undefined;
     message.esn = object.esn ?? undefined;

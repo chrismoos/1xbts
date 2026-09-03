@@ -1,9 +1,15 @@
-import { createClient } from "nice-grpc";
+import { createChannel, createClient } from "nice-grpc";
 import { SmscServiceDefinition } from "../proto/smsc/v1/service";
+import { coLocatedServiceAddress } from "./client";
 
-// Reuse the same channel as BSC — all services are on the same port
-import { channel } from "./client";
+const SMSC_GRPC_ADDRESS =
+  process.env.SMSC_GRPC_ADDRESS || coLocatedServiceAddress(17020);
+
+const smscChannel = createChannel(SMSC_GRPC_ADDRESS, undefined, {
+  "grpc.initial_reconnect_backoff_ms": 100,
+  "grpc.max_reconnect_backoff_ms": 1000,
+});
 
 export function getSmscClient() {
-  return createClient(SmscServiceDefinition, channel);
+  return createClient(SmscServiceDefinition, smscChannel);
 }

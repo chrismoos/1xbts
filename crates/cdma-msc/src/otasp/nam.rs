@@ -1,10 +1,9 @@
 //! Pure-function NAM block assembly for the OTASP Download Request.
 //!
 //! W fields are sourced from the HLR subscriber (full 15-digit IMSI,
-//! phone number → ACCOLC), the cell's `bts_overhead` (SID, NID,
-//! FIRSTCHP), and `OtaspConfig.nam_defaults` (MT flags). RO/RT
-//! fields are echoed verbatim from the MS Configuration Response
-//! read-back.
+//! phone number → ACCOLC), `OtaspConfig.home_network` (SID, NID), and
+//! `OtaspConfig.nam_defaults` (MT flags). RO/RT fields are echoed
+//! verbatim from the MS Configuration Response read-back.
 //!
 //! IMSI uses `IMSI_M_CLASS = 0` (15-digit IMSI represented as a
 //! 10-digit MIN in `IMSI_M_S`). For class-0 the spec requires
@@ -17,7 +16,7 @@ use cdma_otasp::param::mdn::MobileDirectoryNumber;
 use cdma_otasp::param::nam_cdma::NamCdma;
 use cdma_otasp::param::nam_cdma_analog::{NamCdmaAnalog, SidNidPair};
 
-use crate::config::{BtsOverheadConfig, OtaspConfig};
+use crate::config::{HomeNetworkConfig, OtaspConfig};
 
 /// HLR-provided subscriber facts the session driver hands to NAM assembly.
 #[derive(Debug, Clone)]
@@ -101,7 +100,7 @@ impl std::error::Error for NamAssemblyError {}
 /// Build the four NAM-related parameter blocks. Pure function.
 pub fn assemble_nam(
     hlr: &ResolvedSubscriberInput,
-    bts_overhead: &BtsOverheadConfig,
+    home_network: &HomeNetworkConfig,
     otasp_cfg: &OtaspConfig,
     ms_readback: &NamReadback,
 ) -> Result<AssembledNam, NamAssemblyError> {
@@ -125,8 +124,8 @@ pub fn assemble_nam(
     let accolc = accolc_from_mdn(&hlr.phone_number)
         .ok_or_else(|| NamAssemblyError::InvalidMdn(hlr.phone_number.clone()))?;
 
-    let home_sid = bts_overhead.sid;
-    let nid = bts_overhead.nid;
+    let home_sid = home_network.sid;
+    let nid = home_network.nid;
     // FIRSTCHP is the analog first paging/control channel, not the CDMA
     // paging channel. Use the subscriber override when set, otherwise
     // preserve the value read back from the handset's Configuration
@@ -214,19 +213,14 @@ mod tests {
                 mob_term_for_sid: true,
                 mob_term_for_nid: false,
             },
+            home_network: home_network(),
             mms: MmsConfig::default(),
             writes: OtaspWritesConfig::default(),
         }
     }
 
-    fn bts_overhead() -> BtsOverheadConfig {
-        BtsOverheadConfig {
-            mcc: "310".to_string(),
-            imsi_11_12: "55".to_string(),
-            sid: 22,
-            nid: 1,
-            paging_channel_number: 1,
-        }
+    fn home_network() -> HomeNetworkConfig {
+        HomeNetworkConfig { sid: 22, nid: 1 }
     }
 
     fn hlr() -> ResolvedSubscriberInput {
@@ -254,7 +248,7 @@ mod tests {
 
     #[test]
     fn assemble_produces_valid_blocks() {
-        let nam = assemble_nam(&hlr(), &bts_overhead(), &cfg(), &readback()).unwrap();
+        let nam = assemble_nam(&hlr(), &home_network(), &cfg(), &readback()).unwrap();
         assert_eq!(nam.cdma_analog.mcc_m, 209); // "310" -> 209
         assert_eq!(nam.cdma_analog.imsi_m_11_12, 44); // "55" -> 44
         assert_eq!(nam.cdma_analog.home_sid, 22);
@@ -277,7 +271,7 @@ mod tests {
 
     #[test]
     fn mdn_round_trips_through_codec() {
-        let nam = assemble_nam(&hlr(), &bts_overhead(), &cfg(), &readback()).unwrap();
+        let nam = assemble_nam(&hlr(), &home_network(), &cfg(), &readback()).unwrap();
         let bytes = nam.mdn.encode().unwrap();
         let back = MobileDirectoryNumber::decode(&bytes).unwrap();
         assert_eq!(back, nam.mdn);
@@ -297,7 +291,7 @@ mod tests {
         // rather than the CDMA paging channel.
         let mut rb = readback();
         rb.firstchp = 333;
-        let nam = assemble_nam(&hlr(), &bts_overhead(), &cfg(), &rb).unwrap();
+        let nam = assemble_nam(&hlr(), &home_network(), &cfg(), &rb).unwrap();
         assert_eq!(nam.cdma_analog.firstchp, 333);
     }
 
@@ -307,15 +301,31 @@ mod tests {
         sub.firstchp_override = Some(334);
         let mut rb = readback();
         rb.firstchp = 333;
-        let nam = assemble_nam(&sub, &bts_overhead(), &cfg(), &rb).unwrap();
+        let nam = assemble_nam(&sub, &home_network(), &cfg(), &rb).unwrap();
         assert_eq!(nam.cdma_analog.firstchp, 334);
+    }
+
+    #[test]
+    fn assemble_rejects_an_imsi_that_is_not_15_digits() {
+        let mut h = hlr();
+        h.imsi = "31055512345678".to_string();
+        let err = assemble_nam(&h, &home_network(), &cfg(), &readback()).unwrap_err();
+        assert!(matches!(err, NamAssemblyError::InvalidImsi(_)));
+    }
+
+    #[test]
+    fn assemble_rejects_an_imsi_with_a_non_digit() {
+        let mut h = hlr();
+        h.imsi = "3105551234567x9".to_string();
+        let err = assemble_nam(&h, &home_network(), &cfg(), &readback()).unwrap_err();
+        assert!(matches!(err, NamAssemblyError::InvalidImsi(_)));
     }
 
     #[test]
     fn assemble_rejects_non_digit_mdn() {
         let mut h = hlr();
         h.phone_number = "+1-555-1234".to_string();
-        let err = assemble_nam(&h, &bts_overhead(), &cfg(), &readback()).unwrap_err();
+        let err = assemble_nam(&h, &home_network(), &cfg(), &readback()).unwrap_err();
         assert!(matches!(err, NamAssemblyError::InvalidMdn(_)));
     }
 
@@ -323,7 +333,7 @@ mod tests {
     fn assemble_rejects_overlong_system_tag() {
         let mut c = cfg();
         c.system_tag.name = "X".repeat(50);
-        let err = assemble_nam(&hlr(), &bts_overhead(), &c, &readback()).unwrap_err();
+        let err = assemble_nam(&hlr(), &home_network(), &c, &readback()).unwrap_err();
         assert!(matches!(err, NamAssemblyError::InvalidSystemTag(_)));
     }
 }

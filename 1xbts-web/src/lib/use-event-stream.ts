@@ -36,3 +36,23 @@ export function useSSEConnected(): boolean {
 
   return connected;
 }
+
+export type ConnectionState = "connecting" | "online" | "offline";
+
+// The event stream takes a few seconds to open on a fresh load, so a page
+// starts in "connecting" and only reports "offline" once the grace period
+// passes without a connection. A drop after the grace period is reported right
+// away.
+export function useConnectionState(graceMs = 5000): ConnectionState {
+  const connected = useSSEConnected();
+  const [graceElapsed, setGraceElapsed] = useState(false);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setGraceElapsed(true), graceMs);
+    return () => clearTimeout(timer);
+  }, [graceMs]);
+
+  if (connected) return "online";
+  if (!graceElapsed) return "connecting";
+  return "offline";
+}

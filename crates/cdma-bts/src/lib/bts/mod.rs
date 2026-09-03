@@ -5,8 +5,11 @@ pub mod config;
 pub mod evdo;
 pub mod handle;
 pub mod hrpd;
+pub mod hrpd_an;
 pub mod launcher;
+pub mod management;
 pub mod metrics_service;
+pub mod node;
 pub mod paging_service;
 pub mod paging_supplier;
 pub mod power_control;
@@ -22,11 +25,15 @@ pub mod traffic_setup_service;
 pub use bearer_transport_service::BearerTransportService;
 pub use config::{
     BtsAbisTimers, BtsNodeConfig, RadioConfig, ReverseRxTarget, load_radio_from_path,
+    validate_page_chan_alignment,
 };
 pub use evdo::{EvdoConfig, ResolvedEvdoConfig};
 pub use handle::*;
+pub use hrpd_an::{HrpdAirChannels, HrpdAn, hrpd_derived_imsi_config, spawn_hrpd_an};
 pub use launcher::*;
+pub use management::{BtsManagementServiceImpl, BtsManagementState, spawn_bts_management_service};
 pub use metrics_service::MetricsService;
+pub use node::{BtsCliOverrides, BtsNode, BtsNodeOptions, run_node, start_bts_node};
 pub use paging_service::PagingService;
 pub use paging_supplier::PchTransmitEvent;
 pub use power_control::{BtsPowerControlRegistry, BtsPowerControlSnapshot, BtsPowerControlTick};

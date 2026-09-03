@@ -19,8 +19,8 @@ use crate::addressing::{format_ms_address, is_packet_data_so};
 use crate::voice_bearer_bits::{mux_voice_bits_for_air, pack_voice_bits_for_bearer};
 
 use super::{
-    A1_CLEAR_CAUSE_PAGING_RESPONSE_NOT_RECEIVED, A1ClearState, Bsc, DEFAULT_PAGE_TIMEOUT_MS,
-    MsState, PendingVoicePage, VoicePollAction,
+    A1_CLEAR_CAUSE_PAGING_RESPONSE_NOT_RECEIVED, A1ClearState, AccessCellId, Bsc,
+    DEFAULT_PAGE_TIMEOUT_MS, MsState, PendingVoicePage, VoicePollAction,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +222,7 @@ impl Bsc {
         else {
             return;
         };
+        let cell = target.cell;
         let walsh_code = target.walsh_code;
         if target.release_voice_service_only {
             info!(
@@ -230,16 +231,16 @@ impl Bsc {
                 format_ms_address(fwd_address),
                 reason
             );
-            self.mobiles.update_tc(walsh_code, |_, tc| {
+            self.mobiles.update_tc(cell, walsh_code, |_, tc| {
                 tc.clear_voice_service_connection();
             });
-            if let Err(e) = self.send_service_request(walsh_code, ack_seq) {
+            if let Err(e) = self.send_service_request(cell, walsh_code, ack_seq) {
                 warn!(
                     "BSC: failed to send Service Request removing voice connection on walsh={}: {}",
                     walsh_code, e
                 );
             } else {
-                self.mobiles.update_tc(walsh_code, |_, tc| {
+                self.mobiles.update_tc(cell, walsh_code, |_, tc| {
                     tc.mark_waiting_service_response();
                 });
             }
@@ -254,35 +255,41 @@ impl Bsc {
         );
         if let (Some(call_id), A1ClearState::Idle) = (target.a1_call_id, target.a1_clear_state) {
             self.a1.send_clear_request(call_id, 0);
-            self.mobiles.update_tc(walsh_code, |_, tc| {
+            self.mobiles.update_tc(cell, walsh_code, |_, tc| {
                 tc.mark_a1_clear_request_sent();
             });
         }
-        if let Err(e) = self.send_traffic_release_order(walsh_code, ack_seq) {
+        if let Err(e) = self.send_traffic_release_order(cell, walsh_code, ack_seq) {
             warn!(
                 "BSC: failed to send Release Order on walsh={} during {}: {}",
                 walsh_code, reason, e
             );
         }
-        self.mobiles.update_tc(walsh_code, |_, tc| {
+        self.mobiles.update_tc(cell, walsh_code, |_, tc| {
             tc.mark_releasing();
         });
     }
 
     /// Packet TCHs have no A1 `a1_call_id`, so no A1 ClearRequest is sent.
-    pub(crate) fn release_tch_for_assignment_failure(&mut self, walsh_code: u8, reason: &str) {
+    pub(crate) fn release_tch_for_assignment_failure(
+        &mut self,
+        cell: AccessCellId,
+        walsh_code: u8,
+        reason: &str,
+    ) {
         info!(
             "BSC: releasing walsh={} for MT assignment-failure signal ({})",
             walsh_code, reason
         );
-        if let Err(e) = self.send_traffic_release_order(walsh_code, super::DEFAULT_TRAFFIC_ACK_SEQ)
+        if let Err(e) =
+            self.send_traffic_release_order(cell, walsh_code, super::DEFAULT_TRAFFIC_ACK_SEQ)
         {
             warn!(
                 "BSC: failed to send Release Order on walsh={} during {}: {}",
                 walsh_code, reason, e
             );
         }
-        self.mobiles.update_tc(walsh_code, |_, tc| {
+        self.mobiles.update_tc(cell, walsh_code, |_, tc| {
             tc.mark_releasing();
         });
     }
@@ -341,6 +348,7 @@ impl Bsc {
     /// `send_alert_with_info_signal` to embed a tone.
     pub(crate) fn send_alert_with_info(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         ack_seq: u8,
         calling_party: Option<CallingPartyNumberRecord>,
@@ -357,6 +365,7 @@ impl Bsc {
         );
 
         self.send_traffic_signaling(
+            cell,
             walsh_code,
             sdu,
             MessageId::AlertWithInformation,
@@ -374,6 +383,7 @@ impl Bsc {
     /// DTAP Progress relay).
     pub(crate) fn send_alert_with_info_signal(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         ack_seq: u8,
         signal_info: SignalInfoRecord,
@@ -391,6 +401,7 @@ impl Bsc {
         );
 
         self.send_traffic_signaling(
+            cell,
             walsh_code,
             sdu,
             MessageId::AlertWithInformation,
@@ -409,7 +420,12 @@ impl Bsc {
     /// Per C.S0005-E Annex B call flow: after the answer delay, the BS sends
     /// an AWIM with SIGNAL_TYPE='00' (Tone), SIGNAL='111111' (Tones off) to
     /// stop ringback and transition the MS to conversation.
-    pub(crate) fn send_tones_off(&mut self, walsh_code: u8, ack_seq: u8) -> Result<(), Error> {
+    pub(crate) fn send_tones_off(
+        &mut self,
+        cell: AccessCellId,
+        walsh_code: u8,
+        ack_seq: u8,
+    ) -> Result<(), Error> {
         let awim = AlertWithInformationMessage {
             signal_info: Some(SignalInfoRecord {
                 signal_type: 0x00, // Tone signal ('00')
@@ -426,6 +442,7 @@ impl Bsc {
         );
 
         self.send_traffic_signaling(
+            cell,
             walsh_code,
             sdu,
             MessageId::AlertWithInformation,
@@ -446,16 +463,16 @@ impl Bsc {
     /// - Release timeout
     /// - Guard release for any non-MSC-bridged voice leg
     pub(crate) async fn poll_voice_calls(&mut self) {
-        let voice_policy = self.voice_policy();
-        let service_connect_timeout =
-            Duration::from_millis(voice_policy.service_connect_timeout_ms);
-        let release_timeout = Duration::from_millis(voice_policy.release_timeout_ms);
+        let timeouts = self.voice_timeouts();
+        let service_connect_timeout = Duration::from_millis(timeouts.service_connect_timeout_ms);
+        let release_timeout = Duration::from_millis(timeouts.release_timeout_ms);
 
-        // Walsh codes uniquely identify each active voice traffic channel.
-        let voice_walsh_codes = self.mobiles.active_voice_walsh_codes();
+        // Serving cell and Walsh code together identify each active voice
+        // traffic channel.
+        let voice_channels = self.mobiles.active_voice_channels();
 
-        for voice_walsh in voice_walsh_codes {
-            let context = self.mobiles.get_by_walsh(voice_walsh).and_then(|ms| {
+        for (cell, voice_walsh) in voice_channels {
+            let context = self.mobiles.get_by_walsh(cell, voice_walsh).and_then(|ms| {
                 let action = ms
                     .find_traffic_channel_by_walsh(voice_walsh)?
                     .voice_poll_action(service_connect_timeout, release_timeout);
@@ -484,10 +501,10 @@ impl Bsc {
                     );
                     let (session_id, leg_role) = self
                         .mobiles
-                        .get_by_walsh(voice_walsh)
+                        .get_by_walsh(cell, voice_walsh)
                         .and_then(|ms| ms.traffic_voice_context_by_walsh(voice_walsh))
                         .unwrap_or((None, None));
-                    self.teardown_traffic_channel(voice_walsh).await;
+                    self.teardown_traffic_channel(cell, voice_walsh).await;
                     self.on_voice_leg_released(session_id, leg_role);
                 }
                 VoicePollAction::None => {}
@@ -500,10 +517,9 @@ impl Bsc {
     /// Returns the earliest time at which a voice call state machine needs
     /// attention, or `None` if there are no active voice calls.
     pub(crate) fn next_voice_poll_deadline(&self) -> Option<tokio::time::Instant> {
-        let voice_policy = self.voice_policy();
-        let service_connect_timeout =
-            Duration::from_millis(voice_policy.service_connect_timeout_ms);
-        let release_timeout = Duration::from_millis(voice_policy.release_timeout_ms);
+        let timeouts = self.voice_timeouts();
+        let service_connect_timeout = Duration::from_millis(timeouts.service_connect_timeout_ms);
+        let release_timeout = Duration::from_millis(timeouts.release_timeout_ms);
         // Poll at half-frame intervals when connected so the pre-fill loop
         // keeps the TX queue topped up even if previous polls were delayed.
         let connected_poll_interval = Duration::from_millis(5);
@@ -576,7 +592,8 @@ impl Bsc {
         let Some(rate) = traffic_rate_from_bps(frame.rate_bps) else {
             return;
         };
-        let Some((fwd_address, walsh_code)) = self.mobiles.locate_msc_circuit(frame.circuit_id)
+        let Some((fwd_address, cell, walsh_code)) =
+            self.mobiles.locate_msc_circuit(frame.circuit_id)
         else {
             log::debug!(
                 "BSC: forward bearer frame for unknown circuit_id={}",
@@ -586,7 +603,7 @@ impl Bsc {
         };
         if self
             .mobiles
-            .get_traffic_channel(walsh_code)
+            .get_traffic_channel(cell, walsh_code)
             .is_some_and(|tc| tc.is_releasing())
         {
             log::debug!(
@@ -603,7 +620,7 @@ impl Bsc {
             .unwrap_or(false);
         let waiting_for_mt_connect = self
             .mobiles
-            .get_traffic_channel(walsh_code)
+            .get_traffic_channel(cell, walsh_code)
             .is_some_and(|tc| tc.is_waiting_for_mt_connect_order());
         if waiting_for_mt_connect {
             log::debug!(
@@ -616,14 +633,14 @@ impl Bsc {
         if !voice_connected {
             // Mark connected; tones-off is MSC-driven (Progress{Signal=0x3F}
             // on Connect).
-            self.mobiles.update_tc(walsh_code, |_, tc| {
+            self.mobiles.update_tc(cell, walsh_code, |_, tc| {
                 tc.mark_voice_connected(true);
             });
         }
         let Some((mux_bits, _)) = mux_voice_bits_for_air(&frame.payload, frame.rate_bps) else {
             return;
         };
-        if let Err(e) = self.send_forward_fch_traffic_bits(walsh_code, mux_bits, rate) {
+        if let Err(e) = self.send_forward_fch_traffic_bits(cell, walsh_code, mux_bits, rate) {
             log::warn!(
                 "BSC: failed to relay MSC bearer frame to BTS walsh={}: {}",
                 walsh_code,
@@ -645,6 +662,7 @@ impl Bsc {
     /// so on/off-length sleeps do not block the traffic dispatcher.
     pub(crate) fn play_bdtmfm_sequence(
         &self,
+        cell: AccessCellId,
         walsh_code: u8,
         msg: &cdma_common::access::SendBurstDtmfMessage,
     ) {
@@ -653,7 +671,7 @@ impl Bsc {
         };
         let Some(circuit_id) = self
             .mobiles
-            .get_traffic_channel(walsh_code)
+            .get_traffic_channel(cell, walsh_code)
             .and_then(|tc| tc.msc_circuit_id)
         else {
             log::debug!(
@@ -685,7 +703,13 @@ impl Bsc {
     /// fixed `STOP_DURATION_SAMPLES` on `start = false`. No refresh pump
     /// during the hold, so the SIP-side tone length does not track the MS
     /// hold time.
-    pub(crate) fn emit_continuous_dtmf_order(&self, walsh_code: u8, digit: u8, start: bool) {
+    pub(crate) fn emit_continuous_dtmf_order(
+        &self,
+        cell: AccessCellId,
+        walsh_code: u8,
+        digit: u8,
+        start: bool,
+    ) {
         let Some(event_code) = cdma_ios::DtmfBearerEvent::event_from_cdma_digit(digit) else {
             log::warn!(
                 "BSC: dropping Continuous DTMF Order digit code 0x{:02x} (reserved per Table 2.7.1.3.2.4-4)",
@@ -698,7 +722,7 @@ impl Bsc {
         };
         let Some(circuit_id) = self
             .mobiles
-            .get_traffic_channel(walsh_code)
+            .get_traffic_channel(cell, walsh_code)
             .and_then(|tc| tc.msc_circuit_id)
         else {
             return;
@@ -776,8 +800,8 @@ impl Bsc {
         self.mobiles.has_msc_media_for_session(session_id)
     }
 
-    pub(crate) fn reverse_voice_media_enabled(&self, walsh_code: u8) -> bool {
-        let Some(tc) = self.mobiles.get_traffic_channel(walsh_code) else {
+    pub(crate) fn reverse_voice_media_enabled(&self, cell: AccessCellId, walsh_code: u8) -> bool {
+        let Some(tc) = self.mobiles.get_traffic_channel(cell, walsh_code) else {
             return false;
         };
         !tc.is_releasing()
@@ -787,6 +811,7 @@ impl Bsc {
 
     pub(crate) fn send_standard_alert(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         ack_seq: u8,
         calling_party: Option<CallingPartyNumberRecord>,
@@ -801,6 +826,7 @@ impl Bsc {
         };
         let sdu = awim.to_ftch_sdu();
         self.send_traffic_signaling(
+            cell,
             walsh_code,
             sdu,
             MessageId::AlertWithInformation,
@@ -878,7 +904,9 @@ impl Bsc {
             page_correlation_id: None,
         });
         self.publish_mobiles();
+        let serving_cell = self.serving_cell(&fwd_address);
         match self.send_page_for_voice(
+            serving_cell,
             &page_address,
             pgslot,
             slot_cycle_index,
@@ -888,7 +916,7 @@ impl Bsc {
         ) {
             Ok((target_chip, page_seq, page_correlation_id)) => {
                 let next_retry_at =
-                    self.compute_next_retry_at(pgslot, slot_cycle_index, target_chip);
+                    self.compute_next_retry_at(serving_cell, pgslot, slot_cycle_index, target_chip);
                 self.paging.record_voice_page_sent(
                     &fwd_address,
                     target_chip,

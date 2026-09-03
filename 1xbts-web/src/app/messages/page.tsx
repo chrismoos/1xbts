@@ -42,6 +42,7 @@ import {
   uatiHex,
   uatiHexDigits,
 } from "@/lib/hrpd-correlation";
+import { cellLabel } from "@/lib/cell";
 import { useEventStream } from "@/lib/use-event-stream";
 import { type LogEntry, makeLogEntryId, makeSortKey, sortLogEntries, formatTime } from "@/lib/message-log";
 import type { AccessEvent, PagingEvent, TrafficEvent } from "@/lib/proto/bsc/v1/service";
@@ -343,6 +344,7 @@ export default function MessagesPage() {
                         <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
                         <MobileCell event={entry.event} mobiles={mobiles} />
                         <span className="text-accent-blue font-mono text-xs w-12 shrink-0">1x TX</span>
+                        {entry.event.cell && <span className="text-dimmed font-mono text-xs shrink-0" title="Cell/Sector">{cellLabel(entry.event.cell)}</span>}
                         <span className="text-dimmed text-xs shrink-0">{channel}</span>
                         <span className="text-primary font-medium shrink-0">{typeName}</span>
                         {entry.seenCount > 1 && <span className="text-muted text-xs shrink-0">x{entry.seenCount}</span>}
@@ -385,6 +387,7 @@ export default function MessagesPage() {
                         <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
                         <MobileCell event={entry.event} mobiles={mobiles} />
                         <span className="text-accent-cyan font-mono text-xs w-12 shrink-0">1x TX</span>
+                        {entry.event.cell && <span className="text-dimmed font-mono text-xs shrink-0" title="Cell/Sector">{cellLabel(entry.event.cell)}</span>}
                         <span className="text-dimmed text-xs shrink-0">{channel}</span>
                         <span className="text-primary font-medium shrink-0">{typeName}</span>
                         {entry.seenCount > 1 && <span className="text-muted text-xs shrink-0">x{entry.seenCount}</span>}
@@ -470,6 +473,7 @@ export default function MessagesPage() {
                         <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
                         <MobileCell event={ev} mobiles={mobiles} />
                         <span className="text-accent-green font-mono text-xs w-12 shrink-0">1x RX</span>
+                        {ev.cell && <span className="text-dimmed font-mono text-xs shrink-0" title="Cell/Sector">{cellLabel(ev.cell)}</span>}
                         <span className="text-dimmed text-xs shrink-0">{channel}</span>
                         <span className="text-primary font-medium shrink-0">{formatAccessTypeName(ev)}</span>
                         {entry.seenCount > 1 && <span className="text-muted text-xs shrink-0">x{entry.seenCount}</span>}

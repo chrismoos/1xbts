@@ -11,6 +11,7 @@ description = "Abis control and bearer transport types for 1xBTS BTS/BSC communi
 [dependencies]
 log = "0.4"
 parking_lot = "0.12"
+socket2 = { version = "0.5", features = ["all"] }
 tokio = { version = "1", features = ["net", "io-util", "sync", "macros", "rt", "time"] }
 
 [lib]

@@ -13,7 +13,7 @@ use uuid::Uuid;
 use cdma_hlr::repository::HlrRepository;
 use cdma_ios::{AddsDeliverMessage, AddsTransferMessage, AddsUserPart};
 
-use crate::config::{BtsOverheadConfig, OtaspConfig};
+use crate::config::{HomeNetworkConfig, OtaspConfig};
 use crate::grpc::events_proto::v1 as events_proto;
 use crate::otasp::event::{HardwareIdentity, OtaspEvent};
 use crate::otasp::history::OtaspHistory;
@@ -59,7 +59,7 @@ impl<'a> OtaspTransport for Recorder<'a> {
 /// OTASP session coordinator owned by the MSC runtime.
 pub struct OtaspCoordinator {
     cfg: OtaspConfig,
-    bts_overhead: BtsOverheadConfig,
+    home_network: HomeNetworkConfig,
     hlr: Arc<dyn HlrRepository>,
     sessions: HashMap<SessionKey, SessionEntry>,
     history: Arc<OtaspHistory>,
@@ -170,24 +170,24 @@ fn encode_meid_hex(bytes: &[u8; 7]) -> String {
 impl OtaspCoordinator {
     pub fn new(
         cfg: OtaspConfig,
-        bts_overhead: BtsOverheadConfig,
+        home_network: HomeNetworkConfig,
         hlr: Arc<dyn HlrRepository>,
     ) -> Self {
-        Self::with_history(cfg, bts_overhead, hlr, OtaspHistory::new(), None)
+        Self::with_history(cfg, home_network, hlr, OtaspHistory::new(), None)
     }
 
     /// Construct a coordinator that shares an `OtaspHistory` with management
     /// readers and optionally broadcasts each event to a live event stream.
     pub fn with_history(
         cfg: OtaspConfig,
-        bts_overhead: BtsOverheadConfig,
+        home_network: HomeNetworkConfig,
         hlr: Arc<dyn HlrRepository>,
         history: Arc<OtaspHistory>,
         event_tx: Option<tokio::sync::broadcast::Sender<events_proto::MscNetworkEvent>>,
     ) -> Self {
         Self {
             cfg,
-            bts_overhead,
+            home_network,
             hlr,
             sessions: HashMap::new(),
             history,
@@ -374,7 +374,7 @@ impl OtaspCoordinator {
         };
         let mut session = OtaspSession::new(
             self.cfg.clone(),
-            self.bts_overhead.clone(),
+            self.home_network.clone(),
             device.clone(),
             feature_code,
             actual_service_option,
@@ -617,7 +617,7 @@ impl OtaspCoordinator {
                         &cdma_ios::Message::new(cdma_ios::MessageType::AddsDeliver, payload),
                         Some(call_id),
                     );
-                    if let Err(e) = a1.send_to_bsc(msg).await {
+                    if let Err(e) = a1.send(msg).await {
                         warn!("OTASP: failed to send ADDS Deliver to BSC: {e}");
                     }
                 }

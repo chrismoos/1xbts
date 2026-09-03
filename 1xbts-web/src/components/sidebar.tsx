@@ -2,12 +2,14 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
-import { useSSEConnected } from "@/lib/use-event-stream";
+import { useEffect, useSyncExternalStore } from "react";
+import { useConnectionState } from "@/lib/use-event-stream";
+import { useBaseStations } from "@/lib/use-base-stations";
 
 const links = [
   { href: "/", label: "Dashboard" },
-  { href: "/radio", label: "Radio" },
+  { href: "/bts", label: "Cells" },
+  { href: "/base-stations", label: "Base Stations" },
   { href: "/messages", label: "Messages" },
   { href: "/channels", label: "Channels" },
   { href: "/mobiles", label: "Mobiles" },
@@ -16,7 +18,6 @@ const links = [
   { href: "/smsc", label: "SMSC" },
   { href: "/packets", label: "Packets" },
   { href: "/hrpd", label: "HRPD Sessions" },
-  { href: "/config", label: "Config" },
 ];
 
 type Theme = "dark" | "light";
@@ -77,34 +78,6 @@ function ThemeToggle() {
   );
 }
 
-interface BscStatus {
-  pnOffset?: number;
-  bandClass?: number;
-  cdmaChannel?: number;
-  sid?: number;
-  nid?: number;
-}
-
-function useBscStatus() {
-  const [status, setStatus] = useState<BscStatus | null>(null);
-  const connected = useSSEConnected();
-
-  const fetchStatus = useCallback(() => {
-    fetch("/api/system-status")
-      .then((r) => r.json())
-      .then((data) => { if (!data.error) setStatus(data); })
-      .catch(() => setStatus(null));
-  }, []);
-
-  useEffect(() => {
-    fetchStatus();
-    const interval = setInterval(fetchStatus, 10000);
-    return () => clearInterval(interval);
-  }, [fetchStatus]);
-
-  return { status, connected };
-}
-
 function BrandLogo() {
   const theme = useSidebarTheme();
   return (
@@ -121,7 +94,12 @@ function BrandLogo() {
 
 export function Sidebar() {
   const pathname = usePathname();
-  const { status, connected } = useBscStatus();
+  const connection = useConnectionState();
+  const online = connection === "online";
+  const offline = connection === "offline";
+  const { nodes } = useBaseStations(10000);
+  const cells = nodes.flatMap((node) => node.cells);
+  const inService = cells.filter((cell) => cell.inService).length;
 
   return (
     <aside className="glass-sidebar flex flex-col h-full sticky top-0">
@@ -160,19 +138,21 @@ export function Sidebar() {
       {/* Footer */}
       <div className="px-2 py-3 border-t border-border space-y-1">
         <div className="px-2">
-          <div className={`flex items-center gap-1.5 text-xs font-medium ${connected ? "text-primary" : "text-accent-red"}`}>
+          <div className={`flex items-center gap-1.5 text-xs font-medium ${online ? "text-primary" : offline ? "text-accent-red" : "text-muted"}`}>
             <span
               className={`w-1.5 h-1.5 rounded-full ${
-                connected
+                online
                   ? "bg-live shadow-[0_0_6px_var(--live-color)]"
-                  : "bg-accent-red"
+                  : offline
+                    ? "bg-accent-red"
+                    : "bg-dimmed"
               }`}
             />
-            {connected ? "Online" : "Offline"}
+            {online ? "Online" : offline ? "Offline" : "Connecting"}
           </div>
           <div className="text-[11px] text-dimmed mt-1 font-mono">
-            {status
-              ? `PN ${status.pnOffset ?? "-"} · BC${status.bandClass ?? "-"} CH.${status.cdmaChannel ?? "-"} · SID ${status.sid ?? "-"}`
+            {nodes.length > 0
+              ? `${nodes.length} BS · ${inService}/${cells.length} cells in service`
               : "—"}
           </div>
         </div>

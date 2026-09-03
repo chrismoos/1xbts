@@ -4,9 +4,9 @@ services:
     ports:
       - "${ONEXBTS_WEB_PORT:-3000}:3000"
     environment:
-      MANAGEMENT_GRPC_ADDRESS: ${MANAGEMENT_GRPC_ADDRESS:-host.docker.internal:17016}
       MSC_GRPC_ADDRESS: ${MSC_GRPC_ADDRESS:-host.docker.internal:17017}
-      AN_GRPC_ADDRESS: ${AN_GRPC_ADDRESS:-host.docker.internal:17030}
+      HLR_GRPC_ADDRESS: ${HLR_GRPC_ADDRESS:-host.docker.internal:17019}
+      SMSC_GRPC_ADDRESS: ${SMSC_GRPC_ADDRESS:-host.docker.internal:17020}
       EVENTS_GRPC_ADDRESS: ${EVENTS_GRPC_ADDRESS:-host.docker.internal:17023}
     extra_hosts:
       - "host.docker.internal:host-gateway"

@@ -14,15 +14,20 @@
     "ack_timeout_ms": 3000,
     "max_retries": 5
   },
-  "paging_retry": {
-    "ack_timeout_ms": 15000,
-    "max_retries": 0
+  "voice_timeouts": {
+    "service_connect_timeout_ms": 20000,
+    "release_timeout_ms": 5000
   },
-  "abis": {
-    "remote_addr": "127.0.0.1:5604"
-  },
-  "bearer": {
-    "bind_addr": "127.0.0.1:17022",
-    "remote_addr": "127.0.0.1:17014"
-  }
+  "bts_peers": [
+    {
+      "oam_endpoint": "http://127.0.0.1:17024",
+      "abis_addr": "127.0.0.1:5604",
+      "bearer_bind_addr": "127.0.0.1:17022",
+      "bearer_remote_addr": "127.0.0.1:17014"
+    }
+  ],
+  "a1_bind_addr": "127.0.0.1:17013",
+  "hlr_endpoint": "http://127.0.0.1:17019",
+  "smsc_endpoint": "http://127.0.0.1:17020",
+  "packet_endpoint": "http://127.0.0.1:17021"
 }

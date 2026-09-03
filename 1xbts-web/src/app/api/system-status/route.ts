@@ -1,8 +1,9 @@
-import { getBscManagementClient, waitForBscReady } from "@/lib/grpc/client";
+import { bsRequestFromUrl } from "@/lib/cell";
+import { getNetworkManagementClient, waitForManagementReady } from "@/lib/grpc/client";
 
 export const dynamic = "force-dynamic";
 
-export async function GET() {
+export async function GET(request: Request) {
   const abort = AbortController.prototype
     ? new AbortController()
     : { signal: undefined, abort() {} };
@@ -10,9 +11,11 @@ export async function GET() {
 
   try {
     console.log("[system-status] gRPC call");
-    await waitForBscReady();
-    const client = getBscManagementClient();
-    const status = await client.getBscStatus({}, { signal: abort.signal });
+    await waitForManagementReady();
+    const client = getNetworkManagementClient();
+    const status = await client.getBscStatus(bsRequestFromUrl(request.url), {
+      signal: abort.signal,
+    });
     console.log("[system-status] ok");
     return Response.json(status);
   } catch (err) {

@@ -1,5 +1,6 @@
 //! Traffic-channel event DTOs and telemetry formatting.
 
+use cdma_common::events::AccessCellId;
 use cdma_common::formatting::{bitstream_to_hex, forward_order_name};
 use cdma_common::lac::{
     MessageControlStatusBlock,
@@ -19,6 +20,8 @@ use super::{Bsc, next_bsc_event_id};
 #[derive(Debug, Clone)]
 pub struct TrafficEvent {
     pub event_id: String,
+    /// Cell carrying the traffic channel this message went out on.
+    pub cell: AccessCellId,
     pub walsh_code: u8,
     pub service_option: Option<u16>,
     pub rc_label: Option<String>,
@@ -111,6 +114,7 @@ pub(crate) fn traffic_event_l3_summary(
 impl Bsc {
     pub(crate) fn emit_traffic_tx_event(
         &self,
+        cell: AccessCellId,
         walsh_code: u8,
         service_option: u16,
         rc_label: &str,
@@ -129,6 +133,7 @@ impl Bsc {
         let message_id = mcsb.message_id;
         self.events.publish_traffic_event(TrafficEvent {
             event_id: next_bsc_event_id("traffic"),
+            cell,
             walsh_code,
             service_option: Some(service_option),
             rc_label: Some(rc_label.to_string()),

@@ -49,6 +49,7 @@ fn apply_hrpd_pcf_bearer_command(
     a10_table: &mut cdma_a10::BearerTable,
     a8_to_a10: &mut HashMap<u32, u32>,
     a10_to_a8: &mut HashMap<u32, u32>,
+    a8_peers: &mut HashMap<u32, std::net::SocketAddr>,
 ) {
     match command {
         HrpdPcfBearerCommand::Register { a8, a10 } => {
@@ -80,6 +81,10 @@ fn apply_hrpd_pcf_bearer_command(
                 a10_table.remove_session_if_present(a10_id);
             }
             a8_table.remove_session_if_present(a8_id);
+            // The return address dies with the session, so a later session
+            // reusing this GRE key learns its own access network from its
+            // first packet.
+            a8_peers.remove(&a8_id);
             info!(
                 "HRPD PCF bearer: released A8=0x{a8_id:08x} A10={}",
                 a10_id
@@ -96,11 +101,12 @@ fn drain_hrpd_pcf_bearer_commands(
     a10_table: &mut cdma_a10::BearerTable,
     a8_to_a10: &mut HashMap<u32, u32>,
     a10_to_a8: &mut HashMap<u32, u32>,
+    a8_peers: &mut HashMap<u32, std::net::SocketAddr>,
 ) -> usize {
     let mut drained = 0;
     while let Ok(command) = rx.try_recv() {
         drained += 1;
-        apply_hrpd_pcf_bearer_command(command, a8_table, a10_table, a8_to_a10, a10_to_a8);
+        apply_hrpd_pcf_bearer_command(command, a8_table, a10_table, a8_to_a10, a10_to_a8, a8_peers);
     }
     drained
 }
@@ -125,6 +131,8 @@ pub fn spawn_hrpd_pcf_bearer_relay(
         let mut a10_table = cdma_a10::BearerTable::new();
         let mut a8_to_a10: HashMap<u32, u32> = HashMap::new();
         let mut a10_to_a8: HashMap<u32, u32> = HashMap::new();
+        // Access network each A8 session's traffic arrives from.
+        let mut a8_peers: HashMap<u32, std::net::SocketAddr> = HashMap::new();
         let mut buf = vec![0u8; 8192];
         info!("HRPD PCF A8/A10 bearer relay started");
         loop {
@@ -134,6 +142,7 @@ pub fn spawn_hrpd_pcf_bearer_relay(
                 &mut a10_table,
                 &mut a8_to_a10,
                 &mut a10_to_a8,
+                &mut a8_peers,
             ) > 0;
 
             for _ in 0..HRPD_BEARER_MAX_DATAGRAMS_PER_PASS {
@@ -144,6 +153,7 @@ pub fn spawn_hrpd_pcf_bearer_relay(
                     &mut a10_table,
                     a8_endpoint,
                     &a8_to_a10,
+                    &mut a8_peers,
                     &mut buf,
                 )
                 .await
@@ -158,6 +168,7 @@ pub fn spawn_hrpd_pcf_bearer_relay(
                 &mut a10_table,
                 &mut a8_to_a10,
                 &mut a10_to_a8,
+                &mut a8_peers,
             ) > 0;
             for _ in 0..HRPD_BEARER_MAX_DATAGRAMS_PER_PASS {
                 if !relay_one_a10_to_a8(
@@ -169,6 +180,7 @@ pub fn spawn_hrpd_pcf_bearer_relay(
                     a10_endpoint,
                     &mut a8_to_a10,
                     &mut a10_to_a8,
+                    &mut a8_peers,
                     &mut buf,
                 )
                 .await
@@ -190,6 +202,7 @@ pub fn spawn_hrpd_pcf_bearer_relay(
                             &mut a10_table,
                             &mut a8_to_a10,
                             &mut a10_to_a8,
+                            &mut a8_peers,
                         );
                     }
                     result = a8.readable() => {
@@ -215,10 +228,10 @@ fn recv_udp_gre_packet(
     endpoint: &cdma_a8::TokioUdpGreEndpoint,
     buf: &mut [u8],
     label: &str,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, std::net::SocketAddr)> {
     match endpoint.try_recv_gre_packet(buf) {
-        Ok((packet, _)) => match packet.encode() {
-            Ok(wire) => Some(wire),
+        Ok((packet, from)) => match packet.encode() {
+            Ok(wire) => Some((wire, from)),
             Err(err) => {
                 warn!("{label}: failed to reserialize inbound GRE packet: {err}");
                 None
@@ -247,9 +260,10 @@ async fn relay_one_a8_to_a10(
     a10_table: &mut cdma_a10::BearerTable,
     a8_endpoint: cdma_a8::BearerEndpoint,
     a8_to_a10: &HashMap<u32, u32>,
+    a8_peers: &mut HashMap<u32, std::net::SocketAddr>,
     buf: &mut [u8],
 ) -> bool {
-    let Some(wire) = recv_udp_gre_packet(a8_rx, buf, "HRPD PCF A8") else {
+    let Some((wire, from)) = recv_udp_gre_packet(a8_rx, buf, "HRPD PCF A8") else {
         return false;
     };
     let inbound = match a8_table.decode_for_session(a8_endpoint, &wire) {
@@ -259,6 +273,9 @@ async fn relay_one_a8_to_a10(
             return true;
         }
     };
+    // One PCF serves every access network, so the return path is whichever
+    // one this session's traffic arrives from rather than a configured peer.
+    a8_peers.insert(inbound.session_id, from);
     let Some(a10_session) = a8_to_a10.get(&inbound.session_id).copied() else {
         warn!(
             "HRPD PCF A8: no A10 mapping for A8 session=0x{:08x}",
@@ -288,16 +305,17 @@ async fn relay_one_a10_to_a8(
     a10_endpoint: cdma_a10::BearerEndpoint,
     a8_to_a10: &mut HashMap<u32, u32>,
     a10_to_a8: &mut HashMap<u32, u32>,
+    a8_peers: &mut HashMap<u32, std::net::SocketAddr>,
     buf: &mut [u8],
 ) -> bool {
-    let Some(wire) = recv_udp_gre_packet(a10_rx, buf, "HRPD PCF A10") else {
+    let Some((wire, _)) = recv_udp_gre_packet(a10_rx, buf, "HRPD PCF A10") else {
         return false;
     };
     let inbound = match a10_table.decode_for_session(a10_endpoint, &wire) {
         Ok(inbound) => inbound,
         Err(err) => {
             let drained = drain_hrpd_pcf_bearer_commands(
-                command_rx, a8_table, a10_table, a8_to_a10, a10_to_a8,
+                command_rx, a8_table, a10_table, a8_to_a10, a10_to_a8, a8_peers,
             );
             if drained == 0 {
                 warn!("HRPD PCF A10: bearer packet rejected: {err}");
@@ -328,8 +346,17 @@ async fn relay_one_a10_to_a8(
             return true;
         }
     };
-    if let Err(err) = a8_tx.send_wire_packet(&outbound.wire_bytes).await {
-        warn!("HRPD PCF A8: send failed: {err}");
+    // Send back to the access network this session's traffic came from. Until
+    // one arrives there is nowhere to send, and the configured peer would be
+    // right for only one of them.
+    let Some(peer) = a8_peers.get(&a8_session).copied() else {
+        warn!(
+            "HRPD PCF A8: no access network seen yet for A8 session=0x{a8_session:08x}, dropping"
+        );
+        return true;
+    };
+    if let Err(err) = a8_tx.send_wire_packet_to(&outbound.wire_bytes, peer).await {
+        warn!("HRPD PCF A8: send to {peer} failed: {err}");
     }
     true
 }

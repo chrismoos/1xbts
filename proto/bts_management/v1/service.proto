@@ -5,41 +5,153 @@ import "bsc/v1/service.proto";
 import "google/protobuf/empty.proto";
 
 // BTS-local management API for radio state, capture control, and BTS-originated events.
+//
+// A BTS serves this for the single cell it operates. A BSC serves the same API
+// for every cell enrolled with it, selecting the target with `CellId`, so the
+// same client works against either.
 service BtsManagementService {
+  // Returns the cell identity and radio configuration needed to serve this
+  // BTS. Every call reports the configuration as it stands, so a BTS
+  // restarted with an edited config is picked up on re-enrollment.
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+  // Lists the cells reachable through this endpoint. A BTS reports the single
+  // cell it operates. A BSC reports every enrolled cell.
+  rpc ListBts(google.protobuf.Empty) returns (BtsList);
   // Returns BTS runtime status and configured identity.
-  rpc GetBtsStatus(google.protobuf.Empty) returns (bsc.v1.SystemStatus);
+  rpc GetBtsStatus(CellRequest) returns (bsc.v1.SystemStatus);
   // Returns the active BTS radio and overhead configuration.
-  rpc GetBtsConfig(google.protobuf.Empty) returns (bsc.v1.BtsConfig);
+  rpc GetBtsConfig(CellRequest) returns (bsc.v1.BtsConfig);
   // Returns the latest TX/RX/bearer radio metrics snapshot.
-  rpc GetRadioMetrics(google.protobuf.Empty) returns (bsc.v1.RadioMetrics);
+  rpc GetRadioMetrics(CellRequest) returns (bsc.v1.RadioMetrics);
   // Streams TX/RX/bearer radio metrics as they are updated.
-  rpc StreamRadioMetrics(google.protobuf.Empty) returns (stream bsc.v1.RadioMetrics);
+  rpc StreamRadioMetrics(CellRequest) returns (stream bsc.v1.RadioMetrics);
   // Returns current IQ capture state and output paths.
-  rpc GetIqCaptureStatus(google.protobuf.Empty) returns (bsc.v1.IqCaptureStatus);
+  rpc GetIqCaptureStatus(CellRequest) returns (bsc.v1.IqCaptureStatus);
   // Starts a BTS-side IQ capture using the configured capture directory.
-  rpc StartIqCapture(google.protobuf.Empty) returns (bsc.v1.IqCaptureStatus);
+  rpc StartIqCapture(CellRequest) returns (bsc.v1.IqCaptureStatus);
   // Stops the active BTS-side IQ capture, if any.
-  rpc StopIqCapture(google.protobuf.Empty) returns (bsc.v1.IqCaptureStatus);
+  rpc StopIqCapture(CellRequest) returns (bsc.v1.IqCaptureStatus);
   // Lists local pilot, sync, paging, access, and traffic resources.
-  rpc ListLocalRadioResources(google.protobuf.Empty) returns (bsc.v1.ChannelList);
+  rpc ListLocalRadioResources(CellRequest) returns (bsc.v1.ChannelList);
   // Returns reverse closed-loop power control state for one traffic Walsh code.
   rpc GetReversePowerControl(ReversePowerControlRequest) returns (bsc.v1.TrafficChannelPower);
   // Lists reverse closed-loop power control state for active traffic channels.
-  rpc ListReversePowerControls(google.protobuf.Empty) returns (ReversePowerControlList);
+  rpc ListReversePowerControls(CellRequest) returns (ReversePowerControlList);
   // Applies or clears a manual reverse power-control target override.
   rpc SetReversePowerControlOverride(bsc.v1.SetTrafficChannelPowerOverrideRequest) returns (bsc.v1.SetTrafficChannelPowerOverrideResponse);
   // Streams BTS-emitted paging-channel transmissions.
-  rpc StreamPchTransmissions(google.protobuf.Empty) returns (stream bsc.v1.PagingEvent);
+  rpc StreamPchTransmissions(CellRequest) returns (stream bsc.v1.PagingEvent);
 }
 
-// Selects an active traffic channel by Walsh code.
+// Addresses one BTS. Clients set `peer_id` (the stable id from bts_peers) and
+// the BSC resolves it to the peer's cell. `cell` is the internal key the BSC
+// forwards to the BTS.
+message CellRequest {
+  optional bsc.v1.CellId cell = 1;
+  optional string peer_id = 2;
+}
+
+// Requests the cell identity and radio configuration for a BTS.
+message EnrollRequest {}
+
+// Cell identity and radio configuration supplied by a BTS at attach.
+message EnrollResponse {
+  // Identity this BTS serves. Keys the BSC's registry.
+  bsc.v1.CellId cell = 1;
+  // Radio and overhead configuration the BSC uses for call control.
+  bsc.v1.BtsConfig config = 2;
+  // Reverse-link power reference, when the radio is calibrated. Absent leaves
+  // reported Rx levels relative rather than absolute.
+  optional double rx_reference_dbm = 3;
+
+  // Address this cell's HRPD access network serves its session and UATI API
+  // on. Absent when the cell runs no EV-DO carrier.
+  optional string an_grpc_addr = 4;
+  // Paging retransmission budget this BTS applies on the paging channel. The
+  // BSC schedules its own timers against the same values so the two agree on
+  // how long a page is outstanding.
+  PagingRetryConfig paging_retry = 5;
+}
+
+// Paging channel retransmission budget.
+message PagingRetryConfig {
+  // How long the BTS waits for a layer 2 acknowledgment before resending.
+  uint32 ack_timeout_ms = 1;
+  // Resends before the page is abandoned.
+  uint32 max_retries = 2;
+}
+
+// How far a cell has progressed toward carrying traffic.
+enum BtsAttachState {
+  BTS_ATTACH_STATE_UNSPECIFIED = 0;
+  // Configured but not reachable.
+  BTS_ATTACH_STATE_DISCONNECTED = 1;
+  // Configuration retrieved, Abis signaling not yet established.
+  BTS_ATTACH_STATE_ENROLLED = 2;
+  // Enrolled with Abis signaling up. Carries traffic.
+  BTS_ATTACH_STATE_IN_SERVICE = 3;
+}
+
+// One cell, summarized for enumeration.
+message BtsSummary {
+  // Stable opaque id from the BSC's bts_peers config. Present for every
+  // configured peer, including one that has not enrolled, so the client keys
+  // rows by it rather than by the cell a peer only has once in service.
+  string peer_id = 12;
+  // OAM endpoint the BSC reaches this peer at, shown for an offline peer that
+  // has no cell identity yet.
+  string management_endpoint = 13;
+  // Cell identity, present only once the peer is in service.
+  optional bsc.v1.CellId cell = 1;
+  BtsAttachState state = 2;
+  // Pilot PN offset in 64-chip units.
+  uint32 pilot_pn = 3;
+  // Band class label, e.g. "BC0".
+  string band_class = 4;
+  uint32 cdma_channel = 5;
+  uint32 sid = 6;
+  uint32 nid = 7;
+  bool evdo_enabled = 8;
+  // Mobiles registered to this cell. Absent from a BTS answering for itself,
+  // which does not track registration.
+  optional uint32 served_mobiles = 9;
+  // Why the cell is not in service, when it is not.
+  optional string status_detail = 10;
+  // Color code this cell's HRPD sector advertises. It is the top byte of the
+  // on-air access terminal identifier, so it ties an HRPD session back to the
+  // cell that issued its UATI. Absent when the cell runs no EV-DO carrier.
+  optional uint32 evdo_color_code = 11;
+  // Address this cell's HRPD access network serves its session and UATI API
+  // on. The management front door reads HRPD sessions from here. Absent when
+  // the cell runs no EV-DO carrier.
+  optional string an_grpc_addr = 14;
+}
+
+// Cells reachable through this endpoint.
+message BtsList {
+  repeated BtsSummary bts = 1;
+}
+
+// Selects an active traffic channel by Walsh code on one cell.
 message ReversePowerControlRequest {
   // Forward traffic-channel Walsh code assigned to the mobile.
   uint32 walsh_code = 1;
+  optional bsc.v1.CellId cell = 2;
+}
+
+// Reverse power-control state for one active traffic channel.
+message ReversePowerControlEntry {
+  // Forward traffic-channel Walsh code the state belongs to.
+  uint32 walsh_code = 1;
+  bsc.v1.TrafficChannelPower power = 2;
 }
 
 // Collection of reverse power-control snapshots for active traffic channels.
 message ReversePowerControlList {
-  // One snapshot per active traffic channel.
-  repeated bsc.v1.TrafficChannelPower power_controls = 1;
+  // Field 1 carried a different element type in an earlier release.
+  reserved 1;
+  reserved "power_controls";
+  // One entry per active traffic channel, keyed by Walsh code so a caller can
+  // join the whole cell in one request.
+  repeated ReversePowerControlEntry entries = 2;
 }

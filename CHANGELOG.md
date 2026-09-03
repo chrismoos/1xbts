@@ -1,5 +1,29 @@
 # HEAD
 
+- The stack now runs as separate components, with one MSC serving multiple Base Stations, each a BSC with multiple cells, and the web managing the whole network through the MSC. The PDSN supports multiple PCFs.
+  Migration:
+  - `config/msc.json`:
+    - Remove `a1_listen_addr` and `a1_peers`.
+    - Add `base_stations`, one entry per base station giving its `management_endpoint` (the BSC's management gRPC address, e.g. `http://127.0.0.1:17016`) and an optional stable `id`.
+    - Add `packet_endpoint` (the PDSN packet gRPC address, e.g. `http://127.0.0.1:17021`).
+    - Add `hlr_endpoint` and `smsc_endpoint`.
+    - Add an `otasp.home_network` block with `sid` and `nid` matching what your cells broadcast, or handsets will think they are roaming.
+    - Remove `voice.release_timeout_ms` and `voice.service_connect_timeout_ms`, now `voice_timeouts` in `config/bsc.json`.
+  - `config/bsc.json`:
+    - Replace the `abis` and `bearer` blocks with a `bts_peers` list, one entry per cell giving `oam_endpoint`, `abis_addr`, `bearer_bind_addr` and `bearer_remote_addr`, and an optional stable `id`.
+    - Add `a1_bind_addr`, the address the BSC listens for the MSC on.
+    - Add `hlr_endpoint`, `smsc_endpoint`, and `packet_endpoint`.
+    - Add a `voice_timeouts` block with `service_connect_timeout_ms` and `release_timeout_ms`, moved from `voice` in `config/msc.json`.
+    - Remove `paging_retry`: the value from the attaching BTS's config is used.
+  - `config/bts.json`:
+    - Set `sector` and `management.bind_addr`.
+    - `paging_retry` now belongs here (was in `config/bsc.json`). Move any tuned value here.
+    - Move `iq_capture_dir` here from `config/management.json`.
+    - An EV-DO cell needs an `evdo.a9` block naming `pcf_addr`, `pcf_a8_addr` and its own `a8_bind_addr`, and each EV-DO cell sharing a host needs its own `evdo.an_grpc_bind_addr`.
+  - `config/hlr.json` and `config/smsc.json`: `grpc_listen_addr` now binds `0.0.0.0` so the web can reach them directly.
+  - `config/pdsn.json`: `a10_bearer.udp_peer_addr` may now be removed.
+  - `cdma-msc` and `cdma-nib` no longer take `--a1-addr`.
+  - The web uses `MSC_GRPC_ADDRESS` for management, plus `HLR_GRPC_ADDRESS` and `SMSC_GRPC_ADDRESS` (default: the MSC host on ports 17019 and 17020). `AN_GRPC_ADDRESS` and the BSC management address are no longer used.
 - Forward channel power now follows the C.S0010 base station test model: pilot 20%, sync 4.7%, paging 18.8%, and 56.5% shared by active traffic channels. Pilot power stays constant as calls come and go.
   Migration: in `config/bts.json` remove `downlink.{pilot,sync,paging}.gain`, or rename them to `power_fraction` with a share of total power (0..1). Optional `downlink.traffic.power_fraction` and `downlink.traffic.max_channel_power_fraction` set the traffic allotment.
 - Improved RC1/RC2/RC3 reverse power control and reduced frame errors, including with RC3 gating.

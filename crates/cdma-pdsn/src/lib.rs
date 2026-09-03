@@ -8,6 +8,7 @@ pub mod a11_agent;
 pub mod a11_service;
 pub mod config;
 pub mod events;
+pub mod node;
 pub mod session;
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
@@ -15,6 +16,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 pub use a10_runtime::{HrpdPdsnA10Runtime, spawn_hrpd_pdsn_a10_runtime};
 pub use a11_service::{PacketServiceHrpdA10Adapter, spawn_hrpd_pdsn_a11_service};
 pub use config::{PacketTransportConfig, PdsnNodeConfig};
+pub use node::{resolve_config_dir, run_node};
 pub use session::{
     IpPool, PdsnError, PdsnEvent, PdsnSession, PdsnSessionManager, PdsnSessionPhase,
     PdsnTimerPolicy, Result,
@@ -83,6 +85,18 @@ pub async fn run_packet_grpc_server(
     tonic::transport::Server::builder()
         .add_service(cdma_packet::proto::packet_service_server::PacketServiceServer::new(service))
         .serve(addr)
+        .await
+}
+
+/// Serves the packet gRPC service on an already-bound listener, so the caller
+/// reports a bind failure with its cause before anything is spawned.
+pub async fn run_packet_grpc_server_on(
+    listener: tokio::net::TcpListener,
+    service: cdma_packet::grpc::PacketServiceImpl,
+) -> std::result::Result<(), tonic::transport::Error> {
+    tonic::transport::Server::builder()
+        .add_service(cdma_packet::proto::packet_service_server::PacketServiceServer::new(service))
+        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
         .await
 }
 

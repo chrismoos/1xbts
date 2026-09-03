@@ -1,8 +1,9 @@
-//! gRPC server implementing `an.v1.AnService`.
+//! The AN's in-process handle and the gRPC server implementing
+//! `an.v1.AnService` over it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
@@ -25,6 +26,7 @@ use crate::proto::an::v1::{
 };
 use crate::proto::events::v1 as an_events;
 use crate::session::{Session, SessionState};
+use crate::state_machine::StateMachineError;
 use crate::subnet::UatiAllocator;
 
 const SESSION_CONFIGURATION_COMPLETE: u8 = 0x00;
@@ -48,6 +50,10 @@ pub type SessionStore = Arc<Mutex<HashMap<u32, Session>>>;
 pub type SharedUatiAllocator = Arc<Mutex<UatiAllocator>>;
 pub type SharedHrpdAirController = Arc<Mutex<HrpdAirController>>;
 
+/// The AN's in-process handle: HRPD session store, UATI allocation and the
+/// air controller, plus the `an.v1.AnService` view of them. Callers in the
+/// same process drive the air path through the `handle_*` methods. The gRPC
+/// server serves session and UATI queries over the same state.
 #[derive(Clone)]
 pub struct AnServiceImpl {
     sessions: SessionStore,
@@ -89,6 +95,320 @@ impl AnServiceImpl {
     pub fn into_server(self) -> AnServiceServer<Self> {
         AnServiceServer::new(self)
     }
+
+    /// Runs one access-channel indication through the air controller,
+    /// updating the session store and publishing bus events.
+    pub async fn handle_access(
+        &self,
+        indication: &hrpd_air::HrpdAccessIndication,
+    ) -> Result<HrpdAccessOutcome, StateMachineError> {
+        let mut air = self.air.lock().await;
+        let mut allocator = self.uati.lock().await;
+        let outcome = air.handle_access_indication(indication, &mut allocator)?;
+        // Snapshot the session state of every AT this indication updated. A
+        // brand-new AT's UATI is only known after the call, so read the
+        // affected UATIs from the outcome.
+        let affected_sessions: Vec<_> = outcome
+            .affected_uatis
+            .iter()
+            .filter_map(|uati| {
+                air.session_for_uati(*uati)
+                    .and_then(|s| s.session().cloned())
+            })
+            .collect();
+        drop(allocator);
+        drop(air);
+
+        if let Some(sink) = &self.events {
+            let color = sink.color_code();
+            let reason = if indication
+                .messages
+                .iter()
+                .any(|m| matches!(m, hrpd_air::HrpdAccessMessage::ConnectionRequest(_)))
+            {
+                bus::HrpdAccessReason::ConnectionRequest
+            } else if indication
+                .messages
+                .iter()
+                .any(|m| matches!(m, hrpd_air::HrpdAccessMessage::UatiRequest(_)))
+            {
+                bus::HrpdAccessReason::UatiRequest
+            } else if indication
+                .messages
+                .iter()
+                .any(|m| matches!(m, hrpd_air::HrpdAccessMessage::RouteUpdate(_)))
+            {
+                bus::HrpdAccessReason::RouteUpdate
+            } else if indication
+                .messages
+                .iter()
+                .any(|m| matches!(m, hrpd_air::HrpdAccessMessage::KeepAlive))
+            {
+                bus::HrpdAccessReason::KeepAlive
+            } else {
+                bus::HrpdAccessReason::Unknown
+            };
+            let uati = outcome.affected_uatis.first().copied().unwrap_or_else(|| {
+                if indication.ati.ati_type == hrpd_air::AccessTerminalIdentifierType::Uati {
+                    indication.ati.value
+                } else {
+                    0
+                }
+            });
+            for response in &outcome.hardware_id_responses {
+                if let Some(identity) = bus_identity_from_hardware(response) {
+                    sink.record_identity(uati, identity);
+                }
+            }
+            sink.access(bus::HrpdAccessEvent {
+                timestamp_ns: 0,
+                access_signature: 0,
+                reason: reason as i32,
+                payload: indication.security_payload.clone(),
+                color_code: color,
+                direction: bus::HrpdDirection::Rx as i32,
+                decoded_messages: indication
+                    .messages
+                    .iter()
+                    .map(decoded_access_message)
+                    .collect(),
+                payload_length_bytes: indication.security_payload.len() as u32,
+                uati,
+                full_uati: bus_uati_for_event_uati(&affected_sessions, uati),
+                receive_ati: receive_ati_for_event_uati(&affected_sessions, uati),
+                cell: None,
+            });
+            for request in &outcome.forward_signaling {
+                let payload_length_bytes = request.payload.len() as u32;
+                let uati = forward_signaling_uati(request);
+                sink.traffic(bus::HrpdTrafficEvent {
+                    timestamp_ns: 0,
+                    uati,
+                    full_uati: bus_uati_for_event_uati(&affected_sessions, uati),
+                    receive_ati: receive_ati_for_event_uati(&affected_sessions, uati),
+                    reason: bus::HrpdTrafficReason::FrameDecoded as i32,
+                    mac_index: 0,
+                    drc_value: 0,
+                    payload: request.payload.clone(),
+                    reverse_pilot_snr_db_tenths: 0,
+                    direction: bus::HrpdDirection::Tx as i32,
+                    decoded_messages: vec![decoded_forward_signaling(request)],
+                    payload_length_bytes,
+                    cell: None,
+                });
+            }
+            for uati in &outcome.session_closed_uatis {
+                sink.session(bus_session_event(
+                    *uati,
+                    bus::HrpdSessionReason::Closed,
+                    color,
+                ));
+                sink.forget(*uati);
+            }
+        }
+
+        for session in affected_sessions {
+            let uati = session.uati.as_u32();
+            let now_state = session.state;
+            let full_uati = bus_uati_from_session(&session);
+            let mut store = self.sessions.lock().await;
+            let prior_state = store.get(&uati).map(|s| s.state);
+            store.insert(uati, session);
+            drop(store);
+            if let Some(sink) = &self.events {
+                // Emit a session event only on a real state transition so an
+                // open session does not re-announce on every access capsule.
+                let reason = match now_state {
+                    SessionState::Open if prior_state != Some(SessionState::Open) => {
+                        Some(bus::HrpdSessionReason::Opened)
+                    }
+                    SessionState::AmpSetup
+                        if prior_state != Some(SessionState::AmpSetup)
+                            && prior_state != Some(SessionState::Open) =>
+                    {
+                        Some(bus::HrpdSessionReason::UatiAssigned)
+                    }
+                    _ => None,
+                };
+                if let Some(reason) = reason {
+                    let mut event = bus_session_event(uati, reason, sink.color_code());
+                    event.full_uati = Some(full_uati);
+                    sink.session(event);
+                }
+            }
+        }
+        if !outcome.session_closed_uatis.is_empty() {
+            let mut store = self.sessions.lock().await;
+            for uati in &outcome.session_closed_uatis {
+                store.remove(uati);
+                store.remove(&(*uati & 0x00ff_ffff));
+            }
+        }
+
+        Ok(outcome)
+    }
+
+    /// Runs one reverse traffic event through the air controller, updating the
+    /// session store and publishing bus events.
+    pub async fn handle_traffic(&self, event: &hrpd_air::HrpdTrafficEvent) -> HrpdTrafficOutcome {
+        // Stream 0 signaling is UI-visible. DRC feeds the rate-limited change
+        // detector, and reverse-pilot updates the tracked SNR. Bulk Stream 1 data
+        // and forward traffic packets are bearer payload, not message-log
+        // events.
+        let mut stream0: Option<(u32, Vec<u8>)> = None;
+        let mut drc: Option<(u32, u32, u32)> = None;
+        let mut pilot: Option<(u32, u32, i32)> = None;
+        match event {
+            hrpd_air::HrpdTrafficEvent::Stream0Signaling { uati, payload } => {
+                stream0 = Some((*uati, payload.clone()));
+            }
+            hrpd_air::HrpdTrafficEvent::Drc {
+                uati,
+                mac_index,
+                drc_index,
+                ..
+            } => {
+                drc = Some((*uati, u32::from(*mac_index), u32::from(*drc_index)));
+            }
+            hrpd_air::HrpdTrafficEvent::ReversePilot {
+                uati,
+                mac_index,
+                snr_db_tenths,
+                ..
+            } => {
+                pilot = Some((*uati, u32::from(*mac_index), i32::from(*snr_db_tenths)));
+            }
+            _ => {}
+        }
+        let mut air = self.air.lock().await;
+        let mut allocator = self.uati.lock().await;
+        let outcome = air.handle_traffic_event_with_allocator(event, &mut allocator);
+        drop(allocator);
+        drop(air);
+
+        if let Some(sink) = &self.events {
+            let color = sink.color_code();
+            if let Some((uati, mac_index, snr)) = pilot {
+                sink.maybe_emit_reverse_pilot_snr(uati, mac_index, snr);
+            }
+            for response in &outcome.hardware_id_responses {
+                if let Some(identity) = bus_identity_from_hardware(&response.response) {
+                    sink.record_identity(response.uati, identity);
+                }
+            }
+            if let Some((uati, payload)) = stream0 {
+                let mut decoded_messages = decoded_traffic_outcome(&outcome);
+                if decoded_messages.is_empty() && outcome.stream0_invalid_count > 0 {
+                    decoded_messages.push(decoded_message(
+                        "UndecodedStream0Signaling",
+                        format!("Undecoded Stream0 Signaling payload={}B", payload.len()),
+                        u32::from(hrpd_air::DEFAULT_STREAM0_APPLICATION_PROTOCOL_TYPE),
+                        payload.first().copied().map(u32::from).unwrap_or(0),
+                        payload.clone(),
+                    ));
+                }
+                if !decoded_messages.is_empty() {
+                    sink.traffic(bus::HrpdTrafficEvent {
+                        timestamp_ns: 0,
+                        uati,
+                        full_uati: None,
+                        receive_ati: uati,
+                        reason: bus::HrpdTrafficReason::FrameDecoded as i32,
+                        mac_index: 0,
+                        drc_value: 0,
+                        payload: payload.clone(),
+                        reverse_pilot_snr_db_tenths: 0,
+                        direction: bus::HrpdDirection::Rx as i32,
+                        decoded_messages,
+                        payload_length_bytes: payload.len() as u32,
+                        cell: None,
+                    });
+                }
+            }
+            if let Some((uati, mac_index, drc_value)) = drc {
+                sink.maybe_emit_drc(uati, mac_index, drc_value);
+            }
+            for request in &outcome.forward_signaling {
+                let uati = forward_signaling_uati(request);
+                sink.traffic(bus::HrpdTrafficEvent {
+                    timestamp_ns: 0,
+                    uati,
+                    full_uati: None,
+                    receive_ati: uati,
+                    reason: bus::HrpdTrafficReason::FrameDecoded as i32,
+                    mac_index: 0,
+                    drc_value: 0,
+                    payload: request.payload.clone(),
+                    reverse_pilot_snr_db_tenths: 0,
+                    direction: bus::HrpdDirection::Tx as i32,
+                    decoded_messages: vec![decoded_forward_signaling(request)],
+                    payload_length_bytes: request.payload.len() as u32,
+                    cell: None,
+                });
+            }
+            for uati in &outcome.traffic_channel_closed_uatis {
+                sink.traffic(bus::HrpdTrafficEvent {
+                    timestamp_ns: 0,
+                    uati: *uati,
+                    full_uati: None,
+                    receive_ati: *uati,
+                    reason: bus::HrpdTrafficReason::ConnectionClose as i32,
+                    mac_index: 0,
+                    drc_value: 0,
+                    payload: Vec::new(),
+                    reverse_pilot_snr_db_tenths: 0,
+                    direction: bus::HrpdDirection::Rx as i32,
+                    decoded_messages: vec![decoded_message(
+                        "ConnectionClose",
+                        "ConnectionClose",
+                        u32::from(hrpd_air::DEFAULT_CONNECTED_STATE_PROTOCOL_TYPE),
+                        1,
+                        Vec::new(),
+                    )],
+                    payload_length_bytes: 0,
+                    cell: None,
+                });
+                sink.forget(*uati);
+            }
+            for uati in &outcome.session_closed_uatis {
+                sink.session(bus_session_event(
+                    *uati,
+                    bus::HrpdSessionReason::Closed,
+                    color,
+                ));
+                sink.forget(*uati);
+            }
+        }
+        if !outcome.session_closed_uatis.is_empty() {
+            let mut store = self.sessions.lock().await;
+            for uati in &outcome.session_closed_uatis {
+                store.remove(uati);
+                store.remove(&(*uati & 0x00ff_ffff));
+            }
+        }
+
+        outcome
+    }
+
+    /// Advances the AN's session and connection timers. The caller applies
+    /// the outcomes.
+    pub async fn handle_air_timer(&self, now: Instant) -> HrpdTrafficOutcome {
+        let mut air = self.air.lock().await;
+        let mut allocator = self.uati.lock().await;
+        air.handle_timer_with_allocator(now, &mut allocator)
+    }
+
+    /// Tears down the air-side traffic state for a PCF-initiated A9
+    /// `DisconnectA8`.
+    pub async fn handle_a9_disconnect_a8(
+        &self,
+        uati: u32,
+        mac_index: u8,
+        cause: u8,
+    ) -> HrpdTrafficOutcome {
+        let mut air = self.air.lock().await;
+        air.handle_a9_disconnect_a8(uati, mac_index, cause)
+    }
 }
 
 /// Builds a Rev 0 HRPD session event for the bus. Subtypes are all "Default"
@@ -111,6 +431,7 @@ fn bus_session_event(
         mac_subtype: 0,
         physical_layer_subtype: 0,
         full_uati: None,
+        cell: None,
     }
 }
 
@@ -138,6 +459,13 @@ fn bus_uati_from_session(session: &Session) -> bus::HrpdUati {
 
 fn an_uati_from_session(session: &Session) -> an_events::HrpdUati {
     an_uati(session.uati.full(), session.uati.as_u32())
+}
+
+fn an_cell_from_bus(cell: bus::CellId) -> an_events::CellId {
+    an_events::CellId {
+        cell: cell.cell,
+        sector: cell.sector,
+    }
 }
 
 fn an_uati_from_bus(full: bus::HrpdUati) -> an_events::HrpdUati {
@@ -713,6 +1041,7 @@ fn to_an_session_event(e: bus::HrpdSessionEvent) -> an_events::HrpdSessionEvent 
         mac_subtype: e.mac_subtype,
         physical_layer_subtype: e.physical_layer_subtype,
         full_uati: e.full_uati.map(an_uati_from_bus),
+        cell: e.cell.map(an_cell_from_bus),
     }
 }
 
@@ -743,6 +1072,7 @@ fn to_an_access_event(e: bus::HrpdAccessEvent) -> an_events::HrpdAccessEvent {
         uati: e.uati,
         full_uati: e.full_uati.map(an_uati_from_bus),
         receive_ati: e.receive_ati,
+        cell: e.cell.map(an_cell_from_bus),
     }
 }
 
@@ -764,6 +1094,7 @@ fn to_an_traffic_event(e: bus::HrpdTrafficEvent) -> an_events::HrpdTrafficEvent 
         payload_length_bytes: e.payload_length_bytes,
         full_uati: e.full_uati.map(an_uati_from_bus),
         receive_ati: e.receive_ati,
+        cell: e.cell.map(an_cell_from_bus),
     }
 }
 
@@ -1415,149 +1746,10 @@ impl AnService for AnServiceImpl {
         request: Request<proto::HrpdAccessIndication>,
     ) -> Result<Response<proto::HrpdAccessOutcome>, Status> {
         let indication = access_indication_from_proto(request.into_inner())?;
-        let mut air = self.air.lock().await;
-        let mut allocator = self.uati.lock().await;
-        let outcome = air
-            .handle_access_indication(&indication, &mut allocator)
+        let outcome = self
+            .handle_access(&indication)
+            .await
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
-        // Snapshot the session state of every AT this indication updated. A
-        // brand-new AT's UATI is only known after the call, so read the
-        // affected UATIs from the outcome.
-        let affected_sessions: Vec<_> = outcome
-            .affected_uatis
-            .iter()
-            .filter_map(|uati| {
-                air.session_for_uati(*uati)
-                    .and_then(|s| s.session().cloned())
-            })
-            .collect();
-        drop(allocator);
-        drop(air);
-
-        if let Some(sink) = &self.events {
-            let color = sink.color_code();
-            let reason = if indication
-                .messages
-                .iter()
-                .any(|m| matches!(m, hrpd_air::HrpdAccessMessage::ConnectionRequest(_)))
-            {
-                bus::HrpdAccessReason::ConnectionRequest
-            } else if indication
-                .messages
-                .iter()
-                .any(|m| matches!(m, hrpd_air::HrpdAccessMessage::UatiRequest(_)))
-            {
-                bus::HrpdAccessReason::UatiRequest
-            } else if indication
-                .messages
-                .iter()
-                .any(|m| matches!(m, hrpd_air::HrpdAccessMessage::RouteUpdate(_)))
-            {
-                bus::HrpdAccessReason::RouteUpdate
-            } else if indication
-                .messages
-                .iter()
-                .any(|m| matches!(m, hrpd_air::HrpdAccessMessage::KeepAlive))
-            {
-                bus::HrpdAccessReason::KeepAlive
-            } else {
-                bus::HrpdAccessReason::Unknown
-            };
-            let uati = outcome.affected_uatis.first().copied().unwrap_or_else(|| {
-                if indication.ati.ati_type == hrpd_air::AccessTerminalIdentifierType::Uati {
-                    indication.ati.value
-                } else {
-                    0
-                }
-            });
-            for response in &outcome.hardware_id_responses {
-                if let Some(identity) = bus_identity_from_hardware(response) {
-                    sink.record_identity(uati, identity);
-                }
-            }
-            sink.access(bus::HrpdAccessEvent {
-                timestamp_ns: 0,
-                access_signature: 0,
-                reason: reason as i32,
-                payload: indication.security_payload.clone(),
-                color_code: color,
-                direction: bus::HrpdDirection::Rx as i32,
-                decoded_messages: indication
-                    .messages
-                    .iter()
-                    .map(decoded_access_message)
-                    .collect(),
-                payload_length_bytes: indication.security_payload.len() as u32,
-                uati,
-                full_uati: bus_uati_for_event_uati(&affected_sessions, uati),
-                receive_ati: receive_ati_for_event_uati(&affected_sessions, uati),
-            });
-            for request in &outcome.forward_signaling {
-                let payload_length_bytes = request.payload.len() as u32;
-                let uati = forward_signaling_uati(request);
-                sink.traffic(bus::HrpdTrafficEvent {
-                    timestamp_ns: 0,
-                    uati,
-                    full_uati: bus_uati_for_event_uati(&affected_sessions, uati),
-                    receive_ati: receive_ati_for_event_uati(&affected_sessions, uati),
-                    reason: bus::HrpdTrafficReason::FrameDecoded as i32,
-                    mac_index: 0,
-                    drc_value: 0,
-                    payload: request.payload.clone(),
-                    reverse_pilot_snr_db_tenths: 0,
-                    direction: bus::HrpdDirection::Tx as i32,
-                    decoded_messages: vec![decoded_forward_signaling(request)],
-                    payload_length_bytes,
-                });
-            }
-            for uati in &outcome.session_closed_uatis {
-                sink.session(bus_session_event(
-                    *uati,
-                    bus::HrpdSessionReason::Closed,
-                    color,
-                ));
-                sink.forget(*uati);
-            }
-        }
-
-        for session in affected_sessions {
-            let uati = session.uati.as_u32();
-            let now_state = session.state;
-            let full_uati = bus_uati_from_session(&session);
-            let mut store = self.sessions.lock().await;
-            let prior_state = store.get(&uati).map(|s| s.state);
-            store.insert(uati, session);
-            drop(store);
-            if let Some(sink) = &self.events {
-                // Emit a session event only on a real state transition so an
-                // open session does not re-announce on every access capsule.
-                let reason = match now_state {
-                    SessionState::Open if prior_state != Some(SessionState::Open) => {
-                        Some(bus::HrpdSessionReason::Opened)
-                    }
-                    SessionState::AmpSetup
-                        if prior_state != Some(SessionState::AmpSetup)
-                            && prior_state != Some(SessionState::Open) =>
-                    {
-                        Some(bus::HrpdSessionReason::UatiAssigned)
-                    }
-                    _ => None,
-                };
-                if let Some(reason) = reason {
-                    let mut event = bus_session_event(uati, reason, sink.color_code());
-                    event.full_uati = Some(full_uati);
-                    sink.session(event);
-                }
-            }
-        }
-        if !outcome.session_closed_uatis.is_empty() {
-            let mut store = self.sessions.lock().await;
-            for uati in &outcome.session_closed_uatis {
-                store.remove(uati);
-                store.remove(&(*uati & 0x00ff_ffff));
-            }
-        }
-
         Ok(Response::new(outcome_to_proto(outcome)))
     }
 
@@ -1565,134 +1757,8 @@ impl AnService for AnServiceImpl {
         &self,
         request: Request<proto::HrpdTrafficEvent>,
     ) -> Result<Response<proto::HrpdTrafficOutcome>, Status> {
-        let proto_event = request.into_inner();
-        // Capture control-plane events before the proto event is consumed.
-        // Stream 0 signaling is UI-visible; DRC feeds the rate-limited change
-        // detector; reverse-pilot updates the tracked SNR. Bulk Stream 1 data
-        // and forward traffic packets are bearer payload, not message-log
-        // events.
-        let mut stream0: Option<(u32, Vec<u8>)> = None;
-        let mut drc: Option<(u32, u32, u32)> = None;
-        let mut pilot: Option<(u32, u32, i32)> = None;
-        match &proto_event.event {
-            Some(proto::hrpd_traffic_event::Event::Stream0Signaling(ev)) => {
-                stream0 = Some((ev.uati, ev.payload.clone()));
-            }
-            Some(proto::hrpd_traffic_event::Event::Stream1Packet(_)) => {}
-            Some(proto::hrpd_traffic_event::Event::Drc(ev)) => {
-                drc = Some((ev.uati, ev.mac_index, ev.drc_index));
-            }
-            Some(proto::hrpd_traffic_event::Event::Ack(_)) => {}
-            Some(proto::hrpd_traffic_event::Event::ReversePilot(ev)) => {
-                pilot = Some((ev.uati, ev.mac_index, ev.snr_db_tenths));
-            }
-            _ => {}
-        }
-        let event = traffic_event_from_proto(proto_event)?;
-        let mut air = self.air.lock().await;
-        let mut allocator = self.uati.lock().await;
-        let outcome = air.handle_traffic_event_with_allocator(&event, &mut allocator);
-        drop(allocator);
-        drop(air);
-
-        if let Some(sink) = &self.events {
-            let color = sink.color_code();
-            if let Some((uati, mac_index, snr)) = pilot {
-                sink.maybe_emit_reverse_pilot_snr(uati, mac_index, snr);
-            }
-            for response in &outcome.hardware_id_responses {
-                if let Some(identity) = bus_identity_from_hardware(&response.response) {
-                    sink.record_identity(response.uati, identity);
-                }
-            }
-            if let Some((uati, payload)) = stream0 {
-                let mut decoded_messages = decoded_traffic_outcome(&outcome);
-                if decoded_messages.is_empty() && outcome.stream0_invalid_count > 0 {
-                    decoded_messages.push(decoded_message(
-                        "UndecodedStream0Signaling",
-                        format!("Undecoded Stream0 Signaling payload={}B", payload.len()),
-                        u32::from(hrpd_air::DEFAULT_STREAM0_APPLICATION_PROTOCOL_TYPE),
-                        payload.first().copied().map(u32::from).unwrap_or(0),
-                        payload.clone(),
-                    ));
-                }
-                if !decoded_messages.is_empty() {
-                    sink.traffic(bus::HrpdTrafficEvent {
-                        timestamp_ns: 0,
-                        uati,
-                        full_uati: None,
-                        receive_ati: uati,
-                        reason: bus::HrpdTrafficReason::FrameDecoded as i32,
-                        mac_index: 0,
-                        drc_value: 0,
-                        payload: payload.clone(),
-                        reverse_pilot_snr_db_tenths: 0,
-                        direction: bus::HrpdDirection::Rx as i32,
-                        decoded_messages,
-                        payload_length_bytes: payload.len() as u32,
-                    });
-                }
-            }
-            if let Some((uati, mac_index, drc_value)) = drc {
-                sink.maybe_emit_drc(uati, mac_index, drc_value);
-            }
-            for request in &outcome.forward_signaling {
-                let uati = forward_signaling_uati(request);
-                sink.traffic(bus::HrpdTrafficEvent {
-                    timestamp_ns: 0,
-                    uati,
-                    full_uati: None,
-                    receive_ati: uati,
-                    reason: bus::HrpdTrafficReason::FrameDecoded as i32,
-                    mac_index: 0,
-                    drc_value: 0,
-                    payload: request.payload.clone(),
-                    reverse_pilot_snr_db_tenths: 0,
-                    direction: bus::HrpdDirection::Tx as i32,
-                    decoded_messages: vec![decoded_forward_signaling(request)],
-                    payload_length_bytes: request.payload.len() as u32,
-                });
-            }
-            for uati in &outcome.traffic_channel_closed_uatis {
-                sink.traffic(bus::HrpdTrafficEvent {
-                    timestamp_ns: 0,
-                    uati: *uati,
-                    full_uati: None,
-                    receive_ati: *uati,
-                    reason: bus::HrpdTrafficReason::ConnectionClose as i32,
-                    mac_index: 0,
-                    drc_value: 0,
-                    payload: Vec::new(),
-                    reverse_pilot_snr_db_tenths: 0,
-                    direction: bus::HrpdDirection::Rx as i32,
-                    decoded_messages: vec![decoded_message(
-                        "ConnectionClose",
-                        "ConnectionClose",
-                        u32::from(hrpd_air::DEFAULT_CONNECTED_STATE_PROTOCOL_TYPE),
-                        1,
-                        Vec::new(),
-                    )],
-                    payload_length_bytes: 0,
-                });
-                sink.forget(*uati);
-            }
-            for uati in &outcome.session_closed_uatis {
-                sink.session(bus_session_event(
-                    *uati,
-                    bus::HrpdSessionReason::Closed,
-                    color,
-                ));
-                sink.forget(*uati);
-            }
-        }
-        if !outcome.session_closed_uatis.is_empty() {
-            let mut store = self.sessions.lock().await;
-            for uati in &outcome.session_closed_uatis {
-                store.remove(uati);
-                store.remove(&(*uati & 0x00ff_ffff));
-            }
-        }
-
+        let event = traffic_event_from_proto(request.into_inner())?;
+        let outcome = self.handle_traffic(&event).await;
         Ok(Response::new(traffic_outcome_to_proto(outcome)))
     }
 }

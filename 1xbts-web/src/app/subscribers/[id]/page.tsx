@@ -440,7 +440,7 @@ export default function SubscriberDetailPage({
           {binding ? (
             <>
               <Stat label="State" value={binding.state} />
-              <Stat label="Serving Node" value={binding.servingNodeId} mono />
+              <Stat label="Serving BS" value={binding.servingBsId} mono />
               <Stat label="Identity" value={formatBindingIdentity(binding)} mono />
               <Stat label="PGSLOT" value={binding.pgslot != null ? String(binding.pgslot) : "-"} mono />
               <Stat

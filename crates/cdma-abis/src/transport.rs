@@ -91,6 +91,28 @@ impl std::fmt::Display for TransportSendError {
 
 impl std::error::Error for TransportSendError {}
 
+/// How long an idle Abis connection waits before probing the peer.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
+/// Gap between probes once one is outstanding.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+/// Unanswered probes before the connection is declared dead.
+const KEEPALIVE_RETRIES: u32 = 3;
+
+/// Enable TCP keepalive so a peer that disappears without a FIN is detected.
+///
+/// Abis carries no periodic traffic on an idle cell, so without this a BTS
+/// that loses power is indistinguishable from an idle one.
+fn enable_keepalive(stream: &TcpStream, peer: SocketAddr) {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL)
+        .with_retries(KEEPALIVE_RETRIES);
+    let socket = socket2::SockRef::from(stream);
+    if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
+        warn!("Abis signaling: could not enable keepalive toward {peer}: {e}");
+    }
+}
+
 /// Accepts a single Abis signaling connection on the given listener.
 ///
 /// Returns a sender for outbound messages and a receiver for inbound events.
@@ -101,6 +123,7 @@ pub async fn accept(
 ) -> io::Result<(TransportSender, mpsc::Receiver<TransportEvent>)> {
     let (stream, peer) = listener.accept().await?;
     info!("Abis signaling: accepted connection from {peer}");
+    enable_keepalive(&stream, peer);
     Ok(spawn_transport(stream, peer))
 }
 
@@ -110,6 +133,7 @@ pub async fn connect(
 ) -> io::Result<(TransportSender, mpsc::Receiver<TransportEvent>)> {
     let stream = TcpStream::connect(addr).await?;
     info!("Abis signaling: connected to {addr}");
+    enable_keepalive(&stream, addr);
     Ok(spawn_transport(stream, addr))
 }
 

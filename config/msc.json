@@ -1,7 +1,11 @@
 {
-  "a1_listen_addr": "127.0.0.1:17013",
   "mgmt_grpc_addr": "0.0.0.0:17017",
-  "a1_peers": [],
+  "hlr_endpoint": "http://127.0.0.1:17019",
+  "smsc_endpoint": "http://127.0.0.1:17020",
+  "packet_endpoint": "http://127.0.0.1:17021",
+  "base_stations": [
+    { "id": "bts-1", "management_endpoint": "http://127.0.0.1:17016" }
+  ],
   "voice": {
     "gateway": {
       "enabled": true,
@@ -18,7 +22,6 @@
     "media_ringback_enabled": true,
     "media_ringback_type": "nanp",
     "answer_delay_ms": 3000,
-    "release_timeout_ms": 5000,
     "supported_service_options": [32768, 3, 17, 68, 73]
   },
   "welcome_sms": {
@@ -39,6 +42,10 @@
     "system_tag": {
       "name": "1xBTS",
       "tag_p_rev": 1
+    },
+    "home_network": {
+      "sid": 22,
+      "nid": 65535
     },
     "nam_defaults": {
       "mob_term_home": true,

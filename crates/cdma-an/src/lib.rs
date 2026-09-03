@@ -1,9 +1,12 @@
-//! HRPD (1xEV-DO Rev 0) Access Network process.
+//! HRPD (1xEV-DO Rev 0) Access Network.
 //!
 //! Owns the session layer (UATI assignment, protocol negotiation), connection
 //! layer (idle/connected state, route update, overhead delivery), security
-//! pass-through, and stream layer for an HRPD sector. Runs as its own process
-//! and talks to BTS / PCF / 1x BSC only over network reference points
+//! pass-through, and stream layer for an HRPD sector.
+//!
+//! `C.S0024-100-C` §1.11 makes an access network equivalent to a base
+//! station, so this library runs inside the BTS process alongside the HRPD
+//! PHY/MAC and reaches the PCF and the 1x BSC over network reference points
 //! (A8/A9/A21).
 
 pub mod a8_runtime;

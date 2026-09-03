@@ -1,7 +1,8 @@
 //! Aggregated network-event bus.
 //!
 //! Components (BTS/BSC/MSC/PCF/PDSN/HLR/SMSC) publish events to a single
-//! gRPC `EventService` hosted by `cdma-nib`. Subscribers receive a unified,
+//! gRPC `EventService` served by the `cdma-events` element. Subscribers
+//! receive a unified,
 //! well-typed stream via `ListenEvents`. Producers communicate only over
 //! gRPC — there is no in-process bus — so the same publish path works
 //! whether the producer is in the same process or remote.
@@ -11,6 +12,7 @@ pub mod proto {
 }
 
 mod enricher;
+pub mod node;
 mod node_config;
 mod publisher;
 mod server;
@@ -19,6 +21,7 @@ pub use enricher::{
     CachingHlrEnricher, HlrEnricher, build_default_enricher, identity_is_empty,
     subscriber_is_unresolved,
 };
+pub use node::{resolve_config_dir, run_node};
 pub use node_config::EventsNodeConfig;
 pub use publisher::{EventPublisher, EventPublisherConfig, EventPublisherError};
 pub use server::{EventBusConfig, EventBusServer, serve};

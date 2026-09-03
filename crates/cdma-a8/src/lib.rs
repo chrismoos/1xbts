@@ -58,7 +58,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::InvalidTransportConfig(detail) => f.write_str(detail),
+            _ => write!(f, "{self:?}"),
+        }
     }
 }
 
@@ -108,55 +111,103 @@ impl BearerTransportConfig {
 
     /// Validates the outer transport without inspecting any session keys.
     pub fn validate(&self, label: &str) -> std::result::Result<(), String> {
+        match self.transport_validation_error(label, PeerAddrPolicy::Required) {
+            Some(detail) => Err(detail),
+            None => Ok(()),
+        }
+    }
+
+    /// Validates the outer transport for an endpoint that learns each session's peer from
+    /// signaling and traffic, so `udp_peer_addr` is optional.
+    ///
+    pub fn validate_multi_peer(&self, label: &str) -> Result<()> {
+        match self.transport_validation_error(label, PeerAddrPolicy::Optional) {
+            Some(detail) => Err(Error::InvalidTransportConfig(detail)),
+            None => Ok(()),
+        }
+    }
+
+    fn transport_validation_error(
+        &self,
+        label: &str,
+        peer_policy: PeerAddrPolicy,
+    ) -> Option<String> {
         match self.mode {
             BearerTransportMode::RawGre => {
                 if self.udp_bind_addr.is_some() || self.udp_peer_addr.is_some() {
-                    return Err(format!(
+                    return Some(format!(
                         "{label}: raw_gre must not set udp_bind_addr or udp_peer_addr"
                     ));
                 }
-                Ok(())
+                None
             }
             BearerTransportMode::UdpEncapsulatedGre => {
                 if self.udp_bind_addr.is_none() {
-                    return Err(format!(
+                    return Some(format!(
                         "{label}: udp_encapsulated_gre requires udp_bind_addr"
                     ));
                 }
-                if self.udp_peer_addr.is_none() {
-                    return Err(format!(
+                if peer_policy == PeerAddrPolicy::Required && self.udp_peer_addr.is_none() {
+                    return Some(format!(
                         "{label}: udp_encapsulated_gre requires udp_peer_addr"
                     ));
                 }
-                Ok(())
+                None
             }
         }
     }
 }
 
+/// Whether a UDP bearer endpoint needs a configured default peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PeerAddrPolicy {
+    Required,
+    Optional,
+}
+
 /// UDP endpoint carrying exact GRE packet bytes.
 pub struct UdpGreEndpoint {
     socket: UdpSocket,
-    peer_addr: SocketAddr,
+    peer_addr: Option<SocketAddr>,
 }
 
 /// Tokio UDP endpoint carrying exact GRE packet bytes.
 pub struct TokioUdpGreEndpoint {
     socket: tokio::net::UdpSocket,
-    peer_addr: SocketAddr,
+    peer_addr: Option<SocketAddr>,
 }
 
 impl UdpGreEndpoint {
     /// Builds an endpoint from an already-bound UDP socket.
     pub fn from_socket(socket: UdpSocket, peer_addr: SocketAddr) -> Self {
-        Self { socket, peer_addr }
+        Self {
+            socket,
+            peer_addr: Some(peer_addr),
+        }
     }
 
     /// Binds a UDP endpoint from a `udp_encapsulated_gre` transport config.
     pub fn bind(config: BearerTransportConfig, label: &str) -> Result<Self> {
-        config
-            .validate(label)
-            .map_err(Error::InvalidTransportConfig)?;
+        Self::bind_with_peer_policy(config, label, PeerAddrPolicy::Required)
+    }
+
+    /// Binds a UDP endpoint that serves several peers.
+    ///
+    /// `udp_peer_addr` is optional here and only sets the default used by
+    /// [`Self::send_wire_packet`]. Per-peer traffic goes through
+    /// [`TokioUdpGreEndpoint::send_wire_packet_to`].
+    pub fn bind_multi_peer(config: BearerTransportConfig, label: &str) -> Result<Self> {
+        Self::bind_with_peer_policy(config, label, PeerAddrPolicy::Optional)
+    }
+
+    fn bind_with_peer_policy(
+        config: BearerTransportConfig,
+        label: &str,
+        peer_policy: PeerAddrPolicy,
+    ) -> Result<Self> {
+        if let Some(detail) = config.transport_validation_error(label, peer_policy) {
+            return Err(Error::InvalidTransportConfig(detail));
+        }
         if config.mode != BearerTransportMode::UdpEncapsulatedGre {
             return Err(Error::InvalidTransportConfig(format!(
                 "{label}: UdpGreEndpoint requires udp_encapsulated_gre"
@@ -165,16 +216,21 @@ impl UdpGreEndpoint {
         let bind_addr = config
             .udp_bind_addr
             .ok_or_else(|| Error::InvalidTransportConfig(format!("{label}: missing bind addr")))?;
-        let peer_addr = config
-            .udp_peer_addr
-            .ok_or_else(|| Error::InvalidTransportConfig(format!("{label}: missing peer addr")))?;
         let socket = UdpSocket::bind(bind_addr)
             .map_err(|e| Error::UdpTransport(format!("{label}: bind {bind_addr}: {e}")))?;
-        Ok(Self { socket, peer_addr })
+        Ok(Self {
+            socket,
+            peer_addr: config.udp_peer_addr,
+        })
     }
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    /// Default peer for [`Self::send_wire_packet`], if one was configured.
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer_addr
     }
 
     pub fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
@@ -194,10 +250,11 @@ impl UdpGreEndpoint {
         })
     }
 
-    /// Sends one already-encoded GRE packet as a UDP payload.
+    /// Sends one already-encoded GRE packet as a UDP payload to the default peer.
     pub fn send_wire_packet(&self, wire_bytes: &[u8]) -> Result<usize> {
+        let peer = default_peer_addr(self.peer_addr)?;
         self.socket
-            .send_to(wire_bytes, self.peer_addr)
+            .send_to(wire_bytes, peer)
             .map_err(|e| Error::UdpTransport(format!("send exact GRE UDP payload: {e}")))
     }
 
@@ -218,9 +275,22 @@ impl UdpGreEndpoint {
     }
 }
 
+fn default_peer_addr(peer_addr: Option<SocketAddr>) -> Result<SocketAddr> {
+    peer_addr.ok_or_else(|| {
+        Error::InvalidTransportConfig(
+            "send to default peer needs udp_peer_addr, endpoint has none".to_string(),
+        )
+    })
+}
+
 impl TokioUdpGreEndpoint {
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    /// Default peer for [`Self::send_wire_packet`], if one was configured.
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer_addr
     }
 
     /// Waits until the socket may have at least one inbound datagram.
@@ -228,12 +298,18 @@ impl TokioUdpGreEndpoint {
         self.socket.readable().await
     }
 
-    /// Sends one already-encoded GRE packet as a UDP payload.
-    pub async fn send_wire_packet(&self, wire_bytes: &[u8]) -> Result<usize> {
+    /// Sends to a specific peer rather than the default one.
+    pub async fn send_wire_packet_to(&self, wire_bytes: &[u8], peer: SocketAddr) -> Result<usize> {
         self.socket
-            .send_to(wire_bytes, self.peer_addr)
+            .send_to(wire_bytes, peer)
             .await
             .map_err(|e| Error::UdpTransport(format!("send exact GRE UDP payload: {e}")))
+    }
+
+    /// Sends one already-encoded GRE packet as a UDP payload to the default peer.
+    pub async fn send_wire_packet(&self, wire_bytes: &[u8]) -> Result<usize> {
+        let peer = default_peer_addr(self.peer_addr)?;
+        self.send_wire_packet_to(wire_bytes, peer).await
     }
 
     /// Encodes and sends one GRE packet as a UDP payload.

@@ -11,8 +11,8 @@ use crate::a1_edge::EncodedA1Message;
 use crate::addressing::{format_ms_address, is_packet_data_so};
 
 use super::{
-    A1_CLEAR_CAUSE_PAGING_RESPONSE_NOT_RECEIVED, Bsc, MobileRegistryService, VoiceAlertMode,
-    VoiceLegRole, VoiceSessionKind,
+    A1_CLEAR_CAUSE_PAGING_RESPONSE_NOT_RECEIVED, AccessCellId, Bsc, MobileRegistryService,
+    VoiceAlertMode, VoiceLegRole, VoiceSessionKind,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,17 +207,17 @@ impl Bsc {
         // the Callee leg first since AWI with caller-ID belongs to it. Fall
         // back to whichever TC matches the call_id.
         let candidates = self.mobiles.all_walshes_for_a1_call(call_id);
-        let walsh_code = candidates
+        let target = candidates
             .iter()
-            .find(|(_, w)| {
+            .find(|(_, c, w)| {
                 self.mobiles
-                    .get_traffic_channel(*w)
+                    .get_traffic_channel(*c, *w)
                     .and_then(|tc| tc.voice_leg_role)
                     == Some(VoiceLegRole::Callee)
             })
             .or_else(|| candidates.first())
-            .map(|(_, w)| *w);
-        let Some(walsh_code) = walsh_code else {
+            .map(|(_, c, w)| (*c, *w));
+        let Some((cell, walsh_code)) = target else {
             warn!(
                 "BSC: A1 AlertWithInformation for unknown call_id={}, ignoring",
                 call_id
@@ -227,7 +227,7 @@ impl Bsc {
 
         let (leg_role, session_id) = self
             .mobiles
-            .get_traffic_channel(walsh_code)
+            .get_traffic_channel(cell, walsh_code)
             .map(|tc| (tc.voice_leg_role, tc.voice_session_id))
             .unwrap_or((None, None));
         let session_kind = session_id.and_then(|id| self.voice.session(id).map(|s| s.kind));
@@ -249,6 +249,7 @@ impl Bsc {
                     .or(stashed_calling_party);
                 (
                     self.send_standard_alert(
+                        cell,
                         walsh_code,
                         super::DEFAULT_TRAFFIC_ACK_SEQ,
                         calling_party,
@@ -258,7 +259,7 @@ impl Bsc {
                 )
             }
             _ => (
-                self.send_alert_with_info(walsh_code, super::DEFAULT_TRAFFIC_ACK_SEQ, None),
+                self.send_alert_with_info(cell, walsh_code, super::DEFAULT_TRAFFIC_ACK_SEQ, None),
                 VoiceAlertMode::WaitForPeerAnswer,
                 "ringback",
             ),
@@ -276,7 +277,7 @@ impl Bsc {
             log_label, walsh_code, call_id
         );
 
-        if let Some(tc) = self.mobiles.get_traffic_channel_mut(walsh_code) {
+        if let Some(tc) = self.mobiles.get_traffic_channel_mut(cell, walsh_code) {
             tc.mark_voice_alerting(mode);
         }
         if let Some(session_id) = session_id {
@@ -317,17 +318,17 @@ impl Bsc {
         // play ringback). Callee AWI carries no Signal IE so it has no
         // network-instructed tone to silence on answer.
         let candidates = self.mobiles.all_walshes_for_a1_call(call_id);
-        let walsh_code = candidates
+        let target = candidates
             .iter()
-            .find(|(_, w)| {
+            .find(|(_, c, w)| {
                 self.mobiles
-                    .get_traffic_channel(*w)
+                    .get_traffic_channel(*c, *w)
                     .and_then(|tc| tc.voice_leg_role)
                     == Some(VoiceLegRole::Caller)
             })
             .or_else(|| candidates.first())
-            .map(|(_, w)| *w);
-        let Some(walsh_code) = walsh_code else {
+            .map(|(_, c, w)| (*c, *w));
+        let Some((cell, walsh_code)) = target else {
             warn!("BSC: A1 Progress for unknown call_id={}, ignoring", call_id);
             return;
         };
@@ -337,6 +338,7 @@ impl Bsc {
             signal: signal.signal_value,
         };
         if let Err(error) = self.send_alert_with_info_signal(
+            cell,
             walsh_code,
             super::DEFAULT_TRAFFIC_ACK_SEQ,
             signal_info,
@@ -349,8 +351,11 @@ impl Bsc {
     }
 
     fn handle_a1_adds_deliver(&mut self, call_id: u64, msg: cdma_ios::AddsDeliverMessage) {
-        let walsh = self.mobiles.iter().find_map(|ms| ms.a1_call_walsh(call_id));
-        let Some(walsh) = walsh else {
+        let target = self
+            .mobiles
+            .iter()
+            .find_map(|ms| Some((ms.serving_cell?, ms.a1_call_walsh(call_id)?)));
+        let Some((cell, walsh)) = target else {
             warn!(
                 "BSC: A1 ADDS Deliver call_id={} has no matching traffic channel — dropped",
                 call_id
@@ -368,6 +373,7 @@ impl Bsc {
         };
         let sdu = data_burst.to_sdu();
         let send_result = self.send_traffic_signaling(
+            cell,
             walsh,
             sdu,
             cdma_common::lac::message_types::MessageId::DataBurst,
@@ -397,7 +403,7 @@ impl Bsc {
         if burst_type == cdma_common::consts::BURST_TYPE_OTASP {
             if let Some(tag) = a1_tag {
                 self.pending_otasp_dbm.insert(
-                    walsh,
+                    (cell, walsh),
                     super::traffic_signaling::PendingOtaspDbm { a1_tag: tag },
                 );
             }
@@ -451,11 +457,12 @@ impl A1Service {
         &self,
         mobiles: &MobileRegistryService,
         call_id: u64,
+        cell: AccessCellId,
         walsh_code: u8,
         service_option: u16,
     ) {
         let a2p_bearer_session_params = mobiles
-            .get_traffic_channel(walsh_code)
+            .get_traffic_channel(cell, walsh_code)
             .and_then(|tc| tc.msc_bearer_local_addr)
             .map(|addr| cdma_ios::A2pBearerSessionParams {
                 ip_address: match addr.ip() {
@@ -623,10 +630,11 @@ impl Bsc {
             );
             return None;
         };
+        let serving_cell = self.serving_params(fwd_address).cell;
         let cli3 = cdma_ios::CompleteLayer3InformationMessage {
             cell_identifier: cdma_ios::CellId {
-                cell: self.config.overhead.base_id,
-                sector: 0,
+                cell: serving_cell.cell,
+                sector: serving_cell.sector,
             },
             layer3_information: cdma_ios::Layer3Information(l3_bytes),
         };
@@ -694,6 +702,15 @@ impl Bsc {
             );
             return false;
         };
+
+        // The response names where the mobile is now, which may not be where
+        // it last registered. The assignment that follows is keyed on the
+        // serving cell, so record it before anything looks it up.
+        if let Some(cell) = event.cell {
+            self.mobiles.update(fwd_address, |ms| {
+                ms.serving_cell = Some(cell);
+            });
+        }
 
         let paging_response = cdma_ios::PagingResponseMessage {
             classmark_information_type_2: build_a1_classmark_information_type_2_for_event(event, 0),
@@ -944,15 +961,17 @@ impl Bsc {
             } => Some((session_id, leg_role)),
             _ => None,
         };
+        let serving_cell = mobile.serving_cell;
         let existing_voice_walsh = voice_assignment.and_then(|(session_id, leg_role)| {
-            mobile.existing_voice_walsh_for_assignment(
+            let walsh = mobile.existing_voice_walsh_for_assignment(
                 pending.bind_existing_traffic,
                 session_id,
                 leg_role,
-            )
+            )?;
+            Some((serving_cell?, walsh))
         });
 
-        if let Some(walsh_code) = existing_voice_walsh {
+        if let Some((cell, walsh_code)) = existing_voice_walsh {
             let Some((session_id, leg_role)) = voice_assignment else {
                 warn!(
                     "BSC: non-voice A1 Assignment Request unexpectedly matched existing voice traffic call_id={}",
@@ -960,7 +979,7 @@ impl Bsc {
                 );
                 return;
             };
-            self.mobiles.update_tc(walsh_code, |_, tc| {
+            self.mobiles.update_tc(cell, walsh_code, |_, tc| {
                 tc.msc_circuit_id = Some(circuit_id);
                 tc.voice_session_id = Some(session_id);
                 tc.voice_leg_role = Some(leg_role);
@@ -981,9 +1000,10 @@ impl Bsc {
                 });
                 match bearer.open_circuit(circuit_id, msc_remote).await {
                     Ok(local_addr) => {
-                        // After awaiting the bearer open, re-resolve via walsh
-                        // (the walsh code is the stable key for the TC).
-                        self.mobiles.update_tc(walsh_code, |_, tc| {
+                        // After awaiting the bearer open, re-resolve through
+                        // the registry: cell and Walsh code are the stable key
+                        // for the TC.
+                        self.mobiles.update_tc(cell, walsh_code, |_, tc| {
                             tc.msc_bearer_local_addr = Some(local_addr);
                         });
                         apply_negotiated_bearer_payload_types(
@@ -1135,7 +1155,7 @@ impl Bsc {
             return;
         }
 
-        let Some((fwd_address, walsh_code)) = self.mobiles.locate_a1_call(call_id) else {
+        let Some((fwd_address, cell, walsh_code)) = self.mobiles.locate_a1_call(call_id) else {
             info!(
                 "BSC: A1 Clear Command for call_id={} arrived after local teardown; sending Clear Complete",
                 call_id
@@ -1144,7 +1164,7 @@ impl Bsc {
             return;
         };
 
-        let already_releasing = self.mobiles.update_tc(walsh_code, |_, tc| {
+        let already_releasing = self.mobiles.update_tc(cell, walsh_code, |_, tc| {
             tc.a1_clear_state = A1ClearState::ClearCommandReceived;
             tc.is_releasing()
         });
@@ -1205,8 +1225,10 @@ impl Bsc {
                 mobile.subscriber_id.unwrap_or_default(),
             ),
             None => {
-                // Page anyway via a synthesized address; queue_voice_page_for_mobile
-                // falls back to slot_cycle_index=0 when the registry is empty.
+                // Synthesize an address so the call can be tracked. The page
+                // itself goes out only once the mobile has a serving cell.
+                // Until then each attempt logs a warning and the MSC clears
+                // the call on page timeout.
                 let Some(addr) = synthesize_fwd_address_from_imsi(&imsi) else {
                     warn!(
                         "BSC: A1 Paging Request IMSI {} could not be parsed; replying ClearRequest(cause=0x{:02X})",
@@ -1615,6 +1637,7 @@ mod tests {
 
     fn test_access_event() -> AccessChannelEvent {
         AccessChannelEvent {
+            cell: Some(crate::bsc::tests::TEST_CELL),
             event_id: "a1-classmark-test".to_string(),
             chip_start: 0,
             absolute_chip_start: None,
@@ -2186,7 +2209,8 @@ mod tests {
         let first = endpoint.recv_from_bsc().await.unwrap();
         assert_eq!(first.message_type(), cdma_ios::MessageType::ClearRequest);
 
-        bsc.teardown_traffic_channel(walsh_code).await;
+        bsc.teardown_traffic_channel(crate::bsc::tests::TEST_CELL, walsh_code)
+            .await;
         bsc.handle_incoming_a1_message(clear_command_message(call_id))
             .await;
 
@@ -2231,7 +2255,8 @@ mod tests {
             super::super::A1ClearState::ClearCommandReceived
         );
 
-        bsc.teardown_traffic_channel(walsh_code).await;
+        bsc.teardown_traffic_channel(crate::bsc::tests::TEST_CELL, walsh_code)
+            .await;
         let complete = endpoint.recv_from_bsc().await.unwrap();
         assert_eq!(
             complete.message_type(),

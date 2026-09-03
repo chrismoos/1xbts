@@ -9,6 +9,7 @@ import { BinaryReader, BinaryWriter } from "@bufbuild/protobuf/wire";
 import type { CallContext, CallOptions } from "nice-grpc-common";
 import {
   BtsConfig,
+  CellId,
   ChannelList,
   IqCaptureStatus,
   PagingEvent,
@@ -22,26 +23,933 @@ import { Empty } from "../../google/protobuf/empty";
 
 export const protobufPackage = "bts_management.v1";
 
-/** Selects an active traffic channel by Walsh code. */
+/** How far a cell has progressed toward carrying traffic. */
+export enum BtsAttachState {
+  BTS_ATTACH_STATE_UNSPECIFIED = 0,
+  /** BTS_ATTACH_STATE_DISCONNECTED - Configured but not reachable. */
+  BTS_ATTACH_STATE_DISCONNECTED = 1,
+  /** BTS_ATTACH_STATE_ENROLLED - Configuration retrieved, Abis signaling not yet established. */
+  BTS_ATTACH_STATE_ENROLLED = 2,
+  /** BTS_ATTACH_STATE_IN_SERVICE - Enrolled with Abis signaling up. Carries traffic. */
+  BTS_ATTACH_STATE_IN_SERVICE = 3,
+  UNRECOGNIZED = -1,
+}
+
+export function btsAttachStateFromJSON(object: any): BtsAttachState {
+  switch (object) {
+    case 0:
+    case "BTS_ATTACH_STATE_UNSPECIFIED":
+      return BtsAttachState.BTS_ATTACH_STATE_UNSPECIFIED;
+    case 1:
+    case "BTS_ATTACH_STATE_DISCONNECTED":
+      return BtsAttachState.BTS_ATTACH_STATE_DISCONNECTED;
+    case 2:
+    case "BTS_ATTACH_STATE_ENROLLED":
+      return BtsAttachState.BTS_ATTACH_STATE_ENROLLED;
+    case 3:
+    case "BTS_ATTACH_STATE_IN_SERVICE":
+      return BtsAttachState.BTS_ATTACH_STATE_IN_SERVICE;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return BtsAttachState.UNRECOGNIZED;
+  }
+}
+
+export function btsAttachStateToJSON(object: BtsAttachState): string {
+  switch (object) {
+    case BtsAttachState.BTS_ATTACH_STATE_UNSPECIFIED:
+      return "BTS_ATTACH_STATE_UNSPECIFIED";
+    case BtsAttachState.BTS_ATTACH_STATE_DISCONNECTED:
+      return "BTS_ATTACH_STATE_DISCONNECTED";
+    case BtsAttachState.BTS_ATTACH_STATE_ENROLLED:
+      return "BTS_ATTACH_STATE_ENROLLED";
+    case BtsAttachState.BTS_ATTACH_STATE_IN_SERVICE:
+      return "BTS_ATTACH_STATE_IN_SERVICE";
+    case BtsAttachState.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
+/**
+ * Addresses one BTS. Clients set `peer_id` (the stable id from bts_peers) and
+ * the BSC resolves it to the peer's cell. `cell` is the internal key the BSC
+ * forwards to the BTS.
+ */
+export interface CellRequest {
+  cell?: CellId | undefined;
+  peerId?: string | undefined;
+}
+
+/** Requests the cell identity and radio configuration for a BTS. */
+export interface EnrollRequest {
+}
+
+/** Cell identity and radio configuration supplied by a BTS at attach. */
+export interface EnrollResponse {
+  /** Identity this BTS serves. Keys the BSC's registry. */
+  cell:
+    | CellId
+    | undefined;
+  /** Radio and overhead configuration the BSC uses for call control. */
+  config:
+    | BtsConfig
+    | undefined;
+  /**
+   * Reverse-link power reference, when the radio is calibrated. Absent leaves
+   * reported Rx levels relative rather than absolute.
+   */
+  rxReferenceDbm?:
+    | number
+    | undefined;
+  /**
+   * Address this cell's HRPD access network serves its session and UATI API
+   * on. Absent when the cell runs no EV-DO carrier.
+   */
+  anGrpcAddr?:
+    | string
+    | undefined;
+  /**
+   * Paging retransmission budget this BTS applies on the paging channel. The
+   * BSC schedules its own timers against the same values so the two agree on
+   * how long a page is outstanding.
+   */
+  pagingRetry: PagingRetryConfig | undefined;
+}
+
+/** Paging channel retransmission budget. */
+export interface PagingRetryConfig {
+  /** How long the BTS waits for a layer 2 acknowledgment before resending. */
+  ackTimeoutMs: number;
+  /** Resends before the page is abandoned. */
+  maxRetries: number;
+}
+
+/** One cell, summarized for enumeration. */
+export interface BtsSummary {
+  /**
+   * Stable opaque id from the BSC's bts_peers config. Present for every
+   * configured peer, including one that has not enrolled, so the client keys
+   * rows by it rather than by the cell a peer only has once in service.
+   */
+  peerId: string;
+  /**
+   * OAM endpoint the BSC reaches this peer at, shown for an offline peer that
+   * has no cell identity yet.
+   */
+  managementEndpoint: string;
+  /** Cell identity, present only once the peer is in service. */
+  cell?: CellId | undefined;
+  state: BtsAttachState;
+  /** Pilot PN offset in 64-chip units. */
+  pilotPn: number;
+  /** Band class label, e.g. "BC0". */
+  bandClass: string;
+  cdmaChannel: number;
+  sid: number;
+  nid: number;
+  evdoEnabled: boolean;
+  /**
+   * Mobiles registered to this cell. Absent from a BTS answering for itself,
+   * which does not track registration.
+   */
+  servedMobiles?:
+    | number
+    | undefined;
+  /** Why the cell is not in service, when it is not. */
+  statusDetail?:
+    | string
+    | undefined;
+  /**
+   * Color code this cell's HRPD sector advertises. It is the top byte of the
+   * on-air access terminal identifier, so it ties an HRPD session back to the
+   * cell that issued its UATI. Absent when the cell runs no EV-DO carrier.
+   */
+  evdoColorCode?:
+    | number
+    | undefined;
+  /**
+   * Address this cell's HRPD access network serves its session and UATI API
+   * on. The management front door reads HRPD sessions from here. Absent when
+   * the cell runs no EV-DO carrier.
+   */
+  anGrpcAddr?: string | undefined;
+}
+
+/** Cells reachable through this endpoint. */
+export interface BtsList {
+  bts: BtsSummary[];
+}
+
+/** Selects an active traffic channel by Walsh code on one cell. */
 export interface ReversePowerControlRequest {
   /** Forward traffic-channel Walsh code assigned to the mobile. */
   walshCode: number;
+  cell?: CellId | undefined;
+}
+
+/** Reverse power-control state for one active traffic channel. */
+export interface ReversePowerControlEntry {
+  /** Forward traffic-channel Walsh code the state belongs to. */
+  walshCode: number;
+  power: TrafficChannelPower | undefined;
 }
 
 /** Collection of reverse power-control snapshots for active traffic channels. */
 export interface ReversePowerControlList {
-  /** One snapshot per active traffic channel. */
-  powerControls: TrafficChannelPower[];
+  /**
+   * One entry per active traffic channel, keyed by Walsh code so a caller can
+   * join the whole cell in one request.
+   */
+  entries: ReversePowerControlEntry[];
 }
 
+function createBaseCellRequest(): CellRequest {
+  return { cell: undefined, peerId: undefined };
+}
+
+export const CellRequest: MessageFns<CellRequest> = {
+  encode(message: CellRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.cell !== undefined) {
+      CellId.encode(message.cell, writer.uint32(10).fork()).join();
+    }
+    if (message.peerId !== undefined) {
+      writer.uint32(18).string(message.peerId);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): CellRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseCellRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.cell = CellId.decode(reader, reader.uint32());
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.peerId = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): CellRequest {
+    return {
+      cell: isSet(object.cell) ? CellId.fromJSON(object.cell) : undefined,
+      peerId: isSet(object.peerId)
+        ? globalThis.String(object.peerId)
+        : isSet(object.peer_id)
+        ? globalThis.String(object.peer_id)
+        : undefined,
+    };
+  },
+
+  toJSON(message: CellRequest): unknown {
+    const obj: any = {};
+    if (message.cell !== undefined) {
+      obj.cell = CellId.toJSON(message.cell);
+    }
+    if (message.peerId !== undefined) {
+      obj.peerId = message.peerId;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<CellRequest>): CellRequest {
+    return CellRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<CellRequest>): CellRequest {
+    const message = createBaseCellRequest();
+    message.cell = (object.cell !== undefined && object.cell !== null) ? CellId.fromPartial(object.cell) : undefined;
+    message.peerId = object.peerId ?? undefined;
+    return message;
+  },
+};
+
+function createBaseEnrollRequest(): EnrollRequest {
+  return {};
+}
+
+export const EnrollRequest: MessageFns<EnrollRequest> = {
+  encode(_: EnrollRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): EnrollRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseEnrollRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(_: any): EnrollRequest {
+    return {};
+  },
+
+  toJSON(_: EnrollRequest): unknown {
+    const obj: any = {};
+    return obj;
+  },
+
+  create(base?: DeepPartial<EnrollRequest>): EnrollRequest {
+    return EnrollRequest.fromPartial(base ?? {});
+  },
+  fromPartial(_: DeepPartial<EnrollRequest>): EnrollRequest {
+    const message = createBaseEnrollRequest();
+    return message;
+  },
+};
+
+function createBaseEnrollResponse(): EnrollResponse {
+  return {
+    cell: undefined,
+    config: undefined,
+    rxReferenceDbm: undefined,
+    anGrpcAddr: undefined,
+    pagingRetry: undefined,
+  };
+}
+
+export const EnrollResponse: MessageFns<EnrollResponse> = {
+  encode(message: EnrollResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.cell !== undefined) {
+      CellId.encode(message.cell, writer.uint32(10).fork()).join();
+    }
+    if (message.config !== undefined) {
+      BtsConfig.encode(message.config, writer.uint32(18).fork()).join();
+    }
+    if (message.rxReferenceDbm !== undefined) {
+      writer.uint32(25).double(message.rxReferenceDbm);
+    }
+    if (message.anGrpcAddr !== undefined) {
+      writer.uint32(34).string(message.anGrpcAddr);
+    }
+    if (message.pagingRetry !== undefined) {
+      PagingRetryConfig.encode(message.pagingRetry, writer.uint32(42).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): EnrollResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseEnrollResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.cell = CellId.decode(reader, reader.uint32());
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.config = BtsConfig.decode(reader, reader.uint32());
+          continue;
+        }
+        case 3: {
+          if (tag !== 25) {
+            break;
+          }
+
+          message.rxReferenceDbm = reader.double();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.anGrpcAddr = reader.string();
+          continue;
+        }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          message.pagingRetry = PagingRetryConfig.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): EnrollResponse {
+    return {
+      cell: isSet(object.cell) ? CellId.fromJSON(object.cell) : undefined,
+      config: isSet(object.config) ? BtsConfig.fromJSON(object.config) : undefined,
+      rxReferenceDbm: isSet(object.rxReferenceDbm)
+        ? globalThis.Number(object.rxReferenceDbm)
+        : isSet(object.rx_reference_dbm)
+        ? globalThis.Number(object.rx_reference_dbm)
+        : undefined,
+      anGrpcAddr: isSet(object.anGrpcAddr)
+        ? globalThis.String(object.anGrpcAddr)
+        : isSet(object.an_grpc_addr)
+        ? globalThis.String(object.an_grpc_addr)
+        : undefined,
+      pagingRetry: isSet(object.pagingRetry)
+        ? PagingRetryConfig.fromJSON(object.pagingRetry)
+        : isSet(object.paging_retry)
+        ? PagingRetryConfig.fromJSON(object.paging_retry)
+        : undefined,
+    };
+  },
+
+  toJSON(message: EnrollResponse): unknown {
+    const obj: any = {};
+    if (message.cell !== undefined) {
+      obj.cell = CellId.toJSON(message.cell);
+    }
+    if (message.config !== undefined) {
+      obj.config = BtsConfig.toJSON(message.config);
+    }
+    if (message.rxReferenceDbm !== undefined) {
+      obj.rxReferenceDbm = message.rxReferenceDbm;
+    }
+    if (message.anGrpcAddr !== undefined) {
+      obj.anGrpcAddr = message.anGrpcAddr;
+    }
+    if (message.pagingRetry !== undefined) {
+      obj.pagingRetry = PagingRetryConfig.toJSON(message.pagingRetry);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<EnrollResponse>): EnrollResponse {
+    return EnrollResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<EnrollResponse>): EnrollResponse {
+    const message = createBaseEnrollResponse();
+    message.cell = (object.cell !== undefined && object.cell !== null) ? CellId.fromPartial(object.cell) : undefined;
+    message.config = (object.config !== undefined && object.config !== null)
+      ? BtsConfig.fromPartial(object.config)
+      : undefined;
+    message.rxReferenceDbm = object.rxReferenceDbm ?? undefined;
+    message.anGrpcAddr = object.anGrpcAddr ?? undefined;
+    message.pagingRetry = (object.pagingRetry !== undefined && object.pagingRetry !== null)
+      ? PagingRetryConfig.fromPartial(object.pagingRetry)
+      : undefined;
+    return message;
+  },
+};
+
+function createBasePagingRetryConfig(): PagingRetryConfig {
+  return { ackTimeoutMs: 0, maxRetries: 0 };
+}
+
+export const PagingRetryConfig: MessageFns<PagingRetryConfig> = {
+  encode(message: PagingRetryConfig, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.ackTimeoutMs !== 0) {
+      writer.uint32(8).uint32(message.ackTimeoutMs);
+    }
+    if (message.maxRetries !== 0) {
+      writer.uint32(16).uint32(message.maxRetries);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PagingRetryConfig {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePagingRetryConfig();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.ackTimeoutMs = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.maxRetries = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PagingRetryConfig {
+    return {
+      ackTimeoutMs: isSet(object.ackTimeoutMs)
+        ? globalThis.Number(object.ackTimeoutMs)
+        : isSet(object.ack_timeout_ms)
+        ? globalThis.Number(object.ack_timeout_ms)
+        : 0,
+      maxRetries: isSet(object.maxRetries)
+        ? globalThis.Number(object.maxRetries)
+        : isSet(object.max_retries)
+        ? globalThis.Number(object.max_retries)
+        : 0,
+    };
+  },
+
+  toJSON(message: PagingRetryConfig): unknown {
+    const obj: any = {};
+    if (message.ackTimeoutMs !== 0) {
+      obj.ackTimeoutMs = Math.round(message.ackTimeoutMs);
+    }
+    if (message.maxRetries !== 0) {
+      obj.maxRetries = Math.round(message.maxRetries);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PagingRetryConfig>): PagingRetryConfig {
+    return PagingRetryConfig.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PagingRetryConfig>): PagingRetryConfig {
+    const message = createBasePagingRetryConfig();
+    message.ackTimeoutMs = object.ackTimeoutMs ?? 0;
+    message.maxRetries = object.maxRetries ?? 0;
+    return message;
+  },
+};
+
+function createBaseBtsSummary(): BtsSummary {
+  return {
+    peerId: "",
+    managementEndpoint: "",
+    cell: undefined,
+    state: 0,
+    pilotPn: 0,
+    bandClass: "",
+    cdmaChannel: 0,
+    sid: 0,
+    nid: 0,
+    evdoEnabled: false,
+    servedMobiles: undefined,
+    statusDetail: undefined,
+    evdoColorCode: undefined,
+    anGrpcAddr: undefined,
+  };
+}
+
+export const BtsSummary: MessageFns<BtsSummary> = {
+  encode(message: BtsSummary, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.peerId !== "") {
+      writer.uint32(98).string(message.peerId);
+    }
+    if (message.managementEndpoint !== "") {
+      writer.uint32(106).string(message.managementEndpoint);
+    }
+    if (message.cell !== undefined) {
+      CellId.encode(message.cell, writer.uint32(10).fork()).join();
+    }
+    if (message.state !== 0) {
+      writer.uint32(16).int32(message.state);
+    }
+    if (message.pilotPn !== 0) {
+      writer.uint32(24).uint32(message.pilotPn);
+    }
+    if (message.bandClass !== "") {
+      writer.uint32(34).string(message.bandClass);
+    }
+    if (message.cdmaChannel !== 0) {
+      writer.uint32(40).uint32(message.cdmaChannel);
+    }
+    if (message.sid !== 0) {
+      writer.uint32(48).uint32(message.sid);
+    }
+    if (message.nid !== 0) {
+      writer.uint32(56).uint32(message.nid);
+    }
+    if (message.evdoEnabled !== false) {
+      writer.uint32(64).bool(message.evdoEnabled);
+    }
+    if (message.servedMobiles !== undefined) {
+      writer.uint32(72).uint32(message.servedMobiles);
+    }
+    if (message.statusDetail !== undefined) {
+      writer.uint32(82).string(message.statusDetail);
+    }
+    if (message.evdoColorCode !== undefined) {
+      writer.uint32(88).uint32(message.evdoColorCode);
+    }
+    if (message.anGrpcAddr !== undefined) {
+      writer.uint32(114).string(message.anGrpcAddr);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): BtsSummary {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseBtsSummary();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 12: {
+          if (tag !== 98) {
+            break;
+          }
+
+          message.peerId = reader.string();
+          continue;
+        }
+        case 13: {
+          if (tag !== 106) {
+            break;
+          }
+
+          message.managementEndpoint = reader.string();
+          continue;
+        }
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.cell = CellId.decode(reader, reader.uint32());
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.state = reader.int32() as any;
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.pilotPn = reader.uint32();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.bandClass = reader.string();
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.cdmaChannel = reader.uint32();
+          continue;
+        }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.sid = reader.uint32();
+          continue;
+        }
+        case 7: {
+          if (tag !== 56) {
+            break;
+          }
+
+          message.nid = reader.uint32();
+          continue;
+        }
+        case 8: {
+          if (tag !== 64) {
+            break;
+          }
+
+          message.evdoEnabled = reader.bool();
+          continue;
+        }
+        case 9: {
+          if (tag !== 72) {
+            break;
+          }
+
+          message.servedMobiles = reader.uint32();
+          continue;
+        }
+        case 10: {
+          if (tag !== 82) {
+            break;
+          }
+
+          message.statusDetail = reader.string();
+          continue;
+        }
+        case 11: {
+          if (tag !== 88) {
+            break;
+          }
+
+          message.evdoColorCode = reader.uint32();
+          continue;
+        }
+        case 14: {
+          if (tag !== 114) {
+            break;
+          }
+
+          message.anGrpcAddr = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): BtsSummary {
+    return {
+      peerId: isSet(object.peerId)
+        ? globalThis.String(object.peerId)
+        : isSet(object.peer_id)
+        ? globalThis.String(object.peer_id)
+        : "",
+      managementEndpoint: isSet(object.managementEndpoint)
+        ? globalThis.String(object.managementEndpoint)
+        : isSet(object.management_endpoint)
+        ? globalThis.String(object.management_endpoint)
+        : "",
+      cell: isSet(object.cell) ? CellId.fromJSON(object.cell) : undefined,
+      state: isSet(object.state) ? btsAttachStateFromJSON(object.state) : 0,
+      pilotPn: isSet(object.pilotPn)
+        ? globalThis.Number(object.pilotPn)
+        : isSet(object.pilot_pn)
+        ? globalThis.Number(object.pilot_pn)
+        : 0,
+      bandClass: isSet(object.bandClass)
+        ? globalThis.String(object.bandClass)
+        : isSet(object.band_class)
+        ? globalThis.String(object.band_class)
+        : "",
+      cdmaChannel: isSet(object.cdmaChannel)
+        ? globalThis.Number(object.cdmaChannel)
+        : isSet(object.cdma_channel)
+        ? globalThis.Number(object.cdma_channel)
+        : 0,
+      sid: isSet(object.sid) ? globalThis.Number(object.sid) : 0,
+      nid: isSet(object.nid) ? globalThis.Number(object.nid) : 0,
+      evdoEnabled: isSet(object.evdoEnabled)
+        ? globalThis.Boolean(object.evdoEnabled)
+        : isSet(object.evdo_enabled)
+        ? globalThis.Boolean(object.evdo_enabled)
+        : false,
+      servedMobiles: isSet(object.servedMobiles)
+        ? globalThis.Number(object.servedMobiles)
+        : isSet(object.served_mobiles)
+        ? globalThis.Number(object.served_mobiles)
+        : undefined,
+      statusDetail: isSet(object.statusDetail)
+        ? globalThis.String(object.statusDetail)
+        : isSet(object.status_detail)
+        ? globalThis.String(object.status_detail)
+        : undefined,
+      evdoColorCode: isSet(object.evdoColorCode)
+        ? globalThis.Number(object.evdoColorCode)
+        : isSet(object.evdo_color_code)
+        ? globalThis.Number(object.evdo_color_code)
+        : undefined,
+      anGrpcAddr: isSet(object.anGrpcAddr)
+        ? globalThis.String(object.anGrpcAddr)
+        : isSet(object.an_grpc_addr)
+        ? globalThis.String(object.an_grpc_addr)
+        : undefined,
+    };
+  },
+
+  toJSON(message: BtsSummary): unknown {
+    const obj: any = {};
+    if (message.peerId !== "") {
+      obj.peerId = message.peerId;
+    }
+    if (message.managementEndpoint !== "") {
+      obj.managementEndpoint = message.managementEndpoint;
+    }
+    if (message.cell !== undefined) {
+      obj.cell = CellId.toJSON(message.cell);
+    }
+    if (message.state !== 0) {
+      obj.state = btsAttachStateToJSON(message.state);
+    }
+    if (message.pilotPn !== 0) {
+      obj.pilotPn = Math.round(message.pilotPn);
+    }
+    if (message.bandClass !== "") {
+      obj.bandClass = message.bandClass;
+    }
+    if (message.cdmaChannel !== 0) {
+      obj.cdmaChannel = Math.round(message.cdmaChannel);
+    }
+    if (message.sid !== 0) {
+      obj.sid = Math.round(message.sid);
+    }
+    if (message.nid !== 0) {
+      obj.nid = Math.round(message.nid);
+    }
+    if (message.evdoEnabled !== false) {
+      obj.evdoEnabled = message.evdoEnabled;
+    }
+    if (message.servedMobiles !== undefined) {
+      obj.servedMobiles = Math.round(message.servedMobiles);
+    }
+    if (message.statusDetail !== undefined) {
+      obj.statusDetail = message.statusDetail;
+    }
+    if (message.evdoColorCode !== undefined) {
+      obj.evdoColorCode = Math.round(message.evdoColorCode);
+    }
+    if (message.anGrpcAddr !== undefined) {
+      obj.anGrpcAddr = message.anGrpcAddr;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<BtsSummary>): BtsSummary {
+    return BtsSummary.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<BtsSummary>): BtsSummary {
+    const message = createBaseBtsSummary();
+    message.peerId = object.peerId ?? "";
+    message.managementEndpoint = object.managementEndpoint ?? "";
+    message.cell = (object.cell !== undefined && object.cell !== null) ? CellId.fromPartial(object.cell) : undefined;
+    message.state = object.state ?? 0;
+    message.pilotPn = object.pilotPn ?? 0;
+    message.bandClass = object.bandClass ?? "";
+    message.cdmaChannel = object.cdmaChannel ?? 0;
+    message.sid = object.sid ?? 0;
+    message.nid = object.nid ?? 0;
+    message.evdoEnabled = object.evdoEnabled ?? false;
+    message.servedMobiles = object.servedMobiles ?? undefined;
+    message.statusDetail = object.statusDetail ?? undefined;
+    message.evdoColorCode = object.evdoColorCode ?? undefined;
+    message.anGrpcAddr = object.anGrpcAddr ?? undefined;
+    return message;
+  },
+};
+
+function createBaseBtsList(): BtsList {
+  return { bts: [] };
+}
+
+export const BtsList: MessageFns<BtsList> = {
+  encode(message: BtsList, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.bts) {
+      BtsSummary.encode(v!, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): BtsList {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseBtsList();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.bts.push(BtsSummary.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): BtsList {
+    return { bts: globalThis.Array.isArray(object?.bts) ? object.bts.map((e: any) => BtsSummary.fromJSON(e)) : [] };
+  },
+
+  toJSON(message: BtsList): unknown {
+    const obj: any = {};
+    if (message.bts?.length) {
+      obj.bts = message.bts.map((e) => BtsSummary.toJSON(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<BtsList>): BtsList {
+    return BtsList.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<BtsList>): BtsList {
+    const message = createBaseBtsList();
+    message.bts = object.bts?.map((e) => BtsSummary.fromPartial(e)) || [];
+    return message;
+  },
+};
+
 function createBaseReversePowerControlRequest(): ReversePowerControlRequest {
-  return { walshCode: 0 };
+  return { walshCode: 0, cell: undefined };
 }
 
 export const ReversePowerControlRequest: MessageFns<ReversePowerControlRequest> = {
   encode(message: ReversePowerControlRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
     if (message.walshCode !== 0) {
       writer.uint32(8).uint32(message.walshCode);
+    }
+    if (message.cell !== undefined) {
+      CellId.encode(message.cell, writer.uint32(18).fork()).join();
     }
     return writer;
   },
@@ -61,6 +969,14 @@ export const ReversePowerControlRequest: MessageFns<ReversePowerControlRequest> 
           message.walshCode = reader.uint32();
           continue;
         }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.cell = CellId.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -77,6 +993,7 @@ export const ReversePowerControlRequest: MessageFns<ReversePowerControlRequest> 
         : isSet(object.walsh_code)
         ? globalThis.Number(object.walsh_code)
         : 0,
+      cell: isSet(object.cell) ? CellId.fromJSON(object.cell) : undefined,
     };
   },
 
@@ -84,6 +1001,9 @@ export const ReversePowerControlRequest: MessageFns<ReversePowerControlRequest> 
     const obj: any = {};
     if (message.walshCode !== 0) {
       obj.walshCode = Math.round(message.walshCode);
+    }
+    if (message.cell !== undefined) {
+      obj.cell = CellId.toJSON(message.cell);
     }
     return obj;
   },
@@ -94,18 +1014,101 @@ export const ReversePowerControlRequest: MessageFns<ReversePowerControlRequest> 
   fromPartial(object: DeepPartial<ReversePowerControlRequest>): ReversePowerControlRequest {
     const message = createBaseReversePowerControlRequest();
     message.walshCode = object.walshCode ?? 0;
+    message.cell = (object.cell !== undefined && object.cell !== null) ? CellId.fromPartial(object.cell) : undefined;
+    return message;
+  },
+};
+
+function createBaseReversePowerControlEntry(): ReversePowerControlEntry {
+  return { walshCode: 0, power: undefined };
+}
+
+export const ReversePowerControlEntry: MessageFns<ReversePowerControlEntry> = {
+  encode(message: ReversePowerControlEntry, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.walshCode !== 0) {
+      writer.uint32(8).uint32(message.walshCode);
+    }
+    if (message.power !== undefined) {
+      TrafficChannelPower.encode(message.power, writer.uint32(18).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ReversePowerControlEntry {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseReversePowerControlEntry();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.walshCode = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.power = TrafficChannelPower.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ReversePowerControlEntry {
+    return {
+      walshCode: isSet(object.walshCode)
+        ? globalThis.Number(object.walshCode)
+        : isSet(object.walsh_code)
+        ? globalThis.Number(object.walsh_code)
+        : 0,
+      power: isSet(object.power) ? TrafficChannelPower.fromJSON(object.power) : undefined,
+    };
+  },
+
+  toJSON(message: ReversePowerControlEntry): unknown {
+    const obj: any = {};
+    if (message.walshCode !== 0) {
+      obj.walshCode = Math.round(message.walshCode);
+    }
+    if (message.power !== undefined) {
+      obj.power = TrafficChannelPower.toJSON(message.power);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<ReversePowerControlEntry>): ReversePowerControlEntry {
+    return ReversePowerControlEntry.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<ReversePowerControlEntry>): ReversePowerControlEntry {
+    const message = createBaseReversePowerControlEntry();
+    message.walshCode = object.walshCode ?? 0;
+    message.power = (object.power !== undefined && object.power !== null)
+      ? TrafficChannelPower.fromPartial(object.power)
+      : undefined;
     return message;
   },
 };
 
 function createBaseReversePowerControlList(): ReversePowerControlList {
-  return { powerControls: [] };
+  return { entries: [] };
 }
 
 export const ReversePowerControlList: MessageFns<ReversePowerControlList> = {
   encode(message: ReversePowerControlList, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    for (const v of message.powerControls) {
-      TrafficChannelPower.encode(v!, writer.uint32(10).fork()).join();
+    for (const v of message.entries) {
+      ReversePowerControlEntry.encode(v!, writer.uint32(18).fork()).join();
     }
     return writer;
   },
@@ -117,12 +1120,12 @@ export const ReversePowerControlList: MessageFns<ReversePowerControlList> = {
     while (reader.pos < end) {
       const tag = reader.uint32();
       switch (tag >>> 3) {
-        case 1: {
-          if (tag !== 10) {
+        case 2: {
+          if (tag !== 18) {
             break;
           }
 
-          message.powerControls.push(TrafficChannelPower.decode(reader, reader.uint32()));
+          message.entries.push(ReversePowerControlEntry.decode(reader, reader.uint32()));
           continue;
         }
       }
@@ -136,18 +1139,16 @@ export const ReversePowerControlList: MessageFns<ReversePowerControlList> = {
 
   fromJSON(object: any): ReversePowerControlList {
     return {
-      powerControls: globalThis.Array.isArray(object?.powerControls)
-        ? object.powerControls.map((e: any) => TrafficChannelPower.fromJSON(e))
-        : globalThis.Array.isArray(object?.power_controls)
-        ? object.power_controls.map((e: any) => TrafficChannelPower.fromJSON(e))
+      entries: globalThis.Array.isArray(object?.entries)
+        ? object.entries.map((e: any) => ReversePowerControlEntry.fromJSON(e))
         : [],
     };
   },
 
   toJSON(message: ReversePowerControlList): unknown {
     const obj: any = {};
-    if (message.powerControls?.length) {
-      obj.powerControls = message.powerControls.map((e) => TrafficChannelPower.toJSON(e));
+    if (message.entries?.length) {
+      obj.entries = message.entries.map((e) => ReversePowerControlEntry.toJSON(e));
     }
     return obj;
   },
@@ -157,21 +1158,52 @@ export const ReversePowerControlList: MessageFns<ReversePowerControlList> = {
   },
   fromPartial(object: DeepPartial<ReversePowerControlList>): ReversePowerControlList {
     const message = createBaseReversePowerControlList();
-    message.powerControls = object.powerControls?.map((e) => TrafficChannelPower.fromPartial(e)) || [];
+    message.entries = object.entries?.map((e) => ReversePowerControlEntry.fromPartial(e)) || [];
     return message;
   },
 };
 
-/** BTS-local management API for radio state, capture control, and BTS-originated events. */
+/**
+ * BTS-local management API for radio state, capture control, and BTS-originated events.
+ *
+ * A BTS serves this for the single cell it operates. A BSC serves the same API
+ * for every cell enrolled with it, selecting the target with `CellId`, so the
+ * same client works against either.
+ */
 export type BtsManagementServiceDefinition = typeof BtsManagementServiceDefinition;
 export const BtsManagementServiceDefinition = {
   name: "BtsManagementService",
   fullName: "bts_management.v1.BtsManagementService",
   methods: {
+    /**
+     * Returns the cell identity and radio configuration needed to serve this
+     * BTS. Every call reports the configuration as it stands, so a BTS
+     * restarted with an edited config is picked up on re-enrollment.
+     */
+    enroll: {
+      name: "Enroll",
+      requestType: EnrollRequest as typeof EnrollRequest,
+      requestStream: false,
+      responseType: EnrollResponse as typeof EnrollResponse,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * Lists the cells reachable through this endpoint. A BTS reports the single
+     * cell it operates. A BSC reports every enrolled cell.
+     */
+    listBts: {
+      name: "ListBts",
+      requestType: Empty as typeof Empty,
+      requestStream: false,
+      responseType: BtsList as typeof BtsList,
+      responseStream: false,
+      options: {},
+    },
     /** Returns BTS runtime status and configured identity. */
     getBtsStatus: {
       name: "GetBtsStatus",
-      requestType: Empty as typeof Empty,
+      requestType: CellRequest as typeof CellRequest,
       requestStream: false,
       responseType: SystemStatus as typeof SystemStatus,
       responseStream: false,
@@ -180,7 +1212,7 @@ export const BtsManagementServiceDefinition = {
     /** Returns the active BTS radio and overhead configuration. */
     getBtsConfig: {
       name: "GetBtsConfig",
-      requestType: Empty as typeof Empty,
+      requestType: CellRequest as typeof CellRequest,
       requestStream: false,
       responseType: BtsConfig as typeof BtsConfig,
       responseStream: false,
@@ -189,7 +1221,7 @@ export const BtsManagementServiceDefinition = {
     /** Returns the latest TX/RX/bearer radio metrics snapshot. */
     getRadioMetrics: {
       name: "GetRadioMetrics",
-      requestType: Empty as typeof Empty,
+      requestType: CellRequest as typeof CellRequest,
       requestStream: false,
       responseType: RadioMetrics as typeof RadioMetrics,
       responseStream: false,
@@ -198,7 +1230,7 @@ export const BtsManagementServiceDefinition = {
     /** Streams TX/RX/bearer radio metrics as they are updated. */
     streamRadioMetrics: {
       name: "StreamRadioMetrics",
-      requestType: Empty as typeof Empty,
+      requestType: CellRequest as typeof CellRequest,
       requestStream: false,
       responseType: RadioMetrics as typeof RadioMetrics,
       responseStream: true,
@@ -207,7 +1239,7 @@ export const BtsManagementServiceDefinition = {
     /** Returns current IQ capture state and output paths. */
     getIqCaptureStatus: {
       name: "GetIqCaptureStatus",
-      requestType: Empty as typeof Empty,
+      requestType: CellRequest as typeof CellRequest,
       requestStream: false,
       responseType: IqCaptureStatus as typeof IqCaptureStatus,
       responseStream: false,
@@ -216,7 +1248,7 @@ export const BtsManagementServiceDefinition = {
     /** Starts a BTS-side IQ capture using the configured capture directory. */
     startIqCapture: {
       name: "StartIqCapture",
-      requestType: Empty as typeof Empty,
+      requestType: CellRequest as typeof CellRequest,
       requestStream: false,
       responseType: IqCaptureStatus as typeof IqCaptureStatus,
       responseStream: false,
@@ -225,7 +1257,7 @@ export const BtsManagementServiceDefinition = {
     /** Stops the active BTS-side IQ capture, if any. */
     stopIqCapture: {
       name: "StopIqCapture",
-      requestType: Empty as typeof Empty,
+      requestType: CellRequest as typeof CellRequest,
       requestStream: false,
       responseType: IqCaptureStatus as typeof IqCaptureStatus,
       responseStream: false,
@@ -234,7 +1266,7 @@ export const BtsManagementServiceDefinition = {
     /** Lists local pilot, sync, paging, access, and traffic resources. */
     listLocalRadioResources: {
       name: "ListLocalRadioResources",
-      requestType: Empty as typeof Empty,
+      requestType: CellRequest as typeof CellRequest,
       requestStream: false,
       responseType: ChannelList as typeof ChannelList,
       responseStream: false,
@@ -252,7 +1284,7 @@ export const BtsManagementServiceDefinition = {
     /** Lists reverse closed-loop power control state for active traffic channels. */
     listReversePowerControls: {
       name: "ListReversePowerControls",
-      requestType: Empty as typeof Empty,
+      requestType: CellRequest as typeof CellRequest,
       requestStream: false,
       responseType: ReversePowerControlList as typeof ReversePowerControlList,
       responseStream: false,
@@ -270,7 +1302,7 @@ export const BtsManagementServiceDefinition = {
     /** Streams BTS-emitted paging-channel transmissions. */
     streamPchTransmissions: {
       name: "StreamPchTransmissions",
-      requestType: Empty as typeof Empty,
+      requestType: CellRequest as typeof CellRequest,
       requestStream: false,
       responseType: PagingEvent as typeof PagingEvent,
       responseStream: true,
@@ -280,25 +1312,42 @@ export const BtsManagementServiceDefinition = {
 } as const;
 
 export interface BtsManagementServiceImplementation<CallContextExt = {}> {
+  /**
+   * Returns the cell identity and radio configuration needed to serve this
+   * BTS. Every call reports the configuration as it stands, so a BTS
+   * restarted with an edited config is picked up on re-enrollment.
+   */
+  enroll(request: EnrollRequest, context: CallContext & CallContextExt): Promise<DeepPartial<EnrollResponse>>;
+  /**
+   * Lists the cells reachable through this endpoint. A BTS reports the single
+   * cell it operates. A BSC reports every enrolled cell.
+   */
+  listBts(request: Empty, context: CallContext & CallContextExt): Promise<DeepPartial<BtsList>>;
   /** Returns BTS runtime status and configured identity. */
-  getBtsStatus(request: Empty, context: CallContext & CallContextExt): Promise<DeepPartial<SystemStatus>>;
+  getBtsStatus(request: CellRequest, context: CallContext & CallContextExt): Promise<DeepPartial<SystemStatus>>;
   /** Returns the active BTS radio and overhead configuration. */
-  getBtsConfig(request: Empty, context: CallContext & CallContextExt): Promise<DeepPartial<BtsConfig>>;
+  getBtsConfig(request: CellRequest, context: CallContext & CallContextExt): Promise<DeepPartial<BtsConfig>>;
   /** Returns the latest TX/RX/bearer radio metrics snapshot. */
-  getRadioMetrics(request: Empty, context: CallContext & CallContextExt): Promise<DeepPartial<RadioMetrics>>;
+  getRadioMetrics(request: CellRequest, context: CallContext & CallContextExt): Promise<DeepPartial<RadioMetrics>>;
   /** Streams TX/RX/bearer radio metrics as they are updated. */
   streamRadioMetrics(
-    request: Empty,
+    request: CellRequest,
     context: CallContext & CallContextExt,
   ): ServerStreamingMethodResult<DeepPartial<RadioMetrics>>;
   /** Returns current IQ capture state and output paths. */
-  getIqCaptureStatus(request: Empty, context: CallContext & CallContextExt): Promise<DeepPartial<IqCaptureStatus>>;
+  getIqCaptureStatus(
+    request: CellRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<IqCaptureStatus>>;
   /** Starts a BTS-side IQ capture using the configured capture directory. */
-  startIqCapture(request: Empty, context: CallContext & CallContextExt): Promise<DeepPartial<IqCaptureStatus>>;
+  startIqCapture(request: CellRequest, context: CallContext & CallContextExt): Promise<DeepPartial<IqCaptureStatus>>;
   /** Stops the active BTS-side IQ capture, if any. */
-  stopIqCapture(request: Empty, context: CallContext & CallContextExt): Promise<DeepPartial<IqCaptureStatus>>;
+  stopIqCapture(request: CellRequest, context: CallContext & CallContextExt): Promise<DeepPartial<IqCaptureStatus>>;
   /** Lists local pilot, sync, paging, access, and traffic resources. */
-  listLocalRadioResources(request: Empty, context: CallContext & CallContextExt): Promise<DeepPartial<ChannelList>>;
+  listLocalRadioResources(
+    request: CellRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<ChannelList>>;
   /** Returns reverse closed-loop power control state for one traffic Walsh code. */
   getReversePowerControl(
     request: ReversePowerControlRequest,
@@ -306,7 +1355,7 @@ export interface BtsManagementServiceImplementation<CallContextExt = {}> {
   ): Promise<DeepPartial<TrafficChannelPower>>;
   /** Lists reverse closed-loop power control state for active traffic channels. */
   listReversePowerControls(
-    request: Empty,
+    request: CellRequest,
     context: CallContext & CallContextExt,
   ): Promise<DeepPartial<ReversePowerControlList>>;
   /** Applies or clears a manual reverse power-control target override. */
@@ -316,28 +1365,48 @@ export interface BtsManagementServiceImplementation<CallContextExt = {}> {
   ): Promise<DeepPartial<SetTrafficChannelPowerOverrideResponse>>;
   /** Streams BTS-emitted paging-channel transmissions. */
   streamPchTransmissions(
-    request: Empty,
+    request: CellRequest,
     context: CallContext & CallContextExt,
   ): ServerStreamingMethodResult<DeepPartial<PagingEvent>>;
 }
 
 export interface BtsManagementServiceClient<CallOptionsExt = {}> {
+  /**
+   * Returns the cell identity and radio configuration needed to serve this
+   * BTS. Every call reports the configuration as it stands, so a BTS
+   * restarted with an edited config is picked up on re-enrollment.
+   */
+  enroll(request: DeepPartial<EnrollRequest>, options?: CallOptions & CallOptionsExt): Promise<EnrollResponse>;
+  /**
+   * Lists the cells reachable through this endpoint. A BTS reports the single
+   * cell it operates. A BSC reports every enrolled cell.
+   */
+  listBts(request: DeepPartial<Empty>, options?: CallOptions & CallOptionsExt): Promise<BtsList>;
   /** Returns BTS runtime status and configured identity. */
-  getBtsStatus(request: DeepPartial<Empty>, options?: CallOptions & CallOptionsExt): Promise<SystemStatus>;
+  getBtsStatus(request: DeepPartial<CellRequest>, options?: CallOptions & CallOptionsExt): Promise<SystemStatus>;
   /** Returns the active BTS radio and overhead configuration. */
-  getBtsConfig(request: DeepPartial<Empty>, options?: CallOptions & CallOptionsExt): Promise<BtsConfig>;
+  getBtsConfig(request: DeepPartial<CellRequest>, options?: CallOptions & CallOptionsExt): Promise<BtsConfig>;
   /** Returns the latest TX/RX/bearer radio metrics snapshot. */
-  getRadioMetrics(request: DeepPartial<Empty>, options?: CallOptions & CallOptionsExt): Promise<RadioMetrics>;
+  getRadioMetrics(request: DeepPartial<CellRequest>, options?: CallOptions & CallOptionsExt): Promise<RadioMetrics>;
   /** Streams TX/RX/bearer radio metrics as they are updated. */
-  streamRadioMetrics(request: DeepPartial<Empty>, options?: CallOptions & CallOptionsExt): AsyncIterable<RadioMetrics>;
+  streamRadioMetrics(
+    request: DeepPartial<CellRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): AsyncIterable<RadioMetrics>;
   /** Returns current IQ capture state and output paths. */
-  getIqCaptureStatus(request: DeepPartial<Empty>, options?: CallOptions & CallOptionsExt): Promise<IqCaptureStatus>;
+  getIqCaptureStatus(
+    request: DeepPartial<CellRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<IqCaptureStatus>;
   /** Starts a BTS-side IQ capture using the configured capture directory. */
-  startIqCapture(request: DeepPartial<Empty>, options?: CallOptions & CallOptionsExt): Promise<IqCaptureStatus>;
+  startIqCapture(request: DeepPartial<CellRequest>, options?: CallOptions & CallOptionsExt): Promise<IqCaptureStatus>;
   /** Stops the active BTS-side IQ capture, if any. */
-  stopIqCapture(request: DeepPartial<Empty>, options?: CallOptions & CallOptionsExt): Promise<IqCaptureStatus>;
+  stopIqCapture(request: DeepPartial<CellRequest>, options?: CallOptions & CallOptionsExt): Promise<IqCaptureStatus>;
   /** Lists local pilot, sync, paging, access, and traffic resources. */
-  listLocalRadioResources(request: DeepPartial<Empty>, options?: CallOptions & CallOptionsExt): Promise<ChannelList>;
+  listLocalRadioResources(
+    request: DeepPartial<CellRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<ChannelList>;
   /** Returns reverse closed-loop power control state for one traffic Walsh code. */
   getReversePowerControl(
     request: DeepPartial<ReversePowerControlRequest>,
@@ -345,7 +1414,7 @@ export interface BtsManagementServiceClient<CallOptionsExt = {}> {
   ): Promise<TrafficChannelPower>;
   /** Lists reverse closed-loop power control state for active traffic channels. */
   listReversePowerControls(
-    request: DeepPartial<Empty>,
+    request: DeepPartial<CellRequest>,
     options?: CallOptions & CallOptionsExt,
   ): Promise<ReversePowerControlList>;
   /** Applies or clears a manual reverse power-control target override. */
@@ -355,7 +1424,7 @@ export interface BtsManagementServiceClient<CallOptionsExt = {}> {
   ): Promise<SetTrafficChannelPowerOverrideResponse>;
   /** Streams BTS-emitted paging-channel transmissions. */
   streamPchTransmissions(
-    request: DeepPartial<Empty>,
+    request: DeepPartial<CellRequest>,
     options?: CallOptions & CallOptionsExt,
   ): AsyncIterable<PagingEvent>;
 }

@@ -1,10 +1,11 @@
-import { getAnClient } from "@/lib/grpc/an-client";
+import { peerRequestFromUrl, selectorFromUrl } from "@/lib/cell";
+import { getNetworkManagementClient } from "@/lib/grpc/client";
 import { GetSessionResponse } from "@/lib/proto/an/v1/service";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(
-  _req: Request,
+  req: Request,
   { params }: { params: Promise<{ uati: string }> },
 ) {
   const { uati } = await params;
@@ -15,9 +16,13 @@ export async function GET(
   const abort = new AbortController();
   const timeout = setTimeout(() => abort.abort(), 5000);
   try {
-    const client = getAnClient();
-    const result = await client.getSession(
-      { uati: uatiNum },
+    const client = getNetworkManagementClient();
+    const result = await client.getAnSession(
+      {
+        selector: selectorFromUrl(req.url),
+        cell: peerRequestFromUrl(req.url),
+        request: { uati: uatiNum },
+      },
       { signal: abort.signal },
     );
     return Response.json(GetSessionResponse.toJSON(result));

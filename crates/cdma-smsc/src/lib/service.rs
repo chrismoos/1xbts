@@ -39,17 +39,22 @@ pub async fn run_grpc_server(
         .await
 }
 
+/// Binds the SMSC gRPC listener and serves it on a background task.
+///
+/// The returned handle resolves when the server stops, which for a bind
+/// failure is almost immediately. A caller that waits only on a shutdown
+/// signal and ignores it leaves the process up with a dead listener.
 pub async fn spawn_configured_smsc_service(
     config: crate::SmscNodeConfig,
-) -> Result<SocketAddr, String> {
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), String> {
     let addr = config.grpc_listen_addr;
     let repo = PostgresSmscRepository::connect_from_config(&config).await?;
-    tokio::spawn(async move {
+    let served = tokio::spawn(async move {
         if let Err(error) = run_grpc_server(addr, Arc::new(repo)).await {
             log::error!("SMSC gRPC server error: {error}");
         }
     });
-    Ok(addr)
+    Ok((addr, served))
 }
 
 fn datetime_to_timestamp(dt: chrono::DateTime<chrono::Utc>) -> prost_types::Timestamp {

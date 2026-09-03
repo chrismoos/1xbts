@@ -18,7 +18,7 @@ use cdma_common::consts::{
     SERVICE_OPTION_OTASP, SERVICE_OPTION_PACKET_DATA, SERVICE_OPTION_SMS,
 };
 use cdma_hlr::model::{RegistrationBinding, SubscriberIdentity};
-use cdma_ios::{A1TransportError, EncodedA1Message, VoiceBearerFrame, VoiceBearerManager};
+use cdma_ios::{EncodedA1Message, VoiceBearerFrame, VoiceBearerManager};
 
 use crate::call_control::{CallDirection, CallId, MscCallController};
 use crate::circuit::{CircuitService, CircuitSession, DeferredPagingResponse, MscVoiceLeg};
@@ -37,17 +37,8 @@ use crate::media_gateway_service::{
 use crate::mo_call::{MoCallService, MoSubscriberRoute, select_mt_voice_service_option};
 use crate::mt_call::MtCallService;
 
-/// Trait abstracting the A1 transport endpoint (MSC side).
-///
-/// Both in-process loopback and real TCP transport implement this.
-#[async_trait::async_trait]
-pub trait MscA1Endpoint: Send + Sync {
-    /// Receives one A1 message from the BSC.
-    async fn recv_from_bsc(&self) -> Option<EncodedA1Message>;
-
-    /// Sends one A1 message toward the BSC.
-    async fn send_to_bsc(&self, message: EncodedA1Message) -> Result<(), A1TransportError>;
-}
+pub use crate::base_station::MscA1Endpoint;
+use crate::base_station::{A1Event, BaseStationId};
 
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum PagePurpose {
@@ -107,6 +98,8 @@ pub(crate) enum MtSetupError {
     NotRegistered(uuid::Uuid),
     NotPageable(uuid::Uuid, cdma_hlr::model::RegistrationState),
     NoPageableImsi(uuid::Uuid),
+    /// The subscriber's serving base station is not attached to this MSC.
+    ServingNodeUnavailable(uuid::Uuid, String),
     A1Closed,
     Other(String),
 }
@@ -127,6 +120,9 @@ impl MtSetupError {
             Self::NoPageableImsi(id) => {
                 ManagementError::Rejected(format!("subscriber {id} has no IMSI for A1 paging"))
             }
+            Self::ServingNodeUnavailable(id, node) => ManagementError::Rejected(format!(
+                "subscriber {id} is served by base station {node}, which is not attached"
+            )),
             Self::A1Closed => ManagementError::Unavailable("A1 edge to BSC is closed"),
             Self::Other(msg) => ManagementError::Rejected(msg),
         }
@@ -136,7 +132,7 @@ impl MtSetupError {
         match self {
             Self::SubscriberInactive(_) => 404,
             Self::NotRegistered(_) | Self::NotPageable(_, _) | Self::NoPageableImsi(_) => 480,
-            Self::A1Closed | Self::Other(_) => 503,
+            Self::ServingNodeUnavailable(_, _) | Self::A1Closed | Self::Other(_) => 503,
         }
     }
 }
@@ -178,10 +174,6 @@ pub struct MscRuntimeConfig {
     pub sms_retry: crate::config::SmsRetryConfig,
     /// OTASP configuration. `None` disables OTASP entirely.
     pub otasp: Option<crate::config::OtaspConfig>,
-    /// BTS overhead values required by OTASP NAM assembly. The launcher
-    /// (cdma-nib) fills this from the loaded BTS/BSC configs; standalone MSC
-    /// launchers must supply it before OTASP sessions can run.
-    pub bts_overhead: Option<crate::config::BtsOverheadConfig>,
 }
 
 impl MscRuntimeConfig {
@@ -225,7 +217,6 @@ impl MscRuntimeConfig {
             } else {
                 None
             },
-            bts_overhead: None,
         }
     }
 }
@@ -282,22 +273,14 @@ impl MscRuntime {
         let otasp_history = crate::otasp::OtaspHistory::new();
         let (otasp_event_tx, _) =
             tokio::sync::broadcast::channel::<crate::grpc::events_proto::v1::MscNetworkEvent>(256);
-        let otasp = match (config.otasp.as_ref(), config.bts_overhead.as_ref()) {
-            (Some(otasp_cfg), Some(bts_overhead)) => {
-                Some(crate::otasp::OtaspCoordinator::with_history(
-                    otasp_cfg.clone(),
-                    bts_overhead.clone(),
-                    Arc::clone(&config.hlr_repo),
-                    Arc::clone(&otasp_history),
-                    Some(otasp_event_tx.clone()),
-                ))
-            }
-            (Some(_), None) => {
-                log::warn!(
-                    "MSC: OTASP enabled in config but bts_overhead not supplied by launcher — OTASP disabled"
-                );
-                None
-            }
+        let otasp = match config.otasp.as_ref() {
+            Some(otasp_cfg) => Some(crate::otasp::OtaspCoordinator::with_history(
+                otasp_cfg.clone(),
+                otasp_cfg.home_network.clone(),
+                Arc::clone(&config.hlr_repo),
+                Arc::clone(&otasp_history),
+                Some(otasp_event_tx.clone()),
+            )),
             _ => None,
         };
         let mt_page_retry = crate::mt_page_retry::MtPageRetryService::new(
@@ -394,11 +377,19 @@ impl MscRuntime {
                     };
                     self.handle_management_request(request, a1).await;
                 }
-                inbound = a1.recv_from_bsc() => {
-                    let Some(message) = inbound else {
-                        break;
-                    };
-                    self.handle_bsc_a1_message(a1, message).await;
+                inbound = a1.recv() => {
+                    match inbound {
+                        Some(A1Event::Message { node, message }) => {
+                            self.handle_bsc_a1_message(a1, &node, message).await;
+                        }
+                        Some(A1Event::Attached(node)) => {
+                            info!("MSC: base station {node} attached");
+                        }
+                        Some(A1Event::Detached { node, calls }) => {
+                            self.handle_base_station_detached(a1, &node, calls);
+                        }
+                        None => break,
+                    }
                 }
                 result = async {
                     match self.config.voice_bearer.as_ref() {
@@ -524,17 +515,36 @@ impl MscRuntime {
     ///
     /// The gRPC server accepts management requests (initiate_call, list_calls)
     /// and feeds them into the runtime's event loop via an internal channel.
-    pub async fn run_with_grpc(&mut self, mgmt_addr: std::net::SocketAddr, a1: &dyn MscA1Endpoint) {
+    pub async fn run_with_grpc(
+        &mut self,
+        mgmt_addr: std::net::SocketAddr,
+        base_stations: Arc<crate::base_station::BaseStations>,
+        net_mgmt: crate::mgmt_proxy::NetworkManagement,
+    ) {
         let (mgmt_tx, mgmt_rx) = tokio::sync::mpsc::channel::<PendingControlRequest>(16);
         let service = crate::grpc::MscManagementServiceImpl::from_channel(mgmt_tx)
-            .with_otasp(self.otasp_event_tx());
+            .with_otasp(self.otasp_event_tx())
+            .with_base_stations(base_stations.clone());
         let server = tonic::transport::Server::builder()
             .add_service(
                 crate::grpc::msc_management::v1::msc_management_service_server::MscManagementServiceServer::new(service),
             )
+            .add_service(
+                crate::grpc::mgmt::v1::network_management_service_server::NetworkManagementServiceServer::new(net_mgmt),
+            )
             .serve(mgmt_addr);
-        tokio::spawn(server);
-        self.run(mgmt_rx, a1).await;
+        let served = tokio::spawn(server);
+        // Return when either side stops. The caller treats a returning
+        // runtime as fatal, so a dead management listener stops the MSC
+        // instead of leaving a healthy-looking process with no management
+        // plane.
+        tokio::select! {
+            result = served => match result {
+                Ok(Err(e)) => log::error!("MSC management gRPC server on {mgmt_addr} stopped: {e}"),
+                _ => log::error!("MSC management gRPC server on {mgmt_addr} stopped"),
+            },
+            _ = self.run(mgmt_rx, base_stations.as_ref()) => {}
+        }
     }
 
     async fn handle_management_request(
@@ -629,11 +639,21 @@ impl MscRuntime {
 
         let imsi = select_pageable_imsi(&resolved.identities, binding)
             .ok_or(MtSetupError::NoPageableImsi(subscriber_id))?;
+        // The page goes to the node the mobile last registered through. An
+        // unattached node is a refusal, not a broadcast.
+        let serving_node = BaseStationId(binding.serving_bs_id.clone());
+        if !a1.is_attached(&serving_node) {
+            return Err(MtSetupError::ServingNodeUnavailable(
+                subscriber_id,
+                serving_node.0,
+            ));
+        }
 
         let call_id = self.controller.create_call(
             CallDirection::MobileTerminated,
             Some(cdma_ios::MobileIdentity::Imsi(imsi.to_string())),
         );
+        a1.bind_call(call_id, &serving_node);
         self.media_gw
             .register_active_subscriber(subscriber_id, call_id);
         let tag = cdma_ios::Tag(call_id.0 as u32);
@@ -656,7 +676,7 @@ impl MscRuntime {
             call_id,
             &cdma_ios::ProcedureMessage::PagingRequest(paging_request.clone()),
         ) {
-            self.abort_mt_setup(call_id);
+            self.abort_mt_setup(a1, call_id);
             return Err(MtSetupError::Other(format!("msc paging state error: {e}")));
         }
         self.mt_call.mt_plans.insert(
@@ -676,16 +696,17 @@ impl MscRuntime {
             .send_paging_request_to_bsc(a1, call_id, paging_request, PagePurpose::Initial)
             .await
         {
-            self.abort_mt_setup(call_id);
+            self.abort_mt_setup(a1, call_id);
             return Err(MtSetupError::A1Closed);
         }
         Ok(call_id)
     }
 
-    fn abort_mt_setup(&mut self, call_id: CallId) {
+    fn abort_mt_setup(&mut self, a1: &dyn MscA1Endpoint, call_id: CallId) {
         self.mt_page_retry.cancel(call_id);
         self.controller.remove_call(call_id);
         self.stop_media_for_call(call_id);
+        a1.release_call(call_id);
     }
 
     /// Send an A1 PagingRequest; rearms the controller engine on
@@ -729,7 +750,7 @@ impl MscRuntime {
             call_id.0
         );
         if let Err(error) = a1
-            .send_to_bsc(EncodedA1Message::from_message_for_call(
+            .send(EncodedA1Message::from_message_for_call(
                 &cdma_ios::Message::new(cdma_ios::MessageType::PagingRequest, payload),
                 Some(call_id.0),
             ))
@@ -801,12 +822,14 @@ impl MscRuntime {
         self.send_clear_command(a1, call_id).await;
         self.controller.remove_call(call_id);
         self.stop_media_for_call(call_id);
+        a1.release_call(call_id);
     }
 
     /// Handles one inbound A1 message from the BSC.
     pub async fn handle_bsc_a1_message(
         &mut self,
         a1: &dyn MscA1Endpoint,
+        node: &BaseStationId,
         message: EncodedA1Message,
     ) {
         // ADDS messages use SMS Tag correlation, not the A1 transport call_id.
@@ -821,7 +844,8 @@ impl MscRuntime {
                 return;
             }
             cdma_ios::MessageType::CompleteLayer3Information if message.call_id().is_none() => {
-                self.handle_registration_notification(a1, message).await;
+                self.handle_registration_notification(a1, node, message)
+                    .await;
                 return;
             }
             _ => {}
@@ -1162,7 +1186,7 @@ impl MscRuntime {
                 };
                 info!("MSC: A1 tx ClearCommand call_id={}", call_id.0);
                 if let Err(error) = a1
-                    .send_to_bsc(EncodedA1Message::from_message_for_call(
+                    .send(EncodedA1Message::from_message_for_call(
                         &cdma_ios::Message::new(cdma_ios::MessageType::ClearCommand, payload),
                         Some(call_id.0),
                     ))
@@ -1199,6 +1223,7 @@ impl MscRuntime {
                     );
                 }
                 self.stop_media_for_call(call_id);
+                a1.release_call(call_id);
             }
             cdma_ios::MessageType::CompleteLayer3Information => {
                 let cli3 =
@@ -1302,7 +1327,7 @@ impl MscRuntime {
                 if is_non_voice_a1_service_option(service_option) {
                     let cic = self
                         .circuits
-                        .assignment_circuit_identity_code_for_next_leg(call_id);
+                        .assignment_circuit_identity_code_for_next_leg();
                     let circuit_id = cic.to_packed();
                     self.circuits.insert_circuit_session(
                         circuit_id,
@@ -1364,7 +1389,7 @@ impl MscRuntime {
                         service_option, call_id_raw
                     );
                     if let Err(error) = a1
-                        .send_to_bsc(EncodedA1Message::from_message_for_call(
+                        .send(EncodedA1Message::from_message_for_call(
                             &cdma_ios::Message::new(
                                 cdma_ios::MessageType::AssignmentRequest,
                                 payload,
@@ -1443,7 +1468,7 @@ impl MscRuntime {
 
                 let cic = self
                     .circuits
-                    .assignment_circuit_identity_code_for_next_leg(call_id);
+                    .assignment_circuit_identity_code_for_next_leg();
                 let circuit_id = cic.to_packed();
                 self.circuits.insert_circuit_session(
                     circuit_id,
@@ -1546,7 +1571,7 @@ impl MscRuntime {
                 };
                 info!("MSC: A1 tx AssignmentRequest (MO) call_id={}", call_id_raw);
                 if let Err(error) = a1
-                    .send_to_bsc(EncodedA1Message::from_message_for_call(
+                    .send(EncodedA1Message::from_message_for_call(
                         &cdma_ios::Message::new(cdma_ios::MessageType::AssignmentRequest, payload),
                         Some(call_id_raw),
                     ))
@@ -1970,7 +1995,7 @@ impl MscRuntime {
             }
         };
         if let Err(error) = a1
-            .send_to_bsc(EncodedA1Message::from_message_for_call(
+            .send(EncodedA1Message::from_message_for_call(
                 &cdma_ios::Message::new(cdma_ios::MessageType::ClearCommand, payload),
                 Some(call_id.0),
             ))
@@ -2238,6 +2263,7 @@ impl MscRuntime {
             // leak. A later ClearComplete becomes a harmless no-op.
             self.controller.remove_call(call_id);
             self.stop_media_for_call(call_id);
+            a1.release_call(call_id);
         }
     }
 
@@ -2378,6 +2404,7 @@ impl MscRuntime {
     async fn handle_registration_notification(
         &mut self,
         a1: &dyn MscA1Endpoint,
+        node: &BaseStationId,
         message: EncodedA1Message,
     ) {
         let welcome_cfg = match self.config.welcome_sms.as_ref() {
@@ -2411,10 +2438,18 @@ impl MscRuntime {
             Ok(r) => r,
             Err(_) => return, // not a LocationUpdatingRequest — ignore silently
         };
-        let imsi = match &lur.mobile_identity_imsi {
-            cdma_ios::MobileIdentity::Imsi(s) if s != "UNKNOWN" => Some(s.as_str()),
+        // Complete an abbreviated IMSI_S using the serving base station's
+        // broadcast MCC/IMSI_11_12. A BSC already sends the full IMSI, so this
+        // is a no-op there and matters for a femto peer that sends only IMSI_S.
+        let completed_imsi = match &lur.mobile_identity_imsi {
+            cdma_ios::MobileIdentity::Imsi(s) if s != "UNKNOWN" => Some(
+                a1.serving_imsi_prefix(node)
+                    .map(|(mcc, i1112)| crate::base_station::complete_imsi(&mcc, &i1112, s))
+                    .unwrap_or_else(|| s.clone()),
+            ),
             _ => None,
         };
+        let imsi = completed_imsi.as_deref();
         let esn = match &lur.mobile_identity_esn {
             Some(cdma_ios::MobileIdentity::Esn(e)) => Some(*e),
             _ => None,
@@ -2496,21 +2531,32 @@ impl MscRuntime {
                 timeout_ms: 30_000,
                 teleservice_id: None,
                 raw_user_data: None,
+                serving_node: Some(node.clone()),
             },
             a1,
         )
         .await;
     }
-}
 
-pub(crate) fn assignment_circuit_identity_code_with_offset(
-    call_id: CallId,
-    leg_offset: u16,
-) -> cdma_ios::CircuitIdentityCode {
-    let packed = (call_id.0 as u16).wrapping_add(1 + leg_offset);
-    cdma_ios::CircuitIdentityCode {
-        pcm_multiplexer: (packed >> 5) & 0x07ff,
-        timeslot: (packed & 0x1f) as u8,
+    /// Cleans up every call a base station held when its A1 link dropped.
+    /// Nothing can clear them with the node, so the MSC releases its own
+    /// side and lets the node release the air side when it comes back.
+    fn handle_base_station_detached(
+        &mut self,
+        a1: &dyn MscA1Endpoint,
+        node: &BaseStationId,
+        calls: Vec<CallId>,
+    ) {
+        warn!(
+            "MSC: base station {node} detached, releasing {} call(s)",
+            calls.len()
+        );
+        for call_id in calls {
+            self.mt_page_retry.cancel(call_id);
+            self.controller.remove_call(call_id);
+            self.stop_media_for_call(call_id);
+            a1.release_call(call_id);
+        }
     }
 }
 
@@ -2617,6 +2663,7 @@ mod tests {
     use super::*;
     use crate::circuit::{MscLegKey, MscVoiceLeg};
     use crate::media_gateway::{CallHandle, MediaGatewayEvent, VocoderFrame};
+    use cdma_bsc_a1_edge_compat::test_node;
     use cdma_ios::{
         AssignmentCompleteMessage, AssignmentRequestMessage, Cause, ChannelNumber, ChannelType,
         CircuitIdentityCode, ConnectMessage, MobileIdentity, PagingRequestMessage,
@@ -3094,7 +3141,7 @@ mod tests {
                 };
                 let binding = cdma_hlr::model::RegistrationBinding {
                     subscriber_id: self.subscriber_id,
-                    serving_node_id: "test".to_string(),
+                    serving_bs_id: "test".to_string(),
                     state: cdma_hlr::model::RegistrationState::Registered,
                     imsi: Some(self.imsi.to_string()),
                     esn: None,
@@ -3203,7 +3250,7 @@ mod tests {
             assert_eq!(subscriber_id, self.subscriber_id);
             Ok(Some(cdma_hlr::model::RegistrationBinding {
                 subscriber_id,
-                serving_node_id: "test".to_string(),
+                serving_bs_id: "test".to_string(),
                 state: cdma_hlr::model::RegistrationState::Registered,
                 imsi: Some(self.imsi.to_string()),
                 esn: None,
@@ -3418,6 +3465,8 @@ mod tests {
         use cdma_ios::{A1TransportError, EncodedA1Message};
         use tokio::sync::{Mutex, mpsc};
 
+        use crate::CallId;
+
         pub struct InProcessMscEndpoint {
             pub inbound_rx: Mutex<mpsc::Receiver<EncodedA1Message>>,
             pub outbound_tx: mpsc::Sender<EncodedA1Message>,
@@ -3449,17 +3498,63 @@ mod tests {
             }
         }
 
+        /// The single base station every in-process test talks through.
+        pub const TEST_NODE: &str = "bsc-test";
+
+        pub fn test_node() -> crate::base_station::BaseStationId {
+            crate::base_station::BaseStationId(TEST_NODE.to_string())
+        }
+
         #[async_trait::async_trait]
         impl super::MscA1Endpoint for InProcessMscEndpoint {
-            async fn recv_from_bsc(&self) -> Option<EncodedA1Message> {
-                self.inbound_rx.lock().await.recv().await
+            async fn recv(&self) -> Option<crate::base_station::A1Event> {
+                self.inbound_rx.lock().await.recv().await.map(|message| {
+                    crate::base_station::A1Event::Message {
+                        node: test_node(),
+                        message,
+                    }
+                })
             }
 
-            async fn send_to_bsc(&self, message: EncodedA1Message) -> Result<(), A1TransportError> {
+            async fn send(&self, message: EncodedA1Message) -> Result<(), A1TransportError> {
                 self.outbound_tx
                     .send(message)
                     .await
                     .map_err(|_| A1TransportError::Closed)
+            }
+
+            async fn send_to_node(
+                &self,
+                _: &crate::base_station::BaseStationId,
+                message: EncodedA1Message,
+            ) -> Result<(), A1TransportError> {
+                self.send(message).await
+            }
+
+            fn bind_call(&self, _: CallId, _: &crate::base_station::BaseStationId) {}
+
+            fn release_call(&self, _: CallId) {}
+
+            fn node_for_call(&self, _: CallId) -> Option<crate::base_station::BaseStationId> {
+                Some(test_node())
+            }
+
+            fn is_attached(&self, node: &crate::base_station::BaseStationId) -> bool {
+                node.0 == TEST_NODE
+            }
+
+            fn served_cell(
+                &self,
+                _: &crate::base_station::BaseStationId,
+                _: cdma_ios::CellId,
+            ) -> Option<crate::base_station::ServedCell> {
+                None
+            }
+            fn serving_imsi_prefix(
+                &self,
+                _: &crate::base_station::BaseStationId,
+            ) -> Option<(String, String)> {
+                None
             }
         }
     }
@@ -3525,7 +3620,6 @@ mod tests {
             voice_bearer: None,
             media_gateway: None,
             otasp: None,
-            bts_overhead: None,
         });
 
         let call_id = runtime.controller.create_call(
@@ -3601,7 +3695,7 @@ mod tests {
             Some(call_id.0),
         );
         runtime
-            .handle_bsc_a1_message(&endpoint, clear_request)
+            .handle_bsc_a1_message(&endpoint, &test_node(), clear_request)
             .await;
         assert_eq!(
             runtime.controller.state(call_id),
@@ -3624,7 +3718,7 @@ mod tests {
             Some(call_id.0),
         );
         runtime
-            .handle_bsc_a1_message(&endpoint, clear_complete)
+            .handle_bsc_a1_message(&endpoint, &test_node(), clear_complete)
             .await;
         assert_eq!(runtime.controller.active_call_count(), 0);
     }
@@ -3656,7 +3750,6 @@ mod tests {
             voice_bearer: None,
             media_gateway: None,
             otasp: None,
-            bts_overhead: None,
         });
         let call_id = runtime.controller.create_call(
             CallDirection::MobileTerminated,
@@ -3674,6 +3767,7 @@ mod tests {
         runtime
             .handle_bsc_a1_message(
                 &endpoint,
+                &test_node(),
                 EncodedA1Message::from_message_for_call(
                     &cdma_ios::Message::new(
                         cdma_ios::MessageType::PagingResponse,
@@ -3725,7 +3819,6 @@ mod tests {
             voice_bearer: None,
             media_gateway: None,
             otasp: None,
-            bts_overhead: None,
         });
         let call_id = 99;
         let call_id_typed = runtime.controller.create_call_with_id(
@@ -3751,7 +3844,7 @@ mod tests {
             Some(call_id),
         );
         runtime
-            .handle_bsc_a1_message(&endpoint, first_paging_response)
+            .handle_bsc_a1_message(&endpoint, &test_node(), first_paging_response)
             .await;
 
         let first = timeout(Duration::from_millis(50), client.poll_a1())
@@ -3774,7 +3867,7 @@ mod tests {
             Some(call_id),
         );
         runtime
-            .handle_bsc_a1_message(&endpoint, paging_response)
+            .handle_bsc_a1_message(&endpoint, &test_node(), paging_response)
             .await;
 
         assert!(
@@ -3800,7 +3893,7 @@ mod tests {
             Some(call_id),
         );
         runtime
-            .handle_bsc_a1_message(&endpoint, assignment_complete)
+            .handle_bsc_a1_message(&endpoint, &test_node(), assignment_complete)
             .await;
 
         let second = timeout(Duration::from_millis(50), client.poll_a1())
@@ -3877,7 +3970,6 @@ mod tests {
             voice_bearer: None,
             media_gateway: None,
             otasp: None,
-            bts_overhead: None,
         });
         let call_id_typed = runtime.controller.create_call_with_id(
             CallId(call_id),
@@ -3902,7 +3994,9 @@ mod tests {
             ),
             Some(call_id),
         );
-        runtime.handle_bsc_a1_message(&endpoint, primary_pr).await;
+        runtime
+            .handle_bsc_a1_message(&endpoint, &test_node(), primary_pr)
+            .await;
         let _ = timeout(Duration::from_millis(50), client.poll_a1())
             .await
             .unwrap()
@@ -3922,7 +4016,9 @@ mod tests {
             ),
             Some(call_id),
         );
-        runtime.handle_bsc_a1_message(&endpoint, primary_ac).await;
+        runtime
+            .handle_bsc_a1_message(&endpoint, &test_node(), primary_ac)
+            .await;
         // Drain the AlertWithInformation MSC now sends on every MT
         // AssignmentComplete (BSC-autonomous AWIM was retired).
         let _ = timeout(Duration::from_millis(50), client.poll_a1())
@@ -3939,7 +4035,9 @@ mod tests {
             ),
             Some(call_id),
         );
-        runtime.handle_bsc_a1_message(&endpoint, secondary_pr).await;
+        runtime
+            .handle_bsc_a1_message(&endpoint, &test_node(), secondary_pr)
+            .await;
         let _ = timeout(Duration::from_millis(50), client.poll_a1())
             .await
             .unwrap()
@@ -3979,7 +4077,7 @@ mod tests {
         }));
 
         runtime
-            .handle_bsc_a1_message(&endpoint, assignment_failure_msg(call_id))
+            .handle_bsc_a1_message(&endpoint, &test_node(), assignment_failure_msg(call_id))
             .await;
 
         // MSC re-pages the same call_id.
@@ -4056,7 +4154,6 @@ mod tests {
             voice_bearer: None,
             media_gateway: None,
             otasp: None,
-            bts_overhead: None,
         });
         let call_id_typed = runtime.controller.create_call_with_id(
             CallId(call_id),
@@ -4083,7 +4180,9 @@ mod tests {
             ),
             Some(call_id),
         );
-        runtime.handle_bsc_a1_message(&endpoint, first_pr).await;
+        runtime
+            .handle_bsc_a1_message(&endpoint, &test_node(), first_pr)
+            .await;
         let first_ar = timeout(Duration::from_millis(50), client.poll_a1())
             .await
             .expect("MSC should emit Primary AssignmentRequest")
@@ -4102,7 +4201,7 @@ mod tests {
 
         // BSC: AssignmentFailure (TCH teardown timed out).
         runtime
-            .handle_bsc_a1_message(&endpoint, assignment_failure_msg(call_id))
+            .handle_bsc_a1_message(&endpoint, &test_node(), assignment_failure_msg(call_id))
             .await;
         let repage = timeout(Duration::from_millis(50), client.poll_a1())
             .await
@@ -4142,7 +4241,9 @@ mod tests {
             ),
             Some(call_id),
         );
-        runtime.handle_bsc_a1_message(&endpoint, second_pr).await;
+        runtime
+            .handle_bsc_a1_message(&endpoint, &test_node(), second_pr)
+            .await;
         let second_ar = timeout(Duration::from_millis(50), client.poll_a1())
             .await
             .expect("MSC should emit a fresh AssignmentRequest after re-page")
@@ -4173,7 +4274,7 @@ mod tests {
         }
 
         runtime
-            .handle_bsc_a1_message(&endpoint, assignment_failure_msg(call_id))
+            .handle_bsc_a1_message(&endpoint, &test_node(), assignment_failure_msg(call_id))
             .await;
 
         let next = timeout(Duration::from_millis(50), client.poll_a1())
@@ -4199,7 +4300,7 @@ mod tests {
 
         // Drive one AssignmentFailure → re-page.
         runtime
-            .handle_bsc_a1_message(&endpoint, assignment_failure_msg(call_id))
+            .handle_bsc_a1_message(&endpoint, &test_node(), assignment_failure_msg(call_id))
             .await;
         let _ = timeout(Duration::from_millis(50), client.poll_a1())
             .await
@@ -4223,7 +4324,9 @@ mod tests {
             ),
             Some(call_id),
         );
-        runtime.handle_bsc_a1_message(&endpoint, fresh_pr).await;
+        runtime
+            .handle_bsc_a1_message(&endpoint, &test_node(), fresh_pr)
+            .await;
         let _ = timeout(Duration::from_millis(50), client.poll_a1())
             .await
             .unwrap()
@@ -4243,7 +4346,9 @@ mod tests {
             ),
             Some(call_id),
         );
-        runtime.handle_bsc_a1_message(&endpoint, ac).await;
+        runtime
+            .handle_bsc_a1_message(&endpoint, &test_node(), ac)
+            .await;
 
         assert!(
             runtime
@@ -4312,7 +4417,6 @@ mod tests {
             voice_bearer: None,
             media_gateway: None,
             otasp: None,
-            bts_overhead: None,
         });
 
         // BCD encoding of "5559876543" with TON/NPI 0x81.
@@ -4328,7 +4432,9 @@ mod tests {
             ),
             Some(call_id),
         );
-        runtime.handle_bsc_a1_message(&endpoint, cli3_msg).await;
+        runtime
+            .handle_bsc_a1_message(&endpoint, &test_node(), cli3_msg)
+            .await;
 
         // Drain whatever the MSC sent for the MO leg setup. We expect to see
         // an AssignmentRequest (one or more depending on the M2M flow), but
@@ -4384,7 +4490,7 @@ mod tests {
             Some(call_id),
         );
         runtime
-            .handle_bsc_a1_message(&endpoint, assignment_complete)
+            .handle_bsc_a1_message(&endpoint, &test_node(), assignment_complete)
             .await;
 
         // Now expect the deferred PagingRequest to land on the wire.
@@ -4423,7 +4529,7 @@ mod tests {
             Some(call_id),
         );
         runtime
-            .handle_bsc_a1_message(&endpoint, page_response)
+            .handle_bsc_a1_message(&endpoint, &test_node(), page_response)
             .await;
         let secondary_assignment = timeout(Duration::from_millis(50), client.poll_a1())
             .await
@@ -4457,7 +4563,7 @@ mod tests {
             Some(call_id),
         );
         runtime
-            .handle_bsc_a1_message(&endpoint, secondary_complete)
+            .handle_bsc_a1_message(&endpoint, &test_node(), secondary_complete)
             .await;
         let alert = timeout(Duration::from_millis(50), client.poll_a1())
             .await
@@ -4494,13 +4600,13 @@ mod tests {
             voice_bearer: None,
             media_gateway: None,
             otasp: None,
-            bts_overhead: None,
         });
         let call_id = 4243;
         let cli3 = cm_service_request_cli3(Some(vec![0x81, 0x55, 0x95, 0x78, 0x56, 0x34]));
         runtime
             .handle_bsc_a1_message(
                 &endpoint,
+                &test_node(),
                 EncodedA1Message::from_message_for_call(
                     &cdma_ios::Message::new(
                         cdma_ios::MessageType::CompleteLayer3Information,
@@ -4526,7 +4632,7 @@ mod tests {
         }
 
         runtime
-            .handle_bsc_a1_message(&endpoint, assignment_failure_msg(call_id))
+            .handle_bsc_a1_message(&endpoint, &test_node(), assignment_failure_msg(call_id))
             .await;
         let clear = timeout(Duration::from_millis(50), client.poll_a1())
             .await
@@ -4574,7 +4680,6 @@ mod tests {
             voice_bearer: None,
             media_gateway: None,
             otasp: None,
-            bts_overhead: None,
         });
 
         let cli3 = cm_service_request_cli3(Some(vec![0x81, 0x55, 0x95, 0x78, 0x56, 0x34]));
@@ -4586,7 +4691,9 @@ mod tests {
             ),
             Some(call_id),
         );
-        runtime.handle_bsc_a1_message(&endpoint, cli3_msg).await;
+        runtime
+            .handle_bsc_a1_message(&endpoint, &test_node(), cli3_msg)
+            .await;
 
         // Drain the MO leg traffic, asserting no PagingRequest leaked.
         while let Ok(Some(msg)) = timeout(Duration::from_millis(20), client.poll_a1()).await {
@@ -4642,7 +4749,6 @@ mod tests {
             voice_bearer: None,
             media_gateway: Some(Arc::new(FailingMediaGateway)),
             otasp: None,
-            bts_overhead: None,
         });
         let cli3 = cm_service_request_cli3(Some(vec![0x81, 0x00, 0x00, 0x00, 0x00, 0x00]));
         let call_id = 123;
@@ -4654,7 +4760,9 @@ mod tests {
             Some(call_id),
         );
 
-        runtime.handle_bsc_a1_message(&endpoint, message).await;
+        runtime
+            .handle_bsc_a1_message(&endpoint, &test_node(), message)
+            .await;
 
         let outbound = timeout(Duration::from_millis(50), client.poll_a1())
             .await
@@ -4718,7 +4826,6 @@ mod tests {
             voice_bearer: None,
             media_gateway: Some(Arc::new(StubMediaGateway::default())),
             otasp: None,
-            bts_overhead: None,
         });
 
         let cli3 = cm_service_request_cli3(Some(vec![0x81, 0x00, 0x00, 0x00, 0x00, 0x00]));
@@ -4730,7 +4837,9 @@ mod tests {
             ),
             Some(call_id_raw),
         );
-        runtime.handle_bsc_a1_message(&endpoint, cli3_msg).await;
+        runtime
+            .handle_bsc_a1_message(&endpoint, &test_node(), cli3_msg)
+            .await;
 
         // Drain the AssignmentRequest the MSC just sent.
         let outbound = timeout(Duration::from_millis(50), client.poll_a1())
@@ -4758,7 +4867,9 @@ mod tests {
             ),
             Some(call_id_raw),
         );
-        runtime.handle_bsc_a1_message(&endpoint, ac_msg).await;
+        runtime
+            .handle_bsc_a1_message(&endpoint, &test_node(), ac_msg)
+            .await;
 
         assert!(
             runtime.media.feeders.is_empty(),
@@ -4797,7 +4908,6 @@ mod tests {
             voice_bearer: None,
             media_gateway: Some(gateway.clone()),
             otasp: None,
-            bts_overhead: None,
         });
         let call_id = runtime
             .controller
@@ -4891,7 +5001,6 @@ mod tests {
             voice_bearer: Some(msc_bearer),
             media_gateway: None,
             otasp: None,
-            bts_overhead: None,
         });
         let call_id = runtime.controller.create_call_with_id(
             CallId(91),
@@ -5064,7 +5173,6 @@ mod tests {
             voice_bearer: None,
             media_gateway: None,
             otasp: None,
-            bts_overhead: None,
         });
         let call_id = CallId(42);
 
@@ -5115,7 +5223,6 @@ mod tests {
             voice_bearer: None,
             media_gateway: Some(gateway.clone() as Arc<dyn MediaGatewayClient>),
             otasp: None,
-            bts_overhead: None,
         });
 
         runtime

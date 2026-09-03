@@ -44,8 +44,24 @@ parking_lot = "0.12"
 crossbeam-channel = "0.5"
 crossbeam-queue = "0.3"
 cdma-abis = { path = "../cdma-abis" }
+cdma-a8 = { path = "../cdma-a8" }
+cdma-a9 = { path = "../cdma-a9" }
+cdma-an = { path = "../cdma-an" }
+cdma-events = { path = "../cdma-events" }
+cdma-hlr = { path = "../cdma-hlr" }
+cdma-pcf = { path = "../cdma-pcf" }
+tonic = { version = "0.13", features = ["tls-ring"] }
+prost = "0.13"
+async-stream = "0.3"
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[build-dependencies]
+tonic-build = "0.13"
 
 [dev-dependencies]
+cdma-a10 = { path = "../cdma-a10" }
+cdma-a11 = { path = "../cdma-a11" }
+cdma-pdsn = { path = "../cdma-pdsn" }
 cdma-voice = { path = "../cdma-voice" }
 
 [lints]

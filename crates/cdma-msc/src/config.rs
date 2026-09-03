@@ -14,20 +14,24 @@ fn default_answer_delay_ms() -> u64 {
     10000
 }
 
-fn default_voice_release_timeout_ms() -> u64 {
-    5000
-}
-
-fn default_service_connect_timeout_ms() -> u64 {
-    20000
-}
-
 fn default_supported_voice_service_options() -> Vec<u16> {
     vec![3, 68, 70, 32768]
 }
 
 fn default_voice_gateway_endpoint() -> String {
     "http://127.0.0.1:17015".to_string()
+}
+
+fn default_hlr_endpoint() -> String {
+    "http://127.0.0.1:17019".to_string()
+}
+
+fn default_smsc_endpoint() -> String {
+    "http://127.0.0.1:17020".to_string()
+}
+
+fn default_packet_endpoint() -> String {
+    "http://127.0.0.1:17021".to_string()
 }
 
 fn default_media_ringback_enabled() -> bool {
@@ -140,12 +144,6 @@ pub struct VoiceConfig {
     /// Delay before automatic answer in local simulation paths.
     #[serde(default = "default_answer_delay_ms")]
     pub answer_delay_ms: u64,
-    /// Timeout before the call is force-cleared after release starts.
-    #[serde(default = "default_voice_release_timeout_ms")]
-    pub release_timeout_ms: u64,
-    /// Timeout before assignment/service-connect setup is treated as failed.
-    #[serde(default = "default_service_connect_timeout_ms")]
-    pub service_connect_timeout_ms: u64,
     /// Supported voice/circuit service options from the MSC policy point of view.
     #[serde(default = "default_supported_voice_service_options")]
     pub supported_service_options: Vec<u16>,
@@ -176,8 +174,6 @@ impl Default for VoiceConfig {
             page_retry_max_duration_ms: default_page_retry_max_duration_ms(),
             failure_tone_duration_ms: default_failure_tone_duration_ms(),
             answer_delay_ms: default_answer_delay_ms(),
-            release_timeout_ms: default_voice_release_timeout_ms(),
-            service_connect_timeout_ms: default_service_connect_timeout_ms(),
             supported_service_options: default_supported_voice_service_options(),
             voice_bearer_bind_ip: default_voice_bearer_bind_ip(),
             gateway: VoiceGatewayConfig::default(),
@@ -215,10 +211,6 @@ pub struct VoicePolicySnapshot {
     pub failure_tone_duration_ms: u64,
     /// Delay before automatic answer in local simulation paths.
     pub answer_delay_ms: u64,
-    /// Timeout before the call is force-cleared after release starts.
-    pub release_timeout_ms: u64,
-    /// Timeout before assignment/service-connect setup is treated as failed.
-    pub service_connect_timeout_ms: u64,
     /// Supported voice/circuit service options from the MSC policy point of view.
     pub supported_service_options: Vec<u16>,
     /// External media-gateway configuration.
@@ -324,8 +316,6 @@ impl From<VoiceConfig> for VoicePolicySnapshot {
             page_retry_max_duration_ms: value.page_retry_max_duration_ms,
             failure_tone_duration_ms: value.failure_tone_duration_ms,
             answer_delay_ms: value.answer_delay_ms,
-            release_timeout_ms: value.release_timeout_ms,
-            service_connect_timeout_ms: value.service_connect_timeout_ms,
             supported_service_options: value.supported_service_options,
             gateway: value.gateway,
         }
@@ -359,14 +349,25 @@ impl VoicePolicy for StaticVoicePolicy {
     }
 }
 
-/// Static A1 peer reference used by the MSC bootstrap.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct A1PeerConfig {
-    /// Logical peer identifier.
-    pub peer_id: String,
-    /// Peer socket address for the A1 transport.
-    pub addr: Option<SocketAddr>,
+/// One base station the MSC serves. The MSC pulls the node's identity and A1
+/// address from this endpoint, so nothing else about the node is configured.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BaseStationConfig {
+    /// gRPC endpoint of the node's management service, e.g.
+    /// `http://127.0.0.1:17016` for a BSC.
+    pub management_endpoint: String,
+    /// Stable name the management API and UI address this base station by,
+    /// unique across `base_stations`. Defaults to `management_endpoint`.
+    #[serde(default)]
+    pub id: Option<String>,
+}
+
+impl BaseStationConfig {
+    /// The addressable id for this base station: the configured `id`, or the
+    /// management endpoint when none is set.
+    pub fn id(&self) -> &str {
+        self.id.as_deref().unwrap_or(&self.management_endpoint)
+    }
 }
 
 /// Welcome SMS sent to mobiles on first registration or after inactivity.
@@ -434,6 +435,8 @@ pub struct OtaspConfig {
     pub spc_policy: String,
     /// Home System Tag (operator banner) settings.
     pub system_tag: SystemTagConfig,
+    /// Home network identity written into every provisioned NAM.
+    pub home_network: HomeNetworkConfig,
     /// NAM defaults applied to every download.
     pub nam_defaults: NamDefaultsConfig,
     /// MMS URI to push when `writes.mms_uri = true`.
@@ -449,6 +452,7 @@ impl Default for OtaspConfig {
             feature_codes: vec!["*228".to_string()],
             spc_policy: "leave_default".to_string(),
             system_tag: SystemTagConfig::default(),
+            home_network: HomeNetworkConfig::default(),
             nam_defaults: NamDefaultsConfig::default(),
             mms: MmsConfig::default(),
             writes: OtaspWritesConfig::default(),
@@ -531,32 +535,40 @@ pub struct OtaspWritesConfig {
     pub prl: bool,
 }
 
-/// Overhead values pulled from the BTS/BSC node configs by `cdma-nib`.
+/// Home network identity written into a subscriber's NAM during OTASP.
+///
+/// These are properties of the operator's network, not of whichever cell
+/// happens to serve the `*228` call. Per C.S0005-C 2.6.5.2 a base station is a
+/// member of a system (SID) and a network (NID), so many cells share one pair,
+/// and the SID_NID_LIST written here is what decides whether the handset
+/// considers itself roaming.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
-pub struct BtsOverheadConfig {
-    /// MCC string (decimal digits), e.g. `"310"`.
-    pub mcc: String,
-    /// IMSI 11/12 digits as a 2-digit string, e.g. `"55"`.
-    pub imsi_11_12: String,
-    /// Home SID broadcast by the serving BTS.
+pub struct HomeNetworkConfig {
+    /// Home SID.
     pub sid: u16,
-    /// Home NID broadcast by the serving BTS.
+    /// Home NID. `0` covers every base station not in a specific network.
     pub nid: u16,
-    /// First paging channel number used by the serving BTS.
-    pub paging_channel_number: u16,
 }
 
 /// MSC node configuration (loaded from `config/msc.json`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MscNodeConfig {
-    /// Socket address where the MSC will listen for A1 traffic.
-    pub a1_listen_addr: SocketAddr,
     /// MSC management gRPC listen address.
     pub mgmt_grpc_addr: SocketAddr,
-    /// Statically configured BSC A1 peers.
-    #[serde(default)]
-    pub a1_peers: Vec<A1PeerConfig>,
+    /// HLR gRPC endpoint used for subscriber lookups.
+    #[serde(default = "default_hlr_endpoint")]
+    pub hlr_endpoint: String,
+    /// SMSC gRPC endpoint used for SMS submission and delivery tracking.
+    #[serde(default = "default_smsc_endpoint")]
+    pub smsc_endpoint: String,
+    /// Packet core (PDSN) gRPC endpoint the management front door reads packet
+    /// sessions from.
+    #[serde(default = "default_packet_endpoint")]
+    pub packet_endpoint: String,
+    /// The base stations this MSC serves, one entry per BSC-like element.
+    /// Required, with no default.
+    pub base_stations: Vec<BaseStationConfig>,
     /// MSC-owned voice/circuit policy.
     #[serde(default)]
     pub voice: VoiceConfig,
@@ -575,6 +587,7 @@ impl MscNodeConfig {
     /// Load and validate an `MscNodeConfig` from a JSON file.
     pub fn load_from_path(path: &Path) -> Result<Self, std::io::Error> {
         let merged = cdma_common::config_load::load_json_with_local_override(path)?;
+        warn_on_removed_keys(&merged);
         let cfg: Self = serde_json::from_value(merged)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         cfg.validate()
@@ -584,6 +597,16 @@ impl MscNodeConfig {
 
     /// Validate self-contained MSC invariants.
     pub fn validate(&self) -> Result<(), String> {
+        if self.base_stations.is_empty() {
+            return Err("msc.base_stations must name at least one base station".to_string());
+        }
+        for (index, node) in self.base_stations.iter().enumerate() {
+            if node.management_endpoint.trim().is_empty() {
+                return Err(format!(
+                    "msc.base_stations[{index}].management_endpoint must be set"
+                ));
+            }
+        }
         if self.voice.gateway.enabled && self.voice.gateway.endpoint.trim().is_empty() {
             return Err(
                 "msc.voice.gateway.endpoint must be set when gateway is enabled".to_string(),
@@ -594,6 +617,29 @@ impl MscNodeConfig {
         }
         self.otasp.validate()?;
         Ok(())
+    }
+}
+
+/// Warn about keys that moved out of `msc.json`, which serde would skip
+/// silently.
+fn warn_on_removed_keys(merged: &serde_json::Value) {
+    const REMOVED: [(&str, &str); 2] = [
+        (
+            "a1_listen_addr",
+            "the MSC now dials each base station. List them under `base_stations`",
+        ),
+        (
+            "a1_peers",
+            "replaced by `base_stations`, one `management_endpoint` per base station",
+        ),
+    ];
+    let Some(map) = merged.as_object() else {
+        return;
+    };
+    for (key, hint) in REMOVED {
+        if map.contains_key(key) {
+            log::warn!("config: msc.json key {key:?} is no longer read — {hint}");
+        }
     }
 }
 
@@ -617,6 +663,12 @@ impl OtaspConfig {
                 self.system_tag.name.len()
             ));
         }
+        if self.enabled && self.home_network.sid == 0 {
+            log::warn!(
+                "msc.otasp.home_network.sid is 0 — every provisioned handset will consider \
+                 itself roaming; set it to the SID your cells broadcast"
+            );
+        }
         Ok(())
     }
 }
@@ -627,9 +679,14 @@ mod tests {
 
     fn test_config() -> MscNodeConfig {
         MscNodeConfig {
-            a1_listen_addr: "127.0.0.1:17013".parse().unwrap(),
             mgmt_grpc_addr: "127.0.0.1:17017".parse().unwrap(),
-            a1_peers: Vec::new(),
+            hlr_endpoint: default_hlr_endpoint(),
+            smsc_endpoint: default_smsc_endpoint(),
+            packet_endpoint: default_packet_endpoint(),
+            base_stations: vec![BaseStationConfig {
+                management_endpoint: "http://127.0.0.1:17016".to_string(),
+                id: None,
+            }],
             voice: VoiceConfig::default(),
             welcome_sms: WelcomeSmsConfig::default(),
             sms_retry: SmsRetryConfig::default(),
@@ -640,8 +697,16 @@ mod tests {
     #[test]
     fn default_validates() {
         let cfg = test_config();
-        assert_eq!(cfg.a1_listen_addr, "127.0.0.1:17013".parse().unwrap());
+        assert!(cfg.validate().is_ok());
         assert!(!cfg.voice.gateway.enabled);
+    }
+
+    #[test]
+    fn an_msc_with_no_base_stations_is_rejected() {
+        let mut cfg = test_config();
+        cfg.base_stations.clear();
+        let err = cfg.validate().expect_err("no base stations");
+        assert!(err.contains("base_stations"));
     }
 
     #[test]
@@ -651,6 +716,38 @@ mod tests {
             serde_json::from_slice(&std::fs::read(path).expect("read config/msc.json"))
                 .expect("parse config/msc.json");
         assert_eq!(cfg.voice.default_mobile_terminated_service_option(), 32768);
+    }
+
+    #[test]
+    fn shipped_msc_config_carries_hlr_and_smsc_endpoints() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/msc.json");
+        let cfg: MscNodeConfig =
+            serde_json::from_slice(&std::fs::read(path).expect("read config/msc.json"))
+                .expect("parse config/msc.json");
+        assert_eq!(cfg.hlr_endpoint, default_hlr_endpoint());
+        assert_eq!(cfg.smsc_endpoint, default_smsc_endpoint());
+    }
+
+    #[test]
+    fn shipped_home_network_matches_the_shipped_cell_overhead() {
+        let msc_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/msc.json");
+        let cfg: MscNodeConfig =
+            serde_json::from_slice(&std::fs::read(msc_path).expect("read config/msc.json"))
+                .expect("parse config/msc.json");
+        let bts_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/bts.json");
+        let bts: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(bts_path).expect("read config/bts.json"))
+                .expect("parse config/bts.json");
+        // A mismatch provisions handsets that roam on the very cell that
+        // programmed them.
+        assert_eq!(
+            u64::from(cfg.otasp.home_network.sid),
+            bts["overhead"]["sid"].as_u64().expect("bts overhead sid")
+        );
+        assert_eq!(
+            u64::from(cfg.otasp.home_network.nid),
+            bts["overhead"]["nid"].as_u64().expect("bts overhead nid")
+        );
     }
 
     #[test]

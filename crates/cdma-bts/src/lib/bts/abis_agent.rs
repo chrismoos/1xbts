@@ -171,6 +171,28 @@ impl AbisAgent {
         }
     }
 
+    /// Release every traffic channel and SCH this agent holds.
+    ///
+    /// The BSC that allocated them is gone, so nothing will ever send the
+    /// Remove that would free them. Without this they keep transmitting for
+    /// the life of the BTS process.
+    pub fn release_all(&mut self) {
+        for (ccr, session) in self.sessions.drain() {
+            info!(
+                "abis_agent: releasing walsh={} for CCR {:?} after Abis disconnect",
+                session.walsh_code, ccr
+            );
+            self.controller.deallocate_traffic(session.walsh_code);
+            self.controller.request_rx_removal(session.walsh_code);
+            if let Some(sch_walsh_code) = session.sch_walsh_code {
+                self.controller.deallocate_sch(sch_walsh_code);
+            }
+        }
+        if let Some(state) = &self.paging_state {
+            state.lock().clear_ack_notifications();
+        }
+    }
+
     /// Attach the paging supplier state for L2 ack notification tracking.
     pub fn set_paging_state(&mut self, state: Arc<Mutex<PagingSupplierState>>) {
         self.paging_state = Some(state);
@@ -1343,6 +1365,7 @@ mod tests {
             l3_summary: None,
             decoded_l3: None,
             pdu_summary: String::new(),
+            cell: None,
             msg_seq: Some(msg_seq),
             ack_seq: Some(0),
             ack_req: true,

@@ -173,6 +173,12 @@ impl PagingSupplierState {
         }
     }
 
+    /// Drop every pending L2 ack notification. The BSC that asked for them is
+    /// gone, so the acks have nowhere to go.
+    pub fn clear_ack_notifications(&mut self) {
+        self.pending_ack_notifies.clear();
+    }
+
     /// Install a broadcast sender for PCH transmit events.
     pub fn set_pch_transmit_tx(&mut self, tx: tokio::sync::broadcast::Sender<PchTransmitEvent>) {
         self.pch_transmit_tx = Some(tx);

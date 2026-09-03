@@ -1,0 +1,183 @@
+syntax = "proto3";
+package mgmt.v1;
+
+import "bsc/v1/service.proto";
+import "bts_management/v1/service.proto";
+import "an/v1/service.proto";
+import "packet/v1/service.proto";
+import "pcf_management/v1/service.proto";
+import "pdsn_management/v1/service.proto";
+import "management/v1/service.proto";
+import "google/protobuf/empty.proto";
+
+// Single management interface for the whole network.
+//
+// The web dials only this service. It has three families:
+//
+//   - Per-selector proxy: a `BsSelector` names one base station (a BSC) and
+//     the call is forwarded to that BSC's BtsManagement/BscManagement, or to
+//     one of its cells' HRPD access networks. The response (or stream) is
+//     returned unchanged.
+//   - Global interface: the PCF and PDSN are single core elements, so their
+//     management methods take no selector and forward to the one packet core.
+//   - Aggregation: methods that fan out to every base station and merge, for
+//     views that span the whole network.
+//
+// The implementation lives in one module so it can later move into a
+// standalone management-plane gateway without touching the wire contract.
+service NetworkManagementService {
+  // Per-selector proxy: BTS management (one cell of one base station)
+
+  // Lists the cells of one base station.
+  rpc ListBts(BsRequest) returns (bts_management.v1.BtsList);
+  // Returns runtime status for one cell.
+  rpc GetBtsStatus(CellScopedRequest) returns (bsc.v1.SystemStatus);
+  // Returns the active radio and overhead configuration for one cell.
+  rpc GetBtsConfig(CellScopedRequest) returns (bsc.v1.BtsConfig);
+  // Returns the latest radio metrics snapshot for one cell.
+  rpc GetRadioMetrics(CellScopedRequest) returns (bsc.v1.RadioMetrics);
+  // Streams radio metrics for one cell.
+  rpc StreamRadioMetrics(CellScopedRequest) returns (stream bsc.v1.RadioMetrics);
+  // Returns IQ capture state for one cell.
+  rpc GetIqCaptureStatus(CellScopedRequest) returns (bsc.v1.IqCaptureStatus);
+  // Starts an IQ capture on one cell.
+  rpc StartIqCapture(CellScopedRequest) returns (bsc.v1.IqCaptureStatus);
+  // Stops the active IQ capture on one cell.
+  rpc StopIqCapture(CellScopedRequest) returns (bsc.v1.IqCaptureStatus);
+  // Lists local radio resources for one cell.
+  rpc ListLocalRadioResources(CellScopedRequest) returns (bsc.v1.ChannelList);
+  // Returns reverse power-control state for one traffic Walsh code on one cell.
+  rpc GetReversePowerControl(ReversePowerControlScopedRequest) returns (bsc.v1.TrafficChannelPower);
+  // Lists reverse power-control state for one cell.
+  rpc ListReversePowerControls(CellScopedRequest) returns (bts_management.v1.ReversePowerControlList);
+  // Applies or clears a reverse power-control override on one cell.
+  rpc SetReversePowerControlOverride(PowerOverrideScopedRequest) returns (bsc.v1.SetTrafficChannelPowerOverrideResponse);
+  // Streams paging-channel transmissions from one cell.
+  rpc StreamPchTransmissions(CellScopedRequest) returns (stream bsc.v1.PagingEvent);
+
+  // Per-selector proxy: BSC management (one base station)
+
+  // Returns serving status for one base station.
+  rpc GetBscStatus(BsRequest) returns (bsc.v1.SystemStatus);
+  // Lists mobiles on one base station.
+  rpc ListMobiles(BsRequest) returns (bsc.v1.MobileList);
+  // Lists channels on one base station.
+  rpc ListChannels(BsRequest) returns (bsc.v1.ChannelList);
+  // Streams reverse access-channel events from one base station.
+  rpc StreamAccessEvents(BsRequest) returns (stream bsc.v1.AccessEvent);
+  // Streams paging-channel transmissions from one base station.
+  rpc StreamPagingEvents(BsRequest) returns (stream bsc.v1.PagingEvent);
+  // Streams traffic-channel transmissions from one base station.
+  rpc StreamTrafficEvents(BsRequest) returns (stream bsc.v1.TrafficEvent);
+  // Applies or clears a reverse power-control override, resolved by the base
+  // station across its cells.
+  rpc SetTrafficChannelPowerOverride(PowerOverrideScopedRequest) returns (bsc.v1.SetTrafficChannelPowerOverrideResponse);
+
+  // Per-selector proxy: HRPD access network (one EV-DO cell)
+
+  // Lists HRPD sessions on one cell's access network.
+  rpc GetAnSessions(AnSessionsScopedRequest) returns (an.v1.GetSessionsResponse);
+  // Fetches one HRPD session by UATI on one cell's access network.
+  rpc GetAnSession(AnSessionScopedRequest) returns (an.v1.GetSessionResponse);
+  // Inspects UATI allocation on one cell's access network.
+  rpc GetAnUatiAllocation(AnUatiAllocationScopedRequest) returns (an.v1.GetUatiAllocationResponse);
+  // Returns buffered HRPD session events for one UATI on one cell.
+  rpc GetAnSessionEvents(AnSessionEventsScopedRequest) returns (an.v1.GetSessionEventsResponse);
+
+  // Per-selector: data-call setup (pages the mobile on one base station)
+
+  // Initiates a data call by paging the mobile and requesting packet service
+  // on the named base station.
+  rpc InitiateDataCall(InitiateDataCallScopedRequest) returns (bsc.v1.InitiateDataCallResponse);
+
+  // Global interface: PCF (one packet core)
+
+  // Lists packet sessions known by the PCF.
+  rpc ListPcfSessions(google.protobuf.Empty) returns (pcf_management.v1.PcfSessionList);
+  // Returns detailed status for one PCF packet session.
+  rpc GetPcfSession(pcf_management.v1.GetPcfSessionRequest) returns (packet.v1.GetSessionStatusResponse);
+
+  // Global interface: PDSN (one packet core)
+
+  // Lists packet sessions known by the PDSN.
+  rpc ListPdsnSessions(google.protobuf.Empty) returns (pdsn_management.v1.PdsnSessionList);
+  // Returns detailed status for one PDSN packet session.
+  rpc GetPdsnSession(pdsn_management.v1.GetPdsnSessionRequest) returns (packet.v1.GetSessionStatusResponse);
+  // Looks up one active packet session by its assigned mobile IP.
+  rpc GetPdsnSessionByIp(pdsn_management.v1.GetPdsnSessionByIpRequest) returns (packet.v1.GetSessionByIpResponse);
+  // Enables or disables trace capture on one PDSN packet session.
+  rpc SetPacketTraceCapture(pdsn_management.v1.SetPacketTraceCaptureRequest) returns (packet.v1.SetSessionCaptureResponse);
+
+  // Aggregation: fan out to every base station and merge
+
+  // Lists mobiles across every base station.
+  rpc ListAllMobiles(google.protobuf.Empty) returns (bsc.v1.MobileList);
+  // Lists channels across every base station.
+  rpc ListAllChannels(google.protobuf.Empty) returns (bsc.v1.ChannelList);
+  // Streams radio, paging, access, traffic, and health events merged across
+  // every base station.
+  rpc StreamSystemEvents(google.protobuf.Empty) returns (stream management.v1.ManagementEvent);
+}
+
+// Names one base station (a BSC) by its stable config id, from
+// `base_stations[].id` in the MSC config (default: the management endpoint).
+message BsSelector {
+  string base_station = 1;
+}
+
+// A method scoped to one base station with no further arguments.
+message BsRequest {
+  BsSelector selector = 1;
+}
+
+// A method scoped to one base station and, within it, one cell.
+message CellScopedRequest {
+  BsSelector selector = 1;
+  bts_management.v1.CellRequest request = 2;
+}
+
+// A method scoped to one base station and one traffic Walsh code on one cell.
+message ReversePowerControlScopedRequest {
+  BsSelector selector = 1;
+  bts_management.v1.ReversePowerControlRequest request = 2;
+}
+
+// A power-control override scoped to one base station.
+message PowerOverrideScopedRequest {
+  BsSelector selector = 1;
+  bsc.v1.SetTrafficChannelPowerOverrideRequest request = 2;
+}
+
+// A data-call initiation scoped to one base station.
+message InitiateDataCallScopedRequest {
+  BsSelector selector = 1;
+  bsc.v1.InitiateDataCallRequest request = 2;
+}
+
+// An HRPD access-network session list scoped to one cell.
+message AnSessionsScopedRequest {
+  BsSelector selector = 1;
+  bts_management.v1.CellRequest cell = 2;
+  an.v1.GetSessionsRequest request = 3;
+}
+
+// An HRPD access-network single-session lookup scoped to one cell.
+message AnSessionScopedRequest {
+  BsSelector selector = 1;
+  bts_management.v1.CellRequest cell = 2;
+  an.v1.GetSessionRequest request = 3;
+}
+
+// An HRPD UATI-allocation inspection scoped to one cell.
+message AnUatiAllocationScopedRequest {
+  BsSelector selector = 1;
+  bts_management.v1.CellRequest cell = 2;
+  an.v1.GetUatiAllocationRequest request = 3;
+}
+
+// An HRPD session-event history request scoped to one cell.
+message AnSessionEventsScopedRequest {
+  BsSelector selector = 1;
+  bts_management.v1.CellRequest cell = 2;
+  an.v1.GetSessionEventsRequest request = 3;
+}

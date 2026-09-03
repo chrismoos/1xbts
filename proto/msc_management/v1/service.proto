@@ -1,6 +1,7 @@
 syntax = "proto3";
 package msc_management.v1;
 
+import "base_station/v1/service.proto";
 import "bsc/v1/service.proto";
 import "events/v1/msc.proto";
 import "google/protobuf/empty.proto";
@@ -41,7 +42,29 @@ message SendSmsResponse {
 }
 
 // MSC management API for mobile-terminated voice, SMS, and call state.
+// One base station as the MSC sees it.
+message BaseStationSummary {
+  // Management endpoint the MSC enrolls the node through.
+  string management_endpoint = 1;
+  // Empty until the node has enrolled at least once.
+  string node_id = 2;
+  // A1 address the node reported, empty until enrolled.
+  string a1_addr = 3;
+  // Whether the MSC currently holds the node's A1 connection.
+  bool attached = 4;
+  repeated base_station.v1.ServedCell cells = 5;
+  // Why the node is not attached, when it is not.
+  optional string status_detail = 6;
+}
+
+// Every base station the MSC is configured to serve.
+message BaseStationList {
+  repeated BaseStationSummary nodes = 1;
+}
+
 service MscManagementService {
+  // Lists the base stations the MSC serves, attached or not.
+  rpc ListBaseStations(google.protobuf.Empty) returns (BaseStationList);
   // Initiates a mobile-terminated voice call through the BSC and voice gateway.
   rpc InitiateCall(bsc.v1.InitiateCallRequest) returns (bsc.v1.InitiateCallResponse);
   // Submits an SMS for mobile-terminated delivery.

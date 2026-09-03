@@ -1,0 +1,11 @@
+syntax = "proto3";
+package events.v1;
+
+// Cell that served an air-interface transaction, mirroring the Abis Cell
+// Identifier IE (A.S0003-A 7.5).
+message CellId {
+  // Cell number broadcast as BASE_ID.
+  uint32 cell = 1;
+  // Sector within the cell.
+  uint32 sector = 2;
+}

@@ -1,6 +1,8 @@
 syntax = "proto3";
 package events.v1;
 
+import "events/v1/cell.proto";
+
 // HRPD (1xEV-DO Rev 0) Access Network events.
 //
 // Per the project's event-bus rule: fields with a defined value set are typed
@@ -89,6 +91,8 @@ message HrpdSessionEvent {
   uint32 mac_subtype = 10;
   uint32 physical_layer_subtype = 11;
   HrpdUati full_uati = 12;
+  // Cell whose HRPD sector holds the session.
+  CellId cell = 13;
 }
 
 // HRPD access-channel event (capsule received on the reverse access channel).
@@ -113,6 +117,8 @@ message HrpdAccessEvent {
   uint32 uati = 9;
   HrpdUati full_uati = 10;
   uint32 receive_ati = 11;
+  // Cell whose HRPD sector received the capsule.
+  CellId cell = 12;
 }
 
 // HRPD traffic-layer event (per-frame decode, DRC update, ACK, teardown).
@@ -137,6 +143,8 @@ message HrpdTrafficEvent {
   uint32 payload_length_bytes = 10;
   HrpdUati full_uati = 11;
   uint32 receive_ati = 12;
+  // Cell whose HRPD sector carries the traffic channel.
+  CellId cell = 13;
 }
 
 // AN wrapper sub-message for the aggregated event bus. One arm per HRPD

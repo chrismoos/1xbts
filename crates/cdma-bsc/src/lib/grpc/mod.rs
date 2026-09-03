@@ -26,6 +26,11 @@ pub mod bsc_management_proto {
     tonic::include_proto!("bsc_management.v1");
 }
 
+/// Generated types for the base station proto (`base_station.v1`).
+pub mod base_station_proto {
+    tonic::include_proto!("base_station.v1");
+}
+
 /// Generated types for the MSC management proto (`msc_management.v1`).
 pub mod msc_management_proto {
     tonic::include_proto!("msc_management.v1");

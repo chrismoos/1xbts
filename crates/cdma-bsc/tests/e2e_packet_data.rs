@@ -59,12 +59,40 @@ use cdma_packet::grpc::PacketServiceImpl;
 use cdma_packet::ppp::framing::PppPacket;
 use cdma_packet::rlp::{self, RlpRate};
 
-use cdma_bsc::bsc::{Bsc, Config as BscConfig, OverheadParameters};
-use cdma_bsc::config::{PagingRetryConfig, TrafficAssignmentConfig, TrafficRetryConfig};
-use cdma_msc::{StaticVoicePolicy, VoiceConfig};
+use cdma_bsc::bsc::{Bsc, BtsCellParams, BtsRegistry, Config as BscConfig, OverheadParameters};
+use cdma_bsc::config::{TrafficAssignmentConfig, TrafficRetryConfig};
 
-fn test_voice_policy() -> std::sync::Arc<dyn cdma_msc::VoicePolicy> {
-    std::sync::Arc::new(StaticVoicePolicy::new(VoiceConfig::default()))
+/// Cell `test_bts_registry` enrolls: the default overhead base id, and the
+/// sector the registry stamps on a cell it learns from overhead alone.
+const TEST_CELL: cdma_common::events::AccessCellId =
+    cdma_common::events::AccessCellId { cell: 1, sector: 1 };
+
+/// Registry holding the single cell these tests drive, standing in for the
+/// parameters a BTS supplies at enrollment.
+fn test_bts_registry(
+    overhead: OverheadParameters,
+    pilot_offset: usize,
+    paging: &bts::PagingChannelSettings,
+    bts_client: Option<Arc<dyn BtsControlClient>>,
+) -> Arc<BtsRegistry> {
+    let esp = &paging.message_defaults.extended_system_parameters;
+    let registry = BtsRegistry::new();
+    let entry = registry
+        .enroll(
+            BtsCellParams {
+                pilot_offset,
+                mcc: esp.mcc,
+                imsi_11_12: esp.imsi_11_12,
+                ..BtsCellParams::from_overhead(overhead)
+            },
+            None,
+            None,
+        )
+        .expect("first enrollment has no identity conflict");
+    if let Some(client) = bts_client {
+        entry.set_control(client);
+    }
+    registry
 }
 
 fn test_msc_client() -> Arc<dyn cdma_bsc::a1_edge::MscClient> {
@@ -118,6 +146,7 @@ fn test_packet_service() -> Arc<PacketServiceImpl> {
 
 fn synthetic_origination_so7(esn: u32) -> AccessChannelEvent {
     AccessChannelEvent {
+        cell: Some(TEST_CELL),
         event_id: "synth-origination-so7".to_string(),
         chip_start: 2_000_000,
         absolute_chip_start: None,
@@ -911,6 +940,7 @@ fn decode_rc3_bs_ack_from_forward_traffic_iq_samples(
 
 fn synthetic_traffic_preamble(walsh_code: u8) -> AccessChannelEvent {
     AccessChannelEvent {
+        cell: Some(TEST_CELL),
         event_id: "synth-preamble".to_string(),
         chip_start: 3_000_000,
         absolute_chip_start: Some(3_000_000),
@@ -985,6 +1015,7 @@ fn synthetic_traffic_preamble(walsh_code: u8) -> AccessChannelEvent {
 
 fn synthetic_ms_ack_order(walsh_code: u8) -> AccessChannelEvent {
     AccessChannelEvent {
+        cell: Some(TEST_CELL),
         event_id: "synth-ms-ack".to_string(),
         chip_start: 3_100_000,
         absolute_chip_start: Some(3_100_000),
@@ -1059,6 +1090,7 @@ fn synthetic_ms_ack_order(walsh_code: u8) -> AccessChannelEvent {
 
 fn synthetic_service_connect_completion(walsh_code: u8) -> AccessChannelEvent {
     AccessChannelEvent {
+        cell: Some(TEST_CELL),
         event_id: "synth-scc".to_string(),
         chip_start: 3_200_000,
         absolute_chip_start: Some(3_200_000),
@@ -1435,16 +1467,20 @@ async fn test_e2e_so7_packet_data_full_negotiation() {
 
     // -- Create BSC --
     let mut bsc = Bsc::new(BscConfig {
-        pilot_offset: 0,
-        overhead: OverheadParameters {
-            sid: 42,
-            nid: 7,
-            cdma_freq: Some(384),
-            ..Default::default()
-        },
-        paging: bts::PagingChannelSettings::default(),
+        bts: test_bts_registry(
+            OverheadParameters {
+                sid: 42,
+                nid: 7,
+                cdma_freq: Some(384),
+                ..Default::default()
+            },
+            0,
+            &bts::PagingChannelSettings::default(),
+            Some(bts_client.clone()),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None, // We manually forward BTS events
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -1455,14 +1491,11 @@ async fn test_e2e_so7_packet_data_full_negotiation() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
         msc_voice_bearer: None,
-        bts_client: Some(bts_client.clone()),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: Some(Arc::new(cdma_bsc::packet::LegacyPcfClient::new(
             packet_service.clone(),
         ))),
@@ -2070,16 +2103,20 @@ async fn test_e2e_so7_packet_data_phy_bidirectional() {
             },
         ));
     let mut bsc = Bsc::new(BscConfig {
-        pilot_offset: 0,
-        overhead: OverheadParameters {
-            sid: 42,
-            nid: 7,
-            cdma_freq: Some(384),
-            ..Default::default()
-        },
-        paging: bts::PagingChannelSettings::default(),
+        bts: test_bts_registry(
+            OverheadParameters {
+                sid: 42,
+                nid: 7,
+                cdma_freq: Some(384),
+                ..Default::default()
+            },
+            0,
+            &bts::PagingChannelSettings::default(),
+            Some(bts_client.clone()),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None, // We manually forward BTS events
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -2090,14 +2127,11 @@ async fn test_e2e_so7_packet_data_phy_bidirectional() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
         msc_voice_bearer: None,
-        bts_client: Some(bts_client.clone()),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: Some(Arc::new(cdma_bsc::packet::LegacyPcfClient::new(
             packet_service.clone(),
         ))),
@@ -2764,16 +2798,42 @@ async fn test_e2e_so7_rc3_reverse_preamble_queues_bs_ack() {
     let (traffic_tx, mut traffic_rx) = tokio::sync::broadcast::channel(16);
     let (mobiles_tx, mobiles_rx) = watch::channel(Vec::new());
     let mut bsc = Bsc::new(BscConfig {
-        pilot_offset: 0,
-        overhead: OverheadParameters {
-            sid: 42,
-            nid: 7,
-            cdma_freq: Some(384),
-            ..Default::default()
-        },
-        paging: bts::PagingChannelSettings::default(),
+        bts: test_bts_registry(
+            OverheadParameters {
+                sid: 42,
+                nid: 7,
+                cdma_freq: Some(384),
+                ..Default::default()
+            },
+            0,
+            &bts::PagingChannelSettings::default(),
+            Some(Arc::new(NetworkBtsControlClient::spawn_in_process(
+                Arc::new(TrafficResourceService::from_pools(
+                    walsh_allocator.clone(),
+                    traffic_channels.clone(),
+                    traffic_rx_pool.clone(),
+                    traffic_rx_removals.clone(),
+                    cdma_bts::bts::BtsPowerControlRegistry::default(),
+                )),
+                AbisAgentConfig {
+                    pilot_pn: 0,
+                    cell_id: CellId { cell: 1, sector: 1 },
+                    mscid: 1,
+                },
+                NetworkClientConfig {
+                    cell_id: CellId { cell: 1, sector: 1 },
+                    mscid: 1,
+                    pilot_pn: 0,
+                    auth_mode: 0,
+                    p_rev_in_use: 6,
+                    market_id: 1,
+                    generating_entity_id: 1,
+                },
+            )) as Arc<dyn BtsControlClient>),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: Some(access_events),
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -2784,36 +2844,11 @@ async fn test_e2e_so7_rc3_reverse_preamble_queues_bs_ack() {
         mobiles_tx: Some(mobiles_tx),
         paging_broadcast: None,
         traffic_broadcast: Some(traffic_tx),
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
         msc_voice_bearer: None,
-        bts_client: Some(Arc::new(NetworkBtsControlClient::spawn_in_process(
-            Arc::new(TrafficResourceService::from_pools(
-                walsh_allocator.clone(),
-                traffic_channels.clone(),
-                traffic_rx_pool.clone(),
-                traffic_rx_removals.clone(),
-                cdma_bts::bts::BtsPowerControlRegistry::default(),
-            )),
-            AbisAgentConfig {
-                pilot_pn: 0,
-                cell_id: CellId { cell: 1, sector: 1 },
-                mscid: 1,
-            },
-            NetworkClientConfig {
-                cell_id: CellId { cell: 1, sector: 1 },
-                mscid: 1,
-                pilot_pn: 0,
-                auth_mode: 0,
-                p_rev_in_use: 6,
-                market_id: 1,
-                generating_entity_id: 1,
-            },
-        )) as Arc<dyn BtsControlClient>),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -3181,7 +3216,7 @@ impl HlrRepository for FakeHlrRepository {
         let now = chrono::Utc::now();
         Ok(Some(RegistrationBinding {
             subscriber_id: self.subscriber.subscriber_id,
-            serving_node_id: "test".to_string(),
+            serving_bs_id: "test".to_string(),
             state: RegistrationState::Registered,
             imsi: None,
             esn: None,
@@ -3450,6 +3485,7 @@ fn crc16_ccitt(bits: &[u8]) -> u16 {
 
 fn synthetic_origination_so6(esn: u32) -> AccessChannelEvent {
     AccessChannelEvent {
+        cell: Some(TEST_CELL),
         event_id: "synth-origination-so6".to_string(),
         chip_start: 2_000_000,
         absolute_chip_start: None,
@@ -3525,6 +3561,7 @@ fn synthetic_origination_so6(esn: u32) -> AccessChannelEvent {
 #[allow(dead_code)]
 fn synthetic_traffic_data_burst(walsh_code: u8, sms_payload: Vec<u8>) -> AccessChannelEvent {
     AccessChannelEvent {
+        cell: Some(TEST_CELL),
         event_id: "synth-data-burst".to_string(),
         chip_start: 3_400_000,
         absolute_chip_start: Some(3_400_000),
@@ -3976,16 +4013,42 @@ async fn test_e2e_so6_sms_data_burst_phy_bidirectional() {
 
     // -- Create BSC with HLR (no packet_service needed for SMS) --
     let mut bsc = Bsc::new(BscConfig {
-        pilot_offset: 0,
-        overhead: OverheadParameters {
-            sid: 42,
-            nid: 7,
-            cdma_freq: Some(384),
-            ..Default::default()
-        },
-        paging: bts::PagingChannelSettings::default(),
+        bts: test_bts_registry(
+            OverheadParameters {
+                sid: 42,
+                nid: 7,
+                cdma_freq: Some(384),
+                ..Default::default()
+            },
+            0,
+            &bts::PagingChannelSettings::default(),
+            Some(Arc::new(NetworkBtsControlClient::spawn_in_process(
+                Arc::new(TrafficResourceService::from_pools(
+                    walsh_allocator.clone(),
+                    traffic_channels.clone(),
+                    traffic_rx_pool.clone(),
+                    traffic_rx_removals.clone(),
+                    cdma_bts::bts::BtsPowerControlRegistry::default(),
+                )),
+                AbisAgentConfig {
+                    pilot_pn: 0,
+                    cell_id: CellId { cell: 1, sector: 1 },
+                    mscid: 1,
+                },
+                NetworkClientConfig {
+                    cell_id: CellId { cell: 1, sector: 1 },
+                    mscid: 1,
+                    pilot_pn: 0,
+                    auth_mode: 0,
+                    p_rev_in_use: 6,
+                    market_id: 1,
+                    generating_entity_id: 1,
+                },
+            )) as Arc<dyn BtsControlClient>),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None, // We manually forward BTS events
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -3996,36 +4059,11 @@ async fn test_e2e_so6_sms_data_burst_phy_bidirectional() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: Some(hlr.clone()),
         msc_client: test_msc_client(),
         msc_voice_bearer: None,
-        bts_client: Some(Arc::new(NetworkBtsControlClient::spawn_in_process(
-            Arc::new(TrafficResourceService::from_pools(
-                walsh_allocator.clone(),
-                traffic_channels.clone(),
-                traffic_rx_pool.clone(),
-                traffic_rx_removals.clone(),
-                cdma_bts::bts::BtsPowerControlRegistry::default(),
-            )),
-            AbisAgentConfig {
-                pilot_pn: 0,
-                cell_id: CellId { cell: 1, sector: 1 },
-                mscid: 1,
-            },
-            NetworkClientConfig {
-                cell_id: CellId { cell: 1, sector: 1 },
-                mscid: 1,
-                pilot_pn: 0,
-                auth_mode: 0,
-                p_rev_in_use: 6,
-                market_id: 1,
-                generating_entity_id: 1,
-            },
-        )) as Arc<dyn BtsControlClient>),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,

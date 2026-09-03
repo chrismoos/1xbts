@@ -4,6 +4,20 @@ use crate::access::{AccessMessage, RdschPdu};
 use crate::lac::message_types::MessageId;
 use crate::time::CdmaSystemTime;
 
+/// Cell that served an air-interface transaction, mirroring the Abis Cell
+/// Identifier IE (A.S0003-A 7.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AccessCellId {
+    pub cell: u16,
+    pub sector: u8,
+}
+
+impl std::fmt::Display for AccessCellId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}:{}", self.cell, self.sector)
+    }
+}
+
 /// Decoded access channel event surfaced from the RX pipeline to higher layers.
 #[derive(Debug, Clone)]
 pub struct AccessChannelEvent {
@@ -37,6 +51,9 @@ pub struct AccessChannelEvent {
     pub decoded_l3: Option<AccessMessage>,
     /// Full LAC PDU one-line summary (ARQ, addressing, auth, RER, SDU).
     pub pdu_summary: String,
+    /// Cell that received this access message, filled in by the BSC from the
+    /// Abis Cell Identifier IE. `None` inside the BTS, which serves one cell.
+    pub cell: Option<AccessCellId>,
     /// ARQ msg_seq from the access probe (for ACK piggybacking).
     pub msg_seq: Option<u8>,
     /// ARQ ack_seq from the access probe.

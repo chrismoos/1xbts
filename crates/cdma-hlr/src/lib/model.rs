@@ -373,7 +373,7 @@ pub fn validate_phone_number(phone_number: &str) -> Result<(), String> {
 #[derive(Debug, Clone)]
 pub struct RegistrationBinding {
     pub subscriber_id: Uuid,
-    pub serving_node_id: String,
+    pub serving_bs_id: String,
     pub state: RegistrationState,
     /// Authoritative IMSI string, sourced from `SubscriberIdentity`.
     pub imsi: Option<String>,

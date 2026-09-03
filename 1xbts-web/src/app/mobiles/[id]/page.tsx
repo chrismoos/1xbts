@@ -35,6 +35,8 @@ import {
 import { useEventStream } from "@/lib/use-event-stream";
 import { hrpdTimestampNsToUs } from "@/lib/hrpd-correlation";
 import { type LogEntry, makeLogEntryId, makeSortKey, sortLogEntries, formatTime } from "@/lib/message-log";
+import { cellLabel, cellToken, peerIdForCell } from "@/lib/cell";
+import { useBtsList } from "@/lib/use-bts-list";
 import { formatEsn, formatMeid } from "@/lib/format";
 import { isSyntheticPacketMobileAddress } from "@/lib/mobile-directory";
 import { radioConfigName, radioConfigPairName } from "@/lib/radio-config";
@@ -98,6 +100,7 @@ interface MobileInfo {
   trafficWalshCode?: number;
   trafficServiceOption?: number;
   voiceCallState?: string;
+  servingCell?: { cell: number; sector: number };
 }
 
 interface SmsResult {
@@ -268,6 +271,7 @@ export default function MobileDetailPage({
 
   const [mobile, setMobile] = useState<MobileInfo | null>(null);
   const [loading, setLoading] = useState(true);
+  const { cells } = useBtsList();
   const [messages, setMessages] = useState<LogEntry[]>([]);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [packetSessions, setPacketSessions] = useState<PacketSessionInfo[]>([]);
@@ -676,6 +680,10 @@ export default function MobileDetailPage({
 
   const applyPowerOverride = useCallback(async (payload: { targetDb?: number; clear?: boolean }) => {
     if (mobile?.trafficWalshCode == null) return;
+    // A mobile the BSC has not bound to a cell — an unregistered one, or one
+    // synthesized from an HRPD session — leaves the cell unnamed, so the BSC
+    // resolves it the way it resolves any unaddressed request.
+    const cell = cellToken(mobile.servingCell);
 
     setPowerOverridePending(true);
     setPowerOverrideError(null);
@@ -683,7 +691,11 @@ export default function MobileDetailPage({
       const res = await fetch("/api/channels/power-override", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ walshCode: mobile.trafficWalshCode, ...payload }),
+        body: JSON.stringify({
+          walshCode: mobile.trafficWalshCode,
+          ...(cell ? { cell } : {}),
+          ...payload,
+        }),
       });
       const json = await res.json();
       if (!res.ok || !json.accepted) {
@@ -700,7 +712,7 @@ export default function MobileDetailPage({
     } finally {
       setPowerOverridePending(false);
     }
-  }, [fetchMobile, mobile?.trafficWalshCode]);
+  }, [fetchMobile, mobile?.trafficWalshCode, mobile?.servingCell]);
 
   const pinPowerOverride = useCallback(async () => {
     const targetDb = Number(powerDraft.trim());
@@ -746,6 +758,7 @@ export default function MobileDetailPage({
     );
   }
 
+  const servingPeerId = peerIdForCell(cells, mobile.servingCell);
   const observedEsnHex = mobile.esn != null ? formatEsn(mobile.esn) : null;
   const observedMeid = mobile.meid ? formatMeid(mobile.meid) : null;
   const provisionedEsnHex =
@@ -915,6 +928,19 @@ export default function MobileDetailPage({
                 mono
               />
               <Stat label="SLOT_CYCLE_INDEX" value={String(mobile.slotCycleIndex)} />
+              <div className="flex justify-between py-0.5">
+                <span className="text-muted text-sm">Serving Cell</span>
+                {servingPeerId ? (
+                  <Link
+                    href={`/bts/${encodeURIComponent(servingPeerId)}`}
+                    className="text-sm font-mono text-accent-green hover:text-accent-green transition-colors"
+                  >
+                    {cellLabel(mobile.servingCell)}
+                  </Link>
+                ) : (
+                  <span className="text-secondary text-sm font-mono">-</span>
+                )}
+              </div>
               {!mobile.subscriberId && (
                 <div className="mt-3 border-t border-border pt-3">
                   {!showCreateSubscriber ? (

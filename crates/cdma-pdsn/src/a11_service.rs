@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     future::Future,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
     sync::Arc,
 };
@@ -13,6 +13,9 @@ use crate::{PdsnNodeConfig, PdsnSessionManager, spawn_hrpd_pdsn_a10_runtime};
 
 const A11_MSID_TYPE_IMSI: u16 = 0x0006;
 const SERVICE_OPTION_HIGH_RATE_PACKET_DATA: u32 = 33;
+/// PCF A10 bearer port assumed when `pdsn.a10_bearer.udp_peer_addr` is not
+/// set, matching the default assignment in `docs/PORTS.md`.
+const DEFAULT_PCF_A10_UDP_PORT: u16 = 17042;
 
 pub(crate) struct HrpdA10ByteStream {
     pub uplink_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -86,20 +89,24 @@ fn socket_ipv4_octets(addr: SocketAddr, label: &str) -> Result<[u8; 4], String> 
     }
 }
 
-fn configured_a10_ipv4_pair(
+fn configured_a10_local_ipv4(
     bearer: &cdma_a10::BearerTransportConfig,
     label: &str,
-) -> Result<([u8; 4], [u8; 4]), String> {
+) -> Result<[u8; 4], Error> {
     let bind = bearer
         .udp_bind_addr
-        .ok_or_else(|| format!("{label} must use udp_encapsulated_gre"))?;
-    let peer = bearer
-        .udp_peer_addr
-        .ok_or_else(|| format!("{label} must set udp_peer_addr"))?;
-    Ok((
-        socket_ipv4_octets(bind, &format!("{label}.udp_bind_addr"))?,
-        socket_ipv4_octets(peer, &format!("{label}.udp_peer_addr"))?,
-    ))
+        .ok_or_else(|| Error::from(format!("{label} must use udp_encapsulated_gre")))?;
+    socket_ipv4_octets(bind, &format!("{label}.udp_bind_addr")).map_err(Error::from)
+}
+
+/// Where a session's A10 downlink goes until its first uplink packet arrives.
+///
+/// The PCF that sent the A11 Registration Request owns the session, so its
+/// address is the bearer peer. A11 carries no bearer port, so the port comes
+/// from the configured `udp_peer_addr` or the standard PCF A10 port.
+fn seeded_pcf_a10_addr(a11_source: SocketAddr, configured_peer: Option<SocketAddr>) -> SocketAddr {
+    let port = configured_peer.map_or(DEFAULT_PCF_A10_UDP_PORT, |peer| peer.port());
+    SocketAddr::new(a11_source.ip(), port)
 }
 
 fn a11_msid_bcd_to_imsi(msid: &[u8]) -> Result<String, String> {
@@ -242,14 +249,21 @@ pub(crate) async fn spawn_hrpd_pdsn_a11_service_with_a10_service(
     pdsn_config: PdsnNodeConfig,
     a10_byte_stream_service: Arc<dyn HrpdA10ByteStreamService>,
 ) -> Result<SocketAddr, Error> {
-    let (a10_local_ipv4, a10_peer_ipv4) =
-        configured_a10_ipv4_pair(&pdsn_config.a10_bearer, "pdsn.a10_bearer")
-            .map_err(|err| Error::from(format!("HRPD PDSN A10 config: {err}")))?;
-    let a10_endpoint = cdma_a10::BearerEndpoint::new(a10_local_ipv4, a10_peer_ipv4);
+    let a10_local_ipv4 = configured_a10_local_ipv4(&pdsn_config.a10_bearer, "pdsn.a10_bearer")
+        .map_err(|err| Error::from(format!("HRPD PDSN A10 config: {err}")))?;
+    let a10_configured_peer = pdsn_config.a10_bearer.udp_peer_addr;
+    if a10_configured_peer.is_none() {
+        info!(
+            "HRPD PDSN A10: pdsn.a10_bearer.udp_peer_addr not set, assuming PCF A10 port {DEFAULT_PCF_A10_UDP_PORT} until each session's first uplink packet"
+        );
+    }
     let (a10_session_closed_tx, mut a10_session_closed_rx) =
         tokio::sync::mpsc::unbounded_channel::<cdma_a11::SessionKey>();
-    let a10_runtime =
-        spawn_hrpd_pdsn_a10_runtime(pdsn_config.a10_bearer, a10_endpoint, a10_session_closed_tx)?;
+    let a10_runtime = spawn_hrpd_pdsn_a10_runtime(
+        pdsn_config.a10_bearer,
+        a10_local_ipv4,
+        a10_session_closed_tx,
+    )?;
     let requested_a11_bind_addr = pdsn_config.a11.bind_addr;
     let endpoint = cdma_a11::UdpEndpoint::bind(requested_a11_bind_addr)
         .await
@@ -338,6 +352,7 @@ pub(crate) async fn spawn_hrpd_pdsn_a11_service_with_a10_service(
                     "HRPD PDSN A11: received deregistration for {key:?}; closing packet session {session_id}"
                 );
                 registrations.remove(&key);
+                a10_runtime.release(key);
                 a10_byte_stream_service
                     .close_hrpd_a10_byte_stream(&session_id)
                     .await;
@@ -370,18 +385,21 @@ pub(crate) async fn spawn_hrpd_pdsn_a11_service_with_a10_service(
                     }
                 }
             }
-            let a10 = cdma_a10::BearerSession::new(key.pcf_session_id, a10_endpoint);
+            let pcf_a10_addr = seeded_pcf_a10_addr(peer, a10_configured_peer);
+            let IpAddr::V4(pcf_a10_ipv4) = pcf_a10_addr.ip() else {
+                warn!(
+                    "HRPD PDSN A11: cannot bind A10 for {key:?}, PCF {peer} must be IPv4 for the current HRPD A10/A11 path"
+                );
+                continue;
+            };
+            let a10 = cdma_a10::BearerSession::new(
+                key.pcf_session_id,
+                cdma_a10::BearerEndpoint::new(a10_local_ipv4, pcf_a10_ipv4.octets()),
+            );
             match manager.bind_a10_bearer(key, a10) {
                 Ok(event) => info!(
-                    "HRPD PDSN A11: {event:?}; A10 bound {}.{}.{}.{} -> {}.{}.{}.{} key=0x{:08x}",
-                    a10_local_ipv4[0],
-                    a10_local_ipv4[1],
-                    a10_local_ipv4[2],
-                    a10_local_ipv4[3],
-                    a10_peer_ipv4[0],
-                    a10_peer_ipv4[1],
-                    a10_peer_ipv4[2],
-                    a10_peer_ipv4[3],
+                    "HRPD PDSN A11: {event:?}; A10 bound {} -> {pcf_a10_addr} key=0x{:08x}",
+                    Ipv4Addr::from(a10_local_ipv4),
                     key.pcf_session_id
                 ),
                 Err(err) => {
@@ -396,7 +414,13 @@ pub(crate) async fn spawn_hrpd_pdsn_a11_service_with_a10_service(
                 hrpd_packet_metadata_from_a11(key, &request),
             ) {
                 Ok(stream) => {
-                    a10_runtime.register(key, a10, stream.uplink_tx, stream.downlink_rx);
+                    a10_runtime.register(
+                        key,
+                        a10,
+                        pcf_a10_addr,
+                        stream.uplink_tx,
+                        stream.downlink_rx,
+                    );
                 }
                 Err(err) => {
                     warn!("HRPD PDSN A10: packet session not opened for {key:?}: {err}");
@@ -453,5 +477,20 @@ mod tests {
         assert_eq!(metadata.hrpd_mn_id.as_deref(), Some("310556898017332"));
         assert_eq!(metadata.hrpd_mn_id_source.as_deref(), Some("a11"));
         assert_eq!(metadata.mobile_address, "hrpd-uati-session:1a058001");
+    }
+
+    #[test]
+    fn seeded_a10_peer_takes_pcf_ip_from_a11_and_port_from_config_or_default() {
+        let a11_source: SocketAddr = "192.0.2.7:17044".parse().unwrap();
+        let configured: SocketAddr = "127.0.0.1:17042".parse().unwrap();
+
+        assert_eq!(
+            seeded_pcf_a10_addr(a11_source, Some(configured)),
+            "192.0.2.7:17042".parse().unwrap()
+        );
+        assert_eq!(
+            seeded_pcf_a10_addr(a11_source, None),
+            SocketAddr::new(a11_source.ip(), DEFAULT_PCF_A10_UDP_PORT)
+        );
     }
 }

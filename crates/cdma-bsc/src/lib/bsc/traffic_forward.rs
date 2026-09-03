@@ -28,7 +28,7 @@ use crate::addressing::{format_ms_address, is_packet_data_so};
 use cdma_common::sch::Rc3FschProfile;
 
 use super::traffic_bearer::send_forward_fch_bits_with_bearer_client;
-use super::{Bsc, MsState, VOICE_TRAFFIC_CON_REF, VOICE_TRAFFIC_SR_ID, VoiceLegRole};
+use super::{AccessCellId, Bsc, MsState, VOICE_TRAFFIC_CON_REF, VOICE_TRAFFIC_SR_ID, VoiceLegRole};
 
 const FSCH_ESCAM_START_DELAY_FRAMES: u64 = 12;
 const MULTIPLEX_OPTION_RATE_SET_1: u16 = 0x0001;
@@ -88,11 +88,12 @@ fn rlp_blob_for_service_option(service_option: u16) -> Option<Vec<u8>> {
 impl Bsc {
     fn traffic_service_connections(
         &self,
+        cell: AccessCellId,
         walsh_code: u8,
     ) -> Result<Vec<ServiceConnectConnectionRecord>, Error> {
         let tc = self
             .mobiles
-            .get_traffic_channel(walsh_code)
+            .get_traffic_channel(cell, walsh_code)
             .ok_or("no traffic channel for service configuration")?;
         // Voice-over-packet: omit the packet CON_REF to delete it per
         // C.S0005-E §3.7.2.3.2.4.4.
@@ -152,13 +153,16 @@ impl Bsc {
         leg_role: VoiceLegRole,
         a1_call_id: Option<u64>,
     ) -> Result<u8, Error> {
-        let walsh_code = self
+        let ms = self
             .mobiles
             .get(fwd_address)
-            .and_then(|ms| ms.current_traffic_walsh())
             .ok_or("mobile has no existing traffic channel")?;
+        let walsh_code = ms
+            .current_traffic_walsh()
+            .ok_or("mobile has no existing traffic channel")?;
+        let cell = ms.serving_cell.ok_or("mobile has no serving cell")?;
 
-        let setup_result = self.mobiles.update_tc(walsh_code, |_, tc| {
+        let setup_result = self.mobiles.update_tc(cell, walsh_code, |_, tc| {
             if tc.is_releasing() {
                 return Err::<(), Error>("traffic channel is releasing".into());
             }
@@ -176,8 +180,8 @@ impl Bsc {
             None => return Err("mobile has no existing traffic channel".into()),
         }
 
-        self.send_service_request(walsh_code, super::DEFAULT_TRAFFIC_ACK_SEQ)?;
-        self.mobiles.update_tc(walsh_code, |_, tc| {
+        self.send_service_request(cell, walsh_code, super::DEFAULT_TRAFFIC_ACK_SEQ)?;
+        self.mobiles.update_tc(cell, walsh_code, |_, tc| {
             tc.mark_waiting_service_response();
         });
         Ok(walsh_code)
@@ -204,15 +208,19 @@ impl Bsc {
             Some(walsh_code) => walsh_code,
             None => return Ok(ForwardSignalingRoute::NeedsPaging),
         };
+        let Some(cell) = ms.serving_cell else {
+            return Ok(ForwardSignalingRoute::NeedsPaging);
+        };
 
         let msg_seq = self
             .mobiles
-            .get_traffic_channel(walsh_code)
+            .get_traffic_channel(cell, walsh_code)
             .map(|tc| tc.forward_msg_seq_ack)
             .unwrap_or(0);
 
         let sdu = data_burst.to_sdu();
         self.send_traffic_signaling(
+            cell,
             walsh_code,
             sdu,
             MessageId::DataBurst,
@@ -232,9 +240,13 @@ impl Bsc {
     ///
     /// Uses an implicit gate: enabled config, SO33, RC3, MOB_P_REV >= 6, and
     /// RC3 mobile capability. Returns `None` for FCH-only Service Connect.
-    pub(crate) fn fsch_for_service_connect(&self, walsh_code: u8) -> Option<ForSchConfig> {
-        let tc = self.mobiles.get_traffic_channel(walsh_code)?;
-        let ms = self.mobiles.get_by_walsh(walsh_code)?;
+    pub(crate) fn fsch_for_service_connect(
+        &self,
+        cell: AccessCellId,
+        walsh_code: u8,
+    ) -> Option<ForSchConfig> {
+        let tc = self.mobiles.get_traffic_channel(cell, walsh_code)?;
+        let ms = self.mobiles.get_by_walsh(cell, walsh_code)?;
         if !crate::addressing::ms_eligible_for_fsch_phase1(
             self.config.traffic_assignment.enable_f_sch,
             tc.service_option,
@@ -259,6 +271,7 @@ impl Bsc {
     /// Send ESCAM on F-FCH to activate the configured F-SCH profile.
     pub(crate) fn send_escam_for_fsch(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         sch_code: u8,
         profile: Rc3FschProfile,
@@ -269,7 +282,8 @@ impl Bsc {
             for_sch_id: 0,
             sccl_index: 0,
             for_sch_num_bits_idx: profile.num_bits_idx,
-            pilot_pn: self.config.pilot_offset as u16, // PN offset index, already in 64-chip units.
+            // PN offset index, already in 64-chip units.
+            pilot_pn: self.params_for_cell(cell).pilot_offset as u16,
             code_chan_sch: sch_code as u16,
             qof_mask_id_sch: 0,
             for_sch_duration: 0x0F, // 0xF = infinite (until next ESCAM).
@@ -289,10 +303,11 @@ impl Bsc {
         let sdu = params.to_ftch_sdu();
         let ack_seq = self
             .mobiles
-            .get_traffic_channel(walsh_code)
+            .get_traffic_channel(cell, walsh_code)
             .map(|tc| tc.forward_msg_seq_ack & 0x07)
             .unwrap_or(0);
         self.send_traffic_signaling(
+            cell,
             walsh_code,
             sdu,
             MessageId::ExtendedSupplementalChannelAssignment,
@@ -309,6 +324,7 @@ impl Bsc {
     /// Send an ESCAM that releases the active F-SCH assignment.
     pub(crate) fn send_escam_release_for_fsch(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         sch_code: u8,
         profile: Rc3FschProfile,
@@ -318,7 +334,7 @@ impl Bsc {
             for_sch_id: 0,
             sccl_index: 0,
             for_sch_num_bits_idx: profile.num_bits_idx,
-            pilot_pn: self.config.pilot_offset as u16,
+            pilot_pn: self.params_for_cell(cell).pilot_offset as u16,
             code_chan_sch: sch_code as u16,
             qof_mask_id_sch: 0,
             for_sch_duration: 0,
@@ -335,10 +351,11 @@ impl Bsc {
         let sdu = params.to_ftch_sdu();
         let ack_seq = self
             .mobiles
-            .get_traffic_channel(walsh_code)
+            .get_traffic_channel(cell, walsh_code)
             .map(|tc| tc.forward_msg_seq_ack & 0x07)
             .unwrap_or(0);
         self.send_traffic_signaling(
+            cell,
             walsh_code,
             sdu,
             MessageId::ExtendedSupplementalChannelAssignment,
@@ -361,16 +378,17 @@ impl Bsc {
     /// Service Configuration record (type 0x13) for power control parameters.
     pub(crate) fn send_service_connect(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         ack_seq: u8,
     ) -> Result<(), Error> {
         let tc = self
             .mobiles
-            .get_traffic_channel(walsh_code)
+            .get_traffic_channel(cell, walsh_code)
             .ok_or("no traffic channel for Service Connect")?;
         let (for_rc, rev_rc) = (tc.for_rc, tc.rev_rc);
         let serv_con_seq = self.traffic_signaling.next_serv_con_seq();
-        let connections = self.traffic_service_connections(walsh_code)?;
+        let connections = self.traffic_service_connections(cell, walsh_code)?;
         let call_assignments = if let Some(voice_so) = voice_service_option_for_channel(tc) {
             if voice_so != tc.service_option {
                 vec![ServiceConnectCallAssignment {
@@ -389,7 +407,7 @@ impl Bsc {
         let for_mux_option = default_mux_option_for_rc(for_rc)?;
         let rev_mux_option = default_mux_option_for_rc(rev_rc)?;
 
-        let for_sch_config = self.fsch_for_service_connect(walsh_code);
+        let for_sch_config = self.fsch_for_service_connect(cell, walsh_code);
         let non_neg = Some(if for_rc >= 3 {
             if for_sch_config.is_some() {
                 NonNegServiceConfig::rc3_fsch_default()
@@ -431,6 +449,7 @@ impl Bsc {
         );
 
         self.send_traffic_signaling(
+            cell,
             walsh_code,
             sdu,
             MessageId::ServiceConnect,
@@ -451,19 +470,20 @@ impl Bsc {
     /// Uses the propose request purpose from C.S0005-E 3.7.3.3.2.18.
     pub(crate) fn send_service_request(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         ack_seq: u8,
     ) -> Result<(), Error> {
         let tc = self
             .mobiles
-            .get_traffic_channel(walsh_code)
+            .get_traffic_channel(cell, walsh_code)
             .ok_or("no traffic channel for Service Request")?;
         let (for_rc, rev_rc) = (tc.for_rc, tc.rev_rc);
         let service_option = tc.service_option;
         let voice_service_option = voice_service_option_for_channel(tc);
 
         let serv_req_seq = self.traffic_signaling.next_serv_con_seq();
-        let connections = self.traffic_service_connections(walsh_code)?;
+        let connections = self.traffic_service_connections(cell, walsh_code)?;
 
         let for_mux_option = default_mux_option_for_rc(for_rc)?;
         let rev_mux_option = default_mux_option_for_rc(rev_rc)?;
@@ -491,6 +511,7 @@ impl Bsc {
         );
 
         self.send_traffic_signaling(
+            cell,
             walsh_code,
             sdu,
             MessageId::ServiceRequest,
@@ -506,17 +527,18 @@ impl Bsc {
 
     pub(crate) fn send_service_response_counter_proposal(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         ack_seq: u8,
         serv_req_seq: u8,
     ) -> Result<(), Error> {
         let (for_rc, rev_rc) = self
             .mobiles
-            .get_traffic_channel(walsh_code)
+            .get_traffic_channel(cell, walsh_code)
             .map(|tc| (tc.for_rc, tc.rev_rc))
             .ok_or("no traffic channel for Service Response")?;
         let connection_records = self
-            .traffic_service_connections(walsh_code)?
+            .traffic_service_connections(cell, walsh_code)?
             .into_iter()
             .map(
                 |connection| cdma_common::access::ServiceConnectConnectionRecord {
@@ -559,6 +581,7 @@ impl Bsc {
         );
 
         self.send_traffic_signaling(
+            cell,
             walsh_code,
             sdu,
             MessageId::ServiceResponse,
@@ -574,6 +597,7 @@ impl Bsc {
 
     pub(crate) fn send_service_response_reject(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         ack_seq: u8,
         serv_req_seq: u8,
@@ -591,6 +615,7 @@ impl Bsc {
         );
 
         self.send_traffic_signaling(
+            cell,
             walsh_code,
             sdu,
             MessageId::ServiceResponse,
@@ -605,7 +630,12 @@ impl Bsc {
     }
 
     /// Send a BS Ack Order on the forward traffic channel.
-    pub(crate) fn send_traffic_bs_ack(&mut self, walsh_code: u8, ack_seq: u8) -> Result<(), Error> {
+    pub(crate) fn send_traffic_bs_ack(
+        &mut self,
+        cell: AccessCellId,
+        walsh_code: u8,
+        ack_seq: u8,
+    ) -> Result<(), Error> {
         let order_msg = OrderMessage {
             order: 0b010000,
             ordq: 0,
@@ -619,6 +649,7 @@ impl Bsc {
         );
 
         self.send_traffic_signaling(
+            cell,
             walsh_code,
             sdu,
             MessageId::Order,
@@ -635,6 +666,7 @@ impl Bsc {
     /// Send a signaling L3 SDU on the forward traffic channel via Abis bearer.
     pub(crate) fn send_traffic_signaling(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         sdu: cdma_common::bits::Bitstream,
         msg_id: MessageId,
@@ -649,7 +681,7 @@ impl Bsc {
         let (addr, rc_label, tc_walsh, tc_for_rc, tc_so, tc_voice_label) = {
             let ms = self
                 .mobiles
-                .get_by_walsh(walsh_code)
+                .get_by_walsh(cell, walsh_code)
                 .ok_or("no traffic channel assigned")?;
             let tc = ms
                 .find_traffic_channel_by_walsh(walsh_code)
@@ -670,7 +702,7 @@ impl Bsc {
 
         let msg_seq = self
             .mobiles
-            .update_tc(walsh_code, |_, tc| tc.next_forward_msg_seq(ack_req))
+            .update_tc(cell, walsh_code, |_, tc| tc.next_forward_msg_seq(ack_req))
             .ok_or("no traffic channel assigned")?;
 
         let pdu = bts_lac::assemble_f_dsch_pdu(wire_msg_type, &sdu, ack_seq, msg_seq, ack_req);
@@ -702,7 +734,7 @@ impl Bsc {
                 })
                 .collect();
             send_forward_fch_bits_with_bearer_client(
-                self.config.bts_client.as_ref(),
+                self.client_for_cell(cell).as_ref(),
                 0,
                 tc_walsh,
                 tc_for_rc,
@@ -712,11 +744,7 @@ impl Bsc {
             )?;
         }
 
-        let esp = &self
-            .config
-            .paging
-            .message_defaults
-            .extended_system_parameters;
+        let cell_params = self.params_for_cell(cell);
         let traffic_mcsb = MessageControlStatusBlock {
             channel: ChannelType::FTch,
             length_bits: sdu.len(),
@@ -730,11 +758,12 @@ impl Bsc {
             msg_seq,
             ack_req,
             valid_ack: true,
-            overhead_mcc: esp.mcc,
-            overhead_imsi_11_12: esp.imsi_11_12,
+            overhead_mcc: cell_params.mcc,
+            overhead_imsi_11_12: cell_params.imsi_11_12,
         };
 
         self.emit_traffic_tx_event(
+            cell,
             tc_walsh,
             tc_so,
             rc_label,

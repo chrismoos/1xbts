@@ -14,8 +14,17 @@ pub mod events {
         tonic::include_proto!("events.v1");
     }
 }
+// Also referenced by the generated code, as `crate::base_station::v1::ServedCell`.
+#[allow(missing_docs)]
+pub mod base_station {
+    pub mod v1 {
+        pub use crate::grpc::base_station_proto::*;
+    }
+}
 pub mod packet;
 #[allow(dead_code)]
 pub(crate) mod power_control;
 #[allow(dead_code)]
 pub(crate) mod voice_bearer_bits;
+
+pub use bsc::run_node;

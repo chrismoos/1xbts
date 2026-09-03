@@ -8,7 +8,9 @@ use log::{info, warn};
 
 use crate::addressing::format_ms_address;
 
-use super::{A1ClearState, Bsc, ChannelState, MobileStation, MsState, TrafficChannelInfo};
+use super::{
+    A1ClearState, AccessCellId, Bsc, ChannelState, MobileStation, MsState, TrafficChannelInfo,
+};
 
 #[derive(Default)]
 pub(crate) struct TrafficLifecycleService;
@@ -32,8 +34,13 @@ impl Bsc {
     /// Ask the MS to release a packet-data traffic channel before removing the
     /// BTS-side resources. Immediate deallocate can leave the MS transmitting
     /// reverse traffic without forward power control and pollute other Walshes.
-    pub(crate) fn begin_packet_tch_release(&mut self, walsh_code: u8, reason: &str) {
-        let Some(ms) = self.mobiles.get_by_walsh(walsh_code) else {
+    pub(crate) fn begin_packet_tch_release(
+        &mut self,
+        cell: AccessCellId,
+        walsh_code: u8,
+        reason: &str,
+    ) {
+        let Some(ms) = self.mobiles.get_by_walsh(cell, walsh_code) else {
             warn!(
                 "BSC: begin_packet_tch_release called but no traffic channel walsh={}",
                 walsh_code
@@ -62,28 +69,29 @@ impl Bsc {
             format_ms_address(&addr),
             reason
         );
-        if let Err(e) = self.send_traffic_release_order(walsh_code, super::DEFAULT_TRAFFIC_ACK_SEQ)
+        if let Err(e) =
+            self.send_traffic_release_order(cell, walsh_code, super::DEFAULT_TRAFFIC_ACK_SEQ)
         {
             warn!(
                 "BSC: failed to send packet Release Order on walsh={} during {}: {}",
                 walsh_code, reason, e
             );
         }
-        self.mobiles.update_tc(walsh_code, |_, tc| {
+        self.mobiles.update_tc(cell, walsh_code, |_, tc| {
             tc.mark_releasing();
         });
     }
 
-    /// Tear down a traffic channel keyed by Walsh code (the unique stable
-    /// key for an active TC). The owning mobile is resolved through the
-    /// registry, so callers never need to track an `idx` across `.await`.
-    pub(crate) async fn teardown_traffic_channel(&mut self, walsh_code: u8) {
+    /// Tear down the traffic channel `cell` allocated `walsh_code` to. The
+    /// owning mobile is resolved through the registry, so callers never need to
+    /// track an `idx` across `.await`.
+    pub(crate) async fn teardown_traffic_channel(&mut self, cell: AccessCellId, walsh_code: u8) {
         // If there's a pending OTASP DBM that never got an L2 ack or
         // L3 reject, the call is going away before MSC will hear back.
         // Send an AddsDeliverAck(cause=call_cleared) per A.S0001
         // §6.1.7.5 so the OTASP session can advance / terminate
         // instead of waiting on the 5 s inbound-silence timeout.
-        if let Some(pending) = self.pending_otasp_dbm.remove(&walsh_code) {
+        if let Some(pending) = self.pending_otasp_dbm.remove(&(cell, walsh_code)) {
             log::info!(
                 "BSC: walsh={} teardown with pending OTASP DBM tag=0x{:08x} — sending AddsDeliverAck call_cleared",
                 walsh_code,
@@ -94,7 +102,7 @@ impl Bsc {
                 Some(super::traffic_signaling::adds_deliver_ack_cause::CALL_CLEARED),
             );
         }
-        let Some(ms) = self.mobiles.get_by_walsh(walsh_code) else {
+        let Some(ms) = self.mobiles.get_by_walsh(cell, walsh_code) else {
             warn!(
                 "BSC: teardown_traffic_channel called but no traffic channel walsh={}",
                 walsh_code
@@ -145,13 +153,13 @@ impl Bsc {
         let packet_session_id = self.packet.detach_session(&mut tc);
         self.traffic_bearer
             .reverse_voice_silence_encoders
-            .remove(&walsh_code);
+            .remove(&(cell, walsh_code));
 
         if let Some(session_id) = packet_session_id {
             self.close_packet_session(walsh_code, &session_id).await;
         }
 
-        let bts_client = self.config.bts_client.clone();
+        let bts_client = self.serving_client(&addr);
         // F-SCH lives on the same BTS-side session as the FCH and is released
         // by the BTS when it processes `Remove` for the FCH CCR. We just drop
         // the local reference; no separate deallocate exchange is needed here.
@@ -172,7 +180,7 @@ impl Bsc {
             info!("BSC: queued walsh={} for rx removal", walsh_code);
         } else {
             warn!(
-                "BSC: teardown_traffic_channel walsh={} cannot deallocate - bts_client is None!",
+                "BSC: teardown_traffic_channel walsh={} cannot deallocate — the serving cell has no Abis link",
                 walsh_code
             );
         }
@@ -204,6 +212,7 @@ impl Bsc {
     /// Uses the Release Order code from C.S0004-E Table 3.7.2.3.2.1-3.
     pub(crate) fn send_traffic_release_order(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         ack_seq: u8,
     ) -> Result<(), Error> {
@@ -220,6 +229,7 @@ impl Bsc {
         );
 
         self.send_traffic_signaling(
+            cell,
             walsh_code,
             sdu,
             MessageId::Order,

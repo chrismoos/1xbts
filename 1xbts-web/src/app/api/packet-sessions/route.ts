@@ -1,4 +1,4 @@
-import { getPcfManagementClient, waitForBscReady } from "@/lib/grpc/client";
+import { getNetworkManagementClient, waitForManagementReady } from "@/lib/grpc/client";
 import { packetSessionToJson } from "@/lib/grpc/packet-session-json";
 
 export const dynamic = "force-dynamic";
@@ -8,8 +8,8 @@ export async function GET() {
   const timeout = setTimeout(() => abort.abort(), 5000);
 
   try {
-    await waitForBscReady();
-    const client = getPcfManagementClient();
+    await waitForManagementReady();
+    const client = getNetworkManagementClient();
     const result = await client.listPcfSessions({}, { signal: abort.signal });
     return Response.json({
       ...result,

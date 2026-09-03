@@ -1,12 +1,9 @@
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
-use crate::abis_edge::BearerStats;
-use cdma_bts::bts::{
-    BtsCommand, BtsPowerControlSnapshot, BtsRuntimeSettings, IqCaptureStatus as BtsIqCaptureStatus,
-    RxMetrics as BtsRxMetrics, TxMetrics as BtsTxMetrics,
-};
 use cdma_common::access::AccessMessage;
 use cdma_common::consts::{
     SERVICE_OPTION_ASYNC_DATA, SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_PACKET_DATA,
@@ -22,150 +19,422 @@ use cdma_common::lac::{
         GeneralPageRecord, MsAddress, PagingChannelMessage,
     },
 };
-use log::info;
-use tokio::sync::oneshot;
+use log::{info, warn};
+use parking_lot::Mutex;
+use tokio::sync::broadcast;
 use tokio_stream::{Stream, StreamExt};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 
+use super::base_station_proto::base_station_service_server::{
+    BaseStationService, BaseStationServiceServer,
+};
+use super::base_station_proto::{
+    EnrollRequest as BaseStationEnrollRequest, EnrollResponse as BaseStationEnrollResponse,
+    ServedCell,
+};
 use super::bsc_management_proto::bsc_management_service_server::{
     BscManagementService, BscManagementServiceServer,
 };
 use super::bts_management_proto::bts_management_service_server::{
     BtsManagementService, BtsManagementServiceServer,
 };
-use super::bts_management_proto::{ReversePowerControlList, ReversePowerControlRequest};
+use super::bts_management_proto::{
+    BtsAttachState as ProtoBtsAttachState, BtsList, BtsSummary, CellRequest, EnrollRequest,
+    EnrollResponse, ReversePowerControlEntry, ReversePowerControlList, ReversePowerControlRequest,
+};
 use super::management_proto::management_facade_service_server::{
     ManagementFacadeService, ManagementFacadeServiceServer,
 };
 use super::management_proto::{ManagementEvent, NodeHealth, SystemOverview, management_event};
-use super::pcf_management_proto::pcf_management_service_server::{
-    PcfManagementService, PcfManagementServiceServer,
-};
-use super::pcf_management_proto::{GetPcfSessionRequest, PcfSessionList};
-use super::pdsn_management_proto::pdsn_management_service_server::{
-    PdsnManagementService, PdsnManagementServiceServer,
-};
-use super::pdsn_management_proto::{
-    GetPdsnSessionByIpRequest, GetPdsnSessionRequest, PdsnSessionList, SetPacketTraceCaptureRequest,
-};
 use super::proto;
 use super::proto::bsc_service_server::{BscService, BscServiceServer};
 use super::state::BscState;
 use crate::bsc::traffic_events::forward_order_display_name;
-use crate::bsc::{DataCallRequest, PagingEvent, TrafficEvent, TrafficPowerOverrideAction};
+use crate::bsc::{
+    AccessCellId, BtsAttachState, BtsEntry, BtsOamClient, BtsRegistry, DataCallRequest,
+    PagingEvent, TrafficEvent,
+};
 use crate::config::MtlsConfig;
 use crate::power_control::TrafficChannelPowerSnapshot;
 use cdma_common::formatting::{
     bitstream_to_hex, bytes_to_hex, format_dtmf_digits, forward_order_name,
     mobile_station_reject_reason, rejected_pdu_type_name,
 };
-use cdma_hlr::proto::hlr_service_server::HlrServiceServer;
-use cdma_hlr::service::HlrServiceImpl;
-use cdma_packet::proto::packet_service_client::PacketServiceClient;
-use cdma_packet::proto::packet_service_server::{PacketService, PacketServiceServer};
-use cdma_smsc::proto::smsc_service_server::SmscServiceServer;
-use cdma_smsc::service::SmscServiceImpl;
 use uuid::Uuid;
+
+/// Channel type label the BTS uses for an active traffic channel.
+const TRAFFIC_CHANNEL_TYPE: &str = "traffic";
+
+/// How often the BSC checks for an enrolled cell it is not yet following
+/// paging-channel transmissions from.
+const PCH_SUBSCRIBE_POLL: Duration = Duration::from_secs(2);
+/// How long the aggregate radio-metrics stream waits before retrying when no
+/// cell has a management channel yet.
+const RADIO_METRICS_RETRY: Duration = Duration::from_secs(1);
+/// How often the aggregate radio-metrics stream rescans the registry to pick
+/// up a cell that enrolled after it started following the others.
+const RADIO_METRICS_RESCAN: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct BscServiceImpl {
     state: Arc<BscState>,
+    /// Paging-channel transmissions republished from every enrolled cell.
+    pch_transmissions: broadcast::Sender<proto::PagingEvent>,
 }
 
-#[derive(Clone)]
-struct PacketServiceProxy {
-    client: PacketServiceClient<tonic::transport::Channel>,
+/// A request for whichever cell the endpoint resolves on its own.
+fn any_cell() -> Request<CellRequest> {
+    Request::new(CellRequest {
+        cell: None,
+        peer_id: None,
+    })
 }
 
-impl PacketServiceProxy {
-    fn new(endpoint: String) -> Result<Self, Status> {
-        let channel = tonic::transport::Endpoint::new(endpoint)
-            .map_err(|e| Status::unavailable(format!("invalid packet gRPC endpoint: {e}")))?
-            .connect_lazy();
-        Ok(Self {
-            client: PacketServiceClient::new(channel),
+fn cell_request(cell: proto::CellId) -> CellRequest {
+    CellRequest {
+        cell: Some(cell),
+        peer_id: None,
+    }
+}
+
+fn to_proto_cell_id(cell: AccessCellId) -> proto::CellId {
+    proto::CellId {
+        cell: u32::from(cell.cell),
+        sector: u32::from(cell.sector),
+    }
+}
+
+fn from_proto_cell_id(cell: &proto::CellId) -> Result<AccessCellId, Status> {
+    Ok(AccessCellId {
+        cell: u16::try_from(cell.cell)
+            .map_err(|_| Status::invalid_argument("cell must fit in 16 bits"))?,
+        sector: u8::try_from(cell.sector)
+            .map_err(|_| Status::invalid_argument("sector must fit in 8 bits"))?,
+    })
+}
+
+fn to_proto_attach_state(state: BtsAttachState) -> ProtoBtsAttachState {
+    match state {
+        BtsAttachState::Disconnected => ProtoBtsAttachState::Disconnected,
+        BtsAttachState::Enrolled => ProtoBtsAttachState::Enrolled,
+        BtsAttachState::InService => ProtoBtsAttachState::InService,
+    }
+}
+
+fn attach_state_message(state: BtsAttachState) -> &'static str {
+    match state {
+        BtsAttachState::Disconnected => "not reachable",
+        BtsAttachState::Enrolled => "enrolled, Abis signaling not established",
+        BtsAttachState::InService => "in service",
+    }
+}
+
+impl BscServiceImpl {
+    /// The registry entry a request addresses.
+    ///
+    /// A request that names no cell resolves to the sole enrolled cell, which
+    /// keeps a single-cell deployment addressable without naming its cell.
+    fn resolve_entry(&self, cell: Option<proto::CellId>) -> Result<Arc<BtsEntry>, Status> {
+        let registry = &self.state.bts;
+        match cell {
+            Some(cell) => {
+                let id = from_proto_cell_id(&cell)?;
+                registry.get(id).ok_or_else(|| {
+                    Status::not_found(format!(
+                        "cell {}/{} is not enrolled",
+                        cell.cell, cell.sector
+                    ))
+                })
+            }
+            None => registry.sole_entry().ok_or_else(|| {
+                if registry.is_empty() {
+                    Status::failed_precondition("no cell is enrolled")
+                } else {
+                    Status::failed_precondition(
+                        "more than one cell is enrolled; name the cell in the request",
+                    )
+                }
+            }),
+        }
+    }
+
+    /// Management client for the cell a request addresses, with the cell
+    /// identifier to forward so the BTS rejects a misrouted request.
+    fn oam_for(
+        &self,
+        cell: Option<proto::CellId>,
+    ) -> Result<(proto::CellId, BtsOamClient), Status> {
+        let entry = self.resolve_entry(cell)?;
+        let id = to_proto_cell_id(entry.cell());
+        let client = entry.oam().ok_or_else(|| {
+            Status::unavailable(format!(
+                "cell {}/{} has no management channel: {}",
+                id.cell,
+                id.sector,
+                entry
+                    .status_detail()
+                    .unwrap_or_else(|| attach_state_message(entry.attach_state()).to_string())
+            ))
+        })?;
+        Ok((id, client))
+    }
+
+    /// The OAM client a management request addresses. A request naming a
+    /// `peer_id` resolves to that peer's current cell,
+    /// failing fast when the peer is offline so the call never blocks on an
+    /// inactive node. A request naming a `cell` (or neither) uses the cell.
+    fn oam_for_request(
+        &self,
+        request: CellRequest,
+    ) -> Result<(proto::CellId, BtsOamClient), Status> {
+        if let Some(peer_id) = request.peer_id.as_deref() {
+            let cell = self
+                .state
+                .bts
+                .peer_cell(peer_id)
+                .ok_or_else(|| Status::unavailable(format!("BTS {peer_id} is offline")))?;
+            return self.oam_for(Some(to_proto_cell_id(cell)));
+        }
+        self.oam_for(request.cell)
+    }
+
+    /// The cell that answers a request naming none, when there is exactly one.
+    fn default_cell(&self) -> Option<AccessCellId> {
+        self.state.bts.sole_entry().map(|entry| entry.cell())
+    }
+
+    /// The BSC's own power-control state for a traffic Walsh code on `cell`,
+    /// driven by the forward outer loop from the mobile's PMRM reports.
+    ///
+    /// Walsh codes are allocated per cell, so every cell hands out the same
+    /// codes. Without the cell the first mobile holding the code anywhere on
+    /// the BSC would answer.
+    fn bsc_power_snapshot(
+        &self,
+        cell: AccessCellId,
+        walsh_code: u8,
+    ) -> Option<TrafficChannelPowerSnapshot> {
+        let default_cell = self.default_cell();
+        self.state
+            .mobiles
+            .borrow()
+            .iter()
+            .find(|mobile| {
+                mobile.traffic_walsh_code == Some(walsh_code)
+                    && mobile.serving_cell.or(default_cell) == Some(cell)
+            })
+            .and_then(|mobile| mobile.traffic_power.clone())
+    }
+
+    /// Reverse power-control state for every reachable cell, keyed by cell and
+    /// traffic Walsh code. One request per cell replaces a lookup per mobile.
+    async fn reverse_power_by_cell_walsh(
+        &self,
+    ) -> HashMap<(AccessCellId, u8), proto::TrafficChannelPower> {
+        let mut by_cell_walsh = HashMap::new();
+        for entry in self.state.bts.entries() {
+            let Some(mut client) = entry.oam() else {
+                continue;
+            };
+            let cell = entry.cell();
+            let list = match client
+                .list_reverse_power_controls(cell_request(to_proto_cell_id(cell)))
+                .await
+            {
+                Ok(response) => response.into_inner(),
+                Err(e) => {
+                    warn!(
+                        "cell {}/{} reverse power-control list failed: {e}",
+                        cell.cell, cell.sector
+                    );
+                    continue;
+                }
+            };
+            for item in list.entries {
+                let Ok(walsh) = u8::try_from(item.walsh_code) else {
+                    continue;
+                };
+                if let Some(power) = item.power {
+                    by_cell_walsh.insert((cell, walsh), power);
+                }
+            }
+        }
+        by_cell_walsh
+    }
+
+    /// Radio metrics merged from every enrolled cell.
+    ///
+    /// Follows all cells at once, so the aggregate telemetry heartbeat keeps
+    /// flowing whether the BSC serves one cell or several — a consumer merging
+    /// this never loses it. It rescans to pick up a cell that enrolls later,
+    /// drops a cell whose stream ends, and waits rather than ending when no
+    /// cell has a management channel yet.
+    async fn radio_metrics_stream(&self) -> GrpcStream<proto::RadioMetrics> {
+        let service = self.clone();
+        Box::pin(async_stream::stream! {
+            let mut merged = tokio_stream::StreamMap::new();
+            loop {
+                for entry in service.state.bts.entries() {
+                    let cell = to_proto_cell_id(entry.cell());
+                    let key = (cell.cell, cell.sector);
+                    if merged.contains_key(&key) {
+                        continue;
+                    }
+                    let Some(mut client) = entry.oam() else {
+                        continue;
+                    };
+                    match client.stream_radio_metrics(cell_request(cell)).await {
+                        Ok(response) => {
+                            merged.insert(key, response.into_inner());
+                        }
+                        Err(e) => warn!(
+                            "cell {}/{} radio metrics stream unavailable: {e}",
+                            cell.cell, cell.sector
+                        ),
+                    }
+                }
+                if merged.is_empty() {
+                    tokio::time::sleep(RADIO_METRICS_RETRY).await;
+                    continue;
+                }
+                tokio::select! {
+                    item = merged.next() => match item {
+                        Some((_, Ok(metrics))) => yield Ok(metrics),
+                        Some((key, Err(e))) => {
+                            warn!("cell {}/{} radio metrics stream ended: {e}", key.0, key.1);
+                            merged.remove(&key);
+                        }
+                        None => {}
+                    },
+                    _ = tokio::time::sleep(RADIO_METRICS_RESCAN) => {}
+                }
+            }
         })
     }
+}
 
-    fn client(&self) -> PacketServiceClient<tonic::transport::Channel> {
-        self.client.clone()
-    }
+/// Overlay the BSC-owned loop state onto a BTS reverse power-control
+/// snapshot.
+///
+/// The BTS measures the reverse link and owns those fields. The BSC drives
+/// the forward outer loop from PMRM reports. `power_history` stays empty
+/// because it accumulates per mobile rather than per traffic channel.
+fn merge_bsc_power_fields(
+    mut power: proto::TrafficChannelPower,
+    bsc: Option<&TrafficChannelPowerSnapshot>,
+) -> proto::TrafficChannelPower {
+    let Some(bsc) = bsc else {
+        return power;
+    };
+    power.last_pcg_snr_db = bsc
+        .last_pcg_snr_db
+        .map(|arr| arr.to_vec())
+        .unwrap_or_default();
+    power.last_active_pcg_mask = bsc
+        .last_active_pcg_mask
+        .map(|arr| arr.to_vec())
+        .unwrap_or_default();
+    power.reverse_pilot_ec_io_db = bsc.reverse_pilot_ec_io_db;
+    power.forward_gain_offset_db = bsc.forward_gain_offset_db;
+    power.forward_last_fer_pct = bsc.forward_last_fer_pct.unwrap_or(0.0);
+    power.forward_last_pmrm_errors = bsc.forward_last_pmrm_errors;
+    power.forward_last_pmrm_frames = bsc.forward_last_pmrm_frames;
+    power.forward_pmrm_count = bsc.forward_pmrm_count;
+    power.forward_pilot_ec_io_db = bsc.forward_pilot_ec_io_db.clone();
+    power.forward_radio_config = bsc.forward_radio_config;
+    power.reverse_radio_config = bsc.reverse_radio_config;
+    power
+}
+
+/// Follow every enrolled cell's paging-channel transmissions and republish
+/// them, so the BSC's paging stream shows what actually went out on air.
+///
+/// The BTS owns General Page assembly, slot placement and page retry, so the
+/// Abis exchange alone does not say what was transmitted.
+fn spawn_pch_transmission_bridge(
+    registry: Arc<BtsRegistry>,
+    sink: broadcast::Sender<proto::PagingEvent>,
+) {
+    let followed: Arc<Mutex<HashSet<AccessCellId>>> = Arc::new(Mutex::new(HashSet::new()));
+    tokio::spawn(async move {
+        loop {
+            for entry in registry.entries() {
+                let cell = entry.cell();
+                let Some(mut client) = entry.oam() else {
+                    continue;
+                };
+                if !followed.lock().insert(cell) {
+                    continue;
+                }
+                let followed = followed.clone();
+                let sink = sink.clone();
+                tokio::spawn(async move {
+                    match client
+                        .stream_pch_transmissions(cell_request(to_proto_cell_id(cell)))
+                        .await
+                    {
+                        Ok(response) => {
+                            let mut stream = response.into_inner();
+                            while let Some(event) = stream.next().await {
+                                match event {
+                                    Ok(event) => {
+                                        let _ = sink.send(event);
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "cell {}/{} PCH transmission stream ended: {e}",
+                                            cell.cell, cell.sector
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => warn!(
+                            "cell {}/{} PCH transmission subscribe failed: {e}",
+                            cell.cell, cell.sector
+                        ),
+                    }
+                    followed.lock().remove(&cell);
+                });
+            }
+            tokio::time::sleep(PCH_SUBSCRIBE_POLL).await;
+        }
+    });
 }
 
 #[tonic::async_trait]
-impl PacketService for PacketServiceProxy {
-    async fn open_session(
+impl BaseStationService for BscServiceImpl {
+    async fn enroll(
         &self,
-        request: Request<cdma_packet::proto::OpenSessionRequest>,
-    ) -> Result<Response<cdma_packet::proto::OpenSessionResponse>, Status> {
-        self.client().open_session(request).await
-    }
-
-    async fn close_session(
-        &self,
-        request: Request<cdma_packet::proto::CloseSessionRequest>,
-    ) -> Result<Response<cdma_packet::proto::CloseSessionResponse>, Status> {
-        self.client().close_session(request).await
-    }
-
-    type StreamSessionStream =
-        Pin<Box<dyn Stream<Item = Result<cdma_packet::proto::SessionFrame, Status>> + Send>>;
-
-    async fn stream_session(
-        &self,
-        request: Request<tonic::Streaming<cdma_packet::proto::SessionFrame>>,
-    ) -> Result<Response<Self::StreamSessionStream>, Status> {
-        let mut inbound = request.into_inner();
-        let outbound = async_stream::stream! {
-            while let Some(frame) = inbound.next().await {
-                match frame {
-                    Ok(frame) => yield frame,
-                    Err(_) => break,
+        _: Request<BaseStationEnrollRequest>,
+    ) -> Result<Response<BaseStationEnrollResponse>, Status> {
+        let cells = self
+            .state
+            .bts
+            .entries()
+            .into_iter()
+            .map(|entry| {
+                let params = entry.params();
+                ServedCell {
+                    cell: Some(to_proto_cell_id(entry.cell())),
+                    sid: u32::from(params.overhead.sid),
+                    nid: u32::from(params.overhead.nid),
+                    mcc_digits: cdma_common::paging::mcc_to_digits(params.mcc).unwrap_or_default(),
+                    imsi_11_12_digits: cdma_common::paging::imsi_11_12_to_digits(params.imsi_11_12)
+                        .unwrap_or_default(),
+                    in_service: entry.is_in_service(),
                 }
-            }
-        };
-        let response = self.client().stream_session(outbound).await?;
-        Ok(Response::new(Box::pin(response.into_inner())))
-    }
-
-    async fn get_session_status(
-        &self,
-        request: Request<cdma_packet::proto::GetSessionStatusRequest>,
-    ) -> Result<Response<cdma_packet::proto::GetSessionStatusResponse>, Status> {
-        self.client().get_session_status(request).await
-    }
-
-    async fn list_sessions(
-        &self,
-        request: Request<cdma_packet::proto::ListSessionsRequest>,
-    ) -> Result<Response<cdma_packet::proto::ListSessionsResponse>, Status> {
-        self.client().list_sessions(request).await
-    }
-
-    async fn get_session_by_ip(
-        &self,
-        request: Request<cdma_packet::proto::GetSessionByIpRequest>,
-    ) -> Result<Response<cdma_packet::proto::GetSessionByIpResponse>, Status> {
-        self.client().get_session_by_ip(request).await
-    }
-
-    async fn set_session_capture(
-        &self,
-        request: Request<cdma_packet::proto::SetSessionCaptureRequest>,
-    ) -> Result<Response<cdma_packet::proto::SetSessionCaptureResponse>, Status> {
-        self.client().set_session_capture(request).await
-    }
-
-    async fn set_sch_active(
-        &self,
-        request: Request<cdma_packet::proto::SetSchActiveRequest>,
-    ) -> Result<Response<cdma_packet::proto::SetSchActiveResponse>, Status> {
-        self.client().set_sch_active(request).await
+            })
+            .collect();
+        Ok(Response::new(BaseStationEnrollResponse {
+            node_id: self.state.node_id.clone(),
+            a1_addr: self.state.a1_bind_addr.to_string(),
+            cells,
+        }))
     }
 }
-
-// ─── Conversions ────────────────────────────────────────────────
 
 fn to_proto_traffic_channel_power(tp: &TrafficChannelPowerSnapshot) -> proto::TrafficChannelPower {
     proto::TrafficChannelPower {
@@ -213,50 +482,6 @@ fn to_proto_traffic_channel_power(tp: &TrafficChannelPowerSnapshot) -> proto::Tr
     }
 }
 
-fn to_proto_bts_reverse_power(
-    snapshot: &BtsPowerControlSnapshot,
-    bsc_snapshot: Option<&TrafficChannelPowerSnapshot>,
-) -> proto::TrafficChannelPower {
-    proto::TrafficChannelPower {
-        target_eb_nt_db: snapshot.target_eb_nt_db,
-        effective_target_eb_nt_db: snapshot.effective_target_eb_nt_db,
-        manual_target_override_db: snapshot.manual_target_override_db,
-        last_pcg_snr_db: bsc_snapshot
-            .and_then(|s| s.last_pcg_snr_db)
-            .map(|arr| arr.to_vec())
-            .unwrap_or_default(),
-        last_active_pcg_mask: bsc_snapshot
-            .and_then(|s| s.last_active_pcg_mask)
-            .map(|arr| arr.to_vec())
-            .unwrap_or_default(),
-        last_pcbs: snapshot.last_pcbs.iter().map(|b| *b as u32).collect(),
-        reverse_pilot_ec_io_db: bsc_snapshot.and_then(|s| s.reverse_pilot_ec_io_db),
-        fer_pct: snapshot.fer_pct,
-        frames_total: snapshot.frames_total,
-        frames_crc_error: snapshot.frames_crc_error,
-        forward_gain_offset_db: bsc_snapshot.map_or(0.0, |s| s.forward_gain_offset_db),
-        forward_last_fer_pct: bsc_snapshot
-            .and_then(|s| s.forward_last_fer_pct)
-            .unwrap_or(0.0),
-        forward_last_pmrm_errors: bsc_snapshot.map_or(0, |s| s.forward_last_pmrm_errors),
-        forward_last_pmrm_frames: bsc_snapshot.map_or(0, |s| s.forward_last_pmrm_frames),
-        forward_pmrm_count: bsc_snapshot.map_or(0, |s| s.forward_pmrm_count),
-        forward_pilot_ec_io_db: bsc_snapshot
-            .map(|s| s.forward_pilot_ec_io_db.clone())
-            .unwrap_or_default(),
-        last_pcg_pilot_ec_nt_db: snapshot.last_pcg_pilot_ec_nt_db.to_vec(),
-        forward_radio_config: bsc_snapshot.map_or(0, |s| s.forward_radio_config),
-        reverse_radio_config: bsc_snapshot.map_or(0, |s| s.reverse_radio_config),
-        power_history: Vec::new(),
-        measured_inner_loop_1s_db: snapshot
-            .measured_inner_loop_1s
-            .map(|measurement| measurement.mean_db),
-        measured_inner_loop_1s_timestamp_ms: snapshot
-            .measured_inner_loop_1s
-            .map(|measurement| measurement.timestamp_ms),
-    }
-}
-
 /// Format origination digits for gRPC display, appending raw hex for DTMF mode.
 fn format_origination_digits(digit_mode: bool, digits: &[u8]) -> String {
     if digits.is_empty() {
@@ -272,88 +497,6 @@ fn format_origination_digits(digit_mode: bool, digits: &[u8]) -> String {
         .collect::<Vec<_>>()
         .join("");
     format!("{rendered} (raw={raw})")
-}
-
-fn to_proto_tx_metrics(m: &BtsTxMetrics) -> proto::TxMetrics {
-    proto::TxMetrics {
-        timestamp_ns: m.timestamp_ns as i64,
-        chip_cursor: m.chip_cursor,
-        blocks_transmitted: m.blocks_transmitted,
-        rt_ratio: m.rt_ratio,
-        gen_avg_us: m.gen_avg_us,
-        gen_max_us: m.gen_max_us,
-        tx_avg_us: m.tx_avg_us,
-        tx_max_us: m.tx_max_us,
-        pulse_avg_us: m.pulse_avg_us,
-        pulse_max_us: m.pulse_max_us,
-        synth_pilot_us: m.synth_pilot_us,
-        synth_sync_us: m.synth_sync_us,
-        synth_paging_us: m.synth_paging_us,
-        synth_spread_us: m.synth_spread_us,
-        sync_fragments_sent: m.sync_fragments_sent,
-        paging_fragments_sent: m.paging_fragments_sent,
-        hw_margin_min_us: m.hw_margin_min_us,
-        hw_margin_avg_us: m.hw_margin_avg_us,
-        hw_margin_max_us: m.hw_margin_max_us,
-        late_batches: m.late_batches,
-        radio_health: Some(proto::TxRadioHealth {
-            underflows: m.radio_health.underflows,
-            late_packets: m.radio_health.late_packets,
-            sequence_errors: m.radio_health.sequence_errors,
-            burst_acks: m.radio_health.burst_acks,
-            dropped_packets: m.radio_health.dropped_packets,
-            unknown_events: m.radio_health.unknown_events,
-        }),
-        realtime_degraded_events: m.realtime_degraded_events,
-        finalized_queue_airtime_us: m.finalized_queue_airtime_us,
-    }
-}
-
-fn to_proto_rx_metrics(m: &BtsRxMetrics) -> proto::RxMetrics {
-    proto::RxMetrics {
-        reads: m.reads,
-        samples: m.samples,
-        rt_ratio: m.rt_ratio,
-        capture_us: m.capture_us,
-        pipeline_us: m.pipeline_us,
-        total_us: m.total_us,
-        total_max_us: m.total_max_us,
-        stages: m
-            .stages
-            .iter()
-            .map(|s| proto::StageMetrics {
-                name: s.name.clone(),
-                total_us: s.total_us,
-                calls: s.calls,
-                max_us: s.max_us,
-                pct_pipeline: s.pct_pipeline,
-            })
-            .collect(),
-        deficit_ms: m.deficit_ms,
-        queues: m
-            .queues
-            .iter()
-            .map(|q| proto::RxQueueMetrics {
-                name: q.name.clone(),
-                queued_samples: q.queued_samples,
-                queued_airtime_us: q.queued_airtime_us,
-                max_queued_samples: q.max_queued_samples,
-                max_residency_us: q.max_residency_us,
-            })
-            .collect(),
-    }
-}
-
-fn to_proto_bearer_metrics(m: BearerStats) -> proto::BearerMetrics {
-    proto::BearerMetrics {
-        tx_frames: m.tx_frames,
-        rx_accepted: m.rx_accepted,
-        duplicate_drop: m.duplicate_drop,
-        late_drop: m.late_drop,
-        encode_errors: m.encode_errors,
-        route_errors: m.route_errors,
-        delivery_errors: m.delivery_errors,
-    }
 }
 
 fn should_stream_access_event(event: &AccessChannelEvent) -> bool {
@@ -628,6 +771,7 @@ fn to_proto_access_event(e: &AccessChannelEvent) -> proto::AccessEvent {
         is_preamble_only: e.is_preamble_only,
         rdsch_summary,
         rdsch_msg_type_name,
+        cell: e.cell.map(to_proto_cell_id),
     }
 }
 
@@ -827,6 +971,7 @@ fn to_proto_traffic_event(ev: &TrafficEvent) -> proto::TrafficEvent {
         pdu_hex: Some(ev.pdu_hex.clone()),
         body,
         voice_call_state: ev.voice_call_state.clone(),
+        cell: Some(to_proto_cell_id(ev.cell)),
     }
 }
 
@@ -1242,6 +1387,10 @@ fn to_proto_paging_event(ev: &PagingEvent) -> proto::PagingEvent {
         timestamp_us: ev.timestamp_us,
         event_id: ev.event_id.clone(),
         body,
+        // The Abis-level paging event does not say which cell carried the
+        // record. The per-cell transmission stream carries the cell that
+        // actually put it on air.
+        cell: None,
     }
 }
 
@@ -1271,161 +1420,6 @@ fn cam_effective_radio_config(cam: &ChannelAssignmentMessage) -> Option<(u8, u8)
     }
 }
 
-fn to_proto_evdo(r: &cdma_bts::bts::evdo::ResolvedEvdoConfig) -> proto::EvdoCarrierConfig {
-    use cdma_bts::bts::evdo::EvdoTxMode;
-    let mode = match r.tx_mode {
-        EvdoTxMode::AdjacentComposite => proto::EvdoTxMode::AdjacentComposite,
-        EvdoTxMode::HrpdOnly => proto::EvdoTxMode::HrpdOnly,
-    };
-    let sector_id = r
-        .overhead
-        .sector_id
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    proto::EvdoCarrierConfig {
-        channel: u32::from(r.evdo_channel),
-        band_class: u32::from(r.evdo_band_class),
-        frequency_hz: r.evdo_frequency_hz as u64,
-        reverse_frequency_hz: r.evdo_reverse_frequency_hz as u64,
-        composite_center_frequency_hz: r.composite_center_frequency_hz as u64,
-        mode: mode as i32,
-        gain: r.gain,
-        advertise_on_1x: r.advertise_on_1x,
-        sector_id,
-        color_code: u32::from(r.overhead.color_code),
-        subnet_mask: u32::from(r.overhead.subnet_mask),
-    }
-}
-
-fn to_proto_config(
-    cfg: &BtsRuntimeSettings,
-    channel: cdma_common::band_class::ChannelPlan,
-    tx_center_frequency_hz: usize,
-    rx_center_frequency_hz: usize,
-    evdo: Option<&cdma_bts::bts::evdo::ResolvedEvdoConfig>,
-    overhead: &crate::bsc::OverheadParameters,
-    timezone: &cdma_common::timezone::TimezoneConfig,
-    pilot_offset: usize,
-) -> proto::BtsConfig {
-    use cdma_common::timezone::TimezoneSource;
-    let resolved = cdma_common::timezone::resolve(timezone, overhead, chrono::Utc::now());
-    let (source_str, tz_name) = match &timezone.source {
-        TimezoneSource::Overhead => ("overhead".to_string(), None),
-        TimezoneSource::System => (
-            "system".to_string(),
-            cdma_common::timezone::host_iana_name(),
-        ),
-        TimezoneSource::User { tz } => ("user".to_string(), Some(tz.clone())),
-    };
-    proto::BtsConfig {
-        pilot_offset: pilot_offset as u32,
-        spreading_rate: format!("{:?}", cfg.spreading_rate),
-        chip_rate_hz: cfg.chip_rate_hz as u32,
-        tx_sample_rate_hz: cfg.tx_sample_rate_hz as u32,
-        tx_bandwidth_hz: cfg.tx_bandwidth_hz as u32,
-        tx_center_frequency_hz: tx_center_frequency_hz as u32,
-        rx_center_frequency_hz: rx_center_frequency_hz as u32,
-        band_class: channel.band_class.as_str().to_string(),
-        cdma_channel: channel.cdma_channel as u32,
-        band_subclass: channel.band_subclass as u32,
-        tx_digital_backoff: cfg.tx_digital_backoff,
-        block_size_chips: cfg.block_size_chips as u32,
-        pilot: Some(proto::PilotConfig {
-            walsh_code: cfg.downlink.pilot.walsh_code as u32,
-            power_fraction: cfg.downlink.pilot.power_fraction,
-        }),
-        sync: Some(proto::SyncConfig {
-            walsh_code: cfg.downlink.sync.walsh_code as u32,
-            data_rate_bps: cfg.downlink.sync.data_rate_bps as u32,
-            power_fraction: cfg.downlink.sync.power_fraction,
-        }),
-        paging: Some(proto::PagingConfig {
-            walsh_code: cfg.downlink.paging.walsh_code as u32,
-            paging_channel_number: cfg.downlink.paging.paging_channel_number as u32,
-            data_rate_bps: cfg.downlink.paging.data_rate_bps as u32,
-            power_fraction: cfg.downlink.paging.power_fraction,
-        }),
-        overhead: Some(proto::OverheadConfig {
-            sid: overhead.sid as u32,
-            nid: overhead.nid as u32,
-            base_id: overhead.base_id as u32,
-            reg_zone: overhead.reg_zone as u32,
-            total_zones: overhead.total_zones as u32,
-            zone_timer: overhead.zone_timer as u32,
-            max_slot_cycle_index: overhead.max_slot_cycle_index as u32,
-            page_chan: overhead.page_chan as u32,
-            config_seq: overhead.config_seq as u32,
-            acc_config_seq: overhead.acc_config_seq as u32,
-            power_up_reg: overhead.power_up_reg,
-            parameter_reg: overhead.parameter_reg,
-            auth_mode: overhead.auth_mode as u32,
-            lp_sec: overhead.lp_sec as u32,
-            ltm_off: overhead.ltm_off as i32,
-            daylt: overhead.daylt as u32,
-            mcc_digits: {
-                let esp = &cfg
-                    .downlink
-                    .paging
-                    .message_defaults
-                    .extended_system_parameters;
-                cdma_common::paging::mcc_to_digits(esp.mcc).unwrap_or_default()
-            },
-            imsi_11_12_digits: {
-                let esp = &cfg
-                    .downlink
-                    .paging
-                    .message_defaults
-                    .extended_system_parameters;
-                cdma_common::paging::imsi_11_12_to_digits(esp.imsi_11_12).unwrap_or_default()
-            },
-        }),
-        timezone: Some(proto::TimezoneConfig {
-            source: source_str.clone(),
-            tz: match &timezone.source {
-                TimezoneSource::User { tz } => Some(tz.clone()),
-                _ => None,
-            },
-        }),
-        timezone_status: Some(proto::TimezoneStatus {
-            source: source_str,
-            tz: tz_name,
-            ltm_off: resolved.ltm_off as i32,
-            daylt: resolved.daylt as u32,
-            lp_sec: resolved.lp_sec as u32,
-            utc_offset_seconds: i32::from(resolved.local_time_offset_minutes) * 60,
-        }),
-        evdo: evdo.map(to_proto_evdo),
-    }
-}
-
-fn to_proto_iq_capture_status(status: &BtsIqCaptureStatus) -> proto::IqCaptureStatus {
-    proto::IqCaptureStatus {
-        active: status.active,
-        directory: status.directory.display().to_string(),
-        wav_path: status.wav_path.as_ref().map(|p| p.display().to_string()),
-        metadata_path: status
-            .metadata_path
-            .as_ref()
-            .map(|p| p.display().to_string()),
-        first_absolute_chip_start: status.first_absolute_chip_start,
-        // Omitted: at 8x capture this exceeds JS's safe integer range. Exact
-        // sample time stays in the sidecar metadata JSON.
-        first_absolute_sample_start: None,
-        first_sample_system_time: status
-            .first_sample_system_time
-            .as_ref()
-            .map(|t| t.to_rfc3339()),
-        first_hardware_time_ns: status.first_hardware_time_ns.map(|v| v as i64),
-        captured_samples: status.captured_samples,
-        captured_seconds: status.captured_samples as f64 / status.sample_rate_hz.max(1) as f64,
-        sample_rate_hz: status.sample_rate_hz as u32,
-        chip_rate_hz: status.chip_rate_hz as u32,
-    }
-}
-
-// ─── Service Implementation ─────────────────────────────────────
-
 type GrpcStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
 #[tonic::async_trait]
@@ -1434,106 +1428,53 @@ impl BscService for BscServiceImpl {
         &self,
         _: Request<()>,
     ) -> Result<Response<proto::SystemStatus>, Status> {
-        let oh = &self.state.overhead;
+        // The BSC is up whatever the cell count, so report that regardless.
+        // Fill per-cell identity only for a sole enrolled cell — with several,
+        // the per-cell list carries identity and these stay zero.
+        let params = self.state.bts.sole_entry().map(|entry| entry.params());
+        let overhead = params.as_ref().map(|params| &params.overhead);
         Ok(Response::new(proto::SystemStatus {
             running: true,
-            sid: oh.sid as u32,
-            nid: oh.nid as u32,
-            base_id: oh.base_id as u32,
-            pilot_pn: self.state.pilot_offset as u32,
-            reg_zone: oh.reg_zone as u32,
+            sid: overhead.map_or(0, |oh| u32::from(oh.sid)),
+            nid: overhead.map_or(0, |oh| u32::from(oh.nid)),
+            base_id: overhead.map_or(0, |oh| u32::from(oh.base_id)),
+            pilot_pn: params
+                .as_ref()
+                .map_or(0, |params| params.pilot_offset as u32),
+            reg_zone: overhead.map_or(0, |oh| u32::from(oh.reg_zone)),
         }))
     }
 
     async fn get_config(&self, _: Request<()>) -> Result<Response<proto::BtsConfig>, Status> {
-        let cfg = to_proto_config(
-            &self.state.bts_config,
-            self.state.channel,
-            self.state.tx_center_frequency_hz,
-            self.state.rx_center_frequency_hz,
-            self.state.evdo.as_ref(),
-            &self.state.overhead,
-            &self.state.timezone,
-            self.state.pilot_offset,
-        );
-        Ok(Response::new(cfg))
+        <Self as BtsManagementService>::get_bts_config(self, any_cell()).await
     }
 
     async fn get_radio_metrics(
         &self,
         _: Request<()>,
     ) -> Result<Response<proto::RadioMetrics>, Status> {
-        let tx = self.state.tx_metrics.borrow().clone();
-        let rx = self.state.rx_metrics.borrow().clone();
-        Ok(Response::new(proto::RadioMetrics {
-            tx: Some(to_proto_tx_metrics(&tx)),
-            rx: Some(to_proto_rx_metrics(&rx)),
-            bearer: self
-                .state
-                .bts_client
-                .bearer_client()
-                .map(|client| to_proto_bearer_metrics(client.stats())),
-        }))
+        <Self as BtsManagementService>::get_radio_metrics(self, any_cell()).await
     }
 
     async fn get_iq_capture_status(
         &self,
         _: Request<()>,
     ) -> Result<Response<proto::IqCaptureStatus>, Status> {
-        let (respond_to, rx) = oneshot::channel();
-        self.state
-            .bts_commands
-            .send(BtsCommand::GetCaptureStatus {
-                directory: self.state.iq_capture_dir.clone(),
-                respond_to,
-            })
-            .await
-            .map_err(|e| Status::unavailable(format!("BTS command queue unavailable: {}", e)))?;
-
-        let result = rx
-            .await
-            .map_err(|_| Status::unavailable("BTS RX thread dropped capture response"))?;
-        let result = result.map_err(Status::failed_precondition)?;
-        Ok(Response::new(to_proto_iq_capture_status(&result.status)))
+        <Self as BtsManagementService>::get_iq_capture_status(self, any_cell()).await
     }
 
     async fn start_iq_capture(
         &self,
         _: Request<()>,
     ) -> Result<Response<proto::IqCaptureStatus>, Status> {
-        let (respond_to, rx) = oneshot::channel();
-        self.state
-            .bts_commands
-            .send(BtsCommand::StartCapture {
-                directory: self.state.iq_capture_dir.clone(),
-                respond_to,
-            })
-            .await
-            .map_err(|e| Status::unavailable(format!("BTS command queue unavailable: {}", e)))?;
-
-        let result = rx
-            .await
-            .map_err(|_| Status::unavailable("BTS RX thread dropped capture response"))?;
-        let result = result.map_err(Status::failed_precondition)?;
-        Ok(Response::new(to_proto_iq_capture_status(&result.status)))
+        <Self as BtsManagementService>::start_iq_capture(self, any_cell()).await
     }
 
     async fn stop_iq_capture(
         &self,
         _: Request<()>,
     ) -> Result<Response<proto::IqCaptureStatus>, Status> {
-        let (respond_to, rx) = oneshot::channel();
-        self.state
-            .bts_commands
-            .send(BtsCommand::StopCapture { respond_to })
-            .await
-            .map_err(|e| Status::unavailable(format!("BTS command queue unavailable: {}", e)))?;
-
-        let result = rx
-            .await
-            .map_err(|_| Status::unavailable("BTS RX thread dropped capture response"))?;
-        let result = result.map_err(Status::failed_precondition)?;
-        Ok(Response::new(to_proto_iq_capture_status(&result.status)))
+        <Self as BtsManagementService>::stop_iq_capture(self, any_cell()).await
     }
 
     type StreamRadioMetricsStream = GrpcStream<proto::RadioMetrics>;
@@ -1542,26 +1483,7 @@ impl BscService for BscServiceImpl {
         &self,
         _: Request<()>,
     ) -> Result<Response<Self::StreamRadioMetricsStream>, Status> {
-        let mut tx_rx = self.state.tx_metrics.clone();
-        let rx_rx = self.state.rx_metrics.clone();
-        let bts_client = self.state.bts_client.clone();
-        let stream = async_stream::stream! {
-            loop {
-                if tx_rx.changed().await.is_err() {
-                    break;
-                }
-                let tx = tx_rx.borrow().clone();
-                let rx = rx_rx.borrow().clone();
-                yield Ok(proto::RadioMetrics {
-                    tx: Some(to_proto_tx_metrics(&tx)),
-                    rx: Some(to_proto_rx_metrics(&rx)),
-                    bearer: bts_client
-                        .bearer_client()
-                        .map(|client| to_proto_bearer_metrics(client.stats())),
-                });
-            }
-        };
-        Ok(Response::new(Box::pin(stream)))
+        <Self as BtsManagementService>::stream_radio_metrics(self, any_cell()).await
     }
 
     type StreamAccessEventsStream = GrpcStream<proto::AccessEvent>;
@@ -1584,14 +1506,28 @@ impl BscService for BscServiceImpl {
 
     type StreamPagingEventsStream = GrpcStream<proto::PagingEvent>;
 
+    /// Streams both what the BSC sent toward the paging channel and what each
+    /// BTS actually transmitted on it.
     async fn stream_paging_events(
         &self,
         _: Request<()>,
     ) -> Result<Response<Self::StreamPagingEventsStream>, Status> {
         let mut rx = self.state.paging_broadcast.subscribe();
+        let mut pch_rx = self.pch_transmissions.subscribe();
         let stream = async_stream::stream! {
-            while let Ok(event) = rx.recv().await {
-                yield Ok(to_proto_paging_event(&event));
+            loop {
+                tokio::select! {
+                    event = rx.recv() => match event {
+                        Ok(event) => yield Ok(to_proto_paging_event(&event)),
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    },
+                    event = pch_rx.recv() => match event {
+                        Ok(event) => yield Ok(event),
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    },
+                }
             }
         };
         Ok(Response::new(Box::pin(stream)))
@@ -1614,16 +1550,18 @@ impl BscService for BscServiceImpl {
 
     async fn list_mobiles(&self, _: Request<()>) -> Result<Response<proto::MobileList>, Status> {
         let mobiles = self.state.mobiles.borrow().clone();
+        let bts_power = self.reverse_power_by_cell_walsh().await;
+        let default_cell = self.default_cell();
         Ok(Response::new(proto::MobileList {
             mobiles: mobiles
                 .into_iter()
                 .map(|m| {
+                    let cell = m.serving_cell.or(default_cell);
                     let traffic_power = m
                         .traffic_walsh_code
-                        .and_then(|walsh| self.state.bts_power_control.snapshot(walsh))
-                        .map(|snapshot| {
-                            to_proto_bts_reverse_power(&snapshot, m.traffic_power.as_ref())
-                        })
+                        .zip(cell)
+                        .and_then(|(walsh, cell)| bts_power.get(&(cell, walsh)).cloned())
+                        .map(|power| merge_bsc_power_fields(power, m.traffic_power.as_ref()))
                         .or_else(|| m.traffic_power.as_ref().map(to_proto_traffic_channel_power));
                     proto::MobileInfo {
                         address: m.address,
@@ -1656,83 +1594,62 @@ impl BscService for BscServiceImpl {
                         traffic_service_option: m.traffic_service_option.map(|s| s as u32),
                         voice_call_state: m.voice_call_state.clone(),
                         traffic_power,
+                        serving_cell: m.serving_cell.map(to_proto_cell_id),
                     }
                 })
                 .collect(),
         }))
     }
 
+    /// Every cell's local radio resources plus the traffic channels the BSC
+    /// has mobiles on, so one list covers the whole BSC.
     async fn list_channels(&self, _: Request<()>) -> Result<Response<proto::ChannelList>, Status> {
-        let cfg = &self.state.bts_config;
         let mut channels = Vec::new();
-
-        // Forward-link overhead channels
-        channels.push(proto::Channel {
-            walsh_code: Some(cfg.downlink.pilot.walsh_code as u32),
-            channel_type: "pilot".into(),
-            direction: "forward".into(),
-            power_fraction: Some(cfg.downlink.pilot.power_fraction),
-            data_rate_bps: None,
-            paging_channel_number: None,
-            access_channel_number: None,
-            mobile: None,
-            service_option: None,
-            traffic_power: None,
-        });
-        channels.push(proto::Channel {
-            walsh_code: Some(cfg.downlink.sync.walsh_code as u32),
-            channel_type: "sync".into(),
-            direction: "forward".into(),
-            power_fraction: Some(cfg.downlink.sync.power_fraction),
-            data_rate_bps: Some(cfg.downlink.sync.data_rate_bps as u32),
-            paging_channel_number: None,
-            access_channel_number: None,
-            mobile: None,
-            service_option: None,
-            traffic_power: None,
-        });
-        channels.push(proto::Channel {
-            walsh_code: Some(cfg.downlink.paging.walsh_code as u32),
-            channel_type: "paging".into(),
-            direction: "forward".into(),
-            power_fraction: Some(cfg.downlink.paging.power_fraction),
-            data_rate_bps: Some(cfg.downlink.paging.data_rate_bps as u32),
-            paging_channel_number: Some(cfg.downlink.paging.paging_channel_number as u32),
-            access_channel_number: None,
-            mobile: None,
-            service_option: None,
-            traffic_power: None,
-        });
-
-        // Reverse-link access channels
-        for &acc_num in &cfg.uplink.access_channel_numbers {
-            channels.push(proto::Channel {
-                walsh_code: None,
-                channel_type: "access".into(),
-                direction: "reverse".into(),
-                power_fraction: None,
-                data_rate_bps: Some(cfg.uplink.access_channel_rate_bps as u32),
-                paging_channel_number: None,
-                access_channel_number: Some(acc_num as u32),
-                mobile: None,
-                service_option: None,
-                traffic_power: None,
-            });
+        let mut cell_walsh_capacity = Vec::new();
+        for entry in self.state.bts.entries() {
+            let Some(mut client) = entry.oam() else {
+                continue;
+            };
+            let cell = to_proto_cell_id(entry.cell());
+            match client
+                .list_local_radio_resources(CellRequest {
+                    cell: Some(cell),
+                    peer_id: None,
+                })
+                .await
+            {
+                Ok(response) => {
+                    let list = response.into_inner();
+                    cell_walsh_capacity.push(proto::CellWalshCapacity {
+                        cell: Some(cell),
+                        total_walsh_codes: list.total_walsh_codes,
+                    });
+                    channels.extend(
+                        list.channels
+                            .into_iter()
+                            .filter(|c| c.channel_type != TRAFFIC_CHANNEL_TYPE),
+                    );
+                }
+                Err(e) => warn!(
+                    "cell {}/{} local radio resource list failed: {e}",
+                    cell.cell, cell.sector
+                ),
+            }
         }
 
-        // Traffic channels from active mobiles
         let mobiles = self.state.mobiles.borrow().clone();
+        let bts_power = self.reverse_power_by_cell_walsh().await;
+        let default_cell = self.default_cell();
         for m in &mobiles {
             if let Some(walsh) = m.traffic_walsh_code {
-                let traffic_power = self
-                    .state
-                    .bts_power_control
-                    .snapshot(walsh)
-                    .map(|snapshot| to_proto_bts_reverse_power(&snapshot, m.traffic_power.as_ref()))
+                let channel_cell = m.serving_cell.or(default_cell);
+                let traffic_power = channel_cell
+                    .and_then(|cell| bts_power.get(&(cell, walsh)).cloned())
+                    .map(|power| merge_bsc_power_fields(power, m.traffic_power.as_ref()))
                     .or_else(|| m.traffic_power.as_ref().map(to_proto_traffic_channel_power));
                 channels.push(proto::Channel {
                     walsh_code: Some(walsh as u32),
-                    channel_type: "traffic".into(),
+                    channel_type: TRAFFIC_CHANNEL_TYPE.into(),
                     direction: "forward".into(),
                     power_fraction: None,
                     data_rate_bps: None,
@@ -1751,6 +1668,7 @@ impl BscService for BscServiceImpl {
                     }),
                     service_option: m.traffic_service_option.map(|s| s as u32),
                     traffic_power,
+                    cell: channel_cell.map(to_proto_cell_id),
                 });
             }
         }
@@ -1759,7 +1677,11 @@ impl BscService for BscServiceImpl {
 
         Ok(Response::new(proto::ChannelList {
             channels,
-            total_walsh_codes: cfg.orthogonal_code_length as u32,
+            total_walsh_codes: cell_walsh_capacity
+                .iter()
+                .map(|entry| entry.total_walsh_codes)
+                .sum(),
+            cell_walsh_capacity,
         }))
     }
 
@@ -1770,80 +1692,51 @@ impl BscService for BscServiceImpl {
         let req = request.into_inner();
         let walsh_code = u8::try_from(req.walsh_code)
             .map_err(|_| Status::invalid_argument("walsh_code must fit in u8"))?;
-        let action = match req.action {
-            Some(proto::set_traffic_channel_power_override_request::Action::SetTargetEbNtDb(
-                target_db,
-            )) => TrafficPowerOverrideAction::SetTargetEbNtDb(target_db),
-            Some(proto::set_traffic_channel_power_override_request::Action::Clear(_)) => {
-                TrafficPowerOverrideAction::Clear
-            }
-            None => {
-                return Err(Status::invalid_argument(
-                    "one of set_target_eb_nt_db or clear is required",
-                ));
-            }
+        // Each cell allocates Walsh codes from its own pool, so the code alone
+        // does not identify a channel. An unnamed cell resolves to the only
+        // enrolled one, which is how the rest of the cell-addressed API reads
+        // an absent cell.
+        let requested_cell = match req.cell {
+            Some(cell) => Some(from_proto_cell_id(&cell)?),
+            None => self
+                .state
+                .bts
+                .sole_entry()
+                .map(|entry| entry.cell())
+                .ok_or_else(|| {
+                    Status::failed_precondition(
+                        "more than one cell is enrolled, so the request must name one",
+                    )
+                })
+                .map(Some)?,
         };
-        if !self
-            .state
-            .mobiles
-            .borrow()
-            .iter()
-            .any(|mobile| mobile.traffic_walsh_code == Some(walsh_code))
-        {
-            return Err(Status::not_found("active traffic channel not found"));
-        }
-
-        match action {
-            TrafficPowerOverrideAction::SetTargetEbNtDb(target_db) => {
-                self.state
-                    .bts_power_control
-                    .set_target(walsh_code, target_db, true);
-            }
-            TrafficPowerOverrideAction::Clear => {
-                let target_db = self
-                    .state
-                    .bts_power_control
-                    .snapshot(walsh_code)
-                    .map(|snapshot| snapshot.target_eb_nt_db)
-                    .ok_or_else(|| Status::not_found("active BTS power-control state not found"))?;
-                self.state
-                    .bts_power_control
-                    .set_target(walsh_code, target_db, false);
-            }
-        }
-
-        let snapshot = self
-            .state
-            .bts_power_control
-            .snapshot(walsh_code)
-            .ok_or_else(|| Status::not_found("active BTS power-control state not found"))?;
-        let bsc_snapshot = self
-            .state
-            .mobiles
-            .borrow()
-            .iter()
-            .find(|mobile| mobile.traffic_walsh_code == Some(walsh_code))
-            .and_then(|mobile| mobile.traffic_power.clone());
-
-        let message = if let Some(manual_db) = snapshot.manual_target_override_db {
-            format!(
-                "manual reverse target pinned at {:.2} dB on walsh {}",
-                manual_db, walsh_code
-            )
-        } else {
-            format!(
-                "manual reverse target cleared on walsh {}; auto resumed at {:.2} dB",
-                walsh_code, snapshot.target_eb_nt_db
-            )
+        let bsc_snapshot = {
+            self.state
+                .mobiles
+                .borrow()
+                .iter()
+                .find(|mobile| {
+                    mobile.traffic_walsh_code == Some(walsh_code)
+                        && mobile.serving_cell == requested_cell
+                })
+                .map(|mobile| mobile.traffic_power.clone())
+                .ok_or_else(|| Status::not_found("active traffic channel not found"))?
         };
 
-        Ok(Response::new(
-            proto::SetTrafficChannelPowerOverrideResponse {
-                accepted: true,
-                message,
-                traffic_power: Some(to_proto_bts_reverse_power(&snapshot, bsc_snapshot.as_ref())),
-            },
-        ))
+        let (cell, mut client) = self.oam_for(requested_cell.map(to_proto_cell_id))?;
+        // Forward with the resolved cell so the BTS-side check sees the cell
+        // this BSC actually addressed.
+        let mut response = client
+            .set_reverse_power_control_override(proto::SetTrafficChannelPowerOverrideRequest {
+                cell: Some(cell),
+                ..req
+            })
+            .await?
+            .into_inner();
+        response.traffic_power = response
+            .traffic_power
+            .map(|power| merge_bsc_power_fields(power, bsc_snapshot.as_ref()));
+        Ok(Response::new(response))
     }
 
     async fn initiate_data_call(
@@ -1884,25 +1777,37 @@ impl ManagementFacadeService for BscServiceImpl {
         &self,
         request: Request<()>,
     ) -> Result<Response<SystemOverview>, Status> {
+        // Node health matters most when no cell resolves — a BTS down, or
+        // several enrolled — which is exactly when per-cell system status
+        // refuses. The identity block is therefore optional, not a
+        // precondition for the whole overview.
         let status = <Self as BscService>::get_system_status(self, request)
-            .await?
-            .into_inner();
+            .await
+            .ok()
+            .map(|response| response.into_inner());
+        let mut nodes: Vec<NodeHealth> = self
+            .state
+            .bts
+            .summaries()
+            .into_iter()
+            .map(|summary| NodeHealth {
+                node_id: format!("bts-{}-{}", summary.cell.cell, summary.cell.sector),
+                node_type: "BTS".into(),
+                healthy: summary.state == BtsAttachState::InService,
+                message: summary
+                    .status_detail
+                    .unwrap_or_else(|| attach_state_message(summary.state).to_string()),
+            })
+            .collect();
+        nodes.push(NodeHealth {
+            node_id: self.state.node_id.clone(),
+            node_type: "BSC".into(),
+            healthy: true,
+            message: "running".into(),
+        });
         Ok(Response::new(SystemOverview {
-            bsc_status: Some(status),
-            nodes: vec![
-                NodeHealth {
-                    node_id: self.state.node_id.clone(),
-                    node_type: "BTS".into(),
-                    healthy: true,
-                    message: "hosted in current BSC process".into(),
-                },
-                NodeHealth {
-                    node_id: self.state.node_id.clone(),
-                    node_type: "BSC".into(),
-                    healthy: true,
-                    message: "hosted in current BSC process".into(),
-                },
-            ],
+            bsc_status: status,
+            nodes,
         }))
     }
 
@@ -1912,35 +1817,32 @@ impl ManagementFacadeService for BscServiceImpl {
         &self,
         _: Request<()>,
     ) -> Result<Response<Self::StreamSystemEventsStream>, Status> {
-        let mut tx_rx = self.state.tx_metrics.clone();
-        let rx_rx = self.state.rx_metrics.clone();
         let mut access_rx = self.state.access_broadcast.subscribe();
         let mut paging_rx = self.state.paging_broadcast.subscribe();
+        let mut pch_rx = self.pch_transmissions.subscribe();
         let mut traffic_rx = self.state.traffic_broadcast.subscribe();
-        let bts_client = self.state.bts_client.clone();
         let node_id = self.state.node_id.clone();
+        let mut metrics = self.radio_metrics_stream().await;
 
         let stream = async_stream::stream! {
             loop {
                 tokio::select! {
-                    changed = tx_rx.changed() => {
-                        if changed.is_err() {
-                            break;
+                    metrics_event = metrics.next() => {
+                        match metrics_event {
+                            Some(Ok(radio_metrics)) => {
+                                yield Ok(ManagementEvent {
+                                    source_node_id: node_id.clone(),
+                                    source_node_type: "BTS".into(),
+                                    classification: "telemetry".into(),
+                                    body: Some(management_event::Body::RadioMetrics(radio_metrics)),
+                                });
+                            }
+                            Some(Err(e)) => {
+                                warn!("radio metrics stream ended: {e}");
+                                metrics = Box::pin(tokio_stream::pending());
+                            }
+                            None => metrics = Box::pin(tokio_stream::pending()),
                         }
-                        let tx = tx_rx.borrow().clone();
-                        let rx = rx_rx.borrow().clone();
-                        yield Ok(ManagementEvent {
-                            source_node_id: node_id.clone(),
-                            source_node_type: "BTS".into(),
-                            classification: "telemetry".into(),
-                            body: Some(management_event::Body::RadioMetrics(proto::RadioMetrics {
-                                tx: Some(to_proto_tx_metrics(&tx)),
-                                rx: Some(to_proto_rx_metrics(&rx)),
-                                bearer: bts_client
-                                    .bearer_client()
-                                    .map(|client| to_proto_bearer_metrics(client.stats())),
-                            })),
-                        });
                     }
                     event = access_rx.recv() => {
                         match event {
@@ -1954,8 +1856,8 @@ impl ManagementFacadeService for BscServiceImpl {
                                     });
                                 }
                             }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            Err(broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(broadcast::error::RecvError::Closed) => break,
                         }
                     }
                     event = paging_rx.recv() => {
@@ -1968,8 +1870,22 @@ impl ManagementFacadeService for BscServiceImpl {
                                     body: Some(management_event::Body::PagingEvent(to_proto_paging_event(&event))),
                                 });
                             }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            Err(broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                    event = pch_rx.recv() => {
+                        match event {
+                            Ok(event) => {
+                                yield Ok(ManagementEvent {
+                                    source_node_id: node_id.clone(),
+                                    source_node_type: "BTS".into(),
+                                    classification: "standards_event_with_diagnostics".into(),
+                                    body: Some(management_event::Body::PagingEvent(event)),
+                                });
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(broadcast::error::RecvError::Closed) => break,
                         }
                     }
                     event = traffic_rx.recv() => {
@@ -1982,8 +1898,8 @@ impl ManagementFacadeService for BscServiceImpl {
                                     body: Some(management_event::Body::TrafficEvent(to_proto_traffic_event(&event))),
                                 });
                             }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            Err(broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(broadcast::error::RecvError::Closed) => break,
                         }
                     }
                 }
@@ -1994,140 +1910,234 @@ impl ManagementFacadeService for BscServiceImpl {
     }
 }
 
+/// Per-cell forwarding implementation of the API each BTS serves for itself.
+///
+/// A request that names no cell is answered by the sole enrolled cell, so a
+/// single-cell deployment addresses the BSC exactly as it addresses a BTS.
 #[tonic::async_trait]
 impl BtsManagementService for BscServiceImpl {
+    async fn enroll(&self, _: Request<EnrollRequest>) -> Result<Response<EnrollResponse>, Status> {
+        let (_, mut client) = self.oam_for(None)?;
+        client.enroll(EnrollRequest {}).await
+    }
+
+    async fn list_bts(&self, _: Request<()>) -> Result<Response<BtsList>, Status> {
+        let mobiles = self.state.mobiles.borrow().clone();
+        let default_cell = self.default_cell();
+        // One row per configured peer, so offline peers still show.
+        let cell_summaries: std::collections::HashMap<_, _> = self
+            .state
+            .bts
+            .summaries()
+            .into_iter()
+            .map(|summary| (summary.cell, summary))
+            .collect();
+        let bts = self
+            .state
+            .bts
+            .peer_summaries()
+            .into_iter()
+            .map(
+                |peer| match peer.cell.and_then(|cell| cell_summaries.get(&cell)) {
+                    Some(summary) => {
+                        let served_mobiles = mobiles
+                            .iter()
+                            .filter(|m| m.serving_cell.or(default_cell) == Some(summary.cell))
+                            .count() as u32;
+                        BtsSummary {
+                            peer_id: peer.peer_id,
+                            management_endpoint: peer.oam_endpoint,
+                            cell: Some(to_proto_cell_id(summary.cell)),
+                            state: to_proto_attach_state(summary.state) as i32,
+                            pilot_pn: u32::from(summary.pilot_pn),
+                            band_class: summary.band_class.clone(),
+                            cdma_channel: u32::from(summary.cdma_channel),
+                            sid: u32::from(summary.sid),
+                            nid: u32::from(summary.nid),
+                            evdo_enabled: summary.evdo_enabled,
+                            evdo_color_code: summary.evdo_color_code.map(u32::from),
+                            an_grpc_addr: summary.an_grpc_addr.clone(),
+                            served_mobiles: Some(served_mobiles),
+                            status_detail: summary.status_detail.clone(),
+                        }
+                    }
+                    None => BtsSummary {
+                        peer_id: peer.peer_id,
+                        management_endpoint: peer.oam_endpoint,
+                        cell: None,
+                        state: to_proto_attach_state(peer.state) as i32,
+                        pilot_pn: 0,
+                        band_class: String::new(),
+                        cdma_channel: 0,
+                        sid: 0,
+                        nid: 0,
+                        evdo_enabled: false,
+                        evdo_color_code: None,
+                        an_grpc_addr: None,
+                        served_mobiles: None,
+                        status_detail: peer.status_detail,
+                    },
+                },
+            )
+            .collect();
+        Ok(Response::new(BtsList { bts }))
+    }
+
     async fn get_bts_status(
         &self,
-        request: Request<()>,
+        request: Request<CellRequest>,
     ) -> Result<Response<proto::SystemStatus>, Status> {
-        <Self as BscService>::get_system_status(self, request).await
+        let (cell, mut client) = self.oam_for_request(request.into_inner())?;
+        client.get_bts_status(cell_request(cell)).await
     }
 
     async fn get_bts_config(
         &self,
-        request: Request<()>,
+        request: Request<CellRequest>,
     ) -> Result<Response<proto::BtsConfig>, Status> {
-        <Self as BscService>::get_config(self, request).await
+        let (cell, mut client) = self.oam_for_request(request.into_inner())?;
+        client.get_bts_config(cell_request(cell)).await
     }
 
     async fn get_radio_metrics(
         &self,
-        request: Request<()>,
+        request: Request<CellRequest>,
     ) -> Result<Response<proto::RadioMetrics>, Status> {
-        <Self as BscService>::get_radio_metrics(self, request).await
+        let (cell, mut client) = self.oam_for_request(request.into_inner())?;
+        client.get_radio_metrics(cell_request(cell)).await
     }
 
     type StreamRadioMetricsStream = GrpcStream<proto::RadioMetrics>;
 
     async fn stream_radio_metrics(
         &self,
-        request: Request<()>,
+        request: Request<CellRequest>,
     ) -> Result<Response<Self::StreamRadioMetricsStream>, Status> {
-        <Self as BscService>::stream_radio_metrics(self, request).await
+        let (cell, mut client) = self.oam_for_request(request.into_inner())?;
+        let stream = client
+            .stream_radio_metrics(cell_request(cell))
+            .await?
+            .into_inner();
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn get_iq_capture_status(
         &self,
-        request: Request<()>,
+        request: Request<CellRequest>,
     ) -> Result<Response<proto::IqCaptureStatus>, Status> {
-        <Self as BscService>::get_iq_capture_status(self, request).await
+        let (cell, mut client) = self.oam_for_request(request.into_inner())?;
+        client.get_iq_capture_status(cell_request(cell)).await
     }
 
     async fn start_iq_capture(
         &self,
-        request: Request<()>,
+        request: Request<CellRequest>,
     ) -> Result<Response<proto::IqCaptureStatus>, Status> {
-        <Self as BscService>::start_iq_capture(self, request).await
+        let (cell, mut client) = self.oam_for_request(request.into_inner())?;
+        client.start_iq_capture(cell_request(cell)).await
     }
 
     async fn stop_iq_capture(
         &self,
-        request: Request<()>,
+        request: Request<CellRequest>,
     ) -> Result<Response<proto::IqCaptureStatus>, Status> {
-        <Self as BscService>::stop_iq_capture(self, request).await
+        let (cell, mut client) = self.oam_for_request(request.into_inner())?;
+        client.stop_iq_capture(cell_request(cell)).await
     }
 
     async fn list_local_radio_resources(
         &self,
-        request: Request<()>,
+        request: Request<CellRequest>,
     ) -> Result<Response<proto::ChannelList>, Status> {
-        <Self as BscService>::list_channels(self, request).await
+        let (cell, mut client) = self.oam_for_request(request.into_inner())?;
+        client.list_local_radio_resources(cell_request(cell)).await
     }
 
     async fn get_reverse_power_control(
         &self,
         request: Request<ReversePowerControlRequest>,
     ) -> Result<Response<proto::TrafficChannelPower>, Status> {
-        let walsh_code = u8::try_from(request.into_inner().walsh_code)
+        let req = request.into_inner();
+        let walsh_code = u8::try_from(req.walsh_code)
             .map_err(|_| Status::invalid_argument("walsh_code must fit in u8"))?;
-        let snapshot = self
-            .state
-            .bts_power_control
-            .snapshot(walsh_code)
-            .ok_or_else(|| Status::not_found("active BTS power-control state not found"))?;
-        let bsc_snapshot = self
-            .state
-            .mobiles
-            .borrow()
-            .iter()
-            .find(|mobile| mobile.traffic_walsh_code == Some(walsh_code))
-            .and_then(|mobile| mobile.traffic_power.clone());
-        Ok(Response::new(to_proto_bts_reverse_power(
-            &snapshot,
+        let (cell, mut client) = self.oam_for(req.cell)?;
+        let power = client
+            .get_reverse_power_control(ReversePowerControlRequest {
+                walsh_code: req.walsh_code,
+                cell: Some(cell),
+            })
+            .await?
+            .into_inner();
+        let bsc_snapshot = self.bsc_power_snapshot(from_proto_cell_id(&cell)?, walsh_code);
+        Ok(Response::new(merge_bsc_power_fields(
+            power,
             bsc_snapshot.as_ref(),
         )))
     }
 
     async fn list_reverse_power_controls(
         &self,
-        _: Request<()>,
+        request: Request<CellRequest>,
     ) -> Result<Response<ReversePowerControlList>, Status> {
-        let mobiles = self.state.mobiles.borrow().clone();
-        let power_controls = self
-            .state
-            .bts_power_control
-            .snapshots()
-            .iter()
-            .map(|snapshot| {
-                let bsc_snapshot = mobiles
-                    .iter()
-                    .find(|mobile| mobile.traffic_walsh_code == Some(snapshot.walsh_code))
-                    .and_then(|mobile| mobile.traffic_power.as_ref());
-                to_proto_bts_reverse_power(snapshot, bsc_snapshot)
+        let (cell, mut client) = self.oam_for_request(request.into_inner())?;
+        let cell_id = from_proto_cell_id(&cell)?;
+        let list = client
+            .list_reverse_power_controls(cell_request(cell))
+            .await?
+            .into_inner();
+        let entries = list
+            .entries
+            .into_iter()
+            .map(|entry| {
+                let bsc_snapshot = u8::try_from(entry.walsh_code)
+                    .ok()
+                    .and_then(|walsh| self.bsc_power_snapshot(cell_id, walsh));
+                ReversePowerControlEntry {
+                    walsh_code: entry.walsh_code,
+                    power: entry
+                        .power
+                        .map(|power| merge_bsc_power_fields(power, bsc_snapshot.as_ref())),
+                }
             })
             .collect();
-        Ok(Response::new(ReversePowerControlList { power_controls }))
+        Ok(Response::new(ReversePowerControlList { entries }))
     }
 
     async fn set_reverse_power_control_override(
         &self,
         request: Request<proto::SetTrafficChannelPowerOverrideRequest>,
     ) -> Result<Response<proto::SetTrafficChannelPowerOverrideResponse>, Status> {
-        <Self as BscService>::set_traffic_channel_power_override(self, request).await
+        let req = request.into_inner();
+        let (cell, mut client) = self.oam_for(req.cell.clone())?;
+        let walsh_code = u8::try_from(req.walsh_code)
+            .map_err(|_| Status::invalid_argument("walsh_code must fit in u8"))?;
+        let bsc_snapshot = self.bsc_power_snapshot(from_proto_cell_id(&cell)?, walsh_code);
+        // Forward with the resolved cell so the BTS-side check sees the cell
+        // this BSC actually addressed.
+        let mut response = client
+            .set_reverse_power_control_override(proto::SetTrafficChannelPowerOverrideRequest {
+                cell: Some(cell),
+                ..req
+            })
+            .await?
+            .into_inner();
+        response.traffic_power = response
+            .traffic_power
+            .map(|power| merge_bsc_power_fields(power, bsc_snapshot.as_ref()));
+        Ok(Response::new(response))
     }
 
     type StreamPchTransmissionsStream = GrpcStream<proto::PagingEvent>;
 
     async fn stream_pch_transmissions(
         &self,
-        _: Request<()>,
+        request: Request<CellRequest>,
     ) -> Result<Response<Self::StreamPchTransmissionsStream>, Status> {
-        let pch_tx = self
-            .state
-            .pch_transmit_broadcast
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("PCH transmit broadcast not configured"))?;
-        let mut rx = pch_tx.subscribe();
-        let stream = async_stream::stream! {
-            while let Ok(evt) = rx.recv().await {
-                match crate::bsc::pch_transmit_event_to_paging_event(&evt) {
-                    Ok(paging_event) => yield Ok(to_proto_paging_event(&paging_event)),
-                    Err(e) => yield Err(Status::internal(format!(
-                        "PCH transmit reconstruction failed: {e}"
-                    ))),
-                }
-            }
-        };
+        let (cell, mut client) = self.oam_for_request(request.into_inner())?;
+        let stream = client
+            .stream_pch_transmissions(cell_request(cell))
+            .await?
+            .into_inner();
         Ok(Response::new(Box::pin(stream)))
     }
 }
@@ -2190,161 +2200,6 @@ impl BscManagementService for BscServiceImpl {
     }
 }
 
-async fn packet_list_sessions(
-    endpoint: &str,
-) -> Result<Vec<cdma_packet::proto::PacketSessionInfo>, Status> {
-    let mut client = PacketServiceClient::connect(endpoint.to_string())
-        .await
-        .map_err(|e| Status::unavailable(format!("packet gRPC connect failed: {e}")))?;
-    Ok(client
-        .list_sessions(cdma_packet::proto::ListSessionsRequest {})
-        .await?
-        .into_inner()
-        .sessions)
-}
-
-async fn packet_get_session_detail(
-    endpoint: &str,
-    session_id: String,
-) -> Result<cdma_packet::proto::PacketSessionDetail, Status> {
-    let mut client = PacketServiceClient::connect(endpoint.to_string())
-        .await
-        .map_err(|e| Status::unavailable(format!("packet gRPC connect failed: {e}")))?;
-    client
-        .get_session_status(cdma_packet::proto::GetSessionStatusRequest { session_id })
-        .await?
-        .into_inner()
-        .session
-        .ok_or_else(|| Status::not_found("packet session not found"))
-}
-
-async fn packet_set_capture(
-    endpoint: &str,
-    session_id: String,
-    enabled: bool,
-) -> Result<cdma_packet::proto::PacketSessionDetail, Status> {
-    let mut client = PacketServiceClient::connect(endpoint.to_string())
-        .await
-        .map_err(|e| Status::unavailable(format!("packet gRPC connect failed: {e}")))?;
-    client
-        .set_session_capture(cdma_packet::proto::SetSessionCaptureRequest {
-            session_id,
-            enabled,
-        })
-        .await?
-        .into_inner()
-        .session
-        .ok_or_else(|| Status::not_found("packet session not found"))
-}
-
-async fn packet_get_session_by_ip(
-    endpoint: &str,
-    peer_ip: String,
-) -> Result<Option<cdma_packet::proto::PacketSessionInfo>, Status> {
-    let mut client = PacketServiceClient::connect(endpoint.to_string())
-        .await
-        .map_err(|e| Status::unavailable(format!("packet gRPC connect failed: {e}")))?;
-    Ok(client
-        .get_session_by_ip(cdma_packet::proto::GetSessionByIpRequest { peer_ip })
-        .await?
-        .into_inner()
-        .session)
-}
-
-#[tonic::async_trait]
-impl PcfManagementService for BscServiceImpl {
-    async fn initiate_data_call(
-        &self,
-        request: Request<proto::InitiateDataCallRequest>,
-    ) -> Result<Response<proto::InitiateDataCallResponse>, Status> {
-        <Self as BscService>::initiate_data_call(self, request).await
-    }
-
-    async fn list_pcf_sessions(&self, _: Request<()>) -> Result<Response<PcfSessionList>, Status> {
-        Ok(Response::new(PcfSessionList {
-            sessions: packet_list_sessions(&self.state.packet_endpoint)
-                .await?
-                .into_iter()
-                .map(to_management_packet_session_info)
-                .collect(),
-        }))
-    }
-
-    async fn get_pcf_session(
-        &self,
-        request: Request<GetPcfSessionRequest>,
-    ) -> Result<Response<super::packet_proto::GetSessionStatusResponse>, Status> {
-        let session_id = request.into_inner().session_id;
-        let session = packet_get_session_detail(&self.state.packet_endpoint, session_id)
-            .await
-            .map(to_management_packet_session_detail)?;
-        Ok(Response::new(
-            super::packet_proto::GetSessionStatusResponse {
-                session: Some(session),
-            },
-        ))
-    }
-}
-
-#[tonic::async_trait]
-impl PdsnManagementService for BscServiceImpl {
-    async fn list_pdsn_sessions(
-        &self,
-        _: Request<()>,
-    ) -> Result<Response<PdsnSessionList>, Status> {
-        Ok(Response::new(PdsnSessionList {
-            sessions: packet_list_sessions(&self.state.packet_endpoint)
-                .await?
-                .into_iter()
-                .map(to_management_packet_session_info)
-                .collect(),
-        }))
-    }
-
-    async fn get_pdsn_session(
-        &self,
-        request: Request<GetPdsnSessionRequest>,
-    ) -> Result<Response<super::packet_proto::GetSessionStatusResponse>, Status> {
-        let session_id = request.into_inner().session_id;
-        let session = packet_get_session_detail(&self.state.packet_endpoint, session_id)
-            .await
-            .map(to_management_packet_session_detail)?;
-        Ok(Response::new(
-            super::packet_proto::GetSessionStatusResponse {
-                session: Some(session),
-            },
-        ))
-    }
-
-    async fn get_pdsn_session_by_ip(
-        &self,
-        request: Request<GetPdsnSessionByIpRequest>,
-    ) -> Result<Response<super::packet_proto::GetSessionByIpResponse>, Status> {
-        let peer_ip = request.into_inner().peer_ip;
-        let session = packet_get_session_by_ip(&self.state.packet_endpoint, peer_ip)
-            .await?
-            .map(to_management_packet_session_info);
-        Ok(Response::new(super::packet_proto::GetSessionByIpResponse {
-            session,
-        }))
-    }
-
-    async fn set_packet_trace_capture(
-        &self,
-        request: Request<SetPacketTraceCaptureRequest>,
-    ) -> Result<Response<super::packet_proto::SetSessionCaptureResponse>, Status> {
-        let req = request.into_inner();
-        let session = packet_set_capture(&self.state.packet_endpoint, req.session_id, req.enabled)
-            .await
-            .map(to_management_packet_session_detail)?;
-        Ok(Response::new(
-            super::packet_proto::SetSessionCaptureResponse {
-                session: Some(session),
-            },
-        ))
-    }
-}
-
 fn load_server_tls_config(
     mtls: &MtlsConfig,
 ) -> Result<ServerTlsConfig, Box<dyn std::error::Error>> {
@@ -2356,105 +2211,38 @@ fn load_server_tls_config(
         .client_ca_root(Certificate::from_pem(client_ca)))
 }
 
-fn to_management_packet_session_info(
-    session: cdma_packet::proto::PacketSessionInfo,
-) -> super::packet_proto::PacketSessionInfo {
-    super::packet_proto::PacketSessionInfo {
-        session_id: session.session_id,
-        phase: session.phase,
-        service_option: session.service_option,
-        peer_ip: session.peer_ip,
-        our_ip: session.our_ip,
-        tun_device: session.tun_device,
-        uplink_frames: session.uplink_frames,
-        downlink_frames: session.downlink_frames,
-        uplink_bytes: session.uplink_bytes,
-        downlink_bytes: session.downlink_bytes,
-        created_at_ms: session.created_at_ms,
-        last_phase_change_at_ms: session.last_phase_change_at_ms,
-        last_uplink_at_ms: session.last_uplink_at_ms,
-        last_downlink_at_ms: session.last_downlink_at_ms,
-        last_activity_at_ms: session.last_activity_at_ms,
-        last_uplink_rate_bps: session.last_uplink_rate_bps,
-        last_downlink_rate_bps: session.last_downlink_rate_bps,
-        mobile_address: session.mobile_address,
-        subscriber_id: session.subscriber_id,
-        phone_number: session.phone_number,
-        imsi: session.imsi,
-        esn: session.esn,
-        meid: session.meid,
-        hrpd_mn_id: session.hrpd_mn_id,
-        hrpd_mn_id_source: session.hrpd_mn_id_source,
-        subscriber_imsi: session.subscriber_imsi,
-        traffic_walsh_code: session.traffic_walsh_code,
-        rlp_state: session.rlp_state,
-        lcp_state: session.lcp_state,
-        ipcp_state: session.ipcp_state,
-        capture_enabled: session.capture_enabled,
-        access_technology: session.access_technology,
-    }
-}
-
-fn to_management_packet_trace_event(
-    event: cdma_packet::proto::PacketTraceEvent,
-) -> super::packet_proto::PacketTraceEvent {
-    super::packet_proto::PacketTraceEvent {
-        timestamp_ms: event.timestamp_ms,
-        layer: event.layer,
-        direction: event.direction,
-        summary: event.summary,
-        detail: event.detail,
-        payload_hex: event.payload_hex,
-    }
-}
-
-fn to_management_packet_session_detail(
-    detail: cdma_packet::proto::PacketSessionDetail,
-) -> super::packet_proto::PacketSessionDetail {
-    super::packet_proto::PacketSessionDetail {
-        summary: detail.summary.map(to_management_packet_session_info),
-        last_rx_control: detail.last_rx_control,
-        last_tx_control: detail.last_tx_control,
-        last_rx_control_repeats: detail.last_rx_control_repeats,
-        last_tx_control_repeats: detail.last_tx_control_repeats,
-        recent_ppp_events: detail
-            .recent_ppp_events
-            .into_iter()
-            .map(to_management_packet_trace_event)
-            .collect(),
-        capture_events: detail
-            .capture_events
-            .into_iter()
-            .map(to_management_packet_trace_event)
-            .collect(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use cdma_common::lac::paging_messages::ChannelAssignmentGrantedMode;
 
     #[test]
-    fn bts_reverse_power_does_not_mix_bsc_measurement_history() {
-        let snapshot = BtsPowerControlSnapshot {
-            walsh_code: 11,
+    fn merging_bsc_loop_state_keeps_the_bts_reverse_measurements() {
+        let bts = proto::TrafficChannelPower {
             target_eb_nt_db: 8.0,
             effective_target_eb_nt_db: 8.0,
             manual_target_override_db: None,
-            last_pcg_pilot_ec_nt_db: [7.5; 16],
-            last_pcbs: [1; 16],
+            last_pcg_snr_db: Vec::new(),
+            last_active_pcg_mask: Vec::new(),
+            last_pcbs: vec![1; 16],
+            reverse_pilot_ec_io_db: None,
             fer_pct: 0.0,
             frames_total: 100,
             frames_crc_error: 0,
-            measured_inner_loop_1s: Some(
-                cdma_bts::bts::power_control::BtsPowerControlOneSecondMeasurement {
-                    timestamp_ms: 1_234,
-                    mean_db: 0.25,
-                },
-            ),
+            forward_gain_offset_db: 0.0,
+            forward_last_fer_pct: 0.0,
+            forward_last_pmrm_errors: 0,
+            forward_last_pmrm_frames: 0,
+            forward_pmrm_count: 0,
+            forward_pilot_ec_io_db: Vec::new(),
+            last_pcg_pilot_ec_nt_db: vec![7.5; 16],
+            forward_radio_config: 0,
+            reverse_radio_config: 0,
+            power_history: Vec::new(),
+            measured_inner_loop_1s_db: Some(0.25),
+            measured_inner_loop_1s_timestamp_ms: Some(1_234),
         };
-        let bsc_snapshot = TrafficChannelPowerSnapshot {
+        let bsc = TrafficChannelPowerSnapshot {
             target_eb_nt_db: 8.0,
             effective_target_eb_nt_db: 8.0,
             manual_target_override_db: None,
@@ -2483,12 +2271,13 @@ mod tests {
             }],
         };
 
-        let proto = to_proto_bts_reverse_power(&snapshot, Some(&bsc_snapshot));
+        let merged = merge_bsc_power_fields(bts, Some(&bsc));
 
-        assert_eq!(proto.last_pcg_pilot_ec_nt_db, vec![7.5; 16]);
-        assert!(proto.power_history.is_empty());
-        assert_eq!(proto.measured_inner_loop_1s_db, Some(0.25));
-        assert_eq!(proto.measured_inner_loop_1s_timestamp_ms, Some(1_234));
+        assert_eq!(merged.last_pcg_pilot_ec_nt_db, vec![7.5; 16]);
+        assert!(merged.power_history.is_empty());
+        assert_eq!(merged.measured_inner_loop_1s_db, Some(0.25));
+        assert_eq!(merged.measured_inner_loop_1s_timestamp_ms, Some(1_234));
+        assert_eq!(merged.forward_radio_config, 2);
     }
 
     #[test]
@@ -2521,50 +2310,29 @@ mod tests {
     }
 }
 
-/// Start the gRPC server on the given address, serving BSC, HLR, and SMSC services.
+/// Capacity of the republished paging-channel transmission channel. Deep
+/// enough that a slow management client does not drop pages during a burst.
+const PCH_BROADCAST_CAPACITY: usize = 256;
+
+/// Start the BSC management gRPC server on the given address.
 pub async fn run_grpc_server(
     state: Arc<BscState>,
-    packet_endpoint: String,
     addr: SocketAddr,
     mtls: Option<MtlsConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(ref pch_tx) = state.pch_transmit_broadcast {
-        let mut pch_rx = pch_tx.subscribe();
-        let paging_tx = state.paging_broadcast.clone();
-        tokio::spawn(async move {
-            loop {
-                match pch_rx.recv().await {
-                    Ok(evt) => match crate::bsc::pch_transmit_event_to_paging_event(&evt) {
-                        Ok(event) => {
-                            let _ = paging_tx.send(event);
-                        }
-                        Err(e) => {
-                            log::warn!("dropping undecodable PCH transmit event: {e}");
-                        }
-                    },
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        log::warn!("PCH->paging bridge lagged, skipped {n} events");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-    }
+    let (pch_transmissions, _) = broadcast::channel(PCH_BROADCAST_CAPACITY);
+    spawn_pch_transmission_bridge(state.bts.clone(), pch_transmissions.clone());
 
-    let hlr_service = HlrServiceImpl::new(state.hlr_repo.clone());
-    let smsc_service = SmscServiceImpl::new(state.smsc_repo.clone());
-    let packet_service = PacketServiceProxy::new(packet_endpoint)?;
-    let bsc_service = BscServiceImpl { state };
+    let bsc_service = BscServiceImpl {
+        state,
+        pch_transmissions,
+    };
     let management_facade_service = bsc_service.clone();
+    let base_station_service = bsc_service.clone();
     let bts_management_service = bsc_service.clone();
     let bsc_management_service = bsc_service.clone();
-    let pcf_management_service = bsc_service.clone();
-    let pdsn_management_service = bsc_service.clone();
 
-    info!(
-        "gRPC server listening on {} (management + BSC + HLR + SMSC + Packet)",
-        addr
-    );
+    info!("BSC management gRPC server listening on {addr}");
     let mut server = tonic::transport::Server::builder();
     if let Some(mtls) = mtls.as_ref() {
         server = server.tls_config(load_server_tls_config(mtls)?)?;
@@ -2575,14 +2343,10 @@ pub async fn run_grpc_server(
         .add_service(ManagementFacadeServiceServer::new(
             management_facade_service,
         ))
+        .add_service(BaseStationServiceServer::new(base_station_service))
         .add_service(BtsManagementServiceServer::new(bts_management_service))
         .add_service(BscManagementServiceServer::new(bsc_management_service))
-        .add_service(PcfManagementServiceServer::new(pcf_management_service))
-        .add_service(PdsnManagementServiceServer::new(pdsn_management_service))
         .add_service(BscServiceServer::new(bsc_service))
-        .add_service(HlrServiceServer::new(hlr_service))
-        .add_service(SmscServiceServer::new(smsc_service))
-        .add_service(PacketServiceServer::new(packet_service))
         .serve(addr)
         .await?;
     Ok(())

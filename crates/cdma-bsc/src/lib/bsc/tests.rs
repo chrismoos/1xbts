@@ -3,9 +3,8 @@
 use std::time::Duration;
 
 use crate::addressing::is_packet_data_so;
-use crate::config::{PagingRetryConfig, TrafficAssignmentConfig, TrafficRetryConfig};
+use crate::config::{TrafficAssignmentConfig, TrafficRetryConfig};
 use cdma_abis::bearer::{ChannelFamily, FrameContent, ReverseFchDcchFrame};
-use cdma_bts::bts::PagingChannelSettings;
 use cdma_common::consts::{
     SERVICE_OPTION_ASYNC_DATA, SERVICE_OPTION_BASIC_VOICE, SERVICE_OPTION_EVRC_A,
     SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_PACKET_DATA, SERVICE_OPTION_QCELP13,
@@ -55,10 +54,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-fn test_voice_policy() -> Arc<dyn cdma_msc::VoicePolicy> {
-    Arc::new(cdma_msc::StaticVoicePolicy::new(
-        cdma_msc::VoiceConfig::default(),
-    ))
+/// Widen the enrolled cell's paging retransmission window. The budget is
+/// BTS-owned and reaches the BSC through enrollment, so a test that needs a
+/// longer window re-enrolls the cell with one.
+fn set_cell_paging_ack_timeout(bsc: &Bsc, ack_timeout_ms: u64) {
+    for entry in bsc.config.bts.entries() {
+        let mut params = (*entry.params()).clone();
+        params.paging_retry.ack_timeout_ms = ack_timeout_ms;
+        entry.set_enrolled(params, None, None);
+    }
 }
 
 fn test_msc_client() -> Arc<dyn crate::a1_edge::MscClient> {
@@ -243,6 +247,33 @@ fn test_network_client_config() -> NetworkClientConfig {
     }
 }
 
+/// Registry holding one enrolled cell, optionally already in service.
+fn test_registry(
+    overhead: OverheadParameters,
+    bts_client: Option<Arc<dyn BtsControlClient>>,
+) -> Arc<BtsRegistry> {
+    let registry = BtsRegistry::new();
+    let entry = registry
+        .enroll(BtsCellParams::from_overhead(overhead), None, None)
+        .expect("first enrollment has no identity conflict");
+    if let Some(client) = bts_client {
+        entry.set_control(client);
+    }
+    registry
+}
+
+/// A BTS control client over empty resource pools, for tests that never
+/// allocate a traffic channel.
+fn idle_test_bts_client() -> Arc<dyn BtsControlClient> {
+    let traffic_channels: TrafficChannelPool = Arc::new(ChannelRegistry::new());
+    test_bts_client(
+        Arc::new(Mutex::new(WalshAllocator::new())),
+        traffic_channels,
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(Mutex::new(Vec::new())),
+    )
+}
+
 /// Wrap the four shared pool `Arc`s into a `BtsControlClient` backed by
 /// an in-memory Abis transport and AbisAgent. Uses the same two-phase
 /// allocation path as the real network client.
@@ -306,8 +337,14 @@ fn pch_message_types(
         .collect()
 }
 
+/// Cell the test registry enrolls. `test_registry` derives its cell from the
+/// overhead parameters, whose default base id is 1, and the registry stamps
+/// sector 1 on a cell it learns from overhead alone.
+pub(super) const TEST_CELL: AccessCellId = AccessCellId { cell: 1, sector: 1 };
+
 fn test_access_event() -> AccessChannelEvent {
     AccessChannelEvent {
+        cell: Some(TEST_CELL),
         event_id: "test-access-event".to_string(),
         chip_start: 0,
         absolute_chip_start: None,
@@ -542,11 +579,10 @@ fn test_bsc_with_max_slot_cycle_index(max_slot_cycle_index: u8) -> Bsc {
     overhead.max_slot_cycle_index = max_slot_cycle_index;
 
     Bsc::new(Config {
-        pilot_offset: 0,
-        overhead,
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(overhead, None),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -557,13 +593,10 @@ fn test_bsc_with_max_slot_cycle_index(max_slot_cycle_index: u8) -> Bsc {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: None,
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -590,11 +623,18 @@ pub(super) async fn test_bsc_with_active_traffic_channel_and_msc_client(
     let (traffic_tx, traffic_rx) = broadcast::channel(32);
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(test_bts_client(
+                walsh_allocator,
+                traffic_channels,
+                traffic_rx_pool,
+                traffic_rx_removals,
+            )),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -605,18 +645,10 @@ pub(super) async fn test_bsc_with_active_traffic_channel_and_msc_client(
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: Some(traffic_tx),
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client,
-        bts_client: Some(test_bts_client(
-            walsh_allocator,
-            traffic_channels,
-            traffic_rx_pool,
-            traffic_rx_removals,
-        )),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -692,8 +724,11 @@ async fn a1_mt_rejected_evrc_page_assigns_qcelp13k_rc2() {
     let msc: Arc<dyn crate::a1_edge::MscClient> = Arc::new(msc_client);
 
     let mut bsc = test_bsc_with_max_slot_cycle_index(2);
-    bsc.config.bts_client = Some(bts_client.clone() as Arc<dyn BtsControlClient>);
-    bsc.access_tx = AccessTx::new(Some(bts_client.clone() as Arc<dyn BtsControlClient>));
+    bsc.config
+        .bts
+        .resolve(None)
+        .expect("one enrolled cell")
+        .set_control(bts_client.clone() as Arc<dyn BtsControlClient>);
     bsc.config.msc_client = msc.clone();
     bsc.a1.msc_client = msc;
 
@@ -818,8 +853,13 @@ async fn a1_mt_rejected_evrc_page_assigns_qcelp13k_rc2() {
         .find_traffic_channel_by_walsh_mut(walsh_code)
         .expect("traffic channel should remain assigned")
         .mark_waiting_ms_ack();
-    bsc.advance_waiting_ms_ack(walsh_code, 0, "Mobile Station Acknowledgment Order")
-        .await;
+    bsc.advance_waiting_ms_ack(
+        TEST_CELL,
+        walsh_code,
+        0,
+        "Mobile Station Acknowledgment Order",
+    )
+    .await;
     assert_eq!(
         bsc.mobiles[0]
             .find_traffic_channel_by_walsh(walsh_code)
@@ -850,8 +890,11 @@ async fn a1_paging_request_processes_independently_of_prior_assignment_request()
     let msc: Arc<dyn crate::a1_edge::MscClient> = Arc::new(msc_client);
 
     let mut bsc = test_bsc_with_max_slot_cycle_index(2);
-    bsc.config.bts_client = Some(bts_client.clone() as Arc<dyn BtsControlClient>);
-    bsc.access_tx = AccessTx::new(Some(bts_client.clone() as Arc<dyn BtsControlClient>));
+    bsc.config
+        .bts
+        .resolve(None)
+        .expect("one enrolled cell")
+        .set_control(bts_client.clone() as Arc<dyn BtsControlClient>);
     bsc.config.msc_client = msc.clone();
     bsc.a1.msc_client = msc;
 
@@ -950,8 +993,11 @@ async fn concurrent_mt_voice_pages_are_tracked_per_mobile() {
     );
 
     let mut bsc = test_bsc_with_max_slot_cycle_index(2);
-    bsc.config.bts_client = Some(bts_client.clone() as Arc<dyn BtsControlClient>);
-    bsc.access_tx = AccessTx::new(Some(bts_client as Arc<dyn BtsControlClient>));
+    bsc.config
+        .bts
+        .resolve(None)
+        .expect("one enrolled cell")
+        .set_control(bts_client.clone() as Arc<dyn BtsControlClient>);
 
     let first_addr = MsAddress::ImsiS {
         imsi_m_s1: 7_137_215,
@@ -1095,8 +1141,11 @@ async fn pending_mt_voice_page_rejects_packet_reorigination() {
         traffic_rx_removals,
     );
     let mut bsc = test_bsc_with_max_slot_cycle_index(2);
-    bsc.config.bts_client = Some(bts_client.clone() as Arc<dyn BtsControlClient>);
-    bsc.access_tx = AccessTx::new(Some(bts_client.clone() as Arc<dyn BtsControlClient>));
+    bsc.config
+        .bts
+        .resolve(None)
+        .expect("one enrolled cell")
+        .set_control(bts_client.clone() as Arc<dyn BtsControlClient>);
 
     bsc.inject_access_event(test_registration_event_with_esn(0x1234_5678, 1))
         .await;
@@ -1231,7 +1280,7 @@ fn test_ms_release_order(walsh_code: u8) -> AccessChannelEvent {
 async fn complete_traffic_release_guard(bsc: &mut Bsc, walsh_code: u8) {
     let tc = bsc
         .mobiles
-        .get_traffic_channel_mut(walsh_code)
+        .get_traffic_channel_mut(TEST_CELL, walsh_code)
         .expect("traffic channel should remain during the release guard");
     tc.channel_state = ChannelState::Releasing {
         release_guard_started_at: Instant::now()
@@ -1379,14 +1428,17 @@ async fn reverse_qcelp_media_requires_active_session_and_stops_on_release() {
     tc.service_option = SERVICE_OPTION_QCELP13;
     tc.voice_service_option = None;
     tc.msc_circuit_id = Some(circuit_id);
-    assert!(bsc.relay_reverse_silence_to_msc(walsh_code).is_err());
+    assert!(
+        bsc.relay_reverse_silence_to_msc(TEST_CELL, walsh_code)
+            .is_err()
+    );
     bsc.mobiles[0]
         .traffic_channel
         .as_mut()
         .unwrap()
         .voice_session_id = Some(Uuid::new_v4());
 
-    bsc.relay_reverse_silence_to_msc(walsh_code)
+    bsc.relay_reverse_silence_to_msc(TEST_CELL, walsh_code)
         .expect("bad frame should produce bearer silence");
     let received = tokio::time::timeout(Duration::from_secs(1), msc_bearer.recv())
         .await
@@ -1415,7 +1467,10 @@ async fn reverse_qcelp_media_requires_active_session_and_stops_on_release() {
         .as_mut()
         .unwrap()
         .mark_releasing();
-    assert!(bsc.relay_reverse_silence_to_msc(walsh_code).is_err());
+    assert!(
+        bsc.relay_reverse_silence_to_msc(TEST_CELL, walsh_code)
+            .is_err()
+    );
 
     let mut event = test_access_event();
     event.traffic_walsh_code = Some(walsh_code);
@@ -1423,7 +1478,8 @@ async fn reverse_qcelp_media_requires_active_session_and_stops_on_release() {
     event.traffic_fqi_valid = Some(true);
     event.traffic_voice_bits = Some(vec![0; 20]);
     event.traffic_voice_rate_bps = Some(1_800);
-    bsc.handle_traffic_event(walsh_code, &event).await;
+    bsc.handle_traffic_event(TEST_CELL, walsh_code, &event)
+        .await;
 
     assert!(
         tokio::time::timeout(Duration::from_millis(30), msc_bearer.recv())
@@ -1475,7 +1531,8 @@ async fn bad_reverse_local_event_cannot_bypass_fqi_gate() {
     event.traffic_fqi_valid = Some(false);
     event.traffic_voice_bits = Some(vec![1; 171]);
     event.traffic_voice_rate_bps = Some(9_600);
-    bsc.handle_traffic_event(walsh_code, &event).await;
+    bsc.handle_traffic_event(TEST_CELL, walsh_code, &event)
+        .await;
 
     assert!(
         tokio::time::timeout(Duration::from_millis(30), msc_bearer.recv())
@@ -1505,7 +1562,8 @@ async fn valid_rc2_eighth_rate_frame_refreshes_reverse_activity() {
     event.traffic_phy_valid = Some(true);
     event.traffic_fqi_valid = Some(true);
     event.traffic_tail_valid = Some(true);
-    bsc.handle_traffic_event(walsh_code, &event).await;
+    bsc.handle_traffic_event(TEST_CELL, walsh_code, &event)
+        .await;
 
     assert!(
         bsc.mobiles[0]
@@ -1537,7 +1595,8 @@ async fn valid_traffic_signaling_frame_refreshes_reverse_activity() {
     event.traffic_phy_valid = Some(true);
     event.traffic_fqi_valid = Some(true);
     event.traffic_tail_valid = Some(true);
-    bsc.handle_traffic_event(walsh_code, &event).await;
+    bsc.handle_traffic_event(TEST_CELL, walsh_code, &event)
+        .await;
 
     assert!(
         bsc.mobiles[0]
@@ -1570,14 +1629,16 @@ async fn invalid_rc2_and_tail_only_rc1_frames_do_not_refresh_reverse_activity() 
     event.traffic_phy_valid = Some(false);
     event.traffic_fqi_valid = Some(false);
     event.traffic_tail_valid = Some(true);
-    bsc.handle_traffic_event(walsh_code, &event).await;
+    bsc.handle_traffic_event(TEST_CELL, walsh_code, &event)
+        .await;
 
     event.traffic_primary_rate_bps = Some(1_200);
     event.traffic_fqi_bits = Some(0);
     event.traffic_phy_valid = Some(true);
     event.traffic_fqi_valid = Some(true);
     event.traffic_tail_valid = Some(true);
-    bsc.handle_traffic_event(walsh_code, &event).await;
+    bsc.handle_traffic_event(TEST_CELL, walsh_code, &event)
+        .await;
 
     assert_eq!(
         bsc.mobiles[0]
@@ -1999,7 +2060,7 @@ async fn legacy_service_option_negotiation_sends_one_accept_order_after_bs_ack()
         tc.mark_waiting_ms_ack();
     }
 
-    bsc.advance_waiting_ms_ack(walsh_code, 0, "Power Measurement Report Message")
+    bsc.advance_waiting_ms_ack(TEST_CELL, walsh_code, 0, "Power Measurement Report Message")
         .await;
 
     let event = traffic_rx
@@ -2045,11 +2106,18 @@ async fn assigned_channel_preamble_sends_bs_ack_even_if_mobile_state_drifted() {
     let (traffic_tx, mut traffic_rx) = broadcast::channel(32);
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(test_bts_client(
+                walsh_allocator,
+                traffic_channels,
+                traffic_rx_pool,
+                traffic_rx_removals,
+            )),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -2060,18 +2128,10 @@ async fn assigned_channel_preamble_sends_bs_ack_even_if_mobile_state_drifted() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: Some(traffic_tx),
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(test_bts_client(
-            walsh_allocator,
-            traffic_channels,
-            traffic_rx_pool,
-            traffic_rx_removals,
-        )),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -2325,11 +2385,13 @@ async fn access_order_refreshes_registered_mobile_activity() {
 async fn ms_ack_order_gets_bsc_bs_ack_response() {
     let bts_client = Arc::new(CapturingBtsClient::default());
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(bts_client.clone() as Arc<dyn BtsControlClient>),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -2340,13 +2402,10 @@ async fn ms_ack_order_gets_bsc_bs_ack_response() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(bts_client.clone() as Arc<dyn BtsControlClient>),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -2383,11 +2442,11 @@ async fn ms_ack_order_gets_bsc_bs_ack_response() {
 #[test]
 fn paging_slot_cycle_index_is_capped_to_bs_maximum() {
     let bsc = test_bsc_with_max_slot_cycle_index(0);
-    assert_eq!(bsc.effective_slot_cycle_index(2), 0);
+    assert_eq!(bsc.effective_slot_cycle_index(None, 2), 0);
 
     let bsc = test_bsc_with_max_slot_cycle_index(3);
-    assert_eq!(bsc.effective_slot_cycle_index(2), 2);
-    assert_eq!(bsc.effective_slot_cycle_index(5), 3);
+    assert_eq!(bsc.effective_slot_cycle_index(None, 2), 2);
+    assert_eq!(bsc.effective_slot_cycle_index(None, 5), 3);
 }
 
 #[test]
@@ -2399,7 +2458,7 @@ fn assigned_paging_slot_chip_uses_capped_slot_cycle_index() {
 
     let expected =
         cdma_common::paging::next_assigned_slot_chip(search_from, pgslot, 0, chip_rate_hz);
-    let actual = bsc.assigned_paging_slot_chip(search_from, pgslot, 2, chip_rate_hz);
+    let actual = bsc.assigned_paging_slot_chip(None, search_from, pgslot, 2, chip_rate_hz);
 
     assert_eq!(actual, expected);
 }
@@ -2953,11 +3012,10 @@ fn test_sms_attempt(
 
 fn test_bsc_with_smsc(_repo: Arc<FakeSmscRepository>) -> Bsc {
     Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(OverheadParameters::default(), Some(idle_test_bts_client())),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -2968,13 +3026,10 @@ fn test_bsc_with_smsc(_repo: Arc<FakeSmscRepository>) -> Bsc {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: None,
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         msc_voice_bearer: None,
         mobile_idle_timeout_s: 0,
@@ -3262,11 +3317,18 @@ async fn duplicate_reverse_traffic_data_burst_is_acked_but_not_reprocessed() {
     let (traffic_tx, mut traffic_rx) = broadcast::channel(32);
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(test_bts_client(
+                walsh_allocator,
+                traffic_channels,
+                traffic_rx_pool,
+                traffic_rx_removals,
+            )),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -3277,18 +3339,10 @@ async fn duplicate_reverse_traffic_data_burst_is_acked_but_not_reprocessed() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: Some(traffic_tx),
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(test_bts_client(
-            walsh_allocator,
-            traffic_channels,
-            traffic_rx_pool,
-            traffic_rx_removals,
-        )),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -3439,7 +3493,7 @@ async fn traffic_mo_sms_with_a1_call_id_uses_adds_deliver() {
         .await;
     bsc.mobiles[0].phone_number = Some("5551234567".to_string());
     bsc.mobiles[0].subscriber_id = Some(Uuid::new_v4());
-    bsc.mobiles.update_tc(walsh_code, |_, tc| {
+    bsc.mobiles.update_tc(TEST_CELL, walsh_code, |_, tc| {
         tc.a1_call_id = Some(42);
     });
 
@@ -3488,7 +3542,7 @@ async fn pmrm_ack_of_bs_ack_advances_waiting_ms_ack() {
     let (mut bsc, _traffic_rx, walsh_code) =
         test_bsc_with_active_traffic_channel(SERVICE_OPTION_HIGH_RATE_PACKET_DATA).await;
 
-    bsc.send_traffic_bs_ack(walsh_code, DEFAULT_TRAFFIC_ACK_SEQ)
+    bsc.send_traffic_bs_ack(TEST_CELL, walsh_code, DEFAULT_TRAFFIC_ACK_SEQ)
         .expect("BS Ack should send via bearer");
 
     if let Some(tc) = bsc.mobiles[0].traffic_channel.as_mut() {
@@ -3592,7 +3646,7 @@ async fn pending_ecam_delivery_outlives_traffic_transition_timeout() {
     const ASSIGNMENT_CORRELATION_ID: u32 = 78;
     let (mut bsc, _traffic_rx, _walsh_code) =
         test_bsc_with_active_traffic_channel(SERVICE_OPTION_HIGH_RATE_PACKET_DATA).await;
-    bsc.config.paging_retry.ack_timeout_ms = 15_000;
+    set_cell_paging_ack_timeout(&bsc, 15_000);
 
     let tc = bsc.mobiles[0].traffic_channel.as_mut().unwrap();
     tc.channel_state = ChannelState::Assigned {
@@ -3743,11 +3797,18 @@ async fn service_connect_completion_ack_clears_pending_traffic_retry() {
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(test_bts_client(
+                walsh_allocator,
+                traffic_channels,
+                traffic_rx_pool,
+                traffic_rx_removals,
+            )),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -3758,18 +3819,10 @@ async fn service_connect_completion_ack_clears_pending_traffic_retry() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(test_bts_client(
-            walsh_allocator,
-            traffic_channels,
-            traffic_rx_pool,
-            traffic_rx_removals,
-        )),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -3811,7 +3864,7 @@ async fn service_connect_completion_ack_clears_pending_traffic_retry() {
         };
     }
 
-    bsc.send_service_connect(walsh_code, 0)
+    bsc.send_service_connect(TEST_CELL, walsh_code, 0)
         .expect("Service Connect should produce FchForward");
 
     let mut completion = test_access_event();
@@ -3842,11 +3895,18 @@ async fn service_connect_completion_ack_seq_7_clears_pending_traffic_retry() {
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(test_bts_client(
+                walsh_allocator,
+                traffic_channels,
+                traffic_rx_pool,
+                traffic_rx_removals,
+            )),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -3857,18 +3917,10 @@ async fn service_connect_completion_ack_seq_7_clears_pending_traffic_retry() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(test_bts_client(
-            walsh_allocator,
-            traffic_channels,
-            traffic_rx_pool,
-            traffic_rx_removals,
-        )),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -3910,7 +3962,7 @@ async fn service_connect_completion_ack_seq_7_clears_pending_traffic_retry() {
         };
     }
 
-    bsc.send_service_connect(walsh_code, 0)
+    bsc.send_service_connect(TEST_CELL, walsh_code, 0)
         .expect("Service Connect should produce FchForward");
 
     let mut completion = test_access_event();
@@ -3941,11 +3993,18 @@ async fn voice_service_connect_retry_targets_voice_channel() {
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(test_bts_client(
+                walsh_allocator,
+                traffic_channels,
+                traffic_rx_pool,
+                traffic_rx_removals,
+            )),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -3956,18 +4015,10 @@ async fn voice_service_connect_retry_targets_voice_channel() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(test_bts_client(
-            walsh_allocator,
-            traffic_channels,
-            traffic_rx_pool,
-            traffic_rx_removals,
-        )),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -4007,7 +4058,7 @@ async fn voice_service_connect_retry_targets_voice_channel() {
         .expect("voice channel should be assigned")
         .walsh_code;
 
-    bsc.send_service_connect(walsh_code, 0)
+    bsc.send_service_connect(TEST_CELL, walsh_code, 0)
         .expect("Service Connect should produce FchForward");
 
     assert!(
@@ -4031,11 +4082,13 @@ async fn origination_retry_reuses_pending_traffic_channel() {
     );
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(bts_client.clone() as Arc<dyn BtsControlClient>),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -4046,13 +4099,10 @@ async fn origination_retry_reuses_pending_traffic_channel() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(bts_client.clone() as Arc<dyn BtsControlClient>),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -4160,11 +4210,13 @@ async fn legacy_origination_uses_cam_for_rc1_assignment() {
     );
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(bts_client.clone() as Arc<dyn BtsControlClient>),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -4175,13 +4227,10 @@ async fn legacy_origination_uses_cam_for_rc1_assignment() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(bts_client.clone() as Arc<dyn BtsControlClient>),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -4267,11 +4316,13 @@ async fn origination_without_special_service_uses_legacy_so1_rc1_assignment() {
     );
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(bts_client.clone() as Arc<dyn BtsControlClient>),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -4282,16 +4333,10 @@ async fn origination_without_special_service_uses_legacy_so1_rc1_assignment() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: Some(traffic_tx),
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(bts_client.clone() as Arc<dyn BtsControlClient>),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: Arc::new(cdma_msc::StaticVoicePolicy::new(cdma_msc::VoiceConfig {
-            supported_service_options: vec![SERVICE_OPTION_QCELP13],
-            ..cdma_msc::VoiceConfig::default()
-        })),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -4336,8 +4381,13 @@ async fn origination_without_special_service_uses_legacy_so1_rc1_assignment() {
         .find_traffic_channel_by_walsh_mut(walsh_code)
         .expect("traffic channel should remain assigned")
         .mark_waiting_ms_ack();
-    bsc.advance_waiting_ms_ack(walsh_code, 0, "Mobile Station Acknowledgment Order")
-        .await;
+    bsc.advance_waiting_ms_ack(
+        TEST_CELL,
+        walsh_code,
+        0,
+        "Mobile Station Acknowledgment Order",
+    )
+    .await;
 
     let response = traffic_rx
         .try_recv()
@@ -4390,9 +4440,10 @@ async fn legacy_origination_rejects_unsupported_rc3_before_cam() {
     );
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(bts_client.clone() as Arc<dyn BtsControlClient>),
+        ),
         traffic_assignment: TrafficAssignmentConfig {
             supported_for_rcs: vec![3],
             supported_rev_rcs: vec![3],
@@ -4400,6 +4451,7 @@ async fn legacy_origination_rejects_unsupported_rc3_before_cam() {
             ..TrafficAssignmentConfig::default()
         },
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -4410,13 +4462,10 @@ async fn legacy_origination_rejects_unsupported_rc3_before_cam() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(bts_client.clone() as Arc<dyn BtsControlClient>),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -4463,11 +4512,18 @@ async fn origination_prefers_policy_rc1_over_mobile_rc3_preference() {
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(test_bts_client(
+                walsh_allocator,
+                traffic_channels,
+                traffic_rx_pool.clone(),
+                traffic_rx_removals,
+            )),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -4478,18 +4534,10 @@ async fn origination_prefers_policy_rc1_over_mobile_rc3_preference() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(test_bts_client(
-            walsh_allocator,
-            traffic_channels,
-            traffic_rx_pool.clone(),
-            traffic_rx_removals,
-        )),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -4537,9 +4585,15 @@ async fn origination_can_prefer_rc3_when_policy_requests_it() {
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(test_bts_client(
+                walsh_allocator,
+                traffic_channels,
+                traffic_rx_pool.clone(),
+                traffic_rx_removals,
+            )),
+        ),
         traffic_assignment: TrafficAssignmentConfig {
             supported_for_rcs: vec![1, 3],
             supported_rev_rcs: vec![1, 3],
@@ -4547,6 +4601,7 @@ async fn origination_can_prefer_rc3_when_policy_requests_it() {
             ..TrafficAssignmentConfig::default()
         },
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -4557,18 +4612,10 @@ async fn origination_can_prefer_rc3_when_policy_requests_it() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(test_bts_client(
-            walsh_allocator,
-            traffic_channels,
-            traffic_rx_pool.clone(),
-            traffic_rx_removals,
-        )),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -4616,11 +4663,18 @@ async fn packet_data_origination_assigns_non_voice_traffic_channel() {
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(test_bts_client(
+                walsh_allocator,
+                traffic_channels,
+                traffic_rx_pool.clone(),
+                traffic_rx_removals,
+            )),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -4631,18 +4685,10 @@ async fn packet_data_origination_assigns_non_voice_traffic_channel() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(test_bts_client(
-            walsh_allocator,
-            traffic_channels,
-            traffic_rx_pool.clone(),
-            traffic_rx_removals,
-        )),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -4696,11 +4742,13 @@ async fn so12_p_rev3_origination_assigns_rc2_packet_traffic() {
     );
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(bts_client.clone() as Arc<dyn BtsControlClient>),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -4711,13 +4759,10 @@ async fn so12_p_rev3_origination_assigns_rc2_packet_traffic() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(bts_client.clone() as Arc<dyn BtsControlClient>),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -4777,11 +4822,13 @@ async fn packet_origination_retry_replaces_stale_pending_traffic_channel() {
     );
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(bts_client.clone() as Arc<dyn BtsControlClient>),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -4792,13 +4839,10 @@ async fn packet_origination_retry_replaces_stale_pending_traffic_channel() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(bts_client.clone() as Arc<dyn BtsControlClient>),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -4867,11 +4911,13 @@ async fn packet_origination_retry_replaces_stale_pending_traffic_channel() {
 async fn unsupported_origination_service_option_gets_release_rejection() {
     let bts_client = Arc::new(CapturingBtsClient::default());
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(bts_client.clone() as Arc<dyn BtsControlClient>),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -4882,13 +4928,10 @@ async fn unsupported_origination_service_option_gets_release_rejection() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(bts_client.clone() as Arc<dyn BtsControlClient>),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -4949,11 +4992,13 @@ async fn unsupported_origination_service_option_gets_release_rejection() {
 async fn so32768_origination_is_accepted_without_renegotiation() {
     let bts_client = Arc::new(CapturingBtsClient::default());
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(bts_client.clone() as Arc<dyn BtsControlClient>),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -4964,13 +5009,10 @@ async fn so32768_origination_is_accepted_without_renegotiation() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(bts_client.clone() as Arc<dyn BtsControlClient>),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -5052,8 +5094,13 @@ async fn legacy_so_renegotiation_sends_service_option_request_order_after_bs_ack
         tc.mark_waiting_ms_ack();
     }
 
-    bsc.advance_waiting_ms_ack(walsh_code, 0, "Mobile Station Acknowledgment Order")
-        .await;
+    bsc.advance_waiting_ms_ack(
+        TEST_CELL,
+        walsh_code,
+        0,
+        "Mobile Station Acknowledgment Order",
+    )
+    .await;
 
     let event = traffic_rx
         .recv()
@@ -5244,11 +5291,13 @@ async fn ms_reject_of_so_request_order_tears_down_channel() {
 async fn supported_packet_origination_so_is_not_rejected_when_assignment_falls_back() {
     let bts_client = Arc::new(CapturingBtsClient::default());
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(bts_client.clone() as Arc<dyn BtsControlClient>),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -5259,13 +5308,10 @@ async fn supported_packet_origination_so_is_not_rejected_when_assignment_falls_b
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(bts_client.clone() as Arc<dyn BtsControlClient>),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -5324,11 +5370,18 @@ async fn packet_data_service_connect_completion_marks_channel_active() {
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(test_bts_client(
+                walsh_allocator,
+                traffic_channels,
+                traffic_rx_pool,
+                traffic_rx_removals,
+            )),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -5339,18 +5392,10 @@ async fn packet_data_service_connect_completion_marks_channel_active() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(test_bts_client(
-            walsh_allocator,
-            traffic_channels,
-            traffic_rx_pool,
-            traffic_rx_removals,
-        )),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -5408,11 +5453,18 @@ async fn packet_data_send_service_connect_uses_origination_sr_id_and_omits_optio
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(test_bts_client(
+                walsh_allocator,
+                traffic_channels,
+                traffic_rx_pool,
+                traffic_rx_removals,
+            )),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -5423,18 +5475,10 @@ async fn packet_data_send_service_connect_uses_origination_sr_id_and_omits_optio
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(test_bts_client(
-            walsh_allocator,
-            traffic_channels,
-            traffic_rx_pool,
-            traffic_rx_removals,
-        )),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -5475,7 +5519,7 @@ async fn packet_data_send_service_connect_uses_origination_sr_id_and_omits_optio
         };
     }
 
-    bsc.send_service_connect(walsh_code, 0)
+    bsc.send_service_connect(TEST_CELL, walsh_code, 0)
         .expect("packet-data Service Connect should produce FchForward");
 }
 
@@ -5489,11 +5533,18 @@ async fn so33_service_connect_includes_rlp_sync_blob_and_uses_origination_sr_id(
     let (traffic_tx, mut traffic_rx) = broadcast::channel(32);
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(test_bts_client(
+                walsh_allocator,
+                traffic_channels,
+                traffic_rx_pool,
+                traffic_rx_removals,
+            )),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -5504,18 +5555,10 @@ async fn so33_service_connect_includes_rlp_sync_blob_and_uses_origination_sr_id(
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: Some(traffic_tx),
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(test_bts_client(
-            walsh_allocator,
-            traffic_channels,
-            traffic_rx_pool,
-            traffic_rx_removals,
-        )),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -5556,7 +5599,7 @@ async fn so33_service_connect_includes_rlp_sync_blob_and_uses_origination_sr_id(
         };
     }
 
-    bsc.send_service_connect(walsh_code, 0)
+    bsc.send_service_connect(TEST_CELL, walsh_code, 0)
         .expect("SO33 Service Connect should produce FchForward");
 
     let event = traffic_rx
@@ -5590,11 +5633,18 @@ async fn packet_data_reverse_bearer_primary_frame_feeds_packet_session() {
     let traffic_rx_removals = Arc::new(Mutex::new(Vec::new()));
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(test_bts_client(
+                walsh_allocator,
+                traffic_channels,
+                traffic_rx_pool,
+                traffic_rx_removals,
+            )),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -5605,18 +5655,10 @@ async fn packet_data_reverse_bearer_primary_frame_feeds_packet_session() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(test_bts_client(
-            walsh_allocator,
-            traffic_channels,
-            traffic_rx_pool,
-            traffic_rx_removals,
-        )),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -5681,7 +5723,7 @@ async fn packet_data_reverse_bearer_primary_frame_feeds_packet_session() {
     };
 
     assert!(
-        bsc.route_reverse_bearer_packet_primary(walsh_code, &fch)
+        bsc.route_reverse_bearer_packet_primary(TEST_CELL, walsh_code, &fch)
             .await
     );
 
@@ -5712,11 +5754,18 @@ async fn closed_packet_session_sends_release_before_traffic_teardown() {
     let (traffic_tx, mut traffic_rx) = broadcast::channel(32);
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(test_bts_client(
+                walsh_allocator,
+                traffic_channels,
+                traffic_rx_pool,
+                traffic_rx_removals.clone(),
+            )),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -5727,18 +5776,10 @@ async fn closed_packet_session_sends_release_before_traffic_teardown() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: Some(traffic_tx),
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(test_bts_client(
-            walsh_allocator,
-            traffic_channels,
-            traffic_rx_pool,
-            traffic_rx_removals.clone(),
-        )),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -5804,7 +5845,7 @@ async fn closed_packet_session_sends_release_before_traffic_teardown() {
     };
 
     assert!(
-        !bsc.route_reverse_bearer_packet_primary(walsh_code, &fch)
+        !bsc.route_reverse_bearer_packet_primary(TEST_CELL, walsh_code, &fch)
             .await
     );
     let tc = bsc.mobiles[0]
@@ -5911,11 +5952,13 @@ async fn registration_from_paged_ms_cancels_retry_and_delivers_sms() {
     let bts_client = Arc::new(CapturingBtsClient::default());
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(bts_client.clone() as Arc<dyn BtsControlClient>),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -5926,13 +5969,10 @@ async fn registration_from_paged_ms_cancels_retry_and_delivers_sms() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(bts_client.clone() as Arc<dyn BtsControlClient>),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -6004,11 +6044,10 @@ async fn sms_target_imsi_s_matches_registered_imsi_class0_mobile() {
     let (paging_tx, mut paging_rx) = broadcast::channel(16);
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(OverheadParameters::default(), Some(idle_test_bts_client())),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -6019,13 +6058,10 @@ async fn sms_target_imsi_s_matches_registered_imsi_class0_mobile() {
         mobiles_tx: None,
         paging_broadcast: Some(paging_tx),
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: None,
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -6085,11 +6121,10 @@ async fn sms_target_imsi_s_matches_registered_imsi_class0_mobile() {
 #[tokio::test]
 async fn duplicate_access_probe_gets_l2_ack_only() {
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(OverheadParameters::default(), Some(idle_test_bts_client())),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -6100,13 +6135,10 @@ async fn duplicate_access_probe_gets_l2_ack_only() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: None,
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -6186,11 +6218,13 @@ async fn sms_page_gpm_includes_so6_special_service() {
     let bts_client = Arc::new(CapturingBtsClient::default());
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(bts_client.clone() as Arc<dyn BtsControlClient>),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -6201,13 +6235,10 @@ async fn sms_page_gpm_includes_so6_special_service() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(bts_client.clone() as Arc<dyn BtsControlClient>),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -6325,7 +6356,11 @@ fn pch_l2_ack_clears_pending_sms_ack() {
         let attempt_id = Uuid::new_v4();
         let bts_client = Arc::new(CapturingBtsClient::default());
         let mut bsc = test_bsc_with_max_slot_cycle_index(2);
-        bsc.access_tx = AccessTx::new(Some(bts_client.clone() as Arc<dyn BtsControlClient>));
+        bsc.config
+            .bts
+            .resolve(None)
+            .expect("one enrolled cell")
+            .set_control(bts_client.clone() as Arc<dyn BtsControlClient>);
         let addr = MsAddress::ImsiS {
             imsi_m_s1: 16369843,
             imsi_m_s2: 999,
@@ -6847,11 +6882,10 @@ fn build_welcome_test_bsc(
     _welcome_cfg: Option<cdma_msc::WelcomeSmsConfig>,
 ) -> Bsc {
     Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(OverheadParameters::default(), None),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -6862,13 +6896,10 @@ fn build_welcome_test_bsc(
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: Some(hlr as Arc<dyn HlrRepository>),
         msc_client: test_msc_client(),
-        bts_client: None,
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -6898,7 +6929,7 @@ fn fake_hlr_for_welcome(mobile_seen: cdma_hlr::MobileSeenUpsert) -> Arc<FakeHlrR
         },
         binding: RegistrationBinding {
             subscriber_id,
-            serving_node_id: "bsc-test".to_string(),
+            serving_bs_id: "bsc-test".to_string(),
             state: RegistrationState::Registered,
             imsi: None,
             esn: Some(0x1234_5678),
@@ -6989,11 +7020,18 @@ async fn fsch_test_bsc() -> (Bsc, broadcast::Receiver<TrafficEvent>, u32, u8) {
     traffic_assignment.enable_f_sch = true;
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(test_bts_client(
+                walsh_allocator,
+                traffic_channels,
+                traffic_rx_pool,
+                traffic_rx_removals,
+            )),
+        ),
         traffic_assignment,
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -7004,18 +7042,10 @@ async fn fsch_test_bsc() -> (Bsc, broadcast::Receiver<TrafficEvent>, u32, u8) {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: Some(traffic_tx),
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(test_bts_client(
-            walsh_allocator,
-            traffic_channels,
-            traffic_rx_pool,
-            traffic_rx_removals,
-        )),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -7143,7 +7173,7 @@ async fn fsch_activate_commits_burst_and_sends_escam() {
     let (mut bsc, mut traffic_rx, _esn, walsh) = fsch_test_bsc().await;
 
     let sch_code = bsc
-        .try_activate_fsch(walsh)
+        .try_activate_fsch(TEST_CELL, walsh)
         .await
         .expect("ESCAM-only activation must succeed when tc.sch_walsh_code is set");
     let stored = bsc.mobiles[0]
@@ -7179,11 +7209,11 @@ async fn fsch_release_rollback_clears_state_and_frees_code() {
     )
     .unwrap();
     let sch_code = bsc
-        .try_activate_fsch(walsh)
+        .try_activate_fsch(TEST_CELL, walsh)
         .await
         .expect("initial F-SCH activation should succeed");
 
-    bsc.release_fsch_allocation(walsh, sch_code, profile, true, "test rollback")
+    bsc.release_fsch_allocation(TEST_CELL, walsh, sch_code, profile, true, "test rollback")
         .await;
 
     let stored = bsc.mobiles[0]
@@ -7196,7 +7226,7 @@ async fn fsch_release_rollback_clears_state_and_frees_code() {
     );
 
     let reacquired = bsc
-        .try_activate_fsch(walsh)
+        .try_activate_fsch(TEST_CELL, walsh)
         .await
         .expect("SCH should be allocatable again after rollback release");
     assert_eq!(
@@ -7210,7 +7240,7 @@ async fn fsch_activate_returns_none_when_no_w32_stamped() {
     let (mut bsc, _rx, walsh) =
         test_bsc_with_active_traffic_channel(SERVICE_OPTION_HIGH_RATE_PACKET_DATA).await;
     // Default config has F-SCH disabled; try_activate_fsch should be a no-op.
-    let result = bsc.try_activate_fsch(walsh).await;
+    let result = bsc.try_activate_fsch(TEST_CELL, walsh).await;
     assert!(
         result.is_none(),
         "try_activate_fsch must return None when no W(32) was reserved"
@@ -7232,11 +7262,13 @@ async fn qcelp13k_origination_assigns_rc2_traffic_channel() {
     );
 
     let mut bsc = Bsc::new(Config {
-        pilot_offset: 0,
-        overhead: OverheadParameters::default(),
-        paging: PagingChannelSettings::default(),
+        bts: test_registry(
+            OverheadParameters::default(),
+            Some(bts_client.clone() as Arc<dyn BtsControlClient>),
+        ),
         traffic_assignment: TrafficAssignmentConfig::default(),
         access_event_rx: None,
+        cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: None,
         sms_request_tx: None,
@@ -7247,13 +7279,10 @@ async fn qcelp13k_origination_assigns_rc2_traffic_channel() {
         mobiles_tx: None,
         paging_broadcast: None,
         traffic_broadcast: None,
-        rx_reference_dbm: None,
         hlr_repo: None,
         msc_client: test_msc_client(),
-        bts_client: Some(bts_client.clone() as Arc<dyn BtsControlClient>),
         traffic_retry: TrafficRetryConfig::default(),
-        paging_retry: PagingRetryConfig::default(),
-        voice_policy: test_voice_policy(),
+        voice_timeouts: Default::default(),
         pcf_client: None,
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
@@ -7316,7 +7345,7 @@ async fn qcelp13k_origination_assigns_rc2_traffic_channel() {
         2,
         "reverse RX request must be RC2"
     );
-    let power = bsc.mobiles.snapshot(None)[0]
+    let power = bsc.mobiles.snapshot(bsc.bts())[0]
         .traffic_power
         .clone()
         .expect("RC2 assignment should publish traffic power state");

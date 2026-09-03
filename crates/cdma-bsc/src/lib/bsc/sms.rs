@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::addressing::{format_ms_address, parse_sms_target_address};
 
-use super::{Bsc, DEFAULT_PAGE_TIMEOUT_MS, MobileStation, MsState, PendingPage};
+use super::{AccessCellId, Bsc, DEFAULT_PAGE_TIMEOUT_MS, MobileStation, MsState, PendingPage};
 
 /// SMS request to deliver to a registered mobile station.
 pub struct SmsRequest {
@@ -248,6 +248,7 @@ impl SmsService {
     pub(crate) fn send_access_data_burst(
         &mut self,
         access_tx: &super::AccessTx,
+        cell: Option<super::AccessCellId>,
         addr: &MsAddress,
         ack_msg_seq: u8,
         sms_req: &SmsRequest,
@@ -275,6 +276,7 @@ impl SmsService {
 
         let sdu = data_burst.to_sdu();
         let correlation_id = access_tx.send_directed_fpch(
+            cell,
             addr,
             MessageId::DataBurst,
             PagingChannelMessage::DataBurst(data_burst.clone()),
@@ -439,12 +441,17 @@ impl Bsc {
         });
     }
 
-    pub(crate) fn forward_traffic_otasp_to_msc(&self, walsh_code: u8, raw_fields: &[u8]) {
+    pub(crate) fn forward_traffic_otasp_to_msc(
+        &self,
+        cell: AccessCellId,
+        walsh_code: u8,
+        raw_fields: &[u8],
+    ) {
         let call_id = self
             .mobiles
-            .get_traffic_channel(walsh_code)
+            .get_traffic_channel(cell, walsh_code)
             .and_then(|tc| tc.a1_call_id);
-        let mobile = self.mobiles.get_by_walsh(walsh_code);
+        let mobile = self.mobiles.get_by_walsh(cell, walsh_code);
         let imsi = mobile.and_then(|ms| ms.imsi.as_ref()).cloned();
         let esn = mobile.and_then(|ms| ms.esn);
         let mobile_identity_imsi = imsi
@@ -719,9 +726,11 @@ impl Bsc {
         });
 
         self.publish_mobiles();
-        match self.send_page_for_sms(&page_addr, pgslot, sci, None, None) {
+        let serving_cell = self.serving_cell(&target_addr);
+        match self.send_page_for_sms(serving_cell, &page_addr, pgslot, sci, None, None) {
             Ok((target_chip, page_seq, page_correlation_id)) => {
-                let next_retry_at = self.compute_next_retry_at(pgslot, sci, target_chip);
+                let next_retry_at =
+                    self.compute_next_retry_at(serving_cell, pgslot, sci, target_chip);
                 self.paging.record_sms_page_sent(
                     target_chip,
                     next_retry_at,
@@ -782,6 +791,7 @@ impl Bsc {
     /// Send a General Page Message for SMS delivery.
     pub(crate) fn send_page_for_sms(
         &self,
+        cell: Option<super::AccessCellId>,
         page_addr: &MsPageAddress,
         pgslot: Option<u16>,
         slot_cycle_index: u8,
@@ -789,6 +799,7 @@ impl Bsc {
         override_msg_seq: Option<u8>,
     ) -> Result<(Option<u64>, u8, Option<u32>), Error> {
         self.send_general_page(
+            cell,
             page_addr,
             pgslot,
             slot_cycle_index,
@@ -805,7 +816,12 @@ impl Bsc {
     /// 1. BS sends BS Ack Order (ack the data burst)
     /// 2. BS sends SMS Cause Code Data Burst on f-dsch (ack_req=1)
     /// 3. MS sends MS Ack Order -> BS sends Release Order -> teardown
-    pub(crate) fn handle_traffic_data_burst(&mut self, walsh_code: u8, event: &AccessChannelEvent) {
+    pub(crate) fn handle_traffic_data_burst(
+        &mut self,
+        cell: AccessCellId,
+        walsh_code: u8,
+        event: &AccessChannelEvent,
+    ) {
         let burst_type = match event.burst_type {
             Some(bt) => bt,
             None => {
@@ -832,7 +848,7 @@ impl Bsc {
 
         if burst_type == 4 {
             // C.S0016 OTASP — wrap as A1 ADDS Transfer to the MSC.
-            self.forward_traffic_otasp_to_msc(walsh_code, fields);
+            self.forward_traffic_otasp_to_msc(cell, walsh_code, fields);
             return;
         }
 
@@ -852,7 +868,7 @@ impl Bsc {
 
         let sender = self
             .mobiles
-            .get_by_walsh(walsh_code)
+            .get_by_walsh(cell, walsh_code)
             .and_then(|ms| ms.phone_number.clone().map(|n| (n, ms.subscriber_id)));
         let (originating_number, originating_subscriber_id) =
             sender.clone().unwrap_or_else(|| (String::new(), None));
@@ -875,6 +891,7 @@ impl Bsc {
                 walsh_code, sms.destination_number, sms.teleservice_id, sms.message_id, reply_seq,
             );
             self.send_traffic_sms_cause_code(
+                cell,
                 walsh_code,
                 ack_seq,
                 reply_seq,
@@ -884,13 +901,14 @@ impl Bsc {
             return;
         }
 
-        self.send_traffic_mo_sms_to_msc(walsh_code, fields);
+        self.send_traffic_mo_sms_to_msc(cell, walsh_code, fields);
 
-        self.send_traffic_sms_cause_code(walsh_code, ack_seq, reply_seq, 0, None);
+        self.send_traffic_sms_cause_code(cell, walsh_code, ack_seq, reply_seq, 0, None);
     }
 
     fn send_traffic_sms_cause_code(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         ack_seq: u8,
         reply_seq: u8,
@@ -907,6 +925,7 @@ impl Bsc {
         };
         let sdu = data_burst.to_sdu();
         if let Err(e) = self.send_traffic_signaling(
+            cell,
             walsh_code,
             sdu,
             MessageId::DataBurst,
@@ -929,13 +948,13 @@ impl Bsc {
             );
         }
 
-        self.mobiles.update_tc(walsh_code, |_, tc| {
+        self.mobiles.update_tc(cell, walsh_code, |_, tc| {
             tc.mark_sms_pending_release();
         });
     }
 
     /// Send a traffic-channel MO SMS to the MSC via ADDS Deliver (DTAP 0x4c).
-    fn send_traffic_mo_sms_to_msc(&self, walsh_code: u8, fields: &[u8]) {
+    fn send_traffic_mo_sms_to_msc(&self, cell: AccessCellId, walsh_code: u8, fields: &[u8]) {
         let deliver = cdma_ios::AddsDeliverMessage {
             adds_user_part: cdma_ios::AddsUserPart {
                 burst_type: 0x03,
@@ -945,7 +964,7 @@ impl Bsc {
         };
         let call_id = self
             .mobiles
-            .get_traffic_channel(walsh_code)
+            .get_traffic_channel(cell, walsh_code)
             .and_then(|tc| tc.a1_call_id);
         if call_id.is_none() {
             warn!(

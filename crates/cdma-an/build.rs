@@ -6,6 +6,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &[
                 "../../proto/an/v1/service.proto",
                 "../../proto/events/v1/an.proto",
+                "../../proto/events/v1/cell.proto",
             ],
             &["../../proto"],
         )?;

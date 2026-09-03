@@ -9,10 +9,11 @@ homepage.workspace = true
 description = "Aggregated network-event bus and gRPC service for 1xBTS components."
 
 [dependencies]
+cdma-common = { path = "../cdma-common" }
 cdma-hlr = { path = "../cdma-hlr" }
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.13", features = ["tls-ring"] }
 prost = "0.13"
 prost-types = "0.13"
@@ -23,12 +24,18 @@ parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = "1"
+clap = { version = "4", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [build-dependencies]
 tonic-build = "0.13"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util", "macros"] }
+
+[[bin]]
+name = "cdma-events"
+path = "src/main.rs"
 
 [lints]
 workspace = true

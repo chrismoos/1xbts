@@ -74,6 +74,9 @@ pub struct NetworkBtsControlClient {
     local_controller: Option<Arc<TrafficResourceService>>,
     local_bearer: Option<LocalBearerClient>,
     _shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Flips to `true` when the Abis transport closes, so the attach loop can
+    /// re-enroll and reconnect.
+    link_down_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Configuration for the network client.
@@ -173,6 +176,7 @@ impl NetworkBtsControlClient {
             pch_ack_events: VecDeque::new(),
         }));
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (link_down_tx, link_down_rx) = tokio::sync::watch::channel(false);
 
         let inner_clone = inner.clone();
         let event_config = config.clone();
@@ -186,6 +190,7 @@ impl NetworkBtsControlClient {
                 shutdown_rx,
             )
             .await;
+            let _ = link_down_tx.send(true);
         });
 
         Self {
@@ -196,7 +201,13 @@ impl NetworkBtsControlClient {
             local_controller: None,
             local_bearer: None,
             _shutdown_tx: shutdown_tx,
+            link_down_rx,
         }
+    }
+
+    /// Watch that flips to `true` once the Abis transport has closed.
+    pub fn link_down(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.link_down_rx.clone()
     }
 
     /// Create an in-process client backed by a channel transport and a local
@@ -204,14 +215,8 @@ impl NetworkBtsControlClient {
     /// Abis messages identically to the TCP path — same two-phase allocation,
     /// same ECAM commit, same PCH handling.
     ///
-    /// [`AbisAgent`]: cdma_bts::bts::abis_agent::AbisAgent
-    /// Create an in-process client backed by a channel transport and a local
-    /// [`AbisAgent`]. The agent runs in a background tokio task, processing
-    /// Abis messages identically to the TCP path.
-    ///
     /// Bearer frames and queue inspection go directly through the shared
-    /// `TrafficResourceService`, bypassing Abis (same as the old
-    /// `InProcessBtsControlClient`).
+    /// `TrafficResourceService`, bypassing Abis.
     ///
     /// [`AbisAgent`]: cdma_bts::bts::abis_agent::AbisAgent
     pub fn spawn_in_process(
@@ -699,6 +704,12 @@ impl NetworkBtsControlClient {
             l3_summary,
             decoded_l3: Some(decoded_l3),
             pdu_summary,
+            cell: ach
+                .cell_identifier
+                .map(|cell| cdma_common::events::AccessCellId {
+                    cell: cell.cell,
+                    sector: cell.sector,
+                }),
             msg_seq: arq_msg_seq,
             ack_seq: arq_ack_seq,
             ack_req: arq_ack_req,

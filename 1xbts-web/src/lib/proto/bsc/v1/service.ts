@@ -203,7 +203,14 @@ export interface AccessEvent {
   isPreambleOnly: boolean;
   /** Decoded r-dsch summary for traffic channel events */
   rdschSummary?: string | undefined;
-  rdschMsgTypeName?: string | undefined;
+  rdschMsgTypeName?:
+    | string
+    | undefined;
+  /**
+   * Cell that received this message, from the Abis Cell Identifier IE.
+   * Absent when the message reached the BSC without one.
+   */
+  cell?: CellId | undefined;
 }
 
 /** Registration Message fields decoded from the reverse access channel. */
@@ -459,7 +466,14 @@ export interface PagingEvent {
   generalPage?: PagingGeneralPage | undefined;
   order?: PagingOrder | undefined;
   dataBurst?: PagingDataBurst | undefined;
-  channelAssignment?: PagingChannelAssignment | undefined;
+  channelAssignment?:
+    | PagingChannelAssignment
+    | undefined;
+  /**
+   * Cell that transmitted the message. Absent for a message the BSC addressed
+   * to every in-service cell rather than to one of them.
+   */
+  cell?: CellId | undefined;
 }
 
 /** Decoded forward dedicated traffic-channel signaling event. */
@@ -487,7 +501,11 @@ export interface TrafficEvent {
     | TrafficServiceRequest
     | undefined;
   /** Voice call sub-state (e.g. "WaitingServiceConnect", "Alerting", "Connected", "Releasing") */
-  voiceCallState?: string | undefined;
+  voiceCallState?:
+    | string
+    | undefined;
+  /** Cell carrying the traffic channel the message went out on. */
+  cell?: CellId | undefined;
 }
 
 /** One service-configuration connection record in a Service Connect message. */
@@ -848,6 +866,21 @@ export interface OverheadConfig {
    */
   mccDigits: string;
   imsi1112Digits: string;
+  /**
+   * Protocol revision broadcast as P_REV, and the minimum a mobile must
+   * support to be granted service.
+   */
+  pRev: number;
+  minPRev: number;
+  /**
+   * Broadcast overrides for CDMA_FREQ, EXT_CDMA_FREQ and BAND_CLASS. Absent
+   * means the value is derived from the operating channel plan. Set only when
+   * the broadcast value must differ, as in a handoff redirect to another
+   * carrier.
+   */
+  cdmaFreq?: number | undefined;
+  extCdmaFreq?: number | undefined;
+  bandClassOverride?: number | undefined;
 }
 
 /**
@@ -872,6 +905,14 @@ export interface TimezoneStatus {
   daylt: number;
   lpSec: number;
   utcOffsetSeconds: number;
+}
+
+/** Identifies one cell operated by a BTS. */
+export interface CellId {
+  /** Cell number broadcast as BASE_ID. */
+  cell: number;
+  /** Sector within the cell. */
+  sector: number;
 }
 
 /** Mobile/subscriber state currently known by the BSC. */
@@ -937,7 +978,14 @@ export interface MobileInfo {
     | number
     | undefined;
   /** Voice call sub-state (e.g. "Alerting", "Connected", "Releasing"; absent for non-voice) */
-  voiceCallState?: string | undefined;
+  voiceCallState?:
+    | string
+    | undefined;
+  /**
+   * Cell serving this mobile, bound from the Abis Cell Identifier on the
+   * access message that registered it. Absent until the mobile is bound.
+   */
+  servingCell?: CellId | undefined;
 }
 
 /** List of mobiles currently tracked by the BSC. */
@@ -1046,7 +1094,15 @@ export interface Channel {
     | number
     | undefined;
   /** Closed-loop power control snapshot (traffic channels only). */
-  trafficPower?: TrafficChannelPower | undefined;
+  trafficPower?:
+    | TrafficChannelPower
+    | undefined;
+  /**
+   * Cell operating the channel. Walsh codes come from a per-cell pool, so the
+   * code alone does not identify a channel across cells. Absent for a traffic
+   * channel whose mobile is not bound to a cell yet.
+   */
+  cell?: CellId | undefined;
 }
 
 /**
@@ -1188,6 +1244,14 @@ export interface PowerControlSample {
 export interface SetTrafficChannelPowerOverrideRequest {
   /** Active traffic channel Walsh code. */
   walshCode: number;
+  /**
+   * Cell carrying the channel. Each cell allocates Walsh codes from its own
+   * pool, so the code alone does not identify a channel. Absent resolves to
+   * the only enrolled cell.
+   */
+  cell?:
+    | CellId
+    | undefined;
   /** Pin the reverse inner-loop target to this Eb/Nt value in dB. */
   setTargetEbNtDb?:
     | number
@@ -1227,10 +1291,25 @@ export interface ChannelMobile {
   rxLevelDbfs?: number | undefined;
 }
 
-/** List of configured and active channels. */
+/** Walsh code pool size for one cell. Each cell allocates from its own pool. */
+export interface CellWalshCapacity {
+  cell: CellId | undefined;
+  totalWalshCodes: number;
+}
+
+/**
+ * List of configured and active channels, covering one cell when a BTS answers
+ * and every enrolled cell when the BSC does.
+ */
 export interface ChannelList {
   channels: Channel[];
+  /**
+   * Walsh code pool size summed over every cell in `cell_walsh_capacity`, so
+   * it counts the same code space the `channels` rows are drawn from.
+   */
   totalWalshCodes: number;
+  /** Per-cell pool size, one entry per cell covered by this list. */
+  cellWalshCapacity: CellWalshCapacity[];
 }
 
 function createBaseSystemStatus(): SystemStatus {
@@ -2920,6 +2999,7 @@ function createBaseAccessEvent(): AccessEvent {
     isPreambleOnly: false,
     rdschSummary: undefined,
     rdschMsgTypeName: undefined,
+    cell: undefined,
   };
 }
 
@@ -3038,6 +3118,9 @@ export const AccessEvent: MessageFns<AccessEvent> = {
     }
     if (message.rdschMsgTypeName !== undefined) {
       writer.uint32(314).string(message.rdschMsgTypeName);
+    }
+    if (message.cell !== undefined) {
+      CellId.encode(message.cell, writer.uint32(386).fork()).join();
     }
     return writer;
   },
@@ -3353,6 +3436,14 @@ export const AccessEvent: MessageFns<AccessEvent> = {
           message.rdschMsgTypeName = reader.string();
           continue;
         }
+        case 48: {
+          if (tag !== 386) {
+            break;
+          }
+
+          message.cell = CellId.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -3526,6 +3617,7 @@ export const AccessEvent: MessageFns<AccessEvent> = {
         : isSet(object.rdsch_msg_type_name)
         ? globalThis.String(object.rdsch_msg_type_name)
         : undefined,
+      cell: isSet(object.cell) ? CellId.fromJSON(object.cell) : undefined,
     };
   },
 
@@ -3645,6 +3737,9 @@ export const AccessEvent: MessageFns<AccessEvent> = {
     if (message.rdschMsgTypeName !== undefined) {
       obj.rdschMsgTypeName = message.rdschMsgTypeName;
     }
+    if (message.cell !== undefined) {
+      obj.cell = CellId.toJSON(message.cell);
+    }
     return obj;
   },
 
@@ -3709,6 +3804,7 @@ export const AccessEvent: MessageFns<AccessEvent> = {
     message.isPreambleOnly = object.isPreambleOnly ?? false;
     message.rdschSummary = object.rdschSummary ?? undefined;
     message.rdschMsgTypeName = object.rdschMsgTypeName ?? undefined;
+    message.cell = (object.cell !== undefined && object.cell !== null) ? CellId.fromPartial(object.cell) : undefined;
     return message;
   },
 };
@@ -7210,6 +7306,7 @@ function createBasePagingEvent(): PagingEvent {
     order: undefined,
     dataBurst: undefined,
     channelAssignment: undefined,
+    cell: undefined,
   };
 }
 
@@ -7250,6 +7347,9 @@ export const PagingEvent: MessageFns<PagingEvent> = {
     }
     if (message.channelAssignment !== undefined) {
       PagingChannelAssignment.encode(message.channelAssignment, writer.uint32(146).fork()).join();
+    }
+    if (message.cell !== undefined) {
+      CellId.encode(message.cell, writer.uint32(34).fork()).join();
     }
     return writer;
   },
@@ -7357,6 +7457,14 @@ export const PagingEvent: MessageFns<PagingEvent> = {
           message.channelAssignment = PagingChannelAssignment.decode(reader, reader.uint32());
           continue;
         }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.cell = CellId.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -7420,6 +7528,7 @@ export const PagingEvent: MessageFns<PagingEvent> = {
         : isSet(object.channel_assignment)
         ? PagingChannelAssignment.fromJSON(object.channel_assignment)
         : undefined,
+      cell: isSet(object.cell) ? CellId.fromJSON(object.cell) : undefined,
     };
   },
 
@@ -7460,6 +7569,9 @@ export const PagingEvent: MessageFns<PagingEvent> = {
     }
     if (message.channelAssignment !== undefined) {
       obj.channelAssignment = PagingChannelAssignment.toJSON(message.channelAssignment);
+    }
+    if (message.cell !== undefined) {
+      obj.cell = CellId.toJSON(message.cell);
     }
     return obj;
   },
@@ -7502,6 +7614,7 @@ export const PagingEvent: MessageFns<PagingEvent> = {
     message.channelAssignment = (object.channelAssignment !== undefined && object.channelAssignment !== null)
       ? PagingChannelAssignment.fromPartial(object.channelAssignment)
       : undefined;
+    message.cell = (object.cell !== undefined && object.cell !== null) ? CellId.fromPartial(object.cell) : undefined;
     return message;
   },
 };
@@ -7526,6 +7639,7 @@ function createBaseTrafficEvent(): TrafficEvent {
     alertWithInfo: undefined,
     serviceRequest: undefined,
     voiceCallState: undefined,
+    cell: undefined,
   };
 }
 
@@ -7584,6 +7698,9 @@ export const TrafficEvent: MessageFns<TrafficEvent> = {
     }
     if (message.voiceCallState !== undefined) {
       writer.uint32(194).string(message.voiceCallState);
+    }
+    if (message.cell !== undefined) {
+      CellId.encode(message.cell, writer.uint32(106).fork()).join();
     }
     return writer;
   },
@@ -7739,6 +7856,14 @@ export const TrafficEvent: MessageFns<TrafficEvent> = {
           message.voiceCallState = reader.string();
           continue;
         }
+        case 13: {
+          if (tag !== 106) {
+            break;
+          }
+
+          message.cell = CellId.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -7828,6 +7953,7 @@ export const TrafficEvent: MessageFns<TrafficEvent> = {
         : isSet(object.voice_call_state)
         ? globalThis.String(object.voice_call_state)
         : undefined,
+      cell: isSet(object.cell) ? CellId.fromJSON(object.cell) : undefined,
     };
   },
 
@@ -7887,6 +8013,9 @@ export const TrafficEvent: MessageFns<TrafficEvent> = {
     if (message.voiceCallState !== undefined) {
       obj.voiceCallState = message.voiceCallState;
     }
+    if (message.cell !== undefined) {
+      obj.cell = CellId.toJSON(message.cell);
+    }
     return obj;
   },
 
@@ -7925,6 +8054,7 @@ export const TrafficEvent: MessageFns<TrafficEvent> = {
       ? TrafficServiceRequest.fromPartial(object.serviceRequest)
       : undefined;
     message.voiceCallState = object.voiceCallState ?? undefined;
+    message.cell = (object.cell !== undefined && object.cell !== null) ? CellId.fromPartial(object.cell) : undefined;
     return message;
   },
 };
@@ -12736,6 +12866,11 @@ function createBaseOverheadConfig(): OverheadConfig {
     daylt: 0,
     mccDigits: "",
     imsi1112Digits: "",
+    pRev: 0,
+    minPRev: 0,
+    cdmaFreq: undefined,
+    extCdmaFreq: undefined,
+    bandClassOverride: undefined,
   };
 }
 
@@ -12794,6 +12929,21 @@ export const OverheadConfig: MessageFns<OverheadConfig> = {
     }
     if (message.imsi1112Digits !== "") {
       writer.uint32(146).string(message.imsi1112Digits);
+    }
+    if (message.pRev !== 0) {
+      writer.uint32(152).uint32(message.pRev);
+    }
+    if (message.minPRev !== 0) {
+      writer.uint32(160).uint32(message.minPRev);
+    }
+    if (message.cdmaFreq !== undefined) {
+      writer.uint32(168).uint32(message.cdmaFreq);
+    }
+    if (message.extCdmaFreq !== undefined) {
+      writer.uint32(176).uint32(message.extCdmaFreq);
+    }
+    if (message.bandClassOverride !== undefined) {
+      writer.uint32(184).uint32(message.bandClassOverride);
     }
     return writer;
   },
@@ -12949,6 +13099,46 @@ export const OverheadConfig: MessageFns<OverheadConfig> = {
           message.imsi1112Digits = reader.string();
           continue;
         }
+        case 19: {
+          if (tag !== 152) {
+            break;
+          }
+
+          message.pRev = reader.uint32();
+          continue;
+        }
+        case 20: {
+          if (tag !== 160) {
+            break;
+          }
+
+          message.minPRev = reader.uint32();
+          continue;
+        }
+        case 21: {
+          if (tag !== 168) {
+            break;
+          }
+
+          message.cdmaFreq = reader.uint32();
+          continue;
+        }
+        case 22: {
+          if (tag !== 176) {
+            break;
+          }
+
+          message.extCdmaFreq = reader.uint32();
+          continue;
+        }
+        case 23: {
+          if (tag !== 184) {
+            break;
+          }
+
+          message.bandClassOverride = reader.uint32();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -13038,6 +13228,31 @@ export const OverheadConfig: MessageFns<OverheadConfig> = {
         : isSet(object.imsi_11_12_digits)
         ? globalThis.String(object.imsi_11_12_digits)
         : "",
+      pRev: isSet(object.pRev)
+        ? globalThis.Number(object.pRev)
+        : isSet(object.p_rev)
+        ? globalThis.Number(object.p_rev)
+        : 0,
+      minPRev: isSet(object.minPRev)
+        ? globalThis.Number(object.minPRev)
+        : isSet(object.min_p_rev)
+        ? globalThis.Number(object.min_p_rev)
+        : 0,
+      cdmaFreq: isSet(object.cdmaFreq)
+        ? globalThis.Number(object.cdmaFreq)
+        : isSet(object.cdma_freq)
+        ? globalThis.Number(object.cdma_freq)
+        : undefined,
+      extCdmaFreq: isSet(object.extCdmaFreq)
+        ? globalThis.Number(object.extCdmaFreq)
+        : isSet(object.ext_cdma_freq)
+        ? globalThis.Number(object.ext_cdma_freq)
+        : undefined,
+      bandClassOverride: isSet(object.bandClassOverride)
+        ? globalThis.Number(object.bandClassOverride)
+        : isSet(object.band_class_override)
+        ? globalThis.Number(object.band_class_override)
+        : undefined,
     };
   },
 
@@ -13097,6 +13312,21 @@ export const OverheadConfig: MessageFns<OverheadConfig> = {
     if (message.imsi1112Digits !== "") {
       obj.imsi1112Digits = message.imsi1112Digits;
     }
+    if (message.pRev !== 0) {
+      obj.pRev = Math.round(message.pRev);
+    }
+    if (message.minPRev !== 0) {
+      obj.minPRev = Math.round(message.minPRev);
+    }
+    if (message.cdmaFreq !== undefined) {
+      obj.cdmaFreq = Math.round(message.cdmaFreq);
+    }
+    if (message.extCdmaFreq !== undefined) {
+      obj.extCdmaFreq = Math.round(message.extCdmaFreq);
+    }
+    if (message.bandClassOverride !== undefined) {
+      obj.bandClassOverride = Math.round(message.bandClassOverride);
+    }
     return obj;
   },
 
@@ -13123,6 +13353,11 @@ export const OverheadConfig: MessageFns<OverheadConfig> = {
     message.daylt = object.daylt ?? 0;
     message.mccDigits = object.mccDigits ?? "";
     message.imsi1112Digits = object.imsi1112Digits ?? "";
+    message.pRev = object.pRev ?? 0;
+    message.minPRev = object.minPRev ?? 0;
+    message.cdmaFreq = object.cdmaFreq ?? undefined;
+    message.extCdmaFreq = object.extCdmaFreq ?? undefined;
+    message.bandClassOverride = object.bandClassOverride ?? undefined;
     return message;
   },
 };
@@ -13355,6 +13590,82 @@ export const TimezoneStatus: MessageFns<TimezoneStatus> = {
   },
 };
 
+function createBaseCellId(): CellId {
+  return { cell: 0, sector: 0 };
+}
+
+export const CellId: MessageFns<CellId> = {
+  encode(message: CellId, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.cell !== 0) {
+      writer.uint32(8).uint32(message.cell);
+    }
+    if (message.sector !== 0) {
+      writer.uint32(16).uint32(message.sector);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): CellId {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseCellId();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.cell = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.sector = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): CellId {
+    return {
+      cell: isSet(object.cell) ? globalThis.Number(object.cell) : 0,
+      sector: isSet(object.sector) ? globalThis.Number(object.sector) : 0,
+    };
+  },
+
+  toJSON(message: CellId): unknown {
+    const obj: any = {};
+    if (message.cell !== 0) {
+      obj.cell = Math.round(message.cell);
+    }
+    if (message.sector !== 0) {
+      obj.sector = Math.round(message.sector);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<CellId>): CellId {
+    return CellId.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<CellId>): CellId {
+    const message = createBaseCellId();
+    message.cell = object.cell ?? 0;
+    message.sector = object.sector ?? 0;
+    return message;
+  },
+};
+
 function createBaseMobileInfo(): MobileInfo {
   return {
     address: "",
@@ -13381,6 +13692,7 @@ function createBaseMobileInfo(): MobileInfo {
     trafficWalshCode: undefined,
     trafficServiceOption: undefined,
     voiceCallState: undefined,
+    servingCell: undefined,
   };
 }
 
@@ -13457,6 +13769,9 @@ export const MobileInfo: MessageFns<MobileInfo> = {
     }
     if (message.voiceCallState !== undefined) {
       writer.uint32(178).string(message.voiceCallState);
+    }
+    if (message.servingCell !== undefined) {
+      CellId.encode(message.servingCell, writer.uint32(226).fork()).join();
     }
     return writer;
   },
@@ -13660,6 +13975,14 @@ export const MobileInfo: MessageFns<MobileInfo> = {
           message.voiceCallState = reader.string();
           continue;
         }
+        case 28: {
+          if (tag !== 226) {
+            break;
+          }
+
+          message.servingCell = CellId.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -13767,6 +14090,11 @@ export const MobileInfo: MessageFns<MobileInfo> = {
         : isSet(object.voice_call_state)
         ? globalThis.String(object.voice_call_state)
         : undefined,
+      servingCell: isSet(object.servingCell)
+        ? CellId.fromJSON(object.servingCell)
+        : isSet(object.serving_cell)
+        ? CellId.fromJSON(object.serving_cell)
+        : undefined,
     };
   },
 
@@ -13844,6 +14172,9 @@ export const MobileInfo: MessageFns<MobileInfo> = {
     if (message.voiceCallState !== undefined) {
       obj.voiceCallState = message.voiceCallState;
     }
+    if (message.servingCell !== undefined) {
+      obj.servingCell = CellId.toJSON(message.servingCell);
+    }
     return obj;
   },
 
@@ -13882,6 +14213,9 @@ export const MobileInfo: MessageFns<MobileInfo> = {
     message.trafficWalshCode = object.trafficWalshCode ?? undefined;
     message.trafficServiceOption = object.trafficServiceOption ?? undefined;
     message.voiceCallState = object.voiceCallState ?? undefined;
+    message.servingCell = (object.servingCell !== undefined && object.servingCell !== null)
+      ? CellId.fromPartial(object.servingCell)
+      : undefined;
     return message;
   },
 };
@@ -14891,6 +15225,7 @@ function createBaseChannel(): Channel {
     mobile: undefined,
     serviceOption: undefined,
     trafficPower: undefined,
+    cell: undefined,
   };
 }
 
@@ -14925,6 +15260,9 @@ export const Channel: MessageFns<Channel> = {
     }
     if (message.trafficPower !== undefined) {
       TrafficChannelPower.encode(message.trafficPower, writer.uint32(82).fork()).join();
+    }
+    if (message.cell !== undefined) {
+      CellId.encode(message.cell, writer.uint32(90).fork()).join();
     }
     return writer;
   },
@@ -15016,6 +15354,14 @@ export const Channel: MessageFns<Channel> = {
           message.trafficPower = TrafficChannelPower.decode(reader, reader.uint32());
           continue;
         }
+        case 11: {
+          if (tag !== 90) {
+            break;
+          }
+
+          message.cell = CellId.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -15069,6 +15415,7 @@ export const Channel: MessageFns<Channel> = {
         : isSet(object.traffic_power)
         ? TrafficChannelPower.fromJSON(object.traffic_power)
         : undefined,
+      cell: isSet(object.cell) ? CellId.fromJSON(object.cell) : undefined,
     };
   },
 
@@ -15104,6 +15451,9 @@ export const Channel: MessageFns<Channel> = {
     if (message.trafficPower !== undefined) {
       obj.trafficPower = TrafficChannelPower.toJSON(message.trafficPower);
     }
+    if (message.cell !== undefined) {
+      obj.cell = CellId.toJSON(message.cell);
+    }
     return obj;
   },
 
@@ -15126,6 +15476,7 @@ export const Channel: MessageFns<Channel> = {
     message.trafficPower = (object.trafficPower !== undefined && object.trafficPower !== null)
       ? TrafficChannelPower.fromPartial(object.trafficPower)
       : undefined;
+    message.cell = (object.cell !== undefined && object.cell !== null) ? CellId.fromPartial(object.cell) : undefined;
     return message;
   },
 };
@@ -15842,13 +16193,16 @@ export const PowerControlSample: MessageFns<PowerControlSample> = {
 };
 
 function createBaseSetTrafficChannelPowerOverrideRequest(): SetTrafficChannelPowerOverrideRequest {
-  return { walshCode: 0, setTargetEbNtDb: undefined, clear: undefined };
+  return { walshCode: 0, cell: undefined, setTargetEbNtDb: undefined, clear: undefined };
 }
 
 export const SetTrafficChannelPowerOverrideRequest: MessageFns<SetTrafficChannelPowerOverrideRequest> = {
   encode(message: SetTrafficChannelPowerOverrideRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
     if (message.walshCode !== 0) {
       writer.uint32(8).uint32(message.walshCode);
+    }
+    if (message.cell !== undefined) {
+      CellId.encode(message.cell, writer.uint32(34).fork()).join();
     }
     if (message.setTargetEbNtDb !== undefined) {
       writer.uint32(21).float(message.setTargetEbNtDb);
@@ -15872,6 +16226,14 @@ export const SetTrafficChannelPowerOverrideRequest: MessageFns<SetTrafficChannel
           }
 
           message.walshCode = reader.uint32();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.cell = CellId.decode(reader, reader.uint32());
           continue;
         }
         case 2: {
@@ -15906,6 +16268,7 @@ export const SetTrafficChannelPowerOverrideRequest: MessageFns<SetTrafficChannel
         : isSet(object.walsh_code)
         ? globalThis.Number(object.walsh_code)
         : 0,
+      cell: isSet(object.cell) ? CellId.fromJSON(object.cell) : undefined,
       setTargetEbNtDb: isSet(object.setTargetEbNtDb)
         ? globalThis.Number(object.setTargetEbNtDb)
         : isSet(object.set_target_eb_nt_db)
@@ -15919,6 +16282,9 @@ export const SetTrafficChannelPowerOverrideRequest: MessageFns<SetTrafficChannel
     const obj: any = {};
     if (message.walshCode !== 0) {
       obj.walshCode = Math.round(message.walshCode);
+    }
+    if (message.cell !== undefined) {
+      obj.cell = CellId.toJSON(message.cell);
     }
     if (message.setTargetEbNtDb !== undefined) {
       obj.setTargetEbNtDb = message.setTargetEbNtDb;
@@ -15935,6 +16301,7 @@ export const SetTrafficChannelPowerOverrideRequest: MessageFns<SetTrafficChannel
   fromPartial(object: DeepPartial<SetTrafficChannelPowerOverrideRequest>): SetTrafficChannelPowerOverrideRequest {
     const message = createBaseSetTrafficChannelPowerOverrideRequest();
     message.walshCode = object.walshCode ?? 0;
+    message.cell = (object.cell !== undefined && object.cell !== null) ? CellId.fromPartial(object.cell) : undefined;
     message.setTargetEbNtDb = object.setTargetEbNtDb ?? undefined;
     message.clear = object.clear ?? undefined;
     return message;
@@ -16265,8 +16632,88 @@ export const ChannelMobile: MessageFns<ChannelMobile> = {
   },
 };
 
+function createBaseCellWalshCapacity(): CellWalshCapacity {
+  return { cell: undefined, totalWalshCodes: 0 };
+}
+
+export const CellWalshCapacity: MessageFns<CellWalshCapacity> = {
+  encode(message: CellWalshCapacity, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.cell !== undefined) {
+      CellId.encode(message.cell, writer.uint32(10).fork()).join();
+    }
+    if (message.totalWalshCodes !== 0) {
+      writer.uint32(16).uint32(message.totalWalshCodes);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): CellWalshCapacity {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseCellWalshCapacity();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.cell = CellId.decode(reader, reader.uint32());
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.totalWalshCodes = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): CellWalshCapacity {
+    return {
+      cell: isSet(object.cell) ? CellId.fromJSON(object.cell) : undefined,
+      totalWalshCodes: isSet(object.totalWalshCodes)
+        ? globalThis.Number(object.totalWalshCodes)
+        : isSet(object.total_walsh_codes)
+        ? globalThis.Number(object.total_walsh_codes)
+        : 0,
+    };
+  },
+
+  toJSON(message: CellWalshCapacity): unknown {
+    const obj: any = {};
+    if (message.cell !== undefined) {
+      obj.cell = CellId.toJSON(message.cell);
+    }
+    if (message.totalWalshCodes !== 0) {
+      obj.totalWalshCodes = Math.round(message.totalWalshCodes);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<CellWalshCapacity>): CellWalshCapacity {
+    return CellWalshCapacity.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<CellWalshCapacity>): CellWalshCapacity {
+    const message = createBaseCellWalshCapacity();
+    message.cell = (object.cell !== undefined && object.cell !== null) ? CellId.fromPartial(object.cell) : undefined;
+    message.totalWalshCodes = object.totalWalshCodes ?? 0;
+    return message;
+  },
+};
+
 function createBaseChannelList(): ChannelList {
-  return { channels: [], totalWalshCodes: 0 };
+  return { channels: [], totalWalshCodes: 0, cellWalshCapacity: [] };
 }
 
 export const ChannelList: MessageFns<ChannelList> = {
@@ -16276,6 +16723,9 @@ export const ChannelList: MessageFns<ChannelList> = {
     }
     if (message.totalWalshCodes !== 0) {
       writer.uint32(16).uint32(message.totalWalshCodes);
+    }
+    for (const v of message.cellWalshCapacity) {
+      CellWalshCapacity.encode(v!, writer.uint32(26).fork()).join();
     }
     return writer;
   },
@@ -16303,6 +16753,14 @@ export const ChannelList: MessageFns<ChannelList> = {
           message.totalWalshCodes = reader.uint32();
           continue;
         }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.cellWalshCapacity.push(CellWalshCapacity.decode(reader, reader.uint32()));
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -16320,6 +16778,11 @@ export const ChannelList: MessageFns<ChannelList> = {
         : isSet(object.total_walsh_codes)
         ? globalThis.Number(object.total_walsh_codes)
         : 0,
+      cellWalshCapacity: globalThis.Array.isArray(object?.cellWalshCapacity)
+        ? object.cellWalshCapacity.map((e: any) => CellWalshCapacity.fromJSON(e))
+        : globalThis.Array.isArray(object?.cell_walsh_capacity)
+        ? object.cell_walsh_capacity.map((e: any) => CellWalshCapacity.fromJSON(e))
+        : [],
     };
   },
 
@@ -16331,6 +16794,9 @@ export const ChannelList: MessageFns<ChannelList> = {
     if (message.totalWalshCodes !== 0) {
       obj.totalWalshCodes = Math.round(message.totalWalshCodes);
     }
+    if (message.cellWalshCapacity?.length) {
+      obj.cellWalshCapacity = message.cellWalshCapacity.map((e) => CellWalshCapacity.toJSON(e));
+    }
     return obj;
   },
 
@@ -16341,6 +16807,7 @@ export const ChannelList: MessageFns<ChannelList> = {
     const message = createBaseChannelList();
     message.channels = object.channels?.map((e) => Channel.fromPartial(e)) || [];
     message.totalWalshCodes = object.totalWalshCodes ?? 0;
+    message.cellWalshCapacity = object.cellWalshCapacity?.map((e) => CellWalshCapacity.fromPartial(e)) || [];
     return message;
   },
 };

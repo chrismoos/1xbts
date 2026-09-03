@@ -31,7 +31,7 @@ use uuid::Uuid;
 use crate::abis_edge::{BearerFrame, BtsControlClient, ForwardBearerQueue};
 use crate::addressing::is_packet_data_so;
 
-use super::Bsc;
+use super::{AccessCellId, Bsc};
 
 fn encode_forward_bearer_rate(for_rc: u8, rate: TrafficRate) -> FrameContent {
     match (for_rc, rate) {
@@ -141,9 +141,10 @@ pub(crate) struct ReverseBearerMuxReaders {
 #[derive(Default)]
 pub(crate) struct TrafficBearerService {
     pub(crate) next_tx_frame_number: u32,
-    pub(crate) reverse_mux_readers: std::collections::HashMap<u8, ReverseBearerMuxReaders>,
+    pub(crate) reverse_mux_readers:
+        std::collections::HashMap<(AccessCellId, u8), ReverseBearerMuxReaders>,
     pub(crate) reverse_voice_silence_encoders:
-        std::collections::HashMap<u8, std::sync::Mutex<(VoiceCodec, VoiceEncoder)>>,
+        std::collections::HashMap<(AccessCellId, u8), std::sync::Mutex<(VoiceCodec, VoiceEncoder)>>,
 }
 
 impl TrafficBearerService {
@@ -218,10 +219,12 @@ impl Bsc {
 
     pub(super) fn send_forward_fch_signaling_bits(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         bits: Vec<u8>,
     ) -> Result<(), Error> {
         self.send_forward_fch_bits(
+            cell,
             walsh_code,
             bits,
             TrafficRate::Full,
@@ -231,15 +234,17 @@ impl Bsc {
 
     pub(super) fn send_forward_fch_traffic_bits(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         bits: Vec<u8>,
         rate: TrafficRate,
     ) -> Result<(), Error> {
-        self.send_forward_fch_bits(walsh_code, bits, rate, ForwardBearerQueue::Traffic)
+        self.send_forward_fch_bits(cell, walsh_code, bits, rate, ForwardBearerQueue::Traffic)
     }
 
     fn send_forward_fch_bits(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         bits: Vec<u8>,
         rate: TrafficRate,
@@ -248,11 +253,11 @@ impl Bsc {
         let tx_frame_number = self.traffic_bearer.next_bearer_tx_frame_number();
         let for_rc = self
             .mobiles
-            .get_traffic_channel(walsh_code)
+            .get_traffic_channel(cell, walsh_code)
             .map(|tc| tc.for_rc)
             .unwrap_or(3);
         let result = send_forward_fch_bits_with_bearer_client(
-            self.config.bts_client.as_ref(),
+            self.client_for_cell(cell).as_ref(),
             tx_frame_number,
             walsh_code,
             for_rc,
@@ -261,7 +266,7 @@ impl Bsc {
             queue,
         );
         if result.is_ok() {
-            self.mobiles.update_tc(walsh_code, |_, tc| {
+            self.mobiles.update_tc(cell, walsh_code, |_, tc| {
                 tc.last_forward_enqueue_at = Some(Instant::now());
             });
         }
@@ -278,14 +283,26 @@ impl Bsc {
     }
 
     pub(super) async fn poll_reverse_bearer_preambles(&mut self) {
-        let frames = match self.config.bts_client.as_ref() {
-            Some(client) => match client.bearer_client() {
-                Some(bearer) => bearer.drain_received_frames(),
-                None => return,
-            },
-            None => return,
-        };
-        for frame in frames {
+        let frames: Vec<_> = self
+            .config
+            .bts
+            .in_service()
+            .iter()
+            .flat_map(|entry| {
+                let cell = entry.cell();
+                entry
+                    .control()
+                    .and_then(|client| {
+                        client
+                            .bearer_client()
+                            .map(|bearer| bearer.drain_received_frames())
+                    })
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(move |frame| (cell, frame))
+            })
+            .collect();
+        for (cell, frame) in frames {
             if let AbisTrafficFrame::ReverseFchDcch(ref fch) = frame.traffic_frame {
                 let walsh_code = frame.bearer_id as u8;
                 if fch.frame_content == REVERSE_FRAME_CONTENT_NULL {
@@ -293,19 +310,21 @@ impl Bsc {
                         "BSC: reverse bearer preamble null frame walsh={}",
                         walsh_code
                     );
-                    let event = Self::bearer_null_frame_to_preamble_event(
+                    let mut event = Self::bearer_null_frame_to_preamble_event(
                         walsh_code,
                         frame.tx_frame_number,
                     );
+                    event.cell = Some(cell);
                     self.handle_access_event(event).await;
                 } else if fch.fqi {
-                    self.route_reverse_bearer_packet_primary(walsh_code, fch)
+                    self.route_reverse_bearer_packet_primary(cell, walsh_code, fch)
                         .await;
-                    if let Some(event) = Self::bearer_reverse_primary_to_event(
+                    if let Some(mut event) = Self::bearer_reverse_primary_to_event(
                         walsh_code,
                         fch,
                         frame.tx_frame_number,
                     ) {
+                        event.cell = Some(cell);
                         log::trace!(
                             "BSC: reverse bearer primary walsh={} rate={:?} bits={}",
                             walsh_code,
@@ -319,9 +338,14 @@ impl Bsc {
                         self.handle_access_event(event).await;
                     }
 
-                    match self.bearer_reverse_frame_to_event(walsh_code, fch, frame.tx_frame_number)
-                    {
-                        Some(event) => {
+                    match self.bearer_reverse_frame_to_event(
+                        cell,
+                        walsh_code,
+                        fch,
+                        frame.tx_frame_number,
+                    ) {
+                        Some(mut event) => {
+                            event.cell = Some(cell);
                             info!(
                                 "BSC: reverse bearer traffic walsh={} msg={}",
                                 walsh_code, event.pdu_summary
@@ -340,9 +364,9 @@ impl Bsc {
                         }
                     }
                 } else {
-                    self.route_reverse_bearer_packet_primary(walsh_code, fch)
+                    self.route_reverse_bearer_packet_primary(cell, walsh_code, fch)
                         .await;
-                    if let Err(error) = self.relay_reverse_silence_to_msc(walsh_code) {
+                    if let Err(error) = self.relay_reverse_silence_to_msc(cell, walsh_code) {
                         debug!(
                             "BSC: bad reverse frame on walsh={} had no silence substitution: {}",
                             walsh_code, error
@@ -359,29 +383,35 @@ impl Bsc {
         }
     }
 
-    pub(crate) fn relay_reverse_silence_to_msc(&mut self, walsh_code: u8) -> Result<(), String> {
-        if !self.reverse_voice_media_enabled(walsh_code) {
-            return Err("reverse MSC voice media is not active".to_string());
+    pub(crate) fn relay_reverse_silence_to_msc(
+        &mut self,
+        cell: AccessCellId,
+        walsh_code: u8,
+    ) -> Result<(), Error> {
+        if !self.reverse_voice_media_enabled(cell, walsh_code) {
+            return Err("reverse MSC voice media is not active".into());
         }
         let Some(bearer) = self.config.msc_voice_bearer.clone() else {
-            return Err("MSC voice bearer is not configured".to_string());
+            return Err("MSC voice bearer is not configured".into());
         };
-        let Some((circuit_id, service_option)) =
-            self.mobiles.get_traffic_channel(walsh_code).and_then(|tc| {
+        let Some((circuit_id, service_option)) = self
+            .mobiles
+            .get_traffic_channel(cell, walsh_code)
+            .and_then(|tc| {
                 let service_option = super::traffic_forward::voice_service_option_for_channel(tc)?;
                 Some((tc.msc_circuit_id?, service_option))
             })
         else {
-            return Err("traffic channel has no MSC voice circuit".to_string());
+            return Err("traffic channel has no MSC voice circuit".into());
         };
         let Some(codec) = VoiceCodec::from_service_option(service_option) else {
-            return Err(format!("service option {} is not voice", service_option));
+            return Err(format!("service option {} is not voice", service_option).into());
         };
 
         let encoder_state = match self
             .traffic_bearer
             .reverse_voice_silence_encoders
-            .entry(walsh_code)
+            .entry((cell, walsh_code))
         {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -391,7 +421,7 @@ impl Bsc {
         };
         let encoder_state = encoder_state
             .get_mut()
-            .map_err(|_| "reverse silence encoder state is poisoned".to_string())?;
+            .map_err(|_| Error::from("reverse silence encoder state is poisoned"))?;
         if encoder_state.0 != codec {
             let encoder = VoiceEncoder::new(codec)?;
             *encoder_state = (codec, encoder);
@@ -404,9 +434,12 @@ impl Bsc {
             rate_bps: codec.rate_bps(rate),
             payload,
         };
-        bearer
-            .try_send_frame(&frame)
-            .map_err(|error| format!("MSC circuit_id={} send failed: {}", circuit_id, error))?;
+        bearer.try_send_frame(&frame).map_err(|error| {
+            Error::from(format!(
+                "MSC circuit_id={} send failed: {}",
+                circuit_id, error
+            ))
+        })?;
         debug!(
             "BSC: replaced bad reverse voice frame with silence walsh={} circuit_id={}",
             walsh_code, circuit_id
@@ -416,6 +449,7 @@ impl Bsc {
 
     pub(crate) async fn route_reverse_bearer_packet_primary(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         fch: &ReverseFchDcchFrame,
     ) -> bool {
@@ -424,7 +458,7 @@ impl Bsc {
             return false;
         };
 
-        let outcome = self.mobiles.update_tc(walsh_code, |_, tc| {
+        let outcome = self.mobiles.update_tc(cell, walsh_code, |_, tc| {
             if !is_packet_data_so(tc.service_option) {
                 return None;
             }
@@ -458,7 +492,7 @@ impl Bsc {
             Err(TrySendError::Closed(_)) => {
                 let detached = self
                     .mobiles
-                    .update_tc(walsh_code, |_, tc| {
+                    .update_tc(cell, walsh_code, |_, tc| {
                         if tc.packet_session_id.as_deref() != Some(session_id.as_str()) {
                             return false;
                         }
@@ -475,7 +509,7 @@ impl Bsc {
                         "BSC: detached closed packet session {} on walsh={}, initiating traffic release",
                         session_id, walsh_code
                     );
-                    self.begin_packet_tch_release(walsh_code, "closed packet session");
+                    self.begin_packet_tch_release(cell, walsh_code, "closed packet session");
                 }
                 false
             }
@@ -551,6 +585,7 @@ impl Bsc {
             chip_start: 0,
             absolute_chip_start: Some(tx_frame_number as u64),
             receive_time: Some(cdma_common::time::CdmaSystemTime::from(now)),
+            cell: None,
             preamble_frames: 0,
             pd: 0,
             message_id: MessageId::GeneralExtension,
@@ -624,6 +659,7 @@ impl Bsc {
 
     fn bearer_reverse_frame_to_event(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         fch: &ReverseFchDcchFrame,
         tx_frame_number: u32,
@@ -647,7 +683,7 @@ impl Bsc {
         let readers = self
             .traffic_bearer
             .reverse_mux_readers
-            .entry(walsh_code)
+            .entry((cell, walsh_code))
             .or_default();
         if Self::is_reverse_mux2_frame(fch.frame_content) {
             let frame = Self::decode_reverse_mux2_bearer_frame(
@@ -774,6 +810,7 @@ impl Bsc {
             chip_start: 0,
             absolute_chip_start: Some(tx_frame_number as u64),
             receive_time: Some(cdma_common::time::CdmaSystemTime::from(now)),
+            cell: None,
             preamble_frames: 0,
             pd: 0,
             message_id: rdsch.message_id,
@@ -852,6 +889,7 @@ impl Bsc {
             chip_start: 0,
             absolute_chip_start: Some(tx_frame_number as u64),
             receive_time: Some(cdma_common::time::CdmaSystemTime::from(now)),
+            cell: None,
             preamble_frames: 0,
             pd: 0,
             message_id: MessageId::GeneralExtension,

@@ -1,5 +1,10 @@
-//! HRPD AN bridge: A9/A8 session orchestration and the air-event bridge
-//! that drives the AN. Extracted from the nib binary so it is testable.
+//! The HRPD Access Network: A9/A8 session orchestration plus the air-event
+//! path that drives the AN's upper layers from the BTS HRPD MAC.
+//!
+//! `C.S0024-100-C` §1.11 makes the access network equivalent to a base
+//! station, so the AN's session, connection and stream layers run in the BTS
+//! process and reach the air controller by direct call. The gRPC service is
+//! the management view of the same state, not a step on the air path.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -8,33 +13,29 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::convert::*;
+use super::hrpd::scheduler::{ForwardTrafficPacket, ForwardTrafficSender};
+use super::{BtsNodeConfig, evdo};
 use cdma_a8::HrpdA9ClientConfig;
-use cdma_an::air::HrpdAirController;
-use cdma_an::grpc::{
-    AnServiceImpl, SessionStore, SharedHrpdAirController, SharedUatiAllocator,
-    traffic_outcome_to_proto,
-};
-use cdma_an::proto::an::v1 as an_proto;
-use cdma_an::proto::an::v1::an_service_client::AnServiceClient;
+use cdma_an::air::{HrpdAirController, HrpdSessionConfigurationCompleteEvent, HrpdTrafficOutcome};
+use cdma_an::grpc::{AnServiceImpl, SessionStore, SharedUatiAllocator};
 use cdma_an::{
     HrpdA9MobileIdentity, HrpdA9ReleaseContext, HrpdAnA8Runtime, HrpdAnA9Client,
     HrpdAnForwardTrafficPacket, HrpdDerivedImsiConfig, HrpdHardwareIdentity,
     hardware_identity_from_response, resolve_hrpd_a9_identity, spawn_hrpd_an_a8_runtime,
 };
 use cdma_an::{UatiAllocator, UatiSubnet};
-use cdma_bts::bts::{BtsNodeConfig, evdo};
 use cdma_common::error::Error;
 use cdma_common::hrpd::air as hrpd_air;
 #[cfg(test)]
 use cdma_pcf::spawn_hrpd_pcf_a9_service;
 #[cfg(test)]
 use cdma_pdsn::spawn_hrpd_pdsn_a11_service;
-use log::{info, warn};
+use log::{error, info, warn};
 use tokio::sync::Mutex;
 
 // HRPD default-packet protocol/RLP codes and A9/A8 orchestration constants.
 const HRPD_DEFAULT_PACKET_STREAM1_PROTOCOL_TYPE: u8 = 0x15;
+const HRPD_DEFAULT_PACKET_STREAM2_PROTOCOL_TYPE: u8 = 0x16;
 const HRPD_DEFAULT_PACKET_STREAM3_PROTOCOL_TYPE: u8 = 0x17;
 const HRPD_DEFAULT_PACKET_DATA_READY_ACK: u8 = 0x0c;
 const HRPD_DEFAULT_PACKET_XON_REQUEST: u8 = 0x07;
@@ -42,8 +43,16 @@ const HRPD_DEFAULT_PACKET_XOFF_REQUEST: u8 = 0x09;
 const HRPD_ADDRESS_MANAGEMENT_PROTOCOL_TYPE: u8 = 0x11;
 const HRPD_UATI_ASSIGNMENT_MESSAGE_ID: u8 = 0x01;
 const HRPD_ENHANCED_IDLE_DEFAULT_PAGE_PERIOD_CYCLES: u16 = 12;
+/// Management/session gRPC listener for the AN when `evdo.an_grpc_bind_addr`
+/// names none. The web UI reads HRPD sessions and UATI allocation from here.
+const HRPD_AN_MANAGEMENT_GRPC_ADDR: &str = "127.0.0.1:17030";
+/// Cadence of the AN session/connection timer tick.
+const HRPD_AN_TIMER_INTERVAL: Duration = Duration::from_millis(100);
+/// Reporting window for the Stream 1 path timing summary.
+const HRPD_STREAM1_TIMING_WINDOW: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Debug)]
-pub struct PendingHrpdA9Session {
+pub(crate) struct PendingHrpdA9Session {
     session_uati: u32,
     request: hrpd_air::HrpdTrafficAssignmentRequest,
     identity: Option<HrpdA9MobileIdentity>,
@@ -53,7 +62,7 @@ pub struct PendingHrpdA9Session {
 // Only UATI-keyed identities may reach A9: SetupA8 identifies the addressed
 // mobile, so an unresolved setup stays pending until HardwareIDResponse
 // resolves it rather than borrowing another AT's identity.
-pub fn cached_hrpd_a9_identity(
+pub(crate) fn cached_hrpd_a9_identity(
     identities: &HashMap<u32, HrpdA9MobileIdentity>,
     session_uati: u32,
     traffic_uati: u32,
@@ -64,7 +73,7 @@ pub fn cached_hrpd_a9_identity(
         .cloned()
 }
 
-pub fn pending_hrpd_a9_identity_needs_imsi(pending: &PendingHrpdA9Session) -> bool {
+pub(crate) fn pending_hrpd_a9_identity_needs_imsi(pending: &PendingHrpdA9Session) -> bool {
     pending
         .identity
         .as_ref()
@@ -73,12 +82,12 @@ pub fn pending_hrpd_a9_identity_needs_imsi(pending: &PendingHrpdA9Session) -> bo
 }
 
 #[derive(Clone, Debug)]
-pub struct HrpdA9ReleaseRequest {
+pub(crate) struct HrpdA9ReleaseRequest {
     uati: u32,
     reason: String,
 }
 
-pub fn uati_from_access_ati(
+pub(crate) fn uati_from_access_ati(
     ati: hrpd_air::AccessTerminalIdentifier,
     color_code: u8,
 ) -> Option<u32> {
@@ -91,32 +100,32 @@ pub fn uati_from_access_ati(
     Some(ati.value & 0x00ff_ffff)
 }
 
-pub fn session_uati_from_hrpd_traffic_uati(traffic_uati: u32) -> u32 {
+pub(crate) fn session_uati_from_hrpd_traffic_uati(traffic_uati: u32) -> u32 {
     traffic_uati & 0x00ff_ffff
 }
 
-pub fn hrpd_traffic_uati_from_session_uati(session_uati: u32, color_code: u8) -> u32 {
+pub(crate) fn hrpd_traffic_uati_from_session_uati(session_uati: u32, color_code: u8) -> u32 {
     (u32::from(color_code) << 24) | (session_uati & 0x00ff_ffff)
 }
 
-pub fn default_packet_flow_open_for_pending(
+pub(crate) fn default_packet_flow_open_for_pending(
     open_uatis: &HashSet<u32>,
     pending: &PendingHrpdA9Session,
 ) -> bool {
     open_uatis.contains(&pending.request.uati) || open_uatis.contains(&pending.session_uati)
 }
 
-pub fn remember_default_packet_flow_open(open_uatis: &mut HashSet<u32>, uati: u32) {
+pub(crate) fn remember_default_packet_flow_open(open_uatis: &mut HashSet<u32>, uati: u32) {
     open_uatis.insert(uati);
     open_uatis.insert(session_uati_from_hrpd_traffic_uati(uati));
 }
 
-pub fn forget_default_packet_flow_open(open_uatis: &mut HashSet<u32>, uati: u32) {
+pub(crate) fn forget_default_packet_flow_open(open_uatis: &mut HashSet<u32>, uati: u32) {
     open_uatis.remove(&uati);
     open_uatis.remove(&session_uati_from_hrpd_traffic_uati(uati));
 }
 
-pub fn access_default_packet_data_ready_acks(
+pub(crate) fn access_default_packet_data_ready_acks(
     indication: &hrpd_air::HrpdAccessIndication,
 ) -> Vec<u8> {
     indication
@@ -138,7 +147,7 @@ pub fn access_default_packet_data_ready_acks(
         .collect()
 }
 
-pub fn access_default_packet_flow_requests(
+pub(crate) fn access_default_packet_flow_requests(
     indication: &hrpd_air::HrpdAccessIndication,
 ) -> Vec<bool> {
     indication
@@ -161,7 +170,7 @@ pub fn access_default_packet_flow_requests(
         .collect()
 }
 
-pub fn is_hrpd_default_packet_stream_protocol_type(protocol_type: u8) -> bool {
+pub(crate) fn is_hrpd_default_packet_stream_protocol_type(protocol_type: u8) -> bool {
     matches!(
         protocol_type,
         HRPD_DEFAULT_PACKET_STREAM1_PROTOCOL_TYPE
@@ -170,7 +179,7 @@ pub fn is_hrpd_default_packet_stream_protocol_type(protocol_type: u8) -> bool {
     )
 }
 
-pub fn hrpd_uati_subnet_assignment(
+pub(crate) fn hrpd_uati_subnet_assignment(
     sector_id: [u8; 16],
     on_air_subnet_mask: u8,
 ) -> hrpd_air::HrpdUatiSubnetAssignment {
@@ -186,7 +195,7 @@ pub fn hrpd_uati_subnet_assignment(
     }
 }
 
-pub async fn try_complete_hrpd_a9_setup(
+pub(crate) async fn try_complete_hrpd_a9_setup(
     pending: PendingHrpdA9Session,
     a9_config: Option<HrpdA9ClientConfig>,
     a9_endpoint: Option<&cdma_a9::UdpSignalingEndpoint>,
@@ -201,7 +210,7 @@ pub async fn try_complete_hrpd_a9_setup(
     };
     if !pending.session_configuration_complete {
         info!(
-            "HRPD AN bridge: deferring A9 SetupA8 UATI=0x{:08x}; waiting for SessionConfigurationComplete",
+            "HRPD AN: deferring A9 SetupA8 UATI=0x{:08x}; waiting for SessionConfigurationComplete",
             pending.request.uati
         );
         return Err(pending);
@@ -213,7 +222,7 @@ pub async fn try_complete_hrpd_a9_setup(
         .is_none()
     {
         info!(
-            "HRPD AN bridge: deferring A9 SetupA8 UATI=0x{:08x}; waiting for IMSI-format A11 MSID",
+            "HRPD AN: deferring A9 SetupA8 UATI=0x{:08x}; waiting for IMSI-format A11 MSID",
             pending.request.uati
         );
         return Err(pending);
@@ -225,7 +234,7 @@ pub async fn try_complete_hrpd_a9_setup(
     match result {
         Ok(context) => {
             info!(
-                "HRPD AN bridge: A9 SetupA8 connected after {reason} UATI=0x{:08x} MAC={} A8Key=0x{:08x}",
+                "HRPD AN: A9 SetupA8 connected after {reason} UATI=0x{:08x} MAC={} A8Key=0x{:08x}",
                 pending.request.uati,
                 pending.request.mac_index,
                 context.a8_key()
@@ -253,7 +262,7 @@ pub async fn try_complete_hrpd_a9_setup(
     }
 }
 
-pub async fn release_hrpd_a9_and_a10_for_uati(
+pub(crate) async fn release_hrpd_a9_and_a10_for_uati(
     uati: u32,
     reason: &str,
     active_a9_sessions: &mut HashMap<u32, HrpdA9ReleaseContext>,
@@ -273,26 +282,94 @@ pub async fn release_hrpd_a9_and_a10_for_uati(
             }
             _ => {
                 info!(
-                    "HRPD AN bridge: no A9 endpoint available while releasing UATI=0x{uati:08x} after {reason}"
+                    "HRPD AN: no A9 endpoint available while releasing UATI=0x{uati:08x} after {reason}"
                 );
             }
         }
     } else {
-        info!("HRPD AN bridge: no active A9 state for UATI=0x{uati:08x} after {reason}");
+        info!("HRPD AN: no active A9 state for UATI=0x{uati:08x} after {reason}");
     }
 }
 
-pub fn spawn_nib_an_service(
+/// The MCC and IMSI_11_12 the AN derives HRPD subscriber identities from,
+/// read out of the broadcast Extended System Parameters so a derived IMSI
+/// matches what the cell advertises.
+pub fn hrpd_derived_imsi_config(
+    bts_config: &BtsNodeConfig,
+) -> Result<HrpdDerivedImsiConfig, Error> {
+    let esp = &bts_config
+        .runtime
+        .downlink
+        .paging
+        .message_defaults
+        .extended_system_parameters;
+    let mcc = cdma_common::paging::mcc_to_digits(esp.mcc)
+        .ok_or_else(|| Error::from(format!("invalid BTS overhead MCC encoding {}", esp.mcc)))?;
+    let imsi_11_12 =
+        cdma_common::paging::imsi_11_12_to_digits(esp.imsi_11_12).ok_or_else(|| {
+            Error::from(format!(
+                "invalid BTS overhead IMSI_11_12 encoding {}",
+                esp.imsi_11_12
+            ))
+        })?;
+    Ok(HrpdDerivedImsiConfig { mcc, imsi_11_12 })
+}
+
+/// The BTS-side HRPD air channels the AN drives. Field names match the
+/// `hrpd_*` members of `BtsHandle` they are taken from.
+pub struct HrpdAirChannels {
+    pub access_events: tokio::sync::mpsc::UnboundedReceiver<hrpd_air::HrpdAccessIndication>,
+    pub traffic_events: tokio::sync::mpsc::UnboundedReceiver<hrpd_air::HrpdTrafficEvent>,
+    pub forward_signaling:
+        tokio::sync::mpsc::UnboundedSender<hrpd_air::HrpdForwardSignalingRequest>,
+    pub traffic_assignments:
+        tokio::sync::mpsc::UnboundedSender<hrpd_air::HrpdTrafficAssignmentRequest>,
+    pub traffic_releases: tokio::sync::mpsc::UnboundedSender<hrpd_air::HrpdTrafficReleaseRequest>,
+    pub forward_traffic: ForwardTrafficSender,
+}
+
+/// What a started AN hands back to the process that owns it.
+pub struct HrpdAn {
+    /// Address of the AN's management/session gRPC listener.
+    pub grpc_addr: SocketAddr,
+    /// The AN's in-process handle. Session and UATI state stay reachable
+    /// through it, and it is the only route to the air controller.
+    pub service: AnServiceImpl,
+}
+
+/// Start the HRPD Access Network for this sector and bind it to the BTS air
+/// channels. Returns `Ok(None)` when EV-DO is disabled in `bts.json`.
+///
+/// Color code, UATI subnet, pilot offset and the advertised HRPD channel
+/// record all come from the `evdo` block, so the AN's on-air identity matches
+/// what the BTS transmits.
+pub async fn spawn_hrpd_an(
     bts_config: &BtsNodeConfig,
     events_endpoint: Option<&str>,
-) -> Result<Option<(SocketAddr, SharedHrpdAirController, SharedUatiAllocator)>, Error> {
+    a9_config: Option<HrpdA9ClientConfig>,
+    hlr_repo: Option<Arc<dyn cdma_hlr::repository::HlrRepository>>,
+    derived_imsi_config: HrpdDerivedImsiConfig,
+    channels: HrpdAirChannels,
+) -> Result<Option<HrpdAn>, Error> {
     if !bts_config.evdo.enabled {
         return Ok(None);
     }
     let overhead = bts_config.evdo.overhead.resolve()?;
-    let addr: SocketAddr = "127.0.0.1:17030"
-        .parse()
-        .expect("static AN gRPC address should parse");
+    let configured_addr: SocketAddr = match bts_config.evdo.an_grpc_bind_addr {
+        Some(addr) => addr,
+        None => HRPD_AN_MANAGEMENT_GRPC_ADDR
+            .parse()
+            .expect("default AN gRPC address should parse"),
+    };
+    // Bind before serving so a second EV-DO BTS on this host fails startup
+    // with the address conflict named, rather than reporting a running AN
+    // whose listener never came up.
+    let listener = tokio::net::TcpListener::bind(configured_addr)
+        .await
+        .map_err(|e| Error::from(format!("AN gRPC bind {configured_addr} failed: {e}")))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| Error::from(format!("AN gRPC local address unavailable: {e}")))?;
     let uati_subnet_assignment =
         hrpd_uati_subnet_assignment(overhead.sector_id, overhead.subnet_mask);
     let subnet = UatiSubnet {
@@ -321,34 +398,43 @@ pub fn spawn_nib_an_service(
         Some(hrpd_channel),
         Some(uati_subnet_assignment),
     )));
-    let service = AnServiceImpl::new_with_air(sessions, Arc::clone(&uati), Arc::clone(&air));
+    let service = AnServiceImpl::new_with_air(sessions, uati, air);
+    let cell = cdma_events::proto::CellId {
+        cell: u32::from(bts_config.overhead.base_id),
+        sector: u32::from(bts_config.sector),
+    };
     let service = match events_endpoint {
         Some(endpoint) => {
+            // One AN runs per cell, so the bus identity names the cell it
+            // serves and stays distinct across the ANs on a BSC.
+            let producer_instance = format!("an-{}-{}", cell.cell, cell.sector);
             let publisher = cdma_events::EventPublisher::spawn(
-                cdma_events::EventPublisherConfig::new(endpoint.to_string(), "an-0"),
+                cdma_events::EventPublisherConfig::new(endpoint.to_string(), producer_instance),
             )
             .map_err(|e| Error::from(format!("invalid AN events endpoint: {e}")))?;
             info!("HRPD AN events publishing to {endpoint}");
             let sink = Arc::new(cdma_an::events::AnEventSink::new(
                 publisher,
                 u32::from(overhead.color_code),
+                cell,
             ));
             service.with_events(sink)
         }
         None => service,
     };
+    let grpc_service = service.clone();
     tokio::spawn(async move {
-        info!("AN gRPC air/session service listening on {addr}");
+        info!("AN gRPC session/management service listening on {addr}");
         if let Err(err) = tonic::transport::Server::builder()
-            .add_service(service.into_server())
-            .serve(addr)
+            .add_service(grpc_service.into_server())
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await
         {
             log::error!("AN gRPC server error: {err}");
         }
     });
     info!(
-        "HRPD AN enabled: random UATI024 allocator on_air_mask=/{} color_code={} endpoint=http://{} traffic_channel=system_type=0x{:02x}/bc{}/ch{}",
+        "HRPD AN enabled: random UATI024 allocator on_air_mask=/{} color_code={} management=http://{} traffic_channel=system_type=0x{:02x}/bc{}/ch{}",
         overhead.subnet_mask,
         subnet.color_code,
         addr,
@@ -356,23 +442,22 @@ pub fn spawn_nib_an_service(
         hrpd_channel.band_class,
         hrpd_channel.channel_number
     );
-    Ok(Some((addr, air, uati)))
-}
-
-pub async fn connect_an_client(endpoint: &str) -> AnServiceClient<tonic::transport::Channel> {
-    loop {
-        match AnServiceClient::connect(endpoint.to_string()).await {
-            Ok(client) => return client,
-            Err(err) => {
-                warn!("HRPD AN bridge: connect to {endpoint} failed: {err}; retrying");
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
-        }
-    }
+    spawn_hrpd_air_tasks(
+        service.clone(),
+        channels,
+        a9_config,
+        hlr_repo,
+        overhead.color_code,
+        derived_imsi_config,
+    );
+    Ok(Some(HrpdAn {
+        grpc_addr: addr,
+        service,
+    }))
 }
 
 #[derive(Default)]
-pub struct HrpdStream1BridgeTiming {
+pub(crate) struct HrpdStream1BridgeTiming {
     window_started: Option<Instant>,
     samples: u64,
     decoded_timestamp_samples: u64,
@@ -382,24 +467,27 @@ pub struct HrpdStream1BridgeTiming {
     a8_octets: u64,
     queue_us_sum: u128,
     queue_us_max: u128,
-    rpc_us_sum: u128,
-    rpc_us_max: u128,
+    an_us_sum: u128,
+    an_us_max: u128,
     total_us_sum: u128,
     total_us_max: u128,
     air_to_decode_us_sum: u128,
     air_to_decode_us_max: u128,
-    air_to_rpc_done_us_sum: u128,
-    air_to_rpc_done_us_max: u128,
+    air_to_an_done_us_sum: u128,
+    air_to_an_done_us_max: u128,
     backlog_max: usize,
 }
 
 impl HrpdStream1BridgeTiming {
+    // The arguments are the per-event timing samples. Bundling them would
+    // allocate on the reverse hot path for one call site.
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &mut self,
         air_frame_end_received_at: Option<Instant>,
         decoded_at: Option<Instant>,
-        bridge_dequeued_at: Instant,
-        rpc_elapsed: Duration,
+        dequeued_at: Instant,
+        an_elapsed: Duration,
         octets: usize,
         a8_packets: usize,
         a8_octets: usize,
@@ -411,11 +499,11 @@ impl HrpdStream1BridgeTiming {
         self.octets += octets as u64;
         self.a8_packets += a8_packets as u64;
         self.a8_octets += a8_octets as u64;
-        self.rpc_us_sum += rpc_elapsed.as_micros();
-        self.rpc_us_max = self.rpc_us_max.max(rpc_elapsed.as_micros());
+        self.an_us_sum += an_elapsed.as_micros();
+        self.an_us_max = self.an_us_max.max(an_elapsed.as_micros());
         self.backlog_max = self.backlog_max.max(backlog);
         if let Some(decoded_at) = decoded_at {
-            let queue_us = bridge_dequeued_at
+            let queue_us = dequeued_at
                 .saturating_duration_since(decoded_at)
                 .as_micros();
             let total_us = now.saturating_duration_since(decoded_at).as_micros();
@@ -434,29 +522,29 @@ impl HrpdStream1BridgeTiming {
                 self.air_to_decode_us_sum += air_to_decode_us;
                 self.air_to_decode_us_max = self.air_to_decode_us_max.max(air_to_decode_us);
             }
-            let air_to_rpc_done_us = now.saturating_duration_since(air_received_at).as_micros();
-            self.air_to_rpc_done_us_sum += air_to_rpc_done_us;
-            self.air_to_rpc_done_us_max = self.air_to_rpc_done_us_max.max(air_to_rpc_done_us);
+            let air_to_an_done_us = now.saturating_duration_since(air_received_at).as_micros();
+            self.air_to_an_done_us_sum += air_to_an_done_us;
+            self.air_to_an_done_us_max = self.air_to_an_done_us_max.max(air_to_an_done_us);
         }
-        if window_started.elapsed() < Duration::from_secs(5) {
+        if window_started.elapsed() < HRPD_STREAM1_TIMING_WINDOW {
             return;
         }
         let decoded_samples = u128::from(self.decoded_timestamp_samples.max(1));
         let air_samples = u128::from(self.air_timestamp_samples.max(1));
         log::info!(
-            "HRPD Stream1 path timing: samples={} octets={} air_to_decode_us_avg={:.1} air_to_decode_us_max={} decode_to_bridge_us_avg={:.1} decode_to_bridge_us_max={} tonic_us_avg={:.1} tonic_us_max={} decode_to_rpc_done_us_avg={:.1} decode_to_rpc_done_us_max={} air_to_rpc_done_us_avg={:.1} air_to_rpc_done_us_max={} bridge_backlog_max={} a8_packets={} a8_octets={}",
+            "HRPD Stream1 path timing: samples={} octets={} air_to_decode_us_avg={:.1} air_to_decode_us_max={} decode_to_an_us_avg={:.1} decode_to_an_us_max={} an_handle_us_avg={:.1} an_handle_us_max={} decode_to_an_done_us_avg={:.1} decode_to_an_done_us_max={} air_to_an_done_us_avg={:.1} air_to_an_done_us_max={} queue_backlog_max={} a8_packets={} a8_octets={}",
             self.samples,
             self.octets,
             self.air_to_decode_us_sum as f64 / air_samples as f64,
             self.air_to_decode_us_max,
             self.queue_us_sum as f64 / decoded_samples as f64,
             self.queue_us_max,
-            self.rpc_us_sum as f64 / self.samples as f64,
-            self.rpc_us_max,
+            self.an_us_sum as f64 / self.samples as f64,
+            self.an_us_max,
             self.total_us_sum as f64 / decoded_samples as f64,
             self.total_us_max,
-            self.air_to_rpc_done_us_sum as f64 / air_samples as f64,
-            self.air_to_rpc_done_us_max,
+            self.air_to_an_done_us_sum as f64 / air_samples as f64,
+            self.air_to_an_done_us_max,
             self.backlog_max,
             self.a8_packets,
             self.a8_octets,
@@ -465,40 +553,59 @@ impl HrpdStream1BridgeTiming {
     }
 }
 
+fn forward_traffic_from_air_packet(
+    packet: hrpd_air::HrpdForwardTrafficPacket,
+) -> ForwardTrafficPacket {
+    ForwardTrafficPacket {
+        mac_index: packet.mac_index,
+        physical_layer_subtype: packet.physical_layer_subtype,
+        forward_traffic_mac_subtype: packet.forward_traffic_mac_subtype,
+        high_priority: false,
+        payload: packet.payload_bits,
+    }
+}
+
+fn forward_traffic_from_an_packet(packet: HrpdAnForwardTrafficPacket) -> ForwardTrafficPacket {
+    ForwardTrafficPacket {
+        mac_index: packet.mac_index,
+        physical_layer_subtype: packet.physical_layer_subtype,
+        forward_traffic_mac_subtype: packet.forward_traffic_mac_subtype,
+        high_priority: packet.high_priority,
+        payload: packet.payload,
+    }
+}
+
 /// Relay AN-side forward-traffic packets to the BTS scheduler, converting each
 /// to the scheduler's packet format. Runs until the AN or BTS queue closes.
 async fn relay_an_forward_traffic_to_bts(
     mut an_rx: tokio::sync::mpsc::UnboundedReceiver<HrpdAnForwardTrafficPacket>,
-    bts_tx: cdma_bts::bts::hrpd::scheduler::ForwardTrafficSender,
+    bts_tx: ForwardTrafficSender,
 ) {
     while let Some(packet) = an_rx.recv().await {
         if bts_tx.send(forward_traffic_from_an_packet(packet)).is_err() {
-            warn!("HRPD AN bridge: BTS forward-traffic queue closed");
+            warn!("HRPD AN: BTS forward-traffic queue closed");
             break;
         }
     }
 }
 
-pub fn spawn_hrpd_air_bridge(
-    an_addr: SocketAddr,
-    air: SharedHrpdAirController,
-    uati: SharedUatiAllocator,
-    access_rx: tokio::sync::mpsc::UnboundedReceiver<hrpd_air::HrpdAccessIndication>,
-    traffic_rx: tokio::sync::mpsc::UnboundedReceiver<hrpd_air::HrpdTrafficEvent>,
-    forward_tx: tokio::sync::mpsc::UnboundedSender<hrpd_air::HrpdForwardSignalingRequest>,
-    traffic_assignment_tx: tokio::sync::mpsc::UnboundedSender<
-        hrpd_air::HrpdTrafficAssignmentRequest,
-    >,
-    traffic_release_tx: tokio::sync::mpsc::UnboundedSender<hrpd_air::HrpdTrafficReleaseRequest>,
-    forward_traffic_tx: cdma_bts::bts::hrpd::scheduler::ForwardTrafficSender,
+fn spawn_hrpd_air_tasks(
+    service: AnServiceImpl,
+    channels: HrpdAirChannels,
     a9_config: Option<HrpdA9ClientConfig>,
     hlr_repo: Option<Arc<dyn cdma_hlr::repository::HlrRepository>>,
     color_code: u8,
     derived_imsi_config: HrpdDerivedImsiConfig,
 ) {
+    let HrpdAirChannels {
+        access_events: access_rx,
+        traffic_events: traffic_rx,
+        forward_signaling: forward_tx,
+        traffic_assignments: traffic_assignment_tx,
+        traffic_releases: traffic_release_tx,
+        forward_traffic: forward_traffic_tx,
+    } = channels;
     tokio::spawn(async move {
-        let endpoint = format!("http://{an_addr}");
-        let client = connect_an_client(&endpoint).await;
         let stream1_timing = HrpdStream1BridgeTiming::default();
         let (an_forward_traffic_tx, an_forward_traffic_rx) =
             tokio::sync::mpsc::unbounded_channel::<HrpdAnForwardTrafficPacket>();
@@ -516,23 +623,27 @@ pub fn spawn_hrpd_air_bridge(
             ) {
                 Ok(runtime) => Some(runtime),
                 Err(err) => {
-                    warn!("HRPD AN bridge: A8 bearer runtime disabled: {err}");
+                    error!(
+                        "HRPD AN: A8 bearer bind failed, packet data is unavailable on this cell: {err}"
+                    );
                     None
                 }
             },
             None => None,
         };
         let a9_endpoint = match a9_config {
-            Some(_) => match "127.0.0.1:0".parse::<SocketAddr>() {
+            // Wildcard, not loopback: the PCF may be on another host, and a
+            // loopback-bound socket cannot send off-host.
+            Some(_) => match "0.0.0.0:0".parse::<SocketAddr>() {
                 Ok(bind_addr) => match cdma_a9::UdpSignalingEndpoint::bind(bind_addr).await {
                     Ok(endpoint) => Some(endpoint),
                     Err(err) => {
-                        warn!("HRPD AN bridge: failed to bind ephemeral A9 client: {err}");
+                        warn!("HRPD AN: failed to bind ephemeral A9 client: {err}");
                         None
                     }
                 },
                 Err(err) => {
-                    warn!("HRPD AN bridge: invalid ephemeral A9 bind address: {err}");
+                    warn!("HRPD AN: invalid ephemeral A9 bind address: {err}");
                     None
                 }
             },
@@ -546,9 +657,7 @@ pub fn spawn_hrpd_air_bridge(
             Arc::new(Mutex::new(HashSet::new()));
         let (a9_release_tx, a9_release_rx) =
             tokio::sync::mpsc::unbounded_channel::<HrpdA9ReleaseRequest>();
-        let traffic_endpoint = endpoint.clone();
-        let traffic_air = Arc::clone(&air);
-        let traffic_uati = Arc::clone(&uati);
+        let traffic_service = service.clone();
         let traffic_a8_runtime = an_a8_runtime.clone();
         let traffic_forward_tx = forward_tx.clone();
         let traffic_forward_traffic_tx = forward_traffic_tx.clone();
@@ -559,14 +668,12 @@ pub fn spawn_hrpd_air_bridge(
         let traffic_hlr_repo = hlr_repo.clone();
         let traffic_derived_imsi_config = derived_imsi_config.clone();
         tokio::spawn(hrpd_an_traffic_event_task(
-            traffic_endpoint,
+            traffic_service,
             a9_config,
             a9_endpoint,
             traffic_rx,
             a9_release_rx,
             stream1_timing,
-            traffic_air,
-            traffic_uati,
             traffic_a8_runtime,
             traffic_forward_tx,
             traffic_forward_traffic_tx,
@@ -578,8 +685,7 @@ pub fn spawn_hrpd_air_bridge(
             traffic_derived_imsi_config,
         ));
         hrpd_an_access_task(
-            client,
-            endpoint,
+            service,
             access_rx,
             forward_tx,
             traffic_assignment_tx,
@@ -599,21 +705,20 @@ pub fn spawn_hrpd_air_bridge(
     });
 }
 
-/// Drive the AN-side traffic-event loop: unsolicited A9 datagrams, AN traffic
-/// responses, and the periodic air timer, until the AN traffic stream closes.
+/// Drive the AN-side traffic-event loop: unsolicited A9 datagrams, reverse
+/// traffic events, and the periodic air timer, until the BTS traffic stream
+/// closes.
 #[allow(clippy::too_many_arguments)]
 async fn hrpd_an_traffic_event_task(
-    traffic_endpoint: String,
+    service: AnServiceImpl,
     a9_config: Option<HrpdA9ClientConfig>,
     a9_endpoint: Option<cdma_a9::UdpSignalingEndpoint>,
     mut traffic_rx: tokio::sync::mpsc::UnboundedReceiver<hrpd_air::HrpdTrafficEvent>,
     mut a9_release_rx: tokio::sync::mpsc::UnboundedReceiver<HrpdA9ReleaseRequest>,
     mut stream1_timing: HrpdStream1BridgeTiming,
-    traffic_air: SharedHrpdAirController,
-    traffic_uati: SharedUatiAllocator,
     traffic_a8_runtime: Option<HrpdAnA8Runtime>,
     traffic_forward_tx: tokio::sync::mpsc::UnboundedSender<hrpd_air::HrpdForwardSignalingRequest>,
-    traffic_forward_traffic_tx: cdma_bts::bts::hrpd::scheduler::ForwardTrafficSender,
+    traffic_forward_traffic_tx: ForwardTrafficSender,
     traffic_release_tx_for_traffic: tokio::sync::mpsc::UnboundedSender<
         hrpd_air::HrpdTrafficReleaseRequest,
     >,
@@ -623,16 +728,15 @@ async fn hrpd_an_traffic_event_task(
     traffic_hlr_repo: Option<Arc<dyn cdma_hlr::repository::HlrRepository>>,
     traffic_derived_imsi_config: HrpdDerivedImsiConfig,
 ) {
-    let mut client = connect_an_client(&traffic_endpoint).await;
     let mut a9_sequence_no = 0u32;
     let mut traffic_open_uatis: HashSet<u32> = HashSet::new();
     let mut default_packet_flow_open_uatis: HashSet<u32> = HashSet::new();
     let mut active_a9_sessions: HashMap<u32, HrpdA9ReleaseContext> = HashMap::new();
     let mut unsolicited_a9_buf = vec![0u8; 4096];
-    let mut air_timer = tokio::time::interval(Duration::from_millis(100));
+    let mut air_timer = tokio::time::interval(HRPD_AN_TIMER_INTERVAL);
     air_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        let response = tokio::select! {
+        let outcome: HrpdTrafficOutcome = tokio::select! {
             a9 = async {
                 match a9_endpoint.as_ref() {
                     Some(endpoint) => endpoint.recv_datagram(&mut unsolicited_a9_buf).await,
@@ -705,20 +809,15 @@ async fn hrpd_an_traffic_event_task(
                 }
                 traffic_open_uatis.remove(&uati);
                 forget_default_packet_flow_open(&mut default_packet_flow_open_uatis, uati);
-                let outcome = {
-                    let mut air = traffic_air.lock().await;
-                    air.handle_a9_disconnect_a8(
-                        uati,
-                        context.con_ref().0,
-                        disconnect.cause.0,
-                    )
-                };
+                let outcome = service
+                    .handle_a9_disconnect_a8(uati, context.con_ref().0, disconnect.cause.0)
+                    .await;
                 info!(
                     "HRPD AN A9: handled DisconnectA8 UATI=0x{uati:08x} MAC={} cause=0x{:02x}",
                     context.con_ref().0,
                     disconnect.cause.0
                 );
-                traffic_outcome_to_proto(outcome)
+                outcome
             }
             release = a9_release_rx.recv() => {
                 let Some(release) = release else {
@@ -768,92 +867,63 @@ async fn hrpd_an_traffic_event_task(
                 {
                     runtime.update_drc(*uati, *drc_index);
                 }
-                let bridge_dequeued_at = Instant::now();
-                let proto = traffic_event_to_proto(event);
-                let rpc_started_at = Instant::now();
-                let response = match client.handle_traffic_event(proto.clone()).await {
-                    Ok(response) => Ok(response),
-                    Err(err) => {
-                        warn!("HRPD AN bridge: traffic RPC failed: {err}; reconnecting");
-                        client = connect_an_client(&traffic_endpoint).await;
-                        client.handle_traffic_event(proto).await
-                    }
-                };
-                match response {
-                    Ok(response) => {
-                        let response = response.into_inner();
-                        if let Some((air_received_at, decoded_at, octets, backlog)) =
-                            stream1_context
-                        {
-                            stream1_timing.record(
-                                air_received_at,
-                                decoded_at,
-                                bridge_dequeued_at,
-                                rpc_started_at.elapsed(),
-                                octets,
-                                response.a8_uplink.len(),
-                                response
-                                    .a8_uplink
-                                    .iter()
-                                    .map(|packet| packet.payload.len())
-                                    .sum(),
-                                backlog,
-                            );
-                        }
-                        response
-                    }
-                    Err(err) => {
-                        warn!("HRPD AN bridge: traffic RPC retry failed: {err}");
-                        continue;
-                    }
+                let dequeued_at = Instant::now();
+                let outcome = service.handle_traffic(&event).await;
+                if let Some((air_received_at, decoded_at, octets, backlog)) = stream1_context {
+                    stream1_timing.record(
+                        air_received_at,
+                        decoded_at,
+                        dequeued_at,
+                        dequeued_at.elapsed(),
+                        octets,
+                        outcome.a8_uplink.len(),
+                        outcome
+                            .a8_uplink
+                            .iter()
+                            .map(|packet| packet.payload.len())
+                            .sum(),
+                        backlog,
+                    );
                 }
+                outcome
             }
             _ = air_timer.tick() => {
-                let outcome = {
-                    let mut air = traffic_air.lock().await;
-                    let mut allocator = traffic_uati.lock().await;
-                    air.handle_timer_with_allocator(Instant::now(), &mut allocator)
-                };
-                if outcome == cdma_an::air::HrpdTrafficOutcome::default() {
+                let outcome = service.handle_air_timer(Instant::now()).await;
+                if outcome == HrpdTrafficOutcome::default() {
                     continue;
                 }
-                traffic_outcome_to_proto(outcome)
+                outcome
             }
         };
-        if response.unknown_session_count > 0 {
+        if outcome.unknown_session_count > 0 {
             warn!(
-                "HRPD AN bridge: traffic event for {} unknown HRPD session(s)",
-                response.unknown_session_count
+                "HRPD AN: traffic event for {} unknown HRPD session(s)",
+                outcome.unknown_session_count
             );
         }
-        let hardware_id_responses = response.hardware_id_responses;
-        for uati in response.session_configuration_pending_uatis {
+        let hardware_id_responses = outcome.hardware_id_responses;
+        for uati in outcome.session_configuration_pending_uatis {
             if let Some(runtime) = traffic_a8_runtime.as_ref() {
                 runtime.set_traffic_configuration_pending(uati, true);
             }
         }
-        let session_configuration_complete_uatis = response.session_configuration_complete_uatis;
+        let session_configuration_complete_uatis = outcome.session_configuration_complete_uatis;
         let mut session_configuration_complete_events =
-            response.session_configuration_complete_events;
+            outcome.session_configuration_complete_events;
         if session_configuration_complete_events.is_empty() {
             session_configuration_complete_events = session_configuration_complete_uatis
                 .into_iter()
-                .map(|uati| an_proto::HrpdSessionConfigurationCompleteEvent {
+                .map(|uati| HrpdSessionConfigurationCompleteEvent {
                     uati,
-                    full_uati: None,
-                    receive_ati: uati,
                     physical_layer_subtype: 0,
                     forward_traffic_mac_subtype: 0,
-                    idle_preferred_control_channel_cycle_enabled: false,
-                    idle_preferred_control_channel_cycle: 0,
-                    idle_page_period_cycles: u32::from(
-                        HRPD_ENHANCED_IDLE_DEFAULT_PAGE_PERIOD_CYCLES,
-                    ),
+                    idle_preferred_control_channel_cycle: None,
+                    idle_page_period_cycles: HRPD_ENHANCED_IDLE_DEFAULT_PAGE_PERIOD_CYCLES,
                 })
                 .collect();
         }
         let mut released_traffic_uatis: HashSet<u32> = HashSet::new();
-        for uati in response.session_closed_uatis {
+        for uati in outcome.session_closed_uatis {
             released_traffic_uatis.insert(uati);
             traffic_open_uatis.remove(&uati);
             forget_default_packet_flow_open(&mut default_packet_flow_open_uatis, uati);
@@ -871,7 +941,7 @@ async fn hrpd_an_traffic_event_task(
                 runtime.release_session(uati);
             }
         }
-        for uati in response.traffic_channel_closed_uatis {
+        for uati in outcome.traffic_channel_closed_uatis {
             let first_close_for_uati = released_traffic_uatis.insert(uati);
             traffic_open_uatis.remove(&uati);
             forget_default_packet_flow_open(&mut default_packet_flow_open_uatis, uati);
@@ -880,18 +950,8 @@ async fn hrpd_an_traffic_event_task(
                 runtime.set_traffic_channel_open(uati, false);
             }
         }
-        for release in response.traffic_releases {
+        for release in outcome.traffic_releases {
             let first_close_for_uati = released_traffic_uatis.insert(release.uati);
-            let mac_index = match u8::try_from(release.mac_index) {
-                Ok(mac_index) => mac_index,
-                Err(_) => {
-                    warn!(
-                        "HRPD AN bridge: dropping traffic release with invalid mac_index={}",
-                        release.mac_index
-                    );
-                    continue;
-                }
-            };
             traffic_open_uatis.remove(&release.uati);
             forget_default_packet_flow_open(&mut default_packet_flow_open_uatis, release.uati);
             traffic_pending_a9_sessions
@@ -901,31 +961,25 @@ async fn hrpd_an_traffic_event_task(
             if first_close_for_uati && let Some(runtime) = traffic_a8_runtime.as_ref() {
                 runtime.set_traffic_channel_open(release.uati, false);
             }
-            if traffic_release_tx_for_traffic
-                .send(hrpd_air::HrpdTrafficReleaseRequest {
-                    uati: release.uati,
-                    mac_index,
-                })
-                .is_err()
-            {
-                warn!("HRPD AN bridge: BTS traffic-release queue closed");
+            if traffic_release_tx_for_traffic.send(release).is_err() {
+                warn!("HRPD AN: BTS traffic-release queue closed");
                 return;
             }
         }
-        for uati in response.default_packet_flow_open_uatis {
+        for uati in outcome.default_packet_flow_open_uatis {
             remember_default_packet_flow_open(&mut default_packet_flow_open_uatis, uati);
             if let Some(runtime) = traffic_a8_runtime.as_ref() {
                 runtime.set_default_packet_flow_open(uati, true);
             }
         }
-        for uati in response.traffic_channel_open_uatis {
+        for uati in outcome.traffic_channel_open_uatis {
             traffic_open_uatis.insert(uati);
             if let Some(runtime) = traffic_a8_runtime.as_ref() {
                 runtime.set_traffic_channel_open(uati, true);
             }
             if a9_config.is_some() {
                 info!(
-                    "HRPD AN bridge: traffic channel open UATI=0x{uati:08x}; A9 SetupA8 waits for identity + SessionConfigurationComplete"
+                    "HRPD AN: traffic channel open UATI=0x{uati:08x}; A9 SetupA8 waits for identity + SessionConfigurationComplete"
                 );
             }
             let pending = {
@@ -973,153 +1027,86 @@ async fn hrpd_an_traffic_event_task(
                 }
             }
         }
-        for uati in response.default_packet_flow_closed_uatis {
+        for uati in outcome.default_packet_flow_closed_uatis {
             forget_default_packet_flow_open(&mut default_packet_flow_open_uatis, uati);
             if let Some(runtime) = traffic_a8_runtime.as_ref() {
                 runtime.set_default_packet_flow_open(uati, false);
             }
         }
-        for config in response.default_packet_stream_configurations {
-            let (Ok(stream_id), Ok(protocol_type)) = (
-                u8::try_from(config.stream_id),
-                u8::try_from(config.protocol_type),
-            ) else {
-                warn!(
-                    "HRPD AN bridge: dropping invalid DefaultPacket stream config UATI=0x{:08x} stream={} protocol=0x{:x}",
-                    config.uati, config.stream_id, config.protocol_type
-                );
-                continue;
-            };
+        for config in outcome.default_packet_stream_configurations {
             if let Some(runtime) = traffic_a8_runtime.as_ref() {
                 runtime.set_default_packet_stream_configuration(
                     config.uati,
-                    stream_id,
-                    protocol_type,
+                    config.stream_id,
+                    config.protocol_type,
                 );
             }
         }
-        for ack in response.default_packet_data_ready_acks {
+        for ack in outcome.default_packet_data_ready_acks {
             if let Some(runtime) = traffic_a8_runtime.as_ref() {
-                let transaction_id = match u8::try_from(ack.transaction_id) {
-                    Ok(transaction_id) => transaction_id,
-                    Err(_) => {
-                        warn!(
-                            "HRPD AN bridge: dropping traffic DataReadyAck UATI=0x{:08x} with invalid transaction_id=0x{:x}",
-                            ack.uati, ack.transaction_id
-                        );
-                        continue;
-                    }
-                };
-                runtime.default_packet_data_ready_ack(ack.uati, transaction_id);
+                runtime.default_packet_data_ready_ack(ack.uati, ack.transaction_id);
             }
         }
-        for uati in response.default_packet_rlp_reset_uatis {
+        for uati in outcome.default_packet_rlp_reset_uatis {
             if let Some(runtime) = traffic_a8_runtime.as_ref() {
                 runtime.reset_default_packet_rlp(uati);
             }
         }
-        for nak in response.default_packet_rlp_naks {
+        for nak in outcome.default_packet_rlp_naks {
             if let Some(runtime) = traffic_a8_runtime.as_ref() {
-                let mut requests = Vec::with_capacity(nak.requests.len());
-                for request in nak.requests {
-                    let Ok(window_len) = u16::try_from(request.window_len) else {
-                        warn!(
-                            "HRPD AN bridge: dropping invalid DefaultPacket RLP Nak request UATI=0x{:08x} first_erased={} window_len={}",
-                            nak.uati, request.first_erased, request.window_len
-                        );
-                        continue;
-                    };
-                    requests.push(hrpd_air::HrpdDefaultPacketRlpNakRequest {
-                        first_erased: request.first_erased,
-                        window_len,
-                    });
-                }
-                runtime.retransmit_default_packet_rlp(nak.uati, requests);
+                runtime.retransmit_default_packet_rlp(nak.uati, nak.requests);
             }
         }
-        let count = response.a8_uplink.len();
-        for packet in response.a8_uplink {
+        let count = outcome.a8_uplink.len();
+        for packet in outcome.a8_uplink {
             if let Some(runtime) = traffic_a8_runtime.as_ref() {
                 runtime.send_uplink(packet.uati, packet.payload);
             } else {
                 warn!(
-                    "HRPD AN bridge: dropping Stream 1 uplink UATI=0x{:08x}; A8 runtime unavailable",
+                    "HRPD AN: dropping Stream 1 uplink UATI=0x{:08x}; A8 runtime unavailable",
                     packet.uati
                 );
             }
         }
         if count > 0 {
-            log::debug!("HRPD AN bridge: queued {count} A8 uplink packet(s)");
+            log::debug!("HRPD AN: queued {count} A8 uplink packet(s)");
         }
-        let count = response.forward_signaling.len();
-        for request in response.forward_signaling {
-            match forward_signaling_from_proto(request) {
-                Ok(request) => {
-                    if traffic_forward_tx.send(request).is_err() {
-                        warn!(
-                            "HRPD AN bridge: forward signaling channel closed while handling traffic event"
-                        );
-                    }
-                }
-                Err(err) => {
-                    warn!("HRPD AN bridge: invalid forward signaling from traffic event: {err}")
-                }
+        let count = outcome.forward_signaling.len();
+        for request in outcome.forward_signaling {
+            if traffic_forward_tx.send(request).is_err() {
+                warn!("HRPD AN: forward signaling channel closed while handling traffic event");
             }
         }
         if count > 0 {
-            info!("HRPD AN bridge: queued {count} forward signaling packet(s) from traffic event");
+            info!("HRPD AN: queued {count} forward signaling packet(s) from traffic event");
         }
-        let count = response.forward_traffic.len();
-        for packet in response.forward_traffic {
+        let count = outcome.forward_traffic.len();
+        for packet in outcome.forward_traffic {
             if released_traffic_uatis.contains(&packet.uati) {
                 info!(
-                    "HRPD AN bridge: dropping forward traffic packet for released UATI=0x{:08x} mac_index={}",
+                    "HRPD AN: dropping forward traffic packet for released UATI=0x{:08x} mac_index={}",
                     packet.uati, packet.mac_index
                 );
                 continue;
             }
-            match forward_traffic_from_proto(packet) {
-                Ok(packet) => {
-                    if traffic_forward_traffic_tx.send(packet).is_err() {
-                        warn!(
-                            "HRPD AN bridge: forward traffic channel closed while handling traffic event"
-                        );
-                    }
-                }
-                Err(err) => warn!(
-                    "HRPD AN bridge: invalid forward traffic packet from traffic event: {err}"
-                ),
+            if traffic_forward_traffic_tx
+                .send(forward_traffic_from_air_packet(packet))
+                .is_err()
+            {
+                warn!("HRPD AN: forward traffic channel closed while handling traffic event");
             }
         }
         if count > 0 {
-            log::debug!(
-                "HRPD AN bridge: queued {count} forward traffic packet(s) from traffic event"
-            );
+            log::debug!("HRPD AN: queued {count} forward traffic packet(s) from traffic event");
         }
         for hardware in hardware_id_responses {
-            let Some(response) = hardware.hardware_id_response else {
+            let Some(hardware_identity) = hardware_identity_from_response(&hardware.response)
+            else {
                 warn!(
-                    "HRPD AN bridge: traffic HardwareIDResponse UATI=0x{:08x} missing body",
-                    hardware.uati
-                );
-                continue;
-            };
-            let response = match hardware_id_response_from_proto(response) {
-                Ok(response) => response,
-                Err(err) => {
-                    warn!(
-                        "HRPD AN bridge: invalid traffic HardwareIDResponse UATI=0x{:08x}: {err}",
-                        hardware.uati
-                    );
-                    continue;
-                }
-            };
-            let Some(hardware_identity) = hardware_identity_from_response(&response) else {
-                warn!(
-                    "HRPD AN bridge: unsupported/null traffic HardwareIDResponse UATI=0x{:08x} type=0x{:06x} len={}",
+                    "HRPD AN: unsupported/null traffic HardwareIDResponse UATI=0x{:08x} type=0x{:06x} len={}",
                     hardware.uati,
-                    response.hardware_id_type,
-                    response.hardware_id_value.len()
+                    hardware.response.hardware_id_type,
+                    hardware.response.hardware_id_value.len()
                 );
                 continue;
             };
@@ -1129,7 +1116,7 @@ async fn hrpd_an_traffic_event_task(
             };
             let Some(mut pending) = pending else {
                 info!(
-                    "HRPD AN bridge: observed HardwareIDResponse UATI=0x{:08x} with no pending A9 setup hardware={hardware_identity:?}",
+                    "HRPD AN: observed HardwareIDResponse UATI=0x{:08x} with no pending A9 setup hardware={hardware_identity:?}",
                     hardware.uati
                 );
                 continue;
@@ -1141,7 +1128,7 @@ async fn hrpd_an_traffic_event_task(
             )
             .await;
             info!(
-                "HRPD AN bridge: A9 identity for UATI=0x{:08x}: imsi_present={} esn={:?} meid_present={}",
+                "HRPD AN: A9 identity for UATI=0x{:08x}: imsi_present={} esn={:?} meid_present={}",
                 hardware.uati,
                 identity.imsi.is_some(),
                 identity.esn,
@@ -1176,7 +1163,7 @@ async fn hrpd_an_traffic_event_task(
                 }
             } else {
                 info!(
-                    "HRPD AN bridge: deferring A9 SetupA8 UATI=0x{:08x}; waiting for SessionConfigurationComplete",
+                    "HRPD AN: deferring A9 SetupA8 UATI=0x{:08x}; waiting for SessionConfigurationComplete",
                     hardware.uati
                 );
                 let mut sessions = traffic_pending_a9_sessions.lock().await;
@@ -1185,69 +1172,22 @@ async fn hrpd_an_traffic_event_task(
         }
         for event in session_configuration_complete_events {
             let uati = event.uati;
-            let session_uati = event
-                .full_uati
-                .as_ref()
-                .map(|full_uati| full_uati.compact_uati32)
-                .unwrap_or_else(|| session_uati_from_hrpd_traffic_uati(uati));
-            let physical_layer_subtype = match u16::try_from(event.physical_layer_subtype) {
-                Ok(value) => value,
-                Err(_) => {
-                    warn!(
-                        "HRPD AN bridge: rejecting invalid SessionConfigurationComplete physical subtype UATI=0x{uati:08x} physical_subtype=0x{:x}",
-                        event.physical_layer_subtype
-                    );
-                    continue;
-                }
-            };
-            let forward_traffic_mac_subtype = match u16::try_from(event.forward_traffic_mac_subtype)
-            {
-                Ok(value) => value,
-                Err(_) => {
-                    warn!(
-                        "HRPD AN bridge: rejecting invalid SessionConfigurationComplete FTC MAC subtype UATI=0x{uati:08x} ftc_mac_subtype=0x{:x}",
-                        event.forward_traffic_mac_subtype
-                    );
-                    continue;
-                }
-            };
-            let idle_preferred_control_channel_cycle = if event
-                .idle_preferred_control_channel_cycle_enabled
-            {
-                match u16::try_from(event.idle_preferred_control_channel_cycle) {
-                    Ok(value) => Some(value),
-                    Err(_) => {
-                        warn!(
-                            "HRPD AN bridge: invalid SessionConfigurationComplete idle preferred cycle UATI=0x{uati:08x} cycle={}; disabling preferred-cycle paging",
-                            event.idle_preferred_control_channel_cycle
-                        );
-                        None
-                    }
-                }
+            let session_uati = session_uati_from_hrpd_traffic_uati(uati);
+            let idle_page_period_cycles = if event.idle_page_period_cycles > 0 {
+                event.idle_page_period_cycles
             } else {
-                None
-            };
-            let idle_page_period_cycles = match u16::try_from(event.idle_page_period_cycles)
-                .ok()
-                .filter(|period| *period > 0)
-            {
-                Some(period) => period,
-                None => {
-                    warn!(
-                        "HRPD AN bridge: invalid SessionConfigurationComplete idle page period UATI=0x{uati:08x} period={}; using default {}",
-                        event.idle_page_period_cycles,
-                        HRPD_ENHANCED_IDLE_DEFAULT_PAGE_PERIOD_CYCLES
-                    );
-                    HRPD_ENHANCED_IDLE_DEFAULT_PAGE_PERIOD_CYCLES
-                }
+                warn!(
+                    "HRPD AN: SessionConfigurationComplete UATI=0x{uati:08x} carries a zero idle page period; using default {HRPD_ENHANCED_IDLE_DEFAULT_PAGE_PERIOD_CYCLES}"
+                );
+                HRPD_ENHANCED_IDLE_DEFAULT_PAGE_PERIOD_CYCLES
             };
             if let Some(runtime) = traffic_a8_runtime.as_ref() {
                 runtime.set_session_configuration_complete(
                     uati,
                     true,
-                    physical_layer_subtype,
-                    forward_traffic_mac_subtype,
-                    idle_preferred_control_channel_cycle,
+                    event.physical_layer_subtype,
+                    event.forward_traffic_mac_subtype,
+                    event.idle_preferred_control_channel_cycle,
                     idle_page_period_cycles,
                 );
             }
@@ -1265,7 +1205,7 @@ async fn hrpd_an_traffic_event_task(
             }
             let Some(mut pending) = pending else {
                 info!(
-                    "HRPD AN bridge: observed SessionConfigurationComplete UATI=0x{uati:08x} session_uati=0x{session_uati:08x} with no pending A9 setup"
+                    "HRPD AN: observed SessionConfigurationComplete UATI=0x{uati:08x} session_uati=0x{session_uati:08x} with no pending A9 setup"
                 );
                 continue;
             };
@@ -1300,23 +1240,21 @@ async fn hrpd_an_traffic_event_task(
             }
         }
     }
-    info!("HRPD AN bridge stopped: BTS traffic event channel closed");
+    info!("HRPD AN stopped: BTS traffic event channel closed");
 }
 
-/// Drive the AN-side access-indication loop: decode access-channel events,
-/// run A9 setup/release, and reconnect the AN client as needed, until the BTS
-/// access event stream closes.
+/// Drive the AN-side access-indication loop: run each access capsule through
+/// the AN and act on the outcome, until the BTS access event stream closes.
 #[allow(clippy::too_many_arguments)]
 async fn hrpd_an_access_task(
-    mut client: AnServiceClient<tonic::transport::Channel>,
-    endpoint: String,
+    service: AnServiceImpl,
     mut access_rx: tokio::sync::mpsc::UnboundedReceiver<hrpd_air::HrpdAccessIndication>,
     forward_tx: tokio::sync::mpsc::UnboundedSender<hrpd_air::HrpdForwardSignalingRequest>,
     traffic_assignment_tx: tokio::sync::mpsc::UnboundedSender<
         hrpd_air::HrpdTrafficAssignmentRequest,
     >,
     traffic_release_tx: tokio::sync::mpsc::UnboundedSender<hrpd_air::HrpdTrafficReleaseRequest>,
-    forward_traffic_tx: cdma_bts::bts::hrpd::scheduler::ForwardTrafficSender,
+    forward_traffic_tx: ForwardTrafficSender,
     a9_config: Option<HrpdA9ClientConfig>,
     hlr_repo: Option<Arc<dyn cdma_hlr::repository::HlrRepository>>,
     color_code: u8,
@@ -1331,7 +1269,6 @@ async fn hrpd_an_access_task(
     let access_session_a9_identities = session_a9_identities.clone();
     let access_session_a9_config_complete = session_a9_config_complete.clone();
     let access_a9_release_tx = a9_release_tx.clone();
-    info!("HRPD AN bridge connected to {endpoint}");
     while let Some(indication) = access_rx.recv().await {
         let access_uati = uati_from_access_ati(indication.ati, color_code);
         let access_uati_complete_uati = access_uati.filter(|_| {
@@ -1345,7 +1282,7 @@ async fn hrpd_an_access_task(
             let data_ready_acks = access_default_packet_data_ready_acks(&indication);
             if !data_ready_acks.is_empty() {
                 info!(
-                    "HRPD AN bridge: decoded access DefaultPacket DataReadyAck UATI=0x{uati:08x} transactions={}",
+                    "HRPD AN: decoded access DefaultPacket DataReadyAck UATI=0x{uati:08x} transactions={}",
                     data_ready_acks
                         .iter()
                         .map(|transaction| format!("0x{transaction:02x}"))
@@ -1360,7 +1297,7 @@ async fn hrpd_an_access_task(
             for open in access_default_packet_flow_requests(&indication) {
                 let traffic_uati = hrpd_traffic_uati_from_session_uati(uati, color_code);
                 info!(
-                    "HRPD AN bridge: decoded access DefaultPacket {} UATI=0x{uati:08x} traffic_uati=0x{traffic_uati:08x}",
+                    "HRPD AN: decoded access DefaultPacket {} UATI=0x{uati:08x} traffic_uati=0x{traffic_uati:08x}",
                     if open { "XonRequest" } else { "XoffRequest" }
                 );
                 if let Some(runtime) = an_a8_runtime.as_ref() {
@@ -1371,7 +1308,7 @@ async fn hrpd_an_access_task(
                 if let hrpd_air::HrpdAccessMessage::HardwareIdResponse(response) = message {
                     if let Some(hardware) = hardware_identity_from_response(response) {
                         info!(
-                            "HRPD AN bridge: observed HardwareIDResponse UATI=0x{uati:08x} hardware={hardware:?}"
+                            "HRPD AN: observed HardwareIDResponse UATI=0x{uati:08x} hardware={hardware:?}"
                         );
                         hardware_by_uati.insert(uati, hardware.clone());
                         let identity = resolve_hrpd_a9_identity(
@@ -1381,7 +1318,7 @@ async fn hrpd_an_access_task(
                         )
                         .await;
                         info!(
-                            "HRPD AN bridge: A9 identity from access HardwareIDResponse UATI=0x{uati:08x}: imsi_present={} esn={:?} meid_present={}",
+                            "HRPD AN: A9 identity from access HardwareIDResponse UATI=0x{uati:08x}: imsi_present={} esn={:?} meid_present={}",
                             identity.imsi.is_some(),
                             identity.esn,
                             identity.meid.is_some()
@@ -1395,7 +1332,7 @@ async fn hrpd_an_access_task(
                             sessions.get_mut(&uati).map(|pending| {
                                     if pending.identity.is_none() {
                                         info!(
-                                            "HRPD AN bridge: applying access HardwareIDResponse identity to pending A9 setup UATI=0x{uati:08x}"
+                                            "HRPD AN: applying access HardwareIDResponse identity to pending A9 setup UATI=0x{uati:08x}"
                                         );
                                     }
                                     pending.identity = Some(identity.clone());
@@ -1408,7 +1345,7 @@ async fn hrpd_an_access_task(
                         }
                     } else {
                         warn!(
-                            "HRPD AN bridge: unsupported/null HardwareIDResponse UATI=0x{uati:08x} type=0x{:06x} len={}",
+                            "HRPD AN: unsupported/null HardwareIDResponse UATI=0x{uati:08x} type=0x{:06x} len={}",
                             response.hardware_id_type,
                             response.hardware_id_value.len()
                         );
@@ -1416,46 +1353,37 @@ async fn hrpd_an_access_task(
                 }
             }
         }
-        let proto = access_indication_to_proto(indication);
-        let response = match client.handle_access_indication(proto.clone()).await {
-            Ok(response) => Ok(response),
+        let outcome = match service.handle_access(&indication).await {
+            Ok(outcome) => outcome,
             Err(err) => {
-                warn!("HRPD AN bridge: access RPC failed: {err}; reconnecting");
-                client = connect_an_client(&endpoint).await;
-                client.handle_access_indication(proto).await
-            }
-        };
-        let response = match response {
-            Ok(response) => response.into_inner(),
-            Err(err) => {
-                warn!("HRPD AN bridge: access RPC retry failed: {err}");
+                warn!("HRPD AN: access indication rejected: {err}");
                 continue;
             }
         };
-        if response.connection_request_count > 0
-            || !response.traffic_assignments.is_empty()
-            || !response.traffic_releases.is_empty()
-            || !response.forward_traffic.is_empty()
+        if !outcome.connection_requests.is_empty()
+            || !outcome.traffic_assignments.is_empty()
+            || !outcome.traffic_releases.is_empty()
+            || !outcome.forward_traffic.is_empty()
         {
             info!(
-                "HRPD AN bridge: access outcome connection_requests={} traffic_assignments={} traffic_releases={} forward_signaling={} forward_traffic={}",
-                response.connection_request_count,
-                response.traffic_assignments.len(),
-                response.traffic_releases.len(),
-                response.forward_signaling.len(),
-                response.forward_traffic.len()
+                "HRPD AN: access outcome connection_requests={} traffic_assignments={} traffic_releases={} forward_signaling={} forward_traffic={}",
+                outcome.connection_requests.len(),
+                outcome.traffic_assignments.len(),
+                outcome.traffic_releases.len(),
+                outcome.forward_signaling.len(),
+                outcome.forward_traffic.len()
             );
         }
-        let traffic_assignment_uatis = response
+        let traffic_assignment_uatis = outcome
             .traffic_assignments
             .iter()
             .map(|request| request.uati)
             .collect::<HashSet<_>>();
-        let address_assignment_uatis = response
+        let address_assignment_uatis = outcome
             .forward_signaling
             .iter()
             .filter(|request| {
-                request.protocol_type == u32::from(HRPD_ADDRESS_MANAGEMENT_PROTOCOL_TYPE)
+                request.protocol_type == HRPD_ADDRESS_MANAGEMENT_PROTOCOL_TYPE
                     && request.payload.first().copied() == Some(HRPD_UATI_ASSIGNMENT_MESSAGE_ID)
             })
             .filter_map(|request| request.uati)
@@ -1474,32 +1402,32 @@ async fn hrpd_an_access_task(
                 .any(|assigned| (assigned & 0x00ff_ffff) != (old_uati & 0x00ff_ffff));
             if changes_receive_uati {
                 info!(
-                    "HRPD AN bridge: address management pending old_uati=0x{old_uati:08x} assignments=[{assignments}]; quiescing old-UATI packet-data paging"
+                    "HRPD AN: address management pending old_uati=0x{old_uati:08x} assignments=[{assignments}]; quiescing old-UATI packet-data paging"
                 );
             } else {
                 info!(
-                    "HRPD AN bridge: address management reaffirmed UATI=0x{old_uati:08x} assignments=[{assignments}]; holding packet-data paging until UATIComplete"
+                    "HRPD AN: address management reaffirmed UATI=0x{old_uati:08x} assignments=[{assignments}]; holding packet-data paging until UATIComplete"
                 );
             }
             runtime.set_address_management_pending(old_uati, true);
         }
-        let accepted_uati_complete = response.uati_complete_count > 0;
+        let accepted_uati_complete = !outcome.uati_completes.is_empty();
         if let Some(uati) = access_uati_complete_uati
             && let Some(runtime) = an_a8_runtime.as_ref()
         {
             if !accepted_uati_complete {
                 info!(
-                    "HRPD AN bridge: observed UATIComplete UATI=0x{uati:08x} but AN did not accept it as current; not retargeting A8 downlink"
+                    "HRPD AN: observed UATIComplete UATI=0x{uati:08x} but AN did not accept it as current; not retargeting A8 downlink"
                 );
             } else if traffic_assignment_uatis.contains(&uati) {
                 info!(
-                    "HRPD AN bridge: UATIComplete confirmed active UATI=0x{uati:08x} with traffic assignment pending; deferring stale A8 downlink retarget until traffic setup is marked pending"
+                    "HRPD AN: UATIComplete confirmed active UATI=0x{uati:08x} with traffic assignment pending; deferring stale A8 downlink retarget until traffic setup is marked pending"
                 );
                 runtime.set_traffic_setup_pending(uati, true);
                 runtime.set_address_management_pending(uati, false);
             } else {
                 info!(
-                    "HRPD AN bridge: UATIComplete confirmed active UATI=0x{uati:08x}; retargeting stale A8 downlink"
+                    "HRPD AN: UATIComplete confirmed active UATI=0x{uati:08x}; retargeting stale A8 downlink"
                 );
                 runtime.set_address_management_pending(uati, false);
                 runtime.retarget_stale_downlink_to_active_uati(uati);
@@ -1511,7 +1439,7 @@ async fn hrpd_an_access_task(
             && let Some(runtime) = an_a8_runtime.as_ref()
         {
             info!(
-                "HRPD AN bridge: synthesized UATIComplete accepted active UATI=0x{uati:08x}; clearing A8 address-management hold"
+                "HRPD AN: synthesized UATIComplete accepted active UATI=0x{uati:08x}; clearing A8 address-management hold"
             );
             if traffic_assignment_uatis.contains(&uati) {
                 runtime.set_traffic_setup_pending(uati, true);
@@ -1526,76 +1454,54 @@ async fn hrpd_an_access_task(
         for (uati, _) in access_data_ready_acks {
             if traffic_assignment_uatis.contains(&uati) {
                 info!(
-                    "HRPD AN bridge: access DataReadyAck confirms reachable UATI=0x{uati:08x} with traffic assignment pending; deferring stale A8 downlink retarget until traffic setup is marked pending"
+                    "HRPD AN: access DataReadyAck confirms reachable UATI=0x{uati:08x} with traffic assignment pending; deferring stale A8 downlink retarget until traffic setup is marked pending"
                 );
             } else if let Some(runtime) = an_a8_runtime.as_ref() {
                 info!(
-                    "HRPD AN bridge: access DataReadyAck confirms reachable UATI=0x{uati:08x}; retargeting stale A8 downlink"
+                    "HRPD AN: access DataReadyAck confirms reachable UATI=0x{uati:08x}; retargeting stale A8 downlink"
                 );
                 runtime.retarget_stale_downlink_to_active_uati(uati);
             }
         }
-        let count = response.forward_signaling.len();
-        for request in response.forward_signaling {
-            match forward_signaling_from_proto(request) {
-                Ok(request) => {
-                    if forward_tx.send(request).is_err() {
-                        warn!("HRPD AN bridge: BTS forward-signaling queue closed");
-                        return;
-                    }
-                }
-                Err(err) => warn!("HRPD AN bridge: dropping invalid AN response: {err}"),
+        let count = outcome.forward_signaling.len();
+        for request in outcome.forward_signaling {
+            if forward_tx.send(request).is_err() {
+                warn!("HRPD AN: BTS forward-signaling queue closed");
+                return;
             }
         }
         if count > 0 {
-            info!("HRPD AN bridge: queued {count} forward signaling message(s)");
+            info!("HRPD AN: queued {count} forward signaling message(s)");
         }
-        let count = response.forward_traffic.len();
-        for packet in response.forward_traffic {
-            match forward_traffic_from_proto(packet) {
-                Ok(packet) => {
-                    if forward_traffic_tx.send(packet).is_err() {
-                        warn!("HRPD AN bridge: BTS forward-traffic queue closed");
-                        return;
-                    }
-                }
-                Err(err) => warn!("HRPD AN bridge: dropping invalid forward traffic: {err}"),
+        let count = outcome.forward_traffic.len();
+        for packet in outcome.forward_traffic {
+            if forward_traffic_tx
+                .send(forward_traffic_from_air_packet(packet))
+                .is_err()
+            {
+                warn!("HRPD AN: BTS forward-traffic queue closed");
+                return;
             }
         }
         if count > 0 {
-            log::debug!("HRPD AN bridge: queued {count} forward traffic packet(s)");
+            log::debug!("HRPD AN: queued {count} forward traffic packet(s)");
         }
-        let count = response.traffic_releases.len();
-        for release in response.traffic_releases {
-            let mac_index = match u8::try_from(release.mac_index) {
-                Ok(mac_index) => mac_index,
-                Err(_) => {
-                    warn!(
-                        "HRPD AN bridge: dropping traffic release with invalid mac_index={}",
-                        release.mac_index
-                    );
-                    continue;
-                }
-            };
+        let count = outcome.traffic_releases.len();
+        for release in outcome.traffic_releases {
             if let Some(runtime) = an_a8_runtime.as_ref() {
                 runtime.set_traffic_channel_open(release.uati, false);
             }
-            if traffic_release_tx
-                .send(hrpd_air::HrpdTrafficReleaseRequest {
-                    uati: release.uati,
-                    mac_index,
-                })
-                .is_err()
-            {
-                warn!("HRPD AN bridge: BTS traffic-release queue closed");
+            let uati = release.uati;
+            if traffic_release_tx.send(release).is_err() {
+                warn!("HRPD AN: BTS traffic-release queue closed");
                 return;
             }
-            pending_a9_sessions.lock().await.remove(&release.uati);
+            pending_a9_sessions.lock().await.remove(&uati);
         }
         if count > 0 {
-            info!("HRPD AN bridge: queued {count} traffic release(s)");
+            info!("HRPD AN: queued {count} traffic release(s)");
         }
-        for uati in response.session_closed_uatis {
+        for uati in outcome.session_closed_uatis {
             let reason = "access SessionClose";
             if access_a9_release_tx
                 .send(HrpdA9ReleaseRequest {
@@ -1605,7 +1511,7 @@ async fn hrpd_an_access_task(
                 .is_err()
             {
                 warn!(
-                    "HRPD AN bridge: A9 release owner stopped before access SessionClose UATI=0x{uati:08x}; releasing local AN A8 state only"
+                    "HRPD AN: A9 release owner stopped before access SessionClose UATI=0x{uati:08x}; releasing local AN A8 state only"
                 );
                 if let Some(runtime) = an_a8_runtime.as_ref() {
                     runtime.release_session(uati);
@@ -1613,55 +1519,48 @@ async fn hrpd_an_access_task(
             }
             pending_a9_sessions.lock().await.remove(&uati);
         }
-        let count = response.traffic_assignments.len();
-        for request in response.traffic_assignments {
-            match traffic_assignment_from_proto(request) {
-                Ok(request) => {
-                    let session_uati = request.session_uati;
-                    let identity = {
-                        let identities = access_session_a9_identities.lock().await;
-                        cached_hrpd_a9_identity(&identities, session_uati, request.uati)
-                    };
-                    let session_configuration_complete = access_session_a9_config_complete
-                        .lock()
-                        .await
-                        .contains(&session_uati);
-                    if let Some(runtime) = an_a8_runtime.as_ref() {
-                        runtime.set_traffic_mac_index(request.uati, request.mac_index);
-                        runtime.set_traffic_setup_pending(request.uati, true);
-                        runtime.retarget_stale_downlink_to_active_uati(request.uati);
-                    }
-                    if a9_config.is_some() {
-                        let identity_cached = identity.is_some();
-                        pending_a9_sessions.lock().await.insert(
-                            request.uati,
-                            PendingHrpdA9Session {
-                                session_uati,
-                                request: request.clone(),
-                                identity,
-                                session_configuration_complete,
-                            },
-                        );
-                        info!(
-                            "HRPD AN bridge: deferred A9 SetupA8 UATI=0x{:08x} session_uati=0x{session_uati:08x} MAC={} identity_cached={} session_config_complete={session_configuration_complete}",
-                            request.uati, request.mac_index, identity_cached
-                        );
-                    }
-                    if traffic_assignment_tx.send(request.clone()).is_err() {
-                        warn!("HRPD AN bridge: BTS traffic-assignment queue closed");
-                        return;
-                    }
-                }
-                Err(err) => {
-                    warn!("HRPD AN bridge: dropping invalid traffic assignment: {err}")
-                }
+        let count = outcome.traffic_assignments.len();
+        for request in outcome.traffic_assignments {
+            let session_uati = request.session_uati;
+            let identity = {
+                let identities = access_session_a9_identities.lock().await;
+                cached_hrpd_a9_identity(&identities, session_uati, request.uati)
+            };
+            let session_configuration_complete = access_session_a9_config_complete
+                .lock()
+                .await
+                .contains(&session_uati);
+            if let Some(runtime) = an_a8_runtime.as_ref() {
+                runtime.set_traffic_mac_index(request.uati, request.mac_index);
+                runtime.set_traffic_setup_pending(request.uati, true);
+                runtime.retarget_stale_downlink_to_active_uati(request.uati);
+            }
+            if a9_config.is_some() {
+                let identity_cached = identity.is_some();
+                pending_a9_sessions.lock().await.insert(
+                    request.uati,
+                    PendingHrpdA9Session {
+                        session_uati,
+                        request: request.clone(),
+                        identity,
+                        session_configuration_complete,
+                    },
+                );
+                info!(
+                    "HRPD AN: deferred A9 SetupA8 UATI=0x{:08x} session_uati=0x{session_uati:08x} MAC={} identity_cached={} session_config_complete={session_configuration_complete}",
+                    request.uati, request.mac_index, identity_cached
+                );
+            }
+            if traffic_assignment_tx.send(request).is_err() {
+                warn!("HRPD AN: BTS traffic-assignment queue closed");
+                return;
             }
         }
         if count > 0 {
-            info!("HRPD AN bridge: queued {count} traffic assignment(s)");
+            info!("HRPD AN: queued {count} traffic assignment(s)");
         }
     }
-    info!("HRPD AN bridge stopped: BTS access event channel closed");
+    info!("HRPD AN stopped: BTS access event channel closed");
 }
 
 #[cfg(test)]

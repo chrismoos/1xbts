@@ -67,7 +67,7 @@ impl MtCallService {
         default_voice_service_option: u16,
         hlr_repo: &Arc<dyn HlrRepository>,
     ) {
-        let cic = circuits.assignment_circuit_identity_code_for_next_leg(call_id);
+        let cic = circuits.assignment_circuit_identity_code_for_next_leg();
         let tag_val = response.tag.map(|t| t.0).unwrap_or(call_id.0 as u32);
         let mt_plan = if secondary_leg {
             None
@@ -248,7 +248,7 @@ impl MtCallService {
             call_id.0, circuit_id, circuits.circuits[&circuit_id].leg_role
         );
         if let Err(error) = a1
-            .send_to_bsc(EncodedA1Message::from_message_for_call(
+            .send(EncodedA1Message::from_message_for_call(
                 &cdma_ios::Message::new(cdma_ios::MessageType::AssignmentRequest, payload),
                 Some(call_id.0),
             ))

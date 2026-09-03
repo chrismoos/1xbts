@@ -18,8 +18,8 @@ function modeLabel(mode: number): string {
   }
 }
 
-/// Presentational EV-DO carrier card. Pure (no hooks), so both the server
-/// `/config` page and the client `/hrpd` page can render it.
+/// Presentational EV-DO carrier card. Pure (no hooks), so the `/hrpd` page and
+/// the per-cell config view can both render it.
 export function EvdoCarrierCard({ evdo }: { evdo?: EvdoCarrierConfig | null }) {
   if (!evdo) return null;
   return (

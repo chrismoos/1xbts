@@ -50,7 +50,7 @@ pub struct BearerFrame {
     pub queue: ForwardBearerQueue,
 }
 
-/// Per-BTS bearer transport counters surfaced to management/diagnostics.
+/// Per-BTS bearer transport counters reported to management and diagnostics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BearerStats {
     pub tx_frames: u64,

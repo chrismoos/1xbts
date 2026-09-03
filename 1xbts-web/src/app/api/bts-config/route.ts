@@ -1,13 +1,17 @@
-import { getBtsManagementClient } from "@/lib/grpc/client";
+import { cellScopedRequestFromUrl } from "@/lib/cell";
+import { getNetworkManagementClient } from "@/lib/grpc/client";
 
 export const dynamic = "force-dynamic";
 
-export async function GET() {
+export async function GET(request: Request) {
   const abort = new AbortController();
   const timeout = setTimeout(() => abort.abort(), 5000);
   try {
-    const client = getBtsManagementClient();
-    const result = await client.getBtsConfig({}, { signal: abort.signal });
+    const client = getNetworkManagementClient();
+    const result = await client.getBtsConfig(
+      cellScopedRequestFromUrl(request.url),
+      { signal: abort.signal },
+    );
     return Response.json(result);
   } catch (err) {
     const msg = err instanceof Error ? err.message : "unknown error";

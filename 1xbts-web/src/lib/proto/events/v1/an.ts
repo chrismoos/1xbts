@@ -6,6 +6,7 @@
 
 /* eslint-disable */
 import { BinaryReader, BinaryWriter } from "@bufbuild/protobuf/wire";
+import { CellId } from "./cell";
 
 export const protobufPackage = "events.v1";
 
@@ -272,7 +273,11 @@ export interface HrpdSessionEvent {
   securitySubtype: number;
   macSubtype: number;
   physicalLayerSubtype: number;
-  fullUati: HrpdUati | undefined;
+  fullUati:
+    | HrpdUati
+    | undefined;
+  /** Cell whose HRPD sector holds the session. */
+  cell: CellId | undefined;
 }
 
 /** HRPD access-channel event (capsule received on the reverse access channel). */
@@ -301,6 +306,8 @@ export interface HrpdAccessEvent {
   uati: number;
   fullUati: HrpdUati | undefined;
   receiveAti: number;
+  /** Cell whose HRPD sector received the capsule. */
+  cell: CellId | undefined;
 }
 
 /** HRPD traffic-layer event (per-frame decode, DRC update, ACK, teardown). */
@@ -327,6 +334,8 @@ export interface HrpdTrafficEvent {
   payloadLengthBytes: number;
   fullUati: HrpdUati | undefined;
   receiveAti: number;
+  /** Cell whose HRPD sector carries the traffic channel. */
+  cell: CellId | undefined;
 }
 
 /**
@@ -609,6 +618,7 @@ function createBaseHrpdSessionEvent(): HrpdSessionEvent {
     macSubtype: 0,
     physicalLayerSubtype: 0,
     fullUati: undefined,
+    cell: undefined,
   };
 }
 
@@ -649,6 +659,9 @@ export const HrpdSessionEvent: MessageFns<HrpdSessionEvent> = {
     }
     if (message.fullUati !== undefined) {
       HrpdUati.encode(message.fullUati, writer.uint32(98).fork()).join();
+    }
+    if (message.cell !== undefined) {
+      CellId.encode(message.cell, writer.uint32(106).fork()).join();
     }
     return writer;
   },
@@ -756,6 +769,14 @@ export const HrpdSessionEvent: MessageFns<HrpdSessionEvent> = {
           message.fullUati = HrpdUati.decode(reader, reader.uint32());
           continue;
         }
+        case 13: {
+          if (tag !== 106) {
+            break;
+          }
+
+          message.cell = CellId.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -819,6 +840,7 @@ export const HrpdSessionEvent: MessageFns<HrpdSessionEvent> = {
         : isSet(object.full_uati)
         ? HrpdUati.fromJSON(object.full_uati)
         : undefined,
+      cell: isSet(object.cell) ? CellId.fromJSON(object.cell) : undefined,
     };
   },
 
@@ -860,6 +882,9 @@ export const HrpdSessionEvent: MessageFns<HrpdSessionEvent> = {
     if (message.fullUati !== undefined) {
       obj.fullUati = HrpdUati.toJSON(message.fullUati);
     }
+    if (message.cell !== undefined) {
+      obj.cell = CellId.toJSON(message.cell);
+    }
     return obj;
   },
 
@@ -882,6 +907,7 @@ export const HrpdSessionEvent: MessageFns<HrpdSessionEvent> = {
     message.fullUati = (object.fullUati !== undefined && object.fullUati !== null)
       ? HrpdUati.fromPartial(object.fullUati)
       : undefined;
+    message.cell = (object.cell !== undefined && object.cell !== null) ? CellId.fromPartial(object.cell) : undefined;
     return message;
   },
 };
@@ -899,6 +925,7 @@ function createBaseHrpdAccessEvent(): HrpdAccessEvent {
     uati: 0,
     fullUati: undefined,
     receiveAti: 0,
+    cell: undefined,
   };
 }
 
@@ -936,6 +963,9 @@ export const HrpdAccessEvent: MessageFns<HrpdAccessEvent> = {
     }
     if (message.receiveAti !== 0) {
       writer.uint32(88).uint32(message.receiveAti);
+    }
+    if (message.cell !== undefined) {
+      CellId.encode(message.cell, writer.uint32(98).fork()).join();
     }
     return writer;
   },
@@ -1035,6 +1065,14 @@ export const HrpdAccessEvent: MessageFns<HrpdAccessEvent> = {
           message.receiveAti = reader.uint32();
           continue;
         }
+        case 12: {
+          if (tag !== 98) {
+            break;
+          }
+
+          message.cell = CellId.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1085,6 +1123,7 @@ export const HrpdAccessEvent: MessageFns<HrpdAccessEvent> = {
         : isSet(object.receive_ati)
         ? globalThis.Number(object.receive_ati)
         : 0,
+      cell: isSet(object.cell) ? CellId.fromJSON(object.cell) : undefined,
     };
   },
 
@@ -1123,6 +1162,9 @@ export const HrpdAccessEvent: MessageFns<HrpdAccessEvent> = {
     if (message.receiveAti !== 0) {
       obj.receiveAti = Math.round(message.receiveAti);
     }
+    if (message.cell !== undefined) {
+      obj.cell = CellId.toJSON(message.cell);
+    }
     return obj;
   },
 
@@ -1144,6 +1186,7 @@ export const HrpdAccessEvent: MessageFns<HrpdAccessEvent> = {
       ? HrpdUati.fromPartial(object.fullUati)
       : undefined;
     message.receiveAti = object.receiveAti ?? 0;
+    message.cell = (object.cell !== undefined && object.cell !== null) ? CellId.fromPartial(object.cell) : undefined;
     return message;
   },
 };
@@ -1162,6 +1205,7 @@ function createBaseHrpdTrafficEvent(): HrpdTrafficEvent {
     payloadLengthBytes: 0,
     fullUati: undefined,
     receiveAti: 0,
+    cell: undefined,
   };
 }
 
@@ -1202,6 +1246,9 @@ export const HrpdTrafficEvent: MessageFns<HrpdTrafficEvent> = {
     }
     if (message.receiveAti !== 0) {
       writer.uint32(96).uint32(message.receiveAti);
+    }
+    if (message.cell !== undefined) {
+      CellId.encode(message.cell, writer.uint32(106).fork()).join();
     }
     return writer;
   },
@@ -1309,6 +1356,14 @@ export const HrpdTrafficEvent: MessageFns<HrpdTrafficEvent> = {
           message.receiveAti = reader.uint32();
           continue;
         }
+        case 13: {
+          if (tag !== 106) {
+            break;
+          }
+
+          message.cell = CellId.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1364,6 +1419,7 @@ export const HrpdTrafficEvent: MessageFns<HrpdTrafficEvent> = {
         : isSet(object.receive_ati)
         ? globalThis.Number(object.receive_ati)
         : 0,
+      cell: isSet(object.cell) ? CellId.fromJSON(object.cell) : undefined,
     };
   },
 
@@ -1405,6 +1461,9 @@ export const HrpdTrafficEvent: MessageFns<HrpdTrafficEvent> = {
     if (message.receiveAti !== 0) {
       obj.receiveAti = Math.round(message.receiveAti);
     }
+    if (message.cell !== undefined) {
+      obj.cell = CellId.toJSON(message.cell);
+    }
     return obj;
   },
 
@@ -1427,6 +1486,7 @@ export const HrpdTrafficEvent: MessageFns<HrpdTrafficEvent> = {
       ? HrpdUati.fromPartial(object.fullUati)
       : undefined;
     message.receiveAti = object.receiveAti ?? 0;
+    message.cell = (object.cell !== undefined && object.cell !== null) ? CellId.fromPartial(object.cell) : undefined;
     return message;
   },
 };

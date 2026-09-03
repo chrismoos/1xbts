@@ -1,4 +1,5 @@
-import { getBscManagementClient, waitForBscReady } from "@/lib/grpc/client";
+import { bsRequestFromUrl } from "@/lib/cell";
+import { getNetworkManagementClient, waitForManagementReady } from "@/lib/grpc/client";
 
 export const dynamic = "force-dynamic";
 
@@ -24,11 +25,11 @@ export async function GET(request: Request) {
       send("retry: 2000\n\n");
 
       try {
-        await waitForBscReady();
+        await waitForManagementReady();
         console.log("[paging-events] starting gRPC stream");
-        const client = getBscManagementClient();
+        const client = getNetworkManagementClient();
         for await (const event of client.streamPagingEvents(
-          {},
+          bsRequestFromUrl(request.url),
           { signal: abort.signal }
         )) {
           if (abort.signal.aborted) break;

@@ -7,7 +7,7 @@ use std::{
 
 use cdma_abis::udp_bearer::UdpBearerDatagram;
 use cdma_common::error::Error;
-use log::{info, warn};
+use log::{error, info, warn};
 use tokio::sync::{broadcast, mpsc};
 
 #[cfg(feature = "soapy-backend")]
@@ -431,6 +431,70 @@ pub struct BtsLaunchParts {
     pub paging_settings: PagingChannelSettings,
 }
 
+/// Log the open-loop reverse transmit budget an access probe starts from.
+///
+/// C.S0005-E 2.1.2.3.2: the mobile's first probe is
+/// `Tx = -Rx + NOM_PWR - 16 * NOM_PWR_EXT + INIT_PWR - offset`, where `Rx` is
+/// the total received power at the mobile and the offset is band-dependent.
+/// An operator reads this to check NOM_PWR and INIT_PWR against the coverage
+/// they expect before blaming the receiver for missing probes.
+fn log_open_loop_power_init(
+    access: &cdma_common::lac::paging_messages::AccessParametersDefaults,
+    band_class: u8,
+) {
+    // C.S0057-F Table 2.3.1-1: these bands use -76 dB for an SR1 Access
+    // Channel. The remaining implemented bands use -73 dB.
+    const OPEN_LOOP_OFFSET_76DB_BANDS: &[u8] = &[1, 4, 6, 8, 13, 14, 15, 16, 20];
+    const OPEN_LOOP_OFFSET_76DB: i32 = 76;
+    const OPEN_LOOP_OFFSET_73DB: i32 = 73;
+    const NOM_PWR_EXT_STEP_DB: i32 = 16;
+
+    let open_loop_offset = if OPEN_LOOP_OFFSET_76DB_BANDS.contains(&band_class) {
+        OPEN_LOOP_OFFSET_76DB
+    } else {
+        OPEN_LOOP_OFFSET_73DB
+    };
+    let base_offset = i32::from(access.nom_pwr)
+        - NOM_PWR_EXT_STEP_DB * i32::from(access.nom_pwr_ext)
+        + i32::from(access.init_pwr);
+    let max_ramp = i32::from(access.pwr_step) * i32::from(access.num_step.saturating_sub(1));
+    info!(
+        "BTS: open-loop reverse TX init: band_class={} NOM_PWR={} dB NOM_PWR_EXT={} INIT_PWR={} dB \
+         \u{2192} Tx = -Rx - {} dBm (probe 1); ramp +{} dB/probe over {} probes \
+         (final probe Tx = -Rx - {} dBm)",
+        band_class,
+        access.nom_pwr,
+        access.nom_pwr_ext,
+        access.init_pwr,
+        open_loop_offset - base_offset,
+        access.pwr_step,
+        access.num_step,
+        open_loop_offset - base_offset - max_ramp,
+    );
+}
+
+/// Fill in the overhead frequency fields implied by the channel plan, leaving
+/// any explicitly configured value alone.
+///
+/// `CDMA_FREQ`, `EXT_CDMA_FREQ` and `BAND_CLASS` reach the air in the Extended
+/// Channel Assignment Message, and the operations plane serves them to the BSC
+/// that builds it, so they have to be resolved before anything reads the
+/// config.
+pub fn apply_derived_channel_overhead(bts_config: &mut BtsNodeConfig) {
+    let channel_plan = bts_config.channel;
+    let derived_cdma_freq = channel_plan.cdma_freq_field();
+    let derived_band_class = channel_plan.band_class.field_value();
+    if bts_config.overhead.cdma_freq.is_none() {
+        bts_config.overhead.cdma_freq = Some(derived_cdma_freq);
+    }
+    if bts_config.overhead.ext_cdma_freq.is_none() {
+        bts_config.overhead.ext_cdma_freq = Some(derived_cdma_freq);
+    }
+    if bts_config.overhead.band_class.is_none() {
+        bts_config.overhead.band_class = Some(derived_band_class);
+    }
+}
+
 pub fn build_bts_launch_parts(
     mut bts_config: BtsNodeConfig,
     radio: Box<dyn Radio>,
@@ -579,17 +643,8 @@ pub fn build_bts_launch_parts(
             ),
         }
     }
+    apply_derived_channel_overhead(&mut bts_config);
     let derived_cdma_freq = channel_plan.cdma_freq_field();
-    let derived_band_class = channel_plan.band_class.field_value();
-    if bts_config.overhead.cdma_freq.is_none() {
-        bts_config.overhead.cdma_freq = Some(derived_cdma_freq);
-    }
-    if bts_config.overhead.ext_cdma_freq.is_none() {
-        bts_config.overhead.ext_cdma_freq = Some(derived_cdma_freq);
-    }
-    if bts_config.overhead.band_class.is_none() {
-        bts_config.overhead.band_class = Some(derived_band_class);
-    }
     let cdma_freq = bts_config.overhead.cdma_freq.unwrap_or(derived_cdma_freq);
     let ext_cdma_freq = bts_config
         .overhead
@@ -699,6 +754,10 @@ pub fn build_bts_launch_parts(
         state.set_pch_transmit_tx(pch_transmit_tx.clone());
         Arc::new(parking_lot::Mutex::new(state))
     };
+    log_open_loop_power_init(
+        &paging_settings.message_defaults.access_parameters,
+        channel_plan.band_class.field_value(),
+    );
     let paging_supplier = build_bts_paging_supplier(
         overhead.clone(),
         paging_settings.clone(),
@@ -741,6 +800,17 @@ pub struct LocalAbisEndpointConfig {
     pub mscid: u32,
 }
 
+/// A running Abis endpoint: the listener the BSC connects to, and the bearer
+/// transport carrying traffic frames for it. The transport is returned so the
+/// operations plane can report its counters.
+pub struct LocalAbisEndpoint {
+    pub bind_addr: SocketAddr,
+    pub bearer: Arc<cdma_abis::bearer_transport::BearerTransport>,
+    /// Whether a BSC currently holds the Abis signaling connection. The
+    /// operations plane reports the cell in service only while this is set.
+    pub connected: Arc<std::sync::atomic::AtomicBool>,
+}
+
 pub async fn spawn_local_abis_endpoint(
     config: LocalAbisEndpointConfig,
     controller: Arc<TrafficResourceController>,
@@ -748,7 +818,7 @@ pub async fn spawn_local_abis_endpoint(
     mut traffic_ack_seq_rx: mpsc::Receiver<(u8, u8)>,
     paging_state: Arc<parking_lot::Mutex<PagingSupplierState>>,
     mut access_events: mpsc::UnboundedReceiver<super::AccessChannelEvent>,
-) -> Result<SocketAddr, Error> {
+) -> Result<LocalAbisEndpoint, Error> {
     let bearer_config = cdma_abis::bearer_transport::BearerTransportConfig {
         bind_addr: config.bearer_bind_addr,
         remote_addr: config.bearer_remote_addr,
@@ -759,7 +829,11 @@ pub async fn spawn_local_abis_endpoint(
         cdma_abis::bearer_transport::BearerTransport::new(&bearer_config)
             .map_err(|e| Error::from(format!("failed to create BTS bearer transport: {e}")))?,
     );
-    super::bearer_agent::spawn_bts_bearer_agent(bearer, controller.clone(), reverse_bearer_rx);
+    super::bearer_agent::spawn_bts_bearer_agent(
+        bearer.clone(),
+        controller.clone(),
+        reverse_bearer_rx,
+    );
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr)
         .await
@@ -780,190 +854,228 @@ pub async fn spawn_local_abis_endpoint(
     let controller_for_agent = controller.clone();
     let controller_for_frames = controller.clone();
     let agent_cell_id = config.cell_id;
+    let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let connected_for_agent = connected.clone();
     tokio::spawn(async move {
-        let (sender, mut events_rx) = match cdma_abis::transport::accept(&listener).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                warn!("BTS Abis accept failed: {e}");
-                return;
-            }
-        };
-        let mut agent = AbisAgent::new(agent_config, controller_for_agent);
-        agent.set_paging_state(paging_state.clone());
-        let mut tick_interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        let deliver_agent_events = |events: Vec<AbisAgentEvent>,
-                                    ctrl: &Arc<TrafficResourceController>|
-         -> Vec<cdma_abis::control::AbisMessage> {
-            let mut abis_responses = Vec::new();
-            for event in events {
-                match event {
-                    AbisAgentEvent::ForwardTrafficFrames { walsh_code, frames } => {
-                        if let Some(slot) = ctrl.traffic_channels_pool().lookup(walsh_code) {
-                            for frame in frames {
-                                slot.channel.send_signaling_bits(frame.bits().to_vec());
-                            }
-                        } else {
-                            warn!("BTS: ForwardTrafficFrames for unknown walsh={}", walsh_code);
-                        }
-                    }
-                    AbisAgentEvent::TrafficConnected { ccr, walsh_code } => {
-                        info!("BTS: TrafficConnected ccr={:?} walsh={}", ccr, walsh_code);
-                    }
-                    AbisAgentEvent::TrafficReleased { ccr, walsh_code } => {
-                        info!("BTS: TrafficReleased ccr={:?} walsh={}", ccr, walsh_code);
-                    }
-                    AbisAgentEvent::BtsReleaseInitiated { ccr, walsh_code } => {
-                        info!(
-                            "BTS: BtsReleaseInitiated ccr={:?} walsh={}",
-                            ccr, walsh_code
-                        );
-                    }
-                    AbisAgentEvent::PagingRetryFailed { responses } => {
-                        abis_responses.extend(responses);
-                    }
-                }
-            }
-            abis_responses
-        };
-
+        // One BSC at a time, but the listener outlives any single connection:
+        // a BSC restart must not leave the cell unreachable until the BTS
+        // process is restarted.
         loop {
-            tokio::select! {
-                event = events_rx.recv() => {
+            // Transient accept errors retry with backoff inside
+            // accept_with_retry. An error out of it means the listener is
+            // gone for good, and a BTS with no control plane must not keep
+            // radiating as if healthy.
+            let (sender, mut events_rx) =
+                match cdma_abis::transport::accept_with_retry(&listener).await {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        error!("BTS Abis listener failed permanently, exiting: {e}");
+                        std::process::exit(1);
+                    }
+                };
+            // Relaxed is enough: no other memory is ordered against this flag.
+            connected_for_agent.store(true, std::sync::atomic::Ordering::Relaxed);
+            let mut agent = AbisAgent::new(agent_config.clone(), controller_for_agent.clone());
+            agent.set_paging_state(paging_state.clone());
+            let mut tick_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            let deliver_agent_events = |events: Vec<AbisAgentEvent>,
+                                        ctrl: &Arc<TrafficResourceController>|
+             -> Vec<cdma_abis::control::AbisMessage> {
+                let mut abis_responses = Vec::new();
+                for event in events {
                     match event {
-                        Some(cdma_abis::transport::TransportEvent::Message(msg)) => {
-                            let (responses, events) = agent.handle_message(&msg);
-                            for response in responses {
-                                if let Err(e) = sender.send(&response).await {
-                                    warn!("BTS Abis send failed: {e}");
+                        AbisAgentEvent::ForwardTrafficFrames { walsh_code, frames } => {
+                            if let Some(slot) = ctrl.traffic_channels_pool().lookup(walsh_code) {
+                                for frame in frames {
+                                    slot.channel.send_signaling_bits(frame.bits().to_vec());
                                 }
-                            }
-                            let abis_responses = deliver_agent_events(events, &controller_for_frames);
-                            for resp in abis_responses {
-                                if let Err(e) = sender.send(&resp).await {
-                                    warn!("BTS Abis send failed: {e}");
-                                }
+                            } else {
+                                warn!("BTS: ForwardTrafficFrames for unknown walsh={}", walsh_code);
                             }
                         }
-                        Some(cdma_abis::transport::TransportEvent::Disconnected(e)) => {
-                            warn!("BTS Abis disconnected: {e}");
+                        AbisAgentEvent::TrafficConnected { ccr, walsh_code } => {
+                            info!("BTS: TrafficConnected ccr={:?} walsh={}", ccr, walsh_code);
+                        }
+                        AbisAgentEvent::TrafficReleased { ccr, walsh_code } => {
+                            info!("BTS: TrafficReleased ccr={:?} walsh={}", ccr, walsh_code);
+                        }
+                        AbisAgentEvent::BtsReleaseInitiated { ccr, walsh_code } => {
+                            info!(
+                                "BTS: BtsReleaseInitiated ccr={:?} walsh={}",
+                                ccr, walsh_code
+                            );
+                        }
+                        AbisAgentEvent::PagingRetryFailed { responses } => {
+                            abis_responses.extend(responses);
+                        }
+                    }
+                }
+                abis_responses
+            };
+
+            // A closed RX channel means the sender side of the radio is gone,
+            // so there is nothing left to serve a BSC with. Only a transport
+            // disconnect re-enters accept.
+            let mut rx_gone = false;
+            loop {
+                tokio::select! {
+                    event = events_rx.recv() => {
+                        match event {
+                            Some(cdma_abis::transport::TransportEvent::Message(msg)) => {
+                                let (responses, events) = agent.handle_message(&msg);
+                                for response in responses {
+                                    if let Err(e) = sender.send(&response).await {
+                                        warn!("BTS Abis send failed: {e}");
+                                    }
+                                }
+                                let abis_responses = deliver_agent_events(events, &controller_for_frames);
+                                for resp in abis_responses {
+                                    if let Err(e) = sender.send(&resp).await {
+                                        warn!("BTS Abis send failed: {e}");
+                                    }
+                                }
+                            }
+                            Some(cdma_abis::transport::TransportEvent::Disconnected(e)) => {
+                                warn!("BTS Abis disconnected: {e}");
+                                break;
+                            }
+                            None => break,
+                        }
+                    }
+                    ack = traffic_ack_seq_rx.recv() => {
+                        let Some((walsh_code, ack_seq)) = ack else {
+                            rx_gone = true;
                             break;
-                        }
-                        None => break,
-                    }
-                }
-                ack = traffic_ack_seq_rx.recv() => {
-                    let Some((walsh_code, ack_seq)) = ack else { break };
-                    let events = agent.handle_reverse_ack_seq(walsh_code, ack_seq);
-                    let abis_responses = deliver_agent_events(events, &controller_for_frames);
-                    for resp in abis_responses {
-                        if let Err(e) = sender.send(&resp).await {
-                            warn!("BTS Abis send failed: {e}");
-                        }
-                    }
-                }
-                _ = tick_interval.tick() => {
-                    let events = agent.tick_all_sessions();
-                    let abis_responses = deliver_agent_events(events, &controller_for_frames);
-                    for resp in abis_responses {
-                        if let Err(e) = sender.send(&resp).await {
-                            warn!("BTS Abis send failed: {e}");
-                        }
-                    }
-                    let paging_events = agent.tick_paging_retries();
-                    let paging_abis_responses = deliver_agent_events(paging_events, &controller_for_frames);
-                    for resp in paging_abis_responses {
-                        if let Err(e) = sender.send(&resp).await {
-                            warn!("BTS Abis send failed: {e}");
-                        }
-                    }
-                }
-                access = access_events.recv() => {
-                    let Some(access_event) = access else { break };
-                    agent.record_access_msg_seq(&access_event);
-                    let l2_ack_responses = agent.check_access_ack_notify(&access_event);
-                    for resp in l2_ack_responses {
-                        if let Err(e) = sender.send(&resp).await {
-                            warn!("BTS Abis L2 ack send failed: {e}");
-                        }
-                    }
-                    let page_response_acks = agent.check_page_response_cancel(&access_event);
-                    for resp in page_response_acks {
-                        if let Err(e) = sender.send(&resp).await {
-                            warn!("BTS Abis page-response ack send failed: {e}");
-                        }
-                    }
-                    let raw_bits = match &access_event.raw_pdu_bits {
-                        Some(bits) => bits.clone(),
-                        None => continue,
-                    };
-                    let msg_type = access_event
-                        .message_id
-                        .wire_type(crate::lac::message_types::WireChannel::ReverseCommon)
-                        .unwrap_or(0);
-                    let octets: Vec<u8> = raw_bits
-                        .chunks(8)
-                        .map(|chunk| {
-                            let mut byte = 0u8;
-                            for (i, &bit) in chunk.iter().enumerate() {
-                                byte |= (bit & 1) << (7 - i);
+                        };
+                        let events = agent.handle_reverse_ack_seq(walsh_code, ack_seq);
+                        let abis_responses = deliver_agent_events(events, &controller_for_frames);
+                        for resp in abis_responses {
+                            if let Err(e) = sender.send(&resp).await {
+                                warn!("BTS Abis send failed: {e}");
                             }
-                            byte
-                        })
-                        .collect();
-                    let mut mobile_ids = Vec::new();
-                    if let Some(imsi) = access_event.imsi.as_ref() {
-                        mobile_ids.push(cdma_abis::control::typed::MobileIdentity::Imsi(
-                            imsi.clone(),
-                        ));
+                        }
                     }
-                    if let Some(esn) = access_event.esn {
-                        mobile_ids.push(cdma_abis::control::typed::MobileIdentity::Esn(esn));
+                    _ = tick_interval.tick() => {
+                        let events = agent.tick_all_sessions();
+                        let abis_responses = deliver_agent_events(events, &controller_for_frames);
+                        for resp in abis_responses {
+                            if let Err(e) = sender.send(&resp).await {
+                                warn!("BTS Abis send failed: {e}");
+                            }
+                        }
+                        let paging_events = agent.tick_paging_retries();
+                        let paging_abis_responses = deliver_agent_events(paging_events, &controller_for_frames);
+                        for resp in paging_abis_responses {
+                            if let Err(e) = sender.send(&resp).await {
+                                warn!("BTS Abis send failed: {e}");
+                            }
+                        }
                     }
-                    let ach = cdma_abis::control::AchMessageTransferMessage {
-                        correlation_id: None,
-                        mobile_identities: mobile_ids,
-                        cell_identifier: Some(agent_cell_id),
-                        bts_l2_termination: None,
-                        air_interface_message: Some(
-                            cdma_abis::control::typed::AirInterfaceMessagePayload {
-                                message_type: msg_type,
-                                message: octets,
-                            },
-                        ),
-                        cdma_serving_one_way_delay:
-                            cdma_abis::control::typed::CdmaServingOneWayDelay {
-                                cell: agent_cell_id,
-                                delay_100ns: 0,
-                            },
-                        authentication_challenge_parameter: None,
-                    };
-                    match ach.encode() {
-                        Ok(bytes) => match cdma_abis::control::decode(&bytes) {
-                            Ok(abis_msg) => {
-                                info!(
-                                    "BTS→BSC Abis ACH Msg Transfer: {}",
-                                    access_event.msg_type_name
-                                );
-                                if let Err(e) = sender.send(&abis_msg).await {
-                                    warn!("BTS Abis ACH send failed: {e}");
+                    access = access_events.recv() => {
+                        let Some(access_event) = access else {
+                            rx_gone = true;
+                            break;
+                        };
+                        agent.record_access_msg_seq(&access_event);
+                        let l2_ack_responses = agent.check_access_ack_notify(&access_event);
+                        for resp in l2_ack_responses {
+                            if let Err(e) = sender.send(&resp).await {
+                                warn!("BTS Abis L2 ack send failed: {e}");
+                            }
+                        }
+                        let page_response_acks = agent.check_page_response_cancel(&access_event);
+                        for resp in page_response_acks {
+                            if let Err(e) = sender.send(&resp).await {
+                                warn!("BTS Abis page-response ack send failed: {e}");
+                            }
+                        }
+                        let raw_bits = match &access_event.raw_pdu_bits {
+                            Some(bits) => bits.clone(),
+                            None => continue,
+                        };
+                        let msg_type = access_event
+                            .message_id
+                            .wire_type(crate::lac::message_types::WireChannel::ReverseCommon)
+                            .unwrap_or(0);
+                        let octets: Vec<u8> = raw_bits
+                            .chunks(8)
+                            .map(|chunk| {
+                                let mut byte = 0u8;
+                                for (i, &bit) in chunk.iter().enumerate() {
+                                    byte |= (bit & 1) << (7 - i);
                                 }
-                            }
+                                byte
+                            })
+                            .collect();
+                        let mut mobile_ids = Vec::new();
+                        if let Some(imsi) = access_event.imsi.as_ref() {
+                            mobile_ids.push(cdma_abis::control::typed::MobileIdentity::Imsi(
+                                imsi.clone(),
+                            ));
+                        }
+                        if let Some(esn) = access_event.esn {
+                            mobile_ids.push(cdma_abis::control::typed::MobileIdentity::Esn(esn));
+                        }
+                        let ach = cdma_abis::control::AchMessageTransferMessage {
+                            correlation_id: None,
+                            mobile_identities: mobile_ids,
+                            cell_identifier: Some(agent_cell_id),
+                            bts_l2_termination: None,
+                            air_interface_message: Some(
+                                cdma_abis::control::typed::AirInterfaceMessagePayload {
+                                    message_type: msg_type,
+                                    message: octets,
+                                },
+                            ),
+                            cdma_serving_one_way_delay:
+                                cdma_abis::control::typed::CdmaServingOneWayDelay {
+                                    cell: agent_cell_id,
+                                    delay_100ns: 0,
+                                },
+                            authentication_challenge_parameter: None,
+                        };
+                        match ach.encode() {
+                            Ok(bytes) => match cdma_abis::control::decode(&bytes) {
+                                Ok(abis_msg) => {
+                                    info!(
+                                        "BTS→BSC Abis ACH Msg Transfer: {}",
+                                        access_event.msg_type_name
+                                    );
+                                    if let Err(e) = sender.send(&abis_msg).await {
+                                        warn!("BTS Abis ACH send failed: {e}");
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("BTS Abis ACH decode failed: {e}");
+                                }
+                            },
                             Err(e) => {
-                                warn!("BTS Abis ACH decode failed: {e}");
+                                warn!("BTS Abis ACH encode failed: {e}");
                             }
-                        },
-                        Err(e) => {
-                            warn!("BTS Abis ACH encode failed: {e}");
                         }
                     }
                 }
             }
+            connected_for_agent.store(false, std::sync::atomic::Ordering::Relaxed);
+            // Nothing will send the Remove that frees these, so do it here.
+            agent.release_all();
+            if rx_gone {
+                // The RX side of the radio is gone, so the cell cannot serve
+                // anyone. Exit rather than keep radiating with no receiver.
+                error!("BTS Abis: RX event channel closed, exiting");
+                std::process::exit(1);
+            }
+            info!("BTS Abis: connection closed, listening for a new BSC");
         }
     });
 
-    Ok(bind_addr)
+    Ok(LocalAbisEndpoint {
+        bind_addr,
+        bearer,
+        connected,
+    })
 }
 
 pub async fn spawn_configured_local_abis_endpoint(
@@ -973,7 +1085,7 @@ pub async fn spawn_configured_local_abis_endpoint(
     traffic_ack_seq_rx: mpsc::Receiver<(u8, u8)>,
     paging_state: Arc<parking_lot::Mutex<PagingSupplierState>>,
     access_events: mpsc::UnboundedReceiver<cdma_common::events::AccessChannelEvent>,
-) -> Result<SocketAddr, Error> {
+) -> Result<LocalAbisEndpoint, Error> {
     spawn_local_abis_endpoint(
         LocalAbisEndpointConfig {
             bind_addr: bts_config.abis.bind_addr,
@@ -982,7 +1094,7 @@ pub async fn spawn_configured_local_abis_endpoint(
             pilot_pn: bts_config.pilot_offset as u16,
             cell_id: cdma_abis::control::typed::CellId {
                 cell: bts_config.overhead.base_id,
-                sector: 0x01,
+                sector: bts_config.sector,
             },
             mscid: bts_config.overhead.sid as u32,
         },

@@ -203,6 +203,16 @@ impl GrpcHlrRepository {
         Self::connect(format!("http://{addr}")).await
     }
 
+    /// Build a repository over a lazy channel: the endpoint is only parsed
+    /// here and the TCP connection is established on the first RPC, so the
+    /// caller starts whether or not the HLR is already listening.
+    pub fn connect_lazy(endpoint: &str) -> Result<Self, tonic::transport::Error> {
+        let channel = tonic::transport::Endpoint::from_shared(endpoint.to_string())?.connect_lazy();
+        Ok(Self {
+            client: proto::hlr_service_client::HlrServiceClient::new(channel),
+        })
+    }
+
     fn client(&self) -> proto::hlr_service_client::HlrServiceClient<tonic::transport::Channel> {
         self.client.clone()
     }
@@ -436,7 +446,7 @@ fn binding_from_proto(value: proto::RegistrationBinding) -> Result<RegistrationB
     Ok(RegistrationBinding {
         subscriber_id: Uuid::parse_str(&value.subscriber_id)
             .map_err(|e| format!("invalid subscriber_id: {e}"))?,
-        serving_node_id: value.serving_node_id,
+        serving_bs_id: value.serving_bs_id,
         state: RegistrationState::from_str(&value.state)
             .map_err(|e| format!("invalid registration state: {e}"))?,
         imsi: value.imsi,
@@ -793,7 +803,7 @@ impl HlrRepository for GrpcHlrRepository {
         let response = client
             .upsert_registration_binding(proto::UpsertRegistrationBindingRequest {
                 subscriber_id: binding.subscriber_id.to_string(),
-                serving_node_id: binding.serving_node_id,
+                serving_bs_id: binding.serving_bs_id,
                 state: binding.state.as_str().to_string(),
                 imsi: binding.imsi,
                 esn: binding.esn,
@@ -1939,12 +1949,12 @@ impl HlrRepository for PostgresHlrRepository {
         let row = sqlx::query_as::<_, BindingRow>(
             r#"
             INSERT INTO registration_bindings (
-                subscriber_id, serving_node_id, state, imsi, esn, meid,
+                subscriber_id, serving_bs_id, state, imsi, esn, meid,
                 mob_p_rev, pgslot, slot_cycle_index, last_msg_seq,
                 last_registered_at, last_seen_at, updated_at
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             ON CONFLICT (subscriber_id) DO UPDATE SET
-                serving_node_id = EXCLUDED.serving_node_id,
+                serving_bs_id = EXCLUDED.serving_bs_id,
                 state = EXCLUDED.state,
                 imsi = EXCLUDED.imsi,
                 esn = EXCLUDED.esn,
@@ -1956,13 +1966,13 @@ impl HlrRepository for PostgresHlrRepository {
                 last_registered_at = EXCLUDED.last_registered_at,
                 last_seen_at = EXCLUDED.last_seen_at,
                 updated_at = EXCLUDED.updated_at
-            RETURNING subscriber_id, serving_node_id, state, imsi, esn, meid,
+            RETURNING subscriber_id, serving_bs_id, state, imsi, esn, meid,
                 mob_p_rev, pgslot, slot_cycle_index, last_msg_seq,
                 last_registered_at, last_seen_at, updated_at
             "#,
         )
         .bind(binding.subscriber_id)
-        .bind(&binding.serving_node_id)
+        .bind(&binding.serving_bs_id)
         .bind(binding.state.as_str())
         .bind(binding.imsi.as_deref())
         .bind(binding.esn.map(|v| v as i64))
@@ -1987,7 +1997,7 @@ impl HlrRepository for PostgresHlrRepository {
     ) -> Result<Option<RegistrationBinding>, String> {
         let row = sqlx::query_as::<_, BindingRow>(
             r#"
-            SELECT subscriber_id, serving_node_id, state, imsi, esn,
+            SELECT subscriber_id, serving_bs_id, state, imsi, esn,
                 meid, mob_p_rev, pgslot, slot_cycle_index, last_msg_seq,
                 last_registered_at, last_seen_at, updated_at
             FROM registration_bindings WHERE subscriber_id = $1
@@ -2563,7 +2573,7 @@ impl From<IdentityRow> for SubscriberIdentity {
 #[derive(sqlx::FromRow)]
 struct BindingRow {
     subscriber_id: Uuid,
-    serving_node_id: String,
+    serving_bs_id: String,
     state: String,
     imsi: Option<String>,
     esn: Option<i64>,
@@ -2583,7 +2593,7 @@ impl TryFrom<BindingRow> for RegistrationBinding {
     fn try_from(r: BindingRow) -> Result<Self, Self::Error> {
         Ok(RegistrationBinding {
             subscriber_id: r.subscriber_id,
-            serving_node_id: r.serving_node_id,
+            serving_bs_id: r.serving_bs_id,
             state: RegistrationState::from_str(&r.state)?,
             imsi: r.imsi,
             esn: r.esn.map(|v| v as u32),

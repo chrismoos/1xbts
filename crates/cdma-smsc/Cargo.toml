@@ -21,12 +21,18 @@ log = "0.4"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [build-dependencies]
 tonic-build = "0.13"
 
 [lib]
 path = "src/lib/mod.rs"
+
+[[bin]]
+name = "cdma-smsc"
+path = "src/main.rs"
 
 [lints]
 workspace = true

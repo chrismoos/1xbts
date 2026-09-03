@@ -19,10 +19,14 @@ use cdma_common::sch::{DEFAULT_RC3_F_SCH_RATE_BPS, Rc3FschProfile};
 // directly rather than re-exporting through cdma_bsc::config.
 use serde::{Deserialize, Serialize};
 
+// The config directory and the BTS filename are defined by the BTS crate so
+// both elements name the same file.
+pub use cdma_bts::bts::validate_page_chan_alignment;
+pub use cdma_bts::startup::BTS_CONFIG_FILENAME;
+pub use cdma_common::startup::DEFAULT_CONFIG_DIR;
+
 // Default per-node config filenames within the configured config directory.
 
-/// Filename of the standalone BTS node config inside the config directory.
-pub const BTS_CONFIG_FILENAME: &str = "bts.json";
 /// Filename of the standalone BSC node config inside the config directory.
 pub const BSC_CONFIG_FILENAME: &str = "bsc.json";
 /// Filename of the standalone MSC node config inside the config directory.
@@ -39,10 +43,6 @@ pub const SMSC_CONFIG_FILENAME: &str = "smsc.json";
 pub const MANAGEMENT_CONFIG_FILENAME: &str = "management.json";
 /// Filename of the aggregated event bus config inside the config directory.
 pub const EVENTS_CONFIG_FILENAME: &str = "events.json";
-
-/// Default config directory used when neither `--config-dir` nor
-/// `CDMA_CONFIG_DIR` is set.
-pub const DEFAULT_CONFIG_DIR: &str = "config";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RcPairConfig {
@@ -152,6 +152,38 @@ impl Default for TrafficRetryConfig {
     }
 }
 
+fn default_service_connect_timeout_ms() -> u64 {
+    20000
+}
+
+fn default_voice_release_timeout_ms() -> u64 {
+    5000
+}
+
+/// Supervision timers for a voice traffic channel. They apply only to voice
+/// calls. Assignment delivery and MS Ack are supervised for every traffic
+/// type by `traffic_retry` and `paging_retry`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VoiceTimeoutConfig {
+    /// How long a voice channel may sit assigned before service negotiation
+    /// is treated as failed.
+    #[serde(default = "default_service_connect_timeout_ms")]
+    pub service_connect_timeout_ms: u64,
+    /// How long to wait for the release to complete before forcing teardown.
+    #[serde(default = "default_voice_release_timeout_ms")]
+    pub release_timeout_ms: u64,
+}
+
+impl Default for VoiceTimeoutConfig {
+    fn default() -> Self {
+        Self {
+            service_connect_timeout_ms: default_service_connect_timeout_ms(),
+            release_timeout_ms: default_voice_release_timeout_ms(),
+        }
+    }
+}
+
 fn default_paging_ack_timeout_ms() -> u64 {
     1000
 }
@@ -206,69 +238,115 @@ impl Default for BscAbisTimers {
     }
 }
 
-fn default_bsc_bearer_bind_addr() -> SocketAddr {
+/// Default BTS OAM gRPC endpoint for a single-host run.
+pub const DEFAULT_BTS_OAM_ENDPOINT: &str = "http://127.0.0.1:17024";
+/// Default MSC A1 signaling address.
+pub const DEFAULT_A1_BIND_ADDR: &str = "127.0.0.1:17013";
+/// Default HLR gRPC endpoint.
+pub const DEFAULT_HLR_ENDPOINT: &str = "http://127.0.0.1:17019";
+/// Default SMSC gRPC endpoint.
+pub const DEFAULT_SMSC_ENDPOINT: &str = "http://127.0.0.1:17020";
+/// Default packet gRPC endpoint the packet-data path drives sessions through.
+pub const DEFAULT_PACKET_ENDPOINT: &str = "http://127.0.0.1:17021";
+
+fn default_packet_endpoint() -> String {
+    DEFAULT_PACKET_ENDPOINT.to_string()
+}
+
+fn default_bts_oam_endpoint() -> String {
+    DEFAULT_BTS_OAM_ENDPOINT.to_string()
+}
+
+fn default_a1_bind_addr() -> SocketAddr {
+    DEFAULT_A1_BIND_ADDR
+        .parse()
+        .expect("valid default A1 address")
+}
+
+fn default_hlr_endpoint() -> String {
+    DEFAULT_HLR_ENDPOINT.to_string()
+}
+
+fn default_smsc_endpoint() -> String {
+    DEFAULT_SMSC_ENDPOINT.to_string()
+}
+
+fn default_bts_bearer_bind_addr() -> SocketAddr {
     SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
         cdma_abis::transport::ABIS_BSC_BEARER_PORT,
     )
 }
 
-fn default_bsc_bearer_remote_addr() -> SocketAddr {
+fn default_bts_bearer_remote_addr() -> SocketAddr {
     SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
         cdma_abis::transport::ABIS_BTS_BEARER_PORT,
     )
 }
 
-fn default_bsc_abis_remote_addr() -> SocketAddr {
+fn default_bts_abis_addr() -> SocketAddr {
     SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
         cdma_abis::transport::ABIS_SIGNALING_PORT,
     )
 }
 
-/// BSC-side Abis signaling (TCP) addressing.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
-pub struct BscAbisConfig {
-    /// Remote BTS Abis signaling address. Default `127.0.0.1:5604`.
-    #[serde(default = "default_bsc_abis_remote_addr")]
-    pub remote_addr: SocketAddr,
+fn default_bts_peers() -> Vec<BtsPeerConfig> {
+    vec![BtsPeerConfig::default()]
 }
 
-impl Default for BscAbisConfig {
+/// One BTS this BSC attaches to. Membership is BSC-owned. The radio
+/// parameters for the cell come from the BTS itself at enrollment.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BtsPeerConfig {
+    /// Stable, opaque identifier the management API and UI address this peer
+    /// by, independent of the cell it enrolls with. Defaults to
+    /// `oam_endpoint` when unset. Must be unique across peers.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// BTS OAM gRPC endpoint. The BSC calls `Enroll` here before bringing
+    /// up Abis, and again on every re-attach.
+    #[serde(default = "default_bts_oam_endpoint")]
+    pub oam_endpoint: String,
+    /// BTS Abis signaling (TCP) address. Default `127.0.0.1:5604`.
+    #[serde(default = "default_bts_abis_addr")]
+    pub abis_addr: SocketAddr,
+    /// Local UDP address this BSC binds for the peer's Abis bearer.
+    /// Default `127.0.0.1:17022`.
+    #[serde(default = "default_bts_bearer_bind_addr")]
+    pub bearer_bind_addr: SocketAddr,
+    /// Remote BTS Abis bearer address. Default `127.0.0.1:17014`.
+    #[serde(default = "default_bts_bearer_remote_addr")]
+    pub bearer_remote_addr: SocketAddr,
+}
+
+impl Default for BtsPeerConfig {
     fn default() -> Self {
         Self {
-            remote_addr: default_bsc_abis_remote_addr(),
+            id: None,
+            oam_endpoint: default_bts_oam_endpoint(),
+            abis_addr: default_bts_abis_addr(),
+            bearer_bind_addr: default_bts_bearer_bind_addr(),
+            bearer_remote_addr: default_bts_bearer_remote_addr(),
         }
     }
 }
 
-/// BSC-side Abis bearer (UDP) addressing.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
-pub struct BscBearerConfig {
-    /// Local UDP address for the BSC bearer transport. Default `127.0.0.1:17022`.
-    #[serde(default = "default_bsc_bearer_bind_addr")]
-    pub bind_addr: SocketAddr,
-    /// Remote BTS bearer address. Default `127.0.0.1:17014`.
-    #[serde(default = "default_bsc_bearer_remote_addr")]
-    pub remote_addr: SocketAddr,
-}
-
-impl Default for BscBearerConfig {
-    fn default() -> Self {
-        Self {
-            bind_addr: default_bsc_bearer_bind_addr(),
-            remote_addr: default_bsc_bearer_remote_addr(),
-        }
+impl BtsPeerConfig {
+    /// The stable id the management API addresses this peer by: the explicit
+    /// `id` when set, otherwise the OAM endpoint.
+    pub fn peer_id(&self) -> &str {
+        self.id.as_deref().unwrap_or(&self.oam_endpoint)
     }
 }
 
 /// Standalone BSC node configuration (loaded from `config/bsc.json`).
 ///
-/// Carries cell broadcast/overhead policy, radio-resource assignment policy,
-/// traffic and paging retry policy, and the BSC-side Abis timers.
+/// Carries the BTS peers to attach, radio-resource assignment policy, traffic
+/// retry and voice supervision timers, and the BSC-side Abis timers. Cell
+/// broadcast and paging policy live with the BTS and arrive at enrollment.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BscNodeConfig {
@@ -277,8 +355,7 @@ pub struct BscNodeConfig {
     pub traffic_assignment: TrafficAssignmentConfig,
     /// Forward-traffic ACK timing and retry budget.
     pub traffic_retry: TrafficRetryConfig,
-    /// Forward-paging ACK timing and retry budget.
-    pub paging_retry: PagingRetryConfig,
+    pub voice_timeouts: VoiceTimeoutConfig,
     /// Evict idle registered mobiles (no access activity and no active
     /// traffic channel) after this many seconds. Default: 3600 (1 hour).
     /// Set to 0 to disable.
@@ -286,10 +363,22 @@ pub struct BscNodeConfig {
     pub mobile_idle_timeout_s: u64,
     /// BSC-side Abis timers per A.S0003-A §8 Table 8-1.
     pub abis_timers: BscAbisTimers,
-    /// BSC-side Abis signaling (TCP) addressing.
-    pub abis: BscAbisConfig,
-    /// Abis bearer (UDP) addressing for traffic frames.
-    pub bearer: BscBearerConfig,
+    /// The BTSs this BSC serves, one entry per cell.
+    #[serde(default = "default_bts_peers")]
+    pub bts_peers: Vec<BtsPeerConfig>,
+    /// Address the A1 signaling listener accepts the MSC on. The MSC learns
+    /// it from enrollment and dials in.
+    #[serde(default = "default_a1_bind_addr")]
+    pub a1_bind_addr: SocketAddr,
+    /// HLR gRPC endpoint.
+    #[serde(default = "default_hlr_endpoint")]
+    pub hlr_endpoint: String,
+    /// SMSC gRPC endpoint.
+    #[serde(default = "default_smsc_endpoint")]
+    pub smsc_endpoint: String,
+    /// Packet gRPC endpoint the packet-data path drives sessions through.
+    #[serde(default = "default_packet_endpoint")]
+    pub packet_endpoint: String,
     /// Local IP that voice bearer UDP sockets bind to.
     /// Defaults to 127.0.0.1. Set to the host's network-facing IP when the
     /// BSC and voice gateway are on separate hosts.
@@ -300,12 +389,6 @@ pub struct BscNodeConfig {
     /// across all BSC instances. Defaults to "bsc".
     #[serde(default = "default_node_id")]
     pub node_id: String,
-    /// Optional HRPD AN A21 endpoint. When set the BSC opens an A21 client
-    /// connection on startup, maintains a HybridIdentityCache from inbound
-    /// IdentityBinding / IdentityRelease messages, and consults it from the
-    /// paging path to divert HRPD-attached MTs into A21 CrossPageRequest.
-    #[serde(default)]
-    pub an_a21_addr: Option<SocketAddr>,
 }
 
 fn default_node_id() -> String {
@@ -321,14 +404,16 @@ impl Default for BscNodeConfig {
         Self {
             traffic_assignment: TrafficAssignmentConfig::default(),
             traffic_retry: TrafficRetryConfig::default(),
-            paging_retry: PagingRetryConfig::default(),
+            voice_timeouts: VoiceTimeoutConfig::default(),
             mobile_idle_timeout_s: default_mobile_idle_timeout_s(),
             abis_timers: BscAbisTimers::default(),
-            abis: BscAbisConfig::default(),
-            bearer: BscBearerConfig::default(),
+            bts_peers: default_bts_peers(),
+            a1_bind_addr: default_a1_bind_addr(),
+            hlr_endpoint: default_hlr_endpoint(),
+            smsc_endpoint: default_smsc_endpoint(),
+            packet_endpoint: default_packet_endpoint(),
             voice_bearer_bind_ip: default_voice_bearer_bind_ip(),
             node_id: default_node_id(),
-            an_a21_addr: None,
         }
     }
 }
@@ -341,18 +426,90 @@ impl BscNodeConfig {
     /// Load and validate a `BscNodeConfig` from a JSON file.
     pub fn load_from_path(path: &Path) -> Result<Self, Error> {
         let merged = cdma_common::config_load::load_json_with_local_override(path)?;
+        warn_on_removed_keys(&merged);
         let cfg: Self = serde_json::from_value(merged)?;
         cfg.validate()?;
         Ok(cfg)
     }
 
-    /// Validate self-contained BSC invariants. Cross-node validation
-    /// (e.g. matching `page_chan` against the BTS paging channel) is done
-    /// in bootstrap via `validate_page_chan_alignment`.
+    /// Validate self-contained BSC invariants.
     pub fn validate(&self) -> Result<(), Error> {
         validate_traffic_assignment(&self.traffic_assignment)?;
+        validate_bts_peers(&self.bts_peers)?;
         Ok(())
     }
+}
+
+/// Warn about keys that moved out of `bsc.json`, which serde would skip
+/// silently.
+fn warn_on_removed_keys(merged: &serde_json::Value) {
+    const REMOVED: [(&str, &str); 5] = [
+        (
+            "abis",
+            "its address now lives in a `bts_peers` entry's `abis_addr`",
+        ),
+        (
+            "bearer",
+            "its addresses now live in a `bts_peers` entry's `bearer_bind_addr` and `bearer_remote_addr`",
+        ),
+        (
+            "paging_retry",
+            "the BTS owns it and supplies it at enrollment; move any tuned value to `bts.json`",
+        ),
+        ("an_a21_addr", "no element serves A21, remove the key"),
+        (
+            "msc_a1_addr",
+            "the MSC now dials this BSC. Set `a1_bind_addr` to the address it should accept the MSC on",
+        ),
+    ];
+    let Some(map) = merged.as_object() else {
+        return;
+    };
+    for (key, hint) in REMOVED {
+        if map.contains_key(key) {
+            log::warn!("config: bsc.json key {key:?} is no longer read — {hint}");
+        }
+    }
+}
+
+/// Every peer needs its own OAM endpoint and bearer socket, so duplicates are
+/// rejected at load rather than at attach time.
+fn validate_bts_peers(peers: &[BtsPeerConfig]) -> Result<(), Error> {
+    for (index, peer) in peers.iter().enumerate() {
+        if let Some(other) = peers[..index]
+            .iter()
+            .position(|earlier| earlier.oam_endpoint == peer.oam_endpoint)
+        {
+            return Err(format!(
+                "bsc.bts_peers[{index}].oam_endpoint {} duplicates bts_peers[{other}]",
+                peer.oam_endpoint
+            )
+            .into());
+        }
+        if let Some(other) = peers[..index]
+            .iter()
+            .position(|earlier| earlier.bearer_bind_addr == peer.bearer_bind_addr)
+        {
+            return Err(format!(
+                "bsc.bts_peers[{index}].bearer_bind_addr {} duplicates bts_peers[{other}]",
+                peer.bearer_bind_addr
+            )
+            .into());
+        }
+        // The effective peer id shares one namespace whether it comes from an
+        // explicit `id` or defaults to the OAM endpoint, so check them together.
+        if let Some(other) = peers[..index]
+            .iter()
+            .position(|earlier| earlier.peer_id() == peer.peer_id())
+        {
+            return Err(format!(
+                "bsc.bts_peers[{index}] peer id {:?} duplicates bts_peers[{other}]",
+                peer.peer_id()
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 fn default_iq_capture_dir() -> PathBuf {
@@ -385,9 +542,6 @@ pub struct ManagementConfig {
     /// accept any client. Required for multi-host deployments.
     #[serde(default)]
     pub mtls: Option<MtlsConfig>,
-    /// Enable the tokio-console gRPC endpoint for async task introspection.
-    #[serde(default)]
-    pub tokio_console: bool,
     /// Directory where IQ capture files are written. BTS management RPCs
     /// reference this path.
     #[serde(default = "default_iq_capture_dir")]
@@ -479,32 +633,9 @@ pub fn resolved_cdma_freq(
         .unwrap_or_else(|| channel.cdma_freq_field())
 }
 
-/// Cross-node validation: BTS `overhead.page_chan` must match
-/// `bts.runtime.downlink.paging.paging_channel_number`. Both live in
-/// `bts.json` but in different sections, so the bootstrap still
-/// double-checks them.
-pub fn validate_page_chan_alignment(
-    overhead_page_chan: u8,
-    bts_paging_channel_number: u8,
-) -> Result<(), Error> {
-    if overhead_page_chan != bts_paging_channel_number {
-        return Err(
-            "bts.overhead.page_chan must match bts.runtime.downlink.paging.paging_channel_number"
-                .into(),
-        );
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn page_chan_mismatch_is_an_error() {
-        assert!(validate_page_chan_alignment(1, 1).is_ok());
-        assert!(validate_page_chan_alignment(1, 2).is_err());
-    }
 
     #[test]
     fn cdma_freq_resolves_from_channel_plan() {
@@ -566,17 +697,45 @@ mod tests {
     }
 
     #[test]
-    fn abis_signaling_default_remote_is_localhost_spec_port() {
+    fn a_single_cell_run_needs_no_peer_configuration() {
         let cfg = BscNodeConfig::default();
-        assert_eq!(cfg.abis.remote_addr, "127.0.0.1:5604".parse().unwrap());
+        assert_eq!(cfg.bts_peers.len(), 1);
+        assert_eq!(
+            cfg.bts_peers[0].abis_addr,
+            "127.0.0.1:5604".parse().unwrap()
+        );
+        assert_eq!(cfg.bts_peers[0].oam_endpoint, DEFAULT_BTS_OAM_ENDPOINT);
+        assert_eq!(cfg.a1_bind_addr, DEFAULT_A1_BIND_ADDR.parse().unwrap());
     }
 
     #[test]
-    fn abis_signaling_explicit_remote_deserializes() {
-        let cfg: BscNodeConfig =
-            serde_json::from_str(r#"{ "abis": { "remote_addr": "127.0.0.1:5604" } }"#)
-                .expect("deserialize bsc config");
-        assert_eq!(cfg.abis.remote_addr, "127.0.0.1:5604".parse().unwrap());
+    fn a_peer_entry_fills_the_addresses_it_omits() {
+        let cfg: BscNodeConfig = serde_json::from_str(
+            r#"{ "bts_peers": [{ "abis_addr": "10.0.0.2:5604" }, { "abis_addr": "10.0.0.3:5604" }] }"#,
+        )
+        .expect("deserialize bsc config");
+        assert_eq!(cfg.bts_peers.len(), 2);
+        assert_eq!(cfg.bts_peers[1].abis_addr, "10.0.0.3:5604".parse().unwrap());
+        assert_eq!(cfg.bts_peers[1].oam_endpoint, DEFAULT_BTS_OAM_ENDPOINT);
+    }
+
+    #[test]
+    fn two_peers_may_not_share_an_oam_endpoint_or_a_bearer_socket() {
+        let mut cfg = BscNodeConfig::default();
+        cfg.bts_peers = vec![BtsPeerConfig::default(), BtsPeerConfig::default()];
+        let error = cfg
+            .validate()
+            .expect_err("both peers default to one address");
+        assert!(error.to_string().contains("oam_endpoint"), "{error}");
+
+        cfg.bts_peers[1].oam_endpoint = "http://127.0.0.1:17124".to_string();
+        let error = cfg
+            .validate()
+            .expect_err("both peers still bind one bearer socket");
+        assert!(error.to_string().contains("bearer_bind_addr"), "{error}");
+
+        cfg.bts_peers[1].bearer_bind_addr = "127.0.0.1:17122".parse().unwrap();
+        cfg.validate().expect("distinct peers validate");
     }
 
     #[test]
@@ -595,10 +754,8 @@ mod tests {
         let cfg = ManagementConfig {
             grpc_listen_addr: "127.0.0.1:17016".parse().unwrap(),
             mtls: None,
-            tokio_console: false,
             iq_capture_dir: "capture-iq-wav".into(),
         };
         assert!(cfg.mtls.is_none());
-        assert!(!cfg.tokio_console);
     }
 }

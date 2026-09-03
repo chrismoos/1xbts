@@ -1,11 +1,13 @@
 pub mod config;
 pub mod model;
+pub mod node;
 pub mod prl_proto;
 pub mod repository;
 pub mod service;
 
 pub use config::HlrNodeConfig;
 pub use model::MobileSeenUpsert;
+pub use node::{resolve_config_dir, run_node};
 
 // Nested layout matches the proto package hierarchy so prost's
 // generated `super::super::events::v1` paths resolve.

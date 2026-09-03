@@ -9,9 +9,9 @@ use crate::addressing::is_packet_data_so;
 impl Bsc {
     pub async fn run(mut self) -> Result<(), Error> {
         debug!("BSC starting.");
-        self.log_open_loop_power_init();
 
         let mut access_rx = self.config.access_event_rx.take();
+        let mut cell_detach_rx = self.config.cell_detach_rx.take();
         let mut sms_rx = self.config.sms_request_rx.take();
         let mut data_rx = self.config.data_request_rx.take();
         let mut power_override_rx = self.config.power_override_request_rx.take();
@@ -79,6 +79,9 @@ impl Bsc {
                 Some(power_req) = recv_or_pending(power_override_rx.as_mut()) => {
                     self.handle_traffic_power_override_request(power_req);
                 }
+                Some(cell) = recv_unbounded_or_pending(cell_detach_rx.as_mut()) => {
+                    self.handle_cell_detached(cell).await;
+                }
                 result = async {
                     match self.config.msc_voice_bearer.as_ref() {
                         Some(bearer) => bearer.recv().await,
@@ -127,15 +130,27 @@ impl Bsc {
         }
     }
 
+    /// How long an assignment may sit undelivered on `cell`. The budget is the
+    /// cell's own paging retransmission window plus the MS acknowledgment
+    /// wait, so the BSC gives up no earlier than the BTS stops resending.
+    fn assignment_delivery_timeout(
+        &self,
+        cell: Option<cdma_common::events::AccessCellId>,
+        ms_ack_timeout: Duration,
+    ) -> Duration {
+        let paging_retry = &self.config.bts.params(cell).paging_retry;
+        Duration::from_millis(paging_retry.ack_timeout_ms) + ms_ack_timeout
+    }
+
     pub(crate) fn next_traffic_lifecycle_deadline(
         &self,
         ms_ack_timeout: Duration,
     ) -> Option<tokio::time::Instant> {
-        let assignment_delivery_timeout =
-            Duration::from_millis(self.config.paging_retry.ack_timeout_ms) + ms_ack_timeout;
         self.mobiles
             .iter()
             .filter_map(|ms| {
+                let assignment_delivery_timeout =
+                    self.assignment_delivery_timeout(ms.serving_cell, ms_ack_timeout);
                 ms.traffic_channel().and_then(|tc| {
                     tc.next_traffic_lifecycle_deadline(ms_ack_timeout, assignment_delivery_timeout)
                 })
@@ -146,16 +161,17 @@ impl Bsc {
 
     pub(crate) async fn poll_traffic_channel_lifecycle(&mut self, ms_ack_timeout: Duration) {
         let now = Instant::now();
-        let assignment_delivery_timeout =
-            Duration::from_millis(self.config.paging_retry.ack_timeout_ms) + ms_ack_timeout;
         let actions: Vec<_> = self
             .mobiles
             .iter()
             .filter_map(|ms| {
+                let assignment_delivery_timeout =
+                    self.assignment_delivery_timeout(ms.serving_cell, ms_ack_timeout);
                 let tc = ms.traffic_channel()?;
                 match tc.traffic_lifecycle_action(ms_ack_timeout, assignment_delivery_timeout, now)
                 {
                     TrafficChannelAction::Teardown { reason, timeout_ms } => Some((
+                        ms.serving_cell?,
                         tc.walsh_code,
                         tc.voice_session_id,
                         tc.voice_leg_role,
@@ -167,12 +183,12 @@ impl Bsc {
             })
             .collect();
 
-        for (walsh_code, voice_session_id, voice_leg_role, reason, timeout_ms) in actions {
+        for (cell, walsh_code, voice_session_id, voice_leg_role, reason, timeout_ms) in actions {
             warn!(
                 "BSC: {} on walsh={} ({}ms), tearing down",
                 reason, walsh_code, timeout_ms
             );
-            self.teardown_traffic_channel(walsh_code).await;
+            self.teardown_traffic_channel(cell, walsh_code).await;
             self.on_voice_leg_released(voice_session_id, voice_leg_role);
         }
     }
@@ -209,6 +225,7 @@ impl Bsc {
                 }
                 match tc.packet_service_connecting_action(packet_service_connect_timeout, now) {
                     TrafficChannelAction::Teardown { reason, timeout_ms } => Some((
+                        ms.serving_cell?,
                         tc.walsh_code,
                         tc.voice_session_id,
                         tc.voice_leg_role,
@@ -220,12 +237,12 @@ impl Bsc {
             })
             .collect();
 
-        for (walsh_code, voice_session_id, voice_leg_role, reason, timeout_ms) in actions {
+        for (cell, walsh_code, voice_session_id, voice_leg_role, reason, timeout_ms) in actions {
             warn!(
                 "BSC: {} on walsh={} ({}ms), tearing down",
                 reason, walsh_code, timeout_ms
             );
-            self.teardown_traffic_channel(walsh_code).await;
+            self.teardown_traffic_channel(cell, walsh_code).await;
             self.on_voice_leg_released(voice_session_id, voice_leg_role);
         }
     }
@@ -240,24 +257,56 @@ impl Bsc {
             );
             if let (Some(call_id), A1ClearState::Idle) = (stale.a1_call_id, stale.a1_clear_state) {
                 self.a1.send_clear_request(call_id, 0);
-                self.mobiles.update_tc(stale.walsh_code, |_, tc| {
-                    tc.mark_a1_clear_request_sent();
-                });
+                self.mobiles
+                    .update_tc(stale.cell, stale.walsh_code, |_, tc| {
+                        tc.mark_a1_clear_request_sent();
+                    });
             }
-            if let Err(e) =
-                self.send_traffic_release_order(stale.walsh_code, super::DEFAULT_TRAFFIC_ACK_SEQ)
-            {
+            if let Err(e) = self.send_traffic_release_order(
+                stale.cell,
+                stale.walsh_code,
+                super::DEFAULT_TRAFFIC_ACK_SEQ,
+            ) {
                 warn!(
                     "BSC: failed to send Release Order on stale F-TCH walsh={}: {}; tearing down immediately",
                     stale.walsh_code, e
                 );
-                self.teardown_traffic_channel(stale.walsh_code).await;
+                self.teardown_traffic_channel(stale.cell, stale.walsh_code)
+                    .await;
                 self.on_voice_leg_released(stale.voice_session_id, stale.voice_leg_role);
                 continue;
             }
-            self.mobiles.update_tc(stale.walsh_code, |_, tc| {
-                tc.mark_releasing();
-            });
+            self.mobiles
+                .update_tc(stale.cell, stale.walsh_code, |_, tc| {
+                    tc.mark_releasing();
+                });
+        }
+    }
+
+    /// Release everything bound to a cell whose Abis link dropped. The BTS
+    /// frees its side when the connection closes, so nothing will send the
+    /// Remove or the Release Order for these — tear them down directly and
+    /// tell the MSC the calls are gone.
+    pub(crate) async fn handle_cell_detached(&mut self, cell: cdma_common::events::AccessCellId) {
+        let channels = self.mobiles.traffic_channels_on_cell(cell);
+        if channels.is_empty() {
+            return;
+        }
+        warn!(
+            "BSC: cell {:?} detached with {} active traffic channel(s), releasing them",
+            cell,
+            channels.len()
+        );
+        for chan in channels {
+            if let (Some(call_id), A1ClearState::Idle) = (chan.a1_call_id, chan.a1_clear_state) {
+                self.a1.send_clear_request(call_id, 0);
+                self.mobiles.update_tc(chan.cell, chan.walsh_code, |_, tc| {
+                    tc.mark_a1_clear_request_sent();
+                });
+            }
+            self.teardown_traffic_channel(chan.cell, chan.walsh_code)
+                .await;
+            self.on_voice_leg_released(chan.voice_session_id, chan.voice_leg_role);
         }
     }
 

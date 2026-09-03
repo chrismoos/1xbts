@@ -1,4 +1,5 @@
-import { getPcfManagementClient, waitForBscReady } from "@/lib/grpc/client";
+import { selectorFromUrl } from "@/lib/cell";
+import { getNetworkManagementClient, waitForManagementReady } from "@/lib/grpc/client";
 
 export const dynamic = "force-dynamic";
 
@@ -8,12 +9,15 @@ export async function POST(request: Request) {
 
   try {
     const body = await request.json();
-    await waitForBscReady();
-    const client = getPcfManagementClient();
+    await waitForManagementReady();
+    const client = getNetworkManagementClient();
     const result = await client.initiateDataCall(
       {
-        subscriberId: body.subscriberId || "",
-        serviceOption: body.serviceOption ?? 33,
+        selector: selectorFromUrl(request.url),
+        request: {
+          subscriberId: body.subscriberId || "",
+          serviceOption: body.serviceOption ?? 33,
+        },
       },
       { signal: abort.signal }
     );

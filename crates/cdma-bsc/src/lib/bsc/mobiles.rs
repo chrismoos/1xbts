@@ -1,7 +1,4 @@
 //! BSC mobile-station registry queries and lifecycle bookkeeping.
-//!
-//! WS-0 PR3 sibling module per
-//! `docs/architecture-update/09-pr3-method-map.md`.
 
 use std::{
     ops::{Deref, DerefMut},
@@ -25,8 +22,8 @@ use crate::addressing::{format_ms_address, format_ms_page_address, is_packet_dat
 use crate::power_control::TrafficChannelPowerSnapshot;
 
 use super::{
-    Bsc, EventService, TrafficChannelInfo, VoiceLegRole, mark_reverse_regular_msg_seq_received,
-    traffic_channel_power_snapshot,
+    AccessCellId, Bsc, BtsRegistry, EventService, TrafficChannelInfo, VoiceLegRole,
+    mark_reverse_regular_msg_seq_received, traffic_channel_power_snapshot,
 };
 
 /// Public snapshot of a registered mobile, for gRPC/UI consumption.
@@ -42,6 +39,9 @@ pub struct MobileInfo {
     pub page_address_detail: Option<MsPageAddress>,
     pub state: String,
     pub mob_p_rev: u8,
+    /// Cell that carried this mobile's last registration. Traffic, paging and
+    /// packet sessions for it are keyed on this cell.
+    pub serving_cell: Option<AccessCellId>,
     // Structured identity fields
     pub esn: Option<u32>,
     pub imsi: Option<String>,
@@ -54,12 +54,13 @@ pub struct MobileInfo {
     pub snr_db: Option<f32>,
     pub signal_power_db: Option<f32>,
     pub demod_quality_pct: Option<f32>,
-    /// Rx power in dBm (absolute), only present when rx_reference_dbm is configured.
+    /// Rx power in dBm (absolute), present only when the serving cell
+    /// enrolled a reverse-link power reference.
     pub rx_power_dbm: Option<f32>,
     /// Rx level in dBFS (relative to ADC full-scale), referred back to the ADC
     /// input by subtracting the RX matched-filter gain. Always populated when
-    /// the finger has accumulated raw input power, regardless of whether
-    /// rx_reference_dbm is configured.
+    /// the finger has accumulated raw input power, whether or not the serving
+    /// cell enrolled a power reference.
     pub rx_level_dbfs: Option<f32>,
     /// Milliseconds since Unix epoch of last access probe.
     pub last_heard_ms: Option<u64>,
@@ -108,6 +109,9 @@ pub(crate) struct MobileStation {
     imsi_mcc: Option<u16>,
     imsi_11_12: Option<u8>,
     pub(crate) mob_p_rev: u8,
+    /// Cell whose access channel carried this mobile's last registration.
+    /// A mobile has one serving cell and changes cell by re-registering.
+    pub(crate) serving_cell: Option<AccessCellId>,
     pub(crate) state: MsState,
     pub(crate) last_msg_seq: u8,
     /// Reverse access channel (r-csch) duplicate detection per C.S0004-E 3.1.1.2.2.2.
@@ -192,6 +196,7 @@ impl MobileStation {
             imsi_mcc,
             imsi_11_12,
             mob_p_rev,
+            serving_cell: None,
             state,
             last_msg_seq: 0,
             access_msg_seq_rcvd: [false; 8],
@@ -326,6 +331,7 @@ impl MobileStation {
             return None;
         }
         Some(VoiceReleaseTarget {
+            cell: self.serving_cell?,
             walsh_code: tc.walsh_code,
             release_voice_service_only: tc.voice_service_option.is_some()
                 && is_packet_data_so(tc.service_option),
@@ -481,8 +487,10 @@ pub(crate) struct MobileRegistryService {
 }
 
 pub(crate) struct StaleTrafficChannel {
-    /// `walsh_code` is the unique stable key for the traffic channel; the
-    /// owning mobile is resolved at teardown time via the registry.
+    /// Serving cell and Walsh code together are the stable key for the
+    /// traffic channel. The owning mobile is resolved at teardown time via
+    /// the registry.
+    pub(crate) cell: AccessCellId,
     pub(crate) walsh_code: u8,
     pub(crate) inactive_secs: u64,
     pub(crate) channel_state_label: Option<&'static str>,
@@ -507,6 +515,7 @@ pub(crate) struct AccessRegistrationUpdate {
 }
 
 pub(crate) struct VoiceReleaseTarget {
+    pub(crate) cell: AccessCellId,
     pub(crate) walsh_code: u8,
     pub(crate) release_voice_service_only: bool,
     pub(crate) a1_call_id: Option<u64>,
@@ -536,9 +545,9 @@ impl MobileRegistryService {
         }
     }
 
-    pub(crate) fn publish_snapshot(&self, rx_reference_dbm: Option<f64>) {
+    pub(crate) fn publish_snapshot(&self, bts: &BtsRegistry) {
         self.events
-            .publish_mobile_snapshot(self.registry.snapshot(rx_reference_dbm));
+            .publish_mobile_snapshot(self.registry.snapshot(bts));
     }
 
     pub(crate) fn apply_access_registration(
@@ -703,75 +712,95 @@ impl MobileRegistry {
         })
     }
 
-    pub(crate) fn get_by_walsh(&self, walsh_code: u8) -> Option<&MobileStation> {
-        self.entries
-            .iter()
-            .find(|ms| ms.find_traffic_channel_by_walsh(walsh_code).is_some())
+    /// Mobile holding `walsh_code` on `cell`.
+    ///
+    /// Every BTS allocates Walsh codes from its own pool, so the same code is
+    /// live on every cell at once. The serving cell is what makes the lookup
+    /// unique.
+    pub(crate) fn get_by_walsh(
+        &self,
+        cell: AccessCellId,
+        walsh_code: u8,
+    ) -> Option<&MobileStation> {
+        self.entries.iter().find(|ms| {
+            ms.serving_cell == Some(cell) && ms.find_traffic_channel_by_walsh(walsh_code).is_some()
+        })
     }
 
-    /// Read-only access to a traffic channel by its (unique) Walsh code.
-    pub(crate) fn get_traffic_channel(&self, walsh_code: u8) -> Option<&TrafficChannelInfo> {
-        self.entries
-            .iter()
-            .find_map(|ms| ms.find_traffic_channel_by_walsh(walsh_code))
+    /// Read-only access to the traffic channel on `cell` holding `walsh_code`.
+    pub(crate) fn get_traffic_channel(
+        &self,
+        cell: AccessCellId,
+        walsh_code: u8,
+    ) -> Option<&TrafficChannelInfo> {
+        self.get_by_walsh(cell, walsh_code)
+            .and_then(|ms| ms.find_traffic_channel_by_walsh(walsh_code))
     }
 
-    /// Mutable access to a traffic channel by its (unique) Walsh code.
+    /// Mutable access to the traffic channel on `cell` holding `walsh_code`.
     /// `&mut TrafficChannelInfo` is the only mutable reference the registry
     /// hands out — the parent `MobileStation` is reachable for mutation only
     /// via `update` / `update_tc` (which scope the borrow to a closure).
     pub(crate) fn get_traffic_channel_mut(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
     ) -> Option<&mut TrafficChannelInfo> {
         self.entries
             .iter_mut()
+            .filter(|ms| ms.serving_cell == Some(cell))
             .find_map(|ms| ms.find_traffic_channel_by_walsh_mut(walsh_code))
     }
 
-    /// Resolve a stable address from a Walsh code (e.g. for log lines or
-    /// call sites that need the mobile address downstream).
-    pub(crate) fn address_by_walsh(&self, walsh_code: u8) -> Option<MsAddress> {
-        self.get_by_walsh(walsh_code)
+    /// Resolve a stable address from a cell and Walsh code (e.g. for log lines
+    /// or call sites that need the mobile address downstream).
+    pub(crate) fn address_by_walsh(&self, cell: AccessCellId, walsh_code: u8) -> Option<MsAddress> {
+        self.get_by_walsh(cell, walsh_code)
             .map(|ms| ms.fwd_address.clone())
     }
 
-    /// Resolve `(fwd_address, walsh_code)` for an A1 call. Returns the
+    /// Resolve `(fwd_address, cell, walsh_code)` for an A1 call. Returns the
     /// stable keys; callers do not see the registry's internal index.
-    pub(crate) fn locate_a1_call(&self, call_id: u64) -> Option<(MsAddress, u8)> {
+    pub(crate) fn locate_a1_call(&self, call_id: u64) -> Option<(MsAddress, AccessCellId, u8)> {
         self.entries.iter().find_map(|ms| {
-            ms.a1_call_walsh(call_id)
-                .map(|walsh| (ms.fwd_address.clone(), walsh))
+            let walsh = ms.a1_call_walsh(call_id)?;
+            Some((ms.fwd_address.clone(), ms.serving_cell?, walsh))
         })
     }
 
-    /// All `(fwd_address, walsh_code)` for an A1 call. MS-MS calls share one
-    /// call_id across both legs; routers need to disambiguate by inspecting
+    /// All `(fwd_address, cell, walsh_code)` for an A1 call. MS-MS calls share
+    /// one call_id across both legs, so routers disambiguate by inspecting
     /// each TC's `voice_leg_role`.
-    pub(crate) fn all_walshes_for_a1_call(&self, call_id: u64) -> Vec<(MsAddress, u8)> {
+    pub(crate) fn all_walshes_for_a1_call(
+        &self,
+        call_id: u64,
+    ) -> Vec<(MsAddress, AccessCellId, u8)> {
         self.entries
             .iter()
             .filter_map(|ms| {
-                ms.a1_call_walsh(call_id)
-                    .map(|walsh| (ms.fwd_address.clone(), walsh))
+                let walsh = ms.a1_call_walsh(call_id)?;
+                Some((ms.fwd_address.clone(), ms.serving_cell?, walsh))
             })
             .collect()
     }
 
-    /// Resolve `(fwd_address, walsh_code)` for an MSC bearer circuit ID.
-    pub(crate) fn locate_msc_circuit(&self, circuit_id: u16) -> Option<(MsAddress, u8)> {
+    /// Resolve `(fwd_address, cell, walsh_code)` for an MSC bearer circuit ID.
+    pub(crate) fn locate_msc_circuit(
+        &self,
+        circuit_id: u16,
+    ) -> Option<(MsAddress, AccessCellId, u8)> {
         self.entries.iter().find_map(|ms| {
-            ms.msc_circuit_walsh(circuit_id)
-                .map(|walsh| (ms.fwd_address.clone(), walsh))
+            let walsh = ms.msc_circuit_walsh(circuit_id)?;
+            Some((ms.fwd_address.clone(), ms.serving_cell?, walsh))
         })
     }
 
-    /// Walsh codes of all traffic channels currently carrying voice.
-    /// Replaces `active_voice_entries` (which leaked indexes).
-    pub(crate) fn active_voice_walsh_codes(&self) -> Vec<u8> {
+    /// Serving cell and Walsh code of every traffic channel currently
+    /// carrying voice.
+    pub(crate) fn active_voice_channels(&self) -> Vec<(AccessCellId, u8)> {
         self.entries
             .iter()
-            .filter_map(|ms| ms.active_voice_walsh())
+            .filter_map(|ms| Some((ms.serving_cell?, ms.active_voice_walsh()?)))
             .collect()
     }
 
@@ -805,14 +834,16 @@ impl MobileRegistry {
     /// mobile *and* its traffic channel together for sites that need both.
     pub(crate) fn update_tc<R>(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         f: impl FnOnce(&mut MobileStation, &mut TrafficChannelInfo) -> R,
     ) -> Option<R> {
         for ms in self.entries.iter_mut() {
-            if ms
-                .traffic_channel
-                .as_ref()
-                .is_some_and(|tc| tc.walsh_code == walsh_code)
+            if ms.serving_cell == Some(cell)
+                && ms
+                    .traffic_channel
+                    .as_ref()
+                    .is_some_and(|tc| tc.walsh_code == walsh_code)
             {
                 // Split the borrow safely by first taking the TC out, calling
                 // `f` on (`ms`, `tc`), then putting the TC back. This sidesteps
@@ -831,13 +862,16 @@ impl MobileRegistry {
     pub(crate) fn acknowledge_assignment_delivery(
         &mut self,
         correlation_id: u32,
-    ) -> Option<(MsAddress, u8)> {
+    ) -> Option<(MsAddress, AccessCellId, u8)> {
         for ms in self.entries.iter_mut() {
+            let Some(cell) = ms.serving_cell else {
+                continue;
+            };
             let Some(tc) = ms.traffic_channel.as_mut() else {
                 continue;
             };
             if tc.acknowledge_assignment_delivery(correlation_id) {
-                return Some((ms.fwd_address.clone(), tc.walsh_code));
+                return Some((ms.fwd_address.clone(), cell, tc.walsh_code));
             }
         }
         None
@@ -846,21 +880,26 @@ impl MobileRegistry {
     pub(crate) fn pending_assignment_for_correlation(
         &self,
         correlation_id: u32,
-    ) -> Option<(MsAddress, u8)> {
+    ) -> Option<(MsAddress, AccessCellId, u8)> {
         self.entries.iter().find_map(|ms| {
             let tc = ms.traffic_channel.as_ref()?;
-            (tc.is_assigned() && tc.assignment_correlation_id == Some(correlation_id))
-                .then(|| (ms.fwd_address.clone(), tc.walsh_code))
+            if !tc.is_assigned() || tc.assignment_correlation_id != Some(correlation_id) {
+                return None;
+            }
+            Some((ms.fwd_address.clone(), ms.serving_cell?, tc.walsh_code))
         })
     }
 
     /// Iterate every mobile that currently has an active voice traffic
-    /// channel, calling `f(&mut ms, walsh)` for each. The borrow is scoped
-    /// per-iteration; no caller-held idx, no slice escape.
-    pub(crate) fn for_each_active_voice(&mut self, mut f: impl FnMut(&mut MobileStation, u8)) {
+    /// channel, calling `f(&mut ms, cell, walsh)` for each. The borrow is
+    /// scoped per-iteration, with no caller-held index and no slice escape.
+    pub(crate) fn for_each_active_voice(
+        &mut self,
+        mut f: impl FnMut(&mut MobileStation, AccessCellId, u8),
+    ) {
         for ms in self.entries.iter_mut() {
-            if let Some(walsh) = ms.active_voice_walsh() {
-                f(ms, walsh);
+            if let (Some(cell), Some(walsh)) = (ms.serving_cell, ms.active_voice_walsh()) {
+                f(ms, cell, walsh);
             }
         }
     }
@@ -877,10 +916,37 @@ impl MobileRegistry {
         }
     }
 
+    /// Every traffic channel bound to `cell`, for release when the cell
+    /// detaches. Includes channels that are already releasing, whose release
+    /// handshake cannot complete once the cell is gone.
+    pub(crate) fn traffic_channels_on_cell(&self, cell: AccessCellId) -> Vec<StaleTrafficChannel> {
+        self.entries
+            .iter()
+            .filter_map(|ms| {
+                let serving = ms.serving_cell?;
+                if serving != cell {
+                    return None;
+                }
+                let tc = ms.traffic_channel()?;
+                Some(StaleTrafficChannel {
+                    cell: serving,
+                    walsh_code: tc.walsh_code,
+                    inactive_secs: tc.last_activity_at.elapsed().as_secs(),
+                    channel_state_label: Some(tc.channel_state.label()),
+                    voice_session_id: tc.voice_session_id,
+                    voice_leg_role: tc.voice_leg_role,
+                    a1_call_id: tc.a1_call_id,
+                    a1_clear_state: tc.a1_clear_state,
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn stale_traffic_channels(&self, timeout: Duration) -> Vec<StaleTrafficChannel> {
         self.entries
             .iter()
             .filter_map(|ms| {
+                let cell = ms.serving_cell?;
                 let tc = ms.traffic_channel()?;
                 if tc.is_releasing() {
                     return None;
@@ -890,6 +956,7 @@ impl MobileRegistry {
                     return None;
                 }
                 Some(StaleTrafficChannel {
+                    cell,
                     walsh_code: tc.walsh_code,
                     inactive_secs: tc.last_activity_at.elapsed().as_secs(),
                     channel_state_label: Some(tc.channel_state.label()),
@@ -916,48 +983,52 @@ impl<'a> IntoIterator for &'a MobileRegistry {
 }
 
 impl MobileRegistry {
-    pub(crate) fn snapshot(&self, rx_reference_dbm: Option<f64>) -> Vec<MobileInfo> {
+    pub(crate) fn snapshot(&self, bts: &BtsRegistry) -> Vec<MobileInfo> {
         self.iter()
-            .map(|ms| MobileInfo {
-                address: format_ms_address(&ms.fwd_address),
-                page_address: ms
-                    .page_address()
-                    .as_ref()
-                    .map_or("none".to_string(), format_ms_page_address),
-                forward_address: Some(ms.fwd_address.clone()),
-                page_address_detail: ms.page_address(),
-                state: format!("{:?}", ms.state),
-                mob_p_rev: ms.mob_p_rev,
-                esn: ms.esn,
-                imsi: ms.imsi.clone(),
-                meid: ms.meid.clone(),
-                pgslot: ms.pgslot,
-                slot_cycle_index: ms.slot_cycle_index,
-                snr_db: ms.snr_db,
-                signal_power_db: ms.signal_power_db,
-                demod_quality_pct: ms.demod_quality_pct,
-                rx_power_dbm: ms
-                    .raw_power_db
-                    .and_then(|rp| rx_reference_dbm.map(|ref_dbm| rp + ref_dbm as f32)),
-                rx_level_dbfs: ms.raw_power_db,
-                last_heard_ms: ms.last_heard_ms,
-                phone_number: ms.phone_number.clone(),
-                subscriber_display_name: ms.subscriber_display_name.clone(),
-                subscriber_id: ms.subscriber_id.map(|id| id.to_string()),
-                traffic_call_connection_ref: ms
-                    .traffic_channel
-                    .as_ref()
-                    .map(|tc| tc.call_connection_ref),
-                traffic_walsh_code: ms.traffic_channel.as_ref().map(|tc| tc.walsh_code),
-                traffic_service_option: ms.traffic_channel.as_ref().map(|tc| tc.service_option),
-                voice_call_state: ms
-                    .traffic_channel
-                    .as_ref()
-                    .map(|tc| tc.channel_state.label().to_string()),
-                traffic_power: ms
-                    .traffic_channel
-                    .as_ref()
-                    .map(traffic_channel_power_snapshot),
+            .map(|ms| {
+                let rx_reference_dbm = bts.params(ms.serving_cell).rx_reference_dbm;
+                MobileInfo {
+                    address: format_ms_address(&ms.fwd_address),
+                    page_address: ms
+                        .page_address()
+                        .as_ref()
+                        .map_or("none".to_string(), format_ms_page_address),
+                    forward_address: Some(ms.fwd_address.clone()),
+                    page_address_detail: ms.page_address(),
+                    state: format!("{:?}", ms.state),
+                    mob_p_rev: ms.mob_p_rev,
+                    serving_cell: ms.serving_cell,
+                    esn: ms.esn,
+                    imsi: ms.imsi.clone(),
+                    meid: ms.meid.clone(),
+                    pgslot: ms.pgslot,
+                    slot_cycle_index: ms.slot_cycle_index,
+                    snr_db: ms.snr_db,
+                    signal_power_db: ms.signal_power_db,
+                    demod_quality_pct: ms.demod_quality_pct,
+                    rx_power_dbm: ms
+                        .raw_power_db
+                        .and_then(|rp| rx_reference_dbm.map(|ref_dbm| rp + ref_dbm as f32)),
+                    rx_level_dbfs: ms.raw_power_db,
+                    last_heard_ms: ms.last_heard_ms,
+                    phone_number: ms.phone_number.clone(),
+                    subscriber_display_name: ms.subscriber_display_name.clone(),
+                    subscriber_id: ms.subscriber_id.map(|id| id.to_string()),
+                    traffic_call_connection_ref: ms
+                        .traffic_channel
+                        .as_ref()
+                        .map(|tc| tc.call_connection_ref),
+                    traffic_walsh_code: ms.traffic_channel.as_ref().map(|tc| tc.walsh_code),
+                    traffic_service_option: ms.traffic_channel.as_ref().map(|tc| tc.service_option),
+                    voice_call_state: ms
+                        .traffic_channel
+                        .as_ref()
+                        .map(|tc| tc.channel_state.label().to_string()),
+                    traffic_power: ms
+                        .traffic_channel
+                        .as_ref()
+                        .map(traffic_channel_power_snapshot),
+                }
             })
             .collect()
     }
@@ -1102,6 +1173,9 @@ impl MobileRegistry {
                 update.imsi_11_12,
             );
             ms.mob_p_rev = update.mob_p_rev;
+            if let Some(cell) = event.cell {
+                ms.serving_cell = Some(cell);
+            }
             if update.explicit_registration {
                 ms.set_state(MsState::Registered);
             }
@@ -1170,6 +1244,7 @@ impl MobileRegistry {
             imsi_mcc: update.imsi_mcc,
             imsi_11_12: update.imsi_11_12,
             mob_p_rev: update.mob_p_rev,
+            serving_cell: event.cell,
             state: MsState::Registered,
             last_msg_seq: update.last_msg_seq,
             access_msg_seq_rcvd: [false; 8],
@@ -1284,7 +1359,7 @@ impl Bsc {
     /// `mobiles_tx` watch channel for UI / management consumers. No-op
     /// when no transmitter is configured.
     pub(crate) fn publish_mobiles(&self) {
-        self.mobiles.publish_snapshot(self.config.rx_reference_dbm);
+        self.mobiles.publish_snapshot(&self.config.bts);
     }
 
     /// Refresh activity bookkeeping for a registered mobile after an
@@ -1304,10 +1379,14 @@ impl Bsc {
     /// Drain BTS access-channel signal quality measurements and merge them
     /// into the registered mobile table by matching on ESN or IMSI.
     pub(crate) fn apply_rx_measurements(&mut self) {
-        let measurements = match self.config.bts_client.as_ref() {
-            Some(client) => client.drain_rx_measurements(),
-            None => return,
-        };
+        let measurements: Vec<_> = self
+            .config
+            .bts
+            .in_service()
+            .iter()
+            .filter_map(|entry| entry.control())
+            .flat_map(|client| client.drain_rx_measurements())
+            .collect();
         if measurements.is_empty() {
             return;
         }
@@ -1342,22 +1421,18 @@ impl Bsc {
             return None;
         };
 
-        let defaults = &self
-            .config
-            .paging
-            .message_defaults
-            .extended_system_parameters;
+        let cell_params = self.config.bts.params(event.cell);
         // Class 0 and legacy MSID formats (imsi_class == None) use overhead
         // MCC/IMSI_11_12 for the digits the mobile omitted. Class 1 always
         // carries its own, so no fallback needed.
         let use_overhead = event.imsi_class.is_none() || event.imsi_class == Some(0);
-        let fallback_mcc = if use_overhead && defaults.mcc <= 999 {
-            Some(defaults.mcc)
+        let fallback_mcc = if use_overhead && cell_params.mcc <= 999 {
+            Some(cell_params.mcc)
         } else {
             None
         };
-        let fallback_imsi_11_12 = if use_overhead && defaults.imsi_11_12 <= 99 {
-            Some(defaults.imsi_11_12)
+        let fallback_imsi_11_12 = if use_overhead && cell_params.imsi_11_12 <= 99 {
+            Some(cell_params.imsi_11_12)
         } else {
             None
         };
@@ -1369,7 +1444,7 @@ impl Bsc {
             warn!(
                 "BSC: cannot derive IMSI — no MCC available \
                  (event_mcc={:?}, fallback={:?}, overhead_mcc={}, imsi_class={:?})",
-                event.imsi_mcc, fallback_mcc, defaults.mcc, event.imsi_class,
+                event.imsi_mcc, fallback_mcc, cell_params.mcc, event.imsi_class,
             );
             return None;
         };
@@ -1377,7 +1452,7 @@ impl Bsc {
             warn!(
                 "BSC: cannot derive IMSI — no IMSI_11_12 available \
                  (event={:?}, fallback={:?}, overhead={}, imsi_class={:?})",
-                event.imsi_11_12, fallback_imsi_11_12, defaults.imsi_11_12, event.imsi_class,
+                event.imsi_11_12, fallback_imsi_11_12, cell_params.imsi_11_12, event.imsi_class,
             );
             return None;
         };

@@ -118,6 +118,18 @@ export function hrpdPacketSessionUati(session: HrpdPacketSessionKeyFields): numb
   );
 }
 
+// Color code of the cell that issued a packet session's UATI: the top byte of
+// the on-air identifier. Only the UATI-bearing identifiers carry it, so the
+// Walsh-code fallback `hrpdPacketSessionUati` accepts is not consulted here.
+export function hrpdPacketSessionColorCode(
+  session: Pick<HrpdPacketSessionKeyFields, "mobileAddress" | "sessionId">,
+): number | undefined {
+  const uati =
+    parseHrpdPacketMobileAddress(session.mobileAddress) ??
+    parseHrpdA10SessionId(session.sessionId);
+  return uati == null ? undefined : (uati >>> 24) & 0xff;
+}
+
 export function hrpdSessionMatchesPacket(
   hrpdSession: HrpdSessionKeyFields,
   packetSession: HrpdPacketSessionKeyFields,

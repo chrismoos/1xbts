@@ -23,13 +23,12 @@ services:
     container_name: 1xbts-web
     network_mode: host
     working_dir: /app
-    command: sh -c "npm i -g pnpm@11.20.0 && pnpm install --store-dir /pnpm-store && pnpm dev --hostname 0.0.0.0"
+    command: sh -c "npm i -g pnpm@11.20.0 && pnpm install --store-dir /pnpm-store && pnpm build && pnpm start --hostname 0.0.0.0"
     environment:
-      MANAGEMENT_GRPC_ADDRESS: ${MANAGEMENT_GRPC_ADDRESS:-127.0.0.1:17016}
       MSC_GRPC_ADDRESS: ${MSC_GRPC_ADDRESS:-127.0.0.1:17017}
-      AN_GRPC_ADDRESS: ${AN_GRPC_ADDRESS:-127.0.0.1:17030}
+      HLR_GRPC_ADDRESS: ${HLR_GRPC_ADDRESS:-127.0.0.1:17019}
+      SMSC_GRPC_ADDRESS: ${SMSC_GRPC_ADDRESS:-127.0.0.1:17020}
       EVENTS_GRPC_ADDRESS: ${EVENTS_GRPC_ADDRESS:-127.0.0.1:17023}
-      WATCHPACK_POLLING: "true"
     volumes:
       - ./1xbts-web:/app
       - 1xbts-web-node-modules:/app/node_modules

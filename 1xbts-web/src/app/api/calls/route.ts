@@ -1,4 +1,4 @@
-import { getMscManagementClient, waitForBscReady } from "@/lib/grpc/client";
+import { getMscManagementClient, waitForManagementReady } from "@/lib/grpc/client";
 import { validatePhoneNumber } from "@/lib/validation";
 
 export const dynamic = "force-dynamic";
@@ -20,7 +20,7 @@ export async function POST(request: Request) {
         );
       }
     }
-    await waitForBscReady();
+    await waitForManagementReady();
     const client = getMscManagementClient();
     const result = await client.initiateCall(
       {

@@ -5,12 +5,19 @@
     "cdma_channel": 691
   },
   "pilot_offset": 0,
+  "sector": 1,
+  "iq_capture_dir": "captures",
   "evdo": {
     "enabled": false,
     "channel": 630,
     "advertise_on_1x": true,
     "gain": 1.0,
     "mode": "composite",
+    "a9": {
+      "pcf_addr": "127.0.0.1:17046",
+      "pcf_a8_addr": "127.0.0.1:17041",
+      "a8_bind_addr": "127.0.0.1:17040"
+    },
     "overhead": {
       "sector_id": "00800580000000000000000000000000",
       "subnet_mask": 26,
@@ -247,6 +254,15 @@
   "abis": {
     "bind_addr": "127.0.0.1:5604"
   },
+  "management": {
+    "bind_addr": "127.0.0.1:17024"
+  },
+  "paging_retry": {
+    "ack_timeout_ms": 15000,
+    "max_retries": 0
+  },
+  "events_endpoint": "http://127.0.0.1:17023",
+  "hlr_endpoint": "http://127.0.0.1:17019",
   "bearer": {
     "bind_addr": "127.0.0.1:17014",
     "remote_addr": "127.0.0.1:17022"

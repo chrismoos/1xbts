@@ -20,7 +20,7 @@ use crate::power_control::{
     ForwardPowerControlState, PowerControlState, TrafficChannelPowerSnapshot,
 };
 
-use super::{A1ClearState, VoiceAlertMode, VoiceLegRole};
+use super::{A1ClearState, AccessCellId, VoiceAlertMode, VoiceLegRole};
 
 pub(crate) const VOICE_TRAFFIC_CON_REF: u8 = 1;
 pub(crate) const VOICE_TRAFFIC_SR_ID: u8 = 2;
@@ -28,6 +28,9 @@ pub(crate) const VOICE_TRAFFIC_SR_ID: u8 = 2;
 /// Request to pin or clear the reverse inner-loop target on an active
 /// traffic channel.
 pub struct TrafficPowerOverrideRequest {
+    /// Cell that allocated `walsh_code`. Each BTS allocates Walsh codes from
+    /// its own pool, so the code alone does not name a channel.
+    pub cell: AccessCellId,
     pub walsh_code: u8,
     pub action: TrafficPowerOverrideAction,
     pub response_tx: oneshot::Sender<Result<TrafficChannelPowerSnapshot, String>>,

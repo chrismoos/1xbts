@@ -161,6 +161,7 @@ pub(super) fn build_access_event(
 
     Some(AccessChannelEvent {
         event_id: super::next_access_event_id(),
+        cell: None,
         chip_start: blk.chip_start,
         absolute_chip_start,
         receive_time,
@@ -314,6 +315,7 @@ pub(super) fn build_traffic_event(
 
     Some(AccessChannelEvent {
         event_id: super::next_access_event_id(),
+        cell: None,
         chip_start: blk.chip_start,
         absolute_chip_start,
         receive_time,
@@ -439,6 +441,7 @@ pub(super) fn build_traffic_phy_status_event(
 
     Some(AccessChannelEvent {
         event_id: super::next_access_event_id(),
+        cell: None,
         chip_start: blk.chip_start,
         absolute_chip_start,
         receive_time,
@@ -564,6 +567,7 @@ pub(super) fn build_traffic_voice_event(
 
     Some(AccessChannelEvent {
         event_id: super::next_access_event_id(),
+        cell: None,
         chip_start: blk.chip_start,
         absolute_chip_start,
         receive_time,
@@ -657,6 +661,7 @@ pub(super) fn build_traffic_preamble_event(
 ) -> AccessChannelEvent {
     AccessChannelEvent {
         event_id: super::next_access_event_id(),
+        cell: None,
         chip_start,
         absolute_chip_start: None,
         receive_time: None,
@@ -764,6 +769,7 @@ pub(super) fn build_traffic_pcg_measurement_event(
 
     Some(AccessChannelEvent {
         event_id: super::next_access_event_id(),
+        cell: None,
         chip_start: blk.chip_start,
         absolute_chip_start,
         receive_time,

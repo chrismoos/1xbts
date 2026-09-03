@@ -1,0 +1,37 @@
+syntax = "proto3";
+package base_station.v1;
+
+import "bsc/v1/service.proto";
+
+// Identity and served cells of a base station, the element that terminates
+// A1 toward the MSC. A BSC is a base station serving every cell enrolled with
+// it. Enrollment precedes the A1 dial, so identity never rides A1.
+service BaseStationService {
+  // Returns the node as it stands. Every call reports the current served
+  // cells, so calling again refreshes them.
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+}
+
+message EnrollRequest {}
+
+message EnrollResponse {
+  // Stable identifier the node writes into registration bindings. Unique
+  // across every base station one MSC serves.
+  string node_id = 1;
+  // Address the node's A1 signaling listener accepts the MSC on.
+  string a1_addr = 2;
+  repeated ServedCell cells = 3;
+}
+
+// One cell a base station serves, with the identity it broadcasts.
+message ServedCell {
+  bsc.v1.CellId cell = 1;
+  uint32 sid = 2;
+  uint32 nid = 3;
+  // Decimal digits as broadcast, e.g. "310".
+  string mcc_digits = 4;
+  // Decimal digits as broadcast, e.g. "00".
+  string imsi_11_12_digits = 5;
+  // Whether the cell currently carries traffic.
+  bool in_service = 6;
+}

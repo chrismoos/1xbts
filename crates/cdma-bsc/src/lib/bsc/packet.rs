@@ -20,7 +20,7 @@ use super::traffic_bearer::{
     send_forward_fch_bits_with_bearer_client, send_forward_sch_bits_with_bearer_client,
 };
 use super::traffic_forward::fsch_escam_start_time_mod32;
-use super::{Bsc, TrafficChannelInfo, VoiceLegRole};
+use super::{AccessCellId, Bsc, TrafficChannelInfo, VoiceLegRole};
 
 /// Request to initiate a BS-originated data call to a subscriber.
 pub struct DataCallRequest {
@@ -108,8 +108,12 @@ impl Bsc {
         );
     }
 
-    pub(crate) async fn start_packet_session_after_service_connect(&mut self, walsh_code: u8) {
-        let Some(ms) = self.mobiles.get_by_walsh(walsh_code) else {
+    pub(crate) async fn start_packet_session_after_service_connect(
+        &mut self,
+        cell: AccessCellId,
+        walsh_code: u8,
+    ) {
+        let Some(ms) = self.mobiles.get_by_walsh(cell, walsh_code) else {
             return;
         };
         let Some(tc) = ms.find_traffic_channel_by_walsh(walsh_code) else {
@@ -159,8 +163,8 @@ impl Bsc {
         };
 
         // Abis Burst allocates the SCH code; ESCAM activates it on the MS.
-        let bts_client = self.config.bts_client.clone();
-        let sch_code: Option<u8> = self.try_activate_fsch(walsh_code).await;
+        let bts_client = self.client_for_cell(cell);
+        let sch_code: Option<u8> = self.try_activate_fsch(cell, walsh_code).await;
         // After ESCAM, enable rate-matched SCH frames in the packet session.
         let f_sch_rate_bps = self.config.traffic_assignment.f_sch_rate_bps;
         if let Some(sch_code) = sch_code {
@@ -175,14 +179,21 @@ impl Bsc {
                 );
                 let profile = Rc3FschProfile::from_rate_bps(f_sch_rate_bps)
                     .unwrap_or_else(Rc3FschProfile::default_19k2);
-                self.release_fsch_allocation(walsh_code, sch_code, profile, true, "PCF failure")
-                    .await;
+                self.release_fsch_allocation(
+                    cell,
+                    walsh_code,
+                    sch_code,
+                    profile,
+                    true,
+                    "PCF failure",
+                )
+                .await;
             }
         }
         // Re-read after the possible rollback above.
         let sch_code: Option<u8> = self
             .mobiles
-            .get_traffic_channel(walsh_code)
+            .get_traffic_channel(cell, walsh_code)
             .and_then(|tc| tc.sch_walsh_code);
         let sch_bearer_for_task: Option<(u8, u32)> = sch_code.map(|code| (code, 0));
         let walsh_for_log = walsh_code;
@@ -260,7 +271,7 @@ impl Bsc {
         let dl_task_cell = std::sync::Mutex::new(Some(dl_task));
         let installed = self
             .mobiles
-            .update_tc(walsh_code, |_, tc| {
+            .update_tc(cell, walsh_code, |_, tc| {
                 if tc.packet_session_id.is_some() {
                     return false;
                 }
@@ -281,9 +292,13 @@ impl Bsc {
         }
     }
 
-    pub(crate) fn replace_packet_service_with_voice(&mut self, walsh_code: u8) -> Option<String> {
+    pub(crate) fn replace_packet_service_with_voice(
+        &mut self,
+        cell: AccessCellId,
+        walsh_code: u8,
+    ) -> Option<String> {
         self.mobiles
-            .update_tc(walsh_code, |_, tc| {
+            .update_tc(cell, walsh_code, |_, tc| {
                 let voice_so = tc.voice_service_option?;
                 if !is_packet_data_so(tc.service_option) {
                     return None;
@@ -299,18 +314,22 @@ impl Bsc {
 
     /// Allocate F-SCH through Abis Burst, then activate it with ESCAM.
     /// Returns the SCH Walsh code on success.
-    pub(crate) async fn try_activate_fsch(&mut self, walsh_code: u8) -> Option<u8> {
-        self.fsch_for_service_connect(walsh_code)?;
+    pub(crate) async fn try_activate_fsch(
+        &mut self,
+        cell: AccessCellId,
+        walsh_code: u8,
+    ) -> Option<u8> {
+        self.fsch_for_service_connect(cell, walsh_code)?;
         let profile = Rc3FschProfile::from_rate_bps(self.config.traffic_assignment.f_sch_rate_bps)
             .unwrap_or_else(Rc3FschProfile::default_19k2);
-        let bts_client = self.config.bts_client.clone()?;
+        let bts_client = self.client_for_cell(cell)?;
         // The Abis reservation and ESCAM must carry the same modulo-32 start boundary.
         let start_time_mod32 = fsch_escam_start_time_mod32();
         let request = ForwardBurstRadioInfo {
             coding_indicator: profile.coding_indicator,
             qof_mask: 0,
             forward_code_channel_index: 0,
-            pilot_pn_code: self.config.pilot_offset as u16,
+            pilot_pn_code: self.params_for_cell(cell).pilot_offset as u16,
             forward_supplemental_channel_rate: profile.num_bits_idx,
             forward_supplemental_channel_start_time: start_time_mod32,
             start_time_unit: 0,
@@ -321,13 +340,16 @@ impl Bsc {
             .await?;
         let sch_code = committed.forward_code_channel_index as u8;
 
-        if let Err(e) = self.send_escam_for_fsch(walsh_code, sch_code, profile, start_time_mod32) {
+        if let Err(e) =
+            self.send_escam_for_fsch(cell, walsh_code, sch_code, profile, start_time_mod32)
+        {
             warn!(
                 "BSC: F-SCH allocated (code={}) on walsh={} but ESCAM send failed: {}; \
                  releasing SCH",
                 sch_code, walsh_code, e
             );
             self.release_fsch_allocation(
+                cell,
                 walsh_code,
                 sch_code,
                 profile,
@@ -337,7 +359,7 @@ impl Bsc {
             .await;
             return None;
         }
-        self.mobiles.update_tc(walsh_code, |_, tc| {
+        self.mobiles.update_tc(cell, walsh_code, |_, tc| {
             tc.sch_walsh_code = Some(sch_code);
             tc.sch_bearer_id = Some(sch_code as u32);
         });
@@ -351,13 +373,15 @@ impl Bsc {
 
     pub(crate) async fn release_fsch_allocation(
         &mut self,
+        cell: AccessCellId,
         walsh_code: u8,
         sch_code: u8,
         profile: Rc3FschProfile,
         notify_ms: bool,
         reason: &str,
     ) {
-        if notify_ms && let Err(e) = self.send_escam_release_for_fsch(walsh_code, sch_code, profile)
+        if notify_ms
+            && let Err(e) = self.send_escam_release_for_fsch(cell, walsh_code, sch_code, profile)
         {
             warn!(
                 "BSC: failed to send F-SCH release ESCAM walsh={} sch_code={} after {}: {}",
@@ -365,21 +389,21 @@ impl Bsc {
             );
         }
 
-        self.mobiles.update_tc(walsh_code, |_, tc| {
+        self.mobiles.update_tc(cell, walsh_code, |_, tc| {
             if tc.sch_walsh_code == Some(sch_code) {
                 tc.sch_walsh_code = None;
                 tc.sch_bearer_id = None;
             }
         });
 
-        let Some(bts_client) = self.config.bts_client.clone() else {
+        let Some(bts_client) = self.client_for_cell(cell) else {
             return;
         };
         let release = ForwardBurstRadioInfo {
             coding_indicator: profile.coding_indicator,
             qof_mask: 0,
             forward_code_channel_index: sch_code as u16,
-            pilot_pn_code: self.config.pilot_offset as u16,
+            pilot_pn_code: self.params_for_cell(cell).pilot_offset as u16,
             forward_supplemental_channel_rate: profile.num_bits_idx,
             forward_supplemental_channel_start_time: 0,
             start_time_unit: 0,

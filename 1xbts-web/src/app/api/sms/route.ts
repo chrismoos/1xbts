@@ -1,4 +1,4 @@
-import { getMscManagementClient, waitForBscReady } from "@/lib/grpc/client";
+import { getMscManagementClient, waitForManagementReady } from "@/lib/grpc/client";
 
 export const dynamic = "force-dynamic";
 
@@ -11,7 +11,7 @@ export async function POST(request: Request) {
     console.log(
       `[sms] gRPC call: dest=${body.destinationNumber} imsi=${body.destinationImsi}`,
     );
-    await waitForBscReady();
+    await waitForManagementReady();
     const client = getMscManagementClient();
     const result = await client.sendSms(
       {

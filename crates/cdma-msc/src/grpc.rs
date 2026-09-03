@@ -22,6 +22,12 @@ pub mod events {
 // Backwards-compatible alias used by `crate::otasp::*` modules.
 pub use events as events_proto;
 
+pub mod base_station {
+    pub mod v1 {
+        tonic::include_proto!("base_station.v1");
+    }
+}
+
 pub mod msc_management {
     pub mod v1 {
         tonic::include_proto!("msc_management.v1");
@@ -34,6 +40,56 @@ pub mod voice_gateway {
     }
 }
 
+pub mod an {
+    pub mod v1 {
+        tonic::include_proto!("an.v1");
+    }
+}
+
+pub mod packet {
+    pub mod v1 {
+        tonic::include_proto!("packet.v1");
+    }
+}
+
+pub mod bts_management {
+    pub mod v1 {
+        tonic::include_proto!("bts_management.v1");
+    }
+}
+
+pub mod bsc_management {
+    pub mod v1 {
+        tonic::include_proto!("bsc_management.v1");
+    }
+}
+
+pub mod pcf_management {
+    pub mod v1 {
+        tonic::include_proto!("pcf_management.v1");
+    }
+}
+
+pub mod pdsn_management {
+    pub mod v1 {
+        tonic::include_proto!("pdsn_management.v1");
+    }
+}
+
+pub mod management {
+    pub mod v1 {
+        tonic::include_proto!("management.v1");
+    }
+}
+
+// The single network management interface. Its implementation lives in
+// `crate::mgmt_proxy`.
+pub mod mgmt {
+    pub mod v1 {
+        tonic::include_proto!("mgmt.v1");
+    }
+}
+
 use bsc::v1 as proto;
 use msc_management::v1 as mgmt_proto;
 use msc_management::v1::CallList;
@@ -43,6 +99,7 @@ use msc_management::v1::msc_management_service_server::MscManagementService;
 pub struct MscManagementServiceImpl {
     mgmt_tx: tokio::sync::mpsc::Sender<crate::management::PendingControlRequest>,
     otasp_event_tx: Option<tokio::sync::broadcast::Sender<events_proto::v1::MscNetworkEvent>>,
+    base_stations: Option<std::sync::Arc<crate::base_station::BaseStations>>,
 }
 
 impl MscManagementServiceImpl {
@@ -53,7 +110,18 @@ impl MscManagementServiceImpl {
         Self {
             mgmt_tx,
             otasp_event_tx: None,
+            base_stations: None,
         }
+    }
+
+    /// Attach the base station registry so `ListBaseStations` reports what the
+    /// MSC is attached to.
+    pub fn with_base_stations(
+        mut self,
+        base_stations: std::sync::Arc<crate::base_station::BaseStations>,
+    ) -> Self {
+        self.base_stations = Some(base_stations);
+        self
     }
 
     /// Attach the live OTASP event broadcast channel produced by the MSC
@@ -70,6 +138,45 @@ impl MscManagementServiceImpl {
 
 #[tonic::async_trait]
 impl MscManagementService for MscManagementServiceImpl {
+    async fn list_base_stations(
+        &self,
+        _: Request<()>,
+    ) -> Result<Response<mgmt_proto::BaseStationList>, Status> {
+        let Some(base_stations) = self.base_stations.as_ref() else {
+            return Err(Status::unavailable("base station registry not attached"));
+        };
+        let nodes = base_stations
+            .summaries()
+            .into_iter()
+            .map(|summary| mgmt_proto::BaseStationSummary {
+                management_endpoint: summary.management_endpoint,
+                node_id: summary.node_id.map(|id| id.0).unwrap_or_default(),
+                a1_addr: summary
+                    .a1_addr
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_default(),
+                attached: summary.attached,
+                cells: summary
+                    .cells
+                    .into_iter()
+                    .map(|cell| base_station::v1::ServedCell {
+                        cell: Some(proto::CellId {
+                            cell: u32::from(cell.cell.cell),
+                            sector: u32::from(cell.cell.sector),
+                        }),
+                        sid: u32::from(cell.sid),
+                        nid: u32::from(cell.nid),
+                        mcc_digits: cell.mcc_digits,
+                        imsi_11_12_digits: cell.imsi_11_12_digits,
+                        in_service: cell.in_service,
+                    })
+                    .collect(),
+                status_detail: summary.status_detail,
+            })
+            .collect();
+        Ok(Response::new(mgmt_proto::BaseStationList { nodes }))
+    }
+
     async fn initiate_call(
         &self,
         request: Request<proto::InitiateCallRequest>,
@@ -133,6 +240,7 @@ impl MscManagementService for MscManagementServiceImpl {
                     timeout_ms: inner.timeout_ms.unwrap_or(30_000),
                     teleservice_id,
                     raw_user_data: inner.raw_user_data,
+                    serving_node: None,
                 },
                 response_tx,
             })

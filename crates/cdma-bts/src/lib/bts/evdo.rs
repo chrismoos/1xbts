@@ -8,6 +8,7 @@ use cdma_common::hrpd::air::{
 use log::{info, trace, warn};
 use num::complex::Complex32;
 use serde::{Deserialize, Serialize, de};
+use std::net::SocketAddr;
 use std::{collections::VecDeque, fmt};
 
 use crate::{
@@ -297,7 +298,34 @@ pub struct EvdoConfig {
     pub mode: EvdoMode,
     pub advertise_on_1x: bool,
     pub gain: f32,
+    /// Address the AN serves its session and UATI API on. One AN runs per
+    /// BTS, so hosts running more than one EV-DO cell need a distinct address
+    /// per BTS.
+    pub an_grpc_bind_addr: Option<SocketAddr>,
+    /// Address the AN reports in enrollment as the one peers should dial.
+    /// Defaults to the bind address, which only works on the same host. Set
+    /// it when the BSC runs elsewhere and the bind address is loopback or
+    /// unspecified.
+    pub an_grpc_advertise_addr: Option<SocketAddr>,
+    /// How this AN reaches the PCF for packet-data bearers. Required when
+    /// EV-DO is enabled, since each AN needs its own bearer binding.
+    pub a9: Option<HrpdA9Config>,
     pub overhead: HrpdOverheadConfig,
+}
+
+/// AN-side A9 signaling and A8 bearer addressing.
+///
+/// Each AN binds its own bearer, so these cannot be derived from the PCF's
+/// configuration: every AN would compute the same pair and only one would
+/// receive traffic.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HrpdA9Config {
+    /// PCF A9 signaling address SetupA8/ReleaseA8 are sent to.
+    pub pcf_addr: SocketAddr,
+    /// PCF-side A8 bearer address, used to build the A8 traffic id.
+    pub pcf_a8_addr: SocketAddr,
+    /// Address this AN binds for A8 bearer traffic.
+    pub a8_bind_addr: SocketAddr,
 }
 
 impl Default for EvdoConfig {
@@ -310,6 +338,9 @@ impl Default for EvdoConfig {
             // 1.0 = HRPD at parity with 1x at the composer output (post
             // composite_scale they each get half of the summed budget).
             gain: 1.0,
+            an_grpc_bind_addr: None,
+            an_grpc_advertise_addr: None,
+            a9: None,
             overhead: HrpdOverheadConfig::default(),
         }
     }
