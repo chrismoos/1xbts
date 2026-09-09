@@ -1,5 +1,6 @@
 # HEAD
 
+- Fixed libbladeRF binding incompatibility with some versions.
 - The stack now runs as separate components, with one MSC serving multiple Base Stations, each a BSC with multiple cells, and the web managing the whole network through the MSC. The PDSN supports multiple PCFs.
   Migration:
   - `config/msc.json`:

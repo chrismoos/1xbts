@@ -977,20 +977,13 @@ struct BladeRfBackend {
 
 #[cfg(feature = "bladerf-backend")]
 impl BladeRfBackend {
-    /// BLADERF_FORMAT_SC16_Q11_META
-    const FORMAT: u32 = 2;
-    /// BLADERF_META_FLAG_TX_BURST_START
-    const TX_BURST_START: u32 = 1;
-    /// BLADERF_META_FLAG_TX_BURST_END
-    const TX_BURST_END: u32 = 2;
-    /// BLADERF_META_FLAG_TX_NOW
-    const TX_NOW: u32 = 4;
-    /// BLADERF_META_FLAG_TX_UPDATE_TIMESTAMP
-    const TX_UPDATE_TS: u32 = 8;
-    /// BLADERF_META_FLAG_RX_NOW
-    const RX_NOW: u32 = 0x8000_0000;
-    /// BLADERF_META_STATUS_OVERRUN
-    const STATUS_OVERRUN: u32 = 1;
+    const FORMAT: u32 = bladerf::format::SC16_Q11_META;
+    const TX_BURST_START: u32 = bladerf::meta::FLAG_TX_BURST_START;
+    const TX_BURST_END: u32 = bladerf::meta::FLAG_TX_BURST_END;
+    const TX_NOW: u32 = bladerf::meta::FLAG_TX_NOW;
+    const TX_UPDATE_TS: u32 = bladerf::meta::FLAG_TX_UPDATE_TIMESTAMP;
+    const RX_NOW: u32 = bladerf::meta::FLAG_RX_NOW;
+    const STATUS_OVERRUN: u32 = bladerf::meta::STATUS_OVERRUN;
 
     fn new(
         device_str: &str,
@@ -1077,7 +1070,7 @@ impl BladeRfBackend {
             .set_bandwidth(rx_ch, bandwidth_hz as u32)
             .map_err(|e| format!("bladeRF: set RX bandwidth: {}", e))?;
         device
-            .set_gain_mode(rx_ch, 1)
+            .set_gain_mode(rx_ch, bladerf::gain_mode::MGC)
             .map_err(|e| format!("bladeRF: set RX gain mode: {}", e))?;
         device
             .set_gain(rx_ch, rx_gain_db as i32)
@@ -1086,7 +1079,7 @@ impl BladeRfBackend {
         // Configure sync streams: RX first, then TX.
         device
             .sync_config(
-                0u32,
+                bladerf::layout::RX_X1,
                 Self::FORMAT,
                 num_buffers,
                 buffer_size,
@@ -1096,7 +1089,7 @@ impl BladeRfBackend {
             .map_err(|e| format!("bladeRF: sync_config RX: {}", e))?;
         device
             .sync_config(
-                1u32,
+                bladerf::layout::TX_X1,
                 Self::FORMAT,
                 num_buffers,
                 buffer_size,
@@ -1137,7 +1130,7 @@ impl CalibrationBackend for BladeRfBackend {
 
     fn get_time(&mut self) -> Result<u64, Box<dyn std::error::Error>> {
         self.device
-            .get_timestamp(0) // 0 = RX direction
+            .get_timestamp(bladerf::direction::RX)
             .map_err(|e| format!("bladeRF: get_timestamp: {}", e).into())
     }
 

@@ -1343,6 +1343,10 @@ mod bladerf_bench {
 
     use bladerf::Device;
     use bladerf::device::{rx_channel, tx_channel};
+    use bladerf::meta::{
+        FLAG_RX_NOW, FLAG_TX_BURST_END, FLAG_TX_BURST_START, FLAG_TX_NOW, FLAG_TX_UPDATE_TIMESTAMP,
+        STATUS_OVERRUN, STATUS_UNDERRUN,
+    };
     use bladerf::stream::{Sc16Q11, StreamMeta};
 
     /// Local estimate of the bladeRF hardware sample counter, calibrated once
@@ -1387,22 +1391,7 @@ mod bladerf_bench {
         }
     }
 
-    /// BLADERF_FORMAT_SC16_Q11_META
-    const FORMAT_SC16_Q11_META: u32 = 2;
-    /// BLADERF_META_FLAG_TX_BURST_START
-    const META_FLAG_TX_BURST_START: u32 = 1;
-    /// BLADERF_META_FLAG_TX_BURST_END
-    const META_FLAG_TX_BURST_END: u32 = 2;
-    /// BLADERF_META_FLAG_TX_NOW
-    const META_FLAG_TX_NOW: u32 = 4;
-    /// BLADERF_META_FLAG_TX_UPDATE_TIMESTAMP
-    const META_FLAG_TX_UPDATE_TIMESTAMP: u32 = 8;
-    /// BLADERF_META_FLAG_RX_NOW
-    const META_FLAG_RX_NOW: u32 = 0x8000_0000;
-    /// BLADERF_META_STATUS_UNDERRUN
-    const META_STATUS_UNDERRUN: u32 = 2;
-    /// BLADERF_META_STATUS_OVERRUN
-    const META_STATUS_OVERRUN: u32 = 1;
+    const FORMAT_SC16_Q11_META: u32 = bladerf::format::SC16_Q11_META;
 
     pub fn run_bladerf_bench(
         cli: &Cli,
@@ -1575,7 +1564,7 @@ mod bladerf_bench {
             .map_err(|e| format!("bladeRF: set RX freq: {}", e))?;
         if cli.full_duplex {
             device
-                .set_gain_mode(rx_ch, 1)
+                .set_gain_mode(rx_ch, bladerf::gain_mode::MGC)
                 .map_err(|e| format!("bladeRF: set RX gain mode: {}", e))?;
             device
                 .set_gain(rx_ch, rx_gain_db)
@@ -1588,7 +1577,7 @@ mod bladerf_bench {
         // Configure streams: RX first, then TX (same order as bladerf_radio.rs).
         device
             .sync_config(
-                0u32, // BLADERF_RX_X1
+                bladerf::layout::RX_X1,
                 FORMAT_SC16_Q11_META,
                 num_buffers,
                 buffer_size,
@@ -1598,7 +1587,7 @@ mod bladerf_bench {
             .map_err(|e| format!("bladeRF: sync_config RX: {}", e))?;
         device
             .sync_config(
-                1u32, // BLADERF_TX_X1
+                bladerf::layout::TX_X1,
                 FORMAT_SC16_Q11_META,
                 num_buffers,
                 buffer_size,
@@ -1639,15 +1628,15 @@ mod bladerf_bench {
                 .spawn(move || {
                     let mut buf = vec![Sc16Q11::default(); spr_batch];
                     let mut meta = StreamMeta {
-                        flags: META_FLAG_RX_NOW,
+                        flags: FLAG_RX_NOW,
                         ..Default::default()
                     };
                     while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                        meta.flags = META_FLAG_RX_NOW;
+                        meta.flags = FLAG_RX_NOW;
                         match rx_sync.recv(&mut buf, &mut meta, stream_timeout_ms) {
                             Ok(n) if n > 0 => {
                                 reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if meta.status & META_STATUS_OVERRUN != 0 {
+                                if meta.status & STATUS_OVERRUN != 0 {
                                     overflows.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
                             }
@@ -1663,7 +1652,7 @@ mod bladerf_bench {
         // Anchor tx_timestamp off the live hardware clock so it's always
         // exactly 80 ms ahead of "now", regardless of batch size.
         let hw_time = device
-            .get_timestamp(0)
+            .get_timestamp(bladerf::direction::RX)
             .map_err(|e| format!("bladeRF: get_timestamp: {}", e))?;
         let mut tx_timestamp = hw_time + lead_samples;
         info!(
@@ -1694,7 +1683,7 @@ mod bladerf_bench {
         while start.elapsed() < duration {
             // Resync the pacing clock against USB once every 100 ms.
             if pacing_clock.needs_resync(100) {
-                if let Ok(hw) = device.get_timestamp(0) {
+                if let Ok(hw) = device.get_timestamp(bladerf::direction::RX) {
                     pacing_clock.resync(hw);
                 }
             }
@@ -1729,10 +1718,7 @@ mod bladerf_bench {
             // Subsequent sends carry no burst flags so the FPGA streams them
             // back-to-back without per-batch blocking.
             let (flags, ts) = if !burst_active {
-                (
-                    META_FLAG_TX_BURST_START | META_FLAG_TX_UPDATE_TIMESTAMP,
-                    tx_timestamp,
-                )
+                (FLAG_TX_BURST_START | FLAG_TX_UPDATE_TIMESTAMP, tx_timestamp)
             } else {
                 (0, 0)
             };
@@ -1762,14 +1748,14 @@ mod bladerf_bench {
                 }
             }
 
-            if meta.status & META_STATUS_UNDERRUN != 0 {
+            if meta.status & STATUS_UNDERRUN != 0 {
                 // FPGA ran out of buffered data — the host fell behind.
                 // End the burst so the next iteration restarts cleanly.
                 total_underrun += 1;
                 if burst_active {
                     let zero = [Sc16Q11 { i: 0, q: 0 }; 1];
                     let mut end_meta = StreamMeta {
-                        flags: META_FLAG_TX_BURST_END | META_FLAG_TX_NOW,
+                        flags: FLAG_TX_BURST_END | FLAG_TX_NOW,
                         ..Default::default()
                     };
                     let _ = tx_sync.send(&zero, Some(&mut end_meta), stream_timeout_ms);
@@ -1792,7 +1778,7 @@ mod bladerf_bench {
         if burst_active {
             let zero = [Sc16Q11 { i: 0, q: 0 }; 1];
             let mut end_meta = StreamMeta {
-                flags: META_FLAG_TX_BURST_END | META_FLAG_TX_NOW,
+                flags: FLAG_TX_BURST_END | FLAG_TX_NOW,
                 ..Default::default()
             };
             let _ = tx_sync.send(&zero, Some(&mut end_meta), stream_timeout_ms);
@@ -1814,7 +1800,7 @@ mod bladerf_bench {
         let _ = device.enable_module(rx_ch, false);
 
         // Timing sanity — one final USB sync for an accurate elapsed count.
-        if let Ok(hw) = device.get_timestamp(0) {
+        if let Ok(hw) = device.get_timestamp(bladerf::direction::RX) {
             pacing_clock.resync(hw);
         }
         let end_hw = pacing_clock.now();

@@ -2,6 +2,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bladerf::device::{rx_channel, tx_channel};
+use bladerf::format::SC16_Q11_META;
+use bladerf::meta::{
+    FLAG_RX_NOW, FLAG_TX_BURST_END, FLAG_TX_BURST_START, FLAG_TX_NOW, FLAG_TX_UPDATE_TIMESTAMP,
+    STATUS_UNDERRUN,
+};
 use bladerf::stream::{Sc16Q11, StreamMeta};
 use bladerf::{Device, RxSync, TxSync};
 use cdma_common::error::Error;
@@ -10,30 +15,9 @@ use num_complex::Complex32;
 
 use super::{Radio, RadioRx, RadioTx, RxReadResult, TxRadioHealth};
 
-/// BLADERF_FORMAT_SC16_Q11_META — enables hardware timestamps in stream metadata.
-const FORMAT_SC16_Q11_META: u32 = 2;
-
-/// BLADERF_META_FLAG_TX_BURST_START — marks the beginning of a TX burst.
-const META_FLAG_TX_BURST_START: u32 = 1;
-
-/// BLADERF_META_FLAG_TX_BURST_END — marks the end of a TX burst.
-const META_FLAG_TX_BURST_END: u32 = 2;
-
-/// BLADERF_META_FLAG_TX_NOW — transmit immediately, ignore metadata timestamp.
-const META_FLAG_TX_NOW: u32 = 4;
-
-/// BLADERF_META_FLAG_TX_UPDATE_TIMESTAMP — use the metadata timestamp field for scheduled TX.
-const META_FLAG_TX_UPDATE_TIMESTAMP: u32 = 8;
-
-/// BLADERF_META_FLAG_RX_NOW — return samples immediately, ignore timestamp.
-const META_FLAG_RX_NOW: u32 = 0x8000_0000;
-
 /// libbladeRF uses bit 0 for both a software-detected RX overrun and a
 /// hardware condition reported through RX metadata.
-const META_STATUS_RX_FAULT: u32 = 1;
-
-/// BLADERF_META_STATUS_UNDERRUN — TX underrun occurred.
-const META_STATUS_UNDERRUN: u32 = 2;
+const META_STATUS_RX_FAULT: u32 = bladerf::meta::STATUS_OVERRUN;
 
 /// Default number of stream buffers.
 const DEFAULT_NUM_BUFFERS: u32 = 16;
@@ -269,26 +253,25 @@ impl Radio for BladeRfRadio {
             .set_sample_rate(rx_ch, sample_rate_hz as u32)
             .map_err(|e| Error::from(format!("bladeRF: set RX sample rate: {}", e)))?;
 
-        self.device
+        let actual_bandwidth = self
+            .device
             .set_bandwidth(rx_ch, bandwidth_hz as u32)
             .map_err(|e| Error::from(format!("bladeRF: set RX bandwidth: {}", e)))?;
 
         if let Some(gain) = gain_db {
-            // Manual gain mode = 1
             self.device
-                .set_gain_mode(rx_ch, 1)
+                .set_gain_mode(rx_ch, bladerf::gain_mode::MGC)
                 .map_err(|e| Error::from(format!("bladeRF: set RX gain mode: {}", e)))?;
             self.device
                 .set_gain(rx_ch, gain as i32)
                 .map_err(|e| Error::from(format!("bladeRF: set RX gain: {}", e)))?;
         }
 
-        // Configure RX sync: BLADERF_RX_X1 = 0
-        let rx_layout = 0u32;
+        let rx_layout = bladerf::layout::RX_X1;
         self.device
             .sync_config(
                 rx_layout,
-                FORMAT_SC16_Q11_META,
+                SC16_Q11_META,
                 self.num_buffers,
                 self.buffer_size,
                 self.num_transfers,
@@ -301,7 +284,7 @@ impl Radio for BladeRfRadio {
         let actual_freq = self.device.get_frequency(rx_ch).unwrap_or(0);
         info!(
             "bladeRF: RX configured freq={} rate={} bw={} gain={:?}",
-            actual_freq, actual_rate, bandwidth_hz, gain_db
+            actual_freq, actual_rate, actual_bandwidth, gain_db
         );
         Ok(())
     }
@@ -313,11 +296,11 @@ impl Radio for BladeRfRadio {
         // Configure TX sync after RX sync (setup_rx configures RX sync).
         // Doing TX sync_config in the constructor and RX in setup_rx caused
         // the libbladeRF sync worker to time out on shutdown/restart.
-        let tx_layout = 1u32; // BLADERF_TX_X1
+        let tx_layout = bladerf::layout::TX_X1;
         device
             .sync_config(
                 tx_layout,
-                FORMAT_SC16_Q11_META,
+                SC16_Q11_META,
                 self.num_buffers,
                 self.buffer_size,
                 self.num_transfers,
@@ -404,7 +387,7 @@ impl RadioTx for BladeRfTxHalf {
     }
 
     fn get_hardware_time(&self) -> Result<u64, Error> {
-        match self._device.get_timestamp(1) {
+        match self._device.get_timestamp(bladerf::direction::TX) {
             Ok(ts) if ts > 0 => Ok(ts),
             _ => Ok(self.shared_clock.load(Ordering::Relaxed)),
         }
@@ -449,7 +432,7 @@ impl RadioTx for BladeRfTxHalf {
                     self.burst_active = true;
                     StreamMeta {
                         timestamp: ts,
-                        flags: META_FLAG_TX_BURST_START | META_FLAG_TX_UPDATE_TIMESTAMP,
+                        flags: FLAG_TX_BURST_START | FLAG_TX_UPDATE_TIMESTAMP,
                         ..Default::default()
                     }
                 } else {
@@ -468,16 +451,16 @@ impl RadioTx for BladeRfTxHalf {
                         return Err(Error::from(format!("bladeRF: TX send @{}: {}", ts, e)));
                     }
                 }
-                if meta.status & META_STATUS_UNDERRUN != 0 {
+                if meta.status & STATUS_UNDERRUN != 0 {
                     self.health.underflows += 1;
                     warn!("bladeRF: TX underrun detected");
                 }
                 Ok(())
             }
             None => {
-                let mut flags = META_FLAG_TX_NOW;
+                let mut flags = FLAG_TX_NOW;
                 if !self.burst_active {
-                    flags |= META_FLAG_TX_BURST_START;
+                    flags |= FLAG_TX_BURST_START;
                     self.burst_active = true;
                 }
                 let mut meta = StreamMeta {
@@ -487,7 +470,7 @@ impl RadioTx for BladeRfTxHalf {
                 self.tx_sync
                     .send(&self.sc16_scratch, Some(&mut meta), self.stream_timeout_ms)
                     .map_err(|e| Error::from(format!("bladeRF: TX send: {}", e)))?;
-                if meta.status & META_STATUS_UNDERRUN != 0 {
+                if meta.status & STATUS_UNDERRUN != 0 {
                     self.health.underflows += 1;
                     warn!("bladeRF: TX underrun detected");
                 }
@@ -510,7 +493,7 @@ impl RadioTx for BladeRfTxHalf {
             if self.burst_active {
                 let zero = [Sc16Q11 { i: 0, q: 0 }; 1];
                 let mut meta = StreamMeta {
-                    flags: META_FLAG_TX_BURST_END | META_FLAG_TX_NOW,
+                    flags: FLAG_TX_BURST_END | FLAG_TX_NOW,
                     ..Default::default()
                 };
                 let _ = self
@@ -542,7 +525,7 @@ impl Drop for BladeRfTxHalf {
         if self.burst_active {
             let zero = [Sc16Q11 { i: 0, q: 0 }; 1];
             let mut meta = StreamMeta {
-                flags: META_FLAG_TX_BURST_END | META_FLAG_TX_NOW,
+                flags: FLAG_TX_BURST_END | FLAG_TX_NOW,
                 ..Default::default()
             };
             let _ = self
@@ -593,7 +576,7 @@ impl RadioRx for BladeRfRxHalf {
     }
 
     fn get_hardware_time(&self) -> Result<u64, Error> {
-        match self._device.get_timestamp(0) {
+        match self._device.get_timestamp(bladerf::direction::RX) {
             Ok(ts) => {
                 self.shared_clock.store(ts, Ordering::Relaxed);
                 Ok(ts)
@@ -607,7 +590,7 @@ impl RadioRx for BladeRfRxHalf {
 
         let mut sc16_buf = vec![Sc16Q11::default(); buf.len()];
         let mut meta = StreamMeta {
-            flags: META_FLAG_RX_NOW,
+            flags: FLAG_RX_NOW,
             ..Default::default()
         };
 
