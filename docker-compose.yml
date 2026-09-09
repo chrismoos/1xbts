@@ -83,6 +83,16 @@ services:
       HDTP_REPLY_NONCE: "${HDTP_REPLY_NONCE:-prev}"
       # Content-Type for HDML replies: text/x-hdml | text/hdml | application/x-hdmlc.
       HDTP_CONTENT_TYPE: "${HDTP_CONTENT_TYPE:-text/x-hdml}"
+      # Kannel WAP 1.x gateway on the tunnel address, ports 9200/9201. Add a
+      # carrier WAP proxy IP:port to WAP_HIJACK_ENDPOINTS to redirect it here.
+      # WAP_LOG_LEVEL: 0 debug (very chatty), 1 info, 2 warning, 3 error, 4 panic.
+      WAP_ENABLE: "${WAP_ENABLE:-1}"
+      WAP_HIJACK_ENDPOINTS: "${WAP_HIJACK_ENDPOINTS:-}"
+      WAP_LOG_LEVEL: "${WAP_LOG_LEVEL:-1}"
+      # Kannel renders WML but not HTML, so wapbox fetches through a
+      # transcoder. Lower WAP_TRANSCODE_MAX_BLOCKS to shorten decks.
+      WAP_TRANSCODE_MAX_BLOCKS: "${WAP_TRANSCODE_MAX_BLOCKS:-}"
+      WAP_TRANSCODE_LOG: "${WAP_TRANSCODE_LOG:-info}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped

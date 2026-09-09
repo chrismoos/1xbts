@@ -19,12 +19,16 @@ use crate::header::{CTYPE_X_HDML, CTYPE_X_HDMLC, Headers};
 use crate::pdu::{
     ClientMessage, ClientPdu, PduType, Reply, ServerMessage, ServerPdu, SessionRequest,
 };
-use crate::proxy::{FetchBody, Proxy};
 use crate::session::{ReplyConfig, SessionManager};
-use crate::transcode;
+use gw_transcode::proxy::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+use gw_transcode::proxy::{FetchBody, Proxy};
+use gw_transcode::transcode::{self, Limits};
 
 /// Receive buffer size; handset requests are well under this.
 const RECV_BUF: usize = 4096;
+
+/// Media type of the body an HDML Post submits.
+const FORM_URLENCODED: &str = "application/x-www-form-urlencoded";
 
 /// Tunables for the gateway.
 #[derive(Debug, Clone)]
@@ -515,14 +519,21 @@ async fn fetch_deck(proxy: &Proxy, url: &str, post_body: Option<Vec<u8>>) -> Dec
         return home_deck();
     }
     let fetched = match post_body {
-        Some(body) => proxy.post(url, body).await,
-        None => proxy.get(url).await,
+        Some(body) => {
+            // An HDML Post carries its fields as a urlencoded form body.
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static(FORM_URLENCODED));
+            proxy.post(url, &headers, body).await
+        }
+        None => proxy.get(url, &HeaderMap::new()).await,
     };
     match fetched {
-        Ok(page) => match page.body {
-            FetchBody::Html(html) => transcode::html_to_hdml(&html, &page.final_url),
-            FetchBody::Text(text) => transcode::text_to_hdml(&text, "Page"),
-            FetchBody::Other { .. } => notice_deck(
+        Ok(page) => match page.body() {
+            FetchBody::Html(html) => {
+                transcode::html_to_deck(&html, &page.final_url, &Limits::default())
+            }
+            FetchBody::Text(text) => transcode::text_to_deck(&text, "Page", &Limits::default()),
+            FetchBody::Other => notice_deck(
                 "Unsupported",
                 &format!("Cannot display {}.", page.content_type),
             ),

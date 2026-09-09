@@ -15,10 +15,7 @@ test-harness = []
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "deflate"] }
-scraper = "0.20"
-ego-tree = "0.6"
-url = "2"
+gw-transcode = { path = "../gw-transcode" }
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

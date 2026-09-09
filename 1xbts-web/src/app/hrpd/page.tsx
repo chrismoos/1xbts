@@ -105,7 +105,7 @@ function HrpdSessionsView() {
   const carrierCell = requested ?? pinnedDefault;
   const carrierAddressed = requested !== null || !cellsLoading;
 
-  // Carrier config is static at runtime; fetch it once per cell.
+  // Carrier config is static at runtime. Fetch it once per cell.
   useEffect(() => {
     if (!carrierAddressed) return;
     let cancelled = false;

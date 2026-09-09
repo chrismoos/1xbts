@@ -1,103 +1,74 @@
-//! A small HDML 2.0 document model and serializer.
+//! The HDML serialization of a deck.
 //!
-//! HDML (Handheld Device Markup Language) is the card/deck markup UP.Browser
-//! renders. A deck is `<HDML VERSION=2.0> ... </HDML>` wrapping one or more
-//! cards; this gateway emits a single `<DISPLAY>` card per transcoded page.
-//! Output is uncompiled `text/x-hdml`, which UP.Browser accepts in place of
-//! compiled HDMLc.
+//! UP.Browser renders HDML card decks. The document model itself is shared with
+//! the WAP gateway and lives in [`gw_transcode::doc`]. This module turns one
+//! into a `text/x-hdml` document.
 
-/// Inline content within a line.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Inline {
-    Text(String),
-    /// A navigable link. `dest` must be an absolute URL so the follow-up Get
-    /// returns to the gateway with a resolvable target.
-    Link {
-        label: String,
-        dest: String,
-    },
-}
+pub use gw_transcode::doc::{Block, Deck, Field, Form, Inline, notice_deck};
 
-/// A block-level element in a display card.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Block {
-    /// A line of inline content, started with `<LINE>` so long text truncates
-    /// rather than wrapping unpredictably.
-    Line(Vec<Inline>),
-    /// A centered heading line.
-    Heading(String),
-    /// A blank line.
-    Break,
-}
-
-/// A rendered HDML deck.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Deck {
-    pub title: Option<String>,
-    pub blocks: Vec<Block>,
-    /// `PUBLIC=TRUE`: the deck is reachable from any other deck. The gateway
-    /// serves decks from many origins and links freely between them, so without
-    /// this the handset raises an access-control error on cross-origin
-    /// navigation. Defaults to true.
-    pub public: bool,
-}
-
-impl Default for Deck {
-    fn default() -> Self {
-        Deck {
-            title: None,
-            blocks: Vec::new(),
-            public: true,
+/// Serialize a deck to a `text/x-hdml` document.
+pub fn to_hdml(deck: &Deck) -> String {
+    let mut s = String::from("<HDML VERSION=2.0>\n");
+    s.push_str("<DISPLAY");
+    if let Some(t) = &deck.title {
+        s.push_str(&format!(" TITLE=\"{}\"", escape_attr(t)));
+    }
+    s.push_str(">\n");
+    for block in &deck.blocks {
+        match block {
+            Block::Heading(text) => {
+                s.push_str("<LINE><CENTER>");
+                s.push_str(&escape_text(text));
+                s.push('\n');
+            }
+            Block::Line(inlines) => {
+                s.push_str("<LINE>");
+                push_inlines(&mut s, inlines);
+                s.push('\n');
+            }
+            Block::Break => s.push_str("<BR>\n"),
+            Block::Form(form) => push_form(&mut s, form),
         }
     }
+    s.push_str("</DISPLAY>\n</HDML>\n");
+    s
 }
 
-impl Deck {
-    pub fn new() -> Self {
-        Deck::default()
-    }
-
-    pub fn push(&mut self, block: Block) {
-        self.blocks.push(block);
-    }
-
-    /// Serialize to a `text/x-hdml` document.
-    pub fn to_hdml(&self) -> String {
-        let mut s = String::from("<HDML VERSION=2.0>\n");
-        s.push_str("<DISPLAY");
-        if let Some(t) = &self.title {
-            s.push_str(&format!(" TITLE=\"{}\"", escape_attr(t)));
-        }
-        s.push_str(">\n");
-        for block in &self.blocks {
-            match block {
-                Block::Heading(text) => {
-                    s.push_str("<LINE><CENTER>");
-                    s.push_str(&escape_text(text));
-                    s.push('\n');
-                }
-                Block::Line(inlines) => {
-                    s.push_str("<LINE>");
-                    for inl in inlines {
-                        match inl {
-                            Inline::Text(t) => s.push_str(&escape_text(t)),
-                            Inline::Link { label, dest } => {
-                                s.push_str("<A TASK=GO DEST=\"");
-                                s.push_str(&escape_attr(dest));
-                                s.push_str("\">");
-                                s.push_str(&escape_text(label));
-                                s.push_str("</A>");
-                            }
-                        }
-                    }
-                    s.push('\n');
-                }
-                Block::Break => s.push_str("<BR>\n"),
+fn push_inlines(s: &mut String, inlines: &[Inline]) {
+    for inl in inlines {
+        match inl {
+            Inline::Text(t) => s.push_str(&escape_text(t)),
+            Inline::Link { label, dest } => {
+                s.push_str("<A TASK=GO DEST=\"");
+                s.push_str(&escape_attr(dest));
+                s.push_str("\">");
+                s.push_str(&escape_text(label));
+                s.push_str("</A>");
             }
         }
-        s.push_str("</DISPLAY>\n</HDML>\n");
-        s
     }
+}
+
+/// Render a form as its field labels plus a link to the action.
+///
+/// Filling fields in HDML needs `<ENTRY>` cards, a second card model this deck
+/// serializer does not emit, so the submission carries no field values and the
+/// handset reaches the action with a plain Go.
+fn push_form(s: &mut String, form: &Form) {
+    for field in &form.fields {
+        let title = match field {
+            Field::Text { title, .. } | Field::Select { title, .. } => title,
+            Field::Hidden { .. } => continue,
+        };
+        s.push_str("<LINE>");
+        s.push_str(&escape_text(title));
+        s.push_str(":\n");
+    }
+    s.push_str("<LINE><A TASK=GO DEST=\"");
+    s.push_str(&escape_attr(&form.action));
+    s.push_str("\">");
+    s.push_str(&escape_text(&form.submit_label));
+    s.push_str("</A>\n");
 }
 
 /// Escape HDML text content. HDML shares HTML's `&`, `<`, `>` entities and
@@ -132,19 +103,10 @@ pub fn escape_attr(s: &str) -> String {
     out
 }
 
-/// Build a minimal single-message deck (used for errors and notices).
-pub fn notice_deck(title: &str, message: &str) -> Deck {
-    let mut deck = Deck::new();
-    deck.title = Some(title.to_string());
-    deck.push(Block::Heading(title.to_string()));
-    deck.push(Block::Break);
-    deck.push(Block::Line(vec![Inline::Text(message.to_string())]));
-    deck
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gw_transcode::doc::FormMethod;
 
     #[test]
     fn deck_wraps_display_card() {
@@ -155,7 +117,7 @@ mod tests {
             label: "Speedtest".into(),
             dest: "http://speed/".into(),
         }]));
-        let out = d.to_hdml();
+        let out = to_hdml(&d);
         assert!(out.starts_with("<HDML VERSION=2.0>"));
         assert!(out.contains("<DISPLAY TITLE=\"Home\">"));
         assert!(out.contains("<A TASK=GO DEST=\"http://speed/\">Speedtest</A>"));
@@ -169,5 +131,43 @@ mod tests {
             "a &amp; b &lt; c &gt; d $$e"
         );
         assert_eq!(escape_attr("x\"y"), "x&quot;y");
+    }
+
+    #[test]
+    fn dollar_in_a_url_is_doubled_in_the_attribute() {
+        let mut d = Deck::new();
+        d.push(Block::Line(vec![Inline::Link {
+            label: "Pay".into(),
+            dest: "http://x/?amt=$100".into(),
+        }]));
+        // A bare `$` would start a variable reference on the handset.
+        assert!(to_hdml(&d).contains("DEST=\"http://x/?amt=$$100\""));
+    }
+
+    #[test]
+    fn form_degrades_to_labels_and_an_action_link() {
+        let mut d = Deck::new();
+        d.push(Block::Form(Form {
+            action: "http://example.com/search".into(),
+            method: FormMethod::Post,
+            fields: vec![
+                Field::Text {
+                    name: "q".into(),
+                    title: "Query".into(),
+                    value: String::new(),
+                    secret: false,
+                },
+                Field::Hidden {
+                    name: "src".into(),
+                    value: "hdml".into(),
+                },
+            ],
+            submit_label: "Go".into(),
+        }));
+        let out = to_hdml(&d);
+        assert!(out.contains("<LINE>Query:"));
+        // The hidden field is never shown.
+        assert!(!out.contains("src"));
+        assert!(out.contains("<A TASK=GO DEST=\"http://example.com/search\">Go</A>"));
     }
 }

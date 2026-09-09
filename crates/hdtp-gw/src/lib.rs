@@ -9,8 +9,7 @@
 //! Layering:
 //! * [`pdu`] / [`header`] / [`cipher`] — HDTP wire format.
 //! * [`session`] — the session-creation handshake and session table.
-//! * [`hdml`] / [`transcode`] — the HDML document model and the HTML→HDML pass.
-//! * [`proxy`] — the outbound HTTP fetch.
+//! * [`hdml`] — the HDML serialization of a fetched page.
 //! * [`server`] — the UDP service loop tying request to response.
 
 pub mod cipher;
@@ -19,8 +18,6 @@ pub mod hdmlc;
 pub mod header;
 pub mod keyexch;
 pub mod pdu;
-pub mod proxy;
 pub mod rc5;
 pub mod server;
 pub mod session;
-pub mod transcode;

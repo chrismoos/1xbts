@@ -1,0 +1,23 @@
+[package]
+name = "gw-transcode"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Shared web-fetch and transcoding pass for the legacy markup gateways. Fetches a URL over HTTP(S) and transcodes the document to a small markup-neutral deck that a per-protocol backend renders as HDML or WML."
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "deflate"] }
+scraper = "0.20"
+ego-tree = "0.6"
+url = "2"
+tokio = { version = "1", features = ["net"] }
+thiserror = "1"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

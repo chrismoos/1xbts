@@ -14,7 +14,7 @@
 //! `<len>` is the byte count from the `ff` separator through the trailing `89`,
 //! big-endian minimal width (`0f`, or `01 37` for a 311-byte deck).
 
-use crate::hdml::{Block, Deck, Inline};
+use crate::hdml::{Block, Deck, Field, Inline};
 
 mod tok {
     pub const DECK_HDR: [u8; 4] = [0xcf, 0x01, 0x03, 0x00];
@@ -75,6 +75,20 @@ pub fn compile_deck(deck: &Deck) -> Vec<u8> {
                     }
                 }
                 lines.push((text, false));
+            }
+            Block::Form(form) => {
+                // Filling fields needs an ENTRY card, which this compiler does
+                // not emit, so a form degrades to its labels plus a navigable
+                // entry for the action.
+                for field in &form.fields {
+                    match field {
+                        Field::Text { title, .. } | Field::Select { title, .. } => {
+                            lines.push((format!("{title}:"), false));
+                        }
+                        Field::Hidden { .. } => {}
+                    }
+                }
+                links.push((form.submit_label.clone(), form.action.clone()));
             }
         }
     }
@@ -153,6 +167,36 @@ mod tests {
     }
 
     // All expectations are exact HDMLc byte sequences.
+
+    #[test]
+    fn form_compiles_as_its_labels_plus_an_action_entry() {
+        use gw_transcode::doc::{Field, Form, FormMethod};
+        let with_form = deck(vec![Block::Form(Form {
+            action: "http://example.com/search".into(),
+            method: FormMethod::Post,
+            fields: vec![
+                Field::Text {
+                    name: "q".into(),
+                    title: "Query".into(),
+                    value: String::new(),
+                    secret: false,
+                },
+                Field::Hidden {
+                    name: "src".into(),
+                    value: "hdml".into(),
+                },
+            ],
+            submit_label: "Go".into(),
+        })]);
+        let equivalent = deck(vec![
+            line("Query:"),
+            Block::Line(vec![Inline::Link {
+                label: "Go".into(),
+                dest: "http://example.com/search".into(),
+            }]),
+        ]);
+        assert_eq!(compile_deck(&with_form), compile_deck(&equivalent));
+    }
 
     #[test]
     fn display_single_text() {

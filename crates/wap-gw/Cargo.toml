@@ -1,0 +1,35 @@
+[package]
+name = "wap-gw"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "HTML-to-WML transcoding proxy for the WAP gateway. Kannel's wapbox fetches through it, so a WAP browser reaches ordinary web pages as WML decks instead of content it cannot render."
+
+[dependencies]
+gw-transcode = { path = "../gw-transcode" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal"] }
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+[dev-dependencies]
+# Parses the emitted decks in tests so well-formedness is checked by a parser
+# rather than by substring matching.
+roxmltree = "0.20"
+# Validates that emitted links can actually sit in an HTTP request line.
+http = "1"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "wap-gw"
+path = "src/main.rs"
+
+[lints]
+workspace = true

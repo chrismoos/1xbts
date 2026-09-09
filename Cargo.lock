@@ -1406,6 +1406,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
+name = "gw-transcode"
+version = "0.1.0"
+dependencies = [
+ "ego-tree",
+ "reqwest",
+ "scraper",
+ "thiserror 1.0.69",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1457,15 +1469,12 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
- "ego-tree",
+ "gw-transcode",
  "num-bigint",
- "reqwest",
- "scraper",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "url",
 ]
 
 [[package]]
@@ -2799,6 +2808,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "roxmltree"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
+
+[[package]]
 name = "rsa"
 version = "0.9.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3945,6 +3960,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bfa7760aed19e106de2c7c0b581b509f2f25d3dacaf737cb82ac61bc6d760b0e"
 dependencies = [
  "try-lock",
+]
+
+[[package]]
+name = "wap-gw"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "gw-transcode",
+ "http",
+ "roxmltree",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

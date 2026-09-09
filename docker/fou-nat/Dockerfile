@@ -17,11 +17,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p edge-resolver -p hdtp-gw
+RUN cargo build --release -p edge-resolver -p hdtp-gw -p wap-gw
 
 # ---------------------------------------------------------------------------
 # Stage 2: runtime image. Single container, edge-resolver supervised
-# alongside nginx / unbound / fou-tcp-relay by entrypoint.sh.
+# alongside nginx / unbound / Kannel / fou-tcp-relay by entrypoint.sh.
 # ---------------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
 
@@ -30,6 +30,7 @@ RUN apt-get update \
         iproute2 \
         iptables \
         iputils-ping \
+        kannel \
         nginx \
         python3 \
         procps \
@@ -39,6 +40,7 @@ RUN apt-get update \
 
 COPY --from=resolver-build /src/target/release/edge-resolver /usr/local/bin/edge-resolver
 COPY --from=resolver-build /src/target/release/hdtp-gw /usr/local/bin/hdtp-gw
+COPY --from=resolver-build /src/target/release/wap-gw /usr/local/bin/wap-gw
 COPY docker/fou-nat/entrypoint.sh /usr/local/bin/fou-nat-entrypoint
 COPY docker/fou-nat/fou_tcp_relay.py /usr/local/bin/fou-tcp-relay
 RUN chmod +x /usr/local/bin/fou-nat-entrypoint

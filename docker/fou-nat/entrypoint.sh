@@ -26,6 +26,31 @@ HDTP_ENABLE="${HDTP_ENABLE:-1}"
 HDTP_GW_PORT="${HDTP_GW_PORT:-1905}"
 HDTP_HIJACK_ENDPOINTS="${HDTP_HIJACK_ENDPOINTS:-153.114.115.100:1905,153.114.116.100:1905}"
 HDTP_LOG="${HDTP_LOG:-info}"
+
+# Kannel WAP 1.x gateway. bearerbox terminates WSP/WTP on the tunnel address
+# and owns the assigned WDP ports (9200 connectionless, 9201
+# connection-oriented), handing each transaction to wapbox on loopback.
+#
+# A handset dialling the gateway directly needs nothing more. One carrying a
+# provisioned carrier proxy needs that IP:port in WAP_HIJACK_ENDPOINTS, which is
+# DNAT'd below. Those addresses vary per operator, so there is no default.
+WAP_ENABLE="${WAP_ENABLE:-1}"
+WAPBOX_PORT="${WAPBOX_PORT:-13002}"
+WAP_ADMIN_PORT="${WAP_ADMIN_PORT:-13000}"
+WAP_HIJACK_ENDPOINTS="${WAP_HIJACK_ENDPOINTS:-}"
+WAP_LOG_LEVEL="${WAP_LOG_LEVEL:-1}"
+# wapbox fetches through the transcoder, which turns HTML into WML. Bound to
+# loopback because only wapbox calls it.
+WAP_TRANSCODE_BIND="${WAP_TRANSCODE_BIND:-127.0.0.1:8090}"
+WAP_TRANSCODE_MAX_BLOCKS="${WAP_TRANSCODE_MAX_BLOCKS:-}"
+WAP_TRANSCODE_LOG="${WAP_TRANSCODE_LOG:-info}"
+# How long to wait for bearerbox's wapbox listener before starting wapbox.
+BEARERBOX_WAIT_TRIES=20
+BEARERBOX_WAIT_STEP_SECS=0.5
+# Kannel requires an admin password, so generate one per start rather than
+# shipping a constant. The port binds every interface, so an iptables rule below
+# drops the tunnel side.
+WAP_ADMIN_PASSWORD="${WAP_ADMIN_PASSWORD:-$(head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
 # Use docker's embedded DNS directly (not our captive Unbound, which
 # rewrites mmsc.<zone> to the tunnel gateway and would loop back here).
 MMSC_UPSTREAM="${MMSC_UPSTREAM:-http://mbuni}"
@@ -80,6 +105,32 @@ if [ "$HDTP_ENABLE" = "1" ]; then
           || iptables -t nat -A PREROUTING -i fou0 -p udp -d "$hip" --dport "$hport" \
             -j DNAT --to-destination "${GATEWAY_IP}:${HDTP_GW_PORT}"
         echo "HDTP hijack ${hip}:${hport} -> ${GATEWAY_IP}:${HDTP_GW_PORT}"
+    done
+fi
+
+# WAP hijack: same redirect for a provisioned carrier WAP proxy. The
+# destination port is preserved because bearerbox listens on the same assigned
+# ports the handset already dials.
+if [ "$WAP_ENABLE" = "1" ] && [ -n "$WAP_HIJACK_ENDPOINTS" ]; then
+    for ep in $(printf '%s\n' "$WAP_HIJACK_ENDPOINTS" | tr ',' ' '); do
+        [ -n "$ep" ] || continue
+        wip="${ep%%:*}"
+        wport="${ep##*:}"
+        [ -n "$wip" ] && [ -n "$wport" ] || continue
+        iptables -t nat -C PREROUTING -i fou0 -p udp -d "$wip" --dport "$wport" \
+            -j DNAT --to-destination "${GATEWAY_IP}:${wport}" 2>/dev/null \
+          || iptables -t nat -A PREROUTING -i fou0 -p udp -d "$wip" --dport "$wport" \
+            -j DNAT --to-destination "${GATEWAY_IP}:${wport}"
+        echo "WAP hijack ${wip}:${wport} -> ${GATEWAY_IP}:${wport}"
+    done
+fi
+
+# bearerbox binds its admin and wapbox ports on every interface, tunnel
+# included. Drop the handset side rather than rely on Kannel's admin-allow-ip.
+if [ "$WAP_ENABLE" = "1" ]; then
+    for port in "$WAP_ADMIN_PORT" "$WAPBOX_PORT"; do
+        iptables -C INPUT -i fou0 -p tcp --dport "$port" -j DROP 2>/dev/null \
+          || iptables -A INPUT -i fou0 -p tcp --dport "$port" -j DROP
     done
 fi
 
@@ -230,9 +281,32 @@ for upstream in $(printf '%s\n' "$UNBOUND_FORWARD_ADDRS" | tr ',' ' '); do
   printf '    forward-addr: %s\n' "$upstream" >>/etc/unbound/unbound.conf
 done
 
+if [ "$WAP_ENABLE" = "1" ]; then
+    mkdir -p /etc/kannel /var/log/kannel
+    cat >/etc/kannel/kannel.conf <<EOF
+group = core
+admin-port = ${WAP_ADMIN_PORT}
+admin-password = ${WAP_ADMIN_PASSWORD}
+admin-allow-ip = "127.0.0.1"
+wapbox-port = ${WAPBOX_PORT}
+http-proxy-host = ${WAP_TRANSCODE_BIND%%:*}
+http-proxy-port = ${WAP_TRANSCODE_BIND##*:}
+wdp-interface-name = "${GATEWAY_IP}"
+log-file = "/var/log/kannel/bearerbox.log"
+log-level = ${WAP_LOG_LEVEL}
+
+group = wapbox
+bearerbox-host = 127.0.0.1
+log-file = "/var/log/kannel/wapbox.log"
+log-level = ${WAP_LOG_LEVEL}
+EOF
+fi
+
 HDTP_STATUS="disabled"
+WAP_STATUS="disabled"
+[ "$WAP_ENABLE" = "1" ] && WAP_STATUS="${GATEWAY_IP}:9200,${GATEWAY_IP}:9201 transcode=${WAP_TRANSCODE_BIND} hijack=[${WAP_HIJACK_ENDPOINTS}]"
 [ "$HDTP_ENABLE" = "1" ] && HDTP_STATUS="${GATEWAY_IP}:${HDTP_GW_PORT} hijack=[${HDTP_HIJACK_ENDPOINTS}]"
-echo "FOU NAT ready: fou_udp=127.0.0.1:${FOU_LISTEN_PORT} relay_tcp=0.0.0.0:${FOU_TCP_PORT} relay_udp_bind=127.0.0.1:${FOU_REMOTE_PORT} tunnel=fou0 ${TUNNEL_ADDR} nat=${MOBILE_CIDR} dns=${GATEWAY_IP}:53 http=${GATEWAY_IP}:80 speedtest=${SPEEDTEST_UPSTREAM} edge-resolver=${EDGE_RESOLVER_BIND} mgmt=${MGMT_GRPC_ADDR} hdtp-gw=${HDTP_STATUS}"
+echo "FOU NAT ready: fou_udp=127.0.0.1:${FOU_LISTEN_PORT} relay_tcp=0.0.0.0:${FOU_TCP_PORT} relay_udp_bind=127.0.0.1:${FOU_REMOTE_PORT} tunnel=fou0 ${TUNNEL_ADDR} nat=${MOBILE_CIDR} dns=${GATEWAY_IP}:53 http=${GATEWAY_IP}:80 speedtest=${SPEEDTEST_UPSTREAM} edge-resolver=${EDGE_RESOLVER_BIND} mgmt=${MGMT_GRPC_ADDR} hdtp-gw=${HDTP_STATUS} wap-gw=${WAP_STATUS}"
 
 unbound -d -c /etc/unbound/unbound.conf &
 unbound_pid=$!
@@ -256,6 +330,32 @@ if [ "$HDTP_ENABLE" = "1" ]; then
     hdtp_pid=$!
 fi
 
+# WAP gateway. bearerbox binds the WDP ports on the tunnel address and wapbox
+# attaches to it, so start bearerbox first and wait for the listener instead of
+# racing it.
+bearerbox_pid=""
+wapbox_pid=""
+transcode_pid=""
+if [ "$WAP_ENABLE" = "1" ]; then
+    # Left unset, the transcoder keeps its own built-in cap.
+    if [ -n "$WAP_TRANSCODE_MAX_BLOCKS" ]; then
+        export WAP_GW_MAX_BLOCKS="$WAP_TRANSCODE_MAX_BLOCKS"
+    fi
+    WAP_GW_BIND="$WAP_TRANSCODE_BIND" RUST_LOG="$WAP_TRANSCODE_LOG" \
+        /usr/local/bin/wap-gw &
+    transcode_pid=$!
+    /usr/sbin/bearerbox -v "$WAP_LOG_LEVEL" /etc/kannel/kannel.conf &
+    bearerbox_pid=$!
+    tries=0
+    while [ "$tries" -lt "$BEARERBOX_WAIT_TRIES" ]; do
+        ss -ltn "sport = :${WAPBOX_PORT}" 2>/dev/null | grep -q LISTEN && break
+        sleep "$BEARERBOX_WAIT_STEP_SECS"
+        tries=$((tries + 1))
+    done
+    /usr/sbin/wapbox -v "$WAP_LOG_LEVEL" /etc/kannel/kannel.conf &
+    wapbox_pid=$!
+fi
+
 /usr/local/bin/fou-tcp-relay \
   --tcp-port "$FOU_TCP_PORT" \
   --udp-bind-port "$FOU_REMOTE_PORT" \
@@ -264,10 +364,11 @@ fi
 relay_pid=$!
 
 # shellcheck disable=SC2086
-trap 'kill $relay_pid $nginx_pid $resolver_pid $unbound_pid $hdtp_pid 2>/dev/null || true; wait $relay_pid $nginx_pid $resolver_pid $unbound_pid $hdtp_pid 2>/dev/null || true' INT TERM EXIT
+trap 'kill $relay_pid $nginx_pid $resolver_pid $unbound_pid $hdtp_pid $wapbox_pid $bearerbox_pid $transcode_pid 2>/dev/null || true; wait $relay_pid $nginx_pid $resolver_pid $unbound_pid $hdtp_pid $wapbox_pid $bearerbox_pid $transcode_pid 2>/dev/null || true' INT TERM EXIT
 
 while :; do
-  for pid in "$relay_pid" "$nginx_pid" "$resolver_pid" "$unbound_pid" "$hdtp_pid"; do
+  for pid in "$relay_pid" "$nginx_pid" "$resolver_pid" "$unbound_pid" "$hdtp_pid" \
+             "$bearerbox_pid" "$wapbox_pid" "$transcode_pid"; do
     [ -n "$pid" ] || continue
     if ! kill -0 "$pid" 2>/dev/null; then
       exit 1
