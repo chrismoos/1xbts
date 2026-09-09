@@ -99,6 +99,21 @@ fn test_msc_client() -> Arc<dyn cdma_bsc::a1_edge::MscClient> {
     Arc::new(cdma_bsc::bsc::AutoAssignmentMscClient::new())
 }
 
+fn attach_test_cell(
+    mut events: tokio::sync::mpsc::UnboundedReceiver<AccessChannelEvent>,
+) -> tokio::sync::mpsc::UnboundedReceiver<AccessChannelEvent> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(mut event) = events.recv().await {
+            event.cell = Some(TEST_CELL);
+            if tx.send(event).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
 use cdma_hlr::model::{
     RegistrationBinding, RegistrationState, Subscriber, SubscriberIdentity, SubscriberStatus,
 };
@@ -2794,6 +2809,7 @@ async fn test_e2e_so7_rc3_reverse_preamble_queues_bs_ack() {
         rx_measurements: _,
         ..
     } = bts_handle;
+    let access_events = attach_test_cell(access_events);
 
     let (traffic_tx, mut traffic_rx) = tokio::sync::broadcast::channel(16);
     let (mobiles_tx, mobiles_rx) = watch::channel(Vec::new());

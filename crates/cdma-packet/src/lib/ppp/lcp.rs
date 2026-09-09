@@ -9,6 +9,10 @@
 /// - Configure-Request (1), Configure-Ack (2), Configure-Nak (3), Configure-Reject (4)
 /// - Echo-Request (9) → respond with Echo-Reply (10)
 /// - Terminate-Request (5) → respond with Terminate-Ack (6)
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use super::framing::PppPacket;
 
 pub const LCP_PROTOCOL: u16 = 0xC021;
@@ -33,7 +37,11 @@ const CODE_REJECT_MAX_DATA: usize = 1400;
 pub(crate) const CONFIGURE_RESTART_TICKS: u16 = 50;
 const DEFAULT_MAX_CONFIGURE_RESTARTS: u32 = 10;
 const DEFAULT_LOCAL_MAGIC_NUMBER: u32 = 0x1B75_0001;
+const SESSION_MAGIC_INCREMENT: u32 = 0x9E37_79B9;
 const DEFAULT_REQUESTED_RX_ACCM: u32 = 0x0000_0000;
+
+static SESSION_MAGIC_SEED: OnceLock<u32> = OnceLock::new();
+static SESSION_MAGIC_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
 // LCP option types.
 const OPT_MRU: u8 = 1;
@@ -49,20 +57,24 @@ const SUPPORTED_OPTIONS: [u8; 5] = [OPT_MRU, OPT_ACCM, OPT_MAGIC_NUMBER, OPT_PFC
 
 /// Per-session Magic-Number. RFC 1661 §6.4 wants the magic chosen "in the
 /// most random manner possible" so a looped-back link is detectable (our own
-/// request coming back would carry our own magic). Clock entropy is enough
-/// for that purpose; zero is avoided because a zero magic means
-/// "not negotiated" (§5.8).
+/// request coming back would carry our own magic). A process-specific seed and
+/// sequence keep concurrently created sessions distinct. Zero is avoided
+/// because a zero magic means "not negotiated" (§5.8).
 fn session_magic() -> u32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let entropy = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() ^ (d.as_secs() as u32))
-        .unwrap_or(0);
-    let magic = DEFAULT_LOCAL_MAGIC_NUMBER ^ entropy;
-    if magic == 0 {
-        DEFAULT_LOCAL_MAGIC_NUMBER
-    } else {
-        magic
+    let seed = *SESSION_MAGIC_SEED.get_or_init(|| {
+        let clock_entropy = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.subsec_nanos() ^ duration.as_secs() as u32)
+            .unwrap_or(0);
+        DEFAULT_LOCAL_MAGIC_NUMBER ^ clock_entropy ^ std::process::id().rotate_left(16)
+    });
+
+    loop {
+        let sequence = SESSION_MAGIC_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let magic = seed.wrapping_add(sequence.wrapping_mul(SESSION_MAGIC_INCREMENT));
+        if magic != 0 {
+            return magic;
+        }
     }
 }
 
