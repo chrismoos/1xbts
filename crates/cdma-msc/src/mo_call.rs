@@ -1,17 +1,13 @@
 //! Mobile-originated call handling for the MSC runtime.
 //!
-//! Owns per-call MO calling party number resolution and mobile-to-mobile
-//! paging for on-net MO calls.
+//! Resolves calling and called subscribers and retains pending SIP routes.
 
 use std::collections::HashMap;
 
 use cdma_common::consts::{SERVICE_OPTION_EVRC_A, SERVICE_OPTION_QCELP13};
-use log::{info, warn};
-
-use crate::runtime::select_pageable_imsi;
+use log::warn;
 
 use crate::call_control::CallId;
-use crate::circuit::CircuitService;
 
 const IS2000_MIN_P_REV: u32 = 6;
 
@@ -28,17 +24,6 @@ pub(crate) fn select_mt_voice_service_option(
     preferred
         .filter(|service_option| supported_service_options.contains(service_option))
         .unwrap_or(default_voice_service_option)
-}
-
-/// Routing decision for an MO call's called-party number.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MoSubscriberRoute {
-    /// Called number is not a local subscriber.
-    NotSubscriber,
-    /// Called subscriber was paged successfully.
-    Paged,
-    /// Call was rejected (subscriber inactive, unregistered, etc.).
-    Rejected,
 }
 
 /// Routing recorded at MO origination, held until AssignmentComplete.
@@ -91,94 +76,21 @@ impl MoCallService {
         }
     }
 
-    pub(crate) async fn send_mo_mobile_to_mobile_page(
-        &mut self,
-        call_id: CallId,
+    pub(crate) async fn resolve_mo_destination(
+        &self,
         called_number: &str,
-        supported_service_options: &[u16],
-        default_voice_service_option: u16,
         hlr_repo: &dyn cdma_hlr::repository::HlrRepository,
-        circuits: &mut CircuitService,
-    ) -> MoSubscriberRoute {
-        let resolved = match hlr_repo.get_subscriber_by_phone_number(called_number).await {
-            Ok(Some(resolved)) => resolved,
-            Ok(None) => return MoSubscriberRoute::NotSubscriber,
+    ) -> Option<cdma_hlr::model::ResolvedSubscriber> {
+        match hlr_repo.get_subscriber_by_phone_number(called_number).await {
+            Ok(resolved) => resolved,
             Err(error) => {
                 warn!(
                     "MSC: HLR lookup failed for MO called_number='{}': {}",
                     called_number, error
                 );
-                return MoSubscriberRoute::NotSubscriber;
+                None
             }
-        };
-        let subscriber_id = resolved.subscriber.subscriber_id;
-
-        if !matches!(
-            resolved.subscriber.status,
-            cdma_hlr::model::SubscriberStatus::Active
-        ) {
-            warn!(
-                "MSC: refusing MO M2M call_id={} to inactive subscriber {}",
-                call_id.0, subscriber_id
-            );
-            return MoSubscriberRoute::Rejected;
         }
-
-        let Some(binding) = resolved.binding.as_ref() else {
-            warn!(
-                "MSC: refusing MO M2M call_id={} to unregistered subscriber {}",
-                call_id.0, subscriber_id
-            );
-            return MoSubscriberRoute::Rejected;
-        };
-        if !matches!(
-            binding.state,
-            cdma_hlr::model::RegistrationState::Registered
-                | cdma_hlr::model::RegistrationState::PageResponseReceived
-        ) {
-            warn!(
-                "MSC: refusing MO M2M call_id={} to subscriber {} in state {}",
-                call_id.0,
-                subscriber_id,
-                binding.state.as_str()
-            );
-            return MoSubscriberRoute::Rejected;
-        }
-
-        let Some(imsi): Option<&str> = select_pageable_imsi(&resolved.identities, binding) else {
-            warn!(
-                "MSC: refusing MO M2M call_id={} to subscriber {} with no IMSI",
-                call_id.0, subscriber_id
-            );
-            return MoSubscriberRoute::Rejected;
-        };
-        let service_option = select_mt_voice_service_option(
-            binding.mob_p_rev,
-            supported_service_options,
-            default_voice_service_option,
-        );
-
-        let paging_request = cdma_ios::PagingRequestMessage {
-            mobile_identity_imsi: cdma_ios::MobileIdentity::Imsi(imsi.to_string()),
-            tag: Some(cdma_ios::Tag(call_id.0 as u32)),
-            cell_identifier_list: None,
-            slot_cycle_index: binding
-                .slot_cycle_index
-                .map(|value| cdma_ios::SlotCycleIndex(value as u8)),
-            service_option: Some(cdma_ios::ServiceOption(service_option)),
-            is2000_mobile_capabilities: None,
-        };
-        circuits
-            .paging_requests
-            .insert(call_id, paging_request.clone());
-        circuits
-            .deferred_paging_requests
-            .insert(call_id, paging_request);
-        info!(
-            "MSC: deferring MO M2M PagingRequest call_id={} subscriber={} called_number='{}' callee_p_rev={:?} SO{} until primary leg AssignmentComplete",
-            call_id.0, subscriber_id, called_number, binding.mob_p_rev, service_option
-        );
-        MoSubscriberRoute::Paged
     }
 
     /// Clean up MO state associated with a call.

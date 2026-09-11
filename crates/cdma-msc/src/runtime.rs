@@ -8,6 +8,8 @@
 //! `select!` loop. Each service owns its own state; cross-service calls pass
 //! `&mut` references rather than `Arc`.
 
+mod m2m;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,7 +36,7 @@ use crate::media_gateway_service::{
     MediaGatewayService, gateway_clear_cause, send_forward_bearer_frame,
     send_gateway_clear_command, stop_media_for_call,
 };
-use crate::mo_call::{MoCallService, MoSubscriberRoute, select_mt_voice_service_option};
+use crate::mo_call::{MoCallService, select_mt_voice_service_option};
 use crate::mt_call::MtCallService;
 
 pub use crate::base_station::MscA1Endpoint;
@@ -45,7 +47,6 @@ pub(crate) enum PagePurpose {
     Initial,
     Retry,
     RepageAfterAf { failed_leg: MscVoiceLeg },
-    M2mSecondary,
 }
 
 fn is_sms_traffic_service_option(so: u16) -> bool {
@@ -81,7 +82,6 @@ impl PagePurpose {
             Self::Initial => "",
             Self::Retry => " (retry)",
             Self::RepageAfterAf { .. } => " (re-page after AssignmentFailure)",
-            Self::M2mSecondary => " for MO M2M (deferred until primary AssignmentComplete)",
         }
     }
 
@@ -386,7 +386,7 @@ impl MscRuntime {
                             info!("MSC: base station {node} attached");
                         }
                         Some(A1Event::Detached { node, calls }) => {
-                            self.handle_base_station_detached(a1, &node, calls);
+                            self.handle_base_station_detached(a1, &node, calls).await;
                         }
                         None => break,
                     }
@@ -869,9 +869,19 @@ impl MscRuntime {
             decoded.message_type, call_id_raw,
         );
 
+        if decoded.message_type != cdma_ios::MessageType::CompleteLayer3Information
+            && self.controller.snapshot(call_id).is_none()
+        {
+            debug!(
+                "MSC: ignoring {:?} for released or unknown call_id={}",
+                decoded.message_type, call_id_raw
+            );
+            a1.release_call(call_id);
+            return;
+        }
+
         match decoded.message_type {
             cdma_ios::MessageType::PagingResponse => {
-                self.mt_page_retry.cancel(call_id);
                 let response = match cdma_ios::PagingResponseMessage::decode(&decoded.payload) {
                     Ok(response) => response,
                     Err(error) => {
@@ -879,6 +889,16 @@ impl MscRuntime {
                         return;
                     }
                 };
+                if self.circuits.m2m_calls.contains_key(&call_id)
+                    && self.controller.state(call_id) != Some(cdma_ios::CallControlState::Paging)
+                {
+                    debug!(
+                        "MSC: ignoring repeated M2M PagingResponse call_id={}",
+                        call_id.0
+                    );
+                    return;
+                }
+                self.mt_page_retry.cancel(call_id);
                 let secondary_leg = self
                     .circuits
                     .circuits
@@ -929,6 +949,14 @@ impl MscRuntime {
                     }
                 };
                 let completed_circuit_id = self.circuits.assignment_complete_circuit(call_id);
+                if completed_circuit_id.is_none() && self.circuits.m2m_calls.contains_key(&call_id)
+                {
+                    debug!(
+                        "MSC: ignoring unexpected M2M AssignmentComplete call_id={}",
+                        call_id.0
+                    );
+                    return;
+                }
                 let completed_leg = completed_circuit_id
                     .and_then(|cid| self.circuits.circuits.get(&cid))
                     .map(|session| session.leg_role);
@@ -1016,6 +1044,12 @@ impl MscRuntime {
                     );
                     return;
                 }
+                if let Some(call) = self.circuits.m2m_calls.get(&call_id).copied() {
+                    if completed_circuit_id.is_some() {
+                        self.complete_m2m_assignment(a1, call, call_id).await;
+                    }
+                    return;
+                }
                 if completed_circuit_id
                     .and_then(|cid| self.circuits.circuits.get(&cid))
                     .is_some_and(|session| {
@@ -1062,7 +1096,6 @@ impl MscRuntime {
                         snapshot.direction == CallDirection::MobileOriginated
                     })
                 {
-                    self.flush_deferred_paging_request(a1, call_id).await;
                     self.fire_deferred_sip_invite(a1, call_id).await;
                 }
                 self.media_gw
@@ -1107,6 +1140,10 @@ impl MscRuntime {
                         return;
                     }
                 };
+                if let Some(call) = self.circuits.m2m_calls.get(&call_id).copied() {
+                    self.connect_m2m_call(a1, call, call_id).await;
+                    return;
+                }
                 // Tones-Off Progress must precede Connect: the engine accepts
                 // Progress only from Assigned/Alerting (Connect advances to
                 // Connected). BSC routes Signal=0x3F to the Caller leg.
@@ -1158,6 +1195,10 @@ impl MscRuntime {
                 {
                     return;
                 }
+                if self.circuits.m2m_calls.contains_key(&call_id) {
+                    self.send_clear_command(a1, call_id).await;
+                    return;
+                }
                 if let Err(error) = self.controller.apply_from_bsc(
                     call_id,
                     &cdma_ios::ProcedureMessage::ClearRequest(clear_request.clone()),
@@ -1204,6 +1245,10 @@ impl MscRuntime {
                         return;
                     }
                 };
+                if self.circuits.m2m_calls.contains_key(&call_id) {
+                    self.send_clear_command(a1, call_id).await;
+                    return;
+                }
                 if let Err(error) = self.controller.apply_from_bsc(
                     call_id,
                     &cdma_ios::ProcedureMessage::ClearComplete(clear_complete),
@@ -1414,31 +1459,14 @@ impl MscRuntime {
                         .register_active_subscriber(subscriber_id, call_id);
                 }
 
-                let subscriber_route = if let Some(called_number) = called_number.as_deref() {
+                let destination = if let Some(called_number) = called_number.as_deref() {
                     self.mo_call
-                        .send_mo_mobile_to_mobile_page(
-                            call_id,
-                            called_number,
-                            &self.config.supported_voice_service_options,
-                            self.config.default_voice_service_option,
-                            self.config.hlr_repo.as_ref(),
-                            &mut self.circuits,
-                        )
+                        .resolve_mo_destination(called_number, self.config.hlr_repo.as_ref())
                         .await
                 } else {
-                    MoSubscriberRoute::NotSubscriber
+                    None
                 };
-                if subscriber_route == MoSubscriberRoute::Rejected {
-                    send_gateway_clear_command(
-                        a1,
-                        call_id,
-                        &mut self.controller,
-                        gateway_clear_cause(ReleaseCause::SetupFailed, None),
-                    )
-                    .await;
-                    return;
-                }
-                let routes_to_subscriber = subscriber_route == MoSubscriberRoute::Paged;
+                let routes_to_subscriber = destination.is_some();
 
                 let is_otasp_call = self.pending_otasp_originations.contains_key(&call_id);
                 let mut audio_file = None;
@@ -1581,6 +1609,12 @@ impl MscRuntime {
                         "MSC: failed to send A1 Assignment Request to BSC for MO call_id={}: {}",
                         call_id_raw, error
                     );
+                    self.send_clear_command(a1, call_id).await;
+                    return;
+                }
+                if let Some(destination) = destination {
+                    self.start_m2m_callee(a1, call_id, destination, calling_number)
+                        .await;
                 }
             }
             other => {
@@ -1821,6 +1855,15 @@ impl MscRuntime {
     const MT_ASSIGNMENT_FAILURE_MAX_RETRIES: u8 = 3;
 
     async fn handle_assignment_failure(&mut self, a1: &dyn MscA1Endpoint, call_id: CallId) {
+        if self.circuits.m2m_calls.contains_key(&call_id)
+            && !self.circuits.has_pending_assignment_complete(call_id)
+        {
+            debug!(
+                "MSC: ignoring unexpected M2M AssignmentFailure call_id={}",
+                call_id.0
+            );
+            return;
+        }
         let abandoned = self
             .circuits
             .cancel_pending_assignment_leg(call_id, self.config.voice_bearer.as_ref());
@@ -1931,9 +1974,6 @@ impl MscRuntime {
 
         match completed_leg {
             Some(MscVoiceLeg::Secondary) => {
-                // MS-MS callee alerting; AWI (records only) goes to the
-                // Callee leg. Caller-side ringback was already kicked off
-                // at MO M2M page send (see flush_deferred_paging_request).
                 let records = build_caller_id_records(self).await;
                 send_alert_with_information(
                     a1,
@@ -1970,7 +2010,7 @@ impl MscRuntime {
         }
     }
 
-    async fn send_clear_command(&mut self, a1: &dyn MscA1Endpoint, call_id: CallId) {
+    async fn send_clear_command_for_leg(&mut self, a1: &dyn MscA1Endpoint, call_id: CallId) {
         let clear_command = cdma_ios::ClearCommandMessage {
             cause: cdma_ios::Cause(0x16),
             cause_layer3: None,
@@ -2005,29 +2045,6 @@ impl MscRuntime {
                 "MSC: failed to send ClearCommand call_id={}: {}",
                 call_id.0, error
             );
-        }
-    }
-
-    /// Send the MO M2M PagingRequest that was held until the primary leg's
-    /// AssignmentComplete arrived. The callee is paged at this point — never
-    /// before, so a callee PagingResponse cannot race the MO leg's setup.
-    async fn flush_deferred_paging_request(&mut self, a1: &dyn MscA1Endpoint, call_id: CallId) {
-        let Some(paging_request) = self.circuits.take_deferred_paging_request(call_id) else {
-            return;
-        };
-        if !self
-            .send_paging_request_to_bsc(a1, call_id, paging_request, PagePurpose::M2mSecondary)
-            .await
-        {
-            self.circuits.paging_requests.remove(&call_id);
-            return;
-        }
-        // Caller-side ringback fires at the same point as MSC's bearer-side
-        // ringback feeder (Primary AssignmentComplete) so audio and Signal
-        // IE stay in sync for MS-MS.
-        if self.config.send_tones_alert {
-            crate::media_gateway_service::send_progress_ringback(a1, call_id, &mut self.controller)
-                .await;
         }
     }
 
@@ -2541,7 +2558,7 @@ impl MscRuntime {
     /// Cleans up every call a base station held when its A1 link dropped.
     /// Nothing can clear them with the node, so the MSC releases its own
     /// side and lets the node release the air side when it comes back.
-    fn handle_base_station_detached(
+    async fn handle_base_station_detached(
         &mut self,
         a1: &dyn MscA1Endpoint,
         node: &BaseStationId,
@@ -2552,6 +2569,9 @@ impl MscRuntime {
             calls.len()
         );
         for call_id in calls {
+            if self.circuits.m2m_calls.contains_key(&call_id) {
+                self.send_clear_command(a1, call_id).await;
+            }
             self.mt_page_retry.cancel(call_id);
             self.controller.remove_call(call_id);
             self.stop_media_for_call(call_id);
@@ -2660,6 +2680,8 @@ pub(crate) fn select_pageable_imsi<'a>(
 
 #[cfg(test)]
 mod tests {
+    mod m2m;
+
     use super::*;
     use crate::circuit::{MscLegKey, MscVoiceLeg};
     use crate::media_gateway::{CallHandle, MediaGatewayEvent, VocoderFrame};
@@ -2692,6 +2714,7 @@ mod tests {
         subscriber_id: uuid::Uuid,
         imsi: &'static str,
         mob_p_rev: u32,
+        registration_state: cdma_hlr::model::RegistrationState,
     }
 
     impl M2mHlrRepo {
@@ -2705,12 +2728,14 @@ mod tests {
                 subscriber_id: uuid::Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888),
                 imsi: "111111111111111",
                 mob_p_rev,
+                registration_state: cdma_hlr::model::RegistrationState::Registered,
             }
         }
     }
 
     #[derive(Default)]
     struct StubMediaGateway {
+        created: std::sync::Mutex<Vec<CreateCallRequest>>,
         forwarded: std::sync::Mutex<Vec<(CallHandle, VocoderFrame)>>,
     }
 
@@ -2749,6 +2774,14 @@ mod tests {
         async fn recv_event(&self) -> Option<MediaGatewayEvent> {
             std::future::pending().await
         }
+        async fn register_inbound_session(
+            &self,
+            _: String,
+            _: u16,
+        ) -> Result<CallHandle, crate::media_gateway::MgwError> {
+            Ok(CallHandle(1))
+        }
+
         async fn inbound_progress(
             &self,
             session_id: &str,
@@ -2786,8 +2819,9 @@ mod tests {
     impl MediaGatewayClient for StubMediaGateway {
         async fn create_call(
             &self,
-            _: crate::media_gateway::CreateCallRequest,
+            request: crate::media_gateway::CreateCallRequest,
         ) -> Result<CallHandle, crate::media_gateway::MgwError> {
+            self.created.lock().unwrap().push(request);
             Ok(CallHandle(1))
         }
 
@@ -3141,8 +3175,8 @@ mod tests {
                 };
                 let binding = cdma_hlr::model::RegistrationBinding {
                     subscriber_id: self.subscriber_id,
-                    serving_bs_id: "test".to_string(),
-                    state: cdma_hlr::model::RegistrationState::Registered,
+                    serving_bs_id: test_node().0,
+                    state: self.registration_state.clone(),
                     imsi: Some(self.imsi.to_string()),
                     esn: None,
                     meid: None,
@@ -3250,8 +3284,8 @@ mod tests {
             assert_eq!(subscriber_id, self.subscriber_id);
             Ok(Some(cdma_hlr::model::RegistrationBinding {
                 subscriber_id,
-                serving_bs_id: "test".to_string(),
-                state: cdma_hlr::model::RegistrationState::Registered,
+                serving_bs_id: test_node().0,
+                state: self.registration_state.clone(),
                 imsi: Some(self.imsi.to_string()),
                 esn: None,
                 meid: None,
@@ -4360,42 +4394,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn mo_m2m_page_selects_qcelp13_for_registered_is95_callee() {
-        let hlr = M2mHlrRepo::with_p_rev(3);
-        let mut mo_call = MoCallService::new();
-        let mut circuits = CircuitService::new();
-        let call_id = CallId(4241);
-
-        assert_eq!(
-            mo_call
-                .send_mo_mobile_to_mobile_page(
-                    call_id,
-                    hlr.phone_number,
-                    &[cdma_common::consts::SERVICE_OPTION_QCELP13],
-                    cdma_common::consts::SERVICE_OPTION_QCELP13,
-                    &hlr,
-                    &mut circuits,
-                )
-                .await,
-            MoSubscriberRoute::Paged
-        );
-        assert_eq!(
-            circuits.deferred_paging_requests[&call_id].service_option,
-            Some(ServiceOption(cdma_common::consts::SERVICE_OPTION_QCELP13))
-        );
-    }
-
-    /// MO M2M scenario: the secondary-leg PagingRequest must NOT be sent to
-    /// the BSC until the primary (MO) leg's AssignmentComplete arrives.
-    /// This prevents the callee from page-responding before the caller is on
-    /// traffic — the race that orphaned a deferred PagingResponse in the
-    /// trace investigated alongside this change.
-    #[tokio::test]
-    async fn mo_m2m_paging_request_deferred_until_primary_assignment_complete() {
-        let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(8);
-        let hlr = Arc::new(M2mHlrRepo::new());
-        let mut runtime = MscRuntime::new(MscRuntimeConfig {
+    fn m2m_runtime(hlr: Arc<M2mHlrRepo>) -> MscRuntime {
+        MscRuntime::new(MscRuntimeConfig {
             hlr_repo: hlr.clone(),
             smsc_repo: None,
             welcome_sms: None,
@@ -4417,311 +4417,280 @@ mod tests {
             voice_bearer: None,
             media_gateway: None,
             otasp: None,
-        });
-
-        // BCD encoding of "5559876543" with TON/NPI 0x81.
-        // Pairs are nibble-swapped: "55" -> 0x55, "59" -> 0x95, "87" -> 0x78,
-        // "65" -> 0x56, "43" -> 0x34. Trailing nibble 0xf would pad an odd
-        // count; the number has 10 digits so no pad.
-        let cli3 = cm_service_request_cli3(Some(vec![0x81, 0x55, 0x95, 0x78, 0x56, 0x34]));
-        let call_id = 4242;
-        let cli3_msg = EncodedA1Message::from_message_for_call(
-            &cdma_ios::Message::new(
-                cdma_ios::MessageType::CompleteLayer3Information,
-                cli3.encode().unwrap(),
-            ),
-            Some(call_id),
-        );
-        runtime
-            .handle_bsc_a1_message(&endpoint, &test_node(), cli3_msg)
-            .await;
-
-        // Drain whatever the MSC sent for the MO leg setup. We expect to see
-        // an AssignmentRequest (one or more depending on the M2M flow), but
-        // *not* a PagingRequest — that's the message we're deferring.
-        let mut saw_assignment_request = false;
-        let mut assignment_circuit_id: Option<u16> = None;
-        loop {
-            match timeout(Duration::from_millis(50), client.poll_a1()).await {
-                Ok(Some(msg)) => {
-                    assert_ne!(
-                        msg.message_type(),
-                        cdma_ios::MessageType::PagingRequest,
-                        "PagingRequest must be deferred until primary AssignmentComplete"
-                    );
-                    if msg.message_type() == cdma_ios::MessageType::AssignmentRequest {
-                        saw_assignment_request = true;
-                        let payload = msg.decode().unwrap();
-                        let req =
-                            cdma_ios::AssignmentRequestMessage::decode(&payload.payload).unwrap();
-                        assignment_circuit_id = Some(req.circuit_identity_code.to_packed());
-                    }
-                }
-                _ => break,
-            }
-        }
-        assert!(
-            saw_assignment_request,
-            "MO leg AssignmentRequest should have been sent immediately"
-        );
-        assert!(
-            runtime
-                .circuits
-                .deferred_paging_requests
-                .contains_key(&CallId(call_id)),
-            "deferred MO M2M PagingRequest should be stored"
-        );
-
-        // Feed AssignmentComplete for the primary leg; this should flush the
-        // deferred PagingRequest to the BSC.
-        let assignment_complete = EncodedA1Message::from_message_for_call(
-            &cdma_ios::Message::new(
-                cdma_ios::MessageType::AssignmentComplete,
-                AssignmentCompleteMessage {
-                    channel_number: ChannelNumber(0x4321),
-                    encryption_information: None,
-                    service_option: Some(ServiceOption(0x0003)),
-                    a2p_bearer_session_params: None,
-                    a2p_bearer_format_params: None,
-                }
-                .encode()
-                .unwrap(),
-            ),
-            Some(call_id),
-        );
-        runtime
-            .handle_bsc_a1_message(&endpoint, &test_node(), assignment_complete)
-            .await;
-
-        // Now expect the deferred PagingRequest to land on the wire.
-        let paging_request = timeout(Duration::from_millis(50), client.poll_a1())
-            .await
-            .expect("PagingRequest should be sent after primary AssignmentComplete")
-            .expect("A1 channel should remain open");
-        assert_eq!(
-            paging_request.message_type(),
-            cdma_ios::MessageType::PagingRequest
-        );
-        assert_eq!(paging_request.call_id(), Some(call_id));
-        let paging_request_body =
-            PagingRequestMessage::decode(&paging_request.decode().unwrap().payload).unwrap();
-        assert_eq!(
-            paging_request_body.service_option,
-            Some(ServiceOption(cdma_common::consts::SERVICE_OPTION_EVRC_A))
-        );
-        assert!(
-            !runtime
-                .circuits
-                .deferred_paging_requests
-                .contains_key(&CallId(call_id)),
-            "deferred entry should be cleared after flush"
-        );
-        assert_eq!(
-            runtime.circuits.circuits[&assignment_circuit_id.unwrap()].leg_role,
-            MscVoiceLeg::Primary
-        );
-
-        let page_response = EncodedA1Message::from_message_for_call(
-            &cdma_ios::Message::new(
-                cdma_ios::MessageType::PagingResponse,
-                paging_response().encode().unwrap(),
-            ),
-            Some(call_id),
-        );
-        runtime
-            .handle_bsc_a1_message(&endpoint, &test_node(), page_response)
-            .await;
-        let secondary_assignment = timeout(Duration::from_millis(50), client.poll_a1())
-            .await
-            .expect("callee PageResponse should produce AssignmentRequest")
-            .expect("A1 channel should remain open");
-        assert_eq!(
-            secondary_assignment.message_type(),
-            cdma_ios::MessageType::AssignmentRequest
-        );
-        assert_eq!(
-            runtime
-                .circuits
-                .active_assignment_legs
-                .get(&CallId(call_id)),
-            Some(&MscVoiceLeg::Secondary)
-        );
-
-        let secondary_complete = EncodedA1Message::from_message_for_call(
-            &cdma_ios::Message::new(
-                cdma_ios::MessageType::AssignmentComplete,
-                AssignmentCompleteMessage {
-                    channel_number: ChannelNumber(0x4322),
-                    encryption_information: None,
-                    service_option: Some(ServiceOption(0x0003)),
-                    a2p_bearer_session_params: None,
-                    a2p_bearer_format_params: None,
-                }
-                .encode()
-                .unwrap(),
-            ),
-            Some(call_id),
-        );
-        runtime
-            .handle_bsc_a1_message(&endpoint, &test_node(), secondary_complete)
-            .await;
-        let alert = timeout(Duration::from_millis(50), client.poll_a1())
-            .await
-            .expect("callee AssignmentComplete should produce AlertWithInformation")
-            .expect("A1 channel should remain open");
-        assert_eq!(
-            alert.message_type(),
-            cdma_ios::MessageType::AlertWithInformation
-        );
+        })
     }
 
-    #[tokio::test]
-    async fn mo_primary_assignment_failure_clears_without_paging_callee() {
-        let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(8);
-        let mut runtime = MscRuntime::new(MscRuntimeConfig {
-            hlr_repo: Arc::new(M2mHlrRepo::new()),
-            smsc_repo: None,
-            welcome_sms: None,
-            sms_retry: crate::config::SmsRetryConfig::default(),
-            default_voice_service_option: 3,
-            supported_voice_service_options: vec![3],
-            wav_file: None,
-            gateway_fallback_to_wav: true,
-            local_answer_delay_ms: 10_000,
-            media_ringback_enabled: false,
-            media_ringback_type: MediaRingbackType::Nanp,
-            sip_ringback_disable: false,
-            inbound_sip_msc_ringback: false,
-            generate_ringback: true,
-            send_tones_alert: false,
-            page_retry_cooldown_ms: 1000,
-            page_retry_max_duration_ms: 60_000,
-            failure_tone_duration_ms: 0,
-            voice_bearer: None,
-            media_gateway: None,
-            otasp: None,
-        });
-        let call_id = 4243;
+    struct M2mSetup {
+        caller: CallId,
+        callee: CallId,
+        caller_circuit: u16,
+        page: PagingRequestMessage,
+    }
+
+    async fn begin_m2m_setup(
+        runtime: &mut MscRuntime,
+        endpoint: &dyn MscA1Endpoint,
+        client: &cdma_bsc_a1_edge_compat::InProcessMscClient,
+    ) -> M2mSetup {
+        let caller = CallId(4242);
         let cli3 = cm_service_request_cli3(Some(vec![0x81, 0x55, 0x95, 0x78, 0x56, 0x34]));
         runtime
             .handle_bsc_a1_message(
-                &endpoint,
+                endpoint,
                 &test_node(),
                 EncodedA1Message::from_message_for_call(
                     &cdma_ios::Message::new(
                         cdma_ios::MessageType::CompleteLayer3Information,
                         cli3.encode().unwrap(),
                     ),
-                    Some(call_id),
+                    Some(caller.0),
                 ),
             )
             .await;
-
-        loop {
-            match timeout(Duration::from_millis(20), client.poll_a1()).await {
-                Ok(Some(message))
-                    if message.message_type() == cdma_ios::MessageType::AssignmentRequest =>
-                {
-                    break;
-                }
-                Ok(Some(message)) => {
-                    assert_ne!(message.message_type(), cdma_ios::MessageType::PagingRequest);
-                }
-                _ => panic!("MO setup did not produce AssignmentRequest"),
-            }
-        }
-
-        runtime
-            .handle_bsc_a1_message(&endpoint, &test_node(), assignment_failure_msg(call_id))
-            .await;
-        let clear = timeout(Duration::from_millis(50), client.poll_a1())
+        let assignment = timeout(Duration::from_millis(50), client.poll_a1())
             .await
-            .expect("MO primary AssignmentFailure should produce ClearCommand")
-            .expect("A1 channel should remain open");
-        assert_eq!(clear.message_type(), cdma_ios::MessageType::ClearCommand);
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            runtime.controller.state(CallId(call_id)),
-            Some(cdma_ios::CallControlState::Clearing)
+            assignment.message_type(),
+            cdma_ios::MessageType::AssignmentRequest
         );
-        assert!(
-            timeout(Duration::from_millis(20), client.poll_a1())
-                .await
-                .is_err(),
-            "the callee must not be paged after the MO primary assignment fails"
+        assert_eq!(assignment.call_id(), Some(caller.0));
+        let caller_circuit =
+            AssignmentRequestMessage::decode(&assignment.decode().unwrap().payload)
+                .unwrap()
+                .circuit_identity_code
+                .to_packed();
+        let page = timeout(Duration::from_millis(50), client.poll_a1())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.message_type(), cdma_ios::MessageType::PagingRequest);
+        let callee = CallId(page.call_id().unwrap());
+        assert_ne!(caller, callee);
+        M2mSetup {
+            caller,
+            callee,
+            caller_circuit,
+            page: PagingRequestMessage::decode(&page.decode().unwrap().payload).unwrap(),
+        }
+    }
+
+    fn m2m_assignment_complete(call_id: CallId) -> EncodedA1Message {
+        EncodedA1Message::from_message_for_call(
+            &cdma_ios::Message::new(
+                cdma_ios::MessageType::AssignmentComplete,
+                AssignmentCompleteMessage {
+                    channel_number: ChannelNumber(10),
+                    encryption_information: None,
+                    service_option: Some(ServiceOption::EVRC_A),
+                    a2p_bearer_session_params: None,
+                    a2p_bearer_format_params: None,
+                }
+                .encode()
+                .unwrap(),
+            ),
+            Some(call_id.0),
+        )
+    }
+
+    #[tokio::test]
+    async fn mo_m2m_page_selects_qcelp13_for_registered_is95_callee() {
+        let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(8);
+        let mut runtime = m2m_runtime(Arc::new(M2mHlrRepo::with_p_rev(3)));
+        runtime.config.supported_voice_service_options =
+            vec![cdma_common::consts::SERVICE_OPTION_QCELP13];
+        runtime.config.default_voice_service_option = cdma_common::consts::SERVICE_OPTION_QCELP13;
+        let setup = begin_m2m_setup(&mut runtime, &endpoint, &client).await;
+        assert_eq!(
+            setup.page.service_option,
+            Some(ServiceOption(cdma_common::consts::SERVICE_OPTION_QCELP13))
         );
     }
 
-    /// If the call is torn down before the MO leg's AssignmentComplete
-    /// arrives, the deferred PagingRequest must be dropped — the callee is
-    /// never disturbed.
     #[tokio::test]
-    async fn mo_m2m_deferred_paging_request_dropped_on_cleanup() {
-        let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(8);
-        let hlr = Arc::new(M2mHlrRepo::new());
-        let mut runtime = MscRuntime::new(MscRuntimeConfig {
-            hlr_repo: hlr.clone(),
-            smsc_repo: None,
-            welcome_sms: None,
-            sms_retry: crate::config::SmsRetryConfig::default(),
-            default_voice_service_option: 3,
-            supported_voice_service_options: vec![3],
-            wav_file: None,
-            gateway_fallback_to_wav: true,
-            local_answer_delay_ms: 10_000,
-            media_ringback_enabled: false,
-            media_ringback_type: MediaRingbackType::Nanp,
-            sip_ringback_disable: false,
-            inbound_sip_msc_ringback: false,
-            generate_ringback: true,
-            send_tones_alert: false,
-            page_retry_cooldown_ms: 1000,
-            page_retry_max_duration_ms: 60_000,
-            failure_tone_duration_ms: 0,
-            voice_bearer: None,
-            media_gateway: None,
-            otasp: None,
-        });
-
-        let cli3 = cm_service_request_cli3(Some(vec![0x81, 0x55, 0x95, 0x78, 0x56, 0x34]));
-        let call_id = 7777;
-        let cli3_msg = EncodedA1Message::from_message_for_call(
-            &cdma_ios::Message::new(
-                cdma_ios::MessageType::CompleteLayer3Information,
-                cli3.encode().unwrap(),
-            ),
-            Some(call_id),
-        );
-        runtime
-            .handle_bsc_a1_message(&endpoint, &test_node(), cli3_msg)
-            .await;
-
-        // Drain the MO leg traffic, asserting no PagingRequest leaked.
-        while let Ok(Some(msg)) = timeout(Duration::from_millis(20), client.poll_a1()).await {
-            assert_ne!(msg.message_type(), cdma_ios::MessageType::PagingRequest);
-        }
-        assert!(
+    async fn mo_m2m_assigns_both_mobiles_before_either_completes() {
+        for caller_first in [true, false] {
+            let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(8);
+            let mut runtime = m2m_runtime(Arc::new(M2mHlrRepo::new()));
+            let setup = begin_m2m_setup(&mut runtime, &endpoint, &client).await;
+            let mut response = paging_response();
+            response.tag = setup.page.tag;
+            let response = EncodedA1Message::from_message_for_call(
+                &cdma_ios::Message::new(
+                    cdma_ios::MessageType::PagingResponse,
+                    response.encode().unwrap(),
+                ),
+                Some(setup.callee.0),
+            );
             runtime
-                .circuits
-                .deferred_paging_requests
-                .contains_key(&CallId(call_id))
-        );
-
-        // Tear down before AssignmentComplete arrives.
-        runtime.circuits.cleanup_call(CallId(call_id), None);
-
-        assert!(
-            !runtime
-                .circuits
-                .deferred_paging_requests
-                .contains_key(&CallId(call_id)),
-            "cleanup_call must drop the deferred PagingRequest"
-        );
-        assert!(
-            timeout(Duration::from_millis(20), client.poll_a1())
+                .handle_bsc_a1_message(&endpoint, &test_node(), response.clone())
+                .await;
+            let assignment = timeout(Duration::from_millis(50), client.poll_a1())
                 .await
-                .is_err(),
-            "no PagingRequest should be sent after cleanup"
-        );
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                assignment.message_type(),
+                cdma_ios::MessageType::AssignmentRequest
+            );
+            assert_eq!(assignment.call_id(), Some(setup.callee.0));
+            let callee_circuit =
+                AssignmentRequestMessage::decode(&assignment.decode().unwrap().payload)
+                    .unwrap()
+                    .circuit_identity_code
+                    .to_packed();
+            assert!(
+                runtime
+                    .circuits
+                    .has_pending_assignment_complete(setup.caller)
+            );
+            assert!(
+                runtime
+                    .circuits
+                    .has_pending_assignment_complete(setup.callee)
+            );
+            assert_eq!(
+                runtime.circuits.circuits[&setup.caller_circuit].peer_circuit_id,
+                Some(callee_circuit)
+            );
+            assert_eq!(
+                runtime.circuits.circuits[&callee_circuit].peer_circuit_id,
+                Some(setup.caller_circuit)
+            );
+
+            runtime
+                .handle_bsc_a1_message(&endpoint, &test_node(), response)
+                .await;
+            assert_eq!(runtime.circuits.circuits.len(), 2);
+            assert!(runtime.circuits.deferred_paging_responses.is_empty());
+
+            let order = if caller_first {
+                [setup.caller, setup.callee]
+            } else {
+                [setup.callee, setup.caller]
+            };
+            runtime
+                .handle_bsc_a1_message(&endpoint, &test_node(), m2m_assignment_complete(order[0]))
+                .await;
+            assert!(
+                timeout(Duration::from_millis(20), client.poll_a1())
+                    .await
+                    .is_err()
+            );
+            runtime
+                .handle_bsc_a1_message(&endpoint, &test_node(), m2m_assignment_complete(order[1]))
+                .await;
+            let alert = timeout(Duration::from_millis(50), client.poll_a1())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                alert.message_type(),
+                cdma_ios::MessageType::AlertWithInformation
+            );
+            assert_eq!(alert.call_id(), Some(setup.callee.0));
+            assert!(
+                !runtime
+                    .circuits
+                    .has_pending_assignment_complete(setup.caller)
+            );
+            assert!(
+                !runtime
+                    .circuits
+                    .has_pending_assignment_complete(setup.callee)
+            );
+
+            runtime
+                .handle_bsc_a1_message(
+                    &endpoint,
+                    &test_node(),
+                    EncodedA1Message::from_message_for_call(
+                        &cdma_ios::Message::new(
+                            cdma_ios::MessageType::Connect,
+                            cdma_ios::ConnectMessage.encode().unwrap(),
+                        ),
+                        Some(setup.callee.0),
+                    ),
+                )
+                .await;
+            let progress = timeout(Duration::from_millis(50), client.poll_a1())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(progress.message_type(), cdma_ios::MessageType::Progress);
+            assert_eq!(progress.call_id(), Some(setup.caller.0));
+            for leg in [setup.caller, setup.callee] {
+                assert_eq!(
+                    runtime.controller.state(leg),
+                    Some(cdma_ios::CallControlState::Connected)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mo_primary_assignment_failure_clears_both_mobiles() {
+        let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(8);
+        let mut runtime = m2m_runtime(Arc::new(M2mHlrRepo::new()));
+        let setup = begin_m2m_setup(&mut runtime, &endpoint, &client).await;
+        runtime
+            .handle_bsc_a1_message(
+                &endpoint,
+                &test_node(),
+                assignment_failure_msg(setup.caller.0),
+            )
+            .await;
+        for leg in [setup.caller, setup.callee] {
+            let clear = timeout(Duration::from_millis(50), client.poll_a1())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(clear.message_type(), cdma_ios::MessageType::ClearCommand);
+            assert_eq!(clear.call_id(), Some(leg.0));
+            assert!(runtime.controller.snapshot(leg).is_none());
+            assert!(!runtime.mt_page_retry.contains(leg));
+        }
+        assert!(runtime.circuits.m2m_calls.is_empty());
+        assert!(runtime.circuits.circuits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mo_m2m_clear_releases_both_contexts_during_setup() {
+        let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(8);
+        let mut runtime = m2m_runtime(Arc::new(M2mHlrRepo::new()));
+        let setup = begin_m2m_setup(&mut runtime, &endpoint, &client).await;
+        runtime.send_clear_command(&endpoint, setup.callee).await;
+        for leg in [setup.caller, setup.callee] {
+            let clear = timeout(Duration::from_millis(50), client.poll_a1())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(clear.message_type(), cdma_ios::MessageType::ClearCommand);
+            assert_eq!(clear.call_id(), Some(leg.0));
+            runtime
+                .handle_bsc_a1_message(
+                    &endpoint,
+                    &test_node(),
+                    EncodedA1Message::from_message_for_call(
+                        &cdma_ios::Message::new(
+                            cdma_ios::MessageType::ClearComplete,
+                            cdma_ios::ClearCompleteMessage {
+                                power_down_indicator: false,
+                            }
+                            .encode()
+                            .unwrap(),
+                        ),
+                        Some(leg.0),
+                    ),
+                )
+                .await;
+            assert!(runtime.controller.snapshot(leg).is_none());
+            assert!(!runtime.mt_page_retry.contains(leg));
+        }
+        assert!(runtime.circuits.m2m_calls.is_empty());
+        assert!(runtime.circuits.circuits.is_empty());
+        assert!(runtime.mt_call.mt_plans.is_empty());
     }
 
     #[tokio::test]

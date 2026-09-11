@@ -39,6 +39,23 @@ pub(crate) struct CircuitSession {
     pub(crate) called_number: Option<String>,
 }
 
+/// Caller and callee use separate A1 contexts so assignments can finish in either order.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct M2mCall {
+    pub(crate) caller: CallId,
+    pub(crate) callee: CallId,
+}
+
+impl M2mCall {
+    pub(crate) fn peer(self, call_id: CallId) -> CallId {
+        if call_id == self.caller {
+            self.callee
+        } else {
+            self.caller
+        }
+    }
+}
+
 /// A paging response waiting for the active assignment to finish.
 pub(crate) struct DeferredPagingResponse {
     pub(crate) response: cdma_ios::PagingResponseMessage,
@@ -55,18 +72,10 @@ pub(crate) struct CircuitService {
     pub(crate) pending_assignment_completes: HashMap<MscLegKey, u16>,
     /// Call ID -> currently outstanding assignment leg.
     pub(crate) active_assignment_legs: HashMap<CallId, MscVoiceLeg>,
-    /// Secondary leg page responses waiting for the active assignment to finish.
-    ///
-    /// Used by MT multi-leg flows where a second PagingResponse can arrive
-    /// while the first leg's AssignmentComplete is still pending. MO M2M no
-    /// longer reaches this path because the secondary-leg PagingRequest is
-    /// itself deferred (`deferred_paging_requests`) until the MO leg
-    /// completes — so no callee response can race the MO assignment.
+    /// Additional responses sharing an A1 context wait for its active assignment.
     pub(crate) deferred_paging_responses: HashMap<CallId, VecDeque<DeferredPagingResponse>>,
-    /// Outgoing MO M2M PagingRequests held until the primary (MO) leg's
-    /// AssignmentComplete arrives, so the callee is never paged before the
-    /// caller is fully on the traffic channel.
-    pub(crate) deferred_paging_requests: HashMap<CallId, cdma_ios::PagingRequestMessage>,
+    /// Independent A1 contexts belonging to one mobile-to-mobile conversation.
+    pub(crate) m2m_calls: HashMap<CallId, M2mCall>,
     /// Initial Paging Request per MT call, reused to initialize per-leg A1 procedure engines.
     pub(crate) paging_requests: HashMap<CallId, cdma_ios::PagingRequestMessage>,
     /// Per-call retry counter for MT-leg AssignmentFailure-driven re-pages.
@@ -95,7 +104,7 @@ impl CircuitService {
             pending_assignment_completes: HashMap::new(),
             active_assignment_legs: HashMap::new(),
             deferred_paging_responses: HashMap::new(),
-            deferred_paging_requests: HashMap::new(),
+            m2m_calls: HashMap::new(),
             paging_requests: HashMap::new(),
             mt_assignment_failure_retries: HashMap::new(),
             voice_transcoders: HashMap::new(),
@@ -160,7 +169,11 @@ impl CircuitService {
             .iter()
             .find(|(cid, peer)| {
                 **cid != circuit_id
-                    && peer.call_id == session.call_id
+                    && (peer.call_id == session.call_id
+                        || self
+                            .m2m_calls
+                            .get(&session.call_id)
+                            .is_some_and(|call| call.peer(session.call_id) == peer.call_id))
                     && peer.peer_circuit_id.is_none()
             })
             .map(|(cid, _)| *cid);
@@ -304,16 +317,6 @@ impl CircuitService {
         response.map(|r| r.response)
     }
 
-    /// Take the deferred outgoing PagingRequest for a call, if any.
-    ///
-    /// Returns `Some(request)` if one was stored, `None` otherwise.
-    pub(crate) fn take_deferred_paging_request(
-        &mut self,
-        call_id: CallId,
-    ) -> Option<cdma_ios::PagingRequestMessage> {
-        self.deferred_paging_requests.remove(&call_id)
-    }
-
     /// Purge state for whichever leg of `call_id` has an outstanding
     /// AssignmentRequest, inferred from `active_assignment_legs` (A1
     /// AssignmentFailure carries no leg discriminator on the wire).
@@ -353,7 +356,9 @@ impl CircuitService {
             .retain(|leg, _| leg.call_id != call_id);
         self.active_assignment_legs.remove(&call_id);
         self.deferred_paging_responses.remove(&call_id);
-        self.deferred_paging_requests.remove(&call_id);
+        if let Some(call) = self.m2m_calls.remove(&call_id) {
+            self.m2m_calls.remove(&call.peer(call_id));
+        }
         self.paging_requests.remove(&call_id);
         self.leg_procedures.retain(|leg, _| leg.call_id != call_id);
         self.mt_assignment_failure_retries.remove(&call_id);
@@ -371,7 +376,12 @@ impl CircuitService {
             if let Some(bearer) = voice_bearer {
                 bearer.close_circuit(*cid);
             }
-            self.circuits.remove(cid);
+            if let Some(session) = self.circuits.remove(cid)
+                && let Some(peer_id) = session.peer_circuit_id
+                && let Some(peer) = self.circuits.get_mut(&peer_id)
+            {
+                peer.peer_circuit_id = None;
+            }
         }
         circuit_ids
     }

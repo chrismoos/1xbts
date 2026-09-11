@@ -1,5 +1,6 @@
 # HEAD
 
+- MS-to-MS calls paging streamlined for quicker time to ring.
 - Added a WAP 1.x gateway (Kannel on the tunnel address, ports 9200/9201) with HTML-to-WML transcoding. Redirect a handset's provisioned carrier WAP proxy to it with `WAP_HIJACK_ENDPOINTS`.
 - Fixed libbladeRF binding incompatibility with some versions.
 - The stack now runs as separate components, with one MSC serving multiple Base Stations, each a BSC with multiple cells, and the web managing the whole network through the MSC. The PDSN supports multiple PCFs.
