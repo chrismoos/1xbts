@@ -95,6 +95,14 @@ fn hrpd_only_tx_scale(tx_digital_backoff: f32) -> f32 {
     tx_digital_backoff * HRPD_PAPR_HEADROOM
 }
 
+struct ShutdownOnDrop(Arc<AtomicBool>);
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn one_x_synth_scale(tx_digital_backoff: f32, adjacent_composite: bool) -> f32 {
     if adjacent_composite {
         1.0
@@ -394,11 +402,10 @@ impl Bts {
             .name("bts-rx".into())
             .spawn(move || {
                 realtime::apply_rx(&realtime_settings);
-                let shutdown_flag = shutdown.clone();
+                let _stop_tx_on_exit = ShutdownOnDrop(shutdown.clone());
                 let result = rx::run_rx_loop(rx_settings, commands_rx, &mut *radio_rx, shutdown);
-                match &result {
-                    Ok(()) => info!("rx: stopped normally"),
-                    Err(_) => shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed),
+                if result.is_ok() {
+                    info!("rx: stopped normally");
                 }
                 result
             })

@@ -1,5 +1,6 @@
 # HEAD
 
+- Fix issue with HRPD only mode exiting early.
 - MS-to-MS calls paging streamlined for quicker time to ring.
 - Added a WAP 1.x gateway (Kannel on the tunnel address, ports 9200/9201) with HTML-to-WML transcoding. Redirect a handset's provisioned carrier WAP proxy to it with `WAP_HIJACK_ENDPOINTS`.
 - Fixed libbladeRF binding incompatibility with some versions.

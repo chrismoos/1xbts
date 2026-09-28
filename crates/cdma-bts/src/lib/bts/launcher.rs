@@ -915,10 +915,8 @@ pub async fn spawn_local_abis_endpoint(
                 abis_responses
             };
 
-            // A closed RX channel means the sender side of the radio is gone,
-            // so there is nothing left to serve a BSC with. Only a transport
-            // disconnect re-enters accept.
-            let mut rx_gone = false;
+            let mut traffic_ack_open = true;
+            let mut access_open = true;
             loop {
                 tokio::select! {
                     event = events_rx.recv() => {
@@ -944,10 +942,10 @@ pub async fn spawn_local_abis_endpoint(
                             None => break,
                         }
                     }
-                    ack = traffic_ack_seq_rx.recv() => {
+                    ack = traffic_ack_seq_rx.recv(), if traffic_ack_open => {
                         let Some((walsh_code, ack_seq)) = ack else {
-                            rx_gone = true;
-                            break;
+                            traffic_ack_open = false;
+                            continue;
                         };
                         let events = agent.handle_reverse_ack_seq(walsh_code, ack_seq);
                         let abis_responses = deliver_agent_events(events, &controller_for_frames);
@@ -973,10 +971,10 @@ pub async fn spawn_local_abis_endpoint(
                             }
                         }
                     }
-                    access = access_events.recv() => {
+                    access = access_events.recv(), if access_open => {
                         let Some(access_event) = access else {
-                            rx_gone = true;
-                            break;
+                            access_open = false;
+                            continue;
                         };
                         agent.record_access_msg_seq(&access_event);
                         let l2_ack_responses = agent.check_access_ack_notify(&access_event);
@@ -1061,12 +1059,6 @@ pub async fn spawn_local_abis_endpoint(
             connected_for_agent.store(false, std::sync::atomic::Ordering::Relaxed);
             // Nothing will send the Remove that frees these, so do it here.
             agent.release_all();
-            if rx_gone {
-                // The RX side of the radio is gone, so the cell cannot serve
-                // anyone. Exit rather than keep radiating with no receiver.
-                error!("BTS Abis: RX event channel closed, exiting");
-                std::process::exit(1);
-            }
             info!("BTS Abis: connection closed, listening for a new BSC");
         }
     });
