@@ -39,7 +39,7 @@ use cdma_bts::{
             MobileStation, PagingChannelProcessor, PeakSampleDecimator, PipelineProcessor,
             PipelinedReceiver as ChainPipelinedReceiver, PnAlignProcessor,
             PulseMatchedFilterProcessor, SampleBlock, SoftViterbiDecoderProcessor,
-            SyncChannelProcessor, Unrepeater, ViterbiDecoderProcessor, WalshPilotCombiner,
+            SyncChannelProcessor, Unrepeater, WalshPilotCombiner,
             generic_rake_receiver::{
                 BaseFinger, Correlator, FingerProgress, GenericRakeReceiver, RakeFinger,
             },
@@ -268,8 +268,8 @@ impl Radio for BufferRadio {
     fn set_tx_frequency(&mut self, _: usize) -> Result<(), Error> {
         Ok(())
     }
-    fn set_tx_sample_rate(&mut self, _: usize) -> Result<(), Error> {
-        Ok(())
+    fn set_tx_sample_rate(&mut self, sample_rate: usize) -> Result<usize, Error> {
+        Ok(sample_rate)
     }
     fn set_tx_bandwidth(&mut self, _: usize) -> Result<(), Error> {
         Ok(())
@@ -675,10 +675,6 @@ fn build_forward_tracking_chain(
                             BitReversalInterleaver::new(block_interleaver::SR1_PARAMS_128),
                             2,
                         )
-                        .with_offset_search((0..128).collect(), 12, 1)
-                        .with_offset_search_warmup(16)
-                        .with_offset_search_batch_size(4)
-                        .with_offset_search_confirm_passes(1)
                         .with_reset_on_tag("upstream_lock_lost"),
                     ),
                     Box::new(SoftViterbiDecoderProcessor::new(
@@ -721,25 +717,13 @@ fn build_forward_tracking_chain(
                                     BitReversalInterleaver::new(block_interleaver::SR1_PARAMS_384),
                                     1,
                                 )
-                                .with_offset_search((0..384).collect(), 8, 1)
-                                .with_offset_search_warmup(8)
-                                .with_offset_search_batch_size(8)
-                                .with_offset_search_confirm_passes(1)
-                                .with_offset_search_evaluator(
-                                    Box::new(move |bits: &[u8], shift: usize, invert: bool| {
-                                        PagingChannelProcessor::evaluate_alignment(
-                                            bits, shift, invert, rate,
-                                        )
-                                    }),
-                                    half_frame_bits,
-                                )
                                 .with_reset_on_tag("upstream_lock_lost")
                             }),
                             if debug.bypass_paging_viterbi {
                                 Box::new(PagingBypassBitSlicer)
                             } else {
-                                Box::new(ViterbiDecoderProcessor::new(
-                                    ViterbiDecoder::new(get_1_2_k9_encoder()),
+                                Box::new(SoftViterbiDecoderProcessor::new(
+                                    SoftViterbiDecoder::new(get_1_2_k9_encoder()),
                                     swap_pair,
                                     conv_invert,
                                 ))
@@ -787,10 +771,6 @@ fn build_forward_sync_tracking_chain(
                 BitReversalInterleaver::new(block_interleaver::SR1_PARAMS_128),
                 2,
             )
-            .with_offset_search((0..128).collect(), 12, 1)
-            .with_offset_search_warmup(16)
-            .with_offset_search_batch_size(4)
-            .with_offset_search_confirm_passes(1)
             .with_reset_on_tag("upstream_lock_lost"),
         ),
         Box::new(SoftViterbiDecoderProcessor::new(
@@ -3027,19 +3007,9 @@ async fn run_e2e_paging_stack_pulse_shaped_acquisition_case(
                 BitReversalInterleaver::new(block_interleaver::SR1_PARAMS_384),
                 1,
             )
-            .with_offset_search((0..384).collect(), 8, 1)
-            .with_offset_search_warmup(8)
-            .with_offset_search_batch_size(8)
-            .with_offset_search_confirm_passes(1)
-            .with_offset_search_evaluator(
-                Box::new(move |bits: &[u8], shift: usize, invert: bool| {
-                    PagingChannelProcessor::evaluate_alignment(bits, shift, invert, rate)
-                }),
-                96,
-            )
         }));
-        chain.push(Box::new(ViterbiDecoderProcessor::new(
-            ViterbiDecoder::new(get_1_2_k9_encoder()),
+        chain.push(Box::new(SoftViterbiDecoderProcessor::new(
+            SoftViterbiDecoder::new(get_1_2_k9_encoder()),
             false,
             false,
         )));
@@ -3180,19 +3150,9 @@ async fn run_e2e_paging_stack_pulse_shaped_tracker_case(
                 BitReversalInterleaver::new(block_interleaver::SR1_PARAMS_384),
                 1,
             )
-            .with_offset_search((0..384).collect(), 8, 1)
-            .with_offset_search_warmup(8)
-            .with_offset_search_batch_size(8)
-            .with_offset_search_confirm_passes(1)
-            .with_offset_search_evaluator(
-                Box::new(move |bits: &[u8], shift: usize, invert: bool| {
-                    PagingChannelProcessor::evaluate_alignment(bits, shift, invert, rate)
-                }),
-                96,
-            )
         }),
-        Box::new(ViterbiDecoderProcessor::new(
-            ViterbiDecoder::new(get_1_2_k9_encoder()),
+        Box::new(SoftViterbiDecoderProcessor::new(
+            SoftViterbiDecoder::new(get_1_2_k9_encoder()),
             false,
             false,
         )),

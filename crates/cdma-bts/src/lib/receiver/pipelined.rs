@@ -20,7 +20,6 @@ mod long_code_descrambler;
 mod matched_filter_despreader;
 mod matched_filter_tracker;
 pub mod mobile_station;
-mod mobile_station_processor;
 mod paging_channel_processor;
 mod peak_sample_decimator;
 mod pn_align_processor;
@@ -49,7 +48,6 @@ mod soft_viterbi_decoder_r13_processor;
 mod sync_channel_processor;
 mod traffic_channel_processor;
 mod unrepeater;
-mod viterbi_decoder_processor;
 mod walsh_decoder_processor;
 mod walsh_pilot_combiner;
 
@@ -71,7 +69,6 @@ pub use long_code_descrambler::LongCodeDescrambler;
 pub use matched_filter_despreader::MatchedFilterDespreader;
 pub use matched_filter_tracker::MatchedFilterTracker;
 pub use mobile_station::MobileStation;
-pub use mobile_station_processor::MobileStationProcessor;
 pub use paging_channel_processor::PagingChannelProcessor;
 pub use peak_sample_decimator::PeakSampleDecimator;
 pub use pn_align_processor::PnAlignProcessor;
@@ -102,7 +99,6 @@ pub use traffic_channel_processor::{
     parse_reverse_mux2_format, parse_reverse_mux2_full_rate_format,
 };
 pub use unrepeater::Unrepeater;
-pub use viterbi_decoder_processor::ViterbiDecoderProcessor;
 pub use walsh_decoder_processor::WalshDecoderProcessor;
 pub use walsh_pilot_combiner::WalshPilotCombiner;
 
@@ -1415,16 +1411,10 @@ mod tests {
                                 WalshDecoder::new::<64>(0),
                             )),
                             Box::new(Unrepeater::new(4)),
-                            Box::new(
-                                DeinterleaverProcessor::new(
-                                    BitReversalInterleaver::new(block_interleaver::SR1_PARAMS_128),
-                                    2,
-                                )
-                                .with_offset_search((0..128).collect(), 12, 1)
-                                .with_offset_search_warmup(16)
-                                .with_offset_search_batch_size(4)
-                                .with_offset_search_confirm_passes(1),
-                            ),
+                            Box::new(DeinterleaverProcessor::new(
+                                BitReversalInterleaver::new(block_interleaver::SR1_PARAMS_128),
+                                2,
+                            )),
                             Box::new(SoftViterbiDecoderProcessor::new(
                                 SoftViterbiDecoder::new(get_1_2_k9_encoder()),
                                 swap_pair,
@@ -1452,33 +1442,12 @@ mod tests {
                                     )),
                                     Box::new(Unrepeater::new(unrepeat_factor)),
                                     Box::new(LongCodeDescrambler::new(lc_gen, 64)),
-                                    Box::new({
-                                        let half_frame_bits = match paging_ch_rate {
-                                            PagingChannelRate::Rate9600 => 96,
-                                            PagingChannelRate::Rate4800 => 48,
-                                        };
-                                        let rate = paging_ch_rate;
-                                        DeinterleaverProcessor::new(
-                                            BitReversalInterleaver::new(
-                                                block_interleaver::SR1_PARAMS_384,
-                                            ),
-                                            1,
-                                        )
-                                        .with_offset_search((0..384).collect(), 8, 1)
-                                        .with_offset_search_warmup(8)
-                                        .with_offset_search_batch_size(8)
-                                        .with_offset_search_confirm_passes(1)
-                                        .with_offset_search_evaluator(
-                                            Box::new(
-                                                move |bits: &[u8], shift: usize, invert: bool| {
-                                                    PagingChannelProcessor::evaluate_alignment(
-                                                        bits, shift, invert, rate,
-                                                    )
-                                                },
-                                            ),
-                                            half_frame_bits,
-                                        )
-                                    }),
+                                    Box::new(DeinterleaverProcessor::new(
+                                        BitReversalInterleaver::new(
+                                            block_interleaver::SR1_PARAMS_384,
+                                        ),
+                                        1,
+                                    )),
                                     Box::new(SoftViterbiDecoderProcessor::new(
                                         SoftViterbiDecoder::new(get_1_2_k9_encoder()),
                                         swap_pair,
@@ -1618,11 +1587,8 @@ mod tests {
         let base_id: u16 = 1;
         let pilot_pn: u16 = 0;
         let long_code_state: u64 = 1u64 << 41;
-        let max_iq_samples: Option<usize> = None;
-        let skip_iq_samples: usize = 0;
-        let iq_gain_scale: f32 = 1.0;
         eprintln!(
-            "{label}: sample_rate={} oversample={} iq_samples={} chip_start={} chain=reverse_access_chain acn={} pcn={} base_id={} pilot_pn={} lc_state={} skip_iq_samples={} max_iq_samples={:?} iq_gain_scale={}",
+            "{label}: sample_rate={} oversample={} iq_samples={} chip_start={} chain=reverse_access_chain acn={} pcn={} base_id={} pilot_pn={} lc_state={}",
             sample_rate,
             oversample,
             iq_samples.len(),
@@ -1632,25 +1598,7 @@ mod tests {
             base_id,
             pilot_pn,
             long_code_state,
-            skip_iq_samples,
-            max_iq_samples,
-            iq_gain_scale,
         );
-        let chip_start = chip_start + (skip_iq_samples / oversample) as u64;
-        let iq_samples = iq_samples.into_iter().skip(skip_iq_samples);
-        let iq_samples = if let Some(limit) = max_iq_samples {
-            iq_samples.take(limit).collect::<Vec<_>>()
-        } else {
-            iq_samples.collect::<Vec<_>>()
-        };
-        let iq_samples = if (iq_gain_scale - 1.0).abs() > f32::EPSILON {
-            iq_samples
-                .into_iter()
-                .map(|sample| sample * iq_gain_scale)
-                .collect::<Vec<_>>()
-        } else {
-            iq_samples
-        };
         let wav_duration_secs = iq_samples.len() as f64 / sample_rate as f64;
 
         let settings = ReverseAccessSettings {

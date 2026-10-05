@@ -8,8 +8,8 @@ use num_complex::Complex32;
 use crate::phy::walsh::WalshDecoder;
 
 use super::{PipelineProcessor, SampleBlock};
+use log::warn;
 
-/// Walsh decoder with pilot combining.
 pub struct WalshPilotCombiner {
     channel_walsh: WalshDecoder,
     pilot_walsh: WalshDecoder,
@@ -67,7 +67,7 @@ impl WalshPilotCombiner {
 
         if let Some(parent) = Path::new(path).parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!("walsh_pilot_combiner: failed to create dump dir {parent:?}: {e}");
+                warn!("walsh_pilot_combiner: failed to create dump dir {parent:?}: {e}");
                 self.dump_wav_path = None;
                 return;
             }
@@ -85,7 +85,7 @@ impl WalshPilotCombiner {
                 self.dump_writer = Some(writer);
             }
             Err(e) => {
-                eprintln!("walsh_pilot_combiner: failed to create dump wav {path}: {e}");
+                warn!("walsh_pilot_combiner: failed to create dump wav {path}: {e}");
                 self.dump_wav_path = None;
             }
         }
@@ -98,13 +98,13 @@ impl WalshPilotCombiner {
         };
         for s in samples {
             if let Err(e) = writer.write_sample(s.re) {
-                eprintln!("walsh_pilot_combiner: failed writing I sample: {e}");
+                warn!("walsh_pilot_combiner: failed writing I sample: {e}");
                 self.dump_writer = None;
                 self.dump_wav_path = None;
                 return;
             }
             if let Err(e) = writer.write_sample(s.im) {
-                eprintln!("walsh_pilot_combiner: failed writing Q sample: {e}");
+                warn!("walsh_pilot_combiner: failed writing Q sample: {e}");
                 self.dump_writer = None;
                 self.dump_wav_path = None;
                 return;
@@ -207,7 +207,7 @@ impl Drop for WalshPilotCombiner {
     fn drop(&mut self) {
         if let Some(writer) = self.dump_writer.take() {
             if let Err(e) = writer.finalize() {
-                eprintln!("walsh_pilot_combiner: failed to finalize wav dump: {e}");
+                warn!("walsh_pilot_combiner: failed to finalize wav dump: {e}");
             }
         }
     }

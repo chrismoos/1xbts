@@ -10,10 +10,13 @@
 //! ahead of the Layer-3 SDU. Feeding that raw PDU directly into this decoder is
 //! therefore not faithful beyond the message-type header.
 
+pub mod status_records;
+
 use crate::bits::Bitstream;
 use log::info;
 
 use crate::lac::message_types::{MessageId, WireChannel};
+use crate::lac::paging_messages::AlertWithInformationMessage;
 
 /// Reverse access-channel Layer 3 decode context.
 ///
@@ -7729,18 +7732,21 @@ mod tests {
     use super::{
         AccessDecodeContext, AccessInfoRecord, AccessMessage, AccessMessageHeader,
         AuthChallengeResponseMessage, AuthResponseMessage, AuthResyncMessage,
-        CandidateFreqSearchCdmaPilots, CandidateFreqSearchReportMessage,
+        COMPARISON_THRESHOLD_BITS, CandidateFreqSearchCdmaPilots, CandidateFreqSearchReportMessage,
         CandidateFreqSearchReportModeSpecific, CandidateFreqSearchReportPilot,
-        CandidateFreqSearchResponseMessage, DataBurstMessage, DeviceInformationMessage,
-        ExtReleaseResponseMessage, FdschMessage, FdschPdu, FlashWithInfoMessage,
-        ForPdchTypeSpecificFields, GeneralExtensionMessage, HandoffCompletionMessage,
-        NoFieldAccessMessage, OrderMessage, OriginationAdditionalServiceInstance,
-        OriginationContinuationMessage, OriginationMessage, OuterLoopReportMessage,
+        CandidateFreqSearchResponseMessage, DROP_TIMER_BITS, DataBurstMessage,
+        DeviceInformationMessage, ExtReleaseResponseMessage, FLAG_BITS, FdschMessage, FdschPdu,
+        FlashWithInfoMessage, ForPdchTypeSpecificFields, GeneralExtensionMessage,
+        HandoffCompletionMessage, NEIGHBOR_AGE_BITS, NID_BITS, NoFieldAccessMessage, OCTET_BITS,
+        OrderMessage, OriginationAdditionalServiceInstance, OriginationContinuationMessage,
+        OriginationMessage, OuterLoopReportMessage, PILOT_THRESHOLD_BITS, POWER_CONTROL_STEP_BITS,
+        POWER_REPORT_DELAY_BITS, POWER_REPORT_FRAMES_BITS, POWER_REPORT_THRESHOLD_BITS,
         ParametersResponseMessage, ParametersResponseRecord, PeriodicPsmmMessage,
         PeriodicPsmmPilot, PeriodicPsmmSchSetpoint, PeriodicPsmmSetpoints, PilotReport,
-        PilotStrengthMeasurementMessage, PowerMeasurementReportMessage, RdschPdu,
-        ReducedSlotCycleOrderDetail, ResourceRequestMessage, RevPdchTypeSpecificFields,
-        ReverseOrderDetail, SecurityModeRequestMessage, SecurityModeUiEncryptRecord,
+        PilotStrengthMeasurementMessage, PowerMeasurementReportMessage, QUALIFICATION_LENGTH_BITS,
+        RdschPdu, ReducedSlotCycleOrderDetail, ResourceRequestMessage, RevPdchTypeSpecificFields,
+        ReverseOrderDetail, SEARCH_WINDOW_BITS, SID_BITS, SIGNED_INTERCEPT_BITS, SOFT_SLOPE_BITS,
+        STATUS_RECORD_COUNT_BITS, SecurityModeRequestMessage, SecurityModeUiEncryptRecord,
         SendBurstDtmfMessage, ServiceConfigRecord, ServiceConnectCompletionMessage,
         ServiceOptionControlMessage, ServiceRequestMessage, ServiceResponseMessage, StatusMessage,
         StatusResponseMessage, SupplementalChannelPilotRecord, SupplementalChannelPilotReport,
@@ -9532,6 +9538,100 @@ mod tests {
         assert_eq!(4, decoded.serv_req_seq);
         assert_eq!(2, decoded.resp_purpose);
         assert!(decoded.service_config.is_some());
+    }
+
+    #[test]
+    fn fdsch_status_request_decodes_qualification_and_records() {
+        let mut body = Bitstream::new();
+        body.write_u8(2, OCTET_BITS);
+        body.write_u8(2, QUALIFICATION_LENGTH_BITS);
+        body.write_u8(3, OCTET_BITS);
+        body.write_u8(4, OCTET_BITS);
+        body.write_u8(3, STATUS_RECORD_COUNT_BITS);
+        body.write_u8(0x0e, OCTET_BITS);
+        body.write_u8(0x1a, OCTET_BITS);
+        body.write_u8(0x27, OCTET_BITS);
+
+        let pdu = FdschPdu::decode(&fdsch_pdu(MessageId::StatusRequest, body))
+            .expect("decode traffic STRQM");
+        let FdschMessage::StatusRequest(request) = pdu.body else {
+            panic!("expected STRQM")
+        };
+        assert_eq!(request.qualification_type, 2);
+        assert_eq!(request.qualification, vec![3, 4]);
+        assert_eq!(request.record_types, vec![0x0e, 0x1a, 0x27]);
+    }
+
+    #[test]
+    fn fdsch_power_control_parameters_decode_reporting_policy() {
+        let mut body = Bitstream::new();
+        body.write_u8(7, POWER_REPORT_THRESHOLD_BITS);
+        body.write_u8(4, POWER_REPORT_FRAMES_BITS);
+        body.write_u8(1, FLAG_BITS);
+        body.write_u8(1, FLAG_BITS);
+        body.write_u8(5, POWER_REPORT_DELAY_BITS);
+
+        let pdu = FdschPdu::decode(&fdsch_pdu(MessageId::PowerControlParameters, body))
+            .expect("decode traffic PCNPM");
+        let FdschMessage::PowerControlParameters(parameters) = pdu.body else {
+            panic!("expected PCNPM")
+        };
+        assert_eq!(parameters.report_threshold, 7);
+        assert_eq!(parameters.report_frames, 4);
+        assert!(parameters.threshold_enabled);
+        assert!(parameters.periodic_enabled);
+        assert_eq!(parameters.report_delay, 5);
+    }
+
+    #[test]
+    fn fdsch_power_control_decodes_reverse_step() {
+        let mut body = Bitstream::new();
+        body.write_u8(2, POWER_CONTROL_STEP_BITS);
+        body.write_u8(0, FLAG_BITS);
+        body.write_u8(0, FLAG_BITS);
+        body.write_u8(0, FLAG_BITS);
+
+        let pdu = FdschPdu::decode(&fdsch_pdu(MessageId::PowerControl, body))
+            .expect("decode traffic PCNM");
+        let FdschMessage::PowerControl(message) = pdu.body else {
+            panic!("expected PCNM")
+        };
+        assert_eq!(message.reverse_step, 2);
+        assert!(!message.use_time);
+        assert!(!message.forward_parameters_included);
+        assert!(!message.reverse_parameters_included);
+    }
+
+    #[test]
+    fn fdsch_in_traffic_system_parameters_decode_core_fields() {
+        let mut body = Bitstream::new();
+        body.write_u32(4_107, SID_BITS);
+        body.write_u32(u32::from(u16::MAX), NID_BITS);
+        body.write_u8(8, SEARCH_WINDOW_BITS);
+        body.write_u8(9, SEARCH_WINDOW_BITS);
+        body.write_u8(10, SEARCH_WINDOW_BITS);
+        body.write_u8(11, PILOT_THRESHOLD_BITS);
+        body.write_u8(12, PILOT_THRESHOLD_BITS);
+        body.write_u8(3, COMPARISON_THRESHOLD_BITS);
+        body.write_u8(4, DROP_TIMER_BITS);
+        body.write_u8(5, NEIGHBOR_AGE_BITS);
+        body.write_u8(6, OCTET_BITS);
+        body.write_u8(7, SOFT_SLOPE_BITS);
+        body.write_u8(0b11_1111, SIGNED_INTERCEPT_BITS);
+        body.write_u8(2, SIGNED_INTERCEPT_BITS);
+        body.write_u8(9, OCTET_BITS);
+        body.write_u8(0, FLAG_BITS);
+
+        let pdu = FdschPdu::decode(&fdsch_pdu(MessageId::InTrafficSystemParameters, body))
+            .expect("decode traffic ITSPM");
+        let FdschMessage::InTrafficSystemParameters(parameters) = pdu.body else {
+            panic!("expected ITSPM")
+        };
+        assert_eq!(parameters.sid, 4_107);
+        assert_eq!(parameters.nid, u16::MAX);
+        assert_eq!(parameters.protocol_revision, 6);
+        assert_eq!(parameters.add_intercept, -1);
+        assert_eq!(parameters.drop_intercept, 2);
     }
 
     #[test]
@@ -12376,6 +12476,28 @@ mod tests {
     }
 
     #[test]
+    fn service_connect_with_omitted_zero_tail_decodes() {
+        use super::{FdschMessage, FdschPdu, ServiceConnectRecord};
+
+        let pdu = Bitstream::new_bytes(&[
+            0x14, 0xe6, 0x00, 0x00, 0x07, 0x0f, 0x00, 0x01, 0x00, 0x01, 0xf0, 0xf0, 0x01, 0x06,
+            0x01, 0x00, 0x03, 0x11, 0x04, 0x86, 0x30, 0x13, 0x05, 0x84, 0x43, 0x08, 0x00, 0x00,
+        ]);
+        let decoded = FdschPdu::decode(&pdu).expect("decode observed Service Connect PDU");
+        let FdschMessage::ServiceConnect(sc) = decoded.body else {
+            panic!("expected Service Connect");
+        };
+        assert_eq!(sc.serv_con_seq, 0);
+        assert_eq!(sc.records.len(), 2);
+        assert!(matches!(
+            sc.records[0],
+            ServiceConnectRecord::ServiceConfig(_)
+        ));
+        assert!(sc.call_assignments.is_empty());
+        assert!(!sc.use_type0_plcm);
+    }
+
+    #[test]
     fn test_fdsch_service_connect_rejects_service_config_record_len_overrun() {
         use super::FdschPdu;
         use crate::lac::paging_messages::{
@@ -13013,6 +13135,77 @@ pub struct FdschOrderMessage {
     pub con_ref: Option<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InTrafficSystemParametersMessage {
+    pub sid: u16,
+    pub nid: u16,
+    pub search_window_active: u8,
+    pub search_window_neighbor: u8,
+    pub search_window_remaining: u8,
+    pub add_threshold: u8,
+    pub drop_threshold: u8,
+    pub comparison_threshold: u8,
+    pub drop_timer: u8,
+    pub neighbor_max_age: u8,
+    pub protocol_revision: u8,
+    pub soft_slope: u8,
+    pub add_intercept: i8,
+    pub drop_intercept: i8,
+    pub packet_zone_id: u8,
+    pub extension: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PowerControlParametersMessage {
+    pub report_threshold: u8,
+    pub report_frames: u8,
+    pub threshold_enabled: bool,
+    pub periodic_enabled: bool,
+    pub report_delay: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FdschStatusRequestMessage {
+    pub qualification_type: u8,
+    pub qualification: Vec<u8>,
+    pub record_types: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PowerControlMessage {
+    pub reverse_step: u8,
+    pub use_time: bool,
+    pub action_time: Option<u8>,
+    pub forward_parameters_included: bool,
+    pub forward_mode: Option<u8>,
+    pub reverse_parameters_included: bool,
+}
+
+const FLAG_BITS: usize = 1;
+const OCTET_BITS: usize = 8;
+const SID_BITS: usize = 15;
+const NID_BITS: usize = 16;
+const SEARCH_WINDOW_BITS: usize = 4;
+const PILOT_THRESHOLD_BITS: usize = 6;
+const COMPARISON_THRESHOLD_BITS: usize = 4;
+const DROP_TIMER_BITS: usize = 4;
+const NEIGHBOR_AGE_BITS: usize = 4;
+const SOFT_SLOPE_BITS: usize = 6;
+const SIGNED_INTERCEPT_BITS: usize = 6;
+const SIGNED_INTERCEPT_SIGN: u8 = 1 << (SIGNED_INTERCEPT_BITS - 1);
+const SIGNED_INTERCEPT_MODULUS: i8 = 1 << SIGNED_INTERCEPT_BITS;
+const POWER_REPORT_THRESHOLD_BITS: usize = 5;
+const POWER_REPORT_FRAMES_BITS: usize = 4;
+const POWER_REPORT_DELAY_BITS: usize = 5;
+const QUALIFICATION_LENGTH_BITS: usize = 3;
+const STATUS_RECORD_COUNT_BITS: usize = 4;
+const POWER_CONTROL_STEP_BITS: usize = 3;
+const ACTION_TIME_BITS: usize = 6;
+const FORWARD_POWER_MODE_BITS: usize = 3;
+const FORWARD_FER_BITS: usize = 5;
+const FORWARD_SETPOINT_BITS: usize = 8;
+const SUPPLEMENTAL_COUNT_BITS: usize = 2;
+
 impl FdschOrderMessage {
     pub fn order_name(&self) -> &'static str {
         forward_dedicated_order_name(self.order)
@@ -13023,13 +13216,17 @@ impl FdschOrderMessage {
 #[derive(Debug, Clone)]
 pub enum FdschMessage {
     Order(FdschOrderMessage),
+    AlertWithInformation(AlertWithInformationMessage),
     DataBurst(DataBurstMessage),
+    InTrafficSystemParameters(InTrafficSystemParametersMessage),
+    PowerControlParameters(PowerControlParametersMessage),
+    StatusRequest(FdschStatusRequestMessage),
     ServiceRequest(ServiceRequestMessage),
     ServiceResponse(ServiceResponseMessage),
     ServiceConnect(ServiceConnectMessage),
+    PowerControl(PowerControlMessage),
 }
 
-/// Decoded f-dsch PDU.
 #[derive(Debug, Clone)]
 pub struct FdschPdu {
     pub message_id: MessageId,
@@ -13066,6 +13263,9 @@ impl FdschPdu {
 
         let body = match message_id {
             MessageId::Order => decode_fdsch_order(&mut bs)?,
+            MessageId::AlertWithInformation => FdschMessage::AlertWithInformation(
+                AlertWithInformationMessage::from_ftch_sdu(&mut bs)?,
+            ),
             MessageId::DataBurst => {
                 let header = AccessMessageHeader {
                     pd: 0,
@@ -13076,6 +13276,15 @@ impl FdschPdu {
                     _ => return Err("f-dsch DBM decoder returned non-DBM body".to_string()),
                 }
             }
+            MessageId::InTrafficSystemParameters => FdschMessage::InTrafficSystemParameters(
+                decode_in_traffic_system_parameters(&mut bs)?,
+            ),
+            MessageId::PowerControlParameters => {
+                FdschMessage::PowerControlParameters(decode_power_control_parameters(&mut bs)?)
+            }
+            MessageId::StatusRequest => {
+                FdschMessage::StatusRequest(decode_fdsch_status_request(&mut bs)?)
+            }
             MessageId::ServiceRequest => FdschMessage::ServiceRequest(decode_service_request_body(
                 &mut bs,
                 ServiceNegotiationDirection::Forward,
@@ -13084,6 +13293,7 @@ impl FdschPdu {
                 decode_service_response_body(&mut bs, ServiceNegotiationDirection::Forward)?,
             ),
             MessageId::ServiceConnect => decode_fdsch_service_connect(&mut bs)?,
+            MessageId::PowerControl => FdschMessage::PowerControl(decode_power_control(&mut bs)?),
             _ => {
                 return Err(format!(
                     "unsupported f-dsch body decode for {}",
@@ -13125,6 +13335,14 @@ impl FdschPdu {
                     con_ref,
                 )
             }
+            FdschMessage::AlertWithInformation(m) => format!(
+                "AlertWithInformation(signal={:?}, calling_party={})",
+                m.signal_info,
+                m.calling_party
+                    .as_ref()
+                    .map(|record| record.digits.as_str())
+                    .unwrap_or("unknown"),
+            ),
             FdschMessage::DataBurst(m) => format!(
                 "DataBurst(msg_number={}, burst_type=0b{:06b} {}, num_msgs={}, num_fields={})",
                 m.msg_number,
@@ -13132,6 +13350,22 @@ impl FdschPdu {
                 m.burst_type_name(),
                 m.num_msgs,
                 m.num_fields,
+            ),
+            FdschMessage::InTrafficSystemParameters(m) => format!(
+                "InTrafficSystemParameters(SID={}, NID={}, P_REV={}, packet_zone={})",
+                m.sid, m.nid, m.protocol_revision, m.packet_zone_id,
+            ),
+            FdschMessage::PowerControlParameters(m) => format!(
+                "PowerControlParameters(threshold={}, frames={}, threshold_enabled={}, periodic_enabled={}, delay={})",
+                m.report_threshold,
+                m.report_frames,
+                m.threshold_enabled as u8,
+                m.periodic_enabled as u8,
+                m.report_delay,
+            ),
+            FdschMessage::StatusRequest(m) => format!(
+                "StatusRequest(qualification=0x{:02X}, records={:02X?})",
+                m.qualification_type, m.record_types,
             ),
             FdschMessage::ServiceRequest(m) => {
                 let purpose = match m.req_purpose {
@@ -13174,6 +13408,14 @@ impl FdschPdu {
                 m.serv_con_seq,
                 m.records.len(),
             ),
+            FdschMessage::PowerControl(m) => format!(
+                "PowerControl(reverse_step={}, use_time={}, action_time={:?}, fpc_incl={}, rpc_incl={})",
+                m.reverse_step,
+                m.use_time as u8,
+                m.action_time,
+                m.forward_parameters_included as u8,
+                m.reverse_parameters_included as u8,
+            ),
         };
         format!(
             "f-dsch {}(0x{:02X}) ack_seq={} msg_seq={} ack_req={} enc={} | {}",
@@ -13186,6 +13428,130 @@ impl FdschPdu {
             body_sum,
         )
     }
+}
+
+fn signed_six(value: u8) -> i8 {
+    if value & SIGNED_INTERCEPT_SIGN == 0 {
+        value as i8
+    } else {
+        (value as i8) - SIGNED_INTERCEPT_MODULUS
+    }
+}
+
+fn decode_in_traffic_system_parameters(
+    bs: &mut Bitstream,
+) -> Result<InTrafficSystemParametersMessage, String> {
+    Ok(InTrafficSystemParametersMessage {
+        sid: read(bs, SID_BITS, "SID")? as u16,
+        nid: read(bs, NID_BITS, "NID")? as u16,
+        search_window_active: read(bs, SEARCH_WINDOW_BITS, "SRCH_WIN_A")? as u8,
+        search_window_neighbor: read(bs, SEARCH_WINDOW_BITS, "SRCH_WIN_N")? as u8,
+        search_window_remaining: read(bs, SEARCH_WINDOW_BITS, "SRCH_WIN_R")? as u8,
+        add_threshold: read(bs, PILOT_THRESHOLD_BITS, "T_ADD")? as u8,
+        drop_threshold: read(bs, PILOT_THRESHOLD_BITS, "T_DROP")? as u8,
+        comparison_threshold: read(bs, COMPARISON_THRESHOLD_BITS, "T_COMP")? as u8,
+        drop_timer: read(bs, DROP_TIMER_BITS, "T_TDROP")? as u8,
+        neighbor_max_age: read(bs, NEIGHBOR_AGE_BITS, "NGHBR_MAX_AGE")? as u8,
+        protocol_revision: read(bs, OCTET_BITS, "P_REV")? as u8,
+        soft_slope: read(bs, SOFT_SLOPE_BITS, "SOFT_SLOPE")? as u8,
+        add_intercept: signed_six(read(bs, SIGNED_INTERCEPT_BITS, "ADD_INTERCEPT")? as u8),
+        drop_intercept: signed_six(read(bs, SIGNED_INTERCEPT_BITS, "DROP_INTERCEPT")? as u8),
+        packet_zone_id: read(bs, OCTET_BITS, "PACKET_ZONE_ID")? as u8,
+        extension: read(bs, FLAG_BITS, "EXTENSION")? != 0,
+    })
+}
+
+fn decode_power_control_parameters(
+    bs: &mut Bitstream,
+) -> Result<PowerControlParametersMessage, String> {
+    Ok(PowerControlParametersMessage {
+        report_threshold: read(bs, POWER_REPORT_THRESHOLD_BITS, "PWR_REP_THRESH")? as u8,
+        report_frames: read(bs, POWER_REPORT_FRAMES_BITS, "PWR_REP_FRAMES")? as u8,
+        threshold_enabled: read(bs, FLAG_BITS, "PWR_THRESH_ENABLE")? != 0,
+        periodic_enabled: read(bs, FLAG_BITS, "PWR_PERIOD_ENABLE")? != 0,
+        report_delay: read(bs, POWER_REPORT_DELAY_BITS, "PWR_REP_DELAY")? as u8,
+    })
+}
+
+fn decode_fdsch_status_request(bs: &mut Bitstream) -> Result<FdschStatusRequestMessage, String> {
+    let qualification_type = read(bs, OCTET_BITS, "QUAL_INFO_TYPE")? as u8;
+    let qualification_len = read(bs, QUALIFICATION_LENGTH_BITS, "QUAL_INFO_LEN")? as usize;
+    let mut qualification = Vec::with_capacity(qualification_len);
+    for index in 0..qualification_len {
+        qualification.push(read(bs, OCTET_BITS, &format!("QUAL_INFO[{index}]"))? as u8);
+    }
+    let record_count = read(bs, STATUS_RECORD_COUNT_BITS, "NUM_FIELDS")? as usize;
+    let mut record_types = Vec::with_capacity(record_count);
+    for index in 0..record_count {
+        record_types.push(read(bs, OCTET_BITS, &format!("RECORD_TYPE[{index}]"))? as u8);
+    }
+    Ok(FdschStatusRequestMessage {
+        qualification_type,
+        qualification,
+        record_types,
+    })
+}
+
+fn decode_power_control(bs: &mut Bitstream) -> Result<PowerControlMessage, String> {
+    let reverse_step = read(bs, POWER_CONTROL_STEP_BITS, "PWR_CNTL_STEP")? as u8;
+    let use_time = read(bs, FLAG_BITS, "USE_TIME")? != 0;
+    let action_time = use_time
+        .then(|| read(bs, ACTION_TIME_BITS, "ACTION_TIME"))
+        .transpose()?
+        .map(|v| v as u8);
+    let forward_parameters_included = read(bs, FLAG_BITS, "FPC_INCL")? != 0;
+    let forward_mode = forward_parameters_included
+        .then(|| read(bs, FORWARD_POWER_MODE_BITS, "FPC_MODE"))
+        .transpose()?
+        .map(|v| v as u8);
+    if forward_parameters_included {
+        let _primary_channel = read(bs, FLAG_BITS, "FPC_PRI_CHAN")?;
+        let fch_included = read(bs, FLAG_BITS, "FPC_OLPC_FCH_INCL")? != 0;
+        if fch_included {
+            let _ = read(bs, FORWARD_FER_BITS, "FPC_FCH_FER")?;
+            let _ = read(bs, FORWARD_SETPOINT_BITS, "FPC_FCH_MIN_SETPT")?;
+            let _ = read(bs, FORWARD_SETPOINT_BITS, "FPC_FCH_MAX_SETPT")?;
+        }
+        let dcch_included = read(bs, FLAG_BITS, "FPC_OLPC_DCCH_INCL")? != 0;
+        if dcch_included {
+            let _ = read(bs, FORWARD_FER_BITS, "FPC_DCCH_FER")?;
+            let _ = read(bs, FORWARD_SETPOINT_BITS, "FPC_DCCH_MIN_SETPT")?;
+            let _ = read(bs, FORWARD_SETPOINT_BITS, "FPC_DCCH_MAX_SETPT")?;
+        }
+        let _secondary_channel = read(bs, FLAG_BITS, "FPC_SEC_CHAN")?;
+        let supplemental_count = read(bs, SUPPLEMENTAL_COUNT_BITS, "NUM_SUP")? as usize;
+        for index in 0..supplemental_count {
+            let _ = read(bs, FLAG_BITS, &format!("SCH_ID[{index}]"))?;
+            let _ = read(bs, FORWARD_FER_BITS, &format!("FPC_SCH_FER[{index}]"))?;
+            let _ = read(
+                bs,
+                FORWARD_SETPOINT_BITS,
+                &format!("FPC_SCH_MIN_SETPT[{index}]"),
+            )?;
+            let _ = read(
+                bs,
+                FORWARD_SETPOINT_BITS,
+                &format!("FPC_SCH_MAX_SETPT[{index}]"),
+            )?;
+        }
+        let threshold_included = read(bs, FLAG_BITS, "FPC_THRESH_INCL")? != 0;
+        if threshold_included {
+            let _ = read(bs, FORWARD_SETPOINT_BITS, "FPC_SETPT_THRESH")?;
+        }
+        let sch_threshold_included = read(bs, FLAG_BITS, "FPC_THRESH_SCH_INCL")? != 0;
+        if sch_threshold_included {
+            let _ = read(bs, FORWARD_SETPOINT_BITS, "FPC_SETPT_THRESH_SCH")?;
+        }
+    }
+    let reverse_parameters_included = read(bs, FLAG_BITS, "RPC_INCL")? != 0;
+    Ok(PowerControlMessage {
+        reverse_step,
+        use_time,
+        action_time,
+        forward_parameters_included,
+        forward_mode,
+        reverse_parameters_included,
+    })
 }
 
 fn decode_fdsch_order(bs: &mut Bitstream) -> Result<FdschMessage, String> {
@@ -13634,9 +14000,19 @@ fn decode_fdsch_service_connect(bs: &mut Bitstream) -> Result<FdschMessage, Stri
         }
     }
 
+    // A CRC-valid P_REV 5 cell omits both zero-valued tail flags after these records.
+    let omitted_zero_tail = use_old_serv_config == 0
+        && bs.is_empty()
+        && matches!(
+            records.as_slice(),
+            [
+                ServiceConnectRecord::ServiceConfig(_),
+                ServiceConnectRecord::NonNegServiceConfig(_)
+            ]
+        );
     let mut call_assignments = Vec::new();
     if use_old_serv_config == 0 {
-        let cc_info_incl = read(bs, 1, "CC_INFO_INCL")? != 0;
+        let cc_info_incl = !omitted_zero_tail && read(bs, 1, "CC_INFO_INCL")? != 0;
         if cc_info_incl {
             let num_calls_assign = read(bs, 8, "NUM_CALLS_ASSIGN")? as usize;
             call_assignments.reserve(num_calls_assign);
@@ -13660,7 +14036,7 @@ fn decode_fdsch_service_connect(bs: &mut Bitstream) -> Result<FdschMessage, Stri
             }
         }
     }
-    let use_type0_plcm = read(bs, 1, "USE_TYPE0_PLCM")? != 0;
+    let use_type0_plcm = !omitted_zero_tail && read(bs, 1, "USE_TYPE0_PLCM")? != 0;
     if sync_id_incl && use_old_serv_config == 0b10 {
         let _sync_id_bs_initiated_ind = read(bs, 1, "SYNC_ID_BS_INITIATED_IND")?;
     }

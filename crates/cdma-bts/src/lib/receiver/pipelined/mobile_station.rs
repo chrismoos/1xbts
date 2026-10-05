@@ -218,7 +218,7 @@ impl MobileStation {
             0 => PagingRate::Rate9600,
             1 => PagingRate::Rate4800,
             _ => {
-                println!(
+                debug!(
                     "mobile_station: reserved PRAT={}, defaulting to 9600",
                     info.prat
                 );
@@ -236,7 +236,7 @@ impl MobileStation {
         }
         let advanced_lc_state = lc_gen.state();
 
-        println!(
+        debug!(
             "mobile_station: starting paging chain at chip {} (paging_start={} lc_gap={})",
             current_chip, info.paging_start_chip, lc_gap_chips
         );

@@ -5,22 +5,23 @@
 
 use crate::lac::message_types::{MessageId, WireChannel};
 use cdma_common::bits::Bitstream;
+use cdma_common::lac::paging_messages::{
+    AlternativeTechnologiesInformationMessage, ChannelAssignmentMessage,
+    ExtendedChannelAssignmentMessage,
+};
+use log::debug;
 
 pub fn msg_type_name(msg_type: u8) -> &'static str {
     MessageId::from_wire(WireChannel::ForwardCommon, msg_type).map_or("Unknown", |m| m.name())
 }
 
-// ---------------------------------------------------------------------------
-// Decoded message types
-// ---------------------------------------------------------------------------
-
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PagingMessageHeader {
     pub pd: u8,
     pub msg_type: u8,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SystemParametersMessage {
     pub header: PagingMessageHeader,
     pub pilot_pn: u16,
@@ -73,10 +74,19 @@ pub struct SystemParametersMessage {
     pub neg_slot_cycle_index_sup: bool,
     pub crrm_msg_ind: bool,
     pub num_opt_msg_bits: u8,
+    pub ap_pilot_info: bool,
+    pub ap_idt: bool,
+    pub ap_id_text: bool,
+    pub gen_ovhd_inf_ind: bool,
+    pub fd_chan_lst_ind: bool,
+    pub atim_ind: bool,
+    pub appim_period_index: u8,
+    pub gen_ovhd_cycle_index: u8,
+    pub atim_cycle_index: u8,
     pub add_loc_info_incl: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct AccessParametersMessage {
     pub header: PagingMessageHeader,
     pub pilot_pn: u16,
@@ -121,19 +131,19 @@ pub struct AccessParametersMessage {
     pub acct_so_grp_records: Vec<AcctServiceOptionGroupRecord>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct AcctServiceOptionRecord {
     pub aoc_bitmap: Option<u8>,
     pub service_option: u16,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct AcctServiceOptionGroupRecord {
     pub aoc_bitmap: Option<u8>,
     pub service_option_group: u8,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct NeighborListMessage {
     pub header: PagingMessageHeader,
     pub pilot_pn: u16,
@@ -142,12 +152,12 @@ pub struct NeighborListMessage {
     pub neighbors: Vec<NeighborEntry>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct NeighborEntry {
     pub nghbr_pn: u16,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct GeneralPageMessage {
     pub header: PagingMessageHeader,
     pub config_msg_seq: u8,
@@ -163,7 +173,7 @@ pub struct GeneralPageMessage {
     pub page_records: Vec<PageRecord>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub enum PageRecord {
     /// PAGE_CLASS = 0: IMSI-based page
     Class0 {
@@ -197,14 +207,14 @@ pub enum PageRecord {
     Broadcast { bc_addr: u16 },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct OrderMessage {
     pub header: PagingMessageHeader,
     pub order: u8,
     pub ordq: u8,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CdmaChannelListMessage {
     pub header: PagingMessageHeader,
     pub pilot_pn: u16,
@@ -212,7 +222,7 @@ pub struct CdmaChannelListMessage {
     pub channels: Vec<u16>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ExtendedSystemParametersMessage {
     pub header: PagingMessageHeader,
     pub pilot_pn: u16,
@@ -273,20 +283,42 @@ pub struct ExtendedSystemParametersMessage {
     pub pilot_info_req_supported: bool,
 }
 
-#[derive(Debug)]
+/// Extended Neighbor List Message (C.S0005-E §3.7.2.3.2.14).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExtendedNeighborListMessage {
+    pub header: PagingMessageHeader,
+    pub pilot_pn: u16,
+    pub config_msg_seq: u8,
+    pub pilot_inc: u8,
+    pub neighbors: Vec<ExtendedNeighborEntry>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExtendedNeighborEntry {
+    /// NGHBR_CONFIG per Table 3.7.2.3.2.14-1.
+    pub nghbr_config: u8,
+    pub nghbr_pn: u16,
+    /// SEARCH_PRIORITY per Table 3.7.2.3.2.14-2.
+    pub search_priority: u8,
+    /// NGHBR_BAND and NGHBR_FREQ, present when FREQ_INCL is set.
+    pub nghbr_band: Option<u8>,
+    pub nghbr_freq: Option<u16>,
+}
+
+#[derive(Debug, Clone)]
 pub enum PagingMessage {
     SystemParameters(SystemParametersMessage),
     AccessParameters(AccessParametersMessage),
     NeighborList(NeighborListMessage),
+    ExtendedNeighborList(ExtendedNeighborListMessage),
     CdmaChannelList(CdmaChannelListMessage),
     ExtendedSystemParameters(ExtendedSystemParametersMessage),
     GeneralPage(GeneralPageMessage),
     Order(OrderMessage),
+    ChannelAssignment(ChannelAssignmentMessage),
+    ExtendedChannelAssignment(ExtendedChannelAssignmentMessage),
+    AlternativeTechnologiesInformation(AlternativeTechnologiesInformationMessage),
 }
-
-// ---------------------------------------------------------------------------
-// Decoder
-// ---------------------------------------------------------------------------
 
 impl PagingMessage {
     /// Decode a paging channel PDU (payload after MSG_LENGTH, before CRC).
@@ -310,10 +342,22 @@ impl PagingMessage {
             MessageId::SystemParameters => decode_system_parameters(header, &mut bs),
             MessageId::AccessParameters => decode_access_parameters(header, &mut bs),
             MessageId::NeighborList => decode_neighbor_list(header, &mut bs),
+            MessageId::ExtNeighborList => decode_extended_neighbor_list(header, &mut bs),
             MessageId::CdmaChannelList => decode_cdma_channel_list(header, &mut bs),
             MessageId::ExtSystemParameters => decode_extended_system_parameters(header, &mut bs),
             MessageId::GeneralPage => decode_general_page(header, &mut bs),
             MessageId::Order => decode_order(header, &mut bs),
+            MessageId::ChannelAssignment => {
+                ChannelAssignmentMessage::from_sdu(&mut bs).map(PagingMessage::ChannelAssignment)
+            }
+            MessageId::ExtChannelAssignment => ExtendedChannelAssignmentMessage::from_sdu(&mut bs)
+                .map(PagingMessage::ExtendedChannelAssignment)
+                .map_err(|e| e.to_string()),
+            MessageId::AlternativeTechnologiesInformation => {
+                AlternativeTechnologiesInformationMessage::from_sdu(&mut bs)
+                    .map(PagingMessage::AlternativeTechnologiesInformation)
+                    .map_err(|e| e.to_string())
+            }
             _ => Err(format!(
                 "unsupported f-csch body decode for {}",
                 message_id.tag()
@@ -326,10 +370,20 @@ impl PagingMessage {
             PagingMessage::SystemParameters(m) => print_system_parameters(m),
             PagingMessage::AccessParameters(m) => print_access_parameters(m),
             PagingMessage::NeighborList(m) => print_neighbor_list(m),
+            PagingMessage::ExtendedNeighborList(m) => print_extended_neighbor_list(m),
             PagingMessage::CdmaChannelList(m) => print_cdma_channel_list(m),
             PagingMessage::ExtendedSystemParameters(m) => print_extended_system_parameters(m),
             PagingMessage::GeneralPage(m) => print_general_page(m),
             PagingMessage::Order(m) => print_order(m),
+            PagingMessage::ChannelAssignment(m) => {
+                debug!("Channel Assignment Message: {m:?}");
+            }
+            PagingMessage::ExtendedChannelAssignment(m) => {
+                debug!("Extended Channel Assignment Message: {m:?}");
+            }
+            PagingMessage::AlternativeTechnologiesInformation(m) => {
+                debug!("Alternative Technologies Information Message: {m:?}");
+            }
         }
     }
 }
@@ -341,6 +395,16 @@ impl PagingMessage {
 fn read(bs: &mut Bitstream, bits: usize, name: &str) -> Result<u64, String> {
     bs.read_bits(bits)
         .map_err(|_| format!("EOF reading {} ({} bits)", name, bits))
+}
+
+/// Reads a field from the tail of an overhead message, where a base station
+/// at a lower P_REV ends the message early. A field the message has no room
+/// for is absent and reads as zero.
+fn read_tail(bs: &mut Bitstream, bits: usize, name: &str) -> Result<u64, String> {
+    if bs.len() < bits {
+        return Ok(0);
+    }
+    read(bs, bits, name)
 }
 
 fn decode_system_parameters(
@@ -392,24 +456,48 @@ fn decode_system_parameters(
     let user_zone_id = read(bs, 1, "USER_ZONE_ID")? == 1;
     let ext_global_redirect = read(bs, 1, "EXT_GLOBAL_REDIRECT")? == 1;
     let ext_chan_lst = read(bs, 1, "EXT_CHAN_LST")? == 1;
-    // Pre-P_REV-6 traces stop at EXT_CHAN_LST; default to absent.
-    let t_tdrop_range_incl = !bs.is_empty() && read(bs, 1, "T_TDROP_RANGE_INCL")? == 1;
+    let t_tdrop_range_incl = read_tail(bs, 1, "T_TDROP_RANGE_INCL")? == 1;
     let t_tdrop_range = if t_tdrop_range_incl {
         read(bs, 4, "T_TDROP_RANGE")? as u8
     } else {
         0
     };
-    let neg_slot_cycle_index_sup = !bs.is_empty() && read(bs, 1, "NEG_SLOT_CYCLE_INDEX_SUP")? == 1;
-    let crrm_msg_ind = !bs.is_empty() && read(bs, 1, "CRRM_MSG_IND")? == 1;
-    let num_opt_msg_bits = if bs.is_empty() {
-        0
-    } else {
-        read(bs, 4, "NUM_OPT_MSG_BITS")? as u8
-    };
-    if num_opt_msg_bits != 0 {
-        return Err("SPM NUM_OPT_MSG_BITS != 0 not implemented".to_string());
+    let neg_slot_cycle_index_sup = read_tail(bs, 1, "NEG_SLOT_CYCLE_INDEX_SUP")? == 1;
+    let crrm_msg_ind = read_tail(bs, 1, "CRRM_MSG_IND")? == 1;
+    let num_opt_msg_bits = read_tail(bs, 4, "NUM_OPT_MSG_BITS")? as u8;
+    let mut opt_msg_bits = [false; 6];
+    for index in 0..num_opt_msg_bits as usize {
+        let enabled = read(bs, 1, "OPTIONAL_OVERHEAD_MESSAGE_BIT")? != 0;
+        if let Some(bit) = opt_msg_bits.get_mut(index) {
+            *bit = enabled;
+        } else if enabled {
+            return Err("SPM optional overhead reserved bits must be zero".to_string());
+        }
     }
-    let add_loc_info_incl = !bs.is_empty() && read(bs, 1, "ADD_LOC_INFO_INCL")? == 1;
+    let [
+        ap_pilot_info,
+        ap_idt,
+        ap_id_text,
+        gen_ovhd_inf_ind,
+        fd_chan_lst_ind,
+        atim_ind,
+    ] = opt_msg_bits;
+    let appim_period_index = if ap_pilot_info {
+        read(bs, 3, "APPIM_PERIOD_INDEX")? as u8
+    } else {
+        0
+    };
+    let gen_ovhd_cycle_index = if gen_ovhd_inf_ind {
+        read(bs, 3, "GEN_OVHD_CYCLE_INDEX")? as u8
+    } else {
+        0
+    };
+    let atim_cycle_index = if atim_ind {
+        read(bs, 3, "ATIM_CYCLE_INDEX")? as u8
+    } else {
+        0
+    };
+    let add_loc_info_incl = read_tail(bs, 1, "ADD_LOC_INFO_INCL")? == 1;
     if add_loc_info_incl {
         return Err("SPM ADD_LOC_INFO_INCL=1 not implemented".to_string());
     }
@@ -465,6 +553,15 @@ fn decode_system_parameters(
         neg_slot_cycle_index_sup,
         crrm_msg_ind,
         num_opt_msg_bits,
+        ap_pilot_info,
+        ap_idt,
+        ap_id_text,
+        gen_ovhd_inf_ind,
+        fd_chan_lst_ind,
+        atim_ind,
+        appim_period_index,
+        gen_ovhd_cycle_index,
+        atim_cycle_index,
         add_loc_info_incl,
     }))
 }
@@ -631,6 +728,50 @@ fn decode_neighbor_list(
     }))
 }
 
+const ENLM_RECORD_BITS: usize = 3 + 9 + 2 + 1;
+
+fn decode_extended_neighbor_list(
+    header: PagingMessageHeader,
+    bs: &mut Bitstream,
+) -> Result<PagingMessage, String> {
+    let pilot_pn = read(bs, 9, "PILOT_PN")? as u16;
+    let config_msg_seq = read(bs, 6, "CONFIG_MSG_SEQ")? as u8;
+    let pilot_inc = read(bs, 4, "PILOT_INC")? as u8;
+
+    let mut neighbors = Vec::new();
+    while bs.len() >= ENLM_RECORD_BITS {
+        let nghbr_config = read(bs, 3, "NGHBR_CONFIG")? as u8;
+        let nghbr_pn = read(bs, 9, "NGHBR_PN")? as u16;
+        let search_priority = read(bs, 2, "SEARCH_PRIORITY")? as u8;
+        let freq_incl = read(bs, 1, "FREQ_INCL")? == 1;
+        let (nghbr_band, nghbr_freq) = if freq_incl {
+            (
+                Some(read(bs, 5, "NGHBR_BAND")? as u8),
+                Some(read(bs, 11, "NGHBR_FREQ")? as u16),
+            )
+        } else {
+            (None, None)
+        };
+        neighbors.push(ExtendedNeighborEntry {
+            nghbr_config,
+            nghbr_pn,
+            search_priority,
+            nghbr_band,
+            nghbr_freq,
+        });
+    }
+
+    Ok(PagingMessage::ExtendedNeighborList(
+        ExtendedNeighborListMessage {
+            header,
+            pilot_pn,
+            config_msg_seq,
+            pilot_inc,
+            neighbors,
+        },
+    ))
+}
+
 fn decode_cdma_channel_list(
     header: PagingMessageHeader,
     bs: &mut Bitstream,
@@ -743,8 +884,8 @@ fn decode_extended_system_parameters(
             access_ho_allowed.push(read(bs, 1, "ACCESS_HO_ALLOWED")? == 1);
         }
     }
-    let broadcast_gps_asst = read(bs, 1, "BROADCAST_GPS_ASST")? == 1;
-    let qpch_supported = read(bs, 1, "QPCH_SUPPORTED")? == 1;
+    let broadcast_gps_asst = read_tail(bs, 1, "BROADCAST_GPS_ASST")? == 1;
+    let qpch_supported = read_tail(bs, 1, "QPCH_SUPPORTED")? == 1;
     let num_qpch = if qpch_supported {
         Some(read(bs, 2, "NUM_QPCH")? as u8)
     } else {
@@ -770,22 +911,22 @@ fn decode_extended_system_parameters(
     } else {
         None
     };
-    let sdb_supported = read(bs, 1, "SDB_SUPPORTED")? == 1;
-    let rlgain_traffic_pilot = read(bs, 6, "RLGAIN_TRAFFIC_PILOT")? as u8;
-    let rev_pwr_cntl_delay_incl = read(bs, 1, "REV_PWR_CNTL_DELAY_INCL")? == 1;
+    let sdb_supported = read_tail(bs, 1, "SDB_SUPPORTED")? == 1;
+    let rlgain_traffic_pilot = read_tail(bs, 6, "RLGAIN_TRAFFIC_PILOT")? as u8;
+    let rev_pwr_cntl_delay_incl = read_tail(bs, 1, "REV_PWR_CNTL_DELAY_INCL")? == 1;
     let rev_pwr_cntl_delay = if rev_pwr_cntl_delay_incl {
         Some(read(bs, 2, "REV_PWR_CNTL_DELAY")? as u8)
     } else {
         None
     };
-    let auto_msg_supported = read(bs, 1, "AUTO_MSG_SUPPORTED")? == 1;
+    let auto_msg_supported = read_tail(bs, 1, "AUTO_MSG_SUPPORTED")? == 1;
     let auto_msg_interval = if auto_msg_supported {
         Some(read(bs, 3, "AUTO_MSG_INTERVAL")? as u8)
     } else {
         None
     };
-    let mob_qos = read(bs, 1, "MOB_QOS")? == 1;
-    let enc_supported = read(bs, 1, "ENC_SUPPORTED")? == 1;
+    let mob_qos = read_tail(bs, 1, "MOB_QOS")? == 1;
+    let enc_supported = read_tail(bs, 1, "ENC_SUPPORTED")? == 1;
     let sig_encrypt_sup = if enc_supported {
         Some(read(bs, 8, "SIG_ENCRYPT_SUP")? as u8)
     } else {
@@ -796,11 +937,11 @@ fn decode_extended_system_parameters(
     } else {
         None
     };
-    let use_sync_id = read(bs, 1, "USE_SYNC_ID")? == 1;
-    let cs_supported = read(bs, 1, "CS_SUPPORTED")? == 1;
-    let bcch_supported = read(bs, 1, "BCCH_SUPPORTED")? == 1;
-    let ms_init_pos_loc_sup_ind = read(bs, 1, "MS_INIT_POS_LOC_SUP_IND")? == 1;
-    let pilot_info_req_supported = read(bs, 1, "PILOT_INFO_REQ_SUPPORTED")? == 1;
+    let use_sync_id = read_tail(bs, 1, "USE_SYNC_ID")? == 1;
+    let cs_supported = read_tail(bs, 1, "CS_SUPPORTED")? == 1;
+    let bcch_supported = read_tail(bs, 1, "BCCH_SUPPORTED")? == 1;
+    let ms_init_pos_loc_sup_ind = read_tail(bs, 1, "MS_INIT_POS_LOC_SUP_IND")? == 1;
+    let pilot_info_req_supported = read_tail(bs, 1, "PILOT_INFO_REQ_SUPPORTED")? == 1;
 
     Ok(PagingMessage::ExtendedSystemParameters(
         ExtendedSystemParametersMessage {
@@ -1078,23 +1219,19 @@ fn decode_order(header: PagingMessageHeader, bs: &mut Bitstream) -> Result<Pagin
     }))
 }
 
-// ---------------------------------------------------------------------------
-// Pretty printers
-// ---------------------------------------------------------------------------
-
 fn print_system_parameters(m: &SystemParametersMessage) {
-    println!("  Message: System Parameters Message (SPM)");
-    println!("  PD: {}", m.header.pd);
-    println!(
+    debug!("  Message: System Parameters Message (SPM)");
+    debug!("  PD: {}", m.header.pd);
+    debug!(
         "  PILOT_PN: {} (offset = {} chips)",
         m.pilot_pn,
         m.pilot_pn as u32 * 64
     );
-    println!("  CONFIG_MSG_SEQ: {}", m.config_msg_seq);
-    println!("  SID: {}", m.sid);
-    println!("  NID: {}", m.nid);
-    println!("  REG_ZONE: {}", m.reg_zone);
-    println!("  TOTAL_ZONES: {}", m.total_zones);
+    debug!("  CONFIG_MSG_SEQ: {}", m.config_msg_seq);
+    debug!("  SID: {}", m.sid);
+    debug!("  NID: {}", m.nid);
+    debug!("  REG_ZONE: {}", m.reg_zone);
+    debug!("  TOTAL_ZONES: {}", m.total_zones);
     let zone_timer_min = match m.zone_timer {
         0 => 1,
         1 => 2,
@@ -1106,129 +1243,129 @@ fn print_system_parameters(m: &SystemParametersMessage) {
         7 => 60,
         _ => 0,
     };
-    println!("  ZONE_TIMER: {} ({} min)", m.zone_timer, zone_timer_min);
-    println!("  MULT_SIDS: {}", m.mult_sids);
-    println!("  MULT_NIDS: {}", m.mult_nids);
-    println!("  BASE_ID: {}", m.base_id);
-    println!("  BASE_CLASS: {}", m.base_class);
-    println!("  PAGE_CHAN: {}", m.page_chan);
-    println!("  MAX_SLOT_CYCLE_INDEX: {}", m.max_slot_cycle_index);
-    println!("  --- Registration ---");
-    println!("  HOME_REG: {}", m.home_reg);
-    println!("  FOR_SID_REG: {}", m.for_sid_reg);
-    println!("  FOR_NID_REG: {}", m.for_nid_reg);
-    println!("  POWER_UP_REG: {}", m.power_up_reg);
-    println!("  POWER_DOWN_REG: {}", m.power_down_reg);
-    println!("  PARAMETER_REG: {}", m.parameter_reg);
-    println!("  REG_PRD: {}", m.reg_prd);
-    println!("  --- Location ---");
-    println!(
+    debug!("  ZONE_TIMER: {} ({} min)", m.zone_timer, zone_timer_min);
+    debug!("  MULT_SIDS: {}", m.mult_sids);
+    debug!("  MULT_NIDS: {}", m.mult_nids);
+    debug!("  BASE_ID: {}", m.base_id);
+    debug!("  BASE_CLASS: {}", m.base_class);
+    debug!("  PAGE_CHAN: {}", m.page_chan);
+    debug!("  MAX_SLOT_CYCLE_INDEX: {}", m.max_slot_cycle_index);
+    debug!("  --- Registration ---");
+    debug!("  HOME_REG: {}", m.home_reg);
+    debug!("  FOR_SID_REG: {}", m.for_sid_reg);
+    debug!("  FOR_NID_REG: {}", m.for_nid_reg);
+    debug!("  POWER_UP_REG: {}", m.power_up_reg);
+    debug!("  POWER_DOWN_REG: {}", m.power_down_reg);
+    debug!("  PARAMETER_REG: {}", m.parameter_reg);
+    debug!("  REG_PRD: {}", m.reg_prd);
+    debug!("  --- Location ---");
+    debug!(
         "  BASE_LAT: {} ({:.6} deg)",
         m.base_lat,
         base_lat_to_degrees(m.base_lat)
     );
-    println!(
+    debug!(
         "  BASE_LONG: {} ({:.6} deg)",
         m.base_long,
         base_long_to_degrees(m.base_long)
     );
-    println!("  REG_DIST: {}", m.reg_dist);
-    println!("  --- Search Windows ---");
-    println!(
+    debug!("  REG_DIST: {}", m.reg_dist);
+    debug!("  --- Search Windows ---");
+    debug!(
         "  SRCH_WIN_A: {} ({} chips)",
         m.srch_win_a,
         srch_win_chips(m.srch_win_a)
     );
-    println!(
+    debug!(
         "  SRCH_WIN_N: {} ({} chips)",
         m.srch_win_n,
         srch_win_chips(m.srch_win_n)
     );
-    println!(
+    debug!(
         "  SRCH_WIN_R: {} ({} chips)",
         m.srch_win_r,
         srch_win_chips(m.srch_win_r)
     );
-    println!("  NGHBR_MAX_AGE: {}", m.nghbr_max_age);
-    println!("  --- Power ---");
-    println!("  PWR_REP_THRESH: {}", m.pwr_rep_thresh);
-    println!("  PWR_REP_FRAMES: {}", m.pwr_rep_frames);
-    println!("  PWR_THRESH_ENABLE: {}", m.pwr_thresh_enable);
-    println!("  PWR_PERIOD_ENABLE: {}", m.pwr_period_enable);
-    println!("  PWR_REP_DELAY: {}", m.pwr_rep_delay);
-    println!("  RESCAN: {}", m.rescan);
-    println!("  --- Pilot Thresholds ---");
-    println!("  T_ADD: {} ({:.1} dB)", m.t_add, m.t_add as f64 * 0.5);
-    println!("  T_DROP: {} ({:.1} dB)", m.t_drop, m.t_drop as f64 * 0.5);
-    println!("  T_COMP: {} ({:.1} dB)", m.t_comp, m.t_comp as f64 * 0.5);
-    println!("  T_TDROP: {}", m.t_tdrop);
-    println!("  --- Overhead Msg Flags ---");
-    println!("  EXT_SYS_PARAMETER: {}", m.ext_sys_parameter);
-    println!("  EXT_NGHBR_LST: {}", m.ext_nghbr_lst);
-    println!("  GEN_NGHBR_LST: {}", m.gen_nghbr_lst);
-    println!("  GLOBAL_REDIRECT: {}", m.global_redirect);
-    println!("  PRI_NGHBR_LST: {}", m.pri_nghbr_lst);
-    println!("  USER_ZONE_ID: {}", m.user_zone_id);
-    println!("  EXT_GLOBAL_REDIRECT: {}", m.ext_global_redirect);
-    println!("  EXT_CHAN_LST: {}", m.ext_chan_lst);
+    debug!("  NGHBR_MAX_AGE: {}", m.nghbr_max_age);
+    debug!("  --- Power ---");
+    debug!("  PWR_REP_THRESH: {}", m.pwr_rep_thresh);
+    debug!("  PWR_REP_FRAMES: {}", m.pwr_rep_frames);
+    debug!("  PWR_THRESH_ENABLE: {}", m.pwr_thresh_enable);
+    debug!("  PWR_PERIOD_ENABLE: {}", m.pwr_period_enable);
+    debug!("  PWR_REP_DELAY: {}", m.pwr_rep_delay);
+    debug!("  RESCAN: {}", m.rescan);
+    debug!("  --- Pilot Thresholds ---");
+    debug!("  T_ADD: {} ({:.1} dB)", m.t_add, m.t_add as f64 * 0.5);
+    debug!("  T_DROP: {} ({:.1} dB)", m.t_drop, m.t_drop as f64 * 0.5);
+    debug!("  T_COMP: {} ({:.1} dB)", m.t_comp, m.t_comp as f64 * 0.5);
+    debug!("  T_TDROP: {}", m.t_tdrop);
+    debug!("  --- Overhead Msg Flags ---");
+    debug!("  EXT_SYS_PARAMETER: {}", m.ext_sys_parameter);
+    debug!("  EXT_NGHBR_LST: {}", m.ext_nghbr_lst);
+    debug!("  GEN_NGHBR_LST: {}", m.gen_nghbr_lst);
+    debug!("  GLOBAL_REDIRECT: {}", m.global_redirect);
+    debug!("  PRI_NGHBR_LST: {}", m.pri_nghbr_lst);
+    debug!("  USER_ZONE_ID: {}", m.user_zone_id);
+    debug!("  EXT_GLOBAL_REDIRECT: {}", m.ext_global_redirect);
+    debug!("  EXT_CHAN_LST: {}", m.ext_chan_lst);
 }
 
 fn print_access_parameters(m: &AccessParametersMessage) {
-    println!("  Message: Access Parameters Message (APM)");
-    println!("  PD: {}", m.header.pd);
-    println!(
+    debug!("  Message: Access Parameters Message (APM)");
+    debug!("  PD: {}", m.header.pd);
+    debug!(
         "  PILOT_PN: {} (offset = {} chips)",
         m.pilot_pn,
         m.pilot_pn as u32 * 64
     );
-    println!("  ACC_MSG_SEQ: {}", m.acc_msg_seq);
-    println!("  ACC_CHAN: {}", m.acc_chan);
-    println!("  NOM_PWR: {} dB", m.nom_pwr);
-    println!("  INIT_PWR: {} dB", m.init_pwr);
-    println!("  PWR_STEP: {} dB", m.pwr_step);
-    println!("  NUM_STEP: {}", m.num_step);
-    println!("  MAX_CAP_SZ: {} frames", max_cap_sz_frames(m.max_cap_sz));
-    println!("  PAM_SZ: {} frames", pam_sz_frames(m.pam_sz));
-    println!("  PSIST(0-9): {}", m.psist_0_9);
-    println!("  PSIST(10): {}", m.psist_10);
-    println!("  PSIST(11): {}", m.psist_11);
-    println!("  PSIST(12): {}", m.psist_12);
-    println!("  PSIST(13): {}", m.psist_13);
-    println!("  PSIST(14): {}", m.psist_14);
-    println!("  PSIST(15): {}", m.psist_15);
-    println!("  MSG_PSIST: {}", m.msg_psist);
-    println!("  REG_PSIST: {}", m.reg_psist);
-    println!("  PROBE_PN_RAN: {}", m.probe_pn_ran);
-    println!("  ACC_TMO: {}", m.acc_tmo);
-    println!("  PROBE_BKOFF: {}", m.probe_bkoff);
-    println!("  BKOFF: {}", m.bkoff);
-    println!("  MAX_REQ_SEQ: {}", m.max_req_seq);
-    println!("  MAX_RSP_SEQ: {}", m.max_rsp_seq);
-    println!("  AUTH: {}", m.auth);
+    debug!("  ACC_MSG_SEQ: {}", m.acc_msg_seq);
+    debug!("  ACC_CHAN: {}", m.acc_chan);
+    debug!("  NOM_PWR: {} dB", m.nom_pwr);
+    debug!("  INIT_PWR: {} dB", m.init_pwr);
+    debug!("  PWR_STEP: {} dB", m.pwr_step);
+    debug!("  NUM_STEP: {}", m.num_step);
+    debug!("  MAX_CAP_SZ: {} frames", max_cap_sz_frames(m.max_cap_sz));
+    debug!("  PAM_SZ: {} frames", pam_sz_frames(m.pam_sz));
+    debug!("  PSIST(0-9): {}", m.psist_0_9);
+    debug!("  PSIST(10): {}", m.psist_10);
+    debug!("  PSIST(11): {}", m.psist_11);
+    debug!("  PSIST(12): {}", m.psist_12);
+    debug!("  PSIST(13): {}", m.psist_13);
+    debug!("  PSIST(14): {}", m.psist_14);
+    debug!("  PSIST(15): {}", m.psist_15);
+    debug!("  MSG_PSIST: {}", m.msg_psist);
+    debug!("  REG_PSIST: {}", m.reg_psist);
+    debug!("  PROBE_PN_RAN: {}", m.probe_pn_ran);
+    debug!("  ACC_TMO: {}", m.acc_tmo);
+    debug!("  PROBE_BKOFF: {}", m.probe_bkoff);
+    debug!("  BKOFF: {}", m.bkoff);
+    debug!("  MAX_REQ_SEQ: {}", m.max_req_seq);
+    debug!("  MAX_RSP_SEQ: {}", m.max_rsp_seq);
+    debug!("  AUTH: {}", m.auth);
     if m.auth != 0 {
-        println!("  RAND: 0x{:08X}", m.rand);
+        debug!("  RAND: 0x{:08X}", m.rand);
     }
-    println!("  NOM_PWR_EXT: {}", m.nom_pwr_ext);
-    println!("  PSIST_EMG_INCL: {}", m.psist_emg_incl);
+    debug!("  NOM_PWR_EXT: {}", m.nom_pwr_ext);
+    debug!("  PSIST_EMG_INCL: {}", m.psist_emg_incl);
     if let Some(psist_emg) = m.psist_emg {
-        println!("  PSIST_EMG: {}", psist_emg);
+        debug!("  PSIST_EMG: {}", psist_emg);
     }
-    println!("  ACCT_INCL: {}", m.acct_incl);
+    debug!("  ACCT_INCL: {}", m.acct_incl);
 }
 
 fn print_neighbor_list(m: &NeighborListMessage) {
-    println!("  Message: Neighbor List Message (NLM)");
-    println!("  PD: {}", m.header.pd);
-    println!(
+    debug!("  Message: Neighbor List Message (NLM)");
+    debug!("  PD: {}", m.header.pd);
+    debug!(
         "  PILOT_PN: {} (offset = {} chips)",
         m.pilot_pn,
         m.pilot_pn as u32 * 64
     );
-    println!("  CONFIG_MSG_SEQ: {}", m.config_msg_seq);
-    println!("  PILOT_INC: {}", m.pilot_inc);
-    println!("  Neighbors ({}):", m.neighbors.len());
+    debug!("  CONFIG_MSG_SEQ: {}", m.config_msg_seq);
+    debug!("  PILOT_INC: {}", m.pilot_inc);
+    debug!("  Neighbors ({}):", m.neighbors.len());
     for (i, n) in m.neighbors.iter().enumerate() {
-        println!(
+        debug!(
             "    [{}] NGHBR_PN: {} (offset = {} chips)",
             i,
             n.nghbr_pn,
@@ -1237,18 +1374,37 @@ fn print_neighbor_list(m: &NeighborListMessage) {
     }
 }
 
+fn print_extended_neighbor_list(m: &ExtendedNeighborListMessage) {
+    debug!("  Message: Extended Neighbor List Message (ENLM)");
+    debug!("  PD: {}", m.header.pd);
+    debug!(
+        "  PILOT_PN: {} (offset = {} chips)",
+        m.pilot_pn,
+        m.pilot_pn * 64
+    );
+    debug!("  CONFIG_MSG_SEQ: {}", m.config_msg_seq);
+    debug!("  PILOT_INC: {}", m.pilot_inc);
+    debug!("  Neighbors ({}):", m.neighbors.len());
+    for (i, n) in m.neighbors.iter().enumerate() {
+        debug!(
+            "    [{}] NGHBR_PN: {} config={} priority={} band={:?} freq={:?}",
+            i, n.nghbr_pn, n.nghbr_config, n.search_priority, n.nghbr_band, n.nghbr_freq
+        );
+    }
+}
+
 fn print_cdma_channel_list(m: &CdmaChannelListMessage) {
-    println!("  Message: CDMA Channel List Message (CCLM)");
-    println!("  PD: {}", m.header.pd);
-    println!(
+    debug!("  Message: CDMA Channel List Message (CCLM)");
+    debug!("  PD: {}", m.header.pd);
+    debug!(
         "  PILOT_PN: {} (offset = {} chips)",
         m.pilot_pn,
         m.pilot_pn as u32 * 64
     );
-    println!("  CONFIG_MSG_SEQ: {}", m.config_msg_seq);
-    println!("  Channels ({}):", m.channels.len());
+    debug!("  CONFIG_MSG_SEQ: {}", m.config_msg_seq);
+    debug!("  Channels ({}):", m.channels.len());
     for (i, ch) in m.channels.iter().enumerate() {
-        println!(
+        debug!(
             "    [{}] CDMA_FREQ: {} ({:.2} MHz)",
             i,
             ch,
@@ -1258,17 +1414,17 @@ fn print_cdma_channel_list(m: &CdmaChannelListMessage) {
 }
 
 fn print_general_page(m: &GeneralPageMessage) {
-    println!("  Message: General Page Message (GPM)");
-    println!("  PD: {}", m.header.pd);
-    println!("  --- Common Fields ---");
-    println!("  CONFIG_MSG_SEQ: {}", m.config_msg_seq);
-    println!("  ACC_MSG_SEQ: {}", m.acc_msg_seq);
-    println!("  CLASS_0_DONE: {}", m.class_0_done);
-    println!("  CLASS_1_DONE: {}", m.class_1_done);
-    println!("  TMSI_DONE: {}", m.tmsi_done);
-    println!("  ORDERED_TMSIS: {}", m.ordered_tmsis);
-    println!("  BROADCAST_DONE: {}", m.broadcast_done);
-    println!("  ADD_LENGTH: {}", m.add_length);
+    debug!("  Message: General Page Message (GPM)");
+    debug!("  PD: {}", m.header.pd);
+    debug!("  --- Common Fields ---");
+    debug!("  CONFIG_MSG_SEQ: {}", m.config_msg_seq);
+    debug!("  ACC_MSG_SEQ: {}", m.acc_msg_seq);
+    debug!("  CLASS_0_DONE: {}", m.class_0_done);
+    debug!("  CLASS_1_DONE: {}", m.class_1_done);
+    debug!("  TMSI_DONE: {}", m.tmsi_done);
+    debug!("  ORDERED_TMSIS: {}", m.ordered_tmsis);
+    debug!("  BROADCAST_DONE: {}", m.broadcast_done);
+    debug!("  ADD_LENGTH: {}", m.add_length);
     if !m.add_pfield.is_empty() {
         let hex: String = m
             .add_pfield
@@ -1276,11 +1432,11 @@ fn print_general_page(m: &GeneralPageMessage) {
             .map(|b| format!("{:02x}", b))
             .collect::<Vec<_>>()
             .join(" ");
-        println!("  ADD_PFIELD: {}", hex);
+        debug!("  ADD_PFIELD: {}", hex);
     }
-    println!("  --- Page Records ({}) ---", m.page_records.len());
+    debug!("  --- Page Records ({}) ---", m.page_records.len());
     if m.page_records.is_empty() {
-        println!("  (none — overhead-only GPM)");
+        debug!("  (none — overhead-only GPM)");
     }
     for (i, rec) in m.page_records.iter().enumerate() {
         match rec {
@@ -1296,27 +1452,27 @@ fn print_general_page(m: &GeneralPageMessage) {
                 special_service,
                 service_option,
             } => {
-                println!(
+                debug!(
                     "    [{}] Class 0 (IMSI) subclass={} msg_seq={}",
                     i, page_subclass, msg_seq
                 );
                 if let Some(v) = imsi_s {
-                    println!("        IMSI_S: 0x{:09x} ({})", v, imsi_s_to_min(*v));
+                    debug!("        IMSI_S: 0x{:09x} ({})", v, imsi_s_to_min(*v));
                 }
                 if let Some(v) = imsi_11_12 {
-                    println!("        IMSI_11_12: {}", v);
+                    debug!("        IMSI_11_12: {}", v);
                 }
                 if let Some(v) = mcc {
-                    println!("        MCC: {}", v);
+                    debug!("        MCC: {}", v);
                 }
                 if let Some(v) = imsi_addr_num {
-                    println!("        IMSI_ADDR_NUM: {}", v);
+                    debug!("        IMSI_ADDR_NUM: {}", v);
                 }
                 if let Some(v) = imsi_m_s1 {
-                    println!("        IMSI_M_S1: 0x{:06x}", v);
+                    debug!("        IMSI_M_S1: 0x{:06x}", v);
                 }
                 if let Some(v) = imsi_m_s2 {
-                    println!("        IMSI_M_S2: 0x{:03x}", v);
+                    debug!("        IMSI_M_S2: 0x{:03x}", v);
                 }
                 print_special_service(*special_service, *service_option);
             }
@@ -1326,8 +1482,8 @@ fn print_general_page(m: &GeneralPageMessage) {
                 special_service,
                 service_option,
             } => {
-                println!("    [{}] Class 1 (ESN) msg_seq={}", i, msg_seq);
-                println!("        ESN: 0x{:08x}", esn);
+                debug!("    [{}] Class 1 (ESN) msg_seq={}", i, msg_seq);
+                debug!("        ESN: 0x{:08x}", esn);
                 print_special_service(*special_service, *service_option);
             }
             PageRecord::Tmsi {
@@ -1336,69 +1492,71 @@ fn print_general_page(m: &GeneralPageMessage) {
                 special_service,
                 service_option,
             } => {
-                println!("    [{}] Class 2 (TMSI) msg_seq={}", i, msg_seq);
-                println!("        TMSI_CODE_ADDR: 0x{:08x}", tmsi_code_addr);
+                debug!("    [{}] Class 2 (TMSI) msg_seq={}", i, msg_seq);
+                debug!("        TMSI_CODE_ADDR: 0x{:08x}", tmsi_code_addr);
                 print_special_service(*special_service, *service_option);
             }
             PageRecord::Broadcast { bc_addr } => {
-                println!("    [{}] Class 3 (Broadcast)", i);
-                println!("        BC_ADDR: 0x{:04x}", bc_addr);
+                debug!("    [{}] Class 3 (Broadcast)", i);
+                debug!("        BC_ADDR: 0x{:04x}", bc_addr);
             }
         }
     }
 }
 
 fn print_extended_system_parameters(m: &ExtendedSystemParametersMessage) {
-    println!("  Message: Extended System Parameters Message (ESPM)");
-    println!("  PD: {}", m.header.pd);
-    println!(
+    debug!("  Message: Extended System Parameters Message (ESPM)");
+    debug!("  PD: {}", m.header.pd);
+    debug!(
         "  PILOT_PN: {} (offset = {} chips)",
         m.pilot_pn,
         m.pilot_pn as u32 * 64
     );
-    println!("  CONFIG_MSG_SEQ: {}", m.config_msg_seq);
-    println!("  DELETE_FOR_TMSI: {}", m.delete_for_tmsi as u8);
-    println!("  USE_TMSI: {}", m.use_tmsi as u8);
-    println!("  PREF_MSID_TYPE: {}", m.pref_msid_type);
-    println!("  MCC: {}", m.mcc);
-    println!("  IMSI_11_12: {}", m.imsi_11_12);
-    println!("  TMSI_ZONE_LEN: {}", m.tmsi_zone_len);
-    println!("  TMSI_ZONE: {:02x?}", m.tmsi_zone);
-    println!("  BCAST_INDEX: {}", m.bcast_index);
-    println!("  IMSI_T_SUPPORTED: {}", m.imsi_t_supported as u8);
-    println!("  P_REV: {}", m.p_rev);
-    println!("  MIN_P_REV: {}", m.min_p_rev);
-    println!("  SOFT_SLOPE: {}", m.soft_slope);
-    println!("  ADD_INTERCEPT: {}", m.add_intercept);
-    println!("  DROP_INTERCEPT: {}", m.drop_intercept);
-    println!("  PACKET_ZONE_ID: {}", m.packet_zone_id);
-    println!("  MAX_NUM_ALT_SO: {}", m.max_num_alt_so);
-    println!("  RESELECT_INCLUDED: {}", m.reselect_included);
-    println!("  PILOT_REPORT: {}", m.pilot_report);
-    println!("  NGHBR_SET_ENTRY_INFO: {}", m.nghbr_set_entry_info);
-    println!("  NGHBR_SET_ACCESS_INFO: {}", m.nghbr_set_access_info);
-    println!("  BROADCAST_GPS_ASST: {}", m.broadcast_gps_asst);
-    println!("  QPCH_SUPPORTED: {}", m.qpch_supported);
-    println!("  SDB_SUPPORTED: {}", m.sdb_supported);
-    println!("  RLGAIN_TRAFFIC_PILOT: {}", m.rlgain_traffic_pilot);
-    println!("  REV_PWR_CNTL_DELAY_INCL: {}", m.rev_pwr_cntl_delay_incl);
-    println!("  AUTO_MSG_SUPPORTED: {}", m.auto_msg_supported);
-    println!("  MOB_QOS: {}", m.mob_qos);
-    println!("  ENC_SUPPORTED: {}", m.enc_supported);
-    println!("  USE_SYNC_ID: {}", m.use_sync_id);
-    println!("  CS_SUPPORTED: {}", m.cs_supported);
-    println!("  BCCH_SUPPORTED: {}", m.bcch_supported);
-    println!("  MS_INIT_POS_LOC_SUP_IND: {}", m.ms_init_pos_loc_sup_ind);
-    println!("  PILOT_INFO_REQ_SUPPORTED: {}", m.pilot_info_req_supported);
+    debug!("  CONFIG_MSG_SEQ: {}", m.config_msg_seq);
+    debug!("  DELETE_FOR_TMSI: {}", m.delete_for_tmsi as u8);
+    debug!("  USE_TMSI: {}", m.use_tmsi as u8);
+    debug!("  PREF_MSID_TYPE: {}", m.pref_msid_type);
+    debug!("  MCC: {}", m.mcc);
+    debug!("  IMSI_11_12: {}", m.imsi_11_12);
+    debug!("  TMSI_ZONE_LEN: {}", m.tmsi_zone_len);
+    debug!("  TMSI_ZONE: {:02x?}", m.tmsi_zone);
+    debug!("  BCAST_INDEX: {}", m.bcast_index);
+    debug!("  IMSI_T_SUPPORTED: {}", m.imsi_t_supported as u8);
+    debug!("  P_REV: {}", m.p_rev);
+    debug!("  MIN_P_REV: {}", m.min_p_rev);
+    debug!("  SOFT_SLOPE: {}", m.soft_slope);
+    debug!("  ADD_INTERCEPT: {}", m.add_intercept);
+    debug!("  DROP_INTERCEPT: {}", m.drop_intercept);
+    debug!("  PACKET_ZONE_ID: {}", m.packet_zone_id);
+    debug!("  MAX_NUM_ALT_SO: {}", m.max_num_alt_so);
+    debug!("  RESELECT_INCLUDED: {}", m.reselect_included);
+    debug!("  PILOT_REPORT: {}", m.pilot_report);
+    debug!("  NGHBR_SET_ENTRY_INFO: {}", m.nghbr_set_entry_info);
+    debug!("  NGHBR_SET_ACCESS_INFO: {}", m.nghbr_set_access_info);
+    debug!("  BROADCAST_GPS_ASST: {}", m.broadcast_gps_asst);
+    debug!("  QPCH_SUPPORTED: {}", m.qpch_supported);
+    debug!("  SDB_SUPPORTED: {}", m.sdb_supported);
+    debug!("  RLGAIN_TRAFFIC_PILOT: {}", m.rlgain_traffic_pilot);
+    debug!("  REV_PWR_CNTL_DELAY_INCL: {}", m.rev_pwr_cntl_delay_incl);
+    debug!("  AUTO_MSG_SUPPORTED: {}", m.auto_msg_supported);
+    debug!("  MOB_QOS: {}", m.mob_qos);
+    debug!("  ENC_SUPPORTED: {}", m.enc_supported);
+    debug!("  USE_SYNC_ID: {}", m.use_sync_id);
+    debug!("  CS_SUPPORTED: {}", m.cs_supported);
+    debug!("  BCCH_SUPPORTED: {}", m.bcch_supported);
+    debug!("  MS_INIT_POS_LOC_SUP_IND: {}", m.ms_init_pos_loc_sup_ind);
+    debug!("  PILOT_INFO_REQ_SUPPORTED: {}", m.pilot_info_req_supported);
 }
 
 fn print_special_service(special_service: bool, service_option: Option<u16>) {
     if special_service {
-        print!("        SPECIAL_SERVICE: true");
-        if let Some(so) = service_option {
-            println!(" SERVICE_OPTION: {} ({})", so, service_option_name(so));
-        } else {
-            println!();
+        match service_option {
+            Some(so) => debug!(
+                "        SPECIAL_SERVICE: true SERVICE_OPTION: {} ({})",
+                so,
+                service_option_name(so)
+            ),
+            None => debug!("        SPECIAL_SERVICE: true"),
         }
     }
 }
@@ -1434,15 +1592,11 @@ fn imsi_s_to_min(imsi_s: u64) -> String {
 }
 
 fn print_order(m: &OrderMessage) {
-    println!("  Message: Order Message");
-    println!("  PD: {}", m.header.pd);
-    println!("  ORDER: {} ({})", m.order, order_name(m.order));
-    println!("  ORDQ: {}", m.ordq);
+    debug!("  Message: Order Message");
+    debug!("  PD: {}", m.header.pd);
+    debug!("  ORDER: {} ({})", m.order, order_name(m.order));
+    debug!("  ORDQ: {}", m.ordq);
 }
-
-// ---------------------------------------------------------------------------
-// Conversion helpers
-// ---------------------------------------------------------------------------
 
 /// BASE_LAT is in units of 0.25 arc-seconds.
 fn base_lat_to_degrees(raw: u32) -> f64 {
@@ -1559,5 +1713,78 @@ mod tests {
         let err = PagingMessage::decode(&bits).unwrap_err();
 
         assert!(err.contains("unsupported f-csch body decode for FNM"));
+    }
+
+    #[test]
+    fn test_system_parameters_optional_atim_indication() {
+        const SPM_BASE_FIELD_BITS: usize = 222;
+        let mut bits = Bitstream::new();
+        bits.write_u8(0x01, 8);
+        bits.write_u64(0, SPM_BASE_FIELD_BITS);
+        bits.write_u8(0, 3);
+        bits.write_u8(6, 4);
+        bits.write_u8(0b100101, 6);
+        bits.write_u8(2, 3);
+        bits.write_u8(1, 3);
+        bits.write_u8(3, 3);
+        bits.write_u8(0, 1);
+
+        let PagingMessage::SystemParameters(message) = PagingMessage::decode(&bits).unwrap() else {
+            panic!("expected System Parameters Message");
+        };
+        assert_eq!(message.num_opt_msg_bits, 6);
+        assert!(message.atim_ind);
+        assert_eq!(message.atim_cycle_index, 3);
+        assert!(message.ap_pilot_info);
+        assert_eq!(message.appim_period_index, 2);
+        assert!(message.gen_ovhd_inf_ind);
+        assert_eq!(message.gen_ovhd_cycle_index, 1);
+    }
+
+    #[test]
+    fn test_alternative_technologies_information_decodes() {
+        use cdma_common::lac::paging_messages::{
+            AlternativeHrpdRadioInterface, AlternativeTechnologiesInformationMessage,
+            AlternativeTechnologyRadioInterfaceRecord,
+        };
+
+        let encoded = AlternativeTechnologiesInformationMessage {
+            pilot_pn: 21,
+            config_msg_seq: 17,
+            radio_interfaces: vec![AlternativeTechnologyRadioInterfaceRecord::hrpd(
+                &AlternativeHrpdRadioInterface {
+                    subnet_color_code: Some(0x22),
+                    neighbors: Vec::new(),
+                },
+            )],
+        }
+        .to_sdu();
+        let mut bits = Bitstream::new();
+        bits.write_u8(0x2f, 8);
+        bits.extend(&encoded);
+        bits.write_u8(0, 7);
+
+        let PagingMessage::AlternativeTechnologiesInformation(message) =
+            PagingMessage::decode(&bits).unwrap()
+        else {
+            panic!("expected Alternative Technologies Information Message");
+        };
+        assert_eq!(message.pilot_pn, 21);
+        assert_eq!(message.config_msg_seq, 17);
+        assert_eq!(message.radio_interfaces.len(), 1);
+        assert_eq!(
+            message.radio_interfaces[0]
+                .hrpd_fields()
+                .unwrap()
+                .unwrap()
+                .subnet_color_code,
+            Some(0x22)
+        );
+
+        let mut invalid = Bitstream::new();
+        invalid.write_u8(0x2f, 8);
+        invalid.extend(&encoded);
+        invalid.write_u8(1, 7);
+        assert!(PagingMessage::decode(&invalid).is_err());
     }
 }

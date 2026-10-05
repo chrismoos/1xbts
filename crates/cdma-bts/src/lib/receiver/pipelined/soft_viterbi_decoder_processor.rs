@@ -20,11 +20,9 @@ pub struct SoftViterbiDecoderProcessor {
     buffer_sample_rate_hz: f64,
     swap_pair: bool,
     invert_pair: bool,
-    sticky_locked_offset: Option<i64>,
-    sticky_locked_shift: Option<i64>,
-    sticky_locked_invert: Option<i64>,
-    lock_signature: Option<(i64, i64, i64)>,
-    skip_output_bits: usize,
+    /// Timestamp the emitted bits, not the current input block. Viterbi traceback delays output.
+    anchored: bool,
+    reset_on_tag: Option<&'static str>,
 }
 
 impl SoftViterbiDecoderProcessor {
@@ -37,49 +35,44 @@ impl SoftViterbiDecoderProcessor {
             buffer_sample_rate_hz: 0.0,
             swap_pair,
             invert_pair,
-            sticky_locked_offset: None,
-            sticky_locked_shift: None,
-            sticky_locked_invert: None,
-            lock_signature: None,
-            skip_output_bits: 0,
+            anchored: false,
+            reset_on_tag: None,
+        }
+    }
+
+    pub fn with_reset_on_tag(mut self, tag: &'static str) -> Self {
+        self.reset_on_tag = Some(tag);
+        self
+    }
+
+    fn maybe_reset_on_tag(&mut self, tags: &std::collections::HashMap<&'static str, i64>) {
+        let should_reset = self
+            .reset_on_tag
+            .and_then(|tag| tags.get(tag))
+            .copied()
+            .unwrap_or(0)
+            == 1;
+        if should_reset {
+            self.decoder = SoftViterbiDecoder::new(get_1_2_k9_encoder());
+            self.buffer.clear();
+            self.anchored = false;
         }
     }
 }
 
 impl PipelineProcessor for SoftViterbiDecoderProcessor {
     fn process_block(&mut self, block: SampleBlock) -> Vec<SampleBlock> {
-        if let Some(v) = block.tags.get("deinterleaver_locked_offset") {
-            self.sticky_locked_offset = Some(*v);
-        }
-        if let Some(v) = block.tags.get("deinterleaver_locked_shift") {
-            self.sticky_locked_shift = Some(*v);
-        }
-        if let Some(v) = block.tags.get("deinterleaver_locked_invert") {
-            self.sticky_locked_invert = Some(*v);
-        }
-        if let (Some(off), Some(shift), Some(inv)) = (
-            self.sticky_locked_offset,
-            self.sticky_locked_shift,
-            self.sticky_locked_invert,
-        ) {
-            let sig = (off, shift, inv);
-            if self.lock_signature != Some(sig) {
-                // Lock transition: clear traceback history and drop startup bits.
-                self.decoder = SoftViterbiDecoder::new(get_1_2_k9_encoder());
-                self.buffer.clear();
-                self.buffer_chip_start = block.chip_start;
-                self.lock_signature = Some(sig);
-                self.skip_output_bits = 0;
-            }
-        }
+        self.maybe_reset_on_tag(&block.tags);
         if self.buffer.is_empty() {
             self.buffer_tags = block.tags.clone();
-            self.buffer_chip_start = block.chip_start;
             self.buffer_sample_rate_hz = block.sample_rate_hz;
+        }
+        if !self.anchored {
+            self.buffer_chip_start = block.chip_start;
+            self.anchored = true;
         }
         self.buffer.extend(block.samples.iter().map(|s| s.re));
 
-        // Compute peak for normalization over current buffer contents.
         let peak = self.buffer.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
         let inv_peak = if peak > 1e-12 { 1.0 / peak } else { 1.0 };
 
@@ -89,9 +82,7 @@ impl PipelineProcessor for SoftViterbiDecoderProcessor {
             let r1 = self.buffer.pop_front().unwrap();
 
             let mut pair = [raw_to_soft(r0, inv_peak), raw_to_soft(r1, inv_peak)];
-            let effective_invert_pair =
-                self.invert_pair ^ (self.sticky_locked_invert.unwrap_or(0) == 1);
-            if effective_invert_pair {
+            if self.invert_pair {
                 pair[0] = 1.0 - pair[0];
                 pair[1] = 1.0 - pair[1];
             }
@@ -100,11 +91,7 @@ impl PipelineProcessor for SoftViterbiDecoderProcessor {
             }
 
             if let Some(bit) = self.decoder.process(&pair) {
-                if self.skip_output_bits > 0 {
-                    self.skip_output_bits -= 1;
-                } else {
-                    out_samples.push(Complex32::new(bit as f32, 0.0));
-                }
+                out_samples.push(Complex32::new(bit as f32, 0.0));
             }
         }
 
@@ -128,15 +115,6 @@ impl PipelineProcessor for SoftViterbiDecoderProcessor {
         self.buffer_chip_start += len * chips_per_sample(out_rate);
 
         out_block.tags = self.buffer_tags.clone();
-        if let Some(v) = self.sticky_locked_offset {
-            out_block.tags.insert("deinterleaver_locked_offset", v);
-        }
-        if let Some(v) = self.sticky_locked_shift {
-            out_block.tags.insert("deinterleaver_locked_shift", v);
-        }
-        if let Some(v) = self.sticky_locked_invert {
-            out_block.tags.insert("deinterleaver_locked_invert", v);
-        }
         if !self.buffer.is_empty() {
             self.buffer_tags = block.tags;
         }
@@ -236,46 +214,5 @@ mod tests {
 
         assert!(out_bits.len() >= msg.len());
         assert_eq!(&msg[..], &out_bits[..msg.len()]);
-    }
-
-    #[test]
-    fn test_soft_viterbi_processor_lock_transition_resets_state_and_propagates_tags() {
-        let msg = (0..160).map(|i| (i & 1) as u8).collect::<Vec<_>>();
-        let mut enc = get_1_2_k9_encoder();
-        let encoded = msg.iter().flat_map(|b| enc.encode(*b)).collect::<Vec<_>>();
-        let raw_samples = encoded
-            .iter()
-            .map(|b| Complex32::new(if *b == 0 { 1.0 } else { -1.0 }, 0.0))
-            .collect::<Vec<_>>();
-
-        let mut p = SoftViterbiDecoderProcessor::new(
-            SoftViterbiDecoder::new(get_1_2_k9_encoder()),
-            false,
-            false,
-        );
-        let first_out = p.process_block(SampleBlock::new(raw_samples.clone(), 0));
-        assert!(
-            !first_out.is_empty(),
-            "expected decoded output before lock transition"
-        );
-
-        let mut locked_block = SampleBlock::new(raw_samples, 0);
-        locked_block.chip_start = 1_000;
-        locked_block.tags.insert("deinterleaver_locked_offset", 0);
-        locked_block.tags.insert("deinterleaver_locked_shift", 31);
-        locked_block.tags.insert("deinterleaver_locked_invert", 0);
-        let lock_out = p.process_block(locked_block);
-        assert!(
-            !lock_out.is_empty(),
-            "expected decoded output after lock transition"
-        );
-        let out = &lock_out[0];
-        assert_eq!(
-            1_000, out.chip_start,
-            "lock transition should reset Viterbi output chip_start origin"
-        );
-        assert_eq!(Some(&0), out.tags.get("deinterleaver_locked_offset"));
-        assert_eq!(Some(&31), out.tags.get("deinterleaver_locked_shift"));
-        assert_eq!(Some(&0), out.tags.get("deinterleaver_locked_invert"));
     }
 }

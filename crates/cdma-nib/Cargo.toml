@@ -9,11 +9,12 @@ homepage.workspace = true
 description = "Network-in-a-box launcher: builds every 1xBTS network element and runs each as a child process."
 
 [features]
-default = ["uhd-backend", "lime-backend", "bladerf-backend"]
+default = ["uhd-backend", "lime-backend", "bladerf-backend", "network-backend"]
 uhd-backend = ["cdma-bts/uhd-backend"]
 lime-backend = ["cdma-bts/lime-backend"]
 bladerf-backend = ["cdma-bts/bladerf-backend"]
 soapy-backend = ["cdma-bts/soapy-backend"]
+network-backend = ["cdma-bts/network-backend"]
 
 [dependencies]
 cdma-bts = { path = "../cdma-bts", default-features = false }

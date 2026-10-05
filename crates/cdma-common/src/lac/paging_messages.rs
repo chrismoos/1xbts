@@ -3652,7 +3652,7 @@ impl CallingPartyNumberRecord {
 }
 
 /// Standard Alert = SIGNAL_TYPE='10', ALERT_PITCH='00', SIGNAL='000001'.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignalInfoRecord {
     /// 2-bit signal type per Table 3.7.5.5-1.
     pub signal_type: u8,
@@ -3662,12 +3662,8 @@ pub struct SignalInfoRecord {
     pub signal: u8,
 }
 
-/// Alert With Information Message per C.S0005-E 3.7.3.3.2.3.
-///
-/// Sent on f-dsch to tell the MS what call progress tone to play
-/// (e.g., ringback during MO call setup). The message carries one or
-/// more information records.
-#[derive(Clone, Debug)]
+/// C.S0005-E §3.7.3.3.2.3: Alert With Information Message.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AlertWithInformationMessage {
     /// Signal info record (RECORD_TYPE=0x05). If present, the MS plays
     /// the indicated call progress tone.
@@ -3719,11 +3715,61 @@ impl AlertWithInformationMessage {
 
         bs
     }
+
+    pub fn from_ftch_sdu(bs: &mut Bitstream) -> Result<Self, String> {
+        let mut signal_info = None;
+        let mut calling_party = None;
+        while !bs.is_empty() {
+            if bs.len() < 16 {
+                if bs.bits().iter().all(|bit| *bit == 0) {
+                    bs.read_bits(bs.len()).map_err(|error| error.to_string())?;
+                    break;
+                }
+                return Err("AWIM information record header truncated".to_string());
+            }
+            let record_type = bs.read_bits(8).map_err(|error| error.to_string())? as u8;
+            let record_len = bs.read_bits(8).map_err(|error| error.to_string())? as usize;
+            if bs.len() < record_len * 8 {
+                return Err("AWIM information record length exceeds remaining SDU".to_string());
+            }
+            let mut data = Vec::with_capacity(record_len);
+            for _ in 0..record_len {
+                data.push(bs.read_bits(8).map_err(|error| error.to_string())? as u8);
+            }
+            match InfoRecordType::from_wire(record_type) {
+                Some(InfoRecordType::Signal) => {
+                    if data.len() != 2 {
+                        return Err(format!(
+                            "AWIM Signal record has {} octets, expected 2",
+                            data.len()
+                        ));
+                    }
+                    let mut signal = Bitstream::new_bytes(&data);
+                    signal_info = Some(SignalInfoRecord {
+                        signal_type: signal.read_bits(2).map_err(|error| error.to_string())? as u8,
+                        alert_pitch: signal.read_bits(2).map_err(|error| error.to_string())? as u8,
+                        signal: signal.read_bits(6).map_err(|error| error.to_string())? as u8,
+                    });
+                }
+                Some(InfoRecordType::CallingPartyNumber) => {
+                    calling_party = Some(
+                        CallingPartyNumberRecord::decode_content_bytes(&data)
+                            .map_err(str::to_string)?,
+                    );
+                }
+                _ => {}
+            }
+        }
+        Ok(Self {
+            signal_info,
+            calling_party,
+        })
+    }
 }
 
 #[cfg(test)]
 mod calling_party_number_codec_tests {
-    use super::CallingPartyNumberRecord;
+    use super::{AlertWithInformationMessage, CallingPartyNumberRecord, SignalInfoRecord};
 
     #[test]
     fn roundtrip_basic() {
@@ -3737,6 +3783,47 @@ mod calling_party_number_codec_tests {
         let bytes = rec.encode_content_bytes();
         let decoded = CallingPartyNumberRecord::decode_content_bytes(&bytes).unwrap();
         assert_eq!(decoded, rec);
+    }
+
+    #[test]
+    fn alert_with_information_roundtrips_signal_and_caller_id() {
+        let message = AlertWithInformationMessage {
+            signal_info: Some(SignalInfoRecord {
+                signal_type: 2,
+                alert_pitch: 1,
+                signal: 1,
+            }),
+            calling_party: Some(CallingPartyNumberRecord {
+                number_type: 3,
+                number_plan: 1,
+                presentation_indicator: 0,
+                screening_indicator: 3,
+                digits: "5558675309".to_string(),
+            }),
+        };
+
+        let decoded =
+            AlertWithInformationMessage::from_ftch_sdu(&mut message.to_ftch_sdu()).unwrap();
+
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn alert_with_information_accepts_outer_pdu_zero_padding() {
+        let message = AlertWithInformationMessage {
+            signal_info: Some(SignalInfoRecord {
+                signal_type: 2,
+                alert_pitch: 1,
+                signal: 1,
+            }),
+            calling_party: None,
+        };
+        let mut encoded = message.to_ftch_sdu();
+        encoded.write_u8(0, 7);
+
+        let decoded = AlertWithInformationMessage::from_ftch_sdu(&mut encoded).unwrap();
+
+        assert_eq!(decoded, message);
     }
 
     #[test]
@@ -11343,8 +11430,14 @@ impl AlternativeTechnologiesInformationMessage {
             };
             radio_interfaces.push(radio_interface);
         }
-        if !bs.is_empty() {
-            return Err("ATIM has trailing bits after radio-interface records".into());
+        let padding_bits = bs.len();
+        if padding_bits >= 8 {
+            return Err("ATIM has non-padding bits after radio-interface records".into());
+        }
+        for _ in 0..padding_bits {
+            if bs.read_bits(1)? != 0 {
+                return Err("ATIM has non-padding bits after radio-interface records".into());
+            }
         }
         Ok(Self {
             pilot_pn,

@@ -54,16 +54,7 @@ pub fn resolve_reverse_rx_plan(bts_config: &BtsNodeConfig) -> Result<ReverseRxPl
     let one_x_reverse_frequency_hz = bts_config.channel.uplink_hz() as usize;
     let sample_rate_hz = bts_config.rf.rx_sample_rate_hz;
     let bandwidth_hz = bts_config.rf.rx_bandwidth_hz;
-    // The null radio is treated as RX-capable: it supplies a dummy RX half so
-    // the reverse pipeline runs end to end against silence (no hardware).
-    let radio_has_rx = matches!(
-        bts_config.radio,
-        RadioConfig::Soapy { .. }
-            | RadioConfig::Uhd { .. }
-            | RadioConfig::Lime { .. }
-            | RadioConfig::BladeRf { .. }
-            | RadioConfig::Noop
-    );
+    let radio_has_rx = bts_config.radio.has_rx();
     let resolved_target = if !bts_config.evdo.enabled {
         ReverseRxTarget::OneX
     } else {
@@ -408,6 +399,50 @@ pub fn build_radio_from_config(
         #[cfg(not(feature = "bladerf-backend"))]
         RadioConfig::BladeRf { .. } => {
             Err("bladeRF backend not compiled in (enable 'bladerf-backend' feature)".into())
+        }
+        #[cfg(feature = "network-backend")]
+        RadioConfig::Network {
+            addr,
+            data_host,
+            samples_per_packet,
+            tx_transport,
+            rx_antenna,
+            rx_gain_db,
+            ..
+        } => {
+            let mut radio = crate::sdr::NetworkRadio::connect(
+                addr,
+                crate::sdr::NetworkRadioOptions {
+                    samples_per_packet: *samples_per_packet,
+                    tx_transport: *tx_transport,
+                    data_host: data_host.clone(),
+                },
+            )?;
+            if options.configure_rx {
+                // An empty antenna selects the server's own backend default.
+                let rx_ant = rx_antenna.as_deref().unwrap_or("");
+                let freq_hz = rx_freq_hz as f64;
+                let sample_rate_hz = options.rx_sample_rate_hz as f64;
+                let bandwidth_hz = options.rx_bandwidth_hz as f64;
+                radio.setup_rx(
+                    0,
+                    rx_ant,
+                    freq_hz,
+                    sample_rate_hz,
+                    bandwidth_hz,
+                    *rx_gain_db,
+                )?;
+                info!(
+                    "rx: configured network radio {addr} antenna='{rx_ant}' freq={freq_hz} rate={sample_rate_hz} bw={bandwidth_hz} gain={rx_gain_db:?}"
+                );
+            } else {
+                info!("rx: 1x reverse RX disabled by HRPD-only configuration");
+            }
+            Ok(Box::new(radio))
+        }
+        #[cfg(not(feature = "network-backend"))]
+        RadioConfig::Network { .. } => {
+            Err("network radio backend not compiled in (enable 'network-backend' feature)".into())
         }
     }
 }
@@ -1206,5 +1241,61 @@ mod tests {
         assert_eq!(plan.sample_rate_hz, 4_915_200);
         assert_eq!(plan.bandwidth_hz, 3_310_000);
         assert_eq!(plan.required_bandwidth_hz, Some(3_310_000));
+    }
+
+    #[test]
+    fn network_radio_captures_the_composite_evdo_reverse_link() {
+        let mut bts =
+            BtsNodeConfig::load_evdo_enabled_for_test(&fixture_path("../../config/bts.json"))
+                .expect("load BTS config");
+        bts.radio = RadioConfig::Network {
+            addr: "127.0.0.1:50710".to_string(),
+            data_host: None,
+            samples_per_packet: crate::sdr::network::wire::DEFAULT_SAMPLES_PER_PACKET,
+            tx_transport: crate::sdr::network::wire::TxTransport::default(),
+            rx_enabled: true,
+            rx_antenna: None,
+            rx_gain_db: None,
+            rx_power_adj: 0.0,
+            rx_sample_delay: 0,
+            tx_sample_delay: None,
+            rx_batch_pcgs: 2,
+            traffic_rx_continuity: false,
+        };
+
+        let plan = resolve_reverse_rx_plan(&bts).expect("resolve reverse RX plan");
+        assert!(plan.configure_rx);
+        assert_eq!(plan.target, ReverseRxTarget::Composite);
+        assert_eq!(plan.center_frequency_hz, 844_815_000);
+        assert_eq!(plan.hrpd_reverse_frequency_hz, Some(843_900_000));
+        assert_eq!(plan.sample_rate_hz, 4_915_200);
+        assert_eq!(plan.bandwidth_hz, 3_310_000);
+        assert_eq!(bts.radio.tick_rate(plan.sample_rate_hz), 1_000_000_000);
+    }
+
+    #[test]
+    fn network_radio_with_rx_disabled_skips_the_reverse_plan() {
+        let mut bts =
+            BtsNodeConfig::load_evdo_enabled_for_test(&fixture_path("../../config/bts.json"))
+                .expect("load BTS config");
+        bts.radio = RadioConfig::Network {
+            addr: "127.0.0.1:50710".to_string(),
+            data_host: None,
+            samples_per_packet: crate::sdr::network::wire::DEFAULT_SAMPLES_PER_PACKET,
+            tx_transport: crate::sdr::network::wire::TxTransport::default(),
+            rx_enabled: false,
+            rx_antenna: None,
+            rx_gain_db: None,
+            rx_power_adj: 0.0,
+            rx_sample_delay: 0,
+            tx_sample_delay: None,
+            rx_batch_pcgs: 2,
+            traffic_rx_continuity: false,
+        };
+
+        let plan = resolve_reverse_rx_plan(&bts).expect("resolve reverse RX plan");
+        assert!(!plan.configure_rx);
+        assert_eq!(plan.target, ReverseRxTarget::OneX);
+        assert_eq!(plan.hrpd_reverse_frequency_hz, None);
     }
 }

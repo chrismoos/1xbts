@@ -17,6 +17,7 @@ pub mod metrics;
 pub mod overhead;
 pub mod paging;
 pub mod phy;
+pub mod radio;
 pub mod sch;
 pub mod sms;
 pub mod startup;

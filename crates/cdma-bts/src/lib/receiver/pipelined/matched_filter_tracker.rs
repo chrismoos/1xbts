@@ -1,542 +1,457 @@
 use std::sync::Arc;
 
-use crate::receiver::pipelined::{PipelineProcessor, SampleBlock, build_matched_pn_reference};
 use log::{debug, trace};
 use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 
-//pub const FFT_LENGTH: usize = 65536;
-//pub const BUFFER_PADDING: usize = 32767;
-//pub const BUFFER_SAMPLES_NEW: usize = 32769;
+use cdma_common::consts::SR1_CHIP_RATE_HZ;
+
+use crate::receiver::pipelined::{PipelineProcessor, SampleBlock, build_matched_pn_reference};
+use crate::sdr::cdma2000_baseband_filter_taps_f64;
+
+const PN_CHIPS: usize = 32768;
+
+const ACQ_SEGMENT_CHIPS: usize = 256;
+
+const ACQ_SEGMENTS: usize = 16;
+
+/// Half-null spacing (64 FFT bins = 2400 Hz) avoids coherent-search blind spots.
+const ACQ_CFO_BIN_STEP: isize = 64;
+const ACQ_CFO_HALF_COUNT: isize = 2;
+
+/// A 64-chip span puts the first coherent null at 19.2 kHz, beyond acquisition CFOs.
+const TRACK_COHERENT_CHIPS: usize = 64;
+
+const DEFAULT_ACQUIRE_THRESHOLD: f32 = 12.0;
+
+const TRACK_STEP_CHIPS: usize = 1024;
+
+const TRACK_SEARCH_HALF_SAMPLES: usize = 8;
+
+/// Hysteresis prevents noise-driven timing shifts from jittering frame boundaries.
+const TRACK_SLEW_MARGIN: f32 = 1.25;
+
+/// Noise in `|corr|² / energy` is near the oversample factor.
+const DEFAULT_TRACK_THRESHOLD: f32 = 25.0;
+
+const CONFIRM_HITS: usize = 3;
+
+const MISS_LIMIT: usize = 32;
+
+const OUTPUT_BLOCK_CHIPS: usize = 64;
+
+const REFERENCE_FILTER_PASSES: usize = 2;
+
+/// Filter delay between the reference start and chip zero. PN epochs must use chip zero.
+fn reference_group_delay() -> usize {
+    (cdma2000_baseband_filter_taps_f64().len() - 1) * REFERENCE_FILTER_PASSES / 2
+}
+
+fn hypothesis_order() -> impl Iterator<Item = isize> {
+    (0..=ACQ_CFO_HALF_COUNT).flat_map(|k| if k == 0 { vec![0isize] } else { vec![k, -k] })
+}
 
 pub struct MatchedFilterTracker {
-    fft_pn: Vec<Complex32>,
-    fft_planner: Arc<dyn Fft<f32>>,
-    fft_planner_inverse: Arc<dyn Fft<f32>>,
-    fft_scratch: Vec<Complex32>,
-    sample: usize,
-    buffer: Vec<Complex32>,
-    state: State,
-
-    pn_seq_filtered: Vec<Complex32>,
-
-    lock_phase: usize,
-    lock_misses: usize,
-    lock_hits: usize,
-
-    fft_length: usize,
-    buffer_samples: usize,
     oversample: usize,
-    output_samples: Vec<Complex32>,
+    period: usize,
+    pn_seq_filtered: Vec<Complex32>,
+    fft_pn_conj: Vec<Complex32>,
+    fft_fwd: Arc<dyn Fft<f32>>,
+    fft_inv: Arc<dyn Fft<f32>>,
+    fft_scratch: Vec<Complex32>,
+    search_buf: Vec<Complex32>,
+    search_power: Vec<f32>,
+    segment_spectra: Vec<Vec<Complex32>>,
+    search_chips: Vec<Complex32>,
 
-    lock_first_output_block: bool,
-    lock_chip_start: usize,
-    pending_lock_lost_tag: bool,
+    acquire_threshold: f32,
+    track_threshold: f32,
+    track_step: usize,
+    track_coherent: usize,
+
+    state: State,
+    lock_phase: usize,
+    refine_pending: bool,
+    reference_delay: usize,
+    output_phase: usize,
+    hits: usize,
+    misses: usize,
+
+    buffer: Vec<Complex32>,
+    output_samples: Vec<Complex32>,
+    output_chip_start: usize,
     speculative_blocks: Vec<SampleBlock>,
+    pending_lock_lost_tag: bool,
+    consumed: usize,
+    /// Input sample index = output sample index - slew_samples.
+    slew_samples: i64,
+    produced: Vec<SampleBlock>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum State {
     Searching,
-    CoarseTracking,
-    FineTracking,
+    Confirming,
+    Tracking,
 }
 
 impl MatchedFilterTracker {
     pub fn new(oversample: usize) -> MatchedFilterTracker {
-        let pn_seq_filtered = build_matched_pn_reference(32768 * oversample, oversample, 2);
+        let oversample = oversample.max(1);
+        let period = PN_CHIPS * oversample;
+        let pn_seq_filtered = build_matched_pn_reference(period, oversample, 2);
 
-        let mut pn_seq_reversed = pn_seq_filtered.clone();
-        pn_seq_reversed.reverse();
-        for x in &mut pn_seq_reversed {
-            *x = x.conj();
+        let mut planner = FftPlanner::new();
+        let fft_fwd = planner.plan_fft_forward(PN_CHIPS);
+        let fft_inv = planner.plan_fft_inverse(PN_CHIPS);
+
+        let mut fft_pn_conj: Vec<Complex32> = pn_seq_filtered
+            .chunks_exact(oversample)
+            .map(|c| c.iter().sum())
+            .collect();
+        fft_fwd.process(&mut fft_pn_conj);
+        for v in &mut fft_pn_conj {
+            *v = v.conj();
         }
 
-        let fft_length = 32768 * 2 * oversample;
-
-        let mut fft_pn = vec![];
-        for x in 0..fft_length {
-            if x < fft_length / 2 {
-                fft_pn.push(pn_seq_reversed[x]);
-            } else {
-                fft_pn.push(Complex32::new(0.0, 0.0));
-            }
-        }
-
-        let planner = FftPlanner::new().plan_fft_forward(fft_length);
-        planner.process(&mut fft_pn);
+        let scratch_len = fft_fwd
+            .get_inplace_scratch_len()
+            .max(fft_inv.get_inplace_scratch_len());
 
         MatchedFilterTracker {
-            sample: 0,
-            state: State::Searching,
-            fft_planner: planner,
-            fft_planner_inverse: FftPlanner::new().plan_fft_inverse(fft_length),
-            fft_pn,
-            fft_scratch: vec![Complex32::new(0.0, 0.0); fft_length],
-            pn_seq_filtered,
-            lock_phase: 0,
-            lock_hits: 0,
-            lock_misses: 0,
-            fft_length,
             oversample,
-            buffer_samples: (fft_length / 2) + 1,
-            output_samples: vec![],
-            lock_first_output_block: false,
-            lock_chip_start: 0,
-            pending_lock_lost_tag: false,
+            period,
+            pn_seq_filtered,
+            fft_pn_conj,
+            fft_fwd,
+            fft_inv,
+            fft_scratch: vec![Complex32::new(0.0, 0.0); scratch_len],
+            search_buf: vec![Complex32::new(0.0, 0.0); PN_CHIPS],
+            search_power: vec![0.0; PN_CHIPS],
+            segment_spectra: vec![vec![Complex32::new(0.0, 0.0); PN_CHIPS]; ACQ_SEGMENTS],
+            search_chips: vec![Complex32::new(0.0, 0.0); PN_CHIPS],
+            acquire_threshold: DEFAULT_ACQUIRE_THRESHOLD,
+            track_threshold: DEFAULT_TRACK_THRESHOLD,
+            track_step: TRACK_STEP_CHIPS * oversample,
+            track_coherent: TRACK_COHERENT_CHIPS * oversample,
+            state: State::Searching,
+            lock_phase: 0,
+            refine_pending: false,
+            reference_delay: reference_group_delay(),
+            output_phase: 0,
+            hits: 0,
+            misses: 0,
+            buffer: Vec::new(),
+            output_samples: Vec::new(),
+            output_chip_start: 0,
             speculative_blocks: Vec::new(),
-            buffer: vec![Complex32::new(0.0, 0.0); (fft_length / 2) - 1],
+            pending_lock_lost_tag: false,
+            consumed: 0,
+            slew_samples: 0,
+            produced: Vec::new(),
         }
+    }
+
+    pub fn with_coarse_track_threshold(mut self, threshold: f32) -> Self {
+        self.track_threshold = threshold;
+        self
+    }
+
+    pub fn with_acquire_threshold(mut self, threshold: f32) -> Self {
+        self.acquire_threshold = threshold;
+        self
+    }
+
+    fn search(&mut self) -> (usize, f32, f32) {
+        for (chip, samples) in self
+            .search_chips
+            .iter_mut()
+            .zip(self.buffer[..self.period].chunks_exact(self.oversample))
+        {
+            *chip = samples.iter().sum();
+        }
+
+        for segment in 0..ACQ_SEGMENTS {
+            let start = segment * ACQ_SEGMENT_CHIPS;
+            let end = start + ACQ_SEGMENT_CHIPS;
+            // Keep the segment in place inside a zero window so every
+            // segment's peak lands on the same lag.
+            let spectrum = &mut self.segment_spectra[segment];
+            spectrum.fill(Complex32::new(0.0, 0.0));
+            spectrum[start..end].copy_from_slice(&self.search_chips[start..end]);
+            self.fft_fwd
+                .process_with_scratch(spectrum, &mut self.fft_scratch);
+        }
+
+        let mut best = (0usize, 0.0f32, 0.0f32);
+        for h in hypothesis_order() {
+            let shift = h * ACQ_CFO_BIN_STEP;
+            self.search_power.fill(0.0);
+            for spectrum in &self.segment_spectra {
+                for (i, (buf, r)) in self
+                    .search_buf
+                    .iter_mut()
+                    .zip(self.fft_pn_conj.iter())
+                    .enumerate()
+                {
+                    let src = (i as isize - shift).rem_euclid(PN_CHIPS as isize) as usize;
+                    *buf = spectrum[src] * *r;
+                }
+                self.fft_inv
+                    .process_with_scratch(&mut self.search_buf, &mut self.fft_scratch);
+                for (p, v) in self.search_power.iter_mut().zip(self.search_buf.iter()) {
+                    *p += v.norm_sqr();
+                }
+            }
+
+            let mut peak_idx = 0usize;
+            let mut peak = 0.0f32;
+            for (i, p) in self.search_power.iter().enumerate() {
+                if *p > peak {
+                    peak = *p;
+                    peak_idx = i;
+                }
+            }
+            let mid = PN_CHIPS / 2;
+            let mut sorted = self.search_power.clone();
+            sorted.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+            let normalized = peak / sorted[mid].max(1e-20);
+
+            // The window start sits `period - peak_lag` chips into the
+            // sequence, and the winning profile shifted the signal up by
+            // `shift` bins, so the signal itself sits that far low.
+            if normalized > best.1 {
+                let phase = ((PN_CHIPS - peak_idx) % PN_CHIPS) * self.oversample;
+                let cfo = -2.0 * std::f32::consts::PI * shift as f32 / PN_CHIPS as f32;
+                best = (phase, normalized, cfo);
+            }
+            if normalized > self.acquire_threshold {
+                break;
+            }
+        }
+        best
+    }
+
+    fn correlate_at(&self, phase: usize) -> f32 {
+        let mut acc = 0.0f32;
+        let mut energy = 0.0f32;
+        for (b, block) in self.buffer[..self.track_step]
+            .chunks_exact(self.track_coherent)
+            .enumerate()
+        {
+            let base = phase + b * self.track_coherent;
+            let mut corr = Complex32::new(0.0, 0.0);
+            for (i, s) in block.iter().enumerate() {
+                let pn = self.pn_seq_filtered[(base + i) % self.period];
+                corr += *s * pn.conj();
+                energy += s.norm_sqr();
+            }
+            acc += corr.norm_sqr();
+        }
+        if energy <= 1e-20 {
+            return 0.0;
+        }
+        acc / energy
+    }
+
+    fn refine(&self, predicted: usize) -> (usize, f32) {
+        let mut best_phase = predicted;
+        let mut best = 0.0f32;
+        for offset in -(TRACK_SEARCH_HALF_SAMPLES as isize)..=(TRACK_SEARCH_HALF_SAMPLES as isize) {
+            let phase = (predicted as isize + offset).rem_euclid(self.period as isize) as usize;
+            let metric = self.correlate_at(phase);
+            if metric > best {
+                best = metric;
+                best_phase = phase;
+            }
+        }
+        (best_phase, best)
+    }
+
+    fn track(&self, predicted: usize) -> (usize, f32) {
+        let prompt = self.correlate_at(predicted);
+        let early = self.correlate_at((predicted + self.period - 1) % self.period);
+        let late = self.correlate_at((predicted + 1) % self.period);
+        if early > prompt * TRACK_SLEW_MARGIN && early >= late {
+            ((predicted + self.period - 1) % self.period, early)
+        } else if late > prompt * TRACK_SLEW_MARGIN {
+            ((predicted + 1) % self.period, late)
+        } else {
+            (predicted, prompt)
+        }
+    }
+
+    fn despread_step(&mut self, phase: usize, count: usize, slew: i64, sample_rate_hz: f64) {
+        let samples: Vec<Complex32> = self
+            .buffer
+            .drain(..count)
+            .enumerate()
+            .map(|(i, v)| self.pn_seq_filtered[(phase + i) % self.period].conj() * v)
+            .collect();
+        self.consumed += count;
+        // Positive phase steps repeat a sample, negative steps skip one.
+        if slew > 0 {
+            self.output_samples.push(samples[0]);
+        }
+        self.output_samples
+            .extend(samples.into_iter().skip(usize::from(slew < 0)));
+
+        let block_len = OUTPUT_BLOCK_CHIPS * self.oversample;
+        while self.output_samples.len() >= block_len {
+            let mut out = SampleBlock::new(
+                self.output_samples.drain(..block_len).collect::<Vec<_>>(),
+                self.output_chip_start,
+            )
+            .with_sample_rate_hz(sample_rate_hz);
+            out.tags.insert("pilot_phase", self.output_phase as i64);
+            out.tags.insert("pilot_slew_samples", self.slew_samples);
+            self.output_phase = (self.output_phase + block_len) % self.period;
+            if self.pending_lock_lost_tag {
+                out.tags.insert("upstream_lock_lost", 1);
+                self.pending_lock_lost_tag = false;
+            }
+            if self.state == State::Tracking {
+                self.produced.push(out);
+            } else {
+                self.speculative_blocks.push(out);
+            }
+            self.output_chip_start += block_len;
+        }
+    }
+
+    fn drop_lock(&mut self, lost_after_confirm: bool) {
+        self.state = State::Searching;
+        self.hits = 0;
+        self.misses = 0;
+        self.output_samples.clear();
+        self.speculative_blocks.clear();
+        self.output_chip_start = 0;
+        self.slew_samples = 0;
+        if lost_after_confirm {
+            self.pending_lock_lost_tag = true;
+        }
+    }
+}
+
+fn slew_of(from: usize, to: usize, period: usize) -> i64 {
+    match (to + period - from) % period {
+        1 => 1,
+        d if d == period - 1 => -1,
+        _ => 0,
     }
 }
 
 impl PipelineProcessor for MatchedFilterTracker {
     fn process_block(&mut self, block: super::SampleBlock) -> Vec<super::SampleBlock> {
         self.buffer.extend(&block.samples);
-        let mut produced_blocks = Vec::new();
+        self.produced.clear();
 
-        while self.buffer.len() >= self.fft_length {
-            for s in &self.buffer {
-                if !s.is_finite() {
-                    panic!("sample not finite!");
-                }
-            }
-
-            trace!(
-                "processing block {}, sample={}",
-                self.sample / self.buffer_samples,
-                self.sample
-            );
-
-            let mut signal_fft = self.buffer[0..self.fft_length].to_vec();
-            self.fft_planner
-                .process_with_scratch(&mut signal_fft, &mut self.fft_scratch);
-
-            let mut multiplied = (0..self.fft_length)
-                .map(|x| signal_fft[x] * self.fft_pn[x])
-                .collect::<Vec<_>>();
-
-            self.fft_planner_inverse.process(&mut multiplied);
-            for v in &mut multiplied {
-                *v /= self.fft_length as f32;
-            }
-
-            let filter_len = self.fft_length / 2;
-            let overlap = filter_len - 1;
-            let phase_period = filter_len;
-
-            let powers: Vec<f32> = multiplied[overlap..self.fft_length]
-                .iter()
-                .map(|x| x.norm_sqr())
-                .collect();
-
-            let mut top_powers = powers.iter().enumerate().collect::<Vec<_>>();
-            top_powers.sort_by(|a, b| b.1.total_cmp(a.1));
-
-            let mid = powers.len() / 2;
-            let mut mid_powers = powers.clone();
-            mid_powers.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
-            let median = mid_powers[mid];
-
-            // Global peak for Searching / CoarseTracking.
-            let mut global_max = overlap;
-            for x in overlap..multiplied.len() {
-                if multiplied[x].norm_sqr() > multiplied[global_max].norm_sqr() {
-                    global_max = x;
-                }
-            }
-
-            let global_peak_power = multiplied[global_max].norm_sqr();
-            let global_power = global_peak_power / median;
-            // Track PN phase at the start of the current buffer block.
-            // For overlap-save correlation index rel = (idx - overlap), the
-            // block-start phase is -rel mod period.
-            let global_rel = (global_max - overlap) % phase_period;
-            let global_phase = (phase_period - global_rel) % phase_period;
-
-            let acquire_threshold = 12.0;
-            let coarse_track_threshold = 8.0;
-            let track_threshold = 4.0;
-            let phase_threshold = 8usize;
-            let coarse_confirm_threshold = 5usize;
-            let fine_miss_threshold = 5usize;
-            let track_search_half_window = 8usize;
-
-            let log_top3 = |phase_period: usize,
-                            overlap: usize,
-                            top_powers: &Vec<(usize, &f32)>,
-                            median: f32| {
-                for x in 0..3.min(top_powers.len()) {
-                    trace!(
-                        "top (pn_phase={}) {} -> {}, idx: {}",
-                        (phase_period - top_powers[x].0 % phase_period) % phase_period,
-                        top_powers[x].0 + overlap,
-                        top_powers[x].1 / median,
-                        top_powers[x].0
-                    );
-                }
-            };
-
+        loop {
             match self.state {
                 State::Searching => {
-                    if global_power > acquire_threshold {
-                        log_top3(phase_period, overlap, &top_powers, median);
+                    if self.buffer.len() < self.period {
+                        break;
+                    }
+                    let (phase, peak, cfo_rad_per_chip) = self.search();
+                    if peak > self.acquire_threshold {
                         debug!(
-                            "max @ {} (or pn_phase == {}) -> {}, median={}, power={}",
-                            global_max, global_phase, global_peak_power, median, global_power
+                            "acquired pilot at pn_phase={} (peak/median={:.1}, carrier {:+.0} Hz), confirming",
+                            phase,
+                            peak,
+                            cfo_rad_per_chip * SR1_CHIP_RATE_HZ as f32
+                                / (2.0 * std::f32::consts::PI)
                         );
-
-                        debug!("found candidate, Searching -> Coarse");
-                        self.state = State::CoarseTracking;
-                        self.lock_phase = global_phase;
-                        self.lock_hits = 0;
-                        self.lock_misses = 0;
-
-                        // Speculative despread of the acquisition block.
-                        self.sample += self.buffer_samples;
-                        self.lock_chip_start = self.sample.saturating_sub(self.buffer_samples);
-                        let samples = self
-                            .buffer
-                            .drain(0..self.buffer_samples)
-                            .enumerate()
-                            .map(|(idx, val)| {
-                                self.pn_seq_filtered
-                                    [(global_phase + idx) % (32768 * self.oversample)]
-                                    .conj()
-                                    * val
-                            })
-                            .collect::<Vec<_>>();
-                        self.output_samples.extend(samples);
-                        while self.output_samples.len() >= 64 * self.oversample {
-                            let mut out_block = SampleBlock::new(
-                                self.output_samples
-                                    .drain(0..64 * self.oversample)
-                                    .collect::<Vec<_>>(),
-                                self.lock_chip_start,
-                            )
-                            .with_sample_rate_hz(block.sample_rate_hz);
-                            out_block.tags.insert("pilot_phase", global_phase as i64);
-                            if self.pending_lock_lost_tag {
-                                out_block.tags.insert("upstream_lock_lost", 1);
-                                self.pending_lock_lost_tag = false;
-                            }
-                            self.speculative_blocks.push(out_block);
-                            self.lock_chip_start += 64 * self.oversample;
-                        }
+                        self.state = State::Confirming;
+                        self.lock_phase = phase;
+                        self.refine_pending = true;
+                        self.hits = 0;
+                        self.misses = 0;
+                        self.output_chip_start = self.consumed;
+                        self.slew_samples = 0;
                     } else {
-                        self.sample += self.buffer_samples;
-                        self.buffer.drain(0..self.buffer_samples);
+                        trace!("search: no pilot (peak/median={peak:.1})");
+                        let drop = self.period.min(self.buffer.len());
+                        self.buffer.drain(..drop);
+                        self.consumed += drop;
                     }
                 }
 
-                State::CoarseTracking => {
-                    let expected_phase = (self.lock_phase + self.buffer_samples) % phase_period;
-                    let coarse_search_half_window = 16usize;
-
-                    // Local search around expected_phase (not global max).
-                    let mut local_best_idx = overlap;
-                    let mut local_best_power = 0.0f32;
-                    let mut found_local = false;
-
-                    for rel in 0..=(2 * coarse_search_half_window) {
-                        let offset = rel as isize - coarse_search_half_window as isize;
-                        let cand_phase = (expected_phase as isize + offset)
-                            .rem_euclid(phase_period as isize)
-                            as usize;
-                        // If phase is defined at block start, the expected peak
-                        // relative index is simply -phase mod period.
-                        let cand_rel = (phase_period - cand_phase) % phase_period;
-                        let cand_idx = overlap + cand_rel;
-
-                        if cand_idx < multiplied.len() {
-                            let p = multiplied[cand_idx].norm_sqr();
-                            if !found_local || p > local_best_power {
-                                found_local = true;
-                                local_best_power = p;
-                                local_best_idx = cand_idx;
-                            }
-                        }
+                State::Confirming | State::Tracking => {
+                    if self.buffer.len() < self.track_step {
+                        break;
                     }
-
-                    let (measured_phase, measured_power) = if found_local {
-                        (
-                            (phase_period - ((local_best_idx - overlap) % phase_period))
-                                % phase_period,
-                            local_best_power / median,
-                        )
+                    let refining = self.refine_pending;
+                    let (phase, metric) = if refining {
+                        self.refine_pending = false;
+                        self.refine(self.lock_phase)
                     } else {
-                        (expected_phase, 0.0)
+                        self.track(self.lock_phase)
                     };
-
-                    let distance = phase_distance(expected_phase, measured_phase, phase_period);
-
-                    if found_local
-                        && distance <= phase_threshold
-                        && measured_power > coarse_track_threshold
-                    {
-                        self.lock_hits += 1;
-                        self.lock_phase = measured_phase;
-                        if self.lock_misses > 0 {
-                            self.lock_misses -= 1;
+                    // Refinement corrects chip quantization regardless of the hit threshold.
+                    let hit = metric > self.track_threshold;
+                    let mut slew = 0;
+                    if hit || refining {
+                        if !refining {
+                            slew = slew_of(self.lock_phase, phase, self.period);
+                            self.slew_samples += slew;
                         }
-                        trace!(
-                            "coarse: hit @ pn_phase={}, power={:.1}, expected={}, hits={}, misses={}",
-                            measured_phase,
-                            measured_power,
-                            expected_phase,
-                            self.lock_hits,
-                            self.lock_misses
-                        );
-                    } else {
-                        self.lock_misses += 1;
-                        if self.lock_hits > 0 {
-                            self.lock_hits -= 1;
-                        }
-                        // Coast: advance predicted phase
-                        self.lock_phase = expected_phase;
-                        trace!(
-                            "coarse: miss, local_power={:.1}, distance={}, expected={}, hits={}, misses={}",
-                            measured_power,
-                            distance,
-                            expected_phase,
-                            self.lock_hits,
-                            self.lock_misses
-                        );
+                        self.lock_phase = phase;
                     }
-
-                    if self.lock_misses > coarse_confirm_threshold {
-                        debug!("lost coarse lock");
-                        self.state = State::Searching;
-                        self.speculative_blocks.clear();
-                        self.output_samples.clear();
-                        self.lock_chip_start = 0;
-
-                        self.sample += self.buffer_samples;
-                        self.buffer.drain(0..self.buffer_samples);
-                    } else {
-                        // Speculative despread: use measured_phase if on-phase,
-                        // expected_phase otherwise.
-                        let coarse_despread_phase = if found_local && distance <= phase_threshold {
-                            measured_phase
+                    if refining {
+                        // Start output at a PN roll so downstream chip and frame counts remain aligned.
+                        let ahead = (self.reference_delay + self.period
+                            - self.lock_phase % self.period)
+                            % self.period;
+                        if ahead <= self.period / 2 {
+                            let skip = ahead.min(self.buffer.len());
+                            self.buffer.drain(..skip);
+                            self.consumed += skip;
+                            self.lock_phase = (self.lock_phase + skip) % self.period;
+                            self.output_chip_start = self.consumed + self.period;
                         } else {
-                            expected_phase
-                        };
-                        self.sample += self.buffer_samples;
-                        let samples = self
-                            .buffer
-                            .drain(0..self.buffer_samples)
-                            .enumerate()
-                            .map(|(idx, val)| {
-                                self.pn_seq_filtered
-                                    [(coarse_despread_phase + idx) % (32768 * self.oversample)]
-                                    .conj()
-                                    * val
-                            })
-                            .collect::<Vec<_>>();
-                        self.output_samples.extend(samples);
-                        while self.output_samples.len() >= 64 * self.oversample {
-                            let mut out_block = SampleBlock::new(
-                                self.output_samples
-                                    .drain(0..64 * self.oversample)
-                                    .collect::<Vec<_>>(),
-                                self.lock_chip_start,
-                            )
-                            .with_sample_rate_hz(block.sample_rate_hz);
-                            out_block
-                                .tags
-                                .insert("pilot_phase", coarse_despread_phase as i64);
-                            if self.pending_lock_lost_tag {
-                                out_block.tags.insert("upstream_lock_lost", 1);
-                                self.pending_lock_lost_tag = false;
-                            }
-                            self.speculative_blocks.push(out_block);
-                            self.lock_chip_start += 64 * self.oversample;
+                            let backfill = self.period - ahead;
+                            self.output_chip_start = self.consumed + self.period - backfill;
+                            self.output_samples
+                                .extend(std::iter::repeat_n(Complex32::new(0.0, 0.0), backfill));
                         }
-
-                        if self.lock_hits > coarse_confirm_threshold {
-                            self.lock_hits = 0;
-                            self.lock_misses = 0;
-                            self.state = State::FineTracking;
-                            self.lock_first_output_block = false;
-                            debug!("promoted phase {} -> fine tracking", self.lock_phase);
-                            // Flush speculative blocks downstream.
-                            produced_blocks.append(&mut self.speculative_blocks);
+                        self.output_phase = 0;
+                        if self.buffer.len() < self.track_step {
+                            break;
                         }
                     }
-                }
+                    if hit {
+                        self.hits += 1;
+                        self.misses = self.misses.saturating_sub(1);
+                    } else {
+                        self.misses += 1;
+                        self.hits = self.hits.saturating_sub(1);
+                    }
+                    trace!(
+                        "track: phase={} metric={:.1} hit={} hits={} misses={}",
+                        self.lock_phase, metric, hit, self.hits, self.misses
+                    );
 
-                State::FineTracking => {
-                    let phase_period = 32768 * self.oversample;
-                    let expected_phase = (self.lock_phase + self.buffer_samples) % phase_period;
-                    // Search locally around expected_phase using the correct phase->idx mapping:
-                    // If phase is defined at block start:
-                    // rel_idx = (-phase) mod phase_period
-                    // idx = overlap + rel_idx
-                    let mut local_best_idx = overlap;
-                    let mut local_best_power = 0.0f32;
-                    let mut found_local = false;
-
-                    for rel in 0..=(2 * track_search_half_window) {
-                        let offset = rel as isize - track_search_half_window as isize;
-                        let cand_phase = (expected_phase as isize + offset)
-                            .rem_euclid(phase_period as isize)
-                            as usize;
-
-                        let cand_rel = (phase_period - cand_phase) % phase_period;
-                        let cand_idx = overlap + cand_rel;
-
-                        if cand_idx < multiplied.len() {
-                            let p = multiplied[cand_idx].norm_sqr();
-                            if !found_local || p > local_best_power {
-                                found_local = true;
-                                local_best_power = p;
-                                local_best_idx = cand_idx;
-                            }
-                        }
+                    if self.misses > MISS_LIMIT {
+                        debug!("lost pilot lock");
+                        let confirmed = self.state == State::Tracking;
+                        self.drop_lock(confirmed);
+                        continue;
                     }
 
-                    let (measured_phase, measured_power) = if found_local {
-                        (
-                            (phase_period - ((local_best_idx - overlap) % phase_period))
-                                % phase_period,
-                            local_best_power / median,
-                        )
-                    } else {
-                        (expected_phase, 0.0)
-                    };
+                    let despread_phase = self.lock_phase;
+                    self.despread_step(despread_phase, self.track_step, slew, block.sample_rate_hz);
+                    self.lock_phase = (self.lock_phase + self.track_step) % self.period;
 
-                    let distance = phase_distance(expected_phase, measured_phase, phase_period);
-
-                    // Three cases:
-                    // 1) strong + on-phase  -> update lock_phase
-                    // 2) weak  + on-phase   -> coast, but DO NOT count as miss
-                    // 3) off-phase / absent -> real miss
-                    let strong_on_phase = found_local
-                        && distance <= phase_threshold
-                        && measured_power > track_threshold;
-
-                    let weak_but_on_phase = found_local
-                        && distance <= phase_threshold
-                        && measured_power <= track_threshold;
-
-                    let real_miss = !found_local || distance > phase_threshold;
-
-                    let despread_phase = if strong_on_phase {
-                        measured_phase
-                    } else {
-                        expected_phase
-                    };
-
-                    if strong_on_phase {
-                        trace!(
-                            "tracked local peak @ {} (pn_phase == {}) -> {}, median={}, power={}",
-                            local_best_idx,
-                            measured_phase,
-                            local_best_power,
-                            median,
-                            measured_power
-                        );
-
-                        self.lock_phase = measured_phase;
-                        self.lock_hits += 1;
-                        if self.lock_misses > 0 {
-                            self.lock_misses -= 1;
-                        }
-                    } else if weak_but_on_phase {
-                        trace!(
-                            "tracking coast: expected_phase={}, measured_phase={}, measured_power={}",
-                            expected_phase, measured_phase, measured_power
-                        );
-
-                        // Coast: advance predicted phase, no miss counted
-                        self.lock_phase = expected_phase;
-                        self.lock_hits += 1;
-                        if self.lock_misses > 0 {
-                            self.lock_misses -= 1;
-                        }
-                    } else if real_miss {
-                        trace!(
-                            "tracking miss: expected_phase={}, measured_phase={}, measured_power={}",
-                            expected_phase, measured_phase, measured_power
-                        );
-
-                        // Coast: advance predicted phase
-                        self.lock_phase = expected_phase;
-                        self.lock_misses += 1;
-                        if self.lock_hits > 0 {
-                            self.lock_hits -= 1;
-                        }
-                    }
-
-                    if self.lock_misses > fine_miss_threshold {
-                        println!("lost fine lock");
-                        self.state = State::Searching;
-                        self.output_samples.clear();
-                        self.speculative_blocks.clear();
-                        self.lock_first_output_block = false;
-                        self.lock_chip_start = 0;
-
-                        self.sample += self.buffer_samples;
-                        self.buffer.drain(0..self.buffer_samples);
-                        self.pending_lock_lost_tag = true;
-                    } else {
-                        self.sample += self.buffer_samples;
-                        let drained_block_chip_start =
-                            self.sample.saturating_sub(self.buffer_samples);
-
-                        // Defer alignment until we have a strong measurement.
-                        // On weak/miss blocks before alignment, skip despreading
-                        // to avoid corrupting downstream with a bad phase.
-                        if self.lock_first_output_block && !strong_on_phase {
-                            self.buffer.drain(0..self.buffer_samples);
-                        } else {
-                            if self.lock_first_output_block {
-                                // First strong block after lock: start chip timeline
-                                // at the actual drained block position.
-                                self.lock_chip_start = drained_block_chip_start;
-                                self.lock_first_output_block = false;
-                            }
-
-                            let samples = self
-                                .buffer
-                                .drain(0..self.buffer_samples)
-                                .enumerate()
-                                .map(|(idx, val)| {
-                                    self.pn_seq_filtered
-                                        [(despread_phase + idx) % (32768 * self.oversample)]
-                                        .conj()
-                                        * val
-                                })
-                                .collect::<Vec<_>>();
-                            self.output_samples.extend(samples);
-                        }
-
-                        while self.output_samples.len() >= 64 * self.oversample {
-                            let mut out_block = SampleBlock::new(
-                                self.output_samples
-                                    .drain(0..64 * self.oversample)
-                                    .collect::<Vec<_>>(),
-                                self.lock_chip_start,
-                            )
-                            .with_sample_rate_hz(block.sample_rate_hz);
-                            out_block.tags.insert("pilot_phase", despread_phase as i64);
-                            if self.pending_lock_lost_tag {
-                                out_block.tags.insert("upstream_lock_lost", 1);
-                                self.pending_lock_lost_tag = false;
-                            }
-                            produced_blocks.push(out_block);
-                            self.lock_chip_start += 64 * self.oversample;
-                        }
+                    if self.state == State::Confirming && self.hits >= CONFIRM_HITS {
+                        debug!("confirmed pilot at pn_phase={}", self.lock_phase);
+                        self.state = State::Tracking;
+                        let mut released = std::mem::take(&mut self.speculative_blocks);
+                        self.produced.append(&mut released);
                     }
                 }
             }
         }
 
-        produced_blocks
+        std::mem::take(&mut self.produced)
     }
-}
-
-fn phase_distance(a: usize, b: usize, period: usize) -> usize {
-    let d = (a as isize - b as isize).rem_euclid(period as isize) as usize;
-    d.min(period - d)
 }

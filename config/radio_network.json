@@ -1,0 +1,8 @@
+{
+  "kind": "network",
+  "addr": "127.0.0.1:50710",
+  "data_host": "127.0.0.1",
+  "samples_per_packet": 2200,
+  "tx_transport": "tcp",
+  "rx_enabled": true
+}

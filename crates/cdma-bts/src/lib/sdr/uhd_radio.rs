@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 use cdma_common::error::Error;
 use log::{debug, info};
 use num_complex::Complex32;
@@ -14,6 +16,28 @@ use cdma_common::consts::SR1_CHIP_RATE_HZ;
 
 /// Default master clock rate: 39.3216 MHz = 4 ticks per 8× TX sample, 32 ticks per chip.
 const DEFAULT_MASTER_CLOCK_RATE: u64 = 39_321_600;
+
+/// Time reads must not lock, they run on the bts-tx hot path. UHD does not
+/// allow concurrent settings changes, so those hold `settings`.
+struct SharedUsrp {
+    usrp: Usrp,
+    settings: Mutex<()>,
+}
+
+impl SharedUsrp {
+    fn current_ticks(&self, master_clock_rate: u64) -> Result<u64, Error> {
+        let ts = self
+            .usrp
+            .get_current_time(0)
+            .map_err(|e| Error::from(format!("UHD: get_current_time: {}", e)))?;
+        Ok(timespec_to_ticks(&ts, master_clock_rate))
+    }
+
+    fn configure<T>(&self, change: impl FnOnce(&Usrp) -> T) -> T {
+        let _settings = self.settings.lock();
+        change(&self.usrp)
+    }
+}
 
 fn record_async_tx_event(health: &mut TxRadioHealth, code: u32) {
     const BURST_ACK: u32 = 0x01;
@@ -106,6 +130,7 @@ fn log_tx_tick_alignment(master_clock_rate: u64, tx_sample_rate_hz: usize) {
 pub struct UhdRadio {
     usrp: Usrp,
     channel: usize,
+    rx_channel: usize,
     master_clock_rate: u64,
     tx_lo_offset_hz: f64,
     tx_streamer: Option<TransmitStreamer<Complex32>>,
@@ -168,6 +193,7 @@ impl UhdRadio {
         Ok(UhdRadio {
             usrp,
             channel,
+            rx_channel: channel,
             master_clock_rate: mcr,
             tx_lo_offset_hz: 0.0,
             tx_streamer: Some(tx_streamer),
@@ -218,12 +244,17 @@ impl Radio for UhdRadio {
         Ok(())
     }
 
-    fn set_tx_sample_rate(&mut self, sample_rate: usize) -> Result<(), Error> {
+    fn set_tx_sample_rate(&mut self, sample_rate: usize) -> Result<usize, Error> {
         self.usrp
             .set_tx_sample_rate(sample_rate as f64, self.channel)
             .map_err(|e| Error::from(format!("UHD: set TX rate: {}", e)))?;
-        log_tx_tick_alignment(self.master_clock_rate, sample_rate);
-        Ok(())
+        let actual = self
+            .usrp
+            .get_tx_sample_rate(self.channel)
+            .map_err(|e| Error::from(format!("UHD: get TX rate: {}", e)))?
+            .round() as usize;
+        log_tx_tick_alignment(self.master_clock_rate, actual);
+        Ok(actual)
     }
 
     fn set_tx_bandwidth(&mut self, bandwidth: usize) -> Result<(), Error> {
@@ -247,6 +278,7 @@ impl Radio for UhdRadio {
         bandwidth_hz: f64,
         gain_db: Option<f64>,
     ) -> Result<(), Error> {
+        self.rx_channel = channel;
         self.usrp
             .set_rx_antenna(antenna, channel)
             .map_err(|e| Error::from(format!("UHD: set RX antenna: {}", e)))?;
@@ -278,7 +310,10 @@ impl Radio for UhdRadio {
     }
 
     fn split(self: Box<Self>) -> Result<(Box<dyn RadioTx>, Option<Box<dyn RadioRx>>), Error> {
-        let usrp = Arc::new(self.usrp);
+        let usrp = Arc::new(SharedUsrp {
+            usrp: self.usrp,
+            settings: Mutex::new(()),
+        });
         let tx = UhdTxHalf {
             usrp: usrp.clone(),
             tx_streamer: self
@@ -287,28 +322,30 @@ impl Radio for UhdRadio {
             master_clock_rate: self.master_clock_rate,
             start_of_burst: true,
             health: TxRadioHealth::default(),
+            channel: self.channel,
+            tx_lo_offset_hz: self.tx_lo_offset_hz,
         };
+        let rx_channel = self.rx_channel;
         let rx = self.rx_streamer.map(|s| -> Box<dyn RadioRx> {
             Box::new(UhdRxHalf {
                 usrp: usrp.clone(),
                 rx_streamer: s,
                 master_clock_rate: self.master_clock_rate,
+                channel: rx_channel,
             })
         });
         Ok((Box::new(tx), rx))
     }
 }
 
-// ---------------------------------------------------------------------------
-// TX half
-// ---------------------------------------------------------------------------
-
 struct UhdTxHalf {
-    usrp: Arc<Usrp>,
+    usrp: Arc<SharedUsrp>,
     tx_streamer: TransmitStreamer<Complex32>,
     master_clock_rate: u64,
     start_of_burst: bool,
     health: TxRadioHealth,
+    channel: usize,
+    tx_lo_offset_hz: f64,
 }
 
 impl RadioTx for UhdTxHalf {
@@ -317,17 +354,13 @@ impl RadioTx for UhdTxHalf {
     }
 
     fn get_hardware_time(&self) -> Result<u64, Error> {
-        let ts = self
-            .usrp
-            .get_current_time(0)
-            .map_err(|e| Error::from(format!("UHD: get_current_time: {}", e)))?;
-        Ok(timespec_to_ticks(&ts, self.master_clock_rate))
+        self.usrp.current_ticks(self.master_clock_rate)
     }
 
     fn set_hardware_time(&self, ticks: u64) -> Result<(), Error> {
         let ts = ticks_to_timespec(ticks, self.master_clock_rate);
         self.usrp
-            .set_time_unknown_pps(ts.seconds, ts.fraction)
+            .configure(|usrp| usrp.set_time_unknown_pps(ts.seconds, ts.fraction))
             .map_err(|e| Error::from(format!("UHD: set_time_unknown_pps: {}", e)))?;
         Ok(())
     }
@@ -386,6 +419,18 @@ impl RadioTx for UhdTxHalf {
         }
         Ok(self.health)
     }
+
+    fn set_tx_frequency_hz(&mut self, frequency_hz: f64) -> Result<(), Error> {
+        let request = if self.tx_lo_offset_hz != 0.0 {
+            TuneRequest::with_frequency_lo(frequency_hz, self.tx_lo_offset_hz)
+        } else {
+            TuneRequest::with_frequency(frequency_hz)
+        };
+        self.usrp
+            .configure(|usrp| usrp.set_tx_frequency(&request, self.channel))
+            .map_err(|e| Error::from(format!("UHD: set TX freq: {}", e)))?;
+        Ok(())
+    }
 }
 
 impl UhdTxHalf {
@@ -408,14 +453,11 @@ impl UhdTxHalf {
     }
 }
 
-// ---------------------------------------------------------------------------
-// RX half
-// ---------------------------------------------------------------------------
-
 struct UhdRxHalf {
-    usrp: Arc<Usrp>,
+    usrp: Arc<SharedUsrp>,
     rx_streamer: ReceiveStreamer<Complex32>,
     master_clock_rate: u64,
+    channel: usize,
 }
 
 impl RadioRx for UhdRxHalf {
@@ -424,11 +466,7 @@ impl RadioRx for UhdRxHalf {
     }
 
     fn get_hardware_time(&self) -> Result<u64, Error> {
-        let ts = self
-            .usrp
-            .get_current_time(0)
-            .map_err(|e| Error::from(format!("UHD: get_current_time: {}", e)))?;
-        Ok(timespec_to_ticks(&ts, self.master_clock_rate))
+        self.usrp.current_ticks(self.master_clock_rate)
     }
 
     fn rx_read(&mut self, buf: &mut [Complex32], timeout_us: i64) -> Result<RxReadResult, Error> {
@@ -500,6 +538,20 @@ impl RadioRx for UhdRxHalf {
             })
             .map_err(|e| Error::from(format!("UHD: RX deactivate: {}", e)))?;
         Ok(())
+    }
+
+    fn set_rx_frequency(&mut self, frequency_hz: f64) -> Result<(), Error> {
+        let tune = TuneRequest::with_frequency(frequency_hz);
+        self.usrp
+            .configure(|usrp| usrp.set_rx_frequency(&tune, self.channel))
+            .map_err(|e| Error::from(format!("UHD: set RX freq: {}", e)))?;
+        Ok(())
+    }
+
+    fn set_rx_gain(&mut self, gain_db: f64) -> Result<(), Error> {
+        self.usrp
+            .configure(|usrp| usrp.set_rx_gain(gain_db, self.channel, ""))
+            .map_err(|e| Error::from(format!("UHD: set RX gain: {}", e)))
     }
 }
 

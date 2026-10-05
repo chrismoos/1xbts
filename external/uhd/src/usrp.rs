@@ -702,7 +702,7 @@ impl Usrp {
 
     /// Sets the receive center frequency
     pub fn set_rx_frequency(
-        &mut self,
+        &self,
         request: &TuneRequest,
         channel: usize,
     ) -> Result<TuneResult, Error> {
@@ -727,7 +727,7 @@ impl Usrp {
     }
 
     /// Sets the receive gain
-    pub fn set_rx_gain(&mut self, gain: f64, channel: usize, name: &str) -> Result<(), Error> {
+    pub fn set_rx_gain(&self, gain: f64, channel: usize, name: &str) -> Result<(), Error> {
         let name = CString::new(name)?;
         check_status(unsafe {
             uhd_sys::uhd_usrp_set_rx_gain(self.0, gain, channel as _, name.as_ptr())
@@ -754,7 +754,7 @@ impl Usrp {
 
     /// Sets the transmit center frequency
     pub fn set_tx_frequency(
-        &mut self,
+        &self,
         request: &TuneRequest,
         channel: usize,
     ) -> Result<TuneResult, Error> {

@@ -9,6 +9,7 @@
   "rx_reference_dbm": null,
   "rx_power_adj": 0.0,
   "rx_sample_delay": 82,
+  "tx_sample_delay": -82,
   "rx_batch_pcgs": 2,
   "num_buffers": 16,
   "buffer_size": 8192,

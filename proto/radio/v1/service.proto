@@ -1,0 +1,96 @@
+syntax = "proto3";
+package radio.v1;
+
+import "google/protobuf/empty.proto";
+
+// Hardware timestamps are nanoseconds. Convert at the boundary to native driver ticks.
+service RadioControlService {
+  rpc GetInfo(google.protobuf.Empty) returns (RadioInfo);
+  rpc SetTxFrequency(SetTxFrequencyRequest) returns (google.protobuf.Empty);
+  rpc SetTxSampleRate(SetTxSampleRateRequest) returns (SetTxSampleRateResponse);
+  rpc SetTxBandwidth(SetTxBandwidthRequest) returns (google.protobuf.Empty);
+  // The offset is compensated by software rotation.
+  rpc SetTxLoOffset(SetTxLoOffsetRequest) returns (google.protobuf.Empty);
+  rpc SetupRx(SetupRxRequest) returns (google.protobuf.Empty);
+  rpc SetRxFrequency(SetRxFrequencyRequest) returns (google.protobuf.Empty);
+  rpc SetRxGain(SetRxGainRequest) returns (google.protobuf.Empty);
+  rpc OpenSession(OpenSessionRequest) returns (OpenSessionResponse);
+  rpc GetHardwareTime(google.protobuf.Empty) returns (HardwareTime);
+  rpc SetHardwareTime(HardwareTime) returns (google.protobuf.Empty);
+  rpc EnableTransmit(EnableTransmitRequest) returns (google.protobuf.Empty);
+  rpc RxActivate(RxActivateRequest) returns (google.protobuf.Empty);
+  rpc RxDeactivate(google.protobuf.Empty) returns (google.protobuf.Empty);
+}
+
+message RadioInfo {
+  uint64 tick_rate = 1;
+  bool rx_supported = 2;
+  uint32 max_samples_per_packet = 3;
+  string backend = 4;
+  // Connector power for unit-RMS TX samples at the server's configured gain.
+  optional double tx_full_scale_power_estimate_dbm = 5;
+  // Input power that corresponds to 0 dBFS at the server's configured RX gain.
+  optional double rx_reference_dbm = 6;
+  // Signed TX timing correction in four-samples-per-chip units, applied by the mobile.
+  optional int64 tx_sample_delay = 7;
+}
+
+message SetTxFrequencyRequest {
+  uint64 frequency_hz = 1;
+}
+
+message SetTxSampleRateRequest {
+  uint64 sample_rate_hz = 1;
+}
+
+message SetTxSampleRateResponse {
+  uint64 actual_sample_rate_hz = 1;
+}
+
+message SetTxBandwidthRequest {
+  uint64 bandwidth_hz = 1;
+}
+
+message SetTxLoOffsetRequest {
+  int64 offset_hz = 1;
+}
+
+message SetupRxRequest {
+  uint32 channel = 1;
+  string antenna = 2;
+  double frequency_hz = 3;
+  double sample_rate_hz = 4;
+  double bandwidth_hz = 5;
+  optional double gain_db = 6;
+}
+
+message SetRxFrequencyRequest {
+  double frequency_hz = 1;
+}
+
+message SetRxGainRequest {
+  double gain_db = 1;
+}
+
+message OpenSessionRequest {
+  uint32 samples_per_packet = 1;
+}
+
+message OpenSessionResponse {
+  uint32 session_id = 1;
+  uint32 data_port = 2;
+  uint32 samples_per_packet = 3;
+}
+
+message HardwareTime {
+  uint64 time_ns = 1;
+}
+
+message EnableTransmitRequest {
+  bool enable = 1;
+  optional uint64 time_ns = 2;
+}
+
+message RxActivateRequest {
+  optional uint64 time_ns = 1;
+}

@@ -556,7 +556,7 @@ impl ForwardTrafficChannelRc3 {
         config.lc_chip_cursor = chip;
     }
 
-    fn pc_start_from_pcg_lc(long_code_generator: &mut LongCodeGenerator) -> usize {
+    pub fn pc_start_from_pcg_lc(long_code_generator: &mut LongCodeGenerator) -> usize {
         let mut pcg_bits = [0u8; SYMBOLS_PER_PCG];
         for bit in &mut pcg_bits {
             *bit = long_code_generator.next_chip();

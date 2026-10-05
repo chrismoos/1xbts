@@ -1,0 +1,332 @@
+syntax = "proto3";
+package ms.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+service MsService {
+  rpc PowerOn(PowerOnRequest) returns (PowerOnResponse);
+  rpc PowerOff(google.protobuf.Empty) returns (google.protobuf.Empty);
+  rpc GetStatus(google.protobuf.Empty) returns (MsStatus);
+  rpc GetDiagnostics(google.protobuf.Empty) returns (Diagnostics);
+
+  rpc StartScan(StartScanRequest) returns (StartScanResponse);
+  rpc ListChannels(google.protobuf.Empty) returns (ChannelList);
+  rpc PrlVerdict(PrlVerdictRequest) returns (PrlVerdictResponse);
+
+  rpc SetRxGain(SetRxGainRequest) returns (google.protobuf.Empty);
+  rpc DumpForward(DumpForwardRequest) returns (google.protobuf.Empty);
+  rpc TrimTxCalibration(TxCalibrationTrim) returns (TxCalibrationState);
+
+  rpc Register(google.protobuf.Empty) returns (google.protobuf.Empty);
+  rpc Originate(OriginateRequest) returns (OriginateResponse);
+  rpc Answer(google.protobuf.Empty) returns (google.protobuf.Empty);
+  rpc HangUp(google.protobuf.Empty) returns (google.protobuf.Empty);
+  rpc SendDtmfBurst(SendDtmfBurstRequest) returns (google.protobuf.Empty);
+  rpc PushVoiceAudio(VoicePcmFrame) returns (google.protobuf.Empty);
+  rpc StreamVoiceAudio(google.protobuf.Empty) returns (stream VoicePcmFrame);
+  rpc SendSms(SendSmsRequest) returns (SendSmsResponse);
+  rpc DialData(DialDataRequest) returns (DialDataResponse);
+
+  rpc PageWithSms(PageWithSmsRequest) returns (PageWithSmsResponse);
+  rpc ListMobiles(google.protobuf.Empty) returns (MobileList);
+
+  rpc StreamEvents(google.protobuf.Empty) returns (stream MsEvent);
+  rpc StreamMetrics(google.protobuf.Empty) returns (stream MsMetrics);
+}
+
+message SendDtmfBurstRequest {
+  string digits = 1;
+}
+
+message PowerOnRequest {}
+
+// Mobile station protocol state (C.S0005-E §2.3, §2.6).
+enum MsState {
+  MS_STATE_UNSPECIFIED = 0;
+  MS_STATE_OFF = 1;
+  MS_STATE_SYSTEM_DETERMINATION = 2;
+  MS_STATE_PILOT_ACQUISITION = 3;
+  MS_STATE_SYNC_ACQUISITION = 4;
+  MS_STATE_TIMING_CHANGE = 5;
+  MS_STATE_IDLE = 6;
+  MS_STATE_SYSTEM_ACCESS = 7;
+  MS_STATE_TRAFFIC_CHANNEL_INIT = 8;
+  MS_STATE_TRAFFIC_CHANNEL = 9;
+}
+
+// Why the PRL permits or forbids a system.
+enum PrlVerdictReason {
+  PRL_VERDICT_REASON_UNSPECIFIED = 0;
+  // A preferred PRL system record matches.
+  PRL_VERDICT_REASON_PREFERRED = 1;
+  // No record matches and the PRL allows unlisted systems.
+  PRL_VERDICT_REASON_UNLISTED_ALLOWED = 2;
+  // A negative PRL system record matches.
+  PRL_VERDICT_REASON_NEGATIVE = 3;
+  // No record matches and the PRL forbids unlisted systems.
+  PRL_VERDICT_REASON_UNLISTED = 4;
+}
+
+enum ScanMode {
+  // Treated as SCAN_MODE_CAMP in a request.
+  SCAN_MODE_UNSPECIFIED = 0;
+  // Stop on the first permitted system and camp on it.
+  SCAN_MODE_CAMP = 1;
+  // Measure every channel in the plan without camping.
+  SCAN_MODE_SURVEY = 2;
+}
+
+// A mobile's state in the loopback base station's registry.
+enum MobileState {
+  MOBILE_STATE_UNSPECIFIED = 0;
+  MOBILE_STATE_REGISTERED = 1;
+  MOBILE_STATE_PAGED = 2;
+  MOBILE_STATE_PAGE_RESPONSE_RECEIVED = 3;
+  MOBILE_STATE_TRAFFIC_ASSIGNING = 4;
+  MOBILE_STATE_TRAFFIC_ACTIVE = 5;
+}
+
+message PowerOnResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message MsStatus {
+  MsState state = 1;
+  uint32 pilot_pn = 2;
+  uint32 sid = 4;
+  uint32 nid = 5;
+  uint32 base_id = 6;
+  // Registration state: "yes", "no", "pending".
+  string registered = 7;
+  uint32 paging_channel = 8;
+  // SYS_TIME from the sync channel, in 80 ms units.
+  uint64 system_time_chips = 9;
+  double pilot_ec_io_db = 10;
+  string call_state = 11;
+  // Negotiated voice service option, or zero outside a voice call.
+  uint32 voice_service_option = 12;
+  string caller_number = 13;
+}
+
+message PilotStatus {
+  bool locked = 1;
+  // Pilot Ec/Io in dB. `measured` is false before the meter has a value.
+  bool measured = 2;
+  double ec_io_db = 3;
+  double rx_power_dbfs = 6;
+  uint64 pilot_symbols = 7;
+}
+
+// The Sync Channel Message as decoded (C.S0005 §3.7.2.3.2.26).
+message SyncParameters {
+  uint32 p_rev = 1;
+  uint32 min_p_rev = 2;
+  uint32 sid = 3;
+  uint32 nid = 4;
+  uint32 pilot_pn = 5;
+  uint64 lc_state = 6;
+  // SYS_TIME in 80 ms units since the CDMA epoch.
+  uint64 sys_time = 7;
+  string system_time = 8;
+  uint32 lp_sec = 9;
+  int32 ltm_off = 10;
+  bool daylt = 11;
+  uint32 prat = 12;
+  uint32 paging_rate_bps = 13;
+  uint32 cdma_freq = 14;
+}
+
+message Overhead {
+  repeated string received = 1;
+  string system_parameters = 2;
+  string access_parameters = 3;
+  string extended_system_parameters = 4;
+  string cdma_channel_list = 5;
+  string neighbor_list = 6;
+  string extended_neighbor_list = 7;
+}
+
+message PagingStats {
+  uint64 crc_valid = 1;
+  uint64 crc_failed = 2;
+  map<string, uint64> messages = 3;
+  uint64 pages_for_me = 4;
+  map<string, uint64> undecodable = 5;
+}
+
+message PrlVerdictResult {
+  bool permitted = 1;
+  PrlVerdictReason reason = 2;
+  optional uint32 record = 3;
+  optional uint32 geo = 4;
+  optional uint32 roaming_indicator = 5;
+}
+
+message ChannelResult {
+  string band_class = 1;
+  uint32 channel = 2;
+  double frequency_hz = 3;
+  uint32 acq_index = 4;
+  string pilot = 5;
+  PilotStatus measurement = 6;
+  SyncParameters sync = 7;
+  PrlVerdictResult verdict = 8;
+}
+
+message ScanReport {
+  uint32 prl_id = 1;
+  ScanMode mode = 2;
+  bool running = 3;
+  string result = 4;
+  uint32 total_channels = 5;
+  repeated ChannelResult channels = 6;
+}
+
+message RadioStats {
+  uint64 samples_fed = 1;
+  uint64 rx_overflows = 2;
+  double uptime_secs = 3;
+  double real_time_ratio = 4;
+}
+
+message Diagnostics {
+  MsState state = 1;
+  bool registered = 2;
+  PilotStatus pilot = 3;
+  SyncParameters sync = 4;
+  Overhead overhead = 5;
+  PagingStats paging = 6;
+  ScanReport scan = 7;
+  RadioStats radio = 8;
+}
+
+message ScanChannelSpec {
+  string band_class = 1;
+  uint32 channel = 2;
+}
+
+message StartScanRequest {
+  string prl_path = 1;
+  ScanMode mode = 2;
+  repeated string band_classes = 3;
+  // Dwell on an empty channel, in ms. Zero keeps the server default.
+  uint32 dwell_ms = 4;
+  repeated ScanChannelSpec channels = 5;
+}
+
+message StartScanResponse {
+  uint32 channels = 1;
+  string summary = 2;
+}
+
+message ScanChannelInfo {
+  string band_class = 1;
+  uint32 channel = 2;
+  double frequency_hz = 3;
+  uint32 acq_index = 4;
+}
+
+message ChannelList {
+  string summary = 1;
+  repeated ScanChannelInfo channels = 2;
+}
+
+message PrlVerdictRequest {
+  uint32 sid = 1;
+  uint32 nid = 2;
+}
+
+message PrlVerdictResponse {
+  PrlVerdictResult verdict = 1;
+}
+
+message TxCalibrationTrim {
+  optional double tx_reference_dbm = 1;
+  optional int64 tx_delay_samples = 2;
+  optional bool power_control = 3;
+}
+
+message TxCalibrationState {
+  bool supported = 1;
+  double tx_reference_dbm = 2;
+  int64 tx_delay_samples = 3;
+  bool power_control = 4;
+}
+
+message SetRxGainRequest {
+  double gain_db = 1;
+}
+
+message DumpForwardRequest {
+  string path = 1;
+  double seconds = 2;
+}
+
+message MsEvent {
+  google.protobuf.Timestamp timestamp = 1;
+  string event_type = 2;
+  string detail = 3;
+}
+
+message MsMetrics {
+  double rx_power_dbfs = 2;
+  uint64 sync_messages_decoded = 3;
+  uint64 paging_frames_decoded = 4;
+  uint64 access_probes_sent = 5;
+  double pilot_ec_io_db = 6;
+}
+
+message OriginateRequest {
+  uint32 service_option = 1;
+  string dialed_digits = 2;
+}
+
+message OriginateResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message VoicePcmFrame {
+  repeated sint32 samples = 1;
+  uint64 sequence = 2;
+}
+
+message SendSmsRequest {
+  string destination = 1;
+  string text = 2;
+}
+
+message SendSmsResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message DialDataRequest {
+  string dialed_digits = 1;
+}
+
+message DialDataResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message PageWithSmsRequest {
+  string text = 1;
+}
+
+message PageWithSmsResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message MobileEntry {
+  string esn = 1;
+  string imsi = 2;
+  MobileState state = 3;
+}
+
+message MobileList {
+  repeated MobileEntry mobiles = 1;
+}

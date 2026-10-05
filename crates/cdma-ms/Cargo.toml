@@ -1,0 +1,73 @@
+[package]
+name = "cdma-ms"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "CDMA2000 1x Mobile Station (handset) for driving and testing a 1xBTS."
+
+[features]
+default = ["sim"]
+sim = ["dep:cdma-bsc", "dep:cdma-msc", "dep:cdma-abis"]
+grpc = ["dep:tonic", "dep:prost", "dep:prost-types", "dep:async-stream", "dep:tokio-stream"]
+cli = ["dep:clap", "dep:tracing-subscriber", "dep:ratatui", "dep:crossterm", "dep:unicode-width", "dep:rustix", "dep:rustyline", "grpc", "network", "sim"]
+gui = ["cli", "dep:eframe", "dep:cpal", "dep:crossbeam-channel"]
+sdr = ["uhd-backend", "lime-backend", "bladerf-backend", "soapy-backend"]
+uhd-backend = ["cdma-bts/uhd-backend"]
+lime-backend = ["cdma-bts/lime-backend"]
+bladerf-backend = ["cdma-bts/bladerf-backend"]
+soapy-backend = ["cdma-bts/soapy-backend"]
+network = ["cdma-bts/network-backend"]
+
+[dependencies]
+cdma-bts = { path = "../cdma-bts", default-features = false }
+cdma-common = { path = "../cdma-common" }
+cdma-otasp = { path = "../cdma-otasp" }
+cdma-voice = { path = "../cdma-voice" }
+hound = "3"
+chrono = "0.4"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+num-complex = "0.4"
+cdma-bsc = { path = "../cdma-bsc", features = ["test-utils"], optional = true }
+cdma-msc = { path = "../cdma-msc", optional = true }
+cdma-abis = { path = "../cdma-abis", optional = true }
+parking_lot = "0.12"
+tonic = { version = "0.13", optional = true }
+prost = { version = "0.13", optional = true }
+prost-types = { version = "0.13", optional = true }
+async-stream = { version = "0.3", optional = true }
+tokio-stream = { version = "0.1", features = ["net"], optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+ratatui = { version = "0.29", optional = true }
+crossterm = { version = "0.28", optional = true }
+unicode-width = { version = "0.2", optional = true }
+rustix = { workspace = true, optional = true }
+rustyline = { version = "15", optional = true }
+eframe = { version = "0.36", optional = true }
+cpal = { version = "0.18", optional = true }
+crossbeam-channel = { version = "0.5", optional = true }
+
+[dev-dependencies]
+cdma-ms = { path = ".", features = ["cli"] }
+env_logger = "0.11"
+
+[build-dependencies]
+tonic-build = "0.13"
+
+[lib]
+path = "src/lib/mod.rs"
+
+[[bin]]
+name = "cdma-ms"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[lints]
+workspace = true

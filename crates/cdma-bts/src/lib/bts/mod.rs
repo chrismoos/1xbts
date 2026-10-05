@@ -151,6 +151,7 @@ pub struct Bts {
     config: Config,
     radio: Option<Box<dyn Radio>>,
     runtime: BtsRuntimeSettings,
+    tx_rx_anchor: Arc<timing::TxRxAnchor>,
     evdo: Option<evdo::ResolvedEvdoConfig>,
     injected_rx: Option<rx::InjectedRxReceiver>,
     metrics: MetricsService,
@@ -302,10 +303,15 @@ impl Bts {
             traffic_rx_removals: senders.traffic_rx_removals,
             power_control: senders.power_control,
             rx_measurements: senders.rx_measurements,
+            tx_rx_anchor: Arc::new(timing::TxRxAnchor::new()),
             hrpd_harq_bus: senders.hrpd_harq_bus,
             hrpd_power_control: crate::bts::hrpd::HrpdPowerControlRegistry::default(),
         };
         (bts, handle)
+    }
+
+    pub fn tx_rx_anchor(&self) -> Arc<timing::TxRxAnchor> {
+        self.tx_rx_anchor.clone()
     }
 
     fn configure_radio(&mut self) -> Result<(), Error> {
@@ -314,7 +320,13 @@ impl Bts {
             .as_mut()
             .expect("radio consumed before configure");
         radio.set_tx_bandwidth(self.runtime.tx_bandwidth_hz)?;
-        radio.set_tx_sample_rate(self.runtime.tx_sample_rate_hz)?;
+        let actual_tx_sample_rate = radio.set_tx_sample_rate(self.runtime.tx_sample_rate_hz)?;
+        if actual_tx_sample_rate != self.runtime.tx_sample_rate_hz {
+            warn!(
+                "TX sample rate requested={} actual={}, the radio did not deliver the configured rate exactly",
+                self.runtime.tx_sample_rate_hz, actual_tx_sample_rate
+            );
+        }
         radio.set_tx_lo_offset_hz(self.runtime.tx_lo_offset_hz)?;
         let tx_center_frequency_hz = self
             .evdo
@@ -599,7 +611,7 @@ impl Bts {
             let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, flag);
         }
 
-        let tx_rx_anchor = Arc::new(TxRxAnchor::new());
+        let tx_rx_anchor = self.tx_rx_anchor.clone();
 
         let rx_thread = match (
             self.config.rx.clone(),
@@ -791,7 +803,9 @@ impl Bts {
         } else {
             None
         };
-        fpch.channel.advance_lc_to_chip(chip_cursor);
+        let paging_start_chip = timing::align_to_residue(chip_cursor, state.paging_frame_chips, 0);
+        fpch.prefill_silence((paging_start_chip - chip_cursor) as usize);
+        fpch.channel.advance_lc_to_chip(paging_start_chip);
 
         radio_tx.enable_transmit_at(true, Some(state.hardware_start_tick))?;
         info!(
@@ -1398,6 +1412,9 @@ impl Bts {
             sent_blocks += blocks_per_batch;
         }
 
+        // Stop RX after TX. Reversing the order can hang the RX worker join.
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+
         trace!(
             "bts_sync_fragments: requested={} sent={}",
             state.sync_requested_fragments, state.sync_sent_fragments
@@ -1445,7 +1462,20 @@ impl Bts {
             .map_err(|_| Error::from("BTS TX thread panicked"))?
     }
 
-    /// Run the BTS TX loop for a bounded number of synthesis blocks.
+    pub async fn start_unpaced(self) -> Result<(), Error> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        thread::Builder::new()
+            .name("bts-tx".into())
+            .spawn(move || {
+                realtime::apply_tx(&self.runtime.realtime);
+                let result = self.run_loop(None, false);
+                let _ = tx.send(result);
+            })
+            .map_err(|e| Error::from(format!("failed to spawn TX thread: {}", e)))?;
+        rx.await
+            .map_err(|_| Error::from("BTS TX thread panicked"))?
+    }
+
     pub async fn run_for_blocks(self, blocks: usize) -> Result<(), Error> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         thread::Builder::new()
@@ -1460,7 +1490,10 @@ impl Bts {
             .map_err(|_| Error::from("BTS TX thread panicked"))?
     }
 
-    /// Run a bounded BTS TX loop with hardware-time pacing.
+    pub async fn run_for_blocks_paced(self, blocks: usize) -> Result<(), Error> {
+        self.run_for_blocks_realtime(blocks).await
+    }
+
     pub async fn run_for_blocks_realtime(self, blocks: usize) -> Result<(), Error> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         thread::Builder::new()

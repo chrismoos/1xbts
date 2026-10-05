@@ -1,6 +1,6 @@
 use crate::phy::coding::block_interleaver::{self, BitReversalInterleaver};
 use crate::phy::coding::convolutional::{
-    ViterbiDecoder, get_1_2_k9_encoder, get_1_3_k9_soft_viterbi_decoder,
+    SoftViterbiDecoder, get_1_2_k9_encoder, get_1_3_k9_soft_viterbi_decoder,
 };
 use crate::phy::coding::long_code::LongCodeGenerator;
 use crate::phy::walsh::WalshDecoder;
@@ -17,8 +17,8 @@ use super::reverse_access_decoder;
 use super::{
     AccessChannelProcessor, AcquisitionFftProcessor, DeinterleaverProcessor, LongCodeDescrambler,
     MatchedFilterDespreader, PipelineProcessorShared, PulseMatchedFilterProcessor,
-    ReverseAccessOrthogonalDemodProcessor, ReverseAccessSettings, SoftViterbiDecoderR13Processor,
-    SyncChannelProcessor, TrafficChannelProcessor, Unrepeater, ViterbiDecoderProcessor,
+    ReverseAccessOrthogonalDemodProcessor, ReverseAccessSettings, SoftViterbiDecoderProcessor,
+    SoftViterbiDecoderR13Processor, SyncChannelProcessor, TrafficChannelProcessor, Unrepeater,
     WalshPilotCombiner,
 };
 use super::{HrpdAccessFrameFftConfig, HrpdAccessFrameRakeCorrelator};
@@ -105,8 +105,8 @@ pub fn sync_channel_chain(conv_invert_pair: bool) -> Vec<PipelineProcessorShared
             BitReversalInterleaver::new(block_interleaver::SR1_PARAMS_128),
             2,
         )),
-        Box::new(ViterbiDecoderProcessor::new(
-            ViterbiDecoder::new(get_1_2_k9_encoder()),
+        Box::new(SoftViterbiDecoderProcessor::new(
+            SoftViterbiDecoder::new(get_1_2_k9_encoder()),
             false,
             conv_invert_pair,
         )),
@@ -162,8 +162,8 @@ pub fn paging_channel_chain(
             BitReversalInterleaver::new(interleaver_params),
             1,
         )),
-        Box::new(ViterbiDecoderProcessor::new(
-            ViterbiDecoder::new(get_1_2_k9_encoder()),
+        Box::new(SoftViterbiDecoderProcessor::new(
+            SoftViterbiDecoder::new(get_1_2_k9_encoder()),
             false,
             conv_invert_pair,
         )),

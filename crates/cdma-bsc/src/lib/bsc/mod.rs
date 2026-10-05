@@ -63,7 +63,10 @@ pub use packet::DataCallRequest;
 pub use paging::{PagingEvent, pch_transmit_event_to_paging_event};
 pub use sms::SmsRequest;
 #[cfg(any(test, feature = "test-utils"))]
-pub use test_utils::AutoAssignmentMscClient;
+pub use test_utils::{
+    AddsDeliverRecord, AutoAssignmentMscClient, LoopbackHlrRepository, RecordingMscClient,
+};
+
 pub use traffic_channel::{TrafficPowerOverrideAction, TrafficPowerOverrideRequest};
 pub use traffic_events::TrafficEvent;
 

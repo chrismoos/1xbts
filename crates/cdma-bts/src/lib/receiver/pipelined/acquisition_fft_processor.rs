@@ -9,12 +9,10 @@ use crate::{
 };
 
 use super::{PipelineProcessor, SampleBlock};
+use log::debug;
 
-/// FFT-based PN acquisition/searcher.
-///
-/// Buffers one acquisition window, performs circular correlation in frequency
-/// domain against precomputed conj(FFT(PN)), and tags output blocks with lock
-/// metadata for downstream tracking/despread stages.
+/// Buffers acquisition windows, correlates against conj(FFT(PN)), and tags
+/// output blocks with lock metadata for downstream tracking and despreading.
 pub struct AcquisitionFftProcessor {
     sample_rate: f32,
     oversample: usize,
@@ -40,6 +38,7 @@ pub struct AcquisitionFftProcessor {
     last_snr_db: f32,
     last_best_freq_hz: f32,
     noncoherent: Option<NonCoherentConfig>,
+    search_gate: Option<Box<dyn Fn() -> bool + Send>>,
 }
 
 struct NonCoherentConfig {
@@ -58,6 +57,11 @@ enum AcquisitionStage {
 }
 
 impl AcquisitionFftProcessor {
+    pub fn with_search_gate(mut self, gate: Box<dyn Fn() -> bool + Send>) -> Self {
+        self.search_gate = Some(gate);
+        self
+    }
+
     pub fn new(sample_rate: u32) -> Self {
         let oversample = (sample_rate / 1_228_800).max(1) as usize;
         Self::new_with_window_chips(sample_rate, 32768, oversample)
@@ -99,6 +103,7 @@ impl AcquisitionFftProcessor {
             last_snr_db: -120.0,
             last_best_freq_hz: 0.0,
             noncoherent: None,
+            search_gate: None,
         }
     }
 
@@ -325,26 +330,24 @@ impl AcquisitionFftProcessor {
         }
     }
 
-    /// Process one full FFT window worth of filtered samples.
-    /// Returns a SampleBlock with the same samples plus acquisition tags.
+    /// Returns the full FFT window unchanged, with acquisition tags attached.
     fn process_window(&mut self, samples: Vec<Complex32>, chip_start: usize) -> SampleBlock {
-        let should_search = match self.stage {
-            AcquisitionStage::SearchingCoarse
-            | AcquisitionStage::RefiningFine
-            | AcquisitionStage::Verifying => true,
-            AcquisitionStage::Tracking => {
-                self.blocks_since_tracking_search += 1;
-                self.blocks_since_tracking_search >= self.tracking_search_interval_blocks
-            }
-        };
+        let gate_open = self.search_gate.as_ref().is_none_or(|gate| gate());
+        let should_search = gate_open
+            && match self.stage {
+                AcquisitionStage::SearchingCoarse
+                | AcquisitionStage::RefiningFine
+                | AcquisitionStage::Verifying => true,
+                AcquisitionStage::Tracking => {
+                    self.blocks_since_tracking_search += 1;
+                    self.blocks_since_tracking_search >= self.tracking_search_interval_blocks
+                }
+            };
 
         let (peak_idx, snr_db, best_freq_hz, locked) = if should_search {
             let (peak_idx, peak_val, noise_floor, best_freq_hz) =
                 self.correlate_block_mode(&samples, self.stage);
             let snr_db = 10.0 * (peak_val / noise_floor.max(1e-12)).max(1e-12).log10();
-            if self.last_locked {
-                //println!("new snr: {} -> {}", snr_db, self.snr_threshold_db);
-            }
             let locked = snr_db >= self.snr_threshold_db;
             self.last_snr_db = snr_db;
             self.last_best_freq_hz = best_freq_hz;
@@ -366,7 +369,7 @@ impl AcquisitionFftProcessor {
         };
         if new_epoch {
             self.acq_epoch += 1;
-            eprintln!(
+            debug!(
                 "acquisition_fft_lock epoch={} peak_sample={} peak_chip={} timing_phase={} snr_db={:.2} cfo_hz={:.1} stage={:?}",
                 self.acq_epoch,
                 peak_idx,
@@ -385,7 +388,6 @@ impl AcquisitionFftProcessor {
         if should_search {
             self.stage = match self.stage {
                 AcquisitionStage::SearchingCoarse => {
-                    //println!("searching coarse: locked {:?}", locked);
                     if locked {
                         AcquisitionStage::RefiningFine
                     } else {
@@ -417,7 +419,7 @@ impl AcquisitionFftProcessor {
                 }
                 AcquisitionStage::Tracking => {
                     if locked {
-                        println!("we are now tracking");
+                        debug!("we are now tracking");
                         AcquisitionStage::Tracking
                     } else {
                         AcquisitionStage::SearchingCoarse

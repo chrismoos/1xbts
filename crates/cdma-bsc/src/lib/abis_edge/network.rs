@@ -248,13 +248,18 @@ impl NetworkBtsControlClient {
             }
         });
 
-        let mut client = Self::from_transport(client_sender, client_events, config);
-        client.local_bearer = Some(LocalBearerClient {
-            controller: controller.clone(),
-            received_frames: StdMutex::new(VecDeque::new()),
-        });
+        let mut client = Self::from_transport(client_sender, client_events, config)
+            .with_local_bearer(controller.clone());
         client.local_controller = Some(controller);
         client
+    }
+
+    pub fn with_local_bearer(mut self, controller: Arc<TrafficResourceService>) -> Self {
+        self.local_bearer = Some(LocalBearerClient {
+            controller,
+            received_frames: StdMutex::new(VecDeque::new()),
+        });
+        self
     }
 
     /// When running in-process, send an ECAM via PchMessageTransfer to commit

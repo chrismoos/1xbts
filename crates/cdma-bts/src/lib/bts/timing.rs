@@ -301,8 +301,8 @@ pub(super) fn frame_boundaries(state: &TxLoopState, block_chip: u64) -> FrameBou
     FrameBoundaries {
         sync_frame_boundary: block_chip >= state.pilot_offset_chips
             && (block_chip - state.pilot_offset_chips) % state.sync_frame_chips == 0,
-        paging_frame_boundary: block_chip >= state.pilot_offset_chips
-            && (block_chip - state.pilot_offset_chips) % state.paging_frame_chips == 0,
+        // Paging frames align to zero-offset pilot time (C.S0002-E §3.1.3.4.1).
+        paging_frame_boundary: block_chip % state.paging_frame_chips == 0,
         paging_enabled: block_chip >= state.paging_start_enable_chip,
     }
 }

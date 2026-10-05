@@ -27,6 +27,35 @@ mod msg_encoding {
     pub const GSM_DCS: u8 = 0x0A;
 }
 
+/// Transport Layer SMS_MSG_TYPE for a point-to-point message (C.S0015-B §3.4.1).
+const SMS_MSG_TYPE_POINT_TO_POINT: u8 = 0x00;
+
+/// Transport Layer PARAMETER_ID values (C.S0015-B §3.4.3).
+mod parameter_id {
+    pub const TELESERVICE_IDENTIFIER: u8 = 0x00;
+    pub const ORIGINATING_ADDRESS: u8 = 0x02;
+    pub const DESTINATION_ADDRESS: u8 = 0x04;
+    /// Bearer Reply Option (C.S0015-B §3.4.3.5).
+    pub const BEARER_REPLY_OPTION: u8 = 0x06;
+    pub const BEARER_DATA: u8 = 0x08;
+}
+
+/// Bearer Data SUBPARAMETER_ID values (C.S0015-B §4.5).
+mod subparameter_id {
+    pub const MESSAGE_IDENTIFIER: u8 = 0x00;
+    pub const USER_DATA: u8 = 0x01;
+}
+
+/// Teleservice Identifier PARAMETER_LEN, one 16-bit IDENTIFIER.
+const TELESERVICE_IDENTIFIER_LEN: u8 = 2;
+/// Message Identifier SUBPARAM_LEN: MESSAGE_TYPE(4) MESSAGE_ID(16)
+/// HEADER_IND(1) RESERVED(3).
+const MESSAGE_IDENTIFIER_LEN: u8 = 3;
+
+/// Bearer Data MESSAGE_TYPE values (C.S0015-B §4.5.1).
+const MESSAGE_TYPE_DELIVER: u8 = 0x01;
+const MESSAGE_TYPE_SUBMIT: u8 = 0x02;
+
 /// Bearer-data User Data payload for the MT SMS encoder.
 #[derive(Debug, Clone)]
 pub enum UserData {
@@ -59,24 +88,82 @@ pub fn encode_sms_deliver_typed(
     user_data: &UserData,
     message_id: u16,
 ) -> Vec<u8> {
-    let mut buf = Vec::new();
+    let mut buf = vec![SMS_MSG_TYPE_POINT_TO_POINT];
+    encode_teleservice_identifier(&mut buf, teleservice_id);
+    encode_address(
+        &mut buf,
+        originating_number,
+        parameter_id::ORIGINATING_ADDRESS,
+    );
+    encode_bearer_data(&mut buf, user_data, message_id, MESSAGE_TYPE_DELIVER);
+    buf
+}
 
-    // Transport Layer MSG_TYPE = 0x00 (point-to-point)
-    buf.push(0x00);
+const BEARER_REPLY_OPTION_LENGTH: u8 = 1;
+const BEARER_REPLY_SEQUENCE_MASK: u8 = 0x3f;
+const BEARER_REPLY_SEQUENCE_SHIFT: u8 = 2;
+const MO_REPLY_SEQUENCE: u8 = 0;
 
-    // Teleservice Identifier parameter (tag=0x00)
-    buf.push(0x00); // tag
-    buf.push(0x02); // len
-    buf.push((teleservice_id >> 8) as u8);
-    buf.push(teleservice_id as u8);
+/// Encode a mobile-originated SMS Submit as C.S0015-B Transport Layer bytes
+/// (teleservice WMT, 7-bit ASCII). These bytes are the CHARi octets carried in
+/// a reverse Data Burst Message (BURST_TYPE = SMS).
+pub fn encode_mo_sms_submit(destination_number: &str, text: &str, message_id: u16) -> Vec<u8> {
+    encode_mo_sms_submit_with_reply(
+        destination_number,
+        TELESERVICE_WMT,
+        &UserData::Ascii7(text.to_string()),
+        message_id,
+        Some(MO_REPLY_SEQUENCE),
+    )
+}
 
-    // Originating Address parameter (tag=0x02)
-    encode_originating_address(&mut buf, originating_number);
+pub fn encode_mo_sms_submit_typed(
+    destination_number: &str,
+    teleservice_id: u16,
+    user_data: &UserData,
+    message_id: u16,
+) -> Vec<u8> {
+    encode_mo_sms_submit_with_reply(
+        destination_number,
+        teleservice_id,
+        user_data,
+        message_id,
+        None,
+    )
+}
 
-    // Bearer Data parameter (tag=0x08)
-    encode_bearer_data(&mut buf, user_data, message_id);
+fn encode_mo_sms_submit_with_reply(
+    destination_number: &str,
+    teleservice_id: u16,
+    user_data: &UserData,
+    message_id: u16,
+    reply_seq: Option<u8>,
+) -> Vec<u8> {
+    let mut buf = vec![SMS_MSG_TYPE_POINT_TO_POINT];
+    encode_teleservice_identifier(&mut buf, teleservice_id);
+    encode_address(
+        &mut buf,
+        destination_number,
+        parameter_id::DESTINATION_ADDRESS,
+    );
+
+    if let Some(reply_seq) = reply_seq {
+        buf.extend_from_slice(&[
+            parameter_id::BEARER_REPLY_OPTION,
+            BEARER_REPLY_OPTION_LENGTH,
+            (reply_seq & BEARER_REPLY_SEQUENCE_MASK) << BEARER_REPLY_SEQUENCE_SHIFT,
+        ]);
+    }
+
+    encode_bearer_data(&mut buf, user_data, message_id, MESSAGE_TYPE_SUBMIT);
 
     buf
+}
+
+fn encode_teleservice_identifier(buf: &mut Vec<u8>, teleservice_id: u16) {
+    buf.push(parameter_id::TELESERVICE_IDENTIFIER);
+    buf.push(TELESERVICE_IDENTIFIER_LEN);
+    buf.extend_from_slice(&teleservice_id.to_be_bytes());
 }
 
 fn char_to_dtmf(ch: char) -> Option<u8> {
@@ -97,7 +184,7 @@ fn char_to_dtmf(ch: char) -> Option<u8> {
     }
 }
 
-fn encode_originating_address(buf: &mut Vec<u8>, number: &str) {
+fn encode_address(buf: &mut Vec<u8>, number: &str, tag: u8) {
     let mut bs = Bitstream::new();
     if number.chars().all(|ch| char_to_dtmf(ch).is_some()) {
         // DIGIT_MODE=0, NUMBER_MODE=0, NUM_FIELDS, then 4-bit DTMF digits.
@@ -134,27 +221,24 @@ fn encode_originating_address(buf: &mut Vec<u8>, number: &str) {
     }
 
     let bytes = bitstream_to_packed_bytes(&bs);
-    buf.push(0x02); // tag = Originating Address
-    buf.push(bytes.len() as u8); // len
+    buf.push(tag);
+    buf.push(bytes.len() as u8);
     buf.extend_from_slice(&bytes);
 }
 
-fn encode_bearer_data(buf: &mut Vec<u8>, user_data: &UserData, message_id: u16) {
+fn encode_bearer_data(buf: &mut Vec<u8>, user_data: &UserData, message_id: u16, message_type: u8) {
     let mut bearer = Vec::new();
 
-    // Message Identifier sub-parameter (tag=0x00)
-    bearer.push(0x00); // sub-tag
-    bearer.push(0x03); // len = 3 bytes
-    // MESSAGE_TYPE(4) = 0x1 (deliver), MESSAGE_ID(16), HEADER_IND(1)=0, RESERVED(3)=0
+    bearer.push(subparameter_id::MESSAGE_IDENTIFIER);
+    bearer.push(MESSAGE_IDENTIFIER_LEN);
     let mut bs = Bitstream::new();
-    bs.write_u8(0x01, 4); // MESSAGE_TYPE = deliver
+    bs.write_u8(message_type, 4);
     bs.write_u32(message_id as u32, 16);
     bs.write_u8(0, 1); // HEADER_IND = 0
     bs.write_u8(0, 3); // reserved
     let id_bytes = bitstream_to_packed_bytes(&bs);
     bearer.extend_from_slice(&id_bytes);
 
-    // User Data sub-parameter (tag=0x01)
     let mut ud = Bitstream::new();
     match user_data {
         UserData::Ascii7(text) => {
@@ -177,13 +261,11 @@ fn encode_bearer_data(buf: &mut Vec<u8>, user_data: &UserData, message_id: u16) 
         ud.write_u8(0, 8 - remainder);
     }
     let ud_bytes = bitstream_to_packed_bytes(&ud);
-    bearer.push(0x01); // sub-tag = User Data
+    bearer.push(subparameter_id::USER_DATA);
     bearer.push(ud_bytes.len() as u8);
     bearer.extend_from_slice(&ud_bytes);
 
-    // No Bearer Reply Option (MVP: unconfirmed delivery)
-
-    buf.push(0x08); // tag = Bearer Data
+    buf.push(parameter_id::BEARER_DATA);
     buf.push(bearer.len() as u8);
     buf.extend_from_slice(&bearer);
 }
@@ -1176,9 +1258,12 @@ mod tests {
             addr_bs.write_u8(0, 8 - rem);
         }
         let addr_bytes = bitstream_to_packed_bytes(&addr_bs);
-        payload.push(0x04); // tag
+        payload.push(0x04);
         payload.push(addr_bytes.len() as u8);
         payload.extend_from_slice(&addr_bytes);
+
+        // Bearer Reply Option (tag=0x06, len=1, REPLY_SEQ=0)
+        payload.extend_from_slice(&[0x06, 0x01, 0x00]);
 
         // Bearer Data (tag=0x08)
         let mut bearer = Vec::new();
@@ -1218,9 +1303,10 @@ mod tests {
         let decoded = decode_mo_sms(&payload).expect("should decode");
         assert_eq!(decoded.teleservice_id, 0x1002);
         assert_eq!(decoded.destination_number, "5559876");
-        assert_eq!(decoded.message_type, 2); // Submit
+        assert_eq!(decoded.message_type, 2);
         assert_eq!(decoded.message_id, 42);
         assert_eq!(decoded.text, "Hi");
+        assert_eq!(decoded.reply_seq, Some(MO_REPLY_SEQUENCE));
     }
 
     #[test]
@@ -1238,5 +1324,16 @@ mod tests {
         assert_eq!(decoded.message_type, 1); // Deliver
         assert_eq!(decoded.message_id, 7);
         assert_eq!(decoded.text, "Test");
+    }
+
+    #[test]
+    fn test_encode_mo_sms_submit_roundtrips() {
+        let bytes = encode_mo_sms_submit("5559876", "Hi", 42);
+        let decoded = decode_mo_sms(&bytes).expect("should decode");
+        assert_eq!(decoded.teleservice_id, 0x1002);
+        assert_eq!(decoded.destination_number, "5559876");
+        assert_eq!(decoded.message_type, 2);
+        assert_eq!(decoded.message_id, 42);
+        assert_eq!(decoded.text, "Hi");
     }
 }

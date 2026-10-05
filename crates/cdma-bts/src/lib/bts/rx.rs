@@ -2998,7 +2998,10 @@ pub(super) fn run_injected_rx_loop(
                 drain_bts_commands(&mut runtime, &mut commands_rx, &shutdown)?;
                 continue;
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                shutdown.store(true, Ordering::Relaxed);
+                break;
+            }
         };
         let n = msg.samples.len();
         process_rx_message(

@@ -51,6 +51,7 @@ fn resolve_antenna_index(device: &Device, dir_tx: bool, chan: usize, name: &str)
 pub struct LimeRadio {
     device: Arc<Device>,
     channel: usize,
+    rx_channel: usize,
     sample_rate: u64,
     oversample: usize,
     tx_lo_offset_hz: f64,
@@ -168,7 +169,8 @@ impl LimeRadio {
         Ok(LimeRadio {
             device,
             channel,
-            sample_rate: sample_rate_hz as u64,
+            rx_channel: channel,
+            sample_rate: actual_rate.round() as u64,
             oversample,
             tx_lo_offset_hz: 0.0,
             tx_sample_rate_hz: sample_rate_hz as f64,
@@ -237,16 +239,19 @@ impl Radio for LimeRadio {
         Ok(())
     }
 
-    fn set_tx_sample_rate(&mut self, sample_rate: usize) -> Result<(), Error> {
-        // LimeSDR Mini shares sample rate between TX and RX, so this updates
-        // both.  The caller should be aware of this constraint.
+    fn set_tx_sample_rate(&mut self, sample_rate: usize) -> Result<usize, Error> {
+        // Lime shares the TX/RX sample rate. Configure both directions together.
         self.device
             .set_sample_rate(sample_rate as f64, self.oversample)
             .map_err(|e| Error::from(format!("Lime: set sample rate: {}", e)))?;
-        self.sample_rate = sample_rate as u64;
-        self.tx_sample_rate_hz = sample_rate as f64;
+        let actual = self
+            .device
+            .get_sample_rate(true, self.channel)
+            .map_err(|e| Error::from(format!("Lime: get sample rate: {}", e)))?;
+        self.sample_rate = actual.round() as u64;
+        self.tx_sample_rate_hz = actual;
         self.tx_nco_phase_rad = 0.0;
-        Ok(())
+        Ok(self.sample_rate as usize)
     }
 
     fn set_tx_bandwidth(&mut self, bandwidth: usize) -> Result<(), Error> {
@@ -269,7 +274,7 @@ impl Radio for LimeRadio {
         bandwidth_hz: f64,
         gain_db: Option<f64>,
     ) -> Result<(), Error> {
-        // Enable RX channel.
+        self.rx_channel = channel;
         self.device
             .enable_channel(false, channel, true)
             .map_err(|e| Error::from(format!("Lime: enable RX channel: {}", e)))?;
@@ -368,7 +373,9 @@ impl Radio for LimeRadio {
             last_dropped_packets: 0,
             tx_scratch: Vec::with_capacity(self.tx_fifo_size as usize),
             health: TxRadioHealth::default(),
+            channel: self.channel,
         };
+        let rx_channel = self.rx_channel;
         let rx = self.rx_stream.take().map(|s| -> Box<dyn RadioRx> {
             Box::new(LimeRxHalf {
                 _device: device.clone(),
@@ -377,6 +384,7 @@ impl Radio for LimeRadio {
                 shared_clock: shared_clock.clone(),
                 rx_read_count: 0,
                 last_overrun: 0,
+                channel: rx_channel,
             })
         });
         Ok((Box::new(tx), rx))
@@ -402,6 +410,7 @@ struct LimeTxHalf {
     last_dropped_packets: u32,
     tx_scratch: Vec<Complex32>,
     health: TxRadioHealth,
+    channel: usize,
 }
 
 // Safety: LimeTxHalf is only accessed from the TX thread.
@@ -513,11 +522,17 @@ impl RadioTx for LimeTxHalf {
         self.last_dropped_packets = status.dropped_packets;
         Ok(self.health)
     }
-}
 
-// ---------------------------------------------------------------------------
-// RX half
-// ---------------------------------------------------------------------------
+    fn set_tx_frequency_hz(&mut self, frequency_hz: f64) -> Result<(), Error> {
+        let rf_freq = frequency_hz + self.tx_lo_offset_hz;
+        self._device
+            .set_lo_frequency(true, self.channel, rf_freq)
+            .map_err(|e| Error::from(format!("Lime: set TX freq: {}", e)))?;
+        self._device
+            .calibrate(true, self.channel, self.sample_rate as f64)
+            .map_err(|e| Error::from(format!("Lime: calibrate TX after freq change: {}", e)))
+    }
+}
 
 struct LimeRxHalf {
     _device: Arc<Device>,
@@ -527,8 +542,8 @@ struct LimeRxHalf {
     shared_clock: Arc<AtomicU64>,
     /// Counter for periodic stream status logging.
     rx_read_count: u64,
-    /// Last reported overrun count.
     last_overrun: u32,
+    channel: usize,
 }
 
 // Safety: LimeRxHalf is only accessed from the RX thread.
@@ -619,5 +634,17 @@ impl RadioRx for LimeRxHalf {
             .stop()
             .map_err(|e| Error::from(format!("Lime: RX stream stop: {}", e)))?;
         Ok(())
+    }
+
+    fn set_rx_frequency(&mut self, frequency_hz: f64) -> Result<(), Error> {
+        self._device
+            .set_lo_frequency(false, self.channel, frequency_hz)
+            .map_err(|e| Error::from(format!("Lime: set RX LO: {}", e)))
+    }
+
+    fn set_rx_gain(&mut self, gain_db: f64) -> Result<(), Error> {
+        self._device
+            .set_gain_db(false, self.channel, gain_db.max(0.0) as u32)
+            .map_err(|e| Error::from(format!("Lime: set RX gain: {}", e)))
     }
 }

@@ -15,12 +15,14 @@ members = [
     "crates/cdma-hlr",
     "crates/cdma-ios",
     "crates/cdma-modem",
+    "crates/cdma-ms",
     "crates/cdma-msc",
     "crates/cdma-nib",
     "crates/cdma-otasp",
     "crates/cdma-packet",
     "crates/cdma-pcf",
     "crates/cdma-pdsn",
+    "crates/cdma-radiod",
     "crates/cdma-smsc",
     "crates/cdma-voice",
     "crates/edge-resolver",
@@ -38,6 +40,10 @@ members = [
     "external/uhd",
     "external/uhd-sys",
 ]
+
+[workspace.dependencies]
+rustix = { version = "0.38.44", features = ["pipe", "stdio", "termios"] }
+socket2 = "0.6.3"
 
 [workspace.package]
 license = "Apache-2.0"

@@ -19,7 +19,8 @@ use super::{Radio, RadioRx, RadioTx, RxReadResult, TxRadioHealth};
 /// hardware condition reported through RX metadata.
 const META_STATUS_RX_FAULT: u32 = bladerf::meta::STATUS_OVERRUN;
 
-/// Default number of stream buffers.
+const CONTIGUOUS_TIMESTAMP_TOLERANCE_TICKS: u64 = 2;
+
 const DEFAULT_NUM_BUFFERS: u32 = 16;
 
 /// Default buffer size in samples.
@@ -197,7 +198,7 @@ impl Radio for BladeRfRadio {
         Ok(())
     }
 
-    fn set_tx_sample_rate(&mut self, sample_rate: usize) -> Result<(), Error> {
+    fn set_tx_sample_rate(&mut self, sample_rate: usize) -> Result<usize, Error> {
         let actual = self
             .device
             .set_sample_rate(tx_channel(self.channel), sample_rate as u32)
@@ -205,7 +206,7 @@ impl Radio for BladeRfRadio {
         self.sample_rate = actual;
         self.tx_sample_rate_hz = actual as f64;
         self.tx_nco_phase_rad = 0.0;
-        Ok(())
+        Ok(actual as usize)
     }
 
     fn set_tx_bandwidth(&mut self, bandwidth: usize) -> Result<(), Error> {
@@ -329,7 +330,7 @@ impl Radio for BladeRfRadio {
             shared_clock: shared_clock.clone(),
             stream_timeout_ms: self.stream_timeout_ms,
             burst_active: false,
-            module_enabled: true,
+            next_timestamp: None,
             tx_scratch: Vec::with_capacity(self.buffer_size as usize),
             sc16_scratch: Vec::with_capacity(self.buffer_size as usize),
             health: TxRadioHealth::default(),
@@ -349,6 +350,7 @@ impl Radio for BladeRfRadio {
                 sample_rate: self.sample_rate,
                 shared_clock: shared_clock.clone(),
                 module_enabled: true,
+                sc16_scratch: Vec::with_capacity(self.buffer_size as usize),
             }) as Box<dyn RadioRx>)
         } else {
             None
@@ -357,10 +359,6 @@ impl Radio for BladeRfRadio {
         Ok((Box::new(tx), rx))
     }
 }
-
-// ---------------------------------------------------------------------------
-// TX half
-// ---------------------------------------------------------------------------
 
 struct BladeRfTxHalf {
     _device: Arc<Device>,
@@ -373,7 +371,7 @@ struct BladeRfTxHalf {
     shared_clock: Arc<AtomicU64>,
     stream_timeout_ms: u32,
     burst_active: bool,
-    module_enabled: bool,
+    next_timestamp: Option<u64>,
     tx_scratch: Vec<Complex32>,
     sc16_scratch: Vec<Sc16Q11>,
     health: TxRadioHealth,
@@ -425,27 +423,38 @@ impl RadioTx for BladeRfTxHalf {
 
         match tick {
             Some(ts) => {
-                let mut meta = if !self.burst_active {
-                    // First send: set the starting timestamp and begin burst.
-                    // Subsequent sends stream continuously without per-buffer
-                    // timestamp updates so the FPGA outputs them sequentially.
-                    self.burst_active = true;
+                let starting_burst = !self.burst_active;
+                let mut meta = if starting_burst {
                     StreamMeta {
                         timestamp: ts,
                         flags: FLAG_TX_BURST_START | FLAG_TX_UPDATE_TIMESTAMP,
                         ..Default::default()
                     }
-                } else {
+                } else if self
+                    .next_timestamp
+                    .is_some_and(|next| next.abs_diff(ts) <= CONTIGUOUS_TIMESTAMP_TOLERANCE_TICKS)
+                {
                     StreamMeta::default()
+                } else {
+                    StreamMeta {
+                        timestamp: ts,
+                        flags: FLAG_TX_UPDATE_TIMESTAMP,
+                        ..Default::default()
+                    }
                 };
                 match self
                     .tx_sync
                     .send(&self.sc16_scratch, Some(&mut meta), self.stream_timeout_ms)
                 {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        self.burst_active = true;
+                        self.next_timestamp = Some(ts.saturating_add(samples.len() as u64));
+                    }
                     Err(e) if e.to_string().contains("in the past") => {
+                        // The next send resyncs its timestamp.
                         self.health.late_packets += 1;
                         warn!("bladeRF: TX late @{}: {}", ts, e);
+                        return Ok(());
                     }
                     Err(e) => {
                         return Err(Error::from(format!("bladeRF: TX send @{}: {}", ts, e)));
@@ -461,7 +470,6 @@ impl RadioTx for BladeRfTxHalf {
                 let mut flags = FLAG_TX_NOW;
                 if !self.burst_active {
                     flags |= FLAG_TX_BURST_START;
-                    self.burst_active = true;
                 }
                 let mut meta = StreamMeta {
                     flags,
@@ -470,6 +478,8 @@ impl RadioTx for BladeRfTxHalf {
                 self.tx_sync
                     .send(&self.sc16_scratch, Some(&mut meta), self.stream_timeout_ms)
                     .map_err(|e| Error::from(format!("bladeRF: TX send: {}", e)))?;
+                self.burst_active = true;
+                self.next_timestamp = None;
                 if meta.status & STATUS_UNDERRUN != 0 {
                     self.health.underflows += 1;
                     warn!("bladeRF: TX underrun detected");
@@ -481,32 +491,23 @@ impl RadioTx for BladeRfTxHalf {
 
     fn enable_transmit(&mut self, enable: bool) -> Result<(), Error> {
         if enable {
-            self.tx_nco_phase_rad = 0.0;
+            if !self.burst_active {
+                self.tx_nco_phase_rad = 0.0;
+            }
+        } else if self.burst_active {
+            // Ending a burst must not disable the TX channel, which destroys the stream.
+            let zero = [Sc16Q11 { i: 0, q: 0 }; 1];
+            let mut meta = StreamMeta {
+                flags: FLAG_TX_BURST_END,
+                ..Default::default()
+            };
+            let result = self
+                .tx_sync
+                .send(&zero, Some(&mut meta), self.stream_timeout_ms)
+                .map_err(|e| Error::from(format!("bladeRF: end TX burst: {}", e)));
             self.burst_active = false;
-            if !self.module_enabled {
-                self._device
-                    .enable_module(tx_channel(self.channel), enable)
-                    .map_err(|e| Error::from(format!("bladeRF: enable TX: {}", e)))?;
-                self.module_enabled = true;
-            }
-        } else {
-            if self.burst_active {
-                let zero = [Sc16Q11 { i: 0, q: 0 }; 1];
-                let mut meta = StreamMeta {
-                    flags: FLAG_TX_BURST_END | FLAG_TX_NOW,
-                    ..Default::default()
-                };
-                let _ = self
-                    .tx_sync
-                    .send(&zero, Some(&mut meta), self.stream_timeout_ms);
-                self.burst_active = false;
-            }
-            if self.module_enabled {
-                self._device
-                    .enable_module(tx_channel(self.channel), false)
-                    .map_err(|e| Error::from(format!("bladeRF: disable TX: {}", e)))?;
-                self.module_enabled = false;
-            }
+            self.next_timestamp = None;
+            result?;
         }
         Ok(())
     }
@@ -518,6 +519,13 @@ impl RadioTx for BladeRfTxHalf {
     fn tx_health(&mut self) -> Result<TxRadioHealth, Error> {
         Ok(self.health)
     }
+
+    fn set_tx_frequency_hz(&mut self, frequency_hz: f64) -> Result<(), Error> {
+        let rf_freq = (frequency_hz + self.tx_lo_offset_hz) as u64;
+        self._device
+            .set_frequency(tx_channel(self.channel), rf_freq)
+            .map_err(|e| Error::from(format!("bladeRF: set TX freq: {}", e)))
+    }
 }
 
 impl Drop for BladeRfTxHalf {
@@ -525,7 +533,7 @@ impl Drop for BladeRfTxHalf {
         if self.burst_active {
             let zero = [Sc16Q11 { i: 0, q: 0 }; 1];
             let mut meta = StreamMeta {
-                flags: FLAG_TX_BURST_END | FLAG_TX_NOW,
+                flags: FLAG_TX_BURST_END,
                 ..Default::default()
             };
             let _ = self
@@ -536,10 +544,6 @@ impl Drop for BladeRfTxHalf {
     }
 }
 
-// ---------------------------------------------------------------------------
-// RX half
-// ---------------------------------------------------------------------------
-
 struct BladeRfRxHalf {
     _device: Arc<Device>,
     rx_sync: RxSync,
@@ -547,6 +551,7 @@ struct BladeRfRxHalf {
     sample_rate: u32,
     shared_clock: Arc<AtomicU64>,
     module_enabled: bool,
+    sc16_scratch: Vec<Sc16Q11>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -588,16 +593,19 @@ impl RadioRx for BladeRfRxHalf {
     fn rx_read(&mut self, buf: &mut [Complex32], timeout_us: i64) -> Result<RxReadResult, Error> {
         let timeout_ms = (timeout_us / 1000).max(1) as u32;
 
-        let mut sc16_buf = vec![Sc16Q11::default(); buf.len()];
+        self.sc16_scratch.resize(buf.len(), Sc16Q11::default());
         let mut meta = StreamMeta {
             flags: FLAG_RX_NOW,
             ..Default::default()
         };
 
-        match self.rx_sync.recv(&mut sc16_buf, &mut meta, timeout_ms) {
+        match self
+            .rx_sync
+            .recv(&mut self.sc16_scratch, &mut meta, timeout_ms)
+        {
             Ok(n) => {
                 for i in 0..n.min(buf.len()) {
-                    buf[i] = sc16_buf[i].to_complex32();
+                    buf[i] = self.sc16_scratch[i].to_complex32();
                 }
 
                 let end_ts = meta.timestamp + n as u64;
@@ -641,6 +649,22 @@ impl RadioRx for BladeRfRxHalf {
             self.module_enabled = false;
         }
         Ok(())
+    }
+
+    fn set_rx_frequency(&mut self, frequency_hz: f64) -> Result<(), Error> {
+        self._device
+            .set_frequency(rx_channel(self.channel), frequency_hz as u64)
+            .map_err(|e| Error::from(format!("bladeRF: set RX freq: {}", e)))
+    }
+
+    fn set_rx_gain(&mut self, gain_db: f64) -> Result<(), Error> {
+        let rx_ch = rx_channel(self.channel);
+        self._device
+            .set_gain_mode(rx_ch, bladerf::gain_mode::MGC)
+            .map_err(|e| Error::from(format!("bladeRF: set RX gain mode: {}", e)))?;
+        self._device
+            .set_gain(rx_ch, gain_db as i32)
+            .map_err(|e| Error::from(format!("bladeRF: set RX gain: {}", e)))
     }
 }
 

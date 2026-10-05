@@ -37,6 +37,13 @@ pub struct RadioPipeHandle {
 
 impl RadioPipe {
     pub fn new(tx_buffer_depth: usize) -> (RadioPipe, RadioPipeHandle) {
+        Self::with_clock(tx_buffer_depth, Instant::now())
+    }
+
+    pub fn with_clock(
+        tx_buffer_depth: usize,
+        clock_start: Instant,
+    ) -> (RadioPipe, RadioPipeHandle) {
         let (tx_out_tx, tx_out_rx) = mpsc::sync_channel(tx_buffer_depth);
         let (injected_tx, injected_rx) = rx::injected_rx_channel(32);
         let tx_sample_rate_hz = Arc::new(AtomicUsize::new(TX_SAMPLE_RATE));
@@ -45,7 +52,7 @@ impl RadioPipe {
             tx_output: tx_out_tx,
             injected_rx: Some(injected_rx),
             tx_sample_rate_hz: tx_sample_rate_hz.clone(),
-            clock_start: Instant::now(),
+            clock_start,
         };
 
         let handle = RadioPipeHandle {
@@ -72,9 +79,9 @@ impl Radio for RadioPipe {
     fn set_tx_frequency(&mut self, _: usize) -> Result<(), Error> {
         Ok(())
     }
-    fn set_tx_sample_rate(&mut self, sample_rate: usize) -> Result<(), Error> {
+    fn set_tx_sample_rate(&mut self, sample_rate: usize) -> Result<usize, Error> {
         self.tx_sample_rate_hz.store(sample_rate, Ordering::Relaxed);
-        Ok(())
+        Ok(sample_rate)
     }
     fn set_tx_bandwidth(&mut self, _: usize) -> Result<(), Error> {
         Ok(())

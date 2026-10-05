@@ -18,17 +18,14 @@ use std::path::Path;
 
 use serde_json::Value;
 
-/// Read `path` as JSON. If `<stem>.local.json` (or, when the input ends in
-/// `.example.json`, `<stem-without-example>.local.json`) exists alongside it,
-/// deep-merge that file on top before returning.
 pub fn load_json_with_local_override(path: &Path) -> io::Result<Value> {
     let raw = fs::read_to_string(path)?;
-    let mut base: Value = serde_json::from_str(&raw).map_err(io::Error::other)?;
+    let mut base = parse_json(path, &raw)?;
 
     if let Some(local_path) = local_override_path(path) {
         if local_path.exists() {
             let local_raw = fs::read_to_string(&local_path)?;
-            let overlay: Value = serde_json::from_str(&local_raw).map_err(io::Error::other)?;
+            let overlay = parse_json(&local_path, &local_raw)?;
             merge_json(&mut base, overlay);
         }
     }
@@ -36,8 +33,11 @@ pub fn load_json_with_local_override(path: &Path) -> io::Result<Value> {
     Ok(base)
 }
 
-/// Compute the `<name>.local.json` sibling path for a given config path.
-/// Returns `None` if `path` already ends in `.local.json` (avoid recursion).
+fn parse_json(path: &Path, raw: &str) -> io::Result<Value> {
+    serde_json::from_str(raw)
+        .map_err(|error| io::Error::other(format!("{}: {error}", path.display())))
+}
+
 fn local_override_path(path: &Path) -> Option<std::path::PathBuf> {
     let file_name = path.file_name()?.to_str()?;
     if file_name.ends_with(".local.json") {
@@ -135,5 +135,11 @@ mod tests {
     #[test]
     fn local_override_path_skips_local_json() {
         assert_eq!(local_override_path(Path::new("/x/bts.local.json")), None);
+    }
+
+    #[test]
+    fn parse_error_names_the_config_file() {
+        let error = parse_json(Path::new("config/ms.local.json"), "").unwrap_err();
+        assert!(error.to_string().starts_with("config/ms.local.json: EOF"));
     }
 }

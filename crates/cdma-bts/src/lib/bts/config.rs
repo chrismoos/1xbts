@@ -47,6 +47,14 @@ fn default_bladerf_rx_antenna() -> Option<String> {
     Some("B_BALANCED".to_string())
 }
 
+fn default_network_samples_per_packet() -> usize {
+    crate::sdr::network::wire::DEFAULT_SAMPLES_PER_PACKET
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReverseRxTarget {
@@ -56,13 +64,6 @@ pub enum ReverseRxTarget {
     Composite,
 }
 
-/// Radio backend selection plus per-backend hardware parameters used by the
-/// BTS to construct an SDR transmit/receive pipeline at startup.
-///
-/// Variants are tagged by `kind` in JSON (`"file_output"`, `"noop"`,
-/// `"soapy"`, `"uhd"`, `"lime"`). Each backend variant carries the device
-/// addressing fields, RF parameters, and stream tuning knobs needed by the
-/// corresponding `cdma_bts::sdr` implementation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum RadioConfig {
@@ -95,6 +96,8 @@ pub enum RadioConfig {
         rx_power_adj: f32,
         #[serde(default)]
         rx_sample_delay: i64,
+        #[serde(default)]
+        tx_sample_delay: Option<i64>,
         #[serde(default = "default_rx_batch_pcgs")]
         rx_batch_pcgs: usize,
         #[serde(default)]
@@ -106,6 +109,12 @@ pub enum RadioConfig {
         antenna: String,
         #[serde(default = "default_tx_gain_db")]
         tx_gain_db: f64,
+        /// UHD TX gain where the unit-RMS connector power estimate applies.
+        #[serde(default)]
+        tx_max_gain_db: Option<f64>,
+        /// Approximate unit-RMS connector power at `tx_max_gain_db`.
+        #[serde(default)]
+        tx_max_gain_power_estimate_dbm: Option<f32>,
         #[serde(default = "default_uhd_master_clock_rate")]
         master_clock_rate: u64,
         #[serde(default)]
@@ -118,12 +127,19 @@ pub enum RadioConfig {
         rx_gain_db: Option<f64>,
         #[serde(default)]
         rx_reference_dbm: Option<f64>,
+        #[serde(default)]
+        rx_max_gain_db: Option<f64>,
+        /// Approximate input power at 0 dBFS when RX gain is `rx_max_gain_db`.
+        #[serde(default)]
+        rx_max_gain_reference_dbm: Option<f64>,
         /// Radio-specific dBFS calibration offset applied to reverse-link raw
         /// power-control thresholds. Defaults to 0 dBFS.
         #[serde(default)]
         rx_power_adj: f32,
         #[serde(default)]
         rx_sample_delay: i64,
+        #[serde(default)]
+        tx_sample_delay: Option<i64>,
         #[serde(default = "default_rx_batch_pcgs")]
         rx_batch_pcgs: usize,
         #[serde(default)]
@@ -148,6 +164,8 @@ pub enum RadioConfig {
         rx_power_adj: f32,
         #[serde(default)]
         rx_sample_delay: i64,
+        #[serde(default)]
+        tx_sample_delay: Option<i64>,
         #[serde(default = "default_rx_batch_pcgs")]
         rx_batch_pcgs: usize,
         #[serde(default)]
@@ -191,6 +209,8 @@ pub enum RadioConfig {
         rx_power_adj: f32,
         #[serde(default)]
         rx_sample_delay: i64,
+        #[serde(default)]
+        tx_sample_delay: Option<i64>,
         #[serde(default = "default_rx_batch_pcgs")]
         rx_batch_pcgs: usize,
         #[serde(default)]
@@ -206,6 +226,31 @@ pub enum RadioConfig {
         #[serde(default)]
         stream_timeout_ms: Option<u32>,
     },
+    Network {
+        addr: String,
+        #[serde(default)]
+        data_host: Option<String>,
+        #[serde(default = "default_network_samples_per_packet")]
+        samples_per_packet: usize,
+        #[serde(default)]
+        tx_transport: crate::sdr::network::wire::TxTransport,
+        #[serde(default = "default_true")]
+        rx_enabled: bool,
+        #[serde(default)]
+        rx_antenna: Option<String>,
+        #[serde(default)]
+        rx_gain_db: Option<f64>,
+        #[serde(default)]
+        rx_power_adj: f32,
+        #[serde(default)]
+        rx_sample_delay: i64,
+        #[serde(default)]
+        tx_sample_delay: Option<i64>,
+        #[serde(default = "default_rx_batch_pcgs")]
+        rx_batch_pcgs: usize,
+        #[serde(default)]
+        traffic_rx_continuity: bool,
+    },
 }
 
 impl Default for RadioConfig {
@@ -218,6 +263,54 @@ impl Default for RadioConfig {
 }
 
 impl RadioConfig {
+    pub fn has_rx(&self) -> bool {
+        match self {
+            Self::Soapy { .. }
+            | Self::Uhd { .. }
+            | Self::Lime { .. }
+            | Self::BladeRf { .. }
+            | Self::Noop => true,
+            Self::Network { rx_enabled, .. } => *rx_enabled,
+            Self::FileOutput { .. } => false,
+        }
+    }
+
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::FileOutput { .. } => "file_output",
+            Self::Noop => "noop",
+            Self::Soapy { .. } => "soapy",
+            Self::Uhd { .. } => "uhd",
+            Self::Lime { .. } => "lime",
+            Self::BladeRf { .. } => "blade_rf",
+            Self::Network { .. } => "network",
+        }
+    }
+
+    pub fn rx_antenna_or_default(&self) -> String {
+        match self {
+            Self::Soapy { rx_antenna, .. } | Self::Lime { rx_antenna, .. } => {
+                rx_antenna.clone().unwrap_or_else(|| "LNAW".to_string())
+            }
+            Self::Uhd { rx_antenna, .. } => rx_antenna.clone().unwrap_or_else(|| "RX2".to_string()),
+            Self::BladeRf { rx_antenna, .. } | Self::Network { rx_antenna, .. } => {
+                rx_antenna.clone().unwrap_or_default()
+            }
+            _ => String::new(),
+        }
+    }
+
+    pub fn rx_gain_db_f64(&self) -> Option<f64> {
+        match self {
+            Self::Soapy { rx_gain_db, .. }
+            | Self::Uhd { rx_gain_db, .. }
+            | Self::Network { rx_gain_db, .. } => *rx_gain_db,
+            Self::Lime { rx_gain_db, .. } => rx_gain_db.map(|g| g as f64),
+            Self::BladeRf { rx_gain_db, .. } => rx_gain_db.map(|g| g as f64),
+            _ => None,
+        }
+    }
+
     /// Inherent RX pipeline delay in samples (0 when unconfigured or for
     /// non-RX variants). Subtracted from the hardware-time → absolute-sample
     /// mapping so the chip number assigned to each received sample matches
@@ -235,20 +328,58 @@ impl RadioConfig {
             }
             | Self::BladeRf {
                 rx_sample_delay, ..
+            }
+            | Self::Network {
+                rx_sample_delay, ..
             } => *rx_sample_delay,
             _ => 0,
         }
     }
 
-    /// Number of PCGs (1536 chips each) per RX read batch. Lower values
-    /// reduce power-control latency jitter at the cost of more USB reads
-    /// per second. Default 2 for non-RX variants.
+    /// Optional MS transmit timing correction at the 4× chip sample rate.
+    pub fn tx_sample_delay(&self) -> Option<i64> {
+        match self {
+            Self::Soapy {
+                tx_sample_delay, ..
+            }
+            | Self::Uhd {
+                tx_sample_delay, ..
+            }
+            | Self::Lime {
+                tx_sample_delay, ..
+            }
+            | Self::BladeRf {
+                tx_sample_delay, ..
+            }
+            | Self::Network {
+                tx_sample_delay, ..
+            } => *tx_sample_delay,
+            _ => None,
+        }
+    }
+
+    pub fn tx_full_scale_power_estimate_dbm(&self) -> Option<f32> {
+        match self {
+            Self::Uhd {
+                tx_gain_db,
+                tx_max_gain_db: Some(max_gain_db),
+                tx_max_gain_power_estimate_dbm: Some(max_power_dbm),
+                ..
+            } => {
+                let estimate = *max_power_dbm as f64 + tx_gain_db - max_gain_db;
+                estimate.is_finite().then_some(estimate as f32)
+            }
+            _ => None,
+        }
+    }
+
     pub fn rx_batch_pcgs(&self) -> usize {
         match self {
             Self::Soapy { rx_batch_pcgs, .. }
             | Self::Uhd { rx_batch_pcgs, .. }
             | Self::Lime { rx_batch_pcgs, .. }
-            | Self::BladeRf { rx_batch_pcgs, .. } => *rx_batch_pcgs,
+            | Self::BladeRf { rx_batch_pcgs, .. }
+            | Self::Network { rx_batch_pcgs, .. } => *rx_batch_pcgs,
             _ => default_rx_batch_pcgs(),
         }
     }
@@ -273,6 +404,10 @@ impl RadioConfig {
             | Self::BladeRf {
                 traffic_rx_continuity,
                 ..
+            }
+            | Self::Network {
+                traffic_rx_continuity,
+                ..
             } => *traffic_rx_continuity,
             _ => false,
         }
@@ -283,6 +418,15 @@ impl RadioConfig {
     /// ADC). `None` when unconfigured (no calibration data).
     pub fn rx_reference_dbm(&self) -> Option<f64> {
         match self {
+            Self::Uhd {
+                rx_gain_db: Some(gain_db),
+                rx_max_gain_db: Some(max_gain_db),
+                rx_max_gain_reference_dbm: Some(max_reference_dbm),
+                ..
+            } => {
+                let reference_dbm = max_reference_dbm + max_gain_db - gain_db;
+                reference_dbm.is_finite().then_some(reference_dbm)
+            }
             Self::Soapy {
                 rx_reference_dbm, ..
             }
@@ -306,14 +450,12 @@ impl RadioConfig {
             Self::Soapy { rx_power_adj, .. }
             | Self::Uhd { rx_power_adj, .. }
             | Self::Lime { rx_power_adj, .. }
-            | Self::BladeRf { rx_power_adj, .. } => *rx_power_adj,
+            | Self::BladeRf { rx_power_adj, .. }
+            | Self::Network { rx_power_adj, .. } => *rx_power_adj,
             _ => 0.0,
         }
     }
 
-    /// Hardware-time tick rate (ticks per second). UHD uses the configured
-    /// master clock rate; Lime uses the sample rate (timestamps are sample
-    /// counts); everything else uses 1 GHz (nanoseconds).
     pub fn tick_rate(&self, rx_sample_rate_hz: usize) -> u64 {
         match self {
             Self::Uhd {

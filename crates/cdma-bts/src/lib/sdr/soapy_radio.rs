@@ -1,13 +1,20 @@
 use cdma_common::error::Error;
-use log::{debug, info};
+use log::{debug, info, warn};
 use num_complex::Complex32;
 use soapysdr::{Direction, RxStream, TxStream};
 
-use super::{Radio, RadioRx, RadioTx, RxReadResult, TX_SAMPLE_RATE};
+use super::{Radio, RadioRx, RadioTx, RxReadResult, TX_SAMPLE_RATE, TxRadioHealth};
+
+/// `SOAPY_SDR_END_BURST`, which the `soapysdr` crate does not re-export.
+const SOAPY_END_BURST: u32 = 2;
+
+const MAX_TX_STATUS_EVENTS_PER_POLL: usize = 256;
+const TX_WRITE_TIMEOUT_US: i64 = 1_000_000;
 
 pub struct SoapySdrRadio {
     device: soapysdr::Device,
     channel: usize,
+    rx_channel: usize,
     stream: TxStream<num_complex::Complex<f32>>,
     tx_lo_offset_hz: f64,
     tx_sample_rate_hz: f64,
@@ -38,6 +45,7 @@ impl SoapySdrRadio {
         Ok(SoapySdrRadio {
             device,
             channel,
+            rx_channel: channel,
             stream,
             tx_lo_offset_hz: 0.0,
             tx_sample_rate_hz: TX_SAMPLE_RATE as f64,
@@ -99,12 +107,14 @@ impl Radio for SoapySdrRadio {
         Ok(())
     }
 
-    fn set_tx_sample_rate(&mut self, sample_rate: usize) -> Result<(), Error> {
+    fn set_tx_sample_rate(&mut self, sample_rate: usize) -> Result<usize, Error> {
         self.device
             .set_sample_rate(soapysdr::Direction::Tx, self.channel, sample_rate as f64)?;
-        self.tx_sample_rate_hz = sample_rate as f64;
+        self.tx_sample_rate_hz = self
+            .device
+            .sample_rate(soapysdr::Direction::Tx, self.channel)?;
         self.tx_nco_phase_rad = 0.0;
-        Ok(())
+        Ok(self.tx_sample_rate_hz.round() as usize)
     }
 
     fn set_tx_bandwidth(&mut self, bandwidth: usize) -> Result<(), Error> {
@@ -128,6 +138,7 @@ impl Radio for SoapySdrRadio {
         bandwidth_hz: f64,
         gain_db: Option<f64>,
     ) -> Result<(), Error> {
+        self.rx_channel = channel;
         let stream = self.setup_rx_stream(
             channel,
             antenna,
@@ -148,11 +159,16 @@ impl Radio for SoapySdrRadio {
             tx_lo_offset_hz: self.tx_lo_offset_hz,
             tx_sample_rate_hz: self.tx_sample_rate_hz,
             tx_nco_phase_rad: self.tx_nco_phase_rad,
+            channel: self.channel,
+            health: TxRadioHealth::default(),
+            burst_pending: false,
         };
+        let rx_channel = self.rx_channel;
         let rx = self.rx_stream.map(|s| -> Box<dyn RadioRx> {
             Box::new(SoapyRxHalf {
                 device: device.clone(),
                 stream: s,
+                channel: rx_channel,
             })
         });
         Ok((Box::new(tx), rx))
@@ -165,9 +181,60 @@ pub struct SoapyTxHalf {
     tx_lo_offset_hz: f64,
     tx_sample_rate_hz: f64,
     tx_nco_phase_rad: f64,
+    channel: usize,
+    health: TxRadioHealth,
+    burst_pending: bool,
 }
 
 impl SoapyTxHalf {
+    fn finish_transmit(&mut self, tick: Option<u64>) -> Result<(), Error> {
+        let end_result = if std::mem::take(&mut self.burst_pending) {
+            // Some drivers ignore empty END_BURST writes.
+            let silence = [Complex32::new(0.0, 0.0)];
+            self.stream
+                .write_all(&[&silence], None, true, TX_WRITE_TIMEOUT_US)
+        } else {
+            Ok(())
+        };
+        let deactivate_result = self.stream.deactivate(tick.map(|t| t as i64));
+        deactivate_result?;
+        end_result?;
+        Ok(())
+    }
+
+    // Successful writes do not guarantee playback. Late drops arrive through asynchronous status.
+    fn drain_tx_status(&mut self) {
+        for _ in 0..MAX_TX_STATUS_EVENTS_PER_POLL {
+            let mut chan_mask = 0usize;
+            let mut flags = 0i32;
+            let mut time_ns = 0i64;
+            match self
+                .stream
+                .read_status(&mut chan_mask, &mut flags, &mut time_ns, 0)
+            {
+                Ok(_) => {
+                    if flags & (SOAPY_END_BURST as i32) != 0 {
+                        self.health.burst_acks += 1;
+                    }
+                }
+                Err(err) => match err.code {
+                    soapysdr::ErrorCode::Timeout => return,
+                    soapysdr::ErrorCode::TimeError => {
+                        self.health.late_packets += 1;
+                        warn!(
+                            "soapy tx: device discarded a burst scheduled for {time_ns} ns, \
+                             its tick had already passed"
+                        );
+                    }
+                    soapysdr::ErrorCode::Underflow => self.health.underflows += 1,
+                    soapysdr::ErrorCode::Corruption => self.health.sequence_errors += 1,
+                    soapysdr::ErrorCode::Overflow => self.health.dropped_packets += 1,
+                    _ => self.health.unknown_events += 1,
+                },
+            }
+        }
+    }
+
     fn apply_tx_lo_offset(&mut self, samples: &mut [Complex32]) {
         if self.tx_lo_offset_hz == 0.0 || self.tx_sample_rate_hz <= 0.0 {
             return;
@@ -205,11 +272,21 @@ impl RadioTx for SoapyTxHalf {
         self.transmit_at(samples, None)
     }
 
+    fn tx_health(&mut self) -> Result<TxRadioHealth, Error> {
+        self.drain_tx_status();
+        Ok(self.health)
+    }
+
     fn transmit_at(&mut self, samples: &[Complex32], tick: Option<u64>) -> Result<(), Error> {
         let mut samples = samples.to_vec();
         self.apply_tx_lo_offset(&mut samples);
-        self.stream
-            .write_all(&[&samples], tick.map(|t| t as i64), false, 1_000_000)?;
+        self.burst_pending |= !samples.is_empty();
+        self.stream.write_all(
+            &[&samples],
+            tick.map(|t| t as i64),
+            false,
+            TX_WRITE_TIMEOUT_US,
+        )?;
         Ok(())
     }
 
@@ -218,7 +295,7 @@ impl RadioTx for SoapyTxHalf {
             self.tx_nco_phase_rad = 0.0;
             self.stream.activate(None)?;
         } else {
-            self.stream.deactivate(None)?;
+            self.finish_transmit(None)?;
         }
         Ok(())
     }
@@ -228,8 +305,18 @@ impl RadioTx for SoapyTxHalf {
             self.tx_nco_phase_rad = 0.0;
             self.stream.activate(tick.map(|t| t as i64))?;
         } else {
-            self.stream.deactivate(tick.map(|t| t as i64))?;
+            self.finish_transmit(tick)?;
         }
+        Ok(())
+    }
+
+    fn set_tx_frequency_hz(&mut self, frequency_hz: f64) -> Result<(), Error> {
+        self.device.set_frequency(
+            soapysdr::Direction::Tx,
+            self.channel,
+            frequency_hz + self.tx_lo_offset_hz,
+            "",
+        )?;
         Ok(())
     }
 }
@@ -237,6 +324,7 @@ impl RadioTx for SoapyTxHalf {
 pub struct SoapyRxHalf {
     device: std::sync::Arc<soapysdr::Device>,
     stream: RxStream<Complex32>,
+    channel: usize,
 }
 
 impl RadioRx for SoapyRxHalf {
@@ -279,6 +367,17 @@ impl RadioRx for SoapyRxHalf {
 
     fn rx_deactivate(&mut self) -> Result<(), Error> {
         self.stream.deactivate(None)?;
+        Ok(())
+    }
+
+    fn set_rx_frequency(&mut self, frequency_hz: f64) -> Result<(), Error> {
+        self.device
+            .set_frequency(Direction::Rx, self.channel, frequency_hz, "")?;
+        Ok(())
+    }
+
+    fn set_rx_gain(&mut self, gain_db: f64) -> Result<(), Error> {
+        self.device.set_gain(Direction::Rx, self.channel, gain_db)?;
         Ok(())
     }
 }

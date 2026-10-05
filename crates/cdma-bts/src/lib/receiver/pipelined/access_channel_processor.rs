@@ -7,6 +7,11 @@ use crate::receiver::access_pdu::ReverseAccessPdu;
 
 use super::{PipelineProcessor, SampleBlock, chips_per_sample};
 
+/// All-zero information frames in a row that mark a preamble while a message
+/// is being reassembled. One such frame can be message content. Two in a row
+/// is 176 zero bits, which a capsule does not carry.
+const PREAMBLE_RESYNC_FRAMES: usize = 2;
+
 /// Access Channel processor for decoded R-ACH bit streams.
 ///
 /// Expects decoded bits (0.0/1.0 samples) at 96 bits per 20 ms frame.
@@ -21,6 +26,7 @@ pub struct AccessChannelProcessor {
     chips_per_bit: usize,
     access_message_count: usize,
     preamble_frames: usize,
+    zero_frames_in_message: usize,
     near_preamble_logs: usize,
 }
 
@@ -75,6 +81,7 @@ impl AccessChannelProcessor {
             chips_per_bit: 1,
             access_message_count: 0,
             preamble_frames: 0,
+            zero_frames_in_message: 0,
             near_preamble_logs: 0,
         }
     }
@@ -212,7 +219,24 @@ impl PipelineProcessor for AccessChannelProcessor {
                 );
                 self.near_preamble_logs = self.near_preamble_logs.saturating_add(1);
             }
-            if self.reader.is_idle() && info_bits.iter().all(|b| *b == 0) {
+            let all_zero = info_bits.iter().all(|b| *b == 0);
+            if all_zero && !self.reader.is_idle() {
+                self.zero_frames_in_message += 1;
+            } else {
+                self.zero_frames_in_message = 0;
+            }
+            // A run of all-zero frames inside a message is a probe preamble.
+            // The message being reassembled began on noise between probes,
+            // and carrying on would consume the probe's capsule as its body.
+            if self.zero_frames_in_message >= PREAMBLE_RESYNC_FRAMES {
+                debug!(
+                    "access_preamble_resync: chip={} dropping a partial message after {} all-zero frames",
+                    frame_chip, self.zero_frames_in_message
+                );
+                self.reader.reset();
+                self.zero_frames_in_message = 0;
+            }
+            if self.reader.is_idle() && all_zero {
                 self.preamble_frames = self.preamble_frames.saturating_add(1);
                 self.reader.reset();
                 let hex = bits_to_hex(&frame_bits);
@@ -307,6 +331,7 @@ impl PipelineProcessor for AccessChannelProcessor {
         self.bits.clear();
         self.reader.reset();
         self.preamble_frames = 0;
+        self.zero_frames_in_message = 0;
         self.near_preamble_logs = 0;
         Vec::new()
     }

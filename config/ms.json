@@ -1,0 +1,19 @@
+{
+  "identity": {
+    "esn": 305419896,
+    "imsi": "310001234567890",
+    "meid": "A1000012345678"
+  },
+  "channel": {
+    "band_class": "bc1",
+    "cdma_channel": 50
+  },
+  "calibration": {
+    "tx_power_control": true,
+    "relative_access_power": true,
+    "access_initial_backoff_db": 12.0,
+    "tx_reference_dbm": -10,
+    "tx_peak_limit": 0.0625
+  },
+  "grpc_listen": "[::1]:50052"
+}

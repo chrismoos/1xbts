@@ -7,6 +7,7 @@ pub mod ftch_rc3;
 pub mod pilot;
 pub(crate) mod rc12_power_control;
 pub mod rtch;
+pub mod rtch_rc3;
 
 use std::{collections::BTreeMap, collections::VecDeque, sync::Arc};
 

@@ -250,6 +250,15 @@ impl VoiceDecoder {
             Self::Qcelp13k(decoder) => decoder.decode(rate, payload),
         }
     }
+
+    /// Conceal a single lost 20 ms speech frame, keeping the playout cadence.
+    /// Returns `None` for codecs whose wrapper has no erasure path.
+    pub fn decode_erasure(&mut self) -> Option<[i16; SAMPLES_PER_FRAME]> {
+        match self {
+            Self::EvrcA(decoder) => decoder.decode_erasure().ok(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

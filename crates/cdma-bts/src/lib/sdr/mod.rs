@@ -3,6 +3,7 @@ pub mod bladerf_radio;
 pub mod fir;
 #[cfg(feature = "lime-backend")]
 pub mod lime_radio;
+pub mod network;
 pub mod pipe;
 #[cfg(feature = "soapy-backend")]
 pub mod soapy_radio;
@@ -12,6 +13,8 @@ pub mod uhd_radio;
 pub use bladerf_radio::BladeRfRadio;
 #[cfg(feature = "lime-backend")]
 pub use lime_radio::LimeRadio;
+#[cfg(feature = "network-backend")]
+pub use network::{NetworkRadio, NetworkRadioOptions};
 pub use pipe::*;
 #[cfg(feature = "soapy-backend")]
 pub use soapy_radio::SoapySdrRadio;
@@ -19,7 +22,7 @@ pub use soapy_radio::SoapySdrRadio;
 pub use uhd_radio::UhdRadio;
 
 use std::{
-    io::{Seek, Write},
+    io::{BufWriter, Seek, Write},
     thread,
     time::{Duration, Instant},
 };
@@ -33,115 +36,8 @@ use num_complex::Complex32;
 
 use self::fir::{ComplexFir32, PolyphaseComplexFir32};
 
-pub struct RxReadResult {
-    pub samples_read: usize,
-    pub time_ticks: u64,
-    pub overflow: bool,
-}
+pub use cdma_common::radio::{Radio, RadioRx, RadioTx, RxReadResult, TxRadioHealth};
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TxRadioHealth {
-    pub underflows: u64,
-    pub late_packets: u64,
-    pub sequence_errors: u64,
-    pub burst_acks: u64,
-    pub dropped_packets: u64,
-    pub unknown_events: u64,
-}
-
-/// Configuration trait -- used during setup, consumed by split().
-pub trait Radio: Send {
-    fn tick_rate(&self) -> u64;
-    fn set_tx_frequency(&mut self, center_frequency: usize) -> Result<(), Error>;
-    fn set_tx_sample_rate(&mut self, sample_rate: usize) -> Result<(), Error>;
-    fn set_tx_bandwidth(&mut self, bandwidth: usize) -> Result<(), Error>;
-    fn set_tx_lo_offset_hz(&mut self, _offset_hz: i64) -> Result<(), Error> {
-        Ok(())
-    }
-    fn setup_rx(
-        &mut self,
-        _channel: usize,
-        _antenna: &str,
-        _frequency_hz: f64,
-        _sample_rate_hz: f64,
-        _bandwidth_hz: f64,
-        _gain_db: Option<f64>,
-    ) -> Result<(), Error> {
-        Err("RX not supported by this radio".into())
-    }
-    /// Consume this radio and split into TX and RX halves.
-    fn split(self: Box<Self>) -> Result<(Box<dyn RadioTx>, Option<Box<dyn RadioRx>>), Error>;
-}
-
-/// TX half -- owned exclusively by the TX thread.
-///
-/// `transmit` and `transmit_at` accept final SDR-rate complex samples.
-/// Pulse shaping and any multi-carrier composition happen upstream in the
-/// BTS waveform pipeline.
-pub trait RadioTx: Send {
-    fn tick_rate(&self) -> u64;
-    fn get_hardware_time(&self) -> Result<u64, Error>;
-    fn set_hardware_time(&self, _ticks: u64) -> Result<(), Error> {
-        Ok(())
-    }
-    fn transmit(&mut self, samples: &[Complex32]) -> Result<(), Error>;
-    fn prepare_transmit(&mut self, _max_samples: usize) -> Result<(), Error> {
-        Ok(())
-    }
-    fn transmit_at(&mut self, samples: &[Complex32], _tick: Option<u64>) -> Result<(), Error> {
-        self.transmit(samples)
-    }
-    fn enable_transmit(&mut self, enable: bool) -> Result<(), Error>;
-    fn enable_transmit_at(&mut self, enable: bool, _tick: Option<u64>) -> Result<(), Error> {
-        self.enable_transmit(enable)
-    }
-    fn tx_health(&mut self) -> Result<TxRadioHealth, Error> {
-        Ok(TxRadioHealth::default())
-    }
-}
-
-/// RX half -- owned exclusively by the RX thread.
-pub trait RadioRx: Send {
-    fn tick_rate(&self) -> u64;
-    fn get_hardware_time(&self) -> Result<u64, Error>;
-    fn rx_read(&mut self, buf: &mut [Complex32], timeout_us: i64) -> Result<RxReadResult, Error>;
-    fn rx_activate(&mut self, time_ticks: Option<u64>) -> Result<(), Error>;
-    fn rx_deactivate(&mut self) -> Result<(), Error>;
-}
-
-impl RadioTx for Box<dyn RadioTx> {
-    fn tick_rate(&self) -> u64 {
-        (**self).tick_rate()
-    }
-    fn get_hardware_time(&self) -> Result<u64, Error> {
-        (**self).get_hardware_time()
-    }
-    fn set_hardware_time(&self, ticks: u64) -> Result<(), Error> {
-        (**self).set_hardware_time(ticks)
-    }
-    fn transmit(&mut self, samples: &[Complex32]) -> Result<(), Error> {
-        (**self).transmit(samples)
-    }
-    fn prepare_transmit(&mut self, max_samples: usize) -> Result<(), Error> {
-        (**self).prepare_transmit(max_samples)
-    }
-    fn transmit_at(&mut self, samples: &[Complex32], tick: Option<u64>) -> Result<(), Error> {
-        (**self).transmit_at(samples, tick)
-    }
-    fn enable_transmit(&mut self, enable: bool) -> Result<(), Error> {
-        (**self).enable_transmit(enable)
-    }
-    fn enable_transmit_at(&mut self, enable: bool, tick: Option<u64>) -> Result<(), Error> {
-        (**self).enable_transmit_at(enable, tick)
-    }
-    fn tx_health(&mut self) -> Result<TxRadioHealth, Error> {
-        (**self).tx_health()
-    }
-}
-
-// Default 8× chip rate (9.8304 Msps). The live TX sample rate is selected
-// from radio config and carried through `BtsRuntimeSettings`; this constant is
-// only the project default and a convenience for tests/tools.
 pub(crate) const TX_SAMPLE_RATE: usize = SR1_CHIP_RATE_HZ as usize * 8;
 pub(crate) const FILE_OUTPUT_TARGET_PEAK: f32 = 0.90;
 const FILE_OUTPUT_HARD_CLIP_PEAK: f32 = 1.0;
@@ -601,9 +497,9 @@ impl Radio for NoopRadio {
         Ok(())
     }
 
-    fn set_tx_sample_rate(&mut self, sample_rate: usize) -> Result<(), Error> {
+    fn set_tx_sample_rate(&mut self, sample_rate: usize) -> Result<usize, Error> {
         self.tx_sample_rate = sample_rate;
-        Ok(())
+        Ok(sample_rate)
     }
 
     fn set_tx_bandwidth(&mut self, _bandwidth: usize) -> Result<(), Error> {
@@ -781,7 +677,8 @@ pub struct FileOutputRadio<W>
 where
     W: Write + Seek,
 {
-    sink: WavWriter<W>,
+    sink: WavWriter<BufWriter<W>>,
+    sample_rate_hz: usize,
     clock_start: Instant,
 }
 
@@ -791,8 +688,9 @@ where
 {
     pub fn new(writer: W, sample_rate_hz: usize) -> Result<FileOutputRadio<W>, Error> {
         Ok(FileOutputRadio {
+            sample_rate_hz,
             sink: WavWriter::new(
-                writer,
+                BufWriter::new(writer),
                 hound::WavSpec {
                     channels: 2,
                     sample_rate: sample_rate_hz as u32,
@@ -817,8 +715,16 @@ where
         Ok(())
     }
 
-    fn set_tx_sample_rate(&mut self, _sample_rate: usize) -> Result<(), Error> {
-        Ok(())
+    fn set_tx_sample_rate(&mut self, sample_rate: usize) -> Result<usize, Error> {
+        // The WAV header rate is fixed when the file is opened.
+        if sample_rate != self.sample_rate_hz {
+            return Err(format!(
+                "file output was opened at TX sample rate {}, requested {sample_rate}",
+                self.sample_rate_hz
+            )
+            .into());
+        }
+        Ok(sample_rate)
     }
 
     fn set_tx_bandwidth(&mut self, _bandwidth: usize) -> Result<(), Error> {
@@ -835,7 +741,7 @@ where
 }
 
 struct FileOutputTxHalf<W: Write + Seek + Send> {
-    sink: WavWriter<W>,
+    sink: WavWriter<BufWriter<W>>,
     clock_start: Instant,
 }
 
@@ -1186,6 +1092,28 @@ mod tests {
                 mirror
             );
         }
+    }
+
+    #[test]
+    fn tx_pulse_shaper_emits_hardware_rate_samples_and_keeps_state() {
+        let interpolation = TX_SAMPLE_RATE / super::SR1_CHIP_RATE_HZ as usize;
+        let first_chips = vec![Complex32::new(1.0, 0.0); 3072];
+        let second_chips = vec![Complex32::new(0.0, 1.0); 3072];
+
+        let mut batched = TxPulseShaper::new(TX_SAMPLE_RATE).expect("tx pulse shaper");
+        let first = batched.shape(&first_chips);
+        let second = batched.shape(&second_chips);
+        assert_eq!(first.len(), first_chips.len() * interpolation);
+        assert_eq!(second.len(), second_chips.len() * interpolation);
+
+        let mut continuous = TxPulseShaper::new(TX_SAMPLE_RATE).expect("tx pulse shaper");
+        let combined =
+            continuous.shape(&[first_chips.as_slice(), second_chips.as_slice()].concat());
+        assert_eq!(
+            combined.len(),
+            (first_chips.len() + second_chips.len()) * interpolation
+        );
+        assert_eq!([first, second].concat(), combined);
     }
 
     #[test]

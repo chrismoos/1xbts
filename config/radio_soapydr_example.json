@@ -1,14 +1,15 @@
 {
   "kind": "soapy",
-  "device": "driver=lime",
+  "device": "driver=plutosky",
   "channel": 0,
-  "antenna": "BAND1",
-  "tx_gain_db": 60.0,
-  "rx_antenna": "LNAW",
-  "rx_gain_db": 32.0,
+  "antenna": "A",
+  "tx_gain_db": 65.0,
+  "rx_antenna": "A_BALANCED",
+  "rx_gain_db": 35.0,
   "rx_reference_dbm": null,
   "rx_power_adj": 0.0,
   "rx_sample_delay": 0,
+  "tx_sample_delay": -54,
   "rx_batch_pcgs": 2,
   "traffic_rx_continuity": true
 }

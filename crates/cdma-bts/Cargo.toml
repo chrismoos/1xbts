@@ -12,11 +12,18 @@ description = "BTS, LAC/MAC, PHY, receiver, and SDR backend implementation for 1
 path = "src/lib/mod.rs"
 
 [features]
-default = ["uhd-backend", "lime-backend", "bladerf-backend", "soapy-backend"]
+default = [
+    "uhd-backend",
+    "lime-backend",
+    "bladerf-backend",
+    "soapy-backend",
+    "network-backend",
+]
 uhd-backend = ["uhd"]
 lime-backend = ["limesuite"]
 bladerf-backend = ["bladerf"]
 soapy-backend = ["soapysdr"]
+network-backend = ["dep:socket2"]
 
 [dependencies]
 num = "0.4"
@@ -35,6 +42,7 @@ cdma-common = { path = "../cdma-common"}
 chrono = "0.4"
 num-complex = "0.4"
 libc = "0.2"
+socket2 = { workspace = true, optional = true }
 rustfft = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

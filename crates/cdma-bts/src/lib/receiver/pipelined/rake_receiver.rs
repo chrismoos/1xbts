@@ -350,29 +350,17 @@ impl RakeReceiver {
             let t_validation = Instant::now();
             for blk in &chain_output {
                 let ms_sync = blk.tags.get("ms_sync_event").copied();
-                let crc_valid = blk.tags.get("deinterleaver_lock_crc_valid").copied();
                 let access_crc = blk.tags.get("access_crc_valid").copied();
                 let access_preamble = blk.tags.get("access_preamble_detected").copied();
 
-                if ms_sync.is_some()
-                    || crc_valid.is_some()
-                    || access_crc.is_some()
-                    || access_preamble.is_some()
-                {
+                if ms_sync.is_some() || access_crc.is_some() || access_preamble.is_some() {
                     debug!(
-                        "rake: finger {} validation attempt phase={} hits={} — ms_sync={:?} crc={:?} access_crc={:?} access_preamble={:?}",
-                        finger.id,
-                        finger.phase,
-                        finger.hits,
-                        ms_sync,
-                        crc_valid,
-                        access_crc,
-                        access_preamble
+                        "rake: finger {} validation attempt phase={} hits={} — ms_sync={:?} access_crc={:?} access_preamble={:?}",
+                        finger.id, finger.phase, finger.hits, ms_sync, access_crc, access_preamble
                     );
                 }
 
                 let passed = ms_sync == Some(1)
-                    || crc_valid.is_some_and(|v| v > 0)
                     || access_crc.is_some_and(|v| v > 0)
                     || access_preamble.is_some_and(|v| v > 0);
                 if passed && !finger.validated {

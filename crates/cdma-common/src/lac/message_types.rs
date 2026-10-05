@@ -84,8 +84,10 @@ pub enum MessageId {
     AuthResync,               // AURSYNM
     GeneralExtension,         // GEM
 
-    // ---- Forward dedicated (f-dsch) only ----
     AlertWithInformation,                  // AWIM
+    InTrafficSystemParameters,             // ITSPM
+    PowerControlParameters,                // PCNPM
+    PowerControl,                          // PCNM
     ServiceConnect,                        // SCM
     ExtendedSupplementalChannelAssignment, // ESCAM
 
@@ -143,7 +145,11 @@ pub enum WireChannel {
 }
 
 impl MessageId {
-    /// Human-readable message name.
+    const FDSCH_ITSPM: u8 = 0x07;
+    const FDSCH_PCNPM: u8 = 0x0A;
+    const FDSCH_STRQM: u8 = 0x10;
+    const FDSCH_PCNM: u8 = 0x19;
+
     pub fn name(self) -> &'static str {
         match self {
             Self::SyncChannelMessage => "Sync Channel Message",
@@ -216,6 +222,9 @@ impl MessageId {
             Self::CallRecoveryRequest => "Call Recovery Request Message",
             Self::GeneralExtension => "General Extension Message",
             Self::AlertWithInformation => "Alert With Information Message",
+            Self::InTrafficSystemParameters => "In-Traffic System Parameters Message",
+            Self::PowerControlParameters => "Power Control Parameters Message",
+            Self::PowerControl => "Power Control Message",
             Self::ServiceConnect => "Service Connect Message",
             Self::ExtendedSupplementalChannelAssignment => {
                 "Extended Supplemental Channel Assignment Message"
@@ -329,6 +338,9 @@ impl MessageId {
             Self::CallRecoveryRequest => "CRRM",
             Self::GeneralExtension => "GEM",
             Self::AlertWithInformation => "AWIM",
+            Self::InTrafficSystemParameters => "ITSPM",
+            Self::PowerControlParameters => "PCNPM",
+            Self::PowerControl => "PCNM",
             Self::ServiceConnect => "SCM",
             Self::ExtendedSupplementalChannelAssignment => "ESCAM",
             Self::FlashWithInfo => "FWIM",
@@ -576,14 +588,18 @@ impl MessageId {
 
     fn wire_forward_dedicated(self) -> Option<u8> {
         Some(match self {
-            Self::Order => 0x01,                                 // 00000001 ORDRM
-            Self::AuthChallenge => 0x02,                         // 00000010 AUCM
-            Self::AlertWithInformation => 0x03,                  // 00000011 AWIM
-            Self::DataBurst => 0x04,                             // 00000100 DBM
-            Self::FlashWithInfo => 0x0E,                         // 00001110 FWIM
-            Self::ServiceRequest => 0x12,                        // 00010010 SRQM
-            Self::ServiceResponse => 0x13,                       // 00010011 SRPM
-            Self::ServiceConnect => 0x14,                        // 00010100 SCM
+            Self::Order => 0x01,                // 00000001 ORDRM
+            Self::AuthChallenge => 0x02,        // 00000010 AUCM
+            Self::AlertWithInformation => 0x03, // 00000011 AWIM
+            Self::DataBurst => 0x04,            // 00000100 DBM
+            Self::InTrafficSystemParameters => Self::FDSCH_ITSPM,
+            Self::PowerControlParameters => Self::FDSCH_PCNPM,
+            Self::FlashWithInfo => 0x0E, // 00001110 FWIM
+            Self::StatusRequest => Self::FDSCH_STRQM,
+            Self::ServiceRequest => 0x12,  // 00010010 SRQM
+            Self::ServiceResponse => 0x13, // 00010011 SRPM
+            Self::ServiceConnect => 0x14,  // 00010100 SCM
+            Self::PowerControl => Self::FDSCH_PCNM,
             Self::ExtendedSupplementalChannelAssignment => 0x23, // 00100011 ESCAM (C.S0005-E §3.7.3.3.2.37)
             _ => return None,
         })
@@ -595,10 +611,14 @@ impl MessageId {
             0x02 => Self::AuthChallenge,
             0x03 => Self::AlertWithInformation,
             0x04 => Self::DataBurst,
+            Self::FDSCH_ITSPM => Self::InTrafficSystemParameters,
+            Self::FDSCH_PCNPM => Self::PowerControlParameters,
             0x0E => Self::FlashWithInfo,
+            Self::FDSCH_STRQM => Self::StatusRequest,
             0x12 => Self::ServiceRequest,
             0x13 => Self::ServiceResponse,
             0x14 => Self::ServiceConnect,
+            Self::FDSCH_PCNM => Self::PowerControl,
             0x23 => Self::ExtendedSupplementalChannelAssignment,
             _ => return None,
         })
