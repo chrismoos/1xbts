@@ -27,7 +27,7 @@ fn config() -> MsNodeConfig {
         },
         channel: MsChannel {
             band_class: BandClass::Bc0,
-            band_subclass: 0,
+            band_subclass: Some(0),
             cdma_channel: 384,
         },
         radio: MsRadioConfig::default(),

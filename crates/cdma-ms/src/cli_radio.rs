@@ -2,9 +2,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use cdma_bts::bts::config::RadioConfig as SdrRadioConfig;
-use cdma_common::band_class::ChannelPlan;
 use cdma_common::error::Error;
-use cdma_ms::config::{MsNodeConfig, MsOnlyRadioConfig, MsRadioConfig};
+use cdma_ms::config::{MsChannel, MsNodeConfig, MsOnlyRadioConfig, MsRadioConfig};
 use cdma_ms::engine::ScanConfig;
 use cdma_ms::iq_radio::IqSourceRadio;
 use cdma_ms::ms::MsEvent;
@@ -95,8 +94,12 @@ pub fn build_radio(radio: &MsRadioConfig, config: &MsNodeConfig) -> Result<Built
             paced,
             carrier_offset_hz,
         }) => {
-            let plan = ChannelPlan::new(*band_class, *band_subclass, *cdma_channel);
-            plan.validate()?;
+            let plan = MsChannel {
+                band_class: *band_class,
+                band_subclass: *band_subclass,
+                cdma_channel: *cdma_channel,
+            }
+            .channel_plan()?;
             let center_hz = plan.downlink_hz() as f64;
             let source = IqSourceRadio::from_wav(Path::new(path), center_hz)?;
             if (source.sample_rate_hz() - SAMPLE_RATE_HZ).abs() > 1.0 {
@@ -131,8 +134,7 @@ pub fn build_radio(radio: &MsRadioConfig, config: &MsNodeConfig) -> Result<Built
             })
         }
         MsRadioConfig::Sdr(sdr) => {
-            let channel = config.channel.channel_plan();
-            channel.validate()?;
+            let channel = config.channel.channel_plan()?;
             let calibration = tx_calibration_for(sdr, config);
             let sdr_radio = SdrRadio::open(
                 sdr,

@@ -1,5 +1,7 @@
 # HEAD
 
+- Fixed band class channel validation and PRL scanning in cdma-ms, which now tunes by band class and channel alone.
+
 - Added a full CDMA2000 1x Mobile Station library and softphone.
 - Fix issue with HRPD only mode exiting early.
 - MS-to-MS calls paging streamlined for quicker time to ring.

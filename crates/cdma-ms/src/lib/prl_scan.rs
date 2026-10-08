@@ -11,6 +11,8 @@ use cdma_otasp::param::prl::{
 };
 use cdma_otasp::param::prl_ext::{self, ExtAcquisitionBody, ExtSystemId};
 
+use crate::config::MsChannel;
+
 /// BC0 CDMA primary and secondary channels for the A and B cellular
 /// carriers (C.S0057 §2.1.1).
 pub const BC0_A_PRIMARY: u16 = 283;
@@ -33,6 +35,7 @@ const EXTENDED_SSPR_P_REV: u8 = 3;
 
 const GENERIC_BAND_CLASS_BC0: u8 = 0;
 const GENERIC_BAND_CLASS_BC1: u8 = 1;
+const GENERIC_BAND_CLASS_BC5: u8 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrlFormat {
@@ -52,6 +55,7 @@ impl PrlFormat {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScanChannel {
     pub band_class: BandClass,
+    pub band_subclass: u8,
     pub channel: u16,
     pub frequency_hz: f64,
     pub acq_index: u16,
@@ -59,7 +63,7 @@ pub struct ScanChannel {
 
 impl ScanChannel {
     pub fn reverse_hz(&self) -> f64 {
-        ChannelPlan::new(self.band_class, 0, self.channel).uplink_hz() as f64
+        ChannelPlan::new(self.band_class, self.band_subclass, self.channel).uplink_hz() as f64
     }
 
     pub fn label(&self) -> String {
@@ -324,20 +328,30 @@ impl Expander {
         if !self.seen.insert((band_class.field_value(), channel)) {
             return;
         }
-        let plan = ChannelPlan::new(band_class, 0, channel);
-        if let Err(e) = plan.validate() {
-            log::warn!(
-                "ms_scan: acq#{} {} ch{} rejected by band-class validator: {}",
-                acq_index,
-                band_class.as_str(),
-                channel,
-                e
-            );
-            self.invalid += 1;
-            return;
-        }
+        // PRL acquisition entries carry no subclass (C.S0016 §3.5.5.2.2.10).
+        let plan = match (MsChannel {
+            band_class,
+            band_subclass: None,
+            cdma_channel: channel,
+        })
+        .channel_plan()
+        {
+            Ok(plan) => plan,
+            Err(e) => {
+                log::warn!(
+                    "ms_scan: acq#{} {} ch{} rejected by band-class validator: {}",
+                    acq_index,
+                    band_class.as_str(),
+                    channel,
+                    e
+                );
+                self.invalid += 1;
+                return;
+            }
+        };
         self.channels.push(ScanChannel {
             band_class,
+            band_subclass: plan.band_subclass,
             channel,
             frequency_hz: plan.downlink_hz() as f64,
             acq_index,
@@ -459,6 +473,9 @@ impl Expander {
                         GENERIC_BAND_CLASS_BC1 => {
                             self.push(acq_index, BandClass::Bc1, e.channel_number)
                         }
+                        GENERIC_BAND_CLASS_BC5 => {
+                            self.push(acq_index, BandClass::Bc5, e.channel_number)
+                        }
                         other => self.skip(acq_index, &format!("generic 1x band class {other}")),
                     }
                 }
@@ -541,7 +558,14 @@ mod tests {
         );
         assert!(plan.channels_in(BandClass::Bc1) > 40);
         assert_eq!(plan.skipped_records, 18);
-        assert_eq!(plan.channels_in(BandClass::Bc0), 18);
+        let nonzero_subclasses: Vec<_> = plan
+            .channels
+            .iter()
+            .filter(|ch| ch.band_subclass != 0)
+            .map(|ch| (ch.band_class, ch.band_subclass, ch.channel))
+            .collect();
+        assert_eq!(nonzero_subclasses, vec![(BandClass::Bc0, 1, 779)]);
+        assert_eq!(plan.channels_in(BandClass::Bc0), 19);
         assert!(plan.systems.len() > 700);
         assert!(plan.verdict(5269, 0).permitted());
     }
@@ -593,6 +617,75 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn explicit_bc5_channels_scan_across_subclasses() {
+        let plan = PrlScanPlan::from_parts(
+            1,
+            false,
+            &[
+                (BandClass::Bc5, 105),
+                (BandClass::Bc5, 105),
+                (BandClass::Bc5, 600),
+                (BandClass::Bc5, 401),
+            ],
+            vec![],
+        );
+        assert_eq!(plan.channels.len(), 2);
+        assert_eq!(plan.invalid_channels, 1);
+        assert_eq!(plan.channels[0].channel, 105);
+        assert_eq!(plan.channels[0].frequency_hz, 462_600_000.0);
+        assert_eq!(plan.channels[0].reverse_hz(), 452_600_000.0);
+        assert_eq!(plan.channels[1].channel, 600);
+        assert_eq!(plan.channels[1].frequency_hz, 423_200_000.0);
+        assert_eq!(plan.channels[1].reverse_hz(), 413_200_000.0);
+    }
+
+    #[test]
+    fn scan_infers_nonzero_subclasses_and_preserves_reverse_duplex() {
+        let plan = PrlScanPlan::from_parts(
+            1,
+            false,
+            &[
+                (BandClass::Bc0, 1200),
+                (BandClass::Bc2, 2050),
+                (BandClass::Bc5, 130),
+                (BandClass::Bc2, 2109),
+                (BandClass::Bc17, 105),
+            ],
+            vec![],
+        );
+        assert_eq!(plan.channels.len(), 3);
+        assert_eq!(plan.invalid_channels, 2);
+        assert_eq!(plan.channels[0].band_subclass, 3);
+        assert_eq!(plan.channels[0].frequency_hz, 865_320_000.0);
+        assert_eq!(plan.channels[0].reverse_hz(), 820_320_000.0);
+        assert_eq!(plan.channels[1].band_subclass, 3);
+        assert_eq!(plan.channels[1].frequency_hz, 849_050_000.0);
+        assert_eq!(plan.channels[1].reverse_hz(), 894_050_000.0);
+        assert_eq!(plan.channels[2].band_subclass, 1);
+    }
+
+    #[test]
+    fn extended_generic_bc5_channel_105_is_not_skipped() {
+        let mut expander = Expander::default();
+        expander.extended_record(
+            7,
+            &ExtAcquisitionBody::Generic1xIs95 {
+                entries: vec![prl_ext::BandClassChannel {
+                    band_class: GENERIC_BAND_CLASS_BC5,
+                    channel_number: 105,
+                }],
+            },
+        );
+        assert_eq!(expander.skipped, 0);
+        assert_eq!(expander.invalid, 0);
+        assert_eq!(expander.channels.len(), 1);
+        assert_eq!(expander.channels[0].band_class, BandClass::Bc5);
+        assert_eq!(expander.channels[0].acq_index, 7);
+        assert_eq!(expander.channels[0].frequency_hz, 462_600_000.0);
+        assert_eq!(expander.channels[0].reverse_hz(), 452_600_000.0);
     }
 
     #[test]

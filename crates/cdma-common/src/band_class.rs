@@ -1,7 +1,6 @@
 //! CDMA2000 band class + channel number to RF frequency mapping per
-//! 3GPP2 C.S0057-F. BC0/BC1 enforce full per-subclass Valid +
-//! Conditionally Valid tables; BC2–BC22 enforce only the outer
-//! channel-number range. BC17 and BC22 are "Not specified" in the spec
+//! 3GPP2 C.S0057-F. BC0/BC1/BC5 enforce per-subclass Valid and
+//! Conditionally Valid tables. Other bands use per-subclass ranges. BC17 and BC22 are "Not specified" in the spec
 //! and `validate()` rejects them.
 use crate::error::Error;
 use serde::{Deserialize, Serialize};
@@ -513,45 +512,30 @@ fn bc5_uplink_hz(n: u16) -> u64 {
     hz as u64
 }
 
-// Tables 2.1.6-1, 2.1.6-3: subclass 0..13 → block A..N. Fine-grained
-// per-block Conditional sub-ranges are not modeled.
+// C.S0057-F Tables 2.1.6-1 and 2.1.6-3. Base-transmit-only channels
+// cannot form a bidirectional mobile channel plan.
 fn bc5_validity(sub: u8, n: u16) -> Option<Validity> {
-    let in_block = match sub {
-        // A
-        0 => (121..=275).contains(&n),
-        // B
-        1 => (81..=235).contains(&n),
-        // C
-        2 => (1..=168).contains(&n),
-        // D
-        3 => (539..=681).contains(&n),
-        // E
-        4 => (692..=846).contains(&n),
-        // F
-        5 => (1792..=1985).contains(&n),
-        // G
-        6 => (1235..=1442).contains(&n),
-        // H
-        7 => (1039..=1229).contains(&n),
-        // I
-        8 => (54..=205).contains(&n),
-        // J
-        9 => (211..=376).contains(&n),
-        // K
-        10 => (1536..=1690).contains(&n),
-        // L
-        11 => (472..=646).contains(&n),
-        // M
-        12 => (1..=375).contains(&n) || n == 2017 || n == 2018,
-        // N
-        13 => (1..=375).contains(&n) || n == 2017 || n == 2018,
+    if sub == 0 && (126..=145).contains(&n) {
+        return Some(Validity::Conditional);
+    }
+    let valid = match sub {
+        0 => (146..=275).contains(&n),
+        1 => (106..=235).contains(&n),
+        2 => (26..=168).contains(&n),
+        3 => (564..=681).contains(&n),
+        4 => (717..=846).contains(&n),
+        5 => (1823..=1985).contains(&n),
+        6 => (1266..=1442).contains(&n),
+        7 => (1070..=1229).contains(&n),
+        8 => (79..=205).contains(&n),
+        9 => (235..=376).contains(&n),
+        10 => (1561..=1690).contains(&n),
+        11 => (505..=646).contains(&n),
+        12 => (97..=275).contains(&n) || n == 2017 || n == 2018,
+        13 => (26..=275).contains(&n) || n == 2017 || n == 2018,
         _ => false,
     };
-    if in_block {
-        Some(Validity::Valid)
-    } else {
-        None
-    }
+    if valid { Some(Validity::Valid) } else { None }
 }
 
 // ─── BC6 — C.S0057-F §2.1.7, Table 2.1.7-2 ────────────────────────────────
@@ -990,15 +974,59 @@ mod tests {
         p.validate().unwrap();
     }
 
-    // ── BC5 ──
     #[test]
     fn bc5_block_a_sample() {
-        // Block A (sub 0), preferred N=160: base = 25e3·(160-1) + 460e6
-        //                                       = 463_975_000
         let p = ChannelPlan::new(BandClass::Bc5, 0, 160);
         assert_eq!(p.downlink_hz(), 463_975_000);
         assert_eq!(p.uplink_hz(), 453_975_000);
         p.validate().unwrap();
+    }
+
+    #[test]
+    fn bc5_channel_105_is_valid_only_in_c_i_m_n() {
+        for subclass in 0..=BandClass::Bc5.max_subclass() {
+            let plan = ChannelPlan::new(BandClass::Bc5, subclass, 105);
+            assert_eq!(plan.validate().is_ok(), matches!(subclass, 2 | 8 | 12 | 13));
+            assert_freqs(plan, 462_600_000, 452_600_000);
+        }
+    }
+
+    #[test]
+    fn bc5_sr1_block_boundaries_match_the_spec() {
+        let ranges = [
+            (0, 146, 275),
+            (1, 106, 235),
+            (2, 26, 168),
+            (3, 564, 681),
+            (4, 717, 846),
+            (5, 1823, 1985),
+            (6, 1266, 1442),
+            (7, 1070, 1229),
+            (8, 79, 205),
+            (9, 235, 376),
+            (10, 1561, 1690),
+            (11, 505, 646),
+            (12, 97, 275),
+            (13, 26, 275),
+        ];
+        for (subclass, first, last) in ranges {
+            for channel in 0..=2047 {
+                let expected = if subclass == 0 && (126..=145).contains(&channel) {
+                    Some(Validity::Conditional)
+                } else if (first..=last).contains(&channel)
+                    || (matches!(subclass, 12 | 13) && matches!(channel, 2017 | 2018))
+                {
+                    Some(Validity::Valid)
+                } else {
+                    None
+                };
+                assert_eq!(
+                    ChannelPlan::new(BandClass::Bc5, subclass, channel).channel_validity(),
+                    expected,
+                    "subclass {subclass} channel {channel}",
+                );
+            }
+        }
     }
 
     #[test]

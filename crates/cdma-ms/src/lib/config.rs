@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use cdma_bts::bts::config::RadioConfig as SdrRadioConfig;
-use cdma_common::band_class::{BandClass, ChannelPlan};
+use cdma_common::band_class::{BandClass, ChannelPlan, Validity};
 use cdma_common::config_load::load_json_with_local_override;
 use cdma_common::error::Error;
 use serde::{Deserialize, Serialize};
@@ -124,8 +124,8 @@ pub enum MsOnlyRadioConfig {
     IqFile {
         path: String,
         band_class: BandClass,
-        #[serde(default)]
-        band_subclass: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        band_subclass: Option<u8>,
         cdma_channel: u16,
         #[serde(default = "default_true")]
         loop_playback: bool,
@@ -141,14 +141,35 @@ pub enum MsOnlyRadioConfig {
 #[serde(deny_unknown_fields)]
 pub struct MsChannel {
     pub band_class: BandClass,
-    #[serde(default)]
-    pub band_subclass: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Omission accepts a channel valid in any subclass. An explicit value restricts validation.
+    pub band_subclass: Option<u8>,
     pub cdma_channel: u16,
 }
 
 impl MsChannel {
-    pub fn channel_plan(&self) -> ChannelPlan {
-        ChannelPlan::new(self.band_class, self.band_subclass, self.cdma_channel)
+    pub fn channel_plan(&self) -> Result<ChannelPlan, Error> {
+        let subclass = match self.band_subclass {
+            Some(subclass) => subclass,
+            None => (0..=self.band_class.max_subclass())
+                .filter_map(|subclass| {
+                    ChannelPlan::new(self.band_class, subclass, self.cdma_channel)
+                        .channel_validity()
+                        .map(|validity| (subclass, validity))
+                })
+                .min_by_key(|(_, validity)| matches!(validity, Validity::Conditional))
+                .map(|(subclass, _)| subclass)
+                .ok_or_else(|| {
+                    Error::from(format!(
+                        "cdma_channel {} is not valid in any subclass of {}",
+                        self.cdma_channel,
+                        self.band_class.as_str(),
+                    ))
+                })?,
+        };
+        let plan = ChannelPlan::new(self.band_class, subclass, self.cdma_channel);
+        plan.validate()?;
+        Ok(plan)
     }
 }
 
@@ -240,7 +261,7 @@ impl MsNodeConfig {
         let value = load_json_with_local_override(path).map_err(|e| Error::from(e.to_string()))?;
         let config: Self = serde_json::from_value(value).map_err(|e| Error::from(e.to_string()))?;
         config.identity.validate()?;
-        config.channel.channel_plan().validate()?;
+        config.channel.channel_plan()?;
         Ok(config)
     }
 
@@ -269,8 +290,11 @@ mod tests {
         assert_eq!(identity.mcc, "310");
         assert_eq!(identity.imsi_11_12, "00");
         assert_eq!(identity.imsi_s, 1_234_567_890);
-        assert_eq!(cfg.channel.channel_plan().downlink_hz(), 881_520_000);
-        assert_eq!(cfg.channel.channel_plan().uplink_hz(), 836_520_000);
+        assert_eq!(
+            cfg.channel.channel_plan().unwrap().downlink_hz(),
+            881_520_000
+        );
+        assert_eq!(cfg.channel.channel_plan().unwrap().uplink_hz(), 836_520_000);
         assert_eq!(cfg.grpc_listen, default_grpc_listen());
         assert_eq!(cfg.radio.kind(), "sim");
         assert!(!cfg.radio.is_hardware_radio());
@@ -313,10 +337,81 @@ mod tests {
     }
 
     #[test]
+    fn bc5_channel_105_tunes_without_a_subclass() {
+        let cfg: MsNodeConfig = serde_json::from_str(
+            r#"{
+                "identity": {"esn": 305419896, "imsi": "310001234567890"},
+                "channel": {"band_class": "bc5", "cdma_channel": 105}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.channel.band_subclass, None);
+        let plan = cfg.channel.channel_plan().unwrap();
+        assert_eq!(plan.band_subclass, 2);
+        assert_eq!(plan.downlink_hz(), 462_600_000);
+        assert_eq!(plan.uplink_hz(), 452_600_000);
+        let serialized = serde_json::to_value(&cfg.channel).unwrap();
+        assert!(serialized.get("band_subclass").is_none());
+    }
+
+    #[test]
+    fn explicit_subclass_is_strict_and_invalid_channels_are_rejected() {
+        for subclass in [0, 1, 14] {
+            let channel = MsChannel {
+                band_class: BandClass::Bc5,
+                band_subclass: Some(subclass),
+                cdma_channel: 105,
+            };
+            assert!(channel.channel_plan().is_err());
+        }
+        for band in [BandClass::Bc5, BandClass::Bc17, BandClass::Bc22] {
+            let channel = MsChannel {
+                band_class: band,
+                band_subclass: None,
+                cdma_channel: 401,
+            };
+            assert!(channel.channel_plan().is_err());
+        }
+    }
+
+    #[test]
+    fn inferred_subclass_preserves_reverse_duplex_and_prefers_valid_channels() {
+        let channel = MsChannel {
+            band_class: BandClass::Bc2,
+            band_subclass: None,
+            cdma_channel: 2050,
+        };
+        let plan = channel.channel_plan().unwrap();
+        assert_eq!(plan.band_subclass, 3);
+        assert_eq!(plan.downlink_hz(), 849_050_000);
+        assert_eq!(plan.uplink_hz(), 894_050_000);
+        let channel = MsChannel {
+            band_class: BandClass::Bc5,
+            band_subclass: None,
+            cdma_channel: 130,
+        };
+        let plan = channel.channel_plan().unwrap();
+        assert_eq!(plan.band_subclass, 1);
+        assert_eq!(plan.channel_validity(), Some(Validity::Valid));
+    }
+
+    #[test]
+    fn bc5_channel_105_uses_the_configured_subclass() {
+        let channel: MsChannel =
+            serde_json::from_str(r#"{"band_class":"bc5","band_subclass":2,"cdma_channel":105}"#)
+                .unwrap();
+        let plan = channel.channel_plan().unwrap();
+        plan.validate().unwrap();
+        assert_eq!(plan.downlink_hz(), 462_600_000);
+        assert_eq!(plan.uplink_hz(), 452_600_000);
+        assert!(ChannelPlan::new(BandClass::Bc5, 0, 105).validate().is_err());
+    }
+
+    #[test]
     fn example_channel_derives_paired_frequencies_and_rejects_rate_overrides() {
         let cfg: MsNodeConfig =
             serde_json::from_str(include_str!("../../../../config/ms.json")).unwrap();
-        let channel = cfg.channel.channel_plan();
+        let channel = cfg.channel.channel_plan().unwrap();
         channel.validate().unwrap();
         assert_eq!(channel.downlink_hz(), 1_932_500_000);
         assert_eq!(channel.uplink_hz(), 1_852_500_000);
