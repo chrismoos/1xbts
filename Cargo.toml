@@ -124,3 +124,6 @@ wrong_self_convention = "allow"
 
 [profile.dev]
 debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
