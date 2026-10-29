@@ -134,6 +134,24 @@ pub fn to_proto_event(ev: &OtaspEvent) -> events_proto::OtaspEvent {
                 result_code: *result_code as u32,
             })
         }
+        OtaspEvent::AKeyProgress {
+            step,
+            success,
+            a_key_p_rev,
+            elapsed_ms,
+            result_code,
+            skip_reason,
+        } => Kind::AKeyProgress(events_proto::OtaspAKeyProgress {
+            step: to_proto_a_key_step(*step).into(),
+            success: *success,
+            a_key_p_rev: u32::from(*a_key_p_rev),
+            elapsed_ms: *elapsed_ms,
+            result_code: result_code.map(u32::from),
+            skip_reason: skip_reason
+                .map(to_proto_a_key_skip_reason)
+                .unwrap_or(events_proto::OtaspAKeySkipReason::Unspecified)
+                .into(),
+        }),
         OtaspEvent::SessionEnded {
             completed_blocks,
             outcome,
@@ -418,6 +436,9 @@ pub fn to_proto_outcome(outcome: SessionOutcomeKind) -> events_proto::OtaspSessi
         SessionOutcomeKind::NoCapacity => events_proto::OtaspSessionOutcome::NoCapacity,
         SessionOutcomeKind::ProtocolError => events_proto::OtaspSessionOutcome::ProtocolError,
         SessionOutcomeKind::TimedOut => events_proto::OtaspSessionOutcome::TimedOut,
+        SessionOutcomeKind::KeyExchangeFailed => {
+            events_proto::OtaspSessionOutcome::KeyExchangeFailed
+        }
     }
 }
 
@@ -426,5 +447,34 @@ pub fn to_proto_msc_event(ev: &OtaspEvent) -> events_proto::MscNetworkEvent {
         event: Some(events_proto::msc_network_event::Event::Otasp(
             to_proto_event(ev),
         )),
+    }
+}
+
+fn to_proto_a_key_step(step: crate::otasp::event::AKeyStep) -> events_proto::OtaspAKeyStep {
+    use crate::otasp::event::AKeyStep;
+    match step {
+        AKeyStep::Requested => events_proto::OtaspAKeyStep::Requested,
+        AKeyStep::MsKeyResponse => events_proto::OtaspAKeyStep::MsKeyResponse,
+        AKeyStep::KeyGenerationResponse => events_proto::OtaspAKeyStep::KeyGenerationResponse,
+        AKeyStep::KeyDerived => events_proto::OtaspAKeyStep::KeyDerived,
+        AKeyStep::SsdUpdate => events_proto::OtaspAKeyStep::SsdUpdate,
+        AKeyStep::ReAuthentication => events_proto::OtaspAKeyStep::ReAuthentication,
+        AKeyStep::Committed => events_proto::OtaspAKeyStep::Committed,
+        AKeyStep::Skipped => events_proto::OtaspAKeyStep::Skipped,
+    }
+}
+
+fn to_proto_a_key_skip_reason(
+    reason: crate::otasp::event::AKeySkipReason,
+) -> events_proto::OtaspAKeySkipReason {
+    use crate::otasp::event::AKeySkipReason;
+    match reason {
+        AKeySkipReason::KeyOnFileVerified => events_proto::OtaspAKeySkipReason::KeyOnFileVerified,
+        AKeySkipReason::KeyOnFileUnverified => {
+            events_proto::OtaspAKeySkipReason::KeyOnFileUnverified
+        }
+        AKeySkipReason::KeyOnFileNotChecked => {
+            events_proto::OtaspAKeySkipReason::KeyOnFileNotChecked
+        }
     }
 }

@@ -319,6 +319,7 @@ impl Bsc {
             None,
             None,
         )
+        .map(drop)
     }
 
     /// Send an ESCAM that releases the active F-SCH assignment.
@@ -367,6 +368,7 @@ impl Bsc {
             None,
             None,
         )
+        .map(drop)
     }
 
     /// Send a Service Connect Message on the forward traffic channel.
@@ -461,6 +463,7 @@ impl Bsc {
             None,
             None,
         )
+        .map(drop)
     }
 
     /// Send a Service Request Message on the forward traffic channel.
@@ -523,6 +526,7 @@ impl Bsc {
             None,
             None,
         )
+        .map(drop)
     }
 
     pub(crate) fn send_service_response_counter_proposal(
@@ -593,6 +597,7 @@ impl Bsc {
             None,
             None,
         )
+        .map(drop)
     }
 
     pub(crate) fn send_service_response_reject(
@@ -627,6 +632,7 @@ impl Bsc {
             None,
             None,
         )
+        .map(drop)
     }
 
     /// Send a BS Ack Order on the forward traffic channel.
@@ -661,6 +667,7 @@ impl Bsc {
             None,
             None,
         )
+        .map(drop)
     }
 
     /// Send a signaling L3 SDU on the forward traffic channel via Abis bearer.
@@ -677,7 +684,7 @@ impl Bsc {
         service_request: Option<ServiceRequestParams>,
         data_burst: Option<ForwardDataBurstMessage>,
         alert_with_info: Option<AlertWithInformationMessage>,
-    ) -> Result<(), Error> {
+    ) -> Result<u8, Error> {
         let (addr, rc_label, tc_walsh, tc_for_rc, tc_so, tc_voice_label) = {
             let ms = self
                 .mobiles
@@ -780,7 +787,7 @@ impl Bsc {
             tc_voice_label,
         );
 
-        Ok(())
+        Ok(msg_seq)
     }
 }
 

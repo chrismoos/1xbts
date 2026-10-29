@@ -252,6 +252,7 @@ message A1AddsPayload {
 
 // One A1 signaling message, complete.
 message A1SignalingEvent {
+  optional string voice_privacy = 20;
   A1Direction direction = 1;
   A1MessageDiscriminator discriminator = 2;
   A1MessageType message_type = 3;
@@ -260,9 +261,7 @@ message A1SignalingEvent {
   // Message name for display, e.g. "Location Updating Request".
   string message_type_name = 5;
 
-  // The complete reassembled Layer 3 SDU: protocol discriminator, message type
-  // and every information element, byte for byte as the peer sent it. This is
-  // captured before any typed re-encode.
+  // Reassembled Layer 3 SDU. Encryption parameter values are replaced with zeros.
   bytes sdu = 6;
   // Same bytes as uppercase hex, for display and copy-paste.
   string sdu_hex = 7;

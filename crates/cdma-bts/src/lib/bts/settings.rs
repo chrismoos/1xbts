@@ -616,8 +616,7 @@ pub struct RxSettings {
     pub one_x_rx_shift_hz: i64,
     pub hrpd_reverse_frequency_hz: Option<usize>,
     pub hrpd_rx_shift_hz: Option<i64>,
-    /// Serving AUTH_MODE for exact decode of reverse access-channel tails.
-    pub auth_mode: u8,
+    pub global_challenge: Arc<super::global_challenge::GlobalChallenge>,
     /// Serving P_REV_IN_USE for exact decode of reverse access-channel tails.
     pub p_rev_in_use: u8,
     pub capture_iq_wav: Option<PathBuf>,

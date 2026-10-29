@@ -993,9 +993,24 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
         let identity = parse_identity_key(req.identity)?;
-        let a_key = non_empty_key("a_key", req.a_key)?;
-        let ssd_a = non_empty_key("ssd_a", req.ssd_a)?;
-        let ssd_b = non_empty_key("ssd_b", req.ssd_b)?;
+        let mut a_key = non_empty_key("a_key", req.a_key)?;
+        let mut ssd_a = non_empty_key("ssd_a", req.ssd_a)?;
+        let mut ssd_b = non_empty_key("ssd_b", req.ssd_b)?;
+        if let Some(digits) = req.a_key_digits.filter(|d| !d.trim().is_empty()) {
+            if a_key.is_some() {
+                return Err(Status::invalid_argument(
+                    "a_key and a_key_digits are mutually exclusive",
+                ));
+            }
+            let esn = identity.esn().ok_or_else(|| {
+                Status::invalid_argument("A-key check digits are computed over an ESN")
+            })?;
+            let verified = cdma_cave::AKey::from_entry_digits(&digits, cdma_cave::Esn(esn))
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            a_key = Some(verified.0.to_vec());
+            ssd_a = None;
+            ssd_b = None;
+        }
         let requested = auth_algo_from_wire(req.auth_algo);
         let auth_algo = if a_key.is_some() && requested == model::AuthAlgorithm::None {
             model::AuthAlgorithm::Cave
@@ -1030,6 +1045,176 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             auth_failure_count: state.auth_failure_count,
             last_auth_at: state.last_auth_at.map(datetime_to_timestamp),
         }))
+    }
+
+    async fn verify_cave_global_challenge(
+        &self,
+        request: Request<proto::VerifyCaveGlobalChallengeRequest>,
+    ) -> Result<Response<proto::CaveVerdict>, Status> {
+        let req = request.into_inner();
+        let identity = parse_identity_key(req.identity)?;
+        let challenge = crate::auth::GlobalChallenge {
+            esn: req.esn,
+            rand: req.rand,
+            authr: req.authr,
+            count: req
+                .count
+                .map(|count| u8::try_from(count).map_err(|_| Status::invalid_argument("count")))
+                .transpose()?,
+            auth_data: req.auth_data,
+            generate_call_keys: req.generate_call_keys,
+            otasp_reauthentication: req.otasp_reauthentication,
+        };
+        let verdict = self
+            .repo
+            .verify_cave_global_challenge(&identity, &challenge)
+            .await
+            .map_err(map_repo_error)?;
+        Ok(Response::new(crate::repository::cave_verdict_to_proto(
+            verdict,
+        )))
+    }
+
+    async fn verify_cave_unique_challenge(
+        &self,
+        request: Request<proto::VerifyCaveUniqueChallengeRequest>,
+    ) -> Result<Response<proto::CaveVerdict>, Status> {
+        let req = request.into_inner();
+        let identity = parse_identity_key(req.identity)?;
+        let challenge = crate::auth::UniqueChallenge {
+            esn: req.esn,
+            randu: req.randu,
+            authu: req.authu,
+            imsi_s1: req.imsi_s1,
+            imsi_s2: u16::try_from(req.imsi_s2).map_err(|_| Status::invalid_argument("imsi_s2"))?,
+            generate_call_keys: req.generate_call_keys,
+        };
+        let verdict = self
+            .repo
+            .verify_cave_unique_challenge(&identity, &challenge)
+            .await
+            .map_err(map_repo_error)?;
+        Ok(Response::new(crate::repository::cave_verdict_to_proto(
+            verdict,
+        )))
+    }
+
+    async fn begin_cave_ssd_update(
+        &self,
+        request: Request<proto::BeginCaveSsdUpdateRequest>,
+    ) -> Result<Response<proto::BeginCaveSsdUpdateResponse>, Status> {
+        let identity = parse_identity_key(request.into_inner().identity)?;
+        let randssd = self
+            .repo
+            .begin_cave_ssd_update(&identity)
+            .await
+            .map_err(map_repo_error)?;
+        Ok(Response::new(proto::BeginCaveSsdUpdateResponse { randssd }))
+    }
+
+    async fn cave_base_station_challenge(
+        &self,
+        request: Request<proto::CaveBaseStationChallengeRequest>,
+    ) -> Result<Response<proto::CaveBaseStationChallengeResponse>, Status> {
+        let req = request.into_inner();
+        let identity = parse_identity_key(req.identity)?;
+        let authbs = self
+            .repo
+            .cave_base_station_challenge(&identity, req.esn, req.randbs, req.imsi_s1)
+            .await
+            .map_err(map_repo_error)?;
+        Ok(Response::new(proto::CaveBaseStationChallengeResponse {
+            authbs,
+        }))
+    }
+
+    async fn finish_cave_ssd_update(
+        &self,
+        request: Request<proto::FinishCaveSsdUpdateRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        let identity = parse_identity_key(req.identity)?;
+        self.repo
+            .finish_cave_ssd_update(&identity, req.esn, req.confirmed)
+            .await
+            .map_err(map_repo_error)?;
+        Ok(Response::new(()))
+    }
+
+    async fn increment_cave_count(
+        &self,
+        request: Request<proto::IncrementCaveCountRequest>,
+    ) -> Result<Response<proto::IncrementCaveCountResponse>, Status> {
+        let identity = parse_identity_key(request.into_inner().identity)?;
+        let auth_count = self
+            .repo
+            .increment_cave_count(&identity)
+            .await
+            .map_err(map_repo_error)?;
+        Ok(Response::new(proto::IncrementCaveCountResponse {
+            auth_count: u32::from(auth_count),
+        }))
+    }
+
+    async fn begin_cave_key_exchange(
+        &self,
+        request: Request<proto::BeginCaveKeyExchangeRequest>,
+    ) -> Result<Response<proto::BeginCaveKeyExchangeResponse>, Status> {
+        let req = request.into_inner();
+        let identity = parse_identity_key(req.identity)?;
+        let a_key_p_rev =
+            u8::try_from(req.a_key_p_rev).map_err(|_| Status::invalid_argument("a_key_p_rev"))?;
+        let offer = self
+            .repo
+            .begin_cave_key_exchange(&identity, a_key_p_rev)
+            .await
+            .map_err(map_repo_error)?;
+        let (param_p, param_g) = match offer.params {
+            Some((p, g)) => (Some(p), Some(g)),
+            None => (None, None),
+        };
+        Ok(Response::new(proto::BeginCaveKeyExchangeResponse {
+            param_p,
+            param_g,
+            bs_result: offer.bs_result,
+        }))
+    }
+
+    async fn complete_cave_key_exchange(
+        &self,
+        request: Request<proto::CompleteCaveKeyExchangeRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        let identity = parse_identity_key(req.identity)?;
+        self.repo
+            .complete_cave_key_exchange(&identity, &req.ms_result)
+            .await
+            .map_err(map_repo_error)?;
+        Ok(Response::new(()))
+    }
+
+    async fn commit_cave_key(
+        &self,
+        request: Request<proto::CaveKeyIdentityRequest>,
+    ) -> Result<Response<()>, Status> {
+        let identity = parse_identity_key(request.into_inner().identity)?;
+        self.repo
+            .commit_cave_key(&identity)
+            .await
+            .map_err(map_repo_error)?;
+        Ok(Response::new(()))
+    }
+
+    async fn abort_cave_key_exchange(
+        &self,
+        request: Request<proto::CaveKeyIdentityRequest>,
+    ) -> Result<Response<()>, Status> {
+        let identity = parse_identity_key(request.into_inner().identity)?;
+        self.repo
+            .abort_cave_key_exchange(&identity)
+            .await
+            .map_err(map_repo_error)?;
+        Ok(Response::new(()))
     }
 
     // ─── OTASP session history ──────────────────────────────────
@@ -1619,6 +1804,7 @@ mod tests {
             ssd_a: None,
             ssd_b: None,
             auth_algo: proto::AuthAlgorithm::Cave as i32,
+            a_key_digits: None,
         }))
         .await
         .unwrap();
@@ -1628,6 +1814,7 @@ mod tests {
             ssd_a: None,
             ssd_b: None,
             auth_algo: proto::AuthAlgorithm::Unspecified as i32,
+            a_key_digits: None,
         }))
         .await
         .unwrap();
@@ -1643,6 +1830,7 @@ mod tests {
                 ssd_a: None,
                 ssd_b: None,
                 auth_algo: proto::AuthAlgorithm::Cave as i32,
+                a_key_digits: None,
             }))
             .await;
         assert_eq!(resp.unwrap_err().code(), Code::InvalidArgument);

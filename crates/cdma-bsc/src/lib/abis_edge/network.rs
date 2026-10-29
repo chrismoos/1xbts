@@ -88,8 +88,7 @@ pub struct NetworkClientConfig {
     pub mscid: u32,
     /// Pilot PN offset.
     pub pilot_pn: u16,
-    /// System AUTH_MODE from the serving overhead state.
-    pub auth_mode: u8,
+    pub auth_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
     /// Serving P_REV_IN_USE for exact reverse access-channel L3 decode.
     pub p_rev_in_use: u8,
     /// Market ID for CCR generation.
@@ -584,8 +583,10 @@ impl NetworkBtsControlClient {
         let msg_type_id = MessageId::from_wire(WireChannel::ReverseCommon, raw_msg_type)
             .ok_or_else(|| format!("unsupported reverse-common MSG_TAG 0x{raw_msg_type:02x}"))?;
 
-        let decode_ctx =
-            AccessDecodeContext::new(Some(config.auth_mode), Some(config.p_rev_in_use));
+        let decode_ctx = AccessDecodeContext::new(
+            Some(config.auth_mode.load(std::sync::atomic::Ordering::Acquire)),
+            Some(config.p_rev_in_use),
+        );
         let bs = Bitstream::new_init(&payload_bits);
         let pdu = ReverseAccessPdu::decode(&bs)
             .map_err(|err| format!("access PDU decode failed: {err}"))?;
@@ -694,6 +695,25 @@ impl NetworkBtsControlClient {
 
         let msg_type_name = cdma_common::access::access_message_type_name(raw_msg_type).to_string();
 
+        let authentication = match &pdu {
+            ReverseAccessPdu::Pd00Legacy(p) => p.authentication.as_ref(),
+            ReverseAccessPdu::Pd01PRev6(p) => p.authentication.as_ref(),
+            ReverseAccessPdu::Pd10Modern { .. } => None,
+        }
+        .and_then(|fields| {
+            let randc = fields.randc?;
+            Some(cdma_common::events::GlobalChallengeResponse {
+                authr: fields.authr?,
+                randc,
+                count: fields.count?,
+                rand: ach
+                    .authentication_challenge_parameter
+                    .as_ref()
+                    .map(|challenge| u32::from_be_bytes(challenge.rand_value))
+                    .filter(|&rand| cdma_bts::bts::global_challenge::randc(rand) == randc),
+            })
+        });
+
         Ok(AccessChannelEvent {
             event_id: uuid::Uuid::new_v4().to_string(),
             chip_start: 0,
@@ -770,6 +790,7 @@ impl NetworkBtsControlClient {
             traffic_voice_bits: None,
             traffic_voice_rate_bps: None,
             raw_pdu_bits: Some(payload_bits),
+            authentication,
         })
     }
 
@@ -833,17 +854,31 @@ impl NetworkBtsControlClient {
         esn: u32,
         include_sch: bool,
         service_option: Option<u16>,
+        privacy: Option<std::sync::Arc<cdma_common::phy::long_code_privacy::LongCodePrivacy>>,
     ) -> Option<SetupResult> {
         if include_sch {
             log::info!(
                 "abis_edge: ignoring legacy setup-time SCH request; SCH uses Abis Burst allocation"
             );
         }
+        let privacy_info = match privacy
+            .as_ref()
+            .map(|privacy| {
+                cdma_abis::control::typed::PrivacyInfo::private_long_code(privacy.private_mask())
+            })
+            .transpose()
+        {
+            Ok(info) => info,
+            Err(error) => {
+                log::warn!("abis_edge: invalid private long code parameters: {error}");
+                return None;
+            }
+        };
         let physical_channels = vec![PhysicalChannelType::Fch];
         let setup = BtsSetupMessage {
             call_connection_reference: ccr,
             band_class: None,
-            privacy_info: None,
+            privacy_info,
             sdu_id: None,
             mobile_identities: vec![MobileIdentity::Esn(esn)],
             physical_channel_info: Some(PhysicalChannelInfo {
@@ -948,7 +983,7 @@ mod tests {
             cell_id: CellId { cell: 1, sector: 0 },
             mscid: 1,
             pilot_pn: 42,
-            auth_mode: 0,
+            auth_mode: Default::default(),
             p_rev_in_use: 6,
             market_id: 1,
             generating_entity_id: 1,
@@ -1213,7 +1248,7 @@ impl BtsControlClient for NetworkBtsControlClient {
 
     async fn allocate_rc1_traffic(
         &self,
-        _lc_generator: LongCodeGenerator,
+        lc_generator: LongCodeGenerator,
         _initial_lc_chip: u64,
         esn: u32,
         service_option: Option<u16>,
@@ -1222,8 +1257,9 @@ impl BtsControlClient for NetworkBtsControlClient {
             let mut guard = self.inner.lock().await;
             self.allocate_ccr(&mut guard)
         };
-        // RC1 calls never carry F-SCH (Phase 1 is RC3-only).
-        let result = self.send_bts_setup(ccr, esn, false, service_option).await?;
+        let result = self
+            .send_bts_setup(ccr, esn, false, service_option, lc_generator.privacy())
+            .await?;
         {
             let mut guard = self.inner.lock().await;
             guard.walsh_to_ccr.insert(result.walsh_code, ccr);
@@ -1245,7 +1281,7 @@ impl BtsControlClient for NetworkBtsControlClient {
 
     async fn allocate_rc2_traffic(
         &self,
-        _lc_generator: LongCodeGenerator,
+        lc_generator: LongCodeGenerator,
         _initial_lc_chip: u64,
         esn: u32,
         service_option: Option<u16>,
@@ -1254,9 +1290,9 @@ impl BtsControlClient for NetworkBtsControlClient {
             let mut guard = self.inner.lock().await;
             self.allocate_ccr(&mut guard)
         };
-        // RC2 (IS-95B Rate Set 2 — QCELP-13K) shares the RC1 PHY scaffolding
-        // and carries no F-SCH.
-        let result = self.send_bts_setup(ccr, esn, false, service_option).await?;
+        let result = self
+            .send_bts_setup(ccr, esn, false, service_option, lc_generator.privacy())
+            .await?;
         {
             let mut guard = self.inner.lock().await;
             guard.walsh_to_ccr.insert(result.walsh_code, ccr);
@@ -1278,7 +1314,7 @@ impl BtsControlClient for NetworkBtsControlClient {
 
     async fn allocate_rc3_traffic(
         &self,
-        _lc_generator: LongCodeGenerator,
+        lc_generator: LongCodeGenerator,
         _initial_lc_chip: u64,
         _fpc_subchan_gain: u8,
         esn: u32,
@@ -1290,7 +1326,13 @@ impl BtsControlClient for NetworkBtsControlClient {
             self.allocate_ccr(&mut guard)
         };
         let result = self
-            .send_bts_setup(ccr, esn, include_sch, service_option)
+            .send_bts_setup(
+                ccr,
+                esn,
+                include_sch,
+                service_option,
+                lc_generator.privacy(),
+            )
             .await?;
         {
             let mut guard = self.inner.lock().await;
@@ -1388,9 +1430,17 @@ impl BtsControlClient for NetworkBtsControlClient {
         }
     }
 
-    async fn install_rx_request(&self, request: TrafficRxRequest) {
+    async fn install_rx_request(&self, mut request: TrafficRxRequest) {
         if let Some(ref ctrl) = self.local_controller {
             let mut pool = ctrl.traffic_rx_pool().lock();
+            request.long_code_privacy = ctrl.long_code_privacy(request.walsh_code);
+            if request.long_code_privacy.is_some()
+                && !pool
+                    .iter()
+                    .any(|existing| existing.walsh_code == request.walsh_code)
+            {
+                return;
+            }
             pool.retain(|r| r.walsh_code != request.walsh_code);
             pool.push(request);
         }

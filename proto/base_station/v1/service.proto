@@ -12,7 +12,12 @@ service BaseStationService {
   rpc Enroll(EnrollRequest) returns (EnrollResponse);
 }
 
-message EnrollRequest {}
+message EnrollRequest {
+  // True when the MSC verifies the CAVE global challenge, so the cells this
+  // node serves broadcast AUTH = '01' unless their own configuration fixes
+  // AUTH.
+  bool global_challenge = 1;
+}
 
 message EnrollResponse {
   // Stable identifier the node writes into registration bindings. Unique

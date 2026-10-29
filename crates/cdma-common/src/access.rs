@@ -1147,7 +1147,10 @@ impl OrderMessage {
                         parts.push(format!(
                             "REJECTED_ORDER=0b{:06b} ({})",
                             rejected_order,
-                            forward_order_name(rejected_order)
+                            crate::formatting::forward_order_name(
+                                rejected_order,
+                                detail.rejected_ordq
+                            )
                         ));
                     }
                     if let Some(rejected_ordq) = detail.rejected_ordq {
@@ -1463,22 +1466,6 @@ fn reverse_order_name(order: u8) -> &'static str {
         0b011101 => "Service Option Control",
         0b011110 => "PACA Cancel",
         0b011111 => "Mobile Station Reject Order",
-        _ => "Unknown Order",
-    }
-}
-
-fn forward_order_name(order: u8) -> &'static str {
-    match order {
-        0 => "Abbreviated Alert",
-        1 => "Base Station Acknowledgment",
-        2 => "Base Station Challenge Confirmation",
-        0b011011 => "Registration Accepted",
-        0b011100 => "Registration Rejected",
-        5 => "Maintenance Required",
-        6 => "Lock Until Power-Cycled",
-        7 => "Unlock",
-        8 => "Parameter Update",
-        18 => "Release",
         _ => "Unknown Order",
     }
 }
@@ -5446,8 +5433,12 @@ fn decode_origination_tail(
     mut bs: Bitstream,
     include_encryption_supported: bool,
 ) -> Result<OriginationMessage, String> {
+    // MOB_P_REV 3 mobiles end the message before ENCRYPTION_SUPPORTED even with
+    // AUTH_MODE '01', so a field cut off by the end of the SDU is absent.
     let encryption_supported = if include_encryption_supported {
-        Some(read(&mut bs, 4, "ENCRYPTION_SUPPORTED")? as u8)
+        read(&mut bs, 4, "ENCRYPTION_SUPPORTED")
+            .ok()
+            .map(|v| v as u8)
     } else {
         None
     };
@@ -7419,10 +7410,11 @@ fn decode_page_response(
         .p_rev_in_use
         .map(|serving_p_rev| serving_p_rev.min(mob_p_rev))
         .unwrap_or(mob_p_rev);
+    // Legacy mobiles can end the message here, as for the Origination Message.
     let encryption_supported = if p_rev_in_use < 7 {
         match ctx.auth_mode {
             Some(0) => None,
-            Some(_) => Some(read(bs, 4, "ENCRYPTION_SUPPORTED")? as u8),
+            Some(_) => read(bs, 4, "ENCRYPTION_SUPPORTED").ok().map(|v| v as u8),
             None => {
                 return Err("Page Response decode requires AUTH_MODE context".to_string());
             }
@@ -7430,7 +7422,7 @@ fn decode_page_response(
     } else {
         None
     };
-    let num_alt_so = read(bs, 3, "NUM_ALT_SO")? as u8;
+    let num_alt_so = read(bs, 3, "NUM_ALT_SO").unwrap_or(0) as u8;
     let mut alt_service_options = Vec::with_capacity(num_alt_so as usize);
     for idx in 0..num_alt_so {
         alt_service_options.push(read(bs, 16, &format!("ALT_SO[{idx}]"))? as u16);
@@ -11046,6 +11038,52 @@ mod tests {
     }
 
     #[test]
+    fn p_rev_3_messages_without_encryption_supported_decode_with_auth() {
+        let ctx = AccessDecodeContext::new(Some(1), Some(6));
+        let mut origination = Bitstream::new();
+        origination.write_u8(rcsch_wire(MessageId::Origination), 8);
+        origination.write_u8(1, 1); // MOB_TERM
+        origination.write_u8(1, 3); // SLOT_CYCLE_INDEX
+        origination.write_u8(3, 8); // MOB_P_REV
+        origination.write_u8(0x6a, 8); // SCM
+        origination.write_u8(0b011, 3); // REQUEST_MODE
+        origination.write_u8(1, 1); // SPECIAL_SERVICE
+        origination.write_u32(3, 16); // SERVICE_OPTION
+        origination.write_u8(0, 1); // PM
+        origination.write_u8(0, 1); // DIGIT_MODE
+        origination.write_u8(0, 1); // MORE_FIELDS
+        origination.write_u8(4, 8); // NUM_FIELDS
+        for _ in 0..4 {
+            origination.write_u8(2, 4);
+        }
+        let AccessMessage::Origination(message) =
+            AccessMessage::decode_with_context(&origination, ctx).expect("decode origination")
+        else {
+            panic!("expected origination");
+        };
+        assert_eq!(message.digits, vec![2, 2, 2, 2]);
+        assert_eq!(message.encryption_supported, None);
+
+        let mut page_response = Bitstream::new();
+        page_response.write_u8(rcsch_wire(MessageId::PageResponse), 8);
+        page_response.write_u8(1, 1); // MOB_TERM
+        page_response.write_u8(1, 3); // SLOT_CYCLE_INDEX
+        page_response.write_u8(3, 8); // MOB_P_REV
+        page_response.write_u8(0x6a, 8); // SCM
+        page_response.write_u8(0b011, 3); // REQUEST_MODE
+        page_response.write_u32(3, 16); // SERVICE_OPTION
+        page_response.write_u8(0, 1); // PM
+        page_response.write_u8(0, 1); // NAR_AN_CAP
+        let AccessMessage::PageResponse(message) =
+            AccessMessage::decode_with_context(&page_response, ctx).expect("decode page response")
+        else {
+            panic!("expected page response");
+        };
+        assert_eq!(message.encryption_supported, None);
+        assert_eq!(message.num_alt_so, 0);
+    }
+
+    #[test]
     fn test_access_message_decoder_page_response_p_rev6_capabilities() {
         let mut bits = Bitstream::new();
         bits.write_u8(rcsch_wire(MessageId::PageResponse), 8);
@@ -11803,7 +11841,7 @@ mod tests {
         assert!(detail.trailing_bytes.is_empty());
         assert!(
             msg.order_detail(WireChannel::ForwardCommon)
-                .contains("REJECTED_ORDER=0b010010 (Release)")
+                .contains("REJECTED_ORDER=0b010010 (Lock/Unlock)")
         );
         assert!(
             msg.order_detail(WireChannel::ForwardCommon)
@@ -13205,7 +13243,8 @@ const SUPPLEMENTAL_COUNT_BITS: usize = 2;
 
 impl FdschOrderMessage {
     pub fn order_name(&self) -> &'static str {
-        forward_dedicated_order_name(self.order)
+        // ORDQ is the first order-specific octet when ADD_RECORD_LEN is nonzero.
+        crate::formatting::forward_order_name(self.order, self.order_specific.first().copied())
     }
 }
 
@@ -13589,27 +13628,6 @@ fn is_forward_call_control_order(order: u8) -> bool {
             | 0b011001 // Continuous DTMF Tone
             | 0b100001 // Connect
     )
-}
-
-fn forward_dedicated_order_name(order: u8) -> &'static str {
-    match order {
-        0b000001 => "Abbreviated Alert",
-        0b010000 => "Base Station Acknowledgment",
-        0b010001 => "Pilot Measurement Request",
-        0b010010 => "Lock Until Power-Cycled",
-        0b010011 => "Maintenance Required",
-        0b010100 => "Unlock",
-        0b010101 => "Release",
-        0b010110 => "Outer Loop Report Request",
-        0b010111 => "Long Code Transition",
-        0b011001 => "Continuous DTMF Tone",
-        0b011010 => "Status Request",
-        0b011011 => "Registration Accepted",
-        0b011100 => "Registration Rejected",
-        0b011110 => "Local Control",
-        0b100001 => "Connect",
-        _ => "Unknown Order",
-    }
 }
 
 /// Decode a Service Configuration Record body from a bitstream.

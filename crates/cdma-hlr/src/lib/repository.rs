@@ -3,8 +3,14 @@ use chrono::{DateTime, Utc};
 use tonic::Code;
 use uuid::Uuid;
 
+use crate::auth::{
+    CallKeyMaterial, CaveAuthOutcome, CaveCredentials, CaveVerdict, GlobalChallenge,
+    UniqueChallenge,
+};
 use crate::model::*;
 use crate::proto;
+
+const CAVE_UNSUPPORTED: &str = "CAVE authentication is not supported by this repository";
 
 #[async_trait]
 pub trait HlrRepository: Send + Sync {
@@ -192,6 +198,81 @@ pub trait HlrRepository: Send + Sync {
         _identity: &MobileIdentityKey,
     ) -> Result<Option<IdentityAuthState>, String> {
         Ok(None)
+    }
+
+    async fn verify_cave_global_challenge(
+        &self,
+        _identity: &MobileIdentityKey,
+        _challenge: &GlobalChallenge,
+    ) -> Result<CaveVerdict, String> {
+        Err(CAVE_UNSUPPORTED.into())
+    }
+
+    async fn verify_cave_unique_challenge(
+        &self,
+        _identity: &MobileIdentityKey,
+        _challenge: &UniqueChallenge,
+    ) -> Result<CaveVerdict, String> {
+        Err(CAVE_UNSUPPORTED.into())
+    }
+
+    /// Stores a fresh RANDSSD as the pending SSD update and returns it.
+    async fn begin_cave_ssd_update(&self, _identity: &MobileIdentityKey) -> Result<u64, String> {
+        Err(CAVE_UNSUPPORTED.into())
+    }
+
+    async fn cave_base_station_challenge(
+        &self,
+        _identity: &MobileIdentityKey,
+        _esn: u32,
+        _randbs: u32,
+        _imsi_s1: u32,
+    ) -> Result<u32, String> {
+        Err(CAVE_UNSUPPORTED.into())
+    }
+
+    /// Replaces the stored SSD with the pending one when `confirmed`, and clears the pending
+    /// update either way.
+    async fn finish_cave_ssd_update(
+        &self,
+        _identity: &MobileIdentityKey,
+        _esn: u32,
+        _confirmed: bool,
+    ) -> Result<(), String> {
+        Err(CAVE_UNSUPPORTED.into())
+    }
+
+    async fn increment_cave_count(&self, _identity: &MobileIdentityKey) -> Result<u8, String> {
+        Err(CAVE_UNSUPPORTED.into())
+    }
+
+    /// Starts an OTASP A-key exchange and returns the MS Key Request and Key Generation
+    /// Request values (C.S0016-D §4.5.1.3, §4.5.1.4).
+    async fn begin_cave_key_exchange(
+        &self,
+        _identity: &MobileIdentityKey,
+        _a_key_p_rev: u8,
+    ) -> Result<crate::key_exchange::KeyExchangeOffer, String> {
+        Err(CAVE_UNSUPPORTED.into())
+    }
+
+    /// Derives the A-key from MS_RESULT and holds it until `commit_cave_key`.
+    async fn complete_cave_key_exchange(
+        &self,
+        _identity: &MobileIdentityKey,
+        _ms_result: &[u8],
+    ) -> Result<(), String> {
+        Err(CAVE_UNSUPPORTED.into())
+    }
+
+    /// Makes the exchanged A-key and its SSD current after the mobile accepts the Commit.
+    async fn commit_cave_key(&self, _identity: &MobileIdentityKey) -> Result<(), String> {
+        Err(CAVE_UNSUPPORTED.into())
+    }
+
+    /// Discards an uncommitted key exchange and the SSD derived from it.
+    async fn abort_cave_key_exchange(&self, _identity: &MobileIdentityKey) -> Result<(), String> {
+        Err(CAVE_UNSUPPORTED.into())
     }
 
     // OTASP session history
@@ -465,6 +546,43 @@ fn auth_algo_from_proto(value: i32) -> AuthAlgorithm {
         Ok(proto::AuthAlgorithm::Cave) => AuthAlgorithm::Cave,
         _ => AuthAlgorithm::None,
     }
+}
+
+pub(crate) fn cave_outcome_to_proto(outcome: CaveAuthOutcome) -> proto::CaveAuthOutcome {
+    match outcome {
+        CaveAuthOutcome::Success => proto::CaveAuthOutcome::Success,
+        CaveAuthOutcome::SignatureMismatch => proto::CaveAuthOutcome::SignatureMismatch,
+        CaveAuthOutcome::CountMismatch => proto::CaveAuthOutcome::CountMismatch,
+        CaveAuthOutcome::NotProvisioned => proto::CaveAuthOutcome::NotProvisioned,
+    }
+}
+
+pub(crate) fn cave_verdict_to_proto(verdict: CaveVerdict) -> proto::CaveVerdict {
+    proto::CaveVerdict {
+        outcome: cave_outcome_to_proto(verdict.outcome) as i32,
+        cmea_key: verdict.call_keys.map(|k| k.cmea_key.to_vec()),
+        private_long_code_mask: verdict.call_keys.map(|k| k.private_long_code_mask),
+    }
+}
+
+fn cave_verdict_from_proto(verdict: proto::CaveVerdict) -> Result<CaveVerdict, String> {
+    let outcome = match proto::CaveAuthOutcome::try_from(verdict.outcome) {
+        Ok(proto::CaveAuthOutcome::Success) => CaveAuthOutcome::Success,
+        Ok(proto::CaveAuthOutcome::SignatureMismatch) => CaveAuthOutcome::SignatureMismatch,
+        Ok(proto::CaveAuthOutcome::CountMismatch) => CaveAuthOutcome::CountMismatch,
+        Ok(proto::CaveAuthOutcome::NotProvisioned) => CaveAuthOutcome::NotProvisioned,
+        _ => return Err(format!("unknown CAVE outcome {}", verdict.outcome)),
+    };
+    let call_keys = match (verdict.cmea_key, verdict.private_long_code_mask) {
+        (Some(key), Some(mask)) => Some(CallKeyMaterial {
+            cmea_key: key
+                .try_into()
+                .map_err(|_| "CMEA key must be 8 bytes".to_string())?,
+            private_long_code_mask: mask,
+        }),
+        _ => None,
+    };
+    Ok(CaveVerdict { outcome, call_keys })
 }
 
 fn resolved_from_proto(
@@ -1166,6 +1284,7 @@ impl HlrRepository for GrpcHlrRepository {
                 ssd_a,
                 ssd_b,
                 auth_algo: auth_algo_to_proto(auth_algo),
+                a_key_digits: None,
             })
             .await
             .map(|_| ())
@@ -1200,6 +1319,171 @@ impl HlrRepository for GrpcHlrRepository {
                 .map(|ts| timestamp_to_datetime(Some(ts)))
                 .transpose()?,
         }))
+    }
+
+    async fn verify_cave_global_challenge(
+        &self,
+        identity: &MobileIdentityKey,
+        challenge: &GlobalChallenge,
+    ) -> Result<CaveVerdict, String> {
+        let mut client = self.client();
+        let resp = client
+            .verify_cave_global_challenge(proto::VerifyCaveGlobalChallengeRequest {
+                identity: Some(identity_key_to_proto(identity)),
+                esn: challenge.esn,
+                rand: challenge.rand,
+                authr: challenge.authr,
+                count: challenge.count.map(u32::from),
+                auth_data: challenge.auth_data,
+                generate_call_keys: challenge.generate_call_keys,
+                otasp_reauthentication: challenge.otasp_reauthentication,
+            })
+            .await
+            .map_err(|status| format!("HLR VerifyCaveGlobalChallenge: {status}"))?;
+        cave_verdict_from_proto(resp.into_inner())
+    }
+
+    async fn verify_cave_unique_challenge(
+        &self,
+        identity: &MobileIdentityKey,
+        challenge: &UniqueChallenge,
+    ) -> Result<CaveVerdict, String> {
+        let mut client = self.client();
+        let resp = client
+            .verify_cave_unique_challenge(proto::VerifyCaveUniqueChallengeRequest {
+                identity: Some(identity_key_to_proto(identity)),
+                esn: challenge.esn,
+                randu: challenge.randu,
+                authu: challenge.authu,
+                imsi_s1: challenge.imsi_s1,
+                imsi_s2: u32::from(challenge.imsi_s2),
+                generate_call_keys: challenge.generate_call_keys,
+            })
+            .await
+            .map_err(|status| format!("HLR VerifyCaveUniqueChallenge: {status}"))?;
+        cave_verdict_from_proto(resp.into_inner())
+    }
+
+    async fn begin_cave_ssd_update(&self, identity: &MobileIdentityKey) -> Result<u64, String> {
+        let mut client = self.client();
+        client
+            .begin_cave_ssd_update(proto::BeginCaveSsdUpdateRequest {
+                identity: Some(identity_key_to_proto(identity)),
+            })
+            .await
+            .map(|resp| resp.into_inner().randssd)
+            .map_err(|status| format!("HLR BeginCaveSsdUpdate: {status}"))
+    }
+
+    async fn cave_base_station_challenge(
+        &self,
+        identity: &MobileIdentityKey,
+        esn: u32,
+        randbs: u32,
+        imsi_s1: u32,
+    ) -> Result<u32, String> {
+        let mut client = self.client();
+        client
+            .cave_base_station_challenge(proto::CaveBaseStationChallengeRequest {
+                identity: Some(identity_key_to_proto(identity)),
+                esn,
+                randbs,
+                imsi_s1,
+            })
+            .await
+            .map(|resp| resp.into_inner().authbs)
+            .map_err(|status| format!("HLR CaveBaseStationChallenge: {status}"))
+    }
+
+    async fn finish_cave_ssd_update(
+        &self,
+        identity: &MobileIdentityKey,
+        esn: u32,
+        confirmed: bool,
+    ) -> Result<(), String> {
+        let mut client = self.client();
+        client
+            .finish_cave_ssd_update(proto::FinishCaveSsdUpdateRequest {
+                identity: Some(identity_key_to_proto(identity)),
+                esn,
+                confirmed,
+            })
+            .await
+            .map(|_| ())
+            .map_err(|status| format!("HLR FinishCaveSsdUpdate: {status}"))
+    }
+
+    async fn increment_cave_count(&self, identity: &MobileIdentityKey) -> Result<u8, String> {
+        let mut client = self.client();
+        client
+            .increment_cave_count(proto::IncrementCaveCountRequest {
+                identity: Some(identity_key_to_proto(identity)),
+            })
+            .await
+            .map(|resp| resp.into_inner().auth_count as u8)
+            .map_err(|status| format!("HLR IncrementCaveCount: {status}"))
+    }
+
+    async fn begin_cave_key_exchange(
+        &self,
+        identity: &MobileIdentityKey,
+        a_key_p_rev: u8,
+    ) -> Result<crate::key_exchange::KeyExchangeOffer, String> {
+        let mut client = self.client();
+        let resp = client
+            .begin_cave_key_exchange(proto::BeginCaveKeyExchangeRequest {
+                identity: Some(identity_key_to_proto(identity)),
+                a_key_p_rev: u32::from(a_key_p_rev),
+            })
+            .await
+            .map_err(|status| format!("HLR BeginCaveKeyExchange: {status}"))?
+            .into_inner();
+        Ok(crate::key_exchange::KeyExchangeOffer {
+            a_key_p_rev,
+            params: match (resp.param_p, resp.param_g) {
+                (Some(p), Some(g)) => Some((p, g)),
+                _ => None,
+            },
+            bs_result: resp.bs_result,
+        })
+    }
+
+    async fn complete_cave_key_exchange(
+        &self,
+        identity: &MobileIdentityKey,
+        ms_result: &[u8],
+    ) -> Result<(), String> {
+        let mut client = self.client();
+        client
+            .complete_cave_key_exchange(proto::CompleteCaveKeyExchangeRequest {
+                identity: Some(identity_key_to_proto(identity)),
+                ms_result: ms_result.to_vec(),
+            })
+            .await
+            .map(|_| ())
+            .map_err(|status| format!("HLR CompleteCaveKeyExchange: {status}"))
+    }
+
+    async fn commit_cave_key(&self, identity: &MobileIdentityKey) -> Result<(), String> {
+        let mut client = self.client();
+        client
+            .commit_cave_key(proto::CaveKeyIdentityRequest {
+                identity: Some(identity_key_to_proto(identity)),
+            })
+            .await
+            .map(|_| ())
+            .map_err(|status| format!("HLR CommitCaveKey: {status}"))
+    }
+
+    async fn abort_cave_key_exchange(&self, identity: &MobileIdentityKey) -> Result<(), String> {
+        let mut client = self.client();
+        client
+            .abort_cave_key_exchange(proto::CaveKeyIdentityRequest {
+                identity: Some(identity_key_to_proto(identity)),
+            })
+            .await
+            .map(|_| ())
+            .map_err(|status| format!("HLR AbortCaveKeyExchange: {status}"))
     }
 
     async fn save_otasp_session(&self, row: &OtaspSessionRow) -> Result<(), String> {
@@ -1283,11 +1567,60 @@ impl HlrRepository for GrpcHlrRepository {
 
 pub struct PostgresHlrRepository {
     pool: sqlx::PgPool,
+    /// Secret exponents of running OTASP key exchanges, keyed by identity row. They are
+    /// never persisted, so an HLR restart abandons the exchange.
+    key_exchanges:
+        std::sync::Mutex<std::collections::HashMap<Uuid, crate::key_exchange::KeyExchange>>,
 }
 
 impl PostgresHlrRepository {
+    async fn load_cave_credentials(
+        &self,
+        identity: &MobileIdentityKey,
+    ) -> Result<(Uuid, CaveCredentials), String> {
+        let Some(identity_id) = resolve_identity_row_id(&self.pool, identity).await? else {
+            return Err(format!("{VALIDATION_FAILED_PREFIX}identity not found"));
+        };
+        let row = sqlx::query_as::<_, CaveCredentialsRow>(
+            r#"
+            SELECT a_key, ssd_a, ssd_b, auth_count, auth_algo, randssd,
+                pending_a_key, pending_ssd_a, pending_ssd_b
+            FROM subscriber_identities
+            WHERE subscriber_identity_id = $1
+            "#,
+        )
+        .bind(identity_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| format!("load_cave_credentials: {e}"))?;
+        Ok((identity_id, row.try_into()?))
+    }
+
+    async fn record_cave_outcome(
+        &self,
+        identity_id: Uuid,
+        outcome: CaveAuthOutcome,
+    ) -> Result<(), String> {
+        let sql = if outcome.is_success() {
+            "UPDATE subscriber_identities SET last_auth_at = NOW(), auth_failure_count = 0 \
+             WHERE subscriber_identity_id = $1"
+        } else {
+            "UPDATE subscriber_identities SET auth_failure_count = auth_failure_count + 1 \
+             WHERE subscriber_identity_id = $1"
+        };
+        sqlx::query(sql)
+            .bind(identity_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("record_cave_outcome: {e}"))?;
+        Ok(())
+    }
+
     pub fn new(pool: sqlx::PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            key_exchanges: Default::default(),
+        }
     }
 
     pub async fn connect_from_config(config: &crate::HlrNodeConfig) -> Result<Self, String> {
@@ -2641,9 +2974,12 @@ impl HlrRepository for PostgresHlrRepository {
                 auth_algo = $5,
                 auth_count = CASE WHEN $2 IS NULL THEN 0 ELSE auth_count END,
                 auth_failure_count = CASE WHEN $2 IS NULL THEN 0 ELSE auth_failure_count END,
-                randssd = CASE WHEN $2 IS NULL THEN NULL ELSE randssd END,
+                randssd = NULL,
                 pending_rand = CASE WHEN $2 IS NULL THEN NULL ELSE pending_rand END,
-                pending_randu = CASE WHEN $2 IS NULL THEN NULL ELSE pending_randu END
+                pending_randu = CASE WHEN $2 IS NULL THEN NULL ELSE pending_randu END,
+                pending_a_key = NULL,
+                pending_ssd_a = NULL,
+                pending_ssd_b = NULL
             WHERE subscriber_identity_id = $1
             "#,
         )
@@ -2680,6 +3016,250 @@ impl HlrRepository for PostgresHlrRepository {
         .await
         .map_err(|e| format!("get_subscriber_auth_state: {e}"))?;
         row.map(TryInto::try_into).transpose()
+    }
+
+    async fn verify_cave_global_challenge(
+        &self,
+        identity: &MobileIdentityKey,
+        challenge: &GlobalChallenge,
+    ) -> Result<CaveVerdict, String> {
+        let (identity_id, creds) = self.load_cave_credentials(identity).await?;
+        let verdict = crate::auth::verify_global_challenge(&creds, challenge)?;
+        if verdict.outcome.is_success()
+            && !challenge.otasp_reauthentication
+            && let Some(reported) = crate::auth::resynced_count(&creds, challenge)
+        {
+            log::warn!(
+                "HLR: COUNT mismatch for {identity:?}: stored {}, mobile reported {reported}. Adopting the mobile's COUNT. Repeated mismatches can indicate a cloned mobile.",
+                creds.auth_count
+            );
+            sqlx::query(
+                "UPDATE subscriber_identities SET auth_count = $2 WHERE subscriber_identity_id = $1",
+            )
+            .bind(identity_id)
+            .bind(i16::from(reported))
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("resync auth_count: {e}"))?;
+        }
+        self.record_cave_outcome(identity_id, verdict.outcome)
+            .await?;
+        Ok(verdict)
+    }
+
+    async fn verify_cave_unique_challenge(
+        &self,
+        identity: &MobileIdentityKey,
+        challenge: &UniqueChallenge,
+    ) -> Result<CaveVerdict, String> {
+        let (identity_id, creds) = self.load_cave_credentials(identity).await?;
+        let verdict = crate::auth::verify_unique_challenge(&creds, challenge)?;
+        self.record_cave_outcome(identity_id, verdict.outcome)
+            .await?;
+        Ok(verdict)
+    }
+
+    async fn begin_cave_ssd_update(&self, identity: &MobileIdentityKey) -> Result<u64, String> {
+        let (identity_id, creds) = self.load_cave_credentials(identity).await?;
+        if !creds.can_update_ssd() {
+            return Err(format!(
+                "{VALIDATION_FAILED_PREFIX}identity has no CAVE A-key"
+            ));
+        }
+        let randssd = rand::random::<u64>() & ((1 << cdma_cave::RANDSSD_BITS) - 1);
+        let bytes = cdma_cave::RandSsd::from_u64(randssd)
+            .map_err(|e| e.to_string())?
+            .0;
+        sqlx::query(
+            "UPDATE subscriber_identities SET randssd = $2 WHERE subscriber_identity_id = $1",
+        )
+        .bind(identity_id)
+        .bind(bytes.to_vec())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("begin_cave_ssd_update: {e}"))?;
+        Ok(randssd)
+    }
+
+    async fn cave_base_station_challenge(
+        &self,
+        identity: &MobileIdentityKey,
+        esn: u32,
+        randbs: u32,
+        imsi_s1: u32,
+    ) -> Result<u32, String> {
+        let (_, creds) = self.load_cave_credentials(identity).await?;
+        crate::auth::base_station_challenge(&creds, esn, randbs, imsi_s1)
+            .map_err(|e| format!("{VALIDATION_FAILED_PREFIX}{e}"))
+    }
+
+    async fn finish_cave_ssd_update(
+        &self,
+        identity: &MobileIdentityKey,
+        esn: u32,
+        confirmed: bool,
+    ) -> Result<(), String> {
+        let (identity_id, creds) = self.load_cave_credentials(identity).await?;
+        let new_ssd = if confirmed {
+            Some(
+                crate::auth::committed_ssd(&creds, esn)
+                    .map_err(|e| format!("{VALIDATION_FAILED_PREFIX}{e}"))?,
+            )
+        } else {
+            None
+        };
+        // During an OTASP session the new SSD waits for the Commit with the new A-key.
+        let sql = if creds.pending_a_key.is_some() {
+            r#"
+            UPDATE subscriber_identities SET
+                pending_ssd_a = COALESCE($2, pending_ssd_a),
+                pending_ssd_b = COALESCE($3, pending_ssd_b),
+                randssd = NULL
+            WHERE subscriber_identity_id = $1
+            "#
+        } else {
+            r#"
+            UPDATE subscriber_identities SET
+                ssd_a = COALESCE($2, ssd_a),
+                ssd_b = COALESCE($3, ssd_b),
+                randssd = NULL
+            WHERE subscriber_identity_id = $1
+            "#
+        };
+        sqlx::query(sql)
+            .bind(identity_id)
+            .bind(new_ssd.map(|ssd| ssd.ssd_a.to_vec()))
+            .bind(new_ssd.map(|ssd| ssd.ssd_b.to_vec()))
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("finish_cave_ssd_update: {e}"))?;
+        Ok(())
+    }
+
+    async fn increment_cave_count(&self, identity: &MobileIdentityKey) -> Result<u8, String> {
+        let Some(identity_id) = resolve_identity_row_id(&self.pool, identity).await? else {
+            return Err(format!("{VALIDATION_FAILED_PREFIX}identity not found"));
+        };
+        let (count,): (i16,) = sqlx::query_as(
+            "UPDATE subscriber_identities SET auth_count = (auth_count + 1) % $2 \
+             WHERE subscriber_identity_id = $1 RETURNING auth_count",
+        )
+        .bind(identity_id)
+        .bind(i16::from(crate::auth::AUTH_COUNT_MODULUS))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| format!("increment_cave_count: {e}"))?;
+        Ok(count as u8)
+    }
+
+    async fn begin_cave_key_exchange(
+        &self,
+        identity: &MobileIdentityKey,
+        a_key_p_rev: u8,
+    ) -> Result<crate::key_exchange::KeyExchangeOffer, String> {
+        let Some(identity_id) = resolve_identity_row_id(&self.pool, identity).await? else {
+            return Err(format!("{VALIDATION_FAILED_PREFIX}identity not found"));
+        };
+        let exchange =
+            tokio::task::spawn_blocking(move || crate::key_exchange::KeyExchange::new(a_key_p_rev))
+                .await
+                .map_err(|e| format!("begin_cave_key_exchange: {e}"))?
+                .map_err(|e| format!("{VALIDATION_FAILED_PREFIX}{e}"))?;
+        let offer = exchange.offer();
+        self.key_exchanges
+            .lock()
+            .map_err(|_| "key exchange table poisoned".to_string())?
+            .insert(identity_id, exchange);
+        Ok(offer)
+    }
+
+    async fn complete_cave_key_exchange(
+        &self,
+        identity: &MobileIdentityKey,
+        ms_result: &[u8],
+    ) -> Result<(), String> {
+        let Some(identity_id) = resolve_identity_row_id(&self.pool, identity).await? else {
+            return Err(format!("{VALIDATION_FAILED_PREFIX}identity not found"));
+        };
+        let exchange = self
+            .key_exchanges
+            .lock()
+            .map_err(|_| "key exchange table poisoned".to_string())?
+            .remove(&identity_id)
+            .ok_or_else(|| format!("{VALIDATION_FAILED_PREFIX}no key exchange in progress"))?;
+        let a_key = exchange
+            .a_key(ms_result)
+            .map_err(|e| format!("{VALIDATION_FAILED_PREFIX}{e}"))?;
+        sqlx::query(
+            r#"
+            UPDATE subscriber_identities SET
+                pending_a_key = $2,
+                pending_ssd_a = NULL,
+                pending_ssd_b = NULL
+            WHERE subscriber_identity_id = $1
+            "#,
+        )
+        .bind(identity_id)
+        .bind(a_key.to_vec())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("complete_cave_key_exchange: {e}"))?;
+        Ok(())
+    }
+
+    async fn commit_cave_key(&self, identity: &MobileIdentityKey) -> Result<(), String> {
+        let (identity_id, creds) = self.load_cave_credentials(identity).await?;
+        if creds.pending_a_key.is_none() {
+            return Err(format!(
+                "{VALIDATION_FAILED_PREFIX}no exchanged A-key to commit"
+            ));
+        }
+        // Without an SSD update in the session the mobile keeps its previous SSD, which
+        // the HLR does not know, so the stored SSD is cleared and the next call updates it.
+        sqlx::query(
+            r#"
+            UPDATE subscriber_identities SET
+                a_key = pending_a_key,
+                ssd_a = pending_ssd_a,
+                ssd_b = pending_ssd_b,
+                auth_algo = 'cave',
+                pending_a_key = NULL,
+                pending_ssd_a = NULL,
+                pending_ssd_b = NULL,
+                randssd = NULL,
+                auth_failure_count = 0
+            WHERE subscriber_identity_id = $1
+            "#,
+        )
+        .bind(identity_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("commit_cave_key: {e}"))?;
+        Ok(())
+    }
+
+    async fn abort_cave_key_exchange(&self, identity: &MobileIdentityKey) -> Result<(), String> {
+        let Some(identity_id) = resolve_identity_row_id(&self.pool, identity).await? else {
+            return Ok(());
+        };
+        if let Ok(mut exchanges) = self.key_exchanges.lock() {
+            exchanges.remove(&identity_id);
+        }
+        sqlx::query(
+            r#"
+            UPDATE subscriber_identities SET
+                pending_a_key = NULL,
+                pending_ssd_a = NULL,
+                pending_ssd_b = NULL,
+                randssd = NULL
+            WHERE subscriber_identity_id = $1
+            "#,
+        )
+        .bind(identity_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("abort_cave_key_exchange: {e}"))?;
+        Ok(())
     }
 
     async fn save_otasp_session(&self, row: &OtaspSessionRow) -> Result<(), String> {
@@ -2874,6 +3454,60 @@ impl TryFrom<AuthStateRow> for IdentityAuthState {
             auth_count: r.auth_count as u8,
             auth_failure_count: r.auth_failure_count as u32,
             last_auth_at: r.last_auth_at,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct CaveCredentialsRow {
+    a_key: Option<Vec<u8>>,
+    ssd_a: Option<Vec<u8>>,
+    ssd_b: Option<Vec<u8>>,
+    auth_count: i16,
+    auth_algo: String,
+    randssd: Option<Vec<u8>>,
+    pending_a_key: Option<Vec<u8>>,
+    pending_ssd_a: Option<Vec<u8>>,
+    pending_ssd_b: Option<Vec<u8>>,
+}
+
+fn ssd_from(ssd_a: Option<[u8; 8]>, ssd_b: Option<[u8; 8]>) -> Option<cdma_cave::Ssd> {
+    match (ssd_a, ssd_b) {
+        (Some(ssd_a), Some(ssd_b)) => Some(cdma_cave::Ssd { ssd_a, ssd_b }),
+        _ => None,
+    }
+}
+
+fn fixed_bytes<const N: usize>(
+    field: &str,
+    bytes: Option<Vec<u8>>,
+) -> Result<Option<[u8; N]>, String> {
+    bytes
+        .map(|b| {
+            b.try_into()
+                .map_err(|_| format!("stored {field} must be {N} bytes"))
+        })
+        .transpose()
+}
+
+impl TryFrom<CaveCredentialsRow> for CaveCredentials {
+    type Error = String;
+
+    fn try_from(r: CaveCredentialsRow) -> Result<Self, Self::Error> {
+        Ok(CaveCredentials {
+            auth_algo: AuthAlgorithm::from_str(&r.auth_algo)?,
+            a_key: fixed_bytes::<8>("a_key", r.a_key)?,
+            ssd: ssd_from(
+                fixed_bytes::<8>("ssd_a", r.ssd_a)?,
+                fixed_bytes::<8>("ssd_b", r.ssd_b)?,
+            ),
+            auth_count: r.auth_count as u8,
+            randssd: fixed_bytes::<7>("randssd", r.randssd)?,
+            pending_a_key: fixed_bytes::<8>("pending_a_key", r.pending_a_key)?,
+            pending_ssd: ssd_from(
+                fixed_bytes::<8>("pending_ssd_a", r.pending_ssd_a)?,
+                fixed_bytes::<8>("pending_ssd_b", r.pending_ssd_b)?,
+            ),
         })
     }
 }

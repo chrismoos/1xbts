@@ -29,6 +29,7 @@ interface MobileView {
   rxPowerDbm?: number;
   rxLevelDbfs?: number;
   voiceCallState?: string;
+  voicePrivacy?: string;
 }
 
 export async function GET() {

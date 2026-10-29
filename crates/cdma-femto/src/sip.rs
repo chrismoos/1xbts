@@ -1473,6 +1473,12 @@ impl ImsCore {
             cell_identifier: Some(self.cell_identifier),
             tag: None,
             service_option: None,
+            authentication_response_parameter: None,
+            authentication_confirmation_parameter: None,
+            authentication_parameter_count: None,
+            authentication_challenge_parameter: None,
+            authentication_event: None,
+            authentication_data: None,
         };
         let payload = match transfer.encode() {
             Ok(payload) => payload,
@@ -1713,6 +1719,12 @@ impl ImsCore {
             cell_identifier: Some(cell),
             tag: deliver.tag,
             service_option: None,
+            authentication_response_parameter: None,
+            authentication_confirmation_parameter: None,
+            authentication_parameter_count: None,
+            authentication_challenge_parameter: None,
+            authentication_event: None,
+            authentication_data: None,
         };
         Ok(EncodedA1Message::from_message_for_call(
             &Message::new(MessageType::AddsTransfer, transfer.encode()?),

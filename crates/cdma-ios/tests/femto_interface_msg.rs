@@ -334,6 +334,12 @@ fn adds_transfer_fx2_mapping_reproduces_the_a1_wire_bytes() {
         }),
         tag: Some(cdma_ios::Tag(0x0000_0007)),
         service_option: Some(ServiceOption(3)),
+        authentication_response_parameter: None,
+        authentication_confirmation_parameter: None,
+        authentication_parameter_count: None,
+        authentication_challenge_parameter: None,
+        authentication_event: None,
+        authentication_data: None,
     };
 
     let femto = FemtoInterfaceMsg::from_adds_transfer(&transfer).expect("Fx2 mapping");

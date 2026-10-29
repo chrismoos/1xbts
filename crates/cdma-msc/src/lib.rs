@@ -5,6 +5,7 @@
 //! the media-gateway abstraction that replaces direct BSC ownership of voice
 //! orchestration.
 
+pub mod authentication;
 pub mod base_station;
 pub mod call_control;
 pub mod circuit;

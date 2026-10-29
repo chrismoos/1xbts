@@ -23,8 +23,11 @@ use super::{
     Bts, BtsHandle, BtsNodeConfig, Config, OverheadParameters, PagingChannelSettings, RadioConfig,
     RealtimeSettings, ReverseRxTarget, RxSettings, TrafficResourceController,
     abis_agent::{AbisAgent, AbisAgentConfig, AbisAgentEvent},
+    global_challenge::{AUTH_MODE_NONE, GlobalChallenge, randc},
     paging_supplier::{PagingRetryConfig, PagingSupplierState, build_bts_paging_supplier},
 };
+
+/// AUTHs `00`: the base station does not request authentication (C.S0005-E §3.7.2.3.2.2).
 
 pub struct RadioBuildOptions {
     pub null_radio: bool,
@@ -254,7 +257,9 @@ pub fn build_bts_launch_parts(
     radio: Box<dyn Radio>,
     options: BtsLaunchOptions,
 ) -> Result<BtsLaunchParts, Error> {
-    bts_config.runtime.overhead.auth_mode = bts_config.overhead.auth_mode;
+    let initial_auth_mode = bts_config.overhead.auth_mode.unwrap_or(AUTH_MODE_NONE);
+    bts_config.runtime.overhead.auth_mode = initial_auth_mode;
+    let global_challenge = Arc::new(GlobalChallenge::with_auth(initial_auth_mode));
     bts_config.runtime.overhead.p_rev_in_use = bts_config.overhead.p_rev;
 
     let reverse_rx_plan = resolve_reverse_rx_plan(&bts_config)?;
@@ -277,7 +282,7 @@ pub fn build_bts_launch_parts(
             one_x_rx_shift_hz: reverse_rx_plan.one_x_rx_shift_hz,
             hrpd_reverse_frequency_hz: reverse_rx_plan.hrpd_reverse_frequency_hz,
             hrpd_rx_shift_hz: reverse_rx_plan.hrpd_rx_shift_hz,
-            auth_mode: bts_config.overhead.auth_mode,
+            global_challenge: global_challenge.clone(),
             p_rev_in_use: bts_config.overhead.p_rev,
             capture_iq_wav: None,
             capture_seconds: None,
@@ -513,6 +518,14 @@ pub fn build_bts_launch_parts(
                 .imsi_11_12,
         );
         state.set_pch_transmit_tx(pch_transmit_tx.clone());
+        match overhead.auth_mode {
+            Some(auth) => info!(
+                "BTS global challenge: AUTH={auth} set by configuration, RAND=0x{:08X}",
+                global_challenge.current()
+            ),
+            None => info!("BTS global challenge: AUTH follows the MSC, off until enrollment"),
+        }
+        state.set_global_challenge(global_challenge);
         Arc::new(parking_lot::Mutex::new(state))
     };
     log_open_loop_power_init(
@@ -596,6 +609,7 @@ pub async fn spawn_local_abis_endpoint(
         reverse_bearer_rx,
     );
 
+    let global_challenge = paging_state.lock().global_challenge();
     let listener = tokio::net::TcpListener::bind(config.bind_addr)
         .await
         .map_err(|e| {
@@ -777,6 +791,24 @@ pub async fn spawn_local_abis_endpoint(
                         if let Some(esn) = access_event.esn {
                             mobile_ids.push(cdma_abis::control::typed::MobileIdentity::Esn(esn));
                         }
+                        let authentication_challenge_parameter = global_challenge
+                            .as_ref()
+                            .and_then(|rand| {
+                                let randc_value = access_randc(&raw_bits)?;
+                                let matched = rand.rand_for_randc(randc_value);
+                                if matched.is_none() {
+                                    warn!(
+                                        "BTS: RANDC 0x{randc_value:02X} matches no broadcast RAND"
+                                    );
+                                }
+                                matched
+                            })
+                            .map(|rand| {
+                                cdma_abis::control::typed::AuthenticationChallengeParameter::new(
+                                    rand.to_be_bytes(),
+                                )
+                            })
+                            .filter(|_| !mobile_ids.is_empty());
                         let ach = cdma_abis::control::AchMessageTransferMessage {
                             correlation_id: None,
                             mobile_identities: mobile_ids,
@@ -793,7 +825,7 @@ pub async fn spawn_local_abis_endpoint(
                                     cell: agent_cell_id,
                                     delay_100ns: 0,
                                 },
-                            authentication_challenge_parameter: None,
+                            authentication_challenge_parameter,
                         };
                         match ach.encode() {
                             Ok(bytes) => match cdma_abis::control::decode(&bytes) {
@@ -839,6 +871,15 @@ pub async fn spawn_configured_local_abis_endpoint(
     paging_state: Arc<parking_lot::Mutex<PagingSupplierState>>,
     access_events: mpsc::UnboundedReceiver<cdma_common::events::AccessChannelEvent>,
 ) -> Result<LocalAbisEndpoint, Error> {
+    let global_challenge = paging_state.lock().global_challenge();
+    if let Some(rand) = global_challenge
+        && bts_config.overhead.rand_rotation_secs > 0
+    {
+        spawn_rand_rotation(
+            rand,
+            std::time::Duration::from_secs(bts_config.overhead.rand_rotation_secs),
+        );
+    }
     spawn_local_abis_endpoint(
         LocalAbisEndpointConfig {
             bind_addr: bts_config.abis.bind_addr,
@@ -858,6 +899,37 @@ pub async fn spawn_configured_local_abis_endpoint(
         access_events,
     )
     .await
+}
+
+/// RANDC from the r-csch PDU authentication fields, one bit per element MSB first.
+fn access_randc(raw_bits: &[u8]) -> Option<u8> {
+    use crate::receiver::access_pdu::ReverseAccessPdu;
+    let pdu = ReverseAccessPdu::decode(&cdma_common::bits::Bitstream::new_init(raw_bits)).ok()?;
+    let authentication = match &pdu {
+        ReverseAccessPdu::Pd00Legacy(p) => p.authentication.as_ref(),
+        ReverseAccessPdu::Pd01PRev6(p) => p.authentication.as_ref(),
+        ReverseAccessPdu::Pd10Modern { .. } => None,
+    }?;
+    authentication.randc
+}
+
+fn spawn_rand_rotation(rand: Arc<GlobalChallenge>, period: std::time::Duration) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(period);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if !rand.enabled() {
+                continue;
+            }
+            rand.rotate();
+            info!(
+                "BTS global challenge RAND rotated to 0x{:08X} (RANDC 0x{:02X})",
+                rand.current(),
+                randc(rand.current())
+            );
+        }
+    });
 }
 
 #[cfg(test)]

@@ -9,6 +9,7 @@
   --bg-body: #0c0e14;
   --bg-surface: rgba(255, 255, 255, 0.03);
   --bg-surface-solid: #111827;
+  --bg-popover: #1b1d23;
   --bg-surface-raised: rgba(255, 255, 255, 0.05);
   --bg-sidebar: rgba(12, 14, 20, 0.7);
   --bg-input: rgba(255, 255, 255, 0.03);
@@ -82,6 +83,7 @@
   --bg-body: #fafafa;
   --bg-surface: #fff;
   --bg-surface-solid: #fff;
+  --bg-popover: #fff;
   --bg-surface-raised: #f5f5f8;
   --bg-sidebar: #fff;
   --bg-input: #fafafa;
@@ -145,6 +147,7 @@
   --color-body: var(--bg-body);
   --color-surface: var(--bg-surface);
   --color-surface-solid: var(--bg-surface-solid);
+  --color-popover: var(--bg-popover);
   --color-surface-raised: var(--bg-surface-raised);
   --color-sidebar: var(--bg-sidebar);
   --color-input: var(--bg-input);

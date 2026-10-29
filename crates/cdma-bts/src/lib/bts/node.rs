@@ -293,6 +293,7 @@ pub async fn start_bts_node(
         info!("HRPD AN session service listening on {}", an.grpc_addr);
     }
 
+    let global_challenge = paging_state.lock().global_challenge();
     let abis = spawn_configured_local_abis_endpoint(
         &bts_config,
         resource_controller,
@@ -316,6 +317,7 @@ pub async fn start_bts_node(
         pch_transmit_tx,
     )?;
     management_state.bearer = Some(abis.bearer);
+    management_state.global_challenge = global_challenge;
     management_state.abis_connected = Some(abis.connected);
     management_state.an_grpc_addr = hrpd_an.as_ref().map(|an| {
         bts_config

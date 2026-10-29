@@ -39,7 +39,6 @@
     "acc_config_seq": 5,
     "power_up_reg": true,
     "parameter_reg": true,
-    "auth_mode": 0,
     "p_rev": 6,
     "min_p_rev": 1,
     "lp_sec": 18,

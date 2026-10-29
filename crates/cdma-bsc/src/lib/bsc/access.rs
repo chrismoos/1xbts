@@ -256,11 +256,47 @@ impl AccessTx {
             addr,
             ack_msg_seq,
             true,
-            0b011011,
+            REGISTRATION_ORDER_CODE,
             0,
             "Registration Accepted Order",
             requested_tx_time,
             tx_deadline,
+        )
+    }
+
+    pub(crate) fn send_registration_rejected(
+        &self,
+        cell: Option<AccessCellId>,
+        addr: &MsAddress,
+    ) -> Result<(), Error> {
+        self.send_order(
+            cell,
+            addr,
+            0,
+            false,
+            REGISTRATION_ORDER_CODE,
+            REGISTRATION_REJECTED_ORDQ,
+            "Registration Rejected Order",
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn send_registration_accepted_after_authentication(
+        &self,
+        cell: Option<AccessCellId>,
+        addr: &MsAddress,
+    ) -> Result<(), Error> {
+        self.send_order(
+            cell,
+            addr,
+            0,
+            false,
+            REGISTRATION_ORDER_CODE,
+            0,
+            "Registration Accepted Order",
+            None,
+            None,
         )
     }
 
@@ -389,18 +425,43 @@ impl AccessService {
         update: AccessRegistrationUpdate,
     ) -> cdma_common::lac::paging_messages::MsAddress {
         let registration_imsi = update.registration_imsi.clone();
+        let update_was_explicit = update.explicit_registration;
+        let awaits_authentication =
+            update.explicit_registration && registration_awaits_authentication(bsc, event);
         let outcome = bsc.mobiles.apply_access_registration(event, update);
+        let authentication = awaits_authentication.then(|| {
+            let call_id = bsc.voice.allocate_mo_call_id();
+            bsc.a1.push_pending_registration(
+                call_id,
+                super::a1::PendingA1Registration {
+                    fwd_address: outcome.fwd_address.clone(),
+                    cell: event.cell,
+                },
+            );
+            (
+                super::a1::A1GlobalChallengeIes::from_event(event, true),
+                call_id,
+            )
+        });
         // Notify the MSC on *every* event that flows through here
         // (Registration, Origination, PageResponse, Reconnect, …) so the
         // MSC's `mobiles_seen` table refreshes `last_seen_at` on real
         // contact, not just on explicit Registration Messages. The MSC
         // only sends welcome SMS on `is_new || elapsed > threshold`, so this
         // does not multiply welcome traffic.
+        // With AUTH=01 an implicit registration is not reported separately. The
+        // Location Updating Request would carry no authentication fields and be
+        // accepted unchecked, while the originating message reaches the MSC with
+        // its own and binds the mobile only when it verifies.
+        if !update_was_explicit && bsc.config.bts.auth_mode(event.cell) != 0 {
+            return outcome.fwd_address;
+        }
         bsc.notify_msc_registration(
             &outcome.fwd_address,
             registration_imsi,
             event.esn,
             event.meid.clone(),
+            authentication,
         );
         outcome.fwd_address
     }
@@ -662,15 +723,27 @@ impl AccessService {
         // Resolve subscriber via HLR (async, fire-and-forget)
         bsc.resolve_subscriber_from_hlr(event, &fwd_address);
 
-        // Send Registration Accepted Order with ARQ ack piggybacked
-        if let Err(e) = bsc.access_tx.send_registration_accepted(
-            event.cell,
-            &fwd_address,
-            last_msg_seq,
-            access_response_tx_time(event),
-            bsc.access_ack_deadline(event),
-        ) {
-            warn!("BSC: failed to send registration accepted: {}", e);
+        // With AUTH=01 the MSC decides, so only the layer-2 ack goes out now and the
+        // Registration Accepted or Rejected Order follows the Location Updating result.
+        let sent = if registration_awaits_authentication(bsc, event) {
+            bsc.access_tx.send_bs_ack_order(
+                event.cell,
+                &fwd_address,
+                last_msg_seq,
+                access_response_tx_time(event),
+                bsc.access_ack_deadline(event),
+            )
+        } else {
+            bsc.access_tx.send_registration_accepted(
+                event.cell,
+                &fwd_address,
+                last_msg_seq,
+                access_response_tx_time(event),
+                bsc.access_ack_deadline(event),
+            )
+        };
+        if let Err(e) = sent {
+            warn!("BSC: failed to answer registration: {}", e);
             return;
         }
 
@@ -864,7 +937,7 @@ impl AccessService {
             return;
         };
 
-        bsc.route_decoded_mo_sms(&sms, &fwd_addr, fields);
+        bsc.route_decoded_mo_sms(&sms, &fwd_addr, fields, Some(event));
     }
 
     pub(crate) async fn handle_page_response(&mut self, bsc: &mut Bsc, event: &AccessChannelEvent) {
@@ -1458,6 +1531,15 @@ pub(crate) fn extract_page_address(
     }
 }
 
+/// C.S0005-E Table 3.7.4-1: ORDER `011011` specifies Registration Accepted (ORDQ 0)
+/// and Registration Rejected (ORDQ `00000010`).
+const REGISTRATION_ORDER_CODE: u8 = 0b011011;
+const REGISTRATION_REJECTED_ORDQ: u8 = 0b0000_0010;
+
+pub(crate) fn registration_awaits_authentication(bsc: &Bsc, event: &AccessChannelEvent) -> bool {
+    event.message_id == MessageId::Registration && bsc.config.bts.auth_mode(event.cell) != 0
+}
+
 /// Requested TX time for access-coupled responses.  Send as soon as
 /// possible — T56m (200 ms) is the *maximum* allowed BS response time,
 /// not a minimum delay.
@@ -1481,6 +1563,7 @@ impl Bsc {
         registration_imsi: Option<String>,
         event_esn: Option<u32>,
         event_meid: Option<String>,
+        authentication: Option<(super::a1::A1GlobalChallengeIes, u64)>,
     ) {
         // ESN-only mobiles carry it in fwd_address. IMSI+ESN class-0 mobiles
         // carry it in the access PDU addressing fields.
@@ -1493,6 +1576,10 @@ impl Bsc {
         let cell_id = cdma_ios::CellId {
             cell: serving_cell.cell,
             sector: serving_cell.sector,
+        };
+        let (auth_ies, call_id) = match authentication {
+            Some((ies, call_id)) => (ies, Some(call_id)),
+            None => (super::a1::A1GlobalChallengeIes::default(), None),
         };
         tokio::spawn(async move {
             let mobile_identity = registration_imsi
@@ -1509,11 +1596,11 @@ impl Bsc {
                     .as_deref()
                     .and_then(super::a1::meid_identity_from_hex),
                 slot_cycle_index: None,
-                authentication_response_parameter: None,
-                authentication_confirmation_parameter: None,
-                authentication_parameter_count: None,
-                authentication_challenge_parameter: None,
-                authentication_event: None,
+                authentication_response_parameter: auth_ies.response,
+                authentication_confirmation_parameter: auth_ies.randc,
+                authentication_parameter_count: auth_ies.count,
+                authentication_challenge_parameter: auth_ies.challenge,
+                authentication_event: auth_ies.event,
                 user_zone_id: None,
                 is2000_mobile_capabilities: None,
             };
@@ -1535,10 +1622,10 @@ impl Bsc {
                     return;
                 }
             };
-            let msg = cdma_ios::EncodedA1Message::from_message(&cdma_ios::Message::new(
-                cdma_ios::MessageType::CompleteLayer3Information,
-                payload,
-            ));
+            let msg = cdma_ios::EncodedA1Message::from_message_for_call(
+                &cdma_ios::Message::new(cdma_ios::MessageType::CompleteLayer3Information, payload),
+                call_id,
+            );
             if let Err(e) = a1_client.send_a1(msg).await {
                 log::warn!("BSC: failed to send registration notification to MSC: {e}");
             }

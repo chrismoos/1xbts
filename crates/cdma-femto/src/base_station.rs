@@ -98,7 +98,7 @@ mod tests {
         config.sites.insert("test-fap".to_string(), test_fap);
         config.normalize();
         let response = FemtoBaseStationService::new(&config)
-            .enroll(Request::new(proto::EnrollRequest {}))
+            .enroll(Request::new(proto::EnrollRequest::default()))
             .await
             .unwrap()
             .into_inner();

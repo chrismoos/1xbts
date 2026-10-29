@@ -1,4 +1,5 @@
-use std::sync::LazyLock;
+use super::long_code_privacy::{LongCodePrivacy, PRIVACY_FRAME_CHIPS};
+use std::sync::{Arc, LazyLock};
 
 /// Long code generator for CDMA2000 as specified in C.S0002-E v1.0
 ///
@@ -9,6 +10,8 @@ use std::sync::LazyLock;
 pub struct LongCodeGenerator {
     state: u64,
     mask: u64,
+    chip_position: u64,
+    privacy: Option<Arc<LongCodePrivacy>>,
 }
 
 static T_MATRIX_POWERS: LazyLock<[[u64; 42]; 64]> = LazyLock::new(|| {
@@ -26,6 +29,24 @@ impl LongCodeGenerator {
             // Initial state per spec: 42nd bit = 1, all others = 0
             state: 1u64 << 41,
             mask,
+            chip_position: 0,
+            privacy: None,
+        }
+    }
+
+    pub fn with_privacy(mut self, privacy: Option<Arc<LongCodePrivacy>>) -> Self {
+        self.privacy = privacy;
+        self.refresh_privacy_mask();
+        self
+    }
+
+    pub fn privacy(&self) -> Option<Arc<LongCodePrivacy>> {
+        self.privacy.clone()
+    }
+
+    fn refresh_privacy_mask(&mut self) {
+        if let Some(privacy) = &self.privacy {
+            self.mask = privacy.mask_at(self.chip_position);
         }
     }
 
@@ -152,8 +173,12 @@ impl LongCodeGenerator {
     }
 
     pub fn next_chip(&mut self) -> u8 {
+        if self.privacy.is_some() && self.chip_position % PRIVACY_FRAME_CHIPS == 0 {
+            self.refresh_privacy_mask();
+        }
         let chip = self.peek_output();
         self.advance_state();
+        self.chip_position += 1;
         chip
     }
 
@@ -213,6 +238,8 @@ impl LongCodeGenerator {
     }
 
     pub fn advance_chips(&mut self, mut num_chips: usize) {
+        self.chip_position = self.chip_position.saturating_add(num_chips as u64);
+        self.refresh_privacy_mask();
         if num_chips >= 64 {
             // Use matrix-based jumps for large deltas. The T^(2^n) powers are
             // process-wide constants, so keep them out of the hot path.

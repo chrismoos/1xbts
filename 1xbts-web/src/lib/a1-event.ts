@@ -18,6 +18,7 @@ import { serviceOptionName } from "@/lib/service-option";
 
 // SSE-compacted A1 message from `/api/events`: `sdu` is dropped for `sduHex` and IEs arrive pre-hexed, so the browser sees no base64 or Uint8Array.
 export interface A1LogEvent {
+  voicePrivacy?: string;
   // FEID for a femtocell, base-station id for a BSC. Empty when unknown.
   peerId: string;
   direction: A1Direction;

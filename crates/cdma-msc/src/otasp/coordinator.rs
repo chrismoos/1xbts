@@ -19,7 +19,9 @@ use crate::otasp::event::{HardwareIdentity, OtaspEvent};
 use crate::otasp::history::OtaspHistory;
 use crate::otasp::nam::{ResolvedPrlMeta, ResolvedSubscriberInput};
 use crate::otasp::proto_conv::{to_proto_event as to_proto_otasp_event, to_proto_msc_event};
-use crate::otasp::session::{OtaspSession, OtaspTransport, OutboundOtasp, SessionOutcome};
+use crate::otasp::session::{
+    KeyExchangeOffer, OtaspAuthRequest, OtaspSession, OtaspTransport, OutboundOtasp, SessionOutcome,
+};
 use crate::runtime::MscA1Endpoint;
 
 /// Per-session in-memory state plus pending outbound bytes for the next A1 flush.
@@ -37,14 +39,31 @@ struct SessionEntry {
     /// Brief label for the phase the session was last in, so the timeout
     /// event can name what we were waiting on.
     last_phase: String,
+    requests: Vec<OtaspAuthRequest>,
+    identity: Option<cdma_hlr::model::MobileIdentityKey>,
+    imsi: Option<String>,
+    /// Whether the `*228` origination verified. None when it was not authenticated.
+    origination_verified: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OtaspSsdUpdate {
+    pub call_id: u64,
+    pub context: crate::authentication::CallAuthContext,
 }
 
 /// Default inbound silence threshold before a session is force-released.
 pub const DEFAULT_INBOUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Silence allowed while the mobile computes an MS Key Response or Key Generation
+/// Response. C.S0016-D §3.3.1 gives it 30 seconds after receiving the request, and the
+/// extra seconds cover the request's delivery and the response's return.
+pub const KEY_EXCHANGE_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
+
 struct Recorder<'a> {
     out: &'a mut Vec<OutboundOtasp>,
     events: &'a mut Vec<OtaspEvent>,
+    requests: &'a mut Vec<OtaspAuthRequest>,
 }
 
 impl<'a> OtaspTransport for Recorder<'a> {
@@ -53,6 +72,9 @@ impl<'a> OtaspTransport for Recorder<'a> {
     }
     fn emit(&mut self, event: OtaspEvent) {
         self.events.push(event);
+    }
+    fn request(&mut self, request: OtaspAuthRequest) {
+        self.requests.push(request);
     }
 }
 
@@ -74,6 +96,7 @@ pub struct OtaspCoordinator {
     /// so the MSC runtime's `AddsDeliverAck` dispatcher can route by
     /// inspecting the top bit.
     next_tag: u32,
+    ssd_updates: Vec<OtaspSsdUpdate>,
 }
 
 /// High bit set on OTASP-owned ADDS Deliver tags. Lets the MSC
@@ -194,6 +217,7 @@ impl OtaspCoordinator {
             event_tx,
             pending_acks: HashMap::new(),
             next_tag: 0,
+            ssd_updates: Vec::new(),
         }
     }
 
@@ -255,6 +279,7 @@ impl OtaspCoordinator {
             let mut rec = Recorder {
                 out: &mut entry.pending_out,
                 events: &mut entry.events,
+                requests: &mut entry.requests,
             };
             entry.session.on_dbm_failed(cause.0, &mut rec);
             entry.last_activity = std::time::Instant::now();
@@ -285,6 +310,10 @@ impl OtaspCoordinator {
             a1,
         )
         .await;
+        if let Some(outcome) = self.process_auth_requests(&session_key, a1).await {
+            self.finalize_session(&session_key, record_id, outcome)
+                .await;
+        }
     }
 
     /// Returns the shared session-history buffer (for management RPCs).
@@ -325,6 +354,7 @@ impl OtaspCoordinator {
         feature_code: String,
         actual_service_option: u16,
         mobile_identity_for_deliver: cdma_ios::MobileIdentity,
+        origination_verified: Option<bool>,
         call_id: u64,
         a1: &dyn MscA1Endpoint,
     ) {
@@ -364,6 +394,16 @@ impl OtaspCoordinator {
                 None
             }
         };
+        let imsi = hlr
+            .as_ref()
+            .map(|h| h.imsi.clone())
+            .filter(|imsi| !imsi.is_empty());
+        let identity = cdma_hlr::model::MobileIdentityKey::from_parts(
+            imsi.as_deref(),
+            device.esn,
+            device.meid.as_deref(),
+        )
+        .ok();
         let key = match (&device.esn, &device.meid) {
             (Some(e), _) => SessionKey::Esn(*e),
             (None, Some(m)) => SessionKey::Meid(m.clone()),
@@ -382,10 +422,12 @@ impl OtaspCoordinator {
         );
         let mut pending_out = Vec::new();
         let mut events = Vec::new();
+        let mut requests = Vec::new();
         {
             let mut rec = Recorder {
                 out: &mut pending_out,
                 events: &mut events,
+                requests: &mut requests,
             };
             session.start(&mut rec);
         }
@@ -417,6 +459,10 @@ impl OtaspCoordinator {
                 record_id,
                 last_activity: std::time::Instant::now(),
                 last_phase: "Protocol Capability".to_string(),
+                requests,
+                identity,
+                imsi,
+                origination_verified,
             },
         );
         info!("OTASP: session started for device {:?}", device);
@@ -481,10 +527,13 @@ impl OtaspCoordinator {
                 let mut rec = Recorder {
                     out: &mut entry.pending_out,
                     events: &mut entry.events,
+                    requests: &mut entry.requests,
                 };
                 entry.session.on_inbound(&msg.adds_user_part.data, &mut rec)
             };
-            entry.last_activity = std::time::Instant::now();
+            let now = std::time::Instant::now();
+            stamp_mobile_compute_time(&mut entry.events, now.duration_since(entry.last_activity));
+            entry.last_activity = now;
             entry.last_phase =
                 label_for_latest_phase(&entry.events).unwrap_or(entry.last_phase.clone());
             (
@@ -502,11 +551,335 @@ impl OtaspCoordinator {
         }
         self.flush_outbound(&mut out, &mobile_identity_for_deliver, call_id, &key, a1)
             .await;
-        if let Some(o) = outcome {
+        let follow_up = self.process_auth_requests(&key, a1).await;
+        if let Some(o) = outcome.or(follow_up) {
             self.finalize_session(&key, record_id, o).await;
             return Some(call_id);
         }
         None
+    }
+
+    pub(crate) fn take_ssd_updates(&mut self) -> Vec<OtaspSsdUpdate> {
+        std::mem::take(&mut self.ssd_updates)
+    }
+
+    pub fn owns_call(&self, call_id: u64) -> bool {
+        self.sessions.values().any(|e| e.call_id == call_id)
+    }
+
+    pub async fn on_ssd_update_finished(
+        &mut self,
+        call_id: u64,
+        ok: bool,
+        a1: &dyn MscA1Endpoint,
+    ) -> Option<u64> {
+        let key = self
+            .sessions
+            .iter()
+            .find(|(_, e)| e.call_id == call_id)
+            .map(|(k, _)| k.clone())?;
+        let outcome = self
+            .with_session(&key, a1, |session, rec| {
+                session.on_ssd_update_finished(ok, rec)
+            })
+            .await;
+        let follow_up = self.process_auth_requests(&key, a1).await;
+        let outcome = outcome.or(follow_up)?;
+        let record_id = self.sessions.get(&key)?.record_id;
+        self.finalize_session(&key, record_id, outcome).await;
+        Some(call_id)
+    }
+
+    async fn with_session<F>(
+        &mut self,
+        key: &SessionKey,
+        a1: &dyn MscA1Endpoint,
+        f: F,
+    ) -> Option<SessionOutcome>
+    where
+        F: FnOnce(&mut OtaspSession, &mut Recorder<'_>) -> Option<SessionOutcome>,
+    {
+        let (outcome, call_id, record_id, new_events, mut out) = {
+            let entry = self.sessions.get_mut(key)?;
+            let outcome = {
+                let mut rec = Recorder {
+                    out: &mut entry.pending_out,
+                    events: &mut entry.events,
+                    requests: &mut entry.requests,
+                };
+                f(&mut entry.session, &mut rec)
+            };
+            entry.last_activity = std::time::Instant::now();
+            entry.last_phase =
+                label_for_latest_phase(&entry.events).unwrap_or(entry.last_phase.clone());
+            (
+                outcome,
+                entry.call_id,
+                entry.record_id,
+                entry.events.split_off(0),
+                entry.pending_out.split_off(0),
+            )
+        };
+        log_events(&new_events);
+        self.broadcast_events(&new_events);
+        for ev in &new_events {
+            self.history.append(record_id, ev.clone());
+        }
+        let deliver_identity = cdma_ios::MobileIdentity::Imsi(String::new());
+        self.flush_outbound(&mut out, &deliver_identity, call_id, key, a1)
+            .await;
+        outcome
+    }
+
+    fn emit_authentication(
+        &self,
+        key: &SessionKey,
+        procedure: events_proto::AuthenticationProcedure,
+        result: events_proto::AuthenticationResult,
+    ) {
+        let Some(tx) = self.event_tx.as_ref() else {
+            return;
+        };
+        let Some(entry) = self.sessions.get(key) else {
+            return;
+        };
+        let esn = match key {
+            SessionKey::Esn(esn) => Some(*esn),
+            SessionKey::Meid(_) => None,
+        };
+        let _ = tx.send(crate::authentication::authentication_event(
+            procedure,
+            result,
+            false,
+            entry.imsi.as_deref(),
+            esn,
+            "",
+        ));
+    }
+
+    async fn a_key_on_file(
+        &self,
+        key: &SessionKey,
+        identity: Option<&cdma_hlr::model::MobileIdentityKey>,
+    ) -> Option<crate::otasp::event::AKeySkipReason> {
+        use crate::otasp::event::AKeySkipReason;
+        match self.hlr.get_subscriber_auth_state(identity?).await {
+            Ok(Some(state)) if state.credentials_provisioned => {}
+            Ok(_) => return None,
+            Err(error) => {
+                warn!("OTASP: HLR auth state lookup failed: {error}");
+                return None;
+            }
+        }
+        Some(
+            match self
+                .sessions
+                .get(key)
+                .and_then(|entry| entry.origination_verified)
+            {
+                Some(true) => AKeySkipReason::KeyOnFileVerified,
+                Some(false) => AKeySkipReason::KeyOnFileUnverified,
+                None => AKeySkipReason::KeyOnFileNotChecked,
+            },
+        )
+    }
+
+    async fn process_auth_requests(
+        &mut self,
+        key: &SessionKey,
+        a1: &dyn MscA1Endpoint,
+    ) -> Option<SessionOutcome> {
+        use events_proto::{AuthenticationProcedure, AuthenticationResult};
+        loop {
+            let (request, identity, imsi, call_id) = {
+                let entry = self.sessions.get_mut(key)?;
+                if entry.requests.is_empty() {
+                    return None;
+                }
+                (
+                    entry.requests.remove(0),
+                    entry.identity.clone(),
+                    entry.imsi.clone(),
+                    entry.call_id,
+                )
+            };
+            let esn = match key {
+                SessionKey::Esn(esn) => Some(*esn),
+                SessionKey::Meid(_) => None,
+            };
+            let outcome = match request {
+                OtaspAuthRequest::BeginKeyExchange { a_key_p_rev } => {
+                    if let Some(reason) = self.a_key_on_file(key, identity.as_ref()).await {
+                        info!(
+                            "OTASP: keeping the A-key on file for {:?}, no key exchange ({:?})",
+                            key, reason
+                        );
+                        return self
+                            .with_session(key, a1, |session, rec| {
+                                session.on_key_exchange_skipped(reason, rec)
+                            })
+                            .await;
+                    }
+                    let offer = match identity.as_ref() {
+                        Some(identity) => {
+                            match self
+                                .hlr
+                                .begin_cave_key_exchange(identity, a_key_p_rev)
+                                .await
+                            {
+                                Ok(offer) => Some(KeyExchangeOffer {
+                                    a_key_p_rev: offer.a_key_p_rev,
+                                    params: offer.params,
+                                    bs_result: offer.bs_result,
+                                }),
+                                Err(error) => {
+                                    warn!("OTASP: HLR could not start key exchange: {error}");
+                                    None
+                                }
+                            }
+                        }
+                        None => {
+                            warn!("OTASP: no complete identity for A-key provisioning");
+                            None
+                        }
+                    };
+                    if offer.is_none() {
+                        self.emit_authentication(
+                            key,
+                            AuthenticationProcedure::OtaspKeyExchange,
+                            AuthenticationResult::HlrError,
+                        );
+                    }
+                    self.with_session(key, a1, |session, rec| {
+                        session.on_key_exchange_offer(offer, rec)
+                    })
+                    .await
+                }
+                OtaspAuthRequest::CompleteKeyExchange { ms_result } => {
+                    let ok = match identity.as_ref() {
+                        Some(identity) => {
+                            match self
+                                .hlr
+                                .complete_cave_key_exchange(identity, &ms_result)
+                                .await
+                            {
+                                Ok(()) => true,
+                                Err(error) => {
+                                    warn!("OTASP: key exchange failed: {error}");
+                                    false
+                                }
+                            }
+                        }
+                        None => false,
+                    };
+                    self.emit_authentication(
+                        key,
+                        AuthenticationProcedure::OtaspKeyExchange,
+                        if ok {
+                            AuthenticationResult::Success
+                        } else {
+                            AuthenticationResult::HlrError
+                        },
+                    );
+                    self.with_session(key, a1, |session, rec| {
+                        session.on_key_exchange_completed(ok, rec)
+                    })
+                    .await
+                }
+                OtaspAuthRequest::SsdUpdate => match (identity, imsi, esn) {
+                    (Some(identity), Some(imsi), Some(esn)) => {
+                        self.ssd_updates.push(OtaspSsdUpdate {
+                            call_id,
+                            context: crate::authentication::CallAuthContext {
+                                identity,
+                                imsi,
+                                esn,
+                                global_result: crate::authentication::AuthenticationResult::Success,
+                            },
+                        });
+                        None
+                    }
+                    _ => {
+                        self.with_session(key, a1, |session, rec| {
+                            session.on_ssd_update_finished(false, rec)
+                        })
+                        .await
+                    }
+                },
+                OtaspAuthRequest::VerifyReauthentication { rand, response } => {
+                    const RANDC_SHIFT: u32 = 24;
+                    let randc_matches = (rand >> RANDC_SHIFT) as u8 == response.randc;
+                    let verdict = match (identity.as_ref(), esn) {
+                        (Some(identity), Some(esn)) if randc_matches => self
+                            .hlr
+                            .verify_cave_global_challenge(
+                                identity,
+                                &cdma_hlr::auth::GlobalChallenge {
+                                    esn,
+                                    rand,
+                                    authr: response.authr,
+                                    count: Some(response.count),
+                                    auth_data: response.auth_data,
+                                    generate_call_keys: false,
+                                    otasp_reauthentication: true,
+                                },
+                            )
+                            .await
+                            .map(|v| v.outcome)
+                            .map_err(|error| warn!("OTASP: re-authentication failed: {error}"))
+                            .ok(),
+                        _ => None,
+                    };
+                    let ok = verdict == Some(cdma_hlr::auth::CaveAuthOutcome::Success);
+                    self.emit_authentication(
+                        key,
+                        AuthenticationProcedure::OtaspReauthentication,
+                        match verdict {
+                            Some(cdma_hlr::auth::CaveAuthOutcome::Success) => {
+                                AuthenticationResult::Success
+                            }
+                            Some(cdma_hlr::auth::CaveAuthOutcome::CountMismatch) => {
+                                AuthenticationResult::CountMismatch
+                            }
+                            Some(_) => AuthenticationResult::SignatureMismatch,
+                            None if !randc_matches => AuthenticationResult::RandMismatch,
+                            None => AuthenticationResult::HlrError,
+                        },
+                    );
+                    self.with_session(key, a1, |session, rec| {
+                        session.on_reauthentication_verified(ok, rec)
+                    })
+                    .await
+                }
+                OtaspAuthRequest::CommitKey => {
+                    if let Some(identity) = identity.as_ref() {
+                        match self.hlr.commit_cave_key(identity).await {
+                            Ok(()) => {
+                                info!("OTASP: new A-key committed for {:?}", key);
+                                self.emit_authentication(
+                                    key,
+                                    AuthenticationProcedure::OtaspKeyExchange,
+                                    AuthenticationResult::Success,
+                                );
+                            }
+                            Err(error) => warn!("OTASP: HLR failed to commit A-key: {error}"),
+                        }
+                    }
+                    None
+                }
+                OtaspAuthRequest::AbortKeyExchange => {
+                    if let Some(identity) = identity.as_ref()
+                        && let Err(error) = self.hlr.abort_cave_key_exchange(identity).await
+                    {
+                        warn!("OTASP: failed to abandon key exchange: {error}");
+                    }
+                    None
+                }
+            };
+            if outcome.is_some() {
+                return outcome;
+            }
+        }
     }
 
     async fn finalize_session(
@@ -519,7 +892,14 @@ impl OtaspCoordinator {
             "OTASP: session {:?} ended: kind={:?} blocks={}",
             key, outcome.kind, outcome.completed_blocks
         );
-        self.sessions.remove(key);
+        if let Some(entry) = self.sessions.remove(key)
+            && entry.session.key_exchange_started()
+            && outcome.kind != crate::otasp::event::SessionOutcomeKind::Committed
+            && let Some(identity) = entry.identity.as_ref()
+            && let Err(error) = self.hlr.abort_cave_key_exchange(identity).await
+        {
+            warn!("OTASP: failed to abandon key exchange: {error}");
+        }
         if let Some(rec) = self.history.take_finished(record_id) {
             self.persist_session_record(rec).await;
         }
@@ -551,16 +931,28 @@ impl OtaspCoordinator {
         let stale_keys: Vec<SessionKey> = self
             .sessions
             .iter()
-            .filter(|(_, e)| now.duration_since(e.last_activity) >= threshold)
+            .filter(|(_, e)| now.duration_since(e.last_activity) >= session_timeout(e, threshold))
             .map(|(k, _)| k.clone())
             .collect();
         let mut to_persist = Vec::new();
         for key in stale_keys {
             if let Some(entry) = self.sessions.remove(&key) {
-                let phase = entry.last_phase.clone();
+                if entry.session.key_exchange_started()
+                    && let Some(identity) = entry.identity.as_ref()
+                    && let Err(error) = self.hlr.abort_cave_key_exchange(identity).await
+                {
+                    warn!("OTASP: failed to abandon key exchange: {error}");
+                }
+                let phase = entry
+                    .session
+                    .awaited_key_exchange_response()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| entry.last_phase.clone());
                 warn!(
                     "OTASP: session call_id={} timed out after {:?} waiting on '{}' — releasing",
-                    entry.call_id, threshold, phase
+                    entry.call_id,
+                    session_timeout(&entry, threshold),
+                    phase
                 );
                 let events = vec![
                     OtaspEvent::Timeout {
@@ -724,6 +1116,29 @@ fn session_outcome_to_proto(o: crate::otasp::event::SessionOutcomeKind) -> i32 {
             events_proto::OtaspSessionOutcome::ProtocolError as i32
         }
         SessionOutcomeKind::TimedOut => events_proto::OtaspSessionOutcome::TimedOut as i32,
+        SessionOutcomeKind::KeyExchangeFailed => {
+            events_proto::OtaspSessionOutcome::KeyExchangeFailed as i32
+        }
+    }
+}
+
+fn stamp_mobile_compute_time(events: &mut [OtaspEvent], waited: std::time::Duration) {
+    for event in events {
+        if let OtaspEvent::AKeyProgress {
+            step, elapsed_ms, ..
+        } = event
+            && step.mobile_computes()
+        {
+            *elapsed_ms = Some(u32::try_from(waited.as_millis()).unwrap_or(u32::MAX));
+        }
+    }
+}
+
+fn session_timeout(entry: &SessionEntry, threshold: std::time::Duration) -> std::time::Duration {
+    if entry.session.awaited_key_exchange_response().is_some() {
+        threshold.max(KEY_EXCHANGE_RESPONSE_TIMEOUT)
+    } else {
+        threshold
     }
 }
 
@@ -886,6 +1301,17 @@ fn log_events(events: &[OtaspEvent]) {
             } => info!(
                 "OTASP event: session ended blocks={} outcome={:?}",
                 completed_blocks, outcome
+            ),
+            OtaspEvent::AKeyProgress {
+                step,
+                success,
+                a_key_p_rev,
+                elapsed_ms,
+                result_code,
+                skip_reason,
+            } => info!(
+                "OTASP event: A-key {:?} success={} a_key_p_rev={} elapsed_ms={:?} result_code={:?} skip_reason={:?}",
+                step, success, a_key_p_rev, elapsed_ms, result_code, skip_reason
             ),
         }
     }

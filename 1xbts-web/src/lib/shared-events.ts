@@ -9,11 +9,30 @@
 type Listener = (data: string) => void;
 type ConnectListener = (connected: boolean) => void;
 
-const CHANNEL_NAME = "cdma-sse";
+// SSE event names this source registers and relays. A name absent here is still
+// emitted by the stream but never subscribed to, so `useEventStream` callbacks
+// for it silently never fire — add the name when the server emits a new type.
+const SSE_EVENT_TYPES = [
+  "radio-metrics",
+  "paging",
+  "traffic",
+  "access",
+  "hrpd-session",
+  "hrpd-access",
+  "hrpd-traffic",
+  "a1",
+  "authentication",
+];
+
+// Tabs and hot-reloaded modules that register a different set of event names
+// use a different channel and singleton. A leader built from older code would
+// otherwise hold the only EventSource and never relay the newer names.
+const EVENT_TYPES_KEY = SSE_EVENT_TYPES.join(",");
+const CHANNEL_NAME = `cdma-sse:${EVENT_TYPES_KEY}`;
 const HEARTBEAT_MS = 3000;
 const LEADER_TIMEOUT_MS = 5000;
 
-const GLOBAL_KEY = "__cdma_shared_events__" as const;
+const GLOBAL_KEY = `__cdma_shared_events__:${EVENT_TYPES_KEY}`;
 
 export class SharedEventSource {
   private bc: BroadcastChannel;
@@ -177,19 +196,6 @@ export class SharedEventSource {
 }
 
 /** Get or create the singleton shared event source. */
-// SSE event names this source registers and relays. A name absent here is still
-// carried by the stream but never subscribed to, so `useEventStream` callbacks
-// for it silently never fire — add the name when the server emits a new type.
-const SSE_EVENT_TYPES = [
-  "radio-metrics",
-  "paging",
-  "traffic",
-  "access",
-  "hrpd-session",
-  "hrpd-access",
-  "hrpd-traffic",
-  "a1",
-];
 
 export function getSharedEvents(): SharedEventSource {
   const g = globalThis as Record<string, unknown>;

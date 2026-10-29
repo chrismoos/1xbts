@@ -12,6 +12,7 @@ description = "MSC runtime, A1 control, call routing, and voice policy support f
 async-stream = "0.3"
 async-trait = "0.1"
 chrono = "0.4"
+cdma-cave = { path = "../cdma-cave" }
 cdma-common = { path = "../cdma-common" }
 cdma-hlr = { path = "../cdma-hlr" }
 cdma-ios = { path = "../cdma-ios" }
@@ -21,6 +22,7 @@ cdma-voice = { path = "../cdma-voice" }
 log = "0.4"
 prost = "0.13"
 prost-types = "0.13"
+rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "net", "signal"] }

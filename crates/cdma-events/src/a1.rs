@@ -1,4 +1,4 @@
-//! A1 BSMAP/DTAP observations preserve wire SDUs (A.S0001 §3.1) and Fx2 IEs (X.S0059-200 §8.1.1.2).
+//! A1 observations use A.S0001 §3.1 and X.S0059-200 §8.1.1.2 framing. Encryption keys are redacted.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -64,11 +64,54 @@ struct A1Body {
     sdu: Vec<u8>,
     information_elements: Vec<proto::A1InformationElement>,
     message_name: Option<String>,
+    voice_privacy: Option<String>,
 }
 
 impl A1Body {
     fn from_fx2(message: &FemtoInterfaceMsg) -> Self {
+        let mut message = message.clone();
+        let mut voice_privacy = (message.message_type == fx2::MSG_TYPE_PRIVACY_MODE_COMPLETE
+            && message
+                .ies
+                .iter()
+                .any(|ie| ie.iei == fx2::IE_VOICE_PRIVACY_REQUEST))
+        .then(|| "pending".to_string());
+        for ie in &mut message.ies {
+            if ie.iei != fx2::IE_ENCRYPTION_INFORMATION {
+                continue;
+            }
+            const TLV_HEADER_OCTETS: usize = 2;
+            if let Some(payload) = ie.content.get(TLV_HEADER_OCTETS..) {
+                if let Ok(mut info) = cdma_ios::EncryptionInformation::decode(payload) {
+                    for parameter in &mut info.parameters {
+                        if parameter.identifier == cdma_ios::typed::PRIVATE_LONG_CODE_IDENTIFIER {
+                            voice_privacy = Some(
+                                if message.message_type == fx2::MSG_TYPE_PRIVACY_MODE_COMMAND
+                                    || (message.message_type == fx2::MSG_TYPE_ASSIGNMENT_REQUEST
+                                        && parameter.status)
+                                {
+                                    "pending"
+                                } else if parameter.status {
+                                    "private"
+                                } else {
+                                    "public"
+                                }
+                                .to_string(),
+                            );
+                        }
+                        parameter.value.fill(0);
+                    }
+                    if let Ok(payload) = info.encode() {
+                        ie.content.truncate(TLV_HEADER_OCTETS);
+                        ie.content.extend_from_slice(&payload);
+                    }
+                } else {
+                    ie.content[TLV_HEADER_OCTETS..].fill(0);
+                }
+            }
+        }
         Self {
+            voice_privacy,
             message_type: message.message_type,
             discriminator: message.discriminator,
             sdu: message.to_layer3_sdu(),
@@ -95,9 +138,41 @@ impl A1Body {
     /// Information elements are left unsplit: BSMAP IE framing is
     /// per-message-type, not per-IEI — `Cause` is Type 4 in Clear Request and
     /// Type 3 in ADDS Transfer Ack — so a generic scan would desynchronise.
-    /// `sdu` still carries every octet.
     fn from_a1_wire(encoded: &cdma_ios::EncodedA1Message) -> Option<Self> {
         let message = encoded.decode().ok()?;
+        match message.message_type {
+            cdma_ios::MessageType::AssignmentRequest => {
+                let request = cdma_ios::AssignmentRequestMessage::decode(&message.payload).ok()?;
+                if request.encryption_information.is_some() {
+                    return Some(Self::from_fx2(
+                        &FemtoInterfaceMsg::from_assignment_request(&request).ok()?,
+                    ));
+                }
+            }
+            cdma_ios::MessageType::AssignmentComplete => {
+                let complete =
+                    cdma_ios::AssignmentCompleteMessage::decode(&message.payload).ok()?;
+                if complete.encryption_information.is_some() {
+                    return Some(Self::from_fx2(
+                        &FemtoInterfaceMsg::from_assignment_complete(&complete).ok()?,
+                    ));
+                }
+            }
+            cdma_ios::MessageType::PrivacyModeCommand => {
+                let command = cdma_ios::PrivacyModeCommandMessage::decode(&message.payload).ok()?;
+                return Some(Self::from_fx2(
+                    &FemtoInterfaceMsg::from_privacy_mode_command(&command).ok()?,
+                ));
+            }
+            cdma_ios::MessageType::PrivacyModeComplete => {
+                let complete =
+                    cdma_ios::PrivacyModeCompleteMessage::decode(&message.payload).ok()?;
+                return Some(Self::from_fx2(
+                    &FemtoInterfaceMsg::from_privacy_mode_complete(&complete).ok()?,
+                ));
+            }
+            _ => {}
+        }
         let frame = cdma_ios::split_a1_frame(&message.payload)?;
         Some(Self {
             message_type: frame.message_type,
@@ -107,6 +182,7 @@ impl A1Body {
                 Discriminator::Dtap
             }),
             sdu: frame.sdu,
+            voice_privacy: None,
             information_elements: Vec::new(),
             message_name: Some(format!("{:?}", message.message_type)),
         })
@@ -140,6 +216,7 @@ fn signaling_event(body: &A1Body, context: &A1Context) -> proto::A1SignalingEven
     let adds = adds_payload(&information_elements);
 
     proto::A1SignalingEvent {
+        voice_privacy: body.voice_privacy.clone(),
         direction: context.direction as i32,
         discriminator: discriminator as i32,
         message_type: message_type as i32,
@@ -539,3 +616,43 @@ fn next_event_id() -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod privacy_tests {
+    use super::*;
+
+    #[test]
+    fn privacy_observations_redact_key_bytes_and_keep_pending_and_active_distinct() {
+        let command = cdma_ios::PrivacyModeCommandMessage {
+            encryption_information: cdma_ios::EncryptionInformation::private_long_code(
+                0x147_80cc_b8df,
+                true,
+            )
+            .unwrap(),
+        };
+        let femto = FemtoInterfaceMsg::from_privacy_mode_command(&command).unwrap();
+        let event = a1_signaling_event(&femto, &A1Context::default());
+        assert_eq!(event.voice_privacy.as_deref(), Some("pending"));
+        assert!(!event.sdu_hex.contains("014780CCB8DF"));
+        assert!(
+            event
+                .information_elements
+                .iter()
+                .all(|ie| !hex_upper(&ie.content).contains("014780CCB8DF"))
+        );
+        assert_eq!(
+            cdma_ios::PrivacyModeCommandMessage::decode(&femto.to_bsmap_wire().unwrap()).unwrap(),
+            command
+        );
+        let complete = cdma_ios::PrivacyModeCompleteMessage {
+            encryption_information: Some(
+                cdma_ios::EncryptionInformation::private_long_code_status(true),
+            ),
+            voice_privacy_request: false,
+        };
+        let femto = FemtoInterfaceMsg::from_privacy_mode_complete(&complete).unwrap();
+        let event = a1_signaling_event(&femto, &A1Context::default());
+        assert_eq!(event.voice_privacy.as_deref(), Some("private"));
+        assert_eq!(event.sdu_hex, "0005550A029300");
+    }
+}

@@ -87,11 +87,48 @@ pub enum OtaspEvent {
     },
     /// MS responded to the Commit Request.
     CommitResult { result_code: u8 },
+    AKeyProgress {
+        step: AKeyStep,
+        success: bool,
+        a_key_p_rev: u8,
+        elapsed_ms: Option<u32>,
+        result_code: Option<u8>,
+        skip_reason: Option<AKeySkipReason>,
+    },
     /// Session ended; reports how many blocks reached commit.
     SessionEnded {
         completed_blocks: u32,
         outcome: SessionOutcomeKind,
     },
+}
+
+/// Steps of A-key generation by key exchange (C.S0016-D §3.3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AKeyStep {
+    Requested,
+    MsKeyResponse,
+    KeyGenerationResponse,
+    KeyDerived,
+    SsdUpdate,
+    ReAuthentication,
+    Committed,
+    /// No key exchange because an A-key is on file.
+    Skipped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AKeySkipReason {
+    /// The `*228` origination verified, so the mobile shares the key.
+    KeyOnFileVerified,
+    KeyOnFileUnverified,
+    KeyOnFileNotChecked,
+}
+
+impl AKeyStep {
+    /// Steps the mobile answers after computing a key, which can take seconds.
+    pub fn mobile_computes(self) -> bool {
+        matches!(self, Self::MsKeyResponse | Self::KeyGenerationResponse)
+    }
 }
 
 /// Disambiguator for events that carry a BLOCK_ID. Multiple feature
@@ -125,6 +162,8 @@ pub enum SessionOutcomeKind {
     ProtocolError,
     /// Inbound silence past the timeout threshold.
     TimedOut,
+    /// A-key generation failed after the MS computed the key. No Commit was sent.
+    KeyExchangeFailed,
 }
 
 /// Decoded Station Class Mark byte. Fields are spec-named per

@@ -66,6 +66,7 @@ impl MtCallService {
         voice_bearer: Option<&Arc<VoiceBearerManager>>,
         default_voice_service_option: u16,
         hlr_repo: &Arc<dyn HlrRepository>,
+        encryption_information: Option<cdma_ios::EncryptionInformation>,
     ) {
         let cic = circuits.assignment_circuit_identity_code_for_next_leg();
         let tag_val = response.tag.map(|t| t.0).unwrap_or(call_id.0 as u32);
@@ -192,7 +193,7 @@ impl MtCallService {
                 coding: 0x05,
             },
             circuit_identity_code: Some(cic),
-            encryption_information: None,
+            encryption_information,
             service_option: Some(cdma_ios::ServiceOption(service_option)),
             signals: Vec::new(),
             ms_information_records,

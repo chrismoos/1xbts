@@ -22,8 +22,7 @@ use cdma_common::timezone::{TimezoneConfig, TimezoneSource};
 use crate::abis_edge::network::{NetworkBtsControlClient, NetworkClientConfig};
 use crate::config::BtsPeerConfig;
 use crate::grpc::bts_management_proto::{
-    CellRequest, EnrollRequest, EnrollResponse,
-    bts_management_service_client::BtsManagementServiceClient,
+    EnrollRequest, EnrollResponse, bts_management_service_client::BtsManagementServiceClient,
 };
 
 use super::bts_registry::{
@@ -88,33 +87,41 @@ async fn attach_peer_forever(
                 );
                 let mut link_down = attached.link_down;
                 let mut oam = attached.oam;
+                let mut global_challenge = bts.subscribe_global_challenge();
+                global_challenge.mark_unchanged();
                 // A BTS that loses power sends no FIN, so waiting only on the
                 // Abis link can leave a dead cell in service indefinitely.
-                // Poll the operations plane alongside it.
+                // Poll the operations plane alongside it. The poll re-enrolls,
+                // which also delivers the MSC's global challenge setting and
+                // reads back the AUTH the cell broadcasts.
                 let reason = loop {
                     tokio::select! {
                         // `changed()` errors only if the client was dropped,
                         // which also means the link is gone.
                         _ = link_down.changed() => break "Abis link closed",
-                        _ = tokio::time::sleep(LIVENESS_POLL) => {
-                            let probe = oam.check_health(CellRequest { cell: None, peer_id: None });
-                            match tokio::time::timeout(OAM_REQUEST_TIMEOUT, probe).await {
-                                Ok(Ok(_)) => {}
-                                Ok(Err(e)) => {
-                                    warn!(
-                                        "BSC: cell {:?} stopped answering the operations plane: {e}",
-                                        attached.cell
-                                    );
-                                    break "operations plane unreachable";
-                                }
-                                Err(_) => {
-                                    warn!(
-                                        "BSC: cell {:?} operations-plane probe timed out",
-                                        attached.cell
-                                    );
-                                    break "operations plane unreachable";
-                                }
-                            }
+                        _ = global_challenge.changed() => {}
+                        _ = tokio::time::sleep(LIVENESS_POLL) => {}
+                    }
+                    let probe = oam.enroll(EnrollRequest {
+                        global_challenge: bts.global_challenge(),
+                    });
+                    match tokio::time::timeout(OAM_REQUEST_TIMEOUT, probe).await {
+                        Ok(Ok(response)) => {
+                            record_auth_mode(&bts, attached.cell, &response.into_inner());
+                        }
+                        Ok(Err(e)) => {
+                            warn!(
+                                "BSC: cell {:?} stopped answering the operations plane: {e}",
+                                attached.cell
+                            );
+                            break "operations plane unreachable";
+                        }
+                        Err(_) => {
+                            warn!(
+                                "BSC: cell {:?} operations-plane probe timed out",
+                                attached.cell
+                            );
+                            break "operations plane unreachable";
                         }
                     }
                 };
@@ -168,7 +175,9 @@ async fn attach_peer_once(
         .map_err(|e| format!("OAM connect: {e}"))?;
     let mut oam: BtsOamClient = BtsManagementServiceClient::new(channel);
     let response = oam
-        .enroll(EnrollRequest {})
+        .enroll(EnrollRequest {
+            global_challenge: bts.global_challenge(),
+        })
         .await
         .map_err(|e| format!("Enroll: {e}"))?
         .into_inner();
@@ -207,7 +216,7 @@ async fn attach_peer_once(
         },
         mscid: params.overhead.sid as u32,
         pilot_pn: params.pilot_offset as u16,
-        auth_mode: params.overhead.auth_mode,
+        auth_mode: entry.auth_mode_handle(),
         p_rev_in_use: params.overhead.p_rev,
         market_id: params.overhead.sid,
         generating_entity_id: params.overhead.base_id,
@@ -230,6 +239,22 @@ async fn attach_peer_once(
         link_down,
         oam: oam_for_liveness,
     })
+}
+
+fn record_auth_mode(bts: &BtsRegistry, cell: AccessCellId, response: &EnrollResponse) {
+    let Some(auth_mode) = response
+        .config
+        .as_ref()
+        .and_then(|config| config.overhead.as_ref())
+        .map(|overhead| overhead.auth_mode as u8)
+    else {
+        return;
+    };
+    if let Some(entry) = bts.get(cell)
+        && entry.set_auth_mode(auth_mode)
+    {
+        info!("BSC: cell {cell:?} now broadcasts AUTH={auth_mode}");
+    }
 }
 
 /// Make the AN address a peer advertised dialable from this host.
@@ -294,7 +319,7 @@ fn cell_params_from_enrollment(response: &EnrollResponse) -> Result<BtsCellParam
         acc_config_seq: overhead_config.acc_config_seq as u8,
         power_up_reg: overhead_config.power_up_reg,
         parameter_reg: overhead_config.parameter_reg,
-        auth_mode: overhead_config.auth_mode as u8,
+        auth_mode: Some(overhead_config.auth_mode as u8),
         p_rev: overhead_config.p_rev as u8,
         min_p_rev: overhead_config.min_p_rev as u8,
         lp_sec: overhead_config.lp_sec as u8,

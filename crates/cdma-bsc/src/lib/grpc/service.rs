@@ -12,10 +12,11 @@ use cdma_common::events::AccessChannelEvent;
 use cdma_common::lac::{
     message_types::{MessageId, WireChannel},
     paging_messages::{
-        CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC, CHANNEL_ASSIGN_MODE_TRAFFIC,
-        CHANNEL_DEFAULT_CONFIG_EXPLICIT_RCS, CHANNEL_DEFAULT_CONFIG_RC1_RC1,
-        CHANNEL_DEFAULT_CONFIG_RC1_RC2, CHANNEL_DEFAULT_CONFIG_RC2_RC1,
-        CHANNEL_DEFAULT_CONFIG_RC2_RC2, GeneralPageRecord, MsAddress, PagingChannelMessage,
+        AuthenticationChallengeMessage, CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC,
+        CHANNEL_ASSIGN_MODE_TRAFFIC, CHANNEL_DEFAULT_CONFIG_EXPLICIT_RCS,
+        CHANNEL_DEFAULT_CONFIG_RC1_RC1, CHANNEL_DEFAULT_CONFIG_RC1_RC2,
+        CHANNEL_DEFAULT_CONFIG_RC2_RC1, CHANNEL_DEFAULT_CONFIG_RC2_RC2, ForwardOrderDetail,
+        GeneralPageRecord, MsAddress, OrderMessage, PagingChannelMessage, SsdUpdateMessage,
     },
 };
 use log::{info, warn};
@@ -408,8 +409,11 @@ fn spawn_pch_transmission_bridge(
 impl BaseStationService for BscServiceImpl {
     async fn enroll(
         &self,
-        _: Request<BaseStationEnrollRequest>,
+        request: Request<BaseStationEnrollRequest>,
     ) -> Result<Response<BaseStationEnrollResponse>, Status> {
+        self.state
+            .bts
+            .set_global_challenge(request.into_inner().global_challenge);
         let cells = self
             .state
             .bts
@@ -505,7 +509,7 @@ fn should_stream_access_event(event: &AccessChannelEvent) -> bool {
         && !event.is_traffic_phy_status
 }
 
-fn to_proto_access_event(e: &AccessChannelEvent) -> proto::AccessEvent {
+pub(crate) fn to_proto_access_event(e: &AccessChannelEvent) -> proto::AccessEvent {
     let timestamp_us = e.wall_clock_us;
     let body = match e.decoded_l3.as_ref() {
         Some(AccessMessage::Registration(m)) => Some(proto::access_event::Body::Registration(
@@ -625,8 +629,7 @@ fn to_proto_access_event(e: &AccessChannelEvent) -> proto::AccessEvent {
                     rejected_order: detail.rejected_order.map(|v| v as u32),
                     rejected_order_name: detail
                         .rejected_order
-                        .map(forward_order_name)
-                        .map(str::to_string),
+                        .map(|order| forward_order_name(order, detail.rejected_ordq).to_string()),
                     rejected_ordq: detail.rejected_ordq.map(|v| v as u32),
                     rejected_record: detail.rejected_record.map(|v| v as u32),
                     con_ref: detail.con_ref.map(|v| v as u32),
@@ -639,6 +642,12 @@ fn to_proto_access_event(e: &AccessChannelEvent) -> proto::AccessEvent {
                     trailing_hex: bytes_to_hex(&detail.trailing_bytes),
                 }
             });
+            let randbs = match m.reverse_detail(fwd_ch) {
+                Ok(cdma_common::access::ReverseOrderDetail::BaseStationChallenge { randbs }) => {
+                    Some(randbs)
+                }
+                _ => None,
+            };
             Some(proto::access_event::Body::Order(proto::AccessOrder {
                 order: m.order as u32,
                 add_record_len: m.add_record_len as u32,
@@ -647,6 +656,7 @@ fn to_proto_access_event(e: &AccessChannelEvent) -> proto::AccessEvent {
                 order_specific_hex: bytes_to_hex(&m.order_specific),
                 reject,
                 remaining_bits: m.remaining_bits as u32,
+                randbs,
             }))
         }
         Some(AccessMessage::DataBurst(m)) => {
@@ -703,6 +713,11 @@ fn to_proto_access_event(e: &AccessChannelEvent) -> proto::AccessEvent {
                     resp_purpose_name: purpose_name.to_string(),
                     service_option: so,
                 },
+            ))
+        }
+        Some(AccessMessage::AuthChallengeResponse(m)) => {
+            Some(proto::access_event::Body::AuthChallengeResponse(
+                proto::AccessAuthChallengeResponse { authu: m.authu },
             ))
         }
         Some(AccessMessage::PowerMeasurementReport(m)) => {
@@ -772,10 +787,49 @@ fn to_proto_access_event(e: &AccessChannelEvent) -> proto::AccessEvent {
         rdsch_summary,
         rdsch_msg_type_name,
         cell: e.cell.map(to_proto_cell_id),
+        authentication: e.authentication.map(|auth| proto::AccessAuthentication {
+            authr: auth.authr,
+            randc: u32::from(auth.randc),
+            count: u32::from(auth.count),
+            rand: auth.rand,
+        }),
     }
 }
 
-fn to_proto_traffic_event(ev: &TrafficEvent) -> proto::TrafficEvent {
+fn forward_order_authbs(order: &OrderMessage) -> Option<u32> {
+    match order.forward_detail() {
+        Ok(ForwardOrderDetail::BaseStationChallengeConfirmation { authbs }) => Some(authbs),
+        _ => None,
+    }
+}
+
+fn forward_authentication_body(ev: &TrafficEvent) -> Option<proto::traffic_event::Body> {
+    let bytes = (0..ev.sdu_hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(ev.sdu_hex.get(i..i + 2)?, 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    let mut sdu = cdma_common::bits::Bitstream::new_bytes(&bytes);
+    match ev.mcsb.message_id {
+        MessageId::AuthChallenge => {
+            AuthenticationChallengeMessage::from_sdu(&mut sdu)
+                .ok()
+                .map(|m| {
+                    proto::traffic_event::Body::AuthChallenge(
+                        proto::ForwardAuthenticationChallenge {
+                            randu: m.randu,
+                            gen_cmea_key: m.gen_cmea_key,
+                        },
+                    )
+                })
+        }
+        MessageId::SsdUpdate => SsdUpdateMessage::from_sdu(&mut sdu).ok().map(|m| {
+            proto::traffic_event::Body::SsdUpdate(proto::ForwardSsdUpdate { randssd: m.randssd })
+        }),
+        _ => None,
+    }
+}
+
+pub(crate) fn to_proto_traffic_event(ev: &TrafficEvent) -> proto::TrafficEvent {
     let mcsb = &ev.mcsb;
     let header = proto::PagingPduHeader {
         msg_tag: mcsb
@@ -801,7 +855,10 @@ fn to_proto_traffic_event(ev: &TrafficEvent) -> proto::TrafficEvent {
             order: order.order as u32,
             ordq: order.ordq as u32,
             order_name: forward_order_display_name(order).to_string(),
+            authbs: forward_order_authbs(order),
         }))
+    } else if let Some(body) = forward_authentication_body(ev) {
+        Some(body)
     } else if let Some(sr) = ev.service_request.as_ref() {
         let (so, for_mux, rev_mux, for_rc, rev_rc) = sr
             .service_config
@@ -1103,6 +1160,7 @@ fn to_proto_paging_event(ev: &PagingEvent) -> proto::PagingEvent {
                 num_step: m.num_step as u32,
                 max_cap_sz: m.max_cap_sz as u32,
                 auth: m.auth as u32,
+                rand: m.rand,
             }),
         ),
         PagingChannelMessage::NeighborList(m) => Some(proto::paging_event::Body::NeighborList(
@@ -1208,13 +1266,23 @@ fn to_proto_paging_event(ev: &PagingEvent) -> proto::PagingEvent {
             ))
         }
         PagingChannelMessage::Order(m) => {
-            let order_name = forward_order_name(m.order);
+            let order_name = forward_order_name(m.order, Some(m.ordq));
             Some(proto::paging_event::Body::Order(proto::PagingOrder {
                 order: m.order as u32,
                 ordq: m.ordq as u32,
                 order_name: order_name.to_string(),
+                authbs: forward_order_authbs(m),
             }))
         }
+        PagingChannelMessage::AuthenticationChallenge(m) => Some(
+            proto::paging_event::Body::AuthChallenge(proto::ForwardAuthenticationChallenge {
+                randu: m.randu,
+                gen_cmea_key: m.gen_cmea_key,
+            }),
+        ),
+        PagingChannelMessage::SsdUpdate(m) => Some(proto::paging_event::Body::SsdUpdate(
+            proto::ForwardSsdUpdate { randssd: m.randssd },
+        )),
         PagingChannelMessage::DataBurst(m) => {
             let decoded_sms = if m.burst_type == 3 {
                 cdma_common::sms::decode_mt_sms(&m.fields).map(|d| proto::DecodedSms {
@@ -1247,8 +1315,6 @@ fn to_proto_paging_event(ev: &PagingEvent) -> proto::PagingEvent {
                 },
             ))
         }
-        PagingChannelMessage::AuthenticationChallenge(_) => None,
-        PagingChannelMessage::SsdUpdate(_) => None,
         PagingChannelMessage::FeatureNotification(_) => None,
         PagingChannelMessage::ExtendedNeighborList(_) => None,
         PagingChannelMessage::StatusRequest(_) => None,
@@ -1546,6 +1612,7 @@ impl BscService for BscServiceImpl {
                         traffic_walsh_code: m.traffic_walsh_code.map(|w| w as u32),
                         traffic_service_option: m.traffic_service_option.map(|s| s as u32),
                         voice_call_state: m.voice_call_state.clone(),
+                        voice_privacy: m.voice_privacy.clone(),
                         traffic_power,
                         serving_cell: m.serving_cell.map(to_proto_cell_id),
                     }
@@ -1618,6 +1685,7 @@ impl BscService for BscServiceImpl {
                         signal_power_db: m.signal_power_db,
                         demod_quality_pct: m.demod_quality_pct,
                         voice_call_state: m.voice_call_state.clone(),
+                        voice_privacy: m.voice_privacy.clone(),
                     }),
                     service_option: m.traffic_service_option.map(|s| s as u32),
                     traffic_power,
@@ -1858,9 +1926,12 @@ impl ManagementFacadeService for BscServiceImpl {
 /// single-cell deployment addresses the BSC exactly as it addresses a BTS.
 #[tonic::async_trait]
 impl BtsManagementService for BscServiceImpl {
-    async fn enroll(&self, _: Request<EnrollRequest>) -> Result<Response<EnrollResponse>, Status> {
+    async fn enroll(
+        &self,
+        request: Request<EnrollRequest>,
+    ) -> Result<Response<EnrollResponse>, Status> {
         let (_, mut client) = self.oam_for(None)?;
-        client.enroll(EnrollRequest {}).await
+        client.enroll(request.into_inner()).await
     }
 
     async fn list_bts(&self, _: Request<()>) -> Result<Response<BtsList>, Status> {

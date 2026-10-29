@@ -271,8 +271,8 @@ mod tests {
         ClassmarkInformationType2, ClearCommandMessage, ClearCompleteMessage, ClearRequestMessage,
         CompleteLayer3InformationMessage, ConnectMessage, EngineEvent,
         HandoffCdmaServingOneWayDelay, HandoffCellIdentifier, Layer3Information, MobileIdentity,
-        PagingRequestMessage, ProcedureMessage, RadioEnvironmentAndResources, ServiceOption,
-        SlotCycleIndex, Tag, UserZoneId,
+        PagingRequestMessage, ProcedureMessage, RadioEnvironmentAndResources, RandomNumberType,
+        ServiceOption, SlotCycleIndex, Tag, UserZoneId,
     };
 
     fn complete_layer3_information() -> CompleteLayer3InformationMessage {
@@ -314,9 +314,10 @@ mod tests {
             ])),
             authentication_confirmation_parameter: Some(AuthenticationConfirmationParameter(0x99)),
             authentication_parameter_count: Some(AuthenticationParameterCount(0x1f)),
-            authentication_challenge_parameter: Some(AuthenticationChallengeParameter([
-                0x10, 0x01, 0x02, 0x03, 0x04,
-            ])),
+            authentication_challenge_parameter: Some(AuthenticationChallengeParameter::new(
+                RandomNumberType::Rand,
+                0x0102_0304,
+            )),
             service_option: Some(ServiceOption::HIGH_RATE_PACKET_DATA),
             voice_privacy_request: true,
             circuit_identity_code: Some(CircuitIdentityCode {

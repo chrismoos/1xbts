@@ -1694,6 +1694,7 @@ mod reverse_power_control_tests {
         let (sample_rate, iq_samples) = read_iq_wav(reader);
         let oversample = sample_rate as usize / 1_228_800;
         let pipeline = reverse_traffic_chain_rc3(ReverseTrafficSettings {
+            long_code_privacy: None,
             oversample,
             walsh_code,
             esn,

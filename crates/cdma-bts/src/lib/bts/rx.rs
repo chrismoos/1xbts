@@ -482,6 +482,7 @@ fn spawn_traffic_rx_thread(
     oversample: usize,
     walsh_code: u8,
     esn: u32,
+    long_code_privacy: Option<Arc<cdma_common::phy::long_code_privacy::LongCodePrivacy>>,
     preamble_num_pcgs: Option<usize>,
     assigned_rev_rc: u8,
     rev_fch_gating_mode: bool,
@@ -498,6 +499,7 @@ fn spawn_traffic_rx_thread(
     queue_registry: &RxQueueRegistry,
 ) -> TrafficRxThread {
     let settings = crate::receiver::pipelined::ReverseTrafficSettings {
+        long_code_privacy: long_code_privacy.clone(),
         oversample,
         walsh_code,
         esn,
@@ -544,6 +546,7 @@ fn spawn_traffic_rx_thread(
                 bearer_bts_id,
                 bearer_cell_id,
                 worker_queue,
+                long_code_privacy,
             );
         })
         .expect("failed to spawn traffic RX thread");
@@ -2584,7 +2587,7 @@ fn process_rx_message(
                 &blk,
                 runtime.config.chip_rate_hz,
                 runtime.last_hardware_time_ns,
-                runtime.config.auth_mode,
+                runtime.config.global_challenge.auth(),
                 runtime.config.p_rev_in_use,
                 runtime.config.overhead_mcc,
                 runtime.config.overhead_imsi_11_12,
@@ -2708,6 +2711,7 @@ fn process_rx_message(
                 runtime.pipeline_oversample,
                 req.walsh_code,
                 req.esn,
+                req.long_code_privacy.clone(),
                 req.preamble_num_pcgs,
                 req.assigned_rev_rc,
                 req.rev_fch_gating_mode,
@@ -3899,6 +3903,7 @@ fn run_traffic_rx_thread(
     bearer_bts_id: u32,
     bearer_cell_id: u32,
     queue: RxQueueTracker,
+    long_code_privacy: Option<Arc<cdma_common::phy::long_code_privacy::LongCodePrivacy>>,
 ) {
     info!(
         "rx_traffic[w{}]: thread started traffic_rx_continuity={}",
@@ -4003,6 +4008,9 @@ fn run_traffic_rx_thread(
             }
             if out_blk.tags.get("traffic_event") == Some(&1) {
                 if let Some(mut event) = build_traffic_event(&out_blk, chip_rate_hz, hw_time_ns) {
+                    if let Some(privacy) = &long_code_privacy {
+                        super::voice_privacy::observe_reverse_order(privacy, &event);
+                    }
                     if event.message_id == MessageId::Order
                         && event.order_code == Some(RELEASE_ORDER_CODE)
                         && !traffic_fer_gate.release_started()
@@ -4875,6 +4883,7 @@ fn build_access_event(
         traffic_voice_bits: None,
         traffic_voice_rate_bps: None,
         raw_pdu_bits: Some(payload_bits),
+        authentication: None,
     })
 }
 
@@ -5025,6 +5034,7 @@ fn build_traffic_event(
         traffic_voice_bits: None,
         traffic_voice_rate_bps: None,
         raw_pdu_bits: None,
+        authentication: None,
     })
 }
 
@@ -5154,6 +5164,7 @@ fn build_traffic_phy_status_event(
         traffic_voice_bits: None,
         traffic_voice_rate_bps: None,
         raw_pdu_bits: None,
+        authentication: None,
     })
 }
 
@@ -5280,6 +5291,7 @@ fn build_traffic_voice_event(
         traffic_voice_bits: Some(voice_bits),
         traffic_voice_rate_bps: Some(rate_bps),
         raw_pdu_bits: None,
+        authentication: None,
     })
 }
 
@@ -5368,6 +5380,7 @@ fn build_traffic_preamble_event(
         traffic_voice_bits: None,
         traffic_voice_rate_bps: None,
         raw_pdu_bits: None,
+        authentication: None,
     }
 }
 
@@ -5483,6 +5496,7 @@ fn build_traffic_pcg_measurement_event(
         traffic_voice_bits: None,
         traffic_voice_rate_bps: None,
         raw_pdu_bits: None,
+        authentication: None,
     })
 }
 

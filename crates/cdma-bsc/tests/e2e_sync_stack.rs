@@ -901,6 +901,7 @@ fn synthetic_registration_event(
         decoded_l3: None,
         decoded_rdsch: None,
         raw_pdu_bits: None,
+        authentication: None,
     }
 }
 
@@ -3360,7 +3361,7 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
                     cell_id: CellId { cell: 1, sector: 1 },
                     mscid: 1,
                     pilot_pn: 0,
-                    auth_mode: 0,
+                    auth_mode: Default::default(),
                     p_rev_in_use: 6,
                     market_id: 1,
                     generating_entity_id: 1,
@@ -3886,7 +3887,7 @@ async fn run_sync_overhead_window_case(
                     cell_id: CellId { cell: 1, sector: 1 },
                     mscid: 1,
                     pilot_pn: 0,
-                    auth_mode: 0,
+                    auth_mode: Default::default(),
                     p_rev_in_use: 6,
                     market_id: 1,
                     generating_entity_id: 1,
@@ -5959,6 +5960,7 @@ fn synthetic_origination_event(
         rev_supported_rcs,
         decoded_rdsch: None,
         raw_pdu_bits: None,
+        authentication: None,
     }
 }
 
@@ -7816,7 +7818,7 @@ async fn run_traffic_channel_e2e(
                     cell_id: CellId { cell: 1, sector: 1 },
                     mscid: 1,
                     pilot_pn: 0,
-                    auth_mode: 0,
+                    auth_mode: Default::default(),
                     p_rev_in_use: 6,
                     market_id: 1,
                     generating_entity_id: 1,
@@ -8096,7 +8098,7 @@ async fn test_e2e_rc1_reverse_preamble_triggers_crc_valid_bs_ack_order() -> Resu
                 one_x_rx_shift_hz: 0,
                 hrpd_reverse_frequency_hz: None,
                 hrpd_rx_shift_hz: None,
-                auth_mode: 0,
+                global_challenge: Default::default(),
                 p_rev_in_use: 6,
                 capture_iq_wav: None,
                 capture_seconds: None,
@@ -8191,7 +8193,7 @@ async fn test_e2e_rc1_reverse_preamble_triggers_crc_valid_bs_ack_order() -> Resu
                     cell_id: CellId { cell: 1, sector: 1 },
                     mscid: 1,
                     pilot_pn: 0,
-                    auth_mode: 0,
+                    auth_mode: Default::default(),
                     p_rev_in_use: 6,
                     market_id: 1,
                     generating_entity_id: 1,

@@ -11,6 +11,7 @@ use cdma_ios::{
     AssignmentCompleteMessage,
     AssignmentFailureMessage,
     AssignmentRequestMessage,
+    AuthSignatureType,
     AuthenticationChallengeParameter,
     AuthenticationConfirmationParameter,
     AuthenticationData,
@@ -92,6 +93,7 @@ use cdma_ios::{
     ProtocolType,
     QualityOfServiceParameters,
     RadioEnvironmentAndResources,
+    RandomNumberType,
     RegistrationType,
     RejectCause,
     RfChannelIdentity,
@@ -1110,9 +1112,10 @@ fn cm_service_request_roundtrip() {
         ])),
         authentication_confirmation_parameter: Some(AuthenticationConfirmationParameter(0x99)),
         authentication_parameter_count: Some(AuthenticationParameterCount(0x1f)),
-        authentication_challenge_parameter: Some(AuthenticationChallengeParameter([
-            0x10, 0x01, 0x02, 0x03, 0x04,
-        ])),
+        authentication_challenge_parameter: Some(AuthenticationChallengeParameter::new(
+            RandomNumberType::Rand,
+            0x0102_0304,
+        )),
         service_option: Some(ServiceOption::HIGH_RATE_PACKET_DATA),
         voice_privacy_request: true,
         radio_environment_and_resources: Some(RadioEnvironmentAndResources {
@@ -1164,9 +1167,10 @@ fn paging_response_roundtrip() {
         ])),
         authentication_confirmation_parameter: Some(AuthenticationConfirmationParameter(0x99)),
         authentication_parameter_count: Some(AuthenticationParameterCount(0x1f)),
-        authentication_challenge_parameter: Some(AuthenticationChallengeParameter([
-            0x10, 0x01, 0x02, 0x03, 0x04,
-        ])),
+        authentication_challenge_parameter: Some(AuthenticationChallengeParameter::new(
+            RandomNumberType::Rand,
+            0x0102_0304,
+        )),
         service_option: Some(ServiceOption::HIGH_RATE_PACKET_DATA),
         voice_privacy_request: true,
         circuit_identity_code: Some(CircuitIdentityCode {
@@ -1222,9 +1226,10 @@ fn location_updating_request_roundtrip() {
         ])),
         authentication_confirmation_parameter: Some(AuthenticationConfirmationParameter(0x99)),
         authentication_parameter_count: Some(AuthenticationParameterCount(0x1f)),
-        authentication_challenge_parameter: Some(AuthenticationChallengeParameter([
-            0x10, 0x01, 0x02, 0x03, 0x04,
-        ])),
+        authentication_challenge_parameter: Some(AuthenticationChallengeParameter::new(
+            RandomNumberType::Rand,
+            0x0102_0304,
+        )),
         authentication_event: Some(AuthenticationEvent(0x01)),
         user_zone_id: Some(UserZoneId(0x3344)),
         is2000_mobile_capabilities: Some(Is2000MobileCapabilities(vec![0x31, 0x02, 0x03])),
@@ -1242,9 +1247,10 @@ fn location_updating_request_roundtrip() {
 #[test]
 fn authentication_request_bsmap_roundtrip() {
     let message = AuthenticationRequestMessage::Bsmap(AuthenticationRequestBsmapMessage {
-        authentication_challenge_parameter_randu: AuthenticationChallengeParameter([
-            0x10, 0x01, 0x02, 0x03, 0x04,
-        ]),
+        authentication_challenge_parameter_randu: AuthenticationChallengeParameter::new(
+            RandomNumberType::Randu,
+            0x01_0203,
+        ),
         mobile_identity_imsi: Some(MobileIdentity::Imsi("12345678901".to_string())),
         tag: Some(Tag(0x01020304)),
         cell_identifier_list: Some(CellIdentifierList::Cells(vec![cell_id()])),
@@ -1261,10 +1267,10 @@ fn authentication_request_bsmap_roundtrip() {
 #[test]
 fn authentication_request_dtap_roundtrip() {
     let message = AuthenticationRequestMessage::Dtap(AuthenticationRequestDtapMessage {
-        authentication_challenge_parameter_randu: AuthenticationChallengeParameter([
-            0x10, 0x11, 0x22, 0x33, 0x44,
-        ]),
-        is2000_mobile_capabilities: Some(Is2000MobileCapabilities(vec![0x31, 0x02, 0x03])),
+        authentication_challenge_parameter_randu: AuthenticationChallengeParameter::new(
+            RandomNumberType::Randu,
+            0x11_2233,
+        ),
     });
     let encoded = message.encode().unwrap();
     assert_eq!(
@@ -1325,9 +1331,10 @@ fn ssd_update_sequence_message_roundtrips() {
     assert_eq!(encoded[3], 0x05);
 
     let base_station_challenge = BaseStationChallengeMessage {
-        authentication_challenge_parameter_randbs: AuthenticationChallengeParameter([
-            0x80, 0xaa, 0xbb, 0xcc, 0xdd,
-        ]),
+        authentication_challenge_parameter_randbs: AuthenticationChallengeParameter::new(
+            RandomNumberType::Randbs,
+            0xaabb_ccdd,
+        ),
     };
     let encoded = base_station_challenge.encode().unwrap();
     assert_eq!(
@@ -1543,6 +1550,12 @@ fn adds_transfer_roundtrip_with_esn() {
         cell_identifier: None,
         tag: None,
         service_option: None,
+        authentication_response_parameter: None,
+        authentication_confirmation_parameter: None,
+        authentication_parameter_count: None,
+        authentication_challenge_parameter: None,
+        authentication_event: None,
+        authentication_data: None,
     };
     let encoded = msg.encode().unwrap();
     assert_eq!(encoded[0], 0x00);
@@ -1589,6 +1602,12 @@ fn adds_transfer_otasp_roundtrip_full() {
         }),
         tag: Some(Tag(0xCAFEBABE)),
         service_option: Some(ServiceOption(18)),
+        authentication_response_parameter: None,
+        authentication_confirmation_parameter: None,
+        authentication_parameter_count: None,
+        authentication_challenge_parameter: None,
+        authentication_event: None,
+        authentication_data: None,
     };
     let encoded = msg.encode().unwrap();
     assert_eq!(encoded[0], 0x00); // BSMAP disc
@@ -1795,4 +1814,193 @@ fn unambiguous_message_types_are_named_without_a_discriminator() {
     ] {
         assert_eq!(message_type_name(message_type, None), Some(name));
     }
+}
+
+#[test]
+fn authentication_challenge_parameter_length_follows_random_number_type() {
+    assert_eq!(
+        AuthenticationChallengeParameter::new(RandomNumberType::Randu, 0x11_2233).encode(),
+        vec![0x02, 0x11, 0x22, 0x33]
+    );
+    let rand = AuthenticationChallengeParameter::new(RandomNumberType::Rand, 0xAABB_CCDD);
+    assert_eq!(rand.encode(), vec![0x01, 0xAA, 0xBB, 0xCC, 0xDD]);
+    assert_eq!(rand.rand(), Some(0xAABB_CCDD));
+    assert_eq!(rand.randu(), None);
+    let randbs = AuthenticationChallengeParameter::decode(&[0x08, 1, 2, 3, 4]).unwrap();
+    assert_eq!(randbs.randbs(), Some(0x0102_0304));
+}
+
+/// DTAP framing and IE bytes from the A.S0014-D v2.0 bitmap layouts of §3.3.1 to §3.3.6,
+/// §3.3.10 and §3.3.11. Mandatory DTAP IEs are sent without their IE identifier.
+#[test]
+fn authentication_dtap_messages_match_the_spec_bitmaps() {
+    const DTAP_HEADER: [u8; 2] = [0x01, 0x00];
+    const MM_PROTOCOL_DISCRIMINATOR: [u8; 2] = [0x05, 0x00];
+    let frame = |message_type: u8, body: &[u8]| {
+        let mut out = DTAP_HEADER.to_vec();
+        out.push(3 + body.len() as u8);
+        out.extend_from_slice(&MM_PROTOCOL_DISCRIMINATOR);
+        out.push(message_type);
+        out.extend_from_slice(body);
+        out
+    };
+
+    let request = AuthenticationRequestMessage::Dtap(AuthenticationRequestDtapMessage {
+        authentication_challenge_parameter_randu: AuthenticationChallengeParameter::new(
+            RandomNumberType::Randu,
+            0xAB_CDEF,
+        ),
+    });
+    assert_eq!(
+        request.encode().unwrap(),
+        frame(0x45, &[0x04, 0x02, 0xAB, 0xCD, 0xEF])
+    );
+
+    let response = AuthenticationResponseMessage::Dtap(AuthenticationResponseDtapMessage {
+        authentication_response_parameter_authu: AuthenticationResponseParameter::new(
+            AuthSignatureType::Authu,
+            0x2_ABCD,
+        ),
+    });
+    assert_eq!(
+        response.encode().unwrap(),
+        frame(0x46, &[0x04, 0x02, 0x02, 0xAB, 0xCD])
+    );
+
+    let ssd_update = SsdUpdateRequestMessage {
+        authentication_challenge_parameter_randssd: SsdUpdateChallengeParameter([
+            0x04, 0x4D, 0x18, 0xEE, 0xAA, 0x05, 0x89, 0x5C,
+        ]),
+    };
+    assert_eq!(
+        ssd_update.encode().unwrap(),
+        frame(
+            0x47,
+            &[0x08, 0x04, 0x4D, 0x18, 0xEE, 0xAA, 0x05, 0x89, 0x5C]
+        )
+    );
+
+    let challenge = BaseStationChallengeMessage {
+        authentication_challenge_parameter_randbs: AuthenticationChallengeParameter::new(
+            RandomNumberType::Randbs,
+            0xDEAD_BEEF,
+        ),
+    };
+    assert_eq!(
+        challenge.encode().unwrap(),
+        frame(0x48, &[0x05, 0x08, 0xDE, 0xAD, 0xBE, 0xEF])
+    );
+
+    let challenge_response = BaseStationChallengeResponseMessage {
+        authentication_response_parameter_authbs: AuthenticationResponseParameter::new(
+            AuthSignatureType::Authbs,
+            0x1_2345,
+        ),
+    };
+    assert_eq!(
+        challenge_response.encode().unwrap(),
+        frame(0x49, &[0x04, 0x04, 0x01, 0x23, 0x45])
+    );
+
+    let rejected = SsdUpdateResponseMessage {
+        cause_layer_3: Some(CauseLayer3 {
+            coding_standard: 0b00,
+            location: 0b0100,
+            cause_value: 0x3B,
+        }),
+    };
+    assert_eq!(
+        rejected.encode().unwrap(),
+        frame(0x4A, &[0x08, 0x02, 0x84, 0xBB])
+    );
+    assert_eq!(
+        SsdUpdateResponseMessage {
+            cause_layer_3: None
+        }
+        .encode()
+        .unwrap(),
+        frame(0x4A, &[])
+    );
+
+    assert_eq!(
+        ParameterUpdateRequestMessage.encode().unwrap(),
+        frame(0x2C, &[])
+    );
+    assert_eq!(
+        ParameterUpdateConfirmMessage.encode().unwrap(),
+        frame(0x2B, &[])
+    );
+}
+
+/// ADDS Transfer authentication IEs in A.S0014-D §3.6.3 order and §4.2 formats:
+/// AUTHR and RAND are TLV, RANDC and COUNT are TV, Authentication Data follows Cell Identifier.
+#[test]
+fn adds_transfer_carries_authentication_ies_in_spec_order() {
+    let message = AddsTransferMessage {
+        mobile_identity_imsi: MobileIdentity::Imsi("310005551239999".to_string()),
+        adds_user_part: AddsUserPart {
+            burst_type: 0x03,
+            data: vec![0x00],
+        },
+        mobile_identity_esn: Some(MobileIdentity::Esn(0x80AB_CDEF)),
+        mobile_identity_meid: None,
+        authentication_response_parameter: Some(AuthenticationResponseParameter::new(
+            AuthSignatureType::Authr,
+            0x2_ABCD,
+        )),
+        authentication_confirmation_parameter: Some(AuthenticationConfirmationParameter(0x34)),
+        authentication_parameter_count: Some(AuthenticationParameterCount(0x2A)),
+        authentication_challenge_parameter: Some(AuthenticationChallengeParameter::new(
+            RandomNumberType::Rand,
+            0x34A2_B05F,
+        )),
+        authentication_event: None,
+        authentication_data: Some(AuthenticationData([0x55, 0x12, 0xA3])),
+        cell_identifier: None,
+        tag: None,
+        service_option: None,
+    };
+    let encoded = message.encode().unwrap();
+    let challenge = [
+        0x42, 0x04, 0x01, 0x02, 0xAB, 0xCD, 0x28, 0x34, 0x40, 0x2A, 0x41, 0x05, 0x01, 0x34, 0xA2,
+        0xB0, 0x5F,
+    ];
+    let esn_end = encoded
+        .windows(challenge.len())
+        .position(|window| window == challenge)
+        .expect("AUTHR, RANDC, COUNT and RAND follow the ESN contiguously");
+    let data = [0x59, 0x03, 0x55, 0x12, 0xA3];
+    let data_at = encoded
+        .windows(data.len())
+        .position(|window| window == data)
+        .expect("Authentication Data is a TLV");
+    assert!(data_at > esn_end);
+    assert_eq!(AddsTransferMessage::decode(&encoded).unwrap(), message);
+}
+
+#[test]
+fn private_long_code_uses_six_octets_and_complete_contains_only_status() {
+    use cdma_ios::EncryptionInformation;
+    let info = EncryptionInformation::private_long_code(0x147_80cc_b8df, true).unwrap();
+    assert_eq!(
+        info.encode().unwrap(),
+        [0x92, 6, 1, 0x47, 0x80, 0xcc, 0xb8, 0xdf]
+    );
+    let parameter = info.private_long_code_parameter().unwrap().unwrap();
+    assert_eq!(parameter.mask, 0x147_80cc_b8df);
+    assert!(parameter.active);
+    let complete = PrivacyModeCompleteMessage {
+        encryption_information: Some(EncryptionInformation::private_long_code_status(true)),
+        voice_privacy_request: false,
+    };
+    assert_eq!(complete.encode().unwrap(), [0, 5, 0x55, 0x0a, 2, 0x93, 0]);
+    assert!(
+        PrivacyModeCompleteMessage {
+            encryption_information: Some(info),
+            voice_privacy_request: false
+        }
+        .encode()
+        .is_err()
+    );
+    assert!(EncryptionInformation::private_long_code(1u64 << 42, true).is_err());
 }

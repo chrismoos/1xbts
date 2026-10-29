@@ -703,6 +703,7 @@ impl ForwardTrafficChannelRc3 {
         let current_pc_start = Self::pc_start_from_pcg_lc(&mut config.puncture_lc);
         let pc_start = config.previous_pcg_pc_start;
 
+        let previous_mask = config.scrambling_lc.mask();
         let mut previous_chip = config.prev_frame_last_chip;
         let mut mapped = [0.0f32; SYMBOLS_PER_PCG];
         for (pair_idx, pair) in prepared.interleaved[start..end].chunks_exact(2).enumerate() {
@@ -742,6 +743,16 @@ impl ForwardTrafficChannelRc3 {
                 .push_back(Complex32::new(pair[0], pair[1]));
         }
 
+        if config.scrambling_lc.mask() != previous_mask {
+            log::info!(
+                "BTS: RC3 forward long code changed chip={} private={}",
+                config.lc_chip_cursor,
+                config
+                    .scrambling_lc
+                    .privacy()
+                    .is_some_and(|privacy| privacy.is_private_at(config.lc_chip_cursor)),
+            );
+        }
         config.prev_frame_last_chip = previous_chip;
         config.lc_chip_cursor = config.lc_chip_cursor.saturating_add(PCG_CHIPS as u64);
         config.previous_pcg_pc_start = current_pc_start;
@@ -812,6 +823,65 @@ mod tests {
             prev_frame_last_chip: 0,
             disable_lc_scrambling: false,
         })
+    }
+
+    #[test]
+    fn private_transition_preserves_rc3_scrambling_and_power_control() {
+        use cdma_common::phy::long_code_privacy::{
+            LongCodePrivacy, LongCodeTransition, PRIVACY_ACTION_CHIPS, PRIVACY_FRAME_CHIPS,
+        };
+        use std::sync::Arc;
+
+        const PRIVATE_MASK: u64 = 0x147_80cc_b8df;
+        const START_CHIP: u64 = 1_815_159_335_608_320;
+        let action_chip = (START_CHIP / PRIVACY_ACTION_CHIPS + 2) * PRIVACY_ACTION_CHIPS;
+        let actual = make_channel();
+        let reference = make_channel();
+        let public_mask = actual.config.lock().scrambling_lc.mask();
+        let privacy = Arc::new(LongCodePrivacy::new(public_mask, PRIVATE_MASK));
+        {
+            let mut config = actual.config.lock();
+            config.scrambling_lc = config
+                .scrambling_lc
+                .clone()
+                .with_privacy(Some(privacy.clone()));
+            config.puncture_lc = config
+                .puncture_lc
+                .clone()
+                .with_privacy(Some(privacy.clone()));
+        }
+        actual.advance_lc_to_chip(START_CHIP);
+        reference.advance_lc_to_chip(START_CHIP);
+        let mut chip = START_CHIP;
+        while chip <= action_chip + PRIVACY_FRAME_CHIPS {
+            if chip == action_chip - PRIVACY_FRAME_CHIPS {
+                assert!(privacy.request(LongCodeTransition {
+                    action_chip,
+                    private: true
+                }));
+                assert!(privacy.respond(true, chip));
+            }
+            if chip == action_chip {
+                let mut config = reference.config.lock();
+                config.scrambling_lc.set_mask(PRIVATE_MASK);
+                config.puncture_lc.set_mask(PRIVATE_MASK);
+            }
+            let bits = (0..TrafficRate::Full.info_bits())
+                .map(|index| u8::from(index % 3 == 0))
+                .collect::<Vec<_>>();
+            for channel in [&actual, &reference] {
+                channel.send_frame(TrafficFrameRc3 {
+                    data: bits.clone(),
+                    rate: TrafficRate::Full,
+                });
+            }
+            assert_eq!(
+                actual.next(CdmaSystemTime::default()),
+                reference.next(CdmaSystemTime::default()),
+                "RC3 frame at {chip}"
+            );
+            chip += PRIVACY_FRAME_CHIPS;
+        }
     }
 
     #[test]

@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use log::{info, warn};
 use parking_lot::RwLock;
@@ -131,6 +132,7 @@ impl BtsCellParams {
 pub struct BtsEntry {
     cell: AccessCellId,
     inner: RwLock<BtsEntryInner>,
+    auth_mode: Arc<AtomicU8>,
 }
 
 struct BtsEntryInner {
@@ -152,6 +154,18 @@ impl BtsEntry {
 
     pub fn params(&self) -> Arc<BtsCellParams> {
         self.inner.read().params.clone()
+    }
+
+    pub fn auth_mode(&self) -> u8 {
+        self.auth_mode.load(Ordering::Acquire)
+    }
+
+    pub fn auth_mode_handle(&self) -> Arc<AtomicU8> {
+        self.auth_mode.clone()
+    }
+
+    pub fn set_auth_mode(&self, auth_mode: u8) -> bool {
+        self.auth_mode.swap(auth_mode, Ordering::AcqRel) != auth_mode
     }
 
     /// Abis control client for this cell, present once its Abis link is up.
@@ -197,6 +211,7 @@ impl BtsEntry {
         peer: Option<&str>,
     ) {
         let mut inner = self.inner.write();
+        self.set_auth_mode(params.overhead.auth_mode.unwrap_or_default());
         inner.params = Arc::new(params);
         inner.oam = oam;
         inner.status_detail = None;
@@ -327,6 +342,9 @@ pub struct BtsRegistry {
     entries: RwLock<BTreeMap<AccessCellId, Arc<BtsEntry>>>,
     peers: RwLock<Vec<Arc<PeerHandle>>>,
     fallback: Arc<BtsCellParams>,
+    /// The MSC's global challenge setting from its last enrollment, `None`
+    /// before the first one.
+    global_challenge: tokio::sync::watch::Sender<Option<bool>>,
 }
 
 impl BtsRegistry {
@@ -357,6 +375,30 @@ impl BtsRegistry {
             peers: RwLock::new(handles),
             ..Self::default()
         })
+    }
+
+    pub fn set_global_challenge(&self, requested: bool) {
+        self.global_challenge.send_if_modified(|current| {
+            let changed = *current != Some(requested);
+            *current = Some(requested);
+            changed
+        });
+    }
+
+    pub fn global_challenge(&self) -> Option<bool> {
+        *self.global_challenge.borrow()
+    }
+
+    pub fn subscribe_global_challenge(&self) -> tokio::sync::watch::Receiver<Option<bool>> {
+        self.global_challenge.subscribe()
+    }
+
+    /// AUTH broadcast by `cell`, or by the sole enrolled cell when `cell` is `None`.
+    pub fn auth_mode(&self, cell: Option<AccessCellId>) -> u8 {
+        match self.resolve(cell) {
+            Some(entry) => entry.auth_mode(),
+            None => self.fallback.overhead.auth_mode.unwrap_or_default(),
+        }
     }
 
     /// Every configured peer as the management plane sees it, in config order.
@@ -553,6 +595,7 @@ impl BtsRegistry {
                     status_detail: None,
                     peer: None,
                 }),
+                auth_mode: Arc::new(AtomicU8::new(params.overhead.auth_mode.unwrap_or_default())),
             })
         });
         entry.set_enrolled(params, oam, peer);
@@ -777,5 +820,24 @@ mod tests {
         assert!(registry.in_service().is_empty());
         entry.set_abis_down("connection refused");
         assert_eq!(entry.status_detail().as_deref(), Some("connection refused"));
+    }
+
+    #[test]
+    fn auth_mode_follows_enrollment_and_runtime_reports() {
+        let registry = BtsRegistry::new();
+        assert_eq!(registry.global_challenge(), None);
+        registry.set_global_challenge(true);
+        assert_eq!(registry.global_challenge(), Some(true));
+
+        let mut enrolled = params(7);
+        enrolled.overhead.auth_mode = Some(1);
+        let entry = registry.enroll(enrolled, None, None).expect("no conflict");
+        let decoder_view = entry.auth_mode_handle();
+        assert_eq!(registry.auth_mode(Some(cell_id(7))), 1);
+
+        assert!(entry.set_auth_mode(0));
+        assert!(!entry.set_auth_mode(0));
+        assert_eq!(registry.auth_mode(Some(cell_id(7))), 0);
+        assert_eq!(decoder_view.load(Ordering::Acquire), 0);
     }
 }

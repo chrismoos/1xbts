@@ -6,8 +6,8 @@ use cdma_common::lac::{
     MessageControlStatusBlock,
     message_types::MessageId,
     paging_messages::{
-        AlertWithInformationMessage, ForwardDataBurstMessage, ForwardOrderDetail, MsAddress,
-        OrderMessage, ServiceConnectParams, ServiceRequestParams,
+        AlertWithInformationMessage, ForwardDataBurstMessage, MsAddress, OrderMessage,
+        ServiceConnectParams, ServiceRequestParams,
     },
 };
 use cdma_common::sms as air_sms;
@@ -42,11 +42,7 @@ pub struct TrafficEvent {
 }
 
 pub(crate) fn forward_order_display_name(message: &OrderMessage) -> &'static str {
-    match message.forward_detail() {
-        Ok(ForwardOrderDetail::ServiceOptionRequest { .. }) => "Service Option Request",
-        Ok(ForwardOrderDetail::ServiceOptionResponse { .. }) => "Service Option Response",
-        _ => forward_order_name(message.order),
-    }
+    forward_order_name(message.order, Some(message.ordq))
 }
 
 pub(crate) fn traffic_event_l3_summary(

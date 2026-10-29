@@ -1594,7 +1594,11 @@ fn imsi_s_to_min(imsi_s: u64) -> String {
 fn print_order(m: &OrderMessage) {
     debug!("  Message: Order Message");
     debug!("  PD: {}", m.header.pd);
-    debug!("  ORDER: {} ({})", m.order, order_name(m.order));
+    debug!(
+        "  ORDER: {} ({})",
+        m.order,
+        cdma_common::formatting::forward_order_name(m.order, Some(m.ordq))
+    );
     debug!("  ORDQ: {}", m.ordq);
 }
 
@@ -1663,22 +1667,6 @@ fn pam_sz_frames(val: u8) -> u16 {
 fn cdma_freq_to_mhz(freq: u16) -> f64 {
     // CDMA_FREQ * 0.050 + 0.000 for band class 0 (cellular 800 MHz)
     freq as f64 * 0.050
-}
-
-fn order_name(order: u8) -> &'static str {
-    match order {
-        0 => "Abbreviated Alert",
-        1 => "Base Station Acknowledgment",
-        2 => "Base Station Challenge Confirmation",
-        0b011011 => "Registration Accepted",
-        0b011100 => "Registration Rejected",
-        5 => "Maintenance Required",
-        6 => "Lock Until Power-Cycled",
-        7 => "Unlock",
-        8 => "Parameter Update",
-        18 => "Release",
-        _ => "Unknown",
-    }
 }
 
 #[cfg(test)]

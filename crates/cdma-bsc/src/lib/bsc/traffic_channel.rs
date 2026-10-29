@@ -224,6 +224,11 @@ pub(crate) struct TrafficChannelInfo {
     pub(crate) forward_msg_seq_ack: u8,
     /// Forward-link MSG_SEQ counter for unassured PDUs (ack_req=0).
     pub(crate) forward_msg_seq_noack: u8,
+    /// Request number of the last Parameter Update Order, 4 bits (C.S0005-E Table 3.7.4-1).
+    parameter_update_request: u8,
+    pub(crate) privacy_report_at: Option<u64>,
+    pub(crate) long_code_privacy:
+        Option<std::sync::Arc<cdma_common::phy::long_code_privacy::LongCodePrivacy>>,
     /// Owning voice session, if this traffic channel is part of a voice call.
     pub(crate) voice_session_id: Option<Uuid>,
     /// Caller/callee role within the voice session.
@@ -305,6 +310,9 @@ impl TrafficChannelInfo {
             reverse_regular_msg_seq_rcvd_noack: [false; 8],
             forward_msg_seq_ack: 0,
             forward_msg_seq_noack: 0,
+            parameter_update_request: 0,
+            privacy_report_at: None,
+            long_code_privacy: None,
             voice_session_id,
             voice_leg_role,
             a1_call_id,
@@ -362,6 +370,13 @@ impl TrafficChannelInfo {
             rate_bps,
             received_at: Instant::now(),
         });
+    }
+
+    pub(crate) fn next_parameter_update_request(&mut self) -> u8 {
+        const REQUEST_NUMBER_MODULUS: u8 = 16;
+        self.parameter_update_request =
+            (self.parameter_update_request + 1) % REQUEST_NUMBER_MODULUS;
+        self.parameter_update_request
     }
 
     pub(crate) fn next_forward_msg_seq(&mut self, ack_req: bool) -> u8 {

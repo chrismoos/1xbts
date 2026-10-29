@@ -426,6 +426,27 @@ service HlrService {
   rpc SetSubscriberAKey(SetSubscriberAKeyRequest) returns (google.protobuf.Empty);
   // Returns CAVE credential provisioning and running auth state for one identity.
   rpc GetSubscriberAuthState(GetSubscriberAuthStateRequest) returns (GetSubscriberAuthStateResponse);
+  // Verifies a CAVE global-challenge AUTHR against the stored SSD (C.S0004-E §2.1.1.1.2).
+  rpc VerifyCaveGlobalChallenge(VerifyCaveGlobalChallengeRequest) returns (CaveVerdict);
+  // Verifies a CAVE unique-challenge AUTHU against the stored SSD (C.S0005-E §2.3.12.1.4).
+  rpc VerifyCaveUniqueChallenge(VerifyCaveUniqueChallengeRequest) returns (CaveVerdict);
+  // Starts an SSD update and returns the RANDSSD to send to the MS (C.S0005-E §2.3.12.1.5).
+  rpc BeginCaveSsdUpdate(BeginCaveSsdUpdateRequest) returns (BeginCaveSsdUpdateResponse);
+  // Computes AUTHBS over the pending SSD for a Base Station Challenge.
+  rpc CaveBaseStationChallenge(CaveBaseStationChallengeRequest) returns (CaveBaseStationChallengeResponse);
+  // Commits or abandons the pending SSD update.
+  rpc FinishCaveSsdUpdate(FinishCaveSsdUpdateRequest) returns (google.protobuf.Empty);
+  // Increments COUNT after the MS confirms a Parameter Update (C.S0005-E §2.3.12.1.3).
+  rpc IncrementCaveCount(IncrementCaveCountRequest) returns (IncrementCaveCountResponse);
+  // Starts an OTASP A-key exchange (C.S0016-D §5.2, §5.4) and returns the values for the
+  // MS Key Request and Key Generation Request.
+  rpc BeginCaveKeyExchange(BeginCaveKeyExchangeRequest) returns (BeginCaveKeyExchangeResponse);
+  // Derives the A-key from the mobile's MS_RESULT and holds it until commit.
+  rpc CompleteCaveKeyExchange(CompleteCaveKeyExchangeRequest) returns (google.protobuf.Empty);
+  // Makes the exchanged A-key and its SSD current after the mobile commits.
+  rpc CommitCaveKey(CaveKeyIdentityRequest) returns (google.protobuf.Empty);
+  // Discards an uncommitted key exchange.
+  rpc AbortCaveKeyExchange(CaveKeyIdentityRequest) returns (google.protobuf.Empty);
 
   // --- OTASP session history ---
   // Persists a completed OTASP session.
@@ -469,6 +490,11 @@ message SetSubscriberAKeyRequest {
   // Algorithm to record. Defaults to CAVE when an A-key is set and NONE
   // when it is cleared.
   AuthAlgorithm auth_algo = 5;
+  // Keypad entry form of the A-key: up to 20 decimal digits of the key then
+  // 6 check digits (S.S0053-0 §2.2.2). The check digits are verified against
+  // the identity's ESN. Mutually exclusive with a_key. Setting an A-key this
+  // way clears the SSD, as the handset does on entry.
+  optional string a_key_digits = 6;
 }
 
 message GetSubscriberAuthStateRequest {
@@ -488,6 +514,117 @@ message GetSubscriberAuthStateResponse {
   uint32 auth_count = 5;
   uint32 auth_failure_count = 6;
   optional google.protobuf.Timestamp last_auth_at = 7;
+}
+
+enum CaveAuthOutcome {
+  CAVE_AUTH_OUTCOME_UNSPECIFIED = 0;
+  CAVE_AUTH_OUTCOME_SUCCESS = 1;
+  // AUTHR or AUTHU does not match the value computed from the stored SSD.
+  CAVE_AUTH_OUTCOME_SIGNATURE_MISMATCH = 2;
+  // The signature matched but COUNT differs from the stored COUNT.
+  CAVE_AUTH_OUTCOME_COUNT_MISMATCH = 3;
+  // The identity has no CAVE credentials.
+  CAVE_AUTH_OUTCOME_NOT_PROVISIONED = 4;
+}
+
+message VerifyCaveGlobalChallengeRequest {
+  MobileIdentityKey identity = 1;
+  // ESN input to CAVE (the pseudo-ESN for an MEID mobile).
+  uint32 esn = 2;
+  // 32-bit RAND the BS broadcast.
+  uint32 rand = 3;
+  // 18-bit AUTHR.
+  uint32 authr = 4;
+  // MS COUNT (0-63). Omit to skip the COUNT comparison.
+  optional uint32 count = 5;
+  // 24-bit AUTH_DATA.
+  uint32 auth_data = 6;
+  // Derive the call's CMEA key and private long code mask on success.
+  bool generate_call_keys = 7;
+  // Verify an OTASP Re-Authenticate Response against the session's SSD.
+  bool otasp_reauthentication = 8;
+}
+
+message VerifyCaveUniqueChallengeRequest {
+  MobileIdentityKey identity = 1;
+  uint32 esn = 2;
+  // 24-bit RANDU.
+  uint32 randu = 3;
+  // 18-bit AUTHU.
+  uint32 authu = 4;
+  // 24-bit IMSI_S1.
+  uint32 imsi_s1 = 5;
+  // 10-bit IMSI_S2.
+  uint32 imsi_s2 = 6;
+  bool generate_call_keys = 7;
+}
+
+message CaveVerdict {
+  CaveAuthOutcome outcome = 1;
+  // 64-bit CMEA key, present on success when keys were requested.
+  optional bytes cmea_key = 2;
+  // 42-bit private long code mask PVTLCM_42, present with cmea_key.
+  optional uint64 private_long_code_mask = 3;
+}
+
+message BeginCaveSsdUpdateRequest {
+  MobileIdentityKey identity = 1;
+}
+
+message BeginCaveSsdUpdateResponse {
+  // 56-bit RANDSSD.
+  uint64 randssd = 1;
+}
+
+message CaveBaseStationChallengeRequest {
+  MobileIdentityKey identity = 1;
+  uint32 esn = 2;
+  // 32-bit RANDBS chosen by the MS.
+  uint32 randbs = 3;
+  // 24-bit IMSI_S1.
+  uint32 imsi_s1 = 4;
+}
+
+message CaveBaseStationChallengeResponse {
+  // 18-bit AUTHBS.
+  uint32 authbs = 1;
+}
+
+message FinishCaveSsdUpdateRequest {
+  MobileIdentityKey identity = 1;
+  uint32 esn = 2;
+  // True when the MS sent an SSD Update Confirmation Order.
+  bool confirmed = 3;
+}
+
+message IncrementCaveCountRequest {
+  MobileIdentityKey identity = 1;
+}
+
+message IncrementCaveCountResponse {
+  uint32 auth_count = 1;
+}
+
+message BeginCaveKeyExchangeRequest {
+  MobileIdentityKey identity = 1;
+  // A_KEY_P_REV: 2 (512-bit P chosen by the HLR) or 3 (fixed 1024-bit group).
+  uint32 a_key_p_rev = 2;
+}
+
+message BeginCaveKeyExchangeResponse {
+  // PARAM_P and PARAM_G, present only for A_KEY_P_REV 2.
+  optional bytes param_p = 1;
+  optional bytes param_g = 2;
+  bytes bs_result = 3;
+}
+
+message CompleteCaveKeyExchangeRequest {
+  MobileIdentityKey identity = 1;
+  bytes ms_result = 2;
+}
+
+message CaveKeyIdentityRequest {
+  MobileIdentityKey identity = 1;
 }
 
 // PRL storage and decoded-tree messages

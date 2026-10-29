@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+const DEFAULT_RAND_ROTATION_SECS: u64 = 600;
+
 /// Cell-level overhead parameters broadcast on the sync and paging channels.
 ///
 /// These configure the overhead message train (SPM, APM, NLM, CCLM, ESPM)
@@ -20,7 +22,14 @@ pub struct OverheadParameters {
     pub acc_config_seq: u8,
     pub power_up_reg: bool,
     pub parameter_reg: bool,
-    pub auth_mode: u8,
+    /// AUTH broadcast in the Access Parameters Message. When omitted, AUTH
+    /// follows the MSC: '01' while its authentication mode is not off, '00'
+    /// otherwise and before the first enrollment. When set, it is broadcast
+    /// as given.
+    pub auth_mode: Option<u8>,
+    /// Seconds between global-challenge RAND rotations while AUTH is
+    /// nonzero. Zero keeps the current RAND.
+    pub rand_rotation_secs: u64,
     pub t1b_ms: u64,
     pub p_rev: u8,
     pub min_p_rev: u8,
@@ -53,7 +62,8 @@ impl Default for OverheadParameters {
             acc_config_seq: 2,
             power_up_reg: true,
             parameter_reg: false,
-            auth_mode: 0,
+            auth_mode: None,
+            rand_rotation_secs: DEFAULT_RAND_ROTATION_SECS,
             t1b_ms: 1280,
             p_rev: 11,
             min_p_rev: 1,

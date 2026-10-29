@@ -62,6 +62,19 @@ message BaseStationList {
   repeated BaseStationSummary nodes = 1;
 }
 
+message ListAuthenticationEventsRequest {
+  // An event matches when its IMSI is listed here or its ESN equals `esn`.
+  repeated string imsis = 1;
+  optional uint32 esn = 2;
+  // Most events to return. Zero returns every retained match.
+  uint32 limit = 3;
+}
+
+// Authentication results, newest first.
+message AuthenticationEventList {
+  repeated events.v1.AuthenticationEvent events = 1;
+}
+
 service MscManagementService {
   // Lists the base stations the MSC serves, attached or not.
   rpc ListBaseStations(google.protobuf.Empty) returns (BaseStationList);
@@ -74,4 +87,7 @@ service MscManagementService {
   // Streams live OTASP events for real-time dashboards. Persisted
   // session history is served separately by the HLR service.
   rpc StreamOtaspEvents(google.protobuf.Empty) returns (stream events.v1.MscNetworkEvent);
+  // Lists recent authentication results for the given mobiles. The MSC keeps
+  // the most recent results in memory only, so a restart clears them.
+  rpc ListAuthenticationEvents(ListAuthenticationEventsRequest) returns (AuthenticationEventList);
 }

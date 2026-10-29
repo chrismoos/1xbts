@@ -42,7 +42,7 @@ fn client_config() -> NetworkClientConfig {
         },
         mscid: 0x001234,
         pilot_pn: 0,
-        auth_mode: 0,
+        auth_mode: Default::default(),
         p_rev_in_use: 6,
         market_id: 100,
         generating_entity_id: 200,
@@ -415,4 +415,38 @@ async fn abis_tcp_deallocate_unknown_walsh_is_noop() {
     let harness = AbisTestHarness::new().await;
     harness.client().deallocate_traffic(99).await;
     let _agent = harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn abis_private_mask_preload_is_shared_by_the_committed_tx_and_rx_session() {
+    use cdma_common::phy::long_code_privacy::LongCodePrivacy;
+    const ESN: u32 = 0x8085_7e58;
+    const PRIVATE_MASK: u64 = 0x147_80cc_b8df;
+    let harness = AbisTestHarness::new().await;
+    let generator = LongCodeGenerator::new_traffic_channel(ESN);
+    let privacy = Arc::new(LongCodePrivacy::new(generator.mask(), PRIVATE_MASK));
+    let handle = harness
+        .client()
+        .allocate_rc2_traffic(
+            generator.with_privacy(Some(privacy)),
+            0,
+            ESN,
+            Some(SERVICE_OPTION_QCELP13),
+        )
+        .await
+        .unwrap();
+    send_qcelp_cam_commit(harness.client(), handle.walsh_code);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let tx_privacy = harness
+        .controller
+        .long_code_privacy(handle.walsh_code)
+        .expect("private mask from the Abis Privacy Info IE");
+    assert_eq!(tx_privacy.private_mask(), PRIVATE_MASK);
+    let rx_privacy = harness.controller.traffic_rx_pool().lock()[0]
+        .long_code_privacy
+        .clone()
+        .unwrap();
+    assert!(Arc::ptr_eq(&tx_privacy, &rx_privacy));
+    assert_eq!(tx_privacy.status_at(u64::MAX), "public");
+    harness.shutdown().await;
 }

@@ -9,6 +9,7 @@ import { Card, Stat } from "@/components/card";
 import { RecentMessagesCard } from "@/components/recent-messages-card";
 import { RecentOtaspCard } from "@/components/recent-otasp-card";
 import { OtaspOverridesCard } from "@/components/otasp-overrides-card";
+import { AuthenticationCard } from "@/components/authentication-card";
 import { ImsiGenerateButton } from "@/components/imsi-generate-button";
 import { validateRingtoneFile } from "@/lib/validation";
 import {
@@ -511,6 +512,8 @@ export default function SubscriberDetailPage({
       <RecentMessagesCard phone={subscriber.phoneNumber} />
 
       <RecentOtaspCard subscriberId={subscriber.subscriberId} />
+
+      <AuthenticationCard subscriberId={subscriber.subscriberId} />
 
       <OtaspOverridesCard
         subscriberId={subscriber.subscriberId}

@@ -741,6 +741,7 @@ export interface A1AddsPayload {
 
 /** One A1 signaling message, complete. */
 export interface A1SignalingEvent {
+  voicePrivacy?: string | undefined;
   direction: A1Direction;
   discriminator: A1MessageDiscriminator;
   messageType: A1MessageType;
@@ -748,11 +749,7 @@ export interface A1SignalingEvent {
   messageTypeValue: number;
   /** Message name for display, e.g. "Location Updating Request". */
   messageTypeName: string;
-  /**
-   * The complete reassembled Layer 3 SDU: protocol discriminator, message type
-   * and every information element, byte for byte as the peer sent it. This is
-   * captured before any typed re-encode.
-   */
+  /** Reassembled Layer 3 SDU. Encryption parameter values are replaced with zeros. */
   sdu: Uint8Array;
   /** Same bytes as uppercase hex, for display and copy-paste. */
   sduHex: string;
@@ -2313,6 +2310,7 @@ export const A1AddsPayload: MessageFns<A1AddsPayload> = {
 
 function createBaseA1SignalingEvent(): A1SignalingEvent {
   return {
+    voicePrivacy: undefined,
     direction: 0,
     discriminator: 0,
     messageType: 0,
@@ -2337,6 +2335,9 @@ function createBaseA1SignalingEvent(): A1SignalingEvent {
 
 export const A1SignalingEvent: MessageFns<A1SignalingEvent> = {
   encode(message: A1SignalingEvent, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.voicePrivacy !== undefined) {
+      writer.uint32(162).string(message.voicePrivacy);
+    }
     if (message.direction !== 0) {
       writer.uint32(8).int32(message.direction);
     }
@@ -2404,6 +2405,14 @@ export const A1SignalingEvent: MessageFns<A1SignalingEvent> = {
     while (reader.pos < end) {
       const tag = reader.uint32();
       switch (tag >>> 3) {
+        case 20: {
+          if (tag !== 162) {
+            break;
+          }
+
+          message.voicePrivacy = reader.string();
+          continue;
+        }
         case 1: {
           if (tag !== 8) {
             break;
@@ -2567,6 +2576,11 @@ export const A1SignalingEvent: MessageFns<A1SignalingEvent> = {
 
   fromJSON(object: any): A1SignalingEvent {
     return {
+      voicePrivacy: isSet(object.voicePrivacy)
+        ? globalThis.String(object.voicePrivacy)
+        : isSet(object.voice_privacy)
+        ? globalThis.String(object.voice_privacy)
+        : undefined,
       direction: isSet(object.direction) ? a1DirectionFromJSON(object.direction) : 0,
       discriminator: isSet(object.discriminator) ? a1MessageDiscriminatorFromJSON(object.discriminator) : 0,
       messageType: isSet(object.messageType)
@@ -2639,6 +2653,9 @@ export const A1SignalingEvent: MessageFns<A1SignalingEvent> = {
 
   toJSON(message: A1SignalingEvent): unknown {
     const obj: any = {};
+    if (message.voicePrivacy !== undefined) {
+      obj.voicePrivacy = message.voicePrivacy;
+    }
     if (message.direction !== 0) {
       obj.direction = a1DirectionToJSON(message.direction);
     }
@@ -2704,6 +2721,7 @@ export const A1SignalingEvent: MessageFns<A1SignalingEvent> = {
   },
   fromPartial(object: DeepPartial<A1SignalingEvent>): A1SignalingEvent {
     const message = createBaseA1SignalingEvent();
+    message.voicePrivacy = object.voicePrivacy ?? undefined;
     message.direction = object.direction ?? 0;
     message.discriminator = object.discriminator ?? 0;
     message.messageType = object.messageType ?? 0;

@@ -599,7 +599,60 @@ pub struct PrivacyInfo {
     pub privacy_masks: Vec<PrivacyMaskInformation>,
 }
 
+/// A.S0003-A §7.12 and IS-2001 §6.2.2.143.
+const PRIVATE_PRIVACY_MASK_TYPE: u8 = 0b00010;
+const PRIVACY_MASK_OCTETS: usize = 6;
+const PRIVACY_MASK_UNUSED_BITS: u8 = 0b11111100;
+const PRIVACY_MASK_STORAGE_OCTETS: usize = 8;
+const PRIVACY_MASK_BITS: u32 = 42;
+const PRIVACY_MASK_MAX: u64 = (1u64 << PRIVACY_MASK_BITS) - 1;
+
 impl PrivacyInfo {
+    /// A.S0003-A §7.12 and IS-2001 §6.2.2.143 private-mask record.
+    pub fn private_long_code(mask: u64) -> Result<Self> {
+        if mask > PRIVACY_MASK_MAX {
+            return Err(Error::InvalidValue {
+                context: "Privacy Info",
+                reason: "private mask exceeds 42 bits",
+            });
+        }
+        Ok(Self {
+            privacy_masks: vec![PrivacyMaskInformation {
+                privacy_mask_type: PRIVATE_PRIVACY_MASK_TYPE,
+                status: false,
+                available: true,
+                privacy_mask: mask.to_be_bytes()
+                    [PRIVACY_MASK_STORAGE_OCTETS - PRIVACY_MASK_OCTETS..]
+                    .to_vec(),
+            }],
+        })
+    }
+
+    pub fn private_long_code_mask(&self) -> Result<Option<u64>> {
+        let mut mask = None;
+        for record in &self.privacy_masks {
+            if record.privacy_mask_type != PRIVATE_PRIVACY_MASK_TYPE {
+                continue;
+            }
+            if mask.is_some()
+                || record.privacy_mask.len() != PRIVACY_MASK_OCTETS
+                || record.privacy_mask[0] & PRIVACY_MASK_UNUSED_BITS != 0
+            {
+                return Err(Error::InvalidValue {
+                    context: "Privacy Info",
+                    reason: "invalid private long code mask",
+                });
+            }
+            mask = Some(
+                record
+                    .privacy_mask
+                    .iter()
+                    .fold(0u64, |value, byte| (value << 8) | u64::from(*byte)),
+            );
+        }
+        Ok(mask)
+    }
+
     /// Encodes the `Privacy Info` payload.
     pub fn encode(&self) -> Result<Vec<u8>> {
         if self.privacy_masks.is_empty() {
@@ -4113,5 +4166,34 @@ impl<'a> MessageCursor<'a> {
         self.offset = value_end;
         let _ = self.message_type;
         Ok(Some((id, &self.input[value_start..value_end])))
+    }
+}
+
+#[cfg(test)]
+mod privacy_tests {
+    use super::*;
+
+    #[test]
+    fn private_mask_preload_uses_the_spec_privacy_info_record() {
+        const PRIVATE_MASK: u64 = 0x147_80cc_b8df;
+        let info = PrivacyInfo::private_long_code(PRIVATE_MASK).unwrap();
+        let encoded = info.encode().unwrap();
+        assert_eq!(encoded, [0x09, 6, 1, 0x47, 0x80, 0xcc, 0xb8, 0xdf]);
+        assert_eq!(
+            PrivacyInfo::decode(&encoded)
+                .unwrap()
+                .private_long_code_mask()
+                .unwrap(),
+            Some(PRIVATE_MASK)
+        );
+        assert!(PrivacyInfo::private_long_code(1u64 << 42).is_err());
+        let mut invalid = encoded;
+        invalid[2] |= 0b11111100;
+        assert!(
+            PrivacyInfo::decode(&invalid)
+                .unwrap()
+                .private_long_code_mask()
+                .is_err()
+        );
     }
 }

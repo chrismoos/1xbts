@@ -52,7 +52,12 @@ message CellRequest {
 }
 
 // Requests the cell identity and radio configuration for a BTS.
-message EnrollRequest {}
+message EnrollRequest {
+  // Whether the core network verifies the CAVE global challenge. A BTS whose
+  // configuration does not fix AUTH broadcasts AUTH = '01' when true and '00'
+  // when false. Absent leaves AUTH unchanged.
+  optional bool global_challenge = 1;
+}
 
 // Cell identity and radio configuration supplied by a BTS at attach.
 message EnrollResponse {

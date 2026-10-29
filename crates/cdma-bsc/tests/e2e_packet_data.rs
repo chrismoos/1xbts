@@ -231,6 +231,7 @@ fn synthetic_origination_so7(esn: u32) -> AccessChannelEvent {
         rev_supported_rcs: vec![1],
         decoded_rdsch: None,
         raw_pdu_bits: None,
+        authentication: None,
     }
 }
 
@@ -1025,6 +1026,7 @@ fn synthetic_traffic_preamble(walsh_code: u8) -> AccessChannelEvent {
         rev_supported_rcs: Vec::new(),
         decoded_rdsch: None,
         raw_pdu_bits: None,
+        authentication: None,
     }
 }
 
@@ -1100,6 +1102,7 @@ fn synthetic_ms_ack_order(walsh_code: u8) -> AccessChannelEvent {
         rev_supported_rcs: Vec::new(),
         decoded_rdsch: None,
         raw_pdu_bits: None,
+        authentication: None,
     }
 }
 
@@ -1175,6 +1178,7 @@ fn synthetic_service_connect_completion(walsh_code: u8) -> AccessChannelEvent {
         rev_supported_rcs: Vec::new(),
         decoded_rdsch: None,
         raw_pdu_bits: None,
+        authentication: None,
     }
 }
 
@@ -1386,7 +1390,7 @@ async fn test_e2e_so7_packet_data_full_negotiation() {
                 one_x_rx_shift_hz: 0,
                 hrpd_reverse_frequency_hz: None,
                 hrpd_rx_shift_hz: None,
-                auth_mode: 0,
+                global_challenge: Default::default(),
                 p_rev_in_use: 6,
                 capture_iq_wav: None,
                 capture_seconds: None,
@@ -1474,7 +1478,7 @@ async fn test_e2e_so7_packet_data_full_negotiation() {
                 cell_id: CellId { cell: 1, sector: 1 },
                 mscid: 1,
                 pilot_pn: 0,
-                auth_mode: 0,
+                auth_mode: Default::default(),
                 p_rev_in_use: 6,
                 market_id: 1,
                 generating_entity_id: 1,
@@ -2025,7 +2029,7 @@ async fn test_e2e_so7_packet_data_phy_bidirectional() {
                 one_x_rx_shift_hz: 0,
                 hrpd_reverse_frequency_hz: None,
                 hrpd_rx_shift_hz: None,
-                auth_mode: 0,
+                global_challenge: Default::default(),
                 p_rev_in_use: 6,
                 capture_iq_wav: None,
                 capture_seconds: None,
@@ -2113,7 +2117,7 @@ async fn test_e2e_so7_packet_data_phy_bidirectional() {
                 cell_id: CellId { cell: 1, sector: 1 },
                 mscid: 1,
                 pilot_pn: 0,
-                auth_mode: 0,
+                auth_mode: Default::default(),
                 p_rev_in_use: 6,
                 market_id: 1,
                 generating_entity_id: 1,
@@ -2745,7 +2749,7 @@ async fn test_e2e_so7_rc3_reverse_preamble_queues_bs_ack() {
                 one_x_rx_shift_hz: 0,
                 hrpd_reverse_frequency_hz: None,
                 hrpd_rx_shift_hz: None,
-                auth_mode: 0,
+                global_challenge: Default::default(),
                 p_rev_in_use: 6,
                 capture_iq_wav: None,
                 capture_seconds: None,
@@ -2843,7 +2847,7 @@ async fn test_e2e_so7_rc3_reverse_preamble_queues_bs_ack() {
                     cell_id: CellId { cell: 1, sector: 1 },
                     mscid: 1,
                     pilot_pn: 0,
-                    auth_mode: 0,
+                    auth_mode: Default::default(),
                     p_rev_in_use: 6,
                     market_id: 1,
                     generating_entity_id: 1,
@@ -3574,6 +3578,7 @@ fn synthetic_origination_so6(esn: u32) -> AccessChannelEvent {
         rev_supported_rcs: vec![1],
         decoded_rdsch: None,
         raw_pdu_bits: None,
+        authentication: None,
     }
 }
 
@@ -3650,6 +3655,7 @@ fn synthetic_traffic_data_burst(walsh_code: u8, sms_payload: Vec<u8>) -> AccessC
         rev_supported_rcs: Vec::new(),
         decoded_rdsch: None,
         raw_pdu_bits: None,
+        authentication: None,
     }
 }
 
@@ -3963,7 +3969,7 @@ async fn test_e2e_so6_sms_data_burst_phy_bidirectional() {
                 one_x_rx_shift_hz: 0,
                 hrpd_reverse_frequency_hz: None,
                 hrpd_rx_shift_hz: None,
-                auth_mode: 0,
+                global_challenge: Default::default(),
                 p_rev_in_use: 6,
                 capture_iq_wav: None,
                 capture_seconds: None,
@@ -4059,7 +4065,7 @@ async fn test_e2e_so6_sms_data_burst_phy_bidirectional() {
                     cell_id: CellId { cell: 1, sector: 1 },
                     mscid: 1,
                     pilot_pn: 0,
-                    auth_mode: 0,
+                    auth_mode: Default::default(),
                     p_rev_in_use: 6,
                     market_id: 1,
                     generating_entity_id: 1,

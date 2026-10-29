@@ -14,6 +14,10 @@
 use cdma_otasp::message::commit::{CommitRequest, CommitResponse};
 use cdma_otasp::message::configuration::{ConfigurationRequest, ConfigurationResponse};
 use cdma_otasp::message::download::{DownloadParamBlock, DownloadRequest, DownloadResponse};
+use cdma_otasp::message::key_exchange::{
+    KeyGenerationRequest, KeyGenerationResponse, MsKeyRequest, MsKeyResponse,
+    ReAuthenticateRequest, ReAuthenticateResponse,
+};
 use cdma_otasp::message::protocol_capability::{
     ProtocolCapabilityRequest, ProtocolCapabilityResponse,
 };
@@ -32,7 +36,8 @@ use cdma_otasp::param::verify_spc::VerifySpc;
 
 use crate::config::{HomeNetworkConfig, OtaspConfig};
 use crate::otasp::event::{
-    BlockFeature, HardwareIdentity, OtaspEvent, PrlOutcome, PrlReadback, SessionOutcomeKind,
+    AKeySkipReason, AKeyStep, BlockFeature, HardwareIdentity, OtaspEvent, PrlOutcome, PrlReadback,
+    SessionOutcomeKind,
 };
 use crate::otasp::nam::{AssembledNam, NamReadback, ResolvedSubscriberInput, assemble_nam};
 
@@ -47,6 +52,45 @@ pub struct OutboundOtasp {
 pub trait OtaspTransport {
     fn send(&mut self, message: OutboundOtasp);
     fn emit(&mut self, event: OtaspEvent);
+    fn request(&mut self, _request: OtaspAuthRequest) {}
+}
+
+/// A-key provisioning steps that need the HLR or an A1 SSD update (C.S0016-D §3.3.2,
+/// §5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OtaspAuthRequest {
+    BeginKeyExchange {
+        a_key_p_rev: u8,
+    },
+    CompleteKeyExchange {
+        ms_result: Vec<u8>,
+    },
+    /// SSD update with base station challenge on the session's traffic channel.
+    SsdUpdate,
+    VerifyReauthentication {
+        rand: u32,
+        response: ReAuthenticateResponse,
+    },
+    /// The mobile accepted the Commit, so the exchanged A-key and SSD become current.
+    CommitKey,
+    AbortKeyExchange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyExchangeOffer {
+    pub a_key_p_rev: u8,
+    pub params: Option<(Vec<u8>, Vec<u8>)>,
+    pub bs_result: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AKeyProgress {
+    NotPlanned,
+    Planned { a_key_p_rev: u8 },
+    Exchanging { bs_result: Vec<u8> },
+    Ready,
+    Abandoned,
+    Skipped,
 }
 
 /// Terminal outcome of a session.
@@ -137,6 +181,13 @@ enum Phase {
     AwaitingMmsConfig,
     AwaitingMmsDownload,
     AwaitingSsprDownloadResponse,
+    AwaitingKeyExchangeOffer,
+    AwaitingMsKeyResponse,
+    AwaitingKeyGenerationResponse,
+    AwaitingKeyExchangeCompletion,
+    AwaitingSsdUpdate,
+    AwaitingReAuthenticateResponse { rand: u32 },
+    AwaitingReauthenticationVerdict,
     AwaitingCommit,
     Terminated,
 }
@@ -209,6 +260,7 @@ pub struct OtaspSession {
     plan_idx: usize,
     completed_blocks: u32,
     phase: Phase,
+    a_key_p_rev: u8,
     /// Feature IDs the MS advertised in its Protocol Capability Response.
     /// Used to skip writes whose feature isn't supported (e.g. System Tag on
     /// an OTASP_P_REV=1-only device).
@@ -224,6 +276,7 @@ pub struct OtaspSession {
     /// visible values shown on `NamReadback`. `Some` between
     /// `send_nam_download` and the matching `handle_nam_download`.
     pending_download_fields: Option<Vec<(String, String)>>,
+    a_key: AKeyProgress,
 }
 
 impl OtaspSession {
@@ -280,6 +333,7 @@ impl OtaspSession {
                 do_download: true,
             });
         }
+        let cfg_a_key = cfg.writes.a_key;
         Self {
             cfg,
             home_network,
@@ -292,10 +346,18 @@ impl OtaspSession {
             plan_idx: 0,
             completed_blocks: 0,
             phase: Phase::AwaitingProtocolCapability,
+            a_key_p_rev: 0,
             advertised_features: Vec::new(),
             prl_fetch: None,
             prl_push: None,
             pending_download_fields: None,
+            a_key: if cfg_a_key {
+                AKeyProgress::Planned {
+                    a_key_p_rev: cdma_otasp::message::key_exchange::A_KEY_P_REV_2G,
+                }
+            } else {
+                AKeyProgress::NotPlanned
+            },
         }
     }
 
@@ -342,6 +404,18 @@ impl OtaspSession {
             Phase::AwaitingMmsConfig => self.handle_mms_config(bytes, t),
             Phase::AwaitingMmsDownload => self.handle_mms_download(bytes, t),
             Phase::AwaitingSsprDownloadResponse => self.handle_sspr_download_response(bytes, t),
+            Phase::AwaitingMsKeyResponse => self.handle_ms_key_response(bytes, t),
+            Phase::AwaitingKeyGenerationResponse => self.handle_key_generation_response(bytes, t),
+            Phase::AwaitingReAuthenticateResponse { rand } => {
+                self.handle_reauthenticate_response(rand, bytes, t)
+            }
+            Phase::AwaitingKeyExchangeOffer
+            | Phase::AwaitingKeyExchangeCompletion
+            | Phase::AwaitingSsdUpdate
+            | Phase::AwaitingReauthenticationVerdict => {
+                self.terminate(t, SessionOutcomeKind::ProtocolError);
+                StepResult::Terminal(SessionOutcomeKind::ProtocolError)
+            }
             Phase::AwaitingCommit => self.handle_commit(bytes, t),
             Phase::Terminated => unreachable!(),
         };
@@ -431,6 +505,16 @@ impl OtaspSession {
                 self.plan_idx += 1;
                 let _ = self.advance_to_next_target(t);
             }
+            Phase::AwaitingMsKeyResponse | Phase::AwaitingKeyGenerationResponse => {
+                let _ = self.abandon_key_exchange(t);
+            }
+            Phase::AwaitingReAuthenticateResponse { .. } => {
+                let _ = self.fail_key_exchange(t);
+            }
+            Phase::AwaitingKeyExchangeOffer
+            | Phase::AwaitingKeyExchangeCompletion
+            | Phase::AwaitingSsdUpdate
+            | Phase::AwaitingReauthenticationVerdict => {}
             // Read-back / control phases without a block target — no
             // clean recovery, terminate the session.
             Phase::AwaitingProtocolCapability
@@ -516,9 +600,15 @@ impl OtaspSession {
             mob_model: resp.mob_model,
             band_mode_cap: crate::otasp::event::BandModeCapView::from_byte(resp.band_mode_cap.raw),
             otasp_p_rev,
-            features: features_pairs,
+            features: features_pairs.clone(),
         });
         self.prune_plan_for_unsupported_features(t);
+        if let AKeyProgress::Planned { .. } = self.a_key {
+            self.a_key = match key_exchange_p_rev(&features_pairs) {
+                Some(a_key_p_rev) => AKeyProgress::Planned { a_key_p_rev },
+                None => AKeyProgress::NotPlanned,
+            };
+        }
         // Verify SPC: subscriber's stored SPC if set, else IS-95 default.
         let spc = self
             .hlr
@@ -885,17 +975,13 @@ impl OtaspSession {
 
     fn advance_to_next_target<T: OtaspTransport>(&mut self, t: &mut T) -> StepResult {
         if self.plan_idx >= self.plan.len() {
-            // Always send Commit, even with zero blocks downloaded. Per
-            // observed behavior, vintage MSes display "activation
-            // unsuccessful" if the session ends without an explicit Commit.
-            // A zero-blocks Commit is a no-op on the MS but signals
-            // "session is over cleanly."
-            let req = CommitRequest;
-            t.send(OutboundOtasp {
-                bytes: req.encode(),
-            });
-            self.phase = Phase::AwaitingCommit;
-            return StepResult::Continue;
+            if let AKeyProgress::Planned { a_key_p_rev } = self.a_key {
+                self.a_key_p_rev = a_key_p_rev;
+                t.request(OtaspAuthRequest::BeginKeyExchange { a_key_p_rev });
+                self.phase = Phase::AwaitingKeyExchangeOffer;
+                return StepResult::Continue;
+            }
+            return self.send_commit(t);
         }
         let target = self.plan[self.plan_idx].target;
         match target {
@@ -1662,6 +1748,258 @@ impl OtaspSession {
         self.send_next_prl_push_segment(t)
     }
 
+    /// Always send Commit, even with zero blocks downloaded. Vintage MSes display
+    /// "activation unsuccessful" if the session ends without an explicit Commit, and a
+    /// zero-blocks Commit is a no-op on the MS.
+    fn send_commit<T: OtaspTransport>(&mut self, t: &mut T) -> StepResult {
+        t.send(OutboundOtasp {
+            bytes: CommitRequest.encode(),
+        });
+        self.phase = Phase::AwaitingCommit;
+        StepResult::Continue
+    }
+
+    fn abandon_key_exchange<T: OtaspTransport>(&mut self, t: &mut T) -> StepResult {
+        self.a_key = AKeyProgress::Abandoned;
+        t.request(OtaspAuthRequest::AbortKeyExchange);
+        self.send_commit(t)
+    }
+
+    /// Ends the session without a Commit Request once the mobile has accepted the Key
+    /// Generation Request. The mobile then holds A_KEY_TEMP and stores it on any Commit,
+    /// so committing after a failure leaves it with a key the HLR does not have. Without
+    /// a Commit the mobile discards everything the session sent.
+    fn fail_key_exchange<T: OtaspTransport>(&mut self, t: &mut T) -> StepResult {
+        self.a_key = AKeyProgress::Abandoned;
+        self.terminate(t, SessionOutcomeKind::KeyExchangeFailed);
+        StepResult::Terminal(SessionOutcomeKind::KeyExchangeFailed)
+    }
+
+    /// The key exchange response the session waits for, if any. The mobile computes
+    /// it with a modular exponentiation and may take up to 30 seconds
+    /// (C.S0016-D §3.3.1).
+    pub fn awaited_key_exchange_response(&self) -> Option<&'static str> {
+        match self.phase {
+            Phase::AwaitingMsKeyResponse => Some("MS Key Response"),
+            Phase::AwaitingKeyGenerationResponse => Some("Key Generation Response"),
+            _ => None,
+        }
+    }
+
+    fn emit_a_key<T: OtaspTransport>(
+        &self,
+        t: &mut T,
+        step: AKeyStep,
+        success: bool,
+        result_code: Option<u8>,
+    ) {
+        t.emit(OtaspEvent::AKeyProgress {
+            step,
+            success,
+            a_key_p_rev: self.a_key_p_rev,
+            elapsed_ms: None,
+            result_code,
+            skip_reason: None,
+        });
+    }
+
+    pub fn on_key_exchange_skipped<T: OtaspTransport>(
+        &mut self,
+        reason: AKeySkipReason,
+        t: &mut T,
+    ) -> Option<SessionOutcome> {
+        if self.phase != Phase::AwaitingKeyExchangeOffer {
+            return None;
+        }
+        self.a_key = AKeyProgress::Skipped;
+        t.emit(OtaspEvent::AKeyProgress {
+            step: AKeyStep::Skipped,
+            success: true,
+            a_key_p_rev: self.a_key_p_rev,
+            elapsed_ms: None,
+            result_code: None,
+            skip_reason: Some(reason),
+        });
+        let result = self.send_commit(t);
+        self.step_outcome(result)
+    }
+
+    pub fn key_exchange_started(&self) -> bool {
+        matches!(
+            self.a_key,
+            AKeyProgress::Exchanging { .. } | AKeyProgress::Ready | AKeyProgress::Abandoned
+        )
+    }
+
+    pub fn on_key_exchange_offer<T: OtaspTransport>(
+        &mut self,
+        offer: Option<KeyExchangeOffer>,
+        t: &mut T,
+    ) -> Option<SessionOutcome> {
+        if self.phase != Phase::AwaitingKeyExchangeOffer {
+            return None;
+        }
+        let Some(offer) = offer else {
+            self.emit_a_key(t, AKeyStep::Requested, false, None);
+            self.a_key = AKeyProgress::Abandoned;
+            let result = self.send_commit(t);
+            return self.step_outcome(result);
+        };
+        self.a_key_p_rev = offer.a_key_p_rev;
+        let request = MsKeyRequest {
+            a_key_p_rev: offer.a_key_p_rev,
+            params: offer.params,
+        };
+        let result = match request.encode() {
+            Ok(bytes) => {
+                t.send(OutboundOtasp { bytes });
+                self.emit_a_key(t, AKeyStep::Requested, true, None);
+                self.a_key = AKeyProgress::Exchanging {
+                    bs_result: offer.bs_result,
+                };
+                self.phase = Phase::AwaitingMsKeyResponse;
+                StepResult::Continue
+            }
+            Err(_) => self.abandon_key_exchange(t),
+        };
+        self.step_outcome(result)
+    }
+
+    fn handle_ms_key_response<T: OtaspTransport>(&mut self, bytes: &[u8], t: &mut T) -> StepResult {
+        let result = MsKeyResponse::decode(bytes).ok().map(|r| r.result);
+        let accepted = result.is_some_and(|r| r.is_accepted());
+        self.emit_a_key(
+            t,
+            AKeyStep::MsKeyResponse,
+            accepted,
+            result.map(|r| r.to_u8()),
+        );
+        let AKeyProgress::Exchanging { bs_result } = &self.a_key else {
+            return self.abandon_key_exchange(t);
+        };
+        if !accepted {
+            return self.abandon_key_exchange(t);
+        }
+        match (KeyGenerationRequest {
+            bs_result: bs_result.clone(),
+        })
+        .encode()
+        {
+            Ok(bytes) => {
+                t.send(OutboundOtasp { bytes });
+                self.phase = Phase::AwaitingKeyGenerationResponse;
+                StepResult::Continue
+            }
+            Err(_) => self.abandon_key_exchange(t),
+        }
+    }
+
+    fn handle_key_generation_response<T: OtaspTransport>(
+        &mut self,
+        bytes: &[u8],
+        t: &mut T,
+    ) -> StepResult {
+        let response = KeyGenerationResponse::decode(bytes).ok();
+        self.emit_a_key(
+            t,
+            AKeyStep::KeyGenerationResponse,
+            response.as_ref().is_some_and(|r| r.result.is_accepted()),
+            response.as_ref().map(|r| r.result.to_u8()),
+        );
+        match response {
+            Some(response) if response.result.is_accepted() => {
+                t.request(OtaspAuthRequest::CompleteKeyExchange {
+                    ms_result: response.ms_result,
+                });
+                self.phase = Phase::AwaitingKeyExchangeCompletion;
+                StepResult::Continue
+            }
+            _ => self.abandon_key_exchange(t),
+        }
+    }
+
+    pub fn on_key_exchange_completed<T: OtaspTransport>(
+        &mut self,
+        ok: bool,
+        t: &mut T,
+    ) -> Option<SessionOutcome> {
+        if self.phase != Phase::AwaitingKeyExchangeCompletion {
+            return None;
+        }
+        self.emit_a_key(t, AKeyStep::KeyDerived, ok, None);
+        let result = if ok {
+            t.request(OtaspAuthRequest::SsdUpdate);
+            self.phase = Phase::AwaitingSsdUpdate;
+            StepResult::Continue
+        } else {
+            self.fail_key_exchange(t)
+        };
+        self.step_outcome(result)
+    }
+
+    pub fn on_ssd_update_finished<T: OtaspTransport>(
+        &mut self,
+        ok: bool,
+        t: &mut T,
+    ) -> Option<SessionOutcome> {
+        if self.phase != Phase::AwaitingSsdUpdate {
+            return None;
+        }
+        self.emit_a_key(t, AKeyStep::SsdUpdate, ok, None);
+        let result = if ok {
+            let rand = rand::random::<u32>();
+            t.send(OutboundOtasp {
+                bytes: ReAuthenticateRequest { rand }.encode(),
+            });
+            self.phase = Phase::AwaitingReAuthenticateResponse { rand };
+            StepResult::Continue
+        } else {
+            self.fail_key_exchange(t)
+        };
+        self.step_outcome(result)
+    }
+
+    fn handle_reauthenticate_response<T: OtaspTransport>(
+        &mut self,
+        rand: u32,
+        bytes: &[u8],
+        t: &mut T,
+    ) -> StepResult {
+        match ReAuthenticateResponse::decode(bytes) {
+            Ok(response) => {
+                t.request(OtaspAuthRequest::VerifyReauthentication { rand, response });
+                self.phase = Phase::AwaitingReauthenticationVerdict;
+                StepResult::Continue
+            }
+            Err(_) => self.fail_key_exchange(t),
+        }
+    }
+
+    pub fn on_reauthentication_verified<T: OtaspTransport>(
+        &mut self,
+        ok: bool,
+        t: &mut T,
+    ) -> Option<SessionOutcome> {
+        if self.phase != Phase::AwaitingReauthenticationVerdict {
+            return None;
+        }
+        self.emit_a_key(t, AKeyStep::ReAuthentication, ok, None);
+        let result = if ok {
+            self.a_key = AKeyProgress::Ready;
+            self.send_commit(t)
+        } else {
+            self.fail_key_exchange(t)
+        };
+        self.step_outcome(result)
+    }
+
+    fn step_outcome(&mut self, result: StepResult) -> Option<SessionOutcome> {
+        match result {
+            StepResult::Continue => None,
+            StepResult::Terminal(kind) => Some(self.outcome(kind)),
+        }
+    }
+
     fn handle_commit<T: OtaspTransport>(&mut self, bytes: &[u8], t: &mut T) -> StepResult {
         let resp = match CommitResponse::decode(bytes) {
             Ok(r) => r,
@@ -1678,8 +2016,37 @@ impl OtaspSession {
         } else {
             SessionOutcomeKind::Rejected
         };
+        if self.a_key == AKeyProgress::Ready {
+            self.emit_a_key(
+                t,
+                AKeyStep::Committed,
+                resp.result.is_accepted(),
+                Some(resp.result.to_u8()),
+            );
+            t.request(if resp.result.is_accepted() {
+                OtaspAuthRequest::CommitKey
+            } else {
+                OtaspAuthRequest::AbortKeyExchange
+            });
+        }
         self.terminate(t, kind);
         StepResult::Terminal(kind)
+    }
+}
+
+/// The A_KEY_P_REV to request from the Key Exchange FEATURE_P_REV the mobile
+/// advertised (C.S0016-D Table 3.5.1.7-1). Revisions above 3 provision 3G keys only, so
+/// a 2G A-key uses at most A_KEY_P_REV 3.
+fn key_exchange_p_rev(features: &[(u8, u8)]) -> Option<u8> {
+    use cdma_otasp::message::key_exchange::{A_KEY_P_REV_2G, A_KEY_P_REV_2G_3G};
+    use cdma_otasp::message::protocol_capability::feature_id;
+    let (_, p_rev) = features
+        .iter()
+        .find(|(id, _)| *id == feature_id::KEY_EXCHANGE)?;
+    match *p_rev {
+        A_KEY_P_REV_2G => Some(A_KEY_P_REV_2G),
+        A_KEY_P_REV_2G_3G => Some(A_KEY_P_REV_2G_3G),
+        _ => None,
     }
 }
 
@@ -2020,6 +2387,7 @@ mod tests {
     struct Recorder {
         outbound: Vec<OutboundOtasp>,
         events: Vec<OtaspEvent>,
+        requests: Vec<OtaspAuthRequest>,
     }
 
     impl OtaspTransport for Recorder {
@@ -2028,6 +2396,9 @@ mod tests {
         }
         fn emit(&mut self, event: OtaspEvent) {
             self.events.push(event);
+        }
+        fn request(&mut self, request: OtaspAuthRequest) {
+            self.requests.push(request);
         }
     }
 
@@ -2041,6 +2412,7 @@ mod tests {
             home_system_tag: true,
             mms_uri: false,
             prl: false,
+            a_key: false,
         }
     }
 
@@ -2287,6 +2659,7 @@ mod tests {
             home_system_tag: true,
             mms_uri: false,
             prl: false,
+            a_key: false,
         };
         let (mut sess, mut rec) = start_session(writes);
         sess.on_inbound(&pcap_resp_bytes(), &mut rec);
@@ -2320,6 +2693,7 @@ mod tests {
             home_system_tag: false,
             mms_uri: false,
             prl: false,
+            a_key: false,
         };
         let (mut sess, mut rec) = start_session(writes);
         sess.on_inbound(&pcap_resp_bytes(), &mut rec);
@@ -2356,6 +2730,7 @@ mod tests {
             home_system_tag: false,
             mms_uri: false,
             prl: false,
+            a_key: false,
         };
         let (mut sess, mut rec) = start_session(writes);
         sess.on_inbound(&pcap_resp_bytes(), &mut rec);
@@ -2537,6 +2912,7 @@ mod tests {
             home_system_tag: false,
             mms_uri: false,
             prl: true,
+            a_key: false,
         }
     }
 
@@ -2587,6 +2963,328 @@ mod tests {
     /// Walk through the three NAM read-back-only stages (no Download
     /// follows since `do_download = false` for each). Helper used by
     /// the PRL push tests so they don't have to re-derive this flow.
+    fn pcap_resp_with_key_exchange(a_key_p_rev: u8) -> Vec<u8> {
+        use cdma_otasp::message::protocol_capability::{FeatureCapability, feature_id};
+        ProtocolCapabilityResponse {
+            mob_firm_rev: 0x0001,
+            mob_model: 0x42,
+            features: vec![
+                FeatureCapability {
+                    feature_id: feature_id::NAM_DOWNLOAD,
+                    feature_p_rev: 2,
+                },
+                FeatureCapability {
+                    feature_id: feature_id::KEY_EXCHANGE,
+                    feature_p_rev: a_key_p_rev,
+                },
+            ],
+            band_mode_cap: BandModeCap::from_byte(0b0100_0000),
+            additional_trailing: vec![],
+        }
+        .encode()
+        .unwrap()
+    }
+
+    fn writes_a_key_only() -> OtaspWritesConfig {
+        OtaspWritesConfig {
+            a_key: true,
+            ..OtaspWritesConfig::default()
+        }
+    }
+
+    fn last_outbound(rec: &Recorder) -> Vec<u8> {
+        rec.outbound
+            .last()
+            .expect("an outbound message")
+            .bytes
+            .clone()
+    }
+
+    fn session_at_key_exchange(a_key_p_rev: u8) -> (OtaspSession, Recorder) {
+        let (mut sess, mut rec) = start_session(writes_a_key_only());
+        sess.on_inbound(&pcap_resp_with_key_exchange(a_key_p_rev), &mut rec);
+        sess.on_inbound(&validation_resp_accept_bytes(), &mut rec);
+        step_through_nam_readbacks(&mut sess, &mut rec);
+        (sess, rec)
+    }
+
+    fn offer(a_key_p_rev: u8) -> KeyExchangeOffer {
+        KeyExchangeOffer {
+            a_key_p_rev,
+            params: Some((vec![0xF1; 64], vec![0x85; 20])),
+            bs_result: vec![0x33; 64],
+        }
+    }
+
+    #[test]
+    fn a_key_provisioning_runs_before_commit_and_commits_the_key() {
+        use cdma_otasp::message::key_exchange::{
+            A_KEY_P_REV_2G, KeyGenerationResponse, MsKeyResponse, ReAuthenticateResponse,
+        };
+        let (mut sess, mut rec) = session_at_key_exchange(A_KEY_P_REV_2G);
+        assert_eq!(
+            rec.requests.drain(..).collect::<Vec<_>>(),
+            vec![OtaspAuthRequest::BeginKeyExchange {
+                a_key_p_rev: A_KEY_P_REV_2G
+            }]
+        );
+        assert!(
+            !rec.outbound
+                .iter()
+                .any(|m| m.bytes == CommitRequest.encode())
+        );
+
+        assert!(
+            sess.on_key_exchange_offer(Some(offer(A_KEY_P_REV_2G)), &mut rec)
+                .is_none()
+        );
+        let ms_key = MsKeyRequest::decode(&last_outbound(&rec)).unwrap();
+        assert_eq!(ms_key.a_key_p_rev, A_KEY_P_REV_2G);
+        assert_eq!(ms_key.params.unwrap().0.len(), 64);
+        assert_eq!(
+            sess.awaited_key_exchange_response(),
+            Some("MS Key Response")
+        );
+
+        sess.on_inbound(
+            &MsKeyResponse {
+                result: ResultCode::Accepted,
+            }
+            .encode(),
+            &mut rec,
+        );
+        assert_eq!(
+            KeyGenerationRequest::decode(&last_outbound(&rec))
+                .unwrap()
+                .bs_result,
+            vec![0x33; 64]
+        );
+        assert_eq!(
+            sess.awaited_key_exchange_response(),
+            Some("Key Generation Response")
+        );
+
+        sess.on_inbound(
+            &KeyGenerationResponse {
+                result: ResultCode::Accepted,
+                ms_result: vec![0x44; 64],
+            }
+            .encode()
+            .unwrap(),
+            &mut rec,
+        );
+        assert_eq!(
+            rec.requests.drain(..).collect::<Vec<_>>(),
+            vec![OtaspAuthRequest::CompleteKeyExchange {
+                ms_result: vec![0x44; 64]
+            }]
+        );
+
+        sess.on_key_exchange_completed(true, &mut rec);
+        assert_eq!(
+            rec.requests.drain(..).collect::<Vec<_>>(),
+            vec![OtaspAuthRequest::SsdUpdate]
+        );
+
+        sess.on_ssd_update_finished(true, &mut rec);
+        let reauth = ReAuthenticateRequest::decode(&last_outbound(&rec)).unwrap();
+        let response = ReAuthenticateResponse {
+            authr: 0x1_2345,
+            randc: (reauth.rand >> 24) as u8,
+            count: 0,
+            auth_data: 0x12_3456,
+        };
+        sess.on_inbound(&response.encode(), &mut rec);
+        assert_eq!(
+            rec.requests.drain(..).collect::<Vec<_>>(),
+            vec![OtaspAuthRequest::VerifyReauthentication {
+                rand: reauth.rand,
+                response
+            }]
+        );
+
+        sess.on_reauthentication_verified(true, &mut rec);
+        assert_eq!(last_outbound(&rec), CommitRequest.encode());
+        let outcome = sess
+            .on_inbound(&commit_resp_accept(), &mut rec)
+            .expect("commit response terminates");
+        assert_eq!(outcome.kind, SessionOutcomeKind::Committed);
+        assert_eq!(rec.requests, vec![OtaspAuthRequest::CommitKey]);
+    }
+
+    fn a_key_steps(rec: &Recorder) -> Vec<(AKeyStep, bool)> {
+        rec.events
+            .iter()
+            .filter_map(|event| match event {
+                OtaspEvent::AKeyProgress { step, success, .. } => Some((*step, *success)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_key_provisioning_reports_each_step() {
+        use cdma_otasp::message::key_exchange::{
+            A_KEY_P_REV_2G, KeyGenerationResponse, MsKeyResponse, ReAuthenticateResponse,
+        };
+        let (mut sess, mut rec) = session_at_key_exchange(A_KEY_P_REV_2G);
+        sess.on_key_exchange_offer(Some(offer(A_KEY_P_REV_2G)), &mut rec);
+        sess.on_inbound(
+            &MsKeyResponse {
+                result: ResultCode::Accepted,
+            }
+            .encode(),
+            &mut rec,
+        );
+        sess.on_inbound(
+            &KeyGenerationResponse {
+                result: ResultCode::Accepted,
+                ms_result: vec![0x44; 64],
+            }
+            .encode()
+            .unwrap(),
+            &mut rec,
+        );
+        sess.on_key_exchange_completed(true, &mut rec);
+        sess.on_ssd_update_finished(true, &mut rec);
+        let reauth = ReAuthenticateRequest::decode(&last_outbound(&rec)).unwrap();
+        sess.on_inbound(
+            &ReAuthenticateResponse {
+                authr: 0x1_2345,
+                randc: (reauth.rand >> 24) as u8,
+                count: 0,
+                auth_data: 0x12_3456,
+            }
+            .encode(),
+            &mut rec,
+        );
+        sess.on_reauthentication_verified(true, &mut rec);
+        sess.on_inbound(&commit_resp_accept(), &mut rec);
+        assert_eq!(
+            a_key_steps(&rec),
+            vec![
+                (AKeyStep::Requested, true),
+                (AKeyStep::MsKeyResponse, true),
+                (AKeyStep::KeyGenerationResponse, true),
+                (AKeyStep::KeyDerived, true),
+                (AKeyStep::SsdUpdate, true),
+                (AKeyStep::ReAuthentication, true),
+                (AKeyStep::Committed, true),
+            ]
+        );
+    }
+
+    fn session_with_exchanged_key() -> (OtaspSession, Recorder) {
+        use cdma_otasp::message::key_exchange::{
+            A_KEY_P_REV_2G, KeyGenerationResponse, MsKeyResponse,
+        };
+        let (mut sess, mut rec) = session_at_key_exchange(A_KEY_P_REV_2G);
+        sess.on_key_exchange_offer(Some(offer(A_KEY_P_REV_2G)), &mut rec);
+        sess.on_inbound(
+            &MsKeyResponse {
+                result: ResultCode::Accepted,
+            }
+            .encode(),
+            &mut rec,
+        );
+        sess.on_inbound(
+            &KeyGenerationResponse {
+                result: ResultCode::Accepted,
+                ms_result: vec![0x44; 64],
+            }
+            .encode()
+            .unwrap(),
+            &mut rec,
+        );
+        rec.outbound.clear();
+        (sess, rec)
+    }
+
+    #[test]
+    fn failed_ssd_update_ends_the_session_without_a_commit() {
+        let (mut sess, mut rec) = session_with_exchanged_key();
+        sess.on_key_exchange_completed(true, &mut rec);
+        let outcome = sess
+            .on_ssd_update_finished(false, &mut rec)
+            .expect("SSD update failure ends the session");
+        assert_eq!(outcome.kind, SessionOutcomeKind::KeyExchangeFailed);
+        assert!(rec.outbound.is_empty(), "no Commit Request sent");
+    }
+
+    #[test]
+    fn failed_reauthentication_ends_the_session_without_a_commit() {
+        use cdma_otasp::message::key_exchange::ReAuthenticateResponse;
+        let (mut sess, mut rec) = session_with_exchanged_key();
+        sess.on_key_exchange_completed(true, &mut rec);
+        sess.on_ssd_update_finished(true, &mut rec);
+        let reauth = ReAuthenticateRequest::decode(&last_outbound(&rec)).unwrap();
+        sess.on_inbound(
+            &ReAuthenticateResponse {
+                authr: 0x1_2345,
+                randc: (reauth.rand >> 24) as u8,
+                count: 0,
+                auth_data: 0x12_3456,
+            }
+            .encode(),
+            &mut rec,
+        );
+        rec.outbound.clear();
+        let outcome = sess
+            .on_reauthentication_verified(false, &mut rec)
+            .expect("re-authentication failure ends the session");
+        assert_eq!(outcome.kind, SessionOutcomeKind::KeyExchangeFailed);
+        assert!(rec.outbound.is_empty(), "no Commit Request sent");
+    }
+
+    #[test]
+    fn a_key_on_file_skips_the_key_exchange_and_commits() {
+        use cdma_otasp::message::key_exchange::A_KEY_P_REV_2G;
+        let (mut sess, mut rec) = session_at_key_exchange(A_KEY_P_REV_2G);
+        rec.requests.clear();
+        sess.on_key_exchange_skipped(AKeySkipReason::KeyOnFileVerified, &mut rec);
+        assert_eq!(a_key_steps(&rec), vec![(AKeyStep::Skipped, true)]);
+        assert_eq!(last_outbound(&rec), CommitRequest.encode());
+        assert!(!sess.key_exchange_started());
+        sess.on_inbound(&commit_resp_accept(), &mut rec);
+        assert!(
+            rec.requests.is_empty(),
+            "nothing to commit or abort in the HLR"
+        );
+    }
+
+    #[test]
+    fn rejected_key_exchange_aborts_and_still_commits_the_other_blocks() {
+        use cdma_otasp::message::key_exchange::{A_KEY_P_REV_2G, MsKeyResponse};
+        let (mut sess, mut rec) = session_at_key_exchange(A_KEY_P_REV_2G);
+        sess.on_key_exchange_offer(Some(offer(A_KEY_P_REV_2G)), &mut rec);
+        rec.requests.clear();
+        sess.on_inbound(
+            &MsKeyResponse {
+                result: ResultCode::RejectedUnknown,
+            }
+            .encode(),
+            &mut rec,
+        );
+        assert_eq!(rec.requests, vec![OtaspAuthRequest::AbortKeyExchange]);
+        assert_eq!(last_outbound(&rec), CommitRequest.encode());
+        assert!(sess.key_exchange_started());
+        rec.requests.clear();
+        sess.on_inbound(&commit_resp_accept(), &mut rec);
+        assert!(rec.requests.is_empty(), "no A-key to commit");
+    }
+
+    #[test]
+    fn a_key_provisioning_needs_a_supported_key_exchange_revision() {
+        let (_sess, rec) = session_at_key_exchange(0x04);
+        assert!(rec.requests.is_empty());
+        assert_eq!(last_outbound(&rec), CommitRequest.encode());
+        let (_sess, rec) = session_at_key_exchange(0x03);
+        assert_eq!(
+            rec.requests,
+            vec![OtaspAuthRequest::BeginKeyExchange { a_key_p_rev: 0x03 }]
+        );
+    }
+
     fn step_through_nam_readbacks(sess: &mut OtaspSession, rec: &mut Recorder) {
         sess.on_inbound(
             &nam_config_resp_bytes(BLOCK_CDMA_ANALOG_NAM, cdma_analog_block_with_max_sid_nid(4)),
@@ -2749,6 +3447,7 @@ mod tests {
             home_system_tag: false,
             mms_uri: false,
             prl: false,
+            a_key: false,
         };
         let (mut sess, mut rec) = start_session(writes);
         sess.on_inbound(&pcap_resp_bytes(), &mut rec);

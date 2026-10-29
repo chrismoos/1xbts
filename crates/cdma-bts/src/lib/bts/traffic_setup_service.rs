@@ -35,12 +35,8 @@ use super::abis_agent::abis_message_from_typed;
 pub(crate) struct Session {
     pub(crate) walsh_code: u8,
     pub(crate) esn: u32,
-    /// Long code generator, stored at reservation time and consumed when
-    /// the traffic channel is committed (after ECAM decode).
     pub(crate) lc_gen: Option<LongCodeGenerator>,
-    /// `true` once the forward TX channel + reverse RX have been created
-    /// (i.e. after ECAM/CAM decode). Before that, only the walsh code is
-    /// reserved.
+    pub(crate) privacy: Option<Arc<cdma_common::phy::long_code_privacy::LongCodePrivacy>>,
     pub(crate) committed: bool,
     pub(crate) setup: TrafficSetupProcedure,
     pub(crate) release: TrafficReleaseProcedure,
@@ -99,7 +95,26 @@ impl TrafficSetupService {
             })
             .unwrap_or(0);
 
-        let lc_gen = LongCodeGenerator::new_traffic_channel(esn);
+        let mut lc_gen = LongCodeGenerator::new_traffic_channel(esn);
+        let private_mask = match setup
+            .privacy_info
+            .as_ref()
+            .map(|info| info.private_long_code_mask())
+            .transpose()
+        {
+            Ok(mask) => mask.flatten(),
+            Err(error) => {
+                warn!("BTS: invalid Privacy Info: {error}");
+                return;
+            }
+        };
+        let privacy = private_mask.map(|mask| {
+            Arc::new(cdma_common::phy::long_code_privacy::LongCodePrivacy::new(
+                lc_gen.mask(),
+                mask,
+            ))
+        });
+        lc_gen = lc_gen.with_privacy(privacy.clone());
 
         let Some(walsh_code) = self.controller.reserve_walsh() else {
             warn!("traffic_setup: no Walsh codes available for CCR {:?}", ccr);
@@ -184,6 +199,7 @@ impl TrafficSetupService {
                             walsh_code,
                             esn,
                             lc_gen: Some(lc_gen),
+                            privacy,
                             committed: false,
                             setup: setup_proc,
                             release: TrafficReleaseProcedure::new(ccr),
@@ -452,6 +468,7 @@ impl TrafficSetupService {
         }
 
         let rx_request = TrafficRxRequest {
+            long_code_privacy: session.privacy.clone(),
             walsh_code,
             esn: session.esn,
             assigned_rev_rc: rev_rc,

@@ -37,6 +37,9 @@ pub(crate) struct PendingOtaspDbm {
     /// Tag the MSC put on the original ADDS Deliver. The BSC echoes
     /// this on the AddsDeliverAck so MSC can correlate.
     pub a1_tag: cdma_ios::Tag,
+    /// MSG_SEQ the Data Burst was sent with. The mobile's ACK_SEQ for it
+    /// completes the delivery.
+    pub msg_seq: u8,
 }
 
 /// A1 cause codes the BSC reports on `AddsDeliverAck` failures.
@@ -322,6 +325,7 @@ impl Bsc {
             None,
             None,
         )
+        .map(drop)
     }
 
     /// BS-side Service Option Request Order on F-TCH (C.S0005-E §3.6.4).
@@ -354,6 +358,7 @@ impl Bsc {
             None,
             None,
         )
+        .map(drop)
     }
 
     async fn complete_service_negotiation(
@@ -393,6 +398,13 @@ impl Bsc {
                     walsh_code,
                     voice_service_option,
                 );
+            }
+            if should_send_assignment_complete
+                && a1_call_id
+                    .and_then(|id| self.a1.privacy_assignments.get(&id))
+                    .is_some_and(|parameters| parameters.active)
+            {
+                self.request_long_code_transition(cell, walsh_code, true);
             }
             info!(
                 "BSC: voice service negotiation complete on walsh={} after {}",
@@ -685,6 +697,24 @@ impl Bsc {
                     return;
                 }
             }
+        }
+
+        if event.valid_ack
+            && let Some(ack_seq) = event.ack_seq
+            && self
+                .pending_otasp_dbm
+                .get(&(cell, walsh_code))
+                .is_some_and(|pending| pending.msg_seq == ack_seq)
+            && let Some(pending) = self.pending_otasp_dbm.remove(&(cell, walsh_code))
+        {
+            self.a1.send_adds_deliver_ack(pending.a1_tag, None);
+        }
+
+        if !reverse_pdu_duplicate
+            && (self.relay_traffic_authentication_reply(cell, walsh_code, event)
+                || self.answer_long_code_transition_request(cell, walsh_code, event))
+        {
+            return;
         }
 
         // Dispatch based on message identity.

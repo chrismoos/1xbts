@@ -654,6 +654,7 @@ impl Bsc {
             traffic_voice_bits: Some(primary_bits),
             traffic_voice_rate_bps: Some(rate_bps),
             raw_pdu_bits: None,
+            authentication: None,
         })
     }
 
@@ -876,6 +877,7 @@ impl Bsc {
             traffic_voice_bits: None,
             traffic_voice_rate_bps: None,
             raw_pdu_bits: None,
+            authentication: None,
         })
     }
 
@@ -955,6 +957,7 @@ impl Bsc {
             traffic_voice_bits: None,
             traffic_voice_rate_bps: None,
             raw_pdu_bits: None,
+            authentication: None,
         }
     }
 }

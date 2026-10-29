@@ -266,6 +266,7 @@ impl Bsc {
             .unwrap_or(false);
         bts_client
             .install_rx_request(TrafficRxRequest {
+                long_code_privacy: None,
                 walsh_code,
                 esn,
                 assigned_rev_rc: assigned_rcs.1,
@@ -428,6 +429,7 @@ impl Bsc {
             .unwrap_or(false);
         bts_client
             .install_rx_request(cdma_common::traffic::TrafficRxRequest {
+                long_code_privacy: None,
                 walsh_code,
                 esn,
                 assigned_rev_rc: assigned_rcs.1,
@@ -660,6 +662,7 @@ impl Bsc {
             .unwrap_or(false);
         bts_client
             .install_rx_request(TrafficRxRequest {
+                long_code_privacy: None,
                 walsh_code,
                 esn,
                 assigned_rev_rc: assigned_rcs.1,
@@ -728,7 +731,15 @@ impl Bsc {
         let Some(esn) = self.mobiles.get(fwd_address).map(|ms| ms.esn.unwrap_or(0)) else {
             return Err("mobile no longer registered".into());
         };
-        let traffic_lc = LongCodeGenerator::new_traffic_channel(esn);
+        let mut traffic_lc = LongCodeGenerator::new_traffic_channel(esn);
+        if let Some(parameters) = a1_call_id.and_then(|id| self.a1.privacy_assignments.get(&id)) {
+            let privacy =
+                std::sync::Arc::new(cdma_common::phy::long_code_privacy::LongCodePrivacy::new(
+                    traffic_lc.mask(),
+                    parameters.mask,
+                ));
+            traffic_lc = traffic_lc.with_privacy(Some(privacy));
+        }
 
         let old_walsh_and_voice = self.mobiles.get(fwd_address).and_then(|ms| {
             Some((
@@ -813,6 +824,12 @@ impl Bsc {
             a1_call_id,
         );
 
+        self.mobiles.update(fwd_address, |ms| {
+            if let Some(tc) = ms.traffic_channel.as_mut() {
+                tc.long_code_privacy = traffic_lc.privacy();
+            }
+        });
+
         let ms_gating_requested = self
             .mobiles
             .get(fwd_address)
@@ -820,6 +837,7 @@ impl Bsc {
             .unwrap_or(false);
         bts_client
             .install_rx_request(TrafficRxRequest {
+                long_code_privacy: traffic_lc.privacy(),
                 walsh_code,
                 esn,
                 assigned_rev_rc: assigned_rcs.1,

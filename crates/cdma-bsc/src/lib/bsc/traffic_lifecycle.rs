@@ -186,6 +186,7 @@ impl Bsc {
         }
 
         if let Some(call_id) = tc.a1_call_id {
+            self.a1.privacy_assignments.remove(&call_id);
             if matches!(tc.a1_clear_state, A1ClearState::ClearCommandReceived) {
                 self.a1.send_clear_complete(call_id, false);
             } else if pre_assignment_complete
@@ -241,5 +242,6 @@ impl Bsc {
             None,
             None,
         )
+        .map(drop)
     }
 }

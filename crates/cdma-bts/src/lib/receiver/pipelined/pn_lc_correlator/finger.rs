@@ -2911,6 +2911,48 @@ mod raw_power_tests {
     }
 
     #[test]
+    fn rc3_finger_applies_late_armed_private_transition() {
+        use cdma_common::phy::long_code_privacy::{
+            LongCodePrivacy, LongCodeTransition, PRIVACY_ACTION_CHIPS,
+        };
+
+        const PRIVATE_MASK: u64 = 0x147_80cc_b8df;
+        const ACTION_CHIP: u64 = PRIVACY_ACTION_CHIPS * 100;
+        const CHIPS_AROUND_ACTION: u64 = 64;
+        let start_chip = ACTION_CHIP - CHIPS_AROUND_ACTION;
+        let mut public = LongCodeGenerator::new_traffic_channel(0x8041_8ec6);
+        let privacy = Arc::new(LongCodePrivacy::new(public.mask(), PRIVATE_MASK));
+        public.advance_chips(start_chip as usize);
+        let mut actual = test_nonpilot_finger();
+        actual.lc_gen = public.clone().with_privacy(Some(privacy.clone()));
+        actual.lc_decimation = 2;
+        actual.lc_chip_counter = start_chip as usize;
+        let mut reference = test_nonpilot_finger();
+        reference.lc_gen = public;
+        reference.lc_decimation = 2;
+        reference.lc_chip_counter = start_chip as usize;
+        for chip in start_chip..ACTION_CHIP + CHIPS_AROUND_ACTION {
+            if chip == ACTION_CHIP - 1 {
+                assert!(privacy.request(LongCodeTransition {
+                    action_chip: ACTION_CHIP,
+                    private: true
+                }));
+                assert!(privacy.respond(true, chip));
+            }
+            if chip == ACTION_CHIP {
+                reference.lc_gen.set_mask(PRIVATE_MASK);
+            }
+            let pn = Complex32::new(1.0, -1.0);
+            actual.advance_lc_for_new_chip(pn);
+            reference.advance_lc_for_new_chip(pn);
+            assert_eq!(
+                actual.current_lc_conj, reference.current_lc_conj,
+                "RC3 chip {chip}"
+            );
+        }
+    }
+
+    #[test]
     fn adc_power_reference_removes_matched_filter_gain() {
         let filter_gain = 10f64.powf(rx_matched_filter_power_gain_db() as f64 / 10.0);
 

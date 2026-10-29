@@ -196,6 +196,7 @@ mod tests {
             crate::tx::pulse_shape(&modulate_reverse_rc3_traffic(&cfg, &frames, 0, preamble, 4));
 
         let pipeline = reverse_traffic_chain_rc3(ReverseTrafficSettings {
+            long_code_privacy: None,
             oversample,
             walsh_code,
             esn,

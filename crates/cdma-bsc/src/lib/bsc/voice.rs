@@ -377,6 +377,7 @@ impl Bsc {
             None,
             Some(awim),
         )
+        .map(drop)
     }
 
     /// AWIM carrying a caller-supplied Signal Info Record (A.S0014-D §2.1.6
@@ -413,6 +414,7 @@ impl Bsc {
             None,
             Some(awim),
         )
+        .map(drop)
     }
 
     /// Send AWIM "tones off" on the forward traffic channel.
@@ -454,6 +456,7 @@ impl Bsc {
             None,
             Some(awim),
         )
+        .map(drop)
     }
 
     /// Poll voice call timers and advance voice call state machines.
@@ -838,6 +841,7 @@ impl Bsc {
             None,
             Some(awim),
         )
+        .map(drop)
     }
 
     pub(crate) fn queue_voice_page_for_mobile(

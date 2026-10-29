@@ -240,6 +240,7 @@ pub(super) fn build_access_event(
         traffic_voice_bits: None,
         traffic_voice_rate_bps: None,
         raw_pdu_bits: Some(payload_bits),
+        authentication: None,
     })
 }
 
@@ -390,6 +391,7 @@ pub(super) fn build_traffic_event(
         traffic_voice_bits: None,
         traffic_voice_rate_bps: None,
         raw_pdu_bits: None,
+        authentication: None,
     })
 }
 
@@ -519,6 +521,7 @@ pub(super) fn build_traffic_phy_status_event(
         traffic_voice_bits: None,
         traffic_voice_rate_bps: None,
         raw_pdu_bits: None,
+        authentication: None,
     })
 }
 
@@ -645,6 +648,7 @@ pub(super) fn build_traffic_voice_event(
         traffic_voice_bits: Some(voice_bits),
         traffic_voice_rate_bps: Some(rate_bps),
         raw_pdu_bits: None,
+        authentication: None,
     })
 }
 
@@ -733,6 +737,7 @@ pub(super) fn build_traffic_preamble_event(
         traffic_voice_bits: None,
         traffic_voice_rate_bps: None,
         raw_pdu_bits: None,
+        authentication: None,
     }
 }
 
@@ -848,6 +853,7 @@ pub(super) fn build_traffic_pcg_measurement_event(
         traffic_voice_bits: None,
         traffic_voice_rate_bps: None,
         raw_pdu_bits: None,
+        authentication: None,
     })
 }
 

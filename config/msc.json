@@ -6,6 +6,10 @@
   "base_stations": [
     { "id": "bts-1", "management_endpoint": "http://127.0.0.1:17016" }
   ],
+  "authentication": {
+    "mode": "monitor",
+    "voice_privacy": "optional"
+  },
   "voice": {
     "gateway": {
       "enabled": true,
@@ -59,7 +63,8 @@
       "cdma_nam": false,
       "home_system_tag": false,
       "mms_uri": false,
-      "prl": false
+      "prl": false,
+      "a_key": false
     }
   }
 }

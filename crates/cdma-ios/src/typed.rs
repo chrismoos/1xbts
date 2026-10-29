@@ -89,6 +89,8 @@ const IE_VOICE_PRIVACY_REQUEST: u8 = 0xa1;
 const IE_RADIO_ENVIRONMENT_AND_RESOURCES: u8 = 0x1d;
 const IE_AUTHENTICATION_EVENT: u8 = 0x4a;
 const IE_AUTHENTICATION_DATA: u8 = 0x59;
+/// COUNT is the low 6 bits of the Authentication Parameter COUNT octet (§4.2.37).
+const AUTHENTICATION_COUNT_MASK: u8 = 0x3f;
 const IE_PACA_REORIGINATION_INDICATOR: u8 = 0x60;
 const IE_USER_ZONE_ID: u8 = 0x02;
 const IE_CHANNEL_NUMBER: u8 = 0x23;
@@ -365,6 +367,73 @@ impl AuthenticationResponseParameter {
     }
 }
 
+/// A.S0014-D Table 4.2.36-1 Auth Signature Type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AuthSignatureType {
+    Authr = 0b0001,
+    Authu = 0b0010,
+    Authbs = 0b0100,
+}
+
+impl AuthSignatureType {
+    fn from_wire(value: u8) -> Option<Self> {
+        match value & LOW_NIBBLE_MASK {
+            0b0001 => Some(Self::Authr),
+            0b0010 => Some(Self::Authu),
+            0b0100 => Some(Self::Authbs),
+            _ => None,
+        }
+    }
+}
+
+const LOW_NIBBLE_MASK: u8 = 0x0F;
+/// The Auth Signature occupies the low 18 bits of octets 4..6 (A.S0014-D §4.2.36).
+const AUTH_SIGNATURE_MASK: u32 = 0x3_FFFF;
+
+impl AuthenticationResponseParameter {
+    pub fn new(signature_type: AuthSignatureType, signature: u32) -> Self {
+        let sig = (signature & AUTH_SIGNATURE_MASK).to_be_bytes();
+        Self([signature_type as u8, sig[1], sig[2], sig[3]])
+    }
+
+    pub fn signature_type(&self) -> Option<AuthSignatureType> {
+        AuthSignatureType::from_wire(self.0[0])
+    }
+
+    pub fn signature(&self) -> u32 {
+        u32::from_be_bytes([0, self.0[1], self.0[2], self.0[3]]) & AUTH_SIGNATURE_MASK
+    }
+}
+
+/// A.S0014-D Table 4.2.35-1 Random Number Type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RandomNumberType {
+    Rand = 0b0001,
+    Randu = 0b0010,
+    Randssd = 0b0100,
+    Randbs = 0b1000,
+}
+
+impl RandomNumberType {
+    /// Value length per A.S0014-D Table 4.2.35-1.
+    fn value_octets(self) -> usize {
+        match self {
+            Self::Rand | Self::Randbs => 4,
+            Self::Randu => 3,
+            Self::Randssd => 7,
+        }
+    }
+}
+
+/// A.S0014-D §4.2.61 Authentication Event values.
+pub const AUTHENTICATION_EVENT_PARAMETERS_NOT_RECEIVED: u8 = 0x01;
+pub const AUTHENTICATION_EVENT_RANDC_MISMATCH: u8 = 0x02;
+
+/// A.S0014-D §4.2.16 Cause value 1AH.
+pub const CAUSE_AUTHENTICATION_FAILURE: u8 = 0x1A;
+
 /// Exact one-octet `RANDC` payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthenticationConfirmationParameter(pub u8);
@@ -373,25 +442,74 @@ pub struct AuthenticationConfirmationParameter(pub u8);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthenticationParameterCount(pub u8);
 
-/// Exact raw payload for `Authentication Challenge Parameter`.
+/// `Authentication Challenge Parameter` payload: the Random Number Type octet
+/// then the value, whose length follows the type (A.S0014-D §4.2.35).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AuthenticationChallengeParameter(pub [u8; 5]);
+pub struct AuthenticationChallengeParameter {
+    raw: [u8; CHALLENGE_PARAMETER_MAX_LEN],
+    len: u8,
+}
+
+const CHALLENGE_PARAMETER_MAX_LEN: usize = 8;
 
 impl AuthenticationChallengeParameter {
-    /// Encodes the authentication-challenge payload.
-    pub const fn encode(self) -> [u8; 5] {
-        self.0
+    /// `value` is right-aligned. Bits above the type's width are dropped.
+    pub fn new(random_number_type: RandomNumberType, value: u64) -> Self {
+        let octets = random_number_type.value_octets();
+        let bytes = value.to_be_bytes();
+        let mut raw = [0u8; CHALLENGE_PARAMETER_MAX_LEN];
+        raw[0] = random_number_type as u8;
+        raw[1..=octets].copy_from_slice(&bytes[bytes.len() - octets..]);
+        Self {
+            raw,
+            len: (octets + 1) as u8,
+        }
     }
 
-    /// Decodes the authentication-challenge payload.
+    pub fn encode(&self) -> Vec<u8> {
+        self.raw[..usize::from(self.len)].to_vec()
+    }
+
+    /// Accepts any value length so a peer's padding does not drop the IE.
     pub fn decode(input: &[u8]) -> Result<Self> {
-        if input.len() != 5 {
+        if input.len() < 2 || input.len() > CHALLENGE_PARAMETER_MAX_LEN {
             return Err(Error::InvalidLength {
-                expected: 5,
+                expected: CHALLENGE_PARAMETER_MAX_LEN,
                 actual: input.len(),
             });
         }
-        Ok(Self([input[0], input[1], input[2], input[3], input[4]]))
+        let mut raw = [0u8; CHALLENGE_PARAMETER_MAX_LEN];
+        raw[..input.len()].copy_from_slice(input);
+        Ok(Self {
+            raw,
+            len: input.len() as u8,
+        })
+    }
+
+    pub fn random_number_type(&self) -> u8 {
+        self.raw[0] & LOW_NIBBLE_MASK
+    }
+
+    pub fn value(&self) -> u64 {
+        self.raw[1..usize::from(self.len)]
+            .iter()
+            .fold(0u64, |acc, &b| (acc << 8) | u64::from(b))
+    }
+
+    fn value_of(&self, random_number_type: RandomNumberType) -> Option<u64> {
+        (self.random_number_type() == random_number_type as u8).then(|| self.value())
+    }
+
+    pub fn rand(&self) -> Option<u32> {
+        self.value_of(RandomNumberType::Rand).map(|v| v as u32)
+    }
+
+    pub fn randu(&self) -> Option<u32> {
+        self.value_of(RandomNumberType::Randu).map(|v| v as u32)
+    }
+
+    pub fn randbs(&self) -> Option<u32> {
+        self.value_of(RandomNumberType::Randbs).map(|v| v as u32)
     }
 }
 
@@ -725,16 +843,6 @@ impl CmServiceRequestMessage {
             }
             push_l3_tlv(&mut out, IE_MOBILE_IDENTITY, &esn)?;
         }
-        if let Some(mobile_identity_meid) = &self.mobile_identity_meid {
-            let meid = mobile_identity_meid.encode()?;
-            if !matches!(mobile_identity_meid, MobileIdentity::Meid(_)) {
-                return Err(Error::InvalidValue {
-                    context: "CM Service Request",
-                    reason: "MEID field must contain MEID mobile identity",
-                });
-            }
-            push_l3_tlv(&mut out, IE_MOBILE_IDENTITY, &meid)?;
-        }
         if let Some(slot_cycle_index) = self.slot_cycle_index {
             push_fixed(&mut out, IE_SLOT_CYCLE_INDEX, &[slot_cycle_index.encode()?]);
         }
@@ -824,6 +932,16 @@ impl CmServiceRequestMessage {
                 IE_CDMA_SERVING_ONE_WAY_DELAY,
                 &cdma_serving_one_way_delay.encode()?,
             )?;
+        }
+        if let Some(mobile_identity_meid) = &self.mobile_identity_meid {
+            let meid = mobile_identity_meid.encode()?;
+            if !matches!(mobile_identity_meid, MobileIdentity::Meid(_)) {
+                return Err(Error::InvalidValue {
+                    context: "CM Service Request",
+                    reason: "MEID field must contain MEID mobile identity",
+                });
+            }
+            push_l3_tlv(&mut out, IE_MOBILE_IDENTITY, &meid)?;
         }
         Ok(out)
     }
@@ -1165,16 +1283,6 @@ impl PagingResponseMessage {
             }
             push_l3_tlv(&mut out, IE_MOBILE_IDENTITY, &esn)?;
         }
-        if let Some(mobile_identity_meid) = &self.mobile_identity_meid {
-            let meid = mobile_identity_meid.encode()?;
-            if !matches!(mobile_identity_meid, MobileIdentity::Meid(_)) {
-                return Err(Error::InvalidValue {
-                    context: "Paging Response",
-                    reason: "MEID field must contain MEID mobile identity",
-                });
-            }
-            push_l3_tlv(&mut out, IE_MOBILE_IDENTITY, &meid)?;
-        }
         if let Some(slot_cycle_index) = self.slot_cycle_index {
             push_fixed(&mut out, IE_SLOT_CYCLE_INDEX, &[slot_cycle_index.encode()?]);
         }
@@ -1247,6 +1355,16 @@ impl PagingResponseMessage {
                 IE_CDMA_SERVING_ONE_WAY_DELAY,
                 &cdma_serving_one_way_delay.encode()?,
             )?;
+        }
+        if let Some(mobile_identity_meid) = &self.mobile_identity_meid {
+            let meid = mobile_identity_meid.encode()?;
+            if !matches!(mobile_identity_meid, MobileIdentity::Meid(_)) {
+                return Err(Error::InvalidValue {
+                    context: "Paging Response",
+                    reason: "MEID field must contain MEID mobile identity",
+                });
+            }
+            push_l3_tlv(&mut out, IE_MOBILE_IDENTITY, &meid)?;
         }
         Ok(out)
     }
@@ -2132,8 +2250,77 @@ pub struct EncryptionInformation {
     pub parameters: Vec<EncryptionParameter>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrivateLongCodeParameter {
+    pub mask: u64,
+    pub active: bool,
+}
+
+/// A.S0014-D Table 4.2.10-2.
+pub const PRIVATE_LONG_CODE_IDENTIFIER: u8 = 0b00100;
+const PRIVATE_LONG_CODE_OCTETS: usize = 6;
+const PRIVATE_LONG_CODE_MASK_MAX: u64 = (1u64 << 42) - 1;
+const PRIVATE_LONG_CODE_UNUSED_BITS: u8 = 0b11111100;
+
 impl EncryptionInformation {
-    /// Encodes the encryption-information payload.
+    /// A.S0014-D §4.2.10: identifier 00100, six octets with six high bits unused.
+    pub fn private_long_code(mask: u64, active: bool) -> Result<Self> {
+        if mask > PRIVATE_LONG_CODE_MASK_MAX {
+            return Err(Error::InvalidValue {
+                context: "Private longcode",
+                reason: "mask exceeds 42 bits",
+            });
+        }
+        Ok(Self {
+            parameters: vec![EncryptionParameter {
+                identifier: PRIVATE_LONG_CODE_IDENTIFIER,
+                status: active,
+                available: false,
+                value: mask.to_be_bytes()[std::mem::size_of::<u64>() - PRIVATE_LONG_CODE_OCTETS..]
+                    .to_vec(),
+            }],
+        })
+    }
+
+    /// A.S0014-D §3.3.13 reports status with a zero-length parameter value.
+    pub fn private_long_code_status(active: bool) -> Self {
+        Self {
+            parameters: vec![EncryptionParameter {
+                identifier: PRIVATE_LONG_CODE_IDENTIFIER,
+                status: active,
+                available: true,
+                value: Vec::new(),
+            }],
+        }
+    }
+
+    pub fn private_long_code_parameter(&self) -> Result<Option<PrivateLongCodeParameter>> {
+        let mut result = None;
+        for parameter in &self.parameters {
+            if parameter.identifier != PRIVATE_LONG_CODE_IDENTIFIER {
+                continue;
+            }
+            if result.is_some()
+                || parameter.value.len() != PRIVATE_LONG_CODE_OCTETS
+                || parameter.value[0] & PRIVATE_LONG_CODE_UNUSED_BITS != 0
+            {
+                return Err(Error::InvalidValue {
+                    context: "Private longcode",
+                    reason: "duplicate parameter, invalid length, or nonzero unused bits",
+                });
+            }
+            let mask = parameter
+                .value
+                .iter()
+                .fold(0u64, |mask, byte| (mask << 8) | u64::from(*byte));
+            result = Some(PrivateLongCodeParameter {
+                mask,
+                active: parameter.status,
+            });
+        }
+        Ok(result)
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         for parameter in &self.parameters {
@@ -2142,7 +2329,6 @@ impl EncryptionInformation {
         Ok(out)
     }
 
-    /// Decodes the encryption-information payload.
     pub fn decode(input: &[u8]) -> Result<Self> {
         let mut parameters = Vec::new();
         let mut offset = 0;
@@ -2531,64 +2717,29 @@ impl AuthenticationRequestBsmapMessage {
     }
 }
 
-/// Exact DTAP `Authentication Request` message.
+/// Exact DTAP `Authentication Request` message (A.S0014-D §3.3.1). RANDU is
+/// its only IE in the DTAP form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticationRequestDtapMessage {
     pub authentication_challenge_parameter_randu: AuthenticationChallengeParameter,
-    pub is2000_mobile_capabilities: Option<Is2000MobileCapabilities>,
 }
 
 impl AuthenticationRequestDtapMessage {
     /// Encodes the message using the exact A1 mobility-management DTAP wire format.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        let mut body = Vec::new();
-        push_tlv(
-            &mut body,
-            IE_AUTHENTICATION_CHALLENGE_PARAMETER,
-            &self.authentication_challenge_parameter_randu.encode(),
-        )?;
-        if let Some(is2000_mobile_capabilities) = &self.is2000_mobile_capabilities {
-            push_tlv(
-                &mut body,
-                IE_IS2000_MOBILE_CAPABILITIES,
-                is2000_mobile_capabilities.encode()?,
-            )?;
-        }
-        encode_a1_mm_dtap(AUTHENTICATION_REQUEST, &body)
+        encode_a1_mm_dtap(
+            AUTHENTICATION_REQUEST,
+            &encode_single_lv(&self.authentication_challenge_parameter_randu.encode())?,
+        )
     }
 
     /// Decodes the message from the exact A1 mobility-management DTAP wire format.
     pub fn decode(input: &[u8]) -> Result<Self> {
         let body = parse_a1_mm_dtap(AUTHENTICATION_REQUEST, input)?;
-        let mut offset = 0;
-        let mut authentication_challenge_parameter_randu = None;
-        let mut is2000_mobile_capabilities = None;
-        while offset < body.len() {
-            let (id, payload, consumed) = decode_tlv(&body[offset..])?;
-            match id {
-                IE_AUTHENTICATION_CHALLENGE_PARAMETER => set_once(
-                    &mut authentication_challenge_parameter_randu,
-                    AuthenticationChallengeParameter::decode(payload)?,
-                    AUTHENTICATION_REQUEST,
-                    IE_AUTHENTICATION_CHALLENGE_PARAMETER,
-                )?,
-                IE_IS2000_MOBILE_CAPABILITIES => set_once(
-                    &mut is2000_mobile_capabilities,
-                    Is2000MobileCapabilities::decode(payload)?,
-                    AUTHENTICATION_REQUEST,
-                    IE_IS2000_MOBILE_CAPABILITIES,
-                )?,
-                other => return Err(Error::UnknownInformationElement(other)),
-            }
-            offset += consumed;
-        }
         Ok(Self {
-            authentication_challenge_parameter_randu: authentication_challenge_parameter_randu
-                .ok_or(Error::MissingRequiredElement {
-                    message_type: AUTHENTICATION_REQUEST,
-                    id: IE_AUTHENTICATION_CHALLENGE_PARAMETER,
-                })?,
-            is2000_mobile_capabilities,
+            authentication_challenge_parameter_randu: AuthenticationChallengeParameter::decode(
+                decode_single_lv(body)?,
+            )?,
         })
     }
 }
@@ -2753,29 +2904,16 @@ impl AuthenticationResponseDtapMessage {
     pub fn encode(&self) -> Result<Vec<u8>> {
         encode_a1_mm_dtap(
             AUTHENTICATION_RESPONSE,
-            &encode_single_tlv(
-                IE_AUTHENTICATION_RESPONSE_PARAMETER,
-                &self.authentication_response_parameter_authu.encode(),
-            )?,
+            &encode_single_lv(&self.authentication_response_parameter_authu.encode())?,
         )
     }
 
     /// Decodes the message from the exact A1 mobility-management DTAP wire format.
     pub fn decode(input: &[u8]) -> Result<Self> {
         let body = parse_a1_mm_dtap(AUTHENTICATION_RESPONSE, input)?;
-        let (id, payload, consumed) = decode_tlv(body)?;
-        if id != IE_AUTHENTICATION_RESPONSE_PARAMETER {
-            return Err(Error::UnknownInformationElement(id));
-        }
-        if consumed != body.len() {
-            return Err(Error::InvalidLength {
-                expected: consumed,
-                actual: body.len(),
-            });
-        }
         Ok(Self {
             authentication_response_parameter_authu: AuthenticationResponseParameter::decode(
-                payload,
+                decode_single_lv(body)?,
             )?,
         })
     }
@@ -2826,29 +2964,16 @@ impl SsdUpdateRequestMessage {
     pub fn encode(&self) -> Result<Vec<u8>> {
         encode_a1_mm_dtap(
             SSD_UPDATE_REQUEST,
-            &encode_single_tlv(
-                IE_AUTHENTICATION_CHALLENGE_PARAMETER,
-                &self.authentication_challenge_parameter_randssd.encode(),
-            )?,
+            &encode_single_lv(&self.authentication_challenge_parameter_randssd.encode())?,
         )
     }
 
     /// Decodes the message from the exact A1 mobility-management DTAP wire format.
     pub fn decode(input: &[u8]) -> Result<Self> {
         let body = parse_a1_mm_dtap(SSD_UPDATE_REQUEST, input)?;
-        let (id, payload, consumed) = decode_tlv(body)?;
-        if id != IE_AUTHENTICATION_CHALLENGE_PARAMETER {
-            return Err(Error::UnknownInformationElement(id));
-        }
-        if consumed != body.len() {
-            return Err(Error::InvalidLength {
-                expected: consumed,
-                actual: body.len(),
-            });
-        }
         Ok(Self {
             authentication_challenge_parameter_randssd: SsdUpdateChallengeParameter::decode(
-                payload,
+                decode_single_lv(body)?,
             )?,
         })
     }
@@ -2865,29 +2990,16 @@ impl BaseStationChallengeMessage {
     pub fn encode(&self) -> Result<Vec<u8>> {
         encode_a1_mm_dtap(
             BASE_STATION_CHALLENGE,
-            &encode_single_tlv(
-                IE_AUTHENTICATION_CHALLENGE_PARAMETER,
-                &self.authentication_challenge_parameter_randbs.encode(),
-            )?,
+            &encode_single_lv(&self.authentication_challenge_parameter_randbs.encode())?,
         )
     }
 
     /// Decodes the message from the exact A1 mobility-management DTAP wire format.
     pub fn decode(input: &[u8]) -> Result<Self> {
         let body = parse_a1_mm_dtap(BASE_STATION_CHALLENGE, input)?;
-        let (id, payload, consumed) = decode_tlv(body)?;
-        if id != IE_AUTHENTICATION_CHALLENGE_PARAMETER {
-            return Err(Error::UnknownInformationElement(id));
-        }
-        if consumed != body.len() {
-            return Err(Error::InvalidLength {
-                expected: consumed,
-                actual: body.len(),
-            });
-        }
         Ok(Self {
             authentication_challenge_parameter_randbs: AuthenticationChallengeParameter::decode(
-                payload,
+                decode_single_lv(body)?,
             )?,
         })
     }
@@ -2904,29 +3016,16 @@ impl BaseStationChallengeResponseMessage {
     pub fn encode(&self) -> Result<Vec<u8>> {
         encode_a1_mm_dtap(
             BASE_STATION_CHALLENGE_RESPONSE,
-            &encode_single_tlv(
-                IE_AUTHENTICATION_RESPONSE_PARAMETER,
-                &self.authentication_response_parameter_authbs.encode(),
-            )?,
+            &encode_single_lv(&self.authentication_response_parameter_authbs.encode())?,
         )
     }
 
     /// Decodes the message from the exact A1 mobility-management DTAP wire format.
     pub fn decode(input: &[u8]) -> Result<Self> {
         let body = parse_a1_mm_dtap(BASE_STATION_CHALLENGE_RESPONSE, input)?;
-        let (id, payload, consumed) = decode_tlv(body)?;
-        if id != IE_AUTHENTICATION_RESPONSE_PARAMETER {
-            return Err(Error::UnknownInformationElement(id));
-        }
-        if consumed != body.len() {
-            return Err(Error::InvalidLength {
-                expected: consumed,
-                actual: body.len(),
-            });
-        }
         Ok(Self {
             authentication_response_parameter_authbs: AuthenticationResponseParameter::decode(
-                payload,
+                decode_single_lv(body)?,
             )?,
         })
     }
@@ -3028,16 +3127,6 @@ impl LocationUpdatingRequestMessage {
             }
             push_l3_tlv(&mut out, IE_MOBILE_IDENTITY, &esn)?;
         }
-        if let Some(mobile_identity_meid) = &self.mobile_identity_meid {
-            let meid = mobile_identity_meid.encode()?;
-            if !matches!(mobile_identity_meid, MobileIdentity::Meid(_)) {
-                return Err(Error::InvalidValue {
-                    context: "Location Updating Request",
-                    reason: "MEID field must contain MEID mobile identity",
-                });
-            }
-            push_l3_tlv(&mut out, IE_MOBILE_IDENTITY, &meid)?;
-        }
         if let Some(slot_cycle_index) = self.slot_cycle_index {
             push_fixed(&mut out, IE_SLOT_CYCLE_INDEX, &[slot_cycle_index.encode()?]);
         }
@@ -3083,6 +3172,16 @@ impl LocationUpdatingRequestMessage {
                 IE_IS2000_MOBILE_CAPABILITIES,
                 is2000_mobile_capabilities.encode()?,
             )?;
+        }
+        if let Some(mobile_identity_meid) = &self.mobile_identity_meid {
+            let meid = mobile_identity_meid.encode()?;
+            if !matches!(mobile_identity_meid, MobileIdentity::Meid(_)) {
+                return Err(Error::InvalidValue {
+                    context: "Location Updating Request",
+                    reason: "MEID field must contain MEID mobile identity",
+                });
+            }
+            push_l3_tlv(&mut out, IE_MOBILE_IDENTITY, &meid)?;
         }
         Ok(out)
     }
@@ -4333,8 +4432,25 @@ pub struct PrivacyModeCompleteMessage {
 }
 
 impl PrivacyModeCompleteMessage {
+    fn validate_status(&self) -> Result<()> {
+        if let Some(info) = &self.encryption_information {
+            let mut identifiers = Vec::new();
+            for parameter in &info.parameters {
+                if !parameter.value.is_empty() || identifiers.contains(&parameter.identifier) {
+                    return Err(Error::InvalidValue {
+                        context: "Privacy Mode Complete",
+                        reason: "status parameters must be unique and have zero length",
+                    });
+                }
+                identifiers.push(parameter.identifier);
+            }
+        }
+        Ok(())
+    }
+
     /// Encodes the message using the exact A1 BSMAP wire format.
     pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate_status()?;
         if self.encryption_information.is_some() && self.voice_privacy_request {
             return Err(Error::InvalidValue {
                 context: "Privacy Mode Complete",
@@ -4390,10 +4506,12 @@ impl PrivacyModeCompleteMessage {
                 reason: "encryption information and voice privacy request are mutually exclusive",
             });
         }
-        Ok(Self {
+        let message = Self {
             encryption_information,
             voice_privacy_request,
-        })
+        };
+        message.validate_status()?;
+        Ok(message)
     }
 }
 
@@ -7093,10 +7211,27 @@ fn push_tlv(out: &mut Vec<u8>, id: u8, payload: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn encode_single_tlv(id: u8, payload: &[u8]) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    push_tlv(&mut out, id, payload)?;
+/// A DTAP body holding one mandatory IE. Mandatory DTAP IEs are sent without
+/// their IE identifier (A.S0014-D §3.3.1 note i).
+fn encode_single_lv(payload: &[u8]) -> Result<Vec<u8>> {
+    let length = u8::try_from(payload.len()).map_err(|_| Error::InvalidLength {
+        expected: u8::MAX as usize,
+        actual: payload.len(),
+    })?;
+    let mut out = vec![length];
+    out.extend_from_slice(payload);
     Ok(out)
+}
+
+fn decode_single_lv(body: &[u8]) -> Result<&[u8]> {
+    let (_, payload, consumed) = decode_lv(body)?;
+    if consumed != body.len() {
+        return Err(Error::InvalidLength {
+            expected: consumed,
+            actual: body.len(),
+        });
+    }
+    Ok(payload)
 }
 
 fn push_fixed(out: &mut Vec<u8>, id: u8, payload: &[u8]) {
@@ -7412,6 +7547,12 @@ pub struct AddsTransferMessage {
     pub mobile_identity_esn: Option<MobileIdentity>,
     /// MEID of the originating mobile.
     pub mobile_identity_meid: Option<MobileIdentity>,
+    pub authentication_response_parameter: Option<AuthenticationResponseParameter>,
+    pub authentication_confirmation_parameter: Option<AuthenticationConfirmationParameter>,
+    pub authentication_parameter_count: Option<AuthenticationParameterCount>,
+    pub authentication_challenge_parameter: Option<AuthenticationChallengeParameter>,
+    pub authentication_event: Option<AuthenticationEvent>,
+    pub authentication_data: Option<AuthenticationData>,
     /// Cell identifier where the application data was received.
     pub cell_identifier: Option<CellId>,
     /// Correlation tag echoed in the ADDS Transfer Ack.
@@ -7443,8 +7584,42 @@ impl AddsTransferMessage {
             }
             push_tlv(&mut body, IE_MOBILE_IDENTITY, &esn.encode()?)?;
         }
+        if let Some(response) = self.authentication_response_parameter {
+            push_tlv(
+                &mut body,
+                IE_AUTHENTICATION_RESPONSE_PARAMETER,
+                &response.encode(),
+            )?;
+        }
+        if let Some(randc) = self.authentication_confirmation_parameter {
+            push_fixed(
+                &mut body,
+                IE_AUTHENTICATION_CONFIRMATION_PARAMETER,
+                &[randc.0],
+            );
+        }
+        if let Some(count) = self.authentication_parameter_count {
+            push_fixed(
+                &mut body,
+                IE_AUTHENTICATION_PARAMETER_COUNT,
+                &[count.0 & AUTHENTICATION_COUNT_MASK],
+            );
+        }
+        if let Some(challenge) = self.authentication_challenge_parameter {
+            push_tlv(
+                &mut body,
+                IE_AUTHENTICATION_CHALLENGE_PARAMETER,
+                &challenge.encode(),
+            )?;
+        }
+        if let Some(event) = self.authentication_event {
+            push_tlv(&mut body, IE_AUTHENTICATION_EVENT, &[event.0])?;
+        }
         if let Some(cell) = self.cell_identifier {
             push_tlv(&mut body, IE_CELL_IDENTIFIER, &cell.encode()?)?;
+        }
+        if let Some(data) = self.authentication_data {
+            push_tlv(&mut body, IE_AUTHENTICATION_DATA, &data.encode())?;
         }
         if let Some(tag) = self.tag {
             push_fixed(&mut body, IE_TAG, &tag.encode());
@@ -7475,6 +7650,12 @@ impl AddsTransferMessage {
         let mut cell_identifier = None;
         let mut tag = None;
         let mut service_option = None;
+        let mut authentication_response_parameter = None;
+        let mut authentication_confirmation_parameter = None;
+        let mut authentication_parameter_count = None;
+        let mut authentication_challenge_parameter = None;
+        let mut authentication_event = None;
+        let mut authentication_data = None;
         while offset < body.len() {
             match body[offset] {
                 IE_MOBILE_IDENTITY => {
@@ -7502,6 +7683,72 @@ impl AddsTransferMessage {
                         AddsUserPart::decode_body(payload)?,
                         ADDS_TRANSFER,
                         IE_ADDS_USER_PART,
+                    )?;
+                    offset += consumed;
+                }
+                IE_AUTHENTICATION_RESPONSE_PARAMETER => {
+                    let (_, payload, consumed) = decode_tlv(&body[offset..])?;
+                    set_once(
+                        &mut authentication_response_parameter,
+                        AuthenticationResponseParameter::decode(payload)?,
+                        ADDS_TRANSFER,
+                        IE_AUTHENTICATION_RESPONSE_PARAMETER,
+                    )?;
+                    offset += consumed;
+                }
+                IE_AUTHENTICATION_CONFIRMATION_PARAMETER => {
+                    let payload = take_fixed(&body[offset..], 1)?;
+                    set_once(
+                        &mut authentication_confirmation_parameter,
+                        AuthenticationConfirmationParameter(payload[0]),
+                        ADDS_TRANSFER,
+                        IE_AUTHENTICATION_CONFIRMATION_PARAMETER,
+                    )?;
+                    offset += 2;
+                }
+                IE_AUTHENTICATION_PARAMETER_COUNT => {
+                    let payload = take_fixed(&body[offset..], 1)?;
+                    set_once(
+                        &mut authentication_parameter_count,
+                        AuthenticationParameterCount(payload[0] & AUTHENTICATION_COUNT_MASK),
+                        ADDS_TRANSFER,
+                        IE_AUTHENTICATION_PARAMETER_COUNT,
+                    )?;
+                    offset += 2;
+                }
+                IE_AUTHENTICATION_CHALLENGE_PARAMETER => {
+                    let (_, payload, consumed) = decode_tlv(&body[offset..])?;
+                    set_once(
+                        &mut authentication_challenge_parameter,
+                        AuthenticationChallengeParameter::decode(payload)?,
+                        ADDS_TRANSFER,
+                        IE_AUTHENTICATION_CHALLENGE_PARAMETER,
+                    )?;
+                    offset += consumed;
+                }
+                IE_AUTHENTICATION_EVENT => {
+                    let (_, payload, consumed) = decode_tlv(&body[offset..])?;
+                    if payload.len() != 1 {
+                        return Err(Error::InvalidLength {
+                            expected: 1,
+                            actual: payload.len(),
+                        });
+                    }
+                    set_once(
+                        &mut authentication_event,
+                        AuthenticationEvent(payload[0]),
+                        ADDS_TRANSFER,
+                        IE_AUTHENTICATION_EVENT,
+                    )?;
+                    offset += consumed;
+                }
+                IE_AUTHENTICATION_DATA => {
+                    let (_, payload, consumed) = decode_tlv(&body[offset..])?;
+                    set_once(
+                        &mut authentication_data,
+                        AuthenticationData::decode(payload)?,
+                        ADDS_TRANSFER,
+                        IE_AUTHENTICATION_DATA,
                     )?;
                     offset += consumed;
                 }
@@ -7547,6 +7794,12 @@ impl AddsTransferMessage {
             })?,
             mobile_identity_esn,
             mobile_identity_meid,
+            authentication_response_parameter,
+            authentication_confirmation_parameter,
+            authentication_parameter_count,
+            authentication_challenge_parameter,
+            authentication_event,
+            authentication_data,
             cell_identifier,
             tag,
             service_option,

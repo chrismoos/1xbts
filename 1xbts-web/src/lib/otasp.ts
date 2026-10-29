@@ -15,7 +15,8 @@ export type OtaspOutcomeName =
   | "OTASP_SESSION_OUTCOME_NO_CAPACITY"
   | "OTASP_SESSION_OUTCOME_PROTOCOL_ERROR"
   | "OTASP_SESSION_OUTCOME_NOTHING_TO_COMMIT"
-  | "OTASP_SESSION_OUTCOME_TIMED_OUT";
+  | "OTASP_SESSION_OUTCOME_TIMED_OUT"
+  | "OTASP_SESSION_OUTCOME_KEY_EXCHANGE_FAILED";
 
 export function outcomeNameToLabel(name: string | number | undefined): string {
   if (name == null) return "In progress";
@@ -37,6 +38,8 @@ export function outcomeNameToLabel(name: string | number | undefined): string {
       return "Protocol error";
     case "OTASP_SESSION_OUTCOME_TIMED_OUT":
       return "Timed out";
+    case "OTASP_SESSION_OUTCOME_KEY_EXCHANGE_FAILED":
+      return "A-key failed, nothing committed";
     default:
       return "Unknown";
   }
@@ -52,6 +55,7 @@ export function outcomeNumberToName(value: number): OtaspOutcomeName {
     case 6: return "OTASP_SESSION_OUTCOME_PROTOCOL_ERROR";
     case 7: return "OTASP_SESSION_OUTCOME_NOTHING_TO_COMMIT";
     case 8: return "OTASP_SESSION_OUTCOME_TIMED_OUT";
+    case 9: return "OTASP_SESSION_OUTCOME_KEY_EXCHANGE_FAILED";
     default: return "OTASP_SESSION_OUTCOME_UNSPECIFIED";
   }
 }

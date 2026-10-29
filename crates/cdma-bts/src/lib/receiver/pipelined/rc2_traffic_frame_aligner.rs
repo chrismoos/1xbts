@@ -202,6 +202,7 @@ struct DecodedFrame {
 pub struct Rc2TrafficFrameAligner {
     state: AlignerState,
     esn: u32,
+    long_code_privacy: Option<std::sync::Arc<cdma_common::phy::long_code_privacy::LongCodePrivacy>>,
 
     pending_samples: VecDeque<Complex32>,
     pending_chip_start: Option<usize>,
@@ -229,10 +230,19 @@ impl Default for Rc2TrafficFrameAligner {
 }
 
 impl Rc2TrafficFrameAligner {
+    pub fn with_long_code_privacy(
+        mut self,
+        privacy: Option<std::sync::Arc<cdma_common::phy::long_code_privacy::LongCodePrivacy>>,
+    ) -> Self {
+        self.long_code_privacy = privacy;
+        self
+    }
+
     pub fn new(esn: u32) -> Self {
         Self {
             state: AlignerState::Preamble,
             esn,
+            long_code_privacy: None,
             pending_samples: VecDeque::new(),
             pending_chip_start: None,
             frame_soft: Vec::with_capacity(SOFT_BITS_PER_FRAME),
@@ -316,7 +326,8 @@ impl Rc2TrafficFrameAligner {
             Rc2TrafficRate::Eighth => Rc12ReverseRate::Eighth,
         };
         rc12_active_pcgs(
-            &LongCodeGenerator::new_traffic_channel(self.esn),
+            &LongCodeGenerator::new_traffic_channel(self.esn)
+                .with_privacy(self.long_code_privacy.clone()),
             frame_chip_start as u64,
             rate,
         )

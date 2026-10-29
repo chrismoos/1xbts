@@ -1,5 +1,6 @@
 "use client";
 
+import { VoicePrivacyIndicator } from "@/components/voice-privacy-indicator";
 import { useState, useCallback, type ReactNode } from "react";
 import Link from "next/link";
 import { Card } from "@/components/card";
@@ -52,6 +53,8 @@ import {
   uatiHex,
   uatiHexDigits,
 } from "@/lib/hrpd-correlation";
+import { AuthenticationMark } from "@/components/authentication-activity";
+import { type AuthVerdict, verdictForAccess } from "@/lib/authentication-verdict";
 import { cellLabel } from "@/lib/cell";
 import { useBtsList } from "@/lib/use-bts-list";
 import { useEventStream } from "@/lib/use-event-stream";
@@ -62,6 +65,9 @@ import {
   HrpdSessionEvent,
   HrpdTrafficEvent,
 } from "@/lib/proto/events/v1/an";
+
+/** MSC authentication verdicts kept for matching against access rows. */
+const MAX_VERDICTS = 500;
 
 // The matched mobile for a message-log entry, as a fixed-width linkable badge.
 // A single-letter kind prefix (P/I/E) precedes the value, with the long form in the tooltip.
@@ -222,6 +228,11 @@ export default function MessagesPage() {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [filter, setFilter] = useState<MessageFilter>("all");
   const mobiles = useMobileDirectory();
+  const [verdicts, setVerdicts] = useState<AuthVerdict[]>([]);
+  useEventStream("authentication", useCallback((data: string) => {
+    const verdict: AuthVerdict = JSON.parse(data);
+    setVerdicts((prev) => [verdict, ...prev].slice(0, MAX_VERDICTS));
+  }, []));
   const { cells } = useBtsList();
 
 
@@ -418,6 +429,7 @@ export default function MessagesPage() {
                         <LaneBadge lane="L3" />
                         <MobileCell event={entry.event} mobiles={mobiles} />
                         <span className="text-accent-blue font-mono text-xs w-12 shrink-0">1x TX</span>
+                        <span className="inline-block w-5 shrink-0" />
                         {entry.event.cell && <span className="text-dimmed font-mono text-xs shrink-0" title="Cell/Sector">{cellLabel(entry.event.cell)}</span>}
                         <span className="text-dimmed text-xs shrink-0">{channel}</span>
                         <span className="text-primary font-medium shrink-0">{typeName}</span>
@@ -432,7 +444,7 @@ export default function MessagesPage() {
                       </div>
                     </div>
                     {isExpanded && (
-                      <div className="mt-1.5 ml-8 pb-1">
+                      <div className="mt-2 mb-1 ml-8 rounded-lg border border-border-primary bg-surface p-3">
                         {h && (
                           <div className="text-xs text-muted mb-1">
                             MSG_TAG: 0x{h.msgTag.toString(16).toUpperCase().padStart(2, "0")} | MSG_SEQ: {h.msgSeq} | ACK_SEQ: {h.ackSeq} | ACK_REQ: {h.ackReq ? "1" : "0"} | VALID_ACK: {h.validAck ? "1" : "0"}
@@ -462,6 +474,7 @@ export default function MessagesPage() {
                         <LaneBadge lane="L3" />
                         <MobileCell event={entry.event} mobiles={mobiles} />
                         <span className="text-accent-cyan font-mono text-xs w-12 shrink-0">1x TX</span>
+                        <span className="inline-block w-5 shrink-0" />
                         {entry.event.cell && <span className="text-dimmed font-mono text-xs shrink-0" title="Cell/Sector">{cellLabel(entry.event.cell)}</span>}
                         <span className="text-dimmed text-xs shrink-0">{channel}</span>
                         <span className="text-primary font-medium shrink-0">{typeName}</span>
@@ -476,7 +489,7 @@ export default function MessagesPage() {
                       </div>
                     </div>
                     {isExpanded && (
-                      <div className="mt-1.5 ml-8 pb-1">
+                      <div className="mt-2 mb-1 ml-8 rounded-lg border border-border-primary bg-surface p-3">
                         {h && (
                           <div className="text-xs text-muted mb-1">
                             MSG_TAG: 0x{h.msgTag.toString(16).toUpperCase().padStart(2, "0")} | MSG_SEQ: {h.msgSeq} | ACK_SEQ: {h.ackSeq} | ACK_REQ: {h.ackReq ? "1" : "0"} | VALID_ACK: {h.validAck ? "1" : "0"}
@@ -505,8 +518,10 @@ export default function MessagesPage() {
                         <span className={`${a1DirectionClass(ev.direction)} font-mono text-xs w-12 shrink-0`}>
                           {a1DirectionLabel(ev.direction)}
                         </span>
+                        <span className="inline-block w-5 shrink-0" />
                         {ev.cell && <span className="text-dimmed font-mono text-xs shrink-0" title="Cell/Sector">{cellLabel(ev.cell)}</span>}
                         <span className="text-primary font-medium shrink-0">{a1TypeName(ev)}</span>
+                        <VoicePrivacyIndicator status={ev.voicePrivacy} />
                         {entry.seenCount > 1 && <span className="text-muted text-xs shrink-0">x{entry.seenCount}</span>}
                         <span className="text-muted text-xs truncate">{formatA1Summary(ev)}</span>
                       </div>
@@ -518,7 +533,7 @@ export default function MessagesPage() {
                       </div>
                     </div>
                     {isExpanded && (
-                      <div className="mt-1.5 ml-8 pb-1">
+                      <div className="mt-2 mb-1 ml-8 rounded-lg border border-border-primary bg-surface p-3">
                         <A1Detail event={ev} cells={cells} />
                       </div>
                     )}
@@ -557,6 +572,7 @@ export default function MessagesPage() {
                         <span className={`${"direction" in entry.event ? hrpdDirectionClass(entry.event.direction) : hrpdDirectionClass()} font-mono text-xs w-16 shrink-0`}>
                           {"direction" in entry.event ? hrpdDirectionLabel(entry.event.direction) : "EVDO"}
                         </span>
+                        <span className="inline-block w-5 shrink-0" />
                         <span className="text-primary font-medium shrink-0">{typeName}</span>
                         {entry.seenCount > 1 && <span className="text-muted text-xs shrink-0">x{entry.seenCount}</span>}
                         <span className="text-muted text-xs truncate">{summary}</span>
@@ -566,7 +582,7 @@ export default function MessagesPage() {
                       </div>
                     </div>
                     {isExpanded && (
-                      <div className="mt-1.5 ml-8 pb-1">{detail}</div>
+                      <div className="mt-2 mb-1 ml-8 rounded-lg border border-border-primary bg-surface p-3">{detail}</div>
                     )}
                   </div>
                 );
@@ -587,6 +603,7 @@ export default function MessagesPage() {
                         <LaneBadge lane="L3" />
                         <MobileCell event={ev} mobiles={mobiles} />
                         <span className="text-accent-green font-mono text-xs w-12 shrink-0">1x RX</span>
+                        <AuthenticationMark verdict={verdictForAccess(ev, entry.ts, mobileForEvent(ev, mobiles), verdicts)} />
                         {ev.cell && <span className="text-dimmed font-mono text-xs shrink-0" title="Cell/Sector">{cellLabel(ev.cell)}</span>}
                         <span className="text-dimmed text-xs shrink-0">{channel}</span>
                         <span className="text-primary font-medium shrink-0">{formatAccessTypeName(ev)}</span>
@@ -601,8 +618,8 @@ export default function MessagesPage() {
                       </div>
                     </div>
                     {isExpanded && (
-                      <div className="mt-1.5 ml-8 pb-1">
-                        <AccessDetail event={ev} />
+                      <div className="mt-2 mb-1 ml-8 rounded-lg border border-border-primary bg-surface p-3">
+                        <AccessDetail event={ev} verdict={verdictForAccess(ev, entry.ts, mobileForEvent(ev, mobiles), verdicts)} />
                       </div>
                     )}
                   </div>

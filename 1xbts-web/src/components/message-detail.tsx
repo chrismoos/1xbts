@@ -1,8 +1,19 @@
 "use client";
 
+import { VoicePrivacyIndicator } from "@/components/voice-privacy-indicator";
 import Link from "next/link";
 import { useState, type ReactNode } from "react";
+import { AuthenticationMark } from "@/components/authentication-activity";
+import {
+  type AuthVerdict,
+  type VerdictKind,
+  procedureLabel,
+  verdictFeedback,
+  verdictKind,
+  verdictStatus,
+} from "@/lib/authentication-verdict";
 import type {
+  AccessAuthentication,
   AccessDataBurst,
   AccessEvent,
   AccessMobileReject,
@@ -13,9 +24,12 @@ import type {
   AccessRegistration,
   AccessServiceConnectCompletion,
   AccessServiceResponse,
+  ForwardAuthenticationChallenge,
+  ForwardSsdUpdate,
   PagingAddress,
   PagingChannelAssignment,
   PagingEvent,
+  PagingOrder,
   PageRecord,
   TrafficAlertWithInfo,
   TrafficEvent,
@@ -84,16 +98,67 @@ function formatOptBool(value?: boolean): string | null {
 
 function formatHex(value: number | string, width = 2): string {
   try {
-    const normalized = typeof value === "string" ? BigInt(value) : BigInt(value >>> 0);
+    const normalized =
+      typeof value === "string" ? BigInt(value) : value > 0xffffffff ? BigInt(value) : BigInt(value >>> 0);
     return `0x${normalized.toString(16).toUpperCase().padStart(width, "0")}`;
   } catch {
     return `0x${String(value).padStart(width, "0")}`;
   }
 }
 
+// C.S0005-E Table 2.7.3-1 and Table 3.7.4-1 order codes with authentication meaning.
+const ORDER_SSD_UPDATE_RESULT = 0b000011;
+const ORDER_PARAMETER_UPDATE = 0b000101;
+const ORDER_LONG_CODE_TRANSITION = 0b010111;
+const PARAMETER_UPDATE_REQUEST_NUMBER_MASK = 0b0000_1111;
+
+/** Meaning of an authentication or privacy order's ORDQ, or null for other orders. */
+function authenticationOrderMeaning(order: number, ordq: number, reverse: boolean): string | null {
+  switch (order) {
+    case ORDER_SSD_UPDATE_RESULT:
+      return reverse ? (ordq === 0 ? "SSD update confirmed" : ordq === 1 ? "SSD update rejected" : null) : null;
+    case ORDER_PARAMETER_UPDATE:
+      return `request ${ordq & PARAMETER_UPDATE_REQUEST_NUMBER_MASK}`;
+    case ORDER_LONG_CODE_TRANSITION:
+      switch (ordq) {
+        case 0:
+          return "request public long code";
+        case 1:
+          return "request private long code";
+        case 2:
+          return "accept public long code transition";
+        case 3:
+          return "accept private long code transition";
+        default:
+          return null;
+      }
+    default:
+      return null;
+  }
+}
+
+/** AUTHR, RANDC and COUNT of an r-csch PDU (C.S0004-E §2.1.1.1.1.1). */
+function AccessAuthenticationDetail({ auth }: { auth: AccessAuthentication }) {
+  return (
+    <div className="text-xs space-y-1">
+      <div className={SECTION_HEADING_CLASS}>Authentication</div>
+      <FieldGrid>
+        <Field label="AUTHR" value={formatHex(auth.authr, 5)} />
+        <Field label="RANDC" value={formatHex(auth.randc, 2)} />
+        <Field label="COUNT" value={auth.count} />
+        <Field label="RAND" value={auth.rand != null ? formatHex(auth.rand, 8) : "no broadcast RAND matches RANDC"} />
+      </FieldGrid>
+    </div>
+  );
+}
+
+/** A section title with a rule that runs to the right edge. */
+const SECTION_HEADING_CLASS =
+  "flex items-center gap-2 text-[10.5px] font-semibold uppercase tracking-wider text-muted after:h-px after:flex-1 after:bg-border-primary after:content-['']";
+
 function FieldGrid({ children }: { children: ReactNode }) {
   return (
-    <div className="grid grid-cols-2 xl:grid-cols-3 gap-x-4 gap-y-0.5 text-xs text-muted">
+    <div className="grid grid-cols-[repeat(auto-fill,minmax(14rem,1fr))] gap-x-5 text-xs">
       {children}
     </div>
   );
@@ -104,9 +169,29 @@ function Field({ label, value }: { label: string; value?: ReactNode | null }) {
     return null;
   }
   return (
-    <span>
-      {label}: {value}
+    <span className="flex min-w-0 justify-between gap-3 border-b border-dashed border-border-subtle py-0.5">
+      <span className="shrink-0 text-[11px] text-muted">{label}</span>
+      <span className="min-w-0 text-right font-mono text-primary break-words">{value}</span>
     </span>
+  );
+}
+
+function DetailSection({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <div className="space-y-1">
+      <div className={SECTION_HEADING_CLASS}>{title}</div>
+      {children}
+    </div>
+  );
+}
+
+function StatTile({ label, value }: { label: string; value: string | null }) {
+  if (value == null) return null;
+  return (
+    <div className="min-w-24 rounded-md bg-surface-raised px-2.5 py-1.5">
+      <div className="text-[10.5px] uppercase tracking-wide text-muted">{label}</div>
+      <div className="font-mono text-sm text-primary">{value}</div>
+    </div>
   );
 }
 
@@ -147,7 +232,19 @@ export function formatAccessSummary(event: AccessEvent): string {
     const digits = o.digits ? `digits ${o.digits}` : null;
     return [service, rc, digits].filter(Boolean).join(" | ");
   }
+  if (event.authChallengeResponse) {
+    return `AUTHU ${formatHex(event.authChallengeResponse.authu, 5)}`;
+  }
   if (event.order) {
+    if (event.order.randbs != null) {
+      return `${event.order.orderName} | RANDBS ${formatHex(event.order.randbs, 8)}`;
+    }
+    const meaning = authenticationOrderMeaning(
+      event.order.order,
+      parseInt(event.order.orderSpecificHex.slice(0, 2) || "0", 16),
+      true,
+    );
+    if (meaning) return `${event.order.orderName} | ${meaning}`;
     return event.order.detail ? `${event.order.orderName} | ${event.order.detail}` : event.order.orderName;
   }
   if (event.dataBurst) {
@@ -207,7 +304,20 @@ export function formatAccessTypeName(event: AccessEvent): string {
   return simplifyAccessMsgTypeName(event.msgTypeName);
 }
 
+function forwardAuthenticationSummary(event: PagingEvent | TrafficEvent): string | null {
+  if (event.authChallenge) return `RANDU ${formatHex(event.authChallenge.randu, 6)}`;
+  if (event.ssdUpdate) return `RANDSSD ${formatHex(event.ssdUpdate.randssd, 14)}`;
+  if (event.order?.authbs != null) return `${event.order.orderName} | AUTHBS ${formatHex(event.order.authbs, 5)}`;
+  if (event.order) {
+    const meaning = authenticationOrderMeaning(event.order.order, event.order.ordq, false);
+    if (meaning) return `${event.order.orderName} | ${meaning}`;
+  }
+  return null;
+}
+
 export function formatPagingSummary(event: PagingEvent): string {
+  const authentication = forwardAuthenticationSummary(event);
+  if (authentication) return authentication;
   if (event.order) {
     return event.order.orderName;
   }
@@ -234,6 +344,8 @@ export function formatPagingSummary(event: PagingEvent): string {
 }
 
 export function formatTrafficSummary(event: TrafficEvent): string {
+  const authentication = forwardAuthenticationSummary(event);
+  if (authentication) return authentication;
   if (event.order) {
     const voice = event.voiceCallState ? ` [${event.voiceCallState}]` : "";
     return event.order.orderName + voice;
@@ -511,11 +623,50 @@ function AccessOrderDetail({ message }: { message: AccessOrder }) {
         <Field label="ORDER" value={`0b${message.order.toString(2).padStart(6, "0")} (${message.orderName})`} />
         <Field label="ADD_RECORD_LEN" value={message.addRecordLen} />
         <Field label="DETAIL" value={message.detail} />
+        <Field label="RANDBS" value={message.randbs != null ? formatHex(message.randbs, 8) : null} />
+        <Field
+          label="MEANING"
+          value={authenticationOrderMeaning(
+            message.order,
+            parseInt(message.orderSpecificHex.slice(0, 2) || "0", 16),
+            true,
+          )}
+        />
         <Field label="ORDER_SPECIFIC_HEX" value={message.orderSpecificHex || null} />
         <Field label="REMAINING_BITS" value={message.remainingBits} />
       </FieldGrid>
       {message.reject && <RejectDetail reject={message.reject} />}
     </div>
+  );
+}
+
+function ForwardOrderDetail({ order }: { order: PagingOrder }) {
+  return (
+    <FieldGrid>
+      <Field label="ORDER" value={`0b${order.order.toString(2).padStart(6, "0")} (${order.orderName})`} />
+      <Field label="ORDQ" value={order.ordq} />
+      <Field label="AUTHBS" value={order.authbs != null ? formatHex(order.authbs, 5) : null} />
+      <Field label="MEANING" value={authenticationOrderMeaning(order.order, order.ordq, false)} />
+    </FieldGrid>
+  );
+}
+
+/** Authentication Challenge Message (C.S0005-E §3.7.2.3.2.10, §3.7.3.3.2.2). */
+function ForwardAuthChallengeDetail({ message }: { message: ForwardAuthenticationChallenge }) {
+  return (
+    <FieldGrid>
+      <Field label="RANDU" value={formatHex(message.randu, 6)} />
+      <Field label="GEN_CMEA_KEY" value={formatBool(message.genCmeaKey)} />
+    </FieldGrid>
+  );
+}
+
+/** SSD Update Message (C.S0005-E §3.7.2.3.2.11, §3.7.3.3.2.5). */
+function ForwardSsdUpdateDetail({ message }: { message: ForwardSsdUpdate }) {
+  return (
+    <FieldGrid>
+      <Field label="RANDSSD" value={formatHex(message.randssd, 14)} />
+    </FieldGrid>
   );
 }
 
@@ -556,8 +707,8 @@ function AccessPowerMeasurementReportDetail({ message }: { message: AccessPowerM
         )}
       </FieldGrid>
       {message.pilotStrengths.length > 0 && (
-        <div className="pl-2 border-l border-border-input text-xs text-muted space-y-0.5">
-          <div className="text-secondary font-medium">Active Set Pilot Strengths</div>
+        <div className="text-xs space-y-1">
+          <div className={SECTION_HEADING_CLASS}>Active Set Pilot Strengths</div>
           {message.pilotStrengths.map((strength, i) => (
             <div key={i}>
               Pilot {i}: PILOT_STRENGTH={strength}
@@ -639,6 +790,7 @@ export function PagingDetail({ event }: { event: PagingEvent }) {
         <Field label="NUM_STEP" value={m.numStep} />
         <Field label="MAX_CAP_SZ" value={m.maxCapSz} />
         <Field label="AUTH" value={m.auth} />
+        <Field label="RAND" value={m.auth !== 0 ? formatHex(m.rand, 8) : null} />
       </FieldGrid>
     );
   }
@@ -692,13 +844,14 @@ export function PagingDetail({ event }: { event: PagingEvent }) {
       </div>
     );
   }
+  if (event.authChallenge) {
+    return <ForwardAuthChallengeDetail message={event.authChallenge} />;
+  }
+  if (event.ssdUpdate) {
+    return <ForwardSsdUpdateDetail message={event.ssdUpdate} />;
+  }
   if (event.order) {
-    return (
-      <FieldGrid>
-        <Field label="ORDER" value={`0b${event.order.order.toString(2).padStart(6, "0")} (${event.order.orderName})`} />
-        <Field label="ORDQ" value={event.order.ordq} />
-      </FieldGrid>
-    );
+    return <ForwardOrderDetail order={event.order} />;
   }
   if (event.dataBurst) {
     const sms = event.dataBurst.decodedSms;
@@ -731,55 +884,109 @@ export function PagingDetail({ event }: { event: PagingEvent }) {
   return null;
 }
 
-export function AccessDetail({ event }: { event: AccessEvent }) {
+const VERDICT_BANNER_CLASS: Record<VerdictKind, string> = {
+  ok: "bg-accent-green-bg",
+  fail: "bg-accent-red-bg",
+  pending: "bg-accent-amber-bg",
+};
+
+export function AccessDetail({ event, verdict }: { event: AccessEvent; verdict?: AuthVerdict | null }) {
+  const message =
+    event.registration ||
+    event.origination ||
+    event.pageResponse ||
+    event.order ||
+    event.dataBurst ||
+    event.serviceConnectCompletion ||
+    event.serviceResponse ||
+    event.powerMeasurementReport ||
+    event.authChallengeResponse;
+  const kind = verdict ? verdictKind(verdict) : null;
+  const raw = [
+    event.address && `Address: ${event.address}`,
+    event.resolvedAddress && `Resolved address: ${event.resolvedAddress}`,
+    event.l3Summary && `L3: ${event.l3Summary}`,
+    event.rdschMsgTypeName && `R-DSCH type: ${event.rdschMsgTypeName}`,
+    event.rdschSummary && `R-DSCH: ${event.rdschSummary}`,
+    event.pduSummary && `PDU: ${event.pduSummary}`,
+  ].filter(Boolean);
   return (
-    <div className="text-xs text-muted space-y-2">
-      <FieldGrid>
-        <Field label="CHIP_START" value={event.chipStart} />
-        <Field label="PREAMBLE" value={`${event.preambleFrames} frame(s)`} />
-        <Field label="PD" value={event.pd} />
-        <Field label="MSG_TYPE" value={formatHex(event.msgType)} />
-        <Field label="MSG_SEQ" value={event.msgSeq} />
-        <Field label="MSID_TYPE" value={event.msidType} />
-        <Field label="ESN" value={event.esn != null ? formatHex(event.esn, 8) : null} />
-        <Field label="MEID" value={event.meid ? event.meid.toUpperCase() : null} />
-        <Field label="IMSI_M_S1" value={event.imsiMS1} />
-        <Field label="IMSI_M_S2" value={event.imsiMS2} />
-        <Field label="MOB_P_REV" value={event.mobPRev} />
-        <Field label="SUBSCRIBER_ID" value={event.subscriberId ?? null} />
-        <Field label="SNR_DB" value={event.snrDb != null ? event.snrDb.toFixed(1) : null} />
-        <Field label="SIGNAL_PWR_DB" value={event.signalPowerDb != null ? event.signalPowerDb.toFixed(1) : null} />
-        <Field label="DEMOD_QUALITY" value={event.demodQualityPct != null ? `${event.demodQualityPct.toFixed(1)}%` : null} />
-        <Field label="RX_PWR_DBM" value={event.rxPowerDbm != null ? event.rxPowerDbm.toFixed(1) : null} />
-        <Field label="TRAFFIC_WALSH" value={event.trafficWalshCode != null ? `W${event.trafficWalshCode}` : null} />
-        <Field label="PREAMBLE_ONLY" value={event.isPreambleOnly ? "1" : null} />
-      </FieldGrid>
+    <div className="space-y-3 text-xs">
+      {verdict && kind && (
+        <div className={`flex gap-2 rounded-md px-3 py-2 text-secondary ${VERDICT_BANNER_CLASS[kind]}`}>
+          <AuthenticationMark verdict={verdict} />
+          <span>
+            <span className="font-semibold text-primary">
+              {procedureLabel(verdict)}: {verdictStatus(verdict)}.
+            </span>{" "}
+            {verdictFeedback(verdict)}
+          </span>
+        </div>
+      )}
 
-      {event.resolvedAddress && <div>Resolved Address: {event.resolvedAddress}</div>}
-      {event.address && <div>Address: {event.address}</div>}
+      <div className="flex flex-wrap gap-2">
+        <StatTile label="SNR" value={event.snrDb != null ? `${event.snrDb.toFixed(1)} dB` : null} />
+        <StatTile label="Signal" value={event.signalPowerDb != null ? `${event.signalPowerDb.toFixed(1)} dB` : null} />
+        <StatTile label="RX power" value={event.rxPowerDbm != null ? `${event.rxPowerDbm.toFixed(1)} dBm` : null} />
+        <StatTile label="Demod" value={event.demodQualityPct != null ? `${event.demodQualityPct.toFixed(1)}%` : null} />
+        <StatTile label="Preamble" value={event.preambleFrames ? `${event.preambleFrames} frames` : null} />
+        <StatTile label="Walsh" value={event.trafficWalshCode != null ? `W${event.trafficWalshCode}` : null} />
+      </div>
 
-      {event.registration && <AccessRegistrationDetail message={event.registration} />}
-      {event.origination && <AccessOriginationDetail message={event.origination} />}
-      {event.pageResponse && <AccessPageResponseDetail message={event.pageResponse} />}
-      {event.order && <AccessOrderDetail message={event.order} />}
-      {event.dataBurst && <AccessDataBurstDetail message={event.dataBurst} />}
-      {event.serviceConnectCompletion && <AccessServiceConnectCompletionDetail message={event.serviceConnectCompletion} />}
-      {event.serviceResponse && <AccessServiceResponseDetail message={event.serviceResponse} />}
-      {event.powerMeasurementReport && <AccessPowerMeasurementReportDetail message={event.powerMeasurementReport} />}
+      <DetailSection title="Identity">
+        <FieldGrid>
+          <Field label="ESN" value={event.esn != null ? formatHex(event.esn, 8) : null} />
+          <Field label="MEID" value={event.meid ? event.meid.toUpperCase() : null} />
+          <Field label="IMSI_M_S1" value={event.imsiMS1} />
+          <Field label="IMSI_M_S2" value={event.imsiMS2} />
+          <Field label="MSID_TYPE" value={event.msidType} />
+          <Field label="MOB_P_REV" value={event.mobPRev} />
+          <Field label="Subscriber" value={event.subscriberId ?? null} />
+        </FieldGrid>
+      </DetailSection>
 
-      {!event.registration &&
-        !event.origination &&
-        !event.pageResponse &&
-        !event.order &&
-        !event.dataBurst &&
-        !event.serviceConnectCompletion &&
-        !event.serviceResponse &&
-        !event.powerMeasurementReport &&
-        event.l3Summary && <div>L3: {event.l3Summary}</div>}
+      <DetailSection title="Header">
+        <FieldGrid>
+          <Field label="PD" value={event.pd} />
+          <Field label="MSG_TYPE" value={formatHex(event.msgType)} />
+          <Field label="MSG_SEQ" value={event.msgSeq} />
+          <Field label="CHIP_START" value={event.chipStart} />
+          <Field label="PREAMBLE_ONLY" value={event.isPreambleOnly ? "1" : null} />
+        </FieldGrid>
+      </DetailSection>
 
-      {event.rdschSummary && <div>R-DSCH: {event.rdschSummary}</div>}
-      {event.rdschMsgTypeName && <div>R-DSCH Type: {event.rdschMsgTypeName}</div>}
-      {event.pduSummary && <div>PDU: {event.pduSummary}</div>}
+      {event.authentication && <AccessAuthenticationDetail auth={event.authentication} />}
+
+      {message && (
+        <DetailSection title={event.msgTypeName || "Message"}>
+          {event.registration && <AccessRegistrationDetail message={event.registration} />}
+          {event.origination && <AccessOriginationDetail message={event.origination} />}
+          {event.pageResponse && <AccessPageResponseDetail message={event.pageResponse} />}
+          {event.order && <AccessOrderDetail message={event.order} />}
+          {event.dataBurst && <AccessDataBurstDetail message={event.dataBurst} />}
+          {event.serviceConnectCompletion && (
+            <AccessServiceConnectCompletionDetail message={event.serviceConnectCompletion} />
+          )}
+          {event.serviceResponse && <AccessServiceResponseDetail message={event.serviceResponse} />}
+          {event.powerMeasurementReport && (
+            <AccessPowerMeasurementReportDetail message={event.powerMeasurementReport} />
+          )}
+          {event.authChallengeResponse && (
+            <FieldGrid>
+              <Field label="AUTHU" value={formatHex(event.authChallengeResponse.authu, 5)} />
+            </FieldGrid>
+          )}
+        </DetailSection>
+      )}
+
+      {raw.length > 0 && (
+        <details>
+          <summary className="cursor-pointer text-muted">Raw decoder output</summary>
+          <pre className="mt-1.5 whitespace-pre-wrap break-all rounded-md bg-surface-raised px-2.5 py-2 font-mono text-[11.5px] text-secondary">
+            {raw.join("\n")}
+          </pre>
+        </details>
+      )}
     </div>
   );
 }
@@ -793,8 +1000,8 @@ function AlertWithInfoDetail({ message }: { message: TrafficAlertWithInfo }) {
         <Field label="NUM_INFO_RECS" value={message.numInfoRecords} />
       </FieldGrid>
       {sig && (
-        <div className="pl-2 border-l border-border-input text-xs text-muted space-y-0.5">
-          <div className="text-secondary font-medium">Signal Information Record</div>
+        <div className="text-xs space-y-1">
+          <div className={SECTION_HEADING_CLASS}>Signal Information Record</div>
           <FieldGrid>
             <Field label="SIGNAL_TYPE" value={`${sig.signalType} (${sig.signalTypeName})`} />
             <Field label="ALERT_PITCH" value={`${sig.alertPitch} (${sig.alertPitchName})`} />
@@ -803,8 +1010,8 @@ function AlertWithInfoDetail({ message }: { message: TrafficAlertWithInfo }) {
         </div>
       )}
       {cpn && (
-        <div className="pl-2 border-l border-border-input text-xs text-muted space-y-0.5">
-          <div className="text-secondary font-medium">Calling Party Number</div>
+        <div className="text-xs space-y-1">
+          <div className={SECTION_HEADING_CLASS}>Calling Party Number</div>
           <FieldGrid>
             <Field label="DIGITS" value={cpn.digits} />
             <Field label="NUMBER_TYPE" value={formatNumberType(cpn.numberType)} />
@@ -881,12 +1088,9 @@ export function TrafficDetail({ event }: { event: TrafficEvent }) {
       </FieldGrid>
 
       {event.address && <div>Address: {event.address}</div>}
-      {event.order && (
-        <FieldGrid>
-          <Field label="ORDER" value={`0b${event.order.order.toString(2).padStart(6, "0")} (${event.order.orderName})`} />
-          <Field label="ORDQ" value={event.order.ordq} />
-        </FieldGrid>
-      )}
+      {event.order && <ForwardOrderDetail order={event.order} />}
+      {event.authChallenge && <ForwardAuthChallengeDetail message={event.authChallenge} />}
+      {event.ssdUpdate && <ForwardSsdUpdateDetail message={event.ssdUpdate} />}
       {event.dataBurst && (() => {
         const db = event.dataBurst;
         const sms = db.decodedSms;
@@ -928,7 +1132,7 @@ export function TrafficDetail({ event }: { event: TrafficEvent }) {
           }`}>{event.voiceCallState}</span>
         </div>
       )}
-      {!event.order && !event.dataBurst && !event.serviceRequest && !event.serviceConnect && !event.alertWithInfo && event.l3Summary && (
+      {!event.order && !event.dataBurst && !event.serviceRequest && !event.serviceConnect && !event.alertWithInfo && !event.authChallenge && !event.ssdUpdate && event.l3Summary && (
         <div>L3: {event.l3Summary}</div>
       )}
       {event.pduSummary && <div>PDU: {event.pduSummary}</div>}
@@ -1103,7 +1307,7 @@ function HrpdDecodedMessages({ messages }: { messages: HrpdDecodedMessage[] }) {
         const len = payloadLength(message.payload);
         return (
           <div key={index} className="pl-2 border-l border-border-input">
-            <div className="text-secondary font-medium">
+            <div className={SECTION_HEADING_CLASS}>
               {message.typeName || `Message ${index + 1}`}
             </div>
             <FieldGrid>
@@ -1164,6 +1368,7 @@ export function A1Detail({
         <Field label="Direction" value={a1DirectionLabel(event.direction)} />
         <Field label="Discriminator" value={discriminator || null} />
         <Field label="Message Type" value={a1TypeName(event)} />
+        {event.voicePrivacy && <Field label="Voice privacy" value={<span className="inline-flex items-center gap-2"><VoicePrivacyIndicator status={event.voicePrivacy} />{event.voicePrivacy}</span>} />}
         <Field
           label="Peer"
           value={

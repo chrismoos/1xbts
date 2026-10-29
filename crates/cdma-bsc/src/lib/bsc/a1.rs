@@ -46,6 +46,14 @@ pub(crate) struct PendingA1Assignment {
 pub(crate) struct A1Service {
     pub(crate) msc_client: Arc<dyn crate::a1_edge::MscClient>,
     pending_assignments: HashMap<u64, Vec<PendingA1Assignment>>,
+    pub(crate) privacy_assignments: HashMap<u64, cdma_ios::typed::PrivateLongCodeParameter>,
+    pending_registrations: HashMap<u64, PendingA1Registration>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingA1Registration {
+    pub(crate) fwd_address: MsAddress,
+    pub(crate) cell: Option<cdma_common::events::AccessCellId>,
 }
 
 impl A1Service {
@@ -53,7 +61,24 @@ impl A1Service {
         Self {
             msc_client,
             pending_assignments: HashMap::new(),
+            privacy_assignments: HashMap::new(),
+            pending_registrations: HashMap::new(),
         }
+    }
+
+    pub(crate) fn push_pending_registration(
+        &mut self,
+        call_id: u64,
+        pending: PendingA1Registration,
+    ) {
+        self.pending_registrations.insert(call_id, pending);
+    }
+
+    pub(crate) fn take_pending_registration(
+        &mut self,
+        call_id: u64,
+    ) -> Option<PendingA1Registration> {
+        self.pending_registrations.remove(&call_id)
     }
 }
 
@@ -132,6 +157,33 @@ impl Bsc {
                 };
                 self.handle_a1_assignment_request(call_id, request).await;
             }
+            cdma_ios::MessageType::PrivacyModeCommand => {
+                let Some((cell, walsh, _)) = self.traffic_channel_for_call(call_id) else {
+                    return;
+                };
+                let command = match cdma_ios::PrivacyModeCommandMessage::decode(&decoded.payload) {
+                    Ok(command) => command,
+                    Err(error) => {
+                        warn!("BSC: invalid Privacy Mode Command: {error}");
+                        return;
+                    }
+                };
+                let Ok(Some(parameters)) =
+                    command.encryption_information.private_long_code_parameter()
+                else {
+                    return;
+                };
+                let supported = self
+                    .mobiles
+                    .get_traffic_channel(cell, walsh)
+                    .and_then(|tc| tc.long_code_privacy.as_ref())
+                    .is_some_and(|privacy| privacy.private_mask() == parameters.mask);
+                if supported || !parameters.active {
+                    self.request_long_code_transition(cell, walsh, parameters.active && supported);
+                } else {
+                    self.report_privacy_mode(cell, walsh);
+                }
+            }
             cdma_ios::MessageType::ClearCommand => {
                 let command = match cdma_ios::ClearCommandMessage::decode(&decoded.payload) {
                     Ok(command) => command,
@@ -186,6 +238,48 @@ impl Bsc {
                 };
                 self.handle_a1_progress(call_id, progress);
             }
+            cdma_ios::MessageType::AuthenticationRequest => {
+                match cdma_ios::AuthenticationRequestMessage::decode(&decoded.payload) {
+                    Ok(request) => self.handle_a1_authentication_request(call_id, request),
+                    Err(error) => warn!("BSC: failed to decode A1 Authentication Request: {error}"),
+                }
+            }
+            cdma_ios::MessageType::SsdUpdateRequest => {
+                match cdma_ios::SsdUpdateRequestMessage::decode(&decoded.payload) {
+                    Ok(request) => self.handle_a1_ssd_update_request(call_id, request),
+                    Err(error) => warn!("BSC: failed to decode A1 SSD Update Request: {error}"),
+                }
+            }
+            cdma_ios::MessageType::BaseStationChallengeResponse => {
+                match cdma_ios::BaseStationChallengeResponseMessage::decode(&decoded.payload) {
+                    Ok(response) => {
+                        self.handle_a1_base_station_challenge_response(call_id, response)
+                    }
+                    Err(error) => {
+                        warn!("BSC: failed to decode A1 Base Station Challenge Response: {error}")
+                    }
+                }
+            }
+            cdma_ios::MessageType::ParameterUpdateRequest => {
+                self.handle_a1_parameter_update_request(call_id);
+            }
+            cdma_ios::MessageType::LocationUpdatingAccept => {
+                self.handle_a1_location_updating_result(call_id, None);
+            }
+            cdma_ios::MessageType::LocationUpdatingReject => {
+                let reject = match cdma_ios::LocationUpdatingRejectMessage::decode(&decoded.payload)
+                {
+                    Ok(reject) => reject,
+                    Err(error) => {
+                        warn!(
+                            "BSC: failed to decode A1 Location Updating Reject: {}",
+                            error
+                        );
+                        return;
+                    }
+                };
+                self.handle_a1_location_updating_result(call_id, Some(reject.reject_cause));
+            }
             other => {
                 warn!("BSC: A1 message {:?} not yet handled on live path", other);
             }
@@ -194,6 +288,50 @@ impl Bsc {
 }
 
 impl Bsc {
+    fn handle_a1_location_updating_result(
+        &mut self,
+        call_id: Option<u64>,
+        reject_cause: Option<cdma_ios::RejectCause>,
+    ) {
+        let Some(pending) = call_id.and_then(|id| self.a1.take_pending_registration(id)) else {
+            debug!(
+                "BSC: Location Updating {} for an unsolicited notification (call_id={:?})",
+                if reject_cause.is_some() {
+                    "Reject"
+                } else {
+                    "Accept"
+                },
+                call_id
+            );
+            return;
+        };
+        let result = match reject_cause {
+            None => {
+                info!(
+                    "BSC: MSC accepted registration of {}",
+                    format_ms_address(&pending.fwd_address)
+                );
+                self.access_tx
+                    .send_registration_accepted_after_authentication(
+                        pending.cell,
+                        &pending.fwd_address,
+                    )
+            }
+            Some(cause) => {
+                warn!(
+                    "BSC: MSC rejected registration of {} (cause 0x{:02X})",
+                    format_ms_address(&pending.fwd_address),
+                    cause.0
+                );
+                self.access_tx
+                    .send_registration_rejected(pending.cell, &pending.fwd_address)
+            }
+        };
+        if let Err(error) = result {
+            warn!("BSC: failed to send registration result order: {}", error);
+        }
+    }
+
     fn handle_a1_alert_with_information(
         &mut self,
         call_id: Option<u64>,
@@ -385,26 +523,31 @@ impl Bsc {
             Some(data_burst),
             None,
         );
-        if let Err(e) = send_result {
-            warn!(
-                "BSC: failed to send ADDS Deliver burst_type={} on F-TCH walsh={}: {e}",
-                burst_type, walsh
-            );
-            return;
-        }
+        let msg_seq = match send_result {
+            Ok(msg_seq) => msg_seq,
+            Err(e) => {
+                warn!(
+                    "BSC: failed to send ADDS Deliver burst_type={} on F-TCH walsh={}: {e}",
+                    burst_type, walsh
+                );
+                return;
+            }
+        };
         info!(
             "BSC: sent ADDS Deliver burst_type={} ({} bytes) on F-TCH walsh={}",
             burst_type, data_len, walsh
         );
-        // Track OTASP-bearing ADDS Delivers so we can report an
-        // `AddsDeliverAck` to the MSC when the MS either acks (later, on
-        // L2 ack) or rejects (Mobile Station Reject Order). SMS uses a
-        // separate pending-ack flow keyed by msg_seq.
+        // An OTASP ADDS Deliver with a Tag is answered with an ADDS Deliver Ack when
+        // the mobile acknowledges it, rejects it, or the call clears first. SMS uses
+        // its own pending-ack flow.
         if burst_type == cdma_common::consts::BURST_TYPE_OTASP {
             if let Some(tag) = a1_tag {
                 self.pending_otasp_dbm.insert(
                     (cell, walsh),
-                    super::traffic_signaling::PendingOtaspDbm { a1_tag: tag },
+                    super::traffic_signaling::PendingOtaspDbm {
+                        a1_tag: tag,
+                        msg_seq,
+                    },
                 );
             }
         }
@@ -712,6 +855,8 @@ impl Bsc {
             });
         }
 
+        let auth_ies =
+            A1GlobalChallengeIes::from_event(event, self.config.bts.auth_mode(event.cell) != 0);
         let paging_response = cdma_ios::PagingResponseMessage {
             classmark_information_type_2: build_a1_classmark_information_type_2_for_event(event, 0),
             mobile_identity_imsi: cdma_ios::MobileIdentity::Imsi(imsi),
@@ -719,16 +864,16 @@ impl Bsc {
             mobile_identity_esn: event.esn.map(cdma_ios::MobileIdentity::Esn),
             mobile_identity_meid: event.meid.as_deref().and_then(meid_identity_from_hex),
             slot_cycle_index: event.slot_cycle_index.map(cdma_ios::SlotCycleIndex),
-            authentication_response_parameter: None,
-            authentication_confirmation_parameter: None,
-            authentication_parameter_count: None,
-            authentication_challenge_parameter: None,
+            authentication_response_parameter: auth_ies.response,
+            authentication_confirmation_parameter: auth_ies.randc,
+            authentication_parameter_count: auth_ies.count,
+            authentication_challenge_parameter: auth_ies.challenge,
             service_option: Some(cdma_ios::ServiceOption(
                 event.service_option.unwrap_or(pending.service_option),
             )),
             voice_privacy_request: a1_voice_privacy_requested(event),
             circuit_identity_code: None,
-            authentication_event: None,
+            authentication_event: auth_ies.event,
             radio_environment_and_resources: None,
             user_zone_id: None,
             is2000_mobile_capabilities: None,
@@ -924,6 +1069,18 @@ impl Bsc {
             warn!("BSC: refusing A1 Assignment Request without transport call correlation");
             return;
         };
+        if let Some(info) = &request.encryption_information {
+            match info.private_long_code_parameter() {
+                Ok(Some(parameters)) => {
+                    self.a1.privacy_assignments.insert(call_id, parameters);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!("BSC: invalid Assignment Request privacy parameters: {error}");
+                    return;
+                }
+            }
+        }
         let Some(pending) = self.a1.pop_pending_assignment(call_id) else {
             warn!(
                 "BSC: no pending MT assignment state for A1 Assignment Request call_id={}",
@@ -1296,7 +1453,12 @@ impl Bsc {
 }
 
 impl A1Service {
-    fn send_message(&self, call_id: u64, message_type: cdma_ios::MessageType, payload: Vec<u8>) {
+    pub(crate) fn send_message(
+        &self,
+        call_id: u64,
+        message_type: cdma_ios::MessageType,
+        payload: Vec<u8>,
+    ) {
         let encoded = EncodedA1Message::from_message_for_call(
             &cdma_ios::Message::new(message_type, payload),
             Some(call_id),
@@ -1430,6 +1592,8 @@ fn complete_layer3_information_from_origination(
     } else {
         None
     };
+    let auth_ies =
+        A1GlobalChallengeIes::from_event(event, bsc.config.bts.auth_mode(event.cell) != 0);
     let cm_service_request = cdma_ios::CmServiceRequestMessage {
         cm_service_type: cdma_ios::CmServiceType::MobileOriginatingCallEstablishment,
         classmark_information_type_2: build_a1_classmark_information_type_2_for_event(event, 0),
@@ -1448,17 +1612,17 @@ fn complete_layer3_information_from_origination(
                 .or(event.slot_cycle_index)
                 .unwrap_or(0),
         )),
-        authentication_response_parameter: None,
-        authentication_confirmation_parameter: None,
-        authentication_parameter_count: None,
-        authentication_challenge_parameter: None,
+        authentication_response_parameter: auth_ies.response,
+        authentication_confirmation_parameter: auth_ies.randc,
+        authentication_parameter_count: auth_ies.count,
+        authentication_challenge_parameter: auth_ies.challenge,
         service_option: Some(cdma_ios::ServiceOption(service_option)),
-        voice_privacy_request: false,
+        voice_privacy_request: a1_voice_privacy_requested(event),
         radio_environment_and_resources: None,
         called_party_ascii_number,
         circuit_identity_code: None,
-        authentication_event: None,
-        authentication_data: None,
+        authentication_event: auth_ies.event,
+        authentication_data: origination_auth_data(event, origination),
         paca_reorigination_indicator: origination
             .is_some_and(|origination| origination.paca_reorig),
         user_zone_id: origination
@@ -1470,6 +1634,80 @@ fn complete_layer3_information_from_origination(
     cdma_ios::Layer3Information::from_cm_service_request(&cm_service_request)
         .ok()
         .map(|layer3| layer3.0)
+}
+
+/// Global-challenge IEs for Location Updating Request, CM Service Request,
+/// Paging Response and ADDS Transfer (A.S0014-D §4.2.33, §4.2.35-§4.2.37, §4.2.61).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct A1GlobalChallengeIes {
+    pub(crate) response: Option<cdma_ios::AuthenticationResponseParameter>,
+    pub(crate) randc: Option<cdma_ios::AuthenticationConfirmationParameter>,
+    pub(crate) count: Option<cdma_ios::AuthenticationParameterCount>,
+    pub(crate) challenge: Option<cdma_ios::AuthenticationChallengeParameter>,
+    pub(crate) event: Option<cdma_ios::AuthenticationEvent>,
+}
+
+impl A1GlobalChallengeIes {
+    /// `auth_required` is true when the serving cell broadcasts AUTH=01.
+    pub(crate) fn from_event(
+        event: &cdma_common::events::AccessChannelEvent,
+        auth_required: bool,
+    ) -> Self {
+        let Some(auth) = event.authentication else {
+            return Self {
+                event: auth_required.then_some(cdma_ios::AuthenticationEvent(
+                    cdma_ios::AUTHENTICATION_EVENT_PARAMETERS_NOT_RECEIVED,
+                )),
+                ..Self::default()
+            };
+        };
+        Self {
+            response: Some(cdma_ios::AuthenticationResponseParameter::new(
+                cdma_ios::AuthSignatureType::Authr,
+                auth.authr,
+            )),
+            randc: Some(cdma_ios::AuthenticationConfirmationParameter(auth.randc)),
+            count: Some(cdma_ios::AuthenticationParameterCount(auth.count)),
+            challenge: auth.rand.map(|rand| {
+                cdma_ios::AuthenticationChallengeParameter::new(
+                    cdma_ios::RandomNumberType::Rand,
+                    u64::from(rand),
+                )
+            }),
+            event: auth.rand.is_none().then_some(cdma_ios::AuthenticationEvent(
+                cdma_ios::AUTHENTICATION_EVENT_RANDC_MISMATCH,
+            )),
+        }
+    }
+}
+
+/// AUTH_DATA from the last six dialed digits over IMSI_S1 (C.S0004-E §2.1.1.1.2.2).
+fn origination_auth_data(
+    event: &cdma_common::events::AccessChannelEvent,
+    origination: Option<&cdma_common::access::OriginationMessage>,
+) -> Option<cdma_ios::AuthenticationData> {
+    let origination = origination?;
+    dialed_auth_data(
+        event,
+        cdma_common::formatting::format_dtmf_digits(&origination.digits, origination.digit_mode),
+    )
+}
+
+/// AUTH_DATA from the last six digits of `digits` over IMSI_S1. An SMS Data Burst
+/// uses its destination address (C.S0015-B §3.3.3.1).
+pub(crate) fn dialed_auth_data(
+    event: &cdma_common::events::AccessChannelEvent,
+    digits: String,
+) -> Option<cdma_ios::AuthenticationData> {
+    event.authentication?;
+    let value = cdma_cave::AuthData::Dialed {
+        imsi_s1: event.imsi_m_s1?,
+        digits,
+    }
+    .to_u24()
+    .ok()?
+    .to_be_bytes();
+    Some(cdma_ios::AuthenticationData([value[1], value[2], value[3]]))
 }
 
 fn a1_voice_privacy_requested(event: &cdma_common::events::AccessChannelEvent) -> bool {
@@ -1733,6 +1971,7 @@ mod tests {
             traffic_voice_bits: None,
             traffic_voice_rate_bps: None,
             raw_pdu_bits: None,
+            authentication: None,
         }
     }
 

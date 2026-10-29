@@ -594,6 +594,7 @@ impl MessageId {
             Self::DataBurst => 0x04,            // 00000100 DBM
             Self::InTrafficSystemParameters => Self::FDSCH_ITSPM,
             Self::PowerControlParameters => Self::FDSCH_PCNPM,
+            Self::SsdUpdate => 0x0D,     // 00001101 SSDUM
             Self::FlashWithInfo => 0x0E, // 00001110 FWIM
             Self::StatusRequest => Self::FDSCH_STRQM,
             Self::ServiceRequest => 0x12,  // 00010010 SRQM
@@ -613,6 +614,7 @@ impl MessageId {
             0x04 => Self::DataBurst,
             Self::FDSCH_ITSPM => Self::InTrafficSystemParameters,
             Self::FDSCH_PCNPM => Self::PowerControlParameters,
+            0x0D => Self::SsdUpdate,
             0x0E => Self::FlashWithInfo,
             Self::FDSCH_STRQM => Self::StatusRequest,
             0x12 => Self::ServiceRequest,

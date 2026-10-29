@@ -540,6 +540,9 @@ pub struct OtaspWritesConfig {
     /// Push the per-subscriber (or default) PRL via SSPR Download
     /// after the read-back. Gated on FEATURE_ID = 0x02 (SSPR).
     pub prl: bool,
+    /// Generate a new A-key by key exchange, update SSD from it and
+    /// re-authenticate before Commit. Gated on FEATURE_ID = 0x01.
+    pub a_key: bool,
 }
 
 /// Home network identity written into a subscriber's NAM during OTASP.
@@ -588,6 +591,8 @@ pub struct MscNodeConfig {
     /// OTASP `*228`-style provisioning.
     #[serde(default)]
     pub otasp: OtaspConfig,
+    #[serde(default)]
+    pub authentication: crate::authentication::AuthenticationConfig,
 }
 
 impl MscNodeConfig {
@@ -698,7 +703,29 @@ mod tests {
             welcome_sms: WelcomeSmsConfig::default(),
             sms_retry: SmsRetryConfig::default(),
             otasp: OtaspConfig::default(),
+            authentication: Default::default(),
         }
+    }
+
+    #[test]
+    fn authentication_mode_parses_from_json() {
+        let cfg: crate::authentication::AuthenticationConfig =
+            serde_json::from_str(r#"{"mode": "enforce", "allow_unprovisioned": true}"#).unwrap();
+        assert_eq!(cfg.mode, crate::authentication::AuthenticationMode::Enforce);
+        assert!(cfg.allow_unprovisioned);
+        let default: crate::authentication::AuthenticationConfig =
+            serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            default.mode,
+            crate::authentication::AuthenticationMode::Monitor
+        );
+        assert_eq!(
+            crate::authentication::AuthenticationMode::default(),
+            crate::authentication::AuthenticationMode::Monitor
+        );
+        let off: crate::authentication::AuthenticationConfig =
+            serde_json::from_str(r#"{"mode": "off"}"#).unwrap();
+        assert_eq!(off.mode, crate::authentication::AuthenticationMode::Off);
     }
 
     #[test]

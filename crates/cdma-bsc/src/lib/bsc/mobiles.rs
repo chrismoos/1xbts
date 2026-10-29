@@ -78,6 +78,7 @@ pub struct MobileInfo {
     pub traffic_service_option: Option<u16>,
     /// Voice call sub-state label (None for non-voice calls).
     pub voice_call_state: Option<String>,
+    pub voice_privacy: Option<String>,
     /// Closed-loop power control snapshot. Present iff the mobile has an
     /// active reverse traffic channel.
     pub traffic_power: Option<TrafficChannelPowerSnapshot>,
@@ -993,6 +994,16 @@ impl MobileRegistry {
                         .traffic_channel
                         .as_ref()
                         .map(|tc| tc.channel_state.label().to_string()),
+                    voice_privacy: ms.traffic_channel.as_ref().map(|tc| {
+                        let chip = cdma_common::time::chips_since_epoch(
+                            cdma_common::time::system_time_now(),
+                            cdma_common::consts::SR1_CHIP_RATE_HZ,
+                        );
+                        tc.long_code_privacy
+                            .as_ref()
+                            .map_or("public", |privacy| privacy.status_at(chip))
+                            .to_string()
+                    }),
                     traffic_power: ms
                         .traffic_channel
                         .as_ref()

@@ -166,4 +166,17 @@ pub struct AccessChannelEvent {
     pub traffic_voice_rate_bps: Option<u32>,
     /// Raw access channel PDU bits as received from the air interface.
     pub raw_pdu_bits: Option<Vec<u8>>,
+    /// Global-challenge response from the r-csch PDU authentication fields.
+    pub authentication: Option<GlobalChallengeResponse>,
+}
+
+/// AUTHR, RANDC and COUNT sent by the mobile (C.S0004-E §2.1.1.1.1.2) and the
+/// broadcast RAND the base station matched to RANDC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlobalChallengeResponse {
+    pub authr: u32,
+    pub randc: u8,
+    pub count: u8,
+    /// `None` when RANDC matched no RAND broadcast by the base station.
+    pub rand: Option<u32>,
 }

@@ -229,6 +229,60 @@ export function authAlgorithmToJSON(object: AuthAlgorithm): string {
   }
 }
 
+export enum CaveAuthOutcome {
+  CAVE_AUTH_OUTCOME_UNSPECIFIED = 0,
+  CAVE_AUTH_OUTCOME_SUCCESS = 1,
+  /** CAVE_AUTH_OUTCOME_SIGNATURE_MISMATCH - AUTHR or AUTHU does not match the value computed from the stored SSD. */
+  CAVE_AUTH_OUTCOME_SIGNATURE_MISMATCH = 2,
+  /** CAVE_AUTH_OUTCOME_COUNT_MISMATCH - The signature matched but COUNT differs from the stored COUNT. */
+  CAVE_AUTH_OUTCOME_COUNT_MISMATCH = 3,
+  /** CAVE_AUTH_OUTCOME_NOT_PROVISIONED - The identity has no CAVE credentials. */
+  CAVE_AUTH_OUTCOME_NOT_PROVISIONED = 4,
+  UNRECOGNIZED = -1,
+}
+
+export function caveAuthOutcomeFromJSON(object: any): CaveAuthOutcome {
+  switch (object) {
+    case 0:
+    case "CAVE_AUTH_OUTCOME_UNSPECIFIED":
+      return CaveAuthOutcome.CAVE_AUTH_OUTCOME_UNSPECIFIED;
+    case 1:
+    case "CAVE_AUTH_OUTCOME_SUCCESS":
+      return CaveAuthOutcome.CAVE_AUTH_OUTCOME_SUCCESS;
+    case 2:
+    case "CAVE_AUTH_OUTCOME_SIGNATURE_MISMATCH":
+      return CaveAuthOutcome.CAVE_AUTH_OUTCOME_SIGNATURE_MISMATCH;
+    case 3:
+    case "CAVE_AUTH_OUTCOME_COUNT_MISMATCH":
+      return CaveAuthOutcome.CAVE_AUTH_OUTCOME_COUNT_MISMATCH;
+    case 4:
+    case "CAVE_AUTH_OUTCOME_NOT_PROVISIONED":
+      return CaveAuthOutcome.CAVE_AUTH_OUTCOME_NOT_PROVISIONED;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return CaveAuthOutcome.UNRECOGNIZED;
+  }
+}
+
+export function caveAuthOutcomeToJSON(object: CaveAuthOutcome): string {
+  switch (object) {
+    case CaveAuthOutcome.CAVE_AUTH_OUTCOME_UNSPECIFIED:
+      return "CAVE_AUTH_OUTCOME_UNSPECIFIED";
+    case CaveAuthOutcome.CAVE_AUTH_OUTCOME_SUCCESS:
+      return "CAVE_AUTH_OUTCOME_SUCCESS";
+    case CaveAuthOutcome.CAVE_AUTH_OUTCOME_SIGNATURE_MISMATCH:
+      return "CAVE_AUTH_OUTCOME_SIGNATURE_MISMATCH";
+    case CaveAuthOutcome.CAVE_AUTH_OUTCOME_COUNT_MISMATCH:
+      return "CAVE_AUTH_OUTCOME_COUNT_MISMATCH";
+    case CaveAuthOutcome.CAVE_AUTH_OUTCOME_NOT_PROVISIONED:
+      return "CAVE_AUTH_OUTCOME_NOT_PROVISIONED";
+    case CaveAuthOutcome.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
 export enum PrlRoamingIndicatorKind {
   PRL_ROAMING_INDICATOR_KIND_UNSPECIFIED = 0,
   PRL_ROAMING_INDICATOR_KIND_INDICATOR_ON = 1,
@@ -1109,6 +1163,13 @@ export interface SetSubscriberAKeyRequest {
    * when it is cleared.
    */
   authAlgo: AuthAlgorithm;
+  /**
+   * Keypad entry form of the A-key: up to 20 decimal digits of the key then
+   * 6 check digits (S.S0053-0 §2.2.2). The check digits are verified against
+   * the identity's ESN. Mutually exclusive with a_key. Setting an A-key this
+   * way clears the SSD, as the handset does on entry.
+   */
+  aKeyDigits?: string | undefined;
 }
 
 export interface GetSubscriberAuthStateRequest {
@@ -1130,6 +1191,114 @@ export interface GetSubscriberAuthStateResponse {
   authCount: number;
   authFailureCount: number;
   lastAuthAt?: Date | undefined;
+}
+
+export interface VerifyCaveGlobalChallengeRequest {
+  identity:
+    | MobileIdentityKey
+    | undefined;
+  /** ESN input to CAVE (the pseudo-ESN for an MEID mobile). */
+  esn: number;
+  /** 32-bit RAND the BS broadcast. */
+  rand: number;
+  /** 18-bit AUTHR. */
+  authr: number;
+  /** MS COUNT (0-63). Omit to skip the COUNT comparison. */
+  count?:
+    | number
+    | undefined;
+  /** 24-bit AUTH_DATA. */
+  authData: number;
+  /** Derive the call's CMEA key and private long code mask on success. */
+  generateCallKeys: boolean;
+  /** Verify an OTASP Re-Authenticate Response against the session's SSD. */
+  otaspReauthentication: boolean;
+}
+
+export interface VerifyCaveUniqueChallengeRequest {
+  identity: MobileIdentityKey | undefined;
+  esn: number;
+  /** 24-bit RANDU. */
+  randu: number;
+  /** 18-bit AUTHU. */
+  authu: number;
+  /** 24-bit IMSI_S1. */
+  imsiS1: number;
+  /** 10-bit IMSI_S2. */
+  imsiS2: number;
+  generateCallKeys: boolean;
+}
+
+export interface CaveVerdict {
+  outcome: CaveAuthOutcome;
+  /** 64-bit CMEA key, present on success when keys were requested. */
+  cmeaKey?:
+    | Uint8Array
+    | undefined;
+  /** 42-bit private long code mask PVTLCM_42, present with cmea_key. */
+  privateLongCodeMask?: number | undefined;
+}
+
+export interface BeginCaveSsdUpdateRequest {
+  identity: MobileIdentityKey | undefined;
+}
+
+export interface BeginCaveSsdUpdateResponse {
+  /** 56-bit RANDSSD. */
+  randssd: number;
+}
+
+export interface CaveBaseStationChallengeRequest {
+  identity: MobileIdentityKey | undefined;
+  esn: number;
+  /** 32-bit RANDBS chosen by the MS. */
+  randbs: number;
+  /** 24-bit IMSI_S1. */
+  imsiS1: number;
+}
+
+export interface CaveBaseStationChallengeResponse {
+  /** 18-bit AUTHBS. */
+  authbs: number;
+}
+
+export interface FinishCaveSsdUpdateRequest {
+  identity: MobileIdentityKey | undefined;
+  esn: number;
+  /** True when the MS sent an SSD Update Confirmation Order. */
+  confirmed: boolean;
+}
+
+export interface IncrementCaveCountRequest {
+  identity: MobileIdentityKey | undefined;
+}
+
+export interface IncrementCaveCountResponse {
+  authCount: number;
+}
+
+export interface BeginCaveKeyExchangeRequest {
+  identity:
+    | MobileIdentityKey
+    | undefined;
+  /** A_KEY_P_REV: 2 (512-bit P chosen by the HLR) or 3 (fixed 1024-bit group). */
+  aKeyPRev: number;
+}
+
+export interface BeginCaveKeyExchangeResponse {
+  /** PARAM_P and PARAM_G, present only for A_KEY_P_REV 2. */
+  paramP?: Uint8Array | undefined;
+  paramG?: Uint8Array | undefined;
+  bsResult: Uint8Array;
+}
+
+export interface CompleteCaveKeyExchangeRequest {
+  identity: MobileIdentityKey | undefined;
+  msResult: Uint8Array;
+}
+
+export interface CaveKeyIdentityRequest {
+  identity: MobileIdentityKey | undefined;
 }
 
 /** Summary for list view. */
@@ -6238,7 +6407,7 @@ export const SetSubscriberFirstchpOverrideRequest: MessageFns<SetSubscriberFirst
 };
 
 function createBaseSetSubscriberAKeyRequest(): SetSubscriberAKeyRequest {
-  return { identity: undefined, aKey: undefined, ssdA: undefined, ssdB: undefined, authAlgo: 0 };
+  return { identity: undefined, aKey: undefined, ssdA: undefined, ssdB: undefined, authAlgo: 0, aKeyDigits: undefined };
 }
 
 export const SetSubscriberAKeyRequest: MessageFns<SetSubscriberAKeyRequest> = {
@@ -6257,6 +6426,9 @@ export const SetSubscriberAKeyRequest: MessageFns<SetSubscriberAKeyRequest> = {
     }
     if (message.authAlgo !== 0) {
       writer.uint32(40).int32(message.authAlgo);
+    }
+    if (message.aKeyDigits !== undefined) {
+      writer.uint32(50).string(message.aKeyDigits);
     }
     return writer;
   },
@@ -6308,6 +6480,14 @@ export const SetSubscriberAKeyRequest: MessageFns<SetSubscriberAKeyRequest> = {
           message.authAlgo = reader.int32() as any;
           continue;
         }
+        case 6: {
+          if (tag !== 50) {
+            break;
+          }
+
+          message.aKeyDigits = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -6340,6 +6520,11 @@ export const SetSubscriberAKeyRequest: MessageFns<SetSubscriberAKeyRequest> = {
         : isSet(object.auth_algo)
         ? authAlgorithmFromJSON(object.auth_algo)
         : 0,
+      aKeyDigits: isSet(object.aKeyDigits)
+        ? globalThis.String(object.aKeyDigits)
+        : isSet(object.a_key_digits)
+        ? globalThis.String(object.a_key_digits)
+        : undefined,
     };
   },
 
@@ -6360,6 +6545,9 @@ export const SetSubscriberAKeyRequest: MessageFns<SetSubscriberAKeyRequest> = {
     if (message.authAlgo !== 0) {
       obj.authAlgo = authAlgorithmToJSON(message.authAlgo);
     }
+    if (message.aKeyDigits !== undefined) {
+      obj.aKeyDigits = message.aKeyDigits;
+    }
     return obj;
   },
 
@@ -6375,6 +6563,7 @@ export const SetSubscriberAKeyRequest: MessageFns<SetSubscriberAKeyRequest> = {
     message.ssdA = object.ssdA ?? undefined;
     message.ssdB = object.ssdB ?? undefined;
     message.authAlgo = object.authAlgo ?? 0;
+    message.aKeyDigits = object.aKeyDigits ?? undefined;
     return message;
   },
 };
@@ -6627,6 +6816,1307 @@ export const GetSubscriberAuthStateResponse: MessageFns<GetSubscriberAuthStateRe
     message.authCount = object.authCount ?? 0;
     message.authFailureCount = object.authFailureCount ?? 0;
     message.lastAuthAt = object.lastAuthAt ?? undefined;
+    return message;
+  },
+};
+
+function createBaseVerifyCaveGlobalChallengeRequest(): VerifyCaveGlobalChallengeRequest {
+  return {
+    identity: undefined,
+    esn: 0,
+    rand: 0,
+    authr: 0,
+    count: undefined,
+    authData: 0,
+    generateCallKeys: false,
+    otaspReauthentication: false,
+  };
+}
+
+export const VerifyCaveGlobalChallengeRequest: MessageFns<VerifyCaveGlobalChallengeRequest> = {
+  encode(message: VerifyCaveGlobalChallengeRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.identity !== undefined) {
+      MobileIdentityKey.encode(message.identity, writer.uint32(10).fork()).join();
+    }
+    if (message.esn !== 0) {
+      writer.uint32(16).uint32(message.esn);
+    }
+    if (message.rand !== 0) {
+      writer.uint32(24).uint32(message.rand);
+    }
+    if (message.authr !== 0) {
+      writer.uint32(32).uint32(message.authr);
+    }
+    if (message.count !== undefined) {
+      writer.uint32(40).uint32(message.count);
+    }
+    if (message.authData !== 0) {
+      writer.uint32(48).uint32(message.authData);
+    }
+    if (message.generateCallKeys !== false) {
+      writer.uint32(56).bool(message.generateCallKeys);
+    }
+    if (message.otaspReauthentication !== false) {
+      writer.uint32(64).bool(message.otaspReauthentication);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): VerifyCaveGlobalChallengeRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseVerifyCaveGlobalChallengeRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.identity = MobileIdentityKey.decode(reader, reader.uint32());
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.esn = reader.uint32();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.rand = reader.uint32();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.authr = reader.uint32();
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.count = reader.uint32();
+          continue;
+        }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.authData = reader.uint32();
+          continue;
+        }
+        case 7: {
+          if (tag !== 56) {
+            break;
+          }
+
+          message.generateCallKeys = reader.bool();
+          continue;
+        }
+        case 8: {
+          if (tag !== 64) {
+            break;
+          }
+
+          message.otaspReauthentication = reader.bool();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): VerifyCaveGlobalChallengeRequest {
+    return {
+      identity: isSet(object.identity) ? MobileIdentityKey.fromJSON(object.identity) : undefined,
+      esn: isSet(object.esn) ? globalThis.Number(object.esn) : 0,
+      rand: isSet(object.rand) ? globalThis.Number(object.rand) : 0,
+      authr: isSet(object.authr) ? globalThis.Number(object.authr) : 0,
+      count: isSet(object.count) ? globalThis.Number(object.count) : undefined,
+      authData: isSet(object.authData)
+        ? globalThis.Number(object.authData)
+        : isSet(object.auth_data)
+        ? globalThis.Number(object.auth_data)
+        : 0,
+      generateCallKeys: isSet(object.generateCallKeys)
+        ? globalThis.Boolean(object.generateCallKeys)
+        : isSet(object.generate_call_keys)
+        ? globalThis.Boolean(object.generate_call_keys)
+        : false,
+      otaspReauthentication: isSet(object.otaspReauthentication)
+        ? globalThis.Boolean(object.otaspReauthentication)
+        : isSet(object.otasp_reauthentication)
+        ? globalThis.Boolean(object.otasp_reauthentication)
+        : false,
+    };
+  },
+
+  toJSON(message: VerifyCaveGlobalChallengeRequest): unknown {
+    const obj: any = {};
+    if (message.identity !== undefined) {
+      obj.identity = MobileIdentityKey.toJSON(message.identity);
+    }
+    if (message.esn !== 0) {
+      obj.esn = Math.round(message.esn);
+    }
+    if (message.rand !== 0) {
+      obj.rand = Math.round(message.rand);
+    }
+    if (message.authr !== 0) {
+      obj.authr = Math.round(message.authr);
+    }
+    if (message.count !== undefined) {
+      obj.count = Math.round(message.count);
+    }
+    if (message.authData !== 0) {
+      obj.authData = Math.round(message.authData);
+    }
+    if (message.generateCallKeys !== false) {
+      obj.generateCallKeys = message.generateCallKeys;
+    }
+    if (message.otaspReauthentication !== false) {
+      obj.otaspReauthentication = message.otaspReauthentication;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<VerifyCaveGlobalChallengeRequest>): VerifyCaveGlobalChallengeRequest {
+    return VerifyCaveGlobalChallengeRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<VerifyCaveGlobalChallengeRequest>): VerifyCaveGlobalChallengeRequest {
+    const message = createBaseVerifyCaveGlobalChallengeRequest();
+    message.identity = (object.identity !== undefined && object.identity !== null)
+      ? MobileIdentityKey.fromPartial(object.identity)
+      : undefined;
+    message.esn = object.esn ?? 0;
+    message.rand = object.rand ?? 0;
+    message.authr = object.authr ?? 0;
+    message.count = object.count ?? undefined;
+    message.authData = object.authData ?? 0;
+    message.generateCallKeys = object.generateCallKeys ?? false;
+    message.otaspReauthentication = object.otaspReauthentication ?? false;
+    return message;
+  },
+};
+
+function createBaseVerifyCaveUniqueChallengeRequest(): VerifyCaveUniqueChallengeRequest {
+  return { identity: undefined, esn: 0, randu: 0, authu: 0, imsiS1: 0, imsiS2: 0, generateCallKeys: false };
+}
+
+export const VerifyCaveUniqueChallengeRequest: MessageFns<VerifyCaveUniqueChallengeRequest> = {
+  encode(message: VerifyCaveUniqueChallengeRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.identity !== undefined) {
+      MobileIdentityKey.encode(message.identity, writer.uint32(10).fork()).join();
+    }
+    if (message.esn !== 0) {
+      writer.uint32(16).uint32(message.esn);
+    }
+    if (message.randu !== 0) {
+      writer.uint32(24).uint32(message.randu);
+    }
+    if (message.authu !== 0) {
+      writer.uint32(32).uint32(message.authu);
+    }
+    if (message.imsiS1 !== 0) {
+      writer.uint32(40).uint32(message.imsiS1);
+    }
+    if (message.imsiS2 !== 0) {
+      writer.uint32(48).uint32(message.imsiS2);
+    }
+    if (message.generateCallKeys !== false) {
+      writer.uint32(56).bool(message.generateCallKeys);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): VerifyCaveUniqueChallengeRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseVerifyCaveUniqueChallengeRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.identity = MobileIdentityKey.decode(reader, reader.uint32());
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.esn = reader.uint32();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.randu = reader.uint32();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.authu = reader.uint32();
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.imsiS1 = reader.uint32();
+          continue;
+        }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.imsiS2 = reader.uint32();
+          continue;
+        }
+        case 7: {
+          if (tag !== 56) {
+            break;
+          }
+
+          message.generateCallKeys = reader.bool();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): VerifyCaveUniqueChallengeRequest {
+    return {
+      identity: isSet(object.identity) ? MobileIdentityKey.fromJSON(object.identity) : undefined,
+      esn: isSet(object.esn) ? globalThis.Number(object.esn) : 0,
+      randu: isSet(object.randu) ? globalThis.Number(object.randu) : 0,
+      authu: isSet(object.authu) ? globalThis.Number(object.authu) : 0,
+      imsiS1: isSet(object.imsiS1)
+        ? globalThis.Number(object.imsiS1)
+        : isSet(object.imsi_s1)
+        ? globalThis.Number(object.imsi_s1)
+        : 0,
+      imsiS2: isSet(object.imsiS2)
+        ? globalThis.Number(object.imsiS2)
+        : isSet(object.imsi_s2)
+        ? globalThis.Number(object.imsi_s2)
+        : 0,
+      generateCallKeys: isSet(object.generateCallKeys)
+        ? globalThis.Boolean(object.generateCallKeys)
+        : isSet(object.generate_call_keys)
+        ? globalThis.Boolean(object.generate_call_keys)
+        : false,
+    };
+  },
+
+  toJSON(message: VerifyCaveUniqueChallengeRequest): unknown {
+    const obj: any = {};
+    if (message.identity !== undefined) {
+      obj.identity = MobileIdentityKey.toJSON(message.identity);
+    }
+    if (message.esn !== 0) {
+      obj.esn = Math.round(message.esn);
+    }
+    if (message.randu !== 0) {
+      obj.randu = Math.round(message.randu);
+    }
+    if (message.authu !== 0) {
+      obj.authu = Math.round(message.authu);
+    }
+    if (message.imsiS1 !== 0) {
+      obj.imsiS1 = Math.round(message.imsiS1);
+    }
+    if (message.imsiS2 !== 0) {
+      obj.imsiS2 = Math.round(message.imsiS2);
+    }
+    if (message.generateCallKeys !== false) {
+      obj.generateCallKeys = message.generateCallKeys;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<VerifyCaveUniqueChallengeRequest>): VerifyCaveUniqueChallengeRequest {
+    return VerifyCaveUniqueChallengeRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<VerifyCaveUniqueChallengeRequest>): VerifyCaveUniqueChallengeRequest {
+    const message = createBaseVerifyCaveUniqueChallengeRequest();
+    message.identity = (object.identity !== undefined && object.identity !== null)
+      ? MobileIdentityKey.fromPartial(object.identity)
+      : undefined;
+    message.esn = object.esn ?? 0;
+    message.randu = object.randu ?? 0;
+    message.authu = object.authu ?? 0;
+    message.imsiS1 = object.imsiS1 ?? 0;
+    message.imsiS2 = object.imsiS2 ?? 0;
+    message.generateCallKeys = object.generateCallKeys ?? false;
+    return message;
+  },
+};
+
+function createBaseCaveVerdict(): CaveVerdict {
+  return { outcome: 0, cmeaKey: undefined, privateLongCodeMask: undefined };
+}
+
+export const CaveVerdict: MessageFns<CaveVerdict> = {
+  encode(message: CaveVerdict, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.outcome !== 0) {
+      writer.uint32(8).int32(message.outcome);
+    }
+    if (message.cmeaKey !== undefined) {
+      writer.uint32(18).bytes(message.cmeaKey);
+    }
+    if (message.privateLongCodeMask !== undefined) {
+      writer.uint32(24).uint64(message.privateLongCodeMask);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): CaveVerdict {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseCaveVerdict();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.outcome = reader.int32() as any;
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.cmeaKey = reader.bytes();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.privateLongCodeMask = longToNumber(reader.uint64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): CaveVerdict {
+    return {
+      outcome: isSet(object.outcome) ? caveAuthOutcomeFromJSON(object.outcome) : 0,
+      cmeaKey: isSet(object.cmeaKey)
+        ? bytesFromBase64(object.cmeaKey)
+        : isSet(object.cmea_key)
+        ? bytesFromBase64(object.cmea_key)
+        : undefined,
+      privateLongCodeMask: isSet(object.privateLongCodeMask)
+        ? globalThis.Number(object.privateLongCodeMask)
+        : isSet(object.private_long_code_mask)
+        ? globalThis.Number(object.private_long_code_mask)
+        : undefined,
+    };
+  },
+
+  toJSON(message: CaveVerdict): unknown {
+    const obj: any = {};
+    if (message.outcome !== 0) {
+      obj.outcome = caveAuthOutcomeToJSON(message.outcome);
+    }
+    if (message.cmeaKey !== undefined) {
+      obj.cmeaKey = base64FromBytes(message.cmeaKey);
+    }
+    if (message.privateLongCodeMask !== undefined) {
+      obj.privateLongCodeMask = Math.round(message.privateLongCodeMask);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<CaveVerdict>): CaveVerdict {
+    return CaveVerdict.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<CaveVerdict>): CaveVerdict {
+    const message = createBaseCaveVerdict();
+    message.outcome = object.outcome ?? 0;
+    message.cmeaKey = object.cmeaKey ?? undefined;
+    message.privateLongCodeMask = object.privateLongCodeMask ?? undefined;
+    return message;
+  },
+};
+
+function createBaseBeginCaveSsdUpdateRequest(): BeginCaveSsdUpdateRequest {
+  return { identity: undefined };
+}
+
+export const BeginCaveSsdUpdateRequest: MessageFns<BeginCaveSsdUpdateRequest> = {
+  encode(message: BeginCaveSsdUpdateRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.identity !== undefined) {
+      MobileIdentityKey.encode(message.identity, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): BeginCaveSsdUpdateRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseBeginCaveSsdUpdateRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.identity = MobileIdentityKey.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): BeginCaveSsdUpdateRequest {
+    return { identity: isSet(object.identity) ? MobileIdentityKey.fromJSON(object.identity) : undefined };
+  },
+
+  toJSON(message: BeginCaveSsdUpdateRequest): unknown {
+    const obj: any = {};
+    if (message.identity !== undefined) {
+      obj.identity = MobileIdentityKey.toJSON(message.identity);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<BeginCaveSsdUpdateRequest>): BeginCaveSsdUpdateRequest {
+    return BeginCaveSsdUpdateRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<BeginCaveSsdUpdateRequest>): BeginCaveSsdUpdateRequest {
+    const message = createBaseBeginCaveSsdUpdateRequest();
+    message.identity = (object.identity !== undefined && object.identity !== null)
+      ? MobileIdentityKey.fromPartial(object.identity)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseBeginCaveSsdUpdateResponse(): BeginCaveSsdUpdateResponse {
+  return { randssd: 0 };
+}
+
+export const BeginCaveSsdUpdateResponse: MessageFns<BeginCaveSsdUpdateResponse> = {
+  encode(message: BeginCaveSsdUpdateResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.randssd !== 0) {
+      writer.uint32(8).uint64(message.randssd);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): BeginCaveSsdUpdateResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseBeginCaveSsdUpdateResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.randssd = longToNumber(reader.uint64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): BeginCaveSsdUpdateResponse {
+    return { randssd: isSet(object.randssd) ? globalThis.Number(object.randssd) : 0 };
+  },
+
+  toJSON(message: BeginCaveSsdUpdateResponse): unknown {
+    const obj: any = {};
+    if (message.randssd !== 0) {
+      obj.randssd = Math.round(message.randssd);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<BeginCaveSsdUpdateResponse>): BeginCaveSsdUpdateResponse {
+    return BeginCaveSsdUpdateResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<BeginCaveSsdUpdateResponse>): BeginCaveSsdUpdateResponse {
+    const message = createBaseBeginCaveSsdUpdateResponse();
+    message.randssd = object.randssd ?? 0;
+    return message;
+  },
+};
+
+function createBaseCaveBaseStationChallengeRequest(): CaveBaseStationChallengeRequest {
+  return { identity: undefined, esn: 0, randbs: 0, imsiS1: 0 };
+}
+
+export const CaveBaseStationChallengeRequest: MessageFns<CaveBaseStationChallengeRequest> = {
+  encode(message: CaveBaseStationChallengeRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.identity !== undefined) {
+      MobileIdentityKey.encode(message.identity, writer.uint32(10).fork()).join();
+    }
+    if (message.esn !== 0) {
+      writer.uint32(16).uint32(message.esn);
+    }
+    if (message.randbs !== 0) {
+      writer.uint32(24).uint32(message.randbs);
+    }
+    if (message.imsiS1 !== 0) {
+      writer.uint32(32).uint32(message.imsiS1);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): CaveBaseStationChallengeRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseCaveBaseStationChallengeRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.identity = MobileIdentityKey.decode(reader, reader.uint32());
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.esn = reader.uint32();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.randbs = reader.uint32();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.imsiS1 = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): CaveBaseStationChallengeRequest {
+    return {
+      identity: isSet(object.identity) ? MobileIdentityKey.fromJSON(object.identity) : undefined,
+      esn: isSet(object.esn) ? globalThis.Number(object.esn) : 0,
+      randbs: isSet(object.randbs) ? globalThis.Number(object.randbs) : 0,
+      imsiS1: isSet(object.imsiS1)
+        ? globalThis.Number(object.imsiS1)
+        : isSet(object.imsi_s1)
+        ? globalThis.Number(object.imsi_s1)
+        : 0,
+    };
+  },
+
+  toJSON(message: CaveBaseStationChallengeRequest): unknown {
+    const obj: any = {};
+    if (message.identity !== undefined) {
+      obj.identity = MobileIdentityKey.toJSON(message.identity);
+    }
+    if (message.esn !== 0) {
+      obj.esn = Math.round(message.esn);
+    }
+    if (message.randbs !== 0) {
+      obj.randbs = Math.round(message.randbs);
+    }
+    if (message.imsiS1 !== 0) {
+      obj.imsiS1 = Math.round(message.imsiS1);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<CaveBaseStationChallengeRequest>): CaveBaseStationChallengeRequest {
+    return CaveBaseStationChallengeRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<CaveBaseStationChallengeRequest>): CaveBaseStationChallengeRequest {
+    const message = createBaseCaveBaseStationChallengeRequest();
+    message.identity = (object.identity !== undefined && object.identity !== null)
+      ? MobileIdentityKey.fromPartial(object.identity)
+      : undefined;
+    message.esn = object.esn ?? 0;
+    message.randbs = object.randbs ?? 0;
+    message.imsiS1 = object.imsiS1 ?? 0;
+    return message;
+  },
+};
+
+function createBaseCaveBaseStationChallengeResponse(): CaveBaseStationChallengeResponse {
+  return { authbs: 0 };
+}
+
+export const CaveBaseStationChallengeResponse: MessageFns<CaveBaseStationChallengeResponse> = {
+  encode(message: CaveBaseStationChallengeResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.authbs !== 0) {
+      writer.uint32(8).uint32(message.authbs);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): CaveBaseStationChallengeResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseCaveBaseStationChallengeResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.authbs = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): CaveBaseStationChallengeResponse {
+    return { authbs: isSet(object.authbs) ? globalThis.Number(object.authbs) : 0 };
+  },
+
+  toJSON(message: CaveBaseStationChallengeResponse): unknown {
+    const obj: any = {};
+    if (message.authbs !== 0) {
+      obj.authbs = Math.round(message.authbs);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<CaveBaseStationChallengeResponse>): CaveBaseStationChallengeResponse {
+    return CaveBaseStationChallengeResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<CaveBaseStationChallengeResponse>): CaveBaseStationChallengeResponse {
+    const message = createBaseCaveBaseStationChallengeResponse();
+    message.authbs = object.authbs ?? 0;
+    return message;
+  },
+};
+
+function createBaseFinishCaveSsdUpdateRequest(): FinishCaveSsdUpdateRequest {
+  return { identity: undefined, esn: 0, confirmed: false };
+}
+
+export const FinishCaveSsdUpdateRequest: MessageFns<FinishCaveSsdUpdateRequest> = {
+  encode(message: FinishCaveSsdUpdateRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.identity !== undefined) {
+      MobileIdentityKey.encode(message.identity, writer.uint32(10).fork()).join();
+    }
+    if (message.esn !== 0) {
+      writer.uint32(16).uint32(message.esn);
+    }
+    if (message.confirmed !== false) {
+      writer.uint32(24).bool(message.confirmed);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): FinishCaveSsdUpdateRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseFinishCaveSsdUpdateRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.identity = MobileIdentityKey.decode(reader, reader.uint32());
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.esn = reader.uint32();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.confirmed = reader.bool();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): FinishCaveSsdUpdateRequest {
+    return {
+      identity: isSet(object.identity) ? MobileIdentityKey.fromJSON(object.identity) : undefined,
+      esn: isSet(object.esn) ? globalThis.Number(object.esn) : 0,
+      confirmed: isSet(object.confirmed) ? globalThis.Boolean(object.confirmed) : false,
+    };
+  },
+
+  toJSON(message: FinishCaveSsdUpdateRequest): unknown {
+    const obj: any = {};
+    if (message.identity !== undefined) {
+      obj.identity = MobileIdentityKey.toJSON(message.identity);
+    }
+    if (message.esn !== 0) {
+      obj.esn = Math.round(message.esn);
+    }
+    if (message.confirmed !== false) {
+      obj.confirmed = message.confirmed;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<FinishCaveSsdUpdateRequest>): FinishCaveSsdUpdateRequest {
+    return FinishCaveSsdUpdateRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<FinishCaveSsdUpdateRequest>): FinishCaveSsdUpdateRequest {
+    const message = createBaseFinishCaveSsdUpdateRequest();
+    message.identity = (object.identity !== undefined && object.identity !== null)
+      ? MobileIdentityKey.fromPartial(object.identity)
+      : undefined;
+    message.esn = object.esn ?? 0;
+    message.confirmed = object.confirmed ?? false;
+    return message;
+  },
+};
+
+function createBaseIncrementCaveCountRequest(): IncrementCaveCountRequest {
+  return { identity: undefined };
+}
+
+export const IncrementCaveCountRequest: MessageFns<IncrementCaveCountRequest> = {
+  encode(message: IncrementCaveCountRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.identity !== undefined) {
+      MobileIdentityKey.encode(message.identity, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): IncrementCaveCountRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseIncrementCaveCountRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.identity = MobileIdentityKey.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): IncrementCaveCountRequest {
+    return { identity: isSet(object.identity) ? MobileIdentityKey.fromJSON(object.identity) : undefined };
+  },
+
+  toJSON(message: IncrementCaveCountRequest): unknown {
+    const obj: any = {};
+    if (message.identity !== undefined) {
+      obj.identity = MobileIdentityKey.toJSON(message.identity);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<IncrementCaveCountRequest>): IncrementCaveCountRequest {
+    return IncrementCaveCountRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<IncrementCaveCountRequest>): IncrementCaveCountRequest {
+    const message = createBaseIncrementCaveCountRequest();
+    message.identity = (object.identity !== undefined && object.identity !== null)
+      ? MobileIdentityKey.fromPartial(object.identity)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseIncrementCaveCountResponse(): IncrementCaveCountResponse {
+  return { authCount: 0 };
+}
+
+export const IncrementCaveCountResponse: MessageFns<IncrementCaveCountResponse> = {
+  encode(message: IncrementCaveCountResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.authCount !== 0) {
+      writer.uint32(8).uint32(message.authCount);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): IncrementCaveCountResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseIncrementCaveCountResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.authCount = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): IncrementCaveCountResponse {
+    return {
+      authCount: isSet(object.authCount)
+        ? globalThis.Number(object.authCount)
+        : isSet(object.auth_count)
+        ? globalThis.Number(object.auth_count)
+        : 0,
+    };
+  },
+
+  toJSON(message: IncrementCaveCountResponse): unknown {
+    const obj: any = {};
+    if (message.authCount !== 0) {
+      obj.authCount = Math.round(message.authCount);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<IncrementCaveCountResponse>): IncrementCaveCountResponse {
+    return IncrementCaveCountResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<IncrementCaveCountResponse>): IncrementCaveCountResponse {
+    const message = createBaseIncrementCaveCountResponse();
+    message.authCount = object.authCount ?? 0;
+    return message;
+  },
+};
+
+function createBaseBeginCaveKeyExchangeRequest(): BeginCaveKeyExchangeRequest {
+  return { identity: undefined, aKeyPRev: 0 };
+}
+
+export const BeginCaveKeyExchangeRequest: MessageFns<BeginCaveKeyExchangeRequest> = {
+  encode(message: BeginCaveKeyExchangeRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.identity !== undefined) {
+      MobileIdentityKey.encode(message.identity, writer.uint32(10).fork()).join();
+    }
+    if (message.aKeyPRev !== 0) {
+      writer.uint32(16).uint32(message.aKeyPRev);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): BeginCaveKeyExchangeRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseBeginCaveKeyExchangeRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.identity = MobileIdentityKey.decode(reader, reader.uint32());
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.aKeyPRev = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): BeginCaveKeyExchangeRequest {
+    return {
+      identity: isSet(object.identity) ? MobileIdentityKey.fromJSON(object.identity) : undefined,
+      aKeyPRev: isSet(object.aKeyPRev)
+        ? globalThis.Number(object.aKeyPRev)
+        : isSet(object.a_key_p_rev)
+        ? globalThis.Number(object.a_key_p_rev)
+        : 0,
+    };
+  },
+
+  toJSON(message: BeginCaveKeyExchangeRequest): unknown {
+    const obj: any = {};
+    if (message.identity !== undefined) {
+      obj.identity = MobileIdentityKey.toJSON(message.identity);
+    }
+    if (message.aKeyPRev !== 0) {
+      obj.aKeyPRev = Math.round(message.aKeyPRev);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<BeginCaveKeyExchangeRequest>): BeginCaveKeyExchangeRequest {
+    return BeginCaveKeyExchangeRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<BeginCaveKeyExchangeRequest>): BeginCaveKeyExchangeRequest {
+    const message = createBaseBeginCaveKeyExchangeRequest();
+    message.identity = (object.identity !== undefined && object.identity !== null)
+      ? MobileIdentityKey.fromPartial(object.identity)
+      : undefined;
+    message.aKeyPRev = object.aKeyPRev ?? 0;
+    return message;
+  },
+};
+
+function createBaseBeginCaveKeyExchangeResponse(): BeginCaveKeyExchangeResponse {
+  return { paramP: undefined, paramG: undefined, bsResult: new Uint8Array(0) };
+}
+
+export const BeginCaveKeyExchangeResponse: MessageFns<BeginCaveKeyExchangeResponse> = {
+  encode(message: BeginCaveKeyExchangeResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.paramP !== undefined) {
+      writer.uint32(10).bytes(message.paramP);
+    }
+    if (message.paramG !== undefined) {
+      writer.uint32(18).bytes(message.paramG);
+    }
+    if (message.bsResult.length !== 0) {
+      writer.uint32(26).bytes(message.bsResult);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): BeginCaveKeyExchangeResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseBeginCaveKeyExchangeResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.paramP = reader.bytes();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.paramG = reader.bytes();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.bsResult = reader.bytes();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): BeginCaveKeyExchangeResponse {
+    return {
+      paramP: isSet(object.paramP)
+        ? bytesFromBase64(object.paramP)
+        : isSet(object.param_p)
+        ? bytesFromBase64(object.param_p)
+        : undefined,
+      paramG: isSet(object.paramG)
+        ? bytesFromBase64(object.paramG)
+        : isSet(object.param_g)
+        ? bytesFromBase64(object.param_g)
+        : undefined,
+      bsResult: isSet(object.bsResult)
+        ? bytesFromBase64(object.bsResult)
+        : isSet(object.bs_result)
+        ? bytesFromBase64(object.bs_result)
+        : new Uint8Array(0),
+    };
+  },
+
+  toJSON(message: BeginCaveKeyExchangeResponse): unknown {
+    const obj: any = {};
+    if (message.paramP !== undefined) {
+      obj.paramP = base64FromBytes(message.paramP);
+    }
+    if (message.paramG !== undefined) {
+      obj.paramG = base64FromBytes(message.paramG);
+    }
+    if (message.bsResult.length !== 0) {
+      obj.bsResult = base64FromBytes(message.bsResult);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<BeginCaveKeyExchangeResponse>): BeginCaveKeyExchangeResponse {
+    return BeginCaveKeyExchangeResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<BeginCaveKeyExchangeResponse>): BeginCaveKeyExchangeResponse {
+    const message = createBaseBeginCaveKeyExchangeResponse();
+    message.paramP = object.paramP ?? undefined;
+    message.paramG = object.paramG ?? undefined;
+    message.bsResult = object.bsResult ?? new Uint8Array(0);
+    return message;
+  },
+};
+
+function createBaseCompleteCaveKeyExchangeRequest(): CompleteCaveKeyExchangeRequest {
+  return { identity: undefined, msResult: new Uint8Array(0) };
+}
+
+export const CompleteCaveKeyExchangeRequest: MessageFns<CompleteCaveKeyExchangeRequest> = {
+  encode(message: CompleteCaveKeyExchangeRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.identity !== undefined) {
+      MobileIdentityKey.encode(message.identity, writer.uint32(10).fork()).join();
+    }
+    if (message.msResult.length !== 0) {
+      writer.uint32(18).bytes(message.msResult);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): CompleteCaveKeyExchangeRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseCompleteCaveKeyExchangeRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.identity = MobileIdentityKey.decode(reader, reader.uint32());
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.msResult = reader.bytes();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): CompleteCaveKeyExchangeRequest {
+    return {
+      identity: isSet(object.identity) ? MobileIdentityKey.fromJSON(object.identity) : undefined,
+      msResult: isSet(object.msResult)
+        ? bytesFromBase64(object.msResult)
+        : isSet(object.ms_result)
+        ? bytesFromBase64(object.ms_result)
+        : new Uint8Array(0),
+    };
+  },
+
+  toJSON(message: CompleteCaveKeyExchangeRequest): unknown {
+    const obj: any = {};
+    if (message.identity !== undefined) {
+      obj.identity = MobileIdentityKey.toJSON(message.identity);
+    }
+    if (message.msResult.length !== 0) {
+      obj.msResult = base64FromBytes(message.msResult);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<CompleteCaveKeyExchangeRequest>): CompleteCaveKeyExchangeRequest {
+    return CompleteCaveKeyExchangeRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<CompleteCaveKeyExchangeRequest>): CompleteCaveKeyExchangeRequest {
+    const message = createBaseCompleteCaveKeyExchangeRequest();
+    message.identity = (object.identity !== undefined && object.identity !== null)
+      ? MobileIdentityKey.fromPartial(object.identity)
+      : undefined;
+    message.msResult = object.msResult ?? new Uint8Array(0);
+    return message;
+  },
+};
+
+function createBaseCaveKeyIdentityRequest(): CaveKeyIdentityRequest {
+  return { identity: undefined };
+}
+
+export const CaveKeyIdentityRequest: MessageFns<CaveKeyIdentityRequest> = {
+  encode(message: CaveKeyIdentityRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.identity !== undefined) {
+      MobileIdentityKey.encode(message.identity, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): CaveKeyIdentityRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseCaveKeyIdentityRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.identity = MobileIdentityKey.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): CaveKeyIdentityRequest {
+    return { identity: isSet(object.identity) ? MobileIdentityKey.fromJSON(object.identity) : undefined };
+  },
+
+  toJSON(message: CaveKeyIdentityRequest): unknown {
+    const obj: any = {};
+    if (message.identity !== undefined) {
+      obj.identity = MobileIdentityKey.toJSON(message.identity);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<CaveKeyIdentityRequest>): CaveKeyIdentityRequest {
+    return CaveKeyIdentityRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<CaveKeyIdentityRequest>): CaveKeyIdentityRequest {
+    const message = createBaseCaveKeyIdentityRequest();
+    message.identity = (object.identity !== undefined && object.identity !== null)
+      ? MobileIdentityKey.fromPartial(object.identity)
+      : undefined;
     return message;
   },
 };
@@ -13537,6 +15027,99 @@ export const HlrServiceDefinition = {
       responseStream: false,
       options: {},
     },
+    /** Verifies a CAVE global-challenge AUTHR against the stored SSD (C.S0004-E §2.1.1.1.2). */
+    verifyCaveGlobalChallenge: {
+      name: "VerifyCaveGlobalChallenge",
+      requestType: VerifyCaveGlobalChallengeRequest as typeof VerifyCaveGlobalChallengeRequest,
+      requestStream: false,
+      responseType: CaveVerdict as typeof CaveVerdict,
+      responseStream: false,
+      options: {},
+    },
+    /** Verifies a CAVE unique-challenge AUTHU against the stored SSD (C.S0005-E §2.3.12.1.4). */
+    verifyCaveUniqueChallenge: {
+      name: "VerifyCaveUniqueChallenge",
+      requestType: VerifyCaveUniqueChallengeRequest as typeof VerifyCaveUniqueChallengeRequest,
+      requestStream: false,
+      responseType: CaveVerdict as typeof CaveVerdict,
+      responseStream: false,
+      options: {},
+    },
+    /** Starts an SSD update and returns the RANDSSD to send to the MS (C.S0005-E §2.3.12.1.5). */
+    beginCaveSsdUpdate: {
+      name: "BeginCaveSsdUpdate",
+      requestType: BeginCaveSsdUpdateRequest as typeof BeginCaveSsdUpdateRequest,
+      requestStream: false,
+      responseType: BeginCaveSsdUpdateResponse as typeof BeginCaveSsdUpdateResponse,
+      responseStream: false,
+      options: {},
+    },
+    /** Computes AUTHBS over the pending SSD for a Base Station Challenge. */
+    caveBaseStationChallenge: {
+      name: "CaveBaseStationChallenge",
+      requestType: CaveBaseStationChallengeRequest as typeof CaveBaseStationChallengeRequest,
+      requestStream: false,
+      responseType: CaveBaseStationChallengeResponse as typeof CaveBaseStationChallengeResponse,
+      responseStream: false,
+      options: {},
+    },
+    /** Commits or abandons the pending SSD update. */
+    finishCaveSsdUpdate: {
+      name: "FinishCaveSsdUpdate",
+      requestType: FinishCaveSsdUpdateRequest as typeof FinishCaveSsdUpdateRequest,
+      requestStream: false,
+      responseType: Empty as typeof Empty,
+      responseStream: false,
+      options: {},
+    },
+    /** Increments COUNT after the MS confirms a Parameter Update (C.S0005-E §2.3.12.1.3). */
+    incrementCaveCount: {
+      name: "IncrementCaveCount",
+      requestType: IncrementCaveCountRequest as typeof IncrementCaveCountRequest,
+      requestStream: false,
+      responseType: IncrementCaveCountResponse as typeof IncrementCaveCountResponse,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * Starts an OTASP A-key exchange (C.S0016-D §5.2, §5.4) and returns the values for the
+     * MS Key Request and Key Generation Request.
+     */
+    beginCaveKeyExchange: {
+      name: "BeginCaveKeyExchange",
+      requestType: BeginCaveKeyExchangeRequest as typeof BeginCaveKeyExchangeRequest,
+      requestStream: false,
+      responseType: BeginCaveKeyExchangeResponse as typeof BeginCaveKeyExchangeResponse,
+      responseStream: false,
+      options: {},
+    },
+    /** Derives the A-key from the mobile's MS_RESULT and holds it until commit. */
+    completeCaveKeyExchange: {
+      name: "CompleteCaveKeyExchange",
+      requestType: CompleteCaveKeyExchangeRequest as typeof CompleteCaveKeyExchangeRequest,
+      requestStream: false,
+      responseType: Empty as typeof Empty,
+      responseStream: false,
+      options: {},
+    },
+    /** Makes the exchanged A-key and its SSD current after the mobile commits. */
+    commitCaveKey: {
+      name: "CommitCaveKey",
+      requestType: CaveKeyIdentityRequest as typeof CaveKeyIdentityRequest,
+      requestStream: false,
+      responseType: Empty as typeof Empty,
+      responseStream: false,
+      options: {},
+    },
+    /** Discards an uncommitted key exchange. */
+    abortCaveKeyExchange: {
+      name: "AbortCaveKeyExchange",
+      requestType: CaveKeyIdentityRequest as typeof CaveKeyIdentityRequest,
+      requestStream: false,
+      responseType: Empty as typeof Empty,
+      responseStream: false,
+      options: {},
+    },
     /**
      * --- OTASP session history ---
      * Persists a completed OTASP session.
@@ -13711,6 +15294,56 @@ export interface HlrServiceImplementation<CallContextExt = {}> {
     request: GetSubscriberAuthStateRequest,
     context: CallContext & CallContextExt,
   ): Promise<DeepPartial<GetSubscriberAuthStateResponse>>;
+  /** Verifies a CAVE global-challenge AUTHR against the stored SSD (C.S0004-E §2.1.1.1.2). */
+  verifyCaveGlobalChallenge(
+    request: VerifyCaveGlobalChallengeRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<CaveVerdict>>;
+  /** Verifies a CAVE unique-challenge AUTHU against the stored SSD (C.S0005-E §2.3.12.1.4). */
+  verifyCaveUniqueChallenge(
+    request: VerifyCaveUniqueChallengeRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<CaveVerdict>>;
+  /** Starts an SSD update and returns the RANDSSD to send to the MS (C.S0005-E §2.3.12.1.5). */
+  beginCaveSsdUpdate(
+    request: BeginCaveSsdUpdateRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<BeginCaveSsdUpdateResponse>>;
+  /** Computes AUTHBS over the pending SSD for a Base Station Challenge. */
+  caveBaseStationChallenge(
+    request: CaveBaseStationChallengeRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<CaveBaseStationChallengeResponse>>;
+  /** Commits or abandons the pending SSD update. */
+  finishCaveSsdUpdate(
+    request: FinishCaveSsdUpdateRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<Empty>>;
+  /** Increments COUNT after the MS confirms a Parameter Update (C.S0005-E §2.3.12.1.3). */
+  incrementCaveCount(
+    request: IncrementCaveCountRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<IncrementCaveCountResponse>>;
+  /**
+   * Starts an OTASP A-key exchange (C.S0016-D §5.2, §5.4) and returns the values for the
+   * MS Key Request and Key Generation Request.
+   */
+  beginCaveKeyExchange(
+    request: BeginCaveKeyExchangeRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<BeginCaveKeyExchangeResponse>>;
+  /** Derives the A-key from the mobile's MS_RESULT and holds it until commit. */
+  completeCaveKeyExchange(
+    request: CompleteCaveKeyExchangeRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<Empty>>;
+  /** Makes the exchanged A-key and its SSD current after the mobile commits. */
+  commitCaveKey(request: CaveKeyIdentityRequest, context: CallContext & CallContextExt): Promise<DeepPartial<Empty>>;
+  /** Discards an uncommitted key exchange. */
+  abortCaveKeyExchange(
+    request: CaveKeyIdentityRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<Empty>>;
   /**
    * --- OTASP session history ---
    * Persists a completed OTASP session.
@@ -13872,6 +15505,56 @@ export interface HlrServiceClient<CallOptionsExt = {}> {
     request: DeepPartial<GetSubscriberAuthStateRequest>,
     options?: CallOptions & CallOptionsExt,
   ): Promise<GetSubscriberAuthStateResponse>;
+  /** Verifies a CAVE global-challenge AUTHR against the stored SSD (C.S0004-E §2.1.1.1.2). */
+  verifyCaveGlobalChallenge(
+    request: DeepPartial<VerifyCaveGlobalChallengeRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<CaveVerdict>;
+  /** Verifies a CAVE unique-challenge AUTHU against the stored SSD (C.S0005-E §2.3.12.1.4). */
+  verifyCaveUniqueChallenge(
+    request: DeepPartial<VerifyCaveUniqueChallengeRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<CaveVerdict>;
+  /** Starts an SSD update and returns the RANDSSD to send to the MS (C.S0005-E §2.3.12.1.5). */
+  beginCaveSsdUpdate(
+    request: DeepPartial<BeginCaveSsdUpdateRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<BeginCaveSsdUpdateResponse>;
+  /** Computes AUTHBS over the pending SSD for a Base Station Challenge. */
+  caveBaseStationChallenge(
+    request: DeepPartial<CaveBaseStationChallengeRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<CaveBaseStationChallengeResponse>;
+  /** Commits or abandons the pending SSD update. */
+  finishCaveSsdUpdate(
+    request: DeepPartial<FinishCaveSsdUpdateRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<Empty>;
+  /** Increments COUNT after the MS confirms a Parameter Update (C.S0005-E §2.3.12.1.3). */
+  incrementCaveCount(
+    request: DeepPartial<IncrementCaveCountRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<IncrementCaveCountResponse>;
+  /**
+   * Starts an OTASP A-key exchange (C.S0016-D §5.2, §5.4) and returns the values for the
+   * MS Key Request and Key Generation Request.
+   */
+  beginCaveKeyExchange(
+    request: DeepPartial<BeginCaveKeyExchangeRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<BeginCaveKeyExchangeResponse>;
+  /** Derives the A-key from the mobile's MS_RESULT and holds it until commit. */
+  completeCaveKeyExchange(
+    request: DeepPartial<CompleteCaveKeyExchangeRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<Empty>;
+  /** Makes the exchanged A-key and its SSD current after the mobile commits. */
+  commitCaveKey(request: DeepPartial<CaveKeyIdentityRequest>, options?: CallOptions & CallOptionsExt): Promise<Empty>;
+  /** Discards an uncommitted key exchange. */
+  abortCaveKeyExchange(
+    request: DeepPartial<CaveKeyIdentityRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<Empty>;
   /**
    * --- OTASP session history ---
    * Persists a completed OTASP session.

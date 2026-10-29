@@ -79,12 +79,8 @@ pub(super) fn cam_radio_config(
 struct Session {
     walsh_code: u8,
     esn: u32,
-    /// Long code generator, stored at reservation time and consumed when
-    /// the traffic channel is committed (after ECAM decode).
     lc_gen: Option<LongCodeGenerator>,
-    /// `true` once the forward TX channel + reverse RX have been created
-    /// (i.e. after ECAM/CAM decode). Before that, only the walsh code is
-    /// reserved.
+    privacy: Option<Arc<cdma_common::phy::long_code_privacy::LongCodePrivacy>>,
     committed: bool,
     setup: TrafficSetupProcedure,
     release: TrafficReleaseProcedure,
@@ -485,10 +481,27 @@ impl AbisAgent {
             })
             .unwrap_or(0);
 
-        let lc_gen = LongCodeGenerator::new_traffic_channel(esn);
+        let mut lc_gen = LongCodeGenerator::new_traffic_channel(esn);
+        let private_mask = match setup
+            .privacy_info
+            .as_ref()
+            .map(|info| info.private_long_code_mask())
+            .transpose()
+        {
+            Ok(mask) => mask.flatten(),
+            Err(error) => {
+                warn!("BTS: invalid Privacy Info: {error}");
+                return;
+            }
+        };
+        let privacy = private_mask.map(|mask| {
+            Arc::new(cdma_common::phy::long_code_privacy::LongCodePrivacy::new(
+                lc_gen.mask(),
+                mask,
+            ))
+        });
+        lc_gen = lc_gen.with_privacy(privacy.clone());
 
-        // Phase 1: reserve walsh code only — the actual TX/RX channel is
-        // created later when the ECAM arrives via PchMessageTransfer.
         let Some(walsh_code) = self.controller.reserve_walsh() else {
             warn!("abis_agent: no Walsh codes available for CCR {:?}", ccr);
             return;
@@ -556,6 +569,7 @@ impl AbisAgent {
                             walsh_code,
                             esn,
                             lc_gen: Some(lc_gen),
+                            privacy,
                             committed: false,
                             setup: setup_proc,
                             release: TrafficReleaseProcedure::new(ccr),
@@ -1095,6 +1109,7 @@ impl AbisAgent {
         }
 
         let rx_request = super::handle::TrafficRxRequest {
+            long_code_privacy: session.privacy.clone(),
             walsh_code,
             esn: session.esn,
             assigned_rev_rc: rev_rc,
@@ -1416,6 +1431,7 @@ mod tests {
             traffic_voice_bits: None,
             traffic_voice_rate_bps: None,
             raw_pdu_bits: None,
+            authentication: None,
         }
     }
 

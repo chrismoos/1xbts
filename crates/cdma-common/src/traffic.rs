@@ -4,6 +4,7 @@
 /// build the actual pipeline processors.
 #[derive(Debug, Clone)]
 pub struct TrafficRxRequest {
+    pub long_code_privacy: Option<std::sync::Arc<crate::phy::long_code_privacy::LongCodePrivacy>>,
     /// Walsh code assigned to this traffic channel.
     pub walsh_code: u8,
     /// Mobile ESN (used for LC mask).

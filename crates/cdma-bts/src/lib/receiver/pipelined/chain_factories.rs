@@ -39,6 +39,8 @@ const REVERSE_ACCESS_MAX_FINGERS: usize = 10;
 
 /// Settings for building a reverse traffic channel receiver pipeline.
 pub struct ReverseTrafficSettings {
+    pub long_code_privacy:
+        Option<std::sync::Arc<cdma_common::phy::long_code_privacy::LongCodePrivacy>>,
     pub oversample: usize,
     /// Walsh code assigned to this traffic channel.
     pub walsh_code: u8,
@@ -367,11 +369,6 @@ pub fn traffic_channel_chain(
 /// receiver doc rather than the older access-derived RC1 path.
 pub fn reverse_traffic_chain(settings: ReverseTrafficSettings) -> Vec<PipelineProcessorShared> {
     let walsh_code = settings.walsh_code;
-    let expected_preamble_frames = settings
-        .preamble_num_pcgs
-        .map(|pcgs| ((pcgs.max(1)) + 15) / 16)
-        .unwrap_or(1);
-
     let snr_threshold = settings.snr_threshold.unwrap_or(20.0);
     let correlator = pn_lc_correlator::PnLcCorrelator::new(
         pn_lc_correlator::PnLcConfig::default_4x()
@@ -397,8 +394,17 @@ pub fn reverse_traffic_chain(settings: ReverseTrafficSettings) -> Vec<PipelinePr
             // RC1 has no pilot, so this keeps the prompt centered as the
             // sample clocks drift apart.
             .with_nonpilot_cfo_tracking(true),
-        LongCodeGenerator::new_traffic_channel(settings.esn),
-        Box::new(move || traffic_channel_chain(settings.esn, walsh_code, expected_preamble_frames)),
+        LongCodeGenerator::new_traffic_channel(settings.esn)
+            .with_privacy(settings.long_code_privacy.clone()),
+        Box::new(move || {
+            vec![
+                Box::new(
+                    Rc1ReverseTrafficDecoder::new(settings.esn)
+                        .with_long_code_privacy(settings.long_code_privacy.clone()),
+                ),
+                Box::new(TrafficChannelProcessor::new(walsh_code)),
+            ]
+        }),
     );
 
     vec![
@@ -437,8 +443,17 @@ pub fn reverse_traffic_chain_rc2(settings: ReverseTrafficSettings) -> Vec<Pipeli
             .with_epl_tracking(true)
             .with_epl_slew(false)
             .with_nonpilot_cfo_tracking(false),
-        LongCodeGenerator::new_traffic_channel(settings.esn),
-        Box::new(move || traffic_channel_chain_rc2(settings.esn, walsh_code)),
+        LongCodeGenerator::new_traffic_channel(settings.esn)
+            .with_privacy(settings.long_code_privacy.clone()),
+        Box::new(move || {
+            vec![
+                Box::new(
+                    Rc2TrafficFrameAligner::new(settings.esn)
+                        .with_long_code_privacy(settings.long_code_privacy.clone()),
+                ),
+                Box::new(TrafficChannelProcessor::new(walsh_code)),
+            ]
+        }),
     );
 
     vec![
@@ -498,7 +513,8 @@ pub fn reverse_traffic_chain_rc3(settings: ReverseTrafficSettings) -> Vec<Pipeli
             .with_rc3_pilot_gating_mode(rev_fch_gating_mode)
             // Without slewing, clock drift moves the despreader off the pilot.
             .with_epl_slew(settings.epl_pilot),
-        LongCodeGenerator::new_traffic_channel(settings.esn),
+        LongCodeGenerator::new_traffic_channel(settings.esn)
+            .with_privacy(settings.long_code_privacy.clone()),
         Box::new(move || {
             let pilot_detector = match preamble_pcgs {
                 Some(n) => rc3_pilot_detector::Rc3PilotDetector::with_min_pcgs(n),

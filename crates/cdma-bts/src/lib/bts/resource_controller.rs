@@ -1,18 +1,6 @@
-//! BTS-owned traffic resource controller.
-//!
-//! `TrafficResourceService` is the sole intended *mutator* of the BTS
-//! traffic-channel pool, the Walsh allocator, the reverse-traffic RX pool,
-//! and the RX-removal queue. It exists so the BSC stops touching those
-//! pools directly — instead the BSC calls into a `BtsControlClient` trait
-//! whose in-process implementation forwards to this controller.
-//!
-//! WS-0 PR2 scope: the controller is a thin façade that wraps the existing
-//! shared pool `Arc`s already exposed on `BtsHandle`. Both paths refer to
-//! the same underlying state for now (BTS internal TX/RX threads continue
-//! to read the pools via `BtsHandle`); a later PR will re-home pool
-//! ownership entirely inside the controller and remove the duplicate
-//! exposure on `BtsHandle`.
+//! BTS traffic resource ownership and per-channel long-code transition state.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -41,6 +29,7 @@ pub struct TrafficResourceService {
     traffic_rx_pool: TrafficRxPool,
     traffic_rx_removals: TrafficRxRemovals,
     power_control: BtsPowerControlRegistry,
+    privacy: Arc<Mutex<HashMap<u8, super::voice_privacy::ForwardPrivacy>>>,
 }
 
 impl TrafficResourceService {
@@ -59,6 +48,7 @@ impl TrafficResourceService {
             traffic_rx_pool,
             traffic_rx_removals,
             power_control,
+            privacy: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -71,6 +61,23 @@ impl TrafficResourceService {
             traffic_rx_pool: Arc::new(Mutex::new(Vec::new())),
             traffic_rx_removals: Arc::new(Mutex::new(Vec::new())),
             power_control: BtsPowerControlRegistry::default(),
+            privacy: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn long_code_privacy(
+        &self,
+        walsh_code: u8,
+    ) -> Option<Arc<cdma_common::phy::long_code_privacy::LongCodePrivacy>> {
+        self.privacy
+            .lock()
+            .get(&walsh_code)
+            .map(|observer| observer.privacy.clone())
+    }
+
+    pub(super) fn observe_forward_privacy(&self, walsh_code: u8, info_bits: &[u8]) {
+        if let Some(observer) = self.privacy.lock().get_mut(&walsh_code) {
+            observer.observe(info_bits);
         }
     }
 
@@ -92,6 +99,12 @@ impl TrafficResourceService {
         lc_generator: LongCodeGenerator,
         fpc_subchan_gain: u8,
     ) -> TrafficWalshChannel {
+        if let Some(privacy) = lc_generator.privacy() {
+            self.privacy.lock().insert(
+                walsh_code,
+                super::voice_privacy::ForwardPrivacy::new(privacy),
+            );
+        }
         commit_traffic_channel(
             &self.traffic_channels,
             walsh_code,
@@ -108,6 +121,12 @@ impl TrafficResourceService {
         lc_generator: LongCodeGenerator,
         fpc_subchan_gain: u8,
     ) -> TrafficWalshChannelRc2 {
+        if let Some(privacy) = lc_generator.privacy() {
+            self.privacy.lock().insert(
+                walsh_code,
+                super::voice_privacy::ForwardPrivacy::new(privacy),
+            );
+        }
         commit_traffic_channel_rc2(
             &self.traffic_channels,
             walsh_code,
@@ -124,6 +143,12 @@ impl TrafficResourceService {
         lc_generator: LongCodeGenerator,
         fpc_subchan_gain: u8,
     ) -> TrafficWalshChannelRc3 {
+        if let Some(privacy) = lc_generator.privacy() {
+            self.privacy.lock().insert(
+                walsh_code,
+                super::voice_privacy::ForwardPrivacy::new(privacy),
+            );
+        }
         commit_traffic_channel_rc3(
             &self.traffic_channels,
             walsh_code,
@@ -207,6 +232,7 @@ impl TrafficResourceService {
 
     /// Deallocate a forward traffic channel by Walsh code.
     pub fn deallocate_traffic(&self, walsh_code: u8) {
+        self.privacy.lock().remove(&walsh_code);
         deallocate_traffic_channel(&self.walsh_allocator, &self.traffic_channels, walsh_code);
         self.power_control.remove(walsh_code);
     }

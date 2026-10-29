@@ -394,12 +394,15 @@ impl Bsc {
         })
     }
 
-    /// Route a decoded MO SMS to the MSC via ADDS Transfer (access channel).
+    /// Route a decoded MO SMS to the MSC via ADDS Transfer. `access` is the
+    /// access-channel event that delivered it, whose authentication fields are
+    /// included (A.S0014-D §3.6.3). A traffic-channel SMS has none.
     pub(crate) fn route_decoded_mo_sms(
         &self,
         sms: &DecodedMoSms,
         fwd_addr: &MsAddress,
         raw_fields: &[u8],
+        access: Option<&cdma_common::events::AccessChannelEvent>,
     ) {
         info!(
             "BSC: routing MO SMS from {} to {} via ADDS Transfer",
@@ -412,6 +415,16 @@ impl Bsc {
             .map(cdma_ios::MobileIdentity::Imsi)
             .or_else(|| esn.map(cdma_ios::MobileIdentity::Esn))
             .unwrap_or_else(|| cdma_ios::MobileIdentity::Imsi("UNKNOWN".to_string()));
+        let challenge = access
+            .map(|event| {
+                super::a1::A1GlobalChallengeIes::from_event(
+                    event,
+                    self.config.bts.auth_mode(event.cell) != 0,
+                )
+            })
+            .unwrap_or_default();
+        let authentication_data = access
+            .and_then(|event| super::a1::dialed_auth_data(event, sms.destination_number.clone()));
         let transfer = cdma_ios::AddsTransferMessage {
             mobile_identity_imsi,
             adds_user_part: cdma_ios::AddsUserPart {
@@ -423,6 +436,12 @@ impl Bsc {
             cell_identifier: None,
             tag: None,
             service_option: None,
+            authentication_response_parameter: challenge.response,
+            authentication_confirmation_parameter: challenge.randc,
+            authentication_parameter_count: challenge.count,
+            authentication_challenge_parameter: challenge.challenge,
+            authentication_event: challenge.event,
+            authentication_data,
         };
         let client = self.a1.msc_client.clone();
         tokio::spawn(async move {
@@ -468,6 +487,12 @@ impl Bsc {
             cell_identifier: None,
             tag: None,
             service_option: None,
+            authentication_response_parameter: None,
+            authentication_confirmation_parameter: None,
+            authentication_parameter_count: None,
+            authentication_challenge_parameter: None,
+            authentication_event: None,
+            authentication_data: None,
         };
         let client = self.a1.msc_client.clone();
         tokio::spawn(async move {
@@ -529,6 +554,12 @@ impl Bsc {
             cell_identifier: None,
             tag: None,
             service_option: None,
+            authentication_response_parameter: None,
+            authentication_confirmation_parameter: None,
+            authentication_parameter_count: None,
+            authentication_challenge_parameter: None,
+            authentication_event: None,
+            authentication_data: None,
         };
         let client = self.a1.msc_client.clone();
         tokio::spawn(async move {
@@ -908,7 +939,7 @@ impl Bsc {
         });
         if let Some(mobile) = packet_mobile {
             // Packet assignment releases the MSC call context, so ADDS Transfer must carry identity.
-            self.route_decoded_mo_sms(&sms, &mobile.fwd_address, fields);
+            self.route_decoded_mo_sms(&sms, &mobile.fwd_address, fields, None);
         } else {
             self.send_traffic_mo_sms_to_msc(cell, walsh_code, fields);
         }

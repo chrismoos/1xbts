@@ -4457,6 +4457,7 @@ mod tests {
         // Build reverse traffic chain for RC3 mobile.
         // ESN=0x4CDC1D09 supports RC3 only (rev_rcs=[3,4,5]).
         let pipeline = super::reverse_traffic_chain_rc3(super::ReverseTrafficSettings {
+            long_code_privacy: None,
             oversample,
             walsh_code,
             esn,
@@ -4556,6 +4557,7 @@ mod tests {
 
         // EXACTLY match live BTS settings (cdma-bts bts/rx.rs ~line 663).
         let pipeline = super::reverse_traffic_chain_rc3(super::ReverseTrafficSettings {
+            long_code_privacy: None,
             oversample,
             walsh_code,
             esn,
@@ -5724,6 +5726,7 @@ mod tests {
         );
 
         let pipeline = super::reverse_traffic_chain_rc3(super::ReverseTrafficSettings {
+            long_code_privacy: None,
             oversample,
             walsh_code,
             esn,
@@ -6464,6 +6467,7 @@ mod tests {
             );
 
             let pipeline = super::reverse_traffic_chain(super::ReverseTrafficSettings {
+                long_code_privacy: None,
                 oversample,
                 walsh_code,
                 esn,
@@ -6797,6 +6801,7 @@ mod tests {
 
         let oversample = metadata.sample_rate_hz / metadata.chip_rate_hz;
         let pipeline = super::reverse_traffic_chain_rc2(super::ReverseTrafficSettings {
+            long_code_privacy: None,
             oversample,
             walsh_code: 12,
             esn: 0xC9A4_539E,

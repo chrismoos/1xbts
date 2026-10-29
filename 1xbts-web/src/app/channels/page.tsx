@@ -1,5 +1,6 @@
 "use client";
 
+import { VoicePrivacyIndicator } from "@/components/voice-privacy-indicator";
 import { Suspense, useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
@@ -22,6 +23,7 @@ interface ChannelMobile {
   signalPowerDb?: number;
   demodQualityPct?: number;
   voiceCallState?: string;
+  voicePrivacy?: string;
 }
 
 interface TrafficChannelPower {
@@ -406,6 +408,7 @@ function ChannelTable({
                       >
                         {ch.mobile.phoneNumber || ch.mobile.address}
                       </Link>
+                      <VoicePrivacyIndicator status={ch.mobile.voicePrivacy} />
                       {ch.mobile.voiceCallState && (
                         <span className={`text-[10px] px-1.5 py-0.5 rounded ${
                           ch.mobile.voiceCallState === "Connected" ? "bg-badge-green-bg text-badge-green-text" :

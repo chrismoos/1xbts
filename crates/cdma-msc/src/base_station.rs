@@ -256,6 +256,7 @@ pub struct BaseStations {
     calls: Mutex<CallMap>,
     events_tx: mpsc::Sender<A1Event>,
     events_rx: tokio::sync::Mutex<mpsc::Receiver<A1Event>>,
+    global_challenge: std::sync::atomic::AtomicBool,
 }
 
 impl BaseStations {
@@ -280,7 +281,18 @@ impl BaseStations {
             calls: Mutex::new(CallMap::default()),
             events_tx,
             events_rx: tokio::sync::Mutex::new(events_rx),
+            global_challenge: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    pub fn set_global_challenge(&self, enabled: bool) {
+        self.global_challenge
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn global_challenge(&self) -> bool {
+        self.global_challenge
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Start one attach task per configured node. Each runs until the
@@ -536,7 +548,7 @@ async fn attach_once(endpoint: &str, nodes: &Arc<BaseStations>) -> Result<Detach
         .connect()
         .await?;
     let mut client = BaseStationServiceClient::new(channel);
-    let enrolled = enroll(&mut client).await?;
+    let enrolled = enroll(&mut client, nodes.global_challenge()).await?;
     nodes.record_enrollment(
         endpoint,
         enrolled.node_id.clone(),
@@ -576,7 +588,7 @@ async fn attach_once(endpoint: &str, nodes: &Arc<BaseStations>) -> Result<Detach
                 None => break "A1 link closed",
             },
             _ = tokio::time::sleep(LIVENESS_POLL) => {
-                match tokio::time::timeout(OAM_REQUEST_TIMEOUT, enroll(&mut client)).await {
+                match tokio::time::timeout(OAM_REQUEST_TIMEOUT, enroll(&mut client, nodes.global_challenge())).await {
                     Ok(Ok(refreshed)) => nodes.refresh_cells(endpoint, refreshed.cells),
                     Ok(Err(error)) => {
                         warn!("MSC: base station {node} stopped answering its management plane: {error}");
@@ -617,8 +629,12 @@ struct Enrolled {
 
 async fn enroll(
     client: &mut BaseStationServiceClient<tonic::transport::Channel>,
+    global_challenge: bool,
 ) -> Result<Enrolled, AttachError> {
-    let response = client.enroll(EnrollRequest {}).await?.into_inner();
+    let response = client
+        .enroll(EnrollRequest { global_challenge })
+        .await?
+        .into_inner();
     if response.node_id.is_empty() {
         return Err("enrollment carried no node id".into());
     }

@@ -3,6 +3,7 @@ pub mod bearer_agent;
 pub mod bearer_transport_service;
 pub mod config;
 pub mod evdo;
+pub mod global_challenge;
 pub mod handle;
 pub mod hrpd;
 pub mod hrpd_an;
@@ -1572,3 +1573,5 @@ mod tests {
         );
     }
 }
+
+mod voice_privacy;

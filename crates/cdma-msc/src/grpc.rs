@@ -99,6 +99,7 @@ use msc_management::v1::msc_management_service_server::MscManagementService;
 pub struct MscManagementServiceImpl {
     mgmt_tx: tokio::sync::mpsc::Sender<crate::management::PendingControlRequest>,
     otasp_event_tx: Option<tokio::sync::broadcast::Sender<events_proto::v1::MscNetworkEvent>>,
+    authentication_history: Option<std::sync::Arc<crate::authentication::AuthenticationHistory>>,
     base_stations: Option<std::sync::Arc<crate::base_station::BaseStations>>,
 }
 
@@ -110,6 +111,7 @@ impl MscManagementServiceImpl {
         Self {
             mgmt_tx,
             otasp_event_tx: None,
+            authentication_history: None,
             base_stations: None,
         }
     }
@@ -131,6 +133,9 @@ impl MscManagementServiceImpl {
         mut self,
         event_tx: tokio::sync::broadcast::Sender<events_proto::v1::MscNetworkEvent>,
     ) -> Self {
+        self.authentication_history = Some(
+            crate::authentication::AuthenticationHistory::recording(&event_tx),
+        );
         self.otasp_event_tx = Some(event_tx);
         self
     }
@@ -283,6 +288,19 @@ impl MscManagementService for MscManagementServiceImpl {
             }
         };
         Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn list_authentication_events(
+        &self,
+        request: Request<mgmt_proto::ListAuthenticationEventsRequest>,
+    ) -> Result<Response<mgmt_proto::AuthenticationEventList>, Status> {
+        let Some(history) = self.authentication_history.as_ref() else {
+            return Err(Status::unavailable("authentication history not configured"));
+        };
+        let request = request.into_inner();
+        Ok(Response::new(mgmt_proto::AuthenticationEventList {
+            events: history.matching(&request.imsis, request.esn, request.limit as usize),
+        }))
     }
 
     async fn list_calls(&self, _: Request<()>) -> Result<Response<CallList>, Status> {

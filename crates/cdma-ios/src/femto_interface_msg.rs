@@ -40,6 +40,10 @@ pub const MSG_TYPE_ADDS_PAGE: u8 = 0x65;
 pub const MSG_TYPE_ADDS_PAGE_ACK: u8 = 0x66;
 pub const MSG_TYPE_ADDS_TRANSFER: u8 = 0x67;
 pub const MSG_TYPE_ADDS_TRANSFER_ACK: u8 = 0x68;
+/// A.S0014-D §3.3.12 and §3.3.13.
+pub const MSG_TYPE_PRIVACY_MODE_COMMAND: u8 = 0x53;
+pub const MSG_TYPE_PRIVACY_MODE_COMPLETE: u8 = 0x55;
+pub const IE_VOICE_PRIVACY_REQUEST: u8 = 0xa1;
 pub const MSG_TYPE_PAGING_RESPONSE: u8 = 0x27;
 /// BSMAP Message Type Values this stack observes but does not carry over Fx2.
 /// Named here so an A1 message seen at the MSC boundary still logs by name
@@ -121,6 +125,8 @@ pub fn message_type_name(
     }
     let bsmap = matches!(discriminator, Some(Discriminator::Bsmap));
     Some(match (message_type, bsmap) {
+        (MSG_TYPE_PRIVACY_MODE_COMMAND, true) => "Privacy Mode Command",
+        (MSG_TYPE_PRIVACY_MODE_COMPLETE, true) => "Privacy Mode Complete",
         (MSG_TYPE_ASSIGNMENT_REQUEST, true) => "Assignment Request",
         (MSG_TYPE_CLEAR_COMMAND, true) => "Clear Command",
         (MSG_TYPE_CLEAR_COMPLETE, true) => "Clear Complete",
@@ -492,6 +498,38 @@ impl FemtoInterfaceMsg {
             message_type: MSG_TYPE_LOCATION_UPDATING_ACCEPT,
             discriminator: Some(Discriminator::Dtap),
             message_name: Some("Location Updating Accept".to_string()),
+            ies,
+        })
+    }
+
+    pub fn from_privacy_mode_command(msg: &crate::PrivacyModeCommandMessage) -> Result<Self> {
+        Ok(Self {
+            message_type: MSG_TYPE_PRIVACY_MODE_COMMAND,
+            discriminator: Some(Discriminator::Bsmap),
+            message_name: Some("Privacy Mode Command".to_string()),
+            ies: vec![FemtoIe::tlv(
+                IE_ENCRYPTION_INFORMATION,
+                &msg.encryption_information.encode()?,
+            )?],
+        })
+    }
+
+    pub fn from_privacy_mode_complete(msg: &crate::PrivacyModeCompleteMessage) -> Result<Self> {
+        msg.encode()?;
+        let mut ies = Vec::new();
+        if let Some(info) = &msg.encryption_information {
+            ies.push(FemtoIe::tlv(IE_ENCRYPTION_INFORMATION, &info.encode()?)?);
+        }
+        if msg.voice_privacy_request {
+            ies.push(FemtoIe {
+                iei: IE_VOICE_PRIVACY_REQUEST,
+                content: vec![IE_VOICE_PRIVACY_REQUEST],
+            });
+        }
+        Ok(Self {
+            message_type: MSG_TYPE_PRIVACY_MODE_COMPLETE,
+            discriminator: Some(Discriminator::Bsmap),
+            message_name: Some("Privacy Mode Complete".to_string()),
             ies,
         })
     }

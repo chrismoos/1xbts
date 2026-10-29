@@ -147,6 +147,10 @@ impl MtSetupError {
     }
 }
 
+/// A.S0014-D Table 4.2.34-1 Reject Cause `03H` Illegal MS.
+const REJECT_CAUSE_ILLEGAL_MS: u8 = 0x03;
+const SIP_STATUS_FORBIDDEN: u16 = 403;
+
 /// Configuration for the MSC runtime.
 pub struct MscRuntimeConfig {
     /// HLR repository for subscriber lookups.
@@ -184,6 +188,7 @@ pub struct MscRuntimeConfig {
     pub sms_retry: crate::config::SmsRetryConfig,
     /// OTASP configuration. `None` disables OTASP entirely.
     pub otasp: Option<crate::config::OtaspConfig>,
+    pub authentication: crate::authentication::AuthenticationConfig,
 }
 
 impl MscRuntimeConfig {
@@ -227,11 +232,14 @@ impl MscRuntimeConfig {
             } else {
                 None
             },
+            authentication: config.authentication.clone(),
         }
     }
 }
 
-/// MSC runtime that processes A1 and management events.
+/// A.S0014-D Table 5.2-1 T3280 default, in seconds.
+const PRIVACY_MODE_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub struct MscRuntime {
     pub(crate) controller: MscCallController,
     pub(crate) config: MscRuntimeConfig,
@@ -252,6 +260,28 @@ pub struct MscRuntime {
     pub(crate) deliveries: Option<crate::sms_delivery::DeliveryLink>,
     pub(crate) pending_sms_traffic:
         std::collections::HashMap<CallId, crate::sms::SmsTrafficDelivery>,
+    pub(crate) call_keys: std::collections::HashMap<CallId, cdma_hlr::auth::CallKeyMaterial>,
+    privacy_deadlines: std::collections::HashMap<CallId, tokio::time::Instant>,
+    pending_privacy: std::collections::HashMap<CallId, cdma_ios::EncryptionInformation>,
+    privacy_authenticated: std::collections::HashSet<CallId>,
+    traffic_auth_started: std::collections::HashSet<CallId>,
+    pub(crate) call_auth_context:
+        std::collections::HashMap<CallId, crate::authentication::CallAuthContext>,
+    pub(crate) traffic_auth:
+        std::collections::HashMap<CallId, crate::authentication::TrafficAuthentication>,
+    /// Calls that failed the global challenge and must pass an SSD update and
+    /// unique challenge on their traffic channel before they connect.
+    pub(crate) pending_ssd_calls: std::collections::HashSet<CallId>,
+    pub(crate) held_assignments: std::collections::HashMap<CallId, HeldAssignment>,
+    /// The mobile a held call dials, paged only once the call passes.
+    pub(crate) held_m2m_callees:
+        std::collections::HashMap<CallId, (cdma_hlr::model::ResolvedSubscriber, Option<String>)>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HeldAssignment {
+    completed_circuit_id: Option<u16>,
+    completed_leg: Option<MscVoiceLeg>,
 }
 
 async fn recv_delivery(
@@ -271,6 +301,8 @@ pub(crate) struct PendingOtaspOrigination {
     /// voice). Per C.S0016-D §3.2.1, user-initiated OTASP rides a vendor-
     /// chosen voice/data SO, NOT SO 18.
     pub service_option: u16,
+    /// Whether the `*228` origination verified. None when it was not authenticated.
+    pub origination_verified: Option<bool>,
 }
 
 impl MscRuntime {
@@ -324,7 +356,725 @@ impl MscRuntime {
             pending_otasp_originations: std::collections::HashMap::new(),
             deliveries: None,
             pending_sms_traffic: std::collections::HashMap::new(),
+            call_keys: std::collections::HashMap::new(),
+            privacy_deadlines: std::collections::HashMap::new(),
+            pending_privacy: std::collections::HashMap::new(),
+            privacy_authenticated: std::collections::HashSet::new(),
+            traffic_auth_started: std::collections::HashSet::new(),
+            call_auth_context: std::collections::HashMap::new(),
+            traffic_auth: std::collections::HashMap::new(),
+            pending_ssd_calls: std::collections::HashSet::new(),
+            held_assignments: std::collections::HashMap::new(),
+            held_m2m_callees: std::collections::HashMap::new(),
         }
+    }
+
+    async fn continue_assignment_complete(
+        &mut self,
+        a1: &dyn MscA1Endpoint,
+        call_id: CallId,
+        completed_circuit_id: Option<u16>,
+        completed_leg: Option<MscVoiceLeg>,
+    ) {
+        if let Some(call) = self.circuits.m2m_calls.get(&call_id).copied() {
+            if completed_circuit_id.is_some() {
+                self.complete_m2m_assignment(a1, call, call_id).await;
+            }
+            return;
+        }
+        if completed_circuit_id
+            .and_then(|cid| self.circuits.circuits.get(&cid))
+            .is_some_and(|session| {
+                session.audio_file.is_some()
+                    && session.peer_circuit_id.is_none()
+                    && session.media_gateway_handle.is_none()
+                    && self
+                        .controller
+                        .snapshot(session.call_id)
+                        .is_some_and(|snapshot| {
+                            snapshot.direction == CallDirection::MobileOriginated
+                        })
+            })
+        {
+            self.media.schedule_delayed_wav_start(
+                call_id,
+                self.config.local_answer_delay_ms,
+                &self.controller,
+                &self.circuits,
+                self.config.voice_bearer.as_ref(),
+                self.config.media_ringback_enabled,
+                self.config.media_ringback_type,
+                Some(&self.config.hlr_repo),
+            );
+        } else if completed_leg == Some(MscVoiceLeg::Primary) && !self.config.sip_ringback_disable {
+            // `sip_ringback_disable=true` keeps the bearer silent so
+            // the BSC's bearer-flow → tones-off doesn't fire before
+            // SIP audio arrives.
+            self.media.start_ringback_for_call(
+                call_id,
+                &self.controller,
+                &self.circuits,
+                self.config.voice_bearer.as_ref(),
+                self.config.media_ringback_enabled,
+                self.config.media_ringback_type,
+                Some(&self.config.hlr_repo),
+            );
+        }
+        self.flush_deferred_paging_response(a1, call_id).await;
+        if completed_leg == Some(MscVoiceLeg::Primary)
+            && self
+                .controller
+                .snapshot(call_id)
+                .is_some_and(|snapshot| snapshot.direction == CallDirection::MobileOriginated)
+        {
+            self.fire_deferred_sip_invite(a1, call_id).await;
+        }
+        self.media_gw
+            .flush_pending_post_assignment(
+                a1,
+                call_id,
+                &mut self.controller,
+                self.config.send_tones_alert,
+            )
+            .await;
+
+        self.fire_assignment_complete_awi(a1, call_id, completed_leg)
+            .await;
+
+        // Sending 180 after 183 with early media can make the trunk replace MSC audio with local ringback.
+        if let Some(meta) = self.media_gw.inbound_session_for_call(call_id).cloned()
+            && !meta.progress_sent
+            && !self.config.inbound_sip_msc_ringback
+        {
+            if let Some(session_id) = self.media_gw.inbound_by_call.get(&call_id).cloned() {
+                if let Some(gateway) = self.config.media_gateway.clone() {
+                    if let Err(error) = gateway.inbound_progress(&session_id).await {
+                        warn!("MSC: inbound_progress failed for session={session_id}: {error}");
+                    }
+                }
+            }
+            self.media_gw.mark_inbound_progress_sent(call_id);
+        }
+    }
+
+    /// Holds a call that failed the global challenge until an SSD update and a
+    /// unique challenge on its traffic channel pass.
+    async fn hold_until_authenticated(
+        &mut self,
+        a1: &dyn MscA1Endpoint,
+        node: &BaseStationId,
+        call_id: CallId,
+        held: HeldAssignment,
+    ) {
+        self.start_traffic_authentication(a1, node, call_id).await;
+        if !self.traffic_auth.contains_key(&call_id) {
+            warn!(
+                "MSC: call_id={} failed authentication and no SSD update could start, clearing",
+                call_id.0
+            );
+            self.send_clear_command(a1, call_id).await;
+            return;
+        }
+        info!(
+            "MSC: call_id={} held until the SSD update and unique challenge pass",
+            call_id.0
+        );
+        self.held_assignments.insert(call_id, held);
+    }
+
+    fn assignment_privacy(
+        &mut self,
+        call_id: CallId,
+        handset_requested: bool,
+    ) -> Option<cdma_ios::EncryptionInformation> {
+        self.pending_privacy.remove(&call_id);
+        let info = self
+            .config
+            .authentication
+            .voice_privacy
+            .encryption_information(self.call_keys.get(&call_id), handset_requested)?;
+        let parameters = info.private_long_code_parameter().ok().flatten()?;
+        // The private-code request must follow traffic authentication so the handset selects the current call's mask.
+        if parameters.active && !self.privacy_authenticated.contains(&call_id) {
+            self.pending_privacy.insert(call_id, info);
+            cdma_ios::EncryptionInformation::private_long_code(parameters.mask, false).ok()
+        } else {
+            Some(info)
+        }
+    }
+
+    async fn send_privacy_command(
+        &mut self,
+        a1: &dyn MscA1Endpoint,
+        call_id: CallId,
+        info: cdma_ios::EncryptionInformation,
+    ) {
+        let command = cdma_ios::PrivacyModeCommandMessage {
+            encryption_information: info,
+        };
+        let payload = match command.encode() {
+            Ok(payload) => payload,
+            Err(error) => {
+                warn!("MSC: failed to encode Privacy Mode Command: {error}");
+                return;
+            }
+        };
+        let message = cdma_ios::Message::new(cdma_ios::MessageType::PrivacyModeCommand, payload);
+        match a1
+            .send(EncodedA1Message::from_message_for_call(
+                &message,
+                Some(call_id.0),
+            ))
+            .await
+        {
+            Ok(()) => {
+                info!("MSC: A1 tx PrivacyModeCommand call_id={}", call_id.0);
+                self.privacy_deadlines
+                    .insert(call_id, tokio::time::Instant::now() + PRIVACY_MODE_TIMEOUT);
+            }
+            Err(error) => warn!(
+                "MSC: failed to send Privacy Mode Command call_id={}: {error}",
+                call_id.0
+            ),
+        }
+    }
+
+    async fn start_traffic_authentication(
+        &mut self,
+        a1: &dyn MscA1Endpoint,
+        node: &BaseStationId,
+        call_id: CallId,
+    ) {
+        if self.traffic_auth.contains_key(&call_id)
+            || (self.traffic_auth_started.contains(&call_id)
+                && !self.pending_privacy.contains_key(&call_id))
+        {
+            return;
+        }
+        let Some(context) = self.call_auth_context.get(&call_id).cloned() else {
+            return;
+        };
+        let ssd_unset = match self
+            .config
+            .hlr_repo
+            .get_subscriber_auth_state(&context.identity)
+            .await
+        {
+            Ok(Some(state)) => state.credentials_provisioned && !state.ssd_provisioned,
+            Ok(None) => false,
+            Err(error) => {
+                warn!("MSC: HLR auth state lookup failed: {error}");
+                false
+            }
+        };
+        let mut authentication = self.config.authentication.clone();
+        authentication.unique_challenge_on_call |= self.pending_privacy.contains_key(&call_id);
+        let Some(mut procedures) = crate::authentication::TrafficAuthentication::plan(
+            &authentication,
+            context,
+            node.0.clone(),
+            ssd_unset,
+        ) else {
+            return;
+        };
+        let action = procedures
+            .advance(&self.config.authentication, self.config.hlr_repo.as_ref())
+            .await;
+        self.traffic_auth_started.insert(call_id);
+        self.traffic_auth.insert(call_id, procedures);
+        self.apply_traffic_action(a1, call_id, action).await;
+    }
+
+    async fn apply_traffic_action(
+        &mut self,
+        a1: &dyn MscA1Endpoint,
+        call_id: CallId,
+        mut action: crate::authentication::TrafficAction,
+    ) {
+        use crate::authentication::TrafficAction;
+        loop {
+            match action {
+                TrafficAction::Send(message_type, payload) => {
+                    info!("MSC: A1 tx {:?} call_id={}", message_type, call_id.0);
+                    if let Err(error) = a1
+                        .send(EncodedA1Message::from_message_for_call(
+                            &cdma_ios::Message::new(message_type, payload),
+                            Some(call_id.0),
+                        ))
+                        .await
+                    {
+                        warn!("MSC: failed to send {message_type:?}: {error}");
+                        self.traffic_auth.remove(&call_id);
+                    }
+                    return;
+                }
+                TrafficAction::Report {
+                    procedure,
+                    result,
+                    clear_call,
+                } => {
+                    let Some(entry) = self.traffic_auth.get_mut(&call_id) else {
+                        return;
+                    };
+                    let _ = self
+                        .otasp_event_tx
+                        .send(crate::authentication::authentication_event(
+                            procedure,
+                            result,
+                            clear_call,
+                            Some(&entry.context.imsi),
+                            Some(entry.context.esn),
+                            &entry.base_station,
+                        ));
+                    let held_failed = result
+                        != crate::grpc::events_proto::v1::AuthenticationResult::Success
+                        && matches!(
+                            procedure,
+                            crate::grpc::events_proto::v1::AuthenticationProcedure::SsdUpdate
+                                | crate::grpc::events_proto::v1::AuthenticationProcedure::UniqueChallenge
+                        )
+                        && self.held_assignments.contains_key(&call_id);
+                    if clear_call || held_failed {
+                        self.traffic_auth.remove(&call_id);
+                        self.held_assignments.remove(&call_id);
+                        self.send_clear_command(a1, call_id).await;
+                        return;
+                    }
+                    if procedure
+                        == crate::grpc::events_proto::v1::AuthenticationProcedure::SsdUpdate
+                        && self
+                            .otasp
+                            .as_ref()
+                            .is_some_and(|otasp| otasp.owns_call(call_id.0))
+                    {
+                        self.traffic_auth.remove(&call_id);
+                        let ok =
+                            result == crate::grpc::events_proto::v1::AuthenticationResult::Success;
+                        Box::pin(self.finish_otasp_ssd_update(a1, call_id, ok)).await;
+                        return;
+                    }
+                    if procedure
+                        == crate::grpc::events_proto::v1::AuthenticationProcedure::UniqueChallenge
+                    {
+                        if result == crate::grpc::events_proto::v1::AuthenticationResult::Success {
+                            self.privacy_authenticated.insert(call_id);
+                            if let Some(info) = self.pending_privacy.remove(&call_id) {
+                                self.send_privacy_command(a1, call_id, info).await;
+                            }
+                        } else if self.pending_privacy.remove(&call_id).is_some() {
+                            warn!(
+                                "MSC: voice privacy remains inactive after failed unique challenge call_id={}",
+                                call_id.0
+                            );
+                        }
+                    }
+                    let Some(entry) = self.traffic_auth.get_mut(&call_id) else {
+                        return;
+                    };
+                    action = entry
+                        .advance(&self.config.authentication, self.config.hlr_repo.as_ref())
+                        .await;
+                }
+                TrafficAction::Done => {
+                    let authentication_node = self
+                        .traffic_auth
+                        .get(&call_id)
+                        .map(|entry| BaseStationId(entry.base_station.clone()));
+                    if self
+                        .traffic_auth
+                        .get(&call_id)
+                        .is_some_and(|entry| entry.awaiting.is_none())
+                    {
+                        self.traffic_auth.remove(&call_id);
+                    }
+                    if self.pending_privacy.contains_key(&call_id)
+                        && !self.privacy_authenticated.contains(&call_id)
+                        && let Some(node) = authentication_node
+                    {
+                        Box::pin(self.start_traffic_authentication(a1, &node, call_id)).await;
+                    }
+                    if let Some(held) = self.held_assignments.remove(&call_id) {
+                        info!(
+                            "MSC: call_id={} passed the SSD update and unique challenge, connecting",
+                            call_id.0
+                        );
+                        if let Some((destination, calling_number)) =
+                            self.held_m2m_callees.remove(&call_id)
+                        {
+                            Box::pin(self.start_m2m_callee(
+                                a1,
+                                call_id,
+                                destination,
+                                calling_number,
+                            ))
+                            .await;
+                        }
+                        Box::pin(self.continue_assignment_complete(
+                            a1,
+                            call_id,
+                            held.completed_circuit_id,
+                            held.completed_leg,
+                        ))
+                        .await;
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn release_otasp_call(&mut self, a1: &dyn MscA1Endpoint, call_id_raw: u64) {
+        info!(
+            "MSC: OTASP session terminal — releasing call_id={}",
+            call_id_raw
+        );
+        send_gateway_clear_command(
+            a1,
+            CallId(call_id_raw),
+            &mut self.controller,
+            gateway_clear_cause(ReleaseCause::Administrative, None),
+        )
+        .await;
+    }
+
+    async fn start_otasp_ssd_updates(&mut self, a1: &dyn MscA1Endpoint) {
+        let Some(otasp) = self.otasp.as_mut() else {
+            return;
+        };
+        for update in otasp.take_ssd_updates() {
+            let call_id = CallId(update.call_id);
+            let mut procedures = crate::authentication::TrafficAuthentication::ssd_update_only(
+                update.context,
+                String::new(),
+            );
+            let action = procedures
+                .advance(&self.config.authentication, self.config.hlr_repo.as_ref())
+                .await;
+            self.traffic_auth.insert(call_id, procedures);
+            Box::pin(self.apply_traffic_action(a1, call_id, action)).await;
+        }
+    }
+
+    async fn finish_otasp_ssd_update(&mut self, a1: &dyn MscA1Endpoint, call_id: CallId, ok: bool) {
+        let Some(otasp) = self.otasp.as_mut() else {
+            return;
+        };
+        if let Some(release) = otasp.on_ssd_update_finished(call_id.0, ok, a1).await {
+            self.release_otasp_call(a1, release).await;
+        }
+    }
+
+    async fn tick_traffic_authentication(&mut self, a1: &dyn MscA1Endpoint) {
+        let expired: Vec<_> = self
+            .privacy_deadlines
+            .iter()
+            .filter(|(_, deadline)| **deadline <= tokio::time::Instant::now())
+            .map(|(id, _)| *id)
+            .collect();
+        for call_id in expired {
+            self.privacy_deadlines.remove(&call_id);
+            warn!(
+                "MSC: Privacy Mode Complete timed out, clearing call_id={}",
+                call_id.0
+            );
+            self.send_clear_command(a1, call_id).await;
+        }
+
+        let now = tokio::time::Instant::now();
+        let overdue: Vec<CallId> = self
+            .traffic_auth
+            .iter()
+            .filter(|(_, entry)| entry.awaiting.is_some() && entry.deadline <= now)
+            .map(|(call_id, _)| *call_id)
+            .collect();
+        for call_id in overdue {
+            let Some(entry) = self.traffic_auth.get_mut(&call_id) else {
+                continue;
+            };
+            let action = entry.on_timeout(self.config.hlr_repo.as_ref()).await;
+            self.apply_traffic_action(a1, call_id, action).await;
+        }
+    }
+
+    async fn handle_traffic_authentication_reply(
+        &mut self,
+        a1: &dyn MscA1Endpoint,
+        call_id: CallId,
+        message_type: cdma_ios::MessageType,
+        payload: &[u8],
+    ) {
+        let Some(entry) = self.traffic_auth.get_mut(&call_id) else {
+            warn!(
+                "MSC: {:?} for call_id={} with no authentication procedure running",
+                message_type, call_id.0
+            );
+            return;
+        };
+        let config = &self.config.authentication;
+        let hlr = self.config.hlr_repo.as_ref();
+        let action = match message_type {
+            cdma_ios::MessageType::BaseStationChallenge => {
+                match cdma_ios::BaseStationChallengeMessage::decode(payload) {
+                    Ok(message) => match message.authentication_challenge_parameter_randbs.randbs()
+                    {
+                        Some(randbs) => entry.on_base_station_challenge(config, hlr, randbs).await,
+                        None => {
+                            warn!("MSC: Base Station Challenge without RANDBS");
+                            return;
+                        }
+                    },
+                    Err(error) => {
+                        warn!("MSC: failed to decode Base Station Challenge: {error}");
+                        return;
+                    }
+                }
+            }
+            cdma_ios::MessageType::SsdUpdateResponse => {
+                match cdma_ios::SsdUpdateResponseMessage::decode(payload) {
+                    Ok(message) => {
+                        entry
+                            .on_ssd_update_response(hlr, message.cause_layer_3.is_none())
+                            .await
+                    }
+                    Err(error) => {
+                        warn!("MSC: failed to decode SSD Update Response: {error}");
+                        return;
+                    }
+                }
+            }
+            cdma_ios::MessageType::AuthenticationResponse => {
+                let authu = match cdma_ios::AuthenticationResponseMessage::decode(payload) {
+                    Ok(cdma_ios::AuthenticationResponseMessage::Dtap(message)) => {
+                        message.authentication_response_parameter_authu.signature()
+                    }
+                    Ok(cdma_ios::AuthenticationResponseMessage::Bsmap(message)) => {
+                        message.authentication_response_parameter_authu.signature()
+                    }
+                    Err(error) => {
+                        warn!("MSC: failed to decode Authentication Response: {error}");
+                        return;
+                    }
+                };
+                entry.on_authentication_response(config, hlr, authu).await
+            }
+            cdma_ios::MessageType::ParameterUpdateConfirm => {
+                entry.on_parameter_update_confirm(hlr).await
+            }
+            _ => return,
+        };
+        self.apply_traffic_action(a1, call_id, action).await;
+    }
+
+    /// Verifies the global challenge of an SMS sent on the access channel. A
+    /// rejected SMS is answered with an ADDS Transfer Ack carrying Cause
+    /// "Authentication failure" (A.S0014-D §3.6.4) and not delivered. Returns
+    /// true when the SMS may be delivered.
+    async fn authenticate_adds_transfer(
+        &mut self,
+        a1: &dyn MscA1Endpoint,
+        node: &BaseStationId,
+        msg: &cdma_ios::AddsTransferMessage,
+    ) -> bool {
+        let (imsi, esn, meid) = adds_transfer_identity(a1, node, msg);
+        let identity_key =
+            cdma_hlr::model::MobileIdentityKey::from_parts(imsi.as_deref(), esn, meid.as_deref())
+                .ok();
+        let destination = cdma_common::sms::decode_mo_sms(&msg.adds_user_part.data)
+            .map(|sms| sms.destination_number);
+        let subject = crate::authentication::AuthenticationSubject {
+            identity: identity_key.as_ref(),
+            imsi: imsi.as_deref(),
+            esn,
+            dialed_digits: destination.as_deref(),
+        };
+        let decision = self
+            .authenticate_access(
+                node,
+                crate::authentication::AuthenticationProcedure::DataBurst,
+                &subject,
+                &crate::authentication::GlobalChallengeIes::from_adds_transfer(msg),
+            )
+            .await;
+        if decision.allow {
+            return true;
+        }
+        let ack = cdma_ios::AddsTransferAckMessage {
+            mobile_identity_imsi: imsi
+                .map(cdma_ios::MobileIdentity::Imsi)
+                .unwrap_or_else(|| msg.mobile_identity_imsi.clone()),
+            tag: msg.tag,
+            cause: Some(cdma_ios::Cause(cdma_ios::CAUSE_AUTHENTICATION_FAILURE)),
+        };
+        match ack.encode() {
+            Ok(payload) => {
+                let message =
+                    cdma_ios::Message::new(cdma_ios::MessageType::AddsTransferAck, payload);
+                if let Err(error) = a1
+                    .send_to_node(
+                        node,
+                        EncodedA1Message::from_message_for_call(&message, None),
+                    )
+                    .await
+                {
+                    warn!("MSC: failed to send ADDS Transfer Ack: {error}");
+                }
+            }
+            Err(error) => warn!("MSC: failed to encode ADDS Transfer Ack: {error}"),
+        }
+        false
+    }
+
+    async fn authenticate_access(
+        &mut self,
+        node: &BaseStationId,
+        procedure: crate::authentication::AuthenticationProcedure,
+        subject: &crate::authentication::AuthenticationSubject<'_>,
+        ies: &crate::authentication::GlobalChallengeIes,
+    ) -> crate::authentication::AuthenticationDecision {
+        let decision = crate::authentication::authenticate(
+            &self.config.authentication,
+            self.config.hlr_repo.as_ref(),
+            procedure,
+            subject,
+            ies,
+        )
+        .await;
+        if let Some(event) = decision.to_event(subject, &node.0) {
+            let _ = self.otasp_event_tx.send(event);
+        }
+        decision
+    }
+
+    async fn reject_access_for_authentication(&mut self, a1: &dyn MscA1Endpoint, call_id: CallId) {
+        let clear_command = cdma_ios::ClearCommandMessage {
+            cause: cdma_ios::Cause(cdma_ios::CAUSE_AUTHENTICATION_FAILURE),
+            cause_layer3: None,
+        };
+        match clear_command.encode() {
+            Ok(payload) => {
+                if let Err(error) = a1
+                    .send(EncodedA1Message::from_message_for_call(
+                        &cdma_ios::Message::new(cdma_ios::MessageType::ClearCommand, payload),
+                        Some(call_id.0),
+                    ))
+                    .await
+                {
+                    warn!(
+                        "MSC: failed to send authentication-failure ClearCommand call_id={}: {}",
+                        call_id.0, error
+                    );
+                }
+            }
+            Err(error) => warn!("MSC: failed to encode ClearCommand: {error}"),
+        }
+        a1.release_call(call_id);
+    }
+
+    async fn record_mobile_contact(
+        &self,
+        node: &BaseStationId,
+        contact: MobileContact,
+        context: &str,
+    ) -> Option<RecordedContact> {
+        let hlr = self.config.hlr_repo.as_ref();
+        let upsert = match hlr.upsert_mobile_seen(&contact.identity_key, None).await {
+            Ok(upsert) => upsert,
+            Err(error) => {
+                warn!("MSC: upsert_mobile_seen failed during {context}: {error}");
+                return None;
+            }
+        };
+        let subscriber = hlr.resolve_by_identity(&contact.identity_key).await;
+        match &subscriber {
+            Ok(Some(resolved)) => {
+                Self::refresh_registration_binding(
+                    hlr,
+                    node,
+                    resolved.subscriber.subscriber_id,
+                    contact.imsi,
+                    contact.esn,
+                    contact.meid,
+                    contact.slot_cycle_index,
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(error) => warn!("MSC: HLR lookup failed during {context} refresh: {error}"),
+        }
+        Some(RecordedContact {
+            upsert,
+            subscriber: subscriber.map_err(|_| ()),
+        })
+    }
+
+    async fn send_welcome_sms_if_due(
+        &mut self,
+        node: &BaseStationId,
+        identity_key: &cdma_hlr::model::MobileIdentityKey,
+        contact: &RecordedContact,
+    ) {
+        let welcome_cfg = match self.config.welcome_sms.as_ref() {
+            Some(config) if config.enabled => config.clone(),
+            _ => return,
+        };
+        let upsert = &contact.upsert;
+        let should_send = if upsert.is_new {
+            info!("MSC: first-time mobile — welcome SMS queued");
+            true
+        } else if let Some(prev) = upsert.previous_last_seen_at {
+            let elapsed = chrono::Utc::now() - prev;
+            let threshold = chrono::Duration::days(welcome_cfg.inactive_days_threshold as i64);
+            if elapsed > threshold {
+                info!(
+                    "MSC: mobile inactive for {} days — welcome SMS queued",
+                    elapsed.num_days()
+                );
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !should_send {
+            return;
+        }
+        let Ok(subscriber) = &contact.subscriber else {
+            return;
+        };
+        let destination = if let Some(resolved) = subscriber {
+            info!(
+                "MSC: sending welcome SMS to {} on registration",
+                resolved.subscriber.phone_number
+            );
+            crate::sms::SmsDestinationKey::PhoneNumber(resolved.subscriber.phone_number.clone())
+        } else {
+            let imsi = identity_key.imsi();
+            info!(
+                "MSC: sending welcome SMS to non-subscriber by IMSI {} on registration",
+                imsi
+            );
+            crate::sms::SmsDestinationKey::Imsi(imsi.to_string())
+        };
+        let smsc = match self.smsc.as_mut() {
+            Some(smsc) => smsc,
+            None => {
+                warn!(
+                    "MSC: registration accepted but SMSC coordinator is not configured for welcome SMS"
+                );
+                return;
+            }
+        };
+        smsc.send_sms(crate::sms::SmsSendRequest {
+            originating_number: welcome_cfg.originating_number.clone(),
+            text: welcome_cfg.text.clone(),
+            destination,
+            timeout_ms: 30_000,
+            teleservice_id: None,
+            raw_user_data: None,
+            serving_node: Some(node.clone()),
+        })
+        .await;
     }
 
     async fn refresh_registration_binding(
@@ -378,8 +1128,6 @@ impl MscRuntime {
         std::sync::Arc::clone(&self.otasp_history)
     }
 
-    /// Live broadcast channel for OTASP `MscNetworkEvent`s; clone the sender
-    /// to subscribe new receivers.
     pub fn otasp_event_tx(
         &self,
     ) -> tokio::sync::broadcast::Sender<crate::grpc::events_proto::v1::MscNetworkEvent> {
@@ -540,6 +1288,7 @@ impl MscRuntime {
                 }
                 _ = otasp_timeout_interval.tick() => {
                     self.tick_otasp_timeouts(a1).await;
+                    self.tick_traffic_authentication(a1).await;
                 }
                 command = recv_delivery(self.deliveries.as_mut()) => {
                     if let Some(command) = command {
@@ -1067,34 +1816,68 @@ impl MscRuntime {
                     _ => None,
                 };
                 let meid = response.mobile_identity_meid.as_ref().and_then(meid_hex);
+                let auth_identity = cdma_hlr::model::MobileIdentityKey::from_parts(
+                    imsi.as_deref(),
+                    esn,
+                    meid.as_deref(),
+                )
+                .ok();
+                let subject = crate::authentication::AuthenticationSubject {
+                    identity: auth_identity.as_ref(),
+                    imsi: imsi.as_deref(),
+                    esn,
+                    dialed_digits: None,
+                };
+                let decision = self
+                    .authenticate_access(
+                        node,
+                        crate::authentication::AuthenticationProcedure::PageResponse,
+                        &subject,
+                        &crate::authentication::GlobalChallengeIes::from_paging_response(&response),
+                    )
+                    .await;
+                if !decision.allow
+                    || (decision.pending_ssd_update
+                        && self.pending_sms_traffic.contains_key(&call_id))
+                {
+                    self.fail_mt_call(a1, call_id, SIP_STATUS_FORBIDDEN).await;
+                    return;
+                }
+                if decision.pending_ssd_update {
+                    self.pending_ssd_calls.insert(call_id);
+                }
+                if let Some(keys) = decision.call_keys {
+                    self.call_keys.insert(call_id, keys);
+                }
+                if let Some(context) =
+                    crate::authentication::CallAuthContext::from_subject(&subject, &decision)
+                {
+                    self.privacy_authenticated.remove(&call_id);
+                    self.traffic_auth_started.remove(&call_id);
+                    self.call_auth_context.insert(call_id, context);
+                }
                 if let Ok(identity_key) = cdma_hlr::model::MobileIdentityKey::from_parts(
                     imsi.as_deref(),
                     esn,
                     meid.as_deref(),
-                ) {
-                    match self
-                        .config
-                        .hlr_repo
-                        .resolve_by_identity(&identity_key)
-                        .await
-                    {
-                        Ok(Some(resolved)) => {
-                            Self::refresh_registration_binding(
-                                self.config.hlr_repo.as_ref(),
-                                node,
-                                resolved.subscriber.subscriber_id,
-                                imsi,
-                                esn,
-                                meid,
-                                response.slot_cycle_index.map(|value| u32::from(value.0)),
-                            )
-                            .await;
-                        }
-                        Ok(None) => {}
-                        Err(error) => warn!(
-                            "MSC: HLR lookup failed during paging-response binding refresh: {error}"
-                        ),
-                    }
+                ) && let Some(contact) = self
+                    .record_mobile_contact(
+                        node,
+                        MobileContact {
+                            identity_key: identity_key.clone(),
+                            imsi,
+                            esn,
+                            meid,
+                            slot_cycle_index: response
+                                .slot_cycle_index
+                                .map(|value| u32::from(value.0)),
+                        },
+                        "paging-response",
+                    )
+                    .await
+                {
+                    self.send_welcome_sms_if_due(node, &identity_key, &contact)
+                        .await;
                 }
                 let secondary_leg = self
                     .circuits
@@ -1122,11 +1905,12 @@ impl MscRuntime {
                         return;
                     }
                 }
+                let privacy = self.assignment_privacy(call_id, response.voice_privacy_request);
                 self.mt_call
                     .send_assignment_request_for_paging_response(
                         a1,
                         call_id,
-                        response,
+                        response.clone(),
                         secondary_leg,
                         &mut self.controller,
                         &mut self.circuits,
@@ -1134,8 +1918,71 @@ impl MscRuntime {
                         self.config.voice_bearer.as_ref(),
                         self.config.default_voice_service_option,
                         &self.config.hlr_repo,
+                        privacy,
                     )
                     .await;
+            }
+            cdma_ios::MessageType::PrivacyModeComplete => {
+                let complete = match cdma_ios::PrivacyModeCompleteMessage::decode(&decoded.payload)
+                {
+                    Ok(complete) => complete,
+                    Err(error) => {
+                        warn!(
+                            "MSC: invalid Privacy Mode Complete call_id={}: {error}",
+                            call_id.0
+                        );
+                        return;
+                    }
+                };
+                self.privacy_deadlines.remove(&call_id);
+                if complete.voice_privacy_request {
+                    let info = self
+                        .config
+                        .authentication
+                        .voice_privacy
+                        .encryption_information(self.call_keys.get(&call_id), true)
+                        .unwrap_or_else(|| {
+                            cdma_ios::EncryptionInformation::private_long_code(0, false)
+                                .expect("zero is a 42-bit mask")
+                        });
+                    let active = info
+                        .private_long_code_parameter()
+                        .ok()
+                        .flatten()
+                        .is_some_and(|p| p.active);
+                    if active && !self.privacy_authenticated.contains(&call_id) {
+                        self.pending_privacy.insert(call_id, info);
+                        self.start_traffic_authentication(a1, node, call_id).await;
+                    } else {
+                        self.send_privacy_command(a1, call_id, info).await;
+                    }
+                } else {
+                    info!(
+                        "MSC: privacy mode result call_id={} parameters={:?}",
+                        call_id.0,
+                        complete.encryption_information.as_ref().map(|info| info
+                            .parameters
+                            .iter()
+                            .map(|parameter| (
+                                parameter.identifier,
+                                parameter.status,
+                                parameter.available
+                            ))
+                            .collect::<Vec<_>>())
+                    );
+                }
+            }
+            cdma_ios::MessageType::BaseStationChallenge
+            | cdma_ios::MessageType::SsdUpdateResponse
+            | cdma_ios::MessageType::AuthenticationResponse
+            | cdma_ios::MessageType::ParameterUpdateConfirm => {
+                self.handle_traffic_authentication_reply(
+                    a1,
+                    call_id,
+                    decoded.message_type,
+                    &decoded.payload,
+                )
+                .await;
             }
             cdma_ios::MessageType::AssignmentComplete => {
                 let complete = match cdma_ios::AssignmentCompleteMessage::decode(&decoded.payload) {
@@ -1254,6 +2101,7 @@ impl MscRuntime {
                             pending.feature_code,
                             pending.service_option,
                             pending.mobile_identity_imsi,
+                            pending.origination_verified,
                             call_id.0,
                             a1,
                         )
@@ -1273,90 +2121,22 @@ impl MscRuntime {
                     a1.release_call(call_id);
                     return;
                 }
-                if let Some(call) = self.circuits.m2m_calls.get(&call_id).copied() {
-                    if completed_circuit_id.is_some() {
-                        self.complete_m2m_assignment(a1, call, call_id).await;
-                    }
-                    return;
-                }
-                if completed_circuit_id
-                    .and_then(|cid| self.circuits.circuits.get(&cid))
-                    .is_some_and(|session| {
-                        session.audio_file.is_some()
-                            && session.peer_circuit_id.is_none()
-                            && session.media_gateway_handle.is_none()
-                            && self
-                                .controller
-                                .snapshot(session.call_id)
-                                .is_some_and(|snapshot| {
-                                    snapshot.direction == CallDirection::MobileOriginated
-                                })
-                    })
-                {
-                    self.media.schedule_delayed_wav_start(
-                        call_id,
-                        self.config.local_answer_delay_ms,
-                        &self.controller,
-                        &self.circuits,
-                        self.config.voice_bearer.as_ref(),
-                        self.config.media_ringback_enabled,
-                        self.config.media_ringback_type,
-                        Some(&self.config.hlr_repo),
-                    );
-                } else if completed_leg == Some(MscVoiceLeg::Primary)
-                    && !self.config.sip_ringback_disable
-                {
-                    // `sip_ringback_disable=true` keeps the bearer silent so
-                    // the BSC's bearer-flow → tones-off doesn't fire before
-                    // SIP audio arrives.
-                    self.media.start_ringback_for_call(
-                        call_id,
-                        &self.controller,
-                        &self.circuits,
-                        self.config.voice_bearer.as_ref(),
-                        self.config.media_ringback_enabled,
-                        self.config.media_ringback_type,
-                        Some(&self.config.hlr_repo),
-                    );
-                }
-                self.flush_deferred_paging_response(a1, call_id).await;
-                if completed_leg == Some(MscVoiceLeg::Primary)
-                    && self.controller.snapshot(call_id).is_some_and(|snapshot| {
-                        snapshot.direction == CallDirection::MobileOriginated
-                    })
-                {
-                    self.fire_deferred_sip_invite(a1, call_id).await;
-                }
-                self.media_gw
-                    .flush_pending_post_assignment(
+                if self.pending_ssd_calls.remove(&call_id) {
+                    self.hold_until_authenticated(
                         a1,
+                        node,
                         call_id,
-                        &mut self.controller,
-                        self.config.send_tones_alert,
+                        HeldAssignment {
+                            completed_circuit_id,
+                            completed_leg,
+                        },
                     )
                     .await;
-
-                self.fire_assignment_complete_awi(a1, call_id, completed_leg)
-                    .await;
-
-                // Send 180 Ringing only when the trunk is doing ringback;
-                // when MSC sends 183 + early media many trunks interpret 180
-                // as "switch to local ringback" and clobber our audio.
-                if let Some(meta) = self.media_gw.inbound_session_for_call(call_id).cloned()
-                    && !meta.progress_sent
-                    && !self.config.inbound_sip_msc_ringback
-                {
-                    if let Some(session_id) = self.media_gw.inbound_by_call.get(&call_id).cloned() {
-                        if let Some(gateway) = self.config.media_gateway.clone() {
-                            if let Err(error) = gateway.inbound_progress(&session_id).await {
-                                warn!(
-                                    "MSC: inbound_progress failed for session={session_id}: {error}"
-                                );
-                            }
-                        }
-                    }
-                    self.media_gw.mark_inbound_progress_sent(call_id);
+                    return;
                 }
+                self.start_traffic_authentication(a1, node, call_id).await;
+                self.continue_assignment_complete(a1, call_id, completed_circuit_id, completed_leg)
+                    .await;
             }
             cdma_ios::MessageType::AssignmentFailure => {
                 self.handle_assignment_failure(a1, call_id).await;
@@ -1525,6 +2305,80 @@ impl MscRuntime {
                 let called_number = cm_service_request
                     .as_ref()
                     .and_then(cm_service_request_called_number);
+                let mut origination_verified = None;
+
+                if let Some(request) = cm_service_request.as_ref() {
+                    let imsi = match &request.mobile_identity_imsi {
+                        cdma_ios::MobileIdentity::Imsi(imsi) => Some(
+                            a1.serving_imsi_prefix(node)
+                                .map(|(mcc, imsi_11_12)| {
+                                    crate::base_station::complete_imsi(&mcc, &imsi_11_12, imsi)
+                                })
+                                .unwrap_or_else(|| imsi.clone()),
+                        ),
+                        _ => None,
+                    };
+                    let (esn, meid) = extract_hardware_identity(Some(request));
+                    let identity = cdma_hlr::model::MobileIdentityKey::from_parts(
+                        imsi.as_deref(),
+                        esn,
+                        meid.as_deref(),
+                    )
+                    .ok();
+                    let dialed = cm_service_request_dialed_digits(request);
+                    let subject = crate::authentication::AuthenticationSubject {
+                        identity: identity.as_ref(),
+                        imsi: imsi.as_deref(),
+                        esn,
+                        dialed_digits: dialed.as_deref(),
+                    };
+                    let decision = self
+                        .authenticate_access(
+                            node,
+                            crate::authentication::AuthenticationProcedure::Origination,
+                            &subject,
+                            &crate::authentication::GlobalChallengeIes::from_cm_service_request(
+                                request,
+                            ),
+                        )
+                        .await;
+                    // OTASP is how a mobile without a shared A-key gets one, so it is never refused.
+                    let otasp_origination = self.otasp.as_ref().is_some_and(|otasp| {
+                        called_number
+                            .as_deref()
+                            .is_some_and(|dialed| otasp.is_otasp_origination(dialed))
+                    });
+                    origination_verified = match decision.result {
+                        crate::authentication::AuthenticationResult::NotRequested => None,
+                        result => {
+                            Some(result == crate::authentication::AuthenticationResult::Success)
+                        }
+                    };
+                    if !decision.allow && !otasp_origination {
+                        self.reject_access_for_authentication(a1, call_id).await;
+                        return;
+                    }
+                    if decision.pending_ssd_update && !otasp_origination {
+                        // A non-voice call never runs the traffic-channel procedures.
+                        if is_non_voice_a1_service_option(service_option) {
+                            self.reject_access_for_authentication(a1, call_id).await;
+                            return;
+                        }
+                        self.pending_ssd_calls.insert(call_id);
+                    }
+                    if let Some(keys) = decision.call_keys {
+                        self.call_keys.insert(call_id, keys);
+                    }
+                    if !otasp_origination
+                        && let Some(context) = crate::authentication::CallAuthContext::from_subject(
+                            &subject, &decision,
+                        )
+                    {
+                        self.privacy_authenticated.remove(&call_id);
+                        self.traffic_auth_started.remove(&call_id);
+                        self.call_auth_context.insert(call_id, context);
+                    }
+                }
 
                 if let Some(otasp) = self.otasp.as_ref()
                     && let Some(dialed) = called_number.as_deref()
@@ -1542,6 +2396,7 @@ impl MscRuntime {
                     self.pending_otasp_originations.insert(
                         call_id,
                         PendingOtaspOrigination {
+                            origination_verified,
                             device,
                             feature_code,
                             mobile_identity_imsi: imsi_id,
@@ -1560,7 +2415,7 @@ impl MscRuntime {
                         self.config.hlr_repo.as_ref(),
                     )
                     .await;
-                if let Some((_, subscriber_id)) = originator.as_ref() {
+                {
                     let imsi = cm_service_request.as_ref().and_then(|request| {
                         let cdma_ios::MobileIdentity::Imsi(imsi) = &request.mobile_identity_imsi
                         else {
@@ -1573,16 +2428,27 @@ impl MscRuntime {
                         .as_ref()
                         .and_then(|request| request.slot_cycle_index)
                         .map(|value| u32::from(value.0));
-                    Self::refresh_registration_binding(
-                        self.config.hlr_repo.as_ref(),
-                        node,
-                        *subscriber_id,
-                        imsi,
+                    if let Ok(identity_key) = cdma_hlr::model::MobileIdentityKey::from_parts(
+                        imsi.as_deref(),
                         esn,
-                        meid,
-                        slot_cycle_index,
-                    )
-                    .await;
+                        meid.as_deref(),
+                    ) && let Some(contact) = self
+                        .record_mobile_contact(
+                            node,
+                            MobileContact {
+                                identity_key: identity_key.clone(),
+                                imsi,
+                                esn,
+                                meid,
+                                slot_cycle_index,
+                            },
+                            "origination",
+                        )
+                        .await
+                    {
+                        self.send_welcome_sms_if_due(node, &identity_key, &contact)
+                            .await;
+                    }
                 }
                 let calling_number = originator.as_ref().map(|(n, _)| n.clone());
 
@@ -1816,7 +2682,12 @@ impl MscRuntime {
                         coding: 0x05,
                     },
                     circuit_identity_code: Some(cic),
-                    encryption_information: None,
+                    encryption_information: self.assignment_privacy(
+                        call_id,
+                        cm_service_request
+                            .as_ref()
+                            .is_some_and(|request| request.voice_privacy_request),
+                    ),
                     service_option: Some(cdma_ios::ServiceOption(service_option)),
                     signals: Vec::new(),
                     ms_information_records: None,
@@ -1862,8 +2733,13 @@ impl MscRuntime {
                     return;
                 }
                 if let Some(destination) = destination {
-                    self.start_m2m_callee(a1, call_id, destination, calling_number)
-                        .await;
+                    if self.pending_ssd_calls.contains(&call_id) {
+                        self.held_m2m_callees
+                            .insert(call_id, (destination, calling_number));
+                    } else {
+                        self.start_m2m_callee(a1, call_id, destination, calling_number)
+                            .await;
+                    }
                 }
             }
             other => {
@@ -2085,11 +2961,12 @@ impl MscRuntime {
         let Some(response) = self.circuits.take_deferred_paging_response(call_id) else {
             return;
         };
+        let privacy = self.assignment_privacy(call_id, response.voice_privacy_request);
         self.mt_call
             .send_assignment_request_for_paging_response(
                 a1,
                 call_id,
-                response,
+                response.clone(),
                 true,
                 &mut self.controller,
                 &mut self.circuits,
@@ -2097,6 +2974,7 @@ impl MscRuntime {
                 self.config.voice_bearer.as_ref(),
                 self.config.default_voice_service_option,
                 &self.config.hlr_repo,
+                privacy,
             )
             .await;
     }
@@ -2534,6 +3412,16 @@ impl MscRuntime {
     }
 
     fn stop_media_for_call(&mut self, call_id: CallId) {
+        self.call_keys.remove(&call_id);
+        self.privacy_deadlines.remove(&call_id);
+        self.pending_privacy.remove(&call_id);
+        self.privacy_authenticated.remove(&call_id);
+        self.traffic_auth_started.remove(&call_id);
+        self.call_auth_context.remove(&call_id);
+        self.traffic_auth.remove(&call_id);
+        self.pending_ssd_calls.remove(&call_id);
+        self.held_assignments.remove(&call_id);
+        self.held_m2m_callees.remove(&call_id);
         self.mo_call.cleanup_call(call_id);
         self.mt_call.cleanup_call(call_id);
         stop_media_for_call(
@@ -2574,20 +3462,23 @@ impl MscRuntime {
                         }
                     };
                     if let Some(call_id_raw) = release_call_id {
-                        let call_id = CallId(call_id_raw);
-                        info!(
-                            "MSC: OTASP session terminal — releasing call_id={}",
-                            call_id_raw
-                        );
-                        send_gateway_clear_command(
-                            a1,
-                            call_id,
-                            &mut self.controller,
-                            gateway_clear_cause(ReleaseCause::Administrative, None),
-                        )
-                        .await;
+                        self.release_otasp_call(a1, call_id_raw).await;
                     }
+                    self.start_otasp_ssd_updates(a1).await;
                     return;
+                }
+                if msg.adds_user_part.burst_type == cdma_common::consts::BURST_TYPE_SMS
+                    && !self.authenticate_adds_transfer(a1, node, &msg).await
+                {
+                    return;
+                }
+                if let Some(contact) = adds_transfer_contact(a1, node, &msg) {
+                    let identity_key = contact.identity_key.clone();
+                    if let Some(recorded) = self.record_mobile_contact(node, contact, "ADDS").await
+                    {
+                        self.send_welcome_sms_if_due(node, &identity_key, &recorded)
+                            .await;
+                    }
                 }
             }
         }
@@ -2614,16 +3505,14 @@ impl MscRuntime {
                         // Route to OTASP if it owns the tag; else hand
                         // to SMSC. Tags are namespaced (high bit set =
                         // OTASP) so the dispatch is O(1).
-                        let routed_to_otasp = match (msg.tag, self.otasp.as_mut()) {
-                            (Some(t), Some(otasp)) if otasp.owns_ack_tag(t.0) => {
-                                otasp.handle_adds_deliver_ack(&msg, a1).await;
-                                true
-                            }
-                            _ => false,
-                        };
-                        if !routed_to_otasp {
-                            smsc.handle_adds_deliver_ack(&msg).await;
+                        if let (Some(t), Some(otasp)) = (msg.tag, self.otasp.as_mut())
+                            && otasp.owns_ack_tag(t.0)
+                        {
+                            otasp.handle_adds_deliver_ack(&msg, a1).await;
+                            self.start_otasp_ssd_updates(a1).await;
+                            return;
                         }
+                        smsc.handle_adds_deliver_ack(&msg).await;
                     }
                     Err(e) => warn!("MSC: failed to decode ADDS Deliver Ack: {e}"),
                 }
@@ -2639,46 +3528,6 @@ impl MscRuntime {
                                 })
                                 .unwrap_or_else(|| imsi.clone());
                             msg.mobile_identity_imsi = cdma_ios::MobileIdentity::Imsi(completed);
-                        }
-                        let imsi = match &msg.mobile_identity_imsi {
-                            cdma_ios::MobileIdentity::Imsi(imsi) => Some(imsi.clone()),
-                            _ => None,
-                        };
-                        let esn = match msg.mobile_identity_esn.as_ref() {
-                            Some(cdma_ios::MobileIdentity::Esn(esn)) => Some(*esn),
-                            _ => None,
-                        };
-                        let meid = msg.mobile_identity_meid.as_ref().and_then(meid_hex);
-                        if let Ok(identity_key) = cdma_hlr::model::MobileIdentityKey::from_parts(
-                            imsi.as_deref(),
-                            esn,
-                            meid.as_deref(),
-                        ) {
-                            match self
-                                .config
-                                .hlr_repo
-                                .resolve_by_identity(&identity_key)
-                                .await
-                            {
-                                Ok(Some(resolved)) => {
-                                    Self::refresh_registration_binding(
-                                        self.config.hlr_repo.as_ref(),
-                                        node,
-                                        resolved.subscriber.subscriber_id,
-                                        imsi,
-                                        esn,
-                                        meid,
-                                        None,
-                                    )
-                                    .await;
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    warn!(
-                                        "MSC: HLR lookup failed during ADDS binding refresh: {error}"
-                                    )
-                                }
-                            }
                         }
                         let ack = cdma_ios::AddsTransferAckMessage {
                             mobile_identity_imsi: msg.mobile_identity_imsi.clone(),
@@ -2791,39 +3640,62 @@ impl MscRuntime {
                     return;
                 }
             };
-        let upsert = match self
-            .config
-            .hlr_repo
-            .upsert_mobile_seen(&identity_key, None)
-            .await
-        {
-            Ok(u) => u,
-            Err(e) => {
-                warn!("MSC: upsert_mobile_seen failed: {e}");
-                return;
-            }
+        let subject = crate::authentication::AuthenticationSubject {
+            identity: Some(&identity_key),
+            imsi,
+            esn,
+            dialed_digits: None,
         };
-        match self
-            .config
-            .hlr_repo
-            .resolve_by_identity(&identity_key)
-            .await
-        {
-            Ok(Some(resolved)) => {
-                Self::refresh_registration_binding(
-                    self.config.hlr_repo.as_ref(),
-                    node,
-                    resolved.subscriber.subscriber_id,
-                    imsi.map(str::to_string),
-                    esn,
-                    meid.clone(),
-                    lur.slot_cycle_index.map(|value| u32::from(value.0)),
-                )
-                .await;
+        let decision = self
+            .authenticate_access(
+                node,
+                crate::authentication::AuthenticationProcedure::Registration,
+                &subject,
+                &crate::authentication::GlobalChallengeIes::from_location_updating_request(&lur),
+            )
+            .await;
+        if !decision.allow {
+            let reject = cdma_ios::LocationUpdatingRejectMessage {
+                reject_cause: cdma_ios::RejectCause(REJECT_CAUSE_ILLEGAL_MS),
+            };
+            match reject.encode() {
+                Ok(payload) => {
+                    if let Err(error) = a1
+                        .send_to_node(
+                            node,
+                            EncodedA1Message::from_message_for_call(
+                                &cdma_ios::Message::new(
+                                    cdma_ios::MessageType::LocationUpdatingReject,
+                                    payload,
+                                ),
+                                transport_call_id,
+                            ),
+                        )
+                        .await
+                    {
+                        warn!("MSC: failed to send Location Updating Reject: {error}");
+                    }
+                }
+                Err(error) => warn!("MSC: failed to encode Location Updating Reject: {error}"),
             }
-            Ok(None) => {}
-            Err(error) => warn!("MSC: HLR lookup failed during registration refresh: {error}"),
+            return;
         }
+        let Some(contact) = self
+            .record_mobile_contact(
+                node,
+                MobileContact {
+                    identity_key: identity_key.clone(),
+                    imsi: imsi.map(str::to_string),
+                    esn,
+                    meid: meid.clone(),
+                    slot_cycle_index: lur.slot_cycle_index.map(|value| u32::from(value.0)),
+                },
+                "registration",
+            )
+            .await
+        else {
+            return;
+        };
         let accept = cdma_ios::LocationUpdatingAcceptMessage {
             location_area_identification: lur.location_area_identification,
         };
@@ -2852,77 +3724,8 @@ impl MscRuntime {
             identity_key.imsi()
         );
 
-        let welcome_cfg = match self.config.welcome_sms.as_ref() {
-            Some(config) if config.enabled => config.clone(),
-            _ => return,
-        };
-        let should_send = if upsert.is_new {
-            info!("MSC: first-time mobile — welcome SMS queued");
-            true
-        } else if let Some(prev) = upsert.previous_last_seen_at {
-            let elapsed = chrono::Utc::now() - prev;
-            let threshold = chrono::Duration::days(welcome_cfg.inactive_days_threshold as i64);
-            if elapsed > threshold {
-                info!(
-                    "MSC: mobile inactive for {} days — welcome SMS queued",
-                    elapsed.num_days()
-                );
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        if !should_send {
-            return;
-        }
-        let subscriber = match self
-            .config
-            .hlr_repo
-            .resolve_by_identity(&identity_key)
-            .await
-        {
-            Ok(Some(s)) => Some(s),
-            Ok(None) => None,
-            Err(e) => {
-                warn!("MSC: registration HLR lookup failed: {e}");
-                return;
-            }
-        };
-        let destination = if let Some(ref resolved) = subscriber {
-            info!(
-                "MSC: sending welcome SMS to {} on registration",
-                resolved.subscriber.phone_number
-            );
-            crate::sms::SmsDestinationKey::PhoneNumber(resolved.subscriber.phone_number.clone())
-        } else {
-            let imsi = identity_key.imsi();
-            info!(
-                "MSC: sending welcome SMS to non-subscriber by IMSI {} on registration",
-                imsi
-            );
-            crate::sms::SmsDestinationKey::Imsi(imsi.to_string())
-        };
-        let smsc = match self.smsc.as_mut() {
-            Some(smsc) => smsc,
-            None => {
-                warn!(
-                    "MSC: registration accepted but SMSC coordinator is not configured for welcome SMS"
-                );
-                return;
-            }
-        };
-        smsc.send_sms(crate::sms::SmsSendRequest {
-            originating_number: welcome_cfg.originating_number.clone(),
-            text: welcome_cfg.text.clone(),
-            destination,
-            timeout_ms: 30_000,
-            teleservice_id: None,
-            raw_user_data: None,
-            serving_node: Some(node.clone()),
-        })
-        .await;
+        self.send_welcome_sms_if_due(node, &identity_key, &contact)
+            .await;
     }
 
     /// Nothing can clear them with the node, so the MSC releases its own
@@ -2963,6 +3766,61 @@ fn extract_hardware_identity(
     (esn, meid)
 }
 
+/// IMSI (completed from the serving base station's prefix), ESN and MEID of an ADDS Transfer.
+fn adds_transfer_identity(
+    a1: &dyn MscA1Endpoint,
+    node: &BaseStationId,
+    msg: &cdma_ios::AddsTransferMessage,
+) -> (Option<String>, Option<u32>, Option<String>) {
+    let imsi = match &msg.mobile_identity_imsi {
+        cdma_ios::MobileIdentity::Imsi(imsi) => Some(
+            a1.serving_imsi_prefix(node)
+                .map(|(mcc, imsi_11_12)| {
+                    crate::base_station::complete_imsi(&mcc, &imsi_11_12, imsi)
+                })
+                .unwrap_or_else(|| imsi.clone()),
+        ),
+        _ => None,
+    };
+    let esn = match msg.mobile_identity_esn.as_ref() {
+        Some(cdma_ios::MobileIdentity::Esn(esn)) => Some(*esn),
+        _ => None,
+    };
+    let meid = msg.mobile_identity_meid.as_ref().and_then(meid_hex);
+    (imsi, esn, meid)
+}
+
+fn adds_transfer_contact(
+    a1: &dyn MscA1Endpoint,
+    node: &BaseStationId,
+    msg: &cdma_ios::AddsTransferMessage,
+) -> Option<MobileContact> {
+    let (imsi, esn, meid) = adds_transfer_identity(a1, node, msg);
+    let identity_key =
+        cdma_hlr::model::MobileIdentityKey::from_parts(imsi.as_deref(), esn, meid.as_deref())
+            .ok()?;
+    Some(MobileContact {
+        identity_key,
+        imsi,
+        esn,
+        meid,
+        slot_cycle_index: None,
+    })
+}
+
+struct MobileContact {
+    identity_key: cdma_hlr::model::MobileIdentityKey,
+    imsi: Option<String>,
+    esn: Option<u32>,
+    meid: Option<String>,
+    slot_cycle_index: Option<u32>,
+}
+
+struct RecordedContact {
+    upsert: cdma_hlr::model::MobileSeenUpsert,
+    subscriber: Result<Option<cdma_hlr::model::ResolvedSubscriber>, ()>,
+}
+
 pub(crate) fn meid_hex(identity: &cdma_ios::MobileIdentity) -> Option<String> {
     let cdma_ios::MobileIdentity::Meid(bytes) = identity else {
         return None;
@@ -2983,6 +3841,15 @@ fn decode_cm_service_request(
             None
         }
     }
+}
+
+fn cm_service_request_dialed_digits(request: &cdma_ios::CmServiceRequestMessage) -> Option<String> {
+    decode_called_party_bcd_number(request.called_party_bcd_number.as_ref()).or_else(|| {
+        request
+            .called_party_ascii_number
+            .as_ref()
+            .and_then(|number| String::from_utf8(number.0.clone()).ok())
+    })
 }
 
 fn cm_service_request_called_number(request: &cdma_ios::CmServiceRequestMessage) -> Option<String> {
@@ -3056,6 +3923,7 @@ pub(crate) fn select_pageable_imsi<'a>(
 #[cfg(test)]
 mod tests {
     mod m2m;
+    mod privacy;
 
     use super::*;
     use crate::circuit::{MscLegKey, MscVoiceLeg};
@@ -3070,7 +3938,30 @@ mod tests {
     };
     use tokio::time::{Duration, timeout};
 
-    struct StubHlrRepo;
+    struct StubHlrRepo {
+        credentials: std::sync::Mutex<cdma_hlr::auth::CaveCredentials>,
+        seen: std::sync::Mutex<usize>,
+    }
+
+    impl Default for StubHlrRepo {
+        fn default() -> Self {
+            Self {
+                credentials: std::sync::Mutex::new(cdma_hlr::auth::CaveCredentials {
+                    auth_algo: cdma_hlr::model::AuthAlgorithm::Cave,
+                    a_key: Some(STUB_A_KEY),
+                    ssd: Some(STUB_AUTH_SSD),
+                    ..Default::default()
+                }),
+                seen: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    impl StubHlrRepo {
+        fn credentials(&self) -> cdma_hlr::auth::CaveCredentials {
+            self.credentials.lock().unwrap().clone()
+        }
+    }
 
     #[test]
     fn default_so1_origination_preserves_legacy_service_option() {
@@ -3104,7 +3995,7 @@ mod tests {
     async fn completed_packet_data_context_releases_its_circuit() {
         let (_client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
         let mut runtime = MscRuntime::new(MscRuntimeConfig {
-            hlr_repo: Arc::new(StubHlrRepo),
+            hlr_repo: Arc::new(StubHlrRepo::default()),
             smsc_repo: None,
             welcome_sms: None,
             sms_retry: crate::config::SmsRetryConfig::default(),
@@ -3125,6 +4016,7 @@ mod tests {
             voice_bearer: None,
             media_gateway: None,
             otasp: None,
+            authentication: Default::default(),
         });
         let call_id = CallId(42);
         runtime.controller.create_call_with_id(
@@ -3176,7 +4068,7 @@ mod tests {
     }
 
     /// HLR stub that resolves a single phone number to a Registered subscriber
-    /// with one primary IMSI, used to drive the MO M2M paging path.
+    /// with one primary IMSI for MO M2M paging.
     struct M2mHlrRepo {
         phone_number: &'static str,
         subscriber_id: uuid::Uuid,
@@ -3235,7 +4127,7 @@ mod tests {
     async fn correlated_location_update_returns_location_updating_accept() {
         let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
         let mut runtime = MscRuntime::new(MscRuntimeConfig {
-            hlr_repo: Arc::new(StubHlrRepo),
+            hlr_repo: Arc::new(StubHlrRepo::default()),
             smsc_repo: None,
             welcome_sms: None,
             sms_retry: crate::config::SmsRetryConfig::default(),
@@ -3256,6 +4148,7 @@ mod tests {
             voice_bearer: None,
             media_gateway: None,
             otasp: None,
+            authentication: Default::default(),
         });
         let transport_call_id = 73;
         let request = LocationUpdatingRequestMessage {
@@ -3304,6 +4197,707 @@ mod tests {
             cdma_ios::MessageType::LocationUpdatingAccept
         );
         assert_eq!(runtime.controller.active_call_count(), 0);
+    }
+
+    const AUTH_TEST_IMSI: &str = "310005551239999";
+    const AUTH_TEST_ESN: u32 = 0x80ab_cdef;
+    const AUTH_TEST_RAND: u32 = 0x34A2_B05F;
+
+    fn authenticating_runtime(mode: crate::authentication::AuthenticationMode) -> MscRuntime {
+        authenticating_runtime_with_hlr(mode, Arc::new(StubHlrRepo::default()))
+    }
+
+    fn authenticating_runtime_with_hlr(
+        mode: crate::authentication::AuthenticationMode,
+        hlr_repo: Arc<StubHlrRepo>,
+    ) -> MscRuntime {
+        MscRuntime::new(MscRuntimeConfig {
+            hlr_repo,
+            smsc_repo: None,
+            welcome_sms: None,
+            sms_retry: crate::config::SmsRetryConfig::default(),
+            default_voice_service_option: 3,
+            supported_voice_service_options: vec![3],
+            wav_file: None,
+            gateway_fallback_to_wav: true,
+            local_answer_delay_ms: 10_000,
+            media_ringback_enabled: false,
+            media_ringback_type: MediaRingbackType::Nanp,
+            sip_ringback_disable: false,
+            inbound_sip_msc_ringback: false,
+            generate_ringback: true,
+            send_tones_alert: false,
+            page_retry_cooldown_ms: 1000,
+            page_retry_max_duration_ms: 60_000,
+            failure_tone_duration_ms: 0,
+            voice_bearer: None,
+            media_gateway: None,
+            otasp: None,
+            authentication: crate::authentication::AuthenticationConfig {
+                mode,
+                ..Default::default()
+            },
+        })
+    }
+
+    /// A Location Updating Request carrying the global-challenge IEs. `authr_flip`
+    /// is XORed into the correct AUTHR. `None` sends only Authentication Event 01H.
+    fn authenticated_registration(authr_flip: Option<u32>) -> EncodedA1Message {
+        let (s1, _) = cdma_common::paging::imsi_s_from_imsi(AUTH_TEST_IMSI).unwrap();
+        let authr = cdma_cave::auth_signature(
+            AUTH_TEST_RAND,
+            s1,
+            &STUB_AUTH_SSD.ssd_a,
+            cdma_cave::Esn(AUTH_TEST_ESN),
+        )
+        .unwrap()
+        .signature;
+        let with_auth = authr_flip.is_some();
+        let request = LocationUpdatingRequestMessage {
+            mobile_identity_imsi: MobileIdentity::Imsi(AUTH_TEST_IMSI.to_string()),
+            location_area_identification: None,
+            classmark_information_type_2: None,
+            registration_type: Some(RegistrationType(1)),
+            mobile_identity_esn: Some(MobileIdentity::Esn(AUTH_TEST_ESN)),
+            mobile_identity_meid: None,
+            slot_cycle_index: Some(SlotCycleIndex(2)),
+            authentication_response_parameter: authr_flip.map(|flip| {
+                cdma_ios::AuthenticationResponseParameter::new(
+                    cdma_ios::AuthSignatureType::Authr,
+                    authr ^ flip,
+                )
+            }),
+            authentication_confirmation_parameter: with_auth.then_some(
+                cdma_ios::AuthenticationConfirmationParameter((AUTH_TEST_RAND >> 24) as u8),
+            ),
+            authentication_parameter_count: with_auth
+                .then_some(cdma_ios::AuthenticationParameterCount(0)),
+            authentication_challenge_parameter: with_auth.then_some(
+                cdma_ios::AuthenticationChallengeParameter::new(
+                    cdma_ios::RandomNumberType::Rand,
+                    u64::from(AUTH_TEST_RAND),
+                ),
+            ),
+            authentication_event: (!with_auth).then_some(cdma_ios::AuthenticationEvent(
+                cdma_ios::AUTHENTICATION_EVENT_PARAMETERS_NOT_RECEIVED,
+            )),
+            user_zone_id: None,
+            is2000_mobile_capabilities: None,
+        };
+        let cli3 = CompleteLayer3InformationMessage {
+            cell_identifier: cdma_ios::CellId {
+                cell: 0x123,
+                sector: 0,
+            },
+            layer3_information: Layer3Information::from_location_updating_request(&request)
+                .unwrap(),
+        };
+        EncodedA1Message::from_message_for_call(
+            &cdma_ios::Message::new(
+                cdma_ios::MessageType::CompleteLayer3Information,
+                cli3.encode().unwrap(),
+            ),
+            Some(91),
+        )
+    }
+
+    async fn registration_reply(
+        mode: crate::authentication::AuthenticationMode,
+        authr_flip: Option<u32>,
+    ) -> (
+        cdma_ios::MessageType,
+        Vec<crate::grpc::events_proto::v1::MscNetworkEvent>,
+    ) {
+        registration_reply_with_hlr(mode, authr_flip, Arc::new(StubHlrRepo::default())).await
+    }
+
+    async fn registration_reply_with_hlr(
+        mode: crate::authentication::AuthenticationMode,
+        authr_flip: Option<u32>,
+        hlr: Arc<StubHlrRepo>,
+    ) -> (
+        cdma_ios::MessageType,
+        Vec<crate::grpc::events_proto::v1::MscNetworkEvent>,
+    ) {
+        let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
+        let mut runtime = authenticating_runtime_with_hlr(mode, hlr);
+        let mut events = runtime.otasp_event_tx.subscribe();
+        runtime
+            .handle_bsc_a1_message(
+                &endpoint,
+                &test_node(),
+                authenticated_registration(authr_flip),
+            )
+            .await;
+        let outbound = timeout(Duration::from_millis(50), client.poll_a1())
+            .await
+            .expect("a Location Updating result should be sent")
+            .unwrap();
+        assert_eq!(outbound.call_id(), Some(91));
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            seen.push(event);
+        }
+        (outbound.message_type(), seen)
+    }
+
+    fn authentication_results(
+        events: &[crate::grpc::events_proto::v1::MscNetworkEvent],
+    ) -> Vec<(i32, bool)> {
+        use crate::grpc::events_proto::v1::msc_network_event::Event;
+        events
+            .iter()
+            .filter_map(|event| match &event.event {
+                Some(Event::Authentication(auth)) => Some((auth.result, auth.service_rejected)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const AUTH_TEST_SMS_DESTINATION: &str = "18005551203";
+
+    /// An access-channel SMS ADDS Transfer signed over its destination address
+    /// (C.S0015-B §3.3.3.1). `authr_flip` is XORed into the correct AUTHR.
+    fn authenticated_sms(authr_flip: u32) -> EncodedA1Message {
+        let (s1, _) = cdma_common::paging::imsi_s_from_imsi(AUTH_TEST_IMSI).unwrap();
+        signed_sms(AUTH_TEST_SMS_DESTINATION, s1, authr_flip)
+    }
+
+    fn signed_sms(destination: &str, fill: u32, authr_flip: u32) -> EncodedA1Message {
+        let auth_data = cdma_cave::AuthData::Dialed {
+            imsi_s1: fill,
+            digits: destination.to_string(),
+        }
+        .to_u24()
+        .unwrap();
+        let authr = cdma_cave::auth_signature(
+            AUTH_TEST_RAND,
+            auth_data,
+            &STUB_AUTH_SSD.ssd_a,
+            cdma_cave::Esn(AUTH_TEST_ESN),
+        )
+        .unwrap()
+        .signature;
+        let transfer = cdma_ios::AddsTransferMessage {
+            mobile_identity_imsi: MobileIdentity::Imsi(AUTH_TEST_IMSI.to_string()),
+            adds_user_part: cdma_ios::AddsUserPart {
+                burst_type: cdma_common::consts::BURST_TYPE_SMS,
+                data: cdma_common::sms::encode_mo_sms_submit(destination, "hi", 1),
+            },
+            mobile_identity_esn: Some(MobileIdentity::Esn(AUTH_TEST_ESN)),
+            mobile_identity_meid: None,
+            authentication_response_parameter: Some(
+                cdma_ios::AuthenticationResponseParameter::new(
+                    cdma_ios::AuthSignatureType::Authr,
+                    authr ^ authr_flip,
+                ),
+            ),
+            authentication_confirmation_parameter: Some(
+                cdma_ios::AuthenticationConfirmationParameter((AUTH_TEST_RAND >> 24) as u8),
+            ),
+            authentication_parameter_count: Some(cdma_ios::AuthenticationParameterCount(0)),
+            authentication_challenge_parameter: Some(
+                cdma_ios::AuthenticationChallengeParameter::new(
+                    cdma_ios::RandomNumberType::Rand,
+                    u64::from(AUTH_TEST_RAND),
+                ),
+            ),
+            authentication_event: None,
+            authentication_data: None,
+            cell_identifier: None,
+            tag: None,
+            service_option: None,
+        };
+        EncodedA1Message::from_message(&cdma_ios::Message::new(
+            cdma_ios::MessageType::AddsTransfer,
+            transfer.encode().unwrap(),
+        ))
+    }
+
+    async fn sms_reply(
+        authr_flip: u32,
+    ) -> (
+        Option<EncodedA1Message>,
+        Vec<crate::grpc::events_proto::v1::MscNetworkEvent>,
+    ) {
+        sms_reply_to(authenticated_sms(authr_flip)).await
+    }
+
+    async fn sms_reply_to(
+        message: EncodedA1Message,
+    ) -> (
+        Option<EncodedA1Message>,
+        Vec<crate::grpc::events_proto::v1::MscNetworkEvent>,
+    ) {
+        sms_reply_to_with_hlr(message, Arc::new(StubHlrRepo::default())).await
+    }
+
+    async fn sms_reply_to_with_hlr(
+        message: EncodedA1Message,
+        hlr: Arc<StubHlrRepo>,
+    ) -> (
+        Option<EncodedA1Message>,
+        Vec<crate::grpc::events_proto::v1::MscNetworkEvent>,
+    ) {
+        let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
+        let mut runtime = authenticating_runtime_with_hlr(
+            crate::authentication::AuthenticationMode::Enforce,
+            hlr,
+        );
+        let mut events = runtime.otasp_event_tx.subscribe();
+        runtime
+            .handle_bsc_a1_message(&endpoint, &test_node(), message)
+            .await;
+        let outbound = timeout(Duration::from_millis(50), client.poll_a1())
+            .await
+            .ok()
+            .flatten();
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            seen.push(event);
+        }
+        (outbound, seen)
+    }
+
+    #[tokio::test]
+    async fn short_destination_signed_with_zero_fill_is_accepted() {
+        use crate::grpc::events_proto::v1::AuthenticationResult;
+        let (reply, events) = sms_reply_to(signed_sms("222", 0, 0)).await;
+        assert!(reply.is_none(), "no rejection is sent");
+        assert_eq!(
+            authentication_results(&events),
+            vec![(AuthenticationResult::Success as i32, false)]
+        );
+        let (s1, _) = cdma_common::paging::imsi_s_from_imsi(AUTH_TEST_IMSI).unwrap();
+        let (reply, _) = sms_reply_to(signed_sms("222", s1, 0)).await;
+        assert!(
+            reply.is_none(),
+            "the IMSI_S1 fill of the spec is still accepted"
+        );
+        let (reply, _) = sms_reply_to(signed_sms("222", 0, 1)).await;
+        assert!(reply.is_some(), "a wrong AUTHR is still rejected");
+    }
+
+    #[tokio::test]
+    async fn only_an_authenticated_sms_records_the_mobile() {
+        let hlr = Arc::new(StubHlrRepo::default());
+        sms_reply_to_with_hlr(authenticated_sms(1), hlr.clone()).await;
+        assert_eq!(*hlr.seen.lock().unwrap(), 0);
+        sms_reply_to_with_hlr(authenticated_sms(0), hlr.clone()).await;
+        assert_eq!(*hlr.seen.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn enforced_sms_with_valid_authr_is_delivered() {
+        use crate::grpc::events_proto::v1::AuthenticationResult;
+        let (reply, events) = sms_reply(0).await;
+        assert!(reply.is_none(), "no rejection is sent for a valid SMS");
+        assert_eq!(
+            authentication_results(&events),
+            vec![(AuthenticationResult::Success as i32, false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn enforced_sms_with_wrong_authr_is_rejected_with_authentication_failure() {
+        use crate::grpc::events_proto::v1::AuthenticationResult;
+        let (reply, events) = sms_reply(1).await;
+        let reply = reply.expect("an ADDS Transfer Ack rejects the SMS");
+        assert_eq!(reply.message_type(), cdma_ios::MessageType::AddsTransferAck);
+        let ack =
+            cdma_ios::AddsTransferAckMessage::decode(&reply.decode().unwrap().payload).unwrap();
+        assert_eq!(
+            ack.cause,
+            Some(cdma_ios::Cause(cdma_ios::CAUSE_AUTHENTICATION_FAILURE))
+        );
+        assert_eq!(
+            authentication_results(&events),
+            vec![(AuthenticationResult::SignatureMismatch as i32, true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn enforced_registration_with_valid_authr_is_accepted() {
+        use crate::grpc::events_proto::v1::AuthenticationResult;
+        let (reply, events) =
+            registration_reply(crate::authentication::AuthenticationMode::Enforce, Some(0)).await;
+        assert_eq!(reply, cdma_ios::MessageType::LocationUpdatingAccept);
+        assert_eq!(
+            authentication_results(&events),
+            vec![(AuthenticationResult::Success as i32, false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn enforced_registration_with_wrong_authr_is_rejected() {
+        use crate::grpc::events_proto::v1::AuthenticationResult;
+        let (reply, events) =
+            registration_reply(crate::authentication::AuthenticationMode::Enforce, Some(1)).await;
+        assert_eq!(reply, cdma_ios::MessageType::LocationUpdatingReject);
+        assert_eq!(
+            authentication_results(&events),
+            vec![(AuthenticationResult::SignatureMismatch as i32, true)]
+        );
+    }
+
+    fn pending_ssd_updates(events: &[crate::grpc::events_proto::v1::MscNetworkEvent]) -> Vec<bool> {
+        use crate::grpc::events_proto::v1::msc_network_event::Event;
+        events
+            .iter()
+            .filter_map(|event| match &event.event {
+                Some(Event::Authentication(auth)) => Some(auth.pending_ssd_update),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn enforced_registration_with_wrong_authr_is_accepted_while_the_ssd_is_unset() {
+        use crate::grpc::events_proto::v1::AuthenticationResult;
+        let hlr = Arc::new(StubHlrRepo::default());
+        hlr.credentials.lock().unwrap().ssd = None;
+        let (reply, events) = registration_reply_with_hlr(
+            crate::authentication::AuthenticationMode::Enforce,
+            Some(1),
+            hlr.clone(),
+        )
+        .await;
+        assert_eq!(reply, cdma_ios::MessageType::LocationUpdatingAccept);
+        assert_eq!(
+            authentication_results(&events),
+            vec![(AuthenticationResult::SignatureMismatch as i32, false)]
+        );
+        assert_eq!(pending_ssd_updates(&events), vec![true]);
+
+        hlr.credentials.lock().unwrap().a_key = None;
+        let (reply, _) = registration_reply_with_hlr(
+            crate::authentication::AuthenticationMode::Enforce,
+            Some(1),
+            hlr.clone(),
+        )
+        .await;
+        assert_eq!(
+            reply,
+            cdma_ios::MessageType::LocationUpdatingReject,
+            "without an A-key no SSD update can follow"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_registration_reports_no_pending_ssd_update() {
+        let (_, events) =
+            registration_reply(crate::authentication::AuthenticationMode::Enforce, Some(1)).await;
+        assert_eq!(pending_ssd_updates(&events), vec![false]);
+    }
+
+    async fn held_call_after(
+        action: crate::authentication::TrafficAction,
+    ) -> (MscRuntime, Option<cdma_ios::MessageType>) {
+        let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
+        let mut runtime =
+            authenticating_runtime(crate::authentication::AuthenticationMode::Enforce);
+        let call_id = CallId(77);
+        let config = runtime.config.authentication.clone();
+        let mut context = traffic_test_context();
+        context.global_result = crate::authentication::AuthenticationResult::SignatureMismatch;
+        let procedures = crate::authentication::TrafficAuthentication::plan(
+            &config,
+            context,
+            "bs".into(),
+            false,
+        )
+        .unwrap();
+        runtime.traffic_auth.insert(call_id, procedures);
+        runtime.held_assignments.insert(
+            call_id,
+            HeldAssignment {
+                completed_circuit_id: None,
+                completed_leg: None,
+            },
+        );
+        runtime
+            .apply_traffic_action(&endpoint, call_id, action)
+            .await;
+        let sent = timeout(Duration::from_millis(50), client.poll_a1())
+            .await
+            .ok()
+            .flatten()
+            .map(|message| message.message_type());
+        (runtime, sent)
+    }
+
+    #[tokio::test]
+    async fn a_held_call_is_cleared_when_its_ssd_update_fails() {
+        use crate::grpc::events_proto::v1::{AuthenticationProcedure, AuthenticationResult};
+        let (runtime, sent) = held_call_after(crate::authentication::TrafficAction::Report {
+            procedure: AuthenticationProcedure::SsdUpdate,
+            result: AuthenticationResult::SsdUpdateRejected,
+            clear_call: false,
+        })
+        .await;
+        assert_eq!(sent, Some(cdma_ios::MessageType::ClearCommand));
+        assert!(runtime.held_assignments.is_empty());
+        assert!(runtime.traffic_auth.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_held_call_resumes_when_its_procedures_finish() {
+        let (runtime, sent) = held_call_after(crate::authentication::TrafficAction::Done).await;
+        assert_ne!(sent, Some(cdma_ios::MessageType::ClearCommand));
+        assert!(runtime.held_assignments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn enforced_registration_without_parameters_is_rejected() {
+        let (reply, _) =
+            registration_reply(crate::authentication::AuthenticationMode::Enforce, None).await;
+        assert_eq!(reply, cdma_ios::MessageType::LocationUpdatingReject);
+    }
+
+    #[tokio::test]
+    async fn monitored_registration_with_wrong_authr_is_accepted_and_reported() {
+        use crate::grpc::events_proto::v1::AuthenticationResult;
+        let (reply, events) =
+            registration_reply(crate::authentication::AuthenticationMode::Monitor, Some(1)).await;
+        assert_eq!(reply, cdma_ios::MessageType::LocationUpdatingAccept);
+        assert_eq!(
+            authentication_results(&events),
+            vec![(AuthenticationResult::SignatureMismatch as i32, false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_authentication_ignores_wrong_authr() {
+        let (reply, events) =
+            registration_reply(crate::authentication::AuthenticationMode::Off, Some(1)).await;
+        assert_eq!(reply, cdma_ios::MessageType::LocationUpdatingAccept);
+        assert!(authentication_results(&events).is_empty());
+    }
+
+    fn traffic_test_context() -> crate::authentication::CallAuthContext {
+        crate::authentication::CallAuthContext {
+            identity: cdma_hlr::model::MobileIdentityKey::from_parts(
+                Some(AUTH_TEST_IMSI),
+                Some(AUTH_TEST_ESN),
+                None,
+            )
+            .unwrap(),
+            imsi: AUTH_TEST_IMSI.to_string(),
+            esn: AUTH_TEST_ESN,
+            global_result: crate::authentication::AuthenticationResult::Success,
+        }
+    }
+
+    fn expect_send(
+        action: crate::authentication::TrafficAction,
+        message_type: cdma_ios::MessageType,
+    ) -> Vec<u8> {
+        match action {
+            crate::authentication::TrafficAction::Send(sent, payload) if sent == message_type => {
+                payload
+            }
+            other => panic!("expected {message_type:?}, got {other:?}"),
+        }
+    }
+
+    async fn run_traffic_ssd_update(
+        mode: crate::authentication::AuthenticationMode,
+        authu_flip: u32,
+    ) -> crate::authentication::TrafficAction {
+        use crate::authentication::{AuthenticationConfig, TrafficAction, TrafficAuthentication};
+        use crate::grpc::events_proto::v1::{AuthenticationProcedure, AuthenticationResult};
+        let config = AuthenticationConfig {
+            mode,
+            count_update_on_call: false,
+            ..AuthenticationConfig::default()
+        };
+        let hlr = StubHlrRepo::default();
+        let mut procedures =
+            TrafficAuthentication::plan(&config, traffic_test_context(), "bs".into(), true)
+                .expect("an unset SSD plans an SSD update");
+
+        let request = cdma_ios::SsdUpdateRequestMessage::decode(&expect_send(
+            procedures.advance(&config, &hlr).await,
+            cdma_ios::MessageType::SsdUpdateRequest,
+        ))
+        .unwrap();
+        let raw = request.authentication_challenge_parameter_randssd.0;
+        assert_eq!(raw[0], 0b0100, "Random Number Type RANDSSD");
+        let randssd = cdma_cave::RandSsd(raw[1..].try_into().unwrap());
+        let ssd_new = cdma_cave::generate_ssd(
+            &cdma_cave::AKey(STUB_A_KEY),
+            cdma_cave::Esn(AUTH_TEST_ESN),
+            &randssd,
+        );
+
+        let (s1, s2) = cdma_common::paging::imsi_s_from_imsi(AUTH_TEST_IMSI).unwrap();
+        let randbs = 0x1357_9BDF;
+        let response = cdma_ios::BaseStationChallengeResponseMessage::decode(&expect_send(
+            procedures
+                .on_base_station_challenge(&config, &hlr, randbs)
+                .await,
+            cdma_ios::MessageType::BaseStationChallengeResponse,
+        ))
+        .unwrap();
+        assert_eq!(
+            response
+                .authentication_response_parameter_authbs
+                .signature(),
+            cdma_cave::authbs(&ssd_new.ssd_a, randbs, s1, cdma_cave::Esn(AUTH_TEST_ESN)).unwrap()
+        );
+
+        assert_eq!(
+            procedures.on_ssd_update_response(&hlr, true).await,
+            TrafficAction::Report {
+                procedure: AuthenticationProcedure::SsdUpdate,
+                result: AuthenticationResult::Success,
+                clear_call: false,
+            }
+        );
+        assert_eq!(hlr.credentials().ssd, Some(ssd_new));
+
+        let challenge = match cdma_ios::AuthenticationRequestMessage::decode(&expect_send(
+            procedures.advance(&config, &hlr).await,
+            cdma_ios::MessageType::AuthenticationRequest,
+        ))
+        .unwrap()
+        {
+            cdma_ios::AuthenticationRequestMessage::Dtap(message) => message,
+            other => panic!("expected DTAP, got {other:?}"),
+        };
+        let randu = challenge
+            .authentication_challenge_parameter_randu
+            .randu()
+            .expect("RANDU");
+        let authu = cdma_cave::authu(&ssd_new.ssd_a, randu, s1, s2, cdma_cave::Esn(AUTH_TEST_ESN))
+            .unwrap()
+            .signature;
+        let result = procedures
+            .on_authentication_response(&config, &hlr, authu ^ authu_flip)
+            .await;
+        if authu_flip == 0 {
+            assert_eq!(procedures.advance(&config, &hlr).await, TrafficAction::Done);
+        }
+        result
+    }
+
+    #[tokio::test]
+    async fn traffic_ssd_update_and_unique_challenge_succeed() {
+        use crate::grpc::events_proto::v1::{AuthenticationProcedure, AuthenticationResult};
+        assert_eq!(
+            run_traffic_ssd_update(crate::authentication::AuthenticationMode::Enforce, 0).await,
+            crate::authentication::TrafficAction::Report {
+                procedure: AuthenticationProcedure::UniqueChallenge,
+                result: AuthenticationResult::Success,
+                clear_call: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_unique_challenge_clears_the_call_only_under_enforce() {
+        use crate::grpc::events_proto::v1::{AuthenticationProcedure, AuthenticationResult};
+        assert_eq!(
+            run_traffic_ssd_update(crate::authentication::AuthenticationMode::Enforce, 1).await,
+            crate::authentication::TrafficAction::Report {
+                procedure: AuthenticationProcedure::UniqueChallenge,
+                result: AuthenticationResult::SignatureMismatch,
+                clear_call: true,
+            }
+        );
+        assert_eq!(
+            run_traffic_ssd_update(crate::authentication::AuthenticationMode::Monitor, 1).await,
+            crate::authentication::TrafficAction::Report {
+                procedure: AuthenticationProcedure::UniqueChallenge,
+                result: AuthenticationResult::SignatureMismatch,
+                clear_call: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_ssd_update_keeps_the_old_ssd_and_skips_the_challenge() {
+        use crate::authentication::{AuthenticationConfig, TrafficAction, TrafficAuthentication};
+        use crate::grpc::events_proto::v1::{AuthenticationProcedure, AuthenticationResult};
+        let config = AuthenticationConfig {
+            count_update_on_call: false,
+            ..AuthenticationConfig::default()
+        };
+        let hlr = StubHlrRepo::default();
+        let mut procedures =
+            TrafficAuthentication::plan(&config, traffic_test_context(), "bs".into(), true)
+                .unwrap();
+        procedures.advance(&config, &hlr).await;
+        procedures.on_base_station_challenge(&config, &hlr, 1).await;
+        assert_eq!(
+            procedures.on_ssd_update_response(&hlr, false).await,
+            TrafficAction::Report {
+                procedure: AuthenticationProcedure::SsdUpdate,
+                result: AuthenticationResult::SsdUpdateRejected,
+                clear_call: false,
+            }
+        );
+        assert_eq!(hlr.credentials().ssd, Some(STUB_AUTH_SSD));
+        assert_eq!(hlr.credentials().randssd, None);
+        assert_eq!(procedures.advance(&config, &hlr).await, TrafficAction::Done);
+    }
+
+    #[tokio::test]
+    async fn count_update_increments_the_hlr_count() {
+        use crate::authentication::{AuthenticationConfig, TrafficAction, TrafficAuthentication};
+        let config = AuthenticationConfig {
+            ssd_update: crate::authentication::SsdUpdatePolicy::Never,
+            unique_challenge_on_call: false,
+            count_update_on_call: true,
+            ..AuthenticationConfig::default()
+        };
+        let hlr = StubHlrRepo::default();
+        let mut procedures =
+            TrafficAuthentication::plan(&config, traffic_test_context(), "bs".into(), false)
+                .unwrap();
+        expect_send(
+            procedures.advance(&config, &hlr).await,
+            cdma_ios::MessageType::ParameterUpdateRequest,
+        );
+        assert!(matches!(
+            procedures.on_parameter_update_confirm(&hlr).await,
+            TrafficAction::Report { .. }
+        ));
+        assert_eq!(hlr.credentials().auth_count, 1);
+    }
+
+    #[tokio::test]
+    async fn default_plan_starts_with_a_unique_challenge_for_a_good_call() {
+        let config = crate::authentication::AuthenticationConfig::default();
+        let mut procedures = crate::authentication::TrafficAuthentication::plan(
+            &config,
+            traffic_test_context(),
+            "bs".into(),
+            false,
+        )
+        .expect("unique challenge is on by default");
+        expect_send(
+            procedures.advance(&config, &StubHlrRepo::default()).await,
+            cdma_ios::MessageType::AuthenticationRequest,
+        );
+    }
+
+    #[test]
+    fn no_traffic_procedures_planned_when_all_are_off() {
+        let config = crate::authentication::AuthenticationConfig {
+            unique_challenge_on_call: false,
+            count_update_on_call: false,
+            ..crate::authentication::AuthenticationConfig::default()
+        };
+        assert!(
+            crate::authentication::TrafficAuthentication::plan(
+                &config,
+                traffic_test_context(),
+                "bs".into(),
+                false,
+            )
+            .is_none()
+        );
     }
 
     #[derive(Default)]
@@ -3499,8 +5093,94 @@ mod tests {
         }
     }
 
+    const STUB_AUTH_SSD: cdma_cave::Ssd = cdma_cave::Ssd {
+        ssd_a: [0xCC, 0x38, 0x12, 0x94, 0x9F, 0x4D, 0xCD, 0x0D],
+        ssd_b: [0x31, 0x05, 0x02, 0x34, 0x58, 0x0E, 0x63, 0xB4],
+    };
+
+    const STUB_A_KEY: [u8; 8] = [1; 8];
+
     #[async_trait::async_trait]
     impl cdma_hlr::repository::HlrRepository for StubHlrRepo {
+        async fn get_subscriber_auth_state(
+            &self,
+            _: &cdma_hlr::model::MobileIdentityKey,
+        ) -> Result<Option<cdma_hlr::model::IdentityAuthState>, String> {
+            let creds = self.credentials();
+            Ok(Some(cdma_hlr::model::IdentityAuthState {
+                subscriber_identity_id: uuid::Uuid::nil(),
+                credentials_provisioned: creds.a_key.is_some(),
+                ssd_provisioned: creds.ssd.is_some(),
+                auth_algo: creds.auth_algo,
+                auth_count: creds.auth_count,
+                auth_failure_count: 0,
+                last_auth_at: None,
+            }))
+        }
+        async fn verify_cave_global_challenge(
+            &self,
+            _: &cdma_hlr::model::MobileIdentityKey,
+            challenge: &cdma_hlr::auth::GlobalChallenge,
+        ) -> Result<cdma_hlr::auth::CaveVerdict, String> {
+            let creds = self.credentials();
+            let verdict = cdma_hlr::auth::verify_global_challenge(&creds, challenge)?;
+            if verdict.outcome.is_success()
+                && let Some(count) = cdma_hlr::auth::resynced_count(&creds, challenge)
+            {
+                self.credentials.lock().unwrap().auth_count = count;
+            }
+            Ok(verdict)
+        }
+        async fn verify_cave_unique_challenge(
+            &self,
+            _: &cdma_hlr::model::MobileIdentityKey,
+            challenge: &cdma_hlr::auth::UniqueChallenge,
+        ) -> Result<cdma_hlr::auth::CaveVerdict, String> {
+            cdma_hlr::auth::verify_unique_challenge(&self.credentials(), challenge)
+        }
+        async fn begin_cave_ssd_update(
+            &self,
+            _: &cdma_hlr::model::MobileIdentityKey,
+        ) -> Result<u64, String> {
+            const STUB_RANDSSD: u64 = 0x4d_18ee_aa05_895c;
+            self.credentials.lock().unwrap().randssd =
+                Some(cdma_cave::RandSsd::from_u64(STUB_RANDSSD).unwrap().0);
+            Ok(STUB_RANDSSD)
+        }
+        async fn cave_base_station_challenge(
+            &self,
+            _: &cdma_hlr::model::MobileIdentityKey,
+            esn: u32,
+            randbs: u32,
+            imsi_s1: u32,
+        ) -> Result<u32, String> {
+            cdma_hlr::auth::base_station_challenge(&self.credentials(), esn, randbs, imsi_s1)
+        }
+        async fn finish_cave_ssd_update(
+            &self,
+            _: &cdma_hlr::model::MobileIdentityKey,
+            esn: u32,
+            confirmed: bool,
+        ) -> Result<(), String> {
+            let creds = self.credentials();
+            let ssd = if confirmed {
+                Some(cdma_hlr::auth::committed_ssd(&creds, esn)?)
+            } else {
+                creds.ssd
+            };
+            let mut credentials = self.credentials.lock().unwrap();
+            credentials.ssd = ssd;
+            credentials.randssd = None;
+            Ok(())
+        }
+        async fn increment_cave_count(
+            &self,
+            _: &cdma_hlr::model::MobileIdentityKey,
+        ) -> Result<u8, String> {
+            let mut credentials = self.credentials.lock().unwrap();
+            credentials.auth_count = cdma_hlr::auth::next_auth_count(credentials.auth_count);
+            Ok(credentials.auth_count)
+        }
         async fn upsert_subscriber(
             &self,
             _: &str,
@@ -3598,6 +5278,7 @@ mod tests {
             _: &cdma_hlr::model::MobileIdentityKey,
             _: Option<u8>,
         ) -> Result<cdma_hlr::MobileSeenUpsert, String> {
+            *self.seen.lock().unwrap() += 1;
             Ok(cdma_hlr::MobileSeenUpsert {
                 is_new: true,
                 previous_last_seen_at: None,
@@ -4214,7 +5895,7 @@ mod tests {
         let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
 
         let mut runtime = MscRuntime::new(MscRuntimeConfig {
-            hlr_repo: Arc::new(StubHlrRepo),
+            hlr_repo: Arc::new(StubHlrRepo::default()),
             smsc_repo: None,
             welcome_sms: None,
             sms_retry: crate::config::SmsRetryConfig::default(),
@@ -4235,6 +5916,7 @@ mod tests {
             voice_bearer: None,
             media_gateway: None,
             otasp: None,
+            authentication: Default::default(),
         });
 
         let call_id = runtime.controller.create_call(
@@ -4344,7 +6026,7 @@ mod tests {
 
         let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
         let mut runtime = MscRuntime::new(MscRuntimeConfig {
-            hlr_repo: Arc::new(StubHlrRepo),
+            hlr_repo: Arc::new(StubHlrRepo::default()),
             smsc_repo: None,
             welcome_sms: None,
             sms_retry: crate::config::SmsRetryConfig::default(),
@@ -4365,6 +6047,7 @@ mod tests {
             voice_bearer: None,
             media_gateway: None,
             otasp: None,
+            authentication: Default::default(),
         });
         let call_id = runtime.controller.create_call(
             CallDirection::MobileTerminated,
@@ -4417,7 +6100,7 @@ mod tests {
     async fn secondary_paging_response_waits_for_active_assignment_complete() {
         let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
         let mut runtime = MscRuntime::new(MscRuntimeConfig {
-            hlr_repo: Arc::new(StubHlrRepo),
+            hlr_repo: Arc::new(StubHlrRepo::default()),
             smsc_repo: None,
             welcome_sms: None,
             sms_retry: crate::config::SmsRetryConfig::default(),
@@ -4438,6 +6121,7 @@ mod tests {
             voice_bearer: None,
             media_gateway: None,
             otasp: None,
+            authentication: Default::default(),
         });
         let call_id = 99;
         let call_id_typed = runtime.controller.create_call_with_id(
@@ -4580,7 +6264,7 @@ mod tests {
     ) {
         let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(8);
         let mut runtime = MscRuntime::new(MscRuntimeConfig {
-            hlr_repo: Arc::new(StubHlrRepo),
+            hlr_repo: Arc::new(StubHlrRepo::default()),
             smsc_repo: None,
             welcome_sms: None,
             sms_retry: crate::config::SmsRetryConfig::default(),
@@ -4601,6 +6285,7 @@ mod tests {
             voice_bearer: None,
             media_gateway: None,
             otasp: None,
+            authentication: Default::default(),
         });
         let call_id_typed = runtime.controller.create_call_with_id(
             CallId(call_id),
@@ -4764,7 +6449,7 @@ mod tests {
         let call_id = 1004;
         let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(8);
         let mut runtime = MscRuntime::new(MscRuntimeConfig {
-            hlr_repo: Arc::new(StubHlrRepo),
+            hlr_repo: Arc::new(StubHlrRepo::default()),
             smsc_repo: None,
             welcome_sms: None,
             sms_retry: crate::config::SmsRetryConfig::default(),
@@ -4785,6 +6470,7 @@ mod tests {
             voice_bearer: None,
             media_gateway: None,
             otasp: None,
+            authentication: Default::default(),
         });
         let call_id_typed = runtime.controller.create_call_with_id(
             CallId(call_id),
@@ -5014,6 +6700,7 @@ mod tests {
             voice_bearer: None,
             media_gateway: None,
             otasp: None,
+            authentication: Default::default(),
         })
     }
 
@@ -5296,7 +6983,7 @@ mod tests {
     async fn mo_cli3_defers_sip_invite_until_assignment_complete() {
         let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
         let mut runtime = MscRuntime::new(MscRuntimeConfig {
-            hlr_repo: Arc::new(StubHlrRepo),
+            hlr_repo: Arc::new(StubHlrRepo::default()),
             smsc_repo: None,
             welcome_sms: None,
             sms_retry: crate::config::SmsRetryConfig::default(),
@@ -5317,6 +7004,7 @@ mod tests {
             voice_bearer: None,
             media_gateway: Some(Arc::new(FailingMediaGateway)),
             otasp: None,
+            authentication: Default::default(),
         });
         let cli3 = cm_service_request_cli3(Some(vec![0x81, 0x00, 0x00, 0x00, 0x00, 0x00]));
         let call_id = 123;
@@ -5370,7 +7058,7 @@ mod tests {
         // ignores any later Progress(Signal) failure tone.
         let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
         let mut runtime = MscRuntime::new(MscRuntimeConfig {
-            hlr_repo: Arc::new(StubHlrRepo),
+            hlr_repo: Arc::new(StubHlrRepo::default()),
             smsc_repo: None,
             welcome_sms: None,
             sms_retry: crate::config::SmsRetryConfig::default(),
@@ -5394,6 +7082,7 @@ mod tests {
             voice_bearer: None,
             media_gateway: Some(Arc::new(StubMediaGateway::default())),
             otasp: None,
+            authentication: Default::default(),
         });
 
         let cli3 = cm_service_request_cli3(Some(vec![0x81, 0x00, 0x00, 0x00, 0x00, 0x00]));
@@ -5455,7 +7144,7 @@ mod tests {
     async fn reverse_bearer_frame_without_peer_forwards_to_media_gateway() {
         let gateway = Arc::new(StubMediaGateway::default());
         let mut runtime = MscRuntime::new(MscRuntimeConfig {
-            hlr_repo: Arc::new(StubHlrRepo),
+            hlr_repo: Arc::new(StubHlrRepo::default()),
             smsc_repo: None,
             welcome_sms: None,
             sms_retry: crate::config::SmsRetryConfig::default(),
@@ -5476,6 +7165,7 @@ mod tests {
             voice_bearer: None,
             media_gateway: Some(gateway.clone()),
             otasp: None,
+            authentication: Default::default(),
         });
         let call_id = runtime
             .controller
@@ -5548,7 +7238,7 @@ mod tests {
         }
 
         let mut runtime = MscRuntime::new(MscRuntimeConfig {
-            hlr_repo: Arc::new(StubHlrRepo),
+            hlr_repo: Arc::new(StubHlrRepo::default()),
             smsc_repo: None,
             welcome_sms: None,
             sms_retry: crate::config::SmsRetryConfig::default(),
@@ -5569,6 +7259,7 @@ mod tests {
             voice_bearer: Some(msc_bearer),
             media_gateway: None,
             otasp: None,
+            authentication: Default::default(),
         });
         let call_id = runtime.controller.create_call_with_id(
             CallId(91),
@@ -5720,7 +7411,7 @@ mod tests {
     #[test]
     fn assignment_complete_correlation_uses_active_leg_key() {
         let mut runtime = MscRuntime::new(MscRuntimeConfig {
-            hlr_repo: Arc::new(StubHlrRepo),
+            hlr_repo: Arc::new(StubHlrRepo::default()),
             smsc_repo: None,
             welcome_sms: None,
             sms_retry: crate::config::SmsRetryConfig::default(),
@@ -5741,6 +7432,7 @@ mod tests {
             voice_bearer: None,
             media_gateway: None,
             otasp: None,
+            authentication: Default::default(),
         });
         let call_id = CallId(42);
 
@@ -5770,7 +7462,7 @@ mod tests {
         let (_, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
         let gateway = Arc::new(RecordingInboundGateway::default());
         let mut runtime = MscRuntime::new(MscRuntimeConfig {
-            hlr_repo: Arc::new(StubHlrRepo),
+            hlr_repo: Arc::new(StubHlrRepo::default()),
             smsc_repo: None,
             welcome_sms: None,
             sms_retry: crate::config::SmsRetryConfig::default(),
@@ -5791,6 +7483,7 @@ mod tests {
             voice_bearer: None,
             media_gateway: Some(gateway.clone() as Arc<dyn MediaGatewayClient>),
             otasp: None,
+            authentication: Default::default(),
         });
 
         runtime

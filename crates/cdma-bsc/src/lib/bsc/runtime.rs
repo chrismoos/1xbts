@@ -137,6 +137,7 @@ impl Bsc {
                 _ = bearer_poll_interval.tick() => {
                     self.poll_reverse_bearer_preambles().await;
                     self.apply_rx_measurements();
+                    self.poll_privacy_transitions();
                 }
             }
         }

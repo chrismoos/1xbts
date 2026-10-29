@@ -1,5 +1,7 @@
 # HEAD
 
+- Added CAVE authentication, OTASP A-key provisioning, configurable voice privacy, and authentication activity in the dashboard.
+  Migration: remove `overhead.auth_mode` from `config/bts.json` to follow the MSC authentication setting.
 - Added support for PCM16 8kHz audio to cdma-voice-gw.
 - Faster call and data setup for IS-2000 mobiles.
 - Improved 1x access probe decode performance.

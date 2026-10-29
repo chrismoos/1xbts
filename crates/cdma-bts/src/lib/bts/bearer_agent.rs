@@ -120,6 +120,7 @@ pub fn deliver_forward_frame(
                             &payload.forward_link_information,
                             TrafficRate::Full.info_bits(),
                         );
+                        controller.observe_forward_privacy(walsh_code, &bits);
                         ch.channel.send_signaling_bits(bits);
                         log::trace!(
                             "BTS bearer: queued signaling frame walsh={} len={} queue_len={}",
@@ -141,6 +142,7 @@ pub fn deliver_forward_frame(
                             &payload.forward_link_information,
                             TrafficRate::Full.info_bits(),
                         );
+                        controller.observe_forward_privacy(walsh_code, &bits);
                         ch.channel.send_signaling_bits(bits);
                         log::trace!(
                             "BTS bearer: queued signaling frame walsh={} len={} queue_len={}",
@@ -162,6 +164,7 @@ pub fn deliver_forward_frame(
                             &payload.forward_link_information,
                             Rc2Rate::Full.info_bits(),
                         );
+                        controller.observe_forward_privacy(walsh_code, &bits);
                         ch.channel.send_signaling_bits(bits);
                         debug!(
                             "BTS bearer: queued RC2 signaling frame walsh={} len={} queue_len={}",
@@ -296,5 +299,98 @@ mod tests {
             "{}",
             err
         );
+    }
+}
+
+#[cfg(test)]
+mod privacy_tests {
+    use super::*;
+    use cdma_abis::bearer::{ChannelFamily, ForwardFchDcchFrame};
+    use cdma_common::lac::message_types::{MessageId, WireChannel};
+    use cdma_common::lac::paging_messages::OrderMessage;
+    use cdma_common::phy::long_code::LongCodeGenerator;
+    use cdma_common::phy::long_code_privacy::{
+        LONG_CODE_TRANSITION_ORDER, LongCodePrivacy, PRIVACY_ACTION_CHIPS, PRIVACY_ACTION_MODULUS,
+    };
+
+    #[test]
+    fn bearer_signaling_prepares_private_and_public_transitions_for_every_voice_rc() {
+        const PRIVATE_MASK: u64 = 0x147_80cc_b8df;
+        const SIGNALING_LEAD_ACTIONS: u64 = 20;
+        let now_chip = cdma_common::time::chips_since_epoch(
+            cdma_common::time::system_time_now(),
+            cdma_common::consts::SR1_CHIP_RATE_HZ,
+        );
+        for rc in [1, 2, 3] {
+            let controller = Arc::new(TrafficResourceService::new());
+            let public = LongCodeGenerator::new_traffic_channel(0x8085_7e58);
+            let privacy = Arc::new(LongCodePrivacy::new(public.mask(), PRIVATE_MASK));
+            let generator = public.with_privacy(Some(privacy.clone()));
+            let walsh = controller.reserve_walsh().unwrap();
+            match rc {
+                1 => {
+                    controller.commit_rc1_traffic(walsh, generator, 0);
+                }
+                2 => {
+                    controller.commit_rc2_traffic(walsh, generator, 0);
+                }
+                _ => {
+                    controller.commit_rc3_traffic(walsh, generator, 0);
+                }
+            }
+            for (index, private) in [true, false].into_iter().enumerate() {
+                let action_chip = (now_chip / PRIVACY_ACTION_CHIPS
+                    + SIGNALING_LEAD_ACTIONS * (index as u64 + 1))
+                    * PRIVACY_ACTION_CHIPS;
+                let order = OrderMessage {
+                    order: LONG_CODE_TRANSITION_ORDER,
+                    ordq: u8::from(private),
+                    order_specific_fields: Vec::new(),
+                };
+                let sdu = order.to_ftch_sdu_at(Some(
+                    ((action_chip / PRIVACY_ACTION_CHIPS) % PRIVACY_ACTION_MODULUS) as u8,
+                ));
+                let pdu = crate::lac::assemble_f_dsch_pdu(
+                    MessageId::Order
+                        .wire_type(WireChannel::ForwardDedicated)
+                        .unwrap(),
+                    &sdu,
+                    0,
+                    index as u8,
+                    true,
+                );
+                let fragments = if rc == 2 {
+                    crate::lac::sar_fragment_ftch_pdu_dsch_rc2(&pdu)
+                } else {
+                    crate::lac::sar_fragment_ftch_pdu_dsch(&pdu)
+                };
+                for fragment in fragments {
+                    let frame = TrafficFrame::ForwardFchDcch(ForwardFchDcchFrame {
+                        channel_family: ChannelFamily::Fch,
+                        fpc_slc: 1,
+                        fsn: 0,
+                        fpc_gr: 0,
+                        rpc_olt: 0,
+                        frame_content: match rc {
+                            1 => FrameContent::FchRc1_9600,
+                            2 => FrameContent::FchRc2_14400,
+                            _ => FrameContent::FchRc3_9600,
+                        },
+                        forward_link_information: fragment.to_packed_bytes(),
+                        message_crc: 0,
+                    });
+                    deliver_forward_frame(&controller, walsh, frame, true).unwrap();
+                }
+                let pending = privacy
+                    .pending()
+                    .expect("bearer order observed before TX enqueue");
+                assert_eq!(pending.action_chip, action_chip);
+                assert_eq!(pending.private, private);
+                assert!(privacy.respond(private, now_chip));
+                assert_eq!(privacy.is_private_at(action_chip), private);
+            }
+            controller.deallocate_traffic(walsh);
+            assert!(controller.long_code_privacy(walsh).is_none());
+        }
     }
 }

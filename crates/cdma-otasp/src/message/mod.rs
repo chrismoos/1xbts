@@ -3,6 +3,7 @@
 pub mod commit;
 pub mod configuration;
 pub mod download;
+pub mod key_exchange;
 pub mod mms;
 pub mod protocol_capability;
 pub mod result_code;
@@ -14,6 +15,9 @@ pub mod validation;
 pub mod msg_type {
     pub const CONFIGURATION: u8 = 0x00;
     pub const DOWNLOAD: u8 = 0x01;
+    pub const MS_KEY: u8 = 0x02;
+    pub const KEY_GENERATION: u8 = 0x03;
+    pub const RE_AUTHENTICATE: u8 = 0x04;
     pub const COMMIT_REQ_AND_RESP: u8 = 0x05;
     pub const PROTOCOL_CAPABILITY: u8 = 0x06;
     pub const SSPR_CONFIGURATION: u8 = 0x07;

@@ -231,6 +231,15 @@ impl FemtoConvergenceServer {
         call_id: Option<u64>,
     ) -> Result<EncodedA1Message, FcsError> {
         let layer3_information = match message.message_type {
+            cdma_ios::femto_interface_msg::MSG_TYPE_PRIVACY_MODE_COMPLETE
+                if message.discriminator
+                    == Some(cdma_ios::femto_interface_msg::Discriminator::Bsmap) =>
+            {
+                let complete =
+                    cdma_ios::PrivacyModeCompleteMessage::decode(&message.to_bsmap_wire()?)?;
+                let encoded = Message::new(MessageType::PrivacyModeComplete, complete.encode()?);
+                return Ok(EncodedA1Message::from_message_for_call(&encoded, call_id));
+            }
             MSG_TYPE_LOCATION_UPDATING_REQUEST => {
                 let mut request = message.to_location_updating_request()?;
                 self.map_identity_to_full(&mut request.mobile_identity_imsi)?;
@@ -298,6 +307,10 @@ impl FemtoConvergenceServer {
     pub fn from_msc_a1(&self, encoded: &EncodedA1Message) -> Result<FemtoInterfaceMsg, FcsError> {
         let message = encoded.decode()?;
         match message.message_type {
+            MessageType::PrivacyModeCommand => {
+                let command = cdma_ios::PrivacyModeCommandMessage::decode(&message.payload)?;
+                Ok(FemtoInterfaceMsg::from_privacy_mode_command(&command)?)
+            }
             MessageType::LocationUpdatingAccept => {
                 let accept = LocationUpdatingAcceptMessage::decode(&message.payload)?;
                 Ok(FemtoInterfaceMsg::from_location_updating_accept(&accept)?)
@@ -1009,6 +1022,12 @@ mod otasp_transport_tests {
             cell_identifier: None,
             tag: Some(Tag(1)),
             service_option: None,
+            authentication_response_parameter: None,
+            authentication_confirmation_parameter: None,
+            authentication_parameter_count: None,
+            authentication_challenge_parameter: None,
+            authentication_event: None,
+            authentication_data: None,
         };
         let femto = FemtoInterfaceMsg::from_adds_transfer(&transfer).unwrap();
         let returned = fcs
@@ -1028,5 +1047,53 @@ mod otasp_transport_tests {
         );
         assert_eq!(decoded.adds_user_part, transfer.adds_user_part);
         assert_eq!(decoded.mobile_identity_esn, transfer.mobile_identity_esn);
+    }
+}
+
+#[cfg(test)]
+mod privacy_tests {
+    use super::*;
+
+    #[test]
+    fn privacy_command_and_status_use_spec_bsmap_types_and_preserve_call_id() {
+        let fcs = FemtoConvergenceServer::new();
+        let command = cdma_ios::PrivacyModeCommandMessage {
+            encryption_information: cdma_ios::EncryptionInformation::private_long_code(
+                0x147_80cc_b8df,
+                true,
+            )
+            .unwrap(),
+        };
+        let encoded = EncodedA1Message::from_message_for_call(
+            &Message::new(MessageType::PrivacyModeCommand, command.encode().unwrap()),
+            Some(7),
+        );
+        let femto = fcs.from_msc_a1(&encoded).unwrap();
+        assert_eq!(femto.message_type, 0x53);
+        assert_eq!(
+            femto.discriminator,
+            Some(cdma_ios::femto_interface_msg::Discriminator::Bsmap)
+        );
+        assert_eq!(
+            cdma_ios::PrivacyModeCommandMessage::decode(&femto.to_bsmap_wire().unwrap()).unwrap(),
+            command
+        );
+        let complete = cdma_ios::PrivacyModeCompleteMessage {
+            encryption_information: Some(
+                cdma_ios::EncryptionInformation::private_long_code_status(true),
+            ),
+            voice_privacy_request: false,
+        };
+        let femto = FemtoInterfaceMsg::from_privacy_mode_complete(&complete).unwrap();
+        let encoded = fcs
+            .to_msc_a1(&femto, CellId { cell: 1, sector: 0 }, Some(7))
+            .unwrap();
+        assert_eq!(encoded.call_id(), Some(7));
+        assert_eq!(encoded.message_type(), MessageType::PrivacyModeComplete);
+        assert_eq!(
+            cdma_ios::PrivacyModeCompleteMessage::decode(&encoded.decode().unwrap().payload)
+                .unwrap(),
+            complete
+        );
     }
 }

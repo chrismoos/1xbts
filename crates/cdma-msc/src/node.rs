@@ -41,6 +41,26 @@ pub async fn run_node(
     let config_path = config_dir.join(CONFIG_FILENAME);
     info!("Loading MSC config from {}", config_path.display());
     let config = MscNodeConfig::load_from_path(&config_path)?;
+    info!("MSC authentication: {}", config.authentication);
+    if config.authentication.mode == crate::authentication::AuthenticationMode::Off {
+        info!(
+            "MSC authentication is off. Base stations broadcast AUTH=0 unless their own config sets it."
+        );
+    } else {
+        info!(
+            "MSC authentication is on. Base stations broadcast AUTH=1 unless their own config sets it."
+        );
+    }
+    if config.otasp.enabled {
+        info!(
+            "MSC OTASP A-key generation (otasp.writes.a_key): {}",
+            if config.otasp.writes.a_key {
+                "on"
+            } else {
+                "off"
+            }
+        );
+    }
 
     // Both repositories run over lazy channels, so the MSC starts whether or
     // not the HLR and SMSC are already listening and picks them up on the
@@ -59,6 +79,9 @@ pub async fn run_node(
     );
 
     let base_stations = BaseStations::new(&config.base_stations);
+    base_stations.set_global_challenge(
+        config.authentication.mode != crate::authentication::AuthenticationMode::Off,
+    );
     base_stations.spawn_attach_tasks();
     info!(
         "MSC attaching to {} configured base station(s)",

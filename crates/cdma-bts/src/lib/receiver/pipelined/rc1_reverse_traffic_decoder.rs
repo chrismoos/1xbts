@@ -198,6 +198,7 @@ struct DecodedTrafficFrame {
 pub struct Rc1ReverseTrafficDecoder {
     state: DecoderState,
     esn: u32,
+    long_code_privacy: Option<std::sync::Arc<cdma_common::phy::long_code_privacy::LongCodePrivacy>>,
 
     // Sample accumulation (chip-rate)
     pending_samples: VecDeque<Complex32>,
@@ -239,10 +240,19 @@ pub struct Rc1ReverseTrafficDecoder {
 }
 
 impl Rc1ReverseTrafficDecoder {
+    pub fn with_long_code_privacy(
+        mut self,
+        privacy: Option<std::sync::Arc<cdma_common::phy::long_code_privacy::LongCodePrivacy>>,
+    ) -> Self {
+        self.long_code_privacy = privacy;
+        self
+    }
+
     pub fn new(esn: u32) -> Self {
         Self {
             state: DecoderState::Preamble,
             esn,
+            long_code_privacy: None,
             pending_samples: VecDeque::new(),
             pending_chip_start: None,
             frame_soft: Vec::with_capacity(SOFT_BITS_PER_FRAME),
@@ -478,7 +488,8 @@ impl Rc1ReverseTrafficDecoder {
     // ---------------------------------------------------------------
 
     fn lc_randomizer_bits(&self, frame_chip_start: usize) -> [u8; 14] {
-        let mut generator = LongCodeGenerator::new_traffic_channel(self.esn);
+        let mut generator = LongCodeGenerator::new_traffic_channel(self.esn)
+            .with_privacy(self.long_code_privacy.clone());
         let offset = frame_chip_start.saturating_sub(1536 + 14);
         generator.advance_chips(offset);
         let mut bits = [0u8; 14];

@@ -13261,7 +13261,7 @@ impl OrderMessage {
             _ => Err(format!(
                 "typed forward Order detail is not implemented for ORDER=0b{:06b} ({}) ORDQ=0x{:02X} with {} order-specific octets",
                 self.order,
-                crate::formatting::forward_order_name(self.order),
+                crate::formatting::forward_order_name(self.order, Some(self.ordq)),
                 self.ordq,
                 self.order_specific_fields.len()
             )
@@ -13518,13 +13518,18 @@ impl OrderMessage {
         })
     }
 
-    /// Encode the f-dsch Order Message SDU per C.S0004-E 3.2.2.1.1.2:
-    /// USE_TIME(1) + ACTION_TIME(6) + ORDER(6) + ADD_RECORD_LEN(3)
-    /// + [ORDQ(8) + order-specific fields if ADD_RECORD_LEN > 0].
     pub fn to_ftch_sdu(&self) -> Bitstream {
+        self.to_ftch_sdu_at(None)
+    }
+
+    /// C.S0005-E §3.6.4.1.4: ACTION_TIME is System Time in 80 ms units modulo 64.
+    pub fn to_ftch_sdu_at(&self, action_time: Option<u8>) -> Bitstream {
+        const ACTION_TIME_BITS: usize = 6;
+        const ACTION_TIME_MAX: u8 = (1 << ACTION_TIME_BITS) - 1;
+        assert!(action_time.is_none_or(|time| time <= ACTION_TIME_MAX));
         let mut bs = Bitstream::new();
-        bs.write_u8(0, 1); // USE_TIME = 0
-        bs.write_u8(0, 6); // ACTION_TIME = 000000
+        bs.write_u8(u8::from(action_time.is_some()), 1);
+        bs.write_u8(action_time.unwrap_or(0), ACTION_TIME_BITS);
         bs.write_u8(self.order, 6);
         if self.ordq == 0 && self.order_specific_fields.is_empty() {
             bs.write_u8(0, 3); // ADD_RECORD_LEN = 0

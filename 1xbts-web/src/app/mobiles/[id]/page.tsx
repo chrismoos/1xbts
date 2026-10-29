@@ -1,9 +1,16 @@
 "use client";
 
+import { VoicePrivacyIndicator } from "@/components/voice-privacy-indicator";
 import { useEffect, useState, useCallback, useRef, use, useMemo, type FormEvent } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Card, Stat } from "@/components/card";
+import {
+  AuthenticationActivity,
+  AuthenticationMark,
+  useAuthenticationVerdicts,
+} from "@/components/authentication-activity";
+import { verdictForAccess } from "@/lib/authentication-verdict";
 import { RecentMessagesCard } from "@/components/recent-messages-card";
 import { RecentOtaspCard } from "@/components/recent-otasp-card";
 import { TimeSeriesChart, type Series } from "@/components/time-series-chart";
@@ -110,6 +117,7 @@ interface MobileInfo {
   trafficWalshCode?: number;
   trafficServiceOption?: number;
   voiceCallState?: string;
+  voicePrivacy?: string;
   servingCell?: { cell: number; sector: number };
 }
 
@@ -293,6 +301,9 @@ export default function MobileDetailPage({
   const router = useRouter();
 
   const [mobile, setMobile] = useState<MobileInfo | null>(null);
+  const authImsi = mobile?.imsi;
+  const authImsis = useMemo(() => (authImsi ? [authImsi] : []), [authImsi]);
+  const { events: verdicts } = useAuthenticationVerdicts(authImsis, mobile?.esn ?? undefined);
   const [loading, setLoading] = useState(true);
   const { cells } = useBtsList();
   const [messages, setMessages] = useState<LogEntry[]>([]);
@@ -1217,7 +1228,7 @@ export default function MobileDetailPage({
                 <div className="rounded-md border border-border bg-surface px-3 py-2">
                   <div className="text-[11px] uppercase tracking-wide text-muted">Voice</div>
                   <div className="mt-1 text-sm font-medium text-primary">
-                    {mobile.voiceCallState ?? "No active voice state"}
+                    <span className="inline-flex items-center gap-2">{mobile.voiceCallState ?? "No active voice state"}<VoicePrivacyIndicator status={mobile.voicePrivacy} /></span>
                   </div>
                 </div>
               </div>
@@ -1569,6 +1580,10 @@ export default function MobileDetailPage({
         </Card>
       )}
 
+      <Card title="Authentication Activity">
+        <AuthenticationActivity imsis={authImsis} esn={mobile.esn ?? undefined} />
+      </Card>
+
       <Card title={`Message History (${messages.length})`}>
         {messages.length === 0 ? (
           <p className="text-dimmed text-sm">
@@ -1595,6 +1610,7 @@ export default function MobileDetailPage({
                         <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
                         <LaneBadge lane="L3" />
                         <span className="text-accent-blue font-mono text-xs w-12 shrink-0">1x TX</span>
+                        <span className="inline-block w-5 shrink-0" />
                         <span className="text-dimmed text-xs shrink-0">F-PCH</span>
                         <span className="text-primary shrink-0">{typeName}</span>
                         {entry.seenCount > 1 && (
@@ -1612,7 +1628,7 @@ export default function MobileDetailPage({
                       </div>
                     </div>
                     {isExpanded && h && (
-                      <div className="mt-1.5 ml-8 pb-1">
+                      <div className="mt-2 mb-1 ml-8 rounded-lg border border-border-primary bg-surface p-3">
                         <div className="text-xs text-muted mb-1">
                           MSG_TAG: 0x{h.msgTag.toString(16).toUpperCase().padStart(2, "0")} | MSG_SEQ: {h.msgSeq} | ACK_SEQ: {h.ackSeq} | ACK_REQ: {h.ackReq ? "1" : "0"} | VALID_ACK: {h.validAck ? "1" : "0"}
                         </div>
@@ -1638,6 +1654,7 @@ export default function MobileDetailPage({
                         <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
                         <LaneBadge lane="L3" />
                         <span className="text-accent-cyan font-mono text-xs w-12 shrink-0">1x TX</span>
+                        <span className="inline-block w-5 shrink-0" />
                         <span className="text-dimmed text-xs shrink-0">{formatTrafficChannel(entry.event)}</span>
                         <span className="text-primary shrink-0">{typeName}</span>
                         {entry.seenCount > 1 && (
@@ -1655,7 +1672,7 @@ export default function MobileDetailPage({
                       </div>
                     </div>
                     {isExpanded && h && (
-                      <div className="mt-1.5 ml-8 pb-1">
+                      <div className="mt-2 mb-1 ml-8 rounded-lg border border-border-primary bg-surface p-3">
                         <div className="text-xs text-muted mb-1">
                           MSG_TAG: 0x{h.msgTag.toString(16).toUpperCase().padStart(2, "0")} | MSG_SEQ: {h.msgSeq} | ACK_SEQ: {h.ackSeq} | ACK_REQ: {h.ackReq ? "1" : "0"} | VALID_ACK: {h.validAck ? "1" : "0"}
                         </div>
@@ -1696,6 +1713,7 @@ export default function MobileDetailPage({
                         <span className={`${"direction" in entry.event ? hrpdDirectionClass(entry.event.direction) : hrpdDirectionClass()} font-mono text-xs w-16 shrink-0`}>
                           {"direction" in entry.event ? hrpdDirectionLabel(entry.event.direction) : "EVDO"}
                         </span>
+                        <span className="inline-block w-5 shrink-0" />
                         <span className="text-primary shrink-0">{typeName}</span>
                         {entry.seenCount > 1 && (
                           <span className="text-muted text-xs shrink-0">x{entry.seenCount}</span>
@@ -1707,7 +1725,7 @@ export default function MobileDetailPage({
                       </div>
                     </div>
                     {isExpanded && (
-                      <div className="mt-1.5 ml-8 pb-1">{detail}</div>
+                      <div className="mt-2 mb-1 ml-8 rounded-lg border border-border-primary bg-surface p-3">{detail}</div>
                     )}
                   </div>
                 );
@@ -1728,6 +1746,7 @@ export default function MobileDetailPage({
                         <span className={`${a1DirectionClass(ev.direction)} font-mono text-xs w-12 shrink-0`}>
                           {a1DirectionLabel(ev.direction)}
                         </span>
+                        <span className="inline-block w-5 shrink-0" />
                         <span className="text-primary shrink-0">{a1TypeName(ev)}</span>
                         {entry.seenCount > 1 && (
                           <span className="text-muted text-xs shrink-0">x{entry.seenCount}</span>
@@ -1742,7 +1761,7 @@ export default function MobileDetailPage({
                       </div>
                     </div>
                     {isExpanded && (
-                      <div className="mt-1.5 ml-8 pb-1">
+                      <div className="mt-2 mb-1 ml-8 rounded-lg border border-border-primary bg-surface p-3">
                         <A1Detail event={ev} cells={cells} />
                       </div>
                     )}
@@ -1763,6 +1782,14 @@ export default function MobileDetailPage({
                         <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
                         <LaneBadge lane="L3" />
                         <span className="text-accent-green font-mono text-xs w-12 shrink-0">1x RX</span>
+                        <AuthenticationMark
+                          verdict={verdictForAccess(
+                            ev,
+                            entry.ts,
+                            { imsi: mobile.imsi ?? undefined, esn: mobile.esn ?? undefined },
+                            verdicts,
+                          )}
+                        />
                         <span className="text-dimmed text-xs shrink-0">{formatAccessChannel(ev)}</span>
                         <span className="text-primary shrink-0">{ev.msgTypeName}</span>
                         {entry.seenCount > 1 && (
@@ -1778,8 +1805,8 @@ export default function MobileDetailPage({
                       </div>
                     </div>
                     {isExpanded && (
-                      <div className="mt-1.5 ml-8 pb-1">
-                        <AccessDetail event={ev} />
+                      <div className="mt-2 mb-1 ml-8 rounded-lg border border-border-primary bg-surface p-3">
+                        <AccessDetail event={ev} verdict={verdictForAccess(ev, entry.ts, { imsi: mobile.imsi ?? undefined, esn: mobile.esn ?? undefined }, verdicts)} />
                       </div>
                     )}
                   </div>

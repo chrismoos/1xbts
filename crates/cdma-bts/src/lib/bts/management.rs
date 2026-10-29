@@ -19,7 +19,7 @@ use cdma_common::lac::paging_messages::{
     CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC, CHANNEL_ASSIGN_MODE_TRAFFIC,
     CHANNEL_DEFAULT_CONFIG_EXPLICIT_RCS, CHANNEL_DEFAULT_CONFIG_RC1_RC1,
     CHANNEL_DEFAULT_CONFIG_RC1_RC2, CHANNEL_DEFAULT_CONFIG_RC2_RC1, CHANNEL_DEFAULT_CONFIG_RC2_RC2,
-    GeneralPageRecord, MsAddress, PagingChannelMessage,
+    ForwardOrderDetail, GeneralPageRecord, MsAddress, PagingChannelMessage,
 };
 use cdma_common::mac::ChannelType;
 use cdma_common::overhead::OverheadParameters;
@@ -104,6 +104,8 @@ pub struct BtsManagementState {
     pub pch_transmit: broadcast::Sender<PchTransmitEvent>,
     /// Abis bearer transport, present once the Abis endpoint is up.
     pub bearer: Option<Arc<cdma_abis::bearer_transport::BearerTransport>>,
+    /// Broadcast AUTH and RAND. `Enroll` sets AUTH when `overhead.auth_mode` is omitted.
+    pub global_challenge: Option<Arc<super::global_challenge::GlobalChallenge>>,
 }
 
 impl BtsManagementState {
@@ -160,6 +162,7 @@ impl BtsManagementState {
             iq_capture_dir,
             pch_transmit,
             bearer: None,
+            global_challenge: None,
         })
     }
 
@@ -196,14 +199,33 @@ impl BtsManagementState {
         }
     }
 
+    fn apply_global_challenge(&self, requested: Option<bool>) {
+        let (Some(challenge), Some(auth)) = (
+            &self.global_challenge,
+            enrolled_auth_mode(self.overhead.auth_mode, requested),
+        ) else {
+            return;
+        };
+        if challenge.set_auth(auth) {
+            info!(
+                "BTS global challenge: AUTH={auth} from enrollment, RAND=0x{:08X}",
+                challenge.current()
+            );
+        }
+    }
+
     fn bts_config(&self) -> proto::BtsConfig {
+        let mut overhead = self.overhead.clone();
+        if let Some(challenge) = &self.global_challenge {
+            overhead.auth_mode = Some(challenge.auth());
+        }
         to_proto_config(
             &self.config,
             self.channel,
             self.tx_center_frequency_hz,
             self.rx_center_frequency_hz,
             self.evdo.as_ref(),
-            &self.overhead,
+            &overhead,
             &self.timezone,
             self.pilot_offset,
         )
@@ -308,7 +330,12 @@ pub async fn spawn_bts_management_service(
 
 #[tonic::async_trait]
 impl BtsManagementService for BtsManagementServiceImpl {
-    async fn enroll(&self, _: Request<EnrollRequest>) -> Result<Response<EnrollResponse>, Status> {
+    async fn enroll(
+        &self,
+        request: Request<EnrollRequest>,
+    ) -> Result<Response<EnrollResponse>, Status> {
+        self.state
+            .apply_global_challenge(request.into_inner().global_challenge);
         Ok(Response::new(EnrollResponse {
             cell: Some(self.state.cell_id()),
             config: Some(self.state.bts_config()),
@@ -857,6 +884,15 @@ fn to_proto_evdo(r: &ResolvedEvdoConfig) -> proto::EvdoCarrierConfig {
 
 // The arguments mirror the proto message's field groups one-to-one.
 #[allow(clippy::too_many_arguments)]
+fn enrolled_auth_mode(configured: Option<u8>, requested: Option<bool>) -> Option<u8> {
+    use super::global_challenge::{AUTH_MODE_CAVE, AUTH_MODE_NONE};
+    match (configured, requested?) {
+        (Some(_), _) => None,
+        (None, true) => Some(AUTH_MODE_CAVE),
+        (None, false) => Some(AUTH_MODE_NONE),
+    }
+}
+
 fn to_proto_config(
     cfg: &BtsRuntimeSettings,
     channel: ChannelPlan,
@@ -918,7 +954,7 @@ fn to_proto_config(
             acc_config_seq: u32::from(overhead.acc_config_seq),
             power_up_reg: overhead.power_up_reg,
             parameter_reg: overhead.parameter_reg,
-            auth_mode: u32::from(overhead.auth_mode),
+            auth_mode: u32::from(overhead.auth_mode.unwrap_or_default()),
             lp_sec: u32::from(overhead.lp_sec),
             ltm_off: i32::from(overhead.ltm_off),
             daylt: u32::from(overhead.daylt),
@@ -1062,6 +1098,7 @@ fn to_proto_paging_event(
                 num_step: u32::from(m.num_step),
                 max_cap_sz: u32::from(m.max_cap_sz),
                 auth: u32::from(m.auth),
+                rand: m.rand,
             }),
         ),
         PagingChannelMessage::NeighborList(m) => Some(proto::paging_event::Body::NeighborList(
@@ -1170,9 +1207,24 @@ fn to_proto_paging_event(
             Some(proto::paging_event::Body::Order(proto::PagingOrder {
                 order: u32::from(m.order),
                 ordq: u32::from(m.ordq),
-                order_name: forward_order_name(m.order).to_string(),
+                order_name: forward_order_name(m.order, Some(m.ordq)).to_string(),
+                authbs: match m.forward_detail() {
+                    Ok(ForwardOrderDetail::BaseStationChallengeConfirmation { authbs }) => {
+                        Some(authbs)
+                    }
+                    _ => None,
+                },
             }))
         }
+        PagingChannelMessage::AuthenticationChallenge(m) => Some(
+            proto::paging_event::Body::AuthChallenge(proto::ForwardAuthenticationChallenge {
+                randu: m.randu,
+                gen_cmea_key: m.gen_cmea_key,
+            }),
+        ),
+        PagingChannelMessage::SsdUpdate(m) => Some(proto::paging_event::Body::SsdUpdate(
+            proto::ForwardSsdUpdate { randssd: m.randssd },
+        )),
         PagingChannelMessage::DataBurst(m) => {
             const SMS_BURST_TYPE: u8 = 3;
             const TL_MSG_TYPE_DELIVERY_ACK: u8 = 0x02;
@@ -1318,5 +1370,19 @@ fn to_proto_paging_event(
         event_id: next_pch_event_id(),
         body,
         cell: Some(cell),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enrollment_sets_auth_only_when_configuration_leaves_it_open() {
+        assert_eq!(enrolled_auth_mode(None, Some(true)), Some(1));
+        assert_eq!(enrolled_auth_mode(None, Some(false)), Some(0));
+        assert_eq!(enrolled_auth_mode(None, None), None);
+        assert_eq!(enrolled_auth_mode(Some(0), Some(true)), None);
+        assert_eq!(enrolled_auth_mode(Some(1), Some(false)), None);
     }
 }

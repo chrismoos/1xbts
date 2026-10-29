@@ -26,6 +26,7 @@ soapy-backend = ["soapysdr", "sdr-hal/soapy-backend"]
 network-backend = ["sdr-hal/network-backend"]
 
 [dependencies]
+rand = "0.8"
 sdr-hal = { workspace = true, features = ["dsp", "config", "file"] }
 num = "0.4"
 uhd = { package = "sdr-hal-uhd", version = "0.1", optional = true }

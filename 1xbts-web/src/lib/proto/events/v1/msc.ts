@@ -10,6 +10,247 @@ import { Timestamp } from "../../google/protobuf/timestamp";
 
 export const protobufPackage = "events.v1";
 
+/** Subscriber authentication procedure (C.S0005-E §2.3.12.1). */
+export enum AuthenticationProcedure {
+  AUTHENTICATION_PROCEDURE_UNSPECIFIED = 0,
+  /** AUTHENTICATION_PROCEDURE_REGISTRATION - Global challenge on a Registration Message. */
+  AUTHENTICATION_PROCEDURE_REGISTRATION = 1,
+  /** AUTHENTICATION_PROCEDURE_ORIGINATION - Global challenge on an Origination Message. */
+  AUTHENTICATION_PROCEDURE_ORIGINATION = 2,
+  /** AUTHENTICATION_PROCEDURE_PAGE_RESPONSE - Global challenge on a Page Response Message. */
+  AUTHENTICATION_PROCEDURE_PAGE_RESPONSE = 3,
+  /** AUTHENTICATION_PROCEDURE_UNIQUE_CHALLENGE - Unique challenge with RANDU. */
+  AUTHENTICATION_PROCEDURE_UNIQUE_CHALLENGE = 4,
+  /** AUTHENTICATION_PROCEDURE_SSD_UPDATE - SSD update with base station challenge. */
+  AUTHENTICATION_PROCEDURE_SSD_UPDATE = 5,
+  /** AUTHENTICATION_PROCEDURE_COUNT_UPDATE - COUNT increment with the Parameter Update Order. */
+  AUTHENTICATION_PROCEDURE_COUNT_UPDATE = 6,
+  /** AUTHENTICATION_PROCEDURE_OTASP_KEY_EXCHANGE - OTASP A-key generation and commit (C.S0016-D §5). */
+  AUTHENTICATION_PROCEDURE_OTASP_KEY_EXCHANGE = 7,
+  /** AUTHENTICATION_PROCEDURE_OTASP_REAUTHENTICATION - OTASP Re-Authenticate Request with the newly generated SSD. */
+  AUTHENTICATION_PROCEDURE_OTASP_REAUTHENTICATION = 8,
+  /**
+   * AUTHENTICATION_PROCEDURE_DATA_BURST - Global challenge on a Data Burst Message, such as SMS sent on the access
+   * channel.
+   */
+  AUTHENTICATION_PROCEDURE_DATA_BURST = 9,
+  UNRECOGNIZED = -1,
+}
+
+export function authenticationProcedureFromJSON(object: any): AuthenticationProcedure {
+  switch (object) {
+    case 0:
+    case "AUTHENTICATION_PROCEDURE_UNSPECIFIED":
+      return AuthenticationProcedure.AUTHENTICATION_PROCEDURE_UNSPECIFIED;
+    case 1:
+    case "AUTHENTICATION_PROCEDURE_REGISTRATION":
+      return AuthenticationProcedure.AUTHENTICATION_PROCEDURE_REGISTRATION;
+    case 2:
+    case "AUTHENTICATION_PROCEDURE_ORIGINATION":
+      return AuthenticationProcedure.AUTHENTICATION_PROCEDURE_ORIGINATION;
+    case 3:
+    case "AUTHENTICATION_PROCEDURE_PAGE_RESPONSE":
+      return AuthenticationProcedure.AUTHENTICATION_PROCEDURE_PAGE_RESPONSE;
+    case 4:
+    case "AUTHENTICATION_PROCEDURE_UNIQUE_CHALLENGE":
+      return AuthenticationProcedure.AUTHENTICATION_PROCEDURE_UNIQUE_CHALLENGE;
+    case 5:
+    case "AUTHENTICATION_PROCEDURE_SSD_UPDATE":
+      return AuthenticationProcedure.AUTHENTICATION_PROCEDURE_SSD_UPDATE;
+    case 6:
+    case "AUTHENTICATION_PROCEDURE_COUNT_UPDATE":
+      return AuthenticationProcedure.AUTHENTICATION_PROCEDURE_COUNT_UPDATE;
+    case 7:
+    case "AUTHENTICATION_PROCEDURE_OTASP_KEY_EXCHANGE":
+      return AuthenticationProcedure.AUTHENTICATION_PROCEDURE_OTASP_KEY_EXCHANGE;
+    case 8:
+    case "AUTHENTICATION_PROCEDURE_OTASP_REAUTHENTICATION":
+      return AuthenticationProcedure.AUTHENTICATION_PROCEDURE_OTASP_REAUTHENTICATION;
+    case 9:
+    case "AUTHENTICATION_PROCEDURE_DATA_BURST":
+      return AuthenticationProcedure.AUTHENTICATION_PROCEDURE_DATA_BURST;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return AuthenticationProcedure.UNRECOGNIZED;
+  }
+}
+
+export function authenticationProcedureToJSON(object: AuthenticationProcedure): string {
+  switch (object) {
+    case AuthenticationProcedure.AUTHENTICATION_PROCEDURE_UNSPECIFIED:
+      return "AUTHENTICATION_PROCEDURE_UNSPECIFIED";
+    case AuthenticationProcedure.AUTHENTICATION_PROCEDURE_REGISTRATION:
+      return "AUTHENTICATION_PROCEDURE_REGISTRATION";
+    case AuthenticationProcedure.AUTHENTICATION_PROCEDURE_ORIGINATION:
+      return "AUTHENTICATION_PROCEDURE_ORIGINATION";
+    case AuthenticationProcedure.AUTHENTICATION_PROCEDURE_PAGE_RESPONSE:
+      return "AUTHENTICATION_PROCEDURE_PAGE_RESPONSE";
+    case AuthenticationProcedure.AUTHENTICATION_PROCEDURE_UNIQUE_CHALLENGE:
+      return "AUTHENTICATION_PROCEDURE_UNIQUE_CHALLENGE";
+    case AuthenticationProcedure.AUTHENTICATION_PROCEDURE_SSD_UPDATE:
+      return "AUTHENTICATION_PROCEDURE_SSD_UPDATE";
+    case AuthenticationProcedure.AUTHENTICATION_PROCEDURE_COUNT_UPDATE:
+      return "AUTHENTICATION_PROCEDURE_COUNT_UPDATE";
+    case AuthenticationProcedure.AUTHENTICATION_PROCEDURE_OTASP_KEY_EXCHANGE:
+      return "AUTHENTICATION_PROCEDURE_OTASP_KEY_EXCHANGE";
+    case AuthenticationProcedure.AUTHENTICATION_PROCEDURE_OTASP_REAUTHENTICATION:
+      return "AUTHENTICATION_PROCEDURE_OTASP_REAUTHENTICATION";
+    case AuthenticationProcedure.AUTHENTICATION_PROCEDURE_DATA_BURST:
+      return "AUTHENTICATION_PROCEDURE_DATA_BURST";
+    case AuthenticationProcedure.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
+export enum AuthenticationResult {
+  AUTHENTICATION_RESULT_UNSPECIFIED = 0,
+  AUTHENTICATION_RESULT_SUCCESS = 1,
+  /** AUTHENTICATION_RESULT_SIGNATURE_MISMATCH - AUTHR or AUTHU does not match the HLR's value. */
+  AUTHENTICATION_RESULT_SIGNATURE_MISMATCH = 2,
+  /**
+   * AUTHENTICATION_RESULT_COUNT_MISMATCH - COUNT differs from the HLR's value. The HLR adopts the mobile's COUNT and
+   * reports success instead, so this result is not produced.
+   */
+  AUTHENTICATION_RESULT_COUNT_MISMATCH = 3,
+  /** AUTHENTICATION_RESULT_NOT_PROVISIONED - The subscriber has no CAVE credentials. */
+  AUTHENTICATION_RESULT_NOT_PROVISIONED = 4,
+  /** AUTHENTICATION_RESULT_PARAMETERS_MISSING - The base station requires authentication but the mobile sent no response. */
+  AUTHENTICATION_RESULT_PARAMETERS_MISSING = 5,
+  /** AUTHENTICATION_RESULT_RAND_MISMATCH - RANDC matches no RAND the base station broadcast. */
+  AUTHENTICATION_RESULT_RAND_MISMATCH = 6,
+  /** AUTHENTICATION_RESULT_HLR_ERROR - The HLR failed or could not be reached. */
+  AUTHENTICATION_RESULT_HLR_ERROR = 7,
+  /** AUTHENTICATION_RESULT_SSD_UPDATE_REJECTED - The mobile rejected the new SSD, or AUTHBS did not match on the mobile. */
+  AUTHENTICATION_RESULT_SSD_UPDATE_REJECTED = 8,
+  /** AUTHENTICATION_RESULT_TIMEOUT - The mobile did not answer within the procedure timer. */
+  AUTHENTICATION_RESULT_TIMEOUT = 9,
+  UNRECOGNIZED = -1,
+}
+
+export function authenticationResultFromJSON(object: any): AuthenticationResult {
+  switch (object) {
+    case 0:
+    case "AUTHENTICATION_RESULT_UNSPECIFIED":
+      return AuthenticationResult.AUTHENTICATION_RESULT_UNSPECIFIED;
+    case 1:
+    case "AUTHENTICATION_RESULT_SUCCESS":
+      return AuthenticationResult.AUTHENTICATION_RESULT_SUCCESS;
+    case 2:
+    case "AUTHENTICATION_RESULT_SIGNATURE_MISMATCH":
+      return AuthenticationResult.AUTHENTICATION_RESULT_SIGNATURE_MISMATCH;
+    case 3:
+    case "AUTHENTICATION_RESULT_COUNT_MISMATCH":
+      return AuthenticationResult.AUTHENTICATION_RESULT_COUNT_MISMATCH;
+    case 4:
+    case "AUTHENTICATION_RESULT_NOT_PROVISIONED":
+      return AuthenticationResult.AUTHENTICATION_RESULT_NOT_PROVISIONED;
+    case 5:
+    case "AUTHENTICATION_RESULT_PARAMETERS_MISSING":
+      return AuthenticationResult.AUTHENTICATION_RESULT_PARAMETERS_MISSING;
+    case 6:
+    case "AUTHENTICATION_RESULT_RAND_MISMATCH":
+      return AuthenticationResult.AUTHENTICATION_RESULT_RAND_MISMATCH;
+    case 7:
+    case "AUTHENTICATION_RESULT_HLR_ERROR":
+      return AuthenticationResult.AUTHENTICATION_RESULT_HLR_ERROR;
+    case 8:
+    case "AUTHENTICATION_RESULT_SSD_UPDATE_REJECTED":
+      return AuthenticationResult.AUTHENTICATION_RESULT_SSD_UPDATE_REJECTED;
+    case 9:
+    case "AUTHENTICATION_RESULT_TIMEOUT":
+      return AuthenticationResult.AUTHENTICATION_RESULT_TIMEOUT;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return AuthenticationResult.UNRECOGNIZED;
+  }
+}
+
+export function authenticationResultToJSON(object: AuthenticationResult): string {
+  switch (object) {
+    case AuthenticationResult.AUTHENTICATION_RESULT_UNSPECIFIED:
+      return "AUTHENTICATION_RESULT_UNSPECIFIED";
+    case AuthenticationResult.AUTHENTICATION_RESULT_SUCCESS:
+      return "AUTHENTICATION_RESULT_SUCCESS";
+    case AuthenticationResult.AUTHENTICATION_RESULT_SIGNATURE_MISMATCH:
+      return "AUTHENTICATION_RESULT_SIGNATURE_MISMATCH";
+    case AuthenticationResult.AUTHENTICATION_RESULT_COUNT_MISMATCH:
+      return "AUTHENTICATION_RESULT_COUNT_MISMATCH";
+    case AuthenticationResult.AUTHENTICATION_RESULT_NOT_PROVISIONED:
+      return "AUTHENTICATION_RESULT_NOT_PROVISIONED";
+    case AuthenticationResult.AUTHENTICATION_RESULT_PARAMETERS_MISSING:
+      return "AUTHENTICATION_RESULT_PARAMETERS_MISSING";
+    case AuthenticationResult.AUTHENTICATION_RESULT_RAND_MISMATCH:
+      return "AUTHENTICATION_RESULT_RAND_MISMATCH";
+    case AuthenticationResult.AUTHENTICATION_RESULT_HLR_ERROR:
+      return "AUTHENTICATION_RESULT_HLR_ERROR";
+    case AuthenticationResult.AUTHENTICATION_RESULT_SSD_UPDATE_REJECTED:
+      return "AUTHENTICATION_RESULT_SSD_UPDATE_REJECTED";
+    case AuthenticationResult.AUTHENTICATION_RESULT_TIMEOUT:
+      return "AUTHENTICATION_RESULT_TIMEOUT";
+    case AuthenticationResult.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
+/** Where AUTH_DATA came from (C.S0004-E §2.1.1.1.2.2). */
+export enum AuthDataSource {
+  AUTH_DATA_SOURCE_UNSPECIFIED = 0,
+  AUTH_DATA_SOURCE_IMSI_S1 = 1,
+  /** AUTH_DATA_SOURCE_DIALED_DIGITS - The last six dialed digits, with IMSI_S1 filling any digits not dialed. */
+  AUTH_DATA_SOURCE_DIALED_DIGITS = 2,
+  /** AUTH_DATA_SOURCE_DIALED_DIGITS_ZERO_FILLED - Fewer than six dialed digits with zeros in the remaining positions. */
+  AUTH_DATA_SOURCE_DIALED_DIGITS_ZERO_FILLED = 3,
+  /** AUTH_DATA_SOURCE_BASE_STATION - Authentication Data IE sent by the base station. */
+  AUTH_DATA_SOURCE_BASE_STATION = 4,
+  UNRECOGNIZED = -1,
+}
+
+export function authDataSourceFromJSON(object: any): AuthDataSource {
+  switch (object) {
+    case 0:
+    case "AUTH_DATA_SOURCE_UNSPECIFIED":
+      return AuthDataSource.AUTH_DATA_SOURCE_UNSPECIFIED;
+    case 1:
+    case "AUTH_DATA_SOURCE_IMSI_S1":
+      return AuthDataSource.AUTH_DATA_SOURCE_IMSI_S1;
+    case 2:
+    case "AUTH_DATA_SOURCE_DIALED_DIGITS":
+      return AuthDataSource.AUTH_DATA_SOURCE_DIALED_DIGITS;
+    case 3:
+    case "AUTH_DATA_SOURCE_DIALED_DIGITS_ZERO_FILLED":
+      return AuthDataSource.AUTH_DATA_SOURCE_DIALED_DIGITS_ZERO_FILLED;
+    case 4:
+    case "AUTH_DATA_SOURCE_BASE_STATION":
+      return AuthDataSource.AUTH_DATA_SOURCE_BASE_STATION;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return AuthDataSource.UNRECOGNIZED;
+  }
+}
+
+export function authDataSourceToJSON(object: AuthDataSource): string {
+  switch (object) {
+    case AuthDataSource.AUTH_DATA_SOURCE_UNSPECIFIED:
+      return "AUTH_DATA_SOURCE_UNSPECIFIED";
+    case AuthDataSource.AUTH_DATA_SOURCE_IMSI_S1:
+      return "AUTH_DATA_SOURCE_IMSI_S1";
+    case AuthDataSource.AUTH_DATA_SOURCE_DIALED_DIGITS:
+      return "AUTH_DATA_SOURCE_DIALED_DIGITS";
+    case AuthDataSource.AUTH_DATA_SOURCE_DIALED_DIGITS_ZERO_FILLED:
+      return "AUTH_DATA_SOURCE_DIALED_DIGITS_ZERO_FILLED";
+    case AuthDataSource.AUTH_DATA_SOURCE_BASE_STATION:
+      return "AUTH_DATA_SOURCE_BASE_STATION";
+    case AuthDataSource.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
 export enum OtaspPrlRoamingIndicatorKind {
   OTASP_PRL_ROAMING_INDICATOR_KIND_UNSPECIFIED = 0,
   OTASP_PRL_ROAMING_INDICATOR_KIND_INDICATOR_ON = 1,
@@ -907,6 +1148,133 @@ export function otaspResultCodeToJSON(object: OtaspResultCode): string {
   }
 }
 
+/** Why OTASP kept the A-key on file instead of generating a new one. */
+export enum OtaspAKeySkipReason {
+  OTASP_A_KEY_SKIP_REASON_UNSPECIFIED = 0,
+  /** OTASP_A_KEY_SKIP_REASON_KEY_ON_FILE_VERIFIED - The *228 origination verified, so the mobile shares the key. */
+  OTASP_A_KEY_SKIP_REASON_KEY_ON_FILE_VERIFIED = 1,
+  OTASP_A_KEY_SKIP_REASON_KEY_ON_FILE_UNVERIFIED = 2,
+  /** OTASP_A_KEY_SKIP_REASON_KEY_ON_FILE_NOT_CHECKED - The *228 origination was not authenticated. */
+  OTASP_A_KEY_SKIP_REASON_KEY_ON_FILE_NOT_CHECKED = 3,
+  UNRECOGNIZED = -1,
+}
+
+export function otaspAKeySkipReasonFromJSON(object: any): OtaspAKeySkipReason {
+  switch (object) {
+    case 0:
+    case "OTASP_A_KEY_SKIP_REASON_UNSPECIFIED":
+      return OtaspAKeySkipReason.OTASP_A_KEY_SKIP_REASON_UNSPECIFIED;
+    case 1:
+    case "OTASP_A_KEY_SKIP_REASON_KEY_ON_FILE_VERIFIED":
+      return OtaspAKeySkipReason.OTASP_A_KEY_SKIP_REASON_KEY_ON_FILE_VERIFIED;
+    case 2:
+    case "OTASP_A_KEY_SKIP_REASON_KEY_ON_FILE_UNVERIFIED":
+      return OtaspAKeySkipReason.OTASP_A_KEY_SKIP_REASON_KEY_ON_FILE_UNVERIFIED;
+    case 3:
+    case "OTASP_A_KEY_SKIP_REASON_KEY_ON_FILE_NOT_CHECKED":
+      return OtaspAKeySkipReason.OTASP_A_KEY_SKIP_REASON_KEY_ON_FILE_NOT_CHECKED;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return OtaspAKeySkipReason.UNRECOGNIZED;
+  }
+}
+
+export function otaspAKeySkipReasonToJSON(object: OtaspAKeySkipReason): string {
+  switch (object) {
+    case OtaspAKeySkipReason.OTASP_A_KEY_SKIP_REASON_UNSPECIFIED:
+      return "OTASP_A_KEY_SKIP_REASON_UNSPECIFIED";
+    case OtaspAKeySkipReason.OTASP_A_KEY_SKIP_REASON_KEY_ON_FILE_VERIFIED:
+      return "OTASP_A_KEY_SKIP_REASON_KEY_ON_FILE_VERIFIED";
+    case OtaspAKeySkipReason.OTASP_A_KEY_SKIP_REASON_KEY_ON_FILE_UNVERIFIED:
+      return "OTASP_A_KEY_SKIP_REASON_KEY_ON_FILE_UNVERIFIED";
+    case OtaspAKeySkipReason.OTASP_A_KEY_SKIP_REASON_KEY_ON_FILE_NOT_CHECKED:
+      return "OTASP_A_KEY_SKIP_REASON_KEY_ON_FILE_NOT_CHECKED";
+    case OtaspAKeySkipReason.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
+export enum OtaspAKeyStep {
+  OTASP_A_KEY_STEP_UNSPECIFIED = 0,
+  /** OTASP_A_KEY_STEP_REQUESTED - MS Key Request sent. */
+  OTASP_A_KEY_STEP_REQUESTED = 1,
+  OTASP_A_KEY_STEP_MS_KEY_RESPONSE = 2,
+  OTASP_A_KEY_STEP_KEY_GENERATION_RESPONSE = 3,
+  /** OTASP_A_KEY_STEP_KEY_DERIVED - The HLR derived the A-key and SSD from the exchanged values. */
+  OTASP_A_KEY_STEP_KEY_DERIVED = 4,
+  OTASP_A_KEY_STEP_SSD_UPDATE = 5,
+  OTASP_A_KEY_STEP_RE_AUTHENTICATION = 6,
+  /** OTASP_A_KEY_STEP_COMMITTED - The mobile committed the new A-key and the HLR stored it. */
+  OTASP_A_KEY_STEP_COMMITTED = 7,
+  /** OTASP_A_KEY_STEP_SKIPPED - No key exchange because an A-key is on file. */
+  OTASP_A_KEY_STEP_SKIPPED = 8,
+  UNRECOGNIZED = -1,
+}
+
+export function otaspAKeyStepFromJSON(object: any): OtaspAKeyStep {
+  switch (object) {
+    case 0:
+    case "OTASP_A_KEY_STEP_UNSPECIFIED":
+      return OtaspAKeyStep.OTASP_A_KEY_STEP_UNSPECIFIED;
+    case 1:
+    case "OTASP_A_KEY_STEP_REQUESTED":
+      return OtaspAKeyStep.OTASP_A_KEY_STEP_REQUESTED;
+    case 2:
+    case "OTASP_A_KEY_STEP_MS_KEY_RESPONSE":
+      return OtaspAKeyStep.OTASP_A_KEY_STEP_MS_KEY_RESPONSE;
+    case 3:
+    case "OTASP_A_KEY_STEP_KEY_GENERATION_RESPONSE":
+      return OtaspAKeyStep.OTASP_A_KEY_STEP_KEY_GENERATION_RESPONSE;
+    case 4:
+    case "OTASP_A_KEY_STEP_KEY_DERIVED":
+      return OtaspAKeyStep.OTASP_A_KEY_STEP_KEY_DERIVED;
+    case 5:
+    case "OTASP_A_KEY_STEP_SSD_UPDATE":
+      return OtaspAKeyStep.OTASP_A_KEY_STEP_SSD_UPDATE;
+    case 6:
+    case "OTASP_A_KEY_STEP_RE_AUTHENTICATION":
+      return OtaspAKeyStep.OTASP_A_KEY_STEP_RE_AUTHENTICATION;
+    case 7:
+    case "OTASP_A_KEY_STEP_COMMITTED":
+      return OtaspAKeyStep.OTASP_A_KEY_STEP_COMMITTED;
+    case 8:
+    case "OTASP_A_KEY_STEP_SKIPPED":
+      return OtaspAKeyStep.OTASP_A_KEY_STEP_SKIPPED;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return OtaspAKeyStep.UNRECOGNIZED;
+  }
+}
+
+export function otaspAKeyStepToJSON(object: OtaspAKeyStep): string {
+  switch (object) {
+    case OtaspAKeyStep.OTASP_A_KEY_STEP_UNSPECIFIED:
+      return "OTASP_A_KEY_STEP_UNSPECIFIED";
+    case OtaspAKeyStep.OTASP_A_KEY_STEP_REQUESTED:
+      return "OTASP_A_KEY_STEP_REQUESTED";
+    case OtaspAKeyStep.OTASP_A_KEY_STEP_MS_KEY_RESPONSE:
+      return "OTASP_A_KEY_STEP_MS_KEY_RESPONSE";
+    case OtaspAKeyStep.OTASP_A_KEY_STEP_KEY_GENERATION_RESPONSE:
+      return "OTASP_A_KEY_STEP_KEY_GENERATION_RESPONSE";
+    case OtaspAKeyStep.OTASP_A_KEY_STEP_KEY_DERIVED:
+      return "OTASP_A_KEY_STEP_KEY_DERIVED";
+    case OtaspAKeyStep.OTASP_A_KEY_STEP_SSD_UPDATE:
+      return "OTASP_A_KEY_STEP_SSD_UPDATE";
+    case OtaspAKeyStep.OTASP_A_KEY_STEP_RE_AUTHENTICATION:
+      return "OTASP_A_KEY_STEP_RE_AUTHENTICATION";
+    case OtaspAKeyStep.OTASP_A_KEY_STEP_COMMITTED:
+      return "OTASP_A_KEY_STEP_COMMITTED";
+    case OtaspAKeyStep.OTASP_A_KEY_STEP_SKIPPED:
+      return "OTASP_A_KEY_STEP_SKIPPED";
+    case OtaspAKeyStep.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
 export enum OtaspSessionOutcome {
   OTASP_SESSION_OUTCOME_UNSPECIFIED = 0,
   OTASP_SESSION_OUTCOME_COMMITTED = 1,
@@ -917,6 +1285,11 @@ export enum OtaspSessionOutcome {
   OTASP_SESSION_OUTCOME_PROTOCOL_ERROR = 6,
   OTASP_SESSION_OUTCOME_NOTHING_TO_COMMIT = 7,
   OTASP_SESSION_OUTCOME_TIMED_OUT = 8,
+  /**
+   * OTASP_SESSION_OUTCOME_KEY_EXCHANGE_FAILED - A-key generation failed after the mobile computed the key. No Commit was sent,
+   * so the mobile kept its previous A-key and programming.
+   */
+  OTASP_SESSION_OUTCOME_KEY_EXCHANGE_FAILED = 9,
   UNRECOGNIZED = -1,
 }
 
@@ -949,6 +1322,9 @@ export function otaspSessionOutcomeFromJSON(object: any): OtaspSessionOutcome {
     case 8:
     case "OTASP_SESSION_OUTCOME_TIMED_OUT":
       return OtaspSessionOutcome.OTASP_SESSION_OUTCOME_TIMED_OUT;
+    case 9:
+    case "OTASP_SESSION_OUTCOME_KEY_EXCHANGE_FAILED":
+      return OtaspSessionOutcome.OTASP_SESSION_OUTCOME_KEY_EXCHANGE_FAILED;
     case -1:
     case "UNRECOGNIZED":
     default:
@@ -976,6 +1352,8 @@ export function otaspSessionOutcomeToJSON(object: OtaspSessionOutcome): string {
       return "OTASP_SESSION_OUTCOME_NOTHING_TO_COMMIT";
     case OtaspSessionOutcome.OTASP_SESSION_OUTCOME_TIMED_OUT:
       return "OTASP_SESSION_OUTCOME_TIMED_OUT";
+    case OtaspSessionOutcome.OTASP_SESSION_OUTCOME_KEY_EXCHANGE_FAILED:
+      return "OTASP_SESSION_OUTCOME_KEY_EXCHANGE_FAILED";
     case OtaspSessionOutcome.UNRECOGNIZED:
     default:
       return "UNRECOGNIZED";
@@ -985,6 +1363,36 @@ export function otaspSessionOutcomeToJSON(object: OtaspSessionOutcome): string {
 /** MSC-originated events. */
 export interface MscNetworkEvent {
   otasp?: OtaspEvent | undefined;
+  authentication?: AuthenticationEvent | undefined;
+}
+
+/** One subscriber authentication outcome. */
+export interface AuthenticationEvent {
+  time: Date | undefined;
+  procedure: AuthenticationProcedure;
+  result: AuthenticationResult;
+  /** True when service was refused because of this result. */
+  serviceRejected: boolean;
+  imsi: string;
+  esn?:
+    | number
+    | undefined;
+  /** Base station that carried the access. */
+  baseStation: string;
+  /**
+   * True when service was allowed without a verified signature because the
+   * HLR holds an A-key for the mobile. An SSD update and unique challenge on
+   * the mobile's next traffic channel decide whether it keeps service.
+   */
+  pendingSsdUpdate: boolean;
+  /**
+   * Global challenge inputs (C.S0005-E §2.3.12.1.3). Unset for procedures
+   * that do not use them.
+   */
+  rand?: number | undefined;
+  authData?: number | undefined;
+  authDataSource: AuthDataSource;
+  count?: number | undefined;
 }
 
 /**
@@ -1008,6 +1416,7 @@ export interface OtaspEvent {
   namReadback?: OtaspNamReadback | undefined;
   stationClassMark?: OtaspStationClassMark | undefined;
   prlReadback?: OtaspPrlReadback | undefined;
+  aKeyProgress?: OtaspAKeyProgress | undefined;
 }
 
 /**
@@ -1343,6 +1752,20 @@ export interface OtaspBlockRejected {
   feature: OtaspBlockFeature;
 }
 
+/** One step of A-key generation by key exchange (C.S0016-D §3.3.1). */
+export interface OtaspAKeyProgress {
+  step: OtaspAKeyStep;
+  success: boolean;
+  aKeyPRev: number;
+  /** Time the mobile took to answer, for the steps where it computes a key. */
+  elapsedMs?:
+    | number
+    | undefined;
+  /** RESULT_CODE the mobile returned (C.S0016-D Table 3.5.1.2-1). */
+  resultCode?: number | undefined;
+  skipReason: OtaspAKeySkipReason;
+}
+
 export interface OtaspCommitResult {
   resultCode: number;
 }
@@ -1368,13 +1791,16 @@ export interface OtaspRecordedEvents {
 }
 
 function createBaseMscNetworkEvent(): MscNetworkEvent {
-  return { otasp: undefined };
+  return { otasp: undefined, authentication: undefined };
 }
 
 export const MscNetworkEvent: MessageFns<MscNetworkEvent> = {
   encode(message: MscNetworkEvent, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
     if (message.otasp !== undefined) {
       OtaspEvent.encode(message.otasp, writer.uint32(10).fork()).join();
+    }
+    if (message.authentication !== undefined) {
+      AuthenticationEvent.encode(message.authentication, writer.uint32(18).fork()).join();
     }
     return writer;
   },
@@ -1394,6 +1820,14 @@ export const MscNetworkEvent: MessageFns<MscNetworkEvent> = {
           message.otasp = OtaspEvent.decode(reader, reader.uint32());
           continue;
         }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.authentication = AuthenticationEvent.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1404,13 +1838,19 @@ export const MscNetworkEvent: MessageFns<MscNetworkEvent> = {
   },
 
   fromJSON(object: any): MscNetworkEvent {
-    return { otasp: isSet(object.otasp) ? OtaspEvent.fromJSON(object.otasp) : undefined };
+    return {
+      otasp: isSet(object.otasp) ? OtaspEvent.fromJSON(object.otasp) : undefined,
+      authentication: isSet(object.authentication) ? AuthenticationEvent.fromJSON(object.authentication) : undefined,
+    };
   },
 
   toJSON(message: MscNetworkEvent): unknown {
     const obj: any = {};
     if (message.otasp !== undefined) {
       obj.otasp = OtaspEvent.toJSON(message.otasp);
+    }
+    if (message.authentication !== undefined) {
+      obj.authentication = AuthenticationEvent.toJSON(message.authentication);
     }
     return obj;
   },
@@ -1423,6 +1863,278 @@ export const MscNetworkEvent: MessageFns<MscNetworkEvent> = {
     message.otasp = (object.otasp !== undefined && object.otasp !== null)
       ? OtaspEvent.fromPartial(object.otasp)
       : undefined;
+    message.authentication = (object.authentication !== undefined && object.authentication !== null)
+      ? AuthenticationEvent.fromPartial(object.authentication)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseAuthenticationEvent(): AuthenticationEvent {
+  return {
+    time: undefined,
+    procedure: 0,
+    result: 0,
+    serviceRejected: false,
+    imsi: "",
+    esn: undefined,
+    baseStation: "",
+    pendingSsdUpdate: false,
+    rand: undefined,
+    authData: undefined,
+    authDataSource: 0,
+    count: undefined,
+  };
+}
+
+export const AuthenticationEvent: MessageFns<AuthenticationEvent> = {
+  encode(message: AuthenticationEvent, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.time !== undefined) {
+      Timestamp.encode(toTimestamp(message.time), writer.uint32(10).fork()).join();
+    }
+    if (message.procedure !== 0) {
+      writer.uint32(16).int32(message.procedure);
+    }
+    if (message.result !== 0) {
+      writer.uint32(24).int32(message.result);
+    }
+    if (message.serviceRejected !== false) {
+      writer.uint32(32).bool(message.serviceRejected);
+    }
+    if (message.imsi !== "") {
+      writer.uint32(42).string(message.imsi);
+    }
+    if (message.esn !== undefined) {
+      writer.uint32(48).uint32(message.esn);
+    }
+    if (message.baseStation !== "") {
+      writer.uint32(58).string(message.baseStation);
+    }
+    if (message.pendingSsdUpdate !== false) {
+      writer.uint32(64).bool(message.pendingSsdUpdate);
+    }
+    if (message.rand !== undefined) {
+      writer.uint32(72).uint32(message.rand);
+    }
+    if (message.authData !== undefined) {
+      writer.uint32(80).uint32(message.authData);
+    }
+    if (message.authDataSource !== 0) {
+      writer.uint32(88).int32(message.authDataSource);
+    }
+    if (message.count !== undefined) {
+      writer.uint32(96).uint32(message.count);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): AuthenticationEvent {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseAuthenticationEvent();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.time = fromTimestamp(Timestamp.decode(reader, reader.uint32()));
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.procedure = reader.int32() as any;
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.result = reader.int32() as any;
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.serviceRejected = reader.bool();
+          continue;
+        }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          message.imsi = reader.string();
+          continue;
+        }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.esn = reader.uint32();
+          continue;
+        }
+        case 7: {
+          if (tag !== 58) {
+            break;
+          }
+
+          message.baseStation = reader.string();
+          continue;
+        }
+        case 8: {
+          if (tag !== 64) {
+            break;
+          }
+
+          message.pendingSsdUpdate = reader.bool();
+          continue;
+        }
+        case 9: {
+          if (tag !== 72) {
+            break;
+          }
+
+          message.rand = reader.uint32();
+          continue;
+        }
+        case 10: {
+          if (tag !== 80) {
+            break;
+          }
+
+          message.authData = reader.uint32();
+          continue;
+        }
+        case 11: {
+          if (tag !== 88) {
+            break;
+          }
+
+          message.authDataSource = reader.int32() as any;
+          continue;
+        }
+        case 12: {
+          if (tag !== 96) {
+            break;
+          }
+
+          message.count = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): AuthenticationEvent {
+    return {
+      time: isSet(object.time) ? fromJsonTimestamp(object.time) : undefined,
+      procedure: isSet(object.procedure) ? authenticationProcedureFromJSON(object.procedure) : 0,
+      result: isSet(object.result) ? authenticationResultFromJSON(object.result) : 0,
+      serviceRejected: isSet(object.serviceRejected)
+        ? globalThis.Boolean(object.serviceRejected)
+        : isSet(object.service_rejected)
+        ? globalThis.Boolean(object.service_rejected)
+        : false,
+      imsi: isSet(object.imsi) ? globalThis.String(object.imsi) : "",
+      esn: isSet(object.esn) ? globalThis.Number(object.esn) : undefined,
+      baseStation: isSet(object.baseStation)
+        ? globalThis.String(object.baseStation)
+        : isSet(object.base_station)
+        ? globalThis.String(object.base_station)
+        : "",
+      pendingSsdUpdate: isSet(object.pendingSsdUpdate)
+        ? globalThis.Boolean(object.pendingSsdUpdate)
+        : isSet(object.pending_ssd_update)
+        ? globalThis.Boolean(object.pending_ssd_update)
+        : false,
+      rand: isSet(object.rand) ? globalThis.Number(object.rand) : undefined,
+      authData: isSet(object.authData)
+        ? globalThis.Number(object.authData)
+        : isSet(object.auth_data)
+        ? globalThis.Number(object.auth_data)
+        : undefined,
+      authDataSource: isSet(object.authDataSource)
+        ? authDataSourceFromJSON(object.authDataSource)
+        : isSet(object.auth_data_source)
+        ? authDataSourceFromJSON(object.auth_data_source)
+        : 0,
+      count: isSet(object.count) ? globalThis.Number(object.count) : undefined,
+    };
+  },
+
+  toJSON(message: AuthenticationEvent): unknown {
+    const obj: any = {};
+    if (message.time !== undefined) {
+      obj.time = message.time.toISOString();
+    }
+    if (message.procedure !== 0) {
+      obj.procedure = authenticationProcedureToJSON(message.procedure);
+    }
+    if (message.result !== 0) {
+      obj.result = authenticationResultToJSON(message.result);
+    }
+    if (message.serviceRejected !== false) {
+      obj.serviceRejected = message.serviceRejected;
+    }
+    if (message.imsi !== "") {
+      obj.imsi = message.imsi;
+    }
+    if (message.esn !== undefined) {
+      obj.esn = Math.round(message.esn);
+    }
+    if (message.baseStation !== "") {
+      obj.baseStation = message.baseStation;
+    }
+    if (message.pendingSsdUpdate !== false) {
+      obj.pendingSsdUpdate = message.pendingSsdUpdate;
+    }
+    if (message.rand !== undefined) {
+      obj.rand = Math.round(message.rand);
+    }
+    if (message.authData !== undefined) {
+      obj.authData = Math.round(message.authData);
+    }
+    if (message.authDataSource !== 0) {
+      obj.authDataSource = authDataSourceToJSON(message.authDataSource);
+    }
+    if (message.count !== undefined) {
+      obj.count = Math.round(message.count);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<AuthenticationEvent>): AuthenticationEvent {
+    return AuthenticationEvent.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<AuthenticationEvent>): AuthenticationEvent {
+    const message = createBaseAuthenticationEvent();
+    message.time = object.time ?? undefined;
+    message.procedure = object.procedure ?? 0;
+    message.result = object.result ?? 0;
+    message.serviceRejected = object.serviceRejected ?? false;
+    message.imsi = object.imsi ?? "";
+    message.esn = object.esn ?? undefined;
+    message.baseStation = object.baseStation ?? "";
+    message.pendingSsdUpdate = object.pendingSsdUpdate ?? false;
+    message.rand = object.rand ?? undefined;
+    message.authData = object.authData ?? undefined;
+    message.authDataSource = object.authDataSource ?? 0;
+    message.count = object.count ?? undefined;
     return message;
   },
 };
@@ -1444,6 +2156,7 @@ function createBaseOtaspEvent(): OtaspEvent {
     namReadback: undefined,
     stationClassMark: undefined,
     prlReadback: undefined,
+    aKeyProgress: undefined,
   };
 }
 
@@ -1493,6 +2206,9 @@ export const OtaspEvent: MessageFns<OtaspEvent> = {
     }
     if (message.prlReadback !== undefined) {
       OtaspPrlReadback.encode(message.prlReadback, writer.uint32(130).fork()).join();
+    }
+    if (message.aKeyProgress !== undefined) {
+      OtaspAKeyProgress.encode(message.aKeyProgress, writer.uint32(138).fork()).join();
     }
     return writer;
   },
@@ -1624,6 +2340,14 @@ export const OtaspEvent: MessageFns<OtaspEvent> = {
           message.prlReadback = OtaspPrlReadback.decode(reader, reader.uint32());
           continue;
         }
+        case 17: {
+          if (tag !== 138) {
+            break;
+          }
+
+          message.aKeyProgress = OtaspAKeyProgress.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1706,6 +2430,11 @@ export const OtaspEvent: MessageFns<OtaspEvent> = {
         : isSet(object.prl_readback)
         ? OtaspPrlReadback.fromJSON(object.prl_readback)
         : undefined,
+      aKeyProgress: isSet(object.aKeyProgress)
+        ? OtaspAKeyProgress.fromJSON(object.aKeyProgress)
+        : isSet(object.a_key_progress)
+        ? OtaspAKeyProgress.fromJSON(object.a_key_progress)
+        : undefined,
     };
   },
 
@@ -1755,6 +2484,9 @@ export const OtaspEvent: MessageFns<OtaspEvent> = {
     }
     if (message.prlReadback !== undefined) {
       obj.prlReadback = OtaspPrlReadback.toJSON(message.prlReadback);
+    }
+    if (message.aKeyProgress !== undefined) {
+      obj.aKeyProgress = OtaspAKeyProgress.toJSON(message.aKeyProgress);
     }
     return obj;
   },
@@ -1809,6 +2541,9 @@ export const OtaspEvent: MessageFns<OtaspEvent> = {
       : undefined;
     message.prlReadback = (object.prlReadback !== undefined && object.prlReadback !== null)
       ? OtaspPrlReadback.fromPartial(object.prlReadback)
+      : undefined;
+    message.aKeyProgress = (object.aKeyProgress !== undefined && object.aKeyProgress !== null)
+      ? OtaspAKeyProgress.fromPartial(object.aKeyProgress)
       : undefined;
     return message;
   },
@@ -5724,6 +6459,162 @@ export const OtaspBlockRejected: MessageFns<OtaspBlockRejected> = {
     message.blockId = object.blockId ?? 0;
     message.resultCode = object.resultCode ?? 0;
     message.feature = object.feature ?? 0;
+    return message;
+  },
+};
+
+function createBaseOtaspAKeyProgress(): OtaspAKeyProgress {
+  return { step: 0, success: false, aKeyPRev: 0, elapsedMs: undefined, resultCode: undefined, skipReason: 0 };
+}
+
+export const OtaspAKeyProgress: MessageFns<OtaspAKeyProgress> = {
+  encode(message: OtaspAKeyProgress, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.step !== 0) {
+      writer.uint32(8).int32(message.step);
+    }
+    if (message.success !== false) {
+      writer.uint32(16).bool(message.success);
+    }
+    if (message.aKeyPRev !== 0) {
+      writer.uint32(24).uint32(message.aKeyPRev);
+    }
+    if (message.elapsedMs !== undefined) {
+      writer.uint32(32).uint32(message.elapsedMs);
+    }
+    if (message.resultCode !== undefined) {
+      writer.uint32(40).uint32(message.resultCode);
+    }
+    if (message.skipReason !== 0) {
+      writer.uint32(48).int32(message.skipReason);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): OtaspAKeyProgress {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseOtaspAKeyProgress();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.step = reader.int32() as any;
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.success = reader.bool();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.aKeyPRev = reader.uint32();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.elapsedMs = reader.uint32();
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.resultCode = reader.uint32();
+          continue;
+        }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.skipReason = reader.int32() as any;
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): OtaspAKeyProgress {
+    return {
+      step: isSet(object.step) ? otaspAKeyStepFromJSON(object.step) : 0,
+      success: isSet(object.success) ? globalThis.Boolean(object.success) : false,
+      aKeyPRev: isSet(object.aKeyPRev)
+        ? globalThis.Number(object.aKeyPRev)
+        : isSet(object.a_key_p_rev)
+        ? globalThis.Number(object.a_key_p_rev)
+        : 0,
+      elapsedMs: isSet(object.elapsedMs)
+        ? globalThis.Number(object.elapsedMs)
+        : isSet(object.elapsed_ms)
+        ? globalThis.Number(object.elapsed_ms)
+        : undefined,
+      resultCode: isSet(object.resultCode)
+        ? globalThis.Number(object.resultCode)
+        : isSet(object.result_code)
+        ? globalThis.Number(object.result_code)
+        : undefined,
+      skipReason: isSet(object.skipReason)
+        ? otaspAKeySkipReasonFromJSON(object.skipReason)
+        : isSet(object.skip_reason)
+        ? otaspAKeySkipReasonFromJSON(object.skip_reason)
+        : 0,
+    };
+  },
+
+  toJSON(message: OtaspAKeyProgress): unknown {
+    const obj: any = {};
+    if (message.step !== 0) {
+      obj.step = otaspAKeyStepToJSON(message.step);
+    }
+    if (message.success !== false) {
+      obj.success = message.success;
+    }
+    if (message.aKeyPRev !== 0) {
+      obj.aKeyPRev = Math.round(message.aKeyPRev);
+    }
+    if (message.elapsedMs !== undefined) {
+      obj.elapsedMs = Math.round(message.elapsedMs);
+    }
+    if (message.resultCode !== undefined) {
+      obj.resultCode = Math.round(message.resultCode);
+    }
+    if (message.skipReason !== 0) {
+      obj.skipReason = otaspAKeySkipReasonToJSON(message.skipReason);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<OtaspAKeyProgress>): OtaspAKeyProgress {
+    return OtaspAKeyProgress.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<OtaspAKeyProgress>): OtaspAKeyProgress {
+    const message = createBaseOtaspAKeyProgress();
+    message.step = object.step ?? 0;
+    message.success = object.success ?? false;
+    message.aKeyPRev = object.aKeyPRev ?? 0;
+    message.elapsedMs = object.elapsedMs ?? undefined;
+    message.resultCode = object.resultCode ?? undefined;
+    message.skipReason = object.skipReason ?? 0;
     return message;
   },
 };

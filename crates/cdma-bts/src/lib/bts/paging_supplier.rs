@@ -1,6 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use super::global_challenge::GlobalChallenge;
+
 use log::{debug, info, trace, warn};
 use parking_lot::Mutex;
 
@@ -141,6 +143,8 @@ pub struct PagingSupplierState {
     pending_retry_events: Vec<PagingRetryEvent>,
     /// Broadcast sender for PCH transmit events.
     pch_transmit_tx: Option<tokio::sync::broadcast::Sender<PchTransmitEvent>>,
+    /// Global-challenge RAND broadcast in the Access Parameters Message when AUTH is enabled.
+    global_challenge: Option<Arc<GlobalChallenge>>,
 }
 
 impl PagingSupplierState {
@@ -170,6 +174,7 @@ impl PagingSupplierState {
             last_received_msg_seq: HashMap::new(),
             pending_retry_events: Vec::new(),
             pch_transmit_tx: None,
+            global_challenge: None,
         }
     }
 
@@ -182,6 +187,15 @@ impl PagingSupplierState {
     /// Install a broadcast sender for PCH transmit events.
     pub fn set_pch_transmit_tx(&mut self, tx: tokio::sync::broadcast::Sender<PchTransmitEvent>) {
         self.pch_transmit_tx = Some(tx);
+    }
+
+    /// Must be installed before the paging supplier is built.
+    pub fn set_global_challenge(&mut self, rand: Arc<GlobalChallenge>) {
+        self.global_challenge = Some(rand);
+    }
+
+    pub fn global_challenge(&self) -> Option<Arc<GlobalChallenge>> {
+        self.global_challenge.clone()
     }
 
     /// Emit a PCH transmit event for a directed SDU.
@@ -625,6 +639,8 @@ pub fn build_bts_paging_supplier(
         overhead_schedule.push(PagingMessageKind::AlternativeTechnologiesInformation);
     }
 
+    let global_challenge = state.lock().global_challenge.clone();
+
     let mut current_slot_num: Option<u16> = None;
     let mut gpm_sent_this_slot = false;
     let mut overhead_index = 0usize;
@@ -734,7 +750,11 @@ pub fn build_bts_paging_supplier(
             let defaults = &paging.message_defaults.general_page;
             let message = PagingChannelMessage::GeneralPage(GeneralPageMessage {
                 config_msg_seq: overhead.config_seq,
-                acc_msg_seq: overhead.acc_config_seq,
+                acc_msg_seq: global_challenge
+                    .as_ref()
+                    .map_or(overhead.acc_config_seq, |rand| {
+                        rand.acc_msg_seq(overhead.acc_config_seq)
+                    }),
                 class_0_done: defaults.class_0_done && !has_remaining_class0,
                 class_1_done: defaults.class_1_done && !has_remaining_class1,
                 tmsi_done: defaults.tmsi_done && !has_remaining_tmsi,
@@ -793,8 +813,15 @@ pub fn build_bts_paging_supplier(
         }
         let kind = overhead_schedule[overhead_index % overhead_schedule.len()];
         overhead_index += 1;
-        let message =
+        let mut message =
             build_scheduled_message(kind, pilot_offset, &overhead, &paging, evdo_advertisement);
+        if let (PagingChannelMessage::AccessParameters(apm), Some(rand)) =
+            (&mut message, global_challenge.as_ref())
+        {
+            apm.auth = rand.auth();
+            apm.rand = rand.current();
+            apm.acc_msg_seq = rand.acc_msg_seq(overhead.acc_config_seq);
+        }
         trace!(
             "BTS paging supplier: {:?} (overhead_index={}, slot_num={})",
             kind, overhead_index, slot_num

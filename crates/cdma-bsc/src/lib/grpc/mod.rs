@@ -3,6 +3,8 @@ mod state;
 
 /// Starts the BSC management gRPC server on `addr`.
 pub use service::run_grpc_server;
+#[cfg(test)]
+pub(crate) use service::{to_proto_access_event, to_proto_traffic_event};
 /// Shared BSC runtime state exposed to the management gRPC service.
 pub use state::BscState;
 

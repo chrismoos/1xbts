@@ -21,35 +21,48 @@ pub fn bitstream_to_hex(bs: &Bitstream) -> String {
     bytes_to_hex(&bytes)
 }
 
-/// Forward-link order name per C.S0005-E Table 3.7.4-1.
-///
-/// Covers both f-csch (paging channel) and f-dsch (traffic channel) order codes.
-pub fn forward_order_name(order: u8) -> &'static str {
-    match order {
-        // f-csch ORDER codes (C.S0005-E Table 3.7.4-1)
-        0b000001 => "Abbreviated Alert",
-        0b000010 => "Base Station Challenge Confirmation",
-        0b000011 => "Message Encryption Mode",
-        0b000100 => "Reorder",
-        0b000101 => "Parameter Update",
-        0b000110 => "Audit",
-        0b001001 => "Intercept",
-        0b001010 => "Maintenance",
-        // f-dsch ORDER codes (C.S0005-E Table 3.7.4-1)
-        0b010000 => "Base Station Acknowledgment",
-        0b010001 => "Pilot Measurement Request",
-        0b010010 => "Lock Until Power-Cycled",
-        0b010011 => "Maintenance Required",
-        0b010100 => "Unlock",
-        0b010101 => "Release",
-        0b010110 => "Outer Loop Report Request",
-        0b010111 => "Long Code Transition",
-        0b011001 => "Continuous DTMF Tone",
-        0b011010 => "Status Request",
-        0b011011 => "Registration Accepted",
-        0b011100 => "Registration Rejected",
-        0b011110 => "Local Control",
-        0b100001 => "Connect",
+/// Forward order name per C.S0005-E Table 3.7.4-1, which covers both f-csch and
+/// f-dsch. Several ORDER codes name different orders by ORDQ. Without ORDQ those
+/// codes get the name of the order family.
+pub fn forward_order_name(order: u8, ordq: Option<u8>) -> &'static str {
+    match (order, ordq) {
+        (0b000001, _) => "Abbreviated Alert",
+        (0b000010, _) => "Base Station Challenge Confirmation",
+        (0b000011, _) => "Message Encryption Mode",
+        (0b000100, _) => "Reorder",
+        (0b000101, _) => "Parameter Update",
+        (0b000110, _) => "Audit",
+        (0b001001, _) => "Intercept",
+        (0b001010, _) => "Maintenance",
+        (0b010000, _) => "Base Station Acknowledgment",
+        (0b010001, _) => "Pilot Measurement Request",
+        (0b010010, Some(0xFF)) => "Unlock",
+        (0b010010, Some(q)) if q >> 4 == 0b0001 => "Lock Until Power-Cycled",
+        (0b010010, Some(q)) if q >> 4 == 0b0010 => "Maintenance Required",
+        (0b010010, _) => "Lock/Unlock",
+        (0b010011, _) => "Service Option Request",
+        (0b010100, _) => "Service Option Response",
+        (0b010101, _) => "Release",
+        (0b010110, _) => "Outer Loop Report Request",
+        (0b010111, _) => "Long Code Transition",
+        (0b011001, _) => "Continuous DTMF Tone",
+        (0b011010, _) => "Status Request",
+        (0b011011, Some(0b0000_0000 | 0b0000_0101 | 0b0000_0111)) => "Registration Accepted",
+        (0b011011, Some(0b0000_0001)) => "Registration Request",
+        (0b011011, Some(0b0000_0010)) => "Registration Rejected",
+        (0b011011, Some(0b0000_0100)) => "Registration Rejected (delete TMSI)",
+        (0b011011, _) => "Registration",
+        (0b011101, _) => "Service Option Control",
+        (0b011110, _) => "Local Control",
+        (0b011111, _) => "Slotted Mode",
+        (0b100000, _) => "Retry",
+        (0b100001, _) => "Base Station Reject",
+        (0b100010, _) => "Transit to Idle",
+        (0b100011, _) => "BCMC",
+        (0b100100, _) => "Fast Call Setup",
+        (0b100101, _) => "Service Status",
+        (0b100110, _) => "Location Services",
+        (0b100111, _) => "Shared Channel Configuration",
         _ => "Unknown Order",
     }
 }
@@ -146,4 +159,35 @@ pub fn format_dtmf_digits(digits: &[u8], digit_mode: bool) -> String {
             _ => '?',
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::forward_order_name;
+
+    #[test]
+    fn forward_order_names_follow_ordq() {
+        const REGISTRATION: u8 = 0b011011;
+        const LOCK: u8 = 0b010010;
+        assert_eq!(
+            forward_order_name(REGISTRATION, Some(0)),
+            "Registration Accepted"
+        );
+        assert_eq!(
+            forward_order_name(REGISTRATION, Some(2)),
+            "Registration Rejected"
+        );
+        assert_eq!(
+            forward_order_name(REGISTRATION, Some(1)),
+            "Registration Request"
+        );
+        assert_eq!(forward_order_name(REGISTRATION, None), "Registration");
+        assert_eq!(
+            forward_order_name(LOCK, Some(0x13)),
+            "Lock Until Power-Cycled"
+        );
+        assert_eq!(forward_order_name(LOCK, Some(0x21)), "Maintenance Required");
+        assert_eq!(forward_order_name(LOCK, Some(0xFF)), "Unlock");
+        assert_eq!(forward_order_name(0b100001, Some(0)), "Base Station Reject");
+    }
 }

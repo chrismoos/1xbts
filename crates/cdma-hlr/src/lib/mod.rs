@@ -1,4 +1,6 @@
+pub mod auth;
 pub mod config;
+pub mod key_exchange;
 pub mod model;
 pub mod node;
 pub mod prl_proto;

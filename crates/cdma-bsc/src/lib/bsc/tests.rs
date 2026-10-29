@@ -236,7 +236,7 @@ fn test_network_client_config() -> NetworkClientConfig {
         cell_id: CellId { cell: 1, sector: 1 },
         mscid: 1,
         pilot_pn: 0,
-        auth_mode: 0,
+        auth_mode: Default::default(),
         p_rev_in_use: 6,
         market_id: 1,
         generating_entity_id: 1,
@@ -410,6 +410,7 @@ fn test_access_event() -> AccessChannelEvent {
         rev_supported_rcs: Vec::new(),
         decoded_rdsch: None,
         raw_pdu_bits: None,
+        authentication: None,
     }
 }
 
@@ -2273,6 +2274,58 @@ async fn access_reject_of_ecam_removes_pending_traffic_channel() {
 
     assert!(bsc.mobiles[0].traffic_channel().is_none());
     assert_eq!(bsc.mobiles[0].state, MsState::Registered);
+}
+
+#[tokio::test]
+async fn outgoing_call_preserves_handset_voice_privacy_request() {
+    for requested in [false, true] {
+        let (client, endpoint) = crate::a1_edge::InProcessMscClient::pair(32);
+        let (mut bsc, _traffic_rx, _walsh) = test_bsc_with_active_traffic_channel_and_msc_client(
+            SERVICE_OPTION_EVRC_A,
+            Arc::new(client),
+        )
+        .await;
+        let address = bsc.mobiles[0].fwd_address.clone();
+        let mut event = test_registration_event_with_esn(0x1234_5678, 4);
+        event.message_id = MessageId::Origination;
+        event.decoded_l3 = Some(test_origination_l3(SERVICE_OPTION_EVRC_A, 0));
+        let Some(AccessMessage::Origination(origination)) = event.decoded_l3.as_mut() else {
+            panic!("expected origination");
+        };
+        origination.pm = requested;
+        let call_id = bsc
+            .send_complete_layer3_for_origination(
+                &address,
+                &event,
+                SERVICE_OPTION_EVRC_A,
+                Some("2222"),
+                PendingA1AssignmentKind::Voice {
+                    session_id: uuid::Uuid::new_v4(),
+                    leg_role: VoiceLegRole::Caller,
+                    renegotiate_from_so: None,
+                },
+            )
+            .await
+            .expect("origination should be forwarded");
+        let outbound = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let message = endpoint.recv_from_bsc().await.expect("A1 endpoint open");
+                if message.call_id() == Some(call_id) {
+                    break message;
+                }
+            }
+        })
+        .await
+        .expect("outgoing call should reach MSC");
+        let envelope = outbound.decode().expect("decode A1 envelope");
+        let message = cdma_ios::CompleteLayer3InformationMessage::decode(&envelope.payload)
+            .expect("decode Complete Layer 3 Information");
+        let request = message
+            .layer3_information
+            .decode_cm_service_request()
+            .expect("decode CM Service Request");
+        assert_eq!(request.voice_privacy_request, requested);
+    }
 }
 
 #[tokio::test]
@@ -7372,4 +7425,685 @@ async fn qcelp13k_origination_assigns_rc2_traffic_channel() {
     assert_eq!(cam.granted_mode, Some(0b10));
     assert_eq!(cam.bypass_alert_answer, Some(false));
     assert!(!cam.freq_incl);
+}
+
+/// ORDER and ORDQ of each captured PCH Order. The Order SDU starts with
+/// ORDER(6) and ADD_RECORD_LEN(3), and ORDQ(8) opens the additional record when
+/// one is present (C.S0005-E §3.7.2.3.2.7).
+fn pch_orders(client: &CapturingNetworkBtsClient) -> Vec<(u8, u8)> {
+    client
+        .pch_messages
+        .lock()
+        .iter()
+        .filter_map(|message| {
+            let aim = message.air_interface_message.as_ref()?;
+            let id = MessageId::from_wire(
+                cdma_common::lac::message_types::WireChannel::ForwardCommon,
+                aim.message_type,
+            )?;
+            if id != MessageId::Order || aim.message.len() < 2 {
+                return None;
+            }
+            let b = &aim.message;
+            let add_record_len = ((b[0] & 0x03) << 1) | (b[1] >> 7);
+            let ordq = if add_record_len == 0 {
+                0
+            } else {
+                ((b[1] & 0x7F) << 1) | (b.get(2).copied().unwrap_or(0) >> 7)
+            };
+            Some((b[0] >> 2, ordq))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn authenticated_registration_waits_for_the_msc_and_relays_its_reject() {
+    const BS_ACK_ORDER: u8 = 0b010000;
+    const REGISTRATION_ORDER: u8 = 0b011011;
+    const REGISTRATION_REJECTED_ORDQ: u8 = 0b10;
+
+    let bts_client = test_capturing_bts_client(
+        Arc::new(Mutex::new(WalshAllocator::new())),
+        Arc::new(ChannelRegistry::new()),
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let (msc_client, msc_endpoint) = crate::a1_edge::InProcessMscClient::pair(4);
+    let msc: Arc<dyn crate::a1_edge::MscClient> = Arc::new(msc_client);
+    let mut overhead = OverheadParameters::default();
+    overhead.auth_mode = Some(1);
+    let mut bsc = Bsc::new(Config {
+        bts: test_registry(
+            overhead,
+            Some(bts_client.clone() as Arc<dyn BtsControlClient>),
+        ),
+        traffic_assignment: TrafficAssignmentConfig::default(),
+        access_event_rx: None,
+        cell_detach_rx: None,
+        access_event_broadcast: None,
+        sms_request_rx: None,
+        sms_request_tx: None,
+        data_request_rx: None,
+        data_request_tx: None,
+        power_override_request_rx: None,
+        power_override_request_tx: None,
+        mobiles_tx: None,
+        paging_broadcast: None,
+        traffic_broadcast: None,
+        hlr_repo: None,
+        msc_client: msc,
+        traffic_retry: TrafficRetryConfig::default(),
+        voice_timeouts: Default::default(),
+        pcf_client: None,
+        mobile_idle_timeout_s: 0,
+        bts_paging_state: None,
+        node_id: "bsc-auth-test".to_string(),
+        msc_voice_bearer: None,
+    });
+
+    let mut registration = registration_event();
+    registration.authentication = Some(cdma_common::events::GlobalChallengeResponse {
+        authr: 0x2_1234,
+        randc: 0xAB,
+        count: 5,
+        rand: Some(0xAB00_0001),
+    });
+    bsc.inject_access_event(registration).await;
+
+    let outbound = tokio::time::timeout(Duration::from_secs(1), msc_endpoint.recv_from_bsc())
+        .await
+        .expect("Location Updating Request should be sent")
+        .expect("A1 endpoint should receive it");
+    let call_id = outbound.call_id().expect("registration must be correlated");
+    let decoded = outbound.decode().unwrap();
+    let cli3 = cdma_ios::CompleteLayer3InformationMessage::decode(&decoded.payload).unwrap();
+    let lur = cli3
+        .layer3_information
+        .decode_location_updating_request()
+        .unwrap();
+    assert_eq!(
+        lur.authentication_response_parameter.map(|p| p.signature()),
+        Some(0x2_1234)
+    );
+    assert_eq!(
+        lur.authentication_confirmation_parameter.map(|p| p.0),
+        Some(0xAB)
+    );
+    assert_eq!(lur.authentication_parameter_count.map(|p| p.0), Some(5));
+    assert_eq!(
+        lur.authentication_challenge_parameter
+            .and_then(|p| p.rand()),
+        Some(0xAB00_0001)
+    );
+    assert_eq!(pch_orders(&bts_client), vec![(BS_ACK_ORDER, 0)]);
+
+    let reject = cdma_ios::LocationUpdatingRejectMessage {
+        reject_cause: cdma_ios::RejectCause(0x03),
+    };
+    bsc.handle_incoming_a1_message(crate::a1_edge::EncodedA1Message::from_message_for_call(
+        &cdma_ios::Message::new(
+            cdma_ios::MessageType::LocationUpdatingReject,
+            reject.encode().unwrap(),
+        ),
+        Some(call_id),
+    ))
+    .await;
+    assert_eq!(
+        pch_orders(&bts_client),
+        vec![
+            (BS_ACK_ORDER, 0),
+            (REGISTRATION_ORDER, REGISTRATION_REJECTED_ORDQ)
+        ]
+    );
+}
+
+#[test]
+fn global_challenge_ies_report_missing_and_mismatched_rand() {
+    use super::a1::A1GlobalChallengeIes;
+    let mut event = registration_event();
+    assert_eq!(
+        A1GlobalChallengeIes::from_event(&event, false),
+        A1GlobalChallengeIes::default()
+    );
+    assert_eq!(
+        A1GlobalChallengeIes::from_event(&event, true)
+            .event
+            .map(|e| e.0),
+        Some(cdma_ios::AUTHENTICATION_EVENT_PARAMETERS_NOT_RECEIVED)
+    );
+    event.authentication = Some(cdma_common::events::GlobalChallengeResponse {
+        authr: 1,
+        randc: 0x11,
+        count: 0,
+        rand: None,
+    });
+    let ies = A1GlobalChallengeIes::from_event(&event, true);
+    assert!(ies.challenge.is_none());
+    assert_eq!(
+        ies.event.map(|e| e.0),
+        Some(cdma_ios::AUTHENTICATION_EVENT_RANDC_MISMATCH)
+    );
+}
+
+fn traffic_order_event(
+    walsh_code: u8,
+    msg_seq: u8,
+    order: u8,
+    order_specific: Vec<u8>,
+) -> AccessChannelEvent {
+    let mut event = test_access_event();
+    event.message_id = MessageId::Order;
+    event.msg_type_name = "Order Message".to_string();
+    event.msg_seq = Some(msg_seq);
+    event.ack_req = false;
+    event.traffic_walsh_code = Some(walsh_code);
+    event.order_code = Some(order);
+    event.decoded_l3 = Some(AccessMessage::Order(cdma_common::access::OrderMessage {
+        header: AccessMessageHeader {
+            pd: 1,
+            message_id: MessageId::Order,
+        },
+        order,
+        add_record_len: order_specific.len() as u8,
+        order_specific,
+        remaining_bits: 0,
+    }));
+    event
+}
+
+async fn next_a1_from_bsc(
+    endpoint: &crate::a1_edge::InProcessMscEndpoint,
+    message_type: cdma_ios::MessageType,
+) -> crate::a1_edge::EncodedA1Message {
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(1), endpoint.recv_from_bsc())
+            .await
+            .expect("BSC should send an A1 message")
+            .expect("A1 endpoint should receive it");
+        if message.message_type() == message_type {
+            return message;
+        }
+    }
+}
+
+#[tokio::test]
+async fn traffic_ssd_update_is_relayed_between_a1_and_the_mobile() {
+    const CALL_ID: u64 = 77;
+    let (msc_client, msc_endpoint) = crate::a1_edge::InProcessMscClient::pair(8);
+    let (mut bsc, mut traffic_rx, walsh_code) =
+        test_bsc_with_active_traffic_channel_and_msc_client(
+            SERVICE_OPTION_QCELP13,
+            Arc::new(msc_client),
+        )
+        .await;
+    let cell = bsc.mobiles[0]
+        .serving_cell
+        .expect("test mobile has a serving cell");
+    bsc.mobiles
+        .update_tc(cell, walsh_code, |_, tc| tc.a1_call_id = Some(CALL_ID));
+    while traffic_rx.try_recv().is_ok() {}
+
+    let request = cdma_ios::SsdUpdateRequestMessage {
+        authentication_challenge_parameter_randssd: cdma_ios::SsdUpdateChallengeParameter([
+            0x04, 0x4d, 0x18, 0xee, 0xaa, 0x05, 0x89, 0x5c,
+        ]),
+    };
+    bsc.handle_incoming_a1_message(crate::a1_edge::EncodedA1Message::from_message_for_call(
+        &cdma_ios::Message::new(
+            cdma_ios::MessageType::SsdUpdateRequest,
+            request.encode().unwrap(),
+        ),
+        Some(CALL_ID),
+    ))
+    .await;
+    let ssdum = traffic_rx.try_recv().expect("SSD Update Message on F-TCH");
+    assert_eq!(ssdum.mcsb.message_id, MessageId::SsdUpdate);
+    assert_eq!(ssdum.sdu_hex.to_lowercase(), "4d18eeaa05895c");
+
+    bsc.inject_access_event(traffic_order_event(
+        walsh_code,
+        1,
+        0b000010,
+        vec![0x00, 0xDE, 0xAD, 0xBE, 0xEF],
+    ))
+    .await;
+    let challenge =
+        next_a1_from_bsc(&msc_endpoint, cdma_ios::MessageType::BaseStationChallenge).await;
+    assert_eq!(challenge.call_id(), Some(CALL_ID));
+    let challenge =
+        cdma_ios::BaseStationChallengeMessage::decode(&challenge.decode().unwrap().payload)
+            .unwrap();
+    assert_eq!(
+        challenge.authentication_challenge_parameter_randbs.randbs(),
+        Some(0xDEAD_BEEF)
+    );
+
+    while traffic_rx.try_recv().is_ok() {}
+    let response = cdma_ios::BaseStationChallengeResponseMessage {
+        authentication_response_parameter_authbs: cdma_ios::AuthenticationResponseParameter::new(
+            cdma_ios::AuthSignatureType::Authbs,
+            0x2_ABCD,
+        ),
+    };
+    bsc.handle_incoming_a1_message(crate::a1_edge::EncodedA1Message::from_message_for_call(
+        &cdma_ios::Message::new(
+            cdma_ios::MessageType::BaseStationChallengeResponse,
+            response.encode().unwrap(),
+        ),
+        Some(CALL_ID),
+    ))
+    .await;
+    let confirmation = traffic_rx
+        .try_recv()
+        .expect("BS Challenge Confirmation on F-TCH");
+    let order = confirmation.order.expect("an Order");
+    assert_eq!(order.order, 0b000010);
+    assert_eq!(order.order_specific_fields, vec![0xAA, 0xF3, 0x40]);
+
+    bsc.inject_access_event(traffic_order_event(walsh_code, 2, 0b000011, vec![0x01]))
+        .await;
+    let result = next_a1_from_bsc(&msc_endpoint, cdma_ios::MessageType::SsdUpdateResponse).await;
+    let result =
+        cdma_ios::SsdUpdateResponseMessage::decode(&result.decode().unwrap().payload).unwrap();
+    assert_eq!(result.cause_layer_3.map(|c| c.cause_value), Some(0x3B));
+}
+
+#[tokio::test]
+async fn acknowledged_otasp_data_burst_is_reported_delivered() {
+    const CALL_ID: u64 = 78;
+    const TAG: u32 = 0x8000_000E;
+    const MS_ACK_ORDER: u8 = 0b010000;
+    let (msc_client, msc_endpoint) = crate::a1_edge::InProcessMscClient::pair(8);
+    let (mut bsc, mut traffic_rx, walsh_code) =
+        test_bsc_with_active_traffic_channel_and_msc_client(
+            SERVICE_OPTION_QCELP13,
+            Arc::new(msc_client),
+        )
+        .await;
+    let cell = bsc.mobiles[0]
+        .serving_cell
+        .expect("test mobile has a serving cell");
+    bsc.mobiles
+        .update_tc(cell, walsh_code, |_, tc| tc.a1_call_id = Some(CALL_ID));
+    while traffic_rx.try_recv().is_ok() {}
+
+    let deliver = cdma_ios::AddsDeliverMessage {
+        adds_user_part: cdma_ios::AddsUserPart {
+            burst_type: cdma_common::consts::BURST_TYPE_OTASP,
+            data: vec![0x04],
+        },
+        tag: Some(cdma_ios::Tag(TAG)),
+    };
+    bsc.handle_incoming_a1_message(crate::a1_edge::EncodedA1Message::from_message_for_call(
+        &cdma_ios::Message::new(
+            cdma_ios::MessageType::AddsDeliver,
+            deliver.encode().unwrap(),
+        ),
+        Some(CALL_ID),
+    ))
+    .await;
+    let burst = traffic_rx.try_recv().expect("Data Burst on F-TCH");
+    assert_eq!(burst.mcsb.message_id, MessageId::DataBurst);
+
+    let mut ack = traffic_order_event(walsh_code, 1, MS_ACK_ORDER, vec![]);
+    ack.valid_ack = true;
+    ack.ack_seq = Some(burst.mcsb.msg_seq);
+    bsc.inject_access_event(ack).await;
+    let reply = next_a1_from_bsc(&msc_endpoint, cdma_ios::MessageType::AddsDeliverAck).await;
+    let reply = cdma_ios::AddsDeliverAckMessage::decode(&reply.decode().unwrap().payload).unwrap();
+    assert_eq!(reply.tag, Some(cdma_ios::Tag(TAG)));
+    assert_eq!(
+        reply.cause, None,
+        "an acknowledged burst is reported delivered"
+    );
+    assert!(bsc.pending_otasp_dbm.is_empty());
+}
+
+#[tokio::test]
+async fn private_long_code_request_waits_for_msc_authorization() {
+    const LONG_CODE_TRANSITION_REQUEST: u8 = 0b010111;
+    let (msc_client, msc_endpoint) = crate::a1_edge::InProcessMscClient::pair(8);
+    let (mut bsc, mut traffic_rx, walsh_code) =
+        test_bsc_with_active_traffic_channel_and_msc_client(
+            SERVICE_OPTION_QCELP13,
+            Arc::new(msc_client),
+        )
+        .await;
+    const CALL_ID: u64 = 77;
+    let cell = bsc.mobiles[0].serving_cell.unwrap();
+    bsc.mobiles
+        .update_tc(cell, walsh_code, |_, tc| tc.a1_call_id = Some(CALL_ID));
+    while traffic_rx.try_recv().is_ok() {}
+
+    bsc.inject_access_event(traffic_order_event(
+        walsh_code,
+        1,
+        LONG_CODE_TRANSITION_REQUEST,
+        vec![0x01],
+    ))
+    .await;
+    assert!(traffic_rx.try_recv().is_err());
+    let request = next_a1_from_bsc(&msc_endpoint, cdma_ios::MessageType::PrivacyModeComplete).await;
+    let request =
+        cdma_ios::PrivacyModeCompleteMessage::decode(&request.decode().unwrap().payload).unwrap();
+    assert!(request.voice_privacy_request);
+    let command = cdma_ios::PrivacyModeCommandMessage {
+        encryption_information: cdma_ios::EncryptionInformation::private_long_code(0, false)
+            .unwrap(),
+    };
+    bsc.handle_incoming_a1_message(cdma_ios::EncodedA1Message::from_message_for_call(
+        &cdma_ios::Message::new(
+            cdma_ios::MessageType::PrivacyModeCommand,
+            command.encode().unwrap(),
+        ),
+        Some(CALL_ID),
+    ))
+    .await;
+    let reply = traffic_rx
+        .try_recv()
+        .expect("Long Code Transition Request Order on F-TCH");
+    let order = reply.order.expect("an Order");
+    assert_eq!(order.order, LONG_CODE_TRANSITION_REQUEST);
+    assert_eq!(order.ordq, 0x00);
+    assert!(order.order_specific_fields.is_empty());
+}
+
+#[test]
+fn access_event_proto_carries_cave_fields() {
+    use crate::grpc::proto;
+    let mut event = traffic_order_event(10, 1, 0b000010, vec![0x00, 0xDE, 0xAD, 0xBE, 0xEF]);
+    event.authentication = Some(cdma_common::events::GlobalChallengeResponse {
+        authr: 0x2_ABCD,
+        randc: 0x34,
+        count: 3,
+        rand: Some(0x34A2_B05F),
+    });
+    let converted = crate::grpc::to_proto_access_event(&event);
+    assert_eq!(
+        converted.authentication,
+        Some(proto::AccessAuthentication {
+            authr: 0x2_ABCD,
+            randc: 0x34,
+            count: 3,
+            rand: Some(0x34A2_B05F),
+        })
+    );
+    match converted.body {
+        Some(proto::access_event::Body::Order(order)) => {
+            assert_eq!(order.randbs, Some(0xDEAD_BEEF))
+        }
+        other => panic!("expected an order, got {other:?}"),
+    }
+
+    let mut response = test_access_event();
+    response.decoded_l3 = Some(AccessMessage::AuthChallengeResponse(
+        cdma_common::access::AuthChallengeResponseMessage {
+            header: AccessMessageHeader {
+                pd: 1,
+                message_id: MessageId::AuthChallengeResponse,
+            },
+            authu: 0x1_2345,
+            remaining_bits: 0,
+        },
+    ));
+    assert_eq!(
+        crate::grpc::to_proto_access_event(&response).body,
+        Some(proto::access_event::Body::AuthChallengeResponse(
+            proto::AccessAuthChallengeResponse { authu: 0x1_2345 }
+        ))
+    );
+}
+
+#[tokio::test]
+async fn traffic_event_proto_decodes_ssd_update_and_unique_challenge() {
+    use crate::grpc::proto;
+    const CALL_ID: u64 = 78;
+    let (msc_client, _msc_endpoint) = crate::a1_edge::InProcessMscClient::pair(8);
+    let (mut bsc, mut traffic_rx, walsh_code) =
+        test_bsc_with_active_traffic_channel_and_msc_client(
+            SERVICE_OPTION_QCELP13,
+            Arc::new(msc_client),
+        )
+        .await;
+    let cell = bsc.mobiles[0].serving_cell.expect("serving cell");
+    bsc.mobiles
+        .update_tc(cell, walsh_code, |_, tc| tc.a1_call_id = Some(CALL_ID));
+    while traffic_rx.try_recv().is_ok() {}
+
+    let ssd_update = cdma_ios::SsdUpdateRequestMessage {
+        authentication_challenge_parameter_randssd: cdma_ios::SsdUpdateChallengeParameter([
+            0x04, 0x4d, 0x18, 0xee, 0xaa, 0x05, 0x89, 0x5c,
+        ]),
+    };
+    bsc.handle_incoming_a1_message(crate::a1_edge::EncodedA1Message::from_message_for_call(
+        &cdma_ios::Message::new(
+            cdma_ios::MessageType::SsdUpdateRequest,
+            ssd_update.encode().unwrap(),
+        ),
+        Some(CALL_ID),
+    ))
+    .await;
+    let event = traffic_rx.try_recv().expect("SSD Update Message on F-TCH");
+    assert_eq!(
+        crate::grpc::to_proto_traffic_event(&event).body,
+        Some(proto::traffic_event::Body::SsdUpdate(
+            proto::ForwardSsdUpdate {
+                randssd: 0x4d18_eeaa_0589_5c,
+            }
+        ))
+    );
+
+    let challenge =
+        cdma_ios::AuthenticationRequestMessage::Dtap(cdma_ios::AuthenticationRequestDtapMessage {
+            authentication_challenge_parameter_randu:
+                cdma_ios::AuthenticationChallengeParameter::new(
+                    cdma_ios::RandomNumberType::Randu,
+                    0xAB_CDEF,
+                ),
+        });
+    bsc.handle_incoming_a1_message(crate::a1_edge::EncodedA1Message::from_message_for_call(
+        &cdma_ios::Message::new(
+            cdma_ios::MessageType::AuthenticationRequest,
+            challenge.encode().unwrap(),
+        ),
+        Some(CALL_ID),
+    ))
+    .await;
+    let event = traffic_rx
+        .try_recv()
+        .expect("Authentication Challenge Message on F-TCH");
+    assert_eq!(
+        crate::grpc::to_proto_traffic_event(&event).body,
+        Some(proto::traffic_event::Body::AuthChallenge(
+            proto::ForwardAuthenticationChallenge {
+                randu: 0xAB_CDEF,
+                gen_cmea_key: false,
+            }
+        ))
+    );
+}
+
+#[tokio::test]
+async fn implicit_registration_is_not_reported_separately_when_auth_is_required() {
+    let (msc_client, msc_endpoint) = crate::a1_edge::InProcessMscClient::pair(8);
+    let msc: Arc<dyn crate::a1_edge::MscClient> = Arc::new(msc_client);
+    let mut overhead = OverheadParameters::default();
+    overhead.auth_mode = Some(1);
+    let bts_client = test_capturing_bts_client(
+        Arc::new(Mutex::new(WalshAllocator::new())),
+        Arc::new(ChannelRegistry::new()),
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let mut bsc = Bsc::new(Config {
+        bts: test_registry(
+            overhead,
+            Some(bts_client.clone() as Arc<dyn BtsControlClient>),
+        ),
+        traffic_assignment: TrafficAssignmentConfig::default(),
+        access_event_rx: None,
+        cell_detach_rx: None,
+        access_event_broadcast: None,
+        sms_request_rx: None,
+        sms_request_tx: None,
+        data_request_rx: None,
+        data_request_tx: None,
+        power_override_request_rx: None,
+        power_override_request_tx: None,
+        mobiles_tx: None,
+        paging_broadcast: None,
+        traffic_broadcast: None,
+        hlr_repo: None,
+        msc_client: msc,
+        traffic_retry: TrafficRetryConfig::default(),
+        voice_timeouts: Default::default(),
+        pcf_client: None,
+        mobile_idle_timeout_s: 0,
+        bts_paging_state: None,
+        node_id: "bsc-implicit-test".to_string(),
+        msc_voice_bearer: None,
+    });
+
+    let mut page_response = registration_event();
+    page_response.message_id = MessageId::PageResponse;
+    page_response.decoded_l3 = None;
+    page_response.authentication = Some(cdma_common::events::GlobalChallengeResponse {
+        authr: 0x2_1234,
+        randc: 0xAB,
+        count: 5,
+        rand: Some(0xAB00_0001),
+    });
+    bsc.inject_access_event(page_response).await;
+    tokio::task::yield_now().await;
+
+    while let Ok(Some(message)) =
+        tokio::time::timeout(Duration::from_millis(200), msc_endpoint.recv_from_bsc()).await
+    {
+        assert!(
+            message.call_id().is_some(),
+            "no uncorrelated Location Updating Request for an implicit registration"
+        );
+    }
+}
+
+#[tokio::test]
+async fn handset_privacy_request_schedules_private_mask_only_after_accepted_response() {
+    use cdma_common::phy::long_code_privacy::{
+        LONG_CODE_RESPONSE_PRIVATE, LONG_CODE_TRANSITION_ORDER, LongCodePrivacy,
+    };
+    const CALL_ID: u64 = 77;
+    const PRIVATE_MASK: u64 = 0x147_80cc_b8df;
+    let (msc_client, msc_endpoint) = crate::a1_edge::InProcessMscClient::pair(8);
+    let (mut bsc, mut traffic_rx, walsh_code) =
+        test_bsc_with_active_traffic_channel_and_msc_client(
+            SERVICE_OPTION_QCELP13,
+            Arc::new(msc_client),
+        )
+        .await;
+    let cell = bsc.mobiles[0].serving_cell.expect("serving cell");
+    let public_mask =
+        cdma_common::phy::long_code::LongCodeGenerator::new_traffic_channel(0x8085_7e58).mask();
+    let privacy = Arc::new(LongCodePrivacy::new(public_mask, PRIVATE_MASK));
+    bsc.mobiles.update_tc(cell, walsh_code, |_, tc| {
+        tc.long_code_privacy = Some(privacy.clone());
+        tc.a1_call_id = Some(CALL_ID);
+    });
+    while traffic_rx.try_recv().is_ok() {}
+    bsc.inject_access_event(traffic_order_event(
+        walsh_code,
+        1,
+        LONG_CODE_TRANSITION_ORDER,
+        vec![1],
+    ))
+    .await;
+    assert!(privacy.pending().is_none());
+    assert!(traffic_rx.try_recv().is_err());
+    let request = next_a1_from_bsc(&msc_endpoint, cdma_ios::MessageType::PrivacyModeComplete).await;
+    assert!(
+        cdma_ios::PrivacyModeCompleteMessage::decode(&request.decode().unwrap().payload)
+            .unwrap()
+            .voice_privacy_request
+    );
+    let command = cdma_ios::PrivacyModeCommandMessage {
+        encryption_information: cdma_ios::EncryptionInformation::private_long_code(
+            PRIVATE_MASK,
+            true,
+        )
+        .unwrap(),
+    };
+    bsc.handle_incoming_a1_message(cdma_ios::EncodedA1Message::from_message_for_call(
+        &cdma_ios::Message::new(
+            cdma_ios::MessageType::PrivacyModeCommand,
+            command.encode().unwrap(),
+        ),
+        Some(CALL_ID),
+    ))
+    .await;
+    let reply = traffic_rx.try_recv().expect("private transition request");
+    assert_eq!(reply.order.as_ref().unwrap().ordq, 1);
+    assert_ne!(
+        u8::from_str_radix(&reply.sdu_hex[..2], 16).unwrap() & 0x80,
+        0
+    );
+    let transition = privacy.pending().expect("explicit action time pending");
+    assert_eq!(privacy.mask_at(transition.action_chip), public_mask);
+    bsc.inject_access_event(traffic_order_event(
+        walsh_code,
+        2,
+        LONG_CODE_TRANSITION_ORDER,
+        vec![LONG_CODE_RESPONSE_PRIVATE],
+    ))
+    .await;
+    assert!(privacy.pending().is_none());
+    assert_eq!(privacy.status_at(transition.action_chip - 1), "pending");
+    assert_eq!(privacy.mask_at(transition.action_chip - 1), public_mask);
+    assert_eq!(privacy.status_at(transition.action_chip), "private");
+    assert_eq!(privacy.mask_at(transition.action_chip), PRIVATE_MASK);
+}
+
+#[tokio::test]
+async fn rejected_privacy_request_keeps_the_call_on_public_code() {
+    use cdma_common::phy::long_code_privacy::{
+        LONG_CODE_TRANSITION_ORDER, LongCodePrivacy, MOBILE_STATION_REJECT_ORDER,
+    };
+    const PRIVATE_MASK: u64 = 0x147_80cc_b8df;
+    const REJECT_UNSUPPORTED_CAPABILITY: u8 = 0b00000110;
+    const PRIVATE_REQUEST: u8 = 1;
+    let (msc_client, _msc_endpoint) = crate::a1_edge::InProcessMscClient::pair(8);
+    let (mut bsc, _traffic_rx, walsh_code) = test_bsc_with_active_traffic_channel_and_msc_client(
+        SERVICE_OPTION_QCELP13,
+        Arc::new(msc_client),
+    )
+    .await;
+    let cell = bsc.mobiles[0].serving_cell.expect("serving cell");
+    let privacy = Arc::new(LongCodePrivacy::new(
+        cdma_common::phy::long_code::LongCodeGenerator::new_traffic_channel(0x8085_7e58).mask(),
+        PRIVATE_MASK,
+    ));
+    bsc.mobiles.update_tc(cell, walsh_code, |_, tc| {
+        tc.long_code_privacy = Some(privacy.clone());
+    });
+    bsc.request_long_code_transition(cell, walsh_code, true);
+    assert!(privacy.pending().is_some());
+    let order_wire = MessageId::Order
+        .wire_type(cdma_common::lac::message_types::WireChannel::ForwardDedicated)
+        .unwrap();
+    bsc.inject_access_event(traffic_order_event(
+        walsh_code,
+        2,
+        MOBILE_STATION_REJECT_ORDER,
+        vec![
+            REJECT_UNSUPPORTED_CAPABILITY,
+            order_wire,
+            LONG_CODE_TRANSITION_ORDER,
+            PRIVATE_REQUEST,
+            0,
+        ],
+    ))
+    .await;
+    assert!(privacy.pending().is_none());
+    let tc = bsc.mobiles.get_traffic_channel(cell, walsh_code).unwrap();
+    assert!(tc.privacy_report_at.is_none());
+    assert!(!tc.is_releasing());
+    assert_eq!(privacy.status_at(u64::MAX), "public");
 }
