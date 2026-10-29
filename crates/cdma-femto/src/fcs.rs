@@ -774,6 +774,7 @@ mod tests {
     #[test]
     fn maps_paging_request_to_configured_imsi_s() {
         let paging = PagingRequestMessage {
+            mobile_identity_meid: None,
             mobile_identity_imsi: MobileIdentity::Imsi("310005551239999".to_string()),
             tag: Some(Tag(1)),
             cell_identifier_list: None,

@@ -442,7 +442,7 @@ impl Bsc {
                     trigger
                 );
             }
-            if is_packet_data
+            if (is_packet_data || service_option == cdma_common::consts::SERVICE_OPTION_OTASP)
                 && should_send_assignment_complete
                 && let Some(call_id) = a1_call_id
             {

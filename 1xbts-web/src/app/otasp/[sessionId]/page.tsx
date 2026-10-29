@@ -4,6 +4,8 @@ import { use, useEffect, useState } from "react";
 import Link from "next/link";
 import { OtaspSessionDetail } from "@/components/otasp-session-detail";
 
+const SESSION_REFRESH_MS = 2000;
+
 export default function OtaspSessionDetailPage({
   params,
 }: {
@@ -16,7 +18,10 @@ export default function OtaspSessionDetailPage({
 
   useEffect(() => {
     let alive = true;
+    let loadingSession = false;
     const load = async () => {
+      if (loadingSession || !alive) return;
+      loadingSession = true;
       try {
         const res = await fetch(`/api/otasp-events/${encodeURIComponent(sessionId)}`);
         if (!res.ok) {
@@ -27,17 +32,21 @@ export default function OtaspSessionDetailPage({
         if (!alive) return;
         if (data.error) throw new Error(data.error);
         setSession(data.session);
+        if (data.session?.summary?.endedAt && interval) clearInterval(interval);
         setError(null);
       } catch (err) {
         if (!alive) return;
         setError(err instanceof Error ? err.message : "unknown");
       } finally {
+        loadingSession = false;
         if (alive) setLoading(false);
       }
     };
-    load();
+    const interval = setInterval(load, SESSION_REFRESH_MS);
+    void load();
     return () => {
       alive = false;
+      if (interval) clearInterval(interval);
     };
   }, [sessionId]);
 

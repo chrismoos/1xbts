@@ -245,6 +245,23 @@ pub fn next_auth_count(count: u8) -> u8 {
     (count + 1) % AUTH_COUNT_MODULUS
 }
 
+/// SPASM uses SSD-A XOR A-key, the handset challenge, and IMSI_S1 (C.S0016-D §3.3.7).
+pub fn otapa_signature(
+    credentials: &CaveCredentials,
+    esn: u32,
+    rand_otapa: u32,
+    imsi_s1: u32,
+) -> Result<u32, cdma_common::error::Error> {
+    let a_key = credentials
+        .a_key
+        .ok_or("No A-key is provisioned for OTAPA SPASM")?;
+    let ssd = credentials
+        .current_ssd()
+        .ok_or("No CAVE credentials are provisioned for OTAPA SPASM")?;
+    let ssd_auth = std::array::from_fn(|index| ssd.ssd_a[index] ^ a_key[index]);
+    Ok(cdma_cave::auth_signature(rand_otapa, imsi_s1, &ssd_auth, Esn(esn))?.signature)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +293,29 @@ mod tests {
             generate_call_keys: true,
             otasp_reauthentication: false,
         }
+    }
+
+    #[test]
+    fn spasm_uses_current_ssd_xor_key_and_never_pending_credentials() {
+        let mut credentials = CaveCredentials {
+            auth_algo: AuthAlgorithm::Cave,
+            a_key: Some([0x55; 8]),
+            ssd: Some(Ssd {
+                ssd_a: [0xaa; 8],
+                ssd_b: [0; 8],
+            }),
+            pending_a_key: Some([0x11; 8]),
+            ..Default::default()
+        };
+        let expected = cdma_cave::auth_signature(0x12345678, 0x123456, &[0xff; 8], Esn(0x80123456))
+            .unwrap()
+            .signature;
+        assert_eq!(
+            otapa_signature(&credentials, 0x80123456, 0x12345678, 0x123456).unwrap(),
+            expected
+        );
+        credentials.a_key = None;
+        assert!(otapa_signature(&credentials, 0x80123456, 0x12345678, 0x123456).is_err());
     }
 
     #[test]

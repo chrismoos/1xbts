@@ -108,8 +108,14 @@ impl OtaspHistory {
         }
     }
 
-    /// Remove and return the assembled record for a finished session.
-    /// Returns `None` if the session id isn't tracked.
+    pub fn snapshot(&self, session_id: Uuid) -> Option<OtaspSessionRecord> {
+        self.inner
+            .lock()
+            .expect("OtaspHistory mutex poisoned")
+            .get(&session_id)
+            .cloned()
+    }
+
     pub fn take_finished(&self, session_id: Uuid) -> Option<OtaspSessionRecord> {
         let mut inner = self.inner.lock().expect("OtaspHistory mutex poisoned");
         inner.remove(&session_id)

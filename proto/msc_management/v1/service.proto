@@ -75,7 +75,19 @@ message AuthenticationEventList {
   repeated events.v1.AuthenticationEvent events = 1;
 }
 
+message InitiateOtaspRequest {
+  string subscriber_id = 1;
+  // Omit to select the subscriber's primary identity.
+  optional string imsi = 2;
+}
+
+message InitiateOtaspResponse {
+  uint64 call_id = 1;
+}
+
 service MscManagementService {
+  // Pages the handset and applies the configured OTASP writes and subscriber overrides.
+  rpc InitiateOtasp(InitiateOtaspRequest) returns (InitiateOtaspResponse);
   // Lists the base stations the MSC serves, attached or not.
   rpc ListBaseStations(google.protobuf.Empty) returns (BaseStationList);
   // Initiates a mobile-terminated voice call through the BSC and voice gateway.

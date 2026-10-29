@@ -240,6 +240,12 @@ impl MscRuntimeConfig {
 /// A.S0014-D Table 5.2-1 T3280 default, in seconds.
 const PRIVACY_MODE_TIMEOUT: Duration = Duration::from_secs(15);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AccessPurpose {
+    Service,
+    Provisioning,
+}
+
 pub struct MscRuntime {
     pub(crate) controller: MscCallController,
     pub(crate) config: MscRuntimeConfig,
@@ -254,7 +260,13 @@ pub struct MscRuntime {
     pub(crate) otasp_history: std::sync::Arc<crate::otasp::OtaspHistory>,
     pub(crate) otasp_event_tx:
         tokio::sync::broadcast::Sender<crate::grpc::events_proto::v1::MscNetworkEvent>,
-    /// C.S0016-D §3.2.1 permits a voice/data SO for OTASP, so dialed digits identify these calls.
+    pub(crate) otapa_routes: std::collections::HashMap<
+        crate::network_otasp::ProvisioningIdentity,
+        crate::network_otasp::ProvisioningRoute,
+    >,
+    pub(crate) pending_otapa_calls:
+        std::collections::HashMap<CallId, cdma_hlr::model::SubscriberIdentity>,
+    /// C.S0016-D §3.2.1 permits a voice/data SO for user-initiated OTASP.
     pub(crate) pending_otasp_originations:
         std::collections::HashMap<CallId, PendingOtaspOrigination>,
     pub(crate) deliveries: Option<crate::sms_delivery::DeliveryLink>,
@@ -297,9 +309,6 @@ pub(crate) struct PendingOtaspOrigination {
     pub device: crate::otasp::HardwareIdentity,
     pub feature_code: String,
     pub mobile_identity_imsi: cdma_ios::MobileIdentity,
-    /// Actual Service Option from the Origination Message (typically 3 for
-    /// voice). Per C.S0016-D §3.2.1, user-initiated OTASP rides a vendor-
-    /// chosen voice/data SO, NOT SO 18.
     pub service_option: u16,
     /// Whether the `*228` origination verified. None when it was not authenticated.
     pub origination_verified: Option<bool>,
@@ -353,6 +362,8 @@ impl MscRuntime {
             otasp,
             otasp_history,
             otasp_event_tx,
+            otapa_routes: std::collections::HashMap::new(),
+            pending_otapa_calls: std::collections::HashMap::new(),
             pending_otasp_originations: std::collections::HashMap::new(),
             deliveries: None,
             pending_sms_traffic: std::collections::HashMap::new(),
@@ -893,6 +904,7 @@ impl MscRuntime {
                 crate::authentication::AuthenticationProcedure::DataBurst,
                 &subject,
                 &crate::authentication::GlobalChallengeIes::from_adds_transfer(msg),
+                AccessPurpose::Service,
             )
             .await;
         if decision.allow {
@@ -930,9 +942,16 @@ impl MscRuntime {
         procedure: crate::authentication::AuthenticationProcedure,
         subject: &crate::authentication::AuthenticationSubject<'_>,
         ies: &crate::authentication::GlobalChallengeIes,
+        purpose: AccessPurpose,
     ) -> crate::authentication::AuthenticationDecision {
+        let mut authentication = self.config.authentication.clone();
+        if purpose == AccessPurpose::Provisioning
+            && authentication.mode == crate::authentication::AuthenticationMode::Enforce
+        {
+            authentication.mode = crate::authentication::AuthenticationMode::Monitor;
+        }
         let decision = crate::authentication::authenticate(
-            &self.config.authentication,
+            &authentication,
             self.config.hlr_repo.as_ref(),
             procedure,
             subject,
@@ -1377,6 +1396,18 @@ impl MscRuntime {
         a1: &dyn MscA1Endpoint,
     ) {
         match request {
+            PendingControlRequest::InitiateOtasp {
+                subscriber_id,
+                imsi,
+                response_tx,
+            } => {
+                let result = self
+                    .initiate_otasp(a1, subscriber_id, imsi.as_deref())
+                    .await;
+                if response_tx.send(result).is_err() {
+                    warn!("MSC: provisioning response receiver dropped");
+                }
+            }
             PendingControlRequest::InitiateCall {
                 request,
                 response_tx,
@@ -1495,6 +1526,7 @@ impl MscRuntime {
             self.config.default_voice_service_option,
         );
         let paging_request = cdma_ios::PagingRequestMessage {
+            mobile_identity_meid: None,
             mobile_identity_imsi: cdma_ios::MobileIdentity::Imsi(imsi.to_string()),
             tag: Some(tag),
             cell_identifier_list: None,
@@ -1564,6 +1596,7 @@ impl MscRuntime {
         );
         a1.bind_call(call_id, &delivery.serving_node);
         let paging_request = cdma_ios::PagingRequestMessage {
+            mobile_identity_meid: None,
             mobile_identity_imsi: cdma_ios::MobileIdentity::Imsi(imsi),
             tag: Some(cdma_ios::Tag(call_id.0 as u32)),
             cell_identifier_list: None,
@@ -1595,7 +1628,7 @@ impl MscRuntime {
         }
     }
 
-    fn abort_mt_setup(&mut self, a1: &dyn MscA1Endpoint, call_id: CallId) {
+    pub(crate) fn abort_mt_setup(&mut self, a1: &dyn MscA1Endpoint, call_id: CallId) {
         self.mt_page_retry.cancel(call_id);
         self.controller.remove_call(call_id);
         self.stop_media_for_call(call_id);
@@ -1605,7 +1638,7 @@ impl MscRuntime {
     /// Send an A1 PagingRequest; rearms the controller engine on
     /// `RepageAfterAf{ Primary }` and registers with `mt_page_retry` unless
     /// `purpose == Retry`. Returns `false` if rearm/encode/transport failed.
-    async fn send_paging_request_to_bsc(
+    pub(crate) async fn send_paging_request_to_bsc(
         &mut self,
         a1: &dyn MscA1Endpoint,
         call_id: CallId,
@@ -1794,7 +1827,8 @@ impl MscRuntime {
                         return;
                     }
                 };
-                if self.circuits.m2m_calls.contains_key(&call_id)
+                if (self.circuits.m2m_calls.contains_key(&call_id)
+                    || self.pending_otapa_calls.contains_key(&call_id))
                     && self.controller.state(call_id) != Some(cdma_ios::CallControlState::Paging)
                 {
                     debug!(
@@ -1825,6 +1859,85 @@ impl MscRuntime {
                     meid.as_deref(),
                 )
                 .ok();
+                let provisioning = self.pending_otapa_calls.contains_key(&call_id);
+                if provisioning {
+                    let expected = self
+                        .mt_call
+                        .mt_plans
+                        .get(&(call_id.0 as u32))
+                        .map(|plan| plan.subscriber_id);
+                    let target_matches =
+                        self.pending_otapa_calls
+                            .get(&call_id)
+                            .is_some_and(|identity| {
+                                crate::network_otasp::ProvisioningIdentity::from_parts(
+                                    identity.imsi.as_deref().unwrap_or_default(),
+                                    identity.esn,
+                                    identity.meid.as_deref(),
+                                )
+                                .matches(
+                                    imsi.as_deref().unwrap_or_default(),
+                                    esn,
+                                    meid.as_deref(),
+                                )
+                            });
+                    let matched = if !target_matches {
+                        None
+                    } else if let Some(identity) = self.pending_otapa_calls.get(&call_id)
+                        && (identity.meid.is_some() || identity.esn.is_some())
+                    {
+                        self.config
+                            .hlr_repo
+                            .resolve_by_hardware_identity(
+                                if identity.meid.is_some() { None } else { esn },
+                                meid.as_deref(),
+                            )
+                            .await
+                            .ok()
+                            .flatten()
+                    } else {
+                        match auth_identity.as_ref() {
+                            Some(identity) => self
+                                .config
+                                .hlr_repo
+                                .resolve_by_identity(identity)
+                                .await
+                                .ok()
+                                .flatten(),
+                            None => None,
+                        }
+                    };
+                    if matched
+                        .as_ref()
+                        .map(|subscriber| subscriber.subscriber.subscriber_id)
+                        != expected
+                        || expected.is_none()
+                    {
+                        warn!(
+                            "MSC: OTAPA page response rejected call_id={} target_matches={} expected_subscriber={:?} resolved_subscriber={:?} received_imsi={:?} received_esn={:?} received_meid={:?} target_imsi={:?} target_esn={:?} target_meid={:?}",
+                            call_id.0,
+                            target_matches,
+                            expected,
+                            matched
+                                .as_ref()
+                                .map(|subscriber| subscriber.subscriber.subscriber_id),
+                            imsi,
+                            esn,
+                            meid,
+                            self.pending_otapa_calls
+                                .get(&call_id)
+                                .and_then(|identity| identity.imsi.as_deref()),
+                            self.pending_otapa_calls
+                                .get(&call_id)
+                                .and_then(|identity| identity.esn),
+                            self.pending_otapa_calls
+                                .get(&call_id)
+                                .and_then(|identity| identity.meid.as_deref()),
+                        );
+                        self.fail_mt_call(a1, call_id, SIP_STATUS_FORBIDDEN).await;
+                        return;
+                    }
+                }
                 let subject = crate::authentication::AuthenticationSubject {
                     identity: auth_identity.as_ref(),
                     imsi: imsi.as_deref(),
@@ -1837,50 +1950,77 @@ impl MscRuntime {
                         crate::authentication::AuthenticationProcedure::PageResponse,
                         &subject,
                         &crate::authentication::GlobalChallengeIes::from_paging_response(&response),
+                        if self.pending_otapa_calls.contains_key(&call_id) {
+                            AccessPurpose::Provisioning
+                        } else {
+                            AccessPurpose::Service
+                        },
                     )
                     .await;
-                if !decision.allow
-                    || (decision.pending_ssd_update
-                        && self.pending_sms_traffic.contains_key(&call_id))
+                if !provisioning
+                    && (!decision.allow
+                        || (decision.pending_ssd_update
+                            && self.pending_sms_traffic.contains_key(&call_id)))
                 {
                     self.fail_mt_call(a1, call_id, SIP_STATUS_FORBIDDEN).await;
                     return;
                 }
-                if decision.pending_ssd_update {
+                if decision.pending_ssd_update && !provisioning {
                     self.pending_ssd_calls.insert(call_id);
                 }
                 if let Some(keys) = decision.call_keys {
                     self.call_keys.insert(call_id, keys);
                 }
-                if let Some(context) =
-                    crate::authentication::CallAuthContext::from_subject(&subject, &decision)
+                if !provisioning
+                    && let Some(context) =
+                        crate::authentication::CallAuthContext::from_subject(&subject, &decision)
                 {
                     self.privacy_authenticated.remove(&call_id);
                     self.traffic_auth_started.remove(&call_id);
                     self.call_auth_context.insert(call_id, context);
                 }
-                if let Ok(identity_key) = cdma_hlr::model::MobileIdentityKey::from_parts(
-                    imsi.as_deref(),
-                    esn,
-                    meid.as_deref(),
-                ) && let Some(contact) = self
-                    .record_mobile_contact(
-                        node,
-                        MobileContact {
-                            identity_key: identity_key.clone(),
-                            imsi,
-                            esn,
-                            meid,
-                            slot_cycle_index: response
-                                .slot_cycle_index
-                                .map(|value| u32::from(value.0)),
-                        },
-                        "paging-response",
+                if !provisioning
+                    && let Ok(identity_key) = cdma_hlr::model::MobileIdentityKey::from_parts(
+                        imsi.as_deref(),
+                        esn,
+                        meid.as_deref(),
                     )
-                    .await
+                    && let Some(contact) = self
+                        .record_mobile_contact(
+                            node,
+                            MobileContact {
+                                identity_key: identity_key.clone(),
+                                imsi,
+                                esn,
+                                meid,
+                                slot_cycle_index: response
+                                    .slot_cycle_index
+                                    .map(|value| u32::from(value.0)),
+                            },
+                            "paging-response",
+                        )
+                        .await
                 {
                     self.send_welcome_sms_if_due(node, &identity_key, &contact)
                         .await;
+                }
+                if provisioning {
+                    self.pending_otasp_originations.insert(
+                        call_id,
+                        PendingOtaspOrigination {
+                            origination_verified: Some(
+                                decision.result
+                                    == crate::authentication::AuthenticationResult::Success,
+                            ),
+                            device: crate::otasp::HardwareIdentity {
+                                esn,
+                                meid: response.mobile_identity_meid.as_ref().and_then(meid_hex),
+                            },
+                            feature_code: String::new(),
+                            mobile_identity_imsi: response.mobile_identity_imsi.clone(),
+                            service_option: SERVICE_OPTION_OTASP,
+                        },
+                    );
                 }
                 let secondary_leg = self
                     .circuits
@@ -1908,7 +2048,24 @@ impl MscRuntime {
                         return;
                     }
                 }
-                let privacy = self.assignment_privacy(call_id, response.voice_privacy_request);
+                if provisioning
+                    && response
+                        .service_option
+                        .is_some_and(|option| option.0 != SERVICE_OPTION_OTASP)
+                {
+                    info!(
+                        "MSC: handset declined OTAPA service option call_id={} response_so={:?}",
+                        call_id.0,
+                        response.service_option.map(|option| option.0)
+                    );
+                    self.fail_mt_call(a1, call_id, SIP_STATUS_FORBIDDEN).await;
+                    return;
+                }
+                let privacy = if provisioning {
+                    None
+                } else {
+                    self.assignment_privacy(call_id, response.voice_privacy_request)
+                };
                 self.mt_call
                     .send_assignment_request_for_paging_response(
                         a1,
@@ -2091,6 +2248,11 @@ impl MscRuntime {
                     a1.release_call(call_id);
                     return;
                 }
+                if self.pending_otapa_calls.contains_key(&call_id) {
+                    self.fire_assignment_complete_awi(a1, call_id, completed_leg)
+                        .await;
+                    return;
+                }
                 if let Some(pending) = self.pending_otasp_originations.remove(&call_id)
                     && let Some(otasp) = self.otasp.as_mut()
                 {
@@ -2098,8 +2260,14 @@ impl MscRuntime {
                         "MSC: AssignmentComplete call_id={} — starting OTASP session",
                         call_id.0
                     );
+                    let initiation = if self.pending_otapa_calls.contains_key(&call_id) {
+                        crate::otasp::session::SessionInitiation::Network
+                    } else {
+                        crate::otasp::session::SessionInitiation::User
+                    };
                     otasp
-                        .begin_session(
+                        .begin_session_with_initiation(
+                            initiation,
                             pending.device,
                             pending.feature_code,
                             pending.service_option,
@@ -2152,6 +2320,33 @@ impl MscRuntime {
                         return;
                     }
                 };
+                if self.pending_otapa_calls.contains_key(&call_id) {
+                    if let Some(pending) = self.pending_otasp_originations.remove(&call_id)
+                        && let Some(otasp) = self.otasp.as_mut()
+                    {
+                        if let Err(error) = self
+                            .controller
+                            .apply_from_bsc(call_id, &cdma_ios::ProcedureMessage::Connect(connect))
+                        {
+                            warn!("MSC: OTAPA Connect state error: {error}");
+                            self.send_clear_command(a1, call_id).await;
+                            return;
+                        }
+                        otasp
+                            .begin_session_with_initiation(
+                                crate::otasp::session::SessionInitiation::Network,
+                                pending.device,
+                                pending.feature_code,
+                                pending.service_option,
+                                pending.mobile_identity_imsi,
+                                pending.origination_verified,
+                                call_id.0,
+                                a1,
+                            )
+                            .await;
+                    }
+                    return;
+                }
                 if let Some(call) = self.circuits.m2m_calls.get(&call_id).copied() {
                     self.connect_m2m_call(a1, call, call_id).await;
                     return;
@@ -2335,6 +2530,11 @@ impl MscRuntime {
                         esn,
                         dialed_digits: dialed.as_deref(),
                     };
+                    let otasp_origination = self.otasp.as_ref().is_some_and(|otasp| {
+                        called_number
+                            .as_deref()
+                            .is_some_and(|dialed| otasp.is_otasp_origination(dialed))
+                    });
                     let decision = self
                         .authenticate_access(
                             node,
@@ -2343,14 +2543,13 @@ impl MscRuntime {
                             &crate::authentication::GlobalChallengeIes::from_cm_service_request(
                                 request,
                             ),
+                            if otasp_origination {
+                                AccessPurpose::Provisioning
+                            } else {
+                                AccessPurpose::Service
+                            },
                         )
                         .await;
-                    // OTASP is how a mobile without a shared A-key gets one, so it is never refused.
-                    let otasp_origination = self.otasp.as_ref().is_some_and(|otasp| {
-                        called_number
-                            .as_deref()
-                            .is_some_and(|dialed| otasp.is_otasp_origination(dialed))
-                    });
                     origination_verified = match decision.result {
                         crate::authentication::AuthenticationResult::NotRequested => None,
                         result => {
@@ -3415,6 +3614,8 @@ impl MscRuntime {
     }
 
     fn stop_media_for_call(&mut self, call_id: CallId) {
+        self.pending_otapa_calls.remove(&call_id);
+        self.pending_otasp_originations.remove(&call_id);
         self.call_keys.remove(&call_id);
         self.privacy_deadlines.remove(&call_id);
         self.pending_privacy.remove(&call_id);
@@ -3635,6 +3836,18 @@ impl MscRuntime {
             _ => None,
         };
         let meid = lur.mobile_identity_meid.as_ref().and_then(meid_hex);
+        // A rejected registration provides a provisioning route, not a service binding.
+        if let Some(imsi) = imsi {
+            self.otapa_routes.insert(
+                crate::network_otasp::ProvisioningIdentity::from_parts(imsi, esn, meid.as_deref()),
+                crate::network_otasp::ProvisioningRoute {
+                    node: node.clone(),
+                    imsi: imsi.to_string(),
+                    meid: meid.clone(),
+                    slot_cycle_index: lur.slot_cycle_index.map(|value| value.0),
+                },
+            );
+        }
         let identity_key =
             match cdma_hlr::model::MobileIdentityKey::from_parts(imsi, esn, meid.as_deref()) {
                 Ok(identity_key) => identity_key,
@@ -3655,6 +3868,7 @@ impl MscRuntime {
                 crate::authentication::AuthenticationProcedure::Registration,
                 &subject,
                 &crate::authentication::GlobalChallengeIes::from_location_updating_request(&lur),
+                AccessPurpose::Service,
             )
             .await;
         if !decision.allow {
@@ -3739,6 +3953,7 @@ impl MscRuntime {
         node: &BaseStationId,
         calls: Vec<CallId>,
     ) {
+        self.otapa_routes.retain(|_, route| &route.node != node);
         warn!(
             "MSC: base station {node} detached, releasing {} call(s)",
             calls.len()
@@ -3929,6 +4144,7 @@ pub(crate) fn select_pageable_imsi<'a>(
 #[cfg(test)]
 mod tests {
     mod m2m;
+    mod network_otasp;
     mod privacy;
     mod sms_routes;
 
@@ -4080,6 +4296,9 @@ mod tests {
         phone_number: &'static str,
         subscriber_id: uuid::Uuid,
         imsi: &'static str,
+        esn: Option<u32>,
+        meid: Option<&'static str>,
+        strict_hardware_lookup: bool,
         mob_p_rev: u32,
         refreshed_binding: std::sync::Mutex<Option<RegistrationBinding>>,
         registration_state: cdma_hlr::model::RegistrationState,
@@ -4095,6 +4314,9 @@ mod tests {
                 phone_number: "5559876543",
                 subscriber_id: uuid::Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888),
                 imsi: "111111111111111",
+                esn: None,
+                meid: None,
+                strict_hardware_lookup: false,
                 mob_p_rev,
                 refreshed_binding: std::sync::Mutex::new(None),
                 registration_state: cdma_hlr::model::RegistrationState::Registered,
@@ -5430,8 +5652,8 @@ mod tests {
                     subscriber_identity_id: uuid::Uuid::nil(),
                     subscriber_id: self.subscriber_id,
                     imsi: Some(self.imsi.to_string()),
-                    esn: None,
-                    meid: None,
+                    esn: self.esn,
+                    meid: self.meid.map(str::to_string),
                     is_primary: true,
                     created_at: chrono::Utc::now(),
                 };
@@ -5462,9 +5684,13 @@ mod tests {
         }
         async fn get_subscriber_by_id(
             &self,
-            _: uuid::Uuid,
+            id: uuid::Uuid,
         ) -> Result<Option<cdma_hlr::model::ResolvedSubscriber>, String> {
-            unimplemented!()
+            if id == self.subscriber_id {
+                self.get_subscriber_by_phone_number(self.phone_number).await
+            } else {
+                Ok(None)
+            }
         }
         async fn update_subscriber(
             &self,
@@ -5522,16 +5748,43 @@ mod tests {
         }
         async fn resolve_by_identity(
             &self,
-            _: &cdma_hlr::model::MobileIdentityKey,
+            identity: &cdma_hlr::model::MobileIdentityKey,
         ) -> Result<Option<cdma_hlr::model::ResolvedSubscriber>, String> {
-            Ok(None)
+            if identity.imsi() == self.imsi {
+                self.get_subscriber_by_phone_number(self.phone_number).await
+            } else {
+                Ok(None)
+            }
         }
         async fn resolve_by_hardware_identity(
             &self,
-            _: Option<u32>,
-            _: Option<&str>,
+            esn: Option<u32>,
+            meid: Option<&str>,
         ) -> Result<Option<cdma_hlr::model::ResolvedSubscriber>, String> {
-            Ok(None)
+            if self.strict_hardware_lookup
+                && esn.is_none_or(|value| Some(value) != self.esn)
+                && !meid.is_some_and(|value| {
+                    self.meid
+                        .is_some_and(|expected| expected.eq_ignore_ascii_case(value))
+                })
+            {
+                return Ok(None);
+            }
+            self.get_subscriber_by_phone_number(self.phone_number).await
+        }
+        async fn verify_cave_global_challenge(
+            &self,
+            _: &cdma_hlr::model::MobileIdentityKey,
+            challenge: &cdma_hlr::auth::GlobalChallenge,
+        ) -> Result<cdma_hlr::auth::CaveVerdict, String> {
+            Ok(cdma_hlr::auth::CaveVerdict {
+                call_keys: None,
+                outcome: if challenge.authr == 1 {
+                    cdma_hlr::auth::CaveAuthOutcome::SignatureMismatch
+                } else {
+                    cdma_hlr::auth::CaveAuthOutcome::NotProvisioned
+                },
+            })
         }
         async fn upsert_registration_binding(
             &self,
@@ -5863,6 +6116,7 @@ mod tests {
 
     fn paging_request() -> PagingRequestMessage {
         PagingRequestMessage {
+            mobile_identity_meid: None,
             mobile_identity_imsi: MobileIdentity::Imsi("12345678901".to_string()),
             tag: Some(Tag(0x01020304)),
             cell_identifier_list: None,

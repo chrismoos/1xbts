@@ -409,6 +409,12 @@ mod tests {
 
     #[async_trait]
     impl MscManagementService for CapturingMsc {
+        async fn initiate_otasp(
+            &self,
+            _: Request<msc_management::v1::InitiateOtaspRequest>,
+        ) -> Result<Response<msc_management::v1::InitiateOtaspResponse>, Status> {
+            Err(Status::unimplemented(""))
+        }
         async fn initiate_call(
             &self,
             _: Request<bsc::v1::InitiateCallRequest>,
@@ -471,6 +477,13 @@ mod tests {
             struct Svc(Arc<CapturingMsc>);
             #[async_trait]
             impl MscManagementService for Svc {
+                async fn initiate_otasp(
+                    &self,
+                    request: Request<msc_management::v1::InitiateOtaspRequest>,
+                ) -> Result<Response<msc_management::v1::InitiateOtaspResponse>, Status>
+                {
+                    self.0.initiate_otasp(request).await
+                }
                 async fn initiate_call(
                     &self,
                     request: Request<bsc::v1::InitiateCallRequest>,

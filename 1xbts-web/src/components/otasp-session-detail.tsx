@@ -601,7 +601,7 @@ function EventRow({ rec }: { rec: SessionEventRecord }) {
       <div className="grid grid-cols-2 gap-x-6 text-xs">
         <Stat label="ESN" value={formatEsnHex(s.device?.esn)} mono />
         <Stat label="MEID" value={formatMeidColon(s.device?.meid)} mono />
-        <Stat label="Feature Code" value={s.featureCode || "—"} mono />
+        <Stat label="Initiation" value={s.featureCode ? `Handset (${s.featureCode})` : "Network"} />
         <Stat label="Service Option" value={serviceOptionLabel(s.serviceOption ?? 0)} />
       </div>
     );

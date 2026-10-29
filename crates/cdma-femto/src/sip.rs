@@ -4131,6 +4131,7 @@ mod tests {
         let local: SocketAddr = "10.56.0.2:5060".parse().unwrap();
 
         let page = cdma_ios::PagingRequestMessage {
+            mobile_identity_meid: None,
             mobile_identity_imsi: MobileIdentity::Imsi("310005551239999".to_string()),
             tag: Some(Tag(1)),
             cell_identifier_list: None,
@@ -4873,6 +4874,7 @@ mod tests {
         core.remember_registered_fap(&register_request(), peer);
         attach_mobile(&core, "310005551239999", "fap");
         let paging = cdma_ios::PagingRequestMessage {
+            mobile_identity_meid: None,
             mobile_identity_imsi: MobileIdentity::Imsi("310005551239999".to_string()),
             tag: Some(Tag(101)),
             cell_identifier_list: None,
@@ -5237,6 +5239,7 @@ mod tests {
             .call_id()
             .expect("call ID");
         let paging = cdma_ios::PagingRequestMessage {
+            mobile_identity_meid: None,
             mobile_identity_imsi: MobileIdentity::Imsi("310005551239876".to_string()),
             tag: Some(Tag(101)),
             cell_identifier_list: None,
@@ -5285,6 +5288,7 @@ mod tests {
         core.remember_registered_fap(&register_request(), peer);
         attach_mobile(&core, "310005551239999", "fap");
         let paging = cdma_ios::PagingRequestMessage {
+            mobile_identity_meid: None,
             mobile_identity_imsi: MobileIdentity::Imsi("310005551239999".to_string()),
             tag: Some(Tag(101)),
             cell_identifier_list: None,
@@ -5320,6 +5324,7 @@ mod tests {
         core.remember_registered_fap(&register_request(), peer);
         attach_mobile(&core, "310005551239999", "fap");
         let paging = cdma_ios::PagingRequestMessage {
+            mobile_identity_meid: None,
             mobile_identity_imsi: MobileIdentity::Imsi("310005551239999".to_string()),
             tag: Some(Tag(101)),
             cell_identifier_list: None,
@@ -5400,6 +5405,7 @@ mod tests {
         attach_mobile(&core, "310005551239999", "fap");
 
         let paging = cdma_ios::PagingRequestMessage {
+            mobile_identity_meid: None,
             mobile_identity_imsi: MobileIdentity::Imsi("310005551239999".to_string()),
             tag: Some(Tag(101)),
             cell_identifier_list: None,

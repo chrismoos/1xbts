@@ -12,6 +12,7 @@ import {
 } from "@/components/authentication-activity";
 import { verdictForAccess } from "@/lib/authentication-verdict";
 import { RecentMessagesCard } from "@/components/recent-messages-card";
+import { StartOtasp } from "@/components/start-otasp";
 import { RecentOtaspCard } from "@/components/recent-otasp-card";
 import { TimeSeriesChart, type Series } from "@/components/time-series-chart";
 import { esnManufacturer } from "@/lib/esn-manufacturer";
@@ -156,6 +157,7 @@ interface PacketSessionInfo {
 }
 
 interface SubscriberDetail {
+  subscriber?: { displayName?: string };
   identities: SubscriberIdentity[];
   error?: string;
 }
@@ -309,6 +311,7 @@ export default function MobileDetailPage({
   const [messages, setMessages] = useState<LogEntry[]>([]);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [packetSessions, setPacketSessions] = useState<PacketSessionInfo[]>([]);
+  const [subscriberName, setSubscriberName] = useState("");
   const [subscriberIdentities, setSubscriberIdentities] = useState<SubscriberIdentity[]>([]);
   const [identityTab, setIdentityTab] = useState<"subscriber" | "registration">("registration");
 
@@ -459,9 +462,11 @@ export default function MobileDetailPage({
   useEffect(() => {
     if (!mobile?.subscriberId) {
       setSubscriberIdentities([]);
+      setSubscriberName("");
       return;
     }
 
+    setSubscriberName("");
     let cancelled = false;
     const fetchSubscriberIdentities = async () => {
       try {
@@ -469,10 +474,12 @@ export default function MobileDetailPage({
         const data: SubscriberDetail = await res.json();
         if (!cancelled && res.ok && !data.error) {
           setSubscriberIdentities(data.identities || []);
+          setSubscriberName(data.subscriber?.displayName || "");
         }
       } catch {
         if (!cancelled) {
           setSubscriberIdentities([]);
+          setSubscriberName("");
         }
       }
     };
@@ -954,11 +961,12 @@ export default function MobileDetailPage({
                   href={`/subscribers/${encodeURIComponent(mobile.subscriberId)}`}
                   className="text-sm font-mono text-accent-green hover:text-accent-green transition-colors"
                 >
-                  {mobile.subscriberId.length > 20
+                  {subscriberName || (mobile.subscriberId.length > 20
                     ? `${mobile.subscriberId.slice(0, 8)}...${mobile.subscriberId.slice(-8)}`
-                    : mobile.subscriberId}
+                    : mobile.subscriberId)}
                 </Link>
               </div>
+              <div className="my-3"><StartOtasp subscriberId={mobile.subscriberId} imsi={mobile.imsi || undefined} /></div>
               <Stat label="Provisioned ESN" value={provisionedEsnHex || "Not Available"} mono />
               <Stat label="Provisioned IMSI" value={provisionedImsi || "Not Available"} mono />
               <Stat label="Provisioned MEID" value={provisionedMeid || "Not Available"} mono />

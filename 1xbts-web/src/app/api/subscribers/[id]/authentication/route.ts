@@ -57,7 +57,7 @@ export async function GET(_request: Request, ctx: Ctx) {
         if (grpcErrorStatus(err) === 404) return null;
         throw err;
       });
-    return Response.json({ state, identities });
+    return Response.json({ state, identities, generationEsn: identity.esn ?? null });
   } catch (err) {
     return Response.json(
       { error: grpcErrorMessage(err) },

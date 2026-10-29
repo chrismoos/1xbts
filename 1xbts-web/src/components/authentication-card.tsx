@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { akeyChecksum, randomAKey } from "@/lib/akey";
 import { Card } from "@/components/card";
 import { AuthenticationActivity } from "@/components/authentication-activity";
 
@@ -20,6 +21,9 @@ const CLEAR_BTN =
 export function AuthenticationCard({ subscriberId }: { subscriberId: string }) {
   const [state, setState] = useState<AuthState | null>(null);
   const [identities, setIdentities] = useState<{ imsi?: string; esn?: number }[]>([]);
+  const [generationEsn, setGenerationEsn] = useState<number | null>(null);
+  const [generated, setGenerated] = useState(false);
+  const [saved, setSaved] = useState(false);
   const [entry, setEntry] = useState("");
   const [format, setFormat] = useState<"keypad" | "hex">("keypad");
   const [busy, setBusy] = useState(false);
@@ -34,6 +38,7 @@ export function AuthenticationCard({ subscriberId }: { subscriberId: string }) {
         setError(data.error);
       } else {
         setState(data.state);
+        setGenerationEsn(data.generationEsn ?? null);
         setIdentities(data.identities ?? []);
       }
     } catch (e) {
@@ -59,11 +64,34 @@ export function AuthenticationCard({ subscriberId }: { subscriberId: string }) {
       if (data.error) {
         setError(data.error);
       } else {
-        setEntry("");
+        if (aKey == null || !generated) {
+          setEntry("");
+          setGenerated(false);
+        }
+        setSaved(aKey != null && generated);
         await load();
       }
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Saving the A-key failed.");
     } finally {
       setBusy(false);
+    }
+  };
+
+  const generate = () => {
+    if (generationEsn == null) {
+      setError("Configure an ESN on the subscriber's primary identity before generating an A-key.");
+      return;
+    }
+    try {
+      const key = randomAKey();
+      setEntry(key + akeyChecksum(BigInt(key), generationEsn));
+      setFormat("keypad");
+      setGenerated(true);
+      setSaved(false);
+      setError(null);
+    } catch {
+      setError("A-key generation failed. A secure browser connection is required.");
     }
   };
 
@@ -129,7 +157,12 @@ export function AuthenticationCard({ subscriberId }: { subscriberId: string }) {
           <div className="flex flex-wrap items-center gap-2">
             <select
               value={format}
-              onChange={(e) => setFormat(e.target.value as "keypad" | "hex")}
+              onChange={(e) => {
+                setFormat(e.target.value as "keypad" | "hex");
+                setEntry("");
+                setGenerated(false);
+                setSaved(false);
+              }}
               className="glass-input"
               aria-label="A-key format"
             >
@@ -140,11 +173,24 @@ export function AuthenticationCard({ subscriberId }: { subscriberId: string }) {
               type="text"
               inputMode={format === "hex" ? "text" : "numeric"}
               value={entry}
-              onChange={(e) => setEntry(e.target.value)}
+              onChange={(e) => {
+                setEntry(e.target.value);
+                setGenerated(false);
+                setSaved(false);
+              }}
               placeholder={format === "hex" ? "C442F56BE9E17158" : "14 1421 3562 3730 9504 8808 6500"}
-              className="glass-input font-mono w-80"
+              className="glass-input font-mono w-80 max-w-full"
               aria-label={format === "hex" ? "A-key in hex" : "A-key with check digits"}
             />
+            <button
+              type="button"
+              className="border border-white/20 px-3 py-1 rounded disabled:opacity-50 disabled:cursor-not-allowed"
+              disabled={busy || generationEsn == null}
+              aria-describedby="akey-generation-help"
+              onClick={generate}
+            >
+              Generate
+            </button>
             <button
               type="button"
               className={SAVE_BTN}
@@ -162,6 +208,18 @@ export function AuthenticationCard({ subscriberId }: { subscriberId: string }) {
               Clear
             </button>
           </div>
+          <p id="akey-generation-help" className="text-muted">
+            {generationEsn == null
+              ? "Configure an ESN on the subscriber's primary identity to enable generation."
+              : `Generation uses configured ESN ${generationEsn.toString(16).toUpperCase().padStart(8, "0")}.`}
+          </p>
+          {generated && (
+            <p role="status" className="text-muted">
+              {saved
+                ? "A-key saved. Copy the keypad entry above to program the handset."
+                : "A-key generated with check digits. Select Set A-key to save it."}
+            </p>
+          )}
           {error && <p className="text-accent-red">{error}</p>}
         </section>
       </div>

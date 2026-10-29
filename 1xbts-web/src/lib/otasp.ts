@@ -22,6 +22,8 @@ export function outcomeNameToLabel(name: string | number | undefined): string {
   if (name == null) return "In progress";
   const s = typeof name === "number" ? outcomeNumberToName(name) : name;
   switch (s) {
+    case "OTASP_SESSION_OUTCOME_UNSPECIFIED":
+      return "In progress";
     case "OTASP_SESSION_OUTCOME_COMMITTED":
       return "Committed";
     case "OTASP_SESSION_OUTCOME_NOTHING_TO_COMMIT":
@@ -66,6 +68,7 @@ export function outcomeBadgeColor(name: string | number | undefined): string {
   switch (s) {
     case "OTASP_SESSION_OUTCOME_COMMITTED":
       return "bg-badge-green-bg text-badge-green-text";
+    case "OTASP_SESSION_OUTCOME_UNSPECIFIED":
     case "OTASP_SESSION_OUTCOME_NOTHING_TO_COMMIT":
       return "bg-badge-blue-bg text-badge-blue-text";
     default:

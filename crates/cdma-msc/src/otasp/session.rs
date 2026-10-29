@@ -1,15 +1,4 @@
-//! OTASP session state machine (BSC-side driver, per C.S0016-D §3.2.1 + §3.5).
-//!
-//! Drives the user-initiated `*228` programming sequence:
-//!   Protocol Capability → Verify SPC → for each enabled write block
-//!   (Config → Download) → Commit → release.
-//!
-//! Pure logic over OTASP message bytes. The transport (ADDS Deliver out / ADDS
-//! Transfer in) is the caller's job; this module only encodes/decodes OTASP
-//! Data Messages and emits an event stream plus a `SessionOutcome`.
-//!
-//! Per-step failures tear the session down on the first non-Accept result code
-//! per `docs/otasp-plan.md` decision 6. No in-session retries.
+//! OTASP and OTAPA session state machine (C.S0016-D §3.2 and §3.5).
 
 use cdma_otasp::message::commit::{CommitRequest, CommitResponse};
 use cdma_otasp::message::configuration::{ConfigurationRequest, ConfigurationResponse};
@@ -59,6 +48,9 @@ pub trait OtaspTransport {
 /// §5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OtaspAuthRequest {
+    ValidateSpasm {
+        rand_otapa: u32,
+    },
     BeginKeyExchange {
         a_key_p_rev: u8,
     },
@@ -109,6 +101,10 @@ const BLOCK_MMS_URI: u8 = cdma_otasp::message::mms::BLOCK_MMS_URI;
 
 /// Validation block IDs.
 const VBLOCK_VERIFY_SPC: u8 = 0x00;
+/// C.S0016-D §4.5.4.3, Validate SPASM parameter block.
+const VBLOCK_VALIDATE_SPASM: u8 = 0x02;
+const SPASM_SIGNATURE_BITS: usize = 18;
+const SPASM_RESERVED_BITS: usize = 4;
 
 /// Enumerated planned-write target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +165,9 @@ struct PlanStep {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
+    AwaitingOtapaStart,
+    AwaitingSpasmSignature,
+    AwaitingSpasmValidation,
     AwaitingProtocolCapability,
     AwaitingValidation,
     AwaitingPrlDimensions,
@@ -247,7 +246,12 @@ struct PrlPushState {
     segments_sent: u32,
 }
 
-/// OTASP session driver. One per `*228` call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionInitiation {
+    User,
+    Network,
+}
+
 pub struct OtaspSession {
     cfg: OtaspConfig,
     home_network: HomeNetworkConfig,
@@ -361,14 +365,32 @@ impl OtaspSession {
         }
     }
 
-    /// Kicks off the session: emits `SessionStart` and sends the Protocol
-    /// Capability Request.
     pub fn start<T: OtaspTransport>(&mut self, t: &mut T) {
+        self.start_with_initiation(SessionInitiation::User, t);
+    }
+
+    pub fn start_with_initiation<T: OtaspTransport>(
+        &mut self,
+        initiation: SessionInitiation,
+        t: &mut T,
+    ) {
         t.emit(OtaspEvent::SessionStart {
             device: self.device.clone(),
             feature_code: self.feature_code.clone(),
             service_option: self.service_option,
         });
+        if initiation == SessionInitiation::Network {
+            self.phase = Phase::AwaitingOtapaStart;
+            t.send(OutboundOtasp {
+                bytes: cdma_otasp::message::otapa::start_request(),
+            });
+            return;
+        }
+        self.send_protocol_capability(t);
+    }
+
+    fn send_protocol_capability<T: OtaspTransport>(&mut self, t: &mut T) {
+        self.phase = Phase::AwaitingProtocolCapability;
         let req = ProtocolCapabilityRequest::basic();
         match req.encode() {
             Ok(bytes) => t.send(OutboundOtasp { bytes }),
@@ -392,6 +414,8 @@ impl OtaspSession {
             return Some(self.outcome(SessionOutcomeKind::ProtocolError));
         }
         let result = match self.phase {
+            Phase::AwaitingOtapaStart => self.handle_otapa_start(bytes, t),
+            Phase::AwaitingSpasmValidation => self.handle_spasm_validation(bytes, t),
             Phase::AwaitingProtocolCapability => self.handle_protocol_capability(bytes, t),
             Phase::AwaitingValidation => self.handle_validation(bytes, t),
             Phase::AwaitingPrlDimensions => self.handle_prl_dimensions(bytes, t),
@@ -409,7 +433,8 @@ impl OtaspSession {
             Phase::AwaitingReAuthenticateResponse { rand } => {
                 self.handle_reauthenticate_response(rand, bytes, t)
             }
-            Phase::AwaitingKeyExchangeOffer
+            Phase::AwaitingSpasmSignature
+            | Phase::AwaitingKeyExchangeOffer
             | Phase::AwaitingKeyExchangeCompletion
             | Phase::AwaitingSsdUpdate
             | Phase::AwaitingReauthenticationVerdict => {
@@ -422,6 +447,94 @@ impl OtaspSession {
         match result {
             StepResult::Continue => None,
             StepResult::Terminal(kind) => Some(self.outcome(kind)),
+        }
+    }
+
+    fn handle_otapa_start<T: OtaspTransport>(&mut self, bytes: &[u8], t: &mut T) -> StepResult {
+        let response = match cdma_otasp::message::otapa::OtapaResponse::decode(bytes) {
+            Ok(response) => response,
+            Err(_) => {
+                self.terminate(t, SessionOutcomeKind::ProtocolError);
+                return StepResult::Terminal(SessionOutcomeKind::ProtocolError);
+            }
+        };
+        if response.result != ResultCode::Accepted {
+            log::warn!(
+                "OTAPA start rejected or handset NAM requires SPASM validation: result={:?} locked={}",
+                response.result,
+                response.rand_otapa.is_some()
+            );
+            self.terminate(t, SessionOutcomeKind::Rejected);
+            return StepResult::Terminal(SessionOutcomeKind::Rejected);
+        }
+        if let Some(rand_otapa) = response.rand_otapa {
+            self.phase = Phase::AwaitingSpasmSignature;
+            t.request(OtaspAuthRequest::ValidateSpasm { rand_otapa });
+        } else {
+            self.send_protocol_capability(t);
+        }
+        StepResult::Continue
+    }
+
+    pub fn on_spasm_signature<T: OtaspTransport>(
+        &mut self,
+        signature: Option<u32>,
+        t: &mut T,
+    ) -> Option<SessionOutcome> {
+        let Some(signature) = signature.filter(|_| self.phase == Phase::AwaitingSpasmSignature)
+        else {
+            t.emit(OtaspEvent::BlockSkipped {
+                block_id: VBLOCK_VALIDATE_SPASM,
+                reason: "Handset NAM is locked and matching SPASM credentials are unavailable"
+                    .into(),
+                feature: BlockFeature::Nam,
+            });
+            self.terminate(t, SessionOutcomeKind::Rejected);
+            return Some(self.outcome(SessionOutcomeKind::Rejected));
+        };
+        let mut bits = cdma_common::bits::Bitstream::new();
+        bits.write_u64(1, 1);
+        bits.write_u64(u64::from(signature), SPASM_SIGNATURE_BITS);
+        bits.write_u64(1, 1);
+        bits.write_u64(0, SPASM_RESERVED_BITS);
+        let request = ValidationRequest {
+            blocks: vec![ValidationParamBlock {
+                block_id: VBLOCK_VALIDATE_SPASM,
+                param_data: bits.to_packed_bytes(),
+            }],
+        };
+        match request.encode() {
+            Ok(bytes) => {
+                self.phase = Phase::AwaitingSpasmValidation;
+                t.send(OutboundOtasp { bytes });
+                None
+            }
+            Err(_) => {
+                self.terminate(t, SessionOutcomeKind::ProtocolError);
+                Some(self.outcome(SessionOutcomeKind::ProtocolError))
+            }
+        }
+    }
+
+    fn handle_spasm_validation<T: OtaspTransport>(
+        &mut self,
+        bytes: &[u8],
+        t: &mut T,
+    ) -> StepResult {
+        let response = ValidationResponse::decode(bytes);
+        if response.is_ok_and(|response| {
+            response.results.as_slice() == [(VBLOCK_VALIDATE_SPASM, ResultCode::Accepted)]
+        }) {
+            self.send_protocol_capability(t);
+            StepResult::Continue
+        } else {
+            t.emit(OtaspEvent::BlockSkipped {
+                block_id: VBLOCK_VALIDATE_SPASM,
+                reason: "Handset rejected OTAPA SPASM validation".into(),
+                feature: BlockFeature::Nam,
+            });
+            self.terminate(t, SessionOutcomeKind::Rejected);
+            StepResult::Terminal(SessionOutcomeKind::Rejected)
         }
     }
 
@@ -511,13 +624,16 @@ impl OtaspSession {
             Phase::AwaitingReAuthenticateResponse { .. } => {
                 let _ = self.fail_key_exchange(t);
             }
-            Phase::AwaitingKeyExchangeOffer
+            Phase::AwaitingSpasmSignature
+            | Phase::AwaitingKeyExchangeOffer
             | Phase::AwaitingKeyExchangeCompletion
             | Phase::AwaitingSsdUpdate
             | Phase::AwaitingReauthenticationVerdict => {}
             // Read-back / control phases without a block target — no
             // clean recovery, terminate the session.
-            Phase::AwaitingProtocolCapability
+            Phase::AwaitingOtapaStart
+            | Phase::AwaitingSpasmValidation
+            | Phase::AwaitingProtocolCapability
             | Phase::AwaitingValidation
             | Phase::AwaitingPrlDimensions
             | Phase::AwaitingPrlExtendedDimensions
@@ -2600,6 +2716,71 @@ mod tests {
         let mut rec = Recorder::default();
         sess.start(&mut rec);
         (sess, rec)
+    }
+
+    #[test]
+    fn network_session_starts_otapa_before_protocol_capability() {
+        let (mut session, mut rec) = start_session(writes_all_on());
+        rec.outbound.clear();
+        session.start_with_initiation(SessionInitiation::Network, &mut rec);
+        assert_eq!(rec.outbound[0].bytes, [0x0a, 0x80]);
+        assert!(session.on_inbound(&[0x0a, 0, 0], &mut rec).is_none());
+        assert_eq!(
+            &rec.outbound.last().unwrap().bytes,
+            &ProtocolCapabilityRequest::basic().encode().unwrap()
+        );
+    }
+
+    #[test]
+    fn locked_network_session_requires_valid_spasm_before_programming() {
+        let (mut session, mut rec) = start_session(writes_all_on());
+        rec.outbound.clear();
+        session.start_with_initiation(SessionInitiation::Network, &mut rec);
+        assert!(
+            session
+                .on_inbound(&[0x0a, 0, 1, 0x12, 0x34, 0x56, 0x78], &mut rec)
+                .is_none()
+        );
+        assert_eq!(
+            rec.requests.last(),
+            Some(&OtaspAuthRequest::ValidateSpasm {
+                rand_otapa: 0x12345678
+            })
+        );
+        assert_eq!(rec.outbound.len(), 1);
+        assert!(
+            session
+                .on_spasm_signature(Some(0x12345), &mut rec)
+                .is_none()
+        );
+        let request = ValidationRequest::decode(&rec.outbound.last().unwrap().bytes).unwrap();
+        assert_eq!(request.blocks[0].block_id, VBLOCK_VALIDATE_SPASM);
+        assert_eq!(request.blocks[0].param_data, [0xa4, 0x68, 0xb0]);
+        assert!(session.on_inbound(&[0x09, 1, 2, 0], &mut rec).is_none());
+        assert_eq!(
+            &rec.outbound.last().unwrap().bytes,
+            &ProtocolCapabilityRequest::basic().encode().unwrap()
+        );
+    }
+
+    #[test]
+    fn rejected_otapa_or_unavailable_spasm_never_sends_commit() {
+        for response in [&[0x0a, 6, 0][..], &[0x0a, 0, 1, 0, 0, 0, 1][..]] {
+            let (mut session, mut rec) = start_session(writes_all_on());
+            rec.outbound.clear();
+            session.start_with_initiation(SessionInitiation::Network, &mut rec);
+            let result = session.on_inbound(response, &mut rec);
+            let outcome = result
+                .or_else(|| session.on_spasm_signature(None, &mut rec))
+                .unwrap();
+            assert_eq!(outcome.kind, SessionOutcomeKind::Rejected);
+            assert_eq!(
+                rec.outbound,
+                [OutboundOtasp {
+                    bytes: vec![0x0a, 0x80]
+                }]
+            );
+        }
     }
 
     #[test]

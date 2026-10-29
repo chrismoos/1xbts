@@ -1026,6 +1026,7 @@ impl Bsc {
                 if self.send_existing_traffic_paging_response(
                     call_id,
                     fwd_address,
+                    imsi.as_deref(),
                     service_option,
                     session_id,
                     VoiceLegRole::Callee,

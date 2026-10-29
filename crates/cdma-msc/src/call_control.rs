@@ -287,6 +287,7 @@ mod tests {
 
     fn paging_request() -> PagingRequestMessage {
         PagingRequestMessage {
+            mobile_identity_meid: None,
             mobile_identity_imsi: MobileIdentity::Imsi("12345678901".to_string()),
             tag: Some(Tag(0x01020304)),
             cell_identifier_list: Some(CellIdentifierList::Cells(vec![CellId {

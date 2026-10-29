@@ -26,6 +26,7 @@ use crate::runtime::MscA1Endpoint;
 
 /// Per-session in-memory state plus pending outbound bytes for the next A1 flush.
 struct SessionEntry {
+    initiation: crate::otasp::session::SessionInitiation,
     session: OtaspSession,
     pending_out: Vec<OutboundOtasp>,
     events: Vec<OtaspEvent>,
@@ -42,6 +43,8 @@ struct SessionEntry {
     requests: Vec<OtaspAuthRequest>,
     identity: Option<cdma_hlr::model::MobileIdentityKey>,
     imsi: Option<String>,
+    air_imsi: Option<String>,
+    esn: Option<u32>,
     /// Whether the `*228` origination verified. None when it was not authenticated.
     origination_verified: Option<bool>,
 }
@@ -110,9 +113,6 @@ pub fn tag_belongs_to_otasp(tag: u32) -> bool {
     (tag & OTASP_TAG_NAMESPACE_BIT) != 0
 }
 
-/// Key used to demultiplex inbound OTASP messages to the right session.
-/// ESN-only or MEID-only originations are the spec-allowed shape; we key on
-/// whichever the BSC reported alongside the ADDS Transfer.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum SessionKey {
     Esn(u32),
@@ -121,11 +121,11 @@ pub enum SessionKey {
 
 impl SessionKey {
     pub fn from_transfer(msg: &AddsTransferMessage) -> Option<Self> {
-        if let Some(cdma_ios::MobileIdentity::Esn(esn)) = msg.mobile_identity_esn.as_ref() {
-            return Some(Self::Esn(*esn));
-        }
         if let Some(cdma_ios::MobileIdentity::Meid(bytes)) = msg.mobile_identity_meid.as_ref() {
             return Some(Self::Meid(encode_meid_hex(bytes)));
+        }
+        if let Some(cdma_ios::MobileIdentity::Esn(esn)) = msg.mobile_identity_esn.as_ref() {
+            return Some(Self::Esn(*esn));
         }
         None
     }
@@ -302,6 +302,9 @@ impl OtaspCoordinator {
         for ev in &new_events {
             self.history.append(record_id, ev.clone());
         }
+        if !new_events.is_empty() {
+            self.persist_network_progress(record_id).await;
+        }
         self.flush_outbound(
             &mut out,
             &mobile_identity_for_deliver,
@@ -344,10 +347,6 @@ impl OtaspCoordinator {
             .any(|prefix| dialed_digits.starts_with(prefix.as_str()))
     }
 
-    /// Begin a new OTASP session for a recognized `*228` origination. Looks up
-    /// the subscriber in HLR and immediately sends the Protocol Capability
-    /// Request via the supplied A1 endpoint, addressed to the BSC by
-    /// `mobile_identity_for_transfer`.
     pub async fn begin_session(
         &mut self,
         device: HardwareIdentity,
@@ -358,10 +357,51 @@ impl OtaspCoordinator {
         call_id: u64,
         a1: &dyn MscA1Endpoint,
     ) {
-        let hlr_lookup = self
+        self.begin_session_with_initiation(
+            crate::otasp::session::SessionInitiation::User,
+            device,
+            feature_code,
+            actual_service_option,
+            mobile_identity_for_deliver,
+            origination_verified,
+            call_id,
+            a1,
+        )
+        .await;
+    }
+
+    pub async fn begin_session_with_initiation(
+        &mut self,
+        initiation: crate::otasp::session::SessionInitiation,
+        device: HardwareIdentity,
+        feature_code: String,
+        actual_service_option: u16,
+        mobile_identity_for_deliver: cdma_ios::MobileIdentity,
+        origination_verified: Option<bool>,
+        call_id: u64,
+        a1: &dyn MscA1Endpoint,
+    ) {
+        let mut hlr_lookup = self
             .hlr
-            .resolve_by_hardware_identity(device.esn, device.meid.as_deref())
+            .resolve_by_hardware_identity(
+                if device.meid.is_some() {
+                    None
+                } else {
+                    device.esn
+                },
+                device.meid.as_deref(),
+            )
             .await;
+        if matches!(hlr_lookup, Ok(None))
+            && let cdma_ios::MobileIdentity::Imsi(imsi) = &mobile_identity_for_deliver
+            && let Ok(identity) = cdma_hlr::model::MobileIdentityKey::from_parts(
+                Some(imsi.as_str()),
+                device.esn,
+                device.meid.as_deref(),
+            )
+        {
+            hlr_lookup = self.hlr.resolve_by_identity(&identity).await;
+        }
         let mut subscriber_id_for_record: Option<Uuid> = None;
         let hlr = match hlr_lookup {
             Ok(Some(resolved)) => {
@@ -405,8 +445,8 @@ impl OtaspCoordinator {
         )
         .ok();
         let key = match (&device.esn, &device.meid) {
-            (Some(e), _) => SessionKey::Esn(*e),
-            (None, Some(m)) => SessionKey::Meid(m.clone()),
+            (_, Some(m)) => SessionKey::Meid(m.to_ascii_lowercase()),
+            (Some(e), None) => SessionKey::Esn(*e),
             (None, None) => {
                 warn!("OTASP: begin_session with no hardware identity — dropped");
                 return;
@@ -429,7 +469,7 @@ impl OtaspCoordinator {
                 events: &mut events,
                 requests: &mut requests,
             };
-            session.start(&mut rec);
+            session.start_with_initiation(initiation, &mut rec);
         }
         let record_id = self.record_session_start(&device, subscriber_id_for_record, &events);
         log_events(&events);
@@ -452,19 +492,31 @@ impl OtaspCoordinator {
         self.sessions.insert(
             key,
             SessionEntry {
+                initiation,
                 session,
                 pending_out,
                 events: Vec::new(),
                 call_id,
                 record_id,
                 last_activity: std::time::Instant::now(),
-                last_phase: "Protocol Capability".to_string(),
+                last_phase: if initiation == crate::otasp::session::SessionInitiation::Network {
+                    "OTAPA Start"
+                } else {
+                    "Protocol Capability"
+                }
+                .to_string(),
                 requests,
                 identity,
                 imsi,
+                air_imsi: match &mobile_identity_for_deliver {
+                    cdma_ios::MobileIdentity::Imsi(imsi) => Some(imsi.clone()),
+                    _ => None,
+                },
+                esn: device.esn,
                 origination_verified,
             },
         );
+        self.persist_network_progress(record_id).await;
         info!("OTASP: session started for device {:?}", device);
     }
 
@@ -549,6 +601,9 @@ impl OtaspCoordinator {
         for ev in &new_events {
             self.history.append(record_id, ev.clone());
         }
+        if !new_events.is_empty() {
+            self.persist_network_progress(record_id).await;
+        }
         self.flush_outbound(&mut out, &mobile_identity_for_deliver, call_id, &key, a1)
             .await;
         let follow_up = self.process_auth_requests(&key, a1).await;
@@ -625,6 +680,9 @@ impl OtaspCoordinator {
         for ev in &new_events {
             self.history.append(record_id, ev.clone());
         }
+        if !new_events.is_empty() {
+            self.persist_network_progress(record_id).await;
+        }
         let deliver_identity = cdma_ios::MobileIdentity::Imsi(String::new());
         self.flush_outbound(&mut out, &deliver_identity, call_id, key, a1)
             .await;
@@ -643,10 +701,7 @@ impl OtaspCoordinator {
         let Some(entry) = self.sessions.get(key) else {
             return;
         };
-        let esn = match key {
-            SessionKey::Esn(esn) => Some(*esn),
-            SessionKey::Meid(_) => None,
-        };
+        let esn = entry.esn;
         let _ = tx.send(crate::authentication::authentication_event(
             procedure,
             result,
@@ -691,7 +746,7 @@ impl OtaspCoordinator {
     ) -> Option<SessionOutcome> {
         use events_proto::{AuthenticationProcedure, AuthenticationResult};
         loop {
-            let (request, identity, imsi, call_id) = {
+            let (request, identity, imsi, esn, call_id) = {
                 let entry = self.sessions.get_mut(key)?;
                 if entry.requests.is_empty() {
                     return None;
@@ -699,15 +754,39 @@ impl OtaspCoordinator {
                 (
                     entry.requests.remove(0),
                     entry.identity.clone(),
-                    entry.imsi.clone(),
+                    entry.air_imsi.clone().or_else(|| entry.imsi.clone()),
+                    entry.esn,
                     entry.call_id,
                 )
             };
-            let esn = match key {
-                SessionKey::Esn(esn) => Some(*esn),
-                SessionKey::Meid(_) => None,
-            };
             let outcome = match request {
+                OtaspAuthRequest::ValidateSpasm { rand_otapa } => {
+                    let signature = match (identity.as_ref(), imsi.as_deref(), esn) {
+                        (Some(identity), Some(imsi), Some(esn)) => {
+                            if let Some((imsi_s1, _)) = cdma_common::paging::imsi_s_from_imsi(imsi)
+                            {
+                                match self
+                                    .hlr
+                                    .compute_otapa_signature(identity, esn, rand_otapa, imsi_s1)
+                                    .await
+                                {
+                                    Ok(signature) => Some(signature),
+                                    Err(error) => {
+                                        warn!("OTAPA: cannot validate handset NAM lock: {error}");
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    self.with_session(key, a1, |session, rec| {
+                        session.on_spasm_signature(signature, rec)
+                    })
+                    .await
+                }
                 OtaspAuthRequest::BeginKeyExchange { a_key_p_rev } => {
                     if let Some(reason) = self.a_key_on_file(key, identity.as_ref()).await {
                         info!(
@@ -908,6 +987,16 @@ impl OtaspCoordinator {
     /// Encode an in-flight record to an `OtaspSessionRow` and hand it to
     /// the HLR for durable storage. Failures are logged and dropped —
     /// session history is best-effort.
+    async fn persist_network_progress(&self, record_id: Uuid) {
+        if self.sessions.values().any(|entry| {
+            entry.record_id == record_id
+                && entry.initiation == crate::otasp::session::SessionInitiation::Network
+        }) && let Some(record) = self.history.snapshot(record_id)
+        {
+            self.persist_session_record(record).await;
+        }
+    }
+
     async fn persist_session_record(&self, rec: crate::otasp::history::OtaspSessionRecord) {
         let row = otasp_record_to_row(&rec, cdma_common::consts::SERVICE_OPTION_OTASP);
         if let Err(e) = self.hlr.save_otasp_session(&row).await {

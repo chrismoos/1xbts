@@ -19,6 +19,7 @@ pub mod mgmt_proxy;
 pub mod mo_call;
 pub mod mt_call;
 pub mod mt_page_retry;
+mod network_otasp;
 pub mod node;
 pub mod otasp;
 pub mod runtime;

@@ -1112,6 +1112,21 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         Ok(Response::new(proto::BeginCaveSsdUpdateResponse { randssd }))
     }
 
+    async fn compute_otapa_signature(
+        &self,
+        request: Request<proto::ComputeOtapaSignatureRequest>,
+    ) -> Result<Response<proto::ComputeOtapaSignatureResponse>, Status> {
+        let request = request.into_inner();
+        let identity = parse_identity_key(request.identity)?;
+        let auth_otapa = self
+            .repo
+            .compute_otapa_signature(&identity, request.esn, request.rand_otapa, request.imsi_s1)
+            .await?;
+        Ok(Response::new(proto::ComputeOtapaSignatureResponse {
+            auth_otapa,
+        }))
+    }
+
     async fn cave_base_station_challenge(
         &self,
         request: Request<proto::CaveBaseStationChallengeRequest>,

@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Card } from "@/components/card";
+import { StartOtasp } from "@/components/start-otasp";
 import { Pagination } from "@/components/pagination";
 import { formatTimeMs as formatTime } from "@/lib/format";
 import { outcomeBadgeColor, outcomeNameToLabel } from "@/lib/otasp";
@@ -98,6 +99,7 @@ export function RecentOtaspCard({
 
   return (
     <Card title="Recent OTASP Sessions">
+      {subscriberId && <div className="mb-4"><StartOtasp subscriberId={subscriberId} /></div>}
       {loading && rows.length === 0 ? (
         <p className="text-dimmed text-sm">Loading...</p>
       ) : error ? (

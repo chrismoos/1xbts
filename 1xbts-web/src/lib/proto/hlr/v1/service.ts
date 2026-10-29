@@ -1172,6 +1172,17 @@ export interface SetSubscriberAKeyRequest {
   aKeyDigits?: string | undefined;
 }
 
+export interface ComputeOtapaSignatureRequest {
+  identity: MobileIdentityKey | undefined;
+  esn: number;
+  randOtapa: number;
+  imsiS1: number;
+}
+
+export interface ComputeOtapaSignatureResponse {
+  authOtapa: number;
+}
+
 export interface GetSubscriberAuthStateRequest {
   identity: MobileIdentityKey | undefined;
 }
@@ -6564,6 +6575,188 @@ export const SetSubscriberAKeyRequest: MessageFns<SetSubscriberAKeyRequest> = {
     message.ssdB = object.ssdB ?? undefined;
     message.authAlgo = object.authAlgo ?? 0;
     message.aKeyDigits = object.aKeyDigits ?? undefined;
+    return message;
+  },
+};
+
+function createBaseComputeOtapaSignatureRequest(): ComputeOtapaSignatureRequest {
+  return { identity: undefined, esn: 0, randOtapa: 0, imsiS1: 0 };
+}
+
+export const ComputeOtapaSignatureRequest: MessageFns<ComputeOtapaSignatureRequest> = {
+  encode(message: ComputeOtapaSignatureRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.identity !== undefined) {
+      MobileIdentityKey.encode(message.identity, writer.uint32(10).fork()).join();
+    }
+    if (message.esn !== 0) {
+      writer.uint32(16).uint32(message.esn);
+    }
+    if (message.randOtapa !== 0) {
+      writer.uint32(24).uint32(message.randOtapa);
+    }
+    if (message.imsiS1 !== 0) {
+      writer.uint32(32).uint32(message.imsiS1);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ComputeOtapaSignatureRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseComputeOtapaSignatureRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.identity = MobileIdentityKey.decode(reader, reader.uint32());
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.esn = reader.uint32();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.randOtapa = reader.uint32();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.imsiS1 = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ComputeOtapaSignatureRequest {
+    return {
+      identity: isSet(object.identity) ? MobileIdentityKey.fromJSON(object.identity) : undefined,
+      esn: isSet(object.esn) ? globalThis.Number(object.esn) : 0,
+      randOtapa: isSet(object.randOtapa)
+        ? globalThis.Number(object.randOtapa)
+        : isSet(object.rand_otapa)
+        ? globalThis.Number(object.rand_otapa)
+        : 0,
+      imsiS1: isSet(object.imsiS1)
+        ? globalThis.Number(object.imsiS1)
+        : isSet(object.imsi_s1)
+        ? globalThis.Number(object.imsi_s1)
+        : 0,
+    };
+  },
+
+  toJSON(message: ComputeOtapaSignatureRequest): unknown {
+    const obj: any = {};
+    if (message.identity !== undefined) {
+      obj.identity = MobileIdentityKey.toJSON(message.identity);
+    }
+    if (message.esn !== 0) {
+      obj.esn = Math.round(message.esn);
+    }
+    if (message.randOtapa !== 0) {
+      obj.randOtapa = Math.round(message.randOtapa);
+    }
+    if (message.imsiS1 !== 0) {
+      obj.imsiS1 = Math.round(message.imsiS1);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<ComputeOtapaSignatureRequest>): ComputeOtapaSignatureRequest {
+    return ComputeOtapaSignatureRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<ComputeOtapaSignatureRequest>): ComputeOtapaSignatureRequest {
+    const message = createBaseComputeOtapaSignatureRequest();
+    message.identity = (object.identity !== undefined && object.identity !== null)
+      ? MobileIdentityKey.fromPartial(object.identity)
+      : undefined;
+    message.esn = object.esn ?? 0;
+    message.randOtapa = object.randOtapa ?? 0;
+    message.imsiS1 = object.imsiS1 ?? 0;
+    return message;
+  },
+};
+
+function createBaseComputeOtapaSignatureResponse(): ComputeOtapaSignatureResponse {
+  return { authOtapa: 0 };
+}
+
+export const ComputeOtapaSignatureResponse: MessageFns<ComputeOtapaSignatureResponse> = {
+  encode(message: ComputeOtapaSignatureResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.authOtapa !== 0) {
+      writer.uint32(8).uint32(message.authOtapa);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ComputeOtapaSignatureResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseComputeOtapaSignatureResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.authOtapa = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ComputeOtapaSignatureResponse {
+    return {
+      authOtapa: isSet(object.authOtapa)
+        ? globalThis.Number(object.authOtapa)
+        : isSet(object.auth_otapa)
+        ? globalThis.Number(object.auth_otapa)
+        : 0,
+    };
+  },
+
+  toJSON(message: ComputeOtapaSignatureResponse): unknown {
+    const obj: any = {};
+    if (message.authOtapa !== 0) {
+      obj.authOtapa = Math.round(message.authOtapa);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<ComputeOtapaSignatureResponse>): ComputeOtapaSignatureResponse {
+    return ComputeOtapaSignatureResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<ComputeOtapaSignatureResponse>): ComputeOtapaSignatureResponse {
+    const message = createBaseComputeOtapaSignatureResponse();
+    message.authOtapa = object.authOtapa ?? 0;
     return message;
   },
 };
@@ -15009,7 +15202,16 @@ export const HlrServiceDefinition = {
       responseStream: false,
       options: {},
     },
-    /** Provisions (or clears) the CAVE A-key and SSD material for one identity. */
+    /** Computes the SPASM signature without returning stored key material. */
+    computeOtapaSignature: {
+      name: "ComputeOtapaSignature",
+      requestType: ComputeOtapaSignatureRequest as typeof ComputeOtapaSignatureRequest,
+      requestStream: false,
+      responseType: ComputeOtapaSignatureResponse as typeof ComputeOtapaSignatureResponse,
+      responseStream: false,
+      options: {},
+    },
+    /** Provisions or clears the CAVE A-key and SSD for one identity. */
     setSubscriberAKey: {
       name: "SetSubscriberAKey",
       requestType: SetSubscriberAKeyRequest as typeof SetSubscriberAKeyRequest,
@@ -15284,7 +15486,12 @@ export interface HlrServiceImplementation<CallContextExt = {}> {
     request: SetSubscriberFirstchpOverrideRequest,
     context: CallContext & CallContextExt,
   ): Promise<DeepPartial<Empty>>;
-  /** Provisions (or clears) the CAVE A-key and SSD material for one identity. */
+  /** Computes the SPASM signature without returning stored key material. */
+  computeOtapaSignature(
+    request: ComputeOtapaSignatureRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<ComputeOtapaSignatureResponse>>;
+  /** Provisions or clears the CAVE A-key and SSD for one identity. */
   setSubscriberAKey(
     request: SetSubscriberAKeyRequest,
     context: CallContext & CallContextExt,
@@ -15495,7 +15702,12 @@ export interface HlrServiceClient<CallOptionsExt = {}> {
     request: DeepPartial<SetSubscriberFirstchpOverrideRequest>,
     options?: CallOptions & CallOptionsExt,
   ): Promise<Empty>;
-  /** Provisions (or clears) the CAVE A-key and SSD material for one identity. */
+  /** Computes the SPASM signature without returning stored key material. */
+  computeOtapaSignature(
+    request: DeepPartial<ComputeOtapaSignatureRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<ComputeOtapaSignatureResponse>;
+  /** Provisions or clears the CAVE A-key and SSD for one identity. */
   setSubscriberAKey(
     request: DeepPartial<SetSubscriberAKeyRequest>,
     options?: CallOptions & CallOptionsExt,

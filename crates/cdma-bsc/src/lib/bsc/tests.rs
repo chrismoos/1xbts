@@ -956,6 +956,7 @@ async fn a1_paging_request_processes_independently_of_prior_assignment_request()
         &cdma_ios::Message::new(
             cdma_ios::MessageType::PagingRequest,
             cdma_ios::PagingRequestMessage {
+                mobile_identity_meid: None,
                 mobile_identity_imsi: cdma_ios::MobileIdentity::Imsi(imsi.clone()),
                 tag: Some(cdma_ios::Tag(call_id as u32)),
                 cell_identifier_list: None,

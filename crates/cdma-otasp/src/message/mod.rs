@@ -5,6 +5,7 @@ pub mod configuration;
 pub mod download;
 pub mod key_exchange;
 pub mod mms;
+pub mod otapa;
 pub mod protocol_capability;
 pub mod result_code;
 pub mod sspr;
@@ -23,6 +24,7 @@ pub mod msg_type {
     pub const SSPR_CONFIGURATION: u8 = 0x07;
     pub const SSPR_DOWNLOAD: u8 = 0x08;
     pub const VALIDATION: u8 = 0x09;
+    pub const OTAPA: u8 = 0x0a;
     pub const SYSTEM_TAG_CONFIGURATION: u8 = 0x13;
     pub const SYSTEM_TAG_DOWNLOAD: u8 = 0x14;
     pub const MMS_CONFIGURATION: u8 = 0x16;

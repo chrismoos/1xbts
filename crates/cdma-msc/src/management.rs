@@ -69,6 +69,11 @@ pub struct MtCallPlan {
 /// Server-side pending control request awaiting a reply from MSC logic.
 #[derive(Debug)]
 pub enum PendingControlRequest {
+    InitiateOtasp {
+        subscriber_id: Uuid,
+        imsi: Option<String>,
+        response_tx: oneshot::Sender<Result<InitiateCallAccepted, ManagementError>>,
+    },
     /// Pending request to initiate a mobile-terminated call.
     InitiateCall {
         /// Request payload.

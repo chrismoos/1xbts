@@ -949,6 +949,7 @@ impl Bsc {
         &mut self,
         call_id: u64,
         fwd_address: &MsAddress,
+        imsi: Option<&str>,
         service_option: u16,
         session_id: uuid::Uuid,
         leg_role: VoiceLegRole,
@@ -997,7 +998,9 @@ impl Bsc {
                 },
                 0,
             ),
-            mobile_identity_imsi: mobile_identity,
+            mobile_identity_imsi: imsi
+                .map(|imsi| cdma_ios::MobileIdentity::Imsi(imsi.to_owned()))
+                .unwrap_or(mobile_identity),
             tag: Some(cdma_ios::Tag(call_id as u32)),
             mobile_identity_esn: ms.esn.map(cdma_ios::MobileIdentity::Esn),
             mobile_identity_meid: ms.meid.as_deref().and_then(meid_identity_from_hex),
@@ -2464,6 +2467,7 @@ mod tests {
         assert!(bsc.send_existing_traffic_paging_response(
             call_id,
             &test_addr,
+            Some("310006054426442"),
             3,
             session_id,
             VoiceLegRole::Callee,
@@ -2477,6 +2481,10 @@ mod tests {
         assert_eq!(outbound.call_id(), Some(call_id));
         let decoded = outbound.decode().unwrap();
         let response = cdma_ios::PagingResponseMessage::decode(&decoded.payload).unwrap();
+        assert_eq!(
+            response.mobile_identity_imsi,
+            cdma_ios::MobileIdentity::Imsi("310006054426442".to_owned()),
+        );
         assert!(
             response.classmark_information_type_2.0.len() >= 4,
             "A1 Paging Response must carry a valid Classmark Information Type 2"

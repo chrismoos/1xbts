@@ -1,8 +1,7 @@
 //! Validation Request — C.S0016-D §4.5.1.10.
 //! Validation Response — C.S0016-D §3.5.1.10.
 //!
-//! Carries Verify SPC / Change SPC parameter blocks. (Validate SPASM is
-//! deferred per phase-1 scope.)
+//! Validation blocks use an octet identifier, octet length, and parameter bytes.
 
 use crate::Error;
 use crate::message::msg_type::VALIDATION;

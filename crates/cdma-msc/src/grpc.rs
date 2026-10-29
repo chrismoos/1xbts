@@ -182,6 +182,31 @@ impl MscManagementService for MscManagementServiceImpl {
         Ok(Response::new(mgmt_proto::BaseStationList { nodes }))
     }
 
+    async fn initiate_otasp(
+        &self,
+        request: Request<mgmt_proto::InitiateOtaspRequest>,
+    ) -> Result<Response<mgmt_proto::InitiateOtaspResponse>, Status> {
+        let request = request.into_inner();
+        let subscriber_id = uuid::Uuid::parse_str(&request.subscriber_id)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        self.mgmt_tx
+            .send(crate::management::PendingControlRequest::InitiateOtasp {
+                subscriber_id,
+                imsi: request.imsi,
+                response_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable("MSC runtime is shutting down"))?;
+        let accepted = response_rx
+            .await
+            .map_err(|_| Status::unavailable("MSC runtime dropped response"))?
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(Response::new(mgmt_proto::InitiateOtaspResponse {
+            call_id: accepted.call_id.0,
+        }))
+    }
+
     async fn initiate_call(
         &self,
         request: Request<proto::InitiateCallRequest>,

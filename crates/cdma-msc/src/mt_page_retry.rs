@@ -118,6 +118,7 @@ mod tests {
 
     fn req() -> cdma_ios::PagingRequestMessage {
         cdma_ios::PagingRequestMessage {
+            mobile_identity_meid: None,
             mobile_identity_imsi: cdma_ios::MobileIdentity::Imsi("310150123456789".to_string()),
             tag: Some(cdma_ios::Tag(1)),
             cell_identifier_list: None,

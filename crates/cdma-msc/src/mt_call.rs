@@ -51,6 +51,7 @@ impl MtCallService {
     }
 
     pub(crate) fn cleanup_call(&mut self, call_id: CallId) {
+        self.mt_plans.remove(&(call_id.0 as u32));
         self.caller_numbers.remove(&call_id);
     }
 

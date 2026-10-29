@@ -221,6 +221,18 @@ pub trait HlrRepository: Send + Sync {
         Err(CAVE_UNSUPPORTED.into())
     }
 
+    async fn compute_otapa_signature(
+        &self,
+        _identity: &MobileIdentityKey,
+        _esn: u32,
+        _rand_otapa: u32,
+        _imsi_s1: u32,
+    ) -> Result<u32, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "OTAPA SPASM is not supported by this repository",
+        ))
+    }
+
     async fn cave_base_station_challenge(
         &self,
         _identity: &MobileIdentityKey,
@@ -1373,6 +1385,24 @@ impl HlrRepository for GrpcHlrRepository {
             .await
             .map(|resp| resp.into_inner().randssd)
             .map_err(|status| format!("HLR BeginCaveSsdUpdate: {status}"))
+    }
+
+    async fn compute_otapa_signature(
+        &self,
+        identity: &MobileIdentityKey,
+        esn: u32,
+        rand_otapa: u32,
+        imsi_s1: u32,
+    ) -> Result<u32, tonic::Status> {
+        self.client()
+            .compute_otapa_signature(proto::ComputeOtapaSignatureRequest {
+                identity: Some(identity_key_to_proto(identity)),
+                esn,
+                rand_otapa,
+                imsi_s1,
+            })
+            .await
+            .map(|response| response.into_inner().auth_otapa)
     }
 
     async fn cave_base_station_challenge(
@@ -3106,6 +3136,21 @@ impl HlrRepository for PostgresHlrRepository {
         .await
         .map_err(|e| format!("begin_cave_ssd_update: {e}"))?;
         Ok(randssd)
+    }
+
+    async fn compute_otapa_signature(
+        &self,
+        identity: &MobileIdentityKey,
+        esn: u32,
+        rand_otapa: u32,
+        imsi_s1: u32,
+    ) -> Result<u32, tonic::Status> {
+        let (_, credentials) = self
+            .load_cave_credentials(identity)
+            .await
+            .map_err(tonic::Status::internal)?;
+        crate::auth::otapa_signature(&credentials, esn, rand_otapa, imsi_s1)
+            .map_err(|error| tonic::Status::failed_precondition(error.to_string()))
     }
 
     async fn cave_base_station_challenge(

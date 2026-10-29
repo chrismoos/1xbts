@@ -218,6 +218,7 @@ mod event_tests {
 
     fn paging(call_id: u64) -> EncodedA1Message {
         let payload = PagingRequestMessage {
+            mobile_identity_meid: None,
             mobile_identity_imsi: MobileIdentity::Imsi("310009135198800".into()),
             tag: None,
             cell_identifier_list: None,

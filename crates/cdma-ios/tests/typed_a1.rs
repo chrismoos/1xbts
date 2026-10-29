@@ -131,6 +131,7 @@ fn complete_layer3_information_roundtrip() {
 #[test]
 fn paging_request_roundtrip() {
     let message = PagingRequestMessage {
+        mobile_identity_meid: None,
         mobile_identity_imsi: MobileIdentity::Imsi("12345678901".to_string()),
         tag: Some(Tag(0x01020304)),
         cell_identifier_list: Some(CellIdentifierList::Cells(vec![cell_id()])),
@@ -1400,6 +1401,7 @@ fn complete_layer3_information_rejects_duplicate_cell_identifier() {
 #[test]
 fn paging_request_rejects_duplicate_tag() {
     let message = PagingRequestMessage {
+        mobile_identity_meid: None,
         mobile_identity_imsi: MobileIdentity::Imsi("12345678901".to_string()),
         tag: Some(Tag(0x01020304)),
         cell_identifier_list: None,
@@ -2003,4 +2005,21 @@ fn private_long_code_uses_six_octets_and_complete_contains_only_status() {
         .is_err()
     );
     assert!(EncryptionInformation::private_long_code(1u64 << 42, true).is_err());
+}
+
+#[test]
+fn paging_request_retains_imsi_and_additional_meid() {
+    let mut message = PagingRequestMessage {
+        mobile_identity_imsi: MobileIdentity::Imsi("310000000006203".into()),
+        mobile_identity_meid: Some(MobileIdentity::Meid([0xa0, 0, 0, 0x25, 0xf0, 0x79, 0x73])),
+        tag: None,
+        cell_identifier_list: None,
+        slot_cycle_index: None,
+        service_option: Some(ServiceOption(18)),
+        is2000_mobile_capabilities: None,
+    };
+    let bytes = message.encode().unwrap();
+    assert_eq!(PagingRequestMessage::decode(&bytes).unwrap(), message);
+    message.mobile_identity_meid = Some(MobileIdentity::Esn(0x1234_5678));
+    assert!(message.encode().is_err());
 }

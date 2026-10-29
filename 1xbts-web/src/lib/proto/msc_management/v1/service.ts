@@ -94,6 +94,16 @@ export interface AuthenticationEventList {
   events: AuthenticationEvent[];
 }
 
+export interface InitiateOtaspRequest {
+  subscriberId: string;
+  /** Omit to select the subscriber's primary identity. */
+  imsi?: string | undefined;
+}
+
+export interface InitiateOtaspResponse {
+  callId: number;
+}
+
 function createBaseCallList(): CallList {
   return { callIds: [] };
 }
@@ -794,11 +804,164 @@ export const AuthenticationEventList: MessageFns<AuthenticationEventList> = {
   },
 };
 
+function createBaseInitiateOtaspRequest(): InitiateOtaspRequest {
+  return { subscriberId: "", imsi: undefined };
+}
+
+export const InitiateOtaspRequest: MessageFns<InitiateOtaspRequest> = {
+  encode(message: InitiateOtaspRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.subscriberId !== "") {
+      writer.uint32(10).string(message.subscriberId);
+    }
+    if (message.imsi !== undefined) {
+      writer.uint32(18).string(message.imsi);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): InitiateOtaspRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseInitiateOtaspRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.subscriberId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.imsi = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): InitiateOtaspRequest {
+    return {
+      subscriberId: isSet(object.subscriberId)
+        ? globalThis.String(object.subscriberId)
+        : isSet(object.subscriber_id)
+        ? globalThis.String(object.subscriber_id)
+        : "",
+      imsi: isSet(object.imsi) ? globalThis.String(object.imsi) : undefined,
+    };
+  },
+
+  toJSON(message: InitiateOtaspRequest): unknown {
+    const obj: any = {};
+    if (message.subscriberId !== "") {
+      obj.subscriberId = message.subscriberId;
+    }
+    if (message.imsi !== undefined) {
+      obj.imsi = message.imsi;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<InitiateOtaspRequest>): InitiateOtaspRequest {
+    return InitiateOtaspRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<InitiateOtaspRequest>): InitiateOtaspRequest {
+    const message = createBaseInitiateOtaspRequest();
+    message.subscriberId = object.subscriberId ?? "";
+    message.imsi = object.imsi ?? undefined;
+    return message;
+  },
+};
+
+function createBaseInitiateOtaspResponse(): InitiateOtaspResponse {
+  return { callId: 0 };
+}
+
+export const InitiateOtaspResponse: MessageFns<InitiateOtaspResponse> = {
+  encode(message: InitiateOtaspResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.callId !== 0) {
+      writer.uint32(8).uint64(message.callId);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): InitiateOtaspResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseInitiateOtaspResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.callId = longToNumber(reader.uint64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): InitiateOtaspResponse {
+    return {
+      callId: isSet(object.callId)
+        ? globalThis.Number(object.callId)
+        : isSet(object.call_id)
+        ? globalThis.Number(object.call_id)
+        : 0,
+    };
+  },
+
+  toJSON(message: InitiateOtaspResponse): unknown {
+    const obj: any = {};
+    if (message.callId !== 0) {
+      obj.callId = Math.round(message.callId);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<InitiateOtaspResponse>): InitiateOtaspResponse {
+    return InitiateOtaspResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<InitiateOtaspResponse>): InitiateOtaspResponse {
+    const message = createBaseInitiateOtaspResponse();
+    message.callId = object.callId ?? 0;
+    return message;
+  },
+};
+
 export type MscManagementServiceDefinition = typeof MscManagementServiceDefinition;
 export const MscManagementServiceDefinition = {
   name: "MscManagementService",
   fullName: "msc_management.v1.MscManagementService",
   methods: {
+    /** Pages the handset and applies the configured OTASP writes and subscriber overrides. */
+    initiateOtasp: {
+      name: "InitiateOtasp",
+      requestType: InitiateOtaspRequest as typeof InitiateOtaspRequest,
+      requestStream: false,
+      responseType: InitiateOtaspResponse as typeof InitiateOtaspResponse,
+      responseStream: false,
+      options: {},
+    },
     /** Lists the base stations the MSC serves, attached or not. */
     listBaseStations: {
       name: "ListBaseStations",
@@ -863,6 +1026,11 @@ export const MscManagementServiceDefinition = {
 } as const;
 
 export interface MscManagementServiceImplementation<CallContextExt = {}> {
+  /** Pages the handset and applies the configured OTASP writes and subscriber overrides. */
+  initiateOtasp(
+    request: InitiateOtaspRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<InitiateOtaspResponse>>;
   /** Lists the base stations the MSC serves, attached or not. */
   listBaseStations(request: Empty, context: CallContext & CallContextExt): Promise<DeepPartial<BaseStationList>>;
   /** Initiates a mobile-terminated voice call through the BSC and voice gateway. */
@@ -893,6 +1061,11 @@ export interface MscManagementServiceImplementation<CallContextExt = {}> {
 }
 
 export interface MscManagementServiceClient<CallOptionsExt = {}> {
+  /** Pages the handset and applies the configured OTASP writes and subscriber overrides. */
+  initiateOtasp(
+    request: DeepPartial<InitiateOtaspRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<InitiateOtaspResponse>;
   /** Lists the base stations the MSC serves, attached or not. */
   listBaseStations(request: DeepPartial<Empty>, options?: CallOptions & CallOptionsExt): Promise<BaseStationList>;
   /** Initiates a mobile-terminated voice call through the BSC and voice gateway. */

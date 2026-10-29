@@ -3441,10 +3441,11 @@ impl CompleteLayer3InformationMessage {
     }
 }
 
-/// Exact `Paging Request` BSMAP message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PagingRequestMessage {
     pub mobile_identity_imsi: MobileIdentity,
+    /// A.S0014-D §3.1.4 includes MEID in addition to the paging IMSI when available.
+    pub mobile_identity_meid: Option<MobileIdentity>,
     pub tag: Option<Tag>,
     pub cell_identifier_list: Option<CellIdentifierList>,
     pub slot_cycle_index: Option<SlotCycleIndex>,
@@ -3453,7 +3454,6 @@ pub struct PagingRequestMessage {
 }
 
 impl PagingRequestMessage {
-    /// Encodes the message using the exact A1 BSMAP wire format.
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut body = Vec::new();
         let mobile_identity = self.mobile_identity_imsi.encode()?;
@@ -3488,14 +3488,23 @@ impl PagingRequestMessage {
                 is2000_mobile_capabilities.encode()?,
             )?;
         }
+        if let Some(identity) = &self.mobile_identity_meid {
+            if !matches!(identity, MobileIdentity::Meid(_)) {
+                return Err(Error::InvalidValue {
+                    context: "Paging Request",
+                    reason: "MEID field must contain MEID mobile identity",
+                });
+            }
+            push_tlv(&mut body, IE_MOBILE_IDENTITY, &identity.encode()?)?;
+        }
         encode_bsmap(PAGING_REQUEST, &body)
     }
 
-    /// Decodes the message from the exact A1 BSMAP wire format.
     pub fn decode(input: &[u8]) -> Result<Self> {
         let body = parse_bsmap(PAGING_REQUEST, input)?;
         let mut offset = 0;
         let mut mobile_identity_imsi = None;
+        let mut mobile_identity_meid = None;
         let mut tag = None;
         let mut cell_identifier_list = None;
         let mut slot_cycle_index = None;
@@ -3507,18 +3516,26 @@ impl PagingRequestMessage {
                     let (id, payload, consumed) = decode_tlv(&body[offset..])?;
                     debug_assert_eq!(id, IE_MOBILE_IDENTITY);
                     let identity = MobileIdentity::decode(payload)?;
-                    if !matches!(identity, MobileIdentity::Imsi(_)) {
-                        return Err(Error::InvalidValue {
-                            context: "Paging Request",
-                            reason: "mobile identity must be IMSI",
-                        });
+                    match identity {
+                        identity @ MobileIdentity::Imsi(_) => set_once(
+                            &mut mobile_identity_imsi,
+                            identity,
+                            PAGING_REQUEST,
+                            IE_MOBILE_IDENTITY,
+                        )?,
+                        identity @ MobileIdentity::Meid(_) => set_once(
+                            &mut mobile_identity_meid,
+                            identity,
+                            PAGING_REQUEST,
+                            IE_MOBILE_IDENTITY,
+                        )?,
+                        _ => {
+                            return Err(Error::InvalidValue {
+                                context: "Paging Request",
+                                reason: "mobile identity must be IMSI or additional MEID",
+                            });
+                        }
                     }
-                    set_once(
-                        &mut mobile_identity_imsi,
-                        identity,
-                        PAGING_REQUEST,
-                        IE_MOBILE_IDENTITY,
-                    )?;
                     offset += consumed;
                 }
                 IE_TAG => {
@@ -3574,6 +3591,7 @@ impl PagingRequestMessage {
                 message_type: PAGING_REQUEST,
                 id: IE_MOBILE_IDENTITY,
             })?,
+            mobile_identity_meid,
             tag,
             cell_identifier_list,
             slot_cycle_index,
