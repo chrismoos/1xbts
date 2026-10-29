@@ -33,6 +33,8 @@ use super::{
 /// Result of an async HLR subscriber lookup, sent back to the BSC run loop.
 pub(crate) struct HlrResolution {
     pub(crate) fwd_address: MsAddress,
+    pub(crate) observed_esn: Option<u32>,
+    pub(crate) observed_meid: Option<String>,
     pub(crate) subscriber_id: Option<Uuid>,
     pub(crate) phone_number: Option<String>,
     pub(crate) display_name: Option<String>,
@@ -96,6 +98,13 @@ impl AccessTx {
             BS_ACK_HOLD.as_millis(),
         );
         let mut held = self.held_bs_acks.lock();
+        if let Some(ack) = held
+            .iter()
+            .find(|ack| ack.cell == cell && ack.addr == *addr && ack.ack_msg_seq == ack_msg_seq)
+            && ack.due <= tokio::time::Instant::now() + BS_ACK_HOLD
+        {
+            return;
+        }
         held.retain(|ack| ack.addr != *addr);
         held.push(HeldBsAck {
             cell,
@@ -453,7 +462,7 @@ impl AccessService {
         // Location Updating Request would carry no authentication fields and be
         // accepted unchecked, while the originating message reaches the MSC with
         // its own and binds the mobile only when it verifies.
-        if !update_was_explicit && bsc.config.bts.auth_mode(event.cell) != 0 {
+        if !update_was_explicit && bsc.access_authentication_required(event) {
             return outcome.fwd_address;
         }
         bsc.notify_msc_registration(
@@ -524,7 +533,11 @@ impl AccessService {
         let fwd_address = bsc.extract_fwd_address(&event);
         let known_mobile = fwd_address
             .as_ref()
-            .filter(|addr| bsc.mobiles.get(addr).is_some())
+            .filter(|addr| {
+                bsc.mobiles
+                    .get(addr)
+                    .is_some_and(|ms| event.esn.is_none_or(|esn| ms.esn == Some(esn)))
+            })
             .cloned();
         let activity_now = Instant::now();
 
@@ -535,9 +548,13 @@ impl AccessService {
         // original L3 response. The original response has its own MSG_SEQ
         // and retransmission lifecycle on the f-csch.
         if let Some(addr) = known_mobile {
+            let identity_pending = bsc.access_identity.is_pending(&addr, event.cell);
             let duplicate_decision = bsc
                 .mobiles
                 .update(&addr, |ms| {
+                    if identity_pending {
+                        ms.last_access_activity = Some(activity_now);
+                    }
                     self.handle_known_mobile_msg_seq(ms, &event, activity_now)
                 })
                 .unwrap_or(AccessDuplicateDecision::NewSdu);
@@ -569,7 +586,43 @@ impl AccessService {
             // after registration creates the MobileStation entry — see below.
         }
 
+        if bsc.defer_access_for_identity(&event) {
+            return;
+        }
+        self.dispatch_access_event(bsc, event).await;
+    }
+
+    pub(crate) async fn dispatch_access_event(&mut self, bsc: &mut Bsc, event: AccessChannelEvent) {
         match event.message_id {
+            MessageId::StatusResponse | MessageId::ExtStatusResponse => {
+                if let Some(addr) = bsc.extract_fwd_address(&event) {
+                    if event.ack_req
+                        && let Some(seq) = event.msg_seq
+                    {
+                        if bsc.access_identity.is_pending(&addr, event.cell) {
+                            bsc.access_tx.hold_bs_ack_order(
+                                event.cell,
+                                &addr,
+                                seq,
+                                access_response_tx_time(&event),
+                                bsc.access_ack_deadline(&event),
+                            );
+                        } else if let Err(error) = bsc.access_tx.send_bs_ack_order(
+                            event.cell,
+                            &addr,
+                            seq,
+                            access_response_tx_time(&event),
+                            bsc.access_ack_deadline(&event),
+                        ) {
+                            warn!("BSC: failed to acknowledge status response: {error}");
+                        }
+                    }
+                    if let Some(seq) = event.msg_seq {
+                        bsc.mobiles.update(&addr, |ms| ms.last_msg_seq = seq);
+                    }
+                    bsc.handle_meid_response(&addr, &event);
+                }
+            }
             MessageId::Registration => {
                 let registered_addr = bsc.extract_fwd_address(&event);
                 self.handle_registration(bsc, &event);
@@ -580,6 +633,7 @@ impl AccessService {
             }
             MessageId::Order => {
                 self.handle_order(bsc, &event).await;
+                bsc.handle_access_identity_order(&event).await;
             }
             MessageId::DataBurst => {
                 self.handle_data_burst(bsc, &event);
@@ -726,13 +780,17 @@ impl AccessService {
         // With AUTH=01 the MSC decides, so only the layer-2 ack goes out now and the
         // Registration Accepted or Rejected Order follows the Location Updating result.
         let sent = if registration_awaits_authentication(bsc, event) {
-            bsc.access_tx.send_bs_ack_order(
-                event.cell,
-                &fwd_address,
-                last_msg_seq,
-                access_response_tx_time(event),
-                bsc.access_ack_deadline(event),
-            )
+            if event.ack_req {
+                bsc.access_tx.send_bs_ack_order(
+                    event.cell,
+                    &fwd_address,
+                    last_msg_seq,
+                    access_response_tx_time(event),
+                    bsc.access_ack_deadline(event),
+                )
+            } else {
+                Ok(())
+            }
         } else {
             bsc.access_tx.send_registration_accepted(
                 event.cell,
@@ -751,6 +809,9 @@ impl AccessService {
         // Order or Service Redirection only. No channel assignment.
         // Voice page consumption is handled exclusively by handle_page_response()
         // per §3.6.3.3.
+        if !registration_awaits_authentication(bsc, event) {
+            bsc.request_meid(&fwd_address, super::meid::MeidQueryChannel::Paging);
+        }
         bsc.try_deliver_pending_sms_from_access(event, &fwd_address, "Registration");
     }
 
@@ -1397,6 +1458,10 @@ impl Bsc {
     }
 
     pub(crate) async fn handle_access_event(&mut self, event: AccessChannelEvent) {
+        if event.traffic_walsh_code.is_none() {
+            self.expire_access_identities(tokio::time::Instant::now())
+                .await;
+        }
         let mut access_service = std::mem::take(&mut self.access_service);
         access_service.handle_access_event(self, event).await;
         self.access_service = access_service;
@@ -1462,7 +1527,7 @@ impl Bsc {
 /// When the event provides IMSI_S (any class), omitted MCC/IMSI_11_12
 /// are assumed equal to overhead; this matches the behavior of
 /// `extract_page_address`.
-fn resolve_imsi_overhead(
+pub(crate) fn resolve_imsi_overhead(
     event: &AccessChannelEvent,
     overhead_mcc: u16,
     overhead_imsi_11_12: u8,
@@ -1537,7 +1602,7 @@ const REGISTRATION_ORDER_CODE: u8 = 0b011011;
 const REGISTRATION_REJECTED_ORDQ: u8 = 0b0000_0010;
 
 pub(crate) fn registration_awaits_authentication(bsc: &Bsc, event: &AccessChannelEvent) -> bool {
-    event.message_id == MessageId::Registration && bsc.config.bts.auth_mode(event.cell) != 0
+    event.message_id == MessageId::Registration && bsc.access_authentication_required(event)
 }
 
 /// Requested TX time for access-coupled responses.  Send as soon as
@@ -1571,6 +1636,8 @@ impl Bsc {
             MsAddress::Esn(e) => Some(*e),
             _ => None,
         });
+        let event_meid =
+            event_meid.or_else(|| self.mobiles.get(fwd_address).and_then(|ms| ms.meid.clone()));
         let a1_client = self.a1.msc_client.clone();
         let serving_cell = self.serving_params(fwd_address).cell;
         let cell_id = cdma_ios::CellId {
@@ -1658,10 +1725,6 @@ impl Bsc {
         normalize_origination_called_number(&format_dtmf_digits(&msg.digits, msg.digit_mode))
     }
 
-    /// Resolve subscriber identity via HLR and update the mobile's phone_number
-    /// and subscriber_id. Also upserts the registration binding in the HLR.
-    /// Spawns an async task; the result is sent back via `hlr_result_rx` and
-    /// applied in the `run()` select loop.
     pub(crate) fn resolve_subscriber_from_hlr(
         &self,
         event: &AccessChannelEvent,
@@ -1671,9 +1734,15 @@ impl Bsc {
             return;
         };
 
-        let esn = event.esn;
-        let meid = event.meid.clone();
-        let registration_imsi = self.derive_registration_imsi(event);
+        let mobile = self.mobiles.get(fwd_address);
+        let esn = event.esn.or_else(|| mobile.and_then(|ms| ms.esn));
+        let meid = event
+            .meid
+            .clone()
+            .or_else(|| mobile.and_then(|ms| ms.meid.clone()));
+        let registration_imsi = self
+            .derive_registration_imsi(event)
+            .or_else(|| mobile.and_then(|ms| ms.imsi.clone()));
         let identity_key = match cdma_hlr::model::MobileIdentityKey::from_parts(
             registration_imsi.as_deref(),
             esn,
@@ -1700,16 +1769,25 @@ impl Bsc {
             );
             return;
         }
-        let mob_p_rev_raw = event.mob_p_rev.unwrap_or(6);
+        let mob_p_rev_raw = event
+            .mob_p_rev
+            .or_else(|| mobile.map(|ms| ms.mob_p_rev))
+            .unwrap_or(6);
         let mob_p_rev = mob_p_rev_raw as u32;
         let last_msg_seq = event.msg_seq.unwrap_or(0) as u32;
-        let slot_cycle_index = event.slot_cycle_index.unwrap_or(0) as u32;
-        let pgslot = compute_pgslot_from_event(event).map(|v| v as u32);
+        let slot_cycle_index = event
+            .slot_cycle_index
+            .or_else(|| mobile.map(|ms| ms.slot_cycle_index))
+            .unwrap_or(0) as u32;
+        let pgslot = compute_pgslot_from_event(event)
+            .or_else(|| mobile.and_then(|ms| ms.pgslot))
+            .map(u32::from);
         let fwd_addr = fwd_address.clone();
         let cell_params = self.config.bts.params(event.cell);
         let page_addr = extract_page_address(event, cell_params.mcc, cell_params.imsi_11_12);
         let repo = hlr_repo.clone();
         let result_tx = self.hlr_result_tx.clone();
+        let msc_authenticates = self.access_authentication_required(event);
         let node_id = self.config.node_id.clone();
 
         tokio::spawn(async move {
@@ -1751,12 +1829,12 @@ impl Bsc {
                         updated_at: chrono::Utc::now(),
                     };
 
-                    if let Err(e) = repo.upsert_registration_binding(binding.clone()).await {
+                    if !msc_authenticates
+                        && let Err(e) = repo.upsert_registration_binding(binding.clone()).await
+                    {
                         warn!("BSC: HLR upsert_registration_binding failed: {}", e);
                     }
 
-                    // Primary identity comes pre-resolved on the response
-                    // — no need for a follow-up get_identities_for_subscriber.
                     let canonical_imsi = resolved
                         .primary_identity
                         .as_ref()
@@ -1764,6 +1842,8 @@ impl Bsc {
 
                     HlrResolution {
                         fwd_address: fwd_addr,
+                        observed_esn: esn,
+                        observed_meid: meid.clone(),
                         subscriber_id: Some(sub_id),
                         phone_number: Some(phone),
                         display_name: Some(display_name),
@@ -1777,6 +1857,8 @@ impl Bsc {
                     );
                     HlrResolution {
                         fwd_address: fwd_addr,
+                        observed_esn: esn,
+                        observed_meid: meid.clone(),
                         subscriber_id: None,
                         phone_number: None,
                         display_name: None,
@@ -1787,6 +1869,8 @@ impl Bsc {
                     warn!("BSC: HLR resolve_by_identity failed: {}", e);
                     HlrResolution {
                         fwd_address: fwd_addr,
+                        observed_esn: esn,
+                        observed_meid: meid.clone(),
                         subscriber_id: None,
                         phone_number: None,
                         display_name: None,
@@ -1801,6 +1885,19 @@ impl Bsc {
 
     /// Apply an HLR resolution result to the registered mobile.
     pub(crate) fn apply_hlr_resolution(&mut self, resolution: HlrResolution) {
+        let matches_observed_identity =
+            self.mobiles.get(&resolution.fwd_address).is_some_and(|ms| {
+                ms.esn == resolution.observed_esn
+                    && match (ms.meid.as_deref(), resolution.observed_meid.as_deref()) {
+                        (Some(current), Some(observed)) => current.eq_ignore_ascii_case(observed),
+                        (None, None) => true,
+                        _ => false,
+                    }
+            });
+        if !matches_observed_identity {
+            return;
+        }
+
         if let (Some(sub_id), Some(phone)) = (resolution.subscriber_id, resolution.phone_number) {
             if self.mobiles.apply_subscriber_resolution(
                 &resolution.fwd_address,

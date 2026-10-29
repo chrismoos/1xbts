@@ -68,6 +68,7 @@ pub(crate) struct MscSmsCoordinator {
     outcomes: Option<tokio::sync::mpsc::Sender<cdma_smsc::proto::DeliveryOutcome>>,
     mo_submitter: Option<Arc<dyn cdma_smsc::client::MoSubmitter>>,
     traffic_deliveries: Vec<SmsTrafficDelivery>,
+    serving_nodes: HashMap<String, BaseStationId>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,7 +118,30 @@ impl MscSmsCoordinator {
             outcomes: None,
             mo_submitter: None,
             traffic_deliveries: Vec::new(),
+            serving_nodes: HashMap::new(),
         }
+    }
+
+    pub(crate) fn record_mobile_contact(&mut self, imsi: &str, node: &BaseStationId) {
+        self.serving_nodes.insert(imsi.to_string(), node.clone());
+    }
+
+    pub(crate) fn remove_serving_node(&mut self, node: &BaseStationId) {
+        self.serving_nodes.retain(|_, serving| serving != node);
+    }
+
+    fn delivery_node(
+        &self,
+        identity: &MobileIdentity,
+        supplied: Option<&str>,
+    ) -> Option<BaseStationId> {
+        if let Some(node) = supplied {
+            return Some(BaseStationId(node.to_string()));
+        }
+        let MobileIdentity::Imsi(imsi) = identity else {
+            return None;
+        };
+        self.serving_nodes.get(imsi).cloned()
     }
 
     pub(crate) fn set_mo_submitter(&mut self, submitter: Arc<dyn cdma_smsc::client::MoSubmitter>) {
@@ -205,10 +229,8 @@ impl MscSmsCoordinator {
                 return;
             }
         };
-        let Some(node) = target
-            .serving_node
-            .as_ref()
-            .map(|node| BaseStationId(node.clone()))
+        let Some(node) = self
+            .delivery_node(&mobile_identity, target.serving_node.as_deref())
             .filter(|node| a1.is_attached(node))
         else {
             self.report(

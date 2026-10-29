@@ -971,7 +971,7 @@ impl MscRuntime {
     }
 
     async fn record_mobile_contact(
-        &self,
+        &mut self,
         node: &BaseStationId,
         contact: MobileContact,
         context: &str,
@@ -984,6 +984,9 @@ impl MscRuntime {
                 return None;
             }
         };
+        if let Some(smsc) = self.smsc.as_mut() {
+            smsc.record_mobile_contact(contact.identity_key.imsi(), node);
+        }
         let subscriber = hlr.resolve_by_identity(&contact.identity_key).await;
         match &subscriber {
             Ok(Some(resolved)) => {
@@ -3740,6 +3743,9 @@ impl MscRuntime {
             "MSC: base station {node} detached, releasing {} call(s)",
             calls.len()
         );
+        if let Some(smsc) = self.smsc.as_mut() {
+            smsc.remove_serving_node(node);
+        }
         for call_id in calls {
             if self.circuits.m2m_calls.contains_key(&call_id) {
                 self.send_clear_command(a1, call_id).await;
@@ -3924,6 +3930,7 @@ pub(crate) fn select_pageable_imsi<'a>(
 mod tests {
     mod m2m;
     mod privacy;
+    mod sms_routes;
 
     use super::*;
     use crate::circuit::{MscLegKey, MscVoiceLeg};

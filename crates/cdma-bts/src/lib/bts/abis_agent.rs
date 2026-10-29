@@ -273,7 +273,9 @@ impl AbisAgent {
         let Some(addr) = access_event_to_ms_address(event) else {
             return;
         };
-        paging_state.lock().record_received_msg_seq(&addr, msg_seq);
+        paging_state
+            .lock()
+            .record_received_pdu(&addr, msg_seq, event.ack_req);
     }
 
     /// Cancel pending page records when a Page Response is received on the

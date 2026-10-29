@@ -419,7 +419,7 @@ impl Bsc {
             .map(|event| {
                 super::a1::A1GlobalChallengeIes::from_event(
                     event,
-                    self.config.bts.auth_mode(event.cell) != 0,
+                    self.access_authentication_required(event),
                 )
             })
             .unwrap_or_default();
@@ -432,7 +432,9 @@ impl Bsc {
                 data: raw_fields.to_vec(),
             },
             mobile_identity_esn: esn.map(cdma_ios::MobileIdentity::Esn),
-            mobile_identity_meid: None,
+            mobile_identity_meid: mobile
+                .and_then(|ms| ms.meid.as_deref())
+                .and_then(super::a1::meid_identity_from_hex),
             cell_identifier: None,
             tag: None,
             service_option: None,
@@ -483,7 +485,9 @@ impl Bsc {
                 data: raw_fields.to_vec(),
             },
             mobile_identity_esn: esn.map(cdma_ios::MobileIdentity::Esn),
-            mobile_identity_meid: None,
+            mobile_identity_meid: mobile
+                .and_then(|ms| ms.meid.as_deref())
+                .and_then(super::a1::meid_identity_from_hex),
             cell_identifier: None,
             tag: None,
             service_option: None,
@@ -550,7 +554,9 @@ impl Bsc {
                 data: raw_fields.to_vec(),
             },
             mobile_identity_esn: esn.map(cdma_ios::MobileIdentity::Esn),
-            mobile_identity_meid: None,
+            mobile_identity_meid: mobile
+                .and_then(|ms| ms.meid.as_deref())
+                .and_then(super::a1::meid_identity_from_hex),
             cell_identifier: None,
             tag: None,
             service_option: None,

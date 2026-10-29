@@ -103,6 +103,8 @@ pub(crate) struct MobileStation {
     pub(crate) esn: Option<u32>,
     pub(crate) imsi: Option<String>,
     pub(crate) meid: Option<String>,
+    pub(crate) scm: Option<u8>,
+    pub(crate) meid_query: Option<super::meid::PendingMeidQuery>,
     /// Cached IMSI components derived from the full IMSI string.
     /// Used to compute page addresses and OTA encoding without re-parsing.
     imsi_m_s1: Option<u32>,
@@ -192,6 +194,8 @@ impl MobileStation {
             esn,
             imsi,
             meid: None,
+            scm: None,
+            meid_query: None,
             imsi_m_s1,
             imsi_m_s2,
             imsi_mcc,
@@ -1219,6 +1223,8 @@ impl MobileRegistry {
             esn: event.esn,
             imsi: update.registration_imsi,
             meid: event.meid.clone(),
+            scm: event.scm,
+            meid_query: None,
             imsi_m_s1: event.imsi_m_s1,
             imsi_m_s2: event.imsi_m_s2,
             imsi_mcc: update.imsi_mcc,
@@ -1293,7 +1299,22 @@ impl MobileRegistry {
         resolved_mcc: Option<u16>,
         resolved_imsi_11_12: Option<u8>,
     ) {
+        if event
+            .esn
+            .is_some_and(|esn| ms.esn.is_some_and(|cached| cached != esn))
+        {
+            ms.meid = None;
+            ms.meid_query = None;
+            ms.subscriber_id = None;
+            ms.phone_number = None;
+            ms.subscriber_display_name = None;
+            ms.access_msg_seq_rcvd.fill(false);
+            if let Some(seq) = event.msg_seq {
+                mark_reverse_regular_msg_seq_received(&mut ms.access_msg_seq_rcvd, seq);
+            }
+        }
         ms.esn = event.esn.or(ms.esn);
+        ms.scm = event.scm.or(ms.scm);
         if let Some(meid) = event.meid.clone() {
             ms.meid = Some(meid);
         }

@@ -50,18 +50,6 @@ impl Router {
             None => Resolution::Deferred { subscriber_id },
         }
     }
-
-    pub async fn serving_node(&self, imsi: Option<&str>, esn: Option<u32>) -> Option<String> {
-        let key = cdma_hlr::model::MobileIdentityKey::from_parts(imsi, esn, None).ok()?;
-        match self.hlr.resolve_by_identity(&key).await {
-            Ok(Some(resolved)) => resolved.binding.map(|binding| binding.serving_bs_id),
-            Ok(None) => None,
-            Err(e) => {
-                log::warn!("SMSC: HLR identity lookup failed: {e}");
-                None
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

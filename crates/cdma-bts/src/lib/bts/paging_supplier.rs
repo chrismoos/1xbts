@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::global_challenge::GlobalChallenge;
 
@@ -18,6 +19,14 @@ use super::{
     evdo::Evdo1xAdvertisement,
     settings::{OverheadParameters, PagingChannelSettings, build_scheduled_message},
 };
+
+// C.S0005-E T56m bounds the immediate response window after an access probe.
+const ACCESS_ACK_WINDOW: Duration = Duration::from_millis(200);
+
+struct PendingAccessAck {
+    msg_seq: u8,
+    expires_at: Instant,
+}
 
 const PENDING_PAGE_RECORD_ASSIGNED_SLOT_ATTEMPTS: u16 = 4;
 const PENDING_PAGE_RECORD_FAILURE_GUARD_MS: u64 = 10_000;
@@ -138,6 +147,7 @@ pub struct PagingSupplierState {
     /// Updated on every access probe; stamped as valid_ack + ack_seq on
     /// the next directed SDU sent to that mobile.
     last_received_msg_seq: HashMap<(u8, Vec<u8>), u8>,
+    pending_access_acks: HashMap<(u8, Vec<u8>), PendingAccessAck>,
     /// Buffered retry events (failures) produced by slot-aligned retry checks,
     /// drained by `drain_retry_events()`.
     pending_retry_events: Vec<PagingRetryEvent>,
@@ -172,6 +182,7 @@ impl PagingSupplierState {
             overhead_mcc,
             overhead_imsi_11_12,
             last_received_msg_seq: HashMap::new(),
+            pending_access_acks: HashMap::new(),
             pending_retry_events: Vec::new(),
             pch_transmit_tx: None,
             global_challenge: None,
@@ -182,6 +193,7 @@ impl PagingSupplierState {
     /// gone, so the acks have nowhere to go.
     pub fn clear_ack_notifications(&mut self) {
         self.pending_ack_notifies.clear();
+        self.pending_access_acks.clear();
     }
 
     /// Install a broadcast sender for PCH transmit events.
@@ -251,6 +263,23 @@ impl PagingSupplierState {
             msg_seq, addr
         );
         self.last_received_msg_seq.insert(key, msg_seq);
+    }
+
+    pub fn record_received_pdu(&mut self, addr: &MsAddress, msg_seq: u8, ack_req: bool) {
+        self.record_received_msg_seq(addr, msg_seq);
+        let now = Instant::now();
+        self.pending_access_acks
+            .retain(|_, pending| pending.expires_at > now);
+        if ack_req {
+            let key = addr.ack_identity_key(self.overhead_mcc, self.overhead_imsi_11_12);
+            self.pending_access_acks.insert(
+                key,
+                PendingAccessAck {
+                    msg_seq,
+                    expires_at: now + ACCESS_ACK_WINDOW,
+                },
+            );
+        }
     }
 
     fn next_msg_seq(&mut self, addr: &MsAddress, ack_req: bool) -> u8 {
@@ -513,18 +542,61 @@ impl PagingSupplierState {
         std::mem::take(&mut self.pending_retry_events)
     }
 
-    fn record_directed_tx(&mut self, dr: &DataRequest, chip_cursor: u64) {
-        if !dr.mcsb.ack_req {
-            return;
+    fn directed_sdu_active_in_slot(
+        &self,
+        request: &DataRequest,
+        chip_cursor: u64,
+        max_sci: u8,
+        chip_rate_hz: u64,
+    ) -> bool {
+        if request.mcsb.message_id != MessageId::StatusRequest {
+            return true;
         }
+        let Some(addr) = request.mcsb.address.as_ref() else {
+            return true;
+        };
+        let (addr_type, addr_bytes) =
+            addr.ack_identity_key(self.overhead_mcc, self.overhead_imsi_11_12);
+        let initial_tx = self
+            .pending_retries
+            .get(&(addr_type, addr_bytes.clone(), request.mcsb.msg_seq))
+            .is_none_or(|pending| pending.first_tx_chip.is_none());
+        if initial_tx
+            && request.mcsb.valid_ack
+            && self
+                .pending_access_acks
+                .get(&(addr_type, addr_bytes))
+                .is_some_and(|pending| {
+                    pending.msg_seq == request.mcsb.ack_seq && pending.expires_at > Instant::now()
+                })
+        {
+            return true;
+        }
+        pgslot_from_address(addr).is_none_or(|pgslot| {
+            cdma_common::paging::is_assigned_slot(chip_cursor, pgslot, max_sci, chip_rate_hz)
+        })
+    }
+
+    fn record_directed_tx(&mut self, dr: &DataRequest, chip_cursor: u64) {
         let Some(addr) = dr.mcsb.address.as_ref() else {
             return;
         };
         let (addr_type, addr_bytes) =
             addr.ack_identity_key(self.overhead_mcc, self.overhead_imsi_11_12);
-        let key = (addr_type, addr_bytes, dr.mcsb.msg_seq);
-        if let Some(pending) = self.pending_retries.get_mut(&key) {
-            pending.first_tx_chip.get_or_insert(chip_cursor);
+        let access_key = (addr_type, addr_bytes.clone());
+        if dr.mcsb.valid_ack
+            && self
+                .pending_access_acks
+                .get(&access_key)
+                .is_some_and(|pending| pending.msg_seq == dr.mcsb.ack_seq)
+        {
+            self.pending_access_acks.remove(&access_key);
+        }
+        if dr.mcsb.ack_req {
+            let key = (addr_type, addr_bytes, dr.mcsb.msg_seq);
+            if let Some(pending) = self.pending_retries.get_mut(&key) {
+                pending.first_tx_chip.get_or_insert(chip_cursor);
+            }
         }
     }
 
@@ -715,7 +787,16 @@ pub fn build_bts_paging_supplier(
                             )
                         })
                         .filter(|pending| !records_for_slot.contains(&pending.record))
-                        .any(|p| matches!(p.record, GeneralPageRecord::Class0 { .. })),
+                        .any(|p| matches!(p.record, GeneralPageRecord::Class0 { .. }))
+                        || guard.pending_directed_sdus.iter().any(|request| {
+                            request.mcsb.message_id == MessageId::StatusRequest
+                                && guard.directed_sdu_active_in_slot(
+                                    request,
+                                    chip_cursor,
+                                    max_sci,
+                                    chip_rate_hz,
+                                )
+                        }),
                     guard
                         .pending_page_records
                         .iter()
@@ -788,7 +869,19 @@ pub fn build_bts_paging_supplier(
 
         {
             let mut guard = state.lock();
-            if let Some(dr) = guard.pending_directed_sdus.pop_front() {
+            let ready = guard.pending_directed_sdus.iter().position(|request| {
+                guard.directed_sdu_active_in_slot(
+                    request,
+                    chip_cursor,
+                    overhead.max_slot_cycle_index,
+                    chip_rate_hz,
+                ) && (request.mcsb.message_id != MessageId::StatusRequest
+                    || !guard.pending_retries.values().any(|pending| {
+                        pending.data_request.mcsb.message_id != MessageId::StatusRequest
+                            && pending.data_request.mcsb.address == request.mcsb.address
+                    }))
+            });
+            if let Some(dr) = ready.and_then(|index| guard.pending_directed_sdus.remove(index)) {
                 let sdu_hex = dr.sdu.to_packed_bytes();
                 info!(
                     "BTS paging supplier: directed SDU TX msg_id={:?} addr={:?} ack_seq={} msg_seq={} ack_req={} valid_ack={} sdu={:02X?} ({} bits) slot_num={}",
@@ -835,6 +928,187 @@ mod tests {
     use super::*;
     use cdma_abis::control::typed::{AirInterfaceMessagePayload, MobileIdentity};
     use cdma_common::consts::SR1_CHIP_RATE_HZ;
+
+    fn access_status_request() -> (PagingSupplierState, DataRequest, u64) {
+        const ACCESS_MSG_SEQ: u8 = 5;
+        let mut state = PagingSupplierState::new_with_retry_config(
+            PagingRetryConfig {
+                ack_timeout_ms: 15_000,
+                max_retries: 1,
+            },
+            0x03ff,
+            0x7f,
+        );
+        let identity = MobileIdentity::Imsi("310000000006203".to_string());
+        let payload = AirInterfaceMessagePayload::new(
+            MessageId::StatusRequest
+                .wire_type(WireChannel::ForwardCommon)
+                .unwrap(),
+            [0, 0, 0x24, 0xe0],
+        )
+        .unwrap();
+        let addr = mobile_identity_to_ms_address(&identity).unwrap();
+        state.record_received_pdu(&addr, ACCESS_MSG_SEQ, true);
+        state
+            .queue_directed_pch(&identity, &payload, true, Some(2), true)
+            .unwrap();
+        let request = state.pending_directed_sdus.front().unwrap().clone();
+        let pgslot = pgslot_from_address(&addr).unwrap();
+        let chips_per_slot = SR1_CHIP_RATE_HZ * 80 / 1000;
+        let other_chip = (0..16)
+            .map(|slot| slot * chips_per_slot)
+            .find(|chip| !cdma_common::paging::is_assigned_slot(*chip, pgslot, 0, SR1_CHIP_RATE_HZ))
+            .unwrap();
+        (state, request, other_chip)
+    }
+
+    #[test]
+    fn status_request_acknowledges_access_outside_assigned_slot_but_retries_wait() {
+        let (state, request, other_chip) = access_status_request();
+        let state = Arc::new(Mutex::new(state));
+        let overhead = OverheadParameters {
+            max_slot_cycle_index: 0,
+            ..Default::default()
+        };
+        let mut supplier = build_bts_paging_supplier(
+            overhead,
+            PagingChannelSettings::default(),
+            0,
+            None,
+            state.clone(),
+        );
+        let mut gpm = supplier(other_chip).unwrap().sdu;
+        assert!(!GeneralPageMessage::from_sdu(&mut gpm).unwrap().class_0_done);
+        let sent = supplier(other_chip + 1).unwrap();
+        assert_eq!(sent.mcsb.message_id, MessageId::StatusRequest);
+        assert!(sent.mcsb.valid_ack);
+        assert_eq!(sent.mcsb.ack_seq, request.mcsb.ack_seq);
+        assert!(state.lock().pending_access_acks.is_empty());
+        let addr = sent.mcsb.address.as_ref().unwrap();
+        state
+            .lock()
+            .record_received_pdu(addr, sent.mcsb.ack_seq, true);
+        assert!(!state.lock().directed_sdu_active_in_slot(
+            &sent,
+            other_chip + 2,
+            0,
+            SR1_CHIP_RATE_HZ
+        ));
+        state
+            .lock()
+            .check_slot_retries(other_chip + 2, 0, SR1_CHIP_RATE_HZ);
+        assert!(state.lock().pending_directed_sdus.is_empty());
+    }
+
+    #[test]
+    fn standalone_ack_or_expired_access_window_keeps_status_request_slotted() {
+        let (mut state, request, other_chip) = access_status_request();
+        let mut ack = request.clone();
+        ack.mcsb.message_id = MessageId::Order;
+        ack.mcsb.ack_req = false;
+        state.record_directed_tx(&ack, other_chip);
+        assert!(!state.directed_sdu_active_in_slot(&request, other_chip, 0, SR1_CHIP_RATE_HZ));
+        let addr = request.mcsb.address.as_ref().unwrap();
+        state.record_received_pdu(addr, request.mcsb.ack_seq, true);
+        for pending in state.pending_access_acks.values_mut() {
+            pending.expires_at = Instant::now();
+        }
+        assert!(!state.directed_sdu_active_in_slot(&request, other_chip, 0, SR1_CHIP_RATE_HZ));
+    }
+
+    #[test]
+    fn status_request_requires_matching_assured_access_ack() {
+        let (mut state, request, other_chip) = access_status_request();
+        let addr = request.mcsb.address.as_ref().unwrap();
+        state.pending_access_acks.clear();
+        state.record_received_pdu(addr, request.mcsb.ack_seq, false);
+        assert!(!state.directed_sdu_active_in_slot(&request, other_chip, 0, SR1_CHIP_RATE_HZ));
+        state.record_received_pdu(addr, request.mcsb.ack_seq + 1, true);
+        assert!(!state.directed_sdu_active_in_slot(&request, other_chip, 0, SR1_CHIP_RATE_HZ));
+    }
+
+    #[test]
+    fn status_request_waits_for_listening_slot_without_blocking_access_orders() {
+        let overhead = OverheadParameters {
+            max_slot_cycle_index: 0,
+            ..Default::default()
+        };
+        let state = Arc::new(Mutex::new(PagingSupplierState::new_with_retry_config(
+            PagingRetryConfig {
+                ack_timeout_ms: 15_000,
+                max_retries: 0,
+            },
+            0x03ff,
+            0x7f,
+        )));
+        let identity = MobileIdentity::Imsi("310000000006203".to_string());
+        let wire_type = MessageId::StatusRequest
+            .wire_type(WireChannel::ForwardCommon)
+            .unwrap();
+        let payload = AirInterfaceMessagePayload::new(wire_type, [0, 0, 0x24, 0xe0]).unwrap();
+        state
+            .lock()
+            .queue_directed_pch(&identity, &payload, true, Some(1), true)
+            .unwrap();
+        let request = state.lock().pending_directed_sdus.front().unwrap().clone();
+        let chips_per_slot = SR1_CHIP_RATE_HZ * 80 / 1000;
+        let matching_chip = (0..16)
+            .map(|slot| slot * chips_per_slot)
+            .find(|chip| {
+                state
+                    .lock()
+                    .directed_sdu_active_in_slot(&request, *chip, 0, SR1_CHIP_RATE_HZ)
+            })
+            .unwrap();
+        let other_chip = matching_chip + chips_per_slot;
+        let order = AirInterfaceMessagePayload::new(
+            MessageId::Order
+                .wire_type(WireChannel::ForwardCommon)
+                .unwrap(),
+            [0x40, 0],
+        )
+        .unwrap();
+        state
+            .lock()
+            .queue_directed_pch(&identity, &order, true, Some(2), true)
+            .unwrap();
+        let mut supplier = build_bts_paging_supplier(
+            overhead,
+            PagingChannelSettings::default(),
+            0,
+            None,
+            state.clone(),
+        );
+        let mut other_gpm = supplier(other_chip).unwrap().sdu;
+        assert!(
+            GeneralPageMessage::from_sdu(&mut other_gpm)
+                .unwrap()
+                .class_0_done
+        );
+        assert_eq!(
+            supplier(other_chip + 1).unwrap().mcsb.message_id,
+            MessageId::Order
+        );
+        assert_eq!(state.lock().pending_directed_sdus.len(), 1);
+        let next_matching_chip = matching_chip + 16 * chips_per_slot;
+        let mut assigned_gpm = supplier(next_matching_chip).unwrap().sdu;
+        assert!(
+            !GeneralPageMessage::from_sdu(&mut assigned_gpm)
+                .unwrap()
+                .class_0_done
+        );
+        assert_ne!(
+            supplier(next_matching_chip + 1).unwrap().mcsb.message_id,
+            MessageId::StatusRequest
+        );
+        let addr = request.mcsb.address.as_ref().unwrap();
+        assert_eq!(state.lock().check_ack_notify(addr, 1), Some(2));
+        assert_eq!(
+            supplier(next_matching_chip + 2).unwrap().mcsb.message_id,
+            MessageId::StatusRequest
+        );
+        assert!(state.lock().pending_directed_sdus.is_empty());
+    }
 
     #[test]
     fn directed_pch_queue_is_fifo() {

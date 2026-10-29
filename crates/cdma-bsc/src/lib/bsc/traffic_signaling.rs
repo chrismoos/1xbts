@@ -406,6 +406,14 @@ impl Bsc {
             {
                 self.request_long_code_transition(cell, walsh_code, true);
             }
+            if should_send_assignment_complete {
+                if let Some(addr) = self.mobiles.address_by_walsh(cell, walsh_code) {
+                    self.request_meid(
+                        &addr,
+                        super::meid::MeidQueryChannel::Traffic { cell, walsh_code },
+                    );
+                }
+            }
             info!(
                 "BSC: voice service negotiation complete on walsh={} after {}",
                 walsh_code, trigger
@@ -539,6 +547,7 @@ impl Bsc {
             );
             return;
         };
+        self.handle_meid_response(&addr, event);
         let activity_now = Instant::now();
 
         if traffic_event_proves_reverse_activity(event) {

@@ -70,7 +70,21 @@ impl Bsc {
                 }
             };
 
+            let identity_deadline = self.access_identity.next_deadline();
+            let identity_sleep = async {
+                match identity_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+
             tokio::select! {
+                Some(result) = self.access_identity.results.recv() => {
+                    self.handle_access_identity_result(result).await;
+                }
+                _ = identity_sleep => {
+                    self.expire_access_identities(tokio::time::Instant::now()).await;
+                }
                 Some(event) = recv_unbounded_or_pending(access_rx.as_mut()) => {
                     let event = self.enrich_uplink_event(event);
                     if !event.is_traffic_phy_status {
@@ -283,6 +297,9 @@ impl Bsc {
     /// Remove or the Release Order for these — tear them down directly and
     /// tell the MSC the calls are gone.
     pub(crate) async fn handle_cell_detached(&mut self, cell: cdma_common::events::AccessCellId) {
+        for addr in self.access_identity.cancel_cell(cell) {
+            self.mobiles.update(&addr, |ms| ms.meid_query = None);
+        }
         let channels = self.mobiles.traffic_channels_on_cell(cell);
         if channels.is_empty() {
             return;

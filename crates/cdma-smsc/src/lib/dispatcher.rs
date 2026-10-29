@@ -223,19 +223,17 @@ impl Dispatcher {
 
     async fn address(&self, submission: &SmsSubmission) -> Result<DeliveryAddress, Deferral> {
         if let Some(imsi) = submission.destination_imsi.as_deref() {
-            let node = self.router.serving_node(Some(imsi), None).await;
             return Ok(DeliveryAddress {
                 identity: Identity::Imsi(imsi.to_string()),
                 subscriber_id: submission.destination_subscriber_id,
-                serving_node: node,
+                serving_node: None,
             });
         }
         if let Some(esn) = submission.destination_esn {
-            let node = self.router.serving_node(None, Some(esn)).await;
             return Ok(DeliveryAddress {
                 identity: Identity::Esn(u64::from(esn)),
                 subscriber_id: submission.destination_subscriber_id,
-                serving_node: node,
+                serving_node: None,
             });
         }
         let Some(number) = submission.destination_number.as_deref() else {

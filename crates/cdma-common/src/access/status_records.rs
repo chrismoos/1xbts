@@ -25,6 +25,13 @@ const LAST_BASE_CAPABILITY_P_REV: u8 = 6;
 const LATER_CAPABILITY_FLAGS: usize = 13;
 const MEID_HEX_DIGITS: usize = 14;
 const MEID_BYTES: usize = 7;
+/// C.S0005-E §2.7.4.38 assigns four bits each to MEID_LEN and RESERVED.
+const MEID_LENGTH_BITS: usize = 4;
+const MEID_RESERVED_BITS: usize = 4;
+const MEID_RECORD_BYTES: usize =
+    (MEID_LENGTH_BITS + MEID_BYTES * OCTET_BITS + MEID_RESERVED_BITS) / OCTET_BITS;
+/// C.S0005-E §2.7.4 specifies unqualified status information with QUAL_INFO_TYPE zero.
+const UNQUALIFIED_STATUS: u8 = 0x00;
 
 fn packed_record(record_type: u8, mut bits: Bitstream) -> AccessInfoRecord {
     while bits.len() % OCTET_BITS != 0 {
@@ -168,11 +175,62 @@ pub fn fch_channel_configuration_record(
 /// C.S0005-E §2.7.4.38. The seven MEID octets follow a four-bit length and precede padding.
 pub fn meid_record(meid: &[u8; MEID_BYTES]) -> AccessInfoRecord {
     let mut bits = Bitstream::new();
-    bits.write_u8(MEID_BYTES as u8, OPTION_COUNT_BITS);
+    bits.write_u8(MEID_BYTES as u8, MEID_LENGTH_BITS);
     for octet in meid {
         bits.write_u8(*octet, OCTET_BITS);
     }
     packed_record(INFO_RECORD_MEID, bits)
+}
+
+/// C.S0005-E §2.7.4.38 uses a four-bit octet count and four trailing reserved bits.
+pub fn decode_meid_record(record: &AccessInfoRecord) -> Result<[u8; MEID_BYTES], Error> {
+    if record.record_type != INFO_RECORD_MEID || record.data.len() != MEID_RECORD_BYTES {
+        return Err("invalid MEID information record type or length".into());
+    }
+    let mut bits = Bitstream::new_bytes(&record.data);
+    if bits.read_bits(MEID_LENGTH_BITS)? as usize != MEID_BYTES {
+        return Err("MEID information record must contain seven MEID octets".into());
+    }
+    let mut meid = [0; MEID_BYTES];
+    for octet in &mut meid {
+        *octet = bits.read_bits(OCTET_BITS)? as u8;
+    }
+    if bits.read_bits(MEID_RESERVED_BITS)? != 0 {
+        return Err("MEID information record has nonzero reserved bits".into());
+    }
+    Ok(meid)
+}
+
+pub fn decode_meid_response(message: &super::AccessMessage) -> Result<Option<String>, Error> {
+    let records = match message {
+        super::AccessMessage::StatusResponse(response)
+            if response.qual_info_type == UNQUALIFIED_STATUS && response.qual_info.is_empty() =>
+        {
+            &response.records
+        }
+        super::AccessMessage::ExtStatusResponse(response)
+            if response.qual_info_type == UNQUALIFIED_STATUS && response.qual_info.is_empty() =>
+        {
+            &response.records
+        }
+        _ => return Ok(None),
+    };
+    let mut reported = None;
+    for record in records
+        .iter()
+        .filter(|record| record.record_type == INFO_RECORD_MEID)
+    {
+        let bytes = decode_meid_record(record)?;
+        let meid = bytes
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<String>();
+        if reported.as_ref().is_some_and(|previous| previous != &meid) {
+            return Err("conflicting MEID information records".into());
+        }
+        reported = Some(meid);
+    }
+    Ok(reported)
 }
 
 pub fn parse_meid(meid: &str) -> Option<[u8; MEID_BYTES]> {
@@ -187,6 +245,67 @@ pub fn parse_meid(meid: &str) -> Option<[u8; MEID_BYTES]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meid_record_decodes_known_wire_bytes_and_rejects_malformed_records() {
+        let record = AccessInfoRecord {
+            record_type: INFO_RECORD_MEID,
+            data: vec![0x70, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xc0],
+        };
+        assert_eq!(
+            decode_meid_record(&record).unwrap(),
+            [0, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc]
+        );
+        let mut truncated = record.clone();
+        truncated.data.pop();
+        assert!(decode_meid_record(&truncated).is_err());
+        let mut bad_count = record.clone();
+        bad_count.data[0] = 0x60;
+        assert!(decode_meid_record(&bad_count).is_err());
+        let mut bad_padding = record.clone();
+        *bad_padding.data.last_mut().unwrap() |= 1;
+        assert!(decode_meid_record(&bad_padding).is_err());
+        let mut wrong_type = record;
+        wrong_type.record_type = INFO_RECORD_TERMINAL;
+        assert!(decode_meid_record(&wrong_type).is_err());
+    }
+
+    #[test]
+    fn meid_response_requires_unqualified_consistent_records() {
+        use crate::access::{AccessMessage, AccessMessageHeader, StatusResponseMessage};
+        use crate::lac::message_types::MessageId;
+
+        let mut response = StatusResponseMessage {
+            header: AccessMessageHeader {
+                pd: 0,
+                message_id: MessageId::StatusResponse,
+            },
+            qual_info_type: 0,
+            qual_info: vec![],
+            records: vec![meid_record(&[0, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc])],
+            remaining_bits: 0,
+        };
+        assert_eq!(
+            decode_meid_response(&AccessMessage::StatusResponse(response.clone()))
+                .unwrap()
+                .as_deref(),
+            Some("00123456789ABC")
+        );
+        response.records.push(response.records[0].clone());
+        assert!(
+            decode_meid_response(&AccessMessage::StatusResponse(response.clone()))
+                .unwrap()
+                .is_some()
+        );
+        response.records.push(meid_record(&[1; 7]));
+        assert!(decode_meid_response(&AccessMessage::StatusResponse(response.clone())).is_err());
+        response.qual_info_type = 1;
+        assert!(
+            decode_meid_response(&AccessMessage::StatusResponse(response))
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn terminal_record_encodes_caller_identity_and_service_options() {

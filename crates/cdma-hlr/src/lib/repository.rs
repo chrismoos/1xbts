@@ -1781,14 +1781,16 @@ async fn resolve_identity_row_id(
         .map_err(|e| format!("resolve_identity_row_id: {e}"))?,
         MobileIdentityKey::ImsiEsnMeid { imsi, esn, meid } => sqlx::query_as(
             "SELECT subscriber_identity_id FROM subscriber_identities \
-             WHERE imsi = $1 AND esn = $2 AND meid = $3 LIMIT 1",
+             WHERE imsi = $1 AND (esn = $2 OR esn IS NULL) \
+               AND (meid = $3 OR meid IS NULL) \
+               AND (esn IS NOT NULL OR meid IS NOT NULL) LIMIT 1",
         )
         .bind(imsi)
-        .bind(*esn as i64)
+        .bind(i64::from(*esn))
         .bind(meid)
         .fetch_optional(pool)
         .await
-        .map_err(|e| format!("resolve_identity_row_id: {e}"))?,
+        .map_err(|error| format!("resolve_identity_row_id: {error}"))?,
     };
     Ok(row.map(|r| r.0))
 }
@@ -1802,7 +1804,11 @@ async fn select_mobile_seen_by_key(
             r#"
             SELECT id, last_seen_at
             FROM mobiles_seen
-            WHERE imsi = $1 AND esn = $2 AND meid IS NULL
+            WHERE imsi = $1 AND esn = $2
+              AND (meid IS NULL OR (
+                  SELECT COUNT(*) FROM mobiles_seen WHERE imsi = $1 AND esn = $2
+              ) = 1)
+            ORDER BY meid NULLS FIRST
             LIMIT 1
             "#,
         )
@@ -1829,7 +1835,8 @@ async fn select_mobile_seen_by_key(
                 r#"
                 SELECT id, last_seen_at
                 FROM mobiles_seen
-                WHERE imsi = $1 AND esn = $2 AND meid = $3
+                WHERE imsi = $1 AND esn = $2 AND (meid = $3 OR meid IS NULL)
+                ORDER BY meid NULLS LAST
                 LIMIT 1
                 "#,
             )
@@ -1872,7 +1879,7 @@ async fn update_mobile_seen_row(
         UPDATE mobiles_seen
         SET imsi = $2,
             esn = $3,
-            meid = $4,
+            meid = COALESCE($4, meid),
             mob_p_rev = COALESCE($5, mob_p_rev),
             last_seen_at = NOW()
         WHERE id = $1
@@ -2309,7 +2316,10 @@ impl HlrRepository for PostgresHlrRepository {
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| format!("resolve_by_identity imsi+meid: {e}"))?,
-            MobileIdentityKey::ImsiEsnMeid { imsi, esn, meid } => {
+            MobileIdentityKey::ImsiEsnMeid { .. } => {
+                let Some(identity_id) = resolve_identity_row_id(&self.pool, identity).await? else {
+                    return Ok(None);
+                };
                 sqlx::query_as::<_, SubscriberRow>(
                     r#"
                     SELECT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at,
@@ -2318,13 +2328,11 @@ impl HlrRepository for PostgresHlrRepository {
                         (SELECT MIN(duration_ms) FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS ringtone_duration_ms
                     FROM subscribers s
                     JOIN subscriber_identities i ON s.subscriber_id = i.subscriber_id
-                    WHERE i.imsi = $1 AND i.esn = $2 AND i.meid = $3
+                    WHERE i.subscriber_identity_id = $1
                     LIMIT 1
                     "#,
                 )
-                .bind(imsi)
-                .bind(*esn as i64)
-                .bind(meid)
+                .bind(identity_id)
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| format!("resolve_by_identity imsi+esn+meid: {e}"))?
@@ -2354,8 +2362,10 @@ impl HlrRepository for PostgresHlrRepository {
             WHERE b.imsi = $1 AND b.serving_bs_id = $2
               AND b.state = ANY($3)
               AND (b.esn IS NOT NULL OR b.meid IS NOT NULL)
-              AND (b.esn IS NULL OR b.esn = i.esn)
-              AND (b.meid IS NULL OR b.meid = i.meid)
+              AND (b.esn IS NULL OR b.esn = i.esn
+                   OR (i.esn IS NULL AND b.meid = i.meid))
+              AND (b.meid IS NULL OR b.meid = i.meid
+                   OR (i.meid IS NULL AND b.esn = i.esn))
             LIMIT $4
             "#,
         )
@@ -2451,6 +2461,18 @@ impl HlrRepository for PostgresHlrRepository {
             .begin()
             .await
             .map_err(|e| format!("upsert_mobile_seen begin: {e}"))?;
+        if let MobileIdentityKey::ImsiEsnMeid { imsi, esn, meid } = identity {
+            sqlx::query(
+                "UPDATE registration_bindings SET meid = $3 \
+                 WHERE imsi = $1 AND esn = $2 AND (meid IS NULL OR meid = $3)",
+            )
+            .bind(imsi)
+            .bind(i64::from(*esn))
+            .bind(meid)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| format!("upsert_mobile_seen binding MEID: {error}"))?;
+        }
         let existing = select_mobile_seen_by_key(&mut tx, identity).await?;
         if let Some(row) = existing {
             update_mobile_seen_row(&mut tx, row.id, mob_p_rev, identity).await?;
@@ -2501,7 +2523,12 @@ impl HlrRepository for PostgresHlrRepository {
                 state = EXCLUDED.state,
                 imsi = EXCLUDED.imsi,
                 esn = EXCLUDED.esn,
-                meid = EXCLUDED.meid,
+                meid = CASE
+                    WHEN registration_bindings.imsi IS NOT DISTINCT FROM EXCLUDED.imsi
+                     AND registration_bindings.esn IS NOT DISTINCT FROM EXCLUDED.esn
+                    THEN COALESCE(EXCLUDED.meid, registration_bindings.meid)
+                    ELSE EXCLUDED.meid
+                END,
                 mob_p_rev = EXCLUDED.mob_p_rev,
                 pgslot = EXCLUDED.pgslot,
                 slot_cycle_index = EXCLUDED.slot_cycle_index,

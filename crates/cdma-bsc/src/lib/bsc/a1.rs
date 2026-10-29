@@ -327,8 +327,12 @@ impl Bsc {
                     .send_registration_rejected(pending.cell, &pending.fwd_address)
             }
         };
-        if let Err(error) = result {
-            warn!("BSC: failed to send registration result order: {}", error);
+        match result {
+            Ok(()) if reject_cause.is_none() => {
+                self.request_meid(&pending.fwd_address, super::meid::MeidQueryChannel::Paging);
+            }
+            Err(error) => warn!("BSC: failed to send registration result order: {}", error),
+            _ => {}
         }
     }
 
@@ -856,13 +860,21 @@ impl Bsc {
         }
 
         let auth_ies =
-            A1GlobalChallengeIes::from_event(event, self.config.bts.auth_mode(event.cell) != 0);
+            A1GlobalChallengeIes::from_event(event, self.access_authentication_required(event));
         let paging_response = cdma_ios::PagingResponseMessage {
             classmark_information_type_2: build_a1_classmark_information_type_2_for_event(event, 0),
             mobile_identity_imsi: cdma_ios::MobileIdentity::Imsi(imsi),
             tag: pending.a1_tag,
             mobile_identity_esn: event.esn.map(cdma_ios::MobileIdentity::Esn),
-            mobile_identity_meid: event.meid.as_deref().and_then(meid_identity_from_hex),
+            mobile_identity_meid: event
+                .meid
+                .as_deref()
+                .or_else(|| {
+                    self.mobiles
+                        .get(fwd_address)
+                        .and_then(|ms| ms.meid.as_deref())
+                })
+                .and_then(meid_identity_from_hex),
             slot_cycle_index: event.slot_cycle_index.map(cdma_ios::SlotCycleIndex),
             authentication_response_parameter: auth_ies.response,
             authentication_confirmation_parameter: auth_ies.randc,
@@ -1593,7 +1605,7 @@ fn complete_layer3_information_from_origination(
         None
     };
     let auth_ies =
-        A1GlobalChallengeIes::from_event(event, bsc.config.bts.auth_mode(event.cell) != 0);
+        A1GlobalChallengeIes::from_event(event, bsc.access_authentication_required(event));
     let cm_service_request = cdma_ios::CmServiceRequestMessage {
         cm_service_type: cdma_ios::CmServiceType::MobileOriginatingCallEstablishment,
         classmark_information_type_2: build_a1_classmark_information_type_2_for_event(event, 0),

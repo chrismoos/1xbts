@@ -66,6 +66,34 @@ async fn verify(pool: PgPool) {
     assert_eq!(zero_ssd.outcome, CaveAuthOutcome::Success);
     assert!(zero_ssd.call_keys.is_some());
 
+    let discovered_identity =
+        MobileIdentityKey::from_parts(Some(IMSI), Some(ESN), Some("a0000012345678")).unwrap();
+    let discovered = repo
+        .verify_cave_global_challenge(&discovered_identity, &global(&[0; 8], 0x2222_3333, 0))
+        .await
+        .unwrap();
+    assert_eq!(discovered.outcome, CaveAuthOutcome::Success);
+    assert!(discovered.call_keys.is_some());
+
+    sqlx::query("UPDATE subscriber_identities SET esn=NULL, meid=$1 WHERE subscriber_id=$2")
+        .bind("a0000012345678")
+        .bind(subscriber.subscriber_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let meid_only = repo
+        .verify_cave_global_challenge(&discovered_identity, &global(&[0; 8], 0x2222_3333, 0))
+        .await
+        .unwrap();
+    assert_eq!(meid_only.outcome, CaveAuthOutcome::Success);
+    assert!(meid_only.call_keys.is_some());
+    sqlx::query("UPDATE subscriber_identities SET esn=$1, meid=NULL WHERE subscriber_id=$2")
+        .bind(i64::from(ESN))
+        .bind(subscriber.subscriber_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
     let randssd = repo.begin_cave_ssd_update(&identity).await.unwrap();
     let ssd_new = cdma_cave::generate_ssd(
         &AKey::from_u64(A_KEY),

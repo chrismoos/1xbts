@@ -4,6 +4,7 @@
 pub(crate) mod a1;
 #[allow(dead_code)]
 pub(crate) mod access;
+pub(crate) mod access_identity;
 pub(crate) mod authentication;
 pub mod bts_attach;
 pub mod bts_registry;
@@ -14,6 +15,7 @@ pub(crate) mod events;
 pub mod hrpd_coord;
 #[allow(dead_code)]
 pub mod launcher;
+pub(crate) mod meid;
 #[allow(dead_code)]
 pub(crate) mod mobiles;
 pub mod node;

@@ -7060,78 +7060,99 @@ impl ExtendedNeighborListMessage {
 }
 
 impl StatusRequestMessage {
+    /// C.S0005-E §3.7.2.3.2.15 specifies the STRQM field widths and qualification codes.
+    const PAGING_RESERVED_BITS: usize = 4;
+    const OCTET_BITS: usize = 8;
+    const QUAL_INFO_LENGTH_BITS: usize = 3;
+    const BAND_CLASS_BITS: usize = 5;
+    const QUAL_INFO_RESERVED_BITS: usize = 3;
+    const RECORD_COUNT_BITS: usize = 4;
+    const MAX_RECORDS: usize = (1 << Self::RECORD_COUNT_BITS) - 1;
+    const QUAL_INFO_NONE: u8 = 0x00;
+    const QUAL_INFO_BAND_CLASS: u8 = 0x01;
+    const QUAL_INFO_BAND_CLASS_AND_MODE: u8 = 0x02;
+    // STRQM length is three modulo eight, so octet transport appends five zero bits.
+    const OCTET_PADDING_BITS: usize = 5;
+
+    /// C.S0005-E §3.7.3.3.2.16 omits the paging message's four reserved leading bits.
+    pub fn to_ftch_sdu(&self) -> Bitstream {
+        let mut bits = self.to_sdu();
+        bits.drain(0..Self::PAGING_RESERVED_BITS);
+        bits
+    }
+
     /// Encode STRQM per C.S0005-E 3.7.2.3.2.15.
     pub fn to_sdu(&self) -> Bitstream {
         assert!(
-            self.record_types.len() <= 15,
+            self.record_types.len() <= Self::MAX_RECORDS,
             "STRQM NUM_FIELDS must fit in 4 bits"
         );
 
         let mut bs = Bitstream::new();
-        bs.write_u8(0, 4); // RESERVED
+        bs.write_u8(0, Self::PAGING_RESERVED_BITS);
         match self.qual_info {
             StatusQualificationInfo::None => {
-                bs.write_u8(0x00, 8);
-                bs.write_u8(0, 3);
+                bs.write_u8(Self::QUAL_INFO_NONE, Self::OCTET_BITS);
+                bs.write_u8(0, Self::QUAL_INFO_LENGTH_BITS);
             }
             StatusQualificationInfo::BandClass { band_class } => {
-                bs.write_u8(0x01, 8);
-                bs.write_u8(1, 3);
-                bs.write_u8(band_class, 5);
-                bs.write_u8(0, 3); // RESERVED
+                bs.write_u8(Self::QUAL_INFO_BAND_CLASS, Self::OCTET_BITS);
+                bs.write_u8(1, Self::QUAL_INFO_LENGTH_BITS);
+                bs.write_u8(band_class, Self::BAND_CLASS_BITS);
+                bs.write_u8(0, Self::QUAL_INFO_RESERVED_BITS);
             }
             StatusQualificationInfo::BandClassAndOperatingMode {
                 band_class,
                 op_mode,
             } => {
-                bs.write_u8(0x02, 8);
-                bs.write_u8(2, 3);
-                bs.write_u8(band_class, 5);
-                bs.write_u8(op_mode, 8);
-                bs.write_u8(0, 3); // RESERVED
+                bs.write_u8(Self::QUAL_INFO_BAND_CLASS_AND_MODE, Self::OCTET_BITS);
+                bs.write_u8(2, Self::QUAL_INFO_LENGTH_BITS);
+                bs.write_u8(band_class, Self::BAND_CLASS_BITS);
+                bs.write_u8(op_mode, Self::OCTET_BITS);
+                bs.write_u8(0, Self::QUAL_INFO_RESERVED_BITS);
             }
         }
-        bs.write_u8(self.record_types.len() as u8, 4);
+        bs.write_u8(self.record_types.len() as u8, Self::RECORD_COUNT_BITS);
         for record_type in &self.record_types {
-            bs.write_u8(*record_type, 8);
+            bs.write_u8(*record_type, Self::OCTET_BITS);
         }
         bs
     }
 
     pub fn from_sdu(bs: &mut Bitstream) -> Result<Self, crate::error::Error> {
-        let reserved = bs.read_bits(4)? as u8;
+        let reserved = bs.read_bits(Self::PAGING_RESERVED_BITS)? as u8;
         if reserved != 0 {
             return Err("STRQM RESERVED field must be zero".into());
         }
-        let qual_info_type = bs.read_bits(8)? as u8;
-        let qual_info_len = bs.read_bits(3)? as usize;
+        let qual_info_type = bs.read_bits(Self::OCTET_BITS)? as u8;
+        let qual_info_len = bs.read_bits(Self::QUAL_INFO_LENGTH_BITS)? as usize;
         let qual_info = match qual_info_type {
-            0x00 => {
+            Self::QUAL_INFO_NONE => {
                 if qual_info_len != 0 {
                     return Err("STRQM QUAL_INFO_TYPE=0 requires QUAL_INFO_LEN=0".into());
                 }
                 StatusQualificationInfo::None
             }
-            0x01 => {
+            Self::QUAL_INFO_BAND_CLASS => {
                 if qual_info_len != 1 {
                     return Err("STRQM BAND_CLASS qualification requires QUAL_INFO_LEN=1".into());
                 }
-                let band_class = bs.read_bits(5)? as u8;
-                let reserved = bs.read_bits(3)? as u8;
+                let band_class = bs.read_bits(Self::BAND_CLASS_BITS)? as u8;
+                let reserved = bs.read_bits(Self::QUAL_INFO_RESERVED_BITS)? as u8;
                 if reserved != 0 {
                     return Err("STRQM BAND_CLASS reserved bits must be zero".into());
                 }
                 StatusQualificationInfo::BandClass { band_class }
             }
-            0x02 => {
+            Self::QUAL_INFO_BAND_CLASS_AND_MODE => {
                 if qual_info_len != 2 {
                     return Err(
                         "STRQM BAND_CLASS+OP_MODE qualification requires QUAL_INFO_LEN=2".into(),
                     );
                 }
-                let band_class = bs.read_bits(5)? as u8;
-                let op_mode = bs.read_bits(8)? as u8;
-                let reserved = bs.read_bits(3)? as u8;
+                let band_class = bs.read_bits(Self::BAND_CLASS_BITS)? as u8;
+                let op_mode = bs.read_bits(Self::OCTET_BITS)? as u8;
+                let reserved = bs.read_bits(Self::QUAL_INFO_RESERVED_BITS)? as u8;
                 if reserved != 0 {
                     return Err("STRQM BAND_CLASS+OP_MODE reserved bits must be zero".into());
                 }
@@ -7145,16 +7166,19 @@ impl StatusRequestMessage {
             }
         };
 
-        let num_fields = bs.read_bits(4)? as usize;
-        if bs.len() < num_fields * 8 {
+        let num_fields = bs.read_bits(Self::RECORD_COUNT_BITS)? as usize;
+        if bs.len() < num_fields * Self::OCTET_BITS {
             return Err("STRQM RECORD_TYPE list truncated".into());
         }
         let mut record_types = Vec::with_capacity(num_fields);
         for _ in 0..num_fields {
-            record_types.push(bs.read_bits(8)? as u8);
+            record_types.push(bs.read_bits(Self::OCTET_BITS)? as u8);
         }
-        if !bs.is_empty() {
-            return Err("STRQM has trailing bits after RECORD_TYPE list".into());
+        if !bs.is_empty()
+            && (bs.len() != Self::OCTET_PADDING_BITS
+                || bs.read_bits(Self::OCTET_PADDING_BITS)? != 0)
+        {
+            return Err("STRQM has invalid padding after RECORD_TYPE list".into());
         }
 
         Ok(Self {
@@ -15925,6 +15949,28 @@ mod forward_overhead_decode_tests {
             }
             _ => panic!("unexpected decoded message"),
         }
+    }
+
+    #[test]
+    fn meid_status_request_uses_channel_specific_reserved_bits() {
+        let request = StatusRequestMessage {
+            qual_info: StatusQualificationInfo::None,
+            record_types: vec![crate::access::status_records::INFO_RECORD_MEID],
+        };
+        let paging = request.to_sdu();
+        let traffic = request.to_ftch_sdu();
+        assert_eq!(paging.len(), 27);
+        assert_eq!(traffic.len(), 23);
+        assert_eq!(bitstream_to_byte_vec(&paging), vec![0, 0, 0x24, 0xe0]);
+        assert_eq!(bitstream_to_byte_vec(&traffic), vec![0, 0x02, 0x4e]);
+        let mut packed = Bitstream::new_bytes(&[0, 0, 0x24, 0xe0]);
+        let decoded = StatusRequestMessage::from_sdu(&mut packed).unwrap();
+        assert_eq!(decoded.qual_info, request.qual_info);
+        assert_eq!(decoded.record_types, request.record_types);
+        let mut invalid_padding = Bitstream::new_bytes(&[0, 0, 0x24, 0xe1]);
+        assert!(StatusRequestMessage::from_sdu(&mut invalid_padding).is_err());
+        let mut trailing_octet = Bitstream::new_bytes(&[0, 0, 0x24, 0xe0, 0]);
+        assert!(StatusRequestMessage::from_sdu(&mut trailing_octet).is_err());
     }
 
     #[test]
