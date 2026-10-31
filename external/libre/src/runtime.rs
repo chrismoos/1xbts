@@ -1,16 +1,16 @@
-use std::sync::{Mutex, mpsc};
+use std::sync::{Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
 
 use crate::error::{Error, Result, native_status};
 
-static LIBRE_REFCOUNT: Mutex<usize> = Mutex::new(0);
+static LIBRE_CONTEXT_LOCK: Mutex<()> = Mutex::new(());
 
 // Matches libre's RE_THREAD_WORKERS. Each cross-thread SIP call queues a wake job on this pool.
 const ASYNC_WORKERS: u16 = 4;
 
 #[derive(Debug)]
 pub struct Library {
-    _private: (),
+    _guard: MutexGuard<'static, ()>,
 }
 
 impl Library {
@@ -19,37 +19,22 @@ impl Library {
             return Err(Error::NativeUnavailable);
         }
 
-        let mut refcount = LIBRE_REFCOUNT
+        let guard = LIBRE_CONTEXT_LOCK
             .lock()
-            .expect("libre refcount mutex should not be poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        if *refcount == 0 {
-            // SAFETY: libre_init is process-global and serialized by LIBRE_REFCOUNT.
-            let status = unsafe { libre_sys::libre_init() };
-            native_status("libre_init", status)?;
-        }
+        // SAFETY: initializes the calling thread's RE context while holding LIBRE_CONTEXT_LOCK.
+        let status = unsafe { libre_sys::libre_init() };
+        native_status("libre_init", status)?;
 
-        *refcount += 1;
-
-        Ok(Self { _private: () })
+        Ok(Self { _guard: guard })
     }
 }
 
 impl Drop for Library {
     fn drop(&mut self) {
-        let mut refcount = LIBRE_REFCOUNT
-            .lock()
-            .expect("libre refcount mutex should not be poisoned");
-
-        if *refcount == 0 {
-            return;
-        }
-
-        *refcount -= 1;
-        if *refcount == 0 {
-            // SAFETY: the last Library guard owns process-global shutdown.
-            unsafe { libre_sys::libre_close() };
-        }
+        // SAFETY: the guard is dropped on the thread that initialized it, before the lock is released.
+        unsafe { libre_sys::libre_close() };
     }
 }
 
@@ -184,6 +169,21 @@ unsafe extern "C" fn cancel_polling(_: std::ffi::c_int, _: *mut std::ffi::c_void
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlapping_spawn_waits_for_the_running_loop_to_exit() {
+        if !libre_sys::LIBRE_AVAILABLE {
+            return;
+        }
+        let first = EventLoop::spawn().unwrap();
+        let second = thread::spawn(EventLoop::spawn);
+        thread::sleep(std::time::Duration::from_millis(100));
+        first.cancel();
+        first.join().unwrap();
+        let second = second.join().unwrap().unwrap();
+        second.cancel();
+        second.join().unwrap();
+    }
 
     #[test]
     fn event_loop_can_start_and_stop_repeatedly_without_network_activity() {
