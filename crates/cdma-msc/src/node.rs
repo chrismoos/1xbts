@@ -34,6 +34,10 @@ pub struct MscCliOverrides {
 /// `mgmt_grpc_addr` from `msc.json`.
 ///
 /// The caller owns logging setup. This only reads config and runs services.
+/// HRPD access networks start closed, and one that restarts forgets the mode,
+/// so the MSC sets it again on this period.
+const HRPD_ACCESS_MODE_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub async fn run_node(
     config_dir: &Path,
     overrides: MscCliOverrides,
@@ -49,6 +53,12 @@ pub async fn run_node(
     } else {
         info!(
             "MSC authentication is on. Base stations broadcast AUTH=1 unless their own config sets it."
+        );
+    }
+    info!("MSC access: {}", config.access);
+    if config.access.closed() {
+        info!(
+            "MSC access is closed. Only subscribers are served, and base stations wait for the MSC before answering registrations."
         );
     }
     if config.otasp.enabled {
@@ -91,6 +101,17 @@ pub async fn run_node(
     let mgmt_addr = overrides.mgmt_addr.unwrap_or(config.mgmt_grpc_addr);
     let net_mgmt =
         crate::mgmt_proxy::NetworkManagement::new(&config.base_stations, &config.packet_endpoint);
+    {
+        let net_mgmt = net_mgmt.clone();
+        let closed = config.access.closed();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(HRPD_ACCESS_MODE_PUSH_INTERVAL);
+            loop {
+                interval.tick().await;
+                net_mgmt.push_hrpd_access_mode(closed).await;
+            }
+        });
+    }
     let mut runtime_config = MscRuntimeConfig::from_node_config(&config, hlr_repo);
     runtime_config.smsc_repo = Some(smsc_repo);
     let mut runtime = MscRuntime::new(runtime_config);

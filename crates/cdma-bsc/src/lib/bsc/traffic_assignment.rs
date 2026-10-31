@@ -131,7 +131,7 @@ impl Bsc {
             );
 
             match self.traffic_assignment.send_channel_assignment(
-                &self.mobiles,
+                &mut self.mobiles,
                 &self.access_tx,
                 &cell_params,
                 &self.config.traffic_assignment,
@@ -281,7 +281,7 @@ impl Bsc {
         info!("BSC: requested reverse traffic RX for walsh={}", walsh_code);
 
         let assignment = self.traffic_assignment.send_channel_assignment(
-            &self.mobiles,
+            &mut self.mobiles,
             &self.access_tx,
             &cell_params,
             &self.config.traffic_assignment,
@@ -445,7 +445,7 @@ impl Bsc {
         // ack_msg_seq is just for logging; BTS stamps real ARQ values per
         // address. We don't have an access event in this MT path, so pass 0.
         let assignment = self.traffic_assignment.send_channel_assignment(
-            &self.mobiles,
+            &mut self.mobiles,
             &self.access_tx,
             &cell_params,
             &self.config.traffic_assignment,
@@ -680,7 +680,7 @@ impl Bsc {
         );
 
         let assignment = self.traffic_assignment.send_channel_assignment(
-            &self.mobiles,
+            &mut self.mobiles,
             &self.access_tx,
             &cell_params,
             &self.config.traffic_assignment,
@@ -851,7 +851,7 @@ impl Bsc {
             .await;
 
         let assignment = self.traffic_assignment.send_channel_assignment(
-            &self.mobiles,
+            &mut self.mobiles,
             &self.access_tx,
             &cell_params,
             &self.config.traffic_assignment,
@@ -897,7 +897,7 @@ impl TrafficAssignmentService {
     /// on the F-PCH.
     pub(crate) fn send_channel_assignment(
         &self,
-        mobiles: &MobileRegistryService,
+        mobiles: &mut MobileRegistryService,
         access_tx: &super::AccessTx,
         cell_params: &BtsCellParams,
         traffic_config: &crate::config::TrafficAssignmentConfig,
@@ -1097,6 +1097,8 @@ impl TrafficAssignmentService {
         // The BSC learns the assignment arrived when the mobile appears on the
         // reverse traffic channel, so neither message requests a Layer 2 ack.
         access_tx.send_directed_fpch(Some(cell_params.cell), addr, msg_id, message, sdu, false)?;
+        // C.S0005-E 3.6.3.3 and 3.6.3.5 mark common-channel reception inactive on assignment.
+        mobiles.update(addr, |mobile| mobile.last_access_activity = None);
 
         info!(
             "BSC: sending {} (assign_mode=0b{:03b}, walsh={}, ack_seq={})",

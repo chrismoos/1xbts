@@ -301,6 +301,9 @@ pub struct EvdoConfig {
     /// How this AN reaches the PCF for packet-data bearers. Required when
     /// EV-DO is enabled, since each AN needs its own bearer binding.
     pub a9: Option<HrpdA9Config>,
+    /// AN-AAA that receives access authentication results over A12. When
+    /// unset, the CHAP exchange still runs and its result is logged.
+    pub a12: Option<cdma_a12::client::A12ClientConfig>,
     pub overhead: HrpdOverheadConfig,
 }
 
@@ -332,6 +335,7 @@ impl Default for EvdoConfig {
             an_grpc_bind_addr: None,
             an_grpc_advertise_addr: None,
             a9: None,
+            a12: None,
             overhead: HrpdOverheadConfig::default(),
         }
     }

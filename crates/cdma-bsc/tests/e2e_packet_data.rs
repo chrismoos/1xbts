@@ -3223,7 +3223,10 @@ impl HlrRepository for FakeHlrRepository {
         &self,
         _: Option<u32>,
         _: Option<&str>,
-    ) -> Result<Option<cdma_hlr::model::ResolvedSubscriber>, String> {
+    ) -> Result<
+        Option<cdma_hlr::model::ResolvedSubscriber>,
+        cdma_hlr::repository::HardwareLookupError,
+    > {
         Ok(Some(self.resolved()))
     }
     async fn upsert_registration_binding(

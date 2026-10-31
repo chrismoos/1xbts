@@ -6,7 +6,7 @@ import Link from "next/link";
 const SESSION_WAIT_MS = 90000;
 const SESSION_POLL_MS = 2000;
 
-export function StartOtasp({ subscriberId, imsi }: { subscriberId: string; imsi?: string }) {
+export function StartOtasp({ subscriberId, imsi, compact = false }: { subscriberId: string; imsi?: string; compact?: boolean }) {
   const [pending, setPending] = useState(false);
   const [previousSessions, setPreviousSessions] = useState<string[] | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
@@ -74,12 +74,12 @@ export function StartOtasp({ subscriberId, imsi }: { subscriberId: string; imsi?
   }
 
   return (
-    <div className="space-y-2">
+    <div className={compact ? "space-y-2 text-left max-w-xs" : "space-y-2"}>
       <button type="button" onClick={start} disabled={pending}
         className="rounded border border-accent-green/20 bg-accent-green-bg px-3 py-1.5 text-xs text-accent-green transition-colors hover:bg-accent-green/15 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-green disabled:opacity-50">
-        {pending ? "Starting provisioning…" : "Start provisioning"}
+        {pending ? "Starting provisioning…" : compact ? "Start OTASP" : "Start provisioning"}
       </button>
-      <p className="text-xs text-muted">Pages the handset and applies the configured OTASP settings and subscriber overrides.</p>
+      {!compact && <p className="text-xs text-muted">Pages the handset and applies the configured OTASP settings and subscriber overrides.</p>}
       {message && <p role="status" className="text-xs text-secondary">{message}</p>}
       {sessionId && <Link href={`/otasp/${encodeURIComponent(sessionId)}`} className="text-xs text-accent-green underline underline-offset-2">View session progress</Link>}
       {error && <p role="alert" className="text-xs text-accent-red">{error}</p>}

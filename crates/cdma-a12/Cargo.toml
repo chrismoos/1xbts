@@ -11,7 +11,8 @@ description = "A12 AN-AAA (HRPD access terminal authentication) support for 1xBT
 [dependencies]
 md-5 = "0.10"
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["net"] }
+tokio = { version = "1", features = ["net", "time"] }
+getrandom = "0.2"
 log = "0.4"
 thiserror = "2"
 cdma-hlr = { path = "../cdma-hlr" }

@@ -10,6 +10,7 @@
 //! (A8/A9/A21).
 
 pub mod a8_runtime;
+pub mod access_auth;
 pub mod air;
 pub mod connection;
 pub mod events;
@@ -34,8 +35,9 @@ pub use hrpd_a9_client::{
     HrpdA9ReleaseContext, HrpdAnA9Client, build_setup_a8, validate_connect_a8,
 };
 pub use hrpd_identity::{
-    HrpdA9MobileIdentity, HrpdDerivedImsiConfig, HrpdHardwareIdentity, derive_hrpd_imsi,
-    hardware_identity_from_response, resolve_hrpd_a9_identity,
+    HrpdA9MobileIdentity, HrpdDerivedImsiConfig, HrpdHardwareIdentity, HrpdHardwareResolution,
+    derive_hrpd_imsi, hardware_identity_from_response, resolve_hrpd_a9_identity,
+    resolve_hrpd_hardware,
 };
 pub use protocols::{NegotiatedProtocols, ProtocolSubtype, REV0_DEFAULTS};
 pub use security::{SecurityError, SecurityLayer, SecuritySubtype};
@@ -73,6 +75,7 @@ mod proto_tests {
             protocols: None,
             hardware_id_response: None,
             full_uati: None,
+            admission: None,
         };
         let bytes = session.encode_to_vec();
         let decoded = Session::decode(&*bytes).expect("decode");

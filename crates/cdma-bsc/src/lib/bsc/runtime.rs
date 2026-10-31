@@ -79,8 +79,8 @@ impl Bsc {
             };
 
             tokio::select! {
-                Some(result) = self.access_identity.results.recv() => {
-                    self.handle_access_identity_result(result).await;
+                Some(result) = self.access_identity.wakeups.recv() => {
+                    self.handle_access_identity_wakeup(result).await;
                 }
                 _ = identity_sleep => {
                     self.expire_access_identities(tokio::time::Instant::now()).await;
@@ -147,6 +147,7 @@ impl Bsc {
                     self.teardown_stale_traffic_channels(traffic_timeout).await;
                     self.evict_stale_mobiles();
                     self.expire_stale_pending_a1_failures();
+                    self.expire_pending_registrations();
                 }
                 _ = bearer_poll_interval.tick() => {
                     self.poll_reverse_bearer_preambles().await;

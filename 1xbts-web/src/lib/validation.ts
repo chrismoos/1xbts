@@ -3,6 +3,7 @@ export type ValidationResult = { ok: true } | { ok: false; error: string };
 export const PHONE_MAX_DIGITS = 15;
 export const IMSI_DIGITS = 15;
 export const MEID_HEX_DIGITS = 14;
+export const IMEI_DIGITS = 15;
 
 export function validatePhoneNumber(value: string): ValidationResult {
   if (value.length === 0) return { ok: false, error: "Phone number is required" };
@@ -29,6 +30,24 @@ export function validateMeid(value: string): ValidationResult {
     return { ok: false, error: "MEID must contain only hexadecimal digits" };
   if (value.length !== MEID_HEX_DIGITS)
     return { ok: false, error: `MEID must be exactly ${MEID_HEX_DIGITS} hex digits` };
+  return { ok: true };
+}
+
+export function validateImei(value: string): ValidationResult {
+  if (!/^\d+$/.test(value))
+    return { ok: false, error: "IMEI must contain only digits 0–9" };
+  if (value.length !== IMEI_DIGITS)
+    return { ok: false, error: `IMEI must be exactly ${IMEI_DIGITS} digits` };
+  let sum = 0;
+  for (let i = 0; i < value.length; i++) {
+    let digit = Number(value[value.length - 1 - i]);
+    if (i % 2 === 1) {
+      digit *= 2;
+      if (digit > 9) digit -= 9;
+    }
+    sum += digit;
+  }
+  if (sum % 10 !== 0) return { ok: false, error: "IMEI check digit is invalid" };
   return { ok: true };
 }
 

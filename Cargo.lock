@@ -889,6 +889,7 @@ name = "cdma-a12"
 version = "0.1.0"
 dependencies = [
  "cdma-hlr",
+ "getrandom 0.2.17",
  "log",
  "md-5",
  "serde",
@@ -1009,6 +1010,7 @@ dependencies = [
  "biquad",
  "cdma-a10",
  "cdma-a11",
+ "cdma-a12",
  "cdma-a8",
  "cdma-a9",
  "cdma-abis",

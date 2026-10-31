@@ -7,7 +7,7 @@ import { getEventBusClient } from "@/lib/grpc/events-bus-client";
 import { shouldHideAccessEvent } from "@/lib/access-event-filter";
 import { EventSource } from "@/lib/proto/events/v1/service";
 import { A1SignalingEvent } from "@/lib/proto/events/v1/a1";
-import { AuthenticationEvent } from "@/lib/proto/events/v1/msc";
+import { AdmissionEvent, AuthenticationEvent } from "@/lib/proto/events/v1/msc";
 import { HrpdTrafficReason, HrpdUati } from "@/lib/proto/events/v1/an";
 import type {
   HrpdAccessEvent,
@@ -299,6 +299,14 @@ export async function GET(request: Request) {
                 send(
                   `event: authentication\ndata: ${JSON.stringify(
                     AuthenticationEvent.toJSON(value.authentication)
+                  )}\n\n`
+                );
+              }
+              if (value.admission) {
+                retryMs = STREAM_RETRY_BASE_MS;
+                send(
+                  `event: admission\ndata: ${JSON.stringify(
+                    AdmissionEvent.toJSON(value.admission)
                   )}\n\n`
                 );
               }

@@ -11,6 +11,7 @@ import {
   useAuthenticationVerdicts,
 } from "@/components/authentication-activity";
 import { verdictForAccess } from "@/lib/authentication-verdict";
+import { AccessActivity, AccessStatus } from "@/components/access-activity";
 import { RecentMessagesCard } from "@/components/recent-messages-card";
 import { StartOtasp } from "@/components/start-otasp";
 import { RecentOtaspCard } from "@/components/recent-otasp-card";
@@ -472,9 +473,9 @@ export default function MobileDetailPage({
       try {
         const res = await fetch(`/api/subscribers/${encodeURIComponent(mobile.subscriberId!)}`);
         const data: SubscriberDetail = await res.json();
-        if (!cancelled && res.ok && !data.error) {
-          setSubscriberIdentities(data.identities || []);
-          setSubscriberName(data.subscriber?.displayName || "");
+        if (!cancelled) {
+          setSubscriberIdentities(res.ok && !data.error ? data.identities || [] : []);
+          setSubscriberName(res.ok && !data.error ? data.subscriber?.displayName || "" : "");
         }
       } catch {
         if (!cancelled) {
@@ -924,6 +925,12 @@ export default function MobileDetailPage({
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <Card title="Identity">
+          <AccessStatus
+            imsi={mobile.imsi || undefined}
+            esn={mobile.esn ?? undefined}
+            meid={mobile.meid || undefined}
+            subscriberId={mobile.subscriberId}
+          />
           <div className="mb-3 grid grid-cols-2 rounded border border-border bg-surface p-0.5">
             <button
               type="button"
@@ -1588,9 +1595,20 @@ export default function MobileDetailPage({
         </Card>
       )}
 
-      <Card title="Authentication Activity">
-        <AuthenticationActivity imsis={authImsis} esn={mobile.esn ?? undefined} />
-      </Card>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <Card title="Access Activity">
+          <AccessActivity
+            filter={{
+              imsis: mobile.imsi ? [mobile.imsi] : [],
+              esn: mobile.esn ?? undefined,
+              meid: mobile.meid || undefined,
+            }}
+          />
+        </Card>
+        <Card title="Authentication Activity">
+          <AuthenticationActivity imsis={authImsis} esn={mobile.esn ?? undefined} />
+        </Card>
+      </div>
 
       <Card title={`Message History (${messages.length})`}>
         {messages.length === 0 ? (

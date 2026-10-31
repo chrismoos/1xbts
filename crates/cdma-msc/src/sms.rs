@@ -63,6 +63,7 @@ pub(crate) struct SmsTrafficDelivery {
 pub(crate) struct MscSmsCoordinator {
     smsc: Arc<dyn SmscRepository>,
     hlr: Arc<dyn HlrRepository>,
+    access_mode: crate::admission::AccessMode,
     next_tag: u32,
     pending: HashMap<u32, SmsCorrelation>,
     outcomes: Option<tokio::sync::mpsc::Sender<cdma_smsc::proto::DeliveryOutcome>>,
@@ -73,10 +74,7 @@ pub(crate) struct MscSmsCoordinator {
 
 #[derive(Debug, Clone)]
 pub enum SmsDestinationKey {
-    /// Resolve the destination via HLR by phone number (subscriber-only).
     PhoneNumber(String),
-    /// Address the mobile by IMSI directly. No HLR lookup; used for
-    /// non-subscriber mobiles seen on the air.
     Imsi(String),
 }
 
@@ -109,10 +107,15 @@ pub struct SmsSendRequest {
 }
 
 impl MscSmsCoordinator {
-    pub(crate) fn new(smsc: Arc<dyn SmscRepository>, hlr: Arc<dyn HlrRepository>) -> Self {
+    pub(crate) fn new(
+        smsc: Arc<dyn SmscRepository>,
+        hlr: Arc<dyn HlrRepository>,
+        access_mode: crate::admission::AccessMode,
+    ) -> Self {
         Self {
             smsc,
             hlr,
+            access_mode,
             next_tag: 1,
             pending: HashMap::new(),
             outcomes: None,
@@ -174,6 +177,78 @@ impl MscSmsCoordinator {
         if outcomes.send(outcome).await.is_err() {
             warn!("MSC SMS: could not report the outcome for {sms_id}");
         }
+    }
+
+    pub(crate) async fn destination_admitted(&self, destination: &SmsDestinationKey) -> bool {
+        if self.access_mode == crate::admission::AccessMode::Open {
+            return true;
+        }
+        let resolved = match destination {
+            SmsDestinationKey::PhoneNumber(number) => {
+                self.hlr.get_subscriber_by_phone_number(number).await
+            }
+            SmsDestinationKey::Imsi(imsi) => {
+                let Some(node) = self.serving_nodes.get(imsi) else {
+                    return false;
+                };
+                self.hlr
+                    .resolve_registered_imsi(imsi, &node.0)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+        };
+        Self::mt_subscriber_admitted(resolved)
+    }
+
+    fn mt_subscriber_admitted(
+        resolved: Result<Option<cdma_hlr::model::ResolvedSubscriber>, String>,
+    ) -> bool {
+        match resolved {
+            Ok(Some(resolved)) => matches!(
+                resolved.subscriber.status,
+                cdma_hlr::model::SubscriberStatus::Active
+                    | cdma_hlr::model::SubscriberStatus::Suspended
+            ),
+            Ok(None) => false,
+            Err(error) => {
+                warn!("MSC SMS: recipient admission lookup failed: {error}");
+                false
+            }
+        }
+    }
+
+    async fn delivery_admitted(&self, identity: &MobileIdentity, node: &BaseStationId) -> bool {
+        if self.access_mode == crate::admission::AccessMode::Open {
+            return true;
+        }
+        let resolved = match identity {
+            MobileIdentity::Imsi(imsi) => self
+                .hlr
+                .resolve_registered_imsi(imsi, &node.0)
+                .await
+                .map_err(|error| error.to_string()),
+            MobileIdentity::Esn(esn) => self
+                .hlr
+                .resolve_by_hardware_identity(Some(*esn), None)
+                .await
+                .map_err(|error| error.to_string())
+                .map(|resolved| {
+                    resolved.filter(|resolved| {
+                        resolved.binding.as_ref().is_some_and(|binding| {
+                            binding.serving_bs_id == node.0
+                                && binding.esn == Some(*esn)
+                                && binding.imsi.as_ref().is_some_and(|imsi| {
+                                    resolved
+                                        .identities
+                                        .iter()
+                                        .any(|identity| identity.imsi.as_ref() == Some(imsi))
+                                })
+                        })
+                    })
+                }),
+            MobileIdentity::Meid(_) => return false,
+        };
+        Self::mt_subscriber_admitted(resolved)
     }
 
     pub(crate) async fn deliver_from_smsc(
@@ -242,6 +317,18 @@ impl MscSmsCoordinator {
             .await;
             return;
         };
+
+        if !self.delivery_admitted(&mobile_identity, &node).await {
+            warn!("MSC SMS: delivery {sms_id} refused by closed access policy");
+            self.report(
+                sms_id,
+                attempt_id,
+                OutcomeResult::Failed,
+                Some("recipient access denied".into()),
+            )
+            .await;
+            return;
+        }
 
         let message_id = self.alloc_tag() as u16;
         let tag_value = self.alloc_tag();
@@ -323,6 +410,13 @@ impl MscSmsCoordinator {
     }
 
     pub(crate) async fn send_sms(&mut self, req: SmsSendRequest) -> Option<Uuid> {
+        if !self.destination_admitted(&req.destination).await {
+            warn!(
+                "MSC SMS: submission to {} refused by closed access policy",
+                req.destination
+            );
+            return None;
+        }
         let submitter = self.mo_submitter.as_ref()?;
         let message = cdma_smsc::client::MtSubmission {
             originating_number: req.originating_number.clone(),
@@ -446,11 +540,12 @@ impl MscSmsCoordinator {
         msg: &AddsDeliverMessage,
         mobile_identity: &MobileIdentity,
         mobile_identity_esn: Option<&MobileIdentity>,
+        mobile_identity_meid: Option<&MobileIdentity>,
     ) {
         self.record_mo_sms(
             mobile_identity,
             mobile_identity_esn,
-            None,
+            mobile_identity_meid,
             None,
             &msg.adds_user_part,
         )
@@ -565,9 +660,21 @@ impl MscSmsCoordinator {
         };
         let Some(originating) = resolved.map(|resolved| resolved.subscriber) else {
             warn!("MSC SMS: no subscriber identity or matching registration for IMSI {imsi}");
-            self.record_mo_sms_unknown_originator(imsi, &decoded).await;
+            if self.access_mode == crate::admission::AccessMode::Open {
+                self.record_mo_sms_unknown_originator(imsi, &decoded).await;
+            }
             return;
         };
+
+        if self.access_mode == crate::admission::AccessMode::Closed
+            && originating.status != cdma_hlr::model::SubscriberStatus::Active
+        {
+            warn!(
+                "MSC SMS: MO submission from subscriber {} refused by closed access policy",
+                originating.subscriber_id
+            );
+            return;
+        }
 
         let Some(submitter) = self.mo_submitter.as_ref() else {
             warn!("MSC SMS: no SMSC to hand the message to — dropped");

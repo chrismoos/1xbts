@@ -80,10 +80,7 @@ service NetworkManagementService {
   // Returns buffered HRPD session events for one UATI on one cell.
   rpc GetAnSessionEvents(AnSessionEventsScopedRequest) returns (an.v1.GetSessionEventsResponse);
 
-  // Per-selector: data-call setup (pages the mobile on one base station)
-
-  // Initiates a data call by paging the mobile and requesting packet service
-  // on the named base station.
+  // Starts a packet-data call through the subscriber's registered base station.
   rpc InitiateDataCall(InitiateDataCallScopedRequest) returns (bsc.v1.InitiateDataCallResponse);
 
   // Global interface: PCF (one packet core)

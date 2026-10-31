@@ -12,6 +12,29 @@ use crate::proto;
 
 const CAVE_UNSUPPORTED: &str = "CAVE authentication is not supported by this repository";
 
+#[derive(Debug, Clone)]
+pub enum HardwareLookupError {
+    Ambiguous,
+    Unavailable(String),
+}
+
+impl std::fmt::Display for HardwareLookupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ambiguous => formatter.write_str("ambiguous hardware identity"),
+            Self::Unavailable(error) => formatter.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for HardwareLookupError {}
+
+impl From<String> for HardwareLookupError {
+    fn from(error: String) -> Self {
+        Self::Unavailable(error)
+    }
+}
+
 #[async_trait]
 pub trait HlrRepository: Send + Sync {
     // Subscriber
@@ -93,7 +116,26 @@ pub trait HlrRepository: Send + Sync {
         &self,
         esn: Option<u32>,
         meid: Option<&str>,
-    ) -> Result<Option<ResolvedSubscriber>, String>;
+    ) -> Result<Option<ResolvedSubscriber>, HardwareLookupError>;
+
+    /// Resolves an HRPD Hardware ID. A MEID-type value also matches an
+    /// identity whose IMEI starts with it, since multimode handsets report the
+    /// IMEI's first 14 digits there.
+    async fn resolve_by_hrpd_hardware_identity(
+        &self,
+        esn: Option<u32>,
+        meid: Option<&str>,
+    ) -> Result<Option<ResolvedSubscriber>, HardwareLookupError> {
+        self.resolve_by_hardware_identity(esn, meid).await
+    }
+
+    async fn set_identity_imei(
+        &self,
+        _subscriber_identity_id: Uuid,
+        _imei: Option<&str>,
+    ) -> Result<SubscriberIdentity, String> {
+        Err("IMEI update is unavailable".to_string())
+    }
 
     // Mobile sightings
     async fn upsert_mobile_seen(
@@ -102,7 +144,33 @@ pub trait HlrRepository: Send + Sync {
         mob_p_rev: Option<u8>,
     ) -> Result<MobileSeenUpsert, String>;
 
-    // Registration binding
+    /// Records the MSC's admission decision.
+    async fn record_mobile_admission(
+        &self,
+        identity: &MobileIdentityKey,
+        _admission: &MobileAdmission,
+    ) -> Result<MobileSeenUpsert, String> {
+        self.upsert_mobile_seen(identity, None).await
+    }
+
+    async fn record_hardware_admission(
+        &self,
+        _esn: Option<u32>,
+        _meid: Option<&str>,
+        _admission: &MobileAdmission,
+    ) -> Result<(), String> {
+        Err("hardware admission records are unavailable".to_string())
+    }
+
+    async fn list_mobiles_seen(
+        &self,
+        _filter: MobileSeenFilter,
+        _limit: u32,
+        _offset: u32,
+    ) -> Result<(Vec<MobileSeen>, u32), String> {
+        Err("mobile sighting list is unavailable".to_string())
+    }
+
     async fn upsert_registration_binding(
         &self,
         binding: RegistrationBinding,
@@ -312,6 +380,54 @@ pub struct GrpcHlrRepository {
 }
 
 impl GrpcHlrRepository {
+    async fn resolve_hardware_identity(
+        &self,
+        esn: Option<u32>,
+        meid: Option<&str>,
+        match_imei: bool,
+    ) -> Result<Option<ResolvedSubscriber>, HardwareLookupError> {
+        let mut client = self.client();
+        let response = client
+            .resolve_subscriber_by_hardware_identity(
+                proto::ResolveSubscriberByHardwareIdentityRequest {
+                    identity: Some(proto::HardwareIdentityKey {
+                        esn,
+                        meid: meid.map(ToOwned::to_owned),
+                    }),
+                    match_imei,
+                },
+            )
+            .await
+            .map_err(|error| {
+                if error.code() == tonic::Code::FailedPrecondition {
+                    HardwareLookupError::Ambiguous
+                } else {
+                    HardwareLookupError::Unavailable(format!(
+                        "HLR ResolveSubscriberByHardwareIdentity: {error}"
+                    ))
+                }
+            })?
+            .into_inner();
+        let mut resolved = resolved_from_proto(
+            response.subscriber,
+            response.primary_identity,
+            response.binding,
+        )?;
+        if let Some(resolved) = resolved.as_mut() {
+            resolved.identities = if response.identities.is_empty() {
+                self.get_identities_for_subscriber(resolved.subscriber.subscriber_id)
+                    .await?
+            } else {
+                response
+                    .identities
+                    .into_iter()
+                    .map(identity_from_proto)
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+        }
+        Ok(resolved)
+    }
+
     /// Connect to an HLR gRPC endpoint and return a repository that reuses the channel.
     pub async fn connect(endpoint: String) -> Result<Self, String> {
         let client = proto::hlr_service_client::HlrServiceClient::connect(endpoint.clone())
@@ -416,6 +532,98 @@ fn otasp_session_summary_from_proto(
         completed_blocks: s.completed_blocks as i32,
         event_count: s.event_count as i32,
         events_proto,
+    })
+}
+
+pub(crate) fn admission_class_to_proto(class: MobileAdmissionClass) -> proto::MobileAdmissionClass {
+    match class {
+        MobileAdmissionClass::Admitted => proto::MobileAdmissionClass::Admitted,
+        MobileAdmissionClass::Limited => proto::MobileAdmissionClass::Limited,
+        MobileAdmissionClass::Provisioning => proto::MobileAdmissionClass::Provisioning,
+        MobileAdmissionClass::RegistrationOnly => proto::MobileAdmissionClass::RegistrationOnly,
+        MobileAdmissionClass::Denied => proto::MobileAdmissionClass::Denied,
+    }
+}
+
+pub(crate) fn admission_class_from_proto(value: i32) -> Option<MobileAdmissionClass> {
+    match proto::MobileAdmissionClass::try_from(value).ok()? {
+        proto::MobileAdmissionClass::Unspecified => None,
+        proto::MobileAdmissionClass::Admitted => Some(MobileAdmissionClass::Admitted),
+        proto::MobileAdmissionClass::Limited => Some(MobileAdmissionClass::Limited),
+        proto::MobileAdmissionClass::Provisioning => Some(MobileAdmissionClass::Provisioning),
+        proto::MobileAdmissionClass::RegistrationOnly => {
+            Some(MobileAdmissionClass::RegistrationOnly)
+        }
+        proto::MobileAdmissionClass::Denied => Some(MobileAdmissionClass::Denied),
+    }
+}
+
+pub(crate) fn mobile_seen_filter_to_proto(filter: MobileSeenFilter) -> proto::MobileSeenFilter {
+    match filter {
+        MobileSeenFilter::All => proto::MobileSeenFilter::All,
+        MobileSeenFilter::CurrentlyDenied => proto::MobileSeenFilter::CurrentlyDenied,
+        MobileSeenFilter::CurrentlyRestricted => proto::MobileSeenFilter::CurrentlyRestricted,
+        MobileSeenFilter::EverDenied => proto::MobileSeenFilter::EverDenied,
+    }
+}
+
+pub(crate) fn mobile_seen_filter_from_proto(value: i32) -> MobileSeenFilter {
+    match proto::MobileSeenFilter::try_from(value).unwrap_or(proto::MobileSeenFilter::All) {
+        proto::MobileSeenFilter::All => MobileSeenFilter::All,
+        proto::MobileSeenFilter::CurrentlyDenied => MobileSeenFilter::CurrentlyDenied,
+        proto::MobileSeenFilter::CurrentlyRestricted => MobileSeenFilter::CurrentlyRestricted,
+        proto::MobileSeenFilter::EverDenied => MobileSeenFilter::EverDenied,
+    }
+}
+
+pub(crate) fn observed_mobile_to_proto(mobile: &MobileSeen) -> proto::MobileSeen {
+    proto::MobileSeen {
+        imsi: mobile.imsi.clone(),
+        esn: mobile.esn,
+        meid: mobile.meid.clone(),
+        mob_p_rev: mobile.mob_p_rev.map(u32::from),
+        first_seen_at: Some(datetime_to_timestamp(mobile.first_seen_at)),
+        last_seen_at: Some(datetime_to_timestamp(mobile.last_seen_at)),
+        admission_class: mobile
+            .admission_class
+            .map(|class| admission_class_to_proto(class) as i32)
+            .unwrap_or_default(),
+        admission_reason: mobile.admission_reason.clone().unwrap_or_default(),
+        admission_at: mobile.admission_at.map(datetime_to_timestamp),
+        admission_base_station: mobile.admission_base_station.clone().unwrap_or_default(),
+        denied_count: mobile.denied_count,
+        last_denied_at: mobile.last_denied_at.map(datetime_to_timestamp),
+        last_denial_reason: mobile.last_denial_reason.clone().unwrap_or_default(),
+        last_denied_base_station: mobile.last_denied_base_station.clone().unwrap_or_default(),
+    }
+}
+
+fn non_empty(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
+}
+
+fn observed_mobile_from_proto(mobile: proto::MobileSeen) -> Result<MobileSeen, String> {
+    Ok(MobileSeen {
+        imsi: mobile.imsi,
+        esn: mobile.esn,
+        meid: mobile.meid,
+        mob_p_rev: mobile.mob_p_rev.and_then(|value| u8::try_from(value).ok()),
+        first_seen_at: timestamp_to_datetime(mobile.first_seen_at)?,
+        last_seen_at: timestamp_to_datetime(mobile.last_seen_at)?,
+        admission_class: admission_class_from_proto(mobile.admission_class),
+        admission_reason: non_empty(mobile.admission_reason),
+        admission_at: mobile
+            .admission_at
+            .map(|ts| timestamp_to_datetime(Some(ts)))
+            .transpose()?,
+        admission_base_station: non_empty(mobile.admission_base_station),
+        denied_count: mobile.denied_count,
+        last_denied_at: mobile
+            .last_denied_at
+            .map(|ts| timestamp_to_datetime(Some(ts)))
+            .transpose()?,
+        last_denial_reason: non_empty(mobile.last_denial_reason),
+        last_denied_base_station: non_empty(mobile.last_denied_base_station),
     })
 }
 
@@ -532,6 +740,7 @@ fn identity_from_proto(value: proto::SubscriberIdentity) -> Result<SubscriberIde
         imsi: value.imsi,
         esn: value.esn,
         meid: value.meid,
+        imei: value.imei,
         is_primary: value.is_primary,
         created_at: timestamp_to_datetime(value.created_at)?,
     })
@@ -668,6 +877,7 @@ impl HlrRepository for GrpcHlrRepository {
                 meid: None,
                 number_type: number_type_to_proto(number_type) as i32,
                 number_plan: number_plan_to_proto(number_plan) as i32,
+                imei: None,
             })
             .await
             .map_err(|e| format!("HLR UpsertSubscriber: {e}"))?
@@ -781,6 +991,7 @@ impl HlrRepository for GrpcHlrRepository {
                 meid: None,
                 number_type: number_type_to_proto(number_type) as i32,
                 number_plan: number_plan_to_proto(number_plan) as i32,
+                imei: None,
             })
             .await
         {
@@ -950,25 +1161,16 @@ impl HlrRepository for GrpcHlrRepository {
         &self,
         esn: Option<u32>,
         meid: Option<&str>,
-    ) -> Result<Option<ResolvedSubscriber>, String> {
-        let mut client = self.client();
-        let response = client
-            .resolve_subscriber_by_hardware_identity(
-                proto::ResolveSubscriberByHardwareIdentityRequest {
-                    identity: Some(proto::HardwareIdentityKey {
-                        esn,
-                        meid: meid.map(ToOwned::to_owned),
-                    }),
-                },
-            )
-            .await
-            .map_err(|e| format!("HLR ResolveSubscriberByHardwareIdentity: {e}"))?
-            .into_inner();
-        resolved_from_proto(
-            response.subscriber,
-            response.primary_identity,
-            response.binding,
-        )
+    ) -> Result<Option<ResolvedSubscriber>, HardwareLookupError> {
+        self.resolve_hardware_identity(esn, meid, false).await
+    }
+
+    async fn resolve_by_hrpd_hardware_identity(
+        &self,
+        esn: Option<u32>,
+        meid: Option<&str>,
+    ) -> Result<Option<ResolvedSubscriber>, HardwareLookupError> {
+        self.resolve_hardware_identity(esn, meid, true).await
     }
 
     async fn upsert_mobile_seen(
@@ -990,6 +1192,74 @@ impl HlrRepository for GrpcHlrRepository {
                 .result
                 .ok_or_else(|| "missing result".to_string())?,
         )
+    }
+
+    async fn record_mobile_admission(
+        &self,
+        identity: &MobileIdentityKey,
+        admission: &MobileAdmission,
+    ) -> Result<MobileSeenUpsert, String> {
+        let mut client = self.client();
+        let response = client
+            .record_mobile_admission(proto::RecordMobileAdmissionRequest {
+                identity: Some(identity_key_to_proto(identity)),
+                admission_class: admission_class_to_proto(admission.class) as i32,
+                reason: admission.reason.clone(),
+                base_station: admission.base_station.clone(),
+            })
+            .await
+            .map_err(|e| format!("HLR RecordMobileAdmission: {e}"))?
+            .into_inner();
+        mobile_seen_from_proto(
+            response
+                .result
+                .ok_or_else(|| "missing result".to_string())?,
+        )
+    }
+
+    async fn record_hardware_admission(
+        &self,
+        esn: Option<u32>,
+        meid: Option<&str>,
+        admission: &MobileAdmission,
+    ) -> Result<(), String> {
+        self.client()
+            .record_hardware_admission(proto::RecordHardwareAdmissionRequest {
+                identity: Some(proto::HardwareIdentityKey {
+                    esn,
+                    meid: meid.map(ToOwned::to_owned),
+                }),
+                admission_class: admission_class_to_proto(admission.class) as i32,
+                reason: admission.reason.clone(),
+                base_station: admission.base_station.clone(),
+            })
+            .await
+            .map_err(|e| format!("HLR RecordHardwareAdmission: {e}"))?;
+        Ok(())
+    }
+
+    async fn list_mobiles_seen(
+        &self,
+        filter: MobileSeenFilter,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<MobileSeen>, u32), String> {
+        let mut client = self.client();
+        let response = client
+            .list_mobiles_seen(proto::ListMobilesSeenRequest {
+                filter: mobile_seen_filter_to_proto(filter) as i32,
+                page_size: limit,
+                offset,
+            })
+            .await
+            .map_err(|e| format!("HLR ListMobilesSeen: {e}"))?
+            .into_inner();
+        let mobiles = response
+            .mobiles
+            .into_iter()
+            .map(observed_mobile_from_proto)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((mobiles, response.total))
     }
 
     async fn upsert_registration_binding(
@@ -1948,25 +2218,162 @@ async fn delete_legacy_mobile_seen(
     .map_err(|e| format!("delete legacy mobile_seen: {e}"))
 }
 
+async fn upsert_mobile_seen_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    identity: &MobileIdentityKey,
+    mob_p_rev: Option<u8>,
+) -> Result<(Uuid, MobileSeenUpsert), String> {
+    if let MobileIdentityKey::ImsiEsnMeid { imsi, esn, meid } = identity {
+        sqlx::query(
+            "UPDATE registration_bindings SET meid = $3 \
+             WHERE imsi = $1 AND esn = $2 AND (meid IS NULL OR meid = $3)",
+        )
+        .bind(imsi)
+        .bind(i64::from(*esn))
+        .bind(meid)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| format!("upsert_mobile_seen binding MEID: {error}"))?;
+    }
+    if let Some(row) = select_mobile_seen_by_key(tx, identity).await? {
+        update_mobile_seen_row(tx, row.id, mob_p_rev, identity).await?;
+        delete_legacy_mobile_seen(tx, identity.imsi(), Some(row.id)).await?;
+        return Ok((
+            row.id,
+            MobileSeenUpsert {
+                is_new: false,
+                previous_last_seen_at: Some(row.last_seen_at),
+            },
+        ));
+    }
+    if let Some(row) = select_legacy_mobile_seen_by_imsi(tx, identity.imsi()).await? {
+        update_mobile_seen_row(tx, row.id, mob_p_rev, identity).await?;
+        return Ok((
+            row.id,
+            MobileSeenUpsert {
+                is_new: false,
+                previous_last_seen_at: Some(row.last_seen_at),
+            },
+        ));
+    }
+    let id = insert_mobile_seen(tx, mob_p_rev, identity).await?;
+    Ok((
+        id,
+        MobileSeenUpsert {
+            is_new: true,
+            previous_last_seen_at: None,
+        },
+    ))
+}
+
+#[derive(sqlx::FromRow)]
+struct MobileSeenRow {
+    imsi: Option<String>,
+    esn: Option<i64>,
+    meid: Option<String>,
+    mob_p_rev: Option<i32>,
+    first_seen_at: DateTime<Utc>,
+    last_seen_at: DateTime<Utc>,
+    admission_class: Option<String>,
+    admission_reason: Option<String>,
+    admission_at: Option<DateTime<Utc>>,
+    admission_base_station: Option<String>,
+    denied_count: i32,
+    last_denied_at: Option<DateTime<Utc>>,
+    last_denial_reason: Option<String>,
+    last_denied_base_station: Option<String>,
+}
+
+impl From<MobileSeenRow> for MobileSeen {
+    fn from(row: MobileSeenRow) -> Self {
+        Self {
+            imsi: row.imsi,
+            esn: row.esn.and_then(|value| u32::try_from(value).ok()),
+            meid: row.meid,
+            mob_p_rev: row.mob_p_rev.and_then(|value| u8::try_from(value).ok()),
+            first_seen_at: row.first_seen_at,
+            last_seen_at: row.last_seen_at,
+            admission_class: row
+                .admission_class
+                .as_deref()
+                .and_then(MobileAdmissionClass::parse),
+            admission_reason: row.admission_reason,
+            admission_at: row.admission_at,
+            admission_base_station: row.admission_base_station,
+            denied_count: u32::try_from(row.denied_count).unwrap_or_default(),
+            last_denied_at: row.last_denied_at,
+            last_denial_reason: row.last_denial_reason,
+            last_denied_base_station: row.last_denied_base_station,
+        }
+    }
+}
+
 async fn insert_mobile_seen(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     mob_p_rev: Option<u8>,
     identity: &MobileIdentityKey,
-) -> Result<(), String> {
-    sqlx::query(
+) -> Result<Uuid, String> {
+    sqlx::query_scalar(
         r#"
         INSERT INTO mobiles_seen (imsi, esn, meid, mob_p_rev)
         VALUES ($1, $2, $3, $4)
+        RETURNING id
         "#,
     )
     .bind(identity.imsi())
     .bind(identity.esn().map(|v| v as i64))
     .bind(identity.meid())
     .bind(mob_p_rev.map(|v| v as i32))
-    .execute(&mut **tx)
+    .fetch_one(&mut **tx)
     .await
-    .map(|_| ())
     .map_err(|e| format!("insert mobile_seen: {e}"))
+}
+
+impl PostgresHlrRepository {
+    async fn resolve_hardware_identity(
+        &self,
+        esn: Option<u32>,
+        meid: Option<&str>,
+        match_imei: bool,
+    ) -> Result<Option<ResolvedSubscriber>, HardwareLookupError> {
+        if esn.is_none() && meid.is_none() {
+            return Err(
+                "resolve_by_hardware_identity requires at least one of ESN or MEID"
+                    .to_string()
+                    .into(),
+            );
+        }
+        let meid = meid.map(normalize_meid).transpose()?;
+        let rows = sqlx::query_as::<_, SubscriberRow>(
+            r#"
+            SELECT DISTINCT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at,
+                s.number_type, s.number_plan, s.prl_override_id, s.service_programming_code, s.firstchp_override,
+                EXISTS (SELECT 1 FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS has_ringtone,
+                (SELECT MIN(duration_ms) FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS ringtone_duration_ms
+            FROM subscribers s
+            JOIN subscriber_identities i ON s.subscriber_id = i.subscriber_id
+            WHERE ($1::bigint IS NOT NULL AND i.esn = $1)
+               OR ($2::text   IS NOT NULL AND i.meid = $2)
+               OR ($3 AND $2::text IS NOT NULL AND left(i.imei, 14) = $2)
+            LIMIT 2
+            "#,
+        )
+        .bind(esn.map(|v| v as i64))
+        .bind(meid.as_deref())
+        .bind(match_imei)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("resolve_by_hardware_identity: {e}"))?;
+        if rows.len() > 1 {
+            return Err(HardwareLookupError::Ambiguous);
+        }
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let subscriber: Subscriber = row.try_into()?;
+        let sid = subscriber.subscriber_id;
+        Ok(Some(self.assemble_resolved(subscriber, sid).await?))
+    }
 }
 
 #[async_trait]
@@ -2170,7 +2577,7 @@ impl HlrRepository for PostgresHlrRepository {
         check_hardware_identity_unique(&self.pool, subscriber_id, esn, meid).await?;
 
         let existing = sqlx::query_as::<_, IdentityRow>(
-            "SELECT subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at FROM subscriber_identities WHERE subscriber_id = $1 LIMIT 1",
+            "SELECT subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at, imei FROM subscriber_identities WHERE subscriber_id = $1 LIMIT 1",
         )
         .bind(subscriber_id)
         .fetch_optional(&mut *tx)
@@ -2185,7 +2592,7 @@ impl HlrRepository for PostgresHlrRepository {
                     esn = $3,
                     meid = $4
                 WHERE subscriber_identity_id = $1
-                RETURNING subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at
+                RETURNING subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at, imei
                 "#,
             )
             .bind(existing.subscriber_identity_id)
@@ -2201,7 +2608,7 @@ impl HlrRepository for PostgresHlrRepository {
                 r#"
                 INSERT INTO subscriber_identities (subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
-                RETURNING subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at
+                RETURNING subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at, imei
                 "#,
             )
             .bind(id)
@@ -2238,7 +2645,7 @@ impl HlrRepository for PostgresHlrRepository {
         check_hardware_identity_unique(&self.pool, subscriber_id, esn, meid).await?;
         let existing = sqlx::query_as::<_, IdentityRow>(
             r#"
-            SELECT subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at
+            SELECT subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at, imei
             FROM subscriber_identities
             WHERE subscriber_id = $1
             ORDER BY is_primary DESC, created_at ASC
@@ -2259,7 +2666,7 @@ impl HlrRepository for PostgresHlrRepository {
                     meid = $4,
                     is_primary = true
                 WHERE subscriber_identity_id = $1
-                RETURNING subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at
+                RETURNING subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at, imei
                 "#,
             )
             .bind(existing.subscriber_identity_id)
@@ -2277,7 +2684,7 @@ impl HlrRepository for PostgresHlrRepository {
                     subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at
                 )
                 VALUES ($1, $2, $3, $4, $5, true, $6)
-                RETURNING subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at
+                RETURNING subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at, imei
                 "#,
             )
             .bind(id)
@@ -2298,7 +2705,7 @@ impl HlrRepository for PostgresHlrRepository {
         subscriber_id: Uuid,
     ) -> Result<Vec<SubscriberIdentity>, String> {
         let rows = sqlx::query_as::<_, IdentityRow>(
-            "SELECT subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at FROM subscriber_identities WHERE subscriber_id = $1 ORDER BY is_primary DESC, created_at ASC",
+            "SELECT subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at, imei FROM subscriber_identities WHERE subscriber_id = $1 ORDER BY is_primary DESC, created_at ASC",
         )
         .bind(subscriber_id)
         .fetch_all(&self.pool)
@@ -2434,51 +2841,63 @@ impl HlrRepository for PostgresHlrRepository {
         &self,
         esn: Option<u32>,
         meid: Option<&str>,
-    ) -> Result<Option<ResolvedSubscriber>, String> {
-        if esn.is_none() && meid.is_none() {
-            return Err(
-                "resolve_by_hardware_identity requires at least one of ESN or MEID".to_string(),
-            );
+    ) -> Result<Option<ResolvedSubscriber>, HardwareLookupError> {
+        self.resolve_hardware_identity(esn, meid, false).await
+    }
+
+    async fn resolve_by_hrpd_hardware_identity(
+        &self,
+        esn: Option<u32>,
+        meid: Option<&str>,
+    ) -> Result<Option<ResolvedSubscriber>, HardwareLookupError> {
+        self.resolve_hardware_identity(esn, meid, true).await
+    }
+
+    async fn set_identity_imei(
+        &self,
+        subscriber_identity_id: Uuid,
+        imei: Option<&str>,
+    ) -> Result<SubscriberIdentity, String> {
+        let imei = imei
+            .map(normalize_imei)
+            .transpose()
+            .map_err(|e| format!("{VALIDATION_FAILED_PREFIX}{e}"))?;
+        if let Some(imei) = imei.as_deref() {
+            let meid_form = &imei[..IMEI_MEID_FORM_DIGITS];
+            let conflict: Option<(Uuid,)> = sqlx::query_as(
+                r#"
+                SELECT subscriber_id FROM subscriber_identities
+                WHERE subscriber_identity_id <> $1
+                  AND (imei = $2 OR meid = $3 OR left(imei, 14) = $3)
+                LIMIT 1
+                "#,
+            )
+            .bind(subscriber_identity_id)
+            .bind(imei)
+            .bind(meid_form)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("set_identity_imei conflict check: {e}"))?;
+            if conflict.is_some() {
+                return Err(format!(
+                    "{VALIDATION_FAILED_PREFIX}IMEI {imei} is already assigned to another identity"
+                ));
+            }
         }
-        let meid = meid.map(normalize_meid).transpose()?;
-        let rows = sqlx::query_as::<_, SubscriberRow>(
+        let row = sqlx::query_as::<_, IdentityRow>(
             r#"
-            SELECT DISTINCT s.subscriber_id, s.phone_number, s.display_name, s.status, s.created_at, s.updated_at,
-                s.number_type, s.number_plan, s.prl_override_id, s.service_programming_code, s.firstchp_override,
-                EXISTS (SELECT 1 FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS has_ringtone,
-                (SELECT MIN(duration_ms) FROM subscriber_ringtones r WHERE r.subscriber_id = s.subscriber_id) AS ringtone_duration_ms
-            FROM subscribers s
-            JOIN subscriber_identities i ON s.subscriber_id = i.subscriber_id
-            WHERE ($1::bigint IS NOT NULL AND i.esn = $1)
-               OR ($2::text   IS NOT NULL AND i.meid = $2)
-            LIMIT 2
+            UPDATE subscriber_identities SET imei = $2
+            WHERE subscriber_identity_id = $1
+            RETURNING subscriber_identity_id, subscriber_id, imsi, esn, meid, is_primary, created_at, imei
             "#,
         )
-        .bind(esn.map(|v| v as i64))
-        .bind(meid.as_deref())
-        .fetch_all(&self.pool)
+        .bind(subscriber_identity_id)
+        .bind(imei.as_deref())
+        .fetch_optional(&self.pool)
         .await
-        .map_err(|e| format!("resolve_by_hardware_identity: {e}"))?;
-        if rows.len() > 1 {
-            return Err(match (esn, meid.as_deref()) {
-                (Some(esn), Some(_)) => format!(
-                    "ambiguous match: ESN 0x{esn:08X} and MEID resolve to different subscribers"
-                ),
-                (Some(esn), None) => {
-                    format!("ambiguous match: multiple subscribers share ESN 0x{esn:08X}")
-                }
-                (None, Some(_)) => {
-                    "ambiguous match: multiple subscribers share this MEID".to_string()
-                }
-                (None, None) => unreachable!("guarded by earlier check"),
-            });
-        }
-        let Some(row) = rows.into_iter().next() else {
-            return Ok(None);
-        };
-        let subscriber: Subscriber = row.try_into()?;
-        let sid = subscriber.subscriber_id;
-        Ok(Some(self.assemble_resolved(subscriber, sid).await?))
+        .map_err(|e| format!("set_identity_imei: {e}"))?
+        .ok_or_else(|| "subscriber identity not found".to_string())?;
+        Ok(row.into())
     }
 
     async fn upsert_mobile_seen(
@@ -2491,50 +2910,198 @@ impl HlrRepository for PostgresHlrRepository {
             .begin()
             .await
             .map_err(|e| format!("upsert_mobile_seen begin: {e}"))?;
-        if let MobileIdentityKey::ImsiEsnMeid { imsi, esn, meid } = identity {
-            sqlx::query(
-                "UPDATE registration_bindings SET meid = $3 \
-                 WHERE imsi = $1 AND esn = $2 AND (meid IS NULL OR meid = $3)",
-            )
-            .bind(imsi)
-            .bind(i64::from(*esn))
-            .bind(meid)
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| format!("upsert_mobile_seen binding MEID: {error}"))?;
-        }
-        let existing = select_mobile_seen_by_key(&mut tx, identity).await?;
-        if let Some(row) = existing {
-            update_mobile_seen_row(&mut tx, row.id, mob_p_rev, identity).await?;
-            delete_legacy_mobile_seen(&mut tx, identity.imsi(), Some(row.id)).await?;
-            tx.commit()
-                .await
-                .map_err(|e| format!("upsert_mobile_seen commit: {e}"))?;
-            return Ok(MobileSeenUpsert {
-                is_new: false,
-                previous_last_seen_at: Some(row.last_seen_at),
-            });
-        }
-
-        if let Some(row) = select_legacy_mobile_seen_by_imsi(&mut tx, identity.imsi()).await? {
-            update_mobile_seen_row(&mut tx, row.id, mob_p_rev, identity).await?;
-            tx.commit()
-                .await
-                .map_err(|e| format!("upsert_mobile_seen legacy commit: {e}"))?;
-            return Ok(MobileSeenUpsert {
-                is_new: false,
-                previous_last_seen_at: Some(row.last_seen_at),
-            });
-        }
-
-        insert_mobile_seen(&mut tx, mob_p_rev, identity).await?;
+        let (_, upsert) = upsert_mobile_seen_in(&mut tx, identity, mob_p_rev).await?;
         tx.commit()
             .await
-            .map_err(|e| format!("upsert_mobile_seen insert commit: {e}"))?;
-        Ok(MobileSeenUpsert {
-            is_new: true,
-            previous_last_seen_at: None,
-        })
+            .map_err(|e| format!("upsert_mobile_seen commit: {e}"))?;
+        Ok(upsert)
+    }
+
+    async fn record_mobile_admission(
+        &self,
+        identity: &MobileIdentityKey,
+        admission: &MobileAdmission,
+    ) -> Result<MobileSeenUpsert, String> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| format!("record_mobile_admission begin: {e}"))?;
+        let (id, upsert) = upsert_mobile_seen_in(&mut tx, identity, None).await?;
+        let denied = admission.class == MobileAdmissionClass::Denied;
+        let reason = (!admission.reason.is_empty()).then_some(admission.reason.as_str());
+        let base_station =
+            (!admission.base_station.is_empty()).then_some(admission.base_station.as_str());
+        sqlx::query(
+            r#"
+            UPDATE mobiles_seen
+            SET admission_class = $2,
+                admission_reason = $3,
+                admission_at = NOW(),
+                admission_base_station = $4,
+                denied_count = denied_count + CASE WHEN $5 THEN 1 ELSE 0 END,
+                last_denied_at = CASE WHEN $5 THEN NOW() ELSE last_denied_at END,
+                last_denial_reason = CASE WHEN $5 THEN $3 ELSE last_denial_reason END,
+                last_denied_base_station = CASE WHEN $5 THEN $4 ELSE last_denied_base_station END
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .bind(admission.class.as_str())
+        .bind(reason)
+        .bind(base_station)
+        .bind(denied)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("record_mobile_admission update: {e}"))?;
+        tx.commit()
+            .await
+            .map_err(|e| format!("record_mobile_admission commit: {e}"))?;
+        Ok(upsert)
+    }
+
+    async fn record_hardware_admission(
+        &self,
+        esn: Option<u32>,
+        meid: Option<&str>,
+        admission: &MobileAdmission,
+    ) -> Result<(), String> {
+        if esn.is_none() && meid.is_none() {
+            return Err("hardware admission requires an ESN or MEID".to_string());
+        }
+        let meid = meid.map(normalize_meid).transpose()?;
+        let denied = admission.class == MobileAdmissionClass::Denied;
+        let reason = (!admission.reason.is_empty()).then_some(admission.reason.as_str());
+        let base_station =
+            (!admission.base_station.is_empty()).then_some(admission.base_station.as_str());
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| format!("record_hardware_admission begin: {e}"))?;
+        let updated = sqlx::query(
+            r#"
+            UPDATE mobiles_seen
+            SET last_seen_at = NOW()
+            WHERE imsi IS NULL
+              AND (($2::text IS NOT NULL AND meid = $2)
+                OR ($2::text IS NULL AND meid IS NULL AND esn = $1))
+            "#,
+        )
+        .bind(esn.map(i64::from))
+        .bind(meid.as_deref())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("record_hardware_admission touch: {e}"))?
+        .rows_affected();
+        if updated == 0 {
+            sqlx::query(
+                r#"
+                INSERT INTO mobiles_seen (esn, meid, first_seen_at, last_seen_at)
+                VALUES ($1, $2, NOW(), NOW())
+                "#,
+            )
+            .bind(esn.map(i64::from))
+            .bind(meid.as_deref())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("record_hardware_admission insert: {e}"))?;
+        }
+        sqlx::query(
+            r#"
+            UPDATE mobiles_seen
+            SET admission_class = $3,
+                admission_reason = $4,
+                admission_at = NOW(),
+                admission_base_station = $5,
+                denied_count = denied_count + CASE WHEN $6 THEN 1 ELSE 0 END,
+                last_denied_at = CASE WHEN $6 THEN NOW() ELSE last_denied_at END,
+                last_denial_reason = CASE WHEN $6 THEN $4 ELSE last_denial_reason END,
+                last_denied_base_station = CASE WHEN $6 THEN $5 ELSE last_denied_base_station END
+            WHERE imsi IS NULL
+              AND (($2::text IS NOT NULL AND meid = $2)
+                OR ($2::text IS NULL AND meid IS NULL AND esn = $1))
+            "#,
+        )
+        .bind(esn.map(i64::from))
+        .bind(meid.as_deref())
+        .bind(admission.class.as_str())
+        .bind(reason)
+        .bind(base_station)
+        .bind(denied)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("record_hardware_admission update: {e}"))?;
+        tx.commit()
+            .await
+            .map_err(|e| format!("record_hardware_admission commit: {e}"))
+    }
+
+    async fn list_mobiles_seen(
+        &self,
+        filter: MobileSeenFilter,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<MobileSeen>, u32), String> {
+        const ESN_MANUFACTURER_SHIFT: u32 = 24;
+        const PSEUDO_ESN_MANUFACTURER: i64 = 0x80;
+        let condition = match filter {
+            MobileSeenFilter::All => "TRUE",
+            MobileSeenFilter::CurrentlyDenied => "admission_class = 'denied'",
+            MobileSeenFilter::CurrentlyRestricted => {
+                "admission_class IN ('denied', 'provisioning', 'registration_only')"
+            }
+            MobileSeenFilter::EverDenied => "denied_count > 0",
+        };
+        let condition = if matches!(
+            filter,
+            MobileSeenFilter::CurrentlyDenied | MobileSeenFilter::CurrentlyRestricted
+        ) {
+            format!(
+                r#"({condition}) AND NOT EXISTS (
+                    SELECT 1 FROM mobiles_seen AS newer
+                    WHERE newer.admission_at > current_mobile.admission_at
+                      AND (
+                        (current_mobile.meid IS NOT NULL AND newer.meid = current_mobile.meid)
+                        OR (
+                            current_mobile.esn IS NOT NULL
+                            AND (current_mobile.esn >> {ESN_MANUFACTURER_SHIFT}) <> {PSEUDO_ESN_MANUFACTURER}
+                            AND newer.esn = current_mobile.esn
+                            AND (current_mobile.meid IS NULL OR newer.meid IS NULL
+                                OR newer.meid = current_mobile.meid)
+                        )
+                      )
+                )"#
+            )
+        } else {
+            condition.to_string()
+        };
+        let total: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM mobiles_seen AS current_mobile WHERE {condition}"
+        ))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| format!("list_mobiles_seen count: {e}"))?;
+        let rows = sqlx::query_as::<_, MobileSeenRow>(&format!(
+            r#"
+            SELECT imsi, esn, meid, mob_p_rev, first_seen_at, last_seen_at,
+                admission_class, admission_reason, admission_at, admission_base_station,
+                denied_count, last_denied_at, last_denial_reason, last_denied_base_station
+            FROM mobiles_seen AS current_mobile
+            WHERE {condition}
+            ORDER BY last_seen_at DESC, id
+            LIMIT $1 OFFSET $2
+            "#
+        ))
+        .bind(i64::from(limit))
+        .bind(i64::from(offset))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_mobiles_seen: {e}"))?;
+        Ok((
+            rows.into_iter().map(Into::into).collect(),
+            u32::try_from(total).unwrap_or(u32::MAX),
+        ))
     }
 
     async fn upsert_registration_binding(
@@ -3487,6 +4054,8 @@ struct IdentityRow {
     meid: Option<String>,
     is_primary: bool,
     created_at: DateTime<Utc>,
+    #[sqlx(default)]
+    imei: Option<String>,
 }
 
 impl From<IdentityRow> for SubscriberIdentity {
@@ -3497,6 +4066,7 @@ impl From<IdentityRow> for SubscriberIdentity {
             imsi: r.imsi,
             esn: r.esn.map(|v| v as u32),
             meid: r.meid,
+            imei: r.imei,
             is_primary: r.is_primary,
             created_at: r.created_at,
         }

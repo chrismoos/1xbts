@@ -59,6 +59,7 @@ pub(super) fn parse_stream0_slp_d_bits(bits: &[u8]) -> Option<ParsedStream0Signa
     if bits.len() == cursor {
         return Some(ParsedStream0Signaling {
             message: None,
+            protocol_type: None,
             ack_sequence_number,
             sequence_number,
             in_configuration: None,
@@ -74,6 +75,7 @@ pub(super) fn parse_stream0_slp_d_bits(bits: &[u8]) -> Option<ParsedStream0Signa
                         message_sequence: slp_payload[1],
                     },
                 )),
+                protocol_type: None,
                 ack_sequence_number,
                 sequence_number,
                 in_configuration: None,
@@ -86,6 +88,7 @@ pub(super) fn parse_stream0_slp_d_bits(bits: &[u8]) -> Option<ParsedStream0Signa
                         message_sequence: slp_payload[1],
                     },
                 )),
+                protocol_type: None,
                 ack_sequence_number,
                 sequence_number,
                 in_configuration: None,
@@ -101,6 +104,7 @@ pub(super) fn parse_stream0_slp_d_bits(bits: &[u8]) -> Option<ParsedStream0Signa
                     message_id,
                     payload: slp_payload,
                 }),
+                protocol_type: None,
                 ack_sequence_number,
                 sequence_number,
                 in_configuration: None,
@@ -211,6 +215,7 @@ pub(super) fn parse_stream0_slp_d_bits(bits: &[u8]) -> Option<ParsedStream0Signa
     };
     Some(ParsedStream0Signaling {
         message: Some(message),
+        protocol_type: Some(protocol_type),
         ack_sequence_number,
         sequence_number,
         in_configuration: Some(in_configuration),

@@ -5,9 +5,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cdma_common::access::AccessMessage;
-use cdma_common::consts::{
-    SERVICE_OPTION_ASYNC_DATA, SERVICE_OPTION_PACKET_DATA, SERVICE_OPTION_PACKET_DATA_RC3,
-};
 use cdma_common::events::AccessChannelEvent;
 use cdma_common::lac::{
     message_types::{MessageId, WireChannel},
@@ -53,8 +50,7 @@ use super::proto::bsc_service_server::{BscService, BscServiceServer};
 use super::state::BscState;
 use crate::bsc::traffic_events::forward_order_display_name;
 use crate::bsc::{
-    AccessCellId, BtsAttachState, BtsEntry, BtsOamClient, BtsRegistry, DataCallRequest,
-    PagingEvent, TrafficEvent,
+    AccessCellId, BtsAttachState, BtsEntry, BtsOamClient, BtsRegistry, PagingEvent, TrafficEvent,
 };
 use crate::config::MtlsConfig;
 use crate::power_control::TrafficChannelPowerSnapshot;
@@ -62,7 +58,6 @@ use cdma_common::formatting::{
     bitstream_to_hex, bytes_to_hex, format_dtmf_digits, forward_order_name,
     mobile_station_reject_reason, rejected_pdu_type_name,
 };
-use uuid::Uuid;
 
 /// Channel type label the BTS uses for an active traffic channel.
 const TRAFFIC_CHANNEL_TYPE: &str = "traffic";
@@ -411,9 +406,10 @@ impl BaseStationService for BscServiceImpl {
         &self,
         request: Request<BaseStationEnrollRequest>,
     ) -> Result<Response<BaseStationEnrollResponse>, Status> {
+        let request = request.into_inner();
         self.state
             .bts
-            .set_global_challenge(request.into_inner().global_challenge);
+            .set_global_challenge(request.global_challenge);
         let cells = self
             .state
             .bts
@@ -1762,33 +1758,11 @@ impl BscService for BscServiceImpl {
 
     async fn initiate_data_call(
         &self,
-        request: Request<proto::InitiateDataCallRequest>,
+        _request: Request<proto::InitiateDataCallRequest>,
     ) -> Result<Response<proto::InitiateDataCallResponse>, Status> {
-        let req = request.into_inner();
-        let subscriber_id = Uuid::parse_str(&req.subscriber_id)
-            .map_err(|_| Status::invalid_argument("subscriber_id must be a valid UUID"))?;
-        let service_option = match req.service_option {
-            value if value == u32::from(SERVICE_OPTION_PACKET_DATA) => SERVICE_OPTION_PACKET_DATA,
-            value if value == u32::from(SERVICE_OPTION_ASYNC_DATA) => SERVICE_OPTION_ASYNC_DATA,
-            _ => SERVICE_OPTION_PACKET_DATA_RC3,
-        };
-
-        self.state
-            .data_request_tx
-            .send(DataCallRequest {
-                subscriber_id,
-                service_option,
-            })
-            .await
-            .map_err(|e| Status::unavailable(format!("data request queue unavailable: {}", e)))?;
-
-        Ok(Response::new(proto::InitiateDataCallResponse {
-            accepted: true,
-            message: format!(
-                "data call (SO {}) request accepted for subscriber {}",
-                service_option, subscriber_id
-            ),
-        }))
+        Err(Status::failed_precondition(
+            "Data calls must be initiated through MSC network management",
+        ))
     }
 }
 

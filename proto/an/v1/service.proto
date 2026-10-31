@@ -25,6 +25,28 @@ service AnService {
   // Consumes one decoded HRPD reverse Traffic Channel event and returns any
   // AN-authorized A8 user-plane payloads for the PCF bearer.
   rpc HandleTrafficEvent(HrpdTrafficEvent) returns (HrpdTrafficOutcome);
+  // Sets which access terminals the access network serves. Until it is set,
+  // the access network serves only terminals whose Hardware ID matches a
+  // subscriber.
+  rpc SetAccessPolicy(SetAccessPolicyRequest) returns (SetAccessPolicyResponse);
+}
+
+enum AnAccessMode {
+  AN_ACCESS_MODE_UNSPECIFIED = 0;
+  // Every access terminal is served.
+  AN_ACCESS_MODE_OPEN = 1;
+  // Only access terminals whose Hardware ID matches an active subscriber get
+  // a connection.
+  AN_ACCESS_MODE_CLOSED = 2;
+}
+
+message SetAccessPolicyRequest {
+  AnAccessMode mode = 1;
+}
+
+message SetAccessPolicyResponse {
+  // True when the request changed the mode.
+  bool changed = 1;
 }
 
 // Per C.S0024-400 §7 session state.
@@ -75,6 +97,38 @@ message Session {
   HrpdHardwareIdResponse hardware_id_response = 5;
   // Canonical 128-bit UATI assigned to this AT.
   events.v1.HrpdUati full_uati = 6;
+  // Access decisions for this session.
+  SessionAdmission admission = 7;
+}
+
+enum HardwareVerdict {
+  HARDWARE_VERDICT_UNSPECIFIED = 0;
+  // No HardwareIDResponse has been resolved.
+  HARDWARE_VERDICT_UNKNOWN = 1;
+  // The Hardware ID matches an active subscriber.
+  HARDWARE_VERDICT_ADMITTED = 2;
+  HARDWARE_VERDICT_REFUSED = 3;
+}
+
+message SessionAdmission {
+  // True when the access network serves only admitted sessions.
+  bool access_closed = 1;
+  HardwareVerdict hardware_verdict = 2;
+  // Snake-case refusal reason, for example `not_a_subscriber`. Empty unless refused.
+  string reason = 3;
+  // Subscriber the Hardware ID matched. Empty when none.
+  string subscriber_id = 4;
+  // Stream carrying access authentication. Zero when the session has none.
+  uint32 access_stream_id = 5;
+  // Access authentication progress: idle, lcp, challenge_sent,
+  // awaiting_aaa, terminating or settled.
+  string access_auth_state = 6;
+  // Settled result, for example `accepted` or `no_response`. Empty until settled.
+  string access_auth_result = 7;
+  // NAI from the access terminal's CHAP Response. Empty until received.
+  string access_auth_nai = 8;
+  // IMSI from the A12 Access-Accept. Empty when none.
+  string access_auth_imsi = 9;
 }
 
 // Negotiated protocol subtypes for an open session.
@@ -409,6 +463,8 @@ message HrpdStream1PacketEvent {
   uint32 receive_ati = 4;
   bytes payload = 2;
   uint32 sequence = 5;
+  // Stream Layer StreamID. Zero is read as stream 1.
+  uint32 stream_id = 6;
 }
 
 message HrpdA8UplinkPacket {

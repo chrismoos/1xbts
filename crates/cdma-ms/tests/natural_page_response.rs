@@ -5,8 +5,9 @@ use std::time::Duration;
 use support::SmsRequest;
 
 use cdma_ms::tx::{
-    AccessArq, AccessChannelConfig, MsAccessIdentity, ServingSystem, build_page_response_capsule,
-    build_registration_capsule, default_lc_state_at, modulate_access_probe, pulse_shape,
+    AccessArq, AccessChannelConfig, MsAccessIdentity, SCM_MEID_SUPPORT, ServingSystem,
+    build_page_response_capsule, build_registration_capsule, default_lc_state_at,
+    modulate_access_probe, pulse_shape,
 };
 
 const OVERSAMPLE: u64 = 4;
@@ -19,8 +20,11 @@ const SMS_SERVICE_OPTION: u16 = 6;
 async fn ms_answers_a_page_from_an_mt_sms() {
     let esn: u32 = 0x4CDC_1D09;
     let cfg = AccessChannelConfig::default();
+    // The injected probes cannot answer the BSC's MEID query, so the mobile
+    // does not advertise MEID support and the BSC handles its access at once.
     let id = MsAccessIdentity {
         esn,
+        scm: MsAccessIdentity::default().scm & !SCM_MEID_SUPPORT,
         ..Default::default()
     };
 

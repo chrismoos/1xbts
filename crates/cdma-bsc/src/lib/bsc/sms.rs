@@ -920,24 +920,6 @@ impl Bsc {
         };
 
         let reply_seq = sms.reply_seq.unwrap_or(0);
-        if sender.is_none() {
-            const TEMPORARY_ERROR_CLASS: u8 = 0b10;
-            const SMS_CAUSE_NETWORK_FAILURE: u8 = 0x03;
-            warn!(
-                "BSC: rejecting MO SMS on traffic walsh={} with temporary SMS Cause Code: no subscriber/phone number resolved for originating MS (dest=\"{}\" teleservice=0x{:04X} msg_id={} reply_seq={})",
-                walsh_code, sms.destination_number, sms.teleservice_id, sms.message_id, reply_seq,
-            );
-            self.send_traffic_sms_cause_code(
-                cell,
-                walsh_code,
-                ack_seq,
-                reply_seq,
-                TEMPORARY_ERROR_CLASS,
-                Some(SMS_CAUSE_NETWORK_FAILURE),
-            );
-            return;
-        }
-
         let packet_mobile = self.mobiles.get_by_walsh(cell, walsh_code).filter(|ms| {
             ms.traffic_channel
                 .as_ref()

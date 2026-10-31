@@ -9,7 +9,7 @@ import { BinaryReader, BinaryWriter } from "@bufbuild/protobuf/wire";
 import type { CallContext, CallOptions } from "nice-grpc-common";
 import { ServedCell } from "../../base_station/v1/service";
 import { InitiateCallRequest, InitiateCallResponse } from "../../bsc/v1/service";
-import { AuthenticationEvent, MscNetworkEvent } from "../../events/v1/msc";
+import { AdmissionEvent, AuthenticationEvent, MscNetworkEvent } from "../../events/v1/msc";
 import { Empty } from "../../google/protobuf/empty";
 
 export const protobufPackage = "msc_management.v1";
@@ -20,14 +20,7 @@ export interface CallList {
   callIds: string[];
 }
 
-/**
- * Submits a mobile-terminated SMS. Exactly one of `destination_number` or
- * `destination_imsi` must be set:
- *   * `destination_number` resolves the target via HLR and addresses by phone
- *     number (subscriber-only path).
- *   * `destination_imsi` sends to the given IMSI directly without an HLR
- *     lookup; used for non-subscriber mobiles seen on the air.
- */
+/** Closed mode requires an Active or Suspended subscriber for either destination. */
 export interface SendSmsRequest {
   originatingNumber: string;
   text: string;
@@ -92,6 +85,31 @@ export interface ListAuthenticationEventsRequest {
 /** Authentication results, newest first. */
 export interface AuthenticationEventList {
   events: AuthenticationEvent[];
+}
+
+export interface ListAdmissionEventsRequest {
+  /**
+   * An event matches when its IMSI is listed here, its ESN equals `esn` or
+   * its MEID equals `meid`. With no filter every retained event matches.
+   */
+  imsis: string[];
+  esn?: number | undefined;
+  meid: string;
+  /** Most events to return. Zero returns every retained match. */
+  limit: number;
+  /** Latest decision per handset, independent of activity-history retention. */
+  currentOnly: boolean;
+}
+
+export interface AdmissionEventList {
+  events: AdmissionEvent[];
+  /** `open` or `closed`. */
+  accessMode: string;
+  /** `subscriber_only` or `any`. */
+  registerPolicy: string;
+  /** `off`, `monitor` or `enforce`. */
+  authenticationMode: string;
+  currentSnapshot: boolean;
 }
 
 export interface InitiateOtaspRequest {
@@ -804,6 +822,274 @@ export const AuthenticationEventList: MessageFns<AuthenticationEventList> = {
   },
 };
 
+function createBaseListAdmissionEventsRequest(): ListAdmissionEventsRequest {
+  return { imsis: [], esn: undefined, meid: "", limit: 0, currentOnly: false };
+}
+
+export const ListAdmissionEventsRequest: MessageFns<ListAdmissionEventsRequest> = {
+  encode(message: ListAdmissionEventsRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.imsis) {
+      writer.uint32(10).string(v!);
+    }
+    if (message.esn !== undefined) {
+      writer.uint32(16).uint32(message.esn);
+    }
+    if (message.meid !== "") {
+      writer.uint32(26).string(message.meid);
+    }
+    if (message.limit !== 0) {
+      writer.uint32(32).uint32(message.limit);
+    }
+    if (message.currentOnly !== false) {
+      writer.uint32(40).bool(message.currentOnly);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ListAdmissionEventsRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseListAdmissionEventsRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.imsis.push(reader.string());
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.esn = reader.uint32();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.meid = reader.string();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.limit = reader.uint32();
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.currentOnly = reader.bool();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ListAdmissionEventsRequest {
+    return {
+      imsis: globalThis.Array.isArray(object?.imsis) ? object.imsis.map((e: any) => globalThis.String(e)) : [],
+      esn: isSet(object.esn) ? globalThis.Number(object.esn) : undefined,
+      meid: isSet(object.meid) ? globalThis.String(object.meid) : "",
+      limit: isSet(object.limit) ? globalThis.Number(object.limit) : 0,
+      currentOnly: isSet(object.currentOnly)
+        ? globalThis.Boolean(object.currentOnly)
+        : isSet(object.current_only)
+        ? globalThis.Boolean(object.current_only)
+        : false,
+    };
+  },
+
+  toJSON(message: ListAdmissionEventsRequest): unknown {
+    const obj: any = {};
+    if (message.imsis?.length) {
+      obj.imsis = message.imsis;
+    }
+    if (message.esn !== undefined) {
+      obj.esn = Math.round(message.esn);
+    }
+    if (message.meid !== "") {
+      obj.meid = message.meid;
+    }
+    if (message.limit !== 0) {
+      obj.limit = Math.round(message.limit);
+    }
+    if (message.currentOnly !== false) {
+      obj.currentOnly = message.currentOnly;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<ListAdmissionEventsRequest>): ListAdmissionEventsRequest {
+    return ListAdmissionEventsRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<ListAdmissionEventsRequest>): ListAdmissionEventsRequest {
+    const message = createBaseListAdmissionEventsRequest();
+    message.imsis = object.imsis?.map((e) => e) || [];
+    message.esn = object.esn ?? undefined;
+    message.meid = object.meid ?? "";
+    message.limit = object.limit ?? 0;
+    message.currentOnly = object.currentOnly ?? false;
+    return message;
+  },
+};
+
+function createBaseAdmissionEventList(): AdmissionEventList {
+  return { events: [], accessMode: "", registerPolicy: "", authenticationMode: "", currentSnapshot: false };
+}
+
+export const AdmissionEventList: MessageFns<AdmissionEventList> = {
+  encode(message: AdmissionEventList, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.events) {
+      AdmissionEvent.encode(v!, writer.uint32(10).fork()).join();
+    }
+    if (message.accessMode !== "") {
+      writer.uint32(18).string(message.accessMode);
+    }
+    if (message.registerPolicy !== "") {
+      writer.uint32(26).string(message.registerPolicy);
+    }
+    if (message.authenticationMode !== "") {
+      writer.uint32(34).string(message.authenticationMode);
+    }
+    if (message.currentSnapshot !== false) {
+      writer.uint32(40).bool(message.currentSnapshot);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): AdmissionEventList {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseAdmissionEventList();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.events.push(AdmissionEvent.decode(reader, reader.uint32()));
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.accessMode = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.registerPolicy = reader.string();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.authenticationMode = reader.string();
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.currentSnapshot = reader.bool();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): AdmissionEventList {
+    return {
+      events: globalThis.Array.isArray(object?.events) ? object.events.map((e: any) => AdmissionEvent.fromJSON(e)) : [],
+      accessMode: isSet(object.accessMode)
+        ? globalThis.String(object.accessMode)
+        : isSet(object.access_mode)
+        ? globalThis.String(object.access_mode)
+        : "",
+      registerPolicy: isSet(object.registerPolicy)
+        ? globalThis.String(object.registerPolicy)
+        : isSet(object.register_policy)
+        ? globalThis.String(object.register_policy)
+        : "",
+      authenticationMode: isSet(object.authenticationMode)
+        ? globalThis.String(object.authenticationMode)
+        : isSet(object.authentication_mode)
+        ? globalThis.String(object.authentication_mode)
+        : "",
+      currentSnapshot: isSet(object.currentSnapshot)
+        ? globalThis.Boolean(object.currentSnapshot)
+        : isSet(object.current_snapshot)
+        ? globalThis.Boolean(object.current_snapshot)
+        : false,
+    };
+  },
+
+  toJSON(message: AdmissionEventList): unknown {
+    const obj: any = {};
+    if (message.events?.length) {
+      obj.events = message.events.map((e) => AdmissionEvent.toJSON(e));
+    }
+    if (message.accessMode !== "") {
+      obj.accessMode = message.accessMode;
+    }
+    if (message.registerPolicy !== "") {
+      obj.registerPolicy = message.registerPolicy;
+    }
+    if (message.authenticationMode !== "") {
+      obj.authenticationMode = message.authenticationMode;
+    }
+    if (message.currentSnapshot !== false) {
+      obj.currentSnapshot = message.currentSnapshot;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<AdmissionEventList>): AdmissionEventList {
+    return AdmissionEventList.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<AdmissionEventList>): AdmissionEventList {
+    const message = createBaseAdmissionEventList();
+    message.events = object.events?.map((e) => AdmissionEvent.fromPartial(e)) || [];
+    message.accessMode = object.accessMode ?? "";
+    message.registerPolicy = object.registerPolicy ?? "";
+    message.authenticationMode = object.authenticationMode ?? "";
+    message.currentSnapshot = object.currentSnapshot ?? false;
+    return message;
+  },
+};
+
 function createBaseInitiateOtaspRequest(): InitiateOtaspRequest {
   return { subscriberId: "", imsi: undefined };
 }
@@ -1022,6 +1308,19 @@ export const MscManagementServiceDefinition = {
       responseStream: false,
       options: {},
     },
+    /**
+     * Lists recent admission decisions and the configured access policy. The
+     * MSC keeps the most recent decisions in memory only, so a restart clears
+     * them.
+     */
+    listAdmissionEvents: {
+      name: "ListAdmissionEvents",
+      requestType: ListAdmissionEventsRequest as typeof ListAdmissionEventsRequest,
+      requestStream: false,
+      responseType: AdmissionEventList as typeof AdmissionEventList,
+      responseStream: false,
+      options: {},
+    },
   },
 } as const;
 
@@ -1058,6 +1357,15 @@ export interface MscManagementServiceImplementation<CallContextExt = {}> {
     request: ListAuthenticationEventsRequest,
     context: CallContext & CallContextExt,
   ): Promise<DeepPartial<AuthenticationEventList>>;
+  /**
+   * Lists recent admission decisions and the configured access policy. The
+   * MSC keeps the most recent decisions in memory only, so a restart clears
+   * them.
+   */
+  listAdmissionEvents(
+    request: ListAdmissionEventsRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<AdmissionEventList>>;
 }
 
 export interface MscManagementServiceClient<CallOptionsExt = {}> {
@@ -1093,6 +1401,15 @@ export interface MscManagementServiceClient<CallOptionsExt = {}> {
     request: DeepPartial<ListAuthenticationEventsRequest>,
     options?: CallOptions & CallOptionsExt,
   ): Promise<AuthenticationEventList>;
+  /**
+   * Lists recent admission decisions and the configured access policy. The
+   * MSC keeps the most recent decisions in memory only, so a restart clears
+   * them.
+   */
+  listAdmissionEvents(
+    request: DeepPartial<ListAdmissionEventsRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<AdmissionEventList>;
 }
 
 function bytesFromBase64(b64: string): Uint8Array {

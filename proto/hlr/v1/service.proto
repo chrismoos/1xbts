@@ -70,6 +70,7 @@ message SubscriberIdentity {
   optional string imsi = 11;
   optional uint32 esn = 3;
   optional string meid = 12;          // 14 hex digits
+  optional string imei = 13;          // 15 decimal digits
   bool is_primary = 9;
   google.protobuf.Timestamp created_at = 10;
 }
@@ -131,6 +132,8 @@ message UpsertSubscriberRequest {
   optional string meid = 17;
   NumberType number_type = 20;
   NumberPlan number_plan = 21;
+  // 15 decimal digits. Replaces the identity's IMEI, and clears it when unset.
+  optional string imei = 22;
 }
 
 // Created or updated subscriber and identity.
@@ -180,6 +183,83 @@ message UpsertMobileSeenRequest {
 
 message UpsertMobileSeenResponse {
   MobileSeenUpsert result = 1;
+}
+
+enum MobileAdmissionClass {
+  MOBILE_ADMISSION_CLASS_UNSPECIFIED = 0;
+  MOBILE_ADMISSION_CLASS_ADMITTED = 1;
+  MOBILE_ADMISSION_CLASS_LIMITED = 2;
+  MOBILE_ADMISSION_CLASS_PROVISIONING = 3;
+  MOBILE_ADMISSION_CLASS_REGISTRATION_ONLY = 4;
+  MOBILE_ADMISSION_CLASS_DENIED = 5;
+}
+
+// Records the MSC's admission decision for an observed mobile. The sighting
+// is recorded as with UpsertMobileSeen. A Denied decision also increments the
+// mobile's denial count and replaces its last denial.
+message RecordMobileAdmissionRequest {
+  MobileIdentityKey identity = 1;
+  MobileAdmissionClass admission_class = 2;
+  // Snake-case reason name, for example `not_a_subscriber`. Empty when none.
+  string reason = 3;
+  string base_station = 4;
+}
+
+// Records an HRPD admission decision for a handset known only by its Hardware
+// ID. It keeps one sighting per Hardware ID without an IMSI, separate from the
+// handset's 1x sightings.
+message RecordHardwareAdmissionRequest {
+  HardwareIdentityKey identity = 1;
+  MobileAdmissionClass admission_class = 2;
+  // Snake-case reason name, for example `not_a_subscriber`. Empty when none.
+  string reason = 3;
+  string base_station = 4;
+}
+
+message RecordHardwareAdmissionResponse {}
+
+message RecordMobileAdmissionResponse {
+  MobileSeenUpsert result = 1;
+}
+
+message MobileSeen {
+  optional string imsi = 1;
+  optional uint32 esn = 2;
+  optional string meid = 3;
+  optional uint32 mob_p_rev = 4;
+  google.protobuf.Timestamp first_seen_at = 5;
+  google.protobuf.Timestamp last_seen_at = 6;
+  // Unspecified when no admission decision has been recorded.
+  MobileAdmissionClass admission_class = 7;
+  string admission_reason = 8;
+  optional google.protobuf.Timestamp admission_at = 9;
+  string admission_base_station = 10;
+  // Denials ever recorded for this mobile, including ones no longer current.
+  uint32 denied_count = 11;
+  optional google.protobuf.Timestamp last_denied_at = 12;
+  string last_denial_reason = 13;
+  string last_denied_base_station = 14;
+}
+
+enum MobileSeenFilter {
+  MOBILE_SEEN_FILTER_ALL = 0;
+  MOBILE_SEEN_FILTER_CURRENTLY_DENIED = 1;
+  // Mobiles whose latest decision is Denied, Provisioning or Registration only.
+  MOBILE_SEEN_FILTER_CURRENTLY_RESTRICTED = 2;
+  // Mobiles with at least one recorded denial, whatever their latest decision.
+  MOBILE_SEEN_FILTER_EVER_DENIED = 3;
+}
+
+message ListMobilesSeenRequest {
+  MobileSeenFilter filter = 1;
+  // Zero selects the server default of 50. At most 500.
+  uint32 page_size = 2;
+  uint32 offset = 3;
+}
+
+message ListMobilesSeenResponse {
+  repeated MobileSeen mobiles = 1;
+  uint32 total = 2;
 }
 
 // Looks up a subscriber by normalized phone number.
@@ -235,12 +315,16 @@ message ResolveSubscriberByRegisteredImsiRequest {
 // Resolves an ESN and/or MEID hardware identity to a provisioned subscriber.
 message ResolveSubscriberByHardwareIdentityRequest {
   HardwareIdentityKey identity = 1;
+  // Also matches a MEID against the first 14 digits of an identity's IMEI,
+  // the form multimode handsets report as their HRPD Hardware ID.
+  bool match_imei = 2;
 }
 
 message ResolveSubscriberByHardwareIdentityResponse {
   optional Subscriber subscriber = 1;
   optional RegistrationBinding binding = 2;
   optional SubscriberIdentity primary_identity = 3;
+  repeated SubscriberIdentity identities = 4;
 }
 
 // Creates or updates the serving-node registration binding for a subscriber.
@@ -301,6 +385,8 @@ message UpdateSubscriberRequest {
   optional string meid = 17;
   NumberType number_type = 20;
   NumberPlan number_plan = 21;
+  // 15 decimal digits. Replaces the identity's IMEI, and clears it when unset.
+  optional string imei = 22;
 }
 
 // Updated subscriber, identity, and registration state.
@@ -372,6 +458,9 @@ service HlrService {
   rpc GetIdentitiesForSubscriber(GetIdentitiesForSubscriberRequest) returns (GetIdentitiesForSubscriberResponse);
   // Records a mobile sighting.
   rpc UpsertMobileSeen(UpsertMobileSeenRequest) returns (UpsertMobileSeenResponse);
+  rpc RecordMobileAdmission(RecordMobileAdmissionRequest) returns (RecordMobileAdmissionResponse);
+  rpc RecordHardwareAdmission(RecordHardwareAdmissionRequest) returns (RecordHardwareAdmissionResponse);
+  rpc ListMobilesSeen(ListMobilesSeenRequest) returns (ListMobilesSeenResponse);
   // Looks up subscriber state by normalized phone number.
   rpc GetSubscriberByPhoneNumber(GetSubscriberByPhoneNumberRequest) returns (GetSubscriberByPhoneNumberResponse);
   // Looks up subscriber state by subscriber UUID.

@@ -17,6 +17,8 @@ message EnrollRequest {
   // node serves broadcast AUTH = '01' unless their own configuration fixes
   // AUTH.
   bool global_challenge = 1;
+  reserved 2;
+
 }
 
 message EnrollResponse {

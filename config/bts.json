@@ -18,6 +18,10 @@
       "pcf_a8_addr": "127.0.0.1:17041",
       "a8_bind_addr": "127.0.0.1:17040"
     },
+    "a12": {
+      "server": "127.0.0.1:1812",
+      "radius_secret": "secret"
+    },
     "overhead": {
       "sector_id": "00800580000000000000000000000000",
       "subnet_mask": 26,

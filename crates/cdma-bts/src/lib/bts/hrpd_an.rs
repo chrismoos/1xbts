@@ -16,12 +16,16 @@ use std::{
 use super::hrpd::scheduler::{ForwardTrafficPacket, ForwardTrafficSender};
 use super::{BtsNodeConfig, evdo};
 use cdma_a8::HrpdA9ClientConfig;
+use cdma_a12::client::{A12AccessRequest, A12AccessResponse, A12ClientConfig, send_access_request};
+use cdma_an::access_auth::AaaVerdict;
+use cdma_an::air::{HrpdAccessAuthRequest, HrpdHardwareAdmission};
 use cdma_an::air::{HrpdAirController, HrpdSessionConfigurationCompleteEvent, HrpdTrafficOutcome};
 use cdma_an::grpc::{AnServiceImpl, SessionStore, SharedUatiAllocator};
 use cdma_an::{
     HrpdA9MobileIdentity, HrpdA9ReleaseContext, HrpdAnA8Runtime, HrpdAnA9Client,
     HrpdAnForwardTrafficPacket, HrpdDerivedImsiConfig, HrpdHardwareIdentity,
-    hardware_identity_from_response, resolve_hrpd_a9_identity, spawn_hrpd_an_a8_runtime,
+    HrpdHardwareResolution, hardware_identity_from_response, resolve_hrpd_hardware,
+    spawn_hrpd_an_a8_runtime,
 };
 use cdma_an::{UatiAllocator, UatiSubnet};
 use cdma_common::error::Error;
@@ -57,6 +61,166 @@ pub(crate) struct PendingHrpdA9Session {
     request: hrpd_air::HrpdTrafficAssignmentRequest,
     identity: Option<HrpdA9MobileIdentity>,
     session_configuration_complete: bool,
+}
+
+/// Access authentication state per session, keyed by the 24-bit session UATI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HrpdAccessAuthGate {
+    Pending,
+    Settled { imsi: Option<String> },
+}
+
+/// Hardware ID verdicts per session, keyed by the 24-bit session UATI. The
+/// access and traffic tasks both resolve HardwareIDResponses.
+pub(crate) type SharedHardwareAdmissions =
+    Arc<std::sync::Mutex<HashMap<u32, HrpdHardwareAdmission>>>;
+
+/// What A9 SetupA8 waits on beyond identity and session configuration.
+pub(crate) struct HrpdA9Gates {
+    pub access_auth: HashMap<u32, HrpdAccessAuthGate>,
+    pub hardware: SharedHardwareAdmissions,
+    pub access_closed: bool,
+}
+
+impl HrpdA9Gates {
+    pub fn new(hardware: SharedHardwareAdmissions) -> Self {
+        Self {
+            access_auth: HashMap::new(),
+            hardware,
+            access_closed: true,
+        }
+    }
+
+    fn hardware_admission(&self, key: u32) -> HrpdHardwareAdmission {
+        self.hardware
+            .lock()
+            .expect("hardware admissions lock")
+            .get(&key)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// Sends the CHAP result to the AN-AAA and returns the verdict to the traffic
+/// task. Without an AN-AAA the verdict is an error, so the procedure still
+/// settles.
+fn dispatch_access_auth_request(
+    request: HrpdAccessAuthRequest,
+    a12_config: Option<A12ClientConfig>,
+    identifier: u8,
+    verdict_tx: tokio::sync::mpsc::UnboundedSender<(u32, AaaVerdict)>,
+) {
+    let session_uati = request.session_uati;
+    let hardware_id = request
+        .hardware_id
+        .as_ref()
+        .map(|response| response.hardware_id_value.clone());
+    info!(
+        "HRPD AN A12: CHAP credentials session_uati=0x{session_uati:08x} UATI=0x{:08x} nai={} chap_id={} challenge={} response={} hardware_id={}",
+        request.traffic_uati,
+        request.credentials.nai,
+        request.credentials.chap_id,
+        hex_bytes(&request.credentials.challenge),
+        hex_bytes(&request.credentials.response),
+        hardware_id
+            .as_deref()
+            .map(hex_bytes)
+            .unwrap_or_else(|| "<none>".into()),
+    );
+    let Some(config) = a12_config else {
+        info!(
+            "HRPD AN A12: evdo.a12 is not configured; access authentication result is not checked"
+        );
+        let _ = verdict_tx.send((
+            session_uati,
+            AaaVerdict::Error("no AN-AAA configured".into()),
+        ));
+        return;
+    };
+    let a12_request = A12AccessRequest {
+        nai: request.credentials.nai,
+        chap_id: request.credentials.chap_id,
+        challenge: request.credentials.challenge,
+        response: request.credentials.response,
+        hardware_id,
+    };
+    tokio::spawn(async move {
+        let verdict = match send_access_request(&config, &a12_request, identifier).await {
+            Ok(A12AccessResponse::Accept { imsi }) => AaaVerdict::Accept { imsi },
+            Ok(A12AccessResponse::Reject) => AaaVerdict::Reject,
+            Err(error) => AaaVerdict::Error(error.to_string()),
+        };
+        info!(
+            "HRPD AN A12: AN-AAA {} answered session_uati=0x{session_uati:08x} nai={} verdict={verdict:?}",
+            config.server, a12_request.nai
+        );
+        let _ = verdict_tx.send((session_uati, verdict));
+    });
+}
+
+/// Stores a Hardware ID verdict for the gates and the air controller, and
+/// records it in the HLR while access is closed.
+async fn apply_hardware_resolution(
+    service: &AnServiceImpl,
+    hardware_admissions: &SharedHardwareAdmissions,
+    hlr_repo: Option<&Arc<dyn cdma_hlr::repository::HlrRepository>>,
+    uati: u32,
+    hardware: &HrpdHardwareIdentity,
+    resolution: &HrpdHardwareResolution,
+) {
+    info!(
+        "HRPD AN: Hardware ID verdict UATI=0x{uati:08x} hardware={hardware:?} subscriber={} admission={:?}",
+        resolution.subscriber_id.as_deref().unwrap_or("-"),
+        resolution.admission
+    );
+    hardware_admissions
+        .lock()
+        .expect("hardware admissions lock")
+        .insert(
+            session_uati_from_hrpd_traffic_uati(uati),
+            resolution.admission.clone(),
+        );
+    service
+        .set_hardware_admission(
+            uati,
+            resolution.admission.clone(),
+            resolution.subscriber_id.clone(),
+        )
+        .await;
+    let Some(hlr_repo) = hlr_repo.cloned() else {
+        return;
+    };
+    if !service.access_closed().await {
+        return;
+    }
+    let (class, reason) = match &resolution.admission {
+        HrpdHardwareAdmission::Admitted => (cdma_hlr::model::MobileAdmissionClass::Admitted, ""),
+        HrpdHardwareAdmission::Refused { reason } => {
+            (cdma_hlr::model::MobileAdmissionClass::Denied, *reason)
+        }
+        HrpdHardwareAdmission::Unknown => return,
+    };
+    let (esn, meid) = match hardware {
+        HrpdHardwareIdentity::Esn(esn) => (Some(*esn), None),
+        HrpdHardwareIdentity::Meid(meid) => (None, Some(hex_bytes(&meid.0))),
+    };
+    let admission = cdma_hlr::model::MobileAdmission {
+        class,
+        reason: reason.to_string(),
+        base_station: String::new(),
+    };
+    tokio::spawn(async move {
+        if let Err(error) = hlr_repo
+            .record_hardware_admission(esn, meid.as_deref(), &admission)
+            .await
+        {
+            warn!("HRPD AN: failed to record the Hardware ID verdict in the HLR: {error}");
+        }
+    });
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 // Only UATI-keyed identities may reach A9: SetupA8 identifies the addressed
@@ -195,13 +359,15 @@ pub(crate) fn hrpd_uati_subnet_assignment(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_complete_hrpd_a9_setup(
-    pending: PendingHrpdA9Session,
+    mut pending: PendingHrpdA9Session,
     a9_config: Option<HrpdA9ClientConfig>,
     a9_endpoint: Option<&cdma_a9::UdpSignalingEndpoint>,
     an_a8_runtime: Option<&HrpdAnA8Runtime>,
     traffic_open_uatis: &HashSet<u32>,
     default_packet_flow_open_uatis: &HashSet<u32>,
+    gates: &HrpdA9Gates,
     sequence_no: &mut u32,
     reason: &str,
 ) -> Result<HrpdA9ReleaseContext, PendingHrpdA9Session> {
@@ -214,6 +380,41 @@ pub(crate) async fn try_complete_hrpd_a9_setup(
             pending.request.uati
         );
         return Err(pending);
+    }
+    let gate_key = session_uati_from_hrpd_traffic_uati(pending.session_uati);
+    if gates.access_closed {
+        let hardware = gates.hardware_admission(gate_key);
+        if hardware != HrpdHardwareAdmission::Admitted {
+            info!(
+                "HRPD AN: deferring A9 SetupA8 UATI=0x{:08x}; access is closed and the Hardware ID is {hardware:?}",
+                pending.request.uati
+            );
+            return Err(pending);
+        }
+    }
+    match gates.access_auth.get(&gate_key) {
+        Some(HrpdAccessAuthGate::Pending) => {
+            info!(
+                "HRPD AN: deferring A9 SetupA8 UATI=0x{:08x}; waiting for access authentication",
+                pending.request.uati
+            );
+            return Err(pending);
+        }
+        Some(HrpdAccessAuthGate::Settled { imsi: Some(imsi) }) => {
+            let identity = pending.identity.get_or_insert(HrpdA9MobileIdentity {
+                imsi: None,
+                esn: None,
+                meid: None,
+            });
+            if identity.imsi.as_deref() != Some(imsi.as_str()) {
+                info!(
+                    "HRPD AN: A9 MN ID for UATI=0x{:08x} is the A12 IMSI {imsi} (resolved {:?})",
+                    pending.request.uati, identity.imsi
+                );
+                identity.imsi = Some(imsi.clone());
+            }
+        }
+        Some(HrpdAccessAuthGate::Settled { imsi: None }) | None => {}
     }
     if pending
         .identity
@@ -446,6 +647,7 @@ pub async fn spawn_hrpd_an(
         service.clone(),
         channels,
         a9_config,
+        bts_config.evdo.a12.clone(),
         hlr_repo,
         overhead.color_code,
         derived_imsi_config,
@@ -593,6 +795,7 @@ fn spawn_hrpd_air_tasks(
     service: AnServiceImpl,
     channels: HrpdAirChannels,
     a9_config: Option<HrpdA9ClientConfig>,
+    a12_config: Option<A12ClientConfig>,
     hlr_repo: Option<Arc<dyn cdma_hlr::repository::HlrRepository>>,
     color_code: u8,
     derived_imsi_config: HrpdDerivedImsiConfig,
@@ -657,6 +860,7 @@ fn spawn_hrpd_air_tasks(
             Arc::new(Mutex::new(HashSet::new()));
         let (a9_release_tx, a9_release_rx) =
             tokio::sync::mpsc::unbounded_channel::<HrpdA9ReleaseRequest>();
+        let hardware_admissions: SharedHardwareAdmissions = Arc::default();
         let traffic_service = service.clone();
         let traffic_a8_runtime = an_a8_runtime.clone();
         let traffic_forward_tx = forward_tx.clone();
@@ -683,6 +887,8 @@ fn spawn_hrpd_air_tasks(
             traffic_session_a9_config_complete,
             traffic_hlr_repo,
             traffic_derived_imsi_config,
+            a12_config,
+            hardware_admissions.clone(),
         ));
         hrpd_an_access_task(
             service,
@@ -700,6 +906,7 @@ fn spawn_hrpd_air_tasks(
             session_a9_identities,
             session_a9_config_complete,
             a9_release_tx,
+            hardware_admissions,
         )
         .await;
     });
@@ -727,8 +934,14 @@ async fn hrpd_an_traffic_event_task(
     traffic_session_a9_config_complete: Arc<Mutex<HashSet<u32>>>,
     traffic_hlr_repo: Option<Arc<dyn cdma_hlr::repository::HlrRepository>>,
     traffic_derived_imsi_config: HrpdDerivedImsiConfig,
+    a12_config: Option<A12ClientConfig>,
+    hardware_admissions: SharedHardwareAdmissions,
 ) {
     let mut a9_sequence_no = 0u32;
+    let mut gates = HrpdA9Gates::new(hardware_admissions);
+    let mut a12_identifier = 0u8;
+    let (access_auth_verdict_tx, mut access_auth_verdict_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(u32, AaaVerdict)>();
     let mut traffic_open_uatis: HashSet<u32> = HashSet::new();
     let mut default_packet_flow_open_uatis: HashSet<u32> = HashSet::new();
     let mut active_a9_sessions: HashMap<u32, HrpdA9ReleaseContext> = HashMap::new();
@@ -887,6 +1100,12 @@ async fn hrpd_an_traffic_event_task(
                 }
                 outcome
             }
+            verdict = access_auth_verdict_rx.recv() => {
+                let Some((session_uati, verdict)) = verdict else {
+                    continue;
+                };
+                service.handle_access_auth_verdict(session_uati, verdict).await
+            }
             _ = air_timer.tick() => {
                 let outcome = service.handle_air_timer(Instant::now()).await;
                 if outcome == HrpdTrafficOutcome::default() {
@@ -895,11 +1114,86 @@ async fn hrpd_an_traffic_event_task(
                 outcome
             }
         };
+        gates.access_closed = service.access_closed().await;
         if outcome.unknown_session_count > 0 {
             warn!(
                 "HRPD AN: traffic event for {} unknown HRPD session(s)",
                 outcome.unknown_session_count
             );
+        }
+        for session_uati in outcome.access_auth_scheduled {
+            info!(
+                "HRPD AN: access authentication scheduled session_uati=0x{session_uati:08x}; A9 SetupA8 waits for it"
+            );
+            gates.access_auth.insert(
+                session_uati_from_hrpd_traffic_uati(session_uati),
+                HrpdAccessAuthGate::Pending,
+            );
+        }
+        for request in outcome.access_auth_requests {
+            a12_identifier = a12_identifier.wrapping_add(1);
+            dispatch_access_auth_request(
+                request,
+                a12_config.clone(),
+                a12_identifier,
+                access_auth_verdict_tx.clone(),
+            );
+        }
+        let mut access_auth_settled = Vec::new();
+        for settlement in outcome.access_auth_settlements {
+            info!(
+                "HRPD AN: access authentication settled session_uati=0x{:08x} UATI=0x{:08x} result={:?}",
+                settlement.session_uati, settlement.traffic_uati, settlement.result
+            );
+            let key = session_uati_from_hrpd_traffic_uati(settlement.session_uati);
+            gates.access_auth.insert(
+                key,
+                HrpdAccessAuthGate::Settled {
+                    imsi: settlement.result.imsi().map(str::to_string),
+                },
+            );
+            access_auth_settled.push(key);
+        }
+        for key in access_auth_settled {
+            let ready = {
+                let mut sessions = traffic_pending_a9_sessions.lock().await;
+                let uatis: Vec<u32> = sessions
+                    .iter()
+                    .filter(|(_, pending)| {
+                        session_uati_from_hrpd_traffic_uati(pending.session_uati) == key
+                    })
+                    .map(|(uati, _)| *uati)
+                    .collect();
+                uatis
+                    .into_iter()
+                    .filter_map(|uati| sessions.remove(&uati).map(|pending| (uati, pending)))
+                    .collect::<Vec<_>>()
+            };
+            for (uati, pending) in ready {
+                match try_complete_hrpd_a9_setup(
+                    pending,
+                    a9_config,
+                    a9_endpoint.as_ref(),
+                    traffic_a8_runtime.as_ref(),
+                    &traffic_open_uatis,
+                    &default_packet_flow_open_uatis,
+                    &gates,
+                    &mut a9_sequence_no,
+                    "access authentication settled",
+                )
+                .await
+                {
+                    Ok(context) => {
+                        active_a9_sessions.insert(context.a8_key(), context);
+                    }
+                    Err(pending) => {
+                        traffic_pending_a9_sessions
+                            .lock()
+                            .await
+                            .insert(uati, pending);
+                    }
+                }
+            }
         }
         let hardware_id_responses = outcome.hardware_id_responses;
         for uati in outcome.session_configuration_pending_uatis {
@@ -1013,6 +1307,7 @@ async fn hrpd_an_traffic_event_task(
                 traffic_a8_runtime.as_ref(),
                 &traffic_open_uatis,
                 &default_packet_flow_open_uatis,
+                &gates,
                 &mut a9_sequence_no,
                 "TrafficChannelOpen + cached identity/config",
             )
@@ -1110,6 +1405,21 @@ async fn hrpd_an_traffic_event_task(
                 );
                 continue;
             };
+            let resolution = resolve_hrpd_hardware(
+                traffic_hlr_repo.as_ref(),
+                &traffic_derived_imsi_config,
+                &hardware_identity,
+            )
+            .await;
+            apply_hardware_resolution(
+                &service,
+                &gates.hardware,
+                traffic_hlr_repo.as_ref(),
+                hardware.uati,
+                &hardware_identity,
+                &resolution,
+            )
+            .await;
             let pending = {
                 let mut sessions = traffic_pending_a9_sessions.lock().await;
                 sessions.remove(&hardware.uati)
@@ -1121,12 +1431,7 @@ async fn hrpd_an_traffic_event_task(
                 );
                 continue;
             };
-            let identity = resolve_hrpd_a9_identity(
-                traffic_hlr_repo.as_ref(),
-                &traffic_derived_imsi_config,
-                &hardware_identity,
-            )
-            .await;
+            let identity = resolution.identity;
             info!(
                 "HRPD AN: A9 identity for UATI=0x{:08x}: imsi_present={} esn={:?} meid_present={}",
                 hardware.uati,
@@ -1148,6 +1453,7 @@ async fn hrpd_an_traffic_event_task(
                     traffic_a8_runtime.as_ref(),
                     &traffic_open_uatis,
                     &default_packet_flow_open_uatis,
+                    &gates,
                     &mut a9_sequence_no,
                     "HardwareIDResponse + SessionConfigurationComplete",
                 )
@@ -1225,6 +1531,7 @@ async fn hrpd_an_traffic_event_task(
                 traffic_a8_runtime.as_ref(),
                 &traffic_open_uatis,
                 &default_packet_flow_open_uatis,
+                &gates,
                 &mut a9_sequence_no,
                 "SessionConfigurationComplete + identity",
             )
@@ -1264,6 +1571,7 @@ async fn hrpd_an_access_task(
     session_a9_identities: Arc<Mutex<HashMap<u32, HrpdA9MobileIdentity>>>,
     session_a9_config_complete: Arc<Mutex<HashSet<u32>>>,
     a9_release_tx: tokio::sync::mpsc::UnboundedSender<HrpdA9ReleaseRequest>,
+    hardware_admissions: SharedHardwareAdmissions,
 ) {
     let mut hardware_by_uati: HashMap<u32, HrpdHardwareIdentity> = HashMap::new();
     let access_session_a9_identities = session_a9_identities.clone();
@@ -1311,12 +1619,22 @@ async fn hrpd_an_access_task(
                             "HRPD AN: observed HardwareIDResponse UATI=0x{uati:08x} hardware={hardware:?}"
                         );
                         hardware_by_uati.insert(uati, hardware.clone());
-                        let identity = resolve_hrpd_a9_identity(
+                        let resolution = resolve_hrpd_hardware(
                             hlr_repo.as_ref(),
                             &derived_imsi_config,
                             &hardware,
                         )
                         .await;
+                        apply_hardware_resolution(
+                            &service,
+                            &hardware_admissions,
+                            hlr_repo.as_ref(),
+                            uati,
+                            &hardware,
+                            &resolution,
+                        )
+                        .await;
+                        let identity = resolution.identity;
                         info!(
                             "HRPD AN: A9 identity from access HardwareIDResponse UATI=0x{uati:08x}: imsi_present={} esn={:?} meid_present={}",
                             identity.imsi.is_some(),

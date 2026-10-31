@@ -41,9 +41,9 @@
   },
   "events_endpoint": "http://127.0.0.1:17023",
   "a12": {
-    "enabled": false,
+    "enabled": true,
     "listen": "0.0.0.0:1812",
-    "radius_secret": "",
+    "radius_secret": "secret",
     "accept_unverified_chap": true,
     "validate_subscribers": false
   },

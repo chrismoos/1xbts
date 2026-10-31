@@ -60,21 +60,20 @@ pub async fn run_node(config_dir: &Path) -> Result<(), Box<dyn std::error::Error
             .hlr_endpoint
             .as_deref()
         {
-            Some(endpoint) => {
-                match cdma_hlr::repository::GrpcHlrRepository::connect(endpoint.to_string()).await {
-                    Ok(repo) => {
-                        info!("A12 AN-AAA using HLR at {endpoint}");
-                        Some(Arc::new(repo))
-                    }
-                    Err(error) => {
-                        log::warn!(
-                            "A12 AN-AAA HLR connect to {endpoint} failed: {error}; \
-                                 MEID->IMSI lookup disabled"
-                        );
-                        None
-                    }
+            // Lazy, so an HLR that starts after the PDSN is still used.
+            Some(endpoint) => match cdma_hlr::repository::GrpcHlrRepository::connect_lazy(endpoint)
+            {
+                Ok(repo) => {
+                    info!("A12 AN-AAA using HLR at {endpoint}");
+                    Some(Arc::new(repo))
                 }
-            }
+                Err(error) => {
+                    log::warn!(
+                        "A12 AN-AAA HLR endpoint {endpoint} is invalid: {error}; hardware ID lookup disabled"
+                    );
+                    None
+                }
+            },
             None => None,
         };
         let a12 = cdma_a12::A12Server::with_hlr(config.a12.clone(), hlr);

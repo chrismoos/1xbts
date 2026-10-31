@@ -290,13 +290,14 @@ impl BaseStations {
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
-    fn global_challenge(&self) -> bool {
-        self.global_challenge
-            .load(std::sync::atomic::Ordering::Relaxed)
+    fn enroll_request(&self) -> EnrollRequest {
+        EnrollRequest {
+            global_challenge: self
+                .global_challenge
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
     }
 
-    /// Start one attach task per configured node. Each runs until the
-    /// process exits.
     pub fn spawn_attach_tasks(self: &Arc<Self>) {
         let endpoints: Vec<String> = self
             .entries
@@ -548,7 +549,7 @@ async fn attach_once(endpoint: &str, nodes: &Arc<BaseStations>) -> Result<Detach
         .connect()
         .await?;
     let mut client = BaseStationServiceClient::new(channel);
-    let enrolled = enroll(&mut client, nodes.global_challenge()).await?;
+    let enrolled = enroll(&mut client, nodes.enroll_request()).await?;
     nodes.record_enrollment(
         endpoint,
         enrolled.node_id.clone(),
@@ -588,7 +589,7 @@ async fn attach_once(endpoint: &str, nodes: &Arc<BaseStations>) -> Result<Detach
                 None => break "A1 link closed",
             },
             _ = tokio::time::sleep(LIVENESS_POLL) => {
-                match tokio::time::timeout(OAM_REQUEST_TIMEOUT, enroll(&mut client, nodes.global_challenge())).await {
+                match tokio::time::timeout(OAM_REQUEST_TIMEOUT, enroll(&mut client, nodes.enroll_request())).await {
                     Ok(Ok(refreshed)) => nodes.refresh_cells(endpoint, refreshed.cells),
                     Ok(Err(error)) => {
                         warn!("MSC: base station {node} stopped answering its management plane: {error}");
@@ -629,12 +630,9 @@ struct Enrolled {
 
 async fn enroll(
     client: &mut BaseStationServiceClient<tonic::transport::Channel>,
-    global_challenge: bool,
+    request: EnrollRequest,
 ) -> Result<Enrolled, AttachError> {
-    let response = client
-        .enroll(EnrollRequest { global_challenge })
-        .await?
-        .into_inner();
+    let response = client.enroll(request).await?.into_inner();
     if response.node_id.is_empty() {
         return Err("enrollment carried no node id".into());
     }

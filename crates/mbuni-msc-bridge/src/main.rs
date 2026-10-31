@@ -465,6 +465,12 @@ mod tests {
         ) -> Result<Response<msc_management::v1::AuthenticationEventList>, Status> {
             Err(Status::unimplemented(""))
         }
+        async fn list_admission_events(
+            &self,
+            _: Request<msc_management::v1::ListAdmissionEventsRequest>,
+        ) -> Result<Response<msc_management::v1::AdmissionEventList>, Status> {
+            Err(Status::unimplemented(""))
+        }
     }
 
     async fn start_servers() -> (Arc<CapturingMsc>, SocketAddr) {
@@ -527,6 +533,13 @@ mod tests {
                 ) -> Result<Response<msc_management::v1::AuthenticationEventList>, Status>
                 {
                     self.0.list_authentication_events(request).await
+                }
+                async fn list_admission_events(
+                    &self,
+                    request: Request<msc_management::v1::ListAdmissionEventsRequest>,
+                ) -> Result<Response<msc_management::v1::AdmissionEventList>, Status>
+                {
+                    self.0.list_admission_events(request).await
                 }
             }
             let _ = Server::builder()

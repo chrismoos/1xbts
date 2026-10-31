@@ -10,6 +10,73 @@ pub struct MobileSeenUpsert {
     pub previous_last_seen_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobileAdmissionClass {
+    Admitted,
+    Limited,
+    Provisioning,
+    RegistrationOnly,
+    Denied,
+}
+
+impl MobileAdmissionClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::Limited => "limited",
+            Self::Provisioning => "provisioning",
+            Self::RegistrationOnly => "registration_only",
+            Self::Denied => "denied",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "admitted" => Self::Admitted,
+            "limited" => Self::Limited,
+            "provisioning" => Self::Provisioning,
+            "registration_only" => Self::RegistrationOnly,
+            "denied" => Self::Denied,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MobileAdmission {
+    pub class: MobileAdmissionClass,
+    /// Snake-case reason name, empty when none.
+    pub reason: String,
+    pub base_station: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MobileSeen {
+    pub imsi: Option<String>,
+    pub esn: Option<u32>,
+    pub meid: Option<String>,
+    pub mob_p_rev: Option<u8>,
+    pub first_seen_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub admission_class: Option<MobileAdmissionClass>,
+    pub admission_reason: Option<String>,
+    pub admission_at: Option<DateTime<Utc>>,
+    pub admission_base_station: Option<String>,
+    pub denied_count: u32,
+    pub last_denied_at: Option<DateTime<Utc>>,
+    pub last_denial_reason: Option<String>,
+    pub last_denied_base_station: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MobileSeenFilter {
+    #[default]
+    All,
+    CurrentlyDenied,
+    CurrentlyRestricted,
+    EverDenied,
+}
+
 pub const IMSI_LEN: usize = 15;
 pub const MEID_HEX_LEN: usize = 14;
 pub const MAX_PHONE_LEN: usize = 15;
@@ -317,6 +384,8 @@ pub struct SubscriberIdentity {
     pub imsi: Option<String>,
     pub esn: Option<u32>,
     pub meid: Option<String>,
+    /// 15 decimal digits with a valid Luhn check digit.
+    pub imei: Option<String>,
     pub is_primary: bool,
     pub created_at: DateTime<Utc>,
 }
@@ -401,6 +470,36 @@ pub fn normalize_meid(meid: &str) -> Result<String, String> {
     Ok(meid.to_ascii_lowercase())
 }
 
+const IMEI_DIGITS: usize = 15;
+/// An IMEI without its check digit has the MEID's 14-digit length.
+pub const IMEI_MEID_FORM_DIGITS: usize = 14;
+
+/// Validates a 15-digit IMEI, including its Luhn check digit (3GPP TS 23.003 §6.2.1).
+pub fn normalize_imei(imei: &str) -> Result<String, String> {
+    let imei = imei.trim();
+    if imei.len() != IMEI_DIGITS || !imei.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("IMEI must be exactly {IMEI_DIGITS} decimal digits"));
+    }
+    let sum: u32 = imei
+        .bytes()
+        .rev()
+        .enumerate()
+        .map(|(position, byte)| {
+            let digit = u32::from(byte - b'0');
+            if position % 2 == 1 {
+                let doubled = digit * 2;
+                doubled / 10 + doubled % 10
+            } else {
+                digit
+            }
+        })
+        .sum();
+    if sum % 10 != 0 {
+        return Err("IMEI check digit is invalid".to_string());
+    }
+    Ok(imei.to_string())
+}
+
 /// Validates a phone number: 1–15 decimal digits (E.164 max).
 pub fn validate_phone_number(phone_number: &str) -> Result<(), String> {
     if phone_number.is_empty() {
@@ -472,7 +571,21 @@ impl RegistrationState {
 
 #[cfg(test)]
 mod tests {
-    use super::{MobileIdentityKey, normalize_meid, validate_imsi, validate_phone_number};
+
+    #[test]
+    fn imei_requires_fifteen_digits_and_a_valid_check_digit() {
+        assert_eq!(
+            normalize_imei(" 990001242899516 ").as_deref(),
+            Ok("990001242899516")
+        );
+        assert!(normalize_imei("990001242899515").is_err());
+        assert!(normalize_imei("99000124289951").is_err());
+        assert!(normalize_imei("99000124289951a").is_err());
+    }
+
+    use super::{
+        MobileIdentityKey, normalize_imei, normalize_meid, validate_imsi, validate_phone_number,
+    };
 
     #[test]
     fn accepts_exact_15_digit_imsi() {

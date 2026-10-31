@@ -1,14 +1,20 @@
-import { getMscManagementClient, getNetworkManagementClient } from "@/lib/grpc/client";
+import { AdmissionEvent } from "@/lib/proto/events/v1/msc";
+import { latestAdmissionForMobile, type AdmissionVerdict } from "@/lib/admission";
+import { getMscManagementClient, getNetworkManagementClient, grpcErrorStatus } from "@/lib/grpc/client";
 import { getHlrClient, waitForHlrReady } from "@/lib/grpc/hlr-client";
 import type { MobileInfo } from "@/lib/proto/bsc/v1/service";
 import { AccessTechnology, type PacketSessionInfo } from "@/lib/proto/packet/v1/service";
 
 export const dynamic = "force-dynamic";
 
+const ESN_MANUFACTURER_SHIFT = 24;
+const PSEUDO_ESN_MANUFACTURER = 0x80;
+
 interface MobileView {
   address: string;
   pageAddress: string;
   state: string;
+  admission?: AdmissionVerdict;
   baseStation: string;
   baseStations: string[];
   mobPRev: number;
@@ -49,8 +55,22 @@ export async function GET() {
     const mobiles = deduplicateMobiles(results.flatMap((result) =>
       result.status === "fulfilled" ? result.value : [],
     ));
-    await enrichSubscribers(mobiles, abort.signal);
     await enrichPacketSessions(mobiles, abort.signal);
+    await enrichSubscribers(mobiles, abort.signal);
+    try {
+      const snapshot = await getMscManagementClient().listAdmissionEvents(
+        { imsis: [], meid: "", limit: 0, currentOnly: true },
+        { signal: abort.signal },
+      );
+      if (snapshot.currentSnapshot) {
+        const admissions = snapshot.events.map((event) => AdmissionEvent.toJSON(event) as AdmissionVerdict);
+        for (const mobile of mobiles) {
+          mobile.admission = latestAdmissionForMobile(admissions, mobile);
+        }
+      }
+    } catch {
+      // Missing current state must not fall back to an older activity event.
+    }
     console.log(`[mobiles] ok (${mobiles.length} mobiles)`);
     return Response.json(mobiles);
   } catch (error) {
@@ -82,12 +102,12 @@ function toMobileView(mobile: MobileInfo, baseStation: string): MobileView {
 function deduplicateMobiles(mobiles: MobileView[]): MobileView[] {
   const deduplicated = new Map<string, MobileView>();
   for (const mobile of mobiles) {
-    const key = mobile.imsi
-      ? `imsi:${mobile.imsi}`
-      : mobile.meid
-        ? `meid:${mobile.meid}`
-        : mobile.esn != null
-          ? `esn:${mobile.esn}`
+    const key = mobile.meid
+      ? `meid:${mobile.meid.toUpperCase()}`
+      : mobile.esn != null && (mobile.esn >>> ESN_MANUFACTURER_SHIFT) !== PSEUDO_ESN_MANUFACTURER
+        ? `esn:${mobile.esn}`
+        : mobile.imsi
+          ? `imsi:${mobile.imsi}/esn:${mobile.esn ?? ""}`
           : `${mobile.baseStation}:${mobile.address}`;
     const existing = deduplicated.get(key);
     if (!existing) {
@@ -115,11 +135,15 @@ async function enrichSubscribers(mobiles: MobileView[], signal: AbortSignal) {
             { identity: { imsi: mobile.imsi, esn: mobile.esn, meid: mobile.meid } },
             { signal },
           );
-          if (!result.subscriber) return;
-          mobile.phoneNumber = result.subscriber.phoneNumber || undefined;
-          mobile.subscriberId = result.subscriber.subscriberId || undefined;
-          mobile.subscriberDisplayName = result.subscriber.displayName || undefined;
-        } catch {
+          mobile.phoneNumber = result.subscriber?.phoneNumber || undefined;
+          mobile.subscriberId = result.subscriber?.subscriberId || undefined;
+          mobile.subscriberDisplayName = result.subscriber?.displayName || undefined;
+        } catch (error) {
+          if (grpcErrorStatus(error) === 404) {
+            mobile.phoneNumber = undefined;
+            mobile.subscriberId = undefined;
+            mobile.subscriberDisplayName = undefined;
+          }
           return;
         }
       }),

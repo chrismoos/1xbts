@@ -90,6 +90,7 @@ mod tests {
     fn packet(sequence: u32) -> HrpdTrafficEvent {
         HrpdTrafficEvent::Stream1Packet {
             uati: 1,
+            stream_id: 1,
             sequence,
             payload: vec![1],
             decoded_at: None,

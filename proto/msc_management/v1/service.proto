@@ -13,12 +13,7 @@ message CallList {
   repeated string call_ids = 1;
 }
 
-// Submits a mobile-terminated SMS. Exactly one of `destination_number` or
-// `destination_imsi` must be set:
-//   * `destination_number` resolves the target via HLR and addresses by phone
-//     number (subscriber-only path).
-//   * `destination_imsi` sends to the given IMSI directly without an HLR
-//     lookup; used for non-subscriber mobiles seen on the air.
+// Closed mode requires an Active or Suspended subscriber for either destination.
 message SendSmsRequest {
   string originating_number = 1;
   string text = 2;
@@ -75,6 +70,29 @@ message AuthenticationEventList {
   repeated events.v1.AuthenticationEvent events = 1;
 }
 
+message ListAdmissionEventsRequest {
+  // An event matches when its IMSI is listed here, its ESN equals `esn` or
+  // its MEID equals `meid`. With no filter every retained event matches.
+  repeated string imsis = 1;
+  optional uint32 esn = 2;
+  string meid = 3;
+  // Most events to return. Zero returns every retained match.
+  uint32 limit = 4;
+  // Latest decision per handset, independent of activity-history retention.
+  bool current_only = 5;
+}
+
+message AdmissionEventList {
+  repeated events.v1.AdmissionEvent events = 1;
+  // `open` or `closed`.
+  string access_mode = 2;
+  // `subscriber_only` or `any`.
+  string register_policy = 3;
+  // `off`, `monitor` or `enforce`.
+  string authentication_mode = 4;
+  bool current_snapshot = 5;
+}
+
 message InitiateOtaspRequest {
   string subscriber_id = 1;
   // Omit to select the subscriber's primary identity.
@@ -102,4 +120,8 @@ service MscManagementService {
   // Lists recent authentication results for the given mobiles. The MSC keeps
   // the most recent results in memory only, so a restart clears them.
   rpc ListAuthenticationEvents(ListAuthenticationEventsRequest) returns (AuthenticationEventList);
+  // Lists recent admission decisions and the configured access policy. The
+  // MSC keeps the most recent decisions in memory only, so a restart clears
+  // them.
+  rpc ListAdmissionEvents(ListAdmissionEventsRequest) returns (AdmissionEventList);
 }

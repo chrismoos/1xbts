@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { createPortal } from "react-dom";
+import { BaseStationLink } from "@/components/activity-links";
+import { useBaseStations } from "@/lib/use-base-stations";
 import { useEventStream } from "@/lib/use-event-stream";
 import {
   type AuthVerdict,
@@ -65,6 +67,7 @@ export function useAuthenticationVerdicts(
 }
 
 export function AuthenticationActivity({ imsis, esn }: { imsis: string[]; esn?: number }) {
+  const { nodes } = useBaseStations();
   const { events, error } = useAuthenticationVerdicts(imsis, esn);
   const [page, setPage] = useState(0);
   const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
@@ -107,7 +110,7 @@ export function AuthenticationActivity({ imsis, esn }: { imsis: string[]; esn?: 
               <td className={`py-1 pr-3 ${verdict.serviceRejected ? "text-accent-red" : "text-muted"}`}>
                 {verdict.serviceRejected ? "rejected" : "allowed"}
               </td>
-              <td className="py-1 text-muted">{verdict.baseStation || "—"}</td>
+              <td className="py-1 text-muted"><BaseStationLink baseStation={verdict.baseStation} nodes={nodes} /></td>
             </tr>
           ))}
         </tbody>

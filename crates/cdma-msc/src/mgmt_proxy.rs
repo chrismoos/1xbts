@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 
-use log::warn;
+use log::{info, warn};
 use tokio_stream::{Stream, StreamExt, StreamMap};
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
@@ -18,7 +18,6 @@ use tonic::{Request, Response, Status};
 use crate::config::BaseStationConfig;
 use crate::grpc::an::v1::an_service_client::AnServiceClient;
 use crate::grpc::bsc::v1 as bsc;
-use crate::grpc::bsc::v1::bsc_service_client::BscServiceClient;
 use crate::grpc::bsc_management::v1::bsc_management_service_client::BscManagementServiceClient;
 use crate::grpc::bts_management::v1 as bts_mgmt;
 use crate::grpc::bts_management::v1::bts_management_service_client::BtsManagementServiceClient;
@@ -34,6 +33,7 @@ use crate::grpc::pdsn_management::v1 as pdsn_mgmt;
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
 /// Forwards management traffic to base stations and the packet core.
+#[derive(Clone)]
 pub struct NetworkManagement {
     /// Base-station id to a lazily-connected channel to its management gRPC.
     base_stations: HashMap<String, Channel>,
@@ -41,6 +41,7 @@ pub struct NetworkManagement {
     order: Vec<String>,
     /// Lazily-connected channel to the packet core (PDSN) gRPC.
     packet: Channel,
+    control: Option<tokio::sync::mpsc::Sender<crate::management::PendingControlRequest>>,
 }
 
 impl NetworkManagement {
@@ -75,7 +76,16 @@ impl NetworkManagement {
             base_stations,
             order,
             packet,
+            control: None,
         }
+    }
+
+    pub(crate) fn with_control(
+        mut self,
+        control: tokio::sync::mpsc::Sender<crate::management::PendingControlRequest>,
+    ) -> Self {
+        self.control = Some(control);
+        self
     }
 
     /// The channel to the base station a selector names. An absent or empty
@@ -334,10 +344,39 @@ impl NetworkManagementService for NetworkManagement {
         request: Request<mgmt::InitiateDataCallScopedRequest>,
     ) -> Result<Response<bsc::InitiateDataCallResponse>, Status> {
         let req = request.into_inner();
-        let inner = req.request.unwrap_or_default();
-        BscServiceClient::new(self.channel(&req.selector)?)
-            .initiate_data_call(inner)
+        self.channel(&req.selector)?;
+        let inner = req
+            .request
+            .ok_or_else(|| Status::invalid_argument("data call request is required"))?;
+        let subscriber_id = uuid::Uuid::parse_str(&inner.subscriber_id)
+            .map_err(|_| Status::invalid_argument("subscriber_id must be a UUID"))?;
+        let service_option = if inner.service_option == 0 {
+            cdma_common::consts::SERVICE_OPTION_PACKET_DATA_RC3
+        } else {
+            u16::try_from(inner.service_option)
+                .map_err(|_| Status::invalid_argument("invalid data service option"))?
+        };
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("MSC control is unavailable"))?;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        control
+            .send(crate::management::PendingControlRequest::InitiateDataCall {
+                subscriber_id,
+                service_option,
+                response_tx,
+            })
             .await
+            .map_err(|_| Status::unavailable("MSC runtime stopped"))?;
+        let result = response_rx
+            .await
+            .map_err(|_| Status::unavailable("MSC runtime stopped"))?
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(Response::new(bsc::InitiateDataCallResponse {
+            accepted: true,
+            message: format!("call_id={}", result.call_id.0),
+        }))
     }
 
     // Per-selector proxy: HRPD access network (routed behind the BSC)
@@ -513,6 +552,49 @@ impl NetworkManagementService for NetworkManagement {
 }
 
 impl NetworkManagement {
+    /// An access network that cannot be reached keeps its current mode, which
+    /// is closed until it is first set.
+    pub async fn push_hrpd_access_mode(&self, closed: bool) {
+        use crate::grpc::an::v1::{AnAccessMode, SetAccessPolicyRequest};
+        let mode = if closed {
+            AnAccessMode::Closed
+        } else {
+            AnAccessMode::Open
+        };
+        for id in &self.order {
+            let mut bts = BtsManagementServiceClient::new(self.base_stations[id].clone());
+            let cells = match bts.list_bts(()).await {
+                Ok(list) => list.into_inner().bts,
+                Err(error) => {
+                    log::debug!("MSC: cannot list cells on base station {id}: {error}");
+                    continue;
+                }
+            };
+            for cell in cells {
+                let Some(addr) = cell.an_grpc_addr.filter(|addr| !addr.is_empty()) else {
+                    continue;
+                };
+                let result = match an_client(&addr).await {
+                    Ok(mut client) => client
+                        .set_access_policy(SetAccessPolicyRequest { mode: mode as i32 })
+                        .await
+                        .map(|response| response.into_inner().changed),
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(true) => info!(
+                        "MSC: HRPD access network {addr} on base station {id} is now {}",
+                        if closed { "closed" } else { "open" }
+                    ),
+                    Ok(false) => {}
+                    Err(error) => log::debug!(
+                        "MSC: cannot set access mode on HRPD access network {addr}: {error}"
+                    ),
+                }
+            }
+        }
+    }
+
     /// Resolves the HRPD access-network gRPC address for one cell of one base
     /// station by asking the base station for that cell's summary.
     async fn an_addr(
@@ -607,5 +689,48 @@ mod tests {
             "http://127.0.0.1:17021",
         );
         assert!(two.channel(&None).is_err());
+    }
+    #[tokio::test]
+    async fn data_call_management_is_executed_by_the_msc_runtime() {
+        let (control, mut requests) = tokio::sync::mpsc::channel(1);
+        let net = NetworkManagement::new(
+            &[BaseStationConfig {
+                management_endpoint: "http://127.0.0.1:1".into(),
+                id: None,
+            }],
+            "http://127.0.0.1:1",
+        )
+        .with_control(control);
+        let subscriber_id = uuid::Uuid::new_v4();
+        let task = tokio::spawn(async move {
+            net.initiate_data_call(Request::new(mgmt::InitiateDataCallScopedRequest {
+                selector: None,
+                request: Some(bsc::InitiateDataCallRequest {
+                    subscriber_id: subscriber_id.to_string(),
+                    service_option: 0,
+                }),
+            }))
+            .await
+        });
+        match requests.recv().await.unwrap() {
+            crate::management::PendingControlRequest::InitiateDataCall {
+                subscriber_id: received,
+                service_option,
+                response_tx,
+            } => {
+                assert_eq!(received, subscriber_id);
+                assert_eq!(
+                    service_option,
+                    cdma_common::consts::SERVICE_OPTION_PACKET_DATA_RC3
+                );
+                response_tx
+                    .send(Ok(crate::management::InitiateCallAccepted {
+                        call_id: crate::call_control::CallId(1),
+                    }))
+                    .unwrap();
+            }
+            other => panic!("unexpected control request: {other:?}"),
+        }
+        assert!(task.await.unwrap().unwrap().into_inner().accepted);
     }
 }

@@ -1,9 +1,10 @@
 use super::*;
+use cdma_hlr::repository::HlrRepository;
 
 const RESPONSE_WAIT: Duration = Duration::from_secs(1);
 
 #[tokio::test]
-async fn provisioning_page_bypasses_missing_or_invalid_auth_but_voice_does_not() {
+async fn unkeyed_provisioning_page_enrolls_without_proof_but_voice_does_not() {
     for authr in [None, Some(0), Some(1)] {
         for provisioning in [false, true] {
             let hlr = Arc::new(M2mHlrRepo::new());
@@ -90,14 +91,16 @@ async fn provisioning_page_bypasses_missing_or_invalid_auth_but_voice_does_not()
                 .await
                 .unwrap()
                 .unwrap();
+            let assigned = provisioning;
             assert_eq!(
                 reply.message_type(),
-                if provisioning {
+                if assigned {
                     cdma_ios::MessageType::AssignmentRequest
                 } else {
                     cdma_ios::MessageType::ClearCommand
                 }
             );
+            assert!(!runtime.provisioning_challenges.contains_key(&call_id));
             let mut emitted = Vec::new();
             while let Ok(event) = events.try_recv() {
                 emitted.push(event);
@@ -109,7 +112,7 @@ async fn provisioning_page_bypasses_missing_or_invalid_auth_but_voice_does_not()
             assert!(hlr.refreshed_binding.lock().unwrap().is_none());
             assert!(!runtime.pending_ssd_calls.contains(&call_id));
             assert!(!runtime.call_auth_context.contains_key(&call_id));
-            if provisioning {
+            if assigned {
                 assert!(
                     runtime
                         .initiate_otasp(&endpoint, hlr.subscriber_id, None)
@@ -119,6 +122,7 @@ async fn provisioning_page_bypasses_missing_or_invalid_auth_but_voice_does_not()
                 runtime.stop_media_for_call(call_id);
                 assert!(!runtime.pending_otapa_calls.contains_key(&call_id));
                 assert!(!runtime.pending_otasp_originations.contains_key(&call_id));
+                assert!(!runtime.provisioning_challenges.contains_key(&call_id));
             }
         }
     }
@@ -397,6 +401,7 @@ async fn otapa_starts_when_learned_meid_is_not_in_the_subscriber_record() {
             Some(false),
             1,
             &endpoint,
+            None,
         )
         .await;
     let reply = timeout(RESPONSE_WAIT, client.poll_a1())
@@ -404,4 +409,122 @@ async fn otapa_starts_when_learned_meid_is_not_in_the_subscriber_record() {
         .unwrap()
         .unwrap();
     assert_eq!(reply.message_type(), cdma_ios::MessageType::AddsDeliver);
+}
+
+#[tokio::test]
+async fn successful_page_response_replaces_a_previous_denial() {
+    let hlr = Arc::new(M2mHlrRepo::new());
+    let mut runtime = m2m_runtime(hlr.clone());
+    runtime.config.access.mode = crate::admission::AccessMode::Closed;
+    runtime
+        .admission_history
+        .update_current(&crate::grpc::events_proto::v1::AdmissionEvent {
+            imsi: hlr.imsi.into(),
+            esn: Some(AUTH_TEST_ESN),
+            admission_class: crate::grpc::events_proto::v1::AdmissionClass::Denied as i32,
+            ..Default::default()
+        });
+    let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(16);
+    let resolved = hlr
+        .get_subscriber_by_id(hlr.subscriber_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let call_id = runtime
+        .start_mt_call(&endpoint, resolved, None, None)
+        .await
+        .unwrap();
+    let page = client.poll_a1().await.unwrap();
+    let page = PagingRequestMessage::decode(&page.decode().unwrap().payload).unwrap();
+    let mut response = paging_response();
+    response.mobile_identity_imsi = MobileIdentity::Imsi(hlr.imsi.into());
+    response.mobile_identity_esn = Some(MobileIdentity::Esn(AUTH_TEST_ESN));
+    response.tag = page.tag;
+    runtime
+        .handle_bsc_a1_message(
+            &endpoint,
+            &test_node(),
+            EncodedA1Message::from_message_for_call(
+                &cdma_ios::Message::new(
+                    cdma_ios::MessageType::PagingResponse,
+                    response.encode().unwrap(),
+                ),
+                Some(call_id.0),
+            ),
+        )
+        .await;
+    assert_eq!(
+        client.poll_a1().await.unwrap().message_type(),
+        cdma_ios::MessageType::AssignmentRequest
+    );
+    let current = runtime.admission_history.current_matching(
+        &[hlr.imsi.into()],
+        Some(AUTH_TEST_ESN),
+        None,
+        1,
+    );
+    assert_eq!(
+        current[0].admission_class,
+        crate::grpc::events_proto::v1::AdmissionClass::Admitted as i32
+    );
+}
+
+#[tokio::test]
+async fn network_data_call_uses_msc_admission_and_data_assignment() {
+    for disabled_after_page in [false, true] {
+        let hlr = Arc::new(M2mHlrRepo::new());
+        let mut runtime = m2m_runtime(hlr.clone());
+        runtime.config.access.mode = crate::admission::AccessMode::Closed;
+        let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(16);
+        let call_id = runtime
+            .initiate_data_call(&endpoint, hlr.subscriber_id, SERVICE_OPTION_PACKET_DATA_RC3)
+            .await
+            .unwrap()
+            .call_id;
+        let page = client.poll_a1().await.unwrap();
+        assert_eq!(page.message_type(), cdma_ios::MessageType::PagingRequest);
+        let page = PagingRequestMessage::decode(&page.decode().unwrap().payload).unwrap();
+        assert_eq!(
+            page.service_option,
+            Some(ServiceOption(SERVICE_OPTION_PACKET_DATA_RC3))
+        );
+        if disabled_after_page {
+            runtime.config.hlr_repo = Arc::new(StubHlrRepo::default());
+        }
+        let mut response = paging_response();
+        response.mobile_identity_imsi = MobileIdentity::Imsi(hlr.imsi.into());
+        response.mobile_identity_esn = Some(MobileIdentity::Esn(AUTH_TEST_ESN));
+        response.service_option = Some(ServiceOption(SERVICE_OPTION_PACKET_DATA_RC3));
+        response.tag = page.tag;
+        runtime
+            .handle_bsc_a1_message(
+                &endpoint,
+                &test_node(),
+                EncodedA1Message::from_message_for_call(
+                    &cdma_ios::Message::new(
+                        cdma_ios::MessageType::PagingResponse,
+                        response.encode().unwrap(),
+                    ),
+                    Some(call_id.0),
+                ),
+            )
+            .await;
+        let reply = client.poll_a1().await.unwrap();
+        if disabled_after_page {
+            assert_eq!(reply.message_type(), cdma_ios::MessageType::ClearCommand);
+        } else {
+            assert_eq!(
+                reply.message_type(),
+                cdma_ios::MessageType::AssignmentRequest
+            );
+            let assignment =
+                AssignmentRequestMessage::decode(&reply.decode().unwrap().payload).unwrap();
+            assert_eq!(
+                assignment.channel_type.speech_or_data_indicator,
+                ChannelType::SPEECH_OR_DATA_DATA
+            );
+            assert!(assignment.circuit_identity_code.is_none());
+            assert!(assignment.a2p_bearer_session_params.is_none());
+        }
+    }
 }

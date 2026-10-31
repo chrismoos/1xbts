@@ -1,5 +1,6 @@
 //! AN-side consumer for decoded HRPD air-interface events.
 
+mod access_link;
 mod crypto;
 mod session_config;
 mod stream0_codec;
@@ -11,30 +12,32 @@ use std::{
 
 use crate::rlp;
 
+use access_link::AtAccessLink;
 use crypto::{dh_compute_session_key, dh_key_signature, new_dh_key_exchange, random_u16};
 use session_config::*;
 use stream0_codec::*;
 
 use cdma_common::hrpd::air::{
     AccessTerminalIdentifier, AccessTerminalIdentifierType,
-    DEFAULT_ADDRESS_MANAGEMENT_PROTOCOL_TYPE, DEFAULT_CONNECTED_STATE_PROTOCOL_TYPE,
-    DEFAULT_IDLE_STATE_PROTOCOL_TYPE, DEFAULT_ROUTE_UPDATE_PROTOCOL_TYPE,
-    DEFAULT_SESSION_CONFIGURATION_PROTOCOL_TYPE, DEFAULT_SESSION_MANAGEMENT_PROTOCOL_TYPE,
-    DEFAULT_STREAM0_APPLICATION_PROTOCOL_TYPE, HrpdAccessIndication, HrpdAccessMessage,
-    HrpdChannelRecord, HrpdConnectionClose, HrpdConnectionRequest, HrpdDefaultPacketRlpReset,
-    HrpdDefaultPacketRlpResetAck, HrpdDefaultSignalingReset, HrpdDefaultSignalingResetAck,
-    HrpdForwardSignalingRequest, HrpdForwardTrafficPacket, HrpdHardwareIdResponse,
-    HrpdRouteUpdate as AirRouteUpdate, HrpdSessionClose, HrpdTrafficAssignmentRequest,
-    HrpdTrafficChannelAssignment, HrpdTrafficChannelComplete, HrpdTrafficEvent,
-    HrpdTrafficReleaseRequest, HrpdUatiComplete, HrpdUatiRequest, HrpdUatiSubnetAssignment,
-    default_reverse_traffic_long_code_masks, hrpd_connection_close_reason_name,
-    hrpd_protocol_reference_from_more_info, hrpd_session_close_reason_name,
+    CONNECTION_DENY_AUTHENTICATION_OR_BILLING_FAILURE, DEFAULT_ADDRESS_MANAGEMENT_PROTOCOL_TYPE,
+    DEFAULT_CONNECTED_STATE_PROTOCOL_TYPE, DEFAULT_IDLE_STATE_PROTOCOL_TYPE,
+    DEFAULT_ROUTE_UPDATE_PROTOCOL_TYPE, DEFAULT_SESSION_CONFIGURATION_PROTOCOL_TYPE,
+    DEFAULT_SESSION_MANAGEMENT_PROTOCOL_TYPE, DEFAULT_STREAM0_APPLICATION_PROTOCOL_TYPE,
+    HrpdAccessIndication, HrpdAccessMessage, HrpdChannelRecord, HrpdConnectionClose,
+    HrpdConnectionRequest, HrpdDefaultPacketRlpReset, HrpdDefaultPacketRlpResetAck,
+    HrpdDefaultSignalingReset, HrpdDefaultSignalingResetAck, HrpdForwardSignalingRequest,
+    HrpdForwardTrafficPacket, HrpdHardwareIdResponse, HrpdRouteUpdate as AirRouteUpdate,
+    HrpdSessionClose, HrpdTrafficAssignmentRequest, HrpdTrafficChannelAssignment,
+    HrpdTrafficChannelComplete, HrpdTrafficEvent, HrpdTrafficReleaseRequest, HrpdUatiComplete,
+    HrpdUatiRequest, HrpdUatiSubnetAssignment, default_reverse_traffic_long_code_masks,
+    hrpd_connection_close_reason_name, hrpd_protocol_reference_from_more_info,
+    hrpd_session_close_reason_name,
 };
 use cdma_common::hrpd::traffic::{
     DEFAULT_PACKET_STREAM_ID, DEFAULT_PACKET_STREAM1_APPLICATION_PROTOCOL_TYPE,
     DEFAULT_PACKET_STREAM2_APPLICATION_PROTOCOL_TYPE,
     DEFAULT_PACKET_STREAM3_APPLICATION_PROTOCOL_TYPE, MacFlowGrant,
-    default_packet_stream_protocol_type,
+    default_packet_ftc_payload_bits_many_for_mac_subtype, default_packet_stream_protocol_type,
     default_reverse_traffic_mac_grant_ftc_payload_bits_for_mac_subtype,
     default_reverse_traffic_mac_rtc_ack_ftc_payload_bits_for_mac_subtype,
     default_signaling_ftc_payload_bits_with_ack_for_mac_subtype,
@@ -188,6 +191,7 @@ const STREAM0_SLP_RESET_WAIT_ACK_SLOTS: u64 = 240;
 const STREAM0_SLP_RESET_MAX_ATTEMPTS: u32 = 3;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HrpdAccessOutcome {
+    pub connection_denied_uatis: Vec<u32>,
     pub route_updates: Vec<AirRouteUpdate>,
     pub session_outbound: Vec<OutboundSessionMessage>,
     pub forward_signaling: Vec<HrpdForwardSignalingRequest>,
@@ -213,6 +217,7 @@ pub struct HrpdAccessOutcome {
 impl HrpdAccessOutcome {
     fn empty() -> Self {
         Self {
+            connection_denied_uatis: Vec::new(),
             route_updates: Vec::new(),
             session_outbound: Vec::new(),
             forward_signaling: Vec::new(),
@@ -266,6 +271,27 @@ pub struct HrpdDefaultPacketStreamConfiguration {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HrpdAccessAuthStarted {
+    pub session_uati: u32,
+    pub traffic_uati: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HrpdAccessAuthRequest {
+    pub session_uati: u32,
+    pub traffic_uati: u32,
+    pub credentials: crate::access_auth::ChapCredentials,
+    pub hardware_id: Option<HrpdHardwareIdResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HrpdAccessAuthSettlement {
+    pub session_uati: u32,
+    pub traffic_uati: u32,
+    pub result: crate::access_auth::AccessAuthResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HrpdSessionConfigurationCompleteEvent {
     pub uati: u32,
     pub physical_layer_subtype: u16,
@@ -298,6 +324,12 @@ pub struct HrpdTrafficOutcome {
     pub default_packet_flow_closed_uatis: Vec<u32>,
     pub default_packet_data_ready_acks: Vec<HrpdDefaultPacketDataReadyAckEvent>,
     pub default_packet_stream_configurations: Vec<HrpdDefaultPacketStreamConfiguration>,
+    /// Sessions whose access authentication will run on their next ready
+    /// traffic channel. Data setup for them waits for the settlement.
+    pub access_auth_scheduled: Vec<u32>,
+    pub access_auth_started: Vec<HrpdAccessAuthStarted>,
+    pub access_auth_requests: Vec<HrpdAccessAuthRequest>,
+    pub access_auth_settlements: Vec<HrpdAccessAuthSettlement>,
     pub default_packet_rlp_reset_uatis: Vec<u32>,
     pub default_packet_rlp_naks: Vec<HrpdDefaultPacketRlpNakEvent>,
     pub traffic_channel_open_uatis: Vec<u32>,
@@ -611,7 +643,32 @@ struct AtSession {
     committed_session_configuration_response: Option<Vec<u8>>,
     committed_protocol_configuration_responses: HashMap<u8, Vec<u8>>,
     reverse_default_packet_rlp: DefaultPacketRlpReceiver,
+    access: AtAccessLink,
+    hardware_admission: HrpdHardwareAdmission,
+    hardware_subscriber_id: Option<String>,
     last_activity_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HrpdSessionAdmissionView {
+    pub access_closed: bool,
+    pub hardware_admission: HrpdHardwareAdmission,
+    pub subscriber_id: Option<String>,
+    pub access_stream_id: Option<u8>,
+    pub access_auth_state: &'static str,
+    pub access_auth_result: Option<crate::access_auth::AccessAuthResult>,
+    pub access_auth_nai: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum HrpdHardwareAdmission {
+    /// No HardwareIDResponse has been resolved yet.
+    #[default]
+    Unknown,
+    Admitted,
+    Refused {
+        reason: &'static str,
+    },
 }
 
 impl AtSession {
@@ -631,6 +688,9 @@ impl AtSession {
             committed_session_configuration_response: None,
             committed_protocol_configuration_responses: HashMap::new(),
             reverse_default_packet_rlp: DefaultPacketRlpReceiver::default(),
+            access: AtAccessLink::default(),
+            hardware_admission: HrpdHardwareAdmission::Unknown,
+            hardware_subscriber_id: None,
             last_activity_at: now,
         }
     }
@@ -657,6 +717,8 @@ pub struct HrpdAirController {
     // table maps them to a physical packet size.
     last_drc_by_uati: HashMap<u32, u8>,
     default_packet_stream_id: u8,
+    // Starts closed until the MSC sets the access policy.
+    access_closed: bool,
     // Reverse-link SLP-F reassembly state for Stream 0, keyed by traffic UATI.
     // C.S0024-0 §2.6.4.3 requires an independent reassembly buffer per
     // connection endpoint before passing complete payloads up to SLP-D.
@@ -697,6 +759,7 @@ impl HrpdAirController {
             next_mac_index: HRPD_FIRST_TRAFFIC_MAC_INDEX,
             last_drc_by_uati: HashMap::new(),
             default_packet_stream_id: DEFAULT_PACKET_STREAM_ID,
+            access_closed: true,
             stream0_slp_f_rx: HashMap::new(),
             #[cfg(test)]
             test_closed_session: SessionStateMachine::new(color_code),
@@ -706,6 +769,54 @@ impl HrpdAirController {
     fn default_packet_protocol_type(&self) -> u8 {
         default_packet_stream_protocol_type(self.default_packet_stream_id)
             .unwrap_or(DEFAULT_PACKET_STREAM1_APPLICATION_PROTOCOL_TYPE)
+    }
+
+    /// Returns true when the mode changed.
+    pub fn set_access_closed(&mut self, closed: bool) -> bool {
+        let changed = self.access_closed != closed;
+        self.access_closed = closed;
+        changed
+    }
+
+    pub fn access_closed(&self) -> bool {
+        self.access_closed
+    }
+
+    /// Records the HLR verdict for the Hardware ID of the session that owns
+    /// `uati`, a session or traffic UATI.
+    pub fn set_hardware_admission(
+        &mut self,
+        uati: u32,
+        admission: HrpdHardwareAdmission,
+        subscriber_id: Option<String>,
+    ) {
+        let session_uati = if self.ats.contains_key(&uati) {
+            Some(uati)
+        } else {
+            self.session_uati_for_traffic_uati(uati)
+        };
+        match session_uati.and_then(|session_uati| self.ats.get_mut(&session_uati)) {
+            Some(at) => {
+                at.hardware_admission = admission;
+                at.hardware_subscriber_id = subscriber_id;
+            }
+            None => log::info!(
+                "HRPD AN: Hardware ID verdict {admission:?} for unknown UATI=0x{uati:08x}"
+            ),
+        }
+    }
+
+    pub fn session_admission(&self, session_uati: u32) -> Option<HrpdSessionAdmissionView> {
+        let at = self.ats.get(&session_uati)?;
+        Some(HrpdSessionAdmissionView {
+            access_closed: self.access_closed,
+            hardware_admission: at.hardware_admission.clone(),
+            subscriber_id: at.hardware_subscriber_id.clone(),
+            access_stream_id: at.access.stream_id(),
+            access_auth_state: at.access.state_name(),
+            access_auth_result: at.access.result().cloned(),
+            access_auth_nai: at.access.nai().map(str::to_string),
+        })
     }
 
     pub fn session_for_uati(&self, uati: u32) -> Option<&SessionStateMachine> {
@@ -1278,6 +1389,25 @@ impl HrpdAirController {
                                         "HRPD AN: discarding duplicate reliable reverse Stream-0 SLP-D UATI=0x{uati:08x} seq={sequence_number}"
                                     );
                                 }
+                            } else if let Some(message) = &parsed.message
+                                && Self::is_access_stream_protocol(at, parsed.protocol_type)
+                                && matches!(
+                                    message,
+                                    HrpdAccessMessage::DefaultPacketXonRequest
+                                        | HrpdAccessMessage::DefaultPacketXoffRequest
+                                        | HrpdAccessMessage::DefaultPacketDataReadyAck(_)
+                                        | HrpdAccessMessage::DefaultPacketRlpReset(_)
+                                        | HrpdAccessMessage::DefaultPacketRlpResetAck(_)
+                                        | HrpdAccessMessage::DefaultPacketRlpNak(_)
+                                )
+                            {
+                                outcome.decoded_stream0_messages.push(message.clone());
+                                self.handle_access_stream_flow_message(
+                                    at,
+                                    *uati,
+                                    message,
+                                    &mut outcome,
+                                );
                             } else if let Some(message) = &parsed.message {
                                 outcome.decoded_stream0_messages.push(message.clone());
                                 match message {
@@ -1408,10 +1538,11 @@ impl HrpdAirController {
                                     }
                                     HrpdAccessMessage::HardwareIdResponse(hardware) => {
                                         log::info!(
-                                            "HRPD AN: decoded reverse Stream-0 HardwareIdResponse UATI=0x{uati:08x} transaction=0x{:02x} type=0x{:06x} value_len={}",
+                                            "HRPD AN: decoded reverse Stream-0 HardwareIdResponse UATI=0x{uati:08x} transaction=0x{:02x} type=0x{:06x} value_len={} value={}",
                                             hardware.transaction_id,
                                             hardware.hardware_id_type,
-                                            hardware.hardware_id_value.len()
+                                            hardware.hardware_id_value.len(),
+                                            bytes_to_hex(&hardware.hardware_id_value)
                                         );
                                         outcome.hardware_id_responses.push(
                                             HrpdTrafficHardwareIdResponse {
@@ -1593,6 +1724,18 @@ impl HrpdAirController {
                                                     );
                                                 }
                                             }
+                                        } else if protocol_type == SESSION_PROTOCOL_STREAM
+                                            && message_id == Some(SESSION_CONFIGURATION_RESPONSE)
+                                            && Self::access_stream_proposal_pending(at)
+                                        {
+                                            ack_queued = self
+                                                .handle_access_stream_configuration_response(
+                                                    at,
+                                                    *uati,
+                                                    payload,
+                                                    parsed.sequence_number,
+                                                    &mut outcome,
+                                                );
                                         } else {
                                             if let Some(packet) = self
                                                 .handle_stream0_default_packet_message(
@@ -1716,6 +1859,21 @@ impl HrpdAirController {
             }
             HrpdTrafficEvent::Stream1Packet {
                 uati,
+                stream_id,
+                sequence,
+                payload,
+                ..
+            } if at.access.stream_id() == Some(*stream_id) => {
+                if self.is_known_uati(at, *uati) {
+                    outcome.accepted_event_count = 1;
+                    self.handle_access_stream_octets(at, *uati, *sequence, payload, &mut outcome);
+                } else {
+                    outcome.dropped_event_count = 1;
+                    outcome.unknown_session_count = 1;
+                }
+            }
+            HrpdTrafficEvent::Stream1Packet {
+                uati,
                 sequence,
                 payload,
                 ..
@@ -1780,6 +1938,9 @@ impl HrpdAirController {
                     outcome.unknown_session_count = 1;
                 }
             }
+        }
+        if was_present {
+            self.drive_access_auth(&mut at_owned, Instant::now(), &mut outcome);
         }
         // Re-key the AT only if it was a tracked session. A throwaway used for
         // an unknown-UATI drop never enters the map. A SessionClose drops the
@@ -1924,6 +2085,8 @@ impl HrpdAirController {
             self.maybe_expire_session_config_commit_connection_close(&mut at, now, &mut outcome);
             self.maybe_retransmit_reliable_stream0(&mut at, now, &mut outcome);
             self.maybe_expire_pending_traffic_setup(&mut at, now, &mut outcome);
+            self.maybe_expire_access_stream_proposal(&mut at, now, &mut outcome);
+            self.drive_access_auth(&mut at, now, &mut outcome);
             if at.session.session().is_some() {
                 self.ats.insert(session_uati, at);
             }
@@ -2176,6 +2339,34 @@ impl HrpdAirController {
         let uati = session.uati.as_u32();
         let traffic_uati = self.uati_receive_value(uati);
         let receive_ati = self.uati_receive_ati_from_value(traffic_uati);
+        // The connection that configures a new session is let through, since
+        // the HardwareIDResponse usually arrives during it. Data setup is held
+        // separately until the session is admitted.
+        if self.access_closed
+            && at.session_configuration_complete
+            && at.hardware_admission != HrpdHardwareAdmission::Admitted
+        {
+            log::info!(
+                "HRPD AN: ConnectionDeny transaction=0x{:02x} session_uati=0x{uati:08x}; access is closed and the Hardware ID is {:?}",
+                request.transaction_id,
+                at.hardware_admission
+            );
+            outcome
+                .forward_signaling
+                .push(HrpdForwardSignalingRequest::connection_deny(
+                    uati,
+                    receive_ati,
+                    request.transaction_id,
+                    CONNECTION_DENY_AUTHENTICATION_OR_BILLING_FAILURE,
+                ));
+            outcome.connection_denied_uatis.push(uati);
+            // A fresh HardwareIDResponse lets a handset added as a subscriber
+            // since the last lookup through on its next attempt. An earlier
+            // request may never have been answered, so this one replaces it.
+            at.pending_hardware_id = None;
+            self.queue_hardware_id_request(at, outcome);
+            return;
+        }
         let pending_matches_session =
             |pending: &PendingTrafficAssignment| pending.session_uati == uati;
         let active_pending_same_session = at
@@ -3952,6 +4143,7 @@ impl HrpdAirController {
             bytes_to_hex(&attributes)
         );
         if let Some(selection) = default_packet_selection {
+            Self::record_at_stream_configuration(at, &payload[2..], selection.value_id);
             self.default_packet_stream_id = selection.stream_id;
             log::info!(
                 "HRPD AN: negotiated DefaultPacket stream UATI=0x{uati:08x} stream={} protocol=0x{:02x} app_subtype=0x{:04x} value_id=0x{:02x}",
@@ -4398,6 +4590,23 @@ impl HrpdAirController {
         payload: &[u8],
         label: &str,
     ) -> Option<HrpdForwardTrafficPacket> {
+        self.build_default_packet_flow_control_packet_with_protocol(
+            at,
+            uati,
+            self.default_packet_protocol_type(),
+            payload,
+            label,
+        )
+    }
+
+    fn build_default_packet_flow_control_packet_with_protocol(
+        &self,
+        at: &AtSession,
+        uati: u32,
+        protocol_type: u8,
+        payload: &[u8],
+        label: &str,
+    ) -> Option<HrpdForwardTrafficPacket> {
         let pending = at
             .pending_traffic_assignment
             .as_ref()
@@ -4417,7 +4626,7 @@ impl HrpdAirController {
             .unwrap_or(HRPD_DEFAULT_FTC_PHYSICAL_BITS);
         match default_signaling_ftc_payload_bits_with_ack_for_mac_subtype(
             physical_packet_bits,
-            self.default_packet_protocol_type(),
+            protocol_type,
             payload,
             None,
             false,
@@ -4426,7 +4635,7 @@ impl HrpdAirController {
         ) {
             Ok(payload_bits) => {
                 log::info!(
-                    "HRPD AN: queueing FTC DefaultPacket {label} UATI=0x{uati:08x} MAC={mac_index} drc_index=0x{drc_index:x} physical_subtype=0x{:04x} ftc_mac_subtype=0x{:04x} payload_bits={physical_packet_bits}",
+                    "HRPD AN: queueing FTC DefaultPacket {label} UATI=0x{uati:08x} MAC={mac_index} protocol=0x{protocol_type:02x} drc_index=0x{drc_index:x} physical_subtype=0x{:04x} ftc_mac_subtype=0x{:04x} payload_bits={physical_packet_bits}",
                     pending.in_use_physical_layer_subtype,
                     pending.in_use_forward_traffic_mac_subtype,
                 );
@@ -4483,6 +4692,25 @@ impl HrpdAirController {
                         return None;
                     }
                     pending.at_session_config_complete_transaction_id = Some(transaction_id);
+                    if Self::access_stream_proposal_pending(at) {
+                        log::info!(
+                            "HRPD AN: holding AT SessionConfigurationComplete UATI=0x{uati:08x} transaction=0x{transaction_id:02x} until the access stream proposal is answered"
+                        );
+                        return None;
+                    }
+                    if let Some(packet) = Self::maybe_propose_access_stream(
+                        at,
+                        uati,
+                        transaction_id,
+                        drc_index,
+                        ack_sequence_number,
+                    ) {
+                        return Some((packet, false, false));
+                    }
+                    let pending = at
+                        .pending_traffic_assignment
+                        .as_mut()
+                        .filter(|pending| pending.traffic_uati == uati && pending.active)?;
                     let dh_selected = session_config_selected_subtype(
                         pending.session_config_trace.as_ref(),
                         SESSION_PROTOCOL_KEY_EXCHANGE,
@@ -4751,6 +4979,11 @@ impl HrpdAirController {
         let (physical_layer_subtype, forward_traffic_mac_subtype, reverse_traffic_mac_subtype) =
             Self::commit_pending_session_configuration(at, uati)?;
         at.session_configuration_complete = true;
+        if at.access.request_start()
+            && let Some(session_uati) = at.session.session().map(|session| session.uati.as_u32())
+        {
+            outcome.access_auth_scheduled.push(session_uati);
+        }
         outcome.session_configuration_complete_uatis.push(uati);
         outcome.session_configuration_complete_events.push(
             Self::session_configuration_complete_event(
@@ -5630,6 +5863,7 @@ fn traffic_event_uati(event: &HrpdTrafficEvent) -> u32 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedStream0Signaling {
     message: Option<HrpdAccessMessage>,
+    protocol_type: Option<u8>,
     ack_sequence_number: Option<u8>,
     sequence_number: Option<u8>,
     in_configuration: Option<bool>,
@@ -6006,6 +6240,7 @@ mod tests {
 
     fn check_session_configuration_reopen(delivery: ConfigurationCloseDelivery) {
         let mut controller = HrpdAirController::with_sector(26, 0, None);
+        controller.set_access_closed(false);
         let mut allocator = allocator();
         let _ = controller
             .handle_access_indication(
@@ -9936,6 +10171,7 @@ mod tests {
 
         let unknown = controller.handle_traffic_event(&HrpdTrafficEvent::Stream1Packet {
             uati: 0x0005_8002,
+            stream_id: 1,
             sequence: 0,
             payload: vec![0x7e],
             decoded_at: None,
@@ -9946,6 +10182,7 @@ mod tests {
 
         let known = controller.handle_traffic_event(&HrpdTrafficEvent::Stream1Packet {
             uati: 0x1a05_8001,
+            stream_id: 1,
             sequence: 0,
             payload: vec![0x7e, 0xff, 0x03],
             decoded_at: None,
@@ -10029,5 +10266,354 @@ mod tests {
                 window_len: 0x1234,
             }]
         );
+    }
+
+    fn access_stream_frame(protocol: u16, code: u8, id: u8, data: &[u8]) -> Vec<u8> {
+        let mut payload = vec![code, id];
+        payload.extend_from_slice(&((4 + data.len()) as u16).to_be_bytes());
+        payload.extend_from_slice(data);
+        cdma_packet::ppp::framing::frame(&cdma_packet::ppp::framing::PppPacket {
+            protocol,
+            payload,
+        })
+    }
+
+    fn reliable_ack_for(controller: &HrpdAirController, label: &str) -> Vec<u8> {
+        let sequence = controller
+            .pending_traffic_assignment()
+            .unwrap()
+            .reliable_stream0_tx
+            .iter()
+            .find(|packet| packet.label == label)
+            .unwrap_or_else(|| panic!("{label} should await ACK"))
+            .sequence_number;
+        encode_default_signaling_slp_d_ack_packet(sequence)
+    }
+
+    /// Live handsets leave Stream 1 unused. The AN proposes the access stream
+    /// after the AT's ConfigurationComplete, then runs CHAP on it once the
+    /// session configuration commits.
+    #[test]
+    fn access_stream_is_proposed_and_carries_chap_to_an_a12_request() {
+        const LCP: u16 = 0xC021;
+        const CHAP: u16 = 0xC223;
+        let mut controller = HrpdAirController::with_sector(26, 0, None);
+        let mut allocator = allocator();
+        let _ = controller
+            .handle_access_indication(
+                &indication(vec![HrpdAccessMessage::UatiRequest(HrpdUatiRequest {
+                    transaction_id: 0x9c,
+                })]),
+                &mut allocator,
+            )
+            .unwrap();
+        let _ = controller
+            .handle_access_indication(
+                &uati_indication(vec![HrpdAccessMessage::UatiComplete(HrpdUatiComplete {
+                    message_sequence: 0,
+                    upper_old_uati: Vec::new(),
+                    reserved_zero: true,
+                })]),
+                &mut allocator,
+            )
+            .unwrap();
+        let first = controller
+            .handle_access_indication(
+                &uati_indication(vec![HrpdAccessMessage::ConnectionRequest(
+                    HrpdConnectionRequest {
+                        transaction_id: 0x21,
+                        request_reason: 0,
+                        reserved_zero: true,
+                    },
+                )]),
+                &mut allocator,
+            )
+            .unwrap();
+        let traffic = first.traffic_assignments[0].clone();
+        let uati = traffic.uati;
+        let _ = drive_setup_drc(&mut controller, uati, traffic.mac_index, 0, 0xc);
+        let tcc = encode_reliable_default_signaling_packet(
+            DEFAULT_ROUTE_UPDATE_PROTOCOL_TYPE,
+            &[0x02, 0x00],
+            0,
+        );
+        let _ = controller
+            .handle_traffic_event(&HrpdTrafficEvent::Stream0Signaling { uati, payload: tcc });
+        let _ = controller.handle_traffic_event(&HrpdTrafficEvent::Stream0Signaling {
+            uati,
+            payload: vec![0, 1, 0],
+        });
+
+        let mut stream_request = vec![SESSION_CONFIGURATION_REQUEST, 0x01];
+        stream_request.extend_from_slice(&hex_to_bytes(
+            "1c00000000ffff0009ffff010000ffff0005ffff020000ffff0002ffff",
+        ));
+        let _ = controller.handle_traffic_event(&HrpdTrafficEvent::Stream0Signaling {
+            uati,
+            payload: encode_reliable_default_signaling_packet(
+                SESSION_PROTOCOL_STREAM,
+                &stream_request,
+                1,
+            ),
+        });
+        let ack = reliable_ack_for(&controller, "Stream");
+        let _ = controller
+            .handle_traffic_event(&HrpdTrafficEvent::Stream0Signaling { uati, payload: ack });
+
+        let complete = controller.handle_traffic_event(&HrpdTrafficEvent::Stream0Signaling {
+            uati,
+            payload: encode_reliable_default_signaling_packet(
+                DEFAULT_SESSION_CONFIGURATION_PROTOCOL_TYPE,
+                &[SESSION_CONFIGURATION_COMPLETE, 0x12],
+                2,
+            ),
+        });
+        assert_eq!(complete.forward_traffic.len(), 1);
+        let pending = controller.pending_traffic_assignment().unwrap();
+        let proposal = pending
+            .reliable_stream0_tx
+            .iter()
+            .find(|packet| packet.label == "StreamConfigurationRequest")
+            .expect("the AN proposes the access stream");
+        assert_eq!(
+            bytes_to_hex(&proposal.payload),
+            "50010a0000000000010002ffff"
+        );
+        assert!(
+            !pending
+                .reliable_stream0_tx
+                .iter()
+                .any(|packet| packet.label == "SessionConfigurationComplete"),
+            "AN ConfigurationComplete waits for the proposal answer"
+        );
+
+        let accepted = controller.handle_traffic_event(&HrpdTrafficEvent::Stream0Signaling {
+            uati,
+            payload: encode_reliable_default_signaling_packet(
+                SESSION_PROTOCOL_STREAM,
+                &[SESSION_CONFIGURATION_RESPONSE, 0x01, 0x02, 0x00, 0x00],
+                3,
+            ),
+        });
+        assert_eq!(accepted.forward_traffic.len(), 1);
+        let ack = reliable_ack_for(&controller, "SessionConfigurationComplete");
+        let _ = controller
+            .handle_traffic_event(&HrpdTrafficEvent::Stream0Signaling { uati, payload: ack });
+        const CLOSE_REPLY_REASON: u8 = 0x01;
+        let close_reply = HrpdForwardSignalingRequest::connection_close(
+            uati,
+            AccessTerminalIdentifier {
+                ati_type: AccessTerminalIdentifierType::Uati,
+                value: uati,
+            },
+            CLOSE_REPLY_REASON,
+        );
+        let committed = controller.handle_traffic_event(&HrpdTrafficEvent::Stream0Signaling {
+            uati,
+            payload: encode_reliable_default_signaling_packet(
+                close_reply.protocol_type,
+                &close_reply.payload,
+                4,
+            ),
+        });
+        assert_eq!(committed.session_configuration_complete_uatis, vec![uati]);
+        assert_eq!(committed.access_auth_scheduled.len(), 1);
+        let session_uati = committed.access_auth_scheduled[0];
+        assert!(committed.access_auth_started.is_empty());
+        controller.set_hardware_admission(session_uati, HrpdHardwareAdmission::Admitted, None);
+
+        let mut reopen = indication(vec![HrpdAccessMessage::ConnectionRequest(
+            HrpdConnectionRequest {
+                transaction_id: 0x22,
+                request_reason: 0,
+                reserved_zero: true,
+            },
+        )]);
+        reopen.ati = AccessTerminalIdentifier {
+            ati_type: AccessTerminalIdentifierType::Uati,
+            value: uati,
+        };
+        let reopen = controller
+            .handle_access_indication(&reopen, &mut allocator)
+            .unwrap();
+        let traffic = reopen.traffic_assignments[0].clone();
+        let uati = traffic.uati;
+        let _ = drive_setup_drc(&mut controller, uati, traffic.mac_index, 0, 0xc);
+        let tca_sequence = controller
+            .pending_traffic_assignment()
+            .unwrap()
+            .assignment
+            .message_sequence;
+        let tcc = encode_reliable_default_signaling_packet(
+            DEFAULT_ROUTE_UPDATE_PROTOCOL_TYPE,
+            &[0x02, tca_sequence],
+            0,
+        );
+        let _ = controller
+            .handle_traffic_event(&HrpdTrafficEvent::Stream0Signaling { uati, payload: tcc });
+        let started = controller.handle_traffic_event(&HrpdTrafficEvent::Stream0Signaling {
+            uati,
+            payload: vec![0, 1, 0],
+        });
+        assert_eq!(started.access_auth_started.len(), 1);
+        assert_eq!(started.access_auth_started[0].session_uati, session_uati);
+        assert!(
+            started.forward_traffic.len() >= 2,
+            "DataReady and the LCP Configure-Request go out on the access stream"
+        );
+
+        let mut lcp = access_stream_frame(LCP, 1, 7, &[5, 6, 1, 2, 3, 4]);
+        lcp.extend(access_stream_frame(LCP, 2, 1, &[3, 5, 0xc2, 0x23, 5]));
+        let opened = controller.handle_traffic_event(&HrpdTrafficEvent::Stream1Packet {
+            uati,
+            stream_id: 1,
+            sequence: 0,
+            payload: lcp.clone(),
+            decoded_at: None,
+            air_frame_end_received_at: None,
+        });
+        assert_eq!(opened.a8_uplink, Vec::new(), "access octets never reach A8");
+        assert_eq!(
+            opened.forward_traffic.len(),
+            2,
+            "Configure-Ack and CHAP Challenge"
+        );
+
+        let mut response = vec![16];
+        response.extend_from_slice(&[0x5a; 16]);
+        response.extend_from_slice(b"a0000025f07973@hrpd.example");
+        let answered = controller.handle_traffic_event(&HrpdTrafficEvent::Stream1Packet {
+            uati,
+            stream_id: 1,
+            sequence: lcp.len() as u32,
+            payload: access_stream_frame(CHAP, 2, 1, &response),
+            decoded_at: None,
+            air_frame_end_received_at: None,
+        });
+        let request = &answered.access_auth_requests[0];
+        assert_eq!(request.session_uati, session_uati);
+        assert_eq!(request.credentials.nai, "a0000025f07973@hrpd.example");
+        assert_eq!(request.credentials.response, [0x5a; 16]);
+
+        let verdict = controller.handle_access_auth_verdict(
+            session_uati,
+            crate::access_auth::AaaVerdict::Accept {
+                imsi: Some("310550000000042".into()),
+            },
+        );
+        assert_eq!(
+            verdict.forward_traffic.len(),
+            2,
+            "CHAP Success and LCP Terminate"
+        );
+        let settled = controller.handle_traffic_event(&HrpdTrafficEvent::Stream1Packet {
+            uati,
+            stream_id: 1,
+            sequence: (lcp.len() + access_stream_frame(CHAP, 2, 1, &response).len()) as u32,
+            payload: access_stream_frame(LCP, 6, 2, &[]),
+            decoded_at: None,
+            air_frame_end_received_at: None,
+        });
+        assert_eq!(
+            settled.access_auth_settlements[0].result,
+            crate::access_auth::AccessAuthResult::Accepted {
+                imsi: Some("310550000000042".into())
+            }
+        );
+    }
+
+    #[test]
+    fn recording_the_at_stream_configuration_does_not_decide_the_access_stream() {
+        let mut at = AtSession::new(26);
+        HrpdAirController::record_at_stream_configuration(
+            &mut at,
+            &hex_to_bytes("1c00000000ffff0009ffff010000ffff0005ffff020000ffff0002ffff"),
+            0x02,
+        );
+        assert!(at.access.stream_id().is_none());
+    }
+
+    #[test]
+    fn closed_access_denies_reconnect_until_the_hardware_id_is_admitted() {
+        let mut controller = HrpdAirController::with_sector(26, 0, None);
+        let mut allocator = allocator();
+        let _ = controller
+            .handle_access_indication(
+                &indication(vec![HrpdAccessMessage::UatiRequest(HrpdUatiRequest {
+                    transaction_id: 0x9c,
+                })]),
+                &mut allocator,
+            )
+            .unwrap();
+        let _ = controller
+            .handle_access_indication(
+                &uati_indication(vec![HrpdAccessMessage::UatiComplete(HrpdUatiComplete {
+                    message_sequence: 0,
+                    upper_old_uati: Vec::new(),
+                    reserved_zero: true,
+                })]),
+                &mut allocator,
+            )
+            .unwrap();
+        let session_uati = *controller.ats.keys().next().unwrap();
+        controller
+            .ats
+            .get_mut(&session_uati)
+            .unwrap()
+            .session_configuration_complete = true;
+        let connect = |controller: &mut HrpdAirController, allocator: &mut UatiAllocator, txn| {
+            controller
+                .handle_access_indication(
+                    &uati_indication(vec![HrpdAccessMessage::ConnectionRequest(
+                        HrpdConnectionRequest {
+                            transaction_id: txn,
+                            request_reason: 0,
+                            reserved_zero: true,
+                        },
+                    )]),
+                    allocator,
+                )
+                .unwrap()
+        };
+
+        let denied = connect(&mut controller, &mut allocator, 0x31);
+        assert!(denied.traffic_assignments.is_empty());
+        assert_eq!(denied.connection_denied_uatis, vec![session_uati]);
+        let deny = denied
+            .forward_signaling
+            .iter()
+            .find(|request| request.protocol_type == DEFAULT_IDLE_STATE_PROTOCOL_TYPE)
+            .expect("ConnectionDeny");
+        assert_eq!(deny.payload, vec![0x02, 0x31, 0x20]);
+        assert!(
+            denied
+                .forward_signaling
+                .iter()
+                .any(|request| request.protocol_type == DEFAULT_ADDRESS_MANAGEMENT_PROTOCOL_TYPE),
+            "each denial asks for a fresh HardwareIDResponse"
+        );
+
+        controller.set_hardware_admission(
+            session_uati,
+            HrpdHardwareAdmission::Refused {
+                reason: "not_a_subscriber",
+            },
+            None,
+        );
+        assert!(
+            connect(&mut controller, &mut allocator, 0x32)
+                .traffic_assignments
+                .is_empty()
+        );
+
+        controller.set_hardware_admission(session_uati, HrpdHardwareAdmission::Admitted, None);
+        let admitted = connect(&mut controller, &mut allocator, 0x33);
+        assert_eq!(admitted.traffic_assignments.len(), 1);
+        assert!(admitted.connection_denied_uatis.is_empty());
+
+        let mut open = HrpdAirController::with_sector(26, 0, None);
+        assert!(open.access_closed());
+        assert!(open.set_access_closed(false));
+        assert!(!open.set_access_closed(false));
     }
 }

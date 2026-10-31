@@ -42,8 +42,9 @@ use cdma_common::hrpd::{
     traffic::{
         DEFAULT_PACKET_STREAM_ID, DEFAULT_PACKET_STREAM2_ID, TrafficFrameError,
         parse_connection_layer_packets, parse_default_packet_rlp_packet_bits,
-        parse_reverse_stream1_packets, parse_reverse_traffic_mac_packet_for_subtype,
-        parse_stream_layer_packet_bytes, physical_crc24,
+        parse_reverse_default_packet_streams_for_subtype,
+        parse_reverse_traffic_mac_packet_for_subtype, parse_stream_layer_packet_bytes,
+        physical_crc24,
     },
 };
 
@@ -461,6 +462,7 @@ pub fn traffic_events_from_mac_packet_for_reverse_mac_subtype(
                 if !packet.payload.is_empty() {
                     out.push(HrpdTrafficEvent::Stream1Packet {
                         uati,
+                        stream_id: stream.stream_id,
                         sequence: packet.sequence,
                         payload: packet.payload,
                         decoded_at: Some(std::time::Instant::now()),
@@ -486,17 +488,21 @@ pub fn stream1_events_from_mac_packet(
     _mac_index: u8,
     mac_packet_bits: &[u8],
 ) -> Result<Vec<HrpdTrafficEvent>, TrafficFrameError> {
-    Ok(parse_reverse_stream1_packets(mac_packet_bits)?
-        .into_iter()
-        .filter(|packet| !packet.payload.is_empty())
-        .map(|packet| HrpdTrafficEvent::Stream1Packet {
-            uati,
-            sequence: packet.sequence,
-            payload: packet.payload,
-            decoded_at: Some(std::time::Instant::now()),
-            air_frame_end_received_at: None,
-        })
-        .collect())
+    Ok(parse_reverse_default_packet_streams_for_subtype(
+        mac_packet_bits,
+        cdma_common::hrpd::traffic::REVERSE_TRAFFIC_MAC_SUBTYPE_DEFAULT,
+    )?
+    .into_iter()
+    .filter(|(_, packet)| !packet.payload.is_empty())
+    .map(|(stream_id, packet)| HrpdTrafficEvent::Stream1Packet {
+        uati,
+        stream_id,
+        sequence: packet.sequence,
+        payload: packet.payload,
+        decoded_at: Some(std::time::Instant::now()),
+        air_frame_end_received_at: None,
+    })
+    .collect())
 }
 
 /// Decoded reverse-data PHY frame. `crc_ok` is only true after the physical
@@ -1325,6 +1331,7 @@ mod tests {
             &events[0],
             HrpdTrafficEvent::Stream1Packet {
                 uati: 0x8005_8001,
+                stream_id: 1,
                 sequence: 0x1f_f001,
                 payload,
                 decoded_at: Some(_),
@@ -1354,6 +1361,7 @@ mod tests {
             &events[0],
             HrpdTrafficEvent::Stream1Packet {
                 uati: 0x8005_8001,
+                stream_id: 2,
                 sequence: 0x1f_f002,
                 payload,
                 decoded_at: Some(_),
@@ -1404,6 +1412,7 @@ mod tests {
             &events[0],
             HrpdTrafficEvent::Stream1Packet {
                 uati: 0x8005_8001,
+                stream_id: 1,
                 sequence: 0x22_1100,
                 payload,
                 decoded_at: Some(_),

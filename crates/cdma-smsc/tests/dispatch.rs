@@ -174,7 +174,7 @@ impl HlrRepository for OneSubscriber {
         &self,
         _: Option<u32>,
         _: Option<&str>,
-    ) -> Result<Option<ResolvedSubscriber>, String> {
+    ) -> Result<Option<ResolvedSubscriber>, cdma_hlr::repository::HardwareLookupError> {
         unimplemented!("resolve_by_hardware_identity is not part of these tests")
     }
 

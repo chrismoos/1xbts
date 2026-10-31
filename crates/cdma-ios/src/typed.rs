@@ -672,11 +672,21 @@ impl LocationAreaIdentification {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RejectCause(pub u8);
 
+/// A.S0014-D Table 4.2.34-1 Reject Cause values.
+pub const REJECT_CAUSE_IMSI_UNKNOWN_IN_HLR: u8 = 0x02;
+pub const REJECT_CAUSE_ILLEGAL_MS: u8 = 0x03;
+pub const REJECT_CAUSE_ROAMING_NOT_ALLOWED: u8 = 0x0b;
+pub const REJECT_CAUSE_NETWORK_FAILURE: u8 = 0x51;
+pub const REJECT_CAUSE_CONGESTION: u8 = 0x56;
+
 impl RejectCause {
-    /// Encodes the reject-cause payload.
     pub fn encode(self) -> Result<u8> {
         match self.0 {
-            0x03 | 0x0b | 0x51 | 0x56 => Ok(self.0),
+            REJECT_CAUSE_IMSI_UNKNOWN_IN_HLR
+            | REJECT_CAUSE_ILLEGAL_MS
+            | REJECT_CAUSE_ROAMING_NOT_ALLOWED
+            | REJECT_CAUSE_NETWORK_FAILURE
+            | REJECT_CAUSE_CONGESTION => Ok(self.0),
             _ => Err(Error::InvalidValue {
                 context: "Reject Cause",
                 reason: "value is not allowed for Location Updating Reject",
@@ -684,7 +694,6 @@ impl RejectCause {
         }
     }
 
-    /// Decodes the reject-cause payload.
     pub fn decode(input: u8) -> Result<Self> {
         Self(input).encode()?;
         Ok(Self(input))

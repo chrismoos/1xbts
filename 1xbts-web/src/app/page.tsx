@@ -4,6 +4,7 @@ import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { Card, Stat } from "@/components/card";
 import { HrpdSummaryCard } from "@/components/hrpd-summary-card";
+import { AccessSummaryCard } from "@/components/access-summary-card";
 import { useBaseStations } from "@/lib/use-base-stations";
 import { attachStateLabel, cellLabel } from "@/lib/cell";
 import { radioConfigPairName } from "@/lib/radio-config";
@@ -469,6 +470,8 @@ export default function DashboardPage() {
             </Link>
           </div>
         </Card>
+
+        <AccessSummaryCard />
 
         <Card title="SMSC">
           {smsRecent.length > 0 ? (

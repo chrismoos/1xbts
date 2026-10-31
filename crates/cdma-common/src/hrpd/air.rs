@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
 pub const DEFAULT_IDLE_STATE_PROTOCOL_TYPE: u8 = 0x0c;
+pub const CONNECTION_DENY_MESSAGE_ID: u8 = 0x02;
+/// C.S0024-400-C Table 1.4.6.2-2 DenyReason "Authentication or billing failure".
+pub const CONNECTION_DENY_AUTHENTICATION_OR_BILLING_FAILURE: u8 = 0x2;
 pub const DEFAULT_CONNECTED_STATE_PROTOCOL_TYPE: u8 = 0x0d;
 pub const DEFAULT_ROUTE_UPDATE_PROTOCOL_TYPE: u8 = 0x0e;
 pub const DEFAULT_SESSION_MANAGEMENT_PROTOCOL_TYPE: u8 = 0x10;
@@ -732,6 +735,29 @@ impl HrpdForwardSignalingRequest {
         }
     }
 
+    /// Idle State Protocol ConnectionDeny (C.S0024-400-C §1.4.6.2.3). The
+    /// 4-bit DenyReason fills the high nibble of the third octet.
+    pub fn connection_deny(
+        uati: u32,
+        target_ati: AccessTerminalIdentifier,
+        transaction_id: u8,
+        deny_reason: u8,
+    ) -> Self {
+        Self {
+            uati: Some(uati),
+            target_ati,
+            protocol_type: DEFAULT_IDLE_STATE_PROTOCOL_TYPE,
+            payload: vec![
+                CONNECTION_DENY_MESSAGE_ID,
+                transaction_id,
+                (deny_reason & 0x0f) << 4,
+            ],
+            channel: HrpdForwardChannel::AsynchronousControl,
+            reliable_sequence: None,
+            synchronous_control_cycle: None,
+        }
+    }
+
     pub fn hardware_id_request(
         uati: u32,
         target_ati: AccessTerminalIdentifier,
@@ -885,6 +911,8 @@ pub enum HrpdTrafficEvent {
     },
     Stream1Packet {
         uati: u32,
+        /// Stream Layer StreamID (C.S0024 §6.2) the packet arrived on.
+        stream_id: u8,
         /// Default Packet RLP sequence number of the first payload octet.
         sequence: u32,
         payload: Vec<u8>,

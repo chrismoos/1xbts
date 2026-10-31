@@ -916,6 +916,19 @@ pub fn parse_reverse_stream1_packets_for_subtype(
     mac_packet_bits: &[u8],
     reverse_traffic_mac_subtype: u16,
 ) -> Result<Vec<HrpdDefaultPacketRlpPacket>, TrafficFrameError> {
+    Ok(parse_reverse_default_packet_streams_for_subtype(
+        mac_packet_bits,
+        reverse_traffic_mac_subtype,
+    )?
+    .into_iter()
+    .map(|(_, packet)| packet)
+    .collect())
+}
+
+pub fn parse_reverse_default_packet_streams_for_subtype(
+    mac_packet_bits: &[u8],
+    reverse_traffic_mac_subtype: u16,
+) -> Result<Vec<(u8, HrpdDefaultPacketRlpPacket)>, TrafficFrameError> {
     let mac =
         parse_reverse_traffic_mac_packet_for_subtype(mac_packet_bits, reverse_traffic_mac_subtype)?;
     let mut out = Vec::new();
@@ -924,9 +937,10 @@ pub fn parse_reverse_stream1_packets_for_subtype(
     {
         let stream = parse_stream_layer_packet_bytes(&session_packet)?;
         if default_packet_stream_protocol_type(stream.stream_id).is_some() {
-            out.push(parse_default_packet_rlp_packet_bits(
-                &stream.application_packet_bits,
-            )?);
+            out.push((
+                stream.stream_id,
+                parse_default_packet_rlp_packet_bits(&stream.application_packet_bits)?,
+            ));
         }
     }
     Ok(out)

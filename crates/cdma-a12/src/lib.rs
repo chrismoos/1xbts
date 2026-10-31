@@ -1,3 +1,5 @@
+pub mod client;
+
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -20,6 +22,8 @@ const CHAP_CHALLENGE: u8 = 60;
 const VENDOR_3GPP2: u32 = 5535;
 const VSA_HRPD_ACCESS_AUTH: u8 = 60;
 const VSA_HARDWARE_ID: u8 = 61;
+const ESN_HEX_DIGITS: usize = 8;
+const MEID_HEX_DIGITS: usize = 14;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct A12Config {
@@ -94,15 +98,29 @@ impl A12Server {
             return None;
         }
         let attrs = parse_attributes(&wire[HEADER_LEN..]).ok()?;
-        let meid = attrs.nai.as_deref().and_then(nai_meid)?;
-        match hlr.resolve_by_hardware_identity(None, Some(&meid)).await {
+        let (esn, meid) = match attrs.hardware_id.as_deref() {
+            Some(id) if id.len() == ESN_HEX_DIGITS => (u32::from_str_radix(id, 16).ok(), None),
+            Some(id) if id.len() == MEID_HEX_DIGITS => (None, Some(id.to_string())),
+            _ => (None, attrs.nai.as_deref().and_then(nai_meid)),
+        };
+        if esn.is_none() && meid.is_none() {
+            return None;
+        }
+        let label = meid
+            .clone()
+            .or_else(|| esn.map(|esn| format!("{esn:08x}")))
+            .unwrap_or_default();
+        match hlr
+            .resolve_by_hrpd_hardware_identity(esn, meid.as_deref())
+            .await
+        {
             Ok(Some(resolved)) => resolved.primary_identity.and_then(|identity| identity.imsi),
             Ok(None) => {
-                log::info!("A12 HLR has no subscriber for MEID {meid}");
+                log::info!("A12 HLR has no subscriber for hardware ID {label}");
                 None
             }
             Err(error) => {
-                log::warn!("A12 HLR resolution for MEID {meid} failed: {error}");
+                log::warn!("A12 HLR resolution for hardware ID {label} failed: {error}");
                 None
             }
         }

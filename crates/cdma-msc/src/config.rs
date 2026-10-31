@@ -593,6 +593,8 @@ pub struct MscNodeConfig {
     pub otasp: OtaspConfig,
     #[serde(default)]
     pub authentication: crate::authentication::AuthenticationConfig,
+    #[serde(default)]
+    pub access: crate::admission::AccessConfig,
 }
 
 impl MscNodeConfig {
@@ -704,6 +706,7 @@ mod tests {
             sms_retry: SmsRetryConfig::default(),
             otasp: OtaspConfig::default(),
             authentication: Default::default(),
+            access: Default::default(),
         }
     }
 

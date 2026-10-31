@@ -15,6 +15,7 @@ import {
   IMSI_DIGITS,
   PHONE_MAX_DIGITS,
   validateImsi,
+  validateImei,
   validateMeid,
   validatePhoneNumber,
 } from "@/lib/validation";
@@ -24,6 +25,7 @@ type FieldErrors = {
   imsi?: string;
   esn?: string;
   meid?: string;
+  imei?: string;
   form?: string;
 };
 
@@ -76,10 +78,36 @@ export default function SubscribersPage() {
   const [esnHex, setEsnHex] = useState("");
   const [imsi, setImsi] = useState("");
   const [meid, setMeid] = useState("");
+  const [imei, setImei] = useState("");
   const [numberType, setNumberType] = useState<NumberType>(DEFAULT_NUMBER_TYPE);
   const [numberPlan, setNumberPlan] = useState<NumberPlan>(DEFAULT_NUMBER_PLAN);
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
   const [submitting, setSubmitting] = useState(false);
+  const [observed, setObserved] = useState<{ esn?: string; imsi?: string; meid?: string }>({});
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("new") !== "1") return;
+    const seen = {
+      esn: params.get("esn") ?? undefined,
+      imsi: params.get("imsi") ?? undefined,
+      meid: params.get("meid") ?? undefined,
+    };
+    setShowForm(true);
+    if (seen.esn) setEsnHex(seen.esn);
+    if (seen.imsi) setImsi(seen.imsi);
+    if (seen.meid) setMeid(seen.meid);
+    setObserved(seen);
+  }, []);
+
+  const observedPill = (field: "esn" | "imsi" | "meid", value: string) =>
+    observed[field] && observed[field] === value ? (
+      <span className="ml-2 text-[10.5px] font-semibold px-1.5 rounded-full bg-badge-blue-bg text-badge-blue-text">
+        observed
+      </span>
+    ) : null;
+  const observedInput = (field: "esn" | "imsi" | "meid", value: string) =>
+    observed[field] && observed[field] === value ? " border-accent-indigo/60 bg-active" : "";
 
   const clearFieldError = (field: keyof FieldErrors) =>
     setFieldErrors((prev) => {
@@ -131,6 +159,7 @@ export default function SubscribersPage() {
       const normalizedEsn = esnHex.trim();
       const normalizedImsi = imsi.trim();
       const normalizedMeid = meid.trim().toLowerCase();
+      const normalizedImei = imei.trim();
       const errors: FieldErrors = {};
 
       const phoneCheck = validatePhoneNumber(normalizedPhoneNumber);
@@ -150,6 +179,11 @@ export default function SubscribersPage() {
       if (normalizedMeid) {
         const meidCheck = validateMeid(normalizedMeid);
         if (!meidCheck.ok) errors.meid = meidCheck.error;
+      }
+
+      if (normalizedImei) {
+        const imeiCheck = validateImei(normalizedImei);
+        if (!imeiCheck.ok) errors.imei = imeiCheck.error;
       }
 
       if (!errors.esn && !errors.imsi && !errors.meid) {
@@ -174,6 +208,7 @@ export default function SubscribersPage() {
       if (esnValue !== undefined) body.esn = esnValue;
       if (normalizedImsi) body.imsi = normalizedImsi;
       if (normalizedMeid) body.meid = normalizedMeid;
+      if (normalizedImei) body.imei = normalizedImei;
 
       const res = await fetch("/api/subscribers", {
         method: "POST",
@@ -200,6 +235,7 @@ export default function SubscribersPage() {
       setEsnHex("");
       setImsi("");
       setMeid("");
+      setImei("");
       setNumberType(DEFAULT_NUMBER_TYPE);
       setNumberPlan(DEFAULT_NUMBER_PLAN);
       setShowForm(false);
@@ -286,6 +322,7 @@ export default function SubscribersPage() {
               <div>
                 <label className="block text-xs text-muted mb-1" htmlFor="new-esn">
                   ESN (hex)
+                  {observedPill("esn", esnHex)}
                 </label>
                 <input
                   id="new-esn"
@@ -299,7 +336,7 @@ export default function SubscribersPage() {
                   maxLength={8}
                   aria-invalid={!!fieldErrors.esn}
                   aria-describedby={fieldErrors.esn ? "new-esn-error" : undefined}
-                  className="w-full glass-input font-mono"
+                  className={`w-full glass-input font-mono${observedInput("esn", esnHex)}`}
                 />
                 {fieldErrors.esn && (
                   <p id="new-esn-error" className="text-accent-red text-xs mt-1">
@@ -311,6 +348,7 @@ export default function SubscribersPage() {
                 <div className="flex items-end justify-between mb-1">
                   <label className="block text-xs text-muted" htmlFor="new-imsi">
                     IMSI
+                    {observedPill("imsi", imsi)}
                   </label>
                   <ImsiGenerateButton
                     phoneNumber={phoneNumber}
@@ -333,7 +371,7 @@ export default function SubscribersPage() {
                   placeholder="123456789012345"
                   aria-invalid={!!fieldErrors.imsi}
                   aria-describedby={fieldErrors.imsi ? "new-imsi-error" : undefined}
-                  className="w-full glass-input font-mono"
+                  className={`w-full glass-input font-mono${observedInput("imsi", imsi)}`}
                 />
                 {fieldErrors.imsi && (
                   <p id="new-imsi-error" className="text-accent-red text-xs mt-1">
@@ -344,6 +382,7 @@ export default function SubscribersPage() {
               <div>
                 <label className="block text-xs text-muted mb-1" htmlFor="new-meid">
                   MEID (hex)
+                  {observedPill("meid", meid)}
                 </label>
                 <input
                   id="new-meid"
@@ -357,11 +396,36 @@ export default function SubscribersPage() {
                   maxLength={14}
                   aria-invalid={!!fieldErrors.meid}
                   aria-describedby={fieldErrors.meid ? "new-meid-error" : undefined}
-                  className="w-full glass-input font-mono"
+                  className={`w-full glass-input font-mono${observedInput("meid", meid)}`}
                 />
                 {fieldErrors.meid && (
                   <p id="new-meid-error" className="text-accent-red text-xs mt-1">
                     {fieldErrors.meid}
+                  </p>
+                )}
+              </div>
+              <div>
+                <label className="block text-xs text-muted mb-1" htmlFor="new-imei">
+                  IMEI (optional)
+                </label>
+                <input
+                  id="new-imei"
+                  type="text"
+                  inputMode="numeric"
+                  value={imei}
+                  onChange={(e) => {
+                    setImei(e.target.value);
+                    clearFieldError("imei");
+                  }}
+                  placeholder="990001242899516"
+                  maxLength={15}
+                  aria-invalid={!!fieldErrors.imei}
+                  aria-describedby={fieldErrors.imei ? "new-imei-error" : undefined}
+                  className="w-full glass-input font-mono"
+                />
+                {fieldErrors.imei && (
+                  <p id="new-imei-error" className="text-accent-red text-xs mt-1">
+                    {fieldErrors.imei}
                   </p>
                 )}
               </div>

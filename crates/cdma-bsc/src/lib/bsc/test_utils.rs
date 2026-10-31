@@ -15,6 +15,7 @@ use super::{Bsc, SmsRequest};
 pub struct AutoAssignmentMscClient {
     inbound_tx: mpsc::Sender<EncodedA1Message>,
     inbound_rx: tokio::sync::Mutex<mpsc::Receiver<EncodedA1Message>>,
+    accept_registrations: bool,
 }
 
 impl AutoAssignmentMscClient {
@@ -23,6 +24,14 @@ impl AutoAssignmentMscClient {
         Self {
             inbound_tx,
             inbound_rx: tokio::sync::Mutex::new(inbound_rx),
+            accept_registrations: true,
+        }
+    }
+
+    pub fn without_registration_accept() -> Self {
+        Self {
+            accept_registrations: false,
+            ..Self::new()
         }
     }
 }
@@ -38,12 +47,34 @@ impl MscClient for AutoAssignmentMscClient {
     async fn send_a1(&self, message: EncodedA1Message) -> Result<(), cdma_ios::A1TransportError> {
         if message.message_type() == cdma_ios::MessageType::CompleteLayer3Information {
             let call_id = message.call_id();
-            let requested_service_option = message
-                .decode()
-                .ok()
-                .and_then(|decoded| {
-                    cdma_ios::CompleteLayer3InformationMessage::decode(&decoded.payload).ok()
-                })
+            let cl3i = message.decode().ok().and_then(|decoded| {
+                cdma_ios::CompleteLayer3InformationMessage::decode(&decoded.payload).ok()
+            });
+            if cl3i.as_ref().is_some_and(|cl3i| {
+                cl3i.layer3_information
+                    .decode_location_updating_request()
+                    .is_ok()
+            }) {
+                if !self.accept_registrations {
+                    return Ok(());
+                }
+                let accept = cdma_ios::LocationUpdatingAcceptMessage {
+                    location_area_identification: None,
+                };
+                let encoded = EncodedA1Message::from_message_for_call(
+                    &cdma_ios::Message::new(
+                        cdma_ios::MessageType::LocationUpdatingAccept,
+                        accept.encode().map_err(cdma_ios::A1TransportError::Codec)?,
+                    ),
+                    call_id,
+                );
+                return self
+                    .inbound_tx
+                    .send(encoded)
+                    .await
+                    .map_err(|_| cdma_ios::A1TransportError::Closed);
+            }
+            let requested_service_option = cl3i
                 .and_then(|cli3| cli3.layer3_information.decode_cm_service_request().ok())
                 .and_then(|request| request.service_option)
                 .unwrap_or(cdma_ios::ServiceOption(SERVICE_OPTION_BASIC_VOICE));
@@ -288,7 +319,7 @@ impl HlrRepository for LoopbackHlrRepository {
         &self,
         _: Option<u32>,
         _: Option<&str>,
-    ) -> Result<Option<ResolvedSubscriber>, String> {
+    ) -> Result<Option<ResolvedSubscriber>, cdma_hlr::repository::HardwareLookupError> {
         Ok(Some(self.resolved()))
     }
     async fn upsert_mobile_seen(

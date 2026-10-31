@@ -1,10 +1,4 @@
-//! `cdma-msc` — MSC node crate.
-//!
-//! This crate owns MSC-side circuit/session policy above the BSC radio-access
-//! domain. Track-B work starts by defining the MSC-side call-control state and
-//! the media-gateway abstraction that replaces direct BSC ownership of voice
-//! orchestration.
-
+pub mod admission;
 pub mod authentication;
 pub mod base_station;
 pub mod call_control;

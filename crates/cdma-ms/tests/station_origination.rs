@@ -7,7 +7,7 @@ use cdma_ms::engine::EngineConfig;
 use cdma_ms::event::{ChannelSink, EventSink};
 use cdma_ms::ms::MsEvent;
 use cdma_ms::station::MobileStation;
-use cdma_ms::tx::{MsAccessIdentity, SERVICE_OPTION_SMS};
+use cdma_ms::tx::{MsAccessIdentity, SCM_MEID_SUPPORT, SERVICE_OPTION_SMS};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn appliance_originates_and_is_granted_an_rc3_channel() {
@@ -19,9 +19,12 @@ async fn appliance_originates_and_is_granted_an_rc3_channel() {
     let ms = MobileStation::start(
         Box::new(radio),
         EngineConfig {
+            // The engine answers Status Request only on a traffic channel, so it
+            // cannot answer the BSC's MEID query on the paging channel.
             identity: MsAccessIdentity {
                 esn,
                 imsi_s: 1234567890,
+                scm: MsAccessIdentity::default().scm & !SCM_MEID_SUPPORT,
                 ..Default::default()
             },
             sample_rate_hz: support::SAMPLE_RATE_HZ as f64,

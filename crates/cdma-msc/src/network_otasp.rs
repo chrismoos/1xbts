@@ -7,10 +7,6 @@ use crate::call_control::CallDirection;
 use crate::management::{InitiateCallAccepted, ManagementError, MtCallPlan};
 use crate::runtime::{MscRuntime, PagePurpose};
 
-/// C.S0072 §2.1.1.1 reserves manufacturer code 0x80 for non-unique pseudo-ESNs.
-const PSEUDO_ESN_PREFIX: u32 = 0x80;
-const ESN_MANUFACTURER_SHIFT: u32 = 24;
-
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) enum ProvisioningIdentity {
     Meid(String),
@@ -22,9 +18,7 @@ impl ProvisioningIdentity {
     pub(crate) fn from_parts(imsi: &str, esn: Option<u32>, meid: Option<&str>) -> Self {
         if let Some(meid) = meid {
             Self::Meid(meid.to_ascii_uppercase())
-        } else if let Some(esn) =
-            esn.filter(|esn| esn >> ESN_MANUFACTURER_SHIFT != PSEUDO_ESN_PREFIX)
-        {
+        } else if let Some(esn) = esn.filter(|esn| !crate::admission::is_pseudo_esn(*esn)) {
             Self::Esn(esn)
         } else {
             Self::Imsi(imsi.to_string())

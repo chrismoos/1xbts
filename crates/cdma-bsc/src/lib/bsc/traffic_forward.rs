@@ -6,7 +6,7 @@ use cdma_common::access::{
     SERVICE_RESPONSE_PURPOSE_REJECT, ServiceConfigRecord, ServiceResponseMessage,
 };
 use cdma_common::channel::TrafficRate;
-use cdma_common::consts::SERVICE_OPTION_PACKET_DATA_RC3;
+use cdma_common::consts::{SERVICE_OPTION_OTASP, SERVICE_OPTION_PACKET_DATA_RC3};
 use cdma_common::error::Error;
 use cdma_common::lac::{
     MessageControlStatusBlock,
@@ -33,6 +33,18 @@ use super::{AccessCellId, Bsc, MsState, VOICE_TRAFFIC_CON_REF, VOICE_TRAFFIC_SR_
 const FSCH_ESCAM_START_DELAY_FRAMES: u64 = 12;
 const MULTIPLEX_OPTION_RATE_SET_1: u16 = 0x0001;
 const MULTIPLEX_OPTION_RATE_SET_2: u16 = 0x0002;
+const TRAFFIC_TYPE_NONE: u8 = 0;
+const TRAFFIC_TYPE_PRIMARY: u8 = 1;
+
+/// C.S0016-C Table 3.2.2.2-1 requires no primary user traffic for SO18.
+fn service_traffic_type(service_option: u16) -> u8 {
+    if service_option == SERVICE_OPTION_OTASP {
+        TRAFFIC_TYPE_NONE
+    } else {
+        TRAFFIC_TYPE_PRIMARY
+    }
+}
+
 // C.S0017-0-2.10 RLP Type 3 BLOB:
 // type=1, version=3, RTT=0 (perform SYNC), INIT_VAR=1, NAK rounds 3/3, one NAK per round.
 const SO33_RLP3_SYNC_BLOB: [u8; 5] = [0x2c, 0x2d, 0x92, 0x49, 0x20];
@@ -102,8 +114,8 @@ impl Bsc {
                 return Ok(vec![ServiceConnectConnectionRecord {
                     con_ref: tc.voice_connection_ref.unwrap_or(VOICE_TRAFFIC_CON_REF),
                     service_option: voice_so,
-                    for_traffic: 1,
-                    rev_traffic: 1,
+                    for_traffic: service_traffic_type(voice_so),
+                    rev_traffic: service_traffic_type(voice_so),
                     ui_encrypt_mode: 0,
                     sr_id: tc.voice_service_ref_id.unwrap_or(VOICE_TRAFFIC_SR_ID),
                     rlp_info_incl: false,
@@ -117,8 +129,8 @@ impl Bsc {
         connections.push(ServiceConnectConnectionRecord {
             con_ref: 0,
             service_option: tc.service_option,
-            for_traffic: 1,
-            rev_traffic: 1,
+            for_traffic: service_traffic_type(tc.service_option),
+            rev_traffic: service_traffic_type(tc.service_option),
             ui_encrypt_mode: 0,
             sr_id: tc.service_ref_id,
             rlp_info_incl: rlp_blob.is_some(),
@@ -131,8 +143,8 @@ impl Bsc {
                 connections.push(ServiceConnectConnectionRecord {
                     con_ref: tc.voice_connection_ref.unwrap_or(VOICE_TRAFFIC_CON_REF),
                     service_option: voice_so,
-                    for_traffic: 1,
-                    rev_traffic: 1,
+                    for_traffic: service_traffic_type(voice_so),
+                    rev_traffic: service_traffic_type(voice_so),
                     ui_encrypt_mode: 0,
                     sr_id: tc.voice_service_ref_id.unwrap_or(VOICE_TRAFFIC_SR_ID),
                     rlp_info_incl: false,
@@ -246,6 +258,9 @@ impl Bsc {
         walsh_code: u8,
     ) -> Option<ForSchConfig> {
         let tc = self.mobiles.get_traffic_channel(cell, walsh_code)?;
+        if tc.voice_service_option.is_some() {
+            return None;
+        }
         let ms = self.mobiles.get_by_walsh(cell, walsh_code)?;
         if !crate::addressing::ms_eligible_for_fsch_phase1(
             self.config.traffic_assignment.enable_f_sch,

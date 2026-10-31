@@ -1,5 +1,6 @@
 # HEAD
 
+- Added closed access mode (defaults to open) to allow system access for subscribers only (1x and EVDO).
 - Fix issue on Femtocells where DST not applied properly. Add optional per-site `timezone` override in `config/femto.json`.
 - Fixed the cdma-ms softphone clock reading an hour fast under daylight saving time.
 - Added network-initiated OTASP provisioning from subscriber and mobile pages.

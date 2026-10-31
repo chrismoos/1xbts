@@ -221,8 +221,6 @@ impl OtaspCoordinator {
         }
     }
 
-    /// Returns `true` when this tag is OTASP-allocated. The MSC runtime
-    /// uses this to route inbound `AddsDeliverAck` messages.
     pub fn owns_ack_tag(&self, tag: u32) -> bool {
         self.pending_acks.contains_key(&tag)
     }
@@ -356,7 +354,7 @@ impl OtaspCoordinator {
         origination_verified: Option<bool>,
         call_id: u64,
         a1: &dyn MscA1Endpoint,
-    ) {
+    ) -> bool {
         self.begin_session_with_initiation(
             crate::otasp::session::SessionInitiation::User,
             device,
@@ -366,10 +364,13 @@ impl OtaspCoordinator {
             origination_verified,
             call_id,
             a1,
+            None,
         )
-        .await;
+        .await
     }
 
+    /// Starts a session. Returns false when no session started, so the caller
+    /// must release the call.
     pub async fn begin_session_with_initiation(
         &mut self,
         initiation: crate::otasp::session::SessionInitiation,
@@ -380,19 +381,38 @@ impl OtaspCoordinator {
         origination_verified: Option<bool>,
         call_id: u64,
         a1: &dyn MscA1Endpoint,
-    ) {
-        let mut hlr_lookup = self
-            .hlr
-            .resolve_by_hardware_identity(
-                if device.meid.is_some() {
-                    None
-                } else {
-                    device.esn
-                },
-                device.meid.as_deref(),
-            )
-            .await;
-        if matches!(hlr_lookup, Ok(None))
+        target: Option<(Uuid, cdma_hlr::model::MobileIdentityKey)>,
+    ) -> bool {
+        let mut hlr_lookup = match &target {
+            Some((subscriber_id, _)) => match self.hlr.get_subscriber_by_id(*subscriber_id).await {
+                Ok(Some(resolved)) => Ok(Some(resolved)),
+                Ok(None) => Err(format!(
+                    "authorized subscriber {subscriber_id} no longer exists"
+                )),
+                Err(error) => Err(error),
+            },
+            None => self
+                .hlr
+                .resolve_by_hardware_identity(
+                    if device.meid.is_some() {
+                        None
+                    } else {
+                        device.esn
+                    },
+                    device.meid.as_deref(),
+                )
+                .await
+                .map_err(|error| error.to_string()),
+        };
+        if target.is_some() && hlr_lookup.is_err() {
+            warn!(
+                "OTASP: session for call_id={call_id} not started: {}",
+                hlr_lookup.err().unwrap_or_default()
+            );
+            return false;
+        }
+        if target.is_none()
+            && matches!(hlr_lookup, Ok(None))
             && let cdma_ios::MobileIdentity::Imsi(imsi) = &mobile_identity_for_deliver
             && let Ok(identity) = cdma_hlr::model::MobileIdentityKey::from_parts(
                 Some(imsi.as_str()),
@@ -438,18 +458,21 @@ impl OtaspCoordinator {
             .as_ref()
             .map(|h| h.imsi.clone())
             .filter(|imsi| !imsi.is_empty());
-        let identity = cdma_hlr::model::MobileIdentityKey::from_parts(
-            imsi.as_deref(),
-            device.esn,
-            device.meid.as_deref(),
-        )
-        .ok();
+        let identity = match target {
+            Some((_, identity)) => Some(identity),
+            None => cdma_hlr::model::MobileIdentityKey::from_parts(
+                imsi.as_deref(),
+                device.esn,
+                device.meid.as_deref(),
+            )
+            .ok(),
+        };
         let key = match (&device.esn, &device.meid) {
             (_, Some(m)) => SessionKey::Meid(m.to_ascii_lowercase()),
             (Some(e), None) => SessionKey::Esn(*e),
             (None, None) => {
                 warn!("OTASP: begin_session with no hardware identity — dropped");
-                return;
+                return false;
             }
         };
         let mut session = OtaspSession::new(
@@ -518,9 +541,9 @@ impl OtaspCoordinator {
         );
         self.persist_network_progress(record_id).await;
         info!("OTASP: session started for device {:?}", device);
+        true
     }
 
-    /// Open a new history record for the leading `SessionStart` and return its id.
     /// Falls back to a fresh record with no events if the session driver did
     /// not produce a SessionStart (defensive — shouldn't happen).
     fn record_session_start(

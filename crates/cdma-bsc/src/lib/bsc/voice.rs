@@ -949,7 +949,7 @@ impl Bsc {
                 .any(|pending| pending.a1_call_id == a1_call_id)
         {
             info!(
-                "BSC: ignoring duplicate Paging Request while legacy traffic release is pending call_id={:?}",
+                "BSC: ignoring duplicate Paging Request while traffic release is pending call_id={:?}",
                 a1_call_id
             );
             return;
@@ -987,7 +987,10 @@ impl Bsc {
             called_number: None,
         });
         if let Some((packet_traffic, service_negotiated, already_releasing)) = traffic_context {
-            let release_before_page = legacy_traffic || (packet_traffic && !service_negotiated);
+            let release_before_page = legacy_traffic
+                || (packet_traffic
+                    && (!service_negotiated
+                        || service_option == cdma_common::consts::SERVICE_OPTION_OTASP));
             if release_before_page {
                 if self.voice.has_deferred_page_for_address(fwd_address) {
                     warn!(
@@ -1010,7 +1013,7 @@ impl Bsc {
                         imsi,
                     });
                 info!(
-                    "BSC: releasing unusable traffic channel before MT page for session={} legacy={} packet={} negotiated={}",
+                    "BSC: releasing traffic channel before MT page for session={} legacy={} packet={} negotiated={}",
                     session_id, legacy_traffic, packet_traffic, service_negotiated
                 );
                 if !already_releasing {
@@ -1092,7 +1095,7 @@ impl Bsc {
         };
         let pending = self.voice.deferred_pages_after_release.remove(index);
         info!(
-            "BSC: traffic release complete; paging pre-IS-2000 mobile for session={}",
+            "BSC: traffic release complete; paging mobile for session={}",
             pending.session_id
         );
         self.queue_voice_page_for_mobile(

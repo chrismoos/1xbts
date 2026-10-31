@@ -1,5 +1,6 @@
 "use client";
 
+import { HrpdAdmissionCard } from "@/components/hrpd-admission";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
@@ -485,6 +486,8 @@ export default function HrpdSessionPage() {
           <p className="text-muted text-sm">Session not found.</p>
         )}
       </Card>
+
+      <HrpdAdmissionCard admission={session?.admission} />
 
       {packetSession && (
         <Card title="Packet Data">

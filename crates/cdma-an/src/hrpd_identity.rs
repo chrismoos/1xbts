@@ -64,11 +64,35 @@ pub fn hardware_identity_from_response(
     }
 }
 
+/// C.S0072 pseudo-ESN manufacturer code: shared by many handsets, so it does
+/// not identify one.
+const PSEUDO_ESN_MANUFACTURER_CODE: u32 = 0x80;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HrpdHardwareResolution {
+    pub identity: HrpdA9MobileIdentity,
+    pub admission: crate::air::HrpdHardwareAdmission,
+    pub subscriber_id: Option<String>,
+}
+
 pub async fn resolve_hrpd_a9_identity(
     hlr_repo: Option<&Arc<dyn cdma_hlr::repository::HlrRepository>>,
     derived_imsi_config: &HrpdDerivedImsiConfig,
     hardware: &HrpdHardwareIdentity,
 ) -> HrpdA9MobileIdentity {
+    resolve_hrpd_hardware(hlr_repo, derived_imsi_config, hardware)
+        .await
+        .identity
+}
+
+pub async fn resolve_hrpd_hardware(
+    hlr_repo: Option<&Arc<dyn cdma_hlr::repository::HlrRepository>>,
+    derived_imsi_config: &HrpdDerivedImsiConfig,
+    hardware: &HrpdHardwareIdentity,
+) -> HrpdHardwareResolution {
+    use crate::air::HrpdHardwareAdmission;
+    use cdma_hlr::model::SubscriberStatus;
+
     let mut identity = match hardware {
         HrpdHardwareIdentity::Esn(esn) => HrpdA9MobileIdentity {
             imsi: None,
@@ -81,44 +105,80 @@ pub async fn resolve_hrpd_a9_identity(
             meid: Some(*meid),
         },
     };
-
-    let Some(hlr_repo) = hlr_repo else {
-        identity.imsi = Some(derive_hrpd_imsi(derived_imsi_config, hardware));
-        info!(
-            "HRPD AN bridge: derived IMSI-format MN ID for hardware identity {hardware:?}; \
-             no HLR repository is configured, and A12/AN-AAA, roaming/VLR, or an authenticated \
-             subscriber database should provide the authoritative MN ID when available"
-        );
-        return identity;
-    };
-    let (esn, meid_hex) = match hardware {
-        HrpdHardwareIdentity::Esn(esn) => (Some(*esn), None),
-        HrpdHardwareIdentity::Meid(meid) => (None, Some(hex_lower(&meid.0))),
-    };
-    match hlr_repo
-        .resolve_by_hardware_identity(esn, meid_hex.as_deref())
-        .await
-    {
-        Ok(Some(resolved)) => {
-            if let Some(primary) = resolved.primary_identity {
-                identity.imsi = primary.imsi;
-                if identity.esn.is_none() {
-                    identity.esn = primary.esn;
-                }
-                if identity.meid.is_none() {
-                    if let Some(meid) = primary.meid.as_deref() {
-                        if let Some(parsed) = meid_from_hex(meid) {
+    let mut subscriber_id = None;
+    let admission = match hlr_repo {
+        None => HrpdHardwareAdmission::Refused {
+            reason: "hlr_error",
+        },
+        Some(hlr_repo) => {
+            let (esn, meid_hex) = match hardware {
+                HrpdHardwareIdentity::Esn(esn) => (Some(*esn), None),
+                HrpdHardwareIdentity::Meid(meid) => (None, Some(hex_lower(&meid.0))),
+            };
+            match hlr_repo
+                .resolve_by_hrpd_hardware_identity(esn, meid_hex.as_deref())
+                .await
+            {
+                Ok(Some(resolved)) => {
+                    subscriber_id = Some(resolved.subscriber.subscriber_id.to_string());
+                    let status = resolved.subscriber.status.clone();
+                    if let Some(primary) = resolved.primary_identity {
+                        identity.imsi = primary.imsi;
+                        if identity.esn.is_none() {
+                            identity.esn = primary.esn;
+                        }
+                        if identity.meid.is_none()
+                            && let Some(parsed) = primary.meid.as_deref().and_then(meid_from_hex)
+                        {
                             identity.meid = Some(parsed);
                         }
+                    }
+                    match status {
+                        SubscriberStatus::Active => HrpdHardwareAdmission::Admitted,
+                        SubscriberStatus::Suspended => HrpdHardwareAdmission::Refused {
+                            reason: "subscriber_suspended",
+                        },
+                        SubscriberStatus::Disabled => HrpdHardwareAdmission::Refused {
+                            reason: "subscriber_disabled",
+                        },
+                    }
+                }
+                Ok(None) => {
+                    warn!(
+                        "HRPD AN bridge: HLR has no subscriber for hardware identity {hardware:?}"
+                    );
+                    HrpdHardwareAdmission::Refused {
+                        reason: "not_a_subscriber",
+                    }
+                }
+                Err(cdma_hlr::repository::HardwareLookupError::Ambiguous) => {
+                    warn!(
+                        "HRPD AN bridge: hardware identity {hardware:?} matches more than one subscriber"
+                    );
+                    HrpdHardwareAdmission::Refused {
+                        reason: "ambiguous_identity",
+                    }
+                }
+                Err(err) => {
+                    warn!("HRPD AN bridge: HLR hardware identity resolution failed: {err}");
+                    HrpdHardwareAdmission::Refused {
+                        reason: "hlr_error",
                     }
                 }
             }
         }
-        Ok(None) => {
-            warn!("HRPD AN bridge: HLR has no subscriber for hardware identity {hardware:?}");
+    };
+    let admission = match hardware {
+        HrpdHardwareIdentity::Esn(esn)
+            if esn >> 24 == PSEUDO_ESN_MANUFACTURER_CODE
+                && admission == HrpdHardwareAdmission::Admitted =>
+        {
+            HrpdHardwareAdmission::Refused {
+                reason: "pseudo_esn",
+            }
         }
-        Err(err) => warn!("HRPD AN bridge: HLR hardware identity resolution failed: {err}"),
-    }
+        _ => admission,
+    };
     if identity.imsi.is_none() {
         identity.imsi = Some(derive_hrpd_imsi(derived_imsi_config, hardware));
         info!(
@@ -127,7 +187,11 @@ pub async fn resolve_hrpd_a9_identity(
              the authoritative MN ID when available"
         );
     }
-    identity
+    HrpdHardwareResolution {
+        identity,
+        admission,
+        subscriber_id,
+    }
 }
 
 pub fn derive_hrpd_imsi(config: &HrpdDerivedImsiConfig, hardware: &HrpdHardwareIdentity) -> String {
@@ -307,7 +371,7 @@ mod tests {
             &self,
             esn: Option<u32>,
             meid: Option<&str>,
-        ) -> Result<Option<ResolvedSubscriber>, String> {
+        ) -> Result<Option<ResolvedSubscriber>, cdma_hlr::repository::HardwareLookupError> {
             assert_eq!(esn, None);
             assert_eq!(meid, Some("35512606023434"));
             self.resolve_by_hardware_calls
@@ -462,5 +526,34 @@ mod tests {
             identity.meid,
             Some(cdma_a9::Meid([0x35, 0x51, 0x26, 0x06, 0x02, 0x34, 0x34]))
         );
+    }
+
+    #[tokio::test]
+    async fn hardware_verdict_refuses_an_unknown_handset_and_a_missing_hlr() {
+        let hlr_repo: Arc<dyn HlrRepository> = Arc::new(HardwareMissRepo::default());
+        let config = HrpdDerivedImsiConfig {
+            mcc: "310".to_string(),
+            imsi_11_12: "55".to_string(),
+        };
+        let hardware =
+            HrpdHardwareIdentity::Meid(cdma_a9::Meid([0x35, 0x51, 0x26, 0x06, 0x02, 0x34, 0x34]));
+
+        let miss = resolve_hrpd_hardware(Some(&hlr_repo), &config, &hardware).await;
+        assert_eq!(
+            miss.admission,
+            crate::air::HrpdHardwareAdmission::Refused {
+                reason: "not_a_subscriber"
+            }
+        );
+        assert_eq!(miss.subscriber_id, None);
+
+        let no_hlr = resolve_hrpd_hardware(None, &config, &hardware).await;
+        assert_eq!(
+            no_hlr.admission,
+            crate::air::HrpdHardwareAdmission::Refused {
+                reason: "hlr_error"
+            }
+        );
+        assert_eq!(no_hlr.identity.imsi.as_deref(), Some("310556898017332"));
     }
 }

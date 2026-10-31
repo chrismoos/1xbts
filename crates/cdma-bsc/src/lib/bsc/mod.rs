@@ -116,6 +116,8 @@ pub(crate) const DEFAULT_TRAFFIC_ACK_SEQ: u8 = 0b111;
 /// Shared code for forward and reverse acknowledgment orders.
 pub(crate) const ACKNOWLEDGMENT_ORDER_CODE: u8 = 0b010000;
 pub(crate) const RELEASE_ORDER_CODE: u8 = 0b010101;
+/// C.S0005-E Table 3.7.4-1 Intercept Order.
+pub(crate) const INTERCEPT_ORDER_CODE: u8 = 0b001001;
 /// Release Order qualifier for a rejected requested service option.
 pub(crate) const RELEASE_ORDER_SERVICE_OPTION_REJECTED_QUALIFIER: u8 = 0b00000010;
 pub(crate) const TRAFFIC_MSG_SEQ_MASK: u8 = 0b111;

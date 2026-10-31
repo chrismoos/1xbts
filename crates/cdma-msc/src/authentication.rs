@@ -726,6 +726,8 @@ pub(crate) struct TrafficAuthentication {
     pending: std::collections::VecDeque<TrafficProcedure>,
     pub awaiting: Option<TrafficAwaiting>,
     pub deadline: tokio::time::Instant,
+    /// A failed or unanswered unique challenge clears the call in every mode.
+    strict: bool,
 }
 
 /// RANDU is 24 bits (C.S0005-E §2.3.12.1.4).
@@ -783,7 +785,20 @@ impl TrafficAuthentication {
             pending,
             awaiting: None,
             deadline: tokio::time::Instant::now(),
+            strict: false,
         })
+    }
+
+    /// A unique challenge that must pass before a provisioning session starts.
+    pub(crate) fn provisioning_challenge(context: CallAuthContext, base_station: String) -> Self {
+        Self {
+            context,
+            base_station,
+            pending: std::collections::VecDeque::from([TrafficProcedure::UniqueChallenge]),
+            awaiting: None,
+            deadline: tokio::time::Instant::now(),
+            strict: true,
+        }
     }
 
     /// An SSD update alone, for OTASP A-key provisioning (C.S0016-D §3.3.2).
@@ -794,6 +809,7 @@ impl TrafficAuthentication {
             pending: std::collections::VecDeque::from([TrafficProcedure::SsdUpdate]),
             awaiting: None,
             deadline: tokio::time::Instant::now(),
+            strict: false,
         }
     }
 
@@ -987,11 +1003,12 @@ impl TrafficAuthentication {
             return TrafficAction::Done;
         };
         self.awaiting = None;
+        let strict = self.strict;
         let report = |result: events_proto::AuthenticationResult| TrafficAction::Report {
             procedure: events_proto::AuthenticationProcedure::UniqueChallenge,
             result,
             clear_call: result != events_proto::AuthenticationResult::Success
-                && config.mode == AuthenticationMode::Enforce,
+                && (strict || config.mode == AuthenticationMode::Enforce),
         };
         let Some((imsi_s1, imsi_s2)) = self.context.imsi_s() else {
             return report(events_proto::AuthenticationResult::ParametersMissing);
@@ -1067,7 +1084,7 @@ impl TrafficAuthentication {
         TrafficAction::Report {
             procedure: awaiting.procedure(),
             result: events_proto::AuthenticationResult::Timeout,
-            clear_call: false,
+            clear_call: self.strict,
         }
     }
 }

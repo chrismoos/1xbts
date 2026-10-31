@@ -8,6 +8,7 @@ message MscNetworkEvent {
   oneof event {
     OtaspEvent otasp = 1;
     AuthenticationEvent authentication = 2;
+    AdmissionEvent admission = 3;
   }
 }
 
@@ -78,6 +79,70 @@ message AuthenticationEvent {
   optional uint32 auth_data = 10;
   AuthDataSource auth_data_source = 11;
   optional uint32 count = 12;
+}
+
+enum AdmissionClass {
+  ADMISSION_CLASS_UNSPECIFIED = 0;
+  // An Active subscriber matched by IMSI with ESN or MEID. All service.
+  ADMISSION_CLASS_ADMITTED = 1;
+  // A Suspended subscriber. Registers and receives SMS, no calls or data.
+  ADMISSION_CLASS_LIMITED = 2;
+  // Hardware uniquely matches an Active subscriber whose IMSI differs from
+  // the one the mobile presented. Registers and may run OTASP only.
+  ADMISSION_CLASS_PROVISIONING = 3;
+  // An unknown mobile under `register_policy = any`. Registers only.
+  ADMISSION_CLASS_REGISTRATION_ONLY = 4;
+  ADMISSION_CLASS_DENIED = 5;
+}
+
+enum AdmissionReason {
+  ADMISSION_REASON_UNSPECIFIED = 0;
+  ADMISSION_REASON_NOT_A_SUBSCRIBER = 1;
+  ADMISSION_REASON_SUBSCRIBER_SUSPENDED = 2;
+  ADMISSION_REASON_SUBSCRIBER_DISABLED = 3;
+  ADMISSION_REASON_HARDWARE_STAGED = 4;
+  ADMISSION_REASON_HLR_ERROR = 5;
+  ADMISSION_REASON_SERVICE_NOT_ALLOWED = 6;
+  ADMISSION_REASON_REGISTRATION_POLICY_ANY = 7;
+  ADMISSION_REASON_IDENTITY_CONFLICT = 8;
+  ADMISSION_REASON_AMBIGUOUS_IDENTITY = 9;
+  // The subscriber holds an A-key the MSC cannot verify, because no SSD is
+  // established. An ordinary call runs the SSD update that recovers it.
+  ADMISSION_REASON_AUTHENTICATION_RECOVERY_REQUIRED = 10;
+  // Provisioning of a subscriber with an A-key requires a valid
+  // authentication signature from the mobile.
+  ADMISSION_REASON_AUTHENTICATION_REQUIRED = 11;
+}
+
+enum AdmissionService {
+  ADMISSION_SERVICE_UNSPECIFIED = 0;
+  ADMISSION_SERVICE_REGISTRATION = 1;
+  ADMISSION_SERVICE_VOICE = 2;
+  ADMISSION_SERVICE_DATA = 3;
+  ADMISSION_SERVICE_SMS = 4;
+  ADMISSION_SERVICE_OTASP = 5;
+  ADMISSION_SERVICE_PAGE_RESPONSE = 6;
+}
+
+// One admission decision. Emitted for every decision other than Admitted, and
+// for the first Admitted decision after another class, so the last event per
+// mobile is its current class.
+message AdmissionEvent {
+  google.protobuf.Timestamp time = 1;
+  AuthenticationProcedure procedure = 2;
+  AdmissionClass admission_class = 3;
+  AdmissionReason reason = 4;
+  AdmissionService service = 5;
+  bool service_rejected = 6;
+  string imsi = 7;
+  optional uint32 esn = 8;
+  // 14 hex digits, empty when the mobile did not report one.
+  string meid = 9;
+  string base_station = 10;
+  // Subscriber the mobile resolved to, empty when none.
+  string subscriber_id = 11;
+  // IMSI configured on the matched subscriber identity, empty when none.
+  string configured_imsi = 12;
 }
 
 // Where AUTH_DATA came from (C.S0004-E §2.1.1.1.2.2).

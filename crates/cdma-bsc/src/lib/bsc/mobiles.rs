@@ -95,8 +95,17 @@ pub(crate) enum MsState {
     TrafficActive,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegistrationStatus {
+    Unregistered,
+    Pending,
+    Accepted,
+    Rejected,
+}
+
 #[derive(Debug)]
 pub(crate) struct MobileStation {
+    pub(crate) registration_status: RegistrationStatus,
     pub(crate) fwd_address: MsAddress,
     /// Known reverse-link identities, stored separately from the chosen
     /// forward/page address so the UI can show the full identity set.
@@ -120,10 +129,8 @@ pub(crate) struct MobileStation {
     /// Reverse access channel (r-csch) duplicate detection per C.S0004-E 3.1.1.2.2.2.
     /// MSG_SEQ_RCVD[n] = true means MSG_SEQ n has already been processed.
     pub(crate) access_msg_seq_rcvd: [bool; 8],
-    /// When the last r-csch PDU was received from this mobile.
-    /// Per C.S0004-E 3.1.1.2.2.2, the BS considers an MS inactive on the
-    /// r-csch after an implementation-defined timeout and clears
-    /// MSG_SEQ_RCVD on the next received PDU.
+    pub(crate) last_activity: Option<Instant>,
+    // C.S0004-E 3.1.1.2.2.2. None indicates inactive on the common channel.
     pub(crate) last_access_activity: Option<Instant>,
     /// Slot cycle index reported by the mobile (3 bits, 0..7).
     pub(crate) slot_cycle_index: u8,
@@ -190,6 +197,7 @@ impl MobileStation {
             }
         });
         Self {
+            registration_status: RegistrationStatus::Accepted,
             fwd_address,
             esn,
             imsi,
@@ -205,6 +213,7 @@ impl MobileStation {
             state,
             last_msg_seq: 0,
             access_msg_seq_rcvd: [false; 8],
+            last_activity: None,
             last_access_activity: None,
             slot_cycle_index,
             pgslot,
@@ -467,15 +476,6 @@ impl MobileStation {
         }
     }
 
-    /// Resolve a pending traffic retry target to the traffic channel.
-    /// Transition to a new state.
-    ///
-    /// r-csch duplicate state is intentionally not cleared here. Per
-    /// C.S0004-E 3.1.1.2.2.2, MSG_SEQ_RCVD should be cleared when the MS is
-    /// inactive on the common channel, not merely because Layer 3 moved the
-    /// mobile back to `Registered`. This allows an immediate retransmission of
-    /// the same access PDU (for example a Page Response retry) to be detected
-    /// and acknowledged as a duplicate.
     pub(crate) fn set_state(&mut self, new_state: MsState) {
         self.state = new_state;
     }
@@ -969,7 +969,16 @@ impl MobileRegistry {
                         .map_or("none".to_string(), format_ms_page_address),
                     forward_address: Some(ms.fwd_address.clone()),
                     page_address_detail: ms.page_address(),
-                    state: format!("{:?}", ms.state),
+                    state: match (&ms.state, ms.registration_status) {
+                        (MsState::Registered, RegistrationStatus::Unregistered) => {
+                            "NotRegistered".into()
+                        }
+                        (MsState::Registered, RegistrationStatus::Pending) => "Registering".into(),
+                        (MsState::Registered, RegistrationStatus::Rejected) => {
+                            "RegistrationRejected".into()
+                        }
+                        _ => format!("{:?}", ms.state),
+                    },
                     mob_p_rev: ms.mob_p_rev,
                     serving_cell: ms.serving_cell,
                     esn: ms.esn,
@@ -1017,8 +1026,6 @@ impl MobileRegistry {
             .collect()
     }
 
-    /// Refresh per-mobile activity bookkeeping after an access event lands.
-    /// Returns `true` if the mobile was found and updated.
     pub(crate) fn record_activity(
         &mut self,
         addr: &MsAddress,
@@ -1030,7 +1037,7 @@ impl MobileRegistry {
             return false;
         };
         let ms = &mut self.entries[idx];
-        ms.last_access_activity = Some(now);
+        ms.last_activity = Some(now);
         ms.last_heard_ms = Some(last_heard_ms);
         ms.snr_db = event.snr_db.or(ms.snr_db);
         ms.signal_power_db = event.signal_power_db.or(ms.signal_power_db);
@@ -1173,6 +1180,7 @@ impl MobileRegistry {
             ms.raw_power_db = event.raw_power_db.or(ms.raw_power_db);
             ms.demod_quality_pct = event.demod_quality_pct.or(ms.demod_quality_pct);
             ms.last_heard_ms = Some(update.last_heard_ms);
+            ms.last_activity = Some(update.activity_now);
             ms.last_access_activity = Some(update.activity_now);
             if update.explicit_registration {
                 if !event.for_supported_rcs.is_empty() {
@@ -1219,6 +1227,7 @@ impl MobileRegistry {
         );
         let new_addr = update.fwd_address.clone();
         self.entries.push(MobileStation {
+            registration_status: RegistrationStatus::Unregistered,
             fwd_address: update.fwd_address,
             esn: event.esn,
             imsi: update.registration_imsi,
@@ -1234,6 +1243,7 @@ impl MobileRegistry {
             state: MsState::Registered,
             last_msg_seq: update.last_msg_seq,
             access_msg_seq_rcvd: [false; 8],
+            last_activity: Some(update.activity_now),
             last_access_activity: Some(update.activity_now),
             slot_cycle_index: update.slot_cycle_index,
             pgslot: update.pgslot,
@@ -1348,7 +1358,7 @@ impl MobileRegistry {
             if ms.traffic_channel.is_some() {
                 return true;
             }
-            ms.last_access_activity
+            ms.last_activity
                 .is_some_and(|last| last.elapsed() < timeout)
         });
         before - self.entries.len()
@@ -1363,9 +1373,6 @@ impl Bsc {
         self.mobiles.publish_snapshot(&self.config.bts);
     }
 
-    /// Refresh activity bookkeeping for a registered mobile after an
-    /// access event lands. Updates per-mobile signal metrics and the
-    /// idle-eviction timestamp. Returns `true` if the mobile was found.
     pub(crate) fn record_mobile_activity(
         &mut self,
         addr: &MsAddress,

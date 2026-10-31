@@ -10,6 +10,7 @@ fn sms_route_runtime() -> MscRuntime {
     runtime.smsc = Some(crate::sms::MscSmsCoordinator::new(
         Arc::new(smsc),
         runtime.config.hlr_repo.clone(),
+        runtime.config.access.mode,
     ));
     runtime
 }

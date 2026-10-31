@@ -100,6 +100,9 @@ pub struct MscManagementServiceImpl {
     mgmt_tx: tokio::sync::mpsc::Sender<crate::management::PendingControlRequest>,
     otasp_event_tx: Option<tokio::sync::broadcast::Sender<events_proto::v1::MscNetworkEvent>>,
     authentication_history: Option<std::sync::Arc<crate::authentication::AuthenticationHistory>>,
+    admission_history: Option<std::sync::Arc<crate::admission::AdmissionHistory>>,
+    access: crate::admission::AccessConfig,
+    authentication_mode: crate::authentication::AuthenticationMode,
     base_stations: Option<std::sync::Arc<crate::base_station::BaseStations>>,
 }
 
@@ -112,12 +115,23 @@ impl MscManagementServiceImpl {
             mgmt_tx,
             otasp_event_tx: None,
             authentication_history: None,
+            admission_history: None,
+            access: Default::default(),
+            authentication_mode: Default::default(),
             base_stations: None,
         }
     }
 
-    /// Attach the base station registry so `ListBaseStations` reports what the
-    /// MSC is attached to.
+    pub fn with_policy(
+        mut self,
+        access: crate::admission::AccessConfig,
+        authentication_mode: crate::authentication::AuthenticationMode,
+    ) -> Self {
+        self.access = access;
+        self.authentication_mode = authentication_mode;
+        self
+    }
+
     pub fn with_base_stations(
         mut self,
         base_stations: std::sync::Arc<crate::base_station::BaseStations>,
@@ -126,9 +140,14 @@ impl MscManagementServiceImpl {
         self
     }
 
-    /// Attach the live OTASP event broadcast channel produced by the MSC
-    /// runtime so the `StreamOtaspEvents` RPC can fan events out to
-    /// connected dashboards.
+    pub fn with_admission_history(
+        mut self,
+        history: std::sync::Arc<crate::admission::AdmissionHistory>,
+    ) -> Self {
+        self.admission_history = Some(history);
+        self
+    }
+
     pub fn with_otasp(
         mut self,
         event_tx: tokio::sync::broadcast::Sender<events_proto::v1::MscNetworkEvent>,
@@ -328,6 +347,28 @@ impl MscManagementService for MscManagementServiceImpl {
         }))
     }
 
+    async fn list_admission_events(
+        &self,
+        request: Request<mgmt_proto::ListAdmissionEventsRequest>,
+    ) -> Result<Response<mgmt_proto::AdmissionEventList>, Status> {
+        let Some(history) = self.admission_history.as_ref() else {
+            return Err(Status::unavailable("admission history not configured"));
+        };
+        let request = request.into_inner();
+        let meid = (!request.meid.is_empty()).then_some(request.meid.as_str());
+        Ok(Response::new(mgmt_proto::AdmissionEventList {
+            events: if request.current_only {
+                history.current_matching(&request.imsis, request.esn, meid, request.limit as usize)
+            } else {
+                history.matching(&request.imsis, request.esn, meid, request.limit as usize)
+            },
+            current_snapshot: request.current_only,
+            access_mode: self.access.mode.config_name().to_string(),
+            register_policy: self.access.register_policy.config_name().to_string(),
+            authentication_mode: self.authentication_mode.config_name().to_string(),
+        }))
+    }
+
     async fn list_calls(&self, _: Request<()>) -> Result<Response<CallList>, Status> {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         self.mgmt_tx
@@ -341,5 +382,43 @@ impl MscManagementService for MscManagementServiceImpl {
         Ok(Response::new(CallList {
             call_ids: snapshots.iter().map(|s| s.id.0.to_string()).collect(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn current_admission_rpc_returns_snapshot_without_activity_history() {
+        let history = std::sync::Arc::new(crate::admission::AdmissionHistory::default());
+        let denied = events_proto::v1::AdmissionEvent {
+            imsi: "310006026392922".into(),
+            esn: Some(0x3626_2F13),
+            admission_class: events_proto::v1::AdmissionClass::Denied as i32,
+            ..Default::default()
+        };
+        history.update_current(&denied);
+        let (tx, _) = tokio::sync::mpsc::channel(1);
+        let service = MscManagementServiceImpl::from_channel(tx).with_admission_history(history);
+        let request = |current_only| {
+            Request::new(mgmt_proto::ListAdmissionEventsRequest {
+                current_only,
+                ..Default::default()
+            })
+        };
+        let snapshot = service
+            .list_admission_events(request(true))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(snapshot.current_snapshot);
+        assert_eq!(snapshot.events, vec![denied]);
+        let activity = service
+            .list_admission_events(request(false))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(activity.events.is_empty());
     }
 }

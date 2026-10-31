@@ -6,6 +6,7 @@ import { useSearchParams } from "next/navigation";
 import { Card } from "@/components/card";
 import { CellSelector } from "@/components/cell-selector";
 import { EvdoCarrierCard } from "@/components/evdo-carrier-card";
+import { HrpdAdmissionBadge } from "@/components/hrpd-admission";
 import {
   GetSessionsResponse,
   sessionStateToJSON,
@@ -227,6 +228,7 @@ function HrpdSessionsView() {
               <th className="px-3 py-2">Color</th>
               <th className="px-3 py-2">Cell</th>
               <th className="px-3 py-2">State</th>
+              <th className="px-3 py-2">Access</th>
               <th className="px-3 py-2">Packet Data</th>
               <th className="px-3 py-2">Negotiated</th>
             </tr>
@@ -234,7 +236,7 @@ function HrpdSessionsView() {
           <tbody>
             {sessions.length === 0 && (
               <tr>
-                <td className="px-3 py-3 text-muted" colSpan={6}>
+                <td className="px-3 py-3 text-muted" colSpan={7}>
                   No sessions
                 </td>
               </tr>
@@ -275,6 +277,9 @@ function HrpdSessionsView() {
                     )}
                   </td>
                   <td className="px-3 py-2">{stateLabel(s.state)}</td>
+                  <td className="px-3 py-2">
+                    <HrpdAdmissionBadge admission={s.admission} />
+                  </td>
                   <td className="px-3 py-2 text-xs">
                     {packet ? (
                       <div className="space-y-1">

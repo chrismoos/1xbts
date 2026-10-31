@@ -22,6 +22,7 @@ const SSE_EVENT_TYPES = [
   "hrpd-traffic",
   "a1",
   "authentication",
+  "admission",
 ];
 
 // Tabs and hot-reloaded modules that register a different set of event names

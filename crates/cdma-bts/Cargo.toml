@@ -58,6 +58,7 @@ cdma-a9 = { path = "../cdma-a9" }
 cdma-an = { path = "../cdma-an" }
 cdma-events = { path = "../cdma-events" }
 cdma-hlr = { path = "../cdma-hlr" }
+cdma-a12 = { path = "../cdma-a12" }
 cdma-pcf = { path = "../cdma-pcf" }
 tonic = { version = "0.13", features = ["tls-ring"] }
 prost = "0.13"

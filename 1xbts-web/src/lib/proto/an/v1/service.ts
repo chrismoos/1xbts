@@ -11,6 +11,50 @@ import { HrpdAccessEvent, HrpdSessionEvent, HrpdTrafficEvent as HrpdTrafficEvent
 
 export const protobufPackage = "an.v1";
 
+export enum AnAccessMode {
+  AN_ACCESS_MODE_UNSPECIFIED = 0,
+  /** AN_ACCESS_MODE_OPEN - Every access terminal is served. */
+  AN_ACCESS_MODE_OPEN = 1,
+  /**
+   * AN_ACCESS_MODE_CLOSED - Only access terminals whose Hardware ID matches an active subscriber get
+   * a connection.
+   */
+  AN_ACCESS_MODE_CLOSED = 2,
+  UNRECOGNIZED = -1,
+}
+
+export function anAccessModeFromJSON(object: any): AnAccessMode {
+  switch (object) {
+    case 0:
+    case "AN_ACCESS_MODE_UNSPECIFIED":
+      return AnAccessMode.AN_ACCESS_MODE_UNSPECIFIED;
+    case 1:
+    case "AN_ACCESS_MODE_OPEN":
+      return AnAccessMode.AN_ACCESS_MODE_OPEN;
+    case 2:
+    case "AN_ACCESS_MODE_CLOSED":
+      return AnAccessMode.AN_ACCESS_MODE_CLOSED;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return AnAccessMode.UNRECOGNIZED;
+  }
+}
+
+export function anAccessModeToJSON(object: AnAccessMode): string {
+  switch (object) {
+    case AnAccessMode.AN_ACCESS_MODE_UNSPECIFIED:
+      return "AN_ACCESS_MODE_UNSPECIFIED";
+    case AnAccessMode.AN_ACCESS_MODE_OPEN:
+      return "AN_ACCESS_MODE_OPEN";
+    case AnAccessMode.AN_ACCESS_MODE_CLOSED:
+      return "AN_ACCESS_MODE_CLOSED";
+    case AnAccessMode.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
 /** Per C.S0024-400 §7 session state. */
 export enum SessionState {
   SESSION_STATE_UNSPECIFIED = 0,
@@ -203,6 +247,53 @@ export function hrpdConnectionCloseReasonToJSON(object: HrpdConnectionCloseReaso
   }
 }
 
+export enum HardwareVerdict {
+  HARDWARE_VERDICT_UNSPECIFIED = 0,
+  /** HARDWARE_VERDICT_UNKNOWN - No HardwareIDResponse has been resolved. */
+  HARDWARE_VERDICT_UNKNOWN = 1,
+  /** HARDWARE_VERDICT_ADMITTED - The Hardware ID matches an active subscriber. */
+  HARDWARE_VERDICT_ADMITTED = 2,
+  HARDWARE_VERDICT_REFUSED = 3,
+  UNRECOGNIZED = -1,
+}
+
+export function hardwareVerdictFromJSON(object: any): HardwareVerdict {
+  switch (object) {
+    case 0:
+    case "HARDWARE_VERDICT_UNSPECIFIED":
+      return HardwareVerdict.HARDWARE_VERDICT_UNSPECIFIED;
+    case 1:
+    case "HARDWARE_VERDICT_UNKNOWN":
+      return HardwareVerdict.HARDWARE_VERDICT_UNKNOWN;
+    case 2:
+    case "HARDWARE_VERDICT_ADMITTED":
+      return HardwareVerdict.HARDWARE_VERDICT_ADMITTED;
+    case 3:
+    case "HARDWARE_VERDICT_REFUSED":
+      return HardwareVerdict.HARDWARE_VERDICT_REFUSED;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return HardwareVerdict.UNRECOGNIZED;
+  }
+}
+
+export function hardwareVerdictToJSON(object: HardwareVerdict): string {
+  switch (object) {
+    case HardwareVerdict.HARDWARE_VERDICT_UNSPECIFIED:
+      return "HARDWARE_VERDICT_UNSPECIFIED";
+    case HardwareVerdict.HARDWARE_VERDICT_UNKNOWN:
+      return "HARDWARE_VERDICT_UNKNOWN";
+    case HardwareVerdict.HARDWARE_VERDICT_ADMITTED:
+      return "HARDWARE_VERDICT_ADMITTED";
+    case HardwareVerdict.HARDWARE_VERDICT_REFUSED:
+      return "HARDWARE_VERDICT_REFUSED";
+    case HardwareVerdict.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
 export enum AccessTerminalIdentifierType {
   ACCESS_TERMINAL_IDENTIFIER_TYPE_UNSPECIFIED = 0,
   ACCESS_TERMINAL_IDENTIFIER_TYPE_BATI = 1,
@@ -299,6 +390,15 @@ export function hrpdForwardChannelToJSON(object: HrpdForwardChannel): string {
   }
 }
 
+export interface SetAccessPolicyRequest {
+  mode: AnAccessMode;
+}
+
+export interface SetAccessPolicyResponse {
+  /** True when the request changed the mode. */
+  changed: boolean;
+}
+
 /** Per-AT session record (mirrors `cdma_an::session::Session`). */
 export interface Session {
   /** Unicast Access Terminal Identifier assigned to this AT. */
@@ -316,7 +416,34 @@ export interface Session {
     | HrpdHardwareIdResponse
     | undefined;
   /** Canonical 128-bit UATI assigned to this AT. */
-  fullUati: HrpdUati | undefined;
+  fullUati:
+    | HrpdUati
+    | undefined;
+  /** Access decisions for this session. */
+  admission: SessionAdmission | undefined;
+}
+
+export interface SessionAdmission {
+  /** True when the access network serves only admitted sessions. */
+  accessClosed: boolean;
+  hardwareVerdict: HardwareVerdict;
+  /** Snake-case refusal reason, for example `not_a_subscriber`. Empty unless refused. */
+  reason: string;
+  /** Subscriber the Hardware ID matched. Empty when none. */
+  subscriberId: string;
+  /** Stream carrying access authentication. Zero when the session has none. */
+  accessStreamId: number;
+  /**
+   * Access authentication progress: idle, lcp, challenge_sent,
+   * awaiting_aaa, terminating or settled.
+   */
+  accessAuthState: string;
+  /** Settled result, for example `accepted` or `no_response`. Empty until settled. */
+  accessAuthResult: string;
+  /** NAI from the access terminal's CHAP Response. Empty until received. */
+  accessAuthNai: string;
+  /** IMSI from the A12 Access-Accept. Empty when none. */
+  accessAuthImsi: string;
 }
 
 /** Negotiated protocol subtypes for an open session. */
@@ -646,6 +773,8 @@ export interface HrpdStream1PacketEvent {
   receiveAti: number;
   payload: Uint8Array;
   sequence: number;
+  /** Stream Layer StreamID. Zero is read as stream 1. */
+  streamId: number;
 }
 
 export interface HrpdA8UplinkPacket {
@@ -728,8 +857,132 @@ export interface HrpdSessionConfigurationCompleteEvent {
   idlePagePeriodCycles: number;
 }
 
+function createBaseSetAccessPolicyRequest(): SetAccessPolicyRequest {
+  return { mode: 0 };
+}
+
+export const SetAccessPolicyRequest: MessageFns<SetAccessPolicyRequest> = {
+  encode(message: SetAccessPolicyRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.mode !== 0) {
+      writer.uint32(8).int32(message.mode);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SetAccessPolicyRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSetAccessPolicyRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.mode = reader.int32() as any;
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SetAccessPolicyRequest {
+    return { mode: isSet(object.mode) ? anAccessModeFromJSON(object.mode) : 0 };
+  },
+
+  toJSON(message: SetAccessPolicyRequest): unknown {
+    const obj: any = {};
+    if (message.mode !== 0) {
+      obj.mode = anAccessModeToJSON(message.mode);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<SetAccessPolicyRequest>): SetAccessPolicyRequest {
+    return SetAccessPolicyRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<SetAccessPolicyRequest>): SetAccessPolicyRequest {
+    const message = createBaseSetAccessPolicyRequest();
+    message.mode = object.mode ?? 0;
+    return message;
+  },
+};
+
+function createBaseSetAccessPolicyResponse(): SetAccessPolicyResponse {
+  return { changed: false };
+}
+
+export const SetAccessPolicyResponse: MessageFns<SetAccessPolicyResponse> = {
+  encode(message: SetAccessPolicyResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.changed !== false) {
+      writer.uint32(8).bool(message.changed);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SetAccessPolicyResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSetAccessPolicyResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.changed = reader.bool();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SetAccessPolicyResponse {
+    return { changed: isSet(object.changed) ? globalThis.Boolean(object.changed) : false };
+  },
+
+  toJSON(message: SetAccessPolicyResponse): unknown {
+    const obj: any = {};
+    if (message.changed !== false) {
+      obj.changed = message.changed;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<SetAccessPolicyResponse>): SetAccessPolicyResponse {
+    return SetAccessPolicyResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<SetAccessPolicyResponse>): SetAccessPolicyResponse {
+    const message = createBaseSetAccessPolicyResponse();
+    message.changed = object.changed ?? false;
+    return message;
+  },
+};
+
 function createBaseSession(): Session {
-  return { uati: 0, colorCode: 0, state: 0, protocols: undefined, hardwareIdResponse: undefined, fullUati: undefined };
+  return {
+    uati: 0,
+    colorCode: 0,
+    state: 0,
+    protocols: undefined,
+    hardwareIdResponse: undefined,
+    fullUati: undefined,
+    admission: undefined,
+  };
 }
 
 export const Session: MessageFns<Session> = {
@@ -751,6 +1004,9 @@ export const Session: MessageFns<Session> = {
     }
     if (message.fullUati !== undefined) {
       HrpdUati.encode(message.fullUati, writer.uint32(50).fork()).join();
+    }
+    if (message.admission !== undefined) {
+      SessionAdmission.encode(message.admission, writer.uint32(58).fork()).join();
     }
     return writer;
   },
@@ -810,6 +1066,14 @@ export const Session: MessageFns<Session> = {
           message.fullUati = HrpdUati.decode(reader, reader.uint32());
           continue;
         }
+        case 7: {
+          if (tag !== 58) {
+            break;
+          }
+
+          message.admission = SessionAdmission.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -839,6 +1103,7 @@ export const Session: MessageFns<Session> = {
         : isSet(object.full_uati)
         ? HrpdUati.fromJSON(object.full_uati)
         : undefined,
+      admission: isSet(object.admission) ? SessionAdmission.fromJSON(object.admission) : undefined,
     };
   },
 
@@ -862,6 +1127,9 @@ export const Session: MessageFns<Session> = {
     if (message.fullUati !== undefined) {
       obj.fullUati = HrpdUati.toJSON(message.fullUati);
     }
+    if (message.admission !== undefined) {
+      obj.admission = SessionAdmission.toJSON(message.admission);
+    }
     return obj;
   },
 
@@ -882,6 +1150,239 @@ export const Session: MessageFns<Session> = {
     message.fullUati = (object.fullUati !== undefined && object.fullUati !== null)
       ? HrpdUati.fromPartial(object.fullUati)
       : undefined;
+    message.admission = (object.admission !== undefined && object.admission !== null)
+      ? SessionAdmission.fromPartial(object.admission)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseSessionAdmission(): SessionAdmission {
+  return {
+    accessClosed: false,
+    hardwareVerdict: 0,
+    reason: "",
+    subscriberId: "",
+    accessStreamId: 0,
+    accessAuthState: "",
+    accessAuthResult: "",
+    accessAuthNai: "",
+    accessAuthImsi: "",
+  };
+}
+
+export const SessionAdmission: MessageFns<SessionAdmission> = {
+  encode(message: SessionAdmission, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.accessClosed !== false) {
+      writer.uint32(8).bool(message.accessClosed);
+    }
+    if (message.hardwareVerdict !== 0) {
+      writer.uint32(16).int32(message.hardwareVerdict);
+    }
+    if (message.reason !== "") {
+      writer.uint32(26).string(message.reason);
+    }
+    if (message.subscriberId !== "") {
+      writer.uint32(34).string(message.subscriberId);
+    }
+    if (message.accessStreamId !== 0) {
+      writer.uint32(40).uint32(message.accessStreamId);
+    }
+    if (message.accessAuthState !== "") {
+      writer.uint32(50).string(message.accessAuthState);
+    }
+    if (message.accessAuthResult !== "") {
+      writer.uint32(58).string(message.accessAuthResult);
+    }
+    if (message.accessAuthNai !== "") {
+      writer.uint32(66).string(message.accessAuthNai);
+    }
+    if (message.accessAuthImsi !== "") {
+      writer.uint32(74).string(message.accessAuthImsi);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SessionAdmission {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSessionAdmission();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.accessClosed = reader.bool();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.hardwareVerdict = reader.int32() as any;
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.reason = reader.string();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.subscriberId = reader.string();
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.accessStreamId = reader.uint32();
+          continue;
+        }
+        case 6: {
+          if (tag !== 50) {
+            break;
+          }
+
+          message.accessAuthState = reader.string();
+          continue;
+        }
+        case 7: {
+          if (tag !== 58) {
+            break;
+          }
+
+          message.accessAuthResult = reader.string();
+          continue;
+        }
+        case 8: {
+          if (tag !== 66) {
+            break;
+          }
+
+          message.accessAuthNai = reader.string();
+          continue;
+        }
+        case 9: {
+          if (tag !== 74) {
+            break;
+          }
+
+          message.accessAuthImsi = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SessionAdmission {
+    return {
+      accessClosed: isSet(object.accessClosed)
+        ? globalThis.Boolean(object.accessClosed)
+        : isSet(object.access_closed)
+        ? globalThis.Boolean(object.access_closed)
+        : false,
+      hardwareVerdict: isSet(object.hardwareVerdict)
+        ? hardwareVerdictFromJSON(object.hardwareVerdict)
+        : isSet(object.hardware_verdict)
+        ? hardwareVerdictFromJSON(object.hardware_verdict)
+        : 0,
+      reason: isSet(object.reason) ? globalThis.String(object.reason) : "",
+      subscriberId: isSet(object.subscriberId)
+        ? globalThis.String(object.subscriberId)
+        : isSet(object.subscriber_id)
+        ? globalThis.String(object.subscriber_id)
+        : "",
+      accessStreamId: isSet(object.accessStreamId)
+        ? globalThis.Number(object.accessStreamId)
+        : isSet(object.access_stream_id)
+        ? globalThis.Number(object.access_stream_id)
+        : 0,
+      accessAuthState: isSet(object.accessAuthState)
+        ? globalThis.String(object.accessAuthState)
+        : isSet(object.access_auth_state)
+        ? globalThis.String(object.access_auth_state)
+        : "",
+      accessAuthResult: isSet(object.accessAuthResult)
+        ? globalThis.String(object.accessAuthResult)
+        : isSet(object.access_auth_result)
+        ? globalThis.String(object.access_auth_result)
+        : "",
+      accessAuthNai: isSet(object.accessAuthNai)
+        ? globalThis.String(object.accessAuthNai)
+        : isSet(object.access_auth_nai)
+        ? globalThis.String(object.access_auth_nai)
+        : "",
+      accessAuthImsi: isSet(object.accessAuthImsi)
+        ? globalThis.String(object.accessAuthImsi)
+        : isSet(object.access_auth_imsi)
+        ? globalThis.String(object.access_auth_imsi)
+        : "",
+    };
+  },
+
+  toJSON(message: SessionAdmission): unknown {
+    const obj: any = {};
+    if (message.accessClosed !== false) {
+      obj.accessClosed = message.accessClosed;
+    }
+    if (message.hardwareVerdict !== 0) {
+      obj.hardwareVerdict = hardwareVerdictToJSON(message.hardwareVerdict);
+    }
+    if (message.reason !== "") {
+      obj.reason = message.reason;
+    }
+    if (message.subscriberId !== "") {
+      obj.subscriberId = message.subscriberId;
+    }
+    if (message.accessStreamId !== 0) {
+      obj.accessStreamId = Math.round(message.accessStreamId);
+    }
+    if (message.accessAuthState !== "") {
+      obj.accessAuthState = message.accessAuthState;
+    }
+    if (message.accessAuthResult !== "") {
+      obj.accessAuthResult = message.accessAuthResult;
+    }
+    if (message.accessAuthNai !== "") {
+      obj.accessAuthNai = message.accessAuthNai;
+    }
+    if (message.accessAuthImsi !== "") {
+      obj.accessAuthImsi = message.accessAuthImsi;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<SessionAdmission>): SessionAdmission {
+    return SessionAdmission.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<SessionAdmission>): SessionAdmission {
+    const message = createBaseSessionAdmission();
+    message.accessClosed = object.accessClosed ?? false;
+    message.hardwareVerdict = object.hardwareVerdict ?? 0;
+    message.reason = object.reason ?? "";
+    message.subscriberId = object.subscriberId ?? "";
+    message.accessStreamId = object.accessStreamId ?? 0;
+    message.accessAuthState = object.accessAuthState ?? "";
+    message.accessAuthResult = object.accessAuthResult ?? "";
+    message.accessAuthNai = object.accessAuthNai ?? "";
+    message.accessAuthImsi = object.accessAuthImsi ?? "";
     return message;
   },
 };
@@ -5735,7 +6236,7 @@ export const HrpdStream0SignalingEvent: MessageFns<HrpdStream0SignalingEvent> = 
 };
 
 function createBaseHrpdStream1PacketEvent(): HrpdStream1PacketEvent {
-  return { uati: 0, fullUati: undefined, receiveAti: 0, payload: new Uint8Array(0), sequence: 0 };
+  return { uati: 0, fullUati: undefined, receiveAti: 0, payload: new Uint8Array(0), sequence: 0, streamId: 0 };
 }
 
 export const HrpdStream1PacketEvent: MessageFns<HrpdStream1PacketEvent> = {
@@ -5754,6 +6255,9 @@ export const HrpdStream1PacketEvent: MessageFns<HrpdStream1PacketEvent> = {
     }
     if (message.sequence !== 0) {
       writer.uint32(40).uint32(message.sequence);
+    }
+    if (message.streamId !== 0) {
+      writer.uint32(48).uint32(message.streamId);
     }
     return writer;
   },
@@ -5805,6 +6309,14 @@ export const HrpdStream1PacketEvent: MessageFns<HrpdStream1PacketEvent> = {
           message.sequence = reader.uint32();
           continue;
         }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.streamId = reader.uint32();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -5829,6 +6341,11 @@ export const HrpdStream1PacketEvent: MessageFns<HrpdStream1PacketEvent> = {
         : 0,
       payload: isSet(object.payload) ? bytesFromBase64(object.payload) : new Uint8Array(0),
       sequence: isSet(object.sequence) ? globalThis.Number(object.sequence) : 0,
+      streamId: isSet(object.streamId)
+        ? globalThis.Number(object.streamId)
+        : isSet(object.stream_id)
+        ? globalThis.Number(object.stream_id)
+        : 0,
     };
   },
 
@@ -5849,6 +6366,9 @@ export const HrpdStream1PacketEvent: MessageFns<HrpdStream1PacketEvent> = {
     if (message.sequence !== 0) {
       obj.sequence = Math.round(message.sequence);
     }
+    if (message.streamId !== 0) {
+      obj.streamId = Math.round(message.streamId);
+    }
     return obj;
   },
 
@@ -5864,6 +6384,7 @@ export const HrpdStream1PacketEvent: MessageFns<HrpdStream1PacketEvent> = {
     message.receiveAti = object.receiveAti ?? 0;
     message.payload = object.payload ?? new Uint8Array(0);
     message.sequence = object.sequence ?? 0;
+    message.streamId = object.streamId ?? 0;
     return message;
   },
 };
@@ -7547,6 +8068,19 @@ export const AnServiceDefinition = {
       responseStream: false,
       options: {},
     },
+    /**
+     * Sets which access terminals the access network serves. Until it is set,
+     * the access network serves only terminals whose Hardware ID matches a
+     * subscriber.
+     */
+    setAccessPolicy: {
+      name: "SetAccessPolicy",
+      requestType: SetAccessPolicyRequest as typeof SetAccessPolicyRequest,
+      requestStream: false,
+      responseType: SetAccessPolicyResponse as typeof SetAccessPolicyResponse,
+      responseStream: false,
+      options: {},
+    },
   },
 } as const;
 
@@ -7591,6 +8125,15 @@ export interface AnServiceImplementation<CallContextExt = {}> {
     request: HrpdTrafficEvent,
     context: CallContext & CallContextExt,
   ): Promise<DeepPartial<HrpdTrafficOutcome>>;
+  /**
+   * Sets which access terminals the access network serves. Until it is set,
+   * the access network serves only terminals whose Hardware ID matches a
+   * subscriber.
+   */
+  setAccessPolicy(
+    request: SetAccessPolicyRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<SetAccessPolicyResponse>>;
 }
 
 export interface AnServiceClient<CallOptionsExt = {}> {
@@ -7634,6 +8177,15 @@ export interface AnServiceClient<CallOptionsExt = {}> {
     request: DeepPartial<HrpdTrafficEvent>,
     options?: CallOptions & CallOptionsExt,
   ): Promise<HrpdTrafficOutcome>;
+  /**
+   * Sets which access terminals the access network serves. Until it is set,
+   * the access network serves only terminals whose Hardware ID matches a
+   * subscriber.
+   */
+  setAccessPolicy(
+    request: DeepPartial<SetAccessPolicyRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<SetAccessPolicyResponse>;
 }
 
 function bytesFromBase64(b64: string): Uint8Array {

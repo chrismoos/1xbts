@@ -111,6 +111,8 @@ impl MtCallService {
             default_voice_service_option,
         );
 
+        let packet_data = crate::runtime::is_packet_data_service_option(service_option);
+        let voice_bearer = voice_bearer.filter(|_| !packet_data);
         let circuit_id = cic.to_packed();
         circuits.insert_circuit_session(
             circuit_id,
@@ -188,12 +190,8 @@ impl MtCallService {
         let ms_information_records =
             build_calling_party_ms_information_records(caller_number.as_deref(), hlr_repo).await;
         let assignment_request = cdma_ios::AssignmentRequestMessage {
-            channel_type: cdma_ios::ChannelType {
-                speech_or_data_indicator: 0x01,
-                channel_rate_and_type: 0x08,
-                coding: 0x05,
-            },
-            circuit_identity_code: Some(cic),
+            channel_type: crate::runtime::assignment_channel_type(service_option),
+            circuit_identity_code: if packet_data { None } else { Some(cic) },
             encryption_information,
             service_option: Some(cdma_ios::ServiceOption(service_option)),
             signals: Vec::new(),

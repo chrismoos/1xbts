@@ -62,13 +62,17 @@ pub struct MtCallPlan {
     pub audio_file: Option<String>,
     /// Optional caller-ID digits presented to the called mobile.
     pub caller_number: Option<String>,
-    /// Voice service option selected by MSC call policy.
     pub service_option: u16,
 }
 
 /// Server-side pending control request awaiting a reply from MSC logic.
 #[derive(Debug)]
 pub enum PendingControlRequest {
+    InitiateDataCall {
+        subscriber_id: Uuid,
+        service_option: u16,
+        response_tx: oneshot::Sender<Result<InitiateCallAccepted, ManagementError>>,
+    },
     InitiateOtasp {
         subscriber_id: Uuid,
         imsi: Option<String>,

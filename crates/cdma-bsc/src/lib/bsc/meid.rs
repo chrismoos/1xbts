@@ -147,7 +147,7 @@ impl Bsc {
         );
         self.publish_mobiles();
         if self.access_identity.is_pending(addr, event.cell) {
-            self.resume_access_identity_lookup(addr, event.cell);
+            self.wake_access_identity(addr, event.cell);
         } else {
             self.resolve_subscriber_from_hlr(event, addr);
         }

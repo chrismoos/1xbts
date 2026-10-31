@@ -398,6 +398,31 @@ impl AnServiceImpl {
         air.handle_timer_with_allocator(now, &mut allocator)
     }
 
+    pub async fn set_hardware_admission(
+        &self,
+        uati: u32,
+        admission: crate::air::HrpdHardwareAdmission,
+        subscriber_id: Option<String>,
+    ) {
+        self.air
+            .lock()
+            .await
+            .set_hardware_admission(uati, admission, subscriber_id);
+    }
+
+    pub async fn access_closed(&self) -> bool {
+        self.air.lock().await.access_closed()
+    }
+
+    pub async fn handle_access_auth_verdict(
+        &self,
+        session_uati: u32,
+        verdict: crate::access_auth::AaaVerdict,
+    ) -> HrpdTrafficOutcome {
+        let mut air = self.air.lock().await;
+        air.handle_access_auth_verdict(session_uati, verdict)
+    }
+
     /// Tears down the air-side traffic state for a PCF-initiated A9
     /// `DisconnectA8`.
     pub async fn handle_a9_disconnect_a8(
@@ -1477,6 +1502,10 @@ fn traffic_event_from_proto(
         },
         Event::Stream1Packet(packet) => hrpd_air::HrpdTrafficEvent::Stream1Packet {
             uati: packet.uati,
+            stream_id: match packet.stream_id {
+                0 => cdma_common::hrpd::traffic::DEFAULT_PACKET_STREAM_ID,
+                id => checked_u8(id, "stream1_packet.stream_id")?,
+            },
             sequence: packet.sequence,
             payload: packet.payload,
             decoded_at: None,
@@ -1618,9 +1647,39 @@ fn subtype_id(_s: crate::protocols::ProtocolSubtype) -> u32 {
     0
 }
 
+fn admission_to_proto(view: crate::air::HrpdSessionAdmissionView) -> proto::SessionAdmission {
+    use crate::air::HrpdHardwareAdmission;
+    let (verdict, reason) = match view.hardware_admission {
+        HrpdHardwareAdmission::Unknown => (proto::HardwareVerdict::Unknown, ""),
+        HrpdHardwareAdmission::Admitted => (proto::HardwareVerdict::Admitted, ""),
+        HrpdHardwareAdmission::Refused { reason } => (proto::HardwareVerdict::Refused, reason),
+    };
+    proto::SessionAdmission {
+        access_closed: view.access_closed,
+        hardware_verdict: verdict as i32,
+        reason: reason.to_string(),
+        subscriber_id: view.subscriber_id.unwrap_or_default(),
+        access_stream_id: view.access_stream_id.map(u32::from).unwrap_or_default(),
+        access_auth_state: view.access_auth_state.to_string(),
+        access_auth_result: view
+            .access_auth_result
+            .as_ref()
+            .map(|result| result.label().to_string())
+            .unwrap_or_default(),
+        access_auth_nai: view.access_auth_nai.unwrap_or_default(),
+        access_auth_imsi: view
+            .access_auth_result
+            .as_ref()
+            .and_then(|result| result.imsi())
+            .unwrap_or_default()
+            .to_string(),
+    }
+}
+
 fn to_proto_session(
     s: &Session,
     hardware_id_response: Option<hrpd_air::HrpdHardwareIdResponse>,
+    admission: Option<crate::air::HrpdSessionAdmissionView>,
 ) -> ProtoSession {
     let p = &s.protocols;
     ProtoSession {
@@ -1640,11 +1699,31 @@ fn to_proto_session(
         }),
         hardware_id_response: hardware_id_response.map(hardware_id_response_to_proto),
         full_uati: Some(an_uati_from_session(s)),
+        admission: admission.map(admission_to_proto),
     }
 }
 
 #[tonic::async_trait]
 impl AnService for AnServiceImpl {
+    async fn set_access_policy(
+        &self,
+        request: Request<proto::SetAccessPolicyRequest>,
+    ) -> Result<Response<proto::SetAccessPolicyResponse>, Status> {
+        let closed = match proto::AnAccessMode::try_from(request.into_inner().mode) {
+            Ok(proto::AnAccessMode::Open) => false,
+            Ok(proto::AnAccessMode::Closed) => true,
+            _ => return Err(Status::invalid_argument("access mode is required")),
+        };
+        let changed = self.air.lock().await.set_access_closed(closed);
+        if changed {
+            log::info!(
+                "HRPD AN: access is now {}",
+                if closed { "closed" } else { "open" }
+            );
+        }
+        Ok(Response::new(proto::SetAccessPolicyResponse { changed }))
+    }
+
     async fn get_sessions(
         &self,
         request: Request<GetSessionsRequest>,
@@ -1664,7 +1743,13 @@ impl AnService for AnServiceImpl {
         let air = self.air.lock().await;
         let sessions = matching_sessions
             .iter()
-            .map(|s| to_proto_session(s, air.hardware_id_for_uati(s.uati.as_u32()).cloned()))
+            .map(|s| {
+                to_proto_session(
+                    s,
+                    air.hardware_id_for_uati(s.uati.as_u32()).cloned(),
+                    air.session_admission(s.uati.as_u32()),
+                )
+            })
             .collect();
         Ok(Response::new(GetSessionsResponse { sessions }))
     }
@@ -1684,6 +1769,7 @@ impl AnService for AnServiceImpl {
                     session: Some(to_proto_session(
                         &s,
                         air.hardware_id_for_uati(s.uati.as_u32()).cloned(),
+                        air.session_admission(s.uati.as_u32()),
                     )),
                 }))
             }
@@ -2138,6 +2224,7 @@ mod tests {
                         receive_ati,
                         payload: vec![0x7e, 0xff, 0x03],
                         sequence: 0,
+                        stream_id: 0,
                     },
                 )),
             }))

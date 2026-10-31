@@ -8,11 +8,15 @@ import { formatEsn, formatMeid, formatTimeMs as formatTime } from "@/lib/format"
 import { radioConfigPairName } from "@/lib/radio-config";
 import { cellLabel, peerIdForCell } from "@/lib/cell";
 import { useBtsList } from "@/lib/use-bts-list";
+import { AccessBadge, useAdmissionVerdicts } from "@/components/access-activity";
+import { AccessDeniedCard } from "@/components/access-denied-card";
+import { type AdmissionVerdict, accessClass, reasonLabel } from "@/lib/admission";
 
 interface MobileInfo {
   address: string;
   pageAddress: string;
   state: string;
+  admission?: AdmissionVerdict;
   mobPRev: number;
   esn?: number;
   imsi?: string;
@@ -64,6 +68,8 @@ export default function MobilesPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const { cells } = useBtsList();
+  const { policy } = useAdmissionVerdicts({}, 1);
+  const closed = policy?.accessMode === "closed";
 
   const fetchMobiles = useCallback(async () => {
     try {
@@ -88,7 +94,18 @@ export default function MobilesPage() {
 
   return (
     <div className="max-w-7xl mx-auto space-y-6">
-      <h1 className="text-lg font-bold">Mobile Stations</h1>
+      <div className="flex items-center justify-between">
+        <h1 className="text-lg font-bold">Mobile Stations</h1>
+        {policy && (
+          <span
+            className={`text-xs px-2 py-0.5 rounded ${
+              closed ? "bg-badge-red-bg text-badge-red-text" : "bg-badge-green-bg text-badge-green-text"
+            }`}
+          >
+            Access: {closed ? "Closed" : "Open"}
+          </span>
+        )}
+      </div>
 
       <Card title={`Registered Mobiles (${mobiles.length})`}>
         {loading ? (
@@ -107,6 +124,7 @@ export default function MobilesPage() {
                   <th className="text-left py-1">Address</th>
                   <th className="text-left py-1">Subscriber</th>
                   <th className="text-left py-1">State</th>
+                  {closed && <th className="text-left py-1">Access</th>}
                   <th className="text-left py-1">Cell</th>
                   <th className="text-left py-1">Traffic</th>
                   <th className="text-right py-1">SNR (dB)</th>
@@ -125,7 +143,9 @@ export default function MobilesPage() {
                   return (
                     <tr key={i} className="border-t border-border hover:bg-hover">
                       <td className="py-2 text-secondary font-mono text-xs">
-                        <div>{formatMobileLabel(ms)}</div>
+                        <Link href={`/mobiles/${id}`} className="hover:text-accent-green hover:underline">
+                          {formatMobileLabel(ms)}
+                        </Link>
                         <div className="text-[11px] text-muted">
                           <div className="font-mono">
                             IMSI {ms.imsi || "Not Available"}
@@ -165,18 +185,50 @@ export default function MobilesPage() {
                       <td className="py-2">
                         <span
                           className={`text-xs px-2 py-0.5 rounded ${
-                            ms.state === "Registered"
-                              ? "bg-badge-green-bg text-badge-green-text"
-                              : ms.state === "Paged"
+                            ms.state === "RegistrationRejected"
+                              ? "bg-badge-red-bg text-badge-red-text"
+                              : ms.state === "Registering" || ms.state === "Paged"
                                 ? "bg-badge-yellow-bg text-badge-yellow-text"
-                                : ms.state === "TrafficAssigning" || ms.state === "TrafficActive"
-                                  ? "bg-badge-purple-bg text-badge-purple-text"
-                                  : "bg-badge-blue-bg text-badge-blue-text"
+                                : ms.state === "Registered"
+                                  ? "bg-badge-green-bg text-badge-green-text"
+                                  : ms.state === "TrafficAssigning" || ms.state === "TrafficActive"
+                                    ? "bg-badge-purple-bg text-badge-purple-text"
+                                    : "bg-badge-blue-bg text-badge-blue-text"
                           }`}
                         >
-                          {ms.state}
+                          {ms.state === "RegistrationRejected"
+                            ? "Registration rejected"
+                            : ms.state === "NotRegistered"
+                              ? "Not registered"
+                              : ms.state === "TrafficAssigning"
+                                ? "Assigning"
+                                : ms.state === "TrafficActive"
+                                  ? "Traffic active"
+                                  : ms.state}
                         </span>
                       </td>
+                      {closed && (
+                        <td className="py-2">
+                          {(() => {
+                            const verdict = ms.admission;
+                            const kind = accessClass(verdict?.admissionClass);
+                            return (
+                              <>
+                                <AccessBadge value={verdict?.admissionClass} />
+                                {kind && kind !== "admitted" && (
+                                  <div className="text-[11px] text-muted mt-0.5">
+                                    {kind === "provisioning"
+                                      ? "hardware match · IMSI differs"
+                                      : kind === "limited"
+                                        ? "suspended · MT SMS only"
+                                        : reasonLabel(verdict?.reason)}
+                                  </div>
+                                )}
+                              </>
+                            );
+                          })()}
+                        </td>
+                      )}
                       <td className="py-2 font-mono text-xs">
                         {servingPeerId ? (
                           <Link
@@ -251,6 +303,8 @@ export default function MobilesPage() {
           </div>
         )}
       </Card>
+
+      {closed && <AccessDeniedCard />}
     </div>
   );
 }

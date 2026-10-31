@@ -176,7 +176,7 @@ impl ServingSystem {
 /// Slotted-mode capable, SCM bit 5.
 const SCM_SLOTTED: u8 = 0x20;
 /// MEID support indicator, required in access messages at P_REV 6.
-const SCM_MEID_SUPPORT: u8 = 0x10;
+pub const SCM_MEID_SUPPORT: u8 = 0x10;
 /// 25 MHz bandwidth, SCM bit 3, which C.S0005-E Table 2.3.3-1 fixes at 1.
 const SCM_25MHZ_BANDWIDTH: u8 = 0x08;
 /// Extended SCM indicator, SCM bit 7.

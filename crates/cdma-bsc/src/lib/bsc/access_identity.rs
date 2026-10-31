@@ -2,14 +2,12 @@ use std::time::Duration;
 
 use cdma_common::events::{AccessCellId, AccessChannelEvent};
 use cdma_common::lac::{message_types::MessageId, paging_messages::MsAddress};
-use cdma_hlr::model::{MobileIdentityKey, ResolvedSubscriber};
 use log::{info, warn};
-use tokio::{sync::mpsc, task::JoinHandle, time::Instant};
+use tokio::{sync::mpsc, time::Instant};
 use uuid::Uuid;
 
 use super::access::{
-    HlrResolution, access_response_tx_time, compute_pgslot_from_event, event_last_heard_ms,
-    resolve_imsi_overhead,
+    access_response_tx_time, compute_pgslot_from_event, event_last_heard_ms, resolve_imsi_overhead,
 };
 use super::meid::{FIRST_MEID_COMPATIBLE_P_REV, MeidQueryChannel, can_discover_meid};
 use super::{AccessRegistrationUpdate, Bsc};
@@ -18,15 +16,8 @@ use super::{AccessRegistrationUpdate, Bsc};
 const IDENTITY_TIMEOUT: Duration = Duration::from_secs(11);
 const MAX_PENDING_ACCESS_REQUESTS: usize = 256;
 
-pub(crate) enum IdentityLookupOutcome {
-    Found(Box<ResolvedSubscriber>),
-    Missing,
-    Failed,
-}
-
-pub(crate) struct IdentityLookupResult {
+pub(crate) struct AccessIdentityWakeup {
     token: Uuid,
-    outcome: IdentityLookupOutcome,
 }
 
 struct PendingAccessIdentity {
@@ -35,32 +26,22 @@ struct PendingAccessIdentity {
     event: AccessChannelEvent,
     started: Instant,
     deadline: Instant,
-    lookup: Option<JoinHandle<()>>,
-    lookup_has_meid: bool,
     auth_required: bool,
-}
-
-impl Drop for PendingAccessIdentity {
-    fn drop(&mut self) {
-        if let Some(task) = self.lookup.take() {
-            task.abort();
-        }
-    }
 }
 
 pub(crate) struct AccessIdentityService {
     pending: Vec<PendingAccessIdentity>,
-    sender: mpsc::Sender<IdentityLookupResult>,
-    pub(crate) results: mpsc::Receiver<IdentityLookupResult>,
+    sender: mpsc::Sender<AccessIdentityWakeup>,
+    pub(crate) wakeups: mpsc::Receiver<AccessIdentityWakeup>,
 }
 
 impl AccessIdentityService {
     pub(crate) fn new() -> Self {
-        let (sender, results) = mpsc::channel(MAX_PENDING_ACCESS_REQUESTS);
+        let (sender, wakeups) = mpsc::channel(MAX_PENDING_ACCESS_REQUESTS);
         Self {
             pending: Vec::new(),
             sender,
-            results,
+            wakeups,
         }
     }
 
@@ -105,9 +86,6 @@ impl Bsc {
         ) {
             return false;
         }
-        let Some(repo) = self.config.hlr_repo.clone() else {
-            return false;
-        };
         let Some(addr) = self.extract_fwd_address(event) else {
             return false;
         };
@@ -124,7 +102,7 @@ impl Bsc {
             pending.addr != addr || (same_hardware && pending.event.cell == event.cell)
         });
         if same_hardware
-            && mobile.is_some_and(|ms| ms.subscriber_id.is_some())
+            && mobile.is_some_and(|ms| ms.meid.is_some())
             && !self.access_identity.is_pending(&addr, event.cell)
         {
             return false;
@@ -143,10 +121,18 @@ impl Bsc {
                 .then(|| mobile.and_then(|ms| ms.meid.as_deref()))
                 .flatten()
         });
-        let Ok(identity) = MobileIdentityKey::from_parts(imsi.as_deref(), event.esn, meid) else {
+        if meid.is_some() {
             return false;
-        };
+        }
         let same_cell = mobile.is_some_and(|ms| ms.serving_cell == event.cell);
+        let replaces_procedure = self.access_identity.pending.iter().any(|pending| {
+            pending.addr == addr
+                && same_hardware
+                && same_cell
+                && pending.event.message_id != event.message_id
+                && pending.event.message_id != MessageId::DataBurst
+                && event.message_id != MessageId::DataBurst
+        });
         self.access_identity.pending.retain(|pending| {
             pending.addr != addr
                 || (same_hardware
@@ -160,7 +146,7 @@ impl Bsc {
         }
         let params = self.config.bts.params(event.cell);
         let (imsi_mcc, imsi_11_12) = resolve_imsi_overhead(event, params.mcc, params.imsi_11_12);
-        if mobile.is_some_and(|ms| ms.serving_cell != event.cell) {
+        if replaces_procedure || mobile.is_some_and(|ms| ms.serving_cell != event.cell) {
             self.mobiles.update(&addr, |ms| ms.meid_query = None);
         }
         if !same_hardware {
@@ -200,9 +186,6 @@ impl Bsc {
             );
         }
         let token = Uuid::new_v4();
-        let lookup_has_meid = identity.meid().is_some();
-        let lookup =
-            spawn_identity_lookup(repo, self.access_identity.sender.clone(), token, identity);
         let started = Instant::now();
         self.access_identity.pending.push(PendingAccessIdentity {
             token,
@@ -210,45 +193,32 @@ impl Bsc {
             event: event.clone(),
             started,
             deadline: started + IDENTITY_TIMEOUT,
-            lookup: Some(lookup),
-            lookup_has_meid,
             auth_required: self.access_authentication_required(event),
         });
+        let _ = self
+            .access_identity
+            .sender
+            .try_send(AccessIdentityWakeup { token });
         true
     }
 
-    pub(crate) fn resume_access_identity_lookup(
-        &mut self,
-        addr: &MsAddress,
-        cell: Option<AccessCellId>,
-    ) {
+    pub(crate) fn wake_access_identity(&mut self, addr: &MsAddress, cell: Option<AccessCellId>) {
         let Some(ms) = self.mobiles.get(addr) else {
             return;
         };
-        let Some(meid) = ms.meid.as_deref() else {
+        if ms.meid.is_none() {
             return;
-        };
-        let Ok(identity) = MobileIdentityKey::from_parts(ms.imsi.as_deref(), ms.esn, Some(meid))
-        else {
-            return;
-        };
-        let Some(repo) = self.config.hlr_repo.clone() else {
-            return;
-        };
-        for pending in &mut self.access_identity.pending {
-            if pending.addr == *addr && pending.event.cell == cell && pending.lookup.is_none() {
-                pending.lookup_has_meid = true;
-                pending.lookup = Some(spawn_identity_lookup(
-                    repo.clone(),
-                    self.access_identity.sender.clone(),
-                    pending.token,
-                    identity.clone(),
-                ));
+        }
+        for pending in &self.access_identity.pending {
+            if pending.addr == *addr && pending.event.cell == cell {
+                let _ = self.access_identity.sender.try_send(AccessIdentityWakeup {
+                    token: pending.token,
+                });
             }
         }
     }
 
-    pub(crate) async fn handle_access_identity_result(&mut self, result: IdentityLookupResult) {
+    pub(crate) async fn handle_access_identity_wakeup(&mut self, result: AccessIdentityWakeup) {
         let Some(index) = self
             .access_identity
             .pending
@@ -258,41 +228,24 @@ impl Bsc {
             return;
         };
         if self.access_identity.pending[index].deadline <= Instant::now() {
-            self.finish_access_identity(index, None).await;
+            self.finish_access_identity(index).await;
             return;
         }
-        self.access_identity.pending[index].lookup.take();
-        match result.outcome {
-            IdentityLookupOutcome::Found(subscriber) => {
-                self.finish_access_identity(index, Some(*subscriber)).await
+        let addr = self.access_identity.pending[index].addr.clone();
+        if self.mobiles.get(&addr).is_some_and(|ms| ms.meid.is_none()) {
+            self.request_meid(&addr, MeidQueryChannel::Paging);
+            if self
+                .mobiles
+                .get(&addr)
+                .is_some_and(|ms| ms.meid_query.is_some())
+            {
+                return;
             }
-            IdentityLookupOutcome::Missing => {
-                let addr = self.access_identity.pending[index].addr.clone();
-                let ms = self.mobiles.get(&addr);
-                if ms.is_some_and(|ms| ms.meid.is_some())
-                    && !self.access_identity.pending[index].lookup_has_meid
-                {
-                    let cell = self.access_identity.pending[index].event.cell;
-                    self.resume_access_identity_lookup(&addr, cell);
-                    return;
-                }
-                if ms.is_some_and(|ms| ms.meid.is_none()) {
-                    self.request_meid(&addr, MeidQueryChannel::Paging);
-                    if self
-                        .mobiles
-                        .get(&addr)
-                        .is_some_and(|ms| ms.meid_query.is_some())
-                    {
-                        return;
-                    }
-                }
-                self.finish_access_identity(index, None).await;
-            }
-            IdentityLookupOutcome::Failed => self.finish_access_identity(index, None).await,
         }
+        self.finish_access_identity(index).await;
     }
 
-    async fn finish_access_identity(&mut self, index: usize, resolved: Option<ResolvedSubscriber>) {
+    async fn finish_access_identity(&mut self, index: usize) {
         let pending = self.access_identity.pending.remove(index);
         let Some(ms) = self.mobiles.get(&pending.addr) else {
             return;
@@ -316,17 +269,6 @@ impl Bsc {
         // AUTHR remains tied to the original request, but L2 must acknowledge the latest reverse PDU.
         event.msg_seq = Some(ms.last_msg_seq);
         event.meid = ms.meid.clone().or(event.meid);
-        if let Some(resolved) = resolved {
-            self.apply_hlr_resolution(HlrResolution {
-                fwd_address: pending.addr.clone(),
-                observed_esn: event.esn,
-                observed_meid: event.meid.clone(),
-                subscriber_id: Some(resolved.subscriber.subscriber_id),
-                phone_number: Some(resolved.subscriber.phone_number),
-                display_name: Some(resolved.subscriber.display_name),
-                canonical_imsi: resolved.primary_identity.and_then(|identity| identity.imsi),
-            });
-        }
         info!(
             "BSC: access identity ready addr={} type={} elapsed_ms={} meid_present={}",
             crate::addressing::format_ms_address(&pending.addr),
@@ -388,7 +330,7 @@ impl Bsc {
             .iter()
             .position(|pending| pending.addr == addr && pending.event.cell == event.cell)
         {
-            Box::pin(self.finish_access_identity(index, None)).await;
+            Box::pin(self.finish_access_identity(index)).await;
         }
     }
 
@@ -400,26 +342,7 @@ impl Bsc {
             .position(|pending| pending.deadline <= now)
         {
             warn!("BSC: access identity discovery timed out");
-            self.finish_access_identity(index, None).await;
+            self.finish_access_identity(index).await;
         }
     }
-}
-
-fn spawn_identity_lookup(
-    repo: std::sync::Arc<dyn cdma_hlr::repository::HlrRepository>,
-    sender: mpsc::Sender<IdentityLookupResult>,
-    token: Uuid,
-    identity: MobileIdentityKey,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let outcome = match repo.resolve_by_identity(&identity).await {
-            Ok(Some(subscriber)) => IdentityLookupOutcome::Found(Box::new(subscriber)),
-            Ok(None) => IdentityLookupOutcome::Missing,
-            Err(error) => {
-                warn!("BSC: access identity lookup failed: {error}");
-                IdentityLookupOutcome::Failed
-            }
-        };
-        let _ = sender.send(IdentityLookupResult { token, outcome }).await;
-    })
 }

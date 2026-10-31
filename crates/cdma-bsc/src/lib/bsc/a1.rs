@@ -1,5 +1,3 @@
-//! Track B A1 ingress helpers.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -54,7 +52,12 @@ pub(crate) struct A1Service {
 pub(crate) struct PendingA1Registration {
     pub(crate) fwd_address: MsAddress,
     pub(crate) cell: Option<cdma_common::events::AccessCellId>,
+    pub(crate) received_at: tokio::time::Instant,
+    pub(crate) event: cdma_common::events::AccessChannelEvent,
 }
+
+pub(crate) const REGISTRATION_RESULT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
 
 impl A1Service {
     pub(crate) fn new(msc_client: Arc<dyn crate::a1_edge::MscClient>) -> Self {
@@ -79,6 +82,27 @@ impl A1Service {
         call_id: u64,
     ) -> Option<PendingA1Registration> {
         self.pending_registrations.remove(&call_id)
+    }
+
+    pub(crate) fn take_expired_registrations(
+        &mut self,
+        now: tokio::time::Instant,
+        timeout: std::time::Duration,
+    ) -> Vec<(u64, PendingA1Registration)> {
+        let expired: Vec<u64> = self
+            .pending_registrations
+            .iter()
+            .filter(|(_, pending)| now.duration_since(pending.received_at) >= timeout)
+            .map(|(call_id, _)| *call_id)
+            .collect();
+        expired
+            .into_iter()
+            .filter_map(|call_id| {
+                self.pending_registrations
+                    .remove(&call_id)
+                    .map(|pending| (call_id, pending))
+            })
+            .collect()
     }
 }
 
@@ -305,6 +329,14 @@ impl Bsc {
             );
             return;
         };
+        self.mobiles.update(&pending.fwd_address, |mobile| {
+            mobile.registration_status = if reject_cause.is_some() {
+                super::mobiles::RegistrationStatus::Rejected
+            } else {
+                super::mobiles::RegistrationStatus::Accepted
+            };
+        });
+        self.publish_mobiles();
         let result = match reject_cause {
             None => {
                 info!(
@@ -312,10 +344,7 @@ impl Bsc {
                     format_ms_address(&pending.fwd_address)
                 );
                 self.access_tx
-                    .send_registration_accepted_after_authentication(
-                        pending.cell,
-                        &pending.fwd_address,
-                    )
+                    .send_registration_accepted(pending.cell, &pending.fwd_address)
             }
             Some(cause) => {
                 warn!(
@@ -329,10 +358,44 @@ impl Bsc {
         };
         match result {
             Ok(()) if reject_cause.is_none() => {
+                let mut event = pending.event;
+                event.receive_time = None;
+                event.ack_req = false;
+                self.try_deliver_pending_sms_from_access(
+                    &event,
+                    &pending.fwd_address,
+                    "Registration",
+                );
                 self.request_meid(&pending.fwd_address, super::meid::MeidQueryChannel::Paging);
             }
             Err(error) => warn!("BSC: failed to send registration result order: {}", error),
             _ => {}
+        }
+    }
+
+    pub(crate) fn expire_pending_registrations(&mut self) {
+        self.expire_pending_registrations_at(tokio::time::Instant::now());
+    }
+
+    pub(crate) fn expire_pending_registrations_at(&mut self, now: tokio::time::Instant) {
+        let expired = self
+            .a1
+            .take_expired_registrations(now, REGISTRATION_RESULT_TIMEOUT);
+        for (call_id, pending) in expired {
+            self.mobiles.update(&pending.fwd_address, |mobile| {
+                mobile.registration_status = super::mobiles::RegistrationStatus::Rejected;
+            });
+            self.publish_mobiles();
+            warn!(
+                "BSC: no Location Updating result from the MSC for {} (call_id={call_id}), rejecting the registration",
+                format_ms_address(&pending.fwd_address)
+            );
+            if let Err(error) = self
+                .access_tx
+                .send_registration_rejected(pending.cell, &pending.fwd_address)
+            {
+                warn!("BSC: failed to send Registration Rejected Order: {error}");
+            }
         }
     }
 
@@ -919,14 +982,22 @@ impl Bsc {
                 ack_msg_seq,
                 requested_tx_time,
                 tx_deadline,
-                kind: PendingA1AssignmentKind::Voice {
-                    session_id: pending.session_id,
-                    leg_role: pending.leg_role,
-                    renegotiate_from_so: response_service_option,
+                kind: if is_packet_data_so(pending.service_option) {
+                    PendingA1AssignmentKind::PacketData { service_ref_id: 1 }
+                } else {
+                    PendingA1AssignmentKind::Voice {
+                        session_id: pending.session_id,
+                        leg_role: pending.leg_role,
+                        renegotiate_from_so: response_service_option,
+                    }
                 },
                 bind_existing_traffic: false,
             },
         );
+        if is_packet_data_so(pending.service_option) {
+            self.voice
+                .retain_sessions(|session| session.id != pending.session_id);
+        }
         info!(
             "BSC: deferring Page Response ACK to A1 assignment for call_id={} ack_seq={}",
             call_id, ack_msg_seq
@@ -1104,9 +1175,10 @@ impl Bsc {
             return;
         };
 
-        // Re-resolve the target mobile by its stable address. The pending
-        // state has lived across the round-trip to the MSC, so the registry
-        // may have shifted (eviction etc.).
+        self.mobiles.update(&pending.fwd_address, |mobile| {
+            mobile.registration_status = super::mobiles::RegistrationStatus::Accepted;
+        });
+
         let Some(mobile) = self.mobiles.get(&pending.fwd_address) else {
             warn!(
                 "BSC: A1 Assignment Request call_id={} target {} no longer registered, dropping",
@@ -1311,9 +1383,37 @@ impl Bsc {
         };
 
         if let Some(pending) = self.a1.pop_pending_assignment(call_id) {
+            let answering_page = matches!(
+                pending.kind,
+                PendingA1AssignmentKind::Voice {
+                    leg_role: VoiceLegRole::Callee,
+                    ..
+                }
+            );
             if let PendingA1AssignmentKind::Voice { session_id, .. } = pending.kind {
                 self.voice
                     .retain_sessions(|session| session.id != session_id);
+            }
+            // The mobile is still on the paging channel waiting for a channel
+            // assignment. An Intercept Order ends an origination and a Release
+            // Order ends a page response, so it does not wait for its timer.
+            if !pending.bind_existing_traffic {
+                let cell = self
+                    .mobiles
+                    .get(&pending.fwd_address)
+                    .and_then(|ms| ms.serving_cell);
+                let sent = if answering_page {
+                    self.access_tx
+                        .send_release_order(cell, &pending.fwd_address, None, None)
+                } else {
+                    self.access_tx
+                        .send_intercept_order(cell, &pending.fwd_address)
+                };
+                if let Err(error) = sent {
+                    warn!(
+                        "BSC: failed to end the access of call_id={call_id} after Clear Command: {error}"
+                    );
+                }
             }
             self.a1.send_clear_complete(call_id, false);
             return;
@@ -1846,7 +1946,7 @@ fn project_a1_classmark_from_event(
     }
 }
 
-fn build_a1_classmark_information_type_2_for_event(
+pub(crate) fn build_a1_classmark_information_type_2_for_event(
     event: &cdma_common::events::AccessChannelEvent,
     serving_band_class: u8,
 ) -> cdma_ios::ClassmarkInformationType2 {

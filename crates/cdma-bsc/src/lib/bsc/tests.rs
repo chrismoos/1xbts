@@ -2330,50 +2330,30 @@ async fn outgoing_call_preserves_handset_voice_privacy_request() {
 }
 
 #[tokio::test]
-async fn first_origination_notifies_msc_with_lur() {
-    // The mobile in this test never sends an explicit Registration Message;
-    // it origins straight away. The BSC must still notify the MSC via a
-    // CompleteLayer3Information carrying a LocationUpdatingRequest (no
-    // call_id) so the MSC can update mobiles_seen and decide on welcome SMS.
+async fn first_origination_does_not_send_a_separate_registration() {
     let (client, endpoint) = crate::a1_edge::InProcessMscClient::pair(32);
     let mut bsc = test_bsc_with_max_slot_cycle_index(2);
-    bsc.config.msc_client = std::sync::Arc::new(client);
+    bsc.config.msc_client = Arc::new(client);
     bsc.a1.msc_client = bsc.config.msc_client.clone();
-
     let mut origination = test_registration_event_with_esn(0x1234_5678, 4);
     origination.message_id = MessageId::Origination;
-    origination.msg_type_name = "Origination Message".to_string();
+    origination.decoded_l3 = Some(test_origination_l3(SERVICE_OPTION_QCELP13, 1));
     bsc.inject_access_event(origination).await;
-
-    // Drain A1 outbound until we see a CL3 LUR notification (no call_id).
-    // The MO call path also sends a CL3 (with call_id) — accept either order.
-    let mut found_lur = false;
-    for _ in 0..4 {
-        let msg = match tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            endpoint.recv_from_bsc(),
-        )
-        .await
-        {
-            Ok(Some(m)) => m,
-            _ => break,
-        };
-        if msg.message_type() == cdma_ios::MessageType::CompleteLayer3Information
-            && msg.call_id().is_none()
-        {
-            let decoded = msg.decode().expect("decode CLI3 envelope");
-            let cli3 = cdma_ios::CompleteLayer3InformationMessage::decode(&decoded.payload)
-                .expect("decode CLI3 body");
-            cli3.layer3_information
-                .decode_location_updating_request()
-                .expect("CL3-without-call_id must carry a LocationUpdatingRequest");
-            found_lur = true;
-            break;
-        }
-    }
+    let message =
+        next_a1_from_bsc(&endpoint, cdma_ios::MessageType::CompleteLayer3Information).await;
+    assert!(message.call_id().is_some());
+    let cli3 =
+        cdma_ios::CompleteLayer3InformationMessage::decode(&message.decode().unwrap().payload)
+            .unwrap();
+    assert!(cli3.layer3_information.decode_cm_service_request().is_ok());
     assert!(
-        found_lur,
-        "first Origination from a new mobile must produce a LUR notification to the MSC"
+        tokio::time::timeout(Duration::from_millis(10), endpoint.recv_from_bsc())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        bsc.mobiles[0].registration_status,
+        super::mobiles::RegistrationStatus::Unregistered
     );
 }
 
@@ -2390,7 +2370,7 @@ async fn implicit_origination_marks_mobile_active_for_idle_eviction() {
 
     assert_eq!(bsc.mobiles.tracked_count(), 1);
     assert!(
-        bsc.mobiles[0].last_access_activity.is_some(),
+        bsc.mobiles[0].last_activity.is_some(),
         "implicit registration should stamp mobile activity"
     );
     assert_eq!(
@@ -2409,7 +2389,7 @@ async fn access_order_refreshes_registered_mobile_activity() {
     bsc.inject_access_event(test_registration_event_with_esn(0x1234_5678, 3))
         .await;
     let stale_activity = Instant::now() - Duration::from_secs(20);
-    bsc.mobiles[0].last_access_activity = Some(stale_activity);
+    bsc.mobiles[0].last_activity = Some(stale_activity);
 
     let mut order = test_registration_event_with_esn(0x1234_5678, 4);
     order.message_id = MessageId::Order;
@@ -2417,7 +2397,7 @@ async fn access_order_refreshes_registered_mobile_activity() {
     bsc.inject_access_event(order).await;
 
     let refreshed = bsc.mobiles[0]
-        .last_access_activity
+        .last_activity
         .expect("order should refresh mobile activity");
     assert!(
         refreshed > stale_activity,
@@ -2888,7 +2868,10 @@ impl HlrRepository for FakeHlrRepository {
         &self,
         _esn: Option<u32>,
         _meid: Option<&str>,
-    ) -> Result<Option<cdma_hlr::model::ResolvedSubscriber>, String> {
+    ) -> Result<
+        Option<cdma_hlr::model::ResolvedSubscriber>,
+        cdma_hlr::repository::HardwareLookupError,
+    > {
         Ok(Some(self.resolved()))
     }
 
@@ -3504,9 +3487,16 @@ async fn duplicate_reverse_traffic_data_burst_is_acked_but_not_reprocessed() {
 }
 
 #[tokio::test]
-async fn traffic_mo_sms_without_subscriber_sends_temporary_cause_code() {
+async fn traffic_mo_sms_without_cached_subscriber_is_forwarded_to_the_msc() {
+    let (msc_client, msc_endpoint) = crate::a1_edge::InProcessMscClient::pair(16);
     let (mut bsc, mut traffic_rx, walsh_code) =
-        test_bsc_with_active_traffic_channel(SERVICE_OPTION_SMS).await;
+        test_bsc_with_active_traffic_channel_and_msc_client(
+            SERVICE_OPTION_SMS,
+            Arc::new(msc_client),
+        )
+        .await;
+    bsc.mobiles
+        .update_tc(TEST_CELL, walsh_code, |_, tc| tc.a1_call_id = Some(42));
     bsc.mobiles[0].phone_number = None;
     bsc.mobiles[0].subscriber_id = None;
 
@@ -3547,9 +3537,9 @@ async fn traffic_mo_sms_without_subscriber_sends_temporary_cause_code() {
     let fields = cause_fields.expect("expected SMS Cause Code DBM");
     assert_eq!(fields[0], 0x02, "SMS Acknowledge message type");
     assert_eq!(fields[1], 0x07, "Cause Codes parameter");
-    assert_eq!(fields[2], 0x02, "temporary error includes CAUSE_CODE octet");
-    assert_eq!(fields[3] & 0x03, 0b10, "temporary ERROR_CLASS");
-    assert_eq!(fields[4], 0x03, "SMS_CauseCode NetworkFailure");
+    assert_eq!(fields[3] & 0x03, 0, "the radio received the message");
+    let outbound = next_a1_from_bsc(&msc_endpoint, cdma_ios::MessageType::AddsDeliver).await;
+    assert_eq!(outbound.call_id(), Some(42));
 }
 
 #[tokio::test]
@@ -6017,6 +6007,7 @@ fn rc3_mux1_signaling_only_frame_is_not_voice_payload() {
 async fn registration_from_paged_ms_cancels_retry_and_delivers_sms() {
     let bts_client = Arc::new(CapturingBtsClient::default());
 
+    let (msc_client, msc_endpoint) = crate::a1_edge::InProcessMscClient::pair(16);
     let mut bsc = Bsc::new(Config {
         bts: test_registry(
             OverheadParameters::default(),
@@ -6036,7 +6027,7 @@ async fn registration_from_paged_ms_cancels_retry_and_delivers_sms() {
         paging_broadcast: None,
         traffic_broadcast: None,
         hlr_repo: None,
-        msc_client: test_msc_client(),
+        msc_client: Arc::new(msc_client),
         traffic_retry: TrafficRetryConfig::default(),
         voice_timeouts: Default::default(),
         pcf_client: None,
@@ -6082,6 +6073,27 @@ async fn registration_from_paged_ms_cancels_retry_and_delivers_sms() {
 
     registration.msg_seq = Some(4);
     bsc.inject_access_event(registration).await;
+    assert!(
+        bsc.paging.has_pending_page(),
+        "registration must wait for the MSC"
+    );
+    let mut call_id = None;
+    while let Ok(Some(message)) =
+        tokio::time::timeout(Duration::from_millis(10), msc_endpoint.recv_from_bsc()).await
+    {
+        call_id = message.call_id();
+    }
+    let accept = cdma_ios::LocationUpdatingAcceptMessage {
+        location_area_identification: None,
+    };
+    bsc.handle_incoming_a1_message(cdma_ios::EncodedA1Message::from_message_for_call(
+        &cdma_ios::Message::new(
+            cdma_ios::MessageType::LocationUpdatingAccept,
+            accept.encode().unwrap(),
+        ),
+        call_id,
+    ))
+    .await;
 
     assert!(
         !bsc.paging.has_pending_page(),
@@ -6407,12 +6419,6 @@ fn access_duplicate_detection_clears_after_inactivity_timeout() {
         "stale MSG_SEQ state should be cleared after inactivity"
     );
 }
-
-// order_ack_excludes_just_delivered_sms_from_immediate_redelivery_query removed:
-// schedule_redelivery_for_mobile is removed; SMSC redelivery is MSC-owned.
-
-// active_traffic_sms_sweep_enqueues_address_targeted_submission removed:
-// schedule_redelivery_for_active_traffic_mobiles is removed; MSC owns SMS coordination.
 
 #[test]
 fn pch_l2_ack_clears_pending_sms_ack() {
@@ -6947,6 +6953,13 @@ fn build_welcome_test_bsc(
     _sms_tx: mpsc::Sender<SmsRequest>,
     _welcome_cfg: Option<cdma_msc::WelcomeSmsConfig>,
 ) -> Bsc {
+    build_welcome_test_bsc_with_msc(hlr, test_msc_client())
+}
+
+fn build_welcome_test_bsc_with_msc(
+    hlr: Arc<FakeHlrRepository>,
+    msc_client: Arc<dyn crate::a1_edge::MscClient>,
+) -> Bsc {
     Bsc::new(Config {
         bts: test_registry(OverheadParameters::default(), None),
         traffic_assignment: TrafficAssignmentConfig::default(),
@@ -6963,7 +6976,7 @@ fn build_welcome_test_bsc(
         paging_broadcast: None,
         traffic_broadcast: None,
         hlr_repo: Some(hlr as Arc<dyn HlrRepository>),
-        msc_client: test_msc_client(),
+        msc_client,
         traffic_retry: TrafficRetryConfig::default(),
         voice_timeouts: Default::default(),
         pcf_client: None,
@@ -7028,14 +7041,15 @@ fn registration_event() -> AccessChannelEvent {
     evt.imsi_mcc = Some(310);
     evt.imsi_11_12 = Some(99);
     evt.mob_p_rev = Some(6);
+    evt.scm = Some(0x2a);
     evt.slot_cycle_index = Some(2);
     evt
 }
 
 async fn drain_hlr_and_apply(bsc: &mut Bsc) {
     tokio::time::sleep(Duration::from_millis(50)).await;
-    while let Ok(result) = bsc.access_identity.results.try_recv() {
-        bsc.handle_access_identity_result(result).await;
+    while let Ok(result) = bsc.access_identity.wakeups.try_recv() {
+        bsc.handle_access_identity_wakeup(result).await;
     }
     while let Ok(resolution) = bsc.hlr_result_rx.try_recv() {
         bsc.apply_hlr_resolution(resolution);
@@ -7043,21 +7057,20 @@ async fn drain_hlr_and_apply(bsc: &mut Bsc) {
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
-/// Welcome SMS is now MSC-owned. BSC still calls upsert_mobile_seen on
-/// registration so the HLR sightings ledger stays current.
 #[tokio::test]
-async fn registration_upserts_mobile_seen_in_hlr() {
+async fn registration_only_resolves_display_metadata_in_hlr() {
     let hlr = fake_hlr_for_welcome(cdma_hlr::MobileSeenUpsert {
         is_new: true,
         previous_last_seen_at: None,
     });
-    let (sms_tx, _sms_rx) = mpsc::channel(4);
-    let mut bsc = build_welcome_test_bsc(hlr, sms_tx, None);
+    let mut bsc = build_welcome_test_bsc_with_msc(
+        hlr.clone(),
+        Arc::new(crate::bsc::test_utils::AutoAssignmentMscClient::without_registration_accept()),
+    );
 
     bsc.inject_access_event(registration_event()).await;
     drain_hlr_and_apply(&mut bsc).await;
 
-    // The mobile should be registered and resolved via HLR.
     assert_eq!(
         bsc.mobiles.tracked_count(),
         1,
@@ -7066,6 +7079,15 @@ async fn registration_upserts_mobile_seen_in_hlr() {
     assert!(
         bsc.mobiles[0].phone_number.is_some(),
         "HLR resolution should populate phone_number"
+    );
+    assert_eq!(
+        hlr.binding_writes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        bsc.mobiles[0].registration_status,
+        super::mobiles::RegistrationStatus::Pending
     );
 }
 
@@ -7532,6 +7554,14 @@ async fn authenticated_registration_waits_for_the_msc_and_relays_its_reject() {
         rand: Some(0xAB00_0001),
     });
     bsc.inject_access_event(registration).await;
+    assert_eq!(
+        bsc.mobiles[0].registration_status,
+        super::mobiles::RegistrationStatus::Pending
+    );
+    assert_eq!(
+        bsc.mobiles.snapshot(&bsc.config.bts)[0].state,
+        "Registering"
+    );
 
     let outbound = tokio::time::timeout(Duration::from_secs(1), msc_endpoint.recv_from_bsc())
         .await
@@ -7578,6 +7608,240 @@ async fn authenticated_registration_waits_for_the_msc_and_relays_its_reject() {
             (REGISTRATION_ORDER, REGISTRATION_REJECTED_ORDQ)
         ]
     );
+    assert_eq!(
+        bsc.mobiles[0].registration_status,
+        super::mobiles::RegistrationStatus::Rejected
+    );
+    assert_eq!(
+        bsc.mobiles.snapshot(&bsc.config.bts)[0].state,
+        "RegistrationRejected"
+    );
+    let address = bsc.mobiles[0].fwd_address.clone();
+    bsc.mobiles.mark_registered(&address);
+    assert_eq!(
+        bsc.mobiles.snapshot(&bsc.config.bts)[0].state,
+        "RegistrationRejected"
+    );
+}
+
+fn msc_registration_bsc(
+    bts_client: &Arc<CapturingNetworkBtsClient>,
+) -> (Bsc, crate::a1_edge::InProcessMscEndpoint) {
+    let (msc_client, msc_endpoint) = crate::a1_edge::InProcessMscClient::pair(4);
+    let msc: Arc<dyn crate::a1_edge::MscClient> = Arc::new(msc_client);
+    let bts = test_registry(
+        OverheadParameters::default(),
+        Some(bts_client.clone() as Arc<dyn BtsControlClient>),
+    );
+    let bsc = Bsc::new(Config {
+        bts,
+        traffic_assignment: TrafficAssignmentConfig::default(),
+        access_event_rx: None,
+        cell_detach_rx: None,
+        access_event_broadcast: None,
+        sms_request_rx: None,
+        sms_request_tx: None,
+        data_request_rx: None,
+        data_request_tx: None,
+        power_override_request_rx: None,
+        power_override_request_tx: None,
+        mobiles_tx: None,
+        paging_broadcast: None,
+        traffic_broadcast: None,
+        hlr_repo: None,
+        msc_client: msc,
+        traffic_retry: TrafficRetryConfig::default(),
+        voice_timeouts: Default::default(),
+        pcf_client: None,
+        mobile_idle_timeout_s: 0,
+        bts_paging_state: None,
+        node_id: "bsc-closed-test".to_string(),
+        msc_voice_bearer: None,
+    });
+    (bsc, msc_endpoint)
+}
+
+#[tokio::test]
+async fn registration_waits_for_the_msc_and_rejects_on_timeout() {
+    const BS_ACK_ORDER: u8 = 0b010000;
+    const REGISTRATION_ORDER: u8 = 0b011011;
+    const REGISTRATION_REJECTED_ORDQ: u8 = 0b10;
+
+    let bts_client = test_capturing_bts_client(
+        Arc::new(Mutex::new(WalshAllocator::new())),
+        Arc::new(ChannelRegistry::new()),
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let (mut bsc, msc_endpoint) = msc_registration_bsc(&bts_client);
+    bsc.inject_access_event(registration_event()).await;
+    assert_eq!(
+        bsc.mobiles[0].registration_status,
+        super::mobiles::RegistrationStatus::Pending
+    );
+    assert_eq!(
+        bsc.mobiles.snapshot(&bsc.config.bts)[0].state,
+        "Registering"
+    );
+
+    let outbound = tokio::time::timeout(Duration::from_secs(1), msc_endpoint.recv_from_bsc())
+        .await
+        .expect("Location Updating Request should be sent")
+        .expect("A1 endpoint should receive it");
+    let call_id = outbound
+        .call_id()
+        .expect("a held registration is correlated");
+    let lur =
+        cdma_ios::CompleteLayer3InformationMessage::decode(&outbound.decode().unwrap().payload)
+            .unwrap()
+            .layer3_information
+            .decode_location_updating_request()
+            .unwrap();
+    assert_eq!(
+        lur.authentication_event, None,
+        "AUTH = '00' cells do not report missing authentication"
+    );
+    assert_eq!(
+        pch_orders(&bts_client),
+        vec![(BS_ACK_ORDER, 0)],
+        "only the layer 2 acknowledgment goes out before the MSC answers"
+    );
+
+    bsc.expire_pending_registrations();
+    assert_eq!(
+        pch_orders(&bts_client).len(),
+        1,
+        "the MSC still has time to answer"
+    );
+    bsc.expire_pending_registrations_at(
+        tokio::time::Instant::now() + super::a1::REGISTRATION_RESULT_TIMEOUT,
+    );
+    assert_eq!(
+        pch_orders(&bts_client),
+        vec![
+            (BS_ACK_ORDER, 0),
+            (REGISTRATION_ORDER, REGISTRATION_REJECTED_ORDQ)
+        ]
+    );
+
+    let accept = cdma_ios::LocationUpdatingAcceptMessage {
+        location_area_identification: None,
+    };
+    bsc.handle_incoming_a1_message(crate::a1_edge::EncodedA1Message::from_message_for_call(
+        &cdma_ios::Message::new(
+            cdma_ios::MessageType::LocationUpdatingAccept,
+            accept.encode().unwrap(),
+        ),
+        Some(call_id),
+    ))
+    .await;
+    assert_eq!(
+        pch_orders(&bts_client).len(),
+        2,
+        "a late accept cannot reverse the timeout"
+    );
+    assert_eq!(
+        bsc.mobiles[0].registration_status,
+        super::mobiles::RegistrationStatus::Rejected
+    );
+    assert_eq!(
+        bsc.mobiles.snapshot(&bsc.config.bts)[0].state,
+        "RegistrationRejected"
+    );
+}
+
+#[tokio::test]
+async fn registration_relays_the_msc_accept() {
+    const REGISTRATION_ORDER: u8 = 0b011011;
+
+    let bts_client = test_capturing_bts_client(
+        Arc::new(Mutex::new(WalshAllocator::new())),
+        Arc::new(ChannelRegistry::new()),
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let (mut bsc, msc_endpoint) = msc_registration_bsc(&bts_client);
+    bsc.inject_access_event(registration_event()).await;
+    assert_eq!(
+        bsc.mobiles[0].registration_status,
+        super::mobiles::RegistrationStatus::Pending
+    );
+    assert_eq!(
+        bsc.mobiles.snapshot(&bsc.config.bts)[0].state,
+        "Registering"
+    );
+    let outbound = tokio::time::timeout(Duration::from_secs(1), msc_endpoint.recv_from_bsc())
+        .await
+        .unwrap()
+        .unwrap();
+    let accept = cdma_ios::LocationUpdatingAcceptMessage {
+        location_area_identification: None,
+    };
+    bsc.handle_incoming_a1_message(crate::a1_edge::EncodedA1Message::from_message_for_call(
+        &cdma_ios::Message::new(
+            cdma_ios::MessageType::LocationUpdatingAccept,
+            accept.encode().unwrap(),
+        ),
+        outbound.call_id(),
+    ))
+    .await;
+    assert!(
+        pch_orders(&bts_client)
+            .iter()
+            .any(|(order, ordq)| *order == REGISTRATION_ORDER && *ordq == 0),
+        "Registration Accepted Order follows the MSC accept"
+    );
+    assert_eq!(bsc.mobiles[0].state, MsState::Registered);
+    assert_eq!(bsc.mobiles.snapshot(&bsc.config.bts)[0].state, "Registered");
+}
+
+#[tokio::test]
+async fn clear_before_assignment_ends_the_mobiles_access_attempt() {
+    const INTERCEPT_ORDER: u8 = 0b001001;
+    const RELEASE_ORDER: u8 = 0b010101;
+    for (leg_role, expected) in [
+        (VoiceLegRole::Caller, INTERCEPT_ORDER),
+        (VoiceLegRole::Callee, RELEASE_ORDER),
+    ] {
+        let bts_client = test_capturing_bts_client(
+            Arc::new(Mutex::new(WalshAllocator::new())),
+            Arc::new(ChannelRegistry::new()),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let (mut bsc, _msc_endpoint) = msc_registration_bsc(&bts_client);
+        bsc.inject_access_event(registration_event()).await;
+        let fwd_address = bsc.mobiles[0].fwd_address.clone();
+        let before = pch_orders(&bts_client).len();
+        const CALL_ID: u64 = 4242;
+        bsc.a1.push_pending_assignment(
+            CALL_ID,
+            super::a1::PendingA1Assignment {
+                fwd_address,
+                ack_msg_seq: 0,
+                requested_tx_time: None,
+                tx_deadline: None,
+                kind: PendingA1AssignmentKind::Voice {
+                    session_id: uuid::Uuid::new_v4(),
+                    leg_role,
+                    renegotiate_from_so: None,
+                },
+                bind_existing_traffic: false,
+            },
+        );
+        bsc.handle_a1_clear_command(
+            Some(CALL_ID),
+            cdma_ios::ClearCommandMessage {
+                cause: cdma_ios::Cause(0x09),
+                cause_layer3: None,
+            },
+        );
+        assert_eq!(
+            pch_orders(&bts_client)[before..],
+            [(expected, 0)],
+            "{leg_role:?}"
+        );
+    }
 }
 
 #[test]
@@ -8202,6 +8466,7 @@ async fn meid_response_requires_recent_query_and_matching_cell() {
     assert_eq!(bsc.mobiles[0].meid.as_deref(), Some("00123456789ABC"));
     assert!(bsc.mobiles[0].meid_query.is_none());
     drain_hlr_and_apply(&mut bsc).await;
+    drain_hlr_and_apply(&mut bsc).await;
     assert_eq!(bsc.mobiles[0].subscriber_id, Some(subscriber_id));
     assert_eq!(bsc.mobiles[0].phone_number.as_deref(), Some("5550001"));
     bsc.mobiles.update(&addr, |mobile| {
@@ -8266,12 +8531,12 @@ fn meid_access_response(original: &AccessChannelEvent) -> AccessChannelEvent {
     event
 }
 
-async fn complete_access_lookup(bsc: &mut Bsc) {
-    let result = tokio::time::timeout(Duration::from_secs(1), bsc.access_identity.results.recv())
+async fn process_identity_wakeup(bsc: &mut Bsc) {
+    let result = tokio::time::timeout(Duration::from_secs(1), bsc.access_identity.wakeups.recv())
         .await
         .unwrap()
         .unwrap();
-    bsc.handle_access_identity_result(result).await;
+    bsc.handle_access_identity_wakeup(result).await;
 }
 
 #[tokio::test]
@@ -8292,7 +8557,7 @@ async fn cold_registration_discovers_meid_before_a1_with_and_without_authr() {
         event.receive_time = Some(chrono::Utc::now());
         let addr = bsc.extract_fwd_address(&event).unwrap();
         bsc.inject_access_event(event.clone()).await;
-        complete_access_lookup(&mut bsc).await;
+        process_identity_wakeup(&mut bsc).await;
         assert!(bsc.access_identity.is_pending(&addr, event.cell));
         let query = bsc.mobiles.get(&addr).unwrap().meid_query.unwrap().sent_at;
         assert!(
@@ -8309,7 +8574,7 @@ async fn cold_registration_discovers_meid_before_a1_with_and_without_authr() {
             query
         );
         bsc.inject_access_event(meid_access_response(&event)).await;
-        complete_access_lookup(&mut bsc).await;
+        process_identity_wakeup(&mut bsc).await;
         assert!(!bsc.access_identity.is_pending(&addr, event.cell));
         let message = tokio::time::timeout(Duration::from_secs(1), endpoint.recv_from_bsc())
             .await
@@ -8322,6 +8587,11 @@ async fn cold_registration_discovers_meid_before_a1_with_and_without_authr() {
             .layer3_information
             .decode_location_updating_request()
             .unwrap();
+        assert_eq!(
+            request.slot_cycle_index,
+            event.slot_cycle_index.map(cdma_ios::SlotCycleIndex)
+        );
+        assert!(request.classmark_information_type_2.is_some());
         assert_eq!(
             request.mobile_identity_meid,
             super::a1::meid_identity_from_hex("00123456789ABC")
@@ -8342,11 +8612,11 @@ async fn cold_registration_discovers_meid_before_a1_with_and_without_authr() {
             request.authentication_parameter_count.map(|value| value.0),
             authentication.map(|value| value.count)
         );
+        drain_hlr_and_apply(&mut bsc).await;
         assert_eq!(
             bsc.mobiles.get(&addr).unwrap().subscriber_id,
             Some(hlr.subscriber.subscriber_id)
         );
-        drain_hlr_and_apply(&mut bsc).await;
         assert_eq!(
             hlr.binding_writes
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -8379,7 +8649,7 @@ async fn subscriber_dependent_access_procedures_share_meid_discovery() {
         event.authentication = None;
         let addr = bsc.extract_fwd_address(&event).unwrap();
         bsc.inject_access_event(event.clone()).await;
-        complete_access_lookup(&mut bsc).await;
+        process_identity_wakeup(&mut bsc).await;
         assert!(
             bsc.access_identity.is_pending(&addr, event.cell),
             "{message_id:?}"
@@ -8400,7 +8670,7 @@ async fn meid_discovery_timeout_resumes_existing_policy_once_and_ignores_late_re
     event.scm = Some(0x38);
     let addr = bsc.extract_fwd_address(&event).unwrap();
     bsc.inject_access_event(event.clone()).await;
-    complete_access_lookup(&mut bsc).await;
+    process_identity_wakeup(&mut bsc).await;
     bsc.expire_access_identities(bsc.access_identity.next_deadline().unwrap())
         .await;
     assert!(!bsc.access_identity.is_pending(&addr, event.cell));
@@ -8426,11 +8696,11 @@ async fn newer_access_and_cell_detach_cancel_stale_identity_lookup() {
     tokio::task::yield_now().await;
     event.msg_seq = Some(2);
     bsc.inject_access_event(event.clone()).await;
-    complete_access_lookup(&mut bsc).await;
+    process_identity_wakeup(&mut bsc).await;
     assert!(bsc.access_identity.is_pending(&addr, event.cell));
     bsc.handle_cell_detached(event.cell.unwrap()).await;
-    while let Ok(result) = bsc.access_identity.results.try_recv() {
-        bsc.handle_access_identity_result(result).await;
+    while let Ok(result) = bsc.access_identity.wakeups.try_recv() {
+        bsc.handle_access_identity_wakeup(result).await;
     }
     assert!(!bsc.access_identity.is_pending(&addr, event.cell));
     assert!(
@@ -8492,9 +8762,9 @@ async fn cold_origination_and_page_response_resume_with_original_authentication(
             });
         }
         bsc.inject_access_event(event.clone()).await;
-        complete_access_lookup(&mut bsc).await;
+        process_identity_wakeup(&mut bsc).await;
         bsc.inject_access_event(meid_access_response(&event)).await;
-        complete_access_lookup(&mut bsc).await;
+        process_identity_wakeup(&mut bsc).await;
         let encoded = tokio::time::timeout(Duration::from_secs(1), endpoint.recv_from_bsc())
             .await
             .unwrap()
@@ -8543,6 +8813,22 @@ async fn cold_origination_and_page_response_resume_with_original_authentication(
         }
         assert!(!bsc.access_identity.is_pending(&addr, event.cell));
         assert_eq!(bsc.mobiles.get(&addr).unwrap().last_msg_seq, 2);
+        assert_eq!(
+            bsc.mobiles.get(&addr).unwrap().registration_status,
+            super::mobiles::RegistrationStatus::Unregistered
+        );
+        bsc.handle_a1_clear_command(
+            encoded.call_id(),
+            cdma_ios::ClearCommandMessage {
+                cause: cdma_ios::Cause(0x09),
+                cause_layer3: None,
+            },
+        );
+        bsc.mobiles.mark_registered(&addr);
+        assert_eq!(
+            bsc.mobiles.snapshot(&bsc.config.bts)[0].state,
+            "NotRegistered"
+        );
     }
 }
 
@@ -8566,9 +8852,9 @@ async fn cold_access_sms_resumes_with_meid_and_original_payload() {
         rand: Some(0xab00_0001),
     });
     bsc.inject_access_event(event.clone()).await;
-    complete_access_lookup(&mut bsc).await;
+    process_identity_wakeup(&mut bsc).await;
     bsc.inject_access_event(meid_access_response(&event)).await;
-    complete_access_lookup(&mut bsc).await;
+    process_identity_wakeup(&mut bsc).await;
     let encoded = tokio::time::timeout(Duration::from_secs(1), endpoint.recv_from_bsc())
         .await
         .unwrap()
@@ -8599,7 +8885,7 @@ async fn cold_access_sms_resumes_with_meid_and_original_payload() {
 }
 
 #[tokio::test]
-async fn hlr_failure_resumes_policy_without_requesting_meid() {
+async fn meid_discovery_does_not_require_an_available_hlr() {
     let (mut bsc, endpoint, hlr) = cold_meid_bsc();
     let mut failed = (*hlr).clone();
     failed.fail_identity_lookup = true;
@@ -8608,9 +8894,12 @@ async fn hlr_failure_resumes_policy_without_requesting_meid() {
     event.scm = Some(0x38);
     let addr = bsc.extract_fwd_address(&event).unwrap();
     bsc.inject_access_event(event.clone()).await;
-    complete_access_lookup(&mut bsc).await;
+    process_identity_wakeup(&mut bsc).await;
+    assert!(bsc.access_identity.is_pending(&addr, event.cell));
+    assert!(bsc.mobiles.get(&addr).unwrap().meid_query.is_some());
+    bsc.inject_access_event(meid_access_response(&event)).await;
+    process_identity_wakeup(&mut bsc).await;
     assert!(!bsc.access_identity.is_pending(&addr, event.cell));
-    assert!(bsc.mobiles.get(&addr).unwrap().meid_query.is_none());
     assert!(recv_a1_with_timeout(&endpoint).await.is_some());
 }
 
@@ -8624,12 +8913,12 @@ async fn data_bursts_survive_new_registration_and_share_meid_discovery() {
     event.data_burst_fields = Some(vec![1, 2, 3]);
     let addr = bsc.extract_fwd_address(&event).unwrap();
     bsc.inject_access_event(event.clone()).await;
-    complete_access_lookup(&mut bsc).await;
+    process_identity_wakeup(&mut bsc).await;
     let query = bsc.mobiles.get(&addr).unwrap().meid_query.unwrap().sent_at;
     event.msg_seq = Some(2);
     event.data_burst_fields = Some(vec![4, 5, 6]);
     bsc.inject_access_event(event.clone()).await;
-    complete_access_lookup(&mut bsc).await;
+    process_identity_wakeup(&mut bsc).await;
     assert_eq!(
         bsc.mobiles.get(&addr).unwrap().meid_query.unwrap().sent_at,
         query
@@ -8637,11 +8926,11 @@ async fn data_bursts_survive_new_registration_and_share_meid_discovery() {
     event.message_id = MessageId::Registration;
     event.msg_seq = Some(3);
     bsc.inject_access_event(event.clone()).await;
-    complete_access_lookup(&mut bsc).await;
+    process_identity_wakeup(&mut bsc).await;
     bsc.inject_access_event(meid_access_response(&event)).await;
-    complete_access_lookup(&mut bsc).await;
-    complete_access_lookup(&mut bsc).await;
-    complete_access_lookup(&mut bsc).await;
+    process_identity_wakeup(&mut bsc).await;
+    process_identity_wakeup(&mut bsc).await;
+    process_identity_wakeup(&mut bsc).await;
     let mut payloads = Vec::new();
     let mut registrations = 0;
     for _ in 0..3 {
@@ -8679,7 +8968,7 @@ async fn release_cancels_pending_call_and_status_reject_resumes_registration() {
         original.scm = Some(0x38);
         let addr = bsc.extract_fwd_address(&original).unwrap();
         bsc.inject_access_event(original.clone()).await;
-        complete_access_lookup(&mut bsc).await;
+        process_identity_wakeup(&mut bsc).await;
         let mut order = original;
         order.message_id = MessageId::Order;
         order.msg_seq = Some(2);
@@ -8722,18 +9011,20 @@ async fn changed_hardware_does_not_reuse_meid_or_subscriber_cache() {
     original.meid = Some("00123456789ABC".to_string());
     let addr = bsc.extract_fwd_address(&original).unwrap();
     bsc.inject_access_event(original.clone()).await;
-    complete_access_lookup(&mut bsc).await;
     assert!(recv_a1_with_timeout(&endpoint).await.is_some());
-    assert!(bsc.mobiles.get(&addr).unwrap().subscriber_id.is_some());
     let stale = tokio::time::timeout(Duration::from_secs(1), bsc.hlr_result_rx.recv())
         .await
         .unwrap()
         .unwrap();
+    bsc.mobiles.update(&addr, |mobile| {
+        mobile.subscriber_id = stale.subscriber_id;
+        mobile.phone_number = stale.phone_number.clone();
+    });
     let mut replacement = original;
     replacement.esn = Some(0x8765_4321);
     replacement.meid = None;
     bsc.inject_access_event(replacement.clone()).await;
-    complete_access_lookup(&mut bsc).await;
+    process_identity_wakeup(&mut bsc).await;
     bsc.apply_hlr_resolution(stale);
     let mobile = bsc.mobiles.get(&addr).unwrap();
     assert!(mobile.meid.is_none());
@@ -8752,7 +9043,7 @@ async fn changed_hardware_does_not_reuse_meid_or_subscriber_cache() {
 }
 
 #[tokio::test]
-async fn resolved_esn_identity_does_not_wait_for_meid_discovery() {
+async fn meid_discovery_is_independent_of_subscriber_matching() {
     let (mut bsc, endpoint, hlr) = cold_meid_bsc();
     let mut esn_provisioned = (*hlr).clone();
     esn_provisioned.required_meid = None;
@@ -8761,9 +9052,12 @@ async fn resolved_esn_identity_does_not_wait_for_meid_discovery() {
     event.scm = Some(0x38);
     let addr = bsc.extract_fwd_address(&event).unwrap();
     bsc.inject_access_event(event.clone()).await;
-    complete_access_lookup(&mut bsc).await;
+    process_identity_wakeup(&mut bsc).await;
+    assert!(bsc.access_identity.is_pending(&addr, event.cell));
+    assert!(bsc.mobiles.get(&addr).unwrap().meid_query.is_some());
+    bsc.inject_access_event(meid_access_response(&event)).await;
+    process_identity_wakeup(&mut bsc).await;
     assert!(!bsc.access_identity.is_pending(&addr, event.cell));
-    assert!(bsc.mobiles.get(&addr).unwrap().meid_query.is_none());
     assert!(recv_a1_with_timeout(&endpoint).await.is_some());
     event.msg_seq = Some(2);
     assert!(!bsc.defer_access_for_identity(&event));
@@ -8779,10 +9073,10 @@ async fn deferred_registration_retains_ingress_auth_policy_during_enrollment() {
         event.scm = Some(0x38);
         event.authentication = None;
         bsc.inject_access_event(event.clone()).await;
-        complete_access_lookup(&mut bsc).await;
+        process_identity_wakeup(&mut bsc).await;
         cell.set_auth_mode(1 - original_auth_mode);
         bsc.inject_access_event(meid_access_response(&event)).await;
-        complete_access_lookup(&mut bsc).await;
+        process_identity_wakeup(&mut bsc).await;
         let message = tokio::time::timeout(Duration::from_secs(1), endpoint.recv_from_bsc())
             .await
             .unwrap()
@@ -8814,7 +9108,7 @@ async fn identity_status_request_replaces_held_registration_ack() {
     event.scm = Some(0x38);
     bsc.inject_access_event(event).await;
     assert!(bsc.access_tx.next_held_bs_ack_due().is_some());
-    complete_access_lookup(&mut bsc).await;
+    process_identity_wakeup(&mut bsc).await;
     assert!(bsc.mobiles[0].meid_query.is_some());
     assert!(bsc.access_tx.next_held_bs_ack_due().is_none());
 }
@@ -8865,10 +9159,10 @@ async fn meid_response_ack_is_combined_with_msc_registration_result() {
     let mut event = registration_event();
     event.scm = Some(0x38);
     bsc.inject_access_event(event.clone()).await;
-    complete_access_lookup(&mut bsc).await;
+    process_identity_wakeup(&mut bsc).await;
     assert!(pch_orders(&client).is_empty());
     bsc.inject_access_event(meid_access_response(&event)).await;
-    complete_access_lookup(&mut bsc).await;
+    process_identity_wakeup(&mut bsc).await;
     let request = tokio::time::timeout(Duration::from_secs(1), endpoint.recv_from_bsc())
         .await
         .unwrap()
@@ -8888,4 +9182,257 @@ async fn meid_response_ack_is_combined_with_msc_registration_result() {
     .await;
     assert!(bsc.access_tx.next_held_bs_ack_due().is_none());
     assert_eq!(pch_orders(&client), vec![(REGISTRATION_ACCEPTED_ORDER, 0)]);
+}
+
+#[tokio::test]
+async fn cold_origination_starts_meid_discovery() {
+    let (mut bsc, _, _) = cold_meid_bsc();
+    let mut event = registration_event();
+    event.message_id = MessageId::Origination;
+    event.scm = Some(0x38);
+    let addr = bsc.extract_fwd_address(&event).unwrap();
+    assert!(bsc.defer_access_for_identity(&event));
+    process_identity_wakeup(&mut bsc).await;
+    assert!(bsc.access_identity.is_pending(&addr, event.cell));
+    assert!(bsc.mobiles.get(&addr).unwrap().meid_query.is_some());
+}
+
+#[tokio::test]
+async fn origination_replacing_registration_refreshes_meid_query() {
+    let (mut bsc, _, _) = cold_meid_bsc();
+    let mut registration = registration_event();
+    registration.scm = Some(0x38);
+    let addr = bsc.extract_fwd_address(&registration).unwrap();
+    bsc.inject_access_event(registration.clone()).await;
+    process_identity_wakeup(&mut bsc).await;
+    let first_query = bsc.mobiles.get(&addr).unwrap().meid_query.unwrap().sent_at;
+    let mut origination = registration;
+    origination.message_id = MessageId::Origination;
+    origination.msg_seq = Some(origination.msg_seq.unwrap_or_default() + 1);
+    assert!(bsc.defer_access_for_identity(&origination));
+    process_identity_wakeup(&mut bsc).await;
+    let second_query = bsc.mobiles.get(&addr).unwrap().meid_query.unwrap().sent_at;
+    assert!(second_query > first_query);
+    assert!(bsc.access_identity.is_pending(&addr, origination.cell));
+    assert!(bsc.defer_access_for_identity(&origination));
+    process_identity_wakeup(&mut bsc).await;
+    assert_eq!(
+        bsc.mobiles.get(&addr).unwrap().meid_query.unwrap().sent_at,
+        second_query
+    );
+}
+
+#[tokio::test]
+async fn otapa_on_packet_traffic_releases_data_before_paging() {
+    for packet_service in [SERVICE_OPTION_PACKET_DATA, SERVICE_OPTION_PACKET_DATA_RC3] {
+        let (mut bsc, mut events, walsh) =
+            test_bsc_with_active_traffic_channel(packet_service).await;
+        bsc.mobiles[0].mob_p_rev = 6;
+        bsc.mobiles[0].subscriber_id = Some(Uuid::new_v4());
+        bsc.mobiles[0].phone_number = Some("5551234567".to_string());
+        bsc.mobiles[0].traffic_channel.as_mut().unwrap().a1_call_id = Some(42);
+        while events.try_recv().is_ok() {}
+        let address = bsc.mobiles[0].fwd_address.clone();
+        for _ in 0..2 {
+            bsc.start_bs_voice_call_for_mobile(
+                &address,
+                cdma_common::consts::SERVICE_OPTION_OTASP,
+                Some(cdma_ios::Tag(77)),
+                Some(77),
+                None,
+            );
+        }
+        assert_eq!(bsc.voice.deferred_pages_after_release.len(), 1);
+        let deferred = &bsc.voice.deferred_pages_after_release[0];
+        assert_eq!(
+            deferred.service_option,
+            cdma_common::consts::SERVICE_OPTION_OTASP
+        );
+        assert_eq!(deferred.a1_call_id, Some(77));
+        assert!(!bsc.paging.has_pending_voice_page());
+        let traffic = bsc.mobiles[0].traffic_channel.as_ref().unwrap();
+        assert!(traffic.is_releasing());
+        assert_eq!(traffic.a1_call_id, Some(42));
+        assert_eq!(traffic.voice_service_option, None);
+        let messages: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert!(messages.iter().any(|event| {
+            event
+                .order
+                .as_ref()
+                .is_some_and(|order| order.order == RELEASE_ORDER_CODE)
+        }));
+        assert!(messages.iter().all(|event| event.service_request.is_none()));
+        complete_traffic_release_guard(&mut bsc, walsh).await;
+        assert!(bsc.mobiles[0].traffic_channel().is_none());
+        assert!(bsc.voice.deferred_pages_after_release.is_empty());
+        assert!(bsc.paging.pending_voice_page_for_address(&address));
+    }
+}
+
+#[tokio::test]
+async fn fresh_otapa_service_connect_has_no_primary_user_traffic() {
+    let (mut bsc, mut events, walsh) =
+        test_bsc_with_active_traffic_channel(cdma_common::consts::SERVICE_OPTION_OTASP).await;
+    while events.try_recv().is_ok() {}
+    bsc.send_service_connect(TEST_CELL, walsh, 0).unwrap();
+    let connect = std::iter::from_fn(|| events.try_recv().ok())
+        .find_map(|event| event.service_connect)
+        .unwrap();
+    assert_eq!(connect.connections.len(), 1);
+    assert_eq!(
+        connect.connections[0].service_option,
+        cdma_common::consts::SERVICE_OPTION_OTASP
+    );
+    assert_eq!(connect.connections[0].for_traffic, 0);
+    assert_eq!(connect.connections[0].rev_traffic, 0);
+    assert!(connect.for_sch_config.is_none());
+}
+
+#[tokio::test]
+async fn implicit_registration_waits_for_assignment_and_preserves_prior_status() {
+    use super::mobiles::RegistrationStatus;
+
+    for message_id in [MessageId::Origination, MessageId::PageResponse] {
+        for prior_status in [
+            None,
+            Some(RegistrationStatus::Accepted),
+            Some(RegistrationStatus::Rejected),
+        ] {
+            let bts_client = test_capturing_bts_client(
+                Arc::new(Mutex::new(WalshAllocator::new())),
+                Arc::new(ChannelRegistry::new()),
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(Mutex::new(Vec::new())),
+            );
+            let (mut bsc, msc_endpoint) = msc_registration_bsc(&bts_client);
+            let mut event = registration_event();
+            event.message_id = message_id;
+            if let Some(status) = prior_status {
+                super::access::AccessService.ensure_registered(&mut bsc, &event);
+                bsc.mobiles[0].registration_status = status;
+            }
+            super::access::AccessService.ensure_registered(&mut bsc, &event);
+            let expected = prior_status.unwrap_or(RegistrationStatus::Unregistered);
+            assert_eq!(bsc.mobiles[0].registration_status, expected);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), msc_endpoint.recv_from_bsc())
+                    .await
+                    .is_err()
+            );
+
+            const CALL_ID: u64 = 4242;
+            let address = bsc.mobiles[0].fwd_address.clone();
+            let pending = || super::a1::PendingA1Assignment {
+                fwd_address: address.clone(),
+                ack_msg_seq: 0,
+                requested_tx_time: None,
+                tx_deadline: None,
+                kind: PendingA1AssignmentKind::Voice {
+                    session_id: uuid::Uuid::new_v4(),
+                    leg_role: if message_id == MessageId::Origination {
+                        VoiceLegRole::Caller
+                    } else {
+                        VoiceLegRole::Callee
+                    },
+                    renegotiate_from_so: None,
+                },
+                bind_existing_traffic: false,
+            };
+            bsc.a1.push_pending_assignment(CALL_ID, pending());
+            bsc.handle_a1_clear_command(
+                Some(CALL_ID),
+                cdma_ios::ClearCommandMessage {
+                    cause: cdma_ios::Cause(0x09),
+                    cause_layer3: None,
+                },
+            );
+            assert_eq!(bsc.mobiles[0].registration_status, expected);
+            if prior_status.is_none() {
+                assert_eq!(
+                    bsc.mobiles.snapshot(&bsc.config.bts)[0].state,
+                    "NotRegistered"
+                );
+            }
+            bsc.a1.push_pending_assignment(CALL_ID, pending());
+            bsc.handle_incoming_a1_message(test_assignment_request_message(CALL_ID, 1, 3))
+                .await;
+            assert_eq!(
+                bsc.mobiles[0].registration_status,
+                RegistrationStatus::Accepted
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn traffic_activity_does_not_extend_common_channel_duplicate_lifetime() {
+    let mut bsc = test_bsc_with_max_slot_cycle_index(2);
+    let mut event = test_registration_event_with_esn(0x1234_5678, 0);
+    super::access::AccessService.ensure_registered(&mut bsc, &event);
+    let address = bsc.mobiles[0].fwd_address.clone();
+    let last_access = Instant::now();
+    bsc.mobiles[0].last_access_activity = Some(last_access);
+    let now = last_access + access::ACCESS_INACTIVITY_TIMEOUT + Duration::from_millis(1);
+    bsc.record_mobile_activity(&address, &event, now);
+    assert_eq!(bsc.mobiles[0].last_activity, Some(now));
+    assert_eq!(bsc.mobiles[0].last_access_activity, Some(last_access));
+    let mut access = AccessService::new();
+    assert!(matches!(
+        access.handle_known_mobile_msg_seq(&mut bsc.mobiles[0], &event, now),
+        access::AccessDuplicateDecision::NewSdu
+    ));
+    assert!(matches!(
+        access.handle_known_mobile_msg_seq(&mut bsc.mobiles[0], &event, now),
+        access::AccessDuplicateDecision::Duplicate { .. }
+    ));
+    event.msg_seq = Some(1);
+    assert!(matches!(
+        access.handle_known_mobile_msg_seq(&mut bsc.mobiles[0], &event, now),
+        access::AccessDuplicateDecision::NewSdu
+    ));
+}
+
+#[tokio::test]
+async fn cam_and_ecam_mark_common_channel_inactive_before_next_access() {
+    for mob_p_rev in [3, 6] {
+        let mut bsc = test_bsc_with_max_slot_cycle_index(2);
+        let mut event = test_registration_event_with_esn(0x1234_5678, 0);
+        event.mob_p_rev = Some(mob_p_rev);
+        super::access::AccessService.ensure_registered(&mut bsc, &event);
+        let address = bsc.mobiles[0].fwd_address.clone();
+        let now = Instant::now();
+        bsc.mobiles[0].last_access_activity = Some(now);
+        bsc.mobiles[0].access_msg_seq_rcvd[0] = true;
+        let params = bsc.serving_params(&address);
+        bsc.traffic_assignment
+            .send_channel_assignment(
+                &mut bsc.mobiles,
+                &bsc.access_tx,
+                &params,
+                &bsc.config.traffic_assignment,
+                &address,
+                0,
+                10,
+                Some((1, 1)),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(bsc.mobiles[0].last_access_activity, None);
+        let mut access = AccessService::new();
+        event.msg_seq = Some(2);
+        assert!(matches!(
+            access.handle_known_mobile_msg_seq(&mut bsc.mobiles[0], &event, now),
+            access::AccessDuplicateDecision::NewSdu
+        ));
+        event.msg_seq = Some(0);
+        assert!(matches!(
+            access.handle_known_mobile_msg_seq(&mut bsc.mobiles[0], &event, now),
+            access::AccessDuplicateDecision::NewSdu
+        ));
+        assert!(matches!(
+            access.handle_known_mobile_msg_seq(&mut bsc.mobiles[0], &event, now),
+            access::AccessDuplicateDecision::Duplicate { .. }
+        ));
+    }
 }

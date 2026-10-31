@@ -13,6 +13,10 @@ use crate::repository::{
     number_type_from_proto, number_type_to_proto,
 };
 
+const DEFAULT_MOBILES_SEEN_PAGE_SIZE: u32 = 50;
+const MAX_MOBILES_SEEN_PAGE_SIZE: u32 = 500;
+const MAX_ADMISSION_LABEL_LEN: usize = 64;
+
 pub struct HlrServiceImpl {
     repo: Arc<dyn HlrRepository>,
 }
@@ -20,6 +24,20 @@ pub struct HlrServiceImpl {
 impl HlrServiceImpl {
     pub fn new(repo: Arc<dyn HlrRepository>) -> Self {
         Self { repo }
+    }
+
+    async fn apply_identity_imei(
+        &self,
+        identity: model::SubscriberIdentity,
+        imei: Option<&str>,
+    ) -> Result<model::SubscriberIdentity, Status> {
+        if identity.imei.as_deref() == imei {
+            return Ok(identity);
+        }
+        self.repo
+            .set_identity_imei(identity.subscriber_identity_id, imei)
+            .await
+            .map_err(map_repo_error)
     }
 }
 
@@ -105,6 +123,7 @@ fn identity_to_proto(i: &model::SubscriberIdentity) -> proto::SubscriberIdentity
         imsi: i.imsi.clone(),
         esn: i.esn,
         meid: i.meid.clone(),
+        imei: i.imei.clone(),
         is_primary: i.is_primary,
         created_at: Some(datetime_to_timestamp(i.created_at)),
     }
@@ -182,6 +201,14 @@ fn validate_optional_meid(meid: Option<&str>) -> Result<(), Status> {
     Ok(())
 }
 
+fn validate_optional_imei(imei: Option<&str>) -> Result<(), Status> {
+    if let Some(imei) = imei {
+        model::normalize_imei(imei)
+            .map_err(|e| Status::invalid_argument(format!("invalid IMEI: {e}")))?;
+    }
+    Ok(())
+}
+
 fn parse_identity_key(
     identity: Option<proto::MobileIdentityKey>,
 ) -> Result<model::MobileIdentityKey, Status> {
@@ -230,6 +257,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         validate_phone_number(&req.phone_number)?;
         validate_optional_imsi(req.imsi.as_deref())?;
         validate_optional_meid(req.meid.as_deref())?;
+        validate_optional_imei(req.imei.as_deref())?;
 
         let number_type = number_type_from_proto(req.number_type);
         let number_plan = number_plan_from_proto(req.number_plan);
@@ -263,6 +291,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
                 )
                 .await
                 .map_err(map_repo_error)?;
+            let id = self.apply_identity_imei(id, req.imei.as_deref()).await?;
             Some(identity_to_proto(&id))
         } else {
             None
@@ -354,6 +383,95 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             .map_err(Status::internal)?;
         Ok(Response::new(proto::UpsertMobileSeenResponse {
             result: Some(mobile_seen_to_proto(&result)),
+        }))
+    }
+
+    async fn record_hardware_admission(
+        &self,
+        request: Request<proto::RecordHardwareAdmissionRequest>,
+    ) -> Result<Response<proto::RecordHardwareAdmissionResponse>, Status> {
+        let req = request.into_inner();
+        let (esn, meid) = parse_hardware_identity_key(req.identity)?;
+        let class = crate::repository::admission_class_from_proto(req.admission_class)
+            .ok_or_else(|| Status::invalid_argument("admission_class is required"))?;
+        if req.reason.len() > MAX_ADMISSION_LABEL_LEN
+            || req.base_station.len() > MAX_ADMISSION_LABEL_LEN
+        {
+            return Err(Status::invalid_argument(
+                "admission reason and base station are limited to 64 bytes",
+            ));
+        }
+        self.repo
+            .record_hardware_admission(
+                esn,
+                meid.as_deref(),
+                &model::MobileAdmission {
+                    class,
+                    reason: req.reason,
+                    base_station: req.base_station,
+                },
+            )
+            .await
+            .map_err(Status::internal)?;
+        Ok(Response::new(proto::RecordHardwareAdmissionResponse {}))
+    }
+
+    async fn record_mobile_admission(
+        &self,
+        request: Request<proto::RecordMobileAdmissionRequest>,
+    ) -> Result<Response<proto::RecordMobileAdmissionResponse>, Status> {
+        let req = request.into_inner();
+        let identity = parse_identity_key(req.identity)?;
+        let class = crate::repository::admission_class_from_proto(req.admission_class)
+            .ok_or_else(|| Status::invalid_argument("admission_class is required"))?;
+        if req.reason.len() > MAX_ADMISSION_LABEL_LEN
+            || req.base_station.len() > MAX_ADMISSION_LABEL_LEN
+        {
+            return Err(Status::invalid_argument(
+                "admission reason and base station are limited to 64 bytes",
+            ));
+        }
+        let result = self
+            .repo
+            .record_mobile_admission(
+                &identity,
+                &model::MobileAdmission {
+                    class,
+                    reason: req.reason,
+                    base_station: req.base_station,
+                },
+            )
+            .await
+            .map_err(Status::internal)?;
+        Ok(Response::new(proto::RecordMobileAdmissionResponse {
+            result: Some(mobile_seen_to_proto(&result)),
+        }))
+    }
+
+    async fn list_mobiles_seen(
+        &self,
+        request: Request<proto::ListMobilesSeenRequest>,
+    ) -> Result<Response<proto::ListMobilesSeenResponse>, Status> {
+        let req = request.into_inner();
+        let page_size = match req.page_size {
+            0 => DEFAULT_MOBILES_SEEN_PAGE_SIZE,
+            size => size.min(MAX_MOBILES_SEEN_PAGE_SIZE),
+        };
+        let (mobiles, total) = self
+            .repo
+            .list_mobiles_seen(
+                crate::repository::mobile_seen_filter_from_proto(req.filter),
+                page_size,
+                req.offset,
+            )
+            .await
+            .map_err(Status::internal)?;
+        Ok(Response::new(proto::ListMobilesSeenResponse {
+            mobiles: mobiles
+                .iter()
+                .map(crate::repository::observed_mobile_to_proto)
+                .collect(),
+            total,
         }))
     }
 
@@ -472,17 +590,33 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         let req = request.into_inner();
         let (esn, meid) = parse_hardware_identity_key(req.identity)?;
 
-        let resolved = self
-            .repo
-            .resolve_by_hardware_identity(esn, meid.as_deref())
-            .await
-            .map_err(|e| {
-                log::error!("HLR: {e}");
-                Status::internal("internal error")
-            })?;
+        let resolved = if req.match_imei {
+            self.repo
+                .resolve_by_hrpd_hardware_identity(esn, meid.as_deref())
+                .await
+        } else {
+            self.repo
+                .resolve_by_hardware_identity(esn, meid.as_deref())
+                .await
+        };
+        let resolved = resolved.map_err(|e| {
+            log::error!("HLR: {e}");
+            match e {
+                crate::repository::HardwareLookupError::Ambiguous => {
+                    Status::failed_precondition("ambiguous hardware identity")
+                }
+                crate::repository::HardwareLookupError::Unavailable(_) => {
+                    Status::internal("hardware identity lookup failed")
+                }
+            }
+        })?;
 
         Ok(Response::new(
             proto::ResolveSubscriberByHardwareIdentityResponse {
+                identities: resolved
+                    .as_ref()
+                    .map(|resolved| resolved.identities.iter().map(identity_to_proto).collect())
+                    .unwrap_or_default(),
                 subscriber: resolved
                     .as_ref()
                     .map(|r| subscriber_to_proto(&r.subscriber)),
@@ -616,23 +750,27 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
 
         validate_optional_imsi(req.imsi.as_deref())?;
         validate_optional_meid(req.meid.as_deref())?;
+        validate_optional_imei(req.imei.as_deref())?;
 
         let has_identity = req.imsi.is_some() || req.esn.is_some() || req.meid.is_some();
 
         let identity = if has_identity {
+            let identity = self
+                .repo
+                .replace_primary_identity(
+                    subscriber_id,
+                    req.imsi.as_deref(),
+                    req.esn,
+                    req.meid.as_deref(),
+                )
+                .await
+                .map_err(|e| {
+                    log::error!("HLR: {e}");
+                    Status::internal("internal error")
+                })?;
             Some(
-                self.repo
-                    .replace_primary_identity(
-                        subscriber_id,
-                        req.imsi.as_deref(),
-                        req.esn,
-                        req.meid.as_deref(),
-                    )
-                    .await
-                    .map_err(|e| {
-                        log::error!("HLR: {e}");
-                        Status::internal("internal error")
-                    })?,
+                self.apply_identity_imei(identity, req.imei.as_deref())
+                    .await?,
             )
         } else {
             None
@@ -1497,6 +1635,7 @@ mod tests {
     struct StubRepo {
         resolved: Mutex<Option<ResolvedSubscriber>>,
         last_call: Mutex<Option<(Option<u32>, Option<String>)>>,
+        ambiguous_hardware: std::sync::atomic::AtomicBool,
     }
 
     fn sample_subscriber() -> Subscriber {
@@ -1592,7 +1731,13 @@ mod tests {
             &self,
             esn: Option<u32>,
             meid: Option<&str>,
-        ) -> Result<Option<ResolvedSubscriber>, String> {
+        ) -> Result<Option<ResolvedSubscriber>, crate::repository::HardwareLookupError> {
+            if self
+                .ambiguous_hardware
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(crate::repository::HardwareLookupError::Ambiguous);
+            }
             *self.last_call.lock().unwrap() = Some((esn, meid.map(ToOwned::to_owned)));
             Ok(self.resolved.lock().unwrap().clone())
         }
@@ -1741,6 +1886,7 @@ mod tests {
                         esn: None,
                         meid: None,
                     }),
+                    match_imei: false,
                 },
             ))
             .await;
@@ -1758,6 +1904,7 @@ mod tests {
                         esn: None,
                         meid: Some("not-hex".to_string()),
                     }),
+                    match_imei: false,
                 },
             ))
             .await;
@@ -1873,6 +2020,7 @@ mod tests {
                         esn: Some(0x1234_5678),
                         meid: None,
                     }),
+                    match_imei: false,
                 },
             ))
             .await
@@ -1901,6 +2049,7 @@ mod tests {
                         esn: None,
                         meid: Some("A000000123ABCD".to_string()),
                     }),
+                    match_imei: false,
                 },
             ))
             .await
@@ -1912,5 +2061,25 @@ mod tests {
         );
         let call = stub.last_call.lock().unwrap().clone().unwrap();
         assert_eq!(call, (None, Some("a000000123abcd".to_string())));
+    }
+    #[tokio::test]
+    async fn hardware_ambiguity_has_a_structured_grpc_status() {
+        let repo = Arc::new(StubRepo::default());
+        repo.ambiguous_hardware
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let service = HlrServiceImpl::new(repo);
+        let error = service
+            .resolve_subscriber_by_hardware_identity(Request::new(
+                proto::ResolveSubscriberByHardwareIdentityRequest {
+                    identity: Some(proto::HardwareIdentityKey {
+                        esn: Some(0x1234_5678),
+                        meid: None,
+                    }),
+                    match_imei: false,
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
     }
 }

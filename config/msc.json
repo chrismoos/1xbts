@@ -10,6 +10,10 @@
     "mode": "monitor",
     "voice_privacy": "optional"
   },
+  "access": {
+    "mode": "open",
+    "register_policy": "subscriber_only"
+  },
   "voice": {
     "gateway": {
       "enabled": true,

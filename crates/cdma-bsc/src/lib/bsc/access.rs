@@ -252,27 +252,6 @@ impl AccessTx {
         Ok(())
     }
 
-    pub(crate) fn send_registration_accepted(
-        &self,
-        cell: Option<AccessCellId>,
-        addr: &MsAddress,
-        ack_msg_seq: u8,
-        requested_tx_time: Option<cdma_common::time::CdmaSystemTime>,
-        tx_deadline: Option<cdma_common::time::CdmaSystemTime>,
-    ) -> Result<(), Error> {
-        self.send_order(
-            cell,
-            addr,
-            ack_msg_seq,
-            true,
-            REGISTRATION_ORDER_CODE,
-            0,
-            "Registration Accepted Order",
-            requested_tx_time,
-            tx_deadline,
-        )
-    }
-
     pub(crate) fn send_registration_rejected(
         &self,
         cell: Option<AccessCellId>,
@@ -291,7 +270,7 @@ impl AccessTx {
         )
     }
 
-    pub(crate) fn send_registration_accepted_after_authentication(
+    pub(crate) fn send_registration_accepted(
         &self,
         cell: Option<AccessCellId>,
         addr: &MsAddress,
@@ -366,6 +345,24 @@ impl AccessTx {
         Ok(())
     }
 
+    pub(crate) fn send_intercept_order(
+        &self,
+        cell: Option<AccessCellId>,
+        addr: &MsAddress,
+    ) -> Result<(), Error> {
+        self.send_order(
+            cell,
+            addr,
+            0,
+            false,
+            super::INTERCEPT_ORDER_CODE,
+            0,
+            "Intercept Order",
+            None,
+            None,
+        )
+    }
+
     pub(crate) fn send_service_option_rejected_release(
         &self,
         cell: Option<AccessCellId>,
@@ -403,19 +400,18 @@ impl AccessService {
             return AccessDuplicateDecision::NewSdu;
         };
 
-        // Per C.S0004-E 3.1.1.2.2.2: if the MS has been inactive on
-        // the r-csch, clear MSG_SEQ_RCVD before processing to avoid
-        // false duplicate detection.
-        if let Some(last) = mobile.last_access_activity {
-            if activity_now.duration_since(last) > ACCESS_INACTIVITY_TIMEOUT {
-                mobile.access_msg_seq_rcvd = [false; 8];
-                debug!(
-                    "BSC: cleared MSG_SEQ_RCVD for {} (inactive for {:?})",
-                    format_ms_address(&mobile.fwd_address),
-                    activity_now.duration_since(last),
-                );
-            }
+        // C.S0004-E 3.1.1.2.2.2 clears MSG_SEQ_RCVD on access after common-channel inactivity.
+        if mobile
+            .last_access_activity
+            .is_none_or(|last| activity_now.duration_since(last) > ACCESS_INACTIVITY_TIMEOUT)
+        {
+            mobile.access_msg_seq_rcvd.fill(false);
+            debug!(
+                "BSC: cleared MSG_SEQ_RCVD for {} (inactive on common channel)",
+                format_ms_address(&mobile.fwd_address),
+            );
         }
+        mobile.last_access_activity = Some(activity_now);
 
         if mark_reverse_regular_msg_seq_received(&mut mobile.access_msg_seq_rcvd, msg_seq) {
             AccessDuplicateDecision::Duplicate {
@@ -433,45 +429,22 @@ impl AccessService {
         event: &AccessChannelEvent,
         update: AccessRegistrationUpdate,
     ) -> cdma_common::lac::paging_messages::MsAddress {
-        let registration_imsi = update.registration_imsi.clone();
-        let update_was_explicit = update.explicit_registration;
-        let awaits_authentication =
-            update.explicit_registration && registration_awaits_authentication(bsc, event);
+        let explicit = update.explicit_registration;
         let outcome = bsc.mobiles.apply_access_registration(event, update);
-        let authentication = awaits_authentication.then(|| {
-            let call_id = bsc.voice.allocate_mo_call_id();
-            bsc.a1.push_pending_registration(
-                call_id,
-                super::a1::PendingA1Registration {
-                    fwd_address: outcome.fwd_address.clone(),
-                    cell: event.cell,
-                },
-            );
-            (
-                super::a1::A1GlobalChallengeIes::from_event(event, true),
-                call_id,
-            )
-        });
-        // Notify the MSC on *every* event that flows through here
-        // (Registration, Origination, PageResponse, Reconnect, …) so the
-        // MSC's `mobiles_seen` table refreshes `last_seen_at` on real
-        // contact, not just on explicit Registration Messages. The MSC
-        // only sends welcome SMS on `is_new || elapsed > threshold`, so this
-        // does not multiply welcome traffic.
-        // With AUTH=01 an implicit registration is not reported separately. The
-        // Location Updating Request would carry no authentication fields and be
-        // accepted unchecked, while the originating message reaches the MSC with
-        // its own and binds the mobile only when it verifies.
-        if !update_was_explicit && bsc.access_authentication_required(event) {
+        if !explicit {
             return outcome.fwd_address;
         }
-        bsc.notify_msc_registration(
-            &outcome.fwd_address,
-            registration_imsi,
-            event.esn,
-            event.meid.clone(),
-            authentication,
+        let call_id = bsc.voice.allocate_mo_call_id();
+        bsc.a1.push_pending_registration(
+            call_id,
+            super::a1::PendingA1Registration {
+                fwd_address: outcome.fwd_address.clone(),
+                cell: event.cell,
+                received_at: tokio::time::Instant::now(),
+                event: event.clone(),
+            },
         );
+        bsc.notify_msc_registration(&outcome.fwd_address, event, call_id);
         outcome.fwd_address
     }
 
@@ -548,13 +521,9 @@ impl AccessService {
         // original L3 response. The original response has its own MSG_SEQ
         // and retransmission lifecycle on the f-csch.
         if let Some(addr) = known_mobile {
-            let identity_pending = bsc.access_identity.is_pending(&addr, event.cell);
             let duplicate_decision = bsc
                 .mobiles
                 .update(&addr, |ms| {
-                    if identity_pending {
-                        ms.last_access_activity = Some(activity_now);
-                    }
                     self.handle_known_mobile_msg_seq(ms, &event, activity_now)
                 })
                 .unwrap_or(AccessDuplicateDecision::NewSdu);
@@ -628,6 +597,9 @@ impl AccessService {
                 self.handle_registration(bsc, &event);
                 if let Some(addr) = registered_addr {
                     bsc.teardown_traffic_on_idle_registration(&addr).await;
+                    bsc.mobiles.update(&addr, |mobile| {
+                        mobile.registration_status = super::mobiles::RegistrationStatus::Pending;
+                    });
                 }
                 bsc.publish_mobiles();
             }
@@ -777,42 +749,17 @@ impl AccessService {
         // Resolve subscriber via HLR (async, fire-and-forget)
         bsc.resolve_subscriber_from_hlr(event, &fwd_address);
 
-        // With AUTH=01 the MSC decides, so only the layer-2 ack goes out now and the
-        // Registration Accepted or Rejected Order follows the Location Updating result.
-        let sent = if registration_awaits_authentication(bsc, event) {
-            if event.ack_req {
-                bsc.access_tx.send_bs_ack_order(
-                    event.cell,
-                    &fwd_address,
-                    last_msg_seq,
-                    access_response_tx_time(event),
-                    bsc.access_ack_deadline(event),
-                )
-            } else {
-                Ok(())
-            }
-        } else {
-            bsc.access_tx.send_registration_accepted(
+        if event.ack_req
+            && let Err(error) = bsc.access_tx.send_bs_ack_order(
                 event.cell,
                 &fwd_address,
                 last_msg_seq,
                 access_response_tx_time(event),
                 bsc.access_ack_deadline(event),
             )
-        };
-        if let Err(e) = sent {
-            warn!("BSC: failed to answer registration: {}", e);
-            return;
+        {
+            warn!("BSC: failed to acknowledge registration: {error}");
         }
-
-        // Per C.S0005-E §3.6.3.6: Registration → Registration Accepted/Rejected
-        // Order or Service Redirection only. No channel assignment.
-        // Voice page consumption is handled exclusively by handle_page_response()
-        // per §3.6.3.3.
-        if !registration_awaits_authentication(bsc, event) {
-            bsc.request_meid(&fwd_address, super::meid::MeidQueryChannel::Paging);
-        }
-        bsc.try_deliver_pending_sms_from_access(event, &fwd_address, "Registration");
     }
 
     pub(crate) async fn handle_order(&mut self, bsc: &mut Bsc, event: &AccessChannelEvent) {
@@ -982,12 +929,10 @@ impl AccessService {
             warn!("BSC: MO SMS dropped — originating MS has no forward address");
             return;
         };
-        let Some((originating_number, originating_subscriber_id)) =
-            bsc.mobiles.resolve_originating_sms_sender(&fwd_addr)
-        else {
-            warn!("BSC: MO SMS dropped — originating MS has no phone number in HLR");
-            return;
-        };
+        let (originating_number, originating_subscriber_id) = bsc
+            .mobiles
+            .resolve_originating_sms_sender(&fwd_addr)
+            .unwrap_or_default();
 
         let Some(sms) = bsc.decode_reverse_sms(
             fields,
@@ -1601,10 +1546,6 @@ pub(crate) fn extract_page_address(
 const REGISTRATION_ORDER_CODE: u8 = 0b011011;
 const REGISTRATION_REJECTED_ORDQ: u8 = 0b0000_0010;
 
-pub(crate) fn registration_awaits_authentication(bsc: &Bsc, event: &AccessChannelEvent) -> bool {
-    event.message_id == MessageId::Registration && bsc.access_authentication_required(event)
-}
-
 /// Requested TX time for access-coupled responses.  Send as soon as
 /// possible — T56m (200 ms) is the *maximum* allowed BS response time,
 /// not a minimum delay.
@@ -1615,23 +1556,25 @@ pub(crate) fn access_response_tx_time(
 }
 
 impl Bsc {
-    /// Notify the MSC of a registration event by sending a
-    /// `CompleteLayer3Information` carrying a `LocationUpdatingRequest` (no
-    /// call_id). The MSC uses this to update `mobiles_seen` and trigger the
-    /// welcome SMS path when appropriate. Called from `apply_registration`
-    /// whenever a new mobile entry is created or whenever the mobile sent an
-    /// explicit Registration Message; not called on repeat implicit
-    /// registrations of an already-known mobile.
     pub(crate) fn notify_msc_registration(
         &self,
         fwd_address: &MsAddress,
-        registration_imsi: Option<String>,
-        event_esn: Option<u32>,
-        event_meid: Option<String>,
-        authentication: Option<(super::a1::A1GlobalChallengeIes, u64)>,
+        event: &AccessChannelEvent,
+        call_id: u64,
     ) {
-        // ESN-only mobiles carry it in fwd_address. IMSI+ESN class-0 mobiles
-        // carry it in the access PDU addressing fields.
+        let registration_imsi = self.derive_registration_imsi(event);
+        let event_esn = event.esn;
+        let event_meid = event.meid.clone();
+        let slot_cycle_index = event
+            .slot_cycle_index
+            .or_else(|| {
+                self.mobiles
+                    .get(fwd_address)
+                    .map(|mobile| mobile.slot_cycle_index)
+            })
+            .map(cdma_ios::SlotCycleIndex);
+        let classmark_information_type_2 =
+            super::a1::build_a1_classmark_information_type_2_for_event(event, 0);
         let esn_val = event_esn.or(match fwd_address {
             MsAddress::Esn(e) => Some(*e),
             _ => None,
@@ -1644,10 +1587,10 @@ impl Bsc {
             cell: serving_cell.cell,
             sector: serving_cell.sector,
         };
-        let (auth_ies, call_id) = match authentication {
-            Some((ies, call_id)) => (ies, Some(call_id)),
-            None => (super::a1::A1GlobalChallengeIes::default(), None),
-        };
+        let auth_ies = super::a1::A1GlobalChallengeIes::from_event(
+            event,
+            self.access_authentication_required(event),
+        );
         tokio::spawn(async move {
             let mobile_identity = registration_imsi
                 .map(cdma_ios::MobileIdentity::Imsi)
@@ -1656,13 +1599,13 @@ impl Bsc {
             let lur = cdma_ios::LocationUpdatingRequestMessage {
                 mobile_identity_imsi: mobile_identity,
                 location_area_identification: None,
-                classmark_information_type_2: None,
+                classmark_information_type_2: Some(classmark_information_type_2),
                 registration_type: None,
                 mobile_identity_esn: esn_val.map(cdma_ios::MobileIdentity::Esn),
                 mobile_identity_meid: event_meid
                     .as_deref()
                     .and_then(super::a1::meid_identity_from_hex),
-                slot_cycle_index: None,
+                slot_cycle_index,
                 authentication_response_parameter: auth_ies.response,
                 authentication_confirmation_parameter: auth_ies.randc,
                 authentication_parameter_count: auth_ies.count,
@@ -1691,7 +1634,7 @@ impl Bsc {
             };
             let msg = cdma_ios::EncodedA1Message::from_message_for_call(
                 &cdma_ios::Message::new(cdma_ios::MessageType::CompleteLayer3Information, payload),
-                call_id,
+                Some(call_id),
             );
             if let Err(e) = a1_client.send_a1(msg).await {
                 log::warn!("BSC: failed to send registration notification to MSC: {e}");
@@ -1762,33 +1705,15 @@ impl Bsc {
         };
         if registration_imsi.is_none() && esn.is_none() {
             log::error!(
-                "BSC: dropping registration — no resolvable identity \
-                 (no IMSI, no S1/S2, no ESN; esn={:?}, imsi_class={:?})",
+                "BSC: subscriber display lookup skipped, incomplete identity (esn={:?}, imsi_class={:?})",
                 event.esn,
                 event.imsi_class,
             );
             return;
         }
-        let mob_p_rev_raw = event
-            .mob_p_rev
-            .or_else(|| mobile.map(|ms| ms.mob_p_rev))
-            .unwrap_or(6);
-        let mob_p_rev = mob_p_rev_raw as u32;
-        let last_msg_seq = event.msg_seq.unwrap_or(0) as u32;
-        let slot_cycle_index = event
-            .slot_cycle_index
-            .or_else(|| mobile.map(|ms| ms.slot_cycle_index))
-            .unwrap_or(0) as u32;
-        let pgslot = compute_pgslot_from_event(event)
-            .or_else(|| mobile.and_then(|ms| ms.pgslot))
-            .map(u32::from);
         let fwd_addr = fwd_address.clone();
-        let cell_params = self.config.bts.params(event.cell);
-        let page_addr = extract_page_address(event, cell_params.mcc, cell_params.imsi_11_12);
         let repo = hlr_repo.clone();
         let result_tx = self.hlr_result_tx.clone();
-        let msc_authenticates = self.access_authentication_required(event);
-        let node_id = self.config.node_id.clone();
 
         tokio::spawn(async move {
             let result = repo.resolve_by_identity(&identity_key).await;
@@ -1804,36 +1729,6 @@ impl Bsc {
                         sub_id,
                         phone,
                     );
-
-                    let binding_esn = esn.or_else(|| match &fwd_addr {
-                        MsAddress::Esn(e) => Some(*e),
-                        _ => match page_addr {
-                            Some(MsPageAddress::Esn(e)) => Some(e),
-                            _ => None,
-                        },
-                    });
-
-                    let binding = cdma_hlr::model::RegistrationBinding {
-                        subscriber_id: sub_id,
-                        serving_bs_id: node_id.clone(),
-                        state: cdma_hlr::model::RegistrationState::Registered,
-                        imsi: registration_imsi.clone(),
-                        esn: binding_esn,
-                        meid: meid.clone(),
-                        mob_p_rev: Some(mob_p_rev),
-                        pgslot,
-                        slot_cycle_index: Some(slot_cycle_index),
-                        last_msg_seq: Some(last_msg_seq),
-                        last_registered_at: chrono::Utc::now(),
-                        last_seen_at: chrono::Utc::now(),
-                        updated_at: chrono::Utc::now(),
-                    };
-
-                    if !msc_authenticates
-                        && let Err(e) = repo.upsert_registration_binding(binding.clone()).await
-                    {
-                        warn!("BSC: HLR upsert_registration_binding failed: {}", e);
-                    }
 
                     let canonical_imsi = resolved
                         .primary_identity
