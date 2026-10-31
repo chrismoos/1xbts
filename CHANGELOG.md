@@ -1,5 +1,7 @@
 # HEAD
 
+- Fix issue on Femtocells where DST not applied properly. Add optional per-site `timezone` override in `config/femto.json`.
+- Fixed the cdma-ms softphone clock reading an hour fast under daylight saving time.
 - Added network-initiated OTASP provisioning from subscriber and mobile pages.
 - MEID support added to BSC/BTS.
 - Added CAVE authentication, OTASP A-key provisioning, configurable voice privacy, and authentication activity in the dashboard.

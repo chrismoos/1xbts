@@ -6,7 +6,7 @@
 //! i.e. every real-world IANA zone with margin to spare. We still clamp
 //! defensively in case a future tzdata transition drifts further.
 
-use chrono::{DateTime, Offset, TimeZone, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Offset, TimeZone, Utc};
 use chrono_tz::{OffsetComponents, Tz};
 use serde::{Deserialize, Serialize};
 
@@ -213,6 +213,72 @@ fn resolve_zone(zone: Tz, now_utc: DateTime<Utc>) -> (i8, u8, i16) {
     )
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ZoneDst {
+    /// Standard-time offset in seconds, DST never applied. The FAP adds the DST
+    /// hour itself from the fields below, so this stays constant all year.
+    pub standard_offset_secs: i32,
+    pub daylight_savings_used: bool,
+    /// Local date of the spring-forward transition, if the zone has one.
+    pub dst_start: Option<NaiveDate>,
+    /// Local date of the fall-back transition, if the zone has one.
+    pub dst_end: Option<NaiveDate>,
+}
+
+/// Standard offset and DST window for `zone` at `now_utc`. Transitions are
+/// found by sampling each day at 12:00 UTC, clear of the overnight change.
+pub fn zone_dst(zone: Tz, now_utc: DateTime<Utc>) -> ZoneDst {
+    let local_now = zone.from_utc_datetime(&now_utc.naive_utc());
+    let offset_now = local_now.offset();
+    let standard_offset_secs =
+        offset_now.fix().local_minus_utc() - offset_now.dst_offset().num_seconds() as i32;
+
+    let year = local_now.year();
+    let mut used = false;
+    let mut dst_start = None;
+    let mut dst_end = None;
+    let mut prev: Option<bool> = None;
+    let mut day = NaiveDate::from_ymd_opt(year, 1, 1).expect("valid Jan 1");
+    let last = NaiveDate::from_ymd_opt(year, 12, 31).expect("valid Dec 31");
+    while day <= last {
+        let noon = day.and_hms_opt(12, 0, 0).expect("valid noon");
+        let active = zone
+            .from_utc_datetime(&noon)
+            .offset()
+            .dst_offset()
+            .num_seconds()
+            != 0;
+        used |= active;
+        if let Some(was) = prev {
+            if active && !was {
+                dst_start.get_or_insert(day);
+            } else if !active && was {
+                dst_end.get_or_insert(day);
+            }
+        }
+        prev = Some(active);
+        day = day.succ_opt().expect("date within year");
+    }
+
+    ZoneDst {
+        standard_offset_secs,
+        daylight_savings_used: used,
+        dst_start,
+        dst_end,
+    }
+}
+
+/// [`zone_dst`] for an IANA zone name, returning `None` if it does not
+/// parse against the embedded tzdata.
+pub fn zone_dst_by_name(name: &str, now_utc: DateTime<Utc>) -> Option<ZoneDst> {
+    Some(zone_dst(name.parse::<Tz>().ok()?, now_utc))
+}
+
+/// [`zone_dst_by_name`] evaluated at the current instant.
+pub fn zone_dst_now(name: &str) -> Option<ZoneDst> {
+    zone_dst_by_name(name, Utc::now())
+}
+
 fn minutes_clamped(secs: i32) -> i16 {
     let minutes = (secs as f64 / 60.0).round() as i32;
     minutes.clamp(-1024, 1023) as i16
@@ -314,6 +380,30 @@ mod tests {
         assert_eq!(r_jul.ltm_off, 20);
         assert_eq!(r_jul.daylt, 0);
         assert_eq!(r_jul.local_time_offset_minutes, 600);
+    }
+
+    #[test]
+    fn zone_dst_denver_has_mountain_dst() {
+        let r = zone_dst(
+            "America/Denver".parse().unwrap(),
+            at("2026-10-30T18:30:00Z"),
+        );
+        assert_eq!(r.standard_offset_secs, -7 * 3600);
+        assert!(r.daylight_savings_used);
+        assert_eq!(r.dst_start, NaiveDate::from_ymd_opt(2026, 3, 8));
+        assert_eq!(r.dst_end, NaiveDate::from_ymd_opt(2026, 11, 1));
+    }
+
+    #[test]
+    fn zone_dst_phoenix_has_no_dst() {
+        let r = zone_dst(
+            "America/Phoenix".parse().unwrap(),
+            at("2026-07-15T12:00:00Z"),
+        );
+        assert_eq!(r.standard_offset_secs, -7 * 3600);
+        assert!(!r.daylight_savings_used);
+        assert_eq!(r.dst_start, None);
+        assert_eq!(r.dst_end, None);
     }
 
     #[test]

@@ -1,4 +1,8 @@
 use super::*;
+use crate::config::TimezoneField;
+use chrono::NaiveDate;
+use std::sync::OnceLock;
+use tzf_rs::DefaultFinder;
 
 pub(super) fn leaf_name(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
@@ -36,6 +40,61 @@ fn timezone_abbreviation(offset: i32) -> &'static str {
         -5 => "EST",
         _ => "UTC",
     }
+}
+
+/// Format a UTC offset in seconds as a CWMP `LocalTimeZone` string
+/// (`"+HH:MM ABBR"`, or `"+HH:MM"` for a sub-hour offset). The Airvana
+/// format-validates the label length then derives the displayed label from the
+/// numeric offset, so the abbreviation here is cosmetic.
+pub(super) fn offset_secs_to_cwmp_timezone(secs: i32) -> String {
+    let sign = if secs < 0 { '-' } else { '+' };
+    let abs = secs.unsigned_abs();
+    let offset = format!("{sign}{:02}:{:02}", abs / 3600, (abs % 3600) / 60);
+    if abs % 3600 == 0 {
+        format!("{offset} {}", timezone_abbreviation(secs / 3600))
+    } else {
+        offset
+    }
+}
+
+/// Format a DST transition date as the CWMP `DaylightSavings{Start,End}`
+/// dateTime. The Airvana stores the local wall-clock transition, 02:00 by US
+/// convention, carried with a `Z` suffix.
+pub(super) fn dst_date_to_cwmp(date: NaiveDate) -> String {
+    format!("{}T02:00:00.000Z", date.format("%Y-%m-%d"))
+}
+
+static TZ_FINDER: OnceLock<DefaultFinder> = OnceLock::new();
+
+/// Resolve the IANA zone for a FAP GPS position given as Airvana
+/// degrees-minutes strings (latitude then longitude). Returns `None` if either
+/// coordinate does not parse or the position falls outside the boundary set.
+pub(super) fn gps_latlon_to_iana(latitude: &str, longitude: &str) -> Option<String> {
+    let lat = gps_degrees_minutes_to_decimal(latitude)?
+        .parse::<f64>()
+        .ok()?;
+    let lon = gps_degrees_minutes_to_decimal(longitude)?
+        .parse::<f64>()
+        .ok()?;
+    let name = TZ_FINDER
+        .get_or_init(DefaultFinder::new)
+        .get_tz_name(lon, lat);
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Derive one field of the CWMP `InternetGatewayDevice.Time.*` set from an IANA
+/// zone name, evaluated now so the result tracks DST transitions across
+/// provisioning cycles.
+pub(super) fn cwmp_timezone_value(zone_name: &str, field: TimezoneField) -> Option<String> {
+    let info = cdma_common::timezone::zone_dst_now(zone_name)?;
+    Some(match field {
+        TimezoneField::LocalTimeZone => offset_secs_to_cwmp_timezone(info.standard_offset_secs),
+        TimezoneField::DaylightSavingsUsed => {
+            if info.daylight_savings_used { "1" } else { "0" }.to_string()
+        }
+        TimezoneField::DaylightSavingsStart => dst_date_to_cwmp(info.dst_start?),
+        TimezoneField::DaylightSavingsEnd => dst_date_to_cwmp(info.dst_end?),
+    })
 }
 
 pub(super) fn gps_distance_meters(
@@ -113,6 +172,29 @@ mod tests {
             gps_degrees_minutes_to_decimal("-07530.000000").as_deref(),
             Some("-75.500000")
         );
+    }
+
+    #[test]
+    fn formats_offset_as_cwmp_timezone() {
+        assert_eq!(offset_secs_to_cwmp_timezone(-7 * 3600), "-07:00 MST");
+        assert_eq!(offset_secs_to_cwmp_timezone(-6 * 3600), "-06:00 CST");
+        assert_eq!(offset_secs_to_cwmp_timezone(0), "+00:00 UTC");
+        assert_eq!(offset_secs_to_cwmp_timezone(5 * 3600 + 1800), "+05:30");
+    }
+
+    #[test]
+    fn formats_dst_transition_date() {
+        let date = NaiveDate::from_ymd_opt(2026, 3, 8).unwrap();
+        assert_eq!(dst_date_to_cwmp(date), "2026-03-08T02:00:00.000Z");
+    }
+
+    #[test]
+    fn resolves_gps_position_to_iana_zone() {
+        assert_eq!(
+            gps_latlon_to_iana("+4042.000000", "-7400.000000").as_deref(),
+            Some("America/New_York")
+        );
+        assert_eq!(gps_latlon_to_iana("not-a-number", "-7400.000000"), None);
     }
 
     #[test]

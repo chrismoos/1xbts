@@ -163,6 +163,11 @@ pub struct FemtoSiteConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub onex_enabled: Option<bool>,
+    /// IANA zone (e.g. `"America/Denver"`) overriding GPS-derived timezone and
+    /// DST provisioning. When absent, the zone is resolved from the FAP's GPS
+    /// position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +186,9 @@ pub struct UnifiedSite {
     pub acs: SiteAcsCreds,
     pub sip: SiteSipCreds,
     pub segw: SiteSegwCreds,
+    /// IANA zone overriding GPS-derived timezone/DST provisioning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -290,6 +298,7 @@ impl UnifiedSite {
             evdo_color_code: self.evdo.color_code,
             evdo_tx_power: self.evdo.tx_power,
             evdo_pn_offset: self.evdo.pn_offset,
+            timezone: self.timezone.clone(),
         }
     }
 
@@ -521,13 +530,25 @@ pub enum CwmpValueSource {
     FapContext {
         context: CwmpFapValue,
     },
+    /// One field of the timezone/DST set, resolved from the FAP's GPS
+    /// position (CPE `latitude`/`longitude`) or the site timezone override.
+    Timezone {
+        latitude: String,
+        longitude: String,
+        field: TimezoneField,
+    },
 }
 
 impl CwmpValueSource {
-    pub fn cpe_parameter(&self) -> Option<&str> {
+    pub fn cpe_parameters(&self) -> Vec<&str> {
         match self {
-            Self::CpeParameter { parameter, .. } => Some(parameter),
-            Self::FapContext { .. } => None,
+            Self::CpeParameter { parameter, .. } => vec![parameter],
+            Self::FapContext { .. } => Vec::new(),
+            Self::Timezone {
+                latitude,
+                longitude,
+                ..
+            } => vec![latitude, longitude],
         }
     }
 }
@@ -537,6 +558,22 @@ impl CwmpValueSource {
 pub enum CwmpValueTransform {
     GpsDegreesMinutesToDecimalDegrees,
     GpsLongitudeToTimezone,
+}
+
+/// Which value of the CWMP `InternetGatewayDevice.Time.*` set a
+/// [`CwmpValueSource::Timezone`] produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimezoneField {
+    /// `LocalTimeZone` as the standard-time offset, DST never applied. The FAP
+    /// adds the DST hour from the `DaylightSavings*` fields.
+    LocalTimeZone,
+    /// `DaylightSavingsUsed` ("1" if the zone observes DST this year).
+    DaylightSavingsUsed,
+    /// `DaylightSavingsStart` (spring-forward, local 02:00).
+    DaylightSavingsStart,
+    /// `DaylightSavingsEnd` (fall-back, local 02:00).
+    DaylightSavingsEnd,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1009,6 +1046,32 @@ mod tests {
         assert_eq!(cfg.packet.adapter, PacketAdapter::ExternalPdsn);
         assert!(cfg.acs.require_site_approval);
         assert_eq!(cfg.sip.realm, "femto.local.1xbts.org");
+    }
+
+    #[test]
+    fn cwmp_value_source_variants_deserialize_unambiguously() {
+        let tz: CwmpValueSource = serde_json::from_str(
+            r#"{"latitude":"a.Latitude","longitude":"a.Longitude","field":"local_time_zone"}"#,
+        )
+        .expect("timezone source");
+        assert_eq!(
+            tz,
+            CwmpValueSource::Timezone {
+                latitude: "a.Latitude".into(),
+                longitude: "a.Longitude".into(),
+                field: TimezoneField::LocalTimeZone,
+            }
+        );
+        assert_eq!(tz.cpe_parameters(), vec!["a.Latitude", "a.Longitude"]);
+
+        let cpe: CwmpValueSource =
+            serde_json::from_str(r#"{"parameter":"p","transform":"gps_longitude_to_timezone"}"#)
+                .expect("cpe source");
+        assert!(matches!(cpe, CwmpValueSource::CpeParameter { .. }));
+
+        let fap: CwmpValueSource =
+            serde_json::from_str(r#"{"context":"site_sid"}"#).expect("fap source");
+        assert!(matches!(fap, CwmpValueSource::FapContext { .. }));
     }
 
     #[test]

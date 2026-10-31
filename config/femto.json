@@ -255,12 +255,48 @@
                 },
                 "xsd_type": "xsd:string",
                 "verify": true
+              }
+            ]
+          },
+          {
+            "label": "configure-time",
+            "params": [
+              {
+                "name": "InternetGatewayDevice.Time.DaylightSavingsEnd",
+                "value_from": {
+                  "latitude": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLatitude",
+                  "longitude": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLongitude",
+                  "field": "daylight_savings_end"
+                },
+                "xsd_type": "xsd:dateTime",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Time.DaylightSavingsStart",
+                "value_from": {
+                  "latitude": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLatitude",
+                  "longitude": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLongitude",
+                  "field": "daylight_savings_start"
+                },
+                "xsd_type": "xsd:dateTime",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Time.DaylightSavingsUsed",
+                "value_from": {
+                  "latitude": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLatitude",
+                  "longitude": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLongitude",
+                  "field": "daylight_savings_used"
+                },
+                "xsd_type": "xsd:boolean",
+                "verify": true
               },
               {
                 "name": "InternetGatewayDevice.Time.LocalTimeZone",
                 "value_from": {
-                  "parameter": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLongitude",
-                  "transform": "gps_longitude_to_timezone"
+                  "latitude": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLatitude",
+                  "longitude": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLongitude",
+                  "field": "local_time_zone"
                 },
                 "xsd_type": "xsd:string",
                 "verify": true
@@ -289,6 +325,7 @@
             ]
           }
         ],
+        "reapply_stages": ["configure-time"],
         "discovery_query": [
           {
             "name": "InternetGatewayDevice.X_0005B9_GPSStatus.",
@@ -668,12 +705,48 @@
                 },
                 "xsd_type": "xsd:string",
                 "verify": true
+              }
+            ]
+          },
+          {
+            "label": "configure-time",
+            "params": [
+              {
+                "name": "InternetGatewayDevice.Time.DaylightSavingsEnd",
+                "value_from": {
+                  "latitude": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLatitude",
+                  "longitude": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLongitude",
+                  "field": "daylight_savings_end"
+                },
+                "xsd_type": "xsd:dateTime",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Time.DaylightSavingsStart",
+                "value_from": {
+                  "latitude": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLatitude",
+                  "longitude": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLongitude",
+                  "field": "daylight_savings_start"
+                },
+                "xsd_type": "xsd:dateTime",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Time.DaylightSavingsUsed",
+                "value_from": {
+                  "latitude": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLatitude",
+                  "longitude": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLongitude",
+                  "field": "daylight_savings_used"
+                },
+                "xsd_type": "xsd:boolean",
+                "verify": true
               },
               {
                 "name": "InternetGatewayDevice.Time.LocalTimeZone",
                 "value_from": {
-                  "parameter": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLongitude",
-                  "transform": "gps_longitude_to_timezone"
+                  "latitude": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLatitude",
+                  "longitude": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLongitude",
+                  "field": "local_time_zone"
                 },
                 "xsd_type": "xsd:string",
                 "verify": true
@@ -802,6 +875,7 @@
             }
           }
         ],
+        "reapply_stages": ["configure-time"],
         "discovery_query": [
           {
             "name": "InternetGatewayDevice.X_0005B9_GPSStatus.",
@@ -1154,13 +1228,44 @@
             ]
           },
           {
-            "label": "configure-LocalTimeZone",
+            "label": "configure-time",
             "params": [
+              {
+                "name": "InternetGatewayDevice.Time.DaylightSavingsEnd",
+                "value_from": {
+                  "latitude": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLatitude",
+                  "longitude": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLongitude",
+                  "field": "daylight_savings_end"
+                },
+                "xsd_type": "xsd:dateTime",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Time.DaylightSavingsStart",
+                "value_from": {
+                  "latitude": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLatitude",
+                  "longitude": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLongitude",
+                  "field": "daylight_savings_start"
+                },
+                "xsd_type": "xsd:dateTime",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Time.DaylightSavingsUsed",
+                "value_from": {
+                  "latitude": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLatitude",
+                  "longitude": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLongitude",
+                  "field": "daylight_savings_used"
+                },
+                "xsd_type": "xsd:boolean",
+                "verify": true
+              },
               {
                 "name": "InternetGatewayDevice.Time.LocalTimeZone",
                 "value_from": {
-                  "parameter": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLongitude",
-                  "transform": "gps_longitude_to_timezone"
+                  "latitude": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLatitude",
+                  "longitude": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLongitude",
+                  "field": "local_time_zone"
                 },
                 "xsd_type": "xsd:string",
                 "verify": true
@@ -1189,6 +1294,7 @@
             ]
           }
         ],
+        "reapply_stages": ["configure-time"],
         "discovery_query": [
           {
             "name": "InternetGatewayDevice.X_0005B9_GPSStatus.",

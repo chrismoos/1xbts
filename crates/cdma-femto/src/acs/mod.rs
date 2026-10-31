@@ -1,7 +1,7 @@
 use crate::cell::FemtoCellState;
 use crate::config::{
     AcsConfig, CpeCredential, CwmpFapValue, CwmpObject, CwmpValueSource, CwmpValueTransform,
-    ProvisioningStage,
+    ProvisioningStage, TimezoneField,
 };
 use crate::config::{CwmpInformResponseStyle, FapImplementationKind};
 use crate::fap::{FapImplementation, SharedFapRegistry, implementation};
@@ -38,8 +38,9 @@ mod values;
 pub use server::AcsServer;
 use split::split_request;
 use values::{
-    administrative_states, cwmp_values_match, gps_degrees_minutes_to_decimal, gps_distance_meters,
-    gps_longitude_to_timezone, is_sensitive_parameter, leaf_name,
+    administrative_states, cwmp_timezone_value, cwmp_values_match, gps_degrees_minutes_to_decimal,
+    gps_distance_meters, gps_latlon_to_iana, gps_longitude_to_timezone, is_sensitive_parameter,
+    leaf_name,
 };
 
 const SESSION_COOKIE: &str = "1xbts-acs-session";
@@ -164,6 +165,7 @@ struct FapProvisioningContext {
     evdo_tx_power: Option<i32>,
     evdo_pn_offset: Option<u32>,
     term_auth_psk: Option<String>,
+    timezone: Option<String>,
 }
 
 const EVDO_SECTOR_ADMIN_UP: &str = "2";
@@ -229,6 +231,55 @@ impl AcsSession {
         }
     }
 
+    fn resolve_timezone_field(
+        &self,
+        latitude: &str,
+        longitude: &str,
+        field: TimezoneField,
+        readback: &[ParameterValue],
+    ) -> Option<String> {
+        let zone_name = self.resolve_timezone_name(latitude, longitude, readback)?;
+        let value = cwmp_timezone_value(&zone_name, field);
+        if value.is_none() {
+            log::warn!(
+                "ACS: [{}] timezone {zone_name:?} yields no value for {field:?}",
+                self.feid_tag()
+            );
+        }
+        value
+    }
+
+    fn resolve_timezone_name(
+        &self,
+        latitude: &str,
+        longitude: &str,
+        readback: &[ParameterValue],
+    ) -> Option<String> {
+        if let Some(override_zone) = self
+            .fap_context
+            .as_ref()
+            .and_then(|context| context.timezone.clone())
+        {
+            return Some(override_zone);
+        }
+        let reading = |name: &str| {
+            readback
+                .iter()
+                .find(|value| value.name == name)
+                .map(|value| value.value.clone())
+        };
+        let latitude_reading = reading(latitude)?;
+        let longitude_reading = reading(longitude)?;
+        let name = gps_latlon_to_iana(&latitude_reading, &longitude_reading);
+        if name.is_none() {
+            log::warn!(
+                "ACS: [{}] GPS {latitude_reading},{longitude_reading} did not resolve to a timezone",
+                self.feid_tag()
+            );
+        }
+        name
+    }
+
     fn derive_values(&mut self, stages: &[ProvisioningStage], readback: &[ParameterValue]) {
         self.derived_values.clear();
         for parameter in stages.iter().flat_map(|stage| &stage.params) {
@@ -259,6 +310,14 @@ impl AcsSession {
                 CwmpValueSource::FapContext { context: value } => (
                     self.resolve_fap_context_value(value),
                     "per-FAP provisioning context",
+                ),
+                CwmpValueSource::Timezone {
+                    latitude,
+                    longitude,
+                    field,
+                } => (
+                    self.resolve_timezone_field(latitude, longitude, *field, readback),
+                    "GPS position or site timezone override",
                 ),
             };
             match derived {
@@ -434,6 +493,7 @@ impl AcsSession {
             evdo_tx_power: site.evdo_tx_power,
             evdo_pn_offset: site.evdo_pn_offset,
             term_auth_psk,
+            timezone: site.timezone.clone(),
         });
     }
 
@@ -684,7 +744,8 @@ impl AcsSession {
                 crate::config::CwmpValueSource::FapContext { context } => {
                     self.resolve_fap_context_value(context)
                 }
-                crate::config::CwmpValueSource::CpeParameter { .. } => None,
+                crate::config::CwmpValueSource::CpeParameter { .. }
+                | crate::config::CwmpValueSource::Timezone { .. } => None,
             });
         let restore_value = desired.as_deref().unwrap_or(bracket.up_value.as_str());
         let label = Self::stage_label(stage, idx);
@@ -862,7 +923,8 @@ impl AcsSession {
                     .iter()
                     .flat_map(|stage| &stage.params)
                     .filter_map(|parameter| parameter.value_from.as_ref())
-                    .filter_map(|source| source.cpe_parameter().map(str::to_string)),
+                    .flat_map(|source| source.cpe_parameters())
+                    .map(str::to_string),
             )
             .chain(
                 stages
@@ -2222,6 +2284,7 @@ mod tests {
             evdo_tx_power: None,
             evdo_pn_offset: None,
             term_auth_psk: None,
+            timezone: None,
         });
         session.step(&inform(), &stages, &[], false, true);
         let query = session.step(&CwmpMessage::Empty, &stages, &[], false, true);
@@ -2303,6 +2366,7 @@ mod tests {
             evdo_tx_power: None,
             evdo_pn_offset: None,
             term_auth_psk: None,
+            timezone: None,
         });
         session.step(&inform(), &stages, &[], false, true);
         let query = session.step(&CwmpMessage::Empty, &stages, &[], false, true);
@@ -2388,6 +2452,7 @@ mod tests {
             evdo_tx_power: None,
             evdo_pn_offset: None,
             term_auth_psk: None,
+            timezone: None,
         });
         session.step(&inform(), &stages, &[], false, true);
         let query = session.step(&CwmpMessage::Empty, &stages, &[], false, true);
@@ -3111,6 +3176,7 @@ mod tests {
             evdo_tx_power: None,
             evdo_pn_offset: None,
             term_auth_psk: None,
+            timezone: None,
         });
         session.step(&inform(), &stages, &[], false, true);
         let action = report_configuration_drift(&mut session, &[], &stages, &[]);

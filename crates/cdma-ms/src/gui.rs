@@ -1183,7 +1183,7 @@ impl HandsetApp {
         }
         self.net_time = Some(NetClock {
             skew_secs: net_utc - host_unix_secs(),
-            tz_offset_secs: net_tz_offset_secs(sync.ltm_off, sync.daylt),
+            tz_offset_secs: net_tz_offset_secs(sync.ltm_off),
         });
     }
 
@@ -2075,9 +2075,13 @@ fn network_utc_secs(sys_time: u64, lp_sec: u32) -> i64 {
     CDMA_EPOCH_UNIX + (sys_time as i64 * 80) / 1000 - i64::from(lp_sec)
 }
 
-/// Local offset in seconds from LTM_OFF (30-minute units) plus the DAYLT hour.
-fn net_tz_offset_secs(ltm_off: i32, daylt: bool) -> i32 {
-    ltm_off * SECONDS_PER_HALF_HOUR + if daylt { 3600 } else { 0 }
+/// Local offset in seconds from LTM_OFF (30-minute units).
+///
+/// LTM_OFF is the full current offset of local time from System Time
+/// (C.S0005-E §3.7.2.3.2.21), so DST is already included. DAYLT is a display
+/// indicator only and must not shift the clock a second time.
+fn net_tz_offset_secs(ltm_off: i32) -> i32 {
+    ltm_off * SECONDS_PER_HALF_HOUR
 }
 
 fn format_clock(local_epoch: i64, offset_secs: i32) -> (String, String) {
@@ -2174,8 +2178,8 @@ mod tests {
     fn network_time_applies_leap_and_local_offset() {
         assert_eq!(network_utc_secs(0, 0), CDMA_EPOCH_UNIX);
         assert_eq!(network_utc_secs(1000, 18), CDMA_EPOCH_UNIX + 80 - 18);
-        assert_eq!(net_tz_offset_secs(-10, true), -4 * 3600);
-        assert_eq!(net_tz_offset_secs(11, false), 5 * 3600 + 1800);
+        assert_eq!(net_tz_offset_secs(-12), -6 * 3600);
+        assert_eq!(net_tz_offset_secs(11), 5 * 3600 + 1800);
     }
 
     #[test]
