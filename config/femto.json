@@ -325,7 +325,6 @@
             ]
           }
         ],
-        "reapply_stages": ["configure-time"],
         "discovery_query": [
           {
             "name": "InternetGatewayDevice.X_0005B9_GPSStatus.",
@@ -875,7 +874,6 @@
             }
           }
         ],
-        "reapply_stages": ["configure-time"],
         "discovery_query": [
           {
             "name": "InternetGatewayDevice.X_0005B9_GPSStatus.",
@@ -1294,7 +1292,6 @@
             ]
           }
         ],
-        "reapply_stages": ["configure-time"],
         "discovery_query": [
           {
             "name": "InternetGatewayDevice.X_0005B9_GPSStatus.",

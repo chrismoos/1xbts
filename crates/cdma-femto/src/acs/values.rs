@@ -1,6 +1,6 @@
 use super::*;
 use crate::config::TimezoneField;
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate};
 use std::sync::OnceLock;
 use tzf_rs::DefaultFinder;
 
@@ -59,9 +59,10 @@ pub(super) fn offset_secs_to_cwmp_timezone(secs: i32) -> String {
 
 /// Format a DST transition date as the CWMP `DaylightSavings{Start,End}`
 /// dateTime. The Airvana stores the local wall-clock transition, 02:00 by US
-/// convention, carried with a `Z` suffix.
+/// convention, with a `Z` suffix and no fractional seconds, the form the
+/// Airvana returns on readback.
 pub(super) fn dst_date_to_cwmp(date: NaiveDate) -> String {
-    format!("{}T02:00:00.000Z", date.format("%Y-%m-%d"))
+    format!("{}T02:00:00Z", date.format("%Y-%m-%d"))
 }
 
 static TZ_FINDER: OnceLock<DefaultFinder> = OnceLock::new();
@@ -119,15 +120,27 @@ pub(super) fn cwmp_values_match(name: &str, expected: &str, actual: &str) -> boo
     if expected == actual {
         return true;
     }
-    if !name.ends_with(ADMIN_STATE_SUFFIX) {
-        return false;
+    if name.ends_with(ADMIN_STATE_SUFFIX) {
+        return administrative_states(expected, actual)
+            .is_some_and(|(expected, actual)| expected == actual);
     }
-    let normalized = |value: &str| match value.to_ascii_lowercase().as_str() {
-        "lock" | "locked" => Some(false),
-        "unlock" | "unlocked" => Some(true),
-        _ => None,
-    };
-    normalized(expected).is_some_and(|value| normalized(actual) == Some(value))
+    if let (Some(expected), Some(actual)) = (hex_literal(expected), hex_literal(actual)) {
+        return expected.eq_ignore_ascii_case(actual);
+    }
+    match (
+        DateTime::parse_from_rfc3339(expected),
+        DateTime::parse_from_rfc3339(actual),
+    ) {
+        (Ok(expected), Ok(actual)) => expected == actual,
+        _ => false,
+    }
+}
+
+fn hex_literal(value: &str) -> Option<&str> {
+    let digits = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))?;
+    (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(digits)
 }
 
 pub(super) fn administrative_states(expected: &str, actual: &str) -> Option<(bool, bool)> {
@@ -185,7 +198,7 @@ mod tests {
     #[test]
     fn formats_dst_transition_date() {
         let date = NaiveDate::from_ymd_opt(2026, 3, 8).unwrap();
-        assert_eq!(dst_date_to_cwmp(date), "2026-03-08T02:00:00.000Z");
+        assert_eq!(dst_date_to_cwmp(date), "2026-03-08T02:00:00Z");
     }
 
     #[test]
@@ -206,5 +219,38 @@ mod tests {
         assert!(cwmp_values_match(sector, "LOCK", "locked"));
         assert!(!cwmp_values_match(one_x, "unlock", "locked"));
         assert!(!cwmp_values_match("Device.Mode", "unlock", "Unlocked"));
+    }
+
+    #[test]
+    fn compares_hex_literals_without_case() {
+        let sector_id = "Device.DOMO.is856SectorElement.sectorId";
+
+        assert!(cwmp_values_match(
+            sector_id,
+            "0x00840AC0000000000000000000000000",
+            "0x00840ac0000000000000000000000000",
+        ));
+        assert!(!cwmp_values_match(
+            sector_id,
+            "0x00840AC0000000000000000000000000",
+            "0x00840ac0000000000000000000000001",
+        ));
+        assert!(!cwmp_values_match("Device.Name", "ABC", "abc"));
+    }
+
+    #[test]
+    fn compares_date_times_as_instants() {
+        let start = "Device.Time.DaylightSavingsStart";
+
+        assert!(cwmp_values_match(
+            start,
+            "2026-03-08T02:00:00.000Z",
+            "2026-03-08T02:00:00Z",
+        ));
+        assert!(!cwmp_values_match(
+            start,
+            "2026-03-08T02:00:00Z",
+            "2026-03-08T03:00:00Z",
+        ));
     }
 }

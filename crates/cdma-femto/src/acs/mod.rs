@@ -873,7 +873,7 @@ impl AcsSession {
         for parameter in stages
             .iter()
             .flat_map(|stage| &stage.params)
-            .filter(|parameter| parameter.verify && !parameter.name.ends_with("SecurityKey"))
+            .filter(|parameter| parameter.verify)
             .filter(|parameter| {
                 parameter.value_from.is_none() || self.derived_values.contains_key(&parameter.name)
             })
@@ -1230,17 +1230,7 @@ impl AcsSession {
                 let desired = self.settled_parameters(stages);
                 let reapplied = stages
                     .iter()
-                    .filter(|stage| {
-                        self.reapply_stages.contains(&stage.label)
-                            || stage.params.iter().any(|p| {
-                                matches!(
-                                    p.value_from,
-                                    Some(CwmpValueSource::FapContext {
-                                        context: CwmpFapValue::A11SharedSecretHex
-                                    })
-                                )
-                            })
-                    })
+                    .filter(|stage| self.reapply_stages.contains(&stage.label))
                     .flat_map(|stage| stage.params.iter().map(|parameter| parameter.name.clone()))
                     .collect::<HashSet<_>>();
                 let matches = desired.iter().all(|expected| {
@@ -3612,7 +3602,7 @@ mod tests {
         assert_eq!(session.phase(), AcsPhase::Done);
     }
     #[test]
-    fn a11_keys_are_reapplied_when_spi_matches_and_after_key_rotation() {
+    fn a11_keys_are_written_only_when_readback_differs() {
         let mut stages = vec![ProvisioningStage {
             label: "pdsn".to_string(),
             atomic: true,
@@ -3654,7 +3644,8 @@ mod tests {
                 params: vec![],
             },
         );
-        for secret in ["00112233", "aabbccdd"] {
+        let secret = "aabbccdd";
+        let session_with_readback = |key: Option<&str>| {
             let mut session = airave_session();
             session.a11_provisioning = Some(crate::config::A11Provisioning(
                 cdma_a11::A11SecurityConfig {
@@ -3664,20 +3655,73 @@ mod tests {
             ));
             session.step(&inform(), &stages, &[], false, true);
             session.step(&CwmpMessage::Empty, &stages, &[], false, true);
+            let mut parameters = vec![ParameterValue {
+                name: "Pdsn.1.SecurityParameterIndex".to_string(),
+                value: "256".to_string(),
+                xsi_type: "xsd:unsignedInt".to_string(),
+            }];
+            if let Some(key) = key {
+                parameters.push(ParameterValue {
+                    name: "Pdsn.1.SecurityKey".to_string(),
+                    value: key.to_string(),
+                    xsi_type: "xsd:string".to_string(),
+                });
+            }
             let response =
                 CwmpMessage::GetParameterValuesResponse(cdma_cwmp::GetParameterValuesResponse {
-                    parameters: vec![ParameterValue {
-                        name: "Pdsn.1.SecurityParameterIndex".to_string(),
-                        value: "256".to_string(),
-                        xsi_type: "xsd:unsignedInt".to_string(),
-                    }],
+                    parameters,
                 });
-            let AcsAction::Respond(message) = session.step(&response, &stages, &[], false, true)
-            else {
-                panic!("expected key write despite matching SPI");
+            let action = session.step(&response, &stages, &[], false, true);
+            (session, action)
+        };
+
+        let (session, action) = session_with_readback(Some(secret));
+        assert!(
+            !matches!(
+                action,
+                AcsAction::Respond(ref message)
+                    if matches!(**message, CwmpMessage::SetParameterValues(_))
+            ),
+            "matching key and SPI must not be rewritten"
+        );
+        assert!(session.configuration_verified());
+
+        for readback in [Some("00112233"), None] {
+            let (mut session, delete) = session_with_readback(readback);
+            assert!(
+                matches!(
+                    delete,
+                    AcsAction::Respond(ref message)
+                        if matches!(
+                            **message,
+                            CwmpMessage::DeleteObject(ref request)
+                                if request.object_name == "Pdsn.1."
+                        )
+                ),
+                "expected PDSN entry replacement for readback {readback:?}"
+            );
+            session.step(
+                &CwmpMessage::DeleteObjectResponse(cdma_cwmp::DeleteObjectResponse { status: 0 }),
+                &stages,
+                &[],
+                false,
+                true,
+            );
+            let configure = session.step(
+                &CwmpMessage::AddObjectResponse(cdma_cwmp::AddObjectResponse {
+                    instance_number: 1,
+                    status: 0,
+                }),
+                &stages,
+                &[],
+                false,
+                true,
+            );
+            let AcsAction::Respond(message) = configure else {
+                panic!("expected key write for readback {readback:?}");
             };
             let CwmpMessage::SetParameterValues(request) = *message else {
-                panic!("expected SetParameterValues");
+                panic!("expected SetParameterValues for readback {readback:?}");
             };
             assert_eq!(
                 request
