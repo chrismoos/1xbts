@@ -1,5 +1,6 @@
 # HEAD
 
+- Ignore inactive call identities when correlating femtocell OTASP replies.
 - Improve traffic channel FER (RC1/RC2/RC3).
 - Web UI UX updates.
 - Fix issue with USB threads not getting real-time scheduling on macOS.

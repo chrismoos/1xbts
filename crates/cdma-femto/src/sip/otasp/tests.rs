@@ -182,8 +182,8 @@ async fn unacknowledged_answer_times_out_and_clears_sip_and_a1_call() {
     assert!(call.rx.try_recv().is_err());
 }
 
-#[test]
-fn duplicate_info_and_message_ack_replay_success_without_forwarding_twice() {
+#[tokio::test]
+async fn duplicate_info_and_message_ack_replay_success_without_forwarding_twice() {
     for method in [Method::Info, Method::Message] {
         let (core, mut rx) = otasp_test_core();
         core.adds_delivery_calls
@@ -224,8 +224,8 @@ fn duplicate_info_and_message_ack_replay_success_without_forwarding_twice() {
     }
 }
 
-#[test]
-fn full_msc_queue_preserves_delivery_tag_for_retry() {
+#[tokio::test]
+async fn full_msc_queue_preserves_delivery_tag_for_retry() {
     let (core, mut rx) = otasp_test_core();
     let sender = core.msc_a1_tx.as_ref().unwrap();
     while sender.try_send(burst(41)).is_ok() {}
