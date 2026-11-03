@@ -1,7 +1,8 @@
 "use client";
 
+import { useLive } from "@/lib/live";
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
 import { Card } from "@/components/card";
 import {
   mobileForPacketSession,
@@ -116,32 +117,14 @@ function healthForSession(session: PacketSessionInfo): {
   return { label: "Negotiating", className: "bg-badge-blue-bg text-badge-blue-text" };
 }
 
+const NO_SESSIONS: PacketSessionInfo[] = [];
+
 export default function PacketsPage() {
-  const [sessions, setSessions] = useState<PacketSessionInfo[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const live = useLive<{ sessions?: PacketSessionInfo[] }>("/api/packet-sessions");
+  const sessions = live.data?.sessions ?? NO_SESSIONS;
+  const { loading, error } = live;
   const mobiles = useMobileDirectory();
 
-  const fetchSessions = useCallback(async () => {
-    try {
-      const res = await fetch("/api/packet-sessions", { cache: "no-store" });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
-      setSessions(data.sessions || []);
-      setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "unknown error");
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    fetchSessions();
-    const interval = setInterval(fetchSessions, 3000);
-    return () => clearInterval(interval);
-  }, [fetchSessions]);
 
   const sortedSessions = useMemo(() => {
     const phaseRank: Record<string, number> = {

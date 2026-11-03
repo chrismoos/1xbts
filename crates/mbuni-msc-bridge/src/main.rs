@@ -438,6 +438,13 @@ mod tests {
             Err(Status::unimplemented(""))
         }
 
+        async fn release_call(
+            &self,
+            _: Request<msc_management::v1::ReleaseCallRequest>,
+        ) -> Result<Response<()>, Status> {
+            Err(Status::unimplemented(""))
+        }
+
         async fn list_base_stations(
             &self,
             _: Request<()>,
@@ -507,6 +514,12 @@ mod tests {
                     request: Request<()>,
                 ) -> Result<Response<CallList>, Status> {
                     self.0.list_calls(request).await
+                }
+                async fn release_call(
+                    &self,
+                    request: Request<msc_management::v1::ReleaseCallRequest>,
+                ) -> Result<Response<()>, Status> {
+                    self.0.release_call(request).await
                 }
                 async fn list_base_stations(
                     &self,

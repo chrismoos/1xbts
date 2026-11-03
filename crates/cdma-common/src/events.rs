@@ -18,6 +18,21 @@ impl std::fmt::Display for AccessCellId {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AccessSignal {
+    /// Eb/Nt over the probe preamble, in dB.
+    pub eb_nt_db: Option<f32>,
+    /// This mobile's preamble power referred to the ADC input, in dBFS.
+    pub signal_power_dbfs: Option<f32>,
+    /// Share of the message's code symbols demodulated wrong before decoding, in percent.
+    pub raw_ber_pct: Option<f32>,
+    /// Reverse noise floor of the cell when the probe was decoded, in dBFS.
+    pub noise_floor_dbfs: Option<f32>,
+    /// The noise floor has had no quiet period to update from recently, such
+    /// as during a call.
+    pub noise_floor_stale: bool,
+}
+
 /// Decoded access channel event surfaced from the RX pipeline to higher layers.
 #[derive(Debug, Clone)]
 pub struct AccessChannelEvent {
@@ -105,6 +120,7 @@ pub struct AccessChannelEvent {
     pub raw_power_db: Option<f32>,
     /// Demod quality percentage: 100 = all soft decisions confident, 0 = all weak.
     pub demod_quality_pct: Option<f32>,
+    pub access_signal: AccessSignal,
     /// Per-PCG reverse-link quality estimate in dB (16 entries, one per PCG).
     pub pcg_signal_snr_db: Option<Vec<f32>>,
     /// Active-PCG mask for a reverse traffic frame.

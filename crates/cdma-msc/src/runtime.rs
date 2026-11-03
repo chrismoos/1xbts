@@ -141,6 +141,8 @@ impl MtSetupError {
 /// A.S0014-D Table 4.2.34-1 Reject Cause `03H` Illegal MS.
 const REJECT_CAUSE_ILLEGAL_MS: u8 = cdma_ios::REJECT_CAUSE_ILLEGAL_MS;
 const SIP_STATUS_FORBIDDEN: u16 = 403;
+/// RFC 3261 §21.4.25. The caller's INVITE was cancelled before an answer.
+const SIP_STATUS_REQUEST_TERMINATED: u16 = 487;
 
 pub struct MscRuntimeConfig {
     /// HLR repository for subscriber lookups.
@@ -1491,6 +1493,15 @@ impl MscRuntime {
                     warn!("MSC: initiate-call response receiver dropped");
                 }
             }
+            PendingControlRequest::ReleaseCall {
+                call_id,
+                response_tx,
+            } => {
+                let result = self.release_call_on_request(a1, call_id).await;
+                if response_tx.send(result).is_err() {
+                    warn!("MSC: release-call response receiver dropped");
+                }
+            }
             PendingControlRequest::ListCalls { response_tx } => {
                 if response_tx
                     .send(Ok(self.controller.all_snapshots()))
@@ -1539,10 +1550,26 @@ impl MscRuntime {
         else {
             return Err(ManagementError::UnknownSubscriber(request.subscriber_id));
         };
-        self.start_mt_call(a1, resolved, request.caller_number, request.audio_file)
-            .await
-            .map(|call_id| InitiateCallAccepted { call_id })
-            .map_err(MtSetupError::into_management_error)
+        if let Some(service_option) = request.service_option
+            && !self
+                .config
+                .supported_voice_service_options
+                .contains(&service_option)
+        {
+            return Err(ManagementError::Rejected(format!(
+                "SO{service_option} is not a supported voice service option"
+            )));
+        }
+        self.start_mt_service(
+            a1,
+            resolved,
+            request.caller_number,
+            request.audio_file,
+            request.service_option,
+        )
+        .await
+        .map(|call_id| InitiateCallAccepted { call_id })
+        .map_err(MtSetupError::into_management_error)
     }
 
     pub(crate) async fn start_mt_call(
@@ -1818,6 +1845,33 @@ impl MscRuntime {
             self.send_paging_request_to_bsc(a1, call_id, paging_request, PagePurpose::Retry)
                 .await;
         }
+    }
+
+    async fn release_call_on_request(
+        &mut self,
+        a1: &dyn MscA1Endpoint,
+        call_id: CallId,
+    ) -> Result<(), crate::management::ManagementError> {
+        let Some(snapshot) = self.controller.snapshot(call_id) else {
+            return Err(crate::management::ManagementError::UnknownCall(call_id));
+        };
+        info!(
+            "MSC: releasing call_id={} on request (state={:?})",
+            call_id.0, snapshot.state
+        );
+        match snapshot.state {
+            cdma_ios::CallControlState::Assigned
+            | cdma_ios::CallControlState::Alerting
+            | cdma_ios::CallControlState::Connected => {
+                self.mt_page_retry.cancel(call_id);
+                self.send_clear_command(a1, call_id).await;
+            }
+            _ => {
+                self.fail_mt_call(a1, call_id, SIP_STATUS_REQUEST_TERMINATED)
+                    .await
+            }
+        }
+        Ok(())
     }
 
     /// Tear down an MT call that never reached Connect. For SIP-inbound calls
@@ -6684,11 +6738,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn handle_bsc_a1_message_completes_clear_roundtrip() {
-        let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
-
-        let mut runtime = MscRuntime::new(MscRuntimeConfig {
+    fn clear_test_runtime() -> MscRuntime {
+        MscRuntime::new(MscRuntimeConfig {
             hlr_repo: Arc::new(StubHlrRepo::default()),
             smsc_repo: None,
             welcome_sms: None,
@@ -6712,8 +6763,10 @@ mod tests {
             otasp: None,
             authentication: Default::default(),
             access: Default::default(),
-        });
+        })
+    }
 
+    fn connected_mt_call(runtime: &mut MscRuntime) -> CallId {
         let call_id = runtime.controller.create_call(
             CallDirection::MobileTerminated,
             Some(MobileIdentity::Imsi("12345678901".to_string())),
@@ -6773,6 +6826,14 @@ mod tests {
             .controller
             .apply_from_bsc(call_id, &ProcedureMessage::Connect(ConnectMessage))
             .unwrap();
+        call_id
+    }
+
+    #[tokio::test]
+    async fn handle_bsc_a1_message_completes_clear_roundtrip() {
+        let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
+        let mut runtime = clear_test_runtime();
+        let call_id = connected_mt_call(&mut runtime);
 
         let clear_request = EncodedA1Message::from_message_for_call(
             &cdma_ios::Message::new(
@@ -6813,6 +6874,76 @@ mod tests {
             .handle_bsc_a1_message(&endpoint, &test_node(), clear_complete)
             .await;
         assert_eq!(runtime.controller.active_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn release_on_request_clears_a_connected_call_through_the_bsc() {
+        let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
+        let mut runtime = clear_test_runtime();
+        let call_id = connected_mt_call(&mut runtime);
+
+        runtime
+            .release_call_on_request(&endpoint, call_id)
+            .await
+            .unwrap();
+
+        let outbound = client.poll_a1().await.unwrap();
+        assert_eq!(outbound.message_type(), cdma_ios::MessageType::ClearCommand);
+        assert_eq!(outbound.call_id(), Some(call_id.0));
+        assert_eq!(
+            runtime.controller.state(call_id),
+            Some(cdma_ios::CallControlState::Clearing)
+        );
+
+        let clear_complete = EncodedA1Message::from_message_for_call(
+            &cdma_ios::Message::new(
+                cdma_ios::MessageType::ClearComplete,
+                cdma_ios::ClearCompleteMessage {
+                    power_down_indicator: false,
+                }
+                .encode()
+                .unwrap(),
+            ),
+            Some(call_id.0),
+        );
+        runtime
+            .handle_bsc_a1_message(&endpoint, &test_node(), clear_complete)
+            .await;
+        assert_eq!(runtime.controller.active_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn release_on_request_abandons_a_call_still_being_paged() {
+        let (_client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
+        let mut runtime = clear_test_runtime();
+        let call_id = runtime.controller.create_call(
+            CallDirection::MobileTerminated,
+            Some(MobileIdentity::Imsi("12345678901".to_string())),
+        );
+        runtime
+            .controller
+            .apply_from_msc(call_id, &ProcedureMessage::PagingRequest(paging_request()))
+            .unwrap();
+
+        runtime
+            .release_call_on_request(&endpoint, call_id)
+            .await
+            .unwrap();
+
+        assert_eq!(runtime.controller.active_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn release_on_request_rejects_an_unknown_call() {
+        let (_client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
+        let mut runtime = clear_test_runtime();
+
+        let result = runtime.release_call_on_request(&endpoint, CallId(77)).await;
+
+        assert!(matches!(
+            result,
+            Err(crate::management::ManagementError::UnknownCall(CallId(77)))
+        ));
     }
 
     #[tokio::test]

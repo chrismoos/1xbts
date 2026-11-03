@@ -11,6 +11,8 @@ use super::{PipelineProcessor, SampleBlock, chips_per_sample};
 /// is being reassembled. One such frame can be message content. Two in a row
 /// is 176 zero bits, which a capsule does not carry.
 const PREAMBLE_RESYNC_FRAMES: usize = 2;
+const CODE_SYMBOLS_PER_FRAME: u64 = 576;
+const PPM: u64 = 1_000_000;
 
 /// Access Channel processor for decoded R-ACH bit streams.
 ///
@@ -28,6 +30,8 @@ pub struct AccessChannelProcessor {
     preamble_frames: usize,
     zero_frames_in_message: usize,
     near_preamble_logs: usize,
+    message_code_symbol_errors: u64,
+    message_measured_frames: u64,
 }
 
 impl AccessChannelProcessor {
@@ -53,6 +57,8 @@ impl AccessChannelProcessor {
             "finger_snr_mdb",
             "finger_signal_power_mdb",
             "finger_raw_power_mdb",
+            "access_preamble_eb_nt_mdb",
+            "access_preamble_power_mdb",
         ] {
             if let Some(value) = upstream_tags.get(key).copied() {
                 out.tags.insert(key, value);
@@ -83,6 +89,8 @@ impl AccessChannelProcessor {
             preamble_frames: 0,
             zero_frames_in_message: 0,
             near_preamble_logs: 0,
+            message_code_symbol_errors: 0,
+            message_measured_frames: 0,
         }
     }
 
@@ -120,8 +128,28 @@ impl AccessChannelProcessor {
             .insert("access_frame_quality", if frame.crc_valid { 1 } else { 0 });
         out.tags
             .insert("access_preamble_frames", self.preamble_frames as i64);
+        if self.message_measured_frames > 0 {
+            let symbols = self.message_measured_frames * CODE_SYMBOLS_PER_FRAME;
+            out.tags.insert(
+                "access_raw_ber_ppm",
+                (self.message_code_symbol_errors * PPM / symbols) as i64,
+            );
+        }
         Self::copy_context_tags(&mut out, upstream_tags);
         Self::adjust_absolute_chip_tag(&mut out, upstream_chip_start, chip_start);
+        let milli = |key| out.tags.get(key).map(|v| *v as f64 / 1000.0);
+        info!(
+            "access_signal: chip={} crc={} frames={} eb_nt_db={:?} preamble_power_dbfs={:?} raw_ber_pct={:?} band_level_dbfs={:?}",
+            chip_start,
+            frame.crc_valid,
+            self.message_measured_frames,
+            milli("access_preamble_eb_nt_mdb"),
+            milli("access_preamble_power_mdb"),
+            out.tags
+                .get("access_raw_ber_ppm")
+                .map(|v| *v as f64 / 10_000.0),
+            milli("finger_raw_power_mdb"),
+        );
 
         if frame.data.len() >= 8 {
             let mut data = frame.data.clone();
@@ -253,6 +281,14 @@ impl PipelineProcessor for AccessChannelProcessor {
                 continue;
             }
 
+            if self.reader.is_idle() {
+                self.message_code_symbol_errors = 0;
+                self.message_measured_frames = 0;
+            }
+            if let Some(&errors) = block.tags.get("access_frame_code_symbol_errors") {
+                self.message_code_symbol_errors += errors.max(0) as u64;
+                self.message_measured_frames += 1;
+            }
             let mut info = Bitstream::new_init(info_bits);
             if let Ok(Some(access_frame)) = self.reader.process(&mut info) {
                 let payload_hex = bits_to_hex(access_frame.data.bits());

@@ -12,6 +12,9 @@ use crate::phy::coding::convolutional::{
 use crate::phy::walsh::WalshGenerator;
 use crate::receiver::access::AccessFrameReader;
 
+use super::access_signal::{
+    PreambleMeasurement, PreamblePowerAccumulator, WalshSymbolPower, code_symbol_errors,
+};
 use super::{CDMA_CHIP_RATE, PipelineProcessor, SampleBlock, raw_to_soft};
 use cdma_common::consts::{
     RC1_PN_CHIPS_PER_WALSH_CHIP, RC1_SOFT_BITS_PER_SYMBOL, RC1_SYMBOLS_PER_FRAME,
@@ -30,6 +33,12 @@ const MIN_SEARCH_RETRY_BITS: usize = RC1_SOFT_BITS_PER_SYMBOL * 24;
 const SEARCH_DIAG_LOG_THRESHOLD_MS: u128 = 10;
 const W0_PEAK_RATIO_MIN: f32 = 0.10;
 const W0_MARGIN_MIN: f32 = 1.5;
+const SYMBOL_POWER_HISTORY: usize =
+    MAX_SEARCH_BUFFER / RC1_SOFT_BITS_PER_SYMBOL + RC1_SYMBOLS_PER_FRAME;
+/// C.S0005-E PAM_SZ is 4 bits, so a preamble is at most 16 frames.
+const MAX_PREAMBLE_SYMBOLS: usize = RC1_SYMBOLS_PER_FRAME * 16;
+const FRAME_INFO_BITS: usize = 88;
+const FRAME_BITS: usize = 96;
 const REPEAT_PAIR_RAW_INDICES: [(usize, usize); REPEAT_PAIR_COUNT] =
     build_repeat_pair_raw_indices();
 
@@ -84,6 +93,7 @@ struct DecodedWalshSymbol {
     row: usize,
     peak_ratio: f32,
     margin: f32,
+    power: WalshSymbolPower,
 }
 
 impl DecodedWalshSymbol {
@@ -144,6 +154,10 @@ pub struct ReverseAccessDecoder {
     last_search_len: usize,
     use_soft_viterbi: bool,
 
+    symbol_powers: VecDeque<(usize, WalshSymbolPower)>,
+    preamble_run: PreamblePowerAccumulator,
+    preamble: Option<PreambleMeasurement>,
+
     symbols_decoded: u64,
     search_calls: u64,
     rank_us: u64,
@@ -168,6 +182,9 @@ impl ReverseAccessDecoder {
             soft_chip_start: 0,
             last_search_len: 0,
             use_soft_viterbi: true,
+            symbol_powers: VecDeque::with_capacity(SYMBOL_POWER_HISTORY),
+            preamble_run: PreamblePowerAccumulator::default(),
+            preamble: None,
             symbols_decoded: 0,
             search_calls: 0,
             rank_us: 0,
@@ -276,6 +293,7 @@ impl ReverseAccessDecoder {
             row: 0,
             peak_ratio: f32::NEG_INFINITY,
             margin: f32::NEG_INFINITY,
+            power: WalshSymbolPower::default(),
         };
 
         for phase in 0..self.oversample.max(1) {
@@ -290,6 +308,7 @@ impl ReverseAccessDecoder {
                     row,
                     peak_ratio,
                     margin,
+                    power: WalshSymbolPower::from_energies(&energies),
                 };
             }
         }
@@ -597,6 +616,10 @@ impl ReverseAccessDecoder {
             } else {
                 Self::decode_hard_bits(&collapsed)
             };
+            let frame_chip_start = self.soft_chip_start;
+            let frame_bits = &decoded_bits[..decoded_bits.len().min(FRAME_BITS)];
+            let code_symbol_errors = code_symbol_errors(&soft_snapshot, frame_bits);
+            self.track_preamble_frame(frame_chip_start, frame_bits);
             self.decode_us = self
                 .decode_us
                 .saturating_add(frame_started.elapsed().as_micros() as u64);
@@ -613,7 +636,6 @@ impl ReverseAccessDecoder {
                 .filter(|v| v.abs() <= weak_threshold)
                 .count();
 
-            let frame_chip_start = self.soft_chip_start;
             let samples = decoded_bits
                 .into_iter()
                 .take(96)
@@ -637,6 +659,19 @@ impl ReverseAccessDecoder {
             block
                 .tags
                 .insert("access_frame_weak_soft_bits", frame_weak_soft_bits as i64);
+            block
+                .tags
+                .insert("access_frame_code_symbol_errors", code_symbol_errors as i64);
+            if let Some(preamble) = self.preamble {
+                block.tags.insert(
+                    "access_preamble_eb_nt_mdb",
+                    (preamble.eb_nt_db * 1000.0) as i64,
+                );
+                block.tags.insert(
+                    "access_preamble_power_mdb",
+                    (preamble.signal_power_dbfs * 1000.0) as i64,
+                );
+            }
             block.tags.insert("reverse_access_decoder_frame", 1);
             out.push(block);
 
@@ -701,6 +736,8 @@ impl ReverseAccessDecoder {
                     max_pair_score,
                 );
                 self.drain_soft_front(candidate.reassembly_bit_offset);
+                self.preamble = self.preamble_before(self.soft_chip_start);
+                self.preamble_run.clear();
                 self.state = DecoderState::Locked;
                 self.last_search_len = 0;
                 return self.emit_decoded_frames();
@@ -737,8 +774,51 @@ impl ReverseAccessDecoder {
         Vec::new()
     }
 
+    fn preamble_before(&self, message_chip_start: usize) -> Option<PreambleMeasurement> {
+        let mut acc = PreamblePowerAccumulator::default();
+        let mut expected = message_chip_start;
+        for &(chip_start, power) in self.symbol_powers.iter().rev() {
+            if chip_start >= message_chip_start {
+                continue;
+            }
+            if chip_start + PN_CHIPS_PER_SYMBOL != expected {
+                break;
+            }
+            acc.add(power);
+            expected = chip_start;
+            if acc.symbols() >= MAX_PREAMBLE_SYMBOLS {
+                break;
+            }
+        }
+        acc.measure()
+    }
+
+    fn track_preamble_frame(&mut self, frame_chip_start: usize, frame_bits: &[u8]) {
+        let is_preamble = frame_bits.len() >= FRAME_INFO_BITS
+            && frame_bits[..FRAME_INFO_BITS].iter().all(|&bit| bit == 0);
+        if is_preamble {
+            let frame_end = frame_chip_start + RC1_SYMBOLS_PER_FRAME * PN_CHIPS_PER_SYMBOL;
+            for &(chip_start, power) in &self.symbol_powers {
+                if (frame_chip_start..frame_end).contains(&chip_start) {
+                    self.preamble_run.add(power);
+                }
+            }
+            return;
+        }
+        if !self.preamble_run.is_empty() {
+            if let Some(measurement) = self.preamble_run.measure() {
+                self.preamble = Some(measurement);
+            }
+            self.preamble_run.clear();
+        }
+    }
+
     fn handle_symbol(&mut self, chip_start: usize, symbol: DecodedWalshSymbol) -> Vec<SampleBlock> {
         self.symbols_decoded = self.symbols_decoded.saturating_add(1);
+        if self.symbol_powers.len() == SYMBOL_POWER_HISTORY {
+            self.symbol_powers.pop_front();
+        }
+        self.symbol_powers.push_back((chip_start, symbol.power));
         self.tags
             .insert("access_selected_phase", symbol.phase as i64);
         self.tags.insert("access_selected_row", symbol.row as i64);

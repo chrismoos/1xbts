@@ -257,7 +257,8 @@ pub fn pulse_shape(raw: &[Complex32]) -> Vec<Complex32> {
     pulse_filter(raw)
 }
 
-/// Build OQPSK PN samples with half-chip Q delay.
+/// Build OQPSK PN samples as a handset sends them. C.S0002-E §2.1.3.1.17
+/// delays Q by half a chip and puts it on +sin, so complex baseband holds -PN_Q.
 fn build_oqpsk_pn_samples(output_len: usize, oversample: usize) -> Vec<Complex32> {
     assert_eq!(
         0,
@@ -276,7 +277,7 @@ fn build_oqpsk_pn_samples(output_len: usize, oversample: usize) -> Vec<Complex32
     (0..output_len)
         .map(|k| {
             let q_idx = k.saturating_sub(q_delay_samples);
-            Complex32::new(pn_i[k], pn_q[q_idx])
+            Complex32::new(pn_i[k], -pn_q[q_idx])
         })
         .collect()
 }

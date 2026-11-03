@@ -581,6 +581,7 @@ impl Bsc {
         let now = chrono::Utc::now();
 
         Some(AccessChannelEvent {
+            access_signal: Default::default(),
             event_id: Uuid::new_v4().to_string(),
             chip_start: 0,
             absolute_chip_start: Some(tx_frame_number as u64),
@@ -807,6 +808,7 @@ impl Bsc {
         let now = chrono::Utc::now();
 
         Some(AccessChannelEvent {
+            access_signal: Default::default(),
             event_id: Uuid::new_v4().to_string(),
             chip_start: 0,
             absolute_chip_start: Some(tx_frame_number as u64),
@@ -887,6 +889,7 @@ impl Bsc {
     ) -> AccessChannelEvent {
         let now = chrono::Utc::now();
         AccessChannelEvent {
+            access_signal: Default::default(),
             event_id: Uuid::new_v4().to_string(),
             chip_start: 0,
             absolute_chip_start: Some(tx_frame_number as u64),

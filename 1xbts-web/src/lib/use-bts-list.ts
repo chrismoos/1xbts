@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
+import { useLive } from "@/lib/live";
 import type { BtsSummary } from "@/lib/proto/bts_management/v1/service";
 
 import { defaultCellToken } from "@/lib/cell";
@@ -15,50 +16,12 @@ interface BtsListState {
   loading: boolean;
 }
 
-// Polls every configured peer, including offline ones with no cell yet.
-// `pollMs` of 0 fetches once.
-export function useBtsList(pollMs = 5000): BtsListState {
-  const [state, setState] = useState<BtsListState>({
-    cells: [],
-    error: null,
-    loading: true,
-  });
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const load = () => {
-      fetch("/api/bts", { cache: "no-store" })
-        .then((r) => r.json())
-        .then((data: { bts?: CellEntry[]; error?: string }) => {
-          if (cancelled) return;
-          if (data.error) {
-            setState({ cells: [], error: data.error, loading: false });
-          } else {
-            setState({ cells: data.bts ?? [], error: null, loading: false });
-          }
-        })
-        .catch((err) => {
-          if (cancelled) return;
-          setState({
-            cells: [],
-            error: err instanceof Error ? err.message : "unknown error",
-            loading: false,
-          });
-        });
-    };
-
-    load();
-    if (pollMs <= 0) return () => { cancelled = true; };
-    const interval = setInterval(load, pollMs);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  }, [pollMs]);
-
-  return state;
+export function useBtsList(): BtsListState {
+  const { data, error, loading } = useLive<{ bts?: CellEntry[] }>("/api/bts");
+  return { cells: data?.bts ?? NO_CELLS, error, loading };
 }
+
+const NO_CELLS: CellEntry[] = [];
 
 // Default cell for a page whose URL names none, pinned to the first cell it
 // resolves. The list refreshes every few seconds, so an unpinned default

@@ -39,8 +39,9 @@ use crate::receiver::{
     hrpd::access::{AccessFrameLayout, HrpdAccessSignalingMessage, parse_access_mac_capsule},
     pipelined::{
         HrpdReverseAccessSettings, PULSE_MATCHED_FILTERED_TAG, PipelineEmitter,
-        PipelineProcessorShared, ReverseAccessSettings, SampleBlock, VecEmitter, flush_sub_chain,
-        hrpd_reverse_access_chain, reverse_access_chain, run_sub_chain,
+        PipelineProcessorShared, ReverseAccessSettings, SampleBlock, VecEmitter,
+        adc_referenced_power_dbfs, flush_sub_chain, hrpd_reverse_access_chain,
+        reverse_access_chain, run_sub_chain,
     },
 };
 use crate::sdr::{PhasorNco, cdma2000_baseband_filter_taps_f64, fir::SymmetricComplexFir32};
@@ -49,6 +50,7 @@ use super::{
     AccessChannelEvent, BtsCommand, BtsPowerControlRegistry, IqCaptureControlResult,
     IqCaptureStatus, RxSettings,
     handle::{RxMetrics, RxQueueMetrics, StageMetrics, TrafficChannelPool},
+    noise_floor::NoiseFloorEstimator,
     power_control::DIRECT_CONTROL_MIN_LEAD_PCGS,
     settings,
 };
@@ -1270,6 +1272,8 @@ pub(super) struct RxRuntime {
     /// wrong offset in the WAV and a replay decodes nothing there.
     capture_expected_abs_sample: Option<u64>,
     capture_last_tail: Option<Complex32>,
+    noise_floor: NoiseFloorEstimator,
+    last_noise_floor_log: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -1834,6 +1838,8 @@ pub(super) fn open_rx_runtime(rx: RxSettings) -> Result<RxRuntime, Error> {
         pending_capture_stop: None,
         capture_expected_abs_sample: None,
         capture_last_tail: None,
+        noise_floor: NoiseFloorEstimator::default(),
+        last_noise_floor_log: Instant::now(),
     })
 }
 
@@ -2066,6 +2072,7 @@ pub(super) fn run_rx_loop(
     mut commands_rx: tokio_mpsc::Receiver<BtsCommand>,
     radio_rx: &mut dyn crate::sdr::RadioRx,
     shutdown: Arc<AtomicBool>,
+    realtime: super::RealtimeSettings,
 ) -> Result<(), Error> {
     let mut runtime = open_rx_runtime(rx)?;
     start_hrpd_access_worker(&mut runtime, shutdown.clone());
@@ -2182,111 +2189,117 @@ pub(super) fn run_rx_loop(
 
     std::thread::scope(|scope| {
         // Reader thread: reads from SDR hardware and sends samples + timestamp
-        let reader = scope.spawn(move || -> Result<(), Error> {
-            let read_batch_samples = target_batch_samples;
-            info!(
-                "rx: SDR reader read_batch_samples={} read_batch_ms={:.3}",
-                read_batch_samples,
-                read_batch_samples as f64 * 1000.0 / sample_rate_hz.max(1) as f64,
-            );
-            let mut buffer = vec![Complex32::new(0.0, 0.0); read_batch_samples];
-            let mut last_read = Instant::now();
-            let mut read_count: u64 = 0;
-            let mut max_gap_us: u64 = 0;
-            let mut max_receive_us: u64 = 0;
-            let mut last_end_ticks: Option<u64> = None;
-            let mut overflow_count: u64 = 0;
-            while !shutdown_reader.load(Ordering::Relaxed) {
-                let since_last = last_read.elapsed();
-                let receive_start = Instant::now();
-                let result = radio_rx.rx_read(&mut buffer, 250_000)?;
-                let receive_us = receive_start.elapsed().as_micros() as u64;
-                max_receive_us = max_receive_us.max(receive_us);
-                last_read = Instant::now();
-                if result.overflow {
-                    overflow_count += 1;
-                    let gap_us = since_last.as_micros() as u64;
-                    log::warn!(
-                        "rx: SDR overflow #{} metadata_samples={} metadata_time_ticks={} \
+        let reader = std::thread::Builder::new()
+            .name("bts-rx-reader".into())
+            .spawn_scoped(scope, move || -> Result<(), Error> {
+                super::realtime::apply_rx_reader(&realtime);
+                let read_batch_samples = target_batch_samples;
+                info!(
+                    "rx: SDR reader read_batch_samples={} read_batch_ms={:.3}",
+                    read_batch_samples,
+                    read_batch_samples as f64 * 1000.0 / sample_rate_hz.max(1) as f64,
+                );
+                let mut buffer = vec![Complex32::new(0.0, 0.0); read_batch_samples];
+                let mut last_read = Instant::now();
+                let mut read_count: u64 = 0;
+                let mut max_gap_us: u64 = 0;
+                let mut max_receive_us: u64 = 0;
+                let mut last_end_ticks: Option<u64> = None;
+                let mut overflow_count: u64 = 0;
+                while !shutdown_reader.load(Ordering::Relaxed) {
+                    let since_last = last_read.elapsed();
+                    let receive_start = Instant::now();
+                    let result = radio_rx.rx_read(&mut buffer, 250_000)?;
+                    let receive_us = receive_start.elapsed().as_micros() as u64;
+                    max_receive_us = max_receive_us.max(receive_us);
+                    last_read = Instant::now();
+                    if result.overflow {
+                        overflow_count += 1;
+                        let gap_us = since_last.as_micros() as u64;
+                        log::warn!(
+                            "rx: SDR overflow #{} metadata_samples={} metadata_time_ticks={} \
                          read_count={} gap_since_last_read={}us max_gap={}us \
                          receive={}us max_receive={}us",
-                        overflow_count,
-                        result.samples_read,
-                        result.time_ticks,
-                        read_count,
-                        gap_us,
-                        max_gap_us,
-                        receive_us,
-                        max_receive_us,
-                    );
-                }
-                let n = result.samples_read;
-                if n == 0 {
-                    continue;
-                }
-                if let Some(prev_end) = last_end_ticks {
-                    let gap_ticks = result.time_ticks.saturating_sub(prev_end);
-                    let gap_samples = (gap_ticks as u128 * sample_rate_hz as u128
-                        / tick_rate.max(1) as u128) as usize;
-                    if gap_samples > 2 {
-                        log::warn!(
-                            "rx: SDR timestamp gap after_overflows={} zero_filling_samples={} \
-                             gap_ms={:.3} previous_end_ticks={} current_start_ticks={} \
-                             read_count={} gap_since_last_read={}us max_gap={}us \
-                             receive={}us max_receive={}us",
                             overflow_count,
-                            gap_samples,
-                            gap_samples as f64 * 1000.0 / sample_rate_hz.max(1) as f64,
-                            prev_end,
+                            result.samples_read,
                             result.time_ticks,
                             read_count,
-                            since_last.as_micros(),
+                            gap_us,
                             max_gap_us,
                             receive_us,
                             max_receive_us,
                         );
-                        let fill = vec![Complex32::new(0.0, 0.0); gap_samples];
-                        reader_queue_tx.enqueue(gap_samples);
-                        if tx
-                            .send(RxReaderMessage {
-                                samples: fill,
-                                time_ns: prev_end,
-                                n: gap_samples,
-                                enqueue_time: Instant::now(),
-                                absolute_sample_start_override: None,
-                            })
-                            .is_err()
-                        {
-                            reader_queue_tx.rollback(gap_samples);
-                            break;
+                    }
+                    let n = result.samples_read;
+                    if n == 0 {
+                        continue;
+                    }
+                    if let Some(prev_end) = last_end_ticks {
+                        let gap_ticks = result.time_ticks.saturating_sub(prev_end);
+                        let gap_samples = (gap_ticks as u128 * sample_rate_hz as u128
+                            / tick_rate.max(1) as u128)
+                            as usize;
+                        if gap_samples > 2 {
+                            log::warn!(
+                                "rx: SDR timestamp gap after_overflows={} zero_filling_samples={} \
+                             gap_ms={:.3} previous_end_ticks={} current_start_ticks={} \
+                             read_count={} gap_since_last_read={}us max_gap={}us \
+                             receive={}us max_receive={}us",
+                                overflow_count,
+                                gap_samples,
+                                gap_samples as f64 * 1000.0 / sample_rate_hz.max(1) as f64,
+                                prev_end,
+                                result.time_ticks,
+                                read_count,
+                                since_last.as_micros(),
+                                max_gap_us,
+                                receive_us,
+                                max_receive_us,
+                            );
+                            let fill = vec![Complex32::new(0.0, 0.0); gap_samples];
+                            reader_queue_tx.enqueue(gap_samples);
+                            if tx
+                                .send(RxReaderMessage {
+                                    samples: fill,
+                                    time_ns: prev_end,
+                                    n: gap_samples,
+                                    enqueue_time: Instant::now(),
+                                    absolute_sample_start_override: None,
+                                })
+                                .is_err()
+                            {
+                                reader_queue_tx.rollback(gap_samples);
+                                break;
+                            }
                         }
                     }
-                }
-                read_count += 1;
-                let gap_us = since_last.as_micros() as u64;
-                max_gap_us = max_gap_us.max(gap_us);
-                let duration_ticks = n as u128 * tick_rate as u128 / sample_rate_hz.max(1) as u128;
-                last_end_ticks = Some(result.time_ticks + duration_ticks as u64);
+                    read_count += 1;
+                    let gap_us = since_last.as_micros() as u64;
+                    max_gap_us = max_gap_us.max(gap_us);
+                    let duration_ticks =
+                        n as u128 * tick_rate as u128 / sample_rate_hz.max(1) as u128;
+                    last_end_ticks = Some(result.time_ticks + duration_ticks as u64);
 
-                let time_ns = result.time_ticks;
-                let samples = buffer[..n].to_vec();
-                reader_queue_tx.enqueue(n);
-                if tx
-                    .send(RxReaderMessage {
-                        samples,
-                        time_ns,
-                        n,
-                        enqueue_time: Instant::now(),
-                        absolute_sample_start_override: None,
-                    })
-                    .is_err()
-                {
-                    reader_queue_tx.rollback(n);
-                    break; // processing thread gone
+                    let time_ns = result.time_ticks;
+                    let samples = buffer[..n].to_vec();
+                    reader_queue_tx.enqueue(n);
+                    if tx
+                        .send(RxReaderMessage {
+                            samples,
+                            time_ns,
+                            n,
+                            enqueue_time: Instant::now(),
+                            absolute_sample_start_override: None,
+                        })
+                        .is_err()
+                    {
+                        reader_queue_tx.rollback(n);
+                        break; // processing thread gone
+                    }
                 }
-            }
-            Ok(())
-        });
+                Ok(())
+            })
+            .expect("spawn the SDR reader thread");
 
         // Processing thread (this thread): receives blocks and runs pipeline
         let process_result = process_rx_from_channel(
@@ -2550,6 +2563,17 @@ fn process_rx_message(
                 enqueue_time: std::time::Instant::now(),
             });
 
+    if let Some(block) = one_x_block.as_ref() {
+        let block_oversample = (block.sample_rate_hz / runtime.config.chip_rate_hz).max(1);
+        runtime.noise_floor.ingest(
+            &block.samples,
+            block.absolute_sample_start,
+            block_oversample,
+            has_traffic,
+        );
+        log_noise_floor(runtime);
+    }
+
     runtime.next_sample_index = raw_relative_sample_start.saturating_add(n);
 
     let pipeline_start = Instant::now();
@@ -2640,7 +2664,15 @@ fn process_rx_message(
                         top_stage,
                     );
                 }
-                let event = event;
+                let mut event = event;
+                if let Some((start_chip, end_chip)) = access_burst_chips(&blk) {
+                    runtime.noise_floor.mark_busy(start_chip, end_chip);
+                }
+                if let Some(floor) = runtime.noise_floor.reading() {
+                    event.access_signal.noise_floor_dbfs =
+                        Some(adc_referenced_power_dbfs(floor.mean_power));
+                    event.access_signal.noise_floor_stale = floor.stale;
+                }
                 if let Some(store) = &runtime.config.rx_measurements {
                     let key = if let Some(esn) = event.esn {
                         Some(settings::RxMeasurementKey::Esn(esn))
@@ -2658,6 +2690,8 @@ fn process_rx_message(
                                     signal_power_db: event.signal_power_db,
                                     raw_power_db: event.raw_power_db,
                                     demod_quality_pct: event.demod_quality_pct,
+                                    access_signal: event.access_signal,
+                                    message: event.msg_type_name.clone(),
                                     timestamp_us: event.wall_clock_us,
                                 },
                             );
@@ -3041,6 +3075,51 @@ pub(super) fn run_injected_rx_loop(
     drain_bts_commands(&mut runtime, &mut commands_rx, &shutdown)?;
     finalize_capture(&mut runtime);
     Ok(())
+}
+
+/// Widened by a frame on each side for frames the receiver missed.
+fn access_burst_chips(blk: &SampleBlock) -> Option<(u64, u64)> {
+    const ACCESS_FRAME_CHIPS: u64 = 24_576;
+    const ACCESS_FRAME_INFO_BITS: u64 = 88;
+    const BITS_PER_OCTET: u64 = 8;
+    const MARGIN_FRAMES: u64 = 1;
+    let message_start = u64::try_from(*blk.tags.get("absolute_chip_start")?).ok()?;
+    let preamble_frames = blk.tags.get("access_preamble_frames").copied().unwrap_or(0);
+    let message_octets = blk
+        .tags
+        .get("access_msg_length_octets")
+        .copied()
+        .unwrap_or(0);
+    let before_frames = u64::try_from(preamble_frames).unwrap_or(0) + MARGIN_FRAMES;
+    let message_frames = (u64::try_from(message_octets).unwrap_or(0) * BITS_PER_OCTET)
+        .div_ceil(ACCESS_FRAME_INFO_BITS)
+        .max(1)
+        + MARGIN_FRAMES;
+    Some((
+        message_start.saturating_sub(before_frames * ACCESS_FRAME_CHIPS),
+        message_start + message_frames * ACCESS_FRAME_CHIPS,
+    ))
+}
+
+const NOISE_FLOOR_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+fn log_noise_floor(runtime: &mut RxRuntime) {
+    if runtime.last_noise_floor_log.elapsed() < NOISE_FLOOR_LOG_INTERVAL {
+        return;
+    }
+    runtime.last_noise_floor_log = Instant::now();
+    match runtime.noise_floor.reading() {
+        Some(floor) => info!(
+            "rx_noise_floor: floor_dbfs={:.2} stale={} quiet_pcgs={}",
+            adc_referenced_power_dbfs(floor.mean_power),
+            floor.stale,
+            runtime.noise_floor.quiet_pcgs(),
+        ),
+        None => info!(
+            "rx_noise_floor: floor_dbfs=none quiet_pcgs={}",
+            runtime.noise_floor.quiet_pcgs()
+        ),
+    }
 }
 
 fn run_sub_chain_timed(
@@ -3797,6 +3876,7 @@ enum TrafficFerDecision {
     IgnoreBeforePilot,
     IgnoreBeforeFirstValid,
     IgnoreAfterRelease,
+    IgnorePreamble,
     Activated,
 }
 
@@ -3836,10 +3916,15 @@ impl TrafficFerGate {
         self.release_started
     }
 
-    fn observe_phy_frame(&mut self, frame_valid: bool) -> TrafficFerDecision {
+    fn observe_phy_frame(&mut self, frame_valid: bool, is_preamble: bool) -> TrafficFerDecision {
         if self.release_started {
             self.ignored_after_release = self.ignored_after_release.saturating_add(1);
             return TrafficFerDecision::IgnoreAfterRelease;
+        }
+        // A preamble frame is all zeros, CRC field included, so its CRC fails
+        // by construction and is not a decode error.
+        if is_preamble && !frame_valid {
+            return TrafficFerDecision::IgnorePreamble;
         }
         if !self.gate_rc3_startup || self.first_valid_seen {
             return TrafficFerDecision::Count;
@@ -3864,9 +3949,10 @@ fn update_traffic_fer(
     traffic_channels: Option<&TrafficChannelPool>,
     walsh_code: u8,
     frame_valid: bool,
+    is_preamble: bool,
     absolute_chip_start: Option<u64>,
 ) {
-    let decision = gate.observe_phy_frame(frame_valid);
+    let decision = gate.observe_phy_frame(frame_valid, is_preamble);
     if decision == TrafficFerDecision::Activated {
         info!(
             "rx_traffic[w{}]: FER counting enabled on first valid PHY frame abs_chip={} ignored_before_pilot={} ignored_after_pilot={}",
@@ -4242,6 +4328,7 @@ fn run_traffic_rx_thread(
                         traffic_channels.as_ref(),
                         walsh_code,
                         frame_valid,
+                        out_blk.tags.get("traffic_is_preamble") == Some(&1),
                         event.absolute_chip_start,
                     );
                     if let Some(ref tx) = event_tx {
@@ -4260,6 +4347,7 @@ fn run_traffic_rx_thread(
                         traffic_channels.as_ref(),
                         walsh_code,
                         frame_valid,
+                        out_blk.tags.get("traffic_is_preamble") == Some(&1),
                         event.absolute_chip_start,
                     );
                     event.traffic_primary_bearer_routed = emit_reverse_primary_bearer(
@@ -4803,6 +4891,21 @@ fn build_access_event(
     );
 
     Some(AccessChannelEvent {
+        access_signal: cdma_common::events::AccessSignal {
+            eb_nt_db: blk
+                .tags
+                .get("access_preamble_eb_nt_mdb")
+                .map(|v| *v as f32 / 1000.0),
+            signal_power_dbfs: blk
+                .tags
+                .get("access_preamble_power_mdb")
+                .map(|v| *v as f32 / 1000.0),
+            raw_ber_pct: blk
+                .tags
+                .get("access_raw_ber_ppm")
+                .map(|v| *v as f32 / 10_000.0),
+            ..Default::default()
+        },
         event_id: next_access_event_id(),
         cell: None,
         chip_start: blk.chip_start,
@@ -4958,6 +5061,7 @@ fn build_traffic_event(
     );
 
     Some(AccessChannelEvent {
+        access_signal: Default::default(),
         event_id: next_access_event_id(),
         cell: None,
         chip_start: blk.chip_start,
@@ -5085,6 +5189,7 @@ fn build_traffic_phy_status_event(
     });
 
     Some(AccessChannelEvent {
+        access_signal: Default::default(),
         event_id: next_access_event_id(),
         cell: None,
         chip_start: blk.chip_start,
@@ -5212,6 +5317,7 @@ fn build_traffic_voice_event(
     });
 
     Some(AccessChannelEvent {
+        access_signal: Default::default(),
         event_id: next_access_event_id(),
         cell: None,
         chip_start: blk.chip_start,
@@ -5307,6 +5413,7 @@ fn build_traffic_preamble_event(
     preamble_pcgs: i64,
 ) -> AccessChannelEvent {
     AccessChannelEvent {
+        access_signal: Default::default(),
         event_id: next_access_event_id(),
         cell: None,
         chip_start,
@@ -5416,6 +5523,7 @@ fn build_traffic_pcg_measurement_event(
         absolute_chip_start.map(|chip| processing_absolute_chip_end.saturating_sub(chip));
 
     Some(AccessChannelEvent {
+        access_signal: Default::default(),
         event_id: next_access_event_id(),
         cell: None,
         chip_start: blk.chip_start,
@@ -6047,31 +6155,37 @@ mod tests {
         let mut gate = TrafficFerGate::new(true);
 
         assert_eq!(
-            gate.observe_phy_frame(false),
+            gate.observe_phy_frame(false, false),
             TrafficFerDecision::IgnoreBeforePilot
         );
         assert_eq!(
-            gate.observe_phy_frame(true),
+            gate.observe_phy_frame(true, false),
             TrafficFerDecision::IgnoreBeforePilot
         );
 
         gate.pilot_acquired();
         assert_eq!(
-            gate.observe_phy_frame(false),
+            gate.observe_phy_frame(false, false),
             TrafficFerDecision::IgnoreBeforeFirstValid
         );
-        assert_eq!(gate.observe_phy_frame(true), TrafficFerDecision::Activated);
-        assert_eq!(gate.observe_phy_frame(false), TrafficFerDecision::Count);
+        assert_eq!(
+            gate.observe_phy_frame(true, false),
+            TrafficFerDecision::Activated
+        );
+        assert_eq!(
+            gate.observe_phy_frame(false, false),
+            TrafficFerDecision::Count
+        );
         assert_eq!(gate.ignored_before_pilot, 2);
         assert_eq!(gate.ignored_before_first_valid, 1);
 
         gate.start_release();
         assert_eq!(
-            gate.observe_phy_frame(false),
+            gate.observe_phy_frame(false, false),
             TrafficFerDecision::IgnoreAfterRelease
         );
         assert_eq!(
-            gate.observe_phy_frame(true),
+            gate.observe_phy_frame(true, false),
             TrafficFerDecision::IgnoreAfterRelease
         );
         assert_eq!(gate.ignored_after_release, 2);
@@ -6081,12 +6195,36 @@ mod tests {
     fn non_rc3_fer_counts_from_first_phy_frame() {
         let mut gate = TrafficFerGate::new(false);
 
-        assert_eq!(gate.observe_phy_frame(false), TrafficFerDecision::Count);
-        assert_eq!(gate.observe_phy_frame(true), TrafficFerDecision::Count);
+        assert_eq!(
+            gate.observe_phy_frame(false, false),
+            TrafficFerDecision::Count
+        );
+        assert_eq!(
+            gate.observe_phy_frame(true, false),
+            TrafficFerDecision::Count
+        );
         gate.start_release();
         assert_eq!(
-            gate.observe_phy_frame(false),
+            gate.observe_phy_frame(false, false),
             TrafficFerDecision::IgnoreAfterRelease
+        );
+    }
+
+    #[test]
+    fn failed_preamble_frames_are_not_counted() {
+        let mut gate = TrafficFerGate::new(false);
+
+        assert_eq!(
+            gate.observe_phy_frame(false, true),
+            TrafficFerDecision::IgnorePreamble
+        );
+        assert_eq!(
+            gate.observe_phy_frame(true, true),
+            TrafficFerDecision::Count
+        );
+        assert_eq!(
+            gate.observe_phy_frame(false, false),
+            TrafficFerDecision::Count
         );
     }
 

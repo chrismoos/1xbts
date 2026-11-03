@@ -31,6 +31,12 @@ pub struct PchTransferAckEvent {
     pub bts_l2_termination: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BtsReleaseRequestEvent {
+    pub walsh_code: u8,
+    pub cause: Option<u8>,
+}
+
 /// Forward-bearer queue selected at the BTS after UDP bearer routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForwardBearerQueue {
@@ -154,6 +160,10 @@ pub trait BtsControlClient: Send + Sync {
 
     /// Drain received PCH transfer acknowledgments from the BTS.
     fn drain_pch_transfer_acks(&self) -> Vec<PchTransferAckEvent> {
+        Vec::new()
+    }
+
+    fn drain_bts_release_requests(&self) -> Vec<BtsReleaseRequestEvent> {
         Vec::new()
     }
 

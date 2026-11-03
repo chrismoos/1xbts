@@ -1,6 +1,7 @@
 "use client";
 
 import { use, useCallback, useEffect, useMemo, useState } from "react";
+import { RxPower } from "@/components/rx-power";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Card, Stat } from "@/components/card";
@@ -101,7 +102,7 @@ export default function BtsDetailPage({
   const peerId = decodeURIComponent(rawPeerId);
   const baseStation = useSearchParams().get("baseStation");
 
-  const { cells } = useBtsList(3000);
+  const { cells } = useBtsList();
   const summary = useMemo(
     () =>
       cells.find(
@@ -502,11 +503,7 @@ export default function BtsDetailPage({
                       {mobile.snrDb != null ? mobile.snrDb.toFixed(1) : "-"}
                     </td>
                     <td className="py-2 text-right font-mono text-xs text-secondary">
-                      {mobile.rxPowerDbm != null
-                        ? `${mobile.rxPowerDbm.toFixed(1)} dBm`
-                        : mobile.rxLevelDbfs != null
-                          ? `${mobile.rxLevelDbfs.toFixed(1)} dBFS`
-                          : "-"}
+                      <RxPower dbm={mobile.rxPowerDbm} dbfs={mobile.rxLevelDbfs} />
                     </td>
                     <td className="py-2 pl-4 text-muted font-mono text-xs">
                       {mobile.lastHeardMs ? formatTimeMs(mobile.lastHeardMs) : "-"}

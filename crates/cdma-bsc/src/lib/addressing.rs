@@ -1,5 +1,6 @@
 use cdma_common::consts::{
-    SERVICE_OPTION_ASYNC_DATA, SERVICE_OPTION_BASIC_VOICE, SERVICE_OPTION_PACKET_DATA,
+    SERVICE_OPTION_ASYNC_DATA, SERVICE_OPTION_BASIC_VOICE, SERVICE_OPTION_EVRC_A,
+    SERVICE_OPTION_EVRC_B, SERVICE_OPTION_EVRC_WB, SERVICE_OPTION_PACKET_DATA,
     SERVICE_OPTION_PACKET_DATA_RC3, SERVICE_OPTION_QCELP13,
 };
 use cdma_common::lac::paging_messages::{
@@ -152,7 +153,7 @@ pub(crate) fn select_initial_traffic_rcs(
 /// Service-option-aware wrapper around [`select_initial_traffic_rcs`].
 ///
 /// SO1 uses the legacy RC1 configuration. SO12 and QCELP-13K require RC2 in
-/// both directions.
+/// both directions. EVRC is a Rate Set 1 codec, so RC2 is never chosen for it.
 pub(crate) fn select_initial_traffic_rcs_for_so(
     policy: &TrafficAssignmentConfig,
     for_rcs: &[u8],
@@ -198,7 +199,33 @@ pub(crate) fn select_initial_traffic_rcs_for_so(
         );
         return None;
     }
+    if matches!(
+        service_option,
+        Some(SERVICE_OPTION_EVRC_A | SERVICE_OPTION_EVRC_B | SERVICE_OPTION_EVRC_WB)
+    ) {
+        let rate_set_1 = without_rate_set_2(policy);
+        return select_initial_traffic_rcs(
+            &rate_set_1,
+            for_rcs,
+            rev_rcs,
+            for_pref,
+            rev_pref,
+            mob_p_rev,
+        );
+    }
     select_initial_traffic_rcs(policy, for_rcs, rev_rcs, for_pref, rev_pref, mob_p_rev)
+}
+
+const RATE_SET_2_RC: u8 = 2;
+
+fn without_rate_set_2(policy: &TrafficAssignmentConfig) -> TrafficAssignmentConfig {
+    let mut policy = policy.clone();
+    policy.supported_for_rcs.retain(|rc| *rc != RATE_SET_2_RC);
+    policy.supported_rev_rcs.retain(|rc| *rc != RATE_SET_2_RC);
+    policy
+        .preferred_pairs
+        .retain(|pair| pair.for_rc != RATE_SET_2_RC && pair.rev_rc != RATE_SET_2_RC);
+    policy
 }
 
 /// Resolve IMSI class-0 forward-link address from access event fields.
@@ -768,6 +795,25 @@ mod tests {
             Some(SERVICE_OPTION_ASYNC_DATA),
         );
         assert_eq!(result, Some((2, 2)));
+    }
+
+    #[test]
+    fn evrc_never_selects_rc2_even_when_rc2_is_preferred() {
+        let policy = TrafficAssignmentConfig {
+            preferred_pairs: vec![RcPairConfig::new(2, 2)],
+            ..Default::default()
+        };
+        let result = select_initial_traffic_rcs_for_so(
+            &policy,
+            &[1, 2, 3],
+            &[1, 2, 3],
+            None,
+            None,
+            6,
+            BAND_CLASS_CELLULAR,
+            Some(SERVICE_OPTION_EVRC_A),
+        );
+        assert_eq!(result, Some((1, 1)));
     }
 
     #[test]

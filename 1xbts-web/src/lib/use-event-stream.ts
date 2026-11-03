@@ -1,14 +1,20 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { getSharedEvents } from "./shared-events";
+import { liveSocket } from "./live";
 
-/**
- * Subscribe to a named event from the shared SSE connection.
- * Only one tab holds the actual HTTP connection; others receive
- * via BroadcastChannel.
- */
-export function useEventStream(event: string, onData: (data: string) => void) {
+export interface EventStreamOptions {
+  /** Deliver the buffered events first. See `subscribeEvents`. */
+  replay?: boolean;
+  /**
+   * Subscribes only while true. A replaying page that filters on data it loads
+   * separately sets it once that data is present, so the replay is not dropped.
+   */
+  enabled?: boolean;
+}
+
+export function useEventStream(event: string, onData: (data: string) => void, options: EventStreamOptions = {}) {
+  const { replay = false, enabled = true } = options;
   const callbackRef = useRef(onData);
 
   useEffect(() => {
@@ -16,23 +22,20 @@ export function useEventStream(event: string, onData: (data: string) => void) {
   }, [onData]);
 
   useEffect(() => {
-    const shared = getSharedEvents();
-    const handler = (data: string) => callbackRef.current(data);
-    shared.addEventListener(event, handler);
-    return () => shared.removeEventListener(event, handler);
-  }, [event]);
+    if (!enabled) return;
+    return liveSocket().subscribeEvents(
+      (name, data) => {
+        if (name === event) callbackRef.current(data);
+      },
+      { replay },
+    );
+  }, [event, replay, enabled]);
 }
 
-/** Returns true when the shared SSE connection is open. */
 export function useSSEConnected(): boolean {
   const [connected, setConnected] = useState(false);
 
-  useEffect(() => {
-    const shared = getSharedEvents();
-    // onConnect fires immediately with current state
-    shared.onConnect(setConnected);
-    return () => shared.offConnect(setConnected);
-  }, []);
+  useEffect(() => liveSocket().onConnection(setConnected), []);
 
   return connected;
 }

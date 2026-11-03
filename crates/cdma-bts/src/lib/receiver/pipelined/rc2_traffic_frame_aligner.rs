@@ -20,6 +20,7 @@ use cdma_common::phy::data_burst_randomizer::{Rc12ReverseRate, active_pcgs as rc
 use log::info;
 use num_complex::Complex32;
 
+use super::rc12_gated_noise::{GatedNoiseEstimate, walsh64_pcg_eb_nt_db};
 use super::{PipelineProcessor, SampleBlock, raw_to_soft};
 use crate::phy::coding::block_interleaver::{
     Rc12ReverseTrafficInterleaver, Rc12ReverseTrafficRate,
@@ -215,6 +216,7 @@ pub struct Rc2TrafficFrameAligner {
     preamble_event_sent: bool,
     next_measurement_abs_pcg: Option<u64>,
     last_processing_absolute_chip_end: Option<u64>,
+    gated_noise: GatedNoiseEstimate,
 
     tags: HashMap<&'static str, i64>,
     sample_rate_hz: f64,
@@ -253,6 +255,7 @@ impl Rc2TrafficFrameAligner {
             preamble_event_sent: false,
             next_measurement_abs_pcg: None,
             last_processing_absolute_chip_end: None,
+            gated_noise: GatedNoiseEstimate::default(),
             tags: HashMap::new(),
             sample_rate_hz: 0.0,
             frames_decoded: 0,
@@ -349,20 +352,12 @@ impl Rc2TrafficFrameAligner {
     }
 
     fn pcg_eb_nt_db(&self, pcg: usize) -> f32 {
-        let start = pcg * RC1_SYMBOLS_PER_PCG;
+        let start = (pcg * RC1_SYMBOLS_PER_PCG).min(self.symbol_energies.len());
         let end = (start + RC1_SYMBOLS_PER_PCG).min(self.symbol_energies.len());
-        if start >= end {
-            return -30.0;
-        }
-        let mut linear = 0.0;
-        for energies in &self.symbol_energies[start..end] {
-            let peak = energies.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let noise = ((energies.iter().sum::<f32>() - peak)
-                / (RC1_WALSH_CHIPS_PER_SYMBOL - 1) as f32)
-                .max(1e-12);
-            linear += ((peak / noise - 1.0).max(0.0) * 0.5).max(1e-9);
-        }
-        10.0 * (linear / (end - start) as f32).max(1e-9).log10()
+        walsh64_pcg_eb_nt_db(
+            &self.symbol_energies[start..end],
+            self.gated_noise.per_bin(),
+        )
     }
 
     fn pcg_mobile_power_dbfs(&self, pcg: usize) -> f32 {
@@ -557,6 +552,12 @@ impl Rc2TrafficFrameAligner {
         if decoded.validation.phy_valid && self.state == AlignerState::Preamble {
             self.state = AlignerState::Locked;
         }
+        if decoded.validation.phy_valid {
+            let active = self.active_pcgs_for_rate(decoded.rate, self.frame_chip_start);
+            self.gated_noise.update(&self.symbol_energies, &active);
+        } else {
+            self.gated_noise.frame_failed();
+        }
         let mut tags = self.tags.clone();
         tags.insert("traffic_decoded_frame", 1);
         tags.insert("traffic_radio_config", 2);
@@ -569,6 +570,7 @@ impl Rc2TrafficFrameAligner {
         tags.insert("traffic_fqi_valid", decoded.validation.crc_valid as i64);
         tags.insert("traffic_tail_valid", decoded.validation.tail_valid as i64);
         tags.insert("traffic_phy_valid", decoded.validation.phy_valid as i64);
+        tags.insert("traffic_is_preamble", is_preamble as i64);
         tags.insert("absolute_chip_start", self.frame_chip_start as i64);
 
         let samples = decoded

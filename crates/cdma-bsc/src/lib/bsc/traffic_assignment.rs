@@ -9,7 +9,7 @@ use cdma_common::events::AccessChannelEvent;
 use cdma_common::lac::message_types::MessageId;
 use cdma_common::lac::paging_messages::{
     CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC, ChannelAssignmentGrantedMode, ChannelAssignmentMessage,
-    ExtendedChannelAssignmentMessage, MsAddress, PagingChannelMessage,
+    ExtendedChannelAssignmentMessage, MsAddress, PagingChannelMessage, RLGAIN_ADJ_RANGE_DB,
     channel_default_config_for_rcs, extended_cam_supported, service_option_default_rc,
 };
 use cdma_common::overhead::OverheadParameters;
@@ -39,6 +39,17 @@ fn should_use_ecam(mob_p_rev: u8, legacy_so1_assignment: bool, band_class: u8) -
 
 fn reverse_fch_gating_enabled(configured: bool, mobile_requested: bool, rev_rc: u8) -> bool {
     configured && mobile_requested && reverse_fch_gating_supported(rev_rc)
+}
+
+fn rc12_rlgain_adj(configured_db: i8, rev_rc: u8) -> Option<i8> {
+    matches!(rev_rc, 1 | 2)
+        .then(|| configured_db.clamp(*RLGAIN_ADJ_RANGE_DB.start(), *RLGAIN_ADJ_RANGE_DB.end()))
+}
+
+/// BYPASS_ALERT_ANSWER is only applicable to the called mobile. An originating
+/// mobile enters conversation on its own.
+fn bypass_alert_answer_for(configured: bool, leg_role: Option<VoiceLegRole>) -> bool {
+    configured && leg_role == Some(VoiceLegRole::Callee)
 }
 
 impl TrafficAssignmentService {
@@ -920,6 +931,7 @@ impl TrafficAssignmentService {
             needs_service_negotiation,
             legacy_so1_assignment,
             requested_service_option,
+            leg_role,
         ) = mobiles
             .get(addr)
             .map(|ms| {
@@ -941,6 +953,8 @@ impl TrafficAssignmentService {
                         .is_some_and(|tc| tc.service_option == SERVICE_OPTION_BASIC_VOICE),
                     ms.find_traffic_channel_by_walsh(walsh_code)
                         .map(|tc| tc.origination_service_option.unwrap_or(tc.service_option)),
+                    ms.find_traffic_channel_by_walsh(walsh_code)
+                        .and_then(|tc| tc.voice_leg_role),
                 )
             })
             .unwrap_or((
@@ -953,11 +967,14 @@ impl TrafficAssignmentService {
                 false,
                 false,
                 None,
+                None,
             ));
+        let bypass_alert_answer =
+            bypass_alert_answer_for(traffic_config.bypass_alert_answer, leg_role);
 
         let serving_band_class = overhead.band_class.unwrap_or(0);
         let is_bc0 = serving_band_class == 0;
-        let (message, msg_id, assign_mode, code_chan) = if should_use_ecam(
+        let (message, msg_id, assign_mode, code_chan, bypass_signaled) = if should_use_ecam(
             mob_p_rev,
             legacy_so1_assignment,
             serving_band_class,
@@ -1014,9 +1031,13 @@ impl TrafficAssignmentService {
             ecam.rev_pwr_cntl_delay = ecam
                 .rev_fch_gating_mode
                 .then_some(RC3_GATED_REV_PWR_CNTL_DELAY);
+            if let Some(rlgain_adj) = rc12_rlgain_adj(traffic_config.rc12_rlgain_adj_db, rev_rc) {
+                ecam.rlgain_adj = rlgain_adj;
+            }
             ecam.freq_incl = true;
             ecam.band_class = overhead.band_class;
             ecam.cdma_freq = overhead.cdma_freq;
+            ecam.bypass_alert_answer = bypass_alert_answer;
             info!(
                 "BSC: ECAM detail walsh={} {} sdu_hex={}",
                 walsh_code,
@@ -1028,6 +1049,7 @@ impl TrafficAssignmentService {
                 MessageId::ExtChannelAssignment,
                 CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC,
                 walsh_code,
+                bypass_alert_answer,
             )
         } else {
             let (for_rc, rev_rc) = assigned_rcs
@@ -1075,7 +1097,7 @@ impl TrafficAssignmentService {
                     0,
                     default_config,
                     granted_mode,
-                    false,
+                    bypass_alert_answer,
                 )
             } else {
                 return Err(format!(
@@ -1084,13 +1106,20 @@ impl TrafficAssignmentService {
                 .into());
             };
             let assign_mode = cam.assign_mode;
+            let bypass_signaled = cam.bypass_alert_answer.unwrap_or(false);
             (
                 PagingChannelMessage::ChannelAssignment(cam),
                 MessageId::ChannelAssignment,
                 assign_mode,
                 walsh_code,
+                bypass_signaled,
             )
         };
+        mobiles.update(addr, |ms| {
+            if let Some(tc) = ms.find_traffic_channel_by_walsh_mut(walsh_code) {
+                tc.bypass_alert_answer = bypass_signaled;
+            }
+        });
 
         let sdu = message.to_sdu();
 
@@ -1144,6 +1173,23 @@ mod band_class_tests {
         assert!(!reverse_fch_gating_enabled(false, true, 3));
         assert!(!reverse_fch_gating_enabled(true, false, 3));
         assert!(!reverse_fch_gating_enabled(true, true, 2));
+    }
+
+    #[test]
+    fn rlgain_adj_setting_applies_to_rc1_and_rc2_within_the_field_range() {
+        assert_eq!(rc12_rlgain_adj(-4, 1), Some(-4));
+        assert_eq!(rc12_rlgain_adj(-4, 2), Some(-4));
+        assert_eq!(rc12_rlgain_adj(-12, 2), Some(-8));
+        assert_eq!(rc12_rlgain_adj(9, 1), Some(7));
+        assert_eq!(rc12_rlgain_adj(-4, 3), None);
+    }
+
+    #[test]
+    fn bypass_alert_answer_applies_only_to_the_called_mobile() {
+        assert!(bypass_alert_answer_for(true, Some(VoiceLegRole::Callee)));
+        assert!(!bypass_alert_answer_for(true, Some(VoiceLegRole::Caller)));
+        assert!(!bypass_alert_answer_for(true, None));
+        assert!(!bypass_alert_answer_for(false, Some(VoiceLegRole::Callee)));
     }
 }
 

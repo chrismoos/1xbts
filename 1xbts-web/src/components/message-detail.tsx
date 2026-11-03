@@ -2,7 +2,7 @@
 
 import { VoicePrivacyIndicator } from "@/components/voice-privacy-indicator";
 import Link from "next/link";
-import { useState, type ReactNode } from "react";
+import { createContext, useContext, useState, type ReactNode } from "react";
 import { AuthenticationMark } from "@/components/authentication-activity";
 import {
   type AuthVerdict,
@@ -152,46 +152,154 @@ function AccessAuthenticationDetail({ auth }: { auth: AccessAuthentication }) {
   );
 }
 
-/** A section title with a rule that runs to the right edge. */
-const SECTION_HEADING_CLASS =
-  "flex items-center gap-2 text-[10.5px] font-semibold uppercase tracking-wider text-muted after:h-px after:flex-1 after:bg-border-primary after:content-['']";
+const SECTION_HEADING_CLASS = "pt-1 text-[11px] font-semibold text-secondary";
 
-function FieldGrid({ children }: { children: ReactNode }) {
+const FieldLayoutContext = createContext<{ inline: boolean; inCard: boolean }>({ inline: false, inCard: false });
+
+const LABEL_OVERRIDES: Record<string, string> = {
+  PD: "Protocol discriminator",
+  MSG_TAG: "Message tag",
+  MOB_P_REV: "Mobile protocol revision",
+  PWR_MEAS_FRAMES: "Frames measured",
+  LAST_HDM_SEQ: "Last handoff message",
+  MAX_SCI: "Max slot cycle index",
+  PWR_UP_REG: "Power-up registration",
+  PARAM_REG: "Parameter registration",
+  SDU_BITS: "SDU length",
+};
+
+const LABEL_WORDS: Record<string, string> = {
+  MSG: "message",
+  SEQ: "sequence",
+  REQ: "request",
+  NUM: "number of",
+  PWR: "power",
+  MEAS: "measurement",
+  INCL: "included",
+  PREF: "preferred",
+  CHAN: "channel",
+  REG: "registration",
+  INIT: "initial",
+  NOM: "nominal",
+  IND: "indicator",
+  CAP: "capability",
+  REV: "reverse",
+  FOR: "forward",
+  ORIG: "originating",
+};
+
+const LABEL_ACRONYMS = new Set([
+  "ACK", "AUTHR", "AUTHU", "BS", "CDMA", "CRC", "DCCH", "ESN", "FCH", "FER", "HDM", "ID", "IMSI", "LTM", "MCC", "MEID",
+  "MNC", "MS", "MSID", "NID", "PDU", "PLCM", "PN", "RAND", "RANDBS", "RANDC", "RC", "SCH", "SCM", "SDU", "SID",
+  "SMS", "SO", "SSD", "TMSI",
+]);
+
+function readableLabel(label: string): string {
+  if (!/^[A-Z0-9_]+$/.test(label)) return label;
+  if (LABEL_OVERRIDES[label]) return LABEL_OVERRIDES[label];
+  const words = label.split("_").filter(Boolean).map((w) => (LABEL_ACRONYMS.has(w) ? w : LABEL_WORDS[w] ?? w.toLowerCase()));
+  const text = words.join(" ");
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+const FLAG_SUFFIX = /(_INCL|_IND|_REQ|_REG|_ON)$/;
+
+function displayValue(label: string, value: ReactNode): ReactNode {
+  if (FLAG_SUFFIX.test(label) && (value === "1" || value === "0" || value === 1 || value === 0)) {
+    return String(value) === "1" ? <span className="text-accent-green">Yes</span> : <span className="text-dimmed">No</span>;
+  }
+  return value;
+}
+
+export function FieldGrid({ children }: { children: ReactNode }) {
+  const { inline, inCard } = useContext(FieldLayoutContext);
+  if (inline) return <>{children}</>;
+  const grid = <div className="grid grid-cols-[repeat(auto-fill,minmax(16rem,1fr))] gap-x-6 text-xs">{children}</div>;
+  if (inCard) return grid;
   return (
-    <div className="grid grid-cols-[repeat(auto-fill,minmax(14rem,1fr))] gap-x-5 text-xs">
-      {children}
+    <div className="rounded-lg border border-border-subtle bg-surface px-3 py-0.5">
+      <FieldLayoutContext.Provider value={{ inline: false, inCard: true }}>{grid}</FieldLayoutContext.Provider>
     </div>
   );
 }
 
-function Field({ label, value }: { label: string; value?: ReactNode | null }) {
+export function Field({ label, value }: { label: string; value?: ReactNode | null }) {
+  const { inline } = useContext(FieldLayoutContext);
   if (value == null || value === "") {
     return null;
   }
+  const shown = displayValue(label, value);
+  const readable = readableLabel(label);
+  if (inline) {
+    return (
+      <span data-field title={readable !== label ? readable : undefined}>
+        <span className="mr-1.5 text-muted">{label}</span>
+        <span className="text-primary">{shown}</span>
+      </span>
+    );
+  }
   return (
-    <span className="flex min-w-0 justify-between gap-3 border-b border-dashed border-border-subtle py-0.5">
-      <span className="shrink-0 text-[11px] text-muted">{label}</span>
-      <span className="min-w-0 text-right font-mono text-primary break-words">{value}</span>
+    <span data-field className="flex min-w-0 items-baseline justify-between gap-3 border-b border-border-subtle py-1.5">
+      <span className="shrink-0 leading-tight text-muted">
+        {readable}
+        {readable !== label && <span className="block font-mono text-[10px] text-dimmed">{label}</span>}
+      </span>
+      <span className="min-w-0 text-right font-mono text-primary break-words">{shown}</span>
     </span>
   );
 }
 
-function DetailSection({ title, children }: { title: string; children: ReactNode }) {
+export function DetailSection({ title, compact, children }: { title: string; compact?: boolean; children: ReactNode }) {
+  const { inCard } = useContext(FieldLayoutContext);
+  if (compact) {
+    return (
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-lg border border-border-subtle bg-surface px-3 py-1.5 font-mono text-xs [&:not(:has([data-field]))]:hidden">
+        <span className="font-sans text-[10.5px] font-semibold uppercase tracking-wider text-accent-blue">{title}</span>
+        <FieldLayoutContext.Provider value={{ inline: true, inCard: true }}>{children}</FieldLayoutContext.Provider>
+      </div>
+    );
+  }
+  if (inCard) {
+    return (
+      <div className="space-y-1 pt-1">
+        <div className={SECTION_HEADING_CLASS}>{title}</div>
+        {children}
+      </div>
+    );
+  }
   return (
-    <div className="space-y-1">
-      <div className={SECTION_HEADING_CLASS}>{title}</div>
-      {children}
+    <div className="overflow-hidden rounded-lg border border-border-subtle bg-surface [&:not(:has([data-field]))]:hidden">
+      <div className="border-b border-border-subtle px-3 py-2 text-xs font-semibold text-secondary">{title}</div>
+      <FieldLayoutContext.Provider value={{ inline: false, inCard: true }}>
+        <div className="space-y-2 px-3 py-1 text-xs text-secondary">{children}</div>
+      </FieldLayoutContext.Provider>
     </div>
+  );
+}
+
+// C.S0005-E §2.7.2.3.2.6: PILOT_STRENGTH is -2 x Ec/Io in dB.
+const PILOT_STRENGTH_DB_PER_STEP = 0.5;
+const PILOT_BAR_FLOOR_DB = -20;
+
+function PilotStrength({ raw }: { raw: number }) {
+  const db = -raw * PILOT_STRENGTH_DB_PER_STEP;
+  const fill = Math.max(0, Math.min(100, (1 - db / PILOT_BAR_FLOOR_DB) * 100));
+  return (
+    <span className="inline-flex items-center gap-2" title={`PILOT_STRENGTH ${raw}`}>
+      <span className="inline-block h-1.5 w-16 overflow-hidden rounded-full bg-surface-raised">
+        <span className="block h-full rounded-full bg-accent-green" style={{ width: `${fill}%` }} />
+      </span>
+      {db.toFixed(1)} dB
+    </span>
   );
 }
 
 function StatTile({ label, value }: { label: string; value: string | null }) {
   if (value == null) return null;
   return (
-    <div className="min-w-24 rounded-md bg-surface-raised px-2.5 py-1.5">
-      <div className="text-[10.5px] uppercase tracking-wide text-muted">{label}</div>
-      <div className="font-mono text-sm text-primary">{value}</div>
-    </div>
+    <span className="text-xs text-muted">
+      {label} <span className="font-mono font-semibold text-primary">{value}</span>
+    </span>
   );
 }
 
@@ -707,14 +815,13 @@ function AccessPowerMeasurementReportDetail({ message }: { message: AccessPowerM
         )}
       </FieldGrid>
       {message.pilotStrengths.length > 0 && (
-        <div className="text-xs space-y-1">
-          <div className={SECTION_HEADING_CLASS}>Active Set Pilot Strengths</div>
-          {message.pilotStrengths.map((strength, i) => (
-            <div key={i}>
-              Pilot {i}: PILOT_STRENGTH={strength}
-            </div>
-          ))}
-        </div>
+        <DetailSection title="Active set pilot strengths">
+          <FieldGrid>
+            {message.pilotStrengths.map((strength, i) => (
+              <Field key={i} label={`Pilot ${i}`} value={<PilotStrength raw={strength} />} />
+            ))}
+          </FieldGrid>
+        </DetailSection>
       )}
     </div>
   );
@@ -924,7 +1031,7 @@ export function AccessDetail({ event, verdict }: { event: AccessEvent; verdict?:
         </div>
       )}
 
-      <div className="flex flex-wrap gap-2">
+      <div className="flex flex-wrap gap-x-4 gap-y-1">
         <StatTile label="SNR" value={event.snrDb != null ? `${event.snrDb.toFixed(1)} dB` : null} />
         <StatTile label="Signal" value={event.signalPowerDb != null ? `${event.signalPowerDb.toFixed(1)} dB` : null} />
         <StatTile label="RX power" value={event.rxPowerDbm != null ? `${event.rxPowerDbm.toFixed(1)} dBm` : null} />
@@ -932,6 +1039,16 @@ export function AccessDetail({ event, verdict }: { event: AccessEvent; verdict?:
         <StatTile label="Preamble" value={event.preambleFrames ? `${event.preambleFrames} frames` : null} />
         <StatTile label="Walsh" value={event.trafficWalshCode != null ? `W${event.trafficWalshCode}` : null} />
       </div>
+
+      <DetailSection title="Header" compact>
+        <FieldGrid>
+          <Field label="PD" value={event.pd} />
+          <Field label="MSG_TYPE" value={formatHex(event.msgType)} />
+          <Field label="MSG_SEQ" value={event.msgSeq} />
+          <Field label="CHIP_START" value={event.chipStart} />
+          <Field label="PREAMBLE_ONLY" value={event.isPreambleOnly ? "1" : null} />
+        </FieldGrid>
+      </DetailSection>
 
       <DetailSection title="Identity">
         <FieldGrid>
@@ -942,16 +1059,6 @@ export function AccessDetail({ event, verdict }: { event: AccessEvent; verdict?:
           <Field label="MSID_TYPE" value={event.msidType} />
           <Field label="MOB_P_REV" value={event.mobPRev} />
           <Field label="Subscriber" value={event.subscriberId ?? null} />
-        </FieldGrid>
-      </DetailSection>
-
-      <DetailSection title="Header">
-        <FieldGrid>
-          <Field label="PD" value={event.pd} />
-          <Field label="MSG_TYPE" value={formatHex(event.msgType)} />
-          <Field label="MSG_SEQ" value={event.msgSeq} />
-          <Field label="CHIP_START" value={event.chipStart} />
-          <Field label="PREAMBLE_ONLY" value={event.isPreambleOnly ? "1" : null} />
         </FieldGrid>
       </DetailSection>
 
@@ -1072,8 +1179,8 @@ function TrafficServiceConnectDetail({ message }: { message: TrafficServiceConne
 export function TrafficDetail({ event }: { event: TrafficEvent }) {
   const h = event.header;
   return (
-    <div className="text-xs text-muted space-y-2">
-      <FieldGrid>
+    <div className="text-xs text-muted space-y-3">
+      <DetailSection title="Header" compact>
         <Field label="CHANNEL" value={event.channelName} />
         <Field label="WALSH" value={`W${event.walshCode}`} />
         <Field label="SERVICE_OPTION" value={event.serviceOption != null ? `SO${event.serviceOption}` : null} />
@@ -1085,7 +1192,7 @@ export function TrafficDetail({ event }: { event: TrafficEvent }) {
         <Field label="ACK_REQ" value={h != null ? formatBool(h.ackReq) : null} />
         <Field label="VALID_ACK" value={h != null ? formatBool(h.validAck) : null} />
         <Field label="SDU_BITS" value={h?.sduLengthBits} />
-      </FieldGrid>
+      </DetailSection>
 
       {event.address && <div>Address: {event.address}</div>}
       {event.order && <ForwardOrderDetail order={event.order} />}

@@ -60,8 +60,9 @@ use bts_management_proto::bts_management_service_server::{
     BtsManagementService, BtsManagementServiceServer,
 };
 use bts_management_proto::{
-    BtsAttachState, BtsList, BtsSummary, CellRequest, EnrollRequest, EnrollResponse,
-    ReversePowerControlEntry, ReversePowerControlList, ReversePowerControlRequest,
+    AccessMeasurement, AccessMeasurementList, BtsAttachState, BtsList, BtsSummary, CellRequest,
+    EnrollRequest, EnrollResponse, ReversePowerControlEntry, ReversePowerControlList,
+    ReversePowerControlRequest, access_measurement,
 };
 use proto::CellId;
 
@@ -106,6 +107,7 @@ pub struct BtsManagementState {
     pub bearer: Option<Arc<cdma_abis::bearer_transport::BearerTransport>>,
     /// Broadcast AUTH and RAND. `Enroll` sets AUTH when `overhead.auth_mode` is omitted.
     pub global_challenge: Option<Arc<super::global_challenge::GlobalChallenge>>,
+    pub rx_measurements: Option<super::settings::RxMeasurementStore>,
 }
 
 impl BtsManagementState {
@@ -163,6 +165,7 @@ impl BtsManagementState {
             pch_transmit,
             bearer: None,
             global_challenge: None,
+            rx_measurements: None,
         })
     }
 
@@ -519,18 +522,31 @@ impl BtsManagementService for BtsManagementServiceImpl {
             });
         }
 
+        let traffic_power_fractions = self
+            .state
+            .tx_metrics
+            .borrow()
+            .traffic_power_fractions
+            .clone();
         for snapshot in self.state.power_control.snapshots() {
+            let power_fraction = traffic_power_fractions
+                .iter()
+                .find(|(walsh_code, _)| *walsh_code == snapshot.walsh_code)
+                .map(|(_, fraction)| *fraction);
             channels.push(proto::Channel {
                 walsh_code: Some(u32::from(snapshot.walsh_code)),
                 channel_type: "traffic".into(),
                 direction: "forward".into(),
-                power_fraction: None,
+                power_fraction,
                 data_rate_bps: None,
                 paging_channel_number: None,
                 access_channel_number: None,
                 mobile: None,
                 service_option: None,
-                traffic_power: Some(to_proto_bts_reverse_power(&snapshot)),
+                traffic_power: Some(to_proto_bts_reverse_power(
+                    &snapshot,
+                    self.state.rx_reference_dbm,
+                )),
                 cell: Some(cell),
             });
         }
@@ -561,7 +577,10 @@ impl BtsManagementService for BtsManagementServiceImpl {
             .power_control
             .snapshot(walsh_code)
             .ok_or_else(|| Status::not_found("active BTS power-control state not found"))?;
-        Ok(Response::new(to_proto_bts_reverse_power(&snapshot)))
+        Ok(Response::new(to_proto_bts_reverse_power(
+            &snapshot,
+            self.state.rx_reference_dbm,
+        )))
     }
 
     async fn list_reverse_power_controls(
@@ -577,10 +596,48 @@ impl BtsManagementService for BtsManagementServiceImpl {
                 .iter()
                 .map(|snapshot| ReversePowerControlEntry {
                     walsh_code: u32::from(snapshot.walsh_code),
-                    power: Some(to_proto_bts_reverse_power(snapshot)),
+                    power: Some(to_proto_bts_reverse_power(
+                        snapshot,
+                        self.state.rx_reference_dbm,
+                    )),
                 })
                 .collect(),
         }))
+    }
+
+    async fn list_access_measurements(
+        &self,
+        request: Request<CellRequest>,
+    ) -> Result<Response<AccessMeasurementList>, Status> {
+        self.state.check_cell(request.into_inner().cell)?;
+        let Some(store) = &self.state.rx_measurements else {
+            return Ok(Response::new(AccessMeasurementList::default()));
+        };
+        let map = store
+            .lock()
+            .map_err(|_| Status::internal("access measurement store poisoned"))?;
+        let entries = map
+            .iter()
+            .map(|(key, meas)| AccessMeasurement {
+                mobile: Some(match key {
+                    super::settings::RxMeasurementKey::Esn(esn) => {
+                        access_measurement::Mobile::Esn(*esn)
+                    }
+                    super::settings::RxMeasurementKey::Imsi(imsi) => {
+                        access_measurement::Mobile::Imsi(imsi.clone())
+                    }
+                }),
+                eb_nt_db: meas.access_signal.eb_nt_db,
+                signal_power_dbfs: meas.access_signal.signal_power_dbfs,
+                band_level_dbfs: meas.raw_power_db,
+                raw_ber_pct: meas.access_signal.raw_ber_pct,
+                message: meas.message.clone(),
+                measured_at_us: meas.timestamp_us,
+                noise_floor_dbfs: meas.access_signal.noise_floor_dbfs,
+                noise_floor_stale: meas.access_signal.noise_floor_stale,
+            })
+            .collect();
+        Ok(Response::new(AccessMeasurementList { entries }))
     }
 
     async fn set_reverse_power_control_override(
@@ -626,7 +683,10 @@ impl BtsManagementService for BtsManagementServiceImpl {
             proto::SetTrafficChannelPowerOverrideResponse {
                 accepted: true,
                 message,
-                traffic_power: Some(to_proto_bts_reverse_power(&snapshot)),
+                traffic_power: Some(to_proto_bts_reverse_power(
+                    &snapshot,
+                    self.state.rx_reference_dbm,
+                )),
             },
         ))
     }
@@ -800,7 +860,13 @@ fn to_proto_bearer_metrics(
 /// The forward-loop and per-PCG history fields stay empty here. The BSC
 /// drives them from PMRM reports and fills them in when it joins this
 /// snapshot onto a mobile.
-fn to_proto_bts_reverse_power(snapshot: &BtsPowerControlSnapshot) -> proto::TrafficChannelPower {
+fn to_proto_bts_reverse_power(
+    snapshot: &BtsPowerControlSnapshot,
+    rx_reference_dbm: Option<f64>,
+) -> proto::TrafficChannelPower {
+    let reverse_power_dbfs = snapshot
+        .measured_reverse_power_1s
+        .map(|measurement| measurement.mean_db);
     proto::TrafficChannelPower {
         target_eb_nt_db: snapshot.target_eb_nt_db,
         effective_target_eb_nt_db: snapshot.effective_target_eb_nt_db,
@@ -828,6 +894,10 @@ fn to_proto_bts_reverse_power(snapshot: &BtsPowerControlSnapshot) -> proto::Traf
         measured_inner_loop_1s_timestamp_ms: snapshot
             .measured_inner_loop_1s
             .map(|measurement| measurement.timestamp_ms),
+        reverse_power_dbfs,
+        reverse_power_dbm: reverse_power_dbfs
+            .zip(rx_reference_dbm)
+            .map(|(dbfs, reference)| dbfs + reference as f32),
     }
 }
 

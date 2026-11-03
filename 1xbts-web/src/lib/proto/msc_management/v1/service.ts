@@ -122,6 +122,10 @@ export interface InitiateOtaspResponse {
   callId: number;
 }
 
+export interface ReleaseCallRequest {
+  callId: number;
+}
+
 function createBaseCallList(): CallList {
   return { callIds: [] };
 }
@@ -1234,6 +1238,70 @@ export const InitiateOtaspResponse: MessageFns<InitiateOtaspResponse> = {
   },
 };
 
+function createBaseReleaseCallRequest(): ReleaseCallRequest {
+  return { callId: 0 };
+}
+
+export const ReleaseCallRequest: MessageFns<ReleaseCallRequest> = {
+  encode(message: ReleaseCallRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.callId !== 0) {
+      writer.uint32(8).uint64(message.callId);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ReleaseCallRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseReleaseCallRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.callId = longToNumber(reader.uint64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ReleaseCallRequest {
+    return {
+      callId: isSet(object.callId)
+        ? globalThis.Number(object.callId)
+        : isSet(object.call_id)
+        ? globalThis.Number(object.call_id)
+        : 0,
+    };
+  },
+
+  toJSON(message: ReleaseCallRequest): unknown {
+    const obj: any = {};
+    if (message.callId !== 0) {
+      obj.callId = Math.round(message.callId);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<ReleaseCallRequest>): ReleaseCallRequest {
+    return ReleaseCallRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<ReleaseCallRequest>): ReleaseCallRequest {
+    const message = createBaseReleaseCallRequest();
+    message.callId = object.callId ?? 0;
+    return message;
+  },
+};
+
 export type MscManagementServiceDefinition = typeof MscManagementServiceDefinition;
 export const MscManagementServiceDefinition = {
   name: "MscManagementService",
@@ -1281,6 +1349,20 @@ export const MscManagementServiceDefinition = {
       requestType: Empty as typeof Empty,
       requestStream: false,
       responseType: CallList as typeof CallList,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * Releases a call from the network side. A call with a traffic channel is
+     * cleared with an A1 Clear Command, so the mobile receives a Release Order.
+     * A call still being paged is abandoned. Fails with NOT_FOUND for an
+     * unknown call ID.
+     */
+    releaseCall: {
+      name: "ReleaseCall",
+      requestType: ReleaseCallRequest as typeof ReleaseCallRequest,
+      requestStream: false,
+      responseType: Empty as typeof Empty,
       responseStream: false,
       options: {},
     },
@@ -1342,6 +1424,13 @@ export interface MscManagementServiceImplementation<CallContextExt = {}> {
   /** Lists active MSC call IDs. */
   listCalls(request: Empty, context: CallContext & CallContextExt): Promise<DeepPartial<CallList>>;
   /**
+   * Releases a call from the network side. A call with a traffic channel is
+   * cleared with an A1 Clear Command, so the mobile receives a Release Order.
+   * A call still being paged is abandoned. Fails with NOT_FOUND for an
+   * unknown call ID.
+   */
+  releaseCall(request: ReleaseCallRequest, context: CallContext & CallContextExt): Promise<DeepPartial<Empty>>;
+  /**
    * Streams live OTASP events for real-time dashboards. Persisted
    * session history is served separately by the HLR service.
    */
@@ -1385,6 +1474,13 @@ export interface MscManagementServiceClient<CallOptionsExt = {}> {
   sendSms(request: DeepPartial<SendSmsRequest>, options?: CallOptions & CallOptionsExt): Promise<SendSmsResponse>;
   /** Lists active MSC call IDs. */
   listCalls(request: DeepPartial<Empty>, options?: CallOptions & CallOptionsExt): Promise<CallList>;
+  /**
+   * Releases a call from the network side. A call with a traffic channel is
+   * cleared with an A1 Clear Command, so the mobile receives a Release Order.
+   * A call still being paged is abandoned. Fails with NOT_FOUND for an
+   * unknown call ID.
+   */
+  releaseCall(request: DeepPartial<ReleaseCallRequest>, options?: CallOptions & CallOptionsExt): Promise<Empty>;
   /**
    * Streams live OTASP events for real-time dashboards. Persisted
    * session history is served separately by the HLR service.

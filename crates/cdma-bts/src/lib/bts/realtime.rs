@@ -28,6 +28,17 @@ pub(crate) fn apply_rx(settings: &RealtimeSettings) {
     apply_current("bts-rx", settings, settings.rx_priority, settings.rx_cpu);
 }
 
+/// The reader is spawned from `bts-rx` and does every radio read. Linux
+/// threads inherit the creator's scheduling, macOS threads do not.
+pub(crate) fn apply_rx_reader(settings: &RealtimeSettings) {
+    apply_current(
+        "bts-rx-reader",
+        settings,
+        settings.rx_priority,
+        settings.rx_cpu,
+    );
+}
+
 fn apply_current(label: &str, settings: &RealtimeSettings, priority: i32, cpu: Option<usize>) {
     if !settings.enabled {
         info!("{label}: real-time scheduling disabled");
@@ -170,39 +181,73 @@ fn apply_macos_qos(label: &str) {
 }
 
 #[cfg(target_os = "macos")]
-fn apply_macos_time_constraint(label: &str) -> bool {
+mod mach {
     #[repr(C)]
-    struct ThreadTimeConstraintPolicy {
-        period: u32,
-        computation: u32,
-        constraint: u32,
-        preemptible: i32,
+    pub(super) struct ThreadTimeConstraintPolicy {
+        pub period: u32,
+        pub computation: u32,
+        pub constraint: u32,
+        pub preemptible: i32,
     }
     #[repr(C)]
-    struct MachTimebaseInfo {
-        numer: u32,
-        denom: u32,
+    pub(super) struct MachTimebaseInfo {
+        pub numer: u32,
+        pub denom: u32,
+    }
+    /// `thread_extended_info_data_t` from `<mach/thread_info.h>`.
+    #[repr(C)]
+    pub(super) struct ThreadExtendedInfo {
+        pub pth_user_time: u64,
+        pub pth_system_time: u64,
+        pub pth_cpu_usage: i32,
+        pub pth_policy: i32,
+        pub pth_run_state: i32,
+        pub pth_flags: i32,
+        pub pth_sleep_time: i32,
+        pub pth_curpri: i32,
+        pub pth_priority: i32,
+        pub pth_maxpriority: i32,
+        pub pth_name: [std::ffi::c_char; 64],
     }
     unsafe extern "C" {
-        fn mach_thread_self() -> u32;
-        fn thread_policy_set(
+        pub(super) static mach_task_self_: u32;
+        pub(super) fn mach_thread_self() -> u32;
+        pub(super) fn thread_policy_set(
             thread: u32,
             flavor: u32,
             policy_info: *const ThreadTimeConstraintPolicy,
             count: u32,
         ) -> i32;
-        fn thread_policy_get(
+        pub(super) fn thread_policy_get(
             thread: u32,
             flavor: u32,
             policy_info: *mut i32,
             count: *mut u32,
             get_default: *mut i32,
         ) -> i32;
-        fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+        pub(super) fn thread_info(thread: u32, flavor: u32, info: *mut i32, count: *mut u32)
+        -> i32;
+        pub(super) fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+        pub(super) fn task_threads(task: u32, list: *mut *mut u32, count: *mut u32) -> i32;
+        pub(super) fn mach_port_deallocate(task: u32, name: u32) -> i32;
+        pub(super) fn vm_deallocate(task: u32, address: usize, size: usize) -> i32;
     }
-    const THREAD_TIME_CONSTRAINT_POLICY: u32 = 2;
-    const THREAD_TIME_CONSTRAINT_POLICY_COUNT: u32 = 4;
+    pub(super) const THREAD_TIME_CONSTRAINT_POLICY: u32 = 2;
+    pub(super) const THREAD_TIME_CONSTRAINT_POLICY_COUNT: u32 = 4;
+    pub(super) const THREAD_EXTENDED_INFO: u32 = 5;
+    pub(super) const THREAD_EXTENDED_INFO_COUNT: u32 =
+        (std::mem::size_of::<ThreadExtendedInfo>() / std::mem::size_of::<i32>()) as u32;
+}
 
+#[cfg(target_os = "macos")]
+fn apply_macos_time_constraint(label: &str) -> bool {
+    let thread = unsafe { mach::mach_thread_self() };
+    set_macos_time_constraint(label, thread)
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_time_constraint(label: &str, thread: u32) -> bool {
+    use mach::*;
     let mut timebase = MachTimebaseInfo { numer: 0, denom: 0 };
     if unsafe { mach_timebase_info(&mut timebase) } != 0 || timebase.numer == 0 {
         degraded(label, "mach_timebase_info failed");
@@ -219,7 +264,7 @@ fn apply_macos_time_constraint(label: &str) -> bool {
     };
     let ret = unsafe {
         thread_policy_set(
-            mach_thread_self(),
+            thread,
             THREAD_TIME_CONSTRAINT_POLICY,
             &policy,
             THREAD_TIME_CONSTRAINT_POLICY_COUNT,
@@ -242,7 +287,7 @@ fn apply_macos_time_constraint(label: &str) -> bool {
         let mut get_default = 0;
         let verify = unsafe {
             thread_policy_get(
-                mach_thread_self(),
+                thread,
                 THREAD_TIME_CONSTRAINT_POLICY,
                 (&mut actual as *mut ThreadTimeConstraintPolicy).cast::<i32>(),
                 &mut count,
@@ -272,15 +317,104 @@ fn apply_macos_time_constraint(label: &str) -> bool {
     }
 }
 
+/// Send rights to every thread in this task. Port names for one thread are
+/// stable across calls, so two lists can be compared by name. Every name in
+/// the list holds a reference and must go through `release_thread_ports`.
+#[cfg(target_os = "macos")]
+fn task_thread_ports() -> Vec<u32> {
+    let mut list: *mut u32 = std::ptr::null_mut();
+    let mut count: u32 = 0;
+    let task = unsafe { mach::mach_task_self_ };
+    if unsafe { mach::task_threads(task, &mut list, &mut count) } != 0 || list.is_null() {
+        return Vec::new();
+    }
+    let ports = unsafe { std::slice::from_raw_parts(list, count as usize) }.to_vec();
+    unsafe {
+        mach::vm_deallocate(
+            task,
+            list as usize,
+            count as usize * std::mem::size_of::<u32>(),
+        );
+    }
+    ports
+}
+
+#[cfg(target_os = "macos")]
+fn release_thread_ports(ports: &[u32]) {
+    let task = unsafe { mach::mach_task_self_ };
+    for &port in ports {
+        unsafe {
+            mach::mach_port_deallocate(task, port);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn thread_name_and_priority(thread: u32) -> (String, i32) {
+    let mut info = std::mem::MaybeUninit::<mach::ThreadExtendedInfo>::zeroed();
+    let mut count = mach::THREAD_EXTENDED_INFO_COUNT;
+    let ret = unsafe {
+        mach::thread_info(
+            thread,
+            mach::THREAD_EXTENDED_INFO,
+            info.as_mut_ptr().cast::<i32>(),
+            &mut count,
+        )
+    };
+    if ret != 0 {
+        return (String::new(), -1);
+    }
+    let info = unsafe { info.assume_init() };
+    let name = unsafe { std::ffi::CStr::from_ptr(info.pth_name.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    (name, info.pth_curpri)
+}
+
+/// A radio driver's USB event and async threads start at timeshare priority,
+/// which puts the frame return path for a real-time `bts-tx` behind every
+/// other runnable thread on the host. Threads the async runtime names are
+/// left alone.
+#[cfg(target_os = "macos")]
+fn promote_threads_since(label: &str, before: &[u32]) {
+    let after = task_thread_ports();
+    let mut promoted = 0;
+    for &thread in after.iter().filter(|thread| !before.contains(thread)) {
+        let (name, priority) = thread_name_and_priority(thread);
+        if name.starts_with("tokio") {
+            continue;
+        }
+        if set_macos_time_constraint(label, thread) {
+            promoted += 1;
+            info!(
+                "{label}: promoted driver thread 0x{thread:x} name={name:?} from priority {priority}"
+            );
+        } else {
+            warn!("{label}: could not promote driver thread 0x{thread:x} name={name:?}");
+        }
+    }
+    info!(
+        "{label}: driver spawned {} thread(s), promoted {promoted}",
+        after.len().saturating_sub(before.len())
+    );
+    release_thread_ports(&after);
+}
+
 /// Raises the current thread while a radio driver spawns its workers, so they
 /// inherit the elevated scheduling, and restores it on drop.
 ///
 /// Linux threads inherit `SCHED_FIFO` and CPU affinity from their creator. macOS
 /// threads created by `pthread_create` start at `QOS_CLASS_DEFAULT` whatever the
-/// creator runs at, so the guard does nothing there.
+/// creator runs at, so on macOS the guard instead records the task's threads on
+/// entry and gives the time-constraint policy to every thread that appeared by
+/// the time it drops.
 pub(crate) struct DriverPriorityGuard {
     #[cfg(target_os = "linux")]
     saved: Option<LinuxSchedState>,
+    #[cfg(target_os = "macos")]
+    label: &'static str,
+    #[cfg(target_os = "macos")]
+    before: Option<Vec<u32>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -303,11 +437,30 @@ impl DriverPriorityGuard {
             }
         }
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            Self {
+                label,
+                before: settings.enabled.then(task_thread_ports),
+            }
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = (label, settings);
             Self {}
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for DriverPriorityGuard {
+    fn drop(&mut self) {
+        let Some(before) = self.before.take() else {
+            return;
+        };
+        promote_threads_since(self.label, &before);
+        release_thread_ports(&before);
     }
 }
 

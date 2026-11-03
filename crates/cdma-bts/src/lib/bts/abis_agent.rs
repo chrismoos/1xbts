@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use log::{debug, info, warn};
 
@@ -18,10 +19,11 @@ use cdma_abis::control::typed::{
     TrafficCircuitId,
 };
 use cdma_abis::control::{
-    AbisMessage, AbisTimerKind, BtsReleaseAckMessage, BtsReleaseMessage, BtsSetupAckMessage,
-    BtsSetupMessage, CallConnectionReference, ConnectAckMessage, ConnectMessage, MessageType,
-    PchMessageTransferAckMessage, PchMessageTransferMessage, RemoveAckMessage, RemoveMessage,
-    TrafficReleaseProcedure, TrafficSetupProcedure, TrafficSetupState, TrafficSetupTimeoutAction,
+    AbisMessage, AbisTimerKind, BtsReleaseAckMessage, BtsReleaseMessage, BtsReleaseRequestMessage,
+    BtsSetupAckMessage, BtsSetupMessage, CallConnectionReference, ConnectAckMessage,
+    ConnectMessage, MessageType, PchMessageTransferAckMessage, PchMessageTransferMessage,
+    RemoveAckMessage, RemoveMessage, TrafficReleaseProcedure, TrafficSetupProcedure,
+    TrafficSetupState, TrafficSetupTimeoutAction,
 };
 use cdma_abis::control::{decode, encode};
 
@@ -75,6 +77,20 @@ pub(super) fn cam_radio_config(
         })
 }
 
+pub const RADIO_LINK_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+/// A channel with fewer than `RADIO_LINK_MIN_VALID_FRAMES` valid reverse frames
+/// in this long is released.
+const RADIO_LINK_LOSS: Duration = Duration::from_secs(4);
+/// Noise passes the eighth-rate frame check about once a second, so one valid
+/// frame does not prove the mobile is there.
+const RADIO_LINK_MIN_VALID_FRAMES: usize = 10;
+const _: () = assert!(RADIO_LINK_MIN_VALID_FRAMES <= super::power_control::VALID_FRAME_HISTORY);
+const RADIO_LINK_NEVER_UP: Duration = Duration::from_secs(5);
+/// A.S0003-A §6.2.19 Trelreqb: the BTS resends a BTS Release Request the BSC
+/// has not answered.
+const RELEASE_REQUEST_RESEND: Duration = Duration::from_secs(5);
+const RELEASE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Per-CCR session tracking on the BTS side.
 struct Session {
     walsh_code: u8,
@@ -91,6 +107,9 @@ struct Session {
     sch_walsh_code: Option<u8>,
     /// Service option from the BTS Setup Service Option element.
     requested_service_option: Option<u16>,
+    set_up_at: Instant,
+    release_requested_at: Option<Instant>,
+    release_request_resent: bool,
 }
 
 /// Events emitted by the agent to BTS-internal consumers.
@@ -106,7 +125,6 @@ pub enum AbisAgentEvent {
         ccr: CallConnectionReference,
         walsh_code: u8,
     },
-    /// The BTS initiated a release toward the BSC for the given session.
     BtsReleaseInitiated {
         ccr: CallConnectionReference,
         walsh_code: u8,
@@ -130,6 +148,7 @@ pub struct AbisAgentConfig {
     pub cell_id: CellId,
     /// MSC identifier used in TrafficChannelStatus reports.
     pub mscid: u32,
+    pub radio_link_loss_release: bool,
 }
 
 /// BTS-side Abis message handler.
@@ -335,46 +354,118 @@ impl AbisAgent {
         self.sessions.get(ccr).map(|s| s.walsh_code)
     }
 
-    /// Builds a BTS-initiated release message for the session on `walsh_code`.
-    ///
-    /// Returns the encoded `AbisMessage` to send to the BSC and a
-    /// `BtsReleaseInitiated` event. The session is **not** removed here;
-    /// the BSC will follow up with a `Remove` that `handle_remove` processes.
-    pub fn initiate_release(&mut self, walsh_code: u8) -> (Vec<AbisMessage>, Vec<AbisAgentEvent>) {
-        let mut responses = Vec::new();
-        let mut events = Vec::new();
-
-        let Some((&ccr, _session)) = self
-            .sessions
-            .iter()
-            .find(|(_, s)| s.walsh_code == walsh_code)
-        else {
-            warn!(
-                "abis_agent: initiate_release called for unknown walsh_code {}",
-                walsh_code
-            );
-            return (responses, events);
+    /// A.S0003-A §6.2.19 allows only OAM&P intervention, Packet Data Going
+    /// Dormant and Equipment failure as causes, none of which is a lost radio
+    /// link, so the cause is left out. The BSC reports Radio interface
+    /// failure to the MSC.
+    fn request_release(
+        &mut self,
+        ccr: CallConnectionReference,
+        now: Instant,
+        responses: &mut Vec<AbisMessage>,
+        events: &mut Vec<AbisAgentEvent>,
+    ) {
+        let Some(session) = self.sessions.get_mut(&ccr) else {
+            return;
         };
-
-        let release = BtsReleaseMessage {
+        let request = BtsReleaseRequestMessage {
             call_connection_reference: ccr,
-            cell_identifier_list: None,
-            correlation_id: None,
+            cause: None,
+            manufacturer_specific_records: None,
         };
-        match release.encode() {
+        match request.encode() {
             Ok(bytes) => {
                 if let Some(msg) = abis_message_from_typed(&bytes) {
-                    info!(
-                        "abis_agent: BTS-initiated release for CCR {:?} walsh={}",
-                        ccr, walsh_code
-                    );
                     responses.push(msg);
-                    events.push(AbisAgentEvent::BtsReleaseInitiated { ccr, walsh_code });
+                    session.release_requested_at.get_or_insert(now);
+                    events.push(AbisAgentEvent::BtsReleaseInitiated {
+                        ccr,
+                        walsh_code: session.walsh_code,
+                    });
                 }
             }
-            Err(e) => {
-                warn!("abis_agent: BtsRelease encode failed: {e}");
+            Err(e) => warn!("abis_agent: BtsReleaseRequest encode failed: {e}"),
+        }
+    }
+
+    /// A lost channel the BSC has not released within `RELEASE_REQUEST_TIMEOUT` is
+    /// freed locally, so a mobile the BTS can no longer hear is not kept
+    /// transmitting.
+    pub fn check_radio_links(&mut self, now: Instant) -> (Vec<AbisMessage>, Vec<AbisAgentEvent>) {
+        let mut responses = Vec::new();
+        let mut events = Vec::new();
+        let mut lost = Vec::new();
+        let mut resend = Vec::new();
+        let mut unanswered = Vec::new();
+        let power_control = self.controller.power_control();
+        for (&ccr, session) in &self.sessions {
+            if let Some(requested_at) = session.release_requested_at {
+                let waited = now.saturating_duration_since(requested_at);
+                if waited >= RELEASE_REQUEST_TIMEOUT {
+                    unanswered.push(ccr);
+                } else if waited >= RELEASE_REQUEST_RESEND && !session.release_request_resent {
+                    resend.push(ccr);
+                }
+                continue;
             }
+            if !self.config.radio_link_loss_release {
+                continue;
+            }
+            let last_valid =
+                power_control.valid_frame_at(session.walsh_code, RADIO_LINK_MIN_VALID_FRAMES - 1);
+            let lost_link = match last_valid {
+                Some(at) => now.saturating_duration_since(at) >= RADIO_LINK_LOSS,
+                None => now.saturating_duration_since(session.set_up_at) >= RADIO_LINK_NEVER_UP,
+            };
+            if lost_link {
+                lost.push((ccr, session.walsh_code, last_valid));
+            }
+        }
+
+        for (ccr, walsh_code, last_valid) in lost {
+            match last_valid {
+                Some(at) => warn!(
+                    "abis_agent: walsh={} decoded fewer than {} valid reverse frames in {:.1}s, requesting release for CCR {:?}",
+                    walsh_code,
+                    RADIO_LINK_MIN_VALID_FRAMES,
+                    now.saturating_duration_since(at).as_secs_f32(),
+                    ccr
+                ),
+                None => warn!(
+                    "abis_agent: walsh={} decoded fewer than {} valid reverse frames since setup, requesting release for CCR {:?}",
+                    walsh_code, RADIO_LINK_MIN_VALID_FRAMES, ccr
+                ),
+            }
+            self.controller
+                .power_control()
+                .enter_release_hold(self.controller.traffic_channels_pool(), walsh_code);
+            self.request_release(ccr, now, &mut responses, &mut events);
+        }
+
+        for ccr in resend {
+            if let Some(session) = self.sessions.get_mut(&ccr) {
+                session.release_request_resent = true;
+            }
+            self.request_release(ccr, now, &mut responses, &mut events);
+        }
+
+        for ccr in unanswered {
+            let Some(session) = self.sessions.remove(&ccr) else {
+                continue;
+            };
+            warn!(
+                "abis_agent: BSC did not release lost walsh={} for CCR {:?}, releasing it locally",
+                session.walsh_code, ccr
+            );
+            self.controller.deallocate_traffic(session.walsh_code);
+            self.controller.request_rx_removal(session.walsh_code);
+            if let Some(w32) = session.sch_walsh_code {
+                self.controller.deallocate_sch(w32);
+            }
+            events.push(AbisAgentEvent::TrafficReleased {
+                ccr,
+                walsh_code: session.walsh_code,
+            });
         }
 
         (responses, events)
@@ -578,6 +669,9 @@ impl AbisAgent {
                             traffic_lac: None,
                             sch_walsh_code,
                             requested_service_option: setup.service_option.map(|so| so.0),
+                            set_up_at: Instant::now(),
+                            release_requested_at: None,
+                            release_request_resent: false,
                         },
                     );
                     responses.push(msg);
@@ -1342,6 +1436,7 @@ mod tests {
                 sector: 0x01,
             },
             mscid: 0x001234,
+            radio_link_loss_release: true,
         }
     }
 
@@ -1363,6 +1458,7 @@ mod tests {
     fn minimal_access_event(imsi: &str, msg_seq: u8) -> AccessChannelEvent {
         let (imsi_m_s1, imsi_m_s2) = cdma_common::paging::imsi_s_from_imsi(imsi).unwrap();
         AccessChannelEvent {
+            access_signal: Default::default(),
             event_id: "test-access".to_string(),
             chip_start: 0,
             absolute_chip_start: None,
@@ -2096,40 +2192,121 @@ mod tests {
         assert_eq!(controller.traffic_channels_pool().len(), 1);
     }
 
+    fn release_request_cause(message: &AbisMessage) -> Option<u8> {
+        let bytes = encode(message).expect("encode");
+        BtsReleaseRequestMessage::decode(&bytes)
+            .expect("decode")
+            .cause
+    }
+
     #[test]
-    fn bts_initiated_release_sends_release_message() {
+    fn link_loss_release_is_off_unless_configured() {
+        let controller = Arc::new(TrafficResourceService::new());
+        controller
+            .walsh_allocator()
+            .lock()
+            .reserve_system_channels(0, 1, 32);
+        let config = AbisAgentConfig {
+            radio_link_loss_release: false,
+            ..test_config()
+        };
+        let mut agent = AbisAgent::new(config, controller.clone());
+        let ccr = test_ccr();
+        agent.handle_message(&make_bts_setup(ccr, 0xBEEF));
+        let start = Instant::now();
+
+        let (responses, events) = agent.check_radio_links(start + RADIO_LINK_NEVER_UP * 4);
+        assert!(responses.is_empty());
+        assert!(events.is_empty());
+        assert!(agent.walsh_code_for(&ccr).is_some());
+    }
+
+    #[test]
+    fn channel_that_never_decodes_is_released_after_setup_limit() {
         let controller = Arc::new(TrafficResourceService::new());
         controller
             .walsh_allocator()
             .lock()
             .reserve_system_channels(0, 1, 32);
         let mut agent = AbisAgent::new(test_config(), controller.clone());
-
         let ccr = test_ccr();
         agent.handle_message(&make_bts_setup(ccr, 0xBEEF));
         let walsh_code = agent.walsh_code_for(&ccr).unwrap();
+        let start = Instant::now();
 
-        let (responses, events) = agent.initiate_release(walsh_code);
+        let (responses, _) =
+            agent.check_radio_links(start + RADIO_LINK_NEVER_UP - Duration::from_millis(100));
+        assert!(responses.is_empty());
+
+        let (responses, events) =
+            agent.check_radio_links(start + RADIO_LINK_NEVER_UP + Duration::from_millis(100));
         assert_eq!(responses.len(), 1);
-        assert_eq!(responses[0].message_type, MessageType::BtsRelease);
-        assert_eq!(events.len(), 1);
+        assert_eq!(responses[0].message_type, MessageType::BtsReleaseRequest);
+        assert_eq!(release_request_cause(&responses[0]), None);
         assert!(matches!(
             &events[0],
             AbisAgentEvent::BtsReleaseInitiated { ccr: c, walsh_code: w }
             if *c == ccr && *w == walsh_code
         ));
-
         assert_eq!(agent.active_session_count(), 1);
+
+        let requested = start + RADIO_LINK_NEVER_UP + Duration::from_millis(100);
+        let (responses, _) = agent.check_radio_links(requested + Duration::from_secs(1));
+        assert!(responses.is_empty(), "no repeat before Trelreqb");
+        let (responses, _) = agent.check_radio_links(requested + RELEASE_REQUEST_RESEND);
+        assert_eq!(responses.len(), 1, "one resend at Trelreqb");
+        let (responses, _) =
+            agent.check_radio_links(requested + RELEASE_REQUEST_RESEND + Duration::from_secs(1));
+        assert!(responses.is_empty());
     }
 
     #[test]
-    fn bts_initiated_release_unknown_walsh_is_noop() {
+    fn channel_that_stops_decoding_is_released_and_freed_if_bsc_is_silent() {
         let controller = Arc::new(TrafficResourceService::new());
-        let mut agent = AbisAgent::new(test_config(), controller);
+        controller
+            .walsh_allocator()
+            .lock()
+            .reserve_system_channels(0, 1, 32);
+        let mut agent = AbisAgent::new(test_config(), controller.clone());
+        let ccr = test_ccr();
+        agent.handle_message(&make_bts_setup(ccr, 0xBEEF));
+        let walsh_code = agent.walsh_code_for(&ccr).unwrap();
+        for _ in 0..RADIO_LINK_MIN_VALID_FRAMES - 1 {
+            controller
+                .power_control()
+                .outer_loop_tick(None, walsh_code, true);
+        }
+        assert!(agent.check_radio_links(Instant::now()).0.is_empty());
+        controller
+            .power_control()
+            .outer_loop_tick(None, walsh_code, true);
+        let last_valid = controller
+            .power_control()
+            .valid_frame_at(walsh_code, RADIO_LINK_MIN_VALID_FRAMES - 1)
+            .unwrap();
 
-        let (responses, events) = agent.initiate_release(99);
+        let (responses, _) =
+            agent.check_radio_links(last_valid + RADIO_LINK_LOSS - Duration::from_millis(100));
         assert!(responses.is_empty());
-        assert!(events.is_empty());
+
+        let requested = last_valid + RADIO_LINK_LOSS + Duration::from_millis(100);
+        let (responses, _) = agent.check_radio_links(requested);
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].message_type, MessageType::BtsReleaseRequest);
+
+        let (_, events) = agent.check_radio_links(requested + RELEASE_REQUEST_TIMEOUT);
+        assert!(matches!(
+            &events[0],
+            AbisAgentEvent::TrafficReleased { ccr: c, walsh_code: w }
+            if *c == ccr && *w == walsh_code
+        ));
+        assert_eq!(agent.active_session_count(), 0);
+        assert!(
+            controller
+                .traffic_channels_pool()
+                .lookup(walsh_code)
+                .is_none()
+        );
     }
 
     #[test]

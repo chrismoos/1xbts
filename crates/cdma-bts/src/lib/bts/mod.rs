@@ -11,6 +11,7 @@ pub mod launcher;
 pub mod management;
 pub mod metrics_service;
 pub mod node;
+mod noise_floor;
 pub mod paging_service;
 pub mod paging_supplier;
 pub mod power_control;
@@ -22,7 +23,6 @@ pub mod rx;
 pub mod settings;
 pub mod synthesis_service;
 pub mod traffic_lac;
-pub mod traffic_setup_service;
 pub use bearer_transport_service::BearerTransportService;
 pub use config::{
     BtsAbisTimers, BtsNodeConfig, RadioConfig, ReverseRxTarget, load_radio_from_path,
@@ -42,7 +42,6 @@ pub use power_control_service::PowerControlService;
 pub use resource_controller::{TrafficResourceController, TrafficResourceService};
 pub use settings::*;
 pub use synthesis_service::SynthesisService;
-pub use traffic_setup_service::TrafficSetupService;
 
 mod downlink;
 mod synth;
@@ -230,7 +229,10 @@ pub(crate) struct TxLoopState {
     pub(super) scratch_pilot: Vec<num::complex::Complex32>,
     pub(super) scratch_sync: Vec<num::complex::Complex32>,
     pub(super) scratch_paging: Vec<num::complex::Complex32>,
-    pub(super) scratch_tc_snapshot: Vec<(f32, handle::TrafficChannelWrapper)>,
+    pub(super) scratch_tc_snapshot: Vec<(u8, f32, handle::TrafficChannelWrapper)>,
+    /// Share of total forward power each traffic channel took in the last
+    /// block, by Walsh code. A silent channel reads 0.
+    pub(super) traffic_power_fractions: Vec<(u8, f32)>,
     pub(super) scratch_tc_blocks: Vec<(f32, bool, Vec<num::complex::Complex32>)>,
     pub(super) scratch_tc_amps: Vec<f32>,
     /// Last per-block FTCH timing breakdown.
@@ -397,7 +399,13 @@ impl Bts {
             .spawn(move || {
                 realtime::apply_rx(&realtime_settings);
                 let _stop_tx_on_exit = ShutdownOnDrop(shutdown.clone());
-                let result = rx::run_rx_loop(rx_settings, commands_rx, &mut *radio_rx, shutdown);
+                let result = rx::run_rx_loop(
+                    rx_settings,
+                    commands_rx,
+                    &mut *radio_rx,
+                    shutdown,
+                    realtime_settings,
+                );
                 if result.is_ok() {
                     info!("rx: stopped normally");
                 }
@@ -574,6 +582,7 @@ impl Bts {
             scratch_sync: vec![Complex32::default(); self.runtime.block_size_chips],
             scratch_paging: vec![Complex32::default(); self.runtime.block_size_chips],
             scratch_tc_snapshot: Vec::new(),
+            traffic_power_fractions: Vec::new(),
             scratch_tc_blocks: Vec::new(),
             scratch_tc_amps: Vec::new(),
             tx_pool: handle::TxPool::new(self.traffic_channels.tx_cmd_queue()),
@@ -1056,6 +1065,7 @@ impl Bts {
                     sync_fragments_sent: state.sync_sent_fragments as u64,
                     paging_fragments_sent: state.paging_sent_fragments as u64,
                     realtime_degraded_events: realtime::degraded_events(),
+                    traffic_power_fractions: state.traffic_power_fractions.clone(),
                 });
                 state.gen_time_sum_us = 0;
                 state.gen_time_max_us = 0;

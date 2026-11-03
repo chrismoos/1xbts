@@ -9,7 +9,10 @@
     "idle_timeout_s": 15,
     "ms_ack_timeout_ms": 5000,
     "enable_f_sch": true,
-    "f_sch_rate_bps": 153600
+    "f_sch_rate_bps": 153600,
+    "rc12_rlgain_adj_db": -4,
+    "bypass_alert_answer": false,
+    "mt_alert_refresh_s": 50
   },
   "traffic_retry": {
     "ack_timeout_ms": 3000,

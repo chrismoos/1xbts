@@ -83,6 +83,11 @@ pub struct PnLcConfig {
     /// ordinary `I+jQ` IQ samples.
     pub hpsk_signal_conjugated: bool,
 
+    /// OQPSK signal convention for complex samples. C.S0002-E puts the Q
+    /// branch on +sin, so 1x reverse OQPSK arrives as conjugated `I-jQ`
+    /// samples, the same convention `hpsk_signal_conjugated` covers for RC3.
+    pub oqpsk_signal_conjugated: bool,
+
     /// Re-anchor the absolute sample origin on every block using the
     /// hardware-timestamp-derived `absolute_sample_start` tag.
     ///
@@ -257,6 +262,7 @@ impl PnLcConfig {
             split_pn_reference: true,
             short_code_reference: ShortCodeReferenceKind::Cdma2000,
             hpsk_signal_conjugated: true,
+            oqpsk_signal_conjugated: false,
             reanchor_origin: false,
             lc_decimation: 1,
             rc3_pilot_verification: false,
@@ -489,6 +495,11 @@ impl PnLcConfig {
 
     pub fn with_split_pn_reference(mut self, split_pn_reference: bool) -> Self {
         self.split_pn_reference = split_pn_reference;
+        self
+    }
+
+    pub fn with_oqpsk_signal_conjugated(mut self, conjugated: bool) -> Self {
+        self.oqpsk_signal_conjugated = conjugated;
         self
     }
 

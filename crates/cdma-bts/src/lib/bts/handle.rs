@@ -70,6 +70,7 @@ pub struct TxMetrics {
     pub sync_fragments_sent: u64,
     pub paging_fragments_sent: u64,
     pub realtime_degraded_events: u64,
+    pub traffic_power_fractions: Vec<(u8, f32)>,
 }
 
 /// Metrics snapshot from the RX pipeline, published every ~1 second.
@@ -876,7 +877,7 @@ pub fn allocate_traffic_channel_rc2(
                 0,
                 walsh_code,
                 format!("rc2-w{}", walsh_code),
-                PcgPcbFallbackMode::UpBeforeFirstThenHold,
+                PcgPcbFallbackMode::AlternatingHold,
             ),
             fpc_subchan_gain_linear,
             previous_pcg_pc_start: 0,
@@ -917,7 +918,7 @@ pub fn commit_traffic_channel_rc2(
                 0,
                 walsh_code,
                 format!("rc2-w{}", walsh_code),
-                PcgPcbFallbackMode::UpBeforeFirstThenHold,
+                PcgPcbFallbackMode::AlternatingHold,
             ),
             fpc_subchan_gain_linear,
             previous_pcg_pc_start: 0,

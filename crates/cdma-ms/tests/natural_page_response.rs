@@ -45,8 +45,10 @@ async fn ms_answers_a_page_from_an_mt_sms() {
     ));
     let reg_chips = reg_iq.len() as u64 / OVERSAMPLE;
     running.inject_reverse(reg_iq, REG_CHIP);
+    // An SMS that arrives before the MSC accepts the registration has its page
+    // cancelled by that acceptance and is delivered without a page response.
     running
-        .wait_for_mobile(esn, Duration::from_secs(10))
+        .wait_for_mobile_where(esn, Duration::from_secs(10), |m| m.state == "Registered")
         .await
         .expect("MS should register");
 

@@ -442,6 +442,28 @@ impl Bsc {
                 .and_then(|s| s.calling_party_record.clone())
         });
 
+        let bypass_alert_answer = self
+            .mobiles
+            .get_traffic_channel(cell, walsh_code)
+            .is_some_and(|tc| tc.bypass_alert_answer);
+        if leg_role == Some(VoiceLegRole::Callee) && bypass_alert_answer {
+            info!(
+                "BSC: walsh={} was assigned with BYPASS_ALERT_ANSWER, answering call_id={} without alerting",
+                walsh_code, call_id
+            );
+            self.a1.send_connect(call_id);
+            if let Some(tc) = self.mobiles.get_traffic_channel_mut(cell, walsh_code) {
+                tc.mark_voice_connected(true);
+            }
+            if let Some(callee) = session_id
+                .and_then(|id| self.voice.session_mut(id))
+                .and_then(|session| session.callee.as_mut())
+            {
+                callee.answered = true;
+            }
+            return;
+        }
+
         // AWIM uses the default traffic ACK sequence when no reverse message is acknowledged.
         let (send_result, mode, log_label) = match leg_role {
             Some(VoiceLegRole::Callee) => {
@@ -2016,6 +2038,7 @@ mod tests {
 
     fn test_access_event() -> AccessChannelEvent {
         AccessChannelEvent {
+            access_signal: Default::default(),
             cell: Some(crate::bsc::tests::TEST_CELL),
             event_id: "a1-classmark-test".to_string(),
             chip_start: 0,
@@ -2634,6 +2657,48 @@ mod tests {
             timeout(Duration::from_millis(50), endpoint.recv_from_bsc())
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_radio_link_clears_with_radio_interface_failure() {
+        let (client, endpoint) = InProcessMscClient::pair(4);
+        let (mut bsc, _traffic_rx, walsh_code) = test_bsc_with_active_traffic_channel(3).await;
+        let msc: Arc<dyn crate::a1_edge::MscClient> = Arc::new(client);
+        bsc.config.msc_client = msc.clone();
+        bsc.a1.msc_client = msc;
+        let call_id = 66;
+        let tc = bsc.mobiles[0]
+            .find_traffic_channel_by_walsh_mut(walsh_code)
+            .unwrap();
+        tc.a1_call_id = Some(call_id);
+        tc.mark_voice_connected(false);
+
+        let chan = bsc
+            .mobiles
+            .traffic_channel_to_release(crate::bsc::tests::TEST_CELL, walsh_code)
+            .unwrap();
+        bsc.release_traffic_channel(
+            chan,
+            crate::bsc::runtime::CLEAR_CAUSE_RADIO_INTERFACE_FAILURE,
+        )
+        .await;
+
+        let outbound = endpoint.recv_from_bsc().await.unwrap();
+        assert_eq!(outbound.message_type(), cdma_ios::MessageType::ClearRequest);
+        assert_eq!(outbound.call_id(), Some(call_id));
+        let message = outbound.decode().unwrap();
+        let clear = cdma_ios::ClearRequestMessage::decode(&message.payload).unwrap();
+        assert_eq!(clear.cause.0, 0x01);
+        let tc = bsc.mobiles[0]
+            .find_traffic_channel_by_walsh(walsh_code)
+            .unwrap();
+        assert!(tc.is_releasing());
+        assert!(
+            bsc.mobiles
+                .traffic_channel_to_release(crate::bsc::tests::TEST_CELL, walsh_code)
+                .is_none(),
+            "a channel already releasing is not released again"
         );
     }
 

@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import Link from "next/link";
 import { MobileIdentityLink } from "@/components/activity-links";
+import { useLive } from "@/lib/live";
 import { useMobileDirectory } from "@/lib/mobile-directory";
 import { Card, Stat } from "@/components/card";
 import { AccessBadge, useAdmissionVerdicts } from "@/components/access-activity";
@@ -10,7 +10,6 @@ import type { ObservedMobile } from "@/lib/admission";
 import { accessClass } from "@/lib/admission";
 import { formatEsn, formatMeid } from "@/lib/format";
 
-const REFRESH_MS = 10_000;
 const RECENT = 3;
 
 function identityLabel(event: { esn?: number; meid?: string; imsi?: string }): string {
@@ -19,27 +18,16 @@ function identityLabel(event: { esn?: number; meid?: string; imsi?: string }): s
   return event.imsi ?? "-";
 }
 
-export function AccessSummaryCard() {
-  const directory = useMobileDirectory(REFRESH_MS);
-  const { events, policy, error } = useAdmissionVerdicts({}, 0, true);
-  const [restricted, setRestricted] = useState<ObservedMobile[]>([]);
-  const closed = policy?.accessMode === "closed";
+const NO_MOBILES: ObservedMobile[] = [];
 
-  useEffect(() => {
-    if (!closed) return;
-    let cancelled = false;
-    const load = () =>
-      fetch("/api/mobiles-seen?filter=restricted&limit=500")
-        .then((res) => res.json())
-        .then((data) => !cancelled && !data.error && setRestricted(data.mobiles ?? []))
-        .catch(() => {});
-    load();
-    const interval = setInterval(load, REFRESH_MS);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  }, [closed]);
+export function AccessSummaryCard() {
+  const directory = useMobileDirectory();
+  const { events, policy, error } = useAdmissionVerdicts({}, 0, true);
+  const closed = policy?.accessMode === "closed";
+  const restricted =
+    useLive<{ mobiles?: ObservedMobile[] }>(closed ? "/api/mobiles-seen?filter=restricted&limit=500" : null).data?.mobiles ??
+    NO_MOBILES;
+
 
   const count = (kind: string) => restricted.filter((m) => accessClass(m.admissionClass) === kind).length;
   const limited = new Set(
@@ -72,7 +60,7 @@ export function AccessSummaryCard() {
               <div className="grid grid-cols-3 gap-2 my-3">
                 <div>
                   <div className="text-xl font-bold text-accent-red">{count("denied")}</div>
-                  <div className="text-[11px] text-muted">denied now</div>
+                  <div className="text-[11px] text-muted">denied</div>
                 </div>
                 <div>
                   <div className="text-xl font-bold text-accent-blue">{count("provisioning")}</div>

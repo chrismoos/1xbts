@@ -5,6 +5,8 @@ pub struct RxMeasurement {
     pub signal_power_db: Option<f32>,
     pub raw_power_db: Option<f32>,
     pub demod_quality_pct: Option<f32>,
+    pub access_signal: crate::events::AccessSignal,
+    pub message: String,
     pub timestamp_us: u64,
 }
 

@@ -41,6 +41,36 @@ service BtsManagementService {
   rpc SetReversePowerControlOverride(bsc.v1.SetTrafficChannelPowerOverrideRequest) returns (bsc.v1.SetTrafficChannelPowerOverrideResponse);
   // Streams BTS-emitted paging-channel transmissions.
   rpc StreamPchTransmissions(CellRequest) returns (stream bsc.v1.PagingEvent);
+  rpc ListAccessMeasurements(CellRequest) returns (AccessMeasurementList);
+}
+
+message AccessMeasurement {
+  oneof mobile {
+    uint32 esn = 1;
+    string imsi = 2;
+  }
+  // Eb/Nt over the probe preamble.
+  optional float eb_nt_db = 3;
+  // The mobile's preamble power referred to the ADC input.
+  optional float signal_power_dbfs = 4;
+  // Total power in the channel during the probe, from every source.
+  optional float band_level_dbfs = 5;
+  // Share of the message's code symbols demodulated wrong before decoding.
+  optional float raw_ber_pct = 6;
+  // Access message the probe delivered, e.g. "Registration".
+  string message = 7;
+  // Microseconds since the Unix epoch when the probe was decoded.
+  uint64 measured_at_us = 8;
+  // Reverse noise floor of the cell when the probe was decoded, referred to
+  // the ADC input.
+  optional float noise_floor_dbfs = 9;
+  // The noise floor has had no quiet period to update from recently, such as
+  // during a call.
+  bool noise_floor_stale = 10;
+}
+
+message AccessMeasurementList {
+  repeated AccessMeasurement entries = 1;
 }
 
 // Addresses one BTS. Clients set `peer_id` (the stable id from bts_peers) and

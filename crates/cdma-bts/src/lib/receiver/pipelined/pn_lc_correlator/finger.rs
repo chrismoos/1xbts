@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use log::{info, trace, warn};
+use log::{debug, info, trace, warn};
 use num_complex::Complex32;
 
 use super::super::cfo_tracker;
@@ -13,6 +13,10 @@ use super::interpolation::{interp_complex_clamped, interp_complex_contiguous};
 use crate::phy::coding::long_code::LongCodeGenerator;
 use crate::phy::walsh::WalshGenerator;
 use crate::receiver::pipelined::{PipelineProcessorShared, SampleBlock};
+use cdma_common::phy::data_burst_randomizer::{
+    RC12_CHIPS_PER_PCG, RC12_PCGS_PER_FRAME, RC12_RANDOMIZER_LC_BITS, RC12_RANDOMIZER_LEAD_CHIPS,
+    Rc12ReverseRate, active_pcgs_from_bits,
+};
 
 // With Gardner enabled we keep only one neighbor beside the verified prompt to
 // avoid doubling slow false-finger work. Captures with very strong correlation
@@ -285,27 +289,17 @@ pub struct PnLcFinger {
     delay_slew_pending: Option<f32>,
     /// Admitted PCGs since the last reposition, for the settling interval.
     delay_track_pcgs_since_move: usize,
-    /// Frame the PCG quota is being counted against, and how many PCGs of that
-    /// frame have already been fed to the profile.
-    delay_track_frame: usize,
-    delay_track_frame_pcgs: usize,
-    /// Whether the PCG in progress has been counted against the frame quota.
-    delay_track_pcg_counted: bool,
-    /// Prompt envelope power and chip count for the PCG the delay tracker is
-    /// judging, plus its own idle-floor estimate. Kept separate from the EPL
-    /// accumulators so tracking does not depend on that instrumentation.
-    delay_gate_env_prompt: f64,
-    delay_gate_chips: usize,
-    delay_gate_floor: f64,
-    delay_gate_on_pcgs: u64,
-    delay_gate_off_pcgs: u64,
-    /// Fast envelope estimate used to skip profile correlation while the mobile
-    /// is silent. A gated channel transmits a small fraction of its chips, and
-    /// correlating 9 hypotheses through the rest is pure waste.
-    delay_burst_env: f64,
-    /// Chips of the symbol under construction that were inside a burst. Only a
-    /// symbol wholly inside one contributes, so a burst edge cannot enter a
-    /// partially-filled symbol whose peak would be noise.
+    delay_track_level: f64,
+    delay_track_unconfirmed: Option<(isize, u64)>,
+    delay_dbr_bits: [u8; RC12_RANDOMIZER_LC_BITS],
+    /// One-eighth-rate PCGs of the next and the current frame. Every rate
+    /// transmits these (C.S0002-E §2.1.3.1.14.2), so they are the only PCGs
+    /// the profile reads.
+    delay_dbr_next: Option<[bool; RC12_PCGS_PER_FRAME]>,
+    delay_dbr_frame: Option<[bool; RC12_PCGS_PER_FRAME]>,
+    /// Chips of the symbol under construction that were fed to the profile.
+    /// Only a whole symbol contributes, so tracking that starts mid-symbol
+    /// cannot enter a partial one whose peak would be noise.
     delay_symbol_on_chips: usize,
     /// Per-tap 4-chip coherent squared-magnitude accumulator for the
     /// CURRENT rollup window (resets every `EPL_WINDOW_CHIPS` chips).
@@ -422,7 +416,7 @@ pub(super) enum PnReferenceKind {
     Oqpsk,
 }
 
-const DELAY_GATE_PCG_CHIPS: usize = 1536;
+const PCG_CHIPS: usize = RC12_CHIPS_PER_PCG as usize;
 
 /// Wide enough to see a delay that has walked whole chips. An early/late gate
 /// spans a quarter chip and reads zero either side of that.
@@ -447,12 +441,19 @@ const DELAY_TRACK_WARMUP_PCGS: usize = 8;
 /// 2 dB. A whole-chip reposition onto noise is destructive.
 const DELAY_TRACK_MARGIN: f64 = 1.6;
 
-/// Capping the profile at two PCGs a frame pins tracking cost at its 1/8-rate
-/// value instead of letting it swing with the traffic rate: +5% of receive time
-/// against +25% ungated.
-const DELAY_TRACK_PCGS_PER_FRAME: usize = 2;
+/// Minimum best-tap over median-tap ratio (6 dB) of the averaged profile for
+/// a reposition. A flat profile is noise or another mobile's probe, not a path.
+const DELAY_TRACK_MIN_CONTRAST: f64 = 4.0;
 
-const DELAY_TRACK_PCGS_PER_FRAME_TOTAL: usize = 16;
+/// Minimum best-tap over median-tap ratio (3 dB) for a PCG's profile to enter
+/// the average. Noise alone reads about 1.3x.
+const DELAY_PCG_MIN_CONTRAST: f64 = 2.0;
+
+fn profile_contrast(profile: &[f64; DELAY_PROFILE_TAPS]) -> f64 {
+    let mut sorted = *profile;
+    sorted.sort_by(f64::total_cmp);
+    sorted[DELAY_PROFILE_TAPS - 1] / sorted[DELAY_PROFILE_HALF_CHIPS].max(1e-12)
+}
 
 /// The argmax oscillates while two paths sit within a decibel of each other, so
 /// a move is followed by a settling period rather than chasing the flicker.
@@ -462,16 +463,13 @@ const DELAY_TRACK_MIN_PCGS_BETWEEN_MOVES: usize = 16;
 /// than slewed further. Tracking follows a path, it does not hunt for one.
 const DELAY_TRACK_MAX_TOTAL_CHIPS: isize = 24;
 
-/// A burst runs 1536 chips, so a 64-chip time constant settles well inside one.
-const DELAY_BURST_ENV_ALPHA: f64 = 1.0 / 64.0;
+/// A PCG whose total profile power is more than this (6 dB) above the slow
+/// level average is a burst from another transmitter and is left out.
+const DELAY_TRACK_SURGE_RATIO: f64 = 4.0;
+/// Per-PCG weight of the slow level average, about 1.3 s.
+const DELAY_TRACK_LEVEL_ALPHA: f64 = 1.0 / 1024.0;
 
-/// 6 dB above the idle floor counts as transmitting, against 9-19 dB of
-/// contrast between a transmitted PCG and a gated-off one.
-const DELAY_GATE_ON_FACTOR: f64 = 4.0;
-
-/// Small enough that a burst barely moves the idle floor, large enough to track
-/// a genuine noise-floor rise.
-const DELAY_GATE_FLOOR_LEAK: f64 = 0.001;
+const DELAY_TRACK_REVERT_CHIPS: u64 = 100 * RC12_PCGS_PER_FRAME as u64 * PCG_CHIPS as u64;
 
 /// Number of chips accumulated into one EPL rollup window.
 /// At 4096 chips × ~814 ns/chip ≈ 3.3 ms = 16 Walsh symbols worth.
@@ -504,13 +502,13 @@ const EPL_SLEW_DEAD_ZONE_PILOT: f64 = 0.25;
 /// Pilot-mode IIR alpha: more smoothing to dampen per-window variance.
 const EPL_SLEW_ALPHA_PILOT: f64 = 0.05;
 
-/// Pilot-mode loop gain: lower to prevent transient spikes from
-/// accumulating enough to fire.
-const EPL_SLEW_LOOP_GAIN_PILOT: f64 = 0.01;
+/// Pilot-mode loop gain. A saturated error fills the step accumulator in
+/// 17 windows, inside the hold-off below.
+const EPL_SLEW_LOOP_GAIN_PILOT: f64 = 0.06;
 
-/// Pilot-mode min-between: wider spacing since clock drift is slow
-/// (ppm-level) and the pilot discriminator is noisier per-window.
-const EPL_SLEW_MIN_WINDOWS_BETWEEN_PILOT: u64 = 300;
+/// Pilot-mode hold-off between quarter-sample steps, 60 ms, so the finger
+/// follows a full chip in one second.
+const EPL_SLEW_MIN_WINDOWS_BETWEEN_PILOT: u64 = 18;
 
 const EPL_SLEW_MIN_WINDOWS_BETWEEN: u64 = 900;
 
@@ -1097,15 +1095,11 @@ impl PnLcFinger {
             delay_track_total_chips: 0,
             delay_slew_pending: None,
             delay_track_pcgs_since_move: DELAY_TRACK_MIN_PCGS_BETWEEN_MOVES,
-            delay_track_frame: usize::MAX,
-            delay_track_frame_pcgs: 0,
-            delay_track_pcg_counted: false,
-            delay_gate_env_prompt: 0.0,
-            delay_gate_chips: 0,
-            delay_gate_floor: 0.0,
-            delay_gate_on_pcgs: 0,
-            delay_gate_off_pcgs: 0,
-            delay_burst_env: 0.0,
+            delay_track_level: 0.0,
+            delay_track_unconfirmed: None,
+            delay_dbr_bits: [0; RC12_RANDOMIZER_LC_BITS],
+            delay_dbr_next: None,
+            delay_dbr_frame: None,
             delay_symbol_on_chips: 0,
             epl_window_coh4_pwr_early: 0.0,
             epl_window_coh4_pwr_prompt: 0.0,
@@ -1271,6 +1265,9 @@ impl PnLcFinger {
         } else {
             let bit = self.lc_gen.next_chip();
             self.current_lc_conj = Complex32::new(if bit == 1 { -1.0 } else { 1.0 }, 0.0);
+            if self.delay_track_enabled {
+                self.capture_delay_dbr_bit(chip_tx, bit);
+            }
         }
         self.current_chip_enabled = chip_tx >= self.chain_start_chip;
         self.lc_chip_counter += 1;
@@ -1344,7 +1341,7 @@ impl PnLcFinger {
             if let Some(shift) = self.delay_slew_pending.take() {
                 let old_idx = idx;
                 idx += shift;
-                info!(
+                debug!(
                     "DELAY_SLEW[finger={}] shift={:+.2}sample idx={:.3}->{:.3} total={:+} chip",
                     self.base.id, shift, old_idx, idx, self.delay_track_total_chips,
                 );
@@ -1362,7 +1359,7 @@ impl PnLcFinger {
                 let old_dp = self.despread_phase;
                 let old_idx = idx;
                 idx += slew;
-                info!(
+                debug!(
                     "EPL_SLEW[finger={}] direction={:+.2}sample despread_phase={}->{} \
                      idx={:.3}->{:.3} total={:+.2}sample",
                     self.base.id,
@@ -1422,28 +1419,18 @@ impl PnLcFinger {
             if self.current_chip_enabled {
                 let out = despread * self.current_lc_conj;
                 let chip_tx = self.lc_chip_counter.saturating_sub(1);
-                if delay_active {
-                    let power = out.norm_sqr() as f64;
-                    self.delay_gate_env_prompt += power;
-                    self.delay_gate_chips += 1;
-                    self.delay_burst_env += DELAY_BURST_ENV_ALPHA * (power - self.delay_burst_env);
+                let pcg = (chip_tx / PCG_CHIPS) % RC12_PCGS_PER_FRAME;
+                if delay_active && self.delay_dbr_frame.is_some_and(|active| active[pcg]) {
                     if chip_tx % RC1_SYMBOL_CHIPS == 0 {
                         self.delay_symbol_on_chips = 0;
                     }
-                    if chip_tx % DELAY_GATE_PCG_CHIPS == 0 {
-                        self.delay_track_start_pcg(chip_tx);
+                    if chip_tx % PCG_CHIPS == 0 {
+                        self.delay_profile_pcg = [0.0; DELAY_PROFILE_TAPS];
                     }
-                    // Correlating the hypotheses is the expensive part, so do it
-                    // only while the mobile is transmitting, and only for this
-                    // frame's quota of PCGs.
-                    if self.delay_burst_env > DELAY_GATE_ON_FACTOR * self.delay_gate_floor
-                        && self.delay_track_frame_quota_available()
-                    {
-                        self.delay_symbol_on_chips += 1;
-                        self.accumulate_delay_profile_chip(samples, idx, chip_tx);
-                    }
-                    if (chip_tx + 1) % DELAY_GATE_PCG_CHIPS == 0 {
-                        self.delay_commit_gated_pcg();
+                    self.delay_symbol_on_chips += 1;
+                    self.accumulate_delay_profile_chip(samples, idx, chip_tx);
+                    if (chip_tx + 1) % PCG_CHIPS == 0 {
+                        self.delay_commit_pcg();
                     }
                 }
                 let mut pcg_measurement_prompt_chip = out;
@@ -1895,29 +1882,25 @@ impl PnLcFinger {
         }
     }
 
-    /// Open a new PCG for the delay tracker, rolling the per-frame quota over
-    /// when the frame changes.
-    fn delay_track_start_pcg(&mut self, chip_tx: usize) {
-        let frame = chip_tx / (DELAY_GATE_PCG_CHIPS * DELAY_TRACK_PCGS_PER_FRAME_TOTAL);
-        if frame != self.delay_track_frame {
-            self.delay_track_frame = frame;
-            self.delay_track_frame_pcgs = 0;
+    fn capture_delay_dbr_bit(&mut self, chip_tx: usize, bit: u8) {
+        let frame_chips = RC12_PCGS_PER_FRAME * PCG_CHIPS;
+        let chip_in_frame = chip_tx % frame_chips;
+        if chip_in_frame == 0 {
+            self.delay_dbr_frame = self.delay_dbr_next.take();
         }
-        self.delay_track_pcg_counted = false;
-    }
-
-    /// Whether this PCG may be fed to the profile, consuming a frame quota slot
-    /// the first time the PCG is admitted.
-    fn delay_track_frame_quota_available(&mut self) -> bool {
-        if self.delay_track_pcg_counted {
-            return true;
+        let Some(index) = chip_in_frame
+            .checked_sub(frame_chips - RC12_RANDOMIZER_LEAD_CHIPS as usize)
+            .filter(|&index| index < RC12_RANDOMIZER_LC_BITS)
+        else {
+            return;
+        };
+        self.delay_dbr_bits[index] = bit;
+        if index == RC12_RANDOMIZER_LC_BITS - 1 {
+            self.delay_dbr_next = Some(active_pcgs_from_bits(
+                &self.delay_dbr_bits,
+                Rc12ReverseRate::Eighth,
+            ));
         }
-        if self.delay_track_frame_pcgs >= DELAY_TRACK_PCGS_PER_FRAME {
-            return false;
-        }
-        self.delay_track_frame_pcgs += 1;
-        self.delay_track_pcg_counted = true;
-        true
     }
 
     /// Drop the accumulated profile. Called when the sample origin moves, which
@@ -1931,41 +1914,36 @@ impl PnLcFinger {
         self.delay_track_pcgs = 0;
         self.delay_symbol_on_chips = 0;
         self.delay_slew_pending = None;
+        self.delay_track_unconfirmed = None;
     }
 
-    /// Fold one PCG into the tracking decision, if the mobile transmitted during
-    /// it. Silence contributes equally to every hypothesis and hides the peak.
-    fn delay_commit_gated_pcg(&mut self) {
-        let chips = self.delay_gate_chips;
-        if chips == 0 {
-            return;
-        }
-        let per_chip_prompt = self.delay_gate_env_prompt / chips as f64;
-        if self.delay_gate_floor <= 0.0 || per_chip_prompt < self.delay_gate_floor {
-            self.delay_gate_floor = per_chip_prompt;
-        } else {
-            self.delay_gate_floor +=
-                DELAY_GATE_FLOOR_LEAK * (per_chip_prompt - self.delay_gate_floor);
-        }
-
-        if per_chip_prompt > DELAY_GATE_ON_FACTOR * self.delay_gate_floor {
-            self.delay_gate_on_pcgs += 1;
-            for tap in 0..DELAY_PROFILE_TAPS {
-                self.delay_track_acc[tap] +=
-                    DELAY_TRACK_ALPHA * (self.delay_profile_pcg[tap] - self.delay_track_acc[tap]);
+    fn delay_commit_pcg(&mut self) {
+        if profile_contrast(&self.delay_profile_pcg) >= DELAY_PCG_MIN_CONTRAST {
+            let pcg_sum: f64 = self.delay_profile_pcg.iter().sum();
+            if self.delay_track_level <= 0.0 {
+                self.delay_track_level = pcg_sum;
             }
-            self.delay_track_pcgs += 1;
-            self.delay_track_pcgs_since_move = self.delay_track_pcgs_since_move.saturating_add(1);
-            if self.delay_track_enabled && self.delay_track_pcgs >= DELAY_TRACK_WARMUP_PCGS {
-                self.delay_track_decide();
+            let surge = self.delay_track_pcgs >= DELAY_TRACK_WARMUP_PCGS
+                && pcg_sum > self.delay_track_level * DELAY_TRACK_SURGE_RATIO;
+            if surge {
+                self.delay_track_level +=
+                    DELAY_TRACK_LEVEL_ALPHA / 8.0 * (pcg_sum - self.delay_track_level);
+            } else {
+                self.delay_track_level +=
+                    DELAY_TRACK_LEVEL_ALPHA * (pcg_sum - self.delay_track_level);
+                for tap in 0..DELAY_PROFILE_TAPS {
+                    self.delay_track_acc[tap] += DELAY_TRACK_ALPHA
+                        * (self.delay_profile_pcg[tap] - self.delay_track_acc[tap]);
+                }
+                self.delay_track_pcgs += 1;
+                self.delay_track_pcgs_since_move =
+                    self.delay_track_pcgs_since_move.saturating_add(1);
+                if self.delay_track_enabled && self.delay_track_pcgs >= DELAY_TRACK_WARMUP_PCGS {
+                    self.delay_track_decide();
+                }
             }
-        } else {
-            self.delay_gate_off_pcgs += 1;
         }
-
         self.delay_profile_pcg = [0.0; DELAY_PROFILE_TAPS];
-        self.delay_gate_env_prompt = 0.0;
-        self.delay_gate_chips = 0;
     }
 
     /// Reposition the prompt onto the delay carrying the peak. Path delay steps
@@ -1988,6 +1966,9 @@ impl PnLcFinger {
         if chip_shift == 0 || best <= prompt * DELAY_TRACK_MARGIN {
             return;
         }
+        if profile_contrast(&self.delay_track_acc) <= DELAY_TRACK_MIN_CONTRAST {
+            return;
+        }
 
         let total = self.delay_track_total_chips + chip_shift;
         if total.abs() > DELAY_TRACK_MAX_TOTAL_CHIPS {
@@ -2007,6 +1988,8 @@ impl PnLcFinger {
         // their chip time, which makes this a delay change and not a chip slip.
         self.delay_slew_pending = Some((chip_shift * self.oversample as isize) as f32);
         self.delay_track_total_chips = total;
+        let pending = self.delay_track_unconfirmed.map_or(0, |(shift, _)| shift);
+        self.delay_track_unconfirmed = Some((pending + chip_shift, 0));
         info!(
             "DELAY_TRACK[finger={}] chip_tx={} reposition={:+} chip \
              peak_over_prompt={:+.2}dB total={:+} chip pcgs={}",
@@ -2021,6 +2004,39 @@ impl PnLcFinger {
         self.delay_track_acc = [0.0; DELAY_PROFILE_TAPS];
         self.delay_track_pcgs = 0;
         self.delay_track_pcgs_since_move = 0;
+    }
+
+    fn delay_track_observe(&mut self, progress: &FingerProgress, processed_chips: u64) {
+        if !self.delay_track_enabled {
+            return;
+        }
+        let Some((chip_shift, waited)) = self.delay_track_unconfirmed else {
+            return;
+        };
+        if progress.saw_crc_valid {
+            debug!(
+                "DELAY_TRACK[finger={}] reposition={:+} chip confirmed by a valid frame after {} chips",
+                self.base.id, chip_shift, waited,
+            );
+            self.delay_track_unconfirmed = None;
+            return;
+        }
+        let waited = waited.saturating_add(processed_chips);
+        if waited < DELAY_TRACK_REVERT_CHIPS {
+            self.delay_track_unconfirmed = Some((chip_shift, waited));
+            return;
+        }
+        let undo = -(chip_shift * self.oversample as isize) as f32;
+        self.delay_slew_pending = Some(self.delay_slew_pending.unwrap_or(0.0) + undo);
+        self.delay_track_total_chips -= chip_shift;
+        self.delay_track_unconfirmed = None;
+        self.delay_track_acc = [0.0; DELAY_PROFILE_TAPS];
+        self.delay_track_pcgs = 0;
+        self.delay_track_pcgs_since_move = 0;
+        warn!(
+            "DELAY_TRACK[finger={}] chip_tx={} reverting reposition={:+} chip: no valid frame since the move, total={:+} chip",
+            self.base.id, self.lc_chip_counter, chip_shift, self.delay_track_total_chips,
+        );
     }
 
     fn epl_run_slew_loop(&mut self) {
@@ -2639,8 +2655,9 @@ impl PnLcFinger {
         }
         chain_blocks.extend(emitter.blocks);
 
-        self.base
-            .tick_with_progress(&progress, (n_blocks as u64) * (self.chip_block_size as u64));
+        let processed_chips = (n_blocks as u64) * (self.chip_block_size as u64);
+        self.delay_track_observe(&progress, processed_chips);
+        self.base.tick_with_progress(&progress, processed_chips);
 
         out.extend(chain_blocks);
         out
@@ -2871,10 +2888,15 @@ mod raw_power_tests {
 
     use num_complex::Complex32;
 
+    use cdma_common::phy::data_burst_randomizer::{
+        RC12_CHIPS_PER_PCG, RC12_PCGS_PER_FRAME, Rc12ReverseRate, active_pcgs,
+    };
+
     use super::{
+        DELAY_PROFILE_HALF_CHIPS, DELAY_PROFILE_TAPS, DELAY_TRACK_REVERT_CHIPS,
         EPL_NONPILOT_FER_WINDOW_FRAMES, EPL_RC1_WINDOWS_PER_FRAME, EPL_SLEW_MIN_WINDOWS_BETWEEN,
-        EPL_SLEW_STEP_SAMPLES, EPL_SLEW_WARMUP_WINDOWS, PnLcFinger, RC3_PILOT_SYMBOL_CHIPS,
-        RC3_PILOT_SYMBOLS_PER_PCG,
+        EPL_SLEW_STEP_SAMPLES, EPL_SLEW_WARMUP_WINDOWS, FingerProgress, PCG_CHIPS, PnLcFinger,
+        RC3_PILOT_SYMBOL_CHIPS, RC3_PILOT_SYMBOLS_PER_PCG,
     };
     use crate::phy::coding::long_code::LongCodeGenerator;
     use crate::receiver::pipelined::{
@@ -2908,6 +2930,126 @@ mod raw_power_tests {
             false,
             false,
         )
+    }
+
+    fn commit_delay_pcg(finger: &mut PnLcFinger, profile: [f64; DELAY_PROFILE_TAPS]) {
+        finger.delay_profile_pcg = profile;
+        finger.delay_commit_pcg();
+    }
+
+    #[test]
+    fn delay_tracking_reads_the_eighth_rate_pcgs_off_the_long_code() {
+        const ESN: u32 = 0x4CDC_1D09;
+        const FRAMES: u64 = 6;
+        let frame_chips = RC12_PCGS_PER_FRAME as u64 * RC12_CHIPS_PER_PCG;
+        let origin = LongCodeGenerator::new_traffic_channel(ESN);
+        let mut lc = origin.clone();
+        let mut finger = test_nonpilot_finger();
+        finger.set_delay_tracking_enabled(true);
+        for chip in 0..FRAMES * frame_chips {
+            let bit = lc.next_chip();
+            finger.capture_delay_dbr_bit(chip as usize, bit);
+            if chip > 0 && chip % frame_chips == 0 {
+                assert_eq!(
+                    finger.delay_dbr_frame,
+                    Some(active_pcgs(&origin, chip, Rc12ReverseRate::Eighth)),
+                    "frame starting at chip {chip}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn delay_tracking_ignores_flat_profiles_from_another_mobiles_probe() {
+        let mut finger = test_nonpilot_finger();
+        finger.set_delay_tracking_enabled(true);
+        let mut path = [0.05; DELAY_PROFILE_TAPS];
+        path[DELAY_PROFILE_HALF_CHIPS] = 1.0;
+        for _ in 0..32 {
+            commit_delay_pcg(&mut finger, path);
+        }
+
+        let mut probe = [1.0; DELAY_PROFILE_TAPS];
+        probe[DELAY_PROFILE_HALF_CHIPS + 1] = 1.8;
+        for _ in 0..64 {
+            commit_delay_pcg(&mut finger, probe);
+        }
+        assert_eq!(finger.delay_track_total_chips, 0);
+        assert!(finger.delay_slew_pending.is_none());
+
+        let mut moved = [0.05; DELAY_PROFILE_TAPS];
+        moved[DELAY_PROFILE_HALF_CHIPS + 1] = 1.0;
+        for _ in 0..32 {
+            commit_delay_pcg(&mut finger, moved);
+            if finger.delay_track_total_chips != 0 {
+                break;
+            }
+        }
+        assert_eq!(finger.delay_track_total_chips, 1);
+    }
+
+    #[test]
+    fn delay_tracking_ignores_a_power_surge_and_reverts_an_unconfirmed_move() {
+        let valid = FingerProgress {
+            saw_crc_valid: true,
+            ..FingerProgress::default()
+        };
+        let invalid = FingerProgress::default();
+        let mut path = [0.05; DELAY_PROFILE_TAPS];
+        path[DELAY_PROFILE_HALF_CHIPS] = 1.0;
+        let mut moved = [0.05; DELAY_PROFILE_TAPS];
+        moved[DELAY_PROFILE_HALF_CHIPS + 1] = 1.0;
+        let surge = moved.map(|power| power * 20.0);
+
+        let mut finger = test_nonpilot_finger();
+        finger.set_delay_tracking_enabled(true);
+        for _ in 0..32 {
+            commit_delay_pcg(&mut finger, path);
+        }
+        for _ in 0..64 {
+            commit_delay_pcg(&mut finger, surge);
+        }
+        assert_eq!(finger.delay_track_total_chips, 0, "no move on a surge");
+
+        for _ in 0..32 {
+            commit_delay_pcg(&mut finger, moved);
+            if finger.delay_track_total_chips != 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            finger.delay_track_total_chips, 1,
+            "a path change at the usual level moves"
+        );
+        finger.delay_slew_pending = None;
+        finger.delay_track_observe(&invalid, DELAY_TRACK_REVERT_CHIPS - 1);
+        assert_eq!(
+            finger.delay_track_total_chips, 1,
+            "still within the confirmation window"
+        );
+        finger.delay_track_observe(&invalid, 1);
+        assert_eq!(finger.delay_track_total_chips, 0, "unconfirmed move undone");
+        assert_eq!(
+            finger.delay_slew_pending,
+            Some(-(finger.oversample as f32)),
+            "prompt slewed back by one chip"
+        );
+
+        let mut finger = test_nonpilot_finger();
+        finger.set_delay_tracking_enabled(true);
+        for _ in 0..32 {
+            commit_delay_pcg(&mut finger, path);
+        }
+        for _ in 0..32 {
+            commit_delay_pcg(&mut finger, moved);
+            if finger.delay_track_total_chips != 0 {
+                break;
+            }
+        }
+        assert_eq!(finger.delay_track_total_chips, 1);
+        finger.delay_track_observe(&valid, PCG_CHIPS as u64);
+        finger.delay_track_observe(&invalid, DELAY_TRACK_REVERT_CHIPS * 2);
+        assert_eq!(finger.delay_track_total_chips, 1, "a confirmed move stays");
     }
 
     #[test]

@@ -161,6 +161,49 @@ export function cellCapabilityToJSON(object: CellCapability): string {
   }
 }
 
+export interface AccessMeasurement {
+  esn?: number | undefined;
+  imsi?:
+    | string
+    | undefined;
+  /** Eb/Nt over the probe preamble. */
+  ebNtDb?:
+    | number
+    | undefined;
+  /** The mobile's preamble power referred to the ADC input. */
+  signalPowerDbfs?:
+    | number
+    | undefined;
+  /** Total power in the channel during the probe, from every source. */
+  bandLevelDbfs?:
+    | number
+    | undefined;
+  /** Share of the message's code symbols demodulated wrong before decoding. */
+  rawBerPct?:
+    | number
+    | undefined;
+  /** Access message the probe delivered, e.g. "Registration". */
+  message: string;
+  /** Microseconds since the Unix epoch when the probe was decoded. */
+  measuredAtUs: number;
+  /**
+   * Reverse noise floor of the cell when the probe was decoded, referred to
+   * the ADC input.
+   */
+  noiseFloorDbfs?:
+    | number
+    | undefined;
+  /**
+   * The noise floor has had no quiet period to update from recently, such as
+   * during a call.
+   */
+  noiseFloorStale: boolean;
+}
+
+export interface AccessMeasurementList {
+  entries: AccessMeasurement[];
+}
+
 /**
  * Addresses one BTS. Clients set `peer_id` (the stable id from bts_peers) and
  * the BSC resolves it to the peer's cell. `cell` is the internal key the BSC
@@ -305,6 +348,311 @@ export interface ReversePowerControlList {
    */
   entries: ReversePowerControlEntry[];
 }
+
+function createBaseAccessMeasurement(): AccessMeasurement {
+  return {
+    esn: undefined,
+    imsi: undefined,
+    ebNtDb: undefined,
+    signalPowerDbfs: undefined,
+    bandLevelDbfs: undefined,
+    rawBerPct: undefined,
+    message: "",
+    measuredAtUs: 0,
+    noiseFloorDbfs: undefined,
+    noiseFloorStale: false,
+  };
+}
+
+export const AccessMeasurement: MessageFns<AccessMeasurement> = {
+  encode(message: AccessMeasurement, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.esn !== undefined) {
+      writer.uint32(8).uint32(message.esn);
+    }
+    if (message.imsi !== undefined) {
+      writer.uint32(18).string(message.imsi);
+    }
+    if (message.ebNtDb !== undefined) {
+      writer.uint32(29).float(message.ebNtDb);
+    }
+    if (message.signalPowerDbfs !== undefined) {
+      writer.uint32(37).float(message.signalPowerDbfs);
+    }
+    if (message.bandLevelDbfs !== undefined) {
+      writer.uint32(45).float(message.bandLevelDbfs);
+    }
+    if (message.rawBerPct !== undefined) {
+      writer.uint32(53).float(message.rawBerPct);
+    }
+    if (message.message !== "") {
+      writer.uint32(58).string(message.message);
+    }
+    if (message.measuredAtUs !== 0) {
+      writer.uint32(64).uint64(message.measuredAtUs);
+    }
+    if (message.noiseFloorDbfs !== undefined) {
+      writer.uint32(77).float(message.noiseFloorDbfs);
+    }
+    if (message.noiseFloorStale !== false) {
+      writer.uint32(80).bool(message.noiseFloorStale);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): AccessMeasurement {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseAccessMeasurement();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.esn = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.imsi = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 29) {
+            break;
+          }
+
+          message.ebNtDb = reader.float();
+          continue;
+        }
+        case 4: {
+          if (tag !== 37) {
+            break;
+          }
+
+          message.signalPowerDbfs = reader.float();
+          continue;
+        }
+        case 5: {
+          if (tag !== 45) {
+            break;
+          }
+
+          message.bandLevelDbfs = reader.float();
+          continue;
+        }
+        case 6: {
+          if (tag !== 53) {
+            break;
+          }
+
+          message.rawBerPct = reader.float();
+          continue;
+        }
+        case 7: {
+          if (tag !== 58) {
+            break;
+          }
+
+          message.message = reader.string();
+          continue;
+        }
+        case 8: {
+          if (tag !== 64) {
+            break;
+          }
+
+          message.measuredAtUs = longToNumber(reader.uint64());
+          continue;
+        }
+        case 9: {
+          if (tag !== 77) {
+            break;
+          }
+
+          message.noiseFloorDbfs = reader.float();
+          continue;
+        }
+        case 10: {
+          if (tag !== 80) {
+            break;
+          }
+
+          message.noiseFloorStale = reader.bool();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): AccessMeasurement {
+    return {
+      esn: isSet(object.esn) ? globalThis.Number(object.esn) : undefined,
+      imsi: isSet(object.imsi) ? globalThis.String(object.imsi) : undefined,
+      ebNtDb: isSet(object.ebNtDb)
+        ? globalThis.Number(object.ebNtDb)
+        : isSet(object.eb_nt_db)
+        ? globalThis.Number(object.eb_nt_db)
+        : undefined,
+      signalPowerDbfs: isSet(object.signalPowerDbfs)
+        ? globalThis.Number(object.signalPowerDbfs)
+        : isSet(object.signal_power_dbfs)
+        ? globalThis.Number(object.signal_power_dbfs)
+        : undefined,
+      bandLevelDbfs: isSet(object.bandLevelDbfs)
+        ? globalThis.Number(object.bandLevelDbfs)
+        : isSet(object.band_level_dbfs)
+        ? globalThis.Number(object.band_level_dbfs)
+        : undefined,
+      rawBerPct: isSet(object.rawBerPct)
+        ? globalThis.Number(object.rawBerPct)
+        : isSet(object.raw_ber_pct)
+        ? globalThis.Number(object.raw_ber_pct)
+        : undefined,
+      message: isSet(object.message) ? globalThis.String(object.message) : "",
+      measuredAtUs: isSet(object.measuredAtUs)
+        ? globalThis.Number(object.measuredAtUs)
+        : isSet(object.measured_at_us)
+        ? globalThis.Number(object.measured_at_us)
+        : 0,
+      noiseFloorDbfs: isSet(object.noiseFloorDbfs)
+        ? globalThis.Number(object.noiseFloorDbfs)
+        : isSet(object.noise_floor_dbfs)
+        ? globalThis.Number(object.noise_floor_dbfs)
+        : undefined,
+      noiseFloorStale: isSet(object.noiseFloorStale)
+        ? globalThis.Boolean(object.noiseFloorStale)
+        : isSet(object.noise_floor_stale)
+        ? globalThis.Boolean(object.noise_floor_stale)
+        : false,
+    };
+  },
+
+  toJSON(message: AccessMeasurement): unknown {
+    const obj: any = {};
+    if (message.esn !== undefined) {
+      obj.esn = Math.round(message.esn);
+    }
+    if (message.imsi !== undefined) {
+      obj.imsi = message.imsi;
+    }
+    if (message.ebNtDb !== undefined) {
+      obj.ebNtDb = message.ebNtDb;
+    }
+    if (message.signalPowerDbfs !== undefined) {
+      obj.signalPowerDbfs = message.signalPowerDbfs;
+    }
+    if (message.bandLevelDbfs !== undefined) {
+      obj.bandLevelDbfs = message.bandLevelDbfs;
+    }
+    if (message.rawBerPct !== undefined) {
+      obj.rawBerPct = message.rawBerPct;
+    }
+    if (message.message !== "") {
+      obj.message = message.message;
+    }
+    if (message.measuredAtUs !== 0) {
+      obj.measuredAtUs = Math.round(message.measuredAtUs);
+    }
+    if (message.noiseFloorDbfs !== undefined) {
+      obj.noiseFloorDbfs = message.noiseFloorDbfs;
+    }
+    if (message.noiseFloorStale !== false) {
+      obj.noiseFloorStale = message.noiseFloorStale;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<AccessMeasurement>): AccessMeasurement {
+    return AccessMeasurement.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<AccessMeasurement>): AccessMeasurement {
+    const message = createBaseAccessMeasurement();
+    message.esn = object.esn ?? undefined;
+    message.imsi = object.imsi ?? undefined;
+    message.ebNtDb = object.ebNtDb ?? undefined;
+    message.signalPowerDbfs = object.signalPowerDbfs ?? undefined;
+    message.bandLevelDbfs = object.bandLevelDbfs ?? undefined;
+    message.rawBerPct = object.rawBerPct ?? undefined;
+    message.message = object.message ?? "";
+    message.measuredAtUs = object.measuredAtUs ?? 0;
+    message.noiseFloorDbfs = object.noiseFloorDbfs ?? undefined;
+    message.noiseFloorStale = object.noiseFloorStale ?? false;
+    return message;
+  },
+};
+
+function createBaseAccessMeasurementList(): AccessMeasurementList {
+  return { entries: [] };
+}
+
+export const AccessMeasurementList: MessageFns<AccessMeasurementList> = {
+  encode(message: AccessMeasurementList, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.entries) {
+      AccessMeasurement.encode(v!, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): AccessMeasurementList {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseAccessMeasurementList();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.entries.push(AccessMeasurement.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): AccessMeasurementList {
+    return {
+      entries: globalThis.Array.isArray(object?.entries)
+        ? object.entries.map((e: any) => AccessMeasurement.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: AccessMeasurementList): unknown {
+    const obj: any = {};
+    if (message.entries?.length) {
+      obj.entries = message.entries.map((e) => AccessMeasurement.toJSON(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<AccessMeasurementList>): AccessMeasurementList {
+    return AccessMeasurementList.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<AccessMeasurementList>): AccessMeasurementList {
+    const message = createBaseAccessMeasurementList();
+    message.entries = object.entries?.map((e) => AccessMeasurement.fromPartial(e)) || [];
+    return message;
+  },
+};
 
 function createBaseCellRequest(): CellRequest {
   return { cell: undefined, peerId: undefined };
@@ -1516,6 +1864,14 @@ export const BtsManagementServiceDefinition = {
       responseStream: true,
       options: {},
     },
+    listAccessMeasurements: {
+      name: "ListAccessMeasurements",
+      requestType: CellRequest as typeof CellRequest,
+      requestStream: false,
+      responseType: AccessMeasurementList as typeof AccessMeasurementList,
+      responseStream: false,
+      options: {},
+    },
   },
 } as const;
 
@@ -1576,6 +1932,10 @@ export interface BtsManagementServiceImplementation<CallContextExt = {}> {
     request: CellRequest,
     context: CallContext & CallContextExt,
   ): ServerStreamingMethodResult<DeepPartial<PagingEvent>>;
+  listAccessMeasurements(
+    request: CellRequest,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<AccessMeasurementList>>;
 }
 
 export interface BtsManagementServiceClient<CallOptionsExt = {}> {
@@ -1635,6 +1995,10 @@ export interface BtsManagementServiceClient<CallOptionsExt = {}> {
     request: DeepPartial<CellRequest>,
     options?: CallOptions & CallOptionsExt,
   ): AsyncIterable<PagingEvent>;
+  listAccessMeasurements(
+    request: DeepPartial<CellRequest>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<AccessMeasurementList>;
 }
 
 type Builtin = Date | Function | Uint8Array | string | number | boolean | undefined;
@@ -1644,6 +2008,17 @@ export type DeepPartial<T> = T extends Builtin ? T
   : T extends ReadonlyArray<infer U> ? ReadonlyArray<DeepPartial<U>>
   : T extends {} ? { [K in keyof T]?: DeepPartial<T[K]> }
   : Partial<T>;
+
+function longToNumber(int64: { toString(): string }): number {
+  const num = globalThis.Number(int64.toString());
+  if (num > globalThis.Number.MAX_SAFE_INTEGER) {
+    throw new globalThis.Error("Value is larger than Number.MAX_SAFE_INTEGER");
+  }
+  if (num < globalThis.Number.MIN_SAFE_INTEGER) {
+    throw new globalThis.Error("Value is smaller than Number.MIN_SAFE_INTEGER");
+  }
+  return num;
+}
 
 function isSet(value: any): boolean {
   return value !== null && value !== undefined;

@@ -1,5 +1,8 @@
 # HEAD
 
+- Improve traffic channel FER (RC1/RC2/RC3).
+- Web UI UX updates.
+- Fix issue with USB threads not getting real-time scheduling on macOS.
 - Fix issue with femtocell configuration drift.
 - Added closed access mode (defaults to open) to allow system access for subscribers only (1x and EVDO).
 - Fix issue on Femtocells where DST not applied properly. Add optional per-site `timezone` override in `config/femto.json`.

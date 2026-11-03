@@ -6,6 +6,7 @@ mod timing;
 mod trace;
 
 mod access_channel_processor;
+mod access_signal;
 mod acquisition_fft_processor;
 mod acquisition_fft_simple_processor;
 mod all_zeros_primer;
@@ -27,6 +28,7 @@ pub mod pn_lc_correlator;
 mod pulse_matched_filter_processor;
 mod rake_access_searcher;
 pub mod rake_receiver;
+mod rc12_gated_noise;
 mod rc1_reverse_traffic_decoder;
 mod rc1_traffic_frame_aligner;
 mod rc1_traffic_multi_rate_decoder;
@@ -148,7 +150,7 @@ fn rx_matched_filter_power_gain_db() -> f32 {
     })
 }
 
-fn adc_referenced_power_dbfs(mean_power: f64) -> f32 {
+pub(crate) fn adc_referenced_power_dbfs(mean_power: f64) -> f32 {
     10.0 * mean_power.max(1e-15).log10() as f32 - rx_matched_filter_power_gain_db()
 }
 
@@ -3754,6 +3756,20 @@ mod tests {
         );
     }
 
+    /// Turns QPSK chip samples into the reverse-link OQPSK a handset sends.
+    /// C.S0002-E §2.1.3.1.17 delays Q by half a chip and puts it on +sin, so a
+    /// complex baseband sample holds it as -Q.
+    fn spec_reverse_oqpsk(samples: &mut [Complex32], oversample: usize) {
+        let q_delay_samples = oversample / 2;
+        for k in (0..samples.len()).rev() {
+            samples[k].im = if k >= q_delay_samples {
+                -samples[k - q_delay_samples].im
+            } else {
+                0.0
+            };
+        }
+    }
+
     #[test]
     fn test_generic_rake_access_channel() {
         use crate::receiver::pipelined::generic_rake_receiver::GenericRakeReceiver;
@@ -3761,6 +3777,8 @@ mod tests {
         use crate::sdr::{cdma2000_baseband_filter_taps_f64, fir::ComplexFir32};
 
         init_test_logger();
+        // A Q-sign mismatch with the handset's OQPSK reads about 16 dB here.
+        const MIN_CLEAN_PREAMBLE_EB_NT_MDB: i64 = 28_000;
 
         let oversample = 4usize;
         let chip_rate = 1_228_800usize;
@@ -3885,6 +3903,7 @@ mod tests {
             }
         }
         assert_eq!(total_tx_chips * oversample, tx_raw.len());
+        spec_reverse_oqpsk(&mut tx_raw, oversample);
 
         let taps = cdma2000_baseband_filter_taps_f64();
         let tx_signal = ComplexFir32::new(&taps).process_block(&tx_raw);
@@ -3901,7 +3920,7 @@ mod tests {
                 rx_chip_offset, rx_chip_start
             );
 
-            let correlator_cfg = PnLcConfig::default_4x();
+            let correlator_cfg = PnLcConfig::default_4x().with_oqpsk_signal_conjugated(true);
 
             let correlator = PnLcCorrelator::new(
                 correlator_cfg,
@@ -3941,6 +3960,11 @@ mod tests {
                 for blk in &blocks {
                     if blk.tags.get("access_event") == Some(&1) {
                         access_data_frames += 1;
+                        let eb_nt_mdb = blk.tags.get("access_preamble_eb_nt_mdb").copied();
+                        assert!(
+                            eb_nt_mdb.is_some_and(|mdb| mdb >= MIN_CLEAN_PREAMBLE_EB_NT_MDB),
+                            "noise-free OQPSK preamble read {eb_nt_mdb:?} mdB at offset={rx_chip_offset}",
+                        );
                     }
                 }
             }
@@ -5935,6 +5959,57 @@ mod tests {
     /// RC3 reverse traffic channel decode test for SO33 packet data.
     /// WAV captured during SO33 origination on walsh=10, RC3.
     /// MS ESN=0x80857E58.
+    /// Replays a composite IQ capture through the production RC3 reverse
+    /// traffic chain. Env: RC3_REPLAY_WAV (path, JSON sidecar beside it),
+    /// RC3_REPLAY_ESN (hex), RC3_REPLAY_WALSH, optional RC3_REPLAY_PCGS.
+    #[test]
+    #[ignore = "diagnostic replay driven by RC3_REPLAY_* env vars"]
+    fn rc3_reverse_traffic_replay_from_env() {
+        init_test_logger();
+        let wav = std::env::var("RC3_REPLAY_WAV").expect("RC3_REPLAY_WAV");
+        let wav_path = Path::new(&wav);
+        let metadata = test_capture_metadata_from_path(&wav_path.with_extension("json"));
+        let esn = u32::from_str_radix(
+            std::env::var("RC3_REPLAY_ESN")
+                .expect("RC3_REPLAY_ESN")
+                .trim_start_matches("0x"),
+            16,
+        )
+        .expect("hex ESN");
+        let walsh_code: u8 = std::env::var("RC3_REPLAY_WALSH")
+            .expect("RC3_REPLAY_WALSH")
+            .parse()
+            .expect("walsh");
+        let preamble_num_pcgs = std::env::var("RC3_REPLAY_PCGS")
+            .ok()
+            .map(|v| v.parse().expect("pcgs"));
+        let shift_hz = metadata.one_x_rx_shift_hz.unwrap_or(0);
+        let (sample_rate, mut iq_samples, absolute_sample_start) =
+            read_shifted_capture_to_4x_with_shift(wav_path, &metadata, shift_hz);
+        let oversample = sample_rate as u64 / metadata.chip_rate_hz as u64;
+        let skip = (oversample - absolute_sample_start % oversample) % oversample;
+        iq_samples.drain(..skip as usize);
+        let result = run_rc3_reverse_traffic_iq_test(
+            iq_samples,
+            sample_rate as usize,
+            (absolute_sample_start + skip) / oversample,
+            esn,
+            walsh_code,
+            preamble_num_pcgs,
+            "RC3 replay",
+            None,
+            None,
+            None,
+            None,
+        );
+        eprintln!(
+            "RC3 replay: preambles={} crc_valid_frames={} signatures={:?}",
+            result.preamble_count,
+            result.crc_valid_rates.len(),
+            result.recovered_signatures,
+        );
+    }
+
     #[test]
     fn capture_rc3_reverse_traffic_so33_decode() {
         const RC3_SO33_W11_EXPECTED_PCG_MEASUREMENTS: usize = 15_967;

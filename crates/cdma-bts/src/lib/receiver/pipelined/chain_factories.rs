@@ -32,7 +32,8 @@ const REVERSE_ACCESS_ACTIVE_FINGER_DELAY_SUPPRESS_SAMPLES: i32 = 0;
 const REVERSE_ACCESS_ACTIVE_FINGER_BLOCK_SAMPLES: i32 = 16;
 const REVERSE_ACCESS_MAX_SEARCH_INTERVAL_WINDOWS: u64 = 32;
 const RC1_TRAFFIC_PREAMBLE_COH_NORM_MIN: f32 = 0.15;
-const RC3_TRAFFIC_PREAMBLE_COH_NORM_MIN: f32 = 0.20;
+/// Disabled. An RC3 pilot at open-loop power measures 0.10-0.21 here.
+const RC3_TRAFFIC_PREAMBLE_COH_NORM_MIN: f32 = 0.0;
 /// Reverse-access finger budget, fixed to the value the access capture
 /// regression suite exercises.
 const REVERSE_ACCESS_MAX_FINGERS: usize = 10;
@@ -257,7 +258,8 @@ pub fn reverse_access_chain(settings: ReverseAccessSettings) -> Vec<PipelineProc
             )
             .with_gardner_timing(GardnerTimingConfig::reverse_access_4x())
             .with_output_oversampled_chips(false)
-            .with_access_cfo(true),
+            .with_access_cfo(true)
+            .with_oqpsk_signal_conjugated(true),
         LongCodeGenerator::new_access_channel_with_state(
             settings.access_channel_number,
             settings.paging_channel_number,
@@ -380,6 +382,7 @@ pub fn reverse_traffic_chain(settings: ReverseTrafficSettings) -> Vec<PipelinePr
             .with_preamble_hits_required(3)
             .with_search_interval_windows(32)
             .with_split_pn_reference(true)
+            .with_oqpsk_signal_conjugated(true)
             .with_reanchor_origin(settings.reanchor_origin)
             .with_suppress_search_when_locked(true)
             // Gated transmission and FER bursts must not start a competing
@@ -437,11 +440,15 @@ pub fn reverse_traffic_chain_rc2(settings: ReverseTrafficSettings) -> Vec<Pipeli
             .with_preamble_hits_required(3)
             .with_search_interval_windows(32)
             .with_split_pn_reference(true)
+            .with_oqpsk_signal_conjugated(true)
             .with_reanchor_origin(settings.reanchor_origin)
             .with_suppress_search_when_locked(true)
             .with_fractional_timing_recovery(true)
             .with_epl_tracking(true)
             .with_epl_slew(false)
+            // Path delay steps by whole chips during a call, which a
+            // quarter-chip early/late gate cannot see.
+            .with_delay_tracking(true)
             .with_nonpilot_cfo_tracking(false),
         LongCodeGenerator::new_traffic_channel(settings.esn)
             .with_privacy(settings.long_code_privacy.clone()),

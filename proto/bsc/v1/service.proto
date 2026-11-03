@@ -916,6 +916,42 @@ message MobileInfo {
   // Cell serving this mobile, bound from the Abis Cell Identifier on the
   // access message that registered it. Absent until the mobile is bound.
   optional CellId serving_cell = 28;
+  optional AccessSignal access_signal = 30;
+  // Eb/Nt of the most recent access probes in dB, oldest first.
+  repeated float recent_access_eb_nt_db = 31;
+}
+
+enum SignalQuality {
+  SIGNAL_QUALITY_UNSPECIFIED = 0;
+  SIGNAL_QUALITY_POOR = 1;
+  SIGNAL_QUALITY_AVERAGE = 2;
+  SIGNAL_QUALITY_GOOD = 3;
+  SIGNAL_QUALITY_EXCELLENT = 4;
+}
+
+message AccessSignal {
+  float eb_nt_db = 1;
+  SignalQuality quality = 2;
+  // This mobile's preamble power referred to the ADC input.
+  optional float signal_power_dbfs = 3;
+  // Present only when rx_reference_dbm is configured.
+  optional float signal_power_dbm = 4;
+  // Total power in the channel during the probe, from every source.
+  optional float band_level_dbfs = 5;
+  // Share of the message's code symbols demodulated wrong before decoding.
+  optional float raw_ber_pct = 6;
+  // Access message the probe delivered, e.g. "Registration".
+  string message = 7;
+  uint64 measured_at_ms = 8;
+  // Present only when rx_reference_dbm is configured.
+  optional float band_level_dbm = 9;
+  // Reverse noise floor of the cell when the probe was decoded.
+  optional float noise_floor_dbfs = 10;
+  // Present only when rx_reference_dbm is configured.
+  optional float noise_floor_dbm = 11;
+  // The noise floor has had no quiet period to update from recently, such as
+  // during a call.
+  bool noise_floor_stale = 12;
 }
 
 // List of mobiles currently tracked by the BSC.
@@ -954,6 +990,9 @@ message InitiateCallRequest {
   optional string audio_file = 2;
   // Caller ID digits to present to the called party.
   optional string caller_number = 3;
+  // Voice service option to page with, e.g. 32768 for QCELP-13K, which uses
+  // RC2. Absent selects the MSC's default voice service option.
+  optional uint32 service_option = 4;
 }
 
 // Result of accepting or rejecting a voice-call request.
@@ -1100,6 +1139,13 @@ message TrafficChannelPower {
   optional float measured_inner_loop_1s_db = 21;
   // Wall-clock timestamp when measured_inner_loop_1s_db was completed.
   optional uint64 measured_inner_loop_1s_timestamp_ms = 22;
+  // Mean of the channel's own despread receive power over the most recent
+  // one-second window, in dBFS. The pilot for RC3, the transmitted PCGs for
+  // RC1 and RC2.
+  optional float reverse_power_dbfs = 23;
+  // `reverse_power_dbfs` referred to the antenna, present when the radio has
+  // a receive reference.
+  optional float reverse_power_dbm = 24;
 }
 
 // Single 500ms-windowed power control measurement for the time-series

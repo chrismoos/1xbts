@@ -77,7 +77,7 @@ fn snapshot_traffic_channels_into(
     tx_pool: &mut super::handle::TxPool,
     chip_cursor: u64,
     pilot_offset_chips: u64,
-    out: &mut Vec<(f32, TrafficChannelWrapper)>,
+    out: &mut Vec<(u8, f32, TrafficChannelWrapper)>,
 ) {
     tx_pool.drain_commands();
     out.clear();
@@ -119,7 +119,7 @@ fn snapshot_traffic_channels_into(
             tx_slot.frame_align_verified = true;
         }
         let gain = tx_slot.slot.gain();
-        out.push((gain, tx_slot.slot.channel.clone()));
+        out.push((tx_slot.walsh_code, gain, tx_slot.slot.channel.clone()));
     }
 }
 
@@ -171,7 +171,7 @@ pub(super) fn synthesize_block(
         .truncate(state.scratch_tc_snapshot.len());
     let mut tc_sum_us = 0u64;
     let mut tc_max_us = 0u64;
-    for (i, (gain, ch)) in state.scratch_tc_snapshot.iter().enumerate() {
+    for (i, (_, gain, ch)) in state.scratch_tc_snapshot.iter().enumerate() {
         let (g_slot, active_slot, buf) = &mut state.scratch_tc_blocks[i];
         *g_slot = *gain;
         buf.clear();
@@ -200,6 +200,10 @@ pub(super) fn synthesize_block(
         &state.scratch_tc_blocks,
         &mut state.scratch_tc_amps,
     );
+    state.traffic_power_fractions.clear();
+    for ((walsh_code, _, _), amp) in state.scratch_tc_snapshot.iter().zip(&state.scratch_tc_amps) {
+        state.traffic_power_fractions.push((*walsh_code, amp * amp));
+    }
     for amp in state.scratch_tc_amps.iter_mut() {
         *amp *= tx_scale;
     }

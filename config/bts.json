@@ -255,7 +255,8 @@
     }
   },
   "abis": {
-    "bind_addr": "127.0.0.1:5604"
+    "bind_addr": "127.0.0.1:5604",
+    "radio_link_loss_release": false
   },
   "management": {
     "bind_addr": "127.0.0.1:17024"

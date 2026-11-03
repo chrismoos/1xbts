@@ -88,6 +88,22 @@ pub struct TrafficAssignmentConfig {
     /// Target RC3 F-SCH rate. Supported values: 19200, 38400, 76800, 153600.
     #[serde(default = "default_f_sch_rate_bps")]
     pub f_sch_rate_bps: u32,
+    /// ECAM `RLGAIN_ADJ` in dB for RC1 and RC2 assignments: the mobile's
+    /// initial Reverse Traffic Channel power relative to its last access
+    /// probe. Values outside -8..=7 are clamped to that range.
+    #[serde(default = "default_rc12_rlgain_adj_db")]
+    pub rc12_rlgain_adj_db: i8,
+    /// Sets BYPASS_ALERT_ANSWER on mobile-terminated voice assignments, so the
+    /// called mobile connects without ringing. Default false. An RC1
+    /// assignment on band class 0 uses the basic Channel Assignment Message,
+    /// which has no such field, so that mobile still alerts.
+    #[serde(default)]
+    pub bypass_alert_answer: bool,
+    /// Seconds between alert re-sends to a ringing mobile, each of which restarts
+    /// its 65 s answer timer (C.S0005-E T53m). Keep it under 65. 0 disables the
+    /// refresh. Default 50.
+    #[serde(default = "default_mt_alert_refresh_s")]
+    pub mt_alert_refresh_s: u64,
 }
 
 impl Default for TrafficAssignmentConfig {
@@ -106,12 +122,23 @@ impl Default for TrafficAssignmentConfig {
             rev_fch_gating_mode: false,
             enable_f_sch: false,
             f_sch_rate_bps: default_f_sch_rate_bps(),
+            rc12_rlgain_adj_db: default_rc12_rlgain_adj_db(),
+            bypass_alert_answer: false,
+            mt_alert_refresh_s: default_mt_alert_refresh_s(),
         }
     }
 }
 
+fn default_mt_alert_refresh_s() -> u64 {
+    50
+}
+
 fn default_f_sch_rate_bps() -> u32 {
     DEFAULT_RC3_F_SCH_RATE_BPS
+}
+
+fn default_rc12_rlgain_adj_db() -> i8 {
+    cdma_common::lac::paging_messages::RC1_RC2_INITIAL_TRAFFIC_GAIN_ADJ_DB
 }
 
 fn default_traffic_idle_timeout_s() -> u64 {

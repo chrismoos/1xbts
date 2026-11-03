@@ -1,7 +1,7 @@
 "use client";
 
 import { HrpdAdmissionCard } from "@/components/hrpd-admission";
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import { Card } from "@/components/card";
@@ -13,22 +13,13 @@ import {
   type Session,
 } from "@/lib/proto/an/v1/service";
 import { useEventStream } from "@/lib/use-event-stream";
-import {
-  HrpdAccessDetail,
-  HrpdSessionDetail,
-  HrpdTrafficDetail,
-  formatHrpdAccessSummary,
-  formatHrpdSessionSummary,
-  formatHrpdTrafficSummary,
-  hrpdDirectionClass,
-  hrpdDirectionLabel,
-} from "@/components/message-detail";
+import { MessageListHeader, MessageRow, messageView } from "@/components/message-row";
 import {
   HrpdAccessEvent,
   HrpdSessionEvent,
   HrpdTrafficEvent,
 } from "@/lib/proto/events/v1/an";
-import { formatTime } from "@/lib/message-log";
+import type { LogEntry } from "@/lib/message-log";
 import { TimeSeriesChart } from "@/components/time-series-chart";
 import {
   formatHrpdFullUati,
@@ -620,60 +611,30 @@ export default function HrpdSessionPage() {
         {timeline.length === 0 ? (
           <p className="text-dimmed text-sm">Waiting for events...</p>
         ) : (
-          <div className="space-y-0">
+          <>
+            <MessageListHeader />
             {timeline.map((row) => {
-              const isExpanded = expanded.has(row.id);
-              let typeName: string;
-              let summary: string;
-              let detail: ReactNode;
-              if (row.stream === "session") {
-                const event = row.event as HrpdSessionEvent;
-                typeName = "HRPD Session";
-                summary = formatHrpdSessionSummary(event);
-                detail = <HrpdSessionDetail event={event} />;
-              } else if (row.stream === "access") {
-                const event = row.event as HrpdAccessEvent;
-                typeName = "HRPD Access";
-                summary = formatHrpdAccessSummary(event);
-                detail = <HrpdAccessDetail event={event} />;
-              } else {
-                const event = row.event as HrpdTrafficEvent;
-                typeName = "HRPD Traffic";
-                summary = formatHrpdTrafficSummary(event);
-                detail = <HrpdTrafficDetail event={event} />;
-              }
-              const direction =
-                "direction" in row.event ? row.event.direction : undefined;
+              const entry = {
+                kind: "hrpd",
+                stream: row.stream,
+                id: row.id,
+                ts: row.ts,
+                identity: row.id,
+                sortKey: row.id,
+                event: row.event,
+                seenCount: 1,
+              } as LogEntry;
               return (
-                <div
+                <MessageRow
                   key={row.id}
-                  className="border-b border-border-subtle py-1.5 px-2 -mx-2 rounded"
-                >
-                  <div
-                    className="flex items-center gap-2 text-sm cursor-pointer hover:bg-hover rounded"
-                    onClick={() => toggleExpand(row.id)}
-                  >
-                    <div className="flex-1 min-w-0 flex items-center gap-2">
-                      <span className="text-muted font-mono text-xs w-[15rem] shrink-0">
-                        {formatTime(row.ts)}
-                      </span>
-                      <span className={`${hrpdDirectionClass(direction)} font-mono text-xs w-16 shrink-0`}>
-                        {direction != null ? hrpdDirectionLabel(direction) : "EVDO"}
-                      </span>
-                      <span className="text-primary font-medium shrink-0">{typeName}</span>
-                      <span className="text-muted text-xs truncate">{summary}</span>
-                    </div>
-                    <div className="shrink-0 flex items-center gap-1">
-                      <span className="text-dimmed text-xs">{isExpanded ? "▾" : "▸"}</span>
-                    </div>
-                  </div>
-                  {isExpanded && (
-                    <div className="mt-1.5 ml-8 pb-1">{detail}</div>
-                  )}
-                </div>
+                  entry={entry}
+                  view={messageView(entry, { mobile: {}, verdicts: [], cells: [] })}
+                  open={expanded.has(row.id)}
+                  onToggle={() => toggleExpand(row.id)}
+                />
               );
             })}
-          </div>
+          </>
         )}
       </Card>
     </div>

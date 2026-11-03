@@ -103,6 +103,10 @@ message InitiateOtaspResponse {
   uint64 call_id = 1;
 }
 
+message ReleaseCallRequest {
+  uint64 call_id = 1;
+}
+
 service MscManagementService {
   // Pages the handset and applies the configured OTASP writes and subscriber overrides.
   rpc InitiateOtasp(InitiateOtaspRequest) returns (InitiateOtaspResponse);
@@ -114,6 +118,11 @@ service MscManagementService {
   rpc SendSms(SendSmsRequest) returns (SendSmsResponse);
   // Lists active MSC call IDs.
   rpc ListCalls(google.protobuf.Empty) returns (CallList);
+  // Releases a call from the network side. A call with a traffic channel is
+  // cleared with an A1 Clear Command, so the mobile receives a Release Order.
+  // A call still being paged is abandoned. Fails with NOT_FOUND for an
+  // unknown call ID.
+  rpc ReleaseCall(ReleaseCallRequest) returns (google.protobuf.Empty);
   // Streams live OTASP events for real-time dashboards. Persisted
   // session history is served separately by the HLR service.
   rpc StreamOtaspEvents(google.protobuf.Empty) returns (stream events.v1.MscNetworkEvent);

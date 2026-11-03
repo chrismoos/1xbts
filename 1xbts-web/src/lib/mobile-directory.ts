@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useLive } from "@/lib/live";
 
 import type { AccessEvent, PagingEvent, TrafficEvent } from "@/lib/proto/bsc/v1/service";
 
@@ -27,35 +27,12 @@ export interface PacketSessionDirectoryFields {
   trafficWalshCode?: number;
 }
 
-/// Polls `/api/mobiles` periodically and returns the latest snapshot.
-/// Polling is shared per component instance; for many consumers consider
-/// hoisting to a shared store later.
-export function useMobileDirectory(intervalMs = 1500): MobileDirectoryEntry[] {
-  const [mobiles, setMobiles] = useState<MobileDirectoryEntry[]>([]);
-
-  useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const res = await fetch("/api/mobiles");
-        if (!res.ok) return;
-        const data = await res.json();
-        if (cancelled || !Array.isArray(data)) return;
-        setMobiles(data as MobileDirectoryEntry[]);
-      } catch {
-        // ignore — next tick will retry
-      }
-    };
-    void load();
-    const id = setInterval(load, intervalMs);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, [intervalMs]);
-
-  return mobiles;
+export function useMobileDirectory(): MobileDirectoryEntry[] {
+  const { data } = useLive<MobileDirectoryEntry[]>("/api/mobiles");
+  return Array.isArray(data) ? data : EMPTY_DIRECTORY;
 }
+
+const EMPTY_DIRECTORY: MobileDirectoryEntry[] = [];
 
 /// Best-effort match of a Paging/Traffic/Access event to a known mobile.
 /// Returns undefined when no entry in the directory is recognisably the

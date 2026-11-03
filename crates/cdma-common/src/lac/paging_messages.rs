@@ -3929,7 +3929,12 @@ pub enum ChannelAssignmentGrantedMode {
 
 pub const CHANNEL_ASSIGN_MODE_TRAFFIC: u8 = 0b000;
 pub const CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC: u8 = 0b100;
-const RC1_RC2_INITIAL_TRAFFIC_GAIN_ADJ_DB: i8 = 3;
+/// A hotter start corrupts the frames of calls already up until power control
+/// brings it down. Much lower and a phone near the noise floor loses its own
+/// first frames, since the RC1/RC2 loop raises power 1 dB a decision.
+pub const RC1_RC2_INITIAL_TRAFFIC_GAIN_ADJ_DB: i8 = -4;
+/// ECAM `RLGAIN_ADJ` is a 4-bit two's complement field.
+pub const RLGAIN_ADJ_RANGE_DB: std::ops::RangeInclusive<i8> = -8..=7;
 pub const CHANNEL_DEFAULT_CONFIG_RC1_RC1: u8 = 0b000;
 pub const CHANNEL_DEFAULT_CONFIG_RC2_RC2: u8 = 0b001;
 pub const CHANNEL_DEFAULT_CONFIG_RC1_RC2: u8 = 0b010;
@@ -4439,8 +4444,6 @@ impl ExtendedChannelAssignmentMessage {
             enc_key_size: None,
             // FPC values matched to working Anritsu MD8470A trace (RecNo 50).
             fpc_subchan_gain: 12,
-            // RC1/RC2 need enough margin to transition from a low-power
-            // access probe into closed-loop traffic power control.
             rlgain_adj: if matches!(rev_rc, 1 | 2) {
                 RC1_RC2_INITIAL_TRAFFIC_GAIN_ADJ_DB
             } else {

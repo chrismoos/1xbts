@@ -160,6 +160,21 @@ pub(super) fn build_access_event(
     );
 
     Some(AccessChannelEvent {
+        access_signal: cdma_common::events::AccessSignal {
+            eb_nt_db: blk
+                .tags
+                .get("access_preamble_eb_nt_mdb")
+                .map(|v| *v as f32 / 1000.0),
+            signal_power_dbfs: blk
+                .tags
+                .get("access_preamble_power_mdb")
+                .map(|v| *v as f32 / 1000.0),
+            raw_ber_pct: blk
+                .tags
+                .get("access_raw_ber_ppm")
+                .map(|v| *v as f32 / 10_000.0),
+            ..Default::default()
+        },
         event_id: super::next_access_event_id(),
         cell: None,
         chip_start: blk.chip_start,
@@ -315,6 +330,7 @@ pub(super) fn build_traffic_event(
     );
 
     Some(AccessChannelEvent {
+        access_signal: Default::default(),
         event_id: super::next_access_event_id(),
         cell: None,
         chip_start: blk.chip_start,
@@ -442,6 +458,7 @@ pub(super) fn build_traffic_phy_status_event(
     });
 
     Some(AccessChannelEvent {
+        access_signal: Default::default(),
         event_id: super::next_access_event_id(),
         cell: None,
         chip_start: blk.chip_start,
@@ -569,6 +586,7 @@ pub(super) fn build_traffic_voice_event(
     });
 
     Some(AccessChannelEvent {
+        access_signal: Default::default(),
         event_id: super::next_access_event_id(),
         cell: None,
         chip_start: blk.chip_start,
@@ -664,6 +682,7 @@ pub(super) fn build_traffic_preamble_event(
     preamble_pcgs: i64,
 ) -> AccessChannelEvent {
     AccessChannelEvent {
+        access_signal: Default::default(),
         event_id: super::next_access_event_id(),
         cell: None,
         chip_start,
@@ -773,6 +792,7 @@ pub(super) fn build_traffic_pcg_measurement_event(
         absolute_chip_start.map(|chip| processing_absolute_chip_end.saturating_sub(chip));
 
     Some(AccessChannelEvent {
+        access_signal: Default::default(),
         event_id: super::next_access_event_id(),
         cell: None,
         chip_start: blk.chip_start,

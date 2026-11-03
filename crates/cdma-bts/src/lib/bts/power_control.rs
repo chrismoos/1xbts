@@ -11,15 +11,16 @@ use parking_lot::Mutex;
 use super::handle::{TrafficChannelPool, TrafficChannelWrapper};
 use crate::channels::ftch_rc3::Rc3PcgPcbSchedulerSnapshot;
 
-// Keep the RC1 target fixed to prevent multi-mobile noise-floor escalation.
+// Keep the RC1 and RC2 targets fixed to prevent multi-mobile noise-floor
+// escalation.
 const RC1_INITIAL_TARGET_DB: f32 = 13.0;
 const RC1_AUTO_MIN_DB: f32 = 13.0;
 const RC1_AUTO_MAX_DB: f32 = 13.0;
 const RC1_MANUAL_MIN_DB: f32 = 0.0;
 const RC1_MANUAL_MAX_DB: f32 = 40.0;
-const RC2_INITIAL_TARGET_DB: f32 = 10.0;
-const RC2_AUTO_MIN_DB: f32 = 8.0;
-const RC2_AUTO_MAX_DB: f32 = 12.0;
+const RC2_INITIAL_TARGET_DB: f32 = 11.0;
+const RC2_AUTO_MIN_DB: f32 = 11.0;
+const RC2_AUTO_MAX_DB: f32 = 11.0;
 const RC2_MANUAL_MIN_DB: f32 = 0.0;
 const RC2_MANUAL_MAX_DB: f32 = 40.0;
 const RC3_INITIAL_TARGET_DB: f32 = 0.0;
@@ -55,17 +56,22 @@ const RC3_DIRECT_MAX_MEASUREMENT_AGE_PCGS: u64 = DIRECT_MAX_MEASUREMENT_AGE_PCGS
 // That works out to 19-33 PCGs of lead, always past the nine-PCG publication floor.
 const RC12_DIRECT_DELAY_GUARANTEED_SLOTS: u64 = 3;
 const RC12_NEUTRAL_LOOKAHEAD_PCGS: u64 = 16;
+// Consecutive hot decisions, with the last frame decoded, before a 5-step DOWN.
+// Another mobile's access probe reads hot for about three decisions but
+// corrupts the frames under it.
+const RC12_FAST_DOWN_DECISIONS: u8 = 3;
+/// A DOWN step needs the averaged Eb/Nt at least this far above the target.
+const RC12_DOWN_MARGIN_DB: f32 = 1.0;
 const RC3_RELEASE_NEUTRAL_FILL_PCGS: u64 = 16;
 const SR1_CHIPS_PER_PCG: u64 = 1_536;
+pub const VALID_FRAME_HISTORY: usize = 16;
 const SR1_PCGS_PER_SECOND: u64 = 800;
 const CLIP_BEGIN_DBFS: f32 = -8.0;
 const PCG_RAW_HOT_LIMIT_DBFS: f32 = -8.0;
-const RC1_CLIP_BEGIN_DBFS: f32 = -2.0;
-const RC1_PCG_RAW_HOT_LIMIT_DBFS: f32 = -2.0;
-const RC2_PCG_RAW_HOT_LIMIT_DBFS: f32 = -38.0;
+const RC12_CLIP_BEGIN_DBFS: f32 = -2.0;
+const RC12_PCG_RAW_HOT_LIMIT_DBFS: f32 = -2.0;
 const OUTER_LOOP_OVERPOWER_CLIP_PCGS: usize = 4;
-const RC1_OUTER_LOOP_OVERPOWER_CLIP_PCGS: usize = 1;
-const RC2_OUTER_LOOP_OVERPOWER_HOT_PCGS: usize = 1;
+const RC12_OUTER_LOOP_OVERPOWER_CLIP_PCGS: usize = 1;
 const OUTER_LOOP_UNDERPOWER_ERROR_DB: f32 = 4.0;
 const OUTER_LOOP_UNDERPOWER_MAX_RAW_DBFS: f32 = -20.0;
 const OUTER_LOOP_MIN_FRAME_OBSERVATION_PCGS: usize = 8;
@@ -102,6 +108,10 @@ pub struct BtsPowerControlSnapshot {
     pub frames_total: u64,
     pub frames_crc_error: u64,
     pub measured_inner_loop_1s: Option<BtsPowerControlOneSecondMeasurement>,
+    /// Mean of the channel's own despread receive power over the last
+    /// complete second, in dBFS. The pilot for RC3, the transmitted PCGs for
+    /// RC1 and RC2.
+    pub measured_reverse_power_1s: Option<BtsPowerControlOneSecondMeasurement>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -141,18 +151,11 @@ impl RawPowerLimiterProfile {
         overpowered_pcgs: OUTER_LOOP_OVERPOWER_CLIP_PCGS,
     };
 
-    const RC1: Self = Self {
-        clip_begin_dbfs: Some(RC1_CLIP_BEGIN_DBFS),
-        hot_limit_dbfs: RC1_PCG_RAW_HOT_LIMIT_DBFS,
+    const RC12: Self = Self {
+        clip_begin_dbfs: Some(RC12_CLIP_BEGIN_DBFS),
+        hot_limit_dbfs: RC12_PCG_RAW_HOT_LIMIT_DBFS,
         thresholds_follow_rx_power_adj: true,
-        overpowered_pcgs: RC1_OUTER_LOOP_OVERPOWER_CLIP_PCGS,
-    };
-
-    const RC2: Self = Self {
-        clip_begin_dbfs: None,
-        hot_limit_dbfs: RC2_PCG_RAW_HOT_LIMIT_DBFS,
-        thresholds_follow_rx_power_adj: false,
-        overpowered_pcgs: RC2_OUTER_LOOP_OVERPOWER_HOT_PCGS,
+        overpowered_pcgs: RC12_OUTER_LOOP_OVERPOWER_CLIP_PCGS,
     };
 }
 
@@ -169,17 +172,6 @@ impl ReverseTrafficRadioConfig {
             TrafficChannelWrapper::Rc1(_) => Self::Rc1,
             TrafficChannelWrapper::Rc2(_) => Self::Rc2,
             TrafficChannelWrapper::Rc3(_) | TrafficChannelWrapper::SchRc3(_) => Self::Rc3,
-        }
-    }
-
-    fn limiter_power_db(
-        self,
-        raw_power_db: Option<f32>,
-        mobile_power_db: Option<f32>,
-    ) -> Option<f32> {
-        match self {
-            Self::Rc2 => mobile_power_db,
-            Self::Rc1 | Self::Rc3 => raw_power_db,
         }
     }
 
@@ -434,13 +426,174 @@ mod tests {
     }
 
     #[test]
-    fn rc1_control_keeps_large_errors_to_one_step() {
-        let mut state = BtsReversePowerControlState::new_rc1();
-        let tick = state.tick_direct(100, RC1_INITIAL_TARGET_DB - 10.0, Some(-20.0), Some(8));
+    fn rc1_and_rc2_step_down_fast_only_after_consecutive_hot_decisions() {
+        for (mut state, target_db) in [
+            (
+                BtsReversePowerControlState::new_rc1(),
+                RC1_INITIAL_TARGET_DB,
+            ),
+            (
+                BtsReversePowerControlState::new_rc2(),
+                RC2_INITIAL_TARGET_DB,
+            ),
+        ] {
+            let _ = state.outer_loop_tick(10, true);
+            let hot_db = target_db + DIRECT_FIVE_STEP_ERROR_DB;
+            let mut steps = Vec::new();
+            for decision in 0..u64::from(RC12_FAST_DOWN_DECISIONS) + 1 {
+                let ordinal = decision * DIRECT_EPOCH_PCBS + DIRECT_HOLD_PCBS;
+                let tick = state.tick_direct(100 + ordinal, hot_db, Some(-20.0), Some(ordinal));
+                assert_eq!(tick.pcb, 1);
+                steps.push(tick.control_steps);
+            }
+            assert_eq!(steps, [1, 1, 5, 5]);
 
+            let ordinal = 4 * DIRECT_EPOCH_PCBS + DIRECT_HOLD_PCBS;
+            let tick =
+                state.tick_direct(100 + ordinal, target_db - 1.0, Some(-20.0), Some(ordinal));
+            assert_eq!((tick.pcb, tick.control_steps), (0, 1));
+            let ordinal = 5 * DIRECT_EPOCH_PCBS + DIRECT_HOLD_PCBS;
+            let tick = state.tick_direct(100 + ordinal, hot_db, Some(-20.0), Some(ordinal));
+            assert_eq!(tick.control_steps, 1);
+        }
+    }
+
+    #[test]
+    fn rc1_and_rc2_hold_single_steps_while_frames_fail() {
+        for (mut state, target_db) in [
+            (
+                BtsReversePowerControlState::new_rc1(),
+                RC1_INITIAL_TARGET_DB,
+            ),
+            (
+                BtsReversePowerControlState::new_rc2(),
+                RC2_INITIAL_TARGET_DB,
+            ),
+        ] {
+            let _ = state.outer_loop_tick(10, false);
+            let hot_db = target_db + DIRECT_FIVE_STEP_ERROR_DB;
+            for decision in 0..u64::from(RC12_FAST_DOWN_DECISIONS) + 2 {
+                let ordinal = decision * DIRECT_EPOCH_PCBS + DIRECT_HOLD_PCBS;
+                let tick = state.tick_direct(100 + ordinal, hot_db, Some(-20.0), Some(ordinal));
+                assert_eq!(tick.pcb, 1);
+                assert_eq!(tick.control_steps, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn rc1_and_rc2_control_keep_large_errors_to_one_step() {
+        for (mut state, target_db) in [
+            (
+                BtsReversePowerControlState::new_rc1(),
+                RC1_INITIAL_TARGET_DB,
+            ),
+            (
+                BtsReversePowerControlState::new_rc2(),
+                RC2_INITIAL_TARGET_DB,
+            ),
+        ] {
+            let tick = state.tick_direct(100, target_db - 10.0, Some(-20.0), Some(8));
+
+            assert!(tick.measurement_used);
+            assert_eq!(tick.control_steps, 1);
+            assert_eq!(tick.pcb, 0);
+        }
+    }
+
+    #[test]
+    fn reverse_power_averages_over_the_previous_second() {
+        let mut state = BtsReversePowerControlState::new_rc3();
+        let second = SR1_PCGS_PER_SECOND;
+        state.record_reverse_power(second, Some(-60.0));
+        state.record_reverse_power(second + 1, None);
+        state.record_reverse_power(second + 2, Some(-50.0));
+        assert!(state.snapshot(10).measured_reverse_power_1s.is_none());
+        state.record_reverse_power(2 * second, Some(-40.0));
+        let measured = state
+            .snapshot(10)
+            .measured_reverse_power_1s
+            .expect("the first second completed");
+        assert!(
+            (measured.mean_db + 55.0).abs() < 1e-4,
+            "{}",
+            measured.mean_db
+        );
+        state.record_reverse_power(3 * second, None);
+        assert!(
+            (state
+                .snapshot(10)
+                .measured_reverse_power_1s
+                .unwrap()
+                .mean_db
+                + 40.0)
+                .abs()
+                < 1e-4,
+            "a second with one reading reports it"
+        );
+    }
+
+    #[test]
+    fn rc1_and_rc2_hold_inside_the_down_margin() {
+        for (mut state, target_db) in [
+            (
+                BtsReversePowerControlState::new_rc1(),
+                RC1_INITIAL_TARGET_DB,
+            ),
+            (
+                BtsReversePowerControlState::new_rc2(),
+                RC2_INITIAL_TARGET_DB,
+            ),
+        ] {
+            let mut decide = |decision: u64, metric_db: f32| {
+                let ordinal = decision * DIRECT_EPOCH_PCBS + DIRECT_HOLD_PCBS;
+                let tick = state.tick_direct(100 + ordinal, metric_db, Some(-60.0), Some(ordinal));
+                assert!(tick.measurement_used);
+                (tick.pcb, tick.control_steps)
+            };
+            assert_eq!(decide(0, target_db - 0.5), (0, 1), "below target steps up");
+            assert_eq!(decide(1, target_db + 0.5).1, 0, "inside the margin holds");
+            assert_eq!(
+                decide(2, target_db + RC12_DOWN_MARGIN_DB),
+                (1, 1),
+                "at the margin steps down"
+            );
+        }
+    }
+
+    #[test]
+    fn rc1_and_rc2_decide_on_the_linear_mean_of_the_readings_since_the_last_decision() {
+        let mut state = BtsReversePowerControlState::new_rc2();
+        let target_db = RC2_INITIAL_TARGET_DB;
+        for ordinal in 0..DIRECT_HOLD_PCBS {
+            let metric_db = if ordinal % 2 == 0 {
+                target_db + 4.0
+            } else {
+                target_db - 4.0
+            };
+            let tick = state.tick_direct(100 + ordinal, metric_db, Some(-60.0), Some(ordinal));
+            assert!(!tick.control_epoch);
+        }
+        // Four readings at +4 dB and five at -4 dB average to about +1.26 dB
+        // in the linear domain, which is above the margin.
+        let tick = state.tick_direct(
+            100 + DIRECT_HOLD_PCBS,
+            target_db - 4.0,
+            Some(-60.0),
+            Some(DIRECT_HOLD_PCBS),
+        );
         assert!(tick.measurement_used);
-        assert_eq!(tick.control_steps, 1);
-        assert_eq!(tick.pcb, 0);
+        assert!(
+            (tick.control_metric_db - (target_db + 1.26)).abs() < 0.05,
+            "control metric {}",
+            tick.control_metric_db
+        );
+        assert_eq!((tick.pcb, tick.control_steps), (1, 1));
+
+        let ordinal = DIRECT_EPOCH_PCBS + DIRECT_HOLD_PCBS;
+        let tick = state.tick_direct(100 + ordinal, target_db - 2.0, Some(-60.0), Some(ordinal));
+        assert!((tick.control_metric_db - (target_db - 2.0)).abs() < 0.01);
+        assert_eq!((tick.pcb, tick.control_steps), (0, 1));
     }
 
     #[test]
@@ -530,12 +683,12 @@ mod tests {
     }
 
     #[test]
-    fn rc2_power_ceiling_forces_down_without_filtering() {
+    fn rc2_clip_forces_down_without_filtering() {
         let mut state = BtsReversePowerControlState::new_rc2();
         let tick = state.tick_direct(
             100,
             RC2_INITIAL_TARGET_DB - 10.0,
-            Some(RC2_PCG_RAW_HOT_LIMIT_DBFS + 0.1),
+            Some(RC12_CLIP_BEGIN_DBFS + 0.1),
             Some(0),
         );
 
@@ -558,7 +711,7 @@ mod tests {
         state.enter_release_hold();
 
         let ticks = (0..8)
-            .map(|ordinal| state.tick_rc3_release_hold(100 + ordinal, Some(ordinal)))
+            .map(|ordinal| state.tick_release_hold(100 + ordinal, Some(ordinal)))
             .collect::<Vec<_>>();
         assert_eq!(
             ticks.iter().map(|tick| tick.pcb).collect::<Vec<_>>(),
@@ -784,27 +937,9 @@ mod tests {
     }
 
     #[test]
-    fn only_rc2_uses_despread_mobile_power_for_limiting() {
-        let raw = Some(-5.0);
-        let mobile = Some(-40.0);
-        assert_eq!(
-            ReverseTrafficRadioConfig::Rc1.limiter_power_db(raw, mobile),
-            raw
-        );
-        assert_eq!(
-            ReverseTrafficRadioConfig::Rc2.limiter_power_db(raw, mobile),
-            mobile
-        );
-        assert_eq!(
-            ReverseTrafficRadioConfig::Rc3.limiter_power_db(raw, mobile),
-            raw
-        );
-    }
-
-    #[test]
     fn rc2_observations_expire_at_the_next_frame() {
         let mut state = BtsReversePowerControlState::new_rc2();
-        let _ = state.tick_direct(14, 10.0, Some(RC2_PCG_RAW_HOT_LIMIT_DBFS + 0.1), Some(0));
+        let _ = state.tick_direct(14, 10.0, Some(RC12_CLIP_BEGIN_DBFS + 0.1), Some(0));
         let _ = state.tick_direct(15, 10.0, Some(-45.0), Some(1));
         assert!(state.recent_frame_overpowered());
         let _ = state.outer_loop_tick(10, true);
@@ -834,7 +969,7 @@ mod tests {
     #[test]
     fn rc1_outer_loop_detects_one_clipped_guaranteed_pcg() {
         let mut state = BtsReversePowerControlState::new_rc1();
-        let _ = state.tick_direct(2, 10.0, Some(RC1_PCG_RAW_HOT_LIMIT_DBFS + 0.1), Some(0));
+        let _ = state.tick_direct(2, 10.0, Some(RC12_PCG_RAW_HOT_LIMIT_DBFS + 0.1), Some(0));
         let _ = state.tick_direct(10, 10.0, Some(-20.0), Some(1));
 
         assert!(state.recent_frame_overpowered());
@@ -884,6 +1019,26 @@ mod tests {
 
         assert!(registry.snapshot(12).is_none());
     }
+
+    #[test]
+    fn valid_frame_history_counts_back_from_the_latest() {
+        let registry = BtsPowerControlRegistry::default();
+        registry.outer_loop_tick(None, 12, true);
+        registry.outer_loop_tick(None, 12, false);
+        let first = registry.valid_frame_at(12, 0).unwrap();
+        assert!(registry.valid_frame_at(12, 1).is_none());
+
+        for _ in 0..VALID_FRAME_HISTORY {
+            registry.outer_loop_tick(None, 12, true);
+        }
+        assert!(
+            registry
+                .valid_frame_at(12, VALID_FRAME_HISTORY - 1)
+                .unwrap()
+                > first
+        );
+        assert!(registry.valid_frame_at(12, VALID_FRAME_HISTORY).is_none());
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -901,11 +1056,16 @@ struct BtsReversePowerControlState {
     burst_bit: u8,
     burst_start_ordinal: Option<u64>,
     burst_steps: u8,
+    consecutive_hot_decisions: u8,
+    last_frame_crc_valid: bool,
+    rc12_epoch_metric_sum: f64,
+    rc12_epoch_metric_count: u32,
     /// Most recent finite control metric and the PCG it came from. A decision
     /// may use it while it is no older than `DIRECT_MAX_MEASUREMENT_AGE_PCGS`.
     last_valid_metric_db: Option<f32>,
     last_valid_metric_abs_pcg: Option<u64>,
     release_hold: bool,
+    recent_valid_frames: VecDeque<std::time::Instant>,
     last_pcg_pilot_db: [f32; 16],
     last_pcg_control_metric_db: [f32; 16],
     last_pcg_raw_power_db: [f32; 16],
@@ -928,6 +1088,15 @@ struct BtsReversePowerControlState {
     raw_power_profile: RawPowerLimiterProfile,
     one_second_metric_window: Option<OneSecondMetricWindow>,
     measured_inner_loop_1s: Option<BtsPowerControlOneSecondMeasurement>,
+    reverse_power_window: Option<ReversePowerWindow>,
+    measured_reverse_power_1s: Option<BtsPowerControlOneSecondMeasurement>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReversePowerWindow {
+    bucket_index: u64,
+    sum_db: f64,
+    count: u32,
 }
 
 impl BtsReversePowerControlState {
@@ -950,7 +1119,7 @@ impl BtsReversePowerControlState {
             RC1_AUTO_MAX_DB,
             RC1_MANUAL_MIN_DB,
             RC1_MANUAL_MAX_DB,
-            RawPowerLimiterProfile::RC1,
+            RawPowerLimiterProfile::RC12,
         )
     }
 
@@ -962,7 +1131,7 @@ impl BtsReversePowerControlState {
             RC2_AUTO_MAX_DB,
             RC2_MANUAL_MIN_DB,
             RC2_MANUAL_MAX_DB,
-            RawPowerLimiterProfile::RC2,
+            RawPowerLimiterProfile::RC12,
         )
     }
 
@@ -998,9 +1167,14 @@ impl BtsReversePowerControlState {
             burst_bit: 0,
             burst_start_ordinal: None,
             burst_steps: 0,
+            consecutive_hot_decisions: 0,
+            last_frame_crc_valid: false,
+            rc12_epoch_metric_sum: 0.0,
+            rc12_epoch_metric_count: 0,
             last_valid_metric_db: None,
             last_valid_metric_abs_pcg: None,
             release_hold: false,
+            recent_valid_frames: VecDeque::with_capacity(VALID_FRAME_HISTORY),
             last_pcg_pilot_db: [f32::NAN; 16],
             last_pcg_control_metric_db: [f32::NAN; 16],
             last_pcg_raw_power_db: [f32::NAN; 16],
@@ -1021,6 +1195,8 @@ impl BtsReversePowerControlState {
             raw_power_profile,
             one_second_metric_window: None,
             measured_inner_loop_1s: None,
+            reverse_power_window: None,
+            measured_reverse_power_1s: None,
         }
     }
 
@@ -1063,6 +1239,34 @@ impl BtsReversePowerControlState {
         self.burst_steps = 0;
         self.last_valid_metric_db = None;
         self.last_valid_metric_abs_pcg = None;
+    }
+
+    fn record_reverse_power(&mut self, abs_pcg: u64, power_dbfs: Option<f32>) {
+        let bucket_index = abs_pcg / SR1_PCGS_PER_SECOND;
+        if let Some(window) = self
+            .reverse_power_window
+            .take_if(|window| window.bucket_index != bucket_index)
+            && window.count > 0
+        {
+            let timestamp_ms = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            self.measured_reverse_power_1s = Some(BtsPowerControlOneSecondMeasurement {
+                timestamp_ms,
+                mean_db: (window.sum_db / f64::from(window.count)) as f32,
+            });
+        }
+        let Some(power_dbfs) = power_dbfs.filter(|db| db.is_finite()) else {
+            return;
+        };
+        let window = self.reverse_power_window.get_or_insert(ReversePowerWindow {
+            bucket_index,
+            sum_db: 0.0,
+            count: 0,
+        });
+        window.sum_db += f64::from(power_dbfs);
+        window.count = window.count.saturating_add(1);
     }
 
     fn record_one_second_metric(&mut self, abs_pcg: u64, metric_db: f32) {
@@ -1140,6 +1344,14 @@ impl BtsReversePowerControlState {
     }
 
     fn outer_loop_tick(&mut self, walsh_code: u8, crc_valid: bool) -> BtsPowerControlSnapshot {
+        self.last_frame_crc_valid = crc_valid;
+        if crc_valid {
+            if self.recent_valid_frames.len() == VALID_FRAME_HISTORY {
+                self.recent_valid_frames.pop_front();
+            }
+            self.recent_valid_frames
+                .push_back(std::time::Instant::now());
+        }
         if self.release_hold {
             return self.snapshot(walsh_code);
         }
@@ -1443,6 +1655,7 @@ impl BtsReversePowerControlState {
             frames_total: self.total_frames,
             frames_crc_error: self.total_crc_errors,
             measured_inner_loop_1s: self.measured_inner_loop_1s,
+            measured_reverse_power_1s: self.measured_reverse_power_1s,
         }
     }
 
@@ -1478,14 +1691,48 @@ impl BtsReversePowerControlState {
         let measurement_abs_pcg = self.last_valid_metric_abs_pcg.filter(|source_abs_pcg| {
             measured_abs_pcg.saturating_sub(*source_abs_pcg) <= DIRECT_MAX_MEASUREMENT_AGE_PCGS
         });
-        let aged_metric_db = measurement_abs_pcg
+        let mut aged_metric_db = measurement_abs_pcg
             .and(self.last_valid_metric_db)
             .unwrap_or(f32::NAN);
+        if self.radio_config != ReverseTrafficRadioConfig::Rc3 {
+            if metric_db.is_finite() {
+                self.rc12_epoch_metric_sum += 10f64.powf(f64::from(metric_db) / 10.0);
+                self.rc12_epoch_metric_count += 1;
+            }
+            if control_epoch {
+                if self.rc12_epoch_metric_count > 0 {
+                    let mean = self.rc12_epoch_metric_sum / f64::from(self.rc12_epoch_metric_count);
+                    aged_metric_db = (10.0 * mean.log10()) as f32;
+                }
+                self.rc12_epoch_metric_sum = 0.0;
+                self.rc12_epoch_metric_count = 0;
+            }
+        }
         let measurement_used = control_epoch && aged_metric_db.is_finite() && !safety_down;
-        let control_steps: u8 = if measurement_used {
+        let rc12_hold = measurement_used
+            && self.radio_config != ReverseTrafficRadioConfig::Rc3
+            && aged_metric_db >= target_db
+            && aged_metric_db < target_db + RC12_DOWN_MARGIN_DB;
+        if measurement_used {
+            self.consecutive_hot_decisions =
+                if aged_metric_db - target_db >= DIRECT_FIVE_STEP_ERROR_DB {
+                    self.consecutive_hot_decisions.saturating_add(1)
+                } else {
+                    0
+                };
+        }
+        let control_steps: u8 = if rc12_hold {
+            0
+        } else if measurement_used {
             let error_db = (target_db - aged_metric_db).abs();
-            if self.radio_config == ReverseTrafficRadioConfig::Rc1 {
-                1
+            if self.radio_config != ReverseTrafficRadioConfig::Rc3 {
+                if self.consecutive_hot_decisions >= RC12_FAST_DOWN_DECISIONS
+                    && self.last_frame_crc_valid
+                {
+                    5
+                } else {
+                    1
+                }
             } else if error_db >= DIRECT_FIVE_STEP_ERROR_DB {
                 5
             } else if error_db >= DIRECT_THREE_STEP_ERROR_DB {
@@ -1504,6 +1751,10 @@ impl BtsReversePowerControlState {
             self.burst_start_ordinal = None;
             self.burst_steps = 0;
             1
+        } else if rc12_hold {
+            self.burst_start_ordinal = None;
+            self.burst_steps = 0;
+            hold_bit
         } else if measurement_used {
             let pcb = u8::from(aged_metric_db >= target_db);
             self.burst_bit = pcb;
@@ -1575,7 +1826,7 @@ impl BtsReversePowerControlState {
         self.tick_direct(measured_abs_pcg, metric_db, raw_power_db, valid_ordinal)
     }
 
-    fn tick_rc3_release_hold(
+    fn tick_release_hold(
         &mut self,
         measured_abs_pcg: u64,
         valid_ordinal: Option<u64>,
@@ -1736,6 +1987,44 @@ impl BtsPowerControlRegistry {
         self.states.lock().remove(&walsh_code);
     }
 
+    /// When `walsh_code` decoded its `back`-th most recent valid reverse frame,
+    /// counting the latest as 0. `None` until it has decoded that many, and
+    /// always for `back` at or past `VALID_FRAME_HISTORY`.
+    pub fn valid_frame_at(&self, walsh_code: u8, back: usize) -> Option<std::time::Instant> {
+        self.states.lock().get(&walsh_code).and_then(|state| {
+            let len = state.recent_valid_frames.len();
+            back.checked_add(1)
+                .and_then(|n| len.checked_sub(n))
+                .map(|index| state.recent_valid_frames[index])
+        })
+    }
+
+    /// Every later decision is a neutral alternating command, whatever the
+    /// measurement reads, so a channel that lost its mobile cannot drive it to
+    /// full power.
+    pub fn enter_release_hold(
+        &self,
+        traffic_channels: &TrafficChannelPool,
+        walsh_code: u8,
+    ) -> bool {
+        let radio_config = Self::traffic_channel_radio_config(traffic_channels, walsh_code);
+        if radio_config == ReverseTrafficRadioConfig::Rc3 {
+            return self.enter_rc3_release_hold(traffic_channels, walsh_code);
+        }
+        if traffic_channels.lookup(walsh_code).is_none() {
+            return false;
+        }
+        let rx_power_adj_dbfs = self.rx_power_adj_dbfs();
+        let mut states = self.states.lock();
+        let (state, _) =
+            Self::state_for_radio_config(&mut states, walsh_code, radio_config, rx_power_adj_dbfs);
+        state.enter_release_hold();
+        log::info!(
+            "power_release_hold[w{walsh_code}]: {radio_config:?} reverse loop held at neutral"
+        );
+        true
+    }
+
     pub fn enter_rc3_release_hold(
         &self,
         traffic_channels: &TrafficChannelPool,
@@ -1854,13 +2143,14 @@ impl BtsPowerControlRegistry {
             if !state.admit_control_abs_pcg(measured_abs_pcg) {
                 return None;
             }
+            state.record_reverse_power(measured_abs_pcg, despread_pilot_power_dbfs);
             if state.release_hold {
-                state.tick_rc3_release_hold(measured_abs_pcg, valid_ordinal)
+                state.tick_release_hold(measured_abs_pcg, valid_ordinal)
             } else {
                 state.tick_direct(
                     measured_abs_pcg,
                     control_metric_db,
-                    radio_config.limiter_power_db(raw_power_db, mobile_power_db),
+                    raw_power_db,
                     valid_ordinal,
                 )
             }

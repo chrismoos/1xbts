@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useLive } from "@/lib/live";
 import Link from "next/link";
 import { Card } from "@/components/card";
 import {
@@ -13,44 +13,10 @@ import {
 /// and UATI pool utilization. Quietly shows "not running" when the AN service
 /// is unreachable (e.g. EV-DO disabled).
 export function HrpdSummaryCard() {
-  const [sessions, setSessions] = useState<Session[] | null>(null);
-  const [allocation, setAllocation] = useState<GetUatiAllocationResponse | null>(
-    null,
-  );
-  const [unavailable, setUnavailable] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    const tick = () => {
-      fetch("/api/an-sessions")
-        .then((r) => r.json())
-        .then((d: { sessions?: Session[]; error?: string }) => {
-          if (cancelled) return;
-          if (d.error) {
-            setUnavailable(true);
-          } else {
-            setUnavailable(false);
-            setSessions(d.sessions ?? []);
-          }
-        })
-        .catch(() => {
-          if (!cancelled) setUnavailable(true);
-        });
-      fetch("/api/an-uati-allocation")
-        .then((r) => r.json())
-        .then((d: GetUatiAllocationResponse & { error?: string }) => {
-          if (cancelled || d.error) return;
-          setAllocation(d);
-        })
-        .catch(() => {});
-    };
-    tick();
-    const id = setInterval(tick, 3000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, []);
+  const liveSessions = useLive<{ sessions?: Session[] }>("/api/an-sessions");
+  const sessions = liveSessions.data ? (liveSessions.data.sessions ?? []) : null;
+  const unavailable = liveSessions.error != null;
+  const allocation = useLive<GetUatiAllocationResponse>("/api/an-uati-allocation").data ?? null;
 
   const openCount =
     sessions?.filter((s) => s.state === SessionState.SESSION_STATE_OPEN)

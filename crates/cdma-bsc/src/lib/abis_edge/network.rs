@@ -39,8 +39,8 @@ use cdma_common::phy::long_code::LongCodeGenerator;
 use cdma_common::traffic::TrafficRxRequest;
 
 use super::{
-    BearerFrame, BearerStats, BtsBearerClient, BtsControlClient, BtsTrafficChannelHandle,
-    ForwardBearerQueue, PchTransferAckEvent,
+    BearerFrame, BearerStats, BtsBearerClient, BtsControlClient, BtsReleaseRequestEvent,
+    BtsTrafficChannelHandle, ForwardBearerQueue, PchTransferAckEvent,
 };
 
 const FLAG_SIGNALING_QUEUE: u8 = 0x01;
@@ -105,9 +105,15 @@ struct NetworkClientInner {
     walsh_to_ccr: HashMap<u8, CallConnectionReference>,
     access_event_tx: Option<mpsc::UnboundedSender<AccessChannelEvent>>,
     pch_ack_events: VecDeque<PchTransferAckEvent>,
+    bts_release_requests: VecDeque<BtsReleaseRequestEvent>,
+    bts_release_request_signal: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl NetworkBtsControlClient {
+    pub async fn set_bts_release_request_signal(&self, signal: Arc<tokio::sync::Notify>) {
+        self.inner.lock().await.bts_release_request_signal = Some(signal);
+    }
+
     /// Connect to a remote BTS Abis agent.
     pub async fn connect(addr: SocketAddr, config: NetworkClientConfig) -> std::io::Result<Self> {
         let (sender, events_rx) = cdma_abis::transport::connect(addr).await?;
@@ -173,6 +179,8 @@ impl NetworkBtsControlClient {
             walsh_to_ccr: HashMap::new(),
             access_event_tx,
             pch_ack_events: VecDeque::new(),
+            bts_release_requests: VecDeque::new(),
+            bts_release_request_signal: None,
         }));
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let (link_down_tx, link_down_rx) = tokio::sync::watch::channel(false);
@@ -424,6 +432,38 @@ impl NetworkBtsControlClient {
             }
             MessageType::BtsReleaseAck => {
                 info!("abis_network: received BtsReleaseAck");
+            }
+            MessageType::BtsReleaseRequest => {
+                let Ok(bytes) = encode(msg) else { return };
+                let Ok(request) = cdma_abis::control::BtsReleaseRequestMessage::decode(&bytes)
+                else {
+                    warn!("abis_network: failed to decode BtsReleaseRequest");
+                    return;
+                };
+                let ccr = request.call_connection_reference;
+                let mut guard = inner.lock().await;
+                let Some(walsh_code) = guard
+                    .walsh_to_ccr
+                    .iter()
+                    .find(|(_, c)| **c == ccr)
+                    .map(|(walsh_code, _)| *walsh_code)
+                else {
+                    warn!("abis_network: BtsReleaseRequest for unknown CCR {:?}", ccr);
+                    return;
+                };
+                warn!(
+                    "abis_network: received BtsReleaseRequest for CCR {:?} walsh={} cause={:?}",
+                    ccr, walsh_code, request.cause
+                );
+                guard
+                    .bts_release_requests
+                    .push_back(BtsReleaseRequestEvent {
+                        walsh_code,
+                        cause: request.cause,
+                    });
+                if let Some(signal) = &guard.bts_release_request_signal {
+                    signal.notify_one();
+                }
             }
             MessageType::BurstResponse => {
                 let Ok(bytes) = encode(msg) else { return };
@@ -715,6 +755,7 @@ impl NetworkBtsControlClient {
         });
 
         Ok(AccessChannelEvent {
+            access_signal: Default::default(),
             event_id: uuid::Uuid::new_v4().to_string(),
             chip_start: 0,
             absolute_chip_start: None,
@@ -1473,6 +1514,13 @@ impl BtsControlClient for NetworkBtsControlClient {
     fn drain_pch_transfer_acks(&self) -> Vec<PchTransferAckEvent> {
         match self.inner.try_lock() {
             Ok(mut guard) => guard.pch_ack_events.drain(..).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn drain_bts_release_requests(&self) -> Vec<BtsReleaseRequestEvent> {
+        match self.inner.try_lock() {
+            Ok(mut guard) => guard.bts_release_requests.drain(..).collect(),
             Err(_) => Vec::new(),
         }
     }

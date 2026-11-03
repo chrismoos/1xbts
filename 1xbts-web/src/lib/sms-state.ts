@@ -13,3 +13,9 @@ export function smsStateColor(state: string): string {
       return "bg-badge-blue-bg text-badge-blue-text";
   }
 }
+
+const IN_FLIGHT_STATES = new Set(["accepted", "paging", "page_response_received"]);
+
+export function smsInFlight(state: string): boolean {
+  return IN_FLIGHT_STATES.has(state);
+}

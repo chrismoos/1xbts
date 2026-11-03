@@ -8,7 +8,10 @@ use super::long_code::LongCodeGenerator;
 
 pub const RC12_PCGS_PER_FRAME: usize = 16;
 pub const RC12_CHIPS_PER_PCG: u64 = 1536;
-const RC12_RANDOMIZER_LC_BITS: usize = 14;
+pub const RC12_RANDOMIZER_LC_BITS: usize = 14;
+/// The randomizer bits start this many chips before the frame they select PCGs
+/// for: the last 14 long-code chips of the preceding frame's next-to-last PCG.
+pub const RC12_RANDOMIZER_LEAD_CHIPS: u64 = RC12_CHIPS_PER_PCG + RC12_RANDOMIZER_LC_BITS as u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rc12ReverseRate {
@@ -25,17 +28,12 @@ pub fn active_pcgs(
     frame_chip_start: u64,
     rate: Rc12ReverseRate,
 ) -> [bool; RC12_PCGS_PER_FRAME] {
-    let mut active = [false; RC12_PCGS_PER_FRAME];
     if rate == Rc12ReverseRate::Full {
-        active.fill(true);
-        return active;
+        return [true; RC12_PCGS_PER_FRAME];
     }
 
-    // The randomizer consumes the last 14 long-code bits in the next-to-last
-    // PCG of the preceding frame: exactly 1536 + 14 chips before the boundary.
     let mut generator = long_code_origin.clone();
-    let offset =
-        frame_chip_start.saturating_sub(RC12_CHIPS_PER_PCG + RC12_RANDOMIZER_LC_BITS as u64);
+    let offset = frame_chip_start.saturating_sub(RC12_RANDOMIZER_LEAD_CHIPS);
     generator.advance_chips(
         usize::try_from(offset).expect("absolute CDMA chip index must fit in usize"),
     );
@@ -43,7 +41,15 @@ pub fn active_pcgs(
     for bit in &mut b {
         *bit = generator.next_chip();
     }
+    active_pcgs_from_bits(&b, rate)
+}
 
+/// Gated-on PCGs selected by randomizer bits `b0..b13`, in long-code order.
+pub fn active_pcgs_from_bits(
+    b: &[u8; RC12_RANDOMIZER_LC_BITS],
+    rate: Rc12ReverseRate,
+) -> [bool; RC12_PCGS_PER_FRAME] {
+    let mut active = [false; RC12_PCGS_PER_FRAME];
     match rate {
         Rc12ReverseRate::Half => {
             for i in 0..8 {
@@ -82,7 +88,7 @@ pub fn active_pcgs(
             active[lower] = true;
             active[upper] = true;
         }
-        Rc12ReverseRate::Full => unreachable!(),
+        Rc12ReverseRate::Full => active.fill(true),
     }
     active
 }

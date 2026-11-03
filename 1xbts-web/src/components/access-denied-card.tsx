@@ -76,7 +76,7 @@ function Action({ mobile }: { mobile: ObservedMobile }) {
 
 export function AccessDeniedCard() {
   const { nodes } = useBaseStations();
-  const directory = useMobileDirectory(REFRESH_MS);
+  const directory = useMobileDirectory();
   const [offset, setOffset] = useState(0);
   const [mobiles, setMobiles] = useState<ObservedMobile[]>([]);
   const [total, setTotal] = useState(0);

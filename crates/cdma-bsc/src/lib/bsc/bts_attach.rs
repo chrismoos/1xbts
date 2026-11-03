@@ -232,6 +232,9 @@ async fn attach_peer_once(
         entry.set_abis_down(format!("Abis connect: {e}"));
         format!("Abis connect: {e}")
     })?;
+    control
+        .set_bts_release_request_signal(bts.bts_release_request_signal())
+        .await;
     let link_down = control.link_down();
     entry.set_control(Arc::new(control));
     Ok(AttachedPeer {

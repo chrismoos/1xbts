@@ -572,6 +572,7 @@ pub struct LocalAbisEndpointConfig {
     pub pilot_pn: u16,
     pub cell_id: cdma_abis::control::typed::CellId,
     pub mscid: u32,
+    pub radio_link_loss_release: bool,
 }
 
 /// A running Abis endpoint: the listener the BSC connects to, and the bearer
@@ -625,6 +626,7 @@ pub async fn spawn_local_abis_endpoint(
         pilot_pn: config.pilot_pn,
         cell_id: config.cell_id,
         mscid: config.mscid,
+        radio_link_loss_release: config.radio_link_loss_release,
     };
     let controller_for_agent = controller.clone();
     let controller_for_frames = controller.clone();
@@ -654,6 +656,9 @@ pub async fn spawn_local_abis_endpoint(
             agent.set_paging_state(paging_state.clone());
             let mut tick_interval = tokio::time::interval(std::time::Duration::from_secs(1));
             tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut radio_link_interval =
+                tokio::time::interval(super::abis_agent::RADIO_LINK_CHECK_INTERVAL);
+            radio_link_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             let deliver_agent_events = |events: Vec<AbisAgentEvent>,
                                         ctrl: &Arc<TrafficResourceController>|
@@ -677,10 +682,7 @@ pub async fn spawn_local_abis_endpoint(
                             info!("BTS: TrafficReleased ccr={:?} walsh={}", ccr, walsh_code);
                         }
                         AbisAgentEvent::BtsReleaseInitiated { ccr, walsh_code } => {
-                            info!(
-                                "BTS: BtsReleaseInitiated ccr={:?} walsh={}",
-                                ccr, walsh_code
-                            );
+                            info!("BTS: requested release ccr={:?} walsh={}", ccr, walsh_code);
                         }
                         AbisAgentEvent::PagingRetryFailed { responses } => {
                             abis_responses.extend(responses);
@@ -729,6 +731,15 @@ pub async fn spawn_local_abis_endpoint(
                                 warn!("BTS Abis send failed: {e}");
                             }
                         }
+                    }
+                    _ = radio_link_interval.tick() => {
+                        let (link_responses, link_events) = agent.check_radio_links(std::time::Instant::now());
+                        for resp in link_responses {
+                            if let Err(e) = sender.send(&resp).await {
+                                warn!("BTS Abis send failed: {e}");
+                            }
+                        }
+                        let _ = deliver_agent_events(link_events, &controller_for_frames);
                     }
                     _ = tick_interval.tick() => {
                         let events = agent.tick_all_sessions();
@@ -891,6 +902,7 @@ pub async fn spawn_configured_local_abis_endpoint(
                 sector: bts_config.sector,
             },
             mscid: bts_config.overhead.sid as u32,
+            radio_link_loss_release: bts_config.abis.radio_link_loss_release,
         },
         resource_controller,
         reverse_bearer_rx,

@@ -161,6 +161,7 @@ fn test_packet_service() -> Arc<PacketServiceImpl> {
 
 fn synthetic_origination_so7(esn: u32) -> AccessChannelEvent {
     AccessChannelEvent {
+        access_signal: Default::default(),
         cell: Some(TEST_CELL),
         event_id: "synth-origination-so7".to_string(),
         chip_start: 2_000_000,
@@ -956,6 +957,7 @@ fn decode_rc3_bs_ack_from_forward_traffic_iq_samples(
 
 fn synthetic_traffic_preamble(walsh_code: u8) -> AccessChannelEvent {
     AccessChannelEvent {
+        access_signal: Default::default(),
         cell: Some(TEST_CELL),
         event_id: "synth-preamble".to_string(),
         chip_start: 3_000_000,
@@ -1032,6 +1034,7 @@ fn synthetic_traffic_preamble(walsh_code: u8) -> AccessChannelEvent {
 
 fn synthetic_ms_ack_order(walsh_code: u8) -> AccessChannelEvent {
     AccessChannelEvent {
+        access_signal: Default::default(),
         cell: Some(TEST_CELL),
         event_id: "synth-ms-ack".to_string(),
         chip_start: 3_100_000,
@@ -1108,6 +1111,7 @@ fn synthetic_ms_ack_order(walsh_code: u8) -> AccessChannelEvent {
 
 fn synthetic_service_connect_completion(walsh_code: u8) -> AccessChannelEvent {
     AccessChannelEvent {
+        access_signal: Default::default(),
         cell: Some(TEST_CELL),
         event_id: "synth-scc".to_string(),
         chip_start: 3_200_000,
@@ -1473,6 +1477,7 @@ async fn test_e2e_so7_packet_data_full_negotiation() {
                 pilot_pn: 0,
                 cell_id: CellId { cell: 1, sector: 1 },
                 mscid: 1,
+                radio_link_loss_release: false,
             },
             NetworkClientConfig {
                 cell_id: CellId { cell: 1, sector: 1 },
@@ -2112,6 +2117,7 @@ async fn test_e2e_so7_packet_data_phy_bidirectional() {
                 pilot_pn: 0,
                 cell_id: CellId { cell: 1, sector: 1 },
                 mscid: 1,
+                radio_link_loss_release: false,
             },
             NetworkClientConfig {
                 cell_id: CellId { cell: 1, sector: 1 },
@@ -2842,6 +2848,7 @@ async fn test_e2e_so7_rc3_reverse_preamble_queues_bs_ack() {
                     pilot_pn: 0,
                     cell_id: CellId { cell: 1, sector: 1 },
                     mscid: 1,
+                    radio_link_loss_release: false,
                 },
                 NetworkClientConfig {
                     cell_id: CellId { cell: 1, sector: 1 },
@@ -3511,6 +3518,7 @@ fn crc16_ccitt(bits: &[u8]) -> u16 {
 
 fn synthetic_origination_so6(esn: u32) -> AccessChannelEvent {
     AccessChannelEvent {
+        access_signal: Default::default(),
         cell: Some(TEST_CELL),
         event_id: "synth-origination-so6".to_string(),
         chip_start: 2_000_000,
@@ -3588,6 +3596,7 @@ fn synthetic_origination_so6(esn: u32) -> AccessChannelEvent {
 #[allow(dead_code)]
 fn synthetic_traffic_data_burst(walsh_code: u8, sms_payload: Vec<u8>) -> AccessChannelEvent {
     AccessChannelEvent {
+        access_signal: Default::default(),
         cell: Some(TEST_CELL),
         event_id: "synth-data-burst".to_string(),
         chip_start: 3_400_000,
@@ -4063,6 +4072,7 @@ async fn test_e2e_so6_sms_data_burst_phy_bidirectional() {
                     pilot_pn: 0,
                     cell_id: CellId { cell: 1, sector: 1 },
                     mscid: 1,
+                    radio_link_loss_release: false,
                 },
                 NetworkClientConfig {
                     cell_id: CellId { cell: 1, sector: 1 },

@@ -233,6 +233,9 @@ pub(crate) struct TrafficChannelInfo {
     pub(crate) voice_session_id: Option<Uuid>,
     /// Caller/callee role within the voice session.
     pub(crate) voice_leg_role: Option<VoiceLegRole>,
+    /// The assignment told the mobile to skip alerting, so it enters
+    /// conversation on its own and never sends a Connect Order.
+    pub(crate) bypass_alert_answer: bool,
     /// MSC call correlation for channels controlled through the A1 seam.
     pub(crate) a1_call_id: Option<u64>,
     /// Circuit identity assigned by MSC in AssignmentRequest. Used for voice
@@ -315,6 +318,7 @@ impl TrafficChannelInfo {
             long_code_privacy: None,
             voice_session_id,
             voice_leg_role,
+            bypass_alert_answer: false,
             a1_call_id,
             msc_circuit_id: None,
             msc_bearer_local_addr: None,

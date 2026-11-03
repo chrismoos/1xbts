@@ -1,59 +1,39 @@
 "use client";
 
 import { VoicePrivacyIndicator } from "@/components/voice-privacy-indicator";
-import { useEffect, useState, useCallback, useRef, use, useMemo, type FormEvent } from "react";
+import { useEffect, useLayoutEffect, useState, useCallback, useRef, use, useMemo, type FormEvent, type ReactNode } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Card, Stat } from "@/components/card";
+import { useAuthenticationVerdicts } from "@/components/authentication-activity";
+import { AccessStatus } from "@/components/access-activity";
+import { MobileActivity } from "@/components/mobile-activity";
+import { Pager } from "@/components/pager";
 import {
-  AuthenticationActivity,
-  AuthenticationMark,
-  useAuthenticationVerdicts,
-} from "@/components/authentication-activity";
-import { verdictForAccess } from "@/lib/authentication-verdict";
-import { AccessActivity, AccessStatus } from "@/components/access-activity";
-import { RecentMessagesCard } from "@/components/recent-messages-card";
+  MESSAGE_CATEGORY_LABEL,
+  type MessageCategory,
+  MessageListHeader,
+  MessageRow,
+  messageView,
+} from "@/components/message-row";
+import { SendSmsDialog } from "@/components/mobile/send-sms-dialog";
+import { Toast, useToast } from "@/components/toast";
+import { SmsList } from "@/components/mobile/sms-list";
 import { StartOtasp } from "@/components/start-otasp";
 import { RecentOtaspCard } from "@/components/recent-otasp-card";
-import { TimeSeriesChart, type Series } from "@/components/time-series-chart";
+import { TimeSeriesChart } from "@/components/time-series-chart";
 import { esnManufacturer } from "@/lib/esn-manufacturer";
-import {
-  A1Detail,
-  LaneBadge,
-  AccessDetail,
-  HrpdAccessDetail,
-  HrpdSessionDetail,
-  HrpdTrafficDetail,
-  PagingDetail,
-  TrafficDetail,
-  formatAccessSummary,
-  formatAccessChannel,
-  formatHrpdAccessSummary,
-  formatHrpdSessionSummary,
-  formatHrpdTrafficSummary,
-  hrpdDirectionClass,
-  hrpdDirectionLabel,
-  shouldHideAccessEvent,
-  formatPagingSummary,
-  formatTrafficChannel,
-  formatTrafficSummary,
-} from "@/components/message-detail";
+import { shouldHideAccessEvent } from "@/components/message-detail";
 import {
   fingerprintAccessEvent,
   fingerprintPagingEvent,
   fingerprintTrafficEvent,
 } from "@/lib/event-fingerprint";
-import { useEventStream } from "@/lib/use-event-stream";
+import { liveSocket, useLive } from "@/lib/live";
+import { useEventStream, type EventStreamOptions } from "@/lib/use-event-stream";
 import { hrpdTimestampNsToUs } from "@/lib/hrpd-correlation";
 import { type LogEntry, makeLogEntryId, makeSortKey, sortLogEntries, formatTime } from "@/lib/message-log";
-import {
-  a1DirectionClass,
-  a1DirectionLabel,
-  a1TimestampUs,
-  a1TypeName,
-  formatA1Summary,
-  type A1LogEvent,
-} from "@/lib/a1-event";
+import { a1TimestampUs, type A1LogEvent } from "@/lib/a1-event";
 import { cellLabel, cellToken, peerIdForCell } from "@/lib/cell";
 import { useBtsList } from "@/lib/use-bts-list";
 import { formatEsn, formatMeid } from "@/lib/format";
@@ -67,6 +47,16 @@ import type {
   HrpdTrafficEvent,
 } from "@/lib/proto/events/v1/an";
 import type { SubscriberIdentity } from "@/lib/proto/hlr/v1/service";
+import type { AccessSignal } from "@/lib/proto/bsc/v1/service";
+import {
+  Bars,
+  RxPowerCard,
+  SignalQualityCard,
+  accessSignalBars,
+  barsTier,
+} from "@/components/signal-quality";
+import { CALL_KIND_BADGE, CALL_KIND_LABEL, callKind, callStateLabel } from "@/lib/call-kind";
+import { measuredReverseDb, recentMedianDb, reverseMetricLabel, reverseQualityBars } from "@/lib/reverse-quality";
 
 interface MobileInfo {
   address: string;
@@ -78,11 +68,8 @@ interface MobileInfo {
   meid?: string;
   pgslot?: number;
   slotCycleIndex: number;
-  snrDb?: number;
-  signalPowerDb?: number;
-  demodQualityPct?: number;
-  rxPowerDbm?: number;
-  rxLevelDbfs?: number;
+  accessSignal?: AccessSignal;
+  recentAccessEbNtDb?: number[];
   trafficPower?: {
     targetEbNtDb: number;
     effectiveTargetEbNtDb: number;
@@ -164,6 +151,13 @@ interface SubscriberDetail {
 }
 
 const MAX_MESSAGES = 200;
+const NO_PACKET_SESSIONS: PacketSessionInfo[] = [];
+const MESSAGE_PAGE_SIZES = [25, 50, 100] as const;
+// C.S0005: a slot cycle is 16 x 2^SLOT_CYCLE_INDEX slots of 80 ms.
+const SLOT_CYCLE_BASE_SECONDS = 1.28;
+
+type MobileTab = "overview" | "call" | "messages" | "sms" | "otasp" | "activity" | "data";
+const RECENT_MESSAGE_ROWS = 7;
 
 function countActivePcgs(pcgSnrDb: number[], activePcgMask?: boolean[]): number {
   if (activePcgMask && activePcgMask.length === pcgSnrDb.length) {
@@ -243,6 +237,63 @@ function defaultSubscriberName(mobile: MobileInfo): string {
   return "Mobile Station";
 }
 
+function subscriberTitle(subscriberId: string, displayName: string): string {
+  return displayName || `Subscriber ${subscriberId.slice(-4)}`;
+}
+
+function firstVisibleRow(container: HTMLElement | null): { id: string; top: number } | null {
+  if (!container || container.getBoundingClientRect().top >= 0) return null;
+  for (const row of container.querySelectorAll<HTMLElement>("[data-entry-id]")) {
+    const rect = row.getBoundingClientRect();
+    if (rect.bottom > 0 && row.dataset.entryId) return { id: row.dataset.entryId, top: rect.top };
+  }
+  return null;
+}
+
+function IdentityRow({
+  label,
+  observed,
+  provisioned,
+}: {
+  label: string;
+  observed: string | null;
+  provisioned: string | null;
+}) {
+  if (observed && provisioned && observed.toUpperCase() !== provisioned.toUpperCase()) {
+    return (
+      <div className="flex justify-between gap-3 py-1 px-2 -mx-2 my-0.5 rounded bg-accent-amber-bg">
+        <span className="text-muted text-sm">{label}</span>
+        <span className="text-sm font-mono text-right">
+          <span className="text-secondary">{observed}</span>{" "}
+          <span className="text-accent-amber">≠ {provisioned} provisioned</span>
+        </span>
+      </div>
+    );
+  }
+  return (
+    <div className="flex justify-between gap-3 py-0.5">
+      <span className="text-muted text-sm">{label}</span>
+      <span className="text-secondary text-sm font-mono text-right">
+        {observed ?? provisioned ?? "Not available"}
+        {observed && provisioned && (
+          <span className="text-accent-green ml-1.5" title="Matches provisioning">✓</span>
+        )}
+        {!observed && provisioned && <span className="text-muted text-xs ml-1.5">provisioned, not seen</span>}
+      </span>
+    </div>
+  );
+}
+
+function Tile({ label, sub, children }: { label: string; sub?: string; children: ReactNode }) {
+  return (
+    <div className="rounded-lg bg-surface-raised px-3 py-2">
+      <div className="text-[10px] uppercase tracking-wide text-muted">{label}</div>
+      <div className="mt-0.5 text-lg font-semibold text-primary">{children}</div>
+      {sub && <div className="text-[11px] text-muted">{sub}</div>}
+    </div>
+  );
+}
+
 function addressMatchesMobile(
   pagingAddr: PagingEvent["header"],
   mobile: MobileInfo
@@ -303,24 +354,41 @@ export default function MobileDetailPage({
   const address = decodeURIComponent(id);
   const router = useRouter();
 
-  const [mobile, setMobile] = useState<MobileInfo | null>(null);
+  const liveMobiles = useLive<MobileInfo[]>("/api/mobiles");
+  const livePackets = useLive<{ sessions?: PacketSessionInfo[] }>("/api/packet-sessions");
+  const mobile = useMemo(
+    () => (Array.isArray(liveMobiles.data) ? liveMobiles.data.find((m) => m.address === address) ?? null : null),
+    [liveMobiles.data, address],
+  );
   const authImsi = mobile?.imsi;
   const authImsis = useMemo(() => (authImsi ? [authImsi] : []), [authImsi]);
   const { events: verdicts } = useAuthenticationVerdicts(authImsis, mobile?.esn ?? undefined);
-  const [loading, setLoading] = useState(true);
+  const loading = liveMobiles.loading;
   const { cells } = useBtsList();
   const [messages, setMessages] = useState<LogEntry[]>([]);
+  const replayEvents: EventStreamOptions = { replay: true, enabled: mobile != null };
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const [packetSessions, setPacketSessions] = useState<PacketSessionInfo[]>([]);
+  const packetSessions = livePackets.data?.sessions ?? NO_PACKET_SESSIONS;
   const [subscriberName, setSubscriberName] = useState("");
   const [subscriberIdentities, setSubscriberIdentities] = useState<SubscriberIdentity[]>([]);
-  const [identityTab, setIdentityTab] = useState<"subscriber" | "registration">("registration");
+  const [tab, setTab] = useState<MobileTab>("overview");
+  const [msgPage, setMsgPage] = useState(0);
+  const [msgPageSize, setMsgPageSize] = useState<number>(MESSAGE_PAGE_SIZES[0]);
+  const [msgPaused, setMsgPaused] = useState(false);
+  const [shownMessages, setShownMessages] = useState<LogEntry[]>([]);
+  const [pinned, setPinned] = useState<LogEntry[]>([]);
+  const messageListRef = useRef<HTMLDivElement>(null);
+  const scrollAnchorRef = useRef<{ id: string; top: number } | null>(null);
+  const [msgFilter, setMsgFilter] = useState<MessageCategory | "all">("all");
+  const [msgQuery, setMsgQuery] = useState("");
+  const [focusEntryId, setFocusEntryId] = useState<string | null>(null);
+  const [smsOpen, setSmsOpen] = useState(false);
+  const [smsRefresh, setSmsRefresh] = useState(0);
+  const [toast, showToast] = useToast();
+  const [callPending, setCallPending] = useState(false);
+  const [callResult, setCallResult] = useState<SmsResult | null>(null);
 
   // SMS form
-  const [smsFrom, setSmsFrom] = useState("5551234");
-  const [smsText, setSmsText] = useState("");
-  const [smsSending, setSmsSending] = useState(false);
-  const [smsResult, setSmsResult] = useState<SmsResult | null>(null);
   const [showCreateSubscriber, setShowCreateSubscriber] = useState(false);
   const [createPhoneNumber, setCreatePhoneNumber] = useState("");
   const [createDisplayName, setCreateDisplayName] = useState("");
@@ -338,7 +406,6 @@ export default function MobileDetailPage({
     fer: number[];
   }>({ timestamps: [], target: [], measured: [], forwardGain: [], fer: [] });
   const prevWalshRef = useRef<number | undefined>(undefined);
-  const lastStatsUpdateRef = useRef<number>(0);
 
   // Update chart history from a mobile snapshot (called at 500ms intervals).
   const updateChartHistory = useCallback((ms: MobileInfo) => {
@@ -410,55 +477,11 @@ export default function MobileDetailPage({
     }
   }, []);
 
-  const fetchMobile = useCallback(async () => {
-    try {
-      const now = Date.now();
-      const statsStale = now - lastStatsUpdateRef.current >= 1000;
-
-      const fetches: Promise<Response>[] = [fetch("/api/mobiles")];
-      if (statsStale) {
-        fetches.push(fetch("/api/packet-sessions"));
-      }
-      const [mobileRes, packetRes] = await Promise.all(fetches);
-
-      if (mobileRes.ok) {
-        const data: MobileInfo[] = await mobileRes.json();
-        if (data && !("error" in data)) {
-          const ms = data.find((m) => m.address === address);
-          if (ms) {
-            // Always update chart (fast path)
-            updateChartHistory(ms);
-            // Only update stats/UI state at 1s intervals
-            if (statsStale) {
-              setMobile(ms);
-              lastStatsUpdateRef.current = now;
-            }
-          }
-        }
-      }
-
-      if (statsStale && packetRes?.ok) {
-        const packetData = await packetRes.json();
-        if (!packetData.error) {
-          setPacketSessions(packetData.sessions || []);
-        }
-      }
-    } catch {
-      // ignore
-    } finally {
-      setLoading(false);
-    }
-  }, [address, updateChartHistory]);
-
   useEffect(() => {
-    fetchMobile();
-    const interval = setInterval(fetchMobile, 500);
-    return () => clearInterval(interval);
-  }, [fetchMobile]);
+    if (mobile) updateChartHistory(mobile);
+  }, [mobile, updateChartHistory]);
 
-  useEffect(() => {
-    setIdentityTab(mobile?.subscriberId ? "subscriber" : "registration");
-  }, [mobile?.subscriberId]);
+  const refreshMobile = useCallback(() => liveSocket().refresh("/api/mobiles"), []);
 
   useEffect(() => {
     if (!mobile?.subscriberId) {
@@ -521,7 +544,6 @@ export default function MobileDetailPage({
     });
   }, []);
 
-  // Shared SSE via BroadcastChannel, filter to this MS
   useEventStream("paging", useCallback((data: string) => {
     if (!mobile) return;
     const event: PagingEvent = JSON.parse(data);
@@ -538,7 +560,7 @@ export default function MobileDetailPage({
         seenCount: 1,
       });
     }
-  }, [addMessage, mobile]));
+  }, [addMessage, mobile]), replayEvents);
 
   useEventStream("traffic", useCallback((data: string) => {
     if (!mobile) return;
@@ -556,7 +578,7 @@ export default function MobileDetailPage({
         seenCount: 1,
       });
     }
-  }, [addMessage, mobile]));
+  }, [addMessage, mobile]), replayEvents);
 
   useEventStream("access", useCallback((data: string) => {
     if (!mobile) return;
@@ -574,7 +596,7 @@ export default function MobileDetailPage({
         seenCount: 1,
       });
     }
-  }, [addMessage, mobile]));
+  }, [addMessage, mobile]), replayEvents);
 
   useEventStream("hrpd-session", useCallback((data: string) => {
     if (!mobile) return;
@@ -592,7 +614,7 @@ export default function MobileDetailPage({
       event,
       seenCount: 1,
     });
-  }, [addMessage, mobile]));
+  }, [addMessage, mobile]), replayEvents);
 
   useEventStream("hrpd-access", useCallback((data: string) => {
     if (!mobile) return;
@@ -610,7 +632,7 @@ export default function MobileDetailPage({
       event,
       seenCount: 1,
     });
-  }, [addMessage, mobile]));
+  }, [addMessage, mobile]), replayEvents);
 
   useEventStream("hrpd-traffic", useCallback((data: string) => {
     if (!mobile) return;
@@ -628,7 +650,7 @@ export default function MobileDetailPage({
       event,
       seenCount: 1,
     });
-  }, [addMessage, mobile]));
+  }, [addMessage, mobile]), replayEvents);
 
   useEventStream("a1", useCallback((data: string) => {
     if (!mobile) return;
@@ -645,42 +667,7 @@ export default function MobileDetailPage({
       event,
       seenCount: 1,
     });
-  }, [addMessage, mobile]));
-
-  const sendSms = async () => {
-    if (!smsText.trim()) return;
-    setSmsSending(true);
-    setSmsResult(null);
-    try {
-      // Prefer subscriber phone number (HLR-resolved). For non-subscriber
-      // mobiles fall back to addressing by IMSI directly.
-      const destinationNumber = mobile?.phoneNumber || undefined;
-      const destinationImsi = destinationNumber ? undefined : mobile?.imsi || undefined;
-      const res = await fetch("/api/sms", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          originatingNumber: smsFrom,
-          text: smsText,
-          destinationNumber,
-          destinationImsi,
-        }),
-      });
-      const data: SmsResult = await res.json();
-      setSmsResult(data);
-      if (data.accepted) {
-        setSmsText("");
-        setTimeout(fetchMobile, 1000);
-      }
-    } catch (err) {
-      setSmsResult({
-        accepted: false,
-        message: err instanceof Error ? err.message : "unknown error",
-      });
-    } finally {
-      setSmsSending(false);
-    }
-  };
+  }, [addMessage, mobile]), replayEvents);
 
   const openCreateSubscriber = useCallback(() => {
     if (!mobile) return;
@@ -728,14 +715,14 @@ export default function MobileDetailPage({
         router.push(`/subscribers/${encodeURIComponent(data.subscriber.subscriberId)}`);
         return;
       }
-      await fetchMobile();
+      refreshMobile();
       setShowCreateSubscriber(false);
     } catch (err) {
       setCreateError(err instanceof Error ? err.message : "unknown error");
     } finally {
       setCreatingSubscriber(false);
     }
-  }, [createDisplayName, createPhoneNumber, fetchMobile, mobile, router]);
+  }, [createDisplayName, createPhoneNumber, refreshMobile, mobile, router]);
 
   const applyPowerOverride = useCallback(async (payload: { targetDb?: number; clear?: boolean }) => {
     if (mobile?.trafficWalshCode == null) return;
@@ -764,13 +751,13 @@ export default function MobileDetailPage({
       } else if (payload.clear) {
         setPowerDraft("");
       }
-      await fetchMobile();
+      refreshMobile();
     } catch (err) {
       setPowerOverrideError(err instanceof Error ? err.message : "unknown error");
     } finally {
       setPowerOverridePending(false);
     }
-  }, [fetchMobile, mobile?.trafficWalshCode, mobile?.servingCell]);
+  }, [refreshMobile, mobile?.trafficWalshCode, mobile?.servingCell]);
 
   const pinPowerOverride = useCallback(async () => {
     const targetDb = Number(powerDraft.trim());
@@ -784,6 +771,68 @@ export default function MobileDetailPage({
   const clearPowerOverride = useCallback(async () => {
     await applyPowerOverride({ clear: true });
   }, [applyPowerOverride]);
+
+  const messageOpen = shownMessages.some((entry) => expanded.has(entry.id));
+  const holdMessages = msgPaused || messageOpen || msgPage > 0;
+
+  useEffect(() => {
+    if (holdMessages) return;
+    scrollAnchorRef.current = firstVisibleRow(messageListRef.current);
+    setShownMessages(messages);
+  }, [messages, holdMessages]);
+
+  useLayoutEffect(() => {
+    const anchor = scrollAnchorRef.current;
+    scrollAnchorRef.current = null;
+    if (!anchor || !messageListRef.current) return;
+    const row = messageListRef.current.querySelector(`[data-entry-id="${CSS.escape(anchor.id)}"]`);
+    if (row) window.scrollBy(0, row.getBoundingClientRect().top - anchor.top);
+  }, [shownMessages]);
+
+  const heldMessageCount = useMemo(() => {
+    const shownIds = new Set(shownMessages.map((entry) => entry.id));
+    return messages.filter((entry) => !shownIds.has(entry.id)).length;
+  }, [messages, shownMessages]);
+
+  const showHeldMessages = useCallback(() => {
+    setMsgPage(0);
+    setShownMessages(messages);
+  }, [messages]);
+
+  const togglePin = useCallback((entry: LogEntry) => {
+    setPinned((prev) =>
+      prev.some((p) => p.id === entry.id) ? prev.filter((p) => p.id !== entry.id) : [entry, ...prev],
+    );
+  }, []);
+
+  useEffect(() => {
+    if (!focusEntryId || tab !== "messages") return;
+    const row = messageListRef.current?.querySelector(`[data-entry-id="${CSS.escape(focusEntryId)}"]`);
+    row?.scrollIntoView({ block: "center" });
+    setFocusEntryId(null);
+  }, [focusEntryId, tab, shownMessages]);
+
+  const placeCall = useCallback(async () => {
+    if (!mobile?.subscriberId) return;
+    setCallPending(true);
+    setCallResult(null);
+    try {
+      const res = await fetch("/api/calls", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ subscriberId: mobile.subscriberId }),
+      });
+      const data = await res.json();
+      setCallResult({
+        accepted: Boolean(data.accepted),
+        message: data.message || (data.accepted ? "Calling" : `HTTP ${res.status}`),
+      });
+    } catch (err) {
+      setCallResult({ accepted: false, message: err instanceof Error ? err.message : "unknown error" });
+    } finally {
+      setCallPending(false);
+    }
+  }, [mobile?.subscriberId]);
 
   const primarySubscriberIdentity = useMemo(
     () =>
@@ -892,518 +941,552 @@ export default function MobileDetailPage({
     return false;
   });
 
+  const pageTitle = mobile.subscriberId
+    ? subscriberTitle(mobile.subscriberId, subscriberName)
+    : formatMobileTitle(mobile);
+  const onCall = mobile.trafficWalshCode != null;
+  const activeTab: MobileTab = tab === "call" && !onCall ? "overview" : tab;
+  const deviceEsn = mobile.esn ?? primarySubscriberIdentity?.esn;
+  const manufacturer = deviceEsn != null ? (esnManufacturer(deviceEsn) ?? null) : null;
+  const provisioned = Boolean(mobile.subscriberId);
+  const identityPairs: [string, string | null, string | null][] = [
+    ["IMSI", mobile.imsi || null, provisioned ? provisionedImsi : null],
+    ["MEID", observedMeid, provisioned ? provisionedMeid : null],
+    ["ESN", observedEsnHex, provisioned ? provisionedEsnHex : null],
+  ];
+  const mismatched = identityPairs
+    .filter(([, seen, prov]) => seen && prov && seen.toUpperCase() !== prov.toUpperCase())
+    .map(([label]) => label);
+  const pagingLabel = `slot ${mobile.pgslot ?? "-"} · every ${(
+    SLOT_CYCLE_BASE_SECONDS * 2 ** mobile.slotCycleIndex
+  ).toFixed(2)} s`;
+  const kind = callKind(mobile.trafficServiceOption);
+  const reverseMeasuredDb = trafficPower
+    ? (recentMedianDb(powerHistoryRef.current.measured) ?? measuredReverseDb(trafficPower))
+    : undefined;
+  const reverseBars = reverseQualityBars(trafficPower?.reverseRadioConfig, reverseMeasuredDb);
+  const headerBars = trafficPower ? reverseBars : accessSignalBars(mobile.accessSignal);
+  const headerSignalValue =
+    trafficPower && reverseMeasuredDb != null
+      ? `${reverseMeasuredDb.toFixed(1)} dB ${reverseMetricLabel(trafficPower.reverseRadioConfig)} reverse`
+      : mobile.accessSignal
+        ? `${mobile.accessSignal.ebNtDb.toFixed(1)} dB Eb/Nt access`
+        : "No measurement";
+  const messageCtx = {
+    mobile: { imsi: mobile.imsi ?? undefined, esn: mobile.esn ?? undefined },
+    verdicts,
+    cells,
+  };
+  const query = msgQuery.trim().toLowerCase();
+  const shownViews = shownMessages.map((entry) => ({ entry, view: messageView(entry, messageCtx) }));
+  const categories = [...new Set(shownViews.map(({ view }) => view.category))];
+  const filteredViews = shownViews.filter(
+    ({ view }) =>
+      (msgFilter === "all" || view.category === msgFilter) &&
+      (!query || `${view.type} ${view.summary} ${view.channel}`.toLowerCase().includes(query)),
+  );
+  const filteredPages = Math.max(1, Math.ceil(filteredViews.length / msgPageSize));
+  const filteredPage = Math.min(msgPage, filteredPages - 1);
+  const pageViews = filteredViews.slice(filteredPage * msgPageSize, (filteredPage + 1) * msgPageSize);
+  const liveLabel = msgPaused
+    ? "Paused"
+    : messageOpen
+      ? "Paused while a message is open"
+      : filteredPage > 0
+        ? `Paused on page ${filteredPage + 1}`
+        : "Live";
+  const tabs: { id: MobileTab; label: string; badge?: string }[] = [
+    { id: "overview", label: "Overview" },
+    ...(onCall ? [{ id: "call" as const, label: "Call", badge: "live" }] : []),
+    { id: "messages", label: "Messages", badge: String(messages.length) },
+    { id: "sms", label: "SMS" },
+    { id: "otasp", label: "OTASP" },
+    { id: "activity", label: "Activity" },
+    { id: "data", label: "Data", badge: String(mobilePacketSessions.length) },
+  ];
+
+  const openMessage = (id: string) => {
+    setTab("messages");
+    setMsgFilter("all");
+    setMsgQuery("");
+    setMsgPage(0);
+    setShownMessages(messages);
+    setExpanded((prev) => new Set(prev).add(id));
+    setFocusEntryId(id);
+  };
+
+  const pinControl = (entry: LogEntry) => (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation();
+        togglePin(entry);
+      }}
+      className="rounded-md border border-border-input px-2 py-0.5 text-[11px] text-secondary hover:bg-hover"
+    >
+      {pinned.some((p) => p.id === entry.id) ? "Unpin" : "Pin"}
+    </button>
+  );
+
+  const reverseTileClass =
+    reverseMeasuredDb != null && reverseTargetDb != null && reverseMeasuredDb < reverseTargetDb - 1
+      ? "text-accent-red"
+      : "text-primary";
+
   return (
-    <div className="max-w-7xl mx-auto space-y-6">
-      <div className="flex items-center gap-4">
-        <Link
-          href="/mobiles"
-          className="text-sm text-muted hover:text-secondary"
-        >
-          &larr; Mobiles
-        </Link>
-        <div className="min-w-0">
-          <h1 className="text-lg font-bold font-mono">{formatMobileTitle(mobile)}</h1>
-          <div className="text-xs text-muted font-mono truncate">
-            Registered IMSI {mobile.imsi || "Not Available"}
-            {observedMeid ? ` / MEID ${observedMeid}` : ""}
+    <div className="max-w-7xl mx-auto">
+      <Link href="/mobiles" className="text-sm text-muted hover:text-secondary">
+        &larr; Mobiles
+      </Link>
+      <div className="mt-3 flex flex-wrap items-center gap-x-6 gap-y-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <h1 className="text-xl font-semibold">{pageTitle}</h1>
+            <span
+              className={`text-xs px-2 py-0.5 rounded ${
+                mobile.state === "Registered"
+                  ? "bg-badge-green-bg text-badge-green-text"
+                  : mobile.state === "Paged"
+                    ? "bg-badge-yellow-bg text-badge-yellow-text"
+                    : mobile.state === "TrafficAssigning" || mobile.state === "TrafficActive"
+                      ? "bg-badge-purple-bg text-badge-purple-text"
+                      : "bg-badge-blue-bg text-badge-blue-text"
+              }`}
+            >
+              {mobile.state}
+            </span>
+            {mobile.voiceCallState && (
+              <span className="inline-flex items-center gap-1.5 text-xs px-2 py-0.5 rounded bg-surface-raised text-secondary">
+                {callStateLabel(mobile.voiceCallState)}
+                <VoicePrivacyIndicator status={mobile.voicePrivacy} />
+              </span>
+            )}
+            {mismatched.length > 0 && (
+              <span className="text-xs px-2 py-0.5 rounded bg-accent-amber-bg text-accent-amber">
+                {mismatched.join(", ")} mismatch
+              </span>
+            )}
+          </div>
+          <div className="mt-1 text-xs text-muted font-mono truncate">
+            {[
+              mobile.phoneNumber && mobile.phoneNumber !== pageTitle ? mobile.phoneNumber : null,
+              mobile.imsi ? `IMSI ${mobile.imsi}` : null,
+              observedMeid ? `MEID ${observedMeid}` : null,
+              observedEsnHex ? `ESN ${observedEsnHex}` : null,
+            ]
+              .filter(Boolean)
+              .join(" · ")}
+          </div>
+          <div className="text-xs text-muted">
+            {[
+              manufacturer,
+              `P_REV ${mobile.mobPRev}`,
+              mobile.servingCell ? cellLabel(mobile.servingCell) : null,
+              mobile.lastHeardMs ? `last heard ${formatTime(mobile.lastHeardMs * 1000)}` : null,
+            ]
+              .filter(Boolean)
+              .join(" · ")}
           </div>
         </div>
-        <span
-          className={`text-xs px-2 py-0.5 rounded ${
-            mobile.state === "Registered"
-              ? "bg-badge-green-bg text-badge-green-text"
-              : mobile.state === "Paged"
-                ? "bg-badge-yellow-bg text-badge-yellow-text"
-                : mobile.state === "TrafficAssigning" || mobile.state === "TrafficActive"
-                  ? "bg-badge-purple-bg text-badge-purple-text"
-                  : "bg-badge-blue-bg text-badge-blue-text"
-          }`}
-        >
-          {mobile.state}
-        </span>
-      </div>
-
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <Card title="Identity">
-          <AccessStatus
-            imsi={mobile.imsi || undefined}
-            esn={mobile.esn ?? undefined}
-            meid={mobile.meid || undefined}
-            subscriberId={mobile.subscriberId}
-          />
-          <div className="mb-3 grid grid-cols-2 rounded border border-border bg-surface p-0.5">
-            <button
-              type="button"
-              onClick={() => mobile.subscriberId && setIdentityTab("subscriber")}
-              disabled={!mobile.subscriberId}
-              className={`rounded px-2 py-1 text-xs transition-colors ${
-                identityTab === "subscriber"
-                  ? "bg-surface-raised text-secondary"
-                  : "text-muted hover:text-secondary disabled:text-dimmed disabled:hover:text-dimmed"
-              }`}
-            >
-              Subscriber
-            </button>
-            <button
-              type="button"
-              onClick={() => setIdentityTab("registration")}
-              className={`rounded px-2 py-1 text-xs transition-colors ${
-                identityTab === "registration"
-                  ? "bg-surface-raised text-secondary"
-                  : "text-muted hover:text-secondary"
-              }`}
-            >
-              Registration
-            </button>
+        <div className="flex items-center gap-3">
+          <Bars bars={headerBars} size="lg" />
+          <div>
+            <div className={`text-sm font-semibold ${barsTier(headerBars)?.text ?? "text-muted"}`}>
+              {barsTier(headerBars)?.label ?? "Unknown"}
+            </div>
+            <div className="text-xs text-muted font-mono">{headerSignalValue}</div>
           </div>
-
-          {identityTab === "subscriber" && mobile.subscriberId ? (
-            <>
-              {mobile.phoneNumber && (
-                <Stat label="Phone Number" value={mobile.phoneNumber} mono />
-              )}
-              <div className="flex justify-between py-0.5">
-                <span className="text-muted text-sm">Subscriber</span>
-                <Link
-                  href={`/subscribers/${encodeURIComponent(mobile.subscriberId)}`}
-                  className="text-sm font-mono text-accent-green hover:text-accent-green transition-colors"
-                >
-                  {subscriberName || (mobile.subscriberId.length > 20
-                    ? `${mobile.subscriberId.slice(0, 8)}...${mobile.subscriberId.slice(-8)}`
-                    : mobile.subscriberId)}
-                </Link>
-              </div>
-              <div className="my-3"><StartOtasp subscriberId={mobile.subscriberId} imsi={mobile.imsi || undefined} /></div>
-              <Stat label="Provisioned ESN" value={provisionedEsnHex || "Not Available"} mono />
-              <Stat label="Provisioned IMSI" value={provisionedImsi || "Not Available"} mono />
-              <Stat label="Provisioned MEID" value={provisionedMeid || "Not Available"} mono />
-              {primarySubscriberIdentity?.esn != null && esnManufacturer(primarySubscriberIdentity.esn) && (
-                <Stat label="Manufacturer" value={esnManufacturer(primarySubscriberIdentity.esn)!} />
-              )}
-            </>
-          ) : (
-            <>
-              <Stat label="Observed ESN" value={observedEsnHex || "Not Available"} mono />
-              <Stat label="Observed MEID" value={observedMeid || "Not Available"} mono />
-              <Stat label="Registered IMSI" value={mobile.imsi || "Not Available"} mono />
-              <Stat label="MOB_P_REV" value={String(mobile.mobPRev)} />
-              <Stat
-                label="PGSLOT"
-                value={mobile.pgslot != null ? String(mobile.pgslot) : "-"}
-                mono
-              />
-              <Stat label="SLOT_CYCLE_INDEX" value={String(mobile.slotCycleIndex)} />
-              <div className="flex justify-between py-0.5">
-                <span className="text-muted text-sm">Serving Cell</span>
-                {servingPeerId ? (
-                  <Link
-                    href={`/bts/${encodeURIComponent(servingPeerId)}`}
-                    className="text-sm font-mono text-accent-green hover:text-accent-green transition-colors"
-                  >
-                    {cellLabel(mobile.servingCell)}
-                  </Link>
-                ) : (
-                  <span className="text-secondary text-sm font-mono">-</span>
-                )}
-              </div>
-              {!mobile.subscriberId && (
-                <div className="mt-3 border-t border-border pt-3">
-                  {!showCreateSubscriber ? (
-                    <button
-                      type="button"
-                      onClick={openCreateSubscriber}
-                      disabled={!canCreateSubscriber}
-                      className="text-xs px-3 py-1.5 rounded bg-accent-green-bg text-accent-green border border-accent-green/20 hover:bg-accent-green/15 disabled:opacity-50 disabled:hover:bg-accent-green-bg transition-colors"
-                    >
-                      Create Subscriber
-                    </button>
-                  ) : (
-                    <form onSubmit={createSubscriberFromMobile} className="space-y-3">
-                      <div>
-                        <label className="block text-xs text-muted mb-1">Phone Number</label>
-                        <input
-                          type="text"
-                          value={createPhoneNumber}
-                          onChange={(e) => setCreatePhoneNumber(e.target.value)}
-                          placeholder="5551234567"
-                          required
-                          className="w-full glass-input font-mono"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-xs text-muted mb-1">Display Name</label>
-                        <input
-                          type="text"
-                          value={createDisplayName}
-                          onChange={(e) => setCreateDisplayName(e.target.value)}
-                          className="w-full glass-input"
-                        />
-                      </div>
-                      {createError && (
-                        <p className="text-accent-red text-xs">{createError}</p>
-                      )}
-                      <div className="flex items-center gap-2">
-                        <button
-                          type="submit"
-                          disabled={creatingSubscriber}
-                          className="text-xs px-3 py-1.5 rounded bg-accent-green-bg text-accent-green border border-accent-green/20 hover:bg-accent-green/15 disabled:opacity-50 transition-colors"
-                        >
-                          {creatingSubscriber ? "Creating..." : "Create"}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setShowCreateSubscriber(false);
-                            setCreateError(null);
-                          }}
-                          disabled={creatingSubscriber}
-                          className="text-xs px-3 py-1.5 rounded bg-surface-raised text-muted border border-border hover:text-secondary disabled:opacity-50 transition-colors"
-                        >
-                          Cancel
-                        </button>
-                      </div>
-                    </form>
-                  )}
-                </div>
-              )}
-            </>
+        </div>
+        <div className="flex flex-wrap items-start gap-2">
+          {mobile.subscriberId && (
+            <button
+              type="button"
+              onClick={placeCall}
+              disabled={callPending || onCall}
+              className="text-xs px-3 py-1.5 rounded bg-accent-green-bg text-accent-green border border-accent-green/20 hover:bg-accent-green/15 disabled:opacity-50 transition-colors"
+            >
+              {callPending ? "Calling..." : "Call"}
+            </button>
           )}
-        </Card>
-
-        <Card title="Signal Quality">
-          <Stat
-            label="SNR"
-            value={mobile.snrDb != null ? `${mobile.snrDb.toFixed(1)} dB` : "-"}
-            mono
-          />
-          <Stat
-            label="Rx Level"
-            value={
-              mobile.rxPowerDbm != null
-                ? `${mobile.rxPowerDbm.toFixed(1)} dBm`
-                : mobile.rxLevelDbfs != null
-                  ? `${mobile.rxLevelDbfs.toFixed(1)} dBFS`
-                  : mobile.signalPowerDb != null
-                    ? `${mobile.signalPowerDb.toFixed(1)} dB`
-                    : "-"
-            }
-            mono
-          />
-          <Stat
-            label="Demod Quality"
-            value={
-              mobile.demodQualityPct != null
-                ? `${mobile.demodQualityPct.toFixed(0)}%`
-                : "-"
-            }
-            mono
-          />
-          <Stat
-            label="Last Heard"
-            value={mobile.lastHeardMs ? formatTime(mobile.lastHeardMs * 1000) : "-"}
-            mono
-          />
-        </Card>
-
-        <Card title="Send SMS">
-          <div className="space-y-3">
-            <div>
-              <label className="block text-xs text-muted mb-1">
-                Originating Number
-              </label>
-              <input
-                type="text"
-                value={smsFrom}
-                onChange={(e) => setSmsFrom(e.target.value)}
-                className="w-full glass-input"
-              />
-            </div>
-            <div>
-              <label className="block text-xs text-muted mb-1">
-                Message
-              </label>
-              <textarea
-                value={smsText}
-                onChange={(e) => setSmsText(e.target.value)}
-                rows={3}
-                className="w-full glass-input resize-none"
-                placeholder="Enter SMS text..."
-              />
-            </div>
-            <div className="flex items-center gap-3">
-              <button
-                onClick={sendSms}
-                disabled={smsSending || !smsText.trim()}
-                className="px-4 py-1.5 bg-accent-green-bg text-accent-green border border-accent-green/20 hover:bg-accent-green/15 disabled:bg-surface-raised disabled:text-muted text-sm rounded transition-colors"
-              >
-                {smsSending ? "Sending..." : "Send SMS"}
-              </button>
-              {smsResult && (
-                <span
-                  className={`text-xs ${
-                    smsResult.accepted ? "text-accent-green" : "text-accent-red"
-                  }`}
-                >
-                  {smsResult.message}
-                </span>
-              )}
-            </div>
-          </div>
-        </Card>
+          <button
+            type="button"
+            onClick={() => setSmsOpen(true)}
+            className="text-xs px-3 py-1.5 rounded bg-surface-raised text-secondary border border-border hover:bg-hover transition-colors"
+          >
+            Send SMS
+          </button>
+          {mobile.subscriberId && (
+            <StartOtasp subscriberId={mobile.subscriberId} imsi={mobile.imsi || undefined} compact />
+          )}
+        </div>
       </div>
-
-      <RecentMessagesCard phone={mobile.phoneNumber} />
-
-      <RecentOtaspCard esn={mobile.esn} meid={mobile.meid} />
-
-      {mobilePacketSessions.length > 0 && (
-        <Card title={`Active Sessions (${mobilePacketSessions.length})`}>
-          <div className="space-y-3">
-            {mobilePacketSessions.map((session) => (
-              <div
-                key={session.sessionId}
-                className="rounded-lg border border-border bg-surface p-4"
-              >
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div className="space-y-1">
-                    <Link
-                      href={`/packets/${encodeURIComponent(session.sessionId)}`}
-                      className="font-mono text-sm text-accent-green hover:text-accent-green"
-                    >
-                      {session.sessionId}
-                    </Link>
-                    <div className="text-xs text-muted">
-                      {session.accessTechnology || "1x"} · SO{session.serviceOption}
-                      {session.trafficWalshCode
-                        ? session.accessTechnology === "HRPD"
-                          ? ` · key ${session.trafficWalshCode}`
-                          : ` · W${session.trafficWalshCode}`
-                        : ""}
-                      {session.captureEnabled ? " · capture enabled" : ""}
-                    </div>
-                  </div>
-                  <span className="rounded bg-surface-raised px-2 py-0.5 text-xs text-primary">
-                    {session.phase}
-                  </span>
-                </div>
-                <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-4 text-sm">
-                  <div className="text-muted">
-                    Mobile IP
-                    <div className="font-mono text-primary">{session.peerIp || "-"}</div>
-                  </div>
-                  <div className="text-muted">
-                    Gateway IP
-                    <div className="font-mono text-primary">{session.ourIp || "-"}</div>
-                  </div>
-                  <div className="text-muted">
-                    TUN
-                    <div className="font-mono text-primary">{session.tunDevice || "-"}</div>
-                  </div>
-                  <div className="text-muted">
-                    Last Activity
-                    <div className="font-mono text-primary">
-                      {session.lastActivityAtMs ? formatTime(session.lastActivityAtMs * 1000) : "-"}
-                    </div>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-        </Card>
+      {callResult && (
+        <p className={`mt-2 text-xs ${callResult.accepted ? "text-accent-green" : "text-accent-red"}`}>
+          {callResult.message}
+        </p>
       )}
 
-      {mobile.trafficWalshCode != null && (
-        <Card title="Traffic Channel">
-          <div className="space-y-5">
-            <div className="rounded-lg border border-border bg-surface p-4">
-              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-                <div className="rounded-md border border-border bg-surface px-3 py-2">
-                  <div className="text-[11px] uppercase tracking-wide text-muted">Walsh Code</div>
-                  <div className="mt-1 font-mono text-lg text-primary">W{mobile.trafficWalshCode}</div>
-                </div>
-                <div className="rounded-md border border-border bg-surface px-3 py-2">
-                  <div className="text-[11px] uppercase tracking-wide text-muted">Service Option</div>
-                  <div className="mt-1 font-mono text-sm text-primary">
-                    {mobile.trafficServiceOption != null
-                      ? serviceOptionName(mobile.trafficServiceOption)
-                      : "Unknown"}
-                  </div>
-                </div>
-                <div className="rounded-md border border-border bg-surface px-3 py-2">
-                  <div className="text-[11px] uppercase tracking-wide text-muted">Radio Configuration</div>
-                  <div className="mt-1 font-mono text-sm text-primary">
-                    {radioConfigPair ?? "Unknown"}
-                  </div>
-                  <div className="text-[11px] text-muted">forward / reverse</div>
-                </div>
-                <div className="rounded-md border border-border bg-surface px-3 py-2">
-                  <div className="text-[11px] uppercase tracking-wide text-muted">Channel State</div>
-                  <div className="mt-1 text-sm font-medium text-primary">{mobile.state}</div>
-                </div>
-                <div className="rounded-md border border-border bg-surface px-3 py-2">
-                  <div className="text-[11px] uppercase tracking-wide text-muted">Voice</div>
-                  <div className="mt-1 text-sm font-medium text-primary">
-                    <span className="inline-flex items-center gap-2">{mobile.voiceCallState ?? "No active voice state"}<VoicePrivacyIndicator status={mobile.voicePrivacy} /></span>
-                  </div>
-                </div>
-              </div>
-            </div>
+      <div className="mt-4 mb-4 flex gap-1 overflow-x-auto border-b border-border">
+        {tabs.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            onClick={() => setTab(t.id)}
+            className={`-mb-px whitespace-nowrap border-b-2 px-3.5 py-2 text-sm transition-colors ${
+              activeTab === t.id
+                ? "border-accent-green text-primary"
+                : "border-transparent text-muted hover:text-secondary"
+            }`}
+          >
+            {t.label}
+            {t.badge && (
+              <span
+                className={`ml-1.5 rounded-full bg-surface-raised px-1.5 py-px text-[10px] ${
+                  t.id === "call" ? "text-accent-green" : "text-muted"
+                }`}
+              >
+                {t.badge}
+              </span>
+            )}
+          </button>
+        ))}
+      </div>
 
-            {trafficPower ? (
-              <>
-              {/* Power control time-series chart */}
-              {powerHistoryRef.current.timestamps.length >= 2 && (() => {
-                const h = powerHistoryRef.current;
-                const chartSeries: Series[] = [
-                  { key: "target", label: `Target ${metricLabel}`, color: "#f59e0b", values: h.target, dashed: true },
-                  { key: "measured", label: `Measured ${metricLabel}`, color: "#22c55e", values: h.measured },
-                  { key: "fwd_gain", label: "Fwd Gain", color: "#818cf8", values: h.forwardGain },
-                ];
-                return (
-                  <section className="rounded-lg border border-border bg-surface p-4 mb-4">
-                    <div className="mb-3">
-                      <div className="text-sm font-medium text-primary">Power Control — Live {radioConfigPair ? `(${radioConfigPair})` : ""}</div>
-                      <div className="text-xs text-muted">
-                        {Math.round((h.timestamps[h.timestamps.length - 1] - h.timestamps[0]) / 1000)}s window · {isRc3 ? "completed 1s averages" : "live samples"} · Target (dashed) vs Measured {metricLabel} · Forward gain offset
-                      </div>
-                    </div>
+      {activeTab === "overview" && (
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 grid-flow-row-dense gap-4">
+          {onCall && (
+            <Card title="Current Call" action={<span className="text-[11px] text-accent-green">● live</span>}>
+              <div className="mb-2 flex flex-wrap items-center gap-2">
+                <span className={`text-xs px-2 py-0.5 rounded ${CALL_KIND_BADGE[kind]}`}>{CALL_KIND_LABEL[kind]}</span>
+                {mobile.trafficServiceOption != null && (
+                  <span className="text-xs text-muted">{serviceOptionName(mobile.trafficServiceOption)}</span>
+                )}
+              </div>
+              <Stat
+                label="Channel"
+                value={`W${mobile.trafficWalshCode}${radioConfigPair ? ` · ${radioConfigPair}` : ""}`}
+                mono
+              />
+              {trafficPower ? (
+                <>
+                  <div className="flex justify-between py-0.5">
+                    <span className="text-muted text-sm">Reverse</span>
+                    <span className="inline-flex items-center gap-2 text-secondary text-sm font-mono">
+                      <Bars bars={reverseBars} />
+                      {reverseMeasuredDb != null ? `${reverseMeasuredDb.toFixed(1)} dB ${metricLabel}` : "-"}
+                    </span>
+                  </div>
+                  <Stat
+                    label="Reverse FER"
+                    value={`${trafficPower.ferPct.toFixed(1)}% · ${reverseLifetimeFerPct.toFixed(2)}% lifetime`}
+                    mono
+                  />
+                  <Stat
+                    label="Forward FER"
+                    value={`${
+                      trafficPower.forwardPmrmCount > 0 ? `${trafficPower.forwardLastFerPct.toFixed(1)}%` : "no PMRM yet"
+                    } · gain ${trafficPower.forwardGainOffsetDb >= 0 ? "+" : ""}${trafficPower.forwardGainOffsetDb.toFixed(1)} dB`}
+                    mono
+                  />
+                </>
+              ) : (
+                <p className="text-xs text-muted mt-1">No power-control snapshot yet.</p>
+              )}
+              <button
+                type="button"
+                onClick={() => setTab("call")}
+                className="mt-3 text-xs px-2.5 py-1 rounded border border-border-input text-secondary hover:bg-surface-raised"
+              >
+                Call details →
+              </button>
+            </Card>
+          )}
+
+          <SignalQualityCard signal={mobile.accessSignal} recentEbNtDb={mobile.recentAccessEbNtDb} />
+
+          <Card title="Identity">
+            <AccessStatus
+              imsi={mobile.imsi || undefined}
+              esn={mobile.esn ?? undefined}
+              meid={mobile.meid || undefined}
+              subscriberId={mobile.subscriberId}
+            />
+            <div className="flex justify-between py-0.5">
+              <span className="text-muted text-sm">Subscriber</span>
+              {mobile.subscriberId ? (
+                <Link
+                  href={`/subscribers/${encodeURIComponent(mobile.subscriberId)}`}
+                  className="text-sm text-accent-green hover:text-accent-green transition-colors"
+                >
+                  {pageTitle} →
+                </Link>
+              ) : (
+                <span className="text-sm text-muted">Not provisioned</span>
+              )}
+            </div>
+            {mobile.phoneNumber && <Stat label="Phone" value={mobile.phoneNumber} mono />}
+            {identityPairs.map(([label, seen, prov]) => (
+              <IdentityRow key={label} label={label} observed={seen} provisioned={prov} />
+            ))}
+            <div className="my-2 border-t border-border" />
+            <Stat label="Device" value={[manufacturer, `P_REV ${mobile.mobPRev}`].filter(Boolean).join(" · ")} />
+            <Stat
+              label="Paging"
+              value={pagingLabel}
+              title={`PGSLOT ${mobile.pgslot ?? "-"} · SLOT_CYCLE_INDEX ${mobile.slotCycleIndex}`}
+            />
+            <div className="flex justify-between py-0.5">
+              <span className="text-muted text-sm">Serving cell</span>
+              {servingPeerId ? (
+                <Link
+                  href={`/bts/${encodeURIComponent(servingPeerId)}`}
+                  className="text-sm font-mono text-accent-green hover:text-accent-green transition-colors"
+                >
+                  {cellLabel(mobile.servingCell)}
+                </Link>
+              ) : (
+                <span className="text-secondary text-sm font-mono">-</span>
+              )}
+            </div>
+            {!mobile.subscriberId && (
+              <div className="mt-3 border-t border-border pt-3">
+                {!showCreateSubscriber ? (
+                  <button
+                    type="button"
+                    onClick={openCreateSubscriber}
+                    disabled={!canCreateSubscriber}
+                    className="text-xs px-3 py-1.5 rounded bg-accent-green-bg text-accent-green border border-accent-green/20 hover:bg-accent-green/15 disabled:opacity-50 disabled:hover:bg-accent-green-bg transition-colors"
+                  >
+                    Create Subscriber
+                  </button>
+                ) : (
+                  <form onSubmit={createSubscriberFromMobile} className="space-y-3">
                     <div>
-                      <TimeSeriesChart
-                        width={900}
-                        height={300}
-                        yLabel="dB"
-                        timestamps={h.timestamps}
-                        series={chartSeries}
+                      <label className="block text-xs text-muted mb-1">Phone Number</label>
+                      <input
+                        type="text"
+                        value={createPhoneNumber}
+                        onChange={(e) => setCreatePhoneNumber(e.target.value)}
+                        placeholder="5551234567"
+                        required
+                        className="w-full glass-input font-mono"
                       />
                     </div>
-                    <div className="mt-2 flex justify-center gap-6 text-[11px] font-mono text-muted">
-                      <span>Rev FER window <span className={trafficPower.ferPct > 1 ? "text-accent-red" : "text-accent-green"}>{trafficPower.ferPct.toFixed(1)}%</span></span>
-                      <span>Frames {trafficPower.framesTotal.toLocaleString()}</span>
-                      <span>Fwd FER <span className={trafficPower.forwardLastFerPct > 1 ? "text-accent-red" : "text-accent-green"}>{trafficPower.forwardLastFerPct.toFixed(1)}%</span></span>
-                      <span>PMRMs {trafficPower.forwardPmrmCount}</span>
-                      {trafficPower.forwardPilotEcIoDb && trafficPower.forwardPilotEcIoDb.length > 0 && (
-                        <span>Pilot Ec/Io {trafficPower.forwardPilotEcIoDb[0].toFixed(1)} dB</span>
-                      )}
+                    <div>
+                      <label className="block text-xs text-muted mb-1">Display Name</label>
+                      <input
+                        type="text"
+                        value={createDisplayName}
+                        onChange={(e) => setCreateDisplayName(e.target.value)}
+                        className="w-full glass-input"
+                      />
                     </div>
-                  </section>
-                );
-              })()}
+                    {createError && (
+                      <p className="text-accent-red text-xs">{createError}</p>
+                    )}
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="submit"
+                        disabled={creatingSubscriber}
+                        className="text-xs px-3 py-1.5 rounded bg-accent-green-bg text-accent-green border border-accent-green/20 hover:bg-accent-green/15 disabled:opacity-50 transition-colors"
+                      >
+                        {creatingSubscriber ? "Creating..." : "Create"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowCreateSubscriber(false);
+                          setCreateError(null);
+                        }}
+                        disabled={creatingSubscriber}
+                        className="text-xs px-3 py-1.5 rounded bg-surface-raised text-muted border border-border hover:text-secondary disabled:opacity-50 transition-colors"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </form>
+                )}
+              </div>
+            )}
+          </Card>
 
-              <div className="grid gap-4 xl:grid-cols-2">
-                <section className="rounded-lg border border-border bg-surface p-4">
-                  <div className="mb-4">
-                    <div className="text-sm font-medium text-primary">
-                      Reverse Power Control ({reverseRcName ?? "Unknown RC"} — {isRc3 ? "Pilot SINR" : "Data Eb/Nt"})
-                    </div>
-                    <div className="text-xs text-muted">
-                      Closed-loop reverse traffic measurements, live per-PCG PCB scheduling, and bad-frame accounting.
-                    </div>
+          <Card
+            title="Recent Messages"
+            className="md:col-span-2"
+            action={
+              <button
+                type="button"
+                onClick={() => setTab("messages")}
+                className="text-xs px-2 py-0.5 rounded border border-border-input text-secondary hover:bg-surface-raised"
+              >
+                All {messages.length} →
+              </button>
+            }
+          >
+            {messages.length === 0 ? (
+              <p className="text-dimmed text-sm">No messages since this page opened.</p>
+            ) : (
+              <div>
+                {messages.slice(0, RECENT_MESSAGE_ROWS).map((entry) => (
+                  <MessageRow
+                    key={entry.id}
+                    entry={entry}
+                    view={messageView(entry, messageCtx)}
+                    open={false}
+                    onToggle={() => openMessage(entry.id)}
+                  />
+                ))}
+              </div>
+            )}
+          </Card>
+
+          <RxPowerCard signal={mobile.accessSignal} />
+
+          {mobilePacketSessions.length > 0 && (
+            <Card title="Data Session" action={<span className="text-xs text-muted">{mobilePacketSessions[0].phase}</span>}>
+              <Stat label="Mobile IP" value={mobilePacketSessions[0].peerIp || "-"} mono />
+              <Stat label="Service option" value={`SO ${mobilePacketSessions[0].serviceOption}`} mono />
+              <Stat
+                label="Last activity"
+                value={
+                  mobilePacketSessions[0].lastActivityAtMs
+                    ? new Date(mobilePacketSessions[0].lastActivityAtMs).toLocaleTimeString()
+                    : "-"
+                }
+                mono
+              />
+              <button
+                type="button"
+                onClick={() => setTab("data")}
+                className="mt-3 text-xs px-2.5 py-1 rounded border border-border-input text-secondary hover:bg-surface-raised"
+              >
+                {mobilePacketSessions.length > 1 ? `All ${mobilePacketSessions.length} sessions →` : "Session details →"}
+              </button>
+            </Card>
+          )}
+        </div>
+      )}
+
+      {activeTab === "call" && (
+        <div className="space-y-4">
+          <Card
+            title={`${CALL_KIND_LABEL[kind]} call · W${mobile.trafficWalshCode}${radioConfigPair ? ` · ${radioConfigPair}` : ""}`}
+            action={
+              <span className="inline-flex items-center gap-2 text-xs text-secondary">
+                <span className="text-accent-green">●</span>
+                {callStateLabel(mobile.voiceCallState) ?? mobile.state}
+                <VoicePrivacyIndicator status={mobile.voicePrivacy} />
+              </span>
+            }
+          >
+            {trafficPower ? (
+              <>
+                <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-3">
+                  <Tile label={`Reverse ${metricLabel}`}>
+                    <span className="inline-flex items-center gap-2">
+                      <Bars bars={reverseBars} />
+                      <span className={reverseTileClass}>{reverseMeasuredDb != null ? reverseMeasuredDb.toFixed(1) : "-"}</span>
+                      <span className="text-xs font-normal text-muted">dB</span>
+                    </span>
+                  </Tile>
+                  <Tile label="Target" sub={trafficPower.manualTargetOverrideDb != null ? "pinned" : "auto"}>
+                    {trafficPower.effectiveTargetEbNtDb.toFixed(1)} <span className="text-xs font-normal text-muted">dB</span>
+                  </Tile>
+                  <Tile label="Reverse FER" sub="sliding window">
+                    <span className={trafficPower.ferPct > 1 ? "text-accent-amber" : "text-accent-green"}>{trafficPower.ferPct.toFixed(1)}%</span>
+                  </Tile>
+                  <Tile
+                    label="Lifetime FER"
+                    sub={`${trafficPower.framesCrcError} / ${trafficPower.framesTotal.toLocaleString()} frames`}
+                  >
+                    <span className={reverseLifetimeFerPct > 1 ? "text-accent-amber" : "text-accent-green"}>
+                      {reverseLifetimeFerPct.toFixed(2)}%
+                    </span>
+                  </Tile>
+                  <Tile label="Forward FER" sub={trafficPower.forwardPmrmCount > 0 ? "last PMRM" : "no PMRM yet"}>
+                    {trafficPower.forwardPmrmCount > 0 ? `${trafficPower.forwardLastFerPct.toFixed(1)}%` : "-"}
+                  </Tile>
+                  <Tile label="Forward gain" sub="from initial allocation">
+                    {trafficPower.forwardGainOffsetDb >= 0 ? "+" : ""}
+                    {trafficPower.forwardGainOffsetDb.toFixed(1)} <span className="text-xs font-normal text-muted">dB</span>
+                  </Tile>
+                </div>
+
+                <div className="mt-4">
+                  <div className="mb-1 text-xs text-muted">
+                    Power control · target and measured {metricLabel} · forward gain offset
                   </div>
+                  {powerHistoryRef.current.timestamps.length >= 2 ? (
+                    <TimeSeriesChart
+                      width={900}
+                      height={260}
+                      yLabel="dB"
+                      timestamps={powerHistoryRef.current.timestamps}
+                      series={[
+                        { key: "target", label: `Target ${metricLabel}`, color: "#f59e0b", values: powerHistoryRef.current.target },
+                        { key: "measured", label: `Measured ${metricLabel}`, color: "#22c55e", values: powerHistoryRef.current.measured },
+                        { key: "fwd_gain", label: "Fwd gain", color: "#818cf8", values: powerHistoryRef.current.forwardGain },
+                      ]}
+                    />
+                  ) : (
+                    <p className="py-10 text-center text-xs text-muted">Collecting history.</p>
+                  )}
+                </div>
 
-                  <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-                    <div className="rounded-md border border-border bg-surface px-3 py-2">
-                      <div className="text-[11px] uppercase tracking-wide text-muted">Effective Target {metricLabel}</div>
-                      <div className="mt-1 font-mono text-base text-primary">
-                        {trafficPower.effectiveTargetEbNtDb.toFixed(2)} dB
-                      </div>
-                      <div className="text-[11px] text-muted">
-                        auto {trafficPower.targetEbNtDb.toFixed(2)} dB
-                      </div>
-                    </div>
-                    <div className="rounded-md border border-border bg-surface px-3 py-2">
-                      <div className="text-[11px] uppercase tracking-wide text-muted">Recent Peak</div>
-                      <div className="mt-1 font-mono text-base text-primary">
-                        {reverseFrameMax != null ? `${reverseFrameMax.toFixed(2)} dB` : "-"}
-                      </div>
-                      <div className="text-[11px] text-muted">
-                        {reverseFrameMaxPcgs.length === 0
-                          ? "latest 20 ms snapshot"
-                          : reverseFrameMaxPcgs.length === 1
-                            ? `latest 20 ms snapshot, PCG ${reverseFrameMaxPcgs[0]}`
-                            : `latest 20 ms snapshot, PCGs ${reverseFrameMaxPcgs.join(", ")}`}
-                      </div>
-                    </div>
-                    {reversePilotEcIoText ? (
-                      <div className="rounded-md border border-border bg-surface px-3 py-2">
-                        <div className="text-[11px] uppercase tracking-wide text-muted">Pilot Ec/Io (legacy)</div>
-                        <div className="mt-1 font-mono text-base text-primary">
-                          {reversePilotEcIoText}
-                        </div>
-                        <div className="text-[11px] text-muted">1 s smoothed reverse traffic finger — diagnostic only</div>
-                      </div>
-                    ) : null}
-                    <div className="rounded-md border border-border bg-surface px-3 py-2">
-                      <div className="text-[11px] uppercase tracking-wide text-muted">Active PCGs</div>
-                      <div className="mt-1 font-mono text-base text-primary">
-                        {reverseActivePcgs != null ? `${reverseActivePcgs}/16` : "-"}
-                      </div>
-                      <div className="text-[11px] text-muted">
-                        {trafficPower.lastActivePcgMask && trafficPower.lastActivePcgMask.length === 16
-                          ? "exact reverse transmit mask"
-                          : reverseGatedCutoff == null
-                          ? "within 10 dB of frame max"
-                          : reverseGatedCutoff <= 0
-                            ? `cutoff ${reverseGatedCutoff.toFixed(2)} dB, all PCGs count active`
-                            : `cutoff ${reverseGatedCutoff.toFixed(2)} dB`}
-                      </div>
-                    </div>
-                    <div className="rounded-md border border-border bg-surface px-3 py-2">
-                      <div className="text-[11px] uppercase tracking-wide text-muted">Reverse FER Window</div>
-                      <div className="mt-1 font-mono text-base text-primary">
-                        {trafficPower.ferPct.toFixed(2)}%
-                      </div>
-                      <div className="text-[11px] text-muted">outer-loop sliding window</div>
-                    </div>
-                    <div className="rounded-md border border-border bg-surface px-3 py-2">
-                      <div className="text-[11px] uppercase tracking-wide text-muted">Reverse Frames</div>
-                      <div className="mt-1 font-mono text-base text-primary">
-                        {trafficPower.framesTotal}
-                      </div>
-                      <div className="text-[11px] text-muted">lifetime FER {reverseLifetimeFerPct.toFixed(2)}%</div>
-                    </div>
-                    <div className="rounded-md border border-border bg-surface px-3 py-2">
-                      <div className="text-[11px] uppercase tracking-wide text-muted">Bad Frames</div>
-                      <div className="mt-1 font-mono text-base text-primary">
-                        {trafficPower.framesCrcError}
-                      </div>
-                      <div className="text-[11px] text-muted">lifetime bad FQI / CRC</div>
-                    </div>
+                <div className="mt-4 grid gap-4 md:grid-cols-3">
+                  <div>
+                    <div className="mb-1 text-[11px] uppercase tracking-wide text-muted">Forward link {forwardRcName ? `· ${forwardRcName}` : ""}</div>
+                    <Stat label="PMRMs" value={String(trafficPower.forwardPmrmCount)} mono />
+                    <Stat
+                      label="Last PMRM"
+                      value={
+                        trafficPower.forwardPmrmCount > 0
+                          ? `${trafficPower.forwardLastPmrmErrors} errors / ${trafficPower.forwardLastPmrmFrames} frames`
+                          : "-"
+                      }
+                      mono
+                    />
+                    <Stat label="Pilot Ec/Io (mobile)" value={forwardPilotEcIoText} mono />
                   </div>
-
-                  <div className="mt-4 rounded-md border border-border bg-surface px-3 py-3">
-                    <div className="flex flex-wrap items-center justify-between gap-3">
-                      <div>
-                        <div className="text-[11px] uppercase tracking-wide text-muted">Manual Target Override</div>
-                        <div className="mt-1 text-sm text-primary">
-                          {trafficPower.manualTargetOverrideDb != null
-                            ? `Pinned at ${trafficPower.manualTargetOverrideDb.toFixed(2)} dB`
-                            : "Automatic outer loop"}
-                        </div>
-                      </div>
-                      <span className={`inline-flex rounded px-2 py-0.5 text-[11px] ${
-                        trafficPower.manualTargetOverrideDb != null
-                          ? "bg-badge-orange-bg text-badge-orange-text"
-                          : "bg-surface-raised text-muted"
-                      }`}>
+                  <div>
+                    <div className="mb-1 text-[11px] uppercase tracking-wide text-muted">Call</div>
+                    <Stat
+                      label="Service option"
+                      value={mobile.trafficServiceOption != null ? serviceOptionName(mobile.trafficServiceOption) : "Unknown"}
+                    />
+                    <Stat label="Channel state" value={mobile.state} />
+                    <Stat label="Reverse RC" value={reverseRcName ?? "-"} />
+                  </div>
+                  <div>
+                    <div className="mb-1 flex items-center justify-between text-[11px] uppercase tracking-wide text-muted">
+                      <span>Reverse target override</span>
+                      <span
+                        className={`normal-case tracking-normal rounded px-1.5 py-0.5 ${
+                          trafficPower.manualTargetOverrideDb != null
+                            ? "bg-badge-orange-bg text-badge-orange-text"
+                            : "bg-surface-raised text-muted"
+                        }`}
+                      >
                         {trafficPower.manualTargetOverrideDb != null ? "Pinned" : "Auto"}
                       </span>
                     </div>
-                    <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       <input
                         type="number"
                         step="0.1"
                         min={isRc3 ? "-20" : "0"}
-                        max={isRc3 ? "40" : "40"}
+                        max="40"
                         inputMode="decimal"
                         value={powerDraft}
                         onChange={(e) => setPowerDraft(e.target.value)}
                         disabled={powerOverridePending}
-                        className="w-28 rounded border border-border-input bg-body px-2 py-1 text-right font-mono text-sm text-primary disabled:opacity-50"
+                        className="w-24 rounded border border-border-input bg-body px-2 py-1 text-right font-mono text-sm text-primary disabled:opacity-50"
                       />
+                      <span className="text-xs text-muted">dB</span>
                       <button
                         type="button"
                         onClick={pinPowerOverride}
-                        disabled={powerOverridePending || mobile.trafficWalshCode == null}
+                        disabled={powerOverridePending}
                         className="rounded border border-accent-green/30 px-3 py-1 text-xs text-accent-green hover:bg-accent-green-bg disabled:opacity-50"
                       >
                         {powerOverridePending ? "Applying..." : "Pin"}
@@ -1417,431 +1500,363 @@ export default function MobileDetailPage({
                         Clear
                       </button>
                     </div>
-                    {powerOverrideError && (
-                      <div className="mt-2 text-xs text-accent-red">{powerOverrideError}</div>
-                    )}
+                    <p className="mt-1.5 text-[11px] text-muted">
+                      {trafficPower.manualTargetOverrideDb != null
+                        ? `Pinned at ${trafficPower.manualTargetOverrideDb.toFixed(1)} dB. Clear to resume the outer loop.`
+                        : "The outer loop sets the target from reverse FER."}
+                    </p>
+                    {powerOverrideError && <p className="mt-1 text-xs text-accent-red">{powerOverrideError}</p>}
                   </div>
-
-                  <div className="mt-4">
-                    <div className="mb-2 flex items-center justify-between gap-3">
-                      <div className="text-xs uppercase tracking-wide text-muted">
-                        Latest Per-PCG {metricLabel}
-                      </div>
-                      <div className="text-[11px] text-muted">
-                        ● = active, ○ = inactive, ▲ = last scheduled UP, ▼ = last scheduled DOWN
-                      </div>
-                    </div>
-                    <div className="mb-2 text-[11px] text-muted">
-                      {isRc3
-                        ? "Showing pilot SINR (inner-loop control metric). Frame data Eb/Nt shown below each value."
-                        : "Peak highlighting is diagnostic only."}{" "}
-                      Reverse closed-loop decisions are scheduled one PCG at a time on the absolute-PCG timeline.
-                    </div>
-                    <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
-                      {innerLoopPcgDb.map((db, i) => {
-                        const pcb = trafficPower.lastPcbs[i];
-                        const isFrameMax = reverseFrameMaxPcgs.includes(i);
-                        const active = isActivePcg(
-                          i,
-                          db,
-                          reverseGatedCutoff,
-                          trafficPower.lastActivePcgMask,
-                        );
-                        const frameDb = frameEbNtDb[i];
-                        const tone = !active
-                          ? "border-border-subtle bg-surface text-muted opacity-70"
-                          : reverseTargetDb != null && db >= reverseTargetDb
-                            ? "border-accent-green/20 bg-accent-green-bg text-accent-green"
-                            : reverseTargetDb != null && db >= reverseTargetDb - 3
-                              ? "border-accent-amber/20 bg-accent-amber-bg text-accent-amber"
-                              : "border-accent-red/20 bg-accent-red-bg text-accent-red";
-                        return (
-                          <div
-                            key={i}
-                            className={`rounded-md border px-3 py-2 ${tone} ${
-                              isFrameMax ? "ring-1 ring-sky-500/60" : ""
-                            }`}
-                            title={
-                              isFrameMax
-                                ? active
-                                  ? pcb === 0
-                                    ? "Recent-peak PCG, last scheduled UP (PCB=0)"
-                                    : "Recent-peak PCG, last scheduled DOWN (PCB=1)"
-                                  : "Recent-peak PCG, inactive"
-                                : active
-                                ? pcb === 0
-                                  ? "Last scheduled UP (PCB=0)"
-                                  : "Last scheduled DOWN (PCB=1)"
-                                : "Inactive PCG"
-                            }
-                          >
-                            <div className="flex items-center justify-between gap-3 text-[11px] uppercase tracking-wide">
-                              <div className="flex items-center gap-2">
-                                <span
-                                  className={active ? "text-accent-green" : "text-muted"}
-                                  title={active ? "Active PCG" : "Inactive PCG"}
-                                >
-                                  {active ? "●" : "○"}
-                                </span>
-                                <span className="text-muted">PCG {i}</span>
-                              </div>
-                              <div className="flex items-center gap-2">
-                                {isFrameMax && (
-                                  <span
-                                    className="inline-flex items-center gap-1 rounded-full border border-sky-500/40 bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-sky-300"
-                                    title="Recent peak in the latest 20 ms measurement snapshot"
-                                  >
-                                    <svg
-                                      viewBox="0 0 20 20"
-                                      fill="currentColor"
-                                      className="h-3 w-3"
-                                      aria-hidden="true"
-                                    >
-                                      <path d="M10 2.5l2.1 4.26 4.7.68-3.4 3.31.8 4.68L10 13.2l-4.2 2.23.8-4.68-3.4-3.31 4.7-.68L10 2.5z" />
-                                    </svg>
-                                    PEAK
-                                  </span>
-                                )}
-                                {active ? (
-                                  <span className={pcb === 0 ? "text-accent-green" : "text-accent-red"}>
-                                    {pcb === 0 ? "▲" : "▼"}
-                                  </span>
-                                ) : (
-                                  <span className="text-dimmed"> </span>
-                                )}
-                              </div>
-                            </div>
-                            <div className="mt-1 font-mono text-sm">{db != null && Number.isFinite(db) ? `${db.toFixed(2)} dB` : "---"}</div>
-                            {isRc3 && active && frameDb != null && Number.isFinite(frameDb) && (
-                              <div className="mt-0.5 font-mono text-[10px] text-muted" title="Per-frame data Eb/Nt from decoded traffic">
-                                Eb/Nt {frameDb.toFixed(1)}
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                </section>
-
-                <section className="rounded-lg border border-border bg-surface p-4">
-                  <div className="mb-4">
-                    <div className="text-sm font-medium text-primary">
-                      Forward Power Control {forwardRcName ? `(${forwardRcName})` : ""}
-                    </div>
-                    <div className="text-xs text-muted">
-                      PMRM-reported forward FER and the current F-FCH gain walk for this channel.
-                    </div>
-                  </div>
-
-                  <div className="grid gap-3 sm:grid-cols-2">
-                    <div className="rounded-md border border-border bg-surface px-3 py-2">
-                      <div className="text-[11px] uppercase tracking-wide text-muted">Gain Offset</div>
-                      <div className="mt-1 font-mono text-base text-primary">
-                        {trafficPower.forwardGainOffsetDb >= 0 ? "+" : ""}
-                        {trafficPower.forwardGainOffsetDb.toFixed(2)} dB
-                      </div>
-                    </div>
-                    <div className="rounded-md border border-border bg-surface px-3 py-2">
-                      <div className="text-[11px] uppercase tracking-wide text-muted">Forward FER</div>
-                      <div className="mt-1 font-mono text-base text-primary">
-                        {trafficPower.forwardPmrmCount > 0
-                          ? `${trafficPower.forwardLastFerPct.toFixed(2)}%`
-                          : "no PMRM yet"}
-                      </div>
-                    </div>
-                    <div className="rounded-md border border-border bg-surface px-3 py-2">
-                      <div className="text-[11px] uppercase tracking-wide text-muted">Last PMRM</div>
-                      <div className="mt-1 font-mono text-base text-primary">
-                        {trafficPower.forwardPmrmCount > 0
-                          ? `${trafficPower.forwardLastPmrmErrors} / ${trafficPower.forwardLastPmrmFrames}`
-                          : "-"}
-                      </div>
-                      <div className="text-[11px] text-muted">errors / frames</div>
-                    </div>
-                    <div className="rounded-md border border-border bg-surface px-3 py-2">
-                      <div className="text-[11px] uppercase tracking-wide text-muted">PMRMs</div>
-                      <div className="mt-1 font-mono text-base text-primary">
-                        {trafficPower.forwardPmrmCount}
-                      </div>
-                      <div className="text-[11px] text-muted">since allocation</div>
-                    </div>
-                  </div>
-
-                  <div className="mt-4 rounded-md border border-border bg-surface px-3 py-3">
-                    <div className="text-[11px] uppercase tracking-wide text-muted">
-                      Active Set Pilots (Ec/Io)
-                    </div>
-                    <div className="mt-1 font-mono text-sm text-primary">
-                      {forwardPilotEcIoText}
-                    </div>
-                  </div>
-
-                  <p className="mt-4 text-xs leading-5 text-muted">
-                    Reverse FER now reflects the same bad-frame accounting the BSC uses for the
-                    reverse outer loop. Forward FER comes from PMRM reports sent by the mobile,
-                    while the gain offset shows how far the BTS has walked the forward traffic
-                    channel from its initial allocation.
-                  </p>
-                </section>
-              </div>
+                </div>
               </>
             ) : (
-              <div className="rounded-lg border border-dashed border-border bg-surface px-4 py-3 text-sm text-muted">
-                Traffic channel assigned, but no power-control snapshot has arrived yet.
-              </div>
+              <p className="text-sm text-muted">Traffic channel assigned, but no power-control snapshot has arrived yet.</p>
             )}
+          </Card>
+
+          {trafficPower && (
+            <Card title="Reverse Loop Detail">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                <Tile label="Recent peak" sub={reverseFrameMaxPcgs.length ? `PCG ${reverseFrameMaxPcgs.join(", ")}` : "latest 20 ms"}>
+                  {reverseFrameMax != null ? reverseFrameMax.toFixed(1) : "-"} <span className="text-xs font-normal text-muted">dB</span>
+                </Tile>
+                <Tile label="Active PCGs" sub={trafficPower.lastActivePcgMask?.length === 16 ? "exact transmit mask" : "within 10 dB of peak"}>
+                  {reverseActivePcgs != null ? `${reverseActivePcgs}/16` : "-"}
+                </Tile>
+                <Tile label="Bad frames" sub="lifetime FQI / CRC">
+                  {trafficPower.framesCrcError}
+                </Tile>
+                <Tile label="Pilot Ec/Io" sub="reverse finger, diagnostic">
+                  {reversePilotEcIoText ?? "-"}
+                </Tile>
+              </div>
+              <details className="mt-4">
+                <summary className="cursor-pointer select-none text-xs uppercase tracking-wide text-muted">Per-PCG detail</summary>
+                <div className="mt-3">
+                <div className="mb-2 flex items-center justify-between gap-3">
+                  <div className="text-xs uppercase tracking-wide text-muted">
+                    Latest Per-PCG {metricLabel}
+                  </div>
+                  <div className="text-[11px] text-muted">
+                    ● = active, ○ = inactive, ▲ = last scheduled UP, ▼ = last scheduled DOWN
+                  </div>
+                </div>
+                <div className="mb-2 text-[11px] text-muted">
+                  {isRc3
+                    ? "Showing pilot SINR (inner-loop control metric). Frame data Eb/Nt shown below each value."
+                    : "Peak highlighting is diagnostic only."}{" "}
+                  Reverse closed-loop decisions are scheduled one PCG at a time on the absolute-PCG timeline.
+                </div>
+                <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                  {innerLoopPcgDb.map((db, i) => {
+                    const pcb = trafficPower.lastPcbs[i];
+                    const isFrameMax = reverseFrameMaxPcgs.includes(i);
+                    const active = isActivePcg(
+                      i,
+                      db,
+                      reverseGatedCutoff,
+                      trafficPower.lastActivePcgMask,
+                    );
+                    const frameDb = frameEbNtDb[i];
+                    const tone = !active
+                      ? "border-border-subtle bg-surface text-muted opacity-70"
+                      : reverseTargetDb != null && db >= reverseTargetDb
+                        ? "border-accent-green/20 bg-accent-green-bg text-accent-green"
+                        : reverseTargetDb != null && db >= reverseTargetDb - 3
+                          ? "border-accent-amber/20 bg-accent-amber-bg text-accent-amber"
+                          : "border-accent-red/20 bg-accent-red-bg text-accent-red";
+                    return (
+                      <div
+                        key={i}
+                        className={`rounded-md border px-3 py-2 ${tone} ${
+                          isFrameMax ? "ring-1 ring-sky-500/60" : ""
+                        }`}
+                        title={
+                          isFrameMax
+                            ? active
+                              ? pcb === 0
+                                ? "Recent-peak PCG, last scheduled UP (PCB=0)"
+                                : "Recent-peak PCG, last scheduled DOWN (PCB=1)"
+                              : "Recent-peak PCG, inactive"
+                            : active
+                            ? pcb === 0
+                              ? "Last scheduled UP (PCB=0)"
+                              : "Last scheduled DOWN (PCB=1)"
+                            : "Inactive PCG"
+                        }
+                      >
+                        <div className="flex items-center justify-between gap-3 text-[11px] uppercase tracking-wide">
+                          <div className="flex items-center gap-2">
+                            <span
+                              className={active ? "text-accent-green" : "text-muted"}
+                              title={active ? "Active PCG" : "Inactive PCG"}
+                            >
+                              {active ? "●" : "○"}
+                            </span>
+                            <span className="text-muted">PCG {i}</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            {isFrameMax && (
+                              <span
+                                className="inline-flex items-center gap-1 rounded-full border border-sky-500/40 bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-sky-300"
+                                title="Recent peak in the latest 20 ms measurement snapshot"
+                              >
+                                <svg
+                                  viewBox="0 0 20 20"
+                                  fill="currentColor"
+                                  className="h-3 w-3"
+                                  aria-hidden="true"
+                                >
+                                  <path d="M10 2.5l2.1 4.26 4.7.68-3.4 3.31.8 4.68L10 13.2l-4.2 2.23.8-4.68-3.4-3.31 4.7-.68L10 2.5z" />
+                                </svg>
+                                PEAK
+                              </span>
+                            )}
+                            {active ? (
+                              <span className={pcb === 0 ? "text-accent-green" : "text-accent-red"}>
+                                {pcb === 0 ? "▲" : "▼"}
+                              </span>
+                            ) : (
+                              <span className="text-dimmed"> </span>
+                            )}
+                          </div>
+                        </div>
+                        <div className="mt-1 font-mono text-sm">{db != null && Number.isFinite(db) ? `${db.toFixed(2)} dB` : "---"}</div>
+                        {isRc3 && active && frameDb != null && Number.isFinite(frameDb) && (
+                          <div className="mt-0.5 font-mono text-[10px] text-muted" title="Per-frame data Eb/Nt from decoded traffic">
+                            Eb/Nt {frameDb.toFixed(1)}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+                </div>
+              </details>
+            </Card>
+          )}
+        </div>
+      )}
+
+      {activeTab === "messages" && (
+        <Card
+          title={`Message History (${messages.length})`}
+          action={
+            <button
+              type="button"
+              onClick={() => setMsgPaused((p) => !p)}
+              className="inline-flex items-center gap-1.5 rounded-full border border-border px-2.5 py-0.5 text-[11px] text-muted hover:text-secondary"
+              title={msgPaused ? "Resume live updates" : "Pause live updates"}
+            >
+              <span className={`h-1.5 w-1.5 rounded-full ${holdMessages ? "bg-accent-amber" : "bg-accent-green"}`} />
+              {liveLabel}
+            </button>
+          }
+        >
+          <div className="mb-3 flex flex-wrap items-center gap-2">
+            <div className="inline-flex rounded border border-border bg-surface p-0.5">
+              {(["all", ...categories] as const).map((c) => (
+                <button
+                  key={c}
+                  type="button"
+                  onClick={() => {
+                    setMsgFilter(c);
+                    setMsgPage(0);
+                  }}
+                  className={`rounded px-2.5 py-1 text-xs transition-colors ${
+                    msgFilter === c ? "bg-surface-raised text-secondary" : "text-muted hover:text-secondary"
+                  }`}
+                >
+                  {c === "all" ? "All" : MESSAGE_CATEGORY_LABEL[c]}
+                </button>
+              ))}
+            </div>
+            <input
+              type="search"
+              value={msgQuery}
+              onChange={(e) => {
+                setMsgQuery(e.target.value);
+                setMsgPage(0);
+              }}
+              placeholder="Search type or summary"
+              className="min-w-48 flex-1 glass-input text-sm"
+            />
           </div>
+          {pinned.length > 0 && (
+            <div className="mb-3 rounded-lg border border-border bg-surface-raised px-3 pb-1">
+              <div className="flex items-center justify-between py-1.5 text-[11px] text-muted">
+                <span>
+                  <span className="text-secondary font-medium">Pinned</span> · stays here across pages, filters and new messages
+                </span>
+                <button type="button" onClick={() => setPinned([])} className="hover:text-secondary">
+                  Clear
+                </button>
+              </div>
+              {pinned.map((entry) => (
+                <MessageRow key={entry.id} entry={entry} view={messageView(entry, messageCtx)} open actions={pinControl(entry)} />
+              ))}
+            </div>
+          )}
+          {heldMessageCount > 0 && (
+            <button
+              type="button"
+              onClick={showHeldMessages}
+              className="mx-auto mb-2 flex rounded-full bg-accent-blue-bg px-4 py-1 text-xs text-accent-blue shadow-sm hover:opacity-90"
+            >
+              ↑ {heldMessageCount} new message{heldMessageCount > 1 ? "s" : ""} · show
+            </button>
+          )}
+          {shownMessages.length === 0 ? (
+            <p className="text-dimmed text-sm">No messages since this page opened. New ones appear as they are sent and received.</p>
+          ) : filteredViews.length === 0 ? (
+            <p className="text-dimmed text-sm">No messages match.</p>
+          ) : (
+            <>
+              <MessageListHeader />
+              <div ref={messageListRef}>
+                {pageViews.map(({ entry, view }) => {
+                  const open = expanded.has(entry.id);
+                  return (
+                    <MessageRow
+                      key={entry.id}
+                      entry={entry}
+                      view={view}
+                      open={open}
+                      onToggle={() => toggleExpand(entry.id)}
+                      actions={pinControl(entry)}
+                    />
+                  );
+                })}
+              </div>
+              <Pager
+                page={filteredPage}
+                pageSize={msgPageSize}
+                total={filteredViews.length}
+                pageSizes={MESSAGE_PAGE_SIZES}
+                onPage={setMsgPage}
+                onPageSize={(size) => {
+                  setMsgPageSize(size);
+                  setMsgPage(0);
+                }}
+              />
+            </>
+          )}
         </Card>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <Card title="Access Activity">
-          <AccessActivity
-            filter={{
-              imsis: mobile.imsi ? [mobile.imsi] : [],
-              esn: mobile.esn ?? undefined,
-              meid: mobile.meid || undefined,
-            }}
-          />
+      {activeTab === "sms" && (
+        <Card
+          title="SMS"
+          action={
+            <button
+              type="button"
+              onClick={() => setSmsOpen(true)}
+              className="text-xs px-2.5 py-1 rounded bg-accent-green-bg text-accent-green border border-accent-green/20 hover:bg-accent-green/15"
+            >
+              Send SMS
+            </button>
+          }
+        >
+          <SmsList phone={mobile.phoneNumber} refreshKey={smsRefresh} />
         </Card>
-        <Card title="Authentication Activity">
-          <AuthenticationActivity imsis={authImsis} esn={mobile.esn ?? undefined} />
-        </Card>
-      </div>
+      )}
 
-      <Card title={`Message History (${messages.length})`}>
-        {messages.length === 0 ? (
-          <p className="text-dimmed text-sm">
-            No messages for this mobile yet. Messages will appear as they are sent/received.
-          </p>
-        ) : (
-          <div className="space-y-0">
-            {messages.map((entry) => {
-              const isExpanded = expanded.has(entry.id);
-              if (entry.kind === "tx" && entry.stream === "paging") {
-                const h = entry.event.header;
-                const typeName = h?.msgTypeName ?? "Unknown";
-                const detail = formatPagingSummary(entry.event);
-                return (
-                  <div
-                    key={entry.id}
-                    className="border-b border-border-subtle py-1.5 px-2 -mx-2 rounded"
-                  >
-                    <div
-                      className="flex items-center gap-2 text-sm cursor-pointer hover:bg-hover rounded"
-                      onClick={() => toggleExpand(entry.id)}
-                    >
-                      <div className="flex-1 min-w-0 flex items-center gap-2">
-                        <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
-                        <LaneBadge lane="L3" />
-                        <span className="text-accent-blue font-mono text-xs w-12 shrink-0">1x TX</span>
-                        <span className="inline-block w-5 shrink-0" />
-                        <span className="text-dimmed text-xs shrink-0">F-PCH</span>
-                        <span className="text-primary shrink-0">{typeName}</span>
-                        {entry.seenCount > 1 && (
-                          <span className="text-muted text-xs shrink-0">x{entry.seenCount}</span>
-                        )}
-                        {detail && (
-                          <span className="text-muted text-xs truncate">{detail}</span>
-                        )}
-                      </div>
-                      <div className="shrink-0 flex items-center gap-1">
-                        <span className="text-accent-amber text-xs font-mono w-14 text-right">{h ? `SEQ=${h.msgSeq}` : ""}</span>
-                        <span className="text-accent-green text-xs font-mono w-14 text-right">{h?.validAck ? `ACK=${h.ackSeq}` : ""}</span>
-                        <span className="text-badge-orange-text text-xs w-4 text-center" title="ACK required">{h?.ackReq ? "↩" : ""}</span>
-                        <span className="text-dimmed text-xs">{isExpanded ? "▾" : "▸"}</span>
-                      </div>
+      {activeTab === "otasp" && (
+        <RecentOtaspCard title="OTASP Sessions" esn={mobile.esn} meid={mobile.meid} />
+      )}
+
+      {activeTab === "activity" && (
+        <MobileActivity
+          filter={{
+            imsis: mobile.imsi ? [mobile.imsi] : [],
+            esn: mobile.esn ?? undefined,
+            meid: mobile.meid || undefined,
+          }}
+        />
+      )}
+
+      {activeTab === "data" && (
+        <div className="space-y-4">
+          {mobilePacketSessions.length === 0 ? (
+            <Card title="Data Sessions">
+              <p className="text-dimmed text-sm">No active data session.</p>
+            </Card>
+          ) : (
+            mobilePacketSessions.map((session) => (
+              <Card
+                key={session.sessionId}
+                title={`${session.accessTechnology || "1x"} data session · SO ${session.serviceOption}`}
+                action={<span className="rounded bg-surface-raised px-2 py-0.5 text-xs text-secondary">{session.phase}</span>}
+              >
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                  <Tile label="Mobile IP">
+                    <span className="font-mono text-base">{session.peerIp || "-"}</span>
+                  </Tile>
+                  <Tile label="Gateway IP">
+                    <span className="font-mono text-base">{session.ourIp || "-"}</span>
+                  </Tile>
+                  <Tile label="Last activity">
+                    <span className="text-base">
+                      {session.lastActivityAtMs ? new Date(session.lastActivityAtMs).toLocaleTimeString() : "-"}
+                    </span>
+                  </Tile>
+                  <Tile label="Channel">
+                    <span className="font-mono text-base">
+                      {session.trafficWalshCode
+                        ? session.accessTechnology === "HRPD"
+                          ? `key ${session.trafficWalshCode}`
+                          : `W${session.trafficWalshCode}`
+                        : "-"}
+                    </span>
+                  </Tile>
+                </div>
+                <div className="mt-4 grid gap-4 md:grid-cols-3">
+                  <div>
+                    <div className="mb-1 text-[11px] uppercase tracking-wide text-muted">Session</div>
+                    <div className="flex justify-between py-0.5">
+                      <span className="text-muted text-sm">Session ID</span>
+                      <Link
+                        href={`/packets/${encodeURIComponent(session.sessionId)}`}
+                        className="max-w-[60%] truncate font-mono text-sm text-accent-green hover:text-accent-green"
+                      >
+                        {session.sessionId}
+                      </Link>
                     </div>
-                    {isExpanded && h && (
-                      <div className="mt-2 mb-1 ml-8 rounded-lg border border-border-primary bg-surface p-3">
-                        <div className="text-xs text-muted mb-1">
-                          MSG_TAG: 0x{h.msgTag.toString(16).toUpperCase().padStart(2, "0")} | MSG_SEQ: {h.msgSeq} | ACK_SEQ: {h.ackSeq} | ACK_REQ: {h.ackReq ? "1" : "0"} | VALID_ACK: {h.validAck ? "1" : "0"}
-                        </div>
-                        <PagingDetail event={entry.event} />
-                      </div>
-                    )}
+                    <Stat label="TUN" value={session.tunDevice || "-"} mono />
                   </div>
-                );
-              } else if (entry.kind === "tx") {
-                const h = entry.event.header;
-                const typeName = h?.msgTypeName ?? "Unknown";
-                const detail = formatTrafficSummary(entry.event);
-                return (
-                  <div
-                    key={entry.id}
-                    className="border-b border-border-subtle py-1.5 px-2 -mx-2 rounded"
-                  >
-                    <div
-                      className="flex items-center gap-2 text-sm cursor-pointer hover:bg-hover rounded"
-                      onClick={() => toggleExpand(entry.id)}
+                  <div>
+                    <div className="mb-1 text-[11px] uppercase tracking-wide text-muted">Identity</div>
+                    <Stat label="MN ID" value={session.mnId || "-"} mono />
+                    <Stat label="Source" value={session.mnIdSource || "-"} />
+                  </div>
+                  <div>
+                    <div className="mb-1 text-[11px] uppercase tracking-wide text-muted">Capture</div>
+                    <Stat label="Packet capture" value={session.captureEnabled ? "On" : "Off"} />
+                    <Link
+                      href={`/packets/${encodeURIComponent(session.sessionId)}`}
+                      className="mt-2 inline-block text-xs px-2.5 py-1 rounded border border-border-input text-secondary hover:bg-surface-raised"
                     >
-                      <div className="flex-1 min-w-0 flex items-center gap-2">
-                        <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
-                        <LaneBadge lane="L3" />
-                        <span className="text-accent-cyan font-mono text-xs w-12 shrink-0">1x TX</span>
-                        <span className="inline-block w-5 shrink-0" />
-                        <span className="text-dimmed text-xs shrink-0">{formatTrafficChannel(entry.event)}</span>
-                        <span className="text-primary shrink-0">{typeName}</span>
-                        {entry.seenCount > 1 && (
-                          <span className="text-muted text-xs shrink-0">x{entry.seenCount}</span>
-                        )}
-                        {detail && (
-                          <span className="text-muted text-xs truncate">{detail}</span>
-                        )}
-                      </div>
-                      <div className="shrink-0 flex items-center gap-1">
-                        <span className="text-accent-amber text-xs font-mono w-14 text-right">{h ? `SEQ=${h.msgSeq}` : ""}</span>
-                        <span className="text-accent-green text-xs font-mono w-14 text-right">{h?.validAck ? `ACK=${h.ackSeq}` : ""}</span>
-                        <span className="text-badge-orange-text text-xs w-4 text-center" title="ACK required">{h?.ackReq ? "↩" : ""}</span>
-                        <span className="text-dimmed text-xs">{isExpanded ? "▾" : "▸"}</span>
-                      </div>
-                    </div>
-                    {isExpanded && h && (
-                      <div className="mt-2 mb-1 ml-8 rounded-lg border border-border-primary bg-surface p-3">
-                        <div className="text-xs text-muted mb-1">
-                          MSG_TAG: 0x{h.msgTag.toString(16).toUpperCase().padStart(2, "0")} | MSG_SEQ: {h.msgSeq} | ACK_SEQ: {h.ackSeq} | ACK_REQ: {h.ackReq ? "1" : "0"} | VALID_ACK: {h.validAck ? "1" : "0"}
-                        </div>
-                        <TrafficDetail event={entry.event} />
-                      </div>
-                    )}
+                      Open session →
+                    </Link>
                   </div>
-                );
-              } else if (entry.kind === "hrpd") {
-                let typeName: string;
-                let summary: string;
-                let detail;
-                if (entry.stream === "session") {
-                  typeName = "HRPD Session";
-                  summary = formatHrpdSessionSummary(entry.event);
-                  detail = <HrpdSessionDetail event={entry.event} />;
-                } else if (entry.stream === "access") {
-                  typeName = "HRPD Access";
-                  summary = formatHrpdAccessSummary(entry.event);
-                  detail = <HrpdAccessDetail event={entry.event} />;
-                } else {
-                  typeName = "HRPD Traffic";
-                  summary = formatHrpdTrafficSummary(entry.event);
-                  detail = <HrpdTrafficDetail event={entry.event} />;
-                }
-                return (
-                  <div
-                    key={entry.id}
-                    className="border-b border-border-subtle py-1.5 px-2 -mx-2 rounded"
-                  >
-                    <div
-                      className="flex items-center gap-2 text-sm cursor-pointer hover:bg-hover rounded"
-                      onClick={() => toggleExpand(entry.id)}
-                    >
-                      <div className="flex-1 min-w-0 flex items-center gap-2">
-                        <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
-                        <LaneBadge lane="L3" />
-                        <span className={`${"direction" in entry.event ? hrpdDirectionClass(entry.event.direction) : hrpdDirectionClass()} font-mono text-xs w-16 shrink-0`}>
-                          {"direction" in entry.event ? hrpdDirectionLabel(entry.event.direction) : "EVDO"}
-                        </span>
-                        <span className="inline-block w-5 shrink-0" />
-                        <span className="text-primary shrink-0">{typeName}</span>
-                        {entry.seenCount > 1 && (
-                          <span className="text-muted text-xs shrink-0">x{entry.seenCount}</span>
-                        )}
-                        <span className="text-muted text-xs truncate">{summary}</span>
-                      </div>
-                      <div className="shrink-0 flex items-center gap-1">
-                        <span className="text-dimmed text-xs">{isExpanded ? "▾" : "▸"}</span>
-                      </div>
-                    </div>
-                    {isExpanded && (
-                      <div className="mt-2 mb-1 ml-8 rounded-lg border border-border-primary bg-surface p-3">{detail}</div>
-                    )}
-                  </div>
-                );
-              } else if (entry.kind === "a1") {
-                const ev = entry.event;
-                return (
-                  <div
-                    key={entry.id}
-                    className="border-b border-border-subtle py-1.5 px-2 -mx-2 rounded"
-                  >
-                    <div
-                      className="flex items-center gap-2 text-sm cursor-pointer hover:bg-hover rounded"
-                      onClick={() => toggleExpand(entry.id)}
-                    >
-                      <div className="flex-1 min-w-0 flex items-center gap-2">
-                        <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
-                        <LaneBadge lane="A1" />
-                        <span className={`${a1DirectionClass(ev.direction)} font-mono text-xs w-12 shrink-0`}>
-                          {a1DirectionLabel(ev.direction)}
-                        </span>
-                        <span className="inline-block w-5 shrink-0" />
-                        <span className="text-primary shrink-0">{a1TypeName(ev)}</span>
-                        {entry.seenCount > 1 && (
-                          <span className="text-muted text-xs shrink-0">x{entry.seenCount}</span>
-                        )}
-                        <span className="text-muted text-xs truncate">{formatA1Summary(ev)}</span>
-                      </div>
-                      <div className="shrink-0 flex items-center gap-1">
-                        <span className="text-accent-amber text-xs font-mono w-20 text-right">
-                          {ev.sduLengthBytes ? `${ev.sduLengthBytes}B` : ""}
-                        </span>
-                        <span className="text-dimmed text-xs">{isExpanded ? "▾" : "▸"}</span>
-                      </div>
-                    </div>
-                    {isExpanded && (
-                      <div className="mt-2 mb-1 ml-8 rounded-lg border border-border-primary bg-surface p-3">
-                        <A1Detail event={ev} cells={cells} />
-                      </div>
-                    )}
-                  </div>
-                );
-              } else {
-                const ev = entry.event;
-                return (
-                  <div
-                    key={entry.id}
-                    className="border-b border-border-subtle py-1.5 px-2 -mx-2 rounded"
-                  >
-                    <div
-                      className="flex items-center gap-2 text-sm cursor-pointer hover:bg-hover rounded"
-                      onClick={() => toggleExpand(entry.id)}
-                    >
-                      <div className="flex-1 min-w-0 flex items-center gap-2">
-                        <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
-                        <LaneBadge lane="L3" />
-                        <span className="text-accent-green font-mono text-xs w-12 shrink-0">1x RX</span>
-                        <AuthenticationMark
-                          verdict={verdictForAccess(
-                            ev,
-                            entry.ts,
-                            { imsi: mobile.imsi ?? undefined, esn: mobile.esn ?? undefined },
-                            verdicts,
-                          )}
-                        />
-                        <span className="text-dimmed text-xs shrink-0">{formatAccessChannel(ev)}</span>
-                        <span className="text-primary shrink-0">{ev.msgTypeName}</span>
-                        {entry.seenCount > 1 && (
-                          <span className="text-muted text-xs shrink-0">x{entry.seenCount}</span>
-                        )}
-                        <span className="text-muted text-xs truncate">{formatAccessSummary(ev)}</span>
-                      </div>
-                      <div className="shrink-0 flex items-center gap-1">
-                        <span className="text-accent-amber text-xs font-mono w-14 text-right">{ev.msgSeq != null ? `SEQ=${ev.msgSeq}` : ""}</span>
-                        <span className="text-accent-green text-xs font-mono w-14 text-right">{ev.validAck && ev.ackSeq != null ? `ACK=${ev.ackSeq}` : ""}</span>
-                        <span className="text-badge-orange-text text-xs w-4 text-center" title="ACK required">{ev.ackReq ? "↩" : ""}</span>
-                        <span className="text-dimmed text-xs">{isExpanded ? "▾" : "▸"}</span>
-                      </div>
-                    </div>
-                    {isExpanded && (
-                      <div className="mt-2 mb-1 ml-8 rounded-lg border border-border-primary bg-surface p-3">
-                        <AccessDetail event={ev} verdict={verdictForAccess(ev, entry.ts, { imsi: mobile.imsi ?? undefined, esn: mobile.esn ?? undefined }, verdicts)} />
-                      </div>
-                    )}
-                  </div>
-                );
-              }
-            })}
-          </div>
-        )}
-      </Card>
+                </div>
+              </Card>
+            ))
+          )}
+        </div>
+      )}
+
+      <SendSmsDialog
+        open={smsOpen}
+        onClose={() => setSmsOpen(false)}
+        phoneNumber={mobile.phoneNumber}
+        imsi={mobile.imsi || undefined}
+        onSent={(to) => {
+          setSmsRefresh((k) => k + 1);
+          showToast(`Message sent to ${to}`);
+        }}
+      />
+      <Toast toast={toast} />
     </div>
   );
 }

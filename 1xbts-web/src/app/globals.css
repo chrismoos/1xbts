@@ -36,6 +36,8 @@
   --accent-red: #f87171;
   --accent-blue: #60a5fa;
   --accent-cyan: #22d3ee;
+  --accent-lime: #a3e635;
+  --signal-bar-off: rgba(255, 255, 255, 0.12);
 
   /* Accent backgrounds */
   --accent-indigo-bg: rgba(99, 102, 241, 0.15);
@@ -103,6 +105,8 @@
   --accent-amber: #d97706;
   --accent-purple: #7c3aed;
   --accent-red: #dc2626;
+  --accent-lime: #65a30d;
+  --signal-bar-off: #e2e2e8;
   --accent-blue: #6366f1;
   --accent-indigo-text: #6366f1;
 
@@ -171,6 +175,8 @@
   --color-accent-red: var(--accent-red);
   --color-accent-blue: var(--accent-blue);
   --color-accent-cyan: var(--accent-cyan);
+  --color-accent-lime: var(--accent-lime);
+  --color-signal-bar-off: var(--signal-bar-off);
 
   --color-accent-indigo-bg: var(--accent-indigo-bg);
   --color-accent-green-bg: var(--accent-green-bg);

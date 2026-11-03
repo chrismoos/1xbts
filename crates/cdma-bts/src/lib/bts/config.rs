@@ -624,12 +624,18 @@ pub struct BtsAbisConfig {
     /// Local TCP address for the BTS Abis signaling listener. Default `127.0.0.1:5604`.
     #[serde(default = "default_bts_abis_bind_addr")]
     pub bind_addr: SocketAddr,
+    /// When `true`, the BTS requests release of a traffic channel that stops
+    /// decoding valid reverse frames. When `false` (the default), the channel
+    /// stays up until the BSC releases it.
+    #[serde(default)]
+    pub radio_link_loss_release: bool,
 }
 
 impl Default for BtsAbisConfig {
     fn default() -> Self {
         Self {
             bind_addr: default_bts_abis_bind_addr(),
+            radio_link_loss_release: false,
         }
     }
 }

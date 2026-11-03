@@ -228,6 +228,7 @@ fn test_agent_config() -> AbisAgentConfig {
         pilot_pn: 0,
         cell_id: CellId { cell: 1, sector: 1 },
         mscid: 1,
+        radio_link_loss_release: false,
     }
 }
 
@@ -340,6 +341,7 @@ pub(super) const TEST_CELL: AccessCellId = AccessCellId { cell: 1, sector: 1 };
 
 fn test_access_event() -> AccessChannelEvent {
     AccessChannelEvent {
+        access_signal: Default::default(),
         cell: Some(TEST_CELL),
         event_id: "test-access-event".to_string(),
         chip_start: 0,
@@ -1948,6 +1950,44 @@ async fn mt_callee_pre_answer_bearer_does_not_stop_handset_alerting() {
     assert!(
         tc.last_forward_enqueue_at.is_none(),
         "pre-answer bearer media must not enqueue tones-off or traffic"
+    );
+}
+
+#[tokio::test]
+async fn a_ringing_mobile_is_alerted_again_on_the_configured_interval() {
+    let (mut bsc, mut traffic_rx, walsh_code) = test_bsc_with_active_traffic_channel(3).await;
+    bsc.config.traffic_assignment.mt_alert_refresh_s = 1;
+    {
+        let tc = bsc.mobiles[0]
+            .find_traffic_channel_by_walsh_mut(walsh_code)
+            .expect("traffic channel should exist");
+        tc.voice_leg_role = Some(VoiceLegRole::Callee);
+        tc.channel_state = ChannelState::VoiceAlerting {
+            awim_sent_at: std::time::Instant::now() - Duration::from_secs(2),
+            mode: VoiceAlertMode::WaitForConnectOrder,
+        };
+    }
+    while traffic_rx.try_recv().is_ok() {}
+
+    bsc.refresh_alerting_calls();
+
+    let events = std::iter::from_fn(|| traffic_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        events.iter().any(|event| event.alert_with_info.is_some()),
+        "the alert should be sent again"
+    );
+    let tc = bsc.mobiles[0]
+        .find_traffic_channel_by_walsh(walsh_code)
+        .expect("traffic channel should still exist");
+    assert!(matches!(
+        tc.channel_state,
+        ChannelState::VoiceAlerting { awim_sent_at, .. } if awim_sent_at.elapsed() < Duration::from_secs(1)
+    ));
+
+    bsc.refresh_alerting_calls();
+    assert!(
+        traffic_rx.try_recv().is_err(),
+        "a mobile alerted within the interval is left alone"
     );
 }
 

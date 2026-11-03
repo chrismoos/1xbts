@@ -1,38 +1,15 @@
 "use client";
 
-import { VoicePrivacyIndicator } from "@/components/voice-privacy-indicator";
-import { useState, useCallback, type ReactNode } from "react";
+import { useState, useCallback } from "react";
 import Link from "next/link";
 import { Card } from "@/components/card";
+import { MessageListHeader, MessageRow, messageView } from "@/components/message-row";
 import {
-  AccessDetail,
-  PagingDetail,
-  TrafficDetail,
-  HrpdSessionDetail,
-  HrpdAccessDetail,
-  HrpdTrafficDetail,
-  formatAccessSummary,
-  formatAccessChannel,
-  formatAccessTypeName,
-  formatPagingChannel,
-  formatPagingSummary,
-  formatTrafficChannel,
-  formatTrafficSummary,
-  formatHrpdSessionSummary,
-  formatHrpdAccessSummary,
-  formatHrpdTrafficSummary,
-  hrpdDirectionClass,
   hrpdDirectionLabel,
   shouldHideAccessEvent,
-  A1Detail,
-  LaneBadge,
 } from "@/components/message-detail";
 import {
-  a1DirectionClass,
-  a1DirectionLabel,
   a1TimestampUs,
-  a1TypeName,
-  formatA1Summary,
   type A1LogEvent,
 } from "@/lib/a1-event";
 import {
@@ -53,18 +30,18 @@ import {
   uatiHex,
   uatiHexDigits,
 } from "@/lib/hrpd-correlation";
-import { AuthenticationMark } from "@/components/authentication-activity";
-import { type AuthVerdict, verdictForAccess } from "@/lib/authentication-verdict";
-import { cellLabel } from "@/lib/cell";
+import { type AuthVerdict } from "@/lib/authentication-verdict";
 import { useBtsList } from "@/lib/use-bts-list";
-import { useEventStream } from "@/lib/use-event-stream";
-import { type LogEntry, makeLogEntryId, makeSortKey, sortLogEntries, formatTime } from "@/lib/message-log";
+import { useEventStream, type EventStreamOptions } from "@/lib/use-event-stream";
+import { type LogEntry, makeLogEntryId, makeSortKey, sortLogEntries } from "@/lib/message-log";
 import type { AccessEvent, PagingEvent, TrafficEvent } from "@/lib/proto/bsc/v1/service";
 import {
   HrpdAccessEvent,
   HrpdSessionEvent,
   HrpdTrafficEvent,
 } from "@/lib/proto/events/v1/an";
+
+const REPLAY_EVENTS: EventStreamOptions = { replay: true };
 
 /** MSC authentication verdicts kept for matching against access rows. */
 const MAX_VERDICTS = 500;
@@ -232,7 +209,7 @@ export default function MessagesPage() {
   useEventStream("authentication", useCallback((data: string) => {
     const verdict: AuthVerdict = JSON.parse(data);
     setVerdicts((prev) => [verdict, ...prev].slice(0, MAX_VERDICTS));
-  }, []));
+  }, []), REPLAY_EVENTS);
   const { cells } = useBtsList();
 
 
@@ -264,7 +241,7 @@ export default function MessagesPage() {
         seenCount: 1,
       });
     }
-  }, [addEntry]));
+  }, [addEntry]), REPLAY_EVENTS);
 
   useEventStream("traffic", useCallback((data: string) => {
     const event: TrafficEvent = JSON.parse(data);
@@ -281,7 +258,7 @@ export default function MessagesPage() {
         seenCount: 1,
       });
     }
-  }, [addEntry]));
+  }, [addEntry]), REPLAY_EVENTS);
 
   useEventStream("access", useCallback((data: string) => {
     const event: AccessEvent = JSON.parse(data);
@@ -297,7 +274,7 @@ export default function MessagesPage() {
         seenCount: 1,
       });
     }
-  }, [addEntry]));
+  }, [addEntry]), REPLAY_EVENTS);
 
   // HRPD/EV-DO events arrive from the aggregated event bus. They carry no
   // wire timestamp, so stamp them with receive time.
@@ -311,7 +288,7 @@ export default function MessagesPage() {
       id: makeLogEntryId("hrpd", ts), ts,
       identity, sortKey: identity, event, seenCount: 1,
     });
-  }, [addEntry]));
+  }, [addEntry]), REPLAY_EVENTS);
 
   useEventStream("hrpd-access", useCallback((data: string) => {
     const event = HrpdAccessEvent.fromJSON(JSON.parse(data));
@@ -323,7 +300,7 @@ export default function MessagesPage() {
       id: makeLogEntryId("hrpd", ts), ts,
       identity, sortKey: identity, event, seenCount: 1,
     });
-  }, [addEntry]));
+  }, [addEntry]), REPLAY_EVENTS);
 
   useEventStream("hrpd-traffic", useCallback((data: string) => {
     const event = HrpdTrafficEvent.fromJSON(JSON.parse(data));
@@ -336,7 +313,7 @@ export default function MessagesPage() {
       id: makeLogEntryId("hrpd", ts), ts,
       identity, sortKey: identity, event, seenCount: 1,
     });
-  }, [addEntry]));
+  }, [addEntry]), REPLAY_EVENTS);
 
 
 
@@ -353,7 +330,7 @@ export default function MessagesPage() {
       event,
       seenCount: 1,
     });
-  }, [addEntry]));
+  }, [addEntry]), REPLAY_EVENTS);
 
   const toggleExpand = (id: string) => {
     setExpanded((prev) => {
@@ -362,6 +339,13 @@ export default function MessagesPage() {
       else next.add(id);
       return next;
     });
+  };
+
+  const messageCtx = {
+    mobile: {},
+    verdicts,
+    cells,
+    resolveMobile: (event: AccessEvent) => mobileForEvent(event, mobiles),
   };
 
   const filtered = filter === "all" ? entries : entries.filter((e) => hrpdFilterKey(e) === filter);
@@ -407,226 +391,27 @@ export default function MessagesPage() {
         {filtered.length === 0 ? (
           <p className="text-dimmed text-sm">Waiting for messages...</p>
         ) : (
-          <div className="space-y-0">
-            {filtered.map((entry) => {
-              const isExpanded = expanded.has(entry.id);
-              if (entry.kind === "tx" && entry.stream === "paging") {
-                const h = entry.event.header;
-                const typeName = h?.msgTypeName ?? "Unknown";
-                const detail = formatPagingSummary(entry.event);
-                const channel = formatPagingChannel(entry.event);
-                return (
-                  <div
-                    key={entry.id}
-                    className="border-b border-border-subtle py-1.5 px-2 -mx-2 rounded"
-                  >
-                    <div
-                      className="flex items-center gap-2 text-sm cursor-pointer hover:bg-hover rounded"
-                      onClick={() => toggleExpand(entry.id)}
-                    >
-                      <div className="flex-1 min-w-0 flex items-center gap-2">
-                        <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
-                        <LaneBadge lane="L3" />
-                        <MobileCell event={entry.event} mobiles={mobiles} />
-                        <span className="text-accent-blue font-mono text-xs w-12 shrink-0">1x TX</span>
-                        <span className="inline-block w-5 shrink-0" />
-                        {entry.event.cell && <span className="text-dimmed font-mono text-xs shrink-0" title="Cell/Sector">{cellLabel(entry.event.cell)}</span>}
-                        <span className="text-dimmed text-xs shrink-0">{channel}</span>
-                        <span className="text-primary font-medium shrink-0">{typeName}</span>
-                        {entry.seenCount > 1 && <span className="text-muted text-xs shrink-0">x{entry.seenCount}</span>}
-                        {detail && <span className="text-muted text-xs truncate">{detail}</span>}
-                      </div>
-                      <div className="shrink-0 flex items-center gap-1">
-                        <span className="text-accent-amber text-xs font-mono w-14 text-right">{h ? `SEQ=${h.msgSeq}` : ""}</span>
-                        <span className="text-accent-green text-xs font-mono w-14 text-right">{h?.validAck ? `ACK=${h.ackSeq}` : ""}</span>
-                        <span className="text-badge-orange-text text-xs w-4 text-center" title="ACK required">{h?.ackReq ? "↩" : ""}</span>
-                        <span className="text-dimmed text-xs">{isExpanded ? "▾" : "▸"}</span>
-                      </div>
-                    </div>
-                    {isExpanded && (
-                      <div className="mt-2 mb-1 ml-8 rounded-lg border border-border-primary bg-surface p-3">
-                        {h && (
-                          <div className="text-xs text-muted mb-1">
-                            MSG_TAG: 0x{h.msgTag.toString(16).toUpperCase().padStart(2, "0")} | MSG_SEQ: {h.msgSeq} | ACK_SEQ: {h.ackSeq} | ACK_REQ: {h.ackReq ? "1" : "0"} | VALID_ACK: {h.validAck ? "1" : "0"}
-                          </div>
-                        )}
-                        <PagingDetail event={entry.event} />
-                      </div>
-                    )}
-                  </div>
-                );
-              } else if (entry.kind === "tx") {
-                const h = entry.event.header;
-                const typeName = h?.msgTypeName ?? "Unknown";
-                const detail = formatTrafficSummary(entry.event);
-                const channel = formatTrafficChannel(entry.event);
-                return (
-                  <div
-                    key={entry.id}
-                    className="border-b border-border-subtle py-1.5 px-2 -mx-2 rounded"
-                  >
-                    <div
-                      className="flex items-center gap-2 text-sm cursor-pointer hover:bg-hover rounded"
-                      onClick={() => toggleExpand(entry.id)}
-                    >
-                      <div className="flex-1 min-w-0 flex items-center gap-2">
-                        <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
-                        <LaneBadge lane="L3" />
-                        <MobileCell event={entry.event} mobiles={mobiles} />
-                        <span className="text-accent-cyan font-mono text-xs w-12 shrink-0">1x TX</span>
-                        <span className="inline-block w-5 shrink-0" />
-                        {entry.event.cell && <span className="text-dimmed font-mono text-xs shrink-0" title="Cell/Sector">{cellLabel(entry.event.cell)}</span>}
-                        <span className="text-dimmed text-xs shrink-0">{channel}</span>
-                        <span className="text-primary font-medium shrink-0">{typeName}</span>
-                        {entry.seenCount > 1 && <span className="text-muted text-xs shrink-0">x{entry.seenCount}</span>}
-                        {detail && <span className="text-muted text-xs truncate">{detail}</span>}
-                      </div>
-                      <div className="shrink-0 flex items-center gap-1">
-                        <span className="text-accent-amber text-xs font-mono w-14 text-right">{h ? `SEQ=${h.msgSeq}` : ""}</span>
-                        <span className="text-accent-green text-xs font-mono w-14 text-right">{h?.validAck ? `ACK=${h.ackSeq}` : ""}</span>
-                        <span className="text-badge-orange-text text-xs w-4 text-center" title="ACK required">{h?.ackReq ? "↩" : ""}</span>
-                        <span className="text-dimmed text-xs">{isExpanded ? "▾" : "▸"}</span>
-                      </div>
-                    </div>
-                    {isExpanded && (
-                      <div className="mt-2 mb-1 ml-8 rounded-lg border border-border-primary bg-surface p-3">
-                        {h && (
-                          <div className="text-xs text-muted mb-1">
-                            MSG_TAG: 0x{h.msgTag.toString(16).toUpperCase().padStart(2, "0")} | MSG_SEQ: {h.msgSeq} | ACK_SEQ: {h.ackSeq} | ACK_REQ: {h.ackReq ? "1" : "0"} | VALID_ACK: {h.validAck ? "1" : "0"}
-                          </div>
-                        )}
-                        <TrafficDetail event={entry.event} />
-                      </div>
-                    )}
-                  </div>
-                );
-              } else if (entry.kind === "a1") {
-                const ev = entry.event;
-                return (
-                  <div
-                    key={entry.id}
-                    className="border-b border-border-subtle py-1.5 px-2 -mx-2 rounded"
-                  >
-                    <div
-                      className="flex items-center gap-2 text-sm cursor-pointer hover:bg-hover rounded"
-                      onClick={() => toggleExpand(entry.id)}
-                    >
-                      <div className="flex-1 min-w-0 flex items-center gap-2">
-                        <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
-                        <LaneBadge lane="A1" />
-                        <A1MobileCell event={ev} mobiles={mobiles} />
-                        <span className={`${a1DirectionClass(ev.direction)} font-mono text-xs w-12 shrink-0`}>
-                          {a1DirectionLabel(ev.direction)}
-                        </span>
-                        <span className="inline-block w-5 shrink-0" />
-                        {ev.cell && <span className="text-dimmed font-mono text-xs shrink-0" title="Cell/Sector">{cellLabel(ev.cell)}</span>}
-                        <span className="text-primary font-medium shrink-0">{a1TypeName(ev)}</span>
-                        <VoicePrivacyIndicator status={ev.voicePrivacy} />
-                        {entry.seenCount > 1 && <span className="text-muted text-xs shrink-0">x{entry.seenCount}</span>}
-                        <span className="text-muted text-xs truncate">{formatA1Summary(ev)}</span>
-                      </div>
-                      <div className="shrink-0 flex items-center gap-1">
-                        <span className="text-accent-amber text-xs font-mono w-20 text-right">
-                          {ev.sduLengthBytes ? `${ev.sduLengthBytes}B` : ""}
-                        </span>
-                        <span className="text-dimmed text-xs">{isExpanded ? "▾" : "▸"}</span>
-                      </div>
-                    </div>
-                    {isExpanded && (
-                      <div className="mt-2 mb-1 ml-8 rounded-lg border border-border-primary bg-surface p-3">
-                        <A1Detail event={ev} cells={cells} />
-                      </div>
-                    )}
-                  </div>
-                );
-              } else if (entry.kind === "hrpd") {
-                let typeName: string;
-                let summary: string;
-                let detail: ReactNode;
-                if (entry.stream === "session") {
-                  typeName = "HRPD Session";
-                  summary = formatHrpdSessionSummary(entry.event);
-                  detail = <HrpdSessionDetail event={entry.event} />;
-                } else if (entry.stream === "access") {
-                  typeName = "HRPD Access";
-                  summary = formatHrpdAccessSummary(entry.event);
-                  detail = <HrpdAccessDetail event={entry.event} />;
-                } else {
-                  typeName = "HRPD Traffic";
-                  summary = formatHrpdTrafficSummary(entry.event);
-                  detail = <HrpdTrafficDetail event={entry.event} />;
+          <>
+            <MessageListHeader subject="Mobile" />
+            {filtered.map((entry) => (
+              <MessageRow
+                key={entry.id}
+                entry={entry}
+                view={messageView(entry, messageCtx)}
+                open={expanded.has(entry.id)}
+                onToggle={() => toggleExpand(entry.id)}
+                subject={
+                  entry.kind === "hrpd" ? (
+                    <HrpdMobileCell event={entry.event} mobiles={mobiles} />
+                  ) : entry.kind === "a1" ? (
+                    <A1MobileCell event={entry.event} mobiles={mobiles} />
+                  ) : (
+                    <MobileCell event={entry.event} mobiles={mobiles} />
+                  )
                 }
-                return (
-                  <div
-                    key={entry.id}
-                    className="border-b border-border-subtle py-1.5 px-2 -mx-2 rounded"
-                  >
-                    <div
-                      className="flex items-center gap-2 text-sm cursor-pointer hover:bg-hover rounded"
-                      onClick={() => toggleExpand(entry.id)}
-                    >
-                      <div className="flex-1 min-w-0 flex items-center gap-2">
-                        <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
-                        <LaneBadge lane="L3" />
-                        <HrpdMobileCell event={entry.event} mobiles={mobiles} />
-                        <span className={`${"direction" in entry.event ? hrpdDirectionClass(entry.event.direction) : hrpdDirectionClass()} font-mono text-xs w-16 shrink-0`}>
-                          {"direction" in entry.event ? hrpdDirectionLabel(entry.event.direction) : "EVDO"}
-                        </span>
-                        <span className="inline-block w-5 shrink-0" />
-                        <span className="text-primary font-medium shrink-0">{typeName}</span>
-                        {entry.seenCount > 1 && <span className="text-muted text-xs shrink-0">x{entry.seenCount}</span>}
-                        <span className="text-muted text-xs truncate">{summary}</span>
-                      </div>
-                      <div className="shrink-0 flex items-center gap-1">
-                        <span className="text-dimmed text-xs">{isExpanded ? "▾" : "▸"}</span>
-                      </div>
-                    </div>
-                    {isExpanded && (
-                      <div className="mt-2 mb-1 ml-8 rounded-lg border border-border-primary bg-surface p-3">{detail}</div>
-                    )}
-                  </div>
-                );
-              } else {
-                const ev = entry.event;
-                const channel = formatAccessChannel(ev);
-                return (
-                  <div
-                    key={entry.id}
-                    className="border-b border-border-subtle py-1.5 px-2 -mx-2 rounded"
-                  >
-                    <div
-                      className="flex items-center gap-2 text-sm cursor-pointer hover:bg-hover rounded"
-                      onClick={() => toggleExpand(entry.id)}
-                    >
-                      <div className="flex-1 min-w-0 flex items-center gap-2">
-                        <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
-                        <LaneBadge lane="L3" />
-                        <MobileCell event={ev} mobiles={mobiles} />
-                        <span className="text-accent-green font-mono text-xs w-12 shrink-0">1x RX</span>
-                        <AuthenticationMark verdict={verdictForAccess(ev, entry.ts, mobileForEvent(ev, mobiles), verdicts)} />
-                        {ev.cell && <span className="text-dimmed font-mono text-xs shrink-0" title="Cell/Sector">{cellLabel(ev.cell)}</span>}
-                        <span className="text-dimmed text-xs shrink-0">{channel}</span>
-                        <span className="text-primary font-medium shrink-0">{formatAccessTypeName(ev)}</span>
-                        {entry.seenCount > 1 && <span className="text-muted text-xs shrink-0">x{entry.seenCount}</span>}
-                        <span className="text-muted text-xs truncate">{formatAccessSummary(ev)}</span>
-                      </div>
-                      <div className="shrink-0 flex items-center gap-1">
-                        <span className="text-accent-amber text-xs font-mono w-14 text-right">{ev.msgSeq != null ? `SEQ=${ev.msgSeq}` : ""}</span>
-                        <span className="text-accent-green text-xs font-mono w-14 text-right">{ev.validAck && ev.ackSeq != null ? `ACK=${ev.ackSeq}` : ""}</span>
-                        <span className="text-badge-orange-text text-xs w-4 text-center" title="ACK required">{ev.ackReq ? "↩" : ""}</span>
-                        <span className="text-dimmed text-xs">{isExpanded ? "▾" : "▸"}</span>
-                      </div>
-                    </div>
-                    {isExpanded && (
-                      <div className="mt-2 mb-1 ml-8 rounded-lg border border-border-primary bg-surface p-3">
-                        <AccessDetail event={ev} verdict={verdictForAccess(ev, entry.ts, mobileForEvent(ev, mobiles), verdicts)} />
-                      </div>
-                    )}
-                  </div>
-                );
-              }
-            })}
-          </div>
+              />
+            ))}
+          </>
         )}
       </Card>
     </div>

@@ -3,8 +3,15 @@ use std::time::{Duration, Instant};
 use cdma_common::error::Error;
 use log::{debug, info, warn};
 
+use super::mobiles::StaleTrafficChannel;
+use super::traffic_channel::ChannelState;
+use super::voice::VoiceAlertMode;
 use super::{A1ClearState, Bsc, TrafficChannelAction, recv_or_pending, recv_unbounded_or_pending};
 use crate::addressing::is_packet_data_so;
+
+/// A.S0014-D §4.2.16 Cause values for Clear Request.
+const CLEAR_CAUSE_RADIO_INTERFACE_MESSAGE_FAILURE: u8 = 0x00;
+pub(crate) const CLEAR_CAUSE_RADIO_INTERFACE_FAILURE: u8 = 0x01;
 
 impl Bsc {
     pub async fn run(mut self) -> Result<(), Error> {
@@ -25,6 +32,7 @@ impl Bsc {
                 .packet_service_connect_timeout_ms,
         );
         let mut stale_channel_interval = tokio::time::interval(Duration::from_secs(1));
+        let bts_release_request_signal = self.config.bts.bts_release_request_signal();
         let mut bearer_poll_interval = tokio::time::interval(Duration::from_millis(20));
 
         loop {
@@ -101,6 +109,9 @@ impl Bsc {
                 Some(power_req) = recv_or_pending(power_override_rx.as_mut()) => {
                     self.handle_traffic_power_override_request(power_req);
                 }
+                () = bts_release_request_signal.notified() => {
+                    self.handle_bts_release_requests().await;
+                }
                 Some(cell) = recv_unbounded_or_pending(cell_detach_rx.as_mut()) => {
                     self.handle_cell_detached(cell).await;
                 }
@@ -148,6 +159,8 @@ impl Bsc {
                     self.evict_stale_mobiles();
                     self.expire_stale_pending_a1_failures();
                     self.expire_pending_registrations();
+                    self.poll_access_measurements().await;
+                    self.refresh_alerting_calls();
                 }
                 _ = bearer_poll_interval.tick() => {
                     self.poll_reverse_bearer_preambles().await;
@@ -170,6 +183,57 @@ impl Bsc {
             })
             .min()
             .map(tokio::time::Instant::from_std)
+    }
+
+    /// The mobile restarts its T53m answer timer on every Alert With Information
+    /// Message (C.S0005-E §2.6.10.1.2).
+    pub(crate) fn refresh_alerting_calls(&mut self) {
+        let interval = match self.config.traffic_assignment.mt_alert_refresh_s {
+            0 => return,
+            seconds => Duration::from_secs(seconds),
+        };
+        let now = Instant::now();
+        let due: Vec<_> = self
+            .mobiles
+            .iter()
+            .filter_map(|ms| {
+                let tc = ms.traffic_channel()?;
+                match tc.channel_state {
+                    ChannelState::VoiceAlerting {
+                        awim_sent_at,
+                        mode: VoiceAlertMode::WaitForConnectOrder,
+                    } if now.duration_since(awim_sent_at) >= interval => {
+                        Some((ms.serving_cell?, tc.walsh_code, tc.voice_session_id))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        for (cell, walsh_code, session_id) in due {
+            let calling_party = session_id
+                .and_then(|id| self.voice.session(id))
+                .and_then(|session| session.calling_party_record.clone());
+            match self.send_standard_alert(
+                cell,
+                walsh_code,
+                super::DEFAULT_TRAFFIC_ACK_SEQ,
+                calling_party,
+            ) {
+                Ok(()) => {
+                    debug!(
+                        "BSC: re-sent the alert on walsh={} to restart the mobile's answer timer",
+                        walsh_code
+                    );
+                    if let Some(tc) = self.mobiles.get_traffic_channel_mut(cell, walsh_code) {
+                        tc.mark_voice_alerting(VoiceAlertMode::WaitForConnectOrder);
+                    }
+                }
+                Err(error) => warn!(
+                    "BSC: failed to re-send the alert on walsh={}: {}",
+                    walsh_code, error
+                ),
+            }
+        }
     }
 
     pub(crate) async fn poll_traffic_channel_lifecycle(&mut self, ms_ack_timeout: Duration) {
@@ -265,31 +329,76 @@ impl Bsc {
                 "BSC: traffic channel walsh={} inactive for {}s (channel_state={:?}), releasing",
                 stale.walsh_code, stale.inactive_secs, stale.channel_state_label
             );
-            if let (Some(call_id), A1ClearState::Idle) = (stale.a1_call_id, stale.a1_clear_state) {
-                self.a1.send_clear_request(call_id, 0);
-                self.mobiles
-                    .update_tc(stale.cell, stale.walsh_code, |_, tc| {
-                        tc.mark_a1_clear_request_sent();
-                    });
-            }
-            if let Err(e) = self.send_traffic_release_order(
-                stale.cell,
-                stale.walsh_code,
-                super::DEFAULT_TRAFFIC_ACK_SEQ,
-            ) {
-                warn!(
-                    "BSC: failed to send Release Order on stale F-TCH walsh={}: {}; tearing down immediately",
-                    stale.walsh_code, e
+            self.release_traffic_channel(stale, CLEAR_CAUSE_RADIO_INTERFACE_MESSAGE_FAILURE)
+                .await;
+        }
+    }
+
+    /// The channel is torn down when the Release Order is acknowledged or the MSC
+    /// answers with Clear Command, whichever comes first.
+    pub(crate) async fn release_traffic_channel(
+        &mut self,
+        chan: StaleTrafficChannel,
+        clear_cause: u8,
+    ) {
+        if let (Some(call_id), A1ClearState::Idle) = (chan.a1_call_id, chan.a1_clear_state) {
+            self.a1.send_clear_request(call_id, clear_cause);
+            self.mobiles.update_tc(chan.cell, chan.walsh_code, |_, tc| {
+                tc.mark_a1_clear_request_sent();
+            });
+        }
+        if let Err(e) = self.send_traffic_release_order(
+            chan.cell,
+            chan.walsh_code,
+            super::DEFAULT_TRAFFIC_ACK_SEQ,
+        ) {
+            warn!(
+                "BSC: failed to send Release Order on F-TCH walsh={}: {}; tearing down immediately",
+                chan.walsh_code, e
+            );
+            self.teardown_traffic_channel(chan.cell, chan.walsh_code)
+                .await;
+            self.on_voice_leg_released(chan.voice_session_id, chan.voice_leg_role);
+            return;
+        }
+        self.mobiles.update_tc(chan.cell, chan.walsh_code, |_, tc| {
+            tc.mark_releasing();
+        });
+    }
+
+    /// A.S0003-A §5.3: the BSC answers a BTS Release Request with Clear Request
+    /// to the MSC.
+    pub(crate) async fn handle_bts_release_requests(&mut self) {
+        let requests: Vec<_> = self
+            .config
+            .bts
+            .in_service()
+            .iter()
+            .filter_map(|entry| Some((entry.cell(), entry.control()?)))
+            .flat_map(|(cell, client)| {
+                client
+                    .drain_bts_release_requests()
+                    .into_iter()
+                    .map(move |request| (cell, request))
+            })
+            .collect();
+        for (cell, request) in requests {
+            let Some(chan) = self
+                .mobiles
+                .traffic_channel_to_release(cell, request.walsh_code)
+            else {
+                info!(
+                    "BSC: BTS Release Request for walsh={} with no channel to release",
+                    request.walsh_code
                 );
-                self.teardown_traffic_channel(stale.cell, stale.walsh_code)
-                    .await;
-                self.on_voice_leg_released(stale.voice_session_id, stale.voice_leg_role);
                 continue;
-            }
-            self.mobiles
-                .update_tc(stale.cell, stale.walsh_code, |_, tc| {
-                    tc.mark_releasing();
-                });
+            };
+            warn!(
+                "BSC: BTS lost the radio link on walsh={} (channel_state={:?}, Abis cause={:?}), clearing the call",
+                chan.walsh_code, chan.channel_state_label, request.cause
+            );
+            self.release_traffic_channel(chan, CLEAR_CAUSE_RADIO_INTERFACE_FAILURE)
+                .await;
         }
     }
 

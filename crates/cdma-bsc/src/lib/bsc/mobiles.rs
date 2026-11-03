@@ -21,10 +21,42 @@ use uuid::Uuid;
 use crate::addressing::{format_ms_address, format_ms_page_address, is_packet_data_so};
 use crate::power_control::TrafficChannelPowerSnapshot;
 
+use super::access_signal::{AccessSignalHistory, AccessSignalReading};
 use super::{
     AccessCellId, Bsc, BtsRegistry, EventService, TrafficChannelInfo, VoiceLegRole,
     mark_reverse_regular_msg_seq_received, traffic_channel_power_snapshot,
 };
+
+const MICROS_PER_MILLI: u64 = 1_000;
+const ACCESS_MEASUREMENT_POLL_TIMEOUT: Duration = Duration::from_millis(500);
+
+fn access_measurement_from_proto(
+    entry: crate::grpc::bts_management_proto::AccessMeasurement,
+) -> Option<(RxMeasurementKey, RxMeasurement)> {
+    use crate::grpc::bts_management_proto::access_measurement::Mobile;
+    let key = match entry.mobile? {
+        Mobile::Esn(esn) => RxMeasurementKey::Esn(esn),
+        Mobile::Imsi(imsi) => RxMeasurementKey::Imsi(imsi),
+    };
+    Some((
+        key,
+        RxMeasurement {
+            snr_db: None,
+            signal_power_db: None,
+            raw_power_db: entry.band_level_dbfs,
+            demod_quality_pct: None,
+            access_signal: cdma_common::events::AccessSignal {
+                eb_nt_db: entry.eb_nt_db,
+                signal_power_dbfs: entry.signal_power_dbfs,
+                raw_ber_pct: entry.raw_ber_pct,
+                noise_floor_dbfs: entry.noise_floor_dbfs,
+                noise_floor_stale: entry.noise_floor_stale,
+            },
+            message: entry.message,
+            timestamp_us: entry.measured_at_us,
+        },
+    ))
+}
 
 /// Public snapshot of a registered mobile, for gRPC/UI consumption.
 #[derive(Debug, Clone, Default)]
@@ -62,6 +94,11 @@ pub struct MobileInfo {
     /// the finger has accumulated raw input power, whether or not the serving
     /// cell enrolled a power reference.
     pub rx_level_dbfs: Option<f32>,
+    pub access_signal: Option<AccessSignalReading>,
+    /// `access_signal.signal_power_dbfs` in dBm, present only when the serving
+    /// cell enrolled a reverse-link power reference.
+    pub access_rx_reference_dbm: Option<f32>,
+    pub recent_access_eb_nt_db: Vec<f32>,
     /// Milliseconds since Unix epoch of last access probe.
     pub last_heard_ms: Option<u64>,
     /// Subscriber phone number from HLR (if resolved).
@@ -141,6 +178,7 @@ pub(crate) struct MobileStation {
     pub(crate) signal_power_db: Option<f32>,
     pub(crate) raw_power_db: Option<f32>,
     pub(crate) demod_quality_pct: Option<f32>,
+    pub(crate) access_signal: AccessSignalHistory,
     /// Milliseconds since Unix epoch when last access probe was received.
     pub(crate) last_heard_ms: Option<u64>,
     /// Subscriber phone number from HLR (if resolved).
@@ -221,6 +259,7 @@ impl MobileStation {
             signal_power_db: None,
             raw_power_db: None,
             demod_quality_pct: None,
+            access_signal: AccessSignalHistory::default(),
             last_heard_ms: None,
             phone_number: None,
             subscriber_display_name: None,
@@ -916,6 +955,30 @@ impl MobileRegistry {
             .collect()
     }
 
+    /// The traffic channel `cell` allocated `walsh_code` to, unless it is
+    /// already being released.
+    pub(crate) fn traffic_channel_to_release(
+        &self,
+        cell: AccessCellId,
+        walsh_code: u8,
+    ) -> Option<StaleTrafficChannel> {
+        let ms = self.get_by_walsh(cell, walsh_code)?;
+        let tc = ms.find_traffic_channel_by_walsh(walsh_code)?;
+        if tc.is_releasing() {
+            return None;
+        }
+        Some(StaleTrafficChannel {
+            cell,
+            walsh_code,
+            inactive_secs: tc.last_activity_at.elapsed().as_secs(),
+            channel_state_label: Some(tc.channel_state.label()),
+            voice_session_id: tc.voice_session_id,
+            voice_leg_role: tc.voice_leg_role,
+            a1_call_id: tc.a1_call_id,
+            a1_clear_state: tc.a1_clear_state,
+        })
+    }
+
     pub(crate) fn stale_traffic_channels(&self, timeout: Duration) -> Vec<StaleTrafficChannel> {
         self.entries
             .iter()
@@ -993,6 +1056,9 @@ impl MobileRegistry {
                         .raw_power_db
                         .and_then(|rp| rx_reference_dbm.map(|ref_dbm| rp + ref_dbm as f32)),
                     rx_level_dbfs: ms.raw_power_db,
+                    access_signal: ms.access_signal.latest().cloned(),
+                    access_rx_reference_dbm: rx_reference_dbm.map(|ref_dbm| ref_dbm as f32),
+                    recent_access_eb_nt_db: ms.access_signal.recent_eb_nt_db(),
                     last_heard_ms: ms.last_heard_ms,
                     phone_number: ms.phone_number.clone(),
                     subscriber_display_name: ms.subscriber_display_name.clone(),
@@ -1251,6 +1317,7 @@ impl MobileRegistry {
             signal_power_db: event.signal_power_db,
             raw_power_db: event.raw_power_db,
             demod_quality_pct: event.demod_quality_pct,
+            access_signal: AccessSignalHistory::default(),
             last_heard_ms: Some(update.last_heard_ms),
             phone_number: None,
             subscriber_display_name: None,
@@ -1292,11 +1359,29 @@ impl MobileRegistry {
             };
             if let Some(i) = pos {
                 let ms = &mut self.entries[i];
+                let signal_recorded = ms.access_signal.record(
+                    &meas.access_signal,
+                    meas.raw_power_db,
+                    &meas.message,
+                    meas.timestamp_us / MICROS_PER_MILLI,
+                );
+                let before = (
+                    ms.snr_db,
+                    ms.signal_power_db,
+                    ms.raw_power_db,
+                    ms.demod_quality_pct,
+                );
                 ms.snr_db = meas.snr_db.or(ms.snr_db);
                 ms.signal_power_db = meas.signal_power_db.or(ms.signal_power_db);
                 ms.raw_power_db = meas.raw_power_db.or(ms.raw_power_db);
                 ms.demod_quality_pct = meas.demod_quality_pct.or(ms.demod_quality_pct);
-                updated = true;
+                let after = (
+                    ms.snr_db,
+                    ms.signal_power_db,
+                    ms.raw_power_db,
+                    ms.demod_quality_pct,
+                );
+                updated |= signal_recorded || before != after;
             }
         }
         updated
@@ -1382,6 +1467,58 @@ impl Bsc {
         let last_heard_ms = super::access::event_last_heard_ms(event);
         self.mobiles
             .record_activity(addr, event, last_heard_ms, now)
+    }
+
+    /// Abis does not include RX measurements, so a networked BSC fetches them
+    /// over BTS management.
+    pub(crate) async fn poll_access_measurements(&mut self) {
+        use crate::grpc::bts_management_proto::CellRequest;
+        let mut measurements = Vec::new();
+        for entry in self.config.bts.in_service() {
+            let Some(mut client) = entry.oam() else {
+                continue;
+            };
+            let cell = entry.cell();
+            let request = CellRequest {
+                cell: Some(crate::grpc::proto::CellId {
+                    cell: u32::from(cell.cell),
+                    sector: u32::from(cell.sector),
+                }),
+                peer_id: None,
+            };
+            match tokio::time::timeout(
+                ACCESS_MEASUREMENT_POLL_TIMEOUT,
+                client.list_access_measurements(request),
+            )
+            .await
+            {
+                Ok(Ok(response)) => measurements.extend(
+                    response
+                        .into_inner()
+                        .entries
+                        .into_iter()
+                        .filter_map(access_measurement_from_proto),
+                ),
+                Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {}
+                Ok(Err(status)) => {
+                    log::debug!(
+                        "cell {}/{} access measurement poll failed: {status}",
+                        cell.cell,
+                        cell.sector
+                    );
+                }
+                Err(_) => {
+                    log::debug!(
+                        "cell {}/{} access measurement poll timed out",
+                        cell.cell,
+                        cell.sector
+                    );
+                }
+            }
+        }
+        if !measurements.is_empty() && self.mobiles.merge_rx_measurements(measurements) {
+            self.publish_mobiles();
+        }
     }
 
     /// Drain BTS access-channel signal quality measurements and merge them

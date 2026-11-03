@@ -4,6 +4,7 @@ use cdma_common::crc::{crc8, crc12};
 use log::info;
 use num_complex::Complex32;
 
+use super::rc12_gated_noise::{GatedNoiseEstimate, walsh64_pcg_eb_nt_db};
 use super::{PipelineProcessor, SampleBlock, raw_to_soft};
 use crate::phy::coding::block_interleaver::{
     Rc12ReverseTrafficInterleaver, Rc12ReverseTrafficRate,
@@ -26,12 +27,6 @@ const SOFT_BITS_PER_PCG: usize = RC1_SYMBOLS_PER_PCG * RC1_SOFT_BITS_PER_SYMBOL;
 const PCG_CHIPS: usize = RC1_SYMBOLS_PER_PCG * PN_CHIPS_PER_SYMBOL;
 const PREAMBLE_NULL_FRAME_THRESHOLD: usize = 16;
 
-/// Averages the gated interference estimate over about half a second.
-const GATED_NOISE_ALPHA: f32 = 1.0 / 32.0;
-
-/// A full-rate frame leaves no silent group to measure, so the estimate can go
-/// unrefreshed. Stop trusting it after this many frames.
-const GATED_NOISE_MAX_STALE_FRAMES: usize = 50;
 const RATE_HISTORY_LEN: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,10 +224,7 @@ pub struct Rc1ReverseTrafficDecoder {
     tags: HashMap<&'static str, i64>,
     sample_rate_hz: f64,
 
-    /// Mean per-bin energy from groups the mobile did not transmit, and its
-    /// age in frames.
-    gated_noise_per_bin: Option<f32>,
-    frames_since_gated_noise: usize,
+    gated_noise: GatedNoiseEstimate,
 
     // Metrics
     symbols_decoded: u64,
@@ -269,8 +261,7 @@ impl Rc1ReverseTrafficDecoder {
             last_processing_absolute_chip_end: None,
             tags: HashMap::new(),
             sample_rate_hz: 0.0,
-            gated_noise_per_bin: None,
-            frames_since_gated_noise: usize::MAX,
+            gated_noise: GatedNoiseEstimate::default(),
             symbols_decoded: 0,
             frames_decoded: 0,
         }
@@ -561,73 +552,13 @@ impl Rc1ReverseTrafficDecoder {
     // Per-PCG Eb/Nt computation
     // ---------------------------------------------------------------
 
-    /// Refresh the interference estimate from the power control groups this
-    /// frame's rate did not transmit.
-    ///
-    /// The non-peak bins of a transmitted group carry the mobile's own
-    /// multipath, so an estimate taken there rises with its power and the ratio
-    /// against it barely moves. A silent group carries only everything else.
-    fn update_gated_noise_estimate(&mut self, rate: Rc1TrafficRate) {
-        let active = self.exact_active_pcgs_for_rate(rate, self.frame_chip_start);
-        let mut energy = 0.0f64;
-        let mut bins = 0usize;
-        for (pcg, transmitted) in active.iter().copied().enumerate() {
-            if transmitted {
-                continue;
-            }
-            let start = pcg * RC1_SYMBOLS_PER_PCG;
-            let end = (start + RC1_SYMBOLS_PER_PCG).min(self.symbol_energies.len());
-            for symbol in self.symbol_energies.get(start..end).unwrap_or_default() {
-                energy += symbol.iter().map(|bin| *bin as f64).sum::<f64>();
-                bins += RC1_WALSH_CHIPS_PER_SYMBOL;
-            }
-        }
-        self.frames_since_gated_noise = self.frames_since_gated_noise.saturating_add(1);
-        if bins == 0 {
-            return;
-        }
-        let per_bin = (energy / bins as f64) as f32;
-        self.gated_noise_per_bin = Some(match self.gated_noise_per_bin {
-            Some(previous) => previous + GATED_NOISE_ALPHA * (per_bin - previous),
-            None => per_bin,
-        });
-        self.frames_since_gated_noise = 0;
-    }
-
-    /// Interference per Walsh bin, measured while the mobile was silent, or
-    /// `None` when no recent frame offered a silent group to measure.
-    fn gated_noise(&self) -> Option<f32> {
-        self.gated_noise_per_bin
-            .filter(|_| self.frames_since_gated_noise <= GATED_NOISE_MAX_STALE_FRAMES)
-            .filter(|noise| *noise > 0.0)
-    }
-
     fn pcg_eb_nt_db(&self, pcg_idx: usize) -> f32 {
-        let sym_start = pcg_idx * RC1_SYMBOLS_PER_PCG;
-        if sym_start >= self.symbol_energies.len() {
-            return -30.0;
-        }
-        let sym_end = (sym_start + RC1_SYMBOLS_PER_PCG).min(self.symbol_energies.len());
-        let n = sym_end - sym_start;
-        if n == 0 {
-            return -30.0;
-        }
-        let gated_noise = self.gated_noise();
-        let mut linear_eb_nt = 0.0f32;
-        for sym_idx in sym_start..sym_end {
-            let energies = &self.symbol_energies[sym_idx];
-            let peak = energies.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let total: f32 = energies.iter().sum();
-            let noise_sum = (total - peak).max(0.0);
-            let denom = (RC1_WALSH_CHIPS_PER_SYMBOL - 1) as f32;
-            // Fall back to the transmitted group's own non-peak bins only while
-            // no silent-group measurement is available.
-            let noise_mean = gated_noise.unwrap_or((noise_sum / denom).max(1e-12));
-            let es_nt = (peak / noise_mean - 1.0).max(0.0);
-            linear_eb_nt += (es_nt * 0.5).max(1e-9);
-        }
-        let linear_mean = linear_eb_nt / n as f32;
-        10.0 * linear_mean.max(1e-9).log10()
+        let start = (pcg_idx * RC1_SYMBOLS_PER_PCG).min(self.symbol_energies.len());
+        let end = (start + RC1_SYMBOLS_PER_PCG).min(self.symbol_energies.len());
+        walsh64_pcg_eb_nt_db(
+            &self.symbol_energies[start..end],
+            self.gated_noise.per_bin(),
+        )
     }
 
     fn pcg_snr_db_for_frame(&self) -> Vec<f32> {
@@ -797,10 +728,10 @@ impl Rc1ReverseTrafficDecoder {
         self.frames_decoded += 1;
         self.record_rate(decoded.rate);
         if decoded.validation.phy_valid {
-            // A misread rate would mark transmitted groups silent and fold the
-            // mobile's own energy into the interference estimate, so only a
-            // frame that checked out is allowed to move it.
-            self.update_gated_noise_estimate(decoded.rate);
+            let active = self.exact_active_pcgs_for_rate(decoded.rate, self.frame_chip_start);
+            self.gated_noise.update(&self.symbol_energies, &active);
+        } else {
+            self.gated_noise.frame_failed();
         }
 
         let is_preamble =

@@ -700,6 +700,13 @@ impl BtsManagementService for FemtoBtsManagementService {
         unsupported("reverse power control")
     }
 
+    async fn list_access_measurements(
+        &self,
+        _: Request<bts_management::CellRequest>,
+    ) -> Result<Response<bts_management::AccessMeasurementList>, Status> {
+        unsupported("access measurements")
+    }
+
     async fn set_reverse_power_control_override(
         &self,
         _: Request<bsc::SetTrafficChannelPowerOverrideRequest>,

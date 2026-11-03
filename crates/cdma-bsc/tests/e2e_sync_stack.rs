@@ -827,6 +827,7 @@ fn synthetic_registration_event(
     imsi_m_s2: u16,
 ) -> cdma_bts::bts::AccessChannelEvent {
     cdma_bts::bts::AccessChannelEvent {
+        access_signal: Default::default(),
         cell: Some(TEST_CELL),
         event_id: "synthetic-registration-event".to_string(),
         chip_start,
@@ -3356,6 +3357,7 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
                     pilot_pn: 0,
                     cell_id: CellId { cell: 1, sector: 1 },
                     mscid: 1,
+                    radio_link_loss_release: false,
                 },
                 NetworkClientConfig {
                     cell_id: CellId { cell: 1, sector: 1 },
@@ -3882,6 +3884,7 @@ async fn run_sync_overhead_window_case(
                     pilot_pn: 0,
                     cell_id: CellId { cell: 1, sector: 1 },
                     mscid: 1,
+                    radio_link_loss_release: false,
                 },
                 NetworkClientConfig {
                     cell_id: CellId { cell: 1, sector: 1 },
@@ -5890,6 +5893,7 @@ fn synthetic_origination_event(
     rev_supported_rcs: Vec<u8>,
 ) -> cdma_bts::bts::AccessChannelEvent {
     cdma_bts::bts::AccessChannelEvent {
+        access_signal: Default::default(),
         cell: Some(TEST_CELL),
         event_id: "synthetic-origination-event".to_string(),
         chip_start: 2_000_000,
@@ -7813,6 +7817,7 @@ async fn run_traffic_channel_e2e(
                     pilot_pn: 0,
                     cell_id: CellId { cell: 1, sector: 1 },
                     mscid: 1,
+                    radio_link_loss_release: false,
                 },
                 NetworkClientConfig {
                     cell_id: CellId { cell: 1, sector: 1 },
@@ -8188,6 +8193,7 @@ async fn test_e2e_rc1_reverse_preamble_triggers_crc_valid_bs_ack_order() -> Resu
                     pilot_pn: 0,
                     cell_id: CellId { cell: 1, sector: 1 },
                     mscid: 1,
+                    radio_link_loss_release: false,
                 },
                 NetworkClientConfig {
                     cell_id: CellId { cell: 1, sector: 1 },

@@ -345,6 +345,7 @@ pub struct BtsRegistry {
     /// The MSC's global challenge setting from its last enrollment, `None`
     /// before the first one.
     global_challenge: tokio::sync::watch::Sender<Option<bool>>,
+    bts_release_requests: Arc<tokio::sync::Notify>,
 }
 
 impl BtsRegistry {
@@ -387,6 +388,10 @@ impl BtsRegistry {
 
     pub fn global_challenge(&self) -> Option<bool> {
         *self.global_challenge.borrow()
+    }
+
+    pub fn bts_release_request_signal(&self) -> Arc<tokio::sync::Notify> {
+        self.bts_release_requests.clone()
     }
 
     pub fn subscribe_global_challenge(&self) -> tokio::sync::watch::Receiver<Option<bool>> {

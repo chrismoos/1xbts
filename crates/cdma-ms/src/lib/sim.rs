@@ -255,6 +255,7 @@ pub fn boot_with_pilot_pn(pilot_pn: u16) -> BootedNode {
             pilot_pn,
             cell_id: CellId { cell: 1, sector: 1 },
             mscid: 1,
+            radio_link_loss_release: false,
         },
         NetworkClientConfig {
             cell_id: CellId { cell: 1, sector: 1 },

@@ -31,6 +31,7 @@ fn agent_config() -> AbisAgentConfig {
             sector: 0x01,
         },
         mscid: 0x001234,
+        radio_link_loss_release: false,
     }
 }
 

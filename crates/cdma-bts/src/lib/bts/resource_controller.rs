@@ -279,6 +279,10 @@ impl TrafficResourceService {
     // will be removed.
 
     /// BTS-internal: shared traffic-channel pool reference.
+    pub fn power_control(&self) -> &BtsPowerControlRegistry {
+        &self.power_control
+    }
+
     pub fn traffic_channels_pool(&self) -> &TrafficChannelPool {
         &self.traffic_channels
     }

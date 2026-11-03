@@ -37,9 +37,9 @@ use super::bts_management_proto::bts_management_service_server::{
     BtsManagementService, BtsManagementServiceServer,
 };
 use super::bts_management_proto::{
-    BtsAttachState as ProtoBtsAttachState, BtsList, BtsSummary, CellCapability, CellKind,
-    CellRequest, EnrollRequest, EnrollResponse, ReversePowerControlEntry, ReversePowerControlList,
-    ReversePowerControlRequest,
+    AccessMeasurementList, BtsAttachState as ProtoBtsAttachState, BtsList, BtsSummary,
+    CellCapability, CellKind, CellRequest, EnrollRequest, EnrollResponse, ReversePowerControlEntry,
+    ReversePowerControlList, ReversePowerControlRequest,
 };
 use super::management_proto::management_facade_service_server::{
     ManagementFacadeService, ManagementFacadeServiceServer,
@@ -91,6 +91,34 @@ fn cell_request(cell: proto::CellId) -> CellRequest {
     CellRequest {
         cell: Some(cell),
         peer_id: None,
+    }
+}
+
+fn to_proto_access_signal(
+    reading: &crate::bsc::access_signal::AccessSignalReading,
+    rx_reference_dbm: Option<f32>,
+) -> proto::AccessSignal {
+    use crate::bsc::access_signal::SignalQuality;
+    let to_dbm = |dbfs: Option<f32>| dbfs.zip(rx_reference_dbm).map(|(v, r)| v + r);
+    let quality = match reading.quality {
+        SignalQuality::Poor => proto::SignalQuality::Poor,
+        SignalQuality::Average => proto::SignalQuality::Average,
+        SignalQuality::Good => proto::SignalQuality::Good,
+        SignalQuality::Excellent => proto::SignalQuality::Excellent,
+    };
+    proto::AccessSignal {
+        eb_nt_db: reading.eb_nt_db,
+        quality: quality as i32,
+        signal_power_dbfs: reading.signal_power_dbfs,
+        signal_power_dbm: to_dbm(reading.signal_power_dbfs),
+        band_level_dbfs: reading.band_level_dbfs,
+        band_level_dbm: to_dbm(reading.band_level_dbfs),
+        noise_floor_dbfs: reading.noise_floor_dbfs,
+        noise_floor_dbm: to_dbm(reading.noise_floor_dbfs),
+        noise_floor_stale: reading.noise_floor_stale,
+        raw_ber_pct: reading.raw_ber_pct,
+        message: reading.message.clone(),
+        measured_at_ms: reading.measured_at_ms,
     }
 }
 
@@ -479,6 +507,8 @@ fn to_proto_traffic_channel_power(tp: &TrafficChannelPowerSnapshot) -> proto::Tr
             .collect(),
         measured_inner_loop_1s_db: None,
         measured_inner_loop_1s_timestamp_ms: None,
+        reverse_power_dbfs: None,
+        reverse_power_dbm: None,
     }
 }
 
@@ -1611,6 +1641,10 @@ impl BscService for BscServiceImpl {
                         voice_privacy: m.voice_privacy.clone(),
                         traffic_power,
                         serving_cell: m.serving_cell.map(to_proto_cell_id),
+                        access_signal: m.access_signal.as_ref().map(|reading| {
+                            to_proto_access_signal(reading, m.access_rx_reference_dbm)
+                        }),
+                        recent_access_eb_nt_db: m.recent_access_eb_nt_db.clone(),
                     }
                 })
                 .collect(),
@@ -1622,6 +1656,7 @@ impl BscService for BscServiceImpl {
     async fn list_channels(&self, _: Request<()>) -> Result<Response<proto::ChannelList>, Status> {
         let mut channels = Vec::new();
         let mut cell_walsh_capacity = Vec::new();
+        let mut traffic_power_fraction = HashMap::new();
         for entry in self.state.bts.entries() {
             let Some(mut client) = entry.oam() else {
                 continue;
@@ -1640,11 +1675,15 @@ impl BscService for BscServiceImpl {
                         cell: Some(cell),
                         total_walsh_codes: list.total_walsh_codes,
                     });
-                    channels.extend(
-                        list.channels
-                            .into_iter()
-                            .filter(|c| c.channel_type != TRAFFIC_CHANNEL_TYPE),
-                    );
+                    for channel in list.channels {
+                        if channel.channel_type != TRAFFIC_CHANNEL_TYPE {
+                            channels.push(channel);
+                        } else if let (Some(walsh), Some(fraction)) =
+                            (channel.walsh_code, channel.power_fraction)
+                        {
+                            traffic_power_fraction.insert((entry.cell(), walsh as u8), fraction);
+                        }
+                    }
                 }
                 Err(e) => warn!(
                     "cell {}/{} local radio resource list failed: {e}",
@@ -1667,7 +1706,8 @@ impl BscService for BscServiceImpl {
                     walsh_code: Some(walsh as u32),
                     channel_type: TRAFFIC_CHANNEL_TYPE.into(),
                     direction: "forward".into(),
-                    power_fraction: None,
+                    power_fraction: channel_cell
+                        .and_then(|cell| traffic_power_fraction.get(&(cell, walsh)).copied()),
                     data_rate_bps: None,
                     paging_channel_number: None,
                     access_channel_number: None,
@@ -2099,6 +2139,14 @@ impl BtsManagementService for BscServiceImpl {
         Ok(Response::new(ReversePowerControlList { entries }))
     }
 
+    async fn list_access_measurements(
+        &self,
+        request: Request<CellRequest>,
+    ) -> Result<Response<AccessMeasurementList>, Status> {
+        let (cell, mut client) = self.oam_for_request(request.into_inner())?;
+        client.list_access_measurements(cell_request(cell)).await
+    }
+
     async fn set_reverse_power_control_override(
         &self,
         request: Request<proto::SetTrafficChannelPowerOverrideRequest>,
@@ -2232,6 +2280,8 @@ mod tests {
             power_history: Vec::new(),
             measured_inner_loop_1s_db: Some(0.25),
             measured_inner_loop_1s_timestamp_ms: Some(1_234),
+            reverse_power_dbfs: None,
+            reverse_power_dbm: None,
         };
         let bsc = TrafficChannelPowerSnapshot {
             target_eb_nt_db: 8.0,

@@ -5,6 +5,7 @@ pub(crate) mod a1;
 #[allow(dead_code)]
 pub(crate) mod access;
 pub(crate) mod access_identity;
+pub(crate) mod access_signal;
 pub(crate) mod authentication;
 pub mod bts_attach;
 pub mod bts_registry;

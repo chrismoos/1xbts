@@ -328,6 +328,7 @@ impl TrafficChannelProcessor {
             "traffic_tail_bits",
             "traffic_fqi_valid",
             "traffic_tail_valid",
+            "traffic_is_preamble",
         ] {
             if let Some(value) = upstream_tags.get(key).copied() {
                 out.tags.insert(key, value);

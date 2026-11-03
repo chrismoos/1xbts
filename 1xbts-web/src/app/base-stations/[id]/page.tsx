@@ -11,7 +11,7 @@ import { useBaseStations } from "@/lib/use-base-stations";
 export default function BaseStationDetailPage() {
   const raw = useParams().id;
   const id = decodeURIComponent(Array.isArray(raw) ? raw[0] : (raw ?? ""));
-  const { nodes } = useBaseStations(5000);
+  const { nodes } = useBaseStations();
   const node = nodes.find((candidate) => candidate.managementEndpoint === id);
 
   const [cells, setCells] = useState<BtsSummary[]>([]);

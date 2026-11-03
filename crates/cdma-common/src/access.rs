@@ -7422,10 +7422,15 @@ fn decode_page_response(
     } else {
         None
     };
+    // MOB_P_REV 3 mobiles end the message after NAR_AN_CAP and pad with
+    // arbitrary bits, so an ALT_SO list cut off by the end of the SDU is absent.
     let num_alt_so = read(bs, 3, "NUM_ALT_SO").unwrap_or(0) as u8;
     let mut alt_service_options = Vec::with_capacity(num_alt_so as usize);
     for idx in 0..num_alt_so {
-        alt_service_options.push(read(bs, 16, &format!("ALT_SO[{idx}]"))? as u16);
+        match read(bs, 16, &format!("ALT_SO[{idx}]")) {
+            Ok(v) => alt_service_options.push(v as u16),
+            Err(_) => break,
+        }
     }
     let mut uzid_incl = None;
     let mut uzid = None;
@@ -11081,6 +11086,29 @@ mod tests {
         };
         assert_eq!(message.encryption_supported, None);
         assert_eq!(message.num_alt_so, 0);
+    }
+
+    #[test]
+    fn p_rev_3_page_response_padding_that_reads_as_alt_sos_still_decodes() {
+        let ctx = AccessDecodeContext::new(Some(1), Some(6));
+        let mut page_response = Bitstream::new();
+        page_response.write_u8(rcsch_wire(MessageId::PageResponse), 8);
+        page_response.write_u8(1, 1); // MOB_TERM
+        page_response.write_u8(1, 3); // SLOT_CYCLE_INDEX
+        page_response.write_u8(3, 8); // MOB_P_REV
+        page_response.write_u8(0x6a, 8); // SCM
+        page_response.write_u8(0b011, 3); // REQUEST_MODE
+        page_response.write_u32(0x8000, 16); // SERVICE_OPTION
+        page_response.write_u8(0, 1); // PM
+        page_response.write_u8(0, 1); // NAR_AN_CAP
+        page_response.write_u32(0b000_0100_0000, 11);
+        let AccessMessage::PageResponse(message) =
+            AccessMessage::decode_with_context(&page_response, ctx).expect("decode page response")
+        else {
+            panic!("expected page response");
+        };
+        assert_eq!(message.service_option, 0x8000);
+        assert!(message.alt_service_options.is_empty());
     }
 
     #[test]

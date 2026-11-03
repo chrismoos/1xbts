@@ -25,7 +25,7 @@ function stateBadge(node: BaseStationSummary) {
 }
 
 export default function BaseStationsPage() {
-  const { nodes, error, loading } = useBaseStations(3000);
+  const { nodes, error, loading } = useBaseStations();
   const attached = nodes.filter((node) => node.attached).length;
 
   return (

@@ -97,7 +97,7 @@ export function Sidebar() {
   const connection = useConnectionState();
   const online = connection === "online";
   const offline = connection === "offline";
-  const { nodes } = useBaseStations(10000);
+  const { nodes } = useBaseStations();
   const cells = nodes.flatMap((node) => node.cells);
   const inService = cells.filter((cell) => cell.inService).length;
 

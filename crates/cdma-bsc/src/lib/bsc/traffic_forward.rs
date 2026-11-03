@@ -412,7 +412,7 @@ impl Bsc {
                     con_ref: tc.voice_connection_ref.unwrap_or(VOICE_TRAFFIC_CON_REF),
                     response_ind: false,
                     tag: None,
-                    bypass_alert_answer: Some(false),
+                    bypass_alert_answer: Some(tc.bypass_alert_answer),
                 }]
             } else {
                 Vec::new()

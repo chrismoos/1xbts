@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
+import { useLive } from "@/lib/live";
 import Link from "next/link";
 import { Card } from "@/components/card";
 import { StartOtasp } from "@/components/start-otasp";
@@ -44,61 +45,36 @@ function relativeTime(value?: string): string {
   return `${Math.round(hr / 24)}d ago`;
 }
 
+const NO_ROWS: SessionRow[] = [];
+
 export function RecentOtaspCard({
   subscriberId,
   esn,
   meid,
+  title = "Recent OTASP Sessions",
 }: {
   // Exactly one filter is supplied. The subscriber detail page passes
   // `subscriberId`; the mobile detail page passes `esn` / `meid`.
   subscriberId?: string;
   esn?: number | string;
   meid?: string;
+  title?: string;
 }) {
-  const [rows, setRows] = useState<SessionRow[]>([]);
-  const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState(0);
   const [limit, setLimit] = useState(10);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let alive = true;
-    const load = async () => {
-      try {
-        const params = new URLSearchParams();
-        if (subscriberId) params.set("subscriberId", subscriberId);
-        if (esn != null) params.set("esn", String(esn));
-        if (meid) params.set("meid", meid.toLowerCase());
-        params.set("limit", String(limit));
-        params.set("offset", String(offset));
-        const res = await fetch(`/api/otasp-sessions?${params}`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        if (!alive) return;
-        if (data.error) throw new Error(data.error);
-        setRows(data.sessions || []);
-        setTotal(data.total ?? 0);
-        setError(null);
-      } catch (err) {
-        if (!alive) return;
-        setError(err instanceof Error ? err.message : "unknown");
-      } finally {
-        if (alive) setLoading(false);
-      }
-    };
-    load();
-    // Polling keeps the current page fresh — a session that completes
-    // while the operator is looking at page 1 will appear within 10 s.
-    const interval = setInterval(load, 10000);
-    return () => {
-      alive = false;
-      clearInterval(interval);
-    };
-  }, [subscriberId, esn, meid, limit, offset]);
+  const params = new URLSearchParams();
+  if (subscriberId) params.set("subscriberId", subscriberId);
+  if (esn != null) params.set("esn", String(esn));
+  if (meid) params.set("meid", meid.toLowerCase());
+  params.set("limit", String(limit));
+  params.set("offset", String(offset));
+  const live = useLive<{ sessions?: SessionRow[]; total?: number }>(`/api/otasp-sessions?${params}`);
+  const rows = live.data?.sessions ?? NO_ROWS;
+  const total = live.data?.total ?? 0;
+  const { loading, error } = live;
 
   return (
-    <Card title="Recent OTASP Sessions">
+    <Card title={title}>
       {subscriberId && <div className="mb-4"><StartOtasp subscriberId={subscriberId} /></div>}
       {loading && rows.length === 0 ? (
         <p className="text-dimmed text-sm">Loading...</p>

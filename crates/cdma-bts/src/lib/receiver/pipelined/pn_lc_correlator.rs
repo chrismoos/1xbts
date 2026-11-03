@@ -40,7 +40,7 @@ pub use finger::PnLcFinger;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use log::{debug, trace};
+use log::{debug, info, trace};
 use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 
@@ -178,21 +178,28 @@ impl PnLcCorrelator {
     ) -> Self {
         let os = cfg.oversample;
         let phase_period = 32768 * os;
+        // The reference is conj(PN) for an `I+jQ` signal. A conjugated
+        // `I-jQ` signal needs the Q sign flipped, so the reference keeps +PN_Q.
+        let q_sign = if cfg.oqpsk_signal_conjugated {
+            1.0
+        } else {
+            -1.0
+        };
         let pn_fft_seq: Arc<Vec<Complex32>> = Arc::new(
             build_fft_search_pn_samples_with_kind(phase_period, os, cfg.short_code_reference)
                 .into_iter()
-                .map(|s| Complex32::new(s.re, -s.im))
+                .map(|s| Complex32::new(s.re, q_sign * s.im))
                 .collect(),
         );
         let pn_despread_seq: Arc<Vec<Complex32>> = Arc::new(if cfg.split_pn_reference {
             build_oqpsk_pn_samples_with_kind(phase_period, os, cfg.short_code_reference)
                 .into_iter()
-                .map(|s| Complex32::new(s.re, -s.im))
+                .map(|s| Complex32::new(s.re, q_sign * s.im))
                 .collect()
         } else {
             build_fft_search_pn_samples_with_kind(phase_period, os, cfg.short_code_reference)
                 .into_iter()
-                .map(|s| Complex32::new(s.re, -s.im))
+                .map(|s| Complex32::new(s.re, q_sign * s.im))
                 .collect()
         });
 
@@ -655,6 +662,16 @@ impl PnLcCorrelator {
         earliest
     }
 
+    /// Recovers PN_Q from a stored reference `.im`, which holds -PN_Q unless
+    /// `oqpsk_signal_conjugated` keeps it as +PN_Q.
+    fn true_pn_q(&self, stored_im: f32) -> f32 {
+        if self.cfg.oqpsk_signal_conjugated {
+            stored_im
+        } else {
+            -stored_im
+        }
+    }
+
     fn verification_references(
         &self,
         preferred: Option<PnReferenceKind>,
@@ -962,9 +979,8 @@ impl PnLcCorrelator {
         let pn_i_chips: Vec<f32> = (0..n_chips)
             .map(|k| self.pn_fft_seq[(base_phase + k * os) % pp].re)
             .collect();
-        // pn_fft_seq stores conj(PN) so .im = -PN_Q. Negate to get true PN_Q.
         let pn_q_chips: Vec<f32> = (0..n_chips)
-            .map(|k| -self.pn_fft_seq[(base_phase + k * os) % pp].im)
+            .map(|k| self.true_pn_q(self.pn_fft_seq[(base_phase + k * os) % pp].im))
             .collect();
 
         let n_lc = (2 * half + 1) as usize;
@@ -1010,10 +1026,9 @@ impl PnLcCorrelator {
                 let pn_q_dec = if even_k >= 0 && (even_k as usize) < n_chips {
                     pn_q_chips[even_k as usize]
                 } else {
-                    // pn_fft_seq stores conj(PN), negate .im for true PN_Q.
                     let phase = (base_phase as isize + even_k * os as isize).rem_euclid(pp as isize)
                         as usize;
-                    -self.pn_fft_seq[phase].im
+                    self.true_pn_q(self.pn_fft_seq[phase].im)
                 };
                 let lc_q_dec_idx = slice_start as isize + even_k;
                 let lc_q_dec = lc_q_chips[lc_q_dec_idx.max(0) as usize];
@@ -2218,7 +2233,7 @@ impl Correlator for PnLcCorrelator {
                     if let Some(old_origin) = self.absolute_origin_sample {
                         let delta = new_origin as i64 - old_origin as i64;
                         if delta > 4 {
-                            debug!(
+                            info!(
                                 "PnLcCorrelator: sample gap detected \
                                  (delta={} samples, ~{} chips), flushing buffer",
                                 delta,
@@ -2229,6 +2244,7 @@ impl Correlator for PnLcCorrelator {
                             // the current samples_consumed with no leftover.
                             self.absolute_origin_sample = Some(new_origin);
                         } else if delta.abs() > 4 {
+                            info!("PnLcCorrelator: origin re-anchored by {} samples", delta);
                             self.absolute_origin_sample = Some(new_origin);
                             // Surviving fingers now hold a stale origin.
                             self.timing_reanchored = true;

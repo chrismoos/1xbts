@@ -20,6 +20,14 @@ export async function POST(request: Request) {
         );
       }
     }
+    const serviceOption =
+      body.serviceOption === undefined ? undefined : Number(body.serviceOption);
+    if (serviceOption !== undefined && !(Number.isInteger(serviceOption) && serviceOption > 0)) {
+      return Response.json(
+        { accepted: false, message: "serviceOption must be a positive integer" },
+        { status: 400 }
+      );
+    }
     await waitForManagementReady();
     const client = getMscManagementClient();
     const result = await client.initiateCall(
@@ -27,6 +35,7 @@ export async function POST(request: Request) {
         subscriberId: body.subscriberId || "",
         audioFile: body.audioFile || undefined,
         callerNumber: callerNumber || undefined,
+        serviceOption,
       },
       { signal: abort.signal }
     );

@@ -270,6 +270,7 @@ pub async fn start_bts_node(
         hrpd_traffic_releases,
         hrpd_forward_traffic,
         power_control,
+        rx_measurements,
         ..
     } = handle;
 
@@ -318,6 +319,7 @@ pub async fn start_bts_node(
     )?;
     management_state.bearer = Some(abis.bearer);
     management_state.global_challenge = global_challenge;
+    management_state.rx_measurements = Some(rx_measurements);
     management_state.abis_connected = Some(abis.connected);
     management_state.an_grpc_addr = hrpd_an.as_ref().map(|an| {
         bts_config

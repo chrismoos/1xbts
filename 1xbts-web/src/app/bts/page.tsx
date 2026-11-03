@@ -7,7 +7,7 @@ import { BtsAttachState } from "@/lib/proto/bts_management/v1/service";
 import { useBtsList } from "@/lib/use-bts-list";
 
 export default function BtsPage() {
-  const { cells, error, loading } = useBtsList(3000);
+  const { cells, error, loading } = useBtsList();
 
   const inService = cells.filter(
     (summary) => summary.state === BtsAttachState.BTS_ATTACH_STATE_IN_SERVICE,

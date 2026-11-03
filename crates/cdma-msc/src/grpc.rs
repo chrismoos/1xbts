@@ -233,6 +233,12 @@ impl MscManagementService for MscManagementServiceImpl {
         let inner = request.into_inner();
         let subscriber_id = uuid::Uuid::parse_str(&inner.subscriber_id)
             .map_err(|e| Status::invalid_argument(format!("invalid subscriber_id: {e}")))?;
+        let service_option = inner
+            .service_option
+            .map(|so| {
+                u16::try_from(so).map_err(|_| Status::invalid_argument("service_option > 65535"))
+            })
+            .transpose()?;
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         self.mgmt_tx
             .send(crate::management::PendingControlRequest::InitiateCall {
@@ -240,6 +246,7 @@ impl MscManagementService for MscManagementServiceImpl {
                     subscriber_id,
                     audio_file: inner.audio_file,
                     caller_number: inner.caller_number,
+                    service_option,
                 },
                 response_tx,
             })
@@ -367,6 +374,31 @@ impl MscManagementService for MscManagementServiceImpl {
             register_policy: self.access.register_policy.config_name().to_string(),
             authentication_mode: self.authentication_mode.config_name().to_string(),
         }))
+    }
+
+    async fn release_call(
+        &self,
+        request: Request<mgmt_proto::ReleaseCallRequest>,
+    ) -> Result<Response<()>, Status> {
+        let call_id = crate::call_control::CallId(request.into_inner().call_id);
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        self.mgmt_tx
+            .send(crate::management::PendingControlRequest::ReleaseCall {
+                call_id,
+                response_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable("MSC runtime is shutting down"))?;
+        match response_rx
+            .await
+            .map_err(|_| Status::internal("MSC runtime dropped response channel"))?
+        {
+            Ok(()) => Ok(Response::new(())),
+            Err(crate::management::ManagementError::UnknownCall(call_id)) => {
+                Err(Status::not_found(format!("no active call {}", call_id.0)))
+            }
+            Err(error) => Err(Status::internal(error.to_string())),
+        }
     }
 
     async fn list_calls(&self, _: Request<()>) -> Result<Response<CallList>, Status> {

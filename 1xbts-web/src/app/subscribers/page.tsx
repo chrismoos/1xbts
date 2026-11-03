@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { liveSocket, useLive } from "@/lib/live";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Card } from "@/components/card";
 import { ImsiGenerateButton } from "@/components/imsi-generate-button";
@@ -65,12 +66,18 @@ function formatSubscriberId(subscriberId: string): string {
   return `${subscriberId.slice(0, 12)}...${subscriberId.slice(-8)}`;
 }
 
+const NO_SUBSCRIBERS: Subscriber[] = [];
+const NO_MOBILES: MobileInfo[] = [];
+
 export default function SubscribersPage() {
-  const [subscribers, setSubscribers] = useState<Subscriber[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const liveSubscribers = useLive<{ subscribers?: Subscriber[] }>("/api/subscribers");
+  const subscribers = liveSubscribers.data?.subscribers ?? NO_SUBSCRIBERS;
+  const loading = liveSubscribers.loading;
+  const [actionError, setError] = useState<string | null>(null);
+  const error = actionError ?? liveSubscribers.error;
   const [showForm, setShowForm] = useState(false);
-  const [mobiles, setMobiles] = useState<MobileInfo[]>([]);
+  const liveMobiles = useLive<MobileInfo[]>("/api/mobiles").data;
+  const mobiles = Array.isArray(liveMobiles) ? liveMobiles : NO_MOBILES;
 
   // Form state
   const [phoneNumber, setPhoneNumber] = useState("");
@@ -118,37 +125,6 @@ export default function SubscribersPage() {
       return next;
     });
 
-  const fetchSubscribers = useCallback(async () => {
-    try {
-      const res = await fetch("/api/subscribers");
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
-      setSubscribers(data.subscribers || []);
-      setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "unknown error");
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  const fetchMobiles = useCallback(async () => {
-    try {
-      const res = await fetch("/api/mobiles");
-      if (res.ok) {
-        const data = await res.json();
-        if (!data.error) setMobiles(data);
-      }
-    } catch {}
-  }, []);
-
-  useEffect(() => {
-    fetchSubscribers();
-    fetchMobiles();
-    const interval = setInterval(() => { fetchSubscribers(); fetchMobiles(); }, 5000);
-    return () => clearInterval(interval);
-  }, [fetchSubscribers, fetchMobiles]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -218,16 +194,7 @@ export default function SubscribersPage() {
       const data: UpsertResponse = await res.json();
       if (data.error) throw new Error(data.error);
 
-      if (data.subscriber) {
-        const created = {
-          ...data.subscriber,
-          displayName: data.subscriber.displayName || displayName.trim(),
-        };
-        setSubscribers((prev) => [
-          created,
-          ...prev.filter((sub) => sub.subscriberId !== created.subscriberId),
-        ]);
-      }
+      liveSocket().refresh("/api/subscribers");
 
       // Reset form
       setPhoneNumber("");
@@ -239,7 +206,7 @@ export default function SubscribersPage() {
       setNumberType(DEFAULT_NUMBER_TYPE);
       setNumberPlan(DEFAULT_NUMBER_PLAN);
       setShowForm(false);
-      void fetchSubscribers();
+      liveSocket().refresh("/api/subscribers");
     } catch (err) {
       setFieldErrors({
         form: err instanceof Error ? err.message : "unknown error",
@@ -256,7 +223,7 @@ export default function SubscribersPage() {
       });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
-      fetchSubscribers();
+      liveSocket().refresh("/api/subscribers");
     } catch (err) {
       setError(err instanceof Error ? err.message : "unknown error");
     }

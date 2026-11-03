@@ -19,6 +19,8 @@ pub struct InitiateCallRequest {
     pub audio_file: Option<String>,
     /// Optional caller-ID digits presented to the called mobile.
     pub caller_number: Option<String>,
+    /// Voice service option to page with. `None` selects the configured default.
+    pub service_option: Option<u16>,
 }
 
 /// Successful MSC acceptance of an operator-originated call request.
@@ -37,6 +39,7 @@ pub enum ManagementError {
     Unavailable(&'static str),
     /// The request was rejected for a local policy reason.
     Rejected(String),
+    UnknownCall(CallId),
 }
 
 impl Display for ManagementError {
@@ -85,6 +88,10 @@ pub enum PendingControlRequest {
         /// Reply path to the waiting client.
         response_tx: oneshot::Sender<Result<InitiateCallAccepted, ManagementError>>,
     },
+    ReleaseCall {
+        call_id: CallId,
+        response_tx: oneshot::Sender<Result<(), ManagementError>>,
+    },
     /// Pending request to list all active call sessions.
     ListCalls {
         /// Reply path to the waiting client.
@@ -111,6 +118,7 @@ mod tests {
             subscriber_id: Uuid::parse_str("00000000-0000-0000-0000-000000000042").unwrap(),
             audio_file: Some("ring.wav".to_string()),
             caller_number: Some("5551234567".to_string()),
+            service_option: None,
         };
 
         let (response_tx, response_rx) = oneshot::channel();
