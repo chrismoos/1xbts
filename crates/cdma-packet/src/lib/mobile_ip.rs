@@ -487,14 +487,15 @@ impl MobileIpSession {
         }
 
         let mut challenge_rotated = false;
-        match self.authenticate_registration_request(&rrq) {
-            RegistrationAuthentication::Accepted => {
+        let scope = match self.authenticate_registration_request(&rrq) {
+            RegistrationAuthentication::Accepted(scope) => {
                 if let Some(challenge) = rrq.mn_fa_challenge() {
                     let challenge = challenge.to_vec();
                     self.mark_challenge_used(&challenge);
                     self.rotate_challenge();
                     challenge_rotated = true;
                 }
+                scope
             }
             RegistrationAuthentication::InfrastructureRequired(reason) => {
                 log::warn!(
@@ -515,10 +516,11 @@ impl MobileIpSession {
                     &rrq,
                     code,
                     rrq.home_address,
+                    AuthenticatorScope::default(),
                 );
                 return MobileIpPacketResult::Reply(reply);
             }
-        }
+        };
 
         if rrq.flags & RRQ_FLAG_D != 0 {
             let reply = self.registration_reply_packet(
@@ -527,6 +529,7 @@ impl MobileIpSession {
                 &rrq,
                 RRP_CODE_ADMINISTRATIVELY_PROHIBITED,
                 rrq.home_address,
+                scope,
             );
             return MobileIpPacketResult::Reply(reply);
         }
@@ -548,6 +551,7 @@ impl MobileIpSession {
                 &rrq,
                 RRP_CODE_ACCEPTED,
                 home_address,
+                scope,
             );
             return MobileIpPacketResult::Deregistered { reply };
         }
@@ -571,6 +575,7 @@ impl MobileIpSession {
             &rrq,
             RRP_CODE_ACCEPTED,
             home_address,
+            scope,
         );
         self.last_registration = Some(Box::new(CompletedRegistration {
             request: rrq.wire_data,
@@ -598,7 +603,7 @@ impl MobileIpSession {
                     "auth_mode=insecure cannot verify authenticated registrations",
                 );
             }
-            return RegistrationAuthentication::Accepted;
+            return RegistrationAuthentication::Accepted(AuthenticatorScope::default());
         }
 
         let Some(security) = self.config.mn_ha_security.as_deref() else {
@@ -641,16 +646,35 @@ impl MobileIpSession {
                 reason: "MN-HA authenticator length is not 16 bytes",
             };
         }
-        let expected = keyed_md5_prefix_suffix(
-            &security.shared_secret,
-            &rrq.wire_data[..authentication.protected_data_len],
-        );
-        if !constant_time_eq(&expected, &authentication.authenticator) {
+        let scope = [AuthenticatorScope::WithSpi, AuthenticatorScope::WithoutSpi]
+            .into_iter()
+            .find(|scope| {
+                let protected =
+                    &rrq.wire_data[..scope.protected_len(authentication.protected_data_len)];
+                constant_time_eq(
+                    &keyed_md5_prefix_suffix(&security.shared_secret, protected),
+                    &authentication.authenticator,
+                )
+            });
+        let Some(scope) = scope else {
+            let expected = |scope: AuthenticatorScope| {
+                let protected =
+                    &rrq.wire_data[..scope.protected_len(authentication.protected_data_len)];
+                format_hex(&keyed_md5_prefix_suffix(&security.shared_secret, protected))
+            };
+            log::warn!(
+                "MIP4: MN-HA mismatch spi=0x{:08x} received={} expected_with_spi={} expected_without_spi={} wire={}",
+                authentication.spi,
+                format_hex(&authentication.authenticator),
+                expected(AuthenticatorScope::WithSpi),
+                expected(AuthenticatorScope::WithoutSpi),
+                format_hex(&rrq.wire_data),
+            );
             return RegistrationAuthentication::Rejected {
                 code: RRP_CODE_HA_MOBILE_NODE_AUTH_FAILED,
                 reason: "MN-HA authenticator does not match",
             };
-        }
+        };
 
         let challenge_count = rrq
             .extensions
@@ -753,7 +777,7 @@ impl MobileIpSession {
                 "MIP4: accepting MN-AAA authentication without verification because allow_unverified_mn_aaa=true"
             );
         }
-        RegistrationAuthentication::Accepted
+        RegistrationAuthentication::Accepted(scope)
     }
 
     fn agent_advertisement_packet(&mut self, destination: Ipv4Addr) -> Vec<u8> {
@@ -799,6 +823,7 @@ impl MobileIpSession {
         rrq: &RegistrationRequest,
         code: u8,
         home_address: Ipv4Addr,
+        scope: AuthenticatorScope,
     ) -> Vec<u8> {
         let registration_accepted = matches!(
             code,
@@ -829,8 +854,11 @@ impl MobileIpSession {
         if let Some(security) = self.config.mn_ha_security.as_deref() {
             rrp.push(MIP_MOBILE_HOME_AUTH_EXT);
             rrp.push(MIP_AUTH_EXTENSION_VALUE_LEN);
-            let authenticator = keyed_md5_prefix_suffix(&security.shared_secret, &rrp);
             rrp.extend_from_slice(&security.spi.to_be_bytes());
+            // The reply is signed in the scope the request used, which is
+            // the one the handset verifies.
+            let protected = &rrp[..scope.protected_len(rrp.len())];
+            let authenticator = keyed_md5_prefix_suffix(&security.shared_secret, protected);
             rrp.extend_from_slice(&authenticator);
         }
         rrp.push(MIP_MOBILE_FOREIGN_CHALLENGE_EXT);
@@ -930,8 +958,27 @@ fn append_3gpp2_dns_nvse(message: &mut Vec<u8>, primary_dns: Ipv4Addr, secondary
     message.push(MIP_3GPP2_DNS_UNUSED);
 }
 
+/// The fields a keyed-MD5 authenticator covers. RFC 3344 §3.5.1 adds the
+/// extension's SPI to the RFC 2002 §3.5.1 set of UDP payload, prior
+/// extensions, Type and Length. Handsets compute either form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum AuthenticatorScope {
+    #[default]
+    WithSpi,
+    WithoutSpi,
+}
+
+impl AuthenticatorScope {
+    fn protected_len(self, through_spi: usize) -> usize {
+        match self {
+            AuthenticatorScope::WithSpi => through_spi,
+            AuthenticatorScope::WithoutSpi => through_spi - AUTH_EXTENSION_SPI_LEN,
+        }
+    }
+}
+
 enum RegistrationAuthentication {
-    Accepted,
+    Accepted(AuthenticatorScope),
     InfrastructureRequired(&'static str),
     Rejected { code: u8, reason: &'static str },
 }
@@ -1036,22 +1083,28 @@ fn parse_extensions(data: &[u8], mut offset: usize) -> Option<Vec<MobileIpExtens
         let value = &data[value_start..value_start + len];
         let extension = match extension_type {
             MIP_MOBILE_FOREIGN_CHALLENGE_EXT => MobileIpExtension::MnFaChallenge(value.to_vec()),
-            MIP_MOBILE_HOME_AUTH_EXT => match parse_authentication(value, value_start) {
-                Some(authentication) => MobileIpExtension::MobileHomeAuth(authentication),
-                None => MobileIpExtension::Unknown {
-                    extension_type,
-                    subtype: None,
-                    data: value.to_vec(),
-                },
-            },
-            MIP_MOBILE_FOREIGN_AUTH_EXT => match parse_authentication(value, value_start) {
-                Some(authentication) => MobileIpExtension::MobileForeignAuth(authentication),
-                None => MobileIpExtension::Unknown {
-                    extension_type,
-                    subtype: None,
-                    data: value.to_vec(),
-                },
-            },
+            // RFC 3344 §3.5.1: the authenticator covers the Type, Length and
+            // SPI of its own extension.
+            MIP_MOBILE_HOME_AUTH_EXT => {
+                match parse_authentication(value, value_start + AUTH_EXTENSION_SPI_LEN) {
+                    Some(authentication) => MobileIpExtension::MobileHomeAuth(authentication),
+                    None => MobileIpExtension::Unknown {
+                        extension_type,
+                        subtype: None,
+                        data: value.to_vec(),
+                    },
+                }
+            }
+            MIP_MOBILE_FOREIGN_AUTH_EXT => {
+                match parse_authentication(value, value_start + AUTH_EXTENSION_SPI_LEN) {
+                    Some(authentication) => MobileIpExtension::MobileForeignAuth(authentication),
+                    None => MobileIpExtension::Unknown {
+                        extension_type,
+                        subtype: None,
+                        data: value.to_vec(),
+                    },
+                }
+            }
             MIP_MN_NAI_EXT => MobileIpExtension::MnNai(value.to_vec()),
             _ => MobileIpExtension::Unknown {
                 extension_type,
@@ -1721,6 +1774,90 @@ mod tests {
         );
     }
 
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Registers a handset RRQ and returns the reply bytes the MN-HA
+    /// authenticator follows, and the authenticator.
+    fn register_handset(hex: &str) -> (Vec<u8>, Vec<u8>) {
+        let payload = hex_bytes(hex);
+        let rrq = parse_registration_request(&payload).expect("handset RRQ should parse");
+        let mut session = MobileIpSession::new(sprint_authenticated_config(true));
+        session.issue_challenge(rrq.mn_fa_challenge().unwrap().to_vec());
+        let packet = registration_request_packet(&payload);
+        let result = session.handle_ipv4_packet(&packet, TEST_ASSIGNED_HOME);
+        let MobileIpPacketResult::Registered { reply, .. } = result else {
+            panic!("unexpected result: {result:?}");
+        };
+        let reply = registration_reply_payload(&reply).to_vec();
+        let auth = reply
+            .windows(2 + AUTH_EXTENSION_SPI_LEN)
+            .position(|w| {
+                w[0] == MIP_MOBILE_HOME_AUTH_EXT
+                    && w[1] == MIP_AUTH_EXTENSION_VALUE_LEN
+                    && w[2..] == 1234u32.to_be_bytes()
+            })
+            .expect("MN-HA extension in reply")
+            + 2
+            + AUTH_EXTENSION_SPI_LEN;
+        (
+            reply[..auth].to_vec(),
+            reply[auth..auth + MIP_AUTHENTICATOR_LEN].to_vec(),
+        )
+    }
+
+    /// A CSIM computes the MN-HA authenticator over the SPI (RFC 3344
+    /// §3.5.1), and the reply is signed the same way.
+    #[test]
+    fn csim_handset_registers_with_rfc3344_authenticator() {
+        let (signed, authenticator) = register_handset(CSIM_HANDSET_RRQ_HEX);
+        assert_eq!(
+            keyed_md5_prefix_suffix(b"secret", &signed),
+            authenticator.as_slice()
+        );
+    }
+
+    /// A Sprint handset computes it without the SPI (RFC 2002 §3.5.1), and
+    /// the reply is signed the same way.
+    #[test]
+    fn sprint_handset_registers_with_rfc2002_authenticator() {
+        let (signed, authenticator) = register_handset(SPRINT_HANDSET_RRQ_HEX);
+        let without_spi = &signed[..signed.len() - AUTH_EXTENSION_SPI_LEN];
+        assert_eq!(
+            keyed_md5_prefix_suffix(b"secret", without_spi),
+            authenticator.as_slice()
+        );
+    }
+
+    #[test]
+    fn wrong_mn_ha_secret_is_rejected_in_both_scopes() {
+        let payload = hex_bytes(SPRINT_HANDSET_RRQ_HEX);
+        let rrq = parse_registration_request(&payload).unwrap();
+        let mut config = sprint_authenticated_config(true);
+        config.mn_ha_security = Some(Box::new(MobileIpSecurityAssociation::new(
+            1234,
+            b"other".to_vec(),
+        )));
+        let mut session = MobileIpSession::new(config);
+        session.issue_challenge(rrq.mn_fa_challenge().unwrap().to_vec());
+        let result =
+            session.handle_ipv4_packet(&registration_request_packet(&payload), TEST_ASSIGNED_HOME);
+        let MobileIpPacketResult::Reply(reply) = result else {
+            panic!("unexpected result: {result:?}");
+        };
+        assert_eq!(
+            registration_reply_payload(&reply)[MIP_RRP_CODE_OFFSET],
+            RRP_CODE_HA_MOBILE_NODE_AUTH_FAILED
+        );
+    }
+
+    const CSIM_HANDSET_RRQ_HEX: &str = "010004b0000000000a1400010a370001ee94b4bc05121b80831b3030313031303030303535353939394031786274732e6c6f63616c2014000004d280d38d1a6c43b277b1efa289ce9402ff8410a69cdc2158ef44f6afa10ae7c546190624010014000000026eef1cd7521dc3e2f6dbf30ae9f18aac";
+    const SPRINT_HANDSET_RRQ_HEX: &str = "010204b000000000441c0f0c0a370001ee94b6ff05dc8480832041303030303032374533444639304068636d2e737072696e747063732e636f6d2014000004d2374655e248d751afabc6cefb96e690148410634bbba8053a4096a6b263faf0e45d0f24010014000004d2b4d6fc492c0b5aa3146282773ad34c55";
+
     #[test]
     fn sprint_rrq_authenticates_and_receives_signed_reply() {
         let payload = sprint_authenticated_rrq_payload();
@@ -1728,7 +1865,10 @@ mod tests {
         let authentication = rrq.mn_ha_auth().expect("MN-HA authentication");
         assert_eq!(authentication.spi, 1234);
         assert_eq!(
-            keyed_md5_prefix_suffix(b"secret", &payload[..authentication.protected_data_len]),
+            keyed_md5_prefix_suffix(
+                b"secret",
+                &payload[..authentication.protected_data_len - AUTH_EXTENSION_SPI_LEN]
+            ),
             authentication.authenticator.as_slice()
         );
 

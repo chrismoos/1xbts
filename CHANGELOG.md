@@ -1,5 +1,6 @@
 # HEAD
 
+- Added support for Mobile IP handsets that compute the MN-HA authenticator per RFC 3344.
 - Improve traffic channel FER (RC1/RC2/RC3).
 - Web UI UX updates.
 - Fix issue with USB threads not getting real-time scheduling on macOS.
