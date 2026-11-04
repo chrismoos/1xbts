@@ -7,10 +7,9 @@ const HRPD_DERIVED_IMSI_ESN_DOMAIN: &[u8] = b"hrpd-derived-esn-imsi-v1";
 const HRPD_DERIVED_IMSI_MEID_DOMAIN: &[u8] = b"hrpd-derived-meid-imsi-v1";
 const HRPD_DERIVED_IMSI_SUFFIX_MODULUS: u64 = 10_000_000_000;
 
-/// HardwareIDResponse HardwareIDType codes (C.S0024 §7.4, 24-bit field).
+/// HardwareIDResponse HardwareIDType codes (C.S0024-A §7.3.7.2.5, Table 7.3.7.2-1).
 const HARDWARE_ID_TYPE_ESN: u32 = 0x010000;
 const HARDWARE_ID_TYPE_MEID: u32 = 0x00ffff;
-/// The AT reports no hardware identifier.
 const HARDWARE_ID_TYPE_NONE: u32 = 0xffffff;
 const ESN_HARDWARE_ID_OCTETS: usize = 4;
 const MEID_HARDWARE_ID_OCTETS: usize = 7;

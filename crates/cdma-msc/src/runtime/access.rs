@@ -477,16 +477,18 @@ impl MscRuntime {
     ) -> Result<crate::management::InitiateCallAccepted, crate::management::ManagementError> {
         use crate::management::ManagementError;
         if !super::is_packet_data_service_option(service_option) {
-            return Err(ManagementError::Rejected(
-                "unsupported data service option".into(),
-            ));
+            return Err(ManagementError::rejected(
+                cdma_rpc_error::ErrorReason::UnsupportedServiceOption,
+                format!("SO {service_option} is not a supported data service option"),
+            )
+            .with("service_option", service_option));
         }
         let resolved = self
             .config
             .hlr_repo
             .get_subscriber_by_id(subscriber_id)
             .await
-            .map_err(ManagementError::Rejected)?
+            .map_err(ManagementError::HlrUnavailable)?
             .ok_or(ManagementError::UnknownSubscriber(subscriber_id))?;
         let call_id = self
             .start_mt_service(a1, resolved, None, None, Some(service_option))

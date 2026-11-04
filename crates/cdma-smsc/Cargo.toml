@@ -10,6 +10,7 @@ description = "PostgreSQL-backed SMSC service and repository for 1xBTS."
 
 [dependencies]
 cdma-common = { path = "../cdma-common" }
+cdma-rpc-error = { path = "../cdma-rpc-error" }
 cdma-hlr = { path = "../cdma-hlr" }
 cdma-interconnect = { path = "../cdma-interconnect" }
 cdma-interconnect-smpp = { path = "../cdma-interconnect-smpp" }

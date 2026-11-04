@@ -204,6 +204,11 @@ message PacketSessionInfo {
   MnIdSource mn_id_source = 34;
   // Authoritative subscriber IMSI when resolved.
   string subscriber_imsi = 35;
+  // PCF Session ID, the A10 key from the A11 Session Specific Extension.
+  // Present only for a session registered over A11.
+  optional uint32 pcf_session_id = 36;
+  // MN Session Reference ID from the same extension.
+  optional uint32 mn_session_reference_id = 37;
 }
 
 // One trace event emitted by PPP, RLP, IP transport, or capture code.

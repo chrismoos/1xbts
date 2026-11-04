@@ -6,6 +6,8 @@ import { KV, WapBody } from "@/components/wap-body";
 import { formatTimeMs as formatTime, hexToBytes } from "@/lib/format";
 import { smsStateColor } from "@/lib/sms-state";
 import { teleserviceKind, teleserviceName } from "@/lib/teleservice";
+import { apiFetch } from "@/lib/api-client";
+import { ErrorNotice, ResultNotice, type ActionResult } from "@/components/error-notice";
 
 // ─── Types ──────────────────────────────────────────────────────
 
@@ -84,7 +86,7 @@ function SendSmsForm({ onSent }: { onSent: () => void }) {
   const [from, setFrom] = useState("");
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
-  const [result, setResult] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [result, setResult] = useState<ActionResult | null>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -97,26 +99,25 @@ function SendSmsForm({ onSent }: { onSent: () => void }) {
       // IMSI (no HLR lookup). Anything else is treated as a subscriber phone
       // number and resolved through HLR.
       const imsiMatch = destination.match(/^IMSI:(\d+)$/i);
-      const res = await fetch("/api/sms", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          destinationImsi: imsiMatch ? imsiMatch[1] : undefined,
-          destinationNumber: imsiMatch ? undefined : destination,
-          originatingNumber: from || undefined,
-          text,
-        }),
-      });
-      const data = await res.json();
-      if (data.accepted) {
-        setResult({ ok: true, msg: "SMS accepted" });
-        setText("");
-        onSent();
-      } else {
-        setResult({ ok: false, msg: data.message || "Rejected" });
-      }
+      await apiFetch(
+        "/api/sms",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            destinationImsi: imsiMatch ? imsiMatch[1] : undefined,
+            destinationNumber: imsiMatch ? undefined : destination,
+            originatingNumber: from || undefined,
+            text,
+          }),
+        },
+        "send the message",
+      );
+      setResult({ ok: true, text: "Message accepted for delivery." });
+      setText("");
+      onSent();
     } catch (err) {
-      setResult({ ok: false, msg: err instanceof Error ? err.message : "Failed" });
+      setResult({ ok: false, error: err });
     } finally {
       setSending(false);
     }
@@ -165,12 +166,8 @@ function SendSmsForm({ onSent }: { onSent: () => void }) {
           >
             {sending ? "Sending..." : "Send"}
           </button>
-          {result && (
-            <span className={`text-xs ${result.ok ? "text-accent-green" : "text-accent-red"}`}>
-              {result.msg}
-            </span>
-          )}
         </div>
+        <ResultNotice result={result} className="mt-2" />
       </form>
     </Card>
   );
@@ -185,7 +182,7 @@ function SmsHistoryTable() {
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(0);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [stateFilter, setStateFilter] = useState<string | "">("");
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
@@ -196,15 +193,16 @@ function SmsHistoryTable() {
         offset: String(page * PAGE_SIZE),
       });
       if (stateFilter) params.set("state", stateFilter);
-      const res = await fetch(`/api/sms-history?${params}`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
+      const data = await apiFetch<{ submissions?: SmsSubmission[]; total?: number }>(
+        `/api/sms-history?${params}`,
+        undefined,
+        "load message history",
+      );
       setSubmissions(data.submissions || []);
       setTotal(data.total ?? 0);
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "unknown");
+      setError(err);
     } finally {
       setLoading(false);
     }
@@ -243,20 +241,20 @@ function SmsHistoryTable() {
       {loading && submissions.length === 0 ? (
         <p className="text-dimmed text-sm">Loading...</p>
       ) : error ? (
-        <p className="text-accent-red text-sm">{error}</p>
+        <ErrorNotice error={error} />
       ) : submissions.length === 0 ? (
         <p className="text-dimmed text-sm">No SMS submissions.</p>
       ) : (
         <div className="overflow-x-auto">
-          <table className="w-full text-sm">
+          <table className="data-table">
             <thead>
-              <tr className="text-muted text-xs">
-                <th className="text-left py-1 pr-6">Time</th>
-                <th className="text-left py-1 pr-6">From</th>
-                <th className="text-left py-1 pr-6">To</th>
-                <th className="text-left py-1 pr-6">Type</th>
-                <th className="text-left py-1 pr-6">Body</th>
-                <th className="text-left py-1">State</th>
+              <tr>
+                <th>Time</th>
+                <th>From</th>
+                <th>To</th>
+                <th>Type</th>
+                <th>Body</th>
+                <th>State</th>
               </tr>
             </thead>
             <tbody>
@@ -269,19 +267,18 @@ function SmsHistoryTable() {
                 return (
                   <Fragment key={sms.smsId}>
                     <tr
-                      className="border-t border-border hover:bg-hover cursor-pointer"
-                      onClick={() => setExpandedId(isOpen ? null : sms.smsId)}
-                    >
-                      <td className="py-1.5 pr-6 text-muted font-mono text-xs whitespace-nowrap">
+                      className="cursor-pointer"
+                      onClick={() => setExpandedId(isOpen ? null : sms.smsId)}>
+                      <td className="text-muted font-mono whitespace-nowrap">
                         {formatIsoTime(sms.createdAt)}
                       </td>
-                      <td className="py-1.5 pr-6 text-muted font-mono text-xs whitespace-nowrap">
+                      <td className="text-muted font-mono whitespace-nowrap">
                         {sms.originatingNumber || "-"}
                       </td>
-                      <td className="py-1.5 pr-6 text-secondary font-mono text-xs whitespace-nowrap">
+                      <td className="text-secondary font-mono whitespace-nowrap">
                         {sms.destinationNumber || "-"}
                       </td>
-                      <td className="py-1.5 pr-6">
+                      <td>
                         <span className={`text-xs px-2 py-0.5 rounded ${
                           kind === "wap-push"
                             ? "bg-badge-blue-bg text-badge-blue-text"
@@ -290,12 +287,12 @@ function SmsHistoryTable() {
                           {teleserviceName(sms.teleserviceId)}
                         </span>
                       </td>
-                      <td className={`py-1.5 pr-6 text-xs max-w-[20rem] truncate ${
+                      <td className={`max-w-[20rem] truncate ${
                         kind === "wap-push" ? "text-dimmed font-mono" : "text-secondary"
                       }`}>
                         {bodyPreview}
                       </td>
-                      <td className="py-1.5">
+                      <td>
                         <span className={`text-xs px-2 py-0.5 rounded ${smsStateColor(sms.state)}`}>
                           {sms.state}
                         </span>
@@ -350,7 +347,7 @@ export default function SmscPage() {
   const [refreshKey, setRefreshKey] = useState(0);
 
   return (
-    <div className="max-w-7xl mx-auto space-y-4">
+    <div className="page-container space-y-4">
       <h1 className="text-lg font-bold">SMSC</h1>
       <SendSmsForm onSent={() => setRefreshKey((k) => k + 1)} />
       <SmsHistoryTable key={refreshKey} />

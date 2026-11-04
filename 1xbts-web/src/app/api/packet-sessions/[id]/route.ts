@@ -1,5 +1,6 @@
 import { getNetworkManagementClient, waitForManagementReady } from "@/lib/grpc/client";
 import { packetSessionToJson } from "@/lib/grpc/packet-session-json";
+import { apiError } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -29,9 +30,7 @@ export async function GET(
         : result.session,
     });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    const status = msg.toLowerCase().includes("not found") ? 404 : 502;
-    return Response.json({ error: msg }, { status });
+    return apiError(err, "load the packet session");
   } finally {
     clearTimeout(timeout);
   }

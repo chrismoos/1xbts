@@ -34,6 +34,10 @@ fn default_packet_endpoint() -> String {
     "http://127.0.0.1:17021".to_string()
 }
 
+fn default_pcf_endpoint() -> String {
+    "http://127.0.0.1:17047".to_string()
+}
+
 fn default_media_ringback_enabled() -> bool {
     false
 }
@@ -572,10 +576,14 @@ pub struct MscNodeConfig {
     /// SMSC gRPC endpoint used for SMS submission and delivery tracking.
     #[serde(default = "default_smsc_endpoint")]
     pub smsc_endpoint: String,
-    /// Packet core (PDSN) gRPC endpoint the management front door reads packet
+    /// Packet core (PDSN) gRPC endpoint the management interface reads packet
     /// sessions from.
     #[serde(default = "default_packet_endpoint")]
     pub packet_endpoint: String,
+    /// PCF management gRPC endpoint the management interface reads A10 sessions
+    /// from.
+    #[serde(default = "default_pcf_endpoint")]
+    pub pcf_endpoint: String,
     /// The base stations this MSC serves, one entry per BSC-like element.
     /// Required, with no default.
     pub base_stations: Vec<BaseStationConfig>,
@@ -697,6 +705,7 @@ mod tests {
             hlr_endpoint: default_hlr_endpoint(),
             smsc_endpoint: default_smsc_endpoint(),
             packet_endpoint: default_packet_endpoint(),
+            pcf_endpoint: default_pcf_endpoint(),
             base_stations: vec![BaseStationConfig {
                 management_endpoint: "http://127.0.0.1:17016".to_string(),
                 id: None,

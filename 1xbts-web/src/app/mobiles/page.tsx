@@ -7,20 +7,22 @@ import { useBtsList } from "@/lib/use-bts-list";
 import { useAdmissionVerdicts } from "@/components/access-activity";
 import { AccessDeniedCard } from "@/components/access-denied-card";
 import { MobilesTable, type MobileInfo } from "@/components/mobiles-table";
+import { ErrorNotice } from "@/components/error-notice";
 
 const NO_MOBILES: MobileInfo[] = [];
 
 export default function MobilesPage() {
   const live = useLive<MobileInfo[]>("/api/mobiles");
   const mobiles = Array.isArray(live.data) ? live.data : NO_MOBILES;
-  const { loading, error } = live;
+  const { loading } = live;
+  const error = live.errorBody ?? live.error;
   const { cells } = useBtsList();
   const { policy } = useAdmissionVerdicts({}, 1);
   const closed = policy?.accessMode === "closed";
 
 
   return (
-    <div className="max-w-7xl mx-auto space-y-6">
+    <div className="page-container space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-lg font-bold">Mobile Stations</h1>
         {policy && (
@@ -38,7 +40,7 @@ export default function MobilesPage() {
         {loading ? (
           <p className="text-dimmed text-sm">Loading...</p>
         ) : error ? (
-          <p className="text-accent-red text-sm">{error}</p>
+          <ErrorNotice error={error} />
         ) : mobiles.length === 0 ? (
           <p className="text-dimmed text-sm">
             No mobile stations registered.

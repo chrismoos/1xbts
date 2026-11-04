@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { Card } from "@/components/card";
+import { apiFetch } from "@/lib/api-client";
+import { ErrorNotice } from "@/components/error-notice";
 
 interface PrlSummary {
   prlId: string;
@@ -67,7 +69,7 @@ function PrlSection({
   const [prls, setPrls] = useState<PrlSummary[]>([]);
   const [selected, setSelected] = useState<string>(current ?? "");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
 
   useEffect(() => {
     setSelected(current ?? "");
@@ -75,11 +77,10 @@ function PrlSection({
 
   const load = useCallback(async () => {
     try {
-      const res = await fetch("/api/prls");
-      const data = await res.json();
-      if (!data.error) setPrls(data.prls ?? []);
+      const data = await apiFetch<{ prls?: typeof prls }>("/api/prls", undefined, "load PRLs");
+      setPrls(data.prls ?? []);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "load failed");
+      setError(e);
     }
   }, []);
 
@@ -91,17 +92,18 @@ function PrlSection({
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch(
+      await apiFetch(
         `/api/subscribers/${encodeURIComponent(subscriberId)}/prl-override`,
         {
           method: "PUT",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ prlId: selected || null }),
-        }
+        },
+        "save the PRL override",
       );
-      const data = await res.json();
-      if (data.error) setError(data.error);
-      else onChanged?.();
+      onChanged?.();
+    } catch (err) {
+      setError(err);
     } finally {
       setBusy(false);
     }
@@ -133,7 +135,7 @@ function PrlSection({
           </option>
         ))}
       </select>
-      {error && <p className="text-accent-red">{error}</p>}
+      <ErrorNotice error={error} />
       {dirty && (
         <button onClick={save} disabled={busy} className={SAVE_BTN}>
           {busy ? "Saving…" : "Save"}
@@ -154,7 +156,7 @@ function SpcSection({
 }) {
   const [value, setValue] = useState<string>(current ?? "");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
 
   useEffect(() => {
     setValue(current ?? "");
@@ -169,17 +171,18 @@ function SpcSection({
         setError("SPC must be exactly 6 digits");
         return;
       }
-      const res = await fetch(
+      await apiFetch(
         `/api/subscribers/${encodeURIComponent(subscriberId)}/spc`,
         {
           method: "PUT",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ spc: trimmed || null }),
-        }
+        },
+        "save the SPC",
       );
-      const data = await res.json();
-      if (data.error) setError(data.error);
-      else onChanged?.();
+      onChanged?.();
+    } catch (err) {
+      setError(err);
     } finally {
       setBusy(false);
     }
@@ -207,7 +210,7 @@ function SpcSection({
           disabled={busy}
         />
       </label>
-      {error && <p className="text-accent-red">{error}</p>}
+      <ErrorNotice error={error} />
       {dirty && (
         <button onClick={save} disabled={busy} className={SAVE_BTN}>
           {busy ? "Saving…" : "Save"}
@@ -230,7 +233,7 @@ function AnalogControlChannelSection({
     current === undefined ? "" : String(current)
   );
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
 
   useEffect(() => {
     setValue(current === undefined ? "" : String(current));
@@ -254,17 +257,18 @@ function AnalogControlChannelSection({
         }
         firstchp = n;
       }
-      const res = await fetch(
+      await apiFetch(
         `/api/subscribers/${encodeURIComponent(subscriberId)}/firstchp-override`,
         {
           method: "PUT",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ firstchp }),
-        }
+        },
+        "save the FIRSTCHP override",
       );
-      const data = await res.json();
-      if (data.error) setError(data.error);
-      else onChanged?.();
+      onChanged?.();
+    } catch (err) {
+      setError(err);
     } finally {
       setBusy(false);
     }
@@ -294,7 +298,7 @@ function AnalogControlChannelSection({
           disabled={busy}
         />
       </label>
-      {error && <p className="text-accent-red">{error}</p>}
+      <ErrorNotice error={error} />
       {dirty && (
         <button onClick={save} disabled={busy} className={SAVE_BTN}>
           {busy ? "Saving…" : "Save"}

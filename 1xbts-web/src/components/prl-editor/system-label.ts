@@ -13,7 +13,7 @@ export function systemReferenceLabel(
   if (record.cdma2000) {
     return `SYS #${index} · SID ${record.cdma2000.sid || "any"}`;
   }
-  if (record.hrpd) return `SYS #${index} · HRPD subnet`;
+  if (record.hrpd) return `SYS #${index} · EV-DO subnet`;
   if (record.mccMnc) {
     const body =
       record.mccMnc.subtype000 ??

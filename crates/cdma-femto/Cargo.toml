@@ -26,6 +26,7 @@ hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["service", "tokio"] }
 tower = "0.5"
 cdma-common = { path = "../cdma-common" }
+cdma-rpc-error = { path = "../cdma-rpc-error" }
 cdma-a11 = { path = "../cdma-a11" }
 cdma-events = { path = "../cdma-events" }
 cdma-ios = { path = "../cdma-ios" }

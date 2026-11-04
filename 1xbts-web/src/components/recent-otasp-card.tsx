@@ -8,6 +8,7 @@ import { StartOtasp } from "@/components/start-otasp";
 import { Pagination } from "@/components/pagination";
 import { formatTimeMs as formatTime } from "@/lib/format";
 import { outcomeBadgeColor, outcomeNameToLabel } from "@/lib/otasp";
+import { ErrorNotice } from "@/components/error-notice";
 
 // Mirrors `hlr.v1.OtaspSessionSummary` after proto toJSON (timestamps
 // arrive as ISO strings, optional fields are absent rather than null).
@@ -71,7 +72,8 @@ export function RecentOtaspCard({
   const live = useLive<{ sessions?: SessionRow[]; total?: number }>(`/api/otasp-sessions?${params}`);
   const rows = live.data?.sessions ?? NO_ROWS;
   const total = live.data?.total ?? 0;
-  const { loading, error } = live;
+  const { loading } = live;
+  const error = live.errorBody ?? live.error;
 
   return (
     <Card title={title}>
@@ -79,40 +81,40 @@ export function RecentOtaspCard({
       {loading && rows.length === 0 ? (
         <p className="text-dimmed text-sm">Loading...</p>
       ) : error ? (
-        <p className="text-accent-red text-sm">{error}</p>
+        <ErrorNotice error={error} />
       ) : rows.length === 0 ? (
         <p className="text-dimmed text-sm">No OTASP sessions for this device.</p>
       ) : (
         <>
           <div className="overflow-x-auto">
-            <table className="w-full text-sm">
+            <table className="data-table">
               <thead>
-                <tr className="text-muted text-xs">
-                  <th className="text-left py-1 pr-6">Started</th>
-                  <th className="text-left py-1 pr-6">Ended</th>
-                  <th className="text-left py-1 pr-6">Outcome</th>
-                  <th className="text-left py-1 pr-6">Blocks</th>
-                  <th className="text-left py-1 pr-6">Events</th>
-                  <th className="text-left py-1">Session</th>
+                <tr>
+                  <th>Started</th>
+                  <th>Ended</th>
+                  <th>Outcome</th>
+                  <th>Blocks</th>
+                  <th>Events</th>
+                  <th>Session</th>
                 </tr>
               </thead>
               <tbody>
                 {rows.map((row) => (
-                  <tr key={row.sessionId} className="border-t border-border hover:bg-hover">
-                    <td className="py-1.5 pr-6 text-muted font-mono text-xs whitespace-nowrap">
+                  <tr key={row.sessionId}>
+                    <td className="text-muted font-mono whitespace-nowrap">
                       <span title={formatIsoTime(row.startedAt)}>{relativeTime(row.startedAt) || "-"}</span>
                     </td>
-                    <td className="py-1.5 pr-6 text-muted font-mono text-xs whitespace-nowrap">
+                    <td className="text-muted font-mono whitespace-nowrap">
                       <span title={formatIsoTime(row.endedAt)}>{row.endedAt ? relativeTime(row.endedAt) : "in progress"}</span>
                     </td>
-                    <td className="py-1.5 pr-6 text-xs whitespace-nowrap">
+                    <td className="whitespace-nowrap">
                       <span className={`px-2 py-0.5 rounded ${outcomeBadgeColor(row.outcome)}`}>
                         {outcomeNameToLabel(row.outcome)}
                       </span>
                     </td>
-                    <td className="py-1.5 pr-6 text-xs text-muted font-mono">{row.completedBlocks ?? 0}</td>
-                    <td className="py-1.5 pr-6 text-xs text-muted font-mono">{row.eventCount ?? 0}</td>
-                    <td className="py-1.5 text-xs">
+                    <td className="text-muted font-mono">{row.completedBlocks ?? 0}</td>
+                    <td className="text-muted font-mono">{row.eventCount ?? 0}</td>
+                    <td>
                       <Link
                         href={`/otasp/${encodeURIComponent(row.sessionId)}`}
                         className="text-accent-green hover:text-accent-green font-mono"

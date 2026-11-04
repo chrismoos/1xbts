@@ -1952,6 +1952,7 @@ mod tests {
         cdma_pcf::PcfNodeConfig {
             packet_grpc_endpoint: "http://127.0.0.1:17021".to_string(),
             a9_bind_addr: "127.0.0.1:17046".parse().unwrap(),
+            management_bind_addr: "127.0.0.1:0".parse().unwrap(),
             a8_bearer: cdma_a8::BearerTransportConfig::udp_encapsulated_gre(
                 "127.0.0.1:17041".parse().unwrap(),
                 "127.0.0.1:17040".parse().unwrap(),

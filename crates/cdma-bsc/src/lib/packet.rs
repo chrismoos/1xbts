@@ -110,6 +110,7 @@ impl PcfClient for LegacyPcfClient {
             mn_id: None,
             mn_id_source: None,
             subscriber_imsi: None,
+            a10: None,
             traffic_walsh_code: metadata.traffic_walsh_code,
         };
         let (legacy_uplink_tx, mut legacy_downlink_rx) =

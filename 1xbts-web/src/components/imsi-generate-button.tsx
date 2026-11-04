@@ -11,6 +11,8 @@ import {
   shortBaseStation,
 } from "@/lib/cell";
 import { useBtsList } from "@/lib/use-bts-list";
+import { apiFetch } from "@/lib/api-client";
+import { ErrorNotice } from "@/components/error-notice";
 
 interface Props {
   phoneNumber: string;
@@ -19,7 +21,7 @@ interface Props {
 
 export function ImsiGenerateButton({ phoneNumber, onGenerated }: Props) {
   const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
+  const [err, setErr] = useState<unknown>(null);
   const [picked, setPicked] = useState<string | null>(null);
   const { cells } = useBtsList();
   // MCC and IMSI_11_12 are per cell, so the button names the cell (and its base
@@ -36,23 +38,19 @@ export function ImsiGenerateButton({ phoneNumber, onGenerated }: Props) {
     setErr(null);
     setBusy(true);
     try {
-      const res = await fetch(cellHref("/api/cell-identity", token, baseStation));
-      if (!res.ok) {
-        setErr("could not load cell identity");
-        return;
-      }
-      const { mcc, imsi1112 } = (await res.json()) as {
-        mcc: string;
-        imsi1112: string;
-      };
+      const { mcc, imsi1112 } = await apiFetch<{ mcc: string; imsi1112: string }>(
+        cellHref("/api/cell-identity", token, baseStation),
+        undefined,
+        "read the cell's MCC",
+      );
       const { imsi, error } = generateImsi(phoneNumber, mcc, imsi1112);
       if (error) {
         setErr(error);
         return;
       }
       onGenerated(imsi);
-    } catch {
-      setErr("could not load cell identity");
+    } catch (error) {
+      setErr(error);
     } finally {
       setBusy(false);
     }
@@ -97,7 +95,7 @@ export function ImsiGenerateButton({ phoneNumber, onGenerated }: Props) {
           ⓘ
         </span>
       </div>
-      {err && <p className="text-[11px] text-accent-red">{err}</p>}
+      <ErrorNotice error={err} className="text-[11px]" />
     </div>
   );
 }

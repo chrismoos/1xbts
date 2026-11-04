@@ -60,7 +60,7 @@ export const PRIORITY_OPTIONS: PrlOption<PrlPriority>[] = [
 
 export const EXT_SYS_TYPE_OPTIONS: PrlOption<PrlExtSysRecordType>[] = [
   { value: PrlExtSysRecordType.PRL_EXT_SYS_RECORD_TYPE_CDMA2000, label: "cdma2000 / IS-95 (0000)" },
-  { value: PrlExtSysRecordType.PRL_EXT_SYS_RECORD_TYPE_HRPD, label: "HRPD (0001)" },
+  { value: PrlExtSysRecordType.PRL_EXT_SYS_RECORD_TYPE_HRPD, label: "EV-DO (0001)" },
   { value: PrlExtSysRecordType.PRL_EXT_SYS_RECORD_TYPE_MCC_MNC, label: "MCC-MNC (0011)" },
 ];
 
@@ -90,7 +90,7 @@ export const MCC_MNC_SUBTYPE_OPTIONS: MccMncSubtypeOption[] = [
   { value: "subtype000", label: "MCC + MNC only", description: "Just the country + network code" },
   { value: "subtype001", label: "MCC + MNC + SIDs", description: "Plus a list of 16-bit SIDs" },
   { value: "subtype010", label: "MCC + MNC + SID/NID pairs", description: "Plus a list of (SID, NID) pairs" },
-  { value: "subtype011", label: "MCC + MNC + HRPD subnets", description: "Plus a list of HRPD subnet IDs" },
+  { value: "subtype011", label: "MCC + MNC + EV-DO subnets", description: "Plus a list of EV-DO subnet IDs" },
 ];
 
 export const CLASSIC_ACQ_TYPE_OPTIONS: PrlOption<number>[] = [
@@ -108,7 +108,7 @@ export const CLASSIC_ACQ_TYPE_OPTIONS: PrlOption<number>[] = [
 export const EXTENDED_ACQ_TYPE_OPTIONS: PrlOption<number>[] = [
   ...CLASSIC_ACQ_TYPE_OPTIONS,
   { value: 0x0a, label: "Generic 1x" },
-  { value: 0x0b, label: "HRPD" },
+  { value: 0x0b, label: "EV-DO" },
   { value: 0x0f, label: "UMB acquisition table" },
   { value: 0x10, label: "UMB" },
 ];

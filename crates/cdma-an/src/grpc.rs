@@ -12,6 +12,7 @@ use cdma_common::bits::Bitstream;
 use cdma_common::hrpd::air as hrpd_air;
 use cdma_common::hrpd::uati::HrpdUati;
 use cdma_events::proto as bus;
+use cdma_rpc_error::{Domain, ErrorReason};
 
 use crate::air::{HrpdAccessOutcome, HrpdAirController, HrpdTrafficOutcome};
 use crate::events::{AnEventSink, RecentKind};
@@ -438,6 +439,8 @@ impl AnServiceImpl {
 
 /// Builds a Rev 0 HRPD session event for the bus. Subtypes are all "Default"
 /// (0) in Rev 0, matching `subtype_id`.
+const AN: Domain = Domain("an");
+
 fn bus_session_event(
     uati: u32,
     reason: bus::HrpdSessionReason,
@@ -895,14 +898,14 @@ fn decoded_access_message(message: &hrpd_air::HrpdAccessMessage) -> bus::HrpdDec
                 response.hardware_id_type,
                 response.hardware_id_value.len()
             ),
-            u32::from(hrpd_air::DEFAULT_SESSION_MANAGEMENT_PROTOCOL_TYPE),
+            u32::from(hrpd_air::DEFAULT_ADDRESS_MANAGEMENT_PROTOCOL_TYPE),
             0,
             response.hardware_id_value.clone(),
         ),
         hrpd_air::HrpdAccessMessage::KeepAlive => decoded_message(
             "KeepAlive",
             "KeepAlive",
-            u32::from(hrpd_air::DEFAULT_CONNECTED_STATE_PROTOCOL_TYPE),
+            u32::from(hrpd_air::DEFAULT_SESSION_MANAGEMENT_PROTOCOL_TYPE),
             0,
             Vec::new(),
         ),
@@ -1124,15 +1127,17 @@ fn to_an_traffic_event(e: bus::HrpdTrafficEvent) -> an_events::HrpdTrafficEvent 
 }
 
 fn checked_u8(value: u32, field: &'static str) -> Result<u8, Status> {
-    u8::try_from(value).map_err(|_| Status::invalid_argument(format!("{field} exceeds u8")))
+    u8::try_from(value).map_err(|_| AN.invalid_field(field, format!("{field} must be 255 or less")))
 }
 
 fn checked_u16(value: u32, field: &'static str) -> Result<u16, Status> {
-    u16::try_from(value).map_err(|_| Status::invalid_argument(format!("{field} exceeds u16")))
+    u16::try_from(value)
+        .map_err(|_| AN.invalid_field(field, format!("{field} must be 65535 or less")))
 }
 
 fn checked_i16(value: i32, field: &'static str) -> Result<i16, Status> {
-    i16::try_from(value).map_err(|_| Status::invalid_argument(format!("{field} exceeds i16")))
+    i16::try_from(value)
+        .map_err(|_| AN.invalid_field(field, format!("{field} must fit in 16 bits")))
 }
 
 fn ati_type_from_proto(
@@ -1174,9 +1179,14 @@ fn ati_to_proto(ati: hrpd_air::AccessTerminalIdentifier) -> proto::AccessTermina
 fn ati_from_proto(
     ati: Option<proto::AccessTerminalIdentifier>,
 ) -> Result<hrpd_air::AccessTerminalIdentifier, Status> {
-    let ati = ati.ok_or_else(|| Status::invalid_argument("missing ATI"))?;
-    let ati_type = proto::AccessTerminalIdentifierType::try_from(ati.ati_type)
-        .map_err(|_| Status::invalid_argument("invalid ATI type"))?;
+    let ati =
+        ati.ok_or_else(|| AN.invalid_field("ati", "An access terminal identifier is required"))?;
+    let ati_type = proto::AccessTerminalIdentifierType::try_from(ati.ati_type).map_err(|_| {
+        AN.invalid_field(
+            "ati.ati_type",
+            "The access terminal identifier type is not valid",
+        )
+    })?;
     Ok(hrpd_air::AccessTerminalIdentifier {
         ati_type: ati_type_from_proto(ati_type),
         value: ati.value,
@@ -1188,7 +1198,7 @@ fn access_message_from_proto(
 ) -> Result<hrpd_air::HrpdAccessMessage, Status> {
     use proto::hrpd_access_message::Message;
     let Some(message) = message.message else {
-        return Err(Status::invalid_argument("missing HRPD access message body"));
+        return Err(AN.invalid("The access message has no body"));
     };
     Ok(match message {
         Message::RouteUpdate(route) => {
@@ -1211,8 +1221,9 @@ fn access_message_from_proto(
                     .at_total_pilot_transmission
                     .map(|v| {
                         i8::try_from(v).map_err(|_| {
-                            Status::invalid_argument(
-                                "route_update.at_total_pilot_transmission exceeds i8",
+                            AN.invalid_field(
+                                "route_update.at_total_pilot_transmission",
+                                "The total pilot transmission must fit in 8 bits",
                             )
                         })
                     })
@@ -1278,8 +1289,9 @@ fn access_message_from_proto(
         }
         Message::HardwareIdResponse(hardware) => {
             if hardware.hardware_id_type > 0x00ff_ffff {
-                return Err(Status::invalid_argument(
-                    "hardware_id_response.hardware_id_type exceeds 24 bits",
+                return Err(AN.invalid_field(
+                    "hardware_id_response.hardware_id_type",
+                    "The hardware ID type must fit in 24 bits",
                 ));
             }
             hrpd_air::HrpdAccessMessage::HardwareIdResponse(hrpd_air::HrpdHardwareIdResponse {
@@ -1460,7 +1472,7 @@ fn traffic_event_from_proto(
 ) -> Result<hrpd_air::HrpdTrafficEvent, Status> {
     use proto::hrpd_traffic_event::Event;
     let Some(event) = event.event else {
-        return Err(Status::invalid_argument("missing HRPD traffic event body"));
+        return Err(AN.invalid("The traffic event has no body"));
     };
     Ok(match event {
         Event::ReversePilot(pilot) => hrpd_air::HrpdTrafficEvent::ReversePilot {
@@ -1680,8 +1692,14 @@ fn to_proto_session(
     s: &Session,
     hardware_id_response: Option<hrpd_air::HrpdHardwareIdResponse>,
     admission: Option<crate::air::HrpdSessionAdmissionView>,
+    link: Option<crate::air::HrpdSessionLinkView>,
 ) -> ProtoSession {
     let p = &s.protocols;
+    let last_activity_at_ms = link
+        .as_ref()
+        .and_then(|link| std::time::SystemTime::now().checked_sub(link.idle_for))
+        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since_epoch| since_epoch.as_millis() as u64);
     ProtoSession {
         uati: s.uati.as_u32(),
         color_code: u32::from(s.color_code),
@@ -1700,6 +1718,10 @@ fn to_proto_session(
         hardware_id_response: hardware_id_response.map(hardware_id_response_to_proto),
         full_uati: Some(an_uati_from_session(s)),
         admission: admission.map(admission_to_proto),
+        connected: link.as_ref().is_some_and(|link| link.connected),
+        mac_index: link.as_ref().and_then(|link| link.mac_index).map(u32::from),
+        drc_index: link.as_ref().and_then(|link| link.drc_index).map(u32::from),
+        last_activity_at_ms,
     }
 }
 
@@ -1712,7 +1734,7 @@ impl AnService for AnServiceImpl {
         let closed = match proto::AnAccessMode::try_from(request.into_inner().mode) {
             Ok(proto::AnAccessMode::Open) => false,
             Ok(proto::AnAccessMode::Closed) => true,
-            _ => return Err(Status::invalid_argument("access mode is required")),
+            _ => return Err(AN.invalid_field("mode", "An access mode is required")),
         };
         let changed = self.air.lock().await.set_access_closed(closed);
         if changed {
@@ -1748,6 +1770,7 @@ impl AnService for AnServiceImpl {
                     s,
                     air.hardware_id_for_uati(s.uati.as_u32()).cloned(),
                     air.session_admission(s.uati.as_u32()),
+                    air.session_link(s.uati.as_u32(), std::time::Instant::now()),
                 )
             })
             .collect();
@@ -1770,10 +1793,17 @@ impl AnService for AnServiceImpl {
                         &s,
                         air.hardware_id_for_uati(s.uati.as_u32()).cloned(),
                         air.session_admission(s.uati.as_u32()),
+                        air.session_link(s.uati.as_u32(), std::time::Instant::now()),
                     )),
                 }))
             }
-            None => Err(Status::not_found(format!("session {uati:#010x} not found"))),
+            None => Err(AN
+                .not_found(
+                    ErrorReason::EvdoSessionNotFound,
+                    format!("EV-DO session {uati:#010x} not found"),
+                )
+                .with("uati", format!("{uati:#010x}"))
+                .status()),
         }
     }
 
@@ -1786,9 +1816,13 @@ impl AnService for AnServiceImpl {
         let subnet = allocator.subnet();
         let allocator_color = u32::from(subnet.color_code);
         if req_color != WILDCARD_COLOR_CODE && allocator_color != req_color {
-            return Err(Status::not_found(format!(
-                "no allocator for color_code {req_color}"
-            )));
+            return Err(AN
+                .not_found(
+                    ErrorReason::UatiPoolNotFound,
+                    format!("No UATI pool serves color code {req_color}"),
+                )
+                .with("color_code", req_color)
+                .status());
         }
         let capacity = subnet.capacity() as u32;
         let in_use = allocator.issued_count() as u32;
@@ -1832,10 +1866,13 @@ impl AnService for AnServiceImpl {
         request: Request<proto::HrpdAccessIndication>,
     ) -> Result<Response<proto::HrpdAccessOutcome>, Status> {
         let indication = access_indication_from_proto(request.into_inner())?;
-        let outcome = self
-            .handle_access(&indication)
-            .await
-            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        let outcome = self.handle_access(&indication).await.map_err(|e| {
+            AN.precondition(
+                ErrorReason::EvdoRequestRejected,
+                format!("The access network refused the request: {e}"),
+            )
+            .status()
+        })?;
         Ok(Response::new(outcome_to_proto(outcome)))
     }
 

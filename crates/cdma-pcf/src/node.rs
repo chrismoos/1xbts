@@ -6,7 +6,7 @@ use std::path::Path;
 use cdma_common::startup::wait_for_shutdown;
 use log::info;
 
-use crate::{PcfNodeConfig, spawn_hrpd_pcf_a9_service};
+use crate::{PcfNodeConfig, spawn_hrpd_pcf_a9_service_with_sessions, spawn_pcf_management};
 
 /// PCF node config file name within the config directory.
 pub const CONFIG_FILENAME: &str = "pcf.json";
@@ -22,7 +22,9 @@ pub async fn run_node(config_dir: &Path) -> Result<(), Box<dyn std::error::Error
 
     let a9_bind_addr = config.a9_bind_addr;
     let a11_peer_addr = config.a11.peer_addr;
-    spawn_hrpd_pcf_a9_service(config).await?;
+    let (sessions_tx, sessions_rx) = tokio::sync::watch::channel(Vec::new());
+    spawn_pcf_management(config.management_bind_addr, sessions_rx).await?;
+    spawn_hrpd_pcf_a9_service_with_sessions(config, sessions_tx).await?;
     info!("PCF A9 signaling on {a9_bind_addr}, A11 peer {a11_peer_addr}");
 
     wait_for_shutdown().await;

@@ -1,5 +1,6 @@
 # HEAD
 
+- Web UI updates to EV-DO, packet data, and cell view.
 - Added support for Mobile IP handsets that compute the MN-HA authenticator per RFC 3344.
 - Improve traffic channel FER (RC1/RC2/RC3).
 - Web UI UX updates.

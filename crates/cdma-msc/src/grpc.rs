@@ -5,7 +5,7 @@
 
 use tonic::{Request, Response, Status};
 
-use crate::management::InitiateCallRequest;
+use crate::management::{InitiateCallRequest, MSC, ManagementError};
 
 pub mod bsc {
     pub mod v1 {
@@ -67,6 +67,12 @@ pub mod bsc_management {
 pub mod pcf_management {
     pub mod v1 {
         tonic::include_proto!("pcf_management.v1");
+    }
+}
+
+pub mod pcf {
+    pub mod v1 {
+        tonic::include_proto!("pcf.v1");
     }
 }
 
@@ -167,7 +173,10 @@ impl MscManagementService for MscManagementServiceImpl {
         _: Request<()>,
     ) -> Result<Response<mgmt_proto::BaseStationList>, Status> {
         let Some(base_stations) = self.base_stations.as_ref() else {
-            return Err(Status::unavailable("base station registry not attached"));
+            return Err(MSC.not_configured(
+                "base_stations",
+                "No base stations are configured on the MSC",
+            ));
         };
         let nodes = base_stations
             .summaries()
@@ -206,8 +215,8 @@ impl MscManagementService for MscManagementServiceImpl {
         request: Request<mgmt_proto::InitiateOtaspRequest>,
     ) -> Result<Response<mgmt_proto::InitiateOtaspResponse>, Status> {
         let request = request.into_inner();
-        let subscriber_id = uuid::Uuid::parse_str(&request.subscriber_id)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let subscriber_id =
+            uuid::Uuid::parse_str(&request.subscriber_id).map_err(|_| subscriber_id_invalid())?;
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         self.mgmt_tx
             .send(crate::management::PendingControlRequest::InitiateOtasp {
@@ -216,11 +225,11 @@ impl MscManagementService for MscManagementServiceImpl {
                 response_tx,
             })
             .await
-            .map_err(|_| Status::unavailable("MSC runtime is shutting down"))?;
+            .map_err(|_| MSC.stopping())?;
         let accepted = response_rx
             .await
-            .map_err(|_| Status::unavailable("MSC runtime dropped response"))?
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            .map_err(|_| MSC.stopping())?
+            .map_err(ManagementError::into_status)?;
         Ok(Response::new(mgmt_proto::InitiateOtaspResponse {
             call_id: accepted.call_id.0,
         }))
@@ -231,12 +240,14 @@ impl MscManagementService for MscManagementServiceImpl {
         request: Request<proto::InitiateCallRequest>,
     ) -> Result<Response<proto::InitiateCallResponse>, Status> {
         let inner = request.into_inner();
-        let subscriber_id = uuid::Uuid::parse_str(&inner.subscriber_id)
-            .map_err(|e| Status::invalid_argument(format!("invalid subscriber_id: {e}")))?;
+        let subscriber_id =
+            uuid::Uuid::parse_str(&inner.subscriber_id).map_err(|_| subscriber_id_invalid())?;
         let service_option = inner
             .service_option
             .map(|so| {
-                u16::try_from(so).map_err(|_| Status::invalid_argument("service_option > 65535"))
+                u16::try_from(so).map_err(|_| {
+                    MSC.invalid_field("service_option", "The service option must be 65535 or less")
+                })
             })
             .transpose()?;
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -251,11 +262,11 @@ impl MscManagementService for MscManagementServiceImpl {
                 response_tx,
             })
             .await
-            .map_err(|_| Status::unavailable("MSC runtime is shutting down"))?;
+            .map_err(|_| MSC.stopping())?;
         let result = response_rx
             .await
-            .map_err(|_| Status::internal("MSC runtime dropped response channel"))?
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|_| MSC.stopping())?
+            .map_err(ManagementError::into_status)?;
         Ok(Response::new(proto::InitiateCallResponse {
             accepted: true,
             message: format!("call_id={}", result.call_id.0),
@@ -275,15 +286,18 @@ impl MscManagementService for MscManagementServiceImpl {
                 crate::sms::SmsDestinationKey::Imsi(imsi)
             }
             None => {
-                return Err(Status::invalid_argument(
-                    "destination_number or destination_imsi is required",
+                return Err(MSC.invalid_field(
+                    "destination",
+                    "A destination phone number or IMSI is required",
                 ));
             }
         };
         let teleservice_id = inner
             .teleservice_id
             .map(|v| {
-                u16::try_from(v).map_err(|_| Status::invalid_argument("teleservice_id > 65535"))
+                u16::try_from(v).map_err(|_| {
+                    MSC.invalid_field("teleservice_id", "The teleservice ID must be 65535 or less")
+                })
             })
             .transpose()?;
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -301,15 +315,14 @@ impl MscManagementService for MscManagementServiceImpl {
                 response_tx,
             })
             .await
-            .map_err(|_| Status::unavailable("MSC runtime is shutting down"))?;
+            .map_err(|_| MSC.stopping())?;
         let sms_id = response_rx
             .await
-            .map_err(|_| Status::internal("MSC runtime dropped response channel"))?;
+            .map_err(|_| MSC.stopping())?
+            .map_err(ManagementError::into_status)?;
         Ok(Response::new(mgmt_proto::SendSmsResponse {
-            accepted: sms_id.is_some(),
-            message: sms_id.map(|id| format!("sms_id={id}")).unwrap_or_else(|| {
-                "SMS delivery failed (mobile unreachable or SMSC unavailable)".to_string()
-            }),
+            accepted: true,
+            message: format!("sms_id={sms_id}"),
         }))
     }
 
@@ -326,7 +339,7 @@ impl MscManagementService for MscManagementServiceImpl {
         _: Request<()>,
     ) -> Result<Response<Self::StreamOtaspEventsStream>, Status> {
         let Some(tx) = self.otasp_event_tx.as_ref() else {
-            return Err(Status::unavailable("OTASP event stream not configured"));
+            return Err(MSC.not_configured("otasp", "OTASP is not set up on the MSC"));
         };
         let mut rx = tx.subscribe();
         let stream = async_stream::stream! {
@@ -346,7 +359,10 @@ impl MscManagementService for MscManagementServiceImpl {
         request: Request<mgmt_proto::ListAuthenticationEventsRequest>,
     ) -> Result<Response<mgmt_proto::AuthenticationEventList>, Status> {
         let Some(history) = self.authentication_history.as_ref() else {
-            return Err(Status::unavailable("authentication history not configured"));
+            return Err(MSC.not_configured(
+                "authentication_history",
+                "Authentication history is not set up on the MSC",
+            ));
         };
         let request = request.into_inner();
         Ok(Response::new(mgmt_proto::AuthenticationEventList {
@@ -359,7 +375,10 @@ impl MscManagementService for MscManagementServiceImpl {
         request: Request<mgmt_proto::ListAdmissionEventsRequest>,
     ) -> Result<Response<mgmt_proto::AdmissionEventList>, Status> {
         let Some(history) = self.admission_history.as_ref() else {
-            return Err(Status::unavailable("admission history not configured"));
+            return Err(MSC.not_configured(
+                "admission_history",
+                "Admission history is not set up on the MSC",
+            ));
         };
         let request = request.into_inner();
         let meid = (!request.meid.is_empty()).then_some(request.meid.as_str());
@@ -388,16 +407,10 @@ impl MscManagementService for MscManagementServiceImpl {
                 response_tx,
             })
             .await
-            .map_err(|_| Status::unavailable("MSC runtime is shutting down"))?;
-        match response_rx
-            .await
-            .map_err(|_| Status::internal("MSC runtime dropped response channel"))?
-        {
+            .map_err(|_| MSC.stopping())?;
+        match response_rx.await.map_err(|_| MSC.stopping())? {
             Ok(()) => Ok(Response::new(())),
-            Err(crate::management::ManagementError::UnknownCall(call_id)) => {
-                Err(Status::not_found(format!("no active call {}", call_id.0)))
-            }
-            Err(error) => Err(Status::internal(error.to_string())),
+            Err(error) => Err(error.into_status()),
         }
     }
 
@@ -406,15 +419,19 @@ impl MscManagementService for MscManagementServiceImpl {
         self.mgmt_tx
             .send(crate::management::PendingControlRequest::ListCalls { response_tx })
             .await
-            .map_err(|_| Status::unavailable("MSC runtime is shutting down"))?;
+            .map_err(|_| MSC.stopping())?;
         let snapshots = response_rx
             .await
-            .map_err(|_| Status::internal("MSC runtime dropped response channel"))?
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|_| MSC.stopping())?
+            .map_err(ManagementError::into_status)?;
         Ok(Response::new(CallList {
             call_ids: snapshots.iter().map(|s| s.id.0.to_string()).collect(),
         }))
     }
+}
+
+fn subscriber_id_invalid() -> Status {
+    MSC.invalid_field("subscriber_id", "The subscriber ID is not valid")
 }
 
 #[cfg(test)]

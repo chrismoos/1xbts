@@ -1,5 +1,6 @@
 import { selectorFromUrl } from "@/lib/cell";
 import { getNetworkManagementClient, waitForManagementReady } from "@/lib/grpc/client";
+import { apiError } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -18,8 +19,7 @@ export async function GET(request: Request) {
       : await client.listAllChannels({}, { signal: abort.signal });
     return Response.json(result);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    return Response.json({ error: msg });
+    return apiError(err, "load channels");
   } finally {
     clearTimeout(timeout);
   }

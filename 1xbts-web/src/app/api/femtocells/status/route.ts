@@ -1,4 +1,5 @@
 import { getFemtoManagementClient } from "@/lib/grpc/femto-client";
+import { apiError, badRequest } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -7,13 +8,12 @@ export async function GET(request: Request) {
   const baseStation = url.searchParams.get("baseStation");
   const peerId = url.searchParams.get("peerId");
   if (!baseStation || !peerId) {
-    return Response.json({ error: "baseStation and peerId are required" }, { status: 400 });
+    return badRequest("Choose a base station and a femtocell");
   }
   try {
     const status = await getFemtoManagementClient(baseStation).getFemtoCellStatus({ peerId });
     return Response.json(status);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "unknown error";
-    return Response.json({ error: message }, { status: 502 });
+    return apiError(error, "load the femtocell status");
   }
 }

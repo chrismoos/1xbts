@@ -29,6 +29,7 @@ members = [
     "crates/cdma-packet",
     "crates/cdma-pcf",
     "crates/cdma-pdsn",
+    "crates/cdma-rpc-error",
     "crates/cdma-smsc",
     "crates/cdma-voice",
     "crates/edge-resolver",

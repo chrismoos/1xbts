@@ -5,6 +5,7 @@
 // to the system default PRL during OTASP `*228`.
 
 import { getHlrClient, waitForHlrReady } from "@/lib/grpc/hlr-client";
+import { apiError } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -25,9 +26,7 @@ export async function PUT(request: Request, ctx: Ctx) {
     );
     return Response.json({ ok: true });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    const status = /INVALID_ARGUMENT|not found/i.test(msg) ? 400 : 502;
-    return Response.json({ error: msg }, { status });
+    return apiError(err, "save the PRL override");
   } finally {
     clearTimeout(timeout);
   }

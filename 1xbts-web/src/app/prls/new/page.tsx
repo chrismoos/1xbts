@@ -20,6 +20,8 @@ import {
   shortBaseStation,
 } from "@/lib/cell";
 import { type CellEntry, useBtsList, usePinnedDefaultCell } from "@/lib/use-bts-list";
+import { apiFetch } from "@/lib/api-client";
+import { ErrorNotice } from "@/components/error-notice";
 
 function bytesToBase64(bytes: Uint8Array): string {
   let binary = "";
@@ -40,10 +42,10 @@ export default function NewPrlPage() {
   const [selectedCarriers, setSelectedCarriers] =
     useState<RunningSystemCarrierSelection>({ oneX: false, hrpd: false });
   const [configLoading, setConfigLoading] = useState(true);
-  const [configError, setConfigError] = useState<string | null>(null);
+  const [configError, setConfigError] = useState<unknown>(null);
   const [configRequest, setConfigRequest] = useState(0);
   const [pickedCell, setPickedCell] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [busy, setBusy] = useState(false);
   const runningReady =
     mode !== "running" ||
@@ -69,14 +71,7 @@ export default function NewPrlPage() {
     let cancelled = false;
     setConfigLoading(true);
     setConfigError(null);
-    fetch(cellHref("/api/bts-config", seedToken, seedBaseStation))
-      .then(async (response) => {
-        const data = (await response.json()) as BtsConfig & { error?: string };
-        if (!response.ok || data.error) {
-          throw new Error(data.error ?? "Could not read the running system.");
-        }
-        return data;
-      })
+    apiFetch<BtsConfig>(cellHref("/api/bts-config", seedToken, seedBaseStation), undefined, "read the running system")
       .then((config) => {
         if (cancelled) return;
         setRunningConfig(config);
@@ -85,9 +80,7 @@ export default function NewPrlPage() {
       .catch((err) => {
         if (cancelled) return;
         setRunningConfig(null);
-        setConfigError(
-          err instanceof Error ? err.message : "Could not read the running system.",
-        );
+        setConfigError(err);
       })
       .finally(() => {
         if (!cancelled) setConfigLoading(false);
@@ -136,27 +129,26 @@ export default function NewPrlPage() {
               : runningSystemPrl(id, runningConfig!, selectedCarriers);
         body = { name: name.trim(), notes, built };
       }
-      const res = await fetch("/api/prls", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      const data = await res.json();
-      if (!res.ok || data.error) {
-        setError(data.error ?? "save failed");
-        return;
-      }
+      const data = await apiFetch<{ prl?: { summary?: { prlId?: string } } }>(
+        "/api/prls",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        },
+        "create the PRL",
+      );
       const newId = data.prl?.summary?.prlId;
       router.push(newId ? `/prls/${newId}` : "/prls");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "save failed");
+      setError(err);
     } finally {
       setBusy(false);
     }
   };
 
   return (
-    <div className="space-y-4">
+    <div className="page-container space-y-4">
       <h1 className="text-primary text-lg font-medium">New PRL</h1>
 
       <div className="flex gap-1 border border-border rounded text-xs w-fit">
@@ -237,7 +229,7 @@ export default function NewPrlPage() {
             </label>
           )}
 
-          {error && <p className="text-accent-red">{error}</p>}
+          <ErrorNotice error={error} />
 
           <div className="flex gap-2">
             <button
@@ -315,7 +307,7 @@ function RunningSystemPicker({
   config: BtsConfig | null;
   selected: RunningSystemCarrierSelection;
   loading: boolean;
-  error: string | null;
+  error: unknown;
   onChange: (selected: RunningSystemCarrierSelection) => void;
   onRetry: () => void;
   cells: CellEntry[];
@@ -358,7 +350,7 @@ function RunningSystemPicker({
     return (
       <div className="rounded border border-accent-red/40 bg-accent-red/5 px-3 py-3">
         {cellPicker}
-        <p className="text-accent-red">{error ?? "Running system unavailable."}</p>
+        <ErrorNotice error={error ?? "The running system is not available."} />
         <button
           type="button"
           onClick={onRetry}
@@ -391,13 +383,13 @@ function RunningSystemPicker({
           <CarrierChoice
             checked={selected.hrpd}
             onChange={(checked) => onChange({ ...selected, hrpd: checked })}
-            title="EV-DO (HRPD)"
+            title="EV-DO"
             detail={`BC${config.evdo.bandClass} · Channel ${config.evdo.channel} · Sector ${config.evdo.sectorId} · Subnet /${config.evdo.subnetMask}`}
           />
         )}
       </div>
       {config.evdo?.mode === EvdoTxMode.EVDO_TX_MODE_HRPD_ONLY && (
-        <p className="mt-2 text-muted">The BTS is running in HRPD-only mode.</p>
+        <p className="mt-2 text-muted">The BTS is running in EV-DO-only mode.</p>
       )}
     </fieldset>
   );

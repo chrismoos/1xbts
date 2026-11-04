@@ -1,5 +1,6 @@
 //! Network-initiated provisioning uses SO18 and OTAPA Start (C.S0016-D §3.2.2).
 
+use cdma_rpc_error::ErrorReason;
 use uuid::Uuid;
 
 use crate::base_station::{BaseStationId, MscA1Endpoint};
@@ -50,11 +51,15 @@ impl MscRuntime {
         target_imsi: Option<&str>,
     ) -> Result<InitiateCallAccepted, ManagementError> {
         if self.otasp.is_none() {
-            return Err(ManagementError::Rejected("OTASP is disabled".into()));
+            return Err(ManagementError::rejected(
+                ErrorReason::OtaspDisabled,
+                "OTASP is turned off",
+            ));
         }
         if self.media_gw.is_subscriber_busy(subscriber_id) {
-            return Err(ManagementError::Rejected(
-                "Subscriber already has an active call".into(),
+            return Err(ManagementError::rejected(
+                ErrorReason::SubscriberBusy,
+                "The subscriber already has an active call",
             ));
         }
         let resolved = self
@@ -62,10 +67,13 @@ impl MscRuntime {
             .hlr_repo
             .get_subscriber_by_id(subscriber_id)
             .await
-            .map_err(ManagementError::Rejected)?
+            .map_err(ManagementError::HlrUnavailable)?
             .ok_or(ManagementError::UnknownSubscriber(subscriber_id))?;
         if resolved.subscriber.status != cdma_hlr::model::SubscriberStatus::Active {
-            return Err(ManagementError::Rejected("Subscriber is inactive".into()));
+            return Err(ManagementError::rejected(
+                ErrorReason::SubscriberInactive,
+                "The subscriber is not active",
+            ));
         }
         let identity = match target_imsi {
             Some(imsi) => resolved.identities.iter().find(|identity| {
@@ -83,7 +91,10 @@ impl MscRuntime {
             None => resolved.primary_identity.as_ref(),
         }
         .ok_or_else(|| {
-            ManagementError::Rejected("No matching subscriber identity is provisioned".into())
+            ManagementError::rejected(
+                ErrorReason::IdentityNotProvisioned,
+                "The subscriber has no matching identity",
+            )
         })?;
         let target = ProvisioningIdentity::from_parts(
             identity.imsi.as_deref().unwrap_or_default(),
@@ -122,15 +133,18 @@ impl MscRuntime {
                     })
             })
             .ok_or_else(|| {
-                ManagementError::Rejected(
-                    "No observed paging identity is known for this handset".into(),
+                ManagementError::rejected(
+                    ErrorReason::SubscriberNotRegistered,
+                    "The handset has not registered, so there is no identity to page",
                 )
             })?;
         let imsi = route.imsi.clone();
         if !a1.is_attached(&route.node) {
-            return Err(ManagementError::Rejected(
-                "Serving base station is not attached".into(),
-            ));
+            return Err(ManagementError::rejected(
+                ErrorReason::BaseStationNotAttached,
+                format!("The handset's base station {} is not connected", route.node),
+            )
+            .with("base_station", &route.node));
         }
         let call_id = self.controller.create_call(
             CallDirection::MobileTerminated,
@@ -160,7 +174,10 @@ impl MscRuntime {
             &cdma_ios::ProcedureMessage::PagingRequest(page.clone()),
         ) {
             self.abort_mt_setup(a1, call_id);
-            return Err(ManagementError::Rejected(error.to_string()));
+            return Err(ManagementError::rejected(
+                ErrorReason::OtaspRejected,
+                format!("The provisioning page was refused: {error}"),
+            ));
         }
         self.mt_call.mt_plans.insert(
             tag.0,
@@ -178,8 +195,9 @@ impl MscRuntime {
             .await
         {
             self.abort_mt_setup(a1, call_id);
-            return Err(ManagementError::Unavailable(
-                "Provisioning page could not be sent",
+            return Err(ManagementError::unavailable(
+                ErrorReason::PageFailed,
+                "The provisioning page could not be sent",
             ));
         }
         log::info!(

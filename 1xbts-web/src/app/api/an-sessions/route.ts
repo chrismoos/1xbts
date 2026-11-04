@@ -6,6 +6,7 @@ import {
   SessionState,
   type Session,
 } from "@/lib/proto/an/v1/service";
+import { apiError } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -37,8 +38,7 @@ export async function GET(request: Request) {
     );
     return Response.json(GetSessionsResponse.toJSON(result));
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    return Response.json({ error: msg });
+    return apiError(err, "load EV-DO sessions");
   } finally {
     clearTimeout(timeout);
   }

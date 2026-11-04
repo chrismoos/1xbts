@@ -76,11 +76,19 @@ mod proto_tests {
             hardware_id_response: None,
             full_uati: None,
             admission: None,
+            connected: true,
+            mac_index: Some(18),
+            drc_index: None,
+            last_activity_at_ms: 1_800_000_000_000,
         };
         let bytes = session.encode_to_vec();
         let decoded = Session::decode(&*bytes).expect("decode");
         assert_eq!(decoded.uati, 0x1234_5678);
         assert_eq!(decoded.color_code, 42);
         assert_eq!(decoded.state(), SessionState::Open);
+        assert!(decoded.connected);
+        assert_eq!(decoded.mac_index, Some(18));
+        assert_eq!(decoded.drc_index, None);
+        assert_eq!(decoded.last_activity_at_ms, 1_800_000_000_000);
     }
 }

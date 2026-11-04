@@ -44,7 +44,7 @@ export default function AccessPage() {
   const ctx = { mobile: {}, verdicts: [], cells };
 
   return (
-    <div className="max-w-7xl mx-auto space-y-6">
+    <div className="page-container space-y-6">
       <h1 className="text-lg font-bold">Access Channel Inspector</h1>
 
       <Card title={`Events (${entries.length})`}>

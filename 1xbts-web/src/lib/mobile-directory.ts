@@ -1,3 +1,4 @@
+import type { EvdoSummary } from "@/lib/evdo";
 import { useLive } from "@/lib/live";
 
 import type { AccessEvent, PagingEvent, TrafficEvent } from "@/lib/proto/bsc/v1/service";
@@ -6,12 +7,15 @@ import type { AccessEvent, PagingEvent, TrafficEvent } from "@/lib/proto/bsc/v1/
 /// resolve "which mobile sent / received this event" and render a link.
 export interface MobileDirectoryEntry {
   address: string;
+  state?: string;
   esn?: number;
   imsi?: string;
   meid?: string;
   phoneNumber?: string;
   subscriberId?: string;
+  subscriberDisplayName?: string;
   trafficWalshCode?: number;
+  evdo?: EvdoSummary;
 }
 
 export interface PacketSessionDirectoryFields {
@@ -95,7 +99,9 @@ export function mobileForEvent(
 export function isSyntheticPacketMobileAddress(address?: string): boolean {
   return Boolean(
     address &&
-      (address.startsWith("hrpd-uati-session:") || address.startsWith("uati:")),
+      (address.startsWith("hrpd-uati-session:") ||
+        address.startsWith("uati:") ||
+        address.startsWith("pcf-session:")),
   );
 }
 

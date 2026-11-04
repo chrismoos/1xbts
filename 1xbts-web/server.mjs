@@ -145,7 +145,7 @@ async function pollResource(key) {
   try {
     const res = await fetch(SELF + key, { headers: { accept: "application/json" } });
     const body = await res.text();
-    message = res.ok ? { t: "res", k: key, d: body } : { t: "res", k: key, err: `HTTP ${res.status}` };
+    message = { t: "res", k: key, d: body, ...(res.ok ? {} : { hs: res.status }) };
   } catch (err) {
     message = { t: "res", k: key, err: err instanceof Error ? err.message : "fetch failed" };
   } finally {

@@ -1,5 +1,6 @@
 import { cellScopedRequestFromUrl } from "@/lib/cell";
 import { getNetworkManagementClient, waitForManagementReady } from "@/lib/grpc/client";
+import { describeError } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -55,7 +56,7 @@ export async function GET(request: Request) {
         if (!abort.signal.aborted) {
           const msg = err instanceof Error ? err.message : "unknown error";
           console.log(`[radio-metrics] gRPC error: ${msg}`);
-          send(`data: ${JSON.stringify({ error: msg })}\n\n`);
+          send(`data: ${JSON.stringify({ error: describeError(err, "stream radio metrics").body.error })}\n\n`);
         } else {
           console.log("[radio-metrics] aborted");
         }

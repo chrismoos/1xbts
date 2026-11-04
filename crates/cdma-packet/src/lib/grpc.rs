@@ -1,3 +1,4 @@
+use cdma_rpc_error::{Domain, ErrorReason};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -536,6 +537,8 @@ fn to_proto_session_info(session_id: &str, status: &SessionStatus) -> PacketSess
         mn_id: status.mn_id.clone(),
         mn_id_source: mn_id_source_to_proto(&status.mn_id_source),
         subscriber_imsi: status.subscriber_imsi.clone(),
+        pcf_session_id: status.a10.map(|a10| a10.pcf_session_id),
+        mn_session_reference_id: status.a10.map(|a10| u32::from(a10.mn_session_reference_id)),
         traffic_walsh_code: status.traffic_walsh_code,
         rlp_state: status.rlp_state.clone(),
         lcp_state: status.lcp_state.clone(),
@@ -578,10 +581,14 @@ impl PacketService for PacketServiceImpl {
         {
             let sessions = self.sessions.lock().unwrap();
             if sessions.contains_key(&session_id) {
-                return Err(Status::already_exists(format!(
-                    "session {} already exists",
-                    session_id
-                )));
+                return Err(PACKET
+                    .error(
+                        tonic::Code::AlreadyExists,
+                        ErrorReason::PacketSessionExists,
+                        format!("Packet session {session_id} already exists"),
+                    )
+                    .with("session_id", &session_id)
+                    .status());
             }
         }
 
@@ -600,6 +607,7 @@ impl PacketService for PacketServiceImpl {
             mn_id: (!req.mn_id.is_empty()).then(|| req.mn_id.clone()),
             mn_id_source: mn_id_source_label(req.mn_id_source),
             subscriber_imsi: (!req.subscriber_imsi.is_empty()).then(|| req.subscriber_imsi.clone()),
+            a10: None,
             traffic_walsh_code: req.traffic_walsh_code,
         };
         let status = Arc::new(Mutex::new(SessionStatus::new(
@@ -672,10 +680,7 @@ impl PacketService for PacketServiceImpl {
                 close_session_entry(&req.session_id, entry).await;
                 Ok(Response::new(CloseSessionResponse {}))
             }
-            None => Err(Status::not_found(format!(
-                "session {} not found",
-                req.session_id
-            ))),
+            None => Err(session_not_found(&req.session_id)),
         }
     }
 
@@ -692,8 +697,8 @@ impl PacketService for PacketServiceImpl {
         let first_frame = inbound
             .next()
             .await
-            .ok_or_else(|| Status::invalid_argument("empty stream"))?
-            .map_err(|e| Status::internal(format!("stream error: {}", e)))?;
+            .ok_or_else(|| PACKET.invalid("The session stream sent no frames"))?
+            .map_err(|e| PACKET.internal(format!("The session stream failed: {e}")))?;
 
         let session_id = first_frame.session_id.clone();
 
@@ -702,7 +707,7 @@ impl PacketService for PacketServiceImpl {
             let sessions = self.sessions.lock().unwrap();
             let entry = sessions
                 .get(&session_id)
-                .ok_or_else(|| Status::not_found(format!("session {} not found", session_id)))?;
+                .ok_or_else(|| session_not_found(&session_id))?;
             match &entry.bearer {
                 SessionBearer::OneX {
                     uplink_tx,
@@ -710,18 +715,26 @@ impl PacketService for PacketServiceImpl {
                     ..
                 } => {
                     let downlink_rx = downlink_rx.lock().unwrap().take().ok_or_else(|| {
-                        Status::already_exists(format!(
-                            "session {} already has an active stream",
-                            session_id
-                        ))
+                        PACKET
+                            .error(
+                                tonic::Code::AlreadyExists,
+                                ErrorReason::PacketSessionExists,
+                                format!("Packet session {session_id} already has an active stream"),
+                            )
+                            .with("session_id", &session_id)
+                            .status()
                     })?;
                     (uplink_tx.clone(), downlink_rx)
                 }
                 SessionBearer::HrpdA10 { .. } => {
-                    return Err(Status::failed_precondition(format!(
-                        "session {} uses an A10 byte-stream bearer, not RLP SessionFrame streaming",
-                        session_id
-                    )));
+                    return Err(PACKET
+                        .precondition(
+                            ErrorReason::PacketSessionWrongBearer,
+                            format!(
+                                "Packet session {session_id} uses an A10 bearer, not RLP frames"
+                            ),
+                        )
+                        .status());
                 }
             }
         };
@@ -753,7 +766,7 @@ impl PacketService for PacketServiceImpl {
         let req = request.into_inner();
         let info = self
             .get_session_detail(&req.session_id)
-            .ok_or_else(|| Status::not_found(format!("session {} not found", req.session_id)))?;
+            .ok_or_else(|| session_not_found(&req.session_id))?;
 
         Ok(Response::new(GetSessionStatusResponse {
             session: Some(info),
@@ -784,7 +797,7 @@ impl PacketService for PacketServiceImpl {
         let req = request.into_inner();
         let session = self
             .set_session_capture(&req.session_id, req.enabled)
-            .ok_or_else(|| Status::not_found(format!("session {} not found", req.session_id)))?;
+            .ok_or_else(|| session_not_found(&req.session_id))?;
 
         Ok(Response::new(SetSessionCaptureResponse {
             session: Some(session),
@@ -805,12 +818,34 @@ impl PacketService for PacketServiceImpl {
             .await
             .map_err(|e| {
                 if e.contains("not found") {
-                    Status::not_found(e)
+                    session_not_found(&req.session_id)
                 } else {
-                    Status::failed_precondition(e)
+                    PACKET
+                        .precondition(ErrorReason::SchControlFailed, capitalize_first(&e))
+                        .status()
                 }
             })?;
         Ok(Response::new(SetSchActiveResponse {}))
+    }
+}
+
+const PACKET: Domain = Domain("packet");
+
+fn session_not_found(session_id: &str) -> Status {
+    PACKET
+        .not_found(
+            ErrorReason::PacketSessionNotFound,
+            "The packet session has ended or does not exist",
+        )
+        .with("session_id", session_id)
+        .status()
+}
+
+fn capitalize_first(message: &str) -> String {
+    let mut chars = message.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
@@ -861,6 +896,10 @@ mod tests {
                     mn_id: Some("310556898017332".to_string()),
                     mn_id_source: Some("a11".to_string()),
                     subscriber_imsi: None,
+                    a10: Some(crate::session_task::A10Reference {
+                        pcf_session_id: 42,
+                        mn_session_reference_id: 1,
+                    }),
                     traffic_walsh_code: 42,
                 },
             )
@@ -875,6 +914,8 @@ mod tests {
         assert_eq!(listed.imsi, "");
         assert_eq!(listed.mn_id, "310556898017332");
         assert_eq!(listed.mn_id_source(), MnIdSource::A11);
+        assert_eq!(listed.pcf_session_id, Some(42));
+        assert_eq!(listed.mn_session_reference_id, Some(1));
 
         for _ in 0..20 {
             let ready = service

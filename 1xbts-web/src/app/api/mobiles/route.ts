@@ -4,6 +4,19 @@ import { getMscManagementClient, getNetworkManagementClient, grpcErrorStatus } f
 import { getHlrClient, waitForHlrReady } from "@/lib/grpc/hlr-client";
 import type { MobileInfo } from "@/lib/proto/bsc/v1/service";
 import { AccessTechnology, type PacketSessionInfo } from "@/lib/proto/packet/v1/service";
+import { SessionState, type Session } from "@/lib/proto/an/v1/service";
+import type { A10Session } from "@/lib/proto/pcf/v1/service";
+import { evdoCells } from "@/lib/grpc/an-aggregate";
+import {
+  a10ForEvdo,
+  evdoIdentity,
+  evdoSummary,
+  isEvdoSessionOpen,
+  packetSessionForEvdo,
+  type EvdoPacketSession,
+  type EvdoSummary,
+} from "@/lib/evdo";
+import { apiError } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -36,6 +49,7 @@ interface MobileView {
   rxLevelDbfs?: number;
   voiceCallState?: string;
   voicePrivacy?: string;
+  evdo?: EvdoSummary;
 }
 
 export async function GET() {
@@ -55,7 +69,15 @@ export async function GET() {
     const mobiles = deduplicateMobiles(results.flatMap((result) =>
       result.status === "fulfilled" ? result.value : [],
     ));
-    await enrichPacketSessions(mobiles, abort.signal);
+    const packetSessions = await listPacketSessions(abort.signal);
+    const coveredPacketSessions = enrichEvdoSessions(
+      mobiles,
+      await listAnSessions(abort.signal),
+      packetSessions,
+      await listA10Sessions(abort.signal),
+    );
+    enrichPacketSessions(mobiles, packetSessions, coveredPacketSessions);
+    mobiles.sort((left, right) => (right.lastHeardMs ?? 0) - (left.lastHeardMs ?? 0));
     await enrichSubscribers(mobiles, abort.signal);
     try {
       const snapshot = await getMscManagementClient().listAdmissionEvents(
@@ -74,9 +96,7 @@ export async function GET() {
     console.log(`[mobiles] ok (${mobiles.length} mobiles)`);
     return Response.json(mobiles);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "unknown error";
-    console.log(`[mobiles] aggregation error: ${message}`);
-    return Response.json([]);
+    return apiError(error, "load mobiles");
   } finally {
     clearTimeout(timeout);
   }
@@ -154,40 +174,151 @@ async function enrichSubscribers(mobiles: MobileView[], signal: AbortSignal) {
   }
 }
 
-async function enrichPacketSessions(mobiles: MobileView[], signal: AbortSignal) {
+async function listPacketSessions(signal: AbortSignal): Promise<PacketSessionInfo[]> {
   try {
-    const result = await getNetworkManagementClient().listPcfSessions({}, { signal });
-    for (const session of result.sessions) {
-      if (
-        session.accessTechnology !== AccessTechnology.ACCESS_TECHNOLOGY_HRPD ||
-        session.phase === "closed" ||
-        mobiles.some((mobile) => mobileMatchesPacketSession(mobile, session)) ||
-        !session.subscriberId
-      ) {
-        continue;
-      }
-      mobiles.push({
-        address: `hrpd-subscriber:${session.subscriberId}`,
-        pageAddress: session.mobileAddress || session.sessionId,
-        state: session.phase === "active" ? "HRPD Active" : "HRPD",
-        baseStation: "hrpd-an",
-        baseStations: ["hrpd-an"],
-        mobPRev: 0,
-        imsi: session.subscriberImsi || session.imsi || undefined,
-        esn: session.esn || undefined,
-        meid: session.meid || undefined,
-        slotCycleIndex: 0,
-        lastHeardMs: session.lastActivityAtMs || session.createdAtMs || undefined,
-        phoneNumber: session.phoneNumber || undefined,
-        subscriberId: session.subscriberId || undefined,
-        subscriberDisplayName: session.phoneNumber || session.subscriberId,
-        trafficWalshCode: session.trafficWalshCode || undefined,
-        trafficServiceOption: session.serviceOption || undefined,
-      });
-    }
+    return (await getNetworkManagementClient().listPcfSessions({}, { signal })).sessions;
   } catch (error) {
     const message = error instanceof Error ? error.message : "unknown error";
     console.log(`[mobiles] packet-session enrichment skipped: ${message}`);
+    return [];
+  }
+}
+
+async function listAnSessions(signal: AbortSignal): Promise<Session[]> {
+  const client = getNetworkManagementClient();
+  const sessions: Session[] = [];
+  try {
+    for (const ref of await evdoCells(signal)) {
+      try {
+        const result = await client.getAnSessions(
+          { ...ref, request: { stateFilter: SessionState.SESSION_STATE_UNSPECIFIED } },
+          { signal },
+        );
+        sessions.push(...(result.sessions ?? []));
+      } catch {
+        // Skip an EV-DO cell whose AN is not answering.
+      }
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown error";
+    console.log(`[mobiles] EV-DO session enrichment skipped: ${message}`);
+  }
+  return sessions;
+}
+
+async function listA10Sessions(signal: AbortSignal): Promise<A10Session[]> {
+  try {
+    return (await getNetworkManagementClient().listPcfA10Sessions({}, { signal })).sessions;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown error";
+    console.log(`[mobiles] PCF A10 sessions unavailable: ${message}`);
+    return [];
+  }
+}
+
+function evdoPacketSession(session: PacketSessionInfo): EvdoPacketSession {
+  return {
+    sessionId: session.sessionId,
+    phase: session.phase,
+    accessTechnology: "HRPD",
+    mobileAddress: session.mobileAddress,
+    trafficWalshCode: session.trafficWalshCode,
+    subscriberId: session.subscriberId,
+    subscriberImsi: session.subscriberImsi,
+    imsi: session.imsi,
+    meid: session.meid,
+    esn: session.esn,
+    mnId: session.mnId,
+    pcfSessionId: session.pcfSessionId,
+    mnSessionReferenceId: session.mnSessionReferenceId,
+    createdAtMs: session.createdAtMs,
+  };
+}
+
+function enrichEvdoSessions(
+  mobiles: MobileView[],
+  anSessions: Session[],
+  packetSessions: PacketSessionInfo[],
+  a10Sessions: A10Session[],
+): Set<string> {
+  const evdoPackets = packetSessions.map(evdoPacketSession);
+  const covered = new Set<string>();
+  for (const session of anSessions) {
+    if (!isEvdoSessionOpen(session)) continue;
+    const packet = packetSessionForEvdo(session, evdoPackets, a10Sessions);
+    if (packet) covered.add(packet.sessionId);
+    const identity = evdoIdentity(session, mobiles, packet, a10ForEvdo(session, a10Sessions));
+    const summary = evdoSummary(session, packet);
+    const matched = identity.mobile as MobileView | undefined;
+    if (matched) {
+      if (!matched.evdo || (summary.lastActivityAtMs ?? 0) >= (matched.evdo.lastActivityAtMs ?? 0)) {
+        matched.evdo = summary;
+      }
+      continue;
+    }
+    const hardwareId = identity.hardwareId;
+    const key = hardwareId?.meid
+      ? `meid:${hardwareId.meid}`
+      : hardwareId?.esn != null
+        ? `esn:${hardwareId.esn.toString(16).padStart(8, "0")}`
+        : identity.subscriberId
+          ? `subscriber:${identity.subscriberId}`
+          : identity.imsi
+            ? `imsi:${identity.imsi}`
+            : undefined;
+    if (!key) continue;
+    mobiles.push({
+      address: `evdo-${key}`,
+      pageAddress: packet?.mobileAddress || packet?.sessionId || `evdo-${key}`,
+      state: session.connected ? "EV-DO Active" : "EV-DO",
+      baseStation: "evdo-an",
+      baseStations: ["evdo-an"],
+      mobPRev: 0,
+      imsi: identity.imsi,
+      esn: hardwareId?.esn,
+      meid: hardwareId?.meid,
+      slotCycleIndex: 0,
+      lastHeardMs: summary.lastActivityAtMs,
+      subscriberId: identity.subscriberId,
+      evdo: summary,
+    });
+  }
+  return covered;
+}
+
+function enrichPacketSessions(
+  mobiles: MobileView[],
+  packetSessions: PacketSessionInfo[],
+  covered: Set<string>,
+) {
+  for (const session of packetSessions) {
+    if (
+      session.accessTechnology !== AccessTechnology.ACCESS_TECHNOLOGY_HRPD ||
+      session.phase === "closed" ||
+      covered.has(session.sessionId) ||
+      mobiles.some((mobile) => mobileMatchesPacketSession(mobile, session)) ||
+      !session.subscriberId
+    ) {
+      continue;
+    }
+    mobiles.push({
+      address: `evdo-subscriber:${session.subscriberId}`,
+      pageAddress: session.mobileAddress || session.sessionId,
+      state: session.phase === "active" ? "EV-DO Active" : "EV-DO",
+      baseStation: "evdo-an",
+      baseStations: ["evdo-an"],
+      mobPRev: 0,
+      imsi: session.subscriberImsi || session.imsi || undefined,
+      esn: session.esn || undefined,
+      meid: session.meid || undefined,
+      slotCycleIndex: 0,
+      lastHeardMs: session.lastActivityAtMs || session.createdAtMs || undefined,
+      phoneNumber: session.phoneNumber || undefined,
+      subscriberId: session.subscriberId || undefined,
+      subscriberDisplayName: session.phoneNumber || session.subscriberId,
+      trafficWalshCode: session.trafficWalshCode || undefined,
+      trafficServiceOption: session.serviceOption || undefined,
+    });
   }
 }
 

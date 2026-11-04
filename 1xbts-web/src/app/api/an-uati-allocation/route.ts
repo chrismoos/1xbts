@@ -1,6 +1,7 @@
 import { peerRequestFromUrl, selectorFromUrl } from "@/lib/cell";
 import { getNetworkManagementClient } from "@/lib/grpc/client";
 import { evdoCells, isUnscoped } from "@/lib/grpc/an-aggregate";
+import { apiError } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -36,8 +37,7 @@ export async function GET(request: Request) {
     );
     return Response.json(result);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    return Response.json({ error: msg });
+    return apiError(err, "load the UATI pool");
   } finally {
     clearTimeout(timeout);
   }

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { BaseStationLink, MobileIdentityLink } from "@/components/activity-links";
 import { useBaseStations } from "@/lib/use-base-stations";
@@ -11,6 +11,8 @@ import { AccessBadge } from "@/components/access-activity";
 import { type ObservedMobile, accessClass, createSubscriberHref, reasonLabel } from "@/lib/admission";
 import { esnManufacturer } from "@/lib/esn-manufacturer";
 import { formatEsn, formatMeid } from "@/lib/format";
+import { apiFetch } from "@/lib/api-client";
+import { ErrorNotice } from "@/components/error-notice";
 
 const REFRESH_MS = 5_000;
 const PAGE_SIZE = 25;
@@ -80,57 +82,61 @@ export function AccessDeniedCard() {
   const [offset, setOffset] = useState(0);
   const [mobiles, setMobiles] = useState<ObservedMobile[]>([]);
   const [total, setTotal] = useState(0);
-  const [error, setError] = useState<string | null>(null);
-
-  const load = useCallback(async () => {
-    try {
-      const res = await fetch(`/api/mobiles-seen?filter=restricted&limit=${PAGE_SIZE}&offset=${offset}`);
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
-      setMobiles(data.mobiles ?? []);
-      setTotal(data.total ?? 0);
-      setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "load failed");
-    }
-  }, [offset]);
+  const [error, setError] = useState<unknown>(null);
 
   useEffect(() => {
+    let cancelled = false;
+    const load = () =>
+      apiFetch<{ mobiles?: ObservedMobile[]; total?: number }>(
+        `/api/mobiles-seen?filter=restricted&limit=${PAGE_SIZE}&offset=${offset}`,
+        undefined,
+        "load denied mobiles",
+      )
+        .then((data) => {
+          if (cancelled) return;
+          setMobiles(data.mobiles ?? []);
+          setTotal(data.total ?? 0);
+          setError(null);
+        })
+        .catch((err) => !cancelled && setError(err));
     load();
     const interval = setInterval(load, REFRESH_MS);
-    return () => clearInterval(interval);
-  }, [load]);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [offset]);
 
   return (
     <Card title={`Access Denied & Provisioning (${total})`}>
       {error ? (
-        <p className="text-accent-red text-sm">{error}</p>
+        <ErrorNotice error={error} />
       ) : mobiles.length === 0 ? (
         <p className="text-dimmed text-sm">
           No mobile is currently denied or restricted.
         </p>
       ) : (
         <div className="overflow-x-auto">
-          <table className="w-full text-sm">
+          <table className="data-table">
             <thead>
-              <tr className="text-muted text-xs">
-                <th className="text-left py-1">Identity presented</th>
-                <th className="text-left py-1">Network</th>
-                <th className="text-left py-1">Access</th>
-                <th className="text-left py-1">Reason</th>
-                <th className="text-left py-1">Matched subscriber</th>
-                <th className="text-left py-1">Last base station</th>
-                <th className="text-left py-1">Last attempt</th>
-                <th className="text-right py-1">Denials</th>
-                <th className="text-right py-1 pl-4"></th>
+              <tr>
+                <th>Identity presented</th>
+                <th>Network</th>
+                <th>Access</th>
+                <th>Reason</th>
+                <th>Matched subscriber</th>
+                <th>Last base station</th>
+                <th>Last attempt</th>
+                <th className="text-right">Denials</th>
+                <th className="text-right"></th>
               </tr>
             </thead>
             <tbody>
               {mobiles.map((mobile, index) => {
                 const reason = mobile.admissionReason;
                 return (
-                  <tr key={`${mobile.imsi}-${mobile.esn}-${mobile.meid}-${index}`} className="border-t border-border hover:bg-hover">
-                    <td className="py-2 text-xs">
+                  <tr key={`${mobile.imsi}-${mobile.esn}-${mobile.meid}-${index}`}>
+                    <td>
                       <MobileIdentityLink identity={{ ...mobile, subscriberId: mobile.subscriber?.subscriberId }} mobiles={directory}>
                         <div className="font-mono text-secondary group-hover:text-accent-green">
                           {mobile.meid
@@ -161,13 +167,13 @@ export function AccessDeniedCard() {
                         )}
                       </MobileIdentityLink>
                     </td>
-                    <td className="py-2">
+                    <td>
                       <NetworkBadge mobile={mobile} />
                     </td>
-                    <td className="py-2">
+                    <td>
                       <AccessBadge value={mobile.admissionClass} />
                     </td>
-                    <td className="py-2 text-xs text-secondary">
+                    <td className="text-secondary">
                       {reasonLabel(reason)}
                       {accessClass(mobile.admissionClass) === "provisioning" && mobile.subscriber?.configuredImsi && (
                         <div className="text-[11px] text-muted">
@@ -175,7 +181,7 @@ export function AccessDeniedCard() {
                         </div>
                       )}
                     </td>
-                    <td className="py-2 text-xs">
+                    <td>
                       {mobile.subscriber ? (
                         <div>
                           <Link
@@ -192,14 +198,14 @@ export function AccessDeniedCard() {
                         <span className="text-dimmed">-</span>
                       )}
                     </td>
-                    <td className="py-2 font-mono text-xs text-secondary">
+                    <td className="font-mono text-secondary">
                       <BaseStationLink baseStation={mobile.admissionBaseStation} nodes={nodes} />
                     </td>
-                    <td className="py-2 font-mono text-xs text-muted">
+                    <td className="font-mono text-muted">
                       {formatSeen(mobile.admissionAt)}
                     </td>
-                    <td className="py-2 text-right font-mono text-xs text-secondary">{mobile.deniedCount}</td>
-                    <td className="py-2 pl-4 text-right">
+                    <td className="text-right font-mono text-secondary">{mobile.deniedCount}</td>
+                    <td className="text-right">
                       <Action mobile={mobile} />
                     </td>
                   </tr>

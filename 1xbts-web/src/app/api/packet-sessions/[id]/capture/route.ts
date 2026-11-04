@@ -1,4 +1,5 @@
 import { getNetworkManagementClient, waitForManagementReady } from "@/lib/grpc/client";
+import { apiError } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -24,9 +25,7 @@ export async function POST(
     const result = await setCapture(id, true, abort.signal);
     return Response.json(result);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    const status = msg.toLowerCase().includes("not found") ? 404 : 502;
-    return Response.json({ error: msg }, { status });
+    return apiError(err, "start the packet capture");
   } finally {
     clearTimeout(timeout);
   }
@@ -44,9 +43,7 @@ export async function DELETE(
     const result = await setCapture(id, false, abort.signal);
     return Response.json(result);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    const status = msg.toLowerCase().includes("not found") ? 404 : 502;
-    return Response.json({ error: msg }, { status });
+    return apiError(err, "stop the packet capture");
   } finally {
     clearTimeout(timeout);
   }

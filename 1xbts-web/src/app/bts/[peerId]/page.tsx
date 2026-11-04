@@ -1,16 +1,24 @@
 "use client";
 
 import { use, useCallback, useEffect, useMemo, useState } from "react";
-import { RxPower } from "@/components/rx-power";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Card, Stat } from "@/components/card";
-import { BtsConfigCards } from "@/components/bts-config-cards";
 import { IqCaptureCard } from "@/components/iq-capture-card";
 import {
-  RadioMetricsCards,
+  CarriersCard,
+  CodeChannelsCard,
+  ConfigurationSection,
+  DiagnosticsSection,
+  EvdoCarrierSection,
+  HealthKpis,
+  TransmitterSection,
   type RadioMetrics,
-} from "@/components/radio-metrics-cards";
+} from "@/components/cell-view";
+import { MobilesTable, type MobileInfo } from "@/components/mobiles-table";
+import { useAdmissionVerdicts } from "@/components/access-activity";
+import { useLive } from "@/lib/live";
+import type { GetSessionsResponse, GetUatiAllocationResponse } from "@/lib/proto/an/v1/service";
 import {
   attachStateBadgeClass,
   attachStateLabel,
@@ -20,43 +28,22 @@ import {
   peerHref,
   sameCell,
 } from "@/lib/cell";
-import { esnManufacturer } from "@/lib/esn-manufacturer";
-import { formatEsn, formatMeid, formatTimeMs } from "@/lib/format";
 import { radioConfigPairName } from "@/lib/radio-config";
-import { serviceOptionName } from "@/lib/service-option";
 import { useBtsList } from "@/lib/use-bts-list";
 import type { BtsConfig, TrafficChannelPower } from "@/lib/proto/bsc/v1/service";
 import { CellKind, type ReversePowerControlEntry } from "@/lib/proto/bts_management/v1/service";
 import type { FemtoCellStatus } from "@/lib/proto/femto_management/v1/service";
+import { apiFetch } from "@/lib/api-client";
+import { ErrorNotice } from "@/components/error-notice";
 
-interface ServedMobile {
-  address: string;
-  state: string;
-  esn?: number;
-  imsi?: string;
-  meid?: string;
-  snrDb?: number;
-  rxPowerDbm?: number;
-  rxLevelDbfs?: number;
-  demodQualityPct?: number;
-  lastHeardMs?: number;
-  phoneNumber?: string;
-  subscriberId?: string;
-  subscriberDisplayName?: string;
-  trafficWalshCode?: number;
-  trafficServiceOption?: number;
-  servingCell?: { cell: number; sector: number };
-}
+type ServedMobile = MobileInfo;
+
+const CELL_MOBILE_ROWS = 5;
 
 function formatDb(value?: number): string {
   return value != null ? `${value.toFixed(1)} dB` : "-";
 }
 
-function mobileLabel(mobile: ServedMobile): string {
-  if (mobile.esn != null) return `ESN ${formatEsn(mobile.esn)}`;
-  if (mobile.meid) return `MEID ${formatMeid(mobile.meid)}`;
-  return mobile.address;
-}
 
 function FemtoLocationMap({ latitude, longitude }: { latitude: number; longitude: number }) {
   const latitudeDelta = 0.008;
@@ -117,13 +104,22 @@ export default function BtsDetailPage({
   const cellTok = useMemo(() => cellToken(cell), [cell]);
 
   const [config, setConfig] = useState<BtsConfig | null>(null);
-  const [configError, setConfigError] = useState<string | null>(null);
+  const [configError, setConfigError] = useState<unknown>(null);
   const [metrics, setMetrics] = useState<RadioMetrics | null>(null);
   const [powerControls, setPowerControls] = useState<ReversePowerControlEntry[]>([]);
-  const [mobiles, setMobiles] = useState<ServedMobile[]>([]);
+  const liveMobiles = useLive<ServedMobile[]>("/api/mobiles").data;
+  const mobiles = useMemo(() => (Array.isArray(liveMobiles) ? liveMobiles : []), [liveMobiles]);
+  const { policy } = useAdmissionVerdicts({}, 1, true);
+  const evdoScope =
+    summary?.evdoEnabled && summary.kind !== CellKind.CELL_KIND_FEMTOCELL ? cellToken(summary.cell) : null;
+  const anSessions = useLive<GetSessionsResponse>(evdoScope ? cellHref("/api/an-sessions", evdoScope, baseStation) : null).data;
+  const uatiAllocation = useLive<GetUatiAllocationResponse>(
+    evdoScope ? cellHref("/api/an-uati-allocation", evdoScope, baseStation) : null,
+  ).data;
   const [powerDrafts, setPowerDrafts] = useState<Record<number, string>>({});
   const [mutatingWalsh, setMutatingWalsh] = useState<number | null>(null);
-  const [mutationError, setMutationError] = useState<string | null>(null);
+  const [mutationError, setMutationError] = useState<unknown>(null);
+  const [femtoStatusError, setFemtoStatusError] = useState<unknown>(null);
   const [femtoStatus, setFemtoStatus] = useState<FemtoCellStatus | null>(null);
   const [femtoCommandStatus, setFemtoCommandStatus] = useState<string | null>(null);
   const [femtoCommandPending, setFemtoCommandPending] = useState<string | null>(null);
@@ -132,9 +128,13 @@ export default function BtsDetailPage({
   useEffect(() => {
     if (!isFemto || !baseStation) return;
     const query = new URLSearchParams({ baseStation, peerId });
-    const load = () => void fetch(`/api/femtocells/status?${query}`, { cache: "no-store" })
-      .then((response) => response.json())
-      .then((status) => { if (!status.error) setFemtoStatus(status); });
+    const load = () =>
+      void apiFetch<typeof femtoStatus>(`/api/femtocells/status?${query}`, { cache: "no-store" }, "load the femtocell status")
+        .then((status) => {
+          setFemtoStatus(status);
+          setFemtoStatusError(null);
+        })
+        .catch(setFemtoStatusError);
     load();
     const interval = setInterval(load, 5000);
     return () => clearInterval(interval);
@@ -146,16 +146,18 @@ export default function BtsDetailPage({
     setFemtoCommandStatus(null);
     setFemtoCommandPending(action);
     try {
-      const response = await fetch("/api/femtocells/action", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ baseStation, peerId, action }),
-      });
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.error || "femtocell operation failed");
+      const result = await apiFetch<{ message?: string }>(
+        "/api/femtocells/action",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ baseStation, peerId, action }),
+        },
+        action === "sync" ? "start a provisioning sync" : `${action} the femtocell`,
+      );
       setFemtoCommandStatus(result.message || "Command sent");
     } catch (error) {
-      setMutationError(error instanceof Error ? error.message : "femtocell operation failed");
+      setMutationError(error);
     } finally {
       setFemtoCommandPending(null);
     }
@@ -164,21 +166,16 @@ export default function BtsDetailPage({
   useEffect(() => {
     if (!summary || isFemto) return;
     let cancelled = false;
-    fetch(peerHref("/api/bts-config", peerId, baseStation), { cache: "no-store" })
-      .then((r) => r.json())
-      .then((data: BtsConfig & { error?: string }) => {
+    apiFetch<BtsConfig>(peerHref("/api/bts-config", peerId, baseStation), { cache: "no-store" }, "load the BTS config")
+      .then((data) => {
         if (cancelled) return;
-        if (data.error) {
-          setConfigError(data.error);
-          setConfig(null);
-        } else {
-          setConfig(data);
-          setConfigError(null);
-        }
+        setConfig(data);
+        setConfigError(null);
       })
       .catch((err) => {
         if (!cancelled) {
-          setConfigError(err instanceof Error ? err.message : "unknown error");
+          setConfigError(err);
+          setConfig(null);
         }
       });
     return () => {
@@ -211,23 +208,9 @@ export default function BtsDetailPage({
   }, [peerId, baseStation, summary, isFemto]);
 
   useEffect(() => {
-    let cancelled = false;
-    const tick = () => {
-      void loadPowerControls();
-      fetch("/api/mobiles", { cache: "no-store" })
-        .then((r) => r.json())
-        .then((data: ServedMobile[] | { error?: string }) => {
-          if (cancelled || !Array.isArray(data)) return;
-          setMobiles(data);
-        })
-        .catch(() => {});
-    };
-    tick();
-    const interval = setInterval(tick, 3000);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
+    void loadPowerControls();
+    const interval = setInterval(() => void loadPowerControls(), 3000);
+    return () => clearInterval(interval);
   }, [loadPowerControls]);
 
   const servedMobiles = useMemo(
@@ -248,14 +231,21 @@ export default function BtsDetailPage({
       setMutatingWalsh(walshCode);
       setMutationError(null);
       try {
-        const res = await fetch(cellHref("/api/bts/power-override", cellTok, baseStation), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ walshCode, ...payload }),
-        });
-        const json = await res.json();
-        if (!res.ok || !json.accepted) {
-          throw new Error(json.message || `HTTP ${res.status}`);
+        const json = await apiFetch<{
+          accepted?: boolean;
+          message?: string;
+          trafficPower?: { effectiveTargetEbNtDb?: number };
+        }>(
+          cellHref("/api/bts/power-override", cellTok, baseStation),
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ walshCode, ...payload }),
+          },
+          "change the reverse target",
+        );
+        if (!json.accepted) {
+          throw new Error(json.message || "The BTS did not apply the change.");
         }
         setPowerDrafts((prev) => {
           const next = { ...prev };
@@ -268,7 +258,7 @@ export default function BtsDetailPage({
         });
         await loadPowerControls();
       } catch (err) {
-        setMutationError(err instanceof Error ? err.message : "unknown error");
+        setMutationError(err);
       } finally {
         setMutatingWalsh((current) => (current === walshCode ? null : current));
       }
@@ -276,8 +266,12 @@ export default function BtsDetailPage({
     [loadPowerControls, cellTok, baseStation],
   );
 
+  const sessions = anSessions?.sessions;
+  const rejected = servedMobiles.filter((mobile) => mobile.state === "RegistrationRejected").length;
+  const calls = servedMobiles.filter((mobile) => mobile.trafficWalshCode != null).length;
+
   return (
-    <div className="max-w-7xl mx-auto space-y-6">
+    <div className="page-container space-y-4">
       <div className="flex flex-wrap items-center gap-3">
         <Link href="/bts" className="text-sm text-muted hover:text-secondary">
           &larr; Cells
@@ -290,6 +284,14 @@ export default function BtsDetailPage({
             className={`text-xs px-2 py-0.5 rounded ${attachStateBadgeClass(summary.state)}`}
           >
             {attachStateLabel(summary.state)}
+          </span>
+        )}
+        {summary?.evdoEnabled && (
+          <span className="rounded-full bg-accent-purple-bg px-2 py-0.5 text-[11px] font-medium text-accent-purple">EV-DO on</span>
+        )}
+        {cell && summary && (
+          <span className="font-mono text-xs text-muted">
+            PN {summary.pilotPn} · SID {summary.sid} · NID {summary.nid}
           </span>
         )}
         {summary?.statusDetail && (
@@ -306,23 +308,8 @@ export default function BtsDetailPage({
         </Card>
       )}
 
-      {cell && summary && (
-        <Card title="Cell">
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-x-6">
-            <Stat label="Pilot PN" value={String(summary.pilotPn)} mono />
-            <Stat label="Band Class" value={summary.bandClass || "-"} />
-            <Stat label="CDMA Channel" value={String(summary.cdmaChannel)} mono />
-            <Stat label="SID" value={String(summary.sid)} mono />
-            <Stat label="NID" value={String(summary.nid)} mono />
-            <Stat label="Software Version" value={summary.softwareVersion || "-"} mono />
-            <Stat label="EV-DO" value={summary.evdoEnabled ? "Enabled" : "Off"} />
-            <Stat
-              label="Served Mobiles"
-              value={summary.servedMobiles != null ? String(summary.servedMobiles) : "-"}
-              mono
-            />
-          </div>
-        </Card>
+      {!isFemto && cell && (
+        <HealthKpis mobiles={servedMobiles.length} rejected={rejected} calls={calls} metrics={metrics} />
       )}
 
       {isFemto && femtoStatus && (
@@ -356,7 +343,8 @@ export default function BtsDetailPage({
               longitude={femtoStatus.gpsLongitude}
             />
           )}
-          {mutationError && <p className="text-accent-red text-sm mt-3">{mutationError}</p>}
+          <ErrorNotice error={femtoStatusError} className="mt-3" />
+          <ErrorNotice error={mutationError} className="mt-3" />
           {femtoCommandStatus && (
             <p className="mt-3 rounded border border-accent-green/30 bg-accent-green/10 px-3 py-2 text-sm text-accent-green">
               {femtoCommandStatus}
@@ -381,35 +369,47 @@ export default function BtsDetailPage({
         </Card>
       )}
 
-      {configError && (
-        <div className="rounded-lg border border-accent-amber/20 bg-accent-amber-bg p-4 text-accent-amber text-sm">
-          {configError}
-        </div>
-      )}
-
-      {!isFemto && config && <BtsConfigCards config={config} />}
-
-      {!isFemto && <IqCaptureCard peerId={peerId} />}
-
-      {!isFemto && <RadioMetricsCards metrics={metrics} />}
-
-      {!isFemto && <Card title={`Reverse Power Control (${powerControls.length})`}>
-        {mutationError && (
-          <p className="text-accent-red text-sm mb-2">{mutationError}</p>
-        )}
-        {powerControls.length === 0 ? (
-          <p className="text-dimmed text-sm">No active traffic channels.</p>
+      <Card
+        title={`Mobiles on this cell (${servedMobiles.length})`}
+        action={<span className="text-[11px] text-muted">by last heard</span>}
+      >
+        {servedMobiles.length === 0 ? (
+          <p className="text-dimmed text-sm">No mobiles on this cell.</p>
         ) : (
+          <MobilesTable
+            mobiles={[...servedMobiles]
+              .sort((a, b) => (b.lastHeardMs ?? 0) - (a.lastHeardMs ?? 0))
+              .slice(0, CELL_MOBILE_ROWS)}
+            cells={cells}
+            closed={policy?.accessMode === "closed"}
+            hideCell
+          />
+        )}
+        <div className="mt-2 flex items-center justify-between border-t border-border pt-2">
+          <Link href="/mobiles" className="text-xs text-accent-green hover:text-accent-green">
+            All mobiles &rarr;
+          </Link>
+          {servedMobiles.length > CELL_MOBILE_ROWS && (
+            <span className="text-[11px] text-dimmed">
+              Showing {CELL_MOBILE_ROWS} of {servedMobiles.length}
+            </span>
+          )}
+        </div>
+      </Card>
+
+      {!isFemto && powerControls.length > 0 && (
+        <Card title={`Reverse power control (${powerControls.length})`}>
+          <ErrorNotice error={mutationError} className="mb-2" />
           <div className="overflow-x-auto">
-            <table className="w-full text-sm">
+            <table className="data-table">
               <thead>
-                <tr className="text-muted text-xs">
-                  <th className="text-left py-1">Walsh</th>
-                  <th className="text-left py-1">Mobile</th>
-                  <th className="text-left py-1">Target</th>
-                  <th className="text-left py-1">Override</th>
-                  <th className="text-right py-1">FER</th>
-                  <th className="text-right py-1">Frames</th>
+                <tr>
+                  <th>Walsh</th>
+                  <th>Mobile</th>
+                  <th>Target</th>
+                  <th>Override</th>
+                  <th className="text-right">FER</th>
+                  <th className="text-right">Frames</th>
                 </tr>
               </thead>
               <tbody>
@@ -427,102 +427,39 @@ export default function BtsDetailPage({
                     onPin={(targetDb) => void applyOverride(entry.walshCode, { targetDb })}
                     onClear={() => void applyOverride(entry.walshCode, { clear: true })}
                     onInvalid={() =>
-                      setMutationError(`invalid target for W${entry.walshCode}`)
+                      setMutationError(`The reverse target for W${entry.walshCode} is not a number.`)
                     }
                   />
                 ))}
               </tbody>
             </table>
           </div>
-        )}
-      </Card>}
+        </Card>
+      )}
 
-      <Card title={`Mobiles on this Cell (${servedMobiles.length})`}>
-        {servedMobiles.length === 0 ? (
-          <p className="text-dimmed text-sm">No mobiles on this cell.</p>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="text-muted text-xs">
-                  <th className="text-left py-1">Address</th>
-                  <th className="text-left py-1">Subscriber</th>
-                  <th className="text-left py-1">State</th>
-                  <th className="text-left py-1">Traffic</th>
-                  <th className="text-right py-1">SNR (dB)</th>
-                  <th className="text-right py-1">Rx Level</th>
-                  <th className="text-left py-1 pl-4">Last Heard</th>
-                  <th className="text-left py-1"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {servedMobiles.map((mobile) => (
-                  <tr
-                    key={mobile.address}
-                    className="border-t border-border hover:bg-hover"
-                  >
-                    <td className="py-2 text-secondary font-mono text-xs">
-                      <div>{mobileLabel(mobile)}</div>
-                      <div className="text-[11px] text-muted">
-                        IMSI {mobile.imsi || "Not Available"}
-                      </div>
-                      {mobile.esn != null && esnManufacturer(mobile.esn) && (
-                        <div className="text-[11px] text-dimmed">
-                          {esnManufacturer(mobile.esn)}
-                        </div>
-                      )}
-                    </td>
-                    <td className="py-2 text-xs">
-                      {mobile.subscriberId ? (
-                        <Link
-                          href={`/subscribers/${encodeURIComponent(mobile.subscriberId)}`}
-                          className="text-secondary hover:text-accent-green transition-colors"
-                        >
-                          {mobile.subscriberDisplayName || mobile.phoneNumber || "Subscriber"}
-                        </Link>
-                      ) : (
-                        <span className="text-dimmed">-</span>
-                      )}
-                    </td>
-                    <td className="py-2 text-xs text-secondary">{mobile.state}</td>
-                    <td className="py-2 font-mono text-xs text-secondary">
-                      {mobile.trafficWalshCode != null ? (
-                        <span>
-                          W{mobile.trafficWalshCode}
-                          {mobile.trafficServiceOption != null && (
-                            <span className="text-muted ml-1">
-                              {serviceOptionName(mobile.trafficServiceOption)}
-                            </span>
-                          )}
-                        </span>
-                      ) : (
-                        "-"
-                      )}
-                    </td>
-                    <td className="py-2 text-right font-mono text-xs text-secondary">
-                      {mobile.snrDb != null ? mobile.snrDb.toFixed(1) : "-"}
-                    </td>
-                    <td className="py-2 text-right font-mono text-xs text-secondary">
-                      <RxPower dbm={mobile.rxPowerDbm} dbfs={mobile.rxLevelDbfs} />
-                    </td>
-                    <td className="py-2 pl-4 text-muted font-mono text-xs">
-                      {mobile.lastHeardMs ? formatTimeMs(mobile.lastHeardMs) : "-"}
-                    </td>
-                    <td className="py-2 text-right">
-                      <Link
-                        href={`/mobiles/${encodeURIComponent(mobile.address)}`}
-                        className="text-xs text-accent-green hover:text-accent-green transition-colors"
-                      >
-                        View &rarr;
-                      </Link>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+      <ErrorNotice error={configError} boxed />
+
+      {!isFemto && config && (
+        <>
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+            <CarriersCard config={config} />
+            <CodeChannelsCard config={config} />
           </div>
-        )}
-      </Card>
+          <div className="space-y-2.5">
+            <ConfigurationSection config={config} softwareVersion={summary?.softwareVersion} />
+            <TransmitterSection config={config} />
+            <EvdoCarrierSection
+              evdo={config.evdo}
+              sessions={sessions ? sessions.length : null}
+              connected={sessions ? sessions.filter((session) => session.connected).length : null}
+              uati={uatiAllocation?.capacity ? { inUse: uatiAllocation.inUse, capacity: uatiAllocation.capacity } : null}
+              sessionsHref="/evdo"
+            />
+            <DiagnosticsSection metrics={metrics} />
+            <IqCaptureCard peerId={peerId} />
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -557,12 +494,12 @@ function PowerControlRow({
   );
 
   return (
-    <tr className="border-t border-border hover:bg-hover">
-      <td className="py-2 font-mono text-xs text-primary">
+    <tr>
+      <td className="font-mono text-primary">
         <div>W{walshCode}</div>
         {radioConfigs && <div className="text-[11px] text-muted">{radioConfigs}</div>}
       </td>
-      <td className="py-2 text-xs">
+      <td>
         {mobile ? (
           <Link
             href={`/mobiles/${encodeURIComponent(mobile.address)}`}
@@ -574,7 +511,7 @@ function PowerControlRow({
           <span className="text-dimmed">-</span>
         )}
       </td>
-      <td className="py-2 text-xs text-secondary">
+      <td className="text-secondary">
         {power ? (
           <div className="leading-5">
             <div className="text-[10px] uppercase tracking-wide text-muted">
@@ -600,7 +537,7 @@ function PowerControlRow({
           <span className="text-dimmed">-</span>
         )}
       </td>
-      <td className="py-2 text-xs">
+      <td>
         {power ? (
           <div className="flex items-center gap-2">
             <input
@@ -642,10 +579,10 @@ function PowerControlRow({
           <span className="text-dimmed">-</span>
         )}
       </td>
-      <td className="py-2 text-right font-mono text-xs text-secondary">
+      <td className="text-right font-mono text-secondary">
         {power ? `${power.ferPct.toFixed(1)}%` : "-"}
       </td>
-      <td className="py-2 text-right font-mono text-xs text-muted">
+      <td className="text-right font-mono text-muted">
         {power ? `${power.framesCrcError}/${power.framesTotal}` : "-"}
       </td>
     </tr>

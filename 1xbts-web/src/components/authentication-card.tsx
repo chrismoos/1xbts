@@ -4,6 +4,8 @@ import { useCallback, useEffect, useState } from "react";
 import { akeyChecksum, randomAKey } from "@/lib/akey";
 import { Card } from "@/components/card";
 import { AuthenticationActivity } from "@/components/authentication-activity";
+import { apiFetch } from "@/lib/api-client";
+import { ErrorNotice } from "@/components/error-notice";
 
 interface AuthState {
   credentialsProvisioned: boolean;
@@ -27,22 +29,21 @@ export function AuthenticationCard({ subscriberId }: { subscriberId: string }) {
   const [entry, setEntry] = useState("");
   const [format, setFormat] = useState<"keypad" | "hex">("keypad");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const url = `/api/subscribers/${encodeURIComponent(subscriberId)}/authentication`;
 
   const load = useCallback(async () => {
     try {
-      const res = await fetch(url);
-      const data = await res.json();
-      if (data.error) {
-        setError(data.error);
-      } else {
-        setState(data.state);
-        setGenerationEsn(data.generationEsn ?? null);
-        setIdentities(data.identities ?? []);
-      }
+      const data = await apiFetch<{
+        state: AuthState | null;
+        generationEsn?: number | null;
+        identities?: { imsi?: string; esn?: number }[];
+      }>(url, undefined, "load authentication settings");
+      setState(data.state);
+      setGenerationEsn(data.generationEsn ?? null);
+      setIdentities(data.identities ?? []);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "load failed");
+      setError(e);
     }
   }, [url]);
 
@@ -55,24 +56,23 @@ export function AuthenticationCard({ subscriberId }: { subscriberId: string }) {
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch(url, {
-        method: "PUT",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      const data = await res.json();
-      if (data.error) {
-        setError(data.error);
-      } else {
-        if (aKey == null || !generated) {
-          setEntry("");
-          setGenerated(false);
-        }
-        setSaved(aKey != null && generated);
-        await load();
+      await apiFetch(
+        url,
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        },
+        aKey == null ? "clear the A-key" : "save the A-key",
+      );
+      if (aKey == null || !generated) {
+        setEntry("");
+        setGenerated(false);
       }
+      setSaved(aKey != null && generated);
+      await load();
     } catch (error) {
-      setError(error instanceof Error ? error.message : "Saving the A-key failed.");
+      setError(error);
     } finally {
       setBusy(false);
     }
@@ -220,7 +220,7 @@ export function AuthenticationCard({ subscriberId }: { subscriberId: string }) {
                 : "A-key generated with check digits. Select Set A-key to save it."}
             </p>
           )}
-          {error && <p className="text-accent-red">{error}</p>}
+          <ErrorNotice error={error} />
         </section>
       </div>
     </Card>

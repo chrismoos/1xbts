@@ -1,74 +1,51 @@
 "use client";
 
-import { useLive } from "@/lib/live";
 import Link from "next/link";
 import { Card } from "@/components/card";
-import {
-  SessionState,
-  type Session,
-  type GetUatiAllocationResponse,
-} from "@/lib/proto/an/v1/service";
+import { EvdoSessionTable, useEvdoSessionRows } from "@/components/evdo-session-table";
+import { errorBodyOf } from "@/lib/api-client";
+import { ErrorNotice } from "@/components/error-notice";
 
-/// Dashboard rollup of the EV-DO (HRPD) access network: session count by state
-/// and UATI pool utilization. Quietly shows "not running" when the AN service
-/// is unreachable (e.g. EV-DO disabled).
+const DASHBOARD_SESSIONS = 3;
+
 export function HrpdSummaryCard() {
-  const liveSessions = useLive<{ sessions?: Session[] }>("/api/an-sessions");
-  const sessions = liveSessions.data ? (liveSessions.data.sessions ?? []) : null;
-  const unavailable = liveSessions.error != null;
-  const allocation = useLive<GetUatiAllocationResponse>("/api/an-uati-allocation").data ?? null;
-
-  const openCount =
-    sessions?.filter((s) => s.state === SessionState.SESSION_STATE_OPEN)
-      .length ?? 0;
-  const usedPct =
-    allocation && allocation.capacity > 0
-      ? Math.min(100, (allocation.inUse / allocation.capacity) * 100)
-      : 0;
+  const { rows, error, loading } = useEvdoSessionRows("/api/an-sessions");
+  const connected = rows.filter((row) => row.link === "connected").length;
+  const dormant = rows.filter((row) => row.link === "dormant").length;
 
   return (
-    <Card title="EV-DO (HRPD)">
-      {unavailable ? (
-        <p className="text-dimmed text-sm">Not running</p>
+    <Card title="EV-DO">
+      {error ? (
+        errorBodyOf(error).reason === "EVDO_NOT_ENABLED" ? (
+          <p className="text-dimmed text-sm">Not enabled on this cell</p>
+        ) : (
+          <ErrorNotice error={error} className="text-xs" />
+        )
       ) : (
-        <div className="space-y-3 text-xs">
-          <div className="flex flex-wrap gap-x-4 gap-y-1 text-muted">
+        <div className="space-y-2">
+          <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted">
             <span>
-              <span className="text-primary font-mono">
-                {sessions?.length ?? 0}
-              </span>{" "}
-              sessions
+              <span className="font-mono text-primary">{rows.length}</span> sessions
             </span>
             <span>
-              <span className="text-accent-green font-mono">{openCount}</span>{" "}
-              open
+              <span className="font-mono text-accent-cyan">{connected}</span> connected
+            </span>
+            <span>
+              <span className="font-mono text-accent-amber">{dormant}</span> dormant
             </span>
           </div>
-          {allocation && (
-            <div className="space-y-1">
-              <div className="flex justify-between text-muted">
-                <span>UATI pool (color {allocation.colorCode})</span>
-                <span className="font-mono">
-                  {allocation.inUse}/{allocation.capacity}
-                </span>
-              </div>
-              <div className="h-1.5 w-full rounded bg-surface-raised overflow-hidden">
-                <div
-                  className="h-full bg-accent-indigo transition-all"
-                  style={{ width: `${usedPct}%` }}
-                />
-              </div>
+          {!loading && (
+            <div>
+              <EvdoSessionTable rows={rows.slice(0, DASHBOARD_SESSIONS)} compact />
             </div>
           )}
         </div>
       )}
-      <div className="mt-2 pt-2 border-t border-border">
-        <Link
-          href="/hrpd"
-          className="text-xs text-accent-green hover:text-accent-green"
-        >
-          HRPD sessions →
+      <div className="mt-2 flex items-center justify-between border-t border-border pt-2 text-xs">
+        <Link href="/evdo" className="text-accent-green hover:text-accent-green">
+          EV-DO sessions →
         </Link>
+        {rows.length > DASHBOARD_SESSIONS && <span className="text-muted">+{rows.length - DASHBOARD_SESSIONS} more</span>}
       </div>
     </Card>
   );

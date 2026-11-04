@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use cdma_rpc_error::{Domain, ErrorReason};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
@@ -180,9 +181,11 @@ fn delivery_attempt_to_proto(a: &SmsDeliveryAttempt) -> crate::proto::SmsDeliver
     }
 }
 
+const SMSC: Domain = Domain("smsc");
+
 fn parse_uuid(s: &str, field: &str) -> Result<Uuid, Status> {
     Uuid::parse_str(s)
-        .map_err(|_| Status::invalid_argument(format!("invalid UUID for {}: {}", field, s)))
+        .map_err(|_| SMSC.invalid_field(field, format!("The ID \"{s}\" is not valid")))
 }
 
 fn cdma_smsc_lib_options<'a>(
@@ -220,16 +223,15 @@ impl SmscService for SmscServiceImpl {
         } else if let Some(number) = req.destination_number {
             SmsDestination::PhoneNumber(number)
         } else {
-            return Err(Status::invalid_argument(
-                "one of destination_number, destination_esn, or destination_imsi is required",
+            return Err(SMSC.invalid_field(
+                "destination",
+                "A destination phone number, ESN or IMSI is required",
             ));
         };
 
         let teleservice_id = req
             .teleservice_id
-            .map(|v| {
-                u16::try_from(v).map_err(|_| Status::invalid_argument("teleservice_id > 65535"))
-            })
+            .map(|v| u16::try_from(v).map_err(|_| teleservice_out_of_range()))
             .transpose()?;
         let options = cdma_smsc_lib_options(teleservice_id, req.raw_user_data.as_deref());
 
@@ -246,7 +248,7 @@ impl SmscService for SmscServiceImpl {
             .await
             .map_err(|e| {
                 log::error!("db error: {e}");
-                Status::internal("internal error")
+                SMSC.database()
             })?;
 
         Ok(Response::new(CreateSmsSubmissionResponse {
@@ -267,16 +269,18 @@ impl SmscService for SmscServiceImpl {
             Some(ref id) => Some(parse_uuid(id, "destination_subscriber_id")?),
             None => None,
         };
-        let fingerprint = req
-            .fingerprint
-            .ok_or_else(|| Status::invalid_argument("fingerprint is required"))?;
+        let fingerprint = req.fingerprint.ok_or_else(|| {
+            SMSC.invalid_field("fingerprint", "A message fingerprint is required")
+        })?;
         let fingerprint = crate::model::MoSmsFingerprint {
             teleservice_id: u16::try_from(fingerprint.teleservice_id)
-                .map_err(|_| Status::invalid_argument("teleservice_id > 65535"))?,
-            message_type: u8::try_from(fingerprint.message_type)
-                .map_err(|_| Status::invalid_argument("message_type > 255"))?,
-            message_id: u16::try_from(fingerprint.message_id)
-                .map_err(|_| Status::invalid_argument("message_id > 65535"))?,
+                .map_err(|_| teleservice_out_of_range())?,
+            message_type: u8::try_from(fingerprint.message_type).map_err(|_| {
+                SMSC.invalid_field("message_type", "The message type must be 255 or less")
+            })?,
+            message_id: u16::try_from(fingerprint.message_id).map_err(|_| {
+                SMSC.invalid_field("message_id", "The message ID must be 65535 or less")
+            })?,
         };
 
         let (submission, created) = self
@@ -292,7 +296,7 @@ impl SmscService for SmscServiceImpl {
             .await
             .map_err(|e| {
                 log::error!("db error: {e}");
-                Status::internal("internal error")
+                SMSC.database()
             })?;
 
         Ok(Response::new(
@@ -309,8 +313,9 @@ impl SmscService for SmscServiceImpl {
     ) -> Result<Response<UpdateSmsSubmissionStateResponse>, Status> {
         let req = request.into_inner();
         let sms_id = parse_uuid(&req.sms_id, "sms_id")?;
-        let state = SmsState::from_str(&req.state)
-            .ok_or_else(|| Status::invalid_argument(format!("invalid state: {}", req.state)))?;
+        let state = SmsState::from_str(&req.state).ok_or_else(|| {
+            SMSC.invalid_field("state", format!("{} is not a valid state", req.state))
+        })?;
 
         let submission = self
             .repo
@@ -318,7 +323,7 @@ impl SmscService for SmscServiceImpl {
             .await
             .map_err(|e| {
                 log::error!("db error: {e}");
-                Status::internal("internal error")
+                SMSC.database()
             })?;
 
         Ok(Response::new(UpdateSmsSubmissionStateResponse {
@@ -339,13 +344,17 @@ impl SmscService for SmscServiceImpl {
             .await
             .map_err(|e| {
                 log::error!("db error: {e}");
-                Status::internal("internal error")
+                SMSC.database()
             })?
-            .ok_or_else(|| Status::not_found(format!("submission {} not found", sms_id)))?;
+            .ok_or_else(|| {
+                SMSC.not_found(ErrorReason::SmsNotFound, "Message not found")
+                    .with("sms_id", sms_id)
+                    .status()
+            })?;
 
         let attempts = self.repo.get_delivery_attempts(sms_id).await.map_err(|e| {
             log::error!("db error: {e}");
-            Status::internal("internal error")
+            SMSC.database()
         })?;
 
         Ok(Response::new(GetSmsSubmissionResponse {
@@ -377,7 +386,7 @@ impl SmscService for SmscServiceImpl {
             .await
             .map_err(|e| {
                 log::error!("db error: {e}");
-                Status::internal("internal error")
+                SMSC.database()
             })?;
 
         Ok(Response::new(ListSmsSubmissionsResponse {
@@ -404,7 +413,7 @@ impl SmscService for SmscServiceImpl {
             .await
             .map_err(|e| {
                 log::error!("db error: {e}");
-                Status::internal("internal error")
+                SMSC.database()
             })?;
 
         Ok(Response::new(CreateDeliveryAttemptResponse {
@@ -418,8 +427,9 @@ impl SmscService for SmscServiceImpl {
     ) -> Result<Response<UpdateDeliveryAttemptStateResponse>, Status> {
         let req = request.into_inner();
         let attempt_id = parse_uuid(&req.sms_delivery_attempt_id, "sms_delivery_attempt_id")?;
-        let state = DeliveryAttemptState::from_str(&req.state)
-            .ok_or_else(|| Status::invalid_argument(format!("invalid state: {}", req.state)))?;
+        let state = DeliveryAttemptState::from_str(&req.state).ok_or_else(|| {
+            SMSC.invalid_field("state", format!("{} is not a valid state", req.state))
+        })?;
 
         let attempt = self
             .repo
@@ -427,7 +437,7 @@ impl SmscService for SmscServiceImpl {
             .await
             .map_err(|e| {
                 log::error!("db error: {e}");
-                Status::internal("internal error")
+                SMSC.database()
             })?;
 
         Ok(Response::new(UpdateDeliveryAttemptStateResponse {
@@ -448,7 +458,7 @@ impl SmscService for SmscServiceImpl {
             .await
             .map_err(|e| {
                 log::error!("db error: {e}");
-                Status::internal("internal error")
+                SMSC.database()
             })?;
         Ok(Response::new(()))
     }
@@ -464,16 +474,18 @@ impl SmscService for SmscServiceImpl {
             .map(|id| parse_uuid(id, "originating_subscriber_id"))
             .transpose()?;
         // Handset retransmissions preserve the teleservice ID, message type, and message ID.
-        let wire = req
-            .fingerprint
-            .ok_or_else(|| Status::invalid_argument("fingerprint is required"))?;
+        let wire = req.fingerprint.ok_or_else(|| {
+            SMSC.invalid_field("fingerprint", "A message fingerprint is required")
+        })?;
         let fingerprint = crate::model::MoSmsFingerprint {
             teleservice_id: u16::try_from(wire.teleservice_id)
-                .map_err(|_| Status::invalid_argument("teleservice_id > 65535"))?,
-            message_type: u8::try_from(wire.message_type)
-                .map_err(|_| Status::invalid_argument("message_type > 255"))?,
-            message_id: u16::try_from(wire.message_id)
-                .map_err(|_| Status::invalid_argument("message_id > 65535"))?,
+                .map_err(|_| teleservice_out_of_range())?,
+            message_type: u8::try_from(wire.message_type).map_err(|_| {
+                SMSC.invalid_field("message_type", "The message type must be 255 or less")
+            })?,
+            message_id: u16::try_from(wire.message_id).map_err(|_| {
+                SMSC.invalid_field("message_id", "The message ID must be 65535 or less")
+            })?,
         };
         let (submission, created) = self
             .repo
@@ -488,7 +500,7 @@ impl SmscService for SmscServiceImpl {
             .await
             .map_err(|e| {
                 log::error!("db error: {e}");
-                Status::internal("internal error")
+                SMSC.database()
             })?;
         if created && let Some(queue) = &self.dispatch_queue {
             queue.enqueue(submission.clone(), None);
@@ -508,10 +520,16 @@ impl SmscService for SmscServiceImpl {
         let destination = match req.destination {
             Some(Destination::Number(number)) => SmsDestination::PhoneNumber(number),
             Some(Destination::Esn(esn)) => SmsDestination::Esn(
-                u32::try_from(esn).map_err(|_| Status::invalid_argument("esn > 32 bits"))?,
+                u32::try_from(esn)
+                    .map_err(|_| SMSC.invalid_field("esn", "The ESN must fit in 32 bits"))?,
             ),
             Some(Destination::Imsi(imsi)) => SmsDestination::Imsi(imsi),
-            None => return Err(Status::invalid_argument("a destination is required")),
+            None => {
+                return Err(SMSC.invalid_field(
+                    "destination",
+                    "A destination phone number, ESN or IMSI is required",
+                ));
+            }
         };
         let destination_subscriber_id = req
             .destination_subscriber_id
@@ -534,7 +552,7 @@ impl SmscService for SmscServiceImpl {
             .await
             .map_err(|e| {
                 log::error!("db error: {e}");
-                Status::internal("internal error")
+                SMSC.database()
             })?;
 
         if let Some(queue) = &self.dispatch_queue {
@@ -593,4 +611,8 @@ impl futures_core::Stream for DeliveryCommandStream {
     ) -> std::task::Poll<Option<Self::Item>> {
         self.0.poll_recv(cx).map(|next| next.map(Ok))
     }
+}
+
+fn teleservice_out_of_range() -> Status {
+    SMSC.invalid_field("teleservice_id", "The teleservice ID must be 65535 or less")
 }

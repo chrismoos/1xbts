@@ -270,7 +270,7 @@ function MccMncBody({
         />
       </div>
       <ListField<{ subnetLengthBits: number; subnetIdHex: string }>
-        label="HRPD subnets"
+        label="EV-DO subnets"
         items={b.subnets}
         create={() => ({ subnetLengthBits: 0, subnetIdHex: "" })}
         render={(v, set) => (

@@ -1,0 +1,20 @@
+[package]
+name = "cdma-rpc-error"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Structured gRPC error details for 1xBTS services."
+
+[dependencies]
+tonic = "0.13"
+tonic-types = "0.13"
+prost = "0.13"
+
+[build-dependencies]
+tonic-build = "0.13"
+
+[lints]
+workspace = true

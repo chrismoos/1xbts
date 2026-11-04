@@ -5,6 +5,7 @@ import { useLive } from "@/lib/live";
 import type { BtsSummary } from "@/lib/proto/bts_management/v1/service";
 
 import { defaultCellToken } from "@/lib/cell";
+import type { ApiErrorBody } from "./api-error-body";
 
 // A cell plus the base station it belongs to, so callers can address it across
 // base stations (a cell/sector token is only unique within one base station).
@@ -12,13 +13,13 @@ export type CellEntry = BtsSummary & { baseStation: string };
 
 interface BtsListState {
   cells: CellEntry[];
-  error: string | null;
+  error: ApiErrorBody | string | null;
   loading: boolean;
 }
 
 export function useBtsList(): BtsListState {
-  const { data, error, loading } = useLive<{ bts?: CellEntry[] }>("/api/bts");
-  return { cells: data?.bts ?? NO_CELLS, error, loading };
+  const { data, error, errorBody, loading } = useLive<{ bts?: CellEntry[] }>("/api/bts");
+  return { cells: data?.bts ?? NO_CELLS, error: errorBody ?? error, loading };
 }
 
 const NO_CELLS: CellEntry[] = [];

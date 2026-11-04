@@ -12,6 +12,7 @@ description = "HRPD (1xEV-DO) Access Network: session, UATI, connection, and str
 cdma-a8 = { path = "../cdma-a8" }
 cdma-a9 = { path = "../cdma-a9" }
 cdma-common = { path = "../cdma-common" }
+cdma-rpc-error = { path = "../cdma-rpc-error" }
 cdma-events = { path = "../cdma-events" }
 cdma-hlr = { path = "../cdma-hlr" }
 cdma-packet = { path = "../cdma-packet" }

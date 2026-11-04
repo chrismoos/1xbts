@@ -20,6 +20,10 @@ fn default_a9_bind_addr() -> SocketAddr {
     socket_addr("127.0.0.1:17046")
 }
 
+fn default_management_bind_addr() -> SocketAddr {
+    socket_addr("127.0.0.1:17047")
+}
+
 fn default_a8_bearer() -> BearerTransportConfig {
     BearerTransportConfig::udp_encapsulated_gre(
         socket_addr("127.0.0.1:17041"),
@@ -50,6 +54,9 @@ pub struct PcfNodeConfig {
     /// A9 signaling bind address for AN/BS Setup-A8 requests.
     #[serde(default = "default_a9_bind_addr")]
     pub a9_bind_addr: SocketAddr,
+    /// Management gRPC listener that lists the PCF's A10 connections.
+    #[serde(default = "default_management_bind_addr")]
+    pub management_bind_addr: SocketAddr,
     /// A8 bearer delivery toward the AN/BS.
     #[serde(default = "default_a8_bearer")]
     pub a8_bearer: BearerTransportConfig,
@@ -102,6 +109,7 @@ mod tests {
         PcfNodeConfig {
             packet_grpc_endpoint: default_packet_grpc_endpoint(),
             a9_bind_addr: default_a9_bind_addr(),
+            management_bind_addr: default_management_bind_addr(),
             a8_bearer: default_a8_bearer(),
             a10_bearer: default_a10_bearer(),
             a11: default_a11(),

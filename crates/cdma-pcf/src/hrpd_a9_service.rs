@@ -15,6 +15,7 @@ const HRPD_A11_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_mil
 const HRPD_A11_MAX_ATTEMPTS: usize = 3;
 const A11_PROTOCOL_TYPE_UNSTRUCTURED_BYTE_STREAM: u16 = 0x8881;
 const A11_MSID_TYPE_IMSI: u16 = 0x0006;
+const HRPD_A11_MN_SESSION_REFERENCE_ID: u16 = 1;
 const HRPD_A9_RELEASE_A8_CAUSE_PPP_SESSION_CLOSED_BY_MS: u8 = 0x77;
 
 fn unix_seconds() -> u64 {
@@ -38,6 +39,46 @@ async fn send_a9_payload(
         .await
         .map_err(|err| format!("{label}: send A9 UDP datagram to {peer}: {err}"))?;
     Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HrpdA10SessionView {
+    pub pcf_session_id: u32,
+    pub mn_session_reference_id: u16,
+    /// A8 GRE key from the A9 setup. The AN sets it to the session UATI.
+    pub a8_key: u32,
+    pub correlation_id: Option<u32>,
+    pub con_ref: u8,
+    pub imsi: Option<String>,
+    pub esn: Option<u32>,
+    pub meid: Option<[u8; 7]>,
+    pub pdsn_address: Option<[u8; 4]>,
+    pub an_address: SocketAddr,
+}
+
+fn a10_session_views(connected: &HashMap<u32, ConnectedA8>) -> Vec<HrpdA10SessionView> {
+    let mut views: Vec<_> = connected
+        .iter()
+        .filter_map(|(a8_key, entry)| {
+            Some(HrpdA10SessionView {
+                pcf_session_id: u32::try_from(entry.session_id.0).ok()?,
+                mn_session_reference_id: HRPD_A11_MN_SESSION_REFERENCE_ID,
+                a8_key: *a8_key,
+                correlation_id: entry
+                    .connect
+                    .correlation_id
+                    .map(|id| u32::from_be_bytes(id.0)),
+                con_ref: entry.connect.con_ref.0,
+                imsi: entry.connect.imsi.clone(),
+                esn: entry.connect.esn,
+                meid: entry.connect.meid.map(|meid| meid.0),
+                pdsn_address: entry.connect.pdsn_ip_address.map(|address| address.0),
+                an_address: entry.peer,
+            })
+        })
+        .collect();
+    views.sort_by_key(|view| view.pcf_session_id);
+    views
 }
 
 #[derive(Clone, Debug)]
@@ -165,7 +206,7 @@ fn build_hrpd_a11_session_from_imsi(
         protocol_type: A11_PROTOCOL_TYPE_UNSTRUCTURED_BYTE_STREAM,
         pcf_session_id,
         session_id_version: 1,
-        mn_session_reference_id: 1,
+        mn_session_reference_id: HRPD_A11_MN_SESSION_REFERENCE_ID,
         mn_id_type: A11_MSID_TYPE_IMSI,
         mn_id: imsi_to_a11_msid_bcd(imsi)?,
     })
@@ -589,6 +630,14 @@ impl HrpdPcfA9State {
 pub async fn spawn_hrpd_pcf_a9_service(
     pcf_config: crate::PcfNodeConfig,
 ) -> Result<HrpdA9ClientConfig, Error> {
+    let (sessions, _) = tokio::sync::watch::channel(Vec::new());
+    spawn_hrpd_pcf_a9_service_with_sessions(pcf_config, sessions).await
+}
+
+pub async fn spawn_hrpd_pcf_a9_service_with_sessions(
+    pcf_config: crate::PcfNodeConfig,
+    sessions: tokio::sync::watch::Sender<Vec<HrpdA10SessionView>>,
+) -> Result<HrpdA9ClientConfig, Error> {
     let (a8_local_ipv4, a8_peer_ipv4) =
         configured_a8_ipv4_pair(&pcf_config.a8_bearer, "pcf.a8_bearer")
             .map_err(|err| Error::from(format!("HRPD PCF A9 config: {err}")))?;
@@ -643,6 +692,14 @@ pub async fn spawn_hrpd_pcf_a9_service(
             pcf_config_for_task.a11.peer_addr
         );
         loop {
+            let views = a10_session_views(&state.connected);
+            sessions.send_if_modified(|current| {
+                if *current == views {
+                    return false;
+                }
+                *current = views;
+                true
+            });
             let (datagram, peer) = tokio::select! {
                 a11 = a11_endpoint.recv_message_verified(&mut state.a11_buf, &a11_security) => {
                     let (message, peer) = match a11 {
@@ -1211,5 +1268,50 @@ mod tests {
             imsi_to_a11_msid_bcd("310009176936269").unwrap(),
             vec![0x31, 0x01, 0x00, 0x19, 0x67, 0x39, 0x26, 0x96]
         );
+    }
+
+    fn connected(session_id: u64, uati: u32, imsi: &str) -> ConnectedA8 {
+        ConnectedA8 {
+            session_id: PcfSessionId(session_id),
+            connect: cdma_a9::ConnectA8Message {
+                call_connection_reference: None,
+                correlation_id: Some(cdma_a9::CorrelationId(uati.to_be_bytes())),
+                imsi: Some(imsi.to_string()),
+                esn: Some(0x4cdc_1d09),
+                meid: None,
+                con_ref: cdma_a9::ConRef(6),
+                a8_traffic_id: cdma_a9::A8TrafficId::gre_ppp(uati, [127, 0, 0, 1]),
+                cause: cdma_a9::CauseValue::A8_CONNECTION_COMPLETE,
+                pdsn_ip_address: Some(cdma_a9::PdsnIpAddress([127, 0, 0, 2])),
+            },
+            peer: "127.0.0.1:40000".parse().unwrap(),
+            metadata: cdma_a9::TransportMetadata {
+                flags: 0,
+                session_id: 1,
+                sequence_no: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn a10_session_views_pair_each_a8_key_with_its_pcf_session() {
+        let mut map = HashMap::new();
+        map.insert(0x00ce_1e6f, connected(1, 0x00ce_1e6f, "310550000001951"));
+        map.insert(0x0039_7dd2, connected(2, 0x0039_7dd2, "310006054426442"));
+
+        let views = a10_session_views(&map);
+
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].pcf_session_id, 1);
+        assert_eq!(views[0].a8_key, 0x00ce_1e6f);
+        assert_eq!(views[0].imsi.as_deref(), Some("310550000001951"));
+        assert_eq!(views[1].pcf_session_id, 2);
+        assert_eq!(views[1].a8_key, 0x0039_7dd2);
+        assert_eq!(views[1].correlation_id, Some(0x0039_7dd2));
+        assert_eq!(
+            views[1].mn_session_reference_id,
+            HRPD_A11_MN_SESSION_REFERENCE_ID
+        );
+        assert_eq!(views[1].pdsn_address, Some([127, 0, 0, 2]));
     }
 }

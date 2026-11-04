@@ -2,6 +2,8 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { apiFetch } from "@/lib/api-client";
+import { ErrorNotice } from "@/components/error-notice";
 
 const SESSION_WAIT_MS = 90000;
 const SESSION_POLL_MS = 2000;
@@ -11,7 +13,7 @@ export function StartOtasp({ subscriberId, imsi, compact = false }: { subscriber
   const [previousSessions, setPreviousSessions] = useState<string[] | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const sessionsUrl = `/api/otasp-sessions?subscriberId=${encodeURIComponent(subscriberId)}&limit=10`;
 
   useEffect(() => {
@@ -59,16 +61,20 @@ export function StartOtasp({ subscriberId, imsi, compact = false }: { subscriber
     setMessage(null);
     setSessionId(null);
     try {
-      const existing = await fetch(sessionsUrl);
-      if (!existing.ok) throw new Error("Session history is unavailable. Try again when the HLR is connected.");
-      const history = await existing.json();
-      const response = await fetch(`/api/subscribers/${encodeURIComponent(subscriberId)}/otasp`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ imsi }) });
-      const result = await response.json();
-      if (!response.ok || !result.accepted) throw new Error(result.error || "Provisioning could not be started.");
+      const history = await apiFetch<{ sessions?: { sessionId: string }[] }>(
+        sessionsUrl,
+        undefined,
+        "read OTASP session history",
+      );
+      await apiFetch(
+        `/api/subscribers/${encodeURIComponent(subscriberId)}/otasp`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ imsi }) },
+        "start OTASP",
+      );
       setMessage("Paging handset. A recently rejected registration can delay its response.");
       setPreviousSessions((history.sessions || []).map((row: { sessionId: string }) => row.sessionId));
     } catch (error) {
-      setError(error instanceof Error ? error.message : "Provisioning could not be started.");
+      setError(error);
       setPending(false);
     }
   }
@@ -82,7 +88,7 @@ export function StartOtasp({ subscriberId, imsi, compact = false }: { subscriber
       {!compact && <p className="text-xs text-muted">Pages the handset and applies the configured OTASP settings and subscriber overrides.</p>}
       {message && <p role="status" className="text-xs text-secondary">{message}</p>}
       {sessionId && <Link href={`/otasp/${encodeURIComponent(sessionId)}`} className="text-xs text-accent-green underline underline-offset-2">View session progress</Link>}
-      {error && <p role="alert" className="text-xs text-accent-red">{error}</p>}
+      <ErrorNotice error={error} className="text-xs" />
     </div>
   );
 }

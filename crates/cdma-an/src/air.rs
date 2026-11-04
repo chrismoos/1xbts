@@ -660,6 +660,14 @@ pub struct HrpdSessionAdmissionView {
     pub access_auth_nai: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HrpdSessionLinkView {
+    pub connected: bool,
+    pub mac_index: Option<u8>,
+    pub drc_index: Option<u8>,
+    pub idle_for: Duration,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum HrpdHardwareAdmission {
     /// No HardwareIDResponse has been resolved yet.
@@ -816,6 +824,23 @@ impl HrpdAirController {
             access_auth_state: at.access.state_name(),
             access_auth_result: at.access.result().cloned(),
             access_auth_nai: at.access.nai().map(str::to_string),
+        })
+    }
+
+    pub fn session_link(&self, session_uati: u32, now: Instant) -> Option<HrpdSessionLinkView> {
+        let at = self.ats.get(&session_uati)?;
+        let connection = at
+            .pending_traffic_assignment
+            .as_ref()
+            .filter(|pending| pending.active);
+        Some(HrpdSessionLinkView {
+            connected: connection.is_some(),
+            mac_index: connection
+                .and_then(|pending| pending.assignment.pilots.first())
+                .map(|pilot| pilot.mac_index),
+            drc_index: connection
+                .and_then(|pending| self.last_drc_by_uati.get(&pending.traffic_uati).copied()),
+            idle_for: now.saturating_duration_since(at.last_activity_at),
         })
     }
 
@@ -9666,6 +9691,77 @@ mod tests {
             .unwrap();
         assert_eq!(non_acack_signaling(&after_active).len(), 0);
         assert_eq!(after_active.traffic_assignments.len(), 0);
+    }
+
+    #[test]
+    fn session_link_reports_the_connection_once_traffic_channel_complete_arrives() {
+        let mut controller = HrpdAirController::with_sector(26, 0, None);
+        let mut allocator = allocator();
+        let _ = controller
+            .handle_access_indication(
+                &indication(vec![HrpdAccessMessage::UatiRequest(HrpdUatiRequest {
+                    transaction_id: 0x9c,
+                })]),
+                &mut allocator,
+            )
+            .unwrap();
+        let _ = controller
+            .handle_access_indication(
+                &uati_indication(vec![HrpdAccessMessage::UatiComplete(HrpdUatiComplete {
+                    message_sequence: 0,
+                    upper_old_uati: Vec::new(),
+                    reserved_zero: true,
+                })]),
+                &mut allocator,
+            )
+            .unwrap();
+        let session_uati = *controller.ats.keys().next().expect("tracked session");
+        let now = Instant::now();
+        let idle = controller
+            .session_link(session_uati, now)
+            .expect("link view");
+        assert!(!idle.connected);
+        assert_eq!(idle.mac_index, None);
+
+        let first = controller
+            .handle_access_indication(
+                &uati_indication(vec![HrpdAccessMessage::ConnectionRequest(
+                    HrpdConnectionRequest {
+                        transaction_id: 0x21,
+                        request_reason: 0,
+                        reserved_zero: true,
+                    },
+                )]),
+                &mut allocator,
+            )
+            .unwrap();
+        let tca_sequence = signaling_for(&first, DEFAULT_ROUTE_UPDATE_PROTOCOL_TYPE).payload[1];
+        let assigned_mac = first.traffic_assignments[0].mac_index;
+        let pending = controller
+            .session_link(session_uati, Instant::now())
+            .expect("link view");
+        assert!(!pending.connected);
+
+        let _ = controller
+            .handle_access_indication(
+                &uati_indication(vec![HrpdAccessMessage::TrafficChannelComplete(
+                    HrpdTrafficChannelComplete {
+                        message_sequence: tca_sequence,
+                    },
+                )]),
+                &mut allocator,
+            )
+            .unwrap();
+        let connected = controller
+            .session_link(session_uati, Instant::now())
+            .expect("link view");
+        assert!(connected.connected);
+        assert_eq!(connected.mac_index, Some(assigned_mac));
+        assert!(
+            controller
+                .session_link(0xdead_beef, Instant::now())
+                .is_none()
+        );
     }
 
     #[test]

@@ -15,9 +15,6 @@ import {
   formatAccessChannel,
   formatAccessSummary,
   formatPagingChannel,
-  formatHrpdAccessSummary,
-  formatHrpdSessionSummary,
-  formatHrpdTrafficSummary,
   formatPagingSummary,
   formatTrafficChannel,
   formatTrafficSummary,
@@ -28,6 +25,7 @@ import { VoicePrivacyIndicator } from "@/components/voice-privacy-indicator";
 import { cellLabel } from "@/lib/cell";
 import { a1DirectionClass, a1DirectionLabel, a1TypeName, formatA1Summary } from "@/lib/a1-event";
 import { type AuthVerdict, verdictForAccess } from "@/lib/authentication-verdict";
+import { evdoMessageInfo } from "@/lib/evdo-messages";
 import type { LogEntry } from "@/lib/message-log";
 import type { AccessEvent } from "@/lib/proto/bsc/v1/service";
 
@@ -37,7 +35,7 @@ export const MESSAGE_CATEGORY_LABEL: Record<MessageCategory, string> = {
   paging: "Paging",
   access: "Access",
   traffic: "Traffic",
-  hrpd: "HRPD",
+  hrpd: "EV-DO",
   a1: "A1",
 };
 
@@ -119,20 +117,21 @@ export function messageView(entry: LogEntry, ctx: MessageContext): MessageView {
   }
   if (entry.kind === "hrpd") {
     const direction = "direction" in entry.event ? entry.event.direction : undefined;
+    const info = evdoMessageInfo(entry.stream, entry.event);
+    const fields = info.fields.map((field) => `${field.key} ${field.value}`);
     const base = {
       category: "hrpd" as const,
       lane: "L3" as const,
-      direction: direction != null ? hrpdDirectionLabel(direction) : "EVDO",
+      direction: direction != null ? hrpdDirectionLabel(direction) : "EV-DO",
       directionClass: direction != null ? hrpdDirectionClass(direction) : hrpdDirectionClass(),
-      channel: "",
+      channel: info.channel === "Session" ? "" : info.channel,
+      type: info.name,
+      summary: [...fields, info.note].filter(Boolean).join(" · "),
+      bytes: info.bytes,
     };
-    if (entry.stream === "session") {
-      return { ...base, type: "HRPD Session", summary: formatHrpdSessionSummary(entry.event), detail: <HrpdSessionDetail event={entry.event} /> };
-    }
-    if (entry.stream === "access") {
-      return { ...base, type: "HRPD Access", summary: formatHrpdAccessSummary(entry.event), detail: <HrpdAccessDetail event={entry.event} /> };
-    }
-    return { ...base, type: "HRPD Traffic", summary: formatHrpdTrafficSummary(entry.event), detail: <HrpdTrafficDetail event={entry.event} /> };
+    if (entry.stream === "session") return { ...base, detail: <HrpdSessionDetail event={entry.event} /> };
+    if (entry.stream === "access") return { ...base, detail: <HrpdAccessDetail event={entry.event} /> };
+    return { ...base, detail: <HrpdTrafficDetail event={entry.event} /> };
   }
   if (entry.kind === "a1") {
     const ev = entry.event;

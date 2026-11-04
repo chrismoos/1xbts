@@ -1,4 +1,5 @@
 import { getMscManagementClient } from "@/lib/grpc/client";
+import { apiError } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -11,8 +12,7 @@ export async function GET() {
     const result = await client.listBaseStations({}, { signal: abort.signal });
     return Response.json(result);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    return Response.json({ error: msg }, { status: 502 });
+    return apiError(err, "load base stations");
   } finally {
     clearTimeout(timeout);
   }

@@ -1,13 +1,10 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { apiFetch } from "@/lib/api-client";
+import { ResultNotice, type ActionResult } from "@/components/error-notice";
 
 const SMS_MAX_CHARS = 160;
-
-interface SmsResult {
-  accepted: boolean;
-  message: string;
-}
 
 export function SendSmsDialog({
   open,
@@ -25,7 +22,7 @@ export function SendSmsDialog({
   const [from, setFrom] = useState("5551234");
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
-  const [result, setResult] = useState<SmsResult | null>(null);
+  const [result, setResult] = useState<ActionResult | null>(null);
   const textRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -44,25 +41,26 @@ export function SendSmsDialog({
     setSending(true);
     setResult(null);
     try {
-      const res = await fetch("/api/sms", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          originatingNumber: from,
-          text,
-          destinationNumber: phoneNumber || undefined,
-          destinationImsi: phoneNumber ? undefined : imsi || undefined,
-        }),
-      });
-      const data: SmsResult = await res.json();
-      setResult(data);
-      if (data.accepted) {
-        setText("");
-        onSent?.(phoneNumber || (imsi ? `IMSI ${imsi}` : "the mobile"));
-        onClose();
-      }
+      await apiFetch(
+        "/api/sms",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            originatingNumber: from,
+            text,
+            destinationNumber: phoneNumber || undefined,
+            destinationImsi: phoneNumber ? undefined : imsi || undefined,
+          }),
+        },
+        "send the message",
+      );
+      setResult({ ok: true, text: "Message accepted for delivery." });
+      setText("");
+      onSent?.(phoneNumber || (imsi ? `IMSI ${imsi}` : "the mobile"));
+      onClose();
     } catch (err) {
-      setResult({ accepted: false, message: err instanceof Error ? err.message : "unknown error" });
+      setResult({ ok: false, error: err });
     } finally {
       setSending(false);
     }
@@ -124,7 +122,7 @@ export function SendSmsDialog({
             </div>
           </div>
           {result && (
-            <p className={`text-xs ${result.accepted ? "text-accent-green" : "text-accent-red"}`}>{result.message}</p>
+            <ResultNotice result={result} />
           )}
         </div>
       </div>

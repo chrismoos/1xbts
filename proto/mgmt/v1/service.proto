@@ -6,6 +6,7 @@ import "bts_management/v1/service.proto";
 import "an/v1/service.proto";
 import "packet/v1/service.proto";
 import "pcf_management/v1/service.proto";
+import "pcf/v1/service.proto";
 import "pdsn_management/v1/service.proto";
 import "management/v1/service.proto";
 import "google/protobuf/empty.proto";
@@ -87,6 +88,9 @@ service NetworkManagementService {
 
   // Lists packet sessions known by the PCF.
   rpc ListPcfSessions(google.protobuf.Empty) returns (pcf_management.v1.PcfSessionList);
+  // Lists the A10 connections the HRPD PCF holds, each with the A8 key and A9
+  // identifiers it was set up from.
+  rpc ListPcfA10Sessions(google.protobuf.Empty) returns (pcf.v1.ListA10SessionsResponse);
   // Returns detailed status for one PCF packet session.
   rpc GetPcfSession(pcf_management.v1.GetPcfSessionRequest) returns (packet.v1.GetSessionStatusResponse);
 

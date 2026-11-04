@@ -1,5 +1,6 @@
 import { cellScopedRequestFromUrl } from "@/lib/cell";
 import { getNetworkManagementClient } from "@/lib/grpc/client";
+import { apiError } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -14,8 +15,7 @@ export async function GET(request: Request) {
     );
     return Response.json(result);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    return Response.json({ error: msg }, { status: 502 });
+    return apiError(err, "load the BTS config");
   } finally {
     clearTimeout(timeout);
   }

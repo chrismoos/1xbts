@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package pcf.v1;
+
+// An A10 connection the PCF holds for an HRPD access terminal, with the A9
+// identifiers it was set up from.
+message A10Session {
+  // PCF Session ID, the A10 key sent in the A11 Session Specific Extension.
+  uint32 pcf_session_id = 1;
+  // MN Session Reference ID from the same extension.
+  uint32 mn_session_reference_id = 2;
+  // A8 GRE key from the A9 A8 Traffic ID. The AN sets it to the session UATI.
+  uint32 a8_key = 3;
+  // A9 Correlation ID, as a 32-bit value. Absent when the setup had none.
+  optional uint32 correlation_id = 4;
+  // A9 Con Ref of the connection.
+  uint32 con_ref = 5;
+  string imsi = 6;
+  optional uint32 esn = 7;
+  // MEID as 14 hexadecimal digits. Empty when the setup had none.
+  string meid = 8;
+  // PDSN address from the A9 Connect A8, dotted IPv4. Empty when unknown.
+  string pdsn_address = 9;
+  // Address of the AN that sent the A9 setup.
+  string an_address = 10;
+}
+
+message ListA10SessionsRequest {}
+
+message ListA10SessionsResponse {
+  repeated A10Session sessions = 1;
+}
+
+// Management interface of the HRPD PCF node.
+service PcfService {
+  // Lists the A10 connections the PCF currently holds.
+  rpc ListA10Sessions(ListA10SessionsRequest) returns (ListA10SessionsResponse);
+}

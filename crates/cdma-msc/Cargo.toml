@@ -14,6 +14,7 @@ async-trait = "0.1"
 chrono = "0.4"
 cdma-cave = { path = "../cdma-cave" }
 cdma-common = { path = "../cdma-common" }
+cdma-rpc-error = { path = "../cdma-rpc-error" }
 cdma-hlr = { path = "../cdma-hlr" }
 cdma-ios = { path = "../cdma-ios" }
 cdma-otasp = { path = "../cdma-otasp" }

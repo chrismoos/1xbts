@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use cdma_rpc_error::Domain;
 use chrono::{DateTime, Utc};
 use tonic::Code;
 use uuid::Uuid;
@@ -107,8 +108,9 @@ pub trait HlrRepository: Send + Sync {
         _imsi: &str,
         _serving_bs_id: &str,
     ) -> Result<Option<ResolvedSubscriber>, tonic::Status> {
-        Err(tonic::Status::unimplemented(
-            "registered IMSI lookup is unavailable",
+        Err(HLR_REPO.not_supported(
+            "registered_imsi_lookup",
+            "Registered IMSI lookup is not supported by this HLR",
         ))
     }
 
@@ -296,9 +298,7 @@ pub trait HlrRepository: Send + Sync {
         _rand_otapa: u32,
         _imsi_s1: u32,
     ) -> Result<u32, tonic::Status> {
-        Err(tonic::Status::unimplemented(
-            "OTAPA SPASM is not supported by this repository",
-        ))
+        Err(HLR_REPO.not_supported("otapa_spasm", "OTAPA SPASM is not supported by this HLR"))
     }
 
     async fn cave_base_station_challenge(
@@ -2029,10 +2029,8 @@ async fn check_hardware_identity_unique(
         .fetch_optional(pool)
         .await
         .map_err(|e| format!("check_hardware_identity_unique esn: {e}"))?;
-        if row.is_some() {
-            return Err(format!(
-                "{VALIDATION_FAILED_PREFIX}ESN 0x{esn:08X} is already assigned to another subscriber"
-            ));
+        if let Some((owner,)) = row {
+            return Err(identity_in_use("ESN", &format!("0x{esn:08X}"), owner));
         }
     }
     if let Some(meid) = meid {
@@ -2045,16 +2043,45 @@ async fn check_hardware_identity_unique(
         .fetch_optional(pool)
         .await
         .map_err(|e| format!("check_hardware_identity_unique meid: {e}"))?;
-        if row.is_some() {
-            return Err(format!(
-                "{VALIDATION_FAILED_PREFIX}MEID {meid} is already assigned to another subscriber"
-            ));
+        if let Some((owner,)) = row {
+            return Err(identity_in_use("MEID", meid, owner));
         }
     }
     Ok(())
 }
 
+const HLR_REPO: Domain = Domain("hlr");
+
 pub(crate) const VALIDATION_FAILED_PREFIX: &str = "VALIDATION_FAILED: ";
+const IDENTITY_IN_USE_PREFIX: &str = "IDENTITY_IN_USE: ";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IdentityInUse {
+    pub identity: String,
+    pub value: String,
+    pub owner: Uuid,
+}
+
+fn identity_in_use(identity: &str, value: &str, owner: Uuid) -> String {
+    format!("{IDENTITY_IN_USE_PREFIX}{identity} {value} {owner}")
+}
+
+#[cfg(test)]
+pub(crate) fn identity_in_use_for_test(identity: &str, value: &str, owner: Uuid) -> String {
+    identity_in_use(identity, value, owner)
+}
+
+pub(crate) fn parse_identity_in_use(error: &str) -> Option<IdentityInUse> {
+    let mut parts = error.strip_prefix(IDENTITY_IN_USE_PREFIX)?.split(' ');
+    let identity = parts.next()?.to_string();
+    let value = parts.next()?.to_string();
+    let owner = Uuid::parse_str(parts.next()?).ok()?;
+    Some(IdentityInUse {
+        identity,
+        value,
+        owner,
+    })
+}
 
 async fn resolve_identity_row_id(
     pool: &sqlx::PgPool,
@@ -2786,9 +2813,11 @@ impl HlrRepository for PostgresHlrRepository {
         imsi: &str,
         serving_bs_id: &str,
     ) -> Result<Option<ResolvedSubscriber>, tonic::Status> {
-        validate_imsi(imsi).map_err(tonic::Status::invalid_argument)?;
+        validate_imsi(imsi).map_err(|e| HLR_REPO.invalid_field("imsi", e))?;
         if serving_bs_id.trim().is_empty() {
-            return Err(tonic::Status::invalid_argument("serving node is required"));
+            return Err(
+                HLR_REPO.invalid_field("serving_bs_id", "A serving base station is required")
+            );
         }
         const AMBIGUITY_DETECTION_LIMIT: i64 = 2;
         let ids = sqlx::query_scalar::<_, Uuid>(
@@ -2821,19 +2850,22 @@ impl HlrRepository for PostgresHlrRepository {
         .await
         .map_err(|error| {
             log::error!("HLR registered IMSI lookup failed: {error}");
-            tonic::Status::internal("registered IMSI lookup failed")
+            HLR_REPO.database()
         })?;
         if ids.len() > 1 {
-            return Err(tonic::Status::failed_precondition(
-                "multiple subscribers share this registered IMSI",
-            ));
+            return Err(HLR_REPO
+                .precondition(
+                    cdma_rpc_error::ErrorReason::IdentityAmbiguous,
+                    "More than one subscriber is registered with this IMSI",
+                )
+                .status());
         }
         let Some(id) = ids.first() else {
             return Ok(None);
         };
         self.get_subscriber_by_id(*id).await.map_err(|error| {
             log::error!("HLR registered subscriber lookup failed: {error}");
-            tonic::Status::internal("registered subscriber lookup failed")
+            HLR_REPO.database()
         })
     }
 
@@ -2878,10 +2910,8 @@ impl HlrRepository for PostgresHlrRepository {
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| format!("set_identity_imei conflict check: {e}"))?;
-            if conflict.is_some() {
-                return Err(format!(
-                    "{VALIDATION_FAILED_PREFIX}IMEI {imei} is already assigned to another identity"
-                ));
+            if let Some((owner,)) = conflict {
+                return Err(identity_in_use("IMEI", imei, owner));
             }
         }
         let row = sqlx::query_as::<_, IdentityRow>(
@@ -3715,9 +3745,15 @@ impl HlrRepository for PostgresHlrRepository {
         let (_, credentials) = self
             .load_cave_credentials(identity)
             .await
-            .map_err(tonic::Status::internal)?;
-        crate::auth::otapa_signature(&credentials, esn, rand_otapa, imsi_s1)
-            .map_err(|error| tonic::Status::failed_precondition(error.to_string()))
+            .map_err(crate::service::map_repo_error)?;
+        crate::auth::otapa_signature(&credentials, esn, rand_otapa, imsi_s1).map_err(|error| {
+            HLR_REPO
+                .precondition(
+                    cdma_rpc_error::ErrorReason::AKeyMissing,
+                    format!("The OTAPA signature could not be computed: {error}"),
+                )
+                .status()
+        })
     }
 
     async fn cave_base_station_challenge(

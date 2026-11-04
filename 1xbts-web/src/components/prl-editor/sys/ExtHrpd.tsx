@@ -70,7 +70,7 @@ export function ExtHrpdEditor({
       </label>
 
       <label className="block col-span-full border-t border-border/30 pt-2 mt-2">
-        <span className="text-muted text-[11px]">HRPD subnet</span>
+        <span className="text-muted text-[11px]">EV-DO subnet</span>
       </label>
       <NumericInput
         label="SUBNET_LSB_LENGTH (bits)"

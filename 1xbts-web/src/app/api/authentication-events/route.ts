@@ -1,6 +1,6 @@
-import { grpcErrorMessage, grpcErrorStatus } from "@/lib/grpc/client";
 import { getMscManagementClient } from "@/lib/grpc/client";
 import { AuthenticationEvent } from "@/lib/proto/events/v1/msc";
+import { apiError } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -27,10 +27,7 @@ export async function GET(request: Request) {
       events: result.events.map((event) => AuthenticationEvent.toJSON(event)),
     });
   } catch (err) {
-    return Response.json(
-      { error: grpcErrorMessage(err) },
-      { status: grpcErrorStatus(err) }
-    );
+    return apiError(err, "load authentication events");
   } finally {
     clearTimeout(timeout);
   }

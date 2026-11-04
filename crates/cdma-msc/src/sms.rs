@@ -409,15 +409,29 @@ impl MscSmsCoordinator {
         );
     }
 
-    pub(crate) async fn send_sms(&mut self, req: SmsSendRequest) -> Option<Uuid> {
+    pub(crate) async fn send_sms(
+        &mut self,
+        req: SmsSendRequest,
+    ) -> Result<Uuid, crate::management::ManagementError> {
+        use crate::management::ManagementError;
+        use cdma_rpc_error::ErrorReason;
         if !self.destination_admitted(&req.destination).await {
             warn!(
                 "MSC SMS: submission to {} refused by closed access policy",
                 req.destination
             );
-            return None;
+            return Err(ManagementError::rejected(
+                ErrorReason::AccessClosed,
+                "Access is closed and the destination is not a provisioned subscriber",
+            ));
         }
-        let submitter = self.mo_submitter.as_ref()?;
+        let Some(submitter) = self.mo_submitter.as_ref() else {
+            return Err(ManagementError::unavailable(
+                ErrorReason::NotConfigured,
+                "The MSC has no SMSC configured",
+            )
+            .with("feature", "smsc"));
+        };
         let message = cdma_smsc::client::MtSubmission {
             originating_number: req.originating_number.clone(),
             destination: match &req.destination {
@@ -434,13 +448,13 @@ impl MscSmsCoordinator {
             destination_subscriber_id: None,
             serving_node: req.serving_node.as_ref().map(|node| node.0.clone()),
         };
-        match submitter.submit_mt(message).await {
-            Ok(sms_id) => Some(sms_id),
-            Err(e) => {
-                warn!("MSC SMS: the SMSC would not take the message: {e}");
-                None
-            }
-        }
+        submitter.submit_mt(message).await.map_err(|e| {
+            warn!("MSC SMS: the SMSC would not take the message: {e}");
+            ManagementError::rejected(
+                ErrorReason::SmsRejected,
+                format!("The SMSC did not take the message: {e}"),
+            )
+        })
     }
 
     pub(crate) async fn handle_adds_page_ack(&mut self, msg: &AddsPageAckMessage) {

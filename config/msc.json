@@ -3,6 +3,7 @@
   "hlr_endpoint": "http://127.0.0.1:17019",
   "smsc_endpoint": "http://127.0.0.1:17020",
   "packet_endpoint": "http://127.0.0.1:17021",
+  "pcf_endpoint": "http://127.0.0.1:17047",
   "base_stations": [
     { "id": "bts-1", "management_endpoint": "http://127.0.0.1:17016" }
   ],

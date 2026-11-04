@@ -1,4 +1,3 @@
-import { grpcErrorMessage, grpcErrorStatus } from "@/lib/grpc/client";
 import { getHlrClient, waitForHlrReady } from "@/lib/grpc/hlr-client";
 import {
   NumberPlan,
@@ -17,6 +16,7 @@ import {
   validateMeid,
   validatePhoneNumber,
 } from "@/lib/validation";
+import { apiError, badRequest } from "@/lib/api-error";
 
 function withStatusLabel(subscriber: Subscriber) {
   return { ...subscriber, status: subscriberStatusLabel(subscriber.status) };
@@ -58,10 +58,7 @@ export async function GET() {
       total: result.total,
     });
   } catch (err) {
-    return Response.json(
-      { error: grpcErrorMessage(err) },
-      { status: grpcErrorStatus(err) }
-    );
+    return apiError(err, "load subscribers");
   } finally {
     clearTimeout(timeout);
   }
@@ -76,7 +73,7 @@ export async function POST(request: Request) {
     const phoneNumber = asString(body.phoneNumber);
     const phoneCheck = validatePhoneNumber(phoneNumber);
     if (!phoneCheck.ok) {
-      return Response.json({ error: phoneCheck.error }, { status: 400 });
+      return badRequest(phoneCheck.error, "phoneNumber");
     }
 
     const imsi = asString(body.imsi);
@@ -86,26 +83,23 @@ export async function POST(request: Request) {
     if (imsi) {
       const imsiCheck = validateImsi(imsi);
       if (!imsiCheck.ok) {
-        return Response.json({ error: imsiCheck.error }, { status: 400 });
+        return badRequest(imsiCheck.error, "imsi");
       }
     }
     if (meid) {
       const meidCheck = validateMeid(meid);
       if (!meidCheck.ok) {
-        return Response.json({ error: meidCheck.error }, { status: 400 });
+        return badRequest(meidCheck.error, "meid");
       }
     }
     if (imei) {
       const imeiCheck = validateImei(imei);
       if (!imeiCheck.ok) {
-        return Response.json({ error: imeiCheck.error }, { status: 400 });
+        return badRequest(imeiCheck.error, "imei");
       }
     }
     if ((imsi || esn !== undefined || meid) && (!imsi || (esn === undefined && !meid))) {
-      return Response.json(
-        { error: "Subscriber identity requires IMSI plus ESN or MEID" },
-        { status: 400 }
-      );
+      return badRequest("An identity needs an IMSI plus an ESN or MEID", "imsi");
     }
 
     await waitForHlrReady();
@@ -130,10 +124,7 @@ export async function POST(request: Request) {
         : result
     );
   } catch (err) {
-    return Response.json(
-      { error: grpcErrorMessage(err) },
-      { status: grpcErrorStatus(err) }
-    );
+    return apiError(err, "create the subscriber");
   } finally {
     clearTimeout(timeout);
   }
@@ -147,7 +138,7 @@ export async function DELETE(request: Request) {
     const { searchParams } = new URL(request.url);
     const subscriberId = searchParams.get("id");
     if (!subscriberId) {
-      return Response.json({ error: "missing id" }, { status: 400 });
+      return badRequest("A subscriber ID is required", "id");
     }
     await waitForHlrReady();
     const client = getHlrClient();
@@ -157,10 +148,7 @@ export async function DELETE(request: Request) {
     );
     return Response.json({ ok: true });
   } catch (err) {
-    return Response.json(
-      { error: grpcErrorMessage(err) },
-      { status: grpcErrorStatus(err) }
-    );
+    return apiError(err, "delete the subscriber");
   } finally {
     clearTimeout(timeout);
   }

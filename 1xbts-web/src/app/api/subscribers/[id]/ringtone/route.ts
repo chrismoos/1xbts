@@ -1,5 +1,6 @@
 import { getHlrClient, waitForHlrReady } from "@/lib/grpc/hlr-client";
 import { RINGTONE_MAX_UPLOAD_BYTES } from "@/lib/validation";
+import { apiError, badRequest } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -18,14 +19,6 @@ function looksLikeWav(bytes: Uint8Array): boolean {
   );
 }
 
-function statusFromError(msg: string): number {
-  const lower = msg.toLowerCase();
-  if (lower.includes("not found")) return 404;
-  if (lower.includes("invalid_argument") || lower.includes("invalid argument"))
-    return 400;
-  return 502;
-}
-
 export async function POST(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
@@ -38,24 +31,16 @@ export async function POST(
     const form = await request.formData();
     const file = form.get("file");
     if (!(file instanceof File))
-      return Response.json({ error: "missing 'file' field" }, { status: 400 });
+      return badRequest("Choose a WAV file to upload", "file");
 
     if (file.size === 0)
-      return Response.json({ error: "file is empty" }, { status: 400 });
+      return badRequest("The file is empty", "file");
     if (file.size > RINGTONE_MAX_UPLOAD_BYTES)
-      return Response.json(
-        {
-          error: `file exceeds ${RINGTONE_MAX_UPLOAD_BYTES / (1024 * 1024)} MB limit`,
-        },
-        { status: 413 }
-      );
+      return badRequest(`The file is larger than ${RINGTONE_MAX_UPLOAD_BYTES / (1024 * 1024)} MB`, "file", 413);
 
     const buf = new Uint8Array(await file.arrayBuffer());
     if (!looksLikeWav(buf))
-      return Response.json(
-        { error: "file is not a RIFF/WAVE WAV" },
-        { status: 400 }
-      );
+      return badRequest("The file is not a WAV file", "file");
 
     await waitForHlrReady();
     const client = getHlrClient();
@@ -69,8 +54,7 @@ export async function POST(
     );
     return Response.json(result);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    return Response.json({ error: msg }, { status: statusFromError(msg) });
+    return apiError(err, "upload the ringtone");
   } finally {
     clearTimeout(timeout);
   }
@@ -93,8 +77,7 @@ export async function DELETE(
     );
     return new Response(null, { status: 204 });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    return Response.json({ error: msg }, { status: statusFromError(msg) });
+    return apiError(err, "remove the ringtone");
   } finally {
     clearTimeout(timeout);
   }

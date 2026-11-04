@@ -5,6 +5,8 @@ import { useRouter, useParams } from "next/navigation";
 import { Card } from "@/components/card";
 import { PrlEditor } from "@/components/prl-editor/PrlEditor";
 import { PrlDecoded } from "@/lib/proto/hlr/v1/service";
+import { apiFetch } from "@/lib/api-client";
+import { ErrorNotice } from "@/components/error-notice";
 
 interface PrlSummary {
   prlId: string;
@@ -26,22 +28,22 @@ export default function PrlDetailPage() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
   const [prl, setPrl] = useState<PrlFull | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const [actionError, setActionError] = useState<unknown>(null);
   const [name, setName] = useState("");
   const [notes, setNotes] = useState("");
   const [busy, setBusy] = useState(false);
-  const [saveError, setSaveError] = useState<string | undefined>(undefined);
+  const [saveError, setSaveError] = useState<unknown>(null);
 
   const load = useCallback(async () => {
-    const res = await fetch(`/api/prls/${params.id}`);
-    const data = await res.json();
-    if (data.error) {
-      setError(data.error);
-    } else {
-      setPrl(data.prl);
+    try {
+      const data = await apiFetch<{ prl?: PrlFull }>(`/api/prls/${params.id}`, undefined, "load the PRL");
+      setPrl(data.prl ?? null);
       setName(data.prl?.summary?.name ?? "");
       setNotes(data.prl?.summary?.notes ?? "");
-      setError(null);
+      setLoadError(null);
+    } catch (err) {
+      setLoadError(err);
     }
   }, [params.id]);
 
@@ -51,16 +53,20 @@ export default function PrlDetailPage() {
 
   const saveBody = async (built: PrlDecoded) => {
     setBusy(true);
-    setSaveError(undefined);
+    setSaveError(null);
     try {
-      const res = await fetch(`/api/prls/${params.id}`, {
-        method: "PATCH",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ built, name: name.trim(), notes }),
-      });
-      const data = await res.json();
-      if (data.error) setSaveError(data.error);
-      else await load();
+      await apiFetch(
+        `/api/prls/${params.id}`,
+        {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ built, name: name.trim(), notes }),
+        },
+        "save the PRL",
+      );
+      await load();
+    } catch (err) {
+      setSaveError(err);
     } finally {
       setBusy(false);
     }
@@ -68,22 +74,19 @@ export default function PrlDetailPage() {
 
   const setDefault = async () => {
     setBusy(true);
+    setActionError(null);
     try {
-      const res = await fetch(`/api/prls/${params.id}/set-default`, {
-        method: "POST",
-      });
-      const data = await res.json();
-      if (data.error) setError(data.error);
-      else {
-        setPrl((current) =>
-          current?.summary
-            ? {
-                ...current,
-                summary: { ...current.summary, isDefault: true },
-              }
-            : current,
-        );
-      }
+      await apiFetch(`/api/prls/${params.id}/set-default`, { method: "POST" }, "make this the default PRL");
+      setPrl((current) =>
+        current?.summary
+          ? {
+              ...current,
+              summary: { ...current.summary, isDefault: true },
+            }
+          : current,
+      );
+    } catch (err) {
+      setActionError(err);
     } finally {
       setBusy(false);
     }
@@ -92,22 +95,18 @@ export default function PrlDetailPage() {
   const remove = async () => {
     if (!window.confirm(`Delete PRL "${prl?.summary?.name}"?`)) return;
     setBusy(true);
+    setActionError(null);
     try {
-      const res = await fetch(`/api/prls/${params.id}`, { method: "DELETE" });
-      const data = await res.json();
-      if (data.error) setError(data.error);
-      else router.push("/prls");
+      await apiFetch(`/api/prls/${params.id}`, { method: "DELETE" }, "delete the PRL");
+      router.push("/prls");
+    } catch (err) {
+      setActionError(err);
     } finally {
       setBusy(false);
     }
   };
 
-  if (error)
-    return (
-      <Card title="Error" className="border-accent-red/40">
-        <p className="text-accent-red text-sm">{error}</p>
-      </Card>
-    );
+  if (loadError) return <ErrorNotice error={loadError} boxed onRetry={load} />;
   if (!prl) return <p className="text-dimmed text-xs">Loading…</p>;
 
   const s = prl.summary;
@@ -126,7 +125,7 @@ export default function PrlDetailPage() {
       decoded={prl.decoded}
       onSave={saveBody}
       saving={busy}
-      error={saveError}
+      error={saveError ?? actionError}
       metadata={{
         savedName: s.name,
         name,

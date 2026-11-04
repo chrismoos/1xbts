@@ -1,5 +1,6 @@
-import { grpcErrorMessage, grpcErrorStatus, getMscManagementClient } from "@/lib/grpc/client";
+import { getMscManagementClient } from "@/lib/grpc/client";
 import { AdmissionEvent } from "@/lib/proto/events/v1/msc";
+import { apiError } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -33,7 +34,7 @@ export async function GET(request: Request) {
       authenticationMode: result.authenticationMode,
     });
   } catch (err) {
-    return Response.json({ error: grpcErrorMessage(err) }, { status: grpcErrorStatus(err) });
+    return apiError(err, "load admission events");
   } finally {
     clearTimeout(timeout);
   }

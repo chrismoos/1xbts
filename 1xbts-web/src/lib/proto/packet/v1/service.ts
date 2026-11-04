@@ -264,6 +264,15 @@ export interface PacketSessionInfo {
   mnIdSource: MnIdSource;
   /** Authoritative subscriber IMSI when resolved. */
   subscriberImsi: string;
+  /**
+   * PCF Session ID, the A10 key from the A11 Session Specific Extension.
+   * Present only for a session registered over A11.
+   */
+  pcfSessionId?:
+    | number
+    | undefined;
+  /** MN Session Reference ID from the same extension. */
+  mnSessionReferenceId?: number | undefined;
 }
 
 /** One trace event emitted by PPP, RLP, IP transport, or capture code. */
@@ -1548,6 +1557,8 @@ function createBasePacketSessionInfo(): PacketSessionInfo {
     mnId: "",
     mnIdSource: 0,
     subscriberImsi: "",
+    pcfSessionId: undefined,
+    mnSessionReferenceId: undefined,
   };
 }
 
@@ -1648,6 +1659,12 @@ export const PacketSessionInfo: MessageFns<PacketSessionInfo> = {
     }
     if (message.subscriberImsi !== "") {
       writer.uint32(282).string(message.subscriberImsi);
+    }
+    if (message.pcfSessionId !== undefined) {
+      writer.uint32(288).uint32(message.pcfSessionId);
+    }
+    if (message.mnSessionReferenceId !== undefined) {
+      writer.uint32(296).uint32(message.mnSessionReferenceId);
     }
     return writer;
   },
@@ -1915,6 +1932,22 @@ export const PacketSessionInfo: MessageFns<PacketSessionInfo> = {
           message.subscriberImsi = reader.string();
           continue;
         }
+        case 36: {
+          if (tag !== 288) {
+            break;
+          }
+
+          message.pcfSessionId = reader.uint32();
+          continue;
+        }
+        case 37: {
+          if (tag !== 296) {
+            break;
+          }
+
+          message.mnSessionReferenceId = reader.uint32();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -2070,6 +2103,16 @@ export const PacketSessionInfo: MessageFns<PacketSessionInfo> = {
         : isSet(object.subscriber_imsi)
         ? globalThis.String(object.subscriber_imsi)
         : "",
+      pcfSessionId: isSet(object.pcfSessionId)
+        ? globalThis.Number(object.pcfSessionId)
+        : isSet(object.pcf_session_id)
+        ? globalThis.Number(object.pcf_session_id)
+        : undefined,
+      mnSessionReferenceId: isSet(object.mnSessionReferenceId)
+        ? globalThis.Number(object.mnSessionReferenceId)
+        : isSet(object.mn_session_reference_id)
+        ? globalThis.Number(object.mn_session_reference_id)
+        : undefined,
     };
   },
 
@@ -2171,6 +2214,12 @@ export const PacketSessionInfo: MessageFns<PacketSessionInfo> = {
     if (message.subscriberImsi !== "") {
       obj.subscriberImsi = message.subscriberImsi;
     }
+    if (message.pcfSessionId !== undefined) {
+      obj.pcfSessionId = Math.round(message.pcfSessionId);
+    }
+    if (message.mnSessionReferenceId !== undefined) {
+      obj.mnSessionReferenceId = Math.round(message.mnSessionReferenceId);
+    }
     return obj;
   },
 
@@ -2211,6 +2260,8 @@ export const PacketSessionInfo: MessageFns<PacketSessionInfo> = {
     message.mnId = object.mnId ?? "";
     message.mnIdSource = object.mnIdSource ?? 0;
     message.subscriberImsi = object.subscriberImsi ?? "";
+    message.pcfSessionId = object.pcfSessionId ?? undefined;
+    message.mnSessionReferenceId = object.mnSessionReferenceId ?? undefined;
     return message;
   },
 };

@@ -1,6 +1,7 @@
 {
   "packet_grpc_endpoint": "http://127.0.0.1:17021",
   "a9_bind_addr": "127.0.0.1:17046",
+  "management_bind_addr": "127.0.0.1:17047",
   "a8_bearer": {
     "mode": "udp_encapsulated_gre",
     "udp_bind_addr": "127.0.0.1:17041",

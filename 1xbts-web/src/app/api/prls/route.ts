@@ -1,4 +1,5 @@
 import { getHlrClient, waitForHlrReady } from "@/lib/grpc/hlr-client";
+import { apiError, badRequest } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -27,8 +28,7 @@ export async function GET(request: Request) {
       total: result.total,
     });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    return Response.json({ error: msg }, { status: 502 });
+    return apiError(err, "load PRLs");
   } finally {
     clearTimeout(timeout);
   }
@@ -48,19 +48,13 @@ export async function POST(request: Request) {
       typeof body.rawBytesBase64 === "string" ? body.rawBytesBase64 : "";
     const built = body.built ?? null;
     if (!name) {
-      return Response.json({ error: "name is required" }, { status: 400 });
+      return badRequest("A PRL name is required", "name");
     }
     if (!rawBase64 && !built) {
-      return Response.json(
-        { error: "either rawBytesBase64 or built is required" },
-        { status: 400 }
-      );
+      return badRequest("A PRL file or a built PRL is required");
     }
     if (rawBase64 && built) {
-      return Response.json(
-        { error: "send rawBytesBase64 OR built, not both" },
-        { status: 400 }
-      );
+      return badRequest("Send a PRL file or a built PRL, not both");
     }
     await waitForHlrReady();
     const client = getHlrClient();
@@ -72,9 +66,7 @@ export async function POST(request: Request) {
     );
     return Response.json({ prl: result.prl });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    const status = /INVALID_ARGUMENT|PRL validation/.test(msg) ? 400 : 502;
-    return Response.json({ error: msg }, { status });
+    return apiError(err, "create the PRL");
   } finally {
     clearTimeout(timeout);
   }

@@ -24,10 +24,13 @@ use cdma_common::lac::paging_messages::{
 use cdma_common::mac::ChannelType;
 use cdma_common::overhead::OverheadParameters;
 use cdma_common::timezone::TimezoneConfig;
+use cdma_rpc_error::{Domain, ErrorReason};
 use log::{info, warn};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
+
+const BTS: Domain = Domain("bts");
 
 use crate::bts::evdo::{EvdoTxMode, ResolvedEvdoConfig, resolve_evdo_config};
 use crate::bts::{
@@ -195,10 +198,16 @@ impl BtsManagementState {
         match cell {
             None => Ok(()),
             Some(cell) if cell.cell == self.cell && cell.sector == self.sector => Ok(()),
-            Some(cell) => Err(Status::not_found(format!(
-                "cell {}/{} is not served by this BTS (serves {}/{})",
-                cell.cell, cell.sector, self.cell, self.sector
-            ))),
+            Some(cell) => Err(BTS
+                .not_found(
+                    ErrorReason::CellNotFound,
+                    format!(
+                        "Cell {}/{} is not served by this BTS, which serves {}/{}",
+                        cell.cell, cell.sector, self.cell, self.sector
+                    ),
+                )
+                .with("cell", format!("{}/{}", cell.cell, cell.sector))
+                .status()),
         }
     }
 
@@ -262,14 +271,17 @@ impl BtsManagementState {
             },
             CaptureCommand::Stop => BtsCommand::StopCapture { respond_to },
         };
-        self.commands
-            .send(command)
-            .await
-            .map_err(|e| Status::unavailable(format!("BTS command queue unavailable: {e}")))?;
-        let result = rx
-            .await
-            .map_err(|_| Status::unavailable("BTS RX thread dropped capture response"))?
-            .map_err(Status::failed_precondition)?;
+        self.commands.send(command).await.map_err(|e| {
+            warn!("BTS management: command queue unavailable: {e}");
+            BTS.stopping()
+        })?;
+        let result = rx.await.map_err(|_| BTS.stopping())?.map_err(|error| {
+            BTS.precondition(
+                ErrorReason::IqCaptureFailed,
+                format!("The IQ capture could not be changed: {error}"),
+            )
+            .status()
+        })?;
         Ok(to_proto_iq_capture_status(&result.status))
     }
 }
@@ -571,12 +583,12 @@ impl BtsManagementService for BtsManagementServiceImpl {
         let req = request.into_inner();
         self.state.check_cell(req.cell)?;
         let walsh_code = u8::try_from(req.walsh_code)
-            .map_err(|_| Status::invalid_argument("walsh_code must fit in u8"))?;
+            .map_err(|_| BTS.invalid_field("walsh_code", "The Walsh code must be 255 or less"))?;
         let snapshot = self
             .state
             .power_control
             .snapshot(walsh_code)
-            .ok_or_else(|| Status::not_found("active BTS power-control state not found"))?;
+            .ok_or_else(|| power_control_not_found(walsh_code))?;
         Ok(Response::new(to_proto_bts_reverse_power(
             &snapshot,
             self.state.rx_reference_dbm,
@@ -615,7 +627,7 @@ impl BtsManagementService for BtsManagementServiceImpl {
         };
         let map = store
             .lock()
-            .map_err(|_| Status::internal("access measurement store poisoned"))?;
+            .map_err(|_| BTS.internal("The access measurement store is unavailable"))?;
         let entries = map
             .iter()
             .map(|(key, meas)| AccessMeasurement {
@@ -647,7 +659,7 @@ impl BtsManagementService for BtsManagementServiceImpl {
         let req = request.into_inner();
         self.state.check_cell(req.cell)?;
         let walsh_code = u8::try_from(req.walsh_code)
-            .map_err(|_| Status::invalid_argument("walsh_code must fit in u8"))?;
+            .map_err(|_| BTS.invalid_field("walsh_code", "The Walsh code must be 255 or less"))?;
         let power_control = &self.state.power_control;
         match req.action {
             Some(proto::set_traffic_channel_power_override_request::Action::SetTargetEbNtDb(
@@ -657,19 +669,17 @@ impl BtsManagementService for BtsManagementServiceImpl {
                 let target_db = power_control
                     .snapshot(walsh_code)
                     .map(|snapshot| snapshot.target_eb_nt_db)
-                    .ok_or_else(|| Status::not_found("active BTS power-control state not found"))?;
+                    .ok_or_else(|| power_control_not_found(walsh_code))?;
                 power_control.set_target(walsh_code, target_db, false);
             }
             None => {
-                return Err(Status::invalid_argument(
-                    "one of set_target_eb_nt_db or clear is required",
-                ));
+                return Err(BTS.invalid("Set a target Eb/Nt or clear the override"));
             }
         }
 
         let snapshot = power_control
             .snapshot(walsh_code)
-            .ok_or_else(|| Status::not_found("active BTS power-control state not found"))?;
+            .ok_or_else(|| power_control_not_found(walsh_code))?;
         let message = match snapshot.manual_target_override_db {
             Some(manual_db) => {
                 format!("manual reverse target pinned at {manual_db:.2} dB on walsh {walsh_code}")
@@ -705,8 +715,8 @@ impl BtsManagementService for BtsManagementServiceImpl {
                 match rx.recv().await {
                     Ok(evt) => match pch_transmit_event_to_proto(&evt, cell) {
                         Ok(event) => yield Ok(event),
-                        Err(e) => yield Err(Status::internal(format!(
-                            "PCH transmit reconstruction failed: {e}"
+                        Err(e) => yield Err(BTS.internal(format!(
+                            "A paging channel transmission could not be decoded: {e}"
                         ))),
                     },
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -1441,6 +1451,15 @@ fn to_proto_paging_event(
         body,
         cell: Some(cell),
     }
+}
+
+fn power_control_not_found(walsh_code: u8) -> Status {
+    BTS.not_found(
+        ErrorReason::PowerControlNotFound,
+        format!("No active traffic channel uses Walsh code {walsh_code}"),
+    )
+    .with("walsh_code", walsh_code)
+    .status()
 }
 
 #[cfg(test)]

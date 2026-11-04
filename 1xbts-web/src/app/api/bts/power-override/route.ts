@@ -1,5 +1,6 @@
 import { cellRequestFromUrl, selectorFromUrl } from "@/lib/cell";
 import { getNetworkManagementClient, waitForManagementReady } from "@/lib/grpc/client";
+import { apiError } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -48,8 +49,7 @@ export async function POST(request: Request) {
 
     return Response.json(result, { status: result.accepted ? 200 : 400 });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    return Response.json({ accepted: false, message: msg }, { status: 502 });
+    return apiError(err, "change the reverse power target", { accepted: false });
   } finally {
     clearTimeout(timeout);
   }

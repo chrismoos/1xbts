@@ -3,6 +3,8 @@
 import { use, useEffect, useState } from "react";
 import Link from "next/link";
 import { OtaspSessionDetail } from "@/components/otasp-session-detail";
+import { apiFetch } from "@/lib/api-client";
+import { ErrorNotice } from "@/components/error-notice";
 
 const SESSION_REFRESH_MS = 2000;
 
@@ -14,7 +16,7 @@ export default function OtaspSessionDetailPage({
   const { sessionId } = use(params);
   const [session, setSession] = useState<unknown | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
 
   useEffect(() => {
     let alive = true;
@@ -23,20 +25,18 @@ export default function OtaspSessionDetailPage({
       if (loadingSession || !alive) return;
       loadingSession = true;
       try {
-        const res = await fetch(`/api/otasp-events/${encodeURIComponent(sessionId)}`);
-        if (!res.ok) {
-          const body = await res.json().catch(() => ({}));
-          throw new Error(body.error || `HTTP ${res.status}`);
-        }
-        const data = await res.json();
+        const data = await apiFetch<{ session?: { summary?: { endedAt?: unknown } } }>(
+          `/api/otasp-events/${encodeURIComponent(sessionId)}`,
+          undefined,
+          "load the OTASP session",
+        );
         if (!alive) return;
-        if (data.error) throw new Error(data.error);
         setSession(data.session);
         if (data.session?.summary?.endedAt && interval) clearInterval(interval);
         setError(null);
       } catch (err) {
         if (!alive) return;
-        setError(err instanceof Error ? err.message : "unknown");
+        setError(err);
       } finally {
         loadingSession = false;
         if (alive) setLoading(false);
@@ -51,7 +51,7 @@ export default function OtaspSessionDetailPage({
   }, [sessionId]);
 
   return (
-    <div className="max-w-5xl mx-auto space-y-4">
+    <div className="page-container space-y-4">
       <Link href="/mobiles" className="text-sm text-muted hover:text-secondary">
         &larr; Mobiles
       </Link>
@@ -59,9 +59,7 @@ export default function OtaspSessionDetailPage({
       {loading ? (
         <p className="text-dimmed text-sm">Loading...</p>
       ) : error ? (
-        <div className="rounded-lg border border-accent-red/20 bg-accent-red-bg p-4 text-accent-red text-sm">
-          {error}
-        </div>
+        <ErrorNotice error={error} boxed />
       ) : session ? (
         <OtaspSessionDetail session={session as Parameters<typeof OtaspSessionDetail>[0]["session"]} />
       ) : (

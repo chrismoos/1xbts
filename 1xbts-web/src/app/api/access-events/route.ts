@@ -1,6 +1,7 @@
 import { bsRequestFromUrl } from "@/lib/cell";
 import { getNetworkManagementClient, waitForManagementReady } from "@/lib/grpc/client";
 import { shouldHideAccessEvent } from "@/lib/access-event-filter";
+import { describeError } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -44,7 +45,7 @@ export async function GET(request: Request) {
           send(
             `event: status\ndata: ${JSON.stringify({
               state: "connecting",
-              error: msg,
+              error: describeError(err, "stream access channel events").body.error,
             })}\n\n`
           );
         } else {

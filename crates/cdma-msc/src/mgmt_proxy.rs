@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 
+use cdma_rpc_error::ErrorReason;
 use log::{info, warn};
 use tokio_stream::{Stream, StreamExt, StreamMap};
 use tonic::transport::Channel;
@@ -27,8 +28,11 @@ use crate::grpc::mgmt::v1 as mgmt;
 use crate::grpc::mgmt::v1::network_management_service_server::NetworkManagementService;
 use crate::grpc::packet::v1 as packet;
 use crate::grpc::packet::v1::packet_service_client::PacketServiceClient;
+use crate::grpc::pcf::v1 as pcf;
+use crate::grpc::pcf::v1::pcf_service_client::PcfServiceClient;
 use crate::grpc::pcf_management::v1 as pcf_mgmt;
 use crate::grpc::pdsn_management::v1 as pdsn_mgmt;
+use crate::management::MSC;
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
@@ -41,13 +45,18 @@ pub struct NetworkManagement {
     order: Vec<String>,
     /// Lazily-connected channel to the packet core (PDSN) gRPC.
     packet: Channel,
+    pcf: Channel,
     control: Option<tokio::sync::mpsc::Sender<crate::management::PendingControlRequest>>,
 }
 
 impl NetworkManagement {
     /// Builds the interface. Channels connect lazily, so a base station that
     /// is down refuses per call rather than blocking here.
-    pub fn new(base_stations_config: &[BaseStationConfig], packet_endpoint: &str) -> Self {
+    pub fn new(
+        base_stations_config: &[BaseStationConfig],
+        packet_endpoint: &str,
+        pcf_endpoint: &str,
+    ) -> Self {
         let mut base_stations = HashMap::new();
         let mut order = Vec::new();
         for node in base_stations_config {
@@ -72,10 +81,14 @@ impl NetworkManagement {
         let packet = Channel::from_shared(packet_endpoint.to_string())
             .unwrap_or_else(|e| panic!("msc.packet_endpoint is invalid: {e}"))
             .connect_lazy();
+        let pcf = Channel::from_shared(pcf_endpoint.to_string())
+            .unwrap_or_else(|e| panic!("msc.pcf_endpoint is invalid: {e}"))
+            .connect_lazy();
         Self {
             base_stations,
             order,
             packet,
+            pcf,
             control: None,
         }
     }
@@ -99,14 +112,41 @@ impl NetworkManagement {
             if self.order.len() == 1 {
                 return Ok(self.base_stations[&self.order[0]].clone());
             }
-            return Err(Status::invalid_argument(
-                "base_station selector is required when more than one is configured",
-            ));
+            return Err(MSC
+                .error(
+                    tonic::Code::InvalidArgument,
+                    ErrorReason::BaseStationRequired,
+                    "More than one base station is configured, so choose one",
+                )
+                .status());
         }
-        self.base_stations
-            .get(id)
-            .cloned()
-            .ok_or_else(|| Status::not_found(format!("unknown base station {id}")))
+        self.base_stations.get(id).cloned().ok_or_else(|| {
+            MSC.not_found(
+                ErrorReason::BaseStationNotFound,
+                format!("Base station {id} is not configured"),
+            )
+            .with("base_station", id)
+            .status()
+        })
+    }
+
+    fn base_station_error(&self, status: Status, selector: &Option<mgmt::BsSelector>) -> Status {
+        if cdma_rpc_error::error_info(&status).is_some() || !is_unreachable(&status) {
+            return status;
+        }
+        let id = selector
+            .as_ref()
+            .map(|s| s.base_station.clone())
+            .filter(|id| !id.is_empty())
+            .or_else(|| (self.order.len() == 1).then(|| self.order[0].clone()))
+            .unwrap_or_default();
+        warn!("MSC management: base station {id} unreachable: {status}");
+        MSC.unavailable(
+            ErrorReason::BaseStationUnreachable,
+            format!("Base station {id} could not be reached"),
+        )
+        .with("base_station", id)
+        .status()
     }
 
     fn bts(
@@ -148,7 +188,10 @@ impl NetworkManagementService for NetworkManagement {
         request: Request<mgmt::BsRequest>,
     ) -> Result<Response<bts_mgmt::BtsList>, Status> {
         let selector = request.into_inner().selector;
-        self.bts(&selector)?.list_bts(()).await
+        self.bts(&selector)?
+            .list_bts(())
+            .await
+            .map_err(|status| self.base_station_error(status, &selector))
     }
 
     async fn get_bts_config(
@@ -159,6 +202,7 @@ impl NetworkManagementService for NetworkManagement {
         self.bts(&req.selector)?
             .get_bts_config(cell_request(req.request))
             .await
+            .map_err(|status| self.base_station_error(status, &req.selector))
     }
 
     async fn get_radio_metrics(
@@ -169,6 +213,7 @@ impl NetworkManagementService for NetworkManagement {
         self.bts(&req.selector)?
             .get_radio_metrics(cell_request(req.request))
             .await
+            .map_err(|status| self.base_station_error(status, &req.selector))
     }
 
     async fn stream_radio_metrics(
@@ -179,7 +224,8 @@ impl NetworkManagementService for NetworkManagement {
         let upstream = self
             .bts(&req.selector)?
             .stream_radio_metrics(cell_request(req.request))
-            .await?
+            .await
+            .map_err(|status| self.base_station_error(status, &req.selector))?
             .into_inner();
         Ok(Response::new(Box::pin(upstream)))
     }
@@ -192,6 +238,7 @@ impl NetworkManagementService for NetworkManagement {
         self.bts(&req.selector)?
             .get_iq_capture_status(cell_request(req.request))
             .await
+            .map_err(|status| self.base_station_error(status, &req.selector))
     }
 
     async fn start_iq_capture(
@@ -202,6 +249,7 @@ impl NetworkManagementService for NetworkManagement {
         self.bts(&req.selector)?
             .start_iq_capture(cell_request(req.request))
             .await
+            .map_err(|status| self.base_station_error(status, &req.selector))
     }
 
     async fn stop_iq_capture(
@@ -212,6 +260,7 @@ impl NetworkManagementService for NetworkManagement {
         self.bts(&req.selector)?
             .stop_iq_capture(cell_request(req.request))
             .await
+            .map_err(|status| self.base_station_error(status, &req.selector))
     }
 
     async fn list_local_radio_resources(
@@ -222,6 +271,7 @@ impl NetworkManagementService for NetworkManagement {
         self.bts(&req.selector)?
             .list_local_radio_resources(cell_request(req.request))
             .await
+            .map_err(|status| self.base_station_error(status, &req.selector))
     }
 
     async fn get_reverse_power_control(
@@ -233,6 +283,7 @@ impl NetworkManagementService for NetworkManagement {
         self.bts(&req.selector)?
             .get_reverse_power_control(inner)
             .await
+            .map_err(|status| self.base_station_error(status, &req.selector))
     }
 
     async fn list_reverse_power_controls(
@@ -243,6 +294,7 @@ impl NetworkManagementService for NetworkManagement {
         self.bts(&req.selector)?
             .list_reverse_power_controls(cell_request(req.request))
             .await
+            .map_err(|status| self.base_station_error(status, &req.selector))
     }
 
     async fn set_reverse_power_control_override(
@@ -254,6 +306,7 @@ impl NetworkManagementService for NetworkManagement {
         self.bts(&req.selector)?
             .set_reverse_power_control_override(inner)
             .await
+            .map_err(|status| self.base_station_error(status, &req.selector))
     }
 
     async fn stream_pch_transmissions(
@@ -264,7 +317,8 @@ impl NetworkManagementService for NetworkManagement {
         let upstream = self
             .bts(&req.selector)?
             .stream_pch_transmissions(cell_request(req.request))
-            .await?
+            .await
+            .map_err(|status| self.base_station_error(status, &req.selector))?
             .into_inner();
         Ok(Response::new(Box::pin(upstream)))
     }
@@ -276,7 +330,10 @@ impl NetworkManagementService for NetworkManagement {
         request: Request<mgmt::BsRequest>,
     ) -> Result<Response<bsc::MobileList>, Status> {
         let selector = request.into_inner().selector;
-        self.bsc_mgmt(&selector)?.list_mobiles(()).await
+        self.bsc_mgmt(&selector)?
+            .list_mobiles(())
+            .await
+            .map_err(|status| self.base_station_error(status, &selector))
     }
 
     async fn list_channels(
@@ -284,7 +341,10 @@ impl NetworkManagementService for NetworkManagement {
         request: Request<mgmt::BsRequest>,
     ) -> Result<Response<bsc::ChannelList>, Status> {
         let selector = request.into_inner().selector;
-        self.bsc_mgmt(&selector)?.list_channels(()).await
+        self.bsc_mgmt(&selector)?
+            .list_channels(())
+            .await
+            .map_err(|status| self.base_station_error(status, &selector))
     }
 
     async fn stream_access_events(
@@ -295,7 +355,8 @@ impl NetworkManagementService for NetworkManagement {
         let upstream = self
             .bsc_mgmt(&selector)?
             .stream_access_events(())
-            .await?
+            .await
+            .map_err(|status| self.base_station_error(status, &selector))?
             .into_inner();
         Ok(Response::new(Box::pin(upstream)))
     }
@@ -308,7 +369,8 @@ impl NetworkManagementService for NetworkManagement {
         let upstream = self
             .bsc_mgmt(&selector)?
             .stream_paging_events(())
-            .await?
+            .await
+            .map_err(|status| self.base_station_error(status, &selector))?
             .into_inner();
         Ok(Response::new(Box::pin(upstream)))
     }
@@ -321,7 +383,8 @@ impl NetworkManagementService for NetworkManagement {
         let upstream = self
             .bsc_mgmt(&selector)?
             .stream_traffic_events(())
-            .await?
+            .await
+            .map_err(|status| self.base_station_error(status, &selector))?
             .into_inner();
         Ok(Response::new(Box::pin(upstream)))
     }
@@ -335,6 +398,7 @@ impl NetworkManagementService for NetworkManagement {
         self.bsc_mgmt(&req.selector)?
             .set_traffic_channel_power_override(inner)
             .await
+            .map_err(|status| self.base_station_error(status, &req.selector))
     }
 
     // Per-selector: data-call setup
@@ -347,19 +411,17 @@ impl NetworkManagementService for NetworkManagement {
         self.channel(&req.selector)?;
         let inner = req
             .request
-            .ok_or_else(|| Status::invalid_argument("data call request is required"))?;
+            .ok_or_else(|| MSC.invalid_field("request", "A data call request is required"))?;
         let subscriber_id = uuid::Uuid::parse_str(&inner.subscriber_id)
-            .map_err(|_| Status::invalid_argument("subscriber_id must be a UUID"))?;
+            .map_err(|_| MSC.invalid_field("subscriber_id", "The subscriber ID is not valid"))?;
         let service_option = if inner.service_option == 0 {
             cdma_common::consts::SERVICE_OPTION_PACKET_DATA_RC3
         } else {
-            u16::try_from(inner.service_option)
-                .map_err(|_| Status::invalid_argument("invalid data service option"))?
+            u16::try_from(inner.service_option).map_err(|_| {
+                MSC.invalid_field("service_option", "The service option must be 65535 or less")
+            })?
         };
-        let control = self
-            .control
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("MSC control is unavailable"))?;
+        let control = self.control.as_ref().ok_or_else(|| MSC.stopping())?;
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         control
             .send(crate::management::PendingControlRequest::InitiateDataCall {
@@ -368,11 +430,11 @@ impl NetworkManagementService for NetworkManagement {
                 response_tx,
             })
             .await
-            .map_err(|_| Status::unavailable("MSC runtime stopped"))?;
+            .map_err(|_| MSC.stopping())?;
         let result = response_rx
             .await
-            .map_err(|_| Status::unavailable("MSC runtime stopped"))?
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            .map_err(|_| MSC.stopping())?
+            .map_err(crate::management::ManagementError::into_status)?;
         Ok(Response::new(bsc::InitiateDataCallResponse {
             accepted: true,
             message: format!("call_id={}", result.call_id.0),
@@ -391,6 +453,7 @@ impl NetworkManagementService for NetworkManagement {
             .await?
             .get_sessions(req.request.unwrap_or_default())
             .await
+            .map_err(|status| downstream_error(status, Downstream::AccessNetwork))
     }
 
     async fn get_an_session(
@@ -403,6 +466,7 @@ impl NetworkManagementService for NetworkManagement {
             .await?
             .get_session(req.request.unwrap_or_default())
             .await
+            .map_err(|status| downstream_error(status, Downstream::AccessNetwork))
     }
 
     async fn get_an_uati_allocation(
@@ -415,6 +479,7 @@ impl NetworkManagementService for NetworkManagement {
             .await?
             .get_uati_allocation(req.request.unwrap_or_default())
             .await
+            .map_err(|status| downstream_error(status, Downstream::AccessNetwork))
     }
 
     async fn get_an_session_events(
@@ -427,6 +492,7 @@ impl NetworkManagementService for NetworkManagement {
             .await?
             .get_session_events(req.request.unwrap_or_default())
             .await
+            .map_err(|status| downstream_error(status, Downstream::AccessNetwork))
     }
 
     // Global interface: PCF
@@ -438,10 +504,21 @@ impl NetworkManagementService for NetworkManagement {
         let sessions = self
             .packet_client()
             .list_sessions(packet::ListSessionsRequest {})
-            .await?
+            .await
+            .map_err(|status| downstream_error(status, Downstream::Packet))?
             .into_inner()
             .sessions;
         Ok(Response::new(pcf_mgmt::PcfSessionList { sessions }))
+    }
+
+    async fn list_pcf_a10_sessions(
+        &self,
+        _: Request<()>,
+    ) -> Result<Response<pcf::ListA10SessionsResponse>, Status> {
+        PcfServiceClient::new(self.pcf.clone())
+            .list_a10_sessions(pcf::ListA10SessionsRequest {})
+            .await
+            .map_err(|status| downstream_error(status, Downstream::Pcf))
     }
 
     async fn get_pcf_session(
@@ -452,6 +529,7 @@ impl NetworkManagementService for NetworkManagement {
         self.packet_client()
             .get_session_status(packet::GetSessionStatusRequest { session_id })
             .await
+            .map_err(|status| downstream_error(status, Downstream::Packet))
     }
 
     // Global interface: PDSN
@@ -463,7 +541,8 @@ impl NetworkManagementService for NetworkManagement {
         let sessions = self
             .packet_client()
             .list_sessions(packet::ListSessionsRequest {})
-            .await?
+            .await
+            .map_err(|status| downstream_error(status, Downstream::Packet))?
             .into_inner()
             .sessions;
         Ok(Response::new(pdsn_mgmt::PdsnSessionList { sessions }))
@@ -477,6 +556,7 @@ impl NetworkManagementService for NetworkManagement {
         self.packet_client()
             .get_session_status(packet::GetSessionStatusRequest { session_id })
             .await
+            .map_err(|status| downstream_error(status, Downstream::Packet))
     }
 
     async fn get_pdsn_session_by_ip(
@@ -487,6 +567,7 @@ impl NetworkManagementService for NetworkManagement {
         self.packet_client()
             .get_session_by_ip(packet::GetSessionByIpRequest { peer_ip })
             .await
+            .map_err(|status| downstream_error(status, Downstream::Packet))
     }
 
     async fn set_packet_trace_capture(
@@ -500,6 +581,7 @@ impl NetworkManagementService for NetworkManagement {
                 enabled: req.enabled,
             })
             .await
+            .map_err(|status| downstream_error(status, Downstream::Packet))
     }
 
     // Aggregation across every base station
@@ -614,18 +696,34 @@ impl NetworkManagement {
                 (None, Some(c)) => s.cell.as_ref() == Some(c),
                 (None, None) => true,
             })
-            .ok_or_else(|| Status::not_found("cell not found on base station"))?;
+            .ok_or_else(|| {
+                MSC.not_found(
+                    ErrorReason::CellNotFound,
+                    "The cell is not on this base station",
+                )
+                .status()
+            })?;
         summary
             .an_grpc_addr
             .filter(|a| !a.is_empty())
-            .ok_or_else(|| Status::unavailable("cell has no HRPD access network"))
+            .ok_or_else(|| {
+                MSC.precondition(
+                    ErrorReason::EvdoNotEnabled,
+                    "EV-DO is not enabled on this cell",
+                )
+                .status()
+            })
     }
 }
 
 async fn an_client(addr: &str) -> Result<AnServiceClient<Channel>, Status> {
     let endpoint = normalize_grpc_uri(addr);
     let channel = Channel::from_shared(endpoint)
-        .map_err(|e| Status::unavailable(format!("invalid AN address: {e}")))?
+        .map_err(|e| {
+            MSC.internal(format!(
+                "The EV-DO access network address {addr} is not valid: {e}"
+            ))
+        })?
         .connect_lazy();
     Ok(AnServiceClient::new(channel))
 }
@@ -638,6 +736,54 @@ fn normalize_grpc_uri(addr: &str) -> String {
     } else {
         format!("http://{addr}")
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Downstream {
+    AccessNetwork,
+    Packet,
+    Pcf,
+}
+
+impl Downstream {
+    fn name(self) -> &'static str {
+        match self {
+            Self::AccessNetwork => "an",
+            Self::Packet => "packet",
+            Self::Pcf => "pcf",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::AccessNetwork => "EV-DO access network",
+            Self::Packet => "packet data service",
+            Self::Pcf => "PCF",
+        }
+    }
+}
+
+fn is_unreachable(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+    )
+}
+
+fn downstream_error(status: Status, downstream: Downstream) -> Status {
+    if cdma_rpc_error::error_info(&status).is_some() || !is_unreachable(&status) {
+        return status;
+    }
+    warn!(
+        "MSC management: {} unreachable: {status}",
+        downstream.label()
+    );
+    MSC.unavailable(
+        ErrorReason::ServiceUnreachable,
+        format!("The {} could not be reached", downstream.label()),
+    )
+    .with("service", downstream.name())
+    .status()
 }
 
 #[cfg(test)]
@@ -658,6 +804,7 @@ mod tests {
                 id: Some("bts-1".to_string()),
             }],
             "http://127.0.0.1:17021",
+            "http://127.0.0.1:17047",
         );
         assert!(net.channel(&selector("bts-1")).is_ok());
         assert!(net.channel(&selector("http://127.0.0.1:17016")).is_ok());
@@ -672,6 +819,7 @@ mod tests {
                 id: None,
             }],
             "http://127.0.0.1:17021",
+            "http://127.0.0.1:17047",
         );
         assert!(one.channel(&None).is_ok());
 
@@ -687,6 +835,7 @@ mod tests {
                 },
             ],
             "http://127.0.0.1:17021",
+            "http://127.0.0.1:17047",
         );
         assert!(two.channel(&None).is_err());
     }
@@ -699,6 +848,7 @@ mod tests {
                 id: None,
             }],
             "http://127.0.0.1:1",
+            "http://127.0.0.1:17047",
         )
         .with_control(control);
         let subscriber_id = uuid::Uuid::new_v4();
@@ -732,5 +882,59 @@ mod tests {
             other => panic!("unexpected control request: {other:?}"),
         }
         assert!(task.await.unwrap().unwrap().into_inner().accepted);
+    }
+
+    fn reason(status: &Status) -> Option<ErrorReason> {
+        cdma_rpc_error::error_info(status).map(|info| info.reason)
+    }
+
+    #[tokio::test]
+    async fn an_unknown_base_station_names_itself() {
+        let net = NetworkManagement::new(
+            &[BaseStationConfig {
+                management_endpoint: "http://127.0.0.1:17016".to_string(),
+                id: Some("bts-1".to_string()),
+            }],
+            "http://127.0.0.1:17021",
+            "http://127.0.0.1:17047",
+        );
+        let status = net.channel(&selector("nope")).unwrap_err();
+        assert_eq!(status.code(), tonic::Code::NotFound);
+        let info = cdma_rpc_error::error_info(&status).expect("error info");
+        assert_eq!(info.reason, ErrorReason::BaseStationNotFound);
+        assert_eq!(info.metadata["base_station"], "nope");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_base_station_is_named_in_the_forwarded_error() {
+        let net = NetworkManagement::new(
+            &[BaseStationConfig {
+                management_endpoint: "http://127.0.0.1:1".to_string(),
+                id: Some("bts-1".to_string()),
+            }],
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+        );
+        let status = net
+            .list_bts(Request::new(mgmt::BsRequest { selector: None }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        let info = cdma_rpc_error::error_info(&status).expect("error info");
+        assert_eq!(info.reason, ErrorReason::BaseStationUnreachable);
+        assert_eq!(info.metadata["base_station"], "bts-1");
+    }
+
+    #[test]
+    fn a_forwarded_error_with_a_reason_passes_through() {
+        let original = cdma_rpc_error::Domain("packet")
+            .not_found(ErrorReason::PacketSessionNotFound, "Session not found")
+            .status();
+        let forwarded = downstream_error(original, Downstream::Packet);
+        assert_eq!(reason(&forwarded), Some(ErrorReason::PacketSessionNotFound));
+        let unreachable = downstream_error(Status::unavailable("transport error"), Downstream::Pcf);
+        assert_eq!(reason(&unreachable), Some(ErrorReason::ServiceUnreachable));
+        let other = downstream_error(Status::internal("boom"), Downstream::Pcf);
+        assert_eq!(reason(&other), None);
     }
 }

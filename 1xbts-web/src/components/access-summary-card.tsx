@@ -9,6 +9,7 @@ import { AccessBadge, useAdmissionVerdicts } from "@/components/access-activity"
 import type { ObservedMobile } from "@/lib/admission";
 import { accessClass } from "@/lib/admission";
 import { formatEsn, formatMeid } from "@/lib/format";
+import { ErrorNotice } from "@/components/error-notice";
 
 const RECENT = 3;
 
@@ -38,7 +39,7 @@ export function AccessSummaryCard() {
   return (
     <Card title="Access">
       {error ? (
-        <p className="text-xs text-accent-red">{error}</p>
+        <ErrorNotice error={error} className="text-xs" />
       ) : !policy ? (
         <p className="text-xs text-dimmed">Loading...</p>
       ) : (
