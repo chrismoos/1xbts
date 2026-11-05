@@ -1,8 +1,10 @@
 # HEAD
 
+
 - Added a CSIM applet for sysmoISIM-SJA5 cards and a `csim` tool to personalize and inspect CSIM cards. See `sim/README.md`.
 - Web UI updates to EV-DO, packet data, and cell view.
 - Added support for Mobile IP handsets that compute the MN-HA authenticator per RFC 3344.
+- Ignore inactive call identities when correlating femtocell OTASP replies.
 - Improve traffic channel FER (RC1/RC2/RC3).
 - Web UI UX updates.
 - Fix issue with USB threads not getting real-time scheduling on macOS.
