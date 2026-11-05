@@ -440,7 +440,7 @@ export function SysTab({
           ...(mode === "extended"
             ? [
                 {
-                  label: "HRPD",
+                  label: "EV-DO",
                   active: typeFilters.includes("HRPD"),
                   onClick: () =>
                     changeTypeFilters(
@@ -572,7 +572,7 @@ export function SysTab({
                 className={FILTER_INPUT_CLASS}
                 value={subnetFilter}
                 onChange={(event) => setSubnetFilter(event.target.value)}
-                aria-label="Exact HRPD subnet hex"
+                aria-label="Exact EV-DO subnet hex"
               />
             </FilterField>
           )}

@@ -16,6 +16,7 @@ use cdma_common::lac::{
         GeneralPageRecord, MsAddress, OrderMessage, PagingChannelMessage, SsdUpdateMessage,
     },
 };
+use cdma_rpc_error::{Domain, ErrorReason};
 use log::{info, warn};
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
@@ -129,12 +130,27 @@ fn to_proto_cell_id(cell: AccessCellId) -> proto::CellId {
     }
 }
 
+const BSC: Domain = Domain("bsc");
+
+fn cell_required() -> Status {
+    BSC.error(
+        tonic::Code::FailedPrecondition,
+        ErrorReason::CellRequired,
+        "More than one cell is enrolled, so choose one",
+    )
+    .status()
+}
+
+fn walsh_code_out_of_range() -> Status {
+    BSC.invalid_field("walsh_code", "The Walsh code must be 255 or less")
+}
+
 fn from_proto_cell_id(cell: &proto::CellId) -> Result<AccessCellId, Status> {
     Ok(AccessCellId {
         cell: u16::try_from(cell.cell)
-            .map_err(|_| Status::invalid_argument("cell must fit in 16 bits"))?,
+            .map_err(|_| BSC.invalid_field("cell", "The cell number must be 65535 or less"))?,
         sector: u8::try_from(cell.sector)
-            .map_err(|_| Status::invalid_argument("sector must fit in 8 bits"))?,
+            .map_err(|_| BSC.invalid_field("sector", "The sector must be 255 or less"))?,
     })
 }
 
@@ -165,19 +181,20 @@ impl BscServiceImpl {
             Some(cell) => {
                 let id = from_proto_cell_id(&cell)?;
                 registry.get(id).ok_or_else(|| {
-                    Status::not_found(format!(
-                        "cell {}/{} is not enrolled",
-                        cell.cell, cell.sector
-                    ))
+                    BSC.not_found(
+                        ErrorReason::CellNotFound,
+                        format!("Cell {}/{} is not enrolled", cell.cell, cell.sector),
+                    )
+                    .with("cell", format!("{}/{}", cell.cell, cell.sector))
+                    .status()
                 })
             }
             None => registry.sole_entry().ok_or_else(|| {
                 if registry.is_empty() {
-                    Status::failed_precondition("no cell is enrolled")
+                    BSC.precondition(ErrorReason::NoCellEnrolled, "No cell is enrolled")
+                        .status()
                 } else {
-                    Status::failed_precondition(
-                        "more than one cell is enrolled; name the cell in the request",
-                    )
+                    cell_required()
                 }
             }),
         }
@@ -192,14 +209,15 @@ impl BscServiceImpl {
         let entry = self.resolve_entry(cell)?;
         let id = to_proto_cell_id(entry.cell());
         let client = entry.oam().ok_or_else(|| {
-            Status::unavailable(format!(
-                "cell {}/{} has no management channel: {}",
-                id.cell,
-                id.sector,
-                entry
-                    .status_detail()
-                    .unwrap_or_else(|| attach_state_message(entry.attach_state()).to_string())
-            ))
+            let detail = entry
+                .status_detail()
+                .unwrap_or_else(|| attach_state_message(entry.attach_state()).to_string());
+            BSC.unavailable(
+                ErrorReason::CellUnreachable,
+                format!("Cell {}/{} cannot be reached: {detail}", id.cell, id.sector),
+            )
+            .with("cell", format!("{}/{}", id.cell, id.sector))
+            .status()
         })?;
         Ok((id, client))
     }
@@ -213,11 +231,14 @@ impl BscServiceImpl {
         request: CellRequest,
     ) -> Result<(proto::CellId, BtsOamClient), Status> {
         if let Some(peer_id) = request.peer_id.as_deref() {
-            let cell = self
-                .state
-                .bts
-                .peer_cell(peer_id)
-                .ok_or_else(|| Status::unavailable(format!("BTS {peer_id} is offline")))?;
+            let cell = self.state.bts.peer_cell(peer_id).ok_or_else(|| {
+                BSC.unavailable(
+                    ErrorReason::CellUnreachable,
+                    format!("BTS {peer_id} is offline"),
+                )
+                .with("peer_id", peer_id)
+                .status()
+            })?;
             return self.oam_for(Some(to_proto_cell_id(cell)));
         }
         self.oam_for(request.cell)
@@ -1747,8 +1768,7 @@ impl BscService for BscServiceImpl {
         request: Request<proto::SetTrafficChannelPowerOverrideRequest>,
     ) -> Result<Response<proto::SetTrafficChannelPowerOverrideResponse>, Status> {
         let req = request.into_inner();
-        let walsh_code = u8::try_from(req.walsh_code)
-            .map_err(|_| Status::invalid_argument("walsh_code must fit in u8"))?;
+        let walsh_code = u8::try_from(req.walsh_code).map_err(|_| walsh_code_out_of_range())?;
         // Each cell allocates Walsh codes from its own pool, so the code alone
         // does not identify a channel. An unnamed cell resolves to the only
         // enrolled one, which is how the rest of the cell-addressed API reads
@@ -1760,11 +1780,7 @@ impl BscService for BscServiceImpl {
                 .bts
                 .sole_entry()
                 .map(|entry| entry.cell())
-                .ok_or_else(|| {
-                    Status::failed_precondition(
-                        "more than one cell is enrolled, so the request must name one",
-                    )
-                })
+                .ok_or_else(cell_required)
                 .map(Some)?,
         };
         let bsc_snapshot = {
@@ -1777,7 +1793,14 @@ impl BscService for BscServiceImpl {
                         && mobile.serving_cell == requested_cell
                 })
                 .map(|mobile| mobile.traffic_power.clone())
-                .ok_or_else(|| Status::not_found("active traffic channel not found"))?
+                .ok_or_else(|| {
+                    BSC.not_found(
+                        ErrorReason::TrafficChannelNotFound,
+                        format!("No active traffic channel uses Walsh code {walsh_code}"),
+                    )
+                    .with("walsh_code", walsh_code)
+                    .status()
+                })?
         };
 
         let (cell, mut client) = self.oam_for(requested_cell.map(to_proto_cell_id))?;
@@ -1800,8 +1823,9 @@ impl BscService for BscServiceImpl {
         &self,
         _request: Request<proto::InitiateDataCallRequest>,
     ) -> Result<Response<proto::InitiateDataCallResponse>, Status> {
-        Err(Status::failed_precondition(
-            "Data calls must be initiated through MSC network management",
+        Err(BSC.not_supported(
+            "initiate_data_call",
+            "Data calls are started through the MSC",
         ))
     }
 }
@@ -2094,8 +2118,7 @@ impl BtsManagementService for BscServiceImpl {
         request: Request<ReversePowerControlRequest>,
     ) -> Result<Response<proto::TrafficChannelPower>, Status> {
         let req = request.into_inner();
-        let walsh_code = u8::try_from(req.walsh_code)
-            .map_err(|_| Status::invalid_argument("walsh_code must fit in u8"))?;
+        let walsh_code = u8::try_from(req.walsh_code).map_err(|_| walsh_code_out_of_range())?;
         let (cell, mut client) = self.oam_for(req.cell)?;
         let power = client
             .get_reverse_power_control(ReversePowerControlRequest {
@@ -2153,8 +2176,7 @@ impl BtsManagementService for BscServiceImpl {
     ) -> Result<Response<proto::SetTrafficChannelPowerOverrideResponse>, Status> {
         let req = request.into_inner();
         let (cell, mut client) = self.oam_for(req.cell.clone())?;
-        let walsh_code = u8::try_from(req.walsh_code)
-            .map_err(|_| Status::invalid_argument("walsh_code must fit in u8"))?;
+        let walsh_code = u8::try_from(req.walsh_code).map_err(|_| walsh_code_out_of_range())?;
         let bsc_snapshot = self.bsc_power_snapshot(from_proto_cell_id(&cell)?, walsh_code);
         // Forward with the resolved cell so the BTS-side check sees the cell
         // this BSC actually addressed.

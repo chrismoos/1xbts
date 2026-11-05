@@ -15,6 +15,8 @@ import {
   verdictKind,
   verdictStatus,
 } from "@/lib/authentication-verdict";
+import { apiFetch } from "@/lib/api-client";
+import { ErrorNotice } from "@/components/error-notice";
 
 const ACTIVITY_LIMIT = 200;
 const PAGE_SIZES = [10, 25, 50] as const;
@@ -23,9 +25,9 @@ const DEFAULT_PAGE_SIZE = 10;
 export function useAuthenticationVerdicts(
   imsis: string[],
   esn?: number,
-): { events: AuthVerdict[]; error: string | null } {
+): { events: AuthVerdict[]; error: unknown } {
   const [events, setEvents] = useState<AuthVerdict[]>([]);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const imsiKey = imsis.join(",");
 
   useEffect(() => {
@@ -35,14 +37,13 @@ export function useAuthenticationVerdicts(
     if (esn != null) params.set("esn", String(esn));
     params.set("limit", String(ACTIVITY_LIMIT));
     let cancelled = false;
-    fetch(`/api/authentication-events?${params}`)
-      .then((res) => res.json())
+    apiFetch<{ events?: AuthVerdict[] }>(`/api/authentication-events?${params}`, undefined, "load authentication events")
       .then((data) => {
         if (cancelled) return;
-        if (data.error) setError(data.error);
-        else setEvents(data.events ?? []);
+        setError(null);
+        setEvents(data.events ?? []);
       })
-      .catch((e) => !cancelled && setError(e instanceof Error ? e.message : "load failed"));
+      .catch((e) => !cancelled && setError(e));
     return () => {
       cancelled = true;
     };
@@ -72,7 +73,7 @@ export function AuthenticationActivity({ imsis, esn }: { imsis: string[]; esn?: 
   const [page, setPage] = useState(0);
   const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
 
-  if (error) return <p className="text-xs text-accent-red">{error}</p>;
+  if (error) return <ErrorNotice error={error} className="text-xs" />;
   if (events.length === 0) {
     return <p className="text-xs text-dimmed">No authentication activity since the MSC started.</p>;
   }
@@ -82,35 +83,34 @@ export function AuthenticationActivity({ imsis, esn }: { imsis: string[]; esn?: 
   const rows = events.slice(first, first + pageSize);
   return (
     <div>
-      <table className="w-full text-xs">
+      <table className="data-table">
         <thead>
-          <tr className="text-muted text-left">
-            <th className="font-normal py-1 pr-3">Time</th>
-            <th className="font-normal py-1 pr-2 w-6" />
-            <th className="font-normal py-1 pr-3">Procedure</th>
-            <th className="font-normal py-1 pr-3">Result</th>
-            <th className="font-normal py-1 pr-3">Service</th>
-            <th className="font-normal py-1">Base station</th>
+          <tr>
+            <th className="font-normal">Time</th>
+            <th className="font-normal w-6" />
+            <th className="font-normal">Procedure</th>
+            <th className="font-normal">Result</th>
+            <th className="font-normal">Service</th>
+            <th className="font-normal">Base station</th>
           </tr>
         </thead>
         <tbody>
           {rows.map((verdict, index) => (
             <tr
               key={`${verdict.time}-${verdict.procedure}-${first + index}`}
-              className="border-t border-border-subtle"
-            >
-              <td className="py-1 pr-3 font-mono">
+              className="border-border-subtle">
+              <td className="font-mono">
                 {verdict.time ? new Date(verdict.time).toLocaleTimeString() : "—"}
               </td>
-              <td className="py-1 pr-2">
+              <td>
                 <AuthenticationMark verdict={verdict} />
               </td>
-              <td className="py-1 pr-3">{procedureLabel(verdict)}</td>
-              <td className="py-1 pr-3">{resultLabel(verdict)}</td>
-              <td className={`py-1 pr-3 ${verdict.serviceRejected ? "text-accent-red" : "text-muted"}`}>
+              <td>{procedureLabel(verdict)}</td>
+              <td>{resultLabel(verdict)}</td>
+              <td className={`${verdict.serviceRejected ? "text-accent-red" : "text-muted"}`}>
                 {verdict.serviceRejected ? "rejected" : "allowed"}
               </td>
-              <td className="py-1 text-muted"><BaseStationLink baseStation={verdict.baseStation} nodes={nodes} /></td>
+              <td className="text-muted"><BaseStationLink baseStation={verdict.baseStation} nodes={nodes} /></td>
             </tr>
           ))}
         </tbody>

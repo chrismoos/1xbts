@@ -5,6 +5,7 @@ import { Card } from "@/components/card";
 import { attachStateBadgeClass, attachStateLabel } from "@/lib/cell";
 import { BtsAttachState } from "@/lib/proto/bts_management/v1/service";
 import { useBtsList } from "@/lib/use-bts-list";
+import { ErrorNotice } from "@/components/error-notice";
 
 export default function BtsPage() {
   const { cells, error, loading } = useBtsList();
@@ -14,7 +15,7 @@ export default function BtsPage() {
   ).length;
 
   return (
-    <div className="max-w-7xl mx-auto space-y-6">
+    <div className="page-container space-y-6">
       <div className="flex items-center gap-4">
         <h1 className="text-lg font-bold">Cells</h1>
         {cells.length > 0 && (
@@ -29,34 +30,32 @@ export default function BtsPage() {
         {loading ? (
           <p className="text-dimmed text-sm">Loading...</p>
         ) : error ? (
-          <p className="text-accent-red text-sm">{error}</p>
+          <ErrorNotice error={error} />
         ) : cells.length === 0 ? (
           <p className="text-dimmed text-sm">No base stations configured.</p>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-sm">
+            <table className="data-table">
               <thead>
-                <tr className="text-muted text-xs">
-                  <th className="text-left py-1">Cell</th>
-                  <th className="text-left py-1">State</th>
-                  <th className="text-right py-1">Pilot PN</th>
-                  <th className="text-left py-1 pl-4">Band Class</th>
-                  <th className="text-right py-1">Channel</th>
-                  <th className="text-right py-1">SID</th>
-                  <th className="text-right py-1">NID</th>
-                  <th className="text-left py-1 pl-4">EV-DO</th>
-                  <th className="text-right py-1">Mobiles</th>
-                  <th className="text-left py-1"></th>
+                <tr>
+                  <th>Cell</th>
+                  <th>State</th>
+                  <th className="text-right">Pilot PN</th>
+                  <th>Band Class</th>
+                  <th className="text-right">Channel</th>
+                  <th className="text-right">SID</th>
+                  <th className="text-right">NID</th>
+                  <th>EV-DO</th>
+                  <th className="text-right">Mobiles</th>
+                  <th></th>
                 </tr>
               </thead>
               <tbody>
                 {cells.map((summary) => {
                   return (
                     <tr
-                      key={`${summary.baseStation}-${summary.peerId}`}
-                      className="border-t border-border hover:bg-hover"
-                    >
-                      <td className="py-2 text-xs text-primary">
+                      key={`${summary.baseStation}-${summary.peerId}`}>
+                      <td className="text-primary">
                         <Link
                           href={`/bts/${encodeURIComponent(summary.peerId)}?baseStation=${encodeURIComponent(summary.baseStation)}`}
                           className="hover:text-accent-green transition-colors"
@@ -82,7 +81,7 @@ export default function BtsPage() {
                           )}
                         </Link>
                       </td>
-                      <td className="py-2">
+                      <td>
                         <span
                           className={`text-xs px-2 py-0.5 rounded ${attachStateBadgeClass(summary.state)}`}
                         >
@@ -94,22 +93,22 @@ export default function BtsPage() {
                           </div>
                         )}
                       </td>
-                      <td className="py-2 text-right font-mono text-xs text-secondary">
+                      <td className="text-right font-mono text-secondary">
                         {summary.cell ? summary.pilotPn : "-"}
                       </td>
-                      <td className="py-2 pl-4 font-mono text-xs text-secondary">
+                      <td className="font-mono text-secondary">
                         {summary.bandClass || "-"}
                       </td>
-                      <td className="py-2 text-right font-mono text-xs text-secondary">
+                      <td className="text-right font-mono text-secondary">
                         {summary.cell ? summary.cdmaChannel : "-"}
                       </td>
-                      <td className="py-2 text-right font-mono text-xs text-secondary">
+                      <td className="text-right font-mono text-secondary">
                         {summary.cell ? summary.sid : "-"}
                       </td>
-                      <td className="py-2 text-right font-mono text-xs text-secondary">
+                      <td className="text-right font-mono text-secondary">
                         {summary.cell ? summary.nid : "-"}
                       </td>
-                      <td className="py-2 pl-4">
+                      <td>
                         <span
                           className={`text-xs px-2 py-0.5 rounded ${
                             summary.evdoEnabled
@@ -120,10 +119,10 @@ export default function BtsPage() {
                           {summary.evdoEnabled ? "Enabled" : "Off"}
                         </span>
                       </td>
-                      <td className="py-2 text-right font-mono text-xs text-secondary">
+                      <td className="text-right font-mono text-secondary">
                         {summary.servedMobiles != null ? summary.servedMobiles : "-"}
                       </td>
-                      <td className="py-2 text-right">
+                      <td className="text-right">
                         <Link
                           href={`/bts/${encodeURIComponent(summary.peerId)}?baseStation=${encodeURIComponent(summary.baseStation)}`}
                           className="text-xs text-accent-green hover:text-accent-green transition-colors"

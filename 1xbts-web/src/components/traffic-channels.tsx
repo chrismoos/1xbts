@@ -15,6 +15,8 @@ import { radioConfigPairName } from "@/lib/radio-config";
 import { measuredReverseDb, recentMedianDb, reverseMetricLabel, reverseQualityBars } from "@/lib/reverse-quality";
 import { serviceOptionName } from "@/lib/service-option";
 import { liveSocket } from "@/lib/live";
+import { apiFetch } from "@/lib/api-client";
+import { ErrorNotice } from "@/components/error-notice";
 
 export interface ChannelMobile {
   address: string;
@@ -137,7 +139,7 @@ export function TrafficChannelsCard({
   footer?: ReactNode;
 }) {
   const calls = useMemo(() => mergeCalls(channels), [channels]);
-  const [mutationError, setMutationError] = useState<string | null>(null);
+  const [mutationError, setMutationError] = useState<unknown>(null);
   const [powerDrafts, setPowerDrafts] = useState<Record<string, string>>({});
   const [mutatingKey, setMutatingKey] = useState<string | null>(null);
   const [openCalls, setOpenCalls] = useState<Set<string>>(new Set());
@@ -174,19 +176,26 @@ export function TrafficChannelsCard({
       setMutatingKey(call.key);
       setMutationError(null);
       try {
-        const res = await fetch("/api/channels/power-override", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            walshCode: call.walshCode,
-            ...(cellToken(call.cell) ? { cell: cellToken(call.cell) } : {}),
-            ...(baseStation ? { baseStation } : {}),
-            ...payload,
-          }),
-        });
-        const json = await res.json();
-        if (!res.ok || !json.accepted) {
-          throw new Error(json.message || `HTTP ${res.status}`);
+        const json = await apiFetch<{
+          accepted?: boolean;
+          message?: string;
+          trafficPower?: { effectiveTargetEbNtDb?: number };
+        }>(
+          "/api/channels/power-override",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              walshCode: call.walshCode,
+              ...(cellToken(call.cell) ? { cell: cellToken(call.cell) } : {}),
+              ...(baseStation ? { baseStation } : {}),
+              ...payload,
+            }),
+          },
+          "change the reverse target",
+        );
+        if (!json.accepted) {
+          throw new Error(json.message || "The BSC did not apply the change.");
         }
 
         setPowerDrafts((prev) => {
@@ -200,7 +209,7 @@ export function TrafficChannelsCard({
         });
         liveSocket().refresh(channelsKey);
       } catch (err) {
-        setMutationError(err instanceof Error ? err.message : "unknown");
+        setMutationError(err);
       } finally {
         setMutatingKey((current) => (current === call.key ? null : current));
       }
@@ -233,7 +242,7 @@ export function TrafficChannelsCard({
 
   return (
     <Card title="Traffic Channels" className={className} action={action ?? (calls.length > 0 ? <span className="text-[11px] text-accent-green">● {calls.length} active</span> : undefined)}>
-      {mutationError && <p className="mb-2 text-accent-red text-sm">{mutationError}</p>}
+      <ErrorNotice error={mutationError} className="mb-2" />
       <div className={bodyClassName}>
         {unavailable ? (
           <p className="text-dimmed text-sm">Unavailable</p>
@@ -241,20 +250,20 @@ export function TrafficChannelsCard({
           <p className="text-dimmed text-sm">No active traffic channels.</p>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-sm">
+            <table className="data-table">
               <thead>
-                <tr className="text-muted text-xs">
-                  <th className="text-left py-1 pr-3">Walsh</th>
-                  {showCell && <th className="text-left py-1 pr-3">Cell</th>}
-                  <th className="text-left py-1 pr-3">Mobile</th>
-                  <th className="text-left py-1 pr-3">Call</th>
-                  <th className="text-left py-1 pr-3">Reverse quality</th>
-                  <th className="text-right py-1 pr-3">Rev FER</th>
-                  <th className="text-right py-1 pr-3">Lifetime</th>
-                  <th className="text-right py-1 pr-3">Fwd FER</th>
-                  <th className="text-right py-1 pr-3">Fwd gain</th>
-                  <th className="text-right py-1 pr-3">Rx</th>
-                  <th className="text-left py-1">Signal</th>
+                <tr>
+                  <th>Walsh</th>
+                  {showCell && <th>Cell</th>}
+                  <th>Mobile</th>
+                  <th>Call</th>
+                  <th>Reverse quality</th>
+                  <th className="text-right">Rev FER</th>
+                  <th className="text-right">Lifetime</th>
+                  <th className="text-right">Fwd FER</th>
+                  <th className="text-right">Fwd gain</th>
+                  <th className="text-right">Rx</th>
+                  <th>Signal</th>
                 </tr>
               </thead>
               <tbody>
@@ -327,16 +336,16 @@ function CallRows({
 
   return (
     <Fragment>
-      <tr className="border-t border-border hover:bg-hover cursor-pointer" onClick={onToggle}>
-        <td className="py-2 pr-3 font-mono text-xs text-primary whitespace-nowrap">
+      <tr className="cursor-pointer" onClick={onToggle}>
+        <td className="font-mono text-primary whitespace-nowrap">
           <span className="inline-block w-3 text-dimmed">{open ? "▾" : "▸"}</span> W{call.walshCode}
         </td>
         {showCell && (
-          <td className="py-2 pr-3 font-mono text-xs text-muted whitespace-nowrap">
+          <td className="font-mono text-muted whitespace-nowrap">
             {call.cell ? cellLabel(call.cell) : "-"}
           </td>
         )}
-        <td className="py-2 pr-3 text-xs">
+        <td>
           {call.mobile ? (
             <Link
               href={`/mobiles/${encodeURIComponent(call.mobile.address)}`}
@@ -357,7 +366,7 @@ function CallRows({
               .join(" · ")}
           </div>
         </td>
-        <td className="py-2 pr-3 text-xs">
+        <td>
           <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
             <span className={`px-1.5 py-0.5 rounded ${CALL_KIND_BADGE[kind]}`}>{CALL_KIND_LABEL[kind]}</span>
             {call.mobile?.voiceCallState && (
@@ -368,7 +377,7 @@ function CallRows({
             <VoicePrivacyIndicator status={call.mobile?.voicePrivacy} />
           </span>
         </td>
-        <td className="py-2 pr-3 text-xs">
+        <td>
           {power ? (
             <span className="inline-flex items-center gap-2">
               <Sparkline samples={history} />
@@ -392,10 +401,10 @@ function CallRows({
             <span className="text-dimmed">-</span>
           )}
         </td>
-        <td className={`py-2 pr-3 text-right font-mono text-xs ${power ? ferColor(power.ferPct) : "text-dimmed"}`}>
+        <td className={`text-right font-mono ${power ? ferColor(power.ferPct) : "text-dimmed"}`}>
           {power ? `${power.ferPct.toFixed(1)}%` : "-"}
         </td>
-        <td className="py-2 pr-3 text-right text-xs leading-tight">
+        <td className="text-right leading-tight">
           {lifetime != null && power ? (
             <>
               <span className={`block font-mono ${ferColor(lifetime)}`}>{lifetime.toFixed(2)}%</span>
@@ -407,20 +416,20 @@ function CallRows({
             <span className="text-dimmed">-</span>
           )}
         </td>
-        <td className="py-2 pr-3 text-right font-mono text-xs">
+        <td className="text-right font-mono">
           {power && power.forwardPmrmCount > 0 ? (
             <span className={ferColor(power.forwardLastFerPct)}>{power.forwardLastFerPct.toFixed(1)}%</span>
           ) : (
             <span className="text-dimmed" title="No Power Measurement Report yet">-</span>
           )}
         </td>
-        <td className="py-2 pr-3 text-right font-mono text-xs text-secondary whitespace-nowrap">
+        <td className="text-right font-mono text-secondary whitespace-nowrap">
           {power ? signedDb(power.forwardGainOffsetDb) : "-"}
           {call.powerFraction != null && (
             <div className="text-[11px] text-muted">{(call.powerFraction * 100).toFixed(1)}% fwd</div>
           )}
         </td>
-        <td className="py-2 pr-3 text-right font-mono text-xs text-secondary whitespace-nowrap">
+        <td className="text-right font-mono text-secondary whitespace-nowrap">
           {power?.reversePowerDbfs != null || power?.reversePowerDbm != null ? (
             <RxPower dbm={power.reversePowerDbm} dbfs={power.reversePowerDbfs} />
           ) : call.mobile?.rxPowerDbm != null || call.mobile?.rxLevelDbfs != null ? (
@@ -431,7 +440,7 @@ function CallRows({
             "-"
           )}
         </td>
-        <td className="py-2" title={measured != null ? `${metric}: ${measured.toFixed(1)} dB` : "No measurement yet"}>
+        <td  title={measured != null ? `${metric}: ${measured.toFixed(1)} dB` : "No measurement yet"}>
           <Bars bars={bars} />
         </td>
       </tr>

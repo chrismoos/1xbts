@@ -1,4 +1,5 @@
 import { getHlrClient, waitForHlrReady } from "@/lib/grpc/hlr-client";
+import { apiError } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -14,8 +15,7 @@ export async function POST(_request: Request, ctx: Ctx) {
     await client.setDefaultPrl({ prlId: id }, { signal: abort.signal });
     return Response.json({ ok: true });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    return Response.json({ error: msg }, { status: 502 });
+    return apiError(err, "make this the default PRL");
   } finally {
     clearTimeout(timeout);
   }

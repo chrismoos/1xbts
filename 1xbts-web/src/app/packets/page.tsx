@@ -5,11 +5,12 @@ import Link from "next/link";
 import { useMemo } from "react";
 import { Card } from "@/components/card";
 import {
-  mobileForPacketSession,
   mobileLabel,
   useMobileDirectory,
+  type MobileDirectoryEntry,
 } from "@/lib/mobile-directory";
-import { serviceOptionName } from "@/lib/service-option";
+import { packetBearer, packetSubscriber } from "@/lib/packet-session";
+import { ErrorNotice } from "@/components/error-notice";
 
 interface PacketSessionInfo {
   sessionId: string;
@@ -44,6 +45,7 @@ interface PacketSessionInfo {
   ipcpState: string;
   captureEnabled: boolean;
   accessTechnology: string;
+  pcfSessionId?: number;
 }
 
 function formatBytes(bytes: number): string {
@@ -53,48 +55,31 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function formatTimestamp(ms?: number): string {
-  if (!ms) return "-";
-  const d = new Date(ms);
-  if (Number.isNaN(d.getTime())) return "-";
-  return d.toLocaleTimeString();
-}
-
 function formatAge(ms?: number): string {
   if (!ms) return "-";
-  const delta = Math.max(0, Date.now() - ms);
-  const seconds = Math.floor(delta / 1000);
+  const seconds = Math.floor(Math.max(0, Date.now() - ms) / 1000);
   if (seconds < 60) return `${seconds}s`;
   const minutes = Math.floor(seconds / 60);
-  const rem = seconds % 60;
-  if (minutes < 60) return `${minutes}m ${rem}s`;
-  const hours = Math.floor(minutes / 60);
-  return `${hours}h ${minutes % 60}m`;
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
 
 function formatPhase(phase: string): string {
   switch (phase) {
     case "rlp_sync":
-      return "RLP Sync";
+      return "RLP sync";
     case "lcp":
       return "LCP";
     case "ipcp":
       return "IPCP";
-    case "active":
-      return "Active";
-    case "closed":
-      return "Closed";
     default:
       return phase;
   }
 }
 
-function formatStateLabel(value: string): string {
-  if (!value) return "-";
-  return value
-    .split("_")
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
+function formatRate(bps: number): string {
+  if (bps < 1000) return `${bps} bps`;
+  return `${(bps / 1000).toFixed(1)} kbps`;
 }
 
 function healthForSession(session: PacketSessionInfo): {
@@ -119,207 +104,133 @@ function healthForSession(session: PacketSessionInfo): {
 
 const NO_SESSIONS: PacketSessionInfo[] = [];
 
+const PHASE_RANK: Record<string, number> = { active: 0, ipcp: 1, lcp: 2, rlp_sync: 3, closed: 4 };
+
+function SubscriberCell({ session, mobile }: { session: PacketSessionInfo; mobile?: MobileDirectoryEntry }) {
+  const imsi = session.subscriberImsi || session.imsi || session.mnId;
+  const name = mobile?.subscriberDisplayName || mobile?.phoneNumber || (mobile ? mobileLabel(mobile).value : undefined);
+  return (
+    <div>
+      {mobile && name ? (
+        <Link href={`/mobiles/${encodeURIComponent(mobile.address)}`} className="font-semibold text-primary hover:underline">
+          {name}
+        </Link>
+      ) : (
+        <span className="font-semibold text-muted">{session.phoneNumber || "Unknown subscriber"}</span>
+      )}
+      {mobile?.subscriberDisplayName && mobile.phoneNumber && (
+        <div className="text-xs text-muted">{mobile.phoneNumber}</div>
+      )}
+      {imsi && <div className="font-mono text-[11px] text-dimmed">IMSI {imsi}</div>}
+    </div>
+  );
+}
+
 export default function PacketsPage() {
   const live = useLive<{ sessions?: PacketSessionInfo[] }>("/api/packet-sessions");
   const sessions = live.data?.sessions ?? NO_SESSIONS;
-  const { loading, error } = live;
+  const { loading } = live;
+  const error = live.errorBody ?? live.error;
   const mobiles = useMobileDirectory();
 
+  const rows = useMemo(
+    () =>
+      [...sessions]
+        .sort(
+          (left, right) =>
+            (PHASE_RANK[left.phase] ?? 99) - (PHASE_RANK[right.phase] ?? 99) ||
+            (right.lastActivityAtMs || 0) - (left.lastActivityAtMs || 0),
+        )
+        .map((session) => ({ session, ...packetSubscriber(session, mobiles) })),
+    [sessions, mobiles],
+  );
 
-  const sortedSessions = useMemo(() => {
-    const phaseRank: Record<string, number> = {
-      active: 0,
-      ipcp: 1,
-      lcp: 2,
-      rlp_sync: 3,
-      closed: 4,
-    };
-    return [...sessions].sort((left, right) => {
-      const phaseDelta = (phaseRank[left.phase] ?? 99) - (phaseRank[right.phase] ?? 99);
-      if (phaseDelta !== 0) return phaseDelta;
-      return (right.lastActivityAtMs || 0) - (left.lastActivityAtMs || 0);
-    });
-  }, [sessions]);
-
-  const activeCount = sessions.filter((session) => session.phase === "active").length;
-  const negotiatingCount = sessions.filter(
-    (session) => session.phase !== "active" && session.phase !== "closed"
-  ).length;
-  const captureCount = sessions.filter((session) => session.captureEnabled).length;
-  const stalledCount = sessions.filter((session) => healthForSession(session).label === "Stalled").length;
+  const counts = {
+    active: sessions.filter((session) => session.phase === "active").length,
+    negotiating: sessions.filter((session) => session.phase !== "active" && session.phase !== "closed").length,
+    stalled: sessions.filter((session) => healthForSession(session).label === "Stalled").length,
+    captured: sessions.filter((session) => session.captureEnabled).length,
+  };
 
   return (
-    <div className="max-w-7xl mx-auto space-y-4">
-      <div className="flex items-center gap-4">
+    <div className="page-container space-y-4">
+      <div className="flex flex-wrap items-center gap-3">
         <h1 className="text-lg font-bold">Packet Data Sessions</h1>
-        <span className="text-xs text-muted">
-          {sessions.length} session{sessions.length !== 1 ? "s" : ""}
-        </span>
+        <div className="flex flex-wrap gap-2">
+          <Pill value={sessions.length} label="sessions" />
+          <Pill value={counts.active} label="active" className="text-accent-green" />
+          <Pill value={counts.negotiating} label="negotiating" className="text-accent-blue" />
+          {counts.stalled > 0 && <Pill value={counts.stalled} label="stalled" className="text-accent-red" />}
+          {counts.captured > 0 && <Pill value={counts.captured} label="captured" className="text-accent-cyan" />}
+        </div>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-        <Card title="Active">
-          <p className="text-2xl font-mono text-accent-green">{activeCount}</p>
-          <p className="mt-1 text-xs text-muted">IPCP complete and forwarding</p>
-        </Card>
-        <Card title="Negotiating">
-          <p className="text-2xl font-mono text-accent-blue">{negotiatingCount}</p>
-          <p className="mt-1 text-xs text-muted">Bearer, LCP, or IPCP in progress</p>
-        </Card>
-        <Card title="Captured">
-          <p className="text-2xl font-mono text-accent-cyan">{captureCount}</p>
-          <p className="mt-1 text-xs text-muted">Sessions with IP capture enabled</p>
-        </Card>
-        <Card title="Stalled">
-          <p className="text-2xl font-mono text-accent-red">{stalledCount}</p>
-          <p className="mt-1 text-xs text-muted">Bearer setup lingering &gt;10s</p>
-        </Card>
-      </div>
-
-      {loading ? (
-        <p className="text-dimmed text-sm">Loading...</p>
-      ) : error ? (
-        <p className="text-accent-red text-sm">{error}</p>
-      ) : sortedSessions.length === 0 ? (
-        <Card title="Sessions">
-          <p className="text-dimmed text-sm">
-            No packet data sessions are currently registered.
-          </p>
-        </Card>
-      ) : (
-        <Card title="Sessions">
+      <Card title="Sessions">
+        {loading ? (
+          <p className="text-dimmed text-sm">Loading...</p>
+        ) : error ? (
+          <ErrorNotice error={error} />
+        ) : rows.length === 0 ? (
+          <p className="text-dimmed text-sm">No packet data sessions are currently registered.</p>
+        ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-sm">
+            <table className="data-table">
               <thead>
-                <tr className="text-xs text-muted">
-                  <th className="text-left py-1">Session</th>
-                  <th className="text-left py-1">Mobile</th>
-                  <th className="text-left py-1">Access</th>
-                  <th className="text-left py-1">Phase</th>
-                  <th className="text-left py-1">Health</th>
-                  <th className="text-left py-1">Bearer / PPP</th>
-                  <th className="text-left py-1">Last Activity</th>
-                  <th className="text-left py-1">Bearer</th>
-                  <th className="text-right py-1">Traffic</th>
+                <tr>
+                  <th>Subscriber</th>
+                  <th>Bearer</th>
+                  <th>Status</th>
+                  <th>Mobile IP</th>
+                  <th>Last activity</th>
+                  <th className="text-right">Up / Down</th>
                 </tr>
               </thead>
               <tbody>
-                {sortedSessions.map((session) => {
+                {rows.map(({ session, mobile, evdoLinked }) => {
                   const health = healthForSession(session);
-                  const mobile = mobileForPacketSession(session, mobiles);
-                  const label = mobile ? mobileLabel(mobile) : null;
-                  const isHrpd = session.accessTechnology === "HRPD";
-                  const subscriberImsi = session.subscriberImsi || session.imsi;
+                  const bearer = packetBearer(session, evdoLinked);
+                  const rate =
+                    session.lastUplinkRateBps || session.lastDownlinkRateBps
+                      ? `↑ ${formatRate(session.lastUplinkRateBps)} · ↓ ${formatRate(session.lastDownlinkRateBps)}`
+                      : null;
                   return (
-                    <tr
-                      key={session.sessionId}
-                      className="border-t border-border hover:bg-hover"
-                    >
-                      <td className="py-2 align-top">
-                        <Link
-                          href={`/packets/${encodeURIComponent(session.sessionId)}`}
-                          className="font-mono text-xs text-accent-green hover:text-accent-green"
-                        >
-                          {session.sessionId.slice(0, 8)}...{session.sessionId.slice(-8)}
-                        </Link>
-                        <div className="mt-1 text-[11px] text-muted">
-                          age {formatAge(session.createdAtMs)}
+                    <tr key={session.sessionId} className="align-top">
+                      <td>
+                        <SubscriberCell session={session} mobile={mobile} />
+                      </td>
+                      <td>
+                        <span className={`inline-flex rounded-full px-2 py-0.5 text-[11px] font-medium ${bearer.className}`}>
+                          {bearer.label}
+                        </span>
+                        <div className="mt-0.5">
+                          <Link
+                            href={`/packets/${encodeURIComponent(session.sessionId)}`}
+                            className="font-mono text-[11px] text-accent-blue hover:underline"
+                          >
+                            {bearer.detail || "Session"}
+                          </Link>
                         </div>
                       </td>
-                      <td className="py-2 align-top">
-                        {session.mobileAddress ? (
-                          <div className="space-y-1">
-                            {mobile && label ? (
-                              <Link
-                                href={`/mobiles/${encodeURIComponent(mobile.address)}`}
-                                className="font-mono text-xs text-accent-cyan hover:text-accent-cyan"
-                              >
-                                {label.value}
-                              </Link>
-                            ) : (
-                              <div className="font-mono text-xs text-secondary">
-                                {session.phoneNumber || session.mobileAddress}
-                              </div>
-                            )}
-                            <div className="text-[11px] text-muted font-mono">
-                              {session.mobileAddress}
-                            </div>
-                            {session.subscriberId && (
-                              <div className="text-[11px] text-dimmed font-mono">
-                                {session.subscriberId.slice(0, 8)}...{session.subscriberId.slice(-8)}
-                              </div>
-                            )}
-                            {subscriberImsi && (
-                              <div className="text-[11px] text-dimmed font-mono">
-                                Subscriber IMSI {subscriberImsi}
-                              </div>
-                            )}
-                            {session.mnId && (
-                              <div className="text-[11px] text-dimmed font-mono">
-                                MN ID {session.mnId}
-                                {session.mnIdSource ? ` (${session.mnIdSource})` : ""}
-                              </div>
-                            )}
+                      <td>
+                        <span className={`rounded px-2 py-0.5 text-xs ${health.className}`}>{health.label}</span>
+                        {session.phase !== "active" && session.phase !== "closed" && (
+                          <div className="mt-1 text-[11px] text-muted">
+                            {formatPhase(session.phase)} · LCP {session.lcpState || "-"} · IPCP {session.ipcpState || "-"}
                           </div>
-                        ) : (
-                          <span className="text-xs text-dimmed">-</span>
                         )}
+                        {session.captureEnabled && <div className="mt-1 text-[11px] text-accent-cyan">capture on</div>}
                       </td>
-                      <td className="py-2 align-top">
-                        <span className="rounded bg-surface-raised px-2 py-0.5 text-xs text-primary">
-                          {session.accessTechnology || "1x"}
-                        </span>
+                      <td className="font-mono">{session.peerIp || "-"}</td>
+                      <td>
+                        <div className="text-xs text-secondary">{formatAge(session.lastActivityAtMs)} ago</div>
+                        <div className="text-[11px] text-dimmed">up {formatAge(session.createdAtMs)}</div>
+                        {rate && <div className="text-[11px] text-muted font-mono">{rate}</div>}
                       </td>
-                      <td className="py-2 align-top">
-                        <span className="rounded bg-surface-raised px-2 py-0.5 text-xs text-primary">
-                          {formatPhase(session.phase)}
-                        </span>
-                        {session.captureEnabled && (
-                          <div className="mt-1 text-[11px] text-accent-cyan">capture enabled</div>
-                        )}
-                      </td>
-                      <td className="py-2 align-top">
-                        <span className={`rounded px-2 py-0.5 text-xs ${health.className}`}>
-                          {health.label}
-                        </span>
-                      </td>
-                      <td className="py-2 align-top">
-                        <div className="text-xs text-secondary">
-                          {isHrpd ? "A10" : "RLP"} {formatStateLabel(session.rlpState)}
-                        </div>
-                        <div className="text-[11px] text-muted">
-                          LCP {formatStateLabel(session.lcpState)} / IPCP {formatStateLabel(session.ipcpState)}
-                        </div>
-                      </td>
-                      <td className="py-2 align-top">
-                        <div className="text-xs font-mono text-secondary">
-                          {formatTimestamp(session.lastActivityAtMs)}
-                        </div>
-                        <div className="text-[11px] text-muted">
-                          UL {session.lastUplinkRateBps || 0} / DL {session.lastDownlinkRateBps || 0}
-                        </div>
-                      </td>
-                      <td className="py-2 align-top">
-                        <div className="text-xs text-secondary">
-                          {serviceOptionName(session.serviceOption)}
-                          {session.trafficWalshCode
-                            ? session.accessTechnology === "HRPD"
-                              ? ` · key ${session.trafficWalshCode}`
-                              : ` · W${session.trafficWalshCode}`
-                            : ""}
-                        </div>
-                        <div className="text-[11px] text-muted font-mono">
-                          {session.peerIp || "-"} / {session.ourIp || "-"}
-                        </div>
-                        <div className="text-[11px] text-dimmed font-mono">
-                          {session.tunDevice || "no TUN"}
-                        </div>
-                      </td>
-                      <td className="py-2 align-top text-right">
-                        <div className="text-xs font-mono text-secondary">
+                      <td className="text-right">
+                        <div className="font-mono text-xs text-secondary">
                           {formatBytes(session.uplinkBytes)} / {formatBytes(session.downlinkBytes)}
                         </div>
-                        <div className="text-[11px] text-muted font-mono">
+                        <div className="font-mono text-[11px] text-dimmed">
                           {session.uplinkFrames.toLocaleString()} / {session.downlinkFrames.toLocaleString()} frames
                         </div>
                       </td>
@@ -329,8 +240,17 @@ export default function PacketsPage() {
               </tbody>
             </table>
           </div>
-        </Card>
-      )}
+        )}
+      </Card>
+    </div>
+  );
+}
+
+function Pill({ value, label, className }: { value: number; label: string; className?: string }) {
+  return (
+    <div className="flex items-baseline gap-2 rounded-xl border border-border bg-surface px-3 py-1.5">
+      <span className={`text-base font-semibold ${className ?? "text-primary"}`}>{value}</span>
+      <span className="text-xs text-muted">{label}</span>
     </div>
   );
 }

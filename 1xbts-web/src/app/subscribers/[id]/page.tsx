@@ -15,6 +15,8 @@ import { AuthenticationCard } from "@/components/authentication-card";
 import { SubscriberAccessCard } from "@/components/subscriber-access-card";
 import { ImsiGenerateButton } from "@/components/imsi-generate-button";
 import { validateRingtoneFile } from "@/lib/validation";
+import { apiFetch, fieldErrorsOf, readApiJson } from "@/lib/api-client";
+import { ErrorNotice, ResultNotice, type ActionResult } from "@/components/error-notice";
 import {
   NumberPlan,
   NumberType,
@@ -50,6 +52,15 @@ type FieldErrors = {
   imei?: string;
   callerNumber?: string;
   form?: string;
+};
+
+const SERVER_FIELDS: Record<string, keyof FieldErrors> = {
+  phone_number: "phoneNumber",
+  phoneNumber: "phoneNumber",
+  imsi: "imsi",
+  esn: "esn",
+  meid: "meid",
+  imei: "imei",
 };
 
 type UiSubscriber = Omit<Subscriber, "status"> & { status: string };
@@ -95,22 +106,23 @@ export default function SubscriberDetailPage({
   const router = useRouter();
   const [detail, setDetail] = useState<SubscriberDetail | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
-  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<unknown>(null);
+  const [saveError, setSaveError] = useState<unknown>(null);
   const deleteDialogRef = useRef<HTMLDialogElement>(null);
   const [saveResult, setSaveResult] = useState<string | null>(null);
   const [calling, setCalling] = useState(false);
   const [callAudioFile, setCallAudioFile] = useState("");
   const [callerNumber, setCallerNumber] = useState("");
-  const [callResult, setCallResult] = useState<string | null>(null);
+  const [callResult, setCallResult] = useState<ActionResult | null>(null);
   const [startingData, setStartingData] = useState(false);
-  const [dataResult, setDataResult] = useState<string | null>(null);
+  const [dataResult, setDataResult] = useState<ActionResult | null>(null);
   const [dataSo, setDataSo] = useState(33);
   const [ringtoneFile, setRingtoneFile] = useState<File | null>(null);
   const [ringtoneBusy, setRingtoneBusy] = useState(false);
-  const [ringtoneResult, setRingtoneResult] = useState<string | null>(null);
+  const [ringtoneResult, setRingtoneResult] = useState<ActionResult | null>(null);
 
   const primaryIdentity = useMemo(
     () =>
@@ -141,15 +153,15 @@ export default function SubscriberDetailPage({
 
   const fetchDetail = useCallback(async () => {
     try {
-      const res = await fetch(`/api/subscribers/${encodeURIComponent(id)}`);
-      const data: SubscriberDetail = await res.json();
-      if (!res.ok || data.error) {
-        throw new Error(data.error || `HTTP ${res.status}`);
-      }
+      const data = await apiFetch<SubscriberDetail>(
+        `/api/subscribers/${encodeURIComponent(id)}`,
+        undefined,
+        "load the subscriber",
+      );
       setDetail(data);
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "unknown error");
+      setError(err);
     } finally {
       setLoading(false);
     }
@@ -181,6 +193,7 @@ export default function SubscriberDetailPage({
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
     setSaveResult(null);
+    setSaveError(null);
     setSaving(true);
 
     try {
@@ -239,21 +252,21 @@ export default function SubscriberDetailPage({
       if (normalizedMeid) body.meid = normalizedMeid;
       if (normalizedImei) body.imei = normalizedImei;
 
-      const res = await fetch(`/api/subscribers/${encodeURIComponent(id)}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      const data = await res.json();
-      if (!res.ok || data.error) {
-        throw new Error(data.error || `HTTP ${res.status}`);
-      }
+      await apiFetch(
+        `/api/subscribers/${encodeURIComponent(id)}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        },
+        "save the subscriber",
+      );
+      setSaveError(null);
       setSaveResult("Saved");
       await fetchDetail();
     } catch (err) {
-      setFieldErrors({
-        form: err instanceof Error ? err.message : "unknown error",
-      });
+      setFieldErrors(fieldErrorsOf(err, SERVER_FIELDS));
+      setSaveError(err);
     } finally {
       setSaving(false);
     }
@@ -264,17 +277,14 @@ export default function SubscriberDetailPage({
     setDeleting(true);
     setDeleteError(null);
     try {
-      const res = await fetch(
+      await apiFetch(
         `/api/subscribers?id=${encodeURIComponent(detail.subscriber.subscriberId)}`,
-        { method: "DELETE" }
+        { method: "DELETE" },
+        "delete the subscriber",
       );
-      const data = await res.json();
-      if (!res.ok || data.error) {
-        throw new Error(data.error || `HTTP ${res.status}`);
-      }
       router.push("/subscribers");
     } catch (err) {
-      setDeleteError(err instanceof Error ? err.message : "unknown error");
+      setDeleteError(err);
       setDeleting(false);
     }
   };
@@ -298,22 +308,22 @@ export default function SubscriberDetailPage({
     });
     setCalling(true);
     try {
-      const res = await fetch("/api/calls", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          subscriberId: detail.subscriber.subscriberId,
-          audioFile: callAudioFile.trim() || undefined,
-          callerNumber: trimmedCaller || undefined,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok || !data.accepted) {
-        throw new Error(data.message || `HTTP ${res.status}`);
-      }
-      setCallResult(data.message || "Call requested");
+      await apiFetch(
+        "/api/calls",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            subscriberId: detail.subscriber.subscriberId,
+            audioFile: callAudioFile.trim() || undefined,
+            callerNumber: trimmedCaller || undefined,
+          }),
+        },
+        "place the call",
+      );
+      setCallResult({ ok: true, text: "Call requested. The handset is being paged." });
     } catch (err) {
-      setCallResult(err instanceof Error ? err.message : "unknown error");
+      setCallResult({ ok: false, error: err });
     } finally {
       setCalling(false);
     }
@@ -323,7 +333,7 @@ export default function SubscriberDetailPage({
     if (!ringtoneFile) return;
     const validation = validateRingtoneFile(ringtoneFile);
     if (!validation.ok) {
-      setRingtoneResult(validation.error);
+      setRingtoneResult({ ok: false, error: validation.error });
       return;
     }
     setRingtoneBusy(true);
@@ -331,21 +341,19 @@ export default function SubscriberDetailPage({
     try {
       const form = new FormData();
       form.append("file", ringtoneFile);
-      const res = await fetch(
+      const data = await apiFetch<{ codecs?: unknown[]; durationMs?: number }>(
         `/api/subscribers/${encodeURIComponent(id)}/ringtone`,
-        { method: "POST", body: form }
+        { method: "POST", body: form },
+        "upload the ringtone",
       );
-      const data = await res.json();
-      if (!res.ok || data.error) {
-        throw new Error(data.error || `HTTP ${res.status}`);
-      }
-      setRingtoneResult(
-        `Uploaded (${data.codecs?.length ?? 0} codecs, ${(data.durationMs ?? 0) / 1000}s)`
-      );
+      setRingtoneResult({
+        ok: true,
+        text: `Uploaded (${data.codecs?.length ?? 0} codecs, ${(data.durationMs ?? 0) / 1000}s)`,
+      });
       setRingtoneFile(null);
       await fetchDetail();
     } catch (err) {
-      setRingtoneResult(err instanceof Error ? err.message : "unknown error");
+      setRingtoneResult({ ok: false, error: err });
     } finally {
       setRingtoneBusy(false);
     }
@@ -355,18 +363,12 @@ export default function SubscriberDetailPage({
     setRingtoneBusy(true);
     setRingtoneResult(null);
     try {
-      const res = await fetch(
-        `/api/subscribers/${encodeURIComponent(id)}/ringtone`,
-        { method: "DELETE" }
-      );
-      if (!res.ok && res.status !== 204) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || `HTTP ${res.status}`);
-      }
-      setRingtoneResult("Removed");
+      const res = await fetch(`/api/subscribers/${encodeURIComponent(id)}/ringtone`, { method: "DELETE" });
+      if (res.status !== 204) await readApiJson(res, "remove the ringtone");
+      setRingtoneResult({ ok: true, text: "Removed" });
       await fetchDetail();
     } catch (err) {
-      setRingtoneResult(err instanceof Error ? err.message : "unknown error");
+      setRingtoneResult({ ok: false, error: err });
     } finally {
       setRingtoneBusy(false);
     }
@@ -377,42 +379,40 @@ export default function SubscriberDetailPage({
     setStartingData(true);
     setDataResult(null);
     try {
-      const res = await fetch("/api/data-call", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          subscriberId: detail.subscriber.subscriberId,
-          serviceOption: dataSo,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok || !data.accepted) {
-        throw new Error(data.message || `HTTP ${res.status}`);
-      }
-      setDataResult(data.message || "Data session requested");
+      await apiFetch(
+        "/api/data-call",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            subscriberId: detail.subscriber.subscriberId,
+            serviceOption: dataSo,
+          }),
+        },
+        "start the data call",
+      );
+      setDataResult({ ok: true, text: "Data session requested. The handset is being paged." });
     } catch (err) {
-      setDataResult(err instanceof Error ? err.message : "unknown error");
+      setDataResult({ ok: false, error: err });
     } finally {
       setStartingData(false);
     }
   };
 
   if (loading) {
-    return <div className="max-w-7xl mx-auto text-sm text-muted">Loading...</div>;
+    return <div className="page-container text-sm text-muted">Loading...</div>;
   }
 
   if (error || !detail?.subscriber) {
     return (
-      <div className="max-w-7xl mx-auto space-y-4">
+      <div className="page-container space-y-4">
         <Link
           href="/subscribers"
           className="text-sm text-muted hover:text-primary"
         >
           &larr; Subscribers
         </Link>
-        <div className="rounded-lg border border-accent-red/20 bg-accent-red-bg p-4 text-sm text-accent-red">
-          {error || "Subscriber not found"}
-        </div>
+        <ErrorNotice error={error ?? "This subscriber does not exist or was deleted."} boxed onRetry={fetchDetail} />
       </div>
     );
   }
@@ -421,7 +421,7 @@ export default function SubscriberDetailPage({
   const binding = detail.binding;
 
   return (
-    <div className="max-w-7xl mx-auto space-y-6">
+    <div className="page-container space-y-6">
       <div className="flex items-center justify-between gap-4">
         <div className="min-w-0">
           <Link
@@ -463,7 +463,7 @@ export default function SubscriberDetailPage({
         <p id="delete-subscriber-description" className="mt-2 text-sm text-muted">
           The subscriber and its configured identities will be permanently deleted. This cannot be undone.
         </p>
-        {deleteError && <p role="alert" className="mt-3 text-sm text-accent-red">{deleteError}</p>}
+        <ErrorNotice error={deleteError} className="mt-3" />
         <div className="mt-6 flex justify-end gap-3">
           <button
             type="button"
@@ -682,6 +682,7 @@ export default function SubscriberDetailPage({
           </div>
 
           {fieldErrors.form && <p className="text-xs text-accent-red">{fieldErrors.form}</p>}
+          <ErrorNotice error={saveError} className="text-xs" />
           {saveResult && <p className="text-xs text-accent-green">{saveResult}</p>}
 
           <button
@@ -863,17 +864,7 @@ export default function SubscriberDetailPage({
             Places a BS-originated voice call to this subscriber. The subscriber must
             have an active registration binding.
           </p>
-          {callResult && (
-            <p
-              className={`text-xs ${
-                callResult.toLowerCase().includes("accepted")
-                  ? "text-accent-green"
-                  : "text-accent-red"
-              }`}
-            >
-              {callResult}
-            </p>
-          )}
+          <ResultNotice result={callResult} />
         </div>
       </Card>
 
@@ -909,17 +900,7 @@ export default function SubscriberDetailPage({
             Pages the mobile and assigns a traffic channel with the selected packet data
             service option. RLP/PPP negotiation starts automatically on Service Connect.
           </p>
-          {dataResult && (
-            <p
-              className={`text-xs ${
-                dataResult.toLowerCase().includes("accepted")
-                  ? "text-accent-green"
-                  : "text-accent-red"
-              }`}
-            >
-              {dataResult}
-            </p>
-          )}
+          <ResultNotice result={dataResult} />
         </div>
         </Card>
       )}
@@ -979,20 +960,7 @@ export default function SubscriberDetailPage({
               </button>
             )}
           </div>
-          {ringtoneResult && (
-            <p
-              className={`text-xs ${
-                ringtoneResult.toLowerCase().includes("error") ||
-                ringtoneResult.toLowerCase().includes("fail") ||
-                ringtoneResult.toLowerCase().includes("must") ||
-                ringtoneResult.toLowerCase().includes("not")
-                  ? "text-accent-red"
-                  : "text-accent-green"
-              }`}
-            >
-              {ringtoneResult}
-            </p>
-          )}
+          <ResultNotice result={ringtoneResult} />
         </div>
       </Card>
 

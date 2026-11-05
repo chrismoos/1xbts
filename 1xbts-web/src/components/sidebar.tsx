@@ -17,7 +17,7 @@ const links = [
   { href: "/prls", label: "PRLs" },
   { href: "/smsc", label: "SMSC" },
   { href: "/packets", label: "Packets" },
-  { href: "/hrpd", label: "HRPD Sessions" },
+  { href: "/evdo", label: "EV-DO Sessions" },
 ];
 
 type Theme = "dark" | "light";

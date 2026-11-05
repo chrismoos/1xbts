@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { isApiErrorBody, type ApiErrorBody } from "./api-error-body";
 
 // One WebSocket per tab to the hub in server.mjs, with reference-counted topics.
 
@@ -12,7 +13,8 @@ const RECONNECT_MAX_MS = 10000;
 // server.mjs gain nothing on a fresh tab.
 const REPLAY_DEPTH_PER_EVENT = 1000;
 
-type ResourceListener = (value: { data?: unknown; error?: string }) => void;
+type ResourceValue = { data?: unknown; error?: string; errorBody?: ApiErrorBody };
+type ResourceListener = (value: ResourceValue) => void;
 type EventListener = (event: string, data: string) => void;
 type ConnectionListener = (connected: boolean) => void;
 type ReplayItem = [seq: number, event: string, data: string];
@@ -24,7 +26,7 @@ interface EventSubscription {
 
 interface ResourceState {
   listeners: Set<ResourceListener>;
-  last?: { data?: unknown; error?: string };
+  last?: ResourceValue;
 }
 
 class LiveSocket {
@@ -75,6 +77,7 @@ class LiveSocket {
       e?: string;
       c?: boolean;
       s?: number;
+      hs?: number;
       ep?: string;
       items?: ReplayItem[];
     };
@@ -86,15 +89,23 @@ class LiveSocket {
     if (msg.t === "res" && msg.k) {
       const state = this.resources.get(msg.k);
       if (!state) return;
-      let value: { data?: unknown; error?: string };
+      let value: ResourceValue;
       if (msg.err) {
-        value = { error: msg.err };
+        value = { error: "The web server could not load this data. Check that it is running." };
       } else {
         try {
           const data = JSON.parse(msg.d ?? "null");
-          value = data && typeof data === "object" && "error" in data && data.error ? { error: String(data.error) } : { data };
+          value = isApiErrorBody(data)
+            ? { error: data.error, errorBody: data }
+            : msg.hs
+              ? { error: `The web server returned HTTP ${msg.hs}.` }
+              : { data };
         } catch {
-          value = { error: "invalid response" };
+          value = {
+            error: msg.hs
+              ? `The web server returned HTTP ${msg.hs}.`
+              : "The web server sent a response that could not be read.",
+          };
         }
       }
       state.last = value;
@@ -203,25 +214,38 @@ export function liveSocket(): LiveSocket {
 export interface LiveResource<T> {
   data: T | undefined;
   error: string | null;
+  errorBody: ApiErrorBody | null;
   loading: boolean;
 }
 
 /** A null key subscribes to nothing. */
 export function useLive<T>(key: string | null): LiveResource<T> {
-  const [state, setState] = useState<{ key: string | null; data?: T; error: string | null }>({
+  const [state, setState] = useState<{
+    key: string | null;
+    data?: T;
+    error: string | null;
+    errorBody: ApiErrorBody | null;
+  }>({
     key,
     error: null,
+    errorBody: null,
   });
   useEffect(() => {
     if (!key) return;
     return liveSocket().subscribeResource(key, (value) =>
-      setState({ key, data: value.data as T | undefined, error: value.error ?? null }),
+      setState({
+        key,
+        data: value.data as T | undefined,
+        error: value.error ?? null,
+        errorBody: value.errorBody ?? null,
+      }),
     );
   }, [key]);
   const current = state.key === key;
   return {
     data: current ? state.data : undefined,
     error: current ? state.error : null,
+    errorBody: current ? state.errorBody : null,
     loading: key != null && (!current || (state.data === undefined && state.error == null)),
   };
 }

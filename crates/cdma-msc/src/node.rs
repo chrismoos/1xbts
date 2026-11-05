@@ -99,8 +99,11 @@ pub async fn run_node(
     );
 
     let mgmt_addr = overrides.mgmt_addr.unwrap_or(config.mgmt_grpc_addr);
-    let net_mgmt =
-        crate::mgmt_proxy::NetworkManagement::new(&config.base_stations, &config.packet_endpoint);
+    let net_mgmt = crate::mgmt_proxy::NetworkManagement::new(
+        &config.base_stations,
+        &config.packet_endpoint,
+        &config.pcf_endpoint,
+    );
     {
         let net_mgmt = net_mgmt.clone();
         let closed = config.access.closed();

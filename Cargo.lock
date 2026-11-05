@@ -940,6 +940,7 @@ dependencies = [
  "cdma-events",
  "cdma-hlr",
  "cdma-packet",
+ "cdma-rpc-error",
  "getrandom 0.2.17",
  "log",
  "num-bigint",
@@ -976,6 +977,7 @@ dependencies = [
  "cdma-packet",
  "cdma-pcf",
  "cdma-pdsn",
+ "cdma-rpc-error",
  "cdma-smsc",
  "cdma-voice",
  "chrono",
@@ -1020,6 +1022,7 @@ dependencies = [
  "cdma-hlr",
  "cdma-pcf",
  "cdma-pdsn",
+ "cdma-rpc-error",
  "cdma-voice",
  "chrono",
  "clap",
@@ -1123,6 +1126,7 @@ dependencies = [
  "cdma-cwmp",
  "cdma-events",
  "cdma-ios",
+ "cdma-rpc-error",
  "cdma-sip",
  "chrono",
  "env_logger",
@@ -1150,6 +1154,7 @@ dependencies = [
  "cdma-cave",
  "cdma-common",
  "cdma-otasp",
+ "cdma-rpc-error",
  "cdma-voice",
  "chrono",
  "clap",
@@ -1258,6 +1263,7 @@ dependencies = [
  "cdma-hlr",
  "cdma-ios",
  "cdma-otasp",
+ "cdma-rpc-error",
  "cdma-smsc",
  "cdma-voice",
  "chrono",
@@ -1308,6 +1314,7 @@ version = "0.1.0"
 dependencies = [
  "cdma-common",
  "cdma-modem",
+ "cdma-rpc-error",
  "libc",
  "log",
  "md-5",
@@ -1331,9 +1338,13 @@ dependencies = [
  "cdma-common",
  "clap",
  "log",
+ "prost",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
  "tracing-subscriber",
 ]
 
@@ -1363,6 +1374,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cdma-rpc-error"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "tonic",
+ "tonic-build",
+ "tonic-types",
+]
+
+[[package]]
 name = "cdma-sip"
 version = "0.1.0"
 dependencies = [
@@ -1380,6 +1401,7 @@ dependencies = [
  "cdma-hlr",
  "cdma-interconnect",
  "cdma-interconnect-smpp",
+ "cdma-rpc-error",
  "chrono",
  "clap",
  "futures-core",
@@ -1838,6 +1860,18 @@ checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
  "typenum",
+]
+
+[[package]]
+name = "csim"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "pcsc",
+ "serde",
+ "serde_yaml",
+ "sha1",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4432,6 +4466,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "pcsc"
+version = "2.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dd833ecf8967e65934c49d3521a175929839bf6d0e497f3bd0d3a2ca08943da"
+dependencies = [
+ "bitflags 2.13.2",
+ "pcsc-sys",
+]
+
+[[package]]
+name = "pcsc-sys"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e14ef017e15d2e5592a9e39a346c1dbaea5120bab7ed7106b210ef58ebd97003"
+dependencies = [
+ "pkg-config",
+]
+
+[[package]]
 name = "pem-rfc7468"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6545,6 +6598,17 @@ dependencies = [
  "prost-types",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "tonic-types"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07439468da24d5f211d3f3bd7b63665d8f45072804457e838a87414a478e2db8"
+dependencies = [
+ "prost",
+ "prost-types",
+ "tonic",
 ]
 
 [[package]]

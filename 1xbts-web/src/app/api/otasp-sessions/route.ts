@@ -1,5 +1,6 @@
 import { getHlrClient, waitForHlrReady } from "@/lib/grpc/hlr-client";
 import { ListOtaspSessionsResponse } from "@/lib/proto/hlr/v1/service";
+import { apiError } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -37,8 +38,7 @@ export async function GET(request: Request) {
       total: json.total ?? 0,
     });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    return Response.json({ error: msg }, { status: 502 });
+    return apiError(err, "load OTASP sessions");
   } finally {
     clearTimeout(timeout);
   }

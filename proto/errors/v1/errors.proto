@@ -1,0 +1,121 @@
+syntax = "proto3";
+
+package errors.v1;
+
+// Why an RPC failed. A service puts the value's name in the `reason` of a
+// google.rpc.ErrorInfo detail and the service name in its `domain`. Metadata
+// keys are listed per value.
+enum ErrorReason {
+  ERROR_REASON_UNSPECIFIED = 0;
+
+  // A request field is invalid. A google.rpc.BadRequest detail names each field.
+  ERROR_REASON_INVALID_ARGUMENT = 1;
+  ERROR_REASON_INTERNAL = 2;
+  // The service could not read or write its database.
+  ERROR_REASON_DATABASE_UNAVAILABLE = 3;
+  // The service is shutting down or restarting.
+  ERROR_REASON_SERVICE_STOPPING = 4;
+  // The feature is not set up on this deployment. Metadata: feature.
+  ERROR_REASON_NOT_CONFIGURED = 5;
+  // Metadata: operation.
+  ERROR_REASON_NOT_SUPPORTED = 6;
+  ERROR_REASON_TIMEOUT = 7;
+
+  // Metadata: base_station.
+  ERROR_REASON_BASE_STATION_NOT_FOUND = 20;
+  // More than one base station is configured, so the request must name one.
+  ERROR_REASON_BASE_STATION_REQUIRED = 21;
+  // Metadata: base_station.
+  ERROR_REASON_BASE_STATION_UNREACHABLE = 22;
+  // The subscriber's serving base station is not connected to the MSC.
+  // Metadata: base_station.
+  ERROR_REASON_BASE_STATION_NOT_ATTACHED = 23;
+  // Metadata: cell.
+  ERROR_REASON_CELL_NOT_FOUND = 24;
+  // More than one cell is enrolled, so the request must name one.
+  ERROR_REASON_CELL_REQUIRED = 25;
+  ERROR_REASON_NO_CELL_ENROLLED = 26;
+  // The cell is enrolled but its BTS cannot be reached. Metadata: cell.
+  ERROR_REASON_CELL_UNREACHABLE = 27;
+  ERROR_REASON_EVDO_NOT_ENABLED = 28;
+  // The A1 link between the MSC and the BSC is down.
+  ERROR_REASON_BSC_UNAVAILABLE = 29;
+  // A service behind the one called cannot be reached. Metadata: service.
+  ERROR_REASON_SERVICE_UNREACHABLE = 30;
+
+  // Metadata: subscriber_id.
+  ERROR_REASON_SUBSCRIBER_NOT_FOUND = 40;
+  ERROR_REASON_IDENTITY_NOT_FOUND = 41;
+  // Another subscriber or identity holds this value. Metadata: identity (ESN,
+  // MEID or IMEI), value.
+  ERROR_REASON_IDENTITY_IN_USE = 42;
+  // More than one subscriber matches the identity.
+  ERROR_REASON_IDENTITY_AMBIGUOUS = 43;
+  // The subscriber has no identity that matches the request.
+  ERROR_REASON_IDENTITY_NOT_PROVISIONED = 44;
+  ERROR_REASON_SUBSCRIBER_INACTIVE = 45;
+  ERROR_REASON_SUBSCRIBER_NOT_REGISTERED = 46;
+  // Metadata: state.
+  ERROR_REASON_SUBSCRIBER_NOT_PAGEABLE = 47;
+  // The subscriber already has an active call.
+  ERROR_REASON_SUBSCRIBER_BUSY = 48;
+  ERROR_REASON_SUBSCRIBER_HAS_NO_IMSI = 49;
+  ERROR_REASON_A_KEY_MISSING = 50;
+  ERROR_REASON_KEY_EXCHANGE_NOT_STARTED = 51;
+  ERROR_REASON_RINGTONE_NOT_FOUND = 52;
+  // The MSC could not reach the HLR.
+  ERROR_REASON_HLR_UNAVAILABLE = 53;
+
+  ERROR_REASON_PRL_NOT_FOUND = 60;
+  // Metadata: subscriber_count, sample_subscriber_id.
+  ERROR_REASON_PRL_IN_USE = 61;
+  // Metadata: kind.
+  ERROR_REASON_PRL_INVALID = 62;
+
+  // Metadata: call_id.
+  ERROR_REASON_CALL_NOT_FOUND = 70;
+  ERROR_REASON_CALL_REJECTED = 71;
+  // Metadata: service_option.
+  ERROR_REASON_UNSUPPORTED_SERVICE_OPTION = 72;
+  ERROR_REASON_OTASP_DISABLED = 73;
+  ERROR_REASON_OTASP_SESSION_NOT_FOUND = 74;
+  ERROR_REASON_OTASP_REJECTED = 75;
+  ERROR_REASON_PAGE_FAILED = 76;
+  // Metadata: walsh_code.
+  ERROR_REASON_TRAFFIC_CHANNEL_NOT_FOUND = 77;
+
+  // Metadata: sms_id.
+  ERROR_REASON_SMS_NOT_FOUND = 80;
+  // The SMSC refused the message.
+  ERROR_REASON_SMS_REJECTED = 81;
+  // Closed access refuses a destination that is not provisioned.
+  ERROR_REASON_ACCESS_CLOSED = 82;
+
+  // Metadata: session_id.
+  ERROR_REASON_PACKET_SESSION_NOT_FOUND = 90;
+  // Metadata: session_id.
+  ERROR_REASON_PACKET_SESSION_EXISTS = 91;
+  ERROR_REASON_PACKET_SESSION_WRONG_BEARER = 92;
+  ERROR_REASON_CAPTURE_FAILED = 93;
+  // The supplemental channel could not be turned on or off.
+  ERROR_REASON_SCH_CONTROL_FAILED = 94;
+
+  // Metadata: uati.
+  ERROR_REASON_EVDO_SESSION_NOT_FOUND = 100;
+  // Metadata: color_code.
+  ERROR_REASON_UATI_POOL_NOT_FOUND = 101;
+  ERROR_REASON_EVDO_REQUEST_REJECTED = 102;
+
+  // Metadata: femtocell.
+  ERROR_REASON_FEMTOCELL_NOT_FOUND = 110;
+  ERROR_REASON_FEMTOCELL_REQUIRED = 111;
+  ERROR_REASON_FEMTOCELL_NO_MANAGEMENT_PATH = 112;
+  ERROR_REASON_FEMTOCELL_UNREACHABLE = 113;
+  ERROR_REASON_FEMTOCELL_AUTH_FAILED = 114;
+  ERROR_REASON_FEMTOCELL_STATUS_UNAVAILABLE = 115;
+  ERROR_REASON_CONFIG_RELOAD_FAILED = 116;
+
+  ERROR_REASON_IQ_CAPTURE_FAILED = 120;
+  // Metadata: walsh_code.
+  ERROR_REASON_POWER_CONTROL_NOT_FOUND = 121;
+}

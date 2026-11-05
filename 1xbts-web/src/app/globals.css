@@ -278,3 +278,51 @@ body::after {
     border-color: var(--accent-indigo);
   }
 }
+
+@layer components {
+  .page-container {
+    margin-inline: auto;
+    width: 100%;
+    max-width: 80rem;
+  }
+
+  @media (min-width: 96rem) {
+    .page-container {
+      max-width: 96rem;
+    }
+  }
+}
+
+@layer components {
+  /* The one table style. Cell utilities such as text-right or font-mono
+     still apply on top, because utilities sit above this layer. */
+  .data-table {
+    width: 100%;
+    font-size: 0.75rem;
+    line-height: 1rem;
+  }
+
+  .data-table > thead > tr > th {
+    padding: 0.25rem 0.75rem 0.375rem 0;
+    text-align: left;
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+
+  .data-table > tbody > tr > td {
+    padding: 0.5rem 0.75rem 0.5rem 0;
+    border-top: 1px solid var(--border-primary);
+    vertical-align: top;
+  }
+
+  .data-table > thead > tr > th:last-child,
+  .data-table > tbody > tr > td:last-child {
+    padding-right: 0;
+  }
+
+  .data-table > tbody > tr:hover {
+    background: var(--bg-hover);
+  }
+}

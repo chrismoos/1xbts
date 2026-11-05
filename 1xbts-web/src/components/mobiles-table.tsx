@@ -10,6 +10,9 @@ import { type AdmissionVerdict, accessClass, reasonLabel } from "@/lib/admission
 import { RxPowerCell, SignalCell } from "@/components/signal-quality";
 import type { AccessSignal } from "@/lib/proto/bsc/v1/service";
 import type { CellEntry } from "@/lib/use-bts-list";
+import { evdoLinkState, type EvdoSummary } from "@/lib/evdo";
+
+const EVDO_LINK_LABEL = { connected: "connected", dormant: "dormant", idle: "idle" } as const;
 
 export interface MobileInfo {
   address: string;
@@ -38,6 +41,7 @@ export interface MobileInfo {
     reverseRadioConfig: number;
   };
   servingCell?: { cell: number; sector: number };
+  evdo?: EvdoSummary;
 }
 
 function formatMobileLabel(ms: MobileInfo): string {
@@ -56,37 +60,39 @@ export function MobilesTable({
   mobiles,
   cells,
   closed,
+  hideCell = false,
 }: {
   mobiles: MobileInfo[];
   cells: CellEntry[];
   closed: boolean;
+  hideCell?: boolean;
 }) {
   return (
     <div className="overflow-x-auto">
-      <table className="w-full text-sm">
+      <table className="data-table">
         <thead>
-          <tr className="text-muted text-xs">
-            <th className="text-left py-1">Address</th>
-            <th className="text-left py-1">Subscriber</th>
-            <th className="text-left py-1">State</th>
-            {closed && <th className="text-left py-1">Access</th>}
-            <th className="text-left py-1">Cell</th>
-            <th className="text-left py-1">Traffic</th>
-            <th className="text-left py-1">Signal</th>
-            <th className="text-left py-1 pl-4">RX Power</th>
-            <th className="text-left py-1 pl-4">Last Heard</th>
-            <th className="text-left py-1">SCI</th>
-            <th className="text-left py-1"></th>
+          <tr>
+            <th>Address</th>
+            <th>Subscriber</th>
+            <th>State</th>
+            {closed && <th>Access</th>}
+            {!hideCell && <th>Cell</th>}
+            <th>Traffic</th>
+            <th>Signal</th>
+            <th>RX Power</th>
+            <th>Last Heard</th>
+            <th>SCI</th>
+            <th></th>
           </tr>
         </thead>
         <tbody>
           {mobiles.map((ms, i) => {
             const id = encodeURIComponent(ms.address);
-            const isHrpd = ms.state.startsWith("HRPD");
+            const isHrpd = ms.state.startsWith("EV-DO");
             const servingPeerId = peerIdForCell(cells, ms.servingCell);
             return (
-              <tr key={i} className="border-t border-border hover:bg-hover">
-                <td className="py-2 text-secondary font-mono text-xs">
+              <tr key={i}>
+                <td className="text-secondary font-mono">
                   <Link href={`/mobiles/${id}`} className="hover:text-accent-green hover:underline">
                     {formatMobileLabel(ms)}
                   </Link>
@@ -104,7 +110,7 @@ export function MobilesTable({
                     )}
                   </div>
                 </td>
-                <td className="py-2 text-xs">
+                <td>
                   {ms.subscriberId ? (
                     <div>
                       <Link
@@ -126,7 +132,7 @@ export function MobilesTable({
                     <span className="text-dimmed">-</span>
                   )}
                 </td>
-                <td className="py-2">
+                <td>
                   <span
                     className={`text-xs px-2 py-0.5 rounded ${
                       ms.state === "RegistrationRejected"
@@ -150,9 +156,21 @@ export function MobilesTable({
                             ? "Traffic active"
                             : ms.state}
                   </span>
+                  {ms.evdo && !isHrpd && (
+                    <div className="mt-1">
+                      <span className="text-[11px] px-1.5 py-0.5 rounded bg-accent-purple-bg text-accent-purple">
+                        EV-DO {EVDO_LINK_LABEL[evdoLinkState(ms.evdo.connected, ms.evdo.packetPhase)]}
+                      </span>
+                    </div>
+                  )}
+                  {ms.evdo?.verdict === "refused" && (
+                    <div className="mt-0.5 text-[11px] text-accent-red">
+                      EV-DO refused{ms.evdo.refusedReason ? ` · ${reasonLabel(ms.evdo.refusedReason)}` : ""}
+                    </div>
+                  )}
                 </td>
                 {closed && (
-                  <td className="py-2">
+                  <td>
                     {(() => {
                       const verdict = ms.admission;
                       const kind = accessClass(verdict?.admissionClass);
@@ -173,19 +191,21 @@ export function MobilesTable({
                     })()}
                   </td>
                 )}
-                <td className="py-2 font-mono text-xs">
-                  {servingPeerId ? (
-                    <Link
-                      href={`/bts/${encodeURIComponent(servingPeerId)}`}
-                      className="text-secondary hover:text-accent-green transition-colors"
-                    >
-                      {cellLabel(ms.servingCell)}
-                    </Link>
-                  ) : (
-                    <span className="text-dimmed">-</span>
-                  )}
-                </td>
-                <td className="py-2 font-mono text-xs text-secondary">
+                {!hideCell && (
+                  <td className="font-mono">
+                    {servingPeerId ? (
+                      <Link
+                        href={`/bts/${encodeURIComponent(servingPeerId)}`}
+                        className="text-secondary hover:text-accent-green transition-colors"
+                      >
+                        {cellLabel(ms.servingCell)}
+                      </Link>
+                    ) : (
+                      <span className="text-dimmed">-</span>
+                    )}
+                  </td>
+                )}
+                <td className="font-mono text-secondary">
                   {ms.trafficWalshCode != null ? (
                     <span>
                       {isHrpd ? `A10 ${ms.trafficWalshCode}` : `W${ms.trafficWalshCode}`}
@@ -208,17 +228,17 @@ export function MobilesTable({
                     </span>
                   ) : "-"}
                 </td>
-                <td className="py-2">
+                <td>
                   <SignalCell signal={ms.accessSignal} />
                 </td>
-                <td className="py-2 pl-4">
+                <td>
                   <RxPowerCell signal={ms.accessSignal} />
                 </td>
-                <td className="py-2 pl-4 text-muted font-mono text-xs">
+                <td className="text-muted font-mono">
                   {ms.lastHeardMs ? formatTime(ms.lastHeardMs) : "-"}
                 </td>
-                <td className="py-2 text-muted text-xs">{ms.slotCycleIndex}</td>
-                <td className="py-2 text-right">
+                <td className="text-muted">{ms.slotCycleIndex}</td>
+                <td className="text-right">
                   <Link
                     href={`/mobiles/${id}`}
                     className="text-xs text-accent-green hover:text-accent-green transition-colors"

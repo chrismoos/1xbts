@@ -31,7 +31,18 @@ import {
 } from "@/lib/event-fingerprint";
 import { liveSocket, useLive } from "@/lib/live";
 import { useEventStream, type EventStreamOptions } from "@/lib/use-event-stream";
-import { hrpdTimestampNsToUs } from "@/lib/hrpd-correlation";
+import {
+  hrpdRelatedUatis,
+  hrpdTimestampNsToMs,
+  hrpdTimestampNsToUs,
+  isHrpdTelemetryTrafficEvent,
+  uatiHex,
+  uatiHexDigits,
+} from "@/lib/hrpd-correlation";
+import { drcRateLabel, evdoHardwareId, evdoLinkState, formatAge, type EvdoSummary } from "@/lib/evdo";
+import { EvdoChip, EvdoLinkChip, EvdoVerdictChip } from "@/components/evdo";
+import { HrpdAdmissionCard } from "@/components/hrpd-admission";
+import { GetSessionResponse, type Session as EvdoSession } from "@/lib/proto/an/v1/service";
 import { type LogEntry, makeLogEntryId, makeSortKey, sortLogEntries, formatTime } from "@/lib/message-log";
 import { a1TimestampUs, type A1LogEvent } from "@/lib/a1-event";
 import { cellLabel, cellToken, peerIdForCell } from "@/lib/cell";
@@ -57,6 +68,8 @@ import {
 } from "@/components/signal-quality";
 import { CALL_KIND_BADGE, CALL_KIND_LABEL, callKind, callStateLabel } from "@/lib/call-kind";
 import { measuredReverseDb, recentMedianDb, reverseMetricLabel, reverseQualityBars } from "@/lib/reverse-quality";
+import { apiFetch } from "@/lib/api-client";
+import { ErrorNotice, ResultNotice, type ActionResult } from "@/components/error-notice";
 
 interface MobileInfo {
   address: string;
@@ -107,12 +120,8 @@ interface MobileInfo {
   trafficServiceOption?: number;
   voiceCallState?: string;
   voicePrivacy?: string;
+  evdo?: EvdoSummary;
   servingCell?: { cell: number; sector: number };
-}
-
-interface SmsResult {
-  accepted: boolean;
-  message: string;
 }
 
 interface UpsertSubscriberResponse {
@@ -140,6 +149,7 @@ interface PacketSessionInfo {
   subscriberImsi: string;
   esn: number;
   trafficWalshCode: number;
+  pcfSessionId?: number;
   captureEnabled: boolean;
   accessTechnology: string;
 }
@@ -156,7 +166,17 @@ const MESSAGE_PAGE_SIZES = [25, 50, 100] as const;
 // C.S0005: a slot cycle is 16 x 2^SLOT_CYCLE_INDEX slots of 80 ms.
 const SLOT_CYCLE_BASE_SECONDS = 1.28;
 
-type MobileTab = "overview" | "call" | "messages" | "sms" | "otasp" | "activity" | "data";
+type MobileTab = "overview" | "call" | "evdo" | "messages" | "sms" | "otasp" | "activity" | "data";
+
+const UATI_24_MASK = 0x00ff_ffff;
+const SNR_DB_PER_TENTH = 10;
+const MAX_EVDO_SAMPLES = 120;
+
+interface EvdoSample {
+  ts: number;
+  drc: number;
+  snrDb: number;
+}
 const RECENT_MESSAGE_ROWS = 7;
 
 function countActivePcgs(pcgSnrDb: number[], activePcgMask?: boolean[]): number {
@@ -329,6 +349,17 @@ function hrpdMatchesMobile(
   if (mobile.imsi && enriched.identity?.imsi === mobile.imsi) return true;
   if (mobile.esn != null && enriched.identity?.esn === mobile.esn) return true;
   if (mobile.meid && enriched.identity?.meid?.toLowerCase() === mobile.meid.toLowerCase()) return true;
+  // An event the event bus has not linked to an identity yet, such as one sent
+  // before the Hardware ID arrives, still names the session's UATI.
+  if (mobile.evdo) {
+    const sessionUatis = hrpdRelatedUatis({ uati: mobile.evdo.uati, colorCode: mobile.evdo.colorCode }).map(
+      (uati) => uati & UATI_24_MASK,
+    );
+    const eventUatis = [event.uati, "receiveAti" in event ? event.receiveAti : 0, event.fullUati?.compactUati32 ?? 0]
+      .filter((uati) => uati)
+      .map((uati) => uati & UATI_24_MASK);
+    if (eventUatis.some((uati) => sessionUatis.includes(uati))) return true;
+  }
   return false;
 }
 
@@ -367,6 +398,13 @@ export default function MobileDetailPage({
   const { cells } = useBtsList();
   const [messages, setMessages] = useState<LogEntry[]>([]);
   const replayEvents: EventStreamOptions = { replay: true, enabled: mobile != null };
+  const [evdoSamples, setEvdoSamples] = useState<EvdoSample[]>([]);
+  const liveEvdoSession = useLive<unknown>(mobile?.evdo ? `/api/an-sessions/${uatiHexDigits(mobile.evdo.uati)}` : null);
+  const evdoSession: EvdoSession | null = useMemo(() => {
+    const raw = liveEvdoSession.data as { session?: unknown; error?: string } | undefined;
+    if (!raw || raw.error) return null;
+    return GetSessionResponse.fromJSON(raw).session ?? null;
+  }, [liveEvdoSession.data]);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const packetSessions = livePackets.data?.sessions ?? NO_PACKET_SESSIONS;
   const [subscriberName, setSubscriberName] = useState("");
@@ -386,17 +424,17 @@ export default function MobileDetailPage({
   const [smsRefresh, setSmsRefresh] = useState(0);
   const [toast, showToast] = useToast();
   const [callPending, setCallPending] = useState(false);
-  const [callResult, setCallResult] = useState<SmsResult | null>(null);
+  const [callResult, setCallResult] = useState<ActionResult | null>(null);
 
   // SMS form
   const [showCreateSubscriber, setShowCreateSubscriber] = useState(false);
   const [createPhoneNumber, setCreatePhoneNumber] = useState("");
   const [createDisplayName, setCreateDisplayName] = useState("");
-  const [createError, setCreateError] = useState<string | null>(null);
+  const [createError, setCreateError] = useState<unknown>(null);
   const [creatingSubscriber, setCreatingSubscriber] = useState(false);
   const [powerDraft, setPowerDraft] = useState("");
   const [powerOverridePending, setPowerOverridePending] = useState(false);
-  const [powerOverrideError, setPowerOverrideError] = useState<string | null>(null);
+  const [powerOverrideError, setPowerOverrideError] = useState<unknown>(null);
   const [, setChartTick] = useState(0);
   const powerHistoryRef = useRef<{
     timestamps: number[];
@@ -638,6 +676,15 @@ export default function MobileDetailPage({
     if (!mobile) return;
     const event: HrpdTrafficEvent = JSON.parse(data);
     if (!hrpdMatchesMobile(event, mobile)) return;
+    if (isHrpdTelemetryTrafficEvent(event)) {
+      const sample = {
+        ts: hrpdTimestampNsToMs(event.timestampNs) ?? Date.now(),
+        drc: event.drcValue,
+        snrDb: event.reversePilotSnrDbTenths / SNR_DB_PER_TENTH,
+      };
+      setEvdoSamples((prev) => [...prev, sample].slice(-MAX_EVDO_SAMPLES));
+      return;
+    }
     const ts = hrpdTimestampUs(event);
     const sequence = (event as HrpdTrafficEvent & { sequence?: string | number }).sequence ?? ts;
     addMessage({
@@ -695,22 +742,22 @@ export default function MobileDetailPage({
     setCreatingSubscriber(true);
     setCreateError(null);
     try {
-      const res = await fetch("/api/subscribers", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          phoneNumber,
-          displayName: displayName || defaultSubscriberName(mobile),
-          status: "active",
-          esn: mobile.esn,
-          imsi: mobile.imsi,
-          meid: mobile.meid,
-        }),
-      });
-      const data: UpsertSubscriberResponse = await res.json();
-      if (!res.ok || data.error) {
-        throw new Error(data.error || `HTTP ${res.status}`);
-      }
+      const data = await apiFetch<UpsertSubscriberResponse>(
+        "/api/subscribers",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            phoneNumber,
+            displayName: displayName || defaultSubscriberName(mobile),
+            status: "active",
+            esn: mobile.esn,
+            imsi: mobile.imsi,
+            meid: mobile.meid,
+          }),
+        },
+        "create the subscriber",
+      );
       if (data.subscriber?.subscriberId) {
         router.push(`/subscribers/${encodeURIComponent(data.subscriber.subscriberId)}`);
         return;
@@ -718,7 +765,7 @@ export default function MobileDetailPage({
       refreshMobile();
       setShowCreateSubscriber(false);
     } catch (err) {
-      setCreateError(err instanceof Error ? err.message : "unknown error");
+      setCreateError(err);
     } finally {
       setCreatingSubscriber(false);
     }
@@ -733,18 +780,25 @@ export default function MobileDetailPage({
     setPowerOverridePending(true);
     setPowerOverrideError(null);
     try {
-      const res = await fetch("/api/channels/power-override", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          walshCode: mobile.trafficWalshCode,
-          ...(cell ? { cell } : {}),
-          ...payload,
-        }),
-      });
-      const json = await res.json();
-      if (!res.ok || !json.accepted) {
-        throw new Error(json.message || `HTTP ${res.status}`);
+      const json = await apiFetch<{
+        accepted?: boolean;
+        message?: string;
+        trafficPower?: { effectiveTargetEbNtDb?: number };
+      }>(
+        "/api/channels/power-override",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            walshCode: mobile.trafficWalshCode,
+            ...(cell ? { cell } : {}),
+            ...payload,
+          }),
+        },
+        "change the reverse target",
+      );
+      if (!json.accepted) {
+        throw new Error(json.message || "The BSC did not apply the change.");
       }
       if (json.trafficPower?.effectiveTargetEbNtDb != null) {
         setPowerDraft(json.trafficPower.effectiveTargetEbNtDb.toFixed(1));
@@ -753,7 +807,7 @@ export default function MobileDetailPage({
       }
       refreshMobile();
     } catch (err) {
-      setPowerOverrideError(err instanceof Error ? err.message : "unknown error");
+      setPowerOverrideError(err);
     } finally {
       setPowerOverridePending(false);
     }
@@ -817,18 +871,18 @@ export default function MobileDetailPage({
     setCallPending(true);
     setCallResult(null);
     try {
-      const res = await fetch("/api/calls", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ subscriberId: mobile.subscriberId }),
-      });
-      const data = await res.json();
-      setCallResult({
-        accepted: Boolean(data.accepted),
-        message: data.message || (data.accepted ? "Calling" : `HTTP ${res.status}`),
-      });
+      await apiFetch(
+        "/api/calls",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ subscriberId: mobile.subscriberId }),
+        },
+        "place the call",
+      );
+      setCallResult({ ok: true, text: "Calling. The handset is being paged." });
     } catch (err) {
-      setCallResult({ accepted: false, message: err instanceof Error ? err.message : "unknown error" });
+      setCallResult({ ok: false, error: err });
     } finally {
       setCallPending(false);
     }
@@ -843,7 +897,7 @@ export default function MobileDetailPage({
 
   if (loading) {
     return (
-      <div className="max-w-7xl mx-auto">
+      <div className="page-container">
         <p className="text-dimmed text-sm">Loading...</p>
       </div>
     );
@@ -851,7 +905,7 @@ export default function MobileDetailPage({
 
   if (!mobile) {
     return (
-      <div className="max-w-7xl mx-auto space-y-4">
+      <div className="page-container space-y-4">
         <Link
           href="/mobiles"
           className="text-sm text-muted hover:text-secondary"
@@ -925,6 +979,7 @@ export default function MobileDetailPage({
 
   const mobilePacketSessions = packetSessions.filter((session) => {
     if (session.phase === "closed") return false;
+    if (mobile.evdo?.packetSessionId === session.sessionId) return true;
     if (mobile.subscriberId && session.subscriberId === mobile.subscriberId) return true;
     if (mobile.imsi && (session.subscriberImsi === mobile.imsi || session.imsi === mobile.imsi)) {
       return true;
@@ -945,7 +1000,24 @@ export default function MobileDetailPage({
     ? subscriberTitle(mobile.subscriberId, subscriberName)
     : formatMobileTitle(mobile);
   const onCall = mobile.trafficWalshCode != null;
-  const activeTab: MobileTab = tab === "call" && !onCall ? "overview" : tab;
+  const evdo = mobile.evdo;
+  const evdoLink = evdo ? evdoLinkState(evdo.connected, evdo.packetPhase) : undefined;
+  const evdoPacket = evdo?.packetSessionId
+    ? packetSessions.find((session) => session.sessionId === evdo.packetSessionId)
+    : undefined;
+  const evdoSnrDb = evdo?.connected ? evdoSamples.at(-1)?.snrDb : undefined;
+  // The PDSN does not record which air interface an A11 session serves, so the
+  // EV-DO link decides it.
+  const isEvdoPacket = (session: PacketSessionInfo) =>
+    session.accessTechnology === "HRPD" || session.sessionId === evdo?.packetSessionId;
+  const packetChannel = (session: PacketSessionInfo) =>
+    isEvdoPacket(session)
+      ? `A10 key ${session.pcfSessionId ?? session.trafficWalshCode}`
+      : session.trafficWalshCode
+        ? `W${session.trafficWalshCode}`
+        : "-";
+  const activeTab: MobileTab =
+    (tab === "call" && !onCall) || (tab === "evdo" && !evdo) ? "overview" : tab;
   const deviceEsn = mobile.esn ?? primarySubscriberIdentity?.esn;
   const manufacturer = deviceEsn != null ? (esnManufacturer(deviceEsn) ?? null) : null;
   const provisioned = Boolean(mobile.subscriberId);
@@ -998,6 +1070,7 @@ export default function MobileDetailPage({
   const tabs: { id: MobileTab; label: string; badge?: string }[] = [
     { id: "overview", label: "Overview" },
     ...(onCall ? [{ id: "call" as const, label: "Call", badge: "live" }] : []),
+    ...(evdo ? [{ id: "evdo" as const, label: "EV-DO", badge: evdo.connected ? "live" : undefined }] : []),
     { id: "messages", label: "Messages", badge: String(messages.length) },
     { id: "sms", label: "SMS" },
     { id: "otasp", label: "OTASP" },
@@ -1034,7 +1107,7 @@ export default function MobileDetailPage({
       : "text-primary";
 
   return (
-    <div className="max-w-7xl mx-auto">
+    <div className="page-container">
       <Link href="/mobiles" className="text-sm text-muted hover:text-secondary">
         &larr; Mobiles
       </Link>
@@ -1055,6 +1128,14 @@ export default function MobileDetailPage({
             >
               {mobile.state}
             </span>
+            {evdo && evdoLink && (
+              <button type="button" onClick={() => setTab("evdo")} title="EV-DO session">
+                <EvdoChip
+                  label={`EV-DO · ${evdoLink === "connected" ? "Connected" : evdoLink === "dormant" ? "Dormant" : "Idle"}`}
+                  className="text-accent-purple bg-accent-purple-bg"
+                />
+              </button>
+            )}
             {mobile.voiceCallState && (
               <span className="inline-flex items-center gap-1.5 text-xs px-2 py-0.5 rounded bg-surface-raised text-secondary">
                 {callStateLabel(mobile.voiceCallState)}
@@ -1120,11 +1201,7 @@ export default function MobileDetailPage({
           )}
         </div>
       </div>
-      {callResult && (
-        <p className={`mt-2 text-xs ${callResult.accepted ? "text-accent-green" : "text-accent-red"}`}>
-          {callResult.message}
-        </p>
-      )}
+      <ResultNotice result={callResult} className="mt-2" />
 
       <div className="mt-4 mb-4 flex gap-1 overflow-x-auto border-b border-border">
         {tabs.map((t) => (
@@ -1142,7 +1219,7 @@ export default function MobileDetailPage({
             {t.badge && (
               <span
                 className={`ml-1.5 rounded-full bg-surface-raised px-1.5 py-px text-[10px] ${
-                  t.id === "call" ? "text-accent-green" : "text-muted"
+                  t.id === "call" || t.id === "evdo" ? "text-accent-green" : "text-muted"
                 }`}
               >
                 {t.badge}
@@ -1151,6 +1228,98 @@ export default function MobileDetailPage({
           </button>
         ))}
       </div>
+
+      {activeTab === "evdo" && evdo && evdoLink && (
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+          <div className="space-y-4 lg:col-span-2">
+            <Card
+              title="Current session"
+              action={
+                <Link href={`/evdo/${uatiHexDigits(evdo.uati)}`} className="text-xs text-accent-blue hover:underline">
+                  Open session {uatiHex(evdo.uati)} →
+                </Link>
+              }
+            >
+              <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+                <div>
+                  <div className="text-xs text-muted">State</div>
+                  <EvdoLinkChip state={evdoLink} />
+                </div>
+                <div>
+                  <div className="text-xs text-muted">Forward rate</div>
+                  <div className="font-mono text-primary">{evdo.connected ? (drcRateLabel(evdo.drcIndex) ?? "—") : "—"}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-muted">Reverse pilot SNR</div>
+                  <div className="font-mono text-primary">{evdoSnrDb != null ? `${evdoSnrDb.toFixed(1)} dB` : "—"}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-muted">MAC index</div>
+                  <div className="font-mono text-primary">
+                    {evdo.connected && evdo.macIndex != null ? evdo.macIndex : "—"}
+                  </div>
+                </div>
+              </div>
+              <div className="mt-2 text-xs text-muted">
+                Color {evdo.colorCode} · last activity {formatAge(evdo.lastActivityAtMs)} ago
+              </div>
+              <div className="mt-3">
+                {evdoSamples.length >= 2 ? (
+                  <TimeSeriesChart
+                    title="DRC and reverse pilot SNR"
+                    width={900}
+                    height={200}
+                    yLabel="DRC / dB"
+                    timestamps={evdoSamples.map((sample) => sample.ts)}
+                    series={[
+                      { key: "drc", label: "DRC", color: "var(--accent-indigo)", values: evdoSamples.map((sample) => sample.drc) },
+                      { key: "snr", label: "Pilot SNR", color: "var(--accent-green)", values: evdoSamples.map((sample) => sample.snrDb) },
+                    ]}
+                  />
+                ) : (
+                  <p className="text-xs text-dimmed">Telemetry appears while the device holds a traffic channel.</p>
+                )}
+              </div>
+            </Card>
+          </div>
+          <div className="space-y-4">
+            {evdoSession?.admission ? (
+              <HrpdAdmissionCard admission={evdoSession.admission} />
+            ) : (
+              <Card title="Access">
+                <EvdoVerdictChip verdict={evdo.verdict} />
+              </Card>
+            )}
+            {evdoSession && (
+              <Card title="Identifiers">
+                {(() => {
+                  const hardwareId = evdoHardwareId(evdoSession.hardwareIdResponse);
+                  return hardwareId ? <Stat label="Hardware ID" value={`${hardwareId.label} ${hardwareId.value}`} mono /> : null;
+                })()}
+                {evdoSession.admission?.accessAuthImsi && (
+                  <Stat label="IMSI (AN-AAA)" value={evdoSession.admission.accessAuthImsi} mono />
+                )}
+              </Card>
+            )}
+            <Card title="Packet data">
+              {evdoPacket ? (
+                <>
+                  <Stat label="State" value={`A10 ${evdoPacket.phase}`} />
+                  {evdoPacket.trafficWalshCode ? <Stat label="A10 key" value={String(evdoPacket.trafficWalshCode)} mono /> : null}
+                  <Link
+                    href={`/packets/${encodeURIComponent(evdoPacket.sessionId)}`}
+                    className="mt-1 inline-block text-xs text-accent-blue hover:underline"
+                  >
+                    Open packet session →
+                  </Link>
+                </>
+              ) : (
+                <p className="text-xs text-dimmed">No packet session on this EV-DO session.</p>
+              )}
+            </Card>
+          </div>
+        </div>
+      )}
 
       {activeTab === "overview" && (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 grid-flow-row-dense gap-4">
@@ -1198,6 +1367,37 @@ export default function MobileDetailPage({
                 className="mt-3 text-xs px-2.5 py-1 rounded border border-border-input text-secondary hover:bg-surface-raised"
               >
                 Call details →
+              </button>
+            </Card>
+          )}
+
+          {evdo && evdoLink && (
+            <Card
+              title="EV-DO"
+              action={evdo.connected ? <span className="text-[11px] text-accent-green">● live</span> : undefined}
+            >
+              <div className="mb-2 flex flex-wrap items-center gap-2">
+                <EvdoLinkChip state={evdoLink} />
+                <EvdoVerdictChip verdict={evdo.verdict} />
+              </div>
+              <div className="flex justify-between py-0.5">
+                <span className="text-muted text-sm">Session</span>
+                <Link
+                  href={`/evdo/${uatiHexDigits(evdo.uati)}`}
+                  className="font-mono text-sm text-accent-blue hover:underline"
+                >
+                  {uatiHex(evdo.uati)}
+                </Link>
+              </div>
+              {evdo.connected && <Stat label="Forward rate" value={drcRateLabel(evdo.drcIndex) ?? "—"} mono />}
+              {evdoSnrDb != null && <Stat label="Reverse pilot SNR" value={`${evdoSnrDb.toFixed(1)} dB`} mono />}
+              {evdo.packetPhase && <Stat label="Packet data" value={`A10 ${evdo.packetPhase}`} />}
+              <button
+                type="button"
+                onClick={() => setTab("evdo")}
+                className="mt-3 text-xs px-2.5 py-1 rounded border border-border-input text-secondary hover:bg-surface-raised"
+              >
+                EV-DO details →
               </button>
             </Card>
           )}
@@ -1281,8 +1481,8 @@ export default function MobileDetailPage({
                         className="w-full glass-input"
                       />
                     </div>
-                    {createError && (
-                      <p className="text-accent-red text-xs">{createError}</p>
+                    {createError != null && (
+                      <ErrorNotice error={createError} className="text-xs" />
                     )}
                     <div className="flex items-center gap-2">
                       <button
@@ -1345,7 +1545,11 @@ export default function MobileDetailPage({
           {mobilePacketSessions.length > 0 && (
             <Card title="Data Session" action={<span className="text-xs text-muted">{mobilePacketSessions[0].phase}</span>}>
               <Stat label="Mobile IP" value={mobilePacketSessions[0].peerIp || "-"} mono />
-              <Stat label="Service option" value={`SO ${mobilePacketSessions[0].serviceOption}`} mono />
+              {isEvdoPacket(mobilePacketSessions[0]) ? (
+                <Stat label="Bearer" value={`EV-DO · ${packetChannel(mobilePacketSessions[0])}`} mono />
+              ) : (
+                <Stat label="Service option" value={`SO ${mobilePacketSessions[0].serviceOption}`} mono />
+              )}
               <Stat
                 label="Last activity"
                 value={
@@ -1505,7 +1709,7 @@ export default function MobileDetailPage({
                         ? `Pinned at ${trafficPower.manualTargetOverrideDb.toFixed(1)} dB. Clear to resume the outer loop.`
                         : "The outer loop sets the target from reverse FER."}
                     </p>
-                    {powerOverrideError && <p className="mt-1 text-xs text-accent-red">{powerOverrideError}</p>}
+                    <ErrorNotice error={powerOverrideError} className="mt-1 text-xs" />
                   </div>
                 </div>
               </>
@@ -1785,7 +1989,7 @@ export default function MobileDetailPage({
             mobilePacketSessions.map((session) => (
               <Card
                 key={session.sessionId}
-                title={`${session.accessTechnology || "1x"} data session · SO ${session.serviceOption}`}
+                title={isEvdoPacket(session) ? "EV-DO data session" : `1x data session · SO ${session.serviceOption}`}
                 action={<span className="rounded bg-surface-raised px-2 py-0.5 text-xs text-secondary">{session.phase}</span>}
               >
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
@@ -1800,14 +2004,8 @@ export default function MobileDetailPage({
                       {session.lastActivityAtMs ? new Date(session.lastActivityAtMs).toLocaleTimeString() : "-"}
                     </span>
                   </Tile>
-                  <Tile label="Channel">
-                    <span className="font-mono text-base">
-                      {session.trafficWalshCode
-                        ? session.accessTechnology === "HRPD"
-                          ? `key ${session.trafficWalshCode}`
-                          : `W${session.trafficWalshCode}`
-                        : "-"}
-                    </span>
+                  <Tile label={isEvdoPacket(session) ? "A10" : "Channel"}>
+                    <span className="font-mono text-base">{packetChannel(session)}</span>
                   </Tile>
                 </div>
                 <div className="mt-4 grid gap-4 md:grid-cols-3">

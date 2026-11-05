@@ -1,4 +1,3 @@
-import { grpcErrorMessage, grpcErrorStatus } from "@/lib/grpc/client";
 import { getHlrClient } from "@/lib/grpc/hlr-client";
 import {
   MobileSeen,
@@ -6,6 +5,7 @@ import {
   subscriberStatusToJSON,
 } from "@/lib/proto/hlr/v1/service";
 import type { ObservedMobile } from "@/lib/admission";
+import { apiError } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -63,7 +63,7 @@ export async function GET(request: Request) {
     }));
     return Response.json({ mobiles, total: seen.total });
   } catch (err) {
-    return Response.json({ error: grpcErrorMessage(err) }, { status: grpcErrorStatus(err) });
+    return apiError(err, "load seen mobiles");
   } finally {
     clearTimeout(timeout);
   }

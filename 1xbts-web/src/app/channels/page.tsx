@@ -13,6 +13,7 @@ import type { CellId } from "@/lib/proto/bsc/v1/service";
 import { formatPowerFraction } from "@/lib/format";
 import { useLive } from "@/lib/live";
 import { useBtsList, usePinnedDefaultCell } from "@/lib/use-bts-list";
+import { ErrorNotice } from "@/components/error-notice";
 
 
 interface CellWalshCapacity {
@@ -85,7 +86,8 @@ function ChannelsView() {
   const channelsKey = baseStation
     ? `/api/channels?baseStation=${encodeURIComponent(baseStation)}`
     : "/api/channels";
-  const { data, error, loading } = useLive<ChannelListResponse>(channelsKey);
+  const { data, error: errorText, errorBody, loading } = useLive<ChannelListResponse>(channelsKey);
+  const error = errorBody ?? errorText;
   const liveMobiles = useLive<MobileInfo[]>("/api/mobiles").data;
   const subscriberNames = useMemo(() => {
     const names = new Map<string, string>();
@@ -116,7 +118,7 @@ function ChannelsView() {
   const powerPct = (fraction: number) => `${(fraction * 100).toFixed(1)}%`;
 
   return (
-    <div className="max-w-7xl mx-auto space-y-4">
+    <div className="page-container space-y-4">
       <div className="flex flex-wrap items-center gap-4">
         <h1 className="text-lg font-bold">Channels</h1>
         {activeCell?.cell && (
@@ -132,7 +134,7 @@ function ChannelsView() {
       {loading ? (
         <p className="text-dimmed text-sm">Loading...</p>
       ) : error ? (
-        <p className="text-accent-red text-sm">{error}</p>
+        <ErrorNotice error={error} />
       ) : (
         <>
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">

@@ -1,5 +1,6 @@
 import { selectorFromUrl } from "@/lib/cell";
 import { getNetworkManagementClient, waitForManagementReady } from "@/lib/grpc/client";
+import { apiError } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -23,8 +24,7 @@ export async function POST(request: Request) {
     );
     return Response.json(result);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    return Response.json({ accepted: false, message: msg }, { status: 502 });
+    return apiError(err, "start the data call", { accepted: false });
   } finally {
     clearTimeout(timeout);
   }

@@ -420,7 +420,30 @@ export interface Session {
     | HrpdUati
     | undefined;
   /** Access decisions for this session. */
-  admission: SessionAdmission | undefined;
+  admission:
+    | SessionAdmission
+    | undefined;
+  /**
+   * True while the access terminal holds a traffic channel, from its
+   * TrafficChannelComplete until the connection closes.
+   */
+  connected: boolean;
+  /** MAC index of the open connection. Absent when not connected. */
+  macIndex?:
+    | number
+    | undefined;
+  /**
+   * Most recent DRC value the access terminal reported on its connection.
+   * Absent when not connected or before the first report.
+   */
+  drcIndex?:
+    | number
+    | undefined;
+  /**
+   * Last access or traffic activity on this session, in milliseconds since
+   * the Unix epoch. Zero when the AN has no activity record for it.
+   */
+  lastActivityAtMs: number;
 }
 
 export interface SessionAdmission {
@@ -982,6 +1005,10 @@ function createBaseSession(): Session {
     hardwareIdResponse: undefined,
     fullUati: undefined,
     admission: undefined,
+    connected: false,
+    macIndex: undefined,
+    drcIndex: undefined,
+    lastActivityAtMs: 0,
   };
 }
 
@@ -1007,6 +1034,18 @@ export const Session: MessageFns<Session> = {
     }
     if (message.admission !== undefined) {
       SessionAdmission.encode(message.admission, writer.uint32(58).fork()).join();
+    }
+    if (message.connected !== false) {
+      writer.uint32(64).bool(message.connected);
+    }
+    if (message.macIndex !== undefined) {
+      writer.uint32(72).uint32(message.macIndex);
+    }
+    if (message.drcIndex !== undefined) {
+      writer.uint32(80).uint32(message.drcIndex);
+    }
+    if (message.lastActivityAtMs !== 0) {
+      writer.uint32(88).uint64(message.lastActivityAtMs);
     }
     return writer;
   },
@@ -1074,6 +1113,38 @@ export const Session: MessageFns<Session> = {
           message.admission = SessionAdmission.decode(reader, reader.uint32());
           continue;
         }
+        case 8: {
+          if (tag !== 64) {
+            break;
+          }
+
+          message.connected = reader.bool();
+          continue;
+        }
+        case 9: {
+          if (tag !== 72) {
+            break;
+          }
+
+          message.macIndex = reader.uint32();
+          continue;
+        }
+        case 10: {
+          if (tag !== 80) {
+            break;
+          }
+
+          message.drcIndex = reader.uint32();
+          continue;
+        }
+        case 11: {
+          if (tag !== 88) {
+            break;
+          }
+
+          message.lastActivityAtMs = longToNumber(reader.uint64());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1104,6 +1175,22 @@ export const Session: MessageFns<Session> = {
         ? HrpdUati.fromJSON(object.full_uati)
         : undefined,
       admission: isSet(object.admission) ? SessionAdmission.fromJSON(object.admission) : undefined,
+      connected: isSet(object.connected) ? globalThis.Boolean(object.connected) : false,
+      macIndex: isSet(object.macIndex)
+        ? globalThis.Number(object.macIndex)
+        : isSet(object.mac_index)
+        ? globalThis.Number(object.mac_index)
+        : undefined,
+      drcIndex: isSet(object.drcIndex)
+        ? globalThis.Number(object.drcIndex)
+        : isSet(object.drc_index)
+        ? globalThis.Number(object.drc_index)
+        : undefined,
+      lastActivityAtMs: isSet(object.lastActivityAtMs)
+        ? globalThis.Number(object.lastActivityAtMs)
+        : isSet(object.last_activity_at_ms)
+        ? globalThis.Number(object.last_activity_at_ms)
+        : 0,
     };
   },
 
@@ -1130,6 +1217,18 @@ export const Session: MessageFns<Session> = {
     if (message.admission !== undefined) {
       obj.admission = SessionAdmission.toJSON(message.admission);
     }
+    if (message.connected !== false) {
+      obj.connected = message.connected;
+    }
+    if (message.macIndex !== undefined) {
+      obj.macIndex = Math.round(message.macIndex);
+    }
+    if (message.drcIndex !== undefined) {
+      obj.drcIndex = Math.round(message.drcIndex);
+    }
+    if (message.lastActivityAtMs !== 0) {
+      obj.lastActivityAtMs = Math.round(message.lastActivityAtMs);
+    }
     return obj;
   },
 
@@ -1153,6 +1252,10 @@ export const Session: MessageFns<Session> = {
     message.admission = (object.admission !== undefined && object.admission !== null)
       ? SessionAdmission.fromPartial(object.admission)
       : undefined;
+    message.connected = object.connected ?? false;
+    message.macIndex = object.macIndex ?? undefined;
+    message.drcIndex = object.drcIndex ?? undefined;
+    message.lastActivityAtMs = object.lastActivityAtMs ?? 0;
     return message;
   },
 };

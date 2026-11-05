@@ -144,26 +144,26 @@ function AKeyCard({ steps }: { steps: AKeyProgressJson[] }) {
         {aKeySummary(steps)}
         {pRev ? <span className="text-muted"> · A_KEY_P_REV {pRev}</span> : null}
       </p>
-      <table className="w-full text-xs">
+      <table className="data-table">
         <thead>
-          <tr className="text-muted text-left">
-            <th className="font-normal py-1 pr-2 w-6" />
-            <th className="font-normal py-1 pr-3">Step</th>
-            <th className="font-normal py-1 pr-3">Mobile took</th>
-            <th className="font-normal py-1">Detail</th>
+          <tr>
+            <th className="font-normal w-6" />
+            <th className="font-normal">Step</th>
+            <th className="font-normal">Mobile took</th>
+            <th className="font-normal">Detail</th>
           </tr>
         </thead>
         <tbody>
           {steps.map((p, i) => (
-            <tr key={i} className="border-t border-border-subtle">
-              <td className={`py-1 pr-2 font-bold ${p.success ? "text-accent-green" : "text-accent-red"}`}>
+            <tr key={i} className="border-border-subtle">
+              <td className={`font-bold ${p.success ? "text-accent-green" : "text-accent-red"}`}>
                 {p.success ? "✓" : "✗"}
               </td>
-              <td className="py-1 pr-3">{aKeyStepLabel(p.step)}</td>
-              <td className="py-1 pr-3 font-mono">
+              <td>{aKeyStepLabel(p.step)}</td>
+              <td className="font-mono">
                 {p.elapsedMs != null ? formatSeconds(p.elapsedMs) : ""}
               </td>
-              <td className="py-1 text-muted">
+              <td className="text-muted">
                 {p.step === "OTASP_A_KEY_STEP_SKIPPED"
                   ? aKeySkipLabel(p.skipReason)
                   : p.resultCode != null && p.resultCode !== 0

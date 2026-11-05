@@ -1,5 +1,6 @@
 import { getFemtoManagementClient } from "@/lib/grpc/femto-client";
 import { FemtoRadioAdministrativeState } from "@/lib/proto/femto_management/v1/service";
+import { apiError, badRequest } from "@/lib/api-error";
 
 export async function POST(request: Request) {
   const body = await request.json() as {
@@ -8,7 +9,7 @@ export async function POST(request: Request) {
     action?: "enable" | "disable" | "sync" | "reboot";
   };
   if (!body.baseStation || !body.peerId || !body.action) {
-    return Response.json({ error: "baseStation, peerId and action are required" }, { status: 400 });
+    return badRequest("Choose a base station, a femtocell and an action");
   }
   const client = getFemtoManagementClient(body.baseStation);
   const cell = { peerId: body.peerId };
@@ -25,7 +26,6 @@ export async function POST(request: Request) {
           });
     return Response.json(result);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "unknown error";
-    return Response.json({ error: message }, { status: 502 });
+    return apiError(error, "run the femtocell action");
   }
 }

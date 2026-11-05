@@ -6,6 +6,7 @@
 // falls back to the IS-95 default "000000".
 
 import { getHlrClient, waitForHlrReady } from "@/lib/grpc/hlr-client";
+import { apiError, badRequest } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -19,10 +20,7 @@ export async function PUT(request: Request, ctx: Ctx) {
     const body = await request.json().catch(() => ({}));
     const raw = typeof body.spc === "string" ? body.spc.trim() : "";
     if (raw && !/^\d{6}$/.test(raw)) {
-      return Response.json(
-        { error: "SPC must be exactly 6 digits" },
-        { status: 400 }
-      );
+      return badRequest("The SPC must be exactly 6 digits", "spc");
     }
     const servicePrgrammingCode = raw || undefined;
     await waitForHlrReady();
@@ -36,9 +34,7 @@ export async function PUT(request: Request, ctx: Ctx) {
     );
     return Response.json({ ok: true });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    const status = /INVALID_ARGUMENT|not found|6 digits/i.test(msg) ? 400 : 502;
-    return Response.json({ error: msg }, { status });
+    return apiError(err, "save the SPC");
   } finally {
     clearTimeout(timeout);
   }

@@ -5,6 +5,7 @@ import { Card } from "@/components/card";
 import { cellLabel } from "@/lib/cell";
 import type { BaseStationSummary } from "@/lib/proto/msc_management/v1/service";
 import { useBaseStations } from "@/lib/use-base-stations";
+import { ErrorNotice } from "@/components/error-notice";
 
 function stateBadge(node: BaseStationSummary) {
   if (node.attached) {
@@ -29,7 +30,7 @@ export default function BaseStationsPage() {
   const attached = nodes.filter((node) => node.attached).length;
 
   return (
-    <div className="max-w-7xl mx-auto space-y-6">
+    <div className="page-container space-y-6">
       <div className="flex items-center gap-4">
         <h1 className="text-lg font-bold">Base Stations</h1>
         {nodes.length > 0 && (
@@ -44,28 +45,27 @@ export default function BaseStationsPage() {
         {loading ? (
           <p className="text-dimmed text-sm">Loading...</p>
         ) : error ? (
-          <p className="text-accent-red text-sm">{error}</p>
+          <ErrorNotice error={error} />
         ) : nodes.length === 0 ? (
           <p className="text-dimmed text-sm">No base stations configured on the MSC.</p>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-sm">
+            <table className="data-table">
               <thead>
-                <tr className="text-muted text-xs">
-                  <th className="text-left py-1">Node</th>
-                  <th className="text-left py-1">State</th>
-                  <th className="text-left py-1 pl-4">Management</th>
-                  <th className="text-left py-1 pl-4">A1</th>
-                  <th className="text-left py-1 pl-4">Cells</th>
+                <tr>
+                  <th>Node</th>
+                  <th>State</th>
+                  <th>Management</th>
+                  <th>A1</th>
+                  <th>Cells</th>
                 </tr>
               </thead>
               <tbody>
                 {nodes.map((node) => (
                   <tr
                     key={node.managementEndpoint}
-                    className="border-t border-border-subtle"
-                  >
-                    <td className="py-1.5 font-mono text-primary">
+                    className="border-border-subtle">
+                    <td className="font-mono text-primary">
                       <Link
                         href={`/base-stations/${encodeURIComponent(node.managementEndpoint)}`}
                         className="text-accent-green hover:underline"
@@ -73,19 +73,19 @@ export default function BaseStationsPage() {
                         {node.nodeId || node.managementEndpoint}
                       </Link>
                     </td>
-                    <td className="py-1.5">
+                    <td>
                       {stateBadge(node)}
                       {!node.attached && node.statusDetail && (
                         <span className="ml-2 text-xs text-muted">{node.statusDetail}</span>
                       )}
                     </td>
-                    <td className="py-1.5 pl-4 font-mono text-xs text-secondary">
+                    <td className="font-mono text-secondary">
                       {node.managementEndpoint}
                     </td>
-                    <td className="py-1.5 pl-4 font-mono text-xs text-secondary">
+                    <td className="font-mono text-secondary">
                       {node.a1Addr || "-"}
                     </td>
-                    <td className="py-1.5 pl-4 text-xs">
+                    <td>
                       {node.cells.length === 0 ? (
                         <span className="text-dimmed">none</span>
                       ) : (

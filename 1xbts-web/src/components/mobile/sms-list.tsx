@@ -5,6 +5,7 @@ import { liveSocket, useLive } from "@/lib/live";
 import { Pager } from "@/components/pager";
 import { smsStateColor } from "@/lib/sms-state";
 import { teleserviceKind, teleserviceName } from "@/lib/teleservice";
+import { ErrorNotice } from "@/components/error-notice";
 
 const HISTORY_LIMIT = 200;
 const PAGE_SIZES = [25, 50, 100] as const;
@@ -50,7 +51,8 @@ export function SmsList({ phone, refreshKey = 0 }: { phone?: string; refreshKey?
   const key = phone ? `/api/sms-history?${new URLSearchParams({ phone, limit: String(HISTORY_LIMIT) })}` : null;
   const live = useLive<{ submissions?: SmsRow[] }>(key);
   const rows = live.data?.submissions ?? NO_ROWS;
-  const { loading, error } = live;
+  const { loading } = live;
+  const error = live.errorBody ?? live.error;
   const [page, setPage] = useState(0);
   const [pageSize, setPageSize] = useState<number>(PAGE_SIZES[0]);
   const [filter, setFilter] = useState<Filter>("all");
@@ -64,7 +66,7 @@ export function SmsList({ phone, refreshKey = 0 }: { phone?: string; refreshKey?
     return <p className="text-dimmed text-sm">No phone number on this mobile. SMS history is kept per phone number.</p>;
   }
   if (loading && rows.length === 0) return <p className="text-dimmed text-sm">Loading...</p>;
-  if (error) return <p className="text-accent-red text-sm">{error}</p>;
+  if (error) return <ErrorNotice error={error} />;
   if (rows.length === 0) return <p className="text-dimmed text-sm">No messages.</p>;
 
   const q = query.trim().toLowerCase();

@@ -83,6 +83,7 @@ async fn live_session_bind_and_unbind_land_on_the_bus() {
                 mn_id: None,
                 mn_id_source: None,
                 subscriber_imsi: None,
+                a10: None,
                 traffic_walsh_code: 12,
             },
         )
@@ -188,6 +189,7 @@ async fn unprovisioned_mobile_emits_identity_only() {
                 mn_id: None,
                 mn_id_source: None,
                 subscriber_imsi: None,
+                a10: None,
                 traffic_walsh_code: 14,
             },
         )

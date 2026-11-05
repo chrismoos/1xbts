@@ -99,6 +99,17 @@ message Session {
   events.v1.HrpdUati full_uati = 6;
   // Access decisions for this session.
   SessionAdmission admission = 7;
+  // True while the access terminal holds a traffic channel, from its
+  // TrafficChannelComplete until the connection closes.
+  bool connected = 8;
+  // MAC index of the open connection. Absent when not connected.
+  optional uint32 mac_index = 9;
+  // Most recent DRC value the access terminal reported on its connection.
+  // Absent when not connected or before the first report.
+  optional uint32 drc_index = 10;
+  // Last access or traffic activity on this session, in milliseconds since
+  // the Unix epoch. Zero when the AN has no activity record for it.
+  uint64 last_activity_at_ms = 11;
 }
 
 enum HardwareVerdict {

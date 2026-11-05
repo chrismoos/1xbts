@@ -26,6 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "../../proto/bts_management/v1/service.proto",
                 "../../proto/bsc_management/v1/service.proto",
                 "../../proto/pcf_management/v1/service.proto",
+                "../../proto/pcf/v1/service.proto",
                 "../../proto/pdsn_management/v1/service.proto",
                 "../../proto/management/v1/service.proto",
                 "../../proto/mgmt/v1/service.proto",

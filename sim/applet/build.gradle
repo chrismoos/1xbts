@@ -1,0 +1,198 @@
+// The SJA5 runs Java Card 3.0.4 and fails LOAD with 6985 for a CAP built
+// against a newer SDK. The 3.0.4 converter needs JDK 8, so javac and the
+// converter run as JDK 8 processes rather than through the Gradle JVM.
+
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'org.yaml:snakeyaml:2.2'
+    }
+}
+
+def java8Home = System.getenv('JAVA8_HOME')
+        ?: '/Library/Java/JavaVirtualMachines/zulu-8.jdk/Contents/Home'
+def jckit = System.getenv('JC_HOME')
+
+def srcDir = file('src')
+// -Pss0055=int builds the native-int S.S0055 kernel, for a card that
+// supports the optional int type. The default is the int-free stub.
+def ss0055 = project.findProperty('ss0055') ?: 'stub'
+if (!(ss0055 in ['stub', 'int'])) {
+    throw new GradleException("ss0055 must be stub or int, got ${ss0055}")
+}
+// -Pdebug=true builds the debug variant: the APDU trace, EF table dump,
+// crypto self-test and PLATFORM_INFO without ADM1. The default is hardened.
+def variant = (project.findProperty('debug') ?: 'false') == 'true' ? 'debug' : 'hardened'
+def appletSources = files(fileTree(srcDir).include('**/*.java'),
+                          "ss0055/${ss0055}/Ss0055.java",
+                          "variant/${variant}/Variant.java")
+def classesDir = file("${buildDir}/classes")
+def capDir = file("${buildDir}/cap")
+def outCap = file("${buildDir}/csim.cap")
+
+def packageAid  = '0xA0:0x00:0x00:0x03:0x43:0x10:0x02:0x8F:0x01'
+def instanceAid = '0xA0:0x00:0x00:0x03:0x43:0x10:0x02:0xF3:0x10:0xFF:0xFF:0x89:0x02:0x00:0x00:0xFF'  // = CSIM_AID in Csim.java
+def packageName = 'org.onexbts.csim'
+def appletClass = 'org.onexbts.csim.Csim'
+def packageVersion = '1.0'
+
+repositories {
+    mavenCentral()
+}
+
+configurations {
+    simtest
+}
+
+dependencies {
+    simtest 'com.klinec:jcardsim:3.0.5.11'
+    simtest 'org.bouncycastle:bcprov-jdk15on:1.70'
+}
+
+task validateEnv {
+    doLast {
+        if (jckit == null || jckit.isEmpty()) {
+            throw new GradleException(
+                "JC_HOME is not set. Point it at jc304_kit (Java Card 3.0.4) — " +
+                "matches the sysmoISIM-SJA5 firmware. Other versions cause SW=6985 on LOAD.")
+        }
+        def jcLib = file("${jckit}/lib/tools.jar")
+        if (!jcLib.isFile()) {
+            throw new GradleException(
+                "JC_HOME does not look like a JC 3.0.x kit. Missing ${jcLib}.")
+        }
+        def java8c = file("${java8Home}/bin/javac")
+        if (!java8c.isFile()) {
+            throw new GradleException(
+                "JDK 8 not found at ${java8Home}. " +
+                "Install zulu@8 or set JAVA8_HOME.")
+        }
+    }
+}
+
+task compileJava8(type: Exec) {
+    dependsOn validateEnv
+    description = 'Compile sources with JDK 8 targeting Java 1.5 bytecode.'
+    inputs.files appletSources
+    outputs.dir classesDir
+
+    doFirst {
+        classesDir.deleteDir()
+        classesDir.mkdirs()
+        def sources = appletSources.files.collect { it.absolutePath }
+        executable "${java8Home}/bin/javac"
+        args '-source', '1.5'
+        args '-target', '1.5'
+        args '-bootclasspath', "${jckit}/lib/api_classic.jar"
+        args '-classpath', "${jckit}/lib/api_classic_annotations.jar"
+        args '-d', classesDir.absolutePath
+        args '-nowarn'
+        args '-Xlint:-options'
+        args sources
+    }
+    executable 'true'
+}
+
+task convertCap(type: JavaExec) {
+    dependsOn compileJava8
+    description = 'Convert the classes to a CAP file.'
+    inputs.dir classesDir
+    outputs.dir capDir
+
+    doFirst {
+        capDir.deleteDir()
+        capDir.mkdirs()
+    }
+
+    executable = "${java8Home}/bin/java"
+    classpath = files("${jckit}/lib/tools.jar",
+                      "${jckit}/lib/api_classic.jar")
+    mainClass = 'com.sun.javacard.converter.Main'
+    args '-classdir', classesDir.absolutePath
+    args '-d', capDir.absolutePath
+    args '-exportpath', "${jckit}/api_export_files"
+    args '-applet', instanceAid, appletClass
+    if (ss0055 == 'int') {
+        args '-i'
+    }
+    args packageName, packageAid, packageVersion
+}
+
+task copyCap(type: Copy) {
+    dependsOn convertCap
+    description = 'Copy the CAP file to build/csim.cap.'
+    from { "${capDir}/org/onexbts/csim/javacard/csim.cap" }
+    into buildDir
+    doLast {
+        if (!outCap.isFile()) {
+            throw new GradleException("converter did not produce ${outCap}")
+        }
+        println "Built ${outCap} (${outCap.length()} bytes)"
+    }
+}
+
+task dist {
+    dependsOn copyCap
+    description = 'Produce build/csim.cap.'
+    group = 'build'
+}
+
+task clean(type: Delete) {
+    delete buildDir
+}
+
+def simtestOut = file("${buildDir}/simtest")
+def simtestClasses = file("${simtestOut}/classes")
+def simtestClasspathFile = file("${simtestOut}/classpath.txt")
+def efMetaHex = file("${simtestOut}/ef_meta.hex")
+
+task compileSimtest(type: JavaCompile) {
+    description = 'Compile the applet and the jcardsim harness, and write the classpath csim --reader sim uses.'
+    source = files(appletSources, fileTree('simtest').include('*.java'))
+    classpath = configurations.simtest
+    destinationDirectory = simtestClasses
+    sourceCompatibility = '11'
+    targetCompatibility = '11'
+    options.release = 11
+    options.compilerArgs << '-nowarn'
+    outputs.file simtestClasspathFile
+    doLast {
+        simtestClasspathFile.text = (files(simtestClasses) + configurations.simtest).asPath
+    }
+}
+
+// The INIT_META image of ../ef-table.yaml: per EF the FID, structure code,
+// SFI, size big-endian, record length and READ << 4 | UPDATE.
+def efTable = file('../ef-table.yaml')
+def structureCodes = ['transparent': 1, 'linear-fixed': 2, 'cyclic': 6]
+def accessCodes = [ALW: 0, PIN1: 1, ADM: 2, NEV: 3, PIN2: 4]
+
+task simtestEfMeta {
+    description = 'Write the EF table from ../ef-table.yaml for the harness.'
+    inputs.file efTable
+    outputs.file efMetaHex
+    doLast {
+        def out = new StringBuilder()
+        new org.yaml.snakeyaml.Yaml().load(efTable.text).each { e ->
+            int fid = Integer.parseInt(e.fid, 16)
+            int size = e.size
+            def entry = [fid >> 8, fid & 0xFF, structureCodes[e.structure], e.sfi,
+                         size >> 8, size & 0xFF, e.record_length ?: 0,
+                         (accessCodes[e.read] << 4) | accessCodes[e.update]]
+            entry.each { out.append(String.format('%02x', it)) }
+        }
+        simtestOut.mkdirs()
+        efMetaHex.text = out.toString()
+    }
+}
+
+task simtest(type: JavaExec) {
+    dependsOn compileSimtest, simtestEfMeta
+    description = 'Run the applet checks in jcardsim.'
+    group = 'verification'
+    classpath = files(simtestClasses) + configurations.simtest
+    mainClass = 'SimTest'
+    args efMetaHex
+}

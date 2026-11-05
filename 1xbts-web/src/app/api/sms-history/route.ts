@@ -1,5 +1,6 @@
 import { getSmscClient } from "@/lib/grpc/smsc-client";
 import type { SmsSubmission } from "@/lib/proto/smsc/v1/service";
+import { apiError } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -80,8 +81,7 @@ export async function GET(request: Request) {
       total: result.total,
     });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    return Response.json({ error: msg }, { status: 502 });
+    return apiError(err, "load message history");
   } finally {
     clearTimeout(timeout);
   }

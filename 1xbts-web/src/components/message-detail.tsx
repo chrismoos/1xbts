@@ -47,7 +47,6 @@ import {
 } from "@/lib/hrpd-correlation";
 import {
   HrpdDirection,
-  HrpdTrafficReason,
   type HrpdAccessEvent,
   type HrpdDecodedMessage,
   type HrpdSessionEvent,
@@ -1291,49 +1290,16 @@ function payloadLength(payload: Uint8Array | undefined, explicitLength?: number)
   return normalizeBytes(payload).length;
 }
 
-export function hrpdDirectionLabel(direction: HrpdDirection): "EVDO TX" | "EVDO RX" | "EVDO" {
-  if (direction === HrpdDirection.HRPD_DIRECTION_TX) return "EVDO TX";
-  if (direction === HrpdDirection.HRPD_DIRECTION_RX) return "EVDO RX";
-  return "EVDO";
+export function hrpdDirectionLabel(direction: HrpdDirection): "EV-DO TX" | "EV-DO RX" | "EV-DO" {
+  if (direction === HrpdDirection.HRPD_DIRECTION_TX) return "EV-DO TX";
+  if (direction === HrpdDirection.HRPD_DIRECTION_RX) return "EV-DO RX";
+  return "EV-DO";
 }
 
 export function hrpdDirectionClass(direction?: HrpdDirection): string {
   if (direction === HrpdDirection.HRPD_DIRECTION_TX) return "text-accent-cyan";
   if (direction === HrpdDirection.HRPD_DIRECTION_RX) return "text-accent-green";
   return "text-accent-purple";
-}
-
-function primaryDecoded(messages: HrpdDecodedMessage[]): HrpdDecodedMessage | undefined {
-  return messages.find((m) => m.typeName || m.summary);
-}
-
-export function formatHrpdSessionSummary(event: HrpdSessionEvent): string {
-  const canonical = formatHrpdFullUati(event.fullUati);
-  return `HRPD Session uati=${canonical ?? formatUati(event.uati)} ${hrpdSessionReasonToJSON(event.reason)} color=${event.colorCode}`;
-}
-
-export function formatHrpdAccessSummary(event: HrpdAccessEvent): string {
-  const decoded = primaryDecoded(event.decodedMessages);
-  if (decoded?.summary) return decoded.summary;
-  return `HRPD Access sig=${event.accessSignature} ${hrpdAccessReasonToJSON(event.reason)} color=${event.colorCode} (${payloadLength(event.payload, event.payloadLengthBytes)}B)`;
-}
-
-export function formatHrpdTrafficSummary(event: HrpdTrafficEvent): string {
-  const decoded = primaryDecoded(event.decodedMessages);
-  if (decoded?.summary) return decoded.summary;
-  const canonical = formatHrpdFullUati(event.fullUati);
-  const identity = canonical
-    ? `uati=${canonical} receive_ati=${formatUati(event.receiveAti || event.uati)}`
-    : `receive_ati=${formatUati(event.receiveAti || event.uati)}`;
-  if (
-    event.reason ===
-    HrpdTrafficReason.HRPD_TRAFFIC_REASON_REVERSE_PILOT_SNR_UPDATED
-  ) {
-    return `ReversePilotSNR ${identity} mac=${event.macIndex} snr=${(
-      event.reversePilotSnrDbTenths / 10
-    ).toFixed(1)}dB drc=${event.drcValue}`;
-  }
-  return `HRPD Traffic ${identity} mac=${event.macIndex} drc=${event.drcValue} ${hrpdTrafficReasonToJSON(event.reason)}`;
 }
 
 export function HrpdSessionDetail({ event }: { event: HrpdSessionEvent }) {

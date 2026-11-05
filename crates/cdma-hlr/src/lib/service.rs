@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use cdma_rpc_error::{Domain, ErrorReason};
 use chrono::{DateTime, Utc};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
@@ -16,6 +17,7 @@ use crate::repository::{
 const DEFAULT_MOBILES_SEEN_PAGE_SIZE: u32 = 50;
 const MAX_MOBILES_SEEN_PAGE_SIZE: u32 = 500;
 const MAX_ADMISSION_LABEL_LEN: usize = 64;
+const HLR: Domain = Domain("hlr");
 
 pub struct HlrServiceImpl {
     repo: Arc<dyn HlrRepository>,
@@ -110,9 +112,9 @@ fn status_from_proto_i32(value: i32) -> Result<model::SubscriberStatus, Status> 
         Ok(proto::SubscriberStatus::Active) => Ok(model::SubscriberStatus::Active),
         Ok(proto::SubscriberStatus::Suspended) => Ok(model::SubscriberStatus::Suspended),
         Ok(proto::SubscriberStatus::Disabled) => Ok(model::SubscriberStatus::Disabled),
-        Ok(proto::SubscriberStatus::Unspecified) | Err(_) => Err(Status::invalid_argument(
-            format!("invalid subscriber status: {value}"),
-        )),
+        Ok(proto::SubscriberStatus::Unspecified) | Err(_) => {
+            Err(HLR.invalid_field("status", format!("Subscriber status {value} is not valid")))
+        }
     }
 }
 
@@ -150,7 +152,7 @@ fn non_empty_key(field: &str, value: Option<Vec<u8>>) -> Result<Option<Vec<u8>>,
         Some(bytes) if bytes.is_empty() => Ok(None),
         Some(bytes) => {
             model::validate_auth_key(&bytes)
-                .map_err(|e| Status::invalid_argument(format!("invalid {field}: {e}")))?;
+                .map_err(|e| HLR.invalid_field(field, capitalize(&e)))?;
             Ok(Some(bytes))
         }
     }
@@ -182,29 +184,26 @@ fn mobile_seen_to_proto(result: &model::MobileSeenUpsert) -> proto::MobileSeenUp
 }
 
 fn parse_uuid(s: &str) -> Result<Uuid, Status> {
-    Uuid::parse_str(s).map_err(|_| Status::invalid_argument(format!("invalid UUID: {s}")))
+    Uuid::parse_str(s).map_err(|_| HLR.invalid(format!("The ID \"{s}\" is not valid")))
 }
 
 fn validate_optional_imsi(imsi: Option<&str>) -> Result<(), Status> {
     if let Some(imsi) = imsi {
-        model::validate_imsi(imsi)
-            .map_err(|e| Status::invalid_argument(format!("invalid IMSI: {e}")))?;
+        model::validate_imsi(imsi).map_err(|e| HLR.invalid_field("imsi", e))?;
     }
     Ok(())
 }
 
 fn validate_optional_meid(meid: Option<&str>) -> Result<(), Status> {
     if let Some(meid) = meid {
-        model::normalize_meid(meid)
-            .map_err(|e| Status::invalid_argument(format!("invalid MEID: {e}")))?;
+        model::normalize_meid(meid).map_err(|e| HLR.invalid_field("meid", e))?;
     }
     Ok(())
 }
 
 fn validate_optional_imei(imei: Option<&str>) -> Result<(), Status> {
     if let Some(imei) = imei {
-        model::normalize_imei(imei)
-            .map_err(|e| Status::invalid_argument(format!("invalid IMEI: {e}")))?;
+        model::normalize_imei(imei).map_err(|e| HLR.invalid_field("imei", e))?;
     }
     Ok(())
 }
@@ -212,37 +211,34 @@ fn validate_optional_imei(imei: Option<&str>) -> Result<(), Status> {
 fn parse_identity_key(
     identity: Option<proto::MobileIdentityKey>,
 ) -> Result<model::MobileIdentityKey, Status> {
-    let identity = identity.ok_or_else(|| Status::invalid_argument("identity is required"))?;
+    let identity =
+        identity.ok_or_else(|| HLR.invalid_field("identity", "An identity is required"))?;
     model::MobileIdentityKey::from_parts(
         identity.imsi.as_deref(),
         identity.esn,
         identity.meid.as_deref(),
     )
-    .map_err(Status::invalid_argument)
+    .map_err(|e| HLR.invalid_field("identity", capitalize(&e)))
 }
 
 fn parse_hardware_identity_key(
     identity: Option<proto::HardwareIdentityKey>,
 ) -> Result<(Option<u32>, Option<String>), Status> {
-    let identity = identity.ok_or_else(|| Status::invalid_argument("identity is required"))?;
+    let identity =
+        identity.ok_or_else(|| HLR.invalid_field("identity", "An identity is required"))?;
     if identity.esn.is_none() && identity.meid.is_none() {
-        return Err(Status::invalid_argument(
-            "hardware identity requires ESN or MEID",
-        ));
+        return Err(HLR.invalid_field("identity", "An ESN or MEID is required"));
     }
     let meid = identity
         .meid
-        .map(|meid| {
-            model::normalize_meid(&meid)
-                .map_err(|e| Status::invalid_argument(format!("invalid MEID: {e}")))
-        })
+        .map(|meid| model::normalize_meid(&meid).map_err(|e| HLR.invalid_field("meid", e)))
         .transpose()?;
     Ok((identity.esn, meid))
 }
 
 fn validate_phone_number(phone_number: &str) -> Result<(), Status> {
     model::validate_phone_number(phone_number)
-        .map_err(|e| Status::invalid_argument(format!("invalid phone number: {e}")))
+        .map_err(|e| HLR.invalid_field("phone_number", capitalize(&e)))
 }
 
 // ─── gRPC Service Implementation ──────────────────────────────
@@ -275,7 +271,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             .await
             .map_err(|e| {
                 log::error!("HLR: {e}");
-                Status::internal("internal error")
+                HLR.database()
             })?;
 
         let has_identity = req.imsi.is_some() || req.esn.is_some() || req.meid.is_some();
@@ -358,7 +354,10 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             .repo
             .get_identities_for_subscriber(subscriber_id)
             .await
-            .map_err(Status::internal)?;
+            .map_err(|e| {
+                log::error!("HLR: {e}");
+                HLR.database()
+            })?;
         Ok(Response::new(proto::GetIdentitiesForSubscriberResponse {
             identities: identities.iter().map(identity_to_proto).collect(),
         }))
@@ -373,14 +372,18 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         let mob_p_rev = req
             .mob_p_rev
             .map(|value| {
-                u8::try_from(value).map_err(|_| Status::invalid_argument("mob_p_rev > 255"))
+                u8::try_from(value)
+                    .map_err(|_| HLR.invalid_field("mob_p_rev", "MOB_P_REV must be 255 or less"))
             })
             .transpose()?;
         let result = self
             .repo
             .upsert_mobile_seen(&identity, mob_p_rev)
             .await
-            .map_err(Status::internal)?;
+            .map_err(|e| {
+                log::error!("HLR: {e}");
+                HLR.database()
+            })?;
         Ok(Response::new(proto::UpsertMobileSeenResponse {
             result: Some(mobile_seen_to_proto(&result)),
         }))
@@ -392,14 +395,13 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
     ) -> Result<Response<proto::RecordHardwareAdmissionResponse>, Status> {
         let req = request.into_inner();
         let (esn, meid) = parse_hardware_identity_key(req.identity)?;
-        let class = crate::repository::admission_class_from_proto(req.admission_class)
-            .ok_or_else(|| Status::invalid_argument("admission_class is required"))?;
+        let class = crate::repository::admission_class_from_proto(req.admission_class).ok_or_else(
+            || HLR.invalid_field("admission_class", "An admission class is required"),
+        )?;
         if req.reason.len() > MAX_ADMISSION_LABEL_LEN
             || req.base_station.len() > MAX_ADMISSION_LABEL_LEN
         {
-            return Err(Status::invalid_argument(
-                "admission reason and base station are limited to 64 bytes",
-            ));
+            return Err(HLR.invalid("Admission reason and base station are limited to 64 bytes"));
         }
         self.repo
             .record_hardware_admission(
@@ -412,7 +414,10 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
                 },
             )
             .await
-            .map_err(Status::internal)?;
+            .map_err(|e| {
+                log::error!("HLR: {e}");
+                HLR.database()
+            })?;
         Ok(Response::new(proto::RecordHardwareAdmissionResponse {}))
     }
 
@@ -422,14 +427,13 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
     ) -> Result<Response<proto::RecordMobileAdmissionResponse>, Status> {
         let req = request.into_inner();
         let identity = parse_identity_key(req.identity)?;
-        let class = crate::repository::admission_class_from_proto(req.admission_class)
-            .ok_or_else(|| Status::invalid_argument("admission_class is required"))?;
+        let class = crate::repository::admission_class_from_proto(req.admission_class).ok_or_else(
+            || HLR.invalid_field("admission_class", "An admission class is required"),
+        )?;
         if req.reason.len() > MAX_ADMISSION_LABEL_LEN
             || req.base_station.len() > MAX_ADMISSION_LABEL_LEN
         {
-            return Err(Status::invalid_argument(
-                "admission reason and base station are limited to 64 bytes",
-            ));
+            return Err(HLR.invalid("Admission reason and base station are limited to 64 bytes"));
         }
         let result = self
             .repo
@@ -442,7 +446,10 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
                 },
             )
             .await
-            .map_err(Status::internal)?;
+            .map_err(|e| {
+                log::error!("HLR: {e}");
+                HLR.database()
+            })?;
         Ok(Response::new(proto::RecordMobileAdmissionResponse {
             result: Some(mobile_seen_to_proto(&result)),
         }))
@@ -465,7 +472,10 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
                 req.offset,
             )
             .await
-            .map_err(Status::internal)?;
+            .map_err(|e| {
+                log::error!("HLR: {e}");
+                HLR.database()
+            })?;
         Ok(Response::new(proto::ListMobilesSeenResponse {
             mobiles: mobiles
                 .iter()
@@ -487,9 +497,9 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             .await
             .map_err(|e| {
                 log::error!("HLR: {e}");
-                Status::internal("internal error")
+                HLR.database()
             })?
-            .ok_or_else(|| Status::not_found("subscriber not found"))?;
+            .ok_or_else(subscriber_not_found)?;
 
         Ok(Response::new(proto::GetSubscriberByPhoneNumberResponse {
             subscriber: Some(subscriber_to_proto(&resolved.subscriber)),
@@ -512,9 +522,9 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             .await
             .map_err(|e| {
                 log::error!("HLR: {e}");
-                Status::internal("internal error")
+                HLR.database()
             })?
-            .ok_or_else(|| Status::not_found("subscriber not found"))?;
+            .ok_or_else(subscriber_not_found)?;
 
         Ok(Response::new(proto::GetSubscriberResponse {
             subscriber: Some(subscriber_to_proto(&resolved.subscriber)),
@@ -537,7 +547,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             .await
             .map_err(|e| {
                 log::error!("HLR: {e}");
-                Status::internal("internal error")
+                HLR.database()
             })?;
 
         Ok(Response::new(proto::ResolveSubscriberByIdentityResponse {
@@ -560,9 +570,9 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         request: Request<proto::ResolveSubscriberByRegisteredImsiRequest>,
     ) -> Result<Response<proto::ResolveSubscriberByIdentityResponse>, Status> {
         let req = request.into_inner();
-        model::validate_imsi(&req.imsi).map_err(Status::invalid_argument)?;
+        model::validate_imsi(&req.imsi).map_err(|e| HLR.invalid_field("imsi", e))?;
         if req.serving_bs_id.trim().is_empty() {
-            return Err(Status::invalid_argument("serving node is required"));
+            return Err(HLR.invalid_field("serving_bs_id", "A serving base station is required"));
         }
         let resolved = self
             .repo
@@ -602,12 +612,13 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         let resolved = resolved.map_err(|e| {
             log::error!("HLR: {e}");
             match e {
-                crate::repository::HardwareLookupError::Ambiguous => {
-                    Status::failed_precondition("ambiguous hardware identity")
-                }
-                crate::repository::HardwareLookupError::Unavailable(_) => {
-                    Status::internal("hardware identity lookup failed")
-                }
+                crate::repository::HardwareLookupError::Ambiguous => HLR
+                    .precondition(
+                        ErrorReason::IdentityAmbiguous,
+                        "More than one subscriber has this ESN or MEID",
+                    )
+                    .status(),
+                crate::repository::HardwareLookupError::Unavailable(_) => HLR.database(),
             }
         })?;
 
@@ -645,7 +656,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             serving_bs_id: req.serving_bs_id,
             state: model::RegistrationState::from_str(&req.state).map_err(|e| {
                 log::error!("HLR: {e}");
-                Status::internal("internal error")
+                HLR.database()
             })?,
             imsi: req.imsi,
             esn: req.esn,
@@ -665,7 +676,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             .await
             .map_err(|e| {
                 log::error!("HLR: {e}");
-                Status::internal("internal error")
+                HLR.database()
             })?;
 
         Ok(Response::new(proto::UpsertRegistrationBindingResponse {
@@ -685,9 +696,9 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             .await
             .map_err(|e| {
                 log::error!("HLR: {e}");
-                Status::internal("internal error")
+                HLR.database()
             })?
-            .ok_or_else(|| Status::not_found("subscriber not found"))?;
+            .ok_or_else(subscriber_not_found)?;
 
         Ok(Response::new(proto::ResolveSmsTargetResponse {
             subscriber: Some(subscriber_to_proto(&resolved.subscriber)),
@@ -710,7 +721,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
                 .await
                 .map_err(|e| {
                     log::error!("HLR: {e}");
-                    Status::internal("internal error")
+                    HLR.database()
                 })?;
 
         Ok(Response::new(proto::ListSubscribersResponse {
@@ -744,9 +755,9 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             .await
             .map_err(|e| {
                 log::error!("HLR: {e}");
-                Status::internal("internal error")
+                HLR.database()
             })?
-            .ok_or_else(|| Status::not_found("subscriber not found"))?;
+            .ok_or_else(subscriber_not_found)?;
 
         validate_optional_imsi(req.imsi.as_deref())?;
         validate_optional_meid(req.meid.as_deref())?;
@@ -766,7 +777,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
                 .await
                 .map_err(|e| {
                     log::error!("HLR: {e}");
-                    Status::internal("internal error")
+                    HLR.database()
                 })?;
             Some(
                 self.apply_identity_imei(identity, req.imei.as_deref())
@@ -782,7 +793,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             .await
             .map_err(|e| {
                 log::error!("HLR: {e}");
-                Status::internal("internal error")
+                HLR.database()
             })?;
 
         Ok(Response::new(proto::UpdateSubscriberResponse {
@@ -805,11 +816,11 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             .await
             .map_err(|e| {
                 log::error!("HLR: {e}");
-                Status::internal("internal error")
+                HLR.database()
             })?;
 
         if !deleted {
-            return Err(Status::not_found("subscriber not found"));
+            return Err(subscriber_not_found());
         }
 
         Ok(Response::new(()))
@@ -828,7 +839,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             .await
             .map_err(|e| {
                 log::error!("HLR: {e}");
-                Status::internal("internal error")
+                HLR.database()
             })?;
 
         Ok(Response::new(proto::GetRegistrationBindingResponse {
@@ -843,14 +854,15 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         let req = request.into_inner();
         let subscriber_id = parse_uuid(&req.subscriber_id)?;
         if req.wav_bytes.is_empty() {
-            return Err(Status::invalid_argument("wav_bytes is empty"));
+            return Err(HLR.invalid_field("wav_bytes", "The ringtone file is empty"));
         }
         if req.original_filename.is_empty() {
-            return Err(Status::invalid_argument("original_filename is empty"));
+            return Err(HLR.invalid_field("original_filename", "A file name is required"));
         }
         if req.original_filename.len() > 255 {
-            return Err(Status::invalid_argument(
-                "original_filename exceeds 255 chars",
+            return Err(HLR.invalid_field(
+                "original_filename",
+                "The file name must be 255 characters or fewer",
             ));
         }
 
@@ -861,11 +873,14 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             .map_err(|e| {
                 log::warn!("HLR set_ringtone: {e}");
                 if e.contains("preencode") {
-                    Status::invalid_argument(e)
+                    HLR.invalid_field(
+                        "wav_bytes",
+                        format!("The ringtone could not be encoded: {e}"),
+                    )
                 } else if e.contains("not found") {
-                    Status::not_found("subscriber not found")
+                    subscriber_not_found()
                 } else {
-                    Status::internal("internal error")
+                    HLR.database()
                 }
             })?;
 
@@ -891,7 +906,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         let subscriber_id = parse_uuid(&req.subscriber_id)?;
         self.repo.clear_ringtone(subscriber_id).await.map_err(|e| {
             log::error!("HLR: {e}");
-            Status::internal("internal error")
+            HLR.database()
         })?;
         Ok(Response::new(()))
     }
@@ -903,10 +918,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         let req = request.into_inner();
         let subscriber_id = parse_uuid(&req.subscriber_id)?;
         if !is_valid_codec_name(&req.codec) {
-            return Err(Status::invalid_argument(format!(
-                "unknown codec: {}",
-                req.codec
-            )));
+            return Err(HLR.invalid_field("codec", format!("Codec {} is not supported", req.codec)));
         }
         let blob = self
             .repo
@@ -914,9 +926,15 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             .await
             .map_err(|e| {
                 log::error!("HLR: {e}");
-                Status::internal("internal error")
+                HLR.database()
             })?
-            .ok_or_else(|| Status::not_found("ringtone not found"))?;
+            .ok_or_else(|| {
+                HLR.not_found(
+                    ErrorReason::RingtoneNotFound,
+                    "The subscriber has no ringtone",
+                )
+                .status()
+            })?;
         Ok(Response::new(proto::GetSubscriberRingtoneCodecResponse {
             encoded_frames: blob.encoded_frames,
             frame_count: blob.frame_count,
@@ -942,7 +960,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             .await
             .map_err(|e| {
                 log::error!("HLR list_prls: {e}");
-                Status::internal("internal error")
+                HLR.database()
             })?;
         let prls = rows.iter().map(prl_to_summary).collect();
         Ok(Response::new(proto::ListPrlsResponse { prls, total }))
@@ -960,9 +978,12 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             .await
             .map_err(|e| {
                 log::error!("HLR get_prl: {e}");
-                Status::internal("internal error")
+                HLR.database()
             })?
-            .ok_or_else(|| Status::not_found("PRL not found"))?;
+            .ok_or_else(|| {
+                HLR.not_found(ErrorReason::PrlNotFound, "PRL not found")
+                    .status()
+            })?;
         let prl = build_full_prl(row)?;
         Ok(Response::new(proto::GetPrlResponse { prl: Some(prl) }))
     }
@@ -1024,7 +1045,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         let prl_id = parse_uuid(&req.prl_id)?;
         let result = self.repo.soft_delete_prl(prl_id).await.map_err(|e| {
             log::error!("HLR delete_prl: {e}");
-            Status::internal("internal error")
+            HLR.database()
         })?;
         match result {
             Ok(()) => Ok(Response::new(())),
@@ -1033,10 +1054,24 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
                     referencing_subscribers: count,
                     sample_subscriber_ids: sample.iter().map(|u| u.to_string()).collect(),
                 };
-                Err(Status::failed_precondition(format!(
-                    "PRL is referenced by {} subscribers (sample: {:?})",
-                    detail.referencing_subscribers, detail.sample_subscriber_ids
-                )))
+                Err(HLR
+                    .precondition(
+                        ErrorReason::PrlInUse,
+                        format!(
+                            "The PRL is assigned to {} subscribers",
+                            detail.referencing_subscribers
+                        ),
+                    )
+                    .with("subscriber_count", detail.referencing_subscribers)
+                    .with(
+                        "sample_subscriber_id",
+                        detail
+                            .sample_subscriber_ids
+                            .first()
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
+                    .status())
             }
         }
     }
@@ -1060,7 +1095,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
     ) -> Result<Response<proto::GetDefaultPrlResponse>, Status> {
         let row = self.repo.get_default_prl().await.map_err(|e| {
             log::error!("HLR get_default_prl: {e}");
-            Status::internal("internal error")
+            HLR.database()
         })?;
         let prl = match row {
             Some(p) => Some(build_full_prl(p)?),
@@ -1113,9 +1148,10 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             None => None,
             Some(v) if v <= 2047 => Some(v as u16),
             Some(v) => {
-                return Err(Status::invalid_argument(format!(
-                    "firstchp_override {v} out of range 0..=2047"
-                )));
+                return Err(HLR.invalid_field(
+                    "firstchp_override",
+                    format!("FIRSTCHP {v} must be between 0 and 2047"),
+                ));
             }
         };
         self.repo
@@ -1136,15 +1172,19 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         let mut ssd_b = non_empty_key("ssd_b", req.ssd_b)?;
         if let Some(digits) = req.a_key_digits.filter(|d| !d.trim().is_empty()) {
             if a_key.is_some() {
-                return Err(Status::invalid_argument(
-                    "a_key and a_key_digits are mutually exclusive",
+                return Err(HLR.invalid_field(
+                    "a_key_digits",
+                    "Give the A-key as digits or as bytes, not both",
                 ));
             }
             let esn = identity.esn().ok_or_else(|| {
-                Status::invalid_argument("A-key check digits are computed over an ESN")
+                HLR.invalid_field(
+                    "a_key_digits",
+                    "A-key check digits need an ESN on the identity",
+                )
             })?;
             let verified = cdma_cave::AKey::from_entry_digits(&digits, cdma_cave::Esn(esn))
-                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+                .map_err(|e| HLR.invalid_field("a_key_digits", capitalize(&e.to_string())))?;
             a_key = Some(verified.0.to_vec());
             ssd_a = None;
             ssd_b = None;
@@ -1173,7 +1213,10 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             .get_subscriber_auth_state(&identity)
             .await
             .map_err(map_repo_error)?
-            .ok_or_else(|| Status::not_found("identity not found"))?;
+            .ok_or_else(|| {
+                HLR.not_found(ErrorReason::IdentityNotFound, "Identity not found")
+                    .status()
+            })?;
         Ok(Response::new(proto::GetSubscriberAuthStateResponse {
             subscriber_identity_id: state.subscriber_identity_id.to_string(),
             credentials_provisioned: state.credentials_provisioned,
@@ -1197,7 +1240,10 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             authr: req.authr,
             count: req
                 .count
-                .map(|count| u8::try_from(count).map_err(|_| Status::invalid_argument("count")))
+                .map(|count| {
+                    u8::try_from(count)
+                        .map_err(|_| HLR.invalid_field("count", "COUNT must be 255 or less"))
+                })
                 .transpose()?,
             auth_data: req.auth_data,
             generate_call_keys: req.generate_call_keys,
@@ -1224,7 +1270,8 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             randu: req.randu,
             authu: req.authu,
             imsi_s1: req.imsi_s1,
-            imsi_s2: u16::try_from(req.imsi_s2).map_err(|_| Status::invalid_argument("imsi_s2"))?,
+            imsi_s2: u16::try_from(req.imsi_s2)
+                .map_err(|_| HLR.invalid_field("imsi_s2", "IMSI_S2 must fit in 10 bits"))?,
             generate_call_keys: req.generate_call_keys,
         };
         let verdict = self
@@ -1315,8 +1362,8 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
     ) -> Result<Response<proto::BeginCaveKeyExchangeResponse>, Status> {
         let req = request.into_inner();
         let identity = parse_identity_key(req.identity)?;
-        let a_key_p_rev =
-            u8::try_from(req.a_key_p_rev).map_err(|_| Status::invalid_argument("a_key_p_rev"))?;
+        let a_key_p_rev = u8::try_from(req.a_key_p_rev)
+            .map_err(|_| HLR.invalid_field("a_key_p_rev", "A_KEY_P_REV must be 255 or less"))?;
         let offer = self
             .repo
             .begin_cave_key_exchange(&identity, a_key_p_rev)
@@ -1379,7 +1426,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         let req = request.into_inner();
         let summary = req
             .summary
-            .ok_or_else(|| Status::invalid_argument("SaveOtaspSession: summary missing"))?;
+            .ok_or_else(|| HLR.invalid_field("summary", "An OTASP session summary is required"))?;
         let row = otasp_row_from_request(summary, req.events_proto)?;
         self.repo
             .save_otasp_session(&row)
@@ -1429,7 +1476,10 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
             .get_otasp_session(session_id)
             .await
             .map_err(map_repo_error)?
-            .ok_or_else(|| Status::not_found("OTASP session not found"))?;
+            .ok_or_else(|| {
+                HLR.not_found(ErrorReason::OtaspSessionNotFound, "OTASP session not found")
+                    .status()
+            })?;
         let summary = otasp_session_row_to_summary(&row);
         // Decode the events_proto blob into the typed timeline so the
         // client doesn't have to.
@@ -1438,7 +1488,7 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         let wrap = events_proto::OtaspRecordedEvents::decode(row.events_proto.as_slice()).map_err(
             |e| {
                 log::error!("HLR get_otasp_session: events_proto decode failed: {e}");
-                Status::internal("internal error")
+                HLR.internal("The stored OTASP session could not be decoded")
             },
         )?;
         Ok(Response::new(proto::GetOtaspSessionResponse {
@@ -1481,8 +1531,8 @@ fn otasp_row_from_request(
         started_at: summary
             .started_at
             .map(|ts| chrono::DateTime::<chrono::Utc>::from_timestamp(ts.seconds, ts.nanos as u32))
-            .ok_or_else(|| Status::invalid_argument("started_at missing"))?
-            .ok_or_else(|| Status::invalid_argument("invalid started_at"))?,
+            .ok_or_else(|| HLR.invalid_field("started_at", "A start time is required"))?
+            .ok_or_else(|| HLR.invalid_field("started_at", "The start time is not valid"))?,
         ended_at: summary.ended_at.and_then(|ts| {
             chrono::DateTime::<chrono::Utc>::from_timestamp(ts.seconds, ts.nanos as u32)
         }),
@@ -1518,7 +1568,8 @@ fn build_full_prl(p: model::Prl) -> Result<proto::Prl, Status> {
 fn resolve_create_or_update_body(
     source: Option<proto::create_prl_request::Source>,
 ) -> Result<(Vec<u8>, i32, i16), Status> {
-    let src = source.ok_or_else(|| Status::invalid_argument("CreatePrl source missing"))?;
+    let src = source
+        .ok_or_else(|| HLR.invalid("The PRL is required, as raw bytes or as a decoded PRL"))?;
     match src {
         proto::create_prl_request::Source::RawBytes(bytes) => resolve_raw(bytes),
         proto::create_prl_request::Source::Built(d) => resolve_built(&d),
@@ -1542,7 +1593,7 @@ fn resolve_raw(bytes: Vec<u8>) -> Result<(Vec<u8>, i32, i16), Status> {
         Some(proto::prl_decoded::Body::Extended(e)) => {
             (e.pr_list_id as i32, e.cur_sspr_p_rev as i16)
         }
-        None => return Err(Status::invalid_argument("decoded body missing")),
+        None => return Err(HLR.invalid("The decoded PRL has no body")),
     };
     // Reject CRC mismatch up-front so we never persist a row whose CRC
     // doesn't recompute.
@@ -1569,7 +1620,7 @@ fn resolve_built(decoded: &proto::PrlDecoded) -> Result<(Vec<u8>, i32, i16), Sta
         Some(proto::prl_decoded::Body::Extended(e)) => {
             (e.pr_list_id as i32, e.cur_sspr_p_rev as i16)
         }
-        None => return Err(Status::invalid_argument("PrlDecoded.body missing")),
+        None => return Err(HLR.invalid("The decoded PRL has no body")),
     };
     Ok((bytes, pr_list_id, sspr_p_rev))
 }
@@ -1591,16 +1642,63 @@ fn map_validation_error(e: model::PrlValidationFailure) -> Status {
             (proto::prl_validation_error::Kind::EncodeFailed, d.clone())
         }
     };
-    Status::invalid_argument(format!("PRL validation: {:?} — {}", kind, detail))
+    HLR.error(
+        tonic::Code::InvalidArgument,
+        ErrorReason::PrlInvalid,
+        format!("The PRL is not valid: {detail}"),
+    )
+    .with("kind", kind.as_str_name())
+    .status()
 }
 
-fn map_repo_error(e: String) -> Status {
+fn subscriber_not_found() -> Status {
+    HLR.not_found(ErrorReason::SubscriberNotFound, "Subscriber not found")
+        .status()
+}
+
+fn capitalize(message: &str) -> String {
+    let mut chars = message.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+pub(crate) fn map_repo_error(e: String) -> Status {
+    if let Some(conflict) = crate::repository::parse_identity_in_use(&e) {
+        log::warn!("HLR repo validation: {e}");
+        return HLR
+            .error(
+                tonic::Code::AlreadyExists,
+                ErrorReason::IdentityInUse,
+                format!(
+                    "{} {} is already assigned to another subscriber",
+                    conflict.identity, conflict.value
+                ),
+            )
+            .with("identity", conflict.identity)
+            .with("value", conflict.value)
+            .with("subscriber_id", conflict.owner)
+            .status();
+    }
     if let Some(msg) = e.strip_prefix(crate::repository::VALIDATION_FAILED_PREFIX) {
         log::warn!("HLR repo validation: {msg}");
-        return Status::invalid_argument(msg.to_string());
+        let message = capitalize(msg);
+        return match msg {
+            "identity not found" => HLR
+                .not_found(ErrorReason::IdentityNotFound, message)
+                .status(),
+            "identity has no CAVE A-key" => HLR
+                .precondition(ErrorReason::AKeyMissing, "The identity has no A-key")
+                .status(),
+            "no key exchange in progress" | "no exchanged A-key to commit" => HLR
+                .precondition(ErrorReason::KeyExchangeNotStarted, message)
+                .status(),
+            _ => HLR.invalid(message),
+        };
     }
     log::error!("HLR repo: {e}");
-    Status::internal("internal error")
+    HLR.database()
 }
 
 fn is_valid_codec_name(name: &str) -> bool {
@@ -2081,5 +2179,60 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code(), Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn identity_conflict_names_the_owning_subscriber() {
+        let owner = Uuid::from_u128(7);
+        let status = map_repo_error(crate::repository::identity_in_use_for_test(
+            "MEID",
+            "A0000012345678",
+            owner,
+        ));
+        assert_eq!(status.code(), tonic::Code::AlreadyExists);
+        let info = cdma_rpc_error::error_info(&status).expect("error info");
+        assert_eq!(info.reason, ErrorReason::IdentityInUse);
+        assert_eq!(info.domain, "hlr");
+        assert_eq!(info.metadata["identity"], "MEID");
+        assert_eq!(info.metadata["value"], "A0000012345678");
+        assert_eq!(info.metadata["subscriber_id"], owner.to_string());
+    }
+
+    #[test]
+    fn repository_validation_errors_map_to_reasons() {
+        let reason = |message: &str| {
+            cdma_rpc_error::error_info(&map_repo_error(format!(
+                "{}{message}",
+                crate::repository::VALIDATION_FAILED_PREFIX
+            )))
+            .map(|info| info.reason)
+        };
+        assert_eq!(
+            reason("identity not found"),
+            Some(ErrorReason::IdentityNotFound)
+        );
+        assert_eq!(
+            reason("identity has no CAVE A-key"),
+            Some(ErrorReason::AKeyMissing)
+        );
+        assert_eq!(
+            reason("no key exchange in progress"),
+            Some(ErrorReason::KeyExchangeNotStarted)
+        );
+        assert_eq!(reason("something else"), Some(ErrorReason::InvalidArgument));
+        assert_eq!(
+            cdma_rpc_error::error_info(&map_repo_error("connection refused".into()))
+                .map(|info| info.reason),
+            Some(ErrorReason::DatabaseUnavailable)
+        );
+    }
+
+    #[test]
+    fn invalid_imsi_names_the_field() {
+        let status = validate_optional_imsi(Some("123")).unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        let fields = cdma_rpc_error::field_violations(&status);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].0, "imsi");
     }
 }

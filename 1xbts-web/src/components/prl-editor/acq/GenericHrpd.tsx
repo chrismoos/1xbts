@@ -40,7 +40,7 @@ export function GenericHrpdEditor({
       add={add}
       remove={removeAt}
       update={update}
-      label="HRPD entries"
+      label="EV-DO entries"
     />
   );
 }

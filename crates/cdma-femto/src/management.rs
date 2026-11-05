@@ -1,10 +1,13 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
+use cdma_rpc_error::{Domain, ErrorReason};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
+
+const FEMTO: Domain = Domain("femto");
 
 use cdma_cwmp::digest::DigestParams;
 
@@ -105,7 +108,15 @@ impl FemtoCellManagementService {
             return cells
                 .into_iter()
                 .find(|cell| cell.feid == peer_id)
-                .ok_or_else(|| Status::not_found(format!("unknown femtocell {peer_id}")));
+                .ok_or_else(|| {
+                    FEMTO
+                        .not_found(
+                            ErrorReason::FemtocellNotFound,
+                            format!("Femtocell {peer_id} is not known"),
+                        )
+                        .with("femtocell", peer_id)
+                        .status()
+                });
         }
         if let Some(wanted) = &request.cell {
             return cells
@@ -114,14 +125,26 @@ impl FemtoCellManagementService {
                     u32::from(cell.cell_id) == wanted.cell
                         && u32::from(cell.sector) == wanted.sector
                 })
-                .ok_or_else(|| Status::not_found("unknown femtocell cell"));
+                .ok_or_else(|| {
+                    FEMTO
+                        .not_found(
+                            ErrorReason::FemtocellNotFound,
+                            format!("No femtocell serves cell {}/{}", wanted.cell, wanted.sector),
+                        )
+                        .with("cell", format!("{}/{}", wanted.cell, wanted.sector))
+                        .status()
+                });
         }
         if cells.len() == 1 {
             return Ok(cells.into_iter().next().expect("one cell"));
         }
-        Err(Status::invalid_argument(
-            "peer_id or cell is required when multiple femtocells are configured",
-        ))
+        Err(FEMTO
+            .error(
+                tonic::Code::InvalidArgument,
+                ErrorReason::FemtocellRequired,
+                "More than one femtocell is configured, so choose one",
+            )
+            .status())
     }
 
     /// 5.x Airave firmware serves an unauthenticated `GET /acscall` on port 80.
@@ -130,9 +153,14 @@ impl FemtoCellManagementService {
     pub(crate) async fn request_connection(
         cell: &crate::cell::FemtoCellSnapshot,
     ) -> Result<(), Status> {
-        let peer = cell
-            .inner_peer_address
-            .ok_or_else(|| Status::failed_precondition("femtocell has no management path"))?;
+        let peer = cell.inner_peer_address.ok_or_else(|| {
+            FEMTO
+                .precondition(
+                    ErrorReason::FemtocellNoManagementPath,
+                    "The femtocell has no management tunnel yet",
+                )
+                .status()
+        })?;
 
         let (port, path, host_header) = cell
             .connection_request_url
@@ -145,27 +173,25 @@ impl FemtoCellManagementService {
             return Ok(());
         }
         if first.status_code != 401 {
-            return Err(Status::unavailable(format!(
-                "femtocell rejected the connection request (HTTP {})",
+            return Err(femtocell_unreachable(format!(
+                "The femtocell refused the connection request (HTTP {})",
                 first.status_code
             )));
         }
 
         let Some(creds) = cell.connection_request_credentials.as_ref() else {
-            return Err(Status::unavailable(
-                "femtocell connection request requires authentication but the profile has no credentials",
+            return Err(femtocell_auth_failed(
+                "The femtocell wants credentials, but its profile has none",
             ));
         };
         let challenge_header = first.www_authenticate.ok_or_else(|| {
-            Status::unavailable(
-                "femtocell connection request returned 401 without a Digest challenge",
-            )
+            femtocell_auth_failed("The femtocell asked for credentials without a Digest challenge")
         })?;
         let challenge = cdma_cwmp::digest::parse_challenge(&challenge_header);
         let (Some(realm), Some(nonce)) = (challenge.realm.as_deref(), challenge.nonce.as_deref())
         else {
-            return Err(Status::unavailable(
-                "femtocell connection request challenge is missing realm or nonce",
+            return Err(femtocell_auth_failed(
+                "The femtocell's Digest challenge has no realm or nonce",
             ));
         };
         let cnonce = connection_request_cnonce();
@@ -188,8 +214,8 @@ impl FemtoCellManagementService {
         if authed.is_success() {
             return Ok(());
         }
-        Err(Status::unavailable(format!(
-            "femtocell rejected the authenticated connection request (HTTP {})",
+        Err(femtocell_auth_failed(format!(
+            "The femtocell refused the credentials (HTTP {})",
             authed.status_code
         )))
     }
@@ -253,9 +279,9 @@ async fn http_connection_request(
         TcpStream::connect(address),
     )
     .await
-    .map_err(|_| Status::deadline_exceeded("femtocell connection request timed out"))?
+    .map_err(|_| femtocell_timeout())?
     .map_err(|error| {
-        Status::unavailable(format!("femtocell connection request failed: {error}"))
+        femtocell_unreachable(format!("The femtocell could not be reached: {error}"))
     })?;
 
     let mut request =
@@ -268,7 +294,7 @@ async fn http_connection_request(
         .write_all(request.as_bytes())
         .await
         .map_err(|error| {
-            Status::unavailable(format!("femtocell connection request failed: {error}"))
+            femtocell_unreachable(format!("The femtocell could not be reached: {error}"))
         })?;
 
     let mut buffer = Vec::with_capacity(1024);
@@ -276,11 +302,9 @@ async fn http_connection_request(
     loop {
         let read = tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut chunk))
             .await
-            .map_err(|_| {
-                Status::deadline_exceeded("femtocell connection request response timed out")
-            })?
+            .map_err(|_| femtocell_timeout())?
             .map_err(|error| {
-                Status::unavailable(format!("femtocell connection request failed: {error}"))
+                femtocell_unreachable(format!("The femtocell could not be reached: {error}"))
             })?;
         if read == 0 {
             break;
@@ -298,7 +322,7 @@ async fn http_connection_request(
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok())
         .ok_or_else(|| {
-            Status::unavailable("femtocell connection request returned an unparseable response")
+            femtocell_unreachable("The femtocell sent a response that could not be read")
         })?;
     let www_authenticate = text
         .lines()
@@ -352,7 +376,12 @@ pub fn spawn_background_sync(
                             return if succeeded {
                                 Ok(())
                             } else {
-                                Err(Status::unavailable("CWMP status readback failed"))
+                                Err(FEMTO
+                                    .unavailable(
+                                        ErrorReason::FemtocellStatusUnavailable,
+                                        "The femtocell did not report its status",
+                                    )
+                                    .status())
                             };
                         }
                         tokio::time::sleep(STATUS_POLL_INTERVAL).await;
@@ -414,16 +443,14 @@ impl FemtoManagementService for FemtoCellManagementService {
             request
                 .cell
                 .as_ref()
-                .ok_or_else(|| Status::invalid_argument("cell is required"))?,
+                .ok_or_else(|| FEMTO.invalid_field("cell", "A femtocell is required"))?,
         )?;
         let enabled = match femto_management::FemtoRadioAdministrativeState::try_from(request.state)
         {
             Ok(femto_management::FemtoRadioAdministrativeState::Enabled) => true,
             Ok(femto_management::FemtoRadioAdministrativeState::Disabled) => false,
             _ => {
-                return Err(Status::invalid_argument(
-                    "enabled or disabled state is required",
-                ));
+                return Err(FEMTO.invalid_field("state", "Choose enabled or disabled"));
             }
         };
         self.state.request_radio_state(&cell.feid, enabled);
@@ -471,14 +498,17 @@ impl FemtoManagementService for FemtoCellManagementService {
     ) -> Result<Response<femto_management::ReloadConfigResponse>, Status> {
         let path =
             std::env::var("FEMTO_CONFIG").unwrap_or_else(|_| "config/femto.json".to_string());
-        let config = crate::config::FemtoConfig::load(&path)
-            .map_err(|error| Status::internal(format!("reload: config load failed: {error}")))?;
+        let config = crate::config::FemtoConfig::load(&path).map_err(|error| {
+            config_reload_failed(format!("The femtocell config could not be read: {error}"))
+        })?;
         let registry = crate::fap::FapRegistry::from_config(
             &config.fap_profiles,
             &config.flat_sites,
             &config.faps,
         )
-        .map_err(|error| Status::internal(format!("reload: registry build failed: {error}")))?;
+        .map_err(|error| {
+            config_reload_failed(format!("The femtocell config is not valid: {error}"))
+        })?;
         let fap_count = registry.len() as u32;
         let site_count = config.sites.len() as u32;
         *self
@@ -565,9 +595,7 @@ impl FemtoBtsManagementService {
 }
 
 fn unsupported<T>(operation: &str) -> Result<Response<T>, Status> {
-    Err(Status::unimplemented(format!(
-        "femtocells do not support {operation} through BTS management"
-    )))
+    Err(FEMTO.not_supported(operation, "Femtocells do not support this"))
 }
 
 #[tonic::async_trait]
@@ -787,8 +815,9 @@ impl BscManagementService for FemtoBscManagementService {
     }
 
     async fn list_channels(&self, _: Request<()>) -> Result<Response<bsc::ChannelList>, Status> {
-        Err(Status::unimplemented(
-            "femtocells do not expose BSC channel allocation state",
+        Err(FEMTO.not_supported(
+            "channel_allocation_state",
+            "Femtocells do not report channel allocation state",
         ))
     }
 
@@ -798,8 +827,9 @@ impl BscManagementService for FemtoBscManagementService {
         &self,
         _: Request<()>,
     ) -> Result<Response<Self::StreamAccessEventsStream>, Status> {
-        Err(Status::unimplemented(
-            "femtocells do not expose BSC reverse access events",
+        Err(FEMTO.not_supported(
+            "reverse_access_events",
+            "Femtocells do not report reverse access events",
         ))
     }
 
@@ -809,8 +839,9 @@ impl BscManagementService for FemtoBscManagementService {
         &self,
         _: Request<()>,
     ) -> Result<Response<Self::StreamPagingEventsStream>, Status> {
-        Err(Status::unimplemented(
-            "femtocells do not expose BSC paging-channel events",
+        Err(FEMTO.not_supported(
+            "paging_channel_events",
+            "Femtocells do not report paging-channel events",
         ))
     }
 
@@ -820,8 +851,9 @@ impl BscManagementService for FemtoBscManagementService {
         &self,
         _: Request<()>,
     ) -> Result<Response<Self::StreamTrafficEventsStream>, Status> {
-        Err(Status::unimplemented(
-            "femtocells do not expose BSC traffic-channel events",
+        Err(FEMTO.not_supported(
+            "traffic_channel_events",
+            "Femtocells do not report traffic-channel events",
         ))
     }
 
@@ -829,8 +861,9 @@ impl BscManagementService for FemtoBscManagementService {
         &self,
         _: Request<bsc::SetTrafficChannelPowerOverrideRequest>,
     ) -> Result<Response<bsc::SetTrafficChannelPowerOverrideResponse>, Status> {
-        Err(Status::unimplemented(
-            "femtocells do not expose BSC reverse power control",
+        Err(FEMTO.not_supported(
+            "reverse_power_control",
+            "Femtocells do not report reverse power control",
         ))
     }
 }
@@ -878,6 +911,38 @@ impl ManagementFacadeService for FemtoBscManagementService {
             tokio_stream::wrappers::ReceiverStream::new(rx),
         )))
     }
+}
+
+fn femtocell_unreachable(message: impl Into<String>) -> Status {
+    FEMTO
+        .unavailable(ErrorReason::FemtocellUnreachable, message)
+        .status()
+}
+
+fn femtocell_auth_failed(message: impl Into<String>) -> Status {
+    FEMTO
+        .unavailable(ErrorReason::FemtocellAuthFailed, message)
+        .status()
+}
+
+fn femtocell_timeout() -> Status {
+    FEMTO
+        .error(
+            tonic::Code::DeadlineExceeded,
+            ErrorReason::FemtocellUnreachable,
+            "The femtocell did not answer in time",
+        )
+        .status()
+}
+
+fn config_reload_failed(message: impl Into<String>) -> Status {
+    FEMTO
+        .error(
+            tonic::Code::Internal,
+            ErrorReason::ConfigReloadFailed,
+            message,
+        )
+        .status()
 }
 
 #[cfg(test)]
@@ -956,7 +1021,10 @@ mod tests {
         let error = service.list_channels(Request::new(())).await.unwrap_err();
 
         assert_eq!(error.code(), Code::Unimplemented);
-        assert!(error.message().contains("do not expose"));
+        assert_eq!(
+            cdma_rpc_error::error_info(&error).map(|info| info.reason),
+            Some(ErrorReason::NotSupported)
+        );
     }
 
     #[tokio::test]

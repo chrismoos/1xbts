@@ -4,10 +4,13 @@ import Link from "next/link";
 import { use, useCallback, useEffect, useState } from "react";
 import { Card, Stat } from "@/components/card";
 import {
-  mobileForPacketSession,
+  isSyntheticPacketMobileAddress,
   mobileLabel,
   useMobileDirectory,
 } from "@/lib/mobile-directory";
+import { packetBearer, packetSubscriber } from "@/lib/packet-session";
+import { apiFetch } from "@/lib/api-client";
+import { ErrorNotice } from "@/components/error-notice";
 
 interface PacketSessionInfo {
   sessionId: string;
@@ -42,6 +45,7 @@ interface PacketSessionInfo {
   ipcpState: string;
   captureEnabled: boolean;
   accessTechnology: string;
+  pcfSessionId?: number;
 }
 
 interface PacketTraceEvent {
@@ -204,24 +208,23 @@ export default function PacketSessionDetailPage({
   const { id } = use(params);
   const [detail, setDetail] = useState<PacketSessionDetail | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
+  const [captureError, setCaptureError] = useState<unknown>(null);
   const [captureBusy, setCaptureBusy] = useState(false);
   const [activeTab, setActiveTab] = useState<"overview" | "rlp" | "ppp" | "capture">("overview");
   const mobiles = useMobileDirectory();
 
   const fetchDetail = useCallback(async () => {
     try {
-      const res = await fetch(`/api/packet-sessions/${encodeURIComponent(id)}`, {
-        cache: "no-store",
-      });
-      const data: PacketSessionResponse = await res.json();
-      if (!res.ok || data.error) {
-        throw new Error(data.error || `HTTP ${res.status}`);
-      }
+      const data = await apiFetch<PacketSessionResponse>(
+        `/api/packet-sessions/${encodeURIComponent(id)}`,
+        { cache: "no-store" },
+        "load the packet session",
+      );
       setDetail(data.session || null);
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "unknown error");
+      setError(err);
     } finally {
       setLoading(false);
     }
@@ -237,18 +240,15 @@ export default function PacketSessionDetailPage({
     async (enabled: boolean) => {
       setCaptureBusy(true);
       try {
-        const res = await fetch(
+        const data = await apiFetch<PacketSessionResponse>(
           `/api/packet-sessions/${encodeURIComponent(id)}/capture`,
-          { method: enabled ? "POST" : "DELETE" }
+          { method: enabled ? "POST" : "DELETE" },
+          enabled ? "start the packet capture" : "stop the packet capture",
         );
-        const data: PacketSessionResponse = await res.json();
-        if (!res.ok || data.error) {
-          throw new Error(data.error || `HTTP ${res.status}`);
-        }
         setDetail(data.session || null);
-        setError(null);
+        setCaptureError(null);
       } catch (err) {
-        setError(err instanceof Error ? err.message : "unknown error");
+        setCaptureError(err);
       } finally {
         setCaptureBusy(false);
       }
@@ -257,60 +257,63 @@ export default function PacketSessionDetailPage({
   );
 
   const summary = detail?.summary;
-  const mobile = summary ? mobileForPacketSession(summary, mobiles) : undefined;
-  const mobileLinkLabel = mobile ? mobileLabel(mobile) : undefined;
-  const isHrpd = summary?.accessTechnology === "HRPD";
-  const subscriberImsi = summary?.subscriberImsi || summary?.imsi || "";
+  const { mobile, evdoLinked } = summary ? packetSubscriber(summary, mobiles) : { mobile: undefined, evdoLinked: false };
+  const subscriberName = mobile
+    ? mobile.subscriberDisplayName || mobile.phoneNumber || mobileLabel(mobile).value
+    : undefined;
+  const bearer = summary ? packetBearer(summary, evdoLinked) : undefined;
+  const isHrpd = summary?.pcfSessionId != null;
+  const subscriberImsi = summary?.subscriberImsi || summary?.imsi || summary?.mnId || "";
 
   if (loading) {
     return (
-      <div className="max-w-7xl mx-auto">
+      <div className="page-container">
         <p className="text-sm text-dimmed">Loading...</p>
       </div>
     );
   }
 
-  if (error || !summary) {
+  if (error || !summary || !bearer) {
     return (
-      <div className="max-w-7xl mx-auto space-y-4">
+      <div className="page-container space-y-4">
         <Link href="/packets" className="text-sm text-muted hover:text-primary">
           &larr; Packets
         </Link>
-        <div className="rounded-lg border border-accent-red/20 bg-accent-red-bg p-4 text-sm text-accent-red">
-          {error || "Session not found"}
-        </div>
+        <ErrorNotice error={error ?? "This packet data session has ended or does not exist."} boxed />
       </div>
     );
   }
 
   return (
-    <div className="max-w-7xl mx-auto space-y-4">
+    <div className="page-container space-y-4">
       <div className="flex flex-wrap items-center gap-4">
         <Link href="/packets" className="text-sm text-muted hover:text-primary">
           &larr; Packets
         </Link>
-        {mobile && mobileLinkLabel ? (
-          <Link
-            href={`/mobiles/${encodeURIComponent(mobile.address)}`}
-            className="text-sm text-accent-cyan hover:text-accent-cyan"
-          >
-            MS {mobileLinkLabel.value}
-          </Link>
-        ) : summary.mobileAddress ? (
-          <span className="text-sm text-muted">
-            MS {summary.phoneNumber || summary.mobileAddress}
-          </span>
-        ) : (
-          null
-        )}
       </div>
 
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
-          <h1 className="font-mono text-lg font-bold text-primary">{summary.sessionId}</h1>
-          <div className="mt-1 text-sm text-muted">
-            {summary.accessTechnology || "1x"} · {serviceOptionName(summary.serviceOption)} · {formatPhase(summary.phase)} · age {formatAge(summary.createdAtMs)}
+          <div className="flex flex-wrap items-center gap-3">
+            <h1 className="text-lg font-bold text-primary">
+              {mobile && subscriberName ? (
+                <Link href={`/mobiles/${encodeURIComponent(mobile.address)}`} className="hover:underline">
+                  {subscriberName}
+                </Link>
+              ) : (
+                summary.phoneNumber || "Unknown subscriber"
+              )}
+            </h1>
+            <span className={`inline-flex rounded-full px-2 py-0.5 text-[11px] font-medium ${bearer.className}`}>
+              {bearer.label}
+            </span>
           </div>
+          <div className="mt-1 text-sm text-muted">
+            {[bearer.title, bearer.detail, formatPhase(summary.phase), `up ${formatAge(summary.createdAtMs)}`]
+              .filter(Boolean)
+              .join(" · ")}
+          </div>
+          <div className="mt-0.5 font-mono text-[11px] text-dimmed">{summary.sessionId}</div>
         </div>
         <button
           onClick={() => void setCapture(!summary.captureEnabled)}
@@ -329,6 +332,8 @@ export default function PacketSessionDetailPage({
         </button>
       </div>
 
+      <ErrorNotice error={captureError} />
+
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
         <Card title="Activity">
           <Stat label="Last Activity" value={formatTimestamp(summary.lastActivityAtMs)} mono />
@@ -337,17 +342,15 @@ export default function PacketSessionDetailPage({
           <Stat label="Phase Changed" value={formatTimestamp(summary.lastPhaseChangeAtMs)} mono />
         </Card>
         <Card title="Bearer">
-          <Stat
-            label={summary.accessTechnology === "HRPD" ? "A10 Key" : "Walsh"}
-            value={
-              summary.trafficWalshCode
-                ? summary.accessTechnology === "HRPD"
-                  ? String(summary.trafficWalshCode)
-                  : `W${summary.trafficWalshCode}`
-                : "-"
-            }
-            mono
-          />
+          <Stat label="Type" value={bearer.label} />
+          {isHrpd ? (
+            <Stat label="A10 Key" value={String(summary.pcfSessionId)} mono />
+          ) : (
+            <>
+              <Stat label="Service Option" value={serviceOptionName(summary.serviceOption)} mono />
+              <Stat label="Walsh" value={summary.trafficWalshCode ? `W${summary.trafficWalshCode}` : "-"} mono />
+            </>
+          )}
           <Stat label="Mobile IP" value={summary.peerIp || "-"} mono />
           <Stat label="Gateway IP" value={summary.ourIp || "-"} mono />
           <Stat label="TUN" value={summary.tunDevice || "-"} mono />
@@ -359,25 +362,28 @@ export default function PacketSessionDetailPage({
           <Stat label="DL Frames" value={summary.downlinkFrames.toLocaleString()} mono />
         </Card>
         <Card title="Subscriber">
-          {mobile && mobileLinkLabel && (
-            <div className="flex justify-between py-0.5">
-              <span className="text-muted text-sm">Mobile</span>
+          <div className="flex justify-between py-0.5">
+            <span className="text-muted text-sm">Name</span>
+            {mobile && subscriberName ? (
               <Link
                 href={`/mobiles/${encodeURIComponent(mobile.address)}`}
-                className="text-secondary text-sm font-mono hover:text-accent-cyan"
+                className="text-secondary text-sm hover:text-accent-cyan"
               >
-                {mobileLinkLabel.value}
+                {subscriberName}
               </Link>
-            </div>
+            ) : (
+              <span className="text-sm text-dimmed">Unknown</span>
+            )}
+          </div>
+          <Stat label="Phone" value={mobile?.phoneNumber || summary.phoneNumber || "-"} mono />
+          <Stat label="IMSI" value={subscriberImsi || "-"} mono />
+          {summary.esn ? (
+            <Stat label="ESN" value={`0x${summary.esn.toString(16).toUpperCase().padStart(8, "0")}`} mono />
+          ) : null}
+          {summary.meid && <Stat label="MEID" value={summary.meid} mono />}
+          {summary.mobileAddress && !isSyntheticPacketMobileAddress(summary.mobileAddress) && (
+            <Stat label="Address" value={summary.mobileAddress} mono />
           )}
-          <Stat label="Address" value={summary.mobileAddress || "-"} mono />
-          <Stat label="Phone" value={summary.phoneNumber || "-"} mono />
-          <Stat label="Subscriber IMSI" value={subscriberImsi || "-"} mono />
-          <Stat label="Subscriber" value={summary.subscriberId || "-"} mono />
-          <Stat label="ESN" value={summary.esn ? `0x${summary.esn.toString(16).toUpperCase().padStart(8, "0")}` : "-"} mono />
-          <Stat label="MEID" value={summary.meid || "-"} mono />
-          <Stat label="MN ID" value={summary.mnId || "-"} mono />
-          <Stat label="MN ID Source" value={summary.mnIdSource || "-"} mono />
         </Card>
       </div>
 
@@ -391,7 +397,7 @@ export default function PacketSessionDetailPage({
       {activeTab === "overview" && (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           <Card title="State">
-            <Stat label="Access" value={summary.accessTechnology || "1x"} />
+            <Stat label="Bearer" value={bearer.title} />
             <Stat label="Phase" value={formatPhase(summary.phase)} />
             <Stat label={isHrpd ? "A10" : "RLP"} value={formatStateLabel(summary.rlpState)} />
             <Stat label="LCP" value={formatStateLabel(summary.lcpState)} />

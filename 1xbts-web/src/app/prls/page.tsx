@@ -4,6 +4,8 @@ import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { Card } from "@/components/card";
 import { formatTimeMs } from "@/lib/format";
+import { apiFetch } from "@/lib/api-client";
+import { ErrorNotice } from "@/components/error-notice";
 
 interface PrlSummary {
   prlId: string;
@@ -31,22 +33,17 @@ function revLabel(rev: number): string {
 export default function PrlsPage() {
   const [prls, setPrls] = useState<PrlSummary[]>([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await fetch("/api/prls");
-      const data = await res.json();
-      if (data.error) {
-        setError(data.error);
-      } else {
-        setPrls(data.prls ?? []);
-        setError(null);
-      }
+      const data = await apiFetch<{ prls?: PrlSummary[] }>("/api/prls", undefined, "load PRLs");
+      setPrls(data.prls ?? []);
+      setError(null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "load failed");
+      setError(e);
     } finally {
       setLoading(false);
     }
@@ -59,13 +56,10 @@ export default function PrlsPage() {
   const setDefault = async (prlId: string) => {
     setBusyId(prlId);
     try {
-      const res = await fetch(`/api/prls/${prlId}/set-default`, { method: "POST" });
-      const data = await res.json();
-      if (data.error) {
-        setError(data.error);
-      } else {
-        await load();
-      }
+      await apiFetch(`/api/prls/${prlId}/set-default`, { method: "POST" }, "make this the default PRL");
+      await load();
+    } catch (e) {
+      setError(e);
     } finally {
       setBusyId(null);
     }
@@ -75,20 +69,17 @@ export default function PrlsPage() {
     if (!window.confirm(`Delete PRL "${name}"? This is permanent.`)) return;
     setBusyId(prlId);
     try {
-      const res = await fetch(`/api/prls/${prlId}`, { method: "DELETE" });
-      const data = await res.json();
-      if (data.error) {
-        setError(data.error);
-      } else {
-        await load();
-      }
+      await apiFetch(`/api/prls/${prlId}`, { method: "DELETE" }, `delete PRL "${name}"`);
+      await load();
+    } catch (e) {
+      setError(e);
     } finally {
       setBusyId(null);
     }
   };
 
   return (
-    <div className="space-y-4">
+    <div className="page-container space-y-4">
       <div className="flex items-baseline gap-3">
         <h1 className="text-primary text-lg font-medium">PRLs</h1>
         <Link
@@ -99,11 +90,7 @@ export default function PrlsPage() {
         </Link>
       </div>
 
-      {error && (
-        <Card title="Error" className="border-accent-red/40">
-          <p className="text-accent-red text-sm">{error}</p>
-        </Card>
-      )}
+      <ErrorNotice error={error} boxed />
 
       <Card title="">
         {loading ? (
@@ -113,15 +100,15 @@ export default function PrlsPage() {
             No PRLs yet. Upload a .prl file to get started.
           </p>
         ) : (
-          <table className="w-full text-xs">
+          <table className="data-table">
             <thead>
-              <tr className="text-left text-muted">
-                <th className="font-normal pr-3 py-1">Name</th>
-                <th className="font-normal pr-3">PR_LIST_ID</th>
-                <th className="font-normal pr-3">Rev</th>
-                <th className="font-normal pr-3">Size</th>
-                <th className="font-normal pr-3">Default</th>
-                <th className="font-normal pr-3">Updated</th>
+              <tr>
+                <th className="font-normal">Name</th>
+                <th className="font-normal">PR_LIST_ID</th>
+                <th className="font-normal">Rev</th>
+                <th className="font-normal">Size</th>
+                <th className="font-normal">Default</th>
+                <th className="font-normal">Updated</th>
                 <th className="font-normal" />
               </tr>
             </thead>
@@ -129,8 +116,8 @@ export default function PrlsPage() {
               {prls.map((p) => {
                 const updated = timestampMs(p.updatedAt);
                 return (
-                  <tr key={p.prlId} className="border-t border-border/30">
-                    <td className="py-1 pr-3">
+                  <tr key={p.prlId} className="border-border/30">
+                    <td>
                       <Link
                         href={`/prls/${p.prlId}`}
                         className="text-primary hover:underline"
@@ -138,10 +125,10 @@ export default function PrlsPage() {
                         {p.name}
                       </Link>
                     </td>
-                    <td className="font-mono pr-3">{p.prListId}</td>
-                    <td className="pr-3">{revLabel(p.ssprPRev)}</td>
-                    <td className="font-mono pr-3">{p.rawBytesSize} B</td>
-                    <td className="pr-3">
+                    <td className="font-mono">{p.prListId}</td>
+                    <td>{revLabel(p.ssprPRev)}</td>
+                    <td className="font-mono">{p.rawBytesSize} B</td>
+                    <td>
                       {p.isDefault ? (
                         <span className="text-accent-green">✓ default</span>
                       ) : (
@@ -154,7 +141,7 @@ export default function PrlsPage() {
                         </button>
                       )}
                     </td>
-                    <td className="pr-3">{updated ? formatTimeMs(updated) : "—"}</td>
+                    <td>{updated ? formatTimeMs(updated) : "—"}</td>
                     <td>
                       <button
                         onClick={() => remove(p.prlId, p.name)}

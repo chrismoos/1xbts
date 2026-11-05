@@ -1,6 +1,7 @@
 import { peerRequestFromUrl, selectorFromUrl } from "@/lib/cell";
 import { getNetworkManagementClient } from "@/lib/grpc/client";
 import { GetSessionResponse } from "@/lib/proto/an/v1/service";
+import { apiError, badRequest } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -11,7 +12,7 @@ export async function GET(
   const { uati } = await params;
   const uatiNum = Number.parseInt(uati, 16);
   if (!Number.isFinite(uatiNum)) {
-    return Response.json({ error: "invalid uati" }, { status: 400 });
+    return badRequest("The UATI is not valid", "uati");
   }
   const abort = new AbortController();
   const timeout = setTimeout(() => abort.abort(), 5000);
@@ -27,8 +28,7 @@ export async function GET(
     );
     return Response.json(GetSessionResponse.toJSON(result));
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    return Response.json({ error: msg }, { status: 502 });
+    return apiError(err, "load the EV-DO session");
   } finally {
     clearTimeout(timeout);
   }

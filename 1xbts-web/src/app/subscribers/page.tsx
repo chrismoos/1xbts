@@ -20,6 +20,8 @@ import {
   validateMeid,
   validatePhoneNumber,
 } from "@/lib/validation";
+import { apiFetch, fieldErrorsOf } from "@/lib/api-client";
+import { ErrorNotice } from "@/components/error-notice";
 
 type FieldErrors = {
   phoneNumber?: string;
@@ -73,8 +75,9 @@ export default function SubscribersPage() {
   const liveSubscribers = useLive<{ subscribers?: Subscriber[] }>("/api/subscribers");
   const subscribers = liveSubscribers.data?.subscribers ?? NO_SUBSCRIBERS;
   const loading = liveSubscribers.loading;
-  const [actionError, setError] = useState<string | null>(null);
-  const error = actionError ?? liveSubscribers.error;
+  const [deleteError, setDeleteError] = useState<unknown>(null);
+  const [createError, setCreateError] = useState<unknown>(null);
+  const listError = liveSubscribers.errorBody ?? liveSubscribers.error;
   const [showForm, setShowForm] = useState(false);
   const liveMobiles = useLive<MobileInfo[]>("/api/mobiles").data;
   const mobiles = Array.isArray(liveMobiles) ? liveMobiles : NO_MOBILES;
@@ -129,6 +132,7 @@ export default function SubscribersPage() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setSubmitting(true);
+    setCreateError(null);
 
     try {
       const normalizedPhoneNumber = phoneNumber.trim();
@@ -186,13 +190,16 @@ export default function SubscribersPage() {
       if (normalizedMeid) body.meid = normalizedMeid;
       if (normalizedImei) body.imei = normalizedImei;
 
-      const res = await fetch("/api/subscribers", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      const data: UpsertResponse = await res.json();
-      if (data.error) throw new Error(data.error);
+      await apiFetch<UpsertResponse>(
+        "/api/subscribers",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        },
+        "create the subscriber",
+      );
+      setCreateError(null);
 
       liveSocket().refresh("/api/subscribers");
 
@@ -208,9 +215,17 @@ export default function SubscribersPage() {
       setShowForm(false);
       liveSocket().refresh("/api/subscribers");
     } catch (err) {
-      setFieldErrors({
-        form: err instanceof Error ? err.message : "unknown error",
-      });
+      setFieldErrors(
+        fieldErrorsOf(err, {
+          phone_number: "phoneNumber",
+          phoneNumber: "phoneNumber",
+          imsi: "imsi",
+          esn: "esn",
+          meid: "meid",
+          imei: "imei",
+        }),
+      );
+      setCreateError(err);
     } finally {
       setSubmitting(false);
     }
@@ -218,19 +233,20 @@ export default function SubscribersPage() {
 
   const handleDelete = async (subscriberId: string) => {
     try {
-      const res = await fetch(`/api/subscribers?id=${encodeURIComponent(subscriberId)}`, {
-        method: "DELETE",
-      });
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
+      await apiFetch(
+        `/api/subscribers?id=${encodeURIComponent(subscriberId)}`,
+        { method: "DELETE" },
+        "delete the subscriber",
+      );
+      setDeleteError(null);
       liveSocket().refresh("/api/subscribers");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "unknown error");
+      setDeleteError(err);
     }
   };
 
   return (
-    <div className="max-w-7xl mx-auto space-y-6">
+    <div className="page-container space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-lg font-bold">Subscribers</h1>
         <button
@@ -435,6 +451,7 @@ export default function SubscribersPage() {
               </div>
             </div>
 
+            <ErrorNotice error={createError} className="text-xs" />
             {fieldErrors.form && (
               <p className="text-accent-red text-xs">{fieldErrors.form}</p>
             )}
@@ -451,31 +468,32 @@ export default function SubscribersPage() {
       )}
 
       <Card title={`Provisioned Subscribers (${subscribers.length})`}>
+        <ErrorNotice error={deleteError} className="mb-3" />
         {loading ? (
           <p className="text-dimmed text-sm">Loading...</p>
-        ) : error ? (
-          <p className="text-accent-red text-sm">{error}</p>
+        ) : listError ? (
+          <ErrorNotice error={listError} />
         ) : subscribers.length === 0 ? (
           <p className="text-dimmed text-sm">
             No subscribers provisioned. Click &quot;Add Subscriber&quot; to create one.
           </p>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-sm">
+            <table className="data-table">
               <thead>
-                <tr className="text-muted text-xs">
-                  <th className="text-left py-1">Phone Number</th>
-                  <th className="text-left py-1">Display Name</th>
-                  <th className="text-left py-1">Status</th>
-                  <th className="text-left py-1">Active Mobile</th>
-                  <th className="text-left py-1">Subscriber ID</th>
-                  <th className="text-left py-1"></th>
+                <tr>
+                  <th>Phone Number</th>
+                  <th>Display Name</th>
+                  <th>Status</th>
+                  <th>Active Mobile</th>
+                  <th>Subscriber ID</th>
+                  <th></th>
                 </tr>
               </thead>
               <tbody>
                 {subscribers.map((sub) => (
-                  <tr key={sub.subscriberId} className="border-t border-border hover:bg-hover">
-                    <td className="py-2 text-secondary font-mono text-xs">
+                  <tr key={sub.subscriberId}>
+                    <td className="text-secondary font-mono">
                       <Link
                         href={`/subscribers/${encodeURIComponent(sub.subscriberId)}`}
                         className="hover:text-accent-green transition-colors"
@@ -483,10 +501,10 @@ export default function SubscribersPage() {
                         {sub.phoneNumber}
                       </Link>
                     </td>
-                    <td className="py-2 text-secondary text-xs">
+                    <td className="text-secondary">
                       {sub.displayName || "-"}
                     </td>
-                    <td className="py-2">
+                    <td>
                       <span
                         className={`text-xs px-2 py-0.5 rounded ${
                           sub.status === "active"
@@ -499,7 +517,7 @@ export default function SubscribersPage() {
                         {sub.status}
                       </span>
                     </td>
-                    <td className="py-2 text-xs">
+                    <td>
                       {(() => {
                         const ms = mobiles.find((m) => m.subscriberId === sub.subscriberId);
                         if (!ms) return <span className="text-dimmed">-</span>;
@@ -513,7 +531,7 @@ export default function SubscribersPage() {
                         );
                       })()}
                     </td>
-                    <td className="py-2 text-muted font-mono text-[11px]">
+                    <td className="text-muted font-mono text-[11px]">
                       <Link
                         href={`/subscribers/${encodeURIComponent(sub.subscriberId)}`}
                         className="hover:text-accent-green transition-colors"
@@ -522,7 +540,7 @@ export default function SubscribersPage() {
                         {formatSubscriberId(sub.subscriberId)}
                       </Link>
                     </td>
-                    <td className="py-2 text-right space-x-3">
+                    <td className="text-right space-x-3">
                       <Link
                         href={`/subscribers/${encodeURIComponent(sub.subscriberId)}`}
                         className="text-xs text-accent-green hover:text-accent-green transition-colors"

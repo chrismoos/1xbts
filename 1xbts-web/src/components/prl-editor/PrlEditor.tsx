@@ -14,6 +14,7 @@ import { SysTab } from "./SysTab";
 import { CommonSubnetTab } from "./CommonSubnetTab";
 import { SaveReviewModal } from "./SaveReviewModal";
 import { buildSaveReview, type SaveReview } from "./save-review";
+import { ErrorNotice } from "@/components/error-notice";
 
 type Tab = "header" | "acq" | "sys" | "subnet";
 
@@ -38,7 +39,7 @@ export function PrlEditor({
   decoded: PrlDecoded;
   onSave: (next: PrlDecoded) => Promise<void> | void;
   saving?: boolean;
-  error?: string;
+  error?: unknown;
   metadata: PrlGeneralMetadata;
   metadataDirty: boolean;
 }) {
@@ -280,9 +281,9 @@ export function PrlEditor({
         </div>
       </div>
 
-      {error && (
-        <Card title="Save error" className="border-accent-red/40">
-          <p className="text-accent-red text-xs">{error}</p>
+      {error != null && (
+        <Card title="Error" className="border-accent-red/40">
+          <ErrorNotice error={error} className="text-xs" />
         </Card>
       )}
 

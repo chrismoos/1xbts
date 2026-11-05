@@ -91,9 +91,9 @@ function HrpdMobileCell({
     const uati = sessionKey >>> 0;
     return (
       <Link
-        href={`/hrpd/${uatiHexDigits(uati)}`}
+        href={`/evdo/${uatiHexDigits(uati)}`}
         className="font-mono text-xs w-48 shrink-0 flex items-center gap-1.5 text-accent-purple/90 hover:text-accent-purple hover:underline"
-        title={`HRPD session ${fullUati ?? uatiHex(uati)}`}
+        title={`EV-DO session ${fullUati ?? uatiHex(uati)}`}
         onClick={(e) => e.stopPropagation()}
       >
         <span className="text-dimmed w-3 text-center">H</span>
@@ -192,9 +192,9 @@ function hrpdFilterKey(entry: LogEntry): MessageFilter | "evdo" {
   if (entry.kind === "rx") return "1x-rx";
   if (entry.kind === "a1") return "a1";
   if (entry.kind === "hrpd") {
-    const direction = "direction" in entry.event ? hrpdDirectionLabel(entry.event.direction) : "EVDO";
-    if (direction === "EVDO TX") return "evdo-tx";
-    if (direction === "EVDO RX") return "evdo-rx";
+    const direction = "direction" in entry.event ? hrpdDirectionLabel(entry.event.direction) : "EV-DO";
+    if (direction === "EV-DO TX") return "evdo-tx";
+    if (direction === "EV-DO RX") return "evdo-rx";
     return "evdo";
   }
   return "all";
@@ -357,7 +357,7 @@ export default function MessagesPage() {
   const a1Count = entries.filter((e) => hrpdFilterKey(e) === "a1").length;
 
   return (
-    <div className="max-w-7xl mx-auto space-y-4">
+    <div className="page-container space-y-4">
       <div className="flex items-center gap-4 flex-wrap">
         <h1 className="text-lg font-bold">Message Log</h1>
         <div className="flex gap-1 ml-auto">
@@ -378,9 +378,9 @@ export default function MessagesPage() {
                   : f === "1x-rx"
                     ? `1x RX (${oneXRxCount})`
                     : f === "evdo-tx"
-                      ? `EVDO TX (${evdoTxCount})`
+                      ? `EV-DO TX (${evdoTxCount})`
                       : f === "evdo-rx"
-                        ? `EVDO RX (${evdoRxCount})`
+                        ? `EV-DO RX (${evdoRxCount})`
                         : `A1 (${a1Count})`}
             </button>
           ))}

@@ -18,6 +18,8 @@ import {
   reasonLabel,
   serviceLabel,
 } from "@/lib/admission";
+import { apiFetch } from "@/lib/api-client";
+import { ErrorNotice } from "@/components/error-notice";
 
 const ACTIVITY_LIMIT = 200;
 const PAGE_SIZES = [10, 25, 50] as const;
@@ -43,10 +45,10 @@ export function useAdmissionVerdicts(
   filter: AdmissionFilter,
   limit = ACTIVITY_LIMIT,
   currentOnly = false,
-): { events: AdmissionVerdict[]; policy: AccessPolicy | null; error: string | null } {
+): { events: AdmissionVerdict[]; policy: AccessPolicy | null; error: unknown } {
   const [events, setEvents] = useState<AdmissionVerdict[]>([]);
   const [policy, setPolicy] = useState<AccessPolicy | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const filterKey = JSON.stringify(filter);
   const stableFilter: AdmissionFilter = useMemo(() => JSON.parse(filterKey), [filterKey]);
 
@@ -58,14 +60,10 @@ export function useAdmissionVerdicts(
     params.set("limit", String(limit));
     if (currentOnly) params.set("current", "1");
     let cancelled = false;
-    const load = () => fetch(`/api/admission-events?${params}`)
-      .then((res) => res.json())
+    const load = () => apiFetch<{ events?: AdmissionVerdict[] } & AccessPolicy>(`/api/admission-events?${params}`, undefined, "load admission events")
       .then((data) => {
         if (cancelled) return;
-        if (data.error) {
-          setError(data.error);
-          return;
-        }
+        setError(null);
         setEvents(data.events ?? []);
         setPolicy({
           accessMode: data.accessMode,
@@ -73,7 +71,7 @@ export function useAdmissionVerdicts(
           authenticationMode: data.authenticationMode,
         });
       })
-      .catch((e) => !cancelled && setError(e instanceof Error ? e.message : "load failed"));
+      .catch((e) => !cancelled && setError(e));
     load();
     const interval = currentOnly ? setInterval(load, 10_000) : undefined;
     return () => {
@@ -229,7 +227,7 @@ export function AccessActivity({ filter }: { filter: AdmissionFilter }) {
   const [page, setPage] = useState(0);
   const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
 
-  if (error) return <p className="text-xs text-accent-red">{error}</p>;
+  if (error) return <ErrorNotice error={error} className="text-xs" />;
   if (events.length === 0) {
     return (
       <p className="text-xs text-dimmed">
@@ -245,37 +243,37 @@ export function AccessActivity({ filter }: { filter: AdmissionFilter }) {
   const rows = events.slice(first, first + pageSize);
   return (
     <div>
-      <table className="w-full text-xs">
+      <table className="data-table">
         <thead>
-          <tr className="text-muted text-left">
-            <th className="font-normal py-1 pr-3">Time</th>
-            <th className="font-normal py-1 pr-2 w-6" />
-            <th className="font-normal py-1 pr-3">Procedure</th>
-            <th className="font-normal py-1 pr-3">Access</th>
-            <th className="font-normal py-1 pr-3">Reason</th>
-            <th className="font-normal py-1">Base station</th>
+          <tr>
+            <th className="font-normal">Time</th>
+            <th className="font-normal w-6" />
+            <th className="font-normal">Procedure</th>
+            <th className="font-normal">Access</th>
+            <th className="font-normal">Reason</th>
+            <th className="font-normal">Base station</th>
           </tr>
         </thead>
         <tbody>
           {rows.map((verdict, index) => (
-            <tr key={`${verdict.time}-${first + index}`} className="border-t border-border-subtle">
-              <td className="py-1 pr-3 font-mono">
+            <tr key={`${verdict.time}-${first + index}`} className="border-border-subtle">
+              <td className="font-mono">
                 {verdict.time ? new Date(verdict.time).toLocaleTimeString() : "—"}
               </td>
-              <td className="py-1 pr-2">
+              <td>
                 <AccessMark verdict={verdict} />
               </td>
-              <td className="py-1 pr-3 capitalize">{procedureName(verdict.procedure)}</td>
-              <td className="py-1 pr-3">
+              <td className="capitalize">{procedureName(verdict.procedure)}</td>
+              <td>
                 <AccessBadge value={verdict.admissionClass} />
               </td>
-              <td className="py-1 pr-3">
+              <td>
                 {reasonLabel(verdict.reason)}
                 {verdict.serviceRejected && (
                   <span className="text-muted"> · {serviceLabel(verdict.service)} refused</span>
                 )}
               </td>
-              <td className="py-1 text-muted"><BaseStationLink baseStation={verdict.baseStation} nodes={nodes} /></td>
+              <td className="text-muted"><BaseStationLink baseStation={verdict.baseStation} nodes={nodes} /></td>
             </tr>
           ))}
         </tbody>

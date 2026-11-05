@@ -1,4 +1,5 @@
-import { createChannel, createClient } from "nice-grpc";
+import { createChannel } from "nice-grpc";
+import { grpcClients } from "./rich-client";
 import { EventServiceDefinition } from "../proto/events/v1/service";
 
 const EVENTS_GRPC_ADDRESS =
@@ -10,5 +11,5 @@ const eventsChannel = createChannel(EVENTS_GRPC_ADDRESS, undefined, {
 });
 
 export function getEventBusClient() {
-  return createClient(EventServiceDefinition, eventsChannel);
+  return grpcClients.create(EventServiceDefinition, eventsChannel);
 }

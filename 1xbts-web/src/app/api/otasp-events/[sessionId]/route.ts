@@ -1,5 +1,6 @@
 import { getHlrClient, waitForHlrReady } from "@/lib/grpc/hlr-client";
 import { GetOtaspSessionResponse } from "@/lib/proto/hlr/v1/service";
+import { apiError, notFound } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -19,7 +20,7 @@ export async function GET(
       { signal: abort.signal },
     );
     if (!result.session) {
-      return Response.json({ error: "session not found" }, { status: 404 });
+      return notFound("This OTASP session does not exist or was deleted");
     }
     // Use proto toJSON so Uint8Array bytes fields (e.g. PRL raw_bytes
     // embedded in the OtaspPrlReadback event) encode as base64 strings
@@ -30,9 +31,7 @@ export async function GET(
     >;
     return Response.json({ session: json.session });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    const status = msg.toLowerCase().includes("not found") ? 404 : 502;
-    return Response.json({ error: msg }, { status });
+    return apiError(err, "load the OTASP session");
   } finally {
     clearTimeout(timeout);
   }

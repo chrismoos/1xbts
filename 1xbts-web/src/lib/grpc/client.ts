@@ -1,10 +1,6 @@
-import {
-  ClientError,
-  Status,
-  createChannel,
-  createClient,
-  waitForChannelReady,
-} from "nice-grpc";
+import { createChannel } from "nice-grpc";
+import { describeError } from "../api-error";
+import { grpcClients, waitForService } from "./rich-client";
 import { NetworkManagementServiceDefinition } from "../proto/mgmt/v1/service";
 import { MscManagementServiceDefinition } from "../proto/msc_management/v1/service";
 
@@ -35,39 +31,23 @@ const mscChannel = createChannel(MSC_GRPC_ADDRESS, undefined, {
 });
 
 export function getMscManagementClient() {
-  return createClient(MscManagementServiceDefinition, mscChannel);
+  return grpcClients.create(MscManagementServiceDefinition, mscChannel);
 }
 
 // Every radio-access, HRPD, PCF, and PDSN management call routes through the
 // MSC's NetworkManagementService, which fans out to the addressed base station.
 export function getNetworkManagementClient() {
-  return createClient(NetworkManagementServiceDefinition, mscChannel);
+  return grpcClients.create(NetworkManagementServiceDefinition, mscChannel);
 }
 
 export async function waitForManagementReady(timeoutMs = MSC_GRPC_READY_TIMEOUT_MS) {
-  await waitForChannelReady(mscChannel, new Date(Date.now() + timeoutMs));
+  await waitForService(mscChannel, "/mgmt.v1.NetworkManagementService", timeoutMs);
 }
 
 export async function waitForMscReady(timeoutMs = MSC_GRPC_READY_TIMEOUT_MS) {
-  await waitForChannelReady(mscChannel, new Date(Date.now() + timeoutMs));
+  await waitForService(mscChannel, "/mgmt.v1.NetworkManagementService", timeoutMs);
 }
 
 export function grpcErrorStatus(err: unknown): number {
-  if (err instanceof ClientError) {
-    switch (err.code) {
-      case Status.INVALID_ARGUMENT:
-        return 400;
-      case Status.NOT_FOUND:
-        return 404;
-      default:
-        return 502;
-    }
-  }
-  return 502;
-}
-
-export function grpcErrorMessage(err: unknown): string {
-  if (err instanceof ClientError) return err.details;
-  if (err instanceof Error) return err.message;
-  return "unknown error";
+  return describeError(err).status;
 }

@@ -19,6 +19,14 @@ use crate::ppp::ipcp::IpcpConfig;
 /// can do forward enrichment from `imsi`/`esn` instead of resolving a
 /// bogus subscriber. Callers at the gRPC boundary should map empty
 /// strings to `None`.
+/// The A10 connection a session was registered on, from the A11 Session
+/// Specific Extension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct A10Reference {
+    pub pcf_session_id: u32,
+    pub mn_session_reference_id: u16,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SessionMetadata {
     pub access_technology: String,
@@ -37,6 +45,8 @@ pub struct SessionMetadata {
     pub mn_id_source: Option<String>,
     /// Authoritative subscriber IMSI, if separately resolved.
     pub subscriber_imsi: Option<String>,
+    /// Present only for a session registered over A11.
+    pub a10: Option<A10Reference>,
     pub traffic_walsh_code: u32,
 }
 
@@ -66,6 +76,7 @@ pub struct SessionStatus {
     pub mn_id: String,
     pub mn_id_source: String,
     pub subscriber_imsi: String,
+    pub a10: Option<A10Reference>,
     pub traffic_walsh_code: u32,
     pub rlp_state: String,
     pub lcp_state: String,
@@ -236,6 +247,7 @@ impl SessionStatus {
             mn_id: metadata.mn_id.unwrap_or_default(),
             mn_id_source: metadata.mn_id_source.unwrap_or_default(),
             subscriber_imsi: metadata.subscriber_imsi.unwrap_or_default(),
+            a10: metadata.a10,
             traffic_walsh_code: metadata.traffic_walsh_code,
             rlp_state: "sync".into(),
             lcp_state: "closed".into(),

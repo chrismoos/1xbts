@@ -222,8 +222,8 @@ export default function DashboardPage() {
       ? forwardReports.reduce((sum, c) => sum + (c.power?.forwardLastFerPct ?? 0), 0) / forwardReports.length
       : null;
 
-  const onVoice = mobiles.filter((m) => m.trafficWalshCode != null && !m.state.startsWith("HRPD")).length;
-  const onData = mobiles.filter((m) => m.state.startsWith("HRPD") && m.trafficWalshCode != null).length;
+  const onVoice = mobiles.filter((m) => m.trafficWalshCode != null && !m.state.startsWith("EV-DO")).length;
+  const onData = mobiles.filter((m) => m.state.startsWith("EV-DO") && m.trafficWalshCode != null).length;
   const smsToday = smsHistory.filter((s) => isToday(s.createdAt));
   const smsDelivered = smsToday.filter((s) => s.state === "delivered" || s.state === "sent").length;
   const smsPending = smsHistory.filter((s) => smsInFlight(s.state)).length;
@@ -235,7 +235,7 @@ export default function DashboardPage() {
   const nid = networkCells[0]?.nid;
 
   return (
-    <div className="max-w-7xl mx-auto space-y-4">
+    <div className="page-container space-y-4">
       <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
@@ -347,26 +347,6 @@ export default function DashboardPage() {
         <HrpdSummaryCard />
       </div>
 
-      <TrafficChannelsCard
-        channels={channelData?.channels ?? []}
-        channelsKey="/api/channels"
-        baseStation=""
-        showCell
-        unavailable={!channelData}
-        bodyClassName="h-64 overflow-y-auto"
-        footer={
-          <div className="mt-2 pt-2 border-t border-border flex items-center justify-between">
-            <span className="text-[11px] text-dimmed">
-              {channelData &&
-                `Walsh: ${channelData.channels.filter((c) => c.direction === "forward" && c.channelType !== "traffic").length} overhead · ${calls.length} traffic`}
-            </span>
-            <Link href="/channels" className="text-xs text-accent-green hover:text-accent-green">
-              All channels &rarr;
-            </Link>
-          </div>
-        }
-      />
-
       <Card
         title={`Mobiles (${mobiles.length})`}
         action={<span className="text-[11px] text-muted">by last heard</span>}
@@ -387,6 +367,26 @@ export default function DashboardPage() {
           )}
         </div>
       </Card>
+
+      <TrafficChannelsCard
+        channels={channelData?.channels ?? []}
+        channelsKey="/api/channels"
+        baseStation=""
+        showCell
+        unavailable={!channelData}
+        bodyClassName="h-64 overflow-y-auto"
+        footer={
+          <div className="mt-2 pt-2 border-t border-border flex items-center justify-between">
+            <span className="text-[11px] text-dimmed">
+              {channelData &&
+                `Walsh: ${channelData.channels.filter((c) => c.direction === "forward" && c.channelType !== "traffic").length} overhead · ${calls.length} traffic`}
+            </span>
+            <Link href="/channels" className="text-xs text-accent-green hover:text-accent-green">
+              All channels &rarr;
+            </Link>
+          </div>
+        }
+      />
 
       <div className="glass-card p-4">
         <div className="-mt-1 mb-3 flex gap-1 overflow-x-auto border-b border-border">

@@ -14,6 +14,7 @@ import { Pager } from "@/components/pager";
 import { useBaseStations } from "@/lib/use-base-stations";
 import { procedureName, reasonLabel, serviceLabel, type AdmissionVerdict } from "@/lib/admission";
 import { procedureLabel, resultLabel, type AuthVerdict } from "@/lib/authentication-verdict";
+import { ErrorNotice } from "@/components/error-notice";
 
 const PAGE_SIZES = [10, 25, 50] as const;
 const DEFAULT_PAGE_SIZE = 10;
@@ -73,7 +74,7 @@ export function MobileActivity({ filter }: { filter: AdmissionFilter }) {
 
   return (
     <Card title="Activity" action={viewSwitch}>
-      {error && <p className="text-xs text-accent-red mb-2">{error}</p>}
+      <ErrorNotice error={error} className="text-xs mb-2" />
       {rows.length === 0 ? (
         <p className="text-xs text-dimmed">
           {view === "auth"
@@ -85,33 +86,33 @@ export function MobileActivity({ filter }: { filter: AdmissionFilter }) {
       ) : (
         <>
           <div className="overflow-x-auto">
-            <table className="w-full text-xs">
+            <table className="data-table">
               <thead>
-                <tr className="text-muted text-left">
-                  <th className="font-normal py-1 pr-3">Time</th>
-                  <th className="font-normal py-1 pr-2 w-6" />
-                  <th className="font-normal py-1 pr-3">Kind</th>
-                  <th className="font-normal py-1 pr-3">Procedure</th>
-                  <th className="font-normal py-1 pr-3">Result</th>
-                  <th className="font-normal py-1 pr-3">Detail</th>
-                  <th className="font-normal py-1">Base station</th>
+                <tr>
+                  <th className="font-normal">Time</th>
+                  <th className="font-normal w-6" />
+                  <th className="font-normal">Kind</th>
+                  <th className="font-normal">Procedure</th>
+                  <th className="font-normal">Result</th>
+                  <th className="font-normal">Detail</th>
+                  <th className="font-normal">Base station</th>
                 </tr>
               </thead>
               <tbody>
                 {shown.map((row, index) => (
-                  <tr key={`${row.kind}-${row.verdict.time}-${index}`} className="border-t border-border-subtle">
-                    <td className="py-1 pr-3 font-mono whitespace-nowrap">
+                  <tr key={`${row.kind}-${row.verdict.time}-${index}`} className="border-border-subtle">
+                    <td className="font-mono whitespace-nowrap">
                       {row.verdict.time ? new Date(row.verdict.time).toLocaleTimeString() : "—"}
                     </td>
                     {row.kind === "access" ? (
                       <>
-                        <td className="py-1 pr-2"><AccessMark verdict={row.verdict} /></td>
-                        <td className="py-1 pr-3">
+                        <td><AccessMark verdict={row.verdict} /></td>
+                        <td>
                           <span className="rounded px-1.5 py-0.5 bg-badge-blue-bg text-badge-blue-text">Access</span>
                         </td>
-                        <td className="py-1 pr-3 capitalize">{procedureName(row.verdict.procedure)}</td>
-                        <td className="py-1 pr-3"><AccessBadge value={row.verdict.admissionClass} /></td>
-                        <td className="py-1 pr-3">
+                        <td className="capitalize">{procedureName(row.verdict.procedure)}</td>
+                        <td><AccessBadge value={row.verdict.admissionClass} /></td>
+                        <td>
                           {reasonLabel(row.verdict.reason)}
                           {row.verdict.serviceRejected && (
                             <span className="text-muted"> · {serviceLabel(row.verdict.service)} refused</span>
@@ -120,18 +121,18 @@ export function MobileActivity({ filter }: { filter: AdmissionFilter }) {
                       </>
                     ) : (
                       <>
-                        <td className="py-1 pr-2"><AuthenticationMark verdict={row.verdict} /></td>
-                        <td className="py-1 pr-3">
+                        <td><AuthenticationMark verdict={row.verdict} /></td>
+                        <td>
                           <span className="rounded px-1.5 py-0.5 bg-badge-purple-bg text-badge-purple-text">Auth</span>
                         </td>
-                        <td className="py-1 pr-3">{procedureLabel(row.verdict)}</td>
-                        <td className="py-1 pr-3">{resultLabel(row.verdict)}</td>
-                        <td className={`py-1 pr-3 ${row.verdict.serviceRejected ? "text-accent-red" : "text-muted"}`}>
+                        <td>{procedureLabel(row.verdict)}</td>
+                        <td>{resultLabel(row.verdict)}</td>
+                        <td className={`${row.verdict.serviceRejected ? "text-accent-red" : "text-muted"}`}>
                           {row.verdict.serviceRejected ? "service rejected" : "service allowed"}
                         </td>
                       </>
                     )}
-                    <td className="py-1 text-muted"><BaseStationLink baseStation={row.verdict.baseStation} nodes={nodes} /></td>
+                    <td className="text-muted"><BaseStationLink baseStation={row.verdict.baseStation} nodes={nodes} /></td>
                   </tr>
                 ))}
               </tbody>

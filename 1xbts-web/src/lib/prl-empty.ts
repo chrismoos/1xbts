@@ -83,7 +83,7 @@ export function runningSystemPrl(
     throw new Error("The running system is not transmitting a 1x carrier.");
   }
   if (selected.hrpd && !available.hrpd) {
-    throw new Error("The running system does not have an HRPD carrier.");
+    throw new Error("The running system does not have an EV-DO carrier.");
   }
 
   if (selected.oneX) {
@@ -115,10 +115,10 @@ export function runningSystemPrl(
 
   if (selected.hrpd) {
     if (!config.evdo) {
-      throw new Error("The running system does not have an HRPD carrier.");
+      throw new Error("The running system does not have an EV-DO carrier.");
     }
-    validateBandClass(config.evdo.bandClass, "HRPD");
-    validateChannel(config.evdo.channel, "HRPD");
+    validateBandClass(config.evdo.bandClass, "EV-DO");
+    validateChannel(config.evdo.channel, "EV-DO");
     const acqIndex = body.acquisitionRecords.length;
     const acq = emptyExtAcq(0x0b);
     acq.length = 2;
@@ -218,10 +218,10 @@ function hrpdSubnet(
 ): { commonHex: string; lsbLengthBits: number; lsbHex: string } {
   const normalized = sectorId.replace(/^0x/i, "").replace(/:/g, "");
   if (!/^[0-9a-f]{32}$/i.test(normalized)) {
-    throw new Error("The running system reported an invalid HRPD Sector ID.");
+    throw new Error("The running system reported an invalid EV-DO Sector ID.");
   }
   if (!Number.isInteger(subnetMask) || subnetMask < 0 || subnetMask > 128) {
-    throw new Error("The running system reported an invalid HRPD subnet mask.");
+    throw new Error("The running system reported an invalid EV-DO subnet mask.");
   }
 
   // SUBNET_LSB_LENGTH is seven bits. A /128 therefore needs one common

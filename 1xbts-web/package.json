@@ -11,7 +11,7 @@
     "build": "next build",
     "start": "NODE_ENV=production node server.mjs",
     "lint": "eslint",
-    "proto": "protoc --plugin=./node_modules/.bin/protoc-gen-ts_proto --ts_proto_out=src/lib/proto --ts_proto_opt=outputServices=nice-grpc,outputServices=generic-definitions,useExactTypes=false,useJsTypeOverride=true,esModuleInterop=true -I ../proto ../proto/bsc/v1/service.proto ../proto/events/v1/msc.proto ../proto/management/v1/service.proto ../proto/bts_management/v1/service.proto ../proto/femto_management/v1/service.proto ../proto/bsc_management/v1/service.proto ../proto/base_station/v1/service.proto ../proto/msc_management/v1/service.proto ../proto/pcf_management/v1/service.proto ../proto/pdsn_management/v1/service.proto ../proto/mgmt/v1/service.proto ../proto/hlr/v1/service.proto ../proto/smsc/v1/service.proto ../proto/packet/v1/service.proto ../proto/an/v1/service.proto ../proto/events/v1/an.proto ../proto/events/v1/cell.proto ../proto/events/v1/a1.proto ../proto/events/v1/femto.proto ../proto/events/v1/service.proto"
+    "proto": "protoc --plugin=./node_modules/.bin/protoc-gen-ts_proto --ts_proto_out=src/lib/proto --ts_proto_opt=outputServices=nice-grpc,outputServices=generic-definitions,useExactTypes=false,useJsTypeOverride=true,esModuleInterop=true -I ../proto ../proto/bsc/v1/service.proto ../proto/events/v1/msc.proto ../proto/management/v1/service.proto ../proto/bts_management/v1/service.proto ../proto/femto_management/v1/service.proto ../proto/bsc_management/v1/service.proto ../proto/base_station/v1/service.proto ../proto/msc_management/v1/service.proto ../proto/pcf_management/v1/service.proto ../proto/pcf/v1/service.proto ../proto/pdsn_management/v1/service.proto ../proto/mgmt/v1/service.proto ../proto/hlr/v1/service.proto ../proto/smsc/v1/service.proto ../proto/packet/v1/service.proto ../proto/an/v1/service.proto ../proto/events/v1/an.proto ../proto/events/v1/cell.proto ../proto/events/v1/a1.proto ../proto/events/v1/femto.proto ../proto/events/v1/service.proto ../proto/errors/v1/errors.proto"
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.11.0",
@@ -24,6 +24,7 @@
     "next": "16.2.0",
     "nice-grpc": "^2.1.14",
     "nice-grpc-common": "^2.0.2",
+    "nice-grpc-error-details": "0.3.0",
     "protobufjs": "^8.0.0",
     "react": "19.2.4",
     "react-dom": "19.2.4",

@@ -1,0 +1,112 @@
+# CSIM applet EF table (C.S0065-B §5.2, TS 102 221 §13 for the 2Fxx files).
+#
+# csim sends it to the applet with INIT_META after install and before each
+# write, 8 bytes per EF. sfi 0 means none. record_length is set for record
+# EFs only. read and update are ALW, PIN1, PIN2, ADM or NEV. Where the spec
+# leaves a size or record count to the operator, the note gives the value
+# chosen. The applet derives DEACTIVATE and ACTIVATE from the FID.
+
+- {name: EF_DIR, fid: "2F00", structure: linear-fixed, sfi: 0x1E, size: 38, record_length: 38, read: ALW, update: ADM, note: "SFI 1E (TS 102 221 Annex H), 1 record, seeded by the applet"}
+- {name: ICCID, fid: "2FE2", structure: transparent, sfi: 0x02, size: 10, read: ALW, update: NEV, note: "pre-personalization write only"}
+- {name: PL, fid: "2F05", structure: transparent, sfi: 0x00, size: 8, read: ALW, update: PIN1, note: "Preferred languages"}
+- {name: COUNT, fid: "6F21", structure: cyclic, sfi: 0x00, size: 20, record_length: 2, read: PIN1, update: PIN1, note: "10 records"}
+- {name: IMSI_M, fid: "6F22", structure: transparent, sfi: 0x04, size: 10, read: PIN1, update: ADM}
+- {name: IMSI_T, fid: "6F23", structure: transparent, sfi: 0x05, size: 10, read: PIN1, update: ADM}
+- {name: TMSI, fid: "6F24", structure: transparent, sfi: 0x06, size: 16, read: PIN1, update: PIN1}
+- {name: AH, fid: "6F25", structure: transparent, sfi: 0x00, size: 2, read: PIN1, update: PIN1}
+- {name: AOP, fid: "6F26", structure: transparent, sfi: 0x00, size: 1, read: PIN1, update: PIN1}
+- {name: ALOC, fid: "6F27", structure: transparent, sfi: 0x00, size: 7, read: PIN1, update: PIN1}
+- {name: CDMAHOME, fid: "6F28", structure: linear-fixed, sfi: 0x0C, size: 100, record_length: 5, read: PIN1, update: PIN1, note: "20 records"}
+- {name: ZNREGI, fid: "6F29", structure: linear-fixed, sfi: 0x00, size: 56, record_length: 8, read: PIN1, update: PIN1, note: "7 records"}
+- {name: SNREGI, fid: "6F2A", structure: transparent, sfi: 0x0D, size: 7, read: PIN1, update: PIN1}
+- {name: DISTREGI, fid: "6F2B", structure: transparent, sfi: 0x00, size: 8, read: PIN1, update: PIN1}
+- {name: ACCOLC, fid: "6F2C", structure: transparent, sfi: 0x03, size: 1, read: PIN1, update: ADM}
+- {name: TERM, fid: "6F2D", structure: transparent, sfi: 0x00, size: 1, read: PIN1, update: PIN1}
+- {name: SSCI, fid: "6F2E", structure: transparent, sfi: 0x00, size: 1, read: PIN1, update: PIN1}
+- {name: ACP, fid: "6F2F", structure: transparent, sfi: 0x00, size: 7, read: PIN1, update: PIN1}
+- {name: PRL, fid: "6F30", structure: transparent, sfi: 0x07, size: 256, read: PIN1, update: ADM, note: "MAX_PR_LIST_SIZE"}
+- {name: RUIMID, fid: "6F31", structure: transparent, sfi: 0x00, size: 8, read: ALW, update: NEV, note: "pre-personalization write only"}
+- {name: CSIM_ST, fid: "6F32", structure: transparent, sfi: 0x02, size: 10, read: PIN1, update: ADM, note: "services n1..n80"}
+- {name: SPC, fid: "6F33", structure: transparent, sfi: 0x00, size: 3, read: ADM, update: ADM}
+- {name: OTAPASPC, fid: "6F34", structure: transparent, sfi: 0x00, size: 1, read: PIN1, update: PIN1}
+- {name: NAMLOCK, fid: "6F35", structure: transparent, sfi: 0x00, size: 1, read: PIN1, update: PIN1}
+- {name: OTA, fid: "6F36", structure: transparent, sfi: 0x00, size: 17, read: PIN1, update: ADM, note: "2N+1, N=8 features"}
+- {name: SP, fid: "6F37", structure: transparent, sfi: 0x00, size: 1, read: PIN1, update: PIN1}
+- {name: ESN_ME, fid: "6F38", structure: transparent, sfi: 0x00, size: 8, read: ALW, update: ADM, note: "written by Store ESN_MEID_ME"}
+- {name: LI, fid: "6F3A", structure: transparent, sfi: 0x0A, size: 4, read: ALW, update: PIN1, note: "2N, N=2 languages"}
+- {name: FDN, fid: "6F3B", structure: linear-fixed, sfi: 0x00, size: 390, record_length: 39, read: PIN1, update: PIN2, note: "X+14, X=25, 10 records"}
+- {name: SMS, fid: "6F3C", structure: linear-fixed, sfi: 0x00, size: 2880, record_length: 192, read: PIN1, update: PIN1, note: "15 records of 192"}
+- {name: SMSP, fid: "6F3D", structure: linear-fixed, sfi: 0x00, size: 28, record_length: 28, read: PIN1, update: PIN1, note: "1 record"}
+- {name: SMSS, fid: "6F3E", structure: transparent, sfi: 0x00, size: 5, read: PIN1, update: PIN1, note: "5+X, X=0"}
+- {name: SSFC, fid: "6F3F", structure: transparent, sfi: 0x00, size: 111, read: PIN1, update: PIN1, note: "2N+1, N=55 codes"}
+- {name: SPN, fid: "6F41", structure: transparent, sfi: 0x08, size: 35, read: ALW, update: ADM}
+- {name: USGIND, fid: "6F42", structure: transparent, sfi: 0x00, size: 1, read: PIN1, update: ADM}
+- {name: AD, fid: "6F43", structure: transparent, sfi: 0x01, size: 3, read: ALW, update: ADM, note: "3+X, X=0"}
+- {name: MDN, fid: "6F44", structure: linear-fixed, sfi: 0x00, size: 11, record_length: 11, read: PIN1, update: PIN1, note: "1 record"}
+- {name: MAXPRL, fid: "6F45", structure: transparent, sfi: 0x00, size: 4, read: PIN1, update: ADM, note: "PRL and EPRL sizes"}
+- {name: SPCS, fid: "6F46", structure: transparent, sfi: 0x00, size: 1, read: PIN1, update: NEV, note: "derived from EF_SPC by the applet"}
+- {name: ECC, fid: "6F47", structure: transparent, sfi: 0x09, size: 15, read: ALW, update: ADM, note: "3n, n=5"}
+- {name: ME3GPDOPC, fid: "6F48", structure: transparent, sfi: 0x00, size: 1, read: PIN1, update: PIN1}
+- {name: OPM3GPD, fid: "6F49", structure: transparent, sfi: 0x00, size: 1, read: PIN1, update: PIN1, note: "§5.2.40 UPDATE PIN"}
+- {name: SIPCAP, fid: "6F4A", structure: transparent, sfi: 0x00, size: 4, read: PIN1, update: ADM}
+- {name: MIPCAP, fid: "6F4B", structure: transparent, sfi: 0x00, size: 5, read: PIN1, update: ADM}
+- {name: SIPUPP, fid: "6F4C", structure: transparent, sfi: 0x00, size: 128, read: PIN1, update: ADM, note: "operator"}
+- {name: MIPUPP, fid: "6F4D", structure: transparent, sfi: 0x00, size: 192, read: PIN1, update: ADM, note: "operator"}
+- {name: SIPSP, fid: "6F4E", structure: transparent, sfi: 0x00, size: 1, read: PIN1, update: PIN1}
+- {name: MIPSP, fid: "6F4F", structure: transparent, sfi: 0x00, size: 2, read: PIN1, update: PIN1, note: "operator"}
+- {name: SIPPAPSS, fid: "6F50", structure: transparent, sfi: 0x00, size: 33, read: PIN1, update: PIN1, note: "operator"}
+- {name: PUZL, fid: "6F53", structure: transparent, sfi: 0x00, size: 32, read: PIN1, update: ADM, note: "CUR_UZ_LIST_SIZE"}
+- {name: MAXPUZL, fid: "6F54", structure: transparent, sfi: 0x00, size: 5, read: PIN1, update: ADM}
+- {name: MECRP, fid: "6F55", structure: transparent, sfi: 0x00, size: 3, read: PIN1, update: PIN1}
+- {name: HRPDCAP, fid: "6F56", structure: transparent, sfi: 0x00, size: 3, read: PIN1, update: ADM}
+- {name: HRPDUPP, fid: "6F57", structure: transparent, sfi: 0x00, size: 83, read: PIN1, update: ADM, note: "operator, 83"}
+- {name: CSSPR, fid: "6F58", structure: transparent, sfi: 0x00, size: 1, read: PIN1, update: ADM}
+- {name: ATC, fid: "6F59", structure: transparent, sfi: 0x00, size: 1, read: PIN1, update: ADM}
+- {name: EPRL, fid: "6F5A", structure: transparent, sfi: 0x0E, size: 12288, read: PIN1, update: ADM, note: "MAX_PR_LIST_SIZE"}
+- {name: BCSMScfg, fid: "6F5B", structure: transparent, sfi: 0x00, size: 1, read: PIN1, update: ADM}
+- {name: BCSMSpref, fid: "6F5C", structure: transparent, sfi: 0x00, size: 1, read: PIN1, update: PIN1}
+- {name: BCSMStable, fid: "6F5D", structure: linear-fixed, sfi: 0x00, size: 8, record_length: 8, read: PIN1, update: ADM, note: "7+X, X=1"}
+- {name: BCSMSp, fid: "6F5E", structure: linear-fixed, sfi: 0x00, size: 2, record_length: 2, read: PIN1, update: PIN1}
+- {name: BAKPARA, fid: "6F63", structure: linear-fixed, sfi: 0x00, size: 32, record_length: 32, read: PIN1, update: ADM, note: "operator"}
+- {name: UpBAKPARA, fid: "6F64", structure: cyclic, sfi: 0x00, size: 32, record_length: 32, read: PIN1, update: ADM, note: "operator"}
+- {name: MMSN, fid: "6F65", structure: linear-fixed, sfi: 0x00, size: 40, record_length: 8, read: PIN1, update: PIN1, note: "4+X, X=4, 5 records"}
+- {name: EXT8, fid: "6F66", structure: linear-fixed, sfi: 0x00, size: 13, record_length: 13, read: PIN1, update: PIN1, note: "X+2, X=11"}
+- {name: MMSICP, fid: "6F67", structure: transparent, sfi: 0x00, size: 100, read: PIN1, update: ADM, note: "operator"}
+- {name: MMSUP, fid: "6F68", structure: linear-fixed, sfi: 0x00, size: 60, record_length: 60, read: PIN1, update: PIN1, note: "operator"}
+- {name: MMSUCP, fid: "6F69", structure: transparent, sfi: 0x00, size: 100, read: PIN1, update: PIN1, note: "UPDATE PIN/PIN2, PIN"}
+- {name: AUTH_CAP, fid: "6F6A", structure: linear-fixed, sfi: 0x00, size: 5, record_length: 5, read: PIN1, update: ADM, note: "1 record"}
+- {name: 3GCIK, fid: "6F6B", structure: transparent, sfi: 0x0B, size: 32, read: PIN1, update: ADM}
+- {name: DCK, fid: "6F6C", structure: transparent, sfi: 0x00, size: 20, read: PIN1, update: PIN1}
+- {name: GID1, fid: "6F6D", structure: transparent, sfi: 0x00, size: 8, read: PIN1, update: ADM, note: "1..n, n=8"}
+- {name: GID2, fid: "6F6E", structure: transparent, sfi: 0x00, size: 8, read: PIN1, update: ADM, note: "1..n, n=8"}
+- {name: CDMACNL, fid: "6F6F", structure: transparent, sfi: 0x00, size: 7, read: PIN1, update: ADM, note: "7n, n=1"}
+- {name: HOME_TAG, fid: "6F70", structure: transparent, sfi: 0x00, size: 32, read: PIN1, update: ADM, note: "operator"}
+- {name: GROUP_TAG, fid: "6F71", structure: transparent, sfi: 0x00, size: 32, read: PIN1, update: ADM, note: "operator"}
+- {name: SPECIFIC_TAG, fid: "6F72", structure: transparent, sfi: 0x00, size: 32, read: PIN1, update: ADM, note: "operator"}
+- {name: CALL_PROMPT, fid: "6F73", structure: transparent, sfi: 0x00, size: 32, read: PIN1, update: ADM, note: "operator"}
+- {name: SF_EUIMID, fid: "6F74", structure: transparent, sfi: 0x00, size: 7, read: ALW, update: NEV, note: "pre-personalization write only"}
+- {name: EST, fid: "6F75", structure: transparent, sfi: 0x0F, size: 1, read: PIN1, update: PIN2, note: "§5.2.80 UPDATE PIN2"}
+- {name: HIDDEN_KEY, fid: "6F76", structure: transparent, sfi: 0x00, size: 4, read: PIN1, update: PIN1, note: "§5.2.81 UPDATE PIN"}
+- {name: LCSVER, fid: "6F77", structure: transparent, sfi: 0x00, size: 4, read: PIN1, update: ADM, note: "4n, n=1"}
+- {name: LCSCP, fid: "6F78", structure: transparent, sfi: 0x00, size: 16, read: PIN1, update: ADM, note: "operator"}
+- {name: SDN, fid: "6F79", structure: linear-fixed, sfi: 0x00, size: 340, record_length: 34, read: PIN1, update: ADM, note: "§5.2.84 UPDATE ADM, X+14, X=20, 10 records"}
+- {name: EXT2, fid: "6F7A", structure: linear-fixed, sfi: 0x00, size: 26, record_length: 13, read: PIN1, update: PIN2, note: "§5.2.85 UPDATE PIN2, 2 records"}
+- {name: EXT3, fid: "6F7B", structure: linear-fixed, sfi: 0x00, size: 26, record_length: 13, read: PIN1, update: ADM, note: "§5.2.86 UPDATE ADM, 2 records"}
+- {name: ICI, fid: "6F7C", structure: cyclic, sfi: 0x10, size: 440, record_length: 44, read: PIN1, update: PIN1, note: "X+28, X=16, 10 records"}
+- {name: OCI, fid: "6F7D", structure: cyclic, sfi: 0x11, size: 430, record_length: 43, read: PIN1, update: PIN1, note: "X+27, X=16, 10 records"}
+- {name: EXT5, fid: "6F7E", structure: linear-fixed, sfi: 0x00, size: 26, record_length: 13, read: PIN1, update: PIN1, note: "2 records"}
+- {name: CCP2, fid: "6F7F", structure: linear-fixed, sfi: 0x12, size: 30, record_length: 15, read: PIN1, update: PIN1, note: "X>=15, 2 records"}
+- {name: AppLabels, fid: "6F80", structure: transparent, sfi: 0x00, size: 36, read: PIN1, update: ADM, note: "4+N*32, N=1"}
+- {name: Model, fid: "6F81", structure: transparent, sfi: 0x00, size: 126, read: PIN1, update: PIN1}
+- {name: RC, fid: "6F82", structure: transparent, sfi: 0x00, size: 32, read: ALW, update: ADM, note: "operator"}
+- {name: SMSCAP, fid: "6F83", structure: transparent, sfi: 0x00, size: 4, read: PIN1, update: ADM}
+- {name: MIPFlags, fid: "6F84", structure: transparent, sfi: 0x00, size: 1, read: PIN1, update: ADM}
+- {name: SIPUPPExt, fid: "6F85", structure: transparent, sfi: 0x00, size: 16, read: PIN1, update: ADM, note: "operator"}
+- {name: MIPUPPExt, fid: "6F86", structure: transparent, sfi: 0x00, size: 16, read: PIN1, update: ADM, note: "operator"}
+- {name: IPV6CAP, fid: "6F87", structure: transparent, sfi: 0x00, size: 21, read: PIN1, update: ADM}
+- {name: TCPConfig, fid: "6F88", structure: transparent, sfi: 0x00, size: 2, read: PIN1, update: ADM}
+- {name: DGC, fid: "6F89", structure: transparent, sfi: 0x00, size: 3, read: PIN1, update: ADM}
+- {name: WAPBrowserCP, fid: "6F8A", structure: transparent, sfi: 0x00, size: 32, read: PIN1, update: ADM, note: "operator"}
+- {name: WAPBrowserBM, fid: "6F8B", structure: transparent, sfi: 0x00, size: 32, read: PIN1, update: PIN1, note: "operator"}
+- {name: MMSConfig, fid: "6F8C", structure: transparent, sfi: 0x00, size: 8, read: PIN1, update: ADM}
+- {name: JDL, fid: "6F8D", structure: transparent, sfi: 0x00, size: 32, read: PIN1, update: ADM, note: "operator"}

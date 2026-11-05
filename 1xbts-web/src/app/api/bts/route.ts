@@ -5,6 +5,7 @@ import {
   waitForManagementReady,
 } from "@/lib/grpc/client";
 import type { BtsSummary } from "@/lib/proto/bts_management/v1/service";
+import { apiError } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
@@ -46,8 +47,7 @@ export async function GET(request: Request) {
     }
     return Response.json({ bts });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    return Response.json({ error: msg }, { status: 502 });
+    return apiError(err, "load BTS status");
   } finally {
     clearTimeout(timeout);
   }

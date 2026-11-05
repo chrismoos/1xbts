@@ -294,6 +294,10 @@ fn packet_metadata_from_a11(
         mn_id,
         mn_id_source: Some("a11".to_string()),
         subscriber_imsi: None,
+        a10: Some(cdma_packet::session_task::A10Reference {
+            pcf_session_id: key.pcf_session_id,
+            mn_session_reference_id: key.mn_session_reference_id,
+        }),
         traffic_walsh_code: key.pcf_session_id,
     }
 }
@@ -626,6 +630,13 @@ mod tests {
         assert_eq!(metadata.mn_id.as_deref(), Some("310556898017332"));
         assert_eq!(metadata.mn_id_source.as_deref(), Some("a11"));
         assert_eq!(metadata.mobile_address, "pcf-session:1a058001");
+        assert_eq!(
+            metadata.a10,
+            Some(cdma_packet::session_task::A10Reference {
+                pcf_session_id: key.pcf_session_id,
+                mn_session_reference_id: key.mn_session_reference_id,
+            })
+        );
     }
 
     #[test]

@@ -1,0 +1,154 @@
+# Profile template for `csim profile`, which fills it for one IMSI:
+#
+#   csim profile sim/examples/card.tmpl.yaml --imsi 001010000000042
+#
+# {imsi} is the IMSI, {min} its last 10 digits and {mdn} the MDN, by
+# default the MIN. {luhn} is the check digit of the digits before it.
+# {a_key} is a new random A-key and {secret} a new random 16-byte secret at
+# each use. Placeholders in comment lines are not filled, so uncomment a
+# block here to have it filled. EF coding follows C.S0065-B §5.2.
+
+pin1: "1234"
+# PUK1 and PUK2, 8 digits each. Unset keeps 12345678 and 87654321.
+# puk1: "12345678"
+# puk2: "87654321"
+
+# The first 8 digits are kept and the MIN and a check digit appended.
+iccid: "89012345{min}{luhn}"
+
+imsi_m: "{imsi}"
+imsi_t: "{imsi}"
+
+mdn: "{mdn}"
+
+# The SID must match the BTS. NID 65535 matches any NID. Band 0 is
+# cellular, 1 is PCS.
+cdmahome:
+  - { sid: 22, nid: 65535, band: 0 }
+
+accolc: 1                 # access overload class, 0-15
+ah: 1                     # analog home SID
+language: "en"            # EF_LI, the handset menu language
+# EF_ECC: numbers the handset dials as emergency calls, also without
+# service or a verified PIN.
+ecc: ["911", "112"]
+
+# n6 SMS storage, n8 HRPD. n10 and n32 are added from the other keys.
+services: [6, 8]
+enabled_services: []
+
+# The extended PRL lists SID 22 on BC0 channels 384 and 777. The path is
+# relative to this file.
+eprl_file: ../../crates/cdma-otasp/tests/fixtures/verizon_51611.prl
+
+# An empty classic PRL, for handsets that read EF_PRL.
+prl: "00 12 00 01 81 00 40 01 30 B0 52 B6 64 00 00 00 DC CC"
+
+# EF_SPN, the operator name a handset may show (C.S0065-B §5.2.32).
+# display_condition: 1 = display of the registered system is required,
+#   0 = not required.
+# char_encoding (C.R1001-G Table 9.1-1): csim encodes 0x00 octet,
+#   0x02 7-bit ASCII and 0x04 UCS-2. The name fits 32, 36 and 16
+#   characters in them.
+# language_indicator (C.R1001-G Table 9.2-1): 0x00 unknown, 0x01 English,
+#   0x02 French, 0x03 Spanish, 0x04 Japanese, 0x05 Korean, 0x06 Chinese,
+#   0x07 Hebrew.
+spn:
+  name: "1xBTS"
+  display_condition: 1
+  char_encoding: 0x00
+  language_indicator: 0x01
+
+# EF_USGIND: whether the card's UIM_ID and SF_EUIMID replace the handset's
+# ESN and MEID for identification and CAVE.
+usgind:
+  use_uim_id: false
+  use_sf_euimid: false
+
+# EF_HRPDCAP: limits for HRPD (EV-DO) access authentication.
+hrpdcap:
+  max_nai_length: 72          # longest NAI, in bytes
+  max_ss_length: 16           # longest shared secret, in bytes
+  chap_supported: true        # PPP CHAP authentication
+
+# 3GPD packet-data user profiles (C.S0016-D §3.5.8). Each NAI is the
+# user@realm the handset authenticates with and must exist on the network
+# element named below. The first NAI in a list is the active one. Setting
+# a block adds its service to CSIM_ST: n14 for simple_ip, n15 for
+# mobile_ip and n8 for hrpd_access.
+#
+# EF_SIPUPP, Simple IP: up to 15 NAIs by index 0-15. auth is none, chap,
+# pap or chap_pap, default chap. The sip_chap secret with the same index
+# answers the PDSN's CHAP challenge.
+# simple_ip:
+#   - { index: 0, nai: "{imsi}@1xbts.local", auth: chap }
+#
+# EF_MIPUPP, Mobile IP. home_address 0.0.0.0 asks the home agent to assign
+# one. The SPIs must match the home AAA (mn_aaa) and the home agent
+# (mn_ha). retry is optional: max_retries 0-3, first_retry_timeout_ms
+# 250-2000 in steps of 250, rereg_threshold_min 0-63.
+# mobile_ip:
+#   retry: { max_retries: 2, first_retry_timeout_ms: 1000, rereg_threshold_min: 5 }
+#   nais:
+#     - index: 0
+#       nai: "{imsi}@1xbts.local"
+#       reverse_tunneling: false
+#       home_address: 0.0.0.0
+#       primary_home_agent: 10.20.0.1
+#       secondary_home_agent: 10.20.0.2
+#       mn_aaa_auth: md5
+#       mn_aaa_spi: 2
+#       mn_ha_auth: md5
+#       mn_ha_spi: 300
+#
+# EF_HRPDUPP, HRPD (EV-DO) access authentication with the AN-AAA. The NAI
+# must fit max_nai_length in hrpdcap. auth is none or chap, default chap.
+# hrpd_access:
+#   nai: "{imsi}@1xbts.local"
+#   auth: chap
+
+# EF_SPC, the service programming code a handset asks for before NAM
+# programming. Quoted to keep the leading zeros.
+spc: "000000"
+
+# EFs without an encoder, as hex.
+raw:
+  OPM3GPD: "01"               # 3GPD operation mode (C.S0016-C §3.5.8.2)
+  OTA: "08 00 02 01 02 02 01 03 01 04 01 05 01 06 02 07 01"  # OTASP features and revisions
+  OTAPASPC: "00"              # OTAPA disabled
+  NAMLOCK: "00"               # NAM not locked
+  TERM: "07"                  # accept calls at home and roaming
+  SP: "62"                    # system B preferred, CDMA only
+
+# Secrets, loaded with ADM1 and not readable back. Each must match the
+# network's authentication center.
+#
+# CAVE A-key: 64 random bits with no structure (S.S0053 §2.2.2), as 16
+# hex digits (`openssl rand -hex 8`) or the 20-digit decimal form a
+# handset keypad takes (`printf '%020u\n' 0x<hex>`). The calculator at
+# https://1xbts.org/tools/akey-calculator/ generates one and shows both.
+a_key: "{a_key}"
+#
+# SSD_A and SSD_B, 16 bytes, normally derived by an SSD update. Set only
+# to preload the SSD the network already holds.
+# ssd: "CC38 1294 9F4D CD0D 3105 0234 580E 63B4"
+#
+# AKA root keys, 16 bytes each, for example from `openssl rand -hex 16`.
+# aka_root_key: "000102030405060708090A0B0C0D0E0F"
+# wlan_root_key: "101112131415161718191A1B1C1D1E1F"
+#
+# Packet-data shared secrets, up to 32 bytes each, by class and by the
+# index 0-3 of the NAI they belong to. secret_text takes the secret as
+# text, as AAA and home agent configurations usually hold it. secret takes
+# hex instead, for example from `openssl rand -hex 16`. Each must match
+# the network element that checks it. The hrpd secret must fit
+# max_ss_length in hrpdcap.
+# ip_secrets:
+#   # Simple IP CHAP to the PDSN or AAA.
+#   - { class: sip_chap, index: 0, secret: "{secret}" }
+#   # Mobile IP MN-HA authenticator, checked by the home agent.
+#   - { class: mn_ha, index: 0, secret: "{secret}" }
+#   # Mobile IP MN-AAA challenge response, checked by the home AAA.
+#   - { class: mn_aaa, index: 0, secret: "{secret}" }
+#   # HRPD access authentication CHAP to the AN-AAA.
+#   - { class: hrpd, index: 0, secret: "{secret}" }

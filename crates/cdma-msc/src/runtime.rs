@@ -4,6 +4,7 @@ mod m2m;
 use std::sync::Arc;
 use std::time::Duration;
 
+use cdma_rpc_error::ErrorReason;
 use log::{debug, info, warn};
 
 use cdma_common::consts::{
@@ -108,24 +109,38 @@ pub(crate) enum MtSetupError {
 impl MtSetupError {
     pub(crate) fn into_management_error(self) -> ManagementError {
         match self {
-            Self::SubscriberInactive(id) => {
-                ManagementError::Rejected(format!("subscriber {id} is not active"))
-            }
-            Self::NotRegistered(id) => {
-                ManagementError::Rejected(format!("subscriber {id} is not currently registered"))
-            }
-            Self::NotPageable(id, state) => ManagementError::Rejected(format!(
-                "subscriber {id} is not pageable in state {}",
-                state.as_str()
-            )),
-            Self::NoPageableImsi(id) => {
-                ManagementError::Rejected(format!("subscriber {id} has no IMSI for A1 paging"))
-            }
-            Self::ServingNodeUnavailable(id, node) => ManagementError::Rejected(format!(
-                "subscriber {id} is served by base station {node}, which is not attached"
-            )),
-            Self::A1Closed => ManagementError::Unavailable("A1 edge to BSC is closed"),
-            Self::Other(msg) => ManagementError::Rejected(msg),
+            Self::SubscriberInactive(id) => ManagementError::rejected(
+                ErrorReason::SubscriberInactive,
+                "The subscriber is not active",
+            )
+            .with("subscriber_id", id),
+            Self::NotRegistered(id) => ManagementError::rejected(
+                ErrorReason::SubscriberNotRegistered,
+                "The subscriber is not registered",
+            )
+            .with("subscriber_id", id),
+            Self::NotPageable(id, state) => ManagementError::rejected(
+                ErrorReason::SubscriberNotPageable,
+                format!("The subscriber cannot be paged in state {}", state.as_str()),
+            )
+            .with("subscriber_id", id)
+            .with("state", state.as_str()),
+            Self::NoPageableImsi(id) => ManagementError::rejected(
+                ErrorReason::SubscriberHasNoImsi,
+                "The subscriber has no IMSI to page",
+            )
+            .with("subscriber_id", id),
+            Self::ServingNodeUnavailable(id, node) => ManagementError::rejected(
+                ErrorReason::BaseStationNotAttached,
+                format!("The subscriber's base station {node} is not connected"),
+            )
+            .with("subscriber_id", id)
+            .with("base_station", node),
+            Self::A1Closed => ManagementError::unavailable(
+                ErrorReason::BscUnavailable,
+                "The link to the BSC is down",
+            ),
+            Self::Other(msg) => ManagementError::rejected(ErrorReason::CallRejected, msg),
         }
     }
 
@@ -1160,7 +1175,8 @@ impl MscRuntime {
             raw_user_data: None,
             serving_node: Some(node.clone()),
         })
-        .await;
+        .await
+        .ok();
     }
 
     async fn refresh_registration_binding(
@@ -1518,7 +1534,11 @@ impl MscRuntime {
                     smsc.send_sms(request).await
                 } else {
                     warn!("MSC: send_sms requested but SMSC coordinator is not configured");
-                    None
+                    Err(ManagementError::unavailable(
+                        ErrorReason::NotConfigured,
+                        "The MSC has no SMSC configured",
+                    )
+                    .with("feature", "smsc"))
                 };
                 if response_tx.send(result).is_err() {
                     warn!("MSC: send-sms response receiver dropped");
@@ -1546,7 +1566,7 @@ impl MscRuntime {
             .hlr_repo
             .get_subscriber_by_id(request.subscriber_id)
             .await
-            .map_err(ManagementError::Rejected)?
+            .map_err(ManagementError::HlrUnavailable)?
         else {
             return Err(ManagementError::UnknownSubscriber(request.subscriber_id));
         };
@@ -1556,9 +1576,11 @@ impl MscRuntime {
                 .supported_voice_service_options
                 .contains(&service_option)
         {
-            return Err(ManagementError::Rejected(format!(
-                "SO{service_option} is not a supported voice service option"
-            )));
+            return Err(ManagementError::rejected(
+                ErrorReason::UnsupportedServiceOption,
+                format!("SO {service_option} is not a supported voice service option"),
+            )
+            .with("service_option", service_option));
         }
         self.start_mt_service(
             a1,

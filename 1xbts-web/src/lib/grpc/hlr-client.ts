@@ -1,4 +1,5 @@
-import { createChannel, createClient, waitForChannelReady } from "nice-grpc";
+import { createChannel } from "nice-grpc";
+import { grpcClients, waitForService } from "./rich-client";
 import { HlrServiceDefinition } from "../proto/hlr/v1/service";
 import { coLocatedServiceAddress } from "./client";
 
@@ -11,9 +12,9 @@ const hlrChannel = createChannel(HLR_GRPC_ADDRESS, undefined, {
 });
 
 export function getHlrClient() {
-  return createClient(HlrServiceDefinition, hlrChannel);
+  return grpcClients.create(HlrServiceDefinition, hlrChannel);
 }
 
 export async function waitForHlrReady(timeoutMs = 1500) {
-  await waitForChannelReady(hlrChannel, new Date(Date.now() + timeoutMs));
+  await waitForService(hlrChannel, "/hlr.v1.HlrService", timeoutMs);
 }

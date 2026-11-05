@@ -7,15 +7,17 @@ pub mod a9_agent;
 pub mod bearer_relay;
 pub mod config;
 pub mod hrpd_a9_service;
+pub mod management;
 pub mod node;
 pub mod session;
 
 pub use bearer_relay::{HrpdPcfBearerRuntime, spawn_hrpd_pcf_bearer_relay};
 pub use config::PcfNodeConfig;
 pub use hrpd_a9_service::{
-    build_hrpd_a11_registration_request, configured_a8_ipv4_pair, inverted_udp_gre_bearer,
-    spawn_hrpd_pcf_a9_service,
+    HrpdA10SessionView, build_hrpd_a11_registration_request, configured_a8_ipv4_pair,
+    inverted_udp_gre_bearer, spawn_hrpd_pcf_a9_service, spawn_hrpd_pcf_a9_service_with_sessions,
 };
+pub use management::spawn_pcf_management;
 pub use node::{resolve_config_dir, run_node};
 pub use session::{
     PcfError, PcfEvent, PcfSession, PcfSessionId, PcfSessionManager, PcfSessionPhase,

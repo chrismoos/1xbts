@@ -5,6 +5,8 @@ import { Card } from "@/components/card";
 import { formatTimeMs as formatTime } from "@/lib/format";
 import { smsStateColor } from "@/lib/sms-state";
 import { teleserviceKind, teleserviceName } from "@/lib/teleservice";
+import { apiFetch } from "@/lib/api-client";
+import { ErrorNotice } from "@/components/error-notice";
 
 interface SmsRow {
   smsId: string;
@@ -27,7 +29,7 @@ function formatIsoTime(value?: string): string {
 export function RecentMessagesCard({ phone, limit = 10 }: { phone?: string; limit?: number }) {
   const [rows, setRows] = useState<SmsRow[]>([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
 
   useEffect(() => {
     if (!phone) {
@@ -39,16 +41,17 @@ export function RecentMessagesCard({ phone, limit = 10 }: { phone?: string; limi
     const load = async () => {
       try {
         const params = new URLSearchParams({ phone, limit: String(limit) });
-        const res = await fetch(`/api/sms-history?${params}`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
+        const data = await apiFetch<{ submissions?: typeof rows }>(
+          `/api/sms-history?${params}`,
+          undefined,
+          "load recent messages",
+        );
         if (!alive) return;
-        if (data.error) throw new Error(data.error);
         setRows(data.submissions || []);
         setError(null);
       } catch (err) {
         if (!alive) return;
-        setError(err instanceof Error ? err.message : "unknown");
+        setError(err);
       } finally {
         if (alive) setLoading(false);
       }
@@ -76,20 +79,20 @@ export function RecentMessagesCard({ phone, limit = 10 }: { phone?: string; limi
       {loading && rows.length === 0 ? (
         <p className="text-dimmed text-sm">Loading...</p>
       ) : error ? (
-        <p className="text-accent-red text-sm">{error}</p>
+        <ErrorNotice error={error} />
       ) : rows.length === 0 ? (
         <p className="text-dimmed text-sm">No messages.</p>
       ) : (
         <div className="overflow-x-auto">
-          <table className="w-full text-sm">
+          <table className="data-table">
             <thead>
-              <tr className="text-muted text-xs">
-                <th className="text-left py-1 pr-6">Time</th>
-                <th className="text-left py-1 pr-6">Direction</th>
-                <th className="text-left py-1 pr-6">Peer</th>
-                <th className="text-left py-1 pr-6">Type</th>
-                <th className="text-left py-1 pr-6">Body</th>
-                <th className="text-left py-1">State</th>
+              <tr>
+                <th>Time</th>
+                <th>Direction</th>
+                <th>Peer</th>
+                <th>Type</th>
+                <th>Body</th>
+                <th>State</th>
               </tr>
             </thead>
             <tbody>
@@ -101,11 +104,11 @@ export function RecentMessagesCard({ phone, limit = 10 }: { phone?: string; limi
                   ? `[binary, ${sms.rawUserDataHex ? sms.rawUserDataHex.length / 2 : 0} bytes]`
                   : sms.text;
                 return (
-                  <tr key={sms.smsId} className="border-t border-border hover:bg-hover">
-                    <td className="py-1.5 pr-6 text-muted font-mono text-xs whitespace-nowrap">
+                  <tr key={sms.smsId}>
+                    <td className="text-muted font-mono whitespace-nowrap">
                       {formatIsoTime(sms.createdAt)}
                     </td>
-                    <td className="py-1.5 pr-6 text-xs">
+                    <td>
                       <span className={`px-2 py-0.5 rounded ${
                         isMt
                           ? "bg-badge-blue-bg text-badge-blue-text"
@@ -114,16 +117,16 @@ export function RecentMessagesCard({ phone, limit = 10 }: { phone?: string; limi
                         {isMt ? "Incoming" : "Outgoing"}
                       </span>
                     </td>
-                    <td className="py-1.5 pr-6 text-secondary font-mono text-xs whitespace-nowrap">{peer || "-"}</td>
-                    <td className="py-1.5 pr-6 text-xs text-muted whitespace-nowrap">
+                    <td className="text-secondary font-mono whitespace-nowrap">{peer || "-"}</td>
+                    <td className="text-muted whitespace-nowrap">
                       {teleserviceName(sms.teleserviceId)}
                     </td>
-                    <td className={`py-1.5 pr-6 text-xs max-w-[20rem] truncate ${
+                    <td className={`max-w-[20rem] truncate ${
                       kind === "wap-push" ? "text-dimmed font-mono" : "text-secondary"
                     }`}>
                       {body}
                     </td>
-                    <td className="py-1.5">
+                    <td>
                       <span className={`text-xs px-2 py-0.5 rounded ${smsStateColor(sms.state)}`}>
                         {sms.state}
                       </span>

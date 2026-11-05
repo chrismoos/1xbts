@@ -1,10 +1,12 @@
 import { cellScopedRequestFromUrl } from "@/lib/cell";
 import { getNetworkManagementClient, waitForManagementReady } from "@/lib/grpc/client";
+import { apiError } from "@/lib/api-error";
 
 export const dynamic = "force-dynamic";
 
 async function withClient<T>(
-  action: (client: ReturnType<typeof getNetworkManagementClient>, signal: AbortSignal) => Promise<T>
+  action: string,
+  call: (client: ReturnType<typeof getNetworkManagementClient>, signal: AbortSignal) => Promise<T>
 ) {
   const abort = new AbortController();
   const timeout = setTimeout(() => abort.abort(), 5000);
@@ -12,10 +14,9 @@ async function withClient<T>(
   try {
     await waitForManagementReady();
     const client = getNetworkManagementClient();
-    return Response.json(await action(client, abort.signal));
+    return Response.json(await call(client, abort.signal));
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    return Response.json({ error: msg }, { status: 502 });
+    return apiError(err, action);
   } finally {
     clearTimeout(timeout);
   }
@@ -23,15 +24,15 @@ async function withClient<T>(
 
 export async function GET(request: Request) {
   const req = cellScopedRequestFromUrl(request.url);
-  return withClient((client, signal) => client.getIqCaptureStatus(req, { signal }));
+  return withClient("load the IQ capture status", (client, signal) => client.getIqCaptureStatus(req, { signal }));
 }
 
 export async function POST(request: Request) {
   const req = cellScopedRequestFromUrl(request.url);
-  return withClient((client, signal) => client.startIqCapture(req, { signal }));
+  return withClient("start the IQ capture", (client, signal) => client.startIqCapture(req, { signal }));
 }
 
 export async function DELETE(request: Request) {
   const req = cellScopedRequestFromUrl(request.url);
-  return withClient((client, signal) => client.stopIqCapture(req, { signal }));
+  return withClient("stop the IQ capture", (client, signal) => client.stopIqCapture(req, { signal }));
 }
