@@ -1,0 +1,30 @@
+[package]
+name = "csim"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Personalization and inspection of CSIM cards, and management of the 1xBTS CSIM applet."
+
+[features]
+default = []
+# The csim binary and the PC/SC reader transport, which needs libpcsclite.
+csim = ["dep:pcsc", "dep:clap"]
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"], optional = true }
+pcsc = { version = "2", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+sha1 = "0.10"
+thiserror = "2"
+
+[[bin]]
+name = "csim"
+path = "src/bin/csim/main.rs"
+required-features = ["csim"]
+
+[lints]
+workspace = true

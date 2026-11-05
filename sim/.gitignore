@@ -1,0 +1,11 @@
+applet/build/
+applet/lib/
+*.cap
+*.exp
+*.jca
+secrets.yaml
+*-secrets.yaml
+gradle.properties
+applet/.gradle/
+*.local.y*ml
+!applet/dist/*.cap
