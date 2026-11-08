@@ -1866,7 +1866,9 @@ dependencies = [
 name = "csim"
 version = "0.1.0"
 dependencies = [
+ "cdma-cave",
  "clap",
+ "md-5",
  "pcsc",
  "serde",
  "serde_yaml",

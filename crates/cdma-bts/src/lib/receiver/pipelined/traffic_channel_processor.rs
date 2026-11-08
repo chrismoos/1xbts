@@ -1,6 +1,6 @@
 use cdma_common::bits::Bitstream;
 use cdma_common::crc::crc12;
-use log::{debug, info, warn};
+use log::{debug, warn};
 use num_complex::Complex32;
 
 use crate::receiver::access::{AccessFrame, DedicatedFrameReader};
@@ -654,7 +654,7 @@ impl PipelineProcessor for TrafficChannelProcessor {
                 );
                 let mut info_bs = Bitstream::new_init(&signaling_block.bits);
                 if let Ok(Some(frame)) = self.suffix_reader.process(&mut info_bs) {
-                    info!(
+                    log::debug!(
                         "traffic_frame: walsh={} chip={} crc={} mux=2 mux_header=0x{:X} header_bits={} signaling_bits={} msg_len={} payload_bits={} preamble_frames={}",
                         self.walsh_code,
                         frame_chip,
@@ -744,7 +744,7 @@ impl PipelineProcessor for TrafficChannelProcessor {
                 let mut info_bs = Bitstream::new_init(&signaling_block.bits);
                 if let Ok(Some(frame)) = reader.process(&mut info_bs) {
                     let crc_status = if frame.crc_valid { "VALID" } else { "INVALID" };
-                    info!(
+                    log::debug!(
                         "traffic_frame: walsh={} chip={} crc={} layout={:?} mux_header=0b{:04b} signaling_bits={} msg_len={} payload_bits={} preamble_frames={}",
                         self.walsh_code,
                         frame_chip,
@@ -843,7 +843,7 @@ impl PipelineProcessor for TrafficChannelProcessor {
             let mut info_bs = Bitstream::new_init(info);
             if let Ok(Some(frame)) = self.suffix_reader.process(&mut info_bs) {
                 let crc_status = if frame.crc_valid { "VALID" } else { "INVALID" };
-                info!(
+                log::debug!(
                     "traffic_frame: walsh={} chip={} crc={} msg_len={} payload_bits={} preamble_frames={}",
                     self.walsh_code,
                     frame_chip,

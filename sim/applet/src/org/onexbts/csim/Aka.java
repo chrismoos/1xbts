@@ -49,14 +49,14 @@ public final class Aka {
         k = new byte[BLK];
         wlanK = new byte[BLK];
         sqnMs = new byte[SQN_LEN];
-        ak = JCSystem.makeTransientByteArray(AK_LEN, JCSystem.CLEAR_ON_DESELECT);
-        sqn = JCSystem.makeTransientByteArray(SQN_LEN, JCSystem.CLEAR_ON_DESELECT);
-        res = JCSystem.makeTransientByteArray(RES_LEN, JCSystem.CLEAR_ON_DESELECT);
-        mac = JCSystem.makeTransientByteArray(MAC_LEN, JCSystem.CLEAR_ON_DESELECT);
-        ckik = JCSystem.makeTransientByteArray((short) 32, JCSystem.CLEAR_ON_DESELECT);
-        uak = JCSystem.makeTransientByteArray(UAK_LEN, JCSystem.CLEAR_ON_DESELECT);
-        amf0 = JCSystem.makeTransientByteArray(AMF_LEN, JCSystem.CLEAR_ON_DESELECT);
-        okFlag = JCSystem.makeTransientByteArray((short) 1, JCSystem.CLEAR_ON_DESELECT);
+        ak = JCSystem.makeTransientByteArray(AK_LEN, JCSystem.CLEAR_ON_RESET);
+        sqn = JCSystem.makeTransientByteArray(SQN_LEN, JCSystem.CLEAR_ON_RESET);
+        res = JCSystem.makeTransientByteArray(RES_LEN, JCSystem.CLEAR_ON_RESET);
+        mac = JCSystem.makeTransientByteArray(MAC_LEN, JCSystem.CLEAR_ON_RESET);
+        ckik = JCSystem.makeTransientByteArray((short) 32, JCSystem.CLEAR_ON_RESET);
+        uak = JCSystem.makeTransientByteArray(UAK_LEN, JCSystem.CLEAR_ON_RESET);
+        amf0 = JCSystem.makeTransientByteArray(AMF_LEN, JCSystem.CLEAR_ON_RESET);
+        okFlag = JCSystem.makeTransientByteArray((short) 1, JCSystem.CLEAR_ON_RESET);
     }
 
     public void loadRootKey(byte[] src, short off) {

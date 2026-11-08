@@ -1,5 +1,6 @@
 # HEAD
-
+- Reduced CSIM flash wear and improved authentication performance and reliability.
+- Authentication COUNT updates now default to once per 24 hours on the next traffic connection.
 - Added a CSIM applet for sysmoISIM-SJA5 cards and a `csim` tool to personalize and inspect CSIM cards. See `sim/README.md`.
 - Web UI updates to EV-DO, packet data, and cell view.
 - Added support for Mobile IP handsets that compute the MN-HA authenticator per RFC 3344.

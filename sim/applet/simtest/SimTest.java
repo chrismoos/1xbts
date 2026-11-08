@@ -285,7 +285,7 @@ public class SimTest {
         check("UNBLOCK re-enabled PIN1 (PS_DO)", contains(r.getData(), "C60C9001E0"), hex(r.getData()));
         sw("verify PIN1 restored", tx("00200001083132333 4FFFFFFFF".replace(" ", "")), 0x9000);
         r = tx("80FE000000");
-        check("platform info is 29 bytes", r.getSW() == 0x9000 && r.getData().length == 29, String.format("SW=%04X len=%d %s", r.getSW(), r.getData().length, hex(r.getData())));
+        check("platform info is 39 bytes", r.getSW() == 0x9000 && r.getData().length == 39, String.format("SW=%04X len=%d %s", r.getSW(), r.getData().length, hex(r.getData())));
         check("platform info: direct and copy checksums agree", r.getSW() == 0x9000
               && hex(r.getData()).substring(32, 36).equals(hex(r.getData()).substring(36, 40))
               && hex(r.getData()).substring(40, 44).equals(hex(r.getData()).substring(44, 48)), hex(r.getData()));
@@ -320,6 +320,18 @@ public class SimTest {
         r = tx("808E0000020005" + "00");
         check("Generate Key/VPM subset 00..05 is key + 6 octets",
              r.getSW() == 0x9000 && r.getData().length == 14, String.format("SW=%04X len=%d", r.getSW(), r.getData().length));
+        // VPM blocks are generated only up to the last requested octet, so
+        // key-only and tail ranges must still match the full vector.
+        data("Generate Key/VPM key only", tx("808E000002FFFF00"), "A07B1CD102756914");
+        data("Generate Key/VPM tail 3C..40", tx("808E0000023C4000"),
+             "A07B1CD102756914" + "4780CCB8DF");
+        // The saved registers survive the ME re-selecting the CSIM between
+        // Run CAVE and Generate Key/VPM (C.S0023-D §4.4.4.2).
+        sw("select MF before CSIM re-select", tx("00A40004023F00"), 0x9000);
+        sw("re-select CSIM ADF", tx(concat("00A40404", AID_BYTES, "00")), 0x9000);
+        sw("verify PIN1 after re-select", tx("00200001083132333 4FFFFFFFF".replace(" ", "")), 0x9000);
+        data("Generate Key/VPM after CSIM re-select", tx("808E000002FFFF00"), "A07B1CD102756914");
+        sw("verify ADM1 after re-select", tx("0020000A080000000000000000"), 0x9000);
 
         // Unique challenge: RANDU in octets 3-5, RANDTYPE=01.
         r = tx("0088008011" + "01" + "00" + "34A2B0" + "00" + "000000" + "00" + "EC965AD7000000" + "00");
@@ -331,6 +343,8 @@ public class SimTest {
         data("A-key checksum digits (086500)", tx("80F8000004D75A96EC00"), "303836353030");
 
         // SSD generation + update + confirm, end to end.
+        caveDeterministicRegression(meta);
+        caveRamTableReset(meta);
         caveSsdGeneration(meta);
 
         // OTASP A-key Diffie-Hellman end to end (C.S0016-C §5, p_rev 2).
@@ -493,20 +507,112 @@ public class SimTest {
         }
 
         hardening(meta);
+        cyclicPersistence(meta);
+        ssdCandidatePersistence(meta);
 
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURES");
         System.exit(failures == 0 ? 0 : 1);
     }
 
-    /**
-     * SSD generation / update / confirm end to end. The card's AUTHBS is
-     * computed over a RANDBS it generates randomly, so the expected value
-     * is produced on a second card loaded with the known SSD by running
-     * CAVE over that same RANDBS: AUTHBS == Auth_Signature(RANDBS, MIN1,
-     * SSD_A). A matching Confirm SSD then proves the generated SSD equals
-     * the known value, and the final Run CAVE confirms it against the
-     * AUTHR vector.
-     */
+    static void caveDeterministicRegression(byte[] meta) throws Exception {
+        CardSimulator card = freshCaveSim(meta);
+        java.util.Random random = new java.util.Random(0xCAFE);
+        java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+        for (int i = 0; i < 512; i++) {
+            byte[] secret = new byte[16];
+            byte[] input = new byte[21];
+            random.nextBytes(input);
+            System.arraycopy(input, 5, secret, 0, secret.length);
+            ResponseAPDU r = txOn(card, "80F6010010" + hex(secret));
+            if (r.getSW() != 0x9000) throw new Exception("regression SSD load failed");
+            byte[] auth = new byte[23];
+            random.nextBytes(auth);
+            auth[0] = 0;
+            auth[1] = (byte) 0x88;
+            auth[2] = 0;
+            auth[3] = (byte) 0x80;
+            auth[4] = 17;
+            auth[5] = 0;
+            auth[10] = 24;
+            auth[14] = 16;
+            auth[19] = 0;
+            auth[20] = 0;
+            auth[21] = 0;
+            auth[22] = 0;
+            r = card.transmitCommand(new CommandAPDU(auth));
+            if (r.getSW() != 0x9000) throw new Exception("regression authentication failed");
+            digest.update(r.getData());
+            r = txOn(card, "808E000002004000");
+            if (r.getSW() != 0x9000) throw new Exception("regression key/VPM failed");
+            digest.update(r.getData());
+        }
+        check("CAVE deterministic signature and full-VPM regression",
+              hex(digest.digest()).equals("E625C8541EF00D601A55D9271C4835CE86D209DBE9677128F7E0349C5B9FEBB8"),
+              "digest mismatch");
+    }
+
+    static void caveRamTableReset(byte[] meta) throws Exception {
+        CardSimulator s = freshCaveSim(meta);
+        swOn("RAM table: load SSD", s, "80F6010010CC3812949F4DCD0D31050234580E63B4", 0x9000);
+        for (int pass = 0; pass < 2; pass++) {
+            data("RAM table: AUTHR pass " + pass,
+                 txOn(s, "00880080110034A2B05F0000000010EC965AD700000000"), "0366F6");
+            data("RAM table: full key/VPM pass " + pass, txOn(s, "808E000002004000"),
+                 "A07B1CD102756914"
+                 + "189394824A1A2F99A539F95B4D22D57CEE32AC216B260D36A7C96388578CB957"
+                 + "E2D6CA1D77B61FD5C71A73A417B2121E953470E39BCA3FD050BE4FD64780CCB8DF");
+            if (pass == 0) {
+                s.reset();
+                swOn("RAM table: select after reset", s, concat("00A40404", AID_BYTES, "00"), 0x9000);
+                swOn("RAM table: verify after reset", s, "002000010831323334FFFFFFFF", 0x9000);
+                swOn("RAM table: saved registers cleared", s, "808E000002004000", 0x9834);
+            }
+        }
+    }
+
+    static void cyclicPersistence(byte[] meta) throws Exception {
+        CardSimulator s = freshCaveSim(meta);
+        s.reset();
+        swOn("ring: select CSIM", s, concat("00A40404", AID_BYTES, "00"), 0x9000);
+        swOn("ring: verify PIN", s, "002000010831323334FFFFFFFF", 0x9000);
+        swOn("ring: select COUNT", s, "00A4000C026F21", 0x9000);
+        for (int value = 1; value <= 25; value++) {
+            data("ring: increase " + value, txOn(s, "0032000002000100"), String.format("%04X0001", value));
+            for (int record = 1; record <= 10; record++) {
+                data("ring: history " + value + "/" + record,
+                     txOn(s, String.format("00B2%02X0402", record)),
+                     String.format("%04X", Math.max(0, value - record + 1)));
+            }
+        }
+        swOn("ring: overflow", s, "0032000002FFFF", 0x9850);
+        swOn("ring: short record", s, "00DC00030100", 0x6700);
+        s.reset();
+        swOn("ring: reselect after reset", s, concat("00A40404", AID_BYTES, "00"), 0x9000);
+        swOn("ring: reverify after reset", s, "002000010831323334FFFFFFFF", 0x9000);
+        swOn("ring: reselect COUNT", s, "00A4000C026F21", 0x9000);
+        for (int record = 1; record <= 10; record++) {
+            data("ring: persisted history " + record,
+                 txOn(s, String.format("00B2%02X0402", record)), String.format("%04X", 26 - record));
+        }
+        data("ring: increase after reset", txOn(s, "0032000002000100"), "001A0001");
+        swOn("ring: same value still advances history", s, "00DC000302001A", 0x9000);
+        data("ring: duplicate newest", txOn(s, "00B2010402"), "001A");
+        data("ring: duplicate previous", txOn(s, "00B2020402"), "001A");
+    }
+
+    static void ssdCandidatePersistence(byte[] meta) throws Exception {
+        CardSimulator s = freshCaveSim(meta);
+        swOn("candidate: load A-key", s, "80F6000008C442F56BE9E17158", 0x9000);
+        swOn("candidate: load active SSD", s, "80F6010010CC3812949F4DCD0D31050234580E63B4", 0x9000);
+        swOn("candidate: challenge", s, "808A0000041234567804", 0x9000);
+        swOn("candidate: update deferred", s, "808200000F1122334455667704EC965AD7000000", 0x9000);
+        s.reset();
+        swOn("candidate: select after reset", s, concat("00A40404", AID_BYTES, "00"), 0x9000);
+        swOn("candidate: verify after reset", s, "002000010831323334FFFFFFFF", 0x9000);
+        swOn("candidate: confirm after reset rejected", s, "8082000103000000", 0x9834);
+        data("candidate: active SSD survives reset", txOn(s, "00880080110034A2B05F0000000000EC965AD700000000"), "0366F6");
+    }
+
     static void caveSsdGeneration(byte[] meta) throws Exception {
         CardSimulator main = freshCaveSim(meta);
         swOn("ssd: load A-key", main, "80F6000008C442F56BE9E17158", 0x9000);

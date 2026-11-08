@@ -44,6 +44,7 @@ members = [
 ]
 
 [workspace.dependencies]
+md-5 = "0.10"
 quick-xml = { version = "0.41", default-features = false }
 sdr-hal = { version = "0.1", default-features = false }
 rustix = { version = "0.38.44", features = ["pipe", "stdio", "termios"] }

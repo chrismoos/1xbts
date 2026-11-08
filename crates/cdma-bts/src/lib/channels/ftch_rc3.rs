@@ -615,13 +615,7 @@ impl ForwardTrafficChannelRc3 {
                 .null_run_start
                 .map(|s| s.elapsed().as_millis())
                 .unwrap_or(0);
-            let level = if is_queued {
-                log::Level::Debug
-            } else {
-                log::Level::Warn
-            };
-            log::log!(
-                level,
+            log::debug!(
                 "tx_ftch_rc3_queue: chip={} rate={:?} queued_window={} null_window={} total_queued={} total_null={} queue_len={} consecutive_nulls={} null_run_ms={}",
                 frame_start_chip,
                 rate,

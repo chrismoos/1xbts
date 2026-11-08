@@ -8,7 +8,7 @@ const PRIVACY_TEST_MASK: u64 = (1 << 40) | 0x1234;
 fn privacy_test_runtime() -> MscRuntime {
     let mut runtime = authenticating_runtime(crate::authentication::AuthenticationMode::Monitor);
     runtime.config.authentication.unique_challenge_on_call = false;
-    runtime.config.authentication.count_update_on_call = false;
+    runtime.config.authentication.count_update = crate::authentication::CountUpdatePolicy::Never;
     runtime.controller.create_call_with_id(
         PRIVACY_TEST_CALL_ID,
         CallDirection::MobileOriginated,
@@ -207,7 +207,8 @@ async fn wrong_authu_does_not_activate_privacy_in_monitor_mode() {
 async fn handset_privacy_request_during_count_update_waits_for_a_verified_challenge() {
     let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
     let mut runtime = privacy_test_runtime();
-    runtime.config.authentication.count_update_on_call = true;
+    runtime.config.authentication.count_update =
+        crate::authentication::CountUpdatePolicy::EveryCall;
     runtime
         .start_traffic_authentication(&endpoint, &test_node(), PRIVACY_TEST_CALL_ID)
         .await;
@@ -296,4 +297,43 @@ async fn timed_out_unique_challenge_does_not_activate_privacy() {
     );
     assert!(runtime.pending_privacy.is_empty());
     assert!(runtime.privacy_authenticated.is_empty());
+}
+
+#[tokio::test]
+async fn failed_ssd_update_does_not_restart_for_pending_privacy() {
+    use crate::authentication::{AuthenticationResult, TrafficAction};
+    let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
+    let mut runtime = privacy_test_runtime();
+    runtime
+        .call_auth_context
+        .get_mut(&PRIVACY_TEST_CALL_ID)
+        .unwrap()
+        .global_result = AuthenticationResult::SignatureMismatch;
+    runtime
+        .assignment_privacy(PRIVACY_TEST_CALL_ID, true)
+        .unwrap();
+    runtime
+        .start_traffic_authentication(&endpoint, &BaseStationId("bs".into()), PRIVACY_TEST_CALL_ID)
+        .await;
+    let request = timeout(PRIVACY_TEST_RESPONSE_TIMEOUT, client.poll_a1())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        request.message_type(),
+        cdma_ios::MessageType::SsdUpdateRequest
+    );
+    let entry = runtime.traffic_auth.get_mut(&PRIVACY_TEST_CALL_ID).unwrap();
+    let action = entry.on_timeout(runtime.config.hlr_repo.as_ref()).await;
+    assert!(matches!(action, TrafficAction::Report { .. }));
+    runtime
+        .apply_traffic_action(&endpoint, PRIVACY_TEST_CALL_ID, action)
+        .await;
+    assert!(runtime.pending_privacy.is_empty());
+    assert!(runtime.traffic_auth.is_empty());
+    assert!(
+        timeout(PRIVACY_TEST_NO_COMMAND_WAIT, client.poll_a1())
+            .await
+            .is_err()
+    );
 }

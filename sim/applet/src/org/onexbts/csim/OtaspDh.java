@@ -59,9 +59,9 @@ public final class OtaspDh {
         msResult = new byte[MOD_LEN];
         aKeyTemp = new byte[AKEY_LEN];
         rkTemp = new byte[RK_LEN];
-        base = JCSystem.makeTransientByteArray(MOD_LEN, JCSystem.CLEAR_ON_DESELECT);
-        ctr = JCSystem.makeTransientByteArray((short) 8, JCSystem.CLEAR_ON_DESELECT);
-        okFlag = JCSystem.makeTransientByteArray((short) 3, JCSystem.CLEAR_ON_DESELECT);
+        base = JCSystem.makeTransientByteArray(MOD_LEN, JCSystem.CLEAR_ON_RESET);
+        ctr = JCSystem.makeTransientByteArray((short) 8, JCSystem.CLEAR_ON_RESET);
+        okFlag = JCSystem.makeTransientByteArray((short) 3, JCSystem.CLEAR_ON_RESET);
     }
 
     /**

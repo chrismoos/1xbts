@@ -9,7 +9,8 @@
   ],
   "authentication": {
     "mode": "monitor",
-    "voice_privacy": "optional"
+    "voice_privacy": "optional",
+    "count_update": "daily"
   },
   "access": {
     "mode": "open",

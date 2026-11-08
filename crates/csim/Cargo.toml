@@ -11,9 +11,11 @@ description = "Personalization and inspection of CSIM cards, and management of t
 [features]
 default = []
 # The csim binary and the PC/SC reader transport, which needs libpcsclite.
-csim = ["dep:pcsc", "dep:clap"]
+csim = ["dep:pcsc", "dep:clap", "dep:cdma-cave", "dep:md-5"]
 
 [dependencies]
+cdma-cave = { path = "../cdma-cave", optional = true }
+md-5 = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive", "env"], optional = true }
 pcsc = { version = "2", optional = true }
 serde = { version = "1", features = ["derive"] }

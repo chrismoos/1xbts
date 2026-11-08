@@ -702,6 +702,13 @@ impl MscRuntime {
                         Box::pin(self.finish_otasp_ssd_update(a1, call_id, ok)).await;
                         return;
                     }
+                    if matches!(
+                        procedure,
+                        crate::grpc::events_proto::v1::AuthenticationProcedure::SsdUpdate
+                    ) && result != crate::grpc::events_proto::v1::AuthenticationResult::Success
+                    {
+                        self.pending_privacy.remove(&call_id);
+                    }
                     if procedure
                         == crate::grpc::events_proto::v1::AuthenticationProcedure::UniqueChallenge
                     {
@@ -4653,6 +4660,8 @@ mod tests {
 
     struct StubHlrRepo {
         credentials: std::sync::Mutex<cdma_hlr::auth::CaveCredentials>,
+        count_pending: std::sync::Mutex<Option<uuid::Uuid>>,
+        count_updated: std::sync::atomic::AtomicBool,
         seen: std::sync::Mutex<usize>,
         subscribers: std::sync::Mutex<Vec<cdma_hlr::model::ResolvedSubscriber>>,
         lookups_fail: std::sync::atomic::AtomicBool,
@@ -4669,6 +4678,8 @@ mod tests {
                     ssd: Some(STUB_AUTH_SSD),
                     ..Default::default()
                 }),
+                count_pending: std::sync::Mutex::new(None),
+                count_updated: std::sync::atomic::AtomicBool::new(false),
                 seen: std::sync::Mutex::new(0),
                 subscribers: std::sync::Mutex::new(Vec::new()),
                 lookups_fail: std::sync::atomic::AtomicBool::new(false),
@@ -5438,7 +5449,7 @@ mod tests {
         use crate::grpc::events_proto::v1::{AuthenticationProcedure, AuthenticationResult};
         let config = AuthenticationConfig {
             mode,
-            count_update_on_call: false,
+            count_update: crate::authentication::CountUpdatePolicy::Never,
             ..AuthenticationConfig::default()
         };
         let hlr = StubHlrRepo::default();
@@ -5550,7 +5561,7 @@ mod tests {
         use crate::authentication::{AuthenticationConfig, TrafficAction, TrafficAuthentication};
         use crate::grpc::events_proto::v1::{AuthenticationProcedure, AuthenticationResult};
         let config = AuthenticationConfig {
-            count_update_on_call: false,
+            count_update: crate::authentication::CountUpdatePolicy::Never,
             ..AuthenticationConfig::default()
         };
         let hlr = StubHlrRepo::default();
@@ -5578,7 +5589,7 @@ mod tests {
         let config = AuthenticationConfig {
             ssd_update: crate::authentication::SsdUpdatePolicy::Never,
             unique_challenge_on_call: false,
-            count_update_on_call: true,
+            count_update: crate::authentication::CountUpdatePolicy::EveryCall,
             ..AuthenticationConfig::default()
         };
         let hlr = StubHlrRepo::default();
@@ -5593,6 +5604,38 @@ mod tests {
             procedures.on_parameter_update_confirm(&hlr).await,
             TrafficAction::Report { .. }
         ));
+        assert_eq!(hlr.credentials().auth_count, 1);
+    }
+
+    #[tokio::test]
+    async fn daily_count_update_skips_the_next_call() {
+        use crate::authentication::{AuthenticationConfig, TrafficAction, TrafficAuthentication};
+        let config = AuthenticationConfig {
+            ssd_update: crate::authentication::SsdUpdatePolicy::Never,
+            unique_challenge_on_call: false,
+            ..AuthenticationConfig::default()
+        };
+        let hlr = StubHlrRepo::default();
+        let mut first =
+            TrafficAuthentication::plan(&config, traffic_test_context(), "bs".into(), false)
+                .unwrap();
+        expect_send(
+            first.advance(&config, &hlr).await,
+            cdma_ios::MessageType::ParameterUpdateRequest,
+        );
+        let mut concurrent =
+            TrafficAuthentication::plan(&config, traffic_test_context(), "bs".into(), false)
+                .unwrap();
+        assert_eq!(concurrent.advance(&config, &hlr).await, TrafficAction::Done);
+        assert_eq!(hlr.credentials().auth_count, 0);
+        assert!(matches!(
+            first.on_parameter_update_confirm(&hlr).await,
+            TrafficAction::Report { .. }
+        ));
+        let mut second =
+            TrafficAuthentication::plan(&config, traffic_test_context(), "bs".into(), false)
+                .unwrap();
+        assert_eq!(second.advance(&config, &hlr).await, TrafficAction::Done);
         assert_eq!(hlr.credentials().auth_count, 1);
     }
 
@@ -5616,7 +5659,7 @@ mod tests {
     fn no_traffic_procedures_planned_when_all_are_off() {
         let config = crate::authentication::AuthenticationConfig {
             unique_challenge_on_call: false,
-            count_update_on_call: false,
+            count_update: crate::authentication::CountUpdatePolicy::Never,
             ..crate::authentication::AuthenticationConfig::default()
         };
         assert!(
@@ -5902,6 +5945,37 @@ mod tests {
             credentials.ssd = ssd;
             credentials.randssd = None;
             Ok(())
+        }
+        async fn reserve_cave_count_update(
+            &self,
+            _: &cdma_hlr::model::MobileIdentityKey,
+            interval: std::time::Duration,
+            _: std::time::Duration,
+        ) -> Result<Option<uuid::Uuid>, tonic::Status> {
+            let mut pending = self.count_pending.lock().unwrap();
+            if pending.is_some()
+                || (!interval.is_zero()
+                    && self
+                        .count_updated
+                        .load(std::sync::atomic::Ordering::Relaxed))
+            {
+                return Ok(None);
+            }
+            let id = uuid::Uuid::new_v4();
+            *pending = Some(id);
+            Ok(Some(id))
+        }
+        async fn confirm_cave_count_update(
+            &self,
+            identity: &cdma_hlr::model::MobileIdentityKey,
+            update_id: uuid::Uuid,
+        ) -> Result<u8, tonic::Status> {
+            assert_eq!(self.count_pending.lock().unwrap().take(), Some(update_id));
+            self.count_updated
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.increment_cave_count(identity)
+                .await
+                .map_err(tonic::Status::internal)
         }
         async fn increment_cave_count(
             &self,

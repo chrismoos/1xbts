@@ -1,5 +1,6 @@
 package org.onexbts.csim;
 
+import javacard.framework.JCSystem;
 import javacard.framework.Util;
 
 /**
@@ -49,7 +50,6 @@ public final class FileSystem {
     private byte[] EF_META_LO;
     private byte[] EF_META_HI;
 
-    private static final byte NONE = (byte) 0xFF;
     private static final byte STATE_DEACTIVATED = (byte) 0x01;
 
     // EF_DIR application template, TS 102 221 §13.1: 61 L 4F Lc AID 50 Ll label.
@@ -62,28 +62,26 @@ public final class FileSystem {
     private static final short TMSI_CODE_LEN = 4;
     private static final short MMSN_ZERO_PREFIX = 3;
 
+    // Selected EF per channel as index + 1, 0 = none. RAM, cleared on reset.
     private final byte[] currentEfIdx;
     private boolean metaLoaded;
     private byte[] efDataPool;
     private byte[] efDataOffsets;     // NUM_EFS big-endian shorts
     private byte[] efState;           // per EF, bit 0 = deactivated
-    private final Ef flyweight;
+    // One Ef per file, built on first lookup. Rebuilding a shared Ef on every
+    // lookup wrote eleven persistent fields per SELECT, READ and Run CAVE.
+    private Ef[] efs;
     private final byte[] aid;
 
-    private final byte[] fidScratch;
+    private static final short FID_SCRATCH = STRIDE;
+    private static final short REC_SCRATCH = FID_SCRATCH + 2;
+    private static final short SCRATCH_LEN = REC_SCRATCH + 3;
     private final byte[] entryScratch;
-    private final byte[] recScratch;
 
     public FileSystem(byte[] applicationAid) {
         aid = applicationAid;
-        flyweight = new Ef();
-        currentEfIdx = new byte[MAX_CHANNELS];
-        for (byte i = 0; i < MAX_CHANNELS; i++) {
-            currentEfIdx[i] = NONE;
-        }
-        fidScratch = new byte[(short) 2];
-        entryScratch = new byte[(short) STRIDE];
-        recScratch = new byte[(short) 3];
+        currentEfIdx = JCSystem.makeTransientByteArray(MAX_CHANNELS, JCSystem.CLEAR_ON_RESET);
+        entryScratch = JCSystem.makeTransientByteArray(SCRATCH_LEN, JCSystem.CLEAR_ON_RESET);
         metaLoaded = false;
     }
 
@@ -146,6 +144,7 @@ public final class FileSystem {
         efDataPool = new byte[total];
         efDataOffsets = new byte[(short) (NUM_EFS * 2)];
         efState = new byte[NUM_EFS];
+        efs = new Ef[NUM_EFS];
 
         short cur = 0;
         for (byte i = 0; i < NUM_EFS; i++) {
@@ -240,19 +239,19 @@ public final class FileSystem {
         short bodyLen = (short) (2 + aid.length + 2 + APP_LABEL.length);
         if ((short) (bodyLen + 2) > recLen) return;
         short o = poolOff;
-        recScratch[0] = TAG_APP_TEMPLATE;
-        recScratch[1] = (byte) bodyLen;
-        recScratch[2] = TAG_AID;
-        Util.arrayCopyNonAtomic(recScratch, (short) 0, efDataPool, o, (short) 3);
+        entryScratch[(short) (REC_SCRATCH + 0)] = TAG_APP_TEMPLATE;
+        entryScratch[(short) (REC_SCRATCH + 1)] = (byte) bodyLen;
+        entryScratch[(short) (REC_SCRATCH + 2)] = TAG_AID;
+        Util.arrayCopyNonAtomic(entryScratch, REC_SCRATCH, efDataPool, o, (short) 3);
         o = (short) (o + 3);
-        recScratch[0] = (byte) aid.length;
-        Util.arrayCopyNonAtomic(recScratch, (short) 0, efDataPool, o, (short) 1);
+        entryScratch[(short) (REC_SCRATCH + 0)] = (byte) aid.length;
+        Util.arrayCopyNonAtomic(entryScratch, REC_SCRATCH, efDataPool, o, (short) 1);
         o = (short) (o + 1);
         Util.arrayCopyNonAtomic(aid, (short) 0, efDataPool, o, (short) aid.length);
         o = (short) (o + aid.length);
-        recScratch[0] = TAG_LABEL;
-        recScratch[1] = (byte) APP_LABEL.length;
-        Util.arrayCopyNonAtomic(recScratch, (short) 0, efDataPool, o, (short) 2);
+        entryScratch[(short) (REC_SCRATCH + 0)] = TAG_LABEL;
+        entryScratch[(short) (REC_SCRATCH + 1)] = (byte) APP_LABEL.length;
+        Util.arrayCopyNonAtomic(entryScratch, REC_SCRATCH, efDataPool, o, (short) 2);
         o = (short) (o + 2);
         Util.arrayCopyNonAtomic(APP_LABEL, (short) 0, efDataPool, o, (short) APP_LABEL.length);
     }
@@ -265,8 +264,8 @@ public final class FileSystem {
         byte spcsIdx = indexByFid(Const.FID_EF_SPCS);
         if (spcIdx < 0 || spcsIdx < 0) return;
         short spcOff = dataOffset(spcIdx);
-        Util.arrayCopyNonAtomic(efDataPool, spcOff, recScratch, (short) 0, (short) 3);
-        byte status = (byte) ((recScratch[0] | recScratch[1] | recScratch[2]) != 0 ? 1 : 0);
+        Util.arrayCopyNonAtomic(efDataPool, spcOff, entryScratch, REC_SCRATCH, (short) 3);
+        byte status = (byte) ((entryScratch[(short) (REC_SCRATCH + 0)] | entryScratch[(short) (REC_SCRATCH + 1)] | entryScratch[(short) (REC_SCRATCH + 2)]) != 0 ? 1 : 0);
         efDataPool[dataOffset(spcsIdx)] = status;
     }
 
@@ -370,17 +369,17 @@ public final class FileSystem {
     }
 
     public void select(byte channel, Ef ef) {
-        currentEfIdx[channel] = (ef == null) ? NONE : ef.idx;
+        currentEfIdx[channel] = (ef == null) ? (byte) 0 : (byte) (ef.idx + 1);
     }
 
     public Ef current(byte channel) {
-        byte idx = currentEfIdx[channel];
-        if (idx == NONE) return null;
-        return materialize(idx);
+        byte sel = currentEfIdx[channel];
+        if (sel == 0) return null;
+        return materialize((byte) (sel - 1));
     }
 
     public void closeChannel(byte channel) {
-        currentEfIdx[channel] = NONE;
+        currentEfIdx[channel] = 0;
     }
 
     public void setDeactivated(Ef ef, boolean deactivated) {
@@ -425,12 +424,12 @@ public final class FileSystem {
     // helpers
 
     private byte indexByFid(short fid) {
-        fidScratch[0] = (byte) ((fid >> 8) & 0xFF);
-        fidScratch[1] = (byte) (fid & 0xFF);
+        entryScratch[(short) (FID_SCRATCH + 0)] = (byte) ((fid >> 8) & 0xFF);
+        entryScratch[(short) (FID_SCRATCH + 1)] = (byte) (fid & 0xFF);
         for (byte i = 0; i < NUM_EFS; i++) {
             short base = (short) (i * STRIDE);
             if (Util.arrayCompare(_chunkOf(base), _localOff(base),
-                                  fidScratch, (short) 0, (short) 2) == 0) {
+                                  entryScratch, FID_SCRATCH, (short) 2) == 0) {
                 return i;
             }
         }
@@ -443,6 +442,8 @@ public final class FileSystem {
     }
 
     private Ef materialize(byte idx) {
+        Ef ef = efs[idx];
+        if (ef != null) return ef;
         loadEntry(idx);
         short fid = entryFid();
         byte structure = entryScratch[META_STRUCTURE];
@@ -453,8 +454,10 @@ public final class FileSystem {
         byte readAc = (byte) ((ac >> 4) & 0x0F);
         byte updateAc = (byte) (ac & 0x0F);
         boolean deactivated = (efState[idx] & STATE_DEACTIVATED) != 0;
-        flyweight.set(idx, fid, structure, size, recLen, sfi,
-                      readAc, updateAc, deactivated, efDataPool, dataOffset(idx));
-        return flyweight;
+        ef = new Ef();
+        ef.set(idx, fid, structure, size, recLen, sfi,
+               readAc, updateAc, deactivated, efDataPool, dataOffset(idx));
+        efs[idx] = ef;
+        return ef;
     }
 }

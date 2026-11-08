@@ -176,6 +176,7 @@ async fn verify(pool: PgPool) {
     assert!(state.ssd_provisioned);
     assert_eq!(repo.increment_cave_count(&identity).await.unwrap(), 1);
 
+    verify_count_schedule(&pool, &repo, &identity, &ssd_new).await;
     verify_otasp_key_exchange(&repo, &identity, &ssd_new).await;
     verify_keypad_a_key_entry(repo).await;
 }
@@ -324,4 +325,171 @@ async fn cave_authentication_center_round_trip() {
         .unwrap();
     admin.close().await;
     result.unwrap();
+}
+
+async fn verify_count_schedule(
+    pool: &PgPool,
+    repo: &PostgresHlrRepository,
+    identity: &MobileIdentityKey,
+    ssd: &cdma_cave::Ssd,
+) {
+    use std::time::Duration;
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+    const TIMEOUT: Duration = Duration::from_secs(40);
+    sqlx::query("UPDATE subscriber_identities SET count_updated_at = NULL WHERE imsi = $1")
+        .bind(IMSI)
+        .execute(pool)
+        .await
+        .unwrap();
+    let (first, concurrent) = tokio::join!(
+        repo.reserve_cave_count_update(identity, DAY, TIMEOUT),
+        repo.reserve_cave_count_update(identity, DAY, TIMEOUT)
+    );
+    let tokens: Vec<_> = [first.unwrap(), concurrent.unwrap()]
+        .into_iter()
+        .flatten()
+        .collect();
+    assert_eq!(tokens.len(), 1);
+    let token = tokens[0];
+    let before = repo
+        .get_subscriber_auth_state(identity)
+        .await
+        .unwrap()
+        .unwrap()
+        .auth_count;
+    assert!(
+        repo.reserve_cave_count_update(identity, Duration::ZERO, TIMEOUT)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let restarted = PostgresHlrRepository::new(pool.clone());
+    let after = restarted
+        .confirm_cave_count_update(identity, token)
+        .await
+        .unwrap();
+    assert_eq!(after, cdma_hlr::auth::next_auth_count(before));
+    assert_eq!(
+        restarted
+            .confirm_cave_count_update(identity, token)
+            .await
+            .unwrap(),
+        after
+    );
+    assert!(
+        repo.reserve_cave_count_update(identity, DAY, TIMEOUT)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    sqlx::query("UPDATE subscriber_identities SET count_updated_at = now() - interval '23 hours 59 minutes' WHERE imsi = $1")
+        .bind(IMSI).execute(pool).await.unwrap();
+    assert!(
+        repo.reserve_cave_count_update(identity, DAY, TIMEOUT)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    sqlx::query("UPDATE subscriber_identities SET count_updated_at = now() - interval '24 hours' WHERE imsi = $1")
+        .bind(IMSI).execute(pool).await.unwrap();
+    let lost = repo
+        .reserve_cave_count_update(identity, DAY, TIMEOUT)
+        .await
+        .unwrap()
+        .unwrap();
+    let expected = cdma_hlr::auth::next_auth_count(after);
+    repo.verify_cave_global_challenge(identity, &global(&ssd.ssd_a, 0x1234_5678, expected))
+        .await
+        .unwrap();
+    assert!(
+        repo.reserve_cave_count_update(identity, DAY, TIMEOUT)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        repo.get_subscriber_auth_state(identity)
+            .await
+            .unwrap()
+            .unwrap()
+            .auth_count,
+        after
+    );
+    sqlx::query("UPDATE subscriber_identities SET count_pending_until = now() - interval '1 second' WHERE imsi = $1")
+        .bind(IMSI).execute(pool).await.unwrap();
+    let mut invalid = global(&ssd.ssd_a, 0x1234_5678, expected);
+    invalid.authr ^= 1;
+    assert_eq!(
+        repo.verify_cave_global_challenge(identity, &invalid)
+            .await
+            .unwrap()
+            .outcome,
+        CaveAuthOutcome::SignatureMismatch
+    );
+    let pending: Option<Uuid> =
+        sqlx::query_scalar("SELECT count_pending_id FROM subscriber_identities WHERE imsi = $1")
+            .bind(IMSI)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(pending, Some(lost));
+    repo.verify_cave_global_challenge(identity, &global(&ssd.ssd_a, 0x1234_5678, expected))
+        .await
+        .unwrap();
+    assert_eq!(
+        repo.confirm_cave_count_update(identity, lost)
+            .await
+            .unwrap(),
+        expected
+    );
+    assert!(
+        repo.reserve_cave_count_update(identity, DAY, TIMEOUT)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    sqlx::query("UPDATE subscriber_identities SET count_retry_after = NULL WHERE imsi = $1")
+        .bind(IMSI)
+        .execute(pool)
+        .await
+        .unwrap();
+    let unsent = repo
+        .reserve_cave_count_update(identity, Duration::ZERO, TIMEOUT)
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE subscriber_identities SET count_pending_until = now() - interval '1 second' WHERE imsi = $1")
+        .bind(IMSI).execute(pool).await.unwrap();
+    repo.verify_cave_global_challenge(identity, &global(&ssd.ssd_a, 0x1234_5678, expected))
+        .await
+        .unwrap();
+    assert!(
+        repo.confirm_cave_count_update(identity, unsent)
+            .await
+            .is_err()
+    );
+    assert!(
+        repo.reserve_cave_count_update(identity, Duration::ZERO, TIMEOUT)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    sqlx::query("UPDATE subscriber_identities SET count_retry_after = now() - interval '1 second', auth_count = 63 WHERE imsi = $1")
+        .bind(IMSI).execute(pool).await.unwrap();
+    let wrap = repo
+        .reserve_cave_count_update(identity, Duration::ZERO, TIMEOUT)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        repo.confirm_cave_count_update(identity, wrap)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        repo.confirm_cave_count_update(identity, Uuid::new_v4())
+            .await
+            .is_err()
+    );
 }

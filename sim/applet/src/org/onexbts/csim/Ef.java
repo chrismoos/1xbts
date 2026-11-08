@@ -1,17 +1,5 @@
 package org.onexbts.csim;
 
-/**
- * Describes one EF at a time.
- *
- * One instance exists per FileSystem. Its fields are overwritten by
- * every FileSystem.find()/current()/findBySfi() call, so a caller must
- * finish with one EF before looking up another. The sysmoISIM-SJA5 caps
- * persistent object allocation around 50 instances, which rules out one
- * object per EF.
- *
- * The file content lives in {@code pool[poolOffset .. poolOffset+size)}.
- * Bytes outside that range belong to other EFs.
- */
 public final class Ef {
 
     public byte idx;
@@ -26,6 +14,8 @@ public final class Ef {
 
     public byte[] pool;
     public short poolOffset;
+    private static final short BYTE_MASK = 0xFF;
+    private byte recordHead;
 
     public void set(byte idx, short fid, byte structure, short size,
                     byte recordLength, byte sfi, byte readAc, byte updateAc,
@@ -52,8 +42,20 @@ public final class Ef {
         return (short) (size / (recordLength & 0xFF));
     }
 
-    /** Pool offset of 1-based record {@code rec}. */
+    // Handset writes must commit the head and new record in one transaction.
+    public void advanceCyclic() {
+        short head = (short) (recordHead & BYTE_MASK);
+        short next = head == 0 ? (short) (recordCount() - 1) : (short) (head - 1);
+        if (head != next) recordHead = (byte) next;
+    }
+
     public short recordOffset(short rec) {
-        return (short) (poolOffset + (short) ((short) (rec - 1) * (short) (recordLength & 0xFF)));
+        short slot = (short) (rec - 1);
+        if (structure == Const.FS_CYCLIC) {
+            slot = (short) (slot + (recordHead & BYTE_MASK));
+            short count = recordCount();
+            if (slot >= count) slot = (short) (slot - count);
+        }
+        return (short) (poolOffset + (short) (slot * (short) (recordLength & 0xFF)));
     }
 }
