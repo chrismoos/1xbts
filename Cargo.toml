@@ -30,8 +30,10 @@ members = [
     "crates/cdma-pcf",
     "crates/cdma-pdsn",
     "crates/cdma-rpc-error",
+    "crates/cdma-sctp",
     "crates/cdma-smsc",
     "crates/cdma-voice",
+    "crates/cdma-wire-check",
     "crates/csim",
     "crates/edge-resolver",
     "crates/mbuni-msc-bridge",
@@ -41,6 +43,7 @@ members = [
     "crates/wap-gw",
     "external/libre",
     "external/libre-sys",
+    "external/usrsctp-sys",
 ]
 
 [workspace.dependencies]

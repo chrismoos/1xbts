@@ -29,6 +29,8 @@ export enum ServiceOption {
   SERVICE_OPTION_ASYNC_DATA_RC2 = 12,
   /** SERVICE_OPTION_PACKET_DATA_RC3 - SO33 — packet data, RLP Type 3 (cdma2000). */
   SERVICE_OPTION_PACKET_DATA_RC3 = 33,
+  /** SERVICE_OPTION_HRPD_PACKET_DATA - SO59 — HRPD packet data, used on A9 and A11 only (A.S0008-C §1.11.1). */
+  SERVICE_OPTION_HRPD_PACKET_DATA = 59,
   /** SERVICE_OPTION_EVRC_B - SO68 — EVRC-B voice. */
   SERVICE_OPTION_EVRC_B = 68,
   /** SERVICE_OPTION_SMS_EXT - SO70 — extended SMS encoding. */
@@ -61,6 +63,9 @@ export function serviceOptionFromJSON(object: any): ServiceOption {
     case 33:
     case "SERVICE_OPTION_PACKET_DATA_RC3":
       return ServiceOption.SERVICE_OPTION_PACKET_DATA_RC3;
+    case 59:
+    case "SERVICE_OPTION_HRPD_PACKET_DATA":
+      return ServiceOption.SERVICE_OPTION_HRPD_PACKET_DATA;
     case 68:
     case "SERVICE_OPTION_EVRC_B":
       return ServiceOption.SERVICE_OPTION_EVRC_B;
@@ -93,6 +98,8 @@ export function serviceOptionToJSON(object: ServiceOption): string {
       return "SERVICE_OPTION_ASYNC_DATA_RC2";
     case ServiceOption.SERVICE_OPTION_PACKET_DATA_RC3:
       return "SERVICE_OPTION_PACKET_DATA_RC3";
+    case ServiceOption.SERVICE_OPTION_HRPD_PACKET_DATA:
+      return "SERVICE_OPTION_HRPD_PACKET_DATA";
     case ServiceOption.SERVICE_OPTION_EVRC_B:
       return "SERVICE_OPTION_EVRC_B";
     case ServiceOption.SERVICE_OPTION_SMS_EXT:

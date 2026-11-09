@@ -142,6 +142,9 @@ impl ServiceOptionValue {
     /// SO33: High-rate packet data service.
     pub const HIGH_RATE_PACKET_DATA: Self = Self(33);
 
+    /// A.S0008-C §1.11.1 reserves 59, 64, 67 and 71 on A9 and A11 for HRPD.
+    pub const HRPD_PACKET_DATA: Self = Self(59);
+
     /// SO68: EVRC-B narrowband.
     pub const EVRC_B: Self = Self(68);
 
@@ -233,7 +236,7 @@ impl QualityOfServiceParametersTyped {
     }
 }
 
-/// Exact typed A9 indicator payload carried on `A9-Setup-A8`.
+/// Exact typed A9 Indicators payload (A.S0008-C §4.2.17).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct A9Indicators {
     pub packet_boundary_supported: bool,
@@ -944,6 +947,8 @@ pub struct ConnectA8Message {
     pub a8_traffic_id: A8TrafficId,
     pub cause: CauseValue,
     pub pdsn_ip_address: Option<PdsnIpAddress>,
+    /// A.S0008-C §3.1.2 note k.
+    pub a9_indicators: Option<A9Indicators>,
 }
 
 impl ConnectA8Message {
@@ -979,6 +984,11 @@ impl ConnectA8Message {
             ElementId::PdsnIpAddress,
             self.pdsn_ip_address.map(|v| v.encode().to_vec()),
         );
+        push_optional(
+            &mut elements,
+            ElementId::A9Indicators,
+            self.a9_indicators.map(|v| v.encode().to_vec()),
+        );
         encode(&Message::new(MessageType::ConnectA8, elements)?)
     }
 
@@ -995,6 +1005,7 @@ impl ConnectA8Message {
             a8_traffic_id: A8TrafficId::gre_ppp(0, [0, 0, 0, 0]),
             cause: CauseValue(0),
             pdsn_ip_address: None,
+            a9_indicators: None,
         };
         let mut con_ref = None;
         let mut a8_traffic_id = None;
@@ -1031,6 +1042,11 @@ impl ConnectA8Message {
                 ElementId::PdsnIpAddress => set_optional_field(
                     &mut decoded.pdsn_ip_address,
                     PdsnIpAddress::decode(&element.value)?,
+                    element.id,
+                )?,
+                ElementId::A9Indicators => set_optional_field(
+                    &mut decoded.a9_indicators,
+                    A9Indicators::decode(&element.value)?,
                     element.id,
                 )?,
                 _ => unexpected(MessageType::ConnectA8, element.id)?,

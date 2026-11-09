@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use log::{debug, info, warn};
 
+use cdma_abis::bearer::ChannelFamily;
+use cdma_abis::bearer_transport::BearerTransport;
 use cdma_abis::control::typed::{
     A3ConnectInformation, BurstCommitMessage, BurstRequestMessage, BurstResponseMessage, CellId,
     CellIdWithMscId, CellInfoRecord, ChannelElementStatus, CorrelationId, ForwardBurstRadioInfo,
@@ -105,6 +107,7 @@ struct Session {
     /// or `None` before supplemental allocation. Freed when the session is
     /// removed.
     sch_walsh_code: Option<u8>,
+    sch_connect_pending: bool,
     /// Service option from the BTS Setup Service Option element.
     requested_service_option: Option<u16>,
     set_up_at: Instant,
@@ -161,6 +164,91 @@ pub struct AbisAgent {
     controller: Arc<TrafficResourceService>,
     sessions: HashMap<CallConnectionReference, Session>,
     paging_state: Option<Arc<Mutex<PagingSupplierState>>>,
+    bearer: Option<Arc<BearerTransport>>,
+}
+
+/// The BTS UDP port, or the code channel without a bearer transport.
+fn traffic_circuit_id(
+    bearer: &Option<Arc<BearerTransport>>,
+    family: ChannelFamily,
+    code: u8,
+) -> TrafficCircuitId {
+    let traffic_circuit_identifier = match bearer {
+        Some(bearer) => match bearer.open_bearer(family, code as u32) {
+            Ok(port) => port,
+            Err(e) => {
+                warn!("abis_agent: cannot open {family:?} bearer {code}: {e}");
+                code as u16
+            }
+        },
+        None => code as u16,
+    };
+    TrafficCircuitId {
+        traffic_circuit_identifier,
+        traffic_connection_identifier: 0,
+    }
+}
+
+fn sch_connect(
+    ccr: CallConnectionReference,
+    config: &AbisAgentConfig,
+    traffic_circuit_id: TrafficCircuitId,
+    code: u8,
+) -> Option<AbisMessage> {
+    let connect = ConnectMessage {
+        call_connection_reference: ccr,
+        correlation_id: None,
+        sdu_id: None,
+        connect_information: vec![A3ConnectInformation {
+            physical_channel_type: PhysicalChannelType::Sch,
+            new_a3: true,
+            cell_info_records: vec![CellInfoRecord {
+                cell: config.cell_id,
+                qof_mask: 0,
+                new_cell: true,
+                power_combine_indication: false,
+                pilot_pn: config.pilot_pn,
+                code_channel: code,
+            }],
+            traffic_circuit_id,
+            extended_handoff_direction_parameters: None,
+            channel_element_id: vec![code],
+            a3_originating_id: 1,
+            a7_destination_id: 0,
+        }],
+        physical_channel_info: PhysicalChannelInfo {
+            frame_offset: 0,
+            pilot_gating_rate: PilotGatingRate::Full,
+            arfcn: 0,
+            otd: false,
+            physical_channels: vec![PhysicalChannelType::Sch],
+        },
+    };
+    match connect.encode() {
+        Ok(bytes) => abis_message_from_typed(&bytes),
+        Err(e) => {
+            warn!("abis_agent: SCH Connect encode failed: {e}");
+            None
+        }
+    }
+}
+
+fn free_traffic(
+    controller: &TrafficResourceService,
+    bearer: &Option<Arc<BearerTransport>>,
+    walsh_code: u8,
+) {
+    controller.deallocate_traffic(walsh_code);
+    if let Some(bearer) = bearer {
+        bearer.close_bearer(ChannelFamily::Fch, walsh_code as u32);
+    }
+}
+
+fn free_sch(controller: &TrafficResourceService, bearer: &Option<Arc<BearerTransport>>, code: u8) {
+    controller.deallocate_sch(code);
+    if let Some(bearer) = bearer {
+        bearer.close_bearer(ChannelFamily::Sch, code as u32);
+    }
 }
 
 impl AbisAgent {
@@ -171,7 +259,12 @@ impl AbisAgent {
             controller,
             sessions: HashMap::new(),
             paging_state: None,
+            bearer: None,
         }
+    }
+
+    pub fn set_bearer_transport(&mut self, bearer: Arc<BearerTransport>) {
+        self.bearer = Some(bearer);
     }
 
     /// Release every traffic channel and SCH this agent holds.
@@ -185,10 +278,10 @@ impl AbisAgent {
                 "abis_agent: releasing walsh={} for CCR {:?} after Abis disconnect",
                 session.walsh_code, ccr
             );
-            self.controller.deallocate_traffic(session.walsh_code);
+            free_traffic(&self.controller, &self.bearer, session.walsh_code);
             self.controller.request_rx_removal(session.walsh_code);
             if let Some(sch_walsh_code) = session.sch_walsh_code {
-                self.controller.deallocate_sch(sch_walsh_code);
+                free_sch(&self.controller, &self.bearer, sch_walsh_code);
             }
         }
         if let Some(state) = &self.paging_state {
@@ -609,7 +702,7 @@ impl AbisAgent {
         let mut setup_proc = TrafficSetupProcedure::new(ccr);
         if let Err(e) = setup_proc.start_setup(&setup) {
             warn!("abis_agent: setup procedure start failed: {e}");
-            self.controller.deallocate_traffic(walsh_code);
+            free_traffic(&self.controller, &self.bearer, walsh_code);
             return;
         }
 
@@ -624,10 +717,7 @@ impl AbisAgent {
                 pilot_pn: self.config.pilot_pn,
                 code_channel: walsh_code,
             }],
-            traffic_circuit_id: TrafficCircuitId {
-                traffic_circuit_identifier: walsh_code as u16,
-                traffic_connection_identifier: 0,
-            },
+            traffic_circuit_id: traffic_circuit_id(&self.bearer, ChannelFamily::Fch, walsh_code),
             extended_handoff_direction_parameters: None,
             channel_element_id: vec![walsh_code],
             a3_originating_id: 1,
@@ -652,7 +742,7 @@ impl AbisAgent {
                 if let Some(msg) = abis_message_from_typed(&bytes) {
                     if let Err(e) = setup_proc.on_connect(&connect) {
                         warn!("abis_agent: setup procedure on_connect failed: {e}");
-                        self.controller.deallocate_traffic(walsh_code);
+                        free_traffic(&self.controller, &self.bearer, walsh_code);
                         return;
                     }
 
@@ -668,6 +758,7 @@ impl AbisAgent {
                             release: TrafficReleaseProcedure::new(ccr),
                             traffic_lac: None,
                             sch_walsh_code,
+                            sch_connect_pending: false,
                             requested_service_option: setup.service_option.map(|so| so.0),
                             set_up_at: Instant::now(),
                             release_requested_at: None,
@@ -679,7 +770,7 @@ impl AbisAgent {
             }
             Err(e) => {
                 warn!("abis_agent: Connect encode failed: {e}");
-                self.controller.deallocate_traffic(walsh_code);
+                free_traffic(&self.controller, &self.bearer, walsh_code);
             }
         }
     }
@@ -714,7 +805,7 @@ impl AbisAgent {
         };
         if request_info.forward_supplemental_channel_duration == 0 {
             let release_code = if let Some(code) = session.sch_walsh_code.take() {
-                self.controller.deallocate_sch(code);
+                free_sch(&self.controller, &self.bearer, code);
                 info!(
                     "abis_agent: released F-SCH W({})={} for CCR {:?}",
                     profile.walsh_len, code, ccr
@@ -769,6 +860,17 @@ impl AbisAgent {
                         "abis_agent: allocated F-SCH W({})={} rate={} gain={:.3}",
                         profile.walsh_len, code, profile.rate_bps, sch_gain_linear
                     );
+                    if self.bearer.is_some()
+                        && let Some(msg) = sch_connect(
+                            ccr,
+                            &self.config,
+                            traffic_circuit_id(&self.bearer, ChannelFamily::Sch, code),
+                            code,
+                        )
+                    {
+                        session.sch_connect_pending = true;
+                        responses.push(msg);
+                    }
                     code
                 }
                 None => {
@@ -832,6 +934,14 @@ impl AbisAgent {
             warn!("abis_agent: ConnectAck for unknown CCR {:?}", ccr);
             return;
         };
+        if session.sch_connect_pending {
+            session.sch_connect_pending = false;
+            debug!(
+                "abis_agent: ConnectAck for the SCH connection of CCR {:?}",
+                ccr
+            );
+            return;
+        }
 
         if let Err(e) = session.setup.on_connect_ack(&ack) {
             warn!("abis_agent: setup procedure on_connect_ack failed: {e}");
@@ -942,10 +1052,10 @@ impl AbisAgent {
 
         let walsh_code = session.walsh_code;
         let sch_walsh_code = session.sch_walsh_code;
-        self.controller.deallocate_traffic(walsh_code);
+        free_traffic(&self.controller, &self.bearer, walsh_code);
         self.controller.request_rx_removal(walsh_code);
         if let Some(w32) = sch_walsh_code {
-            self.controller.deallocate_sch(w32);
+            free_sch(&self.controller, &self.bearer, w32);
         }
 
         let ack = RemoveAckMessage {
@@ -1280,7 +1390,7 @@ impl AbisAgent {
     /// Submits an L3 SDU received via bearer signaling frame to the traffic LAC.
     ///
     /// This is the BTS-side entry point for forward traffic signaling: the BSC
-    /// sends a ForwardFchDcchFrame over bearer UDP with Signaling queue flag,
+    /// sends a blank-and-burst ForwardFchDcchFrame on the traffic connection,
     /// and the BTS routes it here for ARQ/SAR assembly.
     pub fn submit_bearer_l3_sdu(
         &mut self,

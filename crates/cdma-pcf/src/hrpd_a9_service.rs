@@ -11,6 +11,12 @@ use log::{debug, info, warn};
 use crate::{PcfEvent, PcfSessionId, PcfSessionPhase, spawn_hrpd_pcf_bearer_relay};
 
 const HRPD_A11_REGISTRATION_LIFETIME_SECS: u16 = 600;
+const PACKET_SERVICE_OPTIONS: [u16; 4] = [
+    cdma_common::consts::SERVICE_OPTION_PACKET_DATA,
+    cdma_common::consts::SERVICE_OPTION_ASYNC_DATA,
+    cdma_common::consts::SERVICE_OPTION_PACKET_DATA_RC3,
+    cdma_common::consts::SERVICE_OPTION_HRPD_PACKET_DATA,
+];
 const HRPD_A11_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(700);
 const HRPD_A11_MAX_ATTEMPTS: usize = 3;
 const A11_PROTOCOL_TYPE_UNSTRUCTURED_BYTE_STREAM: u16 = 0x8881;
@@ -26,19 +32,15 @@ fn unix_seconds() -> u64 {
 }
 
 async fn send_a9_payload(
-    endpoint: &cdma_a9::UdpSignalingEndpoint,
+    endpoint: &cdma_a9::SignalingEndpoint,
     peer: SocketAddr,
-    metadata: cdma_a9::TransportMetadata,
     payload: Vec<u8>,
     label: &str,
 ) -> Result<(), String> {
-    let datagram = cdma_a9::UdpSignalingDatagram::new(metadata, payload)
-        .map_err(|err| format!("{label}: encode A9 UDP datagram: {err}"))?;
     endpoint
-        .send_datagram(peer, &datagram)
+        .send_payload(peer, &payload)
         .await
-        .map_err(|err| format!("{label}: send A9 UDP datagram to {peer}: {err}"))?;
-    Ok(())
+        .map_err(|err| format!("{label}: send A9 message to {peer}: {err}"))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,7 +88,6 @@ struct ConnectedA8 {
     session_id: PcfSessionId,
     connect: cdma_a9::ConnectA8Message,
     peer: SocketAddr,
-    metadata: cdma_a9::TransportMetadata,
 }
 
 pub fn socket_ipv4_octets(addr: SocketAddr, label: &str) -> Result<[u8; 4], String> {
@@ -114,11 +115,50 @@ pub fn configured_a8_ipv4_pair(
     ))
 }
 
-fn configured_a10_ipv4_pair(
-    bearer: &cdma_a10::BearerTransportConfig,
-    label: &str,
-) -> Result<([u8; 4], [u8; 4]), String> {
-    configured_a8_ipv4_pair(bearer, label)
+/// Raw GRE uses the A9 signaling address and learns each AN's address from
+/// its SetupA8.
+fn pcf_a8_ipv4_pair(config: &crate::PcfNodeConfig) -> Result<([u8; 4], [u8; 4]), String> {
+    match config.a8_bearer.mode {
+        cdma_a8::BearerTransportMode::UdpEncapsulatedGre => {
+            configured_a8_ipv4_pair(&config.a8_bearer, "pcf.a8_bearer")
+        }
+        cdma_a8::BearerTransportMode::RawGre => {
+            let local = socket_ipv4_octets(config.a9_bind_addr, "pcf.a9_bind_addr")?;
+            Ok((local, local))
+        }
+    }
+}
+
+/// Raw GRE uses the A11 addresses, which A.S0017 defines as the A10 endpoints.
+fn pcf_a10_ipv4_pair(config: &crate::PcfNodeConfig) -> Result<([u8; 4], [u8; 4]), String> {
+    match config.a10_bearer.mode {
+        cdma_a10::BearerTransportMode::UdpEncapsulatedGre => {
+            configured_a8_ipv4_pair(&config.a10_bearer, "pcf.a10_bearer")
+        }
+        cdma_a10::BearerTransportMode::RawGre => Ok((
+            socket_ipv4_octets(config.a11.bind_addr, "pcf.a11.bind_addr")?,
+            socket_ipv4_octets(config.a11.peer_addr, "pcf.a11.peer_addr")?,
+        )),
+    }
+}
+
+/// Port 0 for raw GRE (A.S0016-D §4.2.16).
+fn an_a8_peer(setup: &cdma_a9::SetupA8Message, port: u16) -> SocketAddr {
+    let ip = match setup.a8_traffic_id.ip_address {
+        cdma_a9::A8IpAddress::V4(ip) => IpAddr::from(ip),
+        cdma_a9::A8IpAddress::V6(ip) => IpAddr::from(ip),
+    };
+    SocketAddr::new(ip, port)
+}
+
+fn pcf_a8_traffic_id(
+    setup: &cdma_a9::SetupA8Message,
+    pcf_a8_ipv4: [u8; 4],
+) -> cdma_a9::A8TrafficId {
+    cdma_a9::A8TrafficId {
+        ip_address: cdma_a9::A8IpAddress::V4(pcf_a8_ipv4),
+        ..setup.a8_traffic_id.clone()
+    }
 }
 
 pub fn inverted_udp_gre_bearer(
@@ -126,6 +166,9 @@ pub fn inverted_udp_gre_bearer(
     label: &str,
 ) -> Result<cdma_a8::BearerTransportConfig, String> {
     bearer.validate(label)?;
+    if bearer.mode == cdma_a8::BearerTransportMode::RawGre {
+        return Ok(cdma_a8::BearerTransportConfig::raw_gre());
+    }
     let bind = bearer
         .udp_peer_addr
         .ok_or_else(|| format!("{label}: missing peer addr for inverse endpoint"))?;
@@ -218,8 +261,23 @@ fn build_hrpd_a11_registration_request_for_imsi(
     a11: cdma_a11::A11TransportConfig,
     security: &cdma_a11::A11SecurityAssociation,
     lifetime: u16,
+    service_option: Option<u16>,
+    pcf_features: &[cdma_a11::PcfEnabledFeatureNvse],
 ) -> Result<cdma_a11::Message, String> {
     let care_of_address = socket_ipv4_octets(a11.bind_addr, "pcf.a11.bind_addr")?;
+    // The NVSEs precede the authentication extension, which covers every byte
+    // before it (RFC 3344 §3.5.2).
+    let mut extensions: Vec<cdma_a11::Extension> =
+        service_option
+            .map(|so| cdma_a11::Extension::Nvse(cdma_a11::Nvse::ServiceOption(so)))
+            .into_iter()
+            .chain(pcf_features.iter().map(|feature| {
+                cdma_a11::Extension::Nvse(cdma_a11::Nvse::PcfEnabledFeature(*feature))
+            }))
+            .collect();
+    extensions.push(cdma_a11::Extension::Authentication(
+        security.placeholder_authentication(cdma_a11::AuthenticationExtensionType::MobileHome),
+    ));
     let home_agent = socket_ipv4_octets(a11.peer_addr, "pcf.a11.peer_addr")?;
     let mut message = cdma_a11::Message::RegistrationRequest(cdma_a11::RegistrationRequest {
         flags: 0x0a,
@@ -229,9 +287,7 @@ fn build_hrpd_a11_registration_request_for_imsi(
         care_of_address,
         identification: a11_identification(),
         session: build_hrpd_a11_session_from_imsi(session_id, imsi)?,
-        extensions: vec![cdma_a11::Extension::Authentication(
-            security.placeholder_authentication(cdma_a11::AuthenticationExtensionType::MobileHome),
-        )],
+        extensions,
     });
     security
         .sign_message(&mut message)
@@ -278,7 +334,42 @@ pub fn build_hrpd_a11_registration_request(
         a11,
         security,
         HRPD_A11_REGISTRATION_LIFETIME_SECS,
+        Some(setup.service_option.0),
+        &pcf_enabled_features(setup),
     )
+}
+
+/// The PCF relays segments unchanged, so it accepts them on A10 only when the
+/// AN does (A.S0008-C §4.2.14).
+fn pcf_enabled_features(setup: &cdma_a9::SetupA8Message) -> Vec<cdma_a11::PcfEnabledFeatureNvse> {
+    if setup.a9_indicators.gre_segmentation_supported {
+        vec![cdma_a11::PcfEnabledFeatureNvse::GreSegmentationEnabled]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The PCF relays A10 unchanged, so Connect-A8 mirrors the PDSN Enabled
+/// Features (A.S0008-C §4.2.17).
+fn connect_a8_indicators(reply: &cdma_a11::RegistrationReply) -> Option<cdma_a9::A9Indicators> {
+    let enabled = |wanted: cdma_a11::PdsnEnabledFeatureNvse| {
+        reply.extensions.iter().any(|extension| {
+            matches!(
+                extension,
+                cdma_a11::Extension::Nvse(cdma_a11::Nvse::PdsnEnabledFeature(feature))
+                    if *feature == wanted
+            )
+        })
+    };
+    let packet_boundary_supported =
+        enabled(cdma_a11::PdsnEnabledFeatureNvse::PacketBoundaryEnabled);
+    let gre_segmentation_supported =
+        enabled(cdma_a11::PdsnEnabledFeatureNvse::GreSegmentationEnabled);
+    (packet_boundary_supported || gre_segmentation_supported).then_some(cdma_a9::A9Indicators {
+        packet_boundary_supported,
+        gre_segmentation_supported,
+        ..cdma_a9::A9Indicators::default()
+    })
 }
 
 async fn register_hrpd_a11_session(
@@ -290,7 +381,7 @@ async fn register_hrpd_a11_session(
     session_id: PcfSessionId,
     setup: &cdma_a9::SetupA8Message,
     a10_endpoint: cdma_a10::BearerEndpoint,
-) -> Result<cdma_a11::SessionKey, String> {
+) -> Result<(cdma_a11::SessionKey, Option<cdma_a9::A9Indicators>), String> {
     let request = build_hrpd_a11_registration_request(session_id, setup, pcf_config.a11, security)?;
     let key = match &request {
         cdma_a11::Message::RegistrationRequest(request) => {
@@ -372,7 +463,7 @@ async fn register_hrpd_a11_session(
             cdma_a10::BearerSession::new(key.pcf_session_id, a10_endpoint),
         )
         .map_err(|err| format!("bind PCF A10 bearer: {err}"))?;
-    Ok(key)
+    Ok((key, connect_a8_indicators(reply_body)))
 }
 
 async fn refresh_hrpd_a11_session_after_a8_retarget(
@@ -404,7 +495,7 @@ async fn refresh_hrpd_a11_session_after_a8_retarget(
     )
     .await
     {
-        Ok(a11_key) => debug!(
+        Ok((a11_key, _)) => debug!(
             "HRPD PCF A11: refreshed retargeted session={session_id:?} key={a11_key:?}; A10 packet state is available for resumed traffic"
         ),
         Err(err) => {
@@ -428,6 +519,8 @@ async fn deregister_hrpd_a11_session(
         pcf_config.a11,
         security,
         0,
+        None,
+        &[],
     )?;
     manager
         .enqueue_a11(session_id, request)
@@ -498,6 +591,8 @@ async fn send_hrpd_a11_lifetime_zero_after_registration_update(
         pcf_config.a11,
         security,
         0,
+        None,
+        &[],
     )?;
     let mut buf = vec![0u8; 4096];
     let mut received = None;
@@ -565,7 +660,7 @@ async fn send_hrpd_a11_lifetime_zero_after_registration_update(
 
 async fn send_hrpd_disconnect_a8(
     manager: &mut crate::PcfSessionManager,
-    endpoint: &cdma_a9::UdpSignalingEndpoint,
+    endpoint: &cdma_a9::SignalingEndpoint,
     key: u32,
     connected: &mut ConnectedA8,
     reason: &str,
@@ -591,15 +686,7 @@ async fn send_hrpd_disconnect_a8(
     let payload = disconnect
         .encode()
         .map_err(|err| format!("HRPD PCF A9: encode DisconnectA8: {err}"))?;
-    connected.metadata.sequence_no = connected.metadata.sequence_no.wrapping_add(1);
-    send_a9_payload(
-        endpoint,
-        connected.peer,
-        connected.metadata,
-        payload,
-        "HRPD PCF A9",
-    )
-    .await?;
+    send_a9_payload(endpoint, connected.peer, payload, "HRPD PCF A9").await?;
     info!(
         "HRPD PCF A9: sent DisconnectA8 session={:?} key=0x{key:08x} peer={} reason={reason}",
         connected.session_id, connected.peer
@@ -638,20 +725,15 @@ pub async fn spawn_hrpd_pcf_a9_service_with_sessions(
     pcf_config: crate::PcfNodeConfig,
     sessions: tokio::sync::watch::Sender<Vec<HrpdA10SessionView>>,
 ) -> Result<HrpdA9ClientConfig, Error> {
-    let (a8_local_ipv4, a8_peer_ipv4) =
-        configured_a8_ipv4_pair(&pcf_config.a8_bearer, "pcf.a8_bearer")
-            .map_err(|err| Error::from(format!("HRPD PCF A9 config: {err}")))?;
+    let (a8_local_ipv4, a8_peer_ipv4) = pcf_a8_ipv4_pair(&pcf_config)
+        .map_err(|err| Error::from(format!("HRPD PCF A9 config: {err}")))?;
     let a8_endpoint = cdma_a8::BearerEndpoint::new(a8_local_ipv4, a8_peer_ipv4);
     let an_a8_bearer = inverted_udp_gre_bearer(pcf_config.a8_bearer, "an.a8_bearer")
         .map_err(|err| Error::from(format!("HRPD AN A8 config: {err}")))?;
     let an_a8_endpoint = cdma_a8::BearerEndpoint::new(a8_peer_ipv4, a8_local_ipv4);
-    let an_a8_port = an_a8_bearer
-        .udp_bind_addr
-        .ok_or_else(|| Error::from("an.a8_bearer requires udp_bind_addr"))?
-        .port();
-    let (a10_local_ipv4, a10_peer_ipv4) =
-        configured_a10_ipv4_pair(&pcf_config.a10_bearer, "pcf.a10_bearer")
-            .map_err(|err| Error::from(format!("HRPD PCF A10 config: {err}")))?;
+    let an_a8_port = an_a8_bearer.udp_bind_addr.map_or(0, |addr| addr.port());
+    let (a10_local_ipv4, a10_peer_ipv4) = pcf_a10_ipv4_pair(&pcf_config)
+        .map_err(|err| Error::from(format!("HRPD PCF A10 config: {err}")))?;
     let a10_endpoint = cdma_a10::BearerEndpoint::new(a10_local_ipv4, a10_peer_ipv4);
     let bearer_relay = spawn_hrpd_pcf_bearer_relay(
         pcf_config.a8_bearer,
@@ -673,13 +755,14 @@ pub async fn spawn_hrpd_pcf_a9_service_with_sessions(
     let a11_security = cdma_a11::A11SecurityAssociation::from_config(&pcf_config.a11_security)
         .map_err(|err| Error::from(format!("invalid HRPD PCF A11 security config: {err}")))?;
     let requested_a9_bind_addr = pcf_config.a9_bind_addr;
-    let endpoint = cdma_a9::UdpSignalingEndpoint::bind(requested_a9_bind_addr)
-        .await
-        .map_err(|err| {
-            Error::from(format!(
-                "failed to bind HRPD PCF A9 {requested_a9_bind_addr}: {err}"
-            ))
-        })?;
+    let endpoint =
+        cdma_a9::SignalingEndpoint::listen(requested_a9_bind_addr, pcf_config.a9_transport)
+            .await
+            .map_err(|err| {
+                Error::from(format!(
+                    "failed to bind HRPD PCF A9 {requested_a9_bind_addr}: {err}"
+                ))
+            })?;
     let a9_bind_addr = endpoint
         .local_addr()
         .map_err(|err| Error::from(format!("failed to read HRPD PCF A9 local addr: {err}")))?;
@@ -795,7 +878,7 @@ pub async fn spawn_hrpd_pcf_a9_service_with_sessions(
                     }
                     continue;
                 }
-                a9 = endpoint.recv_datagram(&mut state.a9_buf) => {
+                a9 = endpoint.recv(&mut state.a9_buf) => {
                     match a9 {
                         Ok(value) => value,
                         Err(err) => {
@@ -855,14 +938,7 @@ pub async fn spawn_hrpd_pcf_a9_service_with_sessions(
                         continue;
                     }
                 };
-                let metadata = cdma_a9::TransportMetadata {
-                    flags: 0,
-                    session_id: datagram.metadata.session_id,
-                    sequence_no: datagram.metadata.sequence_no.wrapping_add(1),
-                };
-                if let Err(err) =
-                    send_a9_payload(&endpoint, peer, metadata, payload, "HRPD PCF A9").await
-                {
+                if let Err(err) = send_a9_payload(&endpoint, peer, payload, "HRPD PCF A9").await {
                     warn!("{err}");
                     continue;
                 }
@@ -909,9 +985,9 @@ pub async fn spawn_hrpd_pcf_a9_service_with_sessions(
                     continue;
                 }
             };
-            if setup.service_option != cdma_a9::ServiceOptionValue::HIGH_RATE_PACKET_DATA {
+            if !PACKET_SERVICE_OPTIONS.contains(&setup.service_option.0) {
                 warn!(
-                    "HRPD PCF A9: rejecting SetupA8 SO={} from {peer}; expected SO33",
+                    "HRPD PCF A9: rejecting SetupA8 SO={} from {peer}. Packet data uses SO 7, 12, 33 or 59",
                     setup.service_option.0
                 );
                 continue;
@@ -931,9 +1007,10 @@ pub async fn spawn_hrpd_pcf_a9_service_with_sessions(
                         esn: setup.esn,
                         meid: setup.meid,
                         con_ref: setup.con_ref,
-                        a8_traffic_id: setup.a8_traffic_id.clone(),
+                        a8_traffic_id: pcf_a8_traffic_id(&setup, a8_local_ipv4),
                         cause: cached_connect.cause,
                         pdsn_ip_address: cached_connect.pdsn_ip_address,
+                        a9_indicators: cached_connect.a9_indicators,
                     };
                     debug!(
                         "HRPD PCF A9: retargeting cached ConnectA8 session={:?} key=0x{key:08x} con_ref {} -> {}",
@@ -969,23 +1046,15 @@ pub async fn spawn_hrpd_pcf_a9_service_with_sessions(
                         continue;
                     }
                 };
-                let metadata = cdma_a9::TransportMetadata {
-                    flags: 0,
-                    session_id: datagram.metadata.session_id,
-                    sequence_no: datagram.metadata.sequence_no.wrapping_add(1),
-                };
                 state.connected.insert(
                     key,
                     ConnectedA8 {
                         session_id,
                         connect: connect.clone(),
                         peer,
-                        metadata,
                     },
                 );
-                if let Err(err) =
-                    send_a9_payload(&endpoint, peer, metadata, payload, "HRPD PCF A9").await
-                {
+                if let Err(err) = send_a9_payload(&endpoint, peer, payload, "HRPD PCF A9").await {
                     state.connected.remove(&key);
                     warn!("{err}");
                 } else {
@@ -1018,7 +1087,8 @@ pub async fn spawn_hrpd_pcf_a9_service_with_sessions(
                     bearer_relay.register(
                         bearer,
                         cdma_a10::BearerSession::new(a10_session_id, a10_endpoint),
-                        SocketAddr::new(peer.ip(), an_a8_port),
+                        an_a8_peer(&setup, an_a8_port),
+                        peer,
                     );
                     let connect = cdma_a9::ConnectA8Message {
                         call_connection_reference: setup.call_connection_reference,
@@ -1027,9 +1097,10 @@ pub async fn spawn_hrpd_pcf_a9_service_with_sessions(
                         esn: setup.esn,
                         meid: setup.meid,
                         con_ref: setup.con_ref,
-                        a8_traffic_id: setup.a8_traffic_id.clone(),
+                        a8_traffic_id: pcf_a8_traffic_id(&setup, a8_local_ipv4),
                         cause: cdma_a9::CauseValue(0x13),
                         pdsn_ip_address: cached_connect.pdsn_ip_address,
+                        a9_indicators: cached_connect.a9_indicators,
                     };
                     if let Err(retarget_err) = state.manager.retarget_same_mobile_connected_a9_from(
                         session_id,
@@ -1063,22 +1134,15 @@ pub async fn spawn_hrpd_pcf_a9_service_with_sessions(
                             continue;
                         }
                     };
-                    let metadata = cdma_a9::TransportMetadata {
-                        flags: 0,
-                        session_id: datagram.metadata.session_id,
-                        sequence_no: datagram.metadata.sequence_no.wrapping_add(1),
-                    };
                     state.connected.insert(
                         key,
                         ConnectedA8 {
                             session_id,
                             connect: connect.clone(),
                             peer,
-                            metadata,
                         },
                     );
-                    if let Err(err) =
-                        send_a9_payload(&endpoint, peer, metadata, payload, "HRPD PCF A9").await
+                    if let Err(err) = send_a9_payload(&endpoint, peer, payload, "HRPD PCF A9").await
                     {
                         state.connected.remove(&key);
                         warn!("{err}");
@@ -1113,6 +1177,7 @@ pub async fn spawn_hrpd_pcf_a9_service_with_sessions(
                 continue;
             }
             let mut pdsn_ip_address = None;
+            let mut a9_indicators = None;
             if setup.imsi.is_some() {
                 let a10_session_id = match u32::try_from(session_id.0) {
                     Ok(session_id) if session_id != 0 => session_id,
@@ -1131,7 +1196,8 @@ pub async fn spawn_hrpd_pcf_a9_service_with_sessions(
                 bearer_relay.register(
                     bearer,
                     cdma_a10::BearerSession::new(a10_session_id, a10_endpoint),
-                    SocketAddr::new(peer.ip(), an_a8_port),
+                    an_a8_peer(&setup, an_a8_port),
+                    peer,
                 );
                 match register_hrpd_a11_session(
                     &mut state.manager,
@@ -1145,7 +1211,8 @@ pub async fn spawn_hrpd_pcf_a9_service_with_sessions(
                 )
                 .await
                 {
-                    Ok(a11_key) => {
+                    Ok((a11_key, indicators)) => {
+                        a9_indicators = indicators;
                         pdsn_ip_address = socket_ipv4_octets(
                             pcf_config_for_task.a11.peer_addr,
                             "pcf.a11.peer_addr",
@@ -1181,9 +1248,10 @@ pub async fn spawn_hrpd_pcf_a9_service_with_sessions(
                 esn: setup.esn,
                 meid: setup.meid,
                 con_ref: setup.con_ref,
-                a8_traffic_id: setup.a8_traffic_id.clone(),
+                a8_traffic_id: pcf_a8_traffic_id(&setup, a8_local_ipv4),
                 cause: cdma_a9::CauseValue(0x13),
                 pdsn_ip_address,
+                a9_indicators,
             };
             if let Err(err) = state
                 .manager
@@ -1202,39 +1270,25 @@ pub async fn spawn_hrpd_pcf_a9_service_with_sessions(
                     continue;
                 }
             };
-            let metadata = cdma_a9::TransportMetadata {
-                flags: 0,
-                session_id: datagram.metadata.session_id,
-                sequence_no: datagram.metadata.sequence_no.wrapping_add(1),
-            };
             state.connected.insert(
                 key,
                 ConnectedA8 {
                     session_id,
                     connect: connect.clone(),
                     peer,
-                    metadata,
                 },
             );
-            if let Err(err) =
-                send_a9_payload(&endpoint, peer, metadata, payload, "HRPD PCF A9").await
-            {
+            if let Err(err) = send_a9_payload(&endpoint, peer, payload, "HRPD PCF A9").await {
                 state.connected.remove(&key);
                 warn!("{err}");
                 continue;
             }
             info!(
-                "HRPD PCF A9: accepted SetupA8 session={:?} con_ref={} key=0x{key:08x} peer={peer}; A8 bound {}.{}.{}.{} -> {}.{}.{}.{}",
+                "HRPD PCF A9: accepted SetupA8 session={:?} con_ref={} key=0x{key:08x} peer={peer}; A8 bound {} -> {}",
                 session_id,
                 setup.con_ref.0,
-                a8_local_ipv4[0],
-                a8_local_ipv4[1],
-                a8_local_ipv4[2],
-                a8_local_ipv4[3],
-                a8_peer_ipv4[0],
-                a8_peer_ipv4[1],
-                a8_peer_ipv4[2],
-                a8_peer_ipv4[3],
+                IpAddr::from(a8_local_ipv4),
+                an_a8_peer(&setup, an_a8_port),
             );
             if setup.imsi.is_none() {
                 warn!(
@@ -1248,7 +1302,7 @@ pub async fn spawn_hrpd_pcf_a9_service_with_sessions(
     });
     Ok(HrpdA9ClientConfig {
         pcf_addr: a9_bind_addr,
-        a8_peer_ipv4,
+        a9_transport: pcf_config.a9_transport,
         an_a8_bearer,
         an_a8_endpoint,
     })
@@ -1257,6 +1311,71 @@ pub async fn spawn_hrpd_pcf_a9_service_with_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pcf_accepts_a10_segments_only_when_the_an_accepts_them() {
+        let mut setup = setup_a8_for_features();
+        assert!(pcf_enabled_features(&setup).is_empty());
+
+        setup.a9_indicators.gre_segmentation_supported = true;
+
+        assert_eq!(
+            pcf_enabled_features(&setup),
+            [cdma_a11::PcfEnabledFeatureNvse::GreSegmentationEnabled]
+        );
+    }
+
+    #[test]
+    fn connect_a8_indicators_follow_the_pdsn_enabled_features() {
+        let reply = |features: &[cdma_a11::PdsnEnabledFeatureNvse]| cdma_a11::RegistrationReply {
+            code: 0,
+            lifetime: 1800,
+            home_address: [0; 4],
+            home_agent: [127, 0, 0, 1],
+            identification: 0,
+            session: cdma_a11::SessionSpecificExtension {
+                protocol_type: 0x8881,
+                pcf_session_id: 1,
+                session_id_version: 1,
+                mn_session_reference_id: 1,
+                mn_id_type: A11_MSID_TYPE_IMSI,
+                mn_id: imsi_to_a11_msid_bcd("310005551239999").unwrap(),
+            },
+            extensions: features
+                .iter()
+                .map(|feature| {
+                    cdma_a11::Extension::Nvse(cdma_a11::Nvse::PdsnEnabledFeature(*feature))
+                })
+                .collect(),
+        };
+
+        assert_eq!(connect_a8_indicators(&reply(&[])), None);
+        let indicators = connect_a8_indicators(&reply(&[
+            cdma_a11::PdsnEnabledFeatureNvse::PacketBoundaryEnabled,
+            cdma_a11::PdsnEnabledFeatureNvse::GreSegmentationEnabled,
+        ]))
+        .unwrap();
+        assert!(indicators.packet_boundary_supported);
+        assert!(indicators.gre_segmentation_supported);
+        assert!(!indicators.data_ready);
+    }
+
+    fn setup_a8_for_features() -> cdma_a9::SetupA8Message {
+        cdma_a9::SetupA8Message {
+            call_connection_reference: None,
+            correlation_id: None,
+            imsi: Some("310005551239999".to_string()),
+            esn: None,
+            meid: None,
+            con_ref: cdma_a9::ConRef(1),
+            quality_of_service_parameters: None,
+            bsc_id: cdma_a9::BscId(b"1XBTS".to_vec()),
+            a8_traffic_id: cdma_a9::A8TrafficId::gre_ppp(1, [127, 0, 0, 1]),
+            service_option: cdma_a9::ServiceOptionValue(33),
+            a9_indicators: cdma_a9::A9Indicators::default(),
+            user_zone_id: None,
+        }
+    }
 
     #[test]
     fn imsi_to_a11_msid_bcd_matches_a11_session_format() {
@@ -1283,13 +1402,9 @@ mod tests {
                 a8_traffic_id: cdma_a9::A8TrafficId::gre_ppp(uati, [127, 0, 0, 1]),
                 cause: cdma_a9::CauseValue::A8_CONNECTION_COMPLETE,
                 pdsn_ip_address: Some(cdma_a9::PdsnIpAddress([127, 0, 0, 2])),
+                a9_indicators: None,
             },
             peer: "127.0.0.1:40000".parse().unwrap(),
-            metadata: cdma_a9::TransportMetadata {
-                flags: 0,
-                session_id: 1,
-                sequence_no: 1,
-            },
         }
     }
 

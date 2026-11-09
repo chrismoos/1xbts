@@ -802,6 +802,7 @@ mod tests {
             &[BaseStationConfig {
                 management_endpoint: "http://127.0.0.1:17016".to_string(),
                 id: Some("bts-1".to_string()),
+                a1p: cdma_ios::transport::A1pConfig::for_role(cdma_ios::transport::A1Role::Msc),
             }],
             "http://127.0.0.1:17021",
             "http://127.0.0.1:17047",
@@ -817,6 +818,7 @@ mod tests {
             &[BaseStationConfig {
                 management_endpoint: "http://127.0.0.1:17016".to_string(),
                 id: None,
+                a1p: cdma_ios::transport::A1pConfig::for_role(cdma_ios::transport::A1Role::Msc),
             }],
             "http://127.0.0.1:17021",
             "http://127.0.0.1:17047",
@@ -828,10 +830,12 @@ mod tests {
                 BaseStationConfig {
                     management_endpoint: "http://127.0.0.1:17016".to_string(),
                     id: None,
+                    a1p: cdma_ios::transport::A1pConfig::for_role(cdma_ios::transport::A1Role::Msc),
                 },
                 BaseStationConfig {
                     management_endpoint: "http://127.0.0.1:17026".to_string(),
                     id: None,
+                    a1p: cdma_ios::transport::A1pConfig::for_role(cdma_ios::transport::A1Role::Msc),
                 },
             ],
             "http://127.0.0.1:17021",
@@ -846,6 +850,7 @@ mod tests {
             &[BaseStationConfig {
                 management_endpoint: "http://127.0.0.1:1".into(),
                 id: None,
+                a1p: cdma_ios::transport::A1pConfig::for_role(cdma_ios::transport::A1Role::Msc),
             }],
             "http://127.0.0.1:1",
             "http://127.0.0.1:17047",
@@ -894,6 +899,7 @@ mod tests {
             &[BaseStationConfig {
                 management_endpoint: "http://127.0.0.1:17016".to_string(),
                 id: Some("bts-1".to_string()),
+                a1p: cdma_ios::transport::A1pConfig::for_role(cdma_ios::transport::A1Role::Msc),
             }],
             "http://127.0.0.1:17021",
             "http://127.0.0.1:17047",
@@ -911,6 +917,7 @@ mod tests {
             &[BaseStationConfig {
                 management_endpoint: "http://127.0.0.1:1".to_string(),
                 id: Some("bts-1".to_string()),
+                a1p: cdma_ios::transport::A1pConfig::for_role(cdma_ios::transport::A1Role::Msc),
             }],
             "http://127.0.0.1:1",
             "http://127.0.0.1:1",

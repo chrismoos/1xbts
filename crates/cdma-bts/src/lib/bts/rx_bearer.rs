@@ -1,4 +1,3 @@
-use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 
 use cdma_abis::{
@@ -8,7 +7,6 @@ use cdma_abis::{
 use log::{info, warn};
 
 use super::super::AccessChannelEvent;
-use super::REVERSE_BEARER_SEQ;
 
 pub(super) fn reverse_frame_content_from_rate_bps(rate_bps: u32) -> FrameContent {
     use cdma_abis::bearer::{
@@ -35,8 +33,6 @@ pub(super) fn reverse_frame_content_from_event(event: &AccessChannelEvent) -> Fr
 pub(super) fn emit_reverse_primary_bearer(
     tx: &Option<mpsc::Sender<UdpBearerDatagram>>,
     event: &AccessChannelEvent,
-    bts_id: u32,
-    cell_id: u32,
 ) -> bool {
     let Some(tx) = tx else {
         warn!("emit_reverse_primary_bearer: no bearer tx configured");
@@ -92,14 +88,9 @@ pub(super) fn emit_reverse_primary_bearer(
     };
     let sent = tx
         .send(UdpBearerDatagram {
-            flags: 0,
             channel_family: ChannelFamily::Fch,
             direction: Direction::Reverse,
-            bts_id,
-            cell_id,
             bearer_id: walsh_code as u32,
-            sequence_no: REVERSE_BEARER_SEQ.fetch_add(1, Ordering::Relaxed) as u32,
-            tx_frame_number: event.absolute_chip_start.unwrap_or_default() as u32,
             payload,
         })
         .is_ok();
@@ -118,9 +109,6 @@ pub(super) fn emit_reverse_primary_bearer(
 pub(super) fn emit_reverse_preamble_bearer(
     tx: &Option<mpsc::Sender<UdpBearerDatagram>>,
     walsh_code: u8,
-    abs_chip: u64,
-    bts_id: u32,
-    cell_id: u32,
 ) {
     let Some(tx) = tx else {
         return;
@@ -150,14 +138,9 @@ pub(super) fn emit_reverse_preamble_bearer(
         }
     };
     match tx.send(UdpBearerDatagram {
-        flags: 0,
         channel_family: ChannelFamily::Fch,
         direction: Direction::Reverse,
-        bts_id,
-        cell_id,
         bearer_id: walsh_code as u32,
-        sequence_no: REVERSE_BEARER_SEQ.fetch_add(1, Ordering::Relaxed) as u32,
-        tx_frame_number: abs_chip as u32,
         payload,
     }) {
         Ok(()) => info!(

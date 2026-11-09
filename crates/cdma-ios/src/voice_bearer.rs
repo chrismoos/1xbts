@@ -51,6 +51,23 @@ pub const RFC4733_END_REPEAT_COUNT: usize = 3;
 
 const RTP_HEADER_LEN: usize = 12;
 
+/// RFC 3558 §4.1 / RFC 2658 interleave octet with LLL = NNN = 0 (bundling).
+const NO_INTERLEAVING_OCTET: u8 = 0x00;
+const INTERLEAVE_LENGTH_MASK: u8 = 0b0011_1000;
+/// RFC 3558 §4.1 octet with MMM = 0 and Count = 0 (one ToC entry).
+const RFC3558_NO_MODE_REQUEST_ONE_FRAME: u8 = 0x00;
+const RFC3558_COUNT_MASK: u8 = 0b0001_1111;
+const RFC3558_TOC_HIGH_NIBBLE_SHIFT: u8 = 4;
+const RFC3558_TOC_LOW_NIBBLE_MASK: u8 = 0x0f;
+/// Interleave octet, mode/count octet and one padded ToC octet.
+const RFC3558_SINGLE_FRAME_HEADER_LEN: usize = 3;
+/// RFC 3558 §5.1 erasure frame type.
+const EVRC_ERASURE_CODE: u8 = 5;
+/// RFC 2658 erasure rate octet.
+const QCELP_ERASURE_CODE: u8 = 14;
+/// RFC 2658: receivers handle bundles of up to 10 frames.
+const RFC2658_MAX_BUNDLED_FRAMES: usize = 10;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VoiceBearerFormat {
     Vocoder13k,
@@ -113,6 +130,114 @@ impl VoiceBearerFormat {
         }
     }
 
+    /// Frame type code in the RTP payload: the RFC 3558 §5.1 ToC value for
+    /// EVRC, EVRC-B and EVRC-WB, and the RFC 2658 octet 0 value for 13K.
+    fn frame_type_code(self, frame_type: EvrcFrameType) -> u8 {
+        match (self, frame_type) {
+            (_, EvrcFrameType::Blank) => 0,
+            (_, EvrcFrameType::Eighth) => 1,
+            (_, EvrcFrameType::Quarter) => 2,
+            (_, EvrcFrameType::Half) => 3,
+            (_, EvrcFrameType::Full) => 4,
+            (Self::Vocoder13k, EvrcFrameType::Erasure) => QCELP_ERASURE_CODE,
+            (_, EvrcFrameType::Erasure) => EVRC_ERASURE_CODE,
+        }
+    }
+
+    fn frame_type_from_code(self, code: u8) -> Option<EvrcFrameType> {
+        match code {
+            0 => Some(EvrcFrameType::Blank),
+            1 => Some(EvrcFrameType::Eighth),
+            2 => Some(EvrcFrameType::Quarter),
+            3 => Some(EvrcFrameType::Half),
+            4 => Some(EvrcFrameType::Full),
+            QCELP_ERASURE_CODE if self == Self::Vocoder13k => Some(EvrcFrameType::Erasure),
+            EVRC_ERASURE_CODE if self != Self::Vocoder13k => Some(EvrcFrameType::Erasure),
+            _ => None,
+        }
+    }
+
+    pub fn frame_type_for_len(self, len: usize) -> Option<EvrcFrameType> {
+        [
+            EvrcFrameType::Eighth,
+            EvrcFrameType::Quarter,
+            EvrcFrameType::Half,
+            EvrcFrameType::Full,
+        ]
+        .into_iter()
+        .find(|frame_type| self.payload_bytes(*frame_type) == len)
+    }
+
+    /// A2p payload (A.S0012-D §3.2.3): RFC 3558 §4.1 header-full for the EVRC
+    /// family, RFC 2658 for 13K.
+    pub fn encode_payload(self, frame_type: EvrcFrameType, frame: &[u8]) -> Option<Vec<u8>> {
+        if frame.len() != self.payload_bytes(frame_type) {
+            return None;
+        }
+        let code = self.frame_type_code(frame_type);
+        let mut out = Vec::with_capacity(RFC3558_SINGLE_FRAME_HEADER_LEN + frame.len());
+        out.push(NO_INTERLEAVING_OCTET);
+        match self {
+            Self::Vocoder13k => out.push(code),
+            Self::Evrc | Self::EvrcB | Self::EvrcWb => {
+                out.push(RFC3558_NO_MODE_REQUEST_ONE_FRAME);
+                out.push(code << RFC3558_TOC_HIGH_NIBBLE_SHIFT);
+            }
+        }
+        out.extend_from_slice(frame);
+        Some(out)
+    }
+
+    /// Interleaved packets are rejected.
+    pub fn decode_payload(self, payload: &[u8]) -> Option<Vec<(EvrcFrameType, Vec<u8>)>> {
+        let (&interleave, rest) = payload.split_first()?;
+        if interleave & INTERLEAVE_LENGTH_MASK != 0 {
+            return None;
+        }
+        match self {
+            Self::Vocoder13k => self.decode_rfc2658_frames(rest),
+            Self::Evrc | Self::EvrcB | Self::EvrcWb => self.decode_rfc3558_frames(rest),
+        }
+    }
+
+    fn decode_rfc3558_frames(self, rest: &[u8]) -> Option<Vec<(EvrcFrameType, Vec<u8>)>> {
+        let (&mode_and_count, rest) = rest.split_first()?;
+        let count = usize::from(mode_and_count & RFC3558_COUNT_MASK) + 1;
+        let toc_len = count.div_ceil(2);
+        let tocs = rest.get(..toc_len)?;
+        let mut frames_data = &rest[toc_len..];
+        let mut frames = Vec::with_capacity(count);
+        for index in 0..count {
+            let toc_octet = tocs[index / 2];
+            let code = if index % 2 == 0 {
+                toc_octet >> RFC3558_TOC_HIGH_NIBBLE_SHIFT
+            } else {
+                toc_octet & RFC3558_TOC_LOW_NIBBLE_MASK
+            };
+            let frame_type = self.frame_type_from_code(code)?;
+            let len = self.payload_bytes(frame_type);
+            let frame = frames_data.get(..len)?;
+            frames.push((frame_type, frame.to_vec()));
+            frames_data = &frames_data[len..];
+        }
+        frames_data.is_empty().then_some(frames)
+    }
+
+    fn decode_rfc2658_frames(self, mut rest: &[u8]) -> Option<Vec<(EvrcFrameType, Vec<u8>)>> {
+        let mut frames = Vec::new();
+        while let Some((&code, after_rate)) = rest.split_first() {
+            if frames.len() == RFC2658_MAX_BUNDLED_FRAMES {
+                return None;
+            }
+            let frame_type = self.frame_type_from_code(code)?;
+            let len = self.payload_bytes(frame_type);
+            let frame = after_rate.get(..len)?;
+            frames.push((frame_type, frame.to_vec()));
+            rest = &after_rate[len..];
+        }
+        (!frames.is_empty()).then_some(frames)
+    }
+
     fn payload_bytes(self, frame_type: EvrcFrameType) -> usize {
         match self {
             Self::Vocoder13k => match frame_type {
@@ -133,16 +258,14 @@ impl VoiceBearerFormat {
     }
 }
 
-/// RFC 3558 §4, Table 1: EVRC frame type codes used in the ToC entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
 pub enum EvrcFrameType {
-    Blank = 0,
-    Eighth = 1,
-    Quarter = 2,
-    Half = 3,
-    Full = 4,
-    Erasure = 14,
+    Blank,
+    Eighth,
+    Quarter,
+    Half,
+    Full,
+    Erasure,
 }
 
 impl EvrcFrameType {
@@ -163,18 +286,6 @@ impl EvrcFrameType {
             Self::Quarter => 2400,
             Self::Eighth => 1200,
             Self::Erasure | Self::Blank => 0,
-        }
-    }
-
-    fn from_u8(val: u8) -> Option<Self> {
-        match val {
-            0 => Some(Self::Blank),
-            1 => Some(Self::Eighth),
-            2 => Some(Self::Quarter),
-            3 => Some(Self::Half),
-            4 => Some(Self::Full),
-            14 => Some(Self::Erasure),
-            _ => None,
         }
     }
 }
@@ -286,12 +397,7 @@ impl VoiceBearerFrame {
         ssrc: u32,
     ) -> Option<Vec<u8>> {
         let frame_type = format.frame_type(self.rate_bps)?;
-        if self.payload.len() != format.payload_bytes(frame_type) {
-            return None;
-        }
-        let mut body = Vec::with_capacity(1 + self.payload.len());
-        body.push(frame_type as u8);
-        body.extend_from_slice(&self.payload);
+        let body = format.encode_payload(frame_type, &self.payload)?;
         Some(encode_rtp_packet(
             payload_type,
             false,
@@ -302,10 +408,7 @@ impl VoiceBearerFrame {
         ))
     }
 
-    /// Decodes an RTP/EVRC header-full datagram into a voice bearer frame.
-    ///
-    /// The `circuit_id` is set by the caller from the per-circuit session
-    /// context (not from the RTP header).
+    /// `circuit_id` comes from the per-circuit session, not the RTP header.
     pub fn decode_rtp(buf: &[u8], circuit_id: u16) -> Option<Self> {
         Self::decode_rtp_with_format(buf, circuit_id, VoiceBearerFormat::Evrc)
     }
@@ -315,25 +418,32 @@ impl VoiceBearerFrame {
         circuit_id: u16,
         format: VoiceBearerFormat,
     ) -> Option<Self> {
-        if buf.len() < RTP_HEADER_LEN + 1 {
+        let mut frames = Self::decode_rtp_frames_with_format(buf, circuit_id, format)?;
+        if frames.len() != 1 {
             return None;
         }
-        if (buf[0] >> 6) != 2 {
-            return None;
-        }
+        frames.pop()
+    }
 
-        let toc = buf[RTP_HEADER_LEN];
-        let ft = EvrcFrameType::from_u8(toc & 0x0F)?;
-        let payload = buf[RTP_HEADER_LEN + 1..].to_vec();
-        if payload.len() != format.payload_bytes(ft) {
+    pub fn decode_rtp_frames_with_format(
+        buf: &[u8],
+        circuit_id: u16,
+        format: VoiceBearerFormat,
+    ) -> Option<Vec<Self>> {
+        if buf.len() < RTP_HEADER_LEN + 1 || (buf[0] >> 6) != 2 {
             return None;
         }
-
-        Some(Self {
-            circuit_id,
-            rate_bps: format.rate_bps(ft),
-            payload,
-        })
+        let frames = format.decode_payload(&buf[RTP_HEADER_LEN..])?;
+        Some(
+            frames
+                .into_iter()
+                .map(|(frame_type, payload)| Self {
+                    circuit_id,
+                    rate_bps: format.rate_bps(frame_type),
+                    payload,
+                })
+                .collect(),
+        )
     }
 }
 
@@ -506,8 +616,23 @@ impl VoiceBearerManager {
                         },
                     )
                 } else if pt == pts.voice.payload_type {
-                    VoiceBearerFrame::decode_rtp_with_format(datagram, circuit_id, pts.voice.format)
-                        .map(BearerEvent::Voice)
+                    let frames = VoiceBearerFrame::decode_rtp_frames_with_format(
+                        datagram,
+                        circuit_id,
+                        pts.voice.format,
+                    )
+                    .unwrap_or_default();
+                    let mut closed = false;
+                    for frame in frames {
+                        if tx.send(BearerEvent::Voice(frame)).await.is_err() {
+                            closed = true;
+                            break;
+                        }
+                    }
+                    if closed {
+                        break;
+                    }
+                    None
                 } else {
                     None
                 };
@@ -786,10 +911,9 @@ mod tests {
         assert_eq!(&encoded[4..8], &[0x56, 0x78, 0x9A, 0xBC]);
         // SSRC
         assert_eq!(&encoded[8..12], &[0xDE, 0xAD, 0xBE, 0xEF]);
-        // ToC: Half rate = frame type 3
-        assert_eq!(encoded[12], 3);
-        // Payload
-        assert_eq!(&encoded[13..], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        // RFC 3558 §4.1: no interleaving, MMM=0 Count=0, ToC half rate (3) + pad
+        assert_eq!(&encoded[12..15], &[0x00, 0x00, 0x30]);
+        assert_eq!(&encoded[15..], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     }
 
     #[test]
@@ -807,7 +931,7 @@ mod tests {
                 payload: vec![0; payload_bytes],
             };
             let encoded = frame.encode_rtp(0, 0, 0).expect("valid EVRC frame");
-            assert_eq!(encoded[12] & 0x0F, expected_ft, "rate_bps={}", rate_bps);
+            assert_eq!(encoded[14] >> 4, expected_ft, "rate_bps={}", rate_bps);
 
             let decoded = VoiceBearerFrame::decode_rtp(&encoded, 1).unwrap();
             assert_eq!(decoded.rate_bps, rate_bps);
@@ -846,7 +970,7 @@ mod tests {
                     11,
                 )
                 .expect("valid QCELP rate");
-            assert_eq!(encoded[12], expected_type);
+            assert_eq!(&encoded[12..14], &[0x00, expected_type]);
             let decoded = VoiceBearerFrame::decode_rtp_with_format(
                 &encoded,
                 frame.circuit_id,
@@ -891,8 +1015,86 @@ mod tests {
         pkt.extend_from_slice(&0u16.to_be_bytes());
         pkt.extend_from_slice(&0u32.to_be_bytes());
         pkt.extend_from_slice(&0u32.to_be_bytes());
-        pkt.push(15); // invalid frame type
+        pkt.extend_from_slice(&[0x00, 0x00, 0xf0]); // ToC 15 is not a frame type
         assert!(VoiceBearerFrame::decode_rtp(&pkt, 1).is_none());
+    }
+
+    fn rtp_with_payload(payload: &[u8]) -> Vec<u8> {
+        encode_rtp_packet(EVRC_RTP_PAYLOAD_TYPE, false, 0, 0, 0, payload)
+    }
+
+    #[test]
+    fn rfc3558_bundle_with_odd_toc_count_is_padded_and_decodes_in_order() {
+        // Count=2 (three frames): ToCs full, eighth, half, then 4 bits of padding.
+        let mut payload = vec![0x00, 0x02, 0x41, 0x30];
+        payload.extend(std::iter::repeat_n(0xaa, 22));
+        payload.extend([0xbb; 2]);
+        payload.extend([0xcc; 10]);
+        let frames = VoiceBearerFrame::decode_rtp_frames_with_format(
+            &rtp_with_payload(&payload),
+            3,
+            VoiceBearerFormat::Evrc,
+        )
+        .unwrap();
+        let rates: Vec<u32> = frames.iter().map(|frame| frame.rate_bps).collect();
+        assert_eq!(rates, vec![9600, 1200, 4800]);
+        assert_eq!(frames[2].payload, vec![0xcc; 10]);
+        assert!(
+            VoiceBearerFrame::decode_rtp_with_format(
+                &rtp_with_payload(&payload),
+                3,
+                VoiceBearerFormat::Evrc
+            )
+            .is_none(),
+            "single-frame decode rejects a bundle"
+        );
+    }
+
+    #[test]
+    fn rfc3558_rejects_interleaving_and_trailing_bytes() {
+        let interleaved = [0x08, 0x00, 0x10, 0xbb, 0xbb];
+        assert!(
+            VoiceBearerFormat::Evrc
+                .decode_payload(&interleaved)
+                .is_none()
+        );
+        let trailing = [0x00, 0x00, 0x10, 0xbb, 0xbb, 0xff];
+        assert!(VoiceBearerFormat::Evrc.decode_payload(&trailing).is_none());
+    }
+
+    #[test]
+    fn erasure_codes_follow_each_rfc() {
+        assert_eq!(
+            VoiceBearerFormat::Evrc.decode_payload(&[0x00, 0x00, 0x50]),
+            Some(vec![(EvrcFrameType::Erasure, Vec::new())])
+        );
+        assert_eq!(
+            VoiceBearerFormat::Vocoder13k.decode_payload(&[0x00, 0x0e]),
+            Some(vec![(EvrcFrameType::Erasure, Vec::new())])
+        );
+        assert!(
+            VoiceBearerFormat::Evrc
+                .decode_payload(&[0x00, 0x00, 0xe0])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rfc2658_bundle_uses_each_rate_octet_for_frame_size() {
+        let mut payload = vec![0x00, 0x01];
+        payload.extend([0x11; 3]);
+        payload.push(0x04);
+        payload.extend([0x22; 34]);
+        let frames = VoiceBearerFormat::Vocoder13k
+            .decode_payload(&payload)
+            .unwrap();
+        assert_eq!(
+            frames,
+            vec![
+                (EvrcFrameType::Eighth, vec![0x11; 3]),
+                (EvrcFrameType::Full, vec![0x22; 34]),
+            ]
+        );
     }
 
     #[test]

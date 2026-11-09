@@ -19,7 +19,6 @@ const RTP_MARKER_MASK: u8 = 0x80;
 const RTP_WORD_LEN: usize = 4;
 const RTP_EXTENSION_HEADER_LEN: usize = 4;
 const RTP_EXTENSION_LENGTH_OFFSET: usize = 2;
-const VOICE_FRAME_TYPE_MASK: u8 = 0x0f;
 const SDP_AUDIO_MIN_FIELDS: usize = 3;
 const SDP_ORIGIN_MIN_FIELDS: usize = 6;
 const SDP_ORIGIN_ADDRESS_TYPE_INDEX: usize = 4;
@@ -27,20 +26,6 @@ const SDP_ORIGIN_ADDRESS_INDEX: usize = 5;
 const RTP_CLOCK_RATE: u32 = 8_000;
 const EVRC_PAYLOAD_TYPE: u8 = 96;
 const DTMF_PAYLOAD_TYPE: u8 = 101;
-const VOICE_FRAME_NO_DATA: u8 = 0;
-const VOICE_FRAME_EIGHTH_RATE: u8 = 1;
-const VOICE_FRAME_QUARTER_RATE: u8 = 2;
-const VOICE_FRAME_HALF_RATE: u8 = 3;
-const VOICE_FRAME_FULL_RATE: u8 = 4;
-const VOICE_FRAME_ERASURE: u8 = 14;
-const EVRC_EIGHTH_RATE_BYTES: usize = 2;
-const EVRC_QUARTER_RATE_BYTES: usize = 5;
-const EVRC_HALF_RATE_BYTES: usize = 10;
-const EVRC_FULL_RATE_BYTES: usize = 22;
-const QCELP_EIGHTH_RATE_BYTES: usize = 3;
-const QCELP_QUARTER_RATE_BYTES: usize = 7;
-const QCELP_HALF_RATE_BYTES: usize = 16;
-const QCELP_FULL_RATE_BYTES: usize = 34;
 
 #[derive(Debug, thiserror::Error)]
 pub enum VoiceError {
@@ -99,37 +84,10 @@ impl RelayCodec {
         }
     }
 
-    fn frame_type_for_payload_len(self, payload_len: usize) -> Option<u8> {
-        match (self, payload_len) {
-            (_, 0) => Some(VOICE_FRAME_NO_DATA),
-            (Self::Evrc, EVRC_EIGHTH_RATE_BYTES) | (Self::Qcelp13k, QCELP_EIGHTH_RATE_BYTES) => {
-                Some(VOICE_FRAME_EIGHTH_RATE)
-            }
-            (Self::Evrc, EVRC_QUARTER_RATE_BYTES) | (Self::Qcelp13k, QCELP_QUARTER_RATE_BYTES) => {
-                Some(VOICE_FRAME_QUARTER_RATE)
-            }
-            (Self::Evrc, EVRC_HALF_RATE_BYTES) | (Self::Qcelp13k, QCELP_HALF_RATE_BYTES) => {
-                Some(VOICE_FRAME_HALF_RATE)
-            }
-            (Self::Evrc, EVRC_FULL_RATE_BYTES) | (Self::Qcelp13k, QCELP_FULL_RATE_BYTES) => {
-                Some(VOICE_FRAME_FULL_RATE)
-            }
-            _ => None,
-        }
-    }
-
-    fn payload_len_for_frame_type(self, frame_type: u8) -> Option<usize> {
-        match (self, frame_type) {
-            (_, VOICE_FRAME_NO_DATA | VOICE_FRAME_ERASURE) => Some(0),
-            (Self::Evrc, VOICE_FRAME_EIGHTH_RATE) => Some(EVRC_EIGHTH_RATE_BYTES),
-            (Self::Evrc, VOICE_FRAME_QUARTER_RATE) => Some(EVRC_QUARTER_RATE_BYTES),
-            (Self::Evrc, VOICE_FRAME_HALF_RATE) => Some(EVRC_HALF_RATE_BYTES),
-            (Self::Evrc, VOICE_FRAME_FULL_RATE) => Some(EVRC_FULL_RATE_BYTES),
-            (Self::Qcelp13k, VOICE_FRAME_EIGHTH_RATE) => Some(QCELP_EIGHTH_RATE_BYTES),
-            (Self::Qcelp13k, VOICE_FRAME_QUARTER_RATE) => Some(QCELP_QUARTER_RATE_BYTES),
-            (Self::Qcelp13k, VOICE_FRAME_HALF_RATE) => Some(QCELP_HALF_RATE_BYTES),
-            (Self::Qcelp13k, VOICE_FRAME_FULL_RATE) => Some(QCELP_FULL_RATE_BYTES),
-            _ => None,
+    fn bearer_format(self) -> cdma_ios::VoiceBearerFormat {
+        match self {
+            Self::Evrc => cdma_ios::VoiceBearerFormat::Evrc,
+            Self::Qcelp13k => cdma_ios::VoiceBearerFormat::Vocoder13k,
         }
     }
 }
@@ -552,18 +510,25 @@ fn rtp_payload_offset(packet: &[u8]) -> Option<usize> {
     (packet.len() >= offset).then_some(offset)
 }
 
+/// The FAP sends compact frames with no payload header (A.S0012-D §3.2.3).
 fn add_a2p_toc(packet: &[u8], codec: RelayCodec, fap_payload_type: u8) -> Option<Vec<u8>> {
     let offset = rtp_payload_offset(packet)?;
     let payload_type = packet[1] & RTP_PAYLOAD_TYPE_MASK;
     if payload_type != fap_payload_type && payload_type != EVRC_PAYLOAD_TYPE {
         return Some(packet.to_vec());
     }
-    let frame_type = codec.frame_type_for_payload_len(packet.len() - offset)?;
-    let mut converted = Vec::with_capacity(packet.len() + 1);
+    let format = codec.bearer_format();
+    let frame = &packet[offset..];
+    let frame_type = if frame.is_empty() {
+        cdma_ios::EvrcFrameType::Blank
+    } else {
+        format.frame_type_for_len(frame.len())?
+    };
+    let body = format.encode_payload(frame_type, frame)?;
+    let mut converted = Vec::with_capacity(offset + body.len());
     converted.extend_from_slice(&packet[..offset]);
     converted[1] = (converted[1] & RTP_MARKER_MASK) | EVRC_PAYLOAD_TYPE;
-    converted.push(frame_type);
-    converted.extend_from_slice(&packet[offset..]);
+    converted.extend_from_slice(&body);
     Some(converted)
 }
 
@@ -572,15 +537,15 @@ fn remove_a2p_toc(packet: &[u8], codec: RelayCodec, fap_payload_type: u8) -> Opt
     if packet[1] & RTP_PAYLOAD_TYPE_MASK != EVRC_PAYLOAD_TYPE {
         return Some(packet.to_vec());
     }
-    let toc = *packet.get(offset)?;
-    let payload_len = packet.len().checked_sub(offset + 1)?;
-    if codec.payload_len_for_frame_type(toc & VOICE_FRAME_TYPE_MASK)? != payload_len {
+    let mut frames = codec.bearer_format().decode_payload(&packet[offset..])?;
+    if frames.len() != 1 {
         return None;
     }
-    let mut converted = Vec::with_capacity(packet.len() - 1);
+    let (_, frame) = frames.pop()?;
+    let mut converted = Vec::with_capacity(offset + frame.len());
     converted.extend_from_slice(&packet[..offset]);
     converted[1] = (converted[1] & RTP_MARKER_MASK) | fap_payload_type;
-    converted.extend_from_slice(&packet[offset + 1..]);
+    converted.extend_from_slice(&frame);
     Some(converted)
 }
 
@@ -649,8 +614,11 @@ mod tests {
 
             let a2p =
                 add_a2p_toc(&airave, RelayCodec::Evrc, EVRC_PAYLOAD_TYPE).expect("A2p packet");
-            assert_eq!(a2p.len(), airave.len() + 1);
-            assert_eq!(a2p[RTP_FIXED_HEADER_LEN], frame_type);
+            assert_eq!(a2p.len(), airave.len() + 3);
+            assert_eq!(
+                &a2p[RTP_FIXED_HEADER_LEN..RTP_FIXED_HEADER_LEN + 3],
+                &[0x00, 0x00, frame_type << 4]
+            );
             assert_eq!(
                 remove_a2p_toc(&a2p, RelayCodec::Evrc, EVRC_PAYLOAD_TYPE).expect("Airave packet"),
                 airave
@@ -679,7 +647,10 @@ mod tests {
 
             let a2p =
                 add_a2p_toc(&airave, RelayCodec::Qcelp13k, EVRC_PAYLOAD_TYPE).expect("A2p packet");
-            assert_eq!(a2p[RTP_FIXED_HEADER_LEN], frame_type);
+            assert_eq!(
+                &a2p[RTP_FIXED_HEADER_LEN..RTP_FIXED_HEADER_LEN + 2],
+                &[0x00, frame_type]
+            );
             assert_eq!(
                 remove_a2p_toc(&a2p, RelayCodec::Qcelp13k, EVRC_PAYLOAD_TYPE)
                     .expect("Airave packet"),

@@ -141,6 +141,7 @@ fn gre_packet_encode_rejects_missing_required_fields() {
         protocol_type: 0x8881,
         key: None,
         sequence_number: None,
+        attributes: vec![],
         payload: vec![],
     };
     assert_eq!(missing_key.encode(), Err(Error::MissingSessionKey));
@@ -151,6 +152,7 @@ fn gre_packet_encode_rejects_missing_required_fields() {
         protocol_type: 0x8881,
         key: Some(0x01020304),
         sequence_number: None,
+        attributes: vec![],
         payload: vec![],
     };
     assert_eq!(missing_sequence.encode(), Err(Error::MissingSequenceNumber));
@@ -358,7 +360,7 @@ fn capability_profile_is_retained_in_session_snapshot() {
 
     let snapshot = table.session_snapshot(0x31323334).unwrap();
     assert_eq!(snapshot.session.profile, profile);
-    assert!(snapshot.session.profile.has_unresolved_wire_attributes());
+    assert!(snapshot.session.profile.uses_gre_attributes());
 }
 
 #[test]
@@ -522,7 +524,7 @@ fn apply_session_rekeys_and_reprofiles_existing_binding() {
 
     let snapshot = table.session_snapshot(0x50515253).unwrap();
     assert_eq!(snapshot.session, updated);
-    assert!(snapshot.session.profile.has_unresolved_wire_attributes());
+    assert!(snapshot.session.profile.uses_gre_attributes());
 }
 
 #[test]
@@ -916,4 +918,108 @@ fn sequence_wrap_is_treated_as_forward_progress() {
     assert_eq!(stats.duplicate_sequence_packets, 0);
     assert_eq!(stats.reordered_sequence_packets, 0);
     assert_eq!(stats.sequence_gap_events, 0);
+}
+
+#[test]
+fn gre_attributes_match_a_s0012_figures() {
+    let packet = GrePacket::with_attributes(
+        0x0a0b_0c0d,
+        Some(7),
+        vec![
+            cdma_a8::GreAttribute::IpFlowDiscriminator { flow_id: 0x07 },
+            cdma_a8::GreAttribute::ShortDataIndication,
+            cdma_a8::GreAttribute::FlowControl(cdma_a8::FlowControl::Xoff(
+                cdma_a8::FlowControlDuration::Indefinite,
+            )),
+            cdma_a8::GreAttribute::Segmentation(cdma_a8::GreSegment::Ended),
+        ],
+        [0xde, 0xad],
+    );
+    let wire = packet.encode().unwrap();
+    assert_eq!(
+        wire,
+        [
+            0x30, 0x00, 0x88, 0xd2, // K and S set, 3GPP2 Packet
+            0x0a, 0x0b, 0x0c, 0x0d, // key
+            0x00, 0x00, 0x00, 0x07, // sequence number
+            0x03, 0x02, 0x07, 0x00, // IP Flow Discriminator, flow 7
+            0x01, 0x02, 0x80, 0x00, // Short Data Indication, SDI=1
+            0x02, 0x02, 0xc0, 0x00, // Flow Control, XOFF, INDEFINITE
+            0x84, 0x02, 0x80, 0x00, // E=1, Segmentation, packet ended
+            0xde, 0xad,
+        ]
+    );
+    assert_eq!(GrePacket::decode(&wire).unwrap(), packet);
+}
+
+#[test]
+fn gre_unknown_attribute_is_kept_and_the_frame_still_decodes() {
+    let wire = [
+        0x20, 0x00, 0x88, 0xd2, 0x00, 0x00, 0x00, 0x01, // key 1
+        0x7f, 0x03, 0xaa, 0xbb, 0xcc, // unknown type 0x7f, 3-octet value
+        0x82, 0x02, 0x00, 0x00, // E=1, Flow Control XON
+        0x45,
+    ];
+    let packet = GrePacket::decode(&wire).unwrap();
+    assert_eq!(
+        packet.attributes,
+        vec![
+            cdma_a8::GreAttribute::Unknown {
+                attribute_type: 0x7f,
+                value: vec![0xaa, 0xbb, 0xcc],
+            },
+            cdma_a8::GreAttribute::FlowControl(cdma_a8::FlowControl::Xon),
+        ]
+    );
+    assert_eq!(packet.payload, [0x45]);
+}
+
+#[test]
+fn gre_attribute_list_without_last_flag_is_truncated() {
+    let wire = [
+        0x20, 0x00, 0x88, 0xd2, 0x00, 0x00, 0x00, 0x01, 0x01, 0x02, 0x80, 0x00,
+    ];
+    assert!(matches!(
+        GrePacket::decode(&wire),
+        Err(Error::Truncated { .. })
+    ));
+}
+
+#[test]
+fn gre_3gpp2_packet_requires_attributes_and_plain_frames_reject_them() {
+    let mut packet = GrePacket::with_attributes(1, None, Vec::new(), [0x45]);
+    assert_eq!(packet.encode(), Err(Error::InvalidProtocolType(0x88d2)));
+    packet.protocol_type = 0x8881;
+    packet.attributes = vec![cdma_a8::GreAttribute::ShortDataIndication];
+    assert_eq!(packet.encode(), Err(Error::InvalidProtocolType(0x8881)));
+}
+
+#[test]
+fn bearer_table_accepts_3gpp2_packet_frames_for_a_byte_stream_session() {
+    let endpoint = cdma_a8::BearerEndpoint::new([192, 0, 2, 1], [192, 0, 2, 2]);
+    let mut table = cdma_a8::BearerTable::new();
+    table
+        .create_session(cdma_a8::BearerSession::new(0x55, endpoint))
+        .unwrap();
+    let outbound = table
+        .build_outbound_packet_with_attributes(
+            0x55,
+            [0x45, 0x00],
+            vec![cdma_a8::GreAttribute::ShortDataIndication],
+        )
+        .unwrap();
+    assert_eq!(&outbound.wire_bytes[2..4], &[0x88, 0xd2]);
+
+    let mut receiver = cdma_a8::BearerTable::new();
+    receiver
+        .create_session(cdma_a8::BearerSession::new(0x55, endpoint))
+        .unwrap();
+    let inbound = receiver
+        .decode_for_session(endpoint, &outbound.wire_bytes)
+        .unwrap();
+    assert_eq!(
+        inbound.attributes,
+        vec![cdma_a8::GreAttribute::ShortDataIndication]
+    );
+    assert_eq!(inbound.payload, [0x45, 0x00]);
 }

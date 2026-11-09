@@ -10,8 +10,10 @@ description = "IOS/A1 signaling support used by the 1xBTS BSC and MSC."
 
 [dependencies]
 cdma-common = { path = "../cdma-common" }
+cdma-sctp = { path = "../cdma-sctp" }
 log = "0.4"
 rand = "0.8"
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "macros", "time"] }
 
 [lib]

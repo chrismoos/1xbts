@@ -7,10 +7,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::{
-    Arc, Mutex as StdMutex,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -18,7 +15,7 @@ use log::{info, warn};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-use cdma_abis::bearer::TrafficFrame;
+use cdma_abis::bearer::{ChannelFamily, TrafficFrame};
 use cdma_abis::bearer_transport::BearerTransport;
 use cdma_abis::control::typed::{
     A3RemoveInformation, BurstCommitMessage, BurstRequestMessage, BurstResponseMessage,
@@ -42,8 +39,6 @@ use super::{
     BearerFrame, BearerStats, BtsBearerClient, BtsControlClient, BtsReleaseRequestEvent,
     BtsTrafficChannelHandle, ForwardBearerQueue, PchTransferAckEvent,
 };
-
-const FLAG_SIGNALING_QUEUE: u8 = 0x01;
 
 /// Pending request waiting for a BTS response keyed by CCR.
 struct PendingSetup {
@@ -107,6 +102,7 @@ struct NetworkClientInner {
     pch_ack_events: VecDeque<PchTransferAckEvent>,
     bts_release_requests: VecDeque<BtsReleaseRequestEvent>,
     bts_release_request_signal: Option<Arc<tokio::sync::Notify>>,
+    bearer_transport: Option<Arc<BearerTransport>>,
 }
 
 impl NetworkBtsControlClient {
@@ -128,7 +124,7 @@ impl NetworkBtsControlClient {
     ) -> std::io::Result<Self> {
         let (sender, events_rx) = cdma_abis::transport::connect(addr).await?;
         let mut client = Self::from_transport(sender, events_rx, config);
-        client.bearer = Some(TransportBearerClient::new(transport));
+        client.attach_bearer(transport).await;
         Ok(client)
     }
 
@@ -142,8 +138,13 @@ impl NetworkBtsControlClient {
         let (sender, events_rx) = cdma_abis::transport::connect(addr).await?;
         let mut client =
             Self::from_transport_with_access(sender, events_rx, config, Some(access_event_tx));
-        client.bearer = Some(TransportBearerClient::new(transport));
+        client.attach_bearer(transport).await;
         Ok(client)
+    }
+
+    async fn attach_bearer(&mut self, transport: Arc<BearerTransport>) {
+        self.inner.lock().await.bearer_transport = Some(transport.clone());
+        self.bearer = Some(TransportBearerClient::new(transport));
     }
 
     /// Accept a connection from a BTS on the given listener.
@@ -181,6 +182,7 @@ impl NetworkBtsControlClient {
             pch_ack_events: VecDeque::new(),
             bts_release_requests: VecDeque::new(),
             bts_release_request_signal: None,
+            bearer_transport: None,
         }));
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let (link_down_tx, link_down_rx) = tokio::sync::watch::channel(false);
@@ -385,6 +387,23 @@ impl NetworkBtsControlClient {
                         .unwrap_or(0)
                 });
                 let sch_walsh_code = extract_code(PhysicalChannelType::Sch);
+
+                if let Some(bearer) = inner.lock().await.bearer_transport.clone() {
+                    for info in &connect.connect_information {
+                        let family = match info.physical_channel_type {
+                            PhysicalChannelType::Sch => ChannelFamily::Sch,
+                            PhysicalChannelType::Dcch => ChannelFamily::Dcch,
+                            _ => ChannelFamily::Fch,
+                        };
+                        if let Some(record) = info.cell_info_records.first() {
+                            bearer.set_bearer_port(
+                                family,
+                                u32::from(record.code_channel),
+                                info.traffic_circuit_id.traffic_circuit_identifier,
+                            );
+                        }
+                    }
+                }
 
                 let ack = ConnectAckMessage {
                     call_connection_reference: ccr,
@@ -1136,19 +1155,11 @@ mod tests {
 /// BSC-side bearer client backed by a [`BearerTransport`].
 pub struct TransportBearerClient {
     transport: Arc<BearerTransport>,
-    bearer_sequence: AtomicU64,
 }
 
 impl TransportBearerClient {
     pub fn new(transport: Arc<BearerTransport>) -> Self {
-        Self {
-            transport,
-            bearer_sequence: AtomicU64::new(0),
-        }
-    }
-
-    fn next_bearer_sequence(&self) -> u32 {
-        self.bearer_sequence.fetch_add(1, Ordering::Relaxed) as u32
+        Self { transport }
     }
 }
 
@@ -1159,18 +1170,9 @@ impl BtsBearerClient for TransportBearerClient {
             .encode()
             .map_err(|e| format!("bearer encode: {e}"))?;
         let datagram = UdpBearerDatagram {
-            flags: if frame.queue == ForwardBearerQueue::Signaling {
-                FLAG_SIGNALING_QUEUE
-            } else {
-                0
-            },
             channel_family: frame.channel_family,
             direction: frame.traffic_frame.direction(),
-            bts_id: self.transport.bts_id(),
-            cell_id: self.transport.cell_id(),
             bearer_id: frame.bearer_id,
-            sequence_no: self.next_bearer_sequence(),
-            tx_frame_number: frame.tx_frame_number,
             payload,
         };
         self.transport.send(&datagram)
@@ -1200,8 +1202,8 @@ impl BtsBearerClient for TransportBearerClient {
         BearerStats {
             tx_frames: ts.tx_datagrams,
             rx_accepted: ts.rx_accepted,
-            duplicate_drop: ts.rx_duplicate_drop,
-            late_drop: ts.rx_late_drop,
+            duplicate_drop: 0,
+            late_drop: 0,
             encode_errors: 0,
             route_errors: ts.rx_route_errors + ts.rx_decode_errors,
             delivery_errors: ts.tx_errors,
@@ -1219,13 +1221,9 @@ fn datagram_to_bearer_frame(datagram: UdpBearerDatagram) -> Result<BearerFrame, 
     Ok(BearerFrame {
         channel_family: datagram.channel_family,
         bearer_id: datagram.bearer_id,
-        tx_frame_number: datagram.tx_frame_number,
+        tx_frame_number: 0,
         traffic_frame,
-        queue: if datagram.flags & FLAG_SIGNALING_QUEUE != 0 {
-            ForwardBearerQueue::Signaling
-        } else {
-            ForwardBearerQueue::Traffic
-        },
+        queue: ForwardBearerQueue::Traffic,
     })
 }
 

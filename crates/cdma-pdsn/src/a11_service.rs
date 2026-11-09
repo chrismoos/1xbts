@@ -15,7 +15,7 @@ const A11_MSID_TYPE_IMSI: u16 = 0x0006;
 const SERVICE_OPTION_PACKET_DATA_RC3: u32 = 33;
 /// PCF A10 bearer port assumed when `pdsn.a10_bearer.udp_peer_addr` is not
 /// set, matching the default assignment in `docs/PORTS.md`.
-const DEFAULT_PCF_A10_UDP_PORT: u16 = 17042;
+const DEFAULT_PCF_A10_UDP_PORT: u16 = cdma_a8::GRE_IN_UDP_PORT;
 
 pub(crate) struct PdsnA10ByteStream {
     pub uplink_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -173,13 +173,17 @@ fn configured_a10_local_ipv4(
     }
 }
 
-/// Where a session's A10 downlink goes until its first uplink packet arrives.
-///
-/// The PCF that sent the A11 Registration Request owns the session, so its
-/// address is the bearer peer. A11 carries no bearer port, so the port comes
-/// from the configured `udp_peer_addr` or the standard PCF A10 port.
-fn seeded_pcf_a10_addr(a11_source: SocketAddr, configured_peer: Option<SocketAddr>) -> SocketAddr {
-    let port = configured_peer.map_or(DEFAULT_PCF_A10_UDP_PORT, |peer| peer.port());
+fn seeded_pcf_a10_addr(
+    a11_source: SocketAddr,
+    mode: cdma_a10::BearerTransportMode,
+    configured_peer: Option<SocketAddr>,
+) -> SocketAddr {
+    let port = match mode {
+        cdma_a10::BearerTransportMode::RawGre => 0,
+        cdma_a10::BearerTransportMode::UdpEncapsulatedGre => {
+            configured_peer.map_or(DEFAULT_PCF_A10_UDP_PORT, |peer| peer.port())
+        }
+    };
     SocketAddr::new(a11_source.ip(), port)
 }
 
@@ -261,12 +265,62 @@ fn a11_msid_bcd_to_imsi(msid: &[u8]) -> Result<String, String> {
     digits_to_imsi(digits)
 }
 
+/// HRPD service options on A9 and A11 (A.S0008-C §1.11.1).
+const HRPD_SERVICE_OPTIONS: [u32; 4] = [59, 64, 67, 71];
+const ONE_X_SERVICE_OPTIONS: [u32; 3] = [7, 12, 33];
+
+fn a11_service_option(request: &cdma_a11::RegistrationRequest) -> Option<u32> {
+    request
+        .extensions
+        .iter()
+        .find_map(|extension| match extension {
+            cdma_a11::Extension::Nvse(cdma_a11::Nvse::ServiceOption(so)) => Some(u32::from(*so)),
+            _ => None,
+        })
+}
+
+/// Service options whose A10 stream is PPP in HDLC-like framing.
+const HDLC_FRAMED_SERVICE_OPTIONS: [u32; 4] = [7, 12, 33, 59];
+
+/// A.S0008-C §4.2.14 PCF Enabled Features.
+fn pcf_accepts_gre_segmentation(request: &cdma_a11::RegistrationRequest) -> bool {
+    request.extensions.iter().any(|extension| {
+        matches!(
+            extension,
+            cdma_a11::Extension::Nvse(cdma_a11::Nvse::PcfEnabledFeature(
+                cdma_a11::PcfEnabledFeatureNvse::GreSegmentationEnabled
+            ))
+        )
+    })
+}
+
+fn a10_bearer_profile(request: &cdma_a11::RegistrationRequest) -> cdma_a10::BearerProfile {
+    cdma_a10::BearerProfile {
+        packet_boundary_supported: true,
+        gre_segmentation_supported: pcf_accepts_gre_segmentation(request),
+        ..cdma_a10::BearerProfile::standard_packet_data()
+    }
+}
+
+/// Unknown when the PCF sends no Service Option NVSE.
+fn a11_access_technology(service_option: Option<u32>) -> &'static str {
+    match service_option {
+        Some(so) if HRPD_SERVICE_OPTIONS.contains(&so) => "HRPD",
+        Some(so) if ONE_X_SERVICE_OPTIONS.contains(&so) => "1x",
+        _ => "unspecified",
+    }
+}
+
 fn packet_metadata_from_a11(
     key: cdma_a11::SessionKey,
     request: &cdma_a11::RegistrationRequest,
 ) -> cdma_packet::session_task::SessionMetadata {
+    let access_technology = a11_access_technology(a11_service_option(request));
     let (imsi, mn_id) = if request.session.mn_id_type == A11_MSID_TYPE_IMSI {
         match a11_msid_bcd_to_imsi(&request.session.mn_id) {
+            // A 1x base station sends the subscriber's IMSI. An HRPD AN may
+            // send an MN ID derived from the hardware identity instead.
+            Ok(id) if access_technology == "1x" => (Some(id.clone()), Some(id)),
             Ok(id) => (None, Some(id)),
             Err(_) => match a11_msid_tbcd_to_imsi(&request.session.mn_id) {
                 Ok(id) => (Some(id.clone()), Some(id)),
@@ -284,7 +338,7 @@ fn packet_metadata_from_a11(
         (None, None)
     };
     cdma_packet::session_task::SessionMetadata {
-        access_technology: "unspecified".to_string(),
+        access_technology: access_technology.to_string(),
         mobile_address: format!("pcf-session:{:08x}", key.pcf_session_id),
         subscriber_id: None,
         phone_number: String::new(),
@@ -298,7 +352,7 @@ fn packet_metadata_from_a11(
             pcf_session_id: key.pcf_session_id,
             mn_session_reference_id: key.mn_session_reference_id,
         }),
-        traffic_walsh_code: key.pcf_session_id,
+        traffic_walsh_code: 0,
     }
 }
 
@@ -318,6 +372,24 @@ fn build_a11_registration_reply(
     request: &cdma_a11::RegistrationRequest,
     security: &cdma_a11::A11SecurityAssociation,
 ) -> Result<cdma_a11::Message, String> {
+    // A deregistration sets up no bearer, so it advertises no features
+    // (A.S0008-C §4.2.14).
+    let mut extensions: Vec<cdma_a11::Extension> = if request.lifetime == 0 {
+        Vec::new()
+    } else {
+        [
+            cdma_a11::PdsnEnabledFeatureNvse::PacketBoundaryEnabled,
+            cdma_a11::PdsnEnabledFeatureNvse::GreSegmentationEnabled,
+        ]
+        .into_iter()
+        .map(|feature| cdma_a11::Extension::Nvse(cdma_a11::Nvse::PdsnEnabledFeature(feature)))
+        .collect()
+    };
+    // The authentication extension covers every byte before it (RFC 3344
+    // §3.5.2), so it is the last extension.
+    extensions.push(cdma_a11::Extension::Authentication(
+        security.placeholder_authentication(cdma_a11::AuthenticationExtensionType::MobileHome),
+    ));
     let mut message = cdma_a11::Message::RegistrationReply(cdma_a11::RegistrationReply {
         code: 0,
         lifetime: accepted_reply_lifetime(request.lifetime),
@@ -325,9 +397,7 @@ fn build_a11_registration_reply(
         home_agent: request.home_agent,
         identification: request.identification,
         session: request.session.clone(),
-        extensions: vec![cdma_a11::Extension::Authentication(
-            security.placeholder_authentication(cdma_a11::AuthenticationExtensionType::MobileHome),
-        )],
+        extensions,
     });
     security
         .sign_message(&mut message)
@@ -360,7 +430,7 @@ fn build_hrpd_a11_registration_update(
 
 fn a10_packet_session_id(key: cdma_a11::SessionKey) -> String {
     format!(
-        "hrpd-a10-{:08x}-{:04x}",
+        "a10-{:08x}-{:04x}",
         key.pcf_session_id, key.mn_session_reference_id
     )
 }
@@ -386,8 +456,11 @@ pub(crate) async fn spawn_pdsn_a11_service_with_a10_service(
         "pdsn.a10_bearer",
     )
     .map_err(|err| Error::from(format!("PDSN A10 config: {err}")))?;
+    let a10_mode = pdsn_config.a10_bearer.mode;
     let a10_configured_peer = pdsn_config.a10_bearer.udp_peer_addr;
-    if a10_configured_peer.is_none() {
+    if a10_mode == cdma_a10::BearerTransportMode::UdpEncapsulatedGre
+        && a10_configured_peer.is_none()
+    {
         info!(
             "PDSN A10: pdsn.a10_bearer.udp_peer_addr not set, assuming PCF A10 port {DEFAULT_PCF_A10_UDP_PORT} until each session's first uplink packet"
         );
@@ -400,14 +473,13 @@ pub(crate) async fn spawn_pdsn_a11_service_with_a10_service(
         a10_session_closed_tx,
     )?;
     let requested_a11_bind_addr = pdsn_config.a11.bind_addr;
-    let endpoint =
-        cdma_a11::UdpEndpoint::bind_with_framing(requested_a11_bind_addr, pdsn_config.a11.framing)
-            .await
-            .map_err(|err| {
-                Error::from(format!(
-                    "failed to bind PDSN A11 {requested_a11_bind_addr}: {err}"
-                ))
-            })?;
+    let endpoint = cdma_a11::UdpEndpoint::bind(requested_a11_bind_addr)
+        .await
+        .map_err(|err| {
+            Error::from(format!(
+                "failed to bind PDSN A11 {requested_a11_bind_addr}: {err}"
+            ))
+        })?;
     let a11_bind_addr = endpoint
         .local_addr()
         .map_err(|err| Error::from(format!("failed to read PDSN A11 local addr: {err}")))?;
@@ -530,21 +602,23 @@ pub(crate) async fn spawn_pdsn_a11_service_with_a10_service(
                     }
                 }
             }
-            let pcf_a10_addr = seeded_pcf_a10_addr(peer, a10_configured_peer);
+            let pcf_a10_addr = seeded_pcf_a10_addr(peer, a10_mode, a10_configured_peer);
             let IpAddr::V4(pcf_a10_ipv4) = pcf_a10_addr.ip() else {
                 warn!(
                     "PDSN A11: cannot bind A10 for {key:?}, PCF {peer} must be IPv4 for the current A10/A11 path"
                 );
                 continue;
             };
-            let a10 = cdma_a10::BearerSession::new(
+            let a10 = cdma_a10::BearerSession::with_profile(
                 key.pcf_session_id,
                 cdma_a10::BearerEndpoint::new(a10_local_ipv4, pcf_a10_ipv4.octets()),
+                a10_bearer_profile(&request),
             );
             match manager.bind_a10_bearer(key, a10) {
                 Ok(event) => info!(
-                    "PDSN A11: {event:?}; A10 bound {} -> {pcf_a10_addr} key=0x{:08x}",
+                    "PDSN A11: {event:?}; A10 bound {} -> {} key=0x{:08x}",
                     Ipv4Addr::from(a10_local_ipv4),
+                    crate::a10_runtime::bearer_peer(pcf_a10_addr),
                     key.pcf_session_id
                 ),
                 Err(err) => {
@@ -554,9 +628,11 @@ pub(crate) async fn spawn_pdsn_a11_service_with_a10_service(
             }
             let session_id = a10_packet_session_id(key);
             let metadata = packet_metadata_from_a11(key, &request);
+            let service_option =
+                a11_service_option(&request).unwrap_or(SERVICE_OPTION_PACKET_DATA_RC3);
             match a10_byte_stream_service.open_pdsn_a10_byte_stream(
                 session_id,
-                SERVICE_OPTION_PACKET_DATA_RC3,
+                service_option,
                 metadata,
             ) {
                 Ok(stream) => {
@@ -566,6 +642,7 @@ pub(crate) async fn spawn_pdsn_a11_service_with_a10_service(
                         pcf_a10_addr,
                         stream.uplink_tx,
                         stream.downlink_rx,
+                        HDLC_FRAMED_SERVICE_OPTIONS.contains(&service_option),
                     );
                 }
                 Err(err) if err.contains("already exists") => {
@@ -640,6 +717,24 @@ mod tests {
     }
 
     #[test]
+    fn service_option_nvse_selects_the_air_interface() {
+        let mut request = registration_request_with_imsi_mnid();
+        let key = cdma_a11::SessionKey::from_session(&request.session);
+        request
+            .extensions
+            .push(cdma_a11::Extension::Nvse(cdma_a11::Nvse::ServiceOption(33)));
+        let one_x = packet_metadata_from_a11(key, &request);
+        assert_eq!(one_x.access_technology, "1x");
+        assert_eq!(one_x.imsi.as_deref(), Some("310556898017332"));
+
+        request.extensions = vec![cdma_a11::Extension::Nvse(cdma_a11::Nvse::ServiceOption(59))];
+        let hrpd = packet_metadata_from_a11(key, &request);
+        assert_eq!(hrpd.access_technology, "HRPD");
+        assert_eq!(hrpd.imsi, None);
+        assert_eq!(hrpd.mn_id.as_deref(), Some("310556898017332"));
+    }
+
+    #[test]
     fn a11_imsi_tbcd_decodes_1x_msid() {
         let msid = vec![0x13, 0x00, 0x50, 0x55, 0x21, 0x93, 0x99, 0xf9];
         assert_eq!(a11_msid_tbcd_to_imsi(&msid).unwrap(), "310005551239999");
@@ -676,6 +771,68 @@ mod tests {
             },
         ));
         request
+    }
+
+    fn reply_extensions(request: &cdma_a11::RegistrationRequest) -> Vec<cdma_a11::Extension> {
+        let associations = associations();
+        let mut request = request.clone();
+        request.session.mn_session_reference_id = 1;
+        let cdma_a11::Message::RegistrationReply(reply) =
+            build_a11_registration_reply(&request, associations.for_request(&request)).unwrap()
+        else {
+            panic!("builder returns a Registration Reply");
+        };
+        reply.extensions
+    }
+
+    #[test]
+    fn a_registration_reply_advertises_packet_boundary_and_gre_segmentation() {
+        let extensions = reply_extensions(&registration_request_with_imsi_mnid());
+
+        assert_eq!(
+            extensions[..2],
+            [
+                cdma_a11::Extension::Nvse(cdma_a11::Nvse::PdsnEnabledFeature(
+                    cdma_a11::PdsnEnabledFeatureNvse::PacketBoundaryEnabled
+                )),
+                cdma_a11::Extension::Nvse(cdma_a11::Nvse::PdsnEnabledFeature(
+                    cdma_a11::PdsnEnabledFeatureNvse::GreSegmentationEnabled
+                )),
+            ]
+        );
+        assert!(matches!(
+            extensions.last(),
+            Some(cdma_a11::Extension::Authentication(_))
+        ));
+    }
+
+    #[test]
+    fn a_deregistration_reply_advertises_no_features() {
+        let mut request = registration_request_with_imsi_mnid();
+        request.lifetime = 0;
+
+        let extensions = reply_extensions(&request);
+
+        assert!(matches!(
+            extensions.as_slice(),
+            [cdma_a11::Extension::Authentication(_)]
+        ));
+    }
+
+    #[test]
+    fn the_a10_downlink_is_segmented_only_for_a_pcf_that_accepts_it() {
+        let mut request = registration_request_with_imsi_mnid();
+        let profile = a10_bearer_profile(&request);
+        assert!(profile.packet_boundary_supported);
+        assert!(!profile.gre_segmentation_supported);
+
+        request.extensions.push(cdma_a11::Extension::Nvse(
+            cdma_a11::Nvse::PcfEnabledFeature(
+                cdma_a11::PcfEnabledFeatureNvse::GreSegmentationEnabled,
+            ),
+        ));
+
+        assert!(a10_bearer_profile(&request).gre_segmentation_supported);
     }
 
     #[test]
@@ -732,13 +889,18 @@ mod tests {
         let a11_source: SocketAddr = "192.0.2.7:17044".parse().unwrap();
         let configured: SocketAddr = "127.0.0.1:17042".parse().unwrap();
 
+        let udp = cdma_a10::BearerTransportMode::UdpEncapsulatedGre;
         assert_eq!(
-            seeded_pcf_a10_addr(a11_source, Some(configured)),
+            seeded_pcf_a10_addr(a11_source, udp, Some(configured)),
             "192.0.2.7:17042".parse().unwrap()
         );
         assert_eq!(
-            seeded_pcf_a10_addr(a11_source, None),
+            seeded_pcf_a10_addr(a11_source, udp, None),
             SocketAddr::new(a11_source.ip(), DEFAULT_PCF_A10_UDP_PORT)
+        );
+        assert_eq!(
+            seeded_pcf_a10_addr(a11_source, cdma_a10::BearerTransportMode::RawGre, None),
+            SocketAddr::new(a11_source.ip(), 0)
         );
     }
 }

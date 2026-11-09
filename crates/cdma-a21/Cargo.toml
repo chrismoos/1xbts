@@ -6,10 +6,11 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "A21 reference-point wire protocol for 1x BSC ↔ HRPD AN coordination (hybrid AT cross-paging)."
+description = "A21 AN-to-IWS signaling (A.S0008-C) for 1x and HRPD interworking."
 
 [dependencies]
-tokio = { version = "1", features = ["net", "io-util", "sync", "macros", "rt"] }
+thiserror = "2"
+tokio = { version = "1", features = ["net"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "io-util", "sync", "macros", "rt", "rt-multi-thread", "time"] }

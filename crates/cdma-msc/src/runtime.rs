@@ -1991,7 +1991,7 @@ impl MscRuntime {
 
         match decoded.message_type {
             cdma_ios::MessageType::PagingResponse => {
-                let response = match cdma_ios::PagingResponseMessage::decode(&decoded.payload) {
+                let response = match cdma_ios::PagingResponseMessage::decode_a1(&decoded.payload) {
                     Ok(response) => response,
                     Err(error) => {
                         warn!("MSC: failed to decode A1 Paging Response: {}", error);
@@ -7092,7 +7092,9 @@ mod tests {
                 EncodedA1Message::from_message_for_call(
                     &cdma_ios::Message::new(
                         cdma_ios::MessageType::PagingResponse,
-                        response.encode().unwrap(),
+                        response
+                            .encode_a1(cdma_ios::CellId { cell: 1, sector: 0 })
+                            .unwrap(),
                     ),
                     Some(call_id.0),
                 ),
@@ -7166,7 +7168,9 @@ mod tests {
         let first_paging_response = EncodedA1Message::from_message_for_call(
             &cdma_ios::Message::new(
                 cdma_ios::MessageType::PagingResponse,
-                paging_response().encode().unwrap(),
+                paging_response()
+                    .encode_a1(cdma_ios::CellId { cell: 1, sector: 0 })
+                    .unwrap(),
             ),
             Some(call_id),
         );
@@ -7189,7 +7193,9 @@ mod tests {
         let paging_response = EncodedA1Message::from_message_for_call(
             &cdma_ios::Message::new(
                 cdma_ios::MessageType::PagingResponse,
-                paging_response().encode().unwrap(),
+                paging_response()
+                    .encode_a1(cdma_ios::CellId { cell: 1, sector: 0 })
+                    .unwrap(),
             ),
             Some(call_id),
         );
@@ -7331,7 +7337,9 @@ mod tests {
         let primary_pr = EncodedA1Message::from_message_for_call(
             &cdma_ios::Message::new(
                 cdma_ios::MessageType::PagingResponse,
-                paging_response().encode().unwrap(),
+                paging_response()
+                    .encode_a1(cdma_ios::CellId { cell: 1, sector: 0 })
+                    .unwrap(),
             ),
             Some(call_id),
         );
@@ -7372,7 +7380,9 @@ mod tests {
         let secondary_pr = EncodedA1Message::from_message_for_call(
             &cdma_ios::Message::new(
                 cdma_ios::MessageType::PagingResponse,
-                paging_response().encode().unwrap(),
+                paging_response()
+                    .encode_a1(cdma_ios::CellId { cell: 1, sector: 0 })
+                    .unwrap(),
             ),
             Some(call_id),
         );
@@ -7519,7 +7529,9 @@ mod tests {
         let first_pr = EncodedA1Message::from_message_for_call(
             &cdma_ios::Message::new(
                 cdma_ios::MessageType::PagingResponse,
-                paging_response().encode().unwrap(),
+                paging_response()
+                    .encode_a1(cdma_ios::CellId { cell: 1, sector: 0 })
+                    .unwrap(),
             ),
             Some(call_id),
         );
@@ -7580,7 +7592,9 @@ mod tests {
         let second_pr = EncodedA1Message::from_message_for_call(
             &cdma_ios::Message::new(
                 cdma_ios::MessageType::PagingResponse,
-                paging_response().encode().unwrap(),
+                paging_response()
+                    .encode_a1(cdma_ios::CellId { cell: 1, sector: 0 })
+                    .unwrap(),
             ),
             Some(call_id),
         );
@@ -7663,7 +7677,9 @@ mod tests {
         let fresh_pr = EncodedA1Message::from_message_for_call(
             &cdma_ios::Message::new(
                 cdma_ios::MessageType::PagingResponse,
-                paging_response().encode().unwrap(),
+                paging_response()
+                    .encode_a1(cdma_ios::CellId { cell: 1, sector: 0 })
+                    .unwrap(),
             ),
             Some(call_id),
         );
@@ -7831,7 +7847,9 @@ mod tests {
             let response = EncodedA1Message::from_message_for_call(
                 &cdma_ios::Message::new(
                     cdma_ios::MessageType::PagingResponse,
-                    response.encode().unwrap(),
+                    response
+                        .encode_a1(cdma_ios::CellId { cell: 1, sector: 0 })
+                        .unwrap(),
                 ),
                 Some(setup.callee.0),
             );

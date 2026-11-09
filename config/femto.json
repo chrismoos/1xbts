@@ -36,8 +36,8 @@
   },
   "fcs": {
     "msc_a1_addr": null,
-    "a1_listen": "0.0.0.0:17013",
-    "a1_advertise_addr": "172.31.0.2:17013",
+    "a1_listen": "0.0.0.0:14001",
+    "a1_advertise_addr": "172.31.0.2:14001",
     "node_id": "femto-fcs-1",
     "management_listen": "0.0.0.0:17024",
     "cell_id": 403,

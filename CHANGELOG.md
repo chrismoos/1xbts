@@ -1,4 +1,8 @@
 # HEAD
+- A1 now runs as A1p (BSAP over SUA over SCTP 14001).
+- Abis traffic, A2p, A8/A10, A9, A11 and A21 now use their standard formats and ports, so third-party PCFs and PDSNs interoperate. `docs/PORTS.md` lists the ports.
+  Migration (only for local config overrides): set `pcf.json` `a9_bind_addr` to `127.0.0.1:5603` and `bts.json` `evdo.a9.pcf_addr` to match. Remove `a11.framing`. Replace `an_a21_addr` in `config/bsc.json` with an `a21` block.
+- 1x packet data, including F-SCH and SO 12, now runs through the PCF over A9 and A8 like EV-DO.
 - macOS real-time constraint improvements.
 - Reduced CSIM flash wear and improved authentication performance and reliability.
 - Authentication COUNT updates now default to once per 24 hours on the next traffic connection.

@@ -81,7 +81,9 @@ async fn unkeyed_provisioning_page_enrolls_without_proof_but_voice_does_not() {
                     EncodedA1Message::from_message_for_call(
                         &cdma_ios::Message::new(
                             cdma_ios::MessageType::PagingResponse,
-                            response.encode().unwrap(),
+                            response
+                                .encode_a1(cdma_ios::CellId { cell: 1, sector: 0 })
+                                .unwrap(),
                         ),
                         Some(call_id.0),
                     ),
@@ -232,7 +234,9 @@ async fn factory_imsi_pages_and_validates_by_meid_or_real_esn() {
                     EncodedA1Message::from_message_for_call(
                         &cdma_ios::Message::new(
                             cdma_ios::MessageType::PagingResponse,
-                            response.encode().unwrap(),
+                            response
+                                .encode_a1(cdma_ios::CellId { cell: 1, sector: 0 })
+                                .unwrap(),
                         ),
                         Some(call_id.0),
                     ),
@@ -353,7 +357,9 @@ async fn provisioning_uses_configured_esn_when_response_adds_unconfigured_meid()
                     EncodedA1Message::from_message_for_call(
                         &cdma_ios::Message::new(
                             cdma_ios::MessageType::PagingResponse,
-                            response.encode().unwrap(),
+                            response
+                                .encode_a1(cdma_ios::CellId { cell: 1, sector: 0 })
+                                .unwrap(),
                         ),
                         Some(call_id.0),
                     ),
@@ -447,7 +453,9 @@ async fn successful_page_response_replaces_a_previous_denial() {
             EncodedA1Message::from_message_for_call(
                 &cdma_ios::Message::new(
                     cdma_ios::MessageType::PagingResponse,
-                    response.encode().unwrap(),
+                    response
+                        .encode_a1(cdma_ios::CellId { cell: 1, sector: 0 })
+                        .unwrap(),
                 ),
                 Some(call_id.0),
             ),
@@ -503,7 +511,9 @@ async fn network_data_call_uses_msc_admission_and_data_assignment() {
                 EncodedA1Message::from_message_for_call(
                     &cdma_ios::Message::new(
                         cdma_ios::MessageType::PagingResponse,
-                        response.encode().unwrap(),
+                        response
+                            .encode_a1(cdma_ios::CellId { cell: 1, sector: 0 })
+                            .unwrap(),
                     ),
                     Some(call_id.0),
                 ),

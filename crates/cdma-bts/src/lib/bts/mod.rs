@@ -6,6 +6,7 @@ pub mod evdo;
 pub mod global_challenge;
 pub mod handle;
 pub mod hrpd;
+pub mod hrpd_a21;
 pub mod hrpd_an;
 pub mod launcher;
 pub mod management;

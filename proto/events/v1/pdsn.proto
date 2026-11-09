@@ -37,6 +37,8 @@ enum ServiceOption {
   SERVICE_OPTION_ASYNC_DATA_RC2 = 12;
   // SO33 — packet data, RLP Type 3 (cdma2000).
   SERVICE_OPTION_PACKET_DATA_RC3 = 33;
+  // SO59 — HRPD packet data, used on A9 and A11 only (A.S0008-C §1.11.1).
+  SERVICE_OPTION_HRPD_PACKET_DATA = 59;
   // SO68 — EVRC-B voice.
   SERVICE_OPTION_EVRC_B = 68;
   // SO70 — extended SMS encoding.

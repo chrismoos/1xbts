@@ -147,6 +147,7 @@ interface PacketSessionInfo {
   mnId: string;
   mnIdSource: string;
   subscriberImsi: string;
+  nai?: string;
   esn: number;
   trafficWalshCode: number;
   pcfSessionId?: number;
@@ -2026,6 +2027,7 @@ export default function MobileDetailPage({
                     <div className="mb-1 text-[11px] uppercase tracking-wide text-muted">Identity</div>
                     <Stat label="MN ID" value={session.mnId || "-"} mono />
                     <Stat label="Source" value={session.mnIdSource || "-"} />
+                    {session.nai && <Stat label="NAI" value={session.nai} mono />}
                   </div>
                   <div>
                     <div className="mb-1 text-[11px] uppercase tracking-wide text-muted">Capture</div>

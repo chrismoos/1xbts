@@ -1,5 +1,5 @@
 use cdma_a11::{
-    A11Framing, A11SecurityAssociation, A11SecurityConfig, AuthenticationExtension,
+    A11SecurityAssociation, A11SecurityConfig, AuthenticationExtension,
     AuthenticationExtensionType, CapabilitiesInfo, Message, Nvse, PcfEnabledFeatureNvse,
     RegistrationRequest, SessionSpecificExtension, UdpFrame, UnverifiedDecodeReason,
     decode_unverified, encode,
@@ -58,11 +58,8 @@ fn udp_frame_roundtrip_for_registration_request() {
     let frame = UdpFrame::new(request_message());
     let encoded = frame.encode().unwrap();
 
-    let payload = encode(&frame.message).unwrap();
-    assert_eq!(
-        &encoded[..2],
-        &(u16::try_from(payload.len()).unwrap()).to_be_bytes()
-    );
+    assert_eq!(encoded, encode(&frame.message).unwrap());
+    assert_eq!(encoded[0], 0x01, "datagram starts with the RRQ type octet");
     assert_eq!(
         UdpFrame::decode_unverified(&encoded, UnverifiedDecodeReason::TestFixture).unwrap(),
         frame
@@ -93,63 +90,18 @@ fn udp_frame_decode_verified_returns_verified_message() {
 }
 
 #[test]
-fn payload_len_matches_embedded_message() {
-    let frame = UdpFrame::new(request_message());
-    let payload = encode(&frame.message).unwrap();
-    assert_eq!(frame.payload_len().unwrap(), payload.len() as u16);
-}
-
-#[test]
-fn rejects_truncated_header() {
-    assert_eq!(
-        UdpFrame::decode_unverified(&[0x00], UnverifiedDecodeReason::TestFixture).unwrap_err(),
-        cdma_a11::Error::Truncated {
-            needed: 2,
-            actual: 1
-        }
-    );
-}
-
-#[test]
-fn rejects_truncated_payload() {
+fn rejects_truncated_message() {
     let frame = UdpFrame::new(request_message());
     let mut encoded = frame.encode().unwrap();
     encoded.pop();
-
-    let expected_needed = u16::from_be_bytes([encoded[0], encoded[1]]) as usize + 2;
-    assert_eq!(
-        UdpFrame::decode_unverified(&encoded, UnverifiedDecodeReason::TestFixture).unwrap_err(),
-        cdma_a11::Error::Truncated {
-            needed: expected_needed,
-            actual: encoded.len()
-        }
-    );
+    assert!(UdpFrame::decode_unverified(&encoded, UnverifiedDecodeReason::TestFixture).is_err());
 }
 
 #[test]
-fn rejects_trailing_bytes_beyond_declared_payload() {
-    let frame = UdpFrame::new(request_message());
-    let mut encoded = frame.encode().unwrap();
-    encoded.extend_from_slice(&[0xde, 0xad]);
-
-    assert!(matches!(
-        UdpFrame::decode_unverified(&encoded, UnverifiedDecodeReason::TestFixture).unwrap_err(),
-        cdma_a11::Error::InvalidValue {
-            context: "udp_frame.length",
-            ..
-        }
-    ));
-}
-
-#[test]
-fn rejects_invalid_embedded_message_bytes() {
-    let payload = vec![0xff, 0x00];
-    let mut encoded = Vec::with_capacity(2 + payload.len());
-    encoded.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    encoded.extend_from_slice(&payload);
-
+fn rejects_unknown_message_type() {
     assert_eq!(
-        UdpFrame::decode_unverified(&encoded, UnverifiedDecodeReason::TestFixture).unwrap_err(),
+        UdpFrame::decode_unverified(&[0xff, 0x00], UnverifiedDecodeReason::TestFixture)
+            .unwrap_err(),
         cdma_a11::Error::UnknownMessageType(0xff)
     );
 }
@@ -163,43 +115,29 @@ fn test_security() -> A11SecurityAssociation {
 }
 
 #[test]
-fn bare_framing_roundtrips_without_length_prefix() {
-    let frame = UdpFrame::new(request_message());
-    let encoded = frame.encode_with(A11Framing::Bare).unwrap();
-
-    assert_eq!(encoded, encode(&frame.message).unwrap());
-
-    let decoded = UdpFrame::decode_unverified_with(
-        &encoded,
-        UnverifiedDecodeReason::TestFixture,
-        A11Framing::Bare,
-    )
-    .unwrap();
-    assert_eq!(decoded, frame);
-}
-
-#[test]
-fn length_prefixed_differs_from_bare_only_by_prefix() {
-    let frame = UdpFrame::new(request_message());
-    let bare = frame.encode_with(A11Framing::Bare).unwrap();
-    let prefixed = frame.encode_with(A11Framing::LengthPrefixed).unwrap();
-
-    assert_eq!(prefixed.len(), bare.len() + 2);
-    assert_eq!(&prefixed[..2], &(bare.len() as u16).to_be_bytes());
-    assert_eq!(&prefixed[2..], &bare[..]);
-}
-
-#[test]
-fn bare_framing_verifies_authenticator() {
+fn signed_datagram_verifies_authenticator() {
     let security = test_security();
     let mut message = request_message();
     security.sign_message(&mut message).unwrap();
 
-    let frame = UdpFrame::new(message.clone());
-    let encoded = frame.encode_with(A11Framing::Bare).unwrap();
-
-    let verified = UdpFrame::decode_verified_with(&encoded, &security, A11Framing::Bare).unwrap();
+    let encoded = UdpFrame::new(message.clone()).encode().unwrap();
+    let verified = UdpFrame::decode_verified(&encoded, &security).unwrap();
     assert_eq!(verified.message.message(), &message);
+}
+
+#[tokio::test]
+async fn endpoint_sends_bare_registration_datagrams() {
+    let endpoint = cdma_a11::UdpEndpoint::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    endpoint
+        .send_message(peer.local_addr().unwrap(), request_message())
+        .await
+        .unwrap();
+    let mut buf = [0u8; 2048];
+    let (len, _) = peer.recv_from(&mut buf).await.unwrap();
+    assert_eq!(&buf[..len], encode(&request_message()).unwrap().as_slice());
 }
 
 #[test]

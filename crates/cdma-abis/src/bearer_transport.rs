@@ -1,43 +1,40 @@
-//! Bi-directional UDP bearer transport for Abis traffic frames.
-//!
-//! Both BTS and BSC instantiate a [`BearerTransport`] with their own
-//! `(bind_addr, remote_addr)`. Each side sends [`UdpBearerDatagram`]s to
-//! the remote and receives datagrams on the bind address via a background
-//! thread.
+//! Each Abis traffic connection has its own BTS UDP port, reported in
+//! Abis-Connect (A.S0003-A §4.5.6.2).
 
-use std::net::{SocketAddr, UdpSocket};
+use std::collections::HashMap;
+use std::io;
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self as std_mpsc, Receiver};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self as std_mpsc, Receiver, Sender};
 use std::thread;
+use std::time::Duration;
 
-use log::{info, warn};
+use log::{debug, info, warn};
 use parking_lot::Mutex;
 
-use crate::bearer::{ChannelFamily, Direction};
+use crate::bearer::ChannelFamily;
 use crate::transport;
-use crate::udp_bearer::{
-    BearerRouteKey, UdpBearerDatagram, UdpBearerRouteOutcome, UdpBearerRouter,
-};
+use crate::udp_bearer::UdpBearerDatagram;
 
-/// Well-known default bearer port for the BSC side.
 pub const DEFAULT_BSC_BEARER_PORT: u16 = transport::ABIS_BSC_BEARER_PORT;
-/// Well-known default bearer port for the BTS side.
-pub const DEFAULT_BTS_BEARER_PORT: u16 = transport::ABIS_BTS_BEARER_PORT;
 
-/// Configurable bind + remote addresses for one side of the bearer link.
+const MAX_DATAGRAM_LEN: usize = 4096;
+const BTS_SOCKET_POLL: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BearerRole {
+    Bts,
+    Bsc,
+}
+
 #[derive(Debug, Clone)]
 pub struct BearerTransportConfig {
-    /// Local address to bind the UDP socket.
+    pub role: BearerRole,
+    /// The port is not used on the BTS.
     pub bind_addr: SocketAddr,
-    /// Remote peer address to send datagrams to.
+    /// The port is not used on the BSC.
     pub remote_addr: SocketAddr,
-    /// BTS identifier stamped into every outbound datagram and used as the
-    /// receive routing key. Set to `base_id` from the BTS overhead config.
-    pub bts_id: u32,
-    /// Cell (sector) identifier stamped into every outbound datagram. Use 1
-    /// for a single-sector BTS.
-    pub cell_id: u32,
 }
 
 /// Per-transport counters.
@@ -46,121 +43,178 @@ pub struct BearerTransportStats {
     pub tx_datagrams: u64,
     pub tx_errors: u64,
     pub rx_accepted: u64,
-    pub rx_duplicate_drop: u64,
-    pub rx_late_drop: u64,
     pub rx_decode_errors: u64,
     pub rx_route_errors: u64,
 }
 
-/// Bi-directional UDP bearer transport.
-///
-/// Provides `send()` for outbound datagrams and `recv()` / `drain()` for
-/// inbound datagrams. A background thread handles socket I/O; received
-/// datagrams are routed, deduplicated, and queued for the caller.
-pub struct BearerTransport {
-    socket: UdpSocket,
-    remote_addr: SocketAddr,
-    bts_id: u32,
-    cell_id: u32,
-    rx: Mutex<Receiver<UdpBearerDatagram>>,
+#[derive(Default)]
+struct Counters {
     tx_datagrams: AtomicU64,
     tx_errors: AtomicU64,
-    rx_decode_errors: Arc<AtomicU64>,
-    rx_route_errors: Arc<AtomicU64>,
-    router_state: Arc<Mutex<UdpBearerRouter>>,
+    rx_accepted: AtomicU64,
+    rx_decode_errors: AtomicU64,
+    rx_route_errors: AtomicU64,
+}
+
+struct BtsBearerSocket {
+    socket: UdpSocket,
+    closed: Arc<AtomicBool>,
+}
+
+impl Drop for BtsBearerSocket {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Relaxed);
+    }
+}
+
+/// FCH and SCH code channels are numbered independently.
+pub type BearerKey = (ChannelFamily, u32);
+
+#[derive(Default)]
+struct BscPorts {
+    by_bearer: HashMap<BearerKey, u16>,
+    by_port: HashMap<u16, BearerKey>,
+}
+
+enum Side {
+    Bts {
+        bind_ip: IpAddr,
+        sockets: Mutex<HashMap<BearerKey, BtsBearerSocket>>,
+    },
+    Bsc {
+        socket: UdpSocket,
+        ports: Arc<Mutex<BscPorts>>,
+    },
+}
+
+pub struct BearerTransport {
+    side: Side,
+    remote_addr: SocketAddr,
+    rx_sender: Sender<UdpBearerDatagram>,
+    rx: Mutex<Receiver<UdpBearerDatagram>>,
+    counters: Arc<Counters>,
 }
 
 impl BearerTransport {
-    /// Create a new bearer transport bound to `config.bind_addr`, sending
-    /// datagrams to `config.remote_addr`.
-    pub fn new(config: &BearerTransportConfig) -> std::io::Result<Self> {
-        let socket = UdpSocket::bind(config.bind_addr)?;
-        let local_addr = socket.local_addr()?;
-        info!(
-            "Bearer transport bound {} → remote {}",
-            local_addr, config.remote_addr
-        );
-
-        let recv_socket = socket.try_clone()?;
-        let (tx_chan, rx_chan) = std_mpsc::channel();
-        let router = Arc::new(Mutex::new(all_routes_router(config.bts_id, config.cell_id)));
-        let router_for_thread = router.clone();
-        let rx_decode_errors = Arc::new(AtomicU64::new(0));
-        let rx_route_errors = Arc::new(AtomicU64::new(0));
-        let decode_err = rx_decode_errors.clone();
-        let route_err = rx_route_errors.clone();
-
-        thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            loop {
-                let (n, _peer) = match recv_socket.recv_from(&mut buf) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!("Bearer transport recv failed: {e}");
-                        break;
-                    }
-                };
-                let datagram = match UdpBearerDatagram::decode(&buf[..n]) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        decode_err.fetch_add(1, Ordering::Relaxed);
-                        warn!("Bearer transport decode failed: {e}");
-                        continue;
-                    }
-                };
-                let outcome = {
-                    let mut r = router_for_thread.lock();
-                    match r.route(datagram) {
-                        Ok(routed) => {
-                            if routed.outcome == UdpBearerRouteOutcome::Accepted {
-                                Some(routed.datagram)
-                            } else {
-                                None
-                            }
-                        }
-                        Err(e) => {
-                            route_err.fetch_add(1, Ordering::Relaxed);
-                            warn!("Bearer transport route failed: {e}");
-                            None
-                        }
-                    }
-                };
-                if let Some(datagram) = outcome
-                    && tx_chan.send(datagram).is_err()
-                {
-                    break;
-                }
+    pub fn new(config: &BearerTransportConfig) -> io::Result<Self> {
+        let (rx_sender, rx) = std_mpsc::channel();
+        let counters = Arc::new(Counters::default());
+        let side = match config.role {
+            BearerRole::Bts => Side::Bts {
+                bind_ip: config.bind_addr.ip(),
+                sockets: Mutex::new(HashMap::new()),
+            },
+            BearerRole::Bsc => {
+                let socket = UdpSocket::bind(config.bind_addr)?;
+                info!(
+                    "Bearer transport bound {} -> BTS {}",
+                    socket.local_addr()?,
+                    config.remote_addr.ip()
+                );
+                let ports = Arc::new(Mutex::new(BscPorts::default()));
+                spawn_bsc_receiver(
+                    socket.try_clone()?,
+                    config.remote_addr.ip(),
+                    ports.clone(),
+                    rx_sender.clone(),
+                    counters.clone(),
+                );
+                Side::Bsc { socket, ports }
             }
-        });
-
+        };
         Ok(Self {
-            socket,
+            side,
             remote_addr: config.remote_addr,
-            bts_id: config.bts_id,
-            cell_id: config.cell_id,
-            rx: Mutex::new(rx_chan),
-            tx_datagrams: AtomicU64::new(0),
-            tx_errors: AtomicU64::new(0),
-            rx_decode_errors,
-            rx_route_errors,
-            router_state: router,
+            rx_sender,
+            rx: Mutex::new(rx),
+            counters,
         })
     }
 
-    /// Send a datagram to the remote peer.
+    /// The port is the connection's Traffic Circuit Identifier.
+    pub fn open_bearer(&self, family: ChannelFamily, bearer_id: u32) -> io::Result<u16> {
+        let key = (family, bearer_id);
+        let Side::Bts { bind_ip, sockets } = &self.side else {
+            return Err(io::Error::other("only the BTS opens bearer sockets"));
+        };
+        let mut sockets = sockets.lock();
+        if let Some(open) = sockets.get(&key) {
+            return Ok(open.socket.local_addr()?.port());
+        }
+        let socket = UdpSocket::bind(SocketAddr::new(*bind_ip, 0))?;
+        socket.set_read_timeout(Some(BTS_SOCKET_POLL))?;
+        let port = socket.local_addr()?.port();
+        let closed = Arc::new(AtomicBool::new(false));
+        spawn_bts_receiver(
+            socket.try_clone()?,
+            key,
+            self.remote_addr.ip(),
+            closed.clone(),
+            self.rx_sender.clone(),
+            self.counters.clone(),
+        );
+        info!("Bearer transport: {family:?} connection {bearer_id} on port {port}");
+        sockets.insert(key, BtsBearerSocket { socket, closed });
+        Ok(port)
+    }
+
+    pub fn close_bearer(&self, family: ChannelFamily, bearer_id: u32) {
+        if let Side::Bts { sockets, .. } = &self.side
+            && sockets.lock().remove(&(family, bearer_id)).is_some()
+        {
+            info!("Bearer transport: {family:?} connection {bearer_id} closed");
+        }
+    }
+
+    pub fn set_bearer_port(&self, family: ChannelFamily, bearer_id: u32, port: u16) {
+        let Side::Bsc { ports, .. } = &self.side else {
+            return;
+        };
+        let key = (family, bearer_id);
+        let mut ports = ports.lock();
+        if let Some(old) = ports.by_bearer.insert(key, port)
+            && old != port
+        {
+            ports.by_port.remove(&old);
+        }
+        if let Some(previous) = ports.by_port.insert(port, key)
+            && previous != key
+        {
+            ports.by_bearer.remove(&previous);
+        }
+        info!("Bearer transport: {family:?} connection {bearer_id} at BTS port {port}");
+    }
+
     pub fn send(&self, datagram: &UdpBearerDatagram) -> Result<(), String> {
-        let bytes = datagram
-            .encode()
-            .map_err(|e| format!("bearer encode: {e}"))?;
-        self.socket.send_to(&bytes, self.remote_addr).map_err(|e| {
-            self.tx_errors.fetch_add(1, Ordering::Relaxed);
+        let result = match &self.side {
+            Side::Bts { sockets, .. } => {
+                let sockets = sockets.lock();
+                let Some(open) = sockets.get(&(datagram.channel_family, datagram.bearer_id)) else {
+                    self.counters.tx_errors.fetch_add(1, Ordering::Relaxed);
+                    return Err(format!("no open connection {}", datagram.bearer_id));
+                };
+                open.socket.send_to(&datagram.payload, self.remote_addr)
+            }
+            Side::Bsc { socket, ports } => {
+                let key = (datagram.channel_family, datagram.bearer_id);
+                let Some(port) = ports.lock().by_bearer.get(&key).copied() else {
+                    self.counters.tx_errors.fetch_add(1, Ordering::Relaxed);
+                    return Err(format!("no BTS port for connection {}", datagram.bearer_id));
+                };
+                socket.send_to(
+                    &datagram.payload,
+                    SocketAddr::new(self.remote_addr.ip(), port),
+                )
+            }
+        };
+        result.map_err(|e| {
+            self.counters.tx_errors.fetch_add(1, Ordering::Relaxed);
             format!("bearer send: {e}")
         })?;
-        self.tx_datagrams.fetch_add(1, Ordering::Relaxed);
+        self.counters.tx_datagrams.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
-    /// Drain all received datagrams currently queued.
     pub fn drain(&self) -> Vec<UdpBearerDatagram> {
         let rx = self.rx.lock();
         let mut out = Vec::new();
@@ -170,83 +224,131 @@ impl BearerTransport {
         out
     }
 
-    /// Try to receive a single datagram without blocking.
     pub fn try_recv(&self) -> Option<UdpBearerDatagram> {
         self.rx.lock().try_recv().ok()
     }
 
-    /// The local address this transport is bound to.
-    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.socket.local_addr()
+    pub fn local_addr(&self, key: BearerKey) -> Option<SocketAddr> {
+        match &self.side {
+            Side::Bsc { socket, .. } => socket.local_addr().ok(),
+            Side::Bts { sockets, .. } => sockets
+                .lock()
+                .get(&key)
+                .and_then(|open| open.socket.local_addr().ok()),
+        }
     }
 
-    /// The configured remote peer address.
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote_addr
     }
 
-    /// The BTS identifier stamped into outbound datagrams and used as the receive routing key.
-    pub fn bts_id(&self) -> u32 {
-        self.bts_id
-    }
-
-    /// The cell (sector) identifier stamped into outbound datagrams.
-    pub fn cell_id(&self) -> u32 {
-        self.cell_id
-    }
-
-    /// Current transport statistics.
     pub fn stats(&self) -> BearerTransportStats {
-        let bts_id = self.bts_id;
-        let cell_id = self.cell_id;
-        let r = self.router_state.lock();
-        let mut rx_accepted = 0u64;
-        let mut rx_dup = 0u64;
-        let mut rx_late = 0u64;
-        for family in [ChannelFamily::Fch, ChannelFamily::Sch, ChannelFamily::Dcch] {
-            for direction in [Direction::Forward, Direction::Reverse] {
-                for bearer_id in 0..=u8::MAX {
-                    if let Some(c) = r.counters(BearerRouteKey {
-                        channel_family: family,
-                        direction,
-                        bts_id,
-                        cell_id,
-                        bearer_id: bearer_id as u32,
-                    }) {
-                        rx_accepted += c.accepted;
-                        rx_dup += c.duplicate_drop;
-                        rx_late += c.late_drop;
-                    }
-                }
-            }
-        }
-
+        let c = &self.counters;
         BearerTransportStats {
-            tx_datagrams: self.tx_datagrams.load(Ordering::Relaxed),
-            tx_errors: self.tx_errors.load(Ordering::Relaxed),
-            rx_accepted,
-            rx_duplicate_drop: rx_dup,
-            rx_late_drop: rx_late,
-            rx_decode_errors: self.rx_decode_errors.load(Ordering::Relaxed),
-            rx_route_errors: self.rx_route_errors.load(Ordering::Relaxed),
+            tx_datagrams: c.tx_datagrams.load(Ordering::Relaxed),
+            tx_errors: c.tx_errors.load(Ordering::Relaxed),
+            rx_accepted: c.rx_accepted.load(Ordering::Relaxed),
+            rx_decode_errors: c.rx_decode_errors.load(Ordering::Relaxed),
+            rx_route_errors: c.rx_route_errors.load(Ordering::Relaxed),
         }
     }
 }
 
-fn all_routes_router(bts_id: u32, cell_id: u32) -> UdpBearerRouter {
-    let mut router = UdpBearerRouter::default();
-    for family in [ChannelFamily::Fch, ChannelFamily::Sch, ChannelFamily::Dcch] {
-        for direction in [Direction::Forward, Direction::Reverse] {
-            for bearer_id in 0..=u8::MAX {
-                router.register_route(BearerRouteKey {
-                    channel_family: family,
-                    direction,
-                    bts_id,
-                    cell_id,
-                    bearer_id: bearer_id as u32,
-                });
-            }
+fn deliver(
+    (family, bearer_id): BearerKey,
+    bytes: &[u8],
+    sender: &Sender<UdpBearerDatagram>,
+    counters: &Counters,
+) -> bool {
+    match UdpBearerDatagram::from_payload(bearer_id, bytes.to_vec()) {
+        Ok(datagram) if datagram.channel_family == family => {
+            counters.rx_accepted.fetch_add(1, Ordering::Relaxed);
+            sender.send(datagram).is_ok()
+        }
+        Ok(datagram) => {
+            counters.rx_route_errors.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                "Bearer transport: {:?} frame on {family:?} connection {bearer_id}",
+                datagram.channel_family
+            );
+            true
+        }
+        Err(e) => {
+            counters.rx_decode_errors.fetch_add(1, Ordering::Relaxed);
+            warn!("Bearer transport decode failed on {family:?} connection {bearer_id}: {e}");
+            true
         }
     }
-    router
+}
+
+fn spawn_bts_receiver(
+    socket: UdpSocket,
+    key: BearerKey,
+    bsc_ip: IpAddr,
+    closed: Arc<AtomicBool>,
+    sender: Sender<UdpBearerDatagram>,
+    counters: Arc<Counters>,
+) {
+    thread::spawn(move || {
+        let mut buf = [0u8; MAX_DATAGRAM_LEN];
+        while !closed.load(Ordering::Relaxed) {
+            let (n, peer) = match socket.recv_from(&mut buf) {
+                Ok(received) => received,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Err(e) => {
+                    warn!("Bearer transport recv failed on connection {key:?}: {e}");
+                    break;
+                }
+            };
+            if peer.ip() != bsc_ip {
+                counters.rx_route_errors.fetch_add(1, Ordering::Relaxed);
+                debug!("Bearer transport: connection {key:?} ignored a frame from {peer}");
+                continue;
+            }
+            if !deliver(key, &buf[..n], &sender, &counters) {
+                break;
+            }
+        }
+    });
+}
+
+fn spawn_bsc_receiver(
+    socket: UdpSocket,
+    bts_ip: IpAddr,
+    ports: Arc<Mutex<BscPorts>>,
+    sender: Sender<UdpBearerDatagram>,
+    counters: Arc<Counters>,
+) {
+    thread::spawn(move || {
+        let mut buf = [0u8; MAX_DATAGRAM_LEN];
+        loop {
+            let (n, peer) = match socket.recv_from(&mut buf) {
+                Ok(received) => received,
+                Err(e) => {
+                    warn!("Bearer transport recv failed: {e}");
+                    break;
+                }
+            };
+            let key = if peer.ip() == bts_ip {
+                ports.lock().by_port.get(&peer.port()).copied()
+            } else {
+                None
+            };
+            let Some(key) = key else {
+                counters.rx_route_errors.fetch_add(1, Ordering::Relaxed);
+                debug!("Bearer transport: frame from {peer} matches no connection");
+                continue;
+            };
+            if !deliver(key, &buf[..n], &sender, &counters) {
+                break;
+            }
+        }
+    });
 }

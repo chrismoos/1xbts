@@ -550,7 +550,10 @@ function IdentityTable({
     rows.push({ name: "IMSI", value: identity.imsi, source: imsiSource, status: imsiAgreement ?? undefined });
   }
   if (identity.nai) {
-    rows.push({ name: "NAI", value: identity.nai, source: "CHAP Response", status: { label: "reported", ok: null } });
+    rows.push({ name: "Access auth NAI", value: identity.nai, source: "CHAP Response", status: { label: "reported", ok: null } });
+  }
+  if (packet?.nai) {
+    rows.push({ name: "Mobile IP NAI", value: packet.nai, source: "Mobile IP registration", status: { label: "reported", ok: null } });
   }
   if (isOneXMobile(mobile)) {
     rows.push({
@@ -610,7 +613,11 @@ function PacketDetails({ packet }: { packet: PacketSessionInfo }) {
       <div>
         <Stat label="Session" value={packet.sessionId} mono />
         <Stat label="State" value={packet.phase} />
-        <Stat label="A10 key" value={packet.trafficWalshCode ? String(packet.trafficWalshCode) : "—"} mono />
+        <Stat
+          label="A10 key"
+          value={packet.pcfSessionId != null ? String(packet.pcfSessionId) : packet.trafficWalshCode ? String(packet.trafficWalshCode) : "—"}
+          mono
+        />
         <Stat label="Mobile IP" value={packet.peerIp || "—"} mono />
       </div>
       <div>
@@ -619,6 +626,7 @@ function PacketDetails({ packet }: { packet: PacketSessionInfo }) {
         {packet.meid && <Stat label="MEID" value={packet.meid} mono />}
         {packet.esn ? <Stat label="ESN" value={`0x${packet.esn.toString(16).toUpperCase().padStart(8, "0")}`} mono /> : null}
         {packet.mnId && <Stat label="MN ID" value={`${packet.mnId}${packet.mnIdSource ? ` (${packet.mnIdSource})` : ""}`} mono />}
+        {packet.nai && <Stat label="NAI" value={packet.nai} mono />}
         <Link href={`/packets/${encodeURIComponent(packet.sessionId)}`} className="mt-1 inline-block text-xs text-accent-blue hover:underline">
           Open packet session →
         </Link>

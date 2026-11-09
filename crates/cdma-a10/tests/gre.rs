@@ -196,7 +196,7 @@ fn a10_capability_profile_is_retained_in_session_snapshot() {
 
     let snapshot = table.session_snapshot(0x81828384).unwrap();
     assert_eq!(snapshot.session.profile, profile);
-    assert!(snapshot.session.profile.has_unresolved_wire_attributes());
+    assert!(snapshot.session.profile.uses_gre_attributes());
 }
 
 #[test]
@@ -263,7 +263,7 @@ fn a10_apply_session_rekeys_and_reprofiles_existing_binding() {
 
     let snapshot = table.session_snapshot(0x41424344).unwrap();
     assert_eq!(snapshot.session, updated);
-    assert!(snapshot.session.profile.has_unresolved_wire_attributes());
+    assert!(snapshot.session.profile.uses_gre_attributes());
 }
 
 #[test]

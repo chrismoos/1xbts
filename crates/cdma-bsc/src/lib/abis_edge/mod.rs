@@ -46,7 +46,7 @@ pub enum ForwardBearerQueue {
     Traffic,
 }
 
-/// BSC-facing bearer frame before the transport-only UDP wrapper is applied.
+/// `queue` and `tx_frame_number` are not sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BearerFrame {
     pub channel_family: ChannelFamily,

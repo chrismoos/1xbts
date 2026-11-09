@@ -41,8 +41,8 @@ impl A1EventSink {
 
     pub(super) fn publish(&self, message: &EncodedA1Message, direction: A1Direction) {
         let mut calls = self.calls.lock();
-        let mut record = message
-            .call_id()
+        let call_key = correlation_key(message);
+        let mut record = call_key
             .and_then(|id| calls.get(&id).cloned())
             .unwrap_or_default();
         let context = &mut record.context;
@@ -71,7 +71,7 @@ impl A1EventSink {
             }
             record.identity = a1.mobile_identity.clone();
         }
-        if let Some(id) = message.call_id() {
+        if let Some(id) = call_key {
             if let Some(network_event::Body::A1(a1)) = &event.body {
                 if let Some(identity) = &a1.mobile_identity {
                     context.correlated_imsi =
@@ -93,4 +93,18 @@ impl A1EventSink {
         drop(calls);
         self.publisher.publish(event);
     }
+}
+
+/// A connectionless Paging Request belongs to the call with its Tag.
+fn correlation_key(message: &EncodedA1Message) -> Option<u64> {
+    message.call_id().or_else(|| {
+        if message.message_type() != MessageType::PagingRequest {
+            return None;
+        }
+        let decoded = message.decode().ok()?;
+        cdma_ios::PagingRequestMessage::decode(&decoded.payload)
+            .ok()?
+            .tag
+            .map(|tag| u64::from(tag.0))
+    })
 }

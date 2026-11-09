@@ -65,6 +65,7 @@ export interface EvdoPacketSession extends HrpdPacketSessionKeyFields {
   esn?: number;
   peerIp?: string;
   mnId?: string;
+  nai?: string;
   pcfSessionId?: number;
   mnSessionReferenceId?: number;
   createdAtMs?: number;
@@ -81,7 +82,7 @@ export interface EvdoA10Session {
 }
 
 const UATI_24_MASK = 0x00ff_ffff;
-const A10_PACKET_SESSION_ID = /^hrpd-a10-([0-9a-fA-F]{8})-([0-9a-fA-F]{4})$/;
+const A10_PACKET_SESSION_ID = /^(?:hrpd-)?a10-([0-9a-fA-F]{8})-([0-9a-fA-F]{4})$/;
 const HEX = 16;
 
 export function bytesToArray(value: unknown): number[] {

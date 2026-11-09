@@ -602,10 +602,9 @@ pub async fn spawn_local_abis_endpoint(
     mut access_events: mpsc::UnboundedReceiver<super::AccessChannelEvent>,
 ) -> Result<LocalAbisEndpoint, Error> {
     let bearer_config = cdma_abis::bearer_transport::BearerTransportConfig {
+        role: cdma_abis::bearer_transport::BearerRole::Bts,
         bind_addr: config.bearer_bind_addr,
         remote_addr: config.bearer_remote_addr,
-        bts_id: config.cell_id.cell as u32,
-        cell_id: config.cell_id.sector as u32,
     };
     let bearer = Arc::new(
         cdma_abis::bearer_transport::BearerTransport::new(&bearer_config)
@@ -637,6 +636,7 @@ pub async fn spawn_local_abis_endpoint(
     };
     let controller_for_agent = controller.clone();
     let controller_for_frames = controller.clone();
+    let bearer_for_agent = bearer.clone();
     let agent_cell_id = config.cell_id;
     let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let connected_for_agent = connected.clone();
@@ -661,6 +661,7 @@ pub async fn spawn_local_abis_endpoint(
             connected_for_agent.store(true, std::sync::atomic::Ordering::Relaxed);
             let mut agent = AbisAgent::new(agent_config.clone(), controller_for_agent.clone());
             agent.set_paging_state(paging_state.clone());
+            agent.set_bearer_transport(bearer_for_agent.clone());
             let mut tick_interval = tokio::time::interval(std::time::Duration::from_secs(1));
             tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut radio_link_interval =

@@ -1,8 +1,13 @@
+use std::net::SocketAddr;
+use std::time::Duration;
+
 use cdma_a9::{
-    A8TrafficId, CallConnectionReference, CauseValue, ConRef, ConnectA8Message, CorrelationId,
-    Error, HEADER_LEN, Message, MessageType, ShortDataDeliveryMessage, TransportMetadata,
-    UdpSignalingDatagram, decode, encode,
+    A8TrafficId, A9Transport, CallConnectionReference, CauseValue, ConRef, ConnectA8Message,
+    CorrelationId, DelimitedReader, Error, MessageType, SignalingEndpoint, SignalingMessage,
+    TCP_DELIMITER_LEN, delimit,
 };
+
+const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn connect_message() -> ConnectA8Message {
     ConnectA8Message {
@@ -15,269 +20,160 @@ fn connect_message() -> ConnectA8Message {
         a8_traffic_id: A8TrafficId::gre_ppp(0x01020304, [192, 0, 2, 10]),
         cause: CauseValue(0x13),
         pdsn_ip_address: None,
+        a9_indicators: None,
     }
 }
 
-#[test]
-fn udp_transport_golden_roundtrip() {
-    let message = connect_message();
-    let metadata = TransportMetadata {
-        flags: 0x80,
-        session_id: 0x01020304,
-        sequence_no: 0x05060708,
-    };
-    let datagram = UdpSignalingDatagram::new(metadata, message.encode().unwrap()).unwrap();
-
-    let encoded = datagram.encode().unwrap();
-    assert_eq!(encoded.len(), HEADER_LEN + datagram.payload.len());
-    assert_eq!(
-        &encoded[..HEADER_LEN],
-        &[
-            1,
-            0x80,
-            MessageType::ConnectA8 as u8,
-            0,
-            0x01,
-            0x02,
-            0x03,
-            0x04,
-            0x05,
-            0x06,
-            0x07,
-            0x08,
-            0,
-            datagram.payload.len() as u8,
-            0,
-            0,
-        ]
-    );
-
-    let decoded = UdpSignalingDatagram::decode(&encoded).unwrap();
-    assert_eq!(decoded, datagram);
-    assert_eq!(ConnectA8Message::decode(&decoded.payload).unwrap(), message);
+fn loopback() -> SocketAddr {
+    "127.0.0.1:0".parse().unwrap()
 }
 
 #[test]
-fn udp_transport_from_message_roundtrip() {
-    let typed = connect_message();
-    let message = decode(&typed.encode().unwrap()).unwrap();
-    let metadata = TransportMetadata {
-        flags: 0,
-        session_id: 42,
-        sequence_no: 7,
-    };
-
-    let datagram = UdpSignalingDatagram::from_message(metadata, &message).unwrap();
-    assert_eq!(datagram.message_type, MessageType::ConnectA8);
-    assert_eq!(datagram.decode_message().unwrap(), message);
-}
-
-#[test]
-fn udp_transport_rejects_truncated_header() {
-    let error = UdpSignalingDatagram::decode(&[1, 0, MessageType::ConnectA8 as u8]).unwrap_err();
-    assert_eq!(
-        error,
-        Error::Truncated {
-            needed: HEADER_LEN,
-            actual: 3,
-        }
-    );
-}
-
-#[test]
-fn udp_transport_rejects_truncated_payload() {
-    let message = connect_message().encode().unwrap();
-    let mut encoded = vec![
-        1,
-        0,
-        MessageType::ConnectA8 as u8,
-        0,
-        0,
-        0,
-        0,
-        1,
-        0,
-        0,
-        0,
-        2,
-        0,
-        (message.len() as u8) + 1,
-        0,
-        0,
-    ];
-    encoded.extend_from_slice(&message);
-
-    let error = UdpSignalingDatagram::decode(&encoded).unwrap_err();
-    assert_eq!(
-        error,
-        Error::Truncated {
-            needed: HEADER_LEN + message.len() + 1,
-            actual: HEADER_LEN + message.len(),
-        }
-    );
-}
-
-#[test]
-fn udp_transport_rejects_extra_bytes_beyond_declared_payload_length() {
-    let message = connect_message().encode().unwrap();
-    let mut encoded = vec![
-        1,
-        0,
-        MessageType::ConnectA8 as u8,
-        0,
-        0,
-        0,
-        0,
-        1,
-        0,
-        0,
-        0,
-        2,
-        0,
-        (message.len() as u8).saturating_sub(1),
-        0,
-        0,
-    ];
-    encoded.extend_from_slice(&message);
-
-    let error = UdpSignalingDatagram::decode(&encoded).unwrap_err();
-    assert_eq!(
-        error,
-        Error::InvalidLength {
-            expected: HEADER_LEN + message.len() - 1,
-            actual: HEADER_LEN + message.len(),
-        }
-    );
-}
-
-#[test]
-fn udp_transport_rejects_unknown_header_message_type() {
-    let error =
-        UdpSignalingDatagram::decode(&[1, 0, 0xff, 0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 1, 0, 0, 0xff])
-            .unwrap_err();
-    assert_eq!(error, Error::UnknownMessageType(0xff));
-}
-
-#[test]
-fn udp_transport_rejects_header_payload_message_type_mismatch() {
+fn signaling_message_reads_type_from_first_octet() {
     let payload = connect_message().encode().unwrap();
-    let datagram = UdpSignalingDatagram {
-        metadata: TransportMetadata {
-            flags: 0,
-            session_id: 1,
-            sequence_no: 2,
-        },
-        message_type: MessageType::DisconnectA8,
-        payload,
-    };
-
-    let error = datagram.encode().unwrap_err();
+    let message = SignalingMessage::new(payload.clone()).unwrap();
+    assert_eq!(message.message_type, MessageType::ConnectA8);
+    assert_eq!(message.payload, payload);
     assert_eq!(
-        error,
-        Error::PayloadMessageTypeMismatch {
-            header: MessageType::DisconnectA8,
-            payload: MessageType::ConnectA8,
+        ConnectA8Message::decode(&message.payload).unwrap(),
+        connect_message()
+    );
+}
+
+#[test]
+fn signaling_message_rejects_empty_and_unknown_type() {
+    assert_eq!(
+        SignalingMessage::new(Vec::new()).unwrap_err(),
+        Error::EmptyMessage
+    );
+    assert_eq!(
+        SignalingMessage::new(vec![0xff, 0x00]).unwrap_err(),
+        Error::UnknownMessageType(0xff)
+    );
+}
+
+#[test]
+fn tcp_delimiter_is_version_1_and_four_octet_length() {
+    let payload = connect_message().encode().unwrap();
+    let framed = delimit(&payload).unwrap();
+    let len = payload.len() as u32;
+    assert_eq!(framed[0], 0x01);
+    assert_eq!(&framed[1..TCP_DELIMITER_LEN], &len.to_be_bytes());
+    assert_eq!(&framed[TCP_DELIMITER_LEN..], payload.as_slice());
+}
+
+#[test]
+fn delimited_reader_splits_messages_across_arbitrary_reads() {
+    let first = connect_message().encode().unwrap();
+    let second = vec![MessageType::ReleaseA8Complete as u8, 0x00];
+    let mut stream = delimit(&first).unwrap();
+    stream.extend(delimit(&second).unwrap());
+
+    let mut reader = DelimitedReader::default();
+    let mut messages = Vec::new();
+    for byte in stream {
+        reader.push(&[byte]);
+        while let Some(message) = reader.next_message().unwrap() {
+            messages.push(message);
         }
-    );
+    }
+    assert_eq!(messages, vec![first, second]);
 }
 
 #[test]
-fn udp_transport_rejects_payload_with_unknown_message_type() {
-    let metadata = TransportMetadata {
-        flags: 0,
-        session_id: 1,
-        sequence_no: 2,
-    };
-    let error = UdpSignalingDatagram::new(metadata, vec![0xff, 0x00]).unwrap_err();
-    assert_eq!(error, Error::UnknownMessageType(0xff));
+fn delimited_reader_rejects_unknown_version() {
+    let mut reader = DelimitedReader::default();
+    reader.push(&[0x02, 0, 0, 0, 1, 0x0b]);
+    assert!(matches!(
+        reader.next_message(),
+        Err(Error::InvalidValue { value: 2, .. })
+    ));
 }
 
-#[test]
-fn udp_transport_rejects_invalid_wrapper_version() {
-    let message = connect_message().encode().unwrap();
-    let mut encoded = vec![
-        2,
-        0,
-        MessageType::ConnectA8 as u8,
-        0,
-        0,
-        0,
-        0,
-        1,
-        0,
-        0,
-        0,
-        2,
-        0,
-        message.len() as u8,
-        0,
-        0,
-    ];
-    encoded.extend_from_slice(&message);
+#[tokio::test]
+async fn udp_datagram_is_the_bare_a9_message() {
+    let pcf = SignalingEndpoint::listen(loopback(), A9Transport::Udp)
+        .await
+        .unwrap();
+    let bs = SignalingEndpoint::client(loopback(), A9Transport::Udp)
+        .await
+        .unwrap();
+    let raw = tokio::net::UdpSocket::bind(loopback()).await.unwrap();
+    let payload = connect_message().encode().unwrap();
 
-    let error = UdpSignalingDatagram::decode(&encoded).unwrap_err();
-    assert_eq!(
-        error,
-        Error::InvalidValue {
-            context: "A9 UDP signaling wrapper version",
-            value: 2,
-        }
-    );
+    pcf.send_payload(raw.local_addr().unwrap(), &payload)
+        .await
+        .unwrap();
+    let mut buf = [0u8; 1024];
+    let (len, _) = raw.recv_from(&mut buf).await.unwrap();
+    assert_eq!(&buf[..len], payload.as_slice());
+
+    bs.send_payload(pcf.local_addr().unwrap(), &payload)
+        .await
+        .unwrap();
+    let (received, peer) = tokio::time::timeout(RECV_TIMEOUT, pcf.recv(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(peer, bs.local_addr().unwrap());
+    assert_eq!(received.payload, payload);
 }
 
-#[test]
-fn udp_transport_decodes_wrapped_message() {
-    let message = Message::new(
-        MessageType::ConnectA8,
-        decode(&connect_message().encode().unwrap())
-            .unwrap()
-            .elements,
-    )
-    .unwrap();
-    let datagram = UdpSignalingDatagram::from_message(
-        TransportMetadata {
-            flags: 0x01,
-            session_id: 9,
-            sequence_no: 10,
-        },
-        &message,
-    )
-    .unwrap();
+#[tokio::test]
+async fn tcp_pcf_replies_on_the_connection_the_bs_opened() {
+    let pcf = SignalingEndpoint::listen(loopback(), A9Transport::Tcp)
+        .await
+        .unwrap();
+    let pcf_addr = pcf.local_addr().unwrap();
+    let bs = SignalingEndpoint::client(loopback(), A9Transport::Tcp)
+        .await
+        .unwrap();
+    let setup = vec![MessageType::SetupA8 as u8, 0x00];
+    let connect = connect_message().encode().unwrap();
+    let mut buf = [0u8; 1024];
 
-    assert_eq!(datagram.decode_message().unwrap(), message);
-    assert_eq!(
-        encode(&datagram.decode_message().unwrap()).unwrap(),
-        datagram.payload
-    );
+    bs.send_payload(pcf_addr, &setup).await.unwrap();
+    let (received, bs_peer) = tokio::time::timeout(RECV_TIMEOUT, pcf.recv(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.message_type, MessageType::SetupA8);
+    assert_eq!(received.payload, setup);
+
+    pcf.send_payload(bs_peer, &connect).await.unwrap();
+    let (reply, from) = tokio::time::timeout(RECV_TIMEOUT, bs.recv(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(from, pcf_addr);
+    assert_eq!(reply.message_type, MessageType::ConnectA8);
+    assert_eq!(reply.payload, connect);
 }
 
-#[test]
-fn udp_transport_roundtrips_short_data_delivery_payloads() {
-    let typed = ShortDataDeliveryMessage {
-        correlation_id: Some(CorrelationId([1, 2, 3, 4])),
-        imsi: Some("123456789012345".into()),
-        esn: Some(0x01020304),
-        meid: None,
-        sr_id: None,
-        data_count: Some(cdma_a9::DataCount(0x0008)),
-        adds_user_part: cdma_a9::AddsUserPart::short_data_burst([0xde, 0xad]),
-        a9_indicators: None,
-    };
-    let datagram = UdpSignalingDatagram::new(
-        TransportMetadata {
-            flags: 0x40,
-            session_id: 0x11223344,
-            sequence_no: 0x55667788,
-        },
-        typed.encode().unwrap(),
-    )
-    .unwrap();
+#[tokio::test]
+async fn tcp_wire_bytes_carry_the_ios_delimiter() {
+    let listener = tokio::net::TcpListener::bind(loopback()).await.unwrap();
+    let pcf_addr = listener.local_addr().unwrap();
+    let bs = SignalingEndpoint::client(loopback(), A9Transport::Tcp)
+        .await
+        .unwrap();
+    let payload = connect_message().encode().unwrap();
+    let (sent, accepted) = tokio::join!(bs.send_payload(pcf_addr, &payload), listener.accept());
+    sent.unwrap();
+    let (mut stream, _) = accepted.unwrap();
+    let mut wire = vec![0u8; TCP_DELIMITER_LEN + payload.len()];
+    tokio::io::AsyncReadExt::read_exact(&mut stream, &mut wire)
+        .await
+        .unwrap();
+    assert_eq!(wire, delimit(&payload).unwrap());
+}
 
-    let encoded = datagram.encode().unwrap();
-    let decoded = UdpSignalingDatagram::decode(&encoded).unwrap();
-    assert_eq!(decoded.message_type, MessageType::ShortDataDelivery);
-    assert_eq!(
-        ShortDataDeliveryMessage::decode(&decoded.payload).unwrap(),
-        typed
-    );
+#[tokio::test]
+async fn tcp_pcf_cannot_reach_a_bs_without_a_connection() {
+    let pcf = SignalingEndpoint::listen(loopback(), A9Transport::Tcp)
+        .await
+        .unwrap();
+    let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let payload = connect_message().encode().unwrap();
+    assert!(pcf.send_payload(unreachable, &payload).await.is_err());
 }

@@ -138,13 +138,18 @@ fn hrpd_a9_client_config(bts_config: &BtsNodeConfig) -> Result<HrpdA9ClientConfi
             std::net::IpAddr::V6(_) => Err(Error::from(format!("evdo.a9.{field} must be IPv4"))),
         }
     };
+    let an_a8_bearer = match a9.a8_transport {
+        cdma_a8::BearerTransportMode::RawGre => cdma_a8::BearerTransportConfig::raw_gre(),
+        cdma_a8::BearerTransportMode::UdpEncapsulatedGre => {
+            cdma_a8::BearerTransportConfig::udp_encapsulated_gre(a9.a8_bind_addr, a9.pcf_a8_addr)
+        }
+    };
     Ok(HrpdA9ClientConfig {
         pcf_addr: a9.pcf_addr,
-        a8_peer_ipv4: ipv4(&a9.pcf_a8_addr, "pcf_a8_addr")?,
+        a9_transport: a9.a9_transport,
         an_a8_bearer: cdma_a8::BearerTransportConfig {
-            mode: cdma_a8::BearerTransportMode::UdpEncapsulatedGre,
-            udp_bind_addr: Some(a9.a8_bind_addr),
-            udp_peer_addr: Some(a9.pcf_a8_addr),
+            max_gre_payload: a9.max_gre_payload,
+            ..an_a8_bearer
         },
         an_a8_endpoint: BearerEndpoint::new(
             ipv4(&a9.a8_bind_addr, "a8_bind_addr")?,

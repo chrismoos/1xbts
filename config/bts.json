@@ -14,13 +14,18 @@
     "gain": 1.0,
     "mode": "composite",
     "a9": {
-      "pcf_addr": "127.0.0.1:17046",
+      "pcf_addr": "127.0.0.1:5603",
       "pcf_a8_addr": "127.0.0.1:17041",
-      "a8_bind_addr": "127.0.0.1:17040"
+      "a8_bind_addr": "127.0.0.1:17040",
+      "a8_transport": "udp_encapsulated_gre"
     },
     "a12": {
       "server": "127.0.0.1:1812",
       "radius_secret": "secret"
+    },
+    "a21": {
+      "bind_addr": "127.0.0.1:17049",
+      "iws_addr": "127.0.0.1:4597"
     },
     "overhead": {
       "sector_id": "00800580000000000000000000000000",
@@ -268,7 +273,7 @@
   "events_endpoint": "http://127.0.0.1:17023",
   "hlr_endpoint": "http://127.0.0.1:17019",
   "bearer": {
-    "bind_addr": "127.0.0.1:17014",
+    "bind_addr": "127.0.0.1:0",
     "remote_addr": "127.0.0.1:17022"
   }
 }

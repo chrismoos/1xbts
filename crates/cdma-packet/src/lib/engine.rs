@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::async_nas::AsyncNas;
 use crate::capture::{self, Direction as CaptureDirection};
-use crate::mobile_ip::{MobileIpPacketResult, MobileIpSession};
+use crate::mobile_ip::{HomeAddressClaim, MobileIpPacketResult, MobileIpSession};
 use crate::modem_endpoint::Tcp380Endpoint;
 use crate::ppp::framing::{self, HdlcDeframer, PppPacket};
 use crate::ppp::ipcp::{IPCP_PROTOCOL, IpcpConfig, IpcpOpenState, IpcpSession};
@@ -89,10 +89,11 @@ pub struct PacketSessionTelemetry {
     pub last_uplink_rate_bps: u32,
     pub last_downlink_rate_bps: u32,
     pub recent_ppp_events: Vec<PacketTraceEvent>,
+    pub mobile_ip_nai: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
-struct RlpTelemetry {
+pub(crate) struct RlpTelemetry {
     state: String,
     last_rx_control: String,
     last_tx_control: String,
@@ -104,7 +105,7 @@ struct RlpTelemetry {
 
 // RLP backend trait — abstracts over RLP Type 1 (SO 7) and Type 3 (SO 33).
 
-trait RlpBackend: Send {
+pub(crate) trait RlpBackend: Send {
     /// Process an uplink frame (raw primary traffic bits + rate).
     /// Returns bytes delivered to the upper layer (PPP), if any.
     fn receive_frame_bits(&mut self, bits: &[u8], rate_bps: u32) -> Option<Vec<u8>>;
@@ -1127,6 +1128,8 @@ fn push_bits(bits: &mut Vec<u8>, value: u32, width: usize) {
     }
 }
 
+pub type HomeAddressClaimer = Box<dyn FnMut(Ipv4Addr) -> HomeAddressClaim + Send>;
+
 pub struct PacketSession {
     rlp: Box<dyn RlpBackend>,
     deframer: HdlcDeframer,
@@ -1171,6 +1174,7 @@ pub struct PacketSession {
     is_async_data: bool,
     /// SO 12 emulated-modem TCP/380 endpoint plus the end-user PPP NAS.
     async_modem: Option<AsyncModem>,
+    home_address_claimer: Option<HomeAddressClaimer>,
 }
 
 /// SO 12 async-data modem state: the TCP/380 modem-server endpoint and, once
@@ -1202,6 +1206,27 @@ pub struct PppSessionState {
     pub vj: VjState,
 }
 
+pub(crate) fn rlp_backend_for_service_option(service_option: u32) -> Box<dyn RlpBackend> {
+    if service_option == u32::from(SERVICE_OPTION_PACKET_DATA_RC3) {
+        log::debug!("PacketSession: using RLP Type 3 for SO {}", service_option);
+        Box::new(Rlp3Backend::new(Rlp3Config {
+            mux_option: MuxOption::Odd, // 171-bit frames (MUX option 0x1, Rate Set 1)
+            ..Rlp3Config::default()
+        }))
+    } else if service_option == u32::from(SERVICE_OPTION_ASYNC_DATA) {
+        // SO 12 async data runs over Rate Set 2 (Mux Option 2), and IS-95B
+        // async phones use RLP Type 1 with the RS2 frame sizes.
+        log::debug!(
+            "PacketSession: using RLP Type 1 (RS2) for SO {}",
+            service_option
+        );
+        Box::new(Rlp1Backend::new(RlpMuxOption::Two))
+    } else {
+        log::debug!("PacketSession: using RLP Type 1 for SO {}", service_option);
+        Box::new(Rlp1Backend::new(RlpMuxOption::One))
+    }
+}
+
 impl PacketSession {
     pub fn new(service_option: u32, ipcp_config: IpcpConfig) -> Self {
         Self::new_with_ppp_resume(service_option, ipcp_config, None)
@@ -1212,27 +1237,7 @@ impl PacketSession {
         ipcp_config: IpcpConfig,
         ppp_resume: Option<PppSessionState>,
     ) -> Self {
-        let rlp: Box<dyn RlpBackend> =
-            if service_option == u32::from(SERVICE_OPTION_PACKET_DATA_RC3) {
-                log::debug!("PacketSession: using RLP Type 3 for SO {}", service_option);
-                Box::new(Rlp3Backend::new(Rlp3Config {
-                    mux_option: MuxOption::Odd, // 171-bit frames (MUX option 0x1, Rate Set 1)
-                    ..Rlp3Config::default()
-                }))
-            } else if service_option == u32::from(SERVICE_OPTION_ASYNC_DATA) {
-                // SO 12 async data runs over Rate Set 2 (Mux Option 2). Live
-                // handsets use RLP Type 1 with the RS2 frame sizes, so decode
-                // with Mux Option 2. (RLP Type 2 exists in `rlp2_*` for peers
-                // that negotiate it, but IS-95B async phones speak Type 1.)
-                log::debug!(
-                    "PacketSession: using RLP Type 1 (RS2) for SO {}",
-                    service_option
-                );
-                Box::new(Rlp1Backend::new(RlpMuxOption::Two))
-            } else {
-                log::debug!("PacketSession: using RLP Type 1 for SO {}", service_option);
-                Box::new(Rlp1Backend::new(RlpMuxOption::One))
-            };
+        let rlp = rlp_backend_for_service_option(service_option);
         let mobile_ip = ppp_resume
             .as_ref()
             .map(|state| state.mobile_ip.as_ref().clone())
@@ -1263,6 +1268,7 @@ impl PacketSession {
             lcp_open_after_one_sided_ack: false,
             is_async_data: service_option == u32::from(SERVICE_OPTION_ASYNC_DATA),
             async_modem: None,
+            home_address_claimer: None,
         }
     }
 
@@ -1305,6 +1311,7 @@ impl PacketSession {
             lcp_open_after_one_sided_ack: false,
             is_async_data: false,
             async_modem: None,
+            home_address_claimer: None,
         }
     }
 
@@ -1345,8 +1352,9 @@ impl PacketSession {
             ppp_activity_since_last_check: false,
             peer_requested_lcp_terminate: false,
             lcp_open_after_one_sided_ack: true,
-            is_async_data: false,
+            is_async_data: service_option == u32::from(SERVICE_OPTION_ASYNC_DATA),
             async_modem: None,
+            home_address_claimer: None,
         };
         session.set_ppp_max_configure_restarts(HRPD_A10_PPP_MAX_CONFIGURE_RESTARTS);
         session
@@ -1397,6 +1405,13 @@ impl PacketSession {
 
     pub fn downlink_queue_len(&self) -> usize {
         self.rlp.tx_queue_len()
+    }
+
+    /// Sets the check run before a Mobile IP registration binds a home
+    /// address other than the session's assigned address. Without one, any
+    /// requested address is accepted.
+    pub fn set_home_address_claimer(&mut self, claimer: HomeAddressClaimer) {
+        self.home_address_claimer = Some(claimer);
     }
 
     pub fn set_log_context(&mut self, context: String) {
@@ -1763,6 +1778,7 @@ impl PacketSession {
             last_uplink_rate_bps: rlp.last_uplink_rate_bps,
             last_downlink_rate_bps: rlp.last_downlink_rate_bps,
             recent_ppp_events: self.recent_ppp_events.iter().cloned().collect(),
+            mobile_ip_nai: self.mobile_ip.mn_nai().map(str::to_owned),
         }
     }
 
@@ -2084,10 +2100,17 @@ impl PacketSession {
     }
 
     fn handle_mobile_ip_packet(&mut self, ip_packet: &[u8]) -> bool {
-        match self
-            .mobile_ip
-            .handle_ipv4_packet(ip_packet, self.ipcp.peer_ip())
-        {
+        let assigned_home_address = self.ipcp.peer_ip();
+        let claimer = &mut self.home_address_claimer;
+        let mut claim_home_address = |home_address| match claimer {
+            Some(claim) => claim(home_address),
+            None => HomeAddressClaim::Granted,
+        };
+        match self.mobile_ip.handle_ipv4_packet(
+            ip_packet,
+            assigned_home_address,
+            &mut claim_home_address,
+        ) {
             MobileIpPacketResult::NotMobileIp => false,
             MobileIpPacketResult::Ignored => true,
             MobileIpPacketResult::AuthenticationRequired => {
@@ -3829,6 +3852,7 @@ mod tests {
             &mut seq,
         );
         assert_eq!(session.phase(), SessionPhase::Mip4Pending);
+        assert_eq!(session.telemetry().mobile_ip_nai, None);
 
         let rrq = mobile_mip_rrq_packet(Ipv4Addr::UNSPECIFIED, Ipv4Addr::new(10, 0, 0, 1));
         let ppp = PppPacket {
@@ -3837,6 +3861,10 @@ mod tests {
         };
         let actions = feed_ppp_via_rlp(&mut session, &ppp, &mut seq);
         assert_eq!(session.phase(), SessionPhase::Active);
+        assert_eq!(
+            session.telemetry().mobile_ip_nai.as_deref(),
+            Some(std::str::from_utf8(TEST_MIP_NAI).unwrap())
+        );
         assert!(
             actions
                 .iter()

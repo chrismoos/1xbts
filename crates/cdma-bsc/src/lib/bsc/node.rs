@@ -17,7 +17,6 @@ use crate::{
     a1_edge::{MscClient, network::NetworkMscClient},
     config::{BSC_CONFIG_FILENAME, BscNodeConfig, MANAGEMENT_CONFIG_FILENAME, ManagementConfig},
     grpc::{BscState, run_grpc_server},
-    packet::GrpcPcfClient,
 };
 
 use super::{BscLaunchInputs, BtsRegistry, build_bsc_launch_parts, spawn_bts_attach};
@@ -36,8 +35,7 @@ pub struct BscNodeOptions {
     pub msc_client: Arc<dyn MscClient>,
     /// Supervision timers for voice traffic channels.
     pub voice_timeouts: crate::config::VoiceTimeoutConfig,
-    /// Packet gRPC endpoint the packet-data path drives sessions through.
-    pub packet_endpoint: String,
+    pub pcf_client: Arc<dyn crate::packet::PcfClient>,
     /// Address the A1 listener accepts the MSC on, reported at enrollment.
     pub a1_bind_addr: std::net::SocketAddr,
     pub management: ManagementConfig,
@@ -77,17 +75,25 @@ pub fn start_bsc_node(config: &BscNodeConfig, options: BscNodeOptions) -> BscNod
         cell_detach_rx,
         hlr_repo: options.hlr_repo,
         smsc_repo: options.smsc_repo,
-        packet_endpoint: options.packet_endpoint.clone(),
         a1_bind_addr: options.a1_bind_addr,
         msc_client: options.msc_client,
         voice_timeouts: options.voice_timeouts,
-        pcf_client: Arc::new(GrpcPcfClient::new(options.packet_endpoint)),
+        pcf_client: options.pcf_client,
         voice_bearer_bind_ip: config.voice_bearer_bind_ip,
         node_id: config.node_id.clone(),
     });
     let state = parts.state.clone();
 
-    let bsc = parts.bsc;
+    let mut bsc = parts.bsc;
+    if let Some(a21) = config.a21 {
+        match super::hrpd_coord::spawn_a21_iws(a21) {
+            Ok(coord) => bsc.set_hrpd_coord(coord),
+            Err(e) => log::error!(
+                "BSC A21: bind {} failed, A21 is disabled: {e}",
+                a21.bind_addr
+            ),
+        }
+    }
     tokio::spawn(async move {
         if let Err(e) = bsc.run().await {
             log::error!("BSC fatal error: {e}");
@@ -165,7 +171,7 @@ pub async fn run_node(config_dir: &Path) -> Result<(), Error> {
     let hlr_repo = connect_hlr_with_backoff(&bsc_config.hlr_endpoint).await;
     let smsc_repo = connect_smsc_with_backoff(&bsc_config.smsc_endpoint).await;
 
-    let msc_client = NetworkMscClient::bind(bsc_config.a1_bind_addr)
+    let msc_client = NetworkMscClient::bind(bsc_config.a1_bind_addr, bsc_config.a1p.clone())
         .await
         .map_err(|e| Error::from(format!("failed to bind the BSC A1 listener: {e}")))?;
     let msc_client = match bsc_config.events_endpoint.as_deref() {
@@ -183,21 +189,24 @@ pub async fn run_node(config_dir: &Path) -> Result<(), Error> {
         msc_client.local_addr()?
     );
 
-    let node = start_bsc_node(
+    let pcf_client: Arc<dyn crate::packet::PcfClient> =
+        Arc::new(crate::a9_edge::A9PcfClient::bind(bsc_config.packet_a9.clone()).await?);
+
+    let _node = start_bsc_node(
         &bsc_config,
         BscNodeOptions {
             hlr_repo,
             smsc_repo,
             msc_client: Arc::new(msc_client),
             voice_timeouts: bsc_config.voice_timeouts.clone(),
-            packet_endpoint: bsc_config.packet_endpoint.clone(),
+            pcf_client,
             a1_bind_addr: bsc_config.a1_bind_addr,
             management: mgmt_config,
         },
     );
     info!(
-        "BSC running: node_id={} packet={}",
-        bsc_config.node_id, node.state.packet_endpoint
+        "BSC running: node_id={} pcf={}",
+        bsc_config.node_id, bsc_config.packet_a9.pcf_addr
     );
 
     // The runtime and management server run as tasks. Hold the process open

@@ -901,6 +901,7 @@ dependencies = [
 name = "cdma-a21"
 version = "0.1.0"
 dependencies = [
+ "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -908,6 +909,8 @@ dependencies = [
 name = "cdma-a8"
 version = "0.1.0"
 dependencies = [
+ "cdma-a9",
+ "log",
  "serde",
  "socket2 0.5.10",
  "tokio",
@@ -917,6 +920,8 @@ dependencies = [
 name = "cdma-a9"
 version = "0.1.0"
 dependencies = [
+ "log",
+ "serde",
  "tokio",
 ]
 
@@ -965,6 +970,7 @@ dependencies = [
  "cdma-a11",
  "cdma-a21",
  "cdma-a8",
+ "cdma-a9",
  "cdma-abis",
  "cdma-bsc",
  "cdma-bts",
@@ -978,6 +984,7 @@ dependencies = [
  "cdma-pcf",
  "cdma-pdsn",
  "cdma-rpc-error",
+ "cdma-sctp",
  "cdma-smsc",
  "cdma-voice",
  "chrono",
@@ -1013,6 +1020,7 @@ dependencies = [
  "cdma-a10",
  "cdma-a11",
  "cdma-a12",
+ "cdma-a21",
  "cdma-a8",
  "cdma-a9",
  "cdma-abis",
@@ -1199,8 +1207,10 @@ name = "cdma-ios"
 version = "0.1.0"
 dependencies = [
  "cdma-common",
+ "cdma-sctp",
  "log",
  "rand 0.8.6",
+ "serde",
  "tokio",
 ]
 
@@ -1384,6 +1394,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "cdma-sctp"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+ "serde",
+ "serde_json",
+ "socket2 0.6.3",
+ "thiserror 2.0.18",
+ "tokio",
+ "usrsctp-sys",
+]
+
+[[package]]
 name = "cdma-sip"
 version = "0.1.0"
 dependencies = [
@@ -1449,6 +1473,16 @@ dependencies = [
  "tonic",
  "tonic-build",
  "uuid",
+]
+
+[[package]]
+name = "cdma-wire-check"
+version = "0.1.0"
+dependencies = [
+ "cdma-a11",
+ "cdma-a21",
+ "cdma-a8",
+ "cdma-ios",
 ]
 
 [[package]]
@@ -6884,6 +6918,14 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+]
+
+[[package]]
+name = "usrsctp-sys"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "libc",
 ]
 
 [[package]]

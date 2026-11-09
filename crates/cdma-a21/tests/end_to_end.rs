@@ -1,189 +1,82 @@
-//! End-to-end A21 client/server integration over a real TCP socket on an
-//! ephemeral port. Asserts every message variant is observed by the handler
-//! in the order it was sent.
+//! A21 messages exchanged over loopback UDP.
 
-use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
 use std::time::Duration;
 
-use cdma_a21::{A21Client, A21Connection, A21Handler, A21Message, A21Server, PagingSource};
-use tokio::sync::Mutex;
+use cdma_a21::{
+    A21Cause, A21Endpoint, A21EventKind, A21Message, A21MessageType, MessageTransmissionControl,
+    MobileIdentity,
+};
 
-#[derive(Default)]
-struct RecordingHandler {
-    seen: Arc<Mutex<Vec<A21Message>>>,
-}
+const RECV_TIMEOUT: Duration = Duration::from_secs(2);
 
-impl A21Handler for RecordingHandler {
-    async fn on_identity_binding(
-        &self,
-        _peer: SocketAddr,
-        _conn: A21Connection,
-        imsi: u64,
-    ) -> cdma_a21::Result<()> {
-        self.seen
-            .lock()
-            .await
-            .push(A21Message::IdentityBinding { imsi });
-        Ok(())
-    }
-
-    async fn on_identity_release(
-        &self,
-        _peer: SocketAddr,
-        _conn: A21Connection,
-        imsi: u64,
-    ) -> cdma_a21::Result<()> {
-        self.seen
-            .lock()
-            .await
-            .push(A21Message::IdentityRelease { imsi });
-        Ok(())
-    }
-
-    async fn on_cross_page_request(
-        &self,
-        _peer: SocketAddr,
-        conn: A21Connection,
-        imsi: u64,
-        source: PagingSource,
-        payload: Vec<u8>,
-    ) -> cdma_a21::Result<()> {
-        self.seen.lock().await.push(A21Message::CrossPageRequest {
-            imsi,
-            source,
-            payload,
-        });
-        // Exercise reverse direction on the same connection.
-        conn.send(&A21Message::CrossPageAck {
-            imsi,
-            accepted: true,
-            reason: None,
-        })
+#[tokio::test]
+async fn iws_page_is_acked_from_the_port_it_was_sent_to() {
+    let an = A21Endpoint::bind("127.0.0.1:0".parse().unwrap())
         .await
-    }
+        .unwrap();
+    let iws = A21Endpoint::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let identity = MobileIdentity::Imsi("001010123456789".into());
+    let page = A21Message::air_interface_signaling(
+        42,
+        identity.clone(),
+        MessageTransmissionControl {
+            paging_message: true,
+            ..MessageTransmissionControl::default()
+        },
+        vec![vec![0x01, 0x02, 0x03]],
+    );
+    iws.send(an.local_addr().unwrap(), &page).await.unwrap();
 
-    async fn on_cross_page_ack(
-        &self,
-        _peer: SocketAddr,
-        _conn: A21Connection,
-        imsi: u64,
-        accepted: bool,
-        reason: Option<String>,
-    ) -> cdma_a21::Result<()> {
-        self.seen.lock().await.push(A21Message::CrossPageAck {
-            imsi,
-            accepted,
-            reason,
-        });
-        Ok(())
-    }
+    let (from, received) = tokio::time::timeout(RECV_TIMEOUT, an.recv()).await.unwrap();
+    let received = received.unwrap();
+    assert_eq!(from, iws.local_addr().unwrap());
+    assert_eq!(received, page);
+    assert_eq!(
+        received.lac_pdus().collect::<Vec<_>>(),
+        vec![&[1u8, 2, 3][..]]
+    );
 
-    async fn on_suppression_start(
-        &self,
-        _peer: SocketAddr,
-        _conn: A21Connection,
-        imsi: u64,
-        source: PagingSource,
-    ) -> cdma_a21::Result<()> {
-        self.seen
-            .lock()
-            .await
-            .push(A21Message::SuppressionStart { imsi, source });
-        Ok(())
-    }
-
-    async fn on_suppression_end(
-        &self,
-        _peer: SocketAddr,
-        _conn: A21Connection,
-        imsi: u64,
-    ) -> cdma_a21::Result<()> {
-        self.seen
-            .lock()
-            .await
-            .push(A21Message::SuppressionEnd { imsi });
-        Ok(())
-    }
+    let ack = A21Message::ack(
+        received.correlation_id(),
+        received.mobile_identity().cloned(),
+        Some(A21Cause::TunnelingNotAvailable),
+    );
+    an.send(from, &ack).await.unwrap();
+    let (_, reply) = tokio::time::timeout(RECV_TIMEOUT, iws.recv())
+        .await
+        .unwrap();
+    let reply = reply.unwrap();
+    assert_eq!(reply.message_type, A21MessageType::Ack);
+    assert_eq!(reply.correlation_id(), Some(42));
+    assert_eq!(reply.cause(), Some(A21Cause::TunnelingNotAvailable));
 }
 
 #[tokio::test]
-async fn client_server_roundtrip_over_real_tcp() {
-    let server = A21Server::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+async fn malformed_datagram_is_reported_with_its_sender() {
+    let receiver = A21Endpoint::bind("127.0.0.1:0".parse().unwrap())
         .await
-        .expect("bind");
-    let addr = server.local_addr().expect("local_addr");
-
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let handler = RecordingHandler {
-        seen: Arc::clone(&seen),
-    };
-    tokio::spawn(async move {
-        let _ = server.serve(handler).await;
-    });
-
-    let mut client = A21Client::connect(addr).await.expect("connect");
-
-    let outbound = vec![
-        A21Message::IdentityBinding {
-            imsi: 310_260_000_000_001,
-        },
-        A21Message::IdentityRelease {
-            imsi: 310_260_000_000_002,
-        },
-        A21Message::CrossPageRequest {
-            imsi: 310_260_000_000_003,
-            source: PagingSource::OneX,
-            payload: vec![0xde, 0xad, 0xbe, 0xef],
-        },
-        A21Message::CrossPageAck {
-            imsi: 310_260_000_000_004,
-            accepted: false,
-            reason: Some("HRPD session absent".into()),
-        },
-        A21Message::SuppressionStart {
-            imsi: 310_260_000_000_005,
-            source: PagingSource::Hrpd,
-        },
-        A21Message::SuppressionEnd {
-            imsi: 310_260_000_000_005,
-        },
-    ];
-
-    for m in &outbound {
-        client.send(m).await.expect("send");
-    }
-
-    // The CrossPageRequest triggers a server-side reply; consume it.
-    let reply = tokio::time::timeout(Duration::from_secs(2), client.recv())
+        .unwrap();
+    let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sender
+        .send_to(&[0x7f], receiver.local_addr().unwrap())
         .await
-        .expect("recv timeout")
-        .expect("recv");
-    assert_eq!(
-        reply,
-        A21Message::CrossPageAck {
-            imsi: 310_260_000_000_003,
-            accepted: true,
-            reason: None,
-        }
+        .unwrap();
+    let (from, result) = tokio::time::timeout(RECV_TIMEOUT, receiver.recv())
+        .await
+        .unwrap();
+    assert_eq!(from, sender.local_addr().unwrap());
+    assert!(result.is_err());
+    let event = A21Message::event_notification(
+        1,
+        MobileIdentity::Esn(2),
+        A21EventKind::NoLongerPresentInAn,
     );
-
-    // Drain the handler. Poll until all 6 messages observed or timeout.
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        if seen.lock().await.len() == outbound.len() {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            panic!(
-                "timeout: handler observed {}/{} messages",
-                seen.lock().await.len(),
-                outbound.len()
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-
-    let observed = seen.lock().await.clone();
-    assert_eq!(observed, outbound);
+    assert_eq!(
+        A21Message::decode(&event.encode().unwrap())
+            .unwrap()
+            .event(),
+        Some(A21EventKind::NoLongerPresentInAn)
+    );
 }

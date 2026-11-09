@@ -8,16 +8,13 @@ use cdma_a8::BearerTransportConfig;
 use cdma_a11::{A11SecurityConfig, A11TransportConfig};
 use serde::{Deserialize, Serialize};
 
-fn default_packet_grpc_endpoint() -> String {
-    "http://127.0.0.1:17021".to_string()
-}
-
 fn socket_addr(s: &str) -> SocketAddr {
     s.parse().expect("static socket address should parse")
 }
 
+// Between hosts, A11 uses UDP 699 (A.S0012-D §3.5) and GRE-in-UDP uses 4754.
 fn default_a9_bind_addr() -> SocketAddr {
-    socket_addr("127.0.0.1:17046")
+    socket_addr("127.0.0.1:5603")
 }
 
 fn default_management_bind_addr() -> SocketAddr {
@@ -48,19 +45,19 @@ fn default_a11() -> A11TransportConfig {
 /// PCF node configuration (loaded from `config/pcf.json`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PcfNodeConfig {
-    /// Packet/PCF gRPC endpoint consumed by the BSC-facing PCF client.
-    #[serde(default = "default_packet_grpc_endpoint")]
-    pub packet_grpc_endpoint: String,
     /// A9 signaling bind address for AN/BS Setup-A8 requests.
     #[serde(default = "default_a9_bind_addr")]
     pub a9_bind_addr: SocketAddr,
     /// Management gRPC listener that lists the PCF's A10 connections.
     #[serde(default = "default_management_bind_addr")]
     pub management_bind_addr: SocketAddr,
-    /// A8 bearer delivery toward the AN/BS.
+    /// The AN must use the same one.
+    #[serde(default)]
+    pub a9_transport: cdma_a9::A9Transport,
+    /// Raw GRE binds the `a9_bind_addr` IP.
     #[serde(default = "default_a8_bearer")]
     pub a8_bearer: BearerTransportConfig,
-    /// A10 bearer delivery toward the PDSN.
+    /// Raw GRE uses the `a11` addresses.
     #[serde(default = "default_a10_bearer")]
     pub a10_bearer: BearerTransportConfig,
     /// A11 signaling endpoint toward the PDSN.
@@ -107,9 +104,9 @@ mod tests {
 
     fn test_config() -> PcfNodeConfig {
         PcfNodeConfig {
-            packet_grpc_endpoint: default_packet_grpc_endpoint(),
             a9_bind_addr: default_a9_bind_addr(),
             management_bind_addr: default_management_bind_addr(),
+            a9_transport: cdma_a9::A9Transport::Udp,
             a8_bearer: default_a8_bearer(),
             a10_bearer: default_a10_bearer(),
             a11: default_a11(),
@@ -121,10 +118,10 @@ mod tests {
     fn test_config_validates() {
         let cfg = test_config();
         cfg.validate().unwrap();
-        assert_eq!(cfg.a9_bind_addr, "127.0.0.1:17046".parse().unwrap());
+        assert_eq!(cfg.a9_bind_addr, "127.0.0.1:5603".parse().unwrap());
         assert_eq!(
-            cfg.a8_bearer.udp_bind_addr,
-            Some("127.0.0.1:17041".parse().unwrap())
+            cfg.a8_bearer.mode,
+            cdma_a8::BearerTransportMode::UdpEncapsulatedGre
         );
         assert_eq!(
             cfg.a10_bearer.udp_peer_addr,
@@ -160,6 +157,10 @@ mod tests {
     #[test]
     fn invalid_bearer_config_is_rejected() {
         let mut cfg = test_config();
+        cfg.a8_bearer = BearerTransportConfig::udp_encapsulated_gre(
+            "127.0.0.2:4754".parse().unwrap(),
+            "127.0.0.1:4754".parse().unwrap(),
+        );
         cfg.a8_bearer.udp_peer_addr = None;
         assert!(cfg.validate().unwrap_err().contains("pcf.a8_bearer"));
     }

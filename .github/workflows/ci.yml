@@ -55,7 +55,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential \
             clang \
             libclang-dev \
@@ -72,7 +72,15 @@ jobs:
             libbladerf-dev \
             bladerf \
             liblimesuite-dev \
-            limesuite
+            limesuite \
+            tshark
+
+      - name: Load kernel SCTP
+        run: |
+          sudo modprobe sctp || {
+            sudo apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)"
+            sudo modprobe sctp
+          }
 
       - name: Build libre from upstream
         run: |
@@ -101,7 +109,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --release -- -D warnings
 
+      - name: Clippy (kernel SCTP only)
+        run: cargo clippy -p cdma-sctp --no-default-features --all-targets --release -- -D warnings
+
       - name: Test
+        env:
+          REQUIRE_TSHARK: "1"
         run: cargo test --workspace --all-targets --release -- --skip capture_
 
       - name: Capture tests

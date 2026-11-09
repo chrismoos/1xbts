@@ -102,10 +102,10 @@ impl FemtoService {
             sector: config.fcs.sector,
         };
         let bridge = match config.fcs.msc_a1_addr.clone() {
-            Some(address) => fcs::spawn_msc_bridge(address),
+            Some(address) => fcs::spawn_msc_bridge(address, config.fcs.a1p.clone()),
             None => {
                 let address = parse_addr("fcs.a1_listen", &config.fcs.a1_listen)?;
-                fcs::spawn_msc_listener(address)
+                fcs::spawn_msc_listener(address, config.fcs.a1p.clone())
                     .await
                     .map_err(|source| ServiceError::A1Bind {
                         addr: address.to_string(),

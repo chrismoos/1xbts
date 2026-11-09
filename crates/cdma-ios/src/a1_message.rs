@@ -21,9 +21,11 @@ impl EncodedA1Message {
     /// Builds an encoded A1 message from a typed envelope plus optional
     /// transport-level call correlation metadata.
     pub fn from_message_for_call(message: &Message, call_id: Option<u64>) -> Self {
+        let bytes = crate::encode(message);
+        let message_type = crate::a1_frame_message_type(&bytes).unwrap_or(message.message_type);
         Self {
-            message_type: message.message_type,
-            bytes: crate::encode(message),
+            message_type,
+            bytes,
             call_id,
         }
     }

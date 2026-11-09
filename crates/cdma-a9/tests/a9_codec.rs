@@ -126,6 +126,7 @@ fn typed_message_roundtrips_cover_full_inventory() {
         a8_traffic_id: traffic_id.clone(),
         cause: CauseValue(0x13),
         pdsn_ip_address: Some(PdsnIpAddress([192, 0, 2, 10])),
+        a9_indicators: None,
     };
     assert_eq!(
         ConnectA8Message::decode(&connect.encode().unwrap()).unwrap(),
@@ -288,6 +289,7 @@ fn typed_message_golden_encodings_cover_full_inventory() {
         a8_traffic_id: traffic_id.clone(),
         cause: CauseValue(0x13),
         pdsn_ip_address: Some(PdsnIpAddress([192, 0, 2, 10])),
+        a9_indicators: None,
     };
     assert_eq!(
         connect.encode().unwrap(),
@@ -617,6 +619,7 @@ fn rejects_invalid_message_specific_causes() {
         a8_traffic_id: A8TrafficId::gre_ppp(0x01020304, [10, 0, 0, 1]),
         cause: CauseValue(0x14),
         pdsn_ip_address: None,
+        a9_indicators: None,
     }
     .encode()
     .unwrap_err();

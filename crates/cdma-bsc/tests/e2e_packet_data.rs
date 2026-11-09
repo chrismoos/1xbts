@@ -13,6 +13,8 @@
 
 #![allow(dead_code, unused_assignments, unused_variables)]
 
+mod support;
+
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -55,7 +57,6 @@ use cdma_common::consts::{
 };
 use cdma_common::error::Error;
 
-use cdma_packet::grpc::PacketServiceImpl;
 use cdma_packet::ppp::framing::PppPacket;
 use cdma_packet::rlp::{self, RlpRate};
 
@@ -143,16 +144,6 @@ fn scheduled_pcb_bits(
         }
     }
     scheduler
-}
-
-fn test_packet_service() -> Arc<PacketServiceImpl> {
-    Arc::new(PacketServiceImpl::new(
-        cdma_packet::ip_transport::IpTransportConfig::Tun {
-            nat_interface: "test0".to_string(),
-        },
-        None,
-        None,
-    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1463,7 +1454,8 @@ async fn test_e2e_so7_packet_data_full_negotiation() {
     } = bts_handle;
 
     // -- Create packet service --
-    let packet_service = test_packet_service();
+    let packet_core = support::start_packet_core().await;
+    let packet_service = packet_core.packet_service.clone();
     let bts_client: Arc<dyn BtsControlClient> =
         Arc::new(NetworkBtsControlClient::spawn_in_process(
             Arc::new(TrafficResourceService::from_pools(
@@ -1521,9 +1513,11 @@ async fn test_e2e_so7_packet_data_full_negotiation() {
         msc_voice_bearer: None,
         traffic_retry: TrafficRetryConfig::default(),
         voice_timeouts: Default::default(),
-        pcf_client: Some(Arc::new(cdma_bsc::packet::LegacyPcfClient::new(
-            packet_service.clone(),
-        ))),
+        pcf_client: Some(Arc::new(
+            cdma_bsc::a9_edge::A9PcfClient::bind(packet_core.packet_a9.clone())
+                .await
+                .unwrap(),
+        )),
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
         node_id: "bsc-test".to_string(),
@@ -2103,7 +2097,8 @@ async fn test_e2e_so7_packet_data_phy_bidirectional() {
     } = bts_handle;
 
     // -- Create packet service + BSC --
-    let packet_service = test_packet_service();
+    let packet_core = support::start_packet_core().await;
+    let packet_service = packet_core.packet_service.clone();
     let bts_client: Arc<dyn BtsControlClient> =
         Arc::new(NetworkBtsControlClient::spawn_in_process(
             Arc::new(TrafficResourceService::from_pools(
@@ -2159,9 +2154,11 @@ async fn test_e2e_so7_packet_data_phy_bidirectional() {
         msc_voice_bearer: None,
         traffic_retry: TrafficRetryConfig::default(),
         voice_timeouts: Default::default(),
-        pcf_client: Some(Arc::new(cdma_bsc::packet::LegacyPcfClient::new(
-            packet_service.clone(),
-        ))),
+        pcf_client: Some(Arc::new(
+            cdma_bsc::a9_edge::A9PcfClient::bind(packet_core.packet_a9.clone())
+                .await
+                .unwrap(),
+        )),
         mobile_idle_timeout_s: 0,
         bts_paging_state: None,
         node_id: "bsc-test".to_string(),

@@ -1,24 +1,11 @@
-//! GRE/IP bearer primitives for the A10 user plane.
-//!
-//! This crate wraps the shared keyed-GRE bearer implementation from [`cdma_a8`] with the
-//! A10-specific IPv4 endpoint shape and session terminology used between the PCF and PDSN.
-//!
-//! Implemented wire surface:
-//! - keyed GRE session binding via the GRE `Key` field
-//! - optional RFC 2890 GRE sequencing
-//! - bearer-table ownership of endpoint and session bindings
-//!
-//! The current in-repo source text for `A.S0017` / `X.S0011-*` still leaves the exact
-//! non-RFC GRE attribute bit layout unresolved for short-data indication, GRE segmentation,
-//! and A10 flow-control/duration signaling. Those negotiated capabilities are therefore
-//! retained in [`BearerProfile`] as session metadata only; this crate emits and accepts only
-//! keyed GRE plus optional RFC 2890 sequencing on the wire.
+//! A10 user plane over the shared 3GPP2 GRE bearer (A.S0012-D §2.6, §3.5).
 
 use std::net::{IpAddr, Ipv4Addr};
 
 pub use cdma_a8::{
-    BearerProfile, BearerTransportConfig, BearerTransportMode, Error, GrePacket, GreProtocolType,
-    RebindMode, Result, SequencingMode,
+    BearerChunk, BearerProfile, BearerTransportConfig, BearerTransportMode, Error, FlowControl,
+    FlowControlDuration, GRE_PROTOCOL_TYPE_3GPP2_PACKET, GreAttribute, GrePacket, GreProtocolType,
+    GreSegment, RebindMode, Result, SequencingMode,
 };
 
 /// A10 bearer endpoint binding between the PCF and PDSN.
@@ -113,6 +100,7 @@ pub struct InboundPacket {
     pub rx_ordinal: u64,
     /// GRE sequence number carried by the packet, if present.
     pub gre_sequence: Option<u32>,
+    pub attributes: Vec<GreAttribute>,
     /// Decapsulated bearer payload.
     pub payload: Vec<u8>,
 }
@@ -445,7 +433,20 @@ impl BearerTable {
         session_id: u32,
         payload: impl Into<Vec<u8>>,
     ) -> Result<OutboundPacket> {
-        let packet = self.inner.build_outbound_packet(session_id, payload)?;
+        self.build_outbound_packet_with_attributes(session_id, payload, Vec::new())
+    }
+
+    /// Non-empty `attributes` switch the GRE protocol type to 0x88D2
+    /// (A.S0012-D §2.6).
+    pub fn build_outbound_packet_with_attributes(
+        &mut self,
+        session_id: u32,
+        payload: impl Into<Vec<u8>>,
+        attributes: Vec<GreAttribute>,
+    ) -> Result<OutboundPacket> {
+        let packet = self
+            .inner
+            .build_outbound_packet_with_attributes(session_id, payload, attributes)?;
         Ok(OutboundPacket {
             session_id: packet.session_id,
             gre_key: packet.gre_key,
@@ -455,6 +456,15 @@ impl BearerTable {
             payload_len: packet.payload_len,
             wire_bytes: packet.wire_bytes,
         })
+    }
+
+    pub fn build_outbound_chunk(
+        &mut self,
+        session_id: u32,
+        chunk: BearerChunk,
+    ) -> Result<OutboundPacket> {
+        let attributes = chunk.attributes();
+        self.build_outbound_packet_with_attributes(session_id, chunk.payload, attributes)
     }
 
     /// Encodes a payload for a known A10 session and updates transmit counters.
@@ -482,6 +492,7 @@ impl BearerTable {
             endpoint: from_a8_endpoint(packet.endpoint)?,
             rx_ordinal: packet.rx_ordinal,
             gre_sequence: packet.gre_sequence,
+            attributes: packet.attributes,
             payload: packet.payload,
         })
     }

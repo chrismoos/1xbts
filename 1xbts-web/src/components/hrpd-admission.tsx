@@ -110,7 +110,7 @@ export function HrpdAdmissionCard({ admission }: { admission?: SessionAdmission 
                   admission.accessAuthState)
             }
           />
-          <Stat label="NAI" value={admission.accessAuthNai || "-"} mono />
+          <Stat label="Access auth NAI" value={admission.accessAuthNai || "-"} mono />
           <Stat label="A12 IMSI" value={admission.accessAuthImsi || "-"} mono />
         </>
       )}

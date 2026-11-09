@@ -10,7 +10,7 @@ use cdma_abis::control::{
     PhysicalChannelInfo, PhysicalChannelType, PilotGatingRate, PrivacyInfo, PrivacyMaskInformation,
     QualityOfServiceParameters, SduId, ServiceOption, TrafficCircuitId, decode, encode,
 };
-use cdma_abis::udp_bearer::{HEADER_LEN, UdpBearerDatagram};
+use cdma_abis::udp_bearer::UdpBearerDatagram;
 
 fn cc_ref() -> InformationElement {
     InformationElement::new(ElementId::CallConnectionReference, [0, 1, 0, 2, 0, 0, 0, 3])
@@ -239,7 +239,7 @@ fn bearer_reverse_sch_golden_roundtrip() {
     let encoded = frame.encode().unwrap();
     assert_eq!(
         encoded,
-        vec![0x23, 0xc4, 0x95, 0x3d, 0xde, 0xad, 0xbe, 0xef]
+        vec![0x11, 0x23, 0xc4, 0x95, 0x3d, 0xde, 0xad, 0xbe, 0xef]
     );
     assert_eq!(
         TrafficFrame::decode(ChannelFamily::Sch, Direction::Reverse, &encoded).unwrap(),
@@ -248,27 +248,19 @@ fn bearer_reverse_sch_golden_roundtrip() {
 }
 
 #[test]
-fn udp_bearer_header_golden_roundtrip() {
-    let packet = UdpBearerDatagram {
-        flags: 0x80,
-        channel_family: ChannelFamily::Dcch,
-        direction: Direction::Reverse,
-        bts_id: 1,
-        cell_id: 2,
-        bearer_id: 3,
-        sequence_no: 4,
-        tx_frame_number: 5,
-        payload: vec![0xaa, 0xbb],
-    };
-    let encoded = packet.encode().unwrap();
-    assert_eq!(encoded.len(), HEADER_LEN + 2);
-    assert_eq!(
-        &encoded[..28],
-        &[
-            1, 0x80, 3, 2, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0, 0
-        ]
+fn udp_bearer_datagram_is_the_bare_traffic_frame() {
+    let frame = TrafficFrame::ReverseSch(
+        cdma_abis::bearer::ReverseSchFrame::decode(&[
+            0x11, 0x23, 0xc4, 0x95, 0x3d, 0xde, 0xad, 0xbe, 0xef,
+        ])
+        .unwrap(),
     );
-    assert_eq!(UdpBearerDatagram::decode(&encoded).unwrap(), packet);
+    let payload = frame.encode().unwrap();
+    let datagram = UdpBearerDatagram::from_payload(3, payload.clone()).unwrap();
+    assert_eq!(datagram.channel_family, ChannelFamily::Sch);
+    assert_eq!(datagram.direction, Direction::Reverse);
+    assert_eq!(datagram.payload, payload);
+    assert_eq!(TrafficFrame::decode_message(&payload).unwrap(), frame);
 }
 
 #[test]

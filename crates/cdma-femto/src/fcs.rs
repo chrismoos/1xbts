@@ -8,7 +8,7 @@ use cdma_ios::{
     AddsDeliverAckMessage, AddsDeliverMessage, AddsPageAckMessage, AddsPageMessage,
     AddsTransferAckMessage, AddsTransferMessage, AssignmentRequestMessage, CellId,
     CompleteLayer3InformationMessage, EncodedA1Message, Layer3Information,
-    LocationUpdatingAcceptMessage, Message, MessageType, PagingRequestMessage,
+    LocationUpdatingAcceptMessage, Message, MessageType, PagingRequestMessage, Tag,
 };
 use tokio::sync::mpsc;
 
@@ -262,7 +262,17 @@ impl FemtoConvergenceServer {
                 paging.mobile_identity_meid = paging
                     .mobile_identity_meid
                     .map(crate::cell::canonical_meid_identity);
-                let encoded = Message::new(MessageType::PagingResponse, paging.encode()?);
+                // The Airvana omits the Tag, and the MSC pairs a Paging
+                // Response with its page only by Tag.
+                if paging.tag.is_none() {
+                    paging.tag = call_id
+                        .and_then(|call_id| u32::try_from(call_id).ok())
+                        .map(Tag);
+                }
+                let encoded = Message::new(
+                    MessageType::PagingResponse,
+                    paging.encode_a1(cell_identifier)?,
+                );
                 return Ok(EncodedA1Message::from_message_for_call(&encoded, call_id));
             }
             MSG_TYPE_ADDS_PAGE_ACK => {
@@ -437,7 +447,7 @@ pub struct MscA1Bridge {
     pub downlink: mpsc::Receiver<EncodedA1Message>,
 }
 
-pub fn spawn_msc_bridge(addr: String) -> MscA1Bridge {
+pub fn spawn_msc_bridge(addr: String, a1p: cdma_ios::transport::A1pConfig) -> MscA1Bridge {
     const QUEUE_CAPACITY: usize = 256;
     let (tx, mut rx) = mpsc::channel::<EncodedA1Message>(QUEUE_CAPACITY);
     let (downlink_tx, downlink) = mpsc::channel::<EncodedA1Message>(QUEUE_CAPACITY);
@@ -454,14 +464,19 @@ pub fn spawn_msc_bridge(addr: String) -> MscA1Bridge {
         };
 
         loop {
-            let (sender, mut events) =
-                match cdma_ios::transport::connect_with_reconnect(socket_addr).await {
-                    Ok(transport) => transport,
-                    Err(error) => {
-                        log::warn!("FCS: connecting to MSC A1 endpoint {socket_addr}: {error}");
-                        continue;
-                    }
-                };
+            let (sender, mut events) = match cdma_ios::transport::connect_with_reconnect(
+                socket_addr,
+                &a1p,
+                cdma_ios::transport::A1Role::BaseStation,
+            )
+            .await
+            {
+                Ok(transport) => transport,
+                Err(error) => {
+                    log::warn!("FCS: connecting to MSC A1 endpoint {socket_addr}: {error}");
+                    continue;
+                }
+            };
             loop {
                 tokio::select! {
                     message = rx.recv() => {
@@ -481,7 +496,7 @@ pub fn spawn_msc_bridge(addr: String) -> MscA1Bridge {
                                     message.message_type(),
                                     message.call_id()
                                 );
-                                if downlink_tx.send(message).await.is_err() {
+                                if downlink_tx.send(with_paging_call_id(message)).await.is_err() {
                                     return;
                                 }
                             }
@@ -502,9 +517,16 @@ pub fn spawn_msc_bridge(addr: String) -> MscA1Bridge {
     }
 }
 
-pub async fn spawn_msc_listener(addr: std::net::SocketAddr) -> std::io::Result<MscA1Bridge> {
+pub async fn spawn_msc_listener(
+    addr: std::net::SocketAddr,
+    a1p: cdma_ios::transport::A1pConfig,
+) -> std::io::Result<MscA1Bridge> {
     const QUEUE_CAPACITY: usize = 256;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = cdma_ios::transport::A1Listener::bind(
+        &[addr],
+        a1p,
+        cdma_ios::transport::A1Role::BaseStation,
+    )?;
     let (tx, mut rx) = mpsc::channel::<EncodedA1Message>(QUEUE_CAPACITY);
     let (downlink_tx, downlink) = mpsc::channel::<EncodedA1Message>(QUEUE_CAPACITY);
     log::info!(
@@ -536,7 +558,7 @@ pub async fn spawn_msc_listener(addr: std::net::SocketAddr) -> std::io::Result<M
                     event = events.recv() => {
                         match event {
                             Some(A1TransportEvent::Message(message)) => {
-                                if downlink_tx.send(message).await.is_err() {
+                                if downlink_tx.send(with_paging_call_id(message)).await.is_err() {
                                     return;
                                 }
                             }
@@ -555,6 +577,24 @@ pub async fn spawn_msc_listener(addr: std::net::SocketAddr) -> std::io::Result<M
         uplink: tx,
         downlink,
     })
+}
+
+/// A connectionless Paging Request (SUA CLDT) has no call ID, so the MT call
+/// takes its Tag.
+fn with_paging_call_id(message: EncodedA1Message) -> EncodedA1Message {
+    if message.message_type() != MessageType::PagingRequest || message.call_id().is_some() {
+        return message;
+    }
+    let Ok(decoded) = message.decode() else {
+        return message;
+    };
+    let Some(tag) = PagingRequestMessage::decode(&decoded.payload)
+        .ok()
+        .and_then(|request| request.tag)
+    else {
+        return message;
+    };
+    EncodedA1Message::from_message_for_call(&decoded, Some(u64::from(tag.0)))
 }
 
 fn femto_summary(msg: &FemtoInterfaceMsg) -> String {
@@ -596,6 +636,28 @@ mod tests {
 40=QAA=\r\n\
 41=QQUBAAAA/Q==\r\n\
 0D=DQjxAAAAAAAA8A==\r\n";
+
+    fn paging_request(tag: Option<Tag>) -> EncodedA1Message {
+        let request = PagingRequestMessage {
+            mobile_identity_imsi: MobileIdentity::Imsi("310005551239999".into()),
+            mobile_identity_meid: None,
+            tag,
+            cell_identifier_list: None,
+            slot_cycle_index: None,
+            service_option: None,
+            is2000_mobile_capabilities: None,
+        };
+        let message = Message::new(MessageType::PagingRequest, request.encode().unwrap());
+        EncodedA1Message::from_message_for_call(&message, None)
+    }
+
+    #[test]
+    fn connectionless_paging_request_takes_its_tag_as_call_id() {
+        let paged = with_paging_call_id(paging_request(Some(Tag(7))));
+        assert_eq!(paged.message_type(), MessageType::PagingRequest);
+        assert_eq!(paged.call_id(), Some(7));
+        assert_eq!(with_paging_call_id(paging_request(None)).call_id(), None);
+    }
 
     #[test]
     fn translates_a_femto_interface_msg_body() {
@@ -843,11 +905,12 @@ mod tests {
         assert_eq!(encoded.message_type(), MessageType::PagingResponse);
         assert_eq!(encoded.call_id(), Some(9));
         let decoded = encoded.decode().expect("A1 envelope");
-        let paging = PagingResponseMessage::decode(&decoded.payload).expect("Paging Response");
+        let paging = PagingResponseMessage::decode_a1(&decoded.payload).expect("Paging Response");
         assert_eq!(
             paging.mobile_identity_imsi,
             MobileIdentity::Imsi("310005551239876".to_string())
         );
+        assert_eq!(paging.tag, Some(Tag(9)));
     }
 
     #[test]

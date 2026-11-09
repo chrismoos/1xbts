@@ -19,13 +19,7 @@ use crate::signaling_framing::{SignalingFrame, SignalingFrameStreamDecoder};
 pub const ABIS_SIGNALING_PORT: u16 = 5604;
 
 /// Default BSC-side bearer UDP port (receives reverse frames from BTS).
-///
-/// Distinct from A1_SIGNALING_PORT (17013/TCP in cdma-ios) — different protocol
-/// so the OS allows both, but dedicated ports avoid confusion in split deployments.
 pub const ABIS_BSC_BEARER_PORT: u16 = 17022;
-
-/// Default BTS-side bearer UDP port (receives forward frames from BSC).
-pub const ABIS_BTS_BEARER_PORT: u16 = 17014;
 
 /// Events emitted by the transport to the consumer.
 #[derive(Debug)]
