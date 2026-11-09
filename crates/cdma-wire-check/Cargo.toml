@@ -1,0 +1,18 @@
+[package]
+name = "cdma-wire-check"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Checks IOS wire encodings against the Wireshark dissectors."
+
+[dependencies]
+
+[dev-dependencies]
+cdma-a8 = { path = "../cdma-a8" }
+cdma-a11 = { path = "../cdma-a11" }
+cdma-a21 = { path = "../cdma-a21" }
+cdma-ios = { path = "../cdma-ios" }

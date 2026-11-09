@@ -857,8 +857,8 @@ fn to_proto_bearer_metrics(
     proto::BearerMetrics {
         tx_frames: stats.tx_datagrams,
         rx_accepted: stats.rx_accepted,
-        duplicate_drop: stats.rx_duplicate_drop,
-        late_drop: stats.rx_late_drop,
+        duplicate_drop: 0,
+        late_drop: 0,
         encode_errors: 0,
         route_errors: stats.rx_route_errors + stats.rx_decode_errors,
         delivery_errors: stats.tx_errors,

@@ -21,10 +21,10 @@ import javacard.framework.Util;
  * bytes (see FileSystem), so a single 256-byte table cannot be compiled
  * in.
  *
- * Secret state (A-key, SSD) is persistent. The per-authentication
- * working registers and the "saved registers" that hold a Run CAVE
- * result for Generate Key/VPM are transient and cleared on
- * deselect.
+ * The A-key and active SSD are persistent. Candidate SSD is transient. The working registers and
+ * the "saved registers" that hold a Run CAVE result for Generate Key/VPM
+ * are RAM cleared on card reset, not on deselect: the saved registers
+ * must survive the ME re-selecting the CSIM (C.S0023-D §4.4.4.2).
  */
 public final class Cave {
 
@@ -71,78 +71,72 @@ public final class Cave {
 
     private static final short LO_HALF = 128;
     private static final short RETRY_LIMIT = 32;
+    private static final short LFSR_HALF_MASK = 0x7FFF;
+    private static final short LFSR_LOW_MASK = 0x00FF;
+    private static final short LFSR_HIGH_MASK = (short) 0xFF00;
 
     // Persistent secret state (semi-permanent memory, S.S0053 §1.1).
-    private final byte[] aKey;        // 8
-    private final byte[] ssdA;        // 8, active
-    private final byte[] ssdB;        // 8, active
-    private final byte[] ssdANew;     // 8, candidate from SSD_Generation
-    private final byte[] ssdBNew;     // 8, candidate from SSD_Generation
     // A-key and SSD are semi-permanent, so these persist across power cycles.
     private boolean aKeyLoaded;
     private boolean ssdLoaded;
 
-    // Transient CAVE working state (cleared on deselect).
-    private final byte[] lfsr;        // 4
-    private final byte[] reg;         // 16 mixing registers
-    private final byte[] shuffle;     // 16, permutation scratch for CAVE
-    private final byte[] esn;         // 4, CAVE ESN of the current command
-    private final short[] offsets;    // off1, off2, savedOff1, savedOff2
-
-    // "Saved registers" that hold a Run CAVE result for Generate Key/VPM
-    // (S.S0053 §2.4 SAVE_REGISTERS).
-    private final byte[] savedLfsr;   // 4
-    private final byte[] savedRand;   // 4
-    private final byte[] savedData;   // 3 (AUTH_DATA)
-    private final byte[] savedEsn;    // 4
-
-    // Base Station Challenge / SSD update sequencing state.
-    private final byte[] randbs;      // 4, last challenge handed to the ME
-    private final byte[] authbs;      // 3, expected Confirm SSD value
-
-    // Session-ephemeral validity flags, cleared on deselect together with
-    // the transient arrays they guard. Indices below.
-    private final byte[] fl;
     private static final short FL_SAVED = 0;      // saved registers valid
     private static final short FL_RANDBS = 1;     // RANDBS issued
     private static final short FL_AUTHBS = 2;     // AUTHBS computed
     private static final short FL_CANDIDATE = 3;  // SSD candidate present
     private static final short FL_OTASP = 4;      // defer SSD commit to Commit
-    private static final short FL_COUNT = 5;
+    private static final short FL_KEY = 5;
 
-    // Outputs of Generate Key/VPM.
-    private final byte[] cmeakey;     // 8
-    private final byte[] vpm;         // 65 (VPM octets 0..0x40)
+    // VPM octets valid for the saved registers. The ME may issue Generate
+    // Key/VPM more than once per Run CAVE, so the result is computed once.
+    private static final short VPM_DONE = 4;
 
     public static final short VPM_LEN = 65;
+    // S.S0053 Exhibit 2-15: ten 6-octet VPM blocks, then a final 5-octet block.
+    private static final short VPM_FULL_BLOCKS = 10;
+    private static final short VPM_BLOCK_LEN = 6;
     public static final short KEY_LEN = 8;
     public static final short SIG_LEN = 3;
 
-    private final byte[] div;         // 3, A-key checksum decimal conversion
-    private final byte[] ssdXorKey;   // 8, SSD_A ^ A_KEY for the SPASM signature
+    private final byte[] state;
+    private static final short SAVED_LFSR = 0;
+    private static final short SAVED_RAND = 4;
+    private static final short SAVED_DATA = 8;
+    private static final short SAVED_ESN = 11;
+    private static final short RANDBS = 15;
+    private static final short AUTHBS = 19;
+    private static final short DIV = 22;
+    private static final short SSD_XOR_KEY = 25;
+    private static final short FLAGS = 33;
+    private static final short LFSR = 39;
+    private static final short REG = 43;
+    private static final short SHUFFLE = 59;
+    private static final short ESN = 75;
+    private static final short KEY = 79;
+    private static final short VPM = 87;
+    private static final short OFFSETS = 152;
+    private static final short TABLE_READY = 157;
+    private static final short TABLE = 158;
+    private static final short TABLE_LEN = 2 * LO_HALF;
+    private static final short SSD_A_NEW = TABLE + TABLE_LEN;
+    private static final short SSD_B_NEW = SSD_A_NEW + 8;
+    private static final short STATE_LEN = SSD_B_NEW + 8;
 
-    public Cave() {
-        aKey = new byte[(short) 8];
-        ssdA = new byte[(short) 8];
-        ssdB = new byte[(short) 8];
-        ssdANew = new byte[(short) 8];
-        ssdBNew = new byte[(short) 8];
-        lfsr = JCSystem.makeTransientByteArray((short) 4, JCSystem.CLEAR_ON_DESELECT);
-        reg = JCSystem.makeTransientByteArray((short) 16, JCSystem.CLEAR_ON_DESELECT);
-        shuffle = JCSystem.makeTransientByteArray((short) 16, JCSystem.CLEAR_ON_DESELECT);
-        esn = JCSystem.makeTransientByteArray((short) 4, JCSystem.CLEAR_ON_DESELECT);
-        offsets = JCSystem.makeTransientShortArray((short) 4, JCSystem.CLEAR_ON_DESELECT);
-        savedLfsr = JCSystem.makeTransientByteArray((short) 4, JCSystem.CLEAR_ON_DESELECT);
-        savedRand = JCSystem.makeTransientByteArray((short) 4, JCSystem.CLEAR_ON_DESELECT);
-        savedData = JCSystem.makeTransientByteArray((short) 3, JCSystem.CLEAR_ON_DESELECT);
-        savedEsn = JCSystem.makeTransientByteArray((short) 4, JCSystem.CLEAR_ON_DESELECT);
-        randbs = JCSystem.makeTransientByteArray((short) 4, JCSystem.CLEAR_ON_DESELECT);
-        authbs = JCSystem.makeTransientByteArray((short) 3, JCSystem.CLEAR_ON_DESELECT);
-        cmeakey = JCSystem.makeTransientByteArray(KEY_LEN, JCSystem.CLEAR_ON_DESELECT);
-        vpm = JCSystem.makeTransientByteArray(VPM_LEN, JCSystem.CLEAR_ON_DESELECT);
-        div = JCSystem.makeTransientByteArray((short) 3, JCSystem.CLEAR_ON_DESELECT);
-        ssdXorKey = JCSystem.makeTransientByteArray((short) 8, JCSystem.CLEAR_ON_DESELECT);
-        fl = JCSystem.makeTransientByteArray(FL_COUNT, JCSystem.CLEAR_ON_DESELECT);
+    private static final short BUILD_STATE = 1;
+    private static final short BUILD_AKEY = 2;
+
+    private final byte[] secrets;
+    private static final short AKEY = 0;
+    private static final short SSD_A = 8;
+    private static final short SSD_B = 16;
+    private static final short SECRET_LEN = 8;
+    private static final short SECRETS_LEN = 24;
+
+    public Cave(short[] progress) {
+        progress[0] = BUILD_STATE;
+        state = JCSystem.makeTransientByteArray(STATE_LEN, JCSystem.CLEAR_ON_RESET);
+        progress[0] = BUILD_AKEY;
+        secrets = new byte[SECRETS_LEN];
     }
 
     /**
@@ -153,91 +147,101 @@ public final class Cave {
     public void authOtapa(byte[] rand, short randOff, byte[] data, short dataOff,
                           byte[] e, short esnOff, byte[] out, short outOff) {
         setEsn(e, esnOff);
-        for (short i = 0; i < 8; i++) ssdXorKey[i] = (byte) (ssdA[i] ^ aKey[i]);
-        authSignature(rand, randOff, data, dataOff, ssdXorKey, (short) 0, false, out, outOff);
+        for (short i = 0; i < 8; i++) state[(short) (SSD_XOR_KEY + i)] = (byte) (secrets[(short) (SSD_A + i)] ^ secrets[(short) (AKEY + i)]);
+        authSignature(rand, randOff, data, dataOff, state, SSD_XOR_KEY, false, out, outOff);
+    }
+
+    private short offset(short index) {
+        return (short) (state[(short) (OFFSETS + index)] & 0xFF);
+    }
+
+    private void setOffset(short index, short value) {
+        state[(short) (OFFSETS + index)] = (byte) value;
+    }
+
+    public short cmeaKeyOffset() { return KEY; }
+
+    public short vpmOffset() { return VPM; }
+
+    private void invalidateKeyVpm() {
+        setFlag(FL_KEY, false);
+        setOffset(VPM_DONE, (short) 0);
     }
 
     private boolean flag(short i) {
-        return fl[i] != 0;
+        return state[(short) (FLAGS + i)] != 0;
     }
 
     private void setFlag(short i, boolean v) {
-        fl[i] = v ? (byte) 1 : (byte) 0;
+        state[(short) (FLAGS + i)] = v ? (byte) 1 : (byte) 0;
     }
 
     // CAVE core (S.S0053 Exhibit 2-4)
 
-    private byte tab(short idx) {
-        return (idx < LO_HALF) ? CAVE_TAB_LO[idx] : CAVE_TAB_HI[(short) (idx - LO_HALF)];
-    }
-
-    private byte bitVal(byte octet, short bit) {
-        return (byte) (((octet & 0xFF) << (7 - bit)) & 0x80);
-    }
-
-    private void lfsrCycle() {
-        byte temp = (byte) (bitVal(lfsr[1], (short) 6)
-                ^ bitVal(lfsr[3], (short) 2)
-                ^ bitVal(lfsr[3], (short) 1)
-                ^ bitVal(lfsr[3], (short) 0));
-        for (short i = 3; i > 0; i--) {
-            lfsr[i] = (byte) ((lfsr[i] & 0xFF) >> 1);
-            if ((lfsr[(short) (i - 1)] & 0x01) != 0) lfsr[i] |= (byte) 0x80;
-        }
-        lfsr[0] = (byte) ((lfsr[0] & 0xFF) >> 1);
-        lfsr[0] |= temp;
-    }
-
-    private void rotateRightRegisters() {
-        byte last = reg[15];
-        for (short i = 15; i > 0; i--) {
-            reg[i] = (byte) ((reg[i] & 0xFF) >> 1);
-            if ((reg[(short) (i - 1)] & 0x01) != 0) reg[i] |= (byte) 0x80;
-        }
-        reg[0] = (byte) ((reg[0] & 0xFF) >> 1);
-        if ((last & 0x01) != 0) reg[0] |= (byte) 0x80;
-    }
-
     private void cave(short rounds) {
+        // The RAM table is cleared on reset along with its validity byte.
+        if (state[TABLE_READY] == 0) {
+            Util.arrayCopyNonAtomic(CAVE_TAB_LO, (short) 0, state, TABLE, LO_HALF);
+            Util.arrayCopyNonAtomic(CAVE_TAB_HI, (short) 0, state, (short) (TABLE + LO_HALF), LO_HALF);
+            state[TABLE_READY] = 1;
+        }
+        final byte[] ram = state;
+        short high = (short) (((ram[LFSR] & 0xFF) << 8) | (ram[(short) (LFSR + 1)] & 0xFF));
+        short low = (short) (((ram[(short) (LFSR + 2)] & 0xFF) << 8) | (ram[(short) (LFSR + 3)] & 0xFF));
+        short o0 = offset((short) 0);
+        short o1 = offset((short) 1);
+        short fb;
         for (short round = (short) (rounds - 1); round >= 0; round--) {
-            byte reg0 = reg[0];
+            byte reg0 = ram[(short) (REG + 0)];
             for (short r = 0; r < 16; r++) {
-                byte lowNibble = 0;
-                byte hiNibble = 0;
+                short curU = (short) (ram[(short) (REG + r)] & 0xFF);
+                short curLo = (short) (curU & 0x0F);
+                short curHi = (short) (curU & 0xF0);
+                short lowNibble;
+                short hiNibble;
                 short fail = 0;
                 while (true) {
-                    offsets[0] = (short) ((offsets[0] + ((lfsr[0] & 0xFF) ^ (reg[r] & 0xFF))) & 0xFF);
-                    lowNibble = (byte) (tab(offsets[0]) & 0x0F);
-                    if (lowNibble == (byte) (reg[r] & 0x0F)) {
-                        lfsrCycle();
-                        if (++fail == RETRY_LIMIT) { lfsr[3]++; break; }
-                    } else {
-                        break;
-                    }
+                    o0 = (short) ((o0 + ((high >> 8) ^ curU)) & 0xFF);
+                    lowNibble = (short) (ram[(short) (TABLE + o0)] & 0x0F);
+                    if (lowNibble != curLo) break;
+                    fb = (short) (((high >> 6) ^ (low >> 2) ^ (low >> 1) ^ low) & 1);
+                    low = (short) (((low >> 1) & LFSR_HALF_MASK) | (high << 15));
+                    high = (short) (((high >> 1) & LFSR_HALF_MASK) | (fb << 15));
+                    if (++fail == RETRY_LIMIT) { low = (short) ((low & LFSR_HIGH_MASK) | ((low + 1) & LFSR_LOW_MASK)); break; }
                 }
                 fail = 0;
                 while (true) {
-                    offsets[1] = (short) ((offsets[1] + ((lfsr[1] & 0xFF) ^ (reg[r] & 0xFF))) & 0xFF);
-                    hiNibble = (byte) (tab(offsets[1]) & 0xF0);
-                    if (hiNibble == (byte) (reg[r] & 0xF0)) {
-                        lfsrCycle();
-                        if (++fail == RETRY_LIMIT) { lfsr[3]++; break; }
-                    } else {
-                        break;
-                    }
+                    o1 = (short) ((o1 + (high ^ curU)) & 0xFF);
+                    hiNibble = (short) (ram[(short) (TABLE + o1)] & 0xF0);
+                    if (hiNibble != curHi) break;
+                    fb = (short) (((high >> 6) ^ (low >> 2) ^ (low >> 1) ^ low) & 1);
+                    low = (short) (((low >> 1) & LFSR_HALF_MASK) | (high << 15));
+                    high = (short) (((high >> 1) & LFSR_HALF_MASK) | (fb << 15));
+                    if (++fail == RETRY_LIMIT) { low = (short) ((low & LFSR_HIGH_MASK) | ((low + 1) & LFSR_LOW_MASK)); break; }
                 }
-                byte temp = (byte) (lowNibble | hiNibble);
-                if (r == 15) reg[r] = (byte) (reg0 ^ temp);
-                else reg[r] = (byte) (reg[(short) (r + 1)] ^ temp);
-                lfsrCycle();
+                ram[(short) (REG + r)] = (byte) (((r == 15) ? reg0 : ram[(short) (REG + (short) (r + 1))]) ^ (lowNibble | hiNibble));
+                fb = (short) (((high >> 6) ^ (low >> 2) ^ (low >> 1) ^ low) & 1);
+                low = (short) (((low >> 1) & LFSR_HALF_MASK) | (high << 15));
+                high = (short) (((high >> 1) & LFSR_HALF_MASK) | (fb << 15));
             }
-            rotateRightRegisters();
+            // Rotate the 128-bit register right by one bit and permute it
+            // into shuffle in the same pass.
+            short base = (short) (16 * round);
+            short carry = (short) (ram[(short) (REG + 15)] & 1);
             for (short r = 0; r < 16; r++) {
-                byte slot = (byte) (tab((short) (16 * round + r)) & 0x0F);
-                shuffle[slot] = reg[r];
+                byte b = ram[(short) (REG + r)];
+                ram[(short) (SHUFFLE + (short) (ram[(short) (TABLE + base + r)] & 0x0F))] =
+                        (byte) (((b & 0xFF) >> 1) | (carry << 7));
+                carry = (short) (b & 1);
             }
-            Util.arrayCopyNonAtomic(shuffle, (short) 0, reg, (short) 0, (short) 16);
+            Util.arrayCopyNonAtomic(state, SHUFFLE, state, REG, (short) 16);
         }
+        ram[LFSR] = (byte) (high >> 8);
+        ram[(short) (LFSR + 1)] = (byte) high;
+        ram[(short) (LFSR + 2)] = (byte) (low >> 8);
+        ram[(short) (LFSR + 3)] = (byte) low;
+        setOffset((short) 0, o0);
+        setOffset((short) 1, o1);
     }
 
     private static boolean lfsrZero(byte[] a, short off) {
@@ -250,26 +254,27 @@ public final class Cave {
     public void loadAKey(byte[] src, short off) {
         // Atomic copies and plain stores, so OTASP Commit's transaction
         // covers them. The NonAtomic forms bypass an open transaction.
-        Util.arrayCopy(src, off, aKey, (short) 0, (short) 8);
-        zero(ssdA);
-        zero(ssdB);
-        zero(ssdANew);
-        zero(ssdBNew);
+        Util.arrayCopy(src, off, secrets, AKEY, (short) 8);
+        zeroSecret(SSD_A);
+        zeroSecret(SSD_B);
+        Util.arrayFillNonAtomic(state, SSD_A_NEW, (short) 16, (byte) 0);
         aKeyLoaded = true;
         ssdLoaded = false;
         setFlag(FL_CANDIDATE, false);
+        invalidateKeyVpm();
     }
 
-    private static void zero(byte[] a) {
-        for (short i = 0; i < (short) a.length; i++) a[i] = 0;
+    private void zeroSecret(short offset) {
+        for (short i = 0; i < SECRET_LEN; i++) secrets[(short) (offset + i)] = 0;
     }
 
     /** Load a pre-shared SSD_A || SSD_B directly (provisioning path). */
     public void loadSsd(byte[] src, short off) {
-        Util.arrayCopyNonAtomic(src, off, ssdA, (short) 0, (short) 8);
-        Util.arrayCopyNonAtomic(src, (short) (off + 8), ssdB, (short) 0, (short) 8);
-        ssdLoaded = true;
+        Util.arrayCopyNonAtomic(src, off, secrets, SSD_A, (short) 8);
+        Util.arrayCopyNonAtomic(src, (short) (off + 8), secrets, SSD_B, (short) 8);
+        if (!ssdLoaded) ssdLoaded = true;
         setFlag(FL_CANDIDATE, false);
+        invalidateKeyVpm();
     }
 
     public boolean isAKeyLoaded() {
@@ -283,7 +288,7 @@ public final class Cave {
     }
 
     private void setEsn(byte[] e, short off) {
-        Util.arrayCopyNonAtomic(e, off, esn, (short) 0, (short) 4);
+        Util.arrayCopyNonAtomic(e, off, state, ESN, (short) 4);
     }
 
     // Authentication signature (S.S0053 §2.4 Exhibit 2-14)
@@ -299,31 +304,32 @@ public final class Cave {
                                byte[] ssdAuth, short ssdOff, boolean save,
                                byte[] out, short outOff) {
         for (short i = 0; i < 4; i++) {
-            lfsr[i] = (byte) (rand[(short) (randOff + i)]
+            state[(short) (LFSR + i)] = (byte) (rand[(short) (randOff + i)]
                     ^ ssdAuth[(short) (ssdOff + i)]
                     ^ ssdAuth[(short) (ssdOff + i + 4)]);
         }
-        if (lfsrZero(lfsr, (short) 0)) {
-            Util.arrayCopyNonAtomic(rand, randOff, lfsr, (short) 0, (short) 4);
+        if (lfsrZero(state, LFSR)) {
+            Util.arrayCopyNonAtomic(rand, randOff, state, LFSR, (short) 4);
         }
-        Util.arrayCopyNonAtomic(ssdAuth, ssdOff, reg, (short) 0, (short) 8);
-        reg[8] = AAV;
-        Util.arrayCopyNonAtomic(data, dataOff, reg, (short) 9, (short) 3);
-        Util.arrayCopyNonAtomic(esn, (short) 0, reg, (short) 12, (short) 4);
-        offsets[0] = 128;
-        offsets[1] = 128;
+        Util.arrayCopyNonAtomic(ssdAuth, ssdOff, state, REG, (short) 8);
+        state[(short) (REG + 8)] = AAV;
+        Util.arrayCopyNonAtomic(data, dataOff, state, (short) (REG + 9), (short) 3);
+        Util.arrayCopyNonAtomic(state, ESN, state, (short) (REG + 12), (short) 4);
+        setOffset((short) 0, (short) 128);
+        setOffset((short) 1, (short) 128);
         cave((short) 8);
-        out[outOff] = (byte) ((reg[0] ^ reg[13]) & 0x03);
-        out[(short) (outOff + 1)] = (byte) (reg[1] ^ reg[14]);
-        out[(short) (outOff + 2)] = (byte) (reg[2] ^ reg[15]);
+        out[outOff] = (byte) ((state[(short) (REG + 0)] ^ state[(short) (REG + 13)]) & 0x03);
+        out[(short) (outOff + 1)] = (byte) (state[(short) (REG + 1)] ^ state[(short) (REG + 14)]);
+        out[(short) (outOff + 2)] = (byte) (state[(short) (REG + 2)] ^ state[(short) (REG + 15)]);
         if (save) {
-            offsets[2] = offsets[0];
-            offsets[3] = offsets[1];
-            Util.arrayCopyNonAtomic(lfsr, (short) 0, savedLfsr, (short) 0, (short) 4);
-            Util.arrayCopyNonAtomic(rand, randOff, savedRand, (short) 0, (short) 4);
-            Util.arrayCopyNonAtomic(data, dataOff, savedData, (short) 0, (short) 3);
-            Util.arrayCopyNonAtomic(esn, (short) 0, savedEsn, (short) 0, (short) 4);
+            setOffset((short) 2, offset((short) 0));
+            setOffset((short) 3, offset((short) 1));
+            Util.arrayCopyNonAtomic(state, LFSR, state, SAVED_LFSR, (short) 4);
+            Util.arrayCopyNonAtomic(rand, randOff, state, SAVED_RAND, (short) 4);
+            Util.arrayCopyNonAtomic(data, dataOff, state, SAVED_DATA, (short) 3);
+            Util.arrayCopyNonAtomic(state, ESN, state, SAVED_ESN, (short) 4);
             setFlag(FL_SAVED, true);
+            invalidateKeyVpm();
         }
     }
 
@@ -335,7 +341,7 @@ public final class Cave {
     public void runCave(byte[] rand, short randOff, byte[] data, short dataOff,
                         byte[] e, short esnOff, boolean save, byte[] out, short outOff) {
         setEsn(e, esnOff);
-        authSignature(rand, randOff, data, dataOff, ssdA, (short) 0, save, out, outOff);
+        authSignature(rand, randOff, data, dataOff, secrets, SSD_A, save, out, outOff);
     }
 
     // SSD generation and update (S.S0053 §2.3)
@@ -345,27 +351,27 @@ public final class Cave {
     public void ssdGeneration(byte[] randssd, short rsOff, byte[] e, short esnOff) {
         setEsn(e, esnOff);
         for (short i = 0; i < 4; i++) {
-            lfsr[i] = (byte) (randssd[(short) (rsOff + i + 3)] ^ aKey[i] ^ aKey[(short) (i + 4)]);
+            state[(short) (LFSR + i)] = (byte) (randssd[(short) (rsOff + i + 3)] ^ secrets[(short) (AKEY + i)] ^ secrets[(short) (AKEY + (short) (i + 4))]);
         }
-        if (lfsrZero(lfsr, (short) 0)) {
-            for (short i = 0; i < 4; i++) lfsr[i] = randssd[(short) (rsOff + i + 3)];
+        if (lfsrZero(state, LFSR)) {
+            for (short i = 0; i < 4; i++) state[(short) (LFSR + i)] = randssd[(short) (rsOff + i + 3)];
         }
-        Util.arrayCopyNonAtomic(aKey, (short) 0, reg, (short) 0, (short) 8);
-        reg[8] = AAV;
-        Util.arrayCopyNonAtomic(randssd, rsOff, reg, (short) 9, (short) 3);
-        Util.arrayCopyNonAtomic(esn, (short) 0, reg, (short) 12, (short) 4);
-        offsets[0] = 128;
-        offsets[1] = 128;
+        Util.arrayCopyNonAtomic(secrets, AKEY, state, REG, (short) 8);
+        state[(short) (REG + 8)] = AAV;
+        Util.arrayCopyNonAtomic(randssd, rsOff, state, (short) (REG + 9), (short) 3);
+        Util.arrayCopyNonAtomic(state, ESN, state, (short) (REG + 12), (short) 4);
+        setOffset((short) 0, (short) 128);
+        setOffset((short) 1, (short) 128);
         cave((short) 8);
-        Util.arrayCopyNonAtomic(reg, (short) 0, ssdANew, (short) 0, (short) 8);
-        Util.arrayCopyNonAtomic(reg, (short) 8, ssdBNew, (short) 0, (short) 8);
+        Util.arrayCopyNonAtomic(state, REG, state, SSD_A_NEW, (short) 8);
+        Util.arrayCopyNonAtomic(state, (short) (REG + 8), state, SSD_B_NEW, (short) 8);
         setFlag(FL_CANDIDATE, true);
     }
 
     /** AUTHBS over the candidate SSD_A_NEW using the stored RANDBS and the
      *  given AUTH_DATA (MIN1). Result retained for Confirm SSD. */
     public void computeAuthBs(byte[] data, short dataOff) {
-        authSignature(randbs, (short) 0, data, dataOff, ssdANew, (short) 0, false, authbs, (short) 0);
+        authSignature(state, RANDBS, data, dataOff, state, SSD_A_NEW, false, state, AUTHBS);
         setFlag(FL_AUTHBS, true);
     }
 
@@ -388,7 +394,7 @@ public final class Cave {
     /** Store a freshly generated RANDBS (handed to the ME in the Base
      *  Station Challenge response). */
     public void setRandBs(byte[] src, short off) {
-        Util.arrayCopyNonAtomic(src, off, randbs, (short) 0, (short) 4);
+        Util.arrayCopyNonAtomic(src, off, state, RANDBS, (short) 4);
         setFlag(FL_RANDBS, true);
         setFlag(FL_AUTHBS, false);
     }
@@ -398,34 +404,42 @@ public final class Cave {
      *  a match. */
     public boolean confirmSsd(byte[] src, short off, boolean commitNow) {
         if (!flag(FL_AUTHBS)) return false;
-        boolean ok = (src[off] == authbs[0])
-                && (src[(short) (off + 1)] == authbs[1])
-                && (src[(short) (off + 2)] == authbs[2]);
+        boolean ok = (src[off] == state[AUTHBS])
+                && (src[(short) (off + 1)] == state[(short) (AUTHBS + 1)])
+                && (src[(short) (off + 2)] == state[(short) (AUTHBS + 2)]);
         if (ok && commitNow) {
-            Util.arrayCopy(ssdANew, (short) 0, ssdA, (short) 0, (short) 8);
-            Util.arrayCopy(ssdBNew, (short) 0, ssdB, (short) 0, (short) 8);
-            ssdLoaded = true;
+            persistCandidate(SSD_A_NEW, SSD_A);
+            persistCandidate(SSD_B_NEW, SSD_B);
+            if (!ssdLoaded) ssdLoaded = true;
+            invalidateKeyVpm();
         }
         return ok;
+    }
+
+    private void persistCandidate(short source, short destination) {
+        if (Util.arrayCompare(state, source, secrets, destination, SECRET_LEN) != 0) {
+            Util.arrayCopy(state, source, secrets, destination, SECRET_LEN);
+        }
     }
 
     /** Promote the candidate SSD unconditionally (OTASP Commit). */
     public void commitSsd() {
         if (!flag(FL_CANDIDATE)) return;
-        Util.arrayCopy(ssdANew, (short) 0, ssdA, (short) 0, (short) 8);
-        Util.arrayCopy(ssdBNew, (short) 0, ssdB, (short) 0, (short) 8);
-        ssdLoaded = true;
+        persistCandidate(SSD_A_NEW, SSD_A);
+        persistCandidate(SSD_B_NEW, SSD_B);
+        if (!ssdLoaded) ssdLoaded = true;
+        invalidateKeyVpm();
     }
 
     // CMEA key and VPM generation (S.S0053 §2.5.1 Exhibit 2-15)
 
     private void rollLfsr() {
-        lfsr[0] = reg[0];
-        lfsr[1] = reg[1];
-        lfsr[2] = reg[14];
-        lfsr[3] = reg[15];
-        if (lfsrZero(lfsr, (short) 0)) {
-            Util.arrayCopyNonAtomic(savedRand, (short) 0, lfsr, (short) 0, (short) 4);
+        state[(short) (LFSR + 0)] = state[(short) (REG + 0)];
+        state[(short) (LFSR + 1)] = state[(short) (REG + 1)];
+        state[(short) (LFSR + 2)] = state[(short) (REG + 14)];
+        state[(short) (LFSR + 3)] = state[(short) (REG + 15)];
+        if (lfsrZero(state, LFSR)) {
+            Util.arrayCopyNonAtomic(state, SAVED_RAND, state, LFSR, (short) 4);
         }
     }
 
@@ -436,56 +450,62 @@ public final class Cave {
     /** SSD_A || SSD_B (16 bytes), the key material for the Secure Mode
      *  ciphering key (C.S0016-C §3.3.8.1, KEY_IN_USE 0). */
     public void copySsdAB(byte[] out, short off) {
-        Util.arrayCopyNonAtomic(ssdA, (short) 0, out, off, (short) 8);
-        Util.arrayCopyNonAtomic(ssdB, (short) 0, out, (short) (off + 8), (short) 8);
+        Util.arrayCopyNonAtomic(secrets, SSD_A, out, off, (short) 8);
+        Util.arrayCopyNonAtomic(secrets, SSD_B, out, (short) (off + 8), (short) 8);
     }
 
-    /** Key_VPM_Generation: CMEA key (8 bytes) and the 65-octet VPM, from
-     *  the registers saved by the last Run CAVE with save on and SSD_B. */
-    public void keyVpmGeneration() {
+    /** Key_VPM_Generation: CMEA key (8 bytes) and, when vpmLast is not
+     *  negative, the full 65-octet VPM, from the registers saved by the last
+     *  Run CAVE with save on and SSD_B. Repeat calls reuse the result. */
+    public void keyVpmGeneration(short vpmLast) {
+        if (flag(FL_KEY) && offset(VPM_DONE) > vpmLast) return;
         for (short i = 0; i < 4; i++) {
-            lfsr[i] = (byte) (savedLfsr[i] ^ ssdB[i] ^ ssdB[(short) (i + 4)]);
+            state[(short) (LFSR + i)] = (byte) (state[(short) (SAVED_LFSR + i)] ^ secrets[(short) (SSD_B + i)] ^ secrets[(short) (SSD_B + (short) (i + 4))]);
         }
-        if (lfsrZero(lfsr, (short) 0)) {
-            Util.arrayCopyNonAtomic(savedRand, (short) 0, lfsr, (short) 0, (short) 4);
+        if (lfsrZero(state, LFSR)) {
+            Util.arrayCopyNonAtomic(state, SAVED_RAND, state, LFSR, (short) 4);
         }
-        Util.arrayCopyNonAtomic(ssdB, (short) 0, reg, (short) 0, (short) 8);
-        reg[8] = AAV;
-        Util.arrayCopyNonAtomic(savedData, (short) 0, reg, (short) 9, (short) 3);
-        Util.arrayCopyNonAtomic(savedEsn, (short) 0, reg, (short) 12, (short) 4);
-        offsets[0] = offsets[2];
-        offsets[1] = offsets[3];
+        Util.arrayCopyNonAtomic(secrets, SSD_B, state, REG, (short) 8);
+        state[(short) (REG + 8)] = AAV;
+        Util.arrayCopyNonAtomic(state, SAVED_DATA, state, (short) (REG + 9), (short) 3);
+        Util.arrayCopyNonAtomic(state, SAVED_ESN, state, (short) (REG + 12), (short) 4);
+        setOffset((short) 0, offset((short) 2));
+        setOffset((short) 1, offset((short) 3));
         cave((short) 8);
 
         rollLfsr();
         cave((short) 4);
-        for (short i = 0; i < 4; i++) cmeakey[i] = (byte) (reg[(short) (i + 4)] ^ reg[(short) (i + 8)]);
+        for (short i = 0; i < 4; i++) state[(short) (KEY + i)] = (byte) (state[(short) (REG + (short) (i + 4))] ^ state[(short) (REG + (short) (i + 8))]);
 
         rollLfsr();
         cave((short) 4);
-        for (short i = 4; i < 8; i++) cmeakey[i] = (byte) (reg[i] ^ reg[(short) (i + 4)]);
+        for (short i = 4; i < 8; i++) state[(short) (KEY + i)] = (byte) (state[(short) (REG + i)] ^ state[(short) (REG + (short) (i + 4))]);
+        setFlag(FL_KEY, true);
+        setOffset(VPM_DONE, (short) 0);
+        if (vpmLast < 0) return;
 
         short vp = 0;
-        for (short it = 0; it < 10; it++) {
+        for (short it = 0; it < VPM_FULL_BLOCKS; it++) {
             rollLfsr();
             cave((short) 4);
-            for (short r = 0; r < 6; r++) {
-                vpm[vp++] = (byte) (reg[(short) (r + 2)] ^ reg[(short) (r + 8)]);
+            for (short r = 0; r < VPM_BLOCK_LEN; r++) {
+                state[(short) (VPM + vp++)] = (byte) (state[(short) (REG + (short) (r + 2))] ^ state[(short) (REG + (short) (r + 8))]);
             }
         }
         rollLfsr();
         cave((short) 4);
         for (short j = 0; j < 5; j++) {
-            vpm[vp++] = (byte) (reg[(short) (j + 2)] ^ reg[(short) (j + 8)]);
+            state[(short) (VPM + vp++)] = (byte) (state[(short) (REG + (short) (j + 2))] ^ state[(short) (REG + (short) (j + 8))]);
         }
+        setOffset(VPM_DONE, VPM_LEN);
     }
 
     public byte[] cmeaKey() {
-        return cmeakey;
+        return state;
     }
 
     public byte[] vpm() {
-        return vpm;
+        return state;
     }
 
     // A-key checksum (S.S0053 §2.2.1)
@@ -497,27 +517,27 @@ public final class Cave {
      */
     public void aKeyChecksum(byte[] e, short esnOff, byte[] out, short outOff) {
         setEsn(e, esnOff);
-        if ((aKey[0] | aKey[1] | aKey[2] | aKey[3]) != 0) {
-            Util.arrayCopyNonAtomic(aKey, (short) 0, lfsr, (short) 0, (short) 4);
+        if ((secrets[(short) (AKEY + 0)] | secrets[(short) (AKEY + 1)] | secrets[(short) (AKEY + 2)] | secrets[(short) (AKEY + 3)]) != 0) {
+            Util.arrayCopyNonAtomic(secrets, AKEY, state, LFSR, (short) 4);
         } else {
-            Util.arrayCopyNonAtomic(esn, (short) 0, lfsr, (short) 0, (short) 4);
+            Util.arrayCopyNonAtomic(state, ESN, state, LFSR, (short) 4);
         }
-        Util.arrayCopyNonAtomic(aKey, (short) 0, reg, (short) 0, (short) 8);
-        reg[8] = AAV;
-        Util.arrayCopyNonAtomic(aKey, (short) 5, reg, (short) 9, (short) 3);
-        Util.arrayCopyNonAtomic(esn, (short) 0, reg, (short) 12, (short) 4);
-        offsets[0] = 128;
-        offsets[1] = 128;
+        Util.arrayCopyNonAtomic(secrets, AKEY, state, REG, (short) 8);
+        state[(short) (REG + 8)] = AAV;
+        Util.arrayCopyNonAtomic(secrets, (short) (AKEY + 5), state, (short) (REG + 9), (short) 3);
+        Util.arrayCopyNonAtomic(state, ESN, state, (short) (REG + 12), (short) 4);
+        setOffset((short) 0, (short) 128);
+        setOffset((short) 1, (short) 128);
         cave((short) 8);
         // 18-bit checksum as three bytes, then convert to six decimal digits.
-        div[0] = (byte) ((reg[0] ^ reg[13]) & 0x03);
-        div[1] = (byte) (reg[1] ^ reg[14]);
-        div[2] = (byte) (reg[2] ^ reg[15]);
+        state[DIV] = (byte) ((state[(short) (REG + 0)] ^ state[(short) (REG + 13)]) & 0x03);
+        state[(short) (DIV + 1)] = (byte) (state[(short) (REG + 1)] ^ state[(short) (REG + 14)]);
+        state[(short) (DIV + 2)] = (byte) (state[(short) (REG + 2)] ^ state[(short) (REG + 15)]);
         for (short d = 5; d >= 0; d--) {
             short rem = 0;
             for (short i = 0; i < 3; i++) {
-                short cur = (short) (((rem << 8) | (div[i] & 0xFF)));
-                div[i] = (byte) (cur / 10);
+                short cur = (short) (((rem << 8) | (state[(short) (DIV + i)] & 0xFF)));
+                state[(short) (DIV + i)] = (byte) (cur / 10);
                 rem = (short) (cur % 10);
             }
             out[(short) (outOff + d)] = (byte) ('0' + rem);

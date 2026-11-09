@@ -1688,12 +1688,14 @@ struct HrpdAnA8Actor {
     uplink_queue_us_max: u128,
     uplink_send_us_sum: u128,
     uplink_send_us_max: u128,
+    max_gre_payload: u16,
+    uplink_aligners: HashMap<u32, cdma_a8::PppFrameAligner>,
     pending_command: Option<HrpdAnA8Command>,
     buf: Vec<u8>,
 }
 
 impl HrpdAnA8Actor {
-    fn new() -> Self {
+    fn new(max_gre_payload: u16) -> Self {
         Self {
             table: cdma_a8::BearerTable::new(),
             sessions: HashMap::new(),
@@ -1711,6 +1713,8 @@ impl HrpdAnA8Actor {
             uplink_queue_us_max: 0,
             uplink_send_us_sum: 0,
             uplink_send_us_max: 0,
+            max_gre_payload,
+            uplink_aligners: HashMap::new(),
             pending_command: None,
             buf: vec![0u8; 8192],
         }
@@ -1719,7 +1723,8 @@ impl HrpdAnA8Actor {
     async fn run(
         mut self,
         mut rx: tokio::sync::mpsc::UnboundedReceiver<HrpdAnA8Command>,
-        bearer: cdma_a8::TokioUdpGreEndpoint,
+        bearer: cdma_a8::GreSocket,
+        pcf_peer: std::net::SocketAddr,
         endpoint: cdma_a8::BearerEndpoint,
         forward_signaling_tx: tokio::sync::mpsc::UnboundedSender<
             hrpd_air::HrpdForwardSignalingRequest,
@@ -1739,6 +1744,9 @@ impl HrpdAnA8Actor {
                         bearer,
                     } => {
                         let new_inbound_session_key = bearer.inbound_session_key;
+                        if let Some(aligner) = self.uplink_aligners.get_mut(&uati) {
+                            aligner.set_segmentation(bearer.profile.gre_segmentation_supported);
+                        }
                         match self.table.apply_session(bearer) {
                             Ok(outcome) => {
                                 if let cdma_a8::ApplySessionOutcome::Rebound {
@@ -1927,6 +1935,7 @@ impl HrpdAnA8Actor {
                         uati,
                         retain_session_configuration,
                     } => {
+                        self.uplink_aligners.remove(&uati);
                         let removed_session = self.sessions.remove(&uati);
                         let retain_default_packet_flow_open = retain_session_configuration
                             && removed_session
@@ -2003,21 +2012,39 @@ impl HrpdAnA8Actor {
                             continue;
                         };
                         let payload_len = payload.len();
-                        let outbound = match self.table.build_outbound_packet(uati, payload) {
-                            Ok(outbound) => outbound,
-                            Err(err) => {
-                                warn!(
-                                    "HRPD AN A8: failed to encode uplink UATI=0x{uati:08x}: {err}"
-                                );
-                                continue;
-                            }
-                        };
+                        let segmentation = self
+                            .table
+                            .session(uati)
+                            .is_some_and(|bearer| bearer.profile.gre_segmentation_supported);
+                        let max_gre_payload = self.max_gre_payload;
+                        let chunks = self
+                            .uplink_aligners
+                            .entry(uati)
+                            .or_insert_with(|| {
+                                let mut aligner = cdma_a8::PppFrameAligner::new(max_gre_payload);
+                                aligner.set_segmentation(segmentation);
+                                aligner
+                            })
+                            .push(&payload);
                         let send_started = Instant::now();
-                        if let Err(err) = bearer.send_wire_packet(&outbound.wire_bytes).await {
-                            warn!(
-                                "HRPD AN A8: failed to send uplink UATI=0x{uati:08x} mac_index={}: {err}",
-                                session.mac_index
-                            );
+                        for chunk in chunks {
+                            let outbound = match self.table.build_outbound_chunk(uati, chunk) {
+                                Ok(outbound) => outbound,
+                                Err(err) => {
+                                    warn!(
+                                        "HRPD AN A8: failed to encode uplink UATI=0x{uati:08x}: {err}"
+                                    );
+                                    continue;
+                                }
+                            };
+                            if let Err(err) =
+                                bearer.send_wire_to(&outbound.wire_bytes, pcf_peer).await
+                            {
+                                warn!(
+                                    "HRPD AN A8: failed to send uplink UATI=0x{uati:08x} mac_index={}: {err}",
+                                    session.mac_index
+                                );
+                            }
                         }
                         let send_elapsed = send_started.elapsed();
                         self.uplink_timing_samples += 1;
@@ -2570,22 +2597,10 @@ impl HrpdAnA8Actor {
             }
 
             for _ in 0..A10_BEARER_MAX_DATAGRAMS_PER_PASS {
-                let (packet, _) = match bearer.try_recv_gre_packet(&mut self.buf) {
-                    Ok(value) => value,
-                    Err(cdma_a8::Error::UdpTransport(err)) if is_udp_timeout(&err) => break,
-                    Err(err) => {
-                        warn!("HRPD AN A8: receive/decode failed: {err}");
-                        continue;
-                    }
+                let Some((wire, _)) = bearer.try_recv_wire(&mut self.buf, "HRPD AN A8") else {
+                    break;
                 };
                 pass_active = true;
-                let wire = match packet.encode() {
-                    Ok(wire) => wire,
-                    Err(err) => {
-                        warn!("HRPD AN A8: failed to reserialize inbound GRE packet: {err}");
-                        continue;
-                    }
-                };
                 let inbound = match self.table.decode_for_session(endpoint, &wire) {
                     Ok(inbound) => inbound,
                     Err(err) => {
@@ -2593,6 +2608,16 @@ impl HrpdAnA8Actor {
                         continue;
                     }
                 };
+                if !inbound.attributes.is_empty() {
+                    debug!(
+                        "HRPD AN A8: GRE attributes UATI=0x{:08x} {:?}",
+                        inbound.session_id, inbound.attributes
+                    );
+                }
+                // A 3GPP2 Packet frame may hold only attributes.
+                if inbound.payload.is_empty() {
+                    continue;
+                }
                 let Some(session) = self.sessions.get_mut(&inbound.session_id) else {
                     warn!(
                         "HRPD AN A8: decoded packet for unknown UATI=0x{:08x}",
@@ -2665,26 +2690,25 @@ pub fn spawn_hrpd_an_a8_runtime(
     forward_signaling_tx: tokio::sync::mpsc::UnboundedSender<hrpd_air::HrpdForwardSignalingRequest>,
     forward_traffic_tx: tokio::sync::mpsc::UnboundedSender<HrpdAnForwardTrafficPacket>,
 ) -> Result<HrpdAnA8Runtime, Error> {
-    let bearer = cdma_a8::UdpGreEndpoint::bind(config, "an.a8_bearer")
-        .map_err(|err| Error::from(format!("HRPD AN A8 bind failed: {err}")))?
-        .into_tokio()
-        .map_err(|err| Error::from(format!("HRPD AN A8 Tokio setup failed: {err}")))?;
+    let pcf_peer = match config.mode {
+        cdma_a8::BearerTransportMode::RawGre => std::net::SocketAddr::new(endpoint.remote_ip, 0),
+        cdma_a8::BearerTransportMode::UdpEncapsulatedGre => config
+            .udp_peer_addr
+            .ok_or_else(|| Error::from("an.a8_bearer: GRE-in-UDP requires udp_peer_addr"))?,
+    };
+    let max_gre_payload = config.max_gre_payload();
+    let bearer = cdma_a8::GreSocket::bind(config, endpoint.local_ip, "an.a8_bearer")
+        .map_err(|err| Error::from(format!("HRPD AN A8 bind failed: {err}")))?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(HrpdAnA8Actor::new().run(
+    tokio::spawn(HrpdAnA8Actor::new(max_gre_payload).run(
         rx,
         bearer,
+        pcf_peer,
         endpoint,
         forward_signaling_tx,
         forward_traffic_tx,
     ));
     Ok(HrpdAnA8Runtime { tx })
-}
-
-fn is_udp_timeout(err: &str) -> bool {
-    let err = err.to_ascii_lowercase();
-    err.contains("wouldblock")
-        || err.contains("would block")
-        || err.contains("resource temporarily unavailable")
 }
 
 #[cfg(test)]

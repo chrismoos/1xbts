@@ -252,35 +252,35 @@ async fn abis_tcp_setup_and_udp_bearer_delivers_forward_fch() {
         .reserve_system_channels(0, 1, 32);
     let (_reverse_tx, reverse_rx) = std::sync::mpsc::channel();
 
-    // Use ephemeral ports for test isolation.
-    let bts_bearer_config = cdma_abis::bearer_transport::BearerTransportConfig {
-        bind_addr: "127.0.0.1:0".parse().unwrap(),
-        remote_addr: "127.0.0.1:0".parse().unwrap(), // unused by this forward-only test
-        bts_id: 1,
-        cell_id: 1,
-    };
-    let bts_bearer = std::sync::Arc::new(
-        cdma_abis::bearer_transport::BearerTransport::new(&bts_bearer_config)
-            .expect("BTS bearer bind"),
-    );
-    let bts_bearer_addr = bts_bearer.local_addr().unwrap();
-
-    let bsc_bearer_config = cdma_abis::bearer_transport::BearerTransportConfig {
-        bind_addr: "127.0.0.1:0".parse().unwrap(),
-        remote_addr: bts_bearer_addr,
-        bts_id: 1,
-        cell_id: 1,
-    };
+    use cdma_abis::bearer_transport::{BearerRole, BearerTransport, BearerTransportConfig};
     let bsc_bearer = std::sync::Arc::new(
-        cdma_abis::bearer_transport::BearerTransport::new(&bsc_bearer_config)
-            .expect("BSC bearer bind"),
+        BearerTransport::new(&BearerTransportConfig {
+            role: BearerRole::Bsc,
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            remote_addr: "127.0.0.1:0".parse().unwrap(),
+        })
+        .expect("BSC bearer bind"),
     );
+    // The BTS opens a socket per traffic connection and reports its port in
+    // Abis-Connect.
+    let bts_bearer = std::sync::Arc::new(
+        BearerTransport::new(&BearerTransportConfig {
+            role: BearerRole::Bts,
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            remote_addr: bsc_bearer
+                .local_addr((ChannelFamily::Fch, 0))
+                .expect("BSC bearer address"),
+        })
+        .expect("BTS bearer"),
+    );
+    let bts_bearer_for_agent = bts_bearer.clone();
     cdma_bts::bts::bearer_agent::spawn_bts_bearer_agent(bts_bearer, controller.clone(), reverse_rx);
 
     let controller_clone = controller.clone();
     let server_handle = tokio::spawn(async move {
         let (sender, mut events_rx) = accept(&listener).await.unwrap();
         let mut agent = AbisAgent::new(agent_config(), controller_clone);
+        agent.set_bearer_transport(bts_bearer_for_agent);
         while let Some(event) = events_rx.recv().await {
             match event {
                 TransportEvent::Message(msg) => {

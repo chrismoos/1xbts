@@ -27,7 +27,6 @@ pub struct BscState {
     pub traffic_broadcast: broadcast::Sender<TrafficEvent>,
     pub hlr_repo: Arc<dyn HlrRepository>,
     pub smsc_repo: Arc<dyn SmscRepository>,
-    pub packet_endpoint: String,
     /// Stable node identifier for this BSC instance, used in HLR registrations
     /// and management events. Must be unique across all BSC instances.
     pub node_id: String,

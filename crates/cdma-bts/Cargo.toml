@@ -55,6 +55,7 @@ crossbeam-channel = "0.5"
 crossbeam-queue = "0.3"
 cdma-abis = { path = "../cdma-abis" }
 cdma-a8 = { path = "../cdma-a8" }
+cdma-a21 = { path = "../cdma-a21" }
 cdma-a9 = { path = "../cdma-a9" }
 cdma-an = { path = "../cdma-an" }
 cdma-events = { path = "../cdma-events" }

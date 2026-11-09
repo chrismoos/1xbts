@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cdma_ios::transport::{A1TransportEvent, A1TransportSender};
+use cdma_ios::transport::{A1Listener, A1Role, A1TransportEvent, A1TransportSender, A1pConfig};
 use cdma_ios::{EncodedA1Message, Message, MessageType};
 use cdma_msc::call_control::CallId;
 use cdma_msc::config::BaseStationConfig;
@@ -25,6 +25,32 @@ use tonic::{Request, Response, Status};
 const WAIT: Duration = Duration::from_secs(30);
 const COLLIDING_WIRE_ID: u64 = 7;
 const MSC_ALLOCATED_ID: u64 = 4242;
+const TEST_RTO_INITIAL_MS: u32 = 200;
+const TEST_RTO_MIN_MS: u32 = 200;
+const TEST_RTO_MAX_MS: u32 = 1_000;
+
+fn in_process_udp_port() -> u16 {
+    static PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *PORT.get_or_init(|| {
+        std::net::UdpSocket::bind("0.0.0.0:0")
+            .and_then(|socket| socket.local_addr())
+            .expect("a free UDP port")
+            .port()
+    })
+}
+
+fn in_process(mut config: A1pConfig) -> A1pConfig {
+    config.sctp.fallback_udp_encapsulation.local_port = in_process_udp_port();
+    config.sctp.fallback_udp_encapsulation.remote_port = in_process_udp_port();
+    config.sctp.rto_initial_ms = Some(TEST_RTO_INITIAL_MS);
+    config.sctp.rto_min_ms = Some(TEST_RTO_MIN_MS);
+    config.sctp.rto_max_ms = Some(TEST_RTO_MAX_MS);
+    config
+}
+
+fn msc_config() -> A1pConfig {
+    in_process(A1pConfig::for_role(A1Role::Msc))
+}
 
 struct FakeEnrollService {
     node_id: &'static str,
@@ -67,7 +93,12 @@ struct FakeNode {
 }
 
 async fn start_fake_node(node_id: &'static str, cell: u32, sid: u32) -> FakeNode {
-    let a1_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a1_listener = A1Listener::bind(
+        &["127.0.0.1:0".parse().unwrap()],
+        in_process(A1pConfig::for_role(A1Role::BaseStation)),
+        A1Role::BaseStation,
+    )
+    .expect("this test needs kernel SCTP");
     let a1_addr = a1_listener.local_addr().unwrap();
     let (links_tx, links) = mpsc::unbounded_channel();
     tokio::spawn(async move {
@@ -98,9 +129,48 @@ async fn start_fake_node(node_id: &'static str, cell: u32, sid: u32) -> FakeNode
     FakeNode { endpoint, links }
 }
 
-fn message_with_call_id(call_id: u64) -> EncodedA1Message {
-    EncodedA1Message::from_message(&Message::new(MessageType::PagingRequest, vec![1, 2, 3]))
-        .with_call_id(Some(call_id))
+fn origination(call_id: u64) -> EncodedA1Message {
+    let payload = cdma_ios::CompleteLayer3InformationMessage {
+        cell_identifier: cdma_ios::CellId { cell: 1, sector: 0 },
+        layer3_information: cdma_ios::Layer3Information(vec![0x05, 0x00, 0x08]),
+    }
+    .encode()
+    .unwrap();
+    EncodedA1Message::from_message_for_call(
+        &Message::new(MessageType::CompleteLayer3Information, payload),
+        Some(call_id),
+    )
+}
+
+fn clear_command(call_id: u64) -> EncodedA1Message {
+    let payload = cdma_ios::ClearCommandMessage {
+        cause: cdma_ios::Cause(0x09),
+        cause_layer3: None,
+    }
+    .encode()
+    .unwrap();
+    EncodedA1Message::from_message_for_call(
+        &Message::new(MessageType::ClearCommand, payload),
+        Some(call_id),
+    )
+}
+
+fn page(call_id: u64) -> EncodedA1Message {
+    let payload = cdma_ios::PagingRequestMessage {
+        mobile_identity_imsi: cdma_ios::MobileIdentity::Imsi("310009176936269".into()),
+        mobile_identity_meid: None,
+        tag: Some(cdma_ios::Tag(call_id as u32)),
+        cell_identifier_list: None,
+        slot_cycle_index: None,
+        service_option: None,
+        is2000_mobile_capabilities: None,
+    }
+    .encode()
+    .unwrap();
+    EncodedA1Message::from_message_for_call(
+        &Message::new(MessageType::PagingRequest, payload),
+        Some(call_id),
+    )
 }
 
 async fn next_event(nodes: &Arc<BaseStations>) -> A1Event {
@@ -127,10 +197,12 @@ async fn two_base_stations_enroll_route_and_detach_independently() {
         BaseStationConfig {
             management_endpoint: node_a.endpoint.clone(),
             id: None,
+            a1p: msc_config(),
         },
         BaseStationConfig {
             management_endpoint: node_b.endpoint.clone(),
             id: None,
+            a1p: msc_config(),
         },
     ]);
     nodes.spawn_attach_tasks();
@@ -171,30 +243,25 @@ async fn two_base_stations_enroll_route_and_detach_independently() {
         .expect("node b's cell is enrolled");
     assert_eq!(served.sid, 200);
 
-    // Both nodes use the same wire call id. The MSC must keep them apart.
-    link_a
-        .send(&message_with_call_id(COLLIDING_WIRE_ID))
-        .await
-        .unwrap();
+    // Each association numbers its connections from the same base, so both
+    // nodes' first calls arrive under the same wire id. The MSC must keep them
+    // apart.
+    link_a.send(&origination(COLLIDING_WIRE_ID)).await.unwrap();
     let (from_node, internal_a) = match next_event(&nodes).await {
         A1Event::Message { node, message } => (node, message.call_id().unwrap()),
         other => panic!("expected a message, got {other:?}"),
     };
     assert_eq!(from_node, id_a);
-    link_b
-        .send(&message_with_call_id(COLLIDING_WIRE_ID))
-        .await
-        .unwrap();
+    link_b.send(&origination(COLLIDING_WIRE_ID)).await.unwrap();
     let (from_node, internal_b) = match next_event(&nodes).await {
         A1Event::Message { node, message } => (node, message.call_id().unwrap()),
         other => panic!("expected a message, got {other:?}"),
     };
     assert_eq!(from_node, id_b);
     assert_ne!(internal_a, internal_b);
-    assert_eq!(internal_a.min(internal_b), COLLIDING_WIRE_ID);
 
-    // A call-scoped send comes out on the owning node with its wire id back.
-    nodes.send(message_with_call_id(internal_b)).await.unwrap();
+    // A call-scoped send comes out on the owning node's connection.
+    nodes.send(clear_command(internal_b)).await.unwrap();
     match tokio::time::timeout(WAIT, rx_b.recv()).await.unwrap() {
         Some(A1TransportEvent::Message(message)) => {
             assert_eq!(message.call_id(), Some(COLLIDING_WIRE_ID));
@@ -202,15 +269,13 @@ async fn two_base_stations_enroll_route_and_detach_independently() {
         other => panic!("expected node b to receive the send, got {other:?}"),
     }
 
-    // An MSC-allocated id bound to a node routes there unchanged.
+    // An MSC-allocated id bound to a node routes its page there.
     nodes.bind_call(CallId(MSC_ALLOCATED_ID), &id_a);
-    nodes
-        .send(message_with_call_id(MSC_ALLOCATED_ID))
-        .await
-        .unwrap();
+    nodes.send(page(MSC_ALLOCATED_ID)).await.unwrap();
     match tokio::time::timeout(WAIT, rx_a.recv()).await.unwrap() {
         Some(A1TransportEvent::Message(message)) => {
-            assert_eq!(message.call_id(), Some(MSC_ALLOCATED_ID));
+            assert_eq!(message.message_type(), MessageType::PagingRequest);
+            assert_eq!(message.call_id(), None, "a page is connectionless");
         }
         other => panic!("expected node a to receive the send, got {other:?}"),
     }
@@ -235,7 +300,7 @@ async fn two_base_stations_enroll_route_and_detach_independently() {
 
     assert!(nodes.is_attached(&id_b));
     assert!(nodes.node_for_call(CallId(internal_b)).is_some());
-    nodes.send(message_with_call_id(internal_b)).await.unwrap();
+    nodes.send(clear_command(internal_b)).await.unwrap();
     match tokio::time::timeout(WAIT, rx_b.recv()).await.unwrap() {
         Some(A1TransportEvent::Message(message)) => {
             assert_eq!(message.call_id(), Some(COLLIDING_WIRE_ID));

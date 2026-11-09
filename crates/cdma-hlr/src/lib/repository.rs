@@ -322,6 +322,23 @@ pub trait HlrRepository: Send + Sync {
         Err(CAVE_UNSUPPORTED.into())
     }
 
+    async fn reserve_cave_count_update(
+        &self,
+        _identity: &MobileIdentityKey,
+        _minimum_interval: std::time::Duration,
+        _confirmation_timeout: std::time::Duration,
+    ) -> Result<Option<Uuid>, tonic::Status> {
+        Err(tonic::Status::unimplemented(CAVE_UNSUPPORTED))
+    }
+
+    async fn confirm_cave_count_update(
+        &self,
+        _identity: &MobileIdentityKey,
+        _update_id: Uuid,
+    ) -> Result<u8, tonic::Status> {
+        Err(tonic::Status::unimplemented(CAVE_UNSUPPORTED))
+    }
+
     async fn increment_cave_count(&self, _identity: &MobileIdentityKey) -> Result<u8, String> {
         Err(CAVE_UNSUPPORTED.into())
     }
@@ -1711,6 +1728,46 @@ impl HlrRepository for GrpcHlrRepository {
             .await
             .map(|_| ())
             .map_err(|status| format!("HLR FinishCaveSsdUpdate: {status}"))
+    }
+
+    async fn reserve_cave_count_update(
+        &self,
+        identity: &MobileIdentityKey,
+        minimum_interval: std::time::Duration,
+        confirmation_timeout: std::time::Duration,
+    ) -> Result<Option<Uuid>, tonic::Status> {
+        let response = self
+            .client()
+            .reserve_cave_count_update(proto::ReserveCaveCountUpdateRequest {
+                identity: Some(identity_key_to_proto(identity)),
+                minimum_interval_secs: minimum_interval.as_secs(),
+                confirmation_timeout_secs: confirmation_timeout.as_secs(),
+            })
+            .await?
+            .into_inner();
+        response
+            .update_id
+            .map(|id| {
+                Uuid::parse_str(&id).map_err(|_| tonic::Status::internal("invalid COUNT update ID"))
+            })
+            .transpose()
+    }
+
+    async fn confirm_cave_count_update(
+        &self,
+        identity: &MobileIdentityKey,
+        update_id: Uuid,
+    ) -> Result<u8, tonic::Status> {
+        let response = self
+            .client()
+            .confirm_cave_count_update(proto::ConfirmCaveCountUpdateRequest {
+                identity: Some(identity_key_to_proto(identity)),
+                update_id: update_id.to_string(),
+            })
+            .await?
+            .into_inner();
+        u8::try_from(response.auth_count)
+            .map_err(|_| tonic::Status::internal("invalid COUNT response"))
     }
 
     async fn increment_cave_count(&self, identity: &MobileIdentityKey) -> Result<u8, String> {
@@ -3633,7 +3690,9 @@ impl HlrRepository for PostgresHlrRepository {
                 pending_randu = CASE WHEN $2 IS NULL THEN NULL ELSE pending_randu END,
                 pending_a_key = NULL,
                 pending_ssd_a = NULL,
-                pending_ssd_b = NULL
+                pending_ssd_b = NULL,
+                count_updated_at = NULL, count_pending_id = NULL, count_pending_base = NULL,
+                count_pending_until = NULL, count_retry_after = NULL, count_completed_id = NULL
             WHERE subscriber_identity_id = $1
             "#,
         )
@@ -3681,20 +3740,11 @@ impl HlrRepository for PostgresHlrRepository {
         let verdict = crate::auth::verify_global_challenge(&creds, challenge)?;
         if verdict.outcome.is_success()
             && !challenge.otasp_reauthentication
-            && let Some(reported) = crate::auth::resynced_count(&creds, challenge)
+            && let Some(reported) = challenge.count
         {
-            log::warn!(
-                "HLR: COUNT mismatch for {identity:?}: stored {}, mobile reported {reported}. Adopting the mobile's COUNT. Repeated mismatches can indicate a cloned mobile.",
-                creds.auth_count
-            );
-            sqlx::query(
-                "UPDATE subscriber_identities SET auth_count = $2 WHERE subscriber_identity_id = $1",
-            )
-            .bind(identity_id)
-            .bind(i16::from(reported))
-            .execute(&self.pool)
-            .await
-            .map_err(|e| format!("resync auth_count: {e}"))?;
+            crate::count_updates::reconcile(&self.pool, identity_id, reported)
+                .await
+                .map_err(|error| format!("COUNT reconciliation: {error}"))?;
         }
         self.record_cave_outcome(identity_id, verdict.outcome)
             .await?;
@@ -3811,12 +3861,37 @@ impl HlrRepository for PostgresHlrRepository {
         Ok(())
     }
 
+    async fn reserve_cave_count_update(
+        &self,
+        identity: &MobileIdentityKey,
+        minimum_interval: std::time::Duration,
+        confirmation_timeout: std::time::Duration,
+    ) -> Result<Option<Uuid>, tonic::Status> {
+        let id = resolve_identity_row_id(&self.pool, identity)
+            .await
+            .map_err(crate::service::map_repo_error)?
+            .ok_or_else(|| tonic::Status::not_found("subscriber identity not found"))?;
+        crate::count_updates::reserve(&self.pool, id, minimum_interval, confirmation_timeout).await
+    }
+
+    async fn confirm_cave_count_update(
+        &self,
+        identity: &MobileIdentityKey,
+        update_id: Uuid,
+    ) -> Result<u8, tonic::Status> {
+        let id = resolve_identity_row_id(&self.pool, identity)
+            .await
+            .map_err(crate::service::map_repo_error)?
+            .ok_or_else(|| tonic::Status::not_found("subscriber identity not found"))?;
+        crate::count_updates::confirm(&self.pool, id, update_id).await
+    }
+
     async fn increment_cave_count(&self, identity: &MobileIdentityKey) -> Result<u8, String> {
         let Some(identity_id) = resolve_identity_row_id(&self.pool, identity).await? else {
             return Err(format!("{VALIDATION_FAILED_PREFIX}identity not found"));
         };
         let (count,): (i16,) = sqlx::query_as(
-            "UPDATE subscriber_identities SET auth_count = (auth_count + 1) % $2 \
+            "UPDATE subscriber_identities SET auth_count = (auth_count + 1) % $2, count_updated_at = now() \
              WHERE subscriber_identity_id = $1 RETURNING auth_count",
         )
         .bind(identity_id)

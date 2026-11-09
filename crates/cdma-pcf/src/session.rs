@@ -523,6 +523,7 @@ mod tests {
             a8_traffic_id: setup.a8_traffic_id.clone(),
             cause: cdma_a9::CauseValue(0x13),
             pdsn_ip_address: None,
+            a9_indicators: None,
         }
     }
 

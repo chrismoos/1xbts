@@ -21,8 +21,6 @@ use crate::channels::ftch_rc3::TrafficFrameRc3;
 
 use super::{TrafficChannelWrapper, TrafficResourceService};
 
-const FLAG_SIGNALING_QUEUE: u8 = 0x01;
-
 /// Unpack packed bytes into individual bits (MSB first), padded/truncated to
 /// exactly `target_bits`.
 fn unpack_bytes_to_bits(packed: &[u8], target_bits: usize) -> Vec<u8> {
@@ -39,9 +37,6 @@ fn unpack_bytes_to_bits(packed: &[u8], target_bits: usize) -> Vec<u8> {
 
 /// Start the BTS-side bearer agent.
 ///
-/// The caller provides a pre-constructed [`BearerTransport`] (bound to the
-/// BTS bearer address, remote = BSC bearer address) and the channel that
-/// the RX pipeline pushes reverse bearer datagrams into.
 pub fn spawn_bts_bearer_agent(
     transport: Arc<BearerTransport>,
     controller: Arc<TrafficResourceService>,
@@ -60,7 +55,6 @@ pub fn spawn_bts_bearer_agent(
                 datagrams.len()
             );
             for datagram in datagrams {
-                let is_signaling = datagram.flags & FLAG_SIGNALING_QUEUE != 0;
                 let walsh_code = datagram.bearer_id as u8;
                 let frame = match TrafficFrame::decode(
                     datagram.channel_family,
@@ -73,6 +67,12 @@ pub fn spawn_bts_bearer_agent(
                         continue;
                     }
                 };
+                // Signaling frames take the signaling queue, which the TX
+                // path sends ahead of queued traffic.
+                let is_signaling = matches!(
+                    &frame,
+                    TrafficFrame::ForwardFchDcch(fch) if fch.is_blank_and_burst()
+                );
                 log::trace!(
                     "BTS bearer agent: delivering walsh={} signaling={} family={:?}",
                     walsh_code,

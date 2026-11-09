@@ -11,7 +11,9 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use cdma_a10::BearerTransportConfig;
 use cdma_a11::{A11SecurityConfig, A11TransportConfig};
-use cdma_packet::mobile_ip::{MobileIpAuthMode, MobileIpConfig, MobileIpSecurityAssociation};
+use cdma_packet::mobile_ip::{
+    MnAaaCredential, MobileIpAuthMode, MobileIpConfig, MobileIpSecurityAssociation,
+};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_PPP_SESSION_TIMEOUT_SECS: u64 = 30 * 60;
@@ -27,6 +29,7 @@ fn socket_addr(s: &str) -> SocketAddr {
     s.parse().expect("static socket address should parse")
 }
 
+// Between hosts, A11 uses UDP 699 (A.S0012-D §3.5) and GRE-in-UDP uses 4754.
 fn default_a10_bearer() -> BearerTransportConfig {
     BearerTransportConfig::udp_encapsulated_gre(
         socket_addr("127.0.0.1:17043"),
@@ -77,10 +80,28 @@ pub struct PacketMobileIpConfig {
     pub mn_ha_secret_base64: Option<String>,
     /// Accept MN-AAA credentials without an external AAA verification result.
     pub allow_unverified_mn_aaa: bool,
+    /// A listed NAI needs a valid RFC 3012 CHAP authenticator.
+    pub mn_aaa_subscribers: Vec<PacketMnAaaSubscriber>,
     /// Allow Simple IP fallback on an MN-HA SPI mismatch.
     pub mn_ha_fallback_to_simple_ip: bool,
     /// Optional CIDR for the home-address pool. Defaults to the packet `/24`.
     pub home_address_pool: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PacketMnAaaSubscriber {
+    pub nai: String,
+    pub secret: String,
+}
+
+impl std::fmt::Debug for PacketMnAaaSubscriber {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PacketMnAaaSubscriber")
+            .field("nai", &self.nai)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for PacketMobileIpConfig {
@@ -106,6 +127,7 @@ impl std::fmt::Debug for PacketMobileIpConfig {
                 &self.mn_ha_secret_base64.as_ref().map(|_| "<redacted>"),
             )
             .field("allow_unverified_mn_aaa", &self.allow_unverified_mn_aaa)
+            .field("mn_aaa_subscribers", &self.mn_aaa_subscribers)
             .field(
                 "mn_ha_fallback_to_simple_ip",
                 &self.mn_ha_fallback_to_simple_ip,
@@ -129,6 +151,7 @@ impl Default for PacketMobileIpConfig {
             mn_ha_spi: None,
             mn_ha_secret_base64: None,
             allow_unverified_mn_aaa: false,
+            mn_aaa_subscribers: Vec::new(),
             mn_ha_fallback_to_simple_ip: defaults.mn_ha_fallback_to_simple_ip,
             home_address_pool: None,
         }
@@ -166,6 +189,12 @@ impl PacketMobileIpConfig {
                 if self.allow_unverified_mn_aaa {
                     return Err("pdsn.packet.mobile_ip.allow_unverified_mn_aaa requires auth_mode = \"mn_ha\"".to_string());
                 }
+                if !self.mn_aaa_subscribers.is_empty() {
+                    return Err(
+                        "pdsn.packet.mobile_ip.mn_aaa_subscribers requires auth_mode = \"mn_ha\""
+                            .to_string(),
+                    );
+                }
             }
             PacketMobileIpAuthMode::MnHa => {
                 let spi = self.mn_ha_spi.ok_or(
@@ -178,6 +207,16 @@ impl PacketMobileIpConfig {
                 }
                 self.decode_mn_ha_secret()?;
             }
+        }
+        if let Some(subscriber) = self
+            .mn_aaa_subscribers
+            .iter()
+            .find(|subscriber| subscriber.nai.is_empty() || subscriber.secret.is_empty())
+        {
+            return Err(format!(
+                "pdsn.packet.mobile_ip.mn_aaa_subscribers entry {:?} needs a nai and a secret",
+                subscriber.nai
+            ));
         }
         if let Some(pool) = self.home_address_pool.as_deref() {
             let expected = format!(
@@ -224,6 +263,14 @@ impl PacketMobileIpConfig {
             },
             mn_ha_security,
             allow_unverified_mn_aaa: self.allow_unverified_mn_aaa,
+            mn_aaa_credentials: self
+                .mn_aaa_subscribers
+                .iter()
+                .map(|subscriber| MnAaaCredential {
+                    nai: subscriber.nai.clone(),
+                    secret: subscriber.secret.as_bytes().to_vec(),
+                })
+                .collect(),
             mn_ha_fallback_to_simple_ip: self.mn_ha_fallback_to_simple_ip,
         })
     }
@@ -547,8 +594,7 @@ mod tests {
                 "a10_bearer": { "mode": "raw_gre" },
                 "a11": {
                     "bind_addr": "127.0.0.1:6992",
-                    "peer_addr": "0.0.0.0:0",
-                    "framing": "bare"
+                    "peer_addr": "0.0.0.0:0"
                 },
                 "packet": { "transport": "fou_tcp", "fou_remote": "127.0.0.1:17012" }
             }"#,
@@ -557,14 +603,18 @@ mod tests {
             .expect("raw GRE A10 with unprivileged A11 should validate");
         assert!(cfg.a10_bearer.udp_bind_addr.is_none());
         assert_eq!(cfg.a11.bind_addr, "127.0.0.1:6992".parse().unwrap());
-        assert_eq!(cfg.a11.framing, cdma_a11::A11Framing::Bare);
     }
 
     #[test]
     fn invalid_a10_bearer_config_is_rejected() {
         let mut cfg = test_config();
         cfg.packet.transport = "fou_tcp".to_string();
-        cfg.a10_bearer.udp_bind_addr = None;
+        cfg.a10_bearer = BearerTransportConfig {
+            mode: cdma_a10::BearerTransportMode::UdpEncapsulatedGre,
+            udp_bind_addr: None,
+            udp_peer_addr: None,
+            max_gre_payload: None,
+        };
         assert!(cfg.validate().unwrap_err().contains("pdsn.a10_bearer"));
     }
 

@@ -30,6 +30,56 @@ pub enum SsdUpdatePolicy {
     EveryCall,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CountUpdatePolicy {
+    #[default]
+    Daily,
+    EveryCall,
+    Never,
+}
+
+impl<'de> Deserialize<'de> for CountUpdatePolicy {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Value {
+            Policy(String),
+            Legacy(bool),
+        }
+        match Value::deserialize(deserializer)? {
+            Value::Policy(value) => match value.as_str() {
+                "daily" => Ok(Self::Daily),
+                "every_call" => Ok(Self::EveryCall),
+                "never" => Ok(Self::Never),
+                _ => Err(serde::de::Error::custom(
+                    "COUNT policy must be daily, every_call, or never",
+                )),
+            },
+            Value::Legacy(true) => Ok(Self::EveryCall),
+            Value::Legacy(false) => Ok(Self::Never),
+        }
+    }
+}
+
+impl CountUpdatePolicy {
+    fn config_name(self) -> &'static str {
+        match self {
+            Self::Daily => "daily",
+            Self::EveryCall => "every_call",
+            Self::Never => "never",
+        }
+    }
+    fn minimum_interval(self) -> std::time::Duration {
+        const DAILY_INTERVAL_SECS: u64 = 24 * 60 * 60;
+        std::time::Duration::from_secs(if self == Self::Daily {
+            DAILY_INTERVAL_SECS
+        } else {
+            0
+        })
+    }
+}
+
 /// Voice privacy policy applied only when authenticated call keys are available.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -83,8 +133,8 @@ pub struct AuthenticationConfig {
     /// Challenges every authenticated call when enabled. SSD updates and privacy activation
     /// require a unique challenge even when this is disabled.
     pub unique_challenge_on_call: bool,
-    /// Parameter Update Order, which increments COUNT, on every authenticated call.
-    pub count_update_on_call: bool,
+    #[serde(alias = "count_update_on_call")]
+    pub count_update: CountUpdatePolicy,
     /// Time the MSC waits for each reply of a traffic-channel procedure.
     pub procedure_timeout_ms: u64,
 }
@@ -115,13 +165,13 @@ impl std::fmt::Display for AuthenticationConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "mode={} voice_privacy={} allow_unprovisioned={} ssd_update={} unique_challenge_on_call={} count_update_on_call={} procedure_timeout_ms={}",
+            "mode={} voice_privacy={} allow_unprovisioned={} ssd_update={} unique_challenge_on_call={} count_update={} procedure_timeout_ms={}",
             self.mode.config_name(),
             self.voice_privacy.config_name(),
             self.allow_unprovisioned,
             self.ssd_update.config_name(),
             self.unique_challenge_on_call,
-            self.count_update_on_call,
+            self.count_update.config_name(),
             self.procedure_timeout_ms,
         )
     }
@@ -135,7 +185,7 @@ impl Default for AuthenticationConfig {
             allow_unprovisioned: false,
             ssd_update: SsdUpdatePolicy::WhenNeeded,
             unique_challenge_on_call: true,
-            count_update_on_call: true,
+            count_update: CountUpdatePolicy::Daily,
             procedure_timeout_ms: DEFAULT_PROCEDURE_TIMEOUT_MS,
         }
     }
@@ -701,7 +751,7 @@ pub(crate) enum TrafficAwaiting {
     BaseStationChallenge,
     SsdUpdateResponse,
     AuthenticationResponse { randu: u32 },
-    ParameterUpdateConfirm,
+    ParameterUpdateConfirm { update_id: uuid::Uuid },
 }
 
 impl TrafficAwaiting {
@@ -713,7 +763,9 @@ impl TrafficAwaiting {
             Self::AuthenticationResponse { .. } => {
                 events_proto::AuthenticationProcedure::UniqueChallenge
             }
-            Self::ParameterUpdateConfirm => events_proto::AuthenticationProcedure::CountUpdate,
+            Self::ParameterUpdateConfirm { .. } => {
+                events_proto::AuthenticationProcedure::CountUpdate
+            }
         }
     }
 }
@@ -773,7 +825,7 @@ impl TrafficAuthentication {
         if ssd_update || failed || config.unique_challenge_on_call {
             pending.push_back(TrafficProcedure::UniqueChallenge);
         }
-        if config.count_update_on_call {
+        if config.count_update != CountUpdatePolicy::Never {
             pending.push_back(TrafficProcedure::CountUpdate);
         }
         if pending.is_empty() || context.global_result == AuthenticationResult::NotProvisioned {
@@ -872,7 +924,43 @@ impl TrafficAuthentication {
                 )
             }
             TrafficProcedure::CountUpdate => {
-                self.arm(TrafficAwaiting::ParameterUpdateConfirm, config);
+                const RECONCILIATION_MARGIN_SECS: u64 = 30;
+                let confirmation_timeout = std::time::Duration::from_secs(
+                    config
+                        .procedure_timeout_ms
+                        .div_ceil(1000)
+                        .saturating_add(RECONCILIATION_MARGIN_SECS),
+                );
+                let update_id = match hlr
+                    .reserve_cave_count_update(
+                        &self.context.identity,
+                        config.count_update.minimum_interval(),
+                        confirmation_timeout,
+                    )
+                    .await
+                {
+                    Ok(Some(id)) => id,
+                    Ok(None) => {
+                        info!(
+                            "MSC: COUNT update deferred for IMSI {} by {} policy or pending update",
+                            self.context.imsi,
+                            config.count_update.config_name()
+                        );
+                        return TrafficAction::Done;
+                    }
+                    Err(error) => {
+                        warn!("MSC: cannot reserve COUNT update: {error}");
+                        return TrafficAction::Report {
+                            procedure: events_proto::AuthenticationProcedure::CountUpdate,
+                            result: events_proto::AuthenticationResult::HlrError,
+                            clear_call: false,
+                        };
+                    }
+                };
+                self.arm(
+                    TrafficAwaiting::ParameterUpdateConfirm { update_id },
+                    config,
+                );
                 (
                     cdma_ios::MessageType::ParameterUpdateRequest,
                     cdma_ios::ParameterUpdateRequestMessage.encode(),
@@ -1045,12 +1133,15 @@ impl TrafficAuthentication {
         &mut self,
         hlr: &dyn HlrRepository,
     ) -> TrafficAction {
-        if self.awaiting != Some(TrafficAwaiting::ParameterUpdateConfirm) {
+        let Some(TrafficAwaiting::ParameterUpdateConfirm { update_id }) = self.awaiting else {
             warn!("MSC: unexpected Parameter Update Confirm, ignoring");
             return TrafficAction::Done;
-        }
+        };
         self.awaiting = None;
-        let result = match hlr.increment_cave_count(&self.context.identity).await {
+        let result = match hlr
+            .confirm_cave_count_update(&self.context.identity, update_id)
+            .await
+        {
             Ok(count) => {
                 info!("MSC: COUNT for IMSI {} is now {count}", self.context.imsi);
                 events_proto::AuthenticationResult::Success
@@ -1248,5 +1339,49 @@ mod voice_privacy_tests {
                 serde_json::from_value(serde_json::json!({"voice_privacy": policy})).unwrap();
             assert_eq!(serde_json::to_value(config.voice_privacy).unwrap(), policy);
         }
+    }
+}
+
+#[cfg(test)]
+mod count_policy_tests {
+    use super::*;
+
+    #[test]
+    fn count_policy_defaults_and_legacy_config() {
+        let config: AuthenticationConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.count_update, CountUpdatePolicy::Daily);
+        assert_eq!(config.count_update.minimum_interval().as_secs(), 86_400);
+        for (json, expected) in [
+            (r#"{"count_update":"daily"}"#, CountUpdatePolicy::Daily),
+            (
+                r#"{"count_update":"every_call"}"#,
+                CountUpdatePolicy::EveryCall,
+            ),
+            (r#"{"count_update":"never"}"#, CountUpdatePolicy::Never),
+            (
+                r#"{"count_update_on_call":true}"#,
+                CountUpdatePolicy::EveryCall,
+            ),
+            (
+                r#"{"count_update_on_call":false}"#,
+                CountUpdatePolicy::Never,
+            ),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<AuthenticationConfig>(json)
+                    .unwrap()
+                    .count_update,
+                expected
+            );
+        }
+        assert!(
+            serde_json::from_str::<AuthenticationConfig>(r#"{"count_update":"hourly"}"#).is_err()
+        );
+        assert!(
+            serde_json::from_str::<AuthenticationConfig>(
+                r#"{"count_update":"daily","count_update_on_call":false}"#
+            )
+            .is_err()
+        );
     }
 }

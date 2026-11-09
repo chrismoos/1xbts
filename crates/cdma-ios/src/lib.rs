@@ -8,6 +8,8 @@ pub mod a1_message;
 pub mod femto_interface_msg;
 /// A1 call-control procedures (origination, paging, assignment, release).
 pub mod procedures;
+
+pub mod sua;
 /// Well-known A1 port and address constants.
 pub mod transport;
 /// Strongly-typed A1 information element structs.
@@ -190,18 +192,17 @@ pub use typed::{
     Tag,
     UserZoneId,
     UserZoneUpdateMessage,
+    a1_frame_message_type,
     split_a1_frame,
 };
 pub use voice_bearer::{
-    BearerEvent, BearerPayloadTypes, DtmfBearerEvent, RtpSendState, VoiceBearerFormat,
-    VoiceBearerFrame, VoiceBearerManager, VoiceBearerPayloadType,
+    BearerEvent, BearerPayloadTypes, DtmfBearerEvent, EvrcFrameType, RtpSendState,
+    VoiceBearerFormat, VoiceBearerFrame, VoiceBearerManager, VoiceBearerPayloadType,
 };
 
 /// Supported A1 message types used for dispatch.
 ///
-/// Variants map to spec BSMAP and DTAP message codes (A.S0001). The u8
-/// discriminants are project-local routing tags written into the A1 envelope
-/// prefix byte by `encode()` — they are not BSMAP/DTAP message type codes.
+/// The discriminants never appear on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MessageType {
@@ -321,21 +322,14 @@ impl Message {
     }
 }
 
-/// Encodes an A1 message as `[envelope_type_byte | payload]`.
 #[must_use = "encoding produces a new buffer; the result should not be discarded"]
 pub fn encode(message: &Message) -> Vec<u8> {
-    let mut out = vec![message.message_type as u8];
-    out.extend_from_slice(&message.payload);
-    out
+    message.payload.clone()
 }
 
-/// Decodes an A1 message envelope from bytes.
 pub fn decode(input: &[u8]) -> Result<Message> {
-    let Some((&message_type, rest)) = input.split_first() else {
+    if input.is_empty() {
         return Err(Error::EmptyMessage);
-    };
-    Ok(Message::new(
-        MessageType::from_u8(message_type)?,
-        rest.to_vec(),
-    ))
+    }
+    Ok(Message::new(a1_frame_message_type(input)?, input.to_vec()))
 }

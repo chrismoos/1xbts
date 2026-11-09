@@ -1,0 +1,25 @@
+[package]
+name = "usrsctp-sys"
+version = "0.1.0"
+edition = "2024"
+# The bindings are Apache-2.0. The vendored usrsctp sources they build are
+# BSD-3-Clause (external/usrsctp/LICENSE.md).
+license = "Apache-2.0 AND BSD-3-Clause"
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Bindings to the vendored usrsctp userspace SCTP stack"
+links = "usrsctp"
+build = "build.rs"
+
+[lib]
+doctest = false
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+cc = "1"
+
+[lints]
+workspace = true

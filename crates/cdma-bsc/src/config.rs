@@ -268,18 +268,11 @@ impl Default for BscAbisTimers {
 /// Default BTS OAM gRPC endpoint for a single-host run.
 pub const DEFAULT_BTS_OAM_ENDPOINT: &str = "http://127.0.0.1:17024";
 /// Default MSC A1 signaling address.
-pub const DEFAULT_A1_BIND_ADDR: &str = "127.0.0.1:17013";
+pub const DEFAULT_A1_BIND_ADDR: &str = "127.0.0.1:14001";
 /// Default HLR gRPC endpoint.
 pub const DEFAULT_HLR_ENDPOINT: &str = "http://127.0.0.1:17019";
 /// Default SMSC gRPC endpoint.
 pub const DEFAULT_SMSC_ENDPOINT: &str = "http://127.0.0.1:17020";
-/// Default packet gRPC endpoint the packet-data path drives sessions through.
-pub const DEFAULT_PACKET_ENDPOINT: &str = "http://127.0.0.1:17021";
-
-fn default_packet_endpoint() -> String {
-    DEFAULT_PACKET_ENDPOINT.to_string()
-}
-
 fn default_bts_oam_endpoint() -> String {
     DEFAULT_BTS_OAM_ENDPOINT.to_string()
 }
@@ -306,10 +299,7 @@ fn default_bts_bearer_bind_addr() -> SocketAddr {
 }
 
 fn default_bts_bearer_remote_addr() -> SocketAddr {
-    SocketAddr::new(
-        std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
-        cdma_abis::transport::ABIS_BTS_BEARER_PORT,
-    )
+    SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
 }
 
 fn default_bts_abis_addr() -> SocketAddr {
@@ -344,7 +334,7 @@ pub struct BtsPeerConfig {
     /// Default `127.0.0.1:17022`.
     #[serde(default = "default_bts_bearer_bind_addr")]
     pub bearer_bind_addr: SocketAddr,
-    /// Remote BTS Abis bearer address. Default `127.0.0.1:17014`.
+    /// The port is not used.
     #[serde(default = "default_bts_bearer_remote_addr")]
     pub bearer_remote_addr: SocketAddr,
 }
@@ -397,15 +387,14 @@ pub struct BscNodeConfig {
     /// it from enrollment and dials in.
     #[serde(default = "default_a1_bind_addr")]
     pub a1_bind_addr: SocketAddr,
+    #[serde(default)]
+    pub a1p: cdma_ios::transport::A1pConfig,
     /// HLR gRPC endpoint.
     #[serde(default = "default_hlr_endpoint")]
     pub hlr_endpoint: String,
     /// SMSC gRPC endpoint.
     #[serde(default = "default_smsc_endpoint")]
     pub smsc_endpoint: String,
-    /// Packet gRPC endpoint the packet-data path drives sessions through.
-    #[serde(default = "default_packet_endpoint")]
-    pub packet_endpoint: String,
     pub events_endpoint: Option<String>,
     /// Local IP that voice bearer UDP sockets bind to.
     /// Defaults to 127.0.0.1. Set to the host's network-facing IP when the
@@ -417,6 +406,15 @@ pub struct BscNodeConfig {
     /// across all BSC instances. Defaults to "bsc".
     #[serde(default = "default_node_id")]
     pub node_id: String,
+    /// Omit to disable A21.
+    #[serde(default = "default_a21")]
+    pub a21: Option<crate::bsc::hrpd_coord::A21Config>,
+    #[serde(default)]
+    pub packet_a9: crate::a9_edge::PacketA9Config,
+}
+
+fn default_a21() -> Option<crate::bsc::hrpd_coord::A21Config> {
+    Some(crate::bsc::hrpd_coord::A21Config::default())
 }
 
 const DEFAULT_EVENTS_ENDPOINT: &str = "http://127.0.0.1:17023";
@@ -439,12 +437,14 @@ impl Default for BscNodeConfig {
             abis_timers: BscAbisTimers::default(),
             bts_peers: default_bts_peers(),
             a1_bind_addr: default_a1_bind_addr(),
+            a1p: cdma_ios::transport::A1pConfig::default(),
             hlr_endpoint: default_hlr_endpoint(),
             smsc_endpoint: default_smsc_endpoint(),
-            packet_endpoint: default_packet_endpoint(),
             events_endpoint: Some(DEFAULT_EVENTS_ENDPOINT.to_string()),
             voice_bearer_bind_ip: default_voice_bearer_bind_ip(),
             node_id: default_node_id(),
+            a21: default_a21(),
+            packet_a9: Default::default(),
         }
     }
 }
@@ -487,7 +487,7 @@ fn warn_on_removed_keys(merged: &serde_json::Value) {
             "paging_retry",
             "the BTS owns it and supplies it at enrollment; move any tuned value to `bts.json`",
         ),
-        ("an_a21_addr", "no element serves A21, remove the key"),
+        ("an_a21_addr", "set `a21.an_addr` instead"),
         (
             "msc_a1_addr",
             "the MSC now dials this BSC. Set `a1_bind_addr` to the address it should accept the MSC on",

@@ -34,10 +34,6 @@ pub enum Error {
         context: &'static str,
         value: u32,
     },
-    PayloadMessageTypeMismatch {
-        header: MessageType,
-        payload: MessageType,
-    },
     DuplicateSession,
     DuplicateTrafficId(u32),
     UnknownSession,
@@ -78,7 +74,8 @@ pub use session::{
     VersionInfoRequestState,
 };
 pub use transport::{
-    HEADER_LEN, TransportMetadata, UdpSignalingDatagram, UdpSignalingEndpoint, VERSION,
+    A9_SIGNALING_PORT, A9Transport, DelimitedReader, SignalingEndpoint, SignalingMessage,
+    TCP_DELIMITER_LEN, TCP_DELIMITER_VERSION, delimit,
 };
 pub use typed::{
     A9Indicators, AddsUserPart, AlConnectedAckMessage, AlConnectedMessage,
@@ -473,6 +470,7 @@ fn validate_allowed(message_type: MessageType, element_id: ElementId) -> Result<
             A8TrafficId,
             Cause,
             PdsnIpAddress,
+            A9Indicators,
         ],
         MessageType::DisconnectA8 | MessageType::ReleaseA8 => &[
             CallConnectionReference,
@@ -619,6 +617,7 @@ fn validate_element_order(
             (MessageType::BsServiceRequest, ElementId::DataCount) => 9,
             (MessageType::ConnectA8 | MessageType::AlConnected, ElementId::PdsnIpAddress) => 9,
             (MessageType::SetupA8, ElementId::UserZoneId) => 10,
+            (MessageType::ConnectA8, ElementId::A9Indicators) => 10,
             (
                 MessageType::VersionInfo | MessageType::VersionInfoAck,
                 ElementId::SoftwareVersion,

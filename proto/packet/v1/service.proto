@@ -1,14 +1,8 @@
 syntax = "proto3";
 package packet.v1;
 
-// Packet data service used by the PCF/PDSN edge to manage RLP/PPP/IP sessions.
+// PDSN packet session status and trace capture.
 service PacketService {
-  // Opens or replaces packet session state for one mobile data call.
-  rpc OpenSession(OpenSessionRequest) returns (OpenSessionResponse);
-  // Closes one packet session and releases associated transport resources.
-  rpc CloseSession(CloseSessionRequest) returns (CloseSessionResponse);
-  // Exchanges reverse and forward RLP frame payloads for a packet session.
-  rpc StreamSession(stream SessionFrame) returns (stream SessionFrame);
   // Returns detailed RLP/PPP/IP state for one packet session.
   rpc GetSessionStatus(GetSessionStatusRequest) returns (GetSessionStatusResponse);
   // Lists known packet sessions.
@@ -19,10 +13,6 @@ service PacketService {
   rpc GetSessionByIp(GetSessionByIpRequest) returns (GetSessionByIpResponse);
   // Enables or disables per-session packet trace capture.
   rpc SetSessionCapture(SetSessionCaptureRequest) returns (SetSessionCaptureResponse);
-  // Enables or disables F-SCH downlink frame generation on a running session.
-  // Set active=true after an F-SCH allocation and active=false during
-  // teardown / SCH release.
-  rpc SetSchActive(SetSchActiveRequest) returns (SetSchActiveResponse);
 }
 
 // Radio access technology for a packet session.
@@ -38,62 +28,6 @@ enum MnIdSource {
   MN_ID_SOURCE_A11 = 1;
   MN_ID_SOURCE_DERIVED_HARDWARE = 2;
 }
-
-// One RLP traffic frame moving between the radio stack and packet engine.
-message SessionFrame {
-  // Packet session identifier.
-  string session_id = 1;
-  // Bit vector encoded as one byte per bit, value 0 or 1.
-  bytes bits = 2;
-  // Number of valid bits in `bits`.
-  uint32 num_bits = 3;
-  // CDMA frame rate represented as payload bits per second.
-  uint32 rate_bps = 4;
-}
-
-// Opens packet session state for one mobile packet-data call.
-message OpenSessionRequest {
-  // Packet session identifier allocated by call setup.
-  string session_id = 1;
-  // CDMA service option, for example SO33 for high-rate packet data.
-  uint32 service_option = 2;
-  // Mobile ESN when available.
-  uint32 esn = 3;
-  // Full mobile IMSI when available.
-  string imsi = 4;
-  // Display/debug mobile address.
-  string mobile_address = 5;
-  // HLR subscriber UUID when resolved.
-  string subscriber_id = 6;
-  // Subscriber phone number when resolved.
-  string phone_number = 7;
-  // Assigned forward traffic-channel Walsh code.
-  uint32 traffic_walsh_code = 8;
-  // Mobile MEID when available as subscriber/equipment metadata.
-  string meid = 9;
-  // HRPD A11 MN ID used for bearer registration. This may be an IMSI-format
-  // value derived for A11 and must not be displayed as a subscriber IMSI.
-  string mn_id = 10;
-  // Origin of mn_id.
-  MnIdSource mn_id_source = 11;
-  // Authoritative subscriber IMSI when resolved by HLR/A12/roaming data.
-  string subscriber_imsi = 12;
-}
-
-// Response returned after packet session state is opened.
-message OpenSessionResponse {
-  // Packet session identifier that was opened.
-  string session_id = 1;
-}
-
-// Closes packet session state and transport resources.
-message CloseSessionRequest {
-  // Packet session identifier to close.
-  string session_id = 1;
-}
-
-// Empty response for a successful session close.
-message CloseSessionResponse {}
 
 // Selects one packet session for status lookup.
 message GetSessionStatusRequest {
@@ -141,20 +75,6 @@ message SetSessionCaptureResponse {
   // Updated session detail.
   PacketSessionDetail session = 1;
 }
-
-// Toggles F-SCH downlink frame generation on one packet session.
-message SetSchActiveRequest {
-  // Packet session identifier.
-  string session_id = 1;
-  // True to enable RLP3 SCH frame generation, false to disable.
-  bool active = 2;
-  // RC3 F-SCH rate in bps. Omitted/zero defaults to 19200 for compatibility.
-  uint32 rate_bps = 3;
-}
-
-// Empty response for a successful SCH-active toggle. The error case is
-// surfaced via gRPC status (NotFound when session_id is unknown, etc.).
-message SetSchActiveResponse {}
 
 // Summary state for a packet data session.
 message PacketSessionInfo {
@@ -209,6 +129,9 @@ message PacketSessionInfo {
   optional uint32 pcf_session_id = 36;
   // MN Session Reference ID from the same extension.
   optional uint32 mn_session_reference_id = 37;
+  // NAI from the mobile's Mobile IP Registration Request (MN-NAI extension,
+  // RFC 2794). Empty when the mobile sent none.
+  string nai = 38;
 }
 
 // One trace event emitted by PPP, RLP, IP transport, or capture code.

@@ -53,7 +53,6 @@ impl TxRxAnchor {
 }
 
 pub(super) const HARDWARE_START_LEAD_NS: u64 = 100_000_000;
-const LOOKAHEAD_FINAL_SPIN_NS: u64 = 20_000;
 /// Adaptive sleep margin bounds. The cap stays well under the post-release
 /// underrun cushion (`max_tx_lookahead_ms` minus gen+flush time).
 const PACER_MIN_MARGIN_NS: u64 = 50_000;
@@ -185,9 +184,8 @@ impl LookaheadPacer {
                 let sleep_start = Instant::now();
                 thread::sleep(Duration::from_nanos(sleep_ns));
                 self.adapt_after_sleep(sleep_ns, sleep_start.elapsed().as_nanos() as u64);
-            } else if wait_ns > LOOKAHEAD_FINAL_SPIN_NS {
-                thread::yield_now();
             } else {
+                // Never yield here. macOS drops a yielding thread to priority 0 until it blocks.
                 std::hint::spin_loop();
             }
         }

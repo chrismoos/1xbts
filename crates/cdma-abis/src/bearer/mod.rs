@@ -3,8 +3,7 @@
 use crate::control::MessageType;
 use crate::{Error, Result};
 
-/// Supported bearer channel families carried over the Abis UDP wrapper.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ChannelFamily {
     Fch,
     Sch,
@@ -361,6 +360,11 @@ impl TrafficFrame {
         }
     }
 
+    pub fn decode_message(input: &[u8]) -> Result<Self> {
+        let (family, direction) = frame_kind(input)?;
+        Self::decode(family, direction, input)
+    }
+
     /// Decodes a bearer frame for the given family and direction.
     pub fn decode(family: ChannelFamily, direction: Direction, input: &[u8]) -> Result<Self> {
         match (family, direction) {
@@ -555,6 +559,55 @@ impl ReverseFchDcchFrame {
     }
 }
 
+pub fn frame_kind(input: &[u8]) -> Result<(ChannelFamily, Direction)> {
+    let Some(&octet) = input.first() else {
+        return Err(Error::Truncated {
+            context: "Abis traffic frame",
+            needed: 1,
+            actual: 0,
+        });
+    };
+    match MessageType::from_u8(octet)? {
+        MessageType::FchForward => Ok((ChannelFamily::Fch, Direction::Forward)),
+        MessageType::FchReverse => Ok((ChannelFamily::Fch, Direction::Reverse)),
+        MessageType::DcchForward => Ok((ChannelFamily::Dcch, Direction::Forward)),
+        MessageType::DcchReverse => Ok((ChannelFamily::Dcch, Direction::Reverse)),
+        MessageType::SchForward => Ok((ChannelFamily::Sch, Direction::Forward)),
+        MessageType::SchReverse => Ok((ChannelFamily::Sch, Direction::Reverse)),
+        _ => Err(Error::ReservedValue {
+            context: "Abis traffic frame message type",
+            value: octet,
+        }),
+    }
+}
+
+/// Blank-and-burst MuxPDU headers. MuxPDU Type 1 (Rate Set 1) is MM=1, TT=0,
+/// TM=11 (C.S0003-E Table 2-29). MuxPDU Type 2 (Rate Set 2) is MM=1 and Frame
+/// Mode 0011.
+const RATE_SET_1_BLANK_AND_BURST_MASK: u8 = 0xf0;
+const RATE_SET_1_BLANK_AND_BURST: u8 = 0b1011_0000;
+const RATE_SET_2_BLANK_AND_BURST_MASK: u8 = 0xf8;
+const RATE_SET_2_BLANK_AND_BURST: u8 = 0b1001_1000;
+
+impl ForwardFchDcchFrame {
+    pub fn is_blank_and_burst(&self) -> bool {
+        let Some(&first) = self.forward_link_information.first() else {
+            return false;
+        };
+        match self.frame_content {
+            FrameContent::FchRc1_9600 | FrameContent::FchRc3_9600 | FrameContent::DcchRc3_9600 => {
+                first & RATE_SET_1_BLANK_AND_BURST_MASK == RATE_SET_1_BLANK_AND_BURST
+            }
+            FrameContent::FchRc2_14400
+            | FrameContent::FchRc5_14400
+            | FrameContent::DcchRc5_14400 => {
+                first & RATE_SET_2_BLANK_AND_BURST_MASK == RATE_SET_2_BLANK_AND_BURST
+            }
+            _ => false,
+        }
+    }
+}
+
 fn forward_message_type(channel_family: ChannelFamily) -> MessageType {
     match channel_family {
         ChannelFamily::Fch => MessageType::FchForward,
@@ -571,7 +624,7 @@ fn reverse_message_type(channel_family: ChannelFamily) -> MessageType {
     }
 }
 
-/// Forward-link SCH bearer frame payload.
+/// A3-IS-2000 SCH Forward (A.S0015-D §3.1.16).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardSchFrame {
     pub fpc_slc: u8,
@@ -587,6 +640,7 @@ impl ForwardSchFrame {
     #[must_use = "encoding produces a new buffer; the result should not be discarded"]
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut out = vec![
+            MessageType::SchForward.value(),
             (self.fpc_slc << 4) | (self.fsn & 0x0f),
             self.fpc_gr,
             self.frame_content.value(),
@@ -598,28 +652,34 @@ impl ForwardSchFrame {
 
     /// Decodes a forward SCH frame payload.
     pub fn decode(input: &[u8]) -> Result<Self> {
-        if input.len() < 5 {
+        if input.len() < 6 {
             return Err(Error::Truncated {
                 context: "forward SCH frame",
-                needed: 5,
+                needed: 6,
                 actual: input.len(),
             });
         }
+        if input[0] != MessageType::SchForward.value() {
+            return Err(Error::InvalidValue {
+                context: "forward SCH message type",
+                reason: "message type must be A3-IS-2000 SCH Forward",
+            });
+        }
         Ok(Self {
-            fpc_slc: input[0] >> 4,
-            fsn: input[0] & 0x0f,
-            fpc_gr: input[1],
-            frame_content: FrameContent::from_u8(input[2]).ok_or(Error::ReservedValue {
+            fpc_slc: input[1] >> 4,
+            fsn: input[1] & 0x0f,
+            fpc_gr: input[2],
+            frame_content: FrameContent::from_u8(input[3]).ok_or(Error::ReservedValue {
                 context: "forward SCH frame content",
-                value: input[2],
+                value: input[3],
             })?,
-            forward_link_information: input[3..input.len() - 2].to_vec(),
+            forward_link_information: input[4..input.len() - 2].to_vec(),
             message_crc: u16::from_be_bytes([input[input.len() - 2], input[input.len() - 1]]),
         })
     }
 }
 
-/// Reverse-link SCH bearer frame payload.
+/// A3-IS-2000 SCH Reverse (A.S0015-D §3.1.17).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReverseSchFrame {
     pub soft_handoff_leg: u8,
@@ -638,6 +698,7 @@ impl ReverseSchFrame {
     #[must_use = "encoding produces a new buffer; the result should not be discarded"]
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut out = vec![
+            MessageType::SchReverse.value(),
             (self.soft_handoff_leg << 4) | (self.fsn & 0x0f),
             ((self.fqi as u8) << 7) | (self.reverse_link_quality & 0x7f),
             ((self.scaling & 0x03) << 6) | (self.packet_arrival_time_error & 0x3f),
@@ -650,25 +711,31 @@ impl ReverseSchFrame {
 
     /// Decodes a reverse SCH frame payload.
     pub fn decode(input: &[u8]) -> Result<Self> {
-        if input.len() < 6 {
+        if input.len() < 7 {
             return Err(Error::Truncated {
                 context: "reverse SCH frame",
-                needed: 6,
+                needed: 7,
                 actual: input.len(),
             });
         }
+        if input[0] != MessageType::SchReverse.value() {
+            return Err(Error::InvalidValue {
+                context: "reverse SCH message type",
+                reason: "message type must be A3-IS-2000 SCH Reverse",
+            });
+        }
         Ok(Self {
-            soft_handoff_leg: input[0] >> 4,
-            fsn: input[0] & 0x0f,
-            fqi: input[1] & 0x80 != 0,
-            reverse_link_quality: input[1] & 0x7f,
-            scaling: input[2] >> 6,
-            packet_arrival_time_error: input[2] & 0x3f,
-            frame_content: FrameContent::from_u8(input[3]).ok_or(Error::ReservedValue {
+            soft_handoff_leg: input[1] >> 4,
+            fsn: input[1] & 0x0f,
+            fqi: input[2] & 0x80 != 0,
+            reverse_link_quality: input[2] & 0x7f,
+            scaling: input[3] >> 6,
+            packet_arrival_time_error: input[3] & 0x3f,
+            frame_content: FrameContent::from_u8(input[4]).ok_or(Error::ReservedValue {
                 context: "reverse SCH frame content",
-                value: input[3],
+                value: input[4],
             })?,
-            reverse_link_information: input[4..input.len() - 2].to_vec(),
+            reverse_link_information: input[5..input.len() - 2].to_vec(),
             message_crc: u16::from_be_bytes([input[input.len() - 2], input[input.len() - 1]]),
         })
     }

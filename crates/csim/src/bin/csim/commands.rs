@@ -808,6 +808,8 @@ pub fn apdulog(args: &CardArgs, clear: bool) -> Result<ExitCode> {
 pub fn platform_info(args: &CardArgs) -> Result<ExitCode> {
     const MIN_LEN: usize = 26;
     const WITH_BUILD_STAGE: usize = 29;
+    const WITH_CAVE_STEP: usize = 32;
+    const WITH_IP_STEP: usize = 35;
     const NO_CHECKSUM: u16 = 0xFFFF;
     let mut card = connect(args, true, false, false)?;
     let d = card.platform_info()?;
@@ -869,6 +871,77 @@ pub fn platform_info(args: &CardArgs) -> Result<ExitCode> {
                 be(27)
             ),
         }
+    }
+    if d.len() >= WITH_CAVE_STEP {
+        let exception = match d[29] {
+            0 => "none",
+            1 => "SystemException",
+            2 => "TransactionException",
+            _ => "other CardRuntimeException",
+        };
+        let step = be(30);
+        let steps = [
+            "before constructor",
+            "state RAM",
+            "A-key",
+            "SSD_A",
+            "SSD_B",
+            "SSD_A candidate",
+            "SSD_B candidate",
+            "256-byte lookup table",
+            "lookup table low copy",
+            "lookup table high copy",
+            "LFSR RAM",
+            "register RAM",
+            "shuffle RAM",
+            "ESN RAM",
+            "offset RAM",
+            "key RAM",
+            "VPM RAM",
+        ];
+        let label = steps.get(usize::from(step)).unwrap_or(&"unknown");
+        println!("CAVE build diagnostic:     {exception}, step {step} ({label})");
+    }
+    if d.len() >= WITH_IP_STEP {
+        let exception = match d[32] {
+            0 => "none",
+            1 => "SystemException",
+            2 => "TransactionException",
+            _ => "other CardRuntimeException",
+        };
+        let step = be(33);
+        let steps = [
+            "before constructor",
+            "secret pool",
+            "secret lengths",
+            "MD5 provider",
+            "state RAM",
+        ];
+        let label = steps.get(usize::from(step)).unwrap_or(&"unknown");
+        println!("IP build diagnostic:       {exception}, step {step} ({label})");
+    }
+    const WITH_RNG_DIAGNOSTIC: usize = 39;
+    const RNG_STEP: usize = 35;
+    const RNG_KIND: usize = 36;
+    const RNG_REASON: usize = 37;
+    if d.len() >= WITH_RNG_DIAGNOSTIC {
+        let step = match d[RNG_STEP] {
+            0 => "no failure",
+            1 => "provider creation",
+            2 => "generation",
+            _ => "unknown",
+        };
+        let kind = match d[RNG_KIND] {
+            0 => "none",
+            1 => "SystemException",
+            2 => "CryptoException",
+            3 => "SecurityException",
+            _ => "RuntimeException",
+        };
+        println!(
+            "RNG diagnostic:           {step}, {kind}, reason {:04X}",
+            be(RNG_REASON)
+        );
     }
     Ok(ExitCode::SUCCESS)
 }

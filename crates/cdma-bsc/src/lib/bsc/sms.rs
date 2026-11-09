@@ -715,33 +715,6 @@ impl Bsc {
             warn!("MSC SMS: cannot deliver — mobile has no pageable address");
             return;
         };
-        // If the target AT is HRPD-attached per the A21 identity cache, divert
-        // this SMS into an A21 CrossPageRequest and skip the 1x F-PCH page
-        // entirely. The AN will deliver it as an HRPD DataReadyMessage /
-        // Control Channel page on its own air interface.
-        if let Some(coord) = self.hrpd_coord.as_ref() {
-            let imsi_opt = self
-                .mobiles
-                .get(&target_addr)
-                .and_then(|ms| ms.imsi.clone());
-            if let Some(imsi) = imsi_opt {
-                if coord.is_hrpd_attached(&imsi) {
-                    // Forward the SMS text as the cross-page payload; the AN
-                    // wraps it as a DataReadyMessage / SMS delivery on HRPD.
-                    let payload = sms_req.text.as_bytes().to_vec();
-                    let ok = coord.emit_cross_page(&imsi, cdma_a21::PagingSource::OneX, payload);
-                    if ok {
-                        info!(
-                            "BSC: target IMSI {imsi} HRPD-attached — diverted SMS via A21 CrossPageRequest"
-                        );
-                        return;
-                    }
-                    warn!(
-                        "BSC: A21 channel closed; falling back to 1x F-PCH page for HRPD-attached IMSI {imsi}"
-                    );
-                }
-            }
-        }
 
         self.mobiles.set_state(&target_addr, MsState::Paged);
 

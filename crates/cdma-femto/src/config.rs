@@ -708,6 +708,8 @@ pub struct FcsConfig {
     pub a1_listen: String,
     #[serde(default = "default_fcs_a1_advertise_addr")]
     pub a1_advertise_addr: String,
+    #[serde(default)]
+    pub a1p: cdma_ios::transport::A1pConfig,
     #[serde(default = "default_fcs_node_id")]
     pub node_id: String,
     #[serde(default = "default_fcs_management_listen")]
@@ -736,6 +738,7 @@ impl Default for FcsConfig {
             msc_a1_addr: None,
             a1_listen: default_fcs_a1_listen(),
             a1_advertise_addr: default_fcs_a1_advertise_addr(),
+            a1p: cdma_ios::transport::A1pConfig::default(),
             node_id: default_fcs_node_id(),
             management_listen: default_fcs_management_listen(),
             cell_id: default_fcs_cell_id(),
@@ -751,11 +754,11 @@ impl Default for FcsConfig {
 }
 
 fn default_fcs_a1_listen() -> String {
-    "0.0.0.0:17013".to_string()
+    "0.0.0.0:14001".to_string()
 }
 
 fn default_fcs_a1_advertise_addr() -> String {
-    "127.0.0.1:17013".to_string()
+    "127.0.0.1:14001".to_string()
 }
 
 fn default_fcs_node_id() -> String {

@@ -1,13 +1,11 @@
 use cdma_rpc_error::{Domain, ErrorReason};
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio_stream::{Stream, StreamExt};
-use tonic::{Request, Response, Status, Streaming};
+use tonic::{Request, Response, Status};
 
 use crate::fou_tcp_transport::{FouTcpSessionTransport, FouTcpTunnel};
 use crate::fou_transport::{FouSessionTransport, FouTunnel};
@@ -15,34 +13,20 @@ use crate::ip_allocator::{IpAllocator, SubnetIpAllocator};
 use crate::ip_transport::IpTransportConfig;
 use crate::proto::packet_service_server::PacketService;
 use crate::proto::{
-    AccessTechnology, CloseSessionRequest, CloseSessionResponse, GetSessionByIpRequest,
-    GetSessionByIpResponse, GetSessionStatusRequest, GetSessionStatusResponse, ListSessionsRequest,
-    ListSessionsResponse, MnIdSource, OpenSessionRequest, OpenSessionResponse, PacketSessionDetail,
-    PacketSessionInfo, PacketTraceEvent as ProtoPacketTraceEvent, SessionFrame,
-    SetSchActiveRequest, SetSchActiveResponse, SetSessionCaptureRequest, SetSessionCaptureResponse,
+    AccessTechnology, GetSessionByIpRequest, GetSessionByIpResponse, GetSessionStatusRequest,
+    GetSessionStatusResponse, ListSessionsRequest, ListSessionsResponse, MnIdSource,
+    PacketSessionDetail, PacketSessionInfo, PacketTraceEvent as ProtoPacketTraceEvent,
+    SetSessionCaptureRequest, SetSessionCaptureResponse,
 };
 use crate::session_lifecycle::{NullSink, SessionLifecycleSink};
-use crate::session_task::{self, PppSessionStore, SessionControl, SessionMetadata, SessionStatus};
+use crate::session_task::{PppSessionStore, SessionMetadata, SessionStatus};
 use crate::tun_transport::TunTransport;
 
 const PPP_SESSION_REAPER_MAX_INTERVAL: Duration = Duration::from_secs(60);
 
-enum SessionBearer {
-    OneX {
-        uplink_tx: mpsc::Sender<SessionFrame>,
-        downlink_rx: Arc<Mutex<Option<mpsc::Receiver<SessionFrame>>>>,
-        /// Out-of-band control sender — F-SCH activation, etc. The session task
-        /// selects on this alongside the bearer channels.
-        control_tx: mpsc::Sender<SessionControl>,
-    },
-    HrpdA10 {
-        uplink_tx: mpsc::Sender<Vec<u8>>,
-        shutdown_tx: oneshot::Sender<()>,
-    },
-}
-
 struct PacketSessionEntry {
-    bearer: SessionBearer,
+    uplink_tx: mpsc::Sender<Vec<u8>>,
+    shutdown_tx: oneshot::Sender<()>,
     status: Arc<Mutex<SessionStatus>>,
     task_handle: JoinHandle<()>,
 }
@@ -133,76 +117,6 @@ impl PacketServiceImpl {
         }
     }
 
-    /// Open a session and return the bearer channels directly (for in-process use).
-    /// The gRPC StreamSession RPC provides the same functionality over the network.
-    pub fn open_session_direct(
-        &self,
-        session_id: String,
-        service_option: u32,
-        metadata: SessionMetadata,
-    ) -> Result<(mpsc::Sender<SessionFrame>, mpsc::Receiver<SessionFrame>), String> {
-        // Check for duplicate
-        {
-            let sessions = self.sessions.lock().unwrap();
-            if sessions.contains_key(&session_id) {
-                return Err(format!("session {} already exists", session_id));
-            }
-        }
-
-        let (uplink_tx, uplink_rx) = mpsc::channel(256);
-        let (downlink_tx, downlink_rx) = mpsc::channel(256);
-        let (control_tx, control_rx) = mpsc::channel::<SessionControl>(8);
-
-        let metadata_for_status = metadata.clone();
-        let status = Arc::new(Mutex::new(SessionStatus::new(
-            service_option,
-            metadata_for_status,
-        )));
-        let status_clone = status.clone();
-        let sid = session_id.clone();
-        let so = service_option;
-
-        let transport = self.create_transport();
-        let alloc = Arc::clone(&self.allocator);
-        let sink = Arc::clone(&self.lifecycle_sink);
-        let ppp_store = self.ppp_session_store.clone();
-        let ppp_timeout = self.ppp_session_timeout;
-        let task_handle = tokio::spawn(async move {
-            session_task::run_session(
-                sid,
-                so,
-                transport,
-                uplink_rx,
-                downlink_tx,
-                status_clone,
-                alloc,
-                control_rx,
-                metadata,
-                sink,
-                ppp_store,
-                ppp_timeout,
-            )
-            .await;
-        });
-
-        let entry = PacketSessionEntry {
-            bearer: SessionBearer::OneX {
-                uplink_tx: uplink_tx.clone(),
-                downlink_rx: Arc::new(Mutex::new(None)), // consumed by direct caller
-                control_tx,
-            },
-            status,
-            task_handle,
-        };
-
-        {
-            let mut sessions = self.sessions.lock().unwrap();
-            sessions.insert(session_id, entry);
-        }
-
-        Ok((uplink_tx, downlink_rx))
-    }
-
     /// Open an HRPD A10 Unstructured Byte Stream session and return the A10
     /// bearer payload channels directly.
     ///
@@ -267,10 +181,8 @@ impl PacketServiceImpl {
             sessions.insert(
                 session_id.clone(),
                 PacketSessionEntry {
-                    bearer: SessionBearer::HrpdA10 {
-                        uplink_tx: uplink_tx.clone(),
-                        shutdown_tx,
-                    },
+                    uplink_tx: uplink_tx.clone(),
+                    shutdown_tx,
                     status,
                     task_handle,
                 },
@@ -286,43 +198,9 @@ impl PacketServiceImpl {
         Ok((uplink_tx, downlink_rx))
     }
 
-    /// Toggle F-SCH downlink generation on a running session. Sends a
-    /// `SessionControl::SetSchActive` to the session task; the actual flip
-    /// of `PacketSession::sch_active` happens inside the task. Returns
-    /// `Err` if the session is unknown or its control channel is closed
-    /// (which only happens if the session task has already exited).
-    pub async fn set_session_sch_active(
-        &self,
-        session_id: &str,
-        active: bool,
-        rate_bps: u32,
-    ) -> Result<(), String> {
-        let control_tx = {
-            let sessions = self.sessions.lock().unwrap();
-            let entry = sessions
-                .get(session_id)
-                .ok_or_else(|| format!("session {} not found", session_id))?;
-            match &entry.bearer {
-                SessionBearer::OneX { control_tx, .. } => control_tx.clone(),
-                SessionBearer::HrpdA10 { .. } => {
-                    return Err(format!(
-                        "session {} bearer does not support SCH",
-                        session_id
-                    ));
-                }
-            }
-        };
-        control_tx
-            .send(SessionControl::SetSchActive { active, rate_bps })
-            .await
-            .map_err(|e| format!("session {} control send failed: {e}", session_id))
-    }
-
-    /// Close a session (for in-process use). Drops the uplink sender to
-    /// signal `run_session` to exit its loop and run cleanup (which fires
-    /// the lifecycle sink's `on_unbound`), then awaits the task with a
-    /// 5 s timeout. Aborting here would skip the cleanup block and
-    /// silently drop the unbind event.
+    /// Closes a session and waits up to 5 s for its task to exit. The task's
+    /// cleanup fires the lifecycle sink's `on_unbound`, so aborting it would
+    /// drop the unbind event.
     pub async fn close_session_direct(&self, session_id: &str) {
         let entry = {
             let mut sessions = self.sessions.lock().unwrap();
@@ -393,18 +271,8 @@ impl PacketServiceImpl {
 }
 
 async fn close_session_entry(session_id: &str, entry: PacketSessionEntry) {
-    match entry.bearer {
-        SessionBearer::OneX { uplink_tx, .. } => {
-            drop(uplink_tx);
-        }
-        SessionBearer::HrpdA10 {
-            uplink_tx,
-            shutdown_tx,
-        } => {
-            drop(uplink_tx);
-            let _ = shutdown_tx.send(());
-        }
-    }
+    drop(entry.uplink_tx);
+    let _ = entry.shutdown_tx.send(());
 
     match tokio::time::timeout(std::time::Duration::from_secs(5), entry.task_handle).await {
         Ok(Ok(())) => {
@@ -501,14 +369,6 @@ fn mn_id_source_to_proto(label: &str) -> i32 {
 
 /// Map the wire MN-ID source enum back to the domain label, treating the
 /// unspecified variant as absent.
-fn mn_id_source_label(value: i32) -> Option<String> {
-    match MnIdSource::try_from(value).unwrap_or(MnIdSource::Unspecified) {
-        MnIdSource::A11 => Some("a11".to_string()),
-        MnIdSource::DerivedHardware => Some("derived_hardware".to_string()),
-        MnIdSource::Unspecified => None,
-    }
-}
-
 fn to_proto_session_info(session_id: &str, status: &SessionStatus) -> PacketSessionInfo {
     PacketSessionInfo {
         session_id: session_id.to_string(),
@@ -537,6 +397,7 @@ fn to_proto_session_info(session_id: &str, status: &SessionStatus) -> PacketSess
         mn_id: status.mn_id.clone(),
         mn_id_source: mn_id_source_to_proto(&status.mn_id_source),
         subscriber_imsi: status.subscriber_imsi.clone(),
+        nai: status.nai.clone(),
         pcf_session_id: status.a10.map(|a10| a10.pcf_session_id),
         mn_session_reference_id: status.a10.map(|a10| u32::from(a10.mn_session_reference_id)),
         traffic_walsh_code: status.traffic_walsh_code,
@@ -570,195 +431,6 @@ fn to_proto_session_detail(session_id: &str, status: &SessionStatus) -> PacketSe
 
 #[tonic::async_trait]
 impl PacketService for PacketServiceImpl {
-    async fn open_session(
-        &self,
-        request: Request<OpenSessionRequest>,
-    ) -> Result<Response<OpenSessionResponse>, Status> {
-        let req = request.into_inner();
-        let session_id = req.session_id.clone();
-
-        // Check for duplicate
-        {
-            let sessions = self.sessions.lock().unwrap();
-            if sessions.contains_key(&session_id) {
-                return Err(PACKET
-                    .error(
-                        tonic::Code::AlreadyExists,
-                        ErrorReason::PacketSessionExists,
-                        format!("Packet session {session_id} already exists"),
-                    )
-                    .with("session_id", &session_id)
-                    .status());
-            }
-        }
-
-        let (uplink_tx, uplink_rx) = mpsc::channel(256);
-        let (downlink_tx, downlink_rx) = mpsc::channel(256);
-        let (control_tx, control_rx) = mpsc::channel::<SessionControl>(8);
-
-        let metadata = SessionMetadata {
-            access_technology: "1x".to_string(),
-            mobile_address: req.mobile_address.clone(),
-            subscriber_id: (!req.subscriber_id.is_empty()).then(|| req.subscriber_id.clone()),
-            phone_number: req.phone_number.clone(),
-            imsi: (!req.imsi.is_empty()).then(|| req.imsi.clone()),
-            esn: (req.esn != 0).then_some(req.esn),
-            meid: (!req.meid.is_empty()).then(|| req.meid.clone()),
-            mn_id: (!req.mn_id.is_empty()).then(|| req.mn_id.clone()),
-            mn_id_source: mn_id_source_label(req.mn_id_source),
-            subscriber_imsi: (!req.subscriber_imsi.is_empty()).then(|| req.subscriber_imsi.clone()),
-            a10: None,
-            traffic_walsh_code: req.traffic_walsh_code,
-        };
-        let status = Arc::new(Mutex::new(SessionStatus::new(
-            req.service_option,
-            metadata.clone(),
-        )));
-        let status_clone = status.clone();
-        let sid = session_id.clone();
-        let so = req.service_option;
-
-        let transport = self.create_transport();
-        let alloc = Arc::clone(&self.allocator);
-        let sink = Arc::clone(&self.lifecycle_sink);
-        let ppp_store = self.ppp_session_store.clone();
-        let ppp_timeout = self.ppp_session_timeout;
-        let task_handle = tokio::spawn(async move {
-            session_task::run_session(
-                sid,
-                so,
-                transport,
-                uplink_rx,
-                downlink_tx,
-                status_clone,
-                alloc,
-                control_rx,
-                metadata,
-                sink,
-                ppp_store,
-                ppp_timeout,
-            )
-            .await;
-        });
-
-        let entry = PacketSessionEntry {
-            bearer: SessionBearer::OneX {
-                uplink_tx,
-                downlink_rx: Arc::new(Mutex::new(Some(downlink_rx))),
-                control_tx,
-            },
-            status,
-            task_handle,
-        };
-
-        {
-            let mut sessions = self.sessions.lock().unwrap();
-            sessions.insert(session_id.clone(), entry);
-        }
-
-        log::info!(
-            "packet-service: opened session {} (SO {})",
-            session_id,
-            req.service_option
-        );
-
-        Ok(Response::new(OpenSessionResponse { session_id }))
-    }
-
-    async fn close_session(
-        &self,
-        request: Request<CloseSessionRequest>,
-    ) -> Result<Response<CloseSessionResponse>, Status> {
-        let req = request.into_inner();
-        let entry = {
-            let mut sessions = self.sessions.lock().unwrap();
-            sessions.remove(&req.session_id)
-        };
-
-        match entry {
-            Some(entry) => {
-                close_session_entry(&req.session_id, entry).await;
-                Ok(Response::new(CloseSessionResponse {}))
-            }
-            None => Err(session_not_found(&req.session_id)),
-        }
-    }
-
-    type StreamSessionStream =
-        Pin<Box<dyn Stream<Item = Result<SessionFrame, Status>> + Send + 'static>>;
-
-    async fn stream_session(
-        &self,
-        request: Request<Streaming<SessionFrame>>,
-    ) -> Result<Response<Self::StreamSessionStream>, Status> {
-        let mut inbound = request.into_inner();
-
-        // Read the first frame to determine the session_id
-        let first_frame = inbound
-            .next()
-            .await
-            .ok_or_else(|| PACKET.invalid("The session stream sent no frames"))?
-            .map_err(|e| PACKET.internal(format!("The session stream failed: {e}")))?;
-
-        let session_id = first_frame.session_id.clone();
-
-        // Look up the session and get the channels
-        let (uplink_tx, downlink_rx) = {
-            let sessions = self.sessions.lock().unwrap();
-            let entry = sessions
-                .get(&session_id)
-                .ok_or_else(|| session_not_found(&session_id))?;
-            match &entry.bearer {
-                SessionBearer::OneX {
-                    uplink_tx,
-                    downlink_rx,
-                    ..
-                } => {
-                    let downlink_rx = downlink_rx.lock().unwrap().take().ok_or_else(|| {
-                        PACKET
-                            .error(
-                                tonic::Code::AlreadyExists,
-                                ErrorReason::PacketSessionExists,
-                                format!("Packet session {session_id} already has an active stream"),
-                            )
-                            .with("session_id", &session_id)
-                            .status()
-                    })?;
-                    (uplink_tx.clone(), downlink_rx)
-                }
-                SessionBearer::HrpdA10 { .. } => {
-                    return Err(PACKET
-                        .precondition(
-                            ErrorReason::PacketSessionWrongBearer,
-                            format!(
-                                "Packet session {session_id} uses an A10 bearer, not RLP frames"
-                            ),
-                        )
-                        .status());
-                }
-            }
-        };
-
-        // Forward the first frame
-        let _ = uplink_tx.send(first_frame).await;
-
-        // Spawn a task to forward inbound frames to the session task
-        let uplink_tx_clone = uplink_tx.clone();
-        tokio::spawn(async move {
-            while let Some(Ok(frame)) = inbound.next().await {
-                if uplink_tx_clone.send(frame).await.is_err() {
-                    break;
-                }
-            }
-        });
-
-        // Return the downlink stream
-        let output_stream =
-            tokio_stream::wrappers::ReceiverStream::new(downlink_rx).map(|frame| Ok(frame));
-
-        Ok(Response::new(Box::pin(output_stream)))
-    }
-
     async fn get_session_status(
         &self,
         request: Request<GetSessionStatusRequest>,
@@ -803,30 +475,6 @@ impl PacketService for PacketServiceImpl {
             session: Some(session),
         }))
     }
-
-    async fn set_sch_active(
-        &self,
-        request: Request<SetSchActiveRequest>,
-    ) -> Result<Response<SetSchActiveResponse>, Status> {
-        let req = request.into_inner();
-        let rate_bps = if req.rate_bps == 0 {
-            cdma_common::sch::DEFAULT_RC3_F_SCH_RATE_BPS
-        } else {
-            req.rate_bps
-        };
-        self.set_session_sch_active(&req.session_id, req.active, rate_bps)
-            .await
-            .map_err(|e| {
-                if e.contains("not found") {
-                    session_not_found(&req.session_id)
-                } else {
-                    PACKET
-                        .precondition(ErrorReason::SchControlFailed, capitalize_first(&e))
-                        .status()
-                }
-            })?;
-        Ok(Response::new(SetSchActiveResponse {}))
-    }
 }
 
 const PACKET: Domain = Domain("packet");
@@ -839,14 +487,6 @@ fn session_not_found(session_id: &str) -> Status {
         )
         .with("session_id", session_id)
         .status()
-}
-
-fn capitalize_first(message: &str) -> String {
-    let mut chars = message.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
-    }
 }
 
 #[cfg(test)]
@@ -939,12 +579,6 @@ mod tests {
                 .session_id,
             session_id
         );
-        let sch_error = service
-            .set_session_sch_active(&session_id, true, 19_200)
-            .await
-            .expect_err("HRPD A10 session should reject 1x SCH control");
-        assert!(sch_error.contains("does not support SCH"));
-
         service
             .close_pdsn_a10_byte_stream_session_direct(&session_id)
             .await;

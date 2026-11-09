@@ -38,6 +38,7 @@ interface PacketSessionInfo {
   mnId: string;
   mnIdSource: string;
   subscriberImsi: string;
+  nai?: string;
   esn: number;
   trafficWalshCode: number;
   rlpState: string;
@@ -377,6 +378,7 @@ export default function PacketSessionDetailPage({
           </div>
           <Stat label="Phone" value={mobile?.phoneNumber || summary.phoneNumber || "-"} mono />
           <Stat label="IMSI" value={subscriberImsi || "-"} mono />
+          {summary.nai && <Stat label="NAI" value={summary.nai} mono />}
           {summary.esn ? (
             <Stat label="ESN" value={`0x${summary.esn.toString(16).toUpperCase().padStart(8, "0")}`} mono />
           ) : null}

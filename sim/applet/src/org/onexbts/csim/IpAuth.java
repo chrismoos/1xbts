@@ -41,25 +41,31 @@ public final class IpAuth {
 
     // Persistent shared-secret store: NUM_SLOTS x SLOT, with a length per slot.
     private final byte[] ssPool;
-    private final byte[] ssLen;
+    private static final short LENGTHS = NUM_SLOTS * SLOT;
+    private static final short POOL_LEN = LENGTHS + NUM_SLOTS;
 
     private final MessageDigest md;
 
     // Transient chaining state for MN-HA / MIP-RRQ.
-    private final byte[] mipRrqHash;    // 16, last MIP-RRQ Hash result
-    private final byte[] haSs;          // 32, MN-HA secret kept for the trailer
     private final byte[] st;            // [0]=chainOp [1]=haSsLen [2]=mipRrqValid
     private static final short ST_OP = 0;
     private static final short ST_HA_LEN = 1;
     private static final short ST_MIP_VALID = 2;
 
-    public IpAuth() {
-        ssPool = new byte[(short) (NUM_SLOTS * SLOT)];
-        ssLen = new byte[NUM_SLOTS];
+    private static final short RRQ_HASH = 3;
+    private static final short HA_SECRET = RRQ_HASH + HASH_LEN;
+    private static final short STATE_LEN = HA_SECRET + SLOT;
+    private static final short BUILD_SECRETS = 1;
+    private static final short BUILD_MD5 = 3;
+    private static final short BUILD_STATE = 4;
+
+    public IpAuth(short[] progress) {
+        progress[0] = BUILD_SECRETS;
+        ssPool = new byte[POOL_LEN];
+        progress[0] = BUILD_MD5;
         md = MessageDigest.getInstance(MessageDigest.ALG_MD5, false);
-        mipRrqHash = JCSystem.makeTransientByteArray(HASH_LEN, JCSystem.CLEAR_ON_DESELECT);
-        haSs = JCSystem.makeTransientByteArray(SLOT, JCSystem.CLEAR_ON_DESELECT);
-        st = JCSystem.makeTransientByteArray((short) 3, JCSystem.CLEAR_ON_DESELECT);
+        progress[0] = BUILD_STATE;
+        st = JCSystem.makeTransientByteArray(STATE_LEN, JCSystem.CLEAR_ON_RESET);
         st[ST_OP] = CHAIN_NONE;
     }
 
@@ -76,7 +82,7 @@ public final class IpAuth {
         short base = slotIndex(cls, idx);
         Util.arrayFillNonAtomic(ssPool, base, SLOT, (byte) 0);
         Util.arrayCopyNonAtomic(src, off, ssPool, base, len);
-        ssLen[(byte) (cls * NUM_INDEXES + idx)] = (byte) len;
+        ssPool[(short) (LENGTHS + cls * NUM_INDEXES + idx)] = (byte) len;
     }
 
     private short ssOffset(byte cls, byte idx) {
@@ -86,7 +92,7 @@ public final class IpAuth {
     /** 6985 when no secret is loaded in the slot, so an authenticator is
      *  never computed over an empty secret. */
     private short ssLength(byte cls, byte idx) {
-        short n = (short) (ssLen[(byte) (cls * NUM_INDEXES + idx)] & 0xFF);
+        short n = (short) (ssPool[(short) (LENGTHS + cls * NUM_INDEXES + idx)] & 0xFF);
         if (n == 0) ISOException.throwIt(Const.SW_CONDITIONS_NOT_SAT);
         return n;
     }
@@ -100,8 +106,8 @@ public final class IpAuth {
         short ssOff = ssOffset(cls, naiIdx);
         short ssN = ssLength(cls, naiIdx);
         md.reset();
-        haSs[0] = chapId;
-        md.update(haSs, (short) 0, (short) 1);
+        st[(short) (HA_SECRET + 0)] = chapId;
+        md.update(st, HA_SECRET, (short) 1);
         md.update(ssPool, ssOff, ssN);
         md.doFinal(chal, chalOff, chalLen, out, outOff);
     }
@@ -118,7 +124,7 @@ public final class IpAuth {
             short ssN = ssLength(CLASS_MN_HA, naiIdx);
             md.reset();
             md.update(ssPool, ssOff, ssN);
-            Util.arrayCopyNonAtomic(ssPool, ssOff, haSs, (short) 0, ssN);
+            Util.arrayCopyNonAtomic(ssPool, ssOff, st, HA_SECRET, ssN);
             st[ST_HA_LEN] = (byte) ssN;
             st[ST_OP] = CLASS_MN_HA;
         } else if (st[ST_OP] != CLASS_MN_HA) {
@@ -126,7 +132,7 @@ public final class IpAuth {
         }
         if (lastBlock) {
             md.update(data, dataOff, dataLen);
-            md.doFinal(haSs, (short) 0, (short) (st[ST_HA_LEN] & 0xFF), out, outOff);
+            md.doFinal(st, HA_SECRET, (short) (st[ST_HA_LEN] & 0xFF), out, outOff);
             st[ST_OP] = CHAIN_NONE;
         } else {
             md.update(data, dataOff, dataLen);
@@ -144,7 +150,7 @@ public final class IpAuth {
             ISOException.throwIt(Const.SW_CAVE_NOT_SAVED);
         }
         if (lastBlock) {
-            md.doFinal(data, dataOff, dataLen, mipRrqHash, (short) 0);
+            md.doFinal(data, dataOff, dataLen, st, RRQ_HASH);
             st[ST_MIP_VALID] = 1;
             st[ST_OP] = CHAIN_NONE;
         } else {
@@ -165,7 +171,7 @@ public final class IpAuth {
         md.reset();
         md.update(chal, chalOff, (short) 1);          // highest-order byte
         md.update(ssPool, ssOff, ssN);
-        md.update(mipRrqHash, (short) 0, HASH_LEN);
+        md.update(st, RRQ_HASH, HASH_LEN);
         md.doFinal(chal, chalOff, chalLen, out, outOff);
         st[ST_MIP_VALID] = 0;
     }

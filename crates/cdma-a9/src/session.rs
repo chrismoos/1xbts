@@ -321,7 +321,7 @@ impl ProcedureEngine {
         setup: &SetupA8Message,
         connect: &ConnectA8Message,
     ) -> Result<ProcedureEvent> {
-        if setup.a8_traffic_id != connect.a8_traffic_id {
+        if !same_connection(&setup.a8_traffic_id, &connect.a8_traffic_id) {
             return Err(Error::TrafficIdMismatch {
                 expected: setup.a8_traffic_id.key,
                 actual: connect.a8_traffic_id.key,
@@ -1357,13 +1357,22 @@ fn con_ref_key(con_ref: &ConRef) -> Vec<u8> {
     vec![con_ref.0]
 }
 
+/// Leaves out the IP, which differs between the BS and PCF messages of one
+/// connection (A.S0016-D §4.2.16).
 fn traffic_key(traffic_id: &A8TrafficId) -> Vec<u8> {
-    traffic_id.encode()
+    let mut key = vec![traffic_id.protocol_stack];
+    key.extend_from_slice(&traffic_id.protocol_type.to_be_bytes());
+    key.extend_from_slice(&traffic_id.key.to_be_bytes());
+    key
+}
+
+fn same_connection(a: &A8TrafficId, b: &A8TrafficId) -> bool {
+    traffic_key(a) == traffic_key(b)
 }
 
 fn ensure_matching_traffic_id(session: &Session, actual: &A8TrafficId) -> Result<()> {
     let expected = session.traffic_id();
-    if expected != actual {
+    if !same_connection(expected, actual) {
         return Err(Error::TrafficIdMismatch {
             expected: expected.key,
             actual: actual.key,
@@ -1741,6 +1750,7 @@ mod tests {
             a8_traffic_id: setup.a8_traffic_id.clone(),
             cause: CauseValue(0x13),
             pdsn_ip_address: Some(PdsnIpAddress([127, 0, 0, 2])),
+            a9_indicators: None,
         }
     }
 
@@ -1755,6 +1765,44 @@ mod tests {
             a8_traffic_id: setup.a8_traffic_id.clone(),
             cause: CauseValue(0x77),
         }
+    }
+
+    #[test]
+    fn connect_and_disconnect_carry_the_pcf_address_for_the_same_connection() {
+        const PCF_A8_IP: [u8; 4] = [192, 0, 2, 20];
+        let mut engine = ProcedureEngine::new(ProcedureRole::Pcf);
+        let setup = setup(5, 0x1a05_8001, [1, 2, 3, 4]);
+        let mut connect = connect(&setup);
+        connect.a8_traffic_id = A8TrafficId::gre_ppp(setup.a8_traffic_id.key, PCF_A8_IP);
+        let mut disconnect = disconnect(&setup);
+        disconnect.a8_traffic_id = connect.a8_traffic_id.clone();
+        engine
+            .apply_inbound(ProcedureMessage::SetupA8(setup))
+            .unwrap();
+        engine
+            .apply_outbound(ProcedureMessage::ConnectA8(connect))
+            .unwrap();
+        assert!(
+            engine
+                .apply_outbound(ProcedureMessage::DisconnectA8(disconnect))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_different_gre_key_is_a_different_connection() {
+        let mut engine = ProcedureEngine::new(ProcedureRole::Pcf);
+        let setup = setup(5, 0x1a05_8001, [1, 2, 3, 4]);
+        let mut connect = connect(&setup);
+        connect.a8_traffic_id.key ^= 1;
+        engine
+            .apply_inbound(ProcedureMessage::SetupA8(setup))
+            .unwrap();
+        assert!(
+            engine
+                .apply_outbound(ProcedureMessage::ConnectA8(connect))
+                .is_err()
+        );
     }
 
     #[test]

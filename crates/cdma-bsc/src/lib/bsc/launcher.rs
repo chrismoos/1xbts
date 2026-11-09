@@ -33,7 +33,6 @@ pub struct BscLaunchInputs {
     /// SMSC repository — read by the management layer for history queries.
     /// The BSC itself does no SMSC state updates. The MSC owns SMS coordination.
     pub smsc_repo: Arc<dyn SmscRepository>,
-    pub packet_endpoint: String,
     /// Address the A1 listener accepts the MSC on, reported at enrollment.
     pub a1_bind_addr: std::net::SocketAddr,
     pub msc_client: Arc<dyn MscClient>,
@@ -73,7 +72,6 @@ pub fn build_bsc_launch_parts(inputs: BscLaunchInputs) -> BscLaunchParts {
         traffic_broadcast: traffic_broadcast_tx.clone(),
         hlr_repo: inputs.hlr_repo.clone(),
         smsc_repo: inputs.smsc_repo.clone(),
-        packet_endpoint: inputs.packet_endpoint.clone(),
         node_id: inputs.node_id.clone(),
         a1_bind_addr: inputs.a1_bind_addr,
     });

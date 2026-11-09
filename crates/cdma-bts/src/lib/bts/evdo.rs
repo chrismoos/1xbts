@@ -304,7 +304,14 @@ pub struct EvdoConfig {
     /// AN-AAA that receives access authentication results over A12. When
     /// unset, the CHAP exchange still runs and its result is logged.
     pub a12: Option<cdma_a12::client::A12ClientConfig>,
+    /// Omit to disable A21.
+    #[serde(default = "default_a21")]
+    pub a21: Option<super::hrpd_a21::HrpdA21Config>,
     pub overhead: HrpdOverheadConfig,
+}
+
+fn default_a21() -> Option<super::hrpd_a21::HrpdA21Config> {
+    Some(super::hrpd_a21::HrpdA21Config::default())
 }
 
 /// AN-side A9 signaling and A8 bearer addressing.
@@ -314,12 +321,20 @@ pub struct EvdoConfig {
 /// receive traffic.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HrpdA9Config {
-    /// PCF A9 signaling address SetupA8/ReleaseA8 are sent to.
+    /// Normally port 5603.
     pub pcf_addr: SocketAddr,
-    /// PCF-side A8 bearer address, used to build the A8 traffic id.
+    /// Must match the PCF's `a9_transport`.
+    #[serde(default)]
+    pub a9_transport: cdma_a9::A9Transport,
+    /// Raw GRE uses only its IP.
     pub pcf_a8_addr: SocketAddr,
-    /// Address this AN binds for A8 bearer traffic.
+    /// Raw GRE uses only its IP.
     pub a8_bind_addr: SocketAddr,
+    #[serde(default)]
+    pub a8_transport: cdma_a8::BearerTransportMode,
+    /// Largest PPP payload per A8 GRE frame. Defaults to 1400.
+    #[serde(default)]
+    pub max_gre_payload: Option<u16>,
 }
 
 impl Default for EvdoConfig {
@@ -336,6 +351,7 @@ impl Default for EvdoConfig {
             an_grpc_advertise_addr: None,
             a9: None,
             a12: None,
+            a21: default_a21(),
             overhead: HrpdOverheadConfig::default(),
         }
     }

@@ -597,10 +597,7 @@ impl Default for BtsAbisTimers {
 }
 
 fn default_bts_bearer_bind_addr() -> SocketAddr {
-    SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        cdma_abis::transport::ABIS_BTS_BEARER_PORT,
-    )
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0)
 }
 
 fn default_bts_bearer_remote_addr() -> SocketAddr {
@@ -735,10 +732,9 @@ impl Default for BtsManagementConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BtsBearerConfig {
-    /// Local UDP address for the BTS bearer transport. Default `127.0.0.1:17014`.
+    /// The port is not used.
     #[serde(default = "default_bts_bearer_bind_addr")]
     pub bind_addr: SocketAddr,
-    /// Remote BSC bearer address. Default `127.0.0.1:17013`.
     #[serde(default = "default_bts_bearer_remote_addr")]
     pub remote_addr: SocketAddr,
 }

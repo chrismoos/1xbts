@@ -66,7 +66,6 @@ mod rx_capture;
 mod rx_events;
 
 static ACCESS_EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
-static REVERSE_BEARER_SEQ: AtomicU64 = AtomicU64::new(1);
 const RX_QUEUE_WARN_THRESHOLD_US: u64 = 20_000;
 const HRPD_WORKER_TIMING_REPORT_THRESHOLD_US: u64 = 2_000;
 const HRPD_WORKER_TIMING_REPORT_INTERVAL_BLOCKS: u64 = 400;
@@ -152,8 +151,6 @@ fn reverse_frame_content_from_event(event: &AccessChannelEvent) -> FrameContent 
 fn emit_reverse_primary_bearer(
     tx: &Option<mpsc::Sender<UdpBearerDatagram>>,
     event: &AccessChannelEvent,
-    bts_id: u32,
-    cell_id: u32,
 ) -> bool {
     let Some(tx) = tx else {
         warn!("emit_reverse_primary_bearer: no bearer tx configured");
@@ -209,14 +206,9 @@ fn emit_reverse_primary_bearer(
     };
     let sent = tx
         .send(UdpBearerDatagram {
-            flags: 0,
             channel_family: ChannelFamily::Fch,
             direction: Direction::Reverse,
-            bts_id,
-            cell_id,
             bearer_id: walsh_code as u32,
-            sequence_no: REVERSE_BEARER_SEQ.fetch_add(1, Ordering::Relaxed) as u32,
-            tx_frame_number: event.absolute_chip_start.unwrap_or_default() as u32,
             payload,
         })
         .is_ok();
@@ -232,13 +224,7 @@ fn emit_reverse_primary_bearer(
 
 /// Send a preamble notification as an FCH Rvs null frame (frame_content=0x7F)
 /// over the Abis UDP bearer.
-fn emit_reverse_preamble_bearer(
-    tx: &Option<mpsc::Sender<UdpBearerDatagram>>,
-    walsh_code: u8,
-    abs_chip: u64,
-    bts_id: u32,
-    cell_id: u32,
-) {
+fn emit_reverse_preamble_bearer(tx: &Option<mpsc::Sender<UdpBearerDatagram>>, walsh_code: u8) {
     let Some(tx) = tx else {
         return;
     };
@@ -267,14 +253,9 @@ fn emit_reverse_preamble_bearer(
         }
     };
     match tx.send(UdpBearerDatagram {
-        flags: 0,
         channel_family: ChannelFamily::Fch,
         direction: Direction::Reverse,
-        bts_id,
-        cell_id,
         bearer_id: walsh_code as u32,
-        sequence_no: REVERSE_BEARER_SEQ.fetch_add(1, Ordering::Relaxed) as u32,
-        tx_frame_number: abs_chip as u32,
         payload,
     }) {
         Ok(()) => debug!(
@@ -460,7 +441,7 @@ fn rx_target_batch_samples(sample_rate_hz: usize, chip_rate_hz: usize, batch_pcg
     oversample.saturating_mul(PCG_CHIPS * batch_pcgs.max(1))
 }
 
-fn effective_rx_target_batch_samples(
+pub(crate) fn effective_rx_target_batch_samples(
     sample_rate_hz: usize,
     chip_rate_hz: usize,
     batch_pcgs: usize,
@@ -496,8 +477,6 @@ fn spawn_traffic_rx_thread(
     power_control: Option<BtsPowerControlRegistry>,
     chip_rate_hz: usize,
     traffic_ack_seq_tx: Option<tokio_mpsc::Sender<(u8, u8)>>,
-    bearer_bts_id: u32,
-    bearer_cell_id: u32,
     queue_registry: &RxQueueRegistry,
 ) -> TrafficRxThread {
     let settings = crate::receiver::pipelined::ReverseTrafficSettings {
@@ -545,8 +524,6 @@ fn spawn_traffic_rx_thread(
                 continuity_configured,
                 thread_shutdown_clone,
                 traffic_ack_seq_tx,
-                bearer_bts_id,
-                bearer_cell_id,
                 worker_queue,
                 long_code_privacy,
             );
@@ -2076,8 +2053,6 @@ pub(super) fn run_rx_loop(
 ) -> Result<(), Error> {
     let mut runtime = open_rx_runtime(rx)?;
     start_hrpd_access_worker(&mut runtime, shutdown.clone());
-    let bearer_bts_id = runtime.config.base_id as u32;
-    let bearer_cell_id: u32 = 1;
     let configured_batch_samples = rx_target_batch_samples(
         runtime.config.sample_rate_hz,
         runtime.config.chip_rate_hz,
@@ -2192,7 +2167,10 @@ pub(super) fn run_rx_loop(
         let reader = std::thread::Builder::new()
             .name("bts-rx-reader".into())
             .spawn_scoped(scope, move || -> Result<(), Error> {
-                super::realtime::apply_rx_reader(&realtime);
+                super::realtime::apply_rx_reader(
+                    &realtime,
+                    super::realtime::ThreadBudget::rx_io(target_batch_samples, sample_rate_hz),
+                );
                 let read_batch_samples = target_batch_samples;
                 info!(
                     "rx: SDR reader read_batch_samples={} read_batch_ms={:.3}",
@@ -2308,8 +2286,6 @@ pub(super) fn run_rx_loop(
             &rx_chan,
             &shutdown,
             &reader_queue,
-            bearer_bts_id,
-            bearer_cell_id,
         );
 
         // Wait for reader to finish
@@ -2330,8 +2306,6 @@ fn process_rx_message(
     runtime: &mut RxRuntime,
     traffic_threads: &mut Vec<TrafficRxThread>,
     msg: RxReaderMessage,
-    bearer_bts_id: u32,
-    bearer_cell_id: u32,
 ) -> Result<(), Error> {
     let oversample = (runtime.config.sample_rate_hz / runtime.config.chip_rate_hz).max(1);
     let iter_start = Instant::now();
@@ -2757,8 +2731,6 @@ fn process_rx_message(
                 runtime.config.power_control.clone(),
                 runtime.config.chip_rate_hz,
                 runtime.config.traffic_ack_seq_tx.clone(),
-                bearer_bts_id,
-                bearer_cell_id,
                 &runtime.queue_registry,
             ));
         }
@@ -2997,8 +2969,6 @@ fn process_rx_from_channel(
     rx_chan: &mpsc::Receiver<RxReaderMessage>,
     shutdown: &AtomicBool,
     reader_queue: &RxQueueTracker,
-    bearer_bts_id: u32,
-    bearer_cell_id: u32,
 ) -> Result<(), Error> {
     let mut traffic_threads: Vec<TrafficRxThread> = Vec::new();
 
@@ -3016,13 +2986,7 @@ fn process_rx_from_channel(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         reader_queue.dequeue(msg.n, msg.enqueue_time);
-        process_rx_message(
-            runtime,
-            &mut traffic_threads,
-            msg,
-            bearer_bts_id,
-            bearer_cell_id,
-        )?;
+        process_rx_message(runtime, &mut traffic_threads, msg)?;
         drain_bts_commands(runtime, commands_rx, shutdown)?;
     }
     Ok(())
@@ -3037,8 +3001,6 @@ pub(super) fn run_injected_rx_loop(
     let oversample = (rx.sample_rate_hz / rx.chip_rate_hz).max(1) as u64;
     let mut runtime = open_rx_runtime(rx)?;
     start_hrpd_access_worker(&mut runtime, shutdown.clone());
-    let bearer_bts_id = runtime.config.base_id as u32;
-    let bearer_cell_id: u32 = 1;
     let mut traffic_threads: Vec<TrafficRxThread> = Vec::new();
 
     while !shutdown.load(Ordering::Relaxed) {
@@ -3066,8 +3028,6 @@ pub(super) fn run_injected_rx_loop(
                     .absolute_chip_start
                     .map(|chip| chip.saturating_mul(oversample)),
             },
-            bearer_bts_id,
-            bearer_cell_id,
         )?;
         drain_bts_commands(&mut runtime, &mut commands_rx, &shutdown)?;
     }
@@ -3986,8 +3946,6 @@ fn run_traffic_rx_thread(
     continuity_configured: bool,
     shutdown: Arc<AtomicBool>,
     traffic_ack_seq_tx: Option<tokio::sync::mpsc::Sender<(u8, u8)>>,
-    bearer_bts_id: u32,
-    bearer_cell_id: u32,
     queue: RxQueueTracker,
     long_code_privacy: Option<Arc<cdma_common::phy::long_code_privacy::LongCodePrivacy>>,
 ) {
@@ -4063,13 +4021,7 @@ fn run_traffic_rx_thread(
                         .unwrap_or_else(|| "none".to_string())
                 );
                 // Send preamble as FCH Rvs null frame over Abis UDP bearer
-                emit_reverse_preamble_bearer(
-                    &reverse_bearer_tx,
-                    walsh_code,
-                    abs_chip as u64,
-                    bearer_bts_id,
-                    bearer_cell_id,
-                );
+                emit_reverse_preamble_bearer(&reverse_bearer_tx, walsh_code);
 
                 let event = build_traffic_preamble_event(
                     walsh_code,
@@ -4118,12 +4070,8 @@ fn run_traffic_rx_thread(
                     if let (Some(ack_seq), Some(ack_tx)) = (event.ack_seq, &traffic_ack_seq_tx) {
                         let _ = ack_tx.blocking_send((walsh_code, ack_seq));
                     }
-                    event.traffic_primary_bearer_routed = emit_reverse_primary_bearer(
-                        &reverse_bearer_tx,
-                        &event,
-                        bearer_bts_id,
-                        bearer_cell_id,
-                    );
+                    event.traffic_primary_bearer_routed =
+                        emit_reverse_primary_bearer(&reverse_bearer_tx, &event);
                     if let Some(ref tx) = event_tx {
                         let _ = tx.send(event);
                     }
@@ -4350,12 +4298,8 @@ fn run_traffic_rx_thread(
                         out_blk.tags.get("traffic_is_preamble") == Some(&1),
                         event.absolute_chip_start,
                     );
-                    event.traffic_primary_bearer_routed = emit_reverse_primary_bearer(
-                        &reverse_bearer_tx,
-                        &event,
-                        bearer_bts_id,
-                        bearer_cell_id,
-                    );
+                    event.traffic_primary_bearer_routed =
+                        emit_reverse_primary_bearer(&reverse_bearer_tx, &event);
                     if let Some(ref tx) = event_tx {
                         let _ = tx.send(event);
                     }

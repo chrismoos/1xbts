@@ -27,11 +27,19 @@
       "oam_endpoint": "http://127.0.0.1:17024",
       "abis_addr": "127.0.0.1:5604",
       "bearer_bind_addr": "127.0.0.1:17022",
-      "bearer_remote_addr": "127.0.0.1:17014"
+      "bearer_remote_addr": "127.0.0.1:0"
     }
   ],
-  "a1_bind_addr": "127.0.0.1:17013",
+  "a1_bind_addr": "127.0.0.1:14001",
   "hlr_endpoint": "http://127.0.0.1:17019",
   "smsc_endpoint": "http://127.0.0.1:17020",
-  "packet_endpoint": "http://127.0.0.1:17021"
+  "packet_a9": {
+    "pcf_addr": "127.0.0.1:5603",
+    "pcf_a8_addr": "127.0.0.1:17041",
+    "a8_bind_addr": "127.0.0.1:17048"
+  },
+  "a21": {
+    "bind_addr": "127.0.0.1:4597",
+    "an_addr": "127.0.0.1:17049"
+  }
 }

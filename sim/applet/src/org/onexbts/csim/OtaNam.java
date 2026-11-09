@@ -1,5 +1,6 @@
 package org.onexbts.csim;
 
+import javacard.framework.JCSystem;
 import javacard.framework.Util;
 
 /**
@@ -47,21 +48,24 @@ public final class OtaNam {
     private static final short BLOCK_BUF_LEN = 16;
 
     private final FileSystem fs;
-    private final short[] bit;        // [0] = current bit offset
+    // RAM: [0] bit offset, [1] read base, [2] write base. Persistent cursors
+    // wrote flash on every bit of an OTASP block.
+    private final short[] bit;
+    private static final short BIT_RD_BASE = 1;
+    private static final short BIT_WR_BASE = 2;
 
     public OtaNam(FileSystem fileSystem) {
         fs = fileSystem;
-        bit = new short[1];
+        bit = JCSystem.makeTransientShortArray((short) 3, JCSystem.CLEAR_ON_RESET);
     }
 
     // MSB-first bit reader over an external buffer
 
     private byte[] rdBuf;
-    private short rdBase;
 
     private void start(byte[] buf, short off) {
         rdBuf = buf;
-        rdBase = off;
+        bit[BIT_RD_BASE] = off;
         bit[0] = 0;
     }
 
@@ -70,7 +74,7 @@ public final class OtaNam {
         short v = 0;
         for (short i = 0; i < n; i++) {
             short p = (short) (bit[0] + i);
-            short bytePos = (short) (rdBase + (p >> 3));
+            short bytePos = (short) (bit[BIT_RD_BASE] + (p >> 3));
             short b = (short) ((rdBuf[bytePos] >> (7 - (p & 7))) & 1);
             v = (short) ((v << 1) | b);
         }
@@ -191,11 +195,10 @@ public final class OtaNam {
     // Encode block from EFs (Configuration Request)
 
     private byte[] wrBuf;
-    private short wrBase;
 
     private void startWrite(byte[] buf, short off) {
         wrBuf = buf;
-        wrBase = off;
+        bit[BIT_WR_BASE] = off;
         bit[0] = 0;
         Util.arrayFillNonAtomic(buf, off, BLOCK_BUF_LEN, (byte) 0);
     }
@@ -203,7 +206,7 @@ public final class OtaNam {
     private void writeBits(short value, short n) {
         for (short i = 0; i < n; i++) {
             short p = (short) (bit[0] + i);
-            short bytePos = (short) (wrBase + (p >> 3));
+            short bytePos = (short) (bit[BIT_WR_BASE] + (p >> 3));
             short v = (short) ((value >> (n - 1 - i)) & 1);
             if (v != 0) wrBuf[bytePos] |= (byte) (1 << (7 - (p & 7)));
         }

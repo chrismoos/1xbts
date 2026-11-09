@@ -73,8 +73,8 @@ async fn attach_peer_forever(
     let mut retry = RETRY_MIN;
     // The bearer socket outlives any single attach. Rebinding the address
     // fails while a packet-session task still holds the previous socket, and
-    // the socket carries no per-connection state, so a re-attach of the same
-    // cell reuses it.
+    // each Abis-Connect sets its connection's port again, so a re-attach of
+    // the same cell reuses it.
     let mut bearer_cache: Option<(AccessCellId, BearerHandle)> = None;
     loop {
         match attach_peer_once(&peer, &bts, &access_event_tx, &mut bearer_cache).await {
@@ -191,15 +191,14 @@ async fn attach_peer_once(
         .map_err(|conflict| format!("enrollment refused for cell {cell}: {conflict}"))?;
 
     let bearer_config = cdma_abis::bearer_transport::BearerTransportConfig {
+        role: cdma_abis::bearer_transport::BearerRole::Bsc,
         bind_addr: peer.bearer_bind_addr,
         remote_addr: peer.bearer_remote_addr,
-        bts_id: cell.cell as u32,
-        cell_id: cell.sector as u32,
     };
     let bearer = match bearer_cache.take() {
         Some((cached_cell, bearer)) if cached_cell == cell => bearer,
-        // A different cell id means new bts_id/cell_id framing. Release the
-        // old socket before binding the replacement.
+        // A different cell is a different BTS. Release the old socket before
+        // binding the replacement.
         stale => {
             drop(stale);
             Arc::new(

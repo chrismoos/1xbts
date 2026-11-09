@@ -823,7 +823,8 @@ impl CmServiceRequestMessage {
             CM_SERVICE_REQUEST,
             self.cm_service_type.encode(),
         ];
-        push_l3_tlv(&mut out, 0x12, self.classmark_information_type_2.encode()?)?;
+        // Mandatory LV with no IEI (A.S0014-D §3.1.2).
+        push_l3_lv(&mut out, self.classmark_information_type_2.encode()?)?;
         let mobile_identity = self.mobile_identity_imsi.encode()?;
         if !matches!(self.mobile_identity_imsi, MobileIdentity::Imsi(_)) {
             return Err(Error::InvalidValue {
@@ -966,10 +967,7 @@ impl CmServiceRequestMessage {
         ensure_remaining(rest, offset, 1)?;
         let cm_service_type = CmServiceType::decode(rest[offset])?;
         offset += 1;
-        let (_, payload, consumed) = decode_tlv(&rest[offset..])?;
-        if rest[offset] != 0x12 {
-            return Err(Error::UnknownInformationElement(rest[offset]));
-        }
+        let (_, payload, consumed) = decode_lv(&rest[offset..])?;
         let classmark_information_type_2 = ClassmarkInformationType2::decode(payload)?;
         offset += consumed;
         let (_, imsi_payload, consumed) = decode_lv(&rest[offset..])?;
@@ -1263,6 +1261,21 @@ pub struct PagingResponseMessage {
 }
 
 impl PagingResponseMessage {
+    /// Wrapped in a Complete Layer 3 Information (A.S0014-D §2.1.2).
+    pub fn encode_a1(&self, cell_identifier: CellId) -> Result<Vec<u8>> {
+        CompleteLayer3InformationMessage {
+            cell_identifier,
+            layer3_information: Layer3Information::from_paging_response(self)?,
+        }
+        .encode()
+    }
+
+    pub fn decode_a1(frame: &[u8]) -> Result<Self> {
+        CompleteLayer3InformationMessage::decode(frame)?
+            .layer3_information
+            .decode_paging_response()
+    }
+
     /// Encodes the DTAP message body including protocol discriminator and message type.
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut out = vec![
@@ -1270,7 +1283,8 @@ impl PagingResponseMessage {
             0x00,
             PAGING_RESPONSE,
         ];
-        push_l3_tlv(&mut out, 0x12, self.classmark_information_type_2.encode()?)?;
+        // Mandatory LV with no IEI (A.S0014-D §3.1.5).
+        push_l3_lv(&mut out, self.classmark_information_type_2.encode()?)?;
         let mobile_identity = self.mobile_identity_imsi.encode()?;
         if !matches!(self.mobile_identity_imsi, MobileIdentity::Imsi(_)) {
             return Err(Error::InvalidValue {
@@ -1386,10 +1400,7 @@ impl PagingResponseMessage {
             input,
         )?;
         let mut offset = 0;
-        let (_, payload, consumed) = decode_tlv(&rest[offset..])?;
-        if rest[offset] != 0x12 {
-            return Err(Error::UnknownInformationElement(rest[offset]));
-        }
+        let (_, payload, consumed) = decode_lv(&rest[offset..])?;
         let classmark_information_type_2 = ClassmarkInformationType2::decode(payload)?;
         offset += consumed;
         let (_, imsi_payload, consumed) = decode_lv(&rest[offset..])?;
@@ -8181,6 +8192,124 @@ pub struct A1Frame {
     /// [`crate::femto_interface_msg::FemtoInterfaceMsg::to_layer3_sdu`] uses for
     /// an Fx2-carried body, so both observation paths render identically.
     pub sdu: Vec<u8>,
+}
+
+/// A Complete Layer 3 Information with a Paging Response reports
+/// [`crate::MessageType::PagingResponse`].
+pub fn a1_frame_message_type(frame: &[u8]) -> Result<crate::MessageType> {
+    use crate::MessageType as M;
+    let unknown = |code: u8| Err(Error::UnknownMessageType(code));
+    match frame.first().copied() {
+        Some(BSMAP_MESSAGE_DISCRIMINATION) => {
+            let Some(&code) = frame.get(2) else {
+                return Err(Error::Truncated {
+                    needed: 3,
+                    actual: frame.len(),
+                });
+            };
+            Ok(match code {
+                COMPLETE_LAYER3_INFORMATION => {
+                    let cli3 = CompleteLayer3InformationMessage::decode(frame)?;
+                    let l3 = cli3.layer3_information.encode();
+                    if l3.first() == Some(&DTAP_PROTOCOL_DISCRIMINATOR_CALL_PROCESSING)
+                        && l3.get(2) == Some(&PAGING_RESPONSE)
+                    {
+                        M::PagingResponse
+                    } else {
+                        M::CompleteLayer3Information
+                    }
+                }
+                PAGING_REQUEST => M::PagingRequest,
+                ASSIGNMENT_REQUEST => M::AssignmentRequest,
+                ASSIGNMENT_COMPLETE => M::AssignmentComplete,
+                ASSIGNMENT_FAILURE => M::AssignmentFailure,
+                CLEAR_COMMAND => M::ClearCommand,
+                CLEAR_COMPLETE => M::ClearComplete,
+                CLEAR_REQUEST => M::ClearRequest,
+                BS_SERVICE_REQUEST => M::BsServiceRequest,
+                BS_SERVICE_RESPONSE => M::BsServiceResponse,
+                USER_ZONE_UPDATE => M::UserZoneUpdate,
+                PRIVACY_MODE_COMMAND => M::PrivacyModeCommand,
+                PRIVACY_MODE_COMPLETE => M::PrivacyModeComplete,
+                HANDOFF_REQUEST => M::HandoffRequest,
+                HANDOFF_REQUIRED => M::HandoffRequired,
+                HANDOFF_REQUEST_ACKNOWLEDGE => M::HandoffRequestAcknowledge,
+                HANDOFF_COMMAND => M::HandoffCommand,
+                HANDOFF_COMPLETE => M::HandoffComplete,
+                HANDOFF_COMMENCED => M::HandoffCommenced,
+                HANDOFF_FAILURE => M::HandoffFailure,
+                HANDOFF_PERFORMED => M::HandoffPerformed,
+                HANDOFF_REQUIRED_REJECT => M::HandoffRequiredReject,
+                ADDS_PAGE => M::AddsPage,
+                ADDS_PAGE_ACK => M::AddsPageAck,
+                ADDS_TRANSFER => M::AddsTransfer,
+                ADDS_TRANSFER_ACK => M::AddsTransferAck,
+                AUTHENTICATION_REQUEST => M::AuthenticationRequest,
+                AUTHENTICATION_RESPONSE => M::AuthenticationResponse,
+                other => return unknown(other),
+            })
+        }
+        Some(A1_DTAP_MESSAGE_DISCRIMINATION) => {
+            let (Some(&protocol), Some(&code)) = (frame.get(3), frame.get(5)) else {
+                return Err(Error::Truncated {
+                    needed: 6,
+                    actual: frame.len(),
+                });
+            };
+            Ok(match (protocol, code) {
+                (DTAP_PROTOCOL_DISCRIMINATOR_CALL_PROCESSING, CONNECT) => M::Connect,
+                (DTAP_PROTOCOL_DISCRIMINATOR_CALL_PROCESSING, PROGRESS) => M::Progress,
+                (DTAP_PROTOCOL_DISCRIMINATOR_CALL_PROCESSING, ALERT_WITH_INFORMATION) => {
+                    M::AlertWithInformation
+                }
+                (DTAP_PROTOCOL_DISCRIMINATOR_CALL_PROCESSING, ADDS_DELIVER_DTAP) => M::AddsDeliver,
+                (DTAP_PROTOCOL_DISCRIMINATOR_CALL_PROCESSING, ADDS_DELIVER_ACK_DTAP) => {
+                    M::AddsDeliverAck
+                }
+                (DTAP_PROTOCOL_DISCRIMINATOR_MOBILITY_MANAGEMENT, PARAMETER_UPDATE_REQUEST) => {
+                    M::ParameterUpdateRequest
+                }
+                (DTAP_PROTOCOL_DISCRIMINATOR_MOBILITY_MANAGEMENT, PARAMETER_UPDATE_CONFIRM) => {
+                    M::ParameterUpdateConfirm
+                }
+                (DTAP_PROTOCOL_DISCRIMINATOR_MOBILITY_MANAGEMENT, LOCATION_UPDATING_ACCEPT) => {
+                    M::LocationUpdatingAccept
+                }
+                (DTAP_PROTOCOL_DISCRIMINATOR_MOBILITY_MANAGEMENT, LOCATION_UPDATING_REJECT) => {
+                    M::LocationUpdatingReject
+                }
+                (DTAP_PROTOCOL_DISCRIMINATOR_MOBILITY_MANAGEMENT, AUTHENTICATION_REQUEST) => {
+                    M::AuthenticationRequest
+                }
+                (DTAP_PROTOCOL_DISCRIMINATOR_MOBILITY_MANAGEMENT, AUTHENTICATION_RESPONSE) => {
+                    M::AuthenticationResponse
+                }
+                (DTAP_PROTOCOL_DISCRIMINATOR_MOBILITY_MANAGEMENT, SSD_UPDATE_REQUEST) => {
+                    M::SsdUpdateRequest
+                }
+                (DTAP_PROTOCOL_DISCRIMINATOR_MOBILITY_MANAGEMENT, BASE_STATION_CHALLENGE) => {
+                    M::BaseStationChallenge
+                }
+                (
+                    DTAP_PROTOCOL_DISCRIMINATOR_MOBILITY_MANAGEMENT,
+                    BASE_STATION_CHALLENGE_RESPONSE,
+                ) => M::BaseStationChallengeResponse,
+                (DTAP_PROTOCOL_DISCRIMINATOR_MOBILITY_MANAGEMENT, SSD_UPDATE_RESPONSE) => {
+                    M::SsdUpdateResponse
+                }
+                (_, other) => return unknown(other),
+            })
+        }
+        Some(other) => Err(Error::InvalidValue {
+            context: "A1 message discrimination",
+            reason: if other > A1_DTAP_MESSAGE_DISCRIMINATION {
+                "reserved discrimination value"
+            } else {
+                "unknown discrimination value"
+            },
+        }),
+        None => Err(Error::EmptyMessage),
+    }
 }
 
 pub fn split_a1_frame(payload: &[u8]) -> Option<A1Frame> {

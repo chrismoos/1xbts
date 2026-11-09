@@ -347,6 +347,7 @@ impl SdrRadio {
                 tx_sample_rate_hz: rate,
                 rx_sample_rate_hz: rate,
                 rx_bandwidth_hz: rate,
+                rx_read_batch_samples: RX_READ_SAMPLES,
                 realtime: Default::default(),
             },
         )?;

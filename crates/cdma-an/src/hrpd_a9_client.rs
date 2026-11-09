@@ -1,9 +1,5 @@
 //! AN-side A9 client: establishes and releases the A8 bearer with the PCF by
-//! exchanging SetupA8/ReleaseA8 transactions over A9 UDP signaling.
-//!
-//! This is the client counterpart to the PCF's A9 server. It owns the A9
-//! signaling endpoint borrow, the client config, and the A9 sequence counter,
-//! so the transaction methods no longer thread those through every call.
+//! exchanging SetupA8/ReleaseA8 transactions over A9 signaling.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -30,6 +26,7 @@ pub struct HrpdA9ReleaseContext {
     con_ref: cdma_a9::ConRef,
     a8_traffic_id: cdma_a9::A8TrafficId,
     pdsn_ip_address: Option<cdma_a9::PdsnIpAddress>,
+    pcf_accepts_gre_segmentation: bool,
 }
 
 impl HrpdA9ReleaseContext {
@@ -49,6 +46,7 @@ impl HrpdA9ReleaseContext {
             con_ref,
             a8_traffic_id,
             pdsn_ip_address: None,
+            pcf_accepts_gre_segmentation: false,
         }
     }
 
@@ -66,37 +64,25 @@ impl HrpdA9ReleaseContext {
     pub fn pdsn_ip_address(&self) -> Option<cdma_a9::PdsnIpAddress> {
         self.pdsn_ip_address
     }
+
+    pub fn a8_bearer_profile(&self) -> cdma_a8::BearerProfile {
+        cdma_a8::BearerProfile {
+            packet_boundary_supported: true,
+            gre_segmentation_supported: self.pcf_accepts_gre_segmentation,
+            ..cdma_a8::BearerProfile::standard_packet_data()
+        }
+    }
 }
 
 /// AN-side A9 client bound to one PCF signaling endpoint.
 pub struct HrpdAnA9Client<'a> {
-    endpoint: &'a cdma_a9::UdpSignalingEndpoint,
+    endpoint: &'a cdma_a9::SignalingEndpoint,
     config: HrpdA9ClientConfig,
-    sequence_no: u32,
 }
 
 impl<'a> HrpdAnA9Client<'a> {
-    pub fn new(endpoint: &'a cdma_a9::UdpSignalingEndpoint, config: HrpdA9ClientConfig) -> Self {
-        Self::with_sequence(endpoint, config, 0)
-    }
-
-    /// Construct with an existing A9 sequence counter, so a caller that spans
-    /// several transient clients across a session keeps the counter monotonic.
-    pub fn with_sequence(
-        endpoint: &'a cdma_a9::UdpSignalingEndpoint,
-        config: HrpdA9ClientConfig,
-        sequence_no: u32,
-    ) -> Self {
-        Self {
-            endpoint,
-            config,
-            sequence_no,
-        }
-    }
-
-    /// Current A9 sequence counter, to carry across transient clients.
-    pub fn sequence_no(&self) -> u32 {
-        self.sequence_no
+    pub fn new(endpoint: &'a cdma_a9::SignalingEndpoint, config: HrpdA9ClientConfig) -> Self {
+        Self { endpoint, config }
     }
 
     /// AN-side A8 bearer endpoint (for constructing the local bearer session).
@@ -115,7 +101,7 @@ impl<'a> HrpdAnA9Client<'a> {
         let payload = setup
             .encode()
             .map_err(|err| format!("HRPD AN A9: encode SetupA8: {err}"))?;
-        self.send_payload(request.uati, payload).await?;
+        self.send_payload(payload).await?;
 
         let connect = self
             .recv_reply(cdma_a9::MessageType::ConnectA8, "ConnectA8", |payload| {
@@ -133,8 +119,11 @@ impl<'a> HrpdAnA9Client<'a> {
                 meid: None,
             }),
             con_ref: connect.con_ref,
-            a8_traffic_id: connect.a8_traffic_id,
+            a8_traffic_id: an_a8_traffic_id(connect.a8_traffic_id.key, &self.config),
             pdsn_ip_address: connect.pdsn_ip_address,
+            pcf_accepts_gre_segmentation: connect
+                .a9_indicators
+                .is_some_and(|indicators| indicators.gre_segmentation_supported),
         })
     }
 
@@ -175,7 +164,7 @@ impl<'a> HrpdAnA9Client<'a> {
         let payload = release
             .encode()
             .map_err(|err| format!("HRPD AN A9: encode ReleaseA8: {err}"))?;
-        self.send_payload(uati, payload).await?;
+        self.send_payload(payload).await?;
 
         let complete = self
             .recv_reply(
@@ -200,25 +189,16 @@ impl<'a> HrpdAnA9Client<'a> {
         Ok(())
     }
 
-    async fn send_payload(&mut self, session_id: u32, payload: Vec<u8>) -> Result<(), String> {
-        self.sequence_no = self.sequence_no.wrapping_add(1);
-        let metadata = cdma_a9::TransportMetadata {
-            flags: 0,
-            session_id,
-            sequence_no: self.sequence_no,
-        };
-        let datagram = cdma_a9::UdpSignalingDatagram::new(metadata, payload)
-            .map_err(|err| format!("HRPD AN A9: encode A9 UDP datagram: {err}"))?;
+    async fn send_payload(&self, payload: Vec<u8>) -> Result<(), String> {
         self.endpoint
-            .send_datagram(self.config.pcf_addr, &datagram)
+            .send_payload(self.config.pcf_addr, &payload)
             .await
             .map_err(|err| {
                 format!(
-                    "HRPD AN A9: send A9 UDP datagram to {}: {err}",
+                    "HRPD AN A9: send A9 message to {}: {err}",
                     self.config.pcf_addr
                 )
-            })?;
-        Ok(())
+            })
     }
 
     async fn recv_reply<T>(
@@ -228,16 +208,15 @@ impl<'a> HrpdAnA9Client<'a> {
         decode: impl FnOnce(&[u8]) -> Result<T, String>,
     ) -> Result<T, String> {
         let mut buf = vec![0u8; 4096];
-        let (datagram, peer) =
-            tokio::time::timeout(A9_REPLY_TIMEOUT, self.endpoint.recv_datagram(&mut buf))
-                .await
-                .map_err(|_| {
-                    format!(
-                        "HRPD AN A9: timed out waiting for {label} from {}",
-                        self.config.pcf_addr
-                    )
-                })?
-                .map_err(|err| format!("HRPD AN A9: receive {label}: {err}"))?;
+        let (datagram, peer) = tokio::time::timeout(A9_REPLY_TIMEOUT, self.endpoint.recv(&mut buf))
+            .await
+            .map_err(|_| {
+                format!(
+                    "HRPD AN A9: timed out waiting for {label} from {}",
+                    self.config.pcf_addr
+                )
+            })?
+            .map_err(|err| format!("HRPD AN A9: receive {label}: {err}"))?;
         self.check_peer(peer)?;
         if datagram.message_type != expected {
             return Err(format!(
@@ -278,17 +257,27 @@ pub fn build_setup_a8(
         con_ref: cdma_a9::ConRef(request.mac_index),
         quality_of_service_parameters: None,
         bsc_id: cdma_a9::BscId(b"1XBTS".to_vec()),
-        a8_traffic_id: cdma_a9::A8TrafficId::gre_ppp(request.uati, config.a8_peer_ipv4),
-        service_option: cdma_a9::ServiceOptionValue::HIGH_RATE_PACKET_DATA,
+        a8_traffic_id: an_a8_traffic_id(request.uati, &config),
+        service_option: cdma_a9::ServiceOptionValue::HRPD_PACKET_DATA,
+        // Segments are safe because A8 payloads join one RLP byte stream
+        // (A.S0008-C §4.2.17).
         a9_indicators: cdma_a9::A9Indicators {
             packet_boundary_supported: false,
-            gre_segmentation_supported: false,
+            gre_segmentation_supported: true,
             sdb_supported: false,
             ccpd_mode: false,
             data_ready: true,
             handoff: false,
         },
         user_zone_id: None,
+    }
+}
+
+/// The PCF sends forward traffic to this IP (A.S0016-D §4.2.16).
+fn an_a8_traffic_id(key: u32, config: &HrpdA9ClientConfig) -> cdma_a9::A8TrafficId {
+    match config.an_a8_endpoint.local_ip {
+        std::net::IpAddr::V4(ip) => cdma_a9::A8TrafficId::gre_ppp(key, ip.octets()),
+        std::net::IpAddr::V6(ip) => cdma_a9::A8TrafficId::gre_ppp_ipv6(key, ip.octets()),
     }
 }
 

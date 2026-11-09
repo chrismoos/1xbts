@@ -371,6 +371,12 @@ pub struct BaseStationConfig {
     /// unique across `base_stations`. Defaults to `management_endpoint`.
     #[serde(default)]
     pub id: Option<String>,
+    #[serde(default = "default_msc_a1p")]
+    pub a1p: cdma_ios::transport::A1pConfig,
+}
+
+fn default_msc_a1p() -> cdma_ios::transport::A1pConfig {
+    cdma_ios::transport::A1pConfig::for_role(cdma_ios::transport::A1Role::Msc)
 }
 
 impl BaseStationConfig {
@@ -709,6 +715,7 @@ mod tests {
             base_stations: vec![BaseStationConfig {
                 management_endpoint: "http://127.0.0.1:17016".to_string(),
                 id: None,
+                a1p: cdma_ios::transport::A1pConfig::for_role(cdma_ios::transport::A1Role::Msc),
             }],
             voice: VoiceConfig::default(),
             welcome_sms: WelcomeSmsConfig::default(),

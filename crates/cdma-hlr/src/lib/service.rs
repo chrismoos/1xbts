@@ -1341,6 +1341,41 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         Ok(Response::new(()))
     }
 
+    async fn reserve_cave_count_update(
+        &self,
+        request: Request<proto::ReserveCaveCountUpdateRequest>,
+    ) -> Result<Response<proto::ReserveCaveCountUpdateResponse>, Status> {
+        let req = request.into_inner();
+        let identity = parse_identity_key(req.identity)?;
+        let update_id = self
+            .repo
+            .reserve_cave_count_update(
+                &identity,
+                std::time::Duration::from_secs(req.minimum_interval_secs),
+                std::time::Duration::from_secs(req.confirmation_timeout_secs),
+            )
+            .await?;
+        Ok(Response::new(proto::ReserveCaveCountUpdateResponse {
+            update_id: update_id.map(|id| id.to_string()),
+        }))
+    }
+
+    async fn confirm_cave_count_update(
+        &self,
+        request: Request<proto::ConfirmCaveCountUpdateRequest>,
+    ) -> Result<Response<proto::IncrementCaveCountResponse>, Status> {
+        let req = request.into_inner();
+        let identity = parse_identity_key(req.identity)?;
+        let update_id = parse_uuid(&req.update_id)?;
+        let count = self
+            .repo
+            .confirm_cave_count_update(&identity, update_id)
+            .await?;
+        Ok(Response::new(proto::IncrementCaveCountResponse {
+            auth_count: u32::from(count),
+        }))
+    }
+
     async fn increment_cave_count(
         &self,
         request: Request<proto::IncrementCaveCountRequest>,

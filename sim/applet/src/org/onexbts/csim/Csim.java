@@ -2,6 +2,8 @@ package org.onexbts.csim;
 
 import javacard.framework.APDU;
 import javacard.framework.CardRuntimeException;
+import javacard.framework.SystemException;
+import javacard.framework.TransactionException;
 import javacard.framework.Applet;
 import javacard.framework.ISO7816;
 import javacard.framework.ISOException;
@@ -10,6 +12,7 @@ import javacard.framework.MultiSelectable;
 import javacard.framework.Util;
 import javacard.framework.OwnerPIN;
 import javacard.security.RandomData;
+import javacard.security.CryptoException;
 
 /**
  * CSIM applet (C.S0065-B on a UICC per ETSI TS 102 221).
@@ -228,6 +231,13 @@ public final class Csim extends Applet implements MultiSelectable {
     // subsystem whose constructor threw, for PLATFORM_INFO.
     private byte buildStage;
     private short buildReason;
+    private short caveBuildStep;
+    private byte caveBuildException;
+    private short ipBuildStep;
+    private byte ipBuildException;
+    private static final byte BUILD_SYSTEM_EXCEPTION = 1;
+    private static final byte BUILD_TRANSACTION_EXCEPTION = 2;
+    private static final byte BUILD_OTHER_EXCEPTION = 3;
     private static final byte STAGE_CAVE = 1;
     private static final byte STAGE_IPAUTH = 2;
     private static final byte STAGE_SS0055 = 3;
@@ -235,11 +245,17 @@ public final class Csim extends Applet implements MultiSelectable {
     private static final byte STAGE_OTASPDH = 5;
     private static final byte STAGE_OTANAM = 6;
     private byte[] otaFlags;        // transient: see OTA_* indices
-    private byte[] otaAuthOtapa;    // transient: 3-byte AUTH_OTAPA of the open OTAPA session
     // OTASP download staging: [0] valid, [1] block id, [2] length, [3..] data.
     private byte[] stage;
     private byte[] fresh;           // transient: [0] valid, [1..2] Crypto-Sync
-    private byte[] secMode;         // transient: [0] secure mode active
+    private static final short FRESH_STATE_LEN = 7;
+    private static final short SEC_MODE = 3;
+    private static final short AUTH_OTAPA = 4;
+    private static final byte RNG_CREATE = 1;
+    private static final byte RNG_GENERATE = 2;
+    private byte rngFailureStep;
+    private byte rngFailureKind;
+    private short rngFailureReason;
     private RandomData rng;
     private final byte[] scratch;       // transient, FCP and INCREASE work area
     private static final short SCRATCH_LEN = 128;
@@ -262,9 +278,12 @@ public final class Csim extends Applet implements MultiSelectable {
     // SW bytes of an entry whose command has not completed.
     private static final byte APDU_LOG_SW_PENDING = (byte) 0xFF;
     private static final short APDU_LOG_DUMP_MAX = 254;
-    private short currentLogSlot;
-
-    private short currentOff;
+    // RAM cursors. Instance fields are persistent, so a field updated on
+    // every APDU would write flash on read-only commands.
+    private final short[] cursor;
+    private static final short CUR_FCP = 0;   // FCP/STATUS response write offset
+    private static final short CUR_LOG = 1;   // APDU log slot of the current command
+    private static final short CUR_COUNT = 2;
     // Persistent. Incremented before the SPC comparison, so removing power
     // after a mismatch still counts the attempt.
     private byte spcFails;
@@ -281,27 +300,32 @@ public final class Csim extends Applet implements MultiSelectable {
     private Csim() {
         fs = new FileSystem(CSIM_AID);
         ac = new Ac();
-        otaFlags = JCSystem.makeTransientByteArray(OTA_FLAGS_LEN, JCSystem.CLEAR_ON_DESELECT);
-        otaAuthOtapa = JCSystem.makeTransientByteArray((short) 3, JCSystem.CLEAR_ON_DESELECT);
-        stage = JCSystem.makeTransientByteArray((short) (STAGE_SLOTS * STAGE_SLOT), JCSystem.CLEAR_ON_DESELECT);
-        fresh = JCSystem.makeTransientByteArray((short) 3, JCSystem.CLEAR_ON_DESELECT);
-        secMode = JCSystem.makeTransientByteArray((short) 1, JCSystem.CLEAR_ON_DESELECT);
+        otaFlags = JCSystem.makeTransientByteArray(OTA_FLAGS_LEN, JCSystem.CLEAR_ON_RESET);
+        stage = JCSystem.makeTransientByteArray((short) (STAGE_SLOTS * STAGE_SLOT), JCSystem.CLEAR_ON_RESET);
+        fresh = JCSystem.makeTransientByteArray(FRESH_STATE_LEN, JCSystem.CLEAR_ON_RESET);
         scratch = JCSystem.makeTransientByteArray(SCRATCH_LEN,
                 JCSystem.CLEAR_ON_DESELECT);
         esnScratch = JCSystem.makeTransientByteArray(ESN_ME_LEN,
                 JCSystem.CLEAR_ON_DESELECT);
         tmpOffset = JCSystem.makeTransientShortArray((short) 1,
                 JCSystem.CLEAR_ON_DESELECT);
-        dfOfChannel = new byte[FileSystem.MAX_CHANNELS];
-        selectedRecord = new byte[FileSystem.MAX_CHANNELS];
+        cursor = JCSystem.makeTransientShortArray(CUR_COUNT, JCSystem.CLEAR_ON_RESET);
+        // Selection state is per session. A card reset selects the MF (DF_MF = 0).
+        dfOfChannel = JCSystem.makeTransientByteArray(FileSystem.MAX_CHANNELS, JCSystem.CLEAR_ON_RESET);
+        selectedRecord = JCSystem.makeTransientByteArray(FileSystem.MAX_CHANNELS, JCSystem.CLEAR_ON_RESET);
         apduLogHead = 0;
     }
 
     private Cave cave() {
         if (cave == null) {
             try {
-                cave = new Cave();
+                tmpOffset[0] = 0;
+                cave = new Cave(tmpOffset);
             } catch (CardRuntimeException e) {
+                caveBuildStep = tmpOffset[0];
+                caveBuildException = e instanceof SystemException ? BUILD_SYSTEM_EXCEPTION
+                        : e instanceof TransactionException ? BUILD_TRANSACTION_EXCEPTION
+                        : BUILD_OTHER_EXCEPTION;
                 buildFailed(STAGE_CAVE, e.getReason());
             }
         }
@@ -311,8 +335,13 @@ public final class Csim extends Applet implements MultiSelectable {
     private IpAuth ipAuth() {
         if (ipAuth == null) {
             try {
-                ipAuth = new IpAuth();
+                tmpOffset[0] = 0;
+                ipAuth = new IpAuth(tmpOffset);
             } catch (CardRuntimeException e) {
+                ipBuildStep = tmpOffset[0];
+                ipBuildException = e instanceof SystemException ? BUILD_SYSTEM_EXCEPTION
+                        : e instanceof TransactionException ? BUILD_TRANSACTION_EXCEPTION
+                        : BUILD_OTHER_EXCEPTION;
                 buildFailed(STAGE_IPAUTH, e.getReason());
             }
         }
@@ -421,7 +450,7 @@ public final class Csim extends Applet implements MultiSelectable {
         boolean isDebugDump = (buf[ISO7816.OFFSET_INS] == Const.INS_DEBUG_DUMP_APDULOG)
                            || (buf[ISO7816.OFFSET_INS] == Const.INS_DEBUG_CLEAR_APDULOG);
         short logSlot = (!Variant.DEBUG || isDebugDump) ? (short) -1 : logApduHeader(buf);
-        currentLogSlot = logSlot;
+        cursor[CUR_LOG] = logSlot;
 
         try {
             byte channel = channelOf(apdu);
@@ -547,10 +576,10 @@ public final class Csim extends Applet implements MultiSelectable {
     /** Keeps the first data bytes of the current command, a FID or an
      *  AID prefix, in its trace entry. Never called for PIN commands. */
     private void logApduData(byte[] buf, short lc) {
-        if (currentLogSlot < 0 || lc <= 0) return;
+        if (cursor[CUR_LOG] < 0 || lc <= 0) return;
         short n = lc < APDU_LOG_DATA_LEN ? lc : APDU_LOG_DATA_LEN;
         Util.arrayCopyNonAtomic(buf, ISO7816.OFFSET_CDATA, apduLog,
-                                (short) (currentLogSlot + APDU_LOG_DATA_OFF), n);
+                                (short) (cursor[CUR_LOG] + APDU_LOG_DATA_OFF), n);
     }
 
     private void logApduSw(short slot, short sw) {
@@ -712,24 +741,24 @@ public final class Csim extends Applet implements MultiSelectable {
     // FCP builders (TS 102 221 §11.1.1.3)
 
     private void putTlv1(byte tag, byte value) {
-        scratch[currentOff++] = tag;
-        scratch[currentOff++] = 1;
-        scratch[currentOff++] = value;
+        scratch[cursor[CUR_FCP]++] = tag;
+        scratch[cursor[CUR_FCP]++] = 1;
+        scratch[cursor[CUR_FCP]++] = value;
     }
 
     private void putTlv2(byte tag, short value) {
-        scratch[currentOff++] = tag;
-        scratch[currentOff++] = 2;
-        Util.setShort(scratch, currentOff, value);
-        currentOff += 2;
+        scratch[cursor[CUR_FCP]++] = tag;
+        scratch[cursor[CUR_FCP]++] = 2;
+        Util.setShort(scratch, cursor[CUR_FCP], value);
+        cursor[CUR_FCP] += 2;
     }
 
     /** Security attributes of an EF: READ, UPDATE, INCREASE (cyclic EFs
      *  only, AM_DO tag 84 with INS 32, TS 102 221 §11.1.8), DEACTIVATE
      *  and ACTIVATE, each as one expanded-format rule. */
     private void putEfSecurity(Ef ef) {
-        scratch[currentOff++] = TAG_SEC_EXPANDED;
-        short lenPos = currentOff++;
+        scratch[cursor[CUR_FCP]++] = TAG_SEC_EXPANDED;
+        short lenPos = cursor[CUR_FCP]++;
         putRule(AM_DO_BYTE, AM_READ, ef.readAc);
         putRule(AM_DO_BYTE, AM_UPDATE, ef.updateAc);
         if (ef.structure == Const.FS_CYCLIC) {
@@ -737,34 +766,34 @@ public final class Csim extends Applet implements MultiSelectable {
         }
         putRule(AM_DO_BYTE, AM_DEACTIVATE, FileSystem.deactivateAc(ef.fid));
         putRule(AM_DO_BYTE, AM_ACTIVATE, FileSystem.activateAc(ef.fid));
-        scratch[lenPos] = (byte) (currentOff - lenPos - 1);
+        scratch[lenPos] = (byte) (cursor[CUR_FCP] - lenPos - 1);
     }
 
     /** One expanded-format rule: AM_DO (tag 80 AM byte, or tag 84 INS)
      *  followed by its SC_DO (ISO/IEC 7816-4 §5.4.3.3). */
     private void putRule(byte amTag, byte amValue, byte acCode) {
-        scratch[currentOff++] = amTag;
-        scratch[currentOff++] = 1;
-        scratch[currentOff++] = amValue;
+        scratch[cursor[CUR_FCP]++] = amTag;
+        scratch[cursor[CUR_FCP]++] = 1;
+        scratch[cursor[CUR_FCP]++] = amValue;
         switch (acCode) {
             case Const.AC_ALWAYS:
-                scratch[currentOff++] = SC_DO_ALWAYS;
-                scratch[currentOff++] = 0;
+                scratch[cursor[CUR_FCP]++] = SC_DO_ALWAYS;
+                scratch[cursor[CUR_FCP]++] = 0;
                 break;
             case Const.AC_NEVER:
-                scratch[currentOff++] = SC_DO_NEVER;
-                scratch[currentOff++] = 0;
+                scratch[cursor[CUR_FCP]++] = SC_DO_NEVER;
+                scratch[cursor[CUR_FCP]++] = 0;
                 break;
             default:
-                scratch[currentOff++] = SC_DO_AUTH;
-                scratch[currentOff++] = 6;
-                scratch[currentOff++] = TAG_KEY_REF;
-                scratch[currentOff++] = 1;
-                scratch[currentOff++] = (acCode == Const.AC_PIN1) ? P2_PIN1
+                scratch[cursor[CUR_FCP]++] = SC_DO_AUTH;
+                scratch[cursor[CUR_FCP]++] = 6;
+                scratch[cursor[CUR_FCP]++] = TAG_KEY_REF;
+                scratch[cursor[CUR_FCP]++] = 1;
+                scratch[cursor[CUR_FCP]++] = (acCode == Const.AC_PIN1) ? P2_PIN1
                         : (acCode == Const.AC_PIN2) ? P2_PIN2 : P2_ADM1;
-                scratch[currentOff++] = TAG_USAGE_QUALIFIER;
-                scratch[currentOff++] = 1;
-                scratch[currentOff++] = USAGE_PIN_VERIFICATION;
+                scratch[cursor[CUR_FCP]++] = TAG_USAGE_QUALIFIER;
+                scratch[cursor[CUR_FCP]++] = 1;
+                scratch[cursor[CUR_FCP]++] = USAGE_PIN_VERIFICATION;
         }
     }
 
@@ -776,21 +805,21 @@ public final class Csim extends Applet implements MultiSelectable {
     /** PIN status template DO (TS 102 221 §11.1.1.4.10): PS_DO flags each
      *  listed key reference enabled (1) or disabled (0), b8 first. */
     private void putPinStatusTemplate() {
-        scratch[currentOff++] = TAG_PIN_STATUS_TEMPLATE;
-        scratch[currentOff++] = PS_TEMPLATE_LEN;
-        scratch[currentOff++] = TAG_PS_DO;
-        scratch[currentOff++] = 1;
-        scratch[currentOff++] = (byte) ((ac.isPin1Enabled() ? PS_DO_PIN1 : 0) | PS_DO_PIN2 | PS_DO_ADM1);
+        scratch[cursor[CUR_FCP]++] = TAG_PIN_STATUS_TEMPLATE;
+        scratch[cursor[CUR_FCP]++] = PS_TEMPLATE_LEN;
+        scratch[cursor[CUR_FCP]++] = TAG_PS_DO;
+        scratch[cursor[CUR_FCP]++] = 1;
+        scratch[cursor[CUR_FCP]++] = (byte) ((ac.isPin1Enabled() ? PS_DO_PIN1 : 0) | PS_DO_PIN2 | PS_DO_ADM1);
         putTlv1(TAG_KEY_REF, P2_PIN1);
         putTlv1(TAG_KEY_REF, P2_PIN2);
         putTlv1(TAG_KEY_REF, P2_ADM1);
     }
 
     private void sendFcp(APDU apdu) {
-        scratch[1] = (byte) (currentOff - 2);
+        scratch[1] = (byte) (cursor[CUR_FCP] - 2);
         apdu.setOutgoing();
-        apdu.setOutgoingLength(currentOff);
-        apdu.sendBytesLong(scratch, (short) 0, currentOff);
+        apdu.setOutgoingLength(cursor[CUR_FCP]);
+        apdu.sendBytesLong(scratch, (short) 0, cursor[CUR_FCP]);
     }
 
     // File descriptor DO lengths (TS 102 221 §11.1.1.4.3): descriptor byte
@@ -801,21 +830,21 @@ public final class Csim extends Applet implements MultiSelectable {
 
     private void sendFcpForEf(APDU apdu, Ef ef, byte p2) {
         if ((p2 & SEL_P2_DATA_MASK) == SEL_P2_NO_DATA) return;
-        currentOff = 0;
-        scratch[currentOff++] = TAG_FCP;
-        currentOff++;
-        scratch[currentOff++] = TAG_FILE_DESCRIPTOR;
+        cursor[CUR_FCP] = 0;
+        scratch[cursor[CUR_FCP]++] = TAG_FCP;
+        cursor[CUR_FCP]++;
+        scratch[cursor[CUR_FCP]++] = TAG_FILE_DESCRIPTOR;
         if (ef.structure == Const.FS_TRANSPARENT) {
-            scratch[currentOff++] = FD_LEN_TRANSPARENT;
-            scratch[currentOff++] = (byte) (FD_EF_SHAREABLE | Const.FS_TRANSPARENT);
-            scratch[currentOff++] = DATA_CODING;
+            scratch[cursor[CUR_FCP]++] = FD_LEN_TRANSPARENT;
+            scratch[cursor[CUR_FCP]++] = (byte) (FD_EF_SHAREABLE | Const.FS_TRANSPARENT);
+            scratch[cursor[CUR_FCP]++] = DATA_CODING;
         } else {
-            scratch[currentOff++] = FD_LEN_RECORD;
-            scratch[currentOff++] = (byte) (FD_EF_SHAREABLE | ef.structure);
-            scratch[currentOff++] = DATA_CODING;
-            scratch[currentOff++] = 0x00;
-            scratch[currentOff++] = ef.recordLength;
-            scratch[currentOff++] = (byte) ef.recordCount();
+            scratch[cursor[CUR_FCP]++] = FD_LEN_RECORD;
+            scratch[cursor[CUR_FCP]++] = (byte) (FD_EF_SHAREABLE | ef.structure);
+            scratch[cursor[CUR_FCP]++] = DATA_CODING;
+            scratch[cursor[CUR_FCP]++] = 0x00;
+            scratch[cursor[CUR_FCP]++] = ef.recordLength;
+            scratch[cursor[CUR_FCP]++] = (byte) ef.recordCount();
         }
         putTlv2(TAG_FILE_ID, ef.fid);
         putTlv1(TAG_LIFE_CYCLE, ef.deactivated ? LCS_DEACTIVATED : LCS_ACTIVATED);
@@ -829,27 +858,27 @@ public final class Csim extends Applet implements MultiSelectable {
 
     private void sendFcpForDf(APDU apdu, boolean adf, byte p2) {
         if ((p2 & SEL_P2_DATA_MASK) == SEL_P2_NO_DATA) return;
-        currentOff = 0;
-        scratch[currentOff++] = TAG_FCP;
-        currentOff++;
-        scratch[currentOff++] = TAG_FILE_DESCRIPTOR;
-        scratch[currentOff++] = 2;
-        scratch[currentOff++] = FD_DF;
-        scratch[currentOff++] = DATA_CODING;
+        cursor[CUR_FCP] = 0;
+        scratch[cursor[CUR_FCP]++] = TAG_FCP;
+        cursor[CUR_FCP]++;
+        scratch[cursor[CUR_FCP]++] = TAG_FILE_DESCRIPTOR;
+        scratch[cursor[CUR_FCP]++] = 2;
+        scratch[cursor[CUR_FCP]++] = FD_DF;
+        scratch[cursor[CUR_FCP]++] = DATA_CODING;
         putTlv2(TAG_FILE_ID, adf ? Const.FID_ADF : Const.FID_MF);
         if (adf) {
-            scratch[currentOff++] = TAG_DF_NAME;
-            scratch[currentOff++] = (byte) CSIM_AID.length;
-            Util.arrayCopyNonAtomic(CSIM_AID, (short) 0, scratch, currentOff,
+            scratch[cursor[CUR_FCP]++] = TAG_DF_NAME;
+            scratch[cursor[CUR_FCP]++] = (byte) CSIM_AID.length;
+            Util.arrayCopyNonAtomic(CSIM_AID, (short) 0, scratch, cursor[CUR_FCP],
                                     (short) CSIM_AID.length);
-            currentOff += (short) CSIM_AID.length;
+            cursor[CUR_FCP] += (short) CSIM_AID.length;
         }
-        scratch[currentOff++] = TAG_PROPRIETARY;
-        scratch[currentOff++] = 3;
+        scratch[cursor[CUR_FCP]++] = TAG_PROPRIETARY;
+        scratch[cursor[CUR_FCP]++] = 3;
         putTlv1(TAG_UICC_CHARACTERISTICS, UICC_CHARACTERISTICS);
         putTlv1(TAG_LIFE_CYCLE, LCS_ACTIVATED);
-        scratch[currentOff++] = TAG_SEC_EXPANDED;
-        scratch[currentOff++] = 5;
+        scratch[cursor[CUR_FCP]++] = TAG_SEC_EXPANDED;
+        scratch[cursor[CUR_FCP]++] = 5;
         putRule(AM_DO_BYTE, AM_DF_DELETE, Const.AC_NEVER);
         putPinStatusTemplate();
         sendFcp(apdu);
@@ -1039,7 +1068,7 @@ public final class Csim extends Applet implements MultiSelectable {
         boolean txn = cyclic && begin(channel);
         if (cyclic) {
             // The oldest record is overwritten and becomes record 1.
-            rotateCyclic(ef, channel);
+            ef.advanceCyclic();
             rec = 1;
         }
         write(buf, ISO7816.OFFSET_CDATA, ef.pool, ef.recordOffset(rec), lc, channel);
@@ -1056,6 +1085,13 @@ public final class Csim extends Applet implements MultiSelectable {
     }
 
     private void write(byte[] src, short srcOff, byte[] dst, short dstOff, short len, byte channel) {
+        while (len > 0 && src[srcOff] == dst[dstOff]) {
+            srcOff++;
+            dstOff++;
+            len--;
+        }
+        while (len > 0 && src[(short) (srcOff + len - 1)] == dst[(short) (dstOff + len - 1)]) len--;
+        if (len == 0) return;
         if (tearSafe(channel)) {
             Util.arrayCopy(src, srcOff, dst, dstOff, len);
         } else {
@@ -1073,16 +1109,6 @@ public final class Csim extends Applet implements MultiSelectable {
 
     private static void commit(boolean started) {
         if (started) JCSystem.commitTransaction();
-    }
-
-    /** Shift every record of a cyclic EF down by one. The former last
-     *  record is dropped and record 1 is free for the new value. */
-    private void rotateCyclic(Ef ef, byte channel) {
-        short n = ef.recordCount();
-        short recLen = (short) (ef.recordLength & 0xFF);
-        for (short r = (short) (n - 1); r >= 1; r--) {
-            write(ef.pool, ef.recordOffset(r), ef.pool, ef.recordOffset((short) (r + 1)), recLen, channel);
-        }
     }
 
     // SEARCH RECORD (TS 102 221 §11.1.7), simple search
@@ -1182,7 +1208,7 @@ public final class Csim extends Applet implements MultiSelectable {
             }
         }
         boolean txn = begin(channel);
-        rotateCyclic(ef, channel);
+        ef.advanceCyclic();
         write(scratch, (short) 0, ef.pool, ef.recordOffset((short) 1), recLen, channel);
         commit(txn);
         selectedRecord[channel] = 1;
@@ -1480,6 +1506,8 @@ public final class Csim extends Applet implements MultiSelectable {
         if ((short) (offset + fullLen) > fs.metaSize()) {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         }
+        // Reserve the secure RNG before EF allocation consumes card-managed resources.
+        if (rng == null) randomChallenge(scratch, SC_RAND);
         fs.initMetaChunk(buf, cdata, offset, fullLen, finished);
     }
 
@@ -1530,6 +1558,13 @@ public final class Csim extends Applet implements MultiSelectable {
         Util.setShort(scratch, o, fs.poolLength()); o += 2;
         scratch[o++] = buildStage;
         Util.setShort(scratch, o, buildReason); o += 2;
+        scratch[o++] = caveBuildException;
+        Util.setShort(scratch, o, caveBuildStep); o += 2;
+        scratch[o++] = ipBuildException;
+        Util.setShort(scratch, o, ipBuildStep); o += 2;
+        scratch[o++] = rngFailureStep;
+        scratch[o++] = rngFailureKind;
+        Util.setShort(scratch, o, rngFailureReason); o += 2;
         apdu.setOutgoing();
         apdu.setOutgoingLength(o);
         apdu.sendBytesLong(scratch, (short) 0, o);
@@ -1823,20 +1858,30 @@ public final class Csim extends Applet implements MultiSelectable {
         }
     }
 
-    /**
-     * Base Station Challenge (C.S0065-B §9.4.1.2). Generates a fresh
-     * 4-byte RANDBS, retains it for the following Update SSD, and returns
-     * it. RANDSeed from the ME is not reused (C.S0023-D §4.2.1 permits an
-     * independently generated RANDBS).
-     */
+    private void randomChallenge(byte[] output, short offset) {
+        byte step = RNG_CREATE;
+        try {
+            if (rng == null) rng = RandomData.getInstance(RandomData.ALG_SECURE_RANDOM);
+            step = RNG_GENERATE;
+            rng.generateData(output, offset, (short) 4);
+        } catch (RuntimeException e) {
+            rngFailureStep = step;
+            rngFailureKind = e instanceof SystemException ? (byte) 1
+                    : e instanceof CryptoException ? (byte) 2
+                    : e instanceof SecurityException ? (byte) 3 : (byte) 4;
+            rngFailureReason = e instanceof CardRuntimeException
+                    ? ((CardRuntimeException) e).getReason() : (short) 0;
+            ISOException.throwIt(ISO7816.SW_UNKNOWN);
+        }
+    }
+
     private void doBaseStationChallenge(APDU apdu, byte channel) {
         byte[] buf = apdu.getBuffer();
         if (dfOfChannel[channel] != DF_ADF) ISOException.throwIt(Const.SW_CONDITIONS_NOT_SAT);
         ac.check(Const.AC_PIN1, channel);
         short lc = apdu.setIncomingAndReceive();
         if (lc != BS_CHALLENGE_LC) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-        if (rng == null) rng = RandomData.getInstance(RandomData.ALG_SECURE_RANDOM);
-        rng.generateData(scratch, SC_RAND, (short) 4);
+        randomChallenge(scratch, SC_RAND);
         cave().setRandBs(scratch, SC_RAND);
         Util.arrayCopyNonAtomic(scratch, SC_RAND, buf, (short) 0, (short) 4);
         apdu.setOutgoing();
@@ -1869,10 +1914,10 @@ public final class Csim extends Applet implements MultiSelectable {
             if (f > l || l >= Cave.VPM_LEN) ISOException.throwIt(Const.SW_WRONG_DATA);
             vpmLen = (short) (l - f + 1);
         }
-        cave().keyVpmGeneration();
-        Util.arrayCopyNonAtomic(cave().cmeaKey(), (short) 0, buf, (short) 0, Cave.KEY_LEN);
+        cave().keyVpmGeneration(vpmLen == 0 ? (short) -1 : (short) (f + vpmLen - 1));
+        Util.arrayCopyNonAtomic(cave().cmeaKey(), cave().cmeaKeyOffset(), buf, (short) 0, Cave.KEY_LEN);
         if (vpmLen > 0) {
-            Util.arrayCopyNonAtomic(cave().vpm(), f, buf, Cave.KEY_LEN, vpmLen);
+            Util.arrayCopyNonAtomic(cave().vpm(), (short) (cave().vpmOffset() + f), buf, Cave.KEY_LEN, vpmLen);
         }
         short total = (short) (Cave.KEY_LEN + vpmLen);
         apdu.setOutgoing();
@@ -2122,7 +2167,7 @@ public final class Csim extends Applet implements MultiSelectable {
         byte r0 = (byte) ((b0 >> 5) & 0x03);
         byte r1 = (byte) (((b0 & 0x1F) << 3) | ((b1 >> 5) & 0x07));
         byte r2 = (byte) (((b1 & 0x1F) << 3) | ((b2 >> 5) & 0x07));
-        if (r0 != otaAuthOtapa[0] || r1 != otaAuthOtapa[1] || r2 != otaAuthOtapa[2]) {
+        if (r0 != fresh[AUTH_OTAPA] || r1 != fresh[(short) (AUTH_OTAPA + 1)] || r2 != fresh[(short) (AUTH_OTAPA + 2)]) {
             return VAL_RESULT_INVALID_SPASM;
         }
         otaFlags[OTA_NAM_LOCKED] = 0;
@@ -2337,9 +2382,9 @@ public final class Csim extends Applet implements MultiSelectable {
             Util.arrayCopyNonAtomic(buf, c, scratch, (short) 24, (short) 8);
             ss0055().f3(scratch, (short) 0, scratch, (short) 16, scratch, (short) 32);  // SMCK
             ss0055().espSetKey(scratch, (short) 32);
-            secMode[0] = 1;
+            fresh[SEC_MODE] = 1;
         } else {
-            secMode[0] = 0;
+            fresh[SEC_MODE] = 0;
         }
         buf[0] = VAL_RESULT_ACCEPT;
         apdu.setOutgoing();
@@ -2350,7 +2395,7 @@ public final class Csim extends Applet implements MultiSelectable {
     /** ESP-encrypt or decrypt (XOR keystream) a parameter-data span when
      *  Secure Mode is active, keyed by SMCK and the current FRESH. */
     private void secureParamData(byte[] buf, short off, short len) {
-        if (secMode[0] == 0 || len == 0) return;
+        if (fresh[SEC_MODE] == 0 || len == 0) return;
         ss0055().espMask(fresh, (short) 1, (short) 2, buf, off, len);
     }
 
@@ -2405,13 +2450,12 @@ public final class Csim extends Applet implements MultiSelectable {
         boolean start = (buf[c] & OTAPA_START) != 0;
         boolean namLock = otapaEnabled();
         if (start && namLock) {
-            if (rng == null) rng = RandomData.getInstance(RandomData.ALG_SECURE_RANDOM);
-            rng.generateData(scratch, SC_RAND, (short) 4);
+            randomChallenge(scratch, SC_RAND);
             readImsiM();
             min1FromImsi();
             esnFieldToCave(buf, (short) (c + 5));
             cave().authOtapa(scratch, SC_RAND, scratch, SC_AUTHDATA, scratch, SC_ESN,
-                           otaAuthOtapa, (short) 0);
+                           fresh, AUTH_OTAPA);
             otaFlags[OTA_OTAPA_ACTIVE] = 1;
             otaFlags[OTA_NAM_LOCKED] = 1;
             buf[0] = VAL_RESULT_ACCEPT;

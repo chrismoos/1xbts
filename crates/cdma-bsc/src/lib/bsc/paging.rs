@@ -1208,6 +1208,13 @@ impl Bsc {
         let wire_msg_type = MessageId::GeneralPage
             .wire_type(cdma_common::lac::message_types::WireChannel::ForwardCommon)
             .unwrap_or(0x11);
+        if let Some(coord) = self.hrpd_coord.as_ref() {
+            let mut lac_pdu = vec![wire_msg_type];
+            lac_pdu.extend_from_slice(&sdu_bytes);
+            if coord.offer_page(page_addr, &lac_pdu) {
+                info!("BSC: also sent the {purpose} page to the HRPD AN over A21");
+            }
+        }
         let aim = match AirInterfaceMessagePayload::new(wire_msg_type, sdu_bytes) {
             Ok(aim) => aim,
             Err(e) => {

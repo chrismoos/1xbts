@@ -1,15 +1,7 @@
-//! GRE/IP bearer primitives for the A8 user plane.
-//!
-//! Implemented wire surface:
-//! - keyed GRE session binding via the GRE `Key` field
-//! - optional RFC 2890 GRE sequencing via the GRE sequence-number field
-//! - endpoint and session ownership tracked by the bearer table
-//!
-//! The current in-repo source text for `A.S0016` / `X.S0011-*` still leaves the exact
-//! non-RFC GRE attribute bit layout unresolved for short-data indication and GRE
-//! segmentation signaling. Accordingly, this crate retains those negotiated capabilities in
-//! [`BearerProfile`] as control-plane metadata, but it does not attempt to synthesize or
-//! parse additional GRE header bits beyond keyed GRE plus optional RFC 2890 sequencing.
+//! A8 user plane: keyed 3GPP2 GRE (A.S0012-D §2.6, §3.4).
+
+mod gre_socket;
+mod packet_boundary;
 
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
@@ -18,6 +10,9 @@ use std::os::fd::{AsRawFd, RawFd};
 
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+
+pub use gre_socket::{GRE_IN_UDP_PORT, GreSocket};
+pub use packet_boundary::{BearerChunk, DEFAULT_MAX_GRE_PAYLOAD, PppFrameAligner};
 
 /// Errors returned by the A8 GRE codec and bearer helpers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,10 +67,10 @@ impl std::error::Error for Error {}
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BearerTransportMode {
-    /// Send exact GRE packets over IP protocol 47.
-    #[default]
+    /// IP protocol 47. Requires raw socket privileges.
     RawGre,
-    /// Send the same exact GRE packet bytes as the payload of a UDP datagram.
+    /// RFC 8086, normally to port [`GRE_IN_UDP_PORT`].
+    #[default]
     UdpEncapsulatedGre,
 }
 
@@ -89,6 +84,8 @@ pub struct BearerTransportConfig {
     pub udp_bind_addr: Option<SocketAddr>,
     /// Peer UDP socket for `udp_encapsulated_gre`.
     pub udp_peer_addr: Option<SocketAddr>,
+    /// Largest PPP payload per GRE frame. Defaults to [`DEFAULT_MAX_GRE_PAYLOAD`].
+    pub max_gre_payload: Option<u16>,
 }
 
 impl BearerTransportConfig {
@@ -98,6 +95,7 @@ impl BearerTransportConfig {
             mode: BearerTransportMode::RawGre,
             udp_bind_addr: None,
             udp_peer_addr: None,
+            max_gre_payload: None,
         }
     }
 
@@ -107,7 +105,12 @@ impl BearerTransportConfig {
             mode: BearerTransportMode::UdpEncapsulatedGre,
             udp_bind_addr: Some(bind),
             udp_peer_addr: Some(peer),
+            max_gre_payload: None,
         }
+    }
+
+    pub fn max_gre_payload(&self) -> u16 {
+        self.max_gre_payload.unwrap_or(DEFAULT_MAX_GRE_PAYLOAD)
     }
 
     /// Validates the outer transport without inspecting any session keys.
@@ -133,6 +136,9 @@ impl BearerTransportConfig {
         label: &str,
         peer_policy: PeerAddrPolicy,
     ) -> Option<String> {
+        if self.max_gre_payload == Some(0) {
+            return Some(format!("{label}: max_gre_payload must be at least 1"));
+        }
         match self.mode {
             BearerTransportMode::RawGre => {
                 if self.udp_bind_addr.is_some() || self.udp_peer_addr.is_some() {
@@ -392,6 +398,16 @@ impl RawGreSocket {
     }
 
     pub fn try_recv_wire_packet(&self, buf: &mut [u8]) -> Result<(Vec<u8>, IpAddr)> {
+        let (gre_bytes, source_ip) = self
+            .try_recv_wire_io(buf)
+            .map_err(|e| Error::RawTransport(format!("receive native GRE packet: {e}")))?;
+        GrePacket::decode(&gre_bytes)?;
+        Ok((gre_bytes, source_ip))
+    }
+
+    /// Keeps the I/O error kind so a caller can tell an empty queue from a
+    /// failure.
+    fn try_recv_wire_io(&self, buf: &mut [u8]) -> std::io::Result<(Vec<u8>, IpAddr)> {
         // SAFETY: MaybeUninit<u8> has the same layout as u8. The cast preserves
         // the slice length and exclusive borrow, and recv_from never deinitializes bytes.
         let uninit = unsafe {
@@ -400,16 +416,15 @@ impl RawGreSocket {
                 buf.len(),
             )
         };
-        let (len, from) = self
-            .socket
-            .recv_from(uninit)
-            .map_err(|e| Error::RawTransport(format!("receive native GRE packet: {e}")))?;
-        let source_ip = from
-            .as_socket()
-            .map(|addr| addr.ip())
-            .ok_or_else(|| Error::RawTransport("native GRE source address unavailable".into()))?;
-        let gre_bytes = strip_inbound_ip_header(self.local_ip, &buf[..len])?;
-        GrePacket::decode(gre_bytes)?;
+        let (len, from) = self.socket.recv_from(uninit)?;
+        let source_ip = from.as_socket().map(|addr| addr.ip()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "native GRE source address unavailable",
+            )
+        })?;
+        let gre_bytes = strip_inbound_ip_header(self.local_ip, &buf[..len])
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         Ok((gre_bytes.to_vec(), source_ip))
     }
 }
@@ -439,6 +454,10 @@ impl TokioRawGreSocket {
 
     pub fn try_recv_wire_packet(&self, buf: &mut [u8]) -> Result<(Vec<u8>, IpAddr)> {
         self.socket.get_ref().try_recv_wire_packet(buf)
+    }
+
+    pub(crate) fn try_recv_wire_io(&self, buf: &mut [u8]) -> std::io::Result<(Vec<u8>, IpAddr)> {
+        self.socket.get_ref().try_recv_wire_io(buf)
     }
 
     pub async fn send_wire_packet_to(&self, remote_ip: IpAddr, wire_bytes: &[u8]) -> Result<usize> {
@@ -708,24 +727,11 @@ pub struct BearerProfile {
     /// Whether the bearer requires GRE sequence numbers.
     pub sequencing: SequencingMode,
     /// Whether the sender guarantees higher-layer packet boundaries on the bearer.
-    ///
-    /// This is retained as negotiated session metadata. The current repo spec set does not yet
-    /// pin down the exact non-RFC GRE attribute bit layout needed to carry this on the wire.
     pub packet_boundary_supported: bool,
-    /// Whether the receiver can accept GRE segmentation indications for fragmented packets.
-    ///
-    /// This is retained as negotiated session metadata until the exact GRE attribute bit layout
-    /// is confirmed from primary-source spec text.
+    /// Whether the receiver accepts Segmentation Indication attributes.
     pub gre_segmentation_supported: bool,
-    /// Whether the bearer supports short-data indication negotiation.
-    ///
-    /// This is retained as negotiated session metadata until the exact GRE attribute bit layout
-    /// is confirmed from primary-source spec text.
     pub short_data_indication_supported: bool,
-    /// Whether the peer has advertised GRE flow-control capability for the bearer.
-    ///
-    /// A10-related flow-control/duration bits remain metadata-only until the exact non-RFC GRE
-    /// attribute layout is confirmed from primary-source spec text.
+    /// Whether the peer accepts Flow Control Indication attributes.
     pub flow_control_supported: bool,
 }
 
@@ -754,13 +760,7 @@ impl BearerProfile {
         }
     }
 
-    /// Returns `true` when the negotiated profile includes capabilities whose exact GRE
-    /// attribute bit layout is still unresolved in the current in-repo spec text.
-    ///
-    /// When this returns `true`, the current implementation keeps the capability flags in the
-    /// session record but still emits and accepts only keyed GRE plus the optional RFC 2890
-    /// sequence-number field.
-    pub fn has_unresolved_wire_attributes(self) -> bool {
+    pub fn uses_gre_attributes(self) -> bool {
         self.packet_boundary_supported
             || self.gre_segmentation_supported
             || self.short_data_indication_supported
@@ -780,11 +780,11 @@ impl Default for BearerProfile {
 pub struct HrpdA9ClientConfig {
     /// PCF A9 signaling address the client sends SetupA8/ReleaseA8 to.
     pub pcf_addr: SocketAddr,
-    /// PCF-side A8 bearer IPv4, used to build the A8 traffic id.
-    pub a8_peer_ipv4: [u8; 4],
+    pub a9_transport: cdma_a9::A9Transport,
     /// AN-side A8 bearer transport binding.
     pub an_a8_bearer: BearerTransportConfig,
-    /// AN-side A8 bearer endpoint.
+    /// AN-side A8 bearer endpoint. `local_ip` is sent in SetupA8's A8 Traffic
+    /// ID and `remote_ip` is the PCF's A8 address.
     pub an_a8_endpoint: BearerEndpoint,
 }
 
@@ -903,6 +903,7 @@ pub struct InboundPacket {
     pub rx_ordinal: u64,
     /// GRE sequence number carried by the packet, if present.
     pub gre_sequence: Option<u32>,
+    pub attributes: Vec<GreAttribute>,
     /// Decapsulated bearer payload.
     pub payload: Vec<u8>,
 }
@@ -1071,15 +1072,14 @@ pub enum RebindOutcome {
     },
 }
 
-/// GRE packet carrying A8/A10 bearer traffic.
-///
-/// This codec intentionally supports only keyed GRE plus the optional RFC 2890 sequence-number
-/// field. Non-RFC attribute bits for short-data indication, GRE segmentation indication, and
-/// A10 flow-control/duration remain out of scope until the exact bit layout is confirmed in the
-/// current repo's primary-source spec set.
 const GRE_KEY_FLAG: u16 = 0x2000;
 const GRE_SEQUENCE_FLAG: u16 = 0x1000;
 
+/// A.S0012-D §2.6. The user traffic after the attributes keeps the negotiated
+/// protocol type.
+pub const GRE_PROTOCOL_TYPE_3GPP2_PACKET: u16 = 0x88d2;
+
+/// A.S0012-D Figure 2.6-2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrePacket {
     /// Whether the keyed-GRE flag is set.
@@ -1092,8 +1092,186 @@ pub struct GrePacket {
     pub key: Option<u32>,
     /// Optional GRE sequence number.
     pub sequence_number: Option<u32>,
-    /// Encapsulated bearer payload.
+    /// 3GPP2 attributes. Non-empty only when `protocol_type` is
+    /// [`GRE_PROTOCOL_TYPE_3GPP2_PACKET`].
+    pub attributes: Vec<GreAttribute>,
     pub payload: Vec<u8>,
+}
+
+/// Segmentation Indication value (A.S0012-D §2.6.1.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GreSegment {
+    Started,
+    Continued,
+    Ended,
+}
+
+/// Flow Control Indication duration (A.S0012-D §2.6.1.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowControlDuration {
+    Temporary,
+    Indefinite,
+}
+
+/// Flow Control Indication instruction (A.S0012-D §2.6.1.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowControl {
+    Xon,
+    Xoff(FlowControlDuration),
+}
+
+/// One 3GPP2 GRE attribute (A.S0012-D §2.6.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GreAttribute {
+    /// The packet is suitable for Short Data Burst transmission.
+    ShortDataIndication,
+    FlowControl(FlowControl),
+    IpFlowDiscriminator {
+        flow_id: u8,
+    },
+    Segmentation(GreSegment),
+    /// Discarded by the receiver, which processes the rest of the frame.
+    Unknown {
+        attribute_type: u8,
+        value: Vec<u8>,
+    },
+}
+
+const GRE_ATTRIBUTE_LAST_FLAG: u8 = 0x80;
+const GRE_ATTRIBUTE_TYPE_MASK: u8 = 0x7f;
+const GRE_ATTRIBUTE_HEADER_LEN: usize = 2;
+/// Value length of every attribute A.S0012-D §2.6.1 defines.
+const GRE_ATTRIBUTE_DEFINED_VALUE_LEN: usize = 2;
+const GRE_ATTRIBUTE_SHORT_DATA: u8 = 0x01;
+const GRE_ATTRIBUTE_FLOW_CONTROL: u8 = 0x02;
+const GRE_ATTRIBUTE_IP_FLOW_DISCRIMINATOR: u8 = 0x03;
+const GRE_ATTRIBUTE_SEGMENTATION: u8 = 0x04;
+/// SDI, Flow Control Indicator and the Segmentation value all start at the
+/// most significant bit of the first value octet.
+const GRE_ATTRIBUTE_SDI_BIT: u8 = 0x80;
+const GRE_ATTRIBUTE_FCI_XOFF_BIT: u8 = 0x80;
+const GRE_ATTRIBUTE_DURATION_INDEFINITE_BIT: u8 = 0x40;
+const GRE_ATTRIBUTE_SEGMENT_SHIFT: u8 = 6;
+const GRE_SEGMENT_STARTED: u8 = 0b00;
+const GRE_SEGMENT_CONTINUED: u8 = 0b01;
+const GRE_SEGMENT_ENDED: u8 = 0b10;
+
+impl GreAttribute {
+    fn attribute_type(&self) -> u8 {
+        match self {
+            Self::ShortDataIndication => GRE_ATTRIBUTE_SHORT_DATA,
+            Self::FlowControl(_) => GRE_ATTRIBUTE_FLOW_CONTROL,
+            Self::IpFlowDiscriminator { .. } => GRE_ATTRIBUTE_IP_FLOW_DISCRIMINATOR,
+            Self::Segmentation(_) => GRE_ATTRIBUTE_SEGMENTATION,
+            Self::Unknown { attribute_type, .. } => *attribute_type & GRE_ATTRIBUTE_TYPE_MASK,
+        }
+    }
+
+    fn value(&self) -> Vec<u8> {
+        match self {
+            Self::ShortDataIndication => vec![GRE_ATTRIBUTE_SDI_BIT, 0],
+            Self::FlowControl(FlowControl::Xon) => vec![0, 0],
+            Self::FlowControl(FlowControl::Xoff(duration)) => {
+                let duration_bit = match duration {
+                    FlowControlDuration::Temporary => 0,
+                    FlowControlDuration::Indefinite => GRE_ATTRIBUTE_DURATION_INDEFINITE_BIT,
+                };
+                vec![GRE_ATTRIBUTE_FCI_XOFF_BIT | duration_bit, 0]
+            }
+            Self::IpFlowDiscriminator { flow_id } => vec![*flow_id, 0],
+            Self::Segmentation(segment) => {
+                let code = match segment {
+                    GreSegment::Started => GRE_SEGMENT_STARTED,
+                    GreSegment::Continued => GRE_SEGMENT_CONTINUED,
+                    GreSegment::Ended => GRE_SEGMENT_ENDED,
+                };
+                vec![code << GRE_ATTRIBUTE_SEGMENT_SHIFT, 0]
+            }
+            Self::Unknown { value, .. } => value.clone(),
+        }
+    }
+
+    fn decode_value(attribute_type: u8, value: &[u8]) -> Self {
+        let unknown = || Self::Unknown {
+            attribute_type,
+            value: value.to_vec(),
+        };
+        if value.len() != GRE_ATTRIBUTE_DEFINED_VALUE_LEN {
+            return unknown();
+        }
+        let first = value[0];
+        match attribute_type {
+            GRE_ATTRIBUTE_SHORT_DATA if first & GRE_ATTRIBUTE_SDI_BIT != 0 => {
+                Self::ShortDataIndication
+            }
+            GRE_ATTRIBUTE_FLOW_CONTROL => {
+                if first & GRE_ATTRIBUTE_FCI_XOFF_BIT == 0 {
+                    Self::FlowControl(FlowControl::Xon)
+                } else if first & GRE_ATTRIBUTE_DURATION_INDEFINITE_BIT != 0 {
+                    Self::FlowControl(FlowControl::Xoff(FlowControlDuration::Indefinite))
+                } else {
+                    Self::FlowControl(FlowControl::Xoff(FlowControlDuration::Temporary))
+                }
+            }
+            GRE_ATTRIBUTE_IP_FLOW_DISCRIMINATOR => Self::IpFlowDiscriminator { flow_id: first },
+            GRE_ATTRIBUTE_SEGMENTATION => match first >> GRE_ATTRIBUTE_SEGMENT_SHIFT {
+                GRE_SEGMENT_STARTED => Self::Segmentation(GreSegment::Started),
+                GRE_SEGMENT_CONTINUED => Self::Segmentation(GreSegment::Continued),
+                GRE_SEGMENT_ENDED => Self::Segmentation(GreSegment::Ended),
+                _ => unknown(),
+            },
+            _ => unknown(),
+        }
+    }
+}
+
+fn encode_gre_attributes(attributes: &[GreAttribute], out: &mut Vec<u8>) -> Result<()> {
+    for (index, attribute) in attributes.iter().enumerate() {
+        let value = attribute.value();
+        let length = u8::try_from(value.len()).map_err(|_| Error::Truncated {
+            needed: usize::from(u8::MAX),
+            actual: value.len(),
+        })?;
+        let last = if index + 1 == attributes.len() {
+            GRE_ATTRIBUTE_LAST_FLAG
+        } else {
+            0
+        };
+        out.push(last | attribute.attribute_type());
+        out.push(length);
+        out.extend_from_slice(&value);
+    }
+    Ok(())
+}
+
+/// Parses up to and including the attribute with E set.
+fn decode_gre_attributes(input: &[u8], mut offset: usize) -> Result<(Vec<GreAttribute>, usize)> {
+    let mut attributes = Vec::new();
+    loop {
+        if input.len() < offset + GRE_ATTRIBUTE_HEADER_LEN {
+            return Err(Error::Truncated {
+                needed: offset + GRE_ATTRIBUTE_HEADER_LEN,
+                actual: input.len(),
+            });
+        }
+        let header = input[offset];
+        let length = usize::from(input[offset + 1]);
+        let value_start = offset + GRE_ATTRIBUTE_HEADER_LEN;
+        if input.len() < value_start + length {
+            return Err(Error::Truncated {
+                needed: value_start + length,
+                actual: input.len(),
+            });
+        }
+        attributes.push(GreAttribute::decode_value(
+            header & GRE_ATTRIBUTE_TYPE_MASK,
+            &input[value_start..value_start + length],
+        ));
+        offset = value_start + length;
+        if header & GRE_ATTRIBUTE_LAST_FLAG != 0 {
+            return Ok((attributes, offset));
+        }
+    }
 }
 
 impl GrePacket {
@@ -1109,6 +1287,24 @@ impl GrePacket {
             protocol_type: GreProtocolType::UnstructuredByteStream.as_u16(),
             key: Some(key),
             sequence_number,
+            attributes: Vec::new(),
+            payload: payload.into(),
+        }
+    }
+
+    pub fn with_attributes(
+        key: u32,
+        sequence_number: Option<u32>,
+        attributes: Vec<GreAttribute>,
+        payload: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            key_present: true,
+            sequence_present: sequence_number.is_some(),
+            protocol_type: GRE_PROTOCOL_TYPE_3GPP2_PACKET,
+            key: Some(key),
+            sequence_number,
+            attributes,
             payload: payload.into(),
         }
     }
@@ -1121,6 +1317,7 @@ impl GrePacket {
             protocol_type: GreProtocolType::PointToPointProtocol.as_u16(),
             key: Some(key),
             sequence_number: None,
+            attributes: Vec::new(),
             payload: payload.into(),
         }
     }
@@ -1149,6 +1346,14 @@ impl GrePacket {
                 return Err(Error::MissingSequenceNumber);
             };
             out.extend_from_slice(&sequence_number.to_be_bytes());
+        }
+        if self.protocol_type == GRE_PROTOCOL_TYPE_3GPP2_PACKET {
+            if self.attributes.is_empty() {
+                return Err(Error::InvalidProtocolType(self.protocol_type));
+            }
+            encode_gre_attributes(&self.attributes, &mut out)?;
+        } else if !self.attributes.is_empty() {
+            return Err(Error::InvalidProtocolType(self.protocol_type));
         }
         out.extend_from_slice(&self.payload);
         Ok(out)
@@ -1213,12 +1418,19 @@ impl GrePacket {
             None
         };
 
+        let (attributes, offset) = if protocol_type == GRE_PROTOCOL_TYPE_3GPP2_PACKET {
+            decode_gre_attributes(input, offset)?
+        } else {
+            (Vec::new(), offset)
+        };
+
         Ok(Self {
             key_present,
             sequence_present,
             protocol_type,
             key,
             sequence_number,
+            attributes,
             payload: input[offset..].to_vec(),
         })
     }
@@ -1480,6 +1692,17 @@ impl BearerTable {
         session_id: u32,
         payload: impl Into<Vec<u8>>,
     ) -> Result<OutboundPacket> {
+        self.build_outbound_packet_with_attributes(session_id, payload, Vec::new())
+    }
+
+    /// Non-empty `attributes` switch the GRE protocol type to 0x88D2
+    /// (A.S0012-D §2.6).
+    pub fn build_outbound_packet_with_attributes(
+        &mut self,
+        session_id: u32,
+        payload: impl Into<Vec<u8>>,
+        attributes: Vec<GreAttribute>,
+    ) -> Result<OutboundPacket> {
         let payload = payload.into();
         let Some(entry) = self.sessions.get_mut(&session_id) else {
             return Err(Error::UnknownSession(session_id));
@@ -1494,12 +1717,18 @@ impl BearerTable {
             }
         };
         let gre_key = entry.session.outbound_session_key;
+        let protocol_type = if attributes.is_empty() {
+            entry.session.profile.protocol_type.as_u16()
+        } else {
+            GRE_PROTOCOL_TYPE_3GPP2_PACKET
+        };
         let wire_bytes = GrePacket {
             key_present: true,
             sequence_present: gre_sequence.is_some(),
-            protocol_type: entry.session.profile.protocol_type.as_u16(),
+            protocol_type,
             key: Some(gre_key),
             sequence_number: gre_sequence,
+            attributes,
             payload: payload.clone(),
         }
         .encode()?;
@@ -1521,6 +1750,15 @@ impl BearerTable {
             payload_len: payload.len(),
             wire_bytes,
         })
+    }
+
+    pub fn build_outbound_chunk(
+        &mut self,
+        session_id: u32,
+        chunk: BearerChunk,
+    ) -> Result<OutboundPacket> {
+        let attributes = chunk.attributes();
+        self.build_outbound_packet_with_attributes(session_id, chunk.payload, attributes)
     }
 
     /// Encodes a payload for a known session and updates transmit counters.
@@ -1558,7 +1796,9 @@ impl BearerTable {
             self.stats.unknown_session_packets += 1;
             return Err(Error::UnknownInboundSessionKey(inbound_session_key));
         };
-        if packet.protocol_type != entry.session.profile.protocol_type.as_u16() {
+        if packet.protocol_type != entry.session.profile.protocol_type.as_u16()
+            && packet.protocol_type != GRE_PROTOCOL_TYPE_3GPP2_PACKET
+        {
             self.stats.malformed_packets += 1;
             return Err(Error::InvalidProtocolType(packet.protocol_type));
         }
@@ -1628,6 +1868,7 @@ impl BearerTable {
             endpoint,
             rx_ordinal,
             gre_sequence,
+            attributes: packet.attributes,
             payload: packet.payload,
         })
     }

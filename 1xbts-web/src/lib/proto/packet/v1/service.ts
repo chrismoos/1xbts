@@ -90,65 +90,6 @@ export function mnIdSourceToJSON(object: MnIdSource): string {
   }
 }
 
-/** One RLP traffic frame moving between the radio stack and packet engine. */
-export interface SessionFrame {
-  /** Packet session identifier. */
-  sessionId: string;
-  /** Bit vector encoded as one byte per bit, value 0 or 1. */
-  bits: Uint8Array;
-  /** Number of valid bits in `bits`. */
-  numBits: number;
-  /** CDMA frame rate represented as payload bits per second. */
-  rateBps: number;
-}
-
-/** Opens packet session state for one mobile packet-data call. */
-export interface OpenSessionRequest {
-  /** Packet session identifier allocated by call setup. */
-  sessionId: string;
-  /** CDMA service option, for example SO33 for high-rate packet data. */
-  serviceOption: number;
-  /** Mobile ESN when available. */
-  esn: number;
-  /** Full mobile IMSI when available. */
-  imsi: string;
-  /** Display/debug mobile address. */
-  mobileAddress: string;
-  /** HLR subscriber UUID when resolved. */
-  subscriberId: string;
-  /** Subscriber phone number when resolved. */
-  phoneNumber: string;
-  /** Assigned forward traffic-channel Walsh code. */
-  trafficWalshCode: number;
-  /** Mobile MEID when available as subscriber/equipment metadata. */
-  meid: string;
-  /**
-   * HRPD A11 MN ID used for bearer registration. This may be an IMSI-format
-   * value derived for A11 and must not be displayed as a subscriber IMSI.
-   */
-  mnId: string;
-  /** Origin of mn_id. */
-  mnIdSource: MnIdSource;
-  /** Authoritative subscriber IMSI when resolved by HLR/A12/roaming data. */
-  subscriberImsi: string;
-}
-
-/** Response returned after packet session state is opened. */
-export interface OpenSessionResponse {
-  /** Packet session identifier that was opened. */
-  sessionId: string;
-}
-
-/** Closes packet session state and transport resources. */
-export interface CloseSessionRequest {
-  /** Packet session identifier to close. */
-  sessionId: string;
-}
-
-/** Empty response for a successful session close. */
-export interface CloseSessionResponse {
-}
-
 /** Selects one packet session for status lookup. */
 export interface GetSessionStatusRequest {
   /** Packet session identifier. */
@@ -195,23 +136,6 @@ export interface SetSessionCaptureRequest {
 export interface SetSessionCaptureResponse {
   /** Updated session detail. */
   session: PacketSessionDetail | undefined;
-}
-
-/** Toggles F-SCH downlink frame generation on one packet session. */
-export interface SetSchActiveRequest {
-  /** Packet session identifier. */
-  sessionId: string;
-  /** True to enable RLP3 SCH frame generation, false to disable. */
-  active: boolean;
-  /** RC3 F-SCH rate in bps. Omitted/zero defaults to 19200 for compatibility. */
-  rateBps: number;
-}
-
-/**
- * Empty response for a successful SCH-active toggle. The error case is
- * surfaced via gRPC status (NotFound when session_id is unknown, etc.).
- */
-export interface SetSchActiveResponse {
 }
 
 /** Summary state for a packet data session. */
@@ -272,7 +196,14 @@ export interface PacketSessionInfo {
     | number
     | undefined;
   /** MN Session Reference ID from the same extension. */
-  mnSessionReferenceId?: number | undefined;
+  mnSessionReferenceId?:
+    | number
+    | undefined;
+  /**
+   * NAI from the mobile's Mobile IP Registration Request (MN-NAI extension,
+   * RFC 2794). Empty when the mobile sent none.
+   */
+  nai: string;
 }
 
 /** One trace event emitted by PPP, RLP, IP transport, or capture code. */
@@ -310,582 +241,6 @@ export interface PacketSessionDetail {
   /** Captured trace events retained while capture is enabled. */
   captureEvents: PacketTraceEvent[];
 }
-
-function createBaseSessionFrame(): SessionFrame {
-  return { sessionId: "", bits: new Uint8Array(0), numBits: 0, rateBps: 0 };
-}
-
-export const SessionFrame: MessageFns<SessionFrame> = {
-  encode(message: SessionFrame, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.sessionId !== "") {
-      writer.uint32(10).string(message.sessionId);
-    }
-    if (message.bits.length !== 0) {
-      writer.uint32(18).bytes(message.bits);
-    }
-    if (message.numBits !== 0) {
-      writer.uint32(24).uint32(message.numBits);
-    }
-    if (message.rateBps !== 0) {
-      writer.uint32(32).uint32(message.rateBps);
-    }
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): SessionFrame {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    const end = length === undefined ? reader.len : reader.pos + length;
-    const message = createBaseSessionFrame();
-    while (reader.pos < end) {
-      const tag = reader.uint32();
-      switch (tag >>> 3) {
-        case 1: {
-          if (tag !== 10) {
-            break;
-          }
-
-          message.sessionId = reader.string();
-          continue;
-        }
-        case 2: {
-          if (tag !== 18) {
-            break;
-          }
-
-          message.bits = reader.bytes();
-          continue;
-        }
-        case 3: {
-          if (tag !== 24) {
-            break;
-          }
-
-          message.numBits = reader.uint32();
-          continue;
-        }
-        case 4: {
-          if (tag !== 32) {
-            break;
-          }
-
-          message.rateBps = reader.uint32();
-          continue;
-        }
-      }
-      if ((tag & 7) === 4 || tag === 0) {
-        break;
-      }
-      reader.skip(tag & 7);
-    }
-    return message;
-  },
-
-  fromJSON(object: any): SessionFrame {
-    return {
-      sessionId: isSet(object.sessionId)
-        ? globalThis.String(object.sessionId)
-        : isSet(object.session_id)
-        ? globalThis.String(object.session_id)
-        : "",
-      bits: isSet(object.bits) ? bytesFromBase64(object.bits) : new Uint8Array(0),
-      numBits: isSet(object.numBits)
-        ? globalThis.Number(object.numBits)
-        : isSet(object.num_bits)
-        ? globalThis.Number(object.num_bits)
-        : 0,
-      rateBps: isSet(object.rateBps)
-        ? globalThis.Number(object.rateBps)
-        : isSet(object.rate_bps)
-        ? globalThis.Number(object.rate_bps)
-        : 0,
-    };
-  },
-
-  toJSON(message: SessionFrame): unknown {
-    const obj: any = {};
-    if (message.sessionId !== "") {
-      obj.sessionId = message.sessionId;
-    }
-    if (message.bits.length !== 0) {
-      obj.bits = base64FromBytes(message.bits);
-    }
-    if (message.numBits !== 0) {
-      obj.numBits = Math.round(message.numBits);
-    }
-    if (message.rateBps !== 0) {
-      obj.rateBps = Math.round(message.rateBps);
-    }
-    return obj;
-  },
-
-  create(base?: DeepPartial<SessionFrame>): SessionFrame {
-    return SessionFrame.fromPartial(base ?? {});
-  },
-  fromPartial(object: DeepPartial<SessionFrame>): SessionFrame {
-    const message = createBaseSessionFrame();
-    message.sessionId = object.sessionId ?? "";
-    message.bits = object.bits ?? new Uint8Array(0);
-    message.numBits = object.numBits ?? 0;
-    message.rateBps = object.rateBps ?? 0;
-    return message;
-  },
-};
-
-function createBaseOpenSessionRequest(): OpenSessionRequest {
-  return {
-    sessionId: "",
-    serviceOption: 0,
-    esn: 0,
-    imsi: "",
-    mobileAddress: "",
-    subscriberId: "",
-    phoneNumber: "",
-    trafficWalshCode: 0,
-    meid: "",
-    mnId: "",
-    mnIdSource: 0,
-    subscriberImsi: "",
-  };
-}
-
-export const OpenSessionRequest: MessageFns<OpenSessionRequest> = {
-  encode(message: OpenSessionRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.sessionId !== "") {
-      writer.uint32(10).string(message.sessionId);
-    }
-    if (message.serviceOption !== 0) {
-      writer.uint32(16).uint32(message.serviceOption);
-    }
-    if (message.esn !== 0) {
-      writer.uint32(24).uint32(message.esn);
-    }
-    if (message.imsi !== "") {
-      writer.uint32(34).string(message.imsi);
-    }
-    if (message.mobileAddress !== "") {
-      writer.uint32(42).string(message.mobileAddress);
-    }
-    if (message.subscriberId !== "") {
-      writer.uint32(50).string(message.subscriberId);
-    }
-    if (message.phoneNumber !== "") {
-      writer.uint32(58).string(message.phoneNumber);
-    }
-    if (message.trafficWalshCode !== 0) {
-      writer.uint32(64).uint32(message.trafficWalshCode);
-    }
-    if (message.meid !== "") {
-      writer.uint32(74).string(message.meid);
-    }
-    if (message.mnId !== "") {
-      writer.uint32(82).string(message.mnId);
-    }
-    if (message.mnIdSource !== 0) {
-      writer.uint32(88).int32(message.mnIdSource);
-    }
-    if (message.subscriberImsi !== "") {
-      writer.uint32(98).string(message.subscriberImsi);
-    }
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): OpenSessionRequest {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    const end = length === undefined ? reader.len : reader.pos + length;
-    const message = createBaseOpenSessionRequest();
-    while (reader.pos < end) {
-      const tag = reader.uint32();
-      switch (tag >>> 3) {
-        case 1: {
-          if (tag !== 10) {
-            break;
-          }
-
-          message.sessionId = reader.string();
-          continue;
-        }
-        case 2: {
-          if (tag !== 16) {
-            break;
-          }
-
-          message.serviceOption = reader.uint32();
-          continue;
-        }
-        case 3: {
-          if (tag !== 24) {
-            break;
-          }
-
-          message.esn = reader.uint32();
-          continue;
-        }
-        case 4: {
-          if (tag !== 34) {
-            break;
-          }
-
-          message.imsi = reader.string();
-          continue;
-        }
-        case 5: {
-          if (tag !== 42) {
-            break;
-          }
-
-          message.mobileAddress = reader.string();
-          continue;
-        }
-        case 6: {
-          if (tag !== 50) {
-            break;
-          }
-
-          message.subscriberId = reader.string();
-          continue;
-        }
-        case 7: {
-          if (tag !== 58) {
-            break;
-          }
-
-          message.phoneNumber = reader.string();
-          continue;
-        }
-        case 8: {
-          if (tag !== 64) {
-            break;
-          }
-
-          message.trafficWalshCode = reader.uint32();
-          continue;
-        }
-        case 9: {
-          if (tag !== 74) {
-            break;
-          }
-
-          message.meid = reader.string();
-          continue;
-        }
-        case 10: {
-          if (tag !== 82) {
-            break;
-          }
-
-          message.mnId = reader.string();
-          continue;
-        }
-        case 11: {
-          if (tag !== 88) {
-            break;
-          }
-
-          message.mnIdSource = reader.int32() as any;
-          continue;
-        }
-        case 12: {
-          if (tag !== 98) {
-            break;
-          }
-
-          message.subscriberImsi = reader.string();
-          continue;
-        }
-      }
-      if ((tag & 7) === 4 || tag === 0) {
-        break;
-      }
-      reader.skip(tag & 7);
-    }
-    return message;
-  },
-
-  fromJSON(object: any): OpenSessionRequest {
-    return {
-      sessionId: isSet(object.sessionId)
-        ? globalThis.String(object.sessionId)
-        : isSet(object.session_id)
-        ? globalThis.String(object.session_id)
-        : "",
-      serviceOption: isSet(object.serviceOption)
-        ? globalThis.Number(object.serviceOption)
-        : isSet(object.service_option)
-        ? globalThis.Number(object.service_option)
-        : 0,
-      esn: isSet(object.esn) ? globalThis.Number(object.esn) : 0,
-      imsi: isSet(object.imsi) ? globalThis.String(object.imsi) : "",
-      mobileAddress: isSet(object.mobileAddress)
-        ? globalThis.String(object.mobileAddress)
-        : isSet(object.mobile_address)
-        ? globalThis.String(object.mobile_address)
-        : "",
-      subscriberId: isSet(object.subscriberId)
-        ? globalThis.String(object.subscriberId)
-        : isSet(object.subscriber_id)
-        ? globalThis.String(object.subscriber_id)
-        : "",
-      phoneNumber: isSet(object.phoneNumber)
-        ? globalThis.String(object.phoneNumber)
-        : isSet(object.phone_number)
-        ? globalThis.String(object.phone_number)
-        : "",
-      trafficWalshCode: isSet(object.trafficWalshCode)
-        ? globalThis.Number(object.trafficWalshCode)
-        : isSet(object.traffic_walsh_code)
-        ? globalThis.Number(object.traffic_walsh_code)
-        : 0,
-      meid: isSet(object.meid) ? globalThis.String(object.meid) : "",
-      mnId: isSet(object.mnId)
-        ? globalThis.String(object.mnId)
-        : isSet(object.mn_id)
-        ? globalThis.String(object.mn_id)
-        : "",
-      mnIdSource: isSet(object.mnIdSource)
-        ? mnIdSourceFromJSON(object.mnIdSource)
-        : isSet(object.mn_id_source)
-        ? mnIdSourceFromJSON(object.mn_id_source)
-        : 0,
-      subscriberImsi: isSet(object.subscriberImsi)
-        ? globalThis.String(object.subscriberImsi)
-        : isSet(object.subscriber_imsi)
-        ? globalThis.String(object.subscriber_imsi)
-        : "",
-    };
-  },
-
-  toJSON(message: OpenSessionRequest): unknown {
-    const obj: any = {};
-    if (message.sessionId !== "") {
-      obj.sessionId = message.sessionId;
-    }
-    if (message.serviceOption !== 0) {
-      obj.serviceOption = Math.round(message.serviceOption);
-    }
-    if (message.esn !== 0) {
-      obj.esn = Math.round(message.esn);
-    }
-    if (message.imsi !== "") {
-      obj.imsi = message.imsi;
-    }
-    if (message.mobileAddress !== "") {
-      obj.mobileAddress = message.mobileAddress;
-    }
-    if (message.subscriberId !== "") {
-      obj.subscriberId = message.subscriberId;
-    }
-    if (message.phoneNumber !== "") {
-      obj.phoneNumber = message.phoneNumber;
-    }
-    if (message.trafficWalshCode !== 0) {
-      obj.trafficWalshCode = Math.round(message.trafficWalshCode);
-    }
-    if (message.meid !== "") {
-      obj.meid = message.meid;
-    }
-    if (message.mnId !== "") {
-      obj.mnId = message.mnId;
-    }
-    if (message.mnIdSource !== 0) {
-      obj.mnIdSource = mnIdSourceToJSON(message.mnIdSource);
-    }
-    if (message.subscriberImsi !== "") {
-      obj.subscriberImsi = message.subscriberImsi;
-    }
-    return obj;
-  },
-
-  create(base?: DeepPartial<OpenSessionRequest>): OpenSessionRequest {
-    return OpenSessionRequest.fromPartial(base ?? {});
-  },
-  fromPartial(object: DeepPartial<OpenSessionRequest>): OpenSessionRequest {
-    const message = createBaseOpenSessionRequest();
-    message.sessionId = object.sessionId ?? "";
-    message.serviceOption = object.serviceOption ?? 0;
-    message.esn = object.esn ?? 0;
-    message.imsi = object.imsi ?? "";
-    message.mobileAddress = object.mobileAddress ?? "";
-    message.subscriberId = object.subscriberId ?? "";
-    message.phoneNumber = object.phoneNumber ?? "";
-    message.trafficWalshCode = object.trafficWalshCode ?? 0;
-    message.meid = object.meid ?? "";
-    message.mnId = object.mnId ?? "";
-    message.mnIdSource = object.mnIdSource ?? 0;
-    message.subscriberImsi = object.subscriberImsi ?? "";
-    return message;
-  },
-};
-
-function createBaseOpenSessionResponse(): OpenSessionResponse {
-  return { sessionId: "" };
-}
-
-export const OpenSessionResponse: MessageFns<OpenSessionResponse> = {
-  encode(message: OpenSessionResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.sessionId !== "") {
-      writer.uint32(10).string(message.sessionId);
-    }
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): OpenSessionResponse {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    const end = length === undefined ? reader.len : reader.pos + length;
-    const message = createBaseOpenSessionResponse();
-    while (reader.pos < end) {
-      const tag = reader.uint32();
-      switch (tag >>> 3) {
-        case 1: {
-          if (tag !== 10) {
-            break;
-          }
-
-          message.sessionId = reader.string();
-          continue;
-        }
-      }
-      if ((tag & 7) === 4 || tag === 0) {
-        break;
-      }
-      reader.skip(tag & 7);
-    }
-    return message;
-  },
-
-  fromJSON(object: any): OpenSessionResponse {
-    return {
-      sessionId: isSet(object.sessionId)
-        ? globalThis.String(object.sessionId)
-        : isSet(object.session_id)
-        ? globalThis.String(object.session_id)
-        : "",
-    };
-  },
-
-  toJSON(message: OpenSessionResponse): unknown {
-    const obj: any = {};
-    if (message.sessionId !== "") {
-      obj.sessionId = message.sessionId;
-    }
-    return obj;
-  },
-
-  create(base?: DeepPartial<OpenSessionResponse>): OpenSessionResponse {
-    return OpenSessionResponse.fromPartial(base ?? {});
-  },
-  fromPartial(object: DeepPartial<OpenSessionResponse>): OpenSessionResponse {
-    const message = createBaseOpenSessionResponse();
-    message.sessionId = object.sessionId ?? "";
-    return message;
-  },
-};
-
-function createBaseCloseSessionRequest(): CloseSessionRequest {
-  return { sessionId: "" };
-}
-
-export const CloseSessionRequest: MessageFns<CloseSessionRequest> = {
-  encode(message: CloseSessionRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.sessionId !== "") {
-      writer.uint32(10).string(message.sessionId);
-    }
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): CloseSessionRequest {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    const end = length === undefined ? reader.len : reader.pos + length;
-    const message = createBaseCloseSessionRequest();
-    while (reader.pos < end) {
-      const tag = reader.uint32();
-      switch (tag >>> 3) {
-        case 1: {
-          if (tag !== 10) {
-            break;
-          }
-
-          message.sessionId = reader.string();
-          continue;
-        }
-      }
-      if ((tag & 7) === 4 || tag === 0) {
-        break;
-      }
-      reader.skip(tag & 7);
-    }
-    return message;
-  },
-
-  fromJSON(object: any): CloseSessionRequest {
-    return {
-      sessionId: isSet(object.sessionId)
-        ? globalThis.String(object.sessionId)
-        : isSet(object.session_id)
-        ? globalThis.String(object.session_id)
-        : "",
-    };
-  },
-
-  toJSON(message: CloseSessionRequest): unknown {
-    const obj: any = {};
-    if (message.sessionId !== "") {
-      obj.sessionId = message.sessionId;
-    }
-    return obj;
-  },
-
-  create(base?: DeepPartial<CloseSessionRequest>): CloseSessionRequest {
-    return CloseSessionRequest.fromPartial(base ?? {});
-  },
-  fromPartial(object: DeepPartial<CloseSessionRequest>): CloseSessionRequest {
-    const message = createBaseCloseSessionRequest();
-    message.sessionId = object.sessionId ?? "";
-    return message;
-  },
-};
-
-function createBaseCloseSessionResponse(): CloseSessionResponse {
-  return {};
-}
-
-export const CloseSessionResponse: MessageFns<CloseSessionResponse> = {
-  encode(_: CloseSessionResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): CloseSessionResponse {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    const end = length === undefined ? reader.len : reader.pos + length;
-    const message = createBaseCloseSessionResponse();
-    while (reader.pos < end) {
-      const tag = reader.uint32();
-      switch (tag >>> 3) {
-      }
-      if ((tag & 7) === 4 || tag === 0) {
-        break;
-      }
-      reader.skip(tag & 7);
-    }
-    return message;
-  },
-
-  fromJSON(_: any): CloseSessionResponse {
-    return {};
-  },
-
-  toJSON(_: CloseSessionResponse): unknown {
-    const obj: any = {};
-    return obj;
-  },
-
-  create(base?: DeepPartial<CloseSessionResponse>): CloseSessionResponse {
-    return CloseSessionResponse.fromPartial(base ?? {});
-  },
-  fromPartial(_: DeepPartial<CloseSessionResponse>): CloseSessionResponse {
-    const message = createBaseCloseSessionResponse();
-    return message;
-  },
-};
 
 function createBaseGetSessionStatusRequest(): GetSessionStatusRequest {
   return { sessionId: "" };
@@ -1380,149 +735,6 @@ export const SetSessionCaptureResponse: MessageFns<SetSessionCaptureResponse> = 
   },
 };
 
-function createBaseSetSchActiveRequest(): SetSchActiveRequest {
-  return { sessionId: "", active: false, rateBps: 0 };
-}
-
-export const SetSchActiveRequest: MessageFns<SetSchActiveRequest> = {
-  encode(message: SetSchActiveRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.sessionId !== "") {
-      writer.uint32(10).string(message.sessionId);
-    }
-    if (message.active !== false) {
-      writer.uint32(16).bool(message.active);
-    }
-    if (message.rateBps !== 0) {
-      writer.uint32(24).uint32(message.rateBps);
-    }
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): SetSchActiveRequest {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    const end = length === undefined ? reader.len : reader.pos + length;
-    const message = createBaseSetSchActiveRequest();
-    while (reader.pos < end) {
-      const tag = reader.uint32();
-      switch (tag >>> 3) {
-        case 1: {
-          if (tag !== 10) {
-            break;
-          }
-
-          message.sessionId = reader.string();
-          continue;
-        }
-        case 2: {
-          if (tag !== 16) {
-            break;
-          }
-
-          message.active = reader.bool();
-          continue;
-        }
-        case 3: {
-          if (tag !== 24) {
-            break;
-          }
-
-          message.rateBps = reader.uint32();
-          continue;
-        }
-      }
-      if ((tag & 7) === 4 || tag === 0) {
-        break;
-      }
-      reader.skip(tag & 7);
-    }
-    return message;
-  },
-
-  fromJSON(object: any): SetSchActiveRequest {
-    return {
-      sessionId: isSet(object.sessionId)
-        ? globalThis.String(object.sessionId)
-        : isSet(object.session_id)
-        ? globalThis.String(object.session_id)
-        : "",
-      active: isSet(object.active) ? globalThis.Boolean(object.active) : false,
-      rateBps: isSet(object.rateBps)
-        ? globalThis.Number(object.rateBps)
-        : isSet(object.rate_bps)
-        ? globalThis.Number(object.rate_bps)
-        : 0,
-    };
-  },
-
-  toJSON(message: SetSchActiveRequest): unknown {
-    const obj: any = {};
-    if (message.sessionId !== "") {
-      obj.sessionId = message.sessionId;
-    }
-    if (message.active !== false) {
-      obj.active = message.active;
-    }
-    if (message.rateBps !== 0) {
-      obj.rateBps = Math.round(message.rateBps);
-    }
-    return obj;
-  },
-
-  create(base?: DeepPartial<SetSchActiveRequest>): SetSchActiveRequest {
-    return SetSchActiveRequest.fromPartial(base ?? {});
-  },
-  fromPartial(object: DeepPartial<SetSchActiveRequest>): SetSchActiveRequest {
-    const message = createBaseSetSchActiveRequest();
-    message.sessionId = object.sessionId ?? "";
-    message.active = object.active ?? false;
-    message.rateBps = object.rateBps ?? 0;
-    return message;
-  },
-};
-
-function createBaseSetSchActiveResponse(): SetSchActiveResponse {
-  return {};
-}
-
-export const SetSchActiveResponse: MessageFns<SetSchActiveResponse> = {
-  encode(_: SetSchActiveResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): SetSchActiveResponse {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    const end = length === undefined ? reader.len : reader.pos + length;
-    const message = createBaseSetSchActiveResponse();
-    while (reader.pos < end) {
-      const tag = reader.uint32();
-      switch (tag >>> 3) {
-      }
-      if ((tag & 7) === 4 || tag === 0) {
-        break;
-      }
-      reader.skip(tag & 7);
-    }
-    return message;
-  },
-
-  fromJSON(_: any): SetSchActiveResponse {
-    return {};
-  },
-
-  toJSON(_: SetSchActiveResponse): unknown {
-    const obj: any = {};
-    return obj;
-  },
-
-  create(base?: DeepPartial<SetSchActiveResponse>): SetSchActiveResponse {
-    return SetSchActiveResponse.fromPartial(base ?? {});
-  },
-  fromPartial(_: DeepPartial<SetSchActiveResponse>): SetSchActiveResponse {
-    const message = createBaseSetSchActiveResponse();
-    return message;
-  },
-};
-
 function createBasePacketSessionInfo(): PacketSessionInfo {
   return {
     sessionId: "",
@@ -1559,6 +771,7 @@ function createBasePacketSessionInfo(): PacketSessionInfo {
     subscriberImsi: "",
     pcfSessionId: undefined,
     mnSessionReferenceId: undefined,
+    nai: "",
   };
 }
 
@@ -1665,6 +878,9 @@ export const PacketSessionInfo: MessageFns<PacketSessionInfo> = {
     }
     if (message.mnSessionReferenceId !== undefined) {
       writer.uint32(296).uint32(message.mnSessionReferenceId);
+    }
+    if (message.nai !== "") {
+      writer.uint32(306).string(message.nai);
     }
     return writer;
   },
@@ -1948,6 +1164,14 @@ export const PacketSessionInfo: MessageFns<PacketSessionInfo> = {
           message.mnSessionReferenceId = reader.uint32();
           continue;
         }
+        case 38: {
+          if (tag !== 306) {
+            break;
+          }
+
+          message.nai = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -2113,6 +1337,7 @@ export const PacketSessionInfo: MessageFns<PacketSessionInfo> = {
         : isSet(object.mn_session_reference_id)
         ? globalThis.Number(object.mn_session_reference_id)
         : undefined,
+      nai: isSet(object.nai) ? globalThis.String(object.nai) : "",
     };
   },
 
@@ -2220,6 +1445,9 @@ export const PacketSessionInfo: MessageFns<PacketSessionInfo> = {
     if (message.mnSessionReferenceId !== undefined) {
       obj.mnSessionReferenceId = Math.round(message.mnSessionReferenceId);
     }
+    if (message.nai !== "") {
+      obj.nai = message.nai;
+    }
     return obj;
   },
 
@@ -2262,6 +1490,7 @@ export const PacketSessionInfo: MessageFns<PacketSessionInfo> = {
     message.subscriberImsi = object.subscriberImsi ?? "";
     message.pcfSessionId = object.pcfSessionId ?? undefined;
     message.mnSessionReferenceId = object.mnSessionReferenceId ?? undefined;
+    message.nai = object.nai ?? "";
     return message;
   },
 };
@@ -2604,39 +1833,12 @@ export const PacketSessionDetail: MessageFns<PacketSessionDetail> = {
   },
 };
 
-/** Packet data service used by the PCF/PDSN edge to manage RLP/PPP/IP sessions. */
+/** PDSN packet session status and trace capture. */
 export type PacketServiceDefinition = typeof PacketServiceDefinition;
 export const PacketServiceDefinition = {
   name: "PacketService",
   fullName: "packet.v1.PacketService",
   methods: {
-    /** Opens or replaces packet session state for one mobile data call. */
-    openSession: {
-      name: "OpenSession",
-      requestType: OpenSessionRequest as typeof OpenSessionRequest,
-      requestStream: false,
-      responseType: OpenSessionResponse as typeof OpenSessionResponse,
-      responseStream: false,
-      options: {},
-    },
-    /** Closes one packet session and releases associated transport resources. */
-    closeSession: {
-      name: "CloseSession",
-      requestType: CloseSessionRequest as typeof CloseSessionRequest,
-      requestStream: false,
-      responseType: CloseSessionResponse as typeof CloseSessionResponse,
-      responseStream: false,
-      options: {},
-    },
-    /** Exchanges reverse and forward RLP frame payloads for a packet session. */
-    streamSession: {
-      name: "StreamSession",
-      requestType: SessionFrame as typeof SessionFrame,
-      requestStream: true,
-      responseType: SessionFrame as typeof SessionFrame,
-      responseStream: true,
-      options: {},
-    },
     /** Returns detailed RLP/PPP/IP state for one packet session. */
     getSessionStatus: {
       name: "GetSessionStatus",
@@ -2677,38 +1879,10 @@ export const PacketServiceDefinition = {
       responseStream: false,
       options: {},
     },
-    /**
-     * Enables or disables F-SCH downlink frame generation on a running session.
-     * Set active=true after an F-SCH allocation and active=false during
-     * teardown / SCH release.
-     */
-    setSchActive: {
-      name: "SetSchActive",
-      requestType: SetSchActiveRequest as typeof SetSchActiveRequest,
-      requestStream: false,
-      responseType: SetSchActiveResponse as typeof SetSchActiveResponse,
-      responseStream: false,
-      options: {},
-    },
   },
 } as const;
 
 export interface PacketServiceImplementation<CallContextExt = {}> {
-  /** Opens or replaces packet session state for one mobile data call. */
-  openSession(
-    request: OpenSessionRequest,
-    context: CallContext & CallContextExt,
-  ): Promise<DeepPartial<OpenSessionResponse>>;
-  /** Closes one packet session and releases associated transport resources. */
-  closeSession(
-    request: CloseSessionRequest,
-    context: CallContext & CallContextExt,
-  ): Promise<DeepPartial<CloseSessionResponse>>;
-  /** Exchanges reverse and forward RLP frame payloads for a packet session. */
-  streamSession(
-    request: AsyncIterable<SessionFrame>,
-    context: CallContext & CallContextExt,
-  ): ServerStreamingMethodResult<DeepPartial<SessionFrame>>;
   /** Returns detailed RLP/PPP/IP state for one packet session. */
   getSessionStatus(
     request: GetSessionStatusRequest,
@@ -2733,33 +1907,9 @@ export interface PacketServiceImplementation<CallContextExt = {}> {
     request: SetSessionCaptureRequest,
     context: CallContext & CallContextExt,
   ): Promise<DeepPartial<SetSessionCaptureResponse>>;
-  /**
-   * Enables or disables F-SCH downlink frame generation on a running session.
-   * Set active=true after an F-SCH allocation and active=false during
-   * teardown / SCH release.
-   */
-  setSchActive(
-    request: SetSchActiveRequest,
-    context: CallContext & CallContextExt,
-  ): Promise<DeepPartial<SetSchActiveResponse>>;
 }
 
 export interface PacketServiceClient<CallOptionsExt = {}> {
-  /** Opens or replaces packet session state for one mobile data call. */
-  openSession(
-    request: DeepPartial<OpenSessionRequest>,
-    options?: CallOptions & CallOptionsExt,
-  ): Promise<OpenSessionResponse>;
-  /** Closes one packet session and releases associated transport resources. */
-  closeSession(
-    request: DeepPartial<CloseSessionRequest>,
-    options?: CallOptions & CallOptionsExt,
-  ): Promise<CloseSessionResponse>;
-  /** Exchanges reverse and forward RLP frame payloads for a packet session. */
-  streamSession(
-    request: AsyncIterable<DeepPartial<SessionFrame>>,
-    options?: CallOptions & CallOptionsExt,
-  ): AsyncIterable<SessionFrame>;
   /** Returns detailed RLP/PPP/IP state for one packet session. */
   getSessionStatus(
     request: DeepPartial<GetSessionStatusRequest>,
@@ -2784,40 +1934,6 @@ export interface PacketServiceClient<CallOptionsExt = {}> {
     request: DeepPartial<SetSessionCaptureRequest>,
     options?: CallOptions & CallOptionsExt,
   ): Promise<SetSessionCaptureResponse>;
-  /**
-   * Enables or disables F-SCH downlink frame generation on a running session.
-   * Set active=true after an F-SCH allocation and active=false during
-   * teardown / SCH release.
-   */
-  setSchActive(
-    request: DeepPartial<SetSchActiveRequest>,
-    options?: CallOptions & CallOptionsExt,
-  ): Promise<SetSchActiveResponse>;
-}
-
-function bytesFromBase64(b64: string): Uint8Array {
-  if ((globalThis as any).Buffer) {
-    return Uint8Array.from(globalThis.Buffer.from(b64, "base64"));
-  } else {
-    const bin = globalThis.atob(b64);
-    const arr = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; ++i) {
-      arr[i] = bin.charCodeAt(i);
-    }
-    return arr;
-  }
-}
-
-function base64FromBytes(arr: Uint8Array): string {
-  if ((globalThis as any).Buffer) {
-    return globalThis.Buffer.from(arr).toString("base64");
-  } else {
-    const bin: string[] = [];
-    arr.forEach((byte) => {
-      bin.push(globalThis.String.fromCharCode(byte));
-    });
-    return globalThis.btoa(bin.join(""));
-  }
 }
 
 type Builtin = Date | Function | Uint8Array | string | number | boolean | undefined;
@@ -2842,8 +1958,6 @@ function longToNumber(int64: { toString(): string }): number {
 function isSet(value: any): boolean {
   return value !== null && value !== undefined;
 }
-
-export type ServerStreamingMethodResult<Response> = { [Symbol.asyncIterator](): AsyncIterator<Response, void> };
 
 export interface MessageFns<T> {
   encode(message: T, writer?: BinaryWriter): BinaryWriter;

@@ -20,7 +20,7 @@ import javacard.framework.OwnerPIN;
  *
  * Per TS 102 221 §11.1.9.1, PIN validation is per-logical-channel.
  * OwnerPIN's own isValidated() is global, so verification is tracked
- * separately in three byte arrays indexed by channel. OwnerPIN.check()
+ * in one byte array indexed by key and channel. OwnerPIN.check()
  * is still used for the actual try-counter-managed comparison.
  */
 public final class Ac {
@@ -37,11 +37,15 @@ public final class Ac {
     // must be CLEAR_ON_RESET: the JCRE does not call deselect() on a card
     // reset or power loss, so persistent flags would keep a PIN verified
     // into the next session.
-    private final byte[] pin1OnChannel;
-    private final byte[] pin2OnChannel;
-    private final byte[] admOnChannel;
+
+    private final byte[] verified;
+    private static final short PIN1_FLAGS = 0;
+    private static final short PIN2_FLAGS = FileSystem.MAX_CHANNELS;
+    private static final short ADM_FLAGS = 2 * FileSystem.MAX_CHANNELS;
+    private static final short FLAGS_LEN = 3 * FileSystem.MAX_CHANNELS;
 
     public Ac() {
+        verified = JCSystem.makeTransientByteArray(FLAGS_LEN, JCSystem.CLEAR_ON_RESET);
         pin1 = new OwnerPIN(Const.PIN_MAX_TRIES, Const.PIN_MAX_SIZE);
         pin2 = new OwnerPIN(Const.PIN_MAX_TRIES, Const.PIN_MAX_SIZE);
         puk1 = new OwnerPIN(Const.PUK_MAX_TRIES, Const.PUK_MAX_SIZE);
@@ -54,9 +58,6 @@ public final class Ac {
         adm1.update(Const.DEFAULT_ADM1, (short) 0, (byte) Const.DEFAULT_ADM1.length);
         pin1Enabled = new boolean[1];
         pin1Enabled[0] = true;
-        pin1OnChannel = JCSystem.makeTransientByteArray(FileSystem.MAX_CHANNELS, JCSystem.CLEAR_ON_RESET);
-        pin2OnChannel = JCSystem.makeTransientByteArray(FileSystem.MAX_CHANNELS, JCSystem.CLEAR_ON_RESET);
-        admOnChannel = JCSystem.makeTransientByteArray(FileSystem.MAX_CHANNELS, JCSystem.CLEAR_ON_RESET);
     }
 
     public boolean isPin1Enabled() {
@@ -68,26 +69,26 @@ public final class Ac {
     }
 
     public void setPin1Verified(byte channel, boolean v) {
-        pin1OnChannel[channel] = v ? (byte) 1 : (byte) 0;
+        verified[(short) (PIN1_FLAGS + channel)] = v ? (byte) 1 : (byte) 0;
     }
 
     public void setPin2Verified(byte channel, boolean v) {
-        pin2OnChannel[channel] = v ? (byte) 1 : (byte) 0;
+        verified[(short) (PIN2_FLAGS + channel)] = v ? (byte) 1 : (byte) 0;
     }
 
     public void setAdmVerified(byte channel, boolean v) {
-        admOnChannel[channel] = v ? (byte) 1 : (byte) 0;
+        verified[(short) (ADM_FLAGS + channel)] = v ? (byte) 1 : (byte) 0;
     }
 
     public boolean isAdmVerified(byte channel) {
-        return admOnChannel[channel] != 0;
+        return verified[(short) (ADM_FLAGS + channel)] != 0;
     }
 
     /** Clear all verification state for the given channel. */
     public void clearChannel(byte channel) {
-        pin1OnChannel[channel] = 0;
-        pin2OnChannel[channel] = 0;
-        admOnChannel[channel] = 0;
+        verified[(short) (PIN1_FLAGS + channel)] = 0;
+        verified[(short) (PIN2_FLAGS + channel)] = 0;
+        verified[(short) (ADM_FLAGS + channel)] = 0;
     }
 
     /** Clear verification state across every channel. */
@@ -102,15 +103,15 @@ public final class Ac {
         switch (ac) {
             case Const.AC_ALWAYS: return;
             case Const.AC_PIN1:
-                if (!pin1Enabled[0] || pin1OnChannel[channel] != 0) return;
+                if (!pin1Enabled[0] || verified[(short) (PIN1_FLAGS + channel)] != 0) return;
                 ISOException.throwIt(Const.SW_SECURITY_NOT_SAT);
                 return;
             case Const.AC_PIN2:
-                if (pin2OnChannel[channel] != 0) return;
+                if (verified[(short) (PIN2_FLAGS + channel)] != 0) return;
                 ISOException.throwIt(Const.SW_SECURITY_NOT_SAT);
                 return;
             case Const.AC_ADM:
-                if (admOnChannel[channel] != 0) return;
+                if (verified[(short) (ADM_FLAGS + channel)] != 0) return;
                 ISOException.throwIt(Const.SW_SECURITY_NOT_SAT);
                 return;
             case Const.AC_NEVER:

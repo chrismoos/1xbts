@@ -17,8 +17,9 @@ use tokio::sync::{mpsc, oneshot};
 use crate::engine::{
     PacketSession, PacketTraceEvent, SessionAction, SessionPhase, bytes_to_hex, now_ms,
 };
-use crate::ip_allocator::IpAllocator;
+use crate::ip_allocator::{IpAllocator, IpClaimResult};
 use crate::ip_transport::IpTransport;
+use crate::mobile_ip::HomeAddressClaim;
 use crate::session_lifecycle::{
     SessionBoundInfo, SessionLifecycleSink, SessionUnboundInfo, UnbindReason,
 };
@@ -747,6 +748,17 @@ impl HrpdA10Session {
             "hrpd-session={} uati={}",
             self.session_id, self.metadata.traffic_walsh_code
         ));
+        let claim_allocator = Arc::clone(&self.allocator);
+        let claim_key = allocation_key.clone();
+        session.set_home_address_claimer(Box::new(move |home_address| {
+            match claim_allocator.claim_peer_ip(&claim_key, home_address) {
+                IpClaimResult::Claimed(_) | IpClaimResult::AlreadyOwned(_) => {
+                    HomeAddressClaim::Granted
+                }
+                IpClaimResult::Conflict { .. } => HomeAddressClaim::InUse,
+                IpClaimResult::OutOfPool => HomeAddressClaim::OutsidePool,
+            }
+        }));
         let (to_mobile_tx, mut to_mobile_rx) = mpsc::channel::<Vec<u8>>(256);
         let mut transport_ready = false;
         let mut first_uplink_ip_logged = false;

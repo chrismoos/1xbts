@@ -80,32 +80,32 @@ hrpdcap:
 # EF_SIPUPP, Simple IP: up to 15 NAIs by index 0-15. auth is none, chap,
 # pap or chap_pap, default chap. The sip_chap secret with the same index
 # answers the PDSN's CHAP challenge.
-# simple_ip:
-#   - { index: 0, nai: "{imsi}@1xbts.local", auth: chap }
+simple_ip:
+  - { index: 0, nai: "{imsi}@1xbts.local", auth: chap }
 #
 # EF_MIPUPP, Mobile IP. home_address 0.0.0.0 asks the home agent to assign
 # one. The SPIs must match the home AAA (mn_aaa) and the home agent
 # (mn_ha). retry is optional: max_retries 0-3, first_retry_timeout_ms
 # 250-2000 in steps of 250, rereg_threshold_min 0-63.
-# mobile_ip:
-#   retry: { max_retries: 2, first_retry_timeout_ms: 1000, rereg_threshold_min: 5 }
-#   nais:
-#     - index: 0
-#       nai: "{imsi}@1xbts.local"
-#       reverse_tunneling: false
-#       home_address: 0.0.0.0
-#       primary_home_agent: 10.20.0.1
-#       secondary_home_agent: 10.20.0.2
-#       mn_aaa_auth: md5
-#       mn_aaa_spi: 2
-#       mn_ha_auth: md5
-#       mn_ha_spi: 300
-#
-# EF_HRPDUPP, HRPD (EV-DO) access authentication with the AN-AAA. The NAI
-# must fit max_nai_length in hrpdcap. auth is none or chap, default chap.
-# hrpd_access:
-#   nai: "{imsi}@1xbts.local"
-#   auth: chap
+mobile_ip:
+  retry: { max_retries: 2, first_retry_timeout_ms: 1000, rereg_threshold_min: 5 }
+  nais:
+    - index: 0
+      nai: "{imsi}@1xbts.local"
+      reverse_tunneling: false
+      home_address: 0.0.0.0
+      primary_home_agent: 10.20.0.1
+      secondary_home_agent: 10.20.0.2
+      mn_aaa_auth: md5
+      mn_aaa_spi: 2
+      mn_ha_auth: md5
+      mn_ha_spi: 300
+
+#EF_HRPDUPP, HRPD (EV-DO) access authentication with the AN-AAA. The NAI
+#must fit max_nai_length in hrpdcap. auth is none or chap, default chap.
+hrpd_access:
+  nai: "{imsi}@1xbts.local"
+  auth: chap
 
 # EF_SPC, the service programming code a handset asks for before NAM
 # programming. Quoted to keep the leading zeros.
@@ -143,12 +143,12 @@ a_key: "{a_key}"
 # hex instead, for example from `openssl rand -hex 16`. Each must match
 # the network element that checks it. The hrpd secret must fit
 # max_ss_length in hrpdcap.
-# ip_secrets:
-#   # Simple IP CHAP to the PDSN or AAA.
-#   - { class: sip_chap, index: 0, secret: "{secret}" }
-#   # Mobile IP MN-HA authenticator, checked by the home agent.
-#   - { class: mn_ha, index: 0, secret: "{secret}" }
-#   # Mobile IP MN-AAA challenge response, checked by the home AAA.
-#   - { class: mn_aaa, index: 0, secret: "{secret}" }
-#   # HRPD access authentication CHAP to the AN-AAA.
-#   - { class: hrpd, index: 0, secret: "{secret}" }
+ip_secrets:
+  # Simple IP CHAP to the PDSN or AAA.
+  - { class: sip_chap, index: 0, secret_text: "secret" }
+  # Mobile IP MN-HA authenticator, checked by the home agent.
+  - { class: mn_ha, index: 0, secret_text: "secret" }
+  # Mobile IP MN-AAA challenge response, checked by the home AAA.
+  - { class: mn_aaa, index: 0, secret_text: "secret" }
+  # HRPD access authentication CHAP to the AN-AAA.
+  - { class: hrpd, index: 0, secret_text: "secret" }

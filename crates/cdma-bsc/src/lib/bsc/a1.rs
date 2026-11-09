@@ -979,7 +979,11 @@ impl Bsc {
         let response_service_option = paging_response
             .service_option
             .map(|service_option| service_option.0);
-        let encoded = match paging_response.encode() {
+        let serving_cell = self.serving_params(fwd_address).cell;
+        let encoded = match paging_response.encode_a1(cdma_ios::CellId {
+            cell: serving_cell.cell,
+            sector: serving_cell.sector,
+        }) {
             Ok(payload) => EncodedA1Message::from_message_for_call(
                 &cdma_ios::Message::new(cdma_ios::MessageType::PagingResponse, payload),
                 Some(call_id),
@@ -1112,7 +1116,11 @@ impl Bsc {
             cdma_serving_one_way_delay: None,
         };
 
-        let encoded = match response.encode() {
+        let serving_cell = self.serving_params(fwd_address).cell;
+        let encoded = match response.encode_a1(cdma_ios::CellId {
+            cell: serving_cell.cell,
+            sector: serving_cell.sector,
+        }) {
             Ok(payload) => EncodedA1Message::from_message_for_call(
                 &cdma_ios::Message::new(cdma_ios::MessageType::PagingResponse, payload),
                 Some(call_id),
@@ -1500,26 +1508,6 @@ impl Bsc {
         };
 
         let service_option = request.service_option.map(|so| so.0).unwrap_or(3);
-
-        // If this IMSI is HRPD-attached per the A21 identity cache, divert the
-        // MT voice page to A21 CrossPageRequest and let the HRPD AN deliver the
-        // page over its own air interface. The 1x F-PCH page is suppressed in
-        // that case.
-        if let Some(coord) = self.hrpd_coord.as_ref() {
-            if coord.is_hrpd_attached(&imsi) {
-                let payload = format!("VOICE:{}:so={}", tag.0, service_option).into_bytes();
-                if coord.emit_cross_page(&imsi, cdma_a21::PagingSource::OneX, payload) {
-                    info!(
-                        "BSC: target IMSI {imsi} HRPD-attached — diverted MT voice page via A21 (tag={})",
-                        tag.0
-                    );
-                    return;
-                }
-                warn!(
-                    "BSC: A21 channel closed; falling back to 1x F-PCH for HRPD-attached IMSI {imsi}"
-                );
-            }
-        }
 
         let (fwd_address, subscriber_id) = match self.mobiles.get_by_imsi(&imsi) {
             Some(mobile) => (
@@ -2603,7 +2591,7 @@ mod tests {
         );
         assert_eq!(outbound.call_id(), Some(call_id));
         let decoded = outbound.decode().unwrap();
-        let response = cdma_ios::PagingResponseMessage::decode(&decoded.payload).unwrap();
+        let response = cdma_ios::PagingResponseMessage::decode_a1(&decoded.payload).unwrap();
         assert_eq!(
             response.mobile_identity_imsi,
             cdma_ios::MobileIdentity::Imsi("310006054426442".to_owned()),

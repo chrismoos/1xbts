@@ -363,12 +363,11 @@ pub(crate) fn hrpd_uati_subnet_assignment(
 pub(crate) async fn try_complete_hrpd_a9_setup(
     mut pending: PendingHrpdA9Session,
     a9_config: Option<HrpdA9ClientConfig>,
-    a9_endpoint: Option<&cdma_a9::UdpSignalingEndpoint>,
+    a9_endpoint: Option<&cdma_a9::SignalingEndpoint>,
     an_a8_runtime: Option<&HrpdAnA8Runtime>,
     traffic_open_uatis: &HashSet<u32>,
     default_packet_flow_open_uatis: &HashSet<u32>,
     gates: &HrpdA9Gates,
-    sequence_no: &mut u32,
     reason: &str,
 ) -> Result<HrpdA9ReleaseContext, PendingHrpdA9Session> {
     let (Some(a9_config), Some(a9_endpoint)) = (a9_config, a9_endpoint) else {
@@ -429,9 +428,8 @@ pub(crate) async fn try_complete_hrpd_a9_setup(
         return Err(pending);
     }
     let identity = pending.identity.clone();
-    let mut client = HrpdAnA9Client::with_sequence(a9_endpoint, a9_config, *sequence_no);
+    let mut client = HrpdAnA9Client::new(a9_endpoint, a9_config);
     let result = client.setup_a8(&pending.request, identity.as_ref()).await;
-    *sequence_no = client.sequence_no();
     match result {
         Ok(context) => {
             info!(
@@ -445,7 +443,11 @@ pub(crate) async fn try_complete_hrpd_a9_setup(
                     pending.session_uati,
                     pending.request.uati,
                     pending.request.mac_index,
-                    cdma_a8::BearerSession::new(context.a8_key(), client.an_a8_endpoint()),
+                    cdma_a8::BearerSession::with_profile(
+                        context.a8_key(),
+                        client.an_a8_endpoint(),
+                        context.a8_bearer_profile(),
+                    ),
                 );
                 if default_packet_flow_open_for_pending(default_packet_flow_open_uatis, &pending) {
                     runtime.set_default_packet_flow_open(pending.request.uati, true);
@@ -463,20 +465,32 @@ pub(crate) async fn try_complete_hrpd_a9_setup(
     }
 }
 
+async fn report_session_gone(
+    identities: &Arc<Mutex<HashMap<u32, HrpdA9MobileIdentity>>>,
+    uati: u32,
+) {
+    let imsi = identities
+        .lock()
+        .await
+        .get(&uati)
+        .and_then(|identity| identity.imsi.clone());
+    if let Some(imsi) = imsi {
+        super::hrpd_a21::report_gone(&imsi);
+    }
+}
+
 pub(crate) async fn release_hrpd_a9_and_a10_for_uati(
     uati: u32,
     reason: &str,
     active_a9_sessions: &mut HashMap<u32, HrpdA9ReleaseContext>,
     a9_config: Option<HrpdA9ClientConfig>,
-    a9_endpoint: Option<&cdma_a9::UdpSignalingEndpoint>,
-    a9_sequence_no: &mut u32,
+    a9_endpoint: Option<&cdma_a9::SignalingEndpoint>,
 ) {
     if let Some(context) = active_a9_sessions.remove(&uati) {
         match (a9_config, a9_endpoint) {
             (Some(config), Some(endpoint)) => {
-                let mut client = HrpdAnA9Client::with_sequence(endpoint, config, *a9_sequence_no);
+                let mut client = HrpdAnA9Client::new(endpoint, config);
                 let result = client.release_a8(uati, &context, reason).await;
-                *a9_sequence_no = client.sequence_no();
                 if let Err(err) = result {
                     warn!("{err}");
                 }
@@ -643,6 +657,9 @@ pub async fn spawn_hrpd_an(
         hrpd_channel.band_class,
         hrpd_channel.channel_number
     );
+    if let Some(a21) = bts_config.evdo.a21 {
+        super::hrpd_a21::spawn_hrpd_a21(a21).await;
+    }
     spawn_hrpd_air_tasks(
         service.clone(),
         channels,
@@ -835,21 +852,13 @@ fn spawn_hrpd_air_tasks(
             None => None,
         };
         let a9_endpoint = match a9_config {
-            // Wildcard, not loopback: the PCF may be on another host, and a
-            // loopback-bound socket cannot send off-host.
-            Some(_) => match "0.0.0.0:0".parse::<SocketAddr>() {
-                Ok(bind_addr) => match cdma_a9::UdpSignalingEndpoint::bind(bind_addr).await {
-                    Ok(endpoint) => Some(endpoint),
-                    Err(err) => {
-                        warn!("HRPD AN: failed to bind ephemeral A9 client: {err}");
-                        None
-                    }
-                },
-                Err(err) => {
-                    warn!("HRPD AN: invalid ephemeral A9 bind address: {err}");
-                    None
-                }
-            },
+            Some(config) => cdma_a9::SignalingEndpoint::client(
+                SocketAddr::new(config.an_a8_endpoint.local_ip, 0),
+                config.a9_transport,
+            )
+            .await
+            .inspect_err(|err| warn!("HRPD AN: failed to bind A9 client: {err}"))
+            .ok(),
             None => None,
         };
         let pending_a9_sessions: Arc<Mutex<HashMap<u32, PendingHrpdA9Session>>> =
@@ -919,7 +928,7 @@ fn spawn_hrpd_air_tasks(
 async fn hrpd_an_traffic_event_task(
     service: AnServiceImpl,
     a9_config: Option<HrpdA9ClientConfig>,
-    a9_endpoint: Option<cdma_a9::UdpSignalingEndpoint>,
+    a9_endpoint: Option<cdma_a9::SignalingEndpoint>,
     mut traffic_rx: tokio::sync::mpsc::UnboundedReceiver<hrpd_air::HrpdTrafficEvent>,
     mut a9_release_rx: tokio::sync::mpsc::UnboundedReceiver<HrpdA9ReleaseRequest>,
     mut stream1_timing: HrpdStream1BridgeTiming,
@@ -937,7 +946,6 @@ async fn hrpd_an_traffic_event_task(
     a12_config: Option<A12ClientConfig>,
     hardware_admissions: SharedHardwareAdmissions,
 ) {
-    let mut a9_sequence_no = 0u32;
     let mut gates = HrpdA9Gates::new(hardware_admissions);
     let mut a12_identifier = 0u8;
     let (access_auth_verdict_tx, mut access_auth_verdict_rx) =
@@ -952,7 +960,7 @@ async fn hrpd_an_traffic_event_task(
         let outcome: HrpdTrafficOutcome = tokio::select! {
             a9 = async {
                 match a9_endpoint.as_ref() {
-                    Some(endpoint) => endpoint.recv_datagram(&mut unsolicited_a9_buf).await,
+                    Some(endpoint) => endpoint.recv(&mut unsolicited_a9_buf).await,
                     None => std::future::pending().await,
                 }
             } => {
@@ -1003,7 +1011,7 @@ async fn hrpd_an_traffic_event_task(
                 });
                 if let (Some(config), Some(endpoint)) = (a9_config, a9_endpoint.as_ref()) {
                     let mut client =
-                        HrpdAnA9Client::with_sequence(endpoint, config, a9_sequence_no);
+                        HrpdAnA9Client::new(endpoint, config);
                     let result = client
                         .release_a8_with_cause(
                             uati,
@@ -1012,7 +1020,6 @@ async fn hrpd_an_traffic_event_task(
                             disconnect.cause,
                         )
                         .await;
-                    a9_sequence_no = client.sequence_no();
                     if let Err(err) = result {
                         warn!("{err}");
                     }
@@ -1047,7 +1054,6 @@ async fn hrpd_an_traffic_event_task(
                     &mut active_a9_sessions,
                     a9_config,
                     a9_endpoint.as_ref(),
-                    &mut a9_sequence_no,
                 )
                 .await;
                 if let Some(runtime) = traffic_a8_runtime.as_ref() {
@@ -1178,7 +1184,6 @@ async fn hrpd_an_traffic_event_task(
                     &traffic_open_uatis,
                     &default_packet_flow_open_uatis,
                     &gates,
-                    &mut a9_sequence_no,
                     "access authentication settled",
                 )
                 .await
@@ -1218,6 +1223,7 @@ async fn hrpd_an_traffic_event_task(
         }
         let mut released_traffic_uatis: HashSet<u32> = HashSet::new();
         for uati in outcome.session_closed_uatis {
+            report_session_gone(&traffic_session_a9_identities, uati).await;
             released_traffic_uatis.insert(uati);
             traffic_open_uatis.remove(&uati);
             forget_default_packet_flow_open(&mut default_packet_flow_open_uatis, uati);
@@ -1228,7 +1234,6 @@ async fn hrpd_an_traffic_event_task(
                 &mut active_a9_sessions,
                 a9_config,
                 a9_endpoint.as_ref(),
-                &mut a9_sequence_no,
             )
             .await;
             if let Some(runtime) = traffic_a8_runtime.as_ref() {
@@ -1308,7 +1313,6 @@ async fn hrpd_an_traffic_event_task(
                 &traffic_open_uatis,
                 &default_packet_flow_open_uatis,
                 &gates,
-                &mut a9_sequence_no,
                 "TrafficChannelOpen + cached identity/config",
             )
             .await
@@ -1444,6 +1448,9 @@ async fn hrpd_an_traffic_event_task(
                 identities.insert(pending.session_uati, identity.clone());
                 identities.insert(pending.request.uati, identity.clone());
             }
+            if let Some(imsi) = identity.imsi.as_deref() {
+                super::hrpd_a21::report_present(imsi);
+            }
             pending.identity = Some(identity);
             if pending.session_configuration_complete {
                 match try_complete_hrpd_a9_setup(
@@ -1454,7 +1461,6 @@ async fn hrpd_an_traffic_event_task(
                     &traffic_open_uatis,
                     &default_packet_flow_open_uatis,
                     &gates,
-                    &mut a9_sequence_no,
                     "HardwareIDResponse + SessionConfigurationComplete",
                 )
                 .await
@@ -1532,7 +1538,6 @@ async fn hrpd_an_traffic_event_task(
                 &traffic_open_uatis,
                 &default_packet_flow_open_uatis,
                 &gates,
-                &mut a9_sequence_no,
                 "SessionConfigurationComplete + identity",
             )
             .await
@@ -1644,6 +1649,9 @@ async fn hrpd_an_access_task(
                         {
                             let mut identities = access_session_a9_identities.lock().await;
                             identities.insert(uati, identity.clone());
+                        }
+                        if let Some(imsi) = identity.imsi.as_deref() {
+                            super::hrpd_a21::report_present(imsi);
                         }
                         let pending_session_uati = {
                             let mut sessions = pending_a9_sessions.lock().await;
@@ -1797,6 +1805,7 @@ async fn hrpd_an_access_task(
             info!("HRPD AN: queued {count} traffic release(s)");
         }
         for uati in outcome.session_closed_uatis {
+            report_session_gone(&access_session_a9_identities, uati).await;
             let reason = "access SessionClose";
             if access_a9_release_tx
                 .send(HrpdA9ReleaseRequest {
@@ -1927,7 +1936,7 @@ mod tests {
         );
         HrpdA9ClientConfig {
             pcf_addr: "127.0.0.1:17046".parse().unwrap(),
-            a8_peer_ipv4: [127, 0, 0, 1],
+            a9_transport: cdma_a9::A9Transport::Udp,
             an_a8_bearer: cdma_pcf::inverted_udp_gre_bearer(pcf_a8, "test.an_a8").unwrap(),
             an_a8_endpoint: cdma_a8::BearerEndpoint::new([127, 0, 0, 1], [127, 0, 0, 1]),
         }
@@ -1950,9 +1959,9 @@ mod tests {
 
     fn test_pcf_node_config() -> cdma_pcf::PcfNodeConfig {
         cdma_pcf::PcfNodeConfig {
-            packet_grpc_endpoint: "http://127.0.0.1:17021".to_string(),
             a9_bind_addr: "127.0.0.1:17046".parse().unwrap(),
             management_bind_addr: "127.0.0.1:0".parse().unwrap(),
+            a9_transport: cdma_a9::A9Transport::Udp,
             a8_bearer: cdma_a8::BearerTransportConfig::udp_encapsulated_gre(
                 "127.0.0.1:17041".parse().unwrap(),
                 "127.0.0.1:17040".parse().unwrap(),
@@ -2067,10 +2076,11 @@ mod tests {
         );
         assert_eq!(
             setup.service_option,
-            cdma_a9::ServiceOptionValue::HIGH_RATE_PACKET_DATA
+            cdma_a9::ServiceOptionValue::HRPD_PACKET_DATA
         );
         assert!(setup.a9_indicators.data_ready);
         assert!(!setup.a9_indicators.packet_boundary_supported);
+        assert!(setup.a9_indicators.gre_segmentation_supported);
         assert!(setup.imsi.is_none());
         assert!(setup.esn.is_none());
         assert!(setup.meid.is_none());
@@ -2416,9 +2426,12 @@ mod tests {
             cdma_a10::BearerTransportConfig::udp_encapsulated_gre(pcf_a10, pdsn_a10);
         pcf_config.a11 = cdma_a11::A11TransportConfig::new(free_udp_addr(), free_udp_addr());
         let a9_config = spawn_hrpd_pcf_a9_service(pcf_config).await.unwrap();
-        let endpoint = cdma_a9::UdpSignalingEndpoint::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
+        let endpoint = cdma_a9::SignalingEndpoint::client(
+            "127.0.0.1:0".parse().unwrap(),
+            a9_config.a9_transport,
+        )
+        .await
+        .unwrap();
         let assignment = hrpd_air::HrpdTrafficAssignmentRequest {
             session_uati: 0x0080_0580,
             uati: 0x0080_0580,
@@ -2438,7 +2451,47 @@ mod tests {
 
         assert_eq!(context.con_ref().0, assignment.mac_index);
         assert_eq!(context.a8_key(), assignment.uati);
-        assert_eq!(client.sequence_no(), 1);
+    }
+
+    #[tokio::test]
+    async fn hrpd_setup_a8_roundtrips_through_pcf_a9_listener_over_tcp() {
+        let pcf_a8 = free_udp_addr();
+        let an_a8 = free_udp_addr();
+        let pcf_a10 = free_udp_addr();
+        let pdsn_a10 = free_udp_addr();
+        let mut pcf_config = test_pcf_node_config();
+        pcf_config.a9_bind_addr = "127.0.0.1:0".parse().unwrap();
+        pcf_config.a9_transport = cdma_a9::A9Transport::Tcp;
+        pcf_config.a8_bearer = cdma_a8::BearerTransportConfig::udp_encapsulated_gre(pcf_a8, an_a8);
+        pcf_config.a10_bearer =
+            cdma_a10::BearerTransportConfig::udp_encapsulated_gre(pcf_a10, pdsn_a10);
+        pcf_config.a11 = cdma_a11::A11TransportConfig::new(free_udp_addr(), free_udp_addr());
+        let a9_config = spawn_hrpd_pcf_a9_service(pcf_config).await.unwrap();
+        let endpoint = cdma_a9::SignalingEndpoint::client(
+            "127.0.0.1:0".parse().unwrap(),
+            a9_config.a9_transport,
+        )
+        .await
+        .unwrap();
+        let assignment = hrpd_air::HrpdTrafficAssignmentRequest {
+            session_uati: 0x0080_0580,
+            uati: 0x0080_0580,
+            mac_index: 9,
+            reverse_rate_limit_bps: 153_600,
+            reverse_long_code_mask_i: 0,
+            reverse_long_code_mask_q: 0,
+            drc_lock: true,
+            physical_layer_subtype: 0,
+            reverse_traffic_mac_subtype: 0,
+            frame_offset: 0,
+            drc_cover: 0,
+            drc_length: 1,
+        };
+        let mut client = HrpdAnA9Client::new(&endpoint, a9_config);
+        let context = client.setup_a8(&assignment, None).await.unwrap();
+
+        assert_eq!(context.con_ref().0, assignment.mac_index);
+        assert_eq!(context.a8_key(), assignment.uati);
     }
 
     #[tokio::test]
@@ -2454,9 +2507,12 @@ mod tests {
             cdma_a10::BearerTransportConfig::udp_encapsulated_gre(pcf_a10, pdsn_a10);
         pcf_config.a11 = cdma_a11::A11TransportConfig::new(free_udp_addr(), free_udp_addr());
         let a9_config = spawn_hrpd_pcf_a9_service(pcf_config).await.unwrap();
-        let endpoint = cdma_a9::UdpSignalingEndpoint::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
+        let endpoint = cdma_a9::SignalingEndpoint::client(
+            "127.0.0.1:0".parse().unwrap(),
+            a9_config.a9_transport,
+        )
+        .await
+        .unwrap();
         let assignment = hrpd_air::HrpdTrafficAssignmentRequest {
             session_uati: 0x0080_0580,
             uati: 0x0080_0580,
@@ -2478,8 +2534,6 @@ mod tests {
             .release_a8(assignment.uati, &release_context, "test SessionClose")
             .await
             .unwrap();
-
-        assert_eq!(client.sequence_no(), 2);
     }
 
     #[tokio::test]
@@ -2499,9 +2553,12 @@ mod tests {
             cdma_a10::BearerTransportConfig::udp_encapsulated_gre(pcf_a10, pdsn_a10);
         pcf_config.a11 = cdma_a11::A11TransportConfig::new(free_udp_addr(), pdsn_a11_addr);
         let a9_config = spawn_hrpd_pcf_a9_service(pcf_config).await.unwrap();
-        let endpoint = cdma_a9::UdpSignalingEndpoint::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
+        let endpoint = cdma_a9::SignalingEndpoint::client(
+            "127.0.0.1:0".parse().unwrap(),
+            a9_config.a9_transport,
+        )
+        .await
+        .unwrap();
         let assignment = hrpd_air::HrpdTrafficAssignmentRequest {
             session_uati: 0x0080_0580,
             uati: 0x0080_0580,
@@ -2597,7 +2654,7 @@ mod tests {
         send_update.send(()).unwrap();
         let mut buf = vec![0u8; 4096];
         let (datagram, peer) =
-            tokio::time::timeout(Duration::from_secs(1), endpoint.recv_datagram(&mut buf))
+            tokio::time::timeout(Duration::from_secs(1), endpoint.recv(&mut buf))
                 .await
                 .unwrap()
                 .unwrap();
@@ -2658,9 +2715,12 @@ mod tests {
         pcf_config.a11 =
             cdma_a11::A11TransportConfig::new("127.0.0.1:0".parse().unwrap(), pdsn_a11_addr);
         let a9_config = spawn_hrpd_pcf_a9_service(pcf_config).await.unwrap();
-        let endpoint = cdma_a9::UdpSignalingEndpoint::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
+        let endpoint = cdma_a9::SignalingEndpoint::client(
+            "127.0.0.1:0".parse().unwrap(),
+            a9_config.a9_transport,
+        )
+        .await
+        .unwrap();
         let assignment = hrpd_air::HrpdTrafficAssignmentRequest {
             session_uati: 0x8005_8001,
             uati: 0x8005_8001,

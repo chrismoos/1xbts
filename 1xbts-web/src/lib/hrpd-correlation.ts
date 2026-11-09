@@ -104,7 +104,7 @@ export function parseHrpdPacketMobileAddress(address?: string): number | undefin
 }
 
 export function parseHrpdA10SessionId(sessionId?: string): number | undefined {
-  const match = sessionId?.match(/^hrpd-a10-([0-9a-fA-F]{8})-[0-9a-fA-F]{4}$/);
+  const match = sessionId?.match(/^(?:hrpd-)?a10-([0-9a-fA-F]{8})-[0-9a-fA-F]{4}$/);
   if (!match) return undefined;
   const value = Number.parseInt(match[1], 16);
   return Number.isFinite(value) ? value >>> 0 : undefined;

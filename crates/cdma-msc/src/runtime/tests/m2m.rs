@@ -25,7 +25,9 @@ fn page_response_for(setup: &M2mSetup) -> EncodedA1Message {
     EncodedA1Message::from_message_for_call(
         &cdma_ios::Message::new(
             cdma_ios::MessageType::PagingResponse,
-            response.encode().unwrap(),
+            response
+                .encode_a1(cdma_ios::CellId { cell: 1, sector: 0 })
+                .unwrap(),
         ),
         Some(setup.callee.0),
     )
@@ -434,7 +436,9 @@ async fn inbound_sip_still_pages_alerts_and_answers_one_mobile() {
             EncodedA1Message::from_message_for_call(
                 &cdma_ios::Message::new(
                     cdma_ios::MessageType::PagingResponse,
-                    response.encode().unwrap(),
+                    response
+                        .encode_a1(cdma_ios::CellId { cell: 1, sector: 0 })
+                        .unwrap(),
                 ),
                 Some(callee.0),
             ),

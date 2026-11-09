@@ -1,6 +1,7 @@
 //! `csim`: personalize, read, dump and compare CSIM cards, and manage the
 //! 1xBTS CSIM applet on a sysmoISIM-SJA5.
 
+mod benchmark;
 mod commands;
 mod install;
 mod pcsc_transport;
@@ -57,6 +58,8 @@ pub struct ReaderArgs {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Time reader exchanges and authentication operations using existing card secrets.
+    Bench(benchmark::BenchArgs),
     /// Show the ATR, whether the CSIM is present and the EFs readable
     /// without a PIN.
     Info(ReaderArgs),
@@ -229,6 +232,7 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
+        Command::Bench(args) => benchmark::run(args),
         Command::Info(r) => commands::info(&r),
         Command::Validate { profile } => commands::validate(&profile),
         Command::Profile {

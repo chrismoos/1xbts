@@ -8833,7 +8833,7 @@ async fn cold_origination_and_page_response_resume_with_original_authentication(
         } else {
             assert_eq!(decoded.message_type, cdma_ios::MessageType::PagingResponse);
             assert_eq!(encoded.call_id(), Some(42));
-            let response = cdma_ios::PagingResponseMessage::decode(&decoded.payload).unwrap();
+            let response = cdma_ios::PagingResponseMessage::decode_a1(&decoded.payload).unwrap();
             assert_eq!(
                 response.mobile_identity_meid,
                 super::a1::meid_identity_from_hex("00123456789ABC")

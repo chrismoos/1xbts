@@ -112,6 +112,10 @@ const RRP_CODE_POORLY_FORMED_REQUEST: u8 = 64;
 const RRP_CODE_ADMINISTRATIVELY_PROHIBITED: u8 = 65;
 const RRP_CODE_INSUFFICIENT_RESOURCES: u8 = 66;
 const RRP_CODE_MOBILE_NODE_AUTH_FAILED: u8 = 67;
+/// RFC 3012 §8 CHAP_SPI.
+const MN_AAA_CHAP_SPI: u32 = 2;
+/// RFC 3012 §8: only the least-order 237 bytes of the challenge are hashed.
+const MN_AAA_CHALLENGE_TAIL_LEN: usize = 237;
 const RRP_CODE_HOME_AGENT_AUTH_FAILED: u8 = 68;
 const RRP_CODE_LIFETIME_TOO_LONG: u8 = 69;
 const RRP_CODE_POORLY_FORMED_REPLY: u8 = 70;
@@ -191,6 +195,22 @@ impl MobileIpSecurityAssociation {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct MnAaaCredential {
+    pub nai: String,
+    pub secret: Vec<u8>,
+}
+
+impl std::fmt::Debug for MnAaaCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MnAaaCredential")
+            .field("nai", &self.nai)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MobileIpConfig {
     pub enabled: bool,
@@ -204,6 +224,9 @@ pub struct MobileIpConfig {
     pub auth_mode: MobileIpAuthMode,
     pub mn_ha_security: Option<Box<MobileIpSecurityAssociation>>,
     pub allow_unverified_mn_aaa: bool,
+    /// A listed NAI needs a valid MN-AAA authenticator even when
+    /// `allow_unverified_mn_aaa` is set.
+    pub mn_aaa_credentials: Vec<MnAaaCredential>,
     /// Allow Simple IP fallback on an MN-HA SPI mismatch.
     pub mn_ha_fallback_to_simple_ip: bool,
 }
@@ -222,9 +245,19 @@ impl Default for MobileIpConfig {
             auth_mode: MobileIpAuthMode::Insecure,
             mn_ha_security: None,
             allow_unverified_mn_aaa: false,
+            mn_aaa_credentials: Vec::new(),
             mn_ha_fallback_to_simple_ip: false,
         }
     }
+}
+
+/// Outcome of asking the address pool for a home address the mobile
+/// requested in its Registration Request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomeAddressClaim {
+    Granted,
+    InUse,
+    OutsidePool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +278,7 @@ pub struct MobileIpSession {
     issued_challenges: Vec<IssuedChallenge>,
     binding: Option<MobileIpBinding>,
     last_registration: Option<Box<CompletedRegistration>>,
+    mn_nai: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -391,6 +425,7 @@ impl MobileIpSession {
             issued_challenges: Vec::with_capacity(MIP_CHALLENGE_WINDOW),
             binding: None,
             last_registration: None,
+            mn_nai: None,
         };
         session.rotate_challenge();
         session
@@ -416,10 +451,15 @@ impl MobileIpSession {
         Some(self.agent_advertisement_packet(Ipv4Addr::BROADCAST))
     }
 
+    pub fn mn_nai(&self) -> Option<&str> {
+        self.mn_nai.as_deref()
+    }
+
     pub fn handle_ipv4_packet(
         &mut self,
         packet: &[u8],
         assigned_home_address: Ipv4Addr,
+        claim_home_address: &mut dyn FnMut(Ipv4Addr) -> HomeAddressClaim,
     ) -> MobileIpPacketResult {
         if !self.config.enabled {
             return MobileIpPacketResult::NotMobileIp;
@@ -450,6 +490,9 @@ impl MobileIpSession {
             return MobileIpPacketResult::Ignored;
         };
         let nai = rrq.nai();
+        if nai.is_some() {
+            self.mn_nai = nai.clone();
+        }
         log::info!(
             "MIP4 RX: RRQ src={} dst={} udp={}->{} nai={} home={} ha={} coa={} lifetime={} id=0x{:016x} flags=0x{:02x}({}) mn_fa_challenge={} auth_details=[{}] unknown_exts={} unknown_ext_details=[{}] ext_count={}",
             ip.source,
@@ -554,6 +597,30 @@ impl MobileIpSession {
                 scope,
             );
             return MobileIpPacketResult::Deregistered { reply };
+        }
+        if home_address != assigned_home_address {
+            let rejection = match claim_home_address(home_address) {
+                HomeAddressClaim::Granted => None,
+                HomeAddressClaim::InUse => Some(RRP_CODE_HA_INSUFFICIENT_RESOURCES),
+                HomeAddressClaim::OutsidePool => Some(RRP_CODE_HA_ADMIN_PROHIBITED),
+            };
+            if let Some(code) = rejection {
+                log::warn!(
+                    "MIP4: rejecting RRQ home={} code={}({}), the address is not available to this session",
+                    home_address,
+                    code,
+                    registration_reply_code_label(code)
+                );
+                let reply = self.registration_reply_packet(
+                    &ip,
+                    udp.source_port,
+                    &rrq,
+                    code,
+                    home_address,
+                    scope,
+                );
+                return MobileIpPacketResult::Reply(reply);
+            }
         }
         let lifetime_secs = rrq
             .lifetime_secs
@@ -767,6 +834,11 @@ impl MobileIpSession {
                 "MN-FA security association is not configured",
             );
         }
+        if let (Some(authentication), Some(credential)) =
+            (rrq.mn_aaa_auth(), self.mn_aaa_credential(rrq))
+        {
+            return verify_mn_aaa(rrq, authentication, credential, challenge, scope);
+        }
         if rrq.has_mn_aaa_auth() && !self.config.allow_unverified_mn_aaa {
             return RegistrationAuthentication::InfrastructureRequired(
                 "MN-AAA verification is required by configuration",
@@ -778,6 +850,14 @@ impl MobileIpSession {
             );
         }
         RegistrationAuthentication::Accepted(scope)
+    }
+
+    fn mn_aaa_credential(&self, rrq: &RegistrationRequest) -> Option<&MnAaaCredential> {
+        let nai = rrq.mn_nai()?;
+        self.config
+            .mn_aaa_credentials
+            .iter()
+            .find(|credential| credential.nai.as_bytes().eq_ignore_ascii_case(nai))
     }
 
     fn agent_advertisement_packet(&mut self, destination: Ipv4Addr) -> Vec<u8> {
@@ -1422,6 +1502,68 @@ fn build_ipv4_packet_with_ttl(
     packet
 }
 
+fn verify_mn_aaa(
+    rrq: &RegistrationRequest,
+    authentication: &MobileIpAuthentication,
+    credential: &MnAaaCredential,
+    challenge: &[u8],
+    scope: AuthenticatorScope,
+) -> RegistrationAuthentication {
+    if authentication.spi != MN_AAA_CHAP_SPI {
+        log::warn!(
+            "MIP4: MN-AAA SPI 0x{:08x} for nai={} is not CHAP_SPI",
+            authentication.spi,
+            credential.nai
+        );
+        return RegistrationAuthentication::Rejected {
+            code: RRP_CODE_MOBILE_NODE_AUTH_FAILED,
+            reason: "MN-AAA SPI is not CHAP_SPI",
+        };
+    }
+    let Some(expected) = mn_aaa_chap_authenticator(
+        &credential.secret,
+        challenge,
+        &rrq.wire_data[..authentication.protected_data_len],
+    ) else {
+        return RegistrationAuthentication::Rejected {
+            code: RRP_CODE_MOBILE_NODE_AUTH_FAILED,
+            reason: "MN-FA challenge is empty",
+        };
+    };
+    if !constant_time_eq(&expected, &authentication.authenticator) {
+        log::warn!(
+            "MIP4: MN-AAA mismatch nai={} received={} expected={}",
+            credential.nai,
+            format_hex(&authentication.authenticator),
+            format_hex(&expected),
+        );
+        return RegistrationAuthentication::Rejected {
+            code: RRP_CODE_MOBILE_NODE_AUTH_FAILED,
+            reason: "MN-AAA authenticator does not match",
+        };
+    }
+    log::info!("MIP4: MN-AAA verified nai={}", credential.nai);
+    RegistrationAuthentication::Accepted(scope)
+}
+
+/// RFC 3012 §8: MD5(challenge high-order byte || secret ||
+/// MD5(registration data through the SPI) || challenge least-order 237 bytes).
+fn mn_aaa_chap_authenticator(
+    secret: &[u8],
+    challenge: &[u8],
+    protected_data: &[u8],
+) -> Option<[u8; MIP_AUTHENTICATOR_LEN]> {
+    let (&chap_id, _) = challenge.split_first()?;
+    let tail = &challenge[challenge.len().saturating_sub(MN_AAA_CHALLENGE_TAIL_LEN)..];
+    let inner: [u8; MIP_AUTHENTICATOR_LEN] = Md5::digest(protected_data).into();
+    let mut md5 = Md5::new();
+    md5.update([chap_id]);
+    md5.update(secret);
+    md5.update(inner);
+    md5.update(tail);
+    Some(md5.finalize().into())
+}
+
 fn keyed_md5_prefix_suffix(secret: &[u8], protected_data: &[u8]) -> [u8; MIP_AUTHENTICATOR_LEN] {
     let mut md5 = Md5::new();
     md5.update(secret);
@@ -1670,7 +1812,8 @@ mod tests {
                 CHECKSUM_PLACEHOLDER.to_be_bytes()[1],
             ],
         );
-        let result = session.handle_ipv4_packet(&solicitation, TEST_ASSIGNED_HOME);
+        let result =
+            session.handle_ipv4_packet(&solicitation, TEST_ASSIGNED_HOME, &mut grant_home_address);
         let MobileIpPacketResult::Reply(advertisement) = result else {
             panic!("unexpected result: {result:?}");
         };
@@ -1685,6 +1828,92 @@ mod tests {
             mobility_extension_flags & MIP_AGENT_ADVERTISEMENT_FLAG_REVERSE_TUNNEL,
             0
         );
+    }
+
+    fn grant_home_address(_home_address: Ipv4Addr) -> HomeAddressClaim {
+        HomeAddressClaim::Granted
+    }
+
+    fn rrq_packet_requesting_home(home_address: Ipv4Addr) -> Vec<u8> {
+        let mut payload = rrq_payload_without_auth();
+        payload[MIP_RRQ_HOME_ADDRESS_OFFSET..MIP_RRQ_HOME_ADDRESS_OFFSET + 4]
+            .copy_from_slice(&home_address.octets());
+        registration_request_packet(&payload)
+    }
+
+    fn insecure_session() -> MobileIpSession {
+        MobileIpSession::new(MobileIpConfig {
+            enabled: true,
+            ..MobileIpConfig::default()
+        })
+    }
+
+    #[test]
+    fn rrq_for_a_home_address_held_by_another_session_is_rejected() {
+        let requested = Ipv4Addr::new(10, 55, 0, 3);
+        let mut session = insecure_session();
+        let mut claimed = Vec::new();
+        let result = session.handle_ipv4_packet(
+            &rrq_packet_requesting_home(requested),
+            TEST_ASSIGNED_HOME,
+            &mut |home| {
+                claimed.push(home);
+                HomeAddressClaim::InUse
+            },
+        );
+        let MobileIpPacketResult::Reply(reply) = result else {
+            panic!("unexpected result: {result:?}");
+        };
+        assert_eq!(claimed, [requested]);
+        assert_eq!(
+            registration_reply_payload(&reply)[MIP_RRP_CODE_OFFSET],
+            RRP_CODE_HA_INSUFFICIENT_RESOURCES
+        );
+        assert!(session.binding().is_none());
+    }
+
+    #[test]
+    fn rrq_for_a_home_address_outside_the_pool_is_rejected() {
+        let mut session = insecure_session();
+        let result = session.handle_ipv4_packet(
+            &rrq_packet_requesting_home(Ipv4Addr::new(192, 0, 2, 7)),
+            TEST_ASSIGNED_HOME,
+            &mut |_| HomeAddressClaim::OutsidePool,
+        );
+        let MobileIpPacketResult::Reply(reply) = result else {
+            panic!("unexpected result: {result:?}");
+        };
+        assert_eq!(
+            registration_reply_payload(&reply)[MIP_RRP_CODE_OFFSET],
+            RRP_CODE_HA_ADMIN_PROHIBITED
+        );
+        assert!(session.binding().is_none());
+    }
+
+    #[test]
+    fn rrq_for_a_free_pool_address_registers_after_the_claim() {
+        let requested = Ipv4Addr::new(10, 55, 0, 3);
+        let mut session = insecure_session();
+        let result = session.handle_ipv4_packet(
+            &rrq_packet_requesting_home(requested),
+            TEST_ASSIGNED_HOME,
+            &mut grant_home_address,
+        );
+        let MobileIpPacketResult::Registered { binding, .. } = result else {
+            panic!("unexpected result: {result:?}");
+        };
+        assert_eq!(binding.home_address, requested);
+    }
+
+    #[test]
+    fn rrq_for_the_assigned_home_address_skips_the_claim() {
+        let mut session = insecure_session();
+        let result = session.handle_ipv4_packet(
+            &rrq_packet_requesting_home(TEST_ASSIGNED_HOME),
+            TEST_ASSIGNED_HOME,
+            &mut |home| panic!("unexpected claim for {home}"),
+        );
+        assert!(matches!(result, MobileIpPacketResult::Registered { .. }));
     }
 
     #[test]
@@ -1704,7 +1933,7 @@ mod tests {
             IP_PROTO_UDP,
             &udp,
         );
-        let result = session.handle_ipv4_packet(&ip, TEST_ASSIGNED_HOME);
+        let result = session.handle_ipv4_packet(&ip, TEST_ASSIGNED_HOME, &mut grant_home_address);
         match result {
             MobileIpPacketResult::Registered { binding, reply } => {
                 assert_eq!(binding.home_address, TEST_ASSIGNED_HOME);
@@ -1789,7 +2018,8 @@ mod tests {
         let mut session = MobileIpSession::new(sprint_authenticated_config(true));
         session.issue_challenge(rrq.mn_fa_challenge().unwrap().to_vec());
         let packet = registration_request_packet(&payload);
-        let result = session.handle_ipv4_packet(&packet, TEST_ASSIGNED_HOME);
+        let result =
+            session.handle_ipv4_packet(&packet, TEST_ASSIGNED_HOME, &mut grant_home_address);
         let MobileIpPacketResult::Registered { reply, .. } = result else {
             panic!("unexpected result: {result:?}");
         };
@@ -1844,8 +2074,11 @@ mod tests {
         )));
         let mut session = MobileIpSession::new(config);
         session.issue_challenge(rrq.mn_fa_challenge().unwrap().to_vec());
-        let result =
-            session.handle_ipv4_packet(&registration_request_packet(&payload), TEST_ASSIGNED_HOME);
+        let result = session.handle_ipv4_packet(
+            &registration_request_packet(&payload),
+            TEST_ASSIGNED_HOME,
+            &mut grant_home_address,
+        );
         let MobileIpPacketResult::Reply(reply) = result else {
             panic!("unexpected result: {result:?}");
         };
@@ -1875,7 +2108,8 @@ mod tests {
         let mut session = MobileIpSession::new(sprint_authenticated_config(true));
         session.issue_challenge(rrq.mn_fa_challenge().unwrap().to_vec());
         let packet = registration_request_packet(&payload);
-        let result = session.handle_ipv4_packet(&packet, TEST_ASSIGNED_HOME);
+        let result =
+            session.handle_ipv4_packet(&packet, TEST_ASSIGNED_HOME, &mut grant_home_address);
         let MobileIpPacketResult::Registered { binding, reply } = result else {
             panic!("unexpected result: {result:?}");
         };
@@ -1923,7 +2157,8 @@ mod tests {
             MIP_MOBILE_FOREIGN_CHALLENGE_EXT
         );
 
-        let retransmission = session.handle_ipv4_packet(&packet, TEST_ASSIGNED_HOME);
+        let retransmission =
+            session.handle_ipv4_packet(&packet, TEST_ASSIGNED_HOME, &mut grant_home_address);
         let MobileIpPacketResult::Registered {
             reply: retransmitted_reply,
             ..
@@ -1945,7 +2180,11 @@ mod tests {
         let payload =
             sprint_authenticated_rrq_payload_with(TEST_SPRINT_IDENTIFICATION, &older_challenge);
         assert!(matches!(
-            session.handle_ipv4_packet(&registration_request_packet(&payload), TEST_ASSIGNED_HOME),
+            session.handle_ipv4_packet(
+                &registration_request_packet(&payload),
+                TEST_ASSIGNED_HOME,
+                &mut grant_home_address
+            ),
             MobileIpPacketResult::Registered { .. }
         ));
     }
@@ -1961,7 +2200,8 @@ mod tests {
         assert!(matches!(
             session.handle_ipv4_packet(
                 &registration_request_packet(&first_payload),
-                TEST_ASSIGNED_HOME
+                TEST_ASSIGNED_HOME,
+                &mut grant_home_address
             ),
             MobileIpPacketResult::Registered { .. }
         ));
@@ -1973,6 +2213,7 @@ mod tests {
         let result = session.handle_ipv4_packet(
             &registration_request_packet(&second_payload),
             TEST_ASSIGNED_HOME,
+            &mut grant_home_address,
         );
         let MobileIpPacketResult::Reply(reply) = result else {
             panic!("unexpected result: {result:?}");
@@ -1997,8 +2238,11 @@ mod tests {
 
         let payload =
             sprint_authenticated_rrq_payload_with(TEST_SPRINT_IDENTIFICATION, &old_challenge);
-        let result =
-            session.handle_ipv4_packet(&registration_request_packet(&payload), TEST_ASSIGNED_HOME);
+        let result = session.handle_ipv4_packet(
+            &registration_request_packet(&payload),
+            TEST_ASSIGNED_HOME,
+            &mut grant_home_address,
+        );
         let MobileIpPacketResult::Reply(reply) = result else {
             panic!("unexpected result: {result:?}");
         };
@@ -2019,8 +2263,11 @@ mod tests {
 
         let mut session = MobileIpSession::new(sprint_authenticated_config(true));
         session.issue_challenge(rrq.mn_fa_challenge().unwrap().to_vec());
-        let result =
-            session.handle_ipv4_packet(&registration_request_packet(&payload), TEST_ASSIGNED_HOME);
+        let result = session.handle_ipv4_packet(
+            &registration_request_packet(&payload),
+            TEST_ASSIGNED_HOME,
+            &mut grant_home_address,
+        );
         let MobileIpPacketResult::Reply(reply) = result else {
             panic!("unexpected result: {result:?}");
         };
@@ -2038,8 +2285,69 @@ mod tests {
         let mut session = MobileIpSession::new(sprint_authenticated_config(false));
         session.issue_challenge(rrq.mn_fa_challenge().unwrap().to_vec());
         assert_eq!(
-            session.handle_ipv4_packet(&registration_request_packet(&payload), TEST_ASSIGNED_HOME,),
+            session.handle_ipv4_packet(
+                &registration_request_packet(&payload),
+                TEST_ASSIGNED_HOME,
+                &mut grant_home_address
+            ),
             MobileIpPacketResult::AuthenticationRequired
+        );
+    }
+
+    fn mn_aaa_rrq_payload(secret: &[u8]) -> Vec<u8> {
+        let mut rrq = sprint_authenticated_rrq_payload();
+        let auth_start = rrq.len() - MIP_AUTHENTICATOR_LEN;
+        rrq[auth_start - AUTH_EXTENSION_SPI_LEN..auth_start]
+            .copy_from_slice(&MN_AAA_CHAP_SPI.to_be_bytes());
+        let authenticator =
+            mn_aaa_chap_authenticator(secret, &TEST_SPRINT_CHALLENGE, &rrq[..auth_start]).unwrap();
+        rrq[auth_start..].copy_from_slice(&authenticator);
+        rrq
+    }
+
+    fn mn_aaa_config() -> MobileIpConfig {
+        MobileIpConfig {
+            mn_aaa_credentials: vec![MnAaaCredential {
+                nai: String::from_utf8(TEST_SPRINT_NAI.to_vec()).unwrap(),
+                secret: b"mn-aaa-secret".to_vec(),
+            }],
+            ..sprint_authenticated_config(false)
+        }
+    }
+
+    fn register(config: MobileIpConfig, payload: &[u8]) -> MobileIpPacketResult {
+        let rrq = parse_registration_request(payload).unwrap();
+        let mut session = MobileIpSession::new(config);
+        session.issue_challenge(rrq.mn_fa_challenge().unwrap().to_vec());
+        session.handle_ipv4_packet(
+            &registration_request_packet(payload),
+            TEST_ASSIGNED_HOME,
+            &mut grant_home_address,
+        )
+    }
+
+    #[test]
+    fn mn_aaa_with_configured_secret_is_verified() {
+        let result = register(mn_aaa_config(), &mn_aaa_rrq_payload(b"mn-aaa-secret"));
+        assert!(
+            matches!(result, MobileIpPacketResult::Registered { .. }),
+            "unexpected result: {result:?}"
+        );
+    }
+
+    #[test]
+    fn mn_aaa_with_wrong_secret_is_rejected_even_when_unverified_is_allowed() {
+        let config = MobileIpConfig {
+            allow_unverified_mn_aaa: true,
+            ..mn_aaa_config()
+        };
+        let result = register(config, &mn_aaa_rrq_payload(b"wrong"));
+        let MobileIpPacketResult::Reply(reply) = result else {
+            panic!("unexpected result: {result:?}");
+        };
+        assert_eq!(
+            registration_reply_payload(&reply)[MIP_RRP_CODE_OFFSET],
+            RRP_CODE_MOBILE_NODE_AUTH_FAILED
         );
     }
 
@@ -2063,8 +2371,11 @@ mod tests {
         let rrq = parse_registration_request(&payload).unwrap();
         let mut session = MobileIpSession::new(mismatched_spi_config(false));
         session.issue_challenge(rrq.mn_fa_challenge().unwrap().to_vec());
-        let result =
-            session.handle_ipv4_packet(&registration_request_packet(&payload), TEST_ASSIGNED_HOME);
+        let result = session.handle_ipv4_packet(
+            &registration_request_packet(&payload),
+            TEST_ASSIGNED_HOME,
+            &mut grant_home_address,
+        );
         let MobileIpPacketResult::Reply(reply) = result else {
             panic!("unexpected result: {result:?}");
         };
@@ -2082,7 +2393,11 @@ mod tests {
         let mut session = MobileIpSession::new(mismatched_spi_config(true));
         session.issue_challenge(rrq.mn_fa_challenge().unwrap().to_vec());
         assert_eq!(
-            session.handle_ipv4_packet(&registration_request_packet(&payload), TEST_ASSIGNED_HOME),
+            session.handle_ipv4_packet(
+                &registration_request_packet(&payload),
+                TEST_ASSIGNED_HOME,
+                &mut grant_home_address
+            ),
             MobileIpPacketResult::AuthenticationRequired
         );
         assert!(session.binding().is_none());

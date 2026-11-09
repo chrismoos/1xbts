@@ -1049,7 +1049,14 @@ impl FemtoInterfaceMsg {
             MSG_TYPE_CM_SERVICE_REQUEST,
         ];
         wire.extend_from_slice(&service_type.content);
-        wire.extend_from_slice(&classmark.content);
+        // A1 encodes the classmark as a bare LV, without the IEI the
+        // femtocell interface element has.
+        wire.extend_from_slice(classmark.content.get(1..).ok_or(FemtoError::A1Codec(
+            crate::Error::Truncated {
+                needed: 1,
+                actual: classmark.content.len(),
+            },
+        ))?);
         wire.extend_from_slice(imsi.content.get(1..).ok_or(FemtoError::A1Codec(
             crate::Error::Truncated {
                 needed: 1,
@@ -1097,7 +1104,14 @@ impl FemtoInterfaceMsg {
             DTAP_RESERVED_OCTET,
             MSG_TYPE_PAGING_RESPONSE,
         ];
-        wire.extend_from_slice(&classmark.content);
+        // A1 encodes the classmark as a bare LV, without the IEI the
+        // femtocell interface element has.
+        wire.extend_from_slice(classmark.content.get(1..).ok_or(FemtoError::A1Codec(
+            crate::Error::Truncated {
+                needed: 1,
+                actual: classmark.content.len(),
+            },
+        ))?);
         wire.extend_from_slice(imsi.content.get(1..).ok_or(FemtoError::A1Codec(
             crate::Error::Truncated {
                 needed: 1,

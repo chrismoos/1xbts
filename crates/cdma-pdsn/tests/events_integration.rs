@@ -69,7 +69,7 @@ async fn live_session_bind_and_unbind_land_on_the_bus() {
     .with_lifecycle_sink(sink);
 
     let (uplink_tx, _downlink_rx) = service
-        .open_session_direct(
+        .open_pdsn_a10_byte_stream_session_direct(
             "session-test".to_string(),
             33,
             SessionMetadata {
@@ -117,9 +117,6 @@ async fn live_session_bind_and_unbind_land_on_the_bus() {
         other => panic!("expected pdsn body, got {other:?}"),
     }
 
-    // Close via the service API. `close_session_direct` is graceful:
-    // it drops the cloned uplink sender, awaits the task, and lets
-    // cleanup (and the lifecycle sink's `on_unbound`) run to completion.
     drop(uplink_tx);
     service.close_session_direct("session-test").await;
 
@@ -175,7 +172,7 @@ async fn unprovisioned_mobile_emits_identity_only() {
     .with_lifecycle_sink(sink);
 
     let (uplink_tx, _downlink_rx) = service
-        .open_session_direct(
+        .open_pdsn_a10_byte_stream_session_direct(
             "session-roam".to_string(),
             33,
             SessionMetadata {

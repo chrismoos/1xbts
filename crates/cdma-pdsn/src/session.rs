@@ -9,8 +9,6 @@ use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
-
 /// Result type used by the PDSN session manager.
 pub type Result<T> = std::result::Result<T, PdsnError>;
 
@@ -250,62 +248,6 @@ impl PdsnSessionManager {
             },
         );
         Ok(PdsnEvent::SessionRegistered { key, mobile_ip })
-    }
-
-    /// Starts the legacy PPP/IP/TUN packet-core task under PDSN ownership.
-    ///
-    /// This is a migration adapter: packet-core anchoring is now modeled as
-    /// PDSN state even while the old `cdma-packet` engine still performs PPP,
-    /// IPCP, and local host I/O.
-    pub fn start_legacy_packet_core(
-        &mut self,
-        key: cdma_a11::SessionKey,
-        session_id: String,
-        service_option: u32,
-        metadata: cdma_packet::session_task::SessionMetadata,
-        transport: Box<dyn cdma_packet::ip_transport::IpTransport>,
-        allocator: Arc<dyn cdma_packet::ip_allocator::IpAllocator>,
-    ) -> Result<(
-        mpsc::Sender<cdma_packet::proto::SessionFrame>,
-        mpsc::Receiver<cdma_packet::proto::SessionFrame>,
-    )> {
-        let session = self
-            .sessions
-            .get_mut(&key)
-            .ok_or(PdsnError::UnknownSession(key))?;
-        let (uplink_tx, uplink_rx) = mpsc::channel(256);
-        let (downlink_tx, downlink_rx) = mpsc::channel(256);
-        let metadata_for_task = metadata.clone();
-        let status = Arc::new(Mutex::new(cdma_packet::session_task::SessionStatus::new(
-            service_option,
-            metadata,
-        )));
-        session.legacy_status = Some(status.clone());
-        // PDSN-managed sessions don't currently expose F-SCH control; the
-        // sender is dropped immediately so `control_rx.recv()` always yields
-        // `None` and the session stays FCH-only.
-        let (_control_tx, control_rx) =
-            mpsc::channel::<cdma_packet::session_task::SessionControl>(1);
-        let sink: Arc<dyn cdma_packet::session_lifecycle::SessionLifecycleSink> =
-            Arc::new(cdma_packet::session_lifecycle::NullSink);
-        tokio::spawn(async move {
-            cdma_packet::session_task::run_session(
-                session_id,
-                service_option,
-                transport,
-                uplink_rx,
-                downlink_tx,
-                status,
-                allocator,
-                control_rx,
-                metadata_for_task,
-                sink,
-                None,
-                Duration::ZERO,
-            )
-            .await;
-        });
-        Ok((uplink_tx, downlink_rx))
     }
 
     /// Returns one PDSN session.

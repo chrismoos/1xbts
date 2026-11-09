@@ -49,7 +49,7 @@ pub(super) fn enrich(event: &mut NetworkEvent, encoded: &EncodedA1Message) {
             }
         }
         MessageType::PagingResponse => {
-            if let Ok(response) = cdma_ios::PagingResponseMessage::decode(&message.payload) {
+            if let Ok(response) = cdma_ios::PagingResponseMessage::decode_a1(&message.payload) {
                 merge(&mut identity, &response.mobile_identity_imsi);
                 merge_optional(&mut identity, response.mobile_identity_esn.as_ref());
                 merge_optional(&mut identity, response.mobile_identity_meid.as_ref());

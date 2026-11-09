@@ -30,7 +30,7 @@ use crate::grpc::base_station::v1::EnrollRequest;
 use crate::grpc::base_station::v1::base_station_service_client::BaseStationServiceClient;
 
 /// First delay after a failed or dropped attach.
-const RETRY_MIN: Duration = Duration::from_secs(1);
+const RETRY_MIN: Duration = Duration::from_millis(500);
 /// Ceiling the retry delay backs off to.
 const RETRY_MAX: Duration = Duration::from_secs(30);
 /// How often an attached node is probed over its management plane. A1
@@ -169,6 +169,7 @@ struct NodeEntry {
     cells: Vec<ServedCell>,
     link: Option<A1TransportSender>,
     status_detail: Option<String>,
+    a1p: cdma_ios::transport::A1pConfig,
 }
 
 /// Wire-to-internal call id translation across every node.
@@ -275,6 +276,7 @@ impl BaseStations {
                         cells: Vec::new(),
                         link: None,
                         status_detail: Some("not yet enrolled".to_string()),
+                        a1p: config.a1p.clone(),
                     })
                     .collect(),
             ),
@@ -299,16 +301,16 @@ impl BaseStations {
     }
 
     pub fn spawn_attach_tasks(self: &Arc<Self>) {
-        let endpoints: Vec<String> = self
+        let endpoints: Vec<(String, cdma_ios::transport::A1pConfig)> = self
             .entries
             .lock()
             .expect("base station registry lock")
             .iter()
-            .map(|entry| entry.management_endpoint.clone())
+            .map(|entry| (entry.management_endpoint.clone(), entry.a1p.clone()))
             .collect();
-        for endpoint in endpoints {
+        for (endpoint, a1p) in endpoints {
             let nodes = self.clone();
-            tokio::spawn(async move { attach_forever(endpoint, nodes).await });
+            tokio::spawn(async move { attach_forever(endpoint, a1p, nodes).await });
         }
     }
 
@@ -514,21 +516,28 @@ impl MscA1Endpoint for BaseStations {
     }
 }
 
-async fn attach_forever(endpoint: String, nodes: Arc<BaseStations>) {
+async fn attach_forever(
+    endpoint: String,
+    a1p: cdma_ios::transport::A1pConfig,
+    nodes: Arc<BaseStations>,
+) {
     let mut retry = RETRY_MIN;
     loop {
-        match attach_once(&endpoint, &nodes).await {
+        match attach_once(&endpoint, &a1p, &nodes).await {
             Ok(Detached { node, reason }) => {
                 retry = RETRY_MIN;
                 warn!("MSC: base station {node} at {endpoint} detached ({reason}), re-enrolling");
+                tokio::time::sleep(retry).await;
             }
             Err(error) => {
-                warn!("MSC: attach to base station at {endpoint} failed: {error}");
+                warn!(
+                    "MSC: attach to base station at {endpoint} failed: {error}, retrying in {retry:?}"
+                );
                 nodes.set_link(&endpoint, None, Some(error.to_string()));
+                tokio::time::sleep(retry).await;
                 retry = (retry * 2).min(RETRY_MAX);
             }
         }
-        tokio::time::sleep(retry).await;
     }
 }
 
@@ -539,7 +548,11 @@ struct Detached {
 
 type AttachError = Box<dyn std::error::Error + Send + Sync>;
 
-async fn attach_once(endpoint: &str, nodes: &Arc<BaseStations>) -> Result<Detached, AttachError> {
+async fn attach_once(
+    endpoint: &str,
+    a1p: &cdma_ios::transport::A1pConfig,
+    nodes: &Arc<BaseStations>,
+) -> Result<Detached, AttachError> {
     let channel = tonic::transport::Endpoint::from_shared(endpoint.to_string())?
         .tcp_keepalive(Some(OAM_KEEPALIVE_INTERVAL))
         .http2_keep_alive_interval(OAM_KEEPALIVE_INTERVAL)
@@ -558,9 +571,10 @@ async fn attach_once(endpoint: &str, nodes: &Arc<BaseStations>) -> Result<Detach
     )?;
     let node = enrolled.node_id;
 
-    let (sender, mut events_rx) = cdma_ios::transport::connect(enrolled.a1_addr)
-        .await
-        .map_err(|e| format!("A1 connect to {}: {e}", enrolled.a1_addr))?;
+    let (sender, mut events_rx) =
+        cdma_ios::transport::connect(enrolled.a1_addr, a1p, cdma_ios::transport::A1Role::Msc)
+            .await
+            .map_err(|e| format!("A1 connect to {}: {e}", enrolled.a1_addr))?;
     nodes.set_link(endpoint, Some(sender), None);
     info!(
         "MSC: base station {node} attached (management={endpoint} a1={})",
@@ -672,6 +686,29 @@ async fn enroll(
 mod tests {
     use super::*;
 
+    const TEST_RTO_INITIAL_MS: u32 = 200;
+    const TEST_RTO_MIN_MS: u32 = 200;
+    const TEST_RTO_MAX_MS: u32 = 1_000;
+
+    fn in_process_udp_port() -> u16 {
+        static PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+        *PORT.get_or_init(|| {
+            std::net::UdpSocket::bind("0.0.0.0:0")
+                .and_then(|socket| socket.local_addr())
+                .expect("a free UDP port")
+                .port()
+        })
+    }
+
+    fn in_process(mut config: cdma_ios::transport::A1pConfig) -> cdma_ios::transport::A1pConfig {
+        config.sctp.fallback_udp_encapsulation.local_port = in_process_udp_port();
+        config.sctp.fallback_udp_encapsulation.remote_port = in_process_udp_port();
+        config.sctp.rto_initial_ms = Some(TEST_RTO_INITIAL_MS);
+        config.sctp.rto_min_ms = Some(TEST_RTO_MIN_MS);
+        config.sctp.rto_max_ms = Some(TEST_RTO_MAX_MS);
+        config
+    }
+
     fn node(name: &str) -> BaseStationId {
         BaseStationId(name.to_string())
     }
@@ -737,20 +774,58 @@ mod tests {
 
     #[tokio::test]
     async fn sends_translate_back_to_the_wire_id_of_the_owning_node() {
+        use cdma_ios::transport::{A1Listener, A1Role, A1pConfig};
+
         let nodes = BaseStations::new(&[BaseStationConfig {
             management_endpoint: "http://127.0.0.1:1".to_string(),
             id: None,
+            a1p: A1pConfig::for_role(A1Role::Msc),
         }]);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = match A1Listener::bind(
+            &["127.0.0.1:0".parse().unwrap()],
+            in_process(A1pConfig::for_role(A1Role::BaseStation)),
+            A1Role::BaseStation,
+        ) {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!("skipping: {error}");
+                return;
+            }
+        };
         let addr = listener.local_addr().unwrap();
-        let bsc =
-            tokio::spawn(async move { cdma_ios::transport::accept(&listener).await.unwrap() });
-        let (sender, _msc_rx) = cdma_ios::transport::connect(addr).await.unwrap();
-        let (_bsc_sender, mut bsc_rx) = bsc.await.unwrap();
+        let bsc = tokio::spawn(async move {
+            let link = cdma_ios::transport::accept(&listener).await.unwrap();
+            (link, listener)
+        });
+        let msc_config = in_process(A1pConfig::for_role(A1Role::Msc));
+        let (sender, mut msc_rx) = cdma_ios::transport::connect(addr, &msc_config, A1Role::Msc)
+            .await
+            .unwrap();
+        let ((bsc_sender, mut bsc_rx), _listener) = bsc.await.unwrap();
         nodes
             .record_enrollment("http://127.0.0.1:1", node("bsc-9"), addr, Vec::new())
             .unwrap();
         nodes.set_link("http://127.0.0.1:1", Some(sender), None);
+
+        let bs_call = 5;
+        let cli3 = cdma_ios::CompleteLayer3InformationMessage {
+            cell_identifier: cdma_ios::CellId { cell: 1, sector: 0 },
+            layer3_information: cdma_ios::Layer3Information(vec![0x05, 0x00, 0x08]),
+        }
+        .encode()
+        .unwrap();
+        bsc_sender
+            .send(&EncodedA1Message::from_message_for_call(
+                &cdma_ios::Message::new(cdma_ios::MessageType::CompleteLayer3Information, cli3),
+                Some(bs_call),
+            ))
+            .await
+            .unwrap();
+        let inbound = match msc_rx.recv().await {
+            Some(A1TransportEvent::Message(message)) => message,
+            other => panic!("expected the CL3I, got {other:?}"),
+        };
+        let wire = inbound.call_id().unwrap();
 
         // A wire id already held by another node maps to a fresh internal id.
         nodes
@@ -758,23 +833,25 @@ mod tests {
             .lock()
             .unwrap()
             .by_internal
-            .insert(0x1_0000_0001, (node("other"), 0x1_0000_0001));
-        let inbound = EncodedA1Message::from_message_for_call(
-            &cdma_ios::Message::new(cdma_ios::MessageType::ClearRequest, vec![]),
-            Some(0x1_0000_0001),
-        );
+            .insert(wire, (node("other"), wire));
         let translated = nodes.translate_inbound(&node("bsc-9"), inbound);
         let internal = translated.call_id().unwrap();
         assert!(internal >= REMAPPED_CALL_ID_BASE);
 
+        let clear = cdma_ios::ClearCommandMessage {
+            cause: cdma_ios::Cause(0x09),
+            cause_layer3: None,
+        }
+        .encode()
+        .unwrap();
         let reply = EncodedA1Message::from_message_for_call(
-            &cdma_ios::Message::new(cdma_ios::MessageType::ClearCommand, vec![]),
+            &cdma_ios::Message::new(cdma_ios::MessageType::ClearCommand, clear),
             Some(internal),
         );
         nodes.send(reply).await.unwrap();
         match bsc_rx.recv().await {
             Some(A1TransportEvent::Message(message)) => {
-                assert_eq!(message.call_id(), Some(0x1_0000_0001));
+                assert_eq!(message.call_id(), Some(bs_call));
                 assert_eq!(message.message_type(), cdma_ios::MessageType::ClearCommand);
             }
             other => panic!("expected the translated message, got {other:?}"),

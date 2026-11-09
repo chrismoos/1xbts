@@ -13,6 +13,9 @@ md-5 = "0.10"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["net"] }
 
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "macros", "rt"] }
+
 [lib]
 path = "src/lib.rs"
 

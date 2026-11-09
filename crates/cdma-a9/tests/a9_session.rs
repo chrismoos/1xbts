@@ -45,6 +45,7 @@ fn connect_response(setup: &SetupA8Message) -> ConnectA8Message {
         a8_traffic_id: setup.a8_traffic_id.clone(),
         cause: CauseValue(0x13),
         pdsn_ip_address: None,
+        a9_indicators: None,
     }
 }
 

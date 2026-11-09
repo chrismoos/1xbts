@@ -45,6 +45,9 @@ pub const SERVICE_OPTION_OTASP_RS2: u16 = 19;
 /// SO33: High-rate packet data service.
 pub const SERVICE_OPTION_PACKET_DATA_RC3: u16 = 33;
 
+/// A.S0008-C §1.11.1. Never sent over the air.
+pub const SERVICE_OPTION_HRPD_PACKET_DATA: u16 = 59;
+
 /// SO68: EVRC-B narrowband.
 pub const SERVICE_OPTION_EVRC_B: u16 = 68;
 

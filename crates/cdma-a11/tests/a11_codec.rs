@@ -433,6 +433,16 @@ fn capabilities_info_ack_roundtrip() {
 }
 
 #[test]
+fn pdsn_gre_segmentation_enabled_nvse_matches_the_wire_format() {
+    // A.S0008-C Table 4.2.14-1: Application Type 0AH, Sub-Type 03H, no data.
+    let nvse = Nvse::PdsnEnabledFeature(PdsnEnabledFeatureNvse::GreSegmentationEnabled);
+    let wire = [0x86, 0x08, 0x00, 0x00, 0x00, 0x00, 0x15, 0x9f, 0x0a, 0x03];
+
+    assert_eq!(nvse.encode().unwrap(), wire);
+    assert_eq!(Nvse::decode(&wire).unwrap(), nvse);
+}
+
+#[test]
 fn unknown_nvse_roundtrip_is_preserved() {
     let message = Message::CapabilitiesInfo(CapabilitiesInfo {
         reserved: [0, 0, 0],

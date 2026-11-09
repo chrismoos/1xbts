@@ -14,7 +14,7 @@ pub use procedure::{
     ClearReason, Direction, ProcedureEvent, SessionKey, SessionProcedureTable, SessionSnapshot,
     SessionState,
 };
-pub use transport::{A11_STANDARD_UDP_PORT, A11Framing, UdpEndpoint, UdpFrame, VerifiedUdpFrame};
+pub use transport::{A11_STANDARD_UDP_PORT, UdpEndpoint, UdpFrame, VerifiedUdpFrame};
 
 const THREEGPP2_VENDOR_ID: u32 = 0x0000_159f;
 const PROTOCOL_TYPE_UNSTRUCTURED_BYTE_STREAM: u16 = 0x8881;
@@ -110,11 +110,8 @@ impl A11SecurityAssociation {
 pub struct A11TransportConfig {
     /// Local UDP socket used by this node's A11 endpoint.
     pub bind_addr: SocketAddr,
-    /// Peer UDP socket. Production deployments normally use destination port
-    /// 699. An unprivileged loopback port works for local single-host testing.
+    /// Normally port [`A11_STANDARD_UDP_PORT`].
     pub peer_addr: SocketAddr,
-    #[serde(default)]
-    pub framing: A11Framing,
 }
 
 impl A11TransportConfig {
@@ -122,7 +119,6 @@ impl A11TransportConfig {
         Self {
             bind_addr,
             peer_addr,
-            framing: A11Framing::LengthPrefixed,
         }
     }
 
@@ -380,6 +376,7 @@ pub enum SessionParameterNvse {
 pub enum PdsnEnabledFeatureNvse {
     FlowControlEnabled,
     PacketBoundaryEnabled,
+    GreSegmentationEnabled,
 }
 
 /// PCF enabled-feature NVSE content.
@@ -491,6 +488,9 @@ impl Nvse {
             }
             Self::PdsnEnabledFeature(PdsnEnabledFeatureNvse::PacketBoundaryEnabled) => {
                 Self::header_bytes(0x0a, 0x02, 0)
+            }
+            Self::PdsnEnabledFeature(PdsnEnabledFeatureNvse::GreSegmentationEnabled) => {
+                Self::header_bytes(0x0a, 0x03, 0)
             }
             Self::PcfEnabledFeature(PcfEnabledFeatureNvse::ShortDataIndicationSupported) => {
                 Self::header_bytes(0x0b, 0x01, 0)
@@ -655,6 +655,17 @@ impl Nvse {
                     PdsnEnabledFeatureNvse::PacketBoundaryEnabled,
                 ))
             }
+            (0x0a, 0x03) => {
+                if !application_data.is_empty() {
+                    return Err(Error::InvalidExtensionLength {
+                        expected_min: 0,
+                        actual: application_data.len(),
+                    });
+                }
+                Ok(Self::PdsnEnabledFeature(
+                    PdsnEnabledFeatureNvse::GreSegmentationEnabled,
+                ))
+            }
             (0x0b, 0x01) => {
                 if !application_data.is_empty() {
                     return Err(Error::InvalidExtensionLength {
@@ -704,6 +715,9 @@ impl Nvse {
             }
             Self::PdsnEnabledFeature(PdsnEnabledFeatureNvse::PacketBoundaryEnabled) => {
                 (THREEGPP2_VENDOR_ID, 0x0a, 0x02)
+            }
+            Self::PdsnEnabledFeature(PdsnEnabledFeatureNvse::GreSegmentationEnabled) => {
+                (THREEGPP2_VENDOR_ID, 0x0a, 0x03)
             }
             Self::PcfEnabledFeature(PcfEnabledFeatureNvse::ShortDataIndicationSupported) => {
                 (THREEGPP2_VENDOR_ID, 0x0b, 0x01)

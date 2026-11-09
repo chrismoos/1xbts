@@ -9,7 +9,12 @@ homepage.workspace = true
 description = "A9 packet-data signaling support for the 1xBTS packet core."
 
 [dependencies]
-tokio = { version = "1", features = ["net"] }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["net", "io-util", "sync", "rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "macros", "time"] }
 
 [lib]
 path = "src/lib.rs"

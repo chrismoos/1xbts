@@ -1,27 +1,14 @@
-//! 1x BSC ↔ HRPD AN coordination protocol.
-//!
-//! Serves the cross-system coordination role of the A21 reference point
-//! (A.S0017-D 1x↔HRPD interop, A.S0019-A hybrid AT operation): the 1x BSC and
-//! HRPD AN exchange IMSI presence and cross-paging/suppression so a hybrid AT
-//! is paged once across both systems. The message set and framing are a
-//! 1XBTS-internal hand-rolled binary protocol between two 1XBTS components,
-//! not the spec's A21 message encoding. The boundary is intentionally a real
-//! network boundary — callers must not reach in-process across this crate.
+//! A21 between the HRPD AN and the IWS, which is the 1x BSC (A.S0008-C §2.8).
 
-pub mod client;
-pub mod client_loop;
 pub mod error;
-pub mod hub;
 pub mod identity_cache;
 pub mod message;
-pub mod server;
 pub mod transport;
 
-pub use client::A21Client;
-pub use client_loop::A21ClientLoop;
 pub use error::{A21Error, Result};
-pub use hub::A21Hub;
 pub use identity_cache::{CachedIdentity, HybridIdentityCache};
-pub use message::{A21Message, PagingSource};
-pub use server::{A21Connection, A21Handler, A21Server};
-pub use transport::{MAX_FRAME_LEN, read_frame, write_frame};
+pub use message::{
+    A21Cause, A21Element, A21EventKind, A21Message, A21MessageType, MessageTransmissionControl,
+    MobileIdentity,
+};
+pub use transport::{A21_UDP_PORT, A21Endpoint, MAX_DATAGRAM_LEN, SINGLE_HOST_AN_PORT};
