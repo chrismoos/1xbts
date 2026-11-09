@@ -836,7 +836,7 @@
               {
                 "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_TermAuthMO.X_0005B9_TaConfig.TermAuthAAAPSK",
                 "xsd_type": "xsd:string",
-                "verify": false,
+                "verify": true,
                 "value_from": {
                   "context": "term_auth_psk"
                 }

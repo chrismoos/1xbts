@@ -1,4 +1,5 @@
 # HEAD
+- Airave 2.5 (5.x firmware) femtocells now receive a changed `term_auth_psk` on the next sync (EV-DO terminal authentication failed after the secret was regenerated).
 - A1 now runs as A1p (BSAP over SUA over SCTP 14001).
 - Abis traffic, A2p, A8/A10, A9, A11 and A21 now use their standard formats and ports, so third-party PCFs and PDSNs interoperate. `docs/PORTS.md` lists the ports.
   Migration (only for local config overrides): set `pcf.json` `a9_bind_addr` to `127.0.0.1:5603` and `bts.json` `evdo.a9.pcf_addr` to match. Remove `a11.framing`. Replace `an_a21_addr` in `config/bsc.json` with an `a21` block.
