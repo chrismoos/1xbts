@@ -35,6 +35,7 @@ pub struct RadioBuildOptions {
     pub tx_sample_rate_hz: usize,
     pub rx_sample_rate_hz: usize,
     pub rx_bandwidth_hz: usize,
+    pub rx_read_batch_samples: usize,
     pub realtime: RealtimeSettings,
 }
 
@@ -151,8 +152,14 @@ pub fn build_radio_from_config(
     radio_config: &RadioConfig,
     options: RadioBuildOptions,
 ) -> Result<Box<dyn Radio>, Error> {
-    let _driver_priority =
-        super::realtime::DriverPriorityGuard::enter("radio-driver-init", &options.realtime);
+    let _driver_priority = super::realtime::DriverPriorityGuard::enter(
+        "radio-driver-init",
+        &options.realtime,
+        super::realtime::ThreadBudget::rx_io(
+            options.rx_read_batch_samples,
+            options.rx_sample_rate_hz,
+        ),
+    );
     let mut config = radio_config.hardware_config()?;
     let calibration = config.device.calibration();
     if options.null_radio {

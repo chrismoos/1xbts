@@ -460,7 +460,7 @@ fn rx_target_batch_samples(sample_rate_hz: usize, chip_rate_hz: usize, batch_pcg
     oversample.saturating_mul(PCG_CHIPS * batch_pcgs.max(1))
 }
 
-fn effective_rx_target_batch_samples(
+pub(crate) fn effective_rx_target_batch_samples(
     sample_rate_hz: usize,
     chip_rate_hz: usize,
     batch_pcgs: usize,
@@ -2192,7 +2192,10 @@ pub(super) fn run_rx_loop(
         let reader = std::thread::Builder::new()
             .name("bts-rx-reader".into())
             .spawn_scoped(scope, move || -> Result<(), Error> {
-                super::realtime::apply_rx_reader(&realtime);
+                super::realtime::apply_rx_reader(
+                    &realtime,
+                    super::realtime::ThreadBudget::rx_io(target_batch_samples, sample_rate_hz),
+                );
                 let read_batch_samples = target_batch_samples;
                 info!(
                     "rx: SDR reader read_batch_samples={} read_batch_ms={:.3}",

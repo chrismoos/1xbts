@@ -233,6 +233,11 @@ pub async fn start_bts_node(
             tx_sample_rate_hz: bts_config.runtime.tx_sample_rate_hz,
             rx_sample_rate_hz: reverse_rx_plan.sample_rate_hz,
             rx_bandwidth_hz: reverse_rx_plan.bandwidth_hz,
+            rx_read_batch_samples: super::rx::effective_rx_target_batch_samples(
+                reverse_rx_plan.sample_rate_hz,
+                bts_config.runtime.chip_rate_hz,
+                bts_config.radio.rx_batch_pcgs(),
+            ),
             realtime: bts_config.runtime.realtime.clone(),
         },
     )?;

@@ -20,26 +20,117 @@ fn degraded(label: &str, detail: impl std::fmt::Display) {
     warn!("{label}: real-time setup degraded: {detail}; continuing without the requested setting");
 }
 
-pub(crate) fn apply_tx(settings: &RealtimeSettings) {
-    apply_current("bts-tx", settings, settings.tx_priority, settings.tx_cpu);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) struct ThreadBudget {
+    pub period_ns: u64,
+    /// Mach preempts the thread once it runs this long without blocking.
+    pub computation_ns: u64,
+    pub constraint_ns: u64,
 }
 
+impl ThreadBudget {
+    const COMPUTATION_NUM: u64 = 1;
+    const COMPUTATION_DEN: u64 = 2;
+    const CONSTRAINT_NUM: u64 = 4;
+    const CONSTRAINT_DEN: u64 = 5;
+    const NS_PER_MS: u64 = 1_000_000;
+    const NS_PER_S: u128 = 1_000_000_000;
+
+    /// The pacer wakes TX `max_tx_lookahead_ms` before the batch is due on air.
+    pub(crate) fn tx(tx_batch_chips: usize, chip_rate_hz: usize, max_tx_lookahead_ms: u32) -> Self {
+        let lookahead_ns = u64::from(max_tx_lookahead_ms) * Self::NS_PER_MS;
+        Self::from_period(
+            Self::duration_ns(tx_batch_chips, chip_rate_hz),
+            (lookahead_ns > 0).then_some(lookahead_ns),
+        )
+    }
+
+    pub(crate) fn rx_io(read_batch_samples: usize, sample_rate_hz: usize) -> Self {
+        Self::from_period(Self::duration_ns(read_batch_samples, sample_rate_hz), None)
+    }
+
+    fn duration_ns(units: usize, rate_hz: usize) -> u64 {
+        let ns = units as u128 * Self::NS_PER_S / rate_hz.max(1) as u128;
+        u64::try_from(ns).unwrap_or(u64::MAX).max(1)
+    }
+
+    fn from_period(period_ns: u64, deadline_cap_ns: Option<u64>) -> Self {
+        let batch_constraint = period_ns * Self::CONSTRAINT_NUM / Self::CONSTRAINT_DEN;
+        let constraint_ns = deadline_cap_ns
+            .map_or(batch_constraint, |cap| batch_constraint.min(cap))
+            .max(1);
+        let computation_ns = (period_ns * Self::COMPUTATION_NUM / Self::COMPUTATION_DEN)
+            .min(constraint_ns)
+            .max(1);
+        Self {
+            period_ns,
+            computation_ns,
+            constraint_ns,
+        }
+    }
+}
+
+impl std::fmt::Display for ThreadBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ms = |ns: u64| ns as f64 / Self::NS_PER_MS as f64;
+        write!(
+            f,
+            "period={:.3}ms computation={:.3}ms constraint={:.3}ms",
+            ms(self.period_ns),
+            ms(self.computation_ns),
+            ms(self.constraint_ns)
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+enum MacosPolicy {
+    TimeConstraint(ThreadBudget),
+    Interactive,
+}
+
+pub(crate) fn apply_tx(settings: &RealtimeSettings, budget: ThreadBudget) {
+    apply_current(
+        "bts-tx",
+        settings,
+        settings.tx_priority,
+        settings.tx_cpu,
+        MacosPolicy::TimeConstraint(budget),
+    );
+}
+
+/// RX decode bursts run far longer than any time-constraint computation budget.
 pub(crate) fn apply_rx(settings: &RealtimeSettings) {
-    apply_current("bts-rx", settings, settings.rx_priority, settings.rx_cpu);
+    apply_current(
+        "bts-rx",
+        settings,
+        settings.rx_priority,
+        settings.rx_cpu,
+        MacosPolicy::Interactive,
+    );
 }
 
 /// The reader is spawned from `bts-rx` and does every radio read. Linux
 /// threads inherit the creator's scheduling, macOS threads do not.
-pub(crate) fn apply_rx_reader(settings: &RealtimeSettings) {
+pub(crate) fn apply_rx_reader(settings: &RealtimeSettings, budget: ThreadBudget) {
     apply_current(
         "bts-rx-reader",
         settings,
         settings.rx_priority,
         settings.rx_cpu,
+        MacosPolicy::TimeConstraint(budget),
     );
 }
 
-fn apply_current(label: &str, settings: &RealtimeSettings, priority: i32, cpu: Option<usize>) {
+fn apply_current(
+    label: &str,
+    settings: &RealtimeSettings,
+    priority: i32,
+    cpu: Option<usize>,
+    macos_policy: MacosPolicy,
+) {
     if !settings.enabled {
         info!("{label}: real-time scheduling disabled");
         return;
@@ -47,12 +138,14 @@ fn apply_current(label: &str, settings: &RealtimeSettings, priority: i32, cpu: O
 
     #[cfg(not(target_os = "linux"))]
     let _ = priority;
+    #[cfg(not(target_os = "macos"))]
+    let _ = macos_policy;
 
     #[cfg(target_os = "linux")]
     apply_linux(label, priority, cpu);
 
     #[cfg(target_os = "macos")]
-    apply_macos(label, cpu);
+    apply_macos(label, cpu, macos_policy);
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -138,11 +231,13 @@ fn apply_linux(label: &str, priority: i32, cpu: Option<usize>) {
 }
 
 #[cfg(target_os = "macos")]
-fn apply_macos(label: &str, cpu: Option<usize>) {
+fn apply_macos(label: &str, cpu: Option<usize>, policy: MacosPolicy) {
     if cpu.is_some() {
         warn!("{label}: CPU affinity is not available through the macOS pthread API");
     }
-    if apply_macos_time_constraint(label) {
+    if let MacosPolicy::TimeConstraint(budget) = policy
+        && apply_macos_time_constraint(label, budget)
+    {
         return;
     }
     apply_macos_qos(label);
@@ -240,13 +335,13 @@ mod mach {
 }
 
 #[cfg(target_os = "macos")]
-fn apply_macos_time_constraint(label: &str) -> bool {
+fn apply_macos_time_constraint(label: &str, budget: ThreadBudget) -> bool {
     let thread = unsafe { mach::mach_thread_self() };
-    set_macos_time_constraint(label, thread)
+    set_macos_time_constraint(label, thread, budget)
 }
 
 #[cfg(target_os = "macos")]
-fn set_macos_time_constraint(label: &str, thread: u32) -> bool {
+fn set_macos_time_constraint(label: &str, thread: u32, budget: ThreadBudget) -> bool {
     use mach::*;
     let mut timebase = MachTimebaseInfo { numer: 0, denom: 0 };
     if unsafe { mach_timebase_info(&mut timebase) } != 0 || timebase.numer == 0 {
@@ -257,9 +352,9 @@ fn set_macos_time_constraint(label: &str, thread: u32) -> bool {
         ((ns as u128 * timebase.denom as u128) / timebase.numer as u128) as u32
     };
     let policy = ThreadTimeConstraintPolicy {
-        period: ns_to_abs(1_250_000),
-        computation: ns_to_abs(800_000),
-        constraint: ns_to_abs(1_200_000),
+        period: ns_to_abs(budget.period_ns),
+        computation: ns_to_abs(budget.computation_ns),
+        constraint: ns_to_abs(budget.constraint_ns),
         preemptible: 1,
     };
     let ret = unsafe {
@@ -310,7 +405,7 @@ fn set_macos_time_constraint(label: &str, thread: u32) -> bool {
             return false;
         }
         info!(
-            "{label}: effective time-constraint policy abs_period={} abs_computation={} abs_constraint={} preemptible={}",
+            "{label}: effective time-constraint policy {budget} abs_period={} abs_computation={} abs_constraint={} preemptible={}",
             actual.period, actual.computation, actual.constraint, actual.preemptible,
         );
         true
@@ -376,7 +471,7 @@ fn thread_name_and_priority(thread: u32) -> (String, i32) {
 /// other runnable thread on the host. Threads the async runtime names are
 /// left alone.
 #[cfg(target_os = "macos")]
-fn promote_threads_since(label: &str, before: &[u32]) {
+fn promote_threads_since(label: &str, before: &[u32], budget: ThreadBudget) {
     let after = task_thread_ports();
     let mut promoted = 0;
     for &thread in after.iter().filter(|thread| !before.contains(thread)) {
@@ -384,7 +479,7 @@ fn promote_threads_since(label: &str, before: &[u32]) {
         if name.starts_with("tokio") {
             continue;
         }
-        if set_macos_time_constraint(label, thread) {
+        if set_macos_time_constraint(label, thread, budget) {
             promoted += 1;
             info!(
                 "{label}: promoted driver thread 0x{thread:x} name={name:?} from priority {priority}"
@@ -415,6 +510,8 @@ pub(crate) struct DriverPriorityGuard {
     label: &'static str,
     #[cfg(target_os = "macos")]
     before: Option<Vec<u32>>,
+    #[cfg(target_os = "macos")]
+    budget: ThreadBudget,
 }
 
 #[cfg(target_os = "linux")]
@@ -426,9 +523,14 @@ struct LinuxSchedState {
 }
 
 impl DriverPriorityGuard {
-    pub(crate) fn enter(label: &'static str, settings: &RealtimeSettings) -> Self {
+    pub(crate) fn enter(
+        label: &'static str,
+        settings: &RealtimeSettings,
+        budget: ThreadBudget,
+    ) -> Self {
         #[cfg(target_os = "linux")]
         {
+            let _ = budget;
             Self {
                 saved: settings
                     .enabled
@@ -442,12 +544,13 @@ impl DriverPriorityGuard {
             Self {
                 label,
                 before: settings.enabled.then(task_thread_ports),
+                budget,
             }
         }
 
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            let _ = (label, settings);
+            let _ = (label, settings, budget);
             Self {}
         }
     }
@@ -459,7 +562,7 @@ impl Drop for DriverPriorityGuard {
         let Some(before) = self.before.take() else {
             return;
         };
-        promote_threads_since(self.label, &before);
+        promote_threads_since(self.label, &before, self.budget);
         release_thread_ports(&before);
     }
 }
@@ -497,6 +600,7 @@ fn enter_linux(label: &'static str, settings: &RealtimeSettings) -> Option<Linux
         settings,
         settings.driver_priority,
         settings.driver_cpu,
+        MacosPolicy::Interactive,
     );
     Some(LinuxSchedState {
         label,
@@ -544,5 +648,62 @@ pub(crate) fn prefault_complex(buffer: &mut [Complex32]) {
     }
     if let Some(sample) = buffer.last_mut() {
         unsafe { std::ptr::write_volatile(sample, std::ptr::read_volatile(sample)) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ThreadBudget;
+
+    const CHIP_RATE_HZ: usize = 1_228_800;
+    const TX_BATCH_CHIPS: usize = 6_144;
+
+    #[test]
+    fn tx_budget_follows_the_batch_and_is_capped_by_the_lookahead() {
+        assert_eq!(
+            ThreadBudget::tx(TX_BATCH_CHIPS, CHIP_RATE_HZ, 3),
+            ThreadBudget {
+                period_ns: 5_000_000,
+                computation_ns: 2_500_000,
+                constraint_ns: 3_000_000,
+            }
+        );
+        assert_eq!(
+            ThreadBudget::tx(TX_BATCH_CHIPS, CHIP_RATE_HZ, 10).constraint_ns,
+            4_000_000
+        );
+    }
+
+    #[test]
+    fn tx_budget_without_a_lookahead_uses_the_batch_bound() {
+        assert_eq!(
+            ThreadBudget::tx(TX_BATCH_CHIPS, CHIP_RATE_HZ, 0).constraint_ns,
+            4_000_000
+        );
+    }
+
+    #[test]
+    fn computation_never_exceeds_the_constraint() {
+        let budget = ThreadBudget::tx(TX_BATCH_CHIPS, CHIP_RATE_HZ, 1);
+        assert_eq!(budget.constraint_ns, 1_000_000);
+        assert_eq!(budget.computation_ns, 1_000_000);
+    }
+
+    #[test]
+    fn rx_io_budget_follows_the_read_batch() {
+        assert_eq!(
+            ThreadBudget::rx_io(8_192, 4_915_200),
+            ThreadBudget {
+                period_ns: 1_666_666,
+                computation_ns: 833_333,
+                constraint_ns: 1_333_332,
+            }
+        );
+    }
+
+    #[test]
+    fn zero_rates_do_not_produce_a_zero_budget() {
+        let budget = ThreadBudget::rx_io(0, 0);
+        assert!(budget.period_ns > 0 && budget.computation_ns > 0 && budget.constraint_ns > 0);
     }
 }

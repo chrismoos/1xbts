@@ -486,6 +486,28 @@ impl Bts {
         Ok(())
     }
 
+    fn tx_thread_budget(&self) -> realtime::ThreadBudget {
+        realtime::ThreadBudget::tx(
+            self.runtime.tx_batch_chips,
+            self.runtime.chip_rate_hz,
+            self.runtime.max_tx_lookahead_ms,
+        )
+    }
+
+    fn stream_init_thread_budget(&self) -> realtime::ThreadBudget {
+        self.config.rx.as_ref().map_or_else(
+            || self.tx_thread_budget(),
+            |rx| {
+                let read_batch_samples = rx::effective_rx_target_batch_samples(
+                    rx.sample_rate_hz,
+                    rx.chip_rate_hz,
+                    rx.rx_batch_pcgs,
+                );
+                realtime::ThreadBudget::rx_io(read_batch_samples, rx.sample_rate_hz)
+            },
+        )
+    }
+
     fn run_loop(
         mut self,
         max_blocks: Option<usize>,
@@ -496,8 +518,11 @@ impl Bts {
 
         let radio = self.radio.take().expect("radio consumed before split");
         let (mut radio_tx, mut radio_rx) = {
-            let _driver_priority =
-                realtime::DriverPriorityGuard::enter("radio-stream-init", &self.runtime.realtime);
+            let _driver_priority = realtime::DriverPriorityGuard::enter(
+                "radio-stream-init",
+                &self.runtime.realtime,
+                self.stream_init_thread_budget(),
+            );
             radio.split()?
         };
         let tx_center_frequency_hz = self
@@ -1475,7 +1500,7 @@ impl Bts {
         thread::Builder::new()
             .name("bts-tx".into())
             .spawn(move || {
-                realtime::apply_tx(&self.runtime.realtime);
+                realtime::apply_tx(&self.runtime.realtime, self.tx_thread_budget());
                 let result = self.run_loop(None, true);
                 let _ = tx.send(result);
             })
@@ -1489,7 +1514,7 @@ impl Bts {
         thread::Builder::new()
             .name("bts-tx".into())
             .spawn(move || {
-                realtime::apply_tx(&self.runtime.realtime);
+                realtime::apply_tx(&self.runtime.realtime, self.tx_thread_budget());
                 let result = self.run_loop(None, false);
                 let _ = tx.send(result);
             })
@@ -1503,7 +1528,7 @@ impl Bts {
         thread::Builder::new()
             .name("bts-tx".into())
             .spawn(move || {
-                realtime::apply_tx(&self.runtime.realtime);
+                realtime::apply_tx(&self.runtime.realtime, self.tx_thread_budget());
                 let result = self.run_loop(Some(blocks), false);
                 let _ = tx.send(result);
             })
@@ -1521,7 +1546,7 @@ impl Bts {
         thread::Builder::new()
             .name("bts-tx".into())
             .spawn(move || {
-                realtime::apply_tx(&self.runtime.realtime);
+                realtime::apply_tx(&self.runtime.realtime, self.tx_thread_budget());
                 let result = self.run_loop(Some(blocks), true);
                 let _ = tx.send(result);
             })
