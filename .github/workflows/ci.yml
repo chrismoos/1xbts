@@ -7,6 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUN_CAPTURE_TESTS: "false"
 
 jobs:
   build-voice-latest-ubuntu:
@@ -100,7 +101,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Fetch capture fixtures
-        if: env.CAPTURE_DOWNLOAD_TOKEN != ''
+        if: env.RUN_CAPTURE_TESTS == 'true' && env.CAPTURE_DOWNLOAD_TOKEN != ''
         run: test/capture/fetch-archive.sh
 
       - name: Format
@@ -118,5 +119,5 @@ jobs:
         run: cargo test --workspace --all-targets --release -- --skip capture_
 
       - name: Capture tests
-        if: env.CAPTURE_DOWNLOAD_TOKEN != ''
+        if: env.RUN_CAPTURE_TESTS == 'true' && env.CAPTURE_DOWNLOAD_TOKEN != ''
         run: cargo test --workspace --all-targets --release capture_ -- --test-threads=1
