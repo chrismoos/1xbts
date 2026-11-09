@@ -19,7 +19,7 @@ use cdma_ios::{
 };
 use cdma_sip::message::Method;
 use cdma_sip::{Registrar, SipRequest, SipResponse, challenge_response, response};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket as StdUdpSocket};
 #[cfg(unix)]
@@ -1733,7 +1733,8 @@ impl ImsCore {
     }
 
     /// Airvana can use a new SIP Call-ID for each standalone traffic-channel MESSAGE.
-    /// Resolve only a scoped dialog, a delivery tag, or a unique handset on that FAP.
+    /// Resolve only a delivery tag or a live dialog on the source FAP. Retained
+    /// CM service identities and access transactions are not live traffic calls.
     fn adds_call_id(
         &self,
         request: &SipRequest,
@@ -1762,6 +1763,22 @@ impl ImsCore {
                 "ADDS acknowledgment has no outstanding delivery tag".to_string(),
             ));
         }
+        let mut active_calls: HashSet<_> = self
+            .mo_voice_by_call
+            .lock()
+            .expect("MO voice A1 dialog lock")
+            .iter()
+            .filter(|(_, dialog)| dialog.fap_id == fap_id)
+            .map(|(call_id, _)| *call_id)
+            .collect();
+        active_calls.extend(
+            self.mt_voice_by_call
+                .lock()
+                .expect("MT voice A1 dialog lock")
+                .iter()
+                .filter(|(_, dialog)| dialog.fap_id == fap_id)
+                .map(|(call_id, _)| *call_id),
+        );
         if let Some(sip_call_id) = request.headers.call_id() {
             let scoped = format!("{fap_id}\0{sip_call_id}");
             let existing = self
@@ -1771,7 +1788,7 @@ impl ImsCore {
                 .get(&scoped)
                 .copied();
             if let Some(call_id) = existing {
-                if self.call_fap.lock().expect("call FAP lock").get(&call_id) == Some(&fap_id) {
+                if active_calls.contains(&call_id) {
                     return Ok(Some(call_id));
                 }
             }
@@ -1805,21 +1822,20 @@ impl ImsCore {
             .call_mobile_identities
             .lock()
             .expect("call identities lock");
-        let calls = self.call_fap.lock().expect("call FAP lock");
         let matches: Vec<_> = identities
             .iter()
             .filter_map(|(call_id, identity)| {
                 let mobile = mobiles.get(identity)?;
-                (calls.get(call_id) == Some(&fap_id) && imsis.contains(&mobile.imsi))
-                    .then_some(*call_id)
+                (active_calls.contains(call_id) && imsis.contains(&mobile.imsi)).then_some(*call_id)
             })
             .collect();
         if matches.len() == 1 {
             return Ok(Some(matches[0]));
         }
-        Err(crate::fcs::FcsError::InvalidMobileIdentity(
-            "traffic-channel ADDS message has no unique active handset".to_string(),
-        ))
+        Err(crate::fcs::FcsError::InvalidMobileIdentity(format!(
+            "traffic-channel ADDS message has no unique active handset on FAP {fap_id}: {} matching live dialogs {matches:?}",
+            matches.len()
+        )))
     }
 
     fn classify_call_id_for_message(
@@ -3662,6 +3678,23 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(call_id, "fap-a".into());
+            core.mo_voice_by_call.lock().unwrap().insert(
+                call_id,
+                MoVoiceDialog {
+                    fap_id: "fap-a".into(),
+                    invite: mo_invite_request(),
+                    peer: "198.51.100.1:5060".parse().unwrap(),
+                    local: None,
+                    relay: core
+                        .rtp_relays
+                        .open_with_format(3, MediaPacketFormat::StandardRtp)
+                        .unwrap(),
+                    service_option: 3,
+                    rseq: 1,
+                    assignment_sent: true,
+                    answered: true,
+                },
+            );
         }
         (core, rx)
     }
@@ -3682,8 +3715,8 @@ mod tests {
         req
     }
 
-    #[test]
-    fn otasp_standalone_uplink_resolves_correct_handset_and_hardware_identity() {
+    #[tokio::test]
+    async fn otasp_standalone_uplink_resolves_correct_handset_and_hardware_identity() {
         let (core, mut rx) = otasp_test_core();
         let deliver = cdma_ios::AddsDeliverMessage {
             adds_user_part: AddsUserPart {
@@ -3713,8 +3746,8 @@ mod tests {
         assert_eq!(transfer.adds_user_part, deliver.adds_user_part);
     }
 
-    #[test]
-    fn airvana_ota_reply_without_discriminator_reaches_correct_msc_call() {
+    #[tokio::test]
+    async fn airvana_ota_reply_without_discriminator_reaches_correct_msc_call() {
         for header in ["53", "53 (=\"ADDS Deliver\")"] {
             let (core, mut rx) = otasp_test_core();
             let deliver = cdma_ios::AddsDeliverMessage {
@@ -3763,8 +3796,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn airvana_bare_info_ack_is_forwarded_only_for_matching_delivery_tag_and_fap() {
+    #[tokio::test]
+    async fn airvana_bare_info_ack_is_forwarded_only_for_matching_delivery_tag_and_fap() {
         let (core, mut rx) = otasp_test_core();
         core.adds_delivery_calls
             .lock()
@@ -3824,8 +3857,8 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    #[test]
-    fn otasp_uplink_rejects_ambiguous_handset_and_wrong_fap() {
+    #[tokio::test]
+    async fn otasp_uplink_rejects_ambiguous_handset_and_wrong_fap() {
         let (core, mut rx) = otasp_test_core();
         let deliver = cdma_ios::AddsDeliverMessage {
             adds_user_part: AddsUserPart {
@@ -3845,6 +3878,8 @@ mod tests {
             .unwrap()
             .insert(43, "5551239999".into());
         core.call_fap.lock().unwrap().insert(43, "fap-a".into());
+        let dialog = core.mo_voice_by_call.lock().unwrap()[&41].clone();
+        core.mo_voice_by_call.lock().unwrap().insert(43, dialog);
         assert_eq!(
             core.handle_message(&req, "198.51.100.1:5060".parse().unwrap())
                 .status,
@@ -3853,8 +3888,43 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    #[test]
-    fn otasp_downlink_uses_femto_body_and_delivery_ack_retains_tag_and_cause() {
+    #[tokio::test]
+    async fn otasp_uplink_ignores_retained_identity_and_scoped_session_without_live_dialog() {
+        let (core, mut rx) = otasp_test_core();
+        // A prior CM service attempt can leave identity/route state behind even
+        // though it has no traffic-channel SIP dialog. It must not compete with
+        // the current OTASP call for the same handset.
+        core.call_mobile_identities
+            .lock()
+            .unwrap()
+            .insert(43, "5551239999".into());
+        core.call_fap.lock().unwrap().insert(43, "fap-a".into());
+        let deliver = cdma_ios::AddsDeliverMessage {
+            adds_user_part: AddsUserPart {
+                burst_type: cdma_common::consts::BURST_TYPE_OTASP,
+                data: vec![6],
+            },
+            tag: None,
+        };
+        let req = otasp_message(&FemtoInterfaceMsg::from_adds_deliver(&deliver).unwrap());
+        let peer = "198.51.100.1:5060".parse().unwrap();
+        assert_eq!(core.handle_message(&req, peer).status, SC_OK);
+        assert_eq!(rx.try_recv().unwrap().call_id(), Some(41));
+
+        core.access_sessions
+            .lock()
+            .unwrap()
+            .insert("fap-a\0new-standalone-otasp-message".into(), 43);
+        assert_eq!(core.handle_message(&req, peer).status, SC_OK);
+        assert_eq!(rx.try_recv().unwrap().call_id(), Some(41));
+
+        core.clear_dialog_requests(41, "127.0.0.1:5060".parse().unwrap());
+        assert_eq!(core.handle_message(&req, peer).status, SC_BAD_REQUEST);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn otasp_downlink_uses_femto_body_and_delivery_ack_retains_tag_and_cause() {
         let (core, mut rx) = otasp_test_core();
         let deliver = cdma_ios::AddsDeliverMessage {
             adds_user_part: AddsUserPart {
