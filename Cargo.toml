@@ -135,3 +135,6 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 debug = false
+
+[profile.release.build-override]
+strip = "none"
