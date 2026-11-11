@@ -124,6 +124,32 @@ pub(crate) fn apply_rx_reader(settings: &RealtimeSettings, budget: ThreadBudget)
     );
 }
 
+/// Drops the `SCHED_FIFO` policy and CPU affinity a Linux thread inherits from
+/// its creator.
+pub(crate) fn apply_background(label: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        let thread = unsafe { libc::pthread_self() };
+        let param = libc::sched_param { sched_priority: 0 };
+        let ret = unsafe { libc::pthread_setschedparam(thread, libc::SCHED_OTHER, &param) };
+        if ret != 0 {
+            warn!("{label}: could not return to SCHED_OTHER (errno={ret})");
+        }
+        let mut cpus: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        for cpu in 0..libc::CPU_SETSIZE as usize {
+            unsafe { libc::CPU_SET(cpu, &mut cpus) };
+        }
+        let ret = unsafe {
+            libc::pthread_setaffinity_np(thread, std::mem::size_of::<libc::cpu_set_t>(), &cpus)
+        };
+        if ret != 0 {
+            warn!("{label}: could not clear CPU affinity (errno={ret})");
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = label;
+}
+
 fn apply_current(
     label: &str,
     settings: &RealtimeSettings,

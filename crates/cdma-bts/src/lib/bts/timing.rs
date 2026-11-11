@@ -1,5 +1,8 @@
 use std::{
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -9,6 +12,9 @@ use log::{info, trace};
 use num::complex::Complex32;
 
 use crate::sdr::{RadioRx, RadioTx};
+use sdr_hal::RadioClock;
+
+use super::realtime;
 
 use super::TxLoopState;
 
@@ -188,6 +194,163 @@ impl LookaheadPacer {
                 // Never yield here. macOS drops a yielding thread to priority 0 until it blocks.
                 std::hint::spin_loop();
             }
+        }
+    }
+}
+
+const CLOCK_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const CLOCK_POLL_READS: usize = 4;
+const CLOCK_POLL_READ_SPACING: Duration = Duration::from_millis(2);
+const CLOCK_POLL_MAX_ROUND_TRIP: Duration = Duration::from_millis(2);
+const CLOCK_POLL_REJECTS_BEFORE_ACCEPTING_SLOW: u32 = 5;
+
+/// Device time extrapolated from the host clock.
+pub(super) struct HardwareClockEstimate {
+    epoch: Instant,
+    tick_at_epoch: AtomicU64,
+    tick_rate: u64,
+}
+
+struct ClockReading {
+    tick_at_epoch: u64,
+    round_trip: Duration,
+}
+
+impl HardwareClockEstimate {
+    pub(super) fn new(
+        tick_rate: u64,
+        mut read: impl FnMut() -> Result<u64, Error>,
+    ) -> Result<Self, Error> {
+        let estimate = Self {
+            epoch: Instant::now(),
+            tick_at_epoch: AtomicU64::new(0),
+            tick_rate,
+        };
+        let mut best = estimate.read_once(&mut read)?;
+        for _ in 1..CLOCK_POLL_READS {
+            if let Ok(reading) = estimate.read_once(&mut read) {
+                if reading.round_trip < best.round_trip {
+                    best = reading;
+                }
+            }
+        }
+        estimate
+            .tick_at_epoch
+            .store(best.tick_at_epoch, Ordering::Relaxed);
+        Ok(estimate)
+    }
+
+    pub(super) fn epoch(&self) -> Instant {
+        self.epoch
+    }
+
+    pub(super) fn tick_at_epoch(&self) -> u64 {
+        self.tick_at_epoch.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn now_ticks(&self) -> u64 {
+        self.tick_at_epoch()
+            .saturating_add(self.ticks_in(self.epoch.elapsed()))
+    }
+
+    fn ticks_in(&self, elapsed: Duration) -> u64 {
+        (elapsed.as_nanos() * u128::from(self.tick_rate) / 1_000_000_000) as u64
+    }
+
+    fn read_once(
+        &self,
+        read: &mut impl FnMut() -> Result<u64, Error>,
+    ) -> Result<ClockReading, Error> {
+        let before = self.epoch.elapsed();
+        let ticks = read()?;
+        let round_trip = self.epoch.elapsed().saturating_sub(before);
+        Ok(ClockReading {
+            tick_at_epoch: ticks.saturating_sub(self.ticks_in(before + round_trip / 2)),
+            round_trip,
+        })
+    }
+
+    pub(super) fn refresh(
+        &self,
+        mut read: impl FnMut() -> Result<u64, Error>,
+        accept_slow: bool,
+    ) -> bool {
+        let mut best: Option<ClockReading> = None;
+        for attempt in 0..CLOCK_POLL_READS {
+            if attempt > 0 {
+                thread::sleep(CLOCK_POLL_READ_SPACING);
+            }
+            let Ok(reading) = self.read_once(&mut read) else {
+                continue;
+            };
+            let fast = reading.round_trip <= CLOCK_POLL_MAX_ROUND_TRIP;
+            if best
+                .as_ref()
+                .is_none_or(|best| reading.round_trip < best.round_trip)
+            {
+                best = Some(reading);
+            }
+            if fast {
+                break;
+            }
+        }
+        match best {
+            Some(reading) if accept_slow || reading.round_trip <= CLOCK_POLL_MAX_ROUND_TRIP => {
+                trace!(
+                    "tx_clock_poll: tick_at_epoch={} round_trip_us={}",
+                    reading.tick_at_epoch,
+                    reading.round_trip.as_micros()
+                );
+                self.tick_at_epoch
+                    .store(reading.tick_at_epoch, Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+pub(super) struct HardwareClockPoller {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl HardwareClockPoller {
+    pub(super) fn spawn(estimate: Arc<HardwareClockEstimate>, clock: Box<dyn RadioClock>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let handle = thread::Builder::new()
+            .name("bts-tx-clock".into())
+            .spawn(move || {
+                realtime::apply_background("bts-tx-clock");
+                let mut rejects = 0u32;
+                loop {
+                    thread::park_timeout(CLOCK_POLL_INTERVAL);
+                    if thread_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let accept_slow = rejects >= CLOCK_POLL_REJECTS_BEFORE_ACCEPTING_SLOW;
+                    if estimate.refresh(|| Ok(clock.get_hardware_time()?), accept_slow) {
+                        rejects = 0;
+                    } else {
+                        rejects += 1;
+                    }
+                }
+            })
+            .expect("failed to spawn TX clock thread");
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for HardwareClockPoller {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            let _ = handle.join();
         }
     }
 }
@@ -395,6 +558,38 @@ mod tests {
             error.downcast_ref::<std::io::Error>().unwrap().kind(),
             std::io::ErrorKind::ConnectionReset
         );
+    }
+
+    #[test]
+    fn clock_estimate_tracks_a_device_clock_from_one_read() {
+        let device_epoch = Instant::now();
+        let device_now = || Ok(1_000_000 + device_epoch.elapsed().as_nanos() as u64);
+        let estimate = HardwareClockEstimate::new(1_000_000_000, device_now).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        let error_ns = estimate.now_ticks().abs_diff(device_now().unwrap());
+        assert!(error_ns < 1_000_000, "error {error_ns} ns");
+    }
+
+    #[test]
+    fn clock_estimate_keeps_its_value_when_every_read_is_slow() {
+        let estimate = HardwareClockEstimate::new(1_000_000_000, || Ok(5_000)).unwrap();
+        let before = estimate.tick_at_epoch();
+        let slow = || {
+            thread::sleep(CLOCK_POLL_MAX_ROUND_TRIP * 2);
+            Ok(9_000_000_000)
+        };
+        assert!(!estimate.refresh(slow, false));
+        assert_eq!(estimate.tick_at_epoch(), before);
+        assert!(estimate.refresh(slow, true));
+        assert_ne!(estimate.tick_at_epoch(), before);
+    }
+
+    #[test]
+    fn clock_estimate_keeps_its_value_when_reads_fail() {
+        let estimate = HardwareClockEstimate::new(1_000_000_000, || Ok(5_000)).unwrap();
+        let before = estimate.tick_at_epoch();
+        assert!(!estimate.refresh(|| Err("no clock".into()), true));
+        assert_eq!(estimate.tick_at_epoch(), before);
     }
 
     #[test]
