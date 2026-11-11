@@ -25,12 +25,14 @@ use cdma_bts::bts::paging_supplier::{
     PagingRetryConfig as BtsPagingRetryConfig, PagingSupplierState, build_bts_paging_supplier,
 };
 use cdma_bts::bts::{
-    self, Bts, BtsRuntimeSettings, PagingChannelSettings, TrafficResourceService, TxRxAnchor,
+    self, AccessChannelEvent, Bts, BtsRuntimeSettings, PagingChannelSettings,
+    TrafficResourceService, TxRxAnchor,
 };
 use cdma_bts::receiver::sync::SyncChannelMessage;
 use cdma_bts::sdr::{RadioPipe, RadioPipeHandle, RadioRx, RadioTx, RxReadResult};
 use cdma_bts::{lac, mac};
 use num_complex::Complex32;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
 
 pub use cdma_bsc::bsc::{AddsDeliverRecord, MobileInfo, SmsRequest};
@@ -153,6 +155,8 @@ fn spawn_loopback_abis_client(
     agent_config: AbisAgentConfig,
     config: NetworkClientConfig,
     paging_state: Arc<parking_lot::Mutex<PagingSupplierState>>,
+    mut access_events: UnboundedReceiver<AccessChannelEvent>,
+    bsc_access_events: UnboundedSender<AccessChannelEvent>,
 ) -> NetworkBtsControlClient {
     let (client_sender, client_events, server_sender, mut server_events) =
         spawn_channel_transport();
@@ -160,17 +164,34 @@ fn spawn_loopback_abis_client(
     tokio::spawn(async move {
         let mut agent = AbisAgent::new(agent_config, controller);
         agent.set_paging_state(paging_state);
-        while let Some(event) = server_events.recv().await {
-            match event {
-                TransportEvent::Message(msg) => {
-                    let (responses, _events) = agent.handle_message(&msg);
-                    for resp in responses {
-                        if server_sender.send(&resp).await.is_err() {
-                            return;
-                        }
+        let mut access_open = true;
+        loop {
+            let responses = tokio::select! {
+                event = server_events.recv() => match event {
+                    Some(TransportEvent::Message(msg)) => agent.handle_message(&msg).0,
+                    Some(TransportEvent::Disconnected(_)) | None => return,
+                },
+                access = access_events.recv(), if access_open => {
+                    let Some(mut event) = access else {
+                        access_open = false;
+                        continue;
+                    };
+                    event
+                        .cell
+                        .get_or_insert(cdma_common::events::AccessCellId { cell: 1, sector: 1 });
+                    agent.record_access_msg_seq(&event);
+                    let mut responses = agent.check_access_ack_notify(&event);
+                    responses.extend(agent.check_page_response_cancel(&event));
+                    if bsc_access_events.send(event).is_err() {
+                        access_open = false;
                     }
+                    responses
                 }
-                TransportEvent::Disconnected(_) => return,
+            };
+            for resp in responses {
+                if server_sender.send(&resp).await.is_err() {
+                    return;
+                }
             }
         }
     });
@@ -220,20 +241,7 @@ pub fn boot_with_pilot_pn(pilot_pn: u16) -> BootedNode {
         ..
     } = bts_handle;
 
-    let stamped_access_events = {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut src = access_events;
-        tokio::spawn(async move {
-            while let Some(mut ev) = src.recv().await {
-                ev.cell
-                    .get_or_insert(cdma_common::events::AccessCellId { cell: 1, sector: 1 });
-                if tx.send(ev).is_err() {
-                    break;
-                }
-            }
-        });
-        rx
-    };
+    let (bsc_access_tx, bsc_access_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let (mobiles_tx, mobiles_rx) = watch::channel(Vec::<MobileInfo>::new());
     let (sms_tx, sms_rx) = tokio::sync::mpsc::channel::<SmsRequest>(32);
@@ -267,6 +275,8 @@ pub fn boot_with_pilot_pn(pilot_pn: u16) -> BootedNode {
             generating_entity_id: 1,
         },
         paging_state.clone(),
+        access_events,
+        bsc_access_tx,
     ));
 
     let registry = BtsRegistry::new();
@@ -299,7 +309,7 @@ pub fn boot_with_pilot_pn(pilot_pn: u16) -> BootedNode {
             preferred_pairs: vec![RcPairConfig::new(3, 3), RcPairConfig::new(1, 1)],
             ..TrafficAssignmentConfig::default()
         },
-        access_event_rx: Some(stamped_access_events),
+        access_event_rx: Some(bsc_access_rx),
         cell_detach_rx: None,
         access_event_broadcast: None,
         sms_request_rx: Some(sms_rx),
@@ -992,20 +1002,28 @@ impl RadioTx for FakeSdrTx {
         };
         const BLOCK: usize = 32_768;
         let os = self.shared.oversample;
-        let pipe = self.shared.pipe.lock().unwrap();
+        let inject = |mut block: InjectedRxBlock| -> Result<(), RadioError> {
+            loop {
+                match self.shared.pipe.lock().unwrap().try_inject_rx(block) {
+                    Ok(None) => return Ok(()),
+                    Ok(Some(full)) => block = full,
+                    Err(e) => return Err(e.to_string().into()),
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
         if let Some(mut chip) = self.next_reverse_chip {
             if chip0 < chip {
                 return Err("fake sdr: reverse bursts overlap".into());
             }
             while chip < chip0 {
                 let len = ((chip0 - chip).min(BLOCK as u64 / os) * os) as usize;
-                if pipe
-                    .inject_rx(InjectedRxBlock {
-                        samples: vec![Complex32::new(0.0, 0.0); len],
-                        time_ns: 0,
-                        absolute_chip_start: Some(chip),
-                    })
-                    .is_err()
+                if inject(InjectedRxBlock {
+                    samples: vec![Complex32::new(0.0, 0.0); len],
+                    time_ns: 0,
+                    absolute_chip_start: Some(chip),
+                })
+                .is_err()
                 {
                     return Ok(());
                 }
@@ -1015,7 +1033,7 @@ impl RadioTx for FakeSdrTx {
         let mut off = 0usize;
         while off < samples.len() {
             let end = (off + BLOCK).min(samples.len());
-            let _ = pipe.inject_rx(InjectedRxBlock {
+            let _ = inject(InjectedRxBlock {
                 samples: samples[off..end].to_vec(),
                 time_ns: 0,
                 absolute_chip_start: Some(chip0 + (off as u64 / os)),

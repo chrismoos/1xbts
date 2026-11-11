@@ -924,11 +924,16 @@ impl MsCore {
         }
     }
 
-    pub fn on_access_acknowledged(&mut self, now_chips: u64) {
+    pub fn on_access_acknowledged(&mut self, acked: &AccessReason, now_chips: u64) {
+        if self.pending_access.as_ref() == Some(acked) {
+            self.pending_access = None;
+        }
         let MsProtocolState::SystemAccess { reason } = self.state.clone() else {
             return;
         };
-        self.pending_access = None;
+        if reason != *acked {
+            return;
+        }
         if matches!(
             reason,
             AccessReason::Origination { .. } | AccessReason::PageResponse { .. }
@@ -1670,12 +1675,13 @@ mod tests {
                 digits: "5555".into(),
             },
         };
-        ms.pending_access = Some(AccessReason::Origination {
+        let origination = AccessReason::Origination {
             service_option: 6,
             digits: "5555".into(),
-        });
+        };
+        ms.pending_access = Some(origination.clone());
 
-        ms.on_access_acknowledged(1_000);
+        ms.on_access_acknowledged(&origination, 1_000);
 
         assert!(ms.registered());
         assert!(ms.pending_access().is_none());
@@ -1692,8 +1698,9 @@ mod tests {
         ms.state = MsProtocolState::Idle;
         ms.apply_system_parameters(power_up_spm());
         ms.on_registration_needed(REG_TYPE_POWER_UP);
+        let registration = ms.pending_access().cloned().unwrap();
 
-        ms.on_access_acknowledged(1_000);
+        ms.on_access_acknowledged(&registration, 1_000);
 
         assert!(!ms.registered());
         assert!(ms.pending_access().is_none());
@@ -1703,6 +1710,32 @@ mod tests {
         assert_eq!(*ms.state(), MsProtocolState::Idle);
         assert!(ms.reg.power_up_reg_performed);
         assert!(ms.access_response_deadline_chip.is_none());
+    }
+
+    #[test]
+    fn status_request_acknowledging_registration_keeps_status_response() {
+        let mut ms = MsCore::new(identity());
+        ms.state = MsProtocolState::Idle;
+        ms.apply_system_parameters(power_up_spm());
+        ms.on_registration_needed(REG_TYPE_POWER_UP);
+        let registration = ms.pending_access().cloned().unwrap();
+
+        assert!(ms.on_status_request(0, 0, Vec::new(), vec![27]));
+        ms.on_access_acknowledged(&registration, 1_000);
+
+        assert!(matches!(
+            ms.pending_access(),
+            Some(AccessReason::StatusResponse { .. })
+        ));
+        assert_eq!(
+            *ms.state(),
+            MsProtocolState::SystemAccess {
+                reason: registration
+            }
+        );
+        let status_response = ms.pending_access().cloned().unwrap();
+        ms.on_access_acknowledged(&status_response, 2_000);
+        assert!(ms.pending_access().is_none());
     }
 
     #[test]
@@ -1720,7 +1753,8 @@ mod tests {
         ms.state = MsProtocolState::Idle;
         ms.apply_system_parameters(power_up_spm());
         ms.on_registration_needed(REG_TYPE_POWER_UP);
-        ms.on_access_acknowledged(1_000);
+        let registration = ms.pending_access().cloned().unwrap();
+        ms.on_access_acknowledged(&registration, 1_000);
 
         let deadline = 1_000 + T42M_CHIPS;
         ms.expire_access_response_wait(deadline - 1);

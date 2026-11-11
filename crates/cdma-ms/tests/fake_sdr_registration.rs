@@ -120,6 +120,7 @@ async fn fake_sdr_delivers_mo_sms_over_hardware_time() {
             identity: MsAccessIdentity {
                 esn,
                 imsi_s: 1234567890,
+                meid: Some("A1000012345678".to_string()),
                 ..Default::default()
             },
             sample_rate_hz: support::SAMPLE_RATE_HZ as f64,

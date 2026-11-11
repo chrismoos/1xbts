@@ -892,6 +892,14 @@ impl Engine {
                 .current
                 .as_ref()
                 .is_some_and(|(_, seq)| *seq == pdu.ack_seq);
+        let acked_reason = self
+            .access
+            .as_ref()
+            .map(|(_, reason)| reason.clone())
+            .or_else(|| match self.core.state() {
+                MsProtocolState::SystemAccess { reason } => Some(reason.clone()),
+                _ => None,
+            });
         let registered_before = self.core.registered();
         let on_traffic_before = self.core.state().on_traffic();
         let explicit_origination_rejection = matches!(
@@ -917,7 +925,9 @@ impl Engine {
         let newly_registered = self.core.registered() && !registered_before;
         if acked_our_access || newly_registered {
             self.finish_access(AccessOutcome::Acknowledged);
-            self.core.on_access_acknowledged(now);
+            if let Some(acked) = &acked_reason {
+                self.core.on_access_acknowledged(acked, now);
+            }
         }
     }
 

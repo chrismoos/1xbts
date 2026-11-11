@@ -1,4 +1,5 @@
 # HEAD
+- Fix issue with cdma-ms softphone Status Response handling.
 - BTS now syncs hardware time on its own thread, reducing hardware time fetch jitter.
 - Airave 2.5 (5.x firmware) femtocells now receive a changed `term_auth_psk` on the next sync (EV-DO terminal authentication failed after the secret was regenerated).
 - A1 now runs as A1p (BSAP over SUA over SCTP 14001).

@@ -192,6 +192,20 @@ impl RadioPipeHandle {
             .map_err(|_| "RadioPipe RX channel disconnected".into())
     }
 
+    pub fn try_inject_rx(&self, block: InjectedRxBlock) -> Result<Option<InjectedRxBlock>, Error> {
+        let sender = self
+            .injected_rx_tx
+            .as_ref()
+            .ok_or_else(|| Error::from("RadioPipe RX channel already closed"))?;
+        match sender.try_send(block) {
+            Ok(()) => Ok(None),
+            Err(mpsc::TrySendError::Full(block)) => Ok(Some(block)),
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                Err("RadioPipe RX channel disconnected".into())
+            }
+        }
+    }
+
     /// Close the RX injection channel, signaling end-of-stream to the BTS RX
     /// path. The handle remains usable for reading TX output and dumping WAV.
     pub fn close_rx(&mut self) {
