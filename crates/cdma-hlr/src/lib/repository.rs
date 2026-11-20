@@ -2340,12 +2340,24 @@ async fn upsert_mobile_seen_in(
             },
         ));
     }
-    let id = insert_mobile_seen(tx, mob_p_rev, identity).await?;
+    if let Some(id) = insert_mobile_seen(tx, mob_p_rev, identity).await? {
+        return Ok((
+            id,
+            MobileSeenUpsert {
+                is_new: true,
+                previous_last_seen_at: None,
+            },
+        ));
+    }
+    let row = select_mobile_seen_by_key(tx, identity)
+        .await?
+        .ok_or_else(|| "upsert_mobile_seen: conflicting row not found".to_string())?;
+    update_mobile_seen_row(tx, row.id, mob_p_rev, identity).await?;
     Ok((
-        id,
+        row.id,
         MobileSeenUpsert {
-            is_new: true,
-            previous_last_seen_at: None,
+            is_new: false,
+            previous_last_seen_at: Some(row.last_seen_at),
         },
     ))
 }
@@ -2396,11 +2408,12 @@ async fn insert_mobile_seen(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     mob_p_rev: Option<u8>,
     identity: &MobileIdentityKey,
-) -> Result<Uuid, String> {
+) -> Result<Option<Uuid>, String> {
     sqlx::query_scalar(
         r#"
         INSERT INTO mobiles_seen (imsi, esn, meid, mob_p_rev)
         VALUES ($1, $2, $3, $4)
+        ON CONFLICT DO NOTHING
         RETURNING id
         "#,
     )
@@ -2408,7 +2421,7 @@ async fn insert_mobile_seen(
     .bind(identity.esn().map(|v| v as i64))
     .bind(identity.meid())
     .bind(mob_p_rev.map(|v| v as i32))
-    .fetch_one(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(|e| format!("insert mobile_seen: {e}"))
 }
