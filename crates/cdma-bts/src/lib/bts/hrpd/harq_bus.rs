@@ -485,14 +485,17 @@ impl HarqBus {
 
     /// Drain all queued feedback events for MAC index `mac`.
     pub fn drain_feedback(&self, mac: u8) -> Vec<HarqFeedbackEvent> {
-        let Some(q) = self.feedback.get(mac as usize) else {
-            return Vec::new();
-        };
         let mut out = Vec::new();
-        while let Some(ev) = q.pop() {
-            out.push(ev);
-        }
+        self.drain_feedback_into(mac, &mut out);
         out
+    }
+
+    pub(super) fn drain_feedback_into(&self, mac: u8, out: &mut Vec<HarqFeedbackEvent>) {
+        if let Some(queue) = self.feedback.get(mac as usize) {
+            while let Some(event) = queue.pop() {
+                out.push(event);
+            }
+        }
     }
 
     /// Drop queued emission, feedback, and DRC state for a released MAC index.

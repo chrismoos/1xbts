@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use super::super::despread::despread_chips_with_reference_into;
 use super::*;
 
 impl HrpdReverseTrafficFinger {
@@ -32,8 +33,13 @@ impl HrpdReverseTrafficFinger {
                 return;
             }
 
-            let ref_conj = self.reference_for_region(window_chip, window_chips as usize);
-            let Some(despread) = despread_chips_with_reference(
+            let ref_conj = Self::reference_for_region(
+                &self.ref_conj,
+                self.spawn_chip,
+                window_chip,
+                window_chips as usize,
+            );
+            let Some(()) = despread_chips_with_reference_into(
                 &self.buffer,
                 buf_abs,
                 oversample as usize,
@@ -42,6 +48,7 @@ impl HrpdReverseTrafficFinger {
                 sample_delay_fraction,
                 self.next_params.pilot_phase.conj(),
                 &ref_conj,
+                &mut self.fast_drc_despread,
             ) else {
                 return;
             };
@@ -56,7 +63,7 @@ impl HrpdReverseTrafficFinger {
                 self.fast_drc_stats.window_attempts.saturating_add(1);
             if let Some(symbol) = self
                 .fast_drc_decoder
-                .decode_pilot_derotated(&despread, drc_length)
+                .decode_pilot_derotated(&self.fast_drc_despread, drc_length)
             {
                 self.publish_confirmed_drc(completion_slot, symbol, true);
             } else {
@@ -111,8 +118,13 @@ impl HrpdReverseTrafficFinger {
                 return;
             }
 
-            let ref_conj = self.reference_for_region(repetition_chip, slot_chips as usize);
-            let Some(despread) = despread_chips_with_reference(
+            let ref_conj = Self::reference_for_region(
+                &self.ref_conj,
+                self.spawn_chip,
+                repetition_chip,
+                slot_chips as usize,
+            );
+            let Some(()) = despread_chips_with_reference_into(
                 &self.buffer,
                 buf_abs,
                 oversample as usize,
@@ -121,6 +133,7 @@ impl HrpdReverseTrafficFinger {
                 sample_delay_fraction,
                 self.next_params.pilot_phase.conj(),
                 &ref_conj,
+                &mut self.fast_drc_despread,
             ) else {
                 return;
             };
@@ -133,7 +146,10 @@ impl HrpdReverseTrafficFinger {
             );
             self.fast_drc_stats.repetition_attempts =
                 self.fast_drc_stats.repetition_attempts.saturating_add(1);
-            if let Some(symbol) = self.fast_drc_decoder.decode_pilot_derotated(&despread, 1) {
+            if let Some(symbol) = self
+                .fast_drc_decoder
+                .decode_pilot_derotated(&self.fast_drc_despread, 1)
+            {
                 self.publish_repeated_drc(completion_slot, symbol);
             } else {
                 self.fast_drc_stats.repetition_none =
@@ -144,14 +160,19 @@ impl HrpdReverseTrafficFinger {
         }
     }
 
-    fn reference_for_region(&self, start_chip: u64, len: usize) -> Cow<'_, [Complex32]> {
+    fn reference_for_region(
+        ref_conj: &[Complex32],
+        spawn_chip: u64,
+        start_chip: u64,
+        len: usize,
+    ) -> Cow<'_, [Complex32]> {
         let start =
-            (start_chip.saturating_sub(self.spawn_chip) % HRPD_TRAFFIC_FRAME_CHIPS as u64) as usize;
+            (start_chip.saturating_sub(spawn_chip) % HRPD_TRAFFIC_FRAME_CHIPS as u64) as usize;
         if len <= HRPD_TRAFFIC_FRAME_CHIPS - start {
-            return Cow::Borrowed(&self.ref_conj[start..start + len]);
+            return Cow::Borrowed(&ref_conj[start..start + len]);
         }
         Cow::Owned(
-            self.ref_conj
+            ref_conj
                 .iter()
                 .cycle()
                 .skip(start)

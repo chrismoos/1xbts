@@ -740,6 +740,7 @@ pub struct HrpdReverseTrafficFinger {
     /// Local IQ buffer for the next pending frame. `buffer_abs_sample` is the
     /// absolute sample index of `buffer[0]`.
     buffer: Vec<Complex32>,
+    fast_drc_despread: Vec<Complex32>,
     buffer_abs_sample: Option<u64>,
     sample_rate_hz: f64,
     latest_rx_sample_time: Option<RxSampleTimeAnchor>,
@@ -910,6 +911,7 @@ impl HrpdReverseTrafficFinger {
             next_params,
             ref_conj,
             buffer: Vec::new(),
+            fast_drc_despread: Vec::new(),
             buffer_abs_sample: None,
             sample_rate_hz: 0.0,
             latest_rx_sample_time: None,

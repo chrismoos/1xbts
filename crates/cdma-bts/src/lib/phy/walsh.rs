@@ -3,6 +3,7 @@
 use num::complex::Complex32;
 
 /// Despreads a Walsh-coded symbol using one Walsh row.
+#[derive(Debug)]
 pub struct WalshDecoder {
     /// The selected Walsh row as `+1/-1` chips.
     code: Vec<i8>,

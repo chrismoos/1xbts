@@ -899,6 +899,12 @@ impl Bts {
             .clock_reader()
             .map(|reader| timing::HardwareClockPoller::spawn(Arc::clone(&tx_clock), reader));
         let mut pacer = timing::LookaheadPacer::new();
+        let tx_lookahead_ms = self.runtime.max_tx_lookahead_ms;
+        let startup_lookahead_ms = tx_lookahead_ms.saturating_add(
+            (state.tx_batch_chips * 1_000)
+                .div_ceil(state.chip_rate)
+                .min(u64::from(u32::MAX)) as u32,
+        );
 
         loop {
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -912,13 +918,19 @@ impl Bts {
             }
 
             let batch_playout_tick = timing::batch_playout_tick(&state, chip_cursor, tick_rate);
-            if pace_to_hardware_time && self.runtime.max_tx_lookahead_ms > 0 {
+            if pace_to_hardware_time && tx_lookahead_ms > 0 {
+                // The initial timed send has no queued samples to absorb driver latency.
+                let lookahead_ms = if sent_blocks == 0 {
+                    startup_lookahead_ms
+                } else {
+                    tx_lookahead_ms
+                };
                 pacer.wait_until_within_tx_lookahead(
                     batch_playout_tick,
                     tx_clock.tick_at_epoch(),
                     tx_clock.epoch(),
                     tick_rate,
-                    self.runtime.max_tx_lookahead_ms,
+                    lookahead_ms,
                     &shutdown,
                 );
             }

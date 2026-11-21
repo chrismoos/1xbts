@@ -1178,10 +1178,9 @@ impl<C: Correlator> GenericRakeReceiver<C> {
 
     fn prune_fingers(&mut self) {
         let before = self.fingers.len();
-        let mut kept = Vec::with_capacity(self.fingers.len());
         let mut removed_ids = Vec::new();
 
-        for af in self.fingers.drain(..) {
+        self.fingers.retain(|af| {
             let burst_over = af.finger.signal_lost_chips() >= ACCESS_RETIRE_SIGNAL_LOST_CHIPS
                 || af.finger.idle_chips() >= ACCESS_RETIRE_IDLE_CHIPS;
             let should_drop = (af.decoded_access_message && burst_over)
@@ -1212,12 +1211,10 @@ impl<C: Correlator> GenericRakeReceiver<C> {
                     }
                 }
                 removed_ids.push(af.finger.id());
-            } else {
-                kept.push(af);
             }
-        }
+            !should_drop
+        });
 
-        self.fingers = kept;
         for id in removed_ids {
             self.correlator.notify_finger_removed(id);
         }

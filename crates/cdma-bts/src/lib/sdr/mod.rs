@@ -223,6 +223,14 @@ impl TxPulseShaper {
 
     /// Alloc-free [`shape`](Self::shape) writing into a caller buffer.
     pub fn shape_into(&mut self, samples: &[Complex32], out: &mut Vec<Complex32>) {
+        if self.upsamplers.is_empty() {
+            self.stage1.process_block_into(samples, out);
+            for sample in out {
+                *sample *= self.scale;
+            }
+            return;
+        }
+
         self.stage1.process_block_into(samples, &mut self.scratch_a);
         for up in &mut self.upsamplers {
             up.process_block_into(&self.scratch_a, &mut self.scratch_b);

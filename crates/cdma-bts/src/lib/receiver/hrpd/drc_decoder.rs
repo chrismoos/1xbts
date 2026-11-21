@@ -119,6 +119,8 @@ fn bpsk(bit: u8) -> f32 {
 pub struct DrcDecoder {
     drc_cover: u8,
     threshold: f32,
+    outer: WalshDecoder,
+    inner: WalshDecoder,
 }
 
 impl Default for DrcDecoder {
@@ -138,6 +140,9 @@ impl DrcDecoder {
         Self {
             drc_cover,
             threshold: DRC_DEFAULT_THRESHOLD,
+            // C.S0024 §9.2.1.3.3.3, Table 9.2.1.3.3.3-2 maps W_8^16 to Hadamard row 8.
+            outer: WalshDecoder::new::<DRC_OUTER_WALSH_LEN>(DRC_OUTER_WALSH_LEN / 2),
+            inner: WalshDecoder::new::<DRC_INNER_WALSH_LEN>(drc_cover as usize),
         }
     }
 
@@ -156,7 +161,10 @@ impl DrcDecoder {
     /// Update DRCCover (e.g. after an AN-side change of serving sector).
     pub fn set_drc_cover(&mut self, drc_cover: u8) {
         assert!(drc_cover <= DRC_MAX_COVER);
-        self.drc_cover = drc_cover;
+        if self.drc_cover != drc_cover {
+            self.inner = WalshDecoder::new::<DRC_INNER_WALSH_LEN>(drc_cover as usize);
+            self.drc_cover = drc_cover;
+        }
     }
 
     /// Detection threshold (`peak / mean` over the 16 codeword hypotheses).
@@ -201,15 +209,6 @@ impl DrcDecoder {
             return None;
         }
 
-        // Step 1: outer despread by W_8^16. Each consecutive 16-chip group on
-        // the Q arm collapses into one inner-Walsh chip soft value. We
-        // accumulate all repetitions (2 codewords/slot * drc_length slots) of
-        // each bit position coherently into a single 8-element soft codeword.
-        let outer = WalshDecoder::new::<DRC_OUTER_WALSH_LEN>(DRC_OUTER_WALSH_LEN / 2);
-        // C.S0024 §9.2.1.3.3.3, Table 9.2.1.3.3.3-2 maps W_8^16 to Hadamard row 8.
-
-        let inner = WalshDecoder::new::<DRC_INNER_WALSH_LEN>(self.drc_cover as usize);
-
         let mut null_soft_bits = [0.0_f32; DRC_CODEWORD_BITS];
         let mut soft_bits = [0.0_f32; DRC_CODEWORD_BITS];
 
@@ -251,10 +250,10 @@ impl DrcDecoder {
                     let group_start =
                         cw_start + bit_idx * DRC_CHIPS_PER_BIT + k * DRC_OUTER_WALSH_LEN;
                     let group = &chips[group_start..group_start + DRC_OUTER_WALSH_LEN];
-                    walsh_chips[k] = outer.process_symbol(group);
+                    walsh_chips[k] = self.outer.process_symbol(group);
                 }
                 // C.S0024 §9.2.1.3.1 maps DRC to the Q arm.
-                let inner_out = inner.process_symbol(&walsh_chips) * codeword_derotation;
+                let inner_out = self.inner.process_symbol(&walsh_chips) * codeword_derotation;
                 soft_bits[bit_idx] += inner_out.im;
                 if self.drc_cover != DRC_NULL_COVER {
                     let null_out = walsh_chips.iter().copied().sum::<Complex32>()

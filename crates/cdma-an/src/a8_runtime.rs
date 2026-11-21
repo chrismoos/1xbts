@@ -1368,6 +1368,7 @@ fn flush_hrpd_a8_downlink(
             session.forward_traffic_mac_subtype,
         );
         let mut segments = Vec::with_capacity(max_segments);
+        let mut new_octets = 0u32;
         while segments.len() < max_segments {
             if let Some(segment) = session
                 .pending_retransmit
@@ -1391,13 +1392,8 @@ fn flush_hrpd_a8_downlink(
             let Some(chunk) = session.pending_downlink.pop_front() else {
                 break;
             };
-            let sequence = session.rlp_seq.wrapping_add(
-                segments
-                    .iter()
-                    .filter(|segment| !segment.retransmission)
-                    .map(|segment| segment.octets.len() as u32)
-                    .sum::<u32>(),
-            ) & rlp::SEQUENCE_MASK;
+            let sequence = session.rlp_seq.wrapping_add(new_octets) & rlp::SEQUENCE_MASK;
+            new_octets = new_octets.wrapping_add(chunk.len() as u32);
             segments.push(HrpdA8QueuedRlpSegment {
                 sequence,
                 octets: chunk,
@@ -1421,13 +1417,7 @@ fn flush_hrpd_a8_downlink(
             },
         ) {
             HrpdA8RlpQueueStatus::Queued => {
-                let sent_new_octets = segments
-                    .iter()
-                    .filter(|segment| !segment.retransmission)
-                    .map(|segment| segment.octets.len() as u32)
-                    .sum::<u32>();
-                session.rlp_seq =
-                    session.rlp_seq.wrapping_add(sent_new_octets) & rlp::SEQUENCE_MASK;
+                session.rlp_seq = session.rlp_seq.wrapping_add(new_octets) & rlp::SEQUENCE_MASK;
                 sent_packets += 1;
             }
             HrpdA8RlpQueueStatus::Skipped => {

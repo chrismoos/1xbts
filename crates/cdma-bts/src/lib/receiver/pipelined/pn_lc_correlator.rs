@@ -2273,8 +2273,10 @@ impl Correlator for PnLcCorrelator {
         let window_len = self.cfg.coherent_chips * os;
         let mut detections = Vec::new();
 
-        while self.buffer.len() >= window_len {
-            let window: Vec<Complex32> = self.buffer.drain(..window_len).collect();
+        let mut consumed = 0;
+        while self.buffer.len() - consumed >= window_len {
+            let start = consumed;
+            consumed += window_len;
             let window_offset = self.samples_consumed;
             self.samples_consumed += window_len;
 
@@ -2287,6 +2289,7 @@ impl Correlator for PnLcCorrelator {
                 && self.window_counter > 0
                 && !search_suppressed
             {
+                let window = self.buffer[start..consumed].to_vec();
                 detections.extend(self.run_joint_search(
                     &window,
                     window_offset,
@@ -2300,6 +2303,9 @@ impl Correlator for PnLcCorrelator {
             }
 
             self.window_counter += 1;
+        }
+        if consumed != 0 {
+            self.buffer.drain(..consumed);
         }
 
         detections

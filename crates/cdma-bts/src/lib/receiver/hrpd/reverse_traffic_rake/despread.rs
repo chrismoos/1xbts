@@ -227,6 +227,33 @@ pub fn despread_chips_with_reference(
     phase_correction: Complex32,
     ref_conj: &[Complex32],
 ) -> Option<Vec<Complex32>> {
+    let mut chips = Vec::new();
+    despread_chips_with_reference_into(
+        samples,
+        absolute_sample_start,
+        oversample,
+        start_chip,
+        sample_delay,
+        sample_delay_fraction,
+        phase_correction,
+        ref_conj,
+        &mut chips,
+    )?;
+    Some(chips)
+}
+
+pub(super) fn despread_chips_with_reference_into(
+    samples: &[Complex32],
+    absolute_sample_start: u64,
+    oversample: usize,
+    start_chip: u64,
+    sample_delay: i32,
+    sample_delay_fraction: f32,
+    phase_correction: Complex32,
+    ref_conj: &[Complex32],
+    chips: &mut Vec<Complex32>,
+) -> Option<()> {
+    chips.clear();
     let start_sample = start_chip.checked_mul(oversample as u64)?;
     if start_sample < absolute_sample_start {
         return None;
@@ -244,45 +271,45 @@ pub fn despread_chips_with_reference(
         let first = samples[walk.first_index..].iter().step_by(walk.step);
         if phase_correction == Complex32::new(1.0, 0.0) {
             if frac == 0.0 {
-                return Some(
+                chips.extend(
                     first
                         .zip(ref_conj)
-                        .map(|(&sample, &reference)| sample * reference)
-                        .collect(),
+                        .map(|(&sample, &reference)| sample * reference),
                 );
+                return Some(());
             }
             let second = samples[walk.first_index + 1..].iter().step_by(walk.step);
-            return Some(
+            chips.extend(
                 first
                     .zip(second)
                     .zip(ref_conj)
-                    .map(|((&a, &b), &reference)| (a * (1.0 - frac) + b * frac) * reference)
-                    .collect(),
+                    .map(|((&a, &b), &reference)| (a * (1.0 - frac) + b * frac) * reference),
             );
+            return Some(());
         }
         if frac == 0.0 {
-            return Some(
+            chips.extend(
                 first
                     .zip(ref_conj)
-                    .map(|(&sample, &reference)| sample * reference * phase_correction)
-                    .collect(),
+                    .map(|(&sample, &reference)| sample * reference * phase_correction),
             );
+            return Some(());
         } else {
             let second = samples[walk.first_index + 1..].iter().step_by(walk.step);
-            return Some(
+            chips.extend(
                 first
                     .zip(second)
                     .zip(ref_conj)
                     .map(|((&a, &b), &reference)| {
                         let sample = a * (1.0 - frac) + b * frac;
                         sample * reference * phase_correction
-                    })
-                    .collect(),
+                    }),
             );
+            return Some(());
         }
     }
 
-    let mut chips = Vec::with_capacity(ref_conj.len());
+    chips.reserve(ref_conj.len());
     for (chip, &reference) in ref_conj.iter().enumerate() {
         let sample = sample_chip_at_delay(
             samples,
@@ -294,7 +321,7 @@ pub fn despread_chips_with_reference(
         )?;
         chips.push(sample * reference * phase_correction);
     }
-    Some(chips)
+    Some(())
 }
 
 /// A despread span resolved to a constant sample stride and interpolation

@@ -92,7 +92,7 @@ pub struct AckDecoder {
 }
 
 const ACK_MIN_STANDARD_ERRORS: f32 = 4.0;
-const PILOT_MIN_STANDARD_ERRORS: f32 = 4.0;
+const PILOT_MIN_STANDARD_ERRORS: f32 = 3.0;
 
 pub(crate) struct AckObservation {
     pub mean: Complex32,

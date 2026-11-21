@@ -489,7 +489,14 @@ impl PipelineProcessor for HrpdReverseTrafficAckProcessor {
         let mut expected_issues: Vec<(HarqAckIssue, HarqEmissionEvent, Option<f32>, f32)> =
             Vec::new();
         let mut soft_profile = [f32::NAN; HRPD_TRAFFIC_SLOTS_PER_FRAME];
+        let trace_slots = log::log_enabled!(log::Level::Trace);
+        let report_unplanned =
+            hrpd_harq_verbose() && (self.frames_seen <= 8 || self.frames_seen % 32 == 0);
         for slot_idx in 0..HRPD_TRAFFIC_SLOTS_PER_FRAME as u32 {
+            let slot_expected = slot_expected_in_mask(mask, slot_idx);
+            if !slot_expected && !trace_slots && !report_unplanned {
+                continue;
+            }
             let start = (slot_idx as usize) * HRPD_SLOT_CHIPS;
             let end = start + ACK_CHIPS_PER_BIT;
             let referenced = if end <= block.samples.len() {
@@ -510,7 +517,7 @@ impl PipelineProcessor for HrpdReverseTrafficAckProcessor {
                 soft_profile[slot_idx as usize] = avg.re / slot_pilot_amplitude.max(1e-12);
             }
             let abs_reverse_slot = frame_start_slot + slot_idx as u64;
-            let expected_emission = if slot_expected_in_mask(mask, slot_idx) {
+            let expected_emission = if slot_expected {
                 self.pending_emissions
                     .iter()
                     .find(|ev| ev.expected_ack_reverse_slot == abs_reverse_slot)
@@ -547,7 +554,7 @@ impl PipelineProcessor for HrpdReverseTrafficAckProcessor {
             }
             let slot_state = if despread.is_none() {
                 ACK_PACK_NOT_EXPECTED
-            } else if !slot_expected_in_mask(mask, slot_idx) {
+            } else if !slot_expected {
                 match symbol {
                     AckSymbol::Ack => unexpected_seen.push((slot_idx, true)),
                     AckSymbol::Nak => unexpected_seen.push((slot_idx, false)),
@@ -686,7 +693,7 @@ impl PipelineProcessor for HrpdReverseTrafficAckProcessor {
         self.maybe_report_harq_ack_issues(mac_index, frame_start_slot);
         self.maybe_report_harq_ack_feedback(mac_index, frame_start_slot);
 
-        if expected_mask != 0 && (expected_gated != 0 || expected_seen != 0) {
+        if trace_slots && expected_mask != 0 && (expected_gated != 0 || expected_seen != 0) {
             let soft = soft_profile
                 .iter()
                 .map(|ratio| {
@@ -714,10 +721,7 @@ impl PipelineProcessor for HrpdReverseTrafficAckProcessor {
             );
             log::trace!("{log_line}");
         }
-        if hrpd_harq_verbose()
-            && !unexpected_seen.is_empty()
-            && (self.frames_seen <= 8 || self.frames_seen % 32 == 0)
-        {
+        if report_unplanned && !unexpected_seen.is_empty() {
             let summary = unexpected_seen
                 .iter()
                 .map(|(slot, ack)| format!("{}:{}", slot, if *ack { "ACK" } else { "NAK" }))

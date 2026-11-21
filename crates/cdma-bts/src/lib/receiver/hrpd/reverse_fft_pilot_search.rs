@@ -4,16 +4,18 @@
 //! This primitive runs a single-frame matched-filter correlation against an
 //! oversampled IQ window using FFT/IFFT, returns the top peaks above an SNR
 //! threshold, and is intended to be wrapped by channel-specific correlators
-//! (access today, reverse traffic tomorrow). The primitive owns FFT planners
-//! and reusable buffers; the wrapper owns channel-specific concepts like
+//! (access today, reverse traffic tomorrow). The primitive shares FFT plans
+//! and owns reusable buffers; the wrapper owns channel-specific concepts like
 //! access cycle numbers, sector IDs, etc., and supplies the reference chip
 //! template through the [`HrpdReversePilotReference`] trait.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use num_complex::Complex32;
+use parking_lot::Mutex;
+use rustfft::{Fft, FftPlanner};
 
 /// The HRPD reverse pilot reference (short PN × long code, C.S0024
 /// §9.2.1.3.8) repeats every short-PN period: `reverse_spread` reduces both
@@ -21,7 +23,8 @@ use num_complex::Complex32;
 /// is byte-identical to one for `c + 32768`. The reference-spectrum cache is
 /// therefore keyed on `window_start_chip % HRPD_REVERSE_PILOT_PERIOD_CHIPS`.
 const HRPD_REVERSE_PILOT_PERIOD_CHIPS: u64 = 32768;
-use rustfft::{Fft, FftPlanner};
+static PILOT_FFT_PLANNER: LazyLock<Mutex<FftPlanner<f32>>> =
+    LazyLock::new(|| Mutex::new(FftPlanner::new()));
 
 /// Per-section timing counters for the FFT pilot searcher. Accumulated by
 /// `scan_top_hits` / `scan_window` / `reference_spectrum_for_window` so
@@ -191,9 +194,13 @@ impl HrpdReverseFftPilotSearcher {
             window_samples.saturating_sub(frame_samples)
         };
 
-        let mut planner = FftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(fft_len);
-        let ifft = planner.plan_fft_inverse(fft_len);
+        let (fft, ifft) = {
+            let mut planner = PILOT_FFT_PLANNER.lock();
+            (
+                planner.plan_fft_forward(fft_len),
+                planner.plan_fft_inverse(fft_len),
+            )
+        };
         let scratch_len = fft
             .get_inplace_scratch_len()
             .max(ifft.get_inplace_scratch_len());

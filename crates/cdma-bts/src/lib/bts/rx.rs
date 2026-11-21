@@ -1206,6 +1206,7 @@ pub(super) struct RxRuntime {
     /// carrier opens with the same filter, so filtering here keeps the cost at
     /// one pass instead of one per active traffic channel.
     one_x_matched_filter: SymmetricComplexFir32,
+    one_x_matched_filter_output: Vec<Complex32>,
     hrpd_processors: Option<Vec<PipelineProcessorShared>>,
     hrpd_rx_slice: Option<RxCarrierSlice>,
     hrpd_access_thread: Option<HrpdAccessRxThread>,
@@ -1330,28 +1331,13 @@ impl RxCarrierSlice {
         raw_relative_sample_start: usize,
         raw_absolute_sample_start: u64,
     ) -> CarrierSliceBlock {
-        self.process_in_place(
-            &mut samples,
-            raw_relative_sample_start,
-            raw_absolute_sample_start,
-        )
-    }
-
-    fn process_in_place(
-        &mut self,
-        samples: &mut [Complex32],
-        raw_relative_sample_start: usize,
-        raw_absolute_sample_start: u64,
-    ) -> CarrierSliceBlock {
         let oversample = self.output_oversample.max(1) as u64;
         let output_sample_rate_hz = self.output_sample_rate_hz;
 
-        // Pass-through path: no decimation, so no anti-alias filter. Apply only
-        // the NCO mix (a no-op for a zero shift).
         let Some(fir) = self.anti_alias.as_mut() else {
-            self.nco.rotate_in_place(samples);
+            self.nco.rotate_in_place(&mut samples);
             return CarrierSliceBlock {
-                samples: samples.to_vec(),
+                samples,
                 relative_sample_start: raw_relative_sample_start,
                 absolute_sample_start: raw_absolute_sample_start,
                 absolute_chip_start: raw_absolute_sample_start / oversample,
@@ -1781,6 +1767,7 @@ pub(super) fn open_rx_runtime(rx: RxSettings) -> Result<RxRuntime, Error> {
         processors,
         one_x_rx_slice,
         one_x_matched_filter: SymmetricComplexFir32::new(&cdma2000_baseband_filter_taps_f64()),
+        one_x_matched_filter_output: Vec::new(),
         hrpd_processors,
         hrpd_rx_slice,
         hrpd_access_thread: None,
@@ -2480,12 +2467,19 @@ fn process_rx_message(
         (None, None) => return Err("rx: no reverse carrier slice configured".into()),
     };
 
-    // Keep the HRPD Access Channel correlator fed even while a reverse traffic
-    // assignment has pilot lock; all HRPD consumers share this one sliced block.
-    if let Some(hrpd_block) = hrpd_block.as_ref() {
+    if let Some(mut hrpd_block) = hrpd_block {
+        let mut traffic_remaining = runtime.hrpd_traffic_threads.len();
         if let Some(thread) = runtime.hrpd_access_thread.as_ref() {
+            let samples = if traffic_remaining == 0 {
+                std::mem::take(&mut hrpd_block.samples)
+            } else {
+                hrpd_block.samples.clone()
+            };
             let block = HrpdAccessRxBlock {
-                block: hrpd_block.clone(),
+                block: CarrierSliceBlock {
+                    samples,
+                    ..hrpd_block
+                },
                 enqueue_time: Instant::now(),
             };
             let samples = block.block.samples.len();
@@ -2495,10 +2489,16 @@ fn process_rx_message(
             }
         }
         runtime.hrpd_traffic_threads.retain(|thread| {
+            traffic_remaining -= 1;
+            let samples = if traffic_remaining == 0 {
+                std::mem::take(&mut hrpd_block.samples)
+            } else {
+                hrpd_block.samples.clone()
+            };
             send_hrpd_traffic_rx_block(
                 thread,
                 HrpdTrafficRxBlock {
-                    samples: hrpd_block.samples.clone(),
+                    samples,
                     absolute_sample_start: hrpd_block.absolute_sample_start,
                     sample_rate_hz: hrpd_block.sample_rate_hz,
                     rx_read_completed_at,
@@ -2512,7 +2512,10 @@ fn process_rx_message(
 
     let mut one_x_block = one_x_block;
     if let Some(block) = one_x_block.as_mut() {
-        block.samples = runtime.one_x_matched_filter.process_block(&block.samples);
+        runtime
+            .one_x_matched_filter
+            .process_block_into(&block.samples, &mut runtime.one_x_matched_filter_output);
+        std::mem::swap(&mut block.samples, &mut runtime.one_x_matched_filter_output);
     }
 
     // Clone samples for traffic RX threads if any are active or pending.

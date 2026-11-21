@@ -18,7 +18,7 @@ use num_complex::Complex32;
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock};
 
-use crate::bts::hrpd::harq_bus::{HarqBus, HarqEmissionEvent};
+use crate::bts::hrpd::harq_bus::{HarqBus, HarqEmissionEvent, HarqFeedbackEvent};
 use crate::phy::hrpd::interleaver::forward_channel_interleave;
 use crate::phy::hrpd::rates::{ForwardRate, HrpdModulation, by_drc};
 use crate::phy::hrpd::scrambler::HrpdForwardScrambler;
@@ -394,6 +394,7 @@ pub struct HrpdForwardScheduler {
     ///     reverse slot (forward slot `n` -> reverse slot `n + 3`,
     ///     C.S0024-0 v4.0 §9.2.1.3.3.4).
     harq_bus: Option<Arc<HarqBus>>,
+    feedback_scratch: Vec<HarqFeedbackEvent>,
     stats_window_start_slot: Option<u64>,
     stats_traffic_slots: u32,
     stats_control_slots: u32,
@@ -414,6 +415,7 @@ impl Default for HrpdForwardScheduler {
             last_no_governing_drc_log_slot: 0,
             next_packet_id: 1,
             harq_bus: None,
+            feedback_scratch: Vec::new(),
             stats_window_start_slot: None,
             stats_traffic_slots: 0,
             stats_control_slots: 0,
@@ -598,11 +600,14 @@ impl HrpdForwardScheduler {
         // H-ARQ state by scheduler-local packet id, which is required once
         // one-slot packets are pipelined for the same MAC index.
         if let Some(bus) = self.harq_bus.clone() {
+            let mut feedback = std::mem::take(&mut self.feedback_scratch);
             for mac in 0u8..crate::bts::hrpd::harq_bus::MAC_INDEX_COUNT as u8 {
-                for event in bus.drain_feedback(mac) {
+                bus.drain_feedback_into(mac, &mut feedback);
+                for event in feedback.drain(..) {
                     self.handle_ack(mac, event.packet_id, event.subpacket, event.response);
                 }
             }
+            self.feedback_scratch = feedback;
         }
         self.retire_expired_feedback_waits(slot_index);
 
@@ -622,12 +627,14 @@ impl HrpdForwardScheduler {
         }
 
         let Some(idx) = self.pick_active(slot_index) else {
-            self.record_slot_stats(
-                slot_index,
-                SlotStatsKind::Idle {
-                    reason: self.idle_reason(slot_index),
-                },
-            );
+            if log::log_enabled!(log::Level::Debug) {
+                self.record_slot_stats(
+                    slot_index,
+                    SlotStatsKind::Idle {
+                        reason: self.idle_reason(slot_index),
+                    },
+                );
+            }
             return ForwardSlotOutput {
                 channel: SlotKind::Idle,
                 data_chips: Vec::new(),
@@ -959,7 +966,7 @@ impl HrpdForwardScheduler {
             self.next_packet_id = self.next_packet_id.wrapping_add(1).max(1);
             let scheduled_rtc_ack_seq = pkt.rtc_ack_sequence_number;
             let scheduled_signaling = pkt.default_signaling.clone();
-            let scheduled_rlp_ranges = pkt.rlp_ranges.clone();
+            let scheduled_rlp_ranges = pkt.rlp_ranges.take();
             if let Some(state) = build_harq_state(pkt, at_rate, packet_id) {
                 if let Some(ranges) = scheduled_rlp_ranges.as_ref() {
                     log::trace!(
@@ -1008,7 +1015,13 @@ impl HrpdForwardScheduler {
                             .unwrap_or_else(|| "none".to_string()),
                     );
                 }
-                if let Some(signaling) = scheduled_signaling.as_ref() {
+                if let Some(signaling) = scheduled_signaling.as_ref()
+                    && log::log_enabled!(if is_default_packet_data_payload(signaling) {
+                        log::Level::Trace
+                    } else {
+                        log::Level::Debug
+                    })
+                {
                     let scheduling_line = format!(
                         "rx_hrpd_traffic[m{}]: scheduling FTC packet_id={} protocol=0x{:02x} in_config={} reliable_seq={:?} ack_seq={:?} start_slot={} drc=0x{:x} payload_bits={} slots={} exact_drc={} latest_drc={}",
                         state.packet.mac_index,
@@ -1159,6 +1172,9 @@ impl HrpdForwardScheduler {
     }
 
     fn record_slot_stats(&mut self, slot_index: u64, kind: SlotStatsKind) {
+        if !log::log_enabled!(log::Level::Debug) {
+            return;
+        }
         let start_slot = match self.stats_window_start_slot {
             Some(start_slot) => start_slot,
             None => {

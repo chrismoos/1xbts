@@ -7,7 +7,7 @@
 //! the spec-derived access PN/LC sequence before feeding chip-rate packet chips
 //! to the normal downstream packet processor.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use log::{debug, info};
 use num_complex::Complex32;
@@ -1381,6 +1381,7 @@ fn timing_candidates_near_fft_hit(
     ];
     let grid = ChipGeometry::new(absolute_sample_start, oversample);
     let mut coarse = Vec::new();
+    let mut integer_delay_scores = HashMap::new();
     // Narrowed search space (2×3×27 = 162 candidates): frame_back=1 catches
     // an IFFT peak that rounded into the next frame, and ±1 slot covers the
     // few-chip uncertainty in the peak position.
@@ -1391,9 +1392,10 @@ fn timing_candidates_near_fft_hit(
                 continue;
             }
             for sample_delay in sample_delays {
-                let Some((lag_coherence, phase_step)) =
-                    preamble_lag_coherence(samples, grid.at_delay(sample_delay, 0.0), start_chip)
-                else {
+                let score =
+                    preamble_lag_coherence(samples, grid.at_delay(sample_delay, 0.0), start_chip);
+                integer_delay_scores.insert((start_chip, sample_delay), score);
+                let Some((lag_coherence, phase_step)) = score else {
                     continue;
                 };
                 if lag_coherence >= ACCESS_PREAMBLE_MIN_LAG_COHERENCE || allow_reference_only {
@@ -1419,6 +1421,7 @@ fn timing_candidates_near_fft_hit(
 
     // Reuse the spec reference across delay variants for the same frame start.
     let mut references = HashMap::<i64, Vec<Complex32>>::new();
+    let mut refined_delays = HashSet::new();
     let mut all = Vec::new();
     for coarse in coarse {
         let reference = references
@@ -1441,11 +1444,22 @@ fn timing_candidates_near_fft_hit(
             coarse.sample_delay,
             coarse.sample_delay + 4,
         ] {
+            if !refined_delays.insert((coarse.preamble_start_chip, sample_delay)) {
+                continue;
+            }
             for sample_delay_fraction in [0.0f32, -0.75, 0.75] {
                 let geometry = grid.at_delay(sample_delay, sample_delay_fraction);
-                let Some((lag_coherence, phase_step)) =
+                let score = if sample_delay_fraction == 0.0 {
+                    integer_delay_scores
+                        .get(&(coarse.preamble_start_chip, sample_delay))
+                        .copied()
+                        .unwrap_or_else(|| {
+                            preamble_lag_coherence(samples, geometry, coarse.preamble_start_chip)
+                        })
+                } else {
                     preamble_lag_coherence(samples, geometry, coarse.preamble_start_chip)
-                else {
+                };
+                let Some((lag_coherence, phase_step)) = score else {
                     continue;
                 };
                 if lag_coherence < ACCESS_PREAMBLE_MIN_LAG_COHERENCE && !allow_reference_only {
@@ -1478,14 +1492,6 @@ fn timing_candidates_near_fft_hit(
             .then_with(|| a.sample_delay.cmp(&b.sample_delay))
             .then_with(|| a.sample_delay_fraction.total_cmp(&b.sample_delay_fraction))
     });
-    all.dedup_by(|a, b| {
-        a.preamble_start_chip == b.preamble_start_chip
-            && a.sample_delay == b.sample_delay
-            && (a.sample_delay_fraction - b.sample_delay_fraction).abs() < f32::EPSILON
-    });
-    if all.is_empty() {
-        return Vec::new();
-    }
     all.sort_by(|a, b| {
         b.spec_coherence
             .total_cmp(&a.spec_coherence)
@@ -1623,48 +1629,47 @@ fn preamble_lag_coherence(
     geometry: ChipGeometry,
     preamble_start_chip: i64,
 ) -> Option<(f32, f32)> {
-    let stride = 64usize;
-    let mut dot01 = [Complex32::new(0.0, 0.0); ACCESS_FRAME_SLOTS];
-    let mut dot02 = [Complex32::new(0.0, 0.0); ACCESS_FRAME_SLOTS];
-    let mut dot12 = [Complex32::new(0.0, 0.0); ACCESS_FRAME_SLOTS];
-    let mut pow0 = [0.0f32; ACCESS_FRAME_SLOTS];
-    let mut pow1 = [0.0f32; ACCESS_FRAME_SLOTS];
-    let mut pow2 = [0.0f32; ACCESS_FRAME_SLOTS];
+    const LAG_COHERENCE_STRIDE: usize = 64;
+    let stride = LAG_COHERENCE_STRIDE;
     let last_k = (ACCESS_PACKET_CHIPS - 1) / stride * stride;
     let frame_samples = (ACCESS_PACKET_CHIPS * geometry.oversample) as i64;
     let last_chip = preamble_start_chip + (2 * ACCESS_PACKET_CHIPS + last_k) as i64;
     let scan = geometry.scan(samples, preamble_start_chip, last_chip, stride)?;
 
-    let mut index = scan.index;
-    for k in (0..ACCESS_PACKET_CHIPS).step_by(stride) {
-        let slot = (k / HRPD_SLOT_CHIPS).min(ACCESS_FRAME_SLOTS - 1);
-        let a = scan.interp(samples, index);
-        let b = scan.interp(samples, index + frame_samples);
-        let c = scan.interp(samples, index + 2 * frame_samples);
-        index += scan.step;
-        dot01[slot] += a.conj() * b;
-        dot02[slot] += a.conj() * c;
-        dot12[slot] += b.conj() * c;
-        pow0[slot] += a.norm_sqr();
-        pow1[slot] += b.norm_sqr();
-        pow2[slot] += c.norm_sqr();
-    }
-    // Combine slots non-coherently: each slot is individually coherent
-    // (pilot is frame-periodic within a slot), but a gated probe's carrier
-    // phase jumps between slots, so a coherent sum across slots cancels.
-    // Summing per-slot magnitudes keeps active slots additive and lets dead
-    // (low-power) slots fall out on their own — no gating threshold needed.
     let (mut num01, mut num02, mut num12) = (0.0f32, 0.0f32, 0.0f32);
     let (mut den01, mut den02, mut den12) = (0.0f32, 0.0f32, 0.0f32);
     let mut sum_d01 = Complex32::new(0.0, 0.0);
-    for s in 0..ACCESS_FRAME_SLOTS {
-        num01 += dot01[s].norm();
-        num02 += dot02[s].norm();
-        num12 += dot12[s].norm();
-        den01 += (pow0[s] * pow1[s]).sqrt();
-        den02 += (pow0[s] * pow2[s]).sqrt();
-        den12 += (pow1[s] * pow2[s]).sqrt();
-        sum_d01 += dot01[s];
+    let mut index = scan.index;
+    const SAMPLES_PER_SLOT: usize = HRPD_SLOT_CHIPS / LAG_COHERENCE_STRIDE;
+    const {
+        assert!(HRPD_SLOT_CHIPS % LAG_COHERENCE_STRIDE == 0);
+        assert!(ACCESS_FRAME_SLOTS * HRPD_SLOT_CHIPS == ACCESS_PACKET_CHIPS);
+    }
+    for _ in 0..ACCESS_FRAME_SLOTS {
+        let mut dot01 = Complex32::new(0.0, 0.0);
+        let mut dot02 = Complex32::new(0.0, 0.0);
+        let mut dot12 = Complex32::new(0.0, 0.0);
+        let (mut pow0, mut pow1, mut pow2) = (0.0f32, 0.0f32, 0.0f32);
+        for _ in 0..SAMPLES_PER_SLOT {
+            let a = scan.interp(samples, index);
+            let b = scan.interp(samples, index + frame_samples);
+            let c = scan.interp(samples, index + 2 * frame_samples);
+            index += scan.step;
+            dot01 += a.conj() * b;
+            dot02 += a.conj() * c;
+            dot12 += b.conj() * c;
+            pow0 += a.norm_sqr();
+            pow1 += b.norm_sqr();
+            pow2 += c.norm_sqr();
+        }
+        // Gated slots can have different carrier phases, so sum their magnitudes.
+        num01 += dot01.norm();
+        num02 += dot02.norm();
+        num12 += dot12.norm();
+        den01 += (pow0 * pow1).sqrt();
+        den02 += (pow0 * pow2).sqrt();
+        den12 += (pow1 * pow2).sqrt();
+        sum_d01 += dot01;
     }
     let coh01 = num01 / den01.max(1.0e-12);
     let coh02 = num02 / den02.max(1.0e-12);
