@@ -255,18 +255,18 @@ fn start_server_with_calibration(
     state: Arc<Mutex<FakeState>>,
     calibration: RadioCalibration,
 ) -> (std::thread::JoinHandle<()>, SocketAddr) {
-    let radio = Box::new(FakeRadio {
-        state,
-        clock: Arc::new(FakeClock {
-            start: Instant::now(),
-        }),
-    });
-    let radio = Box::new(
-        CalibratedRadio::new(radio, calibration)
-            .unwrap()
-            .with_rx_reference_gain_db(Some(30.0))
-            .unwrap(),
-    );
+    let open_radio = move || -> Result<Box<dyn Radio>, RadioError> {
+        let radio = Box::new(FakeRadio {
+            state: Arc::clone(&state),
+            clock: Arc::new(FakeClock {
+                start: Instant::now(),
+            }),
+        });
+        Ok(Box::new(
+            CalibratedRadio::new(radio, calibration)?.with_rx_reference_gain_db(Some(30.0))?,
+        ))
+    };
+    let radio = open_radio().expect("open fake radio");
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -279,6 +279,7 @@ fn start_server_with_calibration(
             let localhost = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
             let serve_fut = serve(
                 radio,
+                Box::new(open_radio),
                 true,
                 "fake".to_string(),
                 RxDefaults {
