@@ -7,6 +7,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # cached artifacts can run on difference CPU, so omit `target-cpu=native`
+  RUSTFLAGS: "--cfg tokio_unstable"
   RUN_CAPTURE_TESTS: "false"
 
 jobs:
